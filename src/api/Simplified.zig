@@ -1,4 +1,5 @@
 const std = @import("std");
+const Event = @import("../core/Event.zig").Event;
 
 /// Simplified Module interface using VTable pattern
 /// Provides runtime polymorphism without circular dependencies
@@ -12,7 +13,7 @@ pub const Module = struct {
         start: *const fn (*anyopaque) anyerror!void,
         stop: *const fn (*anyopaque) void,
         dependencies: ?*const fn (*anyopaque) []const []const u8 = null,
-        on_event: ?*const fn (*anyopaque, anytype) void = null,
+        on_event: ?*const fn (*anyopaque, Event) void = null,
     };
 
     pub fn name(self: Module) []const u8 {
@@ -36,6 +37,12 @@ pub const Module = struct {
             return dep_fn(self.ptr);
         }
         return &[]const []const u8{};
+    }
+
+    pub fn onEvent(self: Module, event: Event) void {
+        if (self.vtable.on_event) |handler| {
+            handler(self.ptr, event);
+        }
     }
 };
 
@@ -78,10 +85,18 @@ pub fn ModuleImpl(comptime T: type) type {
                     }
                     return &[]const []const u8{};
                 }
+
+                pub fn on_event(ctx: *anyopaque, evt: Event) void {
+                    const self: *T = @ptrCast(@alignCast(ctx));
+                    if (@hasDecl(T, "onEvent")) {
+                        @call(.auto, T.onEvent, .{ self, evt });
+                    }
+                }
             };
 
             // Check which methods exist at compile time
             const has_deps = @hasDecl(T, "dependencies");
+            const has_event = @hasDecl(T, "onEvent");
 
             return Module{
                 .ptr = ptr,
@@ -91,6 +106,7 @@ pub fn ModuleImpl(comptime T: type) type {
                     .start = gen.start,
                     .stop = gen.stop,
                     .dependencies = if (has_deps) gen.dependencies else null,
+                    .on_event = if (has_event) gen.on_event else null,
                 },
             };
         }
@@ -159,9 +175,15 @@ pub const App = struct {
         self.state = .stopped;
     }
 
-    pub fn publish(self: *Self, event: anytype) void {
-        _ = self;
-        _ = event;
-        // TODO: Implement event publishing
+    /// Publish an event to all registered modules
+    pub fn publish(self: *Self, event: Event) void {
+        for (self.modules.items) |mod| {
+            mod.onEvent(event);
+        }
+    }
+
+    /// Get number of registered modules
+    pub fn moduleCount(self: *Self) usize {
+        return self.modules.items.len;
     }
 };

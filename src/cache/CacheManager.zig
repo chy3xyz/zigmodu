@@ -237,9 +237,36 @@ pub const CacheManager = struct {
 
         // 批量更新访问顺序（如果有LRU）
         if (self.eviction_policy == .LRU and found_count > 0) {
-            // TODO: 优化批量更新
+            // 优化：批量更新访问顺序
+            // 1. 收集所有需要更新的key（排除已经过期的）
+            var valid_keys = std.ArrayList([]const u8).init(self.allocator);
+            defer valid_keys.deinit();
+
             for (keys) |key| {
-                self.updateAccessOrder(key);
+                if (self.entries.contains(key)) {
+                    try valid_keys.append(key);
+                }
+            }
+
+            // 2. 批量移除这些key（从后往前遍历，避免索引偏移问题）
+            var i: usize = self.access_order.items.len;
+            while (i > 0) {
+                i -= 1;
+                const current_key = self.access_order.items[i];
+                // 检查这个key是否在valid_keys中
+                for (valid_keys.items) |vk| {
+                    if (std.mem.eql(u8, current_key, vk)) {
+                        // 使用swapRemove提高效率（顺序不重要，因为我们后面会重新添加）
+                        _ = self.access_order.swapRemove(i);
+                        break;
+                    }
+                }
+            }
+
+            // 3. 批量添加到末尾（最近访问）
+            for (valid_keys.items) |key| {
+                const key_copy = try self.allocator.dupe(u8, key);
+                try self.access_order.append(key_copy);
             }
         }
 
