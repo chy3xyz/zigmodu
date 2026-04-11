@@ -1,0 +1,73 @@
+# This file is for zig-specific build artifacts.
+# If you have other files to ignore, consider adding them to a global .gitignore file.
+# For example, you can create a ~/.gitignore file and add:
+# git config --global core.excludesfile ~/.gitignore
+
+# Zig build artifacts
+.zig-cache/
+zig-out/
+build/
+build-*/
+
+# Binary files
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+
+# Debug files
+*.pdb
+*.dSYM/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test artifacts
+*.test
+
+# Documentation build artifacts
+docs/_build/
+docs/.doctrees/
+
+# Benchmark results
+benchmarks/results/
+*.bench
+
+# Temporary files
+*.tmp
+*.temp
+tmp/
+temp/
+
+# OS files
+Thumbs.db
+.DS_Store
+*.log
+
+# Dependency directories (if vendoring)
+vendor/
+
+# Coverage reports
+coverage/
+*.lcov
+
+# Profiling data
+*.prof
+profile/
+
+# Package files
+*.tar.gz
+*.zip
+*.tar
+
+# Local configuration
+.env
+.env.local
+config.local.json

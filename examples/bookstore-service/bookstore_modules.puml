@@ -1,0 +1,33 @@
+@startuml
+component [catalog] as catalog
+catalog --> database
+component [inventory] as inventory
+inventory --> database
+inventory --> catalog
+component [api] as api
+api --> database
+api --> catalog
+api --> user
+api --> order
+api --> inventory
+component [cart] as cart
+cart --> catalog
+cart --> inventory
+cart --> user
+component [notification] as notification
+notification --> database
+component [order] as order
+order --> database
+order --> catalog
+order --> user
+order --> inventory
+component [audit] as audit
+audit --> database
+component [database] as database
+component [config] as config
+component [user] as user
+user --> database
+component [payment] as payment
+payment --> database
+payment --> order
+@enduml
