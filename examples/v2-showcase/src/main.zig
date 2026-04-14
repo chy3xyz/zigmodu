@@ -204,6 +204,84 @@ pub fn main() !void {
     std.log.info("✅ Web Monitor test passed\n", .{});
 
     // ========================================
+    // Test 6: YAML/TOML Configuration
+    // ========================================
+    std.log.info("=== Test 6: YAML/TOML Configuration ===", .{});
+
+    var yaml_parser = zigmodu.YamlParser.init(allocator);
+    const yaml =
+        \\[server]
+        \\host: "0.0.0.0"
+        \\port: 3000
+    ;
+    var yaml_config = try yaml_parser.parse(yaml);
+    defer yaml_parser.deinitMap(&yaml_config);
+    try std.testing.expectEqualStrings("0.0.0.0", yaml_config.get("server.host").?);
+
+    var toml_parser = zigmodu.TomlParser.init(allocator);
+    const toml =
+        \\[database]
+        \\url = "postgres://localhost"
+        \\pool_size = 10
+    ;
+    var toml_config = try toml_parser.parse(toml);
+    defer toml_parser.deinitMap(&toml_config);
+    try std.testing.expectEqualStrings("postgres://localhost", toml_config.get("database.url").?);
+
+    std.log.info("✅ YAML/TOML Configuration test passed\n", .{});
+
+    // ========================================
+    // Test 7: WebSocket Server
+    // ========================================
+    std.log.info("=== Test 7: WebSocket Server ===", .{});
+
+    var ws_server = zigmodu.WebSocketServer.init(allocator, 19001);
+    defer ws_server.deinit();
+    try ws_server.start();
+    try std.testing.expectEqual(@as(usize, 0), ws_server.clientCount());
+    ws_server.stop();
+    std.log.info("✅ WebSocket Server test passed\n", .{});
+
+    // ========================================
+    // Test 8: Cluster Membership
+    // ========================================
+    std.log.info("=== Test 8: Cluster Membership ===", .{});
+
+    var cluster_bus = zigmodu.DistributedEventBus.init(allocator);
+    defer cluster_bus.deinit();
+
+    const cluster_addr = try std.net.Address.parseIp4("127.0.0.1", 18081);
+    var cluster = try zigmodu.ClusterMembership.init(allocator, "showcase-node", cluster_addr, &cluster_bus);
+    defer cluster.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), cluster.getNodeCount());
+    try std.testing.expect(cluster.isLeader());
+    std.log.info("✅ Cluster Membership test passed\n", .{});
+
+    // ========================================
+    // Test 9: Distributed Transactions (2PC)
+    // ========================================
+    std.log.info("=== Test 9: Distributed Transactions ===", .{});
+
+    var tpc = zigmodu.TwoPhaseCommit.init(allocator);
+    defer tpc.deinit();
+
+    try tpc.createCoordinator("showcase-tx");
+    try tpc.addParticipant("showcase-tx", "db-node-1", struct {
+        fn prep() bool {
+            return true;
+        }
+    }.prep, struct {
+        fn cmt() void {}
+    }.cmt, struct {
+        fn roll() void {}
+    }.roll);
+
+    try tpc.execute("showcase-tx");
+    try std.testing.expectEqual(zigmodu.TwoPhaseCommit.TransactionCoordinator.TwoPhaseStatus.COMMITTED, tpc.coordinators.get("showcase-tx").?.status);
+    std.log.info("✅ Distributed Transactions test passed\n", .{});
+
+    // ========================================
     // Summary
     // ========================================
     std.log.info("╔══════════════════════════════════════════════════════════════╗", .{});
@@ -214,6 +292,10 @@ pub fn main() !void {
     std.log.info("║  ✅ Hot Reloading                                            ║", .{});
     std.log.info("║  ✅ Distributed Event Bus                                    ║", .{});
     std.log.info("║  ✅ Web Monitor                                              ║", .{});
+    std.log.info("║  ✅ YAML/TOML Configuration                                  ║", .{});
+    std.log.info("║  ✅ WebSocket Server                                         ║", .{});
+    std.log.info("║  ✅ Cluster Membership                                       ║", .{});
+    std.log.info("║  ✅ Distributed Transactions                                 ║", .{});
     std.log.info("╚══════════════════════════════════════════════════════════════╝", .{});
 }
 
@@ -323,4 +405,57 @@ test "ReloadStrategy - enum values" {
     try std.testing.expectEqual(zigmodu.ReloadStrategy.restart, .restart);
     try std.testing.expectEqual(zigmodu.ReloadStrategy.preserve_state, .preserve_state);
     try std.testing.expectEqual(zigmodu.ReloadStrategy.gradual_migration, .gradual_migration);
+}
+
+test "YamlParser - basic parsing" {
+    const allocator = std.testing.allocator;
+    var parser = zigmodu.YamlParser.init(allocator);
+    const yaml = "name: zigmodu\nversion: 0.2.0";
+    var map = try parser.parse(yaml);
+    defer parser.deinitMap(&map);
+    try std.testing.expectEqualStrings("zigmodu", map.get("name").?);
+}
+
+test "TomlParser - basic parsing" {
+    const allocator = std.testing.allocator;
+    var parser = zigmodu.TomlParser.init(allocator);
+    const toml = "name = \"zigmodu\"\nversion = \"0.2.0\"";
+    var map = try parser.parse(toml);
+    defer parser.deinitMap(&map);
+    try std.testing.expectEqualStrings("zigmodu", map.get("name").?);
+}
+
+test "WebSocketServer - initialization" {
+    const allocator = std.testing.allocator;
+    var server = zigmodu.WebSocketServer.init(allocator, 19002);
+    defer server.deinit();
+    try std.testing.expectEqual(@as(u16, 19002), server.port);
+}
+
+test "ClusterMembership - initialization" {
+    const allocator = std.testing.allocator;
+    var bus = zigmodu.DistributedEventBus.init(allocator);
+    defer bus.deinit();
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 18082);
+    var cluster = try zigmodu.ClusterMembership.init(allocator, "test-node", addr, &bus);
+    defer cluster.deinit();
+    try std.testing.expect(cluster.isLeader());
+}
+
+test "TwoPhaseCommit - basic commit" {
+    const allocator = std.testing.allocator;
+    var tpc = zigmodu.TwoPhaseCommit.init(allocator);
+    defer tpc.deinit();
+    try tpc.createCoordinator("tx-test");
+    try tpc.addParticipant("tx-test", "p1", struct {
+        fn prep() bool {
+            return true;
+        }
+    }.prep, struct {
+        fn cmt() void {}
+    }.cmt, struct {
+        fn roll() void {}
+    }.roll);
+    try tpc.execute("tx-test");
+    try std.testing.expectEqual(zigmodu.TwoPhaseCommit.TransactionCoordinator.TwoPhaseStatus.COMMITTED, tpc.coordinators.get("tx-test").?.status);
 }

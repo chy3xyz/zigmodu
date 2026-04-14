@@ -231,6 +231,9 @@ pub const TwoPhaseCommit = struct {
         var iter = self.coordinators.iterator();
         while (iter.next()) |entry| {
             var coord = entry.value_ptr.*;
+            for (coord.participants.items) |participant| {
+                self.allocator.free(participant.id);
+            }
             coord.participants.deinit(self.allocator);
             self.allocator.free(coord.tx_id);
         }
@@ -313,3 +316,104 @@ pub const TwoPhaseCommit = struct {
         }
     }
 };
+
+// ========================================
+// Tests
+// ========================================
+
+test "DistributedTransactionManager saga success" {
+    const allocator = std.testing.allocator;
+
+    var dtm = DistributedTransactionManager.init(allocator);
+    defer dtm.deinit();
+
+    const tx_id = try dtm.beginTransaction();
+    defer allocator.free(tx_id);
+
+    try dtm.addStep(tx_id, "step1", struct {
+        fn action() !void {}
+    }.action, struct {
+        fn comp() void {}
+    }.comp);
+
+    try dtm.addStep(tx_id, "step2", struct {
+        fn action() !void {}
+    }.action, struct {
+        fn comp() void {}
+    }.comp);
+
+    try dtm.execute(tx_id);
+    try std.testing.expectEqual(DistributedTransactionManager.SagaTransaction.TransactionStatus.COMPLETED, dtm.getStatus(tx_id).?);
+}
+
+test "DistributedTransactionManager saga compensation" {
+    const allocator = std.testing.allocator;
+
+    var dtm = DistributedTransactionManager.init(allocator);
+    defer dtm.deinit();
+
+    const tx_id = try dtm.beginTransaction();
+    defer allocator.free(tx_id);
+
+    try dtm.addStep(tx_id, "step1", struct {
+        fn action() !void {}
+    }.action, struct {
+        fn comp() void {}
+    }.comp);
+
+    try dtm.addStep(tx_id, "step2", struct {
+        fn action() !void {
+            return error.TestFailure;
+        }
+    }.action, struct {
+        fn comp() void {}
+    }.comp);
+
+    const result = dtm.execute(tx_id);
+    try std.testing.expectError(error.TransactionFailed, result);
+}
+
+test "TwoPhaseCommit success" {
+    const allocator = std.testing.allocator;
+
+    var tpc = TwoPhaseCommit.init(allocator);
+    defer tpc.deinit();
+
+    try tpc.createCoordinator("tx-1");
+
+    try tpc.addParticipant("tx-1", "p1", struct {
+        fn prep() bool {
+            return true;
+        }
+    }.prep, struct {
+        fn cmt() void {}
+    }.cmt, struct {
+        fn roll() void {}
+    }.roll);
+
+    try tpc.execute("tx-1");
+    try std.testing.expectEqual(TwoPhaseCommit.TransactionCoordinator.TwoPhaseStatus.COMMITTED, tpc.coordinators.get("tx-1").?.status);
+}
+
+test "TwoPhaseCommit abort" {
+    const allocator = std.testing.allocator;
+
+    var tpc = TwoPhaseCommit.init(allocator);
+    defer tpc.deinit();
+
+    try tpc.createCoordinator("tx-1");
+
+    try tpc.addParticipant("tx-1", "p1", struct {
+        fn prep() bool {
+            return false;
+        }
+    }.prep, struct {
+        fn cmt() void {}
+    }.cmt, struct {
+        fn roll() void {}
+    }.roll);
+
+    const result = tpc.execute("tx-1");
+    try std.testing.expectError(error.TransactionAborted, result);
+    try std.testing.expectEqual(TwoPhaseCommit.TransactionCoordinator.TwoPhaseStatus.ABORTED, tpc.coordinators.get("tx-1").?.status);
+}

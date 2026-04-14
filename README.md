@@ -289,6 +289,86 @@ fn onModuleChanged(path: []const u8) void {
 }
 ```
 
+### YAML/TOML Configuration
+
+Load configuration from YAML or TOML files:
+
+```zig
+const YamlParser = @import("zigmodu").YamlParser;
+const TomlParser = @import("zigmodu").TomlParser;
+
+var yaml = YamlParser.init(allocator);
+var yaml_config = try yaml.parseFile("config.yaml");
+defer yaml.deinitMap(&yaml_config);
+
+var toml = TomlParser.init(allocator);
+var toml_config = try toml.parseFile("config.toml");
+defer toml.deinitMap(&toml_config);
+
+const host = yaml_config.get("server.host");
+const db_url = toml_config.get("database.url");
+```
+
+### WebSocket Real-Time Monitoring
+
+Push real-time updates to connected clients:
+
+```zig
+const WebSocketMonitor = @import("zigmodu").WebSocketMonitor;
+
+var ws = WebSocketMonitor.init(allocator, 8080);
+defer ws.deinit();
+
+try ws.start(&modules);
+
+// Broadcast JSON updates to all connected clients
+ws.ws_server.broadcast("{\"type\":\"metrics\",\"module_count\":5}");
+```
+
+### Cluster Membership
+
+Gossip-based cluster membership with leader election:
+
+```zig
+const ClusterMembership = @import("zigmodu").ClusterMembership;
+
+var bus = DistributedEventBus.init(allocator);
+var cluster = try ClusterMembership.init(allocator, "node-1", address, &bus);
+
+try cluster.start(.{});
+try cluster.connectToSeed("node-2", seed_address);
+
+if (cluster.isLeader()) {
+    // Only leader performs coordination tasks
+}
+```
+
+### Distributed Transactions
+
+Two-Phase Commit (2PC) and Saga pattern support:
+
+```zig
+const TwoPhaseCommit = @import("zigmodu").TwoPhaseCommit;
+const DistributedTransactionManager = @import("zigmodu").DistributedTransactionManager;
+
+// 2PC Coordinator
+var tpc = TwoPhaseCommit.init(allocator);
+defer tpc.deinit();
+
+try tpc.createCoordinator("tx-1");
+try tpc.addParticipant("tx-1", "db-1", prepareFn, commitFn, rollbackFn);
+try tpc.execute("tx-1");
+
+// Saga pattern
+var dtm = DistributedTransactionManager.init(allocator);
+defer dtm.deinit();
+
+const tx_id = try dtm.beginTransaction();
+try dtm.addStep(tx_id, "deductInventory", deductFn, compensateDeductFn);
+try dtm.addStep(tx_id, "chargePayment", chargeFn, compensateChargeFn);
+try dtm.execute(tx_id);
+```
+
 ## Testing
 
 Run the test suite:
@@ -338,10 +418,13 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [x] ~~Distributed event bus~~ ✅ Implemented  
 - [x] ~~Web interface for module monitoring~~ ✅ Implemented
 - [x] ~~Plugin system~~ ✅ Implemented
-- [ ] YAML/TOML configuration support
-- [ ] WebSocket support for real-time monitoring
-- [ ] Cluster membership service
-- [ ] Distributed transactions
+- [x] ~~YAML/TOML configuration support~~ ✅ Implemented
+- [x] ~~WebSocket support for real-time monitoring~~ ✅ Implemented
+- [x] ~~Cluster membership service~~ ✅ Implemented
+- [x] ~~Distributed transactions~~ ✅ Implemented
+- [ ] Raft consensus for cluster coordination
+- [ ] GraphQL API gateway
+- [ ] Service mesh integration
 
 ---
 

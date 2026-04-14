@@ -92,6 +92,11 @@ pub const ClusterConfig = @import("core/DistributedEventBus.zig").ClusterConfig;
 // Web Monitor (NEW)
 pub const WebMonitor = @import("core/WebMonitor.zig").WebMonitor;
 
+// WebSocket (NEW)
+pub const WebSocketServer = @import("core/WebSocket.zig").WebSocketServer;
+pub const WebSocketClient = @import("core/WebSocket.zig").WebSocketClient;
+pub const WebSocketMonitor = @import("core/WebSocket.zig").WebSocketMonitor;
+
 // Plugin System (NEW)
 pub const PluginManager = @import("core/PluginManager.zig").PluginManager;
 pub const PluginManifest = @import("core/PluginManager.zig").PluginManifest;
@@ -100,6 +105,17 @@ pub const PluginManifest = @import("core/PluginManager.zig").PluginManifest;
 pub const HotReloader = @import("core/HotReloader.zig").HotReloader;
 pub const ReloadStrategy = @import("core/HotReloader.zig").ReloadStrategy;
 pub const ModuleSnapshot = @import("core/HotReloader.zig").ModuleSnapshot;
+
+// Cluster Membership (NEW)
+pub const ClusterMembership = @import("core/ClusterMembership.zig").ClusterMembership;
+
+// Distributed Transactions (NEW)
+pub const DistributedTransactionManager = @import("core/DistributedTransaction.zig").DistributedTransactionManager;
+pub const TwoPhaseCommit = @import("core/DistributedTransaction.zig").TwoPhaseCommit;
+
+// Config Parsers (NEW)
+pub const YamlParser = @import("config/YamlToml.zig").YamlParser;
+pub const TomlParser = @import("config/YamlToml.zig").TomlParser;
 
 // Tests
 test {
