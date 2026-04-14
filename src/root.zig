@@ -85,6 +85,22 @@ pub const LogRotator = @import("log/StructuredLogger.zig").LogRotator;
 // Re-export core types for convenience
 pub const Event = @import("core/Event.zig").Event;
 
+// Distributed Event Bus (NEW)
+pub const DistributedEventBus = @import("core/DistributedEventBus.zig").DistributedEventBus;
+pub const ClusterConfig = @import("core/DistributedEventBus.zig").ClusterConfig;
+
+// Web Monitor (NEW)
+pub const WebMonitor = @import("core/WebMonitor.zig").WebMonitor;
+
+// Plugin System (NEW)
+pub const PluginManager = @import("core/PluginManager.zig").PluginManager;
+pub const PluginManifest = @import("core/PluginManager.zig").PluginManifest;
+
+// Hot Reloading (NEW)
+pub const HotReloader = @import("core/HotReloader.zig").HotReloader;
+pub const ReloadStrategy = @import("core/HotReloader.zig").ReloadStrategy;
+pub const ModuleSnapshot = @import("core/HotReloader.zig").ModuleSnapshot;
+
 // Tests
 test {
     // Import all test files

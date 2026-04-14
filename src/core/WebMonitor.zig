@@ -1,0 +1,213 @@
+const std = @import("std");
+const Application = @import("../Application.zig").Application;
+const ApplicationModules = @import("Module.zig").ApplicationModules;
+const ModuleInfo = @import("Module.zig").ModuleInfo;
+
+/// Web interface for module monitoring
+/// Provides HTTP endpoints for viewing module status, metrics, and health
+pub const WebMonitor = struct {
+    const Self = @This();
+
+    allocator: std.mem.Allocator,
+    port: u16,
+    server: ?std.net.Server,
+    is_running: bool,
+    modules: ?*ApplicationModules,
+    buf: [8192]u8,
+
+    pub fn init(allocator: std.mem.Allocator, port: u16) Self {
+        return .{
+            .allocator = allocator,
+            .port = port,
+            .server = null,
+            .is_running = false,
+            .modules = null,
+            .buf = undefined,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.stop();
+    }
+
+    /// Start the web server
+    pub fn start(self: *Self, modules: *ApplicationModules) !void {
+        if (self.is_running) return;
+
+        self.modules = modules;
+
+        const address = try std.net.Address.parseIp4("0.0.0.0", self.port);
+        self.server = try std.net.Server.init(address, .{
+            .reuse_address = true,
+        });
+
+        self.is_running = true;
+        std.log.info("[WebMonitor] Server started on http://0.0.0.0:{d}", .{self.port});
+
+        // Start server loop
+        const thread = try std.Thread.spawn(.{}, serverLoop, .{self});
+        thread.detach();
+    }
+
+    pub fn stop(self: *Self) void {
+        self.is_running = false;
+        if (self.server) |*s| {
+            s.deinit();
+            self.server = null;
+        }
+    }
+
+    fn serverLoop(self: *Self) void {
+        while (self.is_running) {
+            if (self.server) |*s| {
+                const conn = s.accept() catch |err| {
+                    if (self.is_running) {
+                        std.log.err("[WebMonitor] Accept error: {}", .{err});
+                    }
+                    continue;
+                };
+
+                // Handle request
+                const thread = std.Thread.spawn(.{}, handleRequest, .{ self, conn }) catch |err| {
+                    std.log.err("[WebMonitor] Failed to spawn thread: {}", .{err});
+                    conn.stream.close();
+                    continue;
+                };
+                thread.detach();
+            }
+        }
+    }
+
+    fn handleRequest(self: *Self, conn: std.net.Server.Connection) void {
+        defer conn.stream.close();
+
+        var buf: [4096]u8 = undefined;
+        const bytes_read = conn.stream.read(&buf) catch |err| {
+            std.log.err("[WebMonitor] Read error: {}", .{err});
+            return;
+        };
+
+        if (bytes_read == 0) return;
+
+        const request = buf[0..bytes_read];
+
+        // Simple HTTP parsing
+        var lines = std.mem.split(u8, request, "\r\n");
+        const first_line = lines.first();
+
+        var parts = std.mem.split(u8, first_line, " ");
+        _ = parts.first(); // method (GET, POST, etc.)
+        const path = parts.next() orelse "/";
+
+        // Route request
+        if (std.mem.eql(u8, path, "/")) {
+            self.handleIndex(conn.stream);
+        } else if (std.mem.eql(u8, path, "/api/modules")) {
+            self.handleModules(conn.stream);
+        } else if (std.mem.eql(u8, path, "/api/health")) {
+            self.handleHealth(conn.stream);
+        } else if (std.mem.eql(u8, path, "/api/metrics")) {
+            self.handleMetrics(conn.stream);
+        } else {
+            self.handle404(conn.stream);
+        }
+    }
+
+    fn handleIndex(self: *Self, stream: std.net.Stream) void {
+        _ = self;
+        const html =
+            \\u003c!DOCTYPE html>
+            \\u003chtml>
+            \\u003chead>
+            \\    <title>ZigModu Monitor</title>
+            \\    <style>
+            \\        body { font-family: sans-serif; margin: 40px; }
+            \\        h1 { color: #333; }
+            \\        .endpoint { background: #f5f5f5; padding: 10px; margin: 10px 0; border-radius: 5px; }
+            \\        code { background: #e0e0e0; padding: 2px 6px; border-radius: 3px; }
+            \\    </style>
+            \\u003c/head>
+            \\u003cbody>
+            \\    <h1>ZigModu Module Monitor</h1>
+            \\    <p>Real-time monitoring interface for ZigModu framework</p>
+            \\    
+            \\    <h2>API Endpoints</h2>
+            \\    <div class="endpoint">
+            \\        <code>GET /api/modules</code> - List all modules
+            \\    </div>
+            \\    <div class="endpoint">
+            \\        <code>GET /api/health</code> - System health check
+            \\    </div>
+            \\    <div class="endpoint">
+            \\        <code>GET /api/metrics</code> - System metrics
+            \\    </div>
+            \\u003c/body>
+            \\u003c/html>
+        ;
+
+        var response_buf: [2048]u8 = undefined;
+        const response = std.fmt.bufPrint(&response_buf, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {d}\r\n\r\n{s}", .{ html.len, html }) catch return;
+
+        _ = stream.write(response) catch {};
+    }
+
+    fn handleModules(self: *Self, stream: std.net.Stream) void {
+        var json = std.ArrayList(u8).init(self.allocator);
+        defer json.deinit();
+
+        json.appendSlice("{\"modules\":[\"") catch return;
+
+        if (self.modules) |modules| {
+            var first = true;
+            var iter = modules.modules.iterator();
+            while (iter.next()) |entry| {
+                if (!first) json.appendSlice(",\"") catch return;
+                first = false;
+
+                var mod_buf: [512]u8 = undefined;
+                const module_json = std.fmt.bufPrint(&mod_buf, "{{\"name\":\"{s}\",\"description\":\"{s}\"}}", .{ entry.key_ptr.*, entry.value_ptr.info.description }) catch continue;
+
+                json.appendSlice(module_json) catch continue;
+            }
+        }
+
+        json.appendSlice("]}") catch return;
+
+        var response_buf: [8192]u8 = undefined;
+        const response = std.fmt.bufPrint(&response_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ json.items.len, json.items }) catch return;
+
+        _ = stream.write(response) catch {};
+    }
+
+    fn handleHealth(self: *Self, stream: std.net.Stream) void {
+        _ = self;
+        const json = "{\"status\":\"healthy\",\"timestamp\":0}";
+
+        var response_buf: [256]u8 = undefined;
+        const response = std.fmt.bufPrint(&response_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ json.len, json }) catch return;
+
+        _ = stream.write(response) catch {};
+    }
+
+    fn handleMetrics(self: *Self, stream: std.net.Stream) void {
+        var response_buf: [1024]u8 = undefined;
+
+        const module_count = if (self.modules) |m| m.modules.count() else 0;
+
+        const json = std.fmt.bufPrint(&response_buf, "{{\"module_count\":{d},\"uptime\":0,\"memory_usage\":0}}", .{module_count}) catch return;
+
+        const response = std.fmt.bufPrint(&response_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ json.len, json }) catch return;
+
+        _ = stream.write(response) catch {};
+    }
+
+    fn handle404(self: *Self, stream: std.net.Stream) void {
+        _ = self;
+        const body = "Not Found";
+
+        var response_buf: [256]u8 = undefined;
+        const response = std.fmt.bufPrint(&response_buf, "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch return;
+
+        _ = stream.write(response) catch {};
+    }
+};
