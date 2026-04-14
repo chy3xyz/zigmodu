@@ -128,25 +128,27 @@ pub const ModuleContract = struct {
     /// 契约验证结果
     pub const ValidationResult = struct {
         valid: bool,
-        errors: std.ArrayList([]const u8),
+        errors: std.array_list.Managed([]const u8),
 
         pub fn init(allocator: std.mem.Allocator) ValidationResult {
             return .{
                 .valid = true,
-                .errors = std.ArrayList([]const u8).init(allocator),
+                .errors = std.array_list.Managed([]const u8).init(allocator),
             };
         }
 
         pub fn deinit(self: *ValidationResult) void {
+            const allocator = self.errors.allocator;
             for (self.errors.items) |err| {
-                self.errors.allocator.free(err);
+                allocator.free(err);
             }
             self.errors.deinit();
         }
 
         pub fn addError(self: *ValidationResult, msg: []const u8) !void {
             self.valid = false;
-            const copy = try self.errors.allocator.dupe(u8, msg);
+            const allocator = self.errors.allocator;
+            const copy = try allocator.dupe(u8, msg);
             try self.errors.append(copy);
         }
     };
@@ -200,7 +202,8 @@ pub const ModuleContract = struct {
 
     /// 生成PlantUML组件图描述
     pub fn generatePlantUml(self: *const Self, allocator: std.mem.Allocator) ![]u8 {
-        var buf = std.ArrayList(u8).init(allocator);
+        var buf = std.array_list.Managed(u8).init(allocator);
+        defer buf.deinit();
         const writer = buf.writer();
 
         try writer.print("component \"{s}\" as {s} {{\n", .{ self.name, self.name });
@@ -348,7 +351,8 @@ pub const ContractRegistry = struct {
 
     /// 生成所有契约的PlantUML图
     pub fn generatePlantUmlDiagram(self: *Self, allocator: std.mem.Allocator) ![]u8 {
-        var buf = std.ArrayList(u8).init(allocator);
+        var buf = std.array_list.Managed(u8).init(allocator);
+        defer buf.deinit();
         const writer = buf.writer();
 
         try writer.writeAll("@startuml\n");

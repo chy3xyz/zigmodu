@@ -72,7 +72,14 @@ pub const StructuredLogger = struct {
             .message = message,
             .fields = std.StringHashMap([]const u8).init(self.allocator),
         };
-        defer entry.fields.deinit();
+        defer {
+            var fields_iter = entry.fields.iterator();
+            while (fields_iter.next()) |f| {
+                self.allocator.free(f.key_ptr.*);
+                self.allocator.free(f.value_ptr.*);
+            }
+            entry.fields.deinit();
+        }
 
         // 添加上下文字段
         var ctx_iter = self.context.iterator();
@@ -84,8 +91,8 @@ pub const StructuredLogger = struct {
 
         // 添加参数字段
         const fields_info = @typeInfo(@TypeOf(fields));
-        if (fields_info == .Struct and fields_info.Struct.is_tuple == false) {
-            inline for (fields_info.Struct.fields) |field| {
+        if (fields_info == .@"struct" and fields_info.@"struct".is_tuple == false) {
+            inline for (fields_info.@"struct".fields) |field| {
                 const key = field.name;
                 const value = @field(fields, field.name);
                 const value_str = try std.fmt.allocPrint(self.allocator, "{any}", .{value});
@@ -101,8 +108,8 @@ pub const StructuredLogger = struct {
         // 1. 日志系统本身不应该因为输出失败而崩溃
         // 2. 无法通过日志记录日志失败
         switch (self.output) {
-            .stdout => std.io.getStdOut().writeAll(json) catch {},
-            .stderr => std.io.getStdErr().writeAll(json) catch {},
+            .stdout => std.fs.File.stdout().writeAll(json) catch {},
+            .stderr => std.fs.File.stderr().writeAll(json) catch {},
             .file => |file| file.writeAll(json) catch {},
         }
     }
@@ -207,7 +214,8 @@ const LogEntry = struct {
     fields: std.StringHashMap([]const u8),
 
     pub fn toJson(self: LogEntry, allocator: std.mem.Allocator) ![]const u8 {
-        var buf = std.ArrayList(u8).init(allocator);
+        var buf = std.array_list.Managed(u8).init(allocator);
+        defer buf.deinit();
         const writer = buf.writer();
 
         try writer.writeAll("{");
@@ -229,7 +237,14 @@ const LogEntry = struct {
 test "StructuredLogger basic" {
     const allocator = std.testing.allocator;
 
-    var logger = StructuredLogger.init(allocator, .INFO, .stdout);
+    // Use a temp file instead of stdout to avoid corrupting test runner protocol
+    const tmp_file = try std.fs.cwd().createFile("zigmodu_test_log.tmp", .{});
+    defer {
+        tmp_file.close();
+        std.fs.cwd().deleteFile("zigmodu_test_log.tmp") catch {};
+    }
+
+    var logger = StructuredLogger.init(allocator, .INFO, .{ .file = tmp_file });
     defer logger.deinit();
 
     try logger.withField("app", "test");

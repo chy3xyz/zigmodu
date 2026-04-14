@@ -39,3 +39,47 @@ pub fn scanModules(allocator: std.mem.Allocator, comptime modules: anytype) !App
     }
     return app_modules;
 }
+
+test "scanModules extracts metadata" {
+    const allocator = std.testing.allocator;
+
+    const MockModule = struct {
+        pub const info = @import("../api/Module.zig").Module{
+            .name = "mock",
+            .description = "Mock module for testing",
+            .dependencies = &.{"dep1"},
+        };
+
+        pub fn init() !void {}
+        pub fn deinit() void {}
+    };
+
+    var modules = try scanModules(allocator, .{MockModule});
+    defer modules.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), modules.modules.count());
+    const info = modules.get("mock").?;
+    try std.testing.expectEqualStrings("mock", info.name);
+    try std.testing.expectEqualStrings("Mock module for testing", info.desc);
+    try std.testing.expectEqual(@as(usize, 1), info.deps.len);
+    try std.testing.expectEqualStrings("dep1", info.deps[0]);
+}
+
+test "scanModules optional init/deinit" {
+    const allocator = std.testing.allocator;
+
+    const NoLifecycle = struct {
+        pub const info = @import("../api/Module.zig").Module{
+            .name = "nolife",
+            .description = "No lifecycle",
+            .dependencies = &.{},
+        };
+    };
+
+    var modules = try scanModules(allocator, .{NoLifecycle});
+    defer modules.deinit();
+
+    const info = modules.get("nolife").?;
+    try std.testing.expect(info.init_fn == null);
+    try std.testing.expect(info.deinit_fn == null);
+}

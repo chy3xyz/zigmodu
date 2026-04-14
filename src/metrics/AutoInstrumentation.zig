@@ -1,6 +1,6 @@
 const std = @import("std");
-const PrometheusMetrics = @import("../metrics/PrometheusMetrics.zig");
-const DistributedTracer = @import("../tracing/DistributedTracer.zig");
+const PrometheusMetrics = @import("PrometheusMetrics.zig").PrometheusMetrics;
+const DistributedTracer = @import("../tracing/DistributedTracer.zig").DistributedTracer;
 
 /// 自动埋点器
 /// 自动为模块生命周期、事件处理、API调用等创建指标和链路追踪
@@ -177,7 +177,7 @@ pub const AutoInstrumentation = struct {
             span.status = .OK;
         }
 
-        try span.addEvent(self.allocator, "api_request_complete");
+        span.addEvent(self.allocator, "api_request_complete") catch {};
         self.tracer.endSpan(span);
 
         std.log.info("[AutoInstrumentation] API调用完成，耗时: {d:.3}s，状态: {s}", .{
@@ -257,7 +257,7 @@ pub const InstrumentedLifecycleListener = struct {
     /// 模块初始化前调用
     pub fn onModuleInitStart(self: *Self, module_name: []const u8) !void {
         const start_time = std.time.nanoTimestamp();
-        try self.module_init_times.put(module_name, start_time);
+        try self.module_init_times.put(module_name, @intCast(start_time));
 
         std.log.info("[LifecycleListener] 模块 {s} 开始初始化", .{module_name});
     }

@@ -150,3 +150,30 @@ pub fn TypedEventBus(comptime T: type) type {
         }
     };
 }
+
+test "TypedEventBus subscribe publish unsubscribe" {
+    const allocator = std.testing.allocator;
+
+    const Event = struct {
+        value: i32,
+    };
+
+    var bus = TypedEventBus(Event).init(allocator);
+    defer bus.deinit();
+
+    const Ctx = struct {
+        var received: i32 = 0;
+        fn cb(event: Event) void {
+            received = event.value;
+        }
+    };
+
+    try bus.subscribe(Ctx.cb);
+    try std.testing.expectEqual(@as(usize, 1), bus.subscriberCount());
+
+    bus.publish(.{ .value = 42 });
+    try std.testing.expectEqual(@as(i32, 42), Ctx.received);
+
+    bus.unsubscribe(Ctx.cb);
+    try std.testing.expectEqual(@as(usize, 0), bus.subscriberCount());
+}

@@ -58,3 +58,26 @@ pub const ApplicationModules = struct {
         self.modules.deinit();
     }
 };
+
+test "ModuleInfo init" {
+    const info = ModuleInfo.init("order", "Order module", &.{"inventory"}, undefined);
+    try std.testing.expectEqualStrings("order", info.name);
+    try std.testing.expectEqualStrings("Order module", info.desc);
+    try std.testing.expectEqual(@as(usize, 1), info.deps.len);
+    try std.testing.expectEqualStrings("inventory", info.deps[0]);
+}
+
+test "ApplicationModules register and get" {
+    const allocator = std.testing.allocator;
+    var app = ApplicationModules.init(allocator);
+    defer app.deinit();
+
+    const info = ModuleInfo.init("user", "User module", &.{}, undefined);
+    try app.register(info);
+
+    const retrieved = app.get("user").?;
+    try std.testing.expectEqualStrings("user", retrieved.name);
+    try std.testing.expectEqualStrings("User module", retrieved.desc);
+    try std.testing.expect(app.getPtr("user") != null);
+    try std.testing.expect(app.get("nonexistent") == null);
+}

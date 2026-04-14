@@ -8,7 +8,7 @@ pub const Benchmark = struct {
 
     allocator: std.mem.Allocator,
     name: []const u8,
-    results: std.ArrayList(BenchmarkResult),
+    results: std.array_list.Managed(BenchmarkResult),
     config: Config,
 
     /// 基准测试配置
@@ -38,7 +38,7 @@ pub const Benchmark = struct {
     /// 基准测试结果
     pub const BenchmarkResult = struct {
         name: []const u8,
-        runs: std.ArrayList(RunResult),
+        runs: std.array_list.Managed(RunResult),
 
         // 统计值
         mean_ns: f64 = 0,
@@ -122,11 +122,11 @@ pub const Benchmark = struct {
     };
 
     /// 创建新的基准测试
-    pub fn init(allocator: std.mem.Allocator, name: []const u8, config: Config) Self {
+    pub fn init(allocator: std.mem.Allocator, name: []const u8, config: Config) !Self {
         return .{
             .allocator = allocator,
             .name = try allocator.dupe(u8, name),
-            .results = std.ArrayList(BenchmarkResult).init(allocator),
+            .results = std.array_list.Managed(BenchmarkResult).init(allocator),
             .config = config,
         };
     }
@@ -136,6 +136,7 @@ pub const Benchmark = struct {
         self.allocator.free(self.name);
 
         for (self.results.items) |*result| {
+            self.allocator.free(result.name);
             result.runs.deinit();
         }
         self.results.deinit();
@@ -146,7 +147,7 @@ pub const Benchmark = struct {
         _ = BenchFn;
         var result = BenchmarkResult{
             .name = try self.allocator.dupe(u8, bench_name),
-            .runs = std.ArrayList(RunResult).init(self.allocator),
+            .runs = std.array_list.Managed(RunResult).init(self.allocator),
         };
         errdefer {
             result.runs.deinit();
@@ -232,7 +233,8 @@ pub const Benchmark = struct {
 
     /// 生成完整报告
     pub fn generateReport(self: *Self) ![]const u8 {
-        var buf = std.ArrayList(u8).init(self.allocator);
+        var buf = std.array_list.Managed(u8).init(self.allocator);
+        defer buf.deinit();
         const writer = buf.writer();
 
         try writer.print("# Benchmark Report: {s}\n\n", .{self.name});
@@ -403,13 +405,13 @@ pub const BenchmarkSuite = struct {
 
     allocator: std.mem.Allocator,
     name: []const u8,
-    benchmarks: std.ArrayList(*Benchmark),
+    benchmarks: std.array_list.Managed(*Benchmark),
 
-    pub fn init(allocator: std.mem.Allocator, name: []const u8) Self {
+    pub fn init(allocator: std.mem.Allocator, name: []const u8) !Self {
         return .{
             .allocator = allocator,
             .name = try allocator.dupe(u8, name),
-            .benchmarks = std.ArrayList(*Benchmark).init(allocator),
+            .benchmarks = std.array_list.Managed(*Benchmark).init(allocator),
         };
     }
 
@@ -426,7 +428,7 @@ pub const BenchmarkSuite = struct {
     /// 添加基准测试
     pub fn addBenchmark(self: *Self, name: []const u8, config: Benchmark.Config) !*Benchmark {
         const bench = try self.allocator.create(Benchmark);
-        bench.* = Benchmark.init(self.allocator, name, config);
+        bench.* = try Benchmark.init(self.allocator, name, config);
         try self.benchmarks.append(bench);
         return bench;
     }
@@ -444,7 +446,8 @@ pub const BenchmarkSuite = struct {
 
     /// 生成汇总报告
     pub fn generateSummaryReport(self: *Self) ![]const u8 {
-        var buf = std.ArrayList(u8).init(self.allocator);
+        var buf = std.array_list.Managed(u8).init(self.allocator);
+        defer buf.deinit();
         const writer = buf.writer();
 
         try writer.print("# Benchmark Suite Report: {s}\n\n", .{self.name});
@@ -466,7 +469,7 @@ test "Benchmark basic" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var bench = Benchmark.init(allocator, "test_benchmark", .{
+    var bench = try Benchmark.init(allocator, "test_benchmark", .{
         .min_iterations = 5,
         .max_iterations = 10,
         .verbose = true,
@@ -502,11 +505,11 @@ test "BenchmarkScenarios" {
     const testing = std.testing;
 
     // 测试模块启动基准
-    const startup_bench = BenchmarkScenarios.ModuleStartupBenchmark{
+    var startup_bench = BenchmarkScenarios.ModuleStartupBenchmark{
         .module_name = "test_module",
         .init_fn = struct {
             fn init() !void {
-                std.time.sleep(1 * std.time.ns_per_ms);
+                std.Thread.sleep(1 * std.time.ns_per_ms);
             }
         }.init,
         .deinit_fn = struct {
@@ -522,7 +525,7 @@ test "BenchmarkSuite" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var suite = BenchmarkSuite.init(allocator, "test_suite");
+    var suite = try BenchmarkSuite.init(allocator, "test_suite");
     defer suite.deinit();
 
     const bench = try suite.addBenchmark("module_performance", .{

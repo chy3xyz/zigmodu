@@ -167,14 +167,13 @@ pub const IntegrationTest = struct {
         }
 
         pub fn deinit(self: *DatabaseTestContext, allocator: std.mem.Allocator) void {
+            _ = allocator;
             if (self.transaction_manager) |*tm| {
                 tm.deinit();
             }
 
-            var iter = self.data_sources.iterator();
-            while (iter.next()) |entry| {
-                allocator.destroy(entry.value_ptr.*);
-            }
+            // Note: values are *anyopaque so we cannot safely destroy them without type info.
+            // Callers must manage their own data source lifecycles.
             self.data_sources.deinit();
         }
 

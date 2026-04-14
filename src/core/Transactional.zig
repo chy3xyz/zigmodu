@@ -143,7 +143,7 @@ pub const Transactional = struct {
         fn shouldRollback(definition: Definition, err: anyerror) bool {
             // 默认情况下，所有错误都回滚
             _ = definition;
-            _ = err;
+            _ = @errorName(err);
             return true;
         }
     };
@@ -228,7 +228,7 @@ pub const Transactional = struct {
     /// 内存事务管理器（用于测试）
     pub const InMemoryTransactionManager = struct {
         const TMContext = struct {
-            transactions: std.ArrayList(Status),
+            transactions: std.array_list.Managed(Status),
             allocator: std.mem.Allocator,
         };
 
@@ -238,7 +238,7 @@ pub const Transactional = struct {
         pub fn init(allocator: std.mem.Allocator) !InMemoryTransactionManager {
             const ctx = try allocator.create(TMContext);
             ctx.* = .{
-                .transactions = std.ArrayList(Status).init(allocator),
+                .transactions = std.array_list.Managed(Status).init(allocator),
                 .allocator = allocator,
             };
 

@@ -69,7 +69,7 @@ pub const DistributedTracer = struct {
                 .start_time = std.time.nanoTimestamp(),
                 .end_time = null,
                 .attributes = std.StringHashMap([]const u8).init(allocator),
-                .events = std.ArrayList(SpanEvent).init(allocator),
+                .events = std.ArrayList(SpanEvent){},
                 .status = .UNSET,
             };
         }
@@ -83,7 +83,7 @@ pub const DistributedTracer = struct {
             }
             self.attributes.deinit();
 
-            for (self.events.items) |event| {
+            for (self.events.items) |*event| {
                 var attr_iter = event.attributes.iterator();
                 while (attr_iter.next()) |entry| {
                     allocator.free(entry.key_ptr.*);
@@ -118,7 +118,7 @@ pub const DistributedTracer = struct {
             .allocator = allocator,
             .tracer_name = try allocator.dupe(u8, tracer_name),
             .service_name = try allocator.dupe(u8, service_name),
-            .active_spans = std.ArrayList(*Span).init(allocator),
+            .active_spans = std.ArrayList(*Span){},
         };
     }
 
@@ -172,7 +172,7 @@ pub const DistributedTracer = struct {
     /// 导出为 Jaeger 格式
     pub fn exportJaeger(_self: *Self, span: *Span, allocator: std.mem.Allocator) ![]const u8 {
         _ = _self;
-        var buf = std.ArrayList(u8).init(allocator);
+        var buf = std.ArrayList(u8){};
         const writer = buf.writer(allocator);
 
         try writer.writeAll("{");
@@ -200,7 +200,7 @@ pub const DistributedTracer = struct {
 
     /// 导出为 Zipkin 格式
     pub fn exportZipkin(self: *Self, span: *Span, allocator: std.mem.Allocator) ![]const u8 {
-        var buf = std.ArrayList(u8).init(allocator);
+        var buf = std.ArrayList(u8){};
         const writer = buf.writer(allocator);
 
         try writer.writeAll("[");

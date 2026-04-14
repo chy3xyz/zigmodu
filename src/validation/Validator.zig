@@ -141,13 +141,13 @@ pub const Validator = struct {
     pub fn validate(self: *Self) ValidationResult {
         return .{
             .valid = self.errors.items.len == 0,
-            .errors = self.errors.toOwnedSlice(self.allocator),
+            .errors = self.errors.items,
         };
     }
 
     /// 批量验证对象
     pub fn validateObject(self: *Self, comptime T: type, obj: T) !ValidationResult {
-        inline for (@typeInfo(T).Struct.fields) |field| {
+        inline for (@typeInfo(T).@"struct".fields) |field| {
             const field_name = field.name;
             const field_value = @field(obj, field_name);
 
@@ -217,7 +217,6 @@ test "Validator - basic validation" {
     try validator.email("email", "john@example.com");
 
     const result = validator.validate();
-    defer allocator.free(result.errors);
 
     try std.testing.expect(result.isValid());
 }
@@ -232,7 +231,6 @@ test "Validator - validation errors" {
     try validator.email("email", "invalid-email");
 
     const result = validator.validate();
-    defer allocator.free(result.errors);
 
     try std.testing.expect(!result.isValid());
     try std.testing.expectEqual(@as(usize, 3), result.errors.len);

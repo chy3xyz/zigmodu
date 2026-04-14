@@ -49,4 +49,36 @@ pub fn build(b: *std.Build) void {
     });
     const run_lib_test = b.addRunArtifact(lib_test);
     test_step.dependOn(&run_lib_test.step);
+
+    // Benchmark step
+    const benchmark_mod = b.createModule(.{
+        .root_source_file = b.path("src/benchmark.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    benchmark_mod.addImport("zigmodu", zigmodu_mod);
+
+    const benchmark_exe = b.addExecutable(.{
+        .name = "benchmark",
+        .root_module = benchmark_mod,
+    });
+    const benchmark_run = b.addRunArtifact(benchmark_exe);
+    const benchmark_step = b.step("benchmark", "Run benchmarks");
+    benchmark_step.dependOn(&benchmark_run.step);
+
+    // Docs step
+    const docs_mod = b.createModule(.{
+        .root_source_file = b.path("src/docs.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    docs_mod.addImport("zigmodu", zigmodu_mod);
+
+    const docs_exe = b.addExecutable(.{
+        .name = "docs",
+        .root_module = docs_mod,
+    });
+    const docs_run = b.addRunArtifact(docs_exe);
+    const docs_step = b.step("docs", "Generate documentation");
+    docs_step.dependOn(&docs_run.step);
 }

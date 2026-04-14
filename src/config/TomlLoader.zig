@@ -25,8 +25,9 @@ pub const TomlLoader = struct {
     /// Parse TOML content
     fn parse(self: *Self, content: []const u8, config: *ConfigManager, prefix: []const u8) !void {
         _ = prefix;
-        var lines = std.mem.split(u8, content, "\n");
-        var current_section: []const u8 = "";
+        var lines = std.mem.splitSequence(u8, content, "\n");
+        var current_section: ?[]const u8 = null;
+        defer if (current_section) |s| self.allocator.free(s);
 
         while (lines.next()) |line| {
             const trimmed = std.mem.trim(u8, line, " \t\r");
@@ -34,6 +35,7 @@ pub const TomlLoader = struct {
             if (trimmed.len == 0 or trimmed[0] == '#') continue;
 
             if (trimmed[0] == '[') {
+                if (current_section) |s| self.allocator.free(s);
                 current_section = try self.parseSection(trimmed);
                 continue;
             }
@@ -42,8 +44,8 @@ pub const TomlLoader = struct {
                 const key = std.mem.trim(u8, trimmed[0..eq_pos], " \t");
                 const value = std.mem.trim(u8, trimmed[eq_pos + 1 ..], " \t");
 
-                const full_key = if (current_section.len > 0)
-                    try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ current_section, key })
+                const full_key = if (current_section) |section|
+                    try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ section, key })
                 else
                     try self.allocator.dupe(u8, key);
                 defer self.allocator.free(full_key);
@@ -75,6 +77,7 @@ pub const TomlLoader = struct {
         {
             const str = value[1 .. value.len - 1];
             const unescaped = try self.unescapeString(str);
+            defer self.allocator.free(unescaped);
             try config.set(key, .{ .string = unescaped });
             return;
         }
@@ -89,8 +92,7 @@ pub const TomlLoader = struct {
             return;
         } else |_| {}
 
-        const str_copy = try self.allocator.dupe(u8, value);
-        try config.set(key, .{ .string = str_copy });
+        try config.set(key, .{ .string = value });
     }
 
     fn unescapeString(self: *Self, str: []const u8) ![]const u8 {

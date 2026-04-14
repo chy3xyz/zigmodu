@@ -1,0 +1,19 @@
+@startuml
+!theme plain
+
+component [order] {
+  Order management
+}
+
+order --> inventory
+component [inventory] {
+  Inventory tracking
+}
+
+component [payment] {
+  Payment processing
+}
+
+payment --> order
+
+@enduml

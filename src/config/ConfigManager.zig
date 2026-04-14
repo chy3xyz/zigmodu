@@ -23,7 +23,7 @@ pub const ConfigManager = struct {
                     for (arr.items) |*item| {
                         item.deinit(allocator);
                     }
-                    arr.deinit();
+                    arr.deinit(allocator);
                 },
                 .object => |*obj| {
                     var iter = obj.iterator();
@@ -165,7 +165,13 @@ pub const ConfigManager = struct {
         }
 
         const key_copy = try self.allocator.dupe(u8, key);
-        try self.values.put(key_copy, value);
+        // Duplicate string value so ConfigManager owns the memory
+        var owned_value = value;
+        switch (owned_value) {
+            .string => |s| owned_value.string = try self.allocator.dupe(u8, s),
+            else => {},
+        }
+        try self.values.put(key_copy, owned_value);
     }
 
     /// Check if key exists

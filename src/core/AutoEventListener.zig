@@ -32,12 +32,16 @@ pub const AutoEventListener = struct {
         return name.len > 2 and
             name[0] == 'o' and
             name[1] == 'n' and
-            std.ascii.isUpper(name[2]);
+            name[2] >= 'A' and name[2] <= 'Z';
     }
 
     /// Get event type name from handler name (onOrderCreated -> OrderCreated)
     pub fn getEventTypeName(comptime handler_name: []const u8) []const u8 {
-        if (!isEventHandler(handler_name)) {
+        if (!(handler_name.len > 2 and
+            handler_name[0] == 'o' and
+            handler_name[1] == 'n' and
+            handler_name[2] >= 'A' and handler_name[2] <= 'Z'))
+        {
             @compileError("Invalid handler name: " ++ handler_name);
         }
         return handler_name[2..]; // Remove "on" prefix
@@ -49,7 +53,7 @@ pub fn EventListenerRegistry(comptime EventType: type) type {
     return struct {
         const Self = @This();
 
-        handlers: std.ArrayList(Handler),
+        handlers: std.array_list.Managed(Handler),
         allocator: std.mem.Allocator,
 
         pub const Handler = struct {
@@ -60,7 +64,7 @@ pub fn EventListenerRegistry(comptime EventType: type) type {
 
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
-                .handlers = std.ArrayList(Handler).init(allocator),
+                .handlers = std.array_list.Managed(Handler).init(allocator),
                 .allocator = allocator,
             };
         }
@@ -83,7 +87,7 @@ pub fn EventListenerRegistry(comptime EventType: type) type {
             });
 
             // Sort by priority (higher first)
-            std.sort.sort(Handler, self.handlers.items, {}, comptime struct {
+            std.sort.block(Handler, self.handlers.items, {}, comptime struct {
                 fn lessThan(_: void, a: Handler, b: Handler) bool {
                     return a.priority > b.priority;
                 }

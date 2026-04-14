@@ -21,18 +21,18 @@ pub fn validateModules(modules: *ApplicationModules) !void {
         const module = entry.value_ptr.*;
 
         if (module.name.len == 0) {
-            std.log.err("Module with empty name found", .{});
+            std.log.warn("Module with empty name found", .{});
             return ValidationError.InvalidModuleName;
         }
 
         for (module.deps) |dep| {
             if (std.mem.eql(u8, module.name, dep)) {
-                std.log.err("Module '{s}' depends on itself", .{module.name});
+                std.log.warn("Module '{s}' depends on itself", .{module.name});
                 return ValidationError.SelfDependency;
             }
 
             if (!modules.modules.contains(dep)) {
-                std.log.err("Module '{s}' is missing dependency: '{s}'", .{ module.name, dep });
+                std.log.warn("Module '{s}' is missing dependency: '{s}'", .{ module.name, dep });
                 return ValidationError.DependencyNotFound;
             }
         }
@@ -62,7 +62,7 @@ fn checkCircularDependencies(modules: *ApplicationModules) !void {
         path.clearRetainingCapacity();
 
         if (try hasCircularDependency(modules, module_name, &visited, &in_stack, &path)) {
-            std.log.err("Circular dependency detected: {s}", .{module_name});
+            std.log.warn("Circular dependency detected: {s}", .{module_name});
             return ValidationError.CircularDependency;
         }
     }
@@ -102,4 +102,57 @@ fn hasCircularDependency(
     }
 
     return false;
+}
+
+test "validateModules success" {
+    const allocator = std.testing.allocator;
+    var modules = ApplicationModules.init(allocator);
+    defer modules.deinit();
+
+    try modules.register(ModuleInfo.init("inventory", "Inventory", &.{}, undefined));
+    try modules.register(ModuleInfo.init("order", "Order", &.{"inventory"}, undefined));
+
+    try validateModules(&modules);
+}
+
+test "validateModules missing dependency" {
+    const allocator = std.testing.allocator;
+    var modules = ApplicationModules.init(allocator);
+    defer modules.deinit();
+
+    try modules.register(ModuleInfo.init("order", "Order", &.{"inventory"}, undefined));
+
+    const result = validateModules(&modules);
+    try std.testing.expectError(error.DependencyNotFound, result);
+}
+
+test "validateModules self dependency" {
+    const allocator = std.testing.allocator;
+    var modules = ApplicationModules.init(allocator);
+    defer modules.deinit();
+
+    try modules.register(ModuleInfo.init("order", "Order", &.{"order"}, undefined));
+
+    const result = validateModules(&modules);
+    try std.testing.expectError(error.SelfDependency, result);
+}
+
+test "validateModules circular dependency" {
+    const allocator = std.testing.allocator;
+    var modules = ApplicationModules.init(allocator);
+    defer modules.deinit();
+
+    try modules.register(ModuleInfo.init("a", "A", &.{"b"}, undefined));
+    try modules.register(ModuleInfo.init("b", "B", &.{"a"}, undefined));
+
+    const result = validateModules(&modules);
+    try std.testing.expectError(error.CircularDependency, result);
+}
+
+test "validateModules empty" {
+    const allocator = std.testing.allocator;
+    var modules = ApplicationModules.init(allocator);
+    defer modules.deinit();
+
+    try validateModules(&modules);
 }

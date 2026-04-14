@@ -38,12 +38,12 @@ pub const ModuleBoundary = struct {
             const init_fn = @field(T, "init");
             const init_info = @typeInfo(@TypeOf(init_fn));
 
-            if (init_info != .Fn) {
+            if (init_info != .@"fn") {
                 @compileError("Module 'init' must be a function");
             }
 
             // init 应该返回 !void
-            const return_type = init_info.Fn.return_type.?;
+            const return_type = init_info.@"fn".return_type.?;
             if (return_type != anyerror!void) {
                 compileWarn("Module 'init' should return '!void' for consistency");
             }
@@ -53,12 +53,11 @@ pub const ModuleBoundary = struct {
             const deinit_fn = @field(T, "deinit");
             const deinit_info = @typeInfo(@TypeOf(deinit_fn));
 
-            if (deinit_info != .Fn) {
+            if (deinit_info != .@"fn") {
                 @compileError("Module 'deinit' must be a function");
             }
 
-            // deinit 应该返回 void
-            const return_type = deinit_info.Fn.return_type.?;
+            const return_type = deinit_info.@"fn".return_type.?;
             if (return_type != void) {
                 @compileError("Module 'deinit' must return 'void'");
             }
@@ -164,6 +163,7 @@ test "ModuleBoundary validation" {
             .name = "valid_module",
             .desc = "A valid module",
             .deps = &.{},
+            .ptr = undefined,
         };
 
         pub fn init() !void {}

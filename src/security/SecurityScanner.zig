@@ -7,8 +7,8 @@ pub const SecurityScanner = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
-    rules: std.ArrayList(SecurityRule),
-    findings: std.ArrayList(SecurityFinding),
+    rules: std.array_list.Managed(SecurityRule),
+    findings: std.array_list.Managed(SecurityFinding),
     config: Config,
 
     /// 扫描配置
@@ -110,8 +110,8 @@ pub const SecurityScanner = struct {
     pub fn init(allocator: std.mem.Allocator, config: Config) Self {
         var scanner = Self{
             .allocator = allocator,
-            .rules = std.ArrayList(SecurityRule).init(allocator),
-            .findings = std.ArrayList(SecurityFinding).init(allocator),
+            .rules = std.array_list.Managed(SecurityRule).init(allocator),
+            .findings = std.array_list.Managed(SecurityFinding).init(allocator),
             .config = config,
         };
 
@@ -390,6 +390,7 @@ pub const DependencyScanner = struct {
     pub fn deinit(self: *Self) void {
         var iter = self.vulnerability_db.iterator();
         while (iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
             self.allocator.free(entry.value_ptr.id);
             self.allocator.free(entry.value_ptr.package_name);
             self.allocator.free(entry.value_ptr.affected_versions);
@@ -407,13 +408,30 @@ pub const DependencyScanner = struct {
             vuln.package_name,
             vuln.affected_versions,
         });
-        try self.vulnerability_db.put(key, vuln);
+        errdefer self.allocator.free(key);
+
+        const owned_vuln = Vulnerability{
+            .id = try self.allocator.dupe(u8, vuln.id),
+            .package_name = try self.allocator.dupe(u8, vuln.package_name),
+            .affected_versions = try self.allocator.dupe(u8, vuln.affected_versions),
+            .severity = vuln.severity,
+            .description = try self.allocator.dupe(u8, vuln.description),
+            .fix_version = if (vuln.fix_version) |v| try self.allocator.dupe(u8, v) else null,
+        };
+
+        try self.vulnerability_db.put(key, owned_vuln);
     }
 
     /// 检查依赖是否存在已知漏洞
     pub fn checkDependency(self: *Self, package_name: []const u8, version: []const u8) ?Vulnerability {
         _ = version;
-        return self.vulnerability_db.get(package_name);
+        var iter = self.vulnerability_db.iterator();
+        while (iter.next()) |entry| {
+            if (std.mem.eql(u8, entry.value_ptr.package_name, package_name)) {
+                return entry.value_ptr.*;
+            }
+        }
+        return null;
     }
 };
 
@@ -428,11 +446,11 @@ pub const SecurityConfigValidator = struct {
         validate_fn: *const fn () bool,
     };
 
-    checks: std.ArrayList(SecurityCheck),
+    checks: std.array_list.Managed(SecurityCheck),
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
-            .checks = std.ArrayList(SecurityCheck).init(allocator),
+            .checks = std.array_list.Managed(SecurityCheck).init(allocator),
         };
     }
 
@@ -449,7 +467,7 @@ pub const SecurityConfigValidator = struct {
     pub fn validateAll(self: *Self) ValidationResult {
         var result = ValidationResult{
             .passed = true,
-            .failed_checks = std.ArrayList([]const u8).init(self.checks.allocator),
+            .failed_checks = std.array_list.Managed([]const u8).init(self.checks.allocator),
         };
 
         for (self.checks.items) |check| {
@@ -464,7 +482,7 @@ pub const SecurityConfigValidator = struct {
 
     pub const ValidationResult = struct {
         passed: bool,
-        failed_checks: std.ArrayList([]const u8),
+        failed_checks: std.array_list.Managed([]const u8),
 
         pub fn deinit(self: *ValidationResult) void {
             self.failed_checks.deinit();
@@ -542,7 +560,7 @@ test "SecurityConfigValidator" {
         }.check,
     });
 
-    const result = validator.validateAll();
+    var result = validator.validateAll();
     defer result.deinit();
 
     try testing.expect(result.passed);

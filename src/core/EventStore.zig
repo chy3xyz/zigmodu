@@ -43,7 +43,7 @@ pub const EventStore = struct {
                 self.allocator.free(event.event_type);
                 self.allocator.free(event.event_data);
             }
-            entry.value_ptr.events.deinit();
+            entry.value_ptr.events.deinit(self.allocator);
             self.allocator.free(entry.key_ptr.*);
         }
         self.streams.deinit();

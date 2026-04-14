@@ -51,7 +51,13 @@ pub const DistributedTransactionManager = struct {
         var iter = self.transactions.iterator();
         while (iter.next()) |entry| {
             var tx = entry.value_ptr.*;
+            for (tx.steps.items) |step| {
+                self.allocator.free(step.name);
+            }
             tx.steps.deinit(self.allocator);
+            for (tx.compensations.items) |comp| {
+                self.allocator.free(comp.step_name);
+            }
             tx.compensations.deinit(self.allocator);
             self.allocator.free(tx.id);
         }
@@ -106,7 +112,7 @@ pub const DistributedTransactionManager = struct {
 
         for (tx.steps.items, 0..) |step, i| {
             step.action() catch |err| {
-                std.log.err("Step '{s}' failed in transaction '{s}': {s}", .{ step.name, tx_id, @errorName(err) });
+                std.log.warn("Step '{s}' failed in transaction '{s}': {s}", .{ step.name, tx_id, @errorName(err) });
 
                 // 标记失败的步骤
                 tx.steps.items[i].executed = true;
@@ -328,7 +334,7 @@ test "DistributedTransactionManager saga success" {
     defer dtm.deinit();
 
     const tx_id = try dtm.beginTransaction();
-    defer allocator.free(tx_id);
+    // tx_id is owned by DistributedTransactionManager, do not free here
 
     try dtm.addStep(tx_id, "step1", struct {
         fn action() !void {}
@@ -353,7 +359,7 @@ test "DistributedTransactionManager saga compensation" {
     defer dtm.deinit();
 
     const tx_id = try dtm.beginTransaction();
-    defer allocator.free(tx_id);
+    // tx_id is owned by DistributedTransactionManager, do not free here
 
     try dtm.addStep(tx_id, "step1", struct {
         fn action() !void {}

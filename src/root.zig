@@ -8,6 +8,7 @@ pub const validateModules = @import("core/ModuleValidator.zig").validateModules;
 pub const startAll = @import("core/Lifecycle.zig").startAll;
 pub const stopAll = @import("core/Lifecycle.zig").stopAll;
 pub const generateDocs = @import("core/Documentation.zig").generateDocs;
+pub const Documentation = @import("core/Documentation.zig");
 
 // Application
 pub const Application = @import("Application.zig").Application;

@@ -111,7 +111,7 @@ fn visitModule(
     result: *std.ArrayList([]const u8),
 ) !void {
     if (temp_mark.contains(module_name)) {
-        std.log.err("Circular dependency detected: {s}", .{module_name});
+        std.log.warn("Circular dependency detected: {s}", .{module_name});
         return LifecycleError.CircularDependency;
     }
 
@@ -129,4 +129,61 @@ fn visitModule(
     _ = temp_mark.remove(module_name);
     try visited.put(module_name, {});
     try result.append(modules.allocator, module_name);
+}
+
+test "startAll and stopAll order" {
+    const allocator = std.testing.allocator;
+    var modules = ApplicationModules.init(allocator);
+    defer modules.deinit();
+
+    const Ctx = struct {
+        var order: [3]u8 = undefined;
+        var idx: usize = 0;
+    };
+    Ctx.idx = 0;
+
+    const Base = struct {
+        pub const info = @import("../api/Module.zig").Module{
+            .name = "base",
+            .description = "Base",
+            .dependencies = &.{},
+        };
+        pub fn init() !void {
+            Ctx.order[Ctx.idx] = 'b';
+            Ctx.idx += 1;
+        }
+        pub fn deinit() void {}
+    };
+
+    const Middle = struct {
+        pub const info = @import("../api/Module.zig").Module{
+            .name = "middle",
+            .description = "Middle",
+            .dependencies = &.{"base"},
+        };
+        pub fn init() !void {
+            Ctx.order[Ctx.idx] = 'm';
+            Ctx.idx += 1;
+        }
+        pub fn deinit() void {}
+    };
+
+    const Top = struct {
+        pub const info = @import("../api/Module.zig").Module{
+            .name = "top",
+            .description = "Top",
+            .dependencies = &.{"middle"},
+        };
+        pub fn init() !void {
+            Ctx.order[Ctx.idx] = 't';
+            Ctx.idx += 1;
+        }
+        pub fn deinit() void {}
+    };
+
+    var scanned = try @import("ModuleScanner.zig").scanModules(allocator, .{ Top, Middle, Base });
+    defer scanned.deinit();
+
+    try startAll(&scanned);
+    try std.testing.expectEqualStrings("bmt", &Ctx.order);
 }

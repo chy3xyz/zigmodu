@@ -38,6 +38,7 @@ pub fn generateDocs(modules: *ApplicationModules, path: []const u8, allocator: s
 
 pub fn generateJsonDocs(modules: *ApplicationModules, allocator: std.mem.Allocator) ![]const u8 {
     var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
     const writer = buf.writer(allocator);
 
     try writer.writeAll("{\n");
@@ -70,6 +71,7 @@ pub fn generateJsonDocs(modules: *ApplicationModules, allocator: std.mem.Allocat
 
 pub fn generateMarkdownDocs(modules: *ApplicationModules, allocator: std.mem.Allocator) ![]const u8 {
     var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
     const writer = buf.writer(allocator);
 
     try writer.writeAll("# Module Documentation\n\n");
@@ -107,4 +109,34 @@ pub fn generateMarkdownDocs(modules: *ApplicationModules, allocator: std.mem.All
     }
 
     return buf.toOwnedSlice(allocator);
+}
+
+test "generateJsonDocs" {
+    const allocator = std.testing.allocator;
+    var modules = ApplicationModules.init(allocator);
+    defer modules.deinit();
+
+    try modules.register(ModuleInfo.init("order", "Order module", &.{"inventory"}, undefined));
+    try modules.register(ModuleInfo.init("inventory", "Inventory module", &.{}, undefined));
+
+    const json = try generateJsonDocs(&modules, allocator);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"name\": \"order\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"name\": \"inventory\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"dependencies\": [\"inventory\"]"));
+}
+
+test "generateMarkdownDocs" {
+    const allocator = std.testing.allocator;
+    var modules = ApplicationModules.init(allocator);
+    defer modules.deinit();
+
+    try modules.register(ModuleInfo.init("user", "User module", &.{}, undefined));
+
+    const md = try generateMarkdownDocs(&modules, allocator);
+    defer allocator.free(md);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, md, 1, "# Module Documentation"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, md, 1, "### user"));
 }

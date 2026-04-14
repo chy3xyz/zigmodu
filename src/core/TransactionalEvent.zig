@@ -25,14 +25,14 @@ pub const TransactionalEvent = struct {
         const TM = @This();
 
         allocator: std.mem.Allocator,
-        pending_events: std.ArrayList(TransactionalEvent),
-        committed_events: std.ArrayList(TransactionalEvent),
+        pending_events: std.array_list.Managed(TransactionalEvent),
+        committed_events: std.array_list.Managed(TransactionalEvent),
 
         pub fn init(allocator: std.mem.Allocator) TM {
             return .{
                 .allocator = allocator,
-                .pending_events = std.ArrayList(TransactionalEvent).init(allocator),
-                .committed_events = std.ArrayList(TransactionalEvent).init(allocator),
+                .pending_events = std.array_list.Managed(TransactionalEvent).init(allocator),
+                .committed_events = std.array_list.Managed(TransactionalEvent).init(allocator),
             };
         }
 
@@ -57,13 +57,13 @@ pub const TransactionalEvent = struct {
     /// Individual transaction
     pub const Transaction = struct {
         manager: *TransactionManager,
-        events: std.ArrayList(TransactionalEvent),
+        events: std.array_list.Managed(TransactionalEvent),
         state: State = .pending,
 
         pub fn init(manager: *TransactionManager) Transaction {
             return .{
                 .manager = manager,
-                .events = std.ArrayList(TransactionalEvent).init(manager.allocator),
+                .events = std.array_list.Managed(TransactionalEvent).init(manager.allocator),
                 .state = .pending,
             };
         }
@@ -109,7 +109,7 @@ pub const EventOutbox = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
-    storage: std.ArrayList(OutboxEntry),
+    storage: std.array_list.Managed(OutboxEntry),
 
     const OutboxEntry = struct {
         id: u64,
@@ -122,7 +122,7 @@ pub const EventOutbox = struct {
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
             .allocator = allocator,
-            .storage = std.ArrayList(OutboxEntry).init(allocator),
+            .storage = std.array_list.Managed(OutboxEntry).init(allocator),
         };
     }
 

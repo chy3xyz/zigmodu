@@ -359,5 +359,5 @@ test "TomlParser sections and arrays" {
 
     try std.testing.expectEqualStrings("0.0.0.0", map.get("server.host").?);
     try std.testing.expectEqualStrings("3000", map.get("server.port").?);
-    try std.testing.expectEqualStrings("\"hot_reload\", \"websockets\"", map.get("features").?);
+    try std.testing.expectEqualStrings("\"hot_reload\", \"websockets\"", map.get("server.features").?);
 }

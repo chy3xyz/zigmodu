@@ -64,8 +64,8 @@ pub const PrometheusMetrics = struct {
     pub const Histogram = struct {
         name: []const u8,
         help: []const u8,
-        buckets: std.ArrayList(f64),
-        counts: std.ArrayList(u64),
+        buckets: std.array_list.Managed(f64),
+        counts: std.array_list.Managed(u64),
         sum: f64 = 0.0,
         count: u64 = 0,
 
@@ -84,8 +84,8 @@ pub const PrometheusMetrics = struct {
     pub const Summary = struct {
         name: []const u8,
         help: []const u8,
-        quantiles: std.ArrayList(f64),
-        values: std.ArrayList(f64),
+        quantiles: std.array_list.Managed(f64),
+        values: std.array_list.Managed(f64),
         sum: f64 = 0.0,
         count: u64 = 0,
         max_age_seconds: u64 = 600,
@@ -189,12 +189,12 @@ pub const PrometheusMetrics = struct {
         const name_copy = try self.allocator.dupe(u8, name);
         const help_copy = try self.allocator.dupe(u8, help);
 
-        var bucket_list = std.ArrayList(f64).init(self.allocator);
-        var count_list = std.ArrayList(u64).init(self.allocator);
+        var bucket_list = std.array_list.Managed(f64).init(self.allocator);
+        var count_list = std.array_list.Managed(u64).init(self.allocator);
 
         for (buckets) |bucket| {
-            try bucket_list.append(self.allocator, bucket);
-            try count_list.append(self.allocator, 0);
+            try bucket_list.append(bucket);
+            try count_list.append(0);
         }
 
         const histogram = Histogram{
@@ -220,8 +220,9 @@ pub const PrometheusMetrics = struct {
 
     /// 生成 Prometheus 格式的指标输出
     pub fn toPrometheusFormat(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
-        var buf = std.ArrayList(u8).init(allocator);
-        const writer = buf.writer(allocator);
+        var buf = std.array_list.Managed(u8).init(allocator);
+        defer buf.deinit();
+        const writer = buf.writer();
 
         // Counters
         var counter_iter = self.counters.iterator();
@@ -256,7 +257,7 @@ pub const PrometheusMetrics = struct {
             try writer.print("{s}_count {d}\n\n", .{ hist.name, hist.count });
         }
 
-        return buf.toOwnedSlice(allocator);
+        return buf.toOwnedSlice();
     }
 
     /// 模块指标收集器
