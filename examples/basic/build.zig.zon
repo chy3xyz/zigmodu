@@ -13,4 +13,4 @@
         "build.zig.zon",
         "src",
     },
-}
+};
