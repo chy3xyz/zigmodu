@@ -102,10 +102,10 @@ pub const HealthEndpoint = struct {
 
     /// 生成JSON格式的健康报告
     pub fn toJson(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
-        var buf = std.ArrayList(u8).init(allocator);
+        var buf = std.ArrayList(u8){};
         const writer = buf.writer(allocator);
 
-        const health = self.checkHealth();
+        var health = self.checkHealth();
         defer health.components.deinit();
 
         try writer.writeAll("{\n");
@@ -188,3 +188,51 @@ pub const ReadinessProbe = struct {
         return .UP;
     }
 };
+
+test "HealthEndpoint register and check" {
+    const allocator = std.testing.allocator;
+    var endpoint = HealthEndpoint.init(allocator);
+    defer endpoint.deinit();
+
+    try endpoint.registerCheck("db", "Database health", HealthEndpoint.alwaysUp);
+    try endpoint.registerCheck("cache", "Cache health", HealthEndpoint.alwaysUp);
+
+    var details = endpoint.checkHealth();
+    defer details.components.deinit();
+
+    try std.testing.expectEqual(HealthEndpoint.HealthStatus.UP, details.status);
+    try std.testing.expect(details.components.get("db") != null);
+    try std.testing.expect(details.components.get("cache") != null);
+}
+
+test "HealthEndpoint DOWN status" {
+    const allocator = std.testing.allocator;
+    var endpoint = HealthEndpoint.init(allocator);
+    defer endpoint.deinit();
+
+    try endpoint.registerCheck("db", "Database health", HealthEndpoint.alwaysUp);
+    try endpoint.registerCheck("api", "API health", HealthEndpoint.alwaysDown);
+
+    var details = endpoint.checkHealth();
+    defer details.components.deinit();
+
+    try std.testing.expectEqual(HealthEndpoint.HealthStatus.DOWN, details.status);
+}
+
+test "HealthEndpoint toJson" {
+    const allocator = std.testing.allocator;
+    var endpoint = HealthEndpoint.init(allocator);
+    defer endpoint.deinit();
+
+    try endpoint.registerCheck("db", "Database OK", HealthEndpoint.alwaysUp);
+
+    const json = try endpoint.toJson(allocator);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.startsWith(u8, json, "{"));
+    try std.testing.expect(std.mem.indexOf(u8, json, "UP") != null);
+}
+
+test "LivenessProbe check" {
+    try std.testing.expectEqual(HealthEndpoint.HealthStatus.UP, LivenessProbe.check());
+}

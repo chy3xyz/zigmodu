@@ -20,8 +20,8 @@ ZigModu is a modular application framework for Zig 0.15.2 that brings the power 
 - 🌐 **Distributed Event Bus** - Cross-node event communication via TCP
 - 📝 **Auto Documentation** - Generate PlantUML diagrams from module structure
 - 💉 **Dependency Injection** - Simple DI container for service management
-- 🔌 **Plugin System** - Dynamic plugin loading framework
-- 🔄 **Hot Reloading** - File watching and module reloading
+- 🔌 **Plugin System (Experimental)** - Dynamic plugin loading framework
+- 🔄 **Hot Reloading (Experimental)** - File watching and module reloading
 - 🌐 **Web Monitor** - HTTP interface for module monitoring
 - ⚡ **Zero Runtime Overhead** - Compile-time module scanning
 - 🧪 **Testing Support** - Module-level testing utilities
@@ -134,7 +134,7 @@ my-app/
 - [event-driven](examples/event-driven/) - Event bus communication
 - [dependency-injection](examples/dependency-injection/) - DI container usage
 - [distributed-events](examples/distributed-events/) - Distributed event bus (NEW!)
-- [v2-showcase](examples/v2-showcase/) - v0.2.0 feature showcase: Simplified API, Distributed Event Bus, Web Monitor, Plugin System, Hot Reloading
+- [v2-showcase](examples/v2-showcase/) - v0.2.0 feature showcase: Simplified API, Distributed Event Bus, Web Monitor, Plugin System (Experimental), Hot Reloading (Experimental)
 - [metaverse-creative](examples/metaverse-creative/) - Complex modular application
 
 ## Documentation
@@ -241,7 +241,7 @@ try monitor.start(&modules);
 // GET /api/metrics    - System metrics
 ```
 
-### Plugin System
+### Plugin System (Experimental)
 
 Dynamic plugin loading framework:
 
@@ -264,7 +264,7 @@ if (plugins.isPluginEnabled("my-plugin")) {
 }
 ```
 
-### Hot Reloading
+### Hot Reloading (Experimental)
 
 Watch files for changes and reload modules:
 
@@ -309,7 +309,7 @@ const host = yaml_config.get("server.host");
 const db_url = toml_config.get("database.url");
 ```
 
-### WebSocket Real-Time Monitoring
+### WebSocket Real-Time Monitoring (Experimental)
 
 Push real-time updates to connected clients:
 
@@ -325,7 +325,7 @@ try ws.start(&modules);
 ws.ws_server.broadcast("{\"type\":\"metrics\",\"module_count\":5}");
 ```
 
-### Cluster Membership
+### Cluster Membership (Experimental)
 
 Gossip-based cluster membership with leader election:
 
@@ -343,7 +343,7 @@ if (cluster.isLeader()) {
 }
 ```
 
-### Distributed Transactions
+### Distributed Transactions (Experimental)
 
 Two-Phase Commit (2PC) and Saga pattern support:
 

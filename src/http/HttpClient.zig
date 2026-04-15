@@ -36,8 +36,8 @@ pub const HttpClient = struct {
             return .{
                 .allocator = allocator,
                 .max_connections = max_connections,
-                .idle_connections = std.ArrayList(Connection).init(allocator),
-                .active_connections = std.ArrayList(Connection).init(allocator),
+                .idle_connections = std.ArrayList(Connection){},
+                .active_connections = std.ArrayList(Connection){},
                 .mutex = std.Thread.Mutex{},
             };
         }
@@ -100,7 +100,7 @@ pub const HttpClient = struct {
 
             // 从活跃连接中移除
             for (self.active_connections.items, 0..) |active_conn, i| {
-                if (active_conn.stream == conn.stream) {
+                if (active_conn.stream != null and conn.stream != null and active_conn.stream.?.handle == conn.stream.?.handle) {
                     _ = self.active_connections.orderedRemove(i);
                     break;
                 }
@@ -326,3 +326,69 @@ pub const HttpClient = struct {
         return self.request(req);
     }
 };
+
+test "HttpClient RetryPolicy calculateDelay" {
+    const policy = HttpClient.RetryPolicy.default();
+    try std.testing.expectEqual(@as(u64, 100), policy.calculateDelay(0));
+    try std.testing.expectEqual(@as(u64, 200), policy.calculateDelay(1));
+    try std.testing.expectEqual(@as(u64, 400), policy.calculateDelay(2));
+}
+
+test "HttpClient ConnectionPool acquire and release" {
+    const allocator = std.testing.allocator;
+    var pool = HttpClient.ConnectionPool.init(allocator, 2);
+    defer pool.deinit();
+
+    // Acquire new connection
+    const conn = pool.acquire("127.0.0.1", 9999) catch |err| switch (err) {
+        error.ConnectionRefused => return error.SkipZigTest,
+        else => return err,
+    };
+    try std.testing.expectEqualStrings("127.0.0.1", conn.host);
+    try std.testing.expectEqual(@as(u16, 9999), conn.port);
+
+    // Release back to pool
+    pool.release(conn);
+
+    // Reacquire should reuse if alive
+    const conn2 = pool.acquire("127.0.0.1", 9999) catch |err| switch (err) {
+        error.ConnectionRefused => return error.SkipZigTest,
+        else => return err,
+    };
+    try std.testing.expectEqualStrings("127.0.0.1", conn2.host);
+    try std.testing.expectEqual(@as(u16, 9999), conn2.port);
+
+    pool.release(conn2);
+}
+
+test "HttpClient ConnectionPool exhaustion" {
+    const allocator = std.testing.allocator;
+    var pool = HttpClient.ConnectionPool.init(allocator, 1);
+    defer pool.deinit();
+
+    const conn = pool.acquire("127.0.0.1", 9999) catch |err| switch (err) {
+        error.ConnectionRefused => return error.SkipZigTest,
+        else => return err,
+    };
+    const result = pool.acquire("127.0.0.1", 9999);
+    try std.testing.expectError(error.PoolExhausted, result);
+
+    pool.release(conn);
+}
+
+test "HttpClient HttpRequest and HttpResponse" {
+    const allocator = std.testing.allocator;
+
+    var req = HttpClient.HttpRequest.init(allocator, "POST", "http://example.com/api");
+    defer req.deinit();
+    try req.setHeader("Content-Type", "application/json");
+    try req.setBody("{\"id\":1}");
+
+    try std.testing.expectEqualStrings("application/json", req.headers.get("Content-Type").?);
+    try std.testing.expectEqualStrings("{\"id\":1}", req.body.?);
+
+    var res = HttpClient.HttpResponse.init(allocator);
+    defer res.deinit();
+    res.status_code = 201;
+    try std.testing.expect(res.isSuccess());
+}

@@ -4,7 +4,7 @@ pub const EventLogger = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
-    events: std.ArrayListLoggedEvent,
+    events: std.ArrayList(LoggedEvent),
     max_events: usize,
 
     pub const LoggedEvent = struct {
@@ -70,32 +70,32 @@ pub const EventLogger = struct {
         }
     }
 
-    pub fn getEventsByType(self: *Self, event_type: []const u8) []LoggedEvent {
+    pub fn getEventsByType(self: *Self, event_type: []const u8) ![]LoggedEvent {
         var results = std.ArrayList(LoggedEvent){};
         for (self.events.items) |event| {
             if (std.mem.eql(u8, event.event_type, event_type)) {
-                results.append(self.allocator, event) catch {};
+                try results.append(self.allocator, event);
             }
         }
         return results.toOwnedSlice(self.allocator);
     }
 
-    pub fn getEventsByModule(self: *Self, source_module: []const u8) []LoggedEvent {
+    pub fn getEventsByModule(self: *Self, source_module: []const u8) ![]LoggedEvent {
         var results = std.ArrayList(LoggedEvent){};
         for (self.events.items) |event| {
             if (std.mem.eql(u8, event.source_module, source_module)) {
-                results.append(self.allocator, event) catch {};
+                try results.append(self.allocator, event);
             }
         }
         return results.toOwnedSlice(self.allocator);
     }
 
-    pub fn getEventsByCorrelationId(self: *Self, correlation_id: []const u8) []LoggedEvent {
+    pub fn getEventsByCorrelationId(self: *Self, correlation_id: []const u8) ![]LoggedEvent {
         var results = std.ArrayList(LoggedEvent){};
         for (self.events.items) |event| {
             if (event.correlation_id) |cid| {
                 if (std.mem.eql(u8, cid, correlation_id)) {
-                    results.append(self.allocator, event) catch {};
+                    try results.append(self.allocator, event);
                 }
             }
         }
@@ -120,13 +120,13 @@ pub const TestEventCollector = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
-    collected_events: std.ArrayList(anyopaque),
+    collected_events: std.ArrayList(*anyopaque),
     event_types: std.ArrayList([]const u8),
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
             .allocator = allocator,
-            .collected_events = std.ArrayList(anyopaque){},
+            .collected_events = std.ArrayList(*anyopaque){},
             .event_types = std.ArrayList([]const u8){},
         };
     }
@@ -140,7 +140,8 @@ pub const TestEventCollector = struct {
     }
 
     pub fn collect(self: *Self, event: anytype, event_type: []const u8) !void {
-        try self.collected_events.append(self.allocator, event);
+        const ptr: *anyopaque = @ptrCast(@constCast(&event));
+        try self.collected_events.append(self.allocator, ptr);
         try self.event_types.append(self.allocator, try self.allocator.dupe(u8, event_type));
     }
 
@@ -165,3 +166,64 @@ pub const TestEventCollector = struct {
         self.event_types.clearRetainingCapacity();
     }
 };
+
+test "EventLogger log and retrieve" {
+    const allocator = std.testing.allocator;
+    var logger = EventLogger.init(allocator, 10);
+    defer logger.deinit();
+
+    try logger.log("created", "order", "{\"id\":1}", "corr-1", null);
+    try logger.log("updated", "order", "{\"id\":2}", "corr-2", "corr-1");
+    try logger.log("created", "inventory", "{\"sku\":\"A\"}", null, null);
+
+    try std.testing.expectEqual(@as(usize, 3), logger.getEventCount());
+
+    const created_events = try logger.getEventsByType("created");
+    defer allocator.free(created_events);
+    try std.testing.expectEqual(@as(usize, 2), created_events.len);
+
+    const order_events = try logger.getEventsByModule("order");
+    defer allocator.free(order_events);
+    try std.testing.expectEqual(@as(usize, 2), order_events.len);
+
+    const corr_events = try logger.getEventsByCorrelationId("corr-1");
+    defer allocator.free(corr_events);
+    try std.testing.expectEqual(@as(usize, 1), corr_events.len);
+}
+
+test "EventLogger pruning" {
+    const allocator = std.testing.allocator;
+    var logger = EventLogger.init(allocator, 2);
+    defer logger.deinit();
+
+    try logger.log("evt", "mod", "1", null, null);
+    try logger.log("evt", "mod", "2", null, null);
+    try logger.log("evt", "mod", "3", null, null);
+
+    try std.testing.expectEqual(@as(usize, 2), logger.getEventCount());
+}
+
+test "EventLogger clear" {
+    const allocator = std.testing.allocator;
+    var logger = EventLogger.init(allocator, 10);
+    defer logger.deinit();
+
+    try logger.log("evt", "mod", "data", null, null);
+    logger.clear();
+    try std.testing.expectEqual(@as(usize, 0), logger.getEventCount());
+}
+
+test "TestEventCollector basic operations" {
+    const allocator = std.testing.allocator;
+    var collector = TestEventCollector.init(allocator);
+    defer collector.deinit();
+
+    try collector.collect(@as(u32, 42), "test-event");
+    try std.testing.expectEqual(@as(usize, 1), collector.getEventCount());
+    try std.testing.expect(collector.hasEvent("test-event"));
+    try std.testing.expect(!collector.hasEvent("other"));
+
+    collector.clear();
+    try std.testing.expectEqual(@as(usize, 0), collector.getEventCount());
+    try std.testing.expect(!collector.hasEvent("test-event"));
+}

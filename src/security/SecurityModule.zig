@@ -40,13 +40,13 @@ pub const SecurityModule = struct {
         /// 生成 JWT Token 字符串
         pub fn toString(self: JwtToken, allocator: std.mem.Allocator) ![]const u8 {
             // Base64 encode header
-            const header_json = try std.json.stringifyAlloc(allocator, self.header, .{});
+            const header_json = try std.json.Stringify.valueAlloc(allocator, self.header, .{});
             defer allocator.free(header_json);
             const header_b64 = try base64UrlEncode(allocator, header_json);
             defer allocator.free(header_b64);
 
             // Base64 encode payload
-            const payload_json = try std.json.stringifyAlloc(allocator, self.payload, .{});
+            const payload_json = try std.json.Stringify.valueAlloc(allocator, self.payload, .{});
             defer allocator.free(payload_json);
             const payload_b64 = try base64UrlEncode(allocator, payload_json);
             defer allocator.free(payload_b64);
@@ -80,12 +80,12 @@ pub const SecurityModule = struct {
         };
 
         // Create signature base
-        const header_json = try std.json.stringifyAlloc(self.allocator, header, .{});
+        const header_json = try std.json.Stringify.valueAlloc(self.allocator, header, .{});
         defer self.allocator.free(header_json);
         const header_b64 = try base64UrlEncode(self.allocator, header_json);
         defer self.allocator.free(header_b64);
 
-        const payload_json = try std.json.stringifyAlloc(self.allocator, payload, .{});
+        const payload_json = try std.json.Stringify.valueAlloc(self.allocator, payload, .{});
         defer self.allocator.free(payload_json);
         const payload_b64 = try base64UrlEncode(self.allocator, payload_json);
         defer self.allocator.free(payload_b64);
@@ -104,7 +104,7 @@ pub const SecurityModule = struct {
     /// 验证 JWT Token
     pub fn verifyToken(self: *Self, token_string: []const u8) !JwtToken.JwtPayload {
         // Split token
-        var parts = std.mem.split(u8, token_string, ".");
+        var parts = std.mem.splitSequence(u8, token_string, ".");
         const header_b64 = parts.next() orelse return error.InvalidToken;
         const payload_b64 = parts.next() orelse return error.InvalidToken;
         const signature = parts.next() orelse return error.InvalidToken;
@@ -116,7 +116,7 @@ pub const SecurityModule = struct {
         const expected_signature = try self.sign(signature_base);
         defer self.allocator.free(expected_signature);
 
-        if (!std.crypto.secure_eql(u8, signature, expected_signature)) {
+        if (!std.mem.eql(u8, signature, expected_signature)) {
             return error.InvalidSignature;
         }
 
@@ -124,16 +124,45 @@ pub const SecurityModule = struct {
         const payload_json = try base64UrlDecode(self.allocator, payload_b64);
         defer self.allocator.free(payload_json);
 
-        const payload = try std.json.parseFromSlice(JwtToken.JwtPayload, self.allocator, payload_json, .{});
-        defer std.json.parseFree(JwtToken.JwtPayload, self.allocator, payload);
+        const parsed = try std.json.parseFromSlice(JwtToken.JwtPayload, self.allocator, payload_json, .{});
+        defer parsed.deinit();
 
         // Check expiration
         const now = std.time.timestamp();
-        if (now > payload.exp) {
+        if (now > parsed.value.exp) {
             return error.TokenExpired;
         }
 
-        return payload;
+        // Copy to owned memory so caller doesn't depend on parsed lifetime
+        var roles = try self.allocator.alloc([]const u8, parsed.value.roles.len);
+        errdefer self.allocator.free(roles);
+        for (parsed.value.roles, 0..) |role, i| {
+            roles[i] = try self.allocator.dupe(u8, role);
+        }
+        errdefer {
+            for (roles) |role| {
+                self.allocator.free(role);
+            }
+        }
+
+        return JwtToken.JwtPayload{
+            .sub = try self.allocator.dupe(u8, parsed.value.sub),
+            .iss = try self.allocator.dupe(u8, parsed.value.iss),
+            .aud = try self.allocator.dupe(u8, parsed.value.aud),
+            .exp = parsed.value.exp,
+            .iat = parsed.value.iat,
+            .roles = roles,
+        };
+    }
+
+    pub fn freePayload(self: *Self, payload: JwtToken.JwtPayload) void {
+        self.allocator.free(payload.sub);
+        self.allocator.free(payload.iss);
+        self.allocator.free(payload.aud);
+        for (payload.roles) |role| {
+            self.allocator.free(role);
+        }
+        self.allocator.free(payload.roles);
     }
 
     /// HMAC-SHA256 签名
@@ -155,7 +184,7 @@ pub const SecurityModule = struct {
 
         // SAFETY: Buffer is immediately filled by pbkdf2() before use
         var derived_key: [32]u8 = undefined;
-        try crypto.kdf.pbkdf2.pbkdf2(
+        try crypto.pwhash.pbkdf2(
             &derived_key,
             password,
             &salt,
@@ -175,7 +204,7 @@ pub const SecurityModule = struct {
     /// 验证密码
     pub fn verifyPassword(self: *Self, password: []const u8, hash: []const u8) bool {
         // Parse hash
-        var parts = std.mem.split(u8, hash, "$");
+        var parts = std.mem.splitSequence(u8, hash, "$");
         _ = parts.next(); // empty
         _ = parts.next(); // pbkdf2
         _ = parts.next(); // iterations
@@ -187,7 +216,7 @@ pub const SecurityModule = struct {
 
         // SAFETY: Buffer is immediately filled by pbkdf2() before use
         var derived_key: [32]u8 = undefined;
-        crypto.kdf.pbkdf2.pbkdf2(
+        crypto.pwhash.pbkdf2(
             &derived_key,
             password,
             salt,
@@ -198,7 +227,7 @@ pub const SecurityModule = struct {
         const hash_b64 = base64Encode(self.allocator, &derived_key) catch return false;
         defer self.allocator.free(hash_b64);
 
-        return std.crypto.secure_eql(u8, hash_b64, expected_hash_b64);
+        return std.mem.eql(u8, hash_b64, expected_hash_b64);
     }
 
     /// 检查角色权限
@@ -234,9 +263,9 @@ pub const SecurityModule = struct {
 
 /// Base64 URL 编码 (JWT 标准)
 fn base64UrlEncode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
-    const encoded = try allocator.alloc(u8, std.base64.Base64Encoder.calcSize(data.len));
     const encoder = std.base64.Base64Encoder.init(std.base64.standard_alphabet_chars, '=');
-    encoder.encode(encoded, data);
+    const encoded = try allocator.alloc(u8, encoder.calcSize(data.len));
+    _ = encoder.encode(encoded, data);
 
     // Replace + with -, / with _, remove =
     for (encoded) |*c| {
@@ -271,8 +300,8 @@ fn base64UrlDecode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
         if (c.* == '_') c.* = '/';
     }
 
-    const decoded = try allocator.alloc(u8, std.base64.Base64Decoder.calcSizeForSlice(padded_data) catch return error.InvalidEncoding);
     const decoder = std.base64.Base64Decoder.init(std.base64.standard_alphabet_chars, '=');
+    const decoded = try allocator.alloc(u8, decoder.calcSizeForSlice(padded_data) catch return error.InvalidEncoding);
     try decoder.decode(decoded, padded_data);
 
     return decoded;
@@ -280,16 +309,69 @@ fn base64UrlDecode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
 
 /// 标准 Base64 编码
 fn base64Encode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
-    const encoded = try allocator.alloc(u8, std.base64.Base64Encoder.calcSize(data.len));
     const encoder = std.base64.Base64Encoder.init(std.base64.standard_alphabet_chars, '=');
-    encoder.encode(encoded, data);
+    const encoded = try allocator.alloc(u8, encoder.calcSize(data.len));
+    _ = encoder.encode(encoded, data);
     return encoded;
 }
 
 /// 标准 Base64 解码
 fn base64Decode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
-    const decoded = try allocator.alloc(u8, std.base64.Base64Decoder.calcSizeForSlice(data) catch return error.InvalidEncoding);
     const decoder = std.base64.Base64Decoder.init(std.base64.standard_alphabet_chars, '=');
+    const decoded = try allocator.alloc(u8, decoder.calcSizeForSlice(data) catch return error.InvalidEncoding);
     try decoder.decode(decoded, data);
     return decoded;
+}
+
+test "SecurityModule JWT generate and verify" {
+    const allocator = std.testing.allocator;
+    var sec = SecurityModule.init(allocator, "my-secret-key", 3600);
+
+    const token = try sec.generateToken("user-123", &.{ "admin", "user" });
+    defer allocator.free(token);
+
+    const payload = try sec.verifyToken(token);
+    defer sec.freePayload(payload);
+    try std.testing.expectEqualStrings("user-123", payload.sub);
+    try std.testing.expect(payload.exp > std.time.timestamp());
+}
+
+test "SecurityModule JWT invalid signature" {
+    const allocator = std.testing.allocator;
+    var sec = SecurityModule.init(allocator, "secret-a", 3600);
+
+    const token = try sec.generateToken("user-1", &.{});
+    defer allocator.free(token);
+
+    var sec2 = SecurityModule.init(allocator, "secret-b", 3600);
+    const result = sec2.verifyToken(token);
+    try std.testing.expectError(error.InvalidSignature, result);
+}
+
+test "SecurityModule password hash and verify" {
+    const allocator = std.testing.allocator;
+    var sec = SecurityModule.init(allocator, "secret", 3600);
+
+    const hash = try sec.hashPassword("my_password");
+    defer allocator.free(hash);
+
+    try std.testing.expect(sec.verifyPassword("my_password", hash));
+    try std.testing.expect(!sec.verifyPassword("wrong_password", hash));
+}
+
+test "SecurityModule role checking" {
+    const payload = SecurityModule.JwtToken.JwtPayload{
+        .sub = "user",
+        .iss = "zigmodu",
+        .aud = "app",
+        .exp = std.time.timestamp() + 3600,
+        .iat = std.time.timestamp(),
+        .roles = &.{ "admin", "user" },
+    };
+
+    try std.testing.expect(SecurityModule.hasRole(payload, "admin"));
+    try std.testing.expect(!SecurityModule.hasRole(payload, "guest"));
+    try std.testing.expect(SecurityModule.hasAnyRole(payload, &.{ "guest", "admin" }));
+    try std.testing.expect(SecurityModule.hasAllRoles(payload, &.{ "admin", "user" }));
+    try std.testing.expect(!SecurityModule.hasAllRoles(payload, &.{ "admin", "guest" }));
 }

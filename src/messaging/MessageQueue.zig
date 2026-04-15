@@ -46,7 +46,7 @@ pub const MessageQueue = struct {
             return .{
                 .allocator = allocator,
                 .backend = backend,
-                .topics = std.ArrayList([]const u8).init(allocator),
+                .topics = std.ArrayList([]const u8){},
             };
         }
 
@@ -85,7 +85,7 @@ pub const MessageQueue = struct {
 
         pub fn publish(self: *InMemoryBackend, msg: Message) !void {
             const queue = self.queues.getPtr(msg.topic) orelse blk: {
-                const new_queue = std.ArrayList(Message).init(self.allocator);
+                const new_queue = std.ArrayList(Message){};
                 try self.queues.put(msg.topic, new_queue);
                 break :blk self.queues.getPtr(msg.topic).?;
             };
@@ -123,3 +123,54 @@ pub const MessageQueue = struct {
         return Consumer.init(self.allocator, &self.backend);
     }
 };
+
+test "MessageQueue InMemoryBackend publish and consume" {
+    const allocator = std.testing.allocator;
+    var backend = MessageQueue.InMemoryBackend.init(allocator);
+    defer backend.deinit();
+
+    const msg = MessageQueue.Message{
+        .id = "msg-1",
+        .topic = "orders",
+        .payload = "{\"order_id\":123}",
+        .headers = std.StringHashMap([]const u8).init(allocator),
+        .timestamp = std.time.timestamp(),
+    };
+
+    try backend.publish(msg);
+    const consumed = try backend.consume("orders");
+    try std.testing.expect(consumed != null);
+    try std.testing.expectEqualStrings("msg-1", consumed.?.id);
+    try std.testing.expectEqualStrings("orders", consumed.?.topic);
+
+    const empty = try backend.consume("orders");
+    try std.testing.expect(empty == null);
+}
+
+test "MessageQueue Producer and Consumer" {
+    const allocator = std.testing.allocator;
+    var backend = MessageQueue.InMemoryBackend.init(allocator);
+    defer backend.deinit();
+
+    var mq = MessageQueue.init(allocator, .{ .in_memory = &backend });
+    var producer = mq.createProducer();
+    var consumer = mq.createConsumer();
+    defer consumer.deinit();
+
+    try consumer.subscribe("events");
+    try std.testing.expectEqual(@as(usize, 1), consumer.topics.items.len);
+    try std.testing.expectEqualStrings("events", consumer.topics.items[0]);
+
+    const msg = MessageQueue.Message{
+        .id = "evt-1",
+        .topic = "events",
+        .payload = "hello",
+        .headers = std.StringHashMap([]const u8).init(allocator),
+        .timestamp = std.time.timestamp(),
+    };
+
+    try producer.publish(msg);
+    const consumed = try backend.consume("events");
+    try std.testing.expect(consumed != null);
+    try std.testing.expectEqualStrings("hello", consumed.?.payload);
+}

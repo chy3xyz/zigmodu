@@ -66,7 +66,7 @@ pub const DistributedTracer = struct {
                 .span_id = span_id,
                 .parent_span_id = parent_span_id,
                 .name = try allocator.dupe(u8, name),
-                .start_time = std.time.nanoTimestamp(),
+                .start_time = @intCast(std.time.nanoTimestamp()),
                 .end_time = null,
                 .attributes = std.StringHashMap([]const u8).init(allocator),
                 .events = std.ArrayList(SpanEvent){},
@@ -84,6 +84,7 @@ pub const DistributedTracer = struct {
             self.attributes.deinit();
 
             for (self.events.items) |*event| {
+                allocator.free(event.name);
                 var attr_iter = event.attributes.iterator();
                 while (attr_iter.next()) |entry| {
                     allocator.free(entry.key_ptr.*);
@@ -103,13 +104,13 @@ pub const DistributedTracer = struct {
         pub fn addEvent(self: *Span, allocator: std.mem.Allocator, name: []const u8) !void {
             try self.events.append(allocator, .{
                 .name = try allocator.dupe(u8, name),
-                .timestamp = std.time.nanoTimestamp(),
+                .timestamp = @intCast(std.time.nanoTimestamp()),
                 .attributes = std.StringHashMap([]const u8).init(allocator),
             });
         }
 
         pub fn end(self: *Span) void {
-            self.end_time = std.time.nanoTimestamp();
+            self.end_time = @intCast(std.time.nanoTimestamp());
         }
     };
 
@@ -175,11 +176,18 @@ pub const DistributedTracer = struct {
         var buf = std.ArrayList(u8){};
         const writer = buf.writer(allocator);
 
+        const trace_id_str = try span.trace_id.toString(allocator);
+        defer allocator.free(trace_id_str);
+        const span_id_str = try span.span_id.toString(allocator);
+        defer allocator.free(span_id_str);
+
         try writer.writeAll("{");
-        try writer.print("\"traceID\":\"{s}\",", .{try span.trace_id.toString(allocator)});
-        try writer.print("\"spanID\":\"{s}\",", .{try span.span_id.toString(allocator)});
+        try writer.print("\"traceID\":\"{s}\",", .{trace_id_str});
+        try writer.print("\"spanID\":\"{s}\",", .{span_id_str});
         if (span.parent_span_id) |parent| {
-            try writer.print("\"parentSpanID\":\"{s}\",", .{try parent.toString(allocator)});
+            const parent_id_str = try parent.toString(allocator);
+            defer allocator.free(parent_id_str);
+            try writer.print("\"parentSpanID\":\"{s}\",", .{parent_id_str});
         }
         try writer.print("\"operationName\":\"{s}\",", .{span.name});
         try writer.print("\"startTime\":{d},", .{span.start_time});
@@ -203,10 +211,15 @@ pub const DistributedTracer = struct {
         var buf = std.ArrayList(u8){};
         const writer = buf.writer(allocator);
 
+        const trace_id_str = try span.trace_id.toString(allocator);
+        defer allocator.free(trace_id_str);
+        const span_id_str = try span.span_id.toString(allocator);
+        defer allocator.free(span_id_str);
+
         try writer.writeAll("[");
         try writer.writeAll("{");
-        try writer.print("\"traceId\":\"{s}\",", .{try span.trace_id.toString(allocator)});
-        try writer.print("\"id\":\"{s}\",", .{try span.span_id.toString(allocator)});
+        try writer.print("\"traceId\":\"{s}\",", .{trace_id_str});
+        try writer.print("\"id\":\"{s}\",", .{span_id_str});
         try writer.print("\"name\":\"{s}\",", .{span.name});
         try writer.print("\"timestamp\":{d},", .{@divFloor(span.start_time, 1000)});
         if (span.end_time) |et| {
@@ -259,3 +272,82 @@ pub const Sampler = struct {
         }
     };
 };
+
+test "DistributedTracer trace lifecycle" {
+    const allocator = std.testing.allocator;
+    var tracer = try DistributedTracer.init(allocator, "test-tracer", "test-service");
+    defer tracer.deinit();
+
+    const span = try tracer.startTrace("root-span");
+    try span.setAttribute(allocator, "http.method", "GET");
+    try span.addEvent(allocator, "request_started");
+
+    const child = try tracer.startSpan(span, "child-span");
+    child.end();
+    tracer.endSpan(child);
+    child.deinit(allocator);
+    allocator.destroy(child);
+
+    span.end();
+    tracer.endSpan(span);
+    span.deinit(allocator);
+    allocator.destroy(span);
+
+    try std.testing.expectEqual(@as(usize, 0), tracer.active_spans.items.len);
+}
+
+test "DistributedTracer export formats" {
+    const allocator = std.testing.allocator;
+    var tracer = try DistributedTracer.init(allocator, "test-tracer", "test-service");
+    defer tracer.deinit();
+
+    const span = try tracer.startTrace("export-span");
+    defer {
+        span.end();
+        tracer.endSpan(span);
+        span.deinit(allocator);
+        allocator.destroy(span);
+    }
+
+    const jaeger = try tracer.exportJaeger(span, allocator);
+    defer allocator.free(jaeger);
+    try std.testing.expect(std.mem.startsWith(u8, jaeger, "{"));
+
+    const zipkin = try tracer.exportZipkin(span, allocator);
+    defer allocator.free(zipkin);
+    try std.testing.expect(std.mem.startsWith(u8, zipkin, "["));
+}
+
+test "DistributedTracer context propagation" {
+    const allocator = std.testing.allocator;
+    var tracer = try DistributedTracer.init(allocator, "test-tracer", "test-service");
+    defer tracer.deinit();
+
+    const span = try tracer.startTrace("propagation-span");
+    defer {
+        span.end();
+        tracer.endSpan(span);
+        span.deinit(allocator);
+        allocator.destroy(span);
+    }
+
+    var headers = std.StringHashMap([]const u8).init(allocator);
+    defer headers.deinit();
+
+    try tracer.injectContext(span, &headers);
+    try std.testing.expect(headers.get("x-trace-id") != null);
+    try std.testing.expect(headers.get("x-span-id") != null);
+
+    const maybe_trace = tracer.extractContext(headers);
+    try std.testing.expect(maybe_trace != null);
+}
+
+test "Sampler" {
+    var sampler = Sampler.ProbabilitySampler{ .probability = 0.0 };
+    try std.testing.expect(!sampler.shouldSample());
+
+    sampler.probability = 1.0;
+    try std.testing.expect(sampler.shouldSample());
+
+    try std.testing.expect(Sampler.AlwaysOnSampler.shouldSample());
+}

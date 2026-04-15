@@ -71,3 +71,55 @@ pub const ModuleConfig = struct {
         return ConfigLoader.getBool(self.config, key);
     }
 };
+
+test "ConfigLoader load and get values" {
+    const allocator = std.testing.allocator;
+    var loader = ConfigLoader.init(allocator);
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const file = try tmp_dir.dir.createFile("test.json", .{});
+    try file.writeAll("{\"name\":\"zigmodu\",\"port\":8080,\"debug\":true}");
+    file.close();
+
+    const base_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base_path);
+    const path = try std.fs.path.join(allocator, &.{ base_path, "test.json" });
+    defer allocator.free(path);
+
+    const config = try loader.loadJson(path);
+    defer config.deinit();
+
+    try std.testing.expectEqualStrings("zigmodu", ConfigLoader.getString(config, "name").?);
+    try std.testing.expectEqual(@as(i64, 8080), ConfigLoader.getInt(config, "port").?);
+    try std.testing.expectEqual(true, ConfigLoader.getBool(config, "debug").?);
+    try std.testing.expect(ConfigLoader.getString(config, "missing") == null);
+}
+
+test "ModuleConfig wrapper" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const file = try tmp_dir.dir.createFile("module.json", .{});
+    try file.writeAll("{\"version\":\"1.0.0\"}");
+    file.close();
+
+    const base_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base_path);
+    const path = try std.fs.path.join(allocator, &.{ base_path, "module.json" });
+    defer allocator.free(path);
+
+    var loader = ConfigLoader.init(allocator);
+    const parsed = try loader.loadJson(path);
+
+    var module_config = ModuleConfig{
+        .module_name = "test-module",
+        .config = parsed,
+    };
+    defer module_config.deinit();
+
+    try std.testing.expectEqualStrings("1.0.0", module_config.getString("version").?);
+}

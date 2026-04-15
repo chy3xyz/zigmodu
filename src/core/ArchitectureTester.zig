@@ -39,15 +39,20 @@ pub const ArchitectureTester = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        for (self.violations.items) |v| {
+            self.allocator.free(v.message);
+        }
         self.violations.deinit(self.allocator);
     }
 
     /// 添加违规记录
     fn addViolation(self: *Self, rule_name: []const u8, module_name: []const u8, message: []const u8, severity: Severity) !void {
+        const msg_copy = try self.allocator.dupe(u8, message);
+        errdefer self.allocator.free(msg_copy);
         try self.violations.append(self.allocator, .{
             .rule_name = rule_name,
             .module_name = module_name,
-            .message = message,
+            .message = msg_copy,
             .severity = severity,
         });
     }
@@ -207,7 +212,6 @@ pub const ArchitectureTester = struct {
                     "Module has {d} dependencies, maximum recommended is {d}",
                     .{ module_info.deps.len, max_deps },
                 );
-                defer self.allocator.free(msg);
 
                 try self.addViolation(
                     "LimitedDependencies",
@@ -215,6 +219,7 @@ pub const ArchitectureTester = struct {
                     msg,
                     Severity.warning,
                 );
+                self.allocator.free(msg);
             }
         }
     }
@@ -243,7 +248,6 @@ pub const ArchitectureTester = struct {
                         "Base module should not depend on business module '{s}'",
                         .{dep},
                     );
-                    defer self.allocator.free(msg);
 
                     try self.addViolation(
                         "BaseModulesShouldNotDependOnOthers",
@@ -251,6 +255,7 @@ pub const ArchitectureTester = struct {
                         msg,
                         Severity.err,
                     );
+                    self.allocator.free(msg);
                 }
             }
         }
@@ -321,3 +326,90 @@ pub const ArchitectureTester = struct {
         return self.getViolationCountBySeverity(Severity.err) == 0;
     }
 };
+
+test "ArchitectureTester no violations" {
+    const allocator = std.testing.allocator;
+    var modules = ApplicationModules.init(allocator);
+    defer modules.deinit();
+
+    var order_mod: u8 = 0;
+    var inv_mod: u8 = 0;
+    try modules.register(ModuleInfo.init("order", "Order module", &.{"inventory"}, &order_mod));
+    try modules.register(ModuleInfo.init("inventory", "Inventory module", &.{}, &inv_mod));
+
+    var tester = ArchitectureTester.init(allocator, &modules);
+    defer tester.deinit();
+
+    try tester.ruleNoSelfDependency();
+    try std.testing.expectEqual(@as(usize, 0), tester.getViolationCount());
+}
+
+test "ArchitectureTester self dependency violation" {
+    const allocator = std.testing.allocator;
+    var modules = ApplicationModules.init(allocator);
+    defer modules.deinit();
+
+    var bad_mod: u8 = 0;
+    try modules.register(ModuleInfo.init("bad", "Bad module", &.{"bad"}, &bad_mod));
+
+    var tester = ArchitectureTester.init(allocator, &modules);
+    defer tester.deinit();
+
+    try tester.ruleNoSelfDependency();
+    try std.testing.expectEqual(@as(usize, 1), tester.getViolationCount());
+    try std.testing.expectEqual(@as(usize, 1), tester.getViolationCountBySeverity(Severity.err));
+}
+
+test "ArchitectureTester circular dependency violation" {
+    const allocator = std.testing.allocator;
+    var modules = ApplicationModules.init(allocator);
+    defer modules.deinit();
+
+    var a_mod: u8 = 0;
+    var b_mod: u8 = 0;
+    try modules.register(ModuleInfo.init("a", "A", &.{"b"}, &a_mod));
+    try modules.register(ModuleInfo.init("b", "B", &.{"a"}, &b_mod));
+
+    var tester = ArchitectureTester.init(allocator, &modules);
+    defer tester.deinit();
+
+    try tester.ruleNoCircularDependencies();
+    try std.testing.expect(tester.getViolationCount() > 0);
+}
+
+test "ArchitectureTester naming convention violation" {
+    const allocator = std.testing.allocator;
+    var modules = ApplicationModules.init(allocator);
+    defer modules.deinit();
+
+    var bad_mod: u8 = 0;
+    try modules.register(ModuleInfo.init("BadName", "Bad", &.{}, &bad_mod));
+
+    var tester = ArchitectureTester.init(allocator, &modules);
+    defer tester.deinit();
+
+    try tester.ruleModuleNamingConvention();
+    try std.testing.expect(tester.getViolationCount() > 0);
+}
+
+test "ArchitectureTester print report" {
+    const allocator = std.testing.allocator;
+    var modules = ApplicationModules.init(allocator);
+    defer modules.deinit();
+
+    var bad_mod: u8 = 0;
+    try modules.register(ModuleInfo.init("bad", "Bad", &.{"bad"}, &bad_mod));
+
+    var tester = ArchitectureTester.init(allocator, &modules);
+    defer tester.deinit();
+
+    try tester.ruleNoSelfDependency();
+
+    var buf = std.ArrayList(u8){};
+    const writer = buf.writer(allocator);
+    try tester.printReport(writer);
+    const report = try buf.toOwnedSlice(allocator);
+    defer allocator.free(report);
+
+    try std.testing.expect(std.mem.indexOf(u8, report, "Architecture Test Report") != null);
+}

@@ -279,11 +279,11 @@ pub const IntegrationTest = struct {
     }
 
     pub fn registerService(self: *Self, name: []const u8, service: *anyopaque, comptime T: type) !void {
-        try self.container.register(name, service, T);
+        try self.container.register(T, name, @ptrCast(@alignCast(service)));
     }
 
     pub fn getService(self: *Self, name: []const u8, comptime T: type) ?*T {
-        return self.container.get(name, T);
+        return self.container.get(T, name);
     }
 
     pub fn captureEvents(self: *Self, comptime EventType: type) !void {
@@ -376,7 +376,7 @@ pub const IntegrationTest = struct {
             if (@as(u64, @intCast(std.time.milliTimestamp() - start)) > timeout_ms) {
                 return error.Timeout;
             }
-            std.time.sleep(10 * std.time.ns_per_ms);
+            std.Thread.sleep(10 * std.time.ns_per_ms);
         }
     }
 
@@ -430,16 +430,16 @@ fn EventCapture(comptime T: type) type {
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
                 .allocator = allocator,
-                .events = std.ArrayList(T).init(allocator),
+                .events = std.ArrayList(T){},
             };
         }
 
         pub fn deinit(self: *Self) void {
-            self.events.deinit();
+            self.events.deinit(self.allocator);
         }
 
         pub fn capture(self: *Self, event: T) !void {
-            try self.events.append(event);
+            try self.events.append(self.allocator, event);
         }
 
         pub fn clear(self: *Self) void {
@@ -649,4 +649,24 @@ test "IntegrationTest with HTTP" {
     var response = try client.get("/api/test");
     defer response.deinit(allocator);
     try testing.expectEqual(@as(u16, 200), response.status_code);
+}
+
+test "IntegrationTest end-to-end service registration" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var ctx = try IntegrationTest.init(allocator, .{
+        .enable_metrics = false,
+        .enable_tracing = false,
+        .db_mode = .in_memory,
+    });
+    defer ctx.deinit();
+
+    const service = try allocator.create(i32);
+    service.* = 42;
+    try ctx.registerService("my_service", service, i32);
+
+    const retrieved = ctx.getService("my_service", i32);
+    try testing.expect(retrieved != null);
+    try testing.expectEqual(@as(i32, 42), retrieved.?.*);
 }

@@ -248,3 +248,41 @@ pub fn ModuleSnapshot(comptime T: type) type {
         }
     };
 }
+
+test "HotReloader init and deinit" {
+    const allocator = std.testing.allocator;
+    var reloader = HotReloader.init(allocator);
+    defer reloader.deinit();
+
+    try std.testing.expect(!reloader.is_watching);
+    try std.testing.expectEqual(@as(usize, 0), reloader.getWatchedFiles().len);
+}
+
+test "HotReloader watchPath" {
+    const allocator = std.testing.allocator;
+    var reloader = HotReloader.init(allocator);
+    defer reloader.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const file = try tmp_dir.dir.createFile("test_module.zig", .{});
+    try file.writeAll("pub const x = 1;");
+    file.close();
+
+    const base_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base_path);
+
+    try reloader.watchPath(base_path);
+    try std.testing.expectEqual(@as(usize, 1), reloader.getWatchedFiles().len);
+    try std.testing.expectEqual(@as(usize, 1), reloader.getWatchedFileCount());
+}
+
+test "ModuleSnapshot basic operations" {
+    var snapshot = ModuleSnapshot(i32).init(42);
+    try std.testing.expectEqual(@as(i32, 42), snapshot.data);
+    try std.testing.expectEqual(@as(u32, 1), snapshot.version);
+
+    snapshot.incrementVersion();
+    try std.testing.expectEqual(@as(u32, 2), snapshot.version);
+}

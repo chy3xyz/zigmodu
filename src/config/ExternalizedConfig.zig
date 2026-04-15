@@ -36,10 +36,10 @@ pub const ExternalizedConfig = struct {
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
             .allocator = allocator,
-            .sources = std.ArrayList(ConfigSource).init(allocator),
+            .sources = std.ArrayList(ConfigSource){},
             .properties = std.StringHashMap([]const u8).init(allocator),
-            .listeners = std.ArrayList(*const fn ([]const u8, []const u8) void).init(allocator),
-            .file_watchers = std.ArrayList(FileWatcher).init(allocator),
+            .listeners = std.ArrayList(*const fn ([]const u8, []const u8) void){},
+            .file_watchers = std.ArrayList(FileWatcher){},
             .watch_thread = null,
             .should_stop = std.atomic.Value(bool).init(false),
             .watch_interval_ms = 1000,
@@ -57,14 +57,14 @@ pub const ExternalizedConfig = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.properties.deinit();
-        self.sources.deinit();
-        self.listeners.deinit();
+        self.sources.deinit(self.allocator);
+        self.listeners.deinit(self.allocator);
 
         // 释放文件监听器
         for (self.file_watchers.items) |*watcher| {
             self.allocator.free(watcher.filepath);
         }
-        self.file_watchers.deinit();
+        self.file_watchers.deinit(self.allocator);
     }
 
     /// 添加配置源
@@ -159,9 +159,9 @@ pub const ExternalizedConfig = struct {
         const key_copy = try self.allocator.dupe(u8, key);
         const value_copy = try self.allocator.dupe(u8, value);
 
-        if (self.properties.get(key_copy)) |old_value| {
-            self.allocator.free(old_value);
-            _ = self.properties.remove(key_copy);
+        if (self.properties.fetchRemove(key_copy)) |old_kv| {
+            self.allocator.free(old_kv.key);
+            self.allocator.free(old_kv.value);
         }
 
         try self.properties.put(key_copy, value_copy);
@@ -191,17 +191,16 @@ pub const ExternalizedConfig = struct {
                 .last_modified = std.time.nanoTimestamp(),
                 .loader = loader,
             };
-            try self.file_watchers.append(watcher);
+            try self.file_watchers.append(self.allocator, watcher);
             return;
         };
-        defer std.fs.cwd().closeFile(stat.file);
 
         const watcher = FileWatcher{
             .filepath = path_copy,
             .last_modified = stat.mtime,
             .loader = loader,
         };
-        try self.file_watchers.append(watcher);
+        try self.file_watchers.append(self.allocator, watcher);
 
         std.log.info("开始监听配置文件: {s}", .{filepath});
     }
@@ -243,7 +242,7 @@ pub const ExternalizedConfig = struct {
             var remaining_ms = self.watch_interval_ms;
             while (remaining_ms > 0 and !self.should_stop.load(.acquire)) {
                 const sleep_ms = @min(remaining_ms, 100);
-                std.time.sleep(sleep_ms * std.time.ns_per_ms);
+                std.Thread.sleep(@as(u64, sleep_ms) * std.time.ns_per_ms);
                 remaining_ms -= sleep_ms;
             }
         }
@@ -260,7 +259,6 @@ pub const ExternalizedConfig = struct {
                 }
                 return err;
             };
-            defer std.fs.cwd().closeFile(stat.file);
 
             if (stat.mtime > watcher.last_modified) {
                 std.log.info("检测到配置文件变化: {s}", .{watcher.filepath});
@@ -285,12 +283,12 @@ pub const ExternalizedConfig = struct {
         }
 
         // 记录哪些键发生了变化
-        var changed_keys = std.ArrayList([]const u8).init(self.allocator);
+        var changed_keys = std.ArrayList([]const u8){};
         defer {
             for (changed_keys.items) |key| {
                 self.allocator.free(key);
             }
-            changed_keys.deinit();
+            changed_keys.deinit(self.allocator);
         }
 
         // 应用新配置
@@ -303,7 +301,7 @@ pub const ExternalizedConfig = struct {
                 if (!std.mem.eql(u8, old_value, new_value)) {
                     // 值发生变化
                     const key_copy = try self.allocator.dupe(u8, key);
-                    try changed_keys.append(key_copy);
+                    try changed_keys.append(self.allocator, key_copy);
 
                     // 更新配置
                     self.allocator.free(old_value);
@@ -315,7 +313,7 @@ pub const ExternalizedConfig = struct {
             } else {
                 // 新增配置
                 const key_copy = try self.allocator.dupe(u8, key);
-                try changed_keys.append(key_copy);
+                try changed_keys.append(self.allocator, key_copy);
 
                 const key_copy2 = try self.allocator.dupe(u8, key);
                 const value_copy = try self.allocator.dupe(u8, new_value);
@@ -419,4 +417,116 @@ pub fn jsonFileLoader(filepath: []const u8) *const fn (std.mem.Allocator) anyerr
             return props;
         }
     }.load;
+}
+
+test "ExternalizedConfig basic operations" {
+    const allocator = std.testing.allocator;
+    var config = ExternalizedConfig.init(allocator);
+    defer config.deinit();
+
+    const testLoader = struct {
+        fn load(a: std.mem.Allocator) !std.StringHashMap([]const u8) {
+            var props = std.StringHashMap([]const u8).init(a);
+            const k = try a.dupe(u8, "app.name");
+            const v = try a.dupe(u8, "test-app");
+            try props.put(k, v);
+            return props;
+        }
+    }.load;
+
+    try config.addSource("test", 1, testLoader);
+    try config.load();
+
+    try std.testing.expectEqualStrings("test-app", config.get("app.name").?);
+    try std.testing.expectEqualStrings("default", config.getOrDefault("missing", "default"));
+
+    try config.set("app.port", "8080");
+    try std.testing.expectEqual(@as(i64, 8080), config.getInt("app.port").?);
+    try config.set("feature.enabled", "true");
+    try std.testing.expectEqual(true, config.getBool("feature.enabled").?);
+}
+
+test "ExternalizedConfig listener notification" {
+    const allocator = std.testing.allocator;
+    var config = ExternalizedConfig.init(allocator);
+    defer config.deinit();
+
+    const testLoader = struct {
+        fn load(a: std.mem.Allocator) !std.StringHashMap([]const u8) {
+            var props = std.StringHashMap([]const u8).init(a);
+            const k = try a.dupe(u8, "key1");
+            const v = try a.dupe(u8, "val1");
+            try props.put(k, v);
+            return props;
+        }
+    }.load;
+
+    try config.addSource("test", 1, testLoader);
+    try config.load();
+
+    var notified = false;
+    const listener = struct {
+        var flag: *bool = undefined;
+        fn cb(key: []const u8, value: []const u8) void {
+            if (std.mem.eql(u8, key, "key1") and std.mem.eql(u8, value, "new_val")) {
+                flag.* = true;
+            }
+        }
+    };
+    listener.flag = &notified;
+
+    try config.addListener(listener.cb);
+    try config.set("key1", "new_val");
+    try std.testing.expect(notified);
+}
+
+test "ExternalizedConfig refresh" {
+    const allocator = std.testing.allocator;
+    var config = ExternalizedConfig.init(allocator);
+    defer config.deinit();
+
+    const testLoader = struct {
+        fn load(a: std.mem.Allocator) !std.StringHashMap([]const u8) {
+            var props = std.StringHashMap([]const u8).init(a);
+            const k = try a.dupe(u8, "refresh_key");
+            const v = try a.dupe(u8, "refreshed");
+            try props.put(k, v);
+            return props;
+        }
+    }.load;
+
+    try config.addSource("test", 1, testLoader);
+    try config.load();
+    try config.refresh();
+
+    try std.testing.expectEqualStrings("refreshed", config.get("refresh_key").?);
+}
+
+test "ExternalizedConfig file watcher lifecycle" {
+    const allocator = std.testing.allocator;
+    var config = ExternalizedConfig.init(allocator);
+    defer config.deinit();
+
+    // Create a temp file
+    var tmp = try std.fs.cwd().createFile("zigmodu_test_config.tmp", .{});
+    defer {
+        tmp.close();
+        std.fs.cwd().deleteFile("zigmodu_test_config.tmp") catch {};
+    }
+    try tmp.writeAll("{}");
+
+    const dummyLoader = struct {
+        fn load(a: std.mem.Allocator) !std.StringHashMap([]const u8) {
+            return std.StringHashMap([]const u8).init(a);
+        }
+    }.load;
+
+    try config.watchFile("zigmodu_test_config.tmp", dummyLoader);
+    try std.testing.expectEqual(@as(usize, 1), config.getWatcherCount());
+
+    try config.watch(.{ .interval_ms = 100 });
+    try std.testing.expect(config.isWatching());
+
+    config.stopWatching();
+    try std.testing.expect(!config.isWatching());
 }

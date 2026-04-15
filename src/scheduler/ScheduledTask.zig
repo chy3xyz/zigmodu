@@ -37,7 +37,7 @@ pub const TaskScheduler = struct {
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
             .allocator = allocator,
-            .tasks = std.ArrayList(Task).init(allocator),
+            .tasks = std.ArrayList(Task){},
             .running = false,
         };
     }
@@ -59,7 +59,7 @@ pub const TaskScheduler = struct {
         const name_copy = try self.allocator.dupe(u8, name);
         const next_run = try self.calculateNextCronRun(cron);
 
-        try self.tasks.append(.{
+        try self.tasks.append(self.allocator, .{
             .id = task_id_counter,
             .name = name_copy,
             .schedule = .{ .cron = cron },
@@ -82,7 +82,7 @@ pub const TaskScheduler = struct {
     ) !void {
         const name_copy = try self.allocator.dupe(u8, name);
 
-        try self.tasks.append(.{
+        try self.tasks.append(self.allocator, .{
             .id = task_id_counter,
             .name = name_copy,
             .schedule = .{ .interval = interval_seconds },
@@ -105,7 +105,7 @@ pub const TaskScheduler = struct {
     ) !void {
         const name_copy = try self.allocator.dupe(u8, name);
 
-        try self.tasks.append(.{
+        try self.tasks.append(self.allocator, .{
             .id = task_id_counter,
             .name = name_copy,
             .schedule = .{ .once = timestamp },
@@ -129,7 +129,7 @@ pub const TaskScheduler = struct {
             self.tick() catch |err| {
                 std.log.err("Task scheduler tick failed: {s}", .{@errorName(err)});
             };
-            std.time.sleep(1 * std.time.ns_per_s);
+            std.Thread.sleep(1 * std.time.ns_per_s);
         }
     }
 
@@ -201,7 +201,7 @@ pub const TaskScheduler = struct {
 
     /// 生成调度报告
     pub fn generateReport(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
-        var buf = std.ArrayList(u8).init(allocator);
+        var buf = std.ArrayList(u8){};
         const writer = buf.writer(allocator);
 
         try writer.writeAll("=== Task Scheduler Report ===\n\n");
@@ -224,7 +224,7 @@ pub const TaskScheduler = struct {
 pub const CronParser = struct {
     /// 解析 Cron 字符串 (e.g., "0 0 * * *")
     pub fn parse(allocator: std.mem.Allocator, expression: []const u8) !TaskScheduler.CronExpression {
-        var parts = std.mem.split(u8, expression, " ");
+        var parts = std.mem.splitSequence(u8, expression, " ");
 
         const minute = parts.next() orelse return error.InvalidCronExpression;
         const hour = parts.next() orelse return error.InvalidCronExpression;
@@ -241,3 +241,67 @@ pub const CronParser = struct {
         };
     }
 };
+
+var action_counter: u32 = 0;
+fn testAction() void {
+    action_counter += 1;
+}
+
+test "TaskScheduler add and retrieve tasks" {
+    const allocator = std.testing.allocator;
+    var scheduler = TaskScheduler.init(allocator);
+    defer scheduler.deinit();
+
+    try scheduler.addIntervalTask("task1", 60, testAction);
+    try scheduler.addOneTimeTask("task2", std.time.timestamp() + 300, testAction);
+
+    try std.testing.expectEqual(@as(usize, 2), scheduler.getTasks().len);
+
+    const next = scheduler.getNextTask();
+    try std.testing.expect(next != null);
+    try std.testing.expectEqualStrings("task1", next.?.name);
+}
+
+test "TaskScheduler tick executes task" {
+    const allocator = std.testing.allocator;
+    var scheduler = TaskScheduler.init(allocator);
+    defer scheduler.deinit();
+
+    action_counter = 0;
+    const now = std.time.timestamp();
+    try scheduler.addOneTimeTask("immediate", now - 1, testAction);
+
+    try scheduler.tick();
+    try std.testing.expectEqual(@as(u32, 1), action_counter);
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), scheduler.getTasks()[0].next_run);
+}
+
+test "TaskScheduler generate report" {
+    const allocator = std.testing.allocator;
+    var scheduler = TaskScheduler.init(allocator);
+    defer scheduler.deinit();
+
+    try scheduler.addIntervalTask("report-task", 60, testAction);
+
+    const report = try scheduler.generateReport(allocator);
+    defer allocator.free(report);
+
+    try std.testing.expect(std.mem.startsWith(u8, report, "=== Task Scheduler Report ==="));
+    try std.testing.expect(std.mem.indexOf(u8, report, "report-task") != null);
+}
+
+test "CronParser parse" {
+    const allocator = std.testing.allocator;
+    const cron = try CronParser.parse(allocator, "0 12 * * 1");
+    defer {
+        allocator.free(cron.minute);
+        allocator.free(cron.hour);
+        allocator.free(cron.day_of_month);
+        allocator.free(cron.month);
+        allocator.free(cron.day_of_week);
+    }
+
+    try std.testing.expectEqualStrings("0", cron.minute);
+    try std.testing.expectEqualStrings("12", cron.hour);
+    try std.testing.expectEqualStrings("1", cron.day_of_week);
+}
