@@ -121,7 +121,8 @@ pub const RateLimiterRegistry = struct {
 
     pub fn deinit(self: *Self) void {
         var iter = self.limiters.iterator();
-        while (iter.next()) |entry| {
+        while (iter.next()) |*entry| {
+            self.allocator.free(entry.key_ptr.*);
             entry.value_ptr.deinit();
         }
         self.limiters.deinit();
@@ -134,6 +135,7 @@ pub const RateLimiterRegistry = struct {
         }
 
         const name_copy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_copy);
         const limiter = try RateLimiter.init(
             self.allocator,
             name_copy,
@@ -157,6 +159,7 @@ pub const RateLimiterRegistry = struct {
         }
 
         const id_copy = try self.allocator.dupe(u8, client_id);
+        errdefer self.allocator.free(id_copy);
         const limiter = try RateLimiter.init(self.allocator, id_copy, max_tokens, refill_rate);
         try self.limiters.put(id_copy, limiter);
 
@@ -195,7 +198,7 @@ pub const SlidingWindowRateLimiter = struct {
     name: []const u8,
     window_size_seconds: u64,
     max_requests: u32,
-    requests: std.ArrayList(i64), // 请求时间戳列表
+    requests: std.array_list.Managed(i64), // 请求时间戳列表
 
     pub fn init(allocator: std.mem.Allocator, name: []const u8, window_size_seconds: u64, max_requests: u32) !Self {
         return .{
@@ -203,7 +206,7 @@ pub const SlidingWindowRateLimiter = struct {
             .name = try allocator.dupe(u8, name),
             .window_size_seconds = window_size_seconds,
             .max_requests = max_requests,
-            .requests = std.ArrayList(i64).init(allocator),
+            .requests = std.array_list.Managed(i64).init(allocator),
         };
     }
 
@@ -245,3 +248,42 @@ pub const SlidingWindowRateLimiter = struct {
         return self.requests.items.len;
     }
 };
+
+test "RateLimiter token bucket" {
+    const allocator = std.testing.allocator;
+    var limiter = try RateLimiter.init(allocator, "api", 3, 1);
+    defer limiter.deinit();
+
+    try std.testing.expect(limiter.tryAcquire());
+    try std.testing.expect(limiter.tryAcquire());
+    try std.testing.expect(limiter.tryAcquire());
+    try std.testing.expect(!limiter.tryAcquire()); // exhausted
+
+    // After refill (wait 1s)
+    std.Thread.sleep(1 * std.time.ns_per_s + 100 * std.time.ns_per_ms);
+    try std.testing.expect(limiter.tryAcquire());
+}
+
+test "RateLimiterRegistry" {
+    const allocator = std.testing.allocator;
+    var registry = RateLimiterRegistry.init(allocator, 5, 10);
+    defer registry.deinit();
+
+    const limiter = try registry.getOrCreate("user");
+    try std.testing.expectEqualStrings("user", limiter.name);
+    try std.testing.expect(registry.get("user") != null);
+}
+
+test "SlidingWindowRateLimiter" {
+    const allocator = std.testing.allocator;
+    var limiter = try SlidingWindowRateLimiter.init(allocator, "window", 1, 2);
+    defer limiter.deinit();
+
+    try std.testing.expect(limiter.tryAcquire());
+    try std.testing.expect(limiter.tryAcquire());
+    try std.testing.expect(!limiter.tryAcquire()); // limit reached
+
+    // Wait for window to slide
+    std.Thread.sleep(2 * std.time.ns_per_s);
+    try std.testing.expect(limiter.tryAcquire());
+}

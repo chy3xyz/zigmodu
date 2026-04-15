@@ -69,11 +69,25 @@ jobs:
         version: ${{ env.ZIG_VERSION }}
 
     - name: Generate documentation
-      run: zig build docs || echo "Docs generation not configured yet"
+      run: zig build docs
 
-  benchmark:
+    - name: Run benchmarks
+      run: zig build benchmark
+
+  examples:
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    strategy:
+      matrix:
+        example:
+          - basic
+          - bookstore-service
+          - dependency-injection
+          - distributed-events
+          - event_bus
+          - event-driven
+          - metaverse-creative
+          - testing
+          - v2-showcase
 
     steps:
     - uses: actions/checkout@v4
@@ -83,5 +97,20 @@ jobs:
       with:
         version: ${{ env.ZIG_VERSION }}
 
-    - name: Run benchmarks
-      run: zig build benchmark || echo "Benchmarks not configured yet"
+    - name: Cache Zig dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cache/zig
+          .zig-cache
+        key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon') }}
+        restore-keys: |
+          ${{ runner.os }}-zig-
+
+    - name: Build example
+      working-directory: examples/${{ matrix.example }}
+      run: zig build
+
+    - name: Test example
+      working-directory: examples/${{ matrix.example }}
+      run: zig build test || echo "No tests in example"

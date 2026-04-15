@@ -187,3 +187,81 @@ pub const App = struct {
         return self.modules.items.len;
     }
 };
+
+test "ModuleImpl interface generation" {
+    const MockModule = struct {
+        pub fn name(self: *@This()) []const u8 {
+            _ = self;
+            return "mock-module";
+        }
+        pub fn init(self: *@This(), app: *anyopaque) !void {
+            _ = self;
+            _ = app;
+        }
+        pub fn start(self: *@This()) !void {
+            _ = self;
+        }
+        pub fn stop(self: *@This()) void {
+            _ = self;
+        }
+        pub fn dependencies(self: *@This()) []const []const u8 {
+            _ = self;
+            return &.{"dep1"};
+        }
+    };
+
+    var mock = MockModule{};
+    const module = ModuleImpl(MockModule).interface(&mock);
+
+    try std.testing.expectEqualStrings("mock-module", module.name());
+    try std.testing.expectEqual(@as(usize, 1), module.dependencies().len);
+    try std.testing.expectEqualStrings("dep1", module.dependencies()[0]);
+}
+
+test "App register start stop publish" {
+    const allocator = std.testing.allocator;
+
+    const EventType = @import("../core/Event.zig").Event;
+    const MockModule = struct {
+        started: bool = false,
+        stopped: bool = false,
+        last_event: ?EventType = null,
+
+        pub fn name(self: *@This()) []const u8 {
+            _ = self;
+            return "event-mock";
+        }
+        pub fn init(self: *@This(), app: *anyopaque) !void {
+            _ = app;
+            _ = self;
+        }
+        pub fn start(self: *@This()) !void {
+            self.started = true;
+        }
+        pub fn stop(self: *@This()) void {
+            self.stopped = true;
+        }
+        pub fn onEvent(self: *@This(), evt: EventType) void {
+            self.last_event = evt;
+        }
+    };
+
+    var app = App.init(allocator);
+    defer app.deinit();
+
+    var mock = MockModule{};
+    const module = ModuleImpl(MockModule).interface(&mock);
+
+    try app.register(module);
+    try std.testing.expectEqual(@as(usize, 1), app.moduleCount());
+
+    try app.start();
+    try std.testing.expect(mock.started);
+
+    const evt = EventType{ .module_init = .{ .module_name = "test", .timestamp = 1 } };
+    app.publish(evt);
+    try std.testing.expect(mock.last_event != null);
+
+    app.stop();
+    try std.testing.expect(mock.stopped);
+}

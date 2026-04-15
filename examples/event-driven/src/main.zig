@@ -36,7 +36,7 @@ const OrderModule = struct {
     };
 
     // 事件总线将在启动时注入
-    var event_bus: ?*zigmodu.EventBus(OrderCreated) = null;
+    var event_bus: ?*zigmodu.TypedEventBus(OrderCreated) = null;
 
     pub fn init() !void {
         std.log.info("[order] Order module initialized", .{});
@@ -46,7 +46,7 @@ const OrderModule = struct {
         std.log.info("[order] Order module shut down", .{});
     }
 
-    pub fn setEventBus(bus: *zigmodu.EventBus(OrderCreated)) void {
+    pub fn setEventBus(bus: *zigmodu.TypedEventBus(OrderCreated)) void {
         event_bus = bus;
     }
 
@@ -153,7 +153,7 @@ pub fn main() !void {
     std.log.info("Demonstrates: EventBus, publish-subscribe pattern\n", .{});
 
     // 创建事件总线
-    var order_event_bus = zigmodu.EventBus(OrderCreated).init(allocator);
+    var order_event_bus = zigmodu.TypedEventBus(OrderCreated).init(allocator);
     defer order_event_bus.deinit();
 
     // 订阅事件处理器

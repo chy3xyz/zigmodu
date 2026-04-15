@@ -1,4 +1,5 @@
 const std = @import("std");
+const ManagedArrayList = std.array_list.Managed;
 
 /// 缓存管理器 - 支持多种淘汰策略
 ///
@@ -19,7 +20,7 @@ pub const CacheManager = struct {
     ttl_seconds: u64,
     eviction_policy: EvictionPolicy,
     entries: std.StringHashMap(CacheEntry),
-    access_order: std.ArrayList([]const u8), // For LRU
+    access_order: ManagedArrayList([]const u8), // For LRU
 
     pub const EvictionPolicy = enum {
         LRU, // Least Recently Used
@@ -43,7 +44,7 @@ pub const CacheManager = struct {
             .ttl_seconds = ttl_seconds,
             .eviction_policy = policy,
             .entries = std.StringHashMap(CacheEntry).init(allocator),
-            .access_order = std.ArrayList([]const u8).init(allocator),
+            .access_order = ManagedArrayList([]const u8).init(allocator),
         };
     }
 
@@ -96,7 +97,8 @@ pub const CacheManager = struct {
 
         // 更新访问顺序（用于LRU/FIFO）
         if (self.eviction_policy == .LRU or self.eviction_policy == .FIFO) {
-            try self.access_order.append(key_copy);
+            const order_key = try self.allocator.dupe(u8, key_copy);
+            try self.access_order.append(order_key);
         }
     }
 
@@ -239,7 +241,7 @@ pub const CacheManager = struct {
         if (self.eviction_policy == .LRU and found_count > 0) {
             // 优化：批量更新访问顺序
             // 1. 收集所有需要更新的key（排除已经过期的）
-            var valid_keys = std.ArrayList([]const u8).init(self.allocator);
+            var valid_keys = ManagedArrayList([]const u8).init(self.allocator);
             defer valid_keys.deinit();
 
             for (keys) |key| {
@@ -363,3 +365,66 @@ pub const CacheStats = struct {
         return @as(f64, @floatFromInt(self.size)) / @as(f64, @floatFromInt(self.max_size));
     }
 };
+
+test "CacheManager basic set get remove" {
+    const allocator = std.testing.allocator;
+    var cache = CacheManager.init(allocator, 10, 0, .LRU);
+    defer cache.deinit();
+
+    try cache.set("key1", "value1");
+    try std.testing.expectEqualStrings("value1", cache.get("key1").?);
+
+    try cache.set("key1", "value2");
+    try std.testing.expectEqualStrings("value2", cache.get("key1").?);
+
+    try std.testing.expect(cache.remove("key1"));
+    try std.testing.expect(cache.get("key1") == null);
+}
+
+test "CacheManager LRU eviction" {
+    const allocator = std.testing.allocator;
+    var cache = CacheManager.init(allocator, 2, 0, .LRU);
+    defer cache.deinit();
+
+    try cache.set("a", "1");
+    try cache.set("b", "2");
+    _ = cache.get("a"); // access a to make it recently used
+    try cache.set("c", "3"); // should evict b
+
+    try std.testing.expect(cache.get("a") != null);
+    try std.testing.expect(cache.get("b") == null);
+    try std.testing.expect(cache.get("c") != null);
+}
+
+test "CacheManager TTL expiration" {
+    const allocator = std.testing.allocator;
+    var cache = CacheManager.init(allocator, 10, 1, .TTL);
+    defer cache.deinit();
+
+    try cache.set("a", "1");
+    try std.testing.expectEqualStrings("1", cache.get("a").?);
+
+    // Wait for TTL to expire
+    std.Thread.sleep(2 * std.time.ns_per_s);
+    try std.testing.expect(cache.get("a") == null);
+}
+
+test "CacheManager clear and stats" {
+    const allocator = std.testing.allocator;
+    var cache = CacheManager.init(allocator, 5, 0, .FIFO);
+    defer cache.deinit();
+
+    try cache.set("a", "1");
+    try cache.set("b", "2");
+    _ = cache.get("a");
+    _ = cache.get("b");
+
+    var stats = cache.getStats();
+    try std.testing.expectEqual(@as(usize, 2), stats.size);
+    try std.testing.expectEqual(@as(usize, 5), stats.max_size);
+
+    cache.clear();
+    stats = cache.getStats();
+    try std.testing.expectEqual(@as(usize, 0), stats.size);
+    try std.testing.expect(cache.get("a") == null);
+}

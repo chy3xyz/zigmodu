@@ -46,9 +46,9 @@ pub const Application = struct {
     /// Initialize application with modules
     pub fn init(
         allocator: std.mem.Allocator,
-        comptime app_name: []const u8,
+        app_name: []const u8,
         comptime modules_tuple: anytype,
-        comptime options: Config,
+        options: Config,
     ) !Self {
         const modules = try scanModules(allocator, modules_tuple);
 
@@ -213,4 +213,62 @@ pub const ApplicationBuilder = struct {
 /// Convenience function to create ApplicationBuilder
 pub fn builder(allocator: std.mem.Allocator) ApplicationBuilder {
     return ApplicationBuilder.init(allocator);
+}
+
+test "Application lifecycle" {
+    const allocator = std.testing.allocator;
+
+    const MockModule = struct {
+        pub const info = api.Module{
+            .name = "mock",
+            .description = "Mock",
+            .dependencies = &.{},
+        };
+        pub fn init() !void {}
+        pub fn deinit() void {}
+    };
+
+    var app = try Application.init(allocator, "test-app", .{MockModule}, .{});
+    defer app.deinit();
+
+    try std.testing.expectEqual(Application.State.initialized, app.getState());
+    try std.testing.expect(app.hasModule("mock"));
+    try std.testing.expectEqualStrings("mock", app.getModule("mock").?.name);
+
+    try app.validate();
+    try std.testing.expectEqual(Application.State.validated, app.getState());
+
+    try app.start();
+    try std.testing.expectEqual(Application.State.started, app.getState());
+
+    app.stop();
+    try std.testing.expectEqual(Application.State.stopped, app.getState());
+}
+
+test "ApplicationBuilder" {
+    const allocator = std.testing.allocator;
+
+    const MockModule = struct {
+        pub const info = api.Module{
+            .name = "builder-mock",
+            .description = "Builder Mock",
+            .dependencies = &.{},
+        };
+        pub fn init() !void {}
+        pub fn deinit() void {}
+    };
+
+    var b = ApplicationBuilder.init(allocator);
+    defer b.deinit();
+
+    var app = try b
+        .withName("built-app")
+        .withValidation(false)
+        .withAutoDocs(false)
+        .build(.{MockModule});
+    defer app.deinit();
+
+    try std.testing.expectEqualStrings("built-app", app.config.name);
+    try std.testing.expectEqual(false, app.config.validate_on_start);
+    try std.testing.expect(app.hasModule("builder-mock"));
 }

@@ -212,3 +212,12 @@ pub const WebMonitor = struct {
         _ = stream.write(response) catch {};
     }
 };
+
+test "WebMonitor init stop" {
+    const allocator = std.testing.allocator;
+    var monitor = WebMonitor.init(allocator, 19999);
+    defer monitor.deinit();
+
+    try std.testing.expectEqual(@as(u16, 19999), monitor.port);
+    try std.testing.expect(!monitor.is_running);
+}

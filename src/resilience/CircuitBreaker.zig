@@ -193,7 +193,8 @@ pub const CircuitBreakerRegistry = struct {
 
     pub fn deinit(self: *Self) void {
         var iter = self.breakers.iterator();
-        while (iter.next()) |entry| {
+        while (iter.next()) |*entry| {
+            self.allocator.free(entry.key_ptr.*);
             entry.value_ptr.deinit();
         }
         self.breakers.deinit();
@@ -206,6 +207,7 @@ pub const CircuitBreakerRegistry = struct {
         }
 
         const name_copy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_copy);
         const breaker = try CircuitBreaker.init(self.allocator, name_copy, self.default_config);
         try self.breakers.put(name_copy, breaker);
 
@@ -219,7 +221,8 @@ pub const CircuitBreakerRegistry = struct {
 
     /// 移除断路器
     pub fn remove(self: *Self, name: []const u8) bool {
-        const entry = self.breakers.fetchRemove(name) orelse return false;
+        var entry = self.breakers.fetchRemove(name) orelse return false;
+        self.allocator.free(entry.key);
         entry.value.deinit();
         return true;
     }
@@ -255,3 +258,60 @@ pub const CircuitBreakerRegistry = struct {
         return buf.toOwnedSlice(allocator);
     }
 };
+
+test "CircuitBreaker state transitions" {
+    const allocator = std.testing.allocator;
+    var cb = try CircuitBreaker.init(allocator, "test", .{
+        .failure_threshold = 3,
+        .success_threshold = 2,
+        .timeout_seconds = 1,
+        .half_open_max_calls = 5,
+    });
+    defer cb.deinit();
+
+    const fail_op = struct {
+        fn op() !void {
+            return error.TestFail;
+        }
+    }.op;
+
+    const ok_op = struct {
+        fn op() !void {}
+    }.op;
+
+    // Initially CLOSED
+    try std.testing.expectEqual(CircuitBreaker.State.CLOSED, cb.getState());
+
+    // 3 failures -> OPEN
+    _ = cb.call(fail_op);
+    _ = cb.call(fail_op);
+    _ = cb.call(fail_op);
+    try std.testing.expectEqual(CircuitBreaker.State.OPEN, cb.getState());
+
+    // Wait for timeout -> HALF_OPEN
+    std.Thread.sleep(2 * std.time.ns_per_s);
+    try std.testing.expectEqual(CircuitBreaker.State.HALF_OPEN, cb.getState());
+
+    // 2 successes -> CLOSED
+    _ = cb.call(ok_op);
+    _ = cb.call(ok_op);
+    try std.testing.expectEqual(CircuitBreaker.State.CLOSED, cb.getState());
+}
+
+test "CircuitBreakerRegistry" {
+    const allocator = std.testing.allocator;
+    var registry = CircuitBreakerRegistry.init(allocator, .{
+        .failure_threshold = 2,
+        .success_threshold = 1,
+        .timeout_seconds = 1,
+        .half_open_max_calls = 3,
+    });
+    defer registry.deinit();
+
+    const cb = try registry.getOrCreate("api");
+    try std.testing.expectEqualStrings("api", cb.name);
+    try std.testing.expect(registry.get("api") != null);
+
+    try std.testing.expect(registry.remove("api"));
+    try std.testing.expect(registry.get("api") == null);
+}

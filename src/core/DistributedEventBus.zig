@@ -211,3 +211,40 @@ pub const ClusterConfig = struct {
         port: u16,
     };
 };
+
+test "DistributedEventBus init subscribe publish" {
+    const allocator = std.testing.allocator;
+    var bus = DistributedEventBus.init(allocator);
+    defer bus.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), bus.getNodeCount());
+
+    var received: bool = false;
+    const listener = struct {
+        var flag: *bool = undefined;
+        fn cb(evt: DistributedEventBus.NetworkEvent) void {
+            if (std.mem.eql(u8, evt.topic, "test")) {
+                flag.* = true;
+            }
+        }
+    };
+    listener.flag = &received;
+
+    try bus.subscribe("test", listener.cb);
+    try bus.publish("test", "hello");
+
+    try std.testing.expect(received);
+}
+
+test "DistributedEventBus serializeEvent" {
+    const event = DistributedEventBus.NetworkEvent{
+        .topic = "t1",
+        .payload = "p1",
+        .source_node = "n1",
+        .timestamp = 123,
+    };
+    var buf: [256]u8 = undefined;
+    const serialized = DistributedEventBus.serializeEvent(event, &buf);
+    try std.testing.expect(std.mem.containsAtLeast(u8, serialized, 1, "\"topic\":\"t1\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, serialized, 1, "\"time\":123"));
+}

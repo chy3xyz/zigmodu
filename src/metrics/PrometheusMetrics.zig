@@ -208,6 +208,25 @@ pub const PrometheusMetrics = struct {
         return self.histograms.getPtr(name_copy).?;
     }
 
+    /// 创建 Summary
+    pub fn createSummary(self: *Self, name: []const u8, help: []const u8) !*Summary {
+        const name_copy = try self.allocator.dupe(u8, name);
+        const help_copy = try self.allocator.dupe(u8, help);
+
+        const quantile_list = std.array_list.Managed(f64).init(self.allocator);
+        const value_list = std.array_list.Managed(f64).init(self.allocator);
+
+        const summary = Summary{
+            .name = name_copy,
+            .help = help_copy,
+            .quantiles = quantile_list,
+            .values = value_list,
+        };
+
+        try self.summaries.put(name_copy, summary);
+        return self.summaries.getPtr(name_copy).?;
+    }
+
     /// 获取 Counter
     pub fn getCounter(self: *Self, name: []const u8) ?*Counter {
         return self.counters.getPtr(name);
@@ -270,8 +289,11 @@ pub const PrometheusMetrics = struct {
 
         pub fn init(metrics: *PrometheusMetrics, module_name: []const u8) !ModuleMetricsCollector {
             const req_count_name = try std.fmt.allocPrint(metrics.allocator, "{s}_requests_total", .{module_name});
+            defer metrics.allocator.free(req_count_name);
             const req_duration_name = try std.fmt.allocPrint(metrics.allocator, "{s}_request_duration_seconds", .{module_name});
+            defer metrics.allocator.free(req_duration_name);
             const active_conn_name = try std.fmt.allocPrint(metrics.allocator, "{s}_active_connections", .{module_name});
+            defer metrics.allocator.free(active_conn_name);
 
             return .{
                 .metrics = metrics,
@@ -300,3 +322,66 @@ pub const PrometheusMetrics = struct {
         }
     };
 };
+
+test "PrometheusMetrics counter and gauge" {
+    const allocator = std.testing.allocator;
+    var metrics = PrometheusMetrics.init(allocator);
+    defer metrics.deinit();
+
+    const counter = try metrics.createCounter("requests_total", "Total requests");
+    counter.inc();
+    counter.add(2);
+    try std.testing.expectEqual(@as(u64, 3), counter.get());
+
+    const gauge = try metrics.createGauge("temperature", "Current temp");
+    gauge.set(23.5);
+    gauge.inc();
+    gauge.dec();
+    try std.testing.expectEqual(@as(f64, 23.5), gauge.get());
+}
+
+test "PrometheusMetrics histogram and summary" {
+    const allocator = std.testing.allocator;
+    var metrics = PrometheusMetrics.init(allocator);
+    defer metrics.deinit();
+
+    const hist = try metrics.createHistogram("latency", "Request latency", &.{ 0.1, 0.5, 1.0 });
+    hist.observe(0.05);
+    hist.observe(0.7);
+    try std.testing.expectEqual(@as(u64, 2), hist.count);
+
+    const summary = try metrics.createSummary("response_size", "Response size");
+    try summary.observe(100.0);
+    try summary.observe(200.0);
+    try summary.observe(300.0);
+    try std.testing.expectEqual(@as(f64, 200.0), summary.getQuantile(0.5));
+}
+
+test "PrometheusMetrics toPrometheusFormat" {
+    const allocator = std.testing.allocator;
+    var metrics = PrometheusMetrics.init(allocator);
+    defer metrics.deinit();
+
+    const counter = try metrics.createCounter("test_total", "Test counter");
+    counter.inc();
+
+    const output = try metrics.toPrometheusFormat(allocator);
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "# HELP test_total Test counter"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "test_total 1"));
+}
+
+test "ModuleMetricsCollector" {
+    const allocator = std.testing.allocator;
+    var metrics = PrometheusMetrics.init(allocator);
+    defer metrics.deinit();
+
+    var collector = try PrometheusMetrics.ModuleMetricsCollector.init(&metrics, "order");
+    collector.recordRequest(0.123);
+    collector.connectionOpened();
+    collector.connectionClosed();
+
+    try std.testing.expectEqual(@as(u64, 1), collector.request_count.get());
+    try std.testing.expectEqual(@as(f64, 0.0), collector.active_connections.get());
+}
