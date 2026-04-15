@@ -1,0 +1,19 @@
+@startuml
+!theme plain
+
+component [order] {
+  Order management module - depends on user module
+}
+
+order --> user
+component [payment] {
+  Payment processing module - depends on order module
+}
+
+payment --> order
+component [user] {
+  User management module - base module with no dependencies
+}
+
+
+@enduml
