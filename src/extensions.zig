@@ -50,7 +50,14 @@ pub const FxStream = @import("experimental/Fx.zig").Stream;
 
 // Load Shedding
 pub const AdaptiveShedder = @import("resilience/LoadShedder.zig").AdaptiveShedder;
+// ORM
+pub const Orm = @import("persistence/Orm.zig").Orm;
+pub const OrmValue = @import("persistence/Orm.zig").OrmValue;
+pub const OrmModel = @import("persistence/Orm.zig").Model;
+pub const OrmTx = @import("persistence/Orm.zig").Tx;
+pub const SqlxBackend = @import("persistence/backends/SqlxBackend.zig").SqlxBackend;
 
+// GoZero Validation
 
 // GoZero Validation
 pub const GzValidationResult = @import("experimental/GoZeroValidator.zig").Result;

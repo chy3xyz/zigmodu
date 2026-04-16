@@ -75,6 +75,9 @@ test "compile all source files" {
 
     // Persistence
     _ = @import("persistence/Database.zig");
+    _ = @import("persistence/Orm.zig");
+    _ = @import("persistence/backends/SqlxBackend.zig");
+    _ = @import("persistence/Database.zig");
 
     // Resilience
     _ = @import("resilience/CircuitBreaker.zig");

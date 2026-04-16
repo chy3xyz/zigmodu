@@ -145,6 +145,8 @@ pub const retry = @import("resilience/Retry.zig");
 pub const load_shedder = @import("resilience/LoadShedder.zig");
 
 // Persistence (adapted from zigzero)
+pub const orm = @import("persistence/Orm.zig");
+pub const SqlxBackend = @import("persistence/backends/SqlxBackend.zig").SqlxBackend;
     /// NOTE: ORM is currently removed. Future ORM will be built on top of sqlx.
     // pub const orm = @import("experimental/Orm.zig");
 
