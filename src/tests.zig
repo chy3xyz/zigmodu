@@ -7,8 +7,9 @@ const zigmodu = @import("zigmodu");
 test "compile all source files" {
     // API
     _ = @import("api/Module.zig");
-    _ = @import("api/Router.zig");
+    _ = @import("api/Middleware.zig");
     _ = @import("api/Simplified.zig");
+    _ = @import("api/Server.zig");
 
     // Application
     _ = @import("Application.zig");
@@ -74,13 +75,17 @@ test "compile all source files" {
 
     // Persistence
     _ = @import("persistence/Database.zig");
+    _ = @import("experimental/Orm.zig");
 
     // Resilience
     _ = @import("resilience/CircuitBreaker.zig");
     _ = @import("resilience/RateLimiter.zig");
+    _ = @import("resilience/Retry.zig");
+    _ = @import("resilience/LoadShedder.zig");
 
     // Scheduler
     _ = @import("scheduler/ScheduledTask.zig");
+    _ = @import("scheduler/Cron.zig");
 
     // Security
     _ = @import("security/SecurityModule.zig");
@@ -97,7 +102,26 @@ test "compile all source files" {
 
     // Validation
     _ = @import("validation/Validator.zig");
+    _ = @import("experimental/GoZeroValidator.zig");
 
     // Cache
     _ = @import("cache/CacheManager.zig");
+    _ = @import("cache/Lru.zig");
+
+    // SQLx
+    _ = @import("sqlx/sqlx.zig");
+    _ = @import("sqlx/errors.zig");
+    _ = @import("sqlx/breaker.zig");
+    _ = @import("sqlx/sqlite3_c.zig");
+    _ = @import("sqlx/libpq_c.zig");
+    _ = @import("sqlx/libmysql_c.zig");
+
+    // Redis
+    _ = @import("redis/redis.zig");
+
+    // Pool
+    _ = @import("pool/Pool.zig");
+
+    // Core extensions
+    _ = @import("experimental/Fx.zig");
 }

@@ -17,6 +17,10 @@ pub const builder = @import("Application.zig").builder;
 
 // API
 pub const api = @import("api/Module.zig");
+// HTTP Server (adapted from zigzero)
+pub const http_server = @import("api/Server.zig");
+pub const http_middleware = @import("api/Middleware.zig");
+
 
 // Simplified API (VTable-based)
 pub const App = @import("api/Simplified.zig").App;
@@ -118,6 +122,33 @@ pub const TwoPhaseCommit = @import("core/DistributedTransaction.zig").TwoPhaseCo
 pub const YamlParser = @import("config/YamlToml.zig").YamlParser;
 pub const TomlParser = @import("config/YamlToml.zig").TomlParser;
 
+// SQLx (adapted from zigzero)
+pub const sqlx = @import("sqlx/sqlx.zig");
+
+// Redis (adapted from zigzero)
+pub const redis = @import("redis/redis.zig");
+
+// Pool (adapted from zigzero)
+pub const pool = @import("pool/Pool.zig");
+
+// Cache (adapted from zigzero)
+pub const cache = @import("cache/Lru.zig");
+
+// Scheduler (adapted from zigzero)
+pub const cron = @import("scheduler/Cron.zig");
+
+// Core utilities (adapted from zigzero)
+pub const fx = @import("experimental/Fx.zig");
+
+// Resilience (adapted from zigzero)
+pub const retry = @import("resilience/Retry.zig");
+pub const load_shedder = @import("resilience/LoadShedder.zig");
+
+// Persistence (adapted from zigzero)
+pub const orm = @import("experimental/Orm.zig");
+
+// Validation (adapted from zigzero)
+pub const gozero_validator = @import("experimental/GoZeroValidator.zig");
 // Tests
 test {
     // Import all test files

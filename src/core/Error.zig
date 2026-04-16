@@ -46,6 +46,16 @@ pub const ZigModuError = error{
     DatabaseConnectionFailed,
     QueryExecutionFailed,
     ConnectionPoolExhausted,
+    PoolUnhealthy,
+    DatabaseError,
+    RedisError,
+
+    // 通用业务错误
+    NotFound,
+    RateLimitExceeded,
+    CircuitBreakerOpen,
+    ServiceUnavailable,
+    ServiceOverloaded,
 
     // 安全错误
     AuthenticationFailed,
@@ -68,8 +78,10 @@ pub const ZigModuError = error{
     // 网络错误
     NetworkError,
     ConnectionTimeout,
+    Timeout,
     ConnectionRefused,
     HttpError,
+    ServerError,
 
     // 资源错误
     OutOfMemory,
@@ -180,3 +192,87 @@ pub fn toErrorContext(err: anyerror, message: []const u8) ErrorContext {
 
     return ErrorContext.init(code, message);
 }
+
+/// HTTP status code mapping (aligned with go-zero patterns)
+pub const HttpCode = enum(i32) {
+    OK = 0,
+    BadRequest = 400,
+    Unauthorized = 401,
+    Forbidden = 403,
+    NotFound = 404,
+    RequestTimeout = 408,
+    RateLimit = 429,
+    ServerError = 500,
+    ServiceUnavailable = 503,
+};
+
+/// Map ZigModuError to HttpCode
+pub fn toHttpCode(err: ZigModuError) HttpCode {
+    return switch (err) {
+        .ModuleNotFound,
+        .DependencyNotFound,
+        .CacheKeyNotFound,
+        .NotFound,
+        .ServiceNotFound,
+        .EventHandlerNotFound,
+        .ConfigFileNotFound => .NotFound,
+
+        .AuthenticationFailed,
+        .InvalidToken,
+        .TokenExpired,
+        .InvalidCredentials => .Unauthorized,
+
+        .AuthorizationFailed,
+        .Forbidden => .Forbidden,
+
+        .RateLimitExceeded => .RateLimit,
+
+        .CircuitBreakerOpen,
+        .ServiceUnavailable,
+        .ServiceOverloaded,
+        .ConnectionPoolExhausted => .ServiceUnavailable,
+
+        .ConnectionTimeout,
+        .Timeout => .RequestTimeout,
+
+
+        .InvalidInput,
+        .MissingRequiredField,
+        .InvalidFormat,
+        .ValidationFailed,
+        .ConfigurationError,
+        .ConfigParseError,
+        .ConfigValidationFailed => .BadRequest,
+
+        .HttpError,
+        .ServerError => .ServerError,
+
+        else => .ServerError,
+    };
+}
+
+/// Standardized JSON error response
+pub const ErrorResponse = struct {
+    code: i32,
+    message: []const u8,
+    details: ?[]const u8 = null,
+};
+
+/// Build a JSON error response string. Caller owns returned memory.
+pub fn toJson(allocator: std.mem.Allocator, err: ErrorResponse) ![]u8 {
+    if (err.details) |details| {
+        return std.fmt.allocPrint(allocator, "{{\"code\":{d},\"message\":\"{s}\",\"details\":\"{s}\"}}", .{ err.code, err.message, details });
+    } else {
+        return std.fmt.allocPrint(allocator, "{{\"code\":{d},\"message\":\"{s}\"}}", .{ err.code, err.message });
+    }
+}
+
+/// Convenience: create JSON from ZigModuError + message
+pub fn fromError(allocator: std.mem.Allocator, err: ZigModuError, message: []const u8) ![]u8 {
+    const resp = ErrorResponse{
+        .code = @intFromEnum(toHttpCode(err)),
+        .message = message,
+    };
+    return toJson(allocator, resp);
+}
+
