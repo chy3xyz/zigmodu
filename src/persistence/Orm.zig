@@ -1,9 +1,12 @@
-//! DEPRECATED: Orm has been moved to src/experimental/Orm.zig.
-//! This wrapper is kept for backward compatibility only.
-pub const Config = @import("../experimental/Orm.zig").Config;
-pub const Pool = @import("../experimental/Orm.zig").Pool;
-pub const Connection = @import("../experimental/Orm.zig").Connection;
-pub const Transaction = @import("../experimental/Orm.zig").Transaction;
-pub const Model = @import("../experimental/Orm.zig").Model;
-pub const Query = @import("../experimental/Orm.zig").Query;
-pub const Crud = @import("../experimental/Orm.zig").Crud;
+//! NOTE: ORM has been removed.
+//!
+//! The previous placeholder ORM (src/experimental/Orm.zig) was a no-op implementation
+//! that duplicated sqlx capabilities without leveraging them.
+//!
+//! A future ORM for ZigModu should be built directly on top of sqlx
+//! (src/sqlx/sqlx.zig) using its Client, Builder, and Row.scan() APIs.
+//!
+//! For now, use sqlx directly:
+//!   var client = sqlx.Client.init(allocator, .{ .driver = .sqlite, ... });
+//!   const users = try client.queryRows(User, "SELECT * FROM users", &.{});
+
