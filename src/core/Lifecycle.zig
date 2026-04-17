@@ -37,7 +37,7 @@ pub fn stopAll(modules: *ApplicationModules) void {
     var ordered_modules = getSortedModules(modules) catch {
         std.log.err("Failed to determine stop order, stopping in reverse registration order", .{});
         var iter = modules.modules.iterator();
-        var names = std.ArrayList([]const u8){};
+        var names = std.ArrayList([]const u8).empty;
         defer names.deinit(modules.allocator);
         while (iter.next()) |entry| {
             names.append(modules.allocator, entry.key_ptr.*) catch continue;

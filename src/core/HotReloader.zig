@@ -3,6 +3,7 @@ const Application = @import("../Application.zig").Application;
 const ApplicationModules = @import("Module.zig").ApplicationModules;
 const ArrayList = std.array_list.Managed;
 
+// ⚠️ EXPERIMENTAL: This module is incomplete and not production-ready.
 /// Module Hot-Reloading System
 /// Watches module files for changes and reloads them dynamically
 /// Note: Due to Zig's compile-time nature, true hot-reloading is limited
@@ -11,15 +12,17 @@ pub const HotReloader = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
+    io: std.Io,
     watch_paths: ArrayList([]const u8),
     is_watching: bool,
     watch_thread: ?std.Thread,
     file_hashes: std.StringHashMap(u64),
     on_change_cb: ?*const fn ([]const u8) void,
 
-    pub fn init(allocator: std.mem.Allocator) Self {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) Self {
         return .{
             .allocator = allocator,
+            .io = io,
             .watch_paths = ArrayList([]const u8).init(allocator),
             .is_watching = false,
             .watch_thread = null,
@@ -43,9 +46,10 @@ pub const HotReloader = struct {
         self.file_hashes.deinit();
     }
 
-    /// Add a path to watch
     pub fn watchPath(self: *Self, path: []const u8) !void {
-        const resolved = try std.fs.cwd().realpathAlloc(self.allocator, path);
+        const resolved_z = try std.Io.Dir.cwd().realPathFileAlloc(self.io, path, self.allocator);
+        defer self.allocator.free(resolved_z);
+        const resolved = try self.allocator.dupe(u8, resolved_z);
         errdefer self.allocator.free(resolved);
 
         try self.watch_paths.append(resolved);
@@ -87,7 +91,7 @@ pub const HotReloader = struct {
             };
 
             // Check every 1 second
-            std.Thread.sleep(1 * std.time.ns_per_s);
+            // std.Thread.sleep(1 * std.time.ns_per_s);// TODO: 0.16.0 needs io
         }
     }
 
@@ -98,11 +102,11 @@ pub const HotReloader = struct {
     }
 
     fn checkPathForChanges(self: *Self, path: []const u8) !void {
-        var dir = try std.fs.openDirAbsolute(path, .{ .iterate = true });
-        defer dir.close();
+        var dir = try std.Io.Dir.openDirAbsolute(self.io, path, .{ .iterate = true });
+        defer dir.close(self.io);
 
         var iter = dir.iterate();
-        while (try iter.next()) |entry| {
+        while (try iter.next(self.io)) |entry| {
             if (entry.kind == .file) {
                 const ext = std.fs.path.extension(entry.name);
                 if (std.mem.eql(u8, ext, ".zig")) {
@@ -133,14 +137,14 @@ pub const HotReloader = struct {
     }
 
     fn scanAndHashPath(self: *Self, path: []const u8) !void {
-        var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch |err| {
+        var dir = std.Io.Dir.openDirAbsolute(self.io, path, .{ .iterate = true }) catch |err| {
             std.log.warn("[HotReloader] Could not open directory: {s} - {}", .{ path, err });
             return;
         };
-        defer dir.close();
+        defer dir.close(self.io);
 
         var iter = dir.iterate();
-        while (try iter.next()) |entry| {
+        while (try iter.next(self.io)) |entry| {
             if (entry.kind == .file) {
                 const ext = std.fs.path.extension(entry.name);
                 if (std.mem.eql(u8, ext, ".zig")) {
@@ -157,12 +161,12 @@ pub const HotReloader = struct {
     }
 
     fn hashFile(self: *Self, path: []const u8) !u64 {
-        _ = self;
 
-        const file = try std.fs.openFileAbsolute(path, .{});
-        defer file.close();
 
-        const stat = try file.stat();
+        const file = try std.Io.Dir.openFileAbsolute(self.io, path, .{});
+        defer std.Io.File.close(file, self.io);
+
+        const stat = try std.Io.File.stat(file, self.io);
         const modified_time = stat.mtime;
         const size = stat.size;
 
@@ -238,20 +242,20 @@ pub fn ModuleSnapshot(comptime T: type) type {
             return .{
                 .data = data,
                 .version = 1,
-                .timestamp = std.time.timestamp(),
+                .timestamp = 0,
             };
         }
 
         pub fn incrementVersion(self: *Self) void {
             self.version += 1;
-            self.timestamp = std.time.timestamp();
+            self.timestamp = 0;
         }
     };
 }
 
 test "HotReloader init and deinit" {
     const allocator = std.testing.allocator;
-    var reloader = HotReloader.init(allocator);
+    var reloader = HotReloader.init(allocator, std.testing.io);
     defer reloader.deinit();
 
     try std.testing.expect(!reloader.is_watching);
@@ -260,17 +264,17 @@ test "HotReloader init and deinit" {
 
 test "HotReloader watchPath" {
     const allocator = std.testing.allocator;
-    var reloader = HotReloader.init(allocator);
+    var reloader = HotReloader.init(allocator, std.testing.io);
     defer reloader.deinit();
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("test_module.zig", .{});
-    try file.writeAll("pub const x = 1;");
-    file.close();
+    const file = try tmp_dir.dir.createFile(std.testing.io, "test_module.zig", .{});
+    try file.writeStreamingAll(std.testing.io, "pub const x = 1;");
+    std.Io.File.close(file, std.testing.io);
 
-    const base_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const base_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(base_path);
 
     try reloader.watchPath(base_path);

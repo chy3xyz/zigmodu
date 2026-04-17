@@ -114,71 +114,71 @@ fn structToBackendArgsWithId(comptime B: type, comptime T: type, allocator: std.
 // ==================== SQL Builders ====================
 
 fn buildSelectById(allocator: std.mem.Allocator, table: []const u8, fields: []const []const u8, pk: []const u8) ![]u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
-    try buf.writer(allocator).writeAll("SELECT ");
+    try buf.appendSlice(allocator, "SELECT ");
     for (fields, 0..) |f, i| {
-        if (i > 0) try buf.writer(allocator).writeAll(", ");
-        try buf.writer(allocator).writeAll(f);
+        if (i > 0) try buf.appendSlice(allocator, ", ");
+        try buf.appendSlice(allocator, f);
     }
-    try buf.writer(allocator).print(" FROM {s} WHERE {s} = ?", .{ table, pk });
+    try buf.print(allocator, " FROM {s} WHERE {s} = ?", .{ table, pk });
     return allocator.dupe(u8, buf.items);
 }
 
 fn buildSelectAll(allocator: std.mem.Allocator, table: []const u8, fields: []const []const u8) ![]u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
-    try buf.writer(allocator).writeAll("SELECT ");
+    try buf.appendSlice(allocator, "SELECT ");
     for (fields, 0..) |f, i| {
-        if (i > 0) try buf.writer(allocator).writeAll(", ");
-        try buf.writer(allocator).writeAll(f);
+        if (i > 0) try buf.appendSlice(allocator, ", ");
+        try buf.appendSlice(allocator, f);
     }
-    try buf.writer(allocator).print(" FROM {s}", .{table});
+    try buf.print(allocator, " FROM {s}", .{table});
     return allocator.dupe(u8, buf.items);
 }
 
 fn buildInsert(allocator: std.mem.Allocator, table: []const u8, fields: []const []const u8) ![]u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
-    try buf.writer(allocator).print("INSERT INTO {s} (", .{table});
+    try buf.print(allocator, "INSERT INTO {s} (", .{table});
     for (fields, 0..) |f, i| {
-        if (i > 0) try buf.writer(allocator).writeAll(", ");
-        try buf.writer(allocator).writeAll(f);
+        if (i > 0) try buf.appendSlice(allocator, ", ");
+        try buf.appendSlice(allocator, f);
     }
-    try buf.writer(allocator).writeAll(") VALUES (");
+    try buf.appendSlice(allocator, ") VALUES (");
     for (0..fields.len) |i| {
-        if (i > 0) try buf.writer(allocator).writeAll(", ");
-        try buf.writer(allocator).writeAll("?");
+        if (i > 0) try buf.appendSlice(allocator, ", ");
+        try buf.appendSlice(allocator, "?");
     }
-    try buf.writer(allocator).writeAll(")");
+    try buf.appendSlice(allocator, ")");
     return allocator.dupe(u8, buf.items);
 }
 
 fn buildUpdate(allocator: std.mem.Allocator, table: []const u8, fields: []const []const u8, pk: []const u8) ![]u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
-    try buf.writer(allocator).print("UPDATE {s} SET ", .{table});
+    try buf.print(allocator, "UPDATE {s} SET ", .{table});
     var first = true;
     for (fields) |f| {
         if (std.mem.eql(u8, f, pk)) continue;
-        if (!first) try buf.writer(allocator).writeAll(", ");
+        if (!first) try buf.appendSlice(allocator, ", ");
         first = false;
-        try buf.writer(allocator).print("{s} = ?", .{f});
+        try buf.print(allocator, "{s} = ?", .{f});
     }
-    try buf.writer(allocator).print(" WHERE {s} = ?", .{pk});
+    try buf.print(allocator, " WHERE {s} = ?", .{pk});
     return allocator.dupe(u8, buf.items);
 }
 
 fn buildSelectPage(allocator: std.mem.Allocator, table: []const u8, fields: []const []const u8, page: usize, size: usize) ![]u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
-    try buf.writer(allocator).writeAll("SELECT ");
+    try buf.appendSlice(allocator, "SELECT ");
     for (fields, 0..) |f, i| {
-        if (i > 0) try buf.writer(allocator).writeAll(", ");
-        try buf.writer(allocator).writeAll(f);
+        if (i > 0) try buf.appendSlice(allocator, ", ");
+        try buf.appendSlice(allocator, f);
     }
     const offset = page * size;
-    try buf.writer(allocator).print(" FROM {s} LIMIT {d} OFFSET {d}", .{ table, size, offset });
+    try buf.print(allocator, " FROM {s} LIMIT {d} OFFSET {d}", .{ table, size, offset });
     return allocator.dupe(u8, buf.items);
 }
 

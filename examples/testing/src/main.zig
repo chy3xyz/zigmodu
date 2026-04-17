@@ -72,18 +72,16 @@ const CalculatorService = struct {
     }
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = std.heap.page_allocator;
 
     std.log.info("=== ZigModu Testing Example ===", .{});
     std.log.info("Run with: zig build test\n", .{});
 
     // 运行测试
     try testModuleLifecycle(allocator);
-    try testCalculatorOperations(allocator);
-    try testWithMockModule(allocator);
+    try testCalculatorOperations(init.io, allocator);
+    try testWithMockModule(init.io, allocator);
 }
 
 fn testModuleLifecycle(allocator: std.mem.Allocator) !void {
@@ -118,10 +116,10 @@ fn testModuleLifecycle(allocator: std.mem.Allocator) !void {
     std.log.info("  ✓ Lifecycle test passed\n", .{});
 }
 
-fn testCalculatorOperations(allocator: std.mem.Allocator) !void {
+fn testCalculatorOperations(io: std.Io, allocator: std.mem.Allocator) !void {
     std.log.info("Test 2: Calculator Operations", .{});
 
-    var app = try zigmodu.Application.init(
+    var app = try zigmodu.Application.init(io,
         allocator,
         "test-app",
         .{CalculatorModule},
@@ -159,7 +157,7 @@ fn testCalculatorOperations(allocator: std.mem.Allocator) !void {
     std.log.info("  ✓ All operations passed\n", .{});
 }
 
-fn testWithMockModule(allocator: std.mem.Allocator) !void {
+fn testWithMockModule(_: std.Io, allocator: std.mem.Allocator) !void {
     std.log.info("Test 3: Mock Module", .{});
 
     var ctx = try zigmodu.extensions.ModuleTestContext.init(allocator, "mock_test");
@@ -185,7 +183,7 @@ fn testWithMockModule(allocator: std.mem.Allocator) !void {
 test "calculator basic operations" {
     const allocator = std.testing.allocator;
 
-    var app = try zigmodu.Application.init(
+    var app = try zigmodu.Application.init(std.testing.io,
         allocator,
         "test",
         .{CalculatorModule},
@@ -204,7 +202,7 @@ test "calculator basic operations" {
 test "calculator division by zero" {
     const allocator = std.testing.allocator;
 
-    var app = try zigmodu.Application.init(allocator, "test", .{CalculatorModule}, .{});
+    var app = try zigmodu.Application.init(std.testing.io, allocator, "test", .{CalculatorModule}, .{});
     defer app.deinit();
 
     try app.start();
@@ -217,7 +215,7 @@ test "module dependency validation" {
     const allocator = std.testing.allocator;
 
     // 这应该成功，因为 calculator_service 依赖 calculator
-    var app = try zigmodu.Application.init(
+    var app = try zigmodu.Application.init(std.testing.io,
         allocator,
         "test",
         .{ CalculatorModule, CalculatorService },

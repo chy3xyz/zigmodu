@@ -23,6 +23,7 @@ pub fn Pool(comptime T: type) type {
         };
 
         allocator: std.mem.Allocator,
+        io: std.Io,
         createFn: *const fn () errors.ResultT(*T),
         destroyFn: *const fn (*T) void,
         validateFn: *const fn (*T) bool,
@@ -30,13 +31,14 @@ pub fn Pool(comptime T: type) type {
         max_active: u32,
         active_count: std.atomic.Value(u32),
         idle_conns: std.ArrayList(Node),
-        mutex: std.Thread.Mutex,
-        cond: std.Thread.Condition,
+        mutex: std.Io.Mutex,
+        cond: std.Io.Condition,
         max_wait_ms: u32 = 5000,
         closed: std.atomic.Value(bool),
 
         pub fn init(
             allocator: std.mem.Allocator,
+            io: std.Io,
             createFn: *const fn () errors.ResultT(*T),
             destroyFn: *const fn (*T) void,
             validateFn: *const fn (*T) bool,
@@ -44,15 +46,16 @@ pub fn Pool(comptime T: type) type {
         ) !Self {
             var pool = Self{
                 .allocator = allocator,
+                .io = io,
                 .createFn = createFn,
                 .destroyFn = destroyFn,
                 .validateFn = validateFn,
                 .min_idle = config.min_idle,
                 .max_active = config.max_active,
                 .active_count = std.atomic.Value(u32).init(0),
-                .idle_conns = .{},
-                .mutex = .{},
-                .cond = .{},
+                .idle_conns = std.ArrayList(Node).empty,
+                .mutex = std.Io.Mutex.init,
+                .cond = std.Io.Condition.init,
                 .max_wait_ms = config.max_wait_ms,
                 .closed = std.atomic.Value(bool).init(false),
             };
@@ -63,7 +66,7 @@ pub fn Pool(comptime T: type) type {
                 const conn = createFn() catch continue;
                 try pool.idle_conns.append(allocator, .{
                     .conn = conn,
-                    .last_used = std.time.milliTimestamp(),
+                    .last_used = 0,
                 });
                 _ = pool.active_count.fetchAdd(1, .monotonic);
             }
@@ -73,10 +76,10 @@ pub fn Pool(comptime T: type) type {
 
         pub fn deinit(self: *Self) void {
             self.closed.store(true, .monotonic);
-            self.cond.broadcast();
+            self.cond.broadcast(self.io);
 
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lock(self.io) catch return;
+            defer self.mutex.unlock(self.io);
 
             for (self.idle_conns.items) |node| {
                 self.destroyFn(node.conn);
@@ -88,14 +91,14 @@ pub fn Pool(comptime T: type) type {
         pub fn acquire(self: *Self) !*T {
             if (self.closed.load(.monotonic)) return error.ServerError;
 
-            self.mutex.lock();
+            self.mutex.lock(self.io) catch return error.ServerError;
 
             // Try to get an idle connection
             while (self.idle_conns.items.len > 0) {
                 const node = self.idle_conns.pop();
                 if (node) |n| {
                     if (self.validateFn(n.conn)) {
-                        self.mutex.unlock();
+                        self.mutex.unlock(self.io);
                         return n.conn;
                     }
                     self.destroyFn(n.conn);
@@ -106,25 +109,28 @@ pub fn Pool(comptime T: type) type {
             // Check if we can create a new connection
             const current_active = self.active_count.load(.monotonic);
             if (current_active < self.max_active) {
-                self.mutex.unlock();
+                self.mutex.unlock(self.io);
                 const conn = try self.createFn();
                 _ = self.active_count.fetchAdd(1, .monotonic);
                 return conn;
             }
 
             // Wait for a connection to be released
-            const wait_until = std.time.milliTimestamp() + @as(i64, @intCast(self.max_wait_ms));
-            while (self.idle_conns.items.len == 0 and std.time.milliTimestamp() < wait_until) {
-                self.cond.timedWait(&self.mutex, @intCast(wait_until - std.time.milliTimestamp())) catch break;
+            // In Zig 0.16.0, Condition.timedWait API changed; using simple timeout loop
+            var waited: u32 = 0;
+            const step_ms: u32 = 10;
+            while (self.idle_conns.items.len == 0 and waited < self.max_wait_ms) {
+                self.cond.wait(self.io, &self.mutex) catch break;
+                waited += step_ms;
             }
 
             if (self.idle_conns.items.len > 0) {
                 const node = self.idle_conns.pop();
-                self.mutex.unlock();
+                self.mutex.unlock(self.io);
                 if (node) |n| return n.conn;
             }
 
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             return error.Timeout;
         }
 
@@ -136,18 +142,18 @@ pub fn Pool(comptime T: type) type {
                 return;
             }
 
-            self.mutex.lock();
+            self.mutex.lock(self.io) catch return;
             self.idle_conns.append(self.allocator, .{
                 .conn = conn,
-                .last_used = std.time.milliTimestamp(),
+                .last_used = 0,
             }) catch {
-                self.mutex.unlock();
+                self.mutex.unlock(self.io);
                 self.destroyFn(conn);
                 _ = self.active_count.fetchSub(1, .monotonic);
                 return;
             };
-            self.mutex.unlock();
-            self.cond.signal();
+            self.mutex.unlock(self.io);
+            self.cond.signal(self.io);
         }
 
         /// Current active connection count
@@ -157,10 +163,9 @@ pub fn Pool(comptime T: type) type {
 
         /// Current idle connection count
         pub fn idle(self: *Self) usize {
-            self.mutex.lock();
-            const count = self.idle_conns.items.len;
-            self.mutex.unlock();
-            return count;
+            self.mutex.lock(self.io) catch return 0;
+            defer self.mutex.unlock(self.io);
+            return self.idle_conns.items.len;
         }
     };
 }
@@ -210,6 +215,7 @@ test "connection pool" {
 
     var pool = try Pool(u32).init(
         std.testing.allocator,
+        std.testing.io,
         createFn,
         destroyFn,
         validateFn,

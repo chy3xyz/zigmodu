@@ -179,7 +179,7 @@ pub const WorldModule = struct {
                 .token_symbol = token_symbol_copy,
                 .total_supply = 1000000000,
             },
-            .created_at = std.time.timestamp(),
+            .created_at = 0,
         };
 
         try worlds.put(key_copy, world);
@@ -249,7 +249,7 @@ pub const WorldModule = struct {
         std.log.info("[world] Scene removed: {d} from world {d}", .{ scene_id, world_id });
     }
 
-    pub fn renderScene(world_id: u64, scene_id: u64, writer: anytype) !void {
+    pub fn renderScene(alloc: std.mem.Allocator, world_id: u64, scene_id: u64) ![]const u8 {
         var key_buf: [32]u8 = undefined;
         const key = try std.fmt.bufPrint(&key_buf, "{d}", .{world_id});
 
@@ -258,7 +258,10 @@ pub const WorldModule = struct {
         if (scene_id == 0 or scene_id > world.scenes.items.len) return error.SceneNotFound;
         const scene = world.scenes.items[scene_id - 1];
 
-        try writer.print(
+        var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
+        errdefer buf.deinit(alloc);
+
+        try buf.print(alloc,
             \\n            ╔═══════════════════════════════════════════════════════════╗
             \\║  METAVERSE SCENE RENDER                                  ║
             \\╠═══════════════════════════════════════════════════════════╣
@@ -276,11 +279,11 @@ pub const WorldModule = struct {
         });
 
         if (scene.assets.items.len == 0) {
-            try writer.print("║    (Empty scene - no assets placed yet)                  ║\n", .{});
+            try buf.print(alloc, "║    (Empty scene - no assets placed yet)                  ║\n", .{});
         } else {
             for (scene.assets.items) |scene_asset| {
                 if (AssetModule.getAsset(scene_asset.asset_hash)) |asset| {
-                    try writer.print("║    • {s:<30} [{s}]         ║\n", .{
+                    try buf.print(alloc, "║    • {s:<30} [{s}]         ║\n", .{
                         asset.metadata.name,
                         if (scene_asset.interactive) "Interactive" else "Static",
                     });
@@ -288,11 +291,13 @@ pub const WorldModule = struct {
             }
         }
 
-        try writer.print(
+        try buf.print(alloc,
             \\╠═══════════════════════════════════════════════════════════╣
             \\║  Scene Value: {d:>10} tokens                             ║
             \\╚═══════════════════════════════════════════════════════════╝
         , .{scene.calculateValue()});
+
+        return buf.toOwnedSlice(alloc);
     }
 
     pub fn visitWorld(world_id: u64, visitor_did: []const u8) !u64 {

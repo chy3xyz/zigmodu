@@ -21,29 +21,32 @@ pub const RedisConfig = struct {
 pub const Redis = struct {
     allocator: std.mem.Allocator,
     config: RedisConfig,
-    stream: ?std.net.Stream = null,
+    stream: ?std.Io.net.Stream = null,
+    io: std.Io,
 
     /// Create a new Redis client
-    pub fn new(allocator: std.mem.Allocator, cfg: RedisConfig) !Redis {
+    pub fn new(allocator: std.mem.Allocator, io: std.Io, cfg: RedisConfig) !Redis {
         return Redis{
             .allocator = allocator,
             .config = cfg,
             .stream = null,
+            .io = io,
         };
     }
 
     /// Deinitialize Redis client
     pub fn deinit(self: *Redis) void {
         if (self.stream) |s| {
-            s.close();
+            s.close(self.io);
             self.stream = null;
         }
     }
 
+
     /// Connect to Redis server
     pub fn connect(self: *Redis) !void {
-        const address = std.net.Address.parseIp4(self.config.host, self.config.port) catch return error.RedisError;
-        self.stream = std.net.tcpConnectToAddress(address) catch return error.RedisError;
+        const address = std.Io.net.IpAddress.parseIp4(self.config.host, self.config.port) catch return error.RedisError;
+        self.stream = std.Io.net.tcpConnectToAddress(address) catch return error.RedisError;
     }
 
     /// Disconnect from Redis server
@@ -127,7 +130,7 @@ pub const Redis = struct {
     /// Delete keys
     pub fn del(self: *Redis, keys: []const []const u8) errors.ResultT(u32) {
         if (self.stream) |stream| {
-            var cmd_builder: std.ArrayList(u8) = .{};
+            var cmd_builder: std.ArrayList(u8) = std.ArrayList(u8).empty;
             defer cmd_builder.deinit(self.allocator);
 
             try cmd_builder.writer(self.allocator).print("*{d}\r\n$3\r\nDEL\r\n", .{keys.len + 1});
@@ -483,8 +486,8 @@ pub const RedisCluster = struct {
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
             .allocator = allocator,
-            .nodes = std.ArrayList(Redis){},
-            .node_configs = std.ArrayList(RedisConfig){},
+            .nodes = std.ArrayList(Redis).empty,
+            .node_configs = std.ArrayList(RedisConfig).empty,
         };
     }
 
@@ -503,7 +506,7 @@ pub const RedisCluster = struct {
         const host_copy = try self.allocator.dupe(u8, host);
         const cfg = RedisConfig{ .host = host_copy, .port = port };
         try self.node_configs.append(self.allocator, cfg);
-        const redis = try Redis.new(self.allocator, cfg);
+        const redis = try Redis.new(self.allocator, std.testing.io, cfg);
         try self.nodes.append(self.allocator, redis);
     }
 
@@ -599,7 +602,7 @@ test "redis client" {
     if (true) return error.SkipZigTest;
 
     const cfg = RedisConfig{};
-    var redis = try Redis.new(std.testing.allocator, cfg);
+    var redis = try Redis.new(std.testing.allocator, std.testing.io, cfg);
     defer redis.deinit();
 
     try redis.connect();

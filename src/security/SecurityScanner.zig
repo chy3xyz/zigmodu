@@ -10,6 +10,7 @@ pub const SecurityScanner = struct {
     rules: std.array_list.Managed(SecurityRule),
     findings: std.array_list.Managed(SecurityFinding),
     config: Config,
+    io: std.Io,
 
     /// 扫描配置
     pub const Config = struct {
@@ -107,12 +108,13 @@ pub const SecurityScanner = struct {
     };
 
     /// 初始化扫描器
-    pub fn init(allocator: std.mem.Allocator, config: Config) Self {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Config) Self {
         var scanner = Self{
             .allocator = allocator,
             .rules = std.array_list.Managed(SecurityRule).init(allocator),
             .findings = std.array_list.Managed(SecurityFinding).init(allocator),
             .config = config,
+            .io = io,
         };
 
         // 注册默认规则
@@ -219,26 +221,26 @@ pub const SecurityScanner = struct {
     pub fn scanModule(self: *Self, module_path: []const u8) !ScanResult {
         var result = ScanResult{
             .total_files = 0,
-            .findings = std.ArrayList(SecurityFinding){},
+            .findings = std.ArrayList(SecurityFinding).empty,
         };
         errdefer result.findings.deinit(self.allocator);
 
         // 扫描目录下的所有.zig文件
-        var dir = std.fs.cwd().openDir(module_path, .{ .iterate = true }) catch |err| {
+        var dir = std.Io.Dir.cwd().openDir(std.testing.io, module_path, .{ .iterate = true }) catch |err| {
             std.log.err("无法打开模块目录 {s}: {}", .{ module_path, err });
             return result;
         };
-        defer dir.close();
+        defer dir.close(std.testing.io);
 
         var iter = dir.iterate();
-        while (try iter.next()) |entry| {
+        while (try iter.next(std.testing.io)) |entry| {
             if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".zig")) {
                 result.total_files += 1;
 
                 const file_path = try std.fs.path.join(self.allocator, &.{ module_path, entry.name });
                 defer self.allocator.free(file_path);
 
-                const content = dir.readFileAlloc(self.allocator, entry.name, 1024 * 1024) catch |err| {
+                const content = dir.readFileAlloc(self.io, entry.name, self.allocator, std.Io.Limit.limited(1024 * 1024)) catch |err| {
                     std.log.warn("无法读取文件 {s}: {}", .{ entry.name, err });
                     continue;
                 };
@@ -265,26 +267,25 @@ pub const SecurityScanner = struct {
 
     /// 生成扫描报告
     pub fn generateReport(self: *Self, result: *const ScanResult) ![]const u8 {
-        var buf = std.ArrayList(u8){};
-        const writer = buf.writer(self.allocator);
+        var buf = std.ArrayList(u8).empty;
 
-        try writer.writeAll("# Security Scan Report\n\n");
-        try writer.print("Total Files Scanned: {d}\n", .{result.total_files});
-        try writer.print("Total Issues Found: {d}\n\n", .{result.getTotalIssues()});
+        try buf.appendSlice(self.allocator, "# Security Scan Report\n\n");
+        try buf.print(self.allocator, "Total Files Scanned: {d}\n", .{result.total_files});
+        try buf.print(self.allocator, "Total Issues Found: {d}\n\n", .{result.getTotalIssues()});
 
-        try writer.writeAll("## Severity Summary\n\n");
-        try writer.print("- Critical: {d}\n", .{result.critical_count});
-        try writer.print("- High: {d}\n", .{result.high_count});
-        try writer.print("- Medium: {d}\n", .{result.medium_count});
-        try writer.print("- Low: {d}\n", .{result.low_count});
-        try writer.print("- Info: {d}\n\n", .{result.info_count});
+        try buf.appendSlice(self.allocator, "## Severity Summary\n\n");
+        try buf.print(self.allocator, "- Critical: {d}\n", .{result.critical_count});
+        try buf.print(self.allocator, "- High: {d}\n", .{result.high_count});
+        try buf.print(self.allocator, "- Medium: {d}\n", .{result.medium_count});
+        try buf.print(self.allocator, "- Low: {d}\n", .{result.low_count});
+        try buf.print(self.allocator, "- Info: {d}\n\n", .{result.info_count});
 
         if (result.findings.items.len > 0) {
-            try writer.writeAll("## Detailed Findings\n\n");
+            try buf.appendSlice(self.allocator, "## Detailed Findings\n\n");
             for (result.findings.items) |finding| {
                 const formatted = try finding.format(self.allocator);
                 defer self.allocator.free(formatted);
-                try writer.print("- {s} ({s})\n", .{ formatted, finding.file_path });
+                try buf.print(self.allocator, "- {s} ({s})\n", .{ formatted, finding.file_path });
             }
         }
 
@@ -496,7 +497,7 @@ test "SecurityScanner basic" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var scanner = SecurityScanner.init(allocator, .{
+    var scanner = SecurityScanner.init(allocator, std.testing.io, .{
         .min_severity = .LOW,
     });
     defer scanner.deinit();
@@ -574,22 +575,24 @@ test "SecurityScanner scanModule" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const f1 = try tmp_dir.dir.createFile("main.zig", .{});
-    try f1.writeAll("const password = \"secret123\";\n");
-    f1.close();
+    const f1 = try tmp_dir.dir.createFile(std.testing.io, "main.zig", .{});
+    try f1.writeStreamingAll(std.testing.io, "const password = \"secret123\";\n");
+    f1.close(std.testing.io);
 
-    const f2 = try tmp_dir.dir.createFile("http.zig", .{});
-    try f2.writeAll("const url = \"http://example.com\";\n");
-    f2.close();
 
-    const f3 = try tmp_dir.dir.createFile("crypto.zig", .{});
-    try f3.writeAll("const hash = MD5.init();\n");
-    f3.close();
+    const f2 = try tmp_dir.dir.createFile(std.testing.io, "http.zig", .{});
+    try f2.writeStreamingAll(std.testing.io, "const url = \"http://example.com\";\n");
+    f2.close(std.testing.io);
 
-    const base_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+
+    const f3 = try tmp_dir.dir.createFile(std.testing.io, "crypto.zig", .{});
+    try f3.writeStreamingAll(std.testing.io, "const hash = MD5.init();\n");
+    f3.close(std.testing.io);
+
+    const base_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(base_path);
 
-    var scanner = SecurityScanner.init(allocator, .{
+    var scanner = SecurityScanner.init(allocator, std.testing.io, .{
         .min_severity = .LOW,
     });
     defer scanner.deinit();
@@ -607,7 +610,7 @@ test "SecurityScanner generate report" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var scanner = SecurityScanner.init(allocator, .{});
+    var scanner = SecurityScanner.init(allocator, std.testing.io, .{});
     defer scanner.deinit();
 
     const test_code = "const password = \"secret\";\n";
@@ -615,7 +618,7 @@ test "SecurityScanner generate report" {
 
     var dummy_result = SecurityScanner.ScanResult{
         .total_files = 1,
-        .findings = std.ArrayList(SecurityScanner.SecurityFinding){},
+        .findings = std.ArrayList(SecurityScanner.SecurityFinding).empty,
     };
     defer dummy_result.findings.deinit(allocator);
 
@@ -641,19 +644,19 @@ test "SecurityScanner isSecure" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var scanner = SecurityScanner.init(allocator, .{});
+    var scanner = SecurityScanner.init(allocator, std.testing.io, .{});
     defer scanner.deinit();
 
     var secure_result = SecurityScanner.ScanResult{
         .total_files = 1,
-        .findings = std.ArrayList(SecurityScanner.SecurityFinding){},
+        .findings = std.ArrayList(SecurityScanner.SecurityFinding).empty,
         .low_count = 1,
     };
     defer secure_result.findings.deinit(allocator);
 
     var insecure_result = SecurityScanner.ScanResult{
         .total_files = 1,
-        .findings = std.ArrayList(SecurityScanner.SecurityFinding){},
+        .findings = std.ArrayList(SecurityScanner.SecurityFinding).empty,
         .high_count = 1,
     };
     defer insecure_result.findings.deinit(allocator);

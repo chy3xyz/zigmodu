@@ -35,10 +35,8 @@ pub fn retry(comptime T: type, policy: Policy, operation: *const fn () errors.Re
 
             // Calculate delay with exponential backoff and jitter
             const jitter_amount = @as(f64, @floatFromInt(delay_ms)) * policy.jitter;
-            const random_jitter = std.crypto.random.int(u32) % @as(u32, @intFromFloat(jitter_amount * 2));
-            const actual_delay = delay_ms + random_jitter - @as(u64, @intFromFloat(jitter_amount));
-
-            std.Thread.sleep(actual_delay * std.time.ns_per_ms);
+            _ = jitter_amount;
+            // std.Thread.sleep(delay_ms * std.time.ns_per_ms);// TODO: 0.16.0 needs io
 
             delay_ms = @min(policy.max_delay_ms, @as(u64, @intFromFloat(@as(f64, @floatFromInt(delay_ms)) * policy.multiplier)));
         }
@@ -59,10 +57,8 @@ pub fn retryVoid(policy: Policy, operation: *const fn () errors.Result) errors.R
             }
 
             const jitter_amount = @as(f64, @floatFromInt(delay_ms)) * policy.jitter;
-            const random_jitter = std.crypto.random.int(u32) % @as(u32, @intFromFloat(jitter_amount * 2));
-            const actual_delay = delay_ms + random_jitter - @as(u64, @intFromFloat(jitter_amount));
-
-            std.Thread.sleep(actual_delay * std.time.ns_per_ms);
+            _ = jitter_amount;
+            // std.Thread.sleep(delay_ms * std.time.ns_per_ms);// TODO: 0.16.0 needs io
 
             delay_ms = @min(policy.max_delay_ms, @as(u64, @intFromFloat(@as(f64, @floatFromInt(delay_ms)) * policy.multiplier)));
         };

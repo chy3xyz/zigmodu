@@ -220,7 +220,7 @@ src/modules/
 ## Features
 
 - ✅ PascalCase/camelCase/snake_case sanitization
-- ✅ Zig 0.15.2 compatible
+- ✅ Zig 0.16.0 compatible
 - ✅ No external dependencies
 - ✅ Fast code generation
 - ✅ Spring Modulith package-by-module structure

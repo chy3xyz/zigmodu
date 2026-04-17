@@ -2,9 +2,8 @@ const std = @import("std");
 const zigmodu = @import("zigmodu");
 
 /// Example 1: Simple module with the new simplified API
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
     // Create application
     var app = zigmodu.App.init(allocator);
@@ -63,7 +62,7 @@ pub fn main() !void {
             // Publish an event
             self._app.publish(.{ .module_start = .{
                 .module_name = "order-created",
-                .timestamp = std.time.timestamp(),
+                .timestamp = 0,
             } });
         }
 

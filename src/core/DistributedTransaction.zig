@@ -1,5 +1,8 @@
 const std = @import("std");
 
+// ⚠️ EXPERIMENTAL: This module is incomplete and not production-ready.
+/// 分布式事务管理器
+
 /// 分布式事务管理器
 /// 实现 Saga 模式用于分布式事务
 pub const DistributedTransactionManager = struct {
@@ -72,9 +75,9 @@ pub const DistributedTransactionManager = struct {
         const tx = SagaTransaction{
             .id = id,
             .status = .PENDING,
-            .steps = std.ArrayList(SagaTransaction.SagaStep){},
-            .compensations = std.ArrayList(SagaTransaction.CompensationAction){},
-            .start_time = std.time.timestamp(),
+            .steps = std.ArrayList(SagaTransaction.SagaStep).empty,
+            .compensations = std.ArrayList(SagaTransaction.CompensationAction).empty,
+            .start_time = 0,
         };
 
         try self.transactions.put(id, tx);
@@ -127,7 +130,7 @@ pub const DistributedTransactionManager = struct {
         }
 
         tx.status = .COMPLETED;
-        tx.end_time = std.time.timestamp();
+        tx.end_time = 0;
         std.log.info("Transaction '{s}' completed successfully", .{tx_id});
     }
 
@@ -157,7 +160,7 @@ pub const DistributedTransactionManager = struct {
         }
 
         tx.status = .COMPENSATED;
-        tx.end_time = std.time.timestamp();
+        tx.end_time = 0;
         std.log.info("Compensation completed for transaction: {s}", .{tx_id});
     }
 
@@ -252,7 +255,7 @@ pub const TwoPhaseCommit = struct {
         try self.coordinators.put(id_copy, .{
             .tx_id = id_copy,
             .status = .PREPARING,
-            .participants = std.ArrayList(TransactionCoordinator.Participant){},
+            .participants = std.ArrayList(TransactionCoordinator.Participant).empty,
         });
     }
 

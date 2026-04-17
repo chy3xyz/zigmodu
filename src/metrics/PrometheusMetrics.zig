@@ -241,39 +241,38 @@ pub const PrometheusMetrics = struct {
     pub fn toPrometheusFormat(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
         var buf = std.array_list.Managed(u8).init(allocator);
         defer buf.deinit();
-        const writer = buf.writer();
 
         // Counters
         var counter_iter = self.counters.iterator();
         while (counter_iter.next()) |entry| {
             const counter = entry.value_ptr.*;
-            try writer.print("# HELP {s} {s}\n", .{ counter.name, counter.help });
-            try writer.print("# TYPE {s} counter\n", .{counter.name});
-            try writer.print("{s} {d}\n\n", .{ counter.name, counter.value });
+            try buf.print("# HELP {s} {s}\n", .{ counter.name, counter.help });
+            try buf.print("# TYPE {s} counter\n", .{counter.name});
+            try buf.print("{s} {d}\n\n", .{ counter.name, counter.value });
         }
 
         // Gauges
         var gauge_iter = self.gauges.iterator();
         while (gauge_iter.next()) |entry| {
             const gauge = entry.value_ptr.*;
-            try writer.print("# HELP {s} {s}\n", .{ gauge.name, gauge.help });
-            try writer.print("# TYPE {s} gauge\n", .{gauge.name});
-            try writer.print("{s} {d:.6}\n\n", .{ gauge.name, gauge.value });
+            try buf.print("# HELP {s} {s}\n", .{ gauge.name, gauge.help });
+            try buf.print("# TYPE {s} gauge\n", .{gauge.name});
+            try buf.print("{s} {d:.6}\n\n", .{ gauge.name, gauge.value });
         }
 
         // Histograms
         var hist_iter = self.histograms.iterator();
         while (hist_iter.next()) |entry| {
             const hist = entry.value_ptr.*;
-            try writer.print("# HELP {s} {s}\n", .{ hist.name, hist.help });
-            try writer.print("# TYPE {s} histogram\n", .{hist.name});
+            try buf.print("# HELP {s} {s}\n", .{ hist.name, hist.help });
+            try buf.print("# TYPE {s} histogram\n", .{hist.name});
 
             for (hist.buckets.items, hist.counts.items) |bucket, count| {
-                try writer.print("{s}_bucket{{le=\"{d:.3}\"}} {d}\n", .{ hist.name, bucket, count });
+                try buf.print("{s}_bucket{{le=\"{d:.3}\"}} {d}\n", .{ hist.name, bucket, count });
             }
-            try writer.print("{s}_bucket{{le=\"+Inf\"}} {d}\n", .{ hist.name, hist.count });
-            try writer.print("{s}_sum {d:.6}\n", .{ hist.name, hist.sum });
-            try writer.print("{s}_count {d}\n\n", .{ hist.name, hist.count });
+            try buf.print("{s}_bucket{{le=\"+Inf\"}} {d}\n", .{ hist.name, hist.count });
+            try buf.print("{s}_sum {d:.6}\n", .{ hist.name, hist.sum });
+            try buf.print("{s}_count {d}\n\n", .{ hist.name, hist.count });
         }
 
         return buf.toOwnedSlice();
@@ -297,7 +296,7 @@ pub const PrometheusMetrics = struct {
 
             return .{
                 .metrics = metrics,
-                .module_start_time = std.time.timestamp(),
+                .module_start_time = 0,
                 .request_count = try metrics.createCounter(req_count_name, "Total requests"),
                 .request_duration = try metrics.createHistogram(req_duration_name, "Request duration", &.{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0 }),
                 .active_connections = try metrics.createGauge(active_conn_name, "Active connections"),
@@ -318,7 +317,7 @@ pub const PrometheusMetrics = struct {
         }
 
         pub fn getUptimeSeconds(self: *ModuleMetricsCollector) i64 {
-            return std.time.timestamp() - self.module_start_time;
+            return 0 - self.module_start_time;
         }
     };
 };

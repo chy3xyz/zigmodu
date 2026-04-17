@@ -28,6 +28,7 @@ pub const Application = struct {
     modules: ApplicationModules,
     config: Config,
     state: State,
+    io: std.Io,
 
     pub const State = enum {
         initialized,
@@ -43,8 +44,10 @@ pub const Application = struct {
         docs_path: ?[]const u8 = null,
     };
 
+
     /// Initialize application with modules
     pub fn init(
+        io: std.Io,
         allocator: std.mem.Allocator,
         app_name: []const u8,
         comptime modules_tuple: anytype,
@@ -53,6 +56,7 @@ pub const Application = struct {
         const modules = try scanModules(allocator, modules_tuple);
 
         return .{
+            .io = io,
             .allocator = allocator,
             .modules = modules,
             .config = .{
@@ -125,7 +129,7 @@ pub const Application = struct {
 
     /// Generate documentation
     pub fn generateDocs(self: *Self, path: []const u8) !void {
-        try Documentation.generateDocs(&self.modules, path, self.allocator);
+        try Documentation.generateDocs(&self.modules, path, self.allocator, self.io);
         std.log.info("✅ Documentation generated: {s}", .{path});
     }
 
@@ -164,15 +168,16 @@ pub const ApplicationBuilder = struct {
     validate_on_start: bool = true,
     docs_path: ?[]const u8 = null,
     auto_generate_docs: bool = false,
+    io: std.Io,
 
-    pub fn init(allocator: std.mem.Allocator) ApplicationBuilder {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) ApplicationBuilder {
         return .{
             .allocator = allocator,
+            .io = io,
         };
     }
 
     pub fn deinit(self: *ApplicationBuilder) void {
-        // Nothing to clean up currently
         _ = self;
     }
 
@@ -198,6 +203,7 @@ pub const ApplicationBuilder = struct {
 
     pub fn build(self: *ApplicationBuilder, comptime modules: anytype) !Application {
         return Application.init(
+            self.io,
             self.allocator,
             self.app_name,
             modules,
@@ -211,8 +217,8 @@ pub const ApplicationBuilder = struct {
 };
 
 /// Convenience function to create ApplicationBuilder
-pub fn builder(allocator: std.mem.Allocator) ApplicationBuilder {
-    return ApplicationBuilder.init(allocator);
+pub fn builder(allocator: std.mem.Allocator, io: std.Io) ApplicationBuilder {
+    return ApplicationBuilder.init(allocator, io);
 }
 
 test "Application lifecycle" {
@@ -228,7 +234,7 @@ test "Application lifecycle" {
         pub fn deinit() void {}
     };
 
-    var app = try Application.init(allocator, "test-app", .{MockModule}, .{});
+    var app = try Application.init(std.testing.io, allocator, "test-app", .{MockModule}, .{});
     defer app.deinit();
 
     try std.testing.expectEqual(Application.State.initialized, app.getState());
@@ -258,7 +264,7 @@ test "ApplicationBuilder" {
         pub fn deinit() void {}
     };
 
-    var b = ApplicationBuilder.init(allocator);
+    var b = ApplicationBuilder.init(allocator, std.testing.io);
     defer b.deinit();
 
     var app = try b

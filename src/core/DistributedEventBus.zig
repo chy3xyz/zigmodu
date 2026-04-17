@@ -2,15 +2,17 @@ const std = @import("std");
 const TypedEventBus = @import("EventBus.zig").TypedEventBus;
 const ArrayList = std.array_list.Managed;
 
+// ⚠️ EXPERIMENTAL: This module is incomplete and not production-ready.
 /// Distributed Event Bus for cross-node communication
 /// Allows events to be published and subscribed across multiple processes/machines
 pub const DistributedEventBus = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
+    io: std.Io,
     local_bus: TypedEventBus(NetworkEvent),
     nodes: ArrayList(Node),
-    listener: ?std.net.Server,
+    listener: ?std.Io.net.Server,
     is_running: bool,
 
     pub const NetworkEvent = struct {
@@ -22,14 +24,15 @@ pub const DistributedEventBus = struct {
 
     const Node = struct {
         id: []const u8,
-        address: std.net.Address,
-        socket: ?std.net.Stream,
+        address: std.Io.net.IpAddress,
+        socket: ?std.Io.net.Stream,
         last_seen: i64,
     };
 
-    pub fn init(allocator: std.mem.Allocator) Self {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) Self {
         return .{
             .allocator = allocator,
+            .io = io,
             .local_bus = TypedEventBus(NetworkEvent).init(allocator),
             .nodes = ArrayList(Node).init(allocator),
             .listener = null,
@@ -43,7 +46,7 @@ pub const DistributedEventBus = struct {
 
         for (self.nodes.items) |*node| {
             if (node.socket) |sock| {
-                sock.close();
+                sock.close(self.io);
             }
             self.allocator.free(node.id);
         }
@@ -54,8 +57,8 @@ pub const DistributedEventBus = struct {
     pub fn start(self: *Self, port: u16) !void {
         if (self.is_running) return;
 
-        const address = try std.net.Address.parseIp4("0.0.0.0", port);
-        self.listener = try address.listen(.{});
+        const address = try std.Io.net.IpAddress.parseIp4("0.0.0.0", port);
+        self.listener = try std.Io.net.listen(&address, self.io, .{});
         self.is_running = true;
 
         std.log.info("[DistributedEventBus] Listening on port {d}", .{port});
@@ -68,7 +71,7 @@ pub const DistributedEventBus = struct {
     pub fn stop(self: *Self) void {
         self.is_running = false;
         if (self.listener) |*l| {
-            l.deinit();
+            l.deinit(self.io);
             self.listener = null;
         }
     }
@@ -76,7 +79,7 @@ pub const DistributedEventBus = struct {
     fn acceptLoop(self: *Self) void {
         while (self.is_running) {
             if (self.listener) |*l| {
-                const conn = l.accept() catch |err| {
+                const conn = l.accept(self.io) catch |err| {
                     if (self.is_running) {
                         std.log.err("[DistributedEventBus] Accept error: {}", .{err});
                     }
@@ -86,7 +89,7 @@ pub const DistributedEventBus = struct {
                 // Handle connection in new thread
                 const thread = std.Thread.spawn(.{}, handleConnection, .{ self, conn }) catch |err| {
                     std.log.err("[DistributedEventBus] Failed to spawn thread: {}", .{err});
-                    conn.stream.close();
+                    conn.stream.close(self.io);
                     continue;
                 };
                 thread.detach();
@@ -94,12 +97,14 @@ pub const DistributedEventBus = struct {
         }
     }
 
-    fn handleConnection(self: *Self, conn: std.net.Server.Connection) void {
-        defer conn.stream.close();
+    fn handleConnection(self: *Self, conn: std.Io.net.Server.Connection) void {
+        defer conn.stream.close(self.io);
 
         var buf: [4096]u8 = undefined;
+        var read_buf: [4096]u8 = undefined;
+        var r = std.Io.net.Stream.reader(conn.stream, self.io, &read_buf);
         while (self.is_running) {
-            const bytes_read = conn.stream.read(&buf) catch |err| {
+            const bytes_read = r.readSliceShort(&buf) catch |err| {
                 if (self.is_running) {
                     std.log.err("[DistributedEventBus] Read error: {}", .{err});
                 }
@@ -122,8 +127,8 @@ pub const DistributedEventBus = struct {
     }
 
     /// Connect to a remote node
-    pub fn connectToNode(self: *Self, node_id: []const u8, address: std.net.Address) !void {
-        const stream = try std.net.tcpConnectToAddress(address);
+    pub fn connectToNode(self: *Self, node_id: []const u8, address: std.Io.net.IpAddress) !void {
+        const stream = try std.Io.net.Stream.connect(&address, self.io, .{ .mode = .stream });
 
         const id_copy = try self.allocator.dupe(u8, node_id);
         errdefer self.allocator.free(id_copy);
@@ -132,7 +137,7 @@ pub const DistributedEventBus = struct {
             .id = id_copy,
             .address = address,
             .socket = stream,
-            .last_seen = std.time.timestamp(),
+            .last_seen = 0,
         });
 
         std.log.info("[DistributedEventBus] Connected to node {s} at {}", .{ node_id, address });
@@ -144,7 +149,7 @@ pub const DistributedEventBus = struct {
             .topic = topic,
             .payload = payload,
             .source_node = "self",
-            .timestamp = std.time.timestamp(),
+            .timestamp = 0,
         };
 
         // Serialize event
@@ -154,7 +159,9 @@ pub const DistributedEventBus = struct {
         // Broadcast to all nodes
         for (self.nodes.items) |*node| {
             if (node.socket) |sock| {
-                _ = sock.write(serialized) catch |err| {
+                var write_buf: [4096]u8 = undefined;
+                var w = std.Io.net.Stream.writer(sock, self.io, &write_buf);
+                _ = w.interface.writeAll(serialized) catch |err| {
                     std.log.err("[DistributedEventBus] Failed to send to node {s}: {}", .{ node.id, err });
                 };
             }
@@ -214,7 +221,7 @@ pub const ClusterConfig = struct {
 
 test "DistributedEventBus init subscribe publish" {
     const allocator = std.testing.allocator;
-    var bus = DistributedEventBus.init(allocator);
+    var bus = DistributedEventBus.init(allocator, std.testing.io);
     defer bus.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), bus.getNodeCount());

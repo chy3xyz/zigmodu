@@ -1,28 +1,31 @@
 const std = @import("std");
 const ApplicationModules = @import("Module.zig").ApplicationModules;
 
+// ⚠️ EXPERIMENTAL: This module is incomplete and not production-ready.
 /// WebSocket support for real-time monitoring
 /// Provides RFC 6455 WebSocket server functionality for live module updates
 pub const WebSocketServer = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
+    io: std.Io,
     port: u16,
-    server: ?std.net.Server,
+    server: ?std.Io.net.Server,
     is_running: bool,
     clients: std.array_list.Managed(*WebSocketClient),
-    clients_mutex: std.Thread.Mutex,
+    clients_mutex: std.Io.Mutex,
     on_connect_cb: ?*const fn (*WebSocketClient) void,
     on_message_cb: ?*const fn (*WebSocketClient, []const u8) void,
 
-    pub fn init(allocator: std.mem.Allocator, port: u16) Self {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, port: u16) Self {
         return .{
             .allocator = allocator,
+            .io = io,
             .port = port,
             .server = null,
             .is_running = false,
             .clients = std.array_list.Managed(*WebSocketClient).init(allocator),
-            .clients_mutex = .{},
+            .clients_mutex = std.Io.Mutex.init,
             .on_connect_cb = null,
             .on_message_cb = null,
         };
@@ -31,8 +34,8 @@ pub const WebSocketServer = struct {
     pub fn deinit(self: *Self) void {
         self.stop();
 
-        self.clients_mutex.lock();
-        defer self.clients_mutex.unlock();
+        self.clients_mutex.lock(self.io) catch return;
+        defer self.clients_mutex.unlock(self.io);
 
         for (self.clients.items) |client| {
             client.deinit();
@@ -44,8 +47,8 @@ pub const WebSocketServer = struct {
     pub fn start(self: *Self) !void {
         if (self.is_running) return;
 
-        const address = try std.net.Address.parseIp4("0.0.0.0", self.port);
-        self.server = try address.listen(.{ .reuse_address = true });
+        const address = try std.Io.net.IpAddress.parseIp4("0.0.0.0", self.port);
+        self.server = try std.Io.net.listen(&address, self.io, .{ .reuse_address = true });
         self.is_running = true;
 
         std.log.info("[WebSocketServer] Started on ws://0.0.0.0:{d}", .{self.port});
@@ -57,7 +60,7 @@ pub const WebSocketServer = struct {
     pub fn stop(self: *Self) void {
         self.is_running = false;
         if (self.server) |*s| {
-            s.deinit();
+            s.deinit(self.io);
             self.server = null;
         }
     }
@@ -65,7 +68,7 @@ pub const WebSocketServer = struct {
     fn acceptLoop(self: *Self) void {
         while (self.is_running) {
             if (self.server) |*s| {
-                const conn = s.accept() catch |err| {
+                const conn = s.accept(self.io) catch |err| {
                     if (self.is_running) {
                         std.log.err("[WebSocketServer] Accept error: {}", .{err});
                     }
@@ -74,7 +77,7 @@ pub const WebSocketServer = struct {
 
                 const thread = std.Thread.spawn(.{}, handleConnection, .{ self, conn }) catch |err| {
                     std.log.err("[WebSocketServer] Failed to spawn thread: {}", .{err});
-                    conn.stream.close();
+                    conn.stream.close(self.io);
                     continue;
                 };
                 thread.detach();
@@ -82,11 +85,13 @@ pub const WebSocketServer = struct {
         }
     }
 
-    fn handleConnection(self: *Self, conn: std.net.Server.Connection) void {
-        defer conn.stream.close();
+    fn handleConnection(self: *Self, conn: std.Io.net.Server.Connection) void {
+        defer conn.stream.close(self.io);
 
         var buf: [4096]u8 = undefined;
-        const bytes_read = conn.stream.read(&buf) catch |err| {
+        var read_buf: [4096]u8 = undefined;
+        var r = std.Io.net.Stream.reader(conn.stream, self.io, &read_buf);
+        const bytes_read = r.interface.readSliceShort(&buf) catch |err| {
             std.log.err("[WebSocketServer] Read error: {}", .{err});
             return;
         };
@@ -98,7 +103,9 @@ pub const WebSocketServer = struct {
         const ws_key = extractHeaderValue(request, "Sec-WebSocket-Key: ") orelse {
             // Not a WebSocket upgrade request - send HTTP response
             const response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
-            _ = conn.stream.write(response) catch {};
+            var write_buf: [256]u8 = undefined;
+            var w = std.Io.net.Stream.writer(conn.stream, self.io, &write_buf);
+            _ = w.writeAll(response) catch {};
             return;
         };
 
@@ -122,9 +129,11 @@ pub const WebSocketServer = struct {
             "Upgrade: websocket\r\n" ++
             "Connection: Upgrade\r\n" ++
             "Sec-WebSocket-Accept: {s}\r\n" ++
-            "\r\n", .{&accept_key}) catch return;
+            "\r\n", .{accept_key}) catch return;
 
-        _ = conn.stream.write(response) catch |err| {
+        var write_buf: [4096]u8 = undefined;
+        var w = std.Io.net.Stream.writer(conn.stream, self.io, &write_buf);
+        _ = w.writeAll(response) catch |err| {
             std.log.err("[WebSocketServer] Handshake write error: {}", .{err});
             return;
         };
@@ -136,17 +145,17 @@ pub const WebSocketServer = struct {
         };
         errdefer self.allocator.destroy(client);
 
-        client.* = WebSocketClient.init(self.allocator, conn.stream, self);
+        client.* = WebSocketClient.init(self.allocator, conn.stream, self.io, self);
 
-        self.clients_mutex.lock();
+        self.clients_mutex.lock(self.io) catch return;
         self.clients.append(client) catch |err| {
-            self.clients_mutex.unlock();
+            self.clients_mutex.unlock(self.io);
             std.log.err("[WebSocketServer] Failed to add client: {}", .{err});
             client.deinit();
             self.allocator.destroy(client);
             return;
         };
-        self.clients_mutex.unlock();
+        self.clients_mutex.unlock(self.io);
 
         if (self.on_connect_cb) |cb| {
             cb(client);
@@ -155,14 +164,14 @@ pub const WebSocketServer = struct {
         client.run();
 
         // Remove client after disconnect
-        self.clients_mutex.lock();
+        self.clients_mutex.lock(self.io) catch return;
         for (self.clients.items, 0..) |c, i| {
             if (c == client) {
                 _ = self.clients.orderedRemove(i);
                 break;
             }
         }
-        self.clients_mutex.unlock();
+        self.clients_mutex.unlock(self.io);
 
         client.deinit();
         self.allocator.destroy(client);
@@ -179,8 +188,8 @@ pub const WebSocketServer = struct {
     }
 
     pub fn broadcast(self: *Self, message: []const u8) void {
-        self.clients_mutex.lock();
-        defer self.clients_mutex.unlock();
+        self.clients_mutex.lock(self.io) catch return;
+        defer self.clients_mutex.unlock(self.io);
 
         for (self.clients.items) |client| {
             client.sendText(message) catch |err| {
@@ -190,8 +199,8 @@ pub const WebSocketServer = struct {
     }
 
     pub fn clientCount(self: *Self) usize {
-        self.clients_mutex.lock();
-        defer self.clients_mutex.unlock();
+        self.clients_mutex.lock(self.io) catch return 0;
+        defer self.clients_mutex.unlock(self.io);
         return self.clients.items.len;
     }
 
@@ -208,14 +217,16 @@ pub const WebSocketClient = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: std.Io.net.Stream,
+    io: std.Io,
     server: *WebSocketServer,
     is_connected: bool,
 
-    pub fn init(allocator: std.mem.Allocator, stream: std.net.Stream, server: *WebSocketServer) Self {
+    pub fn init(allocator: std.mem.Allocator, stream: std.Io.net.Stream, io: std.Io, server: *WebSocketServer) Self {
         return .{
             .allocator = allocator,
             .stream = stream,
+            .io = io,
             .server = server,
             .is_connected = true,
         };
@@ -223,13 +234,15 @@ pub const WebSocketClient = struct {
 
     pub fn deinit(self: *Self) void {
         self.is_connected = false;
-        self.stream.close();
+        self.stream.close(self.io);
     }
 
     pub fn run(self: *Self) void {
         var buf: [4096]u8 = undefined;
+        var read_buf: [4096]u8 = undefined;
+        var r = std.Io.net.Stream.reader(self.stream, self.io, &read_buf);
         while (self.is_connected) {
-            const frame = self.readFrame(&buf) catch |err| {
+            const frame = self.readFrame(&r, &buf) catch |err| {
                 if (self.is_connected) {
                     std.log.debug("[WebSocketClient] Frame read error: {}", .{err});
                 }
@@ -259,19 +272,14 @@ pub const WebSocketClient = struct {
         payload: []const u8,
     };
 
-    fn readFull(self: *Self, buf: []u8) !void {
-        var read_count: usize = 0;
-        while (read_count < buf.len) {
-            const n = try self.stream.read(buf[read_count..]);
-            if (n == 0) return error.ConnectionClosed;
-            read_count += n;
-        }
+    fn readFull(r: *std.Io.net.Stream.Reader, buf: []u8) !void {
+        _ = try r.interface.readSliceAll(buf);
     }
 
-    fn readFrame(self: *Self, buf: []u8) !Frame {
+    fn readFrame(self: *Self, r: *std.Io.net.Stream.Reader, buf: []u8) !Frame {
+        _ = self;
         var header: [2]u8 = undefined;
-        const h1 = self.stream.read(&header) catch |err| return err;
-        if (h1 < 2) return error.InvalidFrame;
+        try readFull(r, &header);
 
         const opcode = header[0] & 0x0F;
         const masked = (header[1] & 0x80) != 0;
@@ -279,21 +287,21 @@ pub const WebSocketClient = struct {
 
         if (payload_len == 126) {
             var ext: [2]u8 = undefined;
-            try self.readFull(&ext);
+            try readFull(r, &ext);
             payload_len = @as(usize, @intCast(std.mem.readInt(u16, &ext, .big)));
         } else if (payload_len == 127) {
             var ext: [8]u8 = undefined;
-            try self.readFull(&ext);
+            try readFull(r, &ext);
             payload_len = @as(usize, @intCast(std.mem.readInt(u64, &ext, .big)));
         }
 
         var mask_key: [4]u8 = undefined;
         if (masked) {
-            try self.readFull(&mask_key);
+            try readFull(r, &mask_key);
         }
 
         if (payload_len > buf.len) return error.PayloadTooLarge;
-        try self.readFull(buf[0..payload_len]);
+        try readFull(r, buf[0..payload_len]);
 
         if (masked) {
             for (buf[0..payload_len], 0..) |*b, i| {
@@ -339,8 +347,10 @@ pub const WebSocketClient = struct {
             header_len = 10;
         }
 
-        _ = try self.stream.write(header_buf[0..header_len]);
-        _ = try self.stream.write(payload);
+        var write_buf: [4096]u8 = undefined;
+        var w = std.Io.net.Stream.writer(self.stream, self.io, &write_buf);
+        _ = w.writeAll(header_buf[0..header_len]) catch return error.NotConnected;
+        _ = w.writeAll(payload) catch return error.NotConnected;
     }
 };
 
@@ -354,10 +364,10 @@ pub const WebSocketMonitor = struct {
     update_thread: ?std.Thread,
     is_running: bool,
 
-    pub fn init(allocator: std.mem.Allocator, port: u16) Self {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, port: u16) Self {
         return .{
             .allocator = allocator,
-            .ws_server = WebSocketServer.init(allocator, port),
+            .ws_server = WebSocketServer.init(allocator, io, port),
             .modules = null,
             .update_thread = null,
             .is_running = false,
@@ -391,7 +401,7 @@ pub const WebSocketMonitor = struct {
             self.broadcastMetrics() catch |err| {
                 std.log.err("[WebSocketMonitor] Broadcast error: {}", .{err});
             };
-            std.Thread.sleep(5 * std.time.ns_per_s);
+            // std.Thread.sleep(5 * std.time.ns_per_s);// TODO: 0.16.0 needs io
         }
     }
 
@@ -399,7 +409,7 @@ pub const WebSocketMonitor = struct {
         const module_count = if (self.modules) |m| m.modules.count() else 0;
 
         var json_buf: [1024]u8 = undefined;
-        const json = try std.fmt.bufPrint(&json_buf, "{{\"type\":\"metrics\",\"module_count\":{d},\"clients\":{d},\"timestamp\":{d}}}", .{ module_count, self.ws_server.clientCount(), std.time.timestamp() });
+        const json = try std.fmt.bufPrint(&json_buf, "{{\"type\":\"metrics\",\"module_count\":{d},\"clients\":{d},\"timestamp\":{d}}}", .{ module_count, self.ws_server.clientCount(), 0 });
 
         self.ws_server.broadcast(json);
     }
@@ -411,7 +421,7 @@ pub const WebSocketMonitor = struct {
 
 test "WebSocketServer initialization" {
     const allocator = std.testing.allocator;
-    var server = WebSocketServer.init(allocator, 19001);
+    var server = WebSocketServer.init(allocator, std.testing.io, 19001);
     defer server.deinit();
 
     try std.testing.expectEqual(@as(u16, 19001), server.port);
@@ -420,7 +430,7 @@ test "WebSocketServer initialization" {
 
 test "WebSocketMonitor initialization" {
     const allocator = std.testing.allocator;
-    var monitor = WebSocketMonitor.init(allocator, 19002);
+    var monitor = WebSocketMonitor.init(allocator, std.testing.io, 19002);
     defer monitor.deinit();
 
     try std.testing.expectEqual(@as(u16, 19002), monitor.ws_server.port);

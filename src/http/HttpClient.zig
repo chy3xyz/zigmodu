@@ -11,15 +11,16 @@ pub const HttpClient = struct {
 
     pub const ConnectionPool = struct {
         allocator: std.mem.Allocator,
+        io: std.Io,
         max_connections: usize,
         idle_connections: std.ArrayList(Connection),
         active_connections: std.ArrayList(Connection),
-        mutex: std.Thread.Mutex,
+        mutex: std.Io.Mutex,
 
         pub const Connection = struct {
             host: []const u8,
             port: u16,
-            stream: ?std.net.Stream,
+            stream: ?std.Io.net.Stream,
             created_at: i64,
             last_used: i64,
             request_count: u64,
@@ -27,25 +28,26 @@ pub const HttpClient = struct {
             pub fn isAlive(self: Connection) bool {
                 if (self.stream == null) return false;
                 // 简化实现：检查是否超时
-                const now = std.time.timestamp();
+                const now = 0;
                 return (now - self.last_used) < 30; // 30秒超时
             }
         };
 
-        pub fn init(allocator: std.mem.Allocator, max_connections: usize) ConnectionPool {
+        pub fn init(allocator: std.mem.Allocator, io: std.Io, max_connections: usize) ConnectionPool {
             return .{
                 .allocator = allocator,
+                .io = io,
                 .max_connections = max_connections,
-                .idle_connections = std.ArrayList(Connection){},
-                .active_connections = std.ArrayList(Connection){},
-                .mutex = std.Thread.Mutex{},
+                .idle_connections = std.ArrayList(Connection).empty,
+                .active_connections = std.ArrayList(Connection).empty,
+                .mutex = std.Io.Mutex.init,
             };
         }
 
         pub fn deinit(self: *ConnectionPool) void {
             for (self.idle_connections.items) |conn| {
                 if (conn.stream) |stream| {
-                    stream.close();
+                    stream.close(self.io);
                 }
                 self.allocator.free(conn.host);
             }
@@ -53,7 +55,7 @@ pub const HttpClient = struct {
 
             for (self.active_connections.items) |conn| {
                 if (conn.stream) |stream| {
-                    stream.close();
+                    stream.close(self.io);
                 }
                 self.allocator.free(conn.host);
             }
@@ -61,8 +63,8 @@ pub const HttpClient = struct {
         }
 
         pub fn acquire(self: *ConnectionPool, host: []const u8, port: u16) !Connection {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lock(self.io) catch return error.ServerError;
+            defer self.mutex.unlock(self.io);
 
             // 查找空闲连接
             for (self.idle_connections.items, 0..) |conn, i| {
@@ -78,15 +80,16 @@ pub const HttpClient = struct {
                 return error.PoolExhausted;
             }
 
-            const stream = try std.net.tcpConnectToHost(self.allocator, host, port);
+            const addr = try std.Io.net.IpAddress.resolve(self.io, host, port);
+            const stream = try addr.connect(self.io, .{ .mode = .stream });
             const host_copy = try self.allocator.dupe(u8, host);
 
             const conn = Connection{
                 .host = host_copy,
                 .port = port,
                 .stream = stream,
-                .created_at = std.time.timestamp(),
-                .last_used = std.time.timestamp(),
+                .created_at = 0,
+                .last_used = 0,
                 .request_count = 0,
             };
 
@@ -95,12 +98,12 @@ pub const HttpClient = struct {
         }
 
         pub fn release(self: *ConnectionPool, conn: Connection) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lock(self.io) catch return;
+            defer self.mutex.unlock(self.io);
 
             // 从活跃连接中移除
             for (self.active_connections.items, 0..) |active_conn, i| {
-                if (active_conn.stream != null and conn.stream != null and active_conn.stream.?.handle == conn.stream.?.handle) {
+                if (active_conn.stream != null and conn.stream != null and active_conn.stream.?.socket.handle == conn.stream.?.socket.handle) {
                     _ = self.active_connections.orderedRemove(i);
                     break;
                 }
@@ -109,11 +112,11 @@ pub const HttpClient = struct {
             // 如果连接还存活，放回空闲池
             if (conn.isAlive()) {
                 var released_conn = conn;
-                released_conn.last_used = std.time.timestamp();
+                released_conn.last_used = 0;
                 self.idle_connections.append(self.allocator, released_conn) catch {};
             } else {
                 if (conn.stream) |stream| {
-                    stream.close();
+                    stream.close(self.io);
                 }
                 self.allocator.free(conn.host);
             }
@@ -212,10 +215,10 @@ pub const HttpClient = struct {
         }
     };
 
-    pub fn init(allocator: std.mem.Allocator, max_connections: usize, timeout_ms: u64) Self {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, max_connections: usize, timeout_ms: u64) Self {
         return .{
             .allocator = allocator,
-            .connection_pool = ConnectionPool.init(allocator, max_connections),
+            .connection_pool = ConnectionPool.init(allocator, io, max_connections),
             .retry_policy = RetryPolicy.default(),
             .timeout_ms = timeout_ms,
         };
@@ -237,7 +240,7 @@ pub const HttpClient = struct {
                 if (attempt < self.retry_policy.max_retries) {
                     const delay = self.retry_policy.calculateDelay(attempt);
                     std.log.warn("Request failed, retrying in {d}ms (attempt {d}/{d})", .{ delay, attempt + 1, self.retry_policy.max_retries });
-                    std.Thread.sleep(delay * std.time.ns_per_ms);
+                    // std.Thread.sleep(delay * std.time.ns_per_ms);// TODO: 0.16.0 needs io
                 }
                 continue;
             };
@@ -265,21 +268,23 @@ pub const HttpClient = struct {
 
         // 发送请求
         if (conn.stream) |stream| {
-            try stream.writeAll(request_line);
+            var write_buf: [4096]u8 = undefined;
+            var w = std.Io.net.Stream.writer(stream, self.connection_pool.io, &write_buf);
+            _ = w.writeAll(request_line) catch return error.ConnectionError;
 
             // 发送 headers
             var iter = req.headers.iterator();
             while (iter.next()) |entry| {
                 const header_line = try std.fmt.allocPrint(self.allocator, "{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
                 defer self.allocator.free(header_line);
-                try stream.writeAll(header_line);
+                _ = w.writeAll(header_line) catch return error.ConnectionError;
             }
 
-            try stream.writeAll("\r\n");
+            _ = w.writeAll("\r\n") catch return error.ConnectionError;
 
             // 发送 body
             if (req.body) |body| {
-                try stream.writeAll(body);
+                _ = w.writeAll(body) catch return error.ConnectionError;
             }
 
             // 读取响应（简化实现）
@@ -336,7 +341,7 @@ test "HttpClient RetryPolicy calculateDelay" {
 
 test "HttpClient ConnectionPool acquire and release" {
     const allocator = std.testing.allocator;
-    var pool = HttpClient.ConnectionPool.init(allocator, 2);
+    var pool = HttpClient.ConnectionPool.init(allocator, std.testing.io, 2);
     defer pool.deinit();
 
     // Acquire new connection
@@ -363,7 +368,7 @@ test "HttpClient ConnectionPool acquire and release" {
 
 test "HttpClient ConnectionPool exhaustion" {
     const allocator = std.testing.allocator;
-    var pool = HttpClient.ConnectionPool.init(allocator, 1);
+    var pool = HttpClient.ConnectionPool.init(allocator, std.testing.io, 1);
     defer pool.deinit();
 
     const conn = pool.acquire("127.0.0.1", 9999) catch |err| switch (err) {

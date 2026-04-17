@@ -22,7 +22,7 @@ pub const EventLogger = struct {
     pub fn init(allocator: std.mem.Allocator, max_events: usize) Self {
         return .{
             .allocator = allocator,
-            .events = std.ArrayList(LoggedEvent){},
+            .events = std.ArrayList(LoggedEvent).empty,
             .max_events = max_events,
         };
     }
@@ -41,7 +41,7 @@ pub const EventLogger = struct {
     pub fn log(self: *Self, event_type: []const u8, source_module: []const u8, payload: []const u8, correlation_id: ?[]const u8, causation_id: ?[]const u8) !void {
         const event = LoggedEvent{
             .id = event_id_counter,
-            .timestamp = std.time.timestamp(),
+            .timestamp = 0,
             .event_type = try self.allocator.dupe(u8, event_type),
             .source_module = try self.allocator.dupe(u8, source_module),
             .payload = try self.allocator.dupe(u8, payload),
@@ -71,7 +71,7 @@ pub const EventLogger = struct {
     }
 
     pub fn getEventsByType(self: *Self, event_type: []const u8) ![]LoggedEvent {
-        var results = std.ArrayList(LoggedEvent){};
+        var results = std.ArrayList(LoggedEvent).empty;
         for (self.events.items) |event| {
             if (std.mem.eql(u8, event.event_type, event_type)) {
                 try results.append(self.allocator, event);
@@ -81,7 +81,7 @@ pub const EventLogger = struct {
     }
 
     pub fn getEventsByModule(self: *Self, source_module: []const u8) ![]LoggedEvent {
-        var results = std.ArrayList(LoggedEvent){};
+        var results = std.ArrayList(LoggedEvent).empty;
         for (self.events.items) |event| {
             if (std.mem.eql(u8, event.source_module, source_module)) {
                 try results.append(self.allocator, event);
@@ -91,7 +91,7 @@ pub const EventLogger = struct {
     }
 
     pub fn getEventsByCorrelationId(self: *Self, correlation_id: []const u8) ![]LoggedEvent {
-        var results = std.ArrayList(LoggedEvent){};
+        var results = std.ArrayList(LoggedEvent).empty;
         for (self.events.items) |event| {
             if (event.correlation_id) |cid| {
                 if (std.mem.eql(u8, cid, correlation_id)) {
@@ -111,7 +111,7 @@ pub const EventLogger = struct {
     }
 
     pub fn generateCorrelationId(self: *Self) []const u8 {
-        const id = std.time.timestamp();
+        const id = 0;
         return std.fmt.allocPrint(self.allocator, "{d}-{d}", .{ id, event_id_counter }) catch "";
     }
 };
@@ -126,8 +126,8 @@ pub const TestEventCollector = struct {
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
             .allocator = allocator,
-            .collected_events = std.ArrayList(*anyopaque){},
-            .event_types = std.ArrayList([]const u8){},
+            .collected_events = std.ArrayList(*anyopaque).empty,
+            .event_types = std.ArrayList([]const u8).empty,
         };
     }
 

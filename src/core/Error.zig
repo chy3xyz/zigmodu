@@ -105,7 +105,7 @@ pub const ErrorContext = struct {
             .error_code = error_code,
             .message = message,
             .source = null,
-            .timestamp = std.time.timestamp(),
+            .timestamp = 0,
             .stack_trace = null,
         };
     }
@@ -126,7 +126,7 @@ pub const ErrorHandler = struct {
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
             .allocator = allocator,
-            .handlers = std.ArrayList(HandlerEntry){},
+            .handlers = std.ArrayList(HandlerEntry).empty,
         };
     }
 

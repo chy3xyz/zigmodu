@@ -1,8 +1,8 @@
 # ZigModu
 
-A modular application framework for Zig 0.15.2, inspired by Spring Modulith. Build scalable applications from monolithic to distributed systems with progressive architecture evolution.
+A modular application framework for Zig 0.16.0, inspired by Spring Modulith. Build scalable applications from monolithic to distributed systems with progressive architecture evolution.
 
-[![Zig](https://img.shields.io/badge/Zig-0.15.2+-orange?style=flat-square)](https://ziglang.org/)
+[![Zig](https://img.shields.io/badge/Zig-0.16.0+-orange?style=flat-square)](https://ziglang.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
 [![Build](https://img.shields.io/badge/Build-Passing-green?style=flat-square)](https://github.com/knot3bot/zigmodu/actions)
 
@@ -55,10 +55,10 @@ A modular application framework for Zig 0.15.2, inspired by Spring Modulith. Bui
 ### Prerequisites
 
 ```bash
-# Install Zig 0.15.2
-brew install zig@0.15.2  # macOS
+# Install Zig 0.16.0
+brew install zig@0.16.0  # macOS
 # or
-apt install zig=0.15.2   # Linux
+apt install zig=0.16.0   # Linux
 ```
 
 ### Create Your First Module
@@ -94,11 +94,10 @@ const zigmodu = @import("zigmodu");
 
 const user = @import("modules/user.zig");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
-    var modules = try zigmodu.scanModules(gpa.allocator(), .{user});
+    var modules = try zigmodu.scanModules(allocator, .{user});
     defer modules.deinit();
 
     try zigmodu.validateModules(&modules);

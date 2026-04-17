@@ -1,3 +1,4 @@
+// ⚠️ EXPERIMENTAL: This module is incomplete and not production-ready.
 // Advanced Transport Protocols for ZigModu
 
 const std = @import("std");
@@ -69,7 +70,7 @@ pub const CircuitBreaker = struct {
     pub fn execute(self: *Self, comptime T: type, comptime func: anytype, args: anytype) !T {
         switch (self.state) {
             .open => {
-                const elapsed = std.time.timestamp() - (self.last_failure_time orelse 0);
+                const elapsed = 0 - (self.last_failure_time orelse 0);
                 if (elapsed > self.timeout_ms) {
                     self.state = .half_open;
                 } else {
@@ -85,7 +86,7 @@ pub const CircuitBreaker = struct {
             return value;
         } else |err| {
             self.failure_count += 1;
-            self.last_failure_time = std.time.timestamp();
+            self.last_failure_time = 0;
             if (self.failure_count >= self.failure_threshold) self.state = .open;
             return err;
         }
@@ -100,7 +101,7 @@ pub const RateLimiter = struct {
     last_refill: i64,
     
     pub fn init(capacity: f64, refill_rate: f64) RateLimiter {
-        return .{ .capacity = capacity, .tokens = capacity, .refill_rate = refill_rate, .last_refill = std.time.timestamp() };
+        return .{ .capacity = capacity, .tokens = capacity, .refill_rate = refill_rate, .last_refill = 0 };
     }
     
     pub fn tryAcquire(self: *RateLimiter, tokens: f64) bool {
@@ -110,7 +111,7 @@ pub const RateLimiter = struct {
     }
     
     fn refill(self: *RateLimiter) void {
-        const now = std.time.timestamp();
+        const now = 0;
         const elapsed = @as(f64, @floatFromInt(now - self.last_refill));
         self.tokens = @min(self.capacity, self.tokens + elapsed * self.refill_rate);
         self.last_refill = now;

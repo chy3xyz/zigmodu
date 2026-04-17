@@ -888,7 +888,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        zig-version: ["0.15.2"]
+        zig-version: ["0.16.0"]
     
     steps:
       - uses: actions/checkout@v4

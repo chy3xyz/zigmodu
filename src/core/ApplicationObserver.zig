@@ -22,7 +22,7 @@ pub const ApplicationObserver = struct {
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
             .allocator = allocator,
-            .listeners = std.ArrayList(*const fn (Event) void){},
+            .listeners = std.ArrayList(*const fn (Event) void).empty,
         };
     }
 

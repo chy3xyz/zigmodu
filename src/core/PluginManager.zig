@@ -1,5 +1,8 @@
 const std = @import("std");
 
+// ⚠️ EXPERIMENTAL: This module is incomplete and not production-ready.
+/// Plugin System for dynamic module loading
+
 /// Plugin System for dynamic module loading
 /// Supports loading shared libraries (.so on Linux, .dll on Windows, .dylib on macOS)
 pub const PluginManager = struct {
@@ -227,8 +230,8 @@ test "PluginManager load and unload plugin" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("test_plugin.so", .{});
-    file.close();
+    const file = try tmp_dir.dir.createFile(std.testing.io, "test_plugin.so", .{});
+    file.close(std.testing.io);
 
     const path = try tmp_dir.dir.realpathAlloc(allocator, "test_plugin.so");
     defer allocator.free(path);
@@ -252,8 +255,8 @@ test "PluginManager enable and disable plugin" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("test_plugin.so", .{});
-    file.close();
+    const file = try tmp_dir.dir.createFile(std.testing.io, "test_plugin.so", .{});
+    file.close(std.testing.io);
 
     const path = try tmp_dir.dir.realpathAlloc(allocator, "test_plugin.so");
     defer allocator.free(path);
@@ -275,8 +278,8 @@ test "PluginManager load duplicate plugin fails" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("test_plugin.so", .{});
-    file.close();
+    const file = try tmp_dir.dir.createFile(std.testing.io, "test_plugin.so", .{});
+    file.close(std.testing.io);
 
     const path = try tmp_dir.dir.realpathAlloc(allocator, "test_plugin.so");
     defer allocator.free(path);
@@ -304,11 +307,11 @@ test "PluginManager loadAllPlugins" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const f1 = try tmp_dir.dir.createFile("plugin_a.so", .{});
+    const f1 = try tmp_dir.dir.createFile(std.testing.io, "plugin_a.so", .{});
     f1.close();
-    const f2 = try tmp_dir.dir.createFile("plugin_b.dylib", .{});
+    const f2 = try tmp_dir.dir.createFile(std.testing.io, "plugin_b.dylib", .{});
     f2.close();
-    const f3 = try tmp_dir.dir.createFile("readme.txt", .{});
+    const f3 = try tmp_dir.dir.createFile(std.testing.io, "readme.txt", .{});
     f3.close();
 
     const base_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
@@ -329,8 +332,8 @@ test "PluginManager broadcastEvent" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("test_plugin.so", .{});
-    file.close();
+    const file = try tmp_dir.dir.createFile(std.testing.io, "test_plugin.so", .{});
+    file.close(std.testing.io);
 
     const path = try tmp_dir.dir.realpathAlloc(allocator, "test_plugin.so");
     defer allocator.free(path);
@@ -371,8 +374,8 @@ test "PluginManager broadcastEvent dummy" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("test_plugin.so", .{});
-    file.close();
+    const file = try tmp_dir.dir.createFile(std.testing.io, "test_plugin.so", .{});
+    file.close(std.testing.io);
 
     const path = try tmp_dir.dir.realpathAlloc(allocator, "test_plugin.so");
     defer allocator.free(path);

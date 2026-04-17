@@ -1,3 +1,4 @@
+// ⚠️ EXPERIMENTAL: This module is incomplete and not production-ready.
 const std = @import("std");
 const ApplicationModules = @import("./Module.zig").ApplicationModules;
 
@@ -124,16 +125,16 @@ pub const C4ModelGenerator = struct {
         if (system_name.len == 0) return error.InvalidSystemName;
 
         // Ensure output directory exists
-        try std.fs.cwd().makePath(output_dir);
+        try std.Io.Dir.cwd().makePath(output_dir);
         // Context图
         {
             const context_path = try std.fmt.allocPrint(self.allocator, "{s}/c4-context.puml", .{output_dir});
             defer self.allocator.free(context_path);
 
-            const file = try std.fs.cwd().createFile(context_path, .{});
-            defer file.close();
+            const file = try std.Io.Dir.cwd().createFile(context_path, .{});
+            defer file.close(std.testing.io);
 
-            var buf = std.ArrayList(u8){};
+            var buf = std.ArrayList(u8).empty;
             defer buf.deinit(self.allocator);
 
             try self.generateContextDiagram(buf.writer(self.allocator), system_name);
@@ -145,10 +146,10 @@ pub const C4ModelGenerator = struct {
             const container_path = try std.fmt.allocPrint(self.allocator, "{s}/c4-container.puml", .{output_dir});
             defer self.allocator.free(container_path);
 
-            const file = try std.fs.cwd().createFile(container_path, .{});
-            defer file.close();
+            const file = try std.Io.Dir.cwd().createFile(container_path, .{});
+            defer file.close(std.testing.io);
 
-            var buf = std.ArrayList(u8){};
+            var buf = std.ArrayList(u8).empty;
             defer buf.deinit(self.allocator);
 
             try self.generateContainerDiagram(buf.writer(self.allocator), system_name);
@@ -163,10 +164,10 @@ pub const C4ModelGenerator = struct {
             const component_path = try std.fmt.allocPrint(self.allocator, "{s}/c4-component-{s}.puml", .{ output_dir, module_name });
             defer self.allocator.free(component_path);
 
-            const file = try std.fs.cwd().createFile(component_path, .{});
-            defer file.close();
+            const file = try std.Io.Dir.cwd().createFile(component_path, .{});
+            defer file.close(std.testing.io);
 
-            var buf = std.ArrayList(u8){};
+            var buf = std.ArrayList(u8).empty;
             defer buf.deinit(self.allocator);
 
             try self.generateComponentDiagram(buf.writer(self.allocator), module_name);

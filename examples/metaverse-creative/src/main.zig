@@ -11,10 +11,8 @@ const WorldModule = modules.world.WorldModule;
 /// MetaVerse Creative Economy Demo
 /// 元宇宙创意变现平台演示
 /// ============================================
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = std.heap.page_allocator;
 
     std.log.info("\n╔══════════════════════════════════════════════════════════════╗", .{});
     std.log.info("║     MetaVerse Creative Economy Platform Demo                  ║", .{});
@@ -30,7 +28,7 @@ pub fn main() !void {
     defer modules_collection.deinit();
 
     try zigmodu.validateModules(&modules_collection);
-    try zigmodu.generateDocs(&modules_collection, "metaverse_modules.puml", allocator);
+    try zigmodu.generateDocs(&modules_collection, "metaverse_modules.puml", allocator, init.io);
 
     try zigmodu.startAll(&modules_collection);
     defer zigmodu.stopAll(&modules_collection);
@@ -133,11 +131,11 @@ pub fn main() !void {
     // ==================== Phase 5: 场景渲染 ====================
     std.log.info("【Phase 5】世界场景渲染展示\n", .{});
 
-    var render_buf: [4096]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&render_buf);
+    const rendered = try WorldModule.renderScene(allocator, world_id, 1);
+    defer allocator.free(rendered);
+    std.log.info("{s}", .{rendered});
+    std.log.info("【Phase 5】世界场景渲染展示\n", .{});
 
-    try WorldModule.renderScene(world_id, 1, fbs.writer());
-    std.log.info("{s}", .{fbs.getWritten()});
 
     // ==================== Phase 6: 经济流转 ====================
     std.log.info("【Phase 6】经济系统与创作者收益\n", .{});

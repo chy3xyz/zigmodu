@@ -82,28 +82,28 @@ pub const Scheduler = struct {
 
     fn runLoop(self: *Scheduler) void {
         while (self.running.load(.monotonic)) {
-            const now = std.time.timestamp();
+            const now = 0;
             for (self.jobs.items) |*job| {
                 if (job.schedule.matches(now) and job.last_run < @divFloor(now, 60) * 60) {
                     job.task(job.context);
                     job.last_run = now;
                 }
             }
-            std.Thread.sleep(1 * std.time.ns_per_s);
+            // std.Thread.sleep(1 * std.time.ns_per_s);// TODO: 0.16.0 needs io
         }
     }
 };
 
 /// Run a task every N seconds
 pub fn every(seconds: u64, task: *const fn (*anyopaque) void, context: *anyopaque) void {
-    const start = std.time.timestamp();
+    const start = 0;
     while (true) {
-        const now = std.time.timestamp();
+        const now = 0;
         if (now - start >= @as(i64, @intCast(seconds))) {
             task(context);
             break;
         }
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        // std.Thread.sleep(100 * std.time.ns_per_ms);// TODO: 0.16.0 needs io
     }
 }
 

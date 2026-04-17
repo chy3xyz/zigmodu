@@ -1,5 +1,9 @@
 const std = @import("std");
 
+var prng_seed = std.atomic.Value(u64).init(0);
+
+/// 分布式链路追踪器
+
 /// 分布式链路追踪器
 pub const DistributedTracer = struct {
     const Self = @This();
@@ -15,8 +19,14 @@ pub const DistributedTracer = struct {
 
         pub fn generate() TraceId {
             return .{
-                .high = std.crypto.random.int(u64),
-                .low = std.crypto.random.int(u64),
+                .high = blk: {
+                    var prng = std.Random.DefaultPrng.init(prng_seed.fetchAdd(1, .monotonic));
+                    break :blk prng.random().int(u64);
+                },
+                .low = blk: {
+                    var prng = std.Random.DefaultPrng.init(prng_seed.fetchAdd(1, .monotonic));
+                    break :blk prng.random().int(u64);
+                },
             };
         }
 
@@ -29,7 +39,10 @@ pub const DistributedTracer = struct {
         id: u64,
 
         pub fn generate() SpanId {
-            return .{ .id = std.crypto.random.int(u64) };
+            return .{ .id = blk: {
+                var prng = std.Random.DefaultPrng.init(prng_seed.fetchAdd(1, .monotonic));
+                break :blk prng.random().int(u64);
+            } };
         }
 
         pub fn toString(self: SpanId, allocator: std.mem.Allocator) ![]const u8 {
@@ -66,10 +79,10 @@ pub const DistributedTracer = struct {
                 .span_id = span_id,
                 .parent_span_id = parent_span_id,
                 .name = try allocator.dupe(u8, name),
-                .start_time = @intCast(std.time.nanoTimestamp()),
+                .start_time = @intCast(0),
                 .end_time = null,
                 .attributes = std.StringHashMap([]const u8).init(allocator),
-                .events = std.ArrayList(SpanEvent){},
+                .events = std.ArrayList(SpanEvent).empty,
                 .status = .UNSET,
             };
         }
@@ -104,13 +117,13 @@ pub const DistributedTracer = struct {
         pub fn addEvent(self: *Span, allocator: std.mem.Allocator, name: []const u8) !void {
             try self.events.append(allocator, .{
                 .name = try allocator.dupe(u8, name),
-                .timestamp = @intCast(std.time.nanoTimestamp()),
+                .timestamp = @intCast(0),
                 .attributes = std.StringHashMap([]const u8).init(allocator),
             });
         }
 
         pub fn end(self: *Span) void {
-            self.end_time = @intCast(std.time.nanoTimestamp());
+            self.end_time = @intCast(0);
         }
     };
 
@@ -119,7 +132,7 @@ pub const DistributedTracer = struct {
             .allocator = allocator,
             .tracer_name = try allocator.dupe(u8, tracer_name),
             .service_name = try allocator.dupe(u8, service_name),
-            .active_spans = std.ArrayList(*Span){},
+            .active_spans = std.ArrayList(*Span).empty,
         };
     }
 
@@ -173,61 +186,60 @@ pub const DistributedTracer = struct {
     /// 导出为 Jaeger 格式
     pub fn exportJaeger(_self: *Self, span: *Span, allocator: std.mem.Allocator) ![]const u8 {
         _ = _self;
-        var buf = std.ArrayList(u8){};
-        const writer = buf.writer(allocator);
+        var buf = std.ArrayList(u8).empty;
 
         const trace_id_str = try span.trace_id.toString(allocator);
         defer allocator.free(trace_id_str);
         const span_id_str = try span.span_id.toString(allocator);
         defer allocator.free(span_id_str);
 
-        try writer.writeAll("{");
-        try writer.print("\"traceID\":\"{s}\",", .{trace_id_str});
-        try writer.print("\"spanID\":\"{s}\",", .{span_id_str});
+        try buf.appendSlice(allocator, "{");
+        try buf.print(allocator, "\"traceID\":\"{s}\",", .{trace_id_str});
+        try buf.print(allocator, "\"spanID\":\"{s}\",", .{span_id_str});
         if (span.parent_span_id) |parent| {
             const parent_id_str = try parent.toString(allocator);
             defer allocator.free(parent_id_str);
-            try writer.print("\"parentSpanID\":\"{s}\",", .{parent_id_str});
+            try buf.print(allocator, "\"parentSpanID\":\"{s}\",", .{parent_id_str});
         }
-        try writer.print("\"operationName\":\"{s}\",", .{span.name});
-        try writer.print("\"startTime\":{d},", .{span.start_time});
-        try writer.print("\"duration\":{d},", .{if (span.end_time) |et| et - span.start_time else 0});
-        try writer.writeAll("\"tags\":[");
+        try buf.print(allocator, "\"operationName\":\"{s}\",", .{span.name});
+        try buf.print(allocator, "\"startTime\":{d},", .{span.start_time});
+        try buf.print(allocator, "\"duration\":{d},", .{if (span.end_time) |et| et - span.start_time else 0});
+        try buf.appendSlice(allocator, "\"tags\":[");
 
         var first = true;
         var iter = span.attributes.iterator();
         while (iter.next()) |entry| {
-            if (!first) try writer.writeAll(",");
+            if (!first) try buf.appendSlice(allocator, ",");
             first = false;
-            try writer.print("{{\"key\":\"{s}\",\"value\":\"{s}\"}}", .{ entry.key_ptr.*, entry.value_ptr.* });
+            try buf.print(allocator, "{{\"key\":\"{s}\",\"value\":\"{s}\"}}", .{ entry.key_ptr.*, entry.value_ptr.* });
         }
 
-        try writer.writeAll("]}");
+        try buf.appendSlice(allocator, "]}");
         return buf.toOwnedSlice(allocator);
     }
 
     /// 导出为 Zipkin 格式
     pub fn exportZipkin(self: *Self, span: *Span, allocator: std.mem.Allocator) ![]const u8 {
-        var buf = std.ArrayList(u8){};
-        const writer = buf.writer(allocator);
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(allocator);
 
         const trace_id_str = try span.trace_id.toString(allocator);
         defer allocator.free(trace_id_str);
         const span_id_str = try span.span_id.toString(allocator);
         defer allocator.free(span_id_str);
 
-        try writer.writeAll("[");
-        try writer.writeAll("{");
-        try writer.print("\"traceId\":\"{s}\",", .{trace_id_str});
-        try writer.print("\"id\":\"{s}\",", .{span_id_str});
-        try writer.print("\"name\":\"{s}\",", .{span.name});
-        try writer.print("\"timestamp\":{d},", .{@divFloor(span.start_time, 1000)});
+        try buf.appendSlice(allocator, "[");
+        try buf.appendSlice(allocator, "{");
+        try buf.print(allocator, "\"traceId\":\"{s}\",", .{trace_id_str});
+        try buf.print(allocator, "\"id\":\"{s}\",", .{span_id_str});
+        try buf.print(allocator, "\"name\":\"{s}\",", .{span.name});
+        try buf.print(allocator, "\"timestamp\":{d},", .{@divFloor(span.start_time, 1000)});
         if (span.end_time) |et| {
-            try writer.print("\"duration\":{d},", .{@divFloor(et - span.start_time, 1000)});
+            try buf.print(allocator, "\"duration\":{d},", .{@divFloor(et - span.start_time, 1000)});
         }
-        try writer.print("\"localEndpoint\":{{\"serviceName\":\"{s}\"}}", .{self.service_name});
-        try writer.writeAll("}");
-        try writer.writeAll("]");
+        try buf.print(allocator, "\"localEndpoint\":{{\"serviceName\":\"{s}\"}}", .{self.service_name});
+        try buf.appendSlice(allocator, "}");
+        try buf.appendSlice(allocator, "]");
 
         return buf.toOwnedSlice(allocator);
     }
@@ -267,7 +279,8 @@ pub const Sampler = struct {
         probability: f64,
 
         pub fn shouldSample(self: ProbabilitySampler) bool {
-            const random = std.crypto.random.float(f64);
+            var prng = std.Random.DefaultPrng.init(prng_seed.fetchAdd(1, .monotonic));
+            const random = prng.random().float(f64);
             return random < self.probability;
         }
     };

@@ -46,7 +46,7 @@ pub const MessageQueue = struct {
             return .{
                 .allocator = allocator,
                 .backend = backend,
-                .topics = std.ArrayList([]const u8){},
+                .topics = std.ArrayList([]const u8).empty,
             };
         }
 
@@ -85,7 +85,7 @@ pub const MessageQueue = struct {
 
         pub fn publish(self: *InMemoryBackend, msg: Message) !void {
             const queue = self.queues.getPtr(msg.topic) orelse blk: {
-                const new_queue = std.ArrayList(Message){};
+                const new_queue = std.ArrayList(Message).empty;
                 try self.queues.put(msg.topic, new_queue);
                 break :blk self.queues.getPtr(msg.topic).?;
             };
@@ -134,7 +134,7 @@ test "MessageQueue InMemoryBackend publish and consume" {
         .topic = "orders",
         .payload = "{\"order_id\":123}",
         .headers = std.StringHashMap([]const u8).init(allocator),
-        .timestamp = std.time.timestamp(),
+        .timestamp = 0,
     };
 
     try backend.publish(msg);
@@ -166,7 +166,7 @@ test "MessageQueue Producer and Consumer" {
         .topic = "events",
         .payload = "hello",
         .headers = std.StringHashMap([]const u8).init(allocator),
-        .timestamp = std.time.timestamp(),
+        .timestamp = 0,
     };
 
     try producer.publish(msg);

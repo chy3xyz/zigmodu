@@ -114,7 +114,7 @@ pub const ModuleListenerRegistry = struct {
         // Validate input
         if (module_name.len == 0) return error.InvalidModuleName;
 
-        var result = std.ArrayList(ListenerInfo){};
+        var result = std.ArrayList(ListenerInfo).empty;
         errdefer result.deinit(self.allocator);
 
         var iter = self.listeners.iterator();
@@ -145,7 +145,7 @@ pub const EventExternalization = struct {
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
             .allocator = allocator,
-            .externalizers = std.ArrayList(Externalizer){},
+            .externalizers = std.ArrayList(Externalizer).empty,
         };
     }
 

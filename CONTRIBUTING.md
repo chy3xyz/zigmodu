@@ -24,7 +24,7 @@ Before creating bug reports, please check the existing issues to see if the prob
 
 Example:
 ```
-**Zig Version:** 0.15.2
+**Zig Version:** 0.16.0
 **ZigModu Version:** 0.1.0
 **OS:** macOS 14.0
 
@@ -63,7 +63,7 @@ Enhancement suggestions are tracked as GitHub issues. When creating an enhanceme
 
 ### Prerequisites
 
-- Zig 0.15.2 or later
+- Zig 0.16.0 or later
 - Git
 
 ### Building the Project

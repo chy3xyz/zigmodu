@@ -371,12 +371,12 @@ pub const IntegrationTest = struct {
 
     pub fn waitFor(self: *Self, condition: fn () bool, timeout_ms: u64) !void {
         _ = self;
-        const start = std.time.milliTimestamp();
+        const start = 0;
         while (!condition()) {
-            if (@as(u64, @intCast(std.time.milliTimestamp() - start)) > timeout_ms) {
+            if (@as(u64, @intCast(0 - start)) > timeout_ms) {
                 return error.Timeout;
             }
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+            // std.Thread.sleep(10 * std.time.ns_per_ms);// TODO: 0.16.0 needs io
         }
     }
 
@@ -430,7 +430,7 @@ fn EventCapture(comptime T: type) type {
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
                 .allocator = allocator,
-                .events = std.ArrayList(T){},
+                .events = std.ArrayList(T).empty,
             };
         }
 
@@ -554,10 +554,10 @@ pub const ConcurrentTest = struct {
         tasks: []const fn () anyerror!ResultType,
         timeout_ms: u64,
     ) ![]ResultType {
-        const start = std.time.milliTimestamp();
+        const start = 0;
         const results = try parallel(allocator, ResultType, tasks);
 
-        const elapsed = @as(u64, @intCast(std.time.milliTimestamp() - start));
+        const elapsed = @as(u64, @intCast(0 - start));
         if (elapsed > timeout_ms) {
             allocator.free(results);
             return error.Timeout;

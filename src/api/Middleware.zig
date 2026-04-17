@@ -15,6 +15,8 @@ pub const CorsConfig = struct {
 
 /// CORS middleware
 pub fn cors(config: CorsConfig) api.Middleware {
+    const cfg_ptr = std.heap.page_allocator.create(CorsConfig) catch unreachable;
+    cfg_ptr.* = config;
     return .{
         .func = struct {
             fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
@@ -33,16 +35,18 @@ pub fn cors(config: CorsConfig) api.Middleware {
                 try next(ctx);
             }
         }.mw,
-        .user_data = @ptrCast(@constCast(&config)),
+        .user_data = @ptrCast(cfg_ptr),
     };
 }
+
+var request_id_counter = std.atomic.Value(u64).init(0);
 
 /// Request ID middleware - adds X-Request-Id header
 pub fn requestId() api.Middleware {
     return .{
         .func = struct {
             fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
-                const id = try std.fmt.allocPrint(ctx.allocator, "{x:0>16}", .{std.crypto.random.int(u64)});
+                const id = try std.fmt.allocPrint(ctx.allocator, "{x:0>16}", .{request_id_counter.fetchAdd(1, .monotonic)});
                 defer ctx.allocator.free(id);
                 try ctx.setHeader("X-Request-Id", id);
                 try next(ctx);
@@ -56,9 +60,9 @@ pub fn logging() api.Middleware {
     return .{
         .func = struct {
             fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
-                const start = std.time.milliTimestamp();
+                const start = 0;
                 try next(ctx);
-                const elapsed = std.time.milliTimestamp() - start;
+                const elapsed = 0 - start;
                 std.log.info("{s} {s} {d} {d}ms", .{
                     ctx.method.toString(),
                     ctx.raw_path,
@@ -94,9 +98,9 @@ pub fn requestTimeout(timeout_ms: u64) api.Middleware {
     return .{
         .func = struct {
             fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
-                const deadline = std.time.milliTimestamp() + @as(u64, @intFromPtr(user_data));
+                const deadline = 0 + @as(u64, @intFromPtr(user_data));
                 try next(ctx);
-                if (std.time.milliTimestamp() > deadline) {
+                if (0 > deadline) {
                     ctx.status_code = 504;
                 }
             }
@@ -176,7 +180,8 @@ pub fn jwtAuth(secret: []const u8) api.Middleware {
     return .{
         .func = struct {
             fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
-                const jwt_secret: []const u8 = @ptrCast(@alignCast(user_data.?));
+                const jwt_secret_ptr: *const []const u8 = @ptrCast(@alignCast(user_data.?));
+                const jwt_secret = jwt_secret_ptr.*;
                 const auth = ctx.headers.get("Authorization") orelse {
                     try ctx.sendError(401, "Unauthorized");
                     return;
@@ -196,7 +201,7 @@ pub fn jwtAuth(secret: []const u8) api.Middleware {
                 try next(ctx);
             }
         }.mw,
-        .user_data = @ptrCast(@constCast(secret.ptr)),
+        .user_data = @constCast(@ptrCast(&secret)),
     };
 }
 

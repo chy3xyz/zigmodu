@@ -1,5 +1,8 @@
 const std = @import("std");
 
+// ⚠️ EXPERIMENTAL: This module is incomplete and not production-ready.
+/// ModuleContract - Runtime contract verification for modules
+
 /// 模块契约定义
 /// 显式声明模块发布/消费的事件、提供的API和依赖的服务
 /// 这是架构评估中的高优先级改进项，用于提高模块间的契约清晰度

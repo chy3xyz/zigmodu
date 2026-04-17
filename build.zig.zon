@@ -1,14 +1,9 @@
 .{
     .name = .zigmodu,
-    .version = "0.5.3",
+    .version = "0.5.5",
     .fingerprint = 0x7aa42d07b32f8d53,
-    .minimum_zig_version = "0.15.2",
-    .dependencies = .{
-        .zio = .{
-            .url = "https://github.com/lalinsky/zio/archive/refs/tags/v0.9.0.tar.gz",
-            .hash = "12202c874628a8fc488cd8bcfdd08c2cbfb9e4e09b64313e49a2129d410c0c50ea13",
-        },
-    },
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
     .paths = .{
         "build.zig",
         "build.zig.zon",

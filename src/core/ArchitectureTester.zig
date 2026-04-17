@@ -34,7 +34,7 @@ pub const ArchitectureTester = struct {
         return .{
             .allocator = allocator,
             .modules = modules,
-            .violations = std.ArrayList(Violation){},
+            .violations = std.ArrayList(Violation).empty,
         };
     }
 
@@ -287,25 +287,25 @@ pub const ArchitectureTester = struct {
     }
 
     /// 打印违规报告
-    pub fn printReport(self: *Self, writer: anytype) !void {
-        try writer.writeAll("\n=== Architecture Test Report ===\n\n");
+    pub fn printReport(self: *Self, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+        try buf.appendSlice(allocator, "\n=== Architecture Test Report ===\n\n");
 
         const error_count = self.getViolationCountBySeverity(Severity.err);
         const warning_count = self.getViolationCountBySeverity(Severity.warning);
         const info_count = self.getViolationCountBySeverity(Severity.info);
 
-        try writer.print("Total Violations: {d}\n", .{self.getViolationCount()});
-        try writer.print("  Errors:   {d}\n", .{error_count});
-        try writer.print("  Warnings: {d}\n", .{warning_count});
-        try writer.print("  Info:     {d}\n\n", .{info_count});
+        try buf.print(allocator, "Total Violations: {d}\n", .{self.getViolationCount()});
+        try buf.print(allocator, "  Errors:   {d}\n", .{error_count});
+        try buf.print(allocator, "  Warnings: {d}\n", .{warning_count});
+        try buf.print(allocator, "  Info:     {d}\n\n", .{info_count});
 
         if (self.violations.items.len == 0) {
-            try writer.writeAll("All architecture rules passed!\n");
+            try buf.appendSlice(allocator, "All architecture rules passed!\n");
             return;
         }
 
-        try writer.writeAll("Violations:\n");
-        try writer.writeAll("-----------\n");
+        try buf.appendSlice(allocator, "Violations:\n");
+        try buf.appendSlice(allocator, "-----------\n");
 
         for (self.violations.items) |violation| {
             const severity_str = switch (violation.severity) {
@@ -314,9 +314,9 @@ pub const ArchitectureTester = struct {
                 Severity.info => "INFO",
             };
 
-            try writer.print("[{s}] {s}\n", .{ severity_str, violation.rule_name });
-            try writer.print("  Module: {s}\n", .{violation.module_name});
-            try writer.print("  Message: {s}\n\n", .{violation.message});
+            try buf.print(allocator, "[{s}] {s}\n", .{ severity_str, violation.rule_name });
+            try buf.print(allocator, "  Module: {s}\n", .{violation.module_name});
+            try buf.print(allocator, "  Message: {s}\n\n", .{violation.message});
         }
     }
 
@@ -405,9 +405,8 @@ test "ArchitectureTester print report" {
 
     try tester.ruleNoSelfDependency();
 
-    var buf = std.ArrayList(u8){};
-    const writer = buf.writer(allocator);
-    try tester.printReport(writer);
+    var buf = std.ArrayList(u8).empty;
+    try tester.printReport(&buf, allocator);
     const report = try buf.toOwnedSlice(allocator);
     defer allocator.free(report);
 

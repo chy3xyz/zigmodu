@@ -1,10 +1,10 @@
 # ZigModu Framework Agent Guide
 
 ## Project Overview
-ZigModu is a modular application framework for Zig 0.15.2, aligned with Spring Modulith core features. **Currently fully implemented and working.**
+ZigModu is a modular application framework for Zig 0.16.0, aligned with Spring Modulith core features. **Currently fully implemented and working.**
 
 ## Critical Constraints
-- **Zig Version**: Must use Zig 0.15.2 exactly
+- **Zig Version**: Must use Zig 0.16.0 exactly
 - **No GC**: Framework avoids hidden allocations; uses explicit memory management
 - **Compile-time Validation**: Module dependencies checked at compile time where possible
 - **Explicit Lifecycle**: Modules must implement `init() !void` and `deinit() void`
@@ -12,7 +12,7 @@ ZigModu is a modular application framework for Zig 0.15.2, aligned with Spring M
 ## Project Structure
 ```
 zigmodu/
-├── build.zig                  # Build system (Zig 0.15.2 syntax)
+├── build.zig                  # Build system (Zig 0.16.0 syntax)
 ├── build.zig.zon              # Dependency management
 ├── AGENTS.md                  # This file
 ├── dev.md                     # Design document
@@ -84,10 +84,8 @@ const zigmodu = @import("zigmodu");
 const order = @import("order/module.zig");
 const inventory = @import("inventory/module.zig");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
     // REQUIRED sequence:
     var modules = try zigmodu.scanModules(allocator, .{ order, inventory });
@@ -100,13 +98,13 @@ pub fn main() !void {
 }
 ```
 
-### 3. build.zig.zon Format (Zig 0.15.2)
+### 3. build.zig.zon Format (Zig 0.16.0)
 ```zig
 .{
     .name = .zigmodu,  // MUST be enum literal, not string!
     .version = "0.1.0",
     .fingerprint = 0x7aa42d07b32f8d53,  // Required for new packages
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zio = .{
             .url = "https://github.com/lalinsky/zio/archive/refs/tags/v0.9.0.tar.gz",
@@ -121,7 +119,7 @@ pub fn main() !void {
 }
 ```
 
-### 4. build.zig Format (Zig 0.15.2)
+### 4. build.zig Format (Zig 0.16.0)
 ```zig
 const std = @import("std");
 

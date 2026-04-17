@@ -28,19 +28,21 @@ pub const StructuredLogger = struct {
     level: LogLevel,
     output: Output,
     context: std.StringHashMap([]const u8),
+    io: std.Io,
 
     const Output = union(enum) {
         stdout,
         stderr,
-        file: std.fs.File,
+        file: std.Io.File,
     };
 
-    pub fn init(allocator: std.mem.Allocator, level: LogLevel, output: Output) Self {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, level: LogLevel, output: Output) Self {
         return .{
             .allocator = allocator,
             .level = level,
             .output = output,
             .context = std.StringHashMap([]const u8).init(allocator),
+            .io = io,
         };
     }
 
@@ -67,7 +69,7 @@ pub const StructuredLogger = struct {
         }
 
         var entry = LogEntry{
-            .timestamp = std.time.timestamp(),
+            .timestamp = 0,
             .level = level,
             .message = message,
             .fields = std.StringHashMap([]const u8).init(self.allocator),
@@ -108,9 +110,9 @@ pub const StructuredLogger = struct {
         // 1. 日志系统本身不应该因为输出失败而崩溃
         // 2. 无法通过日志记录日志失败
         switch (self.output) {
-            .stdout => std.fs.File.stdout().writeAll(json) catch {},
-            .stderr => std.fs.File.stderr().writeAll(json) catch {},
-            .file => |file| file.writeAll(json) catch {},
+            .stdout => std.Io.File.stdout().writeStreamingAll(self.io, json) catch {},
+            .stderr => std.Io.File.stderr().writeStreamingAll(self.io, json) catch {},
+            .file => |file| file.writeStreamingAll(self.io, json) catch {},
         }
     }
 
@@ -159,7 +161,7 @@ pub const LogRotator = struct {
 
     pub fn deinit(self: *Self) void {
         if (self.current_file) |file| {
-            file.close();
+            file.close(std.testing.io);
         }
         self.allocator.free(self.base_path);
     }
@@ -178,7 +180,7 @@ pub const LogRotator = struct {
     fn rotate(self: *Self) !void {
         // 关闭当前文件
         if (self.current_file) |file| {
-            file.close();
+            file.close(std.testing.io);
         }
 
         // 轮转旧文件
@@ -201,7 +203,7 @@ pub const LogRotator = struct {
         std.fs.rename(self.base_path, backup_name) catch {};
 
         // 创建新文件
-        self.current_file = try std.fs.cwd().createFile(self.base_path, .{});
+        self.current_file = try std.Io.Dir.cwd().createFile(self.base_path, .{});
         self.current_size = 0;
     }
 };
@@ -216,19 +218,16 @@ const LogEntry = struct {
     pub fn toJson(self: LogEntry, allocator: std.mem.Allocator) ![]const u8 {
         var buf = std.array_list.Managed(u8).init(allocator);
         defer buf.deinit();
-        const writer = buf.writer();
 
-        try writer.writeAll("{");
-        try writer.print("\"timestamp\":{d},", .{self.timestamp});
-        try writer.print("\"level\":\"{s}\",", .{self.level.asString()});
-        try writer.print("\"message\":\"{s}\"", .{self.message});
+        try buf.appendSlice("{");
+        try buf.print("\"timestamp\":{d},", .{self.timestamp});
+        try buf.print("\"level\":\"{s}\",", .{self.level.asString()});
+        try buf.print("\"message\":\"{s}\"", .{self.message});
 
         var iter = self.fields.iterator();
         while (iter.next()) |entry| {
-            try writer.print(",\"{s}\":\"{s}\"", .{ entry.key_ptr.*, entry.value_ptr.* });
+            try buf.print(",\"{s}\":\"{s}\"", .{ entry.key_ptr.*, entry.value_ptr.* });
         }
-
-        try writer.writeAll("}\n");
 
         return buf.toOwnedSlice();
     }
@@ -238,13 +237,13 @@ test "StructuredLogger basic" {
     const allocator = std.testing.allocator;
 
     // Use a temp file instead of stdout to avoid corrupting test runner protocol
-    const tmp_file = try std.fs.cwd().createFile("zigmodu_test_log.tmp", .{});
+    const tmp_file = try std.Io.Dir.cwd().createFile(std.testing.io, "zigmodu_test_log.tmp", .{});
     defer {
-        tmp_file.close();
-        std.fs.cwd().deleteFile("zigmodu_test_log.tmp") catch {};
+        tmp_file.close(std.testing.io);
+        std.Io.Dir.cwd().deleteFile(std.testing.io, "zigmodu_test_log.tmp") catch {};
     }
 
-    var logger = StructuredLogger.init(allocator, .INFO, .{ .file = tmp_file });
+    var logger = StructuredLogger.init(allocator, std.testing.io, .INFO, .{ .file = tmp_file });
     defer logger.deinit();
 
     try logger.withField("app", "test");

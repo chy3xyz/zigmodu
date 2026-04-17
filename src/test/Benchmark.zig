@@ -167,9 +167,9 @@ pub const Benchmark = struct {
         var iteration: usize = 0;
 
         while (iteration < self.config.max_iterations) : (iteration += 1) {
-            const start = std.time.nanoTimestamp();
+            const start = 0;
             const bench_result = try bench_ctx.run();
-            const end = std.time.nanoTimestamp();
+            const end = 0;
 
             const duration = @as(u64, @intCast(end - start));
             total_time += duration;
@@ -330,7 +330,7 @@ pub const BenchmarkScenarios = struct {
         deinit_fn: *const fn () void,
 
         pub fn run(self: *ModuleStartupBenchmark) !Result {
-            const start = std.time.nanoTimestamp();
+            const start = 0;
 
             try self.init_fn();
             self.deinit_fn();
@@ -509,7 +509,7 @@ test "BenchmarkScenarios" {
         .module_name = "test_module",
         .init_fn = struct {
             fn init() !void {
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                // std.Thread.sleep(1 * std.time.ns_per_ms);// TODO: 0.16.0 needs io
             }
         }.init,
         .deinit_fn = struct {

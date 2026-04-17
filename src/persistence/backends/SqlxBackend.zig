@@ -81,7 +81,7 @@ pub const SqlxBackend = struct {
 test "ORM with SqlxBackend end-to-end (sqlite)" {
     const allocator = std.testing.allocator;
 
-    var client = sqlx.Client.init(allocator, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
 
     // Create table manually (migrations would do this in real app)

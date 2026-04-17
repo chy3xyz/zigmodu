@@ -25,7 +25,7 @@ pub const Validator = struct {
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
             .allocator = allocator,
-            .errors = std.ArrayList(ValidationError){},
+            .errors = std.ArrayList(ValidationError).empty,
         };
     }
 
@@ -177,33 +177,6 @@ pub const Validator = struct {
     }
 };
 
-/// DTO 定义宏（简化版）
-pub fn defineDto(comptime name: []const u8, comptime fields: anytype) type {
-    _ = name;
-
-    // SAFETY: This array is filled completely by the inline for loop below
-    // before being used. All struct_fields elements are initialized.
-    var struct_fields: [@typeInfo(@TypeOf(fields)).Struct.fields.len]std.builtin.Type.StructField = undefined;
-
-    inline for (@typeInfo(@TypeOf(fields)).Struct.fields, 0..) |field, i| {
-        struct_fields[i] = .{
-            .name = field.name,
-            .type = field.type,
-            .default_value = null,
-            .is_comptime = false,
-            .alignment = @alignOf(field.type),
-        };
-    }
-
-    return @Type(.{
-        .Struct = .{
-            .layout = .auto,
-            .fields = &struct_fields,
-            .decls = &.{},
-            .is_tuple = false,
-        },
-    });
-}
 
 // 示例 DTO
 test "Validator - basic validation" {

@@ -110,7 +110,7 @@ pub const IdentityModule = struct {
             .did = did_copy,
             .display_name = name_copy,
             .wallet_address = wallet_copy,
-            .created_at = std.time.timestamp(),
+            .created_at = 0,
         };
 
         try identities.put(did_copy, identity);

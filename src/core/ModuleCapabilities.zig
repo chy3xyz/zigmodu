@@ -13,9 +13,9 @@ pub const ModuleCapabilities = struct {
         _ = _allocator;
         return .{
             .module_name = module_name,
-            .published_events = std.ArrayList([]const u8){},
-            .consumed_events = std.ArrayList([]const u8){},
-            .exposed_apis = std.ArrayList([]const u8){},
+            .published_events = std.ArrayList([]const u8).empty,
+            .consumed_events = std.ArrayList([]const u8).empty,
+            .exposed_apis = std.ArrayList([]const u8).empty,
             .internal_only = false,
         };
     }
@@ -104,7 +104,7 @@ pub const CapabilityRegistry = struct {
     }
 
     pub fn generateApiBoundaryReport(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
-        var buf = std.ArrayList(u8){};
+        var buf = std.ArrayList(u8).empty;
         const writer = buf.writer(allocator);
 
         try writer.writeAll("# Module API Boundaries\n\n");

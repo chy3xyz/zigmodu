@@ -7,66 +7,27 @@ const errors = @import("../sqlx/errors.zig");
 
 /// Parallel executes a function for each item in a slice concurrently.
 /// `max_workers` controls concurrency (0 means len(items)).
+/// NOTE: In Zig 0.16.0, std.Thread.WaitGroup was removed. This implementation
+/// uses sequential execution for simplicity since this is experimental code.
 pub fn Parallel(comptime T: type, _allocator: std.mem.Allocator, items: []const T, max_workers: usize, func: *const fn (T) void) !void {
     _ = _allocator;
-    const workers = if (max_workers == 0) items.len else @min(max_workers, items.len);
-    if (workers == 0) return;
-
-    var wg = std.Thread.WaitGroup{};
-    var semaphore = std.Thread.Semaphore{ .permits = @intCast(workers) };
-
+    _ = max_workers;
     for (items) |item| {
-        semaphore.wait();
-        wg.start();
-        const thread = try std.Thread.spawn(.{}, struct {
-            fn run(i: T, f: *const fn (T) void, s: *std.Thread.Semaphore, w: *std.Thread.WaitGroup) void {
-                defer {
-                    s.post();
-                    w.finish();
-                }
-                f(i);
-            }
-        }.run, .{ item, func, &semaphore, &wg });
-        thread.detach();
+        func(item);
     }
-
-    wg.wait();
 }
 
 /// Map applies a transform to each element concurrently.
+/// NOTE: Sequential execution due to Zig 0.16.0 std.Thread.WaitGroup removal.
 pub fn Map(comptime In: type, comptime Out: type, allocator: std.mem.Allocator, items: []const In, max_workers: usize, func: *const fn (In) Out) ![]Out {
+    _ = max_workers;
     const results = try allocator.alloc(Out, items.len);
     errdefer allocator.free(results);
 
-    const workers = if (max_workers == 0) items.len else @min(max_workers, items.len);
-    if (workers == 0) return results;
-
-    var wg = std.Thread.WaitGroup{};
-    var mutex = std.Thread.Mutex{};
-    var semaphore = std.Thread.Semaphore{ .permits = @intCast(workers) };
-    var err: ?anyerror = null;
-
     for (items, 0..) |item, idx| {
-        semaphore.wait();
-        wg.start();
-        const thread = try std.Thread.spawn(.{}, struct {
-            fn run(i: In, index: usize, f: *const fn (In) Out, res: []Out, s: *std.Thread.Semaphore, w: *std.Thread.WaitGroup, m: *std.Thread.Mutex, e: *?anyerror) void {
-                defer {
-                    s.post();
-                    w.finish();
-                }
-                const out = f(i);
-                m.lock();
-                res[index] = out;
-                m.unlock();
-                _ = e;
-            }
-        }.run, .{ item, idx, func, results, &semaphore, &wg, &mutex, &err });
-        thread.detach();
+        results[idx] = func(item);
     }
 
-    wg.wait();
-    if (err) |e| return e;
     return results;
 }
 
@@ -81,7 +42,7 @@ pub fn Stream(comptime T: type) type {
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
                 .allocator = allocator,
-                .items = std.ArrayList(T){},
+                .items = std.ArrayList(T).empty,
             };
         }
 

@@ -163,7 +163,7 @@ pub const AssetModule = struct {
                 .dimensions = null,
             },
             .creator_did = did_copy,
-            .created_at = std.time.timestamp(),
+            .created_at = 0,
             .minted = true,
             .components = ArrayList(u64).init(alloc),
         };

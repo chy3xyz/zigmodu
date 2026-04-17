@@ -115,14 +115,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Module logger with context
 - Module testing utilities (`ModuleTestContext`)
 - Example application demonstrating all features
-- Build system configuration for Zig 0.15.2
+- Build system configuration for Zig 0.16.0
 - Unit tests for all major components
 - README in English and Chinese
 - Contributing guidelines
 - MIT License
 
 ### Technical Details
-- **Zig Version:** 0.15.2
+- **Zig Version:** 0.16.0
 - **Dependencies:** zio 0.9.0+
 - **Memory Management:** Explicit allocator pattern
 - **Error Handling:** Zig error union types

@@ -5,20 +5,24 @@ pub const ConfigLoader = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
+    io: std.Io,
 
-    pub fn init(allocator: std.mem.Allocator) Self {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) Self {
         return .{
             .allocator = allocator,
+            .io = io,
         };
     }
 
     /// Load configuration from a JSON file
     pub fn loadJson(self: *Self, path: []const u8) !std.json.Parsed(std.json.Value) {
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().openFile(self.io, path, .{});
+        defer file.close(self.io);
 
-        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024); // Max 1MB
+        const file_len = try std.Io.File.length(file, self.io);
+        const content = try self.allocator.alloc(u8, file_len);
         defer self.allocator.free(content);
+        _ = try std.Io.File.readPositionalAll(file, self.io, content, 0);
 
         return try std.json.parseFromSlice(std.json.Value, self.allocator, content, .{});
     }
@@ -74,16 +78,16 @@ pub const ModuleConfig = struct {
 
 test "ConfigLoader load and get values" {
     const allocator = std.testing.allocator;
-    var loader = ConfigLoader.init(allocator);
+    var loader = ConfigLoader.init(allocator, std.testing.io);
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("test.json", .{});
-    try file.writeAll("{\"name\":\"zigmodu\",\"port\":8080,\"debug\":true}");
-    file.close();
+    const file = try tmp_dir.dir.createFile(std.testing.io, "test.json", .{});
+    try file.writeStreamingAll(std.testing.io, "{\"name\":\"zigmodu\",\"port\":8080,\"debug\":true}");
+    file.close(std.testing.io);
 
-    const base_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const base_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(base_path);
     const path = try std.fs.path.join(allocator, &.{ base_path, "test.json" });
     defer allocator.free(path);
@@ -103,16 +107,16 @@ test "ModuleConfig wrapper" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("module.json", .{});
-    try file.writeAll("{\"version\":\"1.0.0\"}");
-    file.close();
+    const file = try tmp_dir.dir.createFile(std.testing.io, "module.json", .{});
+    try file.writeStreamingAll(std.testing.io, "{\"version\":\"1.0.0\"}");
+    file.close(std.testing.io);
 
-    const base_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const base_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(base_path);
     const path = try std.fs.path.join(allocator, &.{ base_path, "module.json" });
     defer allocator.free(path);
 
-    var loader = ConfigLoader.init(allocator);
+    var loader = ConfigLoader.init(allocator, std.testing.io);
     const parsed = try loader.loadJson(path);
 
     var module_config = ModuleConfig{

@@ -5,17 +5,17 @@ Get up and running with ZigModu in 5 minutes.
 ## Prerequisites
 
 ```bash
-# Install Zig 0.15.2
-brew install zig@0.15.2    # macOS
+# Install Zig 0.16.0
+brew install zig@0.16.0    # macOS
 # or
-sudo apt install zig=0.15.2  # Ubuntu/Debian
+sudo apt install zig=0.16.0  # Ubuntu/Debian
 # or download from https://ziglang.org/download/
 ```
 
 Verify installation:
 ```bash
 zig version
-# Should show: 0.15.2
+# Should show: 0.16.0
 ```
 
 ## Step 1: Create a Module
@@ -54,10 +54,8 @@ const zigmodu = @import("zigmodu");
 // Import your modules
 const user = @import("modules/user.zig");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
     // Scan and register modules
     var modules = try zigmodu.scanModules(allocator, .{user.UserModule});

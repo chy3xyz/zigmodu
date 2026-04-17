@@ -91,7 +91,7 @@ pub const HealthEndpoint = struct {
         return .{
             .status = overall_status,
             .components = components,
-            .timestamp = std.time.timestamp(),
+            .timestamp = 0,
         };
     }
 
@@ -101,37 +101,38 @@ pub const HealthEndpoint = struct {
     }
 
     /// 生成JSON格式的健康报告
+    /// 生成JSON格式的健康报告
     pub fn toJson(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
-        var buf = std.ArrayList(u8){};
-        const writer = buf.writer(allocator);
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(allocator);
 
         var health = self.checkHealth();
         defer health.components.deinit();
 
-        try writer.writeAll("{\n");
-        try writer.print("  \"status\": \"{s}\",\n", .{@tagName(health.status)});
-        try writer.print("  \"timestamp\": {d},\n", .{health.timestamp});
-        try writer.writeAll("  \"components\": {\n");
+        try buf.appendSlice(allocator, "{\n");
+        try buf.print(allocator, "  \"status\": \"{s}\",\n", .{@tagName(health.status)});
+        try buf.print(allocator, "  \"timestamp\": {d},\n", .{health.timestamp});
+        try buf.appendSlice(allocator, "  \"components\": {\n");
 
         var comp_iter = health.components.iterator();
         var first = true;
         while (comp_iter.next()) |entry| {
-            if (!first) try writer.writeAll(",\n");
+            if (!first) try buf.appendSlice(allocator, ",\n");
             first = false;
 
             const comp_name = entry.key_ptr.*;
             const comp_health = entry.value_ptr.*;
 
-            try writer.print("    \"{s}\": {{\n", .{comp_name});
-            try writer.print("      \"status\": \"{s}\"", .{@tagName(comp_health.status)});
+            try buf.print(allocator, "    \"{s}\": {{\n", .{comp_name});
+            try buf.print(allocator, "      \"status\": \"{s}\"", .{@tagName(comp_health.status)});
             if (comp_health.details) |details| {
-                try writer.print(",\n      \"details\": \"{s}\"", .{details});
+                try buf.print(allocator, ",\n      \"details\": \"{s}\"", .{details});
             }
-            try writer.writeAll("\n    }");
+            try buf.appendSlice(allocator, "\n    }");
         }
 
-        try writer.writeAll("\n  }\n");
-        try writer.writeAll("}\n");
+        try buf.appendSlice(allocator, "\n  }\n");
+        try buf.appendSlice(allocator, "}\n");
 
         return buf.toOwnedSlice(allocator);
     }

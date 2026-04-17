@@ -19,32 +19,36 @@ const Config = struct {
     output_dir: []const u8 = ".",
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    var args = std.ArrayList([]const u8).empty;
+    defer args.deinit(allocator);
+    {
+        var iter = init.minimal.args.iterate();
+        while (iter.next()) |arg| {
+            try args.append(allocator, arg);
+        }
+    }
 
-    if (args.len < 2) {
+    if (args.items.len < 2) {
         printUsage();
         return;
     }
 
-    const command = parseCommand(args[1]) orelse {
-        std.log.err("Unknown command: {s}", .{args[1]});
+    const command = parseCommand(args.items[1]) orelse {
+        std.log.err("Unknown command: {s}", .{args.items[1]});
         printUsage();
         std.process.exit(1);
     };
 
     switch (command) {
-        .new => try cmdNew(allocator, args[2..]),
-        .module => try cmdModule(allocator, args[2..]),
-        .event => try cmdEvent(allocator, args[2..]),
-        .api => try cmdApi(allocator, args[2..]),
-        .orm => try cmdOrm(allocator, args[2..]),
-        .generate => try cmdGenerate(allocator, args[2..]),
+        .new => try cmdNew(init.io, allocator, args.items[2..]),
+        .module => try cmdModule(init.io, allocator, args.items[2..]),
+        .event => try cmdEvent(init.io, allocator, args.items[2..]),
+        .api => try cmdApi(init.io, allocator, args.items[2..]),
+        .orm => try cmdOrm(init.io, allocator, args.items[2..]),
+        .generate => try cmdGenerate(init.io, allocator, args.items[2..]),
         .help => printUsage(),
         .version => printVersion(),
     }
@@ -146,24 +150,15 @@ fn printUsage() void {
         \\  zigctl api users
         \\  zigctl orm --sql schema.sql --out src/modules
         \\
-        \\  help            Show help
-        \\  version         Show version
-        \\
-        \\Examples:
-        \\  zigctl new myapp
-        \\  zigctl module user
-        \\  zigctl event order-created
-        \\  zigctl api users
-        \\
     ;
     std.log.info("{s}", .{usage});
 }
 
 fn printVersion() void {
-    std.log.info("zigctl version 0.1.0", .{});
+    std.log.info("zigctl version 0.5.5", .{});
 }
 
-fn cmdNew(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn cmdNew(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 1) {
         std.log.err("Usage: zigctl new <project-name>", .{});
         return;
@@ -173,7 +168,7 @@ fn cmdNew(allocator: std.mem.Allocator, args: []const []const u8) !void {
     std.log.info("Creating new project: {s}", .{project_name});
 
     // Create project directory
-    try std.fs.cwd().makePath(project_name);
+    try std.Io.Dir.cwd().createDirPath(io, project_name);
 
     // Create subdirectories
     const dirs = [_][]const u8{
@@ -187,7 +182,7 @@ fn cmdNew(allocator: std.mem.Allocator, args: []const []const u8) !void {
     for (dirs) |dir| {
         const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ project_name, dir });
         defer allocator.free(full_path);
-        try std.fs.cwd().makePath(full_path);
+        try std.Io.Dir.cwd().createDirPath(io, full_path);
     }
 
     // Generate build.zig
@@ -197,7 +192,7 @@ fn cmdNew(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const build_path = try std.fmt.allocPrint(allocator, "{s}/build.zig", .{project_name});
     defer allocator.free(build_path);
 
-    try writeFile(build_path, build_zig);
+    try writeFile(io, build_path, build_zig);
 
     // Generate build.zig.zon
     const build_zon = try generateBuildZon(allocator, project_name);
@@ -206,7 +201,7 @@ fn cmdNew(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const zon_path = try std.fmt.allocPrint(allocator, "{s}/build.zig.zon", .{project_name});
     defer allocator.free(zon_path);
 
-    try writeFile(zon_path, build_zon);
+    try writeFile(io, zon_path, build_zon);
 
     // Generate main.zig
     const main_zig = try generateMainZig(allocator, project_name);
@@ -215,13 +210,13 @@ fn cmdNew(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const main_path = try std.fmt.allocPrint(allocator, "{s}/src/main.zig", .{project_name});
     defer allocator.free(main_path);
 
-    try writeFile(main_path, main_zig);
+    try writeFile(io, main_path, main_zig);
 
     std.log.info("Project {s} created successfully!", .{project_name});
     std.log.info("  cd {s} && zig build run", .{project_name});
 }
 
-fn cmdModule(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn cmdModule(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 1) {
         std.log.err("Usage: zigctl module <name>", .{});
         return;
@@ -236,17 +231,17 @@ fn cmdModule(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     const module_dir = try std.fmt.allocPrint(allocator, "src/modules/{s}", .{module_name});
     defer allocator.free(module_dir);
-    try std.fs.cwd().makePath(module_dir);
+    try std.Io.Dir.cwd().createDirPath(io, module_dir);
 
     const module_path = try std.fmt.allocPrint(allocator, "{s}/module.zig", .{module_dir});
     defer allocator.free(module_path);
 
-    try writeFile(module_path, module_code);
+    try writeFile(io, module_path, module_code);
 
     std.log.info("Module {s} created at {s}", .{ module_name, module_path });
 }
 
-fn cmdEvent(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn cmdEvent(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 1) {
         std.log.err("Usage: zigctl event <name>", .{});
         return;
@@ -262,12 +257,12 @@ fn cmdEvent(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const event_path = try std.fmt.allocPrint(allocator, "src/events/{s}.zig", .{event_name});
     defer allocator.free(event_path);
 
-    try writeFile(event_path, event_code);
+    try writeFile(io, event_path, event_code);
 
     std.log.info("Event {s} created at {s}", .{ event_name, event_path });
 }
 
-fn cmdApi(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn cmdApi(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 1) {
         std.log.err("Usage: zigctl api <name> [--module <module-name>]", .{});
         return;
@@ -297,10 +292,10 @@ fn cmdApi(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (target_module) |mod_name| {
         const dir_path = try std.fmt.allocPrint(allocator, "src/modules/{s}", .{mod_name});
         defer allocator.free(dir_path);
-        try std.fs.cwd().makePath(dir_path);
+        try std.Io.Dir.cwd().createDirPath(io, dir_path);
     }
 
-    try writeFile(api_path, api_code);
+    try writeFile(io, api_path, api_code);
 
     if (target_module) |mod_name| {
         std.log.info("API {s} created at {s} (in module {s})", .{ api_name, api_path, mod_name });
@@ -362,7 +357,7 @@ fn generateBuildZon(allocator: std.mem.Allocator, project_name: []const u8) ![]c
         \\    .name = .myapp,
         \\    .version = "0.1.0",
         \\    .fingerprint = 0x0000000000000000,
-        \\    .minimum_zig_version = "0.15.2",
+        \\    .minimum_zig_version = "0.16.0",
         \\    .dependencies = .{
         \\        .zigmodu = .{
         \\            .path = "../zigmodu",
@@ -444,91 +439,59 @@ fn generateApi(allocator: std.mem.Allocator, api_name: []const u8) ![]const u8 {
     const method_name = try toPascalCase(allocator, api_name);
     defer allocator.free(method_name);
 
-    const pieces = [_][]const u8{
-        "const std = @import(\"std\");\n" ++
-            "const zigmodu = @import(\"zigmodu\");\n\n" ++
-            "pub const ",
-        struct_name,
-        "Api = struct {\n" ++
-            "    const Self = @This();\n\n" ++
-            "    router: *zigmodu.api.Router,\n\n" ++
-            "    pub fn init(router: *zigmodu.api.Router) !Self {\n" ++
-            "        var self = Self{ .router = router };\n" ++
-            "        try self.registerRoutes();\n" ++
-            "        return self;\n" ++
-            "    }\n\n" ++
-            "    fn registerRoutes(self: *Self) !void {\n" ++
-            "        try self.router.get(\"/",
-        api_name,
-        "\", &Self.get",
-        method_name,
-        ");\n" ++
-            "        try self.router.post(\"/",
-        api_name,
-        "\", &Self.create",
-        method_name,
-        ");\n" ++
-            "        try self.router.put(\"/",
-        api_name,
-        "/{id}\", &Self.update",
-        method_name,
-        ");\n" ++
-            "        try self.router.delete(\"/",
-        api_name,
-        "/{id}\", &Self.delete",
-        method_name,
-        ");\n" ++
-            "    }\n\n" ++
-            "    fn get",
-        method_name,
-        "(req: zigmodu.api.Router.Request, res: *zigmodu.api.Router.Response) !void {\n" ++
-            "        _ = req;\n" ++
-            "        try res.json(.{ .message = \"GET ",
-        api_name,
-        "\" });\n" ++
-            "    }\n\n" ++
-            "    fn create",
-        method_name,
-        "(req: zigmodu.api.Router.Request, res: *zigmodu.api.Router.Response) !void {\n" ++
-            "        _ = req;\n" ++
-            "        try res.json(.{ .message = \"CREATE ",
-        api_name,
-        "\", .status = \"success\" });\n" ++
-            "    }\n\n" ++
-            "    fn update",
-        method_name,
-        "(req: zigmodu.api.Router.Request, res: *zigmodu.api.Router.Response) !void {\n" ++
-            "        _ = req;\n" ++
-            "        try res.json(.{ .message = \"UPDATE ",
-        api_name,
-        "\", .status = \"success\" });\n" ++
-            "    }\n\n" ++
-            "    fn delete",
-        method_name,
-        "(req: zigmodu.api.Router.Request, res: *zigmodu.api.Router.Response) !void {\n" ++
-            "        _ = req;\n" ++
-            "        try res.json(.{ .message = \"DELETE ",
-        api_name,
-        "\", .status = \"success\" });\n" ++
-            "    }\n};\n",
-    };
+    const template =
+        \\const std = @import("std");
+        \\const zigmodu = @import("zigmodu");
+        \\const Server = zigmodu.api.Server;
+        \\const RouteGroup = Server.RouteGroup;
+        \\const Context = Server.Context;
+        \\
+        \\pub const {s}Api = struct {{
+        \\    pub fn init(group: *RouteGroup) !void {{
+        \\        try group.get("/{s}s", list, null);
+        \\        try group.get("/{s}s/{{id}}", get, null);
+        \\        try group.post("/{s}s", create, null);
+        \\        try group.put("/{s}s/{{id}}", update, null);
+        \\        try group.delete("/{s}s/{{id}}", delete_, null);
+        \\    }}
+        \\
+        \\    fn list(ctx: *Context) !void {{
+        \\        try ctx.json(200, "{{\"message\": \"GET /{s}s\"}}");
+        \\    }}
+        \\
+        \\    fn get(ctx: *Context) !void {{
+        \\        const id = ctx.params.get("id") orelse return error.BadRequest;
+        \\        try ctx.jsonStruct(200, .{{ .id = id, .message = "GET /{s}s/" ++ id }});
+        \\    }}
+        \\
+        \\    fn create(ctx: *Context) !void {{
+        \\        _ = ctx;
+        \\        try ctx.json(201, "{{\"message\": \"CREATE /{s}s\"}}");
+        \\    }}
+        \\
+        \\    fn update(ctx: *Context) !void {{
+        \\        _ = ctx;
+        \\        try ctx.json(200, "{{\"message\": \"UPDATE /{s}s\"}}");
+        \\    }}
+        \\
+        \\    fn delete_(ctx: *Context) !void {{
+        \\        _ = ctx;
+        \\        try ctx.json(204, "");
+        \\    }}
+        \\}};
+        \\
+    ;
 
-    var total_len: usize = 0;
-    for (pieces) |p| total_len += p.len;
-
-    var result = try allocator.alloc(u8, total_len);
-    var offset: usize = 0;
-    for (pieces) |p| {
-        @memcpy(result[offset .. offset + p.len], p);
-        offset += p.len;
-    }
-    return result;
+    return try std.fmt.allocPrint(allocator, template, .{
+        struct_name, api_name, api_name, api_name, api_name, api_name,
+        api_name, api_name, api_name, api_name,
+    });
 }
 
-fn writeFile(path: []const u8, content: []const u8) !void {
-    const file = try std.fs.cwd().createFile(path, .{});
-    defer file.close();
-    try file.writeAll(content);
+fn writeFile(io: std.Io, path: []const u8, content: []const u8) !void {
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, content);
 }
 
 // ==================== ORM Code Generation ====================
@@ -707,7 +670,7 @@ fn parseColumnDef(allocator: std.mem.Allocator, text: []const u8) !ColumnDef {
 }
 
 fn parseColumns(allocator: std.mem.Allocator, text: []const u8, i: *usize) ![]ColumnDef {
-    var cols: std.ArrayList(ColumnDef) = .{};
+    var cols: std.ArrayList(ColumnDef) = std.ArrayList(ColumnDef).empty;
     defer cols.deinit(allocator);
     var depth: usize = 0;
     var start = i.*;
@@ -740,7 +703,7 @@ fn parseColumns(allocator: std.mem.Allocator, text: []const u8, i: *usize) ![]Co
 }
 
 fn parseSqlSchema(allocator: std.mem.Allocator, sql: []const u8) ![]TableDef {
-    var tables: std.ArrayList(TableDef) = .{};
+    var tables: std.ArrayList(TableDef) = std.ArrayList(TableDef).empty;
     defer tables.deinit(allocator);
     var i: usize = 0;
     while (i < sql.len) {
@@ -771,20 +734,19 @@ fn inferModuleName(allocator: std.mem.Allocator, table_name: []const u8) ![]cons
 }
 
 fn generateModuleModel(allocator: std.mem.Allocator, module_name: []const u8, tables: []const TableDef) ![]const u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
-    const writer = buf.writer(allocator);
-
-    try writer.writeAll("//! Auto-generated models for module: ");
-    try writer.writeAll(module_name);
-    try writer.writeAll("\n//! Generated by zigctl orm\n//! Do not modify manually\n\n");
-    try writer.writeAll("const std = @import(\"std\");\n\n");
+    
+    try buf.appendSlice(allocator, "//! Auto-generated models for module: ");
+    try buf.appendSlice(allocator, module_name);
+    try buf.appendSlice(allocator, "\n//! Generated by zigctl orm\n//! Do not modify manually\n\n");
+    try buf.appendSlice(allocator, "const std = @import(\"std\");\n\n");
 
     for (tables) |table| {
         const model_name = try toPascalCase(allocator, table.name);
         defer allocator.free(model_name);
 
-        try writer.print("pub const {s} = struct {{\n", .{model_name});
+        try buf.print(allocator, "pub const {s} = struct {{\n", .{model_name});
         for (table.columns) |col| {
             if (col.col_type == .unknown and col.name.len == 0) continue;
             const zig_type = switch (col.col_type) {
@@ -795,44 +757,43 @@ fn generateModuleModel(allocator: std.mem.Allocator, module_name: []const u8, ta
                 .datetime => "[]const u8",
                 .unknown => "[]const u8",
             };
-            try writer.print("    {s}: {s},\n", .{ col.name, zig_type });
+            try buf.print(allocator, "    {s}: {s},\n", .{ col.name, zig_type });
         }
-        try writer.print("\n    pub fn jsonStringify(self: @This(), jws: anytype) !void {{\n", .{});
-        try writer.writeAll("        try jws.beginObject();\n");
+        try buf.print(allocator, "\n    pub fn jsonStringify(self: @This(), jws: anytype) !void {{\n", .{});
+        try buf.appendSlice(allocator, "        try jws.beginObject();\n");
         for (table.columns) |col| {
             if (col.col_type == .unknown and col.name.len == 0) continue;
-            try writer.print("        try jws.objectField(\"{s}\");\n", .{col.name});
-            try writer.print("        try jws.write(self.{s});\n", .{col.name});
+            try buf.print(allocator, "        try jws.objectField(\"{s}\");\n", .{col.name});
+            try buf.print(allocator, "        try jws.write(self.{s});\n", .{col.name});
         }
-        try writer.writeAll("        try jws.endObject();\n");
-        try writer.writeAll("    }\n");
-        try writer.writeAll("};\n\n");
+        try buf.appendSlice(allocator, "        try jws.endObject();\n");
+        try buf.appendSlice(allocator, "    }\n");
+        try buf.appendSlice(allocator, "};\n\n");
     }
 
     return buf.toOwnedSlice(allocator);
 }
 
 fn generateModulePersistence(allocator: std.mem.Allocator, module_name: []const u8, tables: []const TableDef) ![]const u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
-    const writer = buf.writer(allocator);
-
-    try writer.writeAll("//! Auto-generated ORM persistence for module: ");
-    try writer.writeAll(module_name);
-    try writer.writeAll("\n//! Generated by zigctl orm\n//! Do not modify manually\n\n");
-    try writer.writeAll("const std = @import(\"std\");\n");
-    try writer.writeAll("const zigmodu = @import(\"zigmodu\");\n");
-    try writer.writeAll("const model = @import(\"model.zig\");\n\n");
+    
+    try buf.appendSlice(allocator, "//! Auto-generated ORM persistence for module: ");
+    try buf.appendSlice(allocator, module_name);
+    try buf.appendSlice(allocator, "\n//! Generated by zigctl orm\n//! Do not modify manually\n\n");
+    try buf.appendSlice(allocator, "const std = @import(\"std\");\n");
+    try buf.appendSlice(allocator, "const zigmodu = @import(\"zigmodu\");\n");
+    try buf.appendSlice(allocator, "const model = @import(\"model.zig\");\n\n");
 
     const pascal_module = try toPascalCase(allocator, module_name);
     defer allocator.free(pascal_module);
 
-    try writer.print("pub const {s}Persistence = struct {{\n", .{pascal_module});
-    try writer.writeAll("    backend: zigmodu.SqlxBackend,\n");
-    try writer.writeAll("    orm: zigmodu.orm.Orm(zigmodu.SqlxBackend),\n\n");
-    try writer.print("    pub fn init(backend: zigmodu.SqlxBackend) {s}Persistence {{\n", .{pascal_module});
-    try writer.writeAll("        return .{ .backend = backend, .orm = .{ .backend = backend } };\n");
-    try writer.writeAll("    }\n\n");
+    try buf.print(allocator, "pub const {s}Persistence = struct {{\n", .{pascal_module});
+    try buf.appendSlice(allocator, "    backend: zigmodu.SqlxBackend,\n");
+    try buf.appendSlice(allocator, "    orm: zigmodu.orm.Orm(zigmodu.SqlxBackend),\n\n");
+    try buf.print(allocator, "    pub fn init(backend: zigmodu.SqlxBackend) {s}Persistence {{\n", .{pascal_module});
+    try buf.appendSlice(allocator, "        return .{ .backend = backend, .orm = .{ .backend = backend } };\n");
+    try buf.appendSlice(allocator, "    }\n\n");
 
     for (tables) |table| {
         const model_name = try toPascalCase(allocator, table.name);
@@ -840,35 +801,34 @@ fn generateModulePersistence(allocator: std.mem.Allocator, module_name: []const 
         const method_name = try toCamelCase(allocator, table.name);
         defer allocator.free(method_name);
 
-        try writer.print("    pub fn {s}Repo(self: *{s}Persistence) zigmodu.orm.Orm(zigmodu.SqlxBackend).Repository(model.{s}) {{\n", .{ method_name, pascal_module, model_name });
-        try writer.writeAll("        return .{ .orm = &self.orm };\n");
-        try writer.writeAll("    }\n\n");
+        try buf.print(allocator, "    pub fn {s}Repo(self: *{s}Persistence) zigmodu.orm.Orm(zigmodu.SqlxBackend).Repository(model.{s}) {{\n", .{ method_name, pascal_module, model_name });
+        try buf.appendSlice(allocator, "        return .{ .orm = &self.orm };\n");
+        try buf.appendSlice(allocator, "    }\n\n");
     }
 
-    try writer.writeAll("};\n");
+    try buf.appendSlice(allocator, "};\n");
     return buf.toOwnedSlice(allocator);
 }
 
 fn generateModuleService(allocator: std.mem.Allocator, module_name: []const u8, tables: []const TableDef) ![]const u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
-    const writer = buf.writer(allocator);
-
-    try writer.writeAll("//! Auto-generated service for module: ");
-    try writer.writeAll(module_name);
-    try writer.writeAll("\n//! Generated by zigctl orm\n//! Do not modify manually\n\n");
-    try writer.writeAll("const std = @import(\"std\");\n");
-    try writer.writeAll("const model = @import(\"model.zig\");\n");
-    try writer.writeAll("const persistence = @import(\"persistence.zig\");\n\n");
+    
+    try buf.appendSlice(allocator, "//! Auto-generated service for module: ");
+    try buf.appendSlice(allocator, module_name);
+    try buf.appendSlice(allocator, "\n//! Generated by zigctl orm\n//! Do not modify manually\n\n");
+    try buf.appendSlice(allocator, "const std = @import(\"std\");\n");
+    try buf.appendSlice(allocator, "const model = @import(\"model.zig\");\n");
+    try buf.appendSlice(allocator, "const persistence = @import(\"persistence.zig\");\n\n");
 
     const pascal_module = try toPascalCase(allocator, module_name);
     defer allocator.free(pascal_module);
 
-    try writer.print("pub const {s}Service = struct {{\n", .{pascal_module});
-    try writer.print("    persistence: *persistence.{s}Persistence,\n\n", .{pascal_module});
-    try writer.print("    pub fn init(persistence_ptr: *persistence.{s}Persistence) {s}Service {{\n", .{ pascal_module, pascal_module });
-    try writer.writeAll("        return .{ .persistence = persistence_ptr };\n");
-    try writer.writeAll("    }\n\n");
+    try buf.print(allocator, "pub const {s}Service = struct {{\n", .{pascal_module});
+    try buf.print(allocator, "    persistence: *persistence.{s}Persistence,\n\n", .{pascal_module});
+    try buf.print(allocator, "    pub fn init(persistence_ptr: *persistence.{s}Persistence) {s}Service {{\n", .{ pascal_module, pascal_module });
+    try buf.appendSlice(allocator, "        return .{ .persistence = persistence_ptr };\n");
+    try buf.appendSlice(allocator, "    }\n\n");
 
     for (tables) |table| {
         const model_name = try toPascalCase(allocator, table.name);
@@ -878,58 +838,57 @@ fn generateModuleService(allocator: std.mem.Allocator, module_name: []const u8, 
         const list_method = try std.fmt.allocPrint(allocator, "list{s}s", .{model_name});
         defer allocator.free(list_method);
 
-        try writer.print("    pub fn {s}(self: *{s}Service, page: usize, size: usize) !zigmodu.orm.PageResult(model.{s}) {{\n", .{ list_method, pascal_module, model_name });
-        try writer.print("        var repo = self.persistence.{s}Repo();\n", .{method_name});
-        try writer.writeAll("        return try repo.findPage(page, size);\n");
-        try writer.writeAll("    }\n\n");
+        try buf.print(allocator, "    pub fn {s}(self: *{s}Service, page: usize, size: usize) !zigmodu.orm.PageResult(model.{s}) {{\n", .{ list_method, pascal_module, model_name });
+        try buf.print(allocator, "        var repo = self.persistence.{s}Repo();\n", .{method_name});
+        try buf.appendSlice(allocator, "        return try repo.findPage(page, size);\n");
+        try buf.appendSlice(allocator, "    }\n\n");
 
-        try writer.print("    pub fn get{s}(self: *{s}Service, id: i64) !?model.{s} {{\n", .{ model_name, pascal_module, model_name });
-        try writer.print("        var repo = self.persistence.{s}Repo();\n", .{method_name});
-        try writer.writeAll("        return try repo.findById(id);\n");
-        try writer.writeAll("    }\n\n");
+        try buf.print(allocator, "    pub fn get{s}(self: *{s}Service, id: i64) !?model.{s} {{\n", .{ model_name, pascal_module, model_name });
+        try buf.print(allocator, "        var repo = self.persistence.{s}Repo();\n", .{method_name});
+        try buf.appendSlice(allocator, "        return try repo.findById(id);\n");
+        try buf.appendSlice(allocator, "    }\n\n");
 
-        try writer.print("    pub fn create{s}(self: *{s}Service, entity: model.{s}) !model.{s} {{\n", .{ model_name, pascal_module, model_name, model_name });
-        try writer.print("        var repo = self.persistence.{s}Repo();\n", .{method_name});
-        try writer.writeAll("        return try repo.insert(entity);\n");
-        try writer.writeAll("    }\n\n");
+        try buf.print(allocator, "    pub fn create{s}(self: *{s}Service, entity: model.{s}) !model.{s} {{\n", .{ model_name, pascal_module, model_name, model_name });
+        try buf.print(allocator, "        var repo = self.persistence.{s}Repo();\n", .{method_name});
+        try buf.appendSlice(allocator, "        return try repo.insert(entity);\n");
+        try buf.appendSlice(allocator, "    }\n\n");
 
-        try writer.print("    pub fn update{s}(self: *{s}Service, entity: model.{s}) !void {{\n", .{ model_name, pascal_module, model_name });
-        try writer.print("        var repo = self.persistence.{s}Repo();\n", .{method_name});
-        try writer.writeAll("        return try repo.update(entity);\n");
-        try writer.writeAll("    }\n\n");
+        try buf.print(allocator, "    pub fn update{s}(self: *{s}Service, entity: model.{s}) !void {{\n", .{ model_name, pascal_module, model_name });
+        try buf.print(allocator, "        var repo = self.persistence.{s}Repo();\n", .{method_name});
+        try buf.appendSlice(allocator, "        return try repo.update(entity);\n");
+        try buf.appendSlice(allocator, "    }\n\n");
 
-        try writer.print("    pub fn delete{s}(self: *{s}Service, id: i64) !void {{\n", .{ model_name, pascal_module });
-        try writer.print("        var repo = self.persistence.{s}Repo();\n", .{method_name});
-        try writer.writeAll("        return try repo.delete(id);\n");
-        try writer.writeAll("    }\n\n");
+        try buf.print(allocator, "    pub fn delete{s}(self: *{s}Service, id: i64) !void {{\n", .{ model_name, pascal_module });
+        try buf.print(allocator, "        var repo = self.persistence.{s}Repo();\n", .{method_name});
+        try buf.appendSlice(allocator, "        return try repo.delete(id);\n");
+        try buf.appendSlice(allocator, "    }\n\n");
     }
 
-    try writer.writeAll("};\n");
+    try buf.appendSlice(allocator, "};\n");
     return buf.toOwnedSlice(allocator);
 }
 
 fn generateModuleApi(allocator: std.mem.Allocator, module_name: []const u8, tables: []const TableDef) ![]const u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
-    const writer = buf.writer(allocator);
-
-    try writer.writeAll("//! Auto-generated API for module: ");
-    try writer.writeAll(module_name);
-    try writer.writeAll("\n//! Generated by zigctl orm\n//! Do not modify manually\n\n");
-    try writer.writeAll("const std = @import(\"std\");\n");
-    try writer.writeAll("const zigmodu = @import(\"zigmodu\");\n");
-    try writer.writeAll("const service = @import(\"service.zig\");\n");
-    try writer.writeAll("const model = @import(\"model.zig\");\n\n");
+    
+    try buf.appendSlice(allocator, "//! Auto-generated API for module: ");
+    try buf.appendSlice(allocator, module_name);
+    try buf.appendSlice(allocator, "\n//! Generated by zigctl orm\n//! Do not modify manually\n\n");
+    try buf.appendSlice(allocator, "const std = @import(\"std\");\n");
+    try buf.appendSlice(allocator, "const zigmodu = @import(\"zigmodu\");\n");
+    try buf.appendSlice(allocator, "const service = @import(\"service.zig\");\n");
+    try buf.appendSlice(allocator, "const model = @import(\"model.zig\");\n\n");
 
     const pascal_module = try toPascalCase(allocator, module_name);
     defer allocator.free(pascal_module);
 
-    try writer.print("pub const {s}Api = struct {{\n", .{pascal_module});
-    try writer.print("    service: *service.{s}Service,\n\n", .{pascal_module});
-    try writer.print("    pub fn init(service_ptr: *service.{s}Service) {s}Api {{\n", .{ pascal_module, pascal_module });
-    try writer.writeAll("        return .{ .service = service_ptr };\n");
-    try writer.writeAll("    }\n\n");
-    try writer.print("    pub fn registerRoutes(self: *{s}Api, group: *zigmodu.api.Server.RouteGroup) !void {{\n", .{pascal_module});
+    try buf.print(allocator, "pub const {s}Api = struct {{\n", .{pascal_module});
+    try buf.print(allocator, "    service: *service.{s}Service,\n\n", .{pascal_module});
+    try buf.print(allocator, "    pub fn init(service_ptr: *service.{s}Service) {s}Api {{\n", .{ pascal_module, pascal_module });
+    try buf.appendSlice(allocator, "        return .{ .service = service_ptr };\n");
+    try buf.appendSlice(allocator, "    }\n\n");
+    try buf.print(allocator, "    pub fn registerRoutes(self: *{s}Api, group: *zigmodu.api.Server.RouteGroup) !void {{\n", .{pascal_module});
 
     for (tables) |table| {
         const model_name = try toPascalCase(allocator, table.name);
@@ -947,13 +906,13 @@ fn generateModuleApi(allocator: std.mem.Allocator, module_name: []const u8, tabl
         const delete_fn = try std.fmt.allocPrint(allocator, "delete{s}", .{model_name});
         defer allocator.free(delete_fn);
 
-        try writer.print("        try group.get(\"/{s}s\", {s}, @ptrCast(@alignCast(self)));\n", .{ snake_name, list_fn });
-        try writer.print("        try group.get(\"/{s}s/:id\", {s}, @ptrCast(@alignCast(self)));\n", .{ snake_name, get_fn });
-        try writer.print("        try group.post(\"/{s}s\", {s}, @ptrCast(@alignCast(self)));\n", .{ snake_name, create_fn });
-        try writer.print("        try group.put(\"/{s}s/:id\", {s}, @ptrCast(@alignCast(self)));\n", .{ snake_name, update_fn });
-        try writer.print("        try group.delete(\"/{s}s/:id\", {s}, @ptrCast(@alignCast(self)));\n", .{ snake_name, delete_fn });
+        try buf.print(allocator, "        try group.get(\"/{s}s\", {s}, @ptrCast(@alignCast(self)));\n", .{ snake_name, list_fn });
+        try buf.print(allocator, "        try group.get(\"/{s}s/:id\", {s}, @ptrCast(@alignCast(self)));\n", .{ snake_name, get_fn });
+        try buf.print(allocator, "        try group.post(\"/{s}s\", {s}, @ptrCast(@alignCast(self)));\n", .{ snake_name, create_fn });
+        try buf.print(allocator, "        try group.put(\"/{s}s/:id\", {s}, @ptrCast(@alignCast(self)));\n", .{ snake_name, update_fn });
+        try buf.print(allocator, "        try group.delete(\"/{s}s/:id\", {s}, @ptrCast(@alignCast(self)));\n", .{ snake_name, delete_fn });
     }
-    try writer.writeAll("    }\n\n");
+    try buf.appendSlice(allocator, "    }\n\n");
 
     for (tables) |table| {
         const model_name = try toPascalCase(allocator, table.name);
@@ -969,52 +928,52 @@ fn generateModuleApi(allocator: std.mem.Allocator, module_name: []const u8, tabl
         const delete_fn = try std.fmt.allocPrint(allocator, "delete{s}", .{model_name});
         defer allocator.free(delete_fn);
 
-        try writer.print("    fn {s}(ctx: *zigmodu.api.Server.Context) !void {{\n", .{list_fn});
-        try writer.print("        const self: *{s}Api = @ptrCast(@alignCast(ctx.user_data.?));\n", .{pascal_module});
-        try writer.writeAll("        const page_str = ctx.query.get(\"page\") orelse \"0\";\n");
-        try writer.writeAll("        const size_str = ctx.query.get(\"size\") orelse \"10\";\n");
-        try writer.writeAll("        const page = try std.fmt.parseInt(usize, page_str, 10);\n");
-        try writer.writeAll("        const size = try std.fmt.parseInt(usize, size_str, 10);\n");
-        try writer.print("        const result = try self.service.{s}(page, size);\n", .{list_fn});
-        try writer.writeAll("        try ctx.jsonStruct(200, result);\n");
-        try writer.writeAll("    }\n\n");
+        try buf.print(allocator, "    fn {s}(ctx: *zigmodu.api.Server.Context) !void {{\n", .{list_fn});
+        try buf.print(allocator, "        const self: *{s}Api = @ptrCast(@alignCast(ctx.user_data.?));\n", .{pascal_module});
+        try buf.appendSlice(allocator, "        const page_str = ctx.query.get(\"page\") orelse \"0\";\n");
+        try buf.appendSlice(allocator, "        const size_str = ctx.query.get(\"size\") orelse \"10\";\n");
+        try buf.appendSlice(allocator, "        const page = try std.fmt.parseInt(usize, page_str, 10);\n");
+        try buf.appendSlice(allocator, "        const size = try std.fmt.parseInt(usize, size_str, 10);\n");
+        try buf.print(allocator, "        const result = try self.service.{s}(page, size);\n", .{list_fn});
+        try buf.appendSlice(allocator, "        try ctx.jsonStruct(200, result);\n");
+        try buf.appendSlice(allocator, "    }\n\n");
 
-        try writer.print("    fn {s}(ctx: *zigmodu.api.Server.Context) !void {{\n", .{get_fn});
-        try writer.print("        const self: *{s}Api = @ptrCast(@alignCast(ctx.user_data.?));\n", .{pascal_module});
-        try writer.writeAll("        const id_str = ctx.params.get(\"id\") orelse return error.BadRequest;\n");
-        try writer.writeAll("        const id = try std.fmt.parseInt(i64, id_str, 10);\n");
-        try writer.print("        const item = try self.service.{s}(id);\n", .{get_fn});
-        try writer.writeAll("        if (item) |v| {\n");
-        try writer.writeAll("            try ctx.jsonStruct(200, v);\n");
-        try writer.writeAll("        } else {\n");
-        try writer.writeAll("            try ctx.json(404, \"{\\\"message\\\": \\\"Not found\\\"}\");\n");
-        try writer.writeAll("        }\n");
-        try writer.writeAll("    }\n\n");
+        try buf.print(allocator, "    fn {s}(ctx: *zigmodu.api.Server.Context) !void {{\n", .{get_fn});
+        try buf.print(allocator, "        const self: *{s}Api = @ptrCast(@alignCast(ctx.user_data.?));\n", .{pascal_module});
+        try buf.appendSlice(allocator, "        const id_str = ctx.params.get(\"id\") orelse return error.BadRequest;\n");
+        try buf.appendSlice(allocator, "        const id = try std.fmt.parseInt(i64, id_str, 10);\n");
+        try buf.print(allocator, "        const item = try self.service.{s}(id);\n", .{get_fn});
+        try buf.appendSlice(allocator, "        if (item) |v| {\n");
+        try buf.appendSlice(allocator, "            try ctx.jsonStruct(200, v);\n");
+        try buf.appendSlice(allocator, "        } else {\n");
+        try buf.appendSlice(allocator, "            try ctx.json(404, \"{\\\"message\\\": \\\"Not found\\\"}\");\n");
+        try buf.appendSlice(allocator, "        }\n");
+        try buf.appendSlice(allocator, "    }\n\n");
 
-        try writer.print("    fn {s}(ctx: *zigmodu.api.Server.Context) !void {{\n", .{create_fn});
-        try writer.print("        const self: *{s}Api = @ptrCast(@alignCast(ctx.user_data.?));\n", .{pascal_module});
-        try writer.writeAll("        // TODO: parse request body into entity\n");
-        try writer.writeAll("        _ = self;\n");
-        try writer.writeAll("        try ctx.json(501, \"{\\\"message\\\": \\\"Not implemented\\\"}\");\n");
-        try writer.writeAll("    }\n\n");
+        try buf.print(allocator, "    fn {s}(ctx: *zigmodu.api.Server.Context) !void {{\n", .{create_fn});
+        try buf.print(allocator, "        const self: *{s}Api = @ptrCast(@alignCast(ctx.user_data.?));\n", .{pascal_module});
+        try buf.appendSlice(allocator, "        // TODO: parse request body into entity\n");
+        try buf.appendSlice(allocator, "        _ = self;\n");
+        try buf.appendSlice(allocator, "        try ctx.json(501, \"{\\\"message\\\": \\\"Not implemented\\\"}\");\n");
+        try buf.appendSlice(allocator, "    }\n\n");
 
-        try writer.print("    fn {s}(ctx: *zigmodu.api.Server.Context) !void {{\n", .{update_fn});
-        try writer.print("        const self: *{s}Api = @ptrCast(@alignCast(ctx.user_data.?));\n", .{pascal_module});
-        try writer.writeAll("        // TODO: parse request body into entity\n");
-        try writer.writeAll("        _ = self;\n");
-        try writer.writeAll("        try ctx.json(501, \"{\\\"message\\\": \\\"Not implemented\\\"}\");\n");
-        try writer.writeAll("    }\n\n");
+        try buf.print(allocator, "    fn {s}(ctx: *zigmodu.api.Server.Context) !void {{\n", .{update_fn});
+        try buf.print(allocator, "        const self: *{s}Api = @ptrCast(@alignCast(ctx.user_data.?));\n", .{pascal_module});
+        try buf.appendSlice(allocator, "        // TODO: parse request body into entity\n");
+        try buf.appendSlice(allocator, "        _ = self;\n");
+        try buf.appendSlice(allocator, "        try ctx.json(501, \"{\\\"message\\\": \\\"Not implemented\\\"}\");\n");
+        try buf.appendSlice(allocator, "    }\n\n");
 
-        try writer.print("    fn {s}(ctx: *zigmodu.api.Server.Context) !void {{\n", .{delete_fn});
-        try writer.print("        const self: *{s}Api = @ptrCast(@alignCast(ctx.user_data.?));\n", .{pascal_module});
-        try writer.writeAll("        const id_str = ctx.params.get(\"id\") orelse return error.BadRequest;\n");
-        try writer.writeAll("        const id = try std.fmt.parseInt(i64, id_str, 10);\n");
-        try writer.print("        try self.service.{s}(id);\n", .{delete_fn});
-        try writer.writeAll("        try ctx.json(204, \"\");\n");
-        try writer.writeAll("    }\n\n");
+        try buf.print(allocator, "    fn {s}(ctx: *zigmodu.api.Server.Context) !void {{\n", .{delete_fn});
+        try buf.print(allocator, "        const self: *{s}Api = @ptrCast(@alignCast(ctx.user_data.?));\n", .{pascal_module});
+        try buf.appendSlice(allocator, "        const id_str = ctx.params.get(\"id\") orelse return error.BadRequest;\n");
+        try buf.appendSlice(allocator, "        const id = try std.fmt.parseInt(i64, id_str, 10);\n");
+        try buf.print(allocator, "        try self.service.{s}(id);\n", .{delete_fn});
+        try buf.appendSlice(allocator, "        try ctx.json(204, \"\");\n");
+        try buf.appendSlice(allocator, "    }\n\n");
     }
 
-    try writer.writeAll("};\n");
+    try buf.appendSlice(allocator, "};\n");
     return buf.toOwnedSlice(allocator);
 }
 
@@ -1043,45 +1002,45 @@ fn generateModuleZig(allocator: std.mem.Allocator, module_name: []const u8) ![]c
     , .{ module_name, module_name, module_name, module_name, module_name, module_name, module_name });
 }
 
-fn writeModuleFiles(allocator: std.mem.Allocator, out_dir: []const u8, module_name: []const u8, tables: []const TableDef) !void {
+fn writeModuleFiles(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u8, module_name: []const u8, tables: []const TableDef) !void {
     const module_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ out_dir, module_name });
     defer allocator.free(module_dir);
-    try std.fs.cwd().makePath(module_dir);
+    try std.Io.Dir.cwd().createDirPath(io, module_dir);
 
     const model_code = try generateModuleModel(allocator, module_name, tables);
     defer allocator.free(model_code);
     const model_path = try std.fmt.allocPrint(allocator, "{s}/model.zig", .{module_dir});
     defer allocator.free(model_path);
-    try writeFile(model_path, model_code);
+    try writeFile(io, model_path, model_code);
 
     const persistence_code = try generateModulePersistence(allocator, module_name, tables);
     defer allocator.free(persistence_code);
     const persistence_path = try std.fmt.allocPrint(allocator, "{s}/persistence.zig", .{module_dir});
     defer allocator.free(persistence_path);
-    try writeFile(persistence_path, persistence_code);
+    try writeFile(io, persistence_path, persistence_code);
 
     const service_code = try generateModuleService(allocator, module_name, tables);
     defer allocator.free(service_code);
     const service_path = try std.fmt.allocPrint(allocator, "{s}/service.zig", .{module_dir});
     defer allocator.free(service_path);
-    try writeFile(service_path, service_code);
+    try writeFile(io, service_path, service_code);
 
     const api_code = try generateModuleApi(allocator, module_name, tables);
     defer allocator.free(api_code);
     const api_path = try std.fmt.allocPrint(allocator, "{s}/api.zig", .{module_dir});
     defer allocator.free(api_path);
-    try writeFile(api_path, api_code);
+    try writeFile(io, api_path, api_code);
 
     const module_code = try generateModuleZig(allocator, module_name);
     defer allocator.free(module_code);
     const module_path = try std.fmt.allocPrint(allocator, "{s}/module.zig", .{module_dir});
     defer allocator.free(module_path);
-    try writeFile(module_path, module_code);
+    try writeFile(io, module_path, module_code);
 
     std.log.info("Generated module '{s}' at {s}/ with {d} table(s)", .{ module_name, module_dir, tables.len });
 }
 
-fn cmdGenerate(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn cmdGenerate(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 1) {
         std.log.err("Usage: zigctl generate <module|event|api|orm> [options]", .{});
         return;
@@ -1090,24 +1049,24 @@ fn cmdGenerate(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const sub = args[0];
     if (std.mem.eql(u8, sub, "module")) {
         if (args.len >= 3 and std.mem.eql(u8, args[1], "--sql")) {
-            try cmdOrm(allocator, args[1..]);
+            try cmdOrm(io, allocator, args[1..]);
         } else if (args.len >= 2) {
-            try cmdModule(allocator, args[1..]);
+            try cmdModule(io, allocator, args[1..]);
         } else {
             std.log.err("Usage: zigctl generate module <name> | zigctl generate module --sql <file>", .{});
         }
     } else if (std.mem.eql(u8, sub, "event")) {
-        try cmdEvent(allocator, args[1..]);
+        try cmdEvent(io, allocator, args[1..]);
     } else if (std.mem.eql(u8, sub, "api")) {
-        try cmdApi(allocator, args[1..]);
+        try cmdApi(io, allocator, args[1..]);
     } else if (std.mem.eql(u8, sub, "orm")) {
-        try cmdOrm(allocator, args[1..]);
+        try cmdOrm(io, allocator, args[1..]);
     } else {
         std.log.err("Unknown generate target: {s}", .{sub});
     }
 }
 
-fn cmdOrm(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn cmdOrm(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
     var sql_path: ?[]const u8 = null;
     var out_dir: []const u8 = "src/modules";
     var forced_module: ?[]const u8 = null;
@@ -1131,7 +1090,7 @@ fn cmdOrm(allocator: std.mem.Allocator, args: []const []const u8) !void {
         return;
     }
 
-    const sql_content = try std.fs.cwd().readFileAlloc(allocator, sql_path.?, 1024 * 1024);
+    const sql_content = try std.Io.Dir.cwd().readFileAlloc(io, sql_path.?, allocator, std.Io.Limit.limited(1024 * 1024));
     defer allocator.free(sql_content);
 
     const tables = try parseSqlSchema(allocator, sql_content);
@@ -1148,7 +1107,7 @@ fn cmdOrm(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     if (forced_module) |mod_name| {
-        try writeModuleFiles(allocator, out_dir, mod_name, tables);
+        try writeModuleFiles(io, allocator, out_dir, mod_name, tables);
     } else {
         var module_map = std.StringHashMap(std.ArrayList(TableDef)).init(allocator);
         defer {
@@ -1165,17 +1124,17 @@ fn cmdOrm(allocator: std.mem.Allocator, args: []const []const u8) !void {
             const gop = try module_map.getOrPut(mod_name);
             if (!gop.found_existing) {
                 gop.key_ptr.* = mod_name;
-                gop.value_ptr.* = std.ArrayList(TableDef){};
+            gop.value_ptr.* = std.ArrayList(TableDef).empty;
             } else {
                 allocator.free(mod_name);
             }
             try gop.value_ptr.append(allocator, table);
         }
 
-        try std.fs.cwd().makePath(out_dir);
+        try std.Io.Dir.cwd().createDirPath(io, out_dir);
         var iter = module_map.iterator();
         while (iter.next()) |entry| {
-            try writeModuleFiles(allocator, out_dir, entry.key_ptr.*, entry.value_ptr.items);
+            try writeModuleFiles(io, allocator, out_dir, entry.key_ptr.*, entry.value_ptr.items);
         }
     }
 }

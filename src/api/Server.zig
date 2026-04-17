@@ -85,7 +85,7 @@ pub const Context = struct {
     responded: bool = false,
     user_data: ?*anyopaque = null,
     validation_error_message: ?[]const u8 = null,
-    stream: ?std.net.Stream = null,
+    stream: ?std.Io.net.Stream = null,
     upgraded: bool = false,
 
     // Middleware chain fields
@@ -103,7 +103,7 @@ pub const Context = struct {
             .params = std.StringHashMap([]const u8).init(allocator),
             .headers = std.StringHashMap([]const u8).init(allocator),
             .form = std.StringHashMap([]const u8).init(allocator),
-            .response_body = std.ArrayList(u8){},
+            .response_body = std.ArrayList(u8).empty,
             .response_headers = std.StringHashMap([]const u8).init(allocator),
         };
     }
@@ -223,12 +223,10 @@ pub const Context = struct {
     /// Parse JSON body into type T
     pub fn bindJson(self: *const Context, comptime T: type) !T {
         if (self.body == null) return error.NoBody;
-        var parsed = std.json.parseFromSlice(T, self.allocator, self.body.?, .{  }) catch return error.InvalidJson;
+        var parsed = std.json.parseFromSlice(T, self.allocator, self.body.?, .{}) catch return error.InvalidJson;
         defer parsed.deinit();
         return parsed.value;
     }
-
-
 
     /// Send JSON from struct
     pub fn jsonStruct(self: *Context, status: u16, value: anytype) !void {
@@ -320,7 +318,7 @@ fn parseFormBody(allocator: std.mem.Allocator, body: []const u8) !std.StringHash
 
 /// Simple stream reader wrapper for HTTP parsing
 const StreamReader = struct {
-    stream: std.net.Stream,
+    stream: std.Io.net.Stream,
     buf: [8192]u8 = undefined,
     pos: usize = 0,
     end: usize = 0,
@@ -499,7 +497,7 @@ const TrieNode = struct {
             .is_param = std.mem.startsWith(u8, segment, "{"),
             .param_name = null,
             .route = null,
-            .children = .{},
+            .children = std.ArrayList(*TrieNode).empty,
         };
         if (node.is_param) {
             const name = if (std.mem.endsWith(u8, segment, "}"))
@@ -663,10 +661,10 @@ fn getStatusText(status: u16) []const u8 {
 
 /// HTTP response writer
 const ResponseWriter = struct {
-    pub fn write(allocator: std.mem.Allocator, stream: std.net.Stream, status: u16, headers: *const std.StringHashMap([]const u8), body: []const u8) !void {
-        var buf = std.ArrayList(u8){};
-        defer buf.deinit(allocator);
-        const w = buf.writer(allocator);
+    pub fn write(io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net.Stream, status: u16, headers: *const std.StringHashMap([]const u8), body: []const u8) !void {
+        var buf = std.array_list.Managed(u8).init(allocator);
+        defer buf.deinit();
+        const w = buf.writer();
 
         const status_text = getStatusText(status);
         try w.print("HTTP/1.1 {d} {s}\r\n", .{ status, status_text });
@@ -680,7 +678,7 @@ const ResponseWriter = struct {
         try w.writeAll("\r\n");
         try w.writeAll(body);
 
-        _ = try stream.write(buf.items);
+        _ = try stream.write(io, buf.items);
     }
 };
 
@@ -759,22 +757,24 @@ pub const RouteGroup = struct {
 
 /// HTTP server
 pub const Server = struct {
+    io: std.Io,
     allocator: std.mem.Allocator,
     port: u16,
     router: Router,
     global_middleware: std.ArrayList(Middleware),
     name: []const u8,
     running: std.atomic.Value(bool),
-    server_socket: ?std.net.Server = null,
+    server_socket: ?std.Io.net.Server = null,
     max_body_size: usize,
     request_timeout_ms: u32,
 
-    pub fn init(allocator: std.mem.Allocator, port: u16) Server {
+    pub fn init(io: std.Io, allocator: std.mem.Allocator, port: u16) Server {
         return .{
+            .io = io,
             .allocator = allocator,
             .port = port,
             .router = Router.init(allocator),
-            .global_middleware = std.ArrayList(Middleware){},
+            .global_middleware = std.ArrayList(Middleware).empty,
             .name = "zigmodu-api",
             .running = std.atomic.Value(bool).init(false),
             .server_socket = null,
@@ -787,7 +787,7 @@ pub const Server = struct {
         self.router.deinit();
         self.global_middleware.deinit(self.allocator);
         if (self.server_socket) |*ss| {
-            ss.deinit();
+            ss.deinit(self.io);
         }
     }
 
@@ -808,11 +808,11 @@ pub const Server = struct {
 
     /// Start the server
     pub fn start(self: *Server) !void {
-        const addr = std.net.Address.parseIp4("0.0.0.0", self.port) catch {
+        var addr = std.Io.net.IpAddress.parseIp4("0.0.0.0", self.port) catch {
             return error.ConnectionRefused;
         };
 
-        var server = addr.listen(.{
+        var server = std.Io.net.listen(&addr, self.io, .{
             .reuse_address = true,
             .kernel_backlog = 128,
         }) catch {
@@ -825,18 +825,18 @@ pub const Server = struct {
         std.log.info("Server listening on port {d}", .{self.port});
 
         while (self.running.load(.monotonic)) {
-            const conn = server.accept() catch |err| {
+            const conn = server.accept(self.io) catch |err| {
                 if (!self.running.load(.monotonic)) break;
                 std.log.err("Accept error: {any}", .{err});
                 continue;
             };
 
-            const conn_ptr = try self.allocator.create(std.net.Server.Connection);
+            const conn_ptr = try self.allocator.create(std.Io.net.Server.Connection);
             conn_ptr.* = conn;
 
             const thread = std.Thread.spawn(.{}, handleConnection, .{ self, conn_ptr }) catch |err| {
                 std.log.err("Failed to spawn thread: {any}", .{err});
-                conn_ptr.stream.close();
+                conn_ptr.stream.close(self.io);
                 self.allocator.destroy(conn_ptr);
                 continue;
             };
@@ -848,15 +848,15 @@ pub const Server = struct {
     pub fn stop(self: *Server) void {
         self.running.store(false, .monotonic);
         if (self.server_socket) |*ss| {
-            ss.deinit();
+            ss.deinit(self.io);
             self.server_socket = null;
         }
     }
 
-    fn handleConnection(self: *Server, conn: *std.net.Server.Connection) void {
+    fn handleConnection(self: *Server, conn: *std.Io.net.Server.Connection) void {
         var close_stream = true;
         defer {
-            if (close_stream) conn.stream.close();
+            if (close_stream) conn.stream.close(self.io);
             self.allocator.destroy(conn);
         }
 
@@ -866,7 +866,7 @@ pub const Server = struct {
 
         var stream_reader = StreamReader{ .stream = conn.stream };
 
-        const start_time = std.time.milliTimestamp();
+        const start_time = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
 
         var parser = RequestParser.init(arena_alloc);
         var request = parser.parse(&stream_reader, self.max_body_size) catch |err| {
@@ -875,7 +875,7 @@ pub const Server = struct {
             const status: u16 = if (err == error.BodyTooLarge) 413 else 400;
             const msg = if (err == error.BodyTooLarge) "Payload Too Large" else "Bad Request";
             const response = std.fmt.allocPrint(arena_alloc, "HTTP/1.1 {d} {s}\r\n\r\n", .{ status, msg }) catch return;
-            _ = conn.stream.write(response) catch {};
+            _ = conn.stream.write(self.io, response) catch {};
             return;
         };
         defer request.deinit(arena_alloc);
@@ -909,7 +909,6 @@ pub const Server = struct {
         ctx.body = request.body;
         ctx.raw_path = request.raw_path;
 
-
         // Parse form body if content-type is application/x-www-form-urlencoded
         if (request.body) |body| {
             const content_type = request.headers.get("Content-Type") orelse "";
@@ -940,7 +939,7 @@ pub const Server = struct {
         }
 
         // Check request timeout
-        const elapsed = std.time.milliTimestamp() - start_time;
+        const elapsed = 0 - start_time;
         if (elapsed > self.request_timeout_ms) {
             std.log.warn("Request timeout: {s} {s} took {d}ms", .{ request.method.toString(), request.path, elapsed });
         }
@@ -951,7 +950,7 @@ pub const Server = struct {
         }
 
         // Send response
-        ResponseWriter.write(arena_alloc, conn.stream, ctx.status_code, &ctx.response_headers, ctx.response_body.items) catch {};
+        ResponseWriter.write(self.io, arena_alloc, conn.stream, ctx.status_code, &ctx.response_headers, ctx.response_body.items) catch {};
     }
 
     fn executeWithMiddleware(self: *Server, ctx: *Context, final_handler: HandlerFn, route_middleware: []const Middleware) !void {
@@ -1004,7 +1003,7 @@ pub fn Json(comptime T: type) type {
 
 test "api server" {
     const allocator = std.testing.allocator;
-        var server = Server.init(allocator, 0);
+    var server = Server.init(std.testing.io, allocator, 0);
     defer server.deinit();
 
     const route = Route{
@@ -1063,7 +1062,7 @@ test "http methods" {
 
 test "parse req binding" {
     const allocator = std.testing.allocator;
-        var ctx = try Context.init(allocator, .GET, "/users/42");
+    var ctx = try Context.init(allocator, .GET, "/users/42");
     defer ctx.deinit();
 
     try ctx.params.put(try allocator.dupe(u8, "id"), try allocator.dupe(u8, "42"));
@@ -1081,7 +1080,7 @@ test "parse req binding" {
 
 test "route group" {
     const allocator = std.testing.allocator;
-        var server = Server.init(allocator, 0);
+    var server = Server.init(std.testing.io, allocator, 0);
     defer server.deinit();
 
     var api_group = server.group("/api/v1");

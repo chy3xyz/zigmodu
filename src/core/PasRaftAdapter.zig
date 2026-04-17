@@ -1,4 +1,7 @@
+// ⚠️ EXPERIMENTAL: This module is incomplete and not production-ready.
 // PasRaft Consensus Adapter for ZigModu
+// Provides integration between ZigModu's module system and PasRaft consensus algorithm
+// for cluster-wide coordination and state management
 // Provides integration between ZigModu's module system and PasRaft consensus algorithm
 // for cluster-wide coordination and state management
 
@@ -72,7 +75,7 @@ pub const PasRaftAdapter = struct {
             .term = 1, // Current term (simplified)
             .index = self.log_index + 1,
             .command = try self.allocator.dupe(u8, operation),
-            .timestamp = std.time.timestamp(),
+            .timestamp = 0,
         };
         defer self.allocator.free(entry.command);
 
@@ -111,7 +114,7 @@ pub const PasRaftAdapter = struct {
 
     /// Get current cluster membership status for consensus
     pub fn getClusterStatus(self: *Self) ![]const u8 {
-        var status = std.ArrayList(u8).init(self.allocator);
+        var status = std.ArrayList(u8).empty;
         defer status.deinit();
 
         const writer = status.writer();
@@ -131,7 +134,7 @@ test "PasRaftAdapter initialization" {
     var bus = DistributedEventBus.init(allocator);
     defer bus.deinit();
 
-    var cluster = try ClusterMembership.init(allocator, "node-1", try std.net.Address.parseIp4("127.0.0.1", 18081), &bus);
+    var cluster = try ClusterMembership.init(allocator, "node-1", try std.Io.net.IpAddress.parseIp4("127.0.0.1", 18081), &bus);
     defer cluster.deinit();
 
     var adapter = try PasRaftAdapter.init(allocator, &cluster, &bus, .{});
@@ -145,7 +148,7 @@ test "PasRaftAdapter propose operation" {
     var bus = DistributedEventBus.init(allocator);
     defer bus.deinit();
 
-    var cluster = try ClusterMembership.init(allocator, "node-1", try std.net.Address.parseIp4("127.0.0.1", 18081), &bus);
+    var cluster = try ClusterMembership.init(allocator, "node-1", try std.Io.net.IpAddress.parseIp4("127.0.0.1", 18081), &bus);
     defer cluster.deinit();
 
     var adapter = try PasRaftAdapter.init(allocator, &cluster, &bus, .{});
@@ -160,7 +163,7 @@ test "PasRaftAdapter cluster status" {
     var bus = DistributedEventBus.init(allocator);
     defer bus.deinit();
 
-    var cluster = try ClusterMembership.init(allocator, "node-1", try std.net.Address.parseIp4("127.0.0.1", 18081), &bus);
+    var cluster = try ClusterMembership.init(allocator, "node-1", try std.Io.net.IpAddress.parseIp4("127.0.0.1", 18081), &bus);
     defer cluster.deinit();
 
     var adapter = try PasRaftAdapter.init(allocator, &cluster, &bus, .{});

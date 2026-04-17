@@ -61,7 +61,7 @@ const OrderModule = struct {
                 .order_id = order_id,
                 .user_id = user_id,
                 .total_amount = total,
-                .timestamp = std.time.timestamp(),
+                .timestamp = 0,
             });
             std.log.info("[order] Published OrderCreated event", .{});
         }
@@ -117,7 +117,7 @@ const PaymentModule = struct {
         std.log.info("[payment] Processing payment of ${d:.2}", .{event.total_amount});
 
         // 模拟支付处理
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        // std.Thread.sleep(100 * std.time.ns_per_ms);
 
         std.log.info("[payment] Payment completed successfully", .{});
     }
@@ -144,10 +144,8 @@ const NotificationModule = struct {
     }
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = std.heap.page_allocator;
 
     std.log.info("=== ZigModu Event-Driven Example ===", .{});
     std.log.info("Demonstrates: EventBus, publish-subscribe pattern\n", .{});
@@ -167,7 +165,7 @@ pub fn main() !void {
     std.log.info("  - NotificationModule.onOrderCreated\n", .{});
 
     // 创建应用
-    var app = try zigmodu.Application.init(
+    var app = try zigmodu.Application.init(init.io,
         allocator,
         "event-driven-shop",
         .{ OrderModule, InventoryModule, PaymentModule, NotificationModule },

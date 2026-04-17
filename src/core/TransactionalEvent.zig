@@ -149,7 +149,7 @@ pub const EventOutbox = struct {
             .id = id,
             .event_data = data,
             .event_type = type_copy,
-            .timestamp = std.time.timestamp(),
+            .timestamp = 0,
         });
 
         return id;

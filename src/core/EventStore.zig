@@ -67,7 +67,7 @@ pub const EventStore = struct {
         stream.version += 1;
         try stream.events.append(self.allocator, .{
             .sequence = stream.version,
-            .timestamp = std.time.timestamp(),
+            .timestamp = 0,
             .event_type = type_copy,
             .event_data = data,
             .metadata = metadata,
@@ -82,7 +82,7 @@ pub const EventStore = struct {
         const id_copy = try self.allocator.dupe(u8, stream_id);
         try self.streams.put(id_copy, .{
             .stream_id = id_copy,
-            .events = std.ArrayList(EventStream.StoredEvent){},
+            .events = std.ArrayList(EventStream.StoredEvent).empty,
         });
 
         return self.streams.getPtr(id_copy).?;
@@ -179,7 +179,7 @@ pub const SnapshotStore = struct {
         try self.snapshots.put(id_copy, .{
             .stream_id = id_copy,
             .version = version,
-            .timestamp = std.time.timestamp(),
+            .timestamp = 0,
             .data = data_copy,
         });
     }

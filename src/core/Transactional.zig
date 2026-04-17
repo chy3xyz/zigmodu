@@ -275,7 +275,7 @@ pub const Transactional = struct {
                 .is_new_transaction = true,
                 .is_rollback_only = false,
                 .is_completed = false,
-                .start_time = std.time.timestamp(),
+                .start_time = 0,
             };
 
             try tm_ctx.transactions.append(status);

@@ -1,8 +1,8 @@
 # ZigModu
 
-一个为 Zig 0.15.2 打造的模块化应用框架，受 Spring Modulith 启发。从单体架构到分布式系统，支持渐进式架构演进。
+一个为 Zig 0.16.0 打造的模块化应用框架，受 Spring Modulith 启发。从单体架构到分布式系统，支持渐进式架构演进。
 
-[![Zig](https://img.shields.io/badge/Zig-0.15.2+-orange?style=flat-square)](https://ziglang.org/)
+[![Zig](https://img.shields.io/badge/Zig-0.16.0+-orange?style=flat-square)](https://ziglang.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
 [![Build](https://img.shields.io/badge/Build-Passing-green?style=flat-square)](https://github.com/knot3bot/zigmodu/actions)
 
@@ -57,10 +57,10 @@
 ### 前置要求
 
 ```bash
-# 安装 Zig 0.15.2
-brew install zig@0.15.2  # macOS
+# 安装 Zig 0.16.0
+brew install zig@0.16.0  # macOS
 # 或
-apt install zig=0.15.2   # Linux
+apt install zig=0.16.0   # Linux
 ```
 
 ### 创建第一个模块
@@ -96,11 +96,10 @@ const zigmodu = @import("zigmodu");
 
 const user = @import("modules/user.zig");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
-    var modules = try zigmodu.scanModules(gpa.allocator(), .{user});
+    var modules = try zigmodu.scanModules(allocator, .{user});
     defer modules.deinit();
 
     try zigmodu.validateModules(&modules);

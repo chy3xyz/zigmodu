@@ -50,7 +50,7 @@ fn checkCircularDependencies(modules: *ApplicationModules) !void {
     var in_stack = std.StringHashMap(void).init(modules.allocator);
     defer in_stack.deinit();
 
-    var path = std.ArrayList([]const u8){};
+    var path = std.ArrayList([]const u8).empty;
     defer path.deinit(modules.allocator);
 
     var iter = modules.modules.iterator();

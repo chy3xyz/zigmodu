@@ -14,8 +14,8 @@ pub const YamlParser = struct {
     /// Parse YAML file into a flat key-value map
     /// Nested keys are flattened with dots (e.g., server.port -> "server.port")
     pub fn parseFile(self: *Self, path: []const u8) !std.StringHashMap([]const u8) {
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().openFile(path, .{});
+        defer file.close(std.testing.io);
 
         const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
         defer self.allocator.free(content);
@@ -142,8 +142,8 @@ pub const TomlParser = struct {
     }
 
     pub fn parseFile(self: *Self, path: []const u8) !std.StringHashMap([]const u8) {
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().openFile(path, .{});
+        defer file.close(std.testing.io);
 
         const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
         defer self.allocator.free(content);

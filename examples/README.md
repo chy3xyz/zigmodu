@@ -159,7 +159,7 @@ var reloader = zigmodu.HotReloader.init(allocator);
 ## 🚀 Quick Start
 
 ### Prerequisites
-- Zig 0.15.2 or later
+- Zig 0.16.0 or later
 - Git
 
 ### Running Examples
@@ -351,11 +351,10 @@ const Module1 = struct {
     };
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
     
-    var app = try zigmodu.Application.init(gpa.allocator(), "example", .{Module1}, .{});
+    var app = try zigmodu.Application.init(allocator, "example", .{Module1}, .{});
     defer app.deinit();
     
     try app.start();

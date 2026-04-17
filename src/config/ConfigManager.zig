@@ -56,8 +56,8 @@ pub const ConfigManager = struct {
 
     /// Load configuration from JSON file
     pub fn loadJson(self: *Self, path: []const u8) !void {
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().openFile(path, .{});
+        defer file.close(std.testing.io);
 
         const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
         defer self.allocator.free(content);

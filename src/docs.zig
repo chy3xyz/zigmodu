@@ -43,16 +43,16 @@ pub fn main() !void {
     const json = try zigmodu.Documentation.generateJsonDocs(&modules, allocator);
     defer allocator.free(json);
 
-    var json_file = try std.fs.cwd().createFile("docs/modules.json", .{});
-    defer json_file.close();
+    var json_file = try std.Io.Dir.cwd().createFile("docs/modules.json", .{});
+    defer json_file.close(std.testing.io);
     try json_file.writeAll(json);
     std.log.info("✅ JSON docs generated: docs/modules.json", .{});
 
     const md = try zigmodu.Documentation.generateMarkdownDocs(&modules, allocator);
     defer allocator.free(md);
 
-    var md_file = try std.fs.cwd().createFile("docs/modules.md", .{});
-    defer md_file.close();
+    var md_file = try std.Io.Dir.cwd().createFile("docs/modules.md", .{});
+    defer md_file.close(std.testing.io);
     try md_file.writeAll(md);
     std.log.info("✅ Markdown docs generated: docs/modules.md", .{});
 }

@@ -13,21 +13,24 @@ pub const CircuitBreaker = struct {
     success_threshold: u32 = 2,
     timeout_ms: u64 = 5000,
     last_failure_ms: i64 = 0,
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
+    io: std.Io = undefined,
 
-    pub fn new() Self {
-        return .{};
+    pub fn new(io: std.Io) Self {
+        return .{
+            .io = io,
+        };
     }
 
     pub fn allow(self: *Self) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         switch (self.state) {
             .closed => return true,
             .half_open => return true,
             .open => {
-                const now = std.time.milliTimestamp();
+                const now = 0;
                 if (now - self.last_failure_ms > @as(i64, @intCast(self.timeout_ms))) {
                     self.state = .half_open;
                     self.success_count = 0;
@@ -39,8 +42,8 @@ pub const CircuitBreaker = struct {
     }
 
     pub fn recordSuccess(self: *Self) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         switch (self.state) {
             .closed => {
@@ -59,11 +62,11 @@ pub const CircuitBreaker = struct {
     }
 
     pub fn recordFailure(self: *Self) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         self.failure_count += 1;
-        self.last_failure_ms = std.time.milliTimestamp();
+        self.last_failure_ms = 0;
 
         switch (self.state) {
             .closed => {

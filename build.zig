@@ -6,18 +6,18 @@ const CLibPaths = struct {
 };
 
 fn detectPqPaths(b: *std.Build, allocator: std.mem.Allocator) CLibPaths {
-    if (b.graph.env_map.get("PQ_INCLUDE")) |inc| {
-        return .{ .include = b.dupe(inc), .lib = b.graph.env_map.get("PQ_LIB") };
+    if (b.graph.environ_map.get("PQ_INCLUDE")) |inc| {
+        return .{ .include = b.dupe(inc), .lib = b.graph.environ_map.get("PQ_LIB") };
     }
     const host_target = b.graph.host.result;
     if (host_target.os.tag == .macos) {
-        if (dirExists("/opt/homebrew/opt/libpq")) {
+        if (dirExists(b, "/opt/homebrew/opt/libpq")) {
             return .{
                 .include = "/opt/homebrew/opt/libpq/include",
                 .lib = "/opt/homebrew/opt/libpq/lib",
             };
         }
-        if (dirExists("/usr/local/opt/libpq")) {
+        if (dirExists(b, "/usr/local/opt/libpq")) {
             return .{
                 .include = "/usr/local/opt/libpq/include",
                 .lib = "/usr/local/opt/libpq/lib",
@@ -30,7 +30,7 @@ fn detectPqPaths(b: *std.Build, allocator: std.mem.Allocator) CLibPaths {
             "/usr/pgsql/include",
         };
         for (candidates) |c| {
-            if (dirExists(c)) {
+            if (dirExists(b, c)) {
                 return .{
                     .include = c,
                     .lib = "/usr/lib/x86_64-linux-gnu",
@@ -43,8 +43,8 @@ fn detectPqPaths(b: *std.Build, allocator: std.mem.Allocator) CLibPaths {
 }
 
 fn detectMysqlPaths(b: *std.Build, allocator: std.mem.Allocator) CLibPaths {
-    if (b.graph.env_map.get("MYSQL_INCLUDE")) |inc| {
-        return .{ .include = b.dupe(inc), .lib = b.graph.env_map.get("MYSQL_LIB") };
+    if (b.graph.environ_map.get("MYSQL_INCLUDE")) |inc| {
+        return .{ .include = b.dupe(inc), .lib = b.graph.environ_map.get("MYSQL_LIB") };
     }
     const host_target = b.graph.host.result;
     if (host_target.os.tag == .macos) {
@@ -55,7 +55,7 @@ fn detectMysqlPaths(b: *std.Build, allocator: std.mem.Allocator) CLibPaths {
             "/usr/local/opt/mysql-client",
         };
         for (prefixes) |prefix| {
-            if (dirExists(prefix)) {
+            if (dirExists(b, prefix)) {
                 return .{
                     .include = b.fmt("{s}/include/mariadb", .{prefix}),
                     .lib = b.fmt("{s}/lib", .{prefix}),
@@ -69,7 +69,7 @@ fn detectMysqlPaths(b: *std.Build, allocator: std.mem.Allocator) CLibPaths {
             "/usr/local/include/mariadb",
         };
         for (candidates) |c| {
-            if (dirExists(c)) {
+            if (dirExists(b, c)) {
                 return .{
                     .include = c,
                     .lib = "/usr/lib/x86_64-linux-gnu",
@@ -81,8 +81,10 @@ fn detectMysqlPaths(b: *std.Build, allocator: std.mem.Allocator) CLibPaths {
     return .{};
 }
 
-fn dirExists(path: []const u8) bool {
-    std.fs.cwd().access(path, .{}) catch return false;
+fn dirExists(b: *std.Build, path: []const u8) bool {
+    const io = b.graph.io;
+    const cwd = std.Io.Dir.cwd();
+    cwd.access(io, path, .{}) catch return false;
     return true;
 }
 
@@ -121,12 +123,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Add zio dependency to zigmodu module
-    const zio_dep = b.dependency("zio", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    zigmodu_mod.addImport("zio", zio_dep.module("zio"));
     linkDbLibs(zigmodu_mod, b);
 
     // Create example executable
@@ -156,7 +152,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests");
 
     const lib_test = b.addTest(.{
-        .root_module = zigmodu_mod,
+        .root_module = zigmodu_mod
     });
     const run_lib_test = b.addRunArtifact(lib_test);
     test_step.dependOn(&run_lib_test.step);

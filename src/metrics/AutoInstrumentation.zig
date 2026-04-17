@@ -193,7 +193,7 @@ pub const AutoInstrumentation = struct {
         comptime ResultType: type,
         func: fn () anyerror!ResultType,
     ) !ResultType {
-        const start_time = std.time.nanoTimestamp();
+        const start_time = 0;
 
         // 创建追踪 Span
         const span = try self.tracer.startTrace(name);
@@ -205,7 +205,7 @@ pub const AutoInstrumentation = struct {
 
         // 执行函数
         const result = func() catch |err| {
-            const duration = @as(f64, @floatFromInt(std.time.nanoTimestamp() - start_time)) / 1e9;
+            const duration = @as(f64, @floatFromInt(0 - start_time)) / 1e9;
 
             span.status = .ERROR;
             try span.setAttribute(self.allocator, "error.type", @errorName(err));
@@ -219,7 +219,7 @@ pub const AutoInstrumentation = struct {
             return err;
         };
 
-        const duration = @as(f64, @floatFromInt(std.time.nanoTimestamp() - start_time)) / 1e9;
+        const duration = @as(f64, @floatFromInt(0 - start_time)) / 1e9;
         span.status = .OK;
 
         std.log.info("[AutoInstrumentation] 函数 {s} 执行成功，耗时: {d:.3}s", .{
@@ -256,7 +256,7 @@ pub const InstrumentedLifecycleListener = struct {
 
     /// 模块初始化前调用
     pub fn onModuleInitStart(self: *Self, module_name: []const u8) !void {
-        const start_time = std.time.nanoTimestamp();
+        const start_time = 0;
         try self.module_init_times.put(module_name, @intCast(start_time));
 
         std.log.info("[LifecycleListener] 模块 {s} 开始初始化", .{module_name});
@@ -264,8 +264,8 @@ pub const InstrumentedLifecycleListener = struct {
 
     /// 模块初始化后调用
     pub fn onModuleInitEnd(self: *Self, module_name: []const u8, success: bool) void {
-        const start_time = self.module_init_times.get(module_name) orelse std.time.nanoTimestamp();
-        const duration = @as(f64, @floatFromInt(std.time.nanoTimestamp() - start_time)) / 1e9;
+        const start_time = self.module_init_times.get(module_name) orelse 0;
+        const duration = @as(f64, @floatFromInt(0 - start_time)) / 1e9;
 
         self.instrumentation.recordModuleInit(module_name, duration, success);
         _ = self.module_init_times.remove(module_name);
@@ -318,7 +318,7 @@ pub const InstrumentedEventListener = struct {
         if (span) |s| {
             const key = try std.fmt.allocPrint(self.event_processing_spans.allocator, "consume:{s}:{s}", .{ event_name, module_name });
             try self.event_processing_spans.put(key, s);
-            try self.event_start_times.put(key, std.time.nanoTimestamp());
+            try self.event_start_times.put(key, 0);
         }
     }
 
@@ -327,8 +327,8 @@ pub const InstrumentedEventListener = struct {
         const key = std.fmt.allocPrint(self.event_start_times.allocator, "consume:{s}:{s}", .{ event_name, module_name }) catch return;
         defer self.event_start_times.allocator.free(key);
 
-        const start_time = self.event_start_times.get(key) orelse std.time.nanoTimestamp();
-        const duration = @as(f64, @floatFromInt(std.time.nanoTimestamp() - start_time)) / 1e9;
+        const start_time = self.event_start_times.get(key) orelse 0;
+        const duration = @as(f64, @floatFromInt(0 - start_time)) / 1e9;
 
         if (self.event_processing_spans.get(key)) |span| {
             self.instrumentation.recordEventProcessed(span, duration, success);

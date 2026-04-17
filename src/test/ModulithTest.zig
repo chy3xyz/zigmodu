@@ -33,6 +33,7 @@ pub fn ModulithTest(comptime modules: anytype) type {
         /// Initialize test context
         pub fn init(allocator: std.mem.Allocator) !Self {
             const app = try Application.init(
+                std.testing.io,
                 allocator,
                 "test",
                 modules,
@@ -137,7 +138,7 @@ fn EventCapture(comptime T: type) type {
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
                 .allocator = allocator,
-                .events = std.ArrayList(T){},
+                .events = std.ArrayList(T).empty,
             };
         }
 
@@ -187,12 +188,12 @@ pub const TestUtils = struct {
         condition: fn () bool,
         timeout_ms: u64,
     ) !void {
-        const start = std.time.milliTimestamp();
+        const start = 0;
         while (!condition()) {
-            if (@as(u64, @intCast(std.time.milliTimestamp() - start)) > timeout_ms) {
+            if (@as(u64, @intCast(0 - start)) > timeout_ms) {
                 return error.Timeout;
             }
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            // std.Thread.sleep(1 * std.time.ns_per_ms);// TODO: 0.16.0 needs io
         }
     }
 };

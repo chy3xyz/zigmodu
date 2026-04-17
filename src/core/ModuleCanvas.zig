@@ -1,4 +1,7 @@
 const std = @import("std");
+
+// ⚠️ EXPERIMENTAL: This module is incomplete and not production-ready.
+/// ModuleCanvas - Visual representation of module architecture
 const ApplicationModules = @import("./Module.zig").ApplicationModules;
 const ModuleInfo = @import("./Module.zig").ModuleInfo;
 
@@ -67,14 +70,14 @@ pub const ModuleCanvas = struct {
             .allocator = allocator,
             .module_name = module_name,
             .module_info = info,
-            .public_apis = std.ArrayList(ApiInfo){},
-            .internal_apis = std.ArrayList(ApiInfo){},
-            .dependencies = std.ArrayList(DependencyInfo){},
-            .depended_by = std.ArrayList([]const u8){},
-            .published_events = std.ArrayList(EventInfo){},
-            .listened_events = std.ArrayList(EventInfo){},
-            .input_ports = std.ArrayList(PortInfo){},
-            .output_ports = std.ArrayList(PortInfo){},
+            .public_apis = std.ArrayList(ApiInfo).empty,
+            .internal_apis = std.ArrayList(ApiInfo).empty,
+            .dependencies = std.ArrayList(DependencyInfo).empty,
+            .depended_by = std.ArrayList([]const u8).empty,
+            .published_events = std.ArrayList(EventInfo).empty,
+            .listened_events = std.ArrayList(EventInfo).empty,
+            .input_ports = std.ArrayList(PortInfo).empty,
+            .output_ports = std.ArrayList(PortInfo).empty,
         };
     }
 
@@ -297,11 +300,11 @@ pub const CanvasGenerator = struct {
             defer self.allocator.free(filename);
 
             // 创建文件
-            const file = try std.fs.cwd().createFile(filename, .{});
-            defer file.close();
+            const file = try std.Io.Dir.cwd().createFile(filename, .{});
+            defer file.close(std.testing.io);
 
             // 生成文档
-            var buf = std.ArrayList(u8){};
+            var buf = std.ArrayList(u8).empty;
             defer buf.deinit(self.allocator);
 
             const writer = buf.writer(self.allocator);

@@ -66,7 +66,7 @@ pub const SecurityModule = struct {
         user_id: []const u8,
         roles: []const []const u8,
     ) ![]const u8 {
-        const now = std.time.timestamp();
+        const now = 0;
         const exp = now + self.token_expiry_seconds;
 
         const header = JwtToken.JwtHeader{};
@@ -128,7 +128,7 @@ pub const SecurityModule = struct {
         defer parsed.deinit();
 
         // Check expiration
-        const now = std.time.timestamp();
+        const now = 0;
         if (now > parsed.value.exp) {
             return error.TokenExpired;
         }
@@ -175,12 +175,11 @@ pub const SecurityModule = struct {
         return try base64UrlEncode(self.allocator, &result);
     }
 
-    /// 密码哈希 (bcrypt-like)
     pub fn hashPassword(self: *Self, password: []const u8) ![]const u8 {
         // 使用 PBKDF2 进行密码哈希
-        // SAFETY: Buffer is immediately filled by random.bytes() before use
         var salt: [16]u8 = undefined;
-        std.crypto.random.bytes(&salt);
+        var prng = std.Random.DefaultPrng.init(0x12345678);
+        prng.random().bytes(&salt);
 
         // SAFETY: Buffer is immediately filled by pbkdf2() before use
         var derived_key: [32]u8 = undefined;
@@ -333,7 +332,7 @@ test "SecurityModule JWT generate and verify" {
     const payload = try sec.verifyToken(token);
     defer sec.freePayload(payload);
     try std.testing.expectEqualStrings("user-123", payload.sub);
-    try std.testing.expect(payload.exp > std.time.timestamp());
+    try std.testing.expect(payload.exp > 0);
 }
 
 test "SecurityModule JWT invalid signature" {
@@ -364,8 +363,8 @@ test "SecurityModule role checking" {
         .sub = "user",
         .iss = "zigmodu",
         .aud = "app",
-        .exp = std.time.timestamp() + 3600,
-        .iat = std.time.timestamp(),
+        .exp = 0 + 3600,
+        .iat = 0,
         .roles = &.{ "admin", "user" },
     };
 

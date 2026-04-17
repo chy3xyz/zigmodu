@@ -9,16 +9,15 @@ const UserModule = @import("modules/user.zig");
 const OrderModule = @import("modules/order.zig");
 const PaymentModule = @import("modules/payment.zig");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
     std.log.info("=== ZigModu Basic Example ===", .{});
     std.log.info("Demonstrates: Module definition, dependency management, lifecycle\n", .{});
 
     // Method 1: Using the new Application API (Recommended)
     var app = try zigmodu.Application.init(
+        init.io,
         allocator,
         "shop",
         .{ UserModule, OrderModule, PaymentModule },
@@ -43,7 +42,7 @@ pub fn main() !void {
     }
 
     // Simulate work
-    std.Thread.sleep(500 * std.time.ns_per_ms);
+    // std.Thread.sleep(500 * std.time.ns_per_ms);
 
     std.log.info("\n👋 Application shutting down...", .{});
     // deinit() automatically stops modules in reverse dependency order

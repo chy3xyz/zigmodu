@@ -8,6 +8,7 @@ pub const ExternalizedConfig = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
+    io: std.Io,
     sources: std.ArrayList(ConfigSource),
     properties: std.StringHashMap([]const u8),
     listeners: std.ArrayList(*const fn ([]const u8, []const u8) void),
@@ -15,6 +16,20 @@ pub const ExternalizedConfig = struct {
     watch_thread: ?std.Thread = null,
     should_stop: std.atomic.Value(bool),
     watch_interval_ms: u64,
+
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) Self {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .sources = std.ArrayList(ConfigSource).empty,
+            .properties = std.StringHashMap([]const u8).init(allocator),
+            .listeners = std.ArrayList(*const fn ([]const u8, []const u8) void).empty,
+            .file_watchers = std.ArrayList(FileWatcher).empty,
+            .watch_thread = null,
+            .should_stop = std.atomic.Value(bool).init(false),
+            .watch_interval_ms = 1000,
+        };
+    }
 
     pub const ConfigSource = struct {
         name: []const u8,
@@ -33,18 +48,6 @@ pub const ExternalizedConfig = struct {
         interval_ms: u64 = 1000, // 默认1秒检查一次
     };
 
-    pub fn init(allocator: std.mem.Allocator) Self {
-        return .{
-            .allocator = allocator,
-            .sources = std.ArrayList(ConfigSource){},
-            .properties = std.StringHashMap([]const u8).init(allocator),
-            .listeners = std.ArrayList(*const fn ([]const u8, []const u8) void){},
-            .file_watchers = std.ArrayList(FileWatcher){},
-            .watch_thread = null,
-            .should_stop = std.atomic.Value(bool).init(false),
-            .watch_interval_ms = 1000,
-        };
-    }
 
     pub fn deinit(self: *Self) void {
         // 停止监听线程
@@ -183,12 +186,12 @@ pub const ExternalizedConfig = struct {
         errdefer self.allocator.free(path_copy);
 
         // 获取文件初始修改时间
-        const stat = std.fs.cwd().statFile(filepath) catch |err| {
+        const stat = std.Io.Dir.cwd().statFile(self.io, filepath, .{}) catch |err| {
             std.log.warn("无法获取文件状态 {s}: {}", .{ filepath, err });
             // 文件可能不存在，使用当前时间
             const watcher = FileWatcher{
                 .filepath = path_copy,
-                .last_modified = std.time.nanoTimestamp(),
+                .last_modified = 0,
                 .loader = loader,
             };
             try self.file_watchers.append(self.allocator, watcher);
@@ -197,7 +200,7 @@ pub const ExternalizedConfig = struct {
 
         const watcher = FileWatcher{
             .filepath = path_copy,
-            .last_modified = stat.mtime,
+            .last_modified = @as(i128, @intCast(stat.mtime.nanoseconds)),
             .loader = loader,
         };
         try self.file_watchers.append(self.allocator, watcher);
@@ -242,7 +245,7 @@ pub const ExternalizedConfig = struct {
             var remaining_ms = self.watch_interval_ms;
             while (remaining_ms > 0 and !self.should_stop.load(.acquire)) {
                 const sleep_ms = @min(remaining_ms, 100);
-                std.Thread.sleep(@as(u64, sleep_ms) * std.time.ns_per_ms);
+                // std.Thread.sleep(@as(u64, sleep_ms) * std.time.ns_per_ms);
                 remaining_ms -= sleep_ms;
             }
         }
@@ -251,7 +254,7 @@ pub const ExternalizedConfig = struct {
     /// 检查文件变化并重新加载
     fn checkFileChanges(self: *Self) !void {
         for (self.file_watchers.items) |*watcher| {
-            const stat = std.fs.cwd().statFile(watcher.filepath) catch |err| {
+            const stat = std.Io.Dir.cwd().statFile(self.io, watcher.filepath, .{}) catch |err| {
                 // 文件可能不存在或无法访问，跳过
                 if (err == error.FileNotFound) {
                     std.log.warn("配置文件不存在: {s}", .{watcher.filepath});
@@ -260,9 +263,9 @@ pub const ExternalizedConfig = struct {
                 return err;
             };
 
-            if (stat.mtime > watcher.last_modified) {
+            if (@as(i128, @intCast(stat.mtime.nanoseconds)) > watcher.last_modified) {
                 std.log.info("检测到配置文件变化: {s}", .{watcher.filepath});
-                watcher.last_modified = stat.mtime;
+                watcher.last_modified = @as(i128, @intCast(stat.mtime.nanoseconds));
 
                 // 重新加载配置
                 try self.reloadFromWatcher(watcher.*);
@@ -283,7 +286,7 @@ pub const ExternalizedConfig = struct {
         }
 
         // 记录哪些键发生了变化
-        var changed_keys = std.ArrayList([]const u8){};
+        var changed_keys = std.ArrayList([]const u8).empty;
         defer {
             for (changed_keys.items) |key| {
                 self.allocator.free(key);
@@ -395,17 +398,18 @@ pub fn envVarLoader(allocator: std.mem.Allocator) !std.StringHashMap([]const u8)
     return props;
 }
 
-/// 配置文件加载器（JSON格式）
-pub fn jsonFileLoader(filepath: []const u8) *const fn (std.mem.Allocator) anyerror!std.StringHashMap([]const u8) {
+pub fn jsonFileLoader(filepath: []const u8, io: std.Io) *const fn (std.mem.Allocator) anyerror!std.StringHashMap([]const u8) {
     return struct {
         fn load(allocator: std.mem.Allocator) !std.StringHashMap([]const u8) {
             var props = std.StringHashMap([]const u8).init(allocator);
 
-            const file = std.fs.cwd().openFile(filepath, .{}) catch return props;
-            defer file.close();
+            const file = std.Io.Dir.cwd().openFile(io, filepath, .{}) catch return props;
+            defer std.Io.File.close(file, io);
 
-            const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+            const file_len = try std.Io.File.length(file, io);
+            const content = try allocator.alloc(u8, file_len);
             defer allocator.free(content);
+            _ = try std.Io.File.readPositionalAll(file, io, content, 0);
 
             // 简化实现：解析JSON并扁平化为key-value对
             // 实际实现应使用std.json解析
@@ -421,7 +425,7 @@ pub fn jsonFileLoader(filepath: []const u8) *const fn (std.mem.Allocator) anyerr
 
 test "ExternalizedConfig basic operations" {
     const allocator = std.testing.allocator;
-    var config = ExternalizedConfig.init(allocator);
+    var config = ExternalizedConfig.init(allocator, std.testing.io);
     defer config.deinit();
 
     const testLoader = struct {
@@ -448,7 +452,7 @@ test "ExternalizedConfig basic operations" {
 
 test "ExternalizedConfig listener notification" {
     const allocator = std.testing.allocator;
-    var config = ExternalizedConfig.init(allocator);
+    var config = ExternalizedConfig.init(allocator, std.testing.io);
     defer config.deinit();
 
     const testLoader = struct {
@@ -482,7 +486,7 @@ test "ExternalizedConfig listener notification" {
 
 test "ExternalizedConfig refresh" {
     const allocator = std.testing.allocator;
-    var config = ExternalizedConfig.init(allocator);
+    var config = ExternalizedConfig.init(allocator, std.testing.io);
     defer config.deinit();
 
     const testLoader = struct {
@@ -504,16 +508,16 @@ test "ExternalizedConfig refresh" {
 
 test "ExternalizedConfig file watcher lifecycle" {
     const allocator = std.testing.allocator;
-    var config = ExternalizedConfig.init(allocator);
+    var config = ExternalizedConfig.init(allocator, std.testing.io);
     defer config.deinit();
 
     // Create a temp file
-    var tmp = try std.fs.cwd().createFile("zigmodu_test_config.tmp", .{});
+    var tmp = try std.Io.Dir.cwd().createFile(std.testing.io, "zigmodu_test_config.tmp", .{});
     defer {
-        tmp.close();
-        std.fs.cwd().deleteFile("zigmodu_test_config.tmp") catch {};
+        tmp.close(std.testing.io);
+        std.Io.Dir.cwd().deleteFile(std.testing.io, "zigmodu_test_config.tmp") catch {};
     }
-    try tmp.writeAll("{}");
+    try tmp.writeStreamingAll(std.testing.io, "{}");
 
     const dummyLoader = struct {
         fn load(a: std.mem.Allocator) !std.StringHashMap([]const u8) {

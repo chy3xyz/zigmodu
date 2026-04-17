@@ -4,6 +4,7 @@
 //! Supports SQLite, PostgreSQL, and MySQL via C bindings.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const errors = @import("errors.zig");
 const sqlite3_c = @import("sqlite3_c.zig");
 const libpq_c = @import("libpq_c.zig");
@@ -266,7 +267,7 @@ pub const SQLiteConn = struct {
         try bindSQLite(stmt.?, args);
 
         const col_count = sqlite3_c.sqlite3_column_count(stmt);
-        var rows_list: std.ArrayList(Row) = .{};
+        var rows_list: std.ArrayList(Row) = std.ArrayList(Row).empty;
         var success = false;
         defer {
             if (!success) {
@@ -477,7 +478,7 @@ pub const PostgresConn = struct {
         const n_rows = libpq_c.PQntuples(res);
         const n_cols = libpq_c.PQnfields(res);
 
-        var rows_list: std.ArrayList(Row) = .{};
+        var rows_list: std.ArrayList(Row) = std.ArrayList(Row).empty;
         var success = false;
         defer {
             if (!success) {
@@ -644,7 +645,7 @@ pub const PostgresConn = struct {
 // ==================== MySQL Implementation ====================
 
 fn formatQuery(allocator: std.mem.Allocator, sql: []const u8, args: []const Value) ![]u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
     var arg_idx: usize = 0;
     for (sql) |c| {
@@ -654,8 +655,8 @@ fn formatQuery(allocator: std.mem.Allocator, sql: []const u8, args: []const Valu
             arg_idx += 1;
             switch (arg) {
                 .null => try buf.appendSlice(allocator, "NULL"),
-                .int => |v| try std.fmt.format(buf.writer(allocator), "{d}", .{v}),
-                .float => |v| try std.fmt.format(buf.writer(allocator), "{d}", .{v}),
+                .int => |v| try buf.print(allocator, "{d}", .{v}),
+                .float => |v| try buf.print(allocator, "{d}", .{v}),
                 .string => |v| {
                     try buf.append(allocator, '\'');
                     try buf.appendSlice(allocator, v);
@@ -716,7 +717,7 @@ pub const MySqlConn = struct {
             field_names[c] = allocator.dupe(u8, name) catch return error.DatabaseError;
         }
 
-        var rows_list: std.ArrayList(Row) = .{};
+        var rows_list: std.ArrayList(Row) = std.ArrayList(Row).empty;
         var success = false;
         defer {
             if (!success) {
@@ -884,7 +885,7 @@ pub const SQLiteStmt = struct {
         try bindSQLite(self.stmt.?, args);
 
         const col_count = sqlite3_c.sqlite3_column_count(self.stmt);
-        var rows_list: std.ArrayList(Row) = .{};
+        var rows_list: std.ArrayList(Row) = std.ArrayList(Row).empty;
         var success = false;
         defer {
             if (!success) {
@@ -1010,7 +1011,7 @@ pub const PostgresStmt = struct {
 
         const n_rows = libpq_c.PQntuples(res);
         const n_cols = libpq_c.PQnfields(res);
-        var rows_list: std.ArrayList(Row) = .{};
+        var rows_list: std.ArrayList(Row) = std.ArrayList(Row).empty;
         var success = false;
         defer {
             if (!success) {
@@ -1118,7 +1119,7 @@ pub const MySqlStmt = struct {
             const name = std.mem.span(field.name);
             field_names[c] = allocator.dupe(u8, name) catch return error.DatabaseError;
         }
-        var rows_list: std.ArrayList(Row) = .{};
+        var rows_list: std.ArrayList(Row) = std.ArrayList(Row).empty;
         var success = false;
         defer {
             if (!success) {
@@ -1204,11 +1205,12 @@ const ConnPool = struct {
     reconnect_delay_ms: u32 = 100,
     active: std.atomic.Value(u32),
     idle: std.ArrayList(Conn),
-    mutex: std.Thread.Mutex,
-    cond: std.Thread.Condition,
+    mutex: std.Io.Mutex,
+    cond: std.Io.Condition,
     closed: std.atomic.Value(bool),
+    io: std.Io,
 
-    pub fn init(allocator: std.mem.Allocator, client: *Client, max_open: u32, max_idle: u32) ConnPool {
+    pub fn init(allocator: std.mem.Allocator, client: *Client, max_open: u32, max_idle: u32, io: std.Io) ConnPool {
         return .{
             .allocator = allocator,
             .client = client,
@@ -1216,18 +1218,19 @@ const ConnPool = struct {
             .max_idle = max_idle,
             .max_wait_ms = client.config.max_wait_ms,
             .active = std.atomic.Value(u32).init(0),
-            .idle = .{},
-            .mutex = .{},
-            .cond = .{},
+            .idle = std.ArrayList(Conn).empty,
+            .mutex = std.Io.Mutex.init,
+            .cond = .init,
             .closed = std.atomic.Value(bool).init(false),
+            .io = io,
         };
     }
 
     pub fn deinit(self: *ConnPool) void {
         self.closed.store(true, .monotonic);
-        self.cond.broadcast();
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.cond.broadcast(self.io);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         for (self.idle.items) |*conn| {
             conn.close();
         }
@@ -1237,8 +1240,8 @@ const ConnPool = struct {
     /// Reconnect and add a new idle connection to the pool
     fn reconnect(self: *ConnPool) !void {
         const conn = self.client.newConn() catch return;
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.idle.append(self.allocator, conn) catch {
             conn.close();
         };
@@ -1250,7 +1253,6 @@ const ConnPool = struct {
         while (attempts < self.max_reconnect_attempts) : (attempts += 1) {
             const conn = self.client.newConn() catch {
                 if (attempts < self.max_reconnect_attempts - 1) {
-                    std.Thread.sleep(std.time.ns_per_ms * self.reconnect_delay_ms);
                     self.reconnect() catch {};
                 }
                 continue;
@@ -1259,7 +1261,6 @@ const ConnPool = struct {
             conn.ping() catch {
                 conn.close();
                 if (attempts < self.max_reconnect_attempts - 1) {
-                    std.Thread.sleep(std.time.ns_per_ms * self.reconnect_delay_ms);
                     self.reconnect() catch {};
                 }
                 continue;
@@ -1272,33 +1273,32 @@ const ConnPool = struct {
     pub fn acquire(self: *ConnPool) !Conn {
         if (self.closed.load(.monotonic)) return error.ConnectionFailed;
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
 
         // Try to get from idle pool
         if (self.idle.items.len > 0) {
             const conn = self.idle.pop().?;
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             return conn;
         }
 
         // Create new connection if under limit
         const current_active = self.active.load(.monotonic);
         if (current_active < self.max_open) {
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             const conn = self.client.newConn() catch return error.ConnectionFailed;
             _ = self.active.fetchAdd(1, .monotonic);
             return conn;
         }
 
         // Wait for a connection to become available
-        const wait_until = std.time.milliTimestamp() + @as(i64, @intCast(self.max_wait_ms));
-        while (self.idle.items.len == 0 and std.time.milliTimestamp() < wait_until) {
-            self.cond.timedWait(&self.mutex, @intCast(wait_until - std.time.milliTimestamp())) catch break;
+        while (self.idle.items.len == 0 and !self.closed.load(.monotonic)) {
+            self.cond.waitUncancelable(self.io, &self.mutex);
         }
 
         if (self.idle.items.len > 0) {
             const conn = self.idle.pop().?;
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             // final health check before returning
             conn.ping() catch {
                 conn.close();
@@ -1308,7 +1308,7 @@ const ConnPool = struct {
             return conn;
         }
 
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
         return error.Timeout;
     }
 
@@ -1318,8 +1318,8 @@ const ConnPool = struct {
             _ = self.active.fetchSub(1, .monotonic);
             return;
         }
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         // Return to idle pool if not full, otherwise close
         if (self.idle.items.len < self.max_idle) {
@@ -1328,7 +1328,7 @@ const ConnPool = struct {
                 _ = self.active.fetchSub(1, .monotonic);
                 return;
             };
-            self.cond.signal();
+            self.cond.signal(self.io);
         } else {
             conn.close();
             _ = self.active.fetchSub(1, .monotonic);
@@ -1367,7 +1367,7 @@ pub const SqlContext = struct {
 
     pub fn isDone(self: SqlContext) bool {
         if (self.deadline_ms) |d| {
-            return std.time.milliTimestamp() > d;
+            return 0 > d;
         }
         return false;
     }
@@ -1377,7 +1377,7 @@ pub const SqlContext = struct {
     }
 
     pub fn withTimeout(timeout_ms: i64) SqlContext {
-        return .{ .deadline_ms = std.time.milliTimestamp() + timeout_ms };
+        return .{ .deadline_ms = 0 + timeout_ms };
     }
 };
 
@@ -1399,7 +1399,7 @@ pub const Span = struct {
     pub fn init(name: []const u8) Span {
         return .{
             .name = name,
-            .start_ns = std.time.nanoTimestamp(),
+            .start_ns = 0,
             .end_ns = null,
             .attributes = std.StringHashMap([]const u8).init(std.heap.page_allocator),
         };
@@ -1411,7 +1411,7 @@ pub const Span = struct {
 
     pub fn end(self: *Span) void {
         if (self.end_ns == null) {
-            self.end_ns = std.time.nanoTimestamp();
+            self.end_ns = 0;
         }
     }
 };
@@ -1428,8 +1428,9 @@ pub const Client = struct {
     metrics_callback: ?MetricsCallback = null,
     /// Optional tracer for OpenTelemetry-compatible spans (zero-cost when null)
     tracer: ?*const Tracer = null,
+    io: std.Io,
 
-    pub fn init(allocator: std.mem.Allocator, cfg: Config) Client {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, cfg: Config) Client {
         return .{
             .allocator = allocator,
             .config = cfg,
@@ -1439,6 +1440,7 @@ pub const Client = struct {
             .acceptable = null,
             .metrics_callback = null,
             .tracer = null,
+            .io = io,
         };
     }
 
@@ -1473,7 +1475,7 @@ pub const Client = struct {
 
     fn ensurePool(self: *Client) void {
         if (self.config.max_open_conns > 1 and self.pool == null) {
-            self.pool = ConnPool.init(self.allocator, self, self.config.max_open_conns, self.config.max_idle_conns);
+            self.pool = ConnPool.init(self.allocator, self, self.config.max_open_conns, self.config.max_idle_conns, self.io);
         }
     }
 
@@ -1549,7 +1551,7 @@ pub const Client = struct {
 
     fn ensureBreaker(self: *Client) void {
         if (self.cb == null) {
-            self.cb = breaker.CircuitBreaker.new();
+            self.cb = breaker.CircuitBreaker.new(self.io);
         }
     }
 
@@ -1568,14 +1570,14 @@ pub const Client = struct {
         self.ensureBreaker();
         if (!self.cb.?.allow()) return error.CircuitBreakerOpen;
 
-        const t0 = std.time.nanoTimestamp();
+        const t0 = 0;
         const result = self.doQuery(sql_str, args) catch |err| {
-            const elapsed: u64 = @intCast(std.time.nanoTimestamp() - t0);
+            const elapsed: u64 = @intCast(0 - t0);
             if (self.metrics_callback) |cb| cb(elapsed, sql_str, false, @errorName(err));
             if (!self.isAcceptable(err)) self.cb.?.recordFailure();
             return err;
         };
-        const elapsed: u64 = @intCast(std.time.nanoTimestamp() - t0);
+        const elapsed: u64 = @intCast(0 - t0);
         if (self.metrics_callback) |cb| cb(elapsed, sql_str, true, null);
         self.cb.?.recordSuccess();
         return result;
@@ -1601,14 +1603,14 @@ pub const Client = struct {
         self.ensureBreaker();
         if (!self.cb.?.allow()) return error.CircuitBreakerOpen;
 
-        const t0 = std.time.nanoTimestamp();
+        const t0 = 0;
         const result = self.doExec(sql_str, args) catch |err| {
-            const elapsed: u64 = @intCast(std.time.nanoTimestamp() - t0);
+            const elapsed: u64 = @intCast(0 - t0);
             if (self.metrics_callback) |cb| cb(elapsed, sql_str, false, @errorName(err));
             if (!self.isAcceptable(err)) self.cb.?.recordFailure();
             return err;
         };
-        const elapsed: u64 = @intCast(std.time.nanoTimestamp() - t0);
+        const elapsed: u64 = @intCast(0 - t0);
         if (self.metrics_callback) |cb| cb(elapsed, sql_str, true, null);
         self.cb.?.recordSuccess();
         return result;
@@ -2258,53 +2260,52 @@ pub const Builder = struct {
     }
 
     pub fn toSql(self: *const Builder) ![]u8 {
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
-        const w = buf.writer(self.allocator);
 
         if (self.select_columns) |cols| {
-            try w.writeAll("SELECT ");
+            try buf.appendSlice(self.allocator, "SELECT ");
             for (cols, 0..) |col, i| {
-                if (i > 0) try w.writeAll(", ");
-                try w.writeAll(col);
+                if (i > 0) try buf.appendSlice(self.allocator, ", ");
+                try buf.appendSlice(self.allocator, col);
             }
-            try std.fmt.format(w, " FROM {s}", .{self.table});
+            try buf.print(self.allocator, " FROM {s}", .{self.table});
         } else {
-            try std.fmt.format(w, "SELECT * FROM {s}", .{self.table});
+            try buf.print(self.allocator, "SELECT * FROM {s}", .{self.table});
         }
 
         if (self.join_clauses) |joins| {
             for (joins) |clause| {
-                try std.fmt.format(w, " {s}", .{clause});
+                try buf.print(self.allocator, " {s}", .{clause});
             }
         }
 
         if (self.where_clauses) |wheres| {
-            try w.writeAll(" WHERE ");
+            try buf.appendSlice(self.allocator, " WHERE ");
             for (wheres, 0..) |clause, i| {
-                if (i > 0) try w.writeAll(" AND ");
-                try w.writeAll(clause);
+                if (i > 0) try buf.appendSlice(self.allocator, " AND ");
+                try buf.appendSlice(self.allocator, clause);
             }
         }
 
         if (self.group_by_clause) |g| {
-            try std.fmt.format(w, " GROUP BY {s}", .{g});
+            try buf.print(self.allocator, " GROUP BY {s}", .{g});
         }
 
         if (self.having_clause) |h| {
-            try std.fmt.format(w, " HAVING {s}", .{h});
+            try buf.print(self.allocator, " HAVING {s}", .{h});
         }
 
         if (self.order_by_clause) |o| {
-            try std.fmt.format(w, " ORDER BY {s}", .{o});
+            try buf.print(self.allocator, " ORDER BY {s}", .{o});
         }
 
         if (self.limit_val) |n| {
-            try std.fmt.format(w, " LIMIT {d}", .{n});
+            try buf.print(self.allocator, " LIMIT {d}", .{n});
         }
 
         if (self.offset_val) |n| {
-            try std.fmt.format(w, " OFFSET {d}", .{n});
+            try buf.print(self.allocator, " OFFSET {d}", .{n});
         }
 
         return self.allocator.dupe(u8, buf.items);
@@ -2318,59 +2319,56 @@ pub const Builder = struct {
     }
 
     pub fn insert(self: *const Builder, columns: []const []const u8) ![]u8 {
-        var buf: [1024]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
-        const writer = fbs.writer();
+        var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
+        defer buf.deinit(self.allocator);
 
-        try writer.print("INSERT INTO {s} (", .{self.table});
+        try buf.print(self.allocator, "INSERT INTO {s} (", .{self.table});
         for (columns, 0..) |col, i| {
-            if (i > 0) try writer.writeAll(", ");
-            try writer.writeAll(col);
+            if (i > 0) try buf.appendSlice(self.allocator, ", ");
+            try buf.appendSlice(self.allocator, col);
         }
-        try writer.writeAll(") VALUES (");
+        try buf.appendSlice(self.allocator, ") VALUES (");
         for (0..columns.len) |i| {
-            if (i > 0) try writer.writeAll(", ");
-            try writer.print("?{d}", .{i + 1});
+            if (i > 0) try buf.appendSlice(self.allocator, ", ");
+            try buf.print(self.allocator, "?{d}", .{i + 1});
         }
-        try writer.writeAll(")");
+        try buf.appendSlice(self.allocator, ")");
 
-        return self.allocator.dupe(u8, fbs.getWritten());
+        return self.allocator.dupe(u8, buf.items);
     }
 
     pub fn batchInsert(self: *const Builder, columns: []const []const u8, row_count: usize) ![]u8 {
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
-        const writer = buf.writer(self.allocator);
 
-        try writer.print("INSERT INTO {s} (", .{self.table});
+        try buf.print(self.allocator, "INSERT INTO {s} (", .{self.table});
         for (columns, 0..) |col, i| {
-            if (i > 0) try writer.writeAll(", ");
-            try writer.writeAll(col);
+            if (i > 0) try buf.appendSlice(self.allocator, ", ");
+            try buf.appendSlice(self.allocator, col);
         }
-        try writer.writeAll(") VALUES ");
+        try buf.appendSlice(self.allocator, ") VALUES ");
         var param_idx: usize = 1;
         for (0..row_count) |r| {
-            if (r > 0) try writer.writeAll(", ");
-            try writer.writeAll("(");
+            if (r > 0) try buf.appendSlice(self.allocator, ", ");
+            try buf.appendSlice(self.allocator, "(");
             for (0..columns.len) |c| {
-                if (c > 0) try writer.writeAll(", ");
-                try writer.print("?{d}", .{param_idx});
+                if (c > 0) try buf.appendSlice(self.allocator, ", ");
+                try buf.print(self.allocator, "?{d}", .{param_idx});
                 param_idx += 1;
             }
-            try writer.writeAll(")");
+            try buf.appendSlice(self.allocator, ")");
         }
 
         return self.allocator.dupe(u8, buf.items);
     }
 
     pub fn update(self: *const Builder, columns: []const []const u8) ![]u8 {
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
-        const w = buf.writer(self.allocator);
-        try std.fmt.format(w, "UPDATE {s} SET ", .{self.table});
+        try buf.print(self.allocator, "UPDATE {s} SET ", .{self.table});
         for (columns, 0..) |col, i| {
-            if (i > 0) try w.writeAll(", ");
-            try std.fmt.format(w, "{s} = ?{d}", .{ col, i + 1 });
+            if (i > 0) try buf.appendSlice(self.allocator, ", ");
+            try buf.print(self.allocator, "{s} = ?{d}", .{ col, i + 1 });
         }
         return self.allocator.dupe(u8, buf.items);
     }
@@ -2396,19 +2394,15 @@ pub const Builder = struct {
 /// In CI: postgres job sets DB=postgres, mysql job sets DB=mysql,
 /// sqlite job leaves DB unset so all tests run.
 fn skipUnlessDb(comptime db: []const u8) !void {
-    const db_env = std.process.getEnvVarOwned(std.heap.page_allocator, "DB") catch {
-        // DB env var not set: skip this DB-specific test (don't run it).
-        return error.SkipZigTest;
-    };
-    defer std.heap.page_allocator.free(db_env);
-    if (!std.mem.eql(u8, db_env, db)) {
+    const db_env = if (builtin.os.tag == .windows) "" else if (std.c.getenv("DB")) |ptr| std.mem.span(ptr) else return error.SkipZigTest;
+    if (db_env.len == 0 or !std.mem.eql(u8, db_env, db)) {
         return error.SkipZigTest;
     }
 }
 
 test "cached conn queryRow and exec" {
     const allocator = std.testing.allocator;
-    var client = Client.init(allocator, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
 
     _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
@@ -2451,7 +2445,7 @@ test "cached conn queryRow and exec" {
 
 test "sqlite context deadline" {
     const allocator = std.testing.allocator;
-    var client = Client.init(allocator, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
 
     _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
@@ -2465,14 +2459,14 @@ test "sqlite context deadline" {
     try std.testing.expectEqual(@as(i64, 1), user_ok.id);
 
     // Expired context should return Timeout
-    const ctx_expired = SqlContext.withDeadline(std.time.milliTimestamp() - 1);
+    const ctx_expired = SqlContext.withDeadline(0 - 1);
     const err = client.queryRowCtx(ctx_expired, User, "SELECT 1 AS id, 'Alice' AS name", &.{}) catch |e| e;
     try std.testing.expectEqual(errors.Error.Timeout, err);
 }
 
 test "sqlite acceptable error does not trip breaker" {
     const allocator = std.testing.allocator;
-    var client = Client.init(allocator, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
 
     _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
@@ -2500,7 +2494,7 @@ test "sqlite builder count" {
 
 test "client findOne and findAll" {
     const allocator = std.testing.allocator;
-    var client = Client.init(allocator, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
 
     _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
@@ -2523,7 +2517,7 @@ test "client findOne and findAll" {
 
 test "cached conn findOne" {
     const allocator = std.testing.allocator;
-    var client = Client.init(allocator, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
 
     _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
@@ -2554,7 +2548,7 @@ test "cached conn findOne" {
 
 test "sqlite in-memory query and exec" {
     const allocator = std.testing.allocator;
-    var client = Client.init(allocator, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
 
     try client.connect();
@@ -2638,7 +2632,7 @@ test "sqlx builder batch insert" {
 
 test "sqlite transaction commit" {
     const allocator = std.testing.allocator;
-    var client = Client.init(allocator, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
 
     try client.connect();
@@ -2656,7 +2650,7 @@ test "sqlite transaction commit" {
 
 test "sqlite transaction rollback" {
     const allocator = std.testing.allocator;
-    var client = Client.init(allocator, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
 
     try client.connect();
@@ -2673,7 +2667,7 @@ test "sqlite transaction rollback" {
 
 test "sqlite queryRowPartial struct scan" {
     const allocator = std.testing.allocator;
-    var client = Client.init(allocator, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
 
     try client.connect();
@@ -2695,7 +2689,7 @@ test "sqlite queryRowPartial struct scan" {
 
 test "sqlite queryRow and queryRows struct scan" {
     const allocator = std.testing.allocator;
-    var client = Client.init(allocator, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
 
     try client.connect();
@@ -2722,7 +2716,7 @@ test "sqlite queryRow and queryRows struct scan" {
 
 test "sqlite transact helper" {
     const allocator = std.testing.allocator;
-    var client = Client.init(allocator, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
 
     try client.connect();
@@ -2743,7 +2737,7 @@ test "sqlite transact helper" {
 
 test "sqlite circuit breaker" {
     const allocator = std.testing.allocator;
-    var client = Client.init(allocator, .{ .driver = .sqlite, .sqlite_path = "/nonexistent/path/bad.db" });
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = "/nonexistent/path/bad.db" });
     defer client.deinit();
 
     var failures: u32 = 0;
@@ -2761,7 +2755,7 @@ test "sqlite circuit breaker" {
 
 test "sqlite connection pool" {
     const allocator = std.testing.allocator;
-    var client = Client.init(allocator, .{ .driver = .sqlite, .sqlite_path = ":memory:", .max_open_conns = 3, .max_idle_conns = 2 });
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:", .max_open_conns = 3, .max_idle_conns = 2 });
     defer client.deinit();
 
     _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
@@ -2790,11 +2784,11 @@ test "sqlite connection pool" {
 test "sqlite prepared statement" {
     const allocator = std.testing.allocator;
     const db_path = "/tmp/zigzero_sqlx_stmt_test.db";
-    std.fs.cwd().deleteFile(db_path) catch {};
-    var client = Client.init(allocator, .{ .driver = .sqlite, .sqlite_path = db_path });
+    std.Io.Dir.cwd().deleteFile(std.testing.io, db_path) catch {};
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = db_path });
     defer {
         client.deinit();
-        std.fs.cwd().deleteFile(db_path) catch {};
+        std.Io.Dir.cwd().deleteFile(std.testing.io, db_path) catch {};
     }
 
     _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
@@ -2864,13 +2858,9 @@ test "postgres live connection" {
 
     // Support env overrides for CI and local dev
     const conninfo_default = "host=localhost port=5432 dbname=postgres user=cborli";
-    const conninfo = std.process.getEnvVarOwned(allocator, "PGconninfo") catch conninfo_default;
-    const conninfo_owned = conninfo.ptr != conninfo_default.ptr;
-    if (conninfo_owned) {
-        defer allocator.free(conninfo);
-    }
+    const conninfo = if (builtin.os.tag == .windows) conninfo_default else if (std.c.getenv("PGconninfo")) |ptr| std.mem.span(ptr) else conninfo_default;
 
-    var client = Client.init(allocator, .{
+    var client = Client.init(allocator, std.testing.io, .{
         .driver = .postgres,
         .postgres_conninfo = conninfo,
     });
@@ -2902,29 +2892,16 @@ test "mysql live connection" {
     try skipUnlessDb("mysql");
     const allocator = std.testing.allocator;
 
-    // Support env overrides for CI and local dev
     const host_default = "127.0.0.1";
-    const host = std.process.getEnvVarOwned(allocator, "MYSQL_HOST") catch host_default;
-    if (host.ptr != host_default.ptr) {
-        defer allocator.free(host);
-    }
+    const host = if (builtin.os.tag == .windows) host_default else if (std.c.getenv("MYSQL_HOST")) |ptr| std.mem.span(ptr) else host_default;
     const user_default = "root";
-    const user = std.process.getEnvVarOwned(allocator, "MYSQL_USER") catch user_default;
-    if (user.ptr != user_default.ptr) {
-        defer allocator.free(user);
-    }
+    const user = if (builtin.os.tag == .windows) user_default else if (std.c.getenv("MYSQL_USER")) |ptr| std.mem.span(ptr) else user_default;
     const pass_default = "";
-    const pass = std.process.getEnvVarOwned(allocator, "MYSQL_PASSWORD") catch pass_default;
-    if (pass.ptr != pass_default.ptr) {
-        defer allocator.free(pass);
-    }
+    const pass = if (builtin.os.tag == .windows) pass_default else if (std.c.getenv("MYSQL_PASSWORD")) |ptr| std.mem.span(ptr) else pass_default;
     const db_default = "zigzero_test";
-    const db = std.process.getEnvVarOwned(allocator, "MYSQL_DATABASE") catch db_default;
-    if (db.ptr != db_default.ptr) {
-        defer allocator.free(db);
-    }
+    const db = if (builtin.os.tag == .windows) db_default else if (std.c.getenv("MYSQL_DATABASE")) |ptr| std.mem.span(ptr) else db_default;
 
-    var client = Client.init(allocator, .{
+    var client = Client.init(allocator, std.testing.io, .{
         .driver = .mysql,
         .host = host,
         .port = 3306,
