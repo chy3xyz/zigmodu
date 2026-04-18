@@ -64,10 +64,14 @@ zmodu orm --sql schema.sql --out src/modules
 
 # Force all tables into a single module
 zmodu orm --sql schema.sql --module user --out src/modules
+
+# Generate with zent Schema-as-Code backend
+zmodu orm --sql schema.sql --out src/modules --backend zent
 ```
 
 Creates a complete module directory for each inferred module:
 
+**Sqlx Backend** (default):
 ```
 src/modules/{module}/
 ├── module.zig       # ZigModu module metadata (init/deinit)
@@ -75,6 +79,14 @@ src/modules/{module}/
 ├── persistence.zig  # ORM Repository layer (SqlxBackend)
 ├── service.zig      # Business service with paginated CRUD
 └── api.zig          # HTTP API handlers using api.Server.zig
+```
+
+**Zent Backend**:
+```
+src/modules/{module}/
+├── module.zig       # ZigModu module metadata (init/deinit)
+├── schema.zig       # zent Schema definitions (Schema-as-Code)
+└── client.zig       # zent Client helper
 ```
 
 ### `generate <target> [options]`
@@ -218,6 +230,30 @@ src/modules/
 ```
 
 ## Features
+
+### Code Generation
+- ✅ PascalCase/camelCase/snake_case sanitization
+- ✅ Zig 0.16.0 compatible
+- ✅ No external dependencies
+- ✅ Fast code generation
+- ✅ Unified `generate` command
+
+### Backend Support
+- ✅ **Sqlx Backend** - Full CRUD with HTTP API
+- ✅ **Zent Backend** - Schema-as-Code with compile-time type safety
+
+### Module Features
+- ✅ Spring Modulith package-by-module structure
+- ✅ Service + API scaffolding with DI via `ctx.user_data`
+- ✅ Pagination support with PageResult
+- ✅ Stable JSON field names via jsonStringify
+
+### Zent Backend Features
+- ✅ Schema-as-Code definition directly in Zig
+- ✅ Full static type safety via comptime code generation
+- ✅ Automatic TimeMixin for created_at/updated_at
+- ✅ Type-safe query and mutation builders
+- ✅ Graph traversal queries for relationships
 
 - ✅ PascalCase/camelCase/snake_case sanitization
 - ✅ Zig 0.16.0 compatible

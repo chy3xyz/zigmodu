@@ -4,7 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [0.5.0] - 2026-04-19
 
+### Added
+- **zmodu CLI**
+  - `zmodu orm --backend zent` for zent Schema-as-Code generation
+  - `generateZentSchema()` generates zent Schema DSL from SQL DDL
+  - `generateZentClient()` generates type-safe zent Client helpers
+  - Primary key detection for non-optional field types
+
+### Changed
+- `zmodu orm` default backend remains `sqlx` (backward compatible)
+
+## [0.4.0] - 2025-04-15
 ## [0.4.0] - 2025-04-15
 
 ### Added
