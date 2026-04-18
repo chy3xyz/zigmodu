@@ -368,7 +368,7 @@ fn generateBuildZon(allocator: std.mem.Allocator, project_name: []const u8) ![]c
         \\.{
         \\    .name = .myapp,
         \\    .version = "0.1.0",
-        \\    .fingerprint = 0x123456789abcdef0,
+        \\    .fingerprint = 0x8798022a13474864,
         \\    .minimum_zig_version = "0.16.0",
         \\    .dependencies = .{},
         \\    .paths = .{
