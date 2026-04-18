@@ -378,10 +378,8 @@ fn generateMainZig(allocator: std.mem.Allocator, project_name: []const u8) ![]co
     return try allocator.dupe(u8,
         \\const std = @import("std");
         \\
-        \\pub fn main() !void {
-        \\    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-        \\    defer _ = gpa.deinit();
-        \\    const allocator = gpa.allocator();
+        \\pub fn main(init: std.process.Init) !void {
+        \\    const allocator = init.gpa;
         \\
         \\    std.log.info("Application started!", .{});
         \\
