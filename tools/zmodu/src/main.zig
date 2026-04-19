@@ -525,6 +525,8 @@ const ColumnDef = struct {
     col_type: ColumnType,
     nullable: bool,
     is_primary_key: bool,
+    is_unique: bool,
+    has_default: bool,
     comment: ?[]const u8,
 };
 
@@ -646,7 +648,7 @@ fn parseColumnDef(allocator: std.mem.Allocator, text: []const u8) !ColumnDef {
             std.mem.startsWith(u8, ustr, "UNIQUE") or
             std.mem.startsWith(u8, ustr, "INDEX") or
             std.mem.startsWith(u8, ustr, "KEY")) {
-            return ColumnDef{ .name = try allocator.dupe(u8, ""), .col_type = .unknown, .nullable = true, .is_primary_key = false, .comment = null };
+            return ColumnDef{ .name = try allocator.dupe(u8, ""), .col_type = .unknown, .nullable = true, .is_primary_key = false, .is_unique = false, .has_default = false, .comment = null };
         }
     }
 
@@ -656,8 +658,10 @@ fn parseColumnDef(allocator: std.mem.Allocator, text: []const u8) !ColumnDef {
 
     var nullable = true;
     var is_primary_key = false;
+    var is_unique = false;
+    var has_default = false;
 
-    // scan remainder for NOT NULL / PRIMARY KEY
+    // scan remainder for NOT NULL / PRIMARY KEY / UNIQUE / DEFAULT
     const rest = text[i..];
     const rest_upper_buf = try allocator.alloc(u8, rest.len);
     defer allocator.free(rest_upper_buf);
@@ -666,7 +670,8 @@ fn parseColumnDef(allocator: std.mem.Allocator, text: []const u8) !ColumnDef {
 
     if (std.mem.indexOf(u8, rest_upper, "NOT NULL") != null) nullable = false;
     if (std.mem.indexOf(u8, rest_upper, "PRIMARY KEY") != null) is_primary_key = true;
-
+    if (std.mem.indexOf(u8, rest_upper, "UNIQUE") != null) is_unique = true;
+    if (std.mem.indexOf(u8, rest_upper, "DEFAULT") != null) has_default = true;
     // Parse COMMENT '...'
     var comment: ?[]const u8 = null;
     const comment_upper = "COMMENT";
@@ -681,7 +686,7 @@ fn parseColumnDef(allocator: std.mem.Allocator, text: []const u8) !ColumnDef {
         }
     }
 
-    return ColumnDef{ .name = name, .col_type = col_type, .nullable = nullable, .is_primary_key = is_primary_key, .comment = comment };
+    return ColumnDef{ .name = name, .col_type = col_type, .nullable = nullable, .is_primary_key = is_primary_key, .is_unique = is_unique, .has_default = has_default, .comment = comment };
 }
 
 fn parseColumns(allocator: std.mem.Allocator, text: []const u8, i: *usize) ![]ColumnDef {
@@ -1074,6 +1079,16 @@ fn generateZentSchema(allocator: std.mem.Allocator, module_name: []const u8, tab
         const schema_name = try toPascalCase(allocator, table.name);
         defer allocator.free(schema_name);
 
+        // Check if table has created_at or updated_at for TimeMixin
+        var has_time_fields = false;
+        for (table.columns) |col| {
+            if (std.mem.eql(u8, col.name, "created_at") or
+                std.mem.eql(u8, col.name, "updated_at")) {
+                has_time_fields = true;
+                break;
+            }
+        }
+
         try buf.print(allocator, "const {s} = Schema(\"{s}\", .{{", .{ schema_name, schema_name });
         try buf.appendSlice(allocator, "\n    .fields = &.{\n");
 
@@ -1082,58 +1097,50 @@ fn generateZentSchema(allocator: std.mem.Allocator, module_name: []const u8, tab
             const col_name = col.name;
             const is_pk = col.is_primary_key;
 
-            // Primary keys and non-nullable fields use non-optional types
-            const use_optional = col.nullable and !is_pk;
+            // Build field definition with chain methods
+            var field_buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
+            defer field_buf.deinit(allocator);
 
-            const zent_field = switch (col.col_type) {
-                .int => {
-                    if (use_optional) {
-                        try buf.print(allocator, "        field.IntOptional(\"{s}\"),\n", .{col_name});
-                    } else {
-                        try buf.print(allocator, "        field.Int(\"{s}\"),\n", .{col_name});
-                    }
-                },
-                .string => {
-                    if (use_optional) {
-                        try buf.print(allocator, "        field.StringOptional(\"{s}\"),\n", .{col_name});
-                    } else {
-                        try buf.print(allocator, "        field.String(\"{s}\"),\n", .{col_name});
-                    }
-                },
-                .bool => {
-                    if (use_optional) {
-                        try buf.print(allocator, "        field.BoolOptional(\"{s}\"),\n", .{col_name});
-                    } else {
-                        try buf.print(allocator, "        field.Bool(\"{s}\"),\n", .{col_name});
-                    }
-                },
-                .float => {
-                    if (use_optional) {
-                        try buf.print(allocator, "        field.FloatOptional(\"{s}\"),\n", .{col_name});
-                    } else {
-                        try buf.print(allocator, "        field.Float(\"{s}\"),\n", .{col_name});
-                    }
-                },
-                .datetime => {
-                    if (use_optional) {
-                        try buf.print(allocator, "        field.TimeOptional(\"{s}\"),\n", .{col_name});
-                    } else {
-                        try buf.print(allocator, "        field.Time(\"{s}\"),\n", .{col_name});
-                    }
-                },
-                .unknown => {
-                    if (use_optional) {
-                        try buf.print(allocator, "        field.StringOptional(\"{s}\"),\n", .{col_name});
-                    } else {
-                        try buf.print(allocator, "        field.String(\"{s}\"),\n", .{col_name});
-                    }
-                },
+            // Field constructor
+            const constructor = switch (col.col_type) {
+                .int => "Int",
+                .string => "String",
+                .bool => "Bool",
+                .float => "Float",
+                .datetime => "Time",
+                .unknown => "String",
             };
-            _ = zent_field; // suppress unused warning
+            try field_buf.print(allocator, "        field.{s}(\"{s}\")", .{ constructor, col_name });
+
+            // Chain modifiers
+            if (is_pk) {
+                try field_buf.appendSlice(allocator, ".Unique()");
+            } else if (col.is_unique) {
+                try field_buf.appendSlice(allocator, ".Unique()");
+            }
+
+            if (is_pk) {
+                try field_buf.appendSlice(allocator, ".Required()");
+            } else if (!col.nullable) {
+                try field_buf.appendSlice(allocator, ".Required()");
+            } else {
+                try field_buf.appendSlice(allocator, ".Optional()");
+            }
+
+            if (col.has_default) {
+                try field_buf.appendSlice(allocator, ".Default(\"\")");
+            }
+
+            try field_buf.appendSlice(allocator, ",\n");
+            try buf.appendSlice(allocator, field_buf.items);
         }
 
         try buf.appendSlice(allocator, "    },\n");
-        try buf.appendSlice(allocator, "    .mixins = &.{zent.core.mixin.TimeMixin},\n");
+
+        if (has_time_fields) {
+            try buf.appendSlice(allocator, "    .mixins = &.{zent.core.mixin.TimeMixin},\n");
+        }
+
         try buf.appendSlice(allocator, "});\n\n");
     }
 
