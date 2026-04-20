@@ -319,7 +319,7 @@ fn parseFormBody(allocator: std.mem.Allocator, body: []const u8) !std.StringHash
 /// Simple stream reader wrapper for HTTP parsing
 const StreamReader = struct {
     stream: std.Io.net.Stream,
-    reader: std.Io.net.Stream.Reader,
+    io: std.Io,
     buf: [8192]u8 = undefined,
     pos: usize = 0,
     end: usize = 0,
@@ -327,7 +327,7 @@ const StreamReader = struct {
     fn init(stream: std.Io.net.Stream, io: std.Io) StreamReader {
         return .{
             .stream = stream,
-            .reader = std.Io.net.Stream.Reader.init(stream, io, &.{}),
+            .io = io,
             .buf = undefined,
             .pos = 0,
             .end = 0,
@@ -336,7 +336,11 @@ const StreamReader = struct {
 
     fn readByte(self: *StreamReader) !?u8 {
         if (self.pos >= self.end) {
-            const n = self.reader.read(&self.buf) catch 0;
+            // Use Reader interface directly - readVec reads into iovecs
+            var iovec: [1][]u8 = .{self.buf[0..]};
+            const n = self.stream.reader(self.io, &self.buf).readVec(&iovec) catch {
+                return null; // Connection closed or error
+            };
             if (n == 0) return null;
             self.pos = 0;
             self.end = n;
@@ -354,6 +358,7 @@ const StreamReader = struct {
             i += 1;
             if (b == delimiter) return out[0..i];
         }
+        // Buffer full but no delimiter found
         return out[0..i];
     }
 
@@ -369,7 +374,11 @@ const StreamReader = struct {
                 total += to_copy;
                 continue;
             }
-            const n = try self.reader.read(out[total..]);
+            // Use Reader interface directly
+            var iovec: [1][]u8 = .{out[total..]};
+            const n = self.stream.reader(self.io, &self.buf).readVec(&iovec) catch {
+                break; // Connection closed or error
+            };
             if (n == 0) break;
             total += n;
         }
@@ -439,7 +448,9 @@ const RequestParser = struct {
         // Read body if Content-Length present
         var body: ?[]const u8 = null;
         if (headers.get("Content-Length")) |len_str| {
-            const content_len = std.fmt.parseInt(usize, len_str, 10) catch 0;
+            const content_len = std.fmt.parseInt(usize, len_str, 10) catch {
+                return error.InvalidContentLength;
+            };
             if (content_len > max_body_size) return error.BodyTooLarge;
             if (content_len > 0) {
                 const body_buf = try self.allocator.alloc(u8, content_len);
@@ -447,7 +458,9 @@ const RequestParser = struct {
                 if (bytes_read == content_len) {
                     body = body_buf;
                 } else {
+                    // Incomplete body read - connection closed or error
                     self.allocator.free(body_buf);
+                    return error.IncompleteBody;
                 }
             }
         }
