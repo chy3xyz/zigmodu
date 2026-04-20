@@ -697,7 +697,7 @@ const ThreadPool = struct {
     mutex: std.Io.Mutex,
     cond: std.Io.Condition,
     queue: std.ArrayList(ConnectionTask),
-    shutdown: bool,
+    shutdown: std.atomic.Value(bool),
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, num_threads: usize) !ThreadPool {
         var pool = ThreadPool{
@@ -707,7 +707,7 @@ const ThreadPool = struct {
             .mutex = .init,
             .cond = .init,
             .queue = std.ArrayList(ConnectionTask).empty,
-            .shutdown = false,
+            .shutdown = std.atomic.Value(bool).init(false),
         };
 
         for (0..num_threads) |i| {
@@ -718,8 +718,8 @@ const ThreadPool = struct {
     }
 
     pub fn deinit(self: *ThreadPool) void {
+        self.shutdown.store(true, .release);
         self.mutex.lock(self.io) catch return;
-        self.shutdown = true;
         self.cond.broadcast(self.io);
         self.mutex.unlock(self.io);
 
@@ -735,7 +735,7 @@ const ThreadPool = struct {
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
 
-        if (self.shutdown) return error.Shutdown;
+        if (self.shutdown.load(.acquire)) return error.Shutdown;
 
         try self.queue.append(self.allocator, task);
         self.cond.signal(self.io);
@@ -745,13 +745,17 @@ const ThreadPool = struct {
         while (true) {
             self.mutex.lock(self.io) catch break;
 
-            while (self.queue.items.len == 0 and !self.shutdown) {
+            while (self.queue.items.len == 0) {
                 self.cond.wait(&self.mutex, self.io) catch break;
-            }
+                if (self.shutdown.load(.acquire)) {
+                    self.mutex.unlock(self.io);
+                    return;
+                }
 
-            if (self.shutdown and self.queue.items.len == 0) {
+            if (self.queue.items.len == 0) {
                 self.mutex.unlock(self.io);
-                break;
+                continue;
+            }
             }
 
             const task = self.queue.orderedRemove(0);
