@@ -172,3 +172,36 @@ pub fn build(b: *std.Build) void {
 - Module-specific logging (src/log/)
 - Module testing utilities (src/test/)
 - Comprehensive unit tests
+
+---
+
+## 在其他项目中使用
+
+### 步骤 1：复制技能文件
+在使用 ZigModu 的其他项目中，复制以下文件到项目根目录：
+
+```
+.sisyphus/
+├── skills/
+│   └── zigmodu.md          # ZigModu 开发技能
+└── plans/
+    └── zigmodu-development.md  # 项目开发计划模板
+```
+
+### 步骤 2：AI 自动识别
+AI 助手会自动加载 `.sisyphus/skills/` 中的技能文件，遵循 ZigModu 的最佳实践。
+
+### 步骤 3：使用 zmodu 工具
+```bash
+# 创建新项目
+zmodu new myproject
+
+# 生成模块
+zmodu module user
+
+# 生成 API
+zmodu api users --module user
+
+# 从 SQL 生成 ORM
+zmodu orm --sql schema.sql --out src/modules
+```
