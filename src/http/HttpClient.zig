@@ -240,8 +240,7 @@ pub const HttpClient = struct {
                 if (attempt < self.retry_policy.max_retries) {
                     const delay = self.retry_policy.calculateDelay(attempt);
                     std.log.warn("Request failed, retrying in {d}ms (attempt {d}/{d})", .{ delay, attempt + 1, self.retry_policy.max_retries });
-                    // Note: Blocking sleep unavailable in Zig 0.16.0 sync context
-                    // In async context, use: io.sleep(delay * std.time.ms_per_s, io)
+                    std.Io.sleep(self.connection_pool.io, .{ .nanoseconds = delay * std.time.ns_per_ms }, .real) catch {};
                 }
                 continue;
             };
@@ -288,16 +287,83 @@ pub const HttpClient = struct {
                 _ = w.writeAll(body) catch return error.ConnectionError;
             }
 
-            // 读取响应（简化实现）
-            var response = HttpResponse.init(self.allocator);
-            response.status_code = 200; // 简化
-            response.body = try self.allocator.dupe(u8, "OK");
+            // 读取响应（最小实现：解析 status line + headers + body）
+            const response = try self.readResponse(stream);
 
             conn.request_count += 1;
             return response;
         }
 
         return error.ConnectionError;
+    }
+
+    fn readResponse(self: *Self, stream: std.Io.net.Stream) !HttpResponse {
+        var resp = HttpResponse.init(self.allocator);
+        errdefer resp.deinit();
+
+        var buf: [8192]u8 = undefined;
+        var read_buf: [8192]u8 = undefined;
+        var r = stream.reader(self.connection_pool.io, &read_buf);
+
+        const n = try r.interface.readSliceShort(&buf);
+        if (n == 0) return error.ConnectionError;
+        const raw = buf[0..n];
+
+        const header_end = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.InvalidResponse;
+        const head = raw[0..header_end];
+        const body_start = header_end + 4;
+
+        var line_it = std.mem.splitSequence(u8, head, "\r\n");
+        const status_line = line_it.next() orelse return error.InvalidResponse;
+        // Example: HTTP/1.1 200 OK
+        var parts = std.mem.splitScalar(u8, status_line, ' ');
+        _ = parts.next() orelse return error.InvalidResponse; // http version
+        const status_str = parts.next() orelse return error.InvalidResponse;
+        resp.status_code = std.fmt.parseInt(u16, status_str, 10) catch return error.InvalidResponse;
+
+        var content_length: usize = 0;
+        while (line_it.next()) |line| {
+            if (line.len == 0) break;
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const key_trim = std.mem.trim(u8, line[0..colon], " \t");
+            const val_trim = std.mem.trim(u8, line[colon + 1 ..], " \t");
+
+            const key = try self.allocator.dupe(u8, key_trim);
+            errdefer self.allocator.free(key);
+            const val = try self.allocator.dupe(u8, val_trim);
+            errdefer self.allocator.free(val);
+            try resp.headers.put(key, val);
+
+            if (std.ascii.eqlIgnoreCase(key_trim, "content-length")) {
+                content_length = std.fmt.parseInt(usize, val_trim, 10) catch 0;
+            }
+        }
+
+        const initial_body = raw[body_start..];
+        if (content_length == 0) {
+            resp.body = try self.allocator.dupe(u8, initial_body);
+            return resp;
+        }
+
+        var body_buf = try self.allocator.alloc(u8, content_length);
+        var copied: usize = @min(initial_body.len, content_length);
+        @memcpy(body_buf[0..copied], initial_body[0..copied]);
+
+        while (copied < content_length) {
+            const more = try r.interface.readSliceShort(&buf);
+            if (more == 0) break;
+            const to_copy = @min(@as(usize, more), content_length - copied);
+            @memcpy(body_buf[copied..][0..to_copy], buf[0..to_copy]);
+            copied += to_copy;
+        }
+
+        if (copied != content_length) {
+            self.allocator.free(body_buf);
+            return error.IncompleteBody;
+        }
+
+        resp.body = body_buf;
+        return resp;
     }
 
     /// GET 请求

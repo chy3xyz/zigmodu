@@ -15,6 +15,10 @@ pub const WebSocketServer = struct {
     is_running: bool,
     clients: std.array_list.Managed(*WebSocketClient),
     clients_mutex: std.Io.Mutex,
+    accept_fiber_started: bool,
+    /// Group that owns the `acceptLoop` fiber and every spawned
+    /// `handleConnection` fiber. Awaited in `stop()` so no futures leak.
+    fiber_group: std.Io.Group,
     on_connect_cb: ?*const fn (*WebSocketClient) void,
     on_message_cb: ?*const fn (*WebSocketClient, []const u8) void,
     allowed_origins: []const []const u8 = &.{},
@@ -28,6 +32,8 @@ pub const WebSocketServer = struct {
             .is_running = false,
             .clients = std.array_list.Managed(*WebSocketClient).init(allocator),
             .clients_mutex = std.Io.Mutex.init,
+            .accept_fiber_started = false,
+            .fiber_group = .init,
             .on_connect_cb = null,
             .on_message_cb = null,
         };
@@ -52,11 +58,11 @@ pub const WebSocketServer = struct {
         var address = try std.Io.net.IpAddress.parseIp4("0.0.0.0", self.port);
         self.server = try address.listen(self.io, .{ .reuse_address = true });
         self.is_running = true;
+        self.accept_fiber_started = true;
 
         std.log.info("[WebSocketServer] Started on ws://0.0.0.0:{d}", .{self.port});
-
-        const thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
-        thread.detach();
+        // Start accept loop asynchronously as a member of `fiber_group`.
+        self.fiber_group.async(self.io, acceptLoop, .{self});
     }
 
     pub fn stop(self: *Self) void {
@@ -65,6 +71,9 @@ pub const WebSocketServer = struct {
             s.deinit(self.io);
             self.server = null;
         }
+        // Drain any in-flight accept/connection fibers so their futures do
+        // not leak. Safe to call repeatedly because `Group.await` is idempotent.
+        self.fiber_group.await(self.io) catch {};
     }
 
     fn acceptLoop(self: *Self) void {
@@ -76,13 +85,7 @@ pub const WebSocketServer = struct {
                     }
                     continue;
                 };
-
-                const thread = std.Thread.spawn(.{}, handleConnection, .{ self, conn }) catch |err| {
-                    std.log.err("[WebSocketServer] Failed to spawn thread: {}", .{err});
-                    conn.close(self.io);
-                    continue;
-                };
-                thread.detach();
+                self.fiber_group.async(self.io, handleConnection, .{ self, conn });
             }
         }
     }
@@ -386,6 +389,7 @@ pub const WebSocketMonitor = struct {
     modules: ?*ApplicationModules,
     update_thread: ?std.Thread,
     is_running: bool,
+    update_group: std.Io.Group,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, port: u16) Self {
         return .{
@@ -394,6 +398,7 @@ pub const WebSocketMonitor = struct {
             .modules = null,
             .update_thread = null,
             .is_running = false,
+            .update_group = .init,
         };
     }
 
@@ -406,17 +411,17 @@ pub const WebSocketMonitor = struct {
         self.modules = modules;
         try self.ws_server.start();
         self.is_running = true;
-
-        self.update_thread = try std.Thread.spawn(.{}, updateLoop, .{self});
+        self.update_thread = null;
+        // Run update loop asynchronously, owned by `update_group` so its
+        // future gets released on shutdown.
+        self.update_group.async(self.ws_server.io, updateLoop, .{self});
     }
 
     pub fn stop(self: *Self) void {
         self.is_running = false;
         self.ws_server.stop();
-        if (self.update_thread) |t| {
-            t.join();
-            self.update_thread = null;
-        }
+        self.update_thread = null;
+        self.update_group.await(self.ws_server.io) catch {};
     }
 
     fn updateLoop(self: *Self) void {

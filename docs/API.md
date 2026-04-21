@@ -567,22 +567,437 @@ pub fn put(self: *Self, url: []const u8, body: []const u8) !HttpResponse
 pub fn delete(self: *Self, url: []const u8) !HttpResponse
 ```
 
-### HTTP Server / Router
+### HTTP Server
 
-#### `zigmodu.api.Router`
 
-HTTP routing and middleware.
+
+#### Overview
+
+
+
+ZigModu provides an async fiber-based HTTP server built on `std.Io`. It supports routing, middleware chains, keep-alive connections, and structured request handling aligned with go-zero's rest package.
+
+
+
+**Architecture**: Each incoming connection is handled by an independent fiber via `std.Io.Group.async`, enabling true concurrent request processing without manual thread pools. The underlying I/O uses kqueue (macOS) or io_uring/epoll (Linux) for efficient async operations.
+
+
+
+#### Server
+
+
+
+`zigmodu.http_server.Server` — Main async HTTP server.
+
+
 
 ```zig
-pub fn init(allocator: std.mem.Allocator, prefix: []const u8) Self
-pub fn get(self: *Self, path: []const u8, handler: RequestHandler) !void
-pub fn post(self: *Self, path: []const u8, handler: RequestHandler) !void
-pub fn put(self: *Self, path: []const u8, handler: RequestHandler) !void
-pub fn delete(self: *Self, path: []const u8, handler: RequestHandler) !void
-pub fn use(self: *Self, middleware: Middleware) !void
-pub fn handle(self: *Self, request: Request) !Response
+
+pub fn init(io: std.Io, allocator: std.mem.Allocator, port: u16) Server
+
+pub fn deinit(self: *Server) void
+
+
+
+// Route management
+
+pub fn addRoute(self: *Server, route: Route) !void
+
+pub fn group(self: *Server, prefix: []const u8) RouteGroup
+
+pub fn addMiddleware(self: *Server, mw: Middleware) !void
+
+
+
+// Lifecycle
+
+pub fn start(self: *Server) !void  // Blocks until stop() is called
+
+pub fn stop(self: *Server) void    // Gracefully stops accepting new connections
+
 ```
 
+
+
+**Server Options:**
+
+
+
+| Field | Default | Description |
+
+|-------|---------|-------------|
+
+| `max_body_size` | 8 MB | Maximum request body size |
+
+| `request_timeout_ms` | 30000 | Request timeout in milliseconds |
+
+| `max_requests_per_conn` | 100 | Maximum keep-alive requests per connection |
+
+
+
+**Example:**
+
+
+
+```zig
+
+const std = @import("std");
+
+const zigmodu = @import("zigmodu");
+
+
+
+const Server = zigmodu.http_server.Server;
+
+const Context = zigmodu.http_server.Context;
+
+
+
+pub fn main(init: std.process.Init) !void {
+
+    const allocator = init.gpa;
+
+    const io = init.io;
+
+
+
+    var server = Server.init(io, allocator, 8080);
+
+    defer server.deinit();
+
+
+
+    // Register routes
+
+    try server.addRoute(.{
+
+        .method = .GET,
+
+        .path = "/health",
+
+        .handler = struct {
+
+            fn handle(ctx: *Context) anyerror!void {
+
+                try ctx.json(200, "{\"status\":\"ok\"}");
+
+            }
+
+        }.handle,
+
+    });
+
+
+
+    // Start server (blocks until stop() is called)
+
+    try server.start();
+
+}
+
+```
+
+
+
+#### HTTP Methods
+
+
+
+```zig
+
+pub const Method = enum { GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS };
+
+
+
+pub fn fromString(s: []const u8) Method
+
+pub fn toString(self: Method) []const u8
+
+```
+
+
+
+#### Route Definition
+
+
+
+```zig
+
+pub const Route = struct {
+
+    method: Method,
+
+    path: []const u8,
+
+    handler: HandlerFn,
+
+    middleware: []const Middleware = &.{},  // Per-route middleware
+
+    user_data: ?*anyopaque = null,
+
+};
+
+```
+
+
+
+#### Handler Function
+
+
+
+```zig
+
+pub const HandlerFn = *const fn (*Context) anyerror!void;
+
+```
+
+
+
+#### Context
+
+
+
+`Context` holds request data and provides response helpers. Automatically cleaned up per request via arena allocation.
+
+
+
+**Request Access:**
+
+
+
+```zig
+
+pub fn queryParam(self: *const Context, key: []const u8) ?[]const u8
+
+pub fn param(self: *const Context, key: []const u8) ?[]const u8       // Path param like /users/{id}
+
+pub fn header(self: *const Context, key: []const u8) ?[]const u8
+
+pub fn formValue(self: *const Context, key: []const u8) ?[]const u8
+
+pub fn body: ?[]const u8
+
+```
+
+
+
+**Response Helpers:**
+
+
+
+```zig
+
+pub fn json(self: *Context, status: u16, data: []const u8) !void
+
+pub fn text(self: *Context, status: u16, data: []const u8) !void
+
+pub fn sendError(self: *Context, status: u16, message: []const u8) !void
+
+pub fn sendErrorResponse(self: *Context, status: u16, code: i32, message: []const u8) !void
+
+pub fn setHeader(self: *Context, key: []const u8, value: []const u8) !void
+
+```
+
+
+
+**JSON Binding:**
+
+
+
+```zig
+
+pub fn bindJson(self: *const Context, comptime T: type) !T
+
+pub fn parseReq(self: *Context, comptime T: type, sources: anytype) !T
+
+```
+
+
+
+**Example — Auto parameter binding:**
+
+
+
+```zig
+
+const MyReq = struct { id: u32, page: u32 };
+
+const req = try ctx.parseReq(MyReq, .{ .id = .path, .page = .query });
+
+// GET /users/42?page=3 → req.id = 42, req.page = 3
+
+```
+
+
+
+#### Route Groups
+
+
+
+Group routes under a common prefix:
+
+
+
+```zig
+
+var api = server.group("/api/v1");
+
+try api.get("/users", handleUsers, null);
+
+try api.post("/orders", handleOrders, null);
+
+// Routes: GET /api/v1/users, POST /api/v1/orders
+
+```
+
+
+
+#### Middleware
+
+
+
+```zig
+
+pub const Middleware = struct {
+
+    func: MiddlewareFn,
+
+    user_data: ?*anyopaque = null,
+
+};
+
+
+
+pub const MiddlewareFn = *const fn (*Context, HandlerFn, ?*anyopaque) anyerror!void;
+
+```
+
+
+
+Middleware executes in order: global middleware → route middleware → handler. Call the next handler via `try next(ctx, next, user_data)`.
+
+
+
+**Example — Auth middleware:**
+
+
+
+```zig
+
+fn authMiddleware(ctx: *Context, next: HandlerFn, user_data: ?*anyopaque) anyerror!void {
+
+    const token = ctx.header("Authorization") orelse {
+
+        return ctx.sendError(401, "Unauthorized");
+
+    };
+
+    // Validate token...
+
+    try next(ctx, next, user_data);
+
+}
+
+
+
+try server.addMiddleware(.{ .func = authMiddleware });
+
+```
+
+
+
+#### Complete Example
+
+
+
+```zig
+
+const std = @import("std");
+
+const zigmodu = @import("zigmodu");
+
+const Server = zigmodu.http_server.Server;
+
+const Context = zigmodu.http_server.Context;
+
+
+
+pub fn main(init: std.process.Init) !void {
+
+    var server = Server.init(init.io, init.gpa, 8080);
+
+    defer server.deinit();
+
+
+
+    // JSON endpoint
+
+    try server.addRoute(.{
+
+        .method = .GET,
+
+        .path = "/api/health",
+
+        .handler = struct {
+
+            fn handle(ctx: *Context) anyerror!void {
+
+                try ctx.json(200, "{\"status\":\"ok\"}");
+
+            }
+
+        }.handle,
+
+    });
+
+
+
+    // Plain text endpoint
+
+    try server.addRoute(.{
+
+        .method = .GET,
+
+        .path = "/ping",
+
+        .handler = struct {
+
+            fn handle(ctx: *Context) anyerror!void {
+
+                try ctx.text(200, "pong");
+
+            }
+
+        }.handle,
+
+    });
+
+
+
+    // Route group with path params
+
+    var users = server.group("/api/users");
+
+    try users.get("/{id}", struct {
+
+        fn handle(ctx: *Context) anyerror!void {
+
+            const id = ctx.param("id") orelse return ctx.sendError(400, "missing id");
+
+            try ctx.json(200, try std.fmt.allocPrint(ctx.allocator, "{{\"id\":\"{s}\"}}", .{id}));
+
+        }
+
+    }.handle, null);
+
+
+
+    try server.start();
+
+}
+
+```
 ---
 
 ## Security

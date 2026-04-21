@@ -69,7 +69,7 @@ pub const CircuitBreaker = @import("resilience/CircuitBreaker.zig").CircuitBreak
 pub const RateLimiter = @import("resilience/RateLimiter.zig").RateLimiter;
 
 // Validation
-pub const Validator = @import("validation/Validator.zig").Validator;
+pub const Validator = @import("validation/ObjectValidator.zig").Validator;
 
 // Scheduler
 pub const ScheduledTask = @import("scheduler/ScheduledTask.zig").ScheduledTask;
@@ -138,7 +138,7 @@ pub const cache = @import("cache/Lru.zig");
 pub const cron = @import("scheduler/Cron.zig");
 
 // Core utilities (adapted from zigzero)
-pub const fx = @import("experimental/Fx.zig");
+pub const fx = @import("core/Fx.zig");
 
 // Resilience (adapted from zigzero)
 pub const retry = @import("resilience/Retry.zig");
@@ -149,7 +149,7 @@ pub const orm = @import("persistence/Orm.zig");
 pub const SqlxBackend = @import("persistence/backends/SqlxBackend.zig").SqlxBackend;
 
 // Validation (adapted from zigzero)
-pub const gozero_validator = @import("experimental/GoZeroValidator.zig");
+pub const gozero_validator = @import("validation/Validator.zig");
 // Tests
 test {
     // Import all test files

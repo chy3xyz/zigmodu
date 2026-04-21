@@ -60,6 +60,65 @@ pub const Route = struct {
     user_data: ?*anyopaque = null,
 };
 
+/// Route group helper to prefix paths.
+pub const RouteGroup = struct {
+    server: *Server,
+    prefix: []const u8,
+
+    pub fn init(server: *Server, prefix: []const u8) RouteGroup {
+        return .{ .server = server, .prefix = prefix };
+    }
+
+    fn joinPath(self: *const RouteGroup, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+        // Ensure exactly one '/' between prefix and path.
+        const pfx = self.prefix;
+        const needs_sep = pfx.len > 0 and pfx[pfx.len - 1] != '/' and (path.len == 0 or path[0] != '/');
+        const drop_dup = pfx.len > 0 and pfx[pfx.len - 1] == '/' and path.len > 0 and path[0] == '/';
+
+        if (drop_dup) {
+            return std.fmt.allocPrint(allocator, "{s}{s}", .{ pfx, path[1..] });
+        }
+        if (needs_sep) {
+            return std.fmt.allocPrint(allocator, "{s}/{s}", .{ pfx, path });
+        }
+        return std.fmt.allocPrint(allocator, "{s}{s}", .{ pfx, path });
+    }
+
+    fn add(self: *RouteGroup, method: Method, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
+        const full_path = try self.joinPath(self.server.allocator, path);
+        defer self.server.allocator.free(full_path);
+
+        try self.server.addRoute(.{
+            .method = method,
+            .path = full_path,
+            .handler = handler,
+            .user_data = user_data,
+        });
+    }
+
+    pub fn get(self: *RouteGroup, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
+        try self.add(.GET, path, handler, user_data);
+    }
+    pub fn post(self: *RouteGroup, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
+        try self.add(.POST, path, handler, user_data);
+    }
+    pub fn put(self: *RouteGroup, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
+        try self.add(.PUT, path, handler, user_data);
+    }
+    pub fn delete(self: *RouteGroup, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
+        try self.add(.DELETE, path, handler, user_data);
+    }
+    pub fn patch(self: *RouteGroup, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
+        try self.add(.PATCH, path, handler, user_data);
+    }
+    pub fn head(self: *RouteGroup, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
+        try self.add(.HEAD, path, handler, user_data);
+    }
+    pub fn options(self: *RouteGroup, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
+        try self.add(.OPTIONS, path, handler, user_data);
+    }
+};
+
 /// Field source for auto parameter binding
 pub const FieldSource = enum {
     path,
@@ -317,70 +376,42 @@ fn parseFormBody(allocator: std.mem.Allocator, body: []const u8) !std.StringHash
 }
 
 /// Simple stream reader wrapper for HTTP parsing
+/// Persistent buffered reader over a `std.Io.net.Stream`.
+///
+/// CRITICAL: the underlying `std.Io.net.Stream.Reader` owns an internal buffer.
+/// We must keep a single instance across reads — otherwise its buffer state is
+/// repeatedly reset and data from previous reads gets clobbered. The buffer is
+/// owned by this struct and must be referenced *after* the struct has reached
+/// its final memory location, which is why construction is a two-step process:
+/// allocate uninitialized storage, then call `setup`.
 const StreamReader = struct {
-    stream: std.Io.net.Stream,
-    io: std.Io,
-    buf: [8192]u8 = undefined,
-    pos: usize = 0,
-    end: usize = 0,
+    reader: std.Io.net.Stream.Reader,
+    buffer: [8192]u8 = undefined,
 
-    fn init(stream: std.Io.net.Stream, io: std.Io) StreamReader {
-        return .{
-            .stream = stream,
-            .io = io,
-            .buf = undefined,
-            .pos = 0,
-            .end = 0,
+    fn setup(self: *StreamReader, stream: std.Io.net.Stream, io: std.Io) void {
+        self.buffer = undefined;
+        self.reader = std.Io.net.Stream.Reader.init(stream, io, &self.buffer);
+    }
+
+    /// Reads a single line terminated by `delimiter`. Returns a slice into the
+    /// reader's internal buffer, valid only until the next read operation. The
+    /// caller must copy any data that needs to outlive subsequent reads.
+    ///
+    /// Returns `null` if the peer closed cleanly with no bytes available
+    /// (EOF on a fresh read), and propagates `error.ReadFailed` for actual
+    /// I/O errors so the caller can distinguish benign close from failure.
+    fn readUntilDelimiterOrEof(self: *StreamReader, _: []u8, delimiter: u8) !?[]u8 {
+        return self.reader.interface.takeDelimiter(delimiter) catch |err| switch (err) {
+            error.ReadFailed => error.ReadFailed,
+            error.StreamTooLong => error.InvalidRequest,
         };
     }
 
-    fn readByte(self: *StreamReader) !?u8 {
-        if (self.pos >= self.end) {
-            // Use Reader interface directly
-            var sr = self.stream.reader(self.io, &self.buf); const n = sr.interface.readSliceShort(self.buf[0..]) catch {
-                return null; // Connection closed or error
-            };
-            if (n == 0) return null;
-            self.pos = 0;
-            self.end = n;
-        }
-        const b = self.buf[self.pos];
-        self.pos += 1;
-        return b;
-    }
-
-    fn readUntilDelimiterOrEof(self: *StreamReader, out: []u8, delimiter: u8) !?[]u8 {
-        var i: usize = 0;
-        while (i < out.len) {
-            const b = try self.readByte() orelse return if (i == 0) null else out[0..i];
-            out[i] = b;
-            i += 1;
-            if (b == delimiter) return out[0..i];
-        }
-        // Buffer full but no delimiter found
-        return out[0..i];
-    }
-
     fn readAll(self: *StreamReader, out: []u8) !usize {
-        var total: usize = 0;
-        while (total < out.len) {
-            // First, drain any buffered bytes
-            if (self.pos < self.end) {
-                const avail = self.end - self.pos;
-                const to_copy = @min(avail, out.len - total);
-                @memcpy(out[total..][0..to_copy], self.buf[self.pos..][0..to_copy]);
-                self.pos += to_copy;
-                total += to_copy;
-                continue;
-            }
-            // Use Reader interface directly
-            var sr = self.stream.reader(self.io, &self.buf); const n = sr.interface.readSliceShort(self.buf[0..]) catch {
-                break; // Connection closed or error
-            };
-            if (n == 0) break;
-            total += n;
-        }
-        return total;
+        self.reader.interface.readSliceAll(out) catch |err| switch (err) {
+            error.EndOfStream, error.ReadFailed => return 0,
+        };
+        return out.len;
     }
 };
 
@@ -392,11 +423,28 @@ const RequestParser = struct {
         return .{ .allocator = allocator };
     }
 
+    fn trimCrlf(line: []const u8) []const u8 {
+        var out = line;
+        while (out.len > 0 and (out[out.len - 1] == '\n' or out[out.len - 1] == '\r')) {
+            out = out[0 .. out.len - 1];
+        }
+        return out;
+    }
+
     pub fn parse(self: *RequestParser, reader: *StreamReader, max_body_size: usize) !ParsedRequest {
         var buffer: [8192]u8 = undefined;
 
-        // Read request line
-        const request_line = try reader.readUntilDelimiterOrEof(&buffer, '\n') orelse return error.InvalidRequest;
+        // Read request line. `takeDelimiter` returns a slice into the reader's
+        // internal buffer, which gets invalidated on the next read (rebase).
+        // Dupe it into the parser allocator so subsequent header reads don't
+        // clobber the method/path slices we derive from it.
+        //
+        // A `null` result here means the peer closed before sending anything —
+        // this is a benign end-of-connection, not a malformed request, so we
+        // surface it as a distinct error the caller can ignore silently.
+        const request_line_raw_view = try reader.readUntilDelimiterOrEof(&buffer, '\n') orelse return error.ClientClosed;
+        const request_line_owned = try self.allocator.dupe(u8, trimCrlf(request_line_raw_view));
+        const request_line = request_line_owned;
         if (request_line.len < 14) return error.InvalidRequest; // Minimum: "GET / HTTP/1.1"
 
         // Parse method
@@ -431,10 +479,9 @@ const RequestParser = struct {
         // Parse headers
         var headers = std.StringHashMap([]const u8).init(self.allocator);
         while (true) {
-            const line = try reader.readUntilDelimiterOrEof(&buffer, '\n') orelse return error.InvalidRequest;
-            if (line.len == 0 or (line.len == 1 and line[0] == '\r')) break;
-
-            const header_line = if (line.len > 0 and line[line.len - 1] == '\r') line[0 .. line.len - 1] else line;
+            const line_raw = try reader.readUntilDelimiterOrEof(&buffer, '\n') orelse return error.InvalidRequest;
+            const header_line = trimCrlf(line_raw);
+            if (header_line.len == 0) break;
 
             if (std.mem.indexOf(u8, header_line, ": ")) |colon_pos| {
                 const key = try self.allocator.dupe(u8, header_line[0..colon_pos]);
@@ -730,166 +777,172 @@ const ResponseWriter = struct {
         var write_buf: [4096]u8 = undefined;
         var w = stream.writer(io, &write_buf);
         try w.interface.writeAll(response);
+        try w.interface.flush();
     }
 };
 
-/// Connection task for thread pool
-const ConnectionTask = struct {
-    server: *Server,
-    stream: *std.Io.net.Stream,
+/// Async HTTP request/response handler
+
+/// Parses an HTTP request from a raw byte buffer.
+/// Returns the number of bytes consumed (request line + headers + body).
+const ParsedRequestAsync = struct {
+    method: Method,
+    path: []const u8,
+    raw_path: []const u8,
+    query: std.StringHashMap([]const u8),
+    headers: std.StringHashMap([]const u8),
+    body: ?[]const u8,
+    consumed: usize,
+
+    pub fn deinit(self: *ParsedRequestAsync, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.raw_path);
+        var qiter = self.query.iterator();
+        while (qiter.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        self.query.deinit();
+        var hiter = self.headers.iterator();
+        while (hiter.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        self.headers.deinit();
+        if (self.body) |b| allocator.free(b);
+    }
 };
 
-/// Fixed-size thread pool for handling connections
-const ThreadPool = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    threads: []std.Thread,
-    mutex: std.Io.Mutex,
-    cond: std.Io.Condition,
-    queue: std.ArrayList(ConnectionTask),
-    shutdown: std.atomic.Value(bool),
+/// Parse HTTP request from raw buffer.
+/// Returns the parsed request and the number of bytes consumed from the buffer.
+pub fn parseHttpRequest(allocator: std.mem.Allocator, raw: []const u8, max_body_size: usize) !ParsedRequestAsync {
+    var pos: usize = 0;
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, num_threads: usize) !ThreadPool {
-        var pool = ThreadPool{
-            .allocator = allocator,
-            .io = io,
-            .threads = try allocator.alloc(std.Thread, num_threads),
-            .mutex = .init,
-            .cond = .init,
-            .queue = std.ArrayList(ConnectionTask).empty,
-            .shutdown = std.atomic.Value(bool).init(false),
-        };
+    // Read request line (until \r\n or just \n)
+    const line_end = findLineEnd(raw[pos..]) orelse return error.InvalidRequest;
+    const request_line_raw = raw[pos .. pos + line_end];
+    pos += line_end;
+    if (pos < raw.len and raw[pos] == '\n') pos += 1;
+    if (pos < raw.len and raw[pos - 1] == '\r' and raw[pos - 1] == 0) pos += 0; // handle trailing check
 
-        for (0..num_threads) |i| {
-            pool.threads[i] = try std.Thread.spawn(.{}, workerLoop, .{&pool});
-        }
+    var iter = std.mem.splitScalar(u8, request_line_raw, ' ');
+    const method_str = iter.next() orelse return error.InvalidRequest;
+    const path_str = iter.next() orelse return error.InvalidRequest;
+    _ = iter.next() orelse return error.InvalidRequest; // HTTP version
 
-        return pool;
-    }
+    const method = Method.fromString(method_str);
 
-    pub fn deinit(self: *ThreadPool) void {
-        self.shutdown.store(true, .release);
-        self.mutex.lock(self.io) catch return;
-        self.cond.broadcast(self.io);
-        self.mutex.unlock(self.io);
-
-        for (self.threads) |thread| {
-            thread.join();
-        }
-
-        self.allocator.free(self.threads);
-        self.queue.deinit(self.allocator);
-    }
-
-    pub fn submit(self: *ThreadPool, task: ConnectionTask) !void {
-        try self.mutex.lock(self.io);
-        defer self.mutex.unlock(self.io);
-
-        if (self.shutdown.load(.acquire)) return error.Shutdown;
-
-        try self.queue.append(self.allocator, task);
-        self.cond.signal(self.io);
-    }
-
-    fn workerLoop(self: *ThreadPool) void {
-        while (true) {
-            self.mutex.lock(self.io) catch break;
-
-            while (self.queue.items.len == 0) {
-                self.cond.wait(self.io, &self.mutex) catch break;
-                if (self.shutdown.load(.acquire)) {
-                    self.mutex.unlock(self.io);
-                    return;
-                }
-
-            if (self.queue.items.len == 0) {
-                self.mutex.unlock(self.io);
-                continue;
+    // Parse query
+    var path = path_str;
+    var query_map = std.StringHashMap([]const u8).init(allocator);
+    if (std.mem.indexOf(u8, path_str, "?")) |query_start| {
+        path = path_str[0..query_start];
+        const query_str = path_str[query_start + 1 ..];
+        var qiter = std.mem.splitScalar(u8, query_str, '&');
+        while (qiter.next()) |param| {
+            if (param.len == 0) continue;
+            if (std.mem.indexOf(u8, param, "=")) |eq| {
+                const key = try allocator.dupe(u8, param[0..eq]);
+                const val = try allocator.dupe(u8, param[eq + 1 ..]);
+                try query_map.put(key, val);
             }
+        }
+    } else {
+        const path_copy = try allocator.dupe(u8, path);
+        path = path_copy;
+    }
+
+    // Parse headers
+    var headers = std.StringHashMap([]const u8).init(allocator);
+    var content_length: usize = 0;
+
+    while (pos < raw.len) {
+        const header_end = findLineEnd(raw[pos..]) orelse break;
+        const header_line = raw[pos .. pos + header_end];
+        pos += header_end;
+        if (pos < raw.len and raw[pos] == '\n') pos += 1;
+
+        // Empty line = end of headers
+        if (header_line.len == 0 or (header_line.len == 1 and header_line[0] == '\r')) break;
+
+        const clean_line = if (header_line.len > 0 and header_line[header_line.len - 1] == '\r')
+            header_line[0 .. header_line.len - 1]
+        else
+            header_line;
+
+        if (std.mem.indexOf(u8, clean_line, ": ")) |colon| {
+            const key = try allocator.dupe(u8, clean_line[0..colon]);
+            const val = try allocator.dupe(u8, clean_line[colon + 2 ..]);
+            if (std.ascii.eqlIgnoreCase(key, "content-length")) {
+                content_length = std.fmt.parseInt(usize, val, 10) catch 0;
             }
-
-            const task = self.queue.orderedRemove(0);
-            self.mutex.unlock(self.io);
-
-            task.server.handleConnection(task.stream);
+            try headers.put(key, val);
         }
     }
-};
 
-/// Route group for organizing routes with common prefix and middleware
-pub const RouteGroup = struct {
-    prefix: []const u8,
-    middleware: []const Middleware,
-    server: *Server,
-
-    pub fn init(server: *Server, prefix: []const u8) RouteGroup {
-        return .{
-            .prefix = prefix,
-            .middleware = &.{},
-            .server = server,
-        };
-    }
-
-    pub fn withMiddleware(self: RouteGroup, mws: []const Middleware) RouteGroup {
-        var group = self;
-        group.middleware = mws;
-        return group;
-    }
-
-    fn fullPath(self: *const RouteGroup, path: []const u8) ![]u8 {
-        if (self.prefix.len == 0 or std.mem.eql(u8, path, "/")) {
-            return self.server.allocator.dupe(u8, self.prefix);
+    // Read body
+    var body: ?[]const u8 = null;
+    var body_consumed: usize = 0;
+    if (content_length > 0) {
+        if (content_length > max_body_size) {
+            return error.BodyTooLarge;
         }
-        // Ensure no double slash
-        if (std.mem.endsWith(u8, self.prefix, "/") and std.mem.startsWith(u8, path, "/")) {
-            return std.fmt.allocPrint(self.server.allocator, "{s}{s}", .{ self.prefix, path[1..] });
+        if (pos + content_length <= raw.len) {
+            body = try allocator.dupe(u8, raw[pos .. pos + content_length]);
+            body_consumed = content_length;
         }
-        if (!std.mem.endsWith(u8, self.prefix, "/") and !std.mem.startsWith(u8, path, "/")) {
-            return std.fmt.allocPrint(self.server.allocator, "{s}/{s}", .{ self.prefix, path });
-        }
-        return std.fmt.allocPrint(self.server.allocator, "{s}{s}", .{ self.prefix, path });
     }
 
-    pub fn get(self: *RouteGroup, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
-        try self.handle(.GET, path, handler, user_data);
+    const consumed = pos + body_consumed;
+
+    const raw_path = try allocator.dupe(u8, path);
+
+    return ParsedRequestAsync{
+        .method = method,
+        .path = path,
+        .raw_path = raw_path,
+        .query = query_map,
+        .headers = headers,
+        .body = body,
+        .consumed = consumed,
+    };
+}
+
+fn findLineEnd(line: []const u8) ?usize {
+    return std.mem.indexOf(u8, line, "\r\n") orelse
+           std.mem.indexOf(u8, line, "\n");
+}
+
+/// Write HTTP response to a `std.Io.net.Stream`.
+fn writeResponse(io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net.Stream, status: u16, headers: std.StringHashMap([]const u8), body: []const u8) !void {
+    const status_text = getStatusText(status);
+
+    var resp = std.ArrayList(u8).empty;
+    defer resp.deinit(allocator);
+
+    var line_buf: [128]u8 = undefined;
+    const status_line = try std.fmt.bufPrint(&line_buf, "HTTP/1.1 {d} {s}\r\n", .{ status, status_text });
+    try resp.appendSlice(allocator, status_line);
+
+    var hiter = headers.iterator();
+    while (hiter.next()) |entry| {
+        try resp.appendSlice(allocator, entry.key_ptr.*);
+        try resp.appendSlice(allocator, ": ");
+        try resp.appendSlice(allocator, entry.value_ptr.*);
+        try resp.appendSlice(allocator, "\r\n");
     }
 
-    pub fn post(self: *RouteGroup, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
-        try self.handle(.POST, path, handler, user_data);
-    }
+    const len_line = try std.fmt.bufPrint(&line_buf, "Content-Length: {d}\r\n\r\n", .{body.len});
+    try resp.appendSlice(allocator, len_line);
+    try resp.appendSlice(allocator, body);
 
-    pub fn put(self: *RouteGroup, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
-        try self.handle(.PUT, path, handler, user_data);
-    }
+    var write_buf: [4096]u8 = undefined;
+    var w = stream.writer(io, &write_buf);
+    try w.interface.writeAll(resp.items);
+    try w.interface.flush();
+}
 
-    pub fn delete(self: *RouteGroup, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
-        try self.handle(.DELETE, path, handler, user_data);
-    }
-
-    pub fn patch(self: *RouteGroup, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
-        try self.handle(.PATCH, path, handler, user_data);
-    }
-
-    pub fn handle(self: *RouteGroup, method: Method, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
-        const fp = try self.fullPath(path);
-        defer self.server.allocator.free(fp);
-
-        // Combine group middleware + any empty per-route middleware
-        const mws = try self.server.allocator.alloc(Middleware, self.middleware.len);
-        errdefer self.server.allocator.free(mws);
-        @memcpy(mws, self.middleware);
-
-        try self.server.addRoute(.{
-            .method = method,
-            .path = fp,
-            .handler = handler,
-            .middleware = mws,
-            .user_data = user_data,
-        });
-    }
-};
-
-/// HTTP server
+/// HTTP server — async fiber-based
 pub const Server = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -898,13 +951,18 @@ pub const Server = struct {
     global_middleware: std.ArrayList(Middleware),
     name: []const u8,
     running: std.atomic.Value(bool),
-    server_socket: ?std.Io.net.Server = null,
+    listener: ?std.Io.net.Server,
+    /// Guards exactly-once ownership transfer of `listener` fd close between
+    /// `start()`'s defer and `stop()`. Whichever path first swaps this to
+    /// `true` takes ownership of calling `deinit` on the listener.
+    listener_closing: std.atomic.Value(bool),
+    /// Group of in-flight connection fibers. `start()` owns this: it spawns
+    /// `connFiber` tasks into the group and awaits it on shutdown so no
+    /// fiber futures leak when the accept loop exits.
+    conn_group: std.Io.Group,
     max_body_size: usize,
     request_timeout_ms: u32,
-    thread_pool: ?*ThreadPool = null,
-    max_concurrent: usize = 1000,
-    active_connections: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-
+    max_requests_per_conn: usize,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, port: u16) Server {
         return .{
@@ -915,222 +973,30 @@ pub const Server = struct {
             .global_middleware = std.ArrayList(Middleware).empty,
             .name = "zigmodu-api",
             .running = std.atomic.Value(bool).init(false),
-            .server_socket = null,
+            .listener = null,
+            .listener_closing = std.atomic.Value(bool).init(false),
+            .conn_group = .init,
             .max_body_size = 8 * 1024 * 1024, // 8MB default
             .request_timeout_ms = 30000, // 30s default
-            .max_concurrent = 1000,
-            .active_connections = std.atomic.Value(usize).init(0),
+            .max_requests_per_conn = 100,
         };
     }
 
     pub fn deinit(self: *Server) void {
-        if (self.thread_pool) |pool| {
-            pool.deinit();
-            self.allocator.destroy(pool);
-            self.thread_pool = null;
-        }
         self.router.deinit();
         self.global_middleware.deinit(self.allocator);
-        if (self.server_socket) |*ss| {
-            ss.deinit(self.io);
-        }
     }
 
-    /// Add a route
-    /// Add a route
     pub fn addRoute(self: *Server, route: Route) !void {
         try self.router.addRoute(route);
     }
 
-    /// Create a route group
     pub fn group(self: *Server, prefix: []const u8) RouteGroup {
         return RouteGroup.init(self, prefix);
     }
 
-    /// Add global middleware
     pub fn addMiddleware(self: *Server, mw: Middleware) !void {
         try self.global_middleware.append(self.allocator, mw);
-    }
-
-    /// Start the server
-    pub fn start(self: *Server) !void {
-        var addr = std.Io.net.IpAddress.parseIp4("0.0.0.0", self.port) catch {
-            return error.ConnectionRefused;
-        };
-
-        var server = addr.listen(self.io, .{
-            .reuse_address = true,
-            .kernel_backlog = 128,
-        }) catch {
-            return error.ConnectionRefused;
-        };
-
-        self.server_socket = server;
-        self.running.store(true, .monotonic);
-
-        std.log.info("Server listening on port {d}", .{self.port});
-        // Initialize thread pool on first start
-        if (self.thread_pool == null) {
-            const cpu_count = std.Thread.getCpuCount() catch 4;
-            const pool_size = @max(4, @min(cpu_count * 2, self.max_concurrent));
-            const pool = try self.allocator.create(ThreadPool);
-            pool.* = try ThreadPool.init(self.allocator, self.io, pool_size);
-            self.thread_pool = pool;
-        }
-
-        while (self.running.load(.monotonic)) {
-            // Accept connection
-            const conn = server.accept(self.io) catch |err| {
-                if (!self.running.load(.monotonic)) break;
-                std.log.err("Accept error: {any}", .{err});
-                continue;
-            };
-
-            // Check concurrent connection limit
-            const active = self.active_connections.load(.monotonic);
-            if (active >= self.max_concurrent) {
-                std.log.warn("Server at max concurrent connections ({d}), rejecting connection", .{self.max_concurrent});
-                conn.close(self.io);
-                continue;
-            }
-
-            const conn_ptr = try self.allocator.create(std.Io.net.Stream);
-            conn_ptr.* = conn;
-            _ = self.active_connections.fetchAdd(1, .monotonic);
-
-            self.thread_pool.?.submit(.{
-                .server = self,
-                .stream = conn_ptr,
-            }) catch |err| {
-                std.log.err("Failed to submit task: {any}", .{err});
-                conn.close(self.io);
-                self.allocator.destroy(conn_ptr);
-                _ = self.active_connections.fetchSub(1, .monotonic);
-                continue;
-            };
-        }
-    }
-
-    pub fn stop(self: *Server) void {
-        self.running.store(false, .monotonic);
-        if (self.server_socket) |*ss| {
-            ss.deinit(self.io);
-            self.server_socket = null;
-        }
-        if (self.thread_pool) |pool| {
-            pool.deinit();
-            self.allocator.destroy(pool);
-            self.thread_pool = null;
-        }
-    }
-
-    fn handleConnection(self: *Server, conn: *std.Io.net.Stream) void {
-        var close_stream = true;
-        defer {
-            if (close_stream) conn.close(self.io);
-            self.allocator.destroy(conn);
-            // 减少活跃连接计数
-            _ = self.active_connections.fetchSub(1, .monotonic);
-        }
-
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const arena_alloc = arena.allocator();
-
-        var stream_reader = StreamReader.init(conn.*, self.io);
-
-        const start_time = std.Io.Timestamp.now(self.io, .real);
-
-        var parser = RequestParser.init(arena_alloc);
-        var request = parser.parse(&stream_reader, self.max_body_size) catch |err| {
-            const err_msg = std.fmt.allocPrint(arena_alloc, "Parse error: {any}", .{err}) catch "Parse error";
-            std.log.err("{s}", .{err_msg});
-            const status: u16 = if (err == error.BodyTooLarge) 413 else 400;
-            const msg = if (err == error.BodyTooLarge) "Payload Too Large" else "Bad Request";
-            const response = std.fmt.allocPrint(arena_alloc, "HTTP/1.1 {d} {s}\r\n\r\n", .{ status, msg }) catch return;
-            var write_buf: [1024]u8 = undefined;
-            var w = conn.writer(self.io, &write_buf);
-            w.interface.writeAll(response) catch {};
-            return;
-        };
-        defer request.deinit(arena_alloc);
-
-        // Find matching route
-        const matched = self.router.match(request.method, request.path);
-
-        var ctx = Context.init(arena_alloc, request.method, request.path) catch |err| {
-            std.log.err("Context init error: {any}", .{err});
-            return;
-        };
-        defer ctx.deinit();
-        ctx.stream = conn.*;
-
-        // Copy query params
-        var query_iter = request.query.iterator();
-        while (query_iter.next()) |entry| {
-            const key = arena_alloc.dupe(u8, entry.key_ptr.*) catch continue;
-            const value = arena_alloc.dupe(u8, entry.value_ptr.*) catch continue;
-            ctx.query.put(key, value) catch {};
-        }
-
-        // Copy headers
-        var headers_iter = request.headers.iterator();
-        while (headers_iter.next()) |entry| {
-            const key = arena_alloc.dupe(u8, entry.key_ptr.*) catch continue;
-            const value = arena_alloc.dupe(u8, entry.value_ptr.*) catch continue;
-            ctx.headers.put(key, value) catch {};
-        }
-
-        ctx.body = request.body;
-        ctx.raw_path = request.raw_path;
-
-        // Parse form body if content-type is application/x-www-form-urlencoded
-        if (request.body) |body| {
-            const content_type = request.headers.get("Content-Type") orelse "";
-            if (std.mem.startsWith(u8, content_type, "application/x-www-form-urlencoded")) {
-                ctx.form = parseFormBody(arena_alloc, body) catch ctx.form;
-            }
-        }
-
-        if (matched) |m| {
-            // Copy path params
-            var params_iter = m.params.iterator();
-            while (params_iter.next()) |entry| {
-                const key = arena_alloc.dupe(u8, entry.key_ptr.*) catch continue;
-                const value = arena_alloc.dupe(u8, entry.value_ptr.*) catch continue;
-                ctx.params.put(key, value) catch {};
-            }
-
-            ctx.user_data = m.route.user_data;
-
-            // Execute handler with middleware chain
-            self.executeWithMiddleware(&ctx, m.route.handler, m.route.middleware) catch |err| {
-                if (!ctx.responded) {
-                    ctx.sendError(500, @errorName(err)) catch {};
-                }
-            };
-        } else {
-            ctx.sendError(404, "Not Found") catch {};
-        }
-
-        // Check request timeout
-        const current_time = std.Io.Timestamp.now(self.io, .real);
-        const elapsed_ns = current_time.nanoseconds - start_time.nanoseconds;
-        const elapsed_ms = @divTrunc(elapsed_ns, std.time.ns_per_ms);
-        if (elapsed_ms > self.request_timeout_ms) {
-            std.log.warn("Request timeout: {s} {s} took {d}ms", .{ request.method.toString(), request.path, elapsed_ms });
-            if (!ctx.responded) {
-                ctx.sendError(408, "Request Timeout") catch {};
-            }
-        }
-
-        if (ctx.upgraded) {
-            close_stream = false;
-            return;
-        }
-
-        // Send response
-        ResponseWriter.write(self.io, arena_alloc, conn.*, ctx.status_code, &ctx.response_headers, ctx.response_body.items) catch {};
     }
 
     fn executeWithMiddleware(self: *Server, ctx: *Context, final_handler: HandlerFn, route_middleware: []const Middleware) !void {
@@ -1148,7 +1014,201 @@ pub const Server = struct {
 
         try runMiddlewareChain(ctx);
     }
+
+    /// Start the async HTTP server.
+    /// Blocks until stop() is called (runs within self.io scheduler).
+    pub fn start(self: *Server) !void {
+        const addr = try std.Io.net.IpAddress.parseIp4("0.0.0.0", self.port);
+        self.listener = try addr.listen(self.io, .{
+            .reuse_address = true,
+        });
+        // Only the path that first flips `listener_closing` to true is allowed
+        // to call `deinit`. This prevents a double-close race between `stop()`
+        // (called by user code) and this defer (triggered when the accept loop
+        // exits because the fd was closed underneath it).
+        defer self.closeListener();
+        // Reap any still-running connection fibers on exit so their futures
+        // are released. Await (not cancel) so in-flight requests complete.
+        defer self.conn_group.await(self.io) catch {};
+
+        self.running.store(true, .monotonic);
+        std.log.info("Server listening on port {d}", .{self.port});
+
+        while (self.running.load(.monotonic)) {
+            const stream = (self.listener orelse break).accept(self.io) catch |err| {
+                if (!self.running.load(.monotonic)) break;
+                std.log.err("Accept error: {any}", .{err});
+                continue;
+            };
+
+            self.conn_group.async(self.io, connFiber, .{ self, stream, self.allocator });
+        }
+    }
+
+    pub fn stop(self: *Server) void {
+        self.running.store(false, .monotonic);
+        self.closeListener();
+    }
+
+    /// Close the listener exactly once, whichever caller wins the race.
+    fn closeListener(self: *Server) void {
+        if (self.listener_closing.swap(true, .acq_rel)) return;
+        if (self.listener) |*l| {
+            l.deinit(self.io);
+            self.listener = null;
+        }
+    }
 };
+
+/// Connection fiber — handles one HTTP connection
+fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allocator) void {
+    defer stream.close(server.io);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    var reader: StreamReader = undefined;
+    reader.setup(stream, server.io);
+    var parser = RequestParser.init(arena_alloc);
+
+    var req_count: usize = 0;
+    while (req_count < server.max_requests_per_conn and server.running.load(.monotonic)) : (req_count += 1) {
+        _ = arena.reset(.retain_capacity);
+
+        const start_time = std.Io.Timestamp.now(server.io, .real);
+
+        var request = parser.parse(&reader, server.max_body_size) catch |err| {
+            switch (err) {
+                // Peer closed before sending anything — keep-alive drain or
+                // readiness probe. Nothing to respond with; just exit the loop.
+                error.ClientClosed => return,
+                error.ReadFailed => return,
+                else => {},
+            }
+            std.log.err("Parse error: {any}", .{err});
+            const msg = if (err == error.BodyTooLarge) "Payload Too Large" else "Bad Request";
+            const status: u16 = if (err == error.BodyTooLarge) 413 else 400;
+            writeErrorResponse(server.io, stream, arena_alloc, status, msg);
+            return;
+        };
+        defer request.deinit(arena_alloc);
+
+        std.log.debug("[HC] {s} {s}", .{ request.method.toString(), request.path });
+
+        var ctx = Context.init(arena_alloc, request.method, request.path) catch |err| {
+            std.log.err("Context init error: {any}", .{err});
+            return;
+        };
+        defer ctx.deinit();
+
+        // Copy query params
+        var qiter = request.query.iterator();
+        while (qiter.next()) |entry| {
+            const key = arena_alloc.dupe(u8, entry.key_ptr.*) catch continue;
+            const val = arena_alloc.dupe(u8, entry.value_ptr.*) catch continue;
+            ctx.query.put(key, val) catch {};
+        }
+
+        // Copy headers
+        var hiter = request.headers.iterator();
+        while (hiter.next()) |entry| {
+            const key = arena_alloc.dupe(u8, entry.key_ptr.*) catch continue;
+            const val = arena_alloc.dupe(u8, entry.value_ptr.*) catch continue;
+            ctx.headers.put(key, val) catch {};
+        }
+
+        ctx.body = request.body;
+        ctx.raw_path = request.raw_path;
+
+        // Parse form body
+        if (request.body) |body| {
+            const ct = request.headers.get("Content-Length") orelse "";
+            _ = ct;
+            const ctype = request.headers.get("Content-Type") orelse "";
+            if (std.mem.startsWith(u8, ctype, "application/x-www-form-urlencoded")) {
+                ctx.form = parseFormBody(arena_alloc, body) catch ctx.form;
+            }
+        }
+
+        var matched = server.router.match(request.method, request.path);
+        if (matched) |*m| {
+            defer {
+                var it = m.params.iterator();
+                while (it.next()) |entry| {
+                    arena_alloc.free(entry.key_ptr.*);
+                    arena_alloc.free(entry.value_ptr.*);
+                }
+                m.params.deinit();
+            }
+
+            var piter = m.params.iterator();
+            while (piter.next()) |entry| {
+                const key = arena_alloc.dupe(u8, entry.key_ptr.*) catch continue;
+                const val = arena_alloc.dupe(u8, entry.value_ptr.*) catch continue;
+                ctx.params.put(key, val) catch {};
+            }
+
+            ctx.user_data = m.route.user_data;
+
+            server.executeWithMiddleware(&ctx, m.route.handler, m.route.middleware) catch |err| {
+                std.log.err("[HC] Handler error: {any}", .{err});
+                if (!ctx.responded) {
+                    ctx.sendError(500, @errorName(err)) catch {};
+                }
+            };
+        } else {
+            ctx.sendError(404, "Not Found") catch {};
+        }
+
+        const current_time = std.Io.Timestamp.now(server.io, .real);
+        const elapsed_ms = @divTrunc(current_time.nanoseconds - start_time.nanoseconds, std.time.ns_per_ms);
+        if (elapsed_ms > server.request_timeout_ms and !ctx.responded) {
+            ctx.sendError(408, "Request Timeout") catch {};
+        }
+
+        if (ctx.responded) {
+            writeResponse(server.io, arena_alloc, stream, ctx.status_code, ctx.response_headers, ctx.response_body.items) catch |err| {
+                std.log.err("[HC] write error: {any}", .{err});
+                return;
+            };
+        }
+
+        // Keep-alive decision: default keep-alive unless Connection: close
+        if (request.headers.get("Connection")) |conn_val| {
+            if (std.ascii.eqlIgnoreCase(conn_val, "close")) return;
+        }
+    }
+}
+
+/// Write an error response directly to the connection stream
+fn writeErrorResponse(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, status: u16, message: []const u8) void {
+    var headers = std.StringHashMap([]const u8).init(allocator);
+    defer {
+        var it = headers.iterator();
+        while (it.next()) |e| {
+            allocator.free(e.key_ptr.*);
+            allocator.free(e.value_ptr.*);
+        }
+        headers.deinit();
+    }
+
+    const key = allocator.dupe(u8, "Content-Type") catch return;
+    const val = allocator.dupe(u8, "application/json") catch {
+        allocator.free(key);
+        return;
+    };
+    headers.put(key, val) catch {
+        allocator.free(key);
+        allocator.free(val);
+        return;
+    };
+
+    const body = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{message}) catch return;
+    defer allocator.free(body);
+
+    writeResponse(io, allocator, stream, status, headers, body) catch {};
+}
 
 fn runMiddlewareChain(ctx: *Context) anyerror!void {
     if (ctx.chain_index < ctx.chain_middlewares.len) {

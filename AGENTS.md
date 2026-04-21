@@ -51,7 +51,6 @@ zigmodu/
 - `zig build run` - Run example application
 
 ## Dependencies (from build.zig.zon)
-- **zio**: v0.9.0+ (async runtime) - already configured
 - Note: zig-yaml removed (404 error), zig-events and zig-di referenced but not used
 
 ## Framework Conventions (CRITICAL)
@@ -102,14 +101,10 @@ pub fn main(init: std.process.Init) !void {
 ```zig
 .{
     .name = .zigmodu,  // MUST be enum literal, not string!
-    .version = "0.1.0",
+    .version = "0.7.6",
     .fingerprint = 0x7aa42d07b32f8d53,  // Required for new packages
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        .zio = .{
-            .url = "https://github.com/lalinsky/zio/archive/refs/tags/v0.9.0.tar.gz",
-            .hash = "12202c874628a8fc488cd8bcfdd08c2cbfb9e4e09b64313e49a2129d410c0c50ea13",
-        },
     },
     .paths = .{
         "build.zig",

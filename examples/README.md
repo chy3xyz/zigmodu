@@ -156,7 +156,41 @@ var reloader = zigmodu.HotReloader.init(allocator);
 
 ---
 
+### 8. HTTP Server Stress Test (`examples/http-stress-test`)
+**Demonstrates**: Async HTTP server capabilities
+
+- Concurrent connection handling
+- Route registration
+- JSON and text responses
+- ThreadPool-free fiber architecture
+- Keep-alive support
+- Request timeout handling
+
+**Key Concepts**:
+```zig
+const Server = zigmodu.http_server.Server;
+const Context = zigmodu.http_server.Context;
+
+var server = Server.init(io, allocator, 8080);
+try server.addRoute(.{ .method = .GET, .path = "/health",
+    .handler = struct {
+        fn handle(ctx: *Context) anyerror!void {
+            try ctx.json(200, "{\"status\":\"ok\"}");
+        }
+    }.handle,
+});
+try server.start();
+```
+
+**Run**: `cd examples/http-stress-test && zig build run`
+
+**Test API**: `curl http://localhost:8080/json`
+
+---
+
 ## 🚀 Quick Start
+
+### Prerequisites
 
 ### Prerequisites
 - Zig 0.16.0 or later

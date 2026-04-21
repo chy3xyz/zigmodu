@@ -16,6 +16,8 @@ pub const DistributedEventBus = struct {
     is_running: bool,
     node_id: []const u8,
     heartbeat_thread: ?std.Thread,
+    /// Owns accept/handle/heartbeat fibers; awaited in `stop()`.
+    fiber_group: std.Io.Group,
 
     pub const NetworkEvent = struct {
         topic: []const u8,
@@ -44,6 +46,7 @@ pub const DistributedEventBus = struct {
             .is_running = false,
             .node_id = id_copy,
             .heartbeat_thread = null,
+            .fiber_group = .init,
         };
     }
 
@@ -78,24 +81,22 @@ pub const DistributedEventBus = struct {
 
         std.log.info("[DistributedEventBus] Node '{s}' listening on port {d}", .{ self.node_id, port });
 
-        // Start accept loop in a separate thread
-        const thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
-        thread.detach();
-
-        // Start heartbeat
-        self.heartbeat_thread = try std.Thread.spawn(.{}, heartbeatLoop, .{self});
+        // Start accept loop and heartbeat asynchronously as members of
+        // `fiber_group` so their futures do not leak.
+        self.fiber_group.async(self.io, acceptLoop, .{self});
+        self.heartbeat_thread = null;
+        self.fiber_group.async(self.io, heartbeatLoop, .{self});
     }
 
     pub fn stop(self: *Self) void {
         self.is_running = false;
-        if (self.heartbeat_thread) |thread| {
-            thread.join();
-            self.heartbeat_thread = null;
-        }
+        self.heartbeat_thread = null;
         if (self.listener) |*l| {
             l.deinit(self.io);
             self.listener = null;
         }
+        // Drain accept/handle/heartbeat fibers; idempotent.
+        self.fiber_group.await(self.io) catch {};
     }
 
     fn acceptLoop(self: *Self) void {
@@ -108,13 +109,8 @@ pub const DistributedEventBus = struct {
                     continue;
                 };
 
-                // Handle connection in new thread
-                const thread = std.Thread.spawn(.{}, handleConnection, .{ self, conn }) catch |err| {
-                    std.log.err("[DistributedEventBus] Failed to spawn thread: {}", .{err});
-                    conn.close(self.io);
-                    continue;
-                };
-                thread.detach();
+                // Handle connection asynchronously in the shared group.
+                self.fiber_group.async(self.io, handleConnection, .{ self, conn });
             }
         }
     }

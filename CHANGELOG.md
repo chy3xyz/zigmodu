@@ -193,7 +193,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Technical Details
 - **Zig Version:** 0.16.0
-- **Dependencies:** zio 0.9.0+
 - **Memory Management:** Explicit allocator pattern
 - **Error Handling:** Zig error union types
 - **Testing:** Built-in test runner

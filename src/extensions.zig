@@ -45,8 +45,8 @@ pub const CronScheduler = @import("scheduler/Cron.zig").Scheduler;
 pub const CronExpression = @import("scheduler/Cron.zig").Expression;
 
 // Fx
-pub const FxParallel = @import("experimental/Fx.zig").Parallel;
-pub const FxStream = @import("experimental/Fx.zig").Stream;
+pub const FxParallel = @import("core/Fx.zig").Parallel;
+pub const FxStream = @import("core/Fx.zig").Stream;
 
 // Load Shedding
 pub const AdaptiveShedder = @import("resilience/LoadShedder.zig").AdaptiveShedder;
@@ -58,11 +58,9 @@ pub const OrmTx = @import("persistence/Orm.zig").Tx;
 pub const SqlxBackend = @import("persistence/backends/SqlxBackend.zig").SqlxBackend;
 
 // GoZero Validation
-
-// GoZero Validation
-pub const GzValidationResult = @import("experimental/GoZeroValidator.zig").Result;
-pub const GzFieldRules = @import("experimental/GoZeroValidator.zig").FieldRules;
-pub const gzValidateStruct = @import("experimental/GoZeroValidator.zig").validateStruct;
+pub const GzValidationResult = @import("validation/Validator.zig").Result;
+pub const GzFieldRules = @import("validation/Validator.zig").FieldRules;
+pub const gzValidateStruct = @import("validation/Validator.zig").validateStruct;
 
 // HTTP Server
 pub const HttpServer = @import("api/Server.zig").Server;

@@ -103,8 +103,8 @@ test "compile all source files" {
     _ = @import("tracing/DistributedTracer.zig");
 
     // Validation
+    _ = @import("validation/ObjectValidator.zig");
     _ = @import("validation/Validator.zig");
-    _ = @import("experimental/GoZeroValidator.zig");
 
     // Cache
     _ = @import("cache/CacheManager.zig");
@@ -125,5 +125,5 @@ test "compile all source files" {
     _ = @import("pool/Pool.zig");
 
     // Core extensions
-    _ = @import("experimental/Fx.zig");
+    _ = @import("core/Fx.zig");
 }

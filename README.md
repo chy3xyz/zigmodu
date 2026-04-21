@@ -10,8 +10,8 @@ A modular application framework for Zig 0.16.0, inspired by Spring Modulith. Bui
 
 | Guide | Description |
 |-------|-------------|
-| [Quick Start](QUICK-START.md) | Get started in 5 minutes |
-| [Best Practices](BEST_PRACTICES.md) | Architecture evolution from 1K to 1M+ DAU |
+| [Quick Start](docs/QUICK-START.md) | Get started in 5 minutes |
+| [Best Practices](docs/BEST_PRACTICES.md) | Architecture evolution from 1K to 1M+ DAU |
 | [API Reference](docs/API.md) | Detailed API documentation |
 | [Architecture](docs/ARCHITECTURE.md) | System design and patterns |
 | [Examples](examples/) | Runnable example projects |
@@ -35,6 +35,7 @@ A modular application framework for Zig 0.16.0, inspired by Spring Modulith. Bui
 - **Retry Policy** - Exponential backoff
 
 ### Transport & API
+- **HTTP Server** - Async fiber-based server with routing and middleware
 - **GraphQL Gateway** - Query language for APIs
 - **gRPC Transport** - High-performance RPC
 - **MQTT Transport** - IoT message queue
@@ -113,6 +114,32 @@ pub fn main(init: std.process.Init) !void {
 ```bash
 zig build run
 ```
+
+### Quick HTTP Server Example
+
+```zig
+const Server = zigmodu.http_server.Server;
+const Context = zigmodu.http_server.Context;
+
+pub fn main(init: std.process.Init) !void {
+    var server = Server.init(init.io, init.gpa, 8080);
+    defer server.deinit();
+
+    try server.addRoute(.{
+        .method = .GET,
+        .path = "/health",
+        .handler = struct {
+            fn handle(ctx: *Context) anyerror!void {
+                try ctx.json(200, "{\"status\":\"ok\"}");
+            }
+        }.handle,
+    });
+
+    try server.start();
+}
+```
+
+See [HTTP Server Docs](docs/API.md#http-server) for full API reference.
 
 ## 📖 Architecture
 

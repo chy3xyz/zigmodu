@@ -1,210 +1,336 @@
+//! Validation utilities for zigzero
+//!
+//! Provides input validation aligned with go-zero's validate patterns.
+
 const std = @import("std");
+const errors = @import("../sqlx/errors.zig");
 
-/// 数据验证器 - DTO 和参数验证
-pub const Validator = struct {
-    const Self = @This();
+/// Validation result
+pub const Result = struct {
+    valid: bool,
+    message: ?[]const u8,
 
-    allocator: std.mem.Allocator,
-    errors: std.ArrayList(ValidationError),
-
-    pub const ValidationError = struct {
-        field: []const u8,
-        message: []const u8,
-        code: []const u8,
-    };
-
-    pub const ValidationResult = struct {
-        valid: bool,
-        errors: []ValidationError,
-
-        pub fn isValid(self: ValidationResult) bool {
-            return self.valid;
-        }
-    };
-
-    pub fn init(allocator: std.mem.Allocator) Self {
-        return .{
-            .allocator = allocator,
-            .errors = std.ArrayList(ValidationError).empty,
-        };
+    pub fn ok() Result {
+        return .{ .valid = true, .message = null };
     }
 
-    pub fn deinit(self: *Self) void {
-        for (self.errors.items) |err| {
-            self.allocator.free(err.field);
-            self.allocator.free(err.message);
-            self.allocator.free(err.code);
-        }
-        self.errors.deinit(self.allocator);
-    }
-
-    /// 验证必填字段
-    pub fn required(self: *Self, field_name: []const u8, value: ?[]const u8) !void {
-        if (value == null or value.?.len == 0) {
-            try self.addError(field_name, "Field is required", "REQUIRED");
-        }
-    }
-
-    /// 验证字符串最小长度
-    pub fn minLength(self: *Self, field_name: []const u8, value: []const u8, min: usize) !void {
-        if (value.len < min) {
-            const msg = try std.fmt.allocPrint(self.allocator, "Minimum length is {d}, got {d}", .{ min, value.len });
-            defer self.allocator.free(msg);
-            try self.addError(field_name, msg, "MIN_LENGTH");
-        }
-    }
-
-    /// 验证字符串最大长度
-    pub fn maxLength(self: *Self, field_name: []const u8, value: []const u8, max: usize) !void {
-        if (value.len > max) {
-            const msg = try std.fmt.allocPrint(self.allocator, "Maximum length is {d}, got {d}", .{ max, value.len });
-            defer self.allocator.free(msg);
-            try self.addError(field_name, msg, "MAX_LENGTH");
-        }
-    }
-
-    /// 验证数值范围
-    pub fn range(self: *Self, field_name: []const u8, value: i64, min: i64, max: i64) !void {
-        if (value < min or value > max) {
-            const msg = try std.fmt.allocPrint(self.allocator, "Value must be between {d} and {d}", .{ min, max });
-            defer self.allocator.free(msg);
-            try self.addError(field_name, msg, "RANGE");
-        }
-    }
-
-    /// 验证邮箱格式
-    pub fn email(self: *Self, field_name: []const u8, value: []const u8) !void {
-        if (value.len == 0) return;
-
-        // 简单邮箱验证
-        var has_at = false;
-        var has_dot = false;
-        for (value) |c| {
-            if (c == '@') has_at = true;
-            if (c == '.' and has_at) has_dot = true;
-        }
-
-        if (!has_at or !has_dot) {
-            try self.addError(field_name, "Invalid email format", "EMAIL");
-        }
-    }
-
-    /// 验证正则表达式
-    pub fn pattern(self: *Self, field_name: []const u8, value: []const u8, regex_pattern: []const u8) !void {
-        // 简化实现：检查是否包含数字
-        const requires_digit = std.mem.eql(u8, regex_pattern, ".*\\d.*");
-        if (requires_digit) {
-            var has_digit = false;
-            for (value) |c| {
-                if (std.ascii.isDigit(c)) {
-                    has_digit = true;
-                    break;
-                }
-            }
-            if (!has_digit) {
-                const err_msg = try std.fmt.allocPrint(self.allocator, "Field '{s}' must contain at least one digit", .{field_name});
-                defer self.allocator.free(err_msg);
-                try self.addError(field_name, "Must contain at least one digit", "PATTERN");
-            }
-        }
-    }
-
-    /// 验证枚举值
-    pub fn enumValue(self: *Self, field_name: []const u8, value: []const u8, allowed_values: []const []const u8) !void {
-        for (allowed_values) |allowed| {
-            if (std.mem.eql(u8, value, allowed)) return;
-        }
-        try self.addError(field_name, "Invalid enum value", "ENUM");
-    }
-
-    /// 验证数组非空
-    pub fn notEmpty(self: *Self, field_name: []const u8, value: []const u8) !void {
-        if (value.len == 0) {
-            try self.addError(field_name, "Array must not be empty", "NOT_EMPTY");
-        }
-    }
-
-    /// 添加错误
-    fn addError(self: *Self, field: []const u8, message: []const u8, code: []const u8) !void {
-        const field_copy = try self.allocator.dupe(u8, field);
-        const msg_copy = try self.allocator.dupe(u8, message);
-        const code_copy = try self.allocator.dupe(u8, code);
-
-        try self.errors.append(self.allocator, .{
-            .field = field_copy,
-            .message = msg_copy,
-            .code = code_copy,
-        });
-    }
-
-    /// 获取验证结果
-    pub fn validate(self: *Self) ValidationResult {
-        return .{
-            .valid = self.errors.items.len == 0,
-            .errors = self.errors.items,
-        };
-    }
-
-    /// 批量验证对象
-    pub fn validateObject(self: *Self, comptime T: type, obj: T) !ValidationResult {
-        inline for (@typeInfo(T).@"struct".fields) |field| {
-            const field_name = field.name;
-            const field_value = @field(obj, field_name);
-
-            // 根据类型自动验证
-            switch (@typeInfo(field.type)) {
-                .Optional => {
-                    if (field_value == null) {
-                        try self.required(field_name, null);
-                    }
-                },
-                .Pointer => |ptr| {
-                    if (ptr.size == .Slice and ptr.child == u8) {
-                        // 字符串字段
-                        try self.required(field_name, field_value);
-                        try self.minLength(field_name, field_value, 1);
-                        try self.maxLength(field_name, field_value, 255);
-                    }
-                },
-                .Int => {
-                    try self.range(field_name, field_value, 0, std.math.maxInt(i64));
-                },
-                else => {},
-            }
-        }
-
-        return self.validate();
+    pub fn fail(msg: []const u8) Result {
+        return .{ .valid = false, .message = msg };
     }
 };
 
-
-// 示例 DTO
-test "Validator - basic validation" {
-    const allocator = std.testing.allocator;
-    var validator = Validator.init(allocator);
-    defer validator.deinit();
-
-    try validator.required("username", "john");
-    try validator.minLength("password", "secret123", 6);
-    try validator.maxLength("email", "john@example.com", 100);
-    try validator.email("email", "john@example.com");
-
-    const result = validator.validate();
-
-    try std.testing.expect(result.isValid());
+/// Validate that string is not empty
+pub fn notEmpty(value: []const u8) Result {
+    if (value.len == 0) return Result.fail("value cannot be empty");
+    return Result.ok();
 }
 
-test "Validator - validation errors" {
+/// Validate minimum length
+pub fn minLength(value: []const u8, min: usize) Result {
+    if (value.len < min) return Result.fail("value too short");
+    return Result.ok();
+}
+
+/// Validate maximum length
+pub fn maxLength(value: []const u8, max: usize) Result {
+    if (value.len > max) return Result.fail("value too long");
+    return Result.ok();
+}
+
+/// Validate email format (simplified)
+pub fn email(value: []const u8) Result {
+    if (value.len == 0) return Result.fail("email cannot be empty");
+    if (std.mem.indexOf(u8, value, "@") == null) return Result.fail("invalid email format");
+    if (std.mem.indexOf(u8, value, ".") == null) return Result.fail("invalid email format");
+    return Result.ok();
+}
+
+/// Validate phone number (simplified - digits only, 7-15 chars)
+pub fn phone(value: []const u8) Result {
+    if (value.len < 7 or value.len > 15) return Result.fail("invalid phone length");
+    for (value) |c| {
+        if (!std.ascii.isDigit(c) and c != '+' and c != '-') return Result.fail("invalid phone format");
+    }
+    return Result.ok();
+}
+
+/// Validate range for integers
+pub fn range(comptime T: type, value: T, min: T, max: T) Result {
+    if (value < min or value > max) return Result.fail("value out of range");
+    return Result.ok();
+}
+
+/// Validate that value is in allowed set
+pub fn oneOf(value: []const u8, choices: []const []const u8) Result {
+    for (choices) |choice| {
+        if (std.mem.eql(u8, value, choice)) return Result.ok();
+    }
+    return Result.fail("value not in allowed choices");
+}
+
+/// Validate UUID format
+pub fn uuid(value: []const u8) Result {
+    if (value.len != 36) return Result.fail("invalid UUID length");
+    // Simplified check
+    for (value, 0..) |c, i| {
+        if (i == 8 or i == 13 or i == 18 or i == 23) {
+            if (c != '-') return Result.fail("invalid UUID format");
+        } else {
+            if (!std.ascii.isHex(c)) return Result.fail("invalid UUID format");
+        }
+    }
+    return Result.ok();
+}
+
+/// Validate URL format (simplified)
+pub fn url(value: []const u8) Result {
+    if (value.len == 0) return Result.fail("url cannot be empty");
+    if (!std.mem.startsWith(u8, value, "http://") and !std.mem.startsWith(u8, value, "https://")) {
+        return Result.fail("url must start with http:// or https://");
+    }
+    return Result.ok();
+}
+
+/// Field validation rules for comptime struct validation.
+/// Only fields relevant to the value type are enforced.
+pub const FieldRules = struct {
+    required: bool = false,
+    min_len: ?usize = null,
+    max_len: ?usize = null,
+    min: ?i64 = null,
+    max: ?i64 = null,
+    email: bool = false,
+    uuid: bool = false,
+    phone: bool = false,
+    url: bool = false,
+    one_of: ?[]const u8 = null,
+};
+
+/// Validate a struct value against comptime rules.
+/// Returns an allocator-owned error message if validation fails, or null on success.
+/// Caller must free the returned string if non-null.
+pub fn validateStruct(allocator: std.mem.Allocator, value: anytype, comptime rules: anytype) !?[]const u8 {
+    const T = @TypeOf(value);
+    const t_info = @typeInfo(T);
+    if (t_info != .@"struct") @compileError("value must be a struct");
+
+    const RulesType = @TypeOf(rules);
+    const r_info = @typeInfo(RulesType);
+    if (r_info != .@"struct") @compileError("rules must be a struct literal");
+
+    inline for (r_info.@"struct".fields) |r_field| {
+        const field_name = r_field.name;
+        if (!@hasField(T, field_name)) {
+            @compileError("validation rules contain unknown field: " ++ field_name);
+        }
+
+        const field_value = @field(value, field_name);
+        const field_rules = @field(rules, field_name);
+
+        // required check
+        if (field_rules.required) {
+            const valid = isRequiredValid(@TypeOf(field_value), field_value);
+            if (!valid) {
+                return try std.fmt.allocPrint(allocator, "field '{s}' is required", .{field_name});
+            }
+        }
+
+        // string length checks
+        const is_string = isStringSlice(@TypeOf(field_value));
+        if (is_string) {
+            if (field_rules.min_len) |min| {
+                if (field_value.len < min) {
+                    return try std.fmt.allocPrint(allocator, "field '{s}' must be at least {d} characters", .{ field_name, min });
+                }
+            }
+            if (field_rules.max_len) |max| {
+                if (field_value.len > max) {
+                    return try std.fmt.allocPrint(allocator, "field '{s}' must be at most {d} characters", .{ field_name, max });
+                }
+            }
+        }
+
+        // numeric range checks
+        const is_int = isInteger(@TypeOf(field_value));
+        const is_float = isFloat(@TypeOf(field_value));
+        if (is_int or is_float) {
+            if (field_rules.min) |min| {
+                const fv = asF64(field_value);
+                if (fv < @as(f64, @floatFromInt(min))) {
+                    return try std.fmt.allocPrint(allocator, "field '{s}' must be at least {d}", .{ field_name, min });
+                }
+            }
+            if (field_rules.max) |max| {
+                const fv = asF64(field_value);
+                if (fv > @as(f64, @floatFromInt(max))) {
+                    return try std.fmt.allocPrint(allocator, "field '{s}' must be at most {d}", .{ field_name, max });
+                }
+            }
+        }
+
+        // string format validators
+        if (is_string) {
+            if (field_rules.email) {
+                const r = email(field_value);
+                if (!r.valid) {
+                    return try std.fmt.allocPrint(allocator, "field '{s}' {s}", .{ field_name, r.message.? });
+                }
+            }
+            if (field_rules.uuid) {
+                const r = uuid(field_value);
+                if (!r.valid) {
+                    return try std.fmt.allocPrint(allocator, "field '{s}' {s}", .{ field_name, r.message.? });
+                }
+            }
+            if (field_rules.phone) {
+                const r = phone(field_value);
+                if (!r.valid) {
+                    return try std.fmt.allocPrint(allocator, "field '{s}' {s}", .{ field_name, r.message.? });
+                }
+            }
+            if (field_rules.url) {
+                const r = url(field_value);
+                if (!r.valid) {
+                    return try std.fmt.allocPrint(allocator, "field '{s}' {s}", .{ field_name, r.message.? });
+                }
+            }
+            if (field_rules.one_of) |choices_str| {
+                var it = std.mem.splitScalar(u8, choices_str, ',');
+                var found = false;
+                while (it.next()) |choice| {
+                    if (std.mem.eql(u8, field_value, choice)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    return try std.fmt.allocPrint(allocator, "field '{s}' must be one of: {s}", .{ field_name, choices_str });
+                }
+            }
+        }
+    }
+
+    return null;
+}
+
+fn isRequiredValid(comptime T: type, value: T) bool {
+    const info = @typeInfo(T);
+    if (info == .optional) {
+        return value != null;
+    }
+    if (isStringSlice(T)) {
+        return value.len > 0;
+    }
+    return true;
+}
+
+fn isStringSlice(comptime T: type) bool {
+    const info = @typeInfo(T);
+    if (info == .pointer and info.pointer.size == .slice and info.pointer.child == u8) {
+        return true;
+    }
+    if (info == .optional) {
+        const child = info.optional.child;
+        const child_info = @typeInfo(child);
+        if (child_info == .pointer and child_info.pointer.size == .slice and child_info.pointer.child == u8) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn isInteger(comptime T: type) bool {
+    const info = @typeInfo(T);
+    return info == .int or info == .comptime_int;
+}
+
+fn isFloat(comptime T: type) bool {
+    const info = @typeInfo(T);
+    return info == .float or info == .comptime_float;
+}
+
+fn asF64(value: anytype) f64 {
+    const T = @TypeOf(value);
+    return switch (@typeInfo(T)) {
+        .int, .comptime_int => @floatFromInt(value),
+        .float, .comptime_float => @floatCast(value),
+        else => 0,
+    };
+}
+
+/// Validator that combines multiple checks
+pub const Validator = struct {
+    checks: []const Result,
+
+    pub fn validate(results: []const Result) errors.Result {
+        for (results) |result| {
+            if (!result.valid) return error.ValidationFailed;
+        }
+        return;
+    }
+};
+
+test "validation" {
+    try std.testing.expect(notEmpty("hello").valid);
+    try std.testing.expect(!notEmpty("").valid);
+
+    try std.testing.expect(email("test@example.com").valid);
+    try std.testing.expect(!email("invalid").valid);
+
+    try std.testing.expect(range(u32, 5, 1, 10).valid);
+    try std.testing.expect(!range(u32, 15, 1, 10).valid);
+
+    try std.testing.expect(uuid("550e8400-e29b-41d4-a716-446655440000").valid);
+    try std.testing.expect(!uuid("not-a-uuid").valid);
+}
+
+test "validateStruct" {
     const allocator = std.testing.allocator;
-    var validator = Validator.init(allocator);
-    defer validator.deinit();
 
-    try validator.required("username", null);
-    try validator.minLength("password", "123", 6);
-    try validator.email("email", "invalid-email");
+    const User = struct {
+        name: []const u8,
+        email: []const u8,
+        age: u32,
+        role: []const u8,
+    };
 
-    const result = validator.validate();
+    const valid_user = User{
+        .name = "Alice",
+        .email = "alice@example.com",
+        .age = 30,
+        .role = "admin",
+    };
 
-    try std.testing.expect(!result.isValid());
-    try std.testing.expectEqual(@as(usize, 3), result.errors.len);
+    const rules = .{
+        .name = FieldRules{ .required = true, .min_len = 2, .max_len = 20 },
+        .email = FieldRules{ .required = true, .email = true },
+        .age = FieldRules{ .min = 0, .max = 150 },
+        .role = FieldRules{ .one_of = "admin,user,guest" },
+    };
+
+    const err1 = try validateStruct(allocator, valid_user, rules);
+    try std.testing.expect(err1 == null);
+    if (err1) |e| allocator.free(e);
+
+    const invalid_user = User{
+        .name = "A",
+        .email = "not-an-email",
+        .age = 200,
+        .role = "superuser",
+    };
+
+    const err2 = try validateStruct(allocator, invalid_user, rules);
+    try std.testing.expect(err2 != null);
+    if (err2) |e| allocator.free(e);
+
+    const empty_name_user = User{
+        .name = "",
+        .email = "test@example.com",
+        .age = 25,
+        .role = "user",
+    };
+
+    const err3 = try validateStruct(allocator, empty_name_user, rules);
+    try std.testing.expect(err3 != null);
+    if (err3) |e| allocator.free(e);
 }

@@ -12,8 +12,8 @@
 
 | 指南 | 描述 |
 |------|------|
-| [快速开始](QUICK-START.md) | 5分钟入门 |
-| [最佳实践](BEST_PRACTICES.md) | 从1K到1M+日活的架构演进 |
+| [快速开始](docs/QUICK-START.md) | 5分钟入门 |
+| [最佳实践](docs/BEST_PRACTICES.md) | 从1K到1M+日活的架构演进 |
 | [API参考](docs/API.md) | 完整API文档 |
 | [架构设计](docs/ARCHITECTURE.md) | 系统设计与模式 |
 | [示例项目](examples/) | 可运行的示例 |
