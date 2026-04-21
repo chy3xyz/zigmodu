@@ -336,9 +336,8 @@ const StreamReader = struct {
 
     fn readByte(self: *StreamReader) !?u8 {
         if (self.pos >= self.end) {
-            // Use Reader interface directly - readVec reads into iovecs
-            var iovec: [1][]u8 = .{self.buf[0..]};
-            const n = self.stream.reader(self.io, &self.buf).readVec(&iovec) catch {
+            // Use Reader interface directly
+            var sr = self.stream.reader(self.io, &self.buf); const n = sr.interface.readSliceShort(self.buf[0..]) catch {
                 return null; // Connection closed or error
             };
             if (n == 0) return null;
@@ -375,8 +374,7 @@ const StreamReader = struct {
                 continue;
             }
             // Use Reader interface directly
-            var iovec: [1][]u8 = .{out[total..]};
-            const n = self.stream.reader(self.io, &self.buf).readVec(&iovec) catch {
+            var sr = self.stream.reader(self.io, &self.buf); const n = sr.interface.readSliceShort(self.buf[0..]) catch {
                 break; // Connection closed or error
             };
             if (n == 0) break;
@@ -686,24 +684,52 @@ fn getStatusText(status: u16) []const u8 {
 /// HTTP response writer
 const ResponseWriter = struct {
     pub fn write(io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net.Stream, status: u16, headers: *const std.StringHashMap([]const u8), body: []const u8) !void {
-        var buf = std.array_list.Managed(u8).init(allocator);
-        defer buf.deinit();
-        const w = buf.writer();
-
         const status_text = getStatusText(status);
-        try w.print("HTTP/1.1 {d} {s}\r\n", .{ status, status_text });
-
+        
+        // Build headers string
+        var header_parts = std.ArrayList([]const u8).empty;
+        defer header_parts.deinit(allocator);
+        
+        try header_parts.append(allocator, "HTTP/1.1 ");
+        try header_parts.append(allocator, status_text);
+        try header_parts.append(allocator, "\r\n");
+        
+        // Write headers
         var iter = headers.iterator();
         while (iter.next()) |entry| {
-            try w.print("{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+            try header_parts.append(allocator, entry.key_ptr.*);
+            try header_parts.append(allocator, ": ");
+            try header_parts.append(allocator, entry.value_ptr.*);
+            try header_parts.append(allocator, "\r\n");
         }
-
-        try w.print("Content-Length: {d}\r\n", .{body.len});
-        try w.writeAll("\r\n");
-        try w.writeAll("\r\n");
-        try w.writeAll(body);
-
-        _ = try stream.write(io, buf.items);
+        
+        // Write content length and blank line
+        try header_parts.append(allocator, "Content-Length: ");
+        const len_str = try std.fmt.allocPrint(allocator, "{d}", .{body.len});
+        defer allocator.free(len_str);
+        try header_parts.append(allocator, len_str);
+        try header_parts.append(allocator, "\r\n\r\n");
+        
+        // Calculate total header length
+        var header_len: usize = 0;
+        for (header_parts.items) |part| {
+            header_len += part.len;
+        }
+        
+        // Combine header and body
+        const response = try allocator.alloc(u8, header_len + body.len);
+        defer allocator.free(response);
+        
+        var offset: usize = 0;
+        for (header_parts.items) |part| {
+            @memcpy(response[offset..][0..part.len], part);
+            offset += part.len;
+        }
+        @memcpy(response[offset..], body);
+        
+        var write_buf: [4096]u8 = undefined;
+        var w = stream.writer(io, &write_buf);
+        try w.interface.writeAll(response);
     }
 };
 
@@ -770,7 +796,7 @@ const ThreadPool = struct {
             self.mutex.lock(self.io) catch break;
 
             while (self.queue.items.len == 0) {
-                self.cond.wait(&self.mutex, self.io) catch break;
+                self.cond.wait(self.io, &self.mutex) catch break;
                 if (self.shutdown.load(.acquire)) {
                     self.mutex.unlock(self.io);
                     return;
@@ -1022,7 +1048,9 @@ pub const Server = struct {
             const status: u16 = if (err == error.BodyTooLarge) 413 else 400;
             const msg = if (err == error.BodyTooLarge) "Payload Too Large" else "Bad Request";
             const response = std.fmt.allocPrint(arena_alloc, "HTTP/1.1 {d} {s}\r\n\r\n", .{ status, msg }) catch return;
-            _ = conn.write(self.io, response) catch {};
+            var write_buf: [1024]u8 = undefined;
+            var w = conn.writer(self.io, &write_buf);
+            w.interface.writeAll(response) catch {};
             return;
         };
         defer request.deinit(arena_alloc);
@@ -1035,7 +1063,7 @@ pub const Server = struct {
             return;
         };
         defer ctx.deinit();
-        ctx.stream = conn;
+        ctx.stream = conn.*;
 
         // Copy query params
         var query_iter = request.query.iterator();
@@ -1097,7 +1125,7 @@ pub const Server = struct {
         }
 
         // Send response
-        ResponseWriter.write(self.io, arena_alloc, conn, ctx.status_code, &ctx.response_headers, ctx.response_body.items) catch {};
+        ResponseWriter.write(self.io, arena_alloc, conn.*, ctx.status_code, &ctx.response_headers, ctx.response_body.items) catch {};
     }
 
     fn executeWithMiddleware(self: *Server, ctx: *Context, final_handler: HandlerFn, route_middleware: []const Middleware) !void {

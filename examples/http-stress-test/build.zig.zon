@@ -1,0 +1,1 @@
+.{ .name = .http_stress_test, .version = "0.1.0", .fingerprint = 0xe0637bbad7dbdf59, .minimum_zig_version = "0.16.0", .dependencies = .{ .zigmodu = .{ .path = "../.." } }, .paths = .{ "build.zig", "build.zig.zon", "src" } }
