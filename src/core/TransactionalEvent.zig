@@ -1,4 +1,5 @@
 const std = @import("std");
+const Time = @import("Time.zig");
 const EventPublisher = @import("EventPublisher.zig");
 
 /// Transactional event support
@@ -149,7 +150,7 @@ pub const EventOutbox = struct {
             .id = id,
             .event_data = data,
             .event_type = type_copy,
-            .timestamp = 0,
+            .timestamp = Time.monotonicNowSeconds(),
         });
 
         return id;

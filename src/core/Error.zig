@@ -1,4 +1,5 @@
 const std = @import("std");
+const Time = @import("Time.zig");
 
 /// ZigModu 统一错误类型
 pub const ZigModuError = error{
@@ -67,6 +68,7 @@ pub const ZigModuError = error{
     // 验证错误
     ValidationFailed,
     InvalidInput,
+    InvalidModuleName,
     MissingRequiredField,
     InvalidFormat,
 
@@ -105,7 +107,7 @@ pub const ErrorContext = struct {
             .error_code = error_code,
             .message = message,
             .source = null,
-            .timestamp = 0,
+            .timestamp = Time.monotonicNowSeconds(),
             .stack_trace = null,
         };
     }
@@ -161,7 +163,10 @@ pub fn Result(T: type) type {
         err: ErrorContext,
 
         pub fn isOk(self: @This()) bool {
-            return @as(@typeInfo(@This()).Union.tag_type.?, self) == .ok;
+            return switch (self) {
+                .ok => true,
+                .err => false,
+            };
         }
 
         pub fn isErr(self: @This()) bool {
@@ -209,43 +214,41 @@ pub const HttpCode = enum(i32) {
 /// Map ZigModuError to HttpCode
 pub fn toHttpCode(err: ZigModuError) HttpCode {
     return switch (err) {
-        .ModuleNotFound,
-        .DependencyNotFound,
-        .CacheKeyNotFound,
-        .NotFound,
-        .ServiceNotFound,
-        .EventHandlerNotFound,
-        .ConfigFileNotFound => .NotFound,
+        error.ModuleNotFound,
+        error.DependencyNotFound,
+        error.CacheKeyNotFound,
+        error.NotFound,
+        error.ServiceNotFound,
+        error.EventHandlerNotFound,
+        error.ConfigFileNotFound => .NotFound,
 
-        .AuthenticationFailed,
-        .InvalidToken,
-        .TokenExpired,
-        .InvalidCredentials => .Unauthorized,
+        error.AuthenticationFailed,
+        error.InvalidToken,
+        error.TokenExpired,
+        error.InvalidCredentials => .Unauthorized,
 
-        .AuthorizationFailed,
-        .Forbidden => .Forbidden,
+        error.AuthorizationFailed => .Forbidden,
 
-        .RateLimitExceeded => .RateLimit,
+        error.RateLimitExceeded => .RateLimit,
 
-        .CircuitBreakerOpen,
-        .ServiceUnavailable,
-        .ServiceOverloaded,
-        .ConnectionPoolExhausted => .ServiceUnavailable,
+        error.CircuitBreakerOpen,
+        error.ServiceUnavailable,
+        error.ServiceOverloaded,
+        error.ConnectionPoolExhausted => .ServiceUnavailable,
 
-        .ConnectionTimeout,
-        .Timeout => .RequestTimeout,
+        error.ConnectionTimeout,
+        error.Timeout => .RequestTimeout,
 
+        error.InvalidInput,
+        error.MissingRequiredField,
+        error.InvalidFormat,
+        error.ValidationFailed,
+        error.ConfigurationError,
+        error.ConfigParseError,
+        error.ConfigValidationFailed => .BadRequest,
 
-        .InvalidInput,
-        .MissingRequiredField,
-        .InvalidFormat,
-        .ValidationFailed,
-        .ConfigurationError,
-        .ConfigParseError,
-        .ConfigValidationFailed => .BadRequest,
-
-        .HttpError,
-        .ServerError => .ServerError,
+        error.HttpError,
+        error.ServerError => .ServerError,
 
         else => .ServerError,
     };
@@ -276,3 +279,75 @@ pub fn fromError(allocator: std.mem.Allocator, err: ZigModuError, message: []con
     return toJson(allocator, resp);
 }
 
+test "ErrorContext has real timestamp" {
+    const ctx = ErrorContext.init(error.ModuleNotFound, "test");
+    try std.testing.expect(ctx.timestamp > 0);
+    try std.testing.expectEqual(ZigModuError.ModuleNotFound, ctx.error_code);
+    try std.testing.expectEqualStrings("test", ctx.message);
+}
+
+test "ErrorHandler register and dispatch" {
+    const allocator = std.testing.allocator;
+    var handler = ErrorHandler.init(allocator);
+    defer handler.deinit();
+
+    const Ctx = struct {
+        var handled: bool = false;
+        fn onModuleNotFound(_: ErrorContext) void {
+            handled = true;
+        }
+    };
+
+    try handler.register(error.ModuleNotFound, Ctx.onModuleNotFound);
+    Ctx.handled = false;
+    handler.handle(ErrorContext.init(error.ModuleNotFound, "missing module"));
+    try std.testing.expect(Ctx.handled);
+}
+
+test "Result type ok and err" {
+    const R = Result(i32);
+
+    const ok_result = R{ .ok = 42 };
+    try std.testing.expect(ok_result.isOk());
+    try std.testing.expect(!ok_result.isErr());
+    try std.testing.expectEqual(@as(i32, 42), ok_result.unwrap());
+
+    const err_result = R{ .err = ErrorContext.init(error.ValidationFailed, "bad input") };
+    try std.testing.expect(err_result.isErr());
+    try std.testing.expect(!err_result.isOk());
+    try std.testing.expectEqual(ZigModuError.ValidationFailed, err_result.unwrapErr().error_code);
+}
+
+test "toHttpCode mapping" {
+    try std.testing.expectEqual(HttpCode.NotFound, toHttpCode(error.ModuleNotFound));
+    try std.testing.expectEqual(HttpCode.Unauthorized, toHttpCode(error.AuthenticationFailed));
+    try std.testing.expectEqual(HttpCode.Forbidden, toHttpCode(error.AuthorizationFailed));
+    try std.testing.expectEqual(HttpCode.RateLimit, toHttpCode(error.RateLimitExceeded));
+    try std.testing.expectEqual(HttpCode.ServiceUnavailable, toHttpCode(error.CircuitBreakerOpen));
+    try std.testing.expectEqual(HttpCode.BadRequest, toHttpCode(error.InvalidInput));
+    try std.testing.expectEqual(HttpCode.RequestTimeout, toHttpCode(error.ConnectionTimeout));
+}
+
+test "toJson serialization" {
+    const allocator = std.testing.allocator;
+
+    const json = try toJson(allocator, .{ .code = 404, .message = "not found" });
+    defer allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "404") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "not found") != null);
+}
+
+test "fromError convenience" {
+    const allocator = std.testing.allocator;
+
+    const json = try fromError(allocator, error.RateLimitExceeded, "too many requests");
+    defer allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "429") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "too many requests") != null);
+}
+
+test "toErrorContext maps known errors" {
+    const ctx = toErrorContext(error.OutOfMemory, "allocation failed");
+    try std.testing.expectEqual(ZigModuError.OutOfMemory, ctx.error_code);
+    try std.testing.expectEqualStrings("allocation failed", ctx.message);
+}

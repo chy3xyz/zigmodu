@@ -1,5 +1,6 @@
 const std = @import("std");
 const crypto = std.crypto;
+const Time = @import("../core/Time.zig");
 
 /// 安全模块 - 提供认证、授权、加密功能
 pub const SecurityModule = struct {
@@ -77,7 +78,7 @@ pub const SecurityModule = struct {
         user_id: []const u8,
         roles: []const []const u8,
     ) ![]const u8 {
-        const now = if (self.io) |io| @as(i64, @intCast(@divTrunc(std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds, std.time.ns_per_s))) else 0;
+        const now = if (self.io) |io| @as(i64, @intCast(@divTrunc(std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds, std.time.ns_per_s))) else Time.monotonicNowSeconds();
         const exp = now + self.token_expiry_seconds;
 
         const header = JwtToken.JwtHeader{};
@@ -139,7 +140,7 @@ pub const SecurityModule = struct {
         defer parsed.deinit();
 
         // Check expiration
-        const now = if (self.io) |io| @as(i64, @intCast(@divTrunc(std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds, std.time.ns_per_s))) else 0;
+        const now = if (self.io) |io| @as(i64, @intCast(@divTrunc(std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds, std.time.ns_per_s))) else Time.monotonicNowSeconds();
         if (now > parsed.value.exp) {
             return error.TokenExpired;
         }

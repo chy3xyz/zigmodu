@@ -1,4 +1,5 @@
 const std = @import("std");
+const Time = @import("../core/Time.zig");
 
 /// 日志级别枚举
 pub const LogLevel = enum(u8) {
@@ -69,7 +70,7 @@ pub const StructuredLogger = struct {
         }
 
         var entry = LogEntry{
-            .timestamp = 0,
+            .timestamp = Time.monotonicNowSeconds(),
             .level = level,
             .message = message,
             .fields = std.StringHashMap([]const u8).init(self.allocator),
@@ -142,15 +143,17 @@ pub const LogRotator = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
+    io: std.Io,
     base_path: []const u8,
     max_size: u64,
     max_files: u32,
     current_size: u64,
-    current_file: ?std.fs.File,
+    current_file: ?std.Io.File,
 
-    pub fn init(allocator: std.mem.Allocator, base_path: []const u8, max_size: u64, max_files: u32) !Self {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, base_path: []const u8, max_size: u64, max_files: u32) !Self {
         return .{
             .allocator = allocator,
+            .io = io,
             .base_path = try allocator.dupe(u8, base_path),
             .max_size = max_size,
             .max_files = max_files,
@@ -161,7 +164,7 @@ pub const LogRotator = struct {
 
     pub fn deinit(self: *Self) void {
         if (self.current_file) |file| {
-            file.close(std.testing.io);
+            file.close(self.io);
         }
         self.allocator.free(self.base_path);
     }
@@ -172,7 +175,7 @@ pub const LogRotator = struct {
         }
 
         if (self.current_file) |file| {
-            try file.writeAll(data);
+            try file.writeStreamingAll(self.io, data);
             self.current_size += data.len;
         }
     }
@@ -180,7 +183,7 @@ pub const LogRotator = struct {
     fn rotate(self: *Self) !void {
         // 关闭当前文件
         if (self.current_file) |file| {
-            file.close(std.testing.io);
+            file.close(self.io);
         }
 
         // 轮转旧文件
@@ -194,16 +197,16 @@ pub const LogRotator = struct {
             const new_name = try std.fmt.allocPrint(self.allocator, "{s}.{d}", .{ self.base_path, i });
             defer self.allocator.free(new_name);
 
-            std.fs.rename(old_name, new_name) catch {};
+            std.Io.Dir.cwd().rename(self.io, old_name, new_name) catch {};
         }
 
         // 重命名当前文件
         const backup_name = try std.fmt.allocPrint(self.allocator, "{s}.0", .{self.base_path});
         defer self.allocator.free(backup_name);
-        std.fs.rename(self.base_path, backup_name) catch {};
+        std.Io.Dir.cwd().rename(self.io, self.base_path, backup_name) catch {};
 
         // 创建新文件
-        self.current_file = try std.Io.Dir.cwd().createFile(self.base_path, .{});
+        self.current_file = try std.Io.Dir.cwd().createFile(self.io, self.base_path, .{});
         self.current_size = 0;
     }
 };

@@ -33,31 +33,38 @@ pub const PrometheusMetrics = struct {
     pub const Gauge = struct {
         name: []const u8,
         help: []const u8,
-        value: f64 = 0.0,
+        /// Thread-safe f64 stored as atomic u64 via bit-cast (same as Java's AtomicDouble).
+        raw_value: std.atomic.Value(u64) = std.atomic.Value(u64).init(@bitCast(@as(f64, 0.0))),
         labels: std.StringHashMap([]const u8),
 
         pub fn set(self: *Gauge, value: f64) void {
-            self.value = value;
+            self.raw_value.store(@bitCast(value), .monotonic);
         }
 
         pub fn inc(self: *Gauge) void {
-            self.value += 1.0;
+            self.add(1.0);
         }
 
         pub fn dec(self: *Gauge) void {
-            self.value -= 1.0;
+            self.sub(1.0);
         }
 
         pub fn add(self: *Gauge, value: f64) void {
-            self.value += value;
+            while (true) {
+                const old_bits = self.raw_value.load(.monotonic);
+                const old_val: f64 = @bitCast(old_bits);
+                const new_val = old_val + value;
+                const new_bits: u64 = @bitCast(new_val);
+                if (self.raw_value.cmpxchgWeak(old_bits, new_bits, .monotonic, .monotonic) == null) break;
+            }
         }
 
         pub fn sub(self: *Gauge, value: f64) void {
-            self.value -= value;
+            self.add(-value);
         }
 
         pub fn get(self: *Gauge) f64 {
-            return self.value;
+            return @bitCast(self.raw_value.load(.monotonic));
         }
     };
 
@@ -255,10 +262,10 @@ const counter = Counter{
         // Gauges
         var gauge_iter = self.gauges.iterator();
         while (gauge_iter.next()) |entry| {
-            const gauge = entry.value_ptr.*;
+            const gauge = entry.value_ptr;
             try buf.print("# HELP {s} {s}\n", .{ gauge.name, gauge.help });
             try buf.print("# TYPE {s} gauge\n", .{gauge.name});
-            try buf.print("{s} {d:.6}\n\n", .{ gauge.name, gauge.value });
+            try buf.print("{s} {d:.6}\n\n", .{ gauge.name, gauge.get() });
         }
 
         // Histograms
@@ -384,4 +391,35 @@ test "ModuleMetricsCollector" {
 
     try std.testing.expectEqual(@as(u64, 1), collector.request_count.get());
     try std.testing.expectEqual(@as(f64, 0.0), collector.active_connections.get());
+}
+
+test "Gauge atomic CAS correctness" {
+    const allocator = std.testing.allocator;
+    var metrics = PrometheusMetrics.init(allocator);
+    defer metrics.deinit();
+
+    const gauge = try metrics.createGauge("test_gauge", "Test atomic gauge");
+
+    // Basic operations
+    gauge.set(100.0);
+    try std.testing.expectEqual(@as(f64, 100.0), gauge.get());
+
+    gauge.add(50.5);
+    try std.testing.expectEqual(@as(f64, 150.5), gauge.get());
+
+    gauge.sub(25.25);
+    try std.testing.expectEqual(@as(f64, 125.25), gauge.get());
+
+    // Inc/Dec use add internally
+    gauge.set(0.0);
+    gauge.inc();
+    gauge.inc();
+    gauge.dec();
+    try std.testing.expectEqual(@as(f64, 1.0), gauge.get());
+
+    // Negative values
+    gauge.set(-10.0);
+    try std.testing.expectEqual(@as(f64, -10.0), gauge.get());
+    gauge.add(15.0);
+    try std.testing.expectEqual(@as(f64, 5.0), gauge.get());
 }

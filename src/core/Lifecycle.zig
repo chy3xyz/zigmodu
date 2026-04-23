@@ -1,11 +1,7 @@
 const std = @import("std");
 const ApplicationModules = @import("./Module.zig").ApplicationModules;
 const ModuleInfo = @import("./Module.zig").ModuleInfo;
-
-const LifecycleError = error{
-    CircularDependency,
-    ModuleInitFailed,
-};
+const ZigModuError = @import("./Error.zig").ZigModuError;
 
 pub fn startAll(modules: *ApplicationModules) !void {
     if (modules.modules.count() == 0) {
@@ -23,7 +19,7 @@ pub fn startAll(modules: *ApplicationModules) !void {
             std.log.debug("Starting module: {s}", .{module_name});
             init(module.ptr) catch |err| {
                 std.log.err("Failed to start module '{s}': {s}", .{ module_name, @errorName(err) });
-                return LifecycleError.ModuleInitFailed;
+                return ZigModuError.ModuleInitializationFailed;
             };
         }
     }
@@ -112,12 +108,10 @@ fn visitModule(
 ) !void {
     if (temp_mark.contains(module_name)) {
         std.log.warn("Circular dependency detected: {s}", .{module_name});
-        return LifecycleError.CircularDependency;
+        return ZigModuError.CircularDependency;
     }
 
-    if (visited.contains(module_name)) {
-        return;
-    }
+    if (visited.contains(module_name)) { return; }
 
     try temp_mark.put(module_name, {});
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const Time = @import("Time.zig");
 
 /// Event Store for event sourcing pattern
 /// Stores all domain events for replay, audit, and CQRS
@@ -67,7 +68,7 @@ pub const EventStore = struct {
         stream.version += 1;
         try stream.events.append(self.allocator, .{
             .sequence = stream.version,
-            .timestamp = 0,
+            .timestamp = Time.monotonicNowSeconds(),
             .event_type = type_copy,
             .event_data = data,
             .metadata = metadata,
@@ -179,7 +180,7 @@ pub const SnapshotStore = struct {
         try self.snapshots.put(id_copy, .{
             .stream_id = id_copy,
             .version = version,
-            .timestamp = 0,
+            .timestamp = Time.monotonicNowSeconds(),
             .data = data_copy,
         });
     }

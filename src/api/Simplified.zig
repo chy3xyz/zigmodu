@@ -2,8 +2,18 @@ const std = @import("std");
 const Event = @import("../core/Event.zig").Event;
 const ArrayList = std.array_list.Managed;
 
+/// ╔═══════════════════════════════════════════════════════════════╗
+/// ║  DEPRECATED API                                                ║
+/// ║───────────────────────────────────────────────────────────────║
+/// ║  This API will be removed in a future version.                 ║
+/// ║  Please use: zigmodu.Application.init(...)                     ║
+/// ╚═══════════════════════════════════════════════════════════════╝
+///
 /// Simplified Module interface using VTable pattern
 /// Provides runtime polymorphism without circular dependencies
+///
+/// DEPRECATED: This API is no longer recommended.
+/// Use the Application API instead for better type safety and features.
 pub const Module = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -47,7 +57,10 @@ pub const Module = struct {
     }
 };
 
+/// DEPRECATED: Use zigmodu.Application instead
 /// Auto-generate Module interface from implementation struct
+///
+/// This API is deprecated and will be removed in a future version.
 pub fn ModuleImpl(comptime T: type) type {
     return struct {
         pub fn interface(ptr: *T) Module {
@@ -94,7 +107,6 @@ pub fn ModuleImpl(comptime T: type) type {
                 }
             };
 
-            // Check which methods exist at compile time
             const has_deps = @hasDecl(T, "dependencies");
             const has_event = @hasDecl(T, "onEvent");
 
@@ -113,7 +125,17 @@ pub fn ModuleImpl(comptime T: type) type {
     };
 }
 
+/// ╔═══════════════════════════════════════════════════════════════╗
+/// ║  DEPRECATED API                                                ║
+/// ║───────────────────────────────────────────────────────────────║
+/// ║  This API will be removed in a future version.                 ║
+/// ║  Please use: zigmodu.Application.init(...)                     ║
+/// ╚═══════════════════════════════════════════════════════════════╝
+///
 /// Simplified Application container
+///
+/// DEPRECATED: This API is no longer recommended.
+/// Use the Application API instead for better type safety and features.
 pub const App = struct {
     const Self = @This();
 
@@ -149,12 +171,10 @@ pub const App = struct {
     pub fn start(self: *Self) !void {
         if (self.state == .started) return;
 
-        // Initialize all modules
         for (self.modules.items) |mod| {
             try mod.init(self);
         }
 
-        // Start all modules
         for (self.modules.items) |mod| {
             try mod.start();
         }
@@ -165,7 +185,6 @@ pub const App = struct {
     pub fn stop(self: *Self) void {
         if (self.state != .started) return;
 
-        // Stop in reverse order
         var i: usize = self.modules.items.len;
         while (i > 0) {
             i -= 1;
@@ -175,14 +194,12 @@ pub const App = struct {
         self.state = .stopped;
     }
 
-    /// Publish an event to all registered modules
     pub fn publish(self: *Self, event: Event) void {
         for (self.modules.items) |mod| {
             mod.onEvent(event);
         }
     }
 
-    /// Get number of registered modules
     pub fn moduleCount(self: *Self) usize {
         return self.modules.items.len;
     }

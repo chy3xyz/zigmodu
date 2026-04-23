@@ -38,6 +38,12 @@ pub fn monotonicNow() i64 {
 }
 
 /// Returns monotonic time in seconds (integer).
+/// Returns monotonic time in milliseconds.
+pub fn monotonicNowMilliseconds() i64 {
+    return @divFloor(monotonicNow(), std.time.ns_per_ms);
+}
+
+/// Returns monotonic time in seconds (integer).
 pub fn monotonicNowSeconds() i64 {
     return @divFloor(monotonicNow(), std.time.ns_per_s);
 }

@@ -159,12 +159,7 @@ pub fn checkModuleBoundary(comptime T: type, comptime opts: anytype) void {
 
 test "ModuleBoundary validation" {
     const ValidModule = struct {
-        pub const info = ModuleInfo{
-            .name = "valid_module",
-            .desc = "A valid module",
-            .deps = &.{},
-            .ptr = undefined,
-        };
+        pub const info = ModuleInfo.init("valid_module", "A valid module", &.{});
 
         pub fn init() !void {}
         pub fn deinit() void {}

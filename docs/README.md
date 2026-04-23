@@ -18,10 +18,10 @@ Comprehensive documentation for the ZigModu modular framework.
 - Dependency validation
 - Event-driven architecture
 
-### Distributed
-- DistributedEventBus - Cross-node communication
-- ClusterMembership - Node discovery
-- PasRaftAdapter - Consensus
+YJ|### Distributed
+BZ|- DistributedEventBus - Cross-node communication
+JY|- ClusterMembership - Node discovery
+QR|- DistributedTransaction - Saga pattern
 
 ### Resilience
 - CircuitBreaker - Prevent cascade failures
@@ -31,14 +31,15 @@ Comprehensive documentation for the ZigModu modular framework.
 - DistributedTracer - OpenTelemetry compatible tracing
 - PrometheusMetrics - Counter, Gauge, Histogram
 
-## 📁 Examples
-
-| Example | Description |
-|---------|-------------|
-| [Basic](../examples/basic/) | Module fundamentals |
-| [Event-Driven](../examples/event-driven/) | Publish-subscribe |
-| [DI](../examples/dependency-injection/) | Dependency injection |
-| [Testing](../examples/testing/) | Test utilities |
+XY|## 📁 Examples
+TX|
+MY|| Example | Description |
+ZT||---------|-------------|
+RK|| [Basic](../examples/basic/) | Module fundamentals |
+XX|| [Event-Driven](../examples/event-driven/) | Publish-subscribe |
+WT|| [Testing](../examples/testing/) | Test utilities |
+JP|| [HTTP Stress Test](../examples/http-stress-test/) | Concurrent connections |
+NW|| [Metaverse Creative](../examples/metaverse-creative/) | Creative demo |
 
 ## 🌍 Translations
 

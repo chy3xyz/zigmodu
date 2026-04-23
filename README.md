@@ -27,8 +27,6 @@ A modular application framework for Zig 0.16.0, inspired by Spring Modulith. Bui
 ### Distributed Capabilities
 - **DistributedEventBus** - Cross-node event communication
 - **ClusterMembership** - Node discovery and health checking
-- **PasRaft Consensus** - Leader election and log replication
-
 ### Resilience Patterns
 - **Circuit Breaker** - Prevent cascade failures
 - **Rate Limiter** - Token bucket throttling
@@ -36,10 +34,6 @@ A modular application framework for Zig 0.16.0, inspired by Spring Modulith. Bui
 
 ### Transport & API
 - **HTTP Server** - Async fiber-based server with routing and middleware
-- **GraphQL Gateway** - Query language for APIs
-- **gRPC Transport** - High-performance RPC
-- **MQTT Transport** - IoT message queue
-
 ### Observability
 - **Distributed Tracing** - OpenTelemetry compatible
 - **Prometheus Metrics** - Counter, Gauge, Histogram
@@ -204,9 +198,8 @@ ZigModu grows with your application:
 | 1 | 0-1K | Monolith | Module + Lifecycle |
 | 2 | 1K-10K | Vertical Scale | Cache + Async |
 | 3 | 10K-100K | Multi-Instance | DistributedEventBus + Cluster |
-| 4 | 100K-1M | Service Mesh | CircuitBreaker + Tracing + gRPC |
-| 5 | 1M+ | Global Scale | PasRaft + Hot Reload + Plugins |
-
+| 4 | 100K-1M | Service Mesh | CircuitBreaker + Tracing |
+| 5 | 1M+ | Global Scale | Hot Reload + Plugins |
 See [Best Practices](BEST_PRACTICES.md) for detailed evolution guide.
 
 ## 🛠️ Commands
@@ -228,15 +221,15 @@ zig build docs
 zig fmt
 ```
 
-## 📦 Examples
-
-| Example | Description | Run |
-|---------|-------------|-----|
-| [Basic](examples/basic/) | Module fundamentals | `cd examples/basic && zig build run` |
-| [Event-Driven](examples/event-driven/) | Publish-subscribe | `cd examples/event-driven && zig build run` |
-| [DI](examples/dependency-injection/) | Service container | `cd examples/dependency-injection && zig build run` |
-| [Testing](examples/testing/) | Test utilities | `cd examples/testing && zig build test` |
-| [v2-Showcase](examples/v2-showcase/) | All features | `cd examples/v2-showcase && zig build run` |
+TB|## 📦 Examples
+MJ|
+SM|| Example | Description | Run |
+WJ||---------|-------------|-----|
+BV|| [Basic](examples/basic/) | Module fundamentals | `cd examples/basic && zig build run` |
+VM|| [Event-Driven](examples/event-driven/) | Publish-subscribe | `cd examples/event-driven && zig build run` |
+WT|| [Testing](examples/testing/) | Test utilities | `cd examples/testing && zig build test` |
+JP|| [HTTP Stress Test](examples/http-stress-test/) | Concurrent connections | `cd examples/http-stress-test && zig build run` |
+NW|| [Metaverse Creative](examples/metaverse-creative/) | Creative demo | `cd examples/metaverse-creative && zig build run` |
 
 ## 🤝 Contributing
 

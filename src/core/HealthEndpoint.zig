@@ -1,4 +1,5 @@
 const std = @import("std");
+const Time = @import("Time.zig");
 
 /// 健康检查端点
 /// 提供应用和模块的健康状态
@@ -91,7 +92,7 @@ pub const HealthEndpoint = struct {
         return .{
             .status = overall_status,
             .components = components,
-            .timestamp = 0,
+            .timestamp = Time.monotonicNowSeconds(),
         };
     }
 

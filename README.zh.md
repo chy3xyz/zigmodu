@@ -29,18 +29,13 @@
 ### 分布式能力
 - **DistributedEventBus** - 跨节点事件通信
 - **ClusterMembership** - 节点发现与健康检查
-- **PasRaft 共识** - 领导选举与日志复制
-
 ### 弹性模式
 - **熔断器** - 防止级联故障
 - **限流器** - 令牌桶算法
 - **重试策略** - 指数退避
 
 ### 传输与API
-- **GraphQL网关** - API查询语言
-- **gRPC传输** - 高性能RPC
-- **MQTT传输** - IoT消息队列
-
+- **HTTP服务器** - 异步纤程服务器，支持路由和中间件
 ### 可观测性
 - **分布式追踪** - OpenTelemetry兼容
 - **Prometheus指标** - Counter, Gauge, Histogram
@@ -179,9 +174,8 @@ ZigModu 随应用一起成长：
 | 1 | 0-1K | 单体 | 模块 + 生命周期 |
 | 2 | 1K-10K | 垂直扩展 | 缓存 + 异步 |
 | 3 | 10K-100K | 多实例 | DistributedEventBus + 集群 |
-| 4 | 100K-1M | 服务网格 | CircuitBreaker + 追踪 + gRPC |
-| 5 | 1M+ | 全球规模 | PasRaft + 热更新 + 插件 |
-
+| 4 | 100K-1M | 服务网格 | CircuitBreaker + 追踪 |
+| 5 | 1M+ | 全球规模 | 热更新 + 插件 |
 查看 [最佳实践](BEST_PRACTICES.md) 了解详细演进指南。
 
 ## 🛠️ 命令
@@ -200,15 +194,15 @@ zig build run
 zig fmt
 ```
 
-## 📦 示例
-
-| 示例 | 描述 | 运行 |
-|------|------|------|
-| [基础](examples/basic/) | 模块基础 | `cd examples/basic && zig build run` |
-| [事件驱动](examples/event-driven/) | 发布订阅 | `cd examples/event-driven && zig build run` |
-| [DI](examples/dependency-injection/) | 服务容器 | `cd examples/dependency-injection && zig build run` |
-| [测试](examples/testing/) | 测试工具 | `cd examples/testing && zig build test` |
-| [v2展示](examples/v2-showcase/) | 全部特性 | `cd examples/v2-showcase && zig build run` |
+KM|## 📦 示例
+JR|
+XN|| 示例 | 描述 | 运行 |
+PN||------|------|------|
+SW|| [基础](examples/basic/) | 模块基础 | `cd examples/basic && zig build run` |
+PJ|| [事件驱动](examples/event-driven/) | 发布订阅 | `cd examples/event-driven && zig build run` |
+WT|| [测试](examples/testing/) | 测试工具 | `cd examples/testing && zig build test` |
+JP|| [HTTP压力测试](examples/http-stress-test/) | 并发连接 | `cd examples/http-stress-test && zig build run` |
+NW|| [元宇宙创意](examples/metaverse-creative/) | 创意演示 | `cd examples/metaverse-creative && zig build run` |
 
 ## 🤝 贡献
 

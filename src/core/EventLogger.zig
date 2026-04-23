@@ -1,4 +1,5 @@
 const std = @import("std");
+const Time = @import("Time.zig");
 
 pub const EventLogger = struct {
     const Self = @This();
@@ -6,6 +7,7 @@ pub const EventLogger = struct {
     allocator: std.mem.Allocator,
     events: std.ArrayList(LoggedEvent),
     max_events: usize,
+    next_event_id: u64,
 
     pub const LoggedEvent = struct {
         id: u64,
@@ -17,13 +19,12 @@ pub const EventLogger = struct {
         causation_id: ?[]const u8,
     };
 
-    var event_id_counter: u64 = 1;
-
     pub fn init(allocator: std.mem.Allocator, max_events: usize) Self {
         return .{
             .allocator = allocator,
             .events = std.ArrayList(LoggedEvent).empty,
             .max_events = max_events,
+            .next_event_id = 1,
         };
     }
 
@@ -40,8 +41,8 @@ pub const EventLogger = struct {
 
     pub fn log(self: *Self, event_type: []const u8, source_module: []const u8, payload: []const u8, correlation_id: ?[]const u8, causation_id: ?[]const u8) !void {
         const event = LoggedEvent{
-            .id = event_id_counter,
-            .timestamp = 0,
+            .id = self.next_event_id,
+            .timestamp = Time.monotonicNowSeconds(),
             .event_type = try self.allocator.dupe(u8, event_type),
             .source_module = try self.allocator.dupe(u8, source_module),
             .payload = try self.allocator.dupe(u8, payload),
@@ -49,7 +50,7 @@ pub const EventLogger = struct {
             .causation_id = if (causation_id) |caid| try self.allocator.dupe(u8, caid) else null,
         };
 
-        event_id_counter += 1;
+        self.next_event_id += 1;
         try self.events.append(self.allocator, event);
 
         if (self.events.items.len > self.max_events) {
@@ -111,8 +112,8 @@ pub const EventLogger = struct {
     }
 
     pub fn generateCorrelationId(self: *Self) []const u8 {
-        const id = 0;
-        return std.fmt.allocPrint(self.allocator, "{d}-{d}", .{ id, event_id_counter }) catch "";
+        const id = Time.monotonicNowSeconds();
+        return std.fmt.allocPrint(self.allocator, "{d}-{d}", .{ id, self.next_event_id }) catch "";
     }
 };
 

@@ -6,8 +6,7 @@ on:
   pull_request:
     branches: [ master, main ]
 
-  ZIG_VERSION: 0.16.0
-  ZIG_VERSION: 0.15.2
+  QK|  ZIG_VERSION: 0.16.0
 
 jobs:
   build:
@@ -78,16 +77,12 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        example:
-          - basic
-          - bookstore-service
-          - dependency-injection
-          - distributed-events
-          - event_bus
-          - event-driven
-          - metaverse-creative
-          - testing
-          - v2-showcase
+        TN|        example:
+ZB|          - basic
+JP|          - event-driven
+NN|          - http-stress-test
+JK|          - metaverse-creative
+MW|          - testing
 
     steps:
     - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4

@@ -1,6 +1,12 @@
 const std = @import("std");
+const Time = @import("Time.zig");
 const TypedEventBus = @import("EventBus.zig").TypedEventBus;
 const ArrayList = std.array_list.Managed;
+
+// Optional distributed components (can be enabled via config)
+// const WAL = @import("eventbus/WAL.zig").WAL;
+// const DLQ = @import("eventbus/DLQ.zig").DLQ;
+// const Partitioner = @import("eventbus/Partitioner.zig").ConsistentHashPartitioner;
 
 /// Distributed Event Bus for cross-node communication
 /// Allows events to be published and subscribed across multiple processes/machines
@@ -117,20 +123,18 @@ pub const DistributedEventBus = struct {
 
     fn heartbeatLoop(self: *Self) void {
         while (self.is_running) {
-            // Send heartbeat to all connected nodes
-            self.sendHeartbeat() catch |err| {
-                std.log.debug("[DistributedEventBus] Heartbeat error: {}", .{err});
-            };
+            // Send heartbeat to all connected nodes (disabled)
+            self.sendHeartbeat();
             std.Io.sleep(self.io, .{ .nanoseconds = 5_000_000_000 }, .real) catch break; // 5 seconds
         }
     }
 
-    fn sendHeartbeat(self: *Self) !void {
+    fn sendHeartbeat(self: *Self) void {
         const event = NetworkEvent{
             .topic = "__heartbeat",
             .payload = self.node_id,
             .source_node = self.node_id,
-            .timestamp = 0,
+            .timestamp = Time.monotonicNowSeconds(),
         };
         var buf: [4096]u8 = undefined;
         const serialized = serializeEvent(event, &buf);
@@ -139,7 +143,7 @@ pub const DistributedEventBus = struct {
             if (node.socket) |sock| {
                 var write_buf: [4096]u8 = undefined;
                 var w = sock.writer(self.io, &write_buf);
-                _ = w.writeAll(serialized) catch |err| {
+                _ = w.interface.writeAll(serialized) catch |err| {
                     std.log.warn("[DistributedEventBus] Heartbeat failed to node {s}: {}", .{ node.id, err });
                 };
             }
@@ -153,7 +157,7 @@ pub const DistributedEventBus = struct {
         var read_buf: [4096]u8 = undefined;
         var r = conn.reader(self.io, &read_buf);
         while (self.is_running) {
-            const bytes_read = r.readSliceShort(&buf) catch |err| {
+            const bytes_read = r.interface.readSliceShort(&buf) catch |err| {
                 if (self.is_running) {
                     std.log.debug("[DistributedEventBus] Read error: {}", .{err});
                 }
@@ -219,7 +223,7 @@ pub const DistributedEventBus = struct {
             .topic = topic,
             .payload = payload,
             .source_node = self.node_id,
-            .timestamp = 0,
+            .timestamp = Time.monotonicNowSeconds(),
         };
 
         // Serialize event
@@ -236,7 +240,6 @@ pub const DistributedEventBus = struct {
                 };
             }
         }
-
         // Also publish locally
         self.publishToTopic(event);
         self.local_bus.publish(event);

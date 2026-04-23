@@ -1,4 +1,5 @@
 const std = @import("std");
+const Time = @import("Time.zig");
 const Application = @import("../Application.zig").Application;
 const ApplicationModules = @import("Module.zig").ApplicationModules;
 const ArrayList = std.array_list.Managed;
@@ -245,13 +246,13 @@ pub fn ModuleSnapshot(comptime T: type) type {
             return .{
                 .data = data,
                 .version = 1,
-                .timestamp = 0,
+                .timestamp = Time.monotonicNowSeconds(),
             };
         }
 
         pub fn incrementVersion(self: *Self) void {
             self.version += 1;
-            self.timestamp = 0;
+            self.timestamp = Time.monotonicNowSeconds();
         }
     };
 }

@@ -7,6 +7,14 @@ const validateModules = @import("core/ModuleValidator.zig").validateModules;
 const Lifecycle = @import("core/Lifecycle.zig");
 const Documentation = @import("core/Documentation.zig");
 
+/// Atomic flag for graceful shutdown coordination (set by signal handler).
+var shutdown_requested = std.atomic.Value(bool).init(false);
+
+/// POSIX signal handler — sets the atomic flag.
+fn signalHandler(_: c_int) callconv(.c) void {
+    shutdown_requested.store(true, .release);
+}
+
 /// Application Builder Pattern
 /// Simplified API for creating and managing modular applications
 ///
@@ -29,6 +37,7 @@ pub const Application = struct {
     config: Config,
     state: State,
     io: std.Io,
+    shutdown_hooks: std.ArrayList(*const fn () void) = std.ArrayList(*const fn () void).empty,
 
     pub const State = enum {
         initialized,
@@ -75,6 +84,7 @@ pub const Application = struct {
             self.stop();
         }
         self.modules.deinit();
+        self.shutdown_hooks.deinit(self.allocator);
         self.state = .stopped;
     }
 
@@ -121,6 +131,13 @@ pub const Application = struct {
             return; // Not started, nothing to stop
         }
 
+        // Call shutdown hooks in reverse registration order
+        var i: usize = self.shutdown_hooks.items.len;
+        while (i > 0) {
+            i -= 1;
+            self.shutdown_hooks.items[i]();
+        }
+
         Lifecycle.stopAll(&self.modules);
         self.state = .stopped;
 
@@ -146,6 +163,39 @@ pub const Application = struct {
     /// Get current state
     pub fn getState(self: *Self) State {
         return self.state;
+    }
+
+    /// Register a hook to be called during graceful shutdown (reverse order).
+    pub fn onShutdown(self: *Self, hook: *const fn () void) !void {
+        try self.shutdown_hooks.append(self.allocator, hook);
+    }
+
+    /// Run the application blocking until SIGINT/SIGTERM.
+    /// This is the recommended way to run a production server.
+    /// Note: Uses a polling loop since sigtimedwait is not available on macOS.
+    pub fn run(self: *Self) !void {
+        try self.start();
+
+        std.log.info("🚀 Application '{s}' running. Press Ctrl+C to stop.", .{self.config.name});
+
+        // Install signal handler
+        shutdown_requested.store(false, .release);
+
+        const handler = std.posix.Sigaction{
+            .handler = .{ .handler = signalHandler },
+            .mask = std.posix.empty_sigset,
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.INT, &handler, null) catch {};
+        std.posix.sigaction(std.posix.SIG.TERM, &handler, null) catch {};
+
+        // Block until signal
+        while (!shutdown_requested.load(.acquire)) {
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+        }
+
+        std.log.info("⚡ Shutdown signal received, stopping '{s}'...", .{self.config.name});
+        self.stop();
     }
 };
 
@@ -277,4 +327,135 @@ test "ApplicationBuilder" {
     try std.testing.expectEqualStrings("built-app", app.config.name);
     try std.testing.expectEqual(false, app.config.validate_on_start);
     try std.testing.expect(app.hasModule("builder-mock"));
+}
+
+test "Application shutdown hooks" {
+    const allocator = std.testing.allocator;
+
+    const MockModule = struct {
+        pub const info = api.Module{
+            .name = "hook-mock",
+            .description = "Hook test",
+            .dependencies = &.{},
+        };
+        pub fn init() !void {}
+        pub fn deinit() void {}
+    };
+
+    const HookCtx = struct {
+        var hook_order: [2]u8 = .{ 0, 0 };
+        var hook_idx: u8 = 0;
+
+        fn hook1() void {
+            hook_order[hook_idx] = 1;
+            hook_idx += 1;
+        }
+        fn hook2() void {
+            hook_order[hook_idx] = 2;
+            hook_idx += 1;
+        }
+    };
+
+    var app = try Application.init(std.testing.io, allocator, "hook-app", .{MockModule}, .{});
+    defer app.deinit();
+
+    HookCtx.hook_idx = 0;
+    try app.onShutdown(HookCtx.hook1);
+    try app.onShutdown(HookCtx.hook2);
+
+    try app.start();
+    app.stop();
+
+    // Hooks called in reverse order
+    try std.testing.expectEqual(@as(u8, 2), HookCtx.hook_order[0]);
+    try std.testing.expectEqual(@as(u8, 1), HookCtx.hook_order[1]);
+}
+
+test "Application multi-module with dependencies" {
+    const allocator = std.testing.allocator;
+
+    const InitTracker = struct {
+        var order: [3]u8 = .{ 0, 0, 0 };
+        var idx: u8 = 0;
+    };
+
+    const Database = struct {
+        pub const info = api.Module{
+            .name = "database",
+            .description = "Database layer",
+            .dependencies = &.{},
+        };
+        pub fn init() !void {
+            InitTracker.order[InitTracker.idx] = 1;
+            InitTracker.idx += 1;
+        }
+        pub fn deinit() void {}
+    };
+
+    const Cache = struct {
+        pub const info = api.Module{
+            .name = "cache",
+            .description = "Cache layer",
+            .dependencies = &.{"database"},
+        };
+        pub fn init() !void {
+            InitTracker.order[InitTracker.idx] = 2;
+            InitTracker.idx += 1;
+        }
+        pub fn deinit() void {}
+    };
+
+    const Api = struct {
+        pub const info = api.Module{
+            .name = "api",
+            .description = "API layer",
+            .dependencies = &.{ "database", "cache" },
+        };
+        pub fn init() !void {
+            InitTracker.order[InitTracker.idx] = 3;
+            InitTracker.idx += 1;
+        }
+        pub fn deinit() void {}
+    };
+
+    InitTracker.idx = 0;
+    var app = try Application.init(std.testing.io, allocator, "multi-app", .{ Database, Cache, Api }, .{});
+    defer app.deinit();
+
+    try app.start();
+
+    // Verify all 3 modules started
+    try std.testing.expectEqual(@as(u8, 3), InitTracker.idx);
+
+    // database (no deps) must start before cache and api
+    try std.testing.expectEqual(@as(u8, 1), InitTracker.order[0]);
+
+    app.stop();
+}
+
+test "Application idempotent start and stop" {
+    const allocator = std.testing.allocator;
+
+    const MockModule = struct {
+        pub const info = api.Module{
+            .name = "idempotent",
+            .description = "Idempotent test",
+            .dependencies = &.{},
+        };
+        pub fn init() !void {}
+        pub fn deinit() void {}
+    };
+
+    var app = try Application.init(std.testing.io, allocator, "idem-app", .{MockModule}, .{});
+    defer app.deinit();
+
+    // Double start should not error
+    try app.start();
+    try app.start(); // should be no-op
+
+    // Double stop should not error
+    app.stop();
+    app.stop(); // should be no-op
+
+    try std.testing.expectEqual(Application.State.stopped, app.getState());
 }

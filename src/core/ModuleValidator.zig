@@ -1,13 +1,7 @@
 const std = @import("std");
 const ApplicationModules = @import("./Module.zig").ApplicationModules;
 const ModuleInfo = @import("./Module.zig").ModuleInfo;
-
-pub const ValidationError = error{
-    InvalidModuleName,
-    SelfDependency,
-    DependencyNotFound,
-    CircularDependency,
-};
+const ZigModuError = @import("./Error.zig").ZigModuError;
 
 /// Validates that all module dependencies exist and checks for circular dependencies
 pub fn validateModules(modules: *ApplicationModules) !void {
@@ -22,18 +16,18 @@ pub fn validateModules(modules: *ApplicationModules) !void {
 
         if (module.name.len == 0) {
             std.log.warn("Module with empty name found", .{});
-            return ValidationError.InvalidModuleName;
+            return ZigModuError.InvalidModuleName;
         }
 
         for (module.deps) |dep| {
             if (std.mem.eql(u8, module.name, dep)) {
                 std.log.warn("Module '{s}' depends on itself", .{module.name});
-                return ValidationError.SelfDependency;
+                return ZigModuError.SelfDependency;
             }
 
             if (!modules.modules.contains(dep)) {
                 std.log.warn("Module '{s}' is missing dependency: '{s}'", .{ module.name, dep });
-                return ValidationError.DependencyNotFound;
+                return ZigModuError.DependencyNotFound;
             }
         }
     }
@@ -63,7 +57,7 @@ fn checkCircularDependencies(modules: *ApplicationModules) !void {
 
         if (try hasCircularDependency(modules, module_name, &visited, &in_stack, &path)) {
             std.log.warn("Circular dependency detected: {s}", .{module_name});
-            return ValidationError.CircularDependency;
+            return ZigModuError.CircularDependency;
         }
     }
 }

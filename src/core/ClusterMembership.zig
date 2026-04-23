@@ -1,9 +1,9 @@
 const std = @import("std");
 const Time = @import("Time.zig");
 const DistributedEventBus = @import("DistributedEventBus.zig").DistributedEventBus;
+const AccrualFailureDetector = @import("cluster/FailureDetector.zig").AccrualFailureDetector;
 const ArrayList = std.array_list.Managed;
 
-// ⚠️ EXPERIMENTAL: This module is incomplete and not production-ready.
 /// Cluster Membership Service using gossip protocol
 /// Tracks node health, handles join/leave events, and performs leader election
 pub const ClusterMembership = struct {
@@ -14,6 +14,7 @@ pub const ClusterMembership = struct {
     node_id: []const u8,
     address: std.Io.net.IpAddress,
     bus: *DistributedEventBus,
+    failure_detector: ?*AccrualFailureDetector = null,
     nodes: std.StringHashMap(ClusterNode),
     is_running: bool,
     gossip_thread: ?std.Thread,
@@ -85,6 +86,7 @@ pub const ClusterMembership = struct {
             .node_id = id_copy,
             .address = address,
             .bus = bus,
+            .failure_detector = null,
             .nodes = nodes,
             .is_running = false,
             .gossip_thread = null,
@@ -162,6 +164,12 @@ pub const ClusterMembership = struct {
 
     fn gossipLoop(self: *Self) void {
         while (self.is_running) {
+            // Record our own heartbeat for failure detection
+            if (self.failure_detector) |fd| {
+                fd.heartbeat(self.node_id) catch |err| {
+                    std.log.err("[ClusterMembership] Failed to record heartbeat: {}", .{err});
+                };
+            }
             self.broadcastEvent(.heartbeat) catch |err| {
                 std.log.err("[ClusterMembership] Gossip error: {}", .{err});
             };
@@ -190,23 +198,40 @@ pub const ClusterMembership = struct {
             const node = entry.value_ptr;
             if (std.mem.eql(u8, node.id, self.node_id)) continue;
 
-            if (node.state == .healthy and now - node.last_seen > timeout_secs) {
-                node.state = .suspect;
-                std.log.warn("[ClusterMembership] Node {s} is suspect (last seen {d}s ago)", .{ node.id, now - node.last_seen });
-            } else if (node.state == .suspect and now - node.last_seen > timeout_secs * 2) {
-                node.state = .failed;
-                std.log.warn("[ClusterMembership] Node {s} marked as failed", .{node.id});
+            if (node.state == .healthy) {
+                // Use failure detector if available for more accurate detection
+                const is_node_alive = if (self.failure_detector) |fd|
+                    fd.isAlive(node.id)
+                else
+                    (now - node.last_seen <= timeout_secs);
 
-                if (self.on_node_leave_cb) |cb| {
-                    cb(node.id);
+                if (!is_node_alive) {
+                    node.state = .suspect;
+                    const phi_val: f64 = if (self.failure_detector) |fd| fd.phi(node.id) else 0;
+                    std.log.warn("[ClusterMembership] Node {s} is suspect (phi={d})", .{ node.id, phi_val });
                 }
+            } else if (node.state == .suspect) {
+                // In suspect state, use failure detector or simple timeout
+                const is_node_dead = if (self.failure_detector) |fd|
+                    !fd.isAlive(node.id)
+                else
+                    (now - node.last_seen > timeout_secs * 2);
 
-                // Trigger re-election if leader failed
-                if (self.current_leader) |leader| {
-                    if (std.mem.eql(u8, leader, node.id)) {
-                        self.allocator.free(leader);
-                        self.current_leader = null;
-                        self.electLeaderLocked();
+                if (is_node_dead) {
+                    node.state = .failed;
+                    std.log.warn("[ClusterMembership] Node {s} marked as failed", .{node.id});
+
+                    if (self.on_node_leave_cb) |cb| {
+                        cb(node.id);
+                    }
+
+                    // Trigger re-election if leader failed
+                    if (self.current_leader) |leader| {
+                        if (std.mem.eql(u8, leader, node.id)) {
+                            self.allocator.free(leader);
+                            self.current_leader = null;
+                            self.electLeaderLocked();
+                        }
                     }
                 }
             }
@@ -247,6 +272,11 @@ pub const ClusterMembership = struct {
 
         const now = Time.monotonicNowSeconds();
         const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = event.port } };
+
+        // Record heartbeat in failure detector if available
+        if (self.failure_detector) |fd| {
+            fd.heartbeat(event.node_id) catch {};
+        }
 
         if (self.nodes.getPtr(event.node_id)) |node| {
             node.last_seen = now;
@@ -370,6 +400,20 @@ pub const ClusterMembership = struct {
                 }
             }
         }
+    }
+
+    /// Set the failure detector for advanced health checking
+    /// Must be called before start() for best results
+    pub fn setFailureDetector(self: *Self, fd: *AccrualFailureDetector) void {
+        self.failure_detector = fd;
+    }
+
+    /// Get phi value for a node (requires failure detector)
+    pub fn getNodePhi(self: *Self, node_id: []const u8) ?f64 {
+        if (self.failure_detector) |fd| {
+            return fd.phi(node_id);
+        }
+        return null;
     }
 
     pub fn onNodeJoin(self: *Self, callback: *const fn ([]const u8, std.Io.net.IpAddress) void) void {

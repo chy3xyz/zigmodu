@@ -1,8 +1,6 @@
 const std = @import("std");
 
-// ⚠️ EXPERIMENTAL: This module is incomplete and not production-ready.
 /// 分布式事务管理器
-
 /// 分布式事务管理器
 /// 实现 Saga 模式用于分布式事务
 pub const DistributedTransactionManager = struct {

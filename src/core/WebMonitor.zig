@@ -3,9 +3,7 @@ const Application = @import("../Application.zig").Application;
 const ApplicationModules = @import("Module.zig").ApplicationModules;
 const ModuleInfo = @import("Module.zig").ModuleInfo;
 
-// ⚠️ EXPERIMENTAL: This module is incomplete and not production-ready.
 /// Web interface for module monitoring
-/// Provides HTTP endpoints for viewing module status, metrics, and health
 pub const WebMonitor = struct {
     const Self = @This();
 
