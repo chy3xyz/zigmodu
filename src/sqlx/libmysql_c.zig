@@ -55,6 +55,9 @@ pub extern "c" fn mysql_affected_rows(mysql: ?*MYSQL) c_ulonglong;
 pub extern "c" fn mysql_insert_id(mysql: ?*MYSQL) c_ulonglong;
 pub extern "c" fn mysql_error(mysql: ?*MYSQL) [*c]const u8;
 pub extern "c" fn mysql_errno(mysql: ?*MYSQL) c_uint;
+/// Column count for the current query; used when `mysql_store_result` is NULL to
+/// distinguish errors / empty SELECT from DML (no result set).
+pub extern "c" fn mysql_field_count(mysql: ?*MYSQL) c_uint;
 pub extern "c" fn mysql_autocommit(mysql: ?*MYSQL, auto_mode: bool) c_int;
 pub extern "c" fn mysql_commit(mysql: ?*MYSQL) c_int;
 pub extern "c" fn mysql_rollback(mysql: ?*MYSQL) c_int;

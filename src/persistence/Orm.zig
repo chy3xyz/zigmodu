@@ -59,7 +59,11 @@ pub fn Model(comptime T: type) type {
     if (info != .@"struct") @compileError("Model only supports structs");
 
     return struct {
-        pub const table_name = blk: {
+        /// Explicit SQL table name (snake_case). When present on `T`, used instead of the type name.
+        /// zmodu-generated models set this to match `CREATE TABLE` names.
+        pub const table_name = if (@hasDecl(T, "sql_table_name"))
+            T.sql_table_name
+        else blk: {
             const raw = snakeCase(@typeName(T));
             break :blk raw;
         };
@@ -309,15 +313,24 @@ pub fn Orm(comptime B: type) type {
 
 test "Model metadata extraction" {
     const User = struct {
+        pub const sql_table_name: []const u8 = "users";
         id: i64,
         name: []const u8,
         email: []const u8,
     };
 
     const meta = Model(User);
-    try std.testing.expectEqualStrings("User", meta.table_name);
+    try std.testing.expectEqualStrings("users", meta.table_name);
     try std.testing.expectEqualStrings("id", meta.primary_key);
     try std.testing.expectEqual(@as(usize, 3), meta.fields.len);
+}
+
+test "Model table name defaults to type name without sql_table_name" {
+    const Account = struct {
+        id: i64,
+    };
+    const meta = Model(Account);
+    try std.testing.expectEqualStrings("Account", meta.table_name);
 }
 
 test "SQL builders" {

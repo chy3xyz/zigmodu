@@ -627,6 +627,59 @@ fn formatQuery(allocator: std.mem.Allocator, sql: []const u8, args: []const Valu
     return allocator.dupe(u8, buf.items);
 }
 
+/// After a successful `mysql_real_query` for a statement that may return rows, build `Rows`.
+/// `mysql_store_result` returns NULL in three cases: read failure (errno != 0), statements
+/// with no result set (field_count == 0, e.g. INSERT), or an **empty SELECT** (errno == 0,
+/// field_count > 0). The last case must yield zero rows, not `DatabaseError`.
+/// Caller owns `arena` and should `errdefer arena.deinit()` until `Rows` is returned.
+fn mysqlReadRowsAfterQuery(mysql: ?*libmysql_c.MYSQL, arena: std.heap.ArenaAllocator) errors.ResultT(Rows) {
+    var arena_mut = arena;
+    const arena_alloc = arena_mut.allocator();
+    const res = libmysql_c.mysql_store_result(mysql);
+    if (res) |r| {
+        defer libmysql_c.mysql_free_result(r);
+
+        const n_cols = libmysql_c.mysql_num_fields(r);
+        const n_rows = libmysql_c.mysql_num_rows(r);
+
+        const field_names = arena_alloc.alloc([]const u8, n_cols) catch return error.DatabaseError;
+        for (0..n_cols) |c| {
+            const field = libmysql_c.mysql_fetch_field(r) orelse return error.DatabaseError;
+            const name = std.mem.span(field.name);
+            field_names[c] = arena_alloc.dupe(u8, name) catch return error.DatabaseError;
+        }
+
+        var rows_list: std.ArrayList(Row) = std.ArrayList(Row).empty;
+
+        for (0..n_rows) |_| {
+            const row_data = libmysql_c.mysql_fetch_row(r);
+            const lengths = libmysql_c.mysql_fetch_lengths(r);
+            const columns = arena_alloc.alloc([]const u8, n_cols) catch return error.DatabaseError;
+            const values = arena_alloc.alloc(?Value, n_cols) catch return error.DatabaseError;
+            for (0..n_cols) |c| {
+                columns[c] = arena_alloc.dupe(u8, field_names[c]) catch return error.DatabaseError;
+                if (row_data == null or row_data.?[c] == null) {
+                    values[c] = null;
+                } else {
+                    const len = lengths[c];
+                    const val = row_data.?[c].?[0..len];
+                    values[c] = .{ .string = arena_alloc.dupe(u8, val) catch return error.DatabaseError };
+                }
+            }
+            rows_list.append(arena_alloc, .{ .allocator = arena_alloc, .columns = columns, .values = values }) catch return error.DatabaseError;
+        }
+
+        const rows_slice = arena_alloc.alloc(Row, rows_list.items.len) catch return error.DatabaseError;
+        @memcpy(rows_slice, rows_list.items);
+        return Rows{ .arena = arena_mut, .rows = rows_slice };
+    }
+
+    if (libmysql_c.mysql_errno(mysql) != 0) return error.DatabaseError;
+    if (libmysql_c.mysql_field_count(mysql) == 0) return error.DatabaseError;
+    const rows_slice = arena_alloc.alloc(Row, 0) catch return error.DatabaseError;
+    return Rows{ .arena = arena_mut, .rows = rows_slice };
+}
+
 pub const MySqlConn = struct {
     mysql: ?*libmysql_c.MYSQL,
     allocator: std.mem.Allocator,
@@ -653,49 +706,13 @@ pub const MySqlConn = struct {
         const self = @as(*MySqlConn, @ptrCast(@alignCast(ptr)));
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
-        const arena_alloc = arena.allocator();
 
         const query = formatQuery(self.allocator, sql_str, args) catch return error.DatabaseError;
         defer self.allocator.free(query);
 
         if (libmysql_c.mysql_real_query(self.mysql, @ptrCast(query.ptr), @intCast(query.len)) != 0) return error.DatabaseError;
 
-        const res = libmysql_c.mysql_store_result(self.mysql) orelse return error.DatabaseError;
-        defer libmysql_c.mysql_free_result(res);
-
-        const n_cols = libmysql_c.mysql_num_fields(res);
-        const n_rows = libmysql_c.mysql_num_rows(res);
-
-        const field_names = arena_alloc.alloc([]const u8, n_cols) catch return error.DatabaseError;
-        for (0..n_cols) |c| {
-            const field = libmysql_c.mysql_fetch_field(res) orelse return error.DatabaseError;
-            const name = std.mem.span(field.name);
-            field_names[c] = arena_alloc.dupe(u8, name) catch return error.DatabaseError;
-        }
-
-        var rows_list: std.ArrayList(Row) = std.ArrayList(Row).empty;
-
-        for (0..n_rows) |_| {
-            const row_data = libmysql_c.mysql_fetch_row(res);
-            const lengths = libmysql_c.mysql_fetch_lengths(res);
-            const columns = arena_alloc.alloc([]const u8, n_cols) catch return error.DatabaseError;
-            const values = arena_alloc.alloc(?Value, n_cols) catch return error.DatabaseError;
-            for (0..n_cols) |c| {
-                columns[c] = arena_alloc.dupe(u8, field_names[c]) catch return error.DatabaseError;
-                if (row_data == null or row_data.?[c] == null) {
-                    values[c] = null;
-                } else {
-                    const len = lengths[c];
-                    const val = row_data.?[c].?[0..len];
-                    values[c] = .{ .string = arena_alloc.dupe(u8, val) catch return error.DatabaseError };
-                }
-            }
-            rows_list.append(arena_alloc, .{ .allocator = arena_alloc, .columns = columns, .values = values }) catch return error.DatabaseError;
-        }
-
-        const rows_slice = arena_alloc.alloc(Row, rows_list.items.len) catch return error.DatabaseError;
-        @memcpy(rows_slice, rows_list.items);
-        return Rows{ .arena = arena, .rows = rows_slice };
+        return mysqlReadRowsAfterQuery(self.mysql, arena);
     }
 
     fn execFn(ptr: *anyopaque, sql_str: []const u8, args: []const Value) errors.ResultT(ExecResult) {
@@ -1006,44 +1023,11 @@ pub const MySqlStmt = struct {
         const self = @as(*MySqlStmt, @ptrCast(@alignCast(ptr)));
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
-        const arena_alloc = arena.allocator();
 
         const query = formatQuery(self.allocator, self.sql, args) catch return error.DatabaseError;
         defer self.allocator.free(query);
         if (libmysql_c.mysql_real_query(self.mysql, @ptrCast(query.ptr), @intCast(query.len)) != 0) return error.DatabaseError;
-        const res = libmysql_c.mysql_store_result(self.mysql) orelse return error.DatabaseError;
-        defer libmysql_c.mysql_free_result(res);
-
-        const n_cols = libmysql_c.mysql_num_fields(res);
-        const n_rows = libmysql_c.mysql_num_rows(res);
-        const field_names = arena_alloc.alloc([]const u8, n_cols) catch return error.DatabaseError;
-        for (0..n_cols) |c| {
-            const field = libmysql_c.mysql_fetch_field(res) orelse return error.DatabaseError;
-            const name = std.mem.span(field.name);
-            field_names[c] = arena_alloc.dupe(u8, name) catch return error.DatabaseError;
-        }
-        var rows_list: std.ArrayList(Row) = std.ArrayList(Row).empty;
-
-        for (0..n_rows) |_| {
-            const row_data = libmysql_c.mysql_fetch_row(res);
-            const lengths = libmysql_c.mysql_fetch_lengths(res);
-            const columns = arena_alloc.alloc([]const u8, n_cols) catch return error.DatabaseError;
-            const values = arena_alloc.alloc(?Value, n_cols) catch return error.DatabaseError;
-            for (0..n_cols) |c| {
-                columns[c] = arena_alloc.dupe(u8, field_names[c]) catch return error.DatabaseError;
-                if (row_data == null or row_data.?[c] == null) {
-                    values[c] = null;
-                } else {
-                    const len = lengths[c];
-                    const val = row_data.?[c].?[0..len];
-                    values[c] = .{ .string = arena_alloc.dupe(u8, val) catch return error.DatabaseError };
-                }
-            }
-            rows_list.append(arena_alloc, .{ .allocator = arena_alloc, .columns = columns, .values = values }) catch return error.DatabaseError;
-        }
-        const rows_slice = arena_alloc.alloc(Row, rows_list.items.len) catch return error.DatabaseError;
-        @memcpy(rows_slice, rows_list.items);
-        return Rows{ .arena = arena, .rows = rows_slice };
+        return mysqlReadRowsAfterQuery(self.mysql, arena);
     }
 
     fn execFn(ptr: *anyopaque, args: []const Value) errors.ResultT(ExecResult) {
@@ -2767,6 +2751,10 @@ test "postgres live connection" {
         try std.testing.expectEqualStrings("Alice", name_str);
     } else return error.TestUnexpectedResult;
 
+    var empty_rows = try client.query("SELECT id, name FROM zigzero_test_users WHERE name = $1", &.{.{ .string = "NobodyHere" }});
+    defer empty_rows.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty_rows.rows.len);
+
     _ = try client.exec("DROP TABLE IF EXISTS zigzero_test_users", &.{});
 }
 
@@ -2811,6 +2799,17 @@ test "mysql live connection" {
         try std.testing.expectEqualStrings("Alice", name_str);
         allocator.free(name_str);
     } else return error.TestUnexpectedResult;
+
+    // Empty SELECT: libmysql may return NULL from mysql_store_result with errno==0; must not be DatabaseError.
+    var empty_rows = try client.query("SELECT id, name FROM zigzero_test_users WHERE name = ?", &.{.{ .string = "NobodyHere" }});
+    defer empty_rows.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty_rows.rows.len);
+
+    var empty_stmt = try client.prepare("SELECT id, name FROM zigzero_test_users WHERE name = ?");
+    defer empty_stmt.close();
+    var empty_prepared = try empty_stmt.query(allocator, &.{.{ .string = "NobodyHere" }});
+    defer empty_prepared.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty_prepared.rows.len);
 
     _ = try client.exec("DROP TABLE IF EXISTS zigzero_test_users", &.{});
 }

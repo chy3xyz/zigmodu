@@ -1,0 +1,16 @@
+.{
+    .name = .zon_hash_probe,
+    .version = "0.0.0",
+    .fingerprint = 0x154fee019edc9b89,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .zigmodu = .{
+            .url = "https://github.com/knot3bot/zigmodu/archive/refs/tags/v0.7.0.tar.gz",
+            .hash = "zigmodu-0.6.0-U40vsx_tDAB5XXZFElS7CWizSWV_JA9ZZly21CxeYg2A",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+    },
+}

@@ -15,6 +15,7 @@ A modular application framework for Zig 0.16.0, inspired by Spring Modulith. Bui
 | [API Reference](docs/API.md) | Detailed API documentation |
 | [Architecture](docs/ARCHITECTURE.md) | System design and patterns |
 | [Examples](examples/) | Runnable example projects |
+| [ZModu CLI (codegen)](tools/zmodu/README.md) | `zmodu` — modules, ORM (SQLx/Zent) from SQL, templates under `tools/zmodu/src/templates/` |
 
 ## ✨ Features
 
