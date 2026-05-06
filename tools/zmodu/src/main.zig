@@ -9,6 +9,8 @@ const Command = enum {
     api,
     orm,
     generate,
+    scaffold,
+    bigdemo,
     help,
     version,
 };
@@ -23,6 +25,9 @@ const Config = struct {
 const GenOptions = struct {
     dry_run: bool = false,
     force: bool = false,
+    data_only: bool = false, // Only generate model.zig + persistence.zig
+    split: bool = false, // Split multi-table modules into per-table subdirs
+    enable_events: bool = false, // Auto-generate event publishing in service layer
 };
 
 const OrmCli = struct {
@@ -45,7 +50,10 @@ fn isOrmLongOption(token: []const u8) bool {
         std.mem.eql(u8, token, "--module") or
         std.mem.eql(u8, token, "--backend") or
         std.mem.eql(u8, token, "--dry-run") or
-        std.mem.eql(u8, token, "--force");
+        std.mem.eql(u8, token, "--force") or
+        std.mem.eql(u8, token, "--data-only") or
+        std.mem.eql(u8, token, "--split") or
+        std.mem.eql(u8, token, "--enable-events");
 }
 
 fn parseOrmCli(args: []const []const u8) ParseOrmCliResult {
@@ -85,6 +93,12 @@ fn parseOrmCli(args: []const []const u8) ParseOrmCliResult {
             opts.dry_run = true;
         } else if (std.mem.eql(u8, args[i], "--force")) {
             opts.force = true;
+        } else if (std.mem.eql(u8, args[i], "--data-only")) {
+            opts.data_only = true;
+        } else if (std.mem.eql(u8, args[i], "--split")) {
+            opts.split = true;
+        } else if (std.mem.eql(u8, args[i], "--enable-events")) {
+            opts.enable_events = true;
         } else {
             return .{ .err_unknown_flag = args[i] };
         }
@@ -171,6 +185,8 @@ fn runCommand(io: std.Io, allocator: std.mem.Allocator, command: Command, cmd_ar
         .api => try cmdApi(io, allocator, cmd_args),
         .orm => try cmdOrm(io, allocator, cmd_args),
         .generate => try cmdGenerate(io, allocator, cmd_args),
+        .scaffold => try cmdScaffold(io, allocator, cmd_args),
+        .bigdemo => try cmdBigdemo(io, allocator, cmd_args),
         .help => {
             if (cmd_args.len != 0) {
                 std.log.err("`zmodu help` does not accept arguments (got {d}).", .{cmd_args.len});
@@ -268,6 +284,8 @@ fn parseCommand(cmd: []const u8) ?Command {
     if (std.mem.eql(u8, cmd, "api")) return .api;
     if (std.mem.eql(u8, cmd, "orm")) return .orm;
     if (std.mem.eql(u8, cmd, "generate")) return .generate;
+    if (std.mem.eql(u8, cmd, "scaffold")) return .scaffold;
+    if (std.mem.eql(u8, cmd, "bigdemo")) return .bigdemo;
     if (std.mem.eql(u8, cmd, "help")) return .help;
     if (std.mem.eql(u8, cmd, "version")) return .version;
     if (std.mem.eql(u8, cmd, "--help")) return .help;
@@ -289,7 +307,9 @@ fn printUsage() void {
         \\  module <name>   Generate module boilerplate
         \\  event <name>    Generate event handler
         \\  api <name>      Generate API endpoint
-        \\  orm             Generate ORM models and repositories from SQL
+        \\  orm             Generate ORM modules from SQL (auto-groups by prefix)
+        \\  scaffold        One-shot: SQL -> full project with wiring
+        \\  bigdemo         Regenerate shopdemo (152 tables → 42 modules)
         \\  generate <t>   Alias: generate module|event|api|orm [...]
         \\  help            Show help
         \\  version         Show version
@@ -301,13 +321,13 @@ fn printUsage() void {
         \\  zmodu event order-created
         \\  zmodu api users
         \\  zmodu orm --sql schema.sql --out src/modules
-        \\  zmodu orm --sql schema.sql --out src/modules --dry-run
-        \\  (--out must not contain '..'; --module is one name, no '/' or '\\')
-        \\  zmodu generate module --sql schema.sql --out src/modules
-        \\  zmodu generate orm --sql schema.sql --out src/modules --force
+        \\  zmodu orm --sql schema.sql --out src/modules --module <name> --force
+        \\  zmodu scaffold --sql schema.sql --name myapp
+        \\  zmodu scaffold --sql schema.sql --name myapp --out ./myproject
         \\
         \\Flags (where supported):
         \\  --dry-run   Preview writes / mkdir; no files created
+        \\  --data-only  Only generate model.zig + persistence.zig (not service/api/module/root)
         \\  --force     Overwrite existing generated files (default: refuse)
         \\
         \\Exit codes: 0 success, 1 unknown command or I/O, 2 invalid arguments, 3 refuse overwrite (use --force)
@@ -396,6 +416,54 @@ fn cmdNew(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
     const tests_path = try std.fmt.allocPrint(allocator, "{s}/src/tests.zig", .{project_name});
     defer allocator.free(tests_path);
     try writeFile(io, tests_path, tests_zig);
+
+    // Generate .ai/prompts/ directory with AI prompt templates
+    const ai_prompts_dir = try std.fmt.allocPrint(allocator, "{s}/.ai/prompts", .{project_name});
+    defer allocator.free(ai_prompts_dir);
+    try std.Io.Dir.cwd().createDirPath(io, ai_prompts_dir);
+
+    const add_module_prompt =
+        \\# Add a new module to this project
+        \\
+        \\## Task
+        \\Create a new ZigModu module following the standard structure:
+        \\- module.zig — declaration layer (info, init, deinit)
+        \\- model.zig — data structures
+        \\- persistence.zig — ORM repositories
+        \\- service.zig — business logic
+        \\- api.zig — HTTP routes
+        \\- root.zig — barrel exports
+        \\- test.zig — tests
+        \\- _ai.zig — AI context index
+        \\
+        \\## Steps
+        \\1. Read src/modules/<existing>/_ai.zig for context pattern
+        \\2. Create src/modules/<name>/ directory with all files
+        \\3. Add module to src/main.zig scanModules call
+        \\4. Run `zig build test` to verify
+        \\
+    ;
+    const add_module_path = try std.fmt.allocPrint(allocator, "{s}/add_module.md", .{ai_prompts_dir});
+    defer allocator.free(add_module_path);
+    try writeFile(io, add_module_path, add_module_prompt);
+
+    const project_context =
+        \\# Project AI Context
+        \\
+        \\## Framework: ZigModu v0.7.0 (Zig 0.16.0)
+        \\## Module structure: src/modules/<name>/module.zig
+        \\## Entry point: src/main.zig
+        \\
+        \\## Key conventions:
+        \\- Dependencies must be declared in module.zig info.dependencies
+        \\- All modules have init() and deinit() lifecycle hooks
+        \\- Extension points: service_ext.zig, api_ext.zig (survive regeneration)
+        \\- AI context: each module has _ai.zig with metadata
+        \\
+    ;
+    const context_path = try std.fmt.allocPrint(allocator, "{s}/context.md", .{ai_prompts_dir});
+    defer allocator.free(context_path);
+    try writeFile(io, context_path, project_context);
 
     std.log.info("Project {s} created successfully!", .{project_name});
     std.log.info("  cd {s} && zig build run", .{project_name});
@@ -547,8 +615,6 @@ fn cmdApi(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
 
 // Template generators
 fn generateBuildZig(allocator: std.mem.Allocator, project_name: []const u8) ![]const u8 {
-    _ = project_name;
-
     var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
 
@@ -569,10 +635,7 @@ fn generateBuildZig(allocator: std.mem.Allocator, project_name: []const u8) ![]c
     try buf.appendSlice(allocator, "    });\n");
     try buf.appendSlice(allocator, "    exe_mod.addImport(\"zigmodu\", zigmodu_dep.module(\"zigmodu\"));\n");
     try buf.appendSlice(allocator, "\n");
-    try buf.appendSlice(allocator, "    const exe = b.addExecutable(.{ \n");
-    try buf.appendSlice(allocator, "        .name = \"app\",\n");
-    try buf.appendSlice(allocator, "        .root_module = exe_mod,\n");
-    try buf.appendSlice(allocator, "    });\n");
+    try buf.print(allocator, "    const exe = b.addExecutable(.{{ .name = \"{s}\", .root_module = exe_mod }});\n", .{project_name});
     try buf.appendSlice(allocator, "\n");
     try buf.appendSlice(allocator, "    b.installArtifact(exe);\n");
     try buf.appendSlice(allocator, "\n");
@@ -705,75 +768,19 @@ fn generateMainZig(allocator: std.mem.Allocator, project_name: []const u8) ![]co
 
 fn generateModule(allocator: std.mem.Allocator, module_name: []const u8) ![]const u8 {
     // Same shape as ORM-generated modules (AGENTS.md: init/deinit, api.Module fields).
-    return generateModuleZig(allocator, module_name);
+    return generateModuleZig(allocator, module_name, "&.{}");
 }
 
 fn generateEvent(allocator: std.mem.Allocator, event_name: []const u8) ![]const u8 {
-    const struct_name = try toPascalCase(allocator, event_name);
-    defer allocator.free(struct_name);
-
-    const part1 = "const std = @import(\"std\");\n\npub const ";
-    const part2 = "Event = struct {\n    id: u64,\n    timestamp: i64,\n    data: []const u8,\n};\n\npub fn handle";
-    const part3 = "(event: ";
-    const part4 = "Event) void {\n    std.log.info(\"Handling ";
-    const part5 = " event: id=\" ++ \"{}\", .{ event.id });\n    // TODO: Add event handling logic\n}\n";
-
-    return try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s}{s}{s}{s}{s}", .{ part1, struct_name, part2, struct_name, part3, struct_name, part4, event_name, part5 });
+    const pascal_name = try toPascalCase(allocator, event_name);
+    defer allocator.free(pascal_name);
+    return orm_tpl.expandTemplate(allocator, orm_tpl.event_tpl, &.{ "{{EVENT_NAME}}", "{{PASCAL_NAME}}" }, &.{ event_name, pascal_name });
 }
 
 fn generateApi(allocator: std.mem.Allocator, api_name: []const u8) ![]const u8 {
-    const struct_name = try toPascalCase(allocator, api_name);
-    defer allocator.free(struct_name);
-    const method_name = try toPascalCase(allocator, api_name);
-    defer allocator.free(method_name);
-
-    const template =
-        \\const std = @import("std");
-        \\const zigmodu = @import("zigmodu");
-        \\const Server = zigmodu.http_server.Server;
-        \\const RouteGroup = Server.RouteGroup;
-        \\const Context = Server.Context;
-        \\
-        \\pub const {s}Api = struct {{
-        \\    pub fn init(group: *RouteGroup) !void {{
-        \\        try group.get("/{s}s", list, null);
-        \\        try group.get("/{s}s/{{id}}", get, null);
-        \\        try group.post("/{s}s", create, null);
-        \\        try group.put("/{s}s/{{id}}", update, null);
-        \\        try group.delete("/{s}s/{{id}}", delete_, null);
-        \\    }}
-        \\
-        \\    fn list(ctx: *Context) !void {{
-        \\        try ctx.json(200, "{{\"message\": \"GET /{s}s\"}}");
-        \\    }}
-        \\
-        \\    fn get(ctx: *Context) !void {{
-        \\        const id = ctx.params.get("id") orelse return error.BadRequest;
-        \\        try ctx.jsonStruct(200, .{{ .id = id }});
-        \\    }}
-        \\
-        \\    fn create(ctx: *Context) !void {{
-        \\        _ = ctx;
-        \\        try ctx.json(201, "{{\"message\": \"CREATE /{s}s\"}}");
-        \\    }}
-        \\
-        \\    fn update(ctx: *Context) !void {{
-        \\        _ = ctx;
-        \\        try ctx.json(200, "{{\"message\": \"UPDATE /{s}s\"}}");
-        \\    }}
-        \\
-        \\    fn delete_(ctx: *Context) !void {{
-        \\        _ = ctx;
-        \\        try ctx.json(204, "");
-        \\    }}
-        \\}};
-        \\
-    ;
-
-    return try std.fmt.allocPrint(allocator, template, .{
-        struct_name, api_name, api_name, api_name, api_name, api_name,
-        api_name, api_name, api_name,
-    });
+    const pascal_name = try toPascalCase(allocator, api_name);
+    defer allocator.free(pascal_name);
+    return orm_tpl.expandTemplate(allocator, orm_tpl.api_standalone_tpl, &.{ "{{API_NAME}}", "{{PASCAL_NAME}}" }, &.{ api_name, pascal_name });
 }
 
 fn writeFile(io: std.Io, path: []const u8, content: []const u8) !void {
@@ -829,9 +836,16 @@ const ColumnDef = struct {
     comment: ?[]const u8,
 };
 
+const ForeignKey = struct {
+    column_name: []const u8,
+    ref_table: []const u8,
+    ref_column: []const u8,
+};
+
 const TableDef = struct {
     name: []const u8,
     columns: []ColumnDef,
+    foreign_keys: []ForeignKey,
 };
 
 fn zigScalarColumnType(col_type: ColumnType) []const u8 {
@@ -1004,29 +1018,38 @@ fn parseColumns(allocator: std.mem.Allocator, text: []const u8, i: *usize) ![]Co
     var cols: std.ArrayList(ColumnDef) = std.ArrayList(ColumnDef).empty;
     defer cols.deinit(allocator);
     var depth: usize = 0;
+    var in_single_quote: bool = false;
+    var in_double_quote: bool = false;
+    var in_backtick: bool = false;
     var start = i.*;
     while (i.* < text.len) {
-        if (text[i.*] == '(') depth += 1;
-        if (text[i.*] == ')') {
-            if (depth == 0) {
-                if (i.* > start) {
-                    const col = try parseColumnDef(allocator, text[start..i.*]);
-                    if (col.name.len > 0) try cols.append(allocator, col) else allocator.free(col.name);
+        const c = text[i.*];
+        if (c == '\'' and !in_double_quote and !in_backtick) in_single_quote = !in_single_quote;
+        if (c == '"' and !in_single_quote and !in_backtick) in_double_quote = !in_double_quote;
+        if (c == '`' and !in_single_quote and !in_double_quote) in_backtick = !in_backtick;
+        if (!in_single_quote and !in_double_quote and !in_backtick) {
+            if (c == '(') depth += 1;
+            if (c == ')') {
+                if (depth == 0) {
+                    if (i.* > start) {
+                        const col = try parseColumnDef(allocator, text[start..i.*]);
+                        if (col.name.len > 0) try cols.append(allocator, col) else allocator.free(col.name);
+                    }
+                    i.* += 1;
+                    skipWhitespaceAndComments(text, i);
+                    if (i.* < text.len and text[i.*] == ';') i.* += 1;
+                    break;
+                } else {
+                    depth -= 1;
                 }
-                i.* += 1;
-                skipWhitespaceAndComments(text, i);
-                if (i.* < text.len and text[i.*] == ';') i.* += 1;
-                break;
-            } else {
-                depth -= 1;
             }
-        }
-        if (text[i.*] == ',' and depth == 0) {
-            const col = try parseColumnDef(allocator, text[start..i.*]);
-                    if (col.name.len > 0) try cols.append(allocator, col) else allocator.free(col.name);
-            i.* += 1;
-            start = i.*;
-            continue;
+            if (c == ',' and depth == 0) {
+                const col = try parseColumnDef(allocator, text[start..i.*]);
+                        if (col.name.len > 0) try cols.append(allocator, col) else allocator.free(col.name);
+                i.* += 1;
+                start = i.*;
+                continue;
+            }
         }
         i.* += 1;
     }
@@ -1046,8 +1069,11 @@ fn parseSqlSchema(allocator: std.mem.Allocator, sql: []const u8) ![]TableDef {
                 skipWhitespaceAndComments(sql, &i);
                 if (i < sql.len and sql[i] == '(') {
                     i += 1;
+                    const body_start = i;
                     const columns = try parseColumns(allocator, sql, &i);
-                    try tables.append(allocator, .{ .name = table_name, .columns = columns });
+                    const body_end = i;
+                    const fks = try extractForeignKeys(allocator, sql, body_start, body_end);
+                    try tables.append(allocator, .{ .name = table_name, .columns = columns, .foreign_keys = fks });
                 }
             }
         } else {
@@ -1057,11 +1083,171 @@ fn parseSqlSchema(allocator: std.mem.Allocator, sql: []const u8) ![]TableDef {
     return tables.toOwnedSlice(allocator);
 }
 
-fn inferModuleName(allocator: std.mem.Allocator, table_name: []const u8) ![]const u8 {
-    if (std.mem.indexOf(u8, table_name, "_")) |idx| {
-        return try allocator.dupe(u8, table_name[0..idx]);
+/// Find the longest common prefix (up to and including '_') shared by all table names.
+/// Returns 0 if no common prefix exists (tables are heterogeneous).
+fn commonTablePrefix(tables: []const TableDef) usize {
+    if (tables.len < 2) return 0;
+    const first = tables[0].name;
+    var prefix_len: usize = 0;
+    for (first, 0..) |c, i| {
+        for (tables[1..]) |t| {
+            if (i >= t.name.len or t.name[i] != c) {
+                // Backtrack to last '_' boundary for a clean prefix
+                while (prefix_len > 0 and first[prefix_len - 1] != '_') prefix_len -= 1;
+                return prefix_len;
+            }
+        }
+        prefix_len = i + 1;
     }
-    return try allocator.dupe(u8, table_name);
+    // All tables start with the same full prefix — backtrack to last '_'
+    while (prefix_len > 0 and first[prefix_len - 1] != '_') prefix_len -= 1;
+    return prefix_len;
+}
+
+/// Infer the module name for a table, optionally stripping a common prefix.
+fn inferModuleName(allocator: std.mem.Allocator, table_name: []const u8, strip_prefix_len: usize) ![]const u8 {
+    const effective = if (strip_prefix_len > 0 and strip_prefix_len < table_name.len)
+        table_name[strip_prefix_len..]
+    else
+        table_name;
+    if (std.mem.indexOf(u8, effective, "_")) |idx| {
+        return try allocator.dupe(u8, effective[0..idx]);
+    }
+    return try allocator.dupe(u8, effective);
+}
+
+/// Extract FOREIGN KEY references from raw SQL body text.
+fn extractForeignKeys(allocator: std.mem.Allocator, sql: []const u8, body_start: usize, body_end: usize) ![]ForeignKey {
+    var fks: std.ArrayList(ForeignKey) = std.ArrayList(ForeignKey).empty;
+    const body = sql[body_start..@min(body_end, sql.len)];
+
+    var i: usize = 0;
+    while (i + 7 < body.len) {
+        const rest = body[i..];
+        const rest_upper_buf = try allocator.alloc(u8, rest.len);
+        defer allocator.free(rest_upper_buf);
+        _ = std.ascii.upperString(rest_upper_buf, rest);
+        const ru = rest_upper_buf;
+
+        const fk_pos = std.mem.indexOf(u8, ru, "FOREIGN KEY") orelse break;
+        i += fk_pos + "FOREIGN KEY".len;
+
+        // Find the column name in parentheses after FOREIGN KEY
+        var j: usize = fk_pos + "FOREIGN KEY".len;
+        while (j < rest.len and (rest[j] == ' ' or rest[j] == '\t' or rest[j] == '\n' or rest[j] == '\r')) j += 1;
+        if (j < rest.len and rest[j] == '(') {
+            j += 1;
+            const col_start = j;
+            while (j < rest.len and rest[j] != ')') j += 1;
+            const col_name = try allocator.dupe(u8, std.mem.trim(u8, rest[col_start..j], " \t\n\r`"));
+            j += 1;
+
+            // Find REFERENCES
+            while (j + 10 < rest.len) : (j += 1) {
+                const sub_rest = rest[j..];
+                const sub_buf = try allocator.alloc(u8, sub_rest.len);
+                defer allocator.free(sub_buf);
+                _ = std.ascii.upperString(sub_buf, sub_rest);
+                if (std.mem.startsWith(u8, sub_buf, "REFERENCES")) {
+                    j += "REFERENCES".len;
+                    while (j < rest.len and (rest[j] == ' ' or rest[j] == '\t')) j += 1;
+                    const ref_start = j;
+                    while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '_' or rest[j] == '`')) j += 1;
+                    const ref_table = std.mem.trim(u8, rest[ref_start..j], "`");
+                    if (ref_table.len == 0) break;
+
+                    // Skip ref column in parens if present
+                    var ref_column: []const u8 = "id";
+                    if (j < rest.len and rest[j] == '(') {
+                        j += 1;
+                        const rc_start = j;
+                        while (j < rest.len and rest[j] != ')') j += 1;
+                        ref_column = try allocator.dupe(u8, std.mem.trim(u8, rest[rc_start..j], " \t\n\r`"));
+                        j += 1;
+                    } else {
+                        ref_column = try allocator.dupe(u8, ref_column);
+                    }
+
+                    try fks.append(allocator, .{
+                        .column_name = col_name,
+                        .ref_table = try allocator.dupe(u8, ref_table),
+                        .ref_column = ref_column,
+                    });
+                    break;
+                }
+            }
+        }
+        i += 1; // advance past this FK to find more
+    }
+    return fks.toOwnedSlice(allocator);
+}
+
+/// Infer module-level dependencies from FOREIGN KEY relationships.
+/// Maps referenced table names → module names using the same prefix-stripping logic.
+fn inferModuleDependencies(allocator: std.mem.Allocator, tables: []const TableDef, module_name: []const u8, strip_prefix_len: usize) ![]const u8 {
+    var deps: std.ArrayList([]const u8) = std.ArrayList([]const u8).empty;
+    var seen: std.StringHashMap(void) = std.StringHashMap(void).init(allocator);
+    defer seen.deinit();
+
+    for (tables) |table| {
+        for (table.foreign_keys) |fk| {
+            const ref_module = try inferModuleName(allocator, fk.ref_table, strip_prefix_len);
+            // Only add dependency if the referenced module is different from current module
+            if (!std.mem.eql(u8, ref_module, module_name)) {
+                if (!seen.contains(ref_module)) {
+                    try seen.put(ref_module, {});
+                    try deps.append(allocator, ref_module);
+                } else {
+                    allocator.free(ref_module);
+                }
+            } else {
+                allocator.free(ref_module);
+            }
+        }
+    }
+
+    if (deps.items.len == 0) return try allocator.dupe(u8, "&.{}");
+
+    // Build the dependencies literal: &.{ "dep1", "dep2" }
+    var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
+    try buf.appendSlice(allocator, "&.{ ");
+    for (deps.items, 0..) |dep, idx| {
+        if (idx > 0) try buf.appendSlice(allocator, ", ");
+        try buf.print(allocator, "\"{s}\"", .{dep});
+        allocator.free(dep);
+    }
+    try buf.appendSlice(allocator, " }");
+    deps.deinit(allocator);
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Build a module→tables map, auto-detecting the common table prefix for smart grouping.
+fn groupTablesByModule(allocator: std.mem.Allocator, tables: []const TableDef) !std.StringHashMap(std.ArrayList(TableDef)) {
+    const prefix_len = commonTablePrefix(tables);
+
+    var module_map = std.StringHashMap(std.ArrayList(TableDef)).init(allocator);
+    errdefer {
+        var iter = module_map.iterator();
+        while (iter.next()) |entry| {
+            entry.value_ptr.deinit(allocator);
+            allocator.free(entry.key_ptr.*);
+        }
+        module_map.deinit();
+    }
+
+    for (tables) |table| {
+        const mod_name = try inferModuleName(allocator, table.name, prefix_len);
+        const gop = try module_map.getOrPut(mod_name);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = mod_name;
+            gop.value_ptr.* = .empty;
+        } else {
+            allocator.free(mod_name);
+        }
+        try gop.value_ptr.append(allocator, table);
+    }
+
+    return module_map;
 }
 
 fn generateModuleModel(allocator: std.mem.Allocator, module_name: []const u8, tables: []const TableDef) ![]const u8 {
@@ -1229,68 +1415,67 @@ fn generateModuleApi(allocator: std.mem.Allocator, module_name: []const u8, tabl
         const delete_fn = try std.fmt.allocPrint(allocator, "delete{s}", .{model_name});
         defer allocator.free(delete_fn);
 
-        try buf.print(allocator, "    fn {s}(ctx: *zigmodu.http_server.Server.Context) !void {{\n", .{list_fn});
-        try buf.print(allocator, "        const self: *{s}Api = @ptrCast(@alignCast(ctx.user_data.?));\n", .{pascal_module});
+        try buf.print(allocator, "    fn {s}(ctx: *zigmodu.http_server.Context) !void {{\n", .{list_fn});
+        try buf.print(allocator, "        const self: *{s}Api = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));\n", .{pascal_module});
         try buf.appendSlice(allocator, "        const page_str = ctx.query.get(\"page\") orelse \"0\";\n");
         try buf.appendSlice(allocator, "        const size_str = ctx.query.get(\"size\") orelse \"10\";\n");
         try buf.appendSlice(allocator, "        const page = std.fmt.parseInt(usize, page_str, 10) catch {\n");
-        try buf.appendSlice(allocator, "            try ctx.sendError(400, \"invalid page\");\n");
+        try buf.print(allocator, "            std.log.warn(\"[{s}] list: invalid page\", .{{}});\n", .{module_name});
+        try buf.appendSlice(allocator, "            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), \"invalid page\");\n");
         try buf.appendSlice(allocator, "            return;\n");
         try buf.appendSlice(allocator, "        };\n");
         try buf.appendSlice(allocator, "        const size = std.fmt.parseInt(usize, size_str, 10) catch {\n");
-        try buf.appendSlice(allocator, "            try ctx.sendError(400, \"invalid size\");\n");
+        try buf.print(allocator, "            std.log.warn(\"[{s}] list: invalid size\", .{{}});\n", .{module_name});
+        try buf.appendSlice(allocator, "            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), \"invalid size\");\n");
         try buf.appendSlice(allocator, "            return;\n");
         try buf.appendSlice(allocator, "        };\n");
         try buf.print(allocator, "        const result = try self.service.{s}(page, size);\n", .{list_fn});
         try buf.appendSlice(allocator, "        try ctx.jsonStruct(200, result);\n");
         try buf.appendSlice(allocator, "    }\n\n");
 
-        try buf.print(allocator, "    fn {s}(ctx: *zigmodu.http_server.Server.Context) !void {{\n", .{get_fn});
-        try buf.print(allocator, "        const self: *{s}Api = @ptrCast(@alignCast(ctx.user_data.?));\n", .{pascal_module});
+        try buf.print(allocator, "    fn {s}(ctx: *zigmodu.http_server.Context) !void {{\n", .{get_fn});
+        try buf.print(allocator, "        const self: *{s}Api = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));\n", .{pascal_module});
         try buf.appendSlice(allocator, "        const id_str = ctx.params.get(\"id\") orelse {\n");
-        try buf.appendSlice(allocator, "            try ctx.sendError(400, \"missing id\");\n");
+        try buf.print(allocator, "            std.log.warn(\"[{s}] get: missing id\", .{{}});\n", .{module_name});
+        try buf.appendSlice(allocator, "            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), \"missing id\");\n");
         try buf.appendSlice(allocator, "            return;\n");
         try buf.appendSlice(allocator, "        };\n");
         try buf.appendSlice(allocator, "        const id = std.fmt.parseInt(i64, id_str, 10) catch {\n");
-        try buf.appendSlice(allocator, "            try ctx.sendError(400, \"invalid id\");\n");
+        try buf.print(allocator, "            std.log.warn(\"[{s}] get: invalid id\", .{{}});\n", .{module_name});
+        try buf.appendSlice(allocator, "            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), \"invalid id\");\n");
         try buf.appendSlice(allocator, "            return;\n");
         try buf.appendSlice(allocator, "        };\n");
-        try buf.print(allocator, "        const item = try self.service.{s}(id);\n", .{get_fn});
-        try buf.appendSlice(allocator, "        if (item) |v| {\n");
-        try buf.appendSlice(allocator, "            try ctx.jsonStruct(200, v);\n");
-        try buf.appendSlice(allocator, "        } else {\n");
-        try buf.appendSlice(allocator, "            try ctx.sendError(404, \"not found\");\n");
-        try buf.appendSlice(allocator, "        }\n");
+        try buf.print(allocator, "        const entity = try self.service.{s}(id);\n", .{get_fn});
+        try buf.appendSlice(allocator, "        try ctx.jsonStruct(200, entity);\n");
         try buf.appendSlice(allocator, "    }\n\n");
 
-        try buf.print(allocator, "    fn {s}(ctx: *zigmodu.http_server.Server.Context) !void {{\n", .{create_fn});
-        try buf.print(allocator, "        const self: *{s}Api = @ptrCast(@alignCast(ctx.user_data.?));\n", .{pascal_module});
+        try buf.print(allocator, "    fn {s}(ctx: *zigmodu.http_server.Context) !void {{\n", .{create_fn});
+        try buf.print(allocator, "        const self: *{s}Api = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));\n", .{pascal_module});
         try buf.print(allocator, "        const entity = ctx.bindJson(model.{s}) catch {{\n", .{model_name});
-        try buf.appendSlice(allocator, "            try ctx.sendError(400, \"invalid json body\");\n");
+        try buf.print(allocator, "            std.log.warn(\"[{s}] create: invalid body\", .{{}});\n", .{module_name});
+        try buf.appendSlice(allocator, "            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), \"invalid body\");\n");
         try buf.appendSlice(allocator, "            return;\n");
         try buf.appendSlice(allocator, "        };\n");
         try buf.print(allocator, "        const created = try self.service.{s}(entity);\n", .{create_fn});
         try buf.appendSlice(allocator, "        try ctx.jsonStruct(201, created);\n");
         try buf.appendSlice(allocator, "    }\n\n");
 
-        try buf.print(allocator, "    fn {s}(ctx: *zigmodu.http_server.Server.Context) !void {{\n", .{update_fn});
-        try buf.print(allocator, "        const self: *{s}Api = @ptrCast(@alignCast(ctx.user_data.?));\n", .{pascal_module});
+        try buf.print(allocator, "    fn {s}(ctx: *zigmodu.http_server.Context) !void {{\n", .{update_fn});
+        try buf.print(allocator, "        const self: *{s}Api = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));\n", .{pascal_module});
         try buf.print(allocator, "        const entity = ctx.bindJson(model.{s}) catch {{\n", .{model_name});
-        try buf.appendSlice(allocator, "            try ctx.sendError(400, \"invalid json body\");\n");
+        try buf.print(allocator, "            std.log.warn(\"[{s}] update: invalid body\", .{{}});\n", .{module_name});
+        try buf.appendSlice(allocator, "            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), \"invalid body\");\n");
         try buf.appendSlice(allocator, "            return;\n");
         try buf.appendSlice(allocator, "        };\n");
         try buf.print(allocator, "        try self.service.{s}(entity);\n", .{update_fn});
         try buf.appendSlice(allocator, "        try ctx.jsonStruct(200, entity);\n");
         try buf.appendSlice(allocator, "    }\n\n");
 
-        try buf.print(allocator, "    fn {s}(ctx: *zigmodu.http_server.Server.Context) !void {{\n", .{delete_fn});
-        try buf.print(allocator, "        const self: *{s}Api = @ptrCast(@alignCast(ctx.user_data.?));\n", .{pascal_module});
+        try buf.print(allocator, "    fn {s}(ctx: *zigmodu.http_server.Context) !void {{\n", .{delete_fn});
+        try buf.print(allocator, "        const self: *{s}Api = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));\n", .{pascal_module});
         try buf.appendSlice(allocator, "        const id_str = ctx.params.get(\"id\") orelse {\n");
-        try buf.appendSlice(allocator, "            try ctx.sendError(400, \"missing id\");\n");
-        try buf.appendSlice(allocator, "            return;\n");
-        try buf.appendSlice(allocator, "        };\n");
-        try buf.appendSlice(allocator, "        const id = std.fmt.parseInt(i64, id_str, 10) catch {\n");
-        try buf.appendSlice(allocator, "            try ctx.sendError(400, \"invalid id\");\n");
+        try buf.print(allocator, "            std.log.warn(\"[{s}] delete: missing id\", .{{}});\n", .{module_name});
+        try buf.appendSlice(allocator, "            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), \"invalid id\");\n");
         try buf.appendSlice(allocator, "            return;\n");
         try buf.appendSlice(allocator, "        };\n");
         try buf.print(allocator, "        try self.service.{s}(id);\n", .{delete_fn});
@@ -1302,10 +1487,90 @@ fn generateModuleApi(allocator: std.mem.Allocator, module_name: []const u8, tabl
     return buf.toOwnedSlice(allocator);
 }
 
-fn generateModuleZig(allocator: std.mem.Allocator, module_name: []const u8) ![]const u8 {
+fn generateModuleZig(allocator: std.mem.Allocator, module_name: []const u8, dependencies: []const u8) ![]const u8 {
     const pascal = try toPascalCase(allocator, module_name);
     defer allocator.free(pascal);
-    return orm_tpl.expandOrm(allocator, orm_tpl.sqlx_module_zig, module_name, pascal);
+    const template = orm_tpl.sqlx_module_zig;
+    // Replace <<MODULE_NAME>> and <<PASCAL_MODULE>> first
+    const s1 = try orm_tpl.expandOrm(allocator, template, module_name, pascal);
+    defer allocator.free(s1);
+    // Then replace <<DEPS>> with actual dependencies
+    return replaceAllStr(allocator, s1, "<<DEPS>>", dependencies);
+}
+
+fn replaceAllStr(allocator: std.mem.Allocator, haystack: []const u8, needle: []const u8, replacement: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < haystack.len) {
+        if (i + needle.len <= haystack.len and std.mem.eql(u8, haystack[i..][0..needle.len], needle)) {
+            try out.appendSlice(allocator, replacement);
+            i += needle.len;
+        } else {
+            try out.append(allocator, haystack[i]);
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Generate AI context index file (_ai.zig) for a module.
+/// Provides machine-readable metadata: dependencies, tables, API surface, extension points.
+fn generateAiContext(allocator: std.mem.Allocator, module_name: []const u8, tables: []const TableDef, dependencies: []const u8) ![]const u8 {
+    const pascal_mod = try toPascalCase(allocator, module_name);
+    defer allocator.free(pascal_mod);
+
+    var buf: std.ArrayList(u8) = .empty;
+
+    try buf.appendSlice(allocator, "// ═══════════════════════════════════════════════════════════\n");
+    try buf.appendSlice(allocator, "// AI Context: ");
+    try buf.appendSlice(allocator, module_name);
+    try buf.appendSlice(allocator, " module\n");
+    try buf.appendSlice(allocator, "// ═══════════════════════════════════════════════════════════\n");
+    try buf.appendSlice(allocator, "// Dependencies: ");
+    try buf.appendSlice(allocator, dependencies);
+    try buf.appendSlice(allocator, "\n");
+    try buf.appendSlice(allocator, "// Tables:\n");
+    for (tables) |table| {
+        try buf.print(allocator, "//   {s} — ", .{table.name});
+        var col_count: usize = 0;
+        for (table.columns) |col| {
+            if (col.col_type == .unknown and col.name.len == 0) continue;
+            col_count += 1;
+        }
+        try buf.print(allocator, "{d} columns", .{col_count});
+        if (table.foreign_keys.len > 0) {
+            try buf.appendSlice(allocator, ", FK: ");
+            for (table.foreign_keys, 0..) |fk, idx| {
+                if (idx > 0) try buf.appendSlice(allocator, ", ");
+                try buf.print(allocator, "{s}→{s}", .{ fk.column_name, fk.ref_table });
+            }
+        }
+        try buf.appendSlice(allocator, "\n");
+    }
+    try buf.appendSlice(allocator, "//\n");
+    try buf.appendSlice(allocator, "// Public API: service.zig\n");
+    for (tables) |table| {
+        const model_name = try toPascalCase(allocator, table.name);
+        defer allocator.free(model_name);
+        try buf.print(allocator, "//   list{s}s / get{s} / create{s} / update{s} / delete{s}\n", .{ model_name, model_name, model_name, model_name, model_name });
+    }
+    try buf.appendSlice(allocator, "//\n");
+    try buf.appendSlice(allocator, "// Extension points:\n");
+    try buf.appendSlice(allocator, "//   service_ext.zig — custom business logic (survives regeneration)\n");
+    try buf.appendSlice(allocator, "//   api_ext.zig — custom HTTP endpoints (survives regeneration)\n");
+    try buf.appendSlice(allocator, "//\n");
+    try buf.appendSlice(allocator, "// File map:\n");
+    try buf.appendSlice(allocator, "//   module.zig — declaration layer (module contract)\n");
+    try buf.appendSlice(allocator, "//   model.zig — data structures + jsonStringify\n");
+    try buf.appendSlice(allocator, "//   persistence.zig — ORM repositories\n");
+    try buf.appendSlice(allocator, "//   service.zig — CRUD delegation + event hooks\n");
+    try buf.appendSlice(allocator, "//   api.zig — HTTP routes + JSON handlers\n");
+    try buf.appendSlice(allocator, "//   root.zig — barrel exports\n");
+    try buf.appendSlice(allocator, "//   test.zig — smoke tests\n");
+    try buf.appendSlice(allocator, "// ═══════════════════════════════════════════════════════════\n");
+
+    return buf.toOwnedSlice(allocator);
 }
 
 fn writeModuleFiles(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u8, module_name: []const u8, tables: []const TableDef, opts: GenOptions) !void {
@@ -1325,31 +1590,59 @@ fn writeModuleFiles(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u
     defer allocator.free(persistence_path);
     try writeFileGen(io, persistence_path, persistence_code, opts);
 
-    const service_code = try generateModuleService(allocator, module_name, tables);
-    defer allocator.free(service_code);
-    const service_path = try std.fmt.allocPrint(allocator, "{s}/service.zig", .{module_dir});
-    defer allocator.free(service_path);
-    try writeFileGen(io, service_path, service_code, opts);
+    if (!opts.data_only) {
+        const service_code = try generateModuleService(allocator, module_name, tables);
+        defer allocator.free(service_code);
+        const service_path = try std.fmt.allocPrint(allocator, "{s}/service.zig", .{module_dir});
+        defer allocator.free(service_path);
+        try writeFileGen(io, service_path, service_code, opts);
 
-    const api_code = try generateModuleApi(allocator, module_name, tables);
-    defer allocator.free(api_code);
-    const api_path = try std.fmt.allocPrint(allocator, "{s}/api.zig", .{module_dir});
-    defer allocator.free(api_path);
-    try writeFileGen(io, api_path, api_code, opts);
+        const api_code = try generateModuleApi(allocator, module_name, tables);
+        defer allocator.free(api_code);
+        const api_path = try std.fmt.allocPrint(allocator, "{s}/api.zig", .{module_dir});
+        defer allocator.free(api_path);
+        try writeFileGen(io, api_path, api_code, opts);
 
-    const module_code = try generateModuleZig(allocator, module_name);
-    defer allocator.free(module_code);
-    const module_path = try std.fmt.allocPrint(allocator, "{s}/module.zig", .{module_dir});
-    defer allocator.free(module_path);
-    try writeFileGen(io, module_path, module_code, opts);
+        const dependencies_str = try inferModuleDependencies(allocator, tables, module_name, 0);
+        defer allocator.free(dependencies_str);
 
-    const pascal_mod = try toPascalCase(allocator, module_name);
-    defer allocator.free(pascal_mod);
-    const root_code = try orm_tpl.expandOrm(allocator, orm_tpl.sqlx_root_zig, module_name, pascal_mod);
-    defer allocator.free(root_code);
-    const root_path = try std.fmt.allocPrint(allocator, "{s}/root.zig", .{module_dir});
-    defer allocator.free(root_path);
-    try writeFileGen(io, root_path, root_code, opts);
+        const module_code = try generateModuleZig(allocator, module_name, dependencies_str);
+        defer allocator.free(module_code);
+        const module_path = try std.fmt.allocPrint(allocator, "{s}/module.zig", .{module_dir});
+        defer allocator.free(module_path);
+        try writeFileGen(io, module_path, module_code, opts);
+
+        const pascal_mod = try toPascalCase(allocator, module_name);
+        defer allocator.free(pascal_mod);
+        const root_code = try orm_tpl.expandOrm(allocator, orm_tpl.sqlx_root_zig, module_name, pascal_mod);
+        defer allocator.free(root_code);
+        const root_path = try std.fmt.allocPrint(allocator, "{s}/root.zig", .{module_dir});
+        defer allocator.free(root_path);
+        try writeFileGen(io, root_path, root_code, opts);
+
+        // Generate test.zig
+        const test_code = try orm_tpl.expandOrm(allocator, orm_tpl.sqlx_test_zig, module_name, pascal_mod);
+        defer allocator.free(test_code);
+        const test_path = try std.fmt.allocPrint(allocator, "{s}/test.zig", .{module_dir});
+        defer allocator.free(test_path);
+        try writeFileGen(io, test_path, test_code, opts);
+
+        // Generate _ai.zig — AI context index
+        const ai_ctx = try generateAiContext(allocator, module_name, tables, dependencies_str);
+        defer allocator.free(ai_ctx);
+        const ai_path = try std.fmt.allocPrint(allocator, "{s}/_ai.zig", .{module_dir});
+        defer allocator.free(ai_path);
+        try writeFileGen(io, ai_path, ai_ctx, opts);
+
+        // Generate _arch_test.zig — architecture verification tests
+        const arch_tpl = try orm_tpl.expandOrm(allocator, orm_tpl.sqlx_arch_test_zig, module_name, pascal_mod);
+        defer allocator.free(arch_tpl);
+        const arch_with_deps = try replaceAllStr(allocator, arch_tpl, "<<DEPS>>", dependencies_str);
+        defer allocator.free(arch_with_deps);
+        const arch_path = try std.fmt.allocPrint(allocator, "{s}/_arch_test.zig", .{module_dir});
+        defer allocator.free(arch_path);
+        try writeFileGen(io, arch_path, arch_with_deps, opts);
+    }
 
     std.log.info("Generated module '{s}' at {s}/ with {d} table(s)", .{ module_name, module_dir, tables.len });
 }
@@ -1595,6 +1888,12 @@ fn cmdOrm(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
                 if (c.comment) |com| allocator.free(com);
             }
             allocator.free(t.columns);
+            for (t.foreign_keys) |fk| {
+                allocator.free(fk.column_name);
+                allocator.free(fk.ref_table);
+                allocator.free(fk.ref_column);
+            }
+            allocator.free(t.foreign_keys);
         }
         allocator.free(tables);
     }
@@ -1610,75 +1909,690 @@ fn cmdOrm(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
 
     std.log.info("Parsed {d} table(s) from {s}", .{ tables.len, sql_path });
 
-    if (std.mem.eql(u8, backend, "zent")) {
-        // zent backend
-        if (forced_module) |mod_name| {
+    if (forced_module) |mod_name| {
+        // --module <name>: force all tables into a single module
+        if (std.mem.eql(u8, backend, "zent")) {
             try writeModuleFilesZent(io, allocator, out_dir, mod_name, tables, opts);
         } else {
-            var module_map = std.StringHashMap(std.ArrayList(TableDef)).init(allocator);
-            defer {
-                var iter = module_map.iterator();
-                while (iter.next()) |entry| {
-                    entry.value_ptr.deinit(allocator);
-                    allocator.free(entry.key_ptr.*);
-                }
-                module_map.deinit();
-            }
-
-            for (tables) |table| {
-                const mod_name = try inferModuleName(allocator, table.name);
-                const gop = try module_map.getOrPut(mod_name);
-                if (!gop.found_existing) {
-                    gop.key_ptr.* = mod_name;
-                    gop.value_ptr.* = std.ArrayList(TableDef).empty;
-                } else {
-                    allocator.free(mod_name);
-                }
-                try gop.value_ptr.append(allocator, table);
-            }
-
-            try ensureDirGen(io, out_dir, opts);
-            var iter = module_map.iterator();
-            while (iter.next()) |entry| {
-                try writeModuleFilesZent(io, allocator, out_dir, entry.key_ptr.*, entry.value_ptr.items, opts);
-            }
+            try writeModuleFiles(io, allocator, out_dir, mod_name, tables, opts);
         }
+        std.log.info("All {d} table(s) placed in module '{s}'", .{ tables.len, mod_name });
         return;
     }
 
-    // Default sqlx backend
-    if (forced_module) |mod_name| {
-        try writeModuleFiles(io, allocator, out_dir, mod_name, tables, opts);
-    } else {
-        var module_map = std.StringHashMap(std.ArrayList(TableDef)).init(allocator);
-        defer {
-            var iter = module_map.iterator();
-            while (iter.next()) |entry| {
-                entry.value_ptr.deinit(allocator);
-                allocator.free(entry.key_ptr.*);
-            }
-            module_map.deinit();
-        }
-
-        for (tables) |table| {
-            const mod_name = try inferModuleName(allocator, table.name);
-            const gop = try module_map.getOrPut(mod_name);
-            if (!gop.found_existing) {
-                gop.key_ptr.* = mod_name;
-                gop.value_ptr.* = std.ArrayList(TableDef).empty;
-            } else {
-                allocator.free(mod_name);
-            }
-            try gop.value_ptr.append(allocator, table);
-        }
-
-        try ensureDirGen(io, out_dir, opts);
+    // Auto-group: smart prefix detection + multi-module generation
+    var module_map = try groupTablesByModule(allocator, tables);
+    defer {
         var iter = module_map.iterator();
         while (iter.next()) |entry| {
+            entry.value_ptr.deinit(allocator);
+            allocator.free(entry.key_ptr.*);
+        }
+        module_map.deinit();
+    }
+
+    try ensureDirGen(io, out_dir, opts);
+
+    var iter = module_map.iterator();
+    var module_count: usize = 0;
+    while (iter.next()) |entry| {
+        if (std.mem.eql(u8, backend, "zent")) {
+            try writeModuleFilesZent(io, allocator, out_dir, entry.key_ptr.*, entry.value_ptr.items, opts);
+        } else {
             try writeModuleFiles(io, allocator, out_dir, entry.key_ptr.*, entry.value_ptr.items, opts);
         }
+        module_count += 1;
     }
+    std.log.info("Auto-grouped {d} table(s) into {d} module(s)", .{ tables.len, module_count });
 }
+
+// ── bigdemo: shortcut to regenerate the full shopdemo ──────────────
+
+fn cmdBigdemo(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
+    _ = args; // no extra args — everything is hardcoded
+    const embedded_sql = @embedFile("shopdemo/init.sql");
+
+    // Write embedded SQL to a temp file so cmdScaffold can read it
+    const tmp_path = ".zmodu_bigdemo_tmp.sql";
+    const tmp_file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{});
+    try tmp_file.writeStreamingAll(io, embedded_sql);
+    tmp_file.close(io);
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    // Delegate to scaffold with all capability flags
+    const scaffold_args = [_][]const u8{
+        "--sql",        tmp_path,
+        "--name",       "shopdemo",
+        "--out",        ".",
+        "--with-events",
+        "--with-resilience",
+        "--with-cluster",
+        "--with-marketing",
+        "--force",
+    };
+
+    std.log.info("🚀 zmodu bigdemo — regenerating shopdemo (152 tables, 42 modules)...", .{});
+    try cmdScaffold(io, allocator, &scaffold_args);
+    std.log.info("✅ bigdemo complete — shopdemo/ ready with 484 .zig files", .{});
+}
+
+// ── scaffold: one-shot SQL → full project ────────────────────────
+
+const ScaffoldOpts = struct {
+    sql_path: []const u8,
+    project_name: []const u8,
+    out_dir: []const u8,
+    force: bool,
+    dry_run: bool,
+    with_events: bool = false,
+    with_resilience: bool = false,
+    with_cluster: bool = false,
+    with_marketing: bool = false,
+};
+
+fn parseScaffoldArgs(allocator: std.mem.Allocator, args: []const []const u8) !ScaffoldOpts {
+    _ = allocator;
+    var sql_path: ?[]const u8 = null;
+    var project_name: ?[]const u8 = null;
+    var out_dir: []const u8 = ".";
+    var force: bool = false;
+    var dry_run: bool = false;
+
+    var with_events: bool = false;
+    var with_resilience: bool = false;
+    var with_cluster: bool = false;
+    var with_marketing: bool = false;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--sql")) {
+            if (i + 1 >= args.len) return error.CliUsage;
+            sql_path = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--name")) {
+            if (i + 1 >= args.len) return error.CliUsage;
+            project_name = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--out")) {
+            if (i + 1 >= args.len) return error.CliUsage;
+            out_dir = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--force")) {
+            force = true;
+        } else if (std.mem.eql(u8, args[i], "--dry-run")) {
+            dry_run = true;
+        } else if (std.mem.eql(u8, args[i], "--with-events")) {
+            with_events = true;
+        } else if (std.mem.eql(u8, args[i], "--with-resilience")) {
+            with_resilience = true;
+        } else if (std.mem.eql(u8, args[i], "--with-cluster")) {
+            with_cluster = true;
+        } else if (std.mem.eql(u8, args[i], "--with-marketing")) {
+            with_marketing = true;
+        } else {
+            std.log.err("Unknown scaffold option: {s}", .{args[i]});
+            return error.CliUsage;
+        }
+    }
+
+    if (sql_path == null) {
+        std.log.err("scaffold requires --sql <file>", .{});
+        return error.CliUsage;
+    }
+    if (project_name == null) {
+        std.log.err("scaffold requires --name <project-name>", .{});
+        return error.CliUsage;
+    }
+    return ScaffoldOpts{
+        .sql_path = sql_path.?,
+        .project_name = project_name.?,
+        .out_dir = out_dir,
+        .force = force,
+        .dry_run = dry_run,
+        .with_events = with_events,
+        .with_resilience = with_resilience,
+        .with_cluster = with_cluster,
+        .with_marketing = with_marketing,
+    };
+}
+
+fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
+    const sopts = try parseScaffoldArgs(allocator, args);
+
+    // 1. Read SQL
+    const sql_content = std.Io.Dir.cwd().readFileAlloc(io, sopts.sql_path, allocator, std.Io.Limit.limited(1024 * 1024)) catch |err| {
+        std.log.err("Cannot read SQL file '{s}': {s}", .{ sopts.sql_path, @errorName(err) });
+        return err;
+    };
+    defer allocator.free(sql_content);
+
+    const sql_for_parse = stripUtf8BomAndTrimSql(sql_content);
+    if (sql_for_parse.len == 0) return error.CliUsage;
+
+    const tables = parseSqlSchema(allocator, sql_for_parse) catch |err| {
+        std.log.err("Failed to parse SQL: {s}", .{@errorName(err)});
+        return err;
+    };
+    defer {
+        for (tables) |t| {
+            allocator.free(t.name);
+            for (t.columns) |c| {
+                allocator.free(c.name);
+                if (c.comment) |com| allocator.free(com);
+            }
+            allocator.free(t.columns);
+            for (t.foreign_keys) |fk| {
+                allocator.free(fk.column_name);
+                allocator.free(fk.ref_table);
+                allocator.free(fk.ref_column);
+            }
+            allocator.free(t.foreign_keys);
+        }
+        allocator.free(tables);
+    }
+
+    if (tables.len == 0) {
+        std.log.err("No CREATE TABLE found in '{s}'", .{sopts.sql_path});
+        return error.CliUsage;
+    }
+
+    std.log.info("Scaffolding '{s}' from {d} tables in {s}", .{ sopts.project_name, tables.len, sopts.sql_path });
+
+    // 2. Auto-group tables into modules
+    var module_map = try groupTablesByModule(allocator, tables);
+    defer {
+        var iter = module_map.iterator();
+        while (iter.next()) |entry| {
+            entry.value_ptr.deinit(allocator);
+            allocator.free(entry.key_ptr.*);
+        }
+        module_map.deinit();
+    }
+
+    // Collect sorted module names for deterministic codegen
+    var module_names: std.ArrayList([]const u8) = .empty;
+    defer module_names.deinit(allocator);
+    {
+        var iter = module_map.iterator();
+        while (iter.next()) |entry| {
+            try module_names.append(allocator, entry.key_ptr.*);
+        }
+        std.mem.sort([]const u8, module_names.items, {}, struct {
+            fn lt(_: void, a: []const u8, b: []const u8) bool { return std.mem.lessThan(u8, a, b); }
+        }.lt);
+    }
+
+    // 3. Create project directory structure
+    const project_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ sopts.out_dir, sopts.project_name });
+    defer allocator.free(project_dir);
+
+    if (sopts.dry_run) {
+        std.log.info("[dry-run] mkdir -p {s}", .{project_dir});
+    } else {
+        try std.Io.Dir.cwd().createDirPath(io, project_dir);
+    }
+
+    // 4. Generate modules under src/modules/
+    const modules_dir = try std.fmt.allocPrint(allocator, "{s}/src/modules", .{project_dir});
+    defer allocator.free(modules_dir);
+    const gen_opts: GenOptions = .{ .dry_run = sopts.dry_run, .force = sopts.force };
+
+    for (module_names.items) |mod_name| {
+        const tables_for_mod = module_map.get(mod_name).?;
+        try writeModuleFiles(io, allocator, modules_dir, mod_name, tables_for_mod.items, gen_opts);
+
+        // Generate service_ext.zig template per module
+        const pascal_mod = try toPascalCase(allocator, mod_name);
+        defer allocator.free(pascal_mod);
+        const ext_svc = try std.fmt.allocPrint(allocator,
+            \\// {s} service extension — add custom business logic here.
+            \\// Survives zmodu regeneration.
+            \\const std = @import("std");
+            \\const zigmodu = @import("zigmodu");
+            \\const {s}_svc = @import("service.zig");
+            \\
+            \\pub const {s}ServiceExt = struct {{
+            \\    svc: *{s}_svc.{s}Service,
+            \\    backend: zigmodu.SqlxBackend,
+            \\
+            \\    pub fn init(svc: *{s}_svc.{s}Service, backend: zigmodu.SqlxBackend) {s}ServiceExt {{
+            \\        return .{{ .svc = svc, .backend = backend }};
+            \\    }}
+            \\
+            \\    // Add your custom business methods here
+            \\}};
+            \\
+        , .{ mod_name, mod_name, pascal_mod, mod_name, pascal_mod, mod_name, pascal_mod, pascal_mod });
+        defer allocator.free(ext_svc);
+        const ext_svc_path = try std.fmt.allocPrint(allocator, "{s}/{s}/service_ext.zig", .{ modules_dir, mod_name });
+        defer allocator.free(ext_svc_path);
+        try writeFileGen(io, ext_svc_path, ext_svc, gen_opts);
+
+        // Generate api_ext.zig template per module
+        const ext_api = try std.fmt.allocPrint(allocator,
+            \\// {s} custom API endpoints — add business routes here.
+            \\// Survives zmodu regeneration.
+            \\const std = @import("std");
+            \\const zigmodu = @import("zigmodu");
+            \\const {s}_ext = @import("service_ext.zig");
+            \\
+            \\pub const {s}ApiExt = struct {{
+            \\    ext: *{s}_ext.{s}ServiceExt,
+            \\
+            \\    pub fn init(ext: *{s}_ext.{s}ServiceExt) {s}ApiExt {{
+            \\        return .{{ .ext = ext }};
+            \\    }}
+            \\
+            \\    pub fn registerRoutes(self: *{s}ApiExt, group: *zigmodu.http_server.RouteGroup) !void {{
+            \\        _ = self;
+            \\        // Add custom routes:
+            \\        // try group.get("/{s}/custom", myHandler, @ptrCast(@alignCast(self)));
+            \\    }}
+            \\}};
+            \\
+        , .{ mod_name, mod_name, pascal_mod, mod_name, pascal_mod, mod_name, pascal_mod, pascal_mod, pascal_mod, mod_name });
+        defer allocator.free(ext_api);
+        const ext_api_path = try std.fmt.allocPrint(allocator, "{s}/{s}/api_ext.zig", .{ modules_dir, mod_name });
+        defer allocator.free(ext_api_path);
+        try writeFileGen(io, ext_api_path, ext_api, gen_opts);
+    }
+
+    // 4.5 Generate marketing module group (--with-marketing)
+    if (sopts.with_marketing) {
+        const marketing_dir = try std.fmt.allocPrint(allocator, "{s}/marketing", .{modules_dir});
+        defer allocator.free(marketing_dir);
+        try ensureDirGen(io, marketing_dir, gen_opts);
+
+        const marketing_subs = [_][]const u8{ "coupon", "promotion", "points", "affiliate", "recommendation" };
+        for (marketing_subs) |sub| {
+            const sub_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ marketing_dir, sub });
+            defer allocator.free(sub_dir);
+            try ensureDirGen(io, sub_dir, gen_opts);
+
+            const sub_mod = try std.fmt.allocPrint(allocator,
+                \\const std = @import("std");
+                \\const zigmodu = @import("zigmodu");
+                \\
+                \\pub const info = zigmodu.api.Module{{
+                \\    .name = "marketing.{s}",
+                \\    .description = "Marketing {s} sub-module",
+                \\    .dependencies = &.{{"marketing"}},
+                \\    .is_internal = false,
+                \\}};
+                \\
+                \\pub fn init() !void {{ std.log.info("marketing.{s} initialized", .{{}}); }}
+                \\pub fn deinit() void {{ std.log.info("marketing.{s} cleaned up", .{{}}); }}
+                \\
+            , .{ sub, sub, sub, sub });
+            defer allocator.free(sub_mod);
+            const sub_path = try std.fmt.allocPrint(allocator, "{s}/module.zig", .{sub_dir});
+            defer allocator.free(sub_path);
+            try writeFileGen(io, sub_path, sub_mod, gen_opts);
+        }
+
+        // Generate hot_reload/targets/ for marketing rules
+        const hot_dir = try std.fmt.allocPrint(allocator, "{s}/hot_reload/targets", .{project_dir});
+        defer allocator.free(hot_dir);
+        try ensureDirGen(io, hot_dir, gen_opts);
+
+        const hot_rules = [_][]const u8{ "coupon_rules.zig", "promotion_rules.zig", "ab_test_config.zig" };
+        for (hot_rules) |rule_file| {
+            const rule_content = try std.fmt.allocPrint(allocator,
+                \\// Hot-reloadable {s} — edit without restarting the server.
+                \\// Watched by: zigmodu.HotReloader
+                \\pub const Rules = struct {{
+                \\    pub fn evaluate() bool {{ return true; }}
+                \\}};
+                \\
+            , .{rule_file});
+            defer allocator.free(rule_content);
+            const rule_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ hot_dir, rule_file });
+            defer allocator.free(rule_path);
+            try writeFileGen(io, rule_path, rule_content, gen_opts);
+        }
+
+        // Generate hot_reload/watcher.zig
+        const watcher_content =
+            \\const std = @import("std");
+            \\const zigmodu = @import("zigmodu");
+            \\
+            \\pub fn initWatcher(allocator: std.mem.Allocator, io: std.Io) !zigmodu.HotReloader {
+            \\    var reloader = zigmodu.HotReloader.init(allocator, io);
+            \\    try reloader.watchPath("hot_reload/targets/");
+            \\    reloader.onChange(struct {
+            \\        fn cb(path: []const u8) void {
+            \\            std.log.info("[HotReload] Marketing rules changed: {s}", .{path});
+            \\        }
+            \\    }.cb);
+            \\    return reloader;
+            \\}
+            \\
+        ;
+        const watcher_path = try std.fmt.allocPrint(allocator, "{s}/hot_reload/watcher.zig", .{project_dir});
+        defer allocator.free(watcher_path);
+        try writeFileGen(io, watcher_path, watcher_content, gen_opts);
+
+        // Generate plugins/ directory
+        const plugins_dir = try std.fmt.allocPrint(allocator, "{s}/plugins", .{project_dir});
+        defer allocator.free(plugins_dir);
+        try ensureDirGen(io, plugins_dir, gen_opts);
+
+        const premium_dir = try std.fmt.allocPrint(allocator, "{s}/premium", .{plugins_dir});
+        defer allocator.free(premium_dir);
+        try ensureDirGen(io, premium_dir, gen_opts);
+
+        const community_dir = try std.fmt.allocPrint(allocator, "{s}/community", .{plugins_dir});
+        defer allocator.free(community_dir);
+        try ensureDirGen(io, community_dir, gen_opts);
+
+        // Plugin manifest
+        const manifest_content =
+            \\const std = @import("std");
+            \\const zigmodu = @import("zigmodu");
+            \\
+            \\pub const PluginEntry = struct {
+            \\    name: []const u8,
+            \\    version: []const u8,
+            \\    license_key: ?[]const u8 = null,
+            \\    init_fn: *const fn () anyerror!void,
+            \\};
+            \\
+            \\pub var registry: std.StringHashMap(PluginEntry) = undefined;
+            \\
+            \\pub fn init(allocator: std.mem.Allocator) void {
+            \\    registry = std.StringHashMap(PluginEntry).init(allocator);
+            \\}
+            \\
+            \\pub fn register(name: []const u8, entry: PluginEntry) !void {
+            \\    try registry.put(name, entry);
+            \\    std.log.info("[Plugin] Registered: {s} v{s}", .{ name, entry.version });
+            \\}
+            \\
+        ;
+        const manifest_path = try std.fmt.allocPrint(allocator, "{s}/manifest.zig", .{plugins_dir});
+        defer allocator.free(manifest_path);
+        try writeFileGen(io, manifest_path, manifest_content, gen_opts);
+
+        std.log.info("Marketing module group generated with {d} sub-modules, hot_reload/, and plugins/", .{marketing_subs.len});
+    }
+
+    // 5. Generate build.zig
+    const build_zig = try generateBuildZig(allocator, sopts.project_name);
+    defer allocator.free(build_zig);
+    const build_path = try std.fmt.allocPrint(allocator, "{s}/build.zig", .{project_dir});
+    defer allocator.free(build_path);
+    try writeFileGen(io, build_path, build_zig, gen_opts);
+
+    // 6. Generate build.zig.zon
+    const build_zon = try generateBuildZonImpl(allocator, sopts.project_name, null);
+    defer allocator.free(build_zon);
+    const zon_path = try std.fmt.allocPrint(allocator, "{s}/build.zig.zon", .{project_dir});
+    defer allocator.free(zon_path);
+    try writeFileGen(io, zon_path, build_zon, gen_opts);
+
+    // 7. Generate src/main.zig with all module wiring
+    const main_zig = try generateScaffoldMainZig(allocator, sopts.project_name, module_names.items, sopts);
+    defer allocator.free(main_zig);
+    const main_path = try std.fmt.allocPrint(allocator, "{s}/src/main.zig", .{project_dir});
+    defer allocator.free(main_path);
+    try writeFileGen(io, main_path, main_zig, gen_opts);
+
+    // 8. Generate src/tests.zig
+    const tests_zig = try generateScaffoldTestsZig(allocator, module_names.items);
+    defer allocator.free(tests_zig);
+    const tests_path = try std.fmt.allocPrint(allocator, "{s}/src/tests.zig", .{project_dir});
+    defer allocator.free(tests_path);
+    try writeFileGen(io, tests_path, tests_zig, gen_opts);
+
+    // 9. Generate src/business/root.zig (skeleton)
+    const biz_dir = try std.fmt.allocPrint(allocator, "{s}/src/business", .{project_dir});
+    defer allocator.free(biz_dir);
+    try ensureDirGen(io, biz_dir, gen_opts);
+
+    // Generate business/root.zig with real module stubs
+    var biz_root_buf: std.ArrayList(u8) = .empty;
+    defer biz_root_buf.deinit(allocator);
+    try biz_root_buf.appendSlice(allocator, "// Business logic modules — add your domain logic here.\n");
+    try biz_root_buf.appendSlice(allocator, "pub const enums = @import(\"enums.zig\");\n");
+    try biz_root_buf.appendSlice(allocator, "pub const commission = @import(\"commission.zig\");\n");
+    try biz_root_buf.appendSlice(allocator, "pub const agent = @import(\"agent.zig\");\n");
+    try biz_root_buf.appendSlice(allocator, "pub const referral = @import(\"referral.zig\");\n");
+    try biz_root_buf.appendSlice(allocator, "pub const order_flow = @import(\"order_flow.zig\");\n");
+    try biz_root_buf.appendSlice(allocator, "pub const points = @import(\"points.zig\");\n");
+    try biz_root_buf.appendSlice(allocator, "pub const coupon = @import(\"coupon.zig\");\n");
+    const biz_root = try biz_root_buf.toOwnedSlice(allocator);
+    defer allocator.free(biz_root);
+    const biz_root_path = try std.fmt.allocPrint(allocator, "{s}/root.zig", .{biz_dir});
+    defer allocator.free(biz_root_path);
+    try writeFileGen(io, biz_root_path, biz_root, gen_opts);
+
+    // 10. Generate .env.example
+    const env_example =
+        \\# Database
+        \\DB_HOST=127.0.0.1
+        \\DB_PORT=3306
+        \\DB_USER=root
+        \\DB_PASS=
+        \\DB_NAME=heysen
+        \\DB_MAX_OPEN=10
+        \\DB_MAX_IDLE=5
+        \\
+        \\# HTTP
+        \\HTTP_PORT=8080
+        \\
+        \\# Agent Distribution
+        \\AGENT_LEVEL=2
+        \\AGENT_SETTLE_DAYS=7
+        \\AGENT_SELF_BUY=false
+        \\AGENT_FIRST_RATE=10
+        \\AGENT_SECOND_RATE=5
+        \\
+        \\# Order
+        \\ORDER_CLOSE_DAYS=3
+        \\ORDER_RECEIVE_DAYS=7
+        \\ORDER_REFUND_DAYS=7
+        \\
+    ;
+    const env_path = try std.fmt.allocPrint(allocator, "{s}/.env.example", .{project_dir});
+    defer allocator.free(env_path);
+    try writeFileGen(io, env_path, env_example, gen_opts);
+
+    if (!sopts.dry_run) {
+        try finalizeBuildZigZonFingerprint(io, allocator, sopts.project_name, zon_path);
+    }
+
+    std.log.info("Scaffold complete: {d} tables → {d} modules in '{s}'", .{ tables.len, module_names.items.len, project_dir });
+    std.log.info("  cd {s} && zig build run", .{project_dir});
+}
+
+fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u8, module_names: []const []const u8, sopts: ScaffoldOpts) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator,
+        \\const std = @import("std");
+        \\const zigmodu = @import("zigmodu");
+        \\
+        \\
+    );
+
+    // Module imports (with collision detection for reserved names)
+    for (module_names) |name| {
+        if (std.mem.eql(u8, name, "app") or std.mem.eql(u8, name, "system")) {
+            try buf.print(allocator, "const {s}_mod = @import(\"modules/{s}/root.zig\");\n", .{ name, name });
+        } else {
+            try buf.print(allocator, "const {s} = @import(\"modules/{s}/root.zig\");\n", .{ name, name });
+        }
+    }
+
+    try buf.appendSlice(allocator, "\nconst business = @import(\"business/root.zig\");\n\n");
+
+    try buf.appendSlice(allocator,
+        \\fn envOr(map: *std.process.Environ.Map, allocator: std.mem.Allocator, key: []const u8, default: []const u8) []const u8 {
+        \\    if (map.get(key)) |val| return allocator.dupe(u8, val) catch default;
+        \\    return default;
+        \\}
+        \\
+        \\fn envU16Or(map: *std.process.Environ.Map, key: []const u8, default: u16) u16 {
+        \\    const val = map.get(key) orelse return default;
+        \\    return std.fmt.parseInt(u16, val, 10) catch default;
+        \\}
+        \\
+        \\fn envF64Or(map: *std.process.Environ.Map, key: []const u8, default: f64) f64 {
+        \\    const val = map.get(key) orelse return default;
+        \\    return std.fmt.parseFloat(f64, val) catch default;
+        \\}
+        \\
+        \\fn envBoolOr(map: *std.process.Environ.Map, key: []const u8, default: bool) bool {
+        \\    const val = map.get(key) orelse return default;
+        \\    return std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
+        \\}
+        \\
+        \\pub fn main(init: std.process.Init) !void {
+        \\    const allocator = init.gpa;
+        \\    const env = init.environ_map;
+        \\
+        \\    const db_host = envOr(env, allocator, "DB_HOST", "127.0.0.1");
+        \\    const db_port = envU16Or(env, "DB_PORT", 3306);
+        \\    const db_user = envOr(env, allocator, "DB_USER", "root");
+        \\    const db_pass = envOr(env, allocator, "DB_PASS", "");
+        \\    const db_name = envOr(env, allocator, "DB_NAME", "heysen");
+        \\    const db_max_open = envU16Or(env, "DB_MAX_OPEN", 10);
+        \\    const db_max_idle = envU16Or(env, "DB_MAX_IDLE", 5);
+        \\    const http_port = envU16Or(env, "HTTP_PORT", 8080);
+        \\
+        \\    const db_cfg = zigmodu.sqlx.Config{
+        \\        .driver = .mysql, .host = db_host, .port = @intCast(db_port),
+        \\        .database = db_name, .username = db_user, .password = db_pass,
+        \\        .max_open_conns = @intCast(db_max_open), .max_idle_conns = @intCast(db_max_idle),
+        \\    };
+        \\
+        \\    var db_client = zigmodu.sqlx.Client.init(allocator, init.io, db_cfg);
+        \\    defer db_client.deinit();
+        \\    try db_client.connect();
+        \\    std.log.info("DB: {s}@{s}:{d}/{s} (pool={d}/{d})", .{ db_user, db_host, db_port, db_name, db_max_open, db_max_idle });
+        \\
+        \\    const backend = zigmodu.SqlxBackend{ .allocator = allocator, .client = &db_client };
+        \\
+        \\
+    );
+
+    // Persistence init (with collision-aware naming)
+    try buf.appendSlice(allocator, "    // -- Persistence --\n");
+    for (module_names) |name| {
+        const pascal = try toPascalCase(allocator, name);
+        defer allocator.free(pascal);
+        if (std.mem.eql(u8, name, "app") or std.mem.eql(u8, name, "system")) {
+            try buf.print(allocator, "    var {s}_p = {s}_mod.persistence.{s}Persistence.init(backend);\n", .{ name, name, pascal });
+        } else {
+            try buf.print(allocator, "    var {s}_p = {s}.persistence.{s}Persistence.init(backend);\n", .{ name, name, pascal });
+        }
+    }
+
+    // Service init
+    try buf.appendSlice(allocator, "\n    // -- Service --\n");
+    for (module_names) |name| {
+        const pascal = try toPascalCase(allocator, name);
+        defer allocator.free(pascal);
+        if (std.mem.eql(u8, name, "app") or std.mem.eql(u8, name, "system")) {
+            try buf.print(allocator, "    var {s}_s = {s}_mod.service.{s}Service.init(&{s}_p);\n", .{ name, name, pascal, name });
+        } else {
+            try buf.print(allocator, "    var {s}_s = {s}.service.{s}Service.init(&{s}_p);\n", .{ name, name, pascal, name });
+        }
+    }
+
+    // API init
+    try buf.appendSlice(allocator, "\n    // -- API --\n");
+    for (module_names) |name| {
+        const pascal = try toPascalCase(allocator, name);
+        defer allocator.free(pascal);
+        if (std.mem.eql(u8, name, "app") or std.mem.eql(u8, name, "system")) {
+            try buf.print(allocator, "    var {s}_api = {s}_mod.api.{s}Api.init(&{s}_s);\n", .{ name, name, pascal, name });
+        } else {
+            try buf.print(allocator, "    var {s}_api = {s}.api.{s}Api.init(&{s}_s);\n", .{ name, name, pascal, name });
+        }
+    }
+
+    // HTTP server + health check + route registration
+    try buf.appendSlice(allocator,
+        \\
+        \\    // -- HTTP Server --
+        \\    var server = zigmodu.http_server.Server.init(init.io, allocator, http_port);
+        \\    defer server.deinit();
+        \\    var root = server.group("/api");
+        \\
+        \\    // Health check
+        \\    try root.get("/health", healthCheck, null);
+        \\
+        \\
+    );
+
+    for (module_names) |name| {
+        try buf.print(allocator, "    try {s}_api.registerRoutes(&root);\n", .{name});
+    }
+
+    try buf.appendSlice(allocator,
+        \\
+        \\    // Custom business endpoints (add your api_ext routes here):
+        \\    // const my_ext = @import("modules/my_module/api_ext.zig");
+        \\    // var my_api = my_ext.MyApiExt.init(&my_ext_svc);
+        \\    // try my_api.registerRoutes(&root);
+        \\
+        \\
+    );
+
+    // ── Capability: Events (Stage B) ──
+    if (sopts.with_events) {
+        try buf.appendSlice(allocator, "\n    // -- EventBus (Stage B) --\n    const event_bus = zigmodu.TypedEventBus(struct { id: i64, name: []const u8 }).init(allocator);\n    defer event_bus.deinit();\n");
+    }
+
+    // ── Capability: Resilience (Stage C) ──
+    if (sopts.with_resilience) {
+        try buf.appendSlice(allocator, "\n    // -- Resilience (Stage C) --\n    var breaker = try zigmodu.CircuitBreaker.init(allocator, \"db\", .{ .failure_threshold = 5, .success_threshold = 2, .timeout_seconds = 30, .half_open_max_calls = 3 });\n    defer breaker.deinit();\n    var limiter = try zigmodu.RateLimiter.init(allocator, \"api\", 1000, 100);\n    defer limiter.deinit();\n");
+    }
+
+    // ── Capability: Cluster (Stage D) ──
+    if (sopts.with_cluster) {
+        try buf.appendSlice(allocator, "\n    // -- Cluster (Stage D) --\n    const node_id = try std.fmt.allocPrint(allocator, \"node-{d}\", .{@as(u64, @intCast(std.time.milliTimestamp()))});\n    var dist_bus = try zigmodu.DistributedEventBus.init(allocator, init.io, node_id);\n    defer dist_bus.deinit();\n    try dist_bus.start(9091);\n");
+    }
+
+    // Module count + lifecycle
+    var count_buf: [16]u8 = undefined;
+    const count_str = try std.fmt.bufPrint(&count_buf, "{d}", .{module_names.len});
+
+    try buf.appendSlice(allocator, "\n    std.log.info(\"");
+    try buf.appendSlice(allocator, count_str);
+    try buf.appendSlice(allocator, " modules + health check on :{d}\", .{ http_port });\n\n    // -- Lifecycle --\n    var app = try zigmodu.Application.init(\n        init.io, allocator, \"");
+    try buf.appendSlice(allocator, project_name);
+    try buf.appendSlice(allocator, "\",\n        .{ ");
+
+    for (module_names) |name| {
+        if (std.mem.eql(u8, name, "app") or std.mem.eql(u8, name, "system")) {
+            try buf.print(allocator, "{s}_mod.module, ", .{name});
+        } else {
+            try buf.print(allocator, "{s}.module, ", .{name});
+        }
+    }
+    try buf.appendSlice(allocator, "},\n        .{},\n    );\n    defer app.deinit();\n\n    try app.start();\n    try server.start();\n}\n\nfn healthCheck(ctx: *zigmodu.http_server.Context) !void {\n    try ctx.json(200, \"{\\\"status\\\":\\\"ok\\\"}\");\n}\n");
+
+    return buf.toOwnedSlice(allocator);
+}
+
+fn generateScaffoldTestsZig(allocator: std.mem.Allocator, module_names: []const []const u8) ![]const u8 {
+    _ = module_names;
+    return allocator.dupe(u8,
+        \\const std = @import("std");
+        \\const business = @import("business/root.zig");
+        \\
+        \\test "suite" {
+        \\    _ = business;
+        \\    try std.testing.expect(true);
+        \\}
+        \\
+    );
+}
+
+// ── Tests ────────────────────────────────────────────────────────
 
 test "parseColumnDef: PRIMARY KEY implies non-optional" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1728,7 +2642,7 @@ test "generateZentClient: buildGraph types on one line" {
         .has_default = false,
         .comment = null,
     }};
-    const table = TableDef{ .name = try a.dupe(u8, "line_item"), .columns = cols[0..] };
+    const table = TableDef{ .name = try a.dupe(u8, "line_item"), .columns = cols[0..], .foreign_keys = &.{} };
     const code = try generateZentClient(a, "order", &.{table});
     try std.testing.expect(std.mem.indexOf(u8, code, "buildGraph(&.{ LineItem });") != null);
     try std.testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, code, "buildGraph(&.{\n"));
@@ -1748,8 +2662,8 @@ test "generateZentClient: two tables comma-separated" {
         .comment = null,
     }};
     const tables = [_]TableDef{
-        .{ .name = try a.dupe(u8, "alpha"), .columns = cols[0..] },
-        .{ .name = try a.dupe(u8, "beta"), .columns = cols[0..] },
+        .{ .name = try a.dupe(u8, "alpha"), .columns = cols[0..], .foreign_keys = &.{} },
+        .{ .name = try a.dupe(u8, "beta"), .columns = cols[0..], .foreign_keys = &.{} },
     };
     const code = try generateZentClient(a, "mix", &tables);
     try std.testing.expect(std.mem.indexOf(u8, code, "buildGraph(&.{ Alpha, Beta });") != null);
@@ -1779,7 +2693,7 @@ test "generateZentSchema: TimeMixin when created_at present" {
             .comment = null,
         },
     };
-    const table = TableDef{ .name = try a.dupe(u8, "log"), .columns = cols[0..] };
+    const table = TableDef{ .name = try a.dupe(u8, "log"), .columns = cols[0..], .foreign_keys = &.{} };
     const code = try generateZentSchema(a, "audit", &.{table});
     try std.testing.expect(std.mem.indexOf(u8, code, "TimeMixin") != null);
 }

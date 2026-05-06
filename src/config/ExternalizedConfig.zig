@@ -48,7 +48,6 @@ pub const ExternalizedConfig = struct {
         interval_ms: u64 = 1000, // 默认1秒检查一次
     };
 
-
     pub fn deinit(self: *Self) void {
         // 停止监听线程
         self.stopWatching();

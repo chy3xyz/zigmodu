@@ -22,7 +22,7 @@ pub fn cors(config: CorsConfig) api.Middleware {
             fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
                 const cfg: *const CorsConfig = @ptrCast(@alignCast(user_data.?));
                 const origin = ctx.headers.get("Origin") orelse "";
-                
+
                 // Validate origin against whitelist; reject if not allowed
                 var origin_allowed = false;
                 if (std.mem.eql(u8, origin, "")) {
@@ -35,13 +35,13 @@ pub fn cors(config: CorsConfig) api.Middleware {
                         }
                     }
                 }
-                
+
                 if (!origin_allowed) {
                     ctx.status_code = 403;
                     ctx.responded = true;
                     return;
                 }
-                
+
                 if (cfg.allow_origins.len > 0 and !std.mem.eql(u8, cfg.allow_origins[0], "*")) {
                     try ctx.setHeader("Access-Control-Allow-Origin", origin);
                     try ctx.setHeader("Vary", "Origin");
@@ -227,7 +227,7 @@ pub fn jwtAuth(secret: []const u8) api.Middleware {
                 try next(ctx);
             }
         }.mw,
-        .user_data = @constCast(@ptrCast(&secret)),
+        .user_data = @ptrCast(@constCast(&secret)),
     };
 }
 

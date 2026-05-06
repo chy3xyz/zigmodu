@@ -53,7 +53,6 @@ pub const Application = struct {
         docs_path: ?[]const u8 = null,
     };
 
-
     /// Initialize application with modules
     pub fn init(
         io: std.Io,

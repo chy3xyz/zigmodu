@@ -16,7 +16,6 @@ pub const RedisConfig = struct {
     write_timeout_ms: u32 = 3000,
 };
 
-
 /// Redis client for zigzero
 pub const Redis = struct {
     allocator: std.mem.Allocator,
@@ -41,7 +40,6 @@ pub const Redis = struct {
             self.stream = null;
         }
     }
-
 
     /// Connect to Redis server
     pub fn connect(self: *Redis) !void {

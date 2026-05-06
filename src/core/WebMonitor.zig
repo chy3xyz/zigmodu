@@ -116,7 +116,6 @@ pub const WebMonitor = struct {
     }
 
     fn handleIndex(self: *Self, stream: std.Io.net.Stream) void {
-
         const html =
             \\<!DOCTYPE html>
             \\u003chtml>
@@ -187,7 +186,6 @@ pub const WebMonitor = struct {
     }
 
     fn handleHealth(self: *Self, stream: std.Io.net.Stream) void {
-
         const json = "{\"status\":\"healthy\",\"timestamp\":0}";
 
         var response_buf: [256]u8 = undefined;
@@ -213,7 +211,6 @@ pub const WebMonitor = struct {
     }
 
     fn handle404(self: *Self, stream: std.Io.net.Stream) void {
-
         const body = "Not Found";
 
         var response_buf: [256]u8 = undefined;

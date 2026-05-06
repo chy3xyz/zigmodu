@@ -579,11 +579,9 @@ test "SecurityScanner scanModule" {
     try f1.writeStreamingAll(std.testing.io, "const password = \"secret123\";\n");
     f1.close(std.testing.io);
 
-
     const f2 = try tmp_dir.dir.createFile(std.testing.io, "http.zig", .{});
     try f2.writeStreamingAll(std.testing.io, "const url = \"http://example.com\";\n");
     f2.close(std.testing.io);
-
 
     const f3 = try tmp_dir.dir.createFile(std.testing.io, "crypto.zig", .{});
     try f3.writeStreamingAll(std.testing.io, "const hash = MD5.init();\n");

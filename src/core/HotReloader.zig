@@ -165,8 +165,6 @@ pub const HotReloader = struct {
     }
 
     fn hashFile(self: *Self, path: []const u8) !u64 {
-
-
         const file = try std.Io.Dir.openFileAbsolute(self.io, path, .{});
         defer std.Io.File.close(file, self.io);
 

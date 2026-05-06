@@ -13,4 +13,4 @@ pub const <<PASCAL_MODULE>>Api = struct {
         return .{ .service = service_ptr };
     }
 
-    pub fn registerRoutes(self: *<<PASCAL_MODULE>>Api, group: *zigmodu.http_server.Server.RouteGroup) !void {
+    pub fn registerRoutes(self: *<<PASCAL_MODULE>>Api, group: *zigmodu.http_server.RouteGroup) !void {

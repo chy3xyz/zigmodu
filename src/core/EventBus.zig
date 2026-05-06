@@ -128,7 +128,7 @@ pub fn EventBus(comptime EventType: type) type {
     };
 }
 
-    pub fn TypedEventBus(comptime T: type) type {
+pub fn TypedEventBus(comptime T: type) type {
     return struct {
         const Self = @This();
         const CallbackType = *const fn (T) void;

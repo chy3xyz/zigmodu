@@ -294,7 +294,16 @@ pub const InstrumentedEventListener = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        var span_iter = self.event_processing_spans.iterator();
+        while (span_iter.next()) |entry| {
+            self.event_processing_spans.allocator.free(entry.key_ptr.*);
+        }
         self.event_processing_spans.deinit();
+
+        var time_iter = self.event_start_times.iterator();
+        while (time_iter.next()) |entry| {
+            self.event_start_times.allocator.free(entry.key_ptr.*);
+        }
         self.event_start_times.deinit();
     }
 
@@ -311,6 +320,7 @@ pub const InstrumentedEventListener = struct {
     pub fn onEventConsumeStart(self: *Self, event_name: []const u8, module_name: []const u8) !void {
         // 查找发布时的 span 作为父 span
         const pub_key = try std.fmt.allocPrint(self.event_processing_spans.allocator, "{s}:{s}", .{ event_name, module_name });
+        defer self.event_processing_spans.allocator.free(pub_key);
         const parent_span = self.event_processing_spans.get(pub_key);
 
         const span = try self.instrumentation.recordEventConsumed(event_name, module_name, parent_span);

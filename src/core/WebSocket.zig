@@ -22,7 +22,7 @@ pub const WebSocketServer = struct {
     on_connect_cb: ?*const fn (*WebSocketClient) void,
     on_message_cb: ?*const fn (*WebSocketClient, []const u8) void,
     allowed_origins: []const []const u8 = &.{},
-    
+
     pub fn init(allocator: std.mem.Allocator, io: std.Io, port: u16) Self {
         return .{
             .allocator = allocator,

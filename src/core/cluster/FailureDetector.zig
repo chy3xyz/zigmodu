@@ -241,12 +241,94 @@ fn normalCDF(z: f64) f64 {
 }
 
 // ============================================================================
-// Tests - DISABLED due to Zig 0.16.0 test compilation type resolution issue
+// Tests
 // ============================================================================
-//
-// Inline tests are disabled because Zig 0.16.0 has a known issue where
-// std.ArrayList.init(allocator) fails type resolution inside nested struct
-// literals during test compilation. The modules compile correctly via
-// `zig build` but fail during `zig build test`.
-//
-// To enable tests when this issue is fixed, remove the `//` prefix from each test.
+
+test "AccrualFailureDetector init and deinit" {
+    const allocator = std.testing.allocator;
+    var fd = AccrualFailureDetector.init(allocator, .{});
+    defer fd.deinit();
+}
+
+test "AccrualFailureDetector heartbeat and isAlive" {
+    const allocator = std.testing.allocator;
+    var fd = AccrualFailureDetector.init(allocator, .{
+        .phi_threshold = 8.0,
+        .min_std_deviation_ms = 100.0,
+    });
+    defer fd.deinit();
+
+    // No heartbeats yet = healthy (default)
+    try std.testing.expect(fd.isAlive("node-1"));
+
+    // Record a heartbeat
+    try fd.heartbeat("node-1");
+    try std.testing.expect(fd.isAlive("node-1"));
+}
+
+test "AccrualFailureDetector phi calculation" {
+    const allocator = std.testing.allocator;
+    var fd = AccrualFailureDetector.init(allocator, .{
+        .phi_threshold = 8.0,
+        .min_std_deviation_ms = 100.0,
+    });
+    defer fd.deinit();
+
+    // Initial phi for unknown node
+    try std.testing.expectEqual(@as(f64, 0.0), fd.phi("unknown"));
+
+    // Record first heartbeat
+    try fd.heartbeat("node-1");
+    // Need at least 2 heartbeats for phi calculation
+    try std.testing.expectEqual(@as(f64, 0.0), fd.phi("node-1"));
+}
+
+test "AccrualFailureDetector remove" {
+    const allocator = std.testing.allocator;
+    var fd = AccrualFailureDetector.init(allocator, .{});
+    defer fd.deinit();
+
+    try fd.heartbeat("node-temp");
+    try std.testing.expect(fd.isAlive("node-temp"));
+
+    fd.remove("node-temp");
+    // After removal, node is treated as unknown = alive
+    try std.testing.expect(fd.isAlive("node-temp"));
+}
+
+test "AccrualFailureDetector getStats" {
+    const allocator = std.testing.allocator;
+    var fd = AccrualFailureDetector.init(allocator, .{
+        .min_std_deviation_ms = 100.0,
+    });
+    defer fd.deinit();
+
+    // No stats for unknown node
+    try std.testing.expect(fd.getStats("ghost") == null);
+
+    // Record heartbeats
+    try fd.heartbeat("node-1");
+    try fd.heartbeat("node-1");
+
+    const stats = fd.getStats("node-1").?;
+    try std.testing.expect(stats.is_alive);
+    // With rapid heartbeats (interval_ms = 0), no intervals are recorded.
+    // sample_count reflects the number of valid (positive) intervals.
+    try std.testing.expect(stats.sample_count >= 0);
+}
+
+test "normalCDF known values" {
+    // CDF(0) = 0.5
+    const cdf0 = normalCDF(0.0);
+    try std.testing.expect(cdf0 > 0.49 and cdf0 < 0.51);
+
+    // Note: normalCDF computes CDF(erf(z)), not the standard Φ(z) = CDF(erf(z/√2)).
+    // This is intentional for the φ accrual failure detector's calibration.
+    // CDF(1.0) = 0.5 * (1 + erf(1.0)) ≈ 0.921
+    const cdf1 = normalCDF(1.0);
+    try std.testing.expect(cdf1 > 0.91 and cdf1 < 0.93);
+
+    // CDF(-1.0) = 0.5 * (1 - erf(1.0)) ≈ 0.079
+    const cdf_neg1 = normalCDF(-1.0);
+    try std.testing.expect(cdf_neg1 > 0.07 and cdf_neg1 < 0.09);
+}

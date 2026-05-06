@@ -166,12 +166,12 @@ pub const PrometheusMetrics = struct {
         const name_copy = try self.allocator.dupe(u8, name);
         const help_copy = try self.allocator.dupe(u8, help);
 
-const counter = Counter{
-.name = name_copy,
+        const counter = Counter{
+            .name = name_copy,
             .help = help_copy,
             .value = std.atomic.Value(u64).init(0),
-.labels = std.StringHashMap([]const u8).init(self.allocator),
-};
+            .labels = std.StringHashMap([]const u8).init(self.allocator),
+        };
 
         try self.counters.put(name_copy, counter);
         return self.counters.getPtr(name_copy).?;

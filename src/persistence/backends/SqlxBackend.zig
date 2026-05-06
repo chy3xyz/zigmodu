@@ -148,4 +148,3 @@ const User = struct {
     name: []const u8,
     age: i64,
 };
-

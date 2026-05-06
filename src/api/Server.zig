@@ -728,191 +728,6 @@ fn getStatusText(status: u16) []const u8 {
     };
 }
 
-/// HTTP response writer
-const ResponseWriter = struct {
-    pub fn write(io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net.Stream, status: u16, headers: *const std.StringHashMap([]const u8), body: []const u8) !void {
-        const status_text = getStatusText(status);
-        
-        // Build headers string
-        var header_parts = std.ArrayList([]const u8).empty;
-        defer header_parts.deinit(allocator);
-        
-        try header_parts.append(allocator, "HTTP/1.1 ");
-        try header_parts.append(allocator, status_text);
-        try header_parts.append(allocator, "\r\n");
-        
-        // Write headers
-        var iter = headers.iterator();
-        while (iter.next()) |entry| {
-            try header_parts.append(allocator, entry.key_ptr.*);
-            try header_parts.append(allocator, ": ");
-            try header_parts.append(allocator, entry.value_ptr.*);
-            try header_parts.append(allocator, "\r\n");
-        }
-        
-        // Write content length and blank line
-        try header_parts.append(allocator, "Content-Length: ");
-        const len_str = try std.fmt.allocPrint(allocator, "{d}", .{body.len});
-        defer allocator.free(len_str);
-        try header_parts.append(allocator, len_str);
-        try header_parts.append(allocator, "\r\n\r\n");
-        
-        // Calculate total header length
-        var header_len: usize = 0;
-        for (header_parts.items) |part| {
-            header_len += part.len;
-        }
-        
-        // Combine header and body
-        const response = try allocator.alloc(u8, header_len + body.len);
-        defer allocator.free(response);
-        
-        var offset: usize = 0;
-        for (header_parts.items) |part| {
-            @memcpy(response[offset..][0..part.len], part);
-            offset += part.len;
-        }
-        @memcpy(response[offset..], body);
-        
-        var write_buf: [4096]u8 = undefined;
-        var w = stream.writer(io, &write_buf);
-        try w.interface.writeAll(response);
-        try w.interface.flush();
-    }
-};
-
-/// Async HTTP request/response handler
-
-/// Parses an HTTP request from a raw byte buffer.
-/// Returns the number of bytes consumed (request line + headers + body).
-const ParsedRequestAsync = struct {
-    method: Method,
-    path: []const u8,
-    raw_path: []const u8,
-    query: std.StringHashMap([]const u8),
-    headers: std.StringHashMap([]const u8),
-    body: ?[]const u8,
-    consumed: usize,
-
-    pub fn deinit(self: *ParsedRequestAsync, allocator: std.mem.Allocator) void {
-        allocator.free(self.path);
-        allocator.free(self.raw_path);
-        var qiter = self.query.iterator();
-        while (qiter.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            allocator.free(entry.value_ptr.*);
-        }
-        self.query.deinit();
-        var hiter = self.headers.iterator();
-        while (hiter.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            allocator.free(entry.value_ptr.*);
-        }
-        self.headers.deinit();
-        if (self.body) |b| allocator.free(b);
-    }
-};
-
-/// Parse HTTP request from raw buffer.
-/// Returns the parsed request and the number of bytes consumed from the buffer.
-pub fn parseHttpRequest(allocator: std.mem.Allocator, raw: []const u8, max_body_size: usize) !ParsedRequestAsync {
-    var pos: usize = 0;
-
-    // Read request line (until \r\n or just \n)
-    const line_end = findLineEnd(raw[pos..]) orelse return error.InvalidRequest;
-    const request_line_raw = raw[pos .. pos + line_end];
-    pos += line_end;
-    if (pos < raw.len and raw[pos] == '\n') pos += 1;
-    if (pos < raw.len and raw[pos - 1] == '\r' and raw[pos - 1] == 0) pos += 0; // handle trailing check
-
-    var iter = std.mem.splitScalar(u8, request_line_raw, ' ');
-    const method_str = iter.next() orelse return error.InvalidRequest;
-    const path_str = iter.next() orelse return error.InvalidRequest;
-    _ = iter.next() orelse return error.InvalidRequest; // HTTP version
-
-    const method = Method.fromString(method_str);
-
-    // Parse query
-    var path = path_str;
-    var query_map = std.StringHashMap([]const u8).init(allocator);
-    if (std.mem.indexOf(u8, path_str, "?")) |query_start| {
-        path = path_str[0..query_start];
-        const query_str = path_str[query_start + 1 ..];
-        var qiter = std.mem.splitScalar(u8, query_str, '&');
-        while (qiter.next()) |param| {
-            if (param.len == 0) continue;
-            if (std.mem.indexOf(u8, param, "=")) |eq| {
-                const key = try allocator.dupe(u8, param[0..eq]);
-                const val = try allocator.dupe(u8, param[eq + 1 ..]);
-                try query_map.put(key, val);
-            }
-        }
-    } else {
-        const path_copy = try allocator.dupe(u8, path);
-        path = path_copy;
-    }
-
-    // Parse headers
-    var headers = std.StringHashMap([]const u8).init(allocator);
-    var content_length: usize = 0;
-
-    while (pos < raw.len) {
-        const header_end = findLineEnd(raw[pos..]) orelse break;
-        const header_line = raw[pos .. pos + header_end];
-        pos += header_end;
-        if (pos < raw.len and raw[pos] == '\n') pos += 1;
-
-        // Empty line = end of headers
-        if (header_line.len == 0 or (header_line.len == 1 and header_line[0] == '\r')) break;
-
-        const clean_line = if (header_line.len > 0 and header_line[header_line.len - 1] == '\r')
-            header_line[0 .. header_line.len - 1]
-        else
-            header_line;
-
-        if (std.mem.indexOf(u8, clean_line, ": ")) |colon| {
-            const key = try allocator.dupe(u8, clean_line[0..colon]);
-            const val = try allocator.dupe(u8, clean_line[colon + 2 ..]);
-            if (std.ascii.eqlIgnoreCase(key, "content-length")) {
-                content_length = std.fmt.parseInt(usize, val, 10) catch 0;
-            }
-            try headers.put(key, val);
-        }
-    }
-
-    // Read body
-    var body: ?[]const u8 = null;
-    var body_consumed: usize = 0;
-    if (content_length > 0) {
-        if (content_length > max_body_size) {
-            return error.BodyTooLarge;
-        }
-        if (pos + content_length <= raw.len) {
-            body = try allocator.dupe(u8, raw[pos .. pos + content_length]);
-            body_consumed = content_length;
-        }
-    }
-
-    const consumed = pos + body_consumed;
-
-    const raw_path = try allocator.dupe(u8, path);
-
-    return ParsedRequestAsync{
-        .method = method,
-        .path = path,
-        .raw_path = raw_path,
-        .query = query_map,
-        .headers = headers,
-        .body = body,
-        .consumed = consumed,
-    };
-}
-
-fn findLineEnd(line: []const u8) ?usize {
-    return std.mem.indexOf(u8, line, "\r\n") orelse
-           std.mem.indexOf(u8, line, "\n");
-}
-
 /// Write HTTP response to a `std.Io.net.Stream`.
 fn writeResponse(io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net.Stream, status: u16, headers: std.StringHashMap([]const u8), body: []const u8) !void {
     const status_text = getStatusText(status);
@@ -1420,4 +1235,135 @@ test "middleware chain execution" {
     try std.testing.expectEqual(@as(u8, 3), state.call_order[2]);
     try std.testing.expectEqual(@as(u8, 4), state.call_order[3]);
     try std.testing.expectEqual(@as(u8, 5), state.call_order[4]);
+}
+
+test "integration: router + handler + response" {
+    const allocator = std.testing.allocator;
+
+    // 1. Set up server with a route
+    var server = Server.init(std.testing.io, allocator, 0);
+    defer server.deinit();
+
+    const HandlerCtx = struct {
+        var last_id: u32 = 0;
+        var last_page: u32 = 0;
+    };
+
+    try server.addRoute(.{
+        .method = .GET,
+        .path = "/users/{id}",
+        .handler = struct {
+            fn handle(ctx: *Context) anyerror!void {
+                const id_str = ctx.param("id") orelse "0";
+                const id = try std.fmt.parseInt(u32, id_str, 10);
+                HandlerCtx.last_id = id;
+
+                const page_str = ctx.queryParam("page") orelse "1";
+                HandlerCtx.last_page = try std.fmt.parseInt(u32, page_str, 10);
+
+                try ctx.json(200, "{\"found\":true}");
+            }
+        }.handle,
+    });
+
+    // 2. Simulate a matched request
+    var matched = server.router.match(.GET, "/users/99");
+    try std.testing.expect(matched != null);
+
+    if (matched) |*m| {
+        defer {
+            var it = m.params.iterator();
+            while (it.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                allocator.free(entry.value_ptr.*);
+            }
+            m.params.deinit();
+        }
+
+        var ctx = try Context.init(allocator, .GET, "/users/99");
+        defer ctx.deinit();
+
+        // Copy params from matched route
+        var piter = m.params.iterator();
+        while (piter.next()) |entry| {
+            const key = try allocator.dupe(u8, entry.key_ptr.*);
+            const val = try allocator.dupe(u8, entry.value_ptr.*);
+            try ctx.params.put(key, val);
+        }
+
+        // Set a query param
+        const qk = try allocator.dupe(u8, "page");
+        const qv = try allocator.dupe(u8, "5");
+        try ctx.query.put(qk, qv);
+
+        // Execute handler
+        try m.route.handler(&ctx);
+
+        // Verify response
+        try std.testing.expectEqual(@as(u32, 99), HandlerCtx.last_id);
+        try std.testing.expectEqual(@as(u32, 5), HandlerCtx.last_page);
+        try std.testing.expectEqual(@as(u16, 200), ctx.status_code);
+        try std.testing.expect(ctx.responded);
+        try std.testing.expect(std.mem.indexOf(u8, ctx.response_body.items, "found") != null);
+    }
+}
+
+test "integration: router + global middleware + handler" {
+    const allocator = std.testing.allocator;
+
+    var server = Server.init(std.testing.io, allocator, 0);
+    defer server.deinit();
+
+    const MwCtx = struct {
+        var called: bool = false;
+        var handled: bool = false;
+    };
+
+    // Add global middleware
+    try server.addMiddleware(.{
+        .func = struct {
+            fn mw(ctx: *Context, next: HandlerFn, _: ?*anyopaque) anyerror!void {
+                MwCtx.called = true;
+                try next(ctx);
+            }
+        }.mw,
+    });
+
+    // Add route
+    try server.addRoute(.{
+        .method = .GET,
+        .path = "/health",
+        .handler = struct {
+            fn handle(ctx: *Context) anyerror!void {
+                MwCtx.handled = true;
+                try ctx.json(200, "{\"status\":\"ok\"}");
+            }
+        }.handle,
+    });
+
+    // Simulate match
+    var matched = server.router.match(.GET, "/health");
+    try std.testing.expect(matched != null);
+
+    if (matched) |*m| {
+        defer {
+            var it = m.params.iterator();
+            while (it.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                allocator.free(entry.value_ptr.*);
+            }
+            m.params.deinit();
+        }
+
+        var ctx = try Context.init(allocator, .GET, "/health");
+        defer ctx.deinit();
+
+        // Execute with middleware chain
+        try server.executeWithMiddleware(&ctx, m.route.handler, m.route.middleware);
+
+        try std.testing.expect(MwCtx.called);
+        try std.testing.expect(MwCtx.handled);
+        try std.testing.expectEqual(@as(u16, 200), ctx.status_code);
+        try std.testing.expect(ctx.responded);
+    }
 }

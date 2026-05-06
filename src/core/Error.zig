@@ -214,41 +214,21 @@ pub const HttpCode = enum(i32) {
 /// Map ZigModuError to HttpCode
 pub fn toHttpCode(err: ZigModuError) HttpCode {
     return switch (err) {
-        error.ModuleNotFound,
-        error.DependencyNotFound,
-        error.CacheKeyNotFound,
-        error.NotFound,
-        error.ServiceNotFound,
-        error.EventHandlerNotFound,
-        error.ConfigFileNotFound => .NotFound,
+        error.ModuleNotFound, error.DependencyNotFound, error.CacheKeyNotFound, error.NotFound, error.ServiceNotFound, error.EventHandlerNotFound, error.ConfigFileNotFound => .NotFound,
 
-        error.AuthenticationFailed,
-        error.InvalidToken,
-        error.TokenExpired,
-        error.InvalidCredentials => .Unauthorized,
+        error.AuthenticationFailed, error.InvalidToken, error.TokenExpired, error.InvalidCredentials => .Unauthorized,
 
         error.AuthorizationFailed => .Forbidden,
 
         error.RateLimitExceeded => .RateLimit,
 
-        error.CircuitBreakerOpen,
-        error.ServiceUnavailable,
-        error.ServiceOverloaded,
-        error.ConnectionPoolExhausted => .ServiceUnavailable,
+        error.CircuitBreakerOpen, error.ServiceUnavailable, error.ServiceOverloaded, error.ConnectionPoolExhausted => .ServiceUnavailable,
 
-        error.ConnectionTimeout,
-        error.Timeout => .RequestTimeout,
+        error.ConnectionTimeout, error.Timeout => .RequestTimeout,
 
-        error.InvalidInput,
-        error.MissingRequiredField,
-        error.InvalidFormat,
-        error.ValidationFailed,
-        error.ConfigurationError,
-        error.ConfigParseError,
-        error.ConfigValidationFailed => .BadRequest,
+        error.InvalidInput, error.MissingRequiredField, error.InvalidFormat, error.ValidationFailed, error.ConfigurationError, error.ConfigParseError, error.ConfigValidationFailed => .BadRequest,
 
-        error.HttpError,
-        error.ServerError => .ServerError,
+        error.HttpError, error.ServerError => .ServerError,
 
         else => .ServerError,
     };

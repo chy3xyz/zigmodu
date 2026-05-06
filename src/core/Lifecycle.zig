@@ -111,7 +111,9 @@ fn visitModule(
         return ZigModuError.CircularDependency;
     }
 
-    if (visited.contains(module_name)) { return; }
+    if (visited.contains(module_name)) {
+        return;
+    }
 
     try temp_mark.put(module_name, {});
 

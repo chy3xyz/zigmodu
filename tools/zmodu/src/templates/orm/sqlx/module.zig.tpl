@@ -1,5 +1,10 @@
 //! ZigModu module `<<MODULE_NAME>>` (zmodu: `zmodu module` or `zmodu orm` sqlx).
 //! Template: tools/zmodu/src/templates/orm/sqlx/module.zig.tpl
+//!
+//! ╔═══════════════════════════════════════════════════════════╗
+//! ║  AI Metadata: module=<<MODULE_NAME>> | layer=declaration  ║
+//! ║  role=module contract | deps=<<DEPS>>                     ║
+//! ╚═══════════════════════════════════════════════════════════╝
 
 const std = @import("std");
 const zigmodu = @import("zigmodu");
@@ -7,10 +12,19 @@ const zigmodu = @import("zigmodu");
 pub const info = zigmodu.api.Module{
     .name = "<<MODULE_NAME>>",
     .description = "<<MODULE_NAME>> module",
-    .dependencies = &.{},
+    .dependencies = <<DEPS>>,
     .is_internal = false,
 };
 
+// ── Configuration ──────────────────────────────────────────────
+/// Module-level configuration — populate from env or config file.
+pub const Config = struct {
+    // Add module-specific settings here
+};
+
+var config: Config = .{};
+
+// ── Lifecycle ──────────────────────────────────────────────────
 pub fn init() !void {
     std.log.info("{s} module initialized", .{"<<MODULE_NAME>>"});
 }

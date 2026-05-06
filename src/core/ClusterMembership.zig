@@ -162,6 +162,21 @@ pub const ClusterMembership = struct {
         }
     }
 
+    /// Run a single synchronous gossip + health check pass.
+    /// Useful for testing and for driving the membership loop externally.
+    pub fn runOnce(self: *Self) !void {
+        // Record heartbeat
+        if (self.failure_detector) |fd| {
+            fd.heartbeat(self.node_id) catch |err| {
+                std.log.err("[ClusterMembership] Failed to record heartbeat: {}", .{err});
+            };
+        }
+        self.broadcastEvent(.heartbeat) catch |err| {
+            std.log.err("[ClusterMembership] Gossip error: {}", .{err});
+        };
+        self.checkNodeHealth();
+    }
+
     fn gossipLoop(self: *Self) void {
         while (self.is_running) {
             // Record our own heartbeat for failure detection

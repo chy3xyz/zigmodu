@@ -16,7 +16,6 @@ const builtin = @import("builtin");
 ///
 /// All subsystems (CircuitBreaker, RateLimiter, CacheManager, etc.) should call
 /// these functions instead of hardcoding `const now = 0`.
-
 /// Returns monotonic nanoseconds since an arbitrary epoch.
 /// Suitable for elapsed-time measurement, NOT wall-clock time.
 pub fn monotonicNow() i64 {

@@ -3,7 +3,6 @@ const std = @import("std");
 /// Plugin System for dynamic module loading
 /// Supports loading shared libraries (.so on Linux, .dll on Windows, .dylib on macOS)
 /// Plugin System for dynamic module loading
-
 /// Plugin System for dynamic module loading
 /// Supports loading shared libraries (.so on Linux, .dll on Windows, .dylib on macOS)
 pub const PluginManager = struct {

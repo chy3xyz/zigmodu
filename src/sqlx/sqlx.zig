@@ -1801,7 +1801,6 @@ pub const StringCache = struct {
     }
 };
 
-
 /// Cached SQL connection aligned with go-zero's CachedConn
 pub const CachedConn = struct {
     allocator: std.mem.Allocator,

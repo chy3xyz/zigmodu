@@ -4,7 +4,6 @@ const Time = @import("../core/Time.zig");
 var prng_seed = std.atomic.Value(u64).init(0);
 
 /// 分布式链路追踪器
-
 /// 分布式链路追踪器
 pub const DistributedTracer = struct {
     const Self = @This();

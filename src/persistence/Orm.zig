@@ -22,6 +22,12 @@ pub fn toOrmValue(v: anytype) OrmValue {
         .int, .comptime_int => .{ .int = @intCast(v) },
         .float, .comptime_float => .{ .float = v },
         .bool => .{ .bool = v },
+        .optional => {
+            if (v) |payload| {
+                return toOrmValue(payload);
+            }
+            return .null;
+        },
         else => blk: {
             if (T == []const u8 or T == []u8 or T == [:0]const u8) {
                 break :blk .{ .string = v };
@@ -68,11 +74,18 @@ pub fn Model(comptime T: type) type {
             break :blk raw;
         };
         pub const primary_key = blk: {
-            const pk: []const u8 = "id";
+            // 1. Explicit declaration on model (zmodu future compat)
+            if (@hasDecl(T, "sql_primary_key")) break :blk T.sql_primary_key;
+            // 2. Field named "id" (most common)
             for (info.@"struct".fields) |field| {
                 if (std.mem.eql(u8, field.name, "id")) break :blk "id";
             }
-            break :blk pk;
+            // 3. Any field ending in _id (typical for heysen_* tables)
+            for (info.@"struct".fields) |field| {
+                if (field.name.len > 3 and std.mem.endsWith(u8, field.name, "_id")) break :blk field.name;
+            }
+            // 4. First field
+            break :blk info.@"struct".fields[0].name;
         };
         pub const fields = blk: {
             var names: []const []const u8 = &[_][]const u8{};
@@ -187,7 +200,7 @@ fn buildSelectPage(allocator: std.mem.Allocator, table: []const u8, fields: []co
 }
 
 fn buildCount(allocator: std.mem.Allocator, table: []const u8) ![]u8 {
-return std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM {s}", .{table});
+    return std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM {s}", .{table});
 }
 
 fn buildDelete(allocator: std.mem.Allocator, table: []const u8, pk: []const u8) ![]u8 {
@@ -204,7 +217,6 @@ pub fn PageResult(comptime T: type) type {
         total: usize,
     };
 }
-
 
 /// Transaction wrapper exposed to user callbacks
 pub fn Tx(comptime B: type) type {

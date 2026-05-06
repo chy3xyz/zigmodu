@@ -324,16 +324,16 @@ pub const DistributedEventBus = struct {
         }
 
         return NetworkEvent{
-            .topic = topic.?, 
-            .payload = payload.?, 
-            .source_node = source.?, 
+            .topic = topic.?,
+            .payload = payload.?,
+            .source_node = source.?,
             .timestamp = timestamp,
         };
     }
 
     fn extractJsonStringValue(data: []const u8, key: []const u8) ?[]const u8 {
         const key_idx = std.mem.indexOf(u8, data, key) orelse return null;
-        const after_key = data[key_idx + key.len..];
+        const after_key = data[key_idx + key.len ..];
         // Skip whitespace and colon
         var i: usize = 0;
         while (i < after_key.len and (after_key[i] == ' ' or after_key[i] == ':' or after_key[i] == '"')) : (i += 1) {}
@@ -347,7 +347,7 @@ pub const DistributedEventBus = struct {
 
     fn extractJsonIntValue(data: []const u8, key: []const u8) ?i64 {
         const key_idx = std.mem.indexOf(u8, data, key) orelse return null;
-        const after_key = data[key_idx + key.len..];
+        const after_key = data[key_idx + key.len ..];
         var i: usize = 0;
         while (i < after_key.len and (after_key[i] == ' ' or after_key[i] == ':')) : (i += 1) {}
         const val_start = i;

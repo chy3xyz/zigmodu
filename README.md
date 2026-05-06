@@ -41,7 +41,7 @@ A modular application framework for Zig 0.16.0, inspired by Spring Modulith. Bui
 - **Structured Logging** - JSON formatted logs
 
 ### Developer Experience
-- **Hot Reloading** - Runtime module updates
+- **Hot Reloading** ⚠️ *Experimental* — File-watch based module reloading (Zig compile-time nature limits true runtime hot-reload)
 - **Plugin System** - Dynamic extension loading
 - **Web Monitor** - HTTP dashboard for module inspection
 - **Architecture Tester** - Validate design rules
