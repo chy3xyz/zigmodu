@@ -279,6 +279,53 @@ pub const Context = struct {
         self.responded = true;
     }
 
+    /// Send success response with CommonResult wrapper: {"code":0,"msg":"","data":<data>}
+    pub fn sendSuccess(self: *Context, data_json: []const u8) !void {
+        self.status_code = 200;
+        try self.setHeader("Content-Type", "application/json");
+        const wrapped = try std.fmt.allocPrint(self.allocator, "{{\"code\":0,\"msg\":\"\",\"data\":{s}}}", .{data_json});
+        defer self.allocator.free(wrapped);
+        try self.response_body.appendSlice(self.allocator, wrapped);
+        self.responded = true;
+    }
+
+    /// Send fail response with CommonResult wrapper: {"code":<code>,"msg":"<msg>","data":null}
+    pub fn sendFail(self: *Context, code: u16, msg: []const u8) !void {
+        self.status_code = 200;
+        try self.setHeader("Content-Type", "application/json");
+        const wrapped = try std.fmt.allocPrint(self.allocator, "{{\"code\":{d},\"msg\":\"{s}\",\"data\":null}}", .{ code, msg });
+        defer self.allocator.free(wrapped);
+        try self.response_body.appendSlice(self.allocator, wrapped);
+        self.responded = true;
+    }
+
+    /// Send paginated response with CommonResult wrapper:
+    /// {"code":0,"msg":"","data":{"list":<items>,"total":<total>}}
+    pub fn sendPageResult(self: *Context, items_json: []const u8, total: usize) !void {
+        self.status_code = 200;
+        try self.setHeader("Content-Type", "application/json");
+        const wrapped = try std.fmt.allocPrint(self.allocator, "{{\"code\":0,\"msg\":\"\",\"data\":{{\"list\":{s},\"total\":{d}}}}}", .{ items_json, total });
+        defer self.allocator.free(wrapped);
+        try self.response_body.appendSlice(self.allocator, wrapped);
+        self.responded = true;
+    }
+
+    /// Convenience: serialize any Zig value as JSON array and wrap in page result.
+    /// Usage: try ctx.sendPageItems(vo_slice.items, total);
+    pub fn sendPageItems(self: *Context, items: anytype, total: usize) !void {
+        const json_str = try std.fmt.allocPrint(self.allocator, "{any}", .{std.json.fmt(items, .{})});
+        defer self.allocator.free(json_str);
+        try self.sendPageResult(json_str, total);
+    }
+
+    /// Convenience: serialize any Zig value as JSON and wrap in success response.
+    /// Usage: try ctx.sendJsonItems(vo_slice.items);
+    pub fn sendJsonItems(self: *Context, items: anytype) !void {
+        const json_str = try std.fmt.allocPrint(self.allocator, "{any}", .{std.json.fmt(items, .{})});
+        defer self.allocator.free(json_str);
+        try self.sendSuccess(json_str);
+    }
+
     /// Parse JSON body into type T
     pub fn bindJson(self: *const Context, comptime T: type) !T {
         if (self.body == null) return error.NoBody;

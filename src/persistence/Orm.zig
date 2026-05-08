@@ -59,10 +59,36 @@ fn snakeCase(comptime name: []const u8) []const u8 {
     return name[idx + 1 ..];
 }
 
+/// Convert camelCase to snake_case at comptime.
+/// e.g. "userName" → "user_name", "deptId" → "dept_id", "id" → "id"
+pub fn camelToSnake(comptime input: []const u8) []const u8 {
+    @setEvalBranchQuota(2000);
+    comptime var buf: [256]u8 = [_]u8{0} ** 256;
+    var idx: usize = 0;
+    for (input) |c| {
+        if (c >= 'A' and c <= 'Z') {
+            buf[idx] = '_';
+            idx += 1;
+            buf[idx] = c + ('a' - 'A');
+        } else {
+            buf[idx] = c;
+        }
+        idx += 1;
+    }
+    const result = buf[0..idx];
+    return result;
+}
+
+/// Check if the model type has sql_column_style = .camelCase
+fn isCamelCaseModel(comptime T: type) bool {
+    return @hasDecl(T, "sql_column_style") and T.sql_column_style == .camelCase;
+}
+
 /// Model metadata extracted at compile time from a struct
 pub fn Model(comptime T: type) type {
     const info = @typeInfo(T);
     if (info != .@"struct") @compileError("Model only supports structs");
+    const camel = comptime isCamelCaseModel(T);
 
     return struct {
         /// Explicit SQL table name (snake_case). When present on `T`, used instead of the type name.
@@ -73,20 +99,22 @@ pub fn Model(comptime T: type) type {
             const raw = snakeCase(@typeName(T));
             break :blk raw;
         };
+
+        /// Whether this model uses camelCase fields (mapped to snake_case columns)
+        pub const camel_case = camel;
+
         pub const primary_key = blk: {
-            // 1. Explicit declaration on model (zmodu future compat)
             if (@hasDecl(T, "sql_primary_key")) break :blk T.sql_primary_key;
-            // 2. Field named "id" (most common)
             for (info.@"struct".fields) |field| {
                 if (std.mem.eql(u8, field.name, "id")) break :blk "id";
             }
-            // 3. Any field ending in _id (typical for heysen_* tables)
             for (info.@"struct".fields) |field| {
                 if (field.name.len > 3 and std.mem.endsWith(u8, field.name, "_id")) break :blk field.name;
             }
-            // 4. First field
             break :blk info.@"struct".fields[0].name;
         };
+
+        /// Struct field names (camelCase if model uses camelCase, otherwise snake_case)
         pub const fields = blk: {
             var names: []const []const u8 = &[_][]const u8{};
             for (info.@"struct".fields) |field| {
@@ -94,6 +122,15 @@ pub fn Model(comptime T: type) type {
             }
             break :blk names;
         };
+
+        /// SQL column names (always snake_case for camelCase models, otherwise same as fields)
+        pub const sql_columns = if (camel) blk: {
+            var names: []const []const u8 = &[_][]const u8{};
+            for (info.@"struct".fields) |field| {
+                names = names ++ .{camelToSnake(field.name)};
+            }
+            break :blk names;
+        } else fields;
     };
 }
 
@@ -129,41 +166,49 @@ fn structToBackendArgsWithId(comptime B: type, comptime T: type, allocator: std.
 }
 
 // ==================== SQL Builders ====================
+// For camelCase models, sql_cols are snake_case (actual DB columns), fields are camelCase.
+// SELECT uses "sql_col AS field" so Row.scan matches struct field names.
 
-fn buildSelectById(allocator: std.mem.Allocator, table: []const u8, fields: []const []const u8, pk: []const u8) ![]u8 {
+fn appendColumnList(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, sql_cols: []const []const u8, fields: []const []const u8, camel: bool) !void {
+    for (sql_cols, 0..) |col, i| {
+        if (i > 0) try buf.appendSlice(allocator, ", ");
+        try buf.appendSlice(allocator, col);
+        if (camel and !std.mem.eql(u8, col, fields[i])) {
+            try buf.appendSlice(allocator, " AS \"");
+            try buf.appendSlice(allocator, fields[i]);
+            try buf.appendSlice(allocator, "\"");
+        }
+    }
+}
+
+fn buildSelectById(allocator: std.mem.Allocator, table: []const u8, sql_cols: []const []const u8, fields: []const []const u8, pk: []const u8, camel: bool) ![]u8 {
     var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
     try buf.appendSlice(allocator, "SELECT ");
-    for (fields, 0..) |f, i| {
-        if (i > 0) try buf.appendSlice(allocator, ", ");
-        try buf.appendSlice(allocator, f);
-    }
+    try appendColumnList(&buf, allocator, sql_cols, fields, camel);
     try buf.print(allocator, " FROM {s} WHERE {s} = ?", .{ table, pk });
     return allocator.dupe(u8, buf.items);
 }
 
-fn buildSelectAll(allocator: std.mem.Allocator, table: []const u8, fields: []const []const u8) ![]u8 {
+fn buildSelectAll(allocator: std.mem.Allocator, table: []const u8, sql_cols: []const []const u8, fields: []const []const u8, camel: bool) ![]u8 {
     var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
     try buf.appendSlice(allocator, "SELECT ");
-    for (fields, 0..) |f, i| {
-        if (i > 0) try buf.appendSlice(allocator, ", ");
-        try buf.appendSlice(allocator, f);
-    }
+    try appendColumnList(&buf, allocator, sql_cols, fields, camel);
     try buf.print(allocator, " FROM {s}", .{table});
     return allocator.dupe(u8, buf.items);
 }
 
-fn buildInsert(allocator: std.mem.Allocator, table: []const u8, fields: []const []const u8) ![]u8 {
+fn buildInsert(allocator: std.mem.Allocator, table: []const u8, sql_cols: []const []const u8) ![]u8 {
     var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
     try buf.print(allocator, "INSERT INTO {s} (", .{table});
-    for (fields, 0..) |f, i| {
+    for (sql_cols, 0..) |col, i| {
         if (i > 0) try buf.appendSlice(allocator, ", ");
-        try buf.appendSlice(allocator, f);
+        try buf.appendSlice(allocator, col);
     }
     try buf.appendSlice(allocator, ") VALUES (");
-    for (0..fields.len) |i| {
+    for (0..sql_cols.len) |i| {
         if (i > 0) try buf.appendSlice(allocator, ", ");
         try buf.appendSlice(allocator, "?");
     }
@@ -171,29 +216,26 @@ fn buildInsert(allocator: std.mem.Allocator, table: []const u8, fields: []const 
     return allocator.dupe(u8, buf.items);
 }
 
-fn buildUpdate(allocator: std.mem.Allocator, table: []const u8, fields: []const []const u8, pk: []const u8) ![]u8 {
+fn buildUpdate(allocator: std.mem.Allocator, table: []const u8, sql_cols: []const []const u8, pk: []const u8) ![]u8 {
     var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
     try buf.print(allocator, "UPDATE {s} SET ", .{table});
     var first = true;
-    for (fields) |f| {
-        if (std.mem.eql(u8, f, pk)) continue;
+    for (sql_cols) |col| {
+        if (std.mem.eql(u8, col, pk)) continue;
         if (!first) try buf.appendSlice(allocator, ", ");
         first = false;
-        try buf.print(allocator, "{s} = ?", .{f});
+        try buf.print(allocator, "{s} = ?", .{col});
     }
     try buf.print(allocator, " WHERE {s} = ?", .{pk});
     return allocator.dupe(u8, buf.items);
 }
 
-fn buildSelectPage(allocator: std.mem.Allocator, table: []const u8, fields: []const []const u8, page: usize, size: usize) ![]u8 {
+fn buildSelectPage(allocator: std.mem.Allocator, table: []const u8, sql_cols: []const []const u8, fields: []const []const u8, page: usize, size: usize, camel: bool) ![]u8 {
     var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
     try buf.appendSlice(allocator, "SELECT ");
-    for (fields, 0..) |f, i| {
-        if (i > 0) try buf.appendSlice(allocator, ", ");
-        try buf.appendSlice(allocator, f);
-    }
+    try appendColumnList(&buf, allocator, sql_cols, fields, camel);
     const offset = page * size;
     try buf.print(allocator, " FROM {s} LIMIT {d} OFFSET {d}", .{ table, size, offset });
     return allocator.dupe(u8, buf.items);
@@ -253,7 +295,7 @@ pub fn Orm(comptime B: type) type {
                 orm: *Self,
 
                 pub fn findById(self: @This(), id: anytype) !?T {
-                    const sql = try buildSelectById(self.orm.backend.allocator, meta.table_name, meta.fields, meta.primary_key);
+                    const sql = try buildSelectById(self.orm.backend.allocator, meta.table_name, meta.sql_columns, meta.fields, meta.primary_key, meta.camel_case);
                     defer self.orm.backend.allocator.free(sql);
                     const args = try self.orm.backend.allocator.alloc(B.Value, 1);
                     defer self.orm.backend.allocator.free(args);
@@ -262,7 +304,7 @@ pub fn Orm(comptime B: type) type {
                 }
 
                 pub fn findAll(self: @This()) ![]T {
-                    const sql = try buildSelectAll(self.orm.backend.allocator, meta.table_name, meta.fields);
+                    const sql = try buildSelectAll(self.orm.backend.allocator, meta.table_name, meta.sql_columns, meta.fields, meta.camel_case);
                     defer self.orm.backend.allocator.free(sql);
                     return self.orm.backend.queryRows(T, sql, &.{});
                 }
@@ -275,15 +317,29 @@ pub fn Orm(comptime B: type) type {
                 }
 
                 pub fn findPage(self: @This(), page: usize, size: usize) !PageResult(T) {
-                    const sql = try buildSelectPage(self.orm.backend.allocator, meta.table_name, meta.fields, page, size);
+                    const sql = try buildSelectPage(self.orm.backend.allocator, meta.table_name, meta.sql_columns, meta.fields, page, size, meta.camel_case);
                     defer self.orm.backend.allocator.free(sql);
                     const items = try self.orm.backend.queryRows(T, sql, &.{});
                     const total = try self.count();
                     return .{ .items = items, .page = page, .size = size, .total = total };
                 }
 
+                /// Filtered pagination with custom WHERE clause and args.
+                pub fn findPageFiltered(self: @This(), alloc: std.mem.Allocator, where_sql: []const u8, args: []const B.Value, page: usize, size: usize) !PageResult(T) {
+                    const count_sql = try std.fmt.allocPrint(alloc, "SELECT COUNT(*) as count FROM {s} {s}", .{ meta.table_name, where_sql });
+                    defer alloc.free(count_sql);
+                    const count_row = try self.orm.backend.queryRow(struct { count: i64 }, count_sql, args);
+                    const total: usize = if (count_row) |c| @intCast(c.count) else 0;
+
+                    const offset = page * size;
+                    const data_sql = try std.fmt.allocPrint(alloc, "SELECT * FROM {s} {s} ORDER BY {s} DESC LIMIT {d},{d}", .{ meta.table_name, where_sql, meta.primary_key, offset, size });
+                    defer alloc.free(data_sql);
+                    const items = try self.orm.backend.queryRows(T, data_sql, args);
+                    return .{ .items = items, .page = page, .size = size, .total = total };
+                }
+
                 pub fn insert(self: @This(), entity: T) !T {
-                    const sql = try buildInsert(self.orm.backend.allocator, meta.table_name, meta.fields);
+                    const sql = try buildInsert(self.orm.backend.allocator, meta.table_name, meta.sql_columns);
                     defer self.orm.backend.allocator.free(sql);
                     const args = try structToBackendArgs(B, T, self.orm.backend.allocator, entity);
                     defer self.orm.backend.allocator.free(args);
@@ -292,7 +348,7 @@ pub fn Orm(comptime B: type) type {
                 }
 
                 pub fn update(self: @This(), entity: T) !void {
-                    const sql = try buildUpdate(self.orm.backend.allocator, meta.table_name, meta.fields, meta.primary_key);
+                    const sql = try buildUpdate(self.orm.backend.allocator, meta.table_name, meta.sql_columns, meta.primary_key);
                     defer self.orm.backend.allocator.free(sql);
                     const args = try structToBackendArgsWithId(B, T, self.orm.backend.allocator, entity, meta.primary_key);
                     defer self.orm.backend.allocator.free(args);
@@ -350,11 +406,11 @@ test "SQL builders" {
 
     const fields = &.{ "id", "name", "email" };
 
-    const select_id = try buildSelectById(allocator, "users", fields, "id");
+    const select_id = try buildSelectById(allocator, "users", fields, fields, "id", false);
     defer allocator.free(select_id);
     try std.testing.expectEqualStrings("SELECT id, name, email FROM users WHERE id = ?", select_id);
 
-    const select_all = try buildSelectAll(allocator, "users", fields);
+    const select_all = try buildSelectAll(allocator, "users", fields, fields, false);
     defer allocator.free(select_all);
     try std.testing.expectEqualStrings("SELECT id, name, email FROM users", select_all);
 

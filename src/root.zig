@@ -73,6 +73,12 @@ pub const BenchmarkSuite = @import("test/Benchmark.zig").BenchmarkSuite;
 
 // Security
 pub const SecurityModule = @import("security/SecurityModule.zig").SecurityModule;
+pub const Rbac = @import("security/Rbac.zig");
+pub const PasswordEncoder = @import("security/PasswordEncoder.zig").PasswordEncoder;
+pub const tenant = @import("tenant/TenantContext.zig");
+pub const datapermission = @import("datapermission/DataPermission.zig");
+pub const TenantInterceptor = @import("tenant/TenantInterceptor.zig").TenantInterceptor;
+pub const auth = @import("security/AuthMiddleware.zig");
 pub const SecurityScanner = @import("security/SecurityScanner.zig").SecurityScanner;
 pub const DependencyScanner = @import("security/SecurityScanner.zig").DependencyScanner;
 pub const SecurityConfigValidator = @import("security/SecurityScanner.zig").SecurityConfigValidator;
@@ -155,6 +161,7 @@ pub const load_shedder = @import("resilience/LoadShedder.zig");
 // ORM
 pub const orm = @import("persistence/Orm.zig");
 pub const SqlxBackend = @import("persistence/backends/SqlxBackend.zig").SqlxBackend;
+pub const util = @import("util.zig");
 
 // Gozero Validator (legacy)
 pub const gozero_validator = @import("validation/Validator.zig");

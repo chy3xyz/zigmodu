@@ -330,7 +330,7 @@ pub const RaftElection = struct {
 // Tests
 // ============================================================================
 
-//test "RaftElection initialization" {
+test "RaftElection initialization" {
     const allocator = std.testing.allocator;
 
     const config = ElectionConfig{};
@@ -339,23 +339,24 @@ pub const RaftElection = struct {
         .{ .id = "peer2", .address = "localhost:7002" },
     };
 
-    const transport = struct {
-        fn sendVoteRequest(peer_id: ?[]const u8, addr: []const u8, req: VoteRequest) void {
-            _ = peer_id;
-            _ = addr;
-            _ = req;
-        }
-        fn sendHeartbeat(peer_id: ?[]const u8, addr: []const u8, hb: Heartbeat) void {
-            _ = peer_id;
-            _ = addr;
-            _ = hb;
-        }
+    const TransportImpl = struct {
+        sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
+        sendHeartbeat: *const fn (?[]const u8, []const u8, Heartbeat) void,
     };
+    var transport_impl = TransportImpl{
+        .sendVoteRequest = (struct {
+            fn f(_: ?[]const u8, _: []const u8, _: VoteRequest) void {}
+        }).f,
+        .sendHeartbeat = (struct {
+            fn f(_: ?[]const u8, _: []const u8, _: Heartbeat) void {}
+        }).f,
+    };
+    const transport: RaftElection.ElectionTransport = @constCast(@ptrCast(@alignCast(&transport_impl)));
 
     var election = try RaftElection.init(
         allocator,
         "node1",
-        peers,
+        peers[0..],
         config,
         &transport,
     );
@@ -365,21 +366,34 @@ pub const RaftElection = struct {
     try std.testing.expectEqual(@as(u64, 0), election.getTerm());
 }
 
-//test "RaftElection heartbeat resets deadline" {
+test "RaftElection heartbeat resets leader info" {
     const allocator = std.testing.allocator;
+
+    const TransportImpl = struct {
+        sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
+        sendHeartbeat: *const fn (?[]const u8, []const u8, Heartbeat) void,
+    };
+    var transport_impl = TransportImpl{
+        .sendVoteRequest = (struct {
+            fn f(_: ?[]const u8, _: []const u8, _: VoteRequest) void {}
+        }).f,
+        .sendHeartbeat = (struct {
+            fn f(_: ?[]const u8, _: []const u8, _: Heartbeat) void {}
+        }).f,
+    };
+    const transport: RaftElection.ElectionTransport = @constCast(@ptrCast(@alignCast(&transport_impl)));
+
     var election = try RaftElection.init(
         allocator,
         "node1",
         &.{},
         .{},
-        undefined,
+        &transport,
     );
     defer election.deinit();
 
-    // Initial state
     try std.testing.expect(!election.isLeader());
 
-    // Simulate receiving heartbeat
     const hb = Heartbeat{
         .term = 1,
         .leader_id = "leader1",
@@ -393,18 +407,32 @@ pub const RaftElection = struct {
     try std.testing.expectEqualStrings("leader1", election.getLeader().?);
 }
 
-//test "RaftElection vote request validation" {
+test "RaftElection vote request validation" {
     const allocator = std.testing.allocator;
+
+    const TransportImpl = struct {
+        sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
+        sendHeartbeat: *const fn (?[]const u8, []const u8, Heartbeat) void,
+    };
+    var transport_impl = TransportImpl{
+        .sendVoteRequest = (struct {
+            fn f(_: ?[]const u8, _: []const u8, _: VoteRequest) void {}
+        }).f,
+        .sendHeartbeat = (struct {
+            fn f(_: ?[]const u8, _: []const u8, _: Heartbeat) void {}
+        }).f,
+    };
+    const transport: RaftElection.ElectionTransport = @constCast(@ptrCast(@alignCast(&transport_impl)));
+
     var election = try RaftElection.init(
         allocator,
         "node1",
         &.{},
         .{},
-        undefined,
+        &transport,
     );
     defer election.deinit();
 
-    // Request from newer term
     const req = VoteRequest{
         .term = 5,
         .candidate_id = "candidate1",

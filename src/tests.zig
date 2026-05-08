@@ -142,6 +142,11 @@ test "compile all source files" {
 
     // Pool
     _ = @import("pool/Pool.zig");
+    _ = @import("security/Rbac.zig");
+    _ = @import("security/PasswordEncoder.zig");
+    _ = @import("tenant/TenantContext.zig");
+    _ = @import("tenant/TenantInterceptor.zig");
+    _ = @import("datapermission/DataPermission.zig");
 
     // Core extensions
     _ = @import("core/Fx.zig");
