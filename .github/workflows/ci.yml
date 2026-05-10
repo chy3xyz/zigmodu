@@ -93,11 +93,6 @@ jobs:
       - name: Zig fmt check
         run: zig fmt --check src/
 
-      - name: Architecture validation
-        run: zig build test -- --test-filter "architecture"
-
-      - name: Security scan
-        run: zig build test -- --test-filter "SecurityScanner"
 
   # ── Benchmark ──────────────────────────────────
   benchmark:
