@@ -7,7 +7,7 @@ Code generation tool for ZigModu framework with **Modulith style** architecture.
 ### Via npm (recommended)
 
 ```bash
-npm install -g zmodu
+npm install -g @chy3xyz/zmodu
 zmodu --help
 ```
 

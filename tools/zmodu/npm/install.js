@@ -34,6 +34,15 @@ function getRepo() {
   }
 }
 
+function getPackageName() {
+  try {
+    const pkg = require("./package.json");
+    return pkg.name;  // e.g. "@knot3bot/zmodu" or "zmodu"
+  } catch (_) {
+    return "zmodu";
+  }
+}
+
 function getPlatform() {
   const plat = os.platform();
   const mapped = PLATFORM_MAP[plat];

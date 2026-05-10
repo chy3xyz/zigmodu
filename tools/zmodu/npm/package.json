@@ -1,5 +1,5 @@
 {
-  "name": "zmodu",
+  "name": "@chy3xyz/zmodu",
   "version": "0.6.0",
   "description": "ZigModu CLI — code generation tool for the ZigModu framework",
   "homepage": "https://github.com/knot3bot/zigmodu",
