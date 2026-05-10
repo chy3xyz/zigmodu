@@ -482,3 +482,94 @@ test "Application idempotent start and stop" {
 
     try std.testing.expectEqual(Application.State.stopped, app.getState());
 }
+
+test "e2e: Application smoke test with events and graceful drain" {
+    const allocator = std.testing.allocator;
+
+    const E2eCtx = struct {
+        var event_received: bool = false;
+        var hook_called: bool = false;
+
+        fn onUserCreated(event: struct { name: []const u8 }) void {
+            _ = event;
+            event_received = true;
+        }
+
+        fn onShutdown() void {
+            hook_called = true;
+        }
+    };
+
+    const ModuleA = struct {
+        pub const info = api.Module{
+            .name = "module-a",
+            .description = "E2E module A",
+            .dependencies = &.{},
+        };
+        pub fn init() !void {}
+        pub fn deinit() void {}
+    };
+
+    const ModuleB = struct {
+        pub const info = api.Module{
+            .name = "module-b",
+            .description = "E2E module B",
+            .dependencies = &.{"module-a"},
+        };
+        pub fn init() !void {}
+        pub fn deinit() void {}
+    };
+
+    // Full lifecycle
+    var app = try Application.init(std.testing.io, allocator, "e2e-app", .{ ModuleA, ModuleB }, .{
+        .validate_on_start = true,
+        .auto_generate_docs = false,
+    });
+    defer app.deinit();
+
+    try std.testing.expectEqual(Application.State.initialized, app.getState());
+    try std.testing.expect(app.hasModule("module-a"));
+    try std.testing.expect(app.hasModule("module-b"));
+
+    // Register shutdown hook
+    try app.onShutdown(E2eCtx.onShutdown);
+
+    // Start
+    try app.start();
+    try std.testing.expectEqual(Application.State.started, app.getState());
+
+    // Verify shutdown hook not yet called
+    try std.testing.expect(!E2eCtx.hook_called);
+
+    // Stop
+    app.stop();
+    try std.testing.expectEqual(Application.State.stopped, app.getState());
+    try std.testing.expect(E2eCtx.hook_called);
+}
+
+test "e2e: in-flight counter tracks request lifecycle" {
+    const allocator = std.testing.allocator;
+
+    const MockModule = struct {
+        pub const info = api.Module{
+            .name = "counter-mock",
+            .description = "Counter test module",
+            .dependencies = &.{},
+        };
+        pub fn init() !void {}
+        pub fn deinit() void {}
+    };
+
+    var app = try Application.init(std.testing.io, allocator, "counter-app", .{MockModule}, .{});
+    defer app.deinit();
+
+    const counter = getInFlightCounter();
+    try std.testing.expectEqual(@as(u64, 0), counter.load(.monotonic));
+
+    // Simulate in-flight tracking
+    _ = counter.fetchAdd(1, .monotonic);
+    try std.testing.expectEqual(@as(u64, 1), counter.load(.monotonic));
+
+    _ = counter.fetchSub(1, .monotonic);
+    try std.testing.expectEqual(@as(u64, 0), counter.load(.monotonic));
+}

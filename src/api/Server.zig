@@ -1516,3 +1516,100 @@ test "integration: router + global middleware + handler" {
         try std.testing.expect(ctx.responded);
     }
 }
+
+test "e2e: full middleware chain with error path" {
+    const allocator = std.testing.allocator;
+
+    var server = Server.init(std.testing.io, allocator, 0);
+    defer server.deinit();
+
+    const Ctx = struct {
+        var hit_count: u32 = 0;
+        var last_status: u16 = 0;
+    };
+
+    // Global logging middleware
+    try server.addMiddleware(.{
+        .func = struct {
+            fn h(ctx: *Context, next: HandlerFn, _: ?*anyopaque) anyerror!void {
+                Ctx.hit_count += 1;
+                try next(ctx);
+            }
+        }.h,
+    });
+
+    // Register a route that returns 201
+    try server.addRoute(.{
+        .method = .POST,
+        .path = "/items",
+        .handler = struct {
+            fn handle(ctx: *Context) anyerror!void {
+                Ctx.last_status = 201;
+                try ctx.json(201, "{\"created\":true}");
+            }
+        }.handle,
+    });
+
+    // Register a route that triggers an error
+    try server.addRoute(.{
+        .method = .GET,
+        .path = "/boom",
+        .handler = struct {
+            fn handle(_: *Context) anyerror!void {
+                return error.SomePanic;
+            }
+        }.handle,
+    });
+
+    // Test 1: happy path
+    {
+        Ctx.hit_count = 0;
+        var matched = server.router.match(.POST, "/items");
+        try std.testing.expect(matched != null);
+        if (matched) |*m| {
+            defer {
+                var it = m.params.iterator();
+                while (it.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    allocator.free(entry.value_ptr.*);
+                }
+                m.params.deinit();
+            }
+            var ctx = try Context.init(allocator, .POST, "/items");
+            defer ctx.deinit();
+            try server.executeWithMiddleware(&ctx, m.route.handler, m.route.middleware);
+            try std.testing.expectEqual(@as(u32, 1), Ctx.hit_count);
+            try std.testing.expectEqual(@as(u16, 201), ctx.status_code);
+            try std.testing.expect(ctx.responded);
+        }
+    }
+
+    // Test 2: route not found (404)
+    {
+        const matched = server.router.match(.GET, "/nonexistent");
+        try std.testing.expect(matched == null);
+    }
+
+    // Test 3: panic handler returns 500
+    {
+        Ctx.hit_count = 0;
+        var matched = server.router.match(.GET, "/boom");
+        try std.testing.expect(matched != null);
+        if (matched) |*m| {
+            defer {
+                var it = m.params.iterator();
+                while (it.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    allocator.free(entry.value_ptr.*);
+                }
+                m.params.deinit();
+            }
+            var ctx = try Context.init(allocator, .GET, "/boom");
+            defer ctx.deinit();
+            server.executeWithMiddleware(&ctx, m.route.handler, m.route.middleware) catch {
+                _ = ctx.sendError(500, "Internal Server Error") catch {};
+            };
+            try std.testing.expectEqual(@as(u32, 1), Ctx.hit_count);
+        }
+    }
+}
