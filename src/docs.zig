@@ -38,7 +38,7 @@ pub fn main() !void {
     try zigmodu.validateModules(&modules);
 
     try zigmodu.generateDocs(&modules, "docs/modules.puml", allocator);
-    std.log.info("✅ PlantUML docs generated: docs/modules.puml", .{});
+    std.log.info("PlantUML docs generated: docs/modules.puml", .{});
 
     const json = try zigmodu.Documentation.generateJsonDocs(&modules, allocator);
     defer allocator.free(json);
@@ -46,7 +46,7 @@ pub fn main() !void {
     var json_file = try std.Io.Dir.cwd().createFile("docs/modules.json", .{});
     defer json_file.close(std.testing.io);
     try json_file.writeAll(json);
-    std.log.info("✅ JSON docs generated: docs/modules.json", .{});
+    std.log.info("JSON docs generated: docs/modules.json", .{});
 
     const md = try zigmodu.Documentation.generateMarkdownDocs(&modules, allocator);
     defer allocator.free(md);
@@ -54,5 +54,5 @@ pub fn main() !void {
     var md_file = try std.Io.Dir.cwd().createFile("docs/modules.md", .{});
     defer md_file.close(std.testing.io);
     try md_file.writeAll(md);
-    std.log.info("✅ Markdown docs generated: docs/modules.md", .{});
+    std.log.info("Markdown docs generated: docs/modules.md", .{});
 }

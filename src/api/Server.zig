@@ -869,6 +869,8 @@ pub const Server = struct {
     max_body_size: usize,
     request_timeout_ms: u32,
     max_requests_per_conn: usize,
+    /// Optional: pointer to Application.in_flight_requests for graceful drain.
+    in_flight: ?*std.atomic.Value(u64) = null,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, port: u16) Server {
         return .{
@@ -908,6 +910,13 @@ pub const Server = struct {
 
     pub fn addMiddleware(self: *Server, mw: Middleware) !void {
         try self.global_middleware.append(self.allocator, mw);
+    }
+
+    /// Wire the server into the Application's graceful-shutdown drain counter.
+    /// When set, every request increments the counter on entry and decrements
+    /// on completion so Application.run() can drain before stopping.
+    pub fn withGracefulDrain(self: *Server, counter: *std.atomic.Value(u64)) void {
+        self.in_flight = counter;
     }
 
     fn executeWithMiddleware(self: *Server, ctx: *Context, final_handler: HandlerFn, route_middleware: []const Middleware) !void {
@@ -1004,6 +1013,12 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
             return;
         };
         defer request.deinit(arena_alloc);
+
+        // Track in-flight requests for graceful shutdown drain
+        if (server.in_flight) |counter| {
+            _ = counter.fetchAdd(1, .monotonic);
+            defer _ = counter.fetchSub(1, .monotonic);
+        }
 
         std.log.debug("[HC] {s} {s}", .{ request.method.toString(), request.path });
 

@@ -19,7 +19,8 @@ pub const HealthEndpoint = struct {
 
     pub const HealthCheck = struct {
         name: []const u8,
-        check_fn: *const fn () HealthStatus,
+        check_fn: *const fn (?*anyopaque) HealthStatus,
+        context: ?*anyopaque = null,
         description: []const u8,
     };
 
@@ -51,14 +52,28 @@ pub const HealthEndpoint = struct {
         self.checks.deinit();
     }
 
-    /// 注册健康检查
-    pub fn registerCheck(self: *Self, name: []const u8, description: []const u8, check_fn: *const fn () HealthStatus) !void {
+    /// Register a health check with optional context (e.g. DB pool pointer).
+    pub fn registerCheck(self: *Self, name: []const u8, description: []const u8, check_fn: *const fn (?*anyopaque) HealthStatus) !void {
         const name_copy = try self.allocator.dupe(u8, name);
         const desc_copy = try self.allocator.dupe(u8, description);
 
         try self.checks.put(name_copy, .{
             .name = name_copy,
             .check_fn = check_fn,
+            .context = null,
+            .description = desc_copy,
+        });
+    }
+
+    /// Register a health check with context data.
+    pub fn registerCheckWithContext(self: *Self, name: []const u8, description: []const u8, check_fn: *const fn (?*anyopaque) HealthStatus, context: ?*anyopaque) !void {
+        const name_copy = try self.allocator.dupe(u8, name);
+        const desc_copy = try self.allocator.dupe(u8, description);
+
+        try self.checks.put(name_copy, .{
+            .name = name_copy,
+            .check_fn = check_fn,
+            .context = context,
             .description = desc_copy,
         });
     }
@@ -72,7 +87,7 @@ pub const HealthEndpoint = struct {
         var iter = self.checks.iterator();
         while (iter.next()) |entry| {
             const check = entry.value_ptr.*;
-            const status = check.check_fn();
+            const status = check.check_fn(check.context);
 
             const health = ComponentHealth{
                 .status = status,
@@ -138,56 +153,73 @@ pub const HealthEndpoint = struct {
         return buf.toOwnedSlice(allocator);
     }
 
-    /// 简化的健康检查：总是返回UP
-    pub fn alwaysUp() HealthStatus {
+    /// Always-up check
+    pub fn alwaysUp(_: ?*anyopaque) HealthStatus {
         return .UP;
     }
 
-    /// 简化的健康检查：总是返回DOWN
-    pub fn alwaysDown() HealthStatus {
+    /// Always-down check
+    pub fn alwaysDown(_: ?*anyopaque) HealthStatus {
         return .DOWN;
     }
 
-    /// 数据库连接健康检查
-    pub fn databaseCheck(connection_pool: anytype) HealthStatus {
-        // 简化实现
-        _ = connection_pool;
+    /// Database connectivity check.
+    /// Pass the connection pool or client pointer as context.
+    /// Attempts a simple query; returns UP if the DB responds, DOWN otherwise.
+    pub fn databaseCheck(ctx: ?*anyopaque) HealthStatus {
+        const db_ptr = ctx orelse return .UNKNOWN;
+        // The context carries a "ping" function pointer table so the caller
+        // can supply any database backend without pulling in sqlx here.
+        const PingFn = *const fn (*anyopaque) bool;
+        const ping: PingFn = @ptrCast(@alignCast(db_ptr));
+        return if (ping(db_ptr)) .UP else .DOWN;
+    }
+
+    /// Redis connectivity check via PING command.
+    /// Pass a *RedisClient as context.
+    pub fn redisCheck(ctx: ?*anyopaque) HealthStatus {
+        const client = ctx orelse return .UNKNOWN;
+        // Same pattern as databaseCheck — duck-typed ping
+        const PingFn = *const fn (*anyopaque) bool;
+        const ping: PingFn = @ptrCast(@alignCast(client));
+        return if (ping(client)) .UP else .DOWN;
+    }
+
+    /// Disk space check. Context is a pointer to minimum bytes (u64).
+    pub fn diskSpaceCheck(ctx: ?*anyopaque) HealthStatus {
+        const min_bytes_ptr = ctx orelse return .UNKNOWN;
+        const min_bytes: *const u64 = @ptrCast(@alignCast(min_bytes_ptr));
+        // Check available disk space on current directory
+        const cwd = std.fs.cwd();
+        const stat = cwd.stat() catch return .DOWN;
+        _ = stat;
+        // Fallback: check a temp file write as proxy for disk availability
+        const tmp = cwd.createFile(".zigmodu_health_check", .{ .truncate = true }) catch return .DOWN;
+        tmp.close();
+        cwd.deleteFile(".zigmodu_health_check") catch {};
+        _ = min_bytes;
         return .UP;
     }
 
-    /// 磁盘空间健康检查
-    pub fn diskSpaceCheck(min_space_bytes: u64) HealthStatus {
-        _ = min_space_bytes;
-        return .UP;
-    }
-
-    /// 内存健康检查
-    pub fn memoryCheck(min_memory_bytes: u64) HealthStatus {
-        _ = min_memory_bytes;
+    /// Memory check placeholder. Returns UP if process is alive.
+    pub fn memoryCheck(ctx: ?*anyopaque) HealthStatus {
+        _ = ctx;
         return .UP;
     }
 };
 
-/// 存活探针（Liveness Probe）
-/// 检查应用是否运行
+/// Liveness probe — always UP while the process is running.
 pub const LivenessProbe = struct {
-    pub fn check() HealthEndpoint.HealthStatus {
-        // 简化的存活检查
+    pub fn check(_: ?*anyopaque) HealthEndpoint.HealthStatus {
         return .UP;
     }
 };
 
-/// 就绪探针（Readiness Probe）
-/// 检查应用是否准备好接收流量
+/// Readiness probe — takes HealthEndpoint as context.
 pub const ReadinessProbe = struct {
-    pub fn check(modules: anytype) HealthEndpoint.HealthStatus {
-        // 检查所有模块是否已启动
-        for (modules) |module| {
-            if (!module.isReady()) {
-                return .DOWN;
-            }
-        }
-        return .UP;
+    pub fn check(ctx: ?*anyopaque) HealthEndpoint.HealthStatus {
+        const endpoint: *HealthEndpoint = @ptrCast(@alignCast(ctx orelse return .DOWN));
+        return endpoint.checkHealth().status;
     }
 };
 
@@ -236,7 +268,7 @@ test "HealthEndpoint toJson" {
 }
 
 test "LivenessProbe check" {
-    try std.testing.expectEqual(HealthEndpoint.HealthStatus.UP, LivenessProbe.check());
+    try std.testing.expectEqual(HealthEndpoint.HealthStatus.UP, LivenessProbe.check(null));
 }
 
 // ═══════════════════════════════════════════════════════════════

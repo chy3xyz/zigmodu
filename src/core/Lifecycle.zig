@@ -24,7 +24,7 @@ pub fn startAll(modules: *ApplicationModules) !void {
         }
     }
 
-    std.log.info("✅ All {d} modules started successfully", .{ordered_modules.items.len});
+    std.log.info("All {d} modules started successfully", .{ordered_modules.items.len});
 }
 
 pub fn stopAll(modules: *ApplicationModules) void {
@@ -48,7 +48,7 @@ pub fn stopAll(modules: *ApplicationModules) void {
                 deinit(module.ptr);
             }
         }
-        std.log.info("✅ All modules stopped successfully", .{});
+        std.log.info("All modules stopped successfully", .{});
         return;
     };
     defer ordered_modules.deinit(modules.allocator);
@@ -65,7 +65,7 @@ pub fn stopAll(modules: *ApplicationModules) void {
         }
     }
 
-    std.log.info("✅ All modules stopped successfully", .{});
+    std.log.info("All modules stopped successfully", .{});
 }
 
 fn getSortedModules(modules: *ApplicationModules) !std.ArrayList([]const u8) {

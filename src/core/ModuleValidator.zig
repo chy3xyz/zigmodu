@@ -34,7 +34,7 @@ pub fn validateModules(modules: *ApplicationModules) !void {
 
     try checkCircularDependencies(modules);
 
-    std.log.info("✅ All module dependencies validated successfully ({d} modules)", .{modules.modules.count()});
+    std.log.info("All module dependencies validated successfully ({d} modules)", .{modules.modules.count()});
 }
 
 fn checkCircularDependencies(modules: *ApplicationModules) !void {

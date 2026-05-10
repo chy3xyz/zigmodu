@@ -191,7 +191,7 @@ pub const SecretsManager = struct {
     fn setWithPriority(self: *Self, key: []const u8, value: []const u8, source: SecretsSourcePriority) !void {
         const existing = self.secrets.get(key);
         if (existing) |entry| {
-            if (@intFromEnum(source) <= @intFromEnum(entry.source)) {
+            if (@intFromEnum(source) >= @intFromEnum(entry.source)) {
                 self.allocator.free(key);
                 self.allocator.free(value);
                 return;

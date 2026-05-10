@@ -5,8 +5,9 @@ A modular application framework for Zig 0.16.0, inspired by Spring Modulith. Bui
 [![Zig](https://img.shields.io/badge/Zig-0.16.0+-orange?style=flat-square)](https://ziglang.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
 [![Build](https://img.shields.io/badge/Build-Passing-green?style=flat-square)](https://github.com/knot3bot/zigmodu/actions)
-[![Tests](https://img.shields.io/badge/Tests-282%20passed-green?style=flat-square)]()
+[![Tests](https://img.shields.io/badge/Tests-334%20passed-green?style=flat-square)]()
 [![Version](https://img.shields.io/badge/Version-0.8.0-blue?style=flat-square)]()
+[![Score](https://img.shields.io/badge/Production_Readiness-75%2F100-yellow?style=flat-square)]()
 
 ## 📚 Documentation
 
@@ -16,7 +17,7 @@ A modular application framework for Zig 0.16.0, inspired by Spring Modulith. Bui
 | [Best Practices](docs/BEST_PRACTICES.md) | Architecture evolution from 1K to 1M+ DAU |
 | [API Reference](docs/API.md) | Detailed API documentation |
 | [Architecture](docs/ARCHITECTURE.md) | System design and patterns |
-| [Evaluation Report](docs/EVALUATION_REPORT.md) | Production readiness assessment (93/100) |
+| [Evaluation Report](docs/EVALUATION_REPORT.md) | Production readiness assessment (75/100) |
 | [Examples](examples/) | Runnable example projects |
 | [ZModu CLI](tools/zmodu/README.md) | Code generator for modules, ORM, APIs |
 
@@ -32,7 +33,7 @@ A modular application framework for Zig 0.16.0, inspired by Spring Modulith. Bui
 ### HTTP & API
 - **HTTP Server** — Async fiber-based server (kqueue/io_uring), trie router, middleware chains
 - **WebSocket** — RFC 6455 server/client with origin validation and monitoring
-- **gRPC** — Service registry + Proto parser + 16 standard status codes + HTTP/2 mapping
+- **gRPC** ⚠️ — Service registry + Proto parser + 16 status codes (experimental)
 - **OpenAPI** — 3.0/3.1 JSON document generator from route metadata
 - **Idempotency** — Request deduplication middleware with TTL-based store
 
@@ -53,8 +54,8 @@ A modular application framework for Zig 0.16.0, inspired by Spring Modulith. Bui
 
 ### Distributed Systems
 - **DistributedEventBus** — Cross-node event pub/sub with heartbeat
-- **ClusterMembership** — Gossip-based node discovery + leader election
-- **DistributedTransaction** — 2PC + Saga patterns
+- **ClusterMembership** ⚠️ — Gossip-based node discovery + health check (experimental)
+- **DistributedTransaction** ⚠️ — 2PC + Saga patterns (experimental, needs persistence)
 - **Kafka Connector** — Producer/Consumer with topic stats + EventBridge
 - **Sharding** — Tenant-aware ShardRouter with configurable pools
 
@@ -77,9 +78,9 @@ A modular application framework for Zig 0.16.0, inspired by Spring Modulith. Bui
 - **Architecture Tester** — Compile-time dependency rule validation
 - **Module Interaction Verifier** — Spring Modulith verify()-style interaction model checking
 - **Contract Testing** — Pact-style consumer-driven contract verification
-- **Plugin System** — Dynamic extension loading
-- **Web Monitor** — HTTP dashboard for module inspection
-- **Hot Reloader** ⚠️ — File-watch based module change detection
+- **Plugin System** ⚠️ — Dynamic extension loading (experimental)
+- **Web Monitor** ⚠️ — HTTP dashboard for module inspection (experimental)
+- **Hot Reloader** ⚠️ — File-watch based module change detection (experimental)
 - **CI/CD Pipeline** — GitHub Actions: matrix build (linux/macOS), lint, benchmark, Docker, release
 
 ## 🚀 Quick Start

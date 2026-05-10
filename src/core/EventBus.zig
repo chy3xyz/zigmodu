@@ -2,6 +2,8 @@ const std = @import("std");
 
 /// ListenerSet 用于 O(1) 的订阅/取消订阅操作
 /// ListenerSet 使用 ArrayList 存储回调，小数据量时比 HashMap 更高效
+///
+/// NOTE: This type is NOT thread-safe. For concurrent access, use ThreadSafeEventBus.
 fn ListenerSet(comptime CallbackType: type) type {
     return struct {
         const Self = @This();
@@ -164,6 +166,52 @@ pub fn TypedEventBus(comptime T: type) type {
 
         pub fn deinit(self: *Self) void {
             self.listeners.deinit();
+        }
+    };
+}
+
+/// Thread-safe wrapper around TypedEventBus.
+/// All operations are protected by a Mutex for concurrent access.
+pub fn ThreadSafeEventBus(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        bus: TypedEventBus(T),
+        mu: std.Thread.Mutex,
+
+        pub fn init(alloc: std.mem.Allocator) Self {
+            return .{
+                .bus = TypedEventBus(T).init(alloc),
+                .mu = .{},
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.bus.deinit();
+        }
+
+        pub fn subscribe(self: *Self, listener: TypedEventBus(T).CallbackType) !void {
+            self.mu.lock();
+            defer self.mu.unlock();
+            try self.bus.subscribe(listener);
+        }
+
+        pub fn unsubscribe(self: *Self, listener: TypedEventBus(T).CallbackType) void {
+            self.mu.lock();
+            defer self.mu.unlock();
+            self.bus.unsubscribe(listener);
+        }
+
+        pub fn publish(self: *Self, event: T) void {
+            self.mu.lock();
+            defer self.mu.unlock();
+            self.bus.publish(event);
+        }
+
+        pub fn subscriberCount(self: *Self) usize {
+            self.mu.lock();
+            defer self.mu.unlock();
+            return self.bus.subscriberCount();
         }
     };
 }

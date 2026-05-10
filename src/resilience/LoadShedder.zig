@@ -4,6 +4,7 @@
 //! is under load, based on response time and throughput.
 
 const std = @import("std");
+const Time = @import("../core/Time.zig");
 const errors = @import("../sqlx/errors.zig");
 
 const default_buckets = 50;
@@ -72,7 +73,7 @@ pub fn RollingWindow(comptime T: type) type {
         }
 
         pub fn add(self: *Self, value: T) void {
-            const now_ms = 0;
+            const now_ms = Time.monotonicNowMilliseconds();
             self.advance(now_ms);
             self.buckets[self.last_index].sum += value;
             self.buckets[self.last_index].count += 1;

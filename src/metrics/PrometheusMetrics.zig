@@ -328,7 +328,29 @@ pub const PrometheusMetrics = struct {
             return 0 - self.module_start_time;
         }
     };
+
+    /// Convenience: register /metrics route on a server with Prometheus text format.
+    /// Usage: try metrics.registerMetricsRoute(&server);
+    pub fn registerMetricsRoute(self: *Self, server: anytype) !void {
+        const ptr: *anyopaque = @ptrCast(self);
+        try server.addRoute(.{
+            .method = .GET,
+            .path = "/metrics",
+            .handler = struct {
+                fn handle(ctx: *api.Context) anyerror!void {
+                    const m: *PrometheusMetrics = @ptrCast(@alignCast(ctx.user_data orelse return error.NoMetrics));
+                    const body = try m.toPrometheusFormat(ctx.allocator);
+                    defer ctx.allocator.free(body);
+                    try ctx.setHeader("Content-Type", "text/plain; version=0.0.4");
+                    try ctx.text(200, body);
+                }
+            }.handle,
+            .user_data = ptr,
+        });
+    }
 };
+
+const api = @import("../api/Server.zig");
 
 test "PrometheusMetrics counter and gauge" {
     const allocator = std.testing.allocator;

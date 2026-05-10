@@ -1729,6 +1729,29 @@ pub const Transaction = struct {
         return self.rollback();
     }
 
+    /// queryRow scans a single row into struct T (like Client.queryRow but on tx)
+    pub fn queryRow(self: *Transaction, allocator: std.mem.Allocator, comptime T: type, sql_str: []const u8, args: []const Value) !T {
+        var rows = try self.query(allocator, sql_str, args);
+        defer rows.deinit();
+        if (rows.rows.len == 0) return error.NotFound;
+        return try rows.rows[0].scan(allocator, T);
+    }
+
+    /// queryRows scans all rows into []T (like Client.queryRows but on tx)
+    pub fn queryRows(self: *Transaction, allocator: std.mem.Allocator, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
+        var rows = try self.query(allocator, sql_str, args);
+        defer rows.deinit();
+        const result = try allocator.alloc(T, rows.rows.len);
+        errdefer {
+            for (result) |item| freeScanned(allocator, T, item);
+            allocator.free(result);
+        }
+        for (rows.rows, 0..) |row, i| {
+            result[i] = try row.scan(allocator, T);
+        }
+        return result;
+    }
+
     pub fn prepare(self: *Transaction, allocator: std.mem.Allocator, sql_str: []const u8) !Stmt {
         return self.conn.prepare(allocator, sql_str);
     }

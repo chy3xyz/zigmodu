@@ -156,6 +156,18 @@ pub const ExternalizedConfig = struct {
         return null;
     }
 
+    /// 验证必须的配置键。返回缺失的键列表（空列表 = 全部存在）。
+    /// 在 Application.start() 时调用以提供清晰的启动错误信息。
+    pub fn validateRequired(self: *Self, required_keys: []const []const u8, allocator: std.mem.Allocator) ![]const []const u8 {
+        var missing = std.ArrayList([]const u8).empty;
+        for (required_keys) |key| {
+            if (self.properties.get(key) == null) {
+                try missing.append(allocator, key);
+            }
+        }
+        return missing.toOwnedSlice(allocator);
+    }
+
     /// 设置配置值
     pub fn set(self: *Self, key: []const u8, value: []const u8) !void {
         const key_copy = try self.allocator.dupe(u8, key);
