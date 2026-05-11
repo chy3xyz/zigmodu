@@ -203,3 +203,40 @@ test "compile all source files" {
     // Dashboard
     _ = @import("http/Dashboard.zig");
 }
+
+// ========================================
+// Domain Import Validation
+// ========================================
+test "domain imports: http" {
+    const http = zigmodu.http;
+    _ = http.http_server;
+    _ = http.HttpClient;
+    _ = http.Dashboard;
+    _ = http.ProblemDetails;
+    _ = http.OpenApiGenerator;
+}
+
+test "domain imports: data" {
+    const data = zigmodu.data;
+    _ = data.sqlx;
+    _ = data.redis;
+    _ = data.orm;
+    _ = data.CacheManager;
+    _ = data.MigrationRunner;
+}
+
+test "domain imports: security" {
+    const sec = zigmodu.security;
+    _ = sec.auth;
+    _ = sec.Rbac;
+    _ = sec.SecretsManager;
+    _ = sec.PasswordEncoder;
+}
+
+test "domain imports: observability" {
+    const obs = zigmodu.observability;
+    _ = obs.PrometheusMetrics;
+    _ = obs.DistributedTracer;
+    _ = obs.StructuredLogger;
+    _ = obs.MetricsBackend;
+}
