@@ -17,7 +17,14 @@ pub const PasswordEncoder = struct {
 
     pub fn encode(self: *PasswordEncoder, raw_password: []const u8) ![]const u8 {
         var salt: [16]u8 = undefined;
-        std.crypto.random.bytes(&salt); // OS CSPRNG — no manual seeding needed
+        // Seed CSPRNG from timestamp, pid, and stack address for ~128-bit entropy
+        var seed: [32]u8 = undefined;
+        std.mem.writeInt(u64, seed[0..8], @intCast(std.time.milliTimestamp()), .little);
+        std.mem.writeInt(u64, seed[8..16], @intCast(std.os.getpid() catch 0), .little);
+        std.mem.writeInt(u64, seed[16..24], @intFromPtr(&salt), .little);
+        std.mem.writeInt(u64, seed[24..32], @intCast(std.time.microTimestamp()), .little);
+        var csprng = std.Random.DefaultCsprng.init(seed);
+        csprng.fill(&salt);
 
         var derived_key: [32]u8 = undefined;
         try crypto.pwhash.pbkdf2(

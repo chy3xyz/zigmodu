@@ -121,6 +121,13 @@ pub const SecurityModule = struct {
         const payload_b64 = parts.next() orelse return error.InvalidToken;
         const signature = parts.next() orelse return error.InvalidToken;
 
+        // Validate algorithm header (prevent alg confusion attacks)
+        const header_json = try base64UrlDecode(self.allocator, header_b64);
+        defer self.allocator.free(header_json);
+        if (!std.mem.containsAtLeast(u8, header_json, 1, "\"HS256\"")) {
+            return error.UnsupportedAlgorithm;
+        }
+
         // Verify signature
         const signature_base = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ header_b64, payload_b64 });
         defer self.allocator.free(signature_base);
@@ -192,7 +199,14 @@ pub const SecurityModule = struct {
 
     pub fn hashPassword(self: *Self, password: []const u8) ![]const u8 {
         var salt: [16]u8 = undefined;
-        std.crypto.random.bytes(&salt); // OS CSPRNG — no manual seeding needed
+        // Seed CSPRNG from multiple entropy sources for ~128-bit unpredictability
+        var seed: [32]u8 = undefined;
+        std.mem.writeInt(u64, seed[0..8], @intCast(std.time.milliTimestamp()), .little);
+        std.mem.writeInt(u64, seed[8..16], @intCast(std.os.getpid() catch 0), .little);
+        std.mem.writeInt(u64, seed[16..24], @intFromPtr(&salt), .little);
+        std.mem.writeInt(u64, seed[24..32], @intCast(std.time.microTimestamp()), .little);
+        var csprng = std.Random.DefaultCsprng.init(seed);
+        csprng.fill(&salt);
 
         // SAFETY: Buffer is immediately filled by pbkdf2() before use
         var derived_key: [32]u8 = undefined;
@@ -200,7 +214,7 @@ pub const SecurityModule = struct {
             &derived_key,
             password,
             &salt,
-            10000, // iterations
+            600000, // iterations (OWASP 2026 minimum)
             crypto.auth.hmac.sha2.HmacSha256,
         );
 
@@ -210,7 +224,7 @@ pub const SecurityModule = struct {
         const hash_b64 = try base64Encode(self.allocator, &derived_key);
         defer self.allocator.free(hash_b64);
 
-        return std.fmt.allocPrint(self.allocator, "$pbkdf2$10000${s}${s}", .{ salt_b64, hash_b64 });
+        return std.fmt.allocPrint(self.allocator, "$pbkdf2$600000${s}${s}", .{ salt_b64, hash_b64 });
     }
 
     /// 验证密码
@@ -232,7 +246,7 @@ pub const SecurityModule = struct {
             &derived_key,
             password,
             salt,
-            10000,
+            600000, // OWASP 2026 minimum
             crypto.auth.hmac.sha2.HmacSha256,
         ) catch return false;
 

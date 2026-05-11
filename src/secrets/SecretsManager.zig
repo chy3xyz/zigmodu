@@ -46,12 +46,17 @@ pub const SecretsManager = struct {
     pub fn deinit(self: *Self) void {
         var iter = self.secrets.iterator();
         while (iter.next()) |entry| {
+            // Wipe secrets from memory before freeing to prevent
+            // plaintext lingering in allocator freelists or core dumps.
+            std.crypto.secureZero(u8, @constCast(entry.value_ptr.key));
+            std.crypto.secureZero(u8, @constCast(entry.value_ptr.value));
             self.allocator.free(entry.value_ptr.key);
             self.allocator.free(entry.value_ptr.value);
         }
         self.secrets.deinit();
 
         if (self.vault_config) |vc| {
+            std.crypto.secureZero(u8, @constCast(vc.token));
             self.allocator.free(vc.address);
             self.allocator.free(vc.token);
             if (!std.mem.eql(u8, vc.mount_path, "secret")) {

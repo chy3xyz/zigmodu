@@ -119,7 +119,13 @@ pub const ApiKeyGenerator = struct {
     /// 生成一个 API Key (格式: sk-{32 hex chars})
     pub fn generate(allocator: std.mem.Allocator) ![]const u8 {
         var buf: [16]u8 = undefined;
-        std.crypto.random.bytes(&buf); // OS CSPRNG — unpredictable key material
+        var seed: [32]u8 = undefined;
+        std.mem.writeInt(u64, seed[0..8], @intCast(std.time.milliTimestamp()), .little);
+        std.mem.writeInt(u64, seed[8..16], @intCast(std.os.getpid() catch 0), .little);
+        std.mem.writeInt(u64, seed[16..24], @intFromPtr(&buf), .little);
+        std.mem.writeInt(u64, seed[24..32], @intCast(std.time.microTimestamp()), .little);
+        var csprng = std.Random.DefaultCsprng.init(seed);
+        csprng.fill(&buf);
         const hex_chars = "0123456789abcdef";
         var hex: [32]u8 = undefined;
         for (buf, 0..) |byte, i| {

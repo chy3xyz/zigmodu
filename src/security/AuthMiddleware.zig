@@ -32,19 +32,30 @@ pub fn jwtAuth(security: *SecurityModule, allocator: std.mem.Allocator) !api.Mid
                     return;
                 };
 
-                // Build AuthInfo from JWT payload
+                // Build AuthInfo from JWT payload. Reject malformed numeric fields.
+                const user_id = std.fmt.parseInt(i64, payload.sub, 10) catch {
+                    try ctx.sendErrorResponse(401, 401, "Invalid token: sub claim is not a valid user ID");
+                    return;
+                };
+                const tenant_id = std.fmt.parseInt(i64, payload.aud, 10) catch {
+                    try ctx.sendErrorResponse(401, 401, "Invalid token: aud claim is not a valid tenant ID");
+                    return;
+                };
                 var auth = Rbac.AuthInfo{
-                    .user_id = std.fmt.parseInt(i64, payload.sub, 10) catch 0,
-                    .tenant_id = std.fmt.parseInt(i64, payload.aud, 10) catch 0,
+                    .user_id = user_id,
+                    .tenant_id = tenant_id,
                     .username = self.allocator.dupe(u8, payload.sub) catch return error.OutOfMemory,
                     .role_ids = &.{},
                 };
 
-                // Copy role strings
+                // Copy role strings. Reject malformed role IDs.
                 if (payload.roles.len > 0) {
                     const role_ids = self.allocator.alloc(i64, payload.roles.len) catch return error.OutOfMemory;
                     for (payload.roles, 0..) |role_str, i| {
-                        role_ids[i] = std.fmt.parseInt(i64, role_str, 10) catch 0;
+                        role_ids[i] = std.fmt.parseInt(i64, role_str, 10) catch {
+                            try ctx.sendErrorResponse(401, 401, "Invalid token: role claim contains non-numeric value");
+                            return;
+                        };
                     }
                     auth.role_ids = role_ids;
                 }
