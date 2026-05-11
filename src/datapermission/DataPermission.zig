@@ -97,3 +97,24 @@ fn parseDeptIds(allocator: std.mem.Allocator, input: []const u8) ![]const i64 {
     }
     return list.toOwnedSlice();
 }
+
+test "DataPermissionContext init and default" {
+    const allocator = std.testing.allocator;
+    var ctx = DataPermissionContext.init(allocator);
+    defer ctx.deinit();
+    try std.testing.expect(!ctx.is_admin);
+    try std.testing.expectEqual(@as(i64, 0), ctx.user_id);
+}
+
+test "DataPermissionFilter buildWhere" {
+    const allocator = std.testing.allocator;
+    var ctx = DataPermissionContext.init(allocator);
+    defer ctx.deinit();
+    ctx.user_id = 42;
+
+    const filter = DataPermissionFilter{ .column = "user_id", .scope = .self_ };
+    const where = try filter.buildWhere(allocator, ctx);
+    defer allocator.free(where);
+    try std.testing.expect(where.len > 0);
+}
+

@@ -77,3 +77,20 @@ pub fn TenantRepository(comptime T: type) type {
         }
     };
 }
+
+test "TenantInterceptor tenant field detection" {
+    const T1 = struct { tenant_id: i64, name: []const u8 };
+    const T2 = struct { id: i64, name: []const u8 };
+
+    try std.testing.expect(TenantInterceptor.hasTenantField(T1));
+    try std.testing.expect(!TenantInterceptor.hasTenantField(T2));
+}
+
+test "TenantInterceptor isTenantIgnored" {
+    const Admin = struct { pub const is_global = true; };
+    const User = struct {};
+
+    try std.testing.expect(TenantInterceptor.isTenantIgnored(Admin));
+    try std.testing.expect(!TenantInterceptor.isTenantIgnored(User));
+}
+

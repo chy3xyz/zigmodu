@@ -152,3 +152,24 @@ pub const CapabilityRegistry = struct {
         return buf.toOwnedSlice(allocator);
     }
 };
+
+test "ModuleCapabilities canPublish canConsume" {
+    const allocator = std.testing.allocator;
+    var cap = ModuleCapabilities.init(allocator, "test-module");
+    defer cap.deinit(allocator);
+
+    // All capabilities are allowed by default
+    try std.testing.expect(cap.canPublish("order.created"));
+    try std.testing.expect(cap.canConsume("order.created"));
+}
+
+test "ModuleCapabilities register capability" {
+    const allocator = std.testing.allocator;
+    var cap = ModuleCapabilities.init(allocator, "test-module");
+    defer cap.deinit(allocator);
+
+    try cap.registerCapability("publish", "order.created");
+    try cap.registerCapability("consume", "payment.*");
+    try std.testing.expectEqual(@as(usize, 2), cap.count());
+}
+

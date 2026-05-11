@@ -187,25 +187,28 @@ fn removeSegment(allocator: std.mem.Allocator, io: std.Io, seg: *WAL.Segment) !v
     allocator.destroy(seg);
 }
 
+/// Packed binary header for WAL entries (28 bytes). Zig 0.16 packed struct
+/// replaces manual writeInt calls with a single @bitCast copy.
+const WALEntryHeader = packed struct {
+    seq: u64,
+    timestamp_ms: i64,
+    topic_len: u32,
+    payload_len: u32,
+    source_len: u32,
+};
+
 fn serializeEntry(entry: WALEntry, seq: u64, alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) !void {
-    var tmp: [8]u8 = undefined;
-
-    std.mem.writeInt(u64, &tmp, seq, .big);
-    try buf.appendSlice(alloc, &tmp);
-
-    std.mem.writeInt(u64, &tmp, @intCast(entry.timestamp_ms), .big);
-    try buf.appendSlice(alloc, &tmp);
-
-    std.mem.writeInt(u32, tmp[0..4], @intCast(entry.topic.len), .big);
-    try buf.appendSlice(alloc, tmp[0..4]);
+    const header = WALEntryHeader{
+        .seq = seq,
+        .timestamp_ms = entry.timestamp_ms,
+        .topic_len = @intCast(entry.topic.len),
+        .payload_len = @intCast(entry.payload.len),
+        .source_len = @intCast(entry.source_node.len),
+    };
+    const header_bytes: [@sizeOf(WALEntryHeader)]u8 = @bitCast(header);
+    try buf.appendSlice(alloc, &header_bytes);
     try buf.appendSlice(alloc, entry.topic);
-
-    std.mem.writeInt(u32, tmp[0..4], @intCast(entry.payload.len), .big);
-    try buf.appendSlice(alloc, tmp[0..4]);
     try buf.appendSlice(alloc, entry.payload);
-
-    std.mem.writeInt(u32, tmp[0..4], @intCast(entry.source_node.len), .big);
-    try buf.appendSlice(alloc, tmp[0..4]);
     try buf.appendSlice(alloc, entry.source_node);
 }
 
