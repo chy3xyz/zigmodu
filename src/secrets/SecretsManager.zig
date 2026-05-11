@@ -67,7 +67,10 @@ pub const SecretsManager = struct {
 
     /// 从环境变量加载密钥
     /// 前缀过滤: 只加载指定前缀的变量
+    /// Load secrets from environment variables matching a prefix.
+    /// REQUIRES a non-empty prefix to prevent loading ALL env vars (PATH, HOME, etc.).
     pub fn loadFromEnv(self: *Self, prefix: []const u8) !void {
+        if (prefix.len == 0) return error.EmptyPrefixNotAllowed;
         const env_map = std.process.getEnvMap(self.allocator) catch {
             return error.EnvLoadError;
         };
@@ -75,11 +78,8 @@ pub const SecretsManager = struct {
 
         var iter = env_map.iterator();
         while (iter.next()) |entry| {
-            if (prefix.len == 0 or std.mem.startsWith(u8, entry.key_ptr.*, prefix)) {
-                const secret_key = if (prefix.len > 0)
-                    entry.key_ptr.*[prefix.len..]
-                else
-                    entry.key_ptr.*;
+            if (std.mem.startsWith(u8, entry.key_ptr.*, prefix)) {
+                const secret_key = entry.key_ptr.*[prefix.len..];
 
                 const key_copy = try self.allocator.dupe(u8, secret_key);
                 errdefer self.allocator.free(key_copy);

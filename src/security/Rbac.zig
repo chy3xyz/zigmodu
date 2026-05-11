@@ -116,6 +116,14 @@ pub const MenuTreeNode = struct {
 };
 
 /// 认证信息 — 从 JWT 解析后挂载到请求上下文
+/// Authentication info populated from JWT claims.
+///
+/// IMPORTANT: `permissions` starts empty. The caller MUST load permissions
+/// from the database after JWT verification and populate this map before
+/// calling hasPermission/hasAnyPermission/hasAllPermission:
+///
+///   var auth = ...; // from JWT
+///   try loadPermissions(&auth, auth.role_ids); // user-defined DB lookup
 pub const AuthInfo = struct {
     user_id: i64,
     tenant_id: i64,

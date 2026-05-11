@@ -1,6 +1,16 @@
 //! SQL client abstraction — aligned with go-zero's core/stores/sqlx.
 //! Supports SQLite, PostgreSQL, and MySQL via C bindings.
 //!
+//! SECURITY: Always use parameterized queries with `?` placeholders.
+//! Never concatenate user input directly into SQL strings.
+//!
+//!   // SAFE — parameterized:
+//!   client.query("SELECT * FROM users WHERE name = ?", &.{Value.string(name)});
+//!
+//!   // UNSAFE — SQL injection risk:
+//!   const sql = try std.fmt.allocPrint(alloc, "SELECT * FROM users WHERE name = '{s}'", .{name});
+//!   client.query(sql, &.{}); // ← name may contain '; DROP TABLE users; --
+//!
 //! STRUCTURE (planned split, currently one file):
 //!   §1  Types        — Value, Row, Rows, ExecResult, Driver, Conn, Stmt   (~200L)
 //!   §2  SQLiteConn   — SQLite connection + VTable                          (~160L)
