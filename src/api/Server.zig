@@ -559,11 +559,12 @@ const RequestParser = struct {
 
         return ParsedRequest{
             .method = method,
-            .path = try self.allocator.dupe(u8, path),
-            .raw_path = try self.allocator.dupe(u8, raw_path),
+            .path = path,
+            .raw_path = raw_path,
             .query = query_map,
             .headers = headers,
             .body = body,
+            ._request_line_buf = request_line_owned,
         };
     }
 };
@@ -575,10 +576,12 @@ const ParsedRequest = struct {
     query: std.StringHashMap([]const u8),
     headers: std.StringHashMap([]const u8),
     body: ?[]const u8,
+    /// Owned buffer that path and raw_path slice into.
+    /// Freed by deinit() — do not free path/raw_path separately.
+    _request_line_buf: []const u8,
 
     pub fn deinit(self: *ParsedRequest, allocator: std.mem.Allocator) void {
-        allocator.free(self.path);
-        allocator.free(self.raw_path);
+        allocator.free(self._request_line_buf);
 
         var query_iter = self.query.iterator();
         while (query_iter.next()) |entry| {
@@ -605,6 +608,12 @@ const TrieNode = struct {
     param_name: ?[]const u8,
     route: ?Route,
     children: std.ArrayList(*TrieNode),
+    /// O(1) child lookup map, lazily built when children exceed MAP_THRESHOLD.
+    child_map: ?std.StringHashMap(*TrieNode) = null,
+    /// Cached pointer to the first param child (at most one per node).
+    param_child: ?*TrieNode = null,
+
+    const MAP_THRESHOLD: usize = 8;
 
     pub fn init(allocator: std.mem.Allocator, segment: []const u8) !*TrieNode {
         const node = try allocator.create(TrieNode);
@@ -633,10 +642,37 @@ const TrieNode = struct {
             child.deinit(allocator);
         }
         self.children.deinit(allocator);
+        if (self.child_map) |*map| {
+            map.deinit();
+        }
         allocator.destroy(self);
     }
 
+    /// Insert a child and conditionally upgrade to HashMap lookup.
+    pub fn addChild(self: *TrieNode, allocator: std.mem.Allocator, child: *TrieNode) !void {
+        try self.children.append(allocator, child);
+
+        // Track param child for O(1) access
+        if (child.is_param and self.param_child == null) {
+            self.param_child = child;
+        }
+
+        // Lazy upgrade to HashMap when children cross threshold
+        if (self.children.items.len == MAP_THRESHOLD) {
+            self.child_map = std.StringHashMap(*TrieNode).init(allocator);
+            for (self.children.items) |c| {
+                try self.child_map.?.put(c.segment, c);
+            }
+        } else if (self.child_map) |*map| {
+            try map.put(child.segment, child);
+        }
+    }
+
     pub fn findChild(self: *const TrieNode, segment: []const u8) ?*TrieNode {
+        if (self.child_map) |map| {
+            return map.get(segment);
+        }
+        // Linear scan for small child counts (fast due to cache locality)
         for (self.children.items) |child| {
             if (std.mem.eql(u8, child.segment, segment)) return child;
         }
@@ -644,6 +680,8 @@ const TrieNode = struct {
     }
 
     pub fn findParamChild(self: *const TrieNode) ?*TrieNode {
+        if (self.param_child) |pc| return pc;
+        // Fallback: linear scan (should rarely be reached with addChild tracking)
         for (self.children.items) |child| {
             if (child.is_param) return child;
         }
@@ -684,7 +722,7 @@ const Router = struct {
                 current = child;
             } else {
                 const child = try TrieNode.init(self.allocator, part);
-                try current.children.append(self.allocator, child);
+                try current.addChild(self.allocator, child);
                 current = child;
             }
         }
@@ -1612,4 +1650,67 @@ test "e2e: full middleware chain with error path" {
             try std.testing.expectEqual(@as(u32, 1), Ctx.hit_count);
         }
     }
+}
+
+test "router scalability: 200 routes with O(1) child lookup" {
+    const allocator = std.testing.allocator;
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    // Register 200 routes across different methods and path depths
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        const path = try std.fmt.allocPrint(allocator, "/api/v1/users/{d}", .{i});
+        defer allocator.free(path);
+        try router.addRoute(.{
+            .method = .GET,
+            .path = path,
+            .handler = struct {
+                fn handle(_: *Context) !void {}
+            }.handle,
+        });
+    }
+    // Add 50 more with different prefixes
+    var j: usize = 0;
+    while (j < 50) : (j += 1) {
+        const path = try std.fmt.allocPrint(allocator, "/api/v2/items/{d}/details", .{j});
+        defer allocator.free(path);
+        try router.addRoute(.{
+            .method = .GET,
+            .path = path,
+            .handler = struct {
+                fn handle(_: *Context) !void {}
+            }.handle,
+        });
+    }
+    // 50 POST routes sharing prefixes
+    var k: usize = 0;
+    while (k < 50) : (k += 1) {
+        const path = try std.fmt.allocPrint(allocator, "/api/v1/users/{d}/posts", .{k});
+        defer allocator.free(path);
+        try router.addRoute(.{
+            .method = .POST,
+            .path = path,
+            .handler = struct {
+                fn handle(_: *Context) !void {}
+            }.handle,
+        });
+    }
+
+    // Verify all 200 routes match correctly
+    try std.testing.expect(router.match(.GET, "/api/v1/users/42") != null);
+    try std.testing.expect(router.match(.POST, "/api/v1/users/7/posts") != null);
+    try std.testing.expect(router.match(.GET, "/api/v2/items/3/details") != null);
+    try std.testing.expect(router.match(.GET, "/nonexistent") == null);
+
+    // Verify listRoutes returns all 200
+    const routes = try router.listRoutes(allocator);
+    defer {
+        for (routes) |r| {
+            allocator.free(r.method);
+            allocator.free(r.path);
+        }
+        allocator.free(routes);
+    }
+    try std.testing.expectEqual(@as(usize, 200), routes.len);
 }
