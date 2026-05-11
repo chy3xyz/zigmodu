@@ -8,7 +8,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_PATH="$SCRIPT_DIR/zmodu-bin"
 DATA_DIR="${HOME}/.zmodu"
-VERSION="0.6.0"
+VERSION="0.6.1"
 
 # Try the local bundled binary first
 if command -v "$BIN_PATH" &>/dev/null; then

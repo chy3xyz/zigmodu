@@ -368,7 +368,7 @@ fn printUsage() void {
 }
 
 fn printVersion() void {
-    std.log.info("zmodu version 0.6.0", .{});
+    std.log.info("zmodu version 0.6.1", .{});
 }
 
 fn cmdNew(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
