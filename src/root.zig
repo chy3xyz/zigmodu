@@ -81,6 +81,7 @@ pub const ClusterConfig = @import("core/DistributedEventBus.zig").ClusterConfig;
 // ============================================================
 // 5. DISTRIBUTED
 // ============================================================
+pub const ClusterBootstrap = @import("core/cluster/ClusterBootstrap.zig").ClusterBootstrap;
 pub const ClusterMembership = @import("core/ClusterMembership.zig").ClusterMembership;
 pub const SagaOrchestrator = @import("core/SagaOrchestrator.zig").SagaOrchestrator;
 pub const SagaLog = @import("core/SagaOrchestrator.zig").SagaLog;
