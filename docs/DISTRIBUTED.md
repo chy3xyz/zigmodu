@@ -14,7 +14,7 @@ For multi-node production, see the caveats below.
 | **DistributedTransaction** | 4 | 2PC protocol (commit + abort). |
 | **ClusterMembership** | 4 | Gossip protocol + health checks. Join/leave/rejoin tested. |
 | **DistributedEventBus** | 3 | Cross-node pub/sub with heartbeat. |
-| **WAL** (eventbus/) | 2 | Write-ahead log. Segment management + append/read. |
+| **WAL** (eventbus/) | 2 | Write-ahead log. Zig 0.16 Io.Dir + binary serialization. |
 | **DLQ** (eventbus/) | 3 | Dead-letter queue. Expiry + requeue with cooldown. |
 | **Partitioner** | 3 | Consistent hash ring. Node add/remove + routing. |
 
