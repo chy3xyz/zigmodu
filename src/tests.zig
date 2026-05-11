@@ -58,6 +58,7 @@ test "compile all source files" {
     // Cluster & Distributed (integration tests - these compile successfully)
     _ = @import("core/ClusterMembership.zig");
     _ = @import("core/cluster/FailureDetector.zig");
+    _ = @import("core/cluster/NetworkTransport.zig");
     _ = @import("messaging/OutboxPublisher.zig");
     _ = @import("tenant/ShardRouter.zig");
 
