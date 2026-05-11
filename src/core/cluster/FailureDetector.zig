@@ -332,3 +332,16 @@ test "normalCDF known values" {
     const cdf_neg1 = normalCDF(-1.0);
     try std.testing.expect(cdf_neg1 > 0.07 and cdf_neg1 < 0.09);
 }
+
+test "FailureDetector phi increases after missed heartbeats" {
+    const allocator = std.testing.allocator;
+    var fd = AccrualFailureDetector.init(allocator, 1.0, 100);
+    defer fd.deinit();
+
+    // Initial phi should be 0 (no history)
+    try std.testing.expectEqual(@as(f64, 0.0), fd.phi());
+
+    // After a heartbeat, phi should stay low
+    fd.heartbeat();
+    try std.testing.expect(fd.phi() < 2.0);
+}

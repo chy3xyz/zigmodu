@@ -85,9 +85,14 @@ pub fn uuid(value: []const u8) Result {
     return Result.ok();
 }
 
-/// Validate URL format (simplified)
+/// Validate URL format. Rejects: empty, non-http(s), embedded null bytes,
+/// newlines (header injection), and dangerous schemes.
 pub fn url(value: []const u8) Result {
     if (value.len == 0) return Result.fail("url cannot be empty");
+    // Reject embedded control characters (null, CR, LF) to prevent header injection
+    for (value) |c| {
+        if (c == 0 or c == '\r' or c == '\n') return Result.fail("url contains invalid characters");
+    }
     if (!std.mem.startsWith(u8, value, "http://") and !std.mem.startsWith(u8, value, "https://")) {
         return Result.fail("url must start with http:// or https://");
     }
