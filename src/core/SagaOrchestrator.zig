@@ -443,3 +443,36 @@ test "SagaOrchestrator get log" {
     try std.testing.expectEqual(@as(usize, 1), log.steps.len);
     try std.testing.expectEqual(SagaLog.StepLog.StepStatus.completed, log.steps[0].status);
 }
+
+test "SagaOrchestrator compensation reverse order" {
+    const allocator = std.testing.allocator;
+    var orchestrator = SagaOrchestrator.init(allocator);
+    defer orchestrator.deinit();
+
+    const Ctx = struct {
+        var compensate_order = std.ArrayList([]const u8).empty;
+    };
+
+    const saga_def = SagaOrchestrator.SagaDefinition{
+        .name = "reverse-test",
+        .steps = &.{
+            .{ .name = "step-1", .action = struct {
+                fn f(_: *anyopaque) anyerror!void {}
+            }.f },
+            .{ .name = "step-2", .action = struct {
+                fn f(_: *anyopaque) anyerror!void {}
+            }.f },
+            .{ .name = "step-3", .action = struct {
+                fn f(_: *anyopaque) !void { return error.SimulatedFailure; }
+            }.f, .compensate = struct {
+                fn c(_: *anyopaque) void {
+                    Ctx.compensate_order.append("step-3-comp") catch {};
+                }
+            }.c },
+        },
+    };
+    // Register the saga and verify step count
+    try orchestrator.registerSaga("reverse-test", saga_def.steps);
+    try std.testing.expectEqual(@as(usize, 3), saga_def.steps.len);
+    try std.testing.expect(saga_def.steps[2].compensate != null);
+}

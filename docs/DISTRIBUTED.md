@@ -8,7 +8,7 @@
 | **ClusterMembership** | ✅ Ready | 4 | Gossip protocol + health checks. Node join/leave/health tracking tested. |
 | **SagaOrchestrator** | ✅ Ready | 5 | Auto-compensation saga with step logging. |
 | **DistributedTransaction** | ⚠️ Beta | 5 | 2PC protocol. Needs persistence layer for production. |
-| **KafkaConnector** | ⚠️ Beta | 0 | Producer/Consumer stubs. Needs broker integration testing. |
+| **KafkaConnector** | ⚠️ Beta | 7 | Producer/Consumer structs + wire format. Needs broker integration. |
 | **RaftElection** | ⚠️ Beta | 4 | Leader election + vote counting. Term tracking works. |
 | **FailureDetector** | ⚠️ Beta | 6 | Accrual failure detector. Phi-threshold tested. |
 | **WAL (eventbus/)** | 🔬 WIP | 0 | Write-ahead log. Implemented but not wired to DEB. |
