@@ -183,3 +183,46 @@ test "startAll and stopAll order" {
     try startAll(&scanned);
     try std.testing.expectEqualStrings("bmt", &Ctx.order);
 }
+
+test "stopAll reverse dependency order" {
+    const allocator = std.testing.allocator;
+    var modules = ApplicationModules.init(allocator);
+    defer modules.deinit();
+
+    const Ctx = struct {
+        var deinit_order: [3]u8 = undefined;
+        var idx: usize = 0;
+    };
+    Ctx.idx = 0;
+
+    const Base = struct {
+        pub const info = @import("../api/Module.zig").Module{
+            .name = "base-s", .description = "B", .dependencies = &.{},
+        };
+        pub fn init() !void {}
+        pub fn deinit() void { Ctx.deinit_order[Ctx.idx] = 'b'; Ctx.idx += 1; }
+    };
+    const Middle = struct {
+        pub const info = @import("../api/Module.zig").Module{
+            .name = "middle-s", .description = "M", .dependencies = &.{"base-s"},
+        };
+        pub fn init() !void {}
+        pub fn deinit() void { Ctx.deinit_order[Ctx.idx] = 'm'; Ctx.idx += 1; }
+    };
+    const Top = struct {
+        pub const info = @import("../api/Module.zig").Module{
+            .name = "top-s", .description = "T", .dependencies = &.{"middle-s"},
+        };
+        pub fn init() !void {}
+        pub fn deinit() void { Ctx.deinit_order[Ctx.idx] = 't'; Ctx.idx += 1; }
+    };
+
+    var scanned = try @import("ModuleScanner.zig").scanModules(allocator, .{ Top, Middle, Base });
+    defer scanned.deinit();
+
+    try startAll(&scanned);
+    Ctx.idx = 0;
+    stopAll(&scanned);
+    // Deinit order must be reverse of init: Top → Middle → Base
+    try std.testing.expectEqualStrings("tmb", &Ctx.deinit_order);
+}

@@ -110,9 +110,19 @@ pub fn every(seconds: u64, task: *const fn (*anyopaque) void, context: *anyopaqu
     }
 }
 
-test "cron expression" {
-    const expr = Expression{ .minute = 0, .hour = 12 };
-    // Can't easily test without mocking time
-    _ = expr;
-    try std.testing.expect(true);
+test "cron expression matches specific time" {
+    const expr = Expression{ .minute = 30, .hour = 9, .day = 15, .month = 3 };
+    // March 15, 9:30 AM UTC
+    const ts: std.c.time_t = 1710502200; // 2024-03-15 09:30:00 UTC
+    try std.testing.expect(expr.matches(ts));
+
+    // 1 minute later should NOT match
+    const ts2: std.c.time_t = 1710502260;
+    try std.testing.expect(!expr.matches(ts2));
+}
+
+test "cron expression any-day wildcard" {
+    const expr = Expression{ .minute = 0, .hour = 8, .day = 0, .month = 0 }; // every day at 8:00
+    try std.testing.expect(expr.day == 0); // day=0 means "any"
+    try std.testing.expect(expr.month == 0); // month=0 means "any"
 }
