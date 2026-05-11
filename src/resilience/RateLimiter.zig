@@ -238,7 +238,7 @@ pub const SlidingWindowRateLimiter = struct {
         var i: usize = 0;
         while (i < self.requests.items.len) {
             if (self.requests.items[i] < cutoff) {
-                _ = self.requests.orderedRemove(i);
+                _ = self.requests.swapRemove(i);
             } else {
                 i += 1;
             }

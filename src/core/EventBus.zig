@@ -30,7 +30,7 @@ fn ListenerSet(comptime CallbackType: type) type {
         pub fn remove(self: *Self, callback: CallbackType) bool {
             for (self.list.items, 0..) |cb, i| {
                 if (cb == callback) {
-                    _ = self.list.orderedRemove(i);
+                    _ = self.list.swapRemove(i);
                     return true;
                 }
             }

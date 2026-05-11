@@ -70,7 +70,7 @@ pub const HttpClient = struct {
             // 查找空闲连接
             for (self.idle_connections.items, 0..) |conn, i| {
                 if (std.mem.eql(u8, conn.host, host) and conn.port == port and conn.isAlive()) {
-                    const connection = self.idle_connections.orderedRemove(i);
+                    const connection = self.idle_connections.swapRemove(i);
                     try self.active_connections.append(self.allocator, connection);
                     return connection;
                 }
@@ -105,7 +105,7 @@ pub const HttpClient = struct {
             // 从活跃连接中移除
             for (self.active_connections.items, 0..) |active_conn, i| {
                 if (active_conn.stream != null and conn.stream != null and active_conn.stream.?.socket.handle == conn.stream.?.socket.handle) {
-                    _ = self.active_connections.orderedRemove(i);
+                    _ = self.active_connections.swapRemove(i);
                     break;
                 }
             }

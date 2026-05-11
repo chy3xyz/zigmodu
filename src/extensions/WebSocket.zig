@@ -193,7 +193,7 @@ pub const WebSocketServer = struct {
         self.clients_mutex.lock(self.io) catch return;
         for (self.clients.items, 0..) |c, i| {
             if (c == client) {
-                _ = self.clients.orderedRemove(i);
+                _ = self.clients.swapRemove(i);
                 break;
             }
         }

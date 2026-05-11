@@ -97,13 +97,25 @@ pub const PrometheusMetrics = struct {
         count: u64 = 0,
         max_age_seconds: u64 = 600,
         age_buckets: usize = 5,
+        /// Hard cap on stored samples to prevent unbounded memory growth.
+        /// Once reached, new values replace random existing samples (reservoir sampling).
+        max_samples: usize = 500,
 
         pub fn observe(self: *Summary, value: f64) !void {
             self.sum += value;
             self.count += 1;
-            try self.values.append(value);
+
+            if (self.values.items.len < self.max_samples) {
+                try self.values.append(value);
+            } else {
+                // Reservoir sampling: replace a random sample
+                const idx = @as(usize, @intCast(self.count % self.max_samples));
+                self.values.items[idx] = value;
+            }
         }
 
+        /// Returns the q-th quantile (0.0-1.0).
+        /// NOTE: O(n log n) — sorts values on every call. Avoid in hot paths.
         pub fn getQuantile(self: *Summary, q: f64) f64 {
             if (self.values.items.len == 0) return 0.0;
 

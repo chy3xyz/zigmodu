@@ -273,7 +273,7 @@ pub const DistributedEventBus = struct {
         if (self.topic_callbacks.getPtr(topic)) |callbacks| {
             for (callbacks.items, 0..) |cb, i| {
                 if (cb == callback) {
-                    _ = callbacks.orderedRemove(i);
+                    _ = callbacks.swapRemove(i);
                     break;
                 }
             }
@@ -383,7 +383,7 @@ pub const DistributedEventBus = struct {
                     sock.close(self.io);
                 }
                 self.allocator.free(node.id);
-                _ = self.nodes.orderedRemove(i);
+                _ = self.nodes.swapRemove(i);
                 std.log.info("[DistributedEventBus] Disconnected from node {s}", .{node_id});
                 return;
             }

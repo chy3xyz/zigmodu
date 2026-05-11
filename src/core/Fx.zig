@@ -72,7 +72,7 @@ pub fn Stream(comptime T: type) type {
             var i: usize = 0;
             while (i < self.items.items.len) {
                 if (!func(self.items.items[i])) {
-                    _ = self.items.orderedRemove(i);
+                    _ = self.items.swapRemove(i);
                 } else {
                     i += 1;
                 }

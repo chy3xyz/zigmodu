@@ -48,10 +48,16 @@ pub const CircuitBreaker = struct {
         self.allocator.free(self.name);
     }
 
-    /// 执行受保护的调用
+    /// Execute a protected call through the circuit breaker.
+    ///
+    /// Thread safety: this method is NOT thread-safe. For concurrent access,
+    /// wrap the CircuitBreaker in a Mutex or use one instance per fiber.
     pub fn call(self: *Self, operation: *const fn () anyerror!void) Result {
-        // 检查当前状态
-        self.updateState();
+        // Short-circuit: in CLOSED state (hot path), skip the syscall.
+        // Only check for OPEN→HALF_OPEN transition when the breaker is actually OPEN.
+        if (self.state != .CLOSED) {
+            self.updateState();
+        }
 
         switch (self.state) {
             .OPEN => {
