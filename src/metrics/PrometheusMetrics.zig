@@ -286,6 +286,74 @@ pub const PrometheusMetrics = struct {
         return buf.toOwnedSlice();
     }
 
+    /// Export this metrics registry as a pluggable MetricsBackend.
+    /// Use this to decouple consumers (e.g. AutoInstrumentation) from Prometheus.
+    pub fn toBackend(self: *Self) MetricsBackend {
+        const S = @This();
+        return MetricsBackend{
+            .ptr = self,
+            .vtable = &.{
+                .createCounter = struct {
+                    fn f(ptr: *anyopaque, name: []const u8, help: []const u8) !*anyopaque {
+                        const s: *S = @ptrCast(@alignCast(ptr));
+                        const c = try s.createCounter(name, help);
+                        return @ptrCast(c);
+                    }
+                }.f,
+                .createGauge = struct {
+                    fn f(ptr: *anyopaque, name: []const u8, help: []const u8) !*anyopaque {
+                        const s: *S = @ptrCast(@alignCast(ptr));
+                        const g = try s.createGauge(name, help);
+                        return @ptrCast(g);
+                    }
+                }.f,
+                .createHistogram = struct {
+                    fn f(ptr: *anyopaque, name: []const u8, help: []const u8, buckets: []const f64) !*anyopaque {
+                        const s: *S = @ptrCast(@alignCast(ptr));
+                        const h = try s.createHistogram(name, help, buckets);
+                        return @ptrCast(h);
+                    }
+                }.f,
+                .counterInc = struct {
+                    fn f(ptr: *anyopaque, _: u64) void {
+                        const c: *Counter = @ptrCast(@alignCast(ptr));
+                        c.inc();
+                    }
+                }.f,
+                .counterAdd = struct {
+                    fn f(ptr: *anyopaque, v: u64) void {
+                        const c: *Counter = @ptrCast(@alignCast(ptr));
+                        c.add(v);
+                    }
+                }.f,
+                .gaugeSet = struct {
+                    fn f(ptr: *anyopaque, v: f64) void {
+                        const g: *Gauge = @ptrCast(@alignCast(ptr));
+                        g.set(v);
+                    }
+                }.f,
+                .gaugeInc = struct {
+                    fn f(ptr: *anyopaque) void {
+                        const g: *Gauge = @ptrCast(@alignCast(ptr));
+                        g.inc();
+                    }
+                }.f,
+                .gaugeDec = struct {
+                    fn f(ptr: *anyopaque) void {
+                        const g: *Gauge = @ptrCast(@alignCast(ptr));
+                        g.dec();
+                    }
+                }.f,
+                .histogramObserve = struct {
+                    fn f(ptr: *anyopaque, v: f64) void {
+                        const h: *Histogram = @ptrCast(@alignCast(ptr));
+                        h.observe(v);
+                    }
+                }.f,
+            },
+        };
+    }
+
     /// 模块指标收集器
     pub const ModuleMetricsCollector = struct {
         metrics: *PrometheusMetrics,
@@ -350,6 +418,7 @@ pub const PrometheusMetrics = struct {
     }
 };
 
+const MetricsBackend = @import("MetricsBackend.zig").MetricsBackend;
 const api = @import("../api/Server.zig");
 
 test "PrometheusMetrics counter and gauge" {

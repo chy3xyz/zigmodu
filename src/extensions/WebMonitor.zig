@@ -1,7 +1,7 @@
 const std = @import("std");
 const Application = @import("../Application.zig").Application;
-const ApplicationModules = @import("Module.zig").ApplicationModules;
-const ModuleInfo = @import("Module.zig").ModuleInfo;
+const ApplicationModules = @import("../core/Module.zig").ApplicationModules;
+const ModuleInfo = @import("../core/Module.zig").ModuleInfo;
 
 /// Web interface for module monitoring
 pub const WebMonitor = struct {

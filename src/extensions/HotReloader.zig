@@ -1,7 +1,7 @@
 const std = @import("std");
-const Time = @import("Time.zig");
+const Time = @import("../core/Time.zig");
 const Application = @import("../Application.zig").Application;
-const ApplicationModules = @import("Module.zig").ApplicationModules;
+const ApplicationModules = @import("../core/Module.zig").ApplicationModules;
 const ArrayList = std.array_list.Managed;
 
 // Module Hot-Reloading System

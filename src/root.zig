@@ -100,19 +100,19 @@ pub const datapermission = @import("datapermission/DataPermission.zig");
 // ============================================================
 // 6. EXTENSIONS
 // ============================================================
-pub const PluginManager = @import("core/PluginManager.zig").PluginManager;
-pub const PluginManifest = @import("core/PluginManager.zig").PluginManifest;
-pub const HotReloader = @import("core/HotReloader.zig").HotReloader;
-pub const ReloadStrategy = @import("core/HotReloader.zig").ReloadStrategy;
-pub const ModuleSnapshot = @import("core/HotReloader.zig").ModuleSnapshot;
-pub const WebMonitor = @import("core/WebMonitor.zig").WebMonitor;
-pub const WebSocketServer = @import("core/WebSocket.zig").WebSocketServer;
-pub const WebSocketClient = @import("core/WebSocket.zig").WebSocketClient;
-pub const WebSocketMonitor = @import("core/WebSocket.zig").WebSocketMonitor;
-pub const GrpcServiceRegistry = @import("core/GrpcTransport.zig").GrpcServiceRegistry;
-pub const GrpcClient = @import("core/GrpcTransport.zig").GrpcClient;
-pub const GrpcStatusCode = @import("core/GrpcTransport.zig").GrpcStatusCode;
-pub const ProtoParser = @import("core/GrpcTransport.zig").ProtoParser;
+pub const PluginManager = @import("extensions/PluginManager.zig").PluginManager;
+pub const PluginManifest = @import("extensions/PluginManager.zig").PluginManifest;
+pub const HotReloader = @import("extensions/HotReloader.zig").HotReloader;
+pub const ReloadStrategy = @import("extensions/HotReloader.zig").ReloadStrategy;
+pub const ModuleSnapshot = @import("extensions/HotReloader.zig").ModuleSnapshot;
+pub const WebMonitor = @import("extensions/WebMonitor.zig").WebMonitor;
+pub const WebSocketServer = @import("extensions/WebSocket.zig").WebSocketServer;
+pub const WebSocketClient = @import("extensions/WebSocket.zig").WebSocketClient;
+pub const WebSocketMonitor = @import("extensions/WebSocket.zig").WebSocketMonitor;
+pub const GrpcServiceRegistry = @import("extensions/GrpcTransport.zig").GrpcServiceRegistry;
+pub const GrpcClient = @import("extensions/GrpcTransport.zig").GrpcClient;
+pub const GrpcStatusCode = @import("extensions/GrpcTransport.zig").GrpcStatusCode;
+pub const ProtoParser = @import("extensions/GrpcTransport.zig").ProtoParser;
 
 // ============================================================
 // 7. SCHEDULER

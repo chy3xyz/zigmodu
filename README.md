@@ -85,6 +85,25 @@ A modular application framework for Zig 0.16.0, inspired by Spring Modulith. Bui
 
 ## 🚀 Quick Start
 
+### Fast Compilation
+
+For large projects, import only the domains you need:
+
+```zig
+const zmodu = @import("zigmodu");
+
+// Full import (everything):
+var app = try zmodu.builder(allocator, io).build(.{MyModule});
+
+// Fast import: only HTTP + Core (skips SQLx, Redis, Kafka, etc.):
+const http = zmodu.http;       // Server, middleware, client, OpenAPI
+const data = zmodu.data;       // SQLx, Redis, ORM, Cache, Migrations
+const sec  = zmodu.security;   // Auth, RBAC, API keys, Secrets
+const obs  = zmodu.observability; // Prometheus, Tracing, Logging
+```
+
+Each domain file is self-contained — importing `zmodu.http` does not compile `sqlx` or `redis`.
+
 ### Prerequisites
 
 ```bash

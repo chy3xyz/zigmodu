@@ -1,5 +1,5 @@
 const std = @import("std");
-const ApplicationModules = @import("Module.zig").ApplicationModules;
+const ApplicationModules = @import("../core/Module.zig").ApplicationModules;
 
 /// WebSocket support for real-time monitoring
 /// Provides RFC 6455 WebSocket server functionality for live module updates

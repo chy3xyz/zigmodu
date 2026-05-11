@@ -52,7 +52,7 @@ test "compile all source files" {
     _ = @import("core/EventPublisher.zig");
     _ = @import("core/EventStore.zig");
     _ = @import("core/HealthEndpoint.zig");
-    _ = @import("core/HotReloader.zig");
+    _ = @import("extensions/HotReloader.zig");
     _ = @import("core/Lifecycle.zig");
     _ = @import("core/Module.zig");
     _ = @import("core/ModuleBoundary.zig");
@@ -63,10 +63,10 @@ test "compile all source files" {
     _ = @import("core/ModuleValidator.zig");
     _ = @import("core/Transactional.zig");
     _ = @import("core/TransactionalEvent.zig");
-    _ = @import("core/WebMonitor.zig");
-    _ = @import("core/WebSocket.zig");
+    _ = @import("extensions/WebMonitor.zig");
+    _ = @import("extensions/WebSocket.zig");
     // _ = @import("core/IMWebSocket.zig"); // EXPERIMENTAL - future work
-    // _ = @import("core/GrpcTransport.zig"); // EXPERIMENTAL - future work
+    // _ = @import("extensions/GrpcTransport.zig"); // EXPERIMENTAL - future work
     // _ = @import("core/MqttTransport.zig"); // EXPERIMENTAL - future work
 
     // Cluster & Distributed (integration tests - these compile successfully)
@@ -169,7 +169,7 @@ test "compile all source files" {
     _ = @import("http/OpenApi.zig");
 
     // gRPC Transport
-    _ = @import("core/GrpcTransport.zig");
+    _ = @import("extensions/GrpcTransport.zig");
 
     // Kafka Connector
     _ = @import("core/KafkaConnector.zig");
