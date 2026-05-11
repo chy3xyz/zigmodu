@@ -2,6 +2,6 @@ const std = @import("std");
 const zigmodu = @import("root.zig");
 
 pub fn main() !void {
-    std.log.info("ZigModu Framework v0.8.0", .{});
+    std.log.info("ZigModu Framework v0.8.3", .{});
     std.log.info("Usage: Use zigmodu as a library in your application", .{});
 }

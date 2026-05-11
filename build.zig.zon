@@ -1,6 +1,6 @@
 .{
     .name = .zigmodu,
-    .version = "0.8.0",
+    .version = "0.8.3",
     .fingerprint = 0x7aa42d07b32f8d53,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
