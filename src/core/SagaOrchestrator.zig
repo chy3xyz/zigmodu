@@ -457,15 +457,15 @@ test "SagaOrchestrator compensation reverse order" {
         .name = "reverse-test",
         .steps = &.{
             .{ .name = "step-1", .action = struct {
-                fn f(_: *anyopaque) anyerror!void {}
+                fn f() anyerror!void {}
             }.f },
             .{ .name = "step-2", .action = struct {
-                fn f(_: *anyopaque) anyerror!void {}
+                fn f() anyerror!void {}
             }.f },
             .{ .name = "step-3", .action = struct {
-                fn f(_: *anyopaque) !void { return error.SimulatedFailure; }
+                fn f() anyerror!void { return error.SimulatedFailure; }
             }.f, .compensate = struct {
-                fn c(_: *anyopaque) void {
+                fn c() void {
                     Ctx.compensate_order.append("step-3-comp") catch {};
                 }
             }.c },

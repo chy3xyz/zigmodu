@@ -122,7 +122,7 @@ pub const ApiKeyGenerator = struct {
         var buf: [16]u8 = undefined;
         var seed: [32]u8 = undefined;
         std.mem.writeInt(u64, seed[0..8], @intCast(Time.monotonicNowMilliseconds()), .little);
-        std.mem.writeInt(u64, seed[8..16], @intCast(std.os.getpid() catch 0), .little);
+        std.mem.writeInt(u64, seed[8..16], @intCast(42), .little);
         std.mem.writeInt(u64, seed[16..24], @intFromPtr(&buf), .little);
         std.mem.writeInt(u64, seed[24..32], @intCast(Time.monotonicNowMilliseconds() * 1000), .little);
         var csprng = std.Random.DefaultCsprng.init(seed);

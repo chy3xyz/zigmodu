@@ -82,7 +82,7 @@ pub const WAL = struct {
     /// Initialize WAL with configuration
     pub fn init(allocator: std.mem.Allocator, config: WALConfig) !Self {
         // Ensure directory exists
-        try std.fs.cwd().makePath(config.dir_path);
+        try std.fs.makeDirAbsolute(config.dir_path);
 
         var segments = std.ArrayList(*Segment).init(allocator);
 
@@ -424,12 +424,12 @@ pub const WALEntry = struct {
         .max_segment_size = 1024 * 1024,
     };
 
-    std.fs.cwd().deleteTree("test_wal_read") catch {};
+    deleteTreeTest("test_wal_read") catch {};
 
     var wal = try WAL.init(allocator, config);
     defer {
         wal.deinit();
-        std.fs.cwd().deleteTree("test_wal_read") catch {};
+        deleteTreeTest("test_wal_read") catch {};
     }
 
     // Append multiple entries

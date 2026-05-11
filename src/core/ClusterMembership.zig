@@ -515,22 +515,22 @@ test "ClusterMembership node leave and rejoin" {
 
     // Add 2 nodes
     cluster.handleGossipEvent(.{
-        .event_type = .join, .node_id = "n1", .host = "127.0.0.1", .port = 1, .timestamp = 0,
+        .event_type = .join, .node_id = "n1", .host = "127.0.0.1", .port = 1, .timestamp = 0, .metadata = null,
     });
     cluster.handleGossipEvent(.{
-        .event_type = .join, .node_id = "n2", .host = "127.0.0.1", .port = 2, .timestamp = 0,
+        .event_type = .join, .node_id = "n2", .host = "127.0.0.1", .port = 2, .timestamp = 0, .metadata = null,
     });
     try std.testing.expectEqual(@as(usize, 2), cluster.getHealthyNodeCount());
 
     // Node leaves
     cluster.handleGossipEvent(.{
-        .event_type = .leave, .node_id = "n1", .host = "127.0.0.1", .port = 1, .timestamp = 0,
+        .event_type = .leave, .node_id = "n1", .host = "127.0.0.1", .port = 1, .timestamp = 0, .metadata = null,
     });
     try std.testing.expectEqual(@as(usize, 1), cluster.getHealthyNodeCount());
 
     // Node rejoins
     cluster.handleGossipEvent(.{
-        .event_type = .join, .node_id = "n1", .host = "127.0.0.1", .port = 1, .timestamp = 0,
+        .event_type = .join, .node_id = "n1", .host = "127.0.0.1", .port = 1, .timestamp = 0, .metadata = null,
     });
     try std.testing.expectEqual(@as(usize, 2), cluster.getHealthyNodeCount());
 }

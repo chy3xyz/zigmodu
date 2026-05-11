@@ -462,3 +462,33 @@ test "RaftElection rejects stale term vote" {
     });
     try std.testing.expect(!resp.vote_granted);
 }
+
+test "RaftElection split vote across three candidates" {
+    const allocator = std.testing.allocator;
+    var e1 = try RaftElection.init(allocator, "n1", 3);
+    defer e1.deinit();
+    var e2 = try RaftElection.init(allocator, "n2", 3);
+    defer e2.deinit();
+    var e3 = try RaftElection.init(allocator, "n3", 3);
+    defer e3.deinit();
+
+    // All start election at term 1
+    _ = try e1.startElection();
+    _ = try e2.startElection();
+    _ = try e3.startElection();
+
+    // Each votes for itself — verify all terms incremented
+    try std.testing.expect(e1.getTerm() >= 1);
+    try std.testing.expect(e2.getTerm() >= 1);
+    try std.testing.expect(e3.getTerm() >= 1);
+
+    // N1 requests vote from N2 at higher term — should be granted
+    const req = RaftElection.VoteRequest{
+        .term = @intCast(e1.getTerm()),
+        .candidate_id = "n1",
+        .last_log_index = 5,
+        .last_log_term = 1,
+    };
+    const resp = try e2.handleVoteRequest(req);
+    try std.testing.expect(resp.vote_granted);
+}

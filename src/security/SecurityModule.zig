@@ -137,7 +137,7 @@ pub const SecurityModule = struct {
 
         // Constant-time comparison to prevent timing side-channel
         if (signature.len != expected_signature.len or
-            !std.crypto.timing_safe.eql(u8, signature, expected_signature))
+            !std.crypto.timing_safe.eql(u8, signature, expected_signature[0..signature.len]))
         {
             return error.InvalidSignature;
         }
