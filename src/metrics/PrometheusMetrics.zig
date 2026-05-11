@@ -514,3 +514,28 @@ test "Gauge atomic CAS correctness" {
     gauge.add(15.0);
     try std.testing.expectEqual(@as(f64, 5.0), gauge.get());
 }
+
+test "MetricsBackend adapter" {
+    const allocator = std.testing.allocator;
+    var metrics = PrometheusMetrics.init(allocator);
+    defer metrics.deinit();
+
+    // Create metrics through the VTable-based MetricsBackend adapter
+    const backend = metrics.toBackend();
+    const counter_h = try backend.createCounter("backend_counter", "Test");
+    const gauge_h = try backend.createGauge("backend_gauge", "Test");
+    const hist_h = try backend.createHistogram("backend_hist", "Test", &.{ 0.1, 0.5, 1.0 });
+    backend.counterInc(counter_h);
+    backend.counterAdd(counter_h, 2);
+    backend.gaugeSet(gauge_h, 42.0);
+    backend.gaugeInc(gauge_h);
+    backend.gaugeDec(gauge_h);
+    backend.histogramObserve(hist_h, 0.3);
+
+    // Verify values through the native PrometheusMetrics API
+    const counter = metrics.getCounter("backend_counter").?;
+    try std.testing.expectEqual(@as(u64, 3), counter.get());
+
+    const gauge = metrics.getGauge("backend_gauge").?;
+    try std.testing.expectEqual(@as(f64, 42.0), gauge.get());
+}

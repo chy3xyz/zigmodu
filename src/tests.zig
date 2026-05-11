@@ -28,17 +28,7 @@ test "compile all source files" {
     _ = @import("core/ArchitectureTester.zig");
     _ = @import("core/AutoEventListener.zig");
 
-    // NOTE: The following modules have inline tests that fail to compile in Zig 0.16.0 test mode
-    // due to a known type resolution issue with nested std.ArrayList(T).init(allocator)
-    // in struct literals during test compilation. The modules themselves compile correctly.
-    //
-    // These modules can be tested by:
-    // 1. Running 'zig build' - which compiles them without inline tests
-    // 2. Adding standalone .test.zig files that import the module directly
-    //
-    // Modules disabled due to Zig 0.16.0 test compilation type resolution issue:
-    // _ = @import("core/cluster/FailureDetector.zig");
-    // _ = @import("core/cluster/RaftElection.zig");
+    // WIP modules (tests exist but are disabled pending integration):
     // _ = @import("core/eventbus/WAL.zig");
     // _ = @import("core/eventbus/DLQ.zig");
     // _ = @import("core/eventbus/Partitioner.zig");
@@ -65,9 +55,6 @@ test "compile all source files" {
     _ = @import("core/TransactionalEvent.zig");
     _ = @import("extensions/WebMonitor.zig");
     _ = @import("extensions/WebSocket.zig");
-    // _ = @import("core/IMWebSocket.zig"); // EXPERIMENTAL - future work
-    // _ = @import("extensions/GrpcTransport.zig"); // EXPERIMENTAL - future work
-    // _ = @import("core/MqttTransport.zig"); // EXPERIMENTAL - future work
 
     // Cluster & Distributed (integration tests - these compile successfully)
     _ = @import("core/ClusterMembership.zig");
