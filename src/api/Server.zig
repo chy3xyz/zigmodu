@@ -576,9 +576,10 @@ const RequestParser = struct {
             if (header_line.len == 0) break;
 
             if (std.mem.indexOf(u8, header_line, ": ")) |colon_pos| {
-                const key = try self.allocator.dupe(u8, header_line[0..colon_pos]);
+                const key_raw = try self.allocator.dupe(u8, header_line[0..colon_pos]);
+                for (key_raw) |*c| c.* = std.ascii.toLower(c.*);
                 const value = try self.allocator.dupe(u8, header_line[colon_pos + 2 ..]);
-                try headers.put(key, value);
+                try headers.put(key_raw, value);
             }
         }
 

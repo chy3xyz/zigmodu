@@ -5,17 +5,16 @@ const Rbac = @import("Rbac.zig");
 
 /// JWT 认证中间件 — 验证 Token 并将 AuthInfo 挂载到 ctx.user_data
 pub fn jwtAuth(security: *SecurityModule, allocator: std.mem.Allocator) !api.Middleware {
-    const ctx_ptr = allocator.create(struct {
-        security: *SecurityModule,
-        allocator: std.mem.Allocator,
-    }) catch return error.OutOfMemory;
-    ctx_ptr.* = .{ .security = security, .allocator = allocator };
+    const S = struct {
+        var stored_security: *SecurityModule = undefined;
+        var stored_allocator: std.mem.Allocator = undefined;
+    };
+    S.stored_security = security;
+    S.stored_allocator = allocator;
 
     return .{
         .func = struct {
-            fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
-                const self = @as(*struct { security: *SecurityModule, allocator: std.mem.Allocator }, @ptrCast(@alignCast(user_data.?)));
-
+            fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
                 const auth_header = ctx.headers.get("Authorization") orelse {
                     try ctx.sendErrorResponse(401, 401, "Missing Authorization header");
                     return;
@@ -27,7 +26,7 @@ pub fn jwtAuth(security: *SecurityModule, allocator: std.mem.Allocator) !api.Mid
                     auth_header;
 
                 // verifyToken returns JwtPayload directly
-                const payload = self.security.verifyToken(token) catch {
+                const payload = S.stored_security.verifyToken(token) catch {
                     try ctx.sendErrorResponse(401, 401, "Invalid or expired token");
                     return;
                 };
@@ -44,13 +43,13 @@ pub fn jwtAuth(security: *SecurityModule, allocator: std.mem.Allocator) !api.Mid
                 var auth = Rbac.AuthInfo{
                     .user_id = user_id,
                     .tenant_id = tenant_id,
-                    .username = self.allocator.dupe(u8, payload.sub) catch return error.OutOfMemory,
+                    .username = S.stored_allocator.dupe(u8, payload.sub) catch return error.OutOfMemory,
                     .role_ids = &.{},
                 };
 
                 // Copy role strings. Reject malformed role IDs.
                 if (payload.roles.len > 0) {
-                    const role_ids = self.allocator.alloc(i64, payload.roles.len) catch return error.OutOfMemory;
+                    const role_ids = S.stored_allocator.alloc(i64, payload.roles.len) catch return error.OutOfMemory;
                     for (payload.roles, 0..) |role_str, i| {
                         role_ids[i] = std.fmt.parseInt(i64, role_str, 10) catch {
                             try ctx.sendErrorResponse(401, 401, "Invalid token: role claim contains non-numeric value");
@@ -61,19 +60,18 @@ pub fn jwtAuth(security: *SecurityModule, allocator: std.mem.Allocator) !api.Mid
                 }
 
                 // Store auth in context for downstream handlers
-                const auth_ptr = self.allocator.create(Rbac.AuthInfo) catch return error.OutOfMemory;
+                const auth_ptr = S.stored_allocator.create(Rbac.AuthInfo) catch return error.OutOfMemory;
                 auth_ptr.* = auth;
                 ctx.user_data = @ptrCast(auth_ptr);
 
                 try next(ctx);
 
                 // Cleanup
-                auth_ptr.deinit(self.allocator);
-                self.allocator.destroy(auth_ptr);
-                self.security.freePayload(payload);
+                auth_ptr.deinit(S.stored_allocator);
+                S.stored_allocator.destroy(auth_ptr);
+                S.stored_security.freePayload(payload);
             }
         }.mw,
-        .user_data = @ptrCast(ctx_ptr),
     };
 }
 

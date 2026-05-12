@@ -40,13 +40,10 @@ pub const RateLimiter = struct {
     }
 
     /// 获取一个令牌，如果不可用则等待
-    pub fn acquire(self: *Self) void {
-        while (true) {
-            if (self.tryAcquire()) break;
-            // Note: Blocking sleep unavailable in Zig 0.16.0 sync context
-            // In async context, use: suspend {} or io.sleep()
-            break; // Exit in sync context - caller handles retry
-        }
+    /// DEPRECATED: Use tryAcquire() instead. This was meant to block
+    /// but blocking sleep is unavailable in Zig 0.16 sync context.
+    pub fn acquire(self: *Self) bool {
+        return self.tryAcquire();
     }
 
     /// 尝试获取多个令牌
