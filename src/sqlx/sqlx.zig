@@ -1571,7 +1571,7 @@ pub const Client = struct {
     pub fn transact(self: *Client, comptime T: type, fn_tx: *const fn (*Transaction) errors.ResultT(T)) errors.ResultT(T) {
         var tx = try self.beginTx();
         errdefer {
-            tx.rollback() catch {};
+            tx.rollback() catch |err| std.log.err("[sqlx] Transaction rollback failed: {}", .{err});
             if (tx.pool) |p| p.release(tx.conn);
         }
         const result = try fn_tx(&tx);

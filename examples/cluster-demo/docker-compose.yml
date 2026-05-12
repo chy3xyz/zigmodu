@@ -1,0 +1,53 @@
+# ZigModu 3-node cluster demo
+# Start: docker compose up -d
+# Check: curl http://localhost:8081/cluster/health
+
+services:
+  node1:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: zig build run -- -node=node-1 -port=9001 -peers=node2:9002,node3:9003 -http=8081
+    ports:
+      - "8081:8081"
+      - "9001:9001"
+    environment:
+      - ZIGMODU_NODE_ID=node-1
+      - ZIGMODU_PORT=9001
+      - ZIGMODU_PEERS=node2:9002,node3:9003
+    networks:
+      - cluster
+
+  node2:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: zig build run -- -node=node-2 -port=9002 -peers=node1:9001,node3:9003 -http=8082
+    ports:
+      - "8082:8082"
+      - "9002:9002"
+    environment:
+      - ZIGMODU_NODE_ID=node-2
+      - ZIGMODU_PORT=9002
+      - ZIGMODU_PEERS=node1:9001,node3:9003
+    networks:
+      - cluster
+
+  node3:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: zig build run -- -node=node-3 -port=9003 -peers=node1:9001,node2:9002 -http=8083
+    ports:
+      - "8083:8083"
+      - "9003:9003"
+    environment:
+      - ZIGMODU_NODE_ID=node-3
+      - ZIGMODU_PORT=9003
+      - ZIGMODU_PEERS=node1:9001,node2:9002
+    networks:
+      - cluster
+
+networks:
+  cluster:
+    driver: bridge

@@ -1142,7 +1142,7 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
             server.executeWithMiddleware(&ctx, m.route.handler, m.route.combined_middleware) catch |err| {
                 std.log.err("[HC] Handler error: {any}", .{err});
                 if (!ctx.responded) {
-                    ctx.sendError(500, @errorName(err)) catch {};
+                    ctx.sendError(500, @errorName(err)) catch |e| std.log.err("[Server] Failed to send 500: {}", .{e});
                 }
             };
         } else {
