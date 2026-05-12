@@ -28,7 +28,7 @@ pub const ClusterMessage = struct {
 
     /// Serialize to JSON. Caller owns returned memory.
     pub fn toJson(self: *const ClusterMessage, allocator: std.mem.Allocator) ![]const u8 {
-        return std.json.stringifyAlloc(allocator, self, .{});
+        return try std.fmt.allocPrint(allocator, "{any}", .{std.json.fmt(self, .{})});
     }
 
     /// Deserialize from JSON.

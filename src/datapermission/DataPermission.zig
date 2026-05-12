@@ -113,7 +113,6 @@ test "DataPermissionFilter buildWhere" {
     ctx.user_id = 42;
 
     const where = ctx.buildWhere(allocator, "dept_id", "user_id") orelse return error.UnexpectedNull;
-    defer allocator.free(where.clause);
     defer allocator.free(where.params);
     try std.testing.expect(where.clause.len > 0);
 }

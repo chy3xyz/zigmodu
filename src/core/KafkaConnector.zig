@@ -263,7 +263,7 @@ pub const KafkaWireFormat = struct {
         // Partition count: int32 → 1
         try buf.appendSlice(allocator, &.{ 0x00, 0x00, 0x00, 0x01 });
         // Partition index: int32
-        try appendInt32(&buf, partition);
+        try appendInt32(&buf, allocator, partition);
         // Record batch (simplified)
         try appendRecordBatch(&buf, allocator, key, value);
 
@@ -279,18 +279,18 @@ pub const KafkaWireFormat = struct {
         try buf.appendSlice(alloc, s);
     }
 
-    fn appendInt32(buf: *std.ArrayList(u8), value: i32) !void {
-        try buf.append(buf.allocator, @intCast((value >> 24) & 0xFF));
-        try buf.append(buf.allocator, @intCast((value >> 16) & 0xFF));
-        try buf.append(buf.allocator, @intCast((value >> 8) & 0xFF));
-        try buf.append(buf.allocator, @intCast(value & 0xFF));
+    fn appendInt32(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, value: i32) !void {
+        try buf.append(alloc, @intCast((value >> 24) & 0xFF));
+        try buf.append(alloc, @intCast((value >> 16) & 0xFF));
+        try buf.append(alloc, @intCast((value >> 8) & 0xFF));
+        try buf.append(alloc, @intCast(value & 0xFF));
     }
 
     fn appendRecordBatch(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, _key: ?[]const u8, value: []const u8) !void {
         // Simplified record batch: offset(0) + length + record
-        try appendInt32(buf, 0); // base offset
-        try appendInt32(buf, @intCast(value.len + (if (_key) |k| k.len else 0) + 20)); // batch length
-        try appendInt32(buf, 0); // partition leader epoch
+        try appendInt32(buf, alloc, 0); // base offset
+        try appendInt32(buf, alloc, @intCast(value.len + (if (_key) |k| k.len else 0) + 20)); // batch length
+        try appendInt32(buf, alloc, 0); // partition leader epoch
         try buf.append(alloc, 2); // magic v2
         // CRC would go here in full implementation
     }

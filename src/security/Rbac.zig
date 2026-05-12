@@ -307,8 +307,8 @@ test "AuthInfo hasPermission" {
     var auth = AuthInfo{
         .user_id = 1,
         .tenant_id = 1,
-        .username = "test",
-        .role_ids = &.{},
+        .username = try allocator.dupe(u8, "test"),
+        .role_ids = try allocator.alloc(i64, 0),
         .permissions = std.StringHashMap(bool).init(allocator),
     };
 

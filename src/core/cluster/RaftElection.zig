@@ -117,7 +117,7 @@ pub const RaftElection = struct {
         for (peers) |peer| {
             const id_copy = try allocator.dupe(u8, peer.id);
             const addr_copy = try allocator.dupe(u8, peer.address);
-            try peers_copy.append(.{ .id = id_copy, .address = addr_copy });
+            try peers_copy.append(allocator, .{ .id = id_copy, .address = addr_copy });
         }
 
         const now_ms = Time.monotonicNowMilliseconds();
@@ -129,7 +129,7 @@ pub const RaftElection = struct {
             .peers = peers_copy,
             .transport = transport,
             .last_heartbeat_ms = now_ms,
-            .election_deadline_ms = now_ms + config.election_timeout_max_ms,
+            .election_deadline_ms = now_ms + @as(i64, @intCast(config.election_timeout_max_ms)),
         };
     }
 
@@ -140,7 +140,7 @@ pub const RaftElection = struct {
             self.allocator.free(peer.id);
             self.allocator.free(peer.address);
         }
-        self.peers.deinit();
+        self.peers.deinit(self.allocator);
         if (self.voted_for) |v| self.allocator.free(v);
     }
 
@@ -209,7 +209,7 @@ pub const RaftElection = struct {
         // Reset election deadline
         const now_ms = Time.monotonicNowMilliseconds();
         self.last_heartbeat_ms = now_ms;
-        self.election_deadline_ms = now_ms + self.randomElectionTimeout();
+        self.election_deadline_ms = now_ms + @as(i64, @intCast(self.randomElectionTimeout()));
 
         // Update leader info
         if (self.leader_id) |l| self.allocator.free(l);
@@ -247,7 +247,7 @@ pub const RaftElection = struct {
 
         // Reset election deadline
         const now_ms = Time.monotonicNowMilliseconds();
-        self.election_deadline_ms = now_ms + self.randomElectionTimeout();
+        self.election_deadline_ms = now_ms + @as(i64, @intCast(self.randomElectionTimeout()));
 
         std.log.info("[RaftElection] Starting election for term {d}", .{self.current_term});
 
@@ -260,7 +260,7 @@ pub const RaftElection = struct {
         };
 
         for (self.peers.items) |peer| {
-            self.transport.sendVoteRequest(peer.id, peer.address, vote_req);
+            self.transport.*.sendVoteRequest(peer.id, peer.address, vote_req);
         }
     }
 
@@ -293,7 +293,7 @@ pub const RaftElection = struct {
         };
 
         for (self.peers.items) |peer| {
-            self.transport.sendHeartbeat(peer.id, peer.address, hb);
+            self.transport.*.sendHeartbeat(peer.id, peer.address, hb);
         }
     }
 
@@ -318,6 +318,13 @@ pub const RaftElection = struct {
     /// Get current term
     pub fn getTerm(self: Self) u64 {
         return self.current_term;
+    }
+
+    /// Add a peer to the cluster dynamically.
+    pub fn addPeer(self: *Self, id: []const u8) !void {
+        const id_copy = try self.allocator.dupe(u8, id);
+        errdefer self.allocator.free(id_copy);
+        try self.peers.append(self.allocator, .{ .id = id_copy, .address = "" });
     }
 
     /// Get current state
@@ -345,6 +352,29 @@ pub const RaftElection = struct {
 // Tests
 // ============================================================================
 
+const testNoopTransport = struct {
+    fn sendVote(_: ?[]const u8, _: []const u8, _: VoteRequest) void {}
+    fn sendHb(_: ?[]const u8, _: []const u8, _: Heartbeat) void {}
+};
+
+/// Helper: create a RaftElection with default config and noop transport for testing.
+fn testElection(allocator: std.mem.Allocator, local_id: []const u8) !RaftElection {
+    const S = struct {
+        var transport_impl: ?struct {
+            sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
+            sendHeartbeat: *const fn (?[]const u8, []const u8, Heartbeat) void,
+        } = null;
+    };
+    if (S.transport_impl == null) {
+        S.transport_impl = .{
+            .sendVoteRequest = testNoopTransport.sendVote,
+            .sendHeartbeat = testNoopTransport.sendHb,
+        };
+    }
+    const transport: RaftElection.ElectionTransport = @constCast(@ptrCast(@alignCast(&S.transport_impl.?)));
+    return try RaftElection.init(allocator, local_id, &.{}, .{}, &transport);
+}
+
 test "RaftElection initialization" {
     const allocator = std.testing.allocator;
 
@@ -371,7 +401,7 @@ test "RaftElection initialization" {
     var election = try RaftElection.init(
         allocator,
         "node1",
-        peers[0..],
+        @as([]Peer, @constCast(@as([]const Peer, peers))),
         config,
         &transport,
     );
@@ -462,7 +492,7 @@ test "RaftElection vote request validation" {
 
 test "RaftElection rejects stale term vote" {
     const allocator = std.testing.allocator;
-    var election = try RaftElection.init(allocator, "node-a", 3);
+    var election = try testElection(allocator, "node-a");
     defer election.deinit();
 
     // Advance term
@@ -480,11 +510,11 @@ test "RaftElection rejects stale term vote" {
 
 test "RaftElection split vote across three candidates" {
     const allocator = std.testing.allocator;
-    var e1 = try RaftElection.init(allocator, "n1", 3);
+    var e1 = try testElection(allocator, "n1");
     defer e1.deinit();
-    var e2 = try RaftElection.init(allocator, "n2", 3);
+    var e2 = try testElection(allocator, "n2");
     defer e2.deinit();
-    var e3 = try RaftElection.init(allocator, "n3", 3);
+    var e3 = try testElection(allocator, "n3");
     defer e3.deinit();
 
     // All start election at term 1
@@ -498,7 +528,7 @@ test "RaftElection split vote across three candidates" {
     try std.testing.expect(e3.getTerm() >= 1);
 
     // N1 requests vote from N2 at higher term — should be granted
-    const req = RaftElection.VoteRequest{
+    const req = VoteRequest{
         .term = @intCast(e1.getTerm()),
         .candidate_id = "n1",
         .last_log_index = 5,
@@ -511,7 +541,7 @@ test "RaftElection split vote across three candidates" {
 test "RaftElection quorum calculation" {
     const allocator = std.testing.allocator;
     // 3-node cluster: quorum = 2
-    var e = try RaftElection.init(allocator, "n1", 3);
+    var e = try testElection(allocator, "n1");
     defer e.deinit();
     try e.addPeer("n2");
     try e.addPeer("n3");
@@ -522,7 +552,7 @@ test "RaftElection quorum calculation" {
     try std.testing.expect(!e.hasQuorum(1));
 
     // 5-node cluster: quorum = 3
-    var e2 = try RaftElection.init(allocator, "n1", 5);
+    var e2 = try testElection(allocator, "n1");
     defer e2.deinit();
     try std.testing.expectEqual(@as(usize, 1), e2.clusterSize()); // just self
     try std.testing.expectEqual(@as(usize, 1), e2.quorumSize()); // (1/2)+1 = 1

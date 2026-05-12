@@ -77,8 +77,15 @@ pub const ConsistentHashPartitioner = struct {
 
     /// Release all resources
     pub fn deinit(self: *Self) void {
-        // Clean up ring entries (but not node_ids - they're borrowed)
+        // Free all node IDs in ring (virtual IDs from allocPrint, physical IDs from dupe)
+        for (self.ring.items) |entry| {
+            self.allocator.free(entry.node_id);
+        }
         self.ring.deinit(self.allocator);
+        var node_iter = self.nodes.keyIterator();
+        while (node_iter.next()) |key| {
+            self.allocator.free(key.*);
+        }
         self.nodes.deinit();
     }
 
@@ -86,15 +93,15 @@ pub const ConsistentHashPartitioner = struct {
     ///
     /// Adds virtual nodes spread across the ring.
     pub fn addNode(self: *Self, node_id: []const u8) !void {
-        // Track physical node
-        try self.nodes.put(node_id, {});
+        // Track physical node (dupe key for ownership)
+        const node_key = try self.allocator.dupe(u8, node_id);
+        try self.nodes.put(node_key, {});
 
         // Add virtual nodes
         var i: usize = 0;
         while (i < self.virtual_node_count) : (i += 1) {
             const virtual_id = try std.fmt.allocPrint(self.allocator, "{s}#{d}", .{ node_id, i });
-            defer self.allocator.free(virtual_id);
-
+            // NOTE: virtual_id is stored in ring entry; freed in removeNode/deinit
             const hash = self.hashKey(virtual_id);
             try self.ring.append(self.allocator, .{
                 .hash = hash,
@@ -119,7 +126,9 @@ pub const ConsistentHashPartitioner = struct {
     ///
     /// Removes all virtual nodes for this physical node.
     pub fn removeNode(self: *Self, node_id: []const u8) void {
-        _ = self.nodes.remove(node_id);
+        if (self.nodes.fetchRemove(node_id)) |kv| {
+            self.allocator.free(kv.key);
+        }
 
         // Remove all entries for this node
         var i: usize = 0;
@@ -127,13 +136,9 @@ pub const ConsistentHashPartitioner = struct {
             const entry = self.ring.items[i];
             // Check if this entry belongs to the node being removed
             const starts_with = std.mem.startsWith(u8, entry.node_id, node_id);
-            const is_exact = std.mem.eql(u8, entry.node_id, node_id);
-            const is_virtual = starts_with and !is_exact;
 
             if (starts_with) {
-                if (!is_virtual) {
-                    self.allocator.free(entry.node_id);
-                }
+                self.allocator.free(entry.node_id);
                 _ = self.ring.orderedRemove(i);
             } else {
                 i += 1;
@@ -256,16 +261,16 @@ pub const ConsistentHashPartitioner = struct {
         const m: u64 = 0x0000000000000005;
         const r: u64 = 47;
 
-        var h: u64 = key.len;
+        var h: u64 = @intCast(key.len);
         const len = key.len;
 
         // Process 8-byte chunks
         var i: usize = 0;
         while (i + 8 <= len) : (i += 8) {
             var k: u64 = std.mem.readInt(u64, @as(*const [8]u8, @ptrCast(key[i..i+8].ptr)), .little);
-            k *= c1;
+            k *%= c1;
             k = (k << r) | (k >> (64 - r));
-            k *= c2;
+            k *%= c2;
 
             h ^= k;
             h = (h << r) | (h >> (64 - r));
@@ -280,9 +285,9 @@ pub const ConsistentHashPartitioner = struct {
             @memcpy(dest[0..remaining], key[i..][0..remaining]);
         }
 
-        h ^= @as(u64, remaining);
+        h ^= @as(u64, @intCast(remaining));
         h ^= h >> r;
-        h *= m;
+        h *%= m;
         return h;
     }
 
@@ -295,14 +300,14 @@ pub const ConsistentHashPartitioner = struct {
         const prime3: u64 = 0x165667b19e3779f9;
         const prime4: u64 = 0x85ebca6c8964a03f;
 
-        var h: u64 = key.len * prime1;
+        var h: u64 = @as(u64, @intCast(key.len)) *% prime1;
 
         var i: usize = 0;
         while (i + 32 <= key.len) : (i += 32) {
-            h += prime2;
-            h ^= self.hashFNV1a(key[i..i+32]) * prime3;
+            h +%= prime2;
+            h ^= self.hashFNV1a(key[i..i+32]) *% prime3;
             h = (h << 49) | (h >> 15);
-            h +|= prime4;
+            h +%= prime4;
         }
 
         return h ^ (h >> 31);

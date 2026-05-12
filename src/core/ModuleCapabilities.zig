@@ -49,6 +49,24 @@ pub const ModuleCapabilities = struct {
         return false;
     }
 
+    pub fn registerCapability(self: *Self, allocator: std.mem.Allocator, kind: []const u8, value: []const u8) !void {
+        const value_copy = try allocator.dupe(u8, value);
+        if (std.mem.eql(u8, kind, "publish")) {
+            try self.published_events.append(allocator, value_copy);
+        } else if (std.mem.eql(u8, kind, "consume")) {
+            try self.consumed_events.append(allocator, value_copy);
+        } else if (std.mem.eql(u8, kind, "api")) {
+            try self.exposed_apis.append(allocator, value_copy);
+        } else {
+            allocator.free(value_copy);
+            return error.InvalidCapabilityKind;
+        }
+    }
+
+    pub fn count(self: *Self) usize {
+        return self.published_events.items.len + self.consumed_events.items.len + self.exposed_apis.items.len;
+    }
+
     pub fn canAccessApi(self: *Self, api_name: []const u8) bool {
         for (self.exposed_apis.items) |api| {
             if (std.mem.eql(u8, api, api_name)) return true;
@@ -124,8 +142,8 @@ test "ModuleCapabilities register capability" {
     var cap = ModuleCapabilities.init(allocator, "test-module");
     defer cap.deinit(allocator);
 
-    try cap.registerCapability("publish", "order.created");
-    try cap.registerCapability("consume", "payment.*");
+    try cap.registerCapability(allocator, "publish", "order.created");
+    try cap.registerCapability(allocator, "consume", "payment.*");
     try std.testing.expectEqual(@as(usize, 2), cap.count());
 }
 

@@ -335,13 +335,13 @@ test "normalCDF known values" {
 
 test "FailureDetector phi increases after missed heartbeats" {
     const allocator = std.testing.allocator;
-    var fd = AccrualFailureDetector.init(allocator, .{ .threshold = 1.0, .max_sample_size = 100 });
+    var fd = AccrualFailureDetector.init(allocator, .{ .phi_threshold = 1.0, .max_samples = 100 });
     defer fd.deinit();
 
     // Initial phi should be 0 (no history)
-    try std.testing.expectEqual(@as(f64, 0.0), fd.phi());
+    try std.testing.expectEqual(@as(f64, 0.0), fd.phi("node-b"));
 
     // After a heartbeat, phi should stay low
-    fd.heartbeat();
-    try std.testing.expect(fd.phi() < 2.0);
+    try fd.heartbeat("node-b");
+    try std.testing.expect(fd.phi("node-b") < 2.0);
 }

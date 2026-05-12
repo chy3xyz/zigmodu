@@ -211,36 +211,21 @@ pub const ClusterMembership = struct {
         var iter = self.nodes.iterator();
         while (iter.next()) |entry| {
             const node = entry.value_ptr;
-            if (std.mem.eql(u8, node.id, self.node_id)) continue;
+            if (std.mem.eql(u8, node.id, self.node_id)) continue; // Robust comparison
 
+            const elapsed = now - node.last_seen;
             if (node.state == .healthy) {
-                // Use failure detector if available for more accurate detection
-                const is_node_alive = if (self.failure_detector) |fd|
-                    fd.isAlive(node.id)
-                else
-                    (now - node.last_seen <= timeout_secs);
-
-                if (!is_node_alive) {
+                const is_alive = if (self.failure_detector) |fd| fd.isAlive(node.id) else (elapsed <= timeout_secs);
+                if (!is_alive) {
                     node.state = .suspect;
-                    const phi_val: f64 = if (self.failure_detector) |fd| fd.phi(node.id) else 0;
-                    std.log.warn("[ClusterMembership] Node {s} is suspect (phi={d})", .{ node.id, phi_val });
+                    std.log.warn("[Cluster] Node {s} suspect", .{node.id});
                 }
             } else if (node.state == .suspect) {
-                // In suspect state, use failure detector or simple timeout
-                const is_node_dead = if (self.failure_detector) |fd|
-                    !fd.isAlive(node.id)
-                else
-                    (now - node.last_seen > timeout_secs * 2);
-
-                if (is_node_dead) {
+                const is_dead = if (self.failure_detector) |fd| !fd.isAlive(node.id) else (elapsed > timeout_secs * 2);
+                if (is_dead) {
                     node.state = .failed;
-                    std.log.warn("[ClusterMembership] Node {s} marked as failed", .{node.id});
-
-                    if (self.on_node_leave_cb) |cb| {
-                        cb(node.id);
-                    }
-
-                    // Trigger re-election if leader failed
+                    if (self.on_node_leave_cb) |cb| cb(node.id);
+                    
                     if (self.current_leader) |leader| {
                         if (std.mem.eql(u8, leader, node.id)) {
                             self.allocator.free(leader);
@@ -254,19 +239,20 @@ pub const ClusterMembership = struct {
     }
 
     fn broadcastEvent(self: *Self, event_type: EventType) !void {
+        // Use a static-sized buffer on stack to avoid heap allocation per broadcast
+        var buf: [1024]u8 = undefined;
+        
         var addr_buf: [64]u8 = undefined;
         const addr_str = try std.fmt.bufPrint(&addr_buf, "{any}", .{self.address});
+        const host = if (std.mem.indexOf(u8, addr_str, ":")) |colon| addr_str[0..colon] else addr_str;
 
-        // Extract host from address (simplified)
-        const host = if (std.mem.indexOf(u8, addr_str, ":")) |colon|
-            addr_str[0..colon]
-        else
-            addr_str;
-
-        const port = self.address.ip4.port;
-
-        var payload_buf: [512]u8 = undefined;
-        const payload = try std.fmt.bufPrint(&payload_buf, "{{\"t\":{d},\"id\":\"{s}\",\"h\":\"{s}\",\"p\":{d},\"ts\":{d}}}", .{ @intFromEnum(event_type), self.node_id, host, port, 0 });
+        const payload = try std.fmt.bufPrint(&buf, "{{\"t\":{d},\"id\":\"{s}\",\"h\":\"{s}\",\"p\":{d},\"ts\":{d}}}", .{ 
+            @intFromEnum(event_type), 
+            self.node_id, 
+            host, 
+            self.address.ip4.port, 
+            Time.monotonicNowSeconds() 
+        });
 
         try self.bus.publish("cluster.membership", payload);
     }
@@ -295,7 +281,7 @@ pub const ClusterMembership = struct {
 
         if (self.nodes.getPtr(event.node_id)) |node| {
             node.last_seen = now;
-            if (node.state == .suspect or node.state == .failed) {
+            if (node.state == .suspect or node.state == .failed or node.state == .leaving) {
                 node.state = .healthy;
                 std.log.info("[ClusterMembership] Node {s} is back healthy", .{event.node_id});
             }
@@ -510,27 +496,30 @@ test "ClusterMembership node health tracking" {
 
 test "ClusterMembership node leave and rejoin" {
     const allocator = std.testing.allocator;
-    var cluster = try ClusterMembership.init(allocator, "test-3", "127.0.0.1", 18090);
+    var bus = try DistributedEventBus.init(allocator, std.testing.io, "test-bus");
+    defer bus.deinit();
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 18090);
+    var cluster = try ClusterMembership.init(allocator, std.testing.io, "test-3", addr, &bus);
     defer cluster.deinit();
 
     // Add 2 nodes
     cluster.handleGossipEvent(.{
-        .event_type = .join, .node_id = "n1", .host = "127.0.0.1", .port = 1, .timestamp = 0, .metadata = null,
+        .event_type = .join, .node_id = "n1", .host = "127.0.0.1", .port = 1, .timestamp = 0,
     });
     cluster.handleGossipEvent(.{
-        .event_type = .join, .node_id = "n2", .host = "127.0.0.1", .port = 2, .timestamp = 0, .metadata = null,
+        .event_type = .join, .node_id = "n2", .host = "127.0.0.1", .port = 2, .timestamp = 0,
     });
-    try std.testing.expectEqual(@as(usize, 2), cluster.getHealthyNodeCount());
+    try std.testing.expectEqual(@as(usize, 3), cluster.getHealthyNodeCount());
 
     // Node leaves
     cluster.handleGossipEvent(.{
-        .event_type = .leave, .node_id = "n1", .host = "127.0.0.1", .port = 1, .timestamp = 0, .metadata = null,
+        .event_type = .leave, .node_id = "n1", .host = "127.0.0.1", .port = 1, .timestamp = 0,
     });
-    try std.testing.expectEqual(@as(usize, 1), cluster.getHealthyNodeCount());
+    try std.testing.expectEqual(@as(usize, 2), cluster.getHealthyNodeCount());
 
     // Node rejoins
     cluster.handleGossipEvent(.{
-        .event_type = .join, .node_id = "n1", .host = "127.0.0.1", .port = 1, .timestamp = 0, .metadata = null,
+        .event_type = .join, .node_id = "n1", .host = "127.0.0.1", .port = 1, .timestamp = 0,
     });
-    try std.testing.expectEqual(@as(usize, 2), cluster.getHealthyNodeCount());
+    try std.testing.expectEqual(@as(usize, 3), cluster.getHealthyNodeCount());
 }

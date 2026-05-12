@@ -18,6 +18,9 @@ const NetworkTransport = @import("NetworkTransport.zig");
 const ClusterMembership = @import("../ClusterMembership.zig").ClusterMembership;
 const DistributedEventBus = @import("../DistributedEventBus.zig").DistributedEventBus;
 const RaftElection = @import("RaftElection.zig").RaftElection;
+const ElectionConfig = @import("RaftElection.zig").ElectionConfig;
+const VoteRequest = @import("RaftElection.zig").VoteRequest;
+const Heartbeat = @import("RaftElection.zig").Heartbeat;
 const ClusterMetrics = @import("ClusterMetrics.zig").ClusterMetrics;
 
 pub const BootstrapConfig = struct {
@@ -77,8 +80,22 @@ pub const ClusterBootstrap = struct {
         self.membership = member;
 
         // 4. Create RaftElection (leader election)
+        const election_cfg = ElectionConfig{};
+        const S = struct {
+            var transport_impl: ?struct {
+                sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
+                sendHeartbeat: *const fn (?[]const u8, []const u8, Heartbeat) void,
+            } = null;
+        };
+        if (S.transport_impl == null) {
+            S.transport_impl = .{
+                .sendVoteRequest = struct { fn f(_: ?[]const u8, _: []const u8, _: VoteRequest) void {} }.f,
+                .sendHeartbeat = struct { fn f(_: ?[]const u8, _: []const u8, _: Heartbeat) void {} }.f,
+            };
+        }
+        const election_transport: RaftElection.ElectionTransport = @constCast(@ptrCast(@alignCast(&S.transport_impl.?)));
         const raft = try self.allocator.create(RaftElection);
-        raft.* = try RaftElection.init(self.allocator, self.config.node_id, self.config.raft_cluster_size);
+        raft.* = try RaftElection.init(self.allocator, self.config.node_id, &.{}, election_cfg, &election_transport);
         self.raft = raft;
 
         // Add peers to Raft

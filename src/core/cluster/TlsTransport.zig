@@ -51,22 +51,43 @@ pub const ClusterAuth = struct {
         hmac.final(&sig);
 
         var hex: [64]u8 = undefined;
-        _ = std.fmt.bufPrint(&hex, "{s}", .{std.fmt.fmtSliceHexLower(&sig)}) catch unreachable;
+        const hex_chars = "0123456789abcdef";
+        for (sig, 0..) |byte, i| {
+            hex[i * 2] = hex_chars[byte >> 4];
+            hex[i * 2 + 1] = hex_chars[byte & 0xf];
+        }
         return hex;
+    }
+
+    /// Constant-time slice comparison for signature verification.
+    fn timingSafeEql(a: []const u8, b: []const u8) bool {
+        if (a.len != b.len) return false;
+        var acc: u8 = 0;
+        for (a, 0..) |x, i| acc |= x ^ b[i];
+        const s = @typeInfo(u8).int.bits;
+        const Cu = std.meta.Int(.unsigned, s);
+        const Cext = std.meta.Int(.unsigned, s + 1);
+        return @as(bool, @bitCast(@as(u1, @truncate((@as(Cext, @as(Cu, @bitCast(acc))) -% 1) >> s))));
     }
 
     /// Verify a message signature.
     pub fn verify(self: *ClusterAuth, payload: []const u8, signature: []const u8) bool {
         const expected = self.sign(payload) catch return false;
         // Constant-time comparison to prevent timing oracle
-        return std.crypto.timing_safe.eql(u8, expected[0..], signature);
+        return timingSafeEql(&expected, signature);
     }
 };
 
 test "ClusterAuth sign and verify" {
     const allocator = std.testing.allocator;
-    var key: [32]u8 = [_]u8{0} ** 32;
-    std.crypto.random.bytes(&key);
+    var key: [32]u8 = undefined;
+    var seed: [32]u8 = undefined;
+    std.mem.writeInt(u64, seed[0..8], @intFromPtr(&key), .little);
+    std.mem.writeInt(u64, seed[8..16], @intFromPtr(&seed), .little);
+    std.mem.writeInt(u64, seed[16..24], @intFromPtr(&key) +% @intFromPtr(&seed), .little);
+    std.mem.writeInt(u64, seed[24..32], @intFromPtr(&key) *% @intFromPtr(&seed), .little);
+    var csprng = std.Random.DefaultCsprng.init(seed);
+    csprng.fill(&key);
 
     var auth = try ClusterAuth.init(allocator, "node-1", key);
     defer auth.deinit();

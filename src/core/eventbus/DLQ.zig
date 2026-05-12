@@ -384,7 +384,7 @@ test "DLQ requeue respects cooldown" {
 
     // Requeue immediately should return 0 due to cooldown
     const noopCallback = struct {
-        fn cb(_: DLQ.RequeuedMessage) void {}
+        fn cb(_: RequeuedMessage) void {}
     }.cb;
     const count = try dlq.requeue(&noopCallback);
     try std.testing.expectEqual(@as(usize, 0), count);
