@@ -1843,3 +1843,28 @@ test "router scalability: 200 routes with O(1) child lookup" {
     }
     try std.testing.expectEqual(@as(usize, 200), routes.len);
 }
+
+test "deepCopy strings escape arena lifetime" {
+    const allocator = std.testing.allocator;
+
+    const S = struct { name: []const u8, age: i32 };
+    const original = S{ .name = "alice", .age = 30 };
+    const copy = deepCopy(original, allocator);
+    defer allocator.free(copy.name);
+
+    // Verify deep copy produced independent memory
+    try std.testing.expectEqualStrings("alice", copy.name);
+    try std.testing.expectEqual(@as(i32, 30), copy.age);
+    try std.testing.expect(copy.name.ptr != original.name.ptr); // different pointers
+
+    // Verify nested struct copy
+    const Outer = struct { inner: S, label: []const u8 };
+    const outer = Outer{ .inner = S{ .name = "bob", .age = 25 }, .label = "test" };
+    const outer_copy = deepCopy(outer, allocator);
+    defer allocator.free(outer_copy.inner.name);
+    defer allocator.free(outer_copy.label);
+
+    try std.testing.expectEqualStrings("bob", outer_copy.inner.name);
+    try std.testing.expectEqual(@as(i32, 25), outer_copy.inner.age);
+    try std.testing.expectEqualStrings("test", outer_copy.label);
+}
