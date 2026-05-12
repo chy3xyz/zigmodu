@@ -158,6 +158,13 @@ pub const App = @import("api/Simplified.zig").App;
 pub const Module = @import("api/Simplified.zig").Module;
 pub const ModuleImpl = @import("api/Simplified.zig").ModuleImpl;
 pub const extensions = @import("extensions.zig");
+// Flat backward-compatible exports (for projects using pre-v0.9 API)
+pub const sqlx = @import("sqlx/sqlx.zig");
+pub const orm = @import("persistence/Orm.zig");
+pub const SqlxBackend = @import("persistence/backends/SqlxBackend.zig").SqlxBackend;
+pub const http_server = @import("api/Server.zig");
+pub const PasswordEncoder = @import("security/PasswordEncoder.zig").PasswordEncoder;
+pub const SecurityModule = @import("security/SecurityModule.zig").SecurityModule;
 
 // ============================================================
 // TESTS
