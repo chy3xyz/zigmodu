@@ -1,6 +1,14 @@
-//! Lightweight middleware for ZigModu HTTP server
+//! Lightweight middleware for ZigModu HTTP server.
 //!
-//! Adapted from zigzero, with dependencies reduced to std library only.
+//! Recommended production middleware chain (order matters):
+//!   recover → requestId → cors → jwtAuth → csrf → rateLimit → handler
+//!
+//! Example:
+//!   server.addMiddleware(zigmodu.http_middleware.recover());
+//!   server.addMiddleware(zigmodu.http_middleware.requestId());
+//!   server.addMiddleware(zigmodu.http_middleware.cors(.{}));
+//!   server.addMiddleware(zigmodu.http_middleware.jwtAuth("my-secret"));
+//!   server.addMiddleware(zigmodu.http_middleware.csrf());
 
 const std = @import("std");
 const api = @import("Server.zig");
