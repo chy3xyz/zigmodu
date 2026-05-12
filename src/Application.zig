@@ -48,7 +48,7 @@ pub const Application = struct {
     config: Config,
     state: State,
     io: std.Io,
-    shutdown_hooks: std.ArrayList(*const fn () void) = std.ArrayList(*const fn () void).empty,
+    shutdown_hooks: std.ArrayList(*const fn () void),
 
     pub const State = enum {
         initialized,
@@ -85,6 +85,7 @@ pub const Application = struct {
                 .docs_path = options.docs_path,
             },
             .state = .initialized,
+            .shutdown_hooks = std.ArrayList(*const fn () void).empty,
         };
     }
 
@@ -197,29 +198,23 @@ pub const Application = struct {
         std.posix.sigaction(std.posix.SIG.INT, &handler, null);
         std.posix.sigaction(std.posix.SIG.TERM, &handler, null);
 
-        // Poll until signal (Zig 0.16: std.Thread.sleep removed; use loop with cursor polling)
+        // Poll until signal
+        const poll_interval = std.posix.timespec{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
         while (!shutdown_requested.load(.acquire)) {
-            // Busy-loop: 100ms polling interval via coarse sleep
-            var t_i: usize = 0;
-            while (t_i < 100_000_000) : (t_i += 1) {
-                if (shutdown_requested.load(.acquire)) break;
-            }
+            std.posix.nanosleep(&poll_interval, null);
         }
 
         std.log.info("Shutdown signal received, draining in-flight requests...", .{});
 
         const drain_start = Time.monotonicNowMilliseconds();
         const drain_timeout_ms: i64 = 30_000;
+        const drain_interval = std.posix.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
         while (in_flight_requests.load(.acquire) > 0) {
             if (Time.monotonicNowMilliseconds() - drain_start > drain_timeout_ms) {
                 std.log.warn("Drain timeout after {d}ms, forcing stop...", .{drain_timeout_ms});
                 break;
             }
-            // Yield CPU briefly between drain checks
-            var d_i: usize = 0;
-            while (d_i < 10_000_000) : (d_i += 1) {
-                if (in_flight_requests.load(.acquire) == 0) break;
-            }
+            std.posix.nanosleep(&drain_interval, null);
         }
 
         std.log.info("Stopping application '{s}'...", .{self.config.name});

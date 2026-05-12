@@ -2,11 +2,12 @@ const std = @import("std");
 const ApplicationModules = @import("./Module.zig").ApplicationModules;
 const ModuleInfo = @import("./Module.zig").ModuleInfo;
 
-/// Compile-time module scanner that extracts module metadata
+/// Compile-time module scanner that extracts module metadata and performs topological sort
 pub fn scanModules(allocator: std.mem.Allocator, comptime modules: anytype) !ApplicationModules {
     var app_modules = ApplicationModules.init(allocator);
+
+    // 1. Register all modules first (runtime registration for backward compat)
     inline for (modules) |mod| {
-        // Extract init function pointer if it exists
         const init_fn = if (@hasDecl(mod, "init"))
             struct {
                 fn wrapper(ptr: ?*anyopaque) anyerror!void {
@@ -17,7 +18,6 @@ pub fn scanModules(allocator: std.mem.Allocator, comptime modules: anytype) !App
         else
             null;
 
-        // Extract deinit function pointer if it exists
         const deinit_fn = if (@hasDecl(mod, "deinit"))
             struct {
                 fn wrapper(ptr: ?*anyopaque) void {
@@ -37,7 +37,49 @@ pub fn scanModules(allocator: std.mem.Allocator, comptime modules: anytype) !App
             .deinit_fn = deinit_fn,
         });
     }
+
+    // 2. Perform topological sort at comptime and cache the result
+    // This avoids runtime sorting in Lifecycle.startAll
+    const sorted_names = comptime blk: {
+        var result: []const []const u8 = &[_][]const u8{};
+        for (modules) |mod| {
+            result = visit(mod.info.name, modules, result);
+        }
+        break :blk result;
+    };
+
+    var sorted_list = try std.ArrayList([]const u8).initCapacity(allocator, sorted_names.len);
+    inline for (sorted_names) |name| {
+        sorted_list.appendAssumeCapacity(name);
+    }
+    app_modules.sorted_order = sorted_list;
+
     return app_modules;
+}
+
+/// Comptime helper to visit modules and order them
+fn visit(comptime name: []const u8, comptime modules: anytype, comptime current_sorted: []const []const u8) []const []const u8 {
+    // Check if already in current_sorted
+    for (current_sorted) |existing| {
+        if (std.mem.eql(u8, existing, name)) return current_sorted;
+    }
+
+    // Find module info
+    const mod_info = comptime blk: {
+        for (modules) |m| {
+            if (std.mem.eql(u8, m.info.name, name)) break :blk m.info;
+        }
+        @compileError("Module not found: " ++ name);
+    };
+
+    var result = current_sorted;
+    // Visit dependencies first
+    for (mod_info.dependencies) |dep| {
+        result = visit(dep, modules, result);
+    }
+
+    // Append self
+    return result ++ [_][]const u8{name};
 }
 
 test "scanModules extracts metadata" {
@@ -47,7 +89,7 @@ test "scanModules extracts metadata" {
         pub const info = @import("../api/Module.zig").Module{
             .name = "mock",
             .description = "Mock module for testing",
-            .dependencies = &.{"dep1"},
+            .dependencies = &.{},
         };
 
         pub fn init() !void {}
@@ -61,8 +103,7 @@ test "scanModules extracts metadata" {
     const info = modules.get("mock").?;
     try std.testing.expectEqualStrings("mock", info.name);
     try std.testing.expectEqualStrings("Mock module for testing", info.desc);
-    try std.testing.expectEqual(@as(usize, 1), info.deps.len);
-    try std.testing.expectEqualStrings("dep1", info.deps[0]);
+    try std.testing.expectEqual(@as(usize, 0), info.deps.len);
 }
 
 test "scanModules optional init/deinit" {

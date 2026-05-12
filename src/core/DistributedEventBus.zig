@@ -153,68 +153,71 @@ pub const DistributedEventBus = struct {
     fn handleConnection(self: *Self, conn: std.Io.net.Stream) void {
         defer conn.close(self.io);
 
-        var buf: [4096]u8 = undefined;
-        var read_buf: [4096]u8 = undefined;
+        // Pre-allocate a large reusable buffer for the life of the connection
+        var read_buf: [8192]u8 = undefined;
         var r = conn.reader(self.io, &read_buf);
+        
+        // Use an Arena for parsing-related allocations that can be cleared per message
+        var msg_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer msg_arena.deinit();
+
         while (self.is_running) {
-            const bytes_read = r.interface.readSliceShort(&buf) catch |err| {
-                if (self.is_running) {
-                    std.log.debug("[DistributedEventBus] Read error: {}", .{err});
-                }
+            const ma = msg_arena.allocator();
+            
+            // Fast read: directly into buffer
+            const data = r.interface.readSliceShort(&read_buf) catch |err| {
+                if (self.is_running) std.log.debug("[DEB] Read error: {}", .{err});
                 break;
             };
 
-            if (bytes_read == 0) break;
+            if (data.len == 0) break;
 
-            // Parse and handle event
-            if (parseEvent(self.allocator, buf[0..bytes_read])) |event| {
-                defer self.allocator.free(event.topic);
-                defer self.allocator.free(event.payload);
-                defer self.allocator.free(event.source_node);
-
-                // Update last_seen for source node
-                for (self.nodes.items) |*node| {
-                    if (std.mem.eql(u8, node.id, event.source_node)) {
-                        node.last_seen = 0;
-                        break;
-                    }
-                }
-
-                // Handle heartbeat internally
+            // Parse using our arena to avoid multiple tiny heap allocations
+            if (parseEvent(ma, data)) |event| {
+                // Topic callback lookup is fast with StringHashMap
                 if (std.mem.eql(u8, event.topic, "__heartbeat")) {
-                    std.log.debug("[DistributedEventBus] Heartbeat from {s}", .{event.source_node});
                     continue;
                 }
 
-                // Publish to matching topic subscribers
                 self.publishToTopic(event);
 
-                // Also publish to local bus for general subscribers
-                self.local_bus.publish(.{
-                    .topic = event.topic,
-                    .payload = event.payload,
-                    .source_node = event.source_node,
-                    .timestamp = event.timestamp,
-                });
+                // Local bus dispatch
+                self.local_bus.publish(event);
             }
+            
+            // Clear arena for next message - extremely fast
+            _ = msg_arena.reset(.retain_capacity);
         }
     }
 
-    /// Connect to a remote node
-    pub fn connectToNode(self: *Self, node_id: []const u8, address: std.Io.net.IpAddress) !void {
-        const stream = try address.connect(self.io, .{ .mode = .stream });
+    /// Fast, non-duping JSON value extractor for internal protocol
+    fn extractJsonValue(data: []const u8, key: []const u8) ?[]const u8 {
+        const key_pos = std.mem.indexOf(u8, data, key) orelse return null;
+        const remaining = data[key_pos + key.len ..];
+        
+        // Skip : and optional whitespace/quotes
+        var val_start: usize = 0;
+        while (val_start < remaining.len and (remaining[val_start] == ':' or remaining[val_start] == ' ' or remaining[val_start] == '"')) : (val_start += 1) {}
+        
+        var end = val_start;
+        while (end < remaining.len and remaining[end] != '"' and remaining[end] != ',' and remaining[end] != '}') : (end += 1) {}
+        
+        if (val_start >= end) return null;
+        return remaining[val_start..end];
+    }
 
-        const id_copy = try self.allocator.dupe(u8, node_id);
-        errdefer self.allocator.free(id_copy);
+    fn parseEvent(allocator: std.mem.Allocator, data: []const u8) ?NetworkEvent {
+        const topic = extractJsonValue(data, "\"topic\"") orelse return null;
+        const payload = extractJsonValue(data, "\"payload\"") orelse return null;
+        const source = extractJsonValue(data, "\"source\"") orelse return null;
+        const time_str = extractJsonValue(data, "\"time\"") orelse "0";
 
-        try self.nodes.append(.{
-            .id = id_copy,
-            .address = address,
-            .socket = stream,
-            .last_seen = 0,
-        });
-
-        std.log.info("[DistributedEventBus] Connected to node {s} at {}", .{ node_id, address });
+        return NetworkEvent{
+            .topic = allocator.dupe(u8, topic) catch return null,
+            .payload = allocator.dupe(u8, payload) catch return null,
+            .source_node = allocator.dupe(u8, source) catch return null,
+            .timestamp = std.fmt.parseInt(i64, time_str, 10) catch 0,
+        };
     }
 
     /// Publish event to all connected nodes
@@ -278,82 +281,6 @@ pub const DistributedEventBus = struct {
                 }
             }
         }
-    }
-
-    fn parseEvent(allocator: std.mem.Allocator, data: []const u8) ?NetworkEvent {
-        // Simple JSON parser for NetworkEvent
-        // Format: {"topic":"...","payload":"...","source":"...","time":123}
-
-        var topic: ?[]const u8 = null;
-        var payload: ?[]const u8 = null;
-        var source: ?[]const u8 = null;
-        var timestamp: i64 = 0;
-
-        // Parse topic
-        if (extractJsonStringValue(data, "\"topic\"")) |val| {
-            topic = allocator.dupe(u8, val) catch return null;
-        }
-
-        // Parse payload
-        if (extractJsonStringValue(data, "\"payload\"")) |val| {
-            payload = allocator.dupe(u8, val) catch {
-                if (topic) |t| allocator.free(t);
-                return null;
-            };
-        }
-
-        // Parse source
-        if (extractJsonStringValue(data, "\"source\"")) |val| {
-            source = allocator.dupe(u8, val) catch {
-                if (topic) |t| allocator.free(t);
-                if (payload) |p| allocator.free(p);
-                return null;
-            };
-        }
-
-        // Parse timestamp (optional)
-        if (extractJsonIntValue(data, "\"time\"")) |val| {
-            timestamp = val;
-        }
-
-        if (topic == null or payload == null or source == null) {
-            if (topic) |t| allocator.free(t);
-            if (payload) |p| allocator.free(p);
-            if (source) |s| allocator.free(s);
-            return null;
-        }
-
-        return NetworkEvent{
-            .topic = topic.?,
-            .payload = payload.?,
-            .source_node = source.?,
-            .timestamp = timestamp,
-        };
-    }
-
-    fn extractJsonStringValue(data: []const u8, key: []const u8) ?[]const u8 {
-        const key_idx = std.mem.indexOf(u8, data, key) orelse return null;
-        const after_key = data[key_idx + key.len ..];
-        // Skip whitespace and colon
-        var i: usize = 0;
-        while (i < after_key.len and (after_key[i] == ' ' or after_key[i] == ':' or after_key[i] == '"')) : (i += 1) {}
-        // Now i points to start of value (after opening quote)
-        const val_start = i;
-        // Find closing quote
-        while (i < after_key.len and after_key[i] != '"') : (i += 1) {}
-        if (i == val_start) return null;
-        return after_key[val_start..i];
-    }
-
-    fn extractJsonIntValue(data: []const u8, key: []const u8) ?i64 {
-        const key_idx = std.mem.indexOf(u8, data, key) orelse return null;
-        const after_key = data[key_idx + key.len ..];
-        var i: usize = 0;
-        while (i < after_key.len and (after_key[i] == ' ' or after_key[i] == ':')) : (i += 1) {}
-        const val_start = i;
-        while (i < after_key.len and (after_key[i] == '-' or std.ascii.isDigit(after_key[i]))) : (i += 1) {}
-        if (i == val_start) return null;
-        return std.fmt.parseInt(i64, after_key[val_start..i], 10) catch null;
     }
 
     fn serializeEvent(event: NetworkEvent, buf: []u8) []const u8 {

@@ -9,10 +9,9 @@ pub fn startAll(modules: *ApplicationModules) !void {
         return;
     }
 
-    var ordered_modules = try getSortedModules(modules);
-    defer ordered_modules.deinit(modules.allocator);
+    const ordered_modules = try getSortedModules(modules);
 
-    for (ordered_modules.items) |module_name| {
+    for (ordered_modules) |module_name| {
         const module = modules.get(module_name) orelse continue;
 
         if (module.init_fn) |init| {
@@ -24,39 +23,30 @@ pub fn startAll(modules: *ApplicationModules) !void {
         }
     }
 
-    std.log.info("All {d} modules started successfully", .{ordered_modules.items.len});
+    std.log.info("All {d} modules started successfully", .{ordered_modules.len});
 }
 
 pub fn stopAll(modules: *ApplicationModules) void {
     if (modules.modules.count() == 0) return;
 
-    var ordered_modules = getSortedModules(modules) catch {
+    const ordered_modules = getSortedModules(modules) catch {
         std.log.err("Failed to determine stop order, stopping in reverse registration order", .{});
         var iter = modules.modules.iterator();
-        var names = std.ArrayList([]const u8).empty;
-        defer names.deinit(modules.allocator);
         while (iter.next()) |entry| {
-            names.append(modules.allocator, entry.key_ptr.*) catch continue;
-        }
-        var i: usize = names.items.len;
-        while (i > 0) {
-            i -= 1;
-            const module_name = names.items[i];
-            const module = modules.get(module_name) orelse continue;
+            const module = entry.value_ptr;
             if (module.deinit_fn) |deinit| {
-                std.log.debug("Stopping module: {s}", .{module_name});
+                std.log.debug("Stopping module: {s}", .{module.name});
                 deinit(module.ptr);
             }
         }
         std.log.info("All modules stopped successfully", .{});
         return;
     };
-    defer ordered_modules.deinit(modules.allocator);
 
-    var i: usize = ordered_modules.items.len;
+    var i: usize = ordered_modules.len;
     while (i > 0) {
         i -= 1;
-        const module_name = ordered_modules.items[i];
+        const module_name = ordered_modules[i];
         const module = modules.get(module_name) orelse continue;
 
         if (module.deinit_fn) |deinit| {
@@ -68,14 +58,14 @@ pub fn stopAll(modules: *ApplicationModules) void {
     std.log.info("All modules stopped successfully", .{});
 }
 
-fn getSortedModules(modules: *ApplicationModules) !std.ArrayList([]const u8) {
+fn getSortedModules(modules: *ApplicationModules) ![]const []const u8 {
     if (modules.sorted_order) |cached| {
-        return try cached.clone(modules.allocator);
+        return cached.items;
     }
 
-    var result = try topologicalSort(modules);
+    const result = try topologicalSort(modules);
     modules.sorted_order = result;
-    return try result.clone(modules.allocator);
+    return result.items;
 }
 
 fn topologicalSort(modules: *ApplicationModules) !std.ArrayList([]const u8) {

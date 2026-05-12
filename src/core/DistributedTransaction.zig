@@ -1,4 +1,5 @@
 const std = @import("std");
+const Time = @import("Time.zig");
 
 /// 分布式事务管理器
 /// 分布式事务管理器
@@ -13,6 +14,7 @@ pub const DistributedTransactionManager = struct {
     pub const SagaTransaction = struct {
         id: []const u8,
         status: TransactionStatus,
+        arena: std.heap.ArenaAllocator,
         steps: std.ArrayList(SagaStep),
         compensations: std.ArrayList(CompensationAction),
         start_time: i64,
@@ -52,30 +54,27 @@ pub const DistributedTransactionManager = struct {
         var iter = self.transactions.iterator();
         while (iter.next()) |entry| {
             var tx = entry.value_ptr.*;
-            for (tx.steps.items) |step| {
-                self.allocator.free(step.name);
-            }
-            tx.steps.deinit(self.allocator);
-            for (tx.compensations.items) |comp| {
-                self.allocator.free(comp.step_name);
-            }
-            tx.compensations.deinit(self.allocator);
-            self.allocator.free(tx.id);
+            tx.arena.deinit();
         }
         self.transactions.deinit();
     }
 
     /// 开始新的事务
     pub fn beginTransaction(self: *Self) ![]const u8 {
-        const id = try std.fmt.allocPrint(self.allocator, "tx-{d}", .{self.transaction_id_counter});
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        errdefer arena.deinit();
+        const aa = arena.allocator();
+
+        const id = try std.fmt.allocPrint(aa, "tx-{d}", .{self.transaction_id_counter});
         self.transaction_id_counter += 1;
 
         const tx = SagaTransaction{
             .id = id,
             .status = .PENDING,
+            .arena = arena,
             .steps = std.ArrayList(SagaTransaction.SagaStep).empty,
             .compensations = std.ArrayList(SagaTransaction.CompensationAction).empty,
-            .start_time = 0,
+            .start_time = Time.monotonicNowSeconds(),
         };
 
         try self.transactions.put(id, tx);
@@ -91,15 +90,16 @@ pub const DistributedTransactionManager = struct {
         compensation: *const fn () void,
     ) !void {
         const tx = self.transactions.getPtr(tx_id) orelse return error.TransactionNotFound;
+        const aa = tx.arena.allocator();
 
-        try tx.steps.append(self.allocator, .{
-            .name = try self.allocator.dupe(u8, name),
+        try tx.steps.append(aa, .{
+            .name = try aa.dupe(u8, name),
             .action = action,
             .compensation = compensation,
         });
 
-        try tx.compensations.append(self.allocator, .{
-            .step_name = try self.allocator.dupe(u8, name),
+        try tx.compensations.append(aa, .{
+            .step_name = try aa.dupe(u8, name),
             .action = compensation,
         });
     }
@@ -399,6 +399,7 @@ pub const TransactionLog = struct {
     /// Returns the set of in-flight transaction IDs that were active at crash time.
     pub fn replay(self: *const TransactionLog, alloc: std.mem.Allocator) ![][]const u8 {
         var active = std.StringHashMap(void).init(alloc);
+        defer active.deinit();
         for (self.entries.items) |e| {
             switch (e.event) {
                 .begin => {
