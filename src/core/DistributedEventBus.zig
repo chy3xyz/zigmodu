@@ -102,7 +102,7 @@ pub const DistributedEventBus = struct {
             self.listener = null;
         }
         // Drain accept/handle/heartbeat fibers; idempotent.
-        self.fiber_group.await(self.io) catch {};
+        self.fiber_group.await(self.io) catch |err| std.log.err("[DEB] Fiber await failed: {}", .{err});
     }
 
     fn acceptLoop(self: *Self) void {

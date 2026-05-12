@@ -393,7 +393,7 @@ test "SecretsManager Vault config" {
     try sm.configureVault("https://vault.example.com:8200", "hvs.token123");
     try std.testing.expect(sm.vault_config != null);
 
-    _ = sm.loadFromVault("database/creds") catch {};
+    _ = sm.loadFromVault("database/creds") catch |err| std.log.warn("[Secrets] Vault load skipped: {}", .{err});
 }
 
 test "SecretsManager export as env" {
