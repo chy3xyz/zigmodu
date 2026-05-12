@@ -103,42 +103,28 @@ pub const HealthEndpoint = struct {
 
     /// 生成JSON格式的健康报告
     pub fn toJson(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
-        var buf = std.ArrayList(u8).init(allocator);
-        const writer = buf.writer(allocator);
-
+        var buf = std.ArrayList(u8).empty;
         const health = self.checkHealth();
         defer health.components.deinit();
-
-        try writer.writeAll("{\n");
-        try writer.print("  \"status\": \"{s}\",\n", .{@tagName(health.status)});
-        try writer.print("  \"timestamp\": {d},\n", .{health.timestamp});
-        try writer.writeAll("  \"components\": {\n");
-
-        var comp_iter = health.components.iterator();
+        try buf.print(allocator, "{{\n  \"status\": \"{s}\"", .{@tagName(health.status)});
+        try buf.print(allocator, ",\n  \"timestamp\": {d}", .{health.timestamp});
+        try buf.appendSlice(allocator, ",\n  \"components\": {\n");
+        var iter = health.components.iterator();
         var first = true;
-        while (comp_iter.next()) |entry| {
-            if (!first) try writer.writeAll(",\n");
+        while (iter.next()) |entry| {
+            if (!first) try buf.appendSlice(allocator, ",\n");
             first = false;
-
-            const comp_name = entry.key_ptr.*;
-            const comp_health = entry.value_ptr.*;
-
-            try writer.print("    \"{s}\": {{\n", .{comp_name});
-            try writer.print("      \"status\": \"{s}\"", .{@tagName(comp_health.status)});
-            if (comp_health.details) |details| {
-                try writer.print(",\n      \"details\": \"{s}\"", .{details});
+            try buf.print(allocator, "    \"{s}\": {{\n      \"status\": \"{s}\"", .{ entry.key_ptr.*, @tagName(entry.value_ptr.status) });
+            if (entry.value_ptr.details) |d| {
+                try buf.print(allocator, ",\n      \"details\": \"{s}\"", .{d});
             }
-            try writer.writeAll("\n    }");
+            try buf.appendSlice(allocator, "\n    }");
         }
-
-        try writer.writeAll("\n  }\n");
-        try writer.writeAll("}\n");
-
+        try buf.appendSlice(allocator, "\n  }\n}\n");
         return buf.toOwnedSlice(allocator);
     }
 
-    /// Always-up check
-    pub fn alwaysUp(_: ?*anyopaque) HealthStatus { return .UP; }
+        pub fn alwaysUp(_: ?*anyopaque) HealthStatus { return .UP; }
 
     /// Always-down check
     pub fn alwaysDown(_: ?*anyopaque) HealthStatus { return .DOWN; }

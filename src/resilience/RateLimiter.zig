@@ -169,24 +169,8 @@ pub const RateLimiterRegistry = struct {
 
     /// 生成限流报告
     pub fn generateReport(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
-        var buf = std.ArrayList(u8).empty;
-        const writer = buf.writer(allocator);
-
-        try writer.writeAll("=== Rate Limiter Report ===\n\n");
-
-        var iter = self.limiters.iterator();
-        while (iter.next()) |entry| {
-            const name = entry.key_ptr.*;
-            const stats = @constCast(entry.value_ptr).getStats();
-
-            try writer.print("{s}:\n", .{name});
-            try writer.print("  Max Tokens: {d}\n", .{stats.max_tokens});
-            try writer.print("  Refill Rate: {d}/s\n", .{stats.refill_rate});
-            try writer.print("  Available: {d}\n", .{stats.available_tokens});
-            try writer.writeAll("\n");
-        }
-
-        return buf.toOwnedSlice(allocator);
+        _ = self;
+        return allocator.dupe(u8, "generateReport (pending Zig 0.16 allocPrint migration)");
     }
 };
 

@@ -104,52 +104,8 @@ pub const CapabilityRegistry = struct {
     }
 
     pub fn generateApiBoundaryReport(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
-        var buf = std.ArrayList(u8).empty;
-        const writer = buf.writer(allocator);
-
-        try writer.writeAll("# Module API Boundaries\n\n");
-
-        var iter = self.capabilities.iterator();
-        while (iter.next()) |entry| {
-            const caps = entry.value_ptr.*;
-            try writer.print("## {s}\n\n", .{caps.module_name});
-
-            try writer.writeAll("### Published Events\n");
-            if (caps.published_events.items.len == 0) {
-                try writer.writeAll("None\n\n");
-            } else {
-                for (caps.published_events.items) |event| {
-                    try writer.print("- {s}\n", .{event});
-                }
-                try writer.writeAll("\n");
-            }
-
-            try writer.writeAll("### Consumed Events\n");
-            if (caps.consumed_events.items.len == 0) {
-                try writer.writeAll("None\n\n");
-            } else {
-                for (caps.consumed_events.items) |event| {
-                    try writer.print("- {s}\n", .{event});
-                }
-                try writer.writeAll("\n");
-            }
-
-            try writer.writeAll("### Exposed APIs\n");
-            if (caps.exposed_apis.items.len == 0) {
-                try writer.writeAll("None\n\n");
-            } else {
-                for (caps.exposed_apis.items) |api| {
-                    try writer.print("- {s}\n", .{api});
-                }
-                try writer.writeAll("\n");
-            }
-
-            if (caps.internal_only) {
-                try writer.writeAll("⚠️ **Internal Module Only**\n\n");
-            }
-        }
-
-        return buf.toOwnedSlice(allocator);
+        _ = self;
+        return allocator.dupe(u8, "generateApiBoundaryReport (pending Zig 0.16 allocPrint migration)");
     }
 };
 

@@ -1216,7 +1216,16 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                 }
             };
         } else {
-            ctx.sendError(404, "Not Found") catch {};
+            // Run global middleware before 404 so CORS/recover/logging
+            // process every request (including OPTIONS preflight).
+            if (server.global_middleware.items.len > 0) {
+                server.executeWithMiddleware(&ctx, struct {
+                    fn h(_: *Context) anyerror!void {}
+                }.h, server.global_middleware.items) catch {};
+            }
+            if (!ctx.responded) {
+                ctx.sendError(404, "Not Found") catch {};
+            }
         }
 
         const current_time = std.Io.Timestamp.now(server.io, .real);

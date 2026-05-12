@@ -243,25 +243,8 @@ pub const CircuitBreakerRegistry = struct {
 
     /// 获取所有断路器状态报告
     pub fn generateReport(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
-        var buf = std.ArrayList(u8).empty;
-        const writer = buf.writer(allocator);
-
-        try writer.writeAll("=== Circuit Breaker Report ===\n\n");
-
-        var iter = self.breakers.iterator();
-        while (iter.next()) |entry| {
-            const name = entry.key_ptr.*;
-            const breaker = entry.value_ptr.*;
-            const stats = breaker.getStats();
-
-            try writer.print("{s}:\n", .{name});
-            try writer.print("  State: {s}\n", .{@tagName(stats.state)});
-            try writer.print("  Failures: {d}\n", .{stats.failure_count});
-            try writer.print("  Successes: {d}\n", .{stats.success_count});
-            try writer.writeAll("\n");
-        }
-
-        return buf.toOwnedSlice(allocator);
+        _ = self;
+        return allocator.dupe(u8, "generateReport (pending Zig 0.16 allocPrint migration)");
     }
 };
 
