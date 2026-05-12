@@ -1106,16 +1106,18 @@ pub const Server = struct {
     }
 
     /// Factory: create a Server from environment variables.
-    /// Reads HTTP_PORT (default 8080), HTTP_MAX_BODY (default 8MB).
-    pub fn fromEnv(io: std.Io, allocator: std.mem.Allocator) !Server {
-        const port = if (std.process.getEnvVarOwned(allocator, "HTTP_PORT")) |p| blk: {
-            defer allocator.free(p);
-            break :blk std.fmt.parseInt(u16, p, 10) catch 8080;
-        } else @as(u16, 8080);
-        const max_body = if (std.process.getEnvVarOwned(allocator, "HTTP_MAX_BODY")) |b| blk: {
-            defer allocator.free(b);
-            break :blk std.fmt.parseInt(usize, b, 10) catch 8 * 1024 * 1024;
-        } else @as(usize, 8 * 1024 * 1024);
+    /// Pass std.process.Environ from main's init: Server.fromEnv(io, alloc, init.environ).
+    pub fn fromEnv(io: std.Io, allocator: std.mem.Allocator, env: std.process.Environ) !Server {
+        var port: u16 = 8080;
+        var max_body: usize = 8 * 1024 * 1024;
+        var iter = env.iterator();
+        while (iter.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, "HTTP_PORT")) {
+                port = std.fmt.parseInt(u16, entry.value_ptr.*, 10) catch 8080;
+            } else if (std.mem.eql(u8, entry.key_ptr.*, "HTTP_MAX_BODY")) {
+                max_body = std.fmt.parseInt(usize, entry.value_ptr.*, 10) catch (8 * 1024 * 1024);
+            }
+        }
         return initWithConfig(io, allocator, .{ .port = port, .max_body_size = max_body });
     }
 
