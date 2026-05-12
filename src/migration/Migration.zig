@@ -200,6 +200,37 @@ pub const MigrationRunner = struct {
         return self.migrations.items.len;
     }
 
+    /// Execute all pending migrations against a database client.
+    /// Runs each migration's SQL in order, records results in the history table.
+    pub fn run(self: *Self, client: anytype) !void {
+        // Ensure history table exists
+        _ = client.exec(self.generateHistoryTableDDL() catch return error.OutOfMemory, &.{}) catch return error.QueryExecutionFailed;
+
+        for (self.migrations.items) |migration| {
+            // Skip already-applied migrations
+            var already_applied = false;
+            for (self.history.items) |h| {
+                if (h.version == migration.version and h.success) {
+                    already_applied = true;
+                    break;
+                }
+            }
+            if (already_applied) continue;
+
+            const start_ms = @import("../core/Time.zig").monotonicNowMilliseconds();
+            const result = client.exec(migration.sql, &.{});
+            const elapsed_ms = @import("../core/Time.zig").monotonicNowMilliseconds() - start_ms;
+
+            const checksum = migration.checksum orelse "";
+            if (result) |_| {
+                try self.recordMigration(migration.version, migration.description, checksum, @intCast(elapsed_ms), true);
+            } else |_| {
+                try self.recordMigration(migration.version, migration.description, checksum, @intCast(elapsed_ms), false);
+                return error.MigrationFailed;
+            }
+        }
+    }
+
     /// 生成迁移历史表创建 SQL
     pub fn generateHistoryTableDDL(self: *Self) ![]const u8 {
         return std.fmt.allocPrint(self.allocator,

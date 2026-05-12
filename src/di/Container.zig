@@ -41,6 +41,7 @@ pub const Container = struct {
 
     allocator: std.mem.Allocator,
     services: std.StringHashMap(*ServiceWrapper),
+    deinitialized: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
@@ -50,6 +51,7 @@ pub const Container = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.deinitialized = true;
         var iter = self.services.iterator();
         while (iter.next()) |entry| {
             entry.value_ptr.*.destroy(self.allocator);
@@ -62,7 +64,9 @@ pub const Container = struct {
         try self.services.put(name, wrapper);
     }
 
+    /// Returns null if deinitialized or service not found.
     pub fn get(self: *Self, comptime T: type, name: []const u8) ?*T {
+        if (self.deinitialized) return null;
         const wrapper = self.services.get(name) orelse return null;
         const expected_type = @typeName(T);
         const expected_hash = comptime std.hash.Crc32.hash(expected_type);
