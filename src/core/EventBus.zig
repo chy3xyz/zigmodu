@@ -223,6 +223,12 @@ pub fn ThreadSafeEventBus(comptime T: type) type {
     };
 }
 
+/// Unified event bus — always typed. For untyped usage, pass `void`.
+/// Generated code should use `EventBus(MyEvent)` for type safety.
+pub fn UnifiedEventBus(comptime T: type) type {
+    return TypedEventBus(T);
+}
+
 test "TypedEventBus subscribe publish unsubscribe" {
     const allocator = std.testing.allocator;
 
