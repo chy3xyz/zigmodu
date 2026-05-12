@@ -1334,6 +1334,13 @@ pub const Client = struct {
         };
     }
 
+    /// One-step init + connect. Use instead of init() + connect().
+    pub fn open(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !Client {
+        var client = Client.init(allocator, io, cfg);
+        try client.connect();
+        return client;
+    }
+
     pub fn withOptions(self: *Client, opts: []const SqlOption) void {
         for (opts) |opt| {
             opt(self);
