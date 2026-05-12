@@ -15,4 +15,5 @@ pub const MigrationRunner = @import("migration/Migration.zig").MigrationRunner;
 pub const MigrationLoader = @import("migration/Migration.zig").MigrationLoader;
 pub const MigrationEntry = @import("migration/Migration.zig").MigrationEntry;
 pub const MigrationStatus = @import("migration/Migration.zig").MigrationStatus;
+pub const MigrationStatusEntry = @import("migration/Migration.zig").MigrationStatusEntry;
 pub const AppliedMigration = @import("migration/Migration.zig").AppliedMigration;

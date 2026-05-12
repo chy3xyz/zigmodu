@@ -10,3 +10,6 @@ pub const DistributedTracer = @import("tracing/DistributedTracer.zig").Distribut
 pub const StructuredLogger = @import("log/StructuredLogger.zig").StructuredLogger;
 pub const LogLevel = @import("log/StructuredLogger.zig").LogLevel;
 pub const LogRotator = @import("log/StructuredLogger.zig").LogRotator;
+pub const ModuleLogger = @import("log/ModuleLogger.zig").ModuleLogger;
+pub const LogScope = @import("log/ModuleLogger.zig").ModuleLogger.LogScope;
+pub const Sampler = @import("tracing/DistributedTracer.zig").Sampler;
