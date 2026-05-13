@@ -488,7 +488,7 @@ pub const Context = struct {
     pub fn jsonStruct(self: *Context, status: u16, value: anytype) !void {
         self.status_code = status;
         try self.setHeader("Content-Type", "application/json");
-        const json_str = try std.fmt.allocPrint(self.allocator, "{any}", .{std.json.fmt(value, .{})});
+        const json_str = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
         defer self.allocator.free(json_str);
         try self.response_body.appendSlice(self.allocator, json_str);
         self.responded = true;

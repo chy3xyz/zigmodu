@@ -539,7 +539,7 @@ pub const PostgresConn = struct {
             libpq_c.PQfinish(conn);
             return error.DatabaseError;
         }
-        return .{ .conn = conn, .allocator = allocator };
+        return .{ .conn = conn, .allocator = allocator, .stmt_cache = std.StringHashMap([]const u8).init(allocator) };
     }
 
     fn queryFn(ptr: *anyopaque, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value) errors.ResultT(Rows) {
@@ -756,11 +756,19 @@ pub const PostgresConn = struct {
             if (c == '?') count += 1;
         }
         if (count == 0) return allocator.dupeZ(u8, sql) catch null;
-        // Estimate size: original len - count + count*4 + 1 (null terminator)
-        const est = sql.len - count + count * 4 + 1;
-        const buf = allocator.alloc(u8, est) catch return null;
-        var pos: usize = 0;
+
+        // Calculate exact size: original len minus ? chars plus $N replacements
+        var exact: usize = sql.len - count;
         var n: usize = 0;
+        while (n < count) : (n += 1) {
+            // Each ? becomes "$N" — 1 digit for N<10, 2 for <100, etc.
+            const digits = if (n + 1 < 10) @as(usize, 2) else if (n + 1 < 100) @as(usize, 3) else @as(usize, 4);
+            exact += digits;
+        }
+
+        const buf = allocator.allocSentinel(u8, exact, 0) catch return null;
+        var pos: usize = 0;
+        n = 0;
         for (sql) |c| {
             if (c == '?') {
                 n += 1;
@@ -776,7 +784,6 @@ pub const PostgresConn = struct {
                 pos += 1;
             }
         }
-        buf[pos] = 0;
         return buf[0..pos :0];
     }
 
