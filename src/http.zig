@@ -51,3 +51,22 @@ pub const sendProblemWithType = @import("http/ProblemDetails.zig").sendProblemWi
 pub const sendValidationProblem = @import("http/ProblemDetails.zig").sendValidationProblem;
 pub const wrapContextWithIdempotency = @import("http/Idempotency.zig").wrapContextWithIdempotency;
 pub const recordIdempotencyResponse = @import("http/Idempotency.zig").recordIdempotencyResponse;
+
+/// Unified response renderer (zfinal-style).
+pub const RenderExt = struct {
+    /// {"success":true,"data":<value>}
+    pub fn success(ctx: *http_server.Context, data: anytype) !void {
+        try ctx.jsonStruct(200, .{ .success = true, .data = data });
+    }
+    /// {"success":false,"err":"<message>"}
+    pub fn err(ctx: *http_server.Context, message: []const u8) !void {
+        try ctx.jsonStruct(200, .{ .success = false, .err = message });
+    }
+    /// {"success":true,"data":{"list":<list>,"total":N,"page":P,"pageSize":S,"totalPages":T}}
+    pub fn page(ctx: *http_server.Context, list: anytype, total: usize, page_num: usize, page_size: usize) !void {
+        try ctx.jsonStruct(200, .{ .success = true, .data = .{
+            .list = list, .total = total, .page = page_num, .pageSize = page_size,
+            .totalPages = (total + page_size - 1) / page_size,
+        } });
+    }
+};
