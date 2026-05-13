@@ -242,7 +242,7 @@ fn buildSelectPage(allocator: std.mem.Allocator, table: []const u8, sql_cols: []
 }
 
 fn buildCount(allocator: std.mem.Allocator, table: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM {s}", .{table});
+    return std.fmt.allocPrint(allocator, "SELECT COUNT(*) as count FROM {s}", .{table});
 }
 
 fn buildDelete(allocator: std.mem.Allocator, table: []const u8, pk: []const u8) ![]u8 {
