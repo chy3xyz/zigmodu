@@ -709,12 +709,16 @@ fn formatQuery(allocator: std.mem.Allocator, sql: []const u8, args: []const Valu
                 .float => |v| try buf.print(allocator, "{d}", .{v}),
                 .string => |v| {
                     try buf.append(allocator, '\'');
-                    // Escape single quotes to prevent SQL injection
+                    // Escape backslash and single quotes for MySQL sql_mode (NO_BACKSLASH_ESCAPES off by default)
                     for (v) |char| {
-                        if (char == '\'') {
-                            try buf.appendSlice(allocator, "''");
-                        } else {
-                            try buf.append(allocator, char);
+                        switch (char) {
+                            '\\' => try buf.appendSlice(allocator, "\\\\"),
+                            '\'' => try buf.appendSlice(allocator, "''"),
+                            0x00 => try buf.appendSlice(allocator, "\\0"),
+                            '\n' => try buf.appendSlice(allocator, "\\n"),
+                            '\r' => try buf.appendSlice(allocator, "\\r"),
+                            0x1a => try buf.appendSlice(allocator, "\\Z"),
+                            else => try buf.append(allocator, char),
                         }
                     }
                     try buf.append(allocator, '\'');
@@ -844,6 +848,10 @@ pub const MySqlConn = struct {
     fn pingFn(ptr: *anyopaque) errors.Result {
         const self = @as(*MySqlConn, @ptrCast(@alignCast(ptr)));
         if (self.mysql == null) return error.DatabaseError;
+        const rc = libmysql_c.mysql_real_query(self.mysql, "SELECT 1", @intCast("SELECT 1".len));
+        if (rc != 0) return error.DatabaseError;
+        const res = libmysql_c.mysql_store_result(self.mysql);
+        if (res) |r| libmysql_c.mysql_free_result(r);
     }
 
     fn beginFn(ptr: *anyopaque) errors.Result {
