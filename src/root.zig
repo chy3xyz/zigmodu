@@ -143,6 +143,8 @@ pub const time = @import("core/Time.zig");
 pub const fx = @import("core/Fx.zig");
 pub const util = @import("util.zig");
 pub const pluralize = util.pluralize;
+pub const HashKit = util.HashKit;
+pub const hexEncode = util.hexEncode;
 pub const Validator = @import("validation/ObjectValidator.zig").Validator;
 
 // ============================================================

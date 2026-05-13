@@ -34,3 +34,32 @@ pub fn pluralize(allocator: std.mem.Allocator, singular: []const u8) ![]const u8
 fn isVowel(c: u8) bool {
     return switch (c) { 'a', 'e', 'i', 'o', 'u', 'A', 'E', 'I', 'O', 'U' => true, else => false };
 }
+
+/// Encode bytes as lowercase hex string. Caller owns result.
+pub fn hexEncode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
+    const hex = "0123456789abcdef";
+    var out = try allocator.alloc(u8, data.len * 2);
+    for (data, 0..) |b, i| { out[i*2] = hex[b >> 4]; out[i*2+1] = hex[b & 0xf]; }
+    return out;
+}
+
+pub const HashKit = struct {
+    pub fn md5(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
+        var h: [16]u8 = undefined;
+        std.crypto.hash.Md5.hash(data, &h, .{});
+        return hexEncode(allocator, &h);
+    }
+    pub fn sha1(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
+        var h: [20]u8 = undefined;
+        std.crypto.hash.Sha1.hash(data, &h, .{});
+        return hexEncode(allocator, &h);
+    }
+    pub fn sha256(data: []const u8, out: *[32]u8) void {
+        std.crypto.hash.sha2.Sha256.hash(data, out, .{});
+    }
+    pub fn sha256Hex(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
+        var h: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(data, &h, .{});
+        return hexEncode(allocator, &h);
+    }
+};

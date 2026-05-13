@@ -5,25 +5,95 @@
 const std = @import("std");
 const Time = @import("../core/Time.zig");
 
-/// Cron expression (simplified: minute hour day month dow)
+/// Cron expression (5-field: minute hour day month dow).
+/// Supports: * (any), */n (step), n (specific), n-m (range), n,m (list)
 pub const Expression = struct {
-    minute: u8 = 0, // 0-59
-    hour: u8 = 0, // 0-23
-    day: u8 = 0, // 1-31 (0 = any)
-    month: u8 = 0, // 1-12 (0 = any)
-    dow: u8 = 8, // 0-6 (8 = any)
+    minutes: [60]bool = [_]bool{false} ** 60,
+    hours: [24]bool = [_]bool{false} ** 24,
+    days: [32]bool = [_]bool{false} ** 32,
+    months: [13]bool = [_]bool{false} ** 13,
+    dows: [7]bool = [_]bool{false} ** 7,
+
+    /// Parse standard cron expression "m h d M w"
+    pub fn parse(expr: []const u8) !Expression {
+        var self = Expression{};
+        var it = std.mem.splitScalar(u8, expr, ' ');
+        var fi: usize = 0;
+        while (it.next()) |part| : (fi += 1) {
+            if (part.len == 0) continue;
+            if (fi >= 5) return error.InvalidCronExpr;
+            const target = switch (fi) {
+                0 => &self.minutes, 1 => &self.hours, 2 => &self.days, 3 => &self.months, 4 => &self.dows,
+                else => unreachable,
+            };
+            const max: u8 = switch (fi) { 0 => 59, 1 => 23, 2 => 31, 3 => 12, 4 => 6, else => unreachable };
+            try parseField(part, target, max);
+        }
+        return self;
+    }
 
     /// Check if current time matches expression
-    pub fn matches(self: Expression, tm: std.c.time_t) bool {
-        const local = std.c.localtime(&tm);
-        if (self.minute != local.tm_min) return false;
-        if (self.hour != local.tm_hour) return false;
-        if (self.day != 0 and self.day != local.tm_mday) return false;
-        if (self.month != 0 and self.month != @as(u8, @intCast(local.tm_mon + 1))) return false;
-        if (self.dow != 8 and self.dow != @as(u8, @intCast(local.tm_wday))) return false;
-        return true;
+    pub fn matches(self: Expression, tm: i64) bool {
+        const secs: u64 = @intCast(tm);
+        const days = secs / 86400;
+        const day_secs = secs % 86400;
+        const min: usize = @intCast((day_secs / 60) % 60);
+        const hr: usize = @intCast(day_secs / 3600);
+        const d: usize = @intCast((days + 4) % 7); // 1970-01-01 was Thursday (dow=4)
+        // Simple date calc for month/day
+        var y: u64 = 1970;
+        var remaining = days;
+        while (true) {
+            const yr_days: u64 = if (y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)) 366 else 365;
+            if (remaining < yr_days) break;
+            remaining -= yr_days;
+            y += 1;
+        }
+        const leap = y % 4 == 0 and (y % 100 != 0 or y % 400 == 0);
+        const md = [_]u64{ 31, if (leap) @as(u64, 29) else @as(u64, 28), 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+        var m: usize = 1;
+        for (md) |dim| {
+            if (remaining < dim) break;
+            remaining -= dim;
+            m += 1;
+        }
+        const dom: usize = @intCast(remaining + 1);
+        return self.minutes[min] and self.hours[hr] and self.days[dom] and self.months[m] and self.dows[d];
     }
 };
+
+fn parseField(part: []const u8, target: []bool, max: u8) !void {
+    if (std.mem.eql(u8, part, "*")) {
+        for (0..@min(target.len, @as(usize, max) + 1)) |i| target[i] = true;
+        return;
+    }
+    var sub = std.mem.splitScalar(u8, part, ',');
+    while (sub.next()) |s| {
+        if (std.mem.indexOfScalar(u8, s, '/')) |slash| {
+            const base = s[0..slash];
+            const step_str = s[slash+1..];
+            const step = std.fmt.parseInt(u8, step_str, 10) catch return error.InvalidCronExpr;
+            if (std.mem.eql(u8, base, "*")) {
+                var i: u8 = 0;
+                while (i <= max) : (i += step) target[i] = true;
+            } else {
+                const start = std.fmt.parseInt(u8, base, 10) catch return error.InvalidCronExpr;
+                var i = start;
+                while (i <= max) : (i += step) target[i] = true;
+            }
+        } else if (std.mem.indexOfScalar(u8, s, '-')) |dash| {
+            const start_str = s[0..dash];
+            const end_str = s[dash+1..];
+            const start = std.fmt.parseInt(u8, start_str, 10) catch return error.InvalidCronExpr;
+            const end = std.fmt.parseInt(u8, end_str, 10) catch return error.InvalidCronExpr;
+            var i = start;
+            while (i <= end) : (i += 1) target[i] = true;
+        } else {
+            const v = std.fmt.parseInt(u8, s, 10) catch return error.InvalidCronExpr;
+            if (v <= max) target[v] = true;
+        }
+    }
+}
 
 /// Scheduled job
 pub const Job = struct {
@@ -110,14 +180,34 @@ pub fn every(seconds: u64, task: *const fn (*anyopaque) void, context: *anyopaqu
     }
 }
 
-test "cron expression basic matching" {
-    const expr = Expression{ .minute = 30, .hour = 9, .day = 0, .month = 0 };
-    try std.testing.expectEqual(@as(u8, 30), expr.minute);
-    try std.testing.expectEqual(@as(u8, 9), expr.hour);
+test "cron parse wildcard" {
+    const expr = try Expression.parse("* * * * *");
+    try std.testing.expect(expr.minutes[0]);
+    try std.testing.expect(expr.minutes[59]);
+    try std.testing.expect(expr.hours[0]);
+    try std.testing.expect(expr.hours[23]);
 }
 
-test "cron expression any-day wildcard" {
-    const expr = Expression{ .minute = 0, .hour = 8, .day = 0, .month = 0 };
-    try std.testing.expect(expr.day == 0);
-    try std.testing.expect(expr.month == 0);
+test "cron parse specific" {
+    const expr = try Expression.parse("30 9 * * *");
+    try std.testing.expect(expr.minutes[30]);
+    try std.testing.expect(!expr.minutes[0]);
+    try std.testing.expect(expr.hours[9]);
+    try std.testing.expect(!expr.hours[0]);
+}
+
+test "cron parse step" {
+    const expr = try Expression.parse("*/5 * * * *");
+    try std.testing.expect(expr.minutes[0]);
+    try std.testing.expect(expr.minutes[5]);
+    try std.testing.expect(expr.minutes[10]);
+    try std.testing.expect(!expr.minutes[1]);
+}
+
+test "cron parse range" {
+    const expr = try Expression.parse("0 9-17 * * *");
+    try std.testing.expect(expr.minutes[0]);
+    try std.testing.expect(expr.hours[9]);
+    try std.testing.expect(expr.hours[17]);
+    try std.testing.expect(!expr.hours[8]);
 }
