@@ -626,10 +626,39 @@ pub const PostgresConn = struct {
                 },
             };
         }
-        const res = libpq_c.PQexecParams(self.conn, @ptrCast(sql_str.ptr), @intCast(args.len), null, @ptrCast(paramValues.ptr), @ptrCast(paramLengths.ptr), null, 0);
+        // Convert ? placeholders to $1,$2,... for PostgreSQL
+        const pg_sql = convertPlaceholders(self.allocator, sql_str) orelse {
+            self.allocator.free(paramValues);
+            self.allocator.free(paramLengths);
+            return null;
+        };
+        defer self.allocator.free(pg_sql);
+        const res = libpq_c.PQexecParams(self.conn, @ptrCast(pg_sql.ptr), @intCast(args.len), null, @ptrCast(paramValues.ptr), @ptrCast(paramLengths.ptr), null, 0);
         self.allocator.free(paramValues);
         self.allocator.free(paramLengths);
         return res;
+    }
+
+    fn convertPlaceholders(allocator: std.mem.Allocator, sql: []const u8) ?[]u8 {
+        var count: usize = 0;
+        for (sql) |c| {
+            if (c == '?') count += 1;
+        }
+        if (count == 0) return allocator.dupe(u8, sql) catch null;
+        var buf = std.ArrayList(u8).empty;
+        var n: usize = 0;
+        for (sql) |c| {
+            if (c == '?') {
+                n += 1;
+                // Max $999 = 4 chars
+                var tmp: [5]u8 = undefined;
+                const s = std.fmt.bufPrint(&tmp, "${d}", .{n}) catch return null;
+                buf.appendSlice(allocator, s) catch return null;
+            } else {
+                buf.append(allocator, c) catch return null;
+            }
+        }
+        return buf.toOwnedSlice(allocator) catch null;
     }
 
     fn closeFn(ptr: *anyopaque) void {

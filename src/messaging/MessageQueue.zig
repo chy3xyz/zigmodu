@@ -1,4 +1,5 @@
 const std = @import("std");
+const Nats = @import("Nats.zig");
 
 /// 消息队列抽象接口
 pub const MessageQueue = struct {
@@ -19,6 +20,7 @@ pub const MessageQueue = struct {
 
     pub const QueueBackend = union(enum) {
         in_memory: *InMemoryBackend,
+        nats: *NatsBackend,
         redis: RedisBackend,
         kafka: KafkaBackend,
     };
@@ -30,6 +32,7 @@ pub const MessageQueue = struct {
         pub fn publish(self: *Producer, msg: Message) !void {
             switch (self.backend.*) {
                 .in_memory => |backend| try backend.publish(msg),
+                .nats => |backend| try backend.publish(msg),
                 .redis => {},
                 .kafka => {},
             }
@@ -106,6 +109,27 @@ pub const MessageQueue = struct {
 
     pub const KafkaBackend = struct {
         brokers: []const []const u8,
+    };
+
+    /// NATS message queue backend (default: localhost:4222).
+    pub const NatsBackend = struct {
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        client: Nats.NatsClient,
+
+        pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Nats.NatsConfig) !NatsBackend {
+            var client = Nats.NatsClient.init(allocator, io, config);
+            try client.connect();
+            return .{ .allocator = allocator, .io = io, .client = client };
+        }
+
+        pub fn deinit(self: *NatsBackend) void {
+            self.client.deinit();
+        }
+
+        pub fn publish(self: *NatsBackend, msg: Message) !void {
+            try self.client.publish(msg.topic, msg.payload);
+        }
     };
 
     pub fn init(allocator: std.mem.Allocator, backend: QueueBackend) Self {

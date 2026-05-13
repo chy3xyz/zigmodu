@@ -81,6 +81,7 @@ test "compile all source files" {
     _ = @import("log/StructuredLogger.zig");
 
     // Messaging
+    _ = @import("messaging/Nats.zig");
     _ = @import("messaging/MessageQueue.zig");
 
     // Metrics
