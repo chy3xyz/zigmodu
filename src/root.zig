@@ -58,6 +58,17 @@ pub const data = @import("data.zig");
 pub const security = @import("security.zig");
 pub const observability = @import("observability.zig");
 
+// Convenience flat re-exports — avoid deep import paths:
+//   zmodu.sqlx  vs  zmodu.data.sqlx
+//   zmodu.orm   vs  zmodu.data.orm
+pub const sqlx = @import("sqlx/sqlx.zig");
+pub const orm = @import("persistence/Orm.zig");
+pub const SqlxBackend = @import("persistence/backends/SqlxBackend.zig").SqlxBackend;
+pub const http_server = @import("api/Server.zig");
+pub const PasswordEncoder = @import("security/PasswordEncoder.zig").PasswordEncoder;
+pub const SecurityModule = @import("security/SecurityModule.zig").SecurityModule;
+pub const Cache = @import("cache/Lru.zig").Cache;
+
 // ============================================================
 // 3. RESILIENCE
 // ============================================================
