@@ -482,11 +482,13 @@ pub const Context = struct {
         return deepCopy(parsed.value, self.allocator);
     }
 
-    /// Send JSON from struct — streaming write via std.json.stringify, zero alloc.
+    /// Send JSON from struct.
     pub fn jsonStruct(self: *Context, status: u16, value: anytype) !void {
         self.status_code = status;
         try self.setHeader("Content-Type", "application/json");
-        try std.json.stringify(value, .{}, self.response_body.writer());
+        const json_str = try std.fmt.allocPrint(self.allocator, "{any}", .{std.json.fmt(value, .{})});
+        defer self.allocator.free(json_str);
+        try self.response_body.appendSlice(self.allocator, json_str);
         self.responded = true;
     }
 
