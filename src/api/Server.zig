@@ -695,11 +695,17 @@ const RequestParser = struct {
             if (content_len > max_body_size) return error.BodyTooLarge;
             if (content_len > 0) {
                 const body_buf = try self.allocator.alloc(u8, content_len);
-                const bytes_read = try reader.readAll(body_buf);
-                if (bytes_read == content_len) {
+                // Read body via buffered reader.read() which drains internal buffer
+                // before reading from stream (unlike readSliceAll that bypasses it).
+                var total: usize = 0;
+                while (total < content_len) {
+                    const n = try reader.reader.read(body_buf[total..]);
+                    if (n == 0) break;
+                    total += n;
+                }
+                if (total == content_len) {
                     body = body_buf;
                 } else {
-                    // Incomplete body read - connection closed or error
                     self.allocator.free(body_buf);
                     return error.IncompleteBody;
                 }
