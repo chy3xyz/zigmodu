@@ -80,18 +80,10 @@ pub const RouteGroup = struct {
     }
 
     fn joinPath(self: *const RouteGroup, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-        // Ensure exactly one '/' between prefix and path.
-        const pfx = self.prefix;
-        const needs_sep = pfx.len > 0 and pfx[pfx.len - 1] != '/' and (path.len == 0 or path[0] != '/');
-        const drop_dup = pfx.len > 0 and pfx[pfx.len - 1] == '/' and path.len > 0 and path[0] == '/';
-
-        if (drop_dup) {
-            return std.fmt.allocPrint(allocator, "{s}{s}", .{ pfx, path[1..] });
-        }
-        if (needs_sep) {
-            return std.fmt.allocPrint(allocator, "{s}/{s}", .{ pfx, path });
-        }
-        return std.fmt.allocPrint(allocator, "{s}{s}", .{ pfx, path });
+        const pfx = std.mem.trim(u8, self.prefix, "/");
+        const rel = std.mem.trim(u8, path, "/");
+        if (pfx.len == 0) return allocator.dupe(u8, rel);
+        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ pfx, rel });
     }
 
     fn add(self: *RouteGroup, method: Method, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
@@ -1133,6 +1125,7 @@ pub const Server = struct {
             r.combined_middleware = combined;
         }
         try self.router.addRoute(r);
+        std.log.info("ROUTE: {s} {s}", .{ @tagName(r.method), r.path });
     }
 
     pub fn group(self: *Server, prefix: []const u8) RouteGroup {

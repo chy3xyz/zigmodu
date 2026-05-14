@@ -116,11 +116,7 @@ pub const Conn = struct {
     };
 
     pub fn query(self: Conn, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value) errors.ResultT(Rows) {
-        var rows = try self.vtable.query(self.ptr, allocator, sql_str, args);
-        // Arena was on queryFn stack; move to caller's Rows changes address.
-        // Row.arena must point to the caller's copy (stable), not queryFn's local.
-        for (rows.rows) |*row| row.arena = &rows.arena;
-        return rows;
+        return self.vtable.query(self.ptr, allocator, sql_str, args);
     }
 
     pub fn exec(self: Conn, sql_str: []const u8, args: []const Value) errors.ResultT(ExecResult) {
@@ -237,7 +233,7 @@ fn scanStruct(allocator: std.mem.Allocator, comptime T: type, row: Row, partial:
         const val: ?Value = if (ci) |c| blk: {
             if (row.values[c]) |v| {
                 switch (v) {
-                    .string => |s| break :blk .{ .string = row.rowAllocator().dupe(u8, s) catch return error.DatabaseError },
+                    .string => |s| break :blk .{ .string = allocator.dupe(u8, s) catch return error.DatabaseError },
                     else => break :blk v,
                 }
             }
@@ -1011,16 +1007,13 @@ fn mysqlReadRowsAfterQuery(mysql: ?*libmysql_c.MYSQL, arena: std.heap.ArenaAlloc
 
         const rows_slice = arena_alloc.alloc(Row, rows_list.items.len) catch return error.DatabaseError;
         @memcpy(rows_slice, rows_list.items);
-        var rows = Rows{ .arena = arena_mut, .rows = rows_slice };
-        for (@constCast(rows.rows)) |*row| row.arena = &rows.arena;
-        return rows;
+        return Rows{ .arena = arena_mut, .rows = rows_slice };
     }
 
     if (libmysql_c.mysql_errno(mysql) != 0) return error.DatabaseError;
     if (libmysql_c.mysql_field_count(mysql) == 0) return error.DatabaseError;
     const rows_slice = arena_alloc.alloc(Row, 0) catch return error.DatabaseError;
-    var rows = Rows{ .arena = arena_mut, .rows = rows_slice };
-    for (@constCast(rows.rows)) |*row| row.arena = &rows.arena;
+    const rows = Rows{ .arena = arena_mut, .rows = rows_slice };
     return rows;
 }
 
@@ -1944,18 +1937,22 @@ pub const Client = struct {
     pub fn queryRows(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
         var rows = try self.query(sql_str, args);
         defer rows.deinit();
+        // Fixup: Arena was on driver stack; now in caller's Rows. Update Row.arena pointers.
+        for (@constCast(rows.rows)) |*row| row.arena = &rows.arena;
         // Precompute column→field index once per query (O(F*C) once, not per row)
         const indices = if (rows.rows.len > 0)
             try buildColumnIndices(T, rows.rows[0].columns)
         else
             null;
         const result = try self.allocator.alloc(T, rows.rows.len);
+        var scanned_count: usize = 0;
         errdefer {
-            for (result) |item| freeScanned(self.allocator, T, item);
+            for (result[0..scanned_count]) |item| freeScanned(self.allocator, T, item);
             self.allocator.free(result);
         }
         for (rows.rows, 0..) |row, i| {
             result[i] = try scanStruct(self.allocator, T, row, false, indices);
+            scanned_count += 1;
         }
         return result;
     }
@@ -2105,6 +2102,7 @@ pub const Transaction = struct {
     pub fn queryRows(self: *Transaction, allocator: std.mem.Allocator, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
         var rows = try self.query(allocator, sql_str, args);
         defer rows.deinit();
+        for (@constCast(rows.rows)) |*row| row.arena = &rows.arena;
         const indices = if (rows.rows.len > 0)
             try buildColumnIndices(T, rows.rows[0].columns)
         else
