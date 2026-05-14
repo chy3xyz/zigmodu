@@ -116,7 +116,11 @@ pub const Conn = struct {
     };
 
     pub fn query(self: Conn, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value) errors.ResultT(Rows) {
-        return self.vtable.query(self.ptr, allocator, sql_str, args);
+        var rows = try self.vtable.query(self.ptr, allocator, sql_str, args);
+        // Arena was on queryFn stack; move to caller's Rows changes address.
+        // Row.arena must point to the caller's copy (stable), not queryFn's local.
+        for (rows.rows) |*row| row.arena = &rows.arena;
+        return rows;
     }
 
     pub fn exec(self: Conn, sql_str: []const u8, args: []const Value) errors.ResultT(ExecResult) {
@@ -376,9 +380,7 @@ pub const SQLiteConn = struct {
 
         const rows_slice = arena_alloc.alloc(Row, rows_list.items.len) catch return error.DatabaseError;
         @memcpy(rows_slice, rows_list.items);
-        var rows = Rows{ .arena = arena, .rows = rows_slice };
-        for (rows.rows) |*row| row.arena = &rows.arena;
-        return rows;
+        return Rows{ .arena = arena, .rows = rows_slice };
     }
 
     fn execFn(ptr: *anyopaque, sql_str: []const u8, args: []const Value) errors.ResultT(ExecResult) {
@@ -595,9 +597,7 @@ pub const PostgresConn = struct {
 
         const rows_slice = arena_alloc.alloc(Row, rows_list.items.len) catch return error.DatabaseError;
         @memcpy(rows_slice, rows_list.items);
-        var rows = Rows{ .arena = arena, .rows = rows_slice };
-        for (rows.rows) |*row| row.arena = &rows.arena;
-        return rows;
+        return Rows{ .arena = arena, .rows = rows_slice };
     }
 
     fn execFn(ptr: *anyopaque, sql_str: []const u8, args: []const Value) errors.ResultT(ExecResult) {
@@ -1012,7 +1012,7 @@ fn mysqlReadRowsAfterQuery(mysql: ?*libmysql_c.MYSQL, arena: std.heap.ArenaAlloc
         const rows_slice = arena_alloc.alloc(Row, rows_list.items.len) catch return error.DatabaseError;
         @memcpy(rows_slice, rows_list.items);
         var rows = Rows{ .arena = arena_mut, .rows = rows_slice };
-        for (rows.rows) |*row| row.arena = &rows.arena;
+        for (@constCast(rows.rows)) |*row| row.arena = &rows.arena;
         return rows;
     }
 
@@ -1020,7 +1020,7 @@ fn mysqlReadRowsAfterQuery(mysql: ?*libmysql_c.MYSQL, arena: std.heap.ArenaAlloc
     if (libmysql_c.mysql_field_count(mysql) == 0) return error.DatabaseError;
     const rows_slice = arena_alloc.alloc(Row, 0) catch return error.DatabaseError;
     var rows = Rows{ .arena = arena_mut, .rows = rows_slice };
-    for (rows.rows) |*row| row.arena = &rows.arena;
+    for (@constCast(rows.rows)) |*row| row.arena = &rows.arena;
     return rows;
 }
 
@@ -1205,9 +1205,7 @@ pub const SQLiteStmt = struct {
 
         const rows_slice = arena_alloc.alloc(Row, rows_list.items.len) catch return error.DatabaseError;
         @memcpy(rows_slice, rows_list.items);
-        var rows = Rows{ .arena = arena, .rows = rows_slice };
-        for (rows.rows) |*row| row.arena = &rows.arena;
-        return rows;
+        return Rows{ .arena = arena, .rows = rows_slice };
     }
 
     fn execFn(ptr: *anyopaque, args: []const Value) errors.ResultT(ExecResult) {
@@ -1319,9 +1317,7 @@ pub const PostgresStmt = struct {
         }
         const rows_slice = arena_alloc.alloc(Row, rows_list.items.len) catch return error.DatabaseError;
         @memcpy(rows_slice, rows_list.items);
-        var rows = Rows{ .arena = arena, .rows = rows_slice };
-        for (rows.rows) |*row| row.arena = &rows.arena;
-        return rows;
+        return Rows{ .arena = arena, .rows = rows_slice };
     }
 
     fn execFn(ptr: *anyopaque, args: []const Value) errors.ResultT(ExecResult) {
