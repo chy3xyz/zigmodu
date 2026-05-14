@@ -548,13 +548,22 @@ pub const PostgresConn = struct {
         errdefer arena.deinit();
         const arena_alloc = arena.allocator();
 
-        const res = execPrepared(self, sql_str, args) orelse return error.DatabaseError;
-        defer libpq_c.PQclear(res);
+        const res = execPrepared(self, sql_str, args);
+        if (res == null) {
+            std.log.err("PG queryFn: execPrepared returned null sql={s}", .{sql_str});
+            return error.DatabaseError;
+        }
+        defer libpq_c.PQclear(res.?);
 
-        if (libpq_c.PQresultStatus(res) != libpq_c.ExecStatusType.PGRES_TUPLES_OK) return error.DatabaseError;
+        const status = libpq_c.PQresultStatus(res.?);
+        if (status != libpq_c.ExecStatusType.PGRES_TUPLES_OK) {
+            const err_msg = std.mem.span(libpq_c.PQerrorMessage(self.conn));
+            std.log.err("PG queryFn: status={d} sql={s} err={s}", .{ @intFromEnum(status), sql_str, err_msg });
+            return error.DatabaseError;
+        }
 
-        const n_rows = libpq_c.PQntuples(res);
-        const n_cols = libpq_c.PQnfields(res);
+        const n_rows = libpq_c.PQntuples(res.?);
+        const n_cols = libpq_c.PQnfields(res.?);
 
         var rows_list: std.ArrayList(Row) = std.ArrayList(Row).empty;
 
@@ -562,30 +571,48 @@ pub const PostgresConn = struct {
             const columns = arena_alloc.alloc([]const u8, @intCast(n_cols)) catch return error.DatabaseError;
             const values = arena_alloc.alloc(?Value, @intCast(n_cols)) catch return error.DatabaseError;
             for (0..@intCast(n_cols)) |c| {
-                const name = std.mem.span(libpq_c.PQfname(res, @intCast(c)));
+                const name = std.mem.span(libpq_c.PQfname(res.?, @intCast(c)));
                 columns[c] = arena_alloc.dupe(u8, name) catch return error.DatabaseError;
-                if (libpq_c.PQgetisnull(res, @intCast(r), @intCast(c)) == 1) {
+                if (libpq_c.PQgetisnull(res.?, @intCast(r), @intCast(c)) == 1) {
                     values[c] = null;
                 } else {
-                    const val = std.mem.span(libpq_c.PQgetvalue(res, @intCast(r), @intCast(c)));
+                    const val = std.mem.span(libpq_c.PQgetvalue(res.?, @intCast(r), @intCast(c)));
                     values[c] = .{ .string = arena_alloc.dupe(u8, val) catch return error.DatabaseError };
                 }
             }
+            // Temporarily store arena_alloc; will be updated after Rows is created
+            // so that .allocator points to the moved arena, not the stack copy.
             rows_list.append(arena_alloc, .{ .allocator = arena_alloc, .columns = columns, .values = values }) catch return error.DatabaseError;
         }
 
         const rows_slice = arena_alloc.alloc(Row, rows_list.items.len) catch return error.DatabaseError;
         @memcpy(rows_slice, rows_list.items);
-        return Rows{ .arena = arena, .rows = rows_slice };
+        var rows = Rows{ .arena = arena, .rows = rows_slice };
+        // Fixup: arena was on stack; after moving into Rows, update all Row.allocator
+        // to point to the moved arena. Without this, Row.allocator's internal pointer
+        // dangles to the old stack location, causing segfault on dupe.
+        const moved_alloc = rows.arena.allocator();
+        for (rows.rows) |*row| {
+            row.allocator = moved_alloc;
+        }
+        return rows;
     }
 
     fn execFn(ptr: *anyopaque, sql_str: []const u8, args: []const Value) errors.ResultT(ExecResult) {
         const self = @as(*PostgresConn, @ptrCast(@alignCast(ptr)));
-        const res = execPrepared(self, sql_str, args) orelse return error.DatabaseError;
-        defer libpq_c.PQclear(res);
+        const res = execPrepared(self, sql_str, args);
+        if (res == null) {
+            std.log.err("PG execFn: execPrepared returned null sql={s}", .{sql_str});
+            return error.DatabaseError;
+        }
+        defer libpq_c.PQclear(res.?);
 
-        const status = libpq_c.PQresultStatus(res);
-        if (status != libpq_c.ExecStatusType.PGRES_COMMAND_OK and status != libpq_c.ExecStatusType.PGRES_TUPLES_OK) return error.DatabaseError;
+        const status = libpq_c.PQresultStatus(res.?);
+        if (status != libpq_c.ExecStatusType.PGRES_COMMAND_OK and status != libpq_c.ExecStatusType.PGRES_TUPLES_OK) {
+            const err_msg = std.mem.span(libpq_c.PQerrorMessage(self.conn));
+            std.log.err("PG execFn: status={d} sql={s} err={s}", .{ @intFromEnum(status), sql_str, err_msg });
+            return error.DatabaseError;
+        }
 
         const cmd = std.mem.span(libpq_c.PQcmdTuples(res));
         const affected = std.fmt.parseInt(u64, cmd, 10) catch 0;
@@ -595,49 +622,90 @@ pub const PostgresConn = struct {
     /// Execute with prepared statement caching. First call prepares and caches;
     /// subsequent calls reuse via PQexecPrepared (server-side).
     fn execPrepared(self: *PostgresConn, sql_str: []const u8, args: []const Value) ?*libpq_c.PGresult {
-        // Convert ? → $1,$2,... (always needed for PG)
+        // Bypass prepared statement cache — use PQexecParams directly
+        return execParamsDirect(self, sql_str, args);
+    }
+
+    /// Direct PQexecParams (no prepared statement cache).
+    fn execParamsDirect(self: *PostgresConn, sql_str: []const u8, args: []const Value) ?*libpq_c.PGresult {
+        // Use PQexec (simple query, no params) for queries without args
+        // Must null-terminate the SQL string for libpq
+        if (args.len == 0) {
+            const pg_sql_simple = self.allocator.dupeZ(u8, sql_str) catch return null;
+            defer self.allocator.free(pg_sql_simple);
+            const res = libpq_c.PQexec(self.conn, @ptrCast(pg_sql_simple.ptr));
+            if (res == null) {
+                std.log.err("PG PQexec returned null", .{});
+                return null;
+            }
+            const status = libpq_c.PQresultStatus(res.?);
+            if (status != libpq_c.ExecStatusType.PGRES_TUPLES_OK and status != libpq_c.ExecStatusType.PGRES_COMMAND_OK) {
+                const err = std.mem.span(libpq_c.PQerrorMessage(self.conn));
+                std.log.err("PG PQexec failed: sql={s} err={s}", .{ sql_str, err });
+                libpq_c.PQclear(res.?);
+                return null;
+            }
+            return res.?;
+        }
+
+        // Convert ? → $1,$2,...
         const pg_sql = convertPlaceholders(self.allocator, sql_str) orelse return null;
         defer self.allocator.free(pg_sql);
 
-        // Check cache
-        if (self.stmt_cache.get(pg_sql)) |stmt_name| {
-            return self.execPreparedStmt(stmt_name, args);
-        }
+        const param_count = args.len;
+        const paramValues = self.allocator.alloc(?[*]const u8, param_count) catch return null;
+        const paramLengths = self.allocator.alloc(c_int, param_count) catch {
+            self.allocator.free(paramValues);
+            return null;
+        };
+        const paramAllocs = self.allocator.alloc(?[]const u8, param_count) catch {
+            self.allocator.free(paramValues);
+            self.allocator.free(paramLengths);
+            return null;
+        };
+        @memset(paramAllocs, null);
 
-        // Evict oldest if at capacity
-        if (self.stmt_cache.count() >= PG_MAX_CACHED_STMTS) {
-            var it = self.stmt_cache.iterator();
-            if (it.next()) |entry| {
-                var dealloc_buf: [64]u8 = undefined;
-                const dealloc_sql = std.fmt.bufPrint(&dealloc_buf, "DEALLOCATE {s}", .{entry.value_ptr.*}) catch return null;
-                _ = libpq_c.PQexec(self.conn, @ptrCast(dealloc_sql.ptr));
-                self.allocator.free(entry.key_ptr.*);
-                self.allocator.free(entry.value_ptr.*);
-                _ = self.stmt_cache.remove(entry.key_ptr.*);
+        defer {
+            for (paramAllocs) |maybe_alloc| {
+                if (maybe_alloc) |a| self.allocator.free(a);
             }
+            self.allocator.free(paramAllocs);
+            self.allocator.free(paramLengths);
+            self.allocator.free(paramValues);
         }
 
-        // Prepare new statement
-        self.stmt_counter += 1;
-        var stmt_buf: [32]u8 = undefined;
-        const stmt_name = std.fmt.bufPrint(&stmt_buf, "zs_{d}", .{self.stmt_counter}) catch return null;
-        const prep_res = libpq_c.PQprepare(self.conn, @ptrCast(stmt_name.ptr), @ptrCast(pg_sql.ptr), @intCast(args.len), null);
-        defer libpq_c.PQclear(prep_res);
-        if (libpq_c.PQresultStatus(prep_res) != libpq_c.ExecStatusType.PGRES_COMMAND_OK) return null;
+        for (args, 0..) |arg, i| {
+            paramValues[i] = switch (arg) {
+                .null => null,
+                .int => |v| blk: {
+                    const s = std.fmt.allocPrint(self.allocator, "{d}", .{v}) catch return null;
+                    paramAllocs[i] = s;
+                    paramLengths[i] = @intCast(s.len);
+                    break :blk @ptrCast(s.ptr);
+                },
+                .float => |v| blk: {
+                    const s = std.fmt.allocPrint(self.allocator, "{d}", .{v}) catch return null;
+                    paramAllocs[i] = s;
+                    paramLengths[i] = @intCast(s.len);
+                    break :blk @ptrCast(s.ptr);
+                },
+                .string => |v| blk: {
+                    paramLengths[i] = @intCast(v.len);
+                    break :blk @ptrCast(v.ptr);
+                },
+                .bool => |v| blk: {
+                    paramLengths[i] = 1;
+                    break :blk if (v) @ptrCast("t") else @ptrCast("f");
+                },
+            };
+        }
 
-        // Cache
-        const stmt_name_dup = self.allocator.dupe(u8, stmt_name) catch return null;
-        const sql_dup = self.allocator.dupe(u8, pg_sql) catch {
-            self.allocator.free(stmt_name_dup);
-            return null;
-        };
-        self.stmt_cache.put(sql_dup, stmt_name_dup) catch {
-            self.allocator.free(stmt_name_dup);
-            self.allocator.free(sql_dup);
-            return null;
-        };
-
-        return self.execPreparedStmt(stmt_name, args);
+        const res = libpq_c.PQexecParams(self.conn, @ptrCast(pg_sql.ptr), @intCast(param_count), null, @ptrCast(paramValues.ptr), @ptrCast(paramLengths.ptr), null, 0);
+        if (res == null) {
+            const err = std.mem.span(libpq_c.PQerrorMessage(self.conn));
+            std.log.err("PG PQexecParams returned null: err={s}", .{err});
+        }
+        return res;
     }
 
     /// Execute already-prepared statement.
