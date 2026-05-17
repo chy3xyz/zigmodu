@@ -78,6 +78,16 @@ pub const SecurityModule = struct {
         user_id: []const u8,
         roles: []const []const u8,
     ) ![]const u8 {
+        return self.generateTokenWithTenant(user_id, roles, "zigmodu-app");
+    }
+
+    /// 生成 JWT Token with tenant_id as aud claim
+    pub fn generateTokenWithTenant(
+        self: *Self,
+        user_id: []const u8,
+        roles: []const []const u8,
+        tenant_id: []const u8,
+    ) ![]const u8 {
         const now = if (self.io) |io| @as(i64, @intCast(@divTrunc(std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds, std.time.ns_per_s))) else Time.monotonicNowSeconds();
         const exp = now + self.token_expiry_seconds;
 
@@ -85,7 +95,7 @@ pub const SecurityModule = struct {
         const payload = JwtToken.JwtPayload{
             .sub = user_id,
             .iss = "zigmodu",
-            .aud = "zigmodu-app",
+            .aud = tenant_id,
             .exp = exp,
             .iat = now,
             .roles = roles,
@@ -229,11 +239,12 @@ pub const SecurityModule = struct {
 
     /// 验证密码
     pub fn verifyPassword(self: *Self, password: []const u8, hash: []const u8) bool {
-        // Parse hash
+        // Parse hash: $pbkdf2$<iterations>$<salt>$<hash>
         var parts = std.mem.splitSequence(u8, hash, "$");
         _ = parts.next(); // empty
         _ = parts.next(); // pbkdf2
-        _ = parts.next(); // iterations
+        const iter_str = parts.next() orelse return false;
+        const iterations = std.fmt.parseInt(u32, iter_str, 10) catch return false;
         const salt_b64 = parts.next() orelse return false;
         const expected_hash_b64 = parts.next() orelse return false;
 
@@ -246,7 +257,7 @@ pub const SecurityModule = struct {
             &derived_key,
             password,
             salt,
-            600000, // OWASP 2026 minimum
+            iterations,
             crypto.auth.hmac.sha2.HmacSha256,
         ) catch return false;
 

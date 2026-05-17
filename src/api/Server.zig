@@ -397,7 +397,7 @@ pub const Context = struct {
     pub fn sendError(self: *Context, status: u16, message: []const u8) !void {
         self.status_code = status;
         try self.setHeader("Content-Type", "application/json");
-        const err_json = try std.fmt.allocPrint(self.allocator, "{{\"code\":{d},\"message\":\"{s}\"}}", .{ status, message });
+        const err_json = try std.fmt.allocPrint(self.allocator, "{{\"code\":{d},\"msg\":\"{s}\",\"data\":null}}", .{ status, message });
         defer self.allocator.free(err_json);
         try self.response_body.appendSlice(self.allocator, err_json);
         self.responded = true;
@@ -407,7 +407,7 @@ pub const Context = struct {
     pub fn sendErrorResponse(self: *Context, status: u16, code: i32, message: []const u8) !void {
         self.status_code = status;
         try self.setHeader("Content-Type", "application/json");
-        const err_json = try std.fmt.allocPrint(self.allocator, "{{\"code\":{d},\"message\":\"{s}\"}}", .{ code, message });
+        const err_json = try std.fmt.allocPrint(self.allocator, "{{\"code\":{d},\"msg\":\"{s}\",\"data\":null}}", .{ code, message });
         defer self.allocator.free(err_json);
         try self.response_body.appendSlice(self.allocator, err_json);
         self.responded = true;
@@ -468,7 +468,7 @@ pub const Context = struct {
     /// returned value owns its memory (avoids use-after-free from arena).
     pub fn bindJson(self: *const Context, comptime T: type) !T {
         if (self.body == null) return error.NoBody;
-        var parsed = std.json.parseFromSlice(T, self.allocator, self.body.?, .{}) catch |err| {
+        var parsed = std.json.parseFromSlice(T, self.allocator, self.body.?, .{ .ignore_unknown_fields = true }) catch |err| {
             std.log.err("bindJson({s}) failed: {s} body_len={d}", .{ @typeName(T), @errorName(err), self.body.?.len });
             return error.InvalidJson;
         };

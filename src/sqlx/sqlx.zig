@@ -264,13 +264,44 @@ fn scanStruct(allocator: std.mem.Allocator, comptime T: type, row: Row, partial:
 
 fn valueToType(allocator: std.mem.Allocator, comptime T: type, val: Value) !T {
     return switch (T) {
-        i64 => if (val == .int) val.int else error.DatabaseError,
-        i32 => if (val == .int) @intCast(val.int) else error.DatabaseError,
-        u64 => if (val == .int) @intCast(val.int) else error.DatabaseError,
-        u32 => if (val == .int) @intCast(val.int) else error.DatabaseError,
-        f64 => if (val == .float) val.float else if (val == .int) @floatFromInt(val.int) else error.DatabaseError,
-        f32 => if (val == .float) @floatCast(val.float) else if (val == .int) @floatFromInt(val.int) else error.DatabaseError,
-        bool => if (val == .bool) val.bool else if (val == .int) val.int != 0 else error.DatabaseError,
+        i64 => switch (val) {
+            .int => |v| v,
+            .string => |s| std.fmt.parseInt(i64, s, 10) catch return error.DatabaseError,
+            else => error.DatabaseError,
+        },
+        i32 => switch (val) {
+            .int => |v| @intCast(v),
+            .string => |s| std.fmt.parseInt(i32, s, 10) catch return error.DatabaseError,
+            else => error.DatabaseError,
+        },
+        u64 => switch (val) {
+            .int => |v| @intCast(v),
+            .string => |s| std.fmt.parseInt(u64, s, 10) catch return error.DatabaseError,
+            else => error.DatabaseError,
+        },
+        u32 => switch (val) {
+            .int => |v| @intCast(v),
+            .string => |s| std.fmt.parseInt(u32, s, 10) catch return error.DatabaseError,
+            else => error.DatabaseError,
+        },
+        f64 => switch (val) {
+            .float => |v| v,
+            .int => |v| @floatFromInt(v),
+            .string => |s| std.fmt.parseFloat(f64, s) catch return error.DatabaseError,
+            else => error.DatabaseError,
+        },
+        f32 => switch (val) {
+            .float => |v| @floatCast(v),
+            .int => |v| @floatFromInt(v),
+            .string => |s| std.fmt.parseFloat(f32, s) catch return error.DatabaseError,
+            else => error.DatabaseError,
+        },
+        bool => switch (val) {
+            .bool => |v| v,
+            .int => |v| v != 0,
+            .string => |s| std.mem.eql(u8, s, "t") or std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "1"),
+            else => error.DatabaseError,
+        },
         []const u8 => if (val == .string) (allocator.dupe(u8, val.string) catch return error.DatabaseError) else error.DatabaseError,
         else => @compileError("Unsupported scan type: " ++ @typeName(T)),
     };
@@ -859,7 +890,7 @@ pub const PostgresConn = struct {
         var it = self.stmt_cache.iterator();
         while (it.next()) |entry| {
             var dealloc_buf: [64]u8 = undefined;
-            const sql = std.fmt.bufPrint(&dealloc_buf, "DEALLOCATE {s}", .{entry.value_ptr.*}) catch "";
+            const sql = std.fmt.bufPrintZ(&dealloc_buf, "DEALLOCATE {s}", .{entry.value_ptr.*}) catch "";
             if (self.conn != null) _ = libpq_c.PQexec(self.conn, @ptrCast(sql.ptr));
             self.allocator.free(entry.key_ptr.*);
             self.allocator.free(entry.value_ptr.*);
@@ -1241,9 +1272,11 @@ pub const PostgresStmt = struct {
 
     pub fn prepare(conn: ?*libpq_c.PGconn, allocator: std.mem.Allocator, sql: []const u8) !PostgresStmt {
         var name_buf: [32]u8 = undefined;
-        const stmt_name = try std.fmt.bufPrint(&name_buf, "stmt_{x}", .{@intFromPtr(sql.ptr)});
-        const name_copy = try allocator.dupe(u8, stmt_name);
-        const res = libpq_c.PQprepare(conn, @ptrCast(name_copy.ptr), @ptrCast(sql.ptr), 0, null);
+        const stmt_name = try std.fmt.bufPrintZ(&name_buf, "stmt_{x}", .{@intFromPtr(sql.ptr)});
+        const name_copy = try allocator.dupeZ(u8, stmt_name);
+        const sql_z = try allocator.dupeZ(u8, sql);
+        defer allocator.free(sql_z);
+        const res = libpq_c.PQprepare(conn, @ptrCast(name_copy.ptr), @ptrCast(sql_z.ptr), 0, null);
         if (res == null) return error.DatabaseError;
         defer libpq_c.PQclear(res);
         if (libpq_c.PQresultStatus(res) != libpq_c.ExecStatusType.PGRES_COMMAND_OK) return error.DatabaseError;
@@ -1326,10 +1359,18 @@ pub const PostgresStmt = struct {
 
     fn closeFn(ptr: *anyopaque) void {
         const self = @as(*PostgresStmt, @ptrCast(@alignCast(ptr)));
-        const dealloc_sql = std.fmt.allocPrint(self.allocator, "DEALLOCATE {s}", .{self.name}) catch {
-            self.allocator.free(self.name);
-            self.allocator.destroy(self);
-            return;
+        const dealloc_sql = blk: {
+            var buf: [128]u8 = undefined;
+            const s = std.fmt.bufPrintZ(&buf, "DEALLOCATE {s}", .{self.name}) catch {
+                self.allocator.free(self.name);
+                self.allocator.destroy(self);
+                return;
+            };
+            break :blk self.allocator.dupeZ(u8, s) catch {
+                self.allocator.free(self.name);
+                self.allocator.destroy(self);
+                return;
+            };
         };
         const res = libpq_c.PQexec(self.conn, @ptrCast(dealloc_sql.ptr));
         if (res) |r| libpq_c.PQclear(r);
@@ -1913,6 +1954,7 @@ pub const Client = struct {
     pub fn queryRow(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !T {
         var rows = try self.query(sql_str, args);
         defer rows.deinit();
+        for (@constCast(rows.rows)) |*row| row.arena = &rows.arena;
         if (rows.rows.len == 0) return error.NotFound;
         return try rows.rows[0].scan(self.allocator, T);
     }
@@ -1925,6 +1967,7 @@ pub const Client = struct {
     pub fn queryRowPartial(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !T {
         var rows = try self.query(sql_str, args);
         defer rows.deinit();
+        for (@constCast(rows.rows)) |*row| row.arena = &rows.arena;
         if (rows.rows.len == 0) return error.NotFound;
         return try rows.rows[0].scanPartial(self.allocator, T);
     }
