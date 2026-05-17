@@ -95,11 +95,11 @@ pub const PrometheusMetrics = struct {
             }
         }
 
-        pub fn sum(self: *Histogram) f64 {
+        pub fn sum(self: *const Histogram) f64 {
             return @bitCast(self.sum_bits.load(.monotonic));
         }
 
-        pub fn totalCount(self: *Histogram) u64 {
+        pub fn totalCount(self: *const Histogram) u64 {
             return self.count.load(.monotonic);
         }
     };

@@ -4,6 +4,7 @@ const ModuleInfo = @import("./Module.zig").ModuleInfo;
 
 /// Compile-time module scanner that extracts module metadata and performs topological sort
 pub fn scanModules(allocator: std.mem.Allocator, comptime modules: anytype) !ApplicationModules {
+    @setEvalBranchQuota(50000);
     var app_modules = ApplicationModules.init(allocator);
 
     // 1. Register all modules first (runtime registration for backward compat)
