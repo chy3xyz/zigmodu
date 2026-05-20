@@ -6,6 +6,7 @@
 const std = @import("std");
 const WsFramer = @import("../im/WsFramer.zig").WsFramer;
 const BufferPool = @import("../im/BufferPool.zig").BufferPool;
+const WsUring = @import("../im/ws_uring.zig").WsUring;
 
 /// HTTP method
 pub const Method = enum {
@@ -1105,6 +1106,7 @@ pub const Server = struct {
     global_middleware: std.ArrayList(Middleware),
     ws_handlers: std.StringHashMap(WsRoute),
     ws_buffer_pool: ?*BufferPool = null,
+    ws_uring: ?*WsUring = null,
     name: []const u8,
     running: std.atomic.Value(bool),
     listener: ?std.Io.net.Server,
@@ -1150,6 +1152,12 @@ pub const Server = struct {
     /// Without this, each WS connection stack-allocates 4KB read + write buffers.
     pub fn setWsBufferPool(self: *Server, pool: *BufferPool) void {
         self.ws_buffer_pool = pool;
+    }
+
+    /// Use io_uring for WebSocket I/O instead of fibers.
+    /// Eliminates per-connection fiber stack (6KB → 0). Linux 5.1+ only.
+    pub fn setWsUring(self: *Server, uring: *WsUring) void {
+        self.ws_uring = uring;
     }
 
     pub fn deinit(self: *Server) void {
@@ -1389,7 +1397,18 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                             return;
                         }
 
-                        // WebSocket read loop
+                        // If io_uring is available, transfer fd ownership (fiber stack released here)
+                        if (server.ws_uring) |uring| {
+                            const sock_fd = stream.socket.handle;
+                            uring.adopt(sock_fd, session, ws_route.on_message, ws_route.on_close) catch {
+                                framer.writeClose() catch {};
+                                if (@intFromPtr(ws_route.on_close) != 0) ws_route.on_close(session);
+                                return;
+                            };
+                            return; // Fiber exits — io_uring takes over
+                        }
+
+                        // WebSocket read loop (fiber path)
                         while (server.running.load(.monotonic)) {
                             const read_buf = if (server.ws_buffer_pool) |pool|
                                 pool.acquire() catch break
