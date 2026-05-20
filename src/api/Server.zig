@@ -1253,6 +1253,13 @@ pub const Server = struct {
         return handle;
     }
 
+    /// Enable SO_REUSEPORT for multi-process deployment.
+    /// Must be called before start(). On POSIX, reuse_address already sets
+    /// SO_REUSEPORT; this is a no-op. Call this to document intent.
+    pub fn enableReusePort(self: *Server) void {
+        _ = self;
+    }
+
     fn runLoop(self: *Server) void {
         self.start() catch |err| {
             std.log.err("[Server] Background accept loop failed: {}", .{err});
