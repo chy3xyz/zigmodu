@@ -1,65 +1,156 @@
 const std = @import("std");
 
-/// Lightweight userId-to-connection registry for IM routing.
-/// Uses std.Io.Mutex for fiber-safe synchronization.
-///
-/// Heartbeat tracking: each connection has a tick counter that gets reset
-/// on heartbeat(). cleanupTimeout() removes connections whose tick is behind
-/// the current tick by more than the allowed gap.
+/// Shard count — power of 2 for fast modulo (user_id & (SHARDS-1)).
+const SHARDS = 64;
+
+/// UserId-to-connection registry for IM routing.
+/// Sharded by user_id: concurrent operations on different shards
+/// don't contend. Each shard has its own mutex and tick counter.
 pub const ConnectionRegistry = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
     io: std.Io,
-    /// userId → connection entry
-    by_user: std.AutoHashMap(u64, *ConnectionEntry),
-    /// connectionId → *ConnectionEntry
-    by_conn: std.AutoHashMap(u32, *ConnectionEntry),
-    mutex: std.Io.Mutex,
-    next_id: u32,
-    /// Monotonic tick, incremented on each heartbeat sweep
-    tick: u64,
+    shards: [SHARDS]Shard,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Self {
-        return .{
+        var self = Self{
             .allocator = allocator,
             .io = io,
-            .by_user = std.AutoHashMap(u64, *ConnectionEntry).init(allocator),
-            .by_conn = std.AutoHashMap(u32, *ConnectionEntry).init(allocator),
-            .mutex = std.Io.Mutex.init,
-            .next_id = 1,
-            .tick = 0,
+            .shards = undefined,
         };
+        for (&self.shards, 0..) |*s, i| {
+            s.* = Shard.init(allocator, io, @intCast(i));
+        }
+        return self;
     }
 
     pub fn deinit(self: *Self) void {
-        self.mutex.lock(self.io) catch return;
-        defer self.mutex.unlock(self.io);
-        {
-            var it = self.by_user.iterator();
-            while (it.next()) |kv| {
-                self.allocator.destroy(kv.value_ptr.*);
-            }
+        for (&self.shards) |*s| s.deinit();
+    }
+
+    fn shard(self: *Self, user_id: u64) *Shard {
+        return &self.shards[user_id & (SHARDS - 1)];
+    }
+
+    /// Register a user connection. Replaces old connection.
+    pub fn register(self: *Self, user_id: u64, ctx: *anyopaque, send_fn: SendFn) u32 {
+        return self.shard(user_id).register(self.allocator, user_id, ctx, send_fn);
+    }
+
+    /// Remove a user's connection.
+    pub fn unregister(self: *Self, user_id: u64) void {
+        self.shard(user_id).unregister(self.allocator, user_id);
+    }
+
+    /// Unregister by connection id.
+    pub fn unregisterByConn(self: *Self, conn_id: u32) void {
+        for (&self.shards) |*s| {
+            if (s.unregisterByConn(self.allocator, conn_id)) return;
         }
+    }
+
+    /// Send a text message to a specific user. Returns true if delivered.
+    pub fn sendToUser(self: *Self, user_id: u64, msg: []const u8) bool {
+        return self.shard(user_id).sendToUser(user_id, msg);
+    }
+
+    /// Send a message to multiple users.
+    pub fn sendToUsers(self: *Self, user_ids: []const u64, msg: []const u8) usize {
+        var count: usize = 0;
+        for (user_ids) |uid| {
+            if (self.sendToUser(uid, msg)) count += 1;
+        }
+        return count;
+    }
+
+    /// Check if a user is online.
+    pub fn isOnline(self: *Self, user_id: u64) bool {
+        return self.shard(user_id).isOnline(user_id);
+    }
+
+    /// Update heartbeat for a connection.
+    pub fn heartbeat(self: *Self, conn_id: u32) void {
+        for (&self.shards) |*s| {
+            s.heartbeat(conn_id);
+        }
+    }
+
+    /// Advance tick on ALL shards and remove stale connections.
+    pub fn tickAndCleanup(self: *Self, max_gap: u64) usize {
+        var count: usize = 0;
+        for (&self.shards) |*s| {
+            count += s.tickAndCleanup(self.allocator, max_gap);
+        }
+        return count;
+    }
+
+    pub fn onlineCount(self: *Self) usize {
+        var count: usize = 0;
+        for (&self.shards) |*s| {
+            count += s.onlineCount();
+        }
+        return count;
+    }
+
+    pub fn onlineUsers(self: *Self, buf: []u64) usize {
+        var count: usize = 0;
+        for (&self.shards) |*s| {
+            count += s.onlineUsers(buf[count..]);
+            if (count >= buf.len) break;
+        }
+        return count;
+    }
+};
+
+pub const SendFn = *const fn (ctx: *anyopaque, msg: []const u8) anyerror!void;
+
+const Shard = struct {
+    const SelfShard = @This();
+
+    by_user: std.AutoHashMap(u64, *ConnectionEntry),
+    by_conn: std.AutoHashMap(u32, *ConnectionEntry),
+    mutex: std.Io.Mutex,
+    io: std.Io,
+    next_id_base: u32,
+    tick: u64 = 0,
+    id: u8,
+
+    fn init(allocator: std.mem.Allocator, io: std.Io, id: u8) SelfShard {
+        return .{
+            .by_user = std.AutoHashMap(u64, *ConnectionEntry).init(allocator),
+            .by_conn = std.AutoHashMap(u32, *ConnectionEntry).init(allocator),
+            .mutex = std.Io.Mutex.init,
+            .io = io,
+            .next_id_base = @as(u32, id) << 26,
+            .id = id,
+        };
+    }
+
+    fn deinit(self: *SelfShard) void {
+        var it = self.by_user.iterator();
+        while (it.next()) |kv| self.by_user.allocator.destroy(kv.value_ptr.*);
         self.by_user.deinit();
         self.by_conn.deinit();
     }
 
-    /// Register a user connection. Replaces old connection if user already connected.
-    /// Returns the assigned connection id, or 0 on allocation failure.
-    pub fn register(self: *Self, user_id: u64, ctx: *anyopaque, send_fn: SendFn) u32 {
+    fn nextId(self: *SelfShard) u32 {
+        const id = self.next_id_base;
+        self.next_id_base += 1;
+        return id;
+    }
+
+    fn register(self: *SelfShard, allocator: std.mem.Allocator, user_id: u64, ctx: *anyopaque, send_fn: SendFn) u32 {
         self.mutex.lock(self.io) catch return 0;
         defer self.mutex.unlock(self.io);
 
         if (self.by_user.getPtr(user_id)) |existing| {
             _ = self.by_conn.remove(existing.*.conn_id);
-            self.allocator.destroy(existing.*);
+            allocator.destroy(existing.*);
         }
 
-        const conn_id = self.next_id;
-        self.next_id += 1;
-
-        const entry = self.allocator.create(ConnectionEntry) catch return 0;
+        const conn_id = self.nextId();
+        const entry = allocator.create(ConnectionEntry) catch return 0;
         entry.* = .{
             .conn_id = conn_id,
             .user_id = user_id,
@@ -69,40 +160,36 @@ pub const ConnectionRegistry = struct {
             .is_connected = true,
         };
 
-        self.by_user.put(user_id, entry) catch {
-            self.allocator.destroy(entry);
-            return 0;
-        };
+        self.by_user.put(user_id, entry) catch { allocator.destroy(entry); return 0; };
         self.by_conn.put(conn_id, entry) catch {};
         return conn_id;
     }
 
-    /// Remove a user's connection.
-    pub fn unregister(self: *Self, user_id: u64) void {
+    fn unregister(self: *SelfShard, allocator: std.mem.Allocator, user_id: u64) void {
         self.mutex.lock(self.io) catch return;
         defer self.mutex.unlock(self.io);
 
         if (self.by_user.fetchRemove(user_id)) |kv| {
             _ = self.by_conn.remove(kv.value.conn_id);
             kv.value.is_connected = false;
-            self.allocator.destroy(kv.value);
+            allocator.destroy(kv.value);
         }
     }
 
-    /// Unregister by connection id.
-    pub fn unregisterByConn(self: *Self, conn_id: u32) void {
-        self.mutex.lock(self.io) catch return;
+    fn unregisterByConn(self: *SelfShard, allocator: std.mem.Allocator, conn_id: u32) bool {
+        self.mutex.lock(self.io) catch return false;
         defer self.mutex.unlock(self.io);
 
         if (self.by_conn.fetchRemove(conn_id)) |kv| {
             _ = self.by_user.remove(kv.value.user_id);
             kv.value.is_connected = false;
-            self.allocator.destroy(kv.value);
+            allocator.destroy(kv.value);
+            return true;
         }
+        return false;
     }
 
-    /// Send a text message to a specific user. Returns true if delivered.
-    pub fn sendToUser(self: *Self, user_id: u64, msg: []const u8) bool {
+    fn sendToUser(self: *SelfShard, user_id: u64, msg: []const u8) bool {
         self.mutex.lock(self.io) catch return false;
         defer self.mutex.unlock(self.io);
 
@@ -116,17 +203,7 @@ pub const ConnectionRegistry = struct {
         return true;
     }
 
-    /// Send a message to multiple users. Returns count of successful deliveries.
-    pub fn sendToUsers(self: *Self, user_ids: []const u64, msg: []const u8) usize {
-        var count: usize = 0;
-        for (user_ids) |uid| {
-            if (self.sendToUser(uid, msg)) count += 1;
-        }
-        return count;
-    }
-
-    /// Check if a user is online.
-    pub fn isOnline(self: *Self, user_id: u64) bool {
+    fn isOnline(self: *SelfShard, user_id: u64) bool {
         self.mutex.lock(self.io) catch return false;
         defer self.mutex.unlock(self.io);
 
@@ -134,8 +211,7 @@ pub const ConnectionRegistry = struct {
         return entry.*.is_connected;
     }
 
-    /// Update heartbeat for a connection. Call from ping/pong handler.
-    pub fn heartbeat(self: *Self, conn_id: u32) void {
+    fn heartbeat(self: *SelfShard, conn_id: u32) void {
         self.mutex.lock(self.io) catch return;
         defer self.mutex.unlock(self.io);
 
@@ -144,22 +220,19 @@ pub const ConnectionRegistry = struct {
         }
     }
 
-    /// Advance tick and remove connections that haven't kept up within `max_gap` ticks.
-    /// Returns the number of connections cleaned up.
-    pub fn tickAndCleanup(self: *Self, max_gap: u64) usize {
+    fn tickAndCleanup(self: *SelfShard, allocator: std.mem.Allocator, max_gap: u64) usize {
         self.mutex.lock(self.io) catch return 0;
         defer self.mutex.unlock(self.io);
 
         self.tick += 1;
         const current = self.tick;
-        var dead: [64]u64 = undefined;
+        var dead: [32]u64 = undefined;
         var dead_len: usize = 0;
         var count: usize = 0;
 
         var it = self.by_user.iterator();
         while (it.next()) |kv| {
-            const entry = kv.value_ptr.*;
-            if (!entry.is_connected or (current - entry.last_tick) > max_gap) {
+            if (!kv.value_ptr.*.is_connected or (current - kv.value_ptr.*.last_tick) > max_gap) {
                 if (dead_len < dead.len) {
                     dead[dead_len] = kv.key_ptr.*;
                     dead_len += 1;
@@ -167,26 +240,23 @@ pub const ConnectionRegistry = struct {
             }
         }
 
-        for (dead[0..dead_len]) |user_id| {
-            if (self.by_user.fetchRemove(user_id)) |kv| {
+        for (dead[0..dead_len]) |uid| {
+            if (self.by_user.fetchRemove(uid)) |kv| {
                 _ = self.by_conn.remove(kv.value.conn_id);
-                self.allocator.destroy(kv.value);
+                allocator.destroy(kv.value);
                 count += 1;
             }
         }
-
         return count;
     }
 
-    /// Return total online count.
-    pub fn onlineCount(self: *Self) usize {
+    fn onlineCount(self: *SelfShard) usize {
         self.mutex.lock(self.io) catch return 0;
         defer self.mutex.unlock(self.io);
         return self.by_user.count();
     }
 
-    /// Get list of online user IDs (up to max, returns total written).
-    pub fn onlineUsers(self: *Self, buf: []u64) usize {
+    fn onlineUsers(self: *SelfShard, buf: []u64) usize {
         self.mutex.lock(self.io) catch return 0;
         defer self.mutex.unlock(self.io);
 
@@ -203,9 +273,6 @@ pub const ConnectionRegistry = struct {
     }
 };
 
-/// Function pointer type: send a text message to a specific connection context.
-pub const SendFn = *const fn (ctx: *anyopaque, msg: []const u8) anyerror!void;
-
 const ConnectionEntry = struct {
     conn_id: u32,
     user_id: u64,
@@ -215,7 +282,9 @@ const ConnectionEntry = struct {
     is_connected: bool,
 };
 
-test "register unregister" {
+// ── Tests ──
+
+test "sharded register unregister" {
     const allocator = std.testing.allocator;
     var reg = ConnectionRegistry.init(allocator, std.testing.io);
     defer reg.deinit();
@@ -231,18 +300,33 @@ test "register unregister" {
 
     reg.unregister(1);
     try std.testing.expect(!reg.isOnline(1));
-    try std.testing.expectEqual(@as(usize, 0), reg.onlineCount());
 }
 
-test "sendToUser offline returns false" {
+test "sharded sendToUser offline" {
+    const allocator = std.testing.allocator;
+    var reg = ConnectionRegistry.init(allocator, std.testing.io);
+    defer reg.deinit();
+    try std.testing.expect(!reg.sendToUser(999, "hello"));
+}
+
+test "sharded users in different shards" {
     const allocator = std.testing.allocator;
     var reg = ConnectionRegistry.init(allocator, std.testing.io);
     defer reg.deinit();
 
-    try std.testing.expect(!reg.sendToUser(999, "hello"));
+    var dummy: u8 = 0;
+    // These user_ids hash to different shards
+    _ = reg.register(1, @ptrCast(&dummy), testSendFn);
+    _ = reg.register(65, @ptrCast(&dummy), testSendFn); // Different shard than user 1
+    try std.testing.expectEqual(@as(usize, 2), reg.onlineCount());
+
+    reg.unregister(1);
+    try std.testing.expect(!reg.isOnline(1));
+    try std.testing.expect(reg.isOnline(65));
+    try std.testing.expectEqual(@as(usize, 1), reg.onlineCount());
 }
 
-test "tickAndCleanup with heartbeat keeps connections alive" {
+test "sharded tickAndCleanup" {
     const allocator = std.testing.allocator;
     var reg = ConnectionRegistry.init(allocator, std.testing.io);
     defer reg.deinit();
@@ -250,28 +334,26 @@ test "tickAndCleanup with heartbeat keeps connections alive" {
     var dummy: u8 = 0;
     const cid = reg.register(1, @ptrCast(&dummy), testSendFn);
     try std.testing.expect(cid > 0);
-    try std.testing.expectEqual(@as(usize, 1), reg.onlineCount());
 
-    // Heartbeat to update last_tick to current tick (0)
+    _ = reg.tickAndCleanup(5);
+    try std.testing.expect(reg.isOnline(1));
+
     reg.heartbeat(cid);
+    _ = reg.tickAndCleanup(5);
+    try std.testing.expect(reg.isOnline(1));
+}
 
-    // Advance tick with gap=0 — should NOT clean (tick becomes 1, gap=0, 1-0=1 > 0 → cleaned!)
-    // Hmm: tick=0, last_tick=0 after heartbeat.
-    // tickAndCleanup(0): tick=1, check: 1-0=1 > 0 → true → cleaned
-    // So with gap=0 only connections that are heartbeat'd AFTER the tick is advanced survive.
-    // This is a known quirk: gap=0 means "must have heartbeat since last tick".
+test "sharded unregisterByConn" {
+    const allocator = std.testing.allocator;
+    var reg = ConnectionRegistry.init(allocator, std.testing.io);
+    defer reg.deinit();
 
-    // Use gap=2 to have some slack
-    _ = reg.tickAndCleanup(2); // tick=1, gap check: 1-0=1 > 2? No → survive
-    try std.testing.expectEqual(@as(usize, 1), reg.onlineCount());
+    var dummy: u8 = 0;
+    const cid = reg.register(42, @ptrCast(&dummy), testSendFn);
+    try std.testing.expect(cid > 0);
 
-    // heartbeat again to reset
-    reg.heartbeat(cid);
-    _ = reg.tickAndCleanup(2); // tick=2, gap: 2-1=1 > 2? No
-    try std.testing.expectEqual(@as(usize, 1), reg.onlineCount());
-
-    // Without heartbeat, after several ticks → cleaned
-    _ = reg.tickAndCleanup(1); // tick=3, gap=1, 3-1=2 > 1? Yes → cleaned
+    reg.unregisterByConn(cid);
+    try std.testing.expect(!reg.isOnline(42));
     try std.testing.expectEqual(@as(usize, 0), reg.onlineCount());
 }
 

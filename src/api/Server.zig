@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const WsFramer = @import("../im/WsFramer.zig").WsFramer;
+const BufferPool = @import("../im/BufferPool.zig").BufferPool;
 
 /// HTTP method
 pub const Method = enum {
@@ -1103,6 +1104,7 @@ pub const Server = struct {
     router: Router,
     global_middleware: std.ArrayList(Middleware),
     ws_handlers: std.StringHashMap(WsRoute),
+    ws_buffer_pool: ?*BufferPool = null,
     name: []const u8,
     running: std.atomic.Value(bool),
     listener: ?std.Io.net.Server,
@@ -1142,6 +1144,12 @@ pub const Server = struct {
             .request_timeout_ms = config.request_timeout_ms,
             .max_requests_per_conn = config.max_requests_per_conn,
         };
+    }
+
+    /// Attach a shared buffer pool for WebSocket frame I/O.
+    /// Without this, each WS connection stack-allocates 4KB read + write buffers.
+    pub fn setWsBufferPool(self: *Server, pool: *BufferPool) void {
+        self.ws_buffer_pool = pool;
     }
 
     pub fn deinit(self: *Server) void {
@@ -1375,9 +1383,16 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                         }
 
                         // WebSocket read loop
-                        var read_buf: [4096]u8 = undefined;
                         while (server.running.load(.monotonic)) {
-                            const frame = framer.readFrame(&read_buf) catch break;
+                            const read_buf = if (server.ws_buffer_pool) |pool|
+                                pool.acquire() catch break
+                            else
+                                server.allocator.alloc(u8, 4096) catch break;
+                            defer {
+                                if (server.ws_buffer_pool) |pool| pool.release(read_buf)
+                                else server.allocator.free(read_buf);
+                            }
+                            const frame = framer.readFrame(read_buf) catch break;
                             switch (frame.opcode) {
                                 0x1 => { // Text
                                     if (@intFromPtr(ws_route.on_message) != 0) ws_route.on_message(session, frame.payload);
