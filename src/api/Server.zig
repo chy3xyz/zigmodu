@@ -140,12 +140,13 @@ pub const RouteGroup = struct {
 };
 
 /// WebSocket connect callback: called after successful handshake.
-/// Return true to accept, false to reject.
-pub const WsConnectFn = *const fn (ctx: *Context) bool;
+/// Return session pointer (non-null accepts, null rejects).
+/// The session is opaque to the server; the gateway owns its lifetime.
+pub const WsConnectFn = *const fn (ctx: *Context, framer: *anyopaque) ?*anyopaque;
 /// WebSocket message callback: called for each text frame.
-pub const WsMessageFn = *const fn (ctx: *Context, msg: []const u8) void;
+pub const WsMessageFn = *const fn (session: ?*anyopaque, msg: []const u8) void;
 /// WebSocket close callback: called when the connection closes.
-pub const WsCloseFn = *const fn (ctx: *Context) void;
+pub const WsCloseFn = *const fn (session: ?*anyopaque) void;
 
 pub const WsRoute = struct {
     on_connect: WsConnectFn,
@@ -1365,10 +1366,11 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                         };
                         ctx.upgraded = true;
 
-                        // Call on_connect
-                        if (!ws_route.on_connect(&ctx)) {
+                        // Call on_connect — gateway returns session pointer (null = reject)
+                        const session = ws_route.on_connect(&ctx, @ptrCast(&framer));
+                        if (session == null) {
                             framer.writeClose() catch {};
-                            if (@intFromPtr(ws_route.on_close) != 0) ws_route.on_close(&ctx);
+                            if (@intFromPtr(ws_route.on_close) != 0) ws_route.on_close(null);
                             return;
                         }
 
@@ -1378,7 +1380,7 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                             const frame = framer.readFrame(&read_buf) catch break;
                             switch (frame.opcode) {
                                 0x1 => { // Text
-                                    if (@intFromPtr(ws_route.on_message) != 0) ws_route.on_message(&ctx, frame.payload);
+                                    if (@intFromPtr(ws_route.on_message) != 0) ws_route.on_message(session, frame.payload);
                                 },
                                 0x8 => break, // Close
                                 0x9 => { // Ping → Pong
@@ -1388,7 +1390,7 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                             }
                         }
 
-                        if (@intFromPtr(ws_route.on_close) != 0) ws_route.on_close(&ctx);
+                        if (@intFromPtr(ws_route.on_close) != 0) ws_route.on_close(session);
                         return; // Connection done — don't continue HTTP loop
                     }
                 }
