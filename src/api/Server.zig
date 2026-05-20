@@ -4,6 +4,7 @@
 //! Aligned with go-zero's rest package.
 
 const std = @import("std");
+const WsFramer = @import("../im/WsFramer.zig").WsFramer;
 
 /// HTTP method
 pub const Method = enum {
@@ -119,6 +120,38 @@ pub const RouteGroup = struct {
     pub fn options(self: *RouteGroup, path: []const u8, handler: HandlerFn, user_data: ?*anyopaque) !void {
         try self.add(.OPTIONS, path, handler, user_data);
     }
+
+    /// Register a WebSocket upgrade endpoint.
+    /// on_connect is called after successful handshake (user_data = route user_data).
+    /// on_message is called for each text frame received.
+    /// on_close is called when the connection closes.
+    pub fn ws(self: *RouteGroup, path: []const u8, on_connect: WsConnectFn, on_message: WsMessageFn, on_close: WsCloseFn, user_data: ?*anyopaque) !void {
+        const full_path = try self.joinPath(self.server.allocator, path);
+        defer self.server.allocator.free(full_path);
+
+        const dup_path = try self.server.allocator.dupe(u8, full_path);
+        try self.server.ws_handlers.put(dup_path, .{
+            .on_connect = on_connect,
+            .on_message = on_message,
+            .on_close = on_close,
+            .user_data = user_data,
+        });
+    }
+};
+
+/// WebSocket connect callback: called after successful handshake.
+/// Return true to accept, false to reject.
+pub const WsConnectFn = *const fn (ctx: *Context) bool;
+/// WebSocket message callback: called for each text frame.
+pub const WsMessageFn = *const fn (ctx: *Context, msg: []const u8) void;
+/// WebSocket close callback: called when the connection closes.
+pub const WsCloseFn = *const fn (ctx: *Context) void;
+
+pub const WsRoute = struct {
+    on_connect: WsConnectFn,
+    on_message: WsMessageFn,
+    on_close: WsCloseFn,
+    user_data: ?*anyopaque,
 };
 
 /// Field source for auto parameter binding
@@ -1068,6 +1101,7 @@ pub const Server = struct {
     port: u16,
     router: Router,
     global_middleware: std.ArrayList(Middleware),
+    ws_handlers: std.StringHashMap(WsRoute),
     name: []const u8,
     running: std.atomic.Value(bool),
     listener: ?std.Io.net.Server,
@@ -1097,6 +1131,7 @@ pub const Server = struct {
             .port = config.port,
             .router = Router.init(allocator),
             .global_middleware = std.ArrayList(Middleware).empty,
+            .ws_handlers = std.StringHashMap(WsRoute).init(allocator),
             .name = config.name,
             .running = std.atomic.Value(bool).init(false),
             .listener = null,
@@ -1111,6 +1146,13 @@ pub const Server = struct {
     pub fn deinit(self: *Server) void {
         self.router.deinit();
         self.global_middleware.deinit(self.allocator);
+        {
+            var it = self.ws_handlers.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+            }
+        }
+        self.ws_handlers.deinit();
     }
 
     pub fn addRoute(self: *Server, route: Route) !void {
@@ -1304,6 +1346,52 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
             const ctype = ctx.headers.get("content-type") orelse "";
             if (std.mem.startsWith(u8, ctype, "application/x-www-form-urlencoded")) {
                 ctx.form = parseFormBody(arena_alloc, body) catch null;
+            }
+        }
+
+        // ── WebSocket upgrade check ──
+        if (server.ws_handlers.get(request.path)) |ws_route| {
+            if (std.mem.eql(u8, request.method.toString(), "GET")) {
+                const upgrade_hdr = ctx.headers.get("upgrade") orelse ctx.headers.get("Upgrade") orelse "";
+                if (std.ascii.eqlIgnoreCase(upgrade_hdr, "websocket")) {
+                    const ws_key = ctx.headers.get("sec-websocket-key") orelse ctx.headers.get("Sec-WebSocket-Key") orelse "";
+                    if (ws_key.len > 0) {
+                        ctx.user_data = ws_route.user_data;
+                        // Perform handshake
+                        var framer = WsFramer.init(stream, server.io);
+                        framer.handshake(ws_key) catch {
+                            ctx.sendError(400, "WebSocket handshake failed") catch {};
+                            return;
+                        };
+                        ctx.upgraded = true;
+
+                        // Call on_connect
+                        if (!ws_route.on_connect(&ctx)) {
+                            framer.writeClose() catch {};
+                            if (@intFromPtr(ws_route.on_close) != 0) ws_route.on_close(&ctx);
+                            return;
+                        }
+
+                        // WebSocket read loop
+                        var read_buf: [4096]u8 = undefined;
+                        while (server.running.load(.monotonic)) {
+                            const frame = framer.readFrame(&read_buf) catch break;
+                            switch (frame.opcode) {
+                                0x1 => { // Text
+                                    if (@intFromPtr(ws_route.on_message) != 0) ws_route.on_message(&ctx, frame.payload);
+                                },
+                                0x8 => break, // Close
+                                0x9 => { // Ping → Pong
+                                    framer.writePong(frame.payload) catch break;
+                                },
+                                else => {},
+                            }
+                        }
+
+                        if (@intFromPtr(ws_route.on_close) != 0) ws_route.on_close(&ctx);
+                        return; // Connection done — don't continue HTTP loop
+                    }
+                }
             }
         }
 

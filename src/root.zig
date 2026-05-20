@@ -128,6 +128,7 @@ pub const WebMonitor = @import("extensions/WebMonitor.zig").WebMonitor;
 pub const WebSocketServer = @import("extensions/WebSocket.zig").WebSocketServer;
 pub const WebSocketClient = @import("extensions/WebSocket.zig").WebSocketClient;
 pub const WebSocketMonitor = @import("extensions/WebSocket.zig").WebSocketMonitor;
+pub const im = @import("im/ConnectionRegistry.zig");
 pub const GrpcServiceRegistry = @import("extensions/GrpcTransport.zig").GrpcServiceRegistry;
 pub const GrpcClient = @import("extensions/GrpcTransport.zig").GrpcClient;
 pub const GrpcStatusCode = @import("extensions/GrpcTransport.zig").GrpcStatusCode;
