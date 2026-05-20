@@ -4,7 +4,10 @@ const builtin = @import("builtin");
 const linux = if (builtin.os.tag == .linux) std.os.linux else struct {
     pub const fd_t = i32;
     pub const io_uring_cqe = extern struct { user_data: u64 = 0, res: i32 = 0, flags: u32 = 0 };
-    pub const io_uring_sqe = extern struct {};
+    pub const io_uring_sqe = extern struct {
+        opcode: u8 = 0, flags: u8 = 0, ioprio: u16 = 0, fd: i32 = 0,
+        off: u64 = 0, addr: u64 = 0, len: u32 = 0, user_data: u64 = 0,
+    };
     pub const IORING_OP_READ: u8 = 22;
     pub const IORING_OP_WRITE: u8 = 23;
     pub fn close(_: i32) void {}
@@ -141,7 +144,7 @@ pub const WsUring = struct {
         sqe.opcode = linux.IORING_OP_READ;
         sqe.fd = conn.fd;
         sqe.addr = @intFromPtr(&conn.buf[conn.data_offset + conn.data_len]);
-        sqe.len = Conn.BufSize - conn.data_offset - conn.data_len;
+        sqe.len = @intCast(Conn.BufSize - conn.data_offset - conn.data_len);
         sqe.user_data = @as(u64, @intCast(conn.fd));
     }
 

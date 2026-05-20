@@ -1400,9 +1400,9 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                         // If io_uring is available, transfer fd ownership (fiber stack released here)
                         if (server.ws_uring) |uring| {
                             const sock_fd = stream.socket.handle;
-                            uring.adopt(sock_fd, session, ws_route.on_message, ws_route.on_close) catch {
+                            uring.adopt(sock_fd, session.?, ws_route.on_message, ws_route.on_close) catch {
                                 framer.writeClose() catch {};
-                                if (@intFromPtr(ws_route.on_close) != 0) ws_route.on_close(session);
+                                if (@intFromPtr(ws_route.on_close) != 0) ws_route.on_close(session.?);
                                 return;
                             };
                             return; // Fiber exits — io_uring takes over
