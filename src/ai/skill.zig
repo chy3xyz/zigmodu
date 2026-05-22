@@ -105,7 +105,7 @@ pub const SkillRegistry = struct {
     }
 
     /// List all tool names.
-    pub fn names(self: *Self, buf: []const []const u8) usize {
+    pub fn names(self: *Self, buf: [][]const u8) usize {
         self.mutex.lock(self.io) catch return 0;
         defer self.mutex.unlock(self.io);
 
