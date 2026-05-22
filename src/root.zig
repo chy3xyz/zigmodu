@@ -129,6 +129,7 @@ pub const WebSocketServer = @import("extensions/WebSocket.zig").WebSocketServer;
 pub const WebSocketClient = @import("extensions/WebSocket.zig").WebSocketClient;
 pub const WebSocketMonitor = @import("extensions/WebSocket.zig").WebSocketMonitor;
 pub const im = @import("im/im.zig");
+pub const ai = @import("ai/ai.zig");
 pub const GrpcServiceRegistry = @import("extensions/GrpcTransport.zig").GrpcServiceRegistry;
 pub const GrpcClient = @import("extensions/GrpcTransport.zig").GrpcClient;
 pub const GrpcStatusCode = @import("extensions/GrpcTransport.zig").GrpcStatusCode;
