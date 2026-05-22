@@ -32,6 +32,11 @@ pub const SqlxBackend = struct {
         };
     }
 
+    /// Alias for queryRow — returns single result or null.
+    pub fn queryOne(self: @This(), comptime T: type, sql_str: []const u8, args: []const Value) !?T {
+        return self.queryRow(T, sql_str, args);
+    }
+
     pub fn queryRows(self: @This(), comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
         return self.client.queryRows(T, sql_str, args);
     }

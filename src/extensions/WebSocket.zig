@@ -110,7 +110,7 @@ pub const WebSocketServer = struct {
             const response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
             var write_buf: [256]u8 = undefined;
             var w = conn.writer(self.io, &write_buf);
-            _ = w.writeAll(response) catch {};
+            _ = w.interface.writeAll(response) catch {};
             return;
         };
         // Validate Origin header if allowed_origins is configured
@@ -128,7 +128,7 @@ pub const WebSocketServer = struct {
                     const response = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
                     var write_buf: [256]u8 = undefined;
                     var w = conn.writer(self.io, &write_buf);
-                    _ = w.writeAll(response) catch {};
+                    _ = w.interface.writeAll(response) catch {};
                     return;
                 }
             }
@@ -159,7 +159,7 @@ pub const WebSocketServer = struct {
 
         var write_buf: [4096]u8 = undefined;
         var w = conn.writer(self.io, &write_buf);
-        _ = w.writeAll(response) catch |err| {
+        _ = w.interface.writeAll(response) catch |err| {
             std.log.err("[WebSocketServer] Handshake write error: {}", .{err});
             return;
         };
@@ -375,8 +375,8 @@ pub const WebSocketClient = struct {
 
         var write_buf: [4096]u8 = undefined;
         var w = self.stream.writer(self.io, &write_buf);
-        _ = w.writeAll(header_buf[0..header_len]) catch return error.NotConnected;
-        _ = w.writeAll(payload) catch return error.NotConnected;
+        _ = w.interface.writeAll(header_buf[0..header_len]) catch return error.NotConnected;
+        _ = w.interface.writeAll(payload) catch return error.NotConnected;
     }
 };
 
