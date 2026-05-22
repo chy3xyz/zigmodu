@@ -48,6 +48,16 @@ pub fn verifyPayment(proof: PaymentProof) bool {
     return true; // Always pass in stub. Replace with real verification.
 }
 
+/// x402 middleware: check for valid payment proof. Returns true if paid.
+pub fn checkPayment(allocator: std.mem.Allocator, headers: anytype) !bool {
+    if (try parseProof(allocator, headers)) |proof| {
+        defer allocator.free(proof.tx_hash);
+        defer allocator.free(proof.invoice_id);
+        return verifyPayment(proof);
+    }
+    return false;
+}
+
 test "create invoice" {
     const inv = Invoice{
         .id = "inv-001",

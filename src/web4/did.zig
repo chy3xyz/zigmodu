@@ -107,6 +107,47 @@ fn encodeBase58Btc(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     return result;
 }
 
+/// Resolve a did:key string → DidKey (public key only, no signing capability).
+pub fn resolve(allocator: std.mem.Allocator, did: []const u8) !DidKey {
+    if (!std.mem.startsWith(u8, did, "did:key:z")) return error.InvalidDid;
+    const b58 = did["did:key:z".len..];
+    const decoded = try decodeBase58Btc(allocator, b58);
+    defer allocator.free(decoded);
+    if (decoded.len < 35) return error.InvalidDid;
+    if (decoded[0] != 0x01 or decoded[1] != 0xed) return error.UnsupportedDidMethod;
+    var pk: [32]u8 = undefined;
+    @memcpy(&pk, decoded[2..34]);
+    const resolved_did = try DidKey.formatDidKey(allocator, pk);
+    var sk: [64]u8 = [_]u8{0} ** 64;
+    @memcpy(sk[32..64], &pk);
+    return DidKey{ .secret_key = sk, .public_key = pk, .did = resolved_did };
+}
+
+fn decodeBase58Btc(allocator: std.mem.Allocator, encoded: []const u8) ![]const u8 {
+    const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    var data = try allocator.alloc(u8, encoded.len * 2);
+    @memset(data, 0);
+    var data_len: usize = 0;
+    for (encoded) |ch| {
+        const idx = std.mem.indexOfScalar(u8, alphabet, ch) orelse return error.InvalidBase58;
+        var carry: u32 = @intCast(idx);
+        var i: usize = 0;
+        while (i < data_len or carry != 0) : (i += 1) {
+            if (i < data_len) carry += @as(u32, data[i]) * 58;
+            data[i] = @intCast(carry % 256);
+            carry /= 256;
+        }
+        data_len = i;
+    }
+    var zeroes: usize = 0;
+    while (zeroes < encoded.len and encoded[zeroes] == '1') : (zeroes += 1) {}
+    const result = try allocator.alloc(u8, zeroes + data_len);
+    @memset(result[0..zeroes], 0);
+    for (0..data_len) |i| result[zeroes + i] = data[data_len - 1 - i];
+    allocator.free(data);
+    return result;
+}
+
 // ── Verifiable Credential ──
 
 pub const VerifiableCredential = struct {
@@ -142,7 +183,16 @@ pub fn issueCredential(allocator: std.mem.Allocator, issuer: *DidKey, vc: *Verif
     };
 }
 
-/// Verify a credential's proof against the issuer's public key.
+// Verify a credential's proof against the issuer's public key.
+test "resolve did:key round-trip" {
+    const allocator = std.testing.allocator;
+    const did = DidKey.generate(allocator, std.testing.io);
+    defer allocator.free(did.did);
+    const resolved = try resolve(allocator, did.did);
+    defer allocator.free(resolved.did);
+    try std.testing.expect(std.mem.eql(u8, &did.public_key, &resolved.public_key));
+}
+
 pub fn verifyCredential(allocator: std.mem.Allocator, issuer: *DidKey, vc: *VerifiableCredential) !bool {
     if (vc.proof == null) return false;
     var buf = std.ArrayList(u8).empty;
