@@ -140,7 +140,7 @@ pub const ProtoParser = @import("extensions/GrpcTransport.zig").ProtoParser;
 // 7. SCHEDULER
 // ============================================================
 pub const cron = @import("scheduler/Cron.zig");
-pub const ScheduledTask = @import("scheduler/ScheduledTask.zig").ScheduledTask;
+pub const TaskScheduler = @import("scheduler/ScheduledTask.zig").TaskScheduler;
 
 // ============================================================
 // 8. UTILITIES
