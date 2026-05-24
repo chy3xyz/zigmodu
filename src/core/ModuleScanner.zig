@@ -39,19 +39,8 @@ pub fn scanModules(allocator: std.mem.Allocator, comptime modules: anytype) !App
         });
     }
 
-    // 2. Perform topological sort at comptime and cache the result
-    // Uses runtime visitor (Lifecycle.visitModule) to avoid comptime ++ edge cases
-    // with non-empty dependencies and module names containing '/'.
-    const sorted_names = comptime blk: {
-        var names: []const []const u8 = &[_][]const u8{};
-        for (modules) |mod| {
-            names = names ++ [_][]const u8{mod.info.name};
-        }
-        break :blk names;
-    };
-
-    // Use runtime topological sort for correct dependency ordering
-    _ = sorted_names;
+    // 2. Runtime topological sort with visited/temp tracking.
+    // Avoids comptime ++ edge cases with non-empty dependencies.
     var sorted_list = std.ArrayList([]const u8).empty;
     {
         var visited = std.StringHashMap(void).init(allocator);
