@@ -7,6 +7,9 @@ const ZigModuError = @import("../core/Error.zig").ZigModuError;
 pub const ExternalizedConfig = struct {
     const Self = @This();
 
+    /// Property loader: receives allocator, returns key-value map.
+    pub const LoaderFn = *const fn (std.mem.Allocator) anyerror!std.StringHashMap([]const u8);
+
     allocator: std.mem.Allocator,
     io: std.Io,
     sources: std.ArrayList(ConfigSource),
@@ -70,7 +73,7 @@ pub const ExternalizedConfig = struct {
     }
 
     /// 添加配置源
-    pub fn addSource(self: *Self, name: []const u8, priority: u8, loader: *const fn (std.mem.Allocator) anyerror!std.StringHashMap([]const u8)) !void {
+    pub fn addSource(self: *Self, name: []const u8, priority: u8, loader: LoaderFn) !void {
         try self.sources.append(self.allocator, .{
             .name = name,
             .priority = priority,

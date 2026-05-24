@@ -9,7 +9,7 @@ pub fn scanModules(allocator: std.mem.Allocator, comptime modules: anytype) !App
 
     // 1. Register all modules first (runtime registration for backward compat)
     inline for (modules) |mod| {
-        const init_fn = if (@hasDecl(mod, "init"))
+        const init_fn = if (@hasDecl(mod,"init"))
             struct {
                 fn wrapper(ptr: ?*anyopaque) anyerror!void {
                     _ = ptr;
@@ -19,7 +19,7 @@ pub fn scanModules(allocator: std.mem.Allocator, comptime modules: anytype) !App
         else
             null;
 
-        const deinit_fn = if (@hasDecl(mod, "deinit"))
+        const deinit_fn = if (@hasDecl(mod,"deinit"))
             struct {
                 fn wrapper(ptr: ?*anyopaque) void {
                     _ = ptr;
