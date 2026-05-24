@@ -152,7 +152,7 @@ pub const App = struct {
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
             .allocator = allocator,
-            .modules = ArrayList(Module).init(allocator),
+            .modules = ArrayList(Module).empty,
             .state = .initialized,
         };
     }
@@ -161,11 +161,11 @@ pub const App = struct {
         if (self.state == .started) {
             self.stop();
         }
-        self.modules.deinit();
+        self.modules.deinit(self.allocator);
     }
 
     pub fn register(self: *Self, module: Module) !void {
-        try self.modules.append(module);
+        try self.modules.append(self.allocator, module);
     }
 
     pub fn start(self: *Self) !void {
