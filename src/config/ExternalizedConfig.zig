@@ -84,6 +84,27 @@ pub const ExternalizedConfig = struct {
         std.sort.insertion(ConfigSource, self.sources.items, {}, compareSourcePriority);
     }
 
+    /// Convenience: load from environment variables with a prefix.
+    pub fn addEnvSource(self: *Self, prefix: []const u8) !void {
+        const S = struct {
+            var stored_prefix: []const u8 = undefined;
+            fn loader(alloc: std.mem.Allocator) anyerror!std.StringHashMap([]const u8) {
+                var map = std.StringHashMap([]const u8).init(alloc);
+                var env_iter = std.process.Environ.iterator();
+                while (env_iter.next()) |entry| {
+                    if (std.mem.startsWith(u8, entry.key_ptr.*, stored_prefix)) {
+                        const key = try alloc.dupe(u8, entry.key_ptr.*[stored_prefix.len..]);
+                        const val = try alloc.dupe(u8, entry.value_ptr.*);
+                        try map.put(key, val);
+                    }
+                }
+                return map;
+            }
+        };
+        S.stored_prefix = prefix;
+        try self.addSource("env", 100, S.loader);
+    }
+
     fn compareSourcePriority(_: void, a: ConfigSource, b: ConfigSource) bool {
         return a.priority < b.priority;
     }
