@@ -142,6 +142,7 @@ pub const RaftElection = struct {
         }
         self.peers.deinit(self.allocator);
         if (self.voted_for) |v| self.allocator.free(v);
+        if (self.leader_id) |l| self.allocator.free(l);
     }
 
     /// Main tick function - called periodically
@@ -174,6 +175,7 @@ pub const RaftElection = struct {
         if (req.term > self.current_term) {
             self.current_term = req.term;
             self.state = .follower;
+            if (self.voted_for) |v| self.allocator.free(v);
             self.voted_for = null;
         }
 
@@ -203,6 +205,7 @@ pub const RaftElection = struct {
         if (hb.term > self.current_term) {
             self.current_term = hb.term;
             self.state = .follower;
+            if (self.voted_for) |v| self.allocator.free(v);
             self.voted_for = null;
         }
 
@@ -529,7 +532,7 @@ test "RaftElection split vote across three candidates" {
 
     // N1 requests vote from N2 at higher term — should be granted
     const req = VoteRequest{
-        .term = @intCast(e1.getTerm()),
+        .term = @intCast(e1.getTerm() + 1),
         .candidate_id = "n1",
         .last_log_index = 5,
         .last_log_term = 1,

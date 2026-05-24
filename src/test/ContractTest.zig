@@ -89,11 +89,14 @@ pub const ContractTestRunner = struct {
                 self.allocator.free(h.value);
             }
             self.allocator.free(c.request.headers);
+            if (c.request.body) |b| self.allocator.free(b);
             for (c.response.headers) |h| {
                 self.allocator.free(h.key);
                 self.allocator.free(h.value);
             }
             self.allocator.free(c.response.headers);
+            if (c.response.body_contains) |bc| self.allocator.free(bc);
+            if (c.response.body_schema) |bs| self.allocator.free(bs);
         }
         self.contracts.deinit(self.allocator);
 

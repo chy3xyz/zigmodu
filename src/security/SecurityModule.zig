@@ -29,6 +29,10 @@ pub const SecurityModule = struct {
         };
     }
 
+    pub fn deinit(self: *Self) void {
+        _ = self;
+    }
+
     /// JWT Token 结构
     pub const JwtToken = struct {
         header: JwtHeader,

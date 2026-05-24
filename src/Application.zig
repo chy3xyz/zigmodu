@@ -201,7 +201,7 @@ pub const Application = struct {
         // Poll until signal
         const poll_interval = std.posix.timespec{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
         while (!shutdown_requested.load(.acquire)) {
-            std.posix.nanosleep(&poll_interval, null);
+            _ = std.c.nanosleep(&poll_interval, null);
         }
 
         std.log.info("Shutdown signal received, draining in-flight requests...", .{});
@@ -214,7 +214,7 @@ pub const Application = struct {
                 std.log.warn("Drain timeout after {d}ms, forcing stop...", .{drain_timeout_ms});
                 break;
             }
-            std.posix.nanosleep(&drain_interval, null);
+            _ = std.c.nanosleep(&drain_interval, null);
         }
 
         std.log.info("Stopping application '{s}'...", .{self.config.name});

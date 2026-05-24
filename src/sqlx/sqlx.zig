@@ -719,8 +719,10 @@ pub const PostgresConn = struct {
                     break :blk @ptrCast(s.ptr);
                 },
                 .string => |v| blk: {
-                    paramLengths[i] = @intCast(v.len);
-                    break :blk @ptrCast(v.ptr);
+                    const s = self.allocator.dupe(u8, v) catch return null;
+                    paramAllocs[i] = s;
+                    paramLengths[i] = @intCast(s.len);
+                    break :blk @ptrCast(s.ptr);
                 },
                 .bool => |v| blk: {
                     paramLengths[i] = 1;

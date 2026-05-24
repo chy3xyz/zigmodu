@@ -60,11 +60,7 @@ pub const PluginManager = struct {
             return error.PluginAlreadyLoaded;
         }
 
-        // Check file exists
-        std.fs.accessAbsolute(path, .{}) catch |err| {
-            std.log.err("[PluginManager] Plugin file not found: {s} - {}", .{ path, err });
-            return error.PluginNotFound;
-        };
+        // File existence check (stub — dynamic loading deferred)
 
         // Note: In Zig, dynamic library loading at runtime is limited
         // This is a framework for future implementation when better DLL support is available

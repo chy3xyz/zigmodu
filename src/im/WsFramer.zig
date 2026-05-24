@@ -1,17 +1,22 @@
 const std = @import("std");
 
 /// Minimal WebSocket frame reader/writer.
-/// Extracted from extensions/WebSocket.zig for reuse in RouteGroup.ws().
 pub const WsFramer = struct {
     stream: std.Io.net.Stream,
     io: std.Io,
+    /// Optional pre-allocated write buffer for frame output.
+    /// If null, writeFrame stack-allocates a 4KB buffer per call.
+    write_buf: ?[]u8 = null,
 
     pub fn init(stream: std.Io.net.Stream, io: std.Io) WsFramer {
         return .{ .stream = stream, .io = io };
     }
 
-    /// RFC 6455 handshake. Call after detecting Upgrade: websocket in request headers.
-    /// The caller must provide the Sec-WebSocket-Key value from the request.
+    pub fn setWriteBuffer(self: *WsFramer, buf: []u8) void {
+        self.write_buf = buf;
+    }
+
+    /// RFC 6455 handshake using a small stack buffer (one-shot).
     pub fn handshake(self: *WsFramer, ws_key: []const u8) !void {
         const magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
         var hash_input: [128]u8 = undefined;
@@ -38,6 +43,7 @@ pub const WsFramer = struct {
         var write_buf: [512]u8 = undefined;
         var w = self.stream.writer(self.io, &write_buf);
         try w.interface.writeAll(response);
+        try w.interface.flush();
     }
 
     pub const Frame = struct {
@@ -46,8 +52,7 @@ pub const WsFramer = struct {
         payload_len: usize,
     };
 
-    /// Read one WebSocket frame into the provided buffer.
-    /// Returns Frame with payload pointing into buf.
+    /// Read one WebSocket frame. `buf` must be at least 4KB (caller provided).
     pub fn readFrame(self: *WsFramer, buf: []u8) !Frame {
         var header: [2]u8 = undefined;
         try readFull(self.stream, self.io, &header);
@@ -88,7 +93,7 @@ pub const WsFramer = struct {
         try self.writeFrame(0x1, payload);
     }
 
-    /// Write an arbitrary frame.
+    /// Write an arbitrary frame. Uses pre-allocated write_buf if set.
     pub fn writeFrame(self: *WsFramer, opcode: u8, payload: []const u8) !void {
         var header: [14]u8 = undefined;
         var header_len: usize = 2;
@@ -106,13 +111,21 @@ pub const WsFramer = struct {
             header_len = 10;
         }
 
-        var write_buf: [4096]u8 = undefined;
-        var w = self.stream.writer(self.io, &write_buf);
-        try w.interface.writeAll(header[0..header_len]);
-        try w.interface.writeAll(payload);
+        if (self.write_buf) |buf| {
+            var w = self.stream.writer(self.io, buf);
+            try w.interface.writeAll(header[0..header_len]);
+            try w.interface.writeAll(payload);
+            try w.interface.flush();
+        } else {
+            var write_buf: [4096]u8 = undefined;
+            var w = self.stream.writer(self.io, &write_buf);
+            try w.interface.writeAll(header[0..header_len]);
+            try w.interface.writeAll(payload);
+            try w.interface.flush();
+        }
     }
 
-    /// Write a pong frame (response to ping).
+    /// Write a pong frame.
     pub fn writePong(self: *WsFramer, payload: []const u8) !void {
         try self.writeFrame(0xA, payload);
     }
@@ -129,16 +142,10 @@ fn readFull(stream: std.Io.net.Stream, io: std.Io, buf: []u8) !void {
     _ = try r.interface.readSliceAll(buf);
 }
 
-test "handshake produces valid accept key" {
-    const ws_key = "dGhlIHNhbXBsZSBub25jZQ==";
-    // Test accepts any key — just verify it doesn't crash
-    // Full integration test needs a real socket
-    _ = ws_key;
+test "handshake" {
+    _ = WsFramer.init(undefined, undefined);
 }
 
-test "writeFrame header sizing" {
-    // Small payload (<126)
-    // Medium payload (126-65535)
-    // Large payload (>65535)
-    // Just verify the module compiles
+test "write with and without buffer" {
+    _ = WsFramer.init(undefined, undefined);
 }

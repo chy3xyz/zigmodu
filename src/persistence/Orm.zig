@@ -339,11 +339,39 @@ pub fn Orm(comptime B: type) type {
                 }
 
                 pub fn insert(self: @This(), entity: T) !T {
-                    const sql = try buildInsert(self.orm.backend.allocator, meta.table_name, meta.sql_columns);
-                    defer self.orm.backend.allocator.free(sql);
-                    const args = try structToBackendArgs(B, T, self.orm.backend.allocator, entity);
-                    defer self.orm.backend.allocator.free(args);
-                    _ = try self.orm.backend.exec(sql, args);
+                    // Skip id column (auto-generated) when building INSERT
+                    const alloc = self.orm.backend.allocator;
+                    const cols = meta.sql_columns;
+                    const info = @typeInfo(T).@"struct";
+                    var sql_buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
+                    defer sql_buf.deinit(alloc);
+                    try sql_buf.appendSlice(alloc, "INSERT INTO ");
+                    try sql_buf.appendSlice(alloc, meta.table_name);
+                    try sql_buf.appendSlice(alloc, " (");
+                    var arg_list: std.ArrayList(B.Value) = std.ArrayList(B.Value).empty;
+                    defer arg_list.deinit(alloc);
+                    var first = true;
+                    inline for (info.fields, 0..) |field, i| {
+                        if (comptime std.mem.eql(u8, field.name, "id")) continue;
+                        if (comptime std.mem.eql(u8, field.name, "create_time")) continue;
+                        if (comptime std.mem.eql(u8, field.name, "update_time")) continue;
+                        if (comptime std.mem.eql(u8, field.name, "creator")) continue;
+                        if (comptime std.mem.eql(u8, field.name, "updater")) continue;
+                        if (comptime std.mem.eql(u8, field.name, "deleted")) continue;
+                        if (!first) try sql_buf.appendSlice(alloc, ", ");
+                        first = false;
+                        try sql_buf.appendSlice(alloc, cols[i]);
+                        try arg_list.append(alloc, fieldToBackendValue(B, @field(entity, field.name)));
+                    }
+                    try sql_buf.appendSlice(alloc, ") VALUES (");
+                    for (0..arg_list.items.len) |j| {
+                        if (j > 0) try sql_buf.appendSlice(alloc, ", ");
+                        try sql_buf.appendSlice(alloc, "?");
+                    }
+                    try sql_buf.appendSlice(alloc, ")");
+                    const sql = try alloc.dupe(u8, sql_buf.items);
+                    defer alloc.free(sql);
+                    _ = try self.orm.backend.exec(sql, arg_list.items);
                     return entity;
                 }
 

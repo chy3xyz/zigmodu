@@ -1,6 +1,6 @@
 const std = @import("std");
 const api = @import("../api/Server.zig");
-const SecurityModule = @import("SecurityModule.zig");
+const SecurityModule = @import("SecurityModule.zig").SecurityModule;
 const Rbac = @import("Rbac.zig");
 
 /// JWT 认证中间件 — 验证 Token 并将 AuthInfo 挂载到 ctx.user_data
@@ -45,6 +45,7 @@ pub fn jwtAuth(security: *SecurityModule, allocator: std.mem.Allocator) !api.Mid
                     .tenant_id = tenant_id,
                     .username = S.stored_allocator.dupe(u8, payload.sub) catch return error.OutOfMemory,
                     .role_ids = &.{},
+                    .permissions = std.StringHashMap(bool).init(S.stored_allocator),
                 };
 
                 // Copy role strings. Reject malformed role IDs.

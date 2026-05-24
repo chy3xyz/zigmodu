@@ -69,8 +69,15 @@ pub const Bulkhead = struct {
             }
             return true;
         }
+        self.stats.total_rejected += 1;
+        return false;
+    }
 
-        // 检查是否可排队
+    /// 获取信号量 (阻塞直到可用)
+    pub fn acquire(self: *Self) void {
+        if (self.tryAcquire()) return;
+
+        // 检查是否可排队并阻塞等待
         if (self.max_queue > 0 and self.waiting < self.max_queue) {
             self.waiting += 1;
             // 自旋等待 (简化: 实际应使用条件变量)
@@ -84,18 +91,10 @@ pub const Bulkhead = struct {
             if (self.active_calls > self.stats.peak_concurrent) {
                 self.stats.peak_concurrent = self.active_calls;
             }
-            return true;
+            return;
         }
 
         self.stats.total_rejected += 1;
-        return false;
-    }
-
-    /// 获取信号量 (阻塞直到可用)
-    pub fn acquire(self: *Self) void {
-        while (!self.tryAcquire()) {
-            std.atomic.spinLoopHint();
-        }
     }
 
     /// 释放信号量
