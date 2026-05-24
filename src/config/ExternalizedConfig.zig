@@ -90,7 +90,9 @@ pub const ExternalizedConfig = struct {
             var stored_prefix: []const u8 = undefined;
             fn loader(alloc: std.mem.Allocator) anyerror!std.StringHashMap([]const u8) {
                 var map = std.StringHashMap([]const u8).init(alloc);
-                var env_iter = std.process.Environ.iterator();
+                var env_map = try std.process.Environ.createMap(alloc);
+                defer env_map.deinit();
+                var env_iter = env_map.iterator();
                 while (env_iter.next()) |entry| {
                     if (std.mem.startsWith(u8, entry.key_ptr.*, stored_prefix)) {
                         const key = try alloc.dupe(u8, entry.key_ptr.*[stored_prefix.len..]);
