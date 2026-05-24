@@ -4,7 +4,7 @@ const ModuleInfo = @import("./Module.zig").ModuleInfo;
 
 /// Compile-time module scanner that extracts module metadata and performs topological sort
 pub fn scanModules(allocator: std.mem.Allocator, comptime modules: anytype) !ApplicationModules {
-    @setEvalBranchQuota(50000);
+    @setEvalBranchQuota(100000);
     var app_modules = ApplicationModules.init(allocator);
 
     // 1. Register all modules first (runtime registration for backward compat)
@@ -40,48 +40,57 @@ pub fn scanModules(allocator: std.mem.Allocator, comptime modules: anytype) !App
     }
 
     // 2. Perform topological sort at comptime and cache the result
-    // This avoids runtime sorting in Lifecycle.startAll
+    // Uses runtime visitor (Lifecycle.visitModule) to avoid comptime ++ edge cases
+    // with non-empty dependencies and module names containing '/'.
     const sorted_names = comptime blk: {
-        var result: []const []const u8 = &[_][]const u8{};
+        var names: []const []const u8 = &[_][]const u8{};
         for (modules) |mod| {
-            result = visit(mod.info.name, modules, result);
+            names = names ++ [_][]const u8{mod.info.name};
         }
-        break :blk result;
+        break :blk names;
     };
 
-    var sorted_list = try std.ArrayList([]const u8).initCapacity(allocator, sorted_names.len);
-    inline for (sorted_names) |name| {
-        sorted_list.appendAssumeCapacity(name);
+    // Use runtime topological sort for correct dependency ordering
+    _ = sorted_names;
+    var sorted_list = std.ArrayList([]const u8).empty;
+    {
+        var visited = std.StringHashMap(void).init(allocator);
+        defer visited.deinit();
+        var temp = std.StringHashMap(void).init(allocator);
+        defer temp.deinit();
+
+        var it = app_modules.modules.iterator();
+        while (it.next()) |entry| {
+            if (!visited.contains(entry.key_ptr.*)) {
+                try visitR(allocator, &app_modules, entry.key_ptr.*, &visited, &temp, &sorted_list);
+            }
+        }
     }
     app_modules.sorted_order = sorted_list;
 
     return app_modules;
 }
 
-/// Comptime helper to visit modules and order them
-fn visit(comptime name: []const u8, comptime modules: anytype, comptime current_sorted: []const []const u8) []const []const u8 {
-    // Check if already in current_sorted
-    for (current_sorted) |existing| {
-        if (std.mem.eql(u8, existing, name)) return current_sorted;
-    }
+fn visitR(
+    allocator: std.mem.Allocator,
+    modules: *ApplicationModules,
+    name: []const u8,
+    visited: *std.StringHashMap(void),
+    temp: *std.StringHashMap(void),
+    result: *std.ArrayList([]const u8),
+) !void {
+    if (temp.contains(name)) return;
+    if (visited.contains(name)) return;
+    try temp.put(name, {});
 
-    // Find module info
-    @setEvalBranchQuota(5000);
-    const mod_info = comptime blk: {
-        for (modules) |m| {
-            if (std.mem.eql(u8, m.info.name, name)) break :blk m.info;
+    if (modules.get(name)) |info| {
+        for (info.deps) |dep| {
+            try visitR(allocator, modules, dep, visited, temp, result);
         }
-        @compileError("Module not found: " ++ name);
-    };
-
-    var result = current_sorted;
-    // Visit dependencies first
-    for (mod_info.dependencies) |dep| {
-        result = visit(dep, modules, result);
     }
-
-    // Append self
-    return result ++ [_][]const u8{name};
+    _ = temp.remove(name);
+    try visited.put(name, {});
+    try result.append(allocator, name);
 }
 
 test "scanModules extracts metadata" {
