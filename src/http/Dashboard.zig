@@ -1,4 +1,5 @@
 const std = @import("std");
+const Time = @import("../core/Time.zig");
 const Server = @import("../api/Server.zig");
 const Context = Server.Context;
 const HandlerFn = Server.HandlerFn;
@@ -71,7 +72,7 @@ fn handleModules(ctx: *Context) !void {
 
 /// API: 统计数据
 fn handleStats(ctx: *Context) !void {
-    const now = std.time.timestamp();
+    const now = Time.monotonicNowSeconds();
     const uptime = now - system_info.started_at;
 
     const json = try std.fmt.allocPrint(ctx.allocator,
@@ -91,7 +92,7 @@ fn handleStats(ctx: *Context) !void {
 
 /// API: 系统信息
 fn handleSystem(ctx: *Context) !void {
-    const now = std.time.timestamp();
+    const now = Time.monotonicNowSeconds();
     const uptime = now - system_info.started_at;
 
     const json = try std.fmt.allocPrint(ctx.allocator,
