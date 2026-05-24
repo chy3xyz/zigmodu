@@ -27,7 +27,7 @@ pub const HotReloader = struct {
         return .{
             .allocator = allocator,
             .io = io,
-            .watch_paths = ArrayList([]const u8).init(allocator),
+            .watch_paths = ArrayList([]const u8).empty,
             .is_watching = false,
             .watch_thread = null,
             .file_hashes = std.StringHashMap(u64).init(allocator),
