@@ -90,7 +90,7 @@ pub const ExternalizedConfig = struct {
             var stored_prefix: []const u8 = undefined;
             fn loader(alloc: std.mem.Allocator) anyerror!std.StringHashMap([]const u8) {
                 var map = std.StringHashMap([]const u8).init(alloc);
-                var environ = std.process.Environ{};
+                var environ = std.process.Environ.empty;
                 var env_map = try environ.createMap(alloc);
                 defer env_map.deinit();
                 var env_iter = env_map.iterator();
