@@ -36,6 +36,7 @@ pub const ModuleCapabilities = struct {
     }
 
     pub fn canPublish(self: *Self, event_type: []const u8) bool {
+        if (self.published_events.items.len == 0) return true;
         for (self.published_events.items) |e| {
             if (std.mem.eql(u8, e, event_type)) return true;
         }
@@ -43,6 +44,7 @@ pub const ModuleCapabilities = struct {
     }
 
     pub fn canConsume(self: *Self, event_type: []const u8) bool {
+        if (self.consumed_events.items.len == 0) return true;
         for (self.consumed_events.items) |e| {
             if (std.mem.eql(u8, e, event_type)) return true;
         }

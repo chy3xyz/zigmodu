@@ -310,10 +310,9 @@ fn timingSafeSliceEql(a: []const u8, b: []const u8) bool {
     for (a, 0..) |x, i| {
         acc |= x ^ b[i];
     }
-    const s = @typeInfo(u8).int.bits;
-    const Cu = std.meta.Int(.unsigned, s);
-    const Cext = std.meta.Int(.unsigned, s + 1);
-    return @as(bool, @bitCast(@as(u1, @truncate((@as(Cext, @as(Cu, @bitCast(acc))) -% 1) >> s))));
+    const s: u4 = @intCast(@typeInfo(u8).int.bits);
+    const extended: u16 = @as(u8, @bitCast(acc));
+    return @as(bool, @bitCast(@as(u1, @truncate((extended -% 1) >> s))));
 }
 
 /// Base64 URL 编码 (JWT 标准)

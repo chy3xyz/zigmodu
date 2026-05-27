@@ -63,7 +63,7 @@ fn snakeCase(comptime name: []const u8) []const u8 {
 /// e.g. "userName" → "user_name", "deptId" → "dept_id", "id" → "id"
 pub fn camelToSnake(comptime input: []const u8) []const u8 {
     @setEvalBranchQuota(2000);
-    comptime var buf: [256]u8 = [_]u8{0} ** 256;
+    comptime var buf: [256]u8 = @splat(0);
     var idx: usize = 0;
     for (input) |c| {
         if (c >= 'A' and c <= 'Z') {

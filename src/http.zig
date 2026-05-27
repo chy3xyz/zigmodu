@@ -33,6 +33,7 @@ pub const ApiVersion = @import("http/ApiVersioning.zig").ApiVersion;
 pub const ApiVersionExtractor = @import("http/ApiVersioning.zig").ApiVersionExtractor;
 pub const ApiVersionRouter = @import("http/ApiVersioning.zig").ApiVersionRouter;
 pub const apiVersionMiddleware = @import("http/ApiVersioning.zig").apiVersionMiddleware;
+pub const SseWriter = @import("http/Sse.zig").SseWriter;
 pub const Dashboard = @import("http/Dashboard.zig");
 pub const AccessLogger = @import("http/AccessLog.zig").AccessLogger;
 pub const accessLogMiddleware = @import("http/AccessLog.zig").accessLogMiddleware;

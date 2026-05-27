@@ -8,11 +8,11 @@ const Time = @import("../core/Time.zig");
 /// Cron expression (5-field: minute hour day month dow).
 /// Supports: * (any), */n (step), n (specific), n-m (range), n,m (list)
 pub const Expression = struct {
-    minutes: [60]bool = [_]bool{false} ** 60,
-    hours: [24]bool = [_]bool{false} ** 24,
-    days: [32]bool = [_]bool{false} ** 32,
-    months: [13]bool = [_]bool{false} ** 13,
-    dows: [7]bool = [_]bool{false} ** 7,
+    minutes: [60]bool = @splat(false),
+    hours: [24]bool = @splat(false),
+    days: [32]bool = @splat(false),
+    months: [13]bool = @splat(false),
+    dows: [7]bool = @splat(false),
 
     /// Parse standard cron expression "m h d M w"
     pub fn parse(expr: []const u8) !Expression {

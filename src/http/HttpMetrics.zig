@@ -37,7 +37,7 @@ pub const HttpMetricsCollector = struct {
     /// 请求计数器
     request_count: u64 = 0,
     /// 按状态码分类的计数
-    status_counts: [6]u64 = [_]u64{0} ** 6,
+    status_counts: [6]u64 = @splat(0),
     /// 总延迟 (秒)
     total_duration_seconds: f64 = 0,
     /// 最小延迟 (秒)

@@ -253,7 +253,9 @@ pub const HttpClient = struct {
     fn executeRequest(self: *Self, req: HttpRequest) !HttpResponse {
         // 解析 URL
         const parsed_url = try std.Uri.parse(req.url);
-        const host = parsed_url.host orelse return error.InvalidUrl;
+        const host_component = parsed_url.host orelse return error.InvalidUrl;
+        var host_buf: [256]u8 = undefined;
+        const host = host_component.toRaw(&host_buf) catch return error.InvalidUrl;
         const port: u16 = if (parsed_url.port) |p|
             if (p <= std.math.maxInt(u16)) @intCast(p) else return error.InvalidPort
         else
@@ -264,28 +266,30 @@ pub const HttpClient = struct {
         defer self.connection_pool.release(conn);
 
         // 构建 HTTP 请求
-        const request_line = try std.fmt.allocPrint(self.allocator, "{s} {s} HTTP/1.1\r\n", .{ req.method, parsed_url.path });
+        var path_buf: [4096]u8 = undefined;
+        const path_str = parsed_url.path.toRaw(&path_buf) catch "/";
+        const request_line = try std.fmt.allocPrint(self.allocator, "{s} {s} HTTP/1.1\r\n", .{ req.method, path_str });
         defer self.allocator.free(request_line);
 
         // 发送请求
         if (conn.stream) |stream| {
             var write_buf: [4096]u8 = undefined;
             var w = stream.writer(self.connection_pool.io, &write_buf);
-            _ = w.writeAll(request_line) catch return error.ConnectionError;
+            _ = w.interface.writeAll(request_line) catch return error.ConnectionError;
 
             // 发送 headers
             var iter = req.headers.iterator();
             while (iter.next()) |entry| {
                 const header_line = try std.fmt.allocPrint(self.allocator, "{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
                 defer self.allocator.free(header_line);
-                _ = w.writeAll(header_line) catch return error.ConnectionError;
+                _ = w.interface.writeAll(header_line) catch return error.ConnectionError;
             }
 
-            _ = w.writeAll("\r\n") catch return error.ConnectionError;
+            _ = w.interface.writeAll("\r\n") catch return error.ConnectionError;
 
             // 发送 body
             if (req.body) |body| {
-                _ = w.writeAll(body) catch return error.ConnectionError;
+                _ = w.interface.writeAll(body) catch return error.ConnectionError;
             }
 
             // 读取响应（最小实现：解析 status line + headers + body）

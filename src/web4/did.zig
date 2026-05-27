@@ -118,7 +118,7 @@ pub fn resolve(allocator: std.mem.Allocator, did: []const u8) !DidKey {
     var pk: [32]u8 = undefined;
     @memcpy(&pk, decoded[2..34]);
     const resolved_did = try DidKey.formatDidKey(allocator, pk);
-    var sk: [64]u8 = [_]u8{0} ** 64;
+    var sk: [64]u8 = @splat(0);
     @memcpy(sk[32..64], &pk);
     return DidKey{ .secret_key = sk, .public_key = pk, .did = resolved_did };
 }

@@ -99,8 +99,8 @@ test "ClusterAuth sign and verify" {
 
 test "ClusterAuth different keys reject" {
     const allocator = std.testing.allocator;
-    const k1: [32]u8 = [_]u8{1} ** 32;
-    const k2: [32]u8 = [_]u8{2} ** 32;
+    const k1: [32]u8 = @splat(1);
+    const k2: [32]u8 = @splat(2);
 
     var a1 = try ClusterAuth.init(allocator, "n1", k1);
     defer a1.deinit();

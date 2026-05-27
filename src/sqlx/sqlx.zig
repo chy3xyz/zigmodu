@@ -33,6 +33,20 @@ const libpq_c = @import("libpq_c.zig");
 const libmysql_c = @import("libmysql_c.zig");
 const breaker = @import("breaker.zig");
 
+/// Allocate null-terminated copy (replaces removed allocator.dupeZ in Zig 0.17).
+fn allocZ(allocator: std.mem.Allocator, s: []const u8) ![:0]u8 {
+    const result = try allocator.allocSentinel(u8, s.len, 0);
+    @memcpy(result, s);
+    return result;
+}
+
+/// Format into buffer with null terminator (replaces removed bufPrintZ in Zig 0.17).
+fn bufPrintZ(buf: []u8, comptime fmt: []const u8, args: anytype) ![:0]u8 {
+    const written = try std.fmt.bufPrint(buf, fmt, args);
+    buf[written.len] = 0;
+    return buf[0..written.len :0];
+}
+
 /// SQL value types for parameterized queries
 pub const Value = union(enum) {
     null,
@@ -155,7 +169,7 @@ pub const Conn = struct {
 /// becomes O(F) direct array indexing instead of O(F*C) linear probes.
 fn buildColumnIndices(comptime T: type, columns: []const []const u8) ![std.meta.fields(T).len]?usize {
     const fields = std.meta.fields(T);
-    var indices: [fields.len]?usize = [_]?usize{null} ** fields.len;
+    var indices: [fields.len]?usize = @splat(@as(?usize, null));
     inline for (fields, 0..) |field, fi| {
         for (columns, 0..) |col, ci| {
             if (std.mem.eql(u8, col, field.name)) {
@@ -333,7 +347,7 @@ pub const SQLiteConn = struct {
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !SQLiteConn {
         var db: ?*sqlite3_c.sqlite3 = null;
-        const c_path = allocator.dupeZ(u8, path) catch return error.DatabaseError;
+        const c_path = try allocZ(allocator, path);
         defer allocator.free(c_path);
         const rc = sqlite3_c.sqlite3_open(c_path.ptr, &db);
         if (rc != sqlite3_c.SQLITE_OK or db == null) {
@@ -535,16 +549,16 @@ pub const PostgresConn = struct {
 
     /// Connect using explicit parameters via dlsym (bypasses Zig C ABI issues)
     pub fn connectParams(allocator: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, pass: []const u8, db: []const u8) !PostgresConn {
-        const host_c = try allocator.dupeZ(u8, host);
+        const host_c = try allocZ(allocator, host);
         defer allocator.free(host_c);
         const port_str_buf = try allocator.alloc(u8, 8);
-        const port_str = try std.fmt.bufPrintZ(port_str_buf, "{d}", .{port});
+        const port_str = try bufPrintZ(port_str_buf, "{d}", .{port});
         defer allocator.free(port_str_buf);
-        const user_c = try allocator.dupeZ(u8, user);
+        const user_c = try allocZ(allocator, user);
         defer allocator.free(user_c);
-        const pass_c = try allocator.dupeZ(u8, pass);
+        const pass_c = try allocZ(allocator, pass);
         defer allocator.free(pass_c);
-        const db_c = try allocator.dupeZ(u8, db);
+        const db_c = try allocZ(allocator, db);
         defer allocator.free(db_c);
 
         const empty_opt = "\x00";
@@ -567,7 +581,7 @@ pub const PostgresConn = struct {
 
     /// Null-terminated string connect
     pub fn connect(allocator: std.mem.Allocator, conninfo: []const u8) !PostgresConn {
-        const null_terminated = try allocator.dupeZ(u8, conninfo);
+        const null_terminated = try allocZ(allocator, conninfo);
         defer allocator.free(null_terminated);
         const conn = libpq_c.PQconnectdb(null_terminated);
         if (conn == null) return error.DatabaseError;
@@ -660,7 +674,7 @@ pub const PostgresConn = struct {
         // Use PQexec (simple query, no params) for queries without args
         // Must null-terminate the SQL string for libpq
         if (args.len == 0) {
-            const pg_sql_simple = self.allocator.dupeZ(u8, sql_str) catch return null;
+            const pg_sql_simple = allocZ(self.allocator, sql_str) catch return null;
             defer self.allocator.free(pg_sql_simple);
             const res = libpq_c.PQexec(self.conn, @ptrCast(pg_sql_simple.ptr));
             if (res == null) {
@@ -854,7 +868,7 @@ pub const PostgresConn = struct {
         for (sql) |c| {
             if (c == '?') count += 1;
         }
-        if (count == 0) return allocator.dupeZ(u8, sql) catch null;
+        if (count == 0) return allocZ(allocator, sql) catch null;
 
         // Calculate exact size: original len minus ? chars plus $N replacements
         var exact: usize = sql.len - count;
@@ -892,7 +906,7 @@ pub const PostgresConn = struct {
         var it = self.stmt_cache.iterator();
         while (it.next()) |entry| {
             var dealloc_buf: [64]u8 = undefined;
-            const sql = std.fmt.bufPrintZ(&dealloc_buf, "DEALLOCATE {s}", .{entry.value_ptr.*}) catch "";
+            const sql = bufPrintZ(&dealloc_buf, "DEALLOCATE {s}", .{entry.value_ptr.*}) catch "";
             if (self.conn != null) _ = libpq_c.PQexec(self.conn, @ptrCast(sql.ptr));
             self.allocator.free(entry.key_ptr.*);
             self.allocator.free(entry.value_ptr.*);
@@ -1274,9 +1288,9 @@ pub const PostgresStmt = struct {
 
     pub fn prepare(conn: ?*libpq_c.PGconn, allocator: std.mem.Allocator, sql: []const u8) !PostgresStmt {
         var name_buf: [32]u8 = undefined;
-        const stmt_name = try std.fmt.bufPrintZ(&name_buf, "stmt_{x}", .{@intFromPtr(sql.ptr)});
-        const name_copy = try allocator.dupeZ(u8, stmt_name);
-        const sql_z = try allocator.dupeZ(u8, sql);
+        const stmt_name = try bufPrintZ(&name_buf, "stmt_{x}", .{@intFromPtr(sql.ptr)});
+        const name_copy = try allocZ(allocator, stmt_name);
+        const sql_z = try allocZ(allocator, sql);
         defer allocator.free(sql_z);
         const res = libpq_c.PQprepare(conn, @ptrCast(name_copy.ptr), @ptrCast(sql_z.ptr), 0, null);
         if (res == null) return error.DatabaseError;
@@ -1363,12 +1377,12 @@ pub const PostgresStmt = struct {
         const self = @as(*PostgresStmt, @ptrCast(@alignCast(ptr)));
         const dealloc_sql = blk: {
             var buf: [128]u8 = undefined;
-            const s = std.fmt.bufPrintZ(&buf, "DEALLOCATE {s}", .{self.name}) catch {
+            const s = bufPrintZ(&buf, "DEALLOCATE {s}", .{self.name}) catch {
                 self.allocator.free(self.name);
                 self.allocator.destroy(self);
                 return;
             };
-            break :blk self.allocator.dupeZ(u8, s) catch {
+            break :blk allocZ(self.allocator, s) catch {
                 self.allocator.free(self.name);
                 self.allocator.destroy(self);
                 return;

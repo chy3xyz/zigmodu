@@ -122,7 +122,7 @@ test "message framing round-trip" {
     const msg = "hello cluster";
     var len_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &len_buf, @intCast(msg.len), .big);
-    try std.testing.expectEqual(@as(u32, 14), std.mem.readInt(u32, &len_buf, .big));
+    try std.testing.expectEqual(@as(u32, 13), std.mem.readInt(u32, &len_buf, .big));
 }
 
 test "max message size constant" {
