@@ -3,7 +3,7 @@ const std = @import("std");
 const ServiceWrapper = struct {
     ptr: *anyopaque,
     type_name: []const u8,
-    type_hash: u64, // 添加类型哈希用于运行时验证
+    type_hash: u64, // Add type hash for runtime validation
     vtable: *const VTable,
 
     const VTable = struct {
@@ -16,7 +16,7 @@ const ServiceWrapper = struct {
         wrapper.* = .{
             .ptr = instance,
             .type_name = try allocator.dupe(u8, type_name),
-            .type_hash = comptime std.hash.Crc32.hash(type_name), // 编译时计算类型哈希
+            .type_hash = comptime std.hash.Crc32.hash(type_name), // Compile-time type hash calculation
             .vtable = &comptime VTable{
                 .destroy = struct {
                     fn destroy(service_ptr: *anyopaque, alloc: std.mem.Allocator) void {

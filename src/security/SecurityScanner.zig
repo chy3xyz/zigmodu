@@ -1,8 +1,8 @@
 const std = @import("std");
 
-/// 模块安全扫描器
-/// 提供静态安全分析、依赖漏洞检查和安全最佳实践验证
-/// 这是架构评估中的中优先级改进项
+/// [...]Security scanner
+/// [...]VulnerabilityCheck and security best practicesValidation
+/// Medium-priority architecture improvement
 pub const SecurityScanner = struct {
     const Self = @This();
 
@@ -12,21 +12,21 @@ pub const SecurityScanner = struct {
     config: Config,
     io: std.Io,
 
-    /// 扫描配置
+    /// [...]
     pub const Config = struct {
-        /// 最小严重级别
+        /// [...]
         min_severity: Severity = .LOW,
-        /// 是否扫描依赖
+        /// [...]
         scan_dependencies: bool = true,
-        /// 是否检查敏感信息泄露
+        /// [...]Info[...]
         check_secrets: bool = true,
-        /// 是否检查不安全的API使用
+        /// [...]API[...]
         check_unsafe_apis: bool = true,
-        /// 是否检查权限问题
+        /// [...]Permission[...]
         check_permissions: bool = true,
     };
 
-    /// 安全规则
+    /// [...]
     pub const SecurityRule = struct {
         id: []const u8,
         name: []const u8,
@@ -45,7 +45,7 @@ pub const SecurityScanner = struct {
         };
     };
 
-    /// 安全发现
+    /// [...]
     pub const SecurityFinding = struct {
         rule_id: []const u8,
         severity: Severity,
@@ -64,7 +64,7 @@ pub const SecurityScanner = struct {
         }
     };
 
-    /// 严重级别
+    /// [...]
     pub const Severity = enum {
         CRITICAL,
         HIGH,
@@ -88,7 +88,7 @@ pub const SecurityScanner = struct {
         }
     };
 
-    /// 扫描结果
+    /// Scan result
     pub const ScanResult = struct {
         total_files: usize,
         findings: std.ArrayList(SecurityFinding),
@@ -107,7 +107,7 @@ pub const SecurityScanner = struct {
         }
     };
 
-    /// 初始化扫描器
+    /// [...]
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Config) Self {
         var scanner = Self{
             .allocator = allocator,
@@ -117,13 +117,13 @@ pub const SecurityScanner = struct {
             .io = io,
         };
 
-        // 注册默认规则
+        // [...]
         scanner.registerDefaultRules();
 
         return scanner;
     }
 
-    /// 清理资源
+    /// [...]
     pub fn deinit(self: *Self) void {
         self.rules.deinit();
 
@@ -137,65 +137,65 @@ pub const SecurityScanner = struct {
         self.findings.deinit();
     }
 
-    /// 注册安全规则
+    /// [...]
     pub fn registerRule(self: *Self, rule: SecurityRule) !void {
         try self.rules.append(rule);
     }
 
-    /// 注册默认安全规则
+    /// [...]
     fn registerDefaultRules(self: *Self) void {
-        // 硬编码密钥检测
+        // [...]
         self.registerRule(.{
             .id = "SEC001",
             .name = "Hardcoded Secret",
-            .description = "检测到硬编码的密钥或密码",
+            .description = "Hardcoded key or password detected",
             .severity = .CRITICAL,
             .category = .SECRETS,
             .check_fn = checkHardcodedSecret,
         }) catch {};
 
-        // SQL注入检测
+        // SQL[...]
         self.registerRule(.{
             .id = "SEC002",
             .name = "SQL Injection Risk",
-            .description = "可能存在SQL注入漏洞",
+            .description = "Possible SQL injection vulnerability",
             .severity = .HIGH,
             .category = .INJECTION,
             .check_fn = checkSqlInjection,
         }) catch {};
 
-        // 不安全的HTTP配置
+        // [...]HTTP[...]
         self.registerRule(.{
             .id = "SEC003",
             .name = "Insecure HTTP Configuration",
-            .description = "HTTP配置可能存在安全问题",
+            .description = "HTTPConfig may have security issues",
             .severity = .MEDIUM,
             .category = .CONFIGURATION,
             .check_fn = checkInsecureHttp,
         }) catch {};
 
-        // 弱加密算法检测
+        // [...]Encrypt[...]
         self.registerRule(.{
             .id = "SEC004",
             .name = "Weak Cryptography",
-            .description = "使用了弱加密算法",
+            .description = "Weak encryption algorithm used",
             .severity = .HIGH,
             .category = .CRYPTOGRAPHY,
             .check_fn = checkWeakCrypto,
         }) catch {};
 
-        // 权限绕过检测
+        // Permission[...]
         self.registerRule(.{
             .id = "SEC005",
             .name = "Missing Authorization",
-            .description = "API端点可能缺少授权检查",
+            .description = "APIEndpoint may be missing auth check",
             .severity = .HIGH,
             .category = .PERMISSIONS,
             .check_fn = checkMissingAuth,
         }) catch {};
     }
 
-    /// 扫描源代码
+    /// [...]
     pub fn scanSourceCode(self: *Self, file_path: []const u8, source_code: []const u8) !void {
         for (self.rules.items) |rule| {
             if (@intFromEnum(rule.severity) > @intFromEnum(self.config.min_severity)) {
@@ -217,7 +217,7 @@ pub const SecurityScanner = struct {
         }
     }
 
-    /// 扫描模块
+    /// [...]
     pub fn scanModule(self: *Self, module_path: []const u8) !ScanResult {
         var result = ScanResult{
             .total_files = 0,
@@ -225,9 +225,9 @@ pub const SecurityScanner = struct {
         };
         errdefer result.findings.deinit(self.allocator);
 
-        // 扫描目录下的所有.zig文件
+        // [...].zig[...]
         var dir = std.Io.Dir.cwd().openDir(std.testing.io, module_path, .{ .iterate = true }) catch |err| {
-            std.log.err("无法打开模块目录 {s}: {}", .{ module_path, err });
+            std.log.err("Cannot open module directory {s}: {}", .{ module_path, err });
             return result;
         };
         defer dir.close(std.testing.io);
@@ -241,7 +241,7 @@ pub const SecurityScanner = struct {
                 defer self.allocator.free(file_path);
 
                 const content = dir.readFileAlloc(self.io, entry.name, self.allocator, std.Io.Limit.limited(1024 * 1024)) catch |err| {
-                    std.log.warn("无法读取文件 {s}: {}", .{ entry.name, err });
+                    std.log.warn("Cannot read file {s}: {}", .{ entry.name, err });
                     continue;
                 };
                 defer self.allocator.free(content);
@@ -250,7 +250,7 @@ pub const SecurityScanner = struct {
             }
         }
 
-        // 统计发现的问题
+        // [...]
         for (self.findings.items) |finding| {
             try result.findings.append(self.allocator, finding);
             switch (finding.severity) {
@@ -265,7 +265,7 @@ pub const SecurityScanner = struct {
         return result;
     }
 
-    /// 生成扫描报告
+    /// [...]
     pub fn generateReport(self: *Self, result: *const ScanResult) ![]const u8 {
         var buf = std.ArrayList(u8).empty;
 
@@ -292,13 +292,13 @@ pub const SecurityScanner = struct {
         return buf.toOwnedSlice(self.allocator);
     }
 
-    /// 检查是否通过安全扫描
+    /// Check if[...]Security scan
     pub fn isSecure(self: *Self, result: *const ScanResult) bool {
         _ = self;
         return !result.hasCriticalOrHigh();
     }
 
-    // 规则检查函数
+    // [...]
     fn checkHardcodedSecret(source: []const u8) ?[]const u8 {
         const patterns = [_][]const u8{
             "password = \"",
@@ -310,7 +310,7 @@ pub const SecurityScanner = struct {
 
         for (patterns) |pattern| {
             if (std.mem.indexOf(u8, source, pattern) != null) {
-                return "检测到可能的硬编码密钥";
+                return "Possible hardcoded key detected";
             }
         }
         return null;
@@ -325,7 +325,7 @@ pub const SecurityScanner = struct {
 
         for (patterns) |pattern| {
             if (std.mem.indexOf(u8, source, pattern) != null) {
-                return "可能存在SQL注入风险";
+                return "Possible SQL injection risk";
             }
         }
         return null;
@@ -333,7 +333,7 @@ pub const SecurityScanner = struct {
 
     fn checkInsecureHttp(source: []const u8) ?[]const u8 {
         if (std.mem.indexOf(u8, source, "http://") != null) {
-            return "使用不安全的HTTP协议";
+            return "Insecure HTTP protocol used";
         }
         return null;
     }
@@ -347,32 +347,32 @@ pub const SecurityScanner = struct {
 
         for (patterns) |pattern| {
             if (std.mem.indexOf(u8, source, pattern) != null) {
-                return "使用了弱加密算法";
+                return "Weak encryption algorithm used";
             }
         }
         return null;
     }
 
     fn checkMissingAuth(source: []const u8) ?[]const u8 {
-        // 简化检查：查找API定义但缺少auth检查
+        // [...]API[...]auth[...]
         if (std.mem.indexOf(u8, source, "pub fn") != null and
             std.mem.indexOf(u8, source, "authorize") == null and
             std.mem.indexOf(u8, source, "authenticate") == null)
         {
-            return "公共函数可能缺少授权检查";
+            return "Public function may be missing auth check";
         }
         return null;
     }
 };
 
-/// 依赖漏洞检查器
+/// [...]Vulnerability[...]
 pub const DependencyScanner = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
     vulnerability_db: std.StringHashMap(Vulnerability),
 
-    /// 漏洞信息
+    /// VulnerabilityInfo
     pub const Vulnerability = struct {
         id: []const u8,
         package_name: []const u8,
@@ -404,7 +404,7 @@ pub const DependencyScanner = struct {
         self.vulnerability_db.deinit();
     }
 
-    /// 添加漏洞信息到数据库
+    /// [...]VulnerabilityInfo[...]
     pub fn addVulnerability(self: *Self, vuln: Vulnerability) !void {
         const key = try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{
             vuln.package_name,
@@ -424,7 +424,7 @@ pub const DependencyScanner = struct {
         try self.vulnerability_db.put(key, owned_vuln);
     }
 
-    /// 检查依赖是否存在已知漏洞
+    /// Check if dependency has knownVulnerability
     pub fn checkDependency(self: *Self, package_name: []const u8, version: []const u8) ?Vulnerability {
         _ = version;
         var iter = self.vulnerability_db.iterator();
@@ -437,11 +437,11 @@ pub const DependencyScanner = struct {
     }
 };
 
-/// 安全配置验证器
+/// [...]Validation[...]
 pub const SecurityConfigValidator = struct {
     const Self = @This();
 
-    /// 安全配置检查项
+    /// [...]
     pub const SecurityCheck = struct {
         name: []const u8,
         description: []const u8,
@@ -460,12 +460,12 @@ pub const SecurityConfigValidator = struct {
         self.checks.deinit();
     }
 
-    /// 添加安全检查
+    /// [...]
     pub fn addCheck(self: *Self, check: SecurityCheck) !void {
         try self.checks.append(check);
     }
 
-    /// 运行所有安全检查
+    /// [...]
     pub fn validateAll(self: *Self) ValidationResult {
         var result = ValidationResult{
             .passed = true,
@@ -492,7 +492,7 @@ pub const SecurityConfigValidator = struct {
     };
 };
 
-// 测试用例
+// Tests[...]
 test "SecurityScanner basic" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -502,7 +502,7 @@ test "SecurityScanner basic" {
     });
     defer scanner.deinit();
 
-    // 测试扫描有问题的代码
+    // Tests[...]
     const test_code =
         \\\const password = "secret123";
         \\\var api_key = "sk-1234567890";

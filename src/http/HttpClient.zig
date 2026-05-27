@@ -1,7 +1,7 @@
 const std = @import("std");
 const Time = @import("../core/Time.zig");
 
-/// HTTP 客户端 - 带连接池和重试机制
+/// HTTP client with connection pool and retry
 pub const HttpClient = struct {
     const Self = @This();
 
@@ -28,9 +28,9 @@ pub const HttpClient = struct {
 
             pub fn isAlive(self: Connection) bool {
                 if (self.stream == null) return false;
-                // 简化实现：检查是否超时
+                // Simplified: check timeout
                 const now = Time.monotonicNowSeconds();
-                return (now - self.last_used) < 30; // 30秒超时
+                return (now - self.last_used) < 30; // 30-second timeout
             }
         };
 
@@ -67,7 +67,7 @@ pub const HttpClient = struct {
             self.mutex.lock(self.io) catch return error.ServerError;
             defer self.mutex.unlock(self.io);
 
-            // 查找空闲连接
+            // Find idle connection
             for (self.idle_connections.items, 0..) |conn, i| {
                 if (std.mem.eql(u8, conn.host, host) and conn.port == port and conn.isAlive()) {
                     const connection = self.idle_connections.swapRemove(i);
@@ -76,7 +76,7 @@ pub const HttpClient = struct {
                 }
             }
 
-            // 创建新连接
+            // Create new connection
             if (self.active_connections.items.len >= self.max_connections) {
                 return error.PoolExhausted;
             }
@@ -102,7 +102,7 @@ pub const HttpClient = struct {
             self.mutex.lock(self.io) catch return;
             defer self.mutex.unlock(self.io);
 
-            // 从活跃连接中移除
+            // Remove from active connections
             for (self.active_connections.items, 0..) |active_conn, i| {
                 if (active_conn.stream != null and conn.stream != null and active_conn.stream.?.socket.handle == conn.stream.?.socket.handle) {
                     _ = self.active_connections.swapRemove(i);
@@ -110,7 +110,7 @@ pub const HttpClient = struct {
                 }
             }
 
-            // 如果连接还存活，放回空闲池
+            // Return to idle pool if still alive
             if (conn.isAlive()) {
                 var released_conn = conn;
                 released_conn.last_used = Time.monotonicNowSeconds();
@@ -229,7 +229,7 @@ pub const HttpClient = struct {
         self.connection_pool.deinit();
     }
 
-    /// 发送 HTTP 请求（带重试）
+    /// Send HTTP request (with retry)
     pub fn request(self: *Self, req: HttpRequest) !HttpResponse {
         var last_error: anyerror = error.Unknown;
 
@@ -251,7 +251,7 @@ pub const HttpClient = struct {
     }
 
     fn executeRequest(self: *Self, req: HttpRequest) !HttpResponse {
-        // 解析 URL
+        // Parse URL
         const parsed_url = try std.Uri.parse(req.url);
         const host_component = parsed_url.host orelse return error.InvalidUrl;
         var host_buf: [256]u8 = undefined;
@@ -261,23 +261,23 @@ pub const HttpClient = struct {
         else
             80;
 
-        // 获取连接
+        // Acquire connection
         var conn = try self.connection_pool.acquire(host, port);
         defer self.connection_pool.release(conn);
 
-        // 构建 HTTP 请求
+        // Build HTTP request
         var path_buf: [4096]u8 = undefined;
         const path_str = parsed_url.path.toRaw(&path_buf) catch "/";
         const request_line = try std.fmt.allocPrint(self.allocator, "{s} {s} HTTP/1.1\r\n", .{ req.method, path_str });
         defer self.allocator.free(request_line);
 
-        // 发送请求
+        // Send request
         if (conn.stream) |stream| {
             var write_buf: [4096]u8 = undefined;
             var w = stream.writer(self.connection_pool.io, &write_buf);
             _ = w.interface.writeAll(request_line) catch return error.ConnectionError;
 
-            // 发送 headers
+            // Send headers
             var iter = req.headers.iterator();
             while (iter.next()) |entry| {
                 const header_line = try std.fmt.allocPrint(self.allocator, "{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
@@ -287,12 +287,12 @@ pub const HttpClient = struct {
 
             _ = w.interface.writeAll("\r\n") catch return error.ConnectionError;
 
-            // 发送 body
+            // Send body
             if (req.body) |body| {
                 _ = w.interface.writeAll(body) catch return error.ConnectionError;
             }
 
-            // 读取响应（最小实现：解析 status line + headers + body）
+            // Read response (minimal: parse status line + headers + body)
             const response = try self.readResponse(stream);
 
             conn.request_count += 1;
@@ -371,14 +371,14 @@ pub const HttpClient = struct {
         return resp;
     }
 
-    /// GET 请求
+    /// GET [...]
     pub fn get(self: *Self, url: []const u8) !HttpResponse {
         var req = HttpRequest.init(self.allocator, "GET", url);
         defer req.deinit();
         return self.request(req);
     }
 
-    /// POST 请求
+    /// POST [...]
     pub fn post(self: *Self, url: []const u8, body: []const u8) !HttpResponse {
         var req = HttpRequest.init(self.allocator, "POST", url);
         defer req.deinit();
@@ -387,7 +387,7 @@ pub const HttpClient = struct {
         return self.request(req);
     }
 
-    /// PUT 请求
+    /// PUT [...]
     pub fn put(self: *Self, url: []const u8, body: []const u8) !HttpResponse {
         var req = HttpRequest.init(self.allocator, "PUT", url);
         defer req.deinit();
@@ -396,7 +396,7 @@ pub const HttpClient = struct {
         return self.request(req);
     }
 
-    /// DELETE 请求
+    /// DELETE [...]
     pub fn delete(self: *Self, url: []const u8) !HttpResponse {
         var req = HttpRequest.init(self.allocator, "DELETE", url);
         defer req.deinit();

@@ -939,7 +939,7 @@ const Router = struct {
         return root;
     }
 
-    /// 遍历 trie 树，收集所有已注册路由的 (method, path) 信息
+    /// [...] trie [...]Register route[...] (method, path) Info
     pub fn listRoutes(self: *const Router, alloc: std.mem.Allocator) ![]const RouteInfo {
         var result = std.ArrayList(RouteInfo).empty;
 

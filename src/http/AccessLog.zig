@@ -8,16 +8,16 @@ const Time = @import("../core/Time.zig");
 /// redacted to prevent credential leakage in log output.
 ///
 /// Sensitive headers redacted: Authorization, X-API-Key, Cookie, Set-Cookie
-///   - 请求体大小
-///   - 响应体大小
+/// - Request body[...]
+/// - [...]
 ///   - User-Agent
-///   - 客户端 IP
+/// - [...] IP
 ///
-/// 用法:
+/// Usage:
 ///   var logger = AccessLogger.init(allocator);
 ///   server.addMiddleware(.{ .func = accessLogMiddleware(&logger) });
 ///
-/// 获取日志:
+/// [...]:
 ///   const entries = logger.getEntries();
 ///   const json = try logger.toJson(allocator);
 pub const AccessLogger = struct {
@@ -57,7 +57,7 @@ pub const AccessLogger = struct {
         self.entries.deinit(self.allocator);
     }
 
-    /// 记录日志条目
+    /// [...]
     pub fn log(self: *Self, entry: LogEntry) !void {
         const method_copy = try self.allocator.dupe(u8, entry.method);
         errdefer self.allocator.free(method_copy);
@@ -86,17 +86,17 @@ pub const AccessLogger = struct {
         }
     }
 
-    /// 获取所有日志条目
+    /// [...]
     pub fn getEntries(self: *Self) []const LogEntry {
         return self.entries.items;
     }
 
-    /// 获取日志条目数量
+    /// [...]
     pub fn count(self: *Self) usize {
         return self.entries.items.len;
     }
 
-    /// 按状态码过滤
+    /// [...]
     pub fn filterByStatus(self: *Self, buf: []LogEntry, status: u16) []LogEntry {
         var n: usize = 0;
         for (self.entries.items) |entry| {
@@ -108,7 +108,7 @@ pub const AccessLogger = struct {
         return buf[0..n];
     }
 
-    /// 按路径前缀过滤
+    /// [...]
     pub fn filterByPath(self: *Self, buf: []LogEntry, prefix: []const u8) []LogEntry {
         var n: usize = 0;
         for (self.entries.items) |entry| {
@@ -120,7 +120,7 @@ pub const AccessLogger = struct {
         return buf[0..n];
     }
 
-    /// 导出为 JSON 数组
+    /// [...] JSON [...]
     pub fn toJson(self: *Self) ![]const u8 {
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
@@ -161,7 +161,7 @@ pub const AccessLogger = struct {
     }
 };
 
-/// 访问日志中间件 — 自动记录每个请求
+/// Access logMiddleware — [...]
 pub fn accessLogMiddleware(logger: *AccessLogger) api.MiddlewareFn {
     const S = struct {
         fn handler(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
@@ -169,13 +169,13 @@ pub fn accessLogMiddleware(logger: *AccessLogger) api.MiddlewareFn {
 
             const start = Time.monotonicNowSeconds();
 
-            // 记录请求信息
+            // [...]Info
             const method = ctx.method.toString();
             const path = ctx.path;
             const body_len = if (ctx.body) |b| b.len else 0;
 
             next(ctx, next, null) catch |err| {
-                // 记录错误
+                // [...]Error
                 const elapsed = Time.monotonicNowSeconds() - start;
                 log.log(.{
                     .timestamp = start,

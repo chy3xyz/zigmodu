@@ -1,12 +1,12 @@
 const std = @import("std");
 const Validator = @import("../../validation/Validator.zig");
 
-/// 声明式请求体验证中间件
+/// [...]Request bodyValidation middleware
 ///
-/// 使用 Validator.FieldRules 做编译期结构体验证，
-/// 在 HTTP 层自动校验请求体，失败时返回 RFC 7807 格式错误
+/// [...] Validator.FieldRules [...]Validation[...]
+/// [...] HTTP [...]Request body[...]failure[...] RFC 7807 [...]Error
 ///
-/// 用法:
+/// Usage:
 ///   const UserReq = struct { name: []const u8, email: []const u8, age: u32 };
 ///
 ///   const rules = .{
@@ -39,24 +39,24 @@ pub fn validateRequest(
     }
 }
 
-/// 声明式请求体验证中间件 (自动验证模式)
+/// [...]Request bodyValidation middleware ([...]Validation[...])
 ///
-/// 注册到 Middleware chain 后，自动对带有 `X-Validate` header 的请求进行验证。
-/// 或者始终对匹配的路径+方法进行验证。
+/// [...] Middleware chain [...] `X-Validate` header [...]Validation[...]
+/// Or always for matching paths+[...]Validation[...]
 ///
-/// 用法:
+/// Usage:
 ///   server.addMiddleware(.{ .func = validationMiddleware() });
 ///
-/// 客户端可传 X-Validate-Schema: UserReq 来指定验证规则
+/// [...] X-Validate-Schema: UserReq [...]Validation[...]
 pub fn validationMiddleware() api.MiddlewareFn {
     const S = struct {
         fn handler(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
             _ = user_data;
 
-            // 检查是否请求验证
+            // Check ifRequest validation
             if (ctx.header("X-Validate")) |_| {
-                // 标记: 请求需要验证 (简化实现)
-                // 实际使用中，可在 handler 内调用 validateRequest
+                // [...]: [...]Validation ([...])
+                // [...] handler [...]call validateRequest
             }
 
             try next(ctx, next, null);

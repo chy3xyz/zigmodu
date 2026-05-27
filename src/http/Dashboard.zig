@@ -4,7 +4,7 @@ const Server = @import("../api/Server.zig");
 const Context = Server.Context;
 const HandlerFn = Server.HandlerFn;
 
-/// 系统信息 (单例)
+/// System information ([...])
 pub var system_info = SystemInfo{
     .version = "0.8.0",
     .zig_version = "0.16.0",
@@ -25,24 +25,24 @@ pub const SystemInfo = struct {
     test_skipped: usize,
 };
 
-/// 注册所有 Dashboard 路由到 HTTP Server
+/// [...] Dashboard [...] HTTP Server
 pub fn registerRoutes(server_or_group: anytype) !void {
-    // HTML 页面
+    // HTML [...]
     try server_or_group.get("/", handleIndex, null);
     try server_or_group.get("/dashboard", handleIndex, null);
 
-    // API 端点
+    // API endpoint
     try server_or_group.get("/api/dashboard/modules", handleModules, null);
     try server_or_group.get("/api/dashboard/stats", handleStats, null);
     try server_or_group.get("/api/dashboard/system", handleSystem, null);
 }
 
-/// Dashboard HTML 页面
+/// Dashboard HTML [...]
 fn handleIndex(ctx: *Context) !void {
     try ctx.text(200, DASHBOARD_HTML);
 }
 
-/// API: 模块列表
+/// API: Module list
 fn handleModules(ctx: *Context) !void {
     if (system_info.module_count == 0) {
         try ctx.json(200, "{\"modules\":[],\"count\":0}");
@@ -70,7 +70,7 @@ fn handleModules(ctx: *Context) !void {
     try ctx.json(200, json);
 }
 
-/// API: 统计数据
+/// API: [...]
 fn handleStats(ctx: *Context) !void {
     const now = Time.monotonicNowSeconds();
     const uptime = now - system_info.started_at;
@@ -90,7 +90,7 @@ fn handleStats(ctx: *Context) !void {
     try ctx.json(200, json);
 }
 
-/// API: 系统信息
+/// API: System information
 fn handleSystem(ctx: *Context) !void {
     const now = Time.monotonicNowSeconds();
     const uptime = now - system_info.started_at;
@@ -109,7 +109,7 @@ fn handleSystem(ctx: *Context) !void {
     try ctx.json(200, json);
 }
 
-/// 完整的 Dashboard HTML (HTMX + Alpine.js + TailwindCSS CDN)
+/// [...] Dashboard HTML (HTMX + Alpine.js + TailwindCSS CDN)
 const DASHBOARD_HTML =
     \\<!DOCTYPE html>
     \\<html lang="en" class="dark">

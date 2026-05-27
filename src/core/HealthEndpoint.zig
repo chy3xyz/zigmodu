@@ -1,8 +1,8 @@
 const std = @import("std");
 const Time = @import("Time.zig");
 
-/// 健康检查端点
-/// 提供应用和模块的健康状态
+/// Health check endpoint
+/// Provide app and module health status
 pub const HealthEndpoint = struct {
     const Self = @This();
 
@@ -66,7 +66,7 @@ pub const HealthEndpoint = struct {
         try self.checks.put(name_copy, .{ .name = name_copy, .check_fn = check_fn, .context = context, .description = desc_copy });
     }
 
-    /// 执行所有健康检查
+    /// [...]Health check
     pub fn checkHealth(self: *Self) HealthDetails {
         var components = std.StringHashMap(ComponentHealth).init(self.allocator);
         var overall_status = HealthStatus.UP;
@@ -82,7 +82,7 @@ pub const HealthEndpoint = struct {
 
             components.put(check.name, health) catch {};
 
-            // 如果有任何组件不健康，整体状态为DOWN
+            // If any component is unhealthy[...]DOWN
             if (status != .UP) {
                 overall_status = .DOWN;
             }
@@ -97,12 +97,12 @@ pub const HealthEndpoint = struct {
         };
     }
 
-    /// 获取整体健康状态
+    /// [...]
     pub fn getStatus(self: *Self) HealthStatus {
         return self.status;
     }
 
-    /// 生成JSON格式的健康报告
+    /// [...]JSON[...]
     pub fn toJson(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
         var buf = std.ArrayList(u8).empty;
         const health = self.checkHealth();

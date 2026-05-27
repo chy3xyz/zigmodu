@@ -1,11 +1,11 @@
 const std = @import("std");
 
-/// 请求级租户上下文 — 在 HTTP 中间件中设置，在 SQL 拦截器中读取
+/// Request-scoped tenant context — set in HTTP middleware, read in SQL interceptor
 pub const TenantContext = struct {
     tenant_id: i64 = 0,
-    ignore: bool = false, // 是否跳过租户过滤
+    ignore: bool = false, // Skip tenant filtering
 
-    /// 从请求路径或 JWT 中设置租户 ID
+    /// Set tenant ID from request path or JWT
     pub fn set(self: *TenantContext, id: i64) void {
         self.tenant_id = id;
     }
@@ -14,7 +14,7 @@ pub const TenantContext = struct {
         return self.tenant_id;
     }
 
-    /// 临时忽略租户过滤（对标 @TenantIgnore 注解）
+    /// Temporarily ignore tenant filtering (like @TenantIgnore annotation)
     pub fn ignoreTenant(self: *TenantContext) void {
         self.ignore = true;
     }
@@ -28,15 +28,15 @@ pub const TenantContext = struct {
     }
 };
 
-/// 全局默认租户上下文（非并发场景使用）
+/// Global default tenant context (non-concurrent use)
 var default_context = TenantContext{};
 
 pub fn getDefault() *TenantContext {
     return &default_context;
 }
 
-/// 租户 ID 的 SQL 列名（可配置）
+/// SQL column name for tenant ID (configurable)
 pub const TENANT_COLUMN = "tenant_id";
 
-/// comptime marker: struct 如果声明了这个字段，表示忽略租户过滤
+/// comptime marker: struct declares this field to skip tenant filtering
 pub const IGNORE_TENANT_FIELD = "zigmodu_ignore_tenant";

@@ -1,26 +1,26 @@
 const std = @import("std");
 
-/// RFC 7807 Problem Details — 统一 HTTP 错误响应格式
+/// RFC 7807 Problem Details — [...] HTTP Error[...]
 /// https://tools.ietf.org/html/rfc7807
 ///
-/// 用法:
+/// Usage:
 ///   const problem = ProblemDetails.init(allocator, 404, "User not found", "/users/42");
 ///   try ctx.json(problem.status, try problem.toJson());
 pub const ProblemDetails = struct {
-    /// HTTP 状态码
+    /// HTTP status code
     status: u16,
-    /// 简短错误标题 (如 "Not Found")
+    /// [...]Error[...] ([...] "Not Found")
     title: []const u8,
-    /// 详细错误描述
+    /// [...]Error[...]
     detail: []const u8,
-    /// 产生错误的请求 URI
+    /// [...]Error[...] URI
     instance: ?[]const u8 = null,
-    /// 自定义错误类型 URI (如 "https://api.example.com/errors/validation-failed")
+    /// [...]Error type URI ([...] "https://api.example.com/errors/validation-failed")
     type: ?[]const u8 = null,
 
     const Self = @This();
 
-    /// 标准 HTTP 状态标题映射
+    /// [...] HTTP [...]
     pub fn statusTitle(status: u16) []const u8 {
         return switch (status) {
             400 => "Bad Request",
@@ -41,7 +41,7 @@ pub const ProblemDetails = struct {
         };
     }
 
-    /// 创建一个 ProblemDetails
+    /// [...] ProblemDetails
     pub fn init(status: u16, detail: []const u8, instance: ?[]const u8) ProblemDetails {
         return .{
             .status = status,
@@ -51,7 +51,7 @@ pub const ProblemDetails = struct {
         };
     }
 
-    /// 创建一个带自定义类型的 ProblemDetails
+    /// Create one with custom type ProblemDetails
     pub fn initTyped(status: u16, err_type: []const u8, detail: []const u8) ProblemDetails {
         return .{
             .status = status,
@@ -61,7 +61,7 @@ pub const ProblemDetails = struct {
         };
     }
 
-    /// 序列化为 JSON
+    /// [...] JSON
     pub fn toJson(self: *const Self, allocator: std.mem.Allocator) ![]const u8 {
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(allocator);
@@ -96,7 +96,7 @@ pub const ProblemDetails = struct {
     }
 };
 
-/// 批量验证错误 (RFC 7807 扩展 — 多个字段错误)
+/// [...]ValidationError (RFC 7807 [...] — [...]Field error)
 pub const ValidationProblem = struct {
     base: ProblemDetails,
     errors: []const FieldError,
@@ -107,7 +107,7 @@ pub const ValidationProblem = struct {
         code: ?[]const u8 = null,
     };
 
-    /// 创建验证错误
+    /// [...]ValidationError
     pub fn init(status: u16, detail: []const u8, field_errors: []const FieldError) ValidationProblem {
         return .{
             .base = ProblemDetails.init(status, detail, null),
@@ -115,7 +115,7 @@ pub const ValidationProblem = struct {
         };
     }
 
-    /// 序列化为 JSON (含 errors 数组)
+    /// [...] JSON ([...] errors [...])
     pub fn toJson(self: *const ValidationProblem, allocator: std.mem.Allocator) ![]const u8 {
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(allocator);
@@ -135,7 +135,7 @@ pub const ValidationProblem = struct {
         try buf.appendSlice(allocator, "\"");
         try Emit.field(&buf, allocator, ",\"detail\":\"{s}\"", .{self.base.detail});
 
-        // errors 数组
+        // errors [...]
         try buf.appendSlice(allocator, ",\"errors\":[");
         for (self.errors, 0..) |err, i| {
             if (i > 0) try buf.appendSlice(allocator, ",");
@@ -155,7 +155,7 @@ pub const ValidationProblem = struct {
     }
 };
 
-/// HTTP 错误响应辅助函数 — 用于路由 handler
+/// HTTP Error[...] — for[...] handler
 pub fn sendProblem(ctx: anytype, status: u16, detail: []const u8) !void {
     const problem = ProblemDetails.init(status, detail, null);
     const json = try problem.toJson(ctx.allocator);

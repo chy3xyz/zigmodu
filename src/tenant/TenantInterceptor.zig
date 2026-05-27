@@ -1,7 +1,7 @@
 const std = @import("std");
 const TenantContext = @import("TenantContext.zig");
 
-/// 租户 SQL 拦截器 — 在 ORM 查询中自动注入 tenant_id 条件
+/// Tenant SQL interceptor — auto-injects tenant_id into ORM queries
 pub const TenantInterceptor = struct {
     allocator: std.mem.Allocator,
 
@@ -9,7 +9,7 @@ pub const TenantInterceptor = struct {
         return .{ .allocator = allocator };
     }
 
-    /// 检查 struct 是否声明了忽略租户标记
+    /// Check if struct declares tenant-ignore marker
     pub fn isTenantIgnored(comptime T: type) bool {
         if (@hasDecl(T, "zigmodu_ignore_tenant")) {
             return T.zigmodu_ignore_tenant;
@@ -17,7 +17,7 @@ pub const TenantInterceptor = struct {
         return false;
     }
 
-    /// 检查 struct 是否有 tenant_id 字段
+    /// Check if struct has tenant_id field
     pub fn hasTenantField(comptime T: type) bool {
         const info = @typeInfo(T);
         if (info != .@"struct") return false;
@@ -27,7 +27,7 @@ pub const TenantInterceptor = struct {
         return false;
     }
 
-    /// 包装 SELECT 查询，自动追加 AND tenant_id = ?
+    /// Wrap SELECT query, auto-append AND tenant_id = ?
     pub fn wrapSelect(
         self: *TenantInterceptor,
         ctx: *const TenantContext,
@@ -42,30 +42,30 @@ pub const TenantInterceptor = struct {
         );
     }
 
-    /// 构建 WHERE 子句的租户条件片段
+    /// Build tenant condition fragment for WHERE clause
     pub fn tenantWhere(ctx: *const TenantContext) ?[]const u8 {
         if (!ctx.isActive()) return null;
         return "WHERE " ++ TenantContext.TENANT_COLUMN ++ " = ?";
     }
 
-    /// 构建 AND 租户条件片段
+    /// Build AND tenant condition fragment
     pub fn tenantAnd(ctx: *const TenantContext) ?[]const u8 {
         if (!ctx.isActive()) return null;
         return "AND " ++ TenantContext.TENANT_COLUMN ++ " = ?";
     }
 
-    /// 获取当前租户 ID
+    /// Get current tenant ID
     pub fn tenantId(ctx: *const TenantContext) i64 {
         return ctx.tenant_id;
     }
 };
 
-/// ORM Repository 的租户感知 helper — 编译期检查
+/// Tenant-aware ORM Repository helper — comptime checks
 pub fn TenantRepository(comptime T: type) type {
     return struct {
         const Self = @This();
 
-        /// 在查询前自动追加租户条件
+        /// Auto-append tenant condition before query
         pub fn buildTenantWhere(comptime base_where: []const u8) []const u8 {
             if (TenantInterceptor.isTenantIgnored(T)) return base_where;
             if (!TenantInterceptor.hasTenantField(T)) return base_where;

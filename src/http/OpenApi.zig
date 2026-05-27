@@ -1,12 +1,12 @@
 const std = @import("std");
 
-/// OpenAPI 规范版本
+/// OpenAPI [...]
 pub const OpenApiVersion = enum {
     v3_0,
     v3_1,
 };
 
-/// HTTP 方法
+/// HTTP [...]
 pub const HttpMethod = enum {
     GET,
     POST,
@@ -17,7 +17,7 @@ pub const HttpMethod = enum {
     OPTIONS,
 };
 
-/// 参数位置
+/// [...]
 pub const ParamLocation = enum {
     query,
     path,
@@ -25,7 +25,7 @@ pub const ParamLocation = enum {
     cookie,
 };
 
-/// API 端点参数定义
+/// API endpoint[...]
 pub const ApiParam = struct {
     name: []const u8,
     location: ParamLocation,
@@ -34,7 +34,7 @@ pub const ApiParam = struct {
     description: []const u8 = "",
 };
 
-/// API 端点定义
+/// API endpoint[...]
 pub const ApiEndpoint = struct {
     method: HttpMethod,
     path: []const u8,
@@ -47,7 +47,7 @@ pub const ApiEndpoint = struct {
     deprecated: bool = false,
 };
 
-/// 请求体定义
+/// Request body[...]
 pub const RequestBody = struct {
     content_type: []const u8 = "application/json",
     description: []const u8 = "",
@@ -55,14 +55,14 @@ pub const RequestBody = struct {
     schema_ref: ?[]const u8 = null,
 };
 
-/// API 响应定义
+/// API response[...]
 pub const ApiResponse = struct {
     status_code: u16,
     description: []const u8,
     schema_ref: ?[]const u8 = null,
 };
 
-/// 数据模型/ Schema 定义
+/// [...]/ Schema [...]
 pub const ApiSchema = struct {
     name: []const u8,
     schema_type: []const u8 = "object",
@@ -71,7 +71,7 @@ pub const ApiSchema = struct {
     description: []const u8 = "",
 };
 
-/// Schema 属性
+/// Schema [...]
 pub const SchemaProperty = struct {
     name: []const u8,
     prop_type: []const u8,
@@ -82,8 +82,8 @@ pub const SchemaProperty = struct {
     enum_values: ?[]const []const u8 = null,
 };
 
-/// OpenAPI 文档生成器
-/// 从路由元数据生成 OpenAPI 3.0/3.1 JSON
+/// OpenAPI [...]
+/// [...] OpenAPI 3.0/3.1 JSON
 pub const OpenApiGenerator = struct {
     const Self = @This();
 
@@ -155,12 +155,12 @@ pub const OpenApiGenerator = struct {
         self.tags.deinit(self.allocator);
     }
 
-    /// 注册 API 端点
+    /// [...] API endpoint
     pub fn addEndpoint(self: *Self, endpoint: ApiEndpoint) !void {
         const owned = try self.cloneEndpoint(endpoint);
         try self.endpoints.append(self.allocator, owned);
 
-        // 收集 tags
+        // [...] tags
         for (owned.tags) |tag| {
             var found = false;
             for (self.tags.items) |existing| {
@@ -175,13 +175,13 @@ pub const OpenApiGenerator = struct {
         }
     }
 
-    /// 注册 Schema
+    /// [...] Schema
     pub fn addSchema(self: *Self, schema: ApiSchema) !void {
         const owned = try self.cloneSchema(schema);
         try self.schemas.append(self.allocator, owned);
     }
 
-    /// 生成 OpenAPI JSON 文档
+    /// [...] OpenAPI JSON [...]
     pub fn generate(self: *Self) ![]const u8 {
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);

@@ -2,7 +2,7 @@ const std = @import("std");
 const crypto = std.crypto;
 const Time = @import("../core/Time.zig");
 
-/// 安全模块 - 提供认证、授权、加密功能
+/// Security module - [...]Encrypt[...]
 pub const SecurityModule = struct {
     const Self = @This();
 
@@ -33,7 +33,7 @@ pub const SecurityModule = struct {
         _ = self;
     }
 
-    /// JWT Token 结构
+    /// JWT Token [...]
     pub const JwtToken = struct {
         header: JwtHeader,
         payload: JwtPayload,
@@ -53,7 +53,7 @@ pub const SecurityModule = struct {
             roles: []const []const u8, // user roles
         };
 
-        /// 生成 JWT Token 字符串
+        /// [...] JWT Token [...]
         pub fn toString(self: JwtToken, allocator: std.mem.Allocator) ![]const u8 {
             // Base64 encode header
             const header_json = try std.json.Stringify.valueAlloc(allocator, self.header, .{});
@@ -76,7 +76,7 @@ pub const SecurityModule = struct {
         }
     };
 
-    /// 生成 JWT Token
+    /// [...] JWT Token
     pub fn generateToken(
         self: *Self,
         user_id: []const u8,
@@ -85,7 +85,7 @@ pub const SecurityModule = struct {
         return self.generateTokenWithTenant(user_id, roles, "zigmodu-app");
     }
 
-    /// 生成 JWT Token with tenant_id as aud claim
+    /// [...] JWT Token with tenant_id as aud claim
     pub fn generateTokenWithTenant(
         self: *Self,
         user_id: []const u8,
@@ -123,11 +123,11 @@ pub const SecurityModule = struct {
         const signature = try self.sign(signature_base);
         defer self.allocator.free(signature);
 
-        // 直接构建token字符串，避免中间结构体
+        // [...]token[...]
         return std.fmt.allocPrint(self.allocator, "{s}.{s}.{s}", .{ header_b64, payload_b64, signature });
     }
 
-    /// 验证 JWT Token
+    /// Validation JWT Token
     pub fn verifyToken(self: *Self, token_string: []const u8) !JwtToken.JwtPayload {
         // Split token
         var parts = std.mem.splitSequence(u8, token_string, ".");
@@ -201,7 +201,7 @@ pub const SecurityModule = struct {
         self.allocator.free(payload.roles);
     }
 
-    /// HMAC-SHA256 签名
+    /// HMAC-SHA256 [...]
     fn sign(self: *Self, data: []const u8) ![]const u8 {
         var hmac = crypto.auth.hmac.sha2.HmacSha256.init(self.jwt_secret);
         hmac.update(data);
@@ -241,7 +241,7 @@ pub const SecurityModule = struct {
         return std.fmt.allocPrint(self.allocator, "$pbkdf2$600000${s}${s}", .{ salt_b64, hash_b64 });
     }
 
-    /// 验证密码
+    /// Verify password
     pub fn verifyPassword(self: *Self, password: []const u8, hash: []const u8) bool {
         // Parse hash: $pbkdf2$<iterations>$<salt>$<hash>
         var parts = std.mem.splitSequence(u8, hash, "$");
@@ -272,7 +272,7 @@ pub const SecurityModule = struct {
         return timingSafeSliceEql(hash_b64, expected_hash_b64);
     }
 
-    /// 检查角色权限
+    /// [...]RolePermission
     pub fn hasRole(payload: JwtToken.JwtPayload, role: []const u8) bool {
         for (payload.roles) |r| {
             if (std.mem.eql(u8, r, role)) {
@@ -282,7 +282,7 @@ pub const SecurityModule = struct {
         return false;
     }
 
-    /// 检查任意角色
+    /// [...]Role
     pub fn hasAnyRole(payload: JwtToken.JwtPayload, roles: []const []const u8) bool {
         for (roles) |role| {
             if (hasRole(payload, role)) {
@@ -292,7 +292,7 @@ pub const SecurityModule = struct {
         return false;
     }
 
-    /// 检查所有角色
+    /// [...]Role
     pub fn hasAllRoles(payload: JwtToken.JwtPayload, roles: []const []const u8) bool {
         for (roles) |role| {
             if (!hasRole(payload, role)) {
@@ -303,7 +303,7 @@ pub const SecurityModule = struct {
     }
 };
 
-/// 常量时间切片比较 (Zig 0.16 timing_safe.eql 只接受数组/向量)
+/// [...] (Zig 0.16 timing_safe.eql [...]/[...])
 fn timingSafeSliceEql(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     var acc: u8 = 0;
@@ -315,7 +315,7 @@ fn timingSafeSliceEql(a: []const u8, b: []const u8) bool {
     return @as(bool, @bitCast(@as(u1, @truncate((extended -% 1) >> s))));
 }
 
-/// Base64 URL 编码 (JWT 标准)
+/// Base64 URL [...] (JWT [...])
 fn base64UrlEncode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     const encoder = std.base64.Base64Encoder.init(std.base64.standard_alphabet_chars, '=');
     const encoded = try allocator.alloc(u8, encoder.calcSize(data.len));
@@ -336,7 +336,7 @@ fn base64UrlEncode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     return try allocator.realloc(encoded, len);
 }
 
-/// Base64 URL 解码
+/// Base64 URL [...]
 fn base64UrlDecode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     // Restore padding
     const padding_needed = (4 - (data.len % 4)) % 4;
@@ -361,7 +361,7 @@ fn base64UrlDecode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     return decoded;
 }
 
-/// 标准 Base64 编码
+/// [...] Base64 [...]
 fn base64Encode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     const encoder = std.base64.Base64Encoder.init(std.base64.standard_alphabet_chars, '=');
     const encoded = try allocator.alloc(u8, encoder.calcSize(data.len));
@@ -369,7 +369,7 @@ fn base64Encode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     return encoded;
 }
 
-/// 标准 Base64 解码
+/// [...] Base64 [...]
 fn base64Decode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     const decoder = std.base64.Base64Decoder.init(std.base64.standard_alphabet_chars, '=');
     const decoded = try allocator.alloc(u8, decoder.calcSizeForSlice(data) catch return error.InvalidEncoding);

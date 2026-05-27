@@ -1,28 +1,28 @@
 const std = @import("std");
 const Time = @import("../core/Time.zig");
 
-/// 功能标志条目
+/// [...]
 pub const FeatureFlag = struct {
-    /// 唯一标志名
+    /// [...]
     key: []const u8,
-    /// 是否启用
+    /// [...]
     enabled: bool,
-    /// 标志描述
+    /// [...]
     description: []const u8,
-    /// 创建时间
+    /// [...]
     created_at: i64,
-    /// 最后修改时间
+    /// [...]
     updated_at: i64,
-    /// 灰度百分比 (0-100, 0=完全关闭, 100=完全开启)
+    /// [...] (0-100, 0=[...]CLOSED, 100=[...])
     rollout_percent: u8 = 100,
-    /// 白名单用户/租户 ID 列表
+    /// [...]/[...] ID [...]
     whitelist: []const []const u8 = &.{},
 };
 
-/// 功能标志管理器
-/// 运行时特性开关，支持百分比灰度和白名单
+/// [...]
+/// [...]Feature flags[...]Support percentage rollout and allowlist
 ///
-/// 用法:
+/// Usage:
 ///   var flags = FeatureFlagManager.init(allocator);
 ///   try flags.set("new-checkout", true, "New checkout flow", 10); // 10% rollout
 ///   if (flags.isEnabled("new-checkout", "user-123")) { ... }
@@ -31,7 +31,7 @@ pub const FeatureFlagManager = struct {
 
     allocator: std.mem.Allocator,
     flags: std.StringHashMap(FeatureFlag),
-    /// 变更回调
+    /// [...]
     change_listeners: std.ArrayList(*const fn ([]const u8, FeatureFlag) void),
 
     pub fn init(allocator: std.mem.Allocator) Self {
@@ -54,7 +54,7 @@ pub const FeatureFlagManager = struct {
         self.change_listeners.deinit(self.allocator);
     }
 
-    /// 设置功能标志
+    /// [...]
     pub fn set(self: *Self, key: []const u8, enabled: bool, description: []const u8, rollout_percent: u8) !void {
         const now = Time.monotonicNowSeconds();
 
@@ -76,21 +76,21 @@ pub const FeatureFlagManager = struct {
 
         try self.flags.put(key_copy, flag);
 
-        // 通知变更监听器
+        // [...]
         for (self.change_listeners.items) |listener| {
             listener(key_copy, flag);
         }
     }
 
-    /// 为灰度发布设置白名单
+    /// [...]publish[...]
     pub fn setWhitelist(self: *Self, key: []const u8, whitelist: []const []const u8) !void {
         const flag = self.flags.getPtr(key) orelse return error.FlagNotFound;
 
-        // 释放旧白名单
+        // [...]
         for (flag.whitelist) |w| self.allocator.free(w);
         self.allocator.free(flag.whitelist);
 
-        // 复制新白名单
+        // [...]
         var new_whitelist = try self.allocator.alloc([]const u8, whitelist.len);
         for (whitelist, 0..) |entry, i| {
             new_whitelist[i] = try self.allocator.dupe(u8, entry);
@@ -98,28 +98,28 @@ pub const FeatureFlagManager = struct {
         flag.whitelist = new_whitelist;
     }
 
-    /// 检查标志是否对特定用户启用
-    /// 考虑全局 enabled + rollout_percent + whitelist
+    /// Check if flag is enabled for specific user
+    /// [...] enabled + rollout_percent + whitelist
     pub fn isEnabled(self: *Self, key: []const u8, user_id: ?[]const u8) bool {
         const flag = self.flags.get(key) orelse return false;
 
-        // 全局关闭
+        // [...]CLOSED
         if (!flag.enabled) return false;
 
-        // 检查白名单 (无论 rollout 百分比，白名单始终优先)
+        // [...] ([...] rollout [...])
         if (user_id) |uid| {
             for (flag.whitelist) |w| {
                 if (std.mem.eql(u8, w, uid)) return true;
             }
         }
 
-        // 100% 开启
+        // 100% [...]
         if (flag.rollout_percent == 100) return true;
 
-        // 0% 开启
+        // 0% [...]
         if (flag.rollout_percent == 0) return false;
 
-        // 百分比灰度: 使用用户 ID 的 hash 决定
+        // [...]: [...] ID [...] hash [...]
         if (user_id) |uid| {
             const hash = hashString(uid);
             const bucket = @mod(hash, @as(u32, 100));
@@ -129,18 +129,18 @@ pub const FeatureFlagManager = struct {
         return false;
     }
 
-    /// 获取标志的纯启用状态 (不检查百分比/白名单)
+    /// Get flag pure enabled state ([...]/[...])
     pub fn isGloballyEnabled(self: *Self, key: []const u8) bool {
         const flag = self.flags.get(key) orelse return false;
         return flag.enabled;
     }
 
-    /// 获取标志
+    /// [...]
     pub fn get(self: *Self, key: []const u8) ?FeatureFlag {
         return self.flags.get(key);
     }
 
-    /// 删除标志
+    /// [...]
     pub fn remove(self: *Self, key: []const u8) bool {
         if (self.flags.fetchRemove(key)) |removed| {
             self.allocator.free(removed.key);
@@ -152,7 +152,7 @@ pub const FeatureFlagManager = struct {
         return false;
     }
 
-    /// 列出所有标志
+    /// [...]
     pub fn list(self: *Self) ![]const []const u8 {
         var keys = std.ArrayList([]const u8).empty;
         var iter = self.flags.keyIterator();
@@ -162,7 +162,7 @@ pub const FeatureFlagManager = struct {
         return keys.toOwnedSlice(self.allocator);
     }
 
-    /// 列出所有已启用的标志
+    /// List all enabled flags
     pub fn listEnabled(self: *Self) ![]const []const u8 {
         var keys = std.ArrayList([]const u8).empty;
         var iter = self.flags.iterator();
@@ -174,19 +174,19 @@ pub const FeatureFlagManager = struct {
         return keys.toOwnedSlice(self.allocator);
     }
 
-    /// 注册变更监听器
+    /// [...]
     pub fn onChange(self: *Self, listener: *const fn ([]const u8, FeatureFlag) void) !void {
         try self.change_listeners.append(self.allocator, listener);
     }
 
-    /// 标志总数
+    /// [...]
     pub fn count(self: *Self) usize {
         return self.flags.count();
     }
 
-    /// 从 JSON 内容批量加载功能标志
+    /// [...] JSON Content batch load feature flag
     pub fn loadFromJsonContent(self: *Self, content: []const u8) !void {
-        // 格式: {"flag_name": true, "flag2": false}
+        // [...]: {"flag_name": true, "flag2": false}
         var i: usize = 0;
         while (i < content.len) : (i += 1) {
             while (i < content.len and (content[i] == ' ' or content[i] == '\n' or content[i] == '{' or content[i] == '}' or content[i] == ',')) : (i += 1) {}
@@ -213,7 +213,7 @@ pub const FeatureFlagManager = struct {
     }
 };
 
-/// 简单的字符串哈希 (用于灰度分桶)
+/// [...] (for[...])
 fn hashString(s: []const u8) u32 {
     var hash: u32 = 5381;
     for (s) |c| {
@@ -245,7 +245,7 @@ test "FeatureFlagManager rollout percentage" {
 
     try ffs.set("canary", true, "Canary deployment", 50);
 
-    // 统计 100 个用户的启用率
+    // [...] 100 [...]
     var enabled_count: usize = 0;
     for (0..100) |i| {
         const user_id = try std.fmt.allocPrint(allocator, "user-{d}", .{i});
@@ -253,7 +253,7 @@ test "FeatureFlagManager rollout percentage" {
         if (ffs.isEnabled("canary", user_id)) enabled_count += 1;
     }
 
-    // 期望大约 50% 的用户启用
+    // [...] 50% [...]
     try std.testing.expect(enabled_count > 20 and enabled_count < 80);
 }
 
@@ -262,7 +262,7 @@ test "FeatureFlagManager whitelist" {
     var ffs = FeatureFlagManager.init(allocator);
     defer ffs.deinit();
 
-    try ffs.set("premium", true, "Premium feature", 0); // 0% rollout — 仅白名单
+    try ffs.set("premium", true, "Premium feature", 0); // 0% rollout — allowlist only
 
     try ffs.setWhitelist("premium", &.{ "vip-user", "admin" });
 

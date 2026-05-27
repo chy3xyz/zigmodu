@@ -9,8 +9,8 @@ pub const Severity = enum {
     info,
 };
 
-/// ArchUnit风格的架构测试
-/// 验证模块结构是否符合架构规则
+/// ArchUnit-style architecture test
+/// Validate module structure against architecture rules
 pub const ArchitectureTester = struct {
     const Self = @This();
 
@@ -46,7 +46,7 @@ pub const ArchitectureTester = struct {
         self.violations.deinit(self.allocator);
     }
 
-    /// 添加违规记录
+    /// Add violation record
     fn addViolation(self: *Self, rule_name: []const u8, module_name: []const u8, message: []const u8, severity: Severity) !void {
         const msg_copy = try self.allocator.dupe(u8, message);
         errdefer self.allocator.free(msg_copy);
@@ -58,7 +58,7 @@ pub const ArchitectureTester = struct {
         });
     }
 
-    /// 规则1: 模块不能依赖自身（防止循环依赖）
+    /// Rule 1: modules cannot depend on themselves (prevents circular deps)
     pub fn ruleNoSelfDependency(self: *Self) !void {
         var iter = self.modules.modules.iterator();
         while (iter.next()) |entry| {
@@ -78,7 +78,7 @@ pub const ArchitectureTester = struct {
         }
     }
 
-    /// 规则2: 检测循环依赖
+    /// Rule 2: detect circular dependencies
     pub fn ruleNoCircularDependencies(self: *Self) !void {
         var visited = std.StringHashMap(void).init(self.allocator);
         defer visited.deinit();
@@ -111,28 +111,28 @@ pub const ArchitectureTester = struct {
         recursion_stack: *std.StringHashMap(void),
         parent_module: ?[]const u8,
     ) !bool {
-        // 标记当前模块为已访问
+        // Mark current module as visited
         try visited.put(module_name, {});
         try recursion_stack.put(module_name, {});
 
-        // 获取模块信息
+        // Get module info
         const module_info = self.modules.get(module_name) orelse return false;
 
-        // 检查所有依赖
+        // Check all dependencies
         for (module_info.deps) |dep| {
-            // 如果依赖是父模块，说明有循环
+            // If dependency is parent module, cycle detected
             if (parent_module) |parent| {
                 if (std.mem.eql(u8, dep, parent)) {
                     return true;
                 }
             }
 
-            // 如果依赖在递归栈中，说明有循环
+            // If dependency is in recursion stack, cycle detected
             if (recursion_stack.contains(dep)) {
                 return true;
             }
 
-            // 如果依赖未访问，递归检查
+            // If dependency not visited, recurse
             if (!visited.contains(dep)) {
                 if (try self.hasCircularDependency(dep, visited, recursion_stack, module_name)) {
                     return true;
@@ -140,12 +140,12 @@ pub const ArchitectureTester = struct {
             }
         }
 
-        // 从递归栈中移除
+        // Remove from recursion stack
         _ = recursion_stack.remove(module_name);
         return false;
     }
 
-    /// 规则3: 所有模块必须有描述
+    /// Rule 3: all modules must have a description
     pub fn ruleModulesMustHaveDescription(self: *Self) !void {
         var iter = self.modules.modules.iterator();
         while (iter.next()) |entry| {
@@ -163,13 +163,13 @@ pub const ArchitectureTester = struct {
         }
     }
 
-    /// 规则4: 模块名称必须符合命名规范（小写，使用下划线分隔）
+    /// Rule 4: module names must be lowercase with underscores
     pub fn ruleModuleNamingConvention(self: *Self) !void {
         var iter = self.modules.modules.iterator();
         while (iter.next()) |entry| {
             const module_name = entry.key_ptr.*;
 
-            // 检查是否全小写
+            // Check if all lowercase
             for (module_name) |c| {
                 if (std.ascii.isUpper(c)) {
                     try self.addViolation(
@@ -182,7 +182,7 @@ pub const ArchitectureTester = struct {
                 }
             }
 
-            // 检查是否包含空格
+            // Check for spaces
             for (module_name) |c| {
                 if (c == ' ') {
                     try self.addViolation(
@@ -197,7 +197,7 @@ pub const ArchitectureTester = struct {
         }
     }
 
-    /// 规则5: 模块依赖不能过于复杂（依赖数限制）
+    /// Rule 5: module deps must not be too complex (dep count limit)
     pub fn ruleLimitedDependencies(self: *Self, max_deps: usize) !void {
         // Validate parameter
         if (max_deps == 0) return error.InvalidMaxDependencies;
@@ -225,7 +225,7 @@ pub const ArchitectureTester = struct {
         }
     }
 
-    /// 规则6: 基础模块不应该依赖其他业务模块
+    /// Rule 6: foundation modules must not depend on business modules
     pub fn ruleBaseModulesShouldNotDependOnOthers(self: *Self, base_modules: []const []const u8) !void {
         for (base_modules) |base_name| {
             const base_module = self.modules.get(base_name);
@@ -234,7 +234,7 @@ pub const ArchitectureTester = struct {
             const module_info = base_module.?;
 
             for (module_info.deps) |dep| {
-                // 检查依赖是否是其他业务模块（非基础模块）
+                // Check if dependency is a business module (non-foundation)
                 var is_other_business_module = true;
                 for (base_modules) |other_base| {
                     if (std.mem.eql(u8, dep, other_base)) {
@@ -262,21 +262,21 @@ pub const ArchitectureTester = struct {
         }
     }
 
-    /// 运行所有默认规则
+    /// Run all default rules
     pub fn runDefaultRules(self: *Self) !void {
         try self.ruleNoSelfDependency();
         try self.ruleNoCircularDependencies();
         try self.ruleModulesMustHaveDescription();
         try self.ruleModuleNamingConvention();
-        try self.ruleLimitedDependencies(5); // 最多5个依赖
+        try self.ruleLimitedDependencies(5); // Max 5 dependencies
     }
 
-    /// 获取违规数量
+    /// Get violation count
     pub fn getViolationCount(self: *Self) usize {
         return self.violations.items.len;
     }
 
-    /// 获取特定严重级别的违规数量
+    /// Get violation count by severity
     pub fn getViolationCountBySeverity(self: *Self, severity: Severity) usize {
         var count: usize = 0;
         for (self.violations.items) |violation| {
@@ -287,7 +287,7 @@ pub const ArchitectureTester = struct {
         return count;
     }
 
-    /// 打印违规报告
+    /// Print violation report
     pub fn printReport(self: *Self, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
         try buf.appendSlice(allocator, "\n=== Architecture Test Report ===\n\n");
 
@@ -321,7 +321,7 @@ pub const ArchitectureTester = struct {
         }
     }
 
-    /// 规则7: 验证模块契约中的服务依赖与实际模块依赖一致
+    /// Rule 7: contract service deps must match actual module deps
     pub fn ruleContractsMatchDependencies(self: *Self, registry: *const ContractRegistry) !void {
         var iter = self.modules.modules.iterator();
         while (iter.next()) |entry| {
@@ -349,7 +349,7 @@ pub const ArchitectureTester = struct {
         }
     }
 
-    /// 规则8: 确保内部模块不被外部访问（is_internal 检查）
+    /// Rule 8: ensure internal modules not accessed externally (is_internal check)
     pub fn ruleNoInternalModuleAccess(self: *Self) !void {
         var iter = self.modules.modules.iterator();
         while (iter.next()) |entry| {
@@ -366,7 +366,7 @@ pub const ArchitectureTester = struct {
         }
     }
 
-    /// 验证并返回是否通过（无error级别违规）
+    /// Validate and return whether passed (no error-level violations)
     pub fn verify(self: *Self) !bool {
         try self.runDefaultRules();
         return self.getViolationCountBySeverity(Severity.err) == 0;

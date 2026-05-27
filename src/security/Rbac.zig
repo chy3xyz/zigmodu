@@ -2,7 +2,7 @@ const std = @import("std");
 
 // ── Enums ────────────────────────────────────────────────────────
 
-/// 菜单类型：目录、菜单、按钮
+/// [...]
 pub const MenuType = enum(u8) {
     dir = 1,
     menu = 2,
@@ -18,7 +18,7 @@ pub const MenuType = enum(u8) {
     }
 };
 
-/// 数据范围
+/// [...]
 pub const DataScope = enum(u8) {
     all = 1,
     dept_custom = 2,
@@ -40,7 +40,7 @@ pub const DataScope = enum(u8) {
 
 // ── Core Types ───────────────────────────────────────────────────
 
-/// 角色 — 对应 system_role 表
+/// Role — [...] system_role [...]
 pub const Role = struct {
     id: i64,
     name: []const u8,
@@ -54,7 +54,7 @@ pub const Role = struct {
     tenant_id: i64,
 };
 
-/// 菜单 — 对应 system_menu 表
+/// [...] — [...] system_menu [...]
 pub const Menu = struct {
     id: i64,
     name: []const u8,
@@ -76,21 +76,21 @@ pub const Menu = struct {
     pub fn isButton(self: Menu) bool { return self.menu_type == .button; }
 };
 
-/// 角色-菜单关联
+/// Role-[...]
 pub const RoleMenu = struct {
     id: i64,
     role_id: i64,
     menu_id: i64,
 };
 
-/// 用户-角色关联
+/// [...]-Role[...]
 pub const UserRole = struct {
     id: i64,
     user_id: i64,
     role_id: i64,
 };
 
-/// 菜单树节点（前端渲染用）
+/// [...]
 pub const MenuTreeNode = struct {
     id: i64,
     name: []const u8,
@@ -115,7 +115,7 @@ pub const MenuTreeNode = struct {
     }
 };
 
-/// 认证信息 — 从 JWT 解析后挂载到请求上下文
+/// [...]Info — [...] JWT [...]Context
 /// Authentication info populated from JWT claims.
 ///
 /// IMPORTANT: `permissions` starts empty. The caller MUST load permissions
@@ -170,7 +170,7 @@ pub const RbacEngine = struct {
         return .{ .allocator = allocator };
     }
 
-    /// 从扁平菜单列表构建权限集合
+    /// Build from flat menu listPermission[...]
     pub fn buildPermissionSet(allocator: std.mem.Allocator, menus: []const Menu) !std.StringHashMap(bool) {
         var set = std.StringHashMap(bool).init(allocator);
         for (menus) |menu| {
@@ -181,7 +181,7 @@ pub const RbacEngine = struct {
         return set;
     }
 
-    /// 构建菜单树（从扁平列表 → 树结构）
+    /// [...] → [...]
     pub fn buildMenuTree(self: *const RbacEngine, menus: []const Menu, root_id: i64) !std.ArrayList(MenuTreeNode) {
         var nodes = std.ArrayList(MenuTreeNode){};
         var node_map = std.AutoHashMap(i64, *MenuTreeNode).init(self.allocator);
@@ -208,7 +208,7 @@ pub const RbacEngine = struct {
             try node_map.put(menu.id, node);
         }
 
-        // 建立父子关系
+        // [...]
         var it = node_map.iterator();
         while (it.next()) |entry| {
             const node = entry.value_ptr.*;
@@ -227,7 +227,7 @@ pub const RbacEngine = struct {
         return nodes;
     }
 
-    /// 过滤菜单树：只保留用户有权访问的节点
+    /// [...]Keep only nodes user has access to
     pub fn filterTreeByPermission(self: *const RbacEngine, tree: *std.ArrayList(MenuTreeNode), auth: *const AuthInfo) void {
         var i: usize = 0;
         while (i < tree.items.len) {

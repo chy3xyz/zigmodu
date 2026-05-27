@@ -66,9 +66,9 @@ test "estimateTokens latin" {
 }
 
 test "estimateTokens cjk" {
-    const text = "你好世界这是一个测试消息";
+    const text = "你好世界这是一个Tests消息";
     const tokens = estimateTokens(text);
-    // 12 CJK chars ≈ 12 tokens + 1 baseline
+    // 12 CJK chars ~= 12 tokens + 1 baseline
     try std.testing.expect(tokens >= 10);
     try std.testing.expect(tokens <= 16);
 }

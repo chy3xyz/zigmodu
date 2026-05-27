@@ -1,10 +1,10 @@
 const std = @import("std");
 
-/// API 版本化策略
+/// API version[...]
 pub const ApiVersion = struct {
-    /// 主版本号
+    /// [...]
     major: u16,
-    /// 次版本号
+    /// [...]
     minor: u16 = 0,
 
     pub fn parse(version_str: []const u8) ?ApiVersion {
@@ -33,16 +33,16 @@ pub const ApiVersion = struct {
         return self.major == other.major and self.minor == other.minor;
     }
 
-    /// 检查兼容性: 主版本相同即兼容
+    /// [...]: [...]
     pub fn isCompatible(self: ApiVersion, other: ApiVersion) bool {
         return self.major == other.major;
     }
 };
 
-/// API 版本提取器 — 从请求中提取版本号
-/// 支持 URL 路径和 Header 两种方式
+/// API version[...] — [...]
+/// [...] URL [...] Header [...]
 pub const ApiVersionExtractor = struct {
-    /// 从 URL 路径提取版本: /api/v1/users → v1
+    /// [...] URL [...]: /api/v1/users → v1
     pub fn fromPath(path: []const u8) ?ApiVersion {
         var it = std.mem.splitScalar(u8, path, '/');
         while (it.next()) |segment| {
@@ -53,7 +53,7 @@ pub const ApiVersionExtractor = struct {
         return null;
     }
 
-    /// 从请求头提取版本: Accept-Version: v2
+    /// [...]: Accept-Version: v2
     pub fn fromHeader(headers: anytype, header_name: []const u8) ?ApiVersion {
         if (headers.get(header_name)) |value| {
             return ApiVersion.parse(value);
@@ -61,16 +61,16 @@ pub const ApiVersionExtractor = struct {
         return null;
     }
 
-    /// 从请求中提取版本 (先查 header，再查 path)
+    /// [...] ([...] header[...] path)
     pub fn extract(path: []const u8, headers: anytype, header_name: []const u8) ?ApiVersion {
         if (fromHeader(headers, header_name)) |v| return v;
         return fromPath(path);
     }
 };
 
-/// API 版本路由组 — 为每个版本注册独立路由
+/// API versionRoute group — Register independent routes per version
 ///
-/// 用法:
+/// Usage:
 ///   var v1 = server.group("/api/v1");
 ///   var v2 = server.group("/api/v2");
 ///   try v1.get("/users", handleUsersV1, null);
@@ -97,7 +97,7 @@ pub const ApiVersionRouter = struct {
         self.versions.deinit(self.allocator);
     }
 
-    /// 注册版本
+    /// [...]
     pub fn registerVersion(self: *Self, version: ApiVersion, prefix: []const u8) !void {
         try self.versions.append(self.allocator, .{
             .version = version,
@@ -105,7 +105,7 @@ pub const ApiVersionRouter = struct {
         });
     }
 
-    /// 查找匹配的版本 (选择 ≤ 请求版本的最新版本)
+    /// [...] ([...] ≤ [...])
     pub fn resolve(self: *Self, requested: ApiVersion) ?ApiVersion {
         var best: ?ApiVersion = null;
         for (self.versions.items) |vg| {
@@ -121,10 +121,10 @@ pub const ApiVersionRouter = struct {
     }
 };
 
-/// API 版本协商中间件
-/// 自动从请求中提取版本号并设置 ctx 属性
+/// API version[...]Middleware
+/// Auto-extract version from request and set ctx [...]
 ///
-/// 用法:
+/// Usage:
 ///   server.addMiddleware(.{ .func = apiVersionMiddleware("1.0") });
 pub fn apiVersionMiddleware(default_version_str: []const u8) api.MiddlewareFn {
     const default_ver = ApiVersion.parse(default_version_str) orelse ApiVersion{ .major = 1, .minor = 0 };
@@ -133,14 +133,14 @@ pub fn apiVersionMiddleware(default_version_str: []const u8) api.MiddlewareFn {
         fn handler(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
             _ = user_data;
 
-            // 从 URL 或 Header 提取版本
+            // [...] URL [...] Header [...]
             const version = ApiVersionExtractor.extract(
                 ctx.path,
                 ctx.headers,
                 "Accept-Version",
             ) orelse ApiVersion{ .major = 1, .minor = 0 };
 
-            // 将版本存储到 Context user_data 中
+            // [...] Context user_data [...]
             _ = version;
 
             try next(ctx, next, null);

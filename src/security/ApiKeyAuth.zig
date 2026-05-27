@@ -1,31 +1,31 @@
 const std = @import("std");
 const Time = @import("../core/Time.zig");
 
-/// API Key 认证配置
+/// API Key [...]
 pub const ApiKeyConfig = struct {
-    /// API Key 在请求头中的名称
+    /// API Key [...]
     header_name: []const u8 = "X-API-Key",
-    /// API Key 在 Query 参数中的名称
+    /// API Key [...] Query [...]
     query_param_name: []const u8 = "api_key",
-    /// 是否允许通过 Query 参数传递 (安全性较低)
+    /// [...] Query [...] ([...])
     allow_query_param: bool = false,
-    /// 认证失败时的 HTTP 状态码
+    /// [...]failure[...] HTTP status code
     unauthorized_status: u16 = 401,
-    /// 认证失败消息
+    /// [...]failure[...]
     unauthorized_message: []const u8 = "Invalid or missing API key",
 };
 
-/// API Key 认证中间件
+/// API Key Auth middleware
 ///
-/// 从请求头 X-API-Key (或 Query 参数 ?api_key=) 中提取 API Key
-/// 并验证其是否在允许的密钥列表中
+/// [...] X-API-Key ([...] Query [...] ?api_key=) [...] API Key
+/// [...]ValidationWhether it is in the allowed key list
 ///
-/// 用法:
+/// Usage:
 ///   server.addMiddleware(.{
 ///       .func = apiKeyAuth(.{ .keys = &.{"sk-123", "sk-456"} })
 ///   });
 ///
-/// 支持从外部存储加载密钥 (如数据库、Redis):
+/// Support loading keys from external storage ([...]Redis):
 ///   server.addMiddleware(.{
 ///       .func = apiKeyAuthWithLoader(.{ .loader = loadKeysFromDb })
 ///   });
@@ -53,13 +53,13 @@ pub fn apiKeyAuth(config: ApiKeyAuthConfig) api.MiddlewareFn {
     return S.handler;
 }
 
-/// API Key 认证配置 (含密钥列表)
+/// API Key [...] ([...])
 pub const ApiKeyAuthConfig = struct {
     config: ApiKeyConfig = .{},
     keys: []const []const u8 = &.{},
 };
 
-/// API Key 认证中间件 (带外部加载器)
+/// API Key Auth middleware ([...])
 pub fn apiKeyAuthWithLoader(config: ApiKeyLoaderConfig) api.MiddlewareFn {
     const S = struct {
         var cfg: ApiKeyLoaderConfig = undefined;
@@ -84,20 +84,20 @@ pub fn apiKeyAuthWithLoader(config: ApiKeyLoaderConfig) api.MiddlewareFn {
     return S.handler;
 }
 
-/// API Key 加载器配置
+/// API Key [...]
 pub const ApiKeyLoaderConfig = struct {
     config: ApiKeyConfig = .{},
     loader: *const fn ([]const u8) bool,
 };
 
-/// 从 Context 中提取 API Key (Header 优先，然后 Query)
+/// [...] Context [...] API Key (Header [...] Query)
 fn extractApiKey(ctx: *api.Context, config: ApiKeyConfig) ?[]const u8 {
-    // 1. 从 Header 提取
+    // 1. [...] Header [...]
     if (ctx.header(config.header_name)) |val| {
         return if (val.len > 0) val else null;
     }
 
-    // 2. 从 Query 参数提取 (如允许)
+    // 2. [...] Query [...] ([...])
     if (config.allow_query_param) {
         if (ctx.queryParam(config.query_param_name)) |val| {
             return if (val.len > 0) val else null;
@@ -107,7 +107,7 @@ fn extractApiKey(ctx: *api.Context, config: ApiKeyConfig) ?[]const u8 {
     return null;
 }
 
-/// 验证 API Key 是否在允许列表中
+/// Validation API Key [...]
 fn validateKey(key: []const u8, allowed_keys: []const []const u8) bool {
     for (allowed_keys) |ak| {
         if (std.mem.eql(u8, key, ak)) return true;
@@ -115,9 +115,9 @@ fn validateKey(key: []const u8, allowed_keys: []const []const u8) bool {
     return false;
 }
 
-/// API Key 生成器 — 生成安全的随机 API Key
+/// API Key [...] — [...] API Key
 pub const ApiKeyGenerator = struct {
-    /// 生成一个 API Key (格式: sk-{32 hex chars})
+    /// [...] API Key ([...]: sk-{32 hex chars})
     pub fn generate(allocator: std.mem.Allocator) ![]const u8 {
         var buf: [16]u8 = undefined;
         var seed: [32]u8 = undefined;
@@ -136,7 +136,7 @@ pub const ApiKeyGenerator = struct {
         return std.fmt.allocPrint(allocator, "sk-{s}", .{hex[0..32]});
     }
 
-    /// 验证 API Key 格式 (sk-{32 hex})
+    /// Validation API Key [...] (sk-{32 hex})
     pub fn validateFormat(key: []const u8) bool {
         if (!std.mem.startsWith(u8, key, "sk-")) return false;
         if (key.len != 35) return false; // "sk-" + 32 hex chars

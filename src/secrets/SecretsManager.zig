@@ -1,20 +1,20 @@
 const std = @import("std");
 
-/// 密钥来源优先级
+/// [...]
 pub const SecretsSourcePriority = enum(u8) {
-    /// 环境变量 (最高优先级)
+    /// [...] ([...])
     env = 0,
-    /// 文件 (如 Docker secrets / K8s secrets)
+    /// [...] ([...] Docker secrets / K8s secrets)
     file = 1,
-    /// Vault 等远端密钥管理服务
+    /// Vault Remote key management services
     vault = 2,
-    /// 默认值 (最低优先级)
+    /// [...] ([...])
     default = 3,
 };
 
-/// 密钥管理器
-/// 支持多来源密钥加载，按优先级解析
-/// 类似 HashiCorp Vault / Spring Cloud Config 的密钥管理
+/// Secrets manager
+/// [...]
+/// [...] HashiCorp Vault / Spring Cloud Config [...]
 pub const SecretsManager = struct {
     const Self = @This();
 
@@ -65,8 +65,8 @@ pub const SecretsManager = struct {
         }
     }
 
-    /// 从环境变量加载密钥
-    /// 前缀过滤: 只加载指定前缀的变量
+    /// Load keys from environment variables
+    /// [...]: Only load variables with specified prefix
     /// Load secrets from environment variables matching a prefix.
     /// REQUIRES a non-empty prefix to prevent loading ALL env vars (PATH, HOME, etc.).
     pub fn loadFromEnv(self: *Self, prefix: []const u8) !void {
@@ -92,8 +92,8 @@ pub const SecretsManager = struct {
         }
     }
 
-    /// 从 key=value 格式的内容加载密钥 (用于 Docker secrets / K8s secrets)
-    /// 配合 ConfigManager 或文件读取器使用
+    /// [...] key=value [...] (for Docker secrets / K8s secrets)
+    /// [...] ConfigManager [...]
     pub fn loadFromEnvContent(self: *Self, content: []const u8) !void {
         var lines = std.mem.splitScalar(u8, content, '\n');
         while (lines.next()) |line| {
@@ -115,8 +115,8 @@ pub const SecretsManager = struct {
         }
     }
 
-    /// 从 JSON 内容加载密钥
-    /// 配合 ConfigManager 或文件读取器使用
+    /// [...] JSON [...]
+    /// [...] ConfigManager [...]
     pub fn loadFromJsonContent(self: *Self, content: []const u8) !void {
         var i: usize = 0;
         while (i < content.len) : (i += 1) {
@@ -150,7 +150,7 @@ pub const SecretsManager = struct {
         }
     }
 
-    /// 配置 Vault 连接
+    /// [...] Vault [...]
     pub fn configureVault(self: *Self, address: []const u8, token: []const u8) !void {
         if (self.vault_config) |vc| {
             self.allocator.free(vc.address);
@@ -169,7 +169,7 @@ pub const SecretsManager = struct {
         };
     }
 
-    /// 从 Vault 加载密钥 (placeholder — 需要 HTTP 客户端集成)
+    /// [...] Vault [...] (placeholder — [...] HTTP [...])
     pub fn loadFromVault(self: *Self, path: []const u8) !void {
         if (self.vault_config == null) {
             return error.VaultNotConfigured;
@@ -182,7 +182,7 @@ pub const SecretsManager = struct {
         });
     }
 
-    /// 设置默认值 (最低优先级)
+    /// [...] ([...])
     pub fn setDefault(self: *Self, key: []const u8, value: []const u8) !void {
         const key_copy = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(key_copy);
@@ -217,24 +217,24 @@ pub const SecretsManager = struct {
         });
     }
 
-    /// 获取密钥值
+    /// [...]
     pub fn get(self: *Self, key: []const u8) ?[]const u8 {
         const entry = self.secrets.get(key) orelse return null;
         return entry.value;
     }
 
-    /// 获取密钥 (带默认值)
+    /// [...] ([...])
     pub fn getOrDefault(self: *Self, key: []const u8, default_val: []const u8) []const u8 {
         return self.get(key) orelse default_val;
     }
 
-    /// 获取整数密钥
+    /// [...]
     pub fn getInt(self: *Self, key: []const u8) ?i64 {
         const val = self.get(key) orelse return null;
         return std.fmt.parseInt(i64, val, 10) catch null;
     }
 
-    /// 获取布尔密钥
+    /// [...]
     pub fn getBool(self: *Self, key: []const u8) ?bool {
         const val = self.get(key) orelse return null;
         if (std.mem.eql(u8, val, "true") or std.mem.eql(u8, val, "1")) return true;
@@ -242,18 +242,18 @@ pub const SecretsManager = struct {
         return null;
     }
 
-    /// 检查密钥是否存在
+    /// [...]
     pub fn has(self: *Self, key: []const u8) bool {
         return self.secrets.contains(key);
     }
 
-    /// 获取密钥来源
+    /// [...]
     pub fn getSource(self: *Self, key: []const u8) ?SecretsSourcePriority {
         const entry = self.secrets.get(key) orelse return null;
         return entry.source;
     }
 
-    /// 获取所有密钥的键名列表
+    /// Get all key names list
     pub fn listKeys(self: *Self) ![]const []const u8 {
         var keys = std.ArrayList([]const u8).empty;
         var iter = self.secrets.keyIterator();
@@ -263,7 +263,7 @@ pub const SecretsManager = struct {
         return keys.toOwnedSlice(self.allocator);
     }
 
-    /// 导出为环境变量格式字符串
+    /// Export as environment variable format string
     pub fn exportAsEnv(self: *Self) ![]const u8 {
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
@@ -276,12 +276,12 @@ pub const SecretsManager = struct {
         return buf.toOwnedSlice(self.allocator);
     }
 
-    /// 密钥数量
+    /// [...]
     pub fn count(self: *Self) usize {
         return self.secrets.count();
     }
 
-    /// 清除所有密钥
+    /// [...]
     pub fn clear(self: *Self) void {
         var iter = self.secrets.iterator();
         while (iter.next()) |entry| {

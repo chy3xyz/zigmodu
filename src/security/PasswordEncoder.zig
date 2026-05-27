@@ -90,7 +90,7 @@ pub const PasswordEncoder = struct {
     }
 };
 
-/// 常量时间切片比较 (Zig 0.16 timing_safe.eql 只接受数组/向量)
+/// [...] (Zig 0.16 timing_safe.eql [...]/[...])
 fn timingSafeSliceEql(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     var acc: u8 = 0;

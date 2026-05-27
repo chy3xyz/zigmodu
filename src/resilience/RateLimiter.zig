@@ -1,7 +1,7 @@
 const std = @import("std");
 const Time = @import("../core/Time.zig");
 
-/// 限流器 - 令牌桶算法
+/// Rate limiter — token bucket algorithm
 pub const RateLimiter = struct {
     const Self = @This();
 
@@ -27,7 +27,7 @@ pub const RateLimiter = struct {
         self.allocator.free(self.name);
     }
 
-    /// 尝试获取一个令牌
+    /// Try to acquire one token
     pub fn tryAcquire(self: *Self) bool {
         self.refill();
 
@@ -39,14 +39,14 @@ pub const RateLimiter = struct {
         return false;
     }
 
-    /// 获取一个令牌，如果不可用则等待
+    /// Acquire token, wait if unavailable
     /// DEPRECATED: Use tryAcquire() instead. This was meant to block
     /// but blocking sleep is unavailable in Zig 0.16 sync context.
     pub fn acquire(self: *Self) bool {
         return self.tryAcquire();
     }
 
-    /// 尝试获取多个令牌
+    /// Try to acquire multiple tokens
     pub fn tryAcquireMany(self: *Self, count: u32) bool {
         self.refill();
 
@@ -59,7 +59,7 @@ pub const RateLimiter = struct {
         return false;
     }
 
-    /// 补充令牌 (uses cached timestamp — refill rate is per-second, ~1s staleness OK)
+    /// [...]tokens (uses cached timestamp — refill rate is per-second, ~1s staleness OK)
     fn refill(self: *Self) void {
         const now = Time.cachedNowSeconds();
         const elapsed = now - self.last_refill_time;
@@ -71,19 +71,19 @@ pub const RateLimiter = struct {
         }
     }
 
-    /// 获取当前可用令牌数
+    /// Get current[...]tokens[...]
     pub fn availableTokens(self: *Self) u32 {
         self.refill();
         return @intFromFloat(self.current_tokens);
     }
 
-    /// 重置限流器
+    /// [...]
     pub fn reset(self: *Self) void {
         self.current_tokens = @as(f64, @floatFromInt(self.max_tokens));
         self.last_refill_time = Time.monotonicNowSeconds();
     }
 
-    /// 获取限流器统计
+    /// [...]
     pub fn getStats(self: *Self) Stats {
         self.refill();
         return .{
@@ -102,7 +102,7 @@ pub const RateLimiter = struct {
     };
 };
 
-/// 限流器注册表
+/// [...]
 pub const RateLimiterRegistry = struct {
     const Self = @This();
 
@@ -129,7 +129,7 @@ pub const RateLimiterRegistry = struct {
         self.limiters.deinit();
     }
 
-    /// 获取或创建限流器
+    /// [...]
     pub fn getOrCreate(self: *Self, name: []const u8) !*RateLimiter {
         if (self.limiters.getPtr(name)) |limiter| {
             return limiter;
@@ -148,12 +148,12 @@ pub const RateLimiterRegistry = struct {
         return self.limiters.getPtr(name).?;
     }
 
-    /// 获取限流器
+    /// [...]
     pub fn get(self: *Self, name: []const u8) ?*RateLimiter {
         return self.limiters.getPtr(name);
     }
 
-    /// 为特定客户端创建限流器（IP限流）
+    /// Create rate limiter for specific client[...]IP[...]
     pub fn getOrCreateForClient(self: *Self, client_id: []const u8, max_tokens: u32, refill_rate: u32) !*RateLimiter {
         if (self.limiters.getPtr(client_id)) |limiter| {
             return limiter;
@@ -167,14 +167,14 @@ pub const RateLimiterRegistry = struct {
         return self.limiters.getPtr(client_id).?;
     }
 
-    /// 生成限流报告
+    /// [...]
     pub fn generateReport(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
         _ = self;
         return allocator.dupe(u8, "generateReport (pending Zig 0.16 allocPrint migration)");
     }
 };
 
-/// 滑动窗口限流器（更精确的限流）
+/// [...]
 pub const SlidingWindowRateLimiter = struct {
     const Self = @This();
 
@@ -182,7 +182,7 @@ pub const SlidingWindowRateLimiter = struct {
     name: []const u8,
     window_size_seconds: u64,
     max_requests: u32,
-    requests: std.array_list.Managed(i64), // 请求时间戳列表
+    requests: std.array_list.Managed(i64), // Request timestamp list
 
     pub fn init(allocator: std.mem.Allocator, name: []const u8, window_size_seconds: u64, max_requests: u32) !Self {
         return .{
@@ -199,7 +199,7 @@ pub const SlidingWindowRateLimiter = struct {
         self.requests.deinit();
     }
 
-    /// 尝试获取许可
+    /// [...]
     pub fn tryAcquire(self: *Self) bool {
         self.cleanupOldRequests();
 
@@ -211,7 +211,7 @@ pub const SlidingWindowRateLimiter = struct {
         return false;
     }
 
-    /// 清理过期的请求记录
+    /// [...]
     fn cleanupOldRequests(self: *Self) void {
         const now = Time.cachedNowSeconds();
         const cutoff = now - @as(i64, @intCast(self.window_size_seconds));
@@ -226,7 +226,7 @@ pub const SlidingWindowRateLimiter = struct {
         }
     }
 
-    /// 获取当前窗口内的请求数
+    /// Get current[...]
     pub fn currentCount(self: *Self) usize {
         self.cleanupOldRequests();
         return self.requests.items.len;

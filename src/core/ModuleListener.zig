@@ -1,13 +1,13 @@
 const std = @import("std");
 const EventBus = @import("./EventBus.zig").EventBus;
 
-/// @ApplicationModuleListener 等效实现
-/// 用于标记模块事件监听器，提供事务性、异步等特性
+/// @ApplicationModuleListener [...]
+/// for[...]Module event[...]Transaction[...]Feature
 pub fn ApplicationModuleListener(comptime EventType: type) type {
     return struct {
         const Self = @This();
 
-        /// 监听器配置
+        /// [...]
         pub const Config = struct {
             async_mode: bool = true,
             transactional: bool = false,
@@ -30,11 +30,11 @@ pub fn ApplicationModuleListener(comptime EventType: type) type {
             };
         }
 
-        /// 订阅事件
+        /// Subscribe event
         pub fn subscribe(self: *Self) !void {
             const handler_ptr = self.handler;
 
-            // 根据配置包装处理器
+            // [...]
             const wrapped_handler = if (self.config.async_mode)
                 struct {
                     fn wrapper(event: EventType) void {
@@ -52,20 +52,20 @@ pub fn ApplicationModuleListener(comptime EventType: type) type {
                     }
                 }.wrapper;
 
-            // 实际订阅
+            // [...]
             try self.event_bus.subscribe(wrapped_handler);
         }
 
-        /// 取消订阅
+        /// [...]
         pub fn unsubscribe(self: *Self) void {
             _ = self;
-            // 实现取消订阅逻辑
+            // [...]
         }
     };
 }
 
-/// 模块事件监听器注册表
-/// 管理所有模块的事件监听器
+/// Module event[...]
+/// [...]Event[...]
 pub const ModuleListenerRegistry = struct {
     const Self = @This();
 
@@ -90,7 +90,7 @@ pub const ModuleListenerRegistry = struct {
         self.listeners.deinit();
     }
 
-    /// 注册监听器
+    /// [...]
     pub fn registerListener(
         self: *Self,
         module_name: []const u8,
@@ -109,7 +109,7 @@ pub const ModuleListenerRegistry = struct {
         });
     }
 
-    /// 获取模块的所有监听器
+    /// Get all module listeners
     pub fn getModuleListeners(self: *Self, module_name: []const u8) !std.ArrayList(ListenerInfo) {
         // Validate input
         if (module_name.len == 0) return error.InvalidModuleName;
@@ -128,8 +128,8 @@ pub const ModuleListenerRegistry = struct {
     }
 };
 
-/// 事件外部化支持
-/// 将事件发布到外部系统（消息队列等）
+/// Event[...]
+/// [...]Eventpublish[...]Message queue[...]
 pub const EventExternalization = struct {
     const Self = @This();
 
@@ -153,12 +153,12 @@ pub const EventExternalization = struct {
         self.externalizers.deinit(self.allocator);
     }
 
-    /// 注册外部化器
+    /// [...]
     pub fn registerExternalizer(self: *Self, externalizer: Externalizer) !void {
         try self.externalizers.append(self.allocator, externalizer);
     }
 
-    /// 外部化事件
+    /// [...]Event
     pub fn externalize(self: *Self, event_type: []const u8, event_data: []const u8) !void {
         for (self.externalizers.items) |externalizer| {
             if (externalizer.can_handle(event_type)) {
@@ -167,7 +167,7 @@ pub const EventExternalization = struct {
             }
         }
 
-        // 没有找到合适的外部化器
+        // No suitable externalizer found
         std.log.warn("No externalizer found for event type: {s}", .{event_type});
     }
 };

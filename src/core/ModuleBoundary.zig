@@ -1,29 +1,29 @@
 const std = @import("std");
 const ModuleInfo = @import("Module.zig").ModuleInfo;
 
-/// 编译时模块边界验证器
-/// 确保模块遵循架构规则：
-/// 1. 只导出公共 API
-/// 2. 不直接访问其他模块内部
-/// 3. 遵循命名规范
+/// [...]Module boundary verifier
+/// Ensure modules follow architecture rules：
+/// 1. [...] API
+/// 2. Do not directly access other module internals
+/// 3. [...]
 pub const ModuleBoundary = struct {
-    /// 验证模块边界
-    /// 在编译时检查模块定义
+    /// ValidationModule boundary
+    /// Check module definitions at compile time
     pub fn validate(comptime T: type) void {
-        // 检查模块必须有 info 声明
+        // [...] info [...]
         if (!@hasDecl(T, "info")) {
             @compileError("Module must declare 'pub const info' with module metadata");
         }
 
-        // 获取模块信息
+        // Get module info
         const info = @field(T, "info");
 
-        // 验证模块名称
+        // ValidationModule name
         if (info.name.len == 0) {
             @compileError("Module name cannot be empty");
         }
 
-        // 检查命名规范（小写 + 下划线）
+        // [...] + [...]
         for (info.name) |c| {
             if (std.ascii.isUpper(c)) {
                 @compileError("Module name must be lowercase: '" ++ info.name ++ "'");
@@ -33,7 +33,7 @@ pub const ModuleBoundary = struct {
             }
         }
 
-        // 检查 init 和 deinit 函数签名
+        // [...] init [...] deinit [...]
         if (@hasDecl(T, "init")) {
             const init_fn = @field(T, "init");
             const init_info = @typeInfo(@TypeOf(init_fn));
@@ -42,7 +42,7 @@ pub const ModuleBoundary = struct {
                 @compileError("Module 'init' must be a function");
             }
 
-            // init 应该返回 !void
+            // init [...] !void
             const return_type = init_info.@"fn".return_type.?;
             if (return_type != anyerror!void) {
                 compileWarn("Module 'init' should return '!void' for consistency");
@@ -63,12 +63,12 @@ pub const ModuleBoundary = struct {
             }
         }
 
-        // 检查导出（可选，Zig 中通过 pub 控制）
-        // 这里可以添加更多检查
+        // [...]Zig [...] pub [...]
+        // More checks can be added here
     }
 
-    /// 验证模块依赖
-    /// 检查依赖是否符合规范
+    /// ValidationModule dependencies
+    /// Check if deps comply with spec
     pub fn validateDependencies(comptime T: type, comptime all_modules: []const type) void {
         const info = @field(T, "info");
 
@@ -87,36 +87,36 @@ pub const ModuleBoundary = struct {
                 @compileError("Module '" ++ info.name ++ "' depends on unknown module: '" ++ dep_name ++ "'");
             }
 
-            // 检查循环依赖（简化版）
-            // 完整实现需要在 Application 级别检查
+            // Check circular dependencies[...]
+            // [...] Application [...]
         }
     }
 
-    /// 编译警告（如果支持）
+    /// [...]Warn[...]
     fn compileWarn(comptime msg: []const u8) void {
-        // Zig 目前没有标准的编译警告机制
-        // 可以通过编译错误模拟或日志
-        // 这里暂时不做处理
+        // Zig [...]Warn[...]
+        // [...]Error[...]
+        // [...]
         _ = msg;
     }
 };
 
-/// 模块类型定义
-/// 类似于 Spring Modulith 的 OPEN/CLOSED
+/// [...]
+/// [...] Spring Modulith [...] OPEN/CLOSED
 pub const ModuleType = enum {
-    /// 开放模块：允许其他模块直接访问
+    /// [...]Allow other modules direct access
     open,
 
-    /// 封闭模块：只允许通过公共 API 访问
-    /// 需要严格验证边界
+    /// [...] API [...]
+    /// [...]Validation[...]
     closed,
 
-    /// 内部模块：仅限本模块内部使用
-    /// 不应被其他模块依赖
+    /// [...]Internal use only for this module
+    /// [...]Module dependencies
     internal,
 };
 
-/// 增强的模块定义（可选）
+/// [...]
 pub const ModuleDef = struct {
     name: []const u8,
     description: []const u8 = "",
@@ -126,8 +126,8 @@ pub const ModuleDef = struct {
     exposed_packages: ?[]const []const u8 = null,
 };
 
-/// 编译时边界检查宏
-/// 使用方式：
+/// [...]
+/// [...]
 /// ```zig
 /// comptime {
 ///     checkModuleBoundary(@This(), .{
@@ -138,7 +138,7 @@ pub const ModuleDef = struct {
 pub fn checkModuleBoundary(comptime T: type, comptime opts: anytype) void {
     ModuleBoundary.validate(T);
 
-    // 检查允许的依赖
+    // [...]
     if (@hasField(@TypeOf(opts), "allowed_deps")) {
         const info = @field(T, "info");
         inline for (info.dependencies) |dep| {
@@ -165,17 +165,17 @@ test "ModuleBoundary validation" {
         pub fn deinit() void {}
     };
 
-    // 编译时验证
+    // [...]Validation
     comptime {
         ModuleBoundary.validate(ValidModule);
     }
 }
 
 test "ModuleBoundary catches invalid name" {
-    // 这个测试会编译失败
+    // [...]Tests[...]failure
     // const InvalidModule = struct {
     //     pub const info = ModuleInfo{
-    //         .name = "InvalidModule",  // 大写错误
+    // .name = "InvalidModule",  // [...]Error
     //         .desc = "Invalid",
     //         .deps = &.{},
     //     };

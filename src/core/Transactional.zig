@@ -1,78 +1,78 @@
 const std = @import("std");
 
-/// 声明式事务支持
-/// 提供类似 Spring @Transactional 的事务管理能力
-/// 这是架构评估中的高优先级改进项
+/// [...]Transaction[...]
+/// [...] Spring @Transactional [...]Transaction[...]
+/// High-priority architecture improvement item
 pub const Transactional = struct {
     const Self = @This();
 
-    /// 事务传播行为
+    /// Transaction[...]
     pub const Propagation = enum {
-        /// REQUIRED: 如果当前存在事务，则加入该事务；否则创建新事务（默认）
+        /// REQUIRED: [...]Transaction[...]Transaction[...]Transaction[...]
         REQUIRED,
 
-        /// SUPPORTS: 如果当前存在事务，则加入该事务；否则以非事务方式运行
+        /// SUPPORTS: [...]Transaction[...]Transaction[...]Transaction[...]
         SUPPORTS,
 
-        /// MANDATORY: 如果当前存在事务，则加入该事务；否则抛出异常
+        /// MANDATORY: [...]Transaction[...]Transaction[...]
         MANDATORY,
 
-        /// REQUIRES_NEW: 创建新事务，如果当前存在事务，则挂起当前事务
+        /// REQUIRES_NEW: [...]Transaction[...]Transaction[...]Transaction
         REQUIRES_NEW,
 
-        /// NOT_SUPPORTED: 以非事务方式运行，如果当前存在事务，则挂起当前事务
+        /// NOT_SUPPORTED: [...]Transaction[...]Transaction[...]Transaction
         NOT_SUPPORTED,
 
-        /// NEVER: 以非事务方式运行，如果当前存在事务，则抛出异常
+        /// NEVER: [...]Transaction[...]Transaction[...]
         NEVER,
 
-        /// NESTED: 如果当前存在事务，则在嵌套事务内执行；否则创建新事务
+        /// NESTED: [...]Transaction[...]Transaction[...]Transaction
         NESTED,
     };
 
-    /// 事务隔离级别
+    /// Transaction[...]
     pub const Isolation = enum {
-        /// DEFAULT: 使用数据库默认隔离级别
+        /// DEFAULT: Use database default isolation level
         DEFAULT,
 
-        /// READ_UNCOMMITTED: 读未提交
+        /// READ_UNCOMMITTED: [...]
         READ_UNCOMMITTED,
 
-        /// READ_COMMITTED: 读已提交
+        /// READ_COMMITTED: [...]
         READ_COMMITTED,
 
-        /// REPEATABLE_READ: 可重复读
+        /// REPEATABLE_READ: [...]
         REPEATABLE_READ,
 
-        /// SERIALIZABLE: 串行化
+        /// SERIALIZABLE: [...]
         SERIALIZABLE,
     };
 
-    /// 事务定义
+    /// Transaction[...]
     pub const Definition = struct {
-        /// 事务名称（可选，用于监控和日志）
+        /// Transaction[...]for[...]
         name: []const u8 = "",
 
-        /// 传播行为
+        /// [...]
         propagation: Propagation = .REQUIRED,
 
-        /// 隔离级别
+        /// [...]
         isolation: Isolation = .DEFAULT,
 
-        /// 超时时间（秒），-1 表示使用默认
+        /// [...]-1 [...]
         timeout: i32 = -1,
 
-        /// 是否只读事务
+        /// [...]Transaction
         read_only: bool = false,
 
-        /// 遇到哪些异常时回滚（空数组表示所有RuntimeException）
+        /// [...]RuntimeException[...]
         rollback_for: []const []const u8 = &.{},
 
-        /// 遇到哪些异常时不回滚
+        /// Which exceptions to not rollback on
         no_rollback_for: []const []const u8 = &.{},
     };
 
-    /// 事务状态
+    /// Transaction[...]
     pub const Status = struct {
         definition: Definition,
         is_new_transaction: bool,
@@ -81,13 +81,13 @@ pub const Transactional = struct {
         start_time: i64,
     };
 
-    /// 事务回调接口
+    /// Transaction[...]
     pub const TransactionCallback = struct {
         ctx: *anyopaque,
         execute_fn: *const fn (ctx: *anyopaque) anyerror!void,
     };
 
-    /// 事务管理器接口
+    /// Transaction[...]
     pub const TransactionManager = struct {
         ctx: *anyopaque,
         vtable: *const VTable,
@@ -111,24 +111,24 @@ pub const Transactional = struct {
         }
     };
 
-    /// 事务模板 - 简化事务执行
+    /// Transaction[...] - [...]Transaction[...]
     pub const TransactionTemplate = struct {
         transaction_manager: TransactionManager,
         definition: Definition,
 
-        /// 执行带事务的回调
+        /// [...]Transaction[...]
         pub fn execute(self: TransactionTemplate, callback: TransactionCallback) !void {
             const status = try self.transaction_manager.begin(self.definition);
             errdefer {
                 if (!status.is_completed) {
                     self.transaction_manager.rollback(status) catch |e| {
-                        std.log.err("回滚事务失败: {}", .{e});
+                        std.log.err("Rollback transactionfailure: {}", .{e});
                     };
                 }
             }
 
             callback.execute_fn(callback.ctx) catch |err| {
-                // 检查是否需要回滚
+                // Check if[...]
                 if (shouldRollback(self.definition, err)) {
                     try self.transaction_manager.rollback(status);
                 } else {
@@ -141,21 +141,21 @@ pub const Transactional = struct {
         }
 
         fn shouldRollback(definition: Definition, err: anyerror) bool {
-            // 默认情况下，所有错误都回滚
+            // [...]Error[...]
             _ = definition;
             _ = @errorName(err);
             return true;
         }
     };
 
-    /// 声明式事务属性（用于代码生成或元数据）
+    /// [...]Transaction[...]for[...]
     pub const Attribute = struct {
         definition: Definition,
         target_method: []const u8,
         target_type: []const u8,
     };
 
-    /// 事务拦截器
+    /// Transaction[...]
     pub const Interceptor = struct {
         allocator: std.mem.Allocator,
         transaction_manager: TransactionManager,
@@ -173,15 +173,15 @@ pub const Transactional = struct {
             self.attributes.deinit();
         }
 
-        /// 为方法注册事务属性
+        /// [...]Transaction[...]
         pub fn register(self: *Interceptor, method_signature: []const u8, definition: Definition) !void {
             try self.attributes.put(method_signature, definition);
         }
 
-        /// 拦截方法调用
+        /// [...]call
         pub fn invoke(self: *Interceptor, method_signature: []const u8, comptime ResultType: type, action: fn () anyerror!ResultType) !ResultType {
             const definition = self.attributes.get(method_signature) orelse {
-                // 没有事务配置，直接执行
+                // [...]Transaction[...]
                 return action();
             };
 
@@ -190,7 +190,7 @@ pub const Transactional = struct {
                 .definition = definition,
             };
 
-            // 使用结构体包装结果
+            // [...]
             const Context = struct {
                 result: ?ResultType,
                 action_error: ?anyerror,
@@ -225,7 +225,7 @@ pub const Transactional = struct {
         }
     };
 
-    /// 内存事务管理器（用于测试）
+    /// [...]Transaction[...]forTests[...]
     pub const InMemoryTransactionManager = struct {
         const TMContext = struct {
             transactions: std.array_list.Managed(Status),
@@ -280,7 +280,7 @@ pub const Transactional = struct {
 
             try tm_ctx.transactions.append(status);
 
-            std.log.info("[事务] 开始: {s}, 传播行为: {s}, 隔离级别: {s}", .{
+            std.log.info("[Transaction] begin: {s}, propagation: {s}, isolation: {s}", .{
                 definition.name,
                 @tagName(definition.propagation),
                 @tagName(definition.isolation),
@@ -293,13 +293,13 @@ pub const Transactional = struct {
             const tm_ctx = @as(*TMContext, @ptrCast(@alignCast(ctx)));
 
             if (status.is_rollback_only) {
-                std.log.warn("[事务] 事务标记为仅回滚，执行回滚", .{});
+                std.log.warn("[Transaction] marked rollback-only, rolling back", .{});
                 return rollbackTransaction(ctx, status);
             }
 
-            std.log.info("[事务] 提交: {s}", .{status.definition.name});
+            std.log.info("[Transaction] commit: {s}", .{status.definition.name});
 
-            // 移除事务
+            // [...]Transaction
             if (tm_ctx.transactions.items.len > 0) {
                 _ = tm_ctx.transactions.pop();
             }
@@ -308,21 +308,21 @@ pub const Transactional = struct {
         fn rollbackTransaction(ctx: *anyopaque, status: Status) !void {
             const tm_ctx = @as(*TMContext, @ptrCast(@alignCast(ctx)));
 
-            std.log.info("[事务] 回滚: {s}", .{status.definition.name});
+            std.log.info("[Transaction] rollback: {s}", .{status.definition.name});
 
-            // 移除事务
+            // [...]Transaction
             if (tm_ctx.transactions.items.len > 0) {
                 _ = tm_ctx.transactions.pop();
             }
         }
     };
 
-    /// 便捷宏：执行带事务的操作
-    /// 使用示例:
+    /// [...]Transaction[...]
+    /// [...]:
     /// ```zig
     /// try Transactional.run(tm, .{ .name = "createOrder" }, struct {
     ///     fn exec() !void {
-    ///         // 业务逻辑
+    /// // [...]
     ///     }
     /// }.exec);
     /// ```
@@ -346,7 +346,7 @@ pub const Transactional = struct {
     }
 };
 
-// 测试
+// Tests
 test "Transactional basic" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -359,10 +359,10 @@ test "Transactional basic" {
         .propagation = .REQUIRED,
     };
 
-    // 测试成功提交
+    // Testssuccess[...]
     try Transactional.run(tm.getManager(), definition, struct {
         fn exec() !void {
-            std.log.info("执行业务逻辑", .{});
+            std.log.info("execute business logic", .{});
         }
     }.exec);
 }
@@ -379,7 +379,7 @@ test "Transactional rollback" {
         .propagation = .REQUIRED,
     };
 
-    // 测试回滚
+    // Tests[...]
     const result = Transactional.run(tm.getManager(), definition, struct {
         fn exec() !void {
             return error.TestError;

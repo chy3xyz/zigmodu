@@ -1,20 +1,20 @@
 const std = @import("std");
 const Time = @import("../core/Time.zig");
 
-/// Saga 步骤定义
+/// Saga step[...]
 pub const SagaStep = struct {
     name: []const u8,
-    /// 正向操作
+    /// [...]
     action: *const fn () anyerror!void,
-    /// 补偿操作 (撤销已执行操作)
+    /// [...] ([...])
     compensation: *const fn () void,
-    /// 是否可重试
+    /// [...]
     retryable: bool = true,
-    /// 超时时间 (秒)
+    /// [...] ([...])
     timeout_seconds: u64 = 30,
 };
 
-/// Saga 事务状态
+/// Saga Transaction[...]
 pub const SagaStatus = enum {
     pending,
     running,
@@ -25,7 +25,7 @@ pub const SagaStatus = enum {
     timed_out,
 };
 
-/// Saga 执行记录
+/// Saga [...]
 pub const SagaLog = struct {
     transaction_id: []const u8,
     saga_name: []const u8,
@@ -51,8 +51,8 @@ pub const SagaLog = struct {
     };
 };
 
-/// Saga 编排器
-/// 自动补偿: 任何步骤失败时，自动按逆序执行已成功步骤的补偿操作
+/// Saga orchestrator
+/// [...]: [...]failure[...]success[...]
 pub const SagaOrchestrator = struct {
     const Self = @This();
 
@@ -111,7 +111,7 @@ pub const SagaOrchestrator = struct {
         self.running_instances.deinit();
     }
 
-    /// 注册 Saga 定义
+    /// [...] Saga [...]
     pub fn registerSaga(self: *Self, name: []const u8, steps: []const SagaStep) !void {
         const name_copy = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(name_copy);
@@ -133,7 +133,7 @@ pub const SagaOrchestrator = struct {
         });
     }
 
-    /// 开始执行 Saga
+    /// [...]Execute saga
     pub fn execute(self: *Self, saga_name: []const u8) ![]const u8 {
         const saga = self.sagas.get(saga_name) orelse return error.SagaNotFound;
 
@@ -152,7 +152,7 @@ pub const SagaOrchestrator = struct {
 
         try self.running_instances.put(instance_id, instance);
 
-        // 执行所有步骤
+        // [...]
         for (saga.steps, 0..) |step, i| {
             const inst = self.running_instances.getPtr(instance_id) orelse return error.InternalError;
             inst.current_step = i;
@@ -175,7 +175,7 @@ pub const SagaOrchestrator = struct {
 
                 std.log.warn("[Saga] Step '{s}' failed in '{s}': {s}", .{ step.name, instance_id, err_msg });
 
-                // 自动补偿
+                // [...]
                 try self.compensate(instance_id, i);
                 return error.SagaStepFailed;
             };
@@ -200,7 +200,7 @@ pub const SagaOrchestrator = struct {
         return instance_id;
     }
 
-    /// 执行补偿 (逆序回滚)
+    /// Execute compensation ([...])
     fn compensate(self: *Self, instance_id: []const u8, failed_step_index: usize) !void {
         const inst = self.running_instances.getPtr(instance_id) orelse return;
         const saga = self.sagas.get(inst.saga_name) orelse return;
@@ -209,7 +209,7 @@ pub const SagaOrchestrator = struct {
 
         std.log.info("[Saga] Compensating '{s}' (failed at step {d})", .{ instance_id, failed_step_index });
 
-        // 逆向补偿已成功的步骤
+        // [...]success[...]
         var i: usize = failed_step_index;
         while (i > 0) {
             i -= 1;
@@ -218,7 +218,7 @@ pub const SagaOrchestrator = struct {
             std.log.info("[Saga] Executing compensation for step '{s}'", .{step.name});
             step.compensation();
 
-            // 更新日志
+            // [...]
             for (inst.step_logs.items) |*log| {
                 if (std.mem.eql(u8, log.step_name, step.name) and log.status == .completed) {
                     log.status = .compensated;
@@ -231,13 +231,13 @@ pub const SagaOrchestrator = struct {
         std.log.info("[Saga] Compensation completed for '{s}'", .{instance_id});
     }
 
-    /// 获取 Saga 实例状态
+    /// [...] Saga [...]
     pub fn getStatus(self: *Self, instance_id: []const u8) ?SagaStatus {
         const inst = self.running_instances.get(instance_id) orelse return null;
         return inst.status;
     }
 
-    /// 获取 Saga 执行日志
+    /// [...] Saga [...]
     pub fn getLog(self: *Self, instance_id: []const u8) !?SagaLog {
         const inst = self.running_instances.get(instance_id) orelse return null;
 
@@ -262,7 +262,7 @@ pub const SagaOrchestrator = struct {
         };
     }
 
-    /// 列出所有活跃 Saga 实例
+    /// [...] Saga [...]
     pub fn listActiveInstances(self: *Self) ![]const []const u8 {
         var result = std.ArrayList([]const u8).empty;
 
@@ -276,7 +276,7 @@ pub const SagaOrchestrator = struct {
         return result.toOwnedSlice(self.allocator);
     }
 
-    /// 获取已注册的 Saga 数量
+    /// [...] Saga [...]
     pub fn getSagaCount(self: *Self) usize {
         return self.sagas.count();
     }

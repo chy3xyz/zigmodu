@@ -1,9 +1,9 @@
 const std = @import("std");
 const Time = @import("Time.zig");
 
-/// 分布式事务管理器
-/// 分布式事务管理器
-/// 实现 Saga 模式用于分布式事务
+/// Distributed transaction[...]
+/// Distributed transaction[...]
+/// [...] Saga [...]forDistributed transaction
 pub const DistributedTransactionManager = struct {
     const Self = @This();
 
@@ -59,7 +59,7 @@ pub const DistributedTransactionManager = struct {
         self.transactions.deinit();
     }
 
-    /// 开始新的事务
+    /// [...]Transaction
     pub fn beginTransaction(self: *Self) ![]const u8 {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
@@ -81,7 +81,7 @@ pub const DistributedTransactionManager = struct {
         return id;
     }
 
-    /// 添加 Saga 步骤
+    /// [...] Saga step
     pub fn addStep(
         self: *Self,
         tx_id: []const u8,
@@ -104,7 +104,7 @@ pub const DistributedTransactionManager = struct {
         });
     }
 
-    /// 执行事务
+    /// [...]Transaction
     pub fn execute(self: *Self, tx_id: []const u8) !void {
         const tx = self.transactions.getPtr(tx_id) orelse return error.TransactionNotFound;
 
@@ -115,10 +115,10 @@ pub const DistributedTransactionManager = struct {
             step.action() catch |err| {
                 std.log.warn("Step '{s}' failed in transaction '{s}': {s}", .{ step.name, tx_id, @errorName(err) });
 
-                // 标记失败的步骤
+                // Mark failed steps
                 tx.steps.items[i].executed = true;
 
-                // 执行补偿
+                // Execute compensation
                 try self.compensate(tx_id, i);
                 return error.TransactionFailed;
             };
@@ -132,14 +132,14 @@ pub const DistributedTransactionManager = struct {
         std.log.info("Transaction '{s}' completed successfully", .{tx_id});
     }
 
-    /// 补偿事务
+    /// Compensating transaction
     fn compensate(self: *Self, tx_id: []const u8, failed_step_index: usize) !void {
         const tx = self.transactions.getPtr(tx_id) orelse return error.TransactionNotFound;
 
         tx.status = .COMPENSATING;
         std.log.info("Starting compensation for transaction: {s}", .{tx_id});
 
-        // 逆向执行已完成的步骤的补偿
+        // Reverse-compensate completed steps
         var i: usize = failed_step_index;
         while (i > 0) {
             i -= 1;
@@ -162,13 +162,13 @@ pub const DistributedTransactionManager = struct {
         std.log.info("Compensation completed for transaction: {s}", .{tx_id});
     }
 
-    /// 获取事务状态
+    /// [...]Transaction[...]
     pub fn getStatus(self: *Self, tx_id: []const u8) ?SagaTransaction.TransactionStatus {
         const tx = self.transactions.get(tx_id) orelse return null;
         return tx.status;
     }
 
-    /// 获取事务统计
+    /// [...]Transaction[...]
     pub fn getStatistics(self: *Self) TransactionStatistics {
         var stats = TransactionStatistics{};
 
@@ -196,7 +196,7 @@ pub const TransactionStatistics = struct {
     running: usize = 0,
 };
 
-/// 两阶段提交 (2PC) 实现
+/// [...] (2PC) [...]
 pub const TwoPhaseCommit = struct {
     const Self = @This();
 
@@ -247,7 +247,7 @@ pub const TwoPhaseCommit = struct {
         self.coordinators.deinit();
     }
 
-    /// 创建协调者
+    /// Create coordinator
     pub fn createCoordinator(self: *Self, tx_id: []const u8) !void {
         const id_copy = try self.allocator.dupe(u8, tx_id);
         try self.coordinators.put(id_copy, .{
@@ -257,7 +257,7 @@ pub const TwoPhaseCommit = struct {
         });
     }
 
-    /// 添加参与者
+    /// Add participant
     pub fn addParticipant(
         self: *Self,
         tx_id: []const u8,
@@ -276,7 +276,7 @@ pub const TwoPhaseCommit = struct {
         });
     }
 
-    /// 执行两阶段提交
+    /// [...]
     pub fn execute(self: *Self, tx_id: []const u8) !void {
         const coord = self.coordinators.getPtr(tx_id) orelse return error.CoordinatorNotFound;
 

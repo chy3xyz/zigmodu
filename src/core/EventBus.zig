@@ -1,14 +1,14 @@
 const std = @import("std");
 
-/// ListenerSet 用于 O(1) 的订阅/取消订阅操作
-/// ListenerSet 使用 ArrayList 存储回调，小数据量时比 HashMap 更高效
+/// ListenerSet for O(1) [...]/[...]
+/// ListenerSet [...] ArrayList [...] HashMap [...]
 ///
 /// NOTE: This type is NOT thread-safe. For concurrent access, use ThreadSafeEventBus.
 fn ListenerSet(comptime CallbackType: type) type {
     return struct {
         const Self = @This();
 
-        // 使用 ArrayList 存储回调，实现更好的缓存局部性
+        // [...] ArrayList [...]Achieve better cache locality
         list: std.ArrayList(CallbackType),
         allocator: std.mem.Allocator,
 

@@ -3,8 +3,8 @@ const Time = @import("../core/Time.zig");
 
 var prng_seed = std.atomic.Value(u64).init(0);
 
-/// 分布式链路追踪器
-/// 分布式链路追踪器
+/// Distributed tracer
+/// Distributed tracer
 pub const DistributedTracer = struct {
     const Self = @This();
 
@@ -147,7 +147,7 @@ pub const DistributedTracer = struct {
         self.active_spans.deinit(self.allocator);
     }
 
-    /// 创建新的 Trace
+    /// Create new trace
     pub fn startTrace(self: *Self, span_name: []const u8) !*Span {
         const trace_id = TraceId.generate();
         const span_id = SpanId.generate();
@@ -159,7 +159,7 @@ pub const DistributedTracer = struct {
         return span;
     }
 
-    /// 创建子 Span
+    /// Create child span
     pub fn startSpan(self: *Self, parent: *Span, span_name: []const u8) !*Span {
         const span_id = SpanId.generate();
 
@@ -170,11 +170,11 @@ pub const DistributedTracer = struct {
         return span;
     }
 
-    /// 结束 Span
+    /// End span
     pub fn endSpan(self: *Self, span: *Span) void {
         span.end();
 
-        // 从活跃列表中移除
+        // Remove from active list
         for (self.active_spans.items, 0..) |s, i| {
             if (s == span) {
                 _ = self.active_spans.orderedRemove(i);
@@ -183,7 +183,7 @@ pub const DistributedTracer = struct {
         }
     }
 
-    /// 导出为 Jaeger 格式
+    /// Export as Jaeger format
     pub fn exportJaeger(_self: *Self, span: *Span, allocator: std.mem.Allocator) ![]const u8 {
         _ = _self;
         var buf = std.ArrayList(u8).empty;
@@ -218,7 +218,7 @@ pub const DistributedTracer = struct {
         return buf.toOwnedSlice(allocator);
     }
 
-    /// 导出为 Zipkin 格式
+    /// Export as Zipkin format
     pub fn exportZipkin(self: *Self, span: *Span, allocator: std.mem.Allocator) ![]const u8 {
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(allocator);
@@ -244,7 +244,7 @@ pub const DistributedTracer = struct {
         return buf.toOwnedSlice(allocator);
     }
 
-    /// 传播上下文（用于跨服务调用）
+    /// Propagate context (cross-service calls)
     pub fn injectContext(self: *Self, span: *Span, headers: *std.StringHashMap([]const u8)) !void {
         const trace_id_str = try span.trace_id.toString(self.allocator);
         defer self.allocator.free(trace_id_str);
@@ -256,18 +256,18 @@ pub const DistributedTracer = struct {
         try headers.put("x-span-id", span_id_str);
     }
 
-    /// 提取上下文（从入站请求）
+    /// Extract context (from inbound request)
     pub fn extractContext(self: *Self, headers: std.StringHashMap([]const u8)) ?TraceId {
         _ = self;
         if (headers.get("x-trace-id")) |_| {
-            // 简化实现：生成新的 trace id
+            // Simplified: generate new trace id
             return TraceId.generate();
         }
         return null;
     }
 };
 
-/// 采样器
+/// Sampler
 pub const Sampler = struct {
     pub const AlwaysOnSampler = struct {
         pub fn shouldSample() bool {

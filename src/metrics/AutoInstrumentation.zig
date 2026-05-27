@@ -2,9 +2,9 @@ const std = @import("std");
 const PrometheusMetrics = @import("PrometheusMetrics.zig").PrometheusMetrics;
 const DistributedTracer = @import("../tracing/DistributedTracer.zig").DistributedTracer;
 
-/// 自动埋点器
-/// 自动为模块生命周期、事件处理、API调用等创建指标和链路追踪
-/// 这是架构评估中的高优先级改进项
+/// Auto-instrumentation collector
+/// Auto-create metrics and traces for module lifecycle, events, API calls
+/// High-priority architecture improvement item
 pub const AutoInstrumentation = struct {
     const Self = @This();
 
@@ -12,42 +12,42 @@ pub const AutoInstrumentation = struct {
     metrics: *PrometheusMetrics,
     tracer: *DistributedTracer,
 
-    // 模块生命周期指标
+    // Module lifecycle metrics
     module_init_duration: *PrometheusMetrics.Histogram,
     module_init_total: *PrometheusMetrics.Counter,
     module_active_gauge: *PrometheusMetrics.Gauge,
 
-    // 事件处理指标
+    // Event processing metrics
     event_published_total: *PrometheusMetrics.Counter,
     event_consumed_total: *PrometheusMetrics.Counter,
     event_processing_duration: *PrometheusMetrics.Histogram,
 
-    // API调用指标
+    // API call metrics
     api_request_total: *PrometheusMetrics.Counter,
     api_request_duration: *PrometheusMetrics.Histogram,
     api_error_total: *PrometheusMetrics.Counter,
 
     pub fn init(allocator: std.mem.Allocator, metrics: *PrometheusMetrics, tracer: *DistributedTracer) !Self {
-        // 创建模块生命周期指标
-        const module_init_duration = try metrics.createHistogram("zigmodu_module_init_duration_seconds", "模块初始化耗时", &.{ 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0 });
+        // Create module lifecycle metrics
+        const module_init_duration = try metrics.createHistogram("zigmodu_module_init_duration_seconds", "Module initialization duration", &.{ 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0 });
 
-        const module_init_total = try metrics.createCounter("zigmodu_module_init_total", "模块初始化次数（包括成功和失败）");
+        const module_init_total = try metrics.createCounter("zigmodu_module_init_total", "Module initialization count (success + failure)");
 
-        const module_active_gauge = try metrics.createGauge("zigmodu_module_active", "当前活跃的模块数量");
+        const module_active_gauge = try metrics.createGauge("zigmodu_module_active", "Current active module count");
 
-        // 创建事件处理指标
-        const event_published_total = try metrics.createCounter("zigmodu_event_published_total", "发布的事件总数");
+        // Create event processing metrics
+        const event_published_total = try metrics.createCounter("zigmodu_event_published_total", "Total published events");
 
-        const event_consumed_total = try metrics.createCounter("zigmodu_event_consumed_total", "消费的事件总数");
+        const event_consumed_total = try metrics.createCounter("zigmodu_event_consumed_total", "Total consumed events");
 
-        const event_processing_duration = try metrics.createHistogram("zigmodu_event_processing_duration_seconds", "事件处理耗时", &.{ 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5 });
+        const event_processing_duration = try metrics.createHistogram("zigmodu_event_processing_duration_seconds", "Event processing duration", &.{ 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5 });
 
-        // 创建API调用指标
-        const api_request_total = try metrics.createCounter("zigmodu_api_request_total", "API请求总数");
+        // Create API call metrics
+        const api_request_total = try metrics.createCounter("zigmodu_api_request_total", "Total API requests");
 
-        const api_request_duration = try metrics.createHistogram("zigmodu_api_request_duration_seconds", "API请求耗时", &.{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0 });
+        const api_request_duration = try metrics.createHistogram("zigmodu_api_request_duration_seconds", "API request duration", &.{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0 });
 
-        const api_error_total = try metrics.createCounter("zigmodu_api_error_total", "API错误总数");
+        const api_error_total = try metrics.createCounter("zigmodu_api_error_total", "Total API errors");
 
         return .{
             .allocator = allocator,
@@ -65,7 +65,7 @@ pub const AutoInstrumentation = struct {
         };
     }
 
-    /// 记录模块初始化
+    /// Record module initialization
     pub fn recordModuleInit(self: *Self, module_name: []const u8, duration_seconds: f64, success: bool) void {
         self.module_init_duration.observe(duration_seconds);
         self.module_init_total.inc();
@@ -74,25 +74,25 @@ pub const AutoInstrumentation = struct {
             self.module_active_gauge.inc();
         }
 
-        std.log.info("[AutoInstrumentation] 模块 {s} 初始化完成，耗时: {d:.3}s，状态: {s}", .{
+        std.log.info("[AutoInstrumentation] Module {s} init done, duration: {d:.3}s, status: {s}", .{
             module_name,
             duration_seconds,
-            if (success) "成功" else "失败",
+            if (success) "success" else "failure",
         });
     }
 
-    /// 记录模块关闭
+    /// Record module shutdown
     pub fn recordModuleShutdown(self: *Self, module_name: []const u8) void {
         self.module_active_gauge.dec();
 
-        std.log.info("[AutoInstrumentation] 模块 {s} 已关闭", .{module_name});
+        std.log.info("[AutoInstrumentation] Module {s} shutdown", .{module_name});
     }
 
-    /// 记录事件发布（带链路追踪）
+    /// Record event published (with trace)
     pub fn recordEventPublished(self: *Self, event_name: []const u8, module_name: []const u8) !?*DistributedTracer.Span {
         self.event_published_total.inc();
 
-        // 创建链路追踪 Span
+        // Create trace span
         const span = try self.tracer.startTrace(try std.fmt.allocPrint(self.allocator, "event_publish:{s}", .{event_name}));
         errdefer {
             span.deinit(self.allocator);
@@ -103,16 +103,16 @@ pub const AutoInstrumentation = struct {
         try span.setAttribute(self.allocator, "module.name", module_name);
         try span.setAttribute(self.allocator, "event.type", "published");
 
-        std.log.info("[AutoInstrumentation] 事件 {s} 从模块 {s} 发布", .{ event_name, module_name });
+        std.log.info("[AutoInstrumentation] Event {s} published from module {s}", .{ event_name, module_name });
 
         return span;
     }
 
-    /// 记录事件消费（带链路追踪）
+    /// Record event consumed (with trace)
     pub fn recordEventConsumed(self: *Self, event_name: []const u8, module_name: []const u8, parent_span: ?*DistributedTracer.Span) !?*DistributedTracer.Span {
         self.event_consumed_total.inc();
 
-        // 创建链路追踪 Span
+        // Create trace span
         const span = if (parent_span) |parent|
             try self.tracer.startSpan(parent, try std.fmt.allocPrint(self.allocator, "event_consume:{s}", .{event_name}))
         else
@@ -127,12 +127,12 @@ pub const AutoInstrumentation = struct {
         try span.setAttribute(self.allocator, "module.name", module_name);
         try span.setAttribute(self.allocator, "event.type", "consumed");
 
-        std.log.info("[AutoInstrumentation] 事件 {s} 被模块 {s} 消费", .{ event_name, module_name });
+        std.log.info("[AutoInstrumentation] Event {s} consumed by module {s}", .{ event_name, module_name });
 
         return span;
     }
 
-    /// 记录事件处理完成
+    /// Record event processing complete
     pub fn recordEventProcessed(self: *Self, span: *DistributedTracer.Span, duration_seconds: f64, success: bool) void {
         self.event_processing_duration.observe(duration_seconds);
 
@@ -144,13 +144,13 @@ pub const AutoInstrumentation = struct {
 
         self.tracer.endSpan(span);
 
-        std.log.info("[AutoInstrumentation] 事件处理完成，耗时: {d:.3}s，状态: {s}", .{
+        std.log.info("[AutoInstrumentation] Event processing done, duration: {d:.3}s, status: {s}", .{
             duration_seconds,
-            if (success) "成功" else "失败",
+            if (success) "success" else "failure",
         });
     }
 
-    /// 记录API调用开始（带链路追踪）
+    /// Record API call start (with trace)
     pub fn recordApiRequestStart(self: *Self, api_name: []const u8, module_name: []const u8) !*DistributedTracer.Span {
         self.api_request_total.inc();
 
@@ -166,7 +166,7 @@ pub const AutoInstrumentation = struct {
         return span;
     }
 
-    /// 记录API调用完成
+    /// Record API call complete
     pub fn recordApiRequestEnd(self: *Self, span: *DistributedTracer.Span, duration_seconds: f64, success: bool) void {
         self.api_request_duration.observe(duration_seconds);
 
@@ -180,13 +180,13 @@ pub const AutoInstrumentation = struct {
         span.addEvent(self.allocator, "api_request_complete") catch {};
         self.tracer.endSpan(span);
 
-        std.log.info("[AutoInstrumentation] API调用完成，耗时: {d:.3}s，状态: {s}", .{
+        std.log.info("[AutoInstrumentation] API call done, duration: {d:.3}s, status: {s}", .{
             duration_seconds,
-            if (success) "成功" else "失败",
+            if (success) "success" else "failure",
         });
     }
 
-    /// 包装函数执行，自动记录指标和追踪
+    /// Wrap function execution, auto-record metrics and traces
     pub fn instrumentFunction(
         self: *Self,
         name: []const u8,
@@ -195,7 +195,7 @@ pub const AutoInstrumentation = struct {
     ) !ResultType {
         const start_time = 0;
 
-        // 创建追踪 Span
+        // Create trace span
         const span = try self.tracer.startTrace(name);
         defer {
             self.tracer.endSpan(span);
@@ -203,14 +203,14 @@ pub const AutoInstrumentation = struct {
             self.allocator.destroy(span);
         }
 
-        // 执行函数
+        // Execute function
         const result = func() catch |err| {
             const duration = @as(f64, @floatFromInt(0 - start_time)) / 1e9;
 
             span.status = .ERROR;
             try span.setAttribute(self.allocator, "error.type", @errorName(err));
 
-            std.log.err("[AutoInstrumentation] 函数 {s} 执行失败: {s}，耗时: {d:.3}s", .{
+            std.log.err("[AutoInstrumentation] Function {s} failed: {s}, duration: {d:.3}s", .{
                 name,
                 @errorName(err),
                 duration,
@@ -222,7 +222,7 @@ pub const AutoInstrumentation = struct {
         const duration = @as(f64, @floatFromInt(0 - start_time)) / 1e9;
         span.status = .OK;
 
-        std.log.info("[AutoInstrumentation] 函数 {s} 执行成功，耗时: {d:.3}s", .{
+        std.log.info("[AutoInstrumentation] Function {s} succeeded, duration: {d:.3}s", .{
             name,
             duration,
         });
@@ -230,13 +230,13 @@ pub const AutoInstrumentation = struct {
         return result;
     }
 
-    /// 获取Prometheus格式的指标
+    /// Get Prometheus-format metrics
     pub fn getMetrics(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
         return try self.metrics.toPrometheusFormat(allocator);
     }
 };
 
-/// 模块生命周期监听器（用于自动埋点）
+/// Module lifecycle listener (for auto-instrumentation)
 pub const InstrumentedLifecycleListener = struct {
     const Self = @This();
 
@@ -254,15 +254,15 @@ pub const InstrumentedLifecycleListener = struct {
         self.module_init_times.deinit();
     }
 
-    /// 模块初始化前调用
+    /// Called before module init
     pub fn onModuleInitStart(self: *Self, module_name: []const u8) !void {
         const start_time = 0;
         try self.module_init_times.put(module_name, @intCast(start_time));
 
-        std.log.info("[LifecycleListener] 模块 {s} 开始初始化", .{module_name});
+        std.log.info("[LifecycleListener] Module {s} initializing", .{module_name});
     }
 
-    /// 模块初始化后调用
+    /// Called after module init
     pub fn onModuleInitEnd(self: *Self, module_name: []const u8, success: bool) void {
         const start_time = self.module_init_times.get(module_name) orelse 0;
         const duration = @as(f64, @floatFromInt(0 - start_time)) / 1e9;
@@ -271,13 +271,13 @@ pub const InstrumentedLifecycleListener = struct {
         _ = self.module_init_times.remove(module_name);
     }
 
-    /// 模块关闭前调用
+    /// Called before module shutdown
     pub fn onModuleShutdown(self: *Self, module_name: []const u8) void {
         self.instrumentation.recordModuleShutdown(module_name);
     }
 };
 
-/// 事件监听器（用于自动埋点）
+/// Event listener (for auto-instrumentation)
 pub const InstrumentedEventListener = struct {
     const Self = @This();
 
@@ -307,7 +307,7 @@ pub const InstrumentedEventListener = struct {
         self.event_start_times.deinit();
     }
 
-    /// 事件发布时调用
+    /// Called on event publish
     pub fn onEventPublished(self: *Self, event_name: []const u8, module_name: []const u8) !void {
         const span = try self.instrumentation.recordEventPublished(event_name, module_name);
         if (span) |s| {
@@ -316,9 +316,9 @@ pub const InstrumentedEventListener = struct {
         }
     }
 
-    /// 事件消费开始时调用
+    /// Called on event consumption start
     pub fn onEventConsumeStart(self: *Self, event_name: []const u8, module_name: []const u8) !void {
-        // 查找发布时的 span 作为父 span
+        // Look up publish-time span as parent
         const pub_key = try std.fmt.allocPrint(self.event_processing_spans.allocator, "{s}:{s}", .{ event_name, module_name });
         defer self.event_processing_spans.allocator.free(pub_key);
         const parent_span = self.event_processing_spans.get(pub_key);
@@ -332,7 +332,7 @@ pub const InstrumentedEventListener = struct {
         }
     }
 
-    /// 事件消费完成时调用
+    /// Called on event consumption complete
     pub fn onEventConsumeEnd(self: *Self, event_name: []const u8, module_name: []const u8, success: bool) void {
         const key = std.fmt.allocPrint(self.event_start_times.allocator, "consume:{s}:{s}", .{ event_name, module_name }) catch return;
         defer self.event_start_times.allocator.free(key);
@@ -348,7 +348,7 @@ pub const InstrumentedEventListener = struct {
     }
 };
 
-// 测试
+// Tests
 test "AutoInstrumentation basic" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -361,7 +361,7 @@ test "AutoInstrumentation basic" {
 
     var instrumentation = try AutoInstrumentation.init(allocator, &metrics, &tracer);
 
-    // 测试模块初始化记录
+    // Test module init recording
     instrumentation.recordModuleInit("test_module", 0.5, true);
 
     try testing.expectEqual(@as(u64, 1), instrumentation.module_init_total.get());

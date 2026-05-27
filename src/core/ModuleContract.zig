@@ -1,82 +1,82 @@
 const std = @import("std");
 
 /// ModuleContract - Runtime contract verification for modules
-/// 模块契约定义
-/// 显式声明模块发布/消费的事件、提供的API和依赖的服务
-/// 这是架构评估中的高优先级改进项，用于提高模块间的契约清晰度
+/// Module contract[...]
+/// [...]publish/consume[...]Event[...]API[...]
+/// High-priority architecture improvement item，forImprove inter-module contract clarity
 pub const ModuleContract = struct {
     const Self = @This();
 
-    /// 模块名称
+    /// Module name
     name: []const u8,
 
-    /// 模块描述
+    /// [...]
     description: []const u8 = "",
 
-    /// 发布的事件类型（该模块会发送这些事件）
+    /// publish[...]Event[...]Event[...]
     published_events: []const EventDefinition = &.{},
 
-    /// 消费的事件类型（该模块会监听这些事件）
+    /// consume[...]Event[...]Event[...]
     consumed_events: []const EventDefinition = &.{},
 
-    /// 提供的API接口
+    /// [...]API[...]
     provided_apis: []const ApiDefinition = &.{},
 
-    /// 依赖的服务接口
+    /// [...]
     required_services: []const ServiceDependency = &.{},
 
-    /// 配置属性定义
+    /// [...]
     configuration: []const ConfigProperty = &.{},
 
-    /// 事件定义
+    /// Event[...]
     pub const EventDefinition = struct {
-        /// 事件类型名称（如 "OrderCreated", "PaymentCompleted"）
+        /// Event[...] "OrderCreated", "PaymentCompleted"[...]
         name: []const u8,
 
-        /// 事件描述
+        /// Event[...]
         description: []const u8 = "",
 
-        /// 事件负载类型（用类型名称字符串表示，如 "OrderPayload"）
+        /// Event[...]Represent as type name string[...] "OrderPayload"[...]
         payload_type: []const u8,
 
-        /// 是否是领域事件（Domain Event）
+        /// [...]Event[...]Domain Event[...]
         is_domain_event: bool = true,
 
-        /// 事件版本（用于事件演进）
+        /// Event[...]forEvent[...]
         version: u32 = 1,
 
-        /// 是否持久化到事件存储
+        /// [...]Event[...]
         persistent: bool = true,
     };
 
-    /// API接口定义
+    /// API[...]
     pub const ApiDefinition = struct {
-        /// API名称
+        /// API[...]
         name: []const u8,
 
-        /// API描述
+        /// API[...]
         description: []const u8 = "",
 
-        /// HTTP方法（如果是REST API）
+        /// HTTP[...]REST API[...]
         http_method: HttpMethod = .GET,
 
-        /// API路径
+        /// API[...]
         path: []const u8 = "",
 
-        /// 请求类型名称
+        /// [...]
         request_type: []const u8 = "void",
 
-        /// 响应类型名称
+        /// [...]
         response_type: []const u8 = "void",
 
-        /// 是否公开（不需要认证）
+        /// [...]
         is_public: bool = false,
 
-        /// 所需权限
+        /// [...]Permission
         required_permissions: []const []const u8 = &.{},
     };
 
-    /// HTTP方法枚举
+    /// HTTP[...]
     pub const HttpMethod = enum {
         GET,
         POST,
@@ -85,40 +85,40 @@ pub const ModuleContract = struct {
         PATCH,
     };
 
-    /// 服务依赖定义
+    /// [...]
     pub const ServiceDependency = struct {
-        /// 服务名称
+        /// [...]
         name: []const u8,
 
-        /// 服务描述
+        /// [...]
         description: []const u8 = "",
 
-        /// 是否是必需的依赖
+        /// [...]
         required: bool = true,
 
-        /// 服务接口名称
+        /// [...]
         interface_type: []const u8,
     };
 
-    /// 配置属性定义
+    /// [...]
     pub const ConfigProperty = struct {
-        /// 配置键
+        /// [...]
         key: []const u8,
 
-        /// 配置描述
+        /// [...]
         description: []const u8 = "",
 
-        /// 配置类型
+        /// [...]
         property_type: ConfigType = .String,
 
-        /// 默认值（字符串表示）
+        /// [...]
         default_value: ?[]const u8 = null,
 
-        /// 是否必需
+        /// [...]
         required: bool = false,
     };
 
-    /// 配置类型枚举
+    /// [...]
     pub const ConfigType = enum {
         String,
         Integer,
@@ -126,7 +126,7 @@ pub const ModuleContract = struct {
         Float,
     };
 
-    /// 契约验证结果
+    /// [...]Validation[...]
     pub const ValidationResult = struct {
         valid: bool,
         errors: std.array_list.Managed([]const u8),
@@ -154,54 +154,54 @@ pub const ModuleContract = struct {
         }
     };
 
-    /// 验证契约定义的有效性
+    /// Validation[...]
     pub fn validate(self: *const Self, allocator: std.mem.Allocator) !ValidationResult {
         var result = ValidationResult.init(allocator);
         errdefer result.deinit();
 
-        // 验证模块名称
+        // ValidationModule name
         if (self.name.len == 0) {
-            try result.addError("模块名称不能为空");
+            try result.addError("Module name cannot be empty");
         }
 
-        // 验证发布的事件
+        // Validationpublish[...]Event
         for (self.published_events) |event| {
             if (event.name.len == 0) {
-                try result.addError("发布事件的名称不能为空");
+                try result.addError("Publish event name cannot be empty");
             }
             if (event.payload_type.len == 0) {
-                try result.addError(try std.fmt.allocPrint(allocator, "事件 '{s}' 的负载类型不能为空", .{event.name}));
+                try result.addError(try std.fmt.allocPrint(allocator, "Event '{s}' payload type cannot be empty", .{event.name}));
             }
         }
 
-        // 验证消费的 事件
+        // Validationconsume[...] Event
         for (self.consumed_events) |event| {
             if (event.name.len == 0) {
-                try result.addError("消费事件的名称不能为空");
+                try result.addError("Consume event name cannot be empty");
             }
         }
 
-        // 验证API定义
+        // ValidationAPI[...]
         for (self.provided_apis) |api| {
             if (api.name.len == 0) {
-                try result.addError("API名称不能为空");
+                try result.addError("API name cannot be empty");
             }
         }
 
-        // 验证服务依赖
+        // Validation[...]
         for (self.required_services) |service| {
             if (service.name.len == 0) {
-                try result.addError("依赖服务的名称不能为空");
+                try result.addError("Dependent service name cannot be empty");
             }
             if (service.interface_type.len == 0) {
-                try result.addError(try std.fmt.allocPrint(allocator, "服务 '{s}' 的接口类型不能为空", .{service.name}));
+                try result.addError(try std.fmt.allocPrint(allocator, "Service '{s}' interface type cannot be empty", .{service.name}));
             }
         }
 
         return result;
     }
 
-    /// 生成PlantUML组件图描述
+    /// [...]PlantUML[...]
     pub fn generatePlantUml(self: *const Self, allocator: std.mem.Allocator) ![]u8 {
         var buf = std.array_list.Managed(u8).init(allocator);
         defer buf.deinit();
@@ -209,29 +209,29 @@ pub const ModuleContract = struct {
 
         try writer.print("component \"{s}\" as {s} {{\n", .{ self.name, self.name });
 
-        // 添加描述
+        // [...]
         if (self.description.len > 0) {
             try writer.print("  note right: {s}\n", .{self.description});
         }
 
-        // 添加发布的事件
+        // [...]publish[...]Event
         if (self.published_events.len > 0) {
             try writer.writeAll("  portout PUBLISHED_EVENTS\n");
         }
 
-        // 添加消费的事件
+        // [...]consume[...]Event
         if (self.consumed_events.len > 0) {
             try writer.writeAll("  portin CONSUMED_EVENTS\n");
         }
 
-        // 添加API接口
+        // [...]API[...]
         if (self.provided_apis.len > 0) {
             try writer.writeAll("  portout APIS\n");
         }
 
         try writer.writeAll("}\n");
 
-        // 添加事件详情注释
+        // [...]Event[...]
         for (self.published_events) |event| {
             try writer.print("note right of {s}::PUBLISHED_EVENTS : publishes {s}({s})\n", .{ self.name, event.name, event.payload_type });
         }
@@ -244,7 +244,7 @@ pub const ModuleContract = struct {
     }
 };
 
-/// 契约注册表 - 管理所有模块的契约
+/// Contract registry - [...]
 pub const ContractRegistry = struct {
     const Self = @This();
 
@@ -262,19 +262,19 @@ pub const ContractRegistry = struct {
         self.contracts.deinit();
     }
 
-    /// 注册模块契约
+    /// [...]Module contract
     pub fn register(self: *Self, contract: ModuleContract) !void {
         try self.contracts.put(contract.name, contract);
-        std.log.info("已注册模块契约: {s}", .{contract.name});
+        std.log.info("Registered module contract: {s}", .{contract.name});
     }
 
-    /// 获取模块契约
+    /// [...]Module contract
     pub fn get(self: *Self, module_name: []const u8) ?ModuleContract {
         return self.contracts.get(module_name);
     }
 
-    /// 验证所有契约的兼容性
-    /// 检查事件发布者和消费者是否匹配
+    /// Validation[...]
+    /// [...]Eventpublish[...]consume[...]
     pub fn validateContracts(self: *Self, allocator: std.mem.Allocator) !ModuleContract.ValidationResult {
         var result = ModuleContract.ValidationResult.init(allocator);
         errdefer result.deinit();
@@ -283,7 +283,7 @@ pub const ContractRegistry = struct {
         while (iter.next()) |entry| {
             const contract = entry.value_ptr.*;
 
-            // 验证每个契约
+            // Validation[...]
             var validation = try contract.validate(allocator);
             defer validation.deinit();
 
@@ -295,23 +295,23 @@ pub const ContractRegistry = struct {
                 }
             }
 
-            // 检查依赖的服务是否存在
+            // Check if dependent service exists
             for (contract.required_services) |service| {
                 if (self.contracts.get(service.name) == null and service.required) {
-                    const msg = try std.fmt.allocPrint(allocator, "[{s}] 依赖的服务 '{s}' 未找到", .{ contract.name, service.name });
+                    const msg = try std.fmt.allocPrint(allocator, "[{s}] dependency service '{s}' not found", .{ contract.name, service.name });
                     try result.addError(msg);
                     allocator.free(msg);
                 }
             }
         }
 
-        // 检查事件兼容性
+        // [...]Event[...]
         try self.validateEventCompatibility(&result);
 
         return result;
     }
 
-    /// 验证事件发布/消费的兼容性
+    /// ValidationEventpublish/consume[...]
     fn validateEventCompatibility(self: *Self, result: *ModuleContract.ValidationResult) !void {
         var consumer_iter = self.contracts.iterator();
         while (consumer_iter.next()) |consumer_entry| {
@@ -328,9 +328,9 @@ pub const ContractRegistry = struct {
                         if (std.mem.eql(u8, consumed_event.name, published_event.name)) {
                             found = true;
 
-                            // 检查负载类型是否匹配
+                            // Check if load type matches
                             if (!std.mem.eql(u8, consumed_event.payload_type, published_event.payload_type)) {
-                                const msg = try std.fmt.allocPrint(result.errors.allocator, "[{s}] 消费的事件 '{s}' 负载类型与发布者 [{s}] 不匹配: {s} vs {s}", .{ consumer.name, consumed_event.name, publisher.name, consumed_event.payload_type, published_event.payload_type });
+                                const msg = try std.fmt.allocPrint(result.errors.allocator, "[{s}] consumed event '{s}' payload type mismatch with publisher [{s}] match: {s} vs {s}", .{ consumer.name, consumed_event.name, publisher.name, consumed_event.payload_type, published_event.payload_type });
                                 try result.addError(msg);
                                 result.errors.allocator.free(msg);
                             }
@@ -342,7 +342,7 @@ pub const ContractRegistry = struct {
                 }
 
                 if (!found) {
-                    const msg = try std.fmt.allocPrint(result.errors.allocator, "[{s}] 消费的事件 '{s}' 没有对应的发布者", .{ consumer.name, consumed_event.name });
+                    const msg = try std.fmt.allocPrint(result.errors.allocator, "[{s}] consumed event '{s}' has no corresponding publisher", .{ consumer.name, consumed_event.name });
                     try result.addError(msg);
                     result.errors.allocator.free(msg);
                 }
@@ -350,7 +350,7 @@ pub const ContractRegistry = struct {
         }
     }
 
-    /// 生成所有契约的PlantUML图
+    /// [...]PlantUML[...]
     pub fn generatePlantUmlDiagram(self: *Self, allocator: std.mem.Allocator) ![]u8 {
         var buf = std.array_list.Managed(u8).init(allocator);
         defer buf.deinit();
@@ -361,7 +361,7 @@ pub const ContractRegistry = struct {
         try writer.writeAll("skinparam componentStyle rectangle\n\n");
         try writer.writeAll("title Module Contracts\n\n");
 
-        // 生成每个组件
+        // [...]
         var iter = self.contracts.iterator();
         while (iter.next()) |entry| {
             const contract = entry.value_ptr.*;
@@ -371,7 +371,7 @@ pub const ContractRegistry = struct {
             try writer.writeAll("\n");
         }
 
-        // 生成事件依赖关系
+        // [...]Event[...]
         try self.generateEventRelations(writer);
 
         try writer.writeAll("\n@enduml\n");
@@ -379,7 +379,7 @@ pub const ContractRegistry = struct {
         return buf.toOwnedSlice();
     }
 
-    /// 生成事件关系
+    /// [...]Event[...]
     fn generateEventRelations(self: *Self, writer: anytype) !void {
         var consumer_iter = self.contracts.iterator();
         while (consumer_iter.next()) |consumer_entry| {
@@ -401,21 +401,21 @@ pub const ContractRegistry = struct {
     }
 };
 
-/// 示例：创建一个订单模块契约
+/// [...]Module contract
 pub fn createOrderModuleContract() ModuleContract {
     return .{
         .name = "order",
-        .description = "订单管理模块",
+        .description = "Order management module",
         .published_events = &.{
             .{
                 .name = "OrderCreated",
-                .description = "订单已创建",
+                .description = "Order created",
                 .payload_type = "OrderCreatedPayload",
                 .is_domain_event = true,
             },
             .{
                 .name = "OrderPaid",
-                .description = "订单已支付",
+                .description = "Order paid",
                 .payload_type = "OrderPaidPayload",
                 .is_domain_event = true,
             },
@@ -423,19 +423,19 @@ pub fn createOrderModuleContract() ModuleContract {
         .consumed_events = &.{
             .{
                 .name = "InventoryReserved",
-                .description = "库存已预留",
+                .description = "Inventory reserved",
                 .payload_type = "InventoryReservedPayload",
             },
             .{
                 .name = "PaymentCompleted",
-                .description = "支付完成",
+                .description = "Payment done",
                 .payload_type = "PaymentCompletedPayload",
             },
         },
         .provided_apis = &.{
             .{
                 .name = "createOrder",
-                .description = "创建订单",
+                .description = "Create order",
                 .http_method = .POST,
                 .path = "/api/orders",
                 .request_type = "CreateOrderRequest",
@@ -443,7 +443,7 @@ pub fn createOrderModuleContract() ModuleContract {
             },
             .{
                 .name = "getOrder",
-                .description = "获取订单详情",
+                .description = "Get order details",
                 .http_method = .GET,
                 .path = "/api/orders/{id}",
                 .response_type = "OrderResponse",
@@ -452,13 +452,13 @@ pub fn createOrderModuleContract() ModuleContract {
         .required_services = &.{
             .{
                 .name = "inventory",
-                .description = "库存服务",
+                .description = "Inventory service",
                 .interface_type = "InventoryService",
                 .required = true,
             },
             .{
                 .name = "payment",
-                .description = "支付服务",
+                .description = "Payment service",
                 .interface_type = "PaymentService",
                 .required = true,
             },
@@ -466,13 +466,13 @@ pub fn createOrderModuleContract() ModuleContract {
         .configuration = &.{
             .{
                 .key = "order.timeout_minutes",
-                .description = "订单超时时间（分钟）",
+                .description = "Order timeout (minutes)",
                 .property_type = .Integer,
                 .default_value = "30",
             },
             .{
                 .key = "order.max_items",
-                .description = "单个订单最大商品数",
+                .description = "Max items per order",
                 .property_type = .Integer,
                 .default_value = "100",
             },
@@ -480,7 +480,7 @@ pub fn createOrderModuleContract() ModuleContract {
     };
 }
 
-// 测试
+// Tests
 const testing = std.testing;
 
 test "ModuleContract validation" {

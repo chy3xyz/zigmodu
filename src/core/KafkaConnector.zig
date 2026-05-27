@@ -1,7 +1,7 @@
 const std = @import("std");
 const Time = @import("../core/Time.zig");
 
-/// Kafka 消息
+/// Kafka [...]
 pub const KafkaMessage = struct {
     topic: []const u8,
     key: ?[]const u8,
@@ -16,7 +16,7 @@ pub const KafkaMessage = struct {
     };
 };
 
-/// Kafka 生产者配置
+/// Kafka [...]
 pub const KafkaProducerConfig = struct {
     bootstrap_servers: []const u8 = "localhost:9092",
     client_id: []const u8 = "zigmodu",
@@ -39,7 +39,7 @@ pub const KafkaProducerConfig = struct {
     };
 };
 
-/// Kafka 消费者配置
+/// Kafka consume[...]
 pub const KafkaConsumerConfig = struct {
     bootstrap_servers: []const u8 = "localhost:9092",
     group_id: []const u8 = "zigmodu-group",
@@ -50,7 +50,7 @@ pub const KafkaConsumerConfig = struct {
     session_timeout_ms: u64 = 45000,
 };
 
-/// Kafka 生产者
+/// Kafka [...]
 pub const KafkaProducer = struct {
     const Self = @This();
 
@@ -76,10 +76,10 @@ pub const KafkaProducer = struct {
         self.topic_stats.deinit();
     }
 
-    /// 发送消息到 Kafka
-    /// 实际实现通过 Kafka wire protocol 发送到 broker
+    /// [...] Kafka
+    /// [...] Kafka wire protocol [...] broker
     pub fn send(self: *Self, msg: KafkaMessage) !void {
-        // Placeholder: 实际实现通过 TCP 发送 Kafka protocol
+        // Placeholder: [...] TCP [...] Kafka protocol
         std.log.info("[KafkaProducer] Sending to {s}:{d} topic={s} size={d}", .{
             self.config.bootstrap_servers,
             0,
@@ -95,32 +95,32 @@ pub const KafkaProducer = struct {
         entry.value_ptr.last_produced_at = Time.monotonicNowSeconds();
     }
 
-    /// 批量发送消息
+    /// [...]
     pub fn sendBatch(self: *Self, messages: []const KafkaMessage) !void {
         for (messages) |msg| {
             try self.send(msg);
         }
     }
 
-    /// 获取 topic 统计
+    /// [...] topic [...]
     pub fn getTopicStats(self: *Self, topic: []const u8) ?TopicStats {
         return self.topic_stats.get(topic);
     }
 
-    /// 刷新缓冲区 (确保所有消息已发送)
+    /// [...] (Ensure all messages are sent)
     pub fn flush(self: *Self) !void {
         _ = self;
         std.log.info("[KafkaProducer] Flushing...", .{});
     }
 
-    /// 关闭生产者
+    /// CLOSED[...]
     pub fn close(self: *Self) void {
         _ = self;
         std.log.info("[KafkaProducer] Closed", .{});
     }
 };
 
-/// Kafka 消费者
+/// Kafka consume[...]
 pub const KafkaConsumer = struct {
     const Self = @This();
 
@@ -151,7 +151,7 @@ pub const KafkaConsumer = struct {
         self.subscriptions.deinit();
     }
 
-    /// 订阅 topic
+    /// [...] topic
     pub fn subscribe(self: *Self, topic: []const u8, handler: *const fn (KafkaMessage) void) !void {
         const topic_copy = try self.allocator.dupe(u8, topic);
         errdefer self.allocator.free(topic_copy);
@@ -164,14 +164,14 @@ pub const KafkaConsumer = struct {
         std.log.info("[KafkaConsumer] Subscribed to topic: {s}", .{topic});
     }
 
-    /// 取消订阅
+    /// [...]
     pub fn unsubscribe(self: *Self, topic: []const u8) void {
         if (self.subscriptions.fetchRemove(topic)) |removed| {
             self.allocator.free(removed.key);
         }
     }
 
-    /// 获取订阅列表
+    /// [...]
     pub fn getSubscriptions(self: *Self) ![]const []const u8 {
         var result = std.ArrayList([]const u8).empty;
         var iter = self.subscriptions.keyIterator();
@@ -181,20 +181,20 @@ pub const KafkaConsumer = struct {
         return result.toOwnedSlice(self.allocator);
     }
 
-    /// 开始轮询
+    /// [...]
     pub fn start(self: *Self) void {
         self.is_running = true;
         std.log.info("[KafkaConsumer] Started polling", .{});
     }
 
-    /// 停止轮询
+    /// [...]
     pub fn stop(self: *Self) void {
         self.is_running = false;
         std.log.info("[KafkaConsumer] Stopped", .{});
     }
 };
 
-/// Kafka 事件桥 — 连接 Kafka 和 DistributedEventBus
+/// Kafka Event[...] — [...] Kafka [...] DistributedEventBus
 pub const KafkaEventBridge = struct {
     const Self = @This();
 
@@ -210,7 +210,7 @@ pub const KafkaEventBridge = struct {
         };
     }
 
-    /// 将 InternalEvent 发布到 Kafka
+    /// [...] InternalEvent publish[...] Kafka
     pub fn publishEvent(self: *Self, topic: []const u8, payload: []const u8) !void {
         try self.producer.send(.{
             .topic = topic,
@@ -221,7 +221,7 @@ pub const KafkaEventBridge = struct {
         });
     }
 
-    /// 从 Kafka 消费事件并转发到 InternalEvent bus
+    /// [...] Kafka consumeEvent[...] InternalEvent bus
     pub fn bridgeTopic(self: *Self, topic: []const u8, on_event: *const fn ([]const u8) void) !void {
         try self.consumer.subscribe(topic, struct {
             fn handler(msg: KafkaMessage) void {

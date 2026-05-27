@@ -1,8 +1,8 @@
 const std = @import("std");
 
-/// 性能基准测试框架
-/// 提供完整的性能测试、统计分析和报告生成能力
-/// 这是架构评估中的中优先级改进项
+/// [...]Tests[...]
+/// [...]Tests[...]Statistical analysis and report generation
+/// Medium-priority architecture improvement
 pub const Benchmark = struct {
     const Self = @This();
 
@@ -11,23 +11,23 @@ pub const Benchmark = struct {
     results: std.array_list.Managed(BenchmarkResult),
     config: Config,
 
-    /// 基准测试配置
+    /// [...]Tests[...]
     pub const Config = struct {
-        /// 最小运行次数
+        /// [...]
         min_iterations: usize = 10,
-        /// 最大运行次数
+        /// [...]
         max_iterations: usize = 10000,
-        /// 最小运行时间（纳秒）
-        min_time_ns: u64 = 1_000_000_000, // 1秒
-        /// 是否预热
+        /// [...]
+        min_time_ns: u64 = 1_000_000_000, // 1 second
+        /// [...]
         warmup: bool = true,
-        /// 预热次数
+        /// [...]
         warmup_iterations: usize = 3,
-        /// 是否显示详细输出
+        /// [...]
         verbose: bool = false,
     };
 
-    /// 单次运行结果
+    /// [...]
     pub const RunResult = struct {
         duration_ns: u64,
         iterations: usize,
@@ -35,26 +35,26 @@ pub const Benchmark = struct {
         items_processed: usize = 0,
     };
 
-    /// 基准测试结果
+    /// [...]Tests[...]
     pub const BenchmarkResult = struct {
         name: []const u8,
         runs: std.array_list.Managed(RunResult),
 
-        // 统计值
+        // [...]
         mean_ns: f64 = 0,
         median_ns: f64 = 0,
         min_ns: u64 = 0,
         max_ns: u64 = 0,
         std_dev_ns: f64 = 0,
 
-        // 吞吐量
+        // [...]
         throughput_bytes_per_sec: f64 = 0,
         throughput_items_per_sec: f64 = 0,
 
         pub fn calculateStats(self: *BenchmarkResult) void {
             if (self.runs.items.len == 0) return;
 
-            // 计算均值
+            // [...]
             var sum: u128 = 0;
             var min: u64 = std.math.maxInt(u64);
             var max: u64 = 0;
@@ -73,7 +73,7 @@ pub const Benchmark = struct {
             self.min_ns = min;
             self.max_ns = max;
 
-            // 计算中位数
+            // [...]
             var sorted = self.runs.clone() catch return;
             defer sorted.deinit();
 
@@ -91,7 +91,7 @@ pub const Benchmark = struct {
                 self.median_ns = @as(f64, @floatFromInt(sorted.items[mid].duration_ns));
             }
 
-            // 计算标准差
+            // [...]
             var variance_sum: f64 = 0;
             for (self.runs.items) |r| {
                 const diff = @as(f64, @floatFromInt(r.duration_ns)) - self.mean_ns;
@@ -99,7 +99,7 @@ pub const Benchmark = struct {
             }
             self.std_dev_ns = @sqrt(variance_sum / @as(f64, @floatFromInt(self.runs.items.len)));
 
-            // 计算吞吐量
+            // [...]
             const total_duration_secs = @as(f64, @floatFromInt(sum)) / 1_000_000_000.0;
             if (total_duration_secs > 0) {
                 self.throughput_bytes_per_sec = @as(f64, @floatFromInt(total_bytes)) / total_duration_secs;
@@ -107,7 +107,7 @@ pub const Benchmark = struct {
             }
         }
 
-        /// 获取格式化的时间字符串
+        /// Get formatted time string
         pub fn formatDuration(ns: u64, buf: []u8) ![]const u8 {
             if (ns < 1000) {
                 return try std.fmt.bufPrint(buf, "{d}ns", .{ns});
@@ -121,7 +121,7 @@ pub const Benchmark = struct {
         }
     };
 
-    /// 创建新的基准测试
+    /// [...]Tests
     pub fn init(allocator: std.mem.Allocator, name: []const u8, config: Config) !Self {
         return .{
             .allocator = allocator,
@@ -131,7 +131,7 @@ pub const Benchmark = struct {
         };
     }
 
-    /// 清理资源
+    /// [...]
     pub fn deinit(self: *Self) void {
         self.allocator.free(self.name);
 
@@ -142,7 +142,7 @@ pub const Benchmark = struct {
         self.results.deinit();
     }
 
-    /// 运行单个基准测试函数
+    /// [...]Tests[...]
     pub fn run(self: *Self, bench_name: []const u8, comptime BenchFn: type, bench_ctx: anytype) !void {
         _ = BenchFn;
         var result = BenchmarkResult{
@@ -154,7 +154,7 @@ pub const Benchmark = struct {
             self.allocator.free(result.name);
         }
 
-        // 预热
+        // [...]
         if (self.config.warmup) {
             var i: usize = 0;
             while (i < self.config.warmup_iterations) : (i += 1) {
@@ -162,7 +162,7 @@ pub const Benchmark = struct {
             }
         }
 
-        // 实际测试
+        // [...]Tests
         var total_time: u64 = 0;
         var iteration: usize = 0;
 
@@ -181,13 +181,13 @@ pub const Benchmark = struct {
                 .items_processed = bench_result.items_processed,
             });
 
-            // 检查是否达到最小时间要求
+            // Check if[...]
             if (iteration >= self.config.min_iterations and total_time >= self.config.min_time_ns) {
                 break;
             }
         }
 
-        // 计算统计值
+        // [...]
         result.calculateStats();
 
         try self.results.append(result);
@@ -197,7 +197,7 @@ pub const Benchmark = struct {
         }
     }
 
-    /// 打印单个结果
+    /// [...]
     fn printResult(self: *Self, result: *const BenchmarkResult) void {
         _ = self;
 
@@ -231,7 +231,7 @@ pub const Benchmark = struct {
         }
     }
 
-    /// 生成完整报告
+    /// [...]
     pub fn generateReport(self: *Self) ![]const u8 {
         var buf = std.array_list.Managed(u8).init(self.allocator);
         defer buf.deinit();
@@ -264,7 +264,7 @@ pub const Benchmark = struct {
         return buf.toOwnedSlice();
     }
 
-    /// 与另一个基准测试结果比较
+    /// [...]Tests[...]
     pub fn compareWithBaseline(self: *Self, baseline: *const Benchmark, result_name: []const u8) !?ComparisonResult {
         const current = self.findResult(result_name) orelse return null;
         const base = baseline.findResult(result_name) orelse return null;
@@ -276,7 +276,7 @@ pub const Benchmark = struct {
             .baseline_mean_ns = base.mean_ns,
             .current_mean_ns = current.mean_ns,
             .change_percent = change_pct,
-            .is_regression = change_pct > 5.0, // 5%阈值
+            .is_regression = change_pct > 5.0, // 5% threshold
             .is_improvement = change_pct < -5.0,
         };
     }
@@ -290,7 +290,7 @@ pub const Benchmark = struct {
         return null;
     }
 
-    /// 比较结果
+    /// [...]
     pub const ComparisonResult = struct {
         benchmark_name: []const u8,
         baseline_mean_ns: f64,
@@ -301,7 +301,7 @@ pub const Benchmark = struct {
     };
 };
 
-/// 基准测试上下文接口
+/// [...]TestsContext[...]
 pub fn BenchmarkContext(comptime ReturnType: type) type {
     return struct {
         const Self = @This();
@@ -315,9 +315,9 @@ pub fn BenchmarkContext(comptime ReturnType: type) type {
     };
 }
 
-/// 常用基准测试场景
+/// [...]Tests[...]
 pub const BenchmarkScenarios = struct {
-    /// 模块启动性能测试
+    /// [...]Tests
     pub const ModuleStartupBenchmark = struct {
         pub const Result = struct {
             iterations: usize = 1,
@@ -344,7 +344,7 @@ pub const BenchmarkScenarios = struct {
         }
     };
 
-    /// 事件总线性能测试
+    /// Event bus[...]Tests
     pub const EventBusBenchmark = struct {
         pub const Result = struct {
             iterations: usize,
@@ -368,7 +368,7 @@ pub const BenchmarkScenarios = struct {
         }
     };
 
-    /// HTTP API性能测试
+    /// HTTP API[...]Tests
     pub const HttpApiBenchmark = struct {
         pub const Result = struct {
             iterations: usize,
@@ -399,7 +399,7 @@ pub const BenchmarkScenarios = struct {
     };
 };
 
-/// 基准测试套件 - 运行多个相关基准测试
+/// [...]Tests[...] - [...]Tests
 pub const BenchmarkSuite = struct {
     const Self = @This();
 
@@ -425,7 +425,7 @@ pub const BenchmarkSuite = struct {
         self.benchmarks.deinit();
     }
 
-    /// 添加基准测试
+    /// [...]Tests
     pub fn addBenchmark(self: *Self, name: []const u8, config: Benchmark.Config) !*Benchmark {
         const bench = try self.allocator.create(Benchmark);
         bench.* = try Benchmark.init(self.allocator, name, config);
@@ -433,18 +433,18 @@ pub const BenchmarkSuite = struct {
         return bench;
     }
 
-    /// 运行所有基准测试
+    /// [...]Tests
     pub fn runAll(self: *Self) !void {
         std.log.info("\n=== Running Benchmark Suite: {s} ===", .{self.name});
 
         for (self.benchmarks.items) |bench| {
             std.log.info("\nRunning: {s}", .{bench.name});
-            // 基准测试已经在 addBenchmark 时创建，这里不需要再运行
-            // 实际的运行应该在添加测试用例时完成
+            // [...]Tests[...] addBenchmark [...]
+            // Actual run should be after addingTests[...]done
         }
     }
 
-    /// 生成汇总报告
+    /// [...]
     pub fn generateSummaryReport(self: *Self) ![]const u8 {
         var buf = std.array_list.Managed(u8).init(self.allocator);
         defer buf.deinit();
@@ -464,7 +464,7 @@ pub const BenchmarkSuite = struct {
     }
 };
 
-// 测试用例
+// Tests[...]
 test "Benchmark basic" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -476,7 +476,7 @@ test "Benchmark basic" {
     });
     defer bench.deinit();
 
-    // 创建一个简单的基准测试上下文
+    // Create a simple benchmarkTestsContext
     const TestContext = struct {
         counter: usize = 0,
 
@@ -487,7 +487,7 @@ test "Benchmark basic" {
         };
 
         pub fn run(self: *@This()) !Result {
-            // 模拟一些工作
+            // [...]
             var sum: usize = 0;
             for (0..1000) |i| {
                 sum += i;
@@ -504,7 +504,7 @@ test "Benchmark basic" {
 test "BenchmarkScenarios" {
     const testing = std.testing;
 
-    // 测试模块启动基准
+    // Tests[...]
     var startup_bench = BenchmarkScenarios.ModuleStartupBenchmark{
         .module_name = "test_module",
         .init_fn = struct {

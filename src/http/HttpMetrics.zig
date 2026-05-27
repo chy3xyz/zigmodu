@@ -1,8 +1,8 @@
 const std = @import("std");
 
-/// HTTP Metrics 中间件 — 使用内置收集器自动收集请求计数和延迟
+/// HTTP Metrics Middleware — auto-collect request count and latency
 ///
-/// 用法:
+/// Usage:
 ///   var collector = HttpMetricsCollector.init();
 ///   server.addMiddleware(.{ .func = httpMetricsMiddleware(&collector) });
 pub fn httpMetricsMiddleware(collector: *HttpMetricsCollector) api.MiddlewareFn {
@@ -29,22 +29,22 @@ pub fn httpMetricsMiddleware(collector: *HttpMetricsCollector) api.MiddlewareFn 
     return .{ .func = S.handler, .user_data = @ptrCast(@constCast(collector)) };
 }
 
-/// HTTP Metrics 收集器 (简化版 — 不依赖 PrometheusMetrics)
-/// 适用于需要轻量级指标但不引入 Prometheus 的场景
+/// HTTP Metrics collector (lightweight — no PrometheusMetrics dep)
+/// For scenarios needing lightweight metrics without Prometheus
 pub const HttpMetricsCollector = struct {
     const Self = @This();
 
-    /// 请求计数器
+    /// Request counter
     request_count: u64 = 0,
-    /// 按状态码分类的计数
+    /// Count by status code
     status_counts: [6]u64 = @splat(0),
-    /// 总延迟 (秒)
+    /// Total latency (seconds)
     total_duration_seconds: f64 = 0,
-    /// 最小延迟 (秒)
+    /// Min latency (seconds)
     min_duration_seconds: f64 = std.math.floatMax(f64),
-    /// 最大延迟 (秒)
+    /// Max latency (seconds)
     max_duration_seconds: f64 = 0,
-    /// 活跃请求数
+    /// In-flight request count
     in_flight: u64 = 0,
 
     const StatusBucket = enum(usize) {
@@ -60,7 +60,7 @@ pub const HttpMetricsCollector = struct {
         return .{};
     }
 
-    /// 记录一次请求
+    /// Record one request
     pub fn recordRequest(self: *Self, status: u16, duration_seconds: f64) void {
         self.request_count += 1;
         self.total_duration_seconds += duration_seconds;
@@ -78,19 +78,19 @@ pub const HttpMetricsCollector = struct {
         self.status_counts[bucket] += 1;
     }
 
-    /// 平均延迟
+    /// Average latency
     pub fn avgDuration(self: *Self) f64 {
         if (self.request_count == 0) return 0;
         return self.total_duration_seconds / @as(f64, @floatFromInt(self.request_count));
     }
 
-    /// 请求速率 (req/s — 调用方提供 elapsed_seconds)
+    /// Request rate (req/s — caller provides elapsed_seconds)
     pub fn requestRate(self: *Self, elapsed_seconds: f64) f64 {
         if (elapsed_seconds == 0) return 0;
         return @as(f64, @floatFromInt(self.request_count)) / elapsed_seconds;
     }
 
-    /// 生成可读报告
+    /// Generate human-readable report
     pub fn generateReport(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(allocator);

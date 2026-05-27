@@ -1,7 +1,7 @@
 const std = @import("std");
 const Time = @import("../core/Time.zig");
 
-/// 日志级别枚举
+/// Log level[...]
 pub const LogLevel = enum(u8) {
     DEBUG = 0,
     INFO = 1,
@@ -20,8 +20,8 @@ pub const LogLevel = enum(u8) {
     }
 };
 
-/// 结构化日志记录器
-/// 支持 JSON 格式输出、上下文字段和多种输出目标
+/// Structured logger
+/// [...] JSON [...]Context[...]
 pub const StructuredLogger = struct {
     const Self = @This();
 
@@ -56,14 +56,14 @@ pub const StructuredLogger = struct {
         self.context.deinit();
     }
 
-    /// 添加上下文字段
+    /// [...]Context[...]
     pub fn withField(self: *Self, key: []const u8, value: []const u8) !void {
         const key_copy = try self.allocator.dupe(u8, key);
         const value_copy = try self.allocator.dupe(u8, value);
         try self.context.put(key_copy, value_copy);
     }
 
-    /// 记录日志
+    /// [...]
     pub fn log(self: *Self, level: LogLevel, message: []const u8, fields: anytype) !void {
         if (@intFromEnum(level) < @intFromEnum(self.level)) {
             return;
@@ -84,7 +84,7 @@ pub const StructuredLogger = struct {
             entry.fields.deinit();
         }
 
-        // 添加上下文字段
+        // [...]Context[...]
         var ctx_iter = self.context.iterator();
         while (ctx_iter.next()) |entry_ctx| {
             const key = try self.allocator.dupe(u8, entry_ctx.key_ptr.*);
@@ -92,7 +92,7 @@ pub const StructuredLogger = struct {
             try entry.fields.put(key, value);
         }
 
-        // 添加参数字段
+        // [...]
         const fields_info = @typeInfo(@TypeOf(fields));
         if (fields_info == .@"struct" and fields_info.@"struct".is_tuple == false) {
             inline for (fields_info.@"struct".fields) |field| {
@@ -106,10 +106,10 @@ pub const StructuredLogger = struct {
         const json = try entry.toJson(self.allocator);
         defer self.allocator.free(json);
 
-        // 输出
-        // 注意：日志输出失败时静默处理，因为：
-        // 1. 日志系统本身不应该因为输出失败而崩溃
-        // 2. 无法通过日志记录日志失败
+        // [...]
+        // [...]failure[...]
+        // 1. Log system must not fail due to outputfailure[...]
+        // 2. Cannot log through log systemfailure
         switch (self.output) {
             .stdout => std.Io.File.stdout().writeStreamingAll(self.io, json) catch {},
             .stderr => std.Io.File.stderr().writeStreamingAll(self.io, json) catch {},
@@ -138,7 +138,7 @@ pub const StructuredLogger = struct {
     }
 };
 
-/// 日志文件轮转
+/// [...]
 pub const LogRotator = struct {
     const Self = @This();
 
@@ -181,15 +181,15 @@ pub const LogRotator = struct {
     }
 
     fn rotate(self: *Self) !void {
-        // 关闭当前文件
+        // CLOSED[...]
         if (self.current_file) |file| {
             file.close(self.io);
         }
 
-        // 轮转旧文件
-        // 注意：文件重命名失败时静默处理，因为：
-        // 1. 轮转过程中某些文件可能不存在
-        // 2. 不应该因为轮转失败而阻止新日志写入
+        // [...]
+        // [...]failure[...]
+        // 1. Some files may not exist during rotation
+        // 2. [...]failure[...]
         var i: u32 = self.max_files - 1;
         while (i > 0) : (i -= 1) {
             const old_name = try std.fmt.allocPrint(self.allocator, "{s}.{d}", .{ self.base_path, i - 1 });
@@ -200,18 +200,18 @@ pub const LogRotator = struct {
             std.Io.Dir.cwd().rename(self.io, old_name, new_name) catch {};
         }
 
-        // 重命名当前文件
+        // [...]
         const backup_name = try std.fmt.allocPrint(self.allocator, "{s}.0", .{self.base_path});
         defer self.allocator.free(backup_name);
         std.Io.Dir.cwd().rename(self.io, self.base_path, backup_name) catch {};
 
-        // 创建新文件
+        // [...]
         self.current_file = try std.Io.Dir.cwd().createFile(self.io, self.base_path, .{});
         self.current_size = 0;
     }
 };
 
-/// 日志条目
+/// [...]
 const LogEntry = struct {
     timestamp: i64,
     level: LogLevel,

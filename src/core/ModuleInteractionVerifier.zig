@@ -1,46 +1,46 @@
 const std = @import("std");
 const ModuleInfo = @import("Module.zig").ModuleInfo;
 
-/// 模块交互验证器
-/// 验证模块之间只通过允许的通道通信，防止架构腐化
-/// 对标 Spring Modulith 的 `verify()` + ArchUnit
+/// Module interaction verifier
+/// Validate modules communicate only through allowed channels, preventing architecture erosion
+/// Equivalent to Spring Modulith verify() + ArchUnit
 pub const ModuleInteractionVerifier = struct {
     const Self = @This();
 
-    /// 模块间交互类型
+    /// Inter-module interaction type
     pub const InteractionType = enum {
-        /// 直接依赖 (import / function call)
+        /// Direct dependency (import / function call)
         direct_dependency,
-        /// 事件驱动 (EventBus)
+        /// Event-driven (EventBus)
         event_driven,
-        /// 共享数据 (同表/同缓存)
+        /// Shared data (same table/cache)
         shared_data,
-        /// API 调用 (HTTP/gRPC)
+        /// API call (HTTP/gRPC)
         api_call,
     };
 
-    /// 单个模块交互规则
+    /// Single module interaction rule
     pub const InteractionRule = struct {
-        /// 允许的交互类型
+        /// Allowed interaction types
         allowed_types: []const InteractionType,
-        /// 来源模块 (空 = 所有模块)
+        /// Source module (empty = all)
         from_module: ?[]const u8 = null,
-        /// 目标模块 (空 = 所有模块)
+        /// Target module (empty = all)
         to_module: ?[]const u8 = null,
-        /// 规则描述
+        /// Rule description
         description: []const u8 = "",
     };
 
-    /// 模块交互模型 (定义哪些模块如何通信)
+    /// Module interaction model (defines how modules communicate)
     pub const InteractionModel = struct {
         module_name: []const u8,
-        /// 允许的传出交互
+        /// Allowed outgoing interactions
         allowed_outgoing: std.StringHashMap([]const InteractionType),
-        /// 允许的传入交互
+        /// Allowed incoming interactions
         allowed_incoming: std.StringHashMap([]const InteractionType),
     };
 
-    /// 验证违规
+    /// Validation violation
     pub const Violation = struct {
         from_module: []const u8,
         to_module: []const u8,
@@ -48,15 +48,15 @@ pub const ModuleInteractionVerifier = struct {
         message: []const u8,
     };
 
-    /// 验证配置
+    /// Validation config
     pub const Config = struct {
-        /// 是否允许循环依赖
+        /// Whether to allow circular deps
         allow_circular_deps: bool = false,
-        /// 最大依赖深度
+        /// Max dependency depth
         max_dependency_depth: usize = 5,
-        /// 每个模块的最大依赖数
+        /// Max dependency count per module
         max_dependencies_per_module: usize = 10,
-        /// 是否严格要求通过事件通信
+        /// Whether to strictly require Event[...]
         enforce_event_driven: bool = false,
     };
 
@@ -89,7 +89,7 @@ pub const ModuleInteractionVerifier = struct {
         self.violations.deinit(self.allocator);
     }
 
-    /// 注册交互规则
+    /// [...]
     pub fn addRule(self: *Self, allowed_types: []const InteractionType, description: []const u8) !void {
         const types_copy = try self.allocator.dupe(InteractionType, allowed_types);
         errdefer self.allocator.free(types_copy);
@@ -103,7 +103,7 @@ pub const ModuleInteractionVerifier = struct {
         });
     }
 
-    /// 注册模块间特定交互规则
+    /// Register specific inter-module interaction rules
     pub fn addModuleRule(
         self: *Self,
         from_module: []const u8,
@@ -125,8 +125,8 @@ pub const ModuleInteractionVerifier = struct {
         });
     }
 
-    /// 验证单个模块的依赖是否合规
-    /// 返回违规列表
+    /// ValidationWhether single module deps are compliant
+    /// [...]
     pub fn verifyModuleDependencies(
         self: *Self,
         comptime module_info: ModuleInfo,
@@ -134,7 +134,7 @@ pub const ModuleInteractionVerifier = struct {
     ) ![]Violation {
         var result = std.ArrayList(Violation).empty;
 
-        // 1. 检查依赖深度
+        // 1. Check dependency depth
         if (module_info.dependencies.len > self.config.max_dependencies_per_module) {
             const msg = try std.fmt.allocPrint(self.allocator,
                 "Module '{s}' has {d} dependencies, exceeding max of {d}",
@@ -148,7 +148,7 @@ pub const ModuleInteractionVerifier = struct {
             });
         }
 
-        // 2. 检查循环依赖
+        // 2. Check circular dependencies
         if (!self.config.allow_circular_deps) {
             for (module_info.dependencies) |dep_name| {
                 inline for (all_modules) |mod| {
@@ -175,7 +175,7 @@ pub const ModuleInteractionVerifier = struct {
             }
         }
 
-        // 3. 检查是否有自依赖
+        // 3. Check if[...]
         for (module_info.dependencies) |dep_name| {
             if (std.mem.eql(u8, dep_name, module_info.name)) {
                 const msg = try std.fmt.allocPrint(self.allocator,
@@ -194,7 +194,7 @@ pub const ModuleInteractionVerifier = struct {
         return result.toOwnedSlice(self.allocator);
     }
 
-    /// 验证所有模块的依赖拓扑
+    /// Validation[...]
     pub fn verifyAllModules(
         self: *Self,
         comptime modules: anytype,
@@ -217,7 +217,7 @@ pub const ModuleInteractionVerifier = struct {
         return result.toOwnedSlice(self.allocator);
     }
 
-    /// 添加违规记录
+    /// Add violation record
     pub fn addViolation(
         self: *Self,
         from_module: []const u8,
@@ -233,17 +233,17 @@ pub const ModuleInteractionVerifier = struct {
         });
     }
 
-    /// 获取所有违规
+    /// [...]
     pub fn getViolations(self: *Self) []const Violation {
         return self.violations.items;
     }
 
-    /// 是否有违规
+    /// Whether has violations
     pub fn hasViolations(self: *Self) bool {
         return self.violations.items.len > 0;
     }
 
-    /// 生成可读的违规报告
+    /// Generate human-readable violation report
     pub fn generateReport(self: *Self) ![]const u8 {
         if (self.violations.items.len == 0) {
             return try self.allocator.dupe(u8, "✓ No architecture violations detected.\n");

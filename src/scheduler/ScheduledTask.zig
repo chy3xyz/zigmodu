@@ -1,7 +1,7 @@
 const std = @import("std");
 const Time = @import("../core/Time.zig");
 
-/// 定时任务调度器
+/// [...]Task scheduler
 pub const TaskScheduler = struct {
     const Self = @This();
 
@@ -50,7 +50,7 @@ pub const TaskScheduler = struct {
         self.tasks.deinit(self.allocator);
     }
 
-    /// 添加 Cron 任务
+    /// [...] Cron [...]
     pub fn addCronTask(
         self: *Self,
         name: []const u8,
@@ -74,7 +74,7 @@ pub const TaskScheduler = struct {
         std.log.info("Scheduled cron task: {s}", .{name});
     }
 
-    /// 添加间隔任务
+    /// [...]
     pub fn addIntervalTask(
         self: *Self,
         name: []const u8,
@@ -97,7 +97,7 @@ pub const TaskScheduler = struct {
         std.log.info("Scheduled interval task: {s} (every {d}s)", .{ name, interval_seconds });
     }
 
-    /// 添加一次性任务
+    /// [...]
     pub fn addOneTimeTask(
         self: *Self,
         name: []const u8,
@@ -120,12 +120,12 @@ pub const TaskScheduler = struct {
         std.log.info("Scheduled one-time task: {s} at {d}", .{ name, timestamp });
     }
 
-    /// 启动调度器
+    /// [...]
     pub fn start(self: *Self) !void {
         self.running = true;
         std.log.info("Task scheduler started with {d} tasks", .{self.tasks.items.len});
 
-        // 简化实现：在实际应用中应该使用线程
+        // [...]Should use threads in production
         while (self.running) {
             self.tick() catch |err| {
                 std.log.err("Task scheduler tick failed: {s}", .{@errorName(err)});
@@ -136,25 +136,25 @@ pub const TaskScheduler = struct {
         }
     }
 
-    /// 停止调度器
+    /// [...]
     pub fn stop(self: *Self) void {
         self.running = false;
         std.log.info("Task scheduler stopped", .{});
     }
 
-    /// 执行调度检查
+    /// [...]
     pub fn tick(self: *Self) !void {
         const now = Time.monotonicNowSeconds();
 
         for (self.tasks.items) |*task| {
             if (now >= task.next_run) {
-                // 执行任务
+                // [...]
                 std.log.info("Executing task: {s}", .{task.name});
                 task.action();
                 task.last_run = now;
                 task.run_count += 1;
 
-                // 计算下次执行时间
+                // [...]
                 switch (task.schedule) {
                     .cron => |cron| {
                         task.next_run = try self.calculateNextCronRun(cron);
@@ -163,7 +163,7 @@ pub const TaskScheduler = struct {
                         task.next_run = now + @as(i64, @intCast(interval));
                     },
                     .once => {
-                        // 一次性任务，标记为已完成
+                        // [...]done
                         task.next_run = std.math.maxInt(i64);
                     },
                 }
@@ -171,21 +171,21 @@ pub const TaskScheduler = struct {
         }
     }
 
-    /// 计算下次 Cron 执行时间（简化实现）
+    /// [...] Cron [...]
     fn calculateNextCronRun(_self: *Self, cron: CronExpression) !i64 {
         _ = _self;
         _ = cron;
-        // 简化实现：每小时执行
+        // [...]
         const now = Time.monotonicNowSeconds();
         return now + 3600;
     }
 
-    /// 获取任务列表
+    /// [...]
     pub fn getTasks(self: *Self) []Task {
         return self.tasks.items;
     }
 
-    /// 获取即将执行的任务
+    /// [...]
     pub fn getNextTask(self: *Self) ?*Task {
         if (self.tasks.items.len == 0) return null;
 
@@ -202,7 +202,7 @@ pub const TaskScheduler = struct {
         return next_task;
     }
 
-    /// 生成调度报告
+    /// [...]
     pub fn generateReport(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
         var buf = std.ArrayList(u8).empty;
 
@@ -222,9 +222,9 @@ pub const TaskScheduler = struct {
     }
 };
 
-/// Cron 表达式解析器
+/// Cron expression[...]
 pub const CronParser = struct {
-    /// 解析 Cron 字符串 (e.g., "0 0 * * *")
+    /// [...] Cron [...] (e.g., "0 0 * * *")
     pub fn parse(allocator: std.mem.Allocator, expression: []const u8) !TaskScheduler.CronExpression {
         var parts = std.mem.splitSequence(u8, expression, " ");
 

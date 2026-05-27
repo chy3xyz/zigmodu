@@ -1,20 +1,20 @@
 const std = @import("std");
 
-/// 合约定义 (Consumer-Driven Contract)
+/// [...] (Consumer-Driven Contract)
 pub const Contract = struct {
-    /// 合约名称
+    /// [...]
     name: []const u8,
-    /// 消费者名称
+    /// consume[...]
     consumer: []const u8,
-    /// 提供者名称
+    /// [...]
     provider: []const u8,
-    /// 合约版本
+    /// [...]
     version: []const u8,
-    /// 交互类型
+    /// Interaction type
     interaction_type: InteractionType,
-    /// 请求匹配规则
+    /// [...]
     request: RequestMatcher,
-    /// 响应期望
+    /// [...]
     response: ResponseExpectation,
 
     pub const InteractionType = enum {
@@ -44,7 +44,7 @@ pub const Contract = struct {
     };
 };
 
-/// 合约验证结果
+/// [...]Validation[...]
 pub const ContractVerificationResult = struct {
     contract_name: []const u8,
     passed: bool,
@@ -59,8 +59,8 @@ pub const ContractVerificationResult = struct {
     };
 };
 
-/// 合约测试运行器
-/// 消费者驱动的合约测试 (Pact-style)
+/// [...]Tests[...]
+/// consume[...]Tests (Pact-style)
 pub const ContractTestRunner = struct {
     const Self = @This();
 
@@ -113,13 +113,13 @@ pub const ContractTestRunner = struct {
         self.verifications.deinit(self.allocator);
     }
 
-    /// 注册合约
+    /// [...]
     pub fn registerContract(self: *Self, contract: Contract) !void {
         const owned = try self.cloneContract(contract);
         try self.contracts.append(self.allocator, owned);
     }
 
-    /// 验证合约: 模拟请求并校验响应
+    /// Validation[...]: [...]
     pub fn verifyContract(
         self: *Self,
         contract_name: []const u8,
@@ -132,7 +132,7 @@ pub const ContractTestRunner = struct {
         var failures = std.ArrayList(ContractVerificationResult.ContractFailure).empty;
         const start = @import("../core/Time.zig").monotonicNowSeconds();
 
-        // 验证状态码
+        // Validation[...]
         if (actual_status != contract.response.status) {
             try failures.append(self.allocator, .{
                 .field = try self.allocator.dupe(u8, "status"),
@@ -142,7 +142,7 @@ pub const ContractTestRunner = struct {
             });
         }
 
-        // 验证响应体包含
+        // Validation[...]
         if (contract.response.body_contains) |expected| {
             if (!std.mem.containsAtLeast(u8, actual_body, 1, expected)) {
                 try failures.append(self.allocator, .{
@@ -154,7 +154,7 @@ pub const ContractTestRunner = struct {
             }
         }
 
-        // 验证响应头
+        // Validation[...]
         for (contract.response.headers) |expected_header| {
             var found = false;
             for (actual_headers) |actual_header| {
@@ -193,7 +193,7 @@ pub const ContractTestRunner = struct {
         };
     }
 
-    /// 生成合约报告
+    /// [...]
     pub fn generateReport(self: *Self) ![]const u8 {
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);

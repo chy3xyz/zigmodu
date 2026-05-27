@@ -1,14 +1,14 @@
 const std = @import("std");
 
-/// gRPC 服务方法定义
+/// gRPC [...]
 pub const GrpcMethod = struct {
-    /// 完整方法名 (e.g. "/order.OrderService/CreateOrder")
+    /// [...] (e.g. "/order.OrderService/CreateOrder")
     path: []const u8,
-    /// 服务名
+    /// [...]
     service: []const u8,
-    /// 方法名
+    /// [...]
     method: []const u8,
-    /// 方法类型
+    /// [...]
     method_type: MethodType,
 
     pub const MethodType = enum {
@@ -19,10 +19,10 @@ pub const GrpcMethod = struct {
     };
 };
 
-/// gRPC 请求头
+/// gRPC [...]
 pub const GrpcRequest = struct {
     method: GrpcMethod,
-    /// 序列化后的 protobuf 载荷
+    /// [...] protobuf [...]
     payload: []const u8,
     /// metadata (key-value pairs)
     metadata: std.StringHashMap([]const u8),
@@ -30,17 +30,17 @@ pub const GrpcRequest = struct {
     timeout_ms: u64,
 };
 
-/// gRPC 响应
+/// gRPC [...]
 pub const GrpcResponse = struct {
-    /// 序列化后的 protobuf 载荷
+    /// [...] protobuf [...]
     payload: []const u8,
     /// gRPC status code
     status: GrpcStatusCode,
-    /// 错误消息 (如果有)
+    /// Error[...] ([...])
     message: []const u8,
 };
 
-/// gRPC 状态码
+/// gRPC [...]
 pub const GrpcStatusCode = enum(u8) {
     OK = 0,
     CANCELLED = 1,
@@ -100,10 +100,10 @@ pub const GrpcStatusCode = enum(u8) {
     }
 };
 
-/// gRPC 服务处理器 (单请求/单响应)
+/// gRPC [...] ([...]/[...])
 pub const UnaryHandler = *const fn (request: GrpcRequest) anyerror!GrpcResponse;
 
-/// gRPC 服务注册表
+/// gRPC [...]
 pub const GrpcServiceRegistry = struct {
     const Self = @This();
 
@@ -111,9 +111,9 @@ pub const GrpcServiceRegistry = struct {
     services: std.StringHashMap(ServiceEntry),
 
     pub const ServiceEntry = struct {
-        /// 服务名 (如 "order.OrderService")
+        /// [...] ([...] "order.OrderService")
         name: []const u8,
-        /// 方法注册表
+        /// [...]
         methods: std.StringHashMap(RegisteredMethod),
     };
 
@@ -144,7 +144,7 @@ pub const GrpcServiceRegistry = struct {
         self.services.deinit();
     }
 
-    /// 注册服务
+    /// [...]
     pub fn registerService(self: *Self, service_name: []const u8) !void {
         const name_copy = try self.allocator.dupe(u8, service_name);
         errdefer self.allocator.free(name_copy);
@@ -155,7 +155,7 @@ pub const GrpcServiceRegistry = struct {
         });
     }
 
-    /// 注册方法
+    /// [...]
     pub fn registerMethod(
         self: *Self,
         service_name: []const u8,
@@ -183,7 +183,7 @@ pub const GrpcServiceRegistry = struct {
         });
     }
 
-    /// 根据路径查找处理器
+    /// [...]
     pub fn findHandler(self: *Self, path: []const u8) ?struct { method: GrpcMethod, handler: UnaryHandler } {
         var svc_iter = self.services.iterator();
         while (svc_iter.next()) |svc_entry| {
@@ -194,7 +194,7 @@ pub const GrpcServiceRegistry = struct {
         return null;
     }
 
-    /// 列出所有注册的方法
+    /// [...]
     pub fn listMethods(self: *Self) ![]const GrpcMethod {
         var result = std.ArrayList(GrpcMethod).empty;
 
@@ -210,16 +210,16 @@ pub const GrpcServiceRegistry = struct {
     }
 };
 
-/// Proto 文件解析器 (简化版)
-/// 解析 .proto 文件提取 service/method/message 定义
+/// Proto [...] ([...])
+/// [...] .proto [...] service/method/message [...]
 pub const ProtoParser = struct {
-    /// 解析结果: 服务定义
+    /// [...]: [...]
     pub const ProtoService = struct {
         name: []const u8,
         methods: []const ProtoMethod,
     };
 
-    /// 解析结果: 方法定义
+    /// [...]: [...]
     pub const ProtoMethod = struct {
         name: []const u8,
         input_type: []const u8,
@@ -227,7 +227,7 @@ pub const ProtoParser = struct {
         is_streaming: bool = false,
     };
 
-    /// 解析 proto 文件内容
+    /// [...] proto [...]
     pub fn parse(allocator: std.mem.Allocator, content: []const u8) ![]const ProtoService {
         var services = std.ArrayList(ProtoService).empty;
 
@@ -280,7 +280,7 @@ pub const ProtoParser = struct {
     }
 };
 
-/// gRPC 客户端存根
+/// gRPC [...]
 pub const GrpcClient = struct {
     const Self = @This();
 
@@ -307,7 +307,7 @@ pub const GrpcClient = struct {
         self.endpoints.deinit();
     }
 
-    /// 注册服务端点
+    /// [...]
     pub fn registerEndpoint(self: *Self, service_name: []const u8, address: []const u8, port: u16) !void {
         const addr_copy = try self.allocator.dupe(u8, address);
         errdefer self.allocator.free(addr_copy);
@@ -318,8 +318,8 @@ pub const GrpcClient = struct {
         });
     }
 
-    /// 调用远程 gRPC 服务 (单请求/响应)
-    /// placeholder: 实际实现通过 HTTP/2 + protobuf 序列化
+    /// call[...] gRPC [...] ([...]/[...])
+    /// placeholder: [...] HTTP/2 + protobuf [...]
     pub fn call(self: *Self, service: []const u8, method: []const u8) !GrpcResponse {
         const ep = self.endpoints.get(service) orelse return error.EndpointNotFound;
 

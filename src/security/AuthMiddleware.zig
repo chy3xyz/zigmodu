@@ -3,7 +3,7 @@ const api = @import("../api/Server.zig");
 const SecurityModule = @import("SecurityModule.zig").SecurityModule;
 const Rbac = @import("Rbac.zig");
 
-/// JWT 认证中间件 — 验证 Token 并将 AuthInfo 挂载到 ctx.user_data
+/// JWT authenticationMiddleware — Validation Token [...] AuthInfo [...] ctx.user_data
 pub fn jwtAuth(security: *SecurityModule, allocator: std.mem.Allocator) !api.Middleware {
     const S = struct {
         var stored_security: *SecurityModule = undefined;
@@ -76,8 +76,8 @@ pub fn jwtAuth(security: *SecurityModule, allocator: std.mem.Allocator) !api.Mid
     };
 }
 
-/// 权限校验中间件 — 要求单一权限
-/// 需在 jwtAuth 之后使用
+/// Permission[...]Middleware — [...]Permission
+/// [...] jwtAuth [...]
 pub fn requirePermission(perm: []const u8) api.Middleware {
     const perm_copy = std.heap.page_allocator.dupe(u8, perm) catch return .{
         .func = struct {
@@ -106,7 +106,7 @@ pub fn requirePermission(perm: []const u8) api.Middleware {
     };
 }
 
-/// 权限校验 — 满足任一即可
+/// Permission[...] — [...]
 pub fn requireAnyPermission(perms: []const []const u8) !api.Middleware {
     const perms_copy = std.heap.page_allocator.dupe([]const u8, perms) catch return error.OutOfMemory;
     return .{
@@ -129,7 +129,7 @@ pub fn requireAnyPermission(perms: []const []const u8) !api.Middleware {
     };
 }
 
-/// 权限校验 — 全部满足
+/// Permission[...] — [...]
 pub fn requireAllPermissions(perms: []const []const u8) !api.Middleware {
     const perms_copy = std.heap.page_allocator.dupe([]const u8, perms) catch return error.OutOfMemory;
     return .{
@@ -152,7 +152,7 @@ pub fn requireAllPermissions(perms: []const []const u8) !api.Middleware {
     };
 }
 
-/// 从 ctx.user_data 获取当前 AuthInfo（如果 jwtAuth 已执行）
+/// [...] ctx.user_data Get current AuthInfo[...] jwtAuth [...]
 pub fn getAuth(ctx: *api.Context) ?*Rbac.AuthInfo {
     if (ctx.user_data) |data| {
         return @ptrCast(@alignCast(data));

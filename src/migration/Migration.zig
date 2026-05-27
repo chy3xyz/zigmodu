@@ -1,21 +1,21 @@
 const std = @import("std");
 const Time = @import("../core/Time.zig");
 
-/// 数据库迁移条目
+/// Database migration[...]
 pub const MigrationEntry = struct {
-    /// 版本号 (时间戳格式: YYYYMMDDHHMMSS)
+    /// [...] ([...]: YYYYMMDDHHMMSS)
     version: i64,
-    /// 迁移描述
+    /// [...]
     description: []const u8,
-    /// SQL 内容
+    /// SQL [...]
     sql: []const u8,
-    /// 回滚 SQL (可选)
+    /// [...] SQL ([...])
     rollback_sql: ?[]const u8 = null,
-    /// 校验和 (SHA256)
+    /// [...] (SHA256)
     checksum: ?[]const u8 = null,
 };
 
-/// 已执行的迁移记录
+/// [...]
 pub const AppliedMigration = struct {
     version: i64,
     description: []const u8,
@@ -25,7 +25,7 @@ pub const AppliedMigration = struct {
     success: bool,
 };
 
-/// 迁移状态
+/// [...]
 pub const MigrationStatus = enum {
     pending,
     applied,
@@ -33,22 +33,22 @@ pub const MigrationStatus = enum {
     skipped,
 };
 
-/// 迁移状态条目 (用于 getMigrationStatus)
+/// [...] (for getMigrationStatus)
 pub const MigrationStatusEntry = struct {
     version: i64,
     description: []const u8,
     status: MigrationStatus,
 };
 
-/// 迁移执行器
-/// 类似 Flyway / Liquibase 的数据库迁移管理
+/// [...]
+/// [...] Flyway / Liquibase [...]Database migration[...]
 pub const MigrationRunner = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
     migrations: std.ArrayList(MigrationEntry),
     history: std.ArrayList(AppliedMigration),
-    /// 迁移历史表名
+    /// Migration history[...]
     history_table: []const u8,
 
     pub fn init(allocator: std.mem.Allocator) Self {
@@ -76,7 +76,7 @@ pub const MigrationRunner = struct {
         self.history.deinit(self.allocator);
     }
 
-    /// 注册迁移
+    /// [...]
     pub fn addMigration(self: *Self, version: i64, description: []const u8, sql: []const u8) !void {
         const desc_copy = try self.allocator.dupe(u8, description);
         errdefer self.allocator.free(desc_copy);
@@ -84,7 +84,7 @@ pub const MigrationRunner = struct {
         const sql_copy = try self.allocator.dupe(u8, sql);
         errdefer self.allocator.free(sql_copy);
 
-        // 计算校验和
+        // [...]
         const checksum = try computeChecksum(self.allocator, sql);
 
         try self.migrations.append(self.allocator, .{
@@ -95,7 +95,7 @@ pub const MigrationRunner = struct {
         });
     }
 
-    /// 注册带回滚的迁移
+    /// [...]
     pub fn addMigrationWithRollback(
         self: *Self,
         version: i64,
@@ -123,7 +123,7 @@ pub const MigrationRunner = struct {
         });
     }
 
-    /// 获取待执行的迁移列表
+    /// Get pending migration list
     pub fn getPendingMigrations(self: *Self, buf: []MigrationEntry) []MigrationEntry {
         var count: usize = 0;
         for (self.migrations.items) |migration| {
@@ -142,7 +142,7 @@ pub const MigrationRunner = struct {
         return buf[0..count];
     }
 
-    /// 获取所有迁移的状态
+    /// [...]
     pub fn getMigrationStatus(self: *Self, buf: []MigrationStatusEntry) []MigrationStatusEntry {
         var count: usize = 0;
         for (self.migrations.items) |migration| {
@@ -161,7 +161,7 @@ pub const MigrationRunner = struct {
         return buf[0..count];
     }
 
-    /// 记录迁移执行结果
+    /// [...]
     pub fn recordMigration(
         self: *Self,
         version: i64,
@@ -186,7 +186,7 @@ pub const MigrationRunner = struct {
         });
     }
 
-    /// 获取已应用的迁移数量
+    /// Get applied migration count
     pub fn getAppliedCount(self: *Self) usize {
         var count: usize = 0;
         for (self.history.items) |h| {
@@ -195,7 +195,7 @@ pub const MigrationRunner = struct {
         return count;
     }
 
-    /// 获取迁移总数
+    /// [...]
     pub fn getTotalCount(self: *Self) usize {
         return self.migrations.items.len;
     }
@@ -231,7 +231,7 @@ pub const MigrationRunner = struct {
         }
     }
 
-    /// 生成迁移历史表创建 SQL
+    /// [...]Migration history[...] SQL
     pub fn generateHistoryTableDDL(self: *Self) ![]const u8 {
         return std.fmt.allocPrint(self.allocator,
             \\CREATE TABLE IF NOT EXISTS {s} (
@@ -245,7 +245,7 @@ pub const MigrationRunner = struct {
         , .{self.history_table});
     }
 
-    /// 验证已应用迁移的校验和
+    /// Validation[...]
     pub fn validateChecksums(self: *Self) !bool {
         for (self.history.items) |applied| {
             if (!applied.success) continue;
@@ -269,12 +269,12 @@ pub const MigrationRunner = struct {
     }
 };
 
-/// SQL 迁移文件加载器
+/// SQL [...]
 pub const MigrationLoader = struct {
-    /// 从 SQL 文件字符串加载迁移
-    /// 期望格式: -- version: YYYYMMDDHHMMSS
+    /// [...] SQL [...]
+    /// [...]: -- version: YYYYMMDDHHMMSS
     ///           -- description: xxx
-    ///           -- rollback: ... (可选)
+    /// -- rollback: ... ([...])
     ///           SQL statements...
     pub fn parseMigrationFile(allocator: std.mem.Allocator, content: []const u8) !struct {
         version: i64,
@@ -316,7 +316,7 @@ pub const MigrationLoader = struct {
             return error.InvalidMigrationFormat;
         }
 
-        // 提取 SQL 内容
+        // [...] SQL [...]
         var sql_buf = std.ArrayList(u8).empty;
         defer sql_buf.deinit(allocator);
         var lines2 = std.mem.splitScalar(u8, content, '\n');
@@ -336,13 +336,13 @@ pub const MigrationLoader = struct {
         };
     }
 
-    /// 从 V{version}__{description}.sql 文件名解析版本和描述
+    /// [...] V{version}__{description}.sql Parse version and description from filename
     pub fn parseMigrationFilename(filename: []const u8) ?struct { version: i64, description: []const u8 } {
-        // 格式: V{YYYYMMDDHHMMSS}__{description}.sql
+        // [...]: V{YYYYMMDDHHMMSS}__{description}.sql
         if (!std.mem.startsWith(u8, filename, "V")) return null;
         if (!std.mem.endsWith(u8, filename, ".sql")) return null;
 
-        const inner = filename[1 .. filename.len - 4]; // 去掉 V 和 .sql
+        const inner = filename[1 .. filename.len - 4]; // Strip V prefix and .sql suffix
 
         const sep = std.mem.indexOf(u8, inner, "__") orelse return null;
         const ver_str = inner[0..sep];
@@ -353,7 +353,7 @@ pub const MigrationLoader = struct {
     }
 };
 
-/// 计算字符串的 SHA256 校验和
+/// [...] SHA256 [...]
 fn computeChecksum(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(data);
@@ -364,7 +364,7 @@ fn computeChecksum(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     return encodeHex(allocator, &hash);
 }
 
-/// 将字节切片编码为十六进制字符串
+/// Encode byte slice as hex string
 fn encodeHex(allocator: std.mem.Allocator, bytes: []const u8) ![]const u8 {
     const hex_chars = "0123456789abcdef";
     var result = try allocator.alloc(u8, bytes.len * 2);

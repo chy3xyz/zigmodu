@@ -1,7 +1,7 @@
 const std = @import("std");
 const Nats = @import("Nats.zig");
 
-/// 消息队列抽象接口
+/// Message queue[...]
 pub const MessageQueue = struct {
     const Self = @This();
 
@@ -25,7 +25,7 @@ pub const MessageQueue = struct {
         kafka: KafkaBackend,
     };
 
-    /// 生产者
+    /// [...]
     pub const Producer = struct {
         backend: *QueueBackend,
 
@@ -39,7 +39,7 @@ pub const MessageQueue = struct {
         }
     };
 
-    /// 消费者
+    /// consume[...]
     pub const Consumer = struct {
         allocator: std.mem.Allocator,
         backend: *QueueBackend,
@@ -66,7 +66,7 @@ pub const MessageQueue = struct {
         }
     };
 
-    /// 内存后端
+    /// [...]
     pub const InMemoryBackend = struct {
         allocator: std.mem.Allocator,
         queues: std.StringHashMap(std.ArrayList(Message)),

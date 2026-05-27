@@ -1,34 +1,34 @@
 const std = @import("std");
 const Time = @import("../core/Time.zig");
 
-/// Bulkhead 模式 — 信号量隔离并发限制
+/// Bulkhead [...] — Semaphore[...]
 ///
-/// 将资源按组隔离，防止某个下游服务的故障耗尽所有资源
-/// 类似 Resilience4j Bulkhead / Hystrix Thread Pool Isolation
+/// [...]Prevent downstream failure from exhausting all resources
+/// [...] Resilience4j Bulkhead / Hystrix Thread Pool Isolation
 ///
-/// 用法:
+/// Usage:
 ///   var bulkhead = Bulkhead.init(allocator, "db-pool", 10, 5);
 ///   try bulkhead.acquire();
 ///   defer bulkhead.release();
-///   // ... 受保护的操作 ...
+/// // ... [...] ...
 ///
-/// 信号量容量语义:
-///   max_concurrent: 最大并发数
-///   max_queue:      等待队列长度 (0 = 无队列，直接拒绝)
+/// Semaphore[...]:
+/// max_concurrent: [...]
+/// max_queue:      [...] (0 = [...])
 pub const Bulkhead = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
     name: []const u8,
-    /// 当前活跃调用数
+    /// [...]call[...]
     active_calls: u32,
-    /// 最大并发数
+    /// [...]
     max_concurrent: u32,
-    /// 最大等待队列
+    /// [...]
     max_queue: u32,
-    /// 当前等待数
+    /// [...]
     waiting: u32,
-    /// 统计
+    /// [...]
     stats: BulkheadStats,
 
     pub const BulkheadStats = struct {
@@ -58,8 +58,8 @@ pub const Bulkhead = struct {
         self.allocator.free(self.name);
     }
 
-    /// 尝试获取信号量
-    /// 成功返回 true，繁忙返回 false
+    /// [...]Semaphore
+    /// success[...] true[...] false
     pub fn tryAcquire(self: *Self) bool {
         if (self.active_calls < self.max_concurrent) {
             self.active_calls += 1;
@@ -73,14 +73,14 @@ pub const Bulkhead = struct {
         return false;
     }
 
-    /// 获取信号量 (阻塞直到可用)
+    /// [...]Semaphore ([...])
     pub fn acquire(self: *Self) void {
         if (self.tryAcquire()) return;
 
-        // 检查是否可排队并阻塞等待
+        // Check if[...]
         if (self.max_queue > 0 and self.waiting < self.max_queue) {
             self.waiting += 1;
-            // 自旋等待 (简化: 实际应使用条件变量)
+            // [...] ([...]: [...])
             while (self.active_calls >= self.max_concurrent) {
                 // yield
                 std.atomic.spinLoopHint();
@@ -97,7 +97,7 @@ pub const Bulkhead = struct {
         self.stats.total_rejected += 1;
     }
 
-    /// 释放信号量
+    /// [...]Semaphore
     pub fn release(self: *Self) void {
         if (self.active_calls > 0) {
             self.active_calls -= 1;
@@ -105,39 +105,39 @@ pub const Bulkhead = struct {
         }
     }
 
-    /// 获取当前活跃数
+    /// Get current[...]
     pub fn getActiveCount(self: *Self) u32 {
         return self.active_calls;
     }
 
-    /// 获取最大并发数
+    /// [...]
     pub fn getMaxConcurrent(self: *Self) u32 {
         return self.max_concurrent;
     }
 
-    /// 获取当前等待数
+    /// Get current[...]
     pub fn getWaitingCount(self: *Self) u32 {
         return self.waiting;
     }
 
-    /// 获取统计信息
+    /// [...]Info
     pub fn getStats(self: *Self) BulkheadStats {
         return self.stats;
     }
 
-    /// 检查是否已满
+    /// Check if[...]
     pub fn isFull(self: *Self) bool {
         return self.active_calls >= self.max_concurrent;
     }
 
-    /// 获取当前利用率 (0.0-1.0)
+    /// Get current[...] (0.0-1.0)
     pub fn getUtilization(self: *Self) f64 {
         if (self.max_concurrent == 0) return 0;
         return @as(f64, @floatFromInt(self.active_calls)) / @as(f64, @floatFromInt(self.max_concurrent));
     }
 };
 
-/// BulkheadRegistry — 管理多个 Bulkhead 实例
+/// BulkheadRegistry — [...] Bulkhead [...]
 pub const BulkheadRegistry = struct {
     const Self = @This();
 
@@ -197,7 +197,7 @@ test "Bulkhead max concurrent enforcement" {
 
     try std.testing.expect(bh.tryAcquire());
     try std.testing.expect(bh.tryAcquire());
-    // 第三个应该失败
+    // [...]failure
     try std.testing.expect(!bh.tryAcquire());
 
     try std.testing.expect(bh.isFull());
@@ -238,7 +238,7 @@ test "BulkheadRegistry get or create" {
     const bh1 = try registry.getOrCreate("db", 10, 5);
     const bh2 = try registry.getOrCreate("db", 10, 5);
 
-    // 应该返回同一个实例
+    // [...]
     try std.testing.expect(bh1 == bh2);
 
     try std.testing.expect(bh1.tryAcquire());

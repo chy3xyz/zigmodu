@@ -1,7 +1,7 @@
 const std = @import("std");
 const Time = @import("../core/Time.zig");
 
-/// 断路器模式 - 实现容错机制
+/// [...] - [...]
 pub const CircuitBreaker = struct {
     const Self = @This();
 
@@ -14,16 +14,16 @@ pub const CircuitBreaker = struct {
     config: Config,
 
     pub const State = enum {
-        CLOSED, // 正常状态，允许请求通过
-        OPEN, // 断路状态，拒绝请求
-        HALF_OPEN, // 半开状态，允许有限请求测试
+        CLOSED, // Normal — allow requests through
+        OPEN, // Open circuit — reject requests
+        HALF_OPEN, // Half-open — allow limited test requests
     };
 
     pub const Config = struct {
-        failure_threshold: u32, // 触发断路的失败次数阈值
-        success_threshold: u32, // 半开状态下恢复成功的阈值
-        timeout_seconds: u64, // 断路器打开后的超时时间
-        half_open_max_calls: u32, // 半开状态下允许的最大调用数
+        failure_threshold: u32, // Failure count to open circuit
+        success_threshold: u32, // Success count to close circuit
+        timeout_seconds: u64, // Time before half-open after open
+        half_open_max_calls: u32, // Max calls allowed in half-open state
     };
 
     pub const Result = union(enum) {
@@ -72,7 +72,7 @@ pub const CircuitBreaker = struct {
             .CLOSED => {},
         }
 
-        // 执行操作
+        // [...]
         operation() catch |err| {
             self.onFailure();
             return .{ .failure = err };
@@ -82,17 +82,17 @@ pub const CircuitBreaker = struct {
         return .success;
     }
 
-    /// 记录成功
+    /// [...]success
     fn onSuccess(self: *Self) void {
         switch (self.state) {
             .CLOSED => {
-                // 重置失败计数
+                // [...]Failure count
                 self.failure_count = 0;
             },
             .HALF_OPEN => {
                 self.success_count += 1;
                 if (self.success_count >= self.config.success_threshold) {
-                    // 恢复关闭状态
+                    // [...]CLOSED[...]
                     std.log.info("Circuit breaker '{s}' closing after {d} successes", .{ self.name, self.success_count });
                     self.state = .CLOSED;
                     self.failure_count = 0;
@@ -103,7 +103,7 @@ pub const CircuitBreaker = struct {
         }
     }
 
-    /// 记录失败
+    /// [...]failure
     fn onFailure(self: *Self) void {
         self.failure_count += 1;
         self.last_failure_time = Time.monotonicNowSeconds();
@@ -111,13 +111,13 @@ pub const CircuitBreaker = struct {
         switch (self.state) {
             .CLOSED => {
                 if (self.failure_count >= self.config.failure_threshold) {
-                    // 触发断路
+                    // [...]
                     std.log.warn("Circuit breaker '{s}' opening after {d} failures", .{ self.name, self.failure_count });
                     self.state = .OPEN;
                 }
             },
             .HALF_OPEN => {
-                // 半开状态下失败，重新打开
+                // HALF_OPEN[...]failure[...]OPEN
                 std.log.warn("Circuit breaker '{s}' re-opening after failure in HALF_OPEN", .{self.name});
                 self.state = .OPEN;
                 self.success_count = 0;
@@ -126,14 +126,14 @@ pub const CircuitBreaker = struct {
         }
     }
 
-    /// 更新断路器状态（检查超时）
+    /// [...]
     fn updateState(self: *Self) void {
         if (self.state == .OPEN) {
             const now = Time.monotonicNowSeconds();
             const elapsed = @as(u64, @intCast(now - self.last_failure_time));
 
             if (elapsed >= self.config.timeout_seconds) {
-                // 超时，进入半开状态
+                // [...]HALF_OPEN[...]
                 std.log.info("Circuit breaker '{s}' entering HALF_OPEN after timeout", .{self.name});
                 self.state = .HALF_OPEN;
                 self.success_count = 0;
@@ -141,7 +141,7 @@ pub const CircuitBreaker = struct {
         }
     }
 
-    /// 手动重置断路器
+    /// Manually reset circuit breaker
     pub fn reset(self: *Self) void {
         std.log.info("Circuit breaker '{s}' manually reset", .{self.name});
         self.state = .CLOSED;
@@ -150,20 +150,20 @@ pub const CircuitBreaker = struct {
         self.last_failure_time = 0;
     }
 
-    /// 强制打开断路器
+    /// [...]OPEN[...]
     pub fn forceOpen(self: *Self) void {
         std.log.warn("Circuit breaker '{s}' manually forced OPEN", .{self.name});
         self.state = .OPEN;
         self.last_failure_time = 0;
     }
 
-    /// 获取当前状态
+    /// Get current[...]
     pub fn getState(self: *Self) State {
         self.updateState();
         return self.state;
     }
 
-    /// 获取统计信息
+    /// [...]Info
     pub fn getStats(self: *Self) Stats {
         return .{
             .state = self.state,
@@ -181,7 +181,7 @@ pub const CircuitBreaker = struct {
     };
 };
 
-/// 断路器注册表 - 管理多个断路器
+/// [...] - [...]
 pub const CircuitBreakerRegistry = struct {
     const Self = @This();
 
@@ -206,7 +206,7 @@ pub const CircuitBreakerRegistry = struct {
         self.breakers.deinit();
     }
 
-    /// 获取或创建断路器
+    /// [...]
     pub fn getOrCreate(self: *Self, name: []const u8) !*CircuitBreaker {
         if (self.breakers.getPtr(name)) |breaker| {
             return breaker;
@@ -220,12 +220,12 @@ pub const CircuitBreakerRegistry = struct {
         return self.breakers.getPtr(name).?;
     }
 
-    /// 获取断路器
+    /// [...]
     pub fn get(self: *Self, name: []const u8) ?*CircuitBreaker {
         return self.breakers.getPtr(name);
     }
 
-    /// 移除断路器
+    /// [...]
     pub fn remove(self: *Self, name: []const u8) bool {
         var entry = self.breakers.fetchRemove(name) orelse return false;
         self.allocator.free(entry.key);
@@ -233,7 +233,7 @@ pub const CircuitBreakerRegistry = struct {
         return true;
     }
 
-    /// 重置所有断路器
+    /// [...]
     pub fn resetAll(self: *Self) void {
         var iter = self.breakers.iterator();
         while (iter.next()) |entry| {
@@ -241,7 +241,7 @@ pub const CircuitBreakerRegistry = struct {
         }
     }
 
-    /// 获取所有断路器状态报告
+    /// Get all circuit breaker status reports
     pub fn generateReport(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
         _ = self;
         return allocator.dupe(u8, "generateReport (pending Zig 0.16 allocPrint migration)");

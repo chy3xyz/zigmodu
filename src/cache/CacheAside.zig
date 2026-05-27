@@ -1,17 +1,17 @@
 const std = @import("std");
 const CacheManager = @import("CacheManager.zig").CacheManager;
 
-/// Cache-Aside 模式 — 自动 read-through / write-through 缓存
+/// Cache-Aside [...] — [...] read-through / write-through [...]
 ///
-/// 读取流程:
-///   1. 查缓存 → 命中则返回
-///   2. 缓存未命中 → 查数据库 → 写入缓存 → 返回
+/// [...]:
+/// 1. [...] → [...]
+/// 2. [...] → [...] → [...] → [...]
 ///
-/// 写入流程:
-///   1. 写入数据库
-///   2. 失效缓存 (或更新缓存)
+/// [...]:
+/// 1. [...]
+/// 2. [...] ([...])
 ///
-/// 用法:
+/// Usage:
 ///   var aside = CacheAside.init(allocator, &cache);
 ///   const user = try aside.get("user:42", struct {
 ///       fn load(key: []const u8) ![]const u8 { return db.query(key); }
@@ -21,7 +21,7 @@ pub const CacheAside = struct {
 
     allocator: std.mem.Allocator,
     cache: *CacheManager,
-    /// 缓存 TTL 覆盖 (0 = 使用 CacheManager 的默认 TTL)
+    /// [...] TTL [...] (0 = [...] CacheManager [...] TTL)
     ttl_seconds: u64,
 
     pub fn init(allocator: std.mem.Allocator, cache: *CacheManager) Self {
@@ -32,41 +32,41 @@ pub const CacheAside = struct {
         };
     }
 
-    /// Read-Through: 先从缓存取，未命中则从 DB 加载并缓存
+    /// Read-Through: [...] DB [...]
     pub fn get(self: *Self, key: []const u8, db_loader: *const fn ([]const u8) anyerror![]const u8) anyerror![]const u8 {
-        // Step 1: 查缓存
+        // Step 1: [...]
         if (self.cache.get(key)) |cached| {
             return cached;
         }
 
-        // Step 2: 缓存未命中 → 查数据库
+        // Step 2: [...] → [...]
         const value = try db_loader(key);
 
-        // Step 3: 写入缓存
+        // Step 3: [...]
         try self.cache.set(key, value);
 
         return value;
     }
 
-    /// Write-Through: 写入 DB，然后更新缓存
+    /// Write-Through: [...] DB[...]
     pub fn set(self: *Self, key: []const u8, value: []const u8, db_writer: *const fn ([]const u8, []const u8) anyerror!void) !void {
         try db_writer(key, value);
         try self.cache.set(key, value);
     }
 
-    /// Write-Invalidate: 写入 DB，然后失效缓存 (常用模式)
+    /// Write-Invalidate: [...] DB[...] ([...])
     pub fn invalidate(self: *Self, key: []const u8, db_writer: *const fn ([]const u8) anyerror!void) !void {
         try db_writer(key);
         _ = self.cache.remove(key);
     }
 
-    /// 直接删除 (DB + Cache)
+    /// [...] (DB + Cache)
     pub fn delete(self: *Self, key: []const u8, db_deleter: *const fn ([]const u8) anyerror!void) !void {
         try db_deleter(key);
         _ = self.cache.remove(key);
     }
 
-    /// 预热缓存: 从 DB 批量加载到缓存
+    /// [...]: [...] DB [...]
     pub fn warmup(self: *Self, keys: []const []const u8, db_loader: *const fn ([]const u8) anyerror![]const u8) !void {
         for (keys) |key| {
             _ = self.get(key, db_loader) catch |err| {
@@ -75,7 +75,7 @@ pub const CacheAside = struct {
         }
     }
 
-    /// 获取缓存统计
+    /// [...]
     pub fn getStats(self: *Self) CacheManager.CacheStats {
         return self.cache.getStats();
     }

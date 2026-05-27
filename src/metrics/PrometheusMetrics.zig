@@ -1,7 +1,7 @@
 const std = @import("std");
 
-/// Prometheus 指标收集器
-/// 支持 Counter, Gauge, Histogram, Summary
+/// Prometheus metrics collector
+/// Supports Counter, Gauge, Histogram, Summary
 pub const PrometheusMetrics = struct {
     const Self = @This();
 
@@ -195,7 +195,7 @@ pub const PrometheusMetrics = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        // 释放所有指标
+        // Free all metrics
         var counter_iter = self.counters.iterator();
         while (counter_iter.next()) |entry| {
             self.allocator.free(entry.value_ptr.name);
@@ -231,7 +231,7 @@ pub const PrometheusMetrics = struct {
         self.summaries.deinit();
     }
 
-    /// 创建 Counter
+    /// Create Counter
     pub fn createCounter(self: *Self, name: []const u8, help: []const u8) !*Counter {
         const name_copy = try self.allocator.dupe(u8, name);
         const help_copy = try self.allocator.dupe(u8, help);
@@ -247,7 +247,7 @@ pub const PrometheusMetrics = struct {
         return self.counters.getPtr(name_copy).?;
     }
 
-    /// 创建 Gauge
+    /// Create Gauge
     pub fn createGauge(self: *Self, name: []const u8, help: []const u8) !*Gauge {
         const name_copy = try self.allocator.dupe(u8, name);
         const help_copy = try self.allocator.dupe(u8, help);
@@ -262,7 +262,7 @@ pub const PrometheusMetrics = struct {
         return self.gauges.getPtr(name_copy).?;
     }
 
-    /// 创建 Histogram
+    /// Create Histogram
     pub fn createHistogram(self: *Self, name: []const u8, help: []const u8, buckets: []const f64) !*Histogram {
         const name_copy = try self.allocator.dupe(u8, name);
         const help_copy = try self.allocator.dupe(u8, help);
@@ -286,7 +286,7 @@ pub const PrometheusMetrics = struct {
         return self.histograms.getPtr(name_copy).?;
     }
 
-    /// 创建 Summary
+    /// Create Summary
     pub fn createSummary(self: *Self, name: []const u8, help: []const u8) !*Summary {
         const name_copy = try self.allocator.dupe(u8, name);
         const help_copy = try self.allocator.dupe(u8, help);
@@ -305,17 +305,17 @@ pub const PrometheusMetrics = struct {
         return self.summaries.getPtr(name_copy).?;
     }
 
-    /// 获取 Counter
+    /// Get Counter
     pub fn getCounter(self: *Self, name: []const u8) ?*Counter {
         return self.counters.getPtr(name);
     }
 
-    /// 获取 Gauge
+    /// Get Gauge
     pub fn getGauge(self: *Self, name: []const u8) ?*Gauge {
         return self.gauges.getPtr(name);
     }
 
-    /// 生成 Prometheus 格式的指标输出
+    /// Generate Prometheus-format metrics output
     pub fn toPrometheusFormat(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
         var buf = std.array_list.Managed(u8).init(allocator);
         defer buf.deinit();
@@ -424,7 +424,7 @@ pub const PrometheusMetrics = struct {
         };
     }
 
-    /// 模块指标收集器
+    /// Module metrics collector
     pub const ModuleMetricsCollector = struct {
         metrics: *PrometheusMetrics,
         module_start_time: i64,

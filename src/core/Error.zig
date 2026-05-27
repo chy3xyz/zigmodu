@@ -1,49 +1,49 @@
 const std = @import("std");
 const Time = @import("Time.zig");
 
-/// ZigModu 统一错误类型
+/// ZigModu [...]Error type
 pub const ZigModuError = error{
-    // 模块相关错误
+    // [...]Error
     ModuleNotFound,
     ModuleAlreadyExists,
     ModuleInitializationFailed,
     ModuleDeinitializationFailed,
 
-    // 依赖相关错误
+    // [...]Error
     DependencyNotFound,
     DependencyViolation,
     CircularDependency,
     SelfDependency,
 
-    // 生命周期错误
+    // [...]Error
     InvalidLifecycleState,
     StartupFailed,
     ShutdownFailed,
 
-    // 配置错误
+    // [...]Error
     ConfigurationError,
     ConfigFileNotFound,
     ConfigParseError,
     ConfigValidationFailed,
 
-    // DI 容器错误
+    // DI [...]Error
     ServiceNotFound,
     ServiceAlreadyExists,
     TypeMismatch,
     ContainerClosed,
 
-    // 事件系统错误
+    // Event[...]Error
     EventBusError,
     EventHandlerNotFound,
     EventSerializationFailed,
 
-    // 事务错误
+    // TransactionError
     TransactionFailed,
     TransactionRollbackFailed,
     TransactionAlreadyActive,
     NoActiveTransaction,
 
-    // 数据库错误
+    // [...]Error
     DatabaseConnectionFailed,
     QueryExecutionFailed,
     ConnectionPoolExhausted,
@@ -51,33 +51,33 @@ pub const ZigModuError = error{
     DatabaseError,
     RedisError,
 
-    // 通用业务错误
+    // [...]Error
     NotFound,
     RateLimitExceeded,
     CircuitBreakerOpen,
     ServiceUnavailable,
     ServiceOverloaded,
 
-    // 安全错误
+    // [...]Error
     AuthenticationFailed,
     AuthorizationFailed,
     TokenExpired,
     InvalidToken,
     InvalidCredentials,
 
-    // 验证错误
+    // ValidationError
     ValidationFailed,
     InvalidInput,
     InvalidModuleName,
     MissingRequiredField,
     InvalidFormat,
 
-    // 缓存错误
+    // [...]Error
     CacheError,
     CacheKeyNotFound,
     CacheFull,
 
-    // 网络错误
+    // [...]Error
     NetworkError,
     ConnectionTimeout,
     Timeout,
@@ -85,16 +85,16 @@ pub const ZigModuError = error{
     HttpError,
     ServerError,
 
-    // 资源错误
+    // [...]Error
     OutOfMemory,
     ResourceExhausted,
     ResourceLeak,
 
-    // 未知错误
+    // [...]Error
     UnknownError,
 };
 
-/// 错误上下文信息
+/// Error contextInfo
 pub const ErrorContext = struct {
     error_code: ZigModuError,
     message: []const u8,
@@ -113,7 +113,7 @@ pub const ErrorContext = struct {
     }
 };
 
-/// 错误处理器
+/// Error handler
 pub const ErrorHandler = struct {
     const Self = @This();
 
@@ -151,12 +151,12 @@ pub const ErrorHandler = struct {
             }
         }
 
-        // 默认处理：记录日志
+        // [...]
         std.log.err("[{s}] {s}", .{ @errorName(ctx.error_code), ctx.message });
     }
 };
 
-/// 结果类型别名
+/// [...]
 pub fn Result(T: type) type {
     return union(enum) {
         ok: T,
@@ -185,7 +185,7 @@ pub fn Result(T: type) type {
     };
 }
 
-/// 错误转换辅助函数
+/// Error[...]
 pub fn toErrorContext(err: anyerror, message: []const u8) ErrorContext {
     const code = switch (err) {
         error.OutOfMemory => ZigModuError.OutOfMemory,
