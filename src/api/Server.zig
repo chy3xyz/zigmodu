@@ -188,76 +188,61 @@ pub const Context = struct {
     streaming: bool = false,
     upgraded: bool = false,
 
+    /// Per-request arena — eliminates ~20 heap allocs per request.
+    /// Init once per connection, reset between keep-alive requests.
+    request_arena: std.heap.ArenaAllocator,
+
     // Middleware chain fields
     chain_middlewares: []const Middleware = &.{},
     chain_handler: *const fn (*Context) anyerror!void = undefined,
     chain_index: usize = 0,
 
+    /// Get arena allocator for request-scoped allocations (headers, params, body).
+    /// Falls back to main allocator if arena is exhausted.
+    pub fn arenaAlloc(self: *Context) std.mem.Allocator {
+        return self.request_arena.allocator();
+    }
+
+    /// Reset the request arena between keep-alive requests.
+    pub fn resetArena(self: *Context) void {
+        _ = self.request_arena.reset(.retain_capacity);
+        // Re-init HashMaps with old allocator data cleared
+        self.query.clearRetainingCapacity();
+        self.params.clearRetainingCapacity();
+        self.headers.clearRetainingCapacity();
+        self.attributes.clearRetainingCapacity();
+        self.response_headers.clearRetainingCapacity();
+        if (self.form) |*f| f.clearRetainingCapacity();
+    }
+
     pub fn init(allocator: std.mem.Allocator, method: Method, path: []const u8) !Context {
+        const arena = std.heap.ArenaAllocator.init(allocator);
+        const arena_alloc = arena.allocator();
         return Context{
             .allocator = allocator,
+            .request_arena = arena,
             .method = method,
             .path = path,
             .raw_path = path,
-            .query = std.StringHashMap([]const u8).init(allocator),
-            .params = std.StringHashMap([]const u8).init(allocator),
-            .headers = std.StringHashMap([]const u8).init(allocator),
+            .query = std.StringHashMap([]const u8).init(arena_alloc),
+            .params = std.StringHashMap([]const u8).init(arena_alloc),
+            .headers = std.StringHashMap([]const u8).init(arena_alloc),
             .response_body = std.ArrayList(u8).empty,
-            .response_headers = std.StringHashMap([]const u8).init(allocator),
-            .attributes = std.StringHashMap([]const u8).init(allocator),
+            .response_headers = std.StringHashMap([]const u8).init(arena_alloc),
+            .attributes = std.StringHashMap([]const u8).init(arena_alloc),
         };
     }
 
     pub fn deinit(self: *Context) void {
-        var query_iter = self.query.iterator();
-        while (query_iter.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.*);
-        }
+        // Arena frees all request-scoped allocations at once — no individual free needed.
         self.query.deinit();
-
-        var params_iter = self.params.iterator();
-        while (params_iter.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.*);
-        }
         self.params.deinit();
-
-        var headers_iter = self.headers.iterator();
-        while (headers_iter.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.*);
-        }
         self.headers.deinit();
-
-        if (self.form) |*f| {
-            var form_iter = f.iterator();
-            while (form_iter.next()) |entry| {
-                self.allocator.free(entry.key_ptr.*);
-                self.allocator.free(entry.value_ptr.*);
-            }
-            f.deinit();
-        }
-
-        self.response_body.deinit(self.allocator);
-
-        var resp_headers_iter = self.response_headers.iterator();
-        while (resp_headers_iter.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.*);
-        }
+        if (self.form) |*f| f.deinit();
+        self.response_body.deinit(self.request_arena.allocator());
         self.response_headers.deinit();
-
-        if (self.validation_error_message) |msg| {
-            self.allocator.free(msg);
-        }
-
-        var attr_it = self.attributes.iterator();
-        while (attr_it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.*);
-        }
         self.attributes.deinit();
+        self.request_arena.deinit();
         self.* = undefined;
     }
 
@@ -1127,6 +1112,9 @@ pub const Server = struct {
         max_body_size: usize = 8 * 1024 * 1024,
         request_timeout_ms: u32 = 30000,
         max_requests_per_conn: usize = 100,
+        /// Per-connection thread stack size. Default 128KB suffices for HTTP handlers.
+        /// Lower = more concurrent connections. Raise if handlers need deep recursion.
+        connection_stack_size: usize = 128 * 1024,
     };
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, port: u16) Server {
@@ -1278,7 +1266,7 @@ pub const Server = struct {
     /// services (HTTP + gRPC + cluster) in the same process.
     pub fn runInBackground(self: *Server) !std.Thread {
         self.running.store(true, .monotonic);
-        const handle = try std.Thread.spawn(.{}, runLoop, .{self});
+        const handle = try std.Thread.spawn(.{ .stack_size = self.config.connection_stack_size }, runLoop, .{self});
         return handle;
     }
 
