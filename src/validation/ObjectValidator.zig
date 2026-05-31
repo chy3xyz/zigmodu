@@ -36,6 +36,7 @@ pub const Validator = struct {
             self.allocator.free(err.code);
         }
         self.errors.deinit(self.allocator);
+        self.* = undefined;
     }
 
     /// ValidationRequired field

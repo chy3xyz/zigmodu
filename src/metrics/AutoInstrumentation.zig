@@ -252,6 +252,7 @@ pub const InstrumentedLifecycleListener = struct {
 
     pub fn deinit(self: *Self) void {
         self.module_init_times.deinit();
+        self.* = undefined;
     }
 
     /// Called before module init
@@ -305,6 +306,7 @@ pub const InstrumentedEventListener = struct {
             self.event_start_times.allocator.free(entry.key_ptr.*);
         }
         self.event_start_times.deinit();
+        self.* = undefined;
     }
 
     /// Called on event publish

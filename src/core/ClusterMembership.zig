@@ -117,6 +117,7 @@ pub const ClusterMembership = struct {
         }
         self.nodes.deinit();
         self.allocator.free(self.node_id);
+        self.* = undefined;
     }
 
     pub fn start(self: *Self, config: Config) !void {

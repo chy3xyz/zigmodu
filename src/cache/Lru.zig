@@ -46,6 +46,7 @@ pub fn Cache(comptime K: type, comptime V: type) type {
             self.map.deinit();
             // List nodes are owned by the Node structs, so no separate cleanup needed
             self.list = .{};
+            self.* = undefined;
         }
 
         /// Get value from cache (returns pointer to avoid copying)

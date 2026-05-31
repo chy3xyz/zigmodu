@@ -50,6 +50,7 @@ pub const HealthEndpoint = struct {
             self.allocator.free(entry.value_ptr.description);
         }
         self.checks.deinit();
+        self.* = undefined;
     }
 
     /// Register a health check with optional context.

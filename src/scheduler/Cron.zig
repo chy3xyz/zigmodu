@@ -122,6 +122,7 @@ pub const Scheduler = struct {
     pub fn deinit(self: *Scheduler) void {
         self.stop();
         self.jobs.deinit(self.allocator);
+        self.* = undefined;
     }
 
     /// Add a job to the scheduler

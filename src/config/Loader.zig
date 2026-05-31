@@ -61,6 +61,7 @@ pub const ModuleConfig = struct {
 
     pub fn deinit(self: *Self) void {
         self.config.deinit();
+        self.* = undefined;
     }
 
     pub fn getString(self: *Self, key: []const u8) ?[]const u8 {

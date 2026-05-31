@@ -33,6 +33,7 @@ pub const ModuleCapabilities = struct {
         self.published_events.deinit(allocator);
         self.consumed_events.deinit(allocator);
         self.exposed_apis.deinit(allocator);
+        self.* = undefined;
     }
 
     pub fn canPublish(self: *Self, event_type: []const u8) bool {
@@ -96,6 +97,7 @@ pub const CapabilityRegistry = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.capabilities.deinit();
+        self.* = undefined;
     }
 
     pub fn register(self: *Self, caps: ModuleCapabilities) !void {

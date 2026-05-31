@@ -87,6 +87,7 @@ pub const ModuleInteractionVerifier = struct {
             self.allocator.free(v.message);
         }
         self.violations.deinit(self.allocator);
+        self.* = undefined;
     }
 
     /// [...]

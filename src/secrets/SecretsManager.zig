@@ -63,6 +63,7 @@ pub const SecretsManager = struct {
                 self.allocator.free(vc.mount_path);
             }
         }
+        self.* = undefined;
     }
 
     /// Load keys from environment variables

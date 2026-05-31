@@ -71,6 +71,7 @@ pub fn EventListenerRegistry(comptime EventType: type) type {
 
         pub fn deinit(self: *Self) void {
             self.handlers.deinit();
+            self.* = undefined;
         }
 
         /// Register a handler with optional priority

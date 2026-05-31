@@ -162,6 +162,7 @@ pub const App = struct {
             self.stop();
         }
         self.modules.deinit(self.allocator);
+        self.* = undefined;
     }
 
     pub fn register(self: *Self, module: Module) !void {

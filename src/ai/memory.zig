@@ -48,6 +48,7 @@ pub const MemoryStore = struct {
             self.allocator.free(entry.value_ptr.*.value);
         }
         self.entries.deinit();
+        self.* = undefined;
     }
 
     /// Store a fact. Key format: "namespace:category:detail" (e.g. "user:pref:lang").

@@ -85,6 +85,7 @@ pub const AiProvider = struct {
         if (self.rate_limiter) |*rl| {
             rl.limiter.deinit();
         }
+        self.* = undefined;
     }
 
     /// Send chat messages, return response content. Caller owns ChatResponse.content.

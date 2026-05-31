@@ -44,6 +44,7 @@ pub const IdempotencyStore = struct {
             self.allocator.free(entry.value_ptr.response);
         }
         self.entries.deinit();
+        self.* = undefined;
     }
 
     /// [...]Idempotency[...]

@@ -144,6 +144,7 @@ pub const ModuleContract = struct {
                 allocator.free(err);
             }
             self.errors.deinit();
+            self.* = undefined;
         }
 
         pub fn addError(self: *ValidationResult, msg: []const u8) !void {
@@ -216,20 +217,20 @@ pub const ModuleContract = struct {
 
         // [...]publish[...]Event
         if (self.published_events.len > 0) {
-            try writer.writeAll("  portout PUBLISHED_EVENTS\n");
+            try writer.interface.writeAll("  portout PUBLISHED_EVENTS\n");
         }
 
         // [...]consume[...]Event
         if (self.consumed_events.len > 0) {
-            try writer.writeAll("  portin CONSUMED_EVENTS\n");
+            try writer.interface.writeAll("  portin CONSUMED_EVENTS\n");
         }
 
         // [...]API[...]
         if (self.provided_apis.len > 0) {
-            try writer.writeAll("  portout APIS\n");
+            try writer.interface.writeAll("  portout APIS\n");
         }
 
-        try writer.writeAll("}\n");
+        try writer.interface.writeAll("}\n");
 
         // [...]Event[...]
         for (self.published_events) |event| {
@@ -260,6 +261,7 @@ pub const ContractRegistry = struct {
 
     pub fn deinit(self: *Self) void {
         self.contracts.deinit();
+        self.* = undefined;
     }
 
     /// [...]Module contract
@@ -356,10 +358,10 @@ pub const ContractRegistry = struct {
         defer buf.deinit();
         const writer = buf.writer();
 
-        try writer.writeAll("@startuml\n");
-        try writer.writeAll("!theme plain\n");
-        try writer.writeAll("skinparam componentStyle rectangle\n\n");
-        try writer.writeAll("title Module Contracts\n\n");
+        try writer.interface.writeAll("@startuml\n");
+        try writer.interface.writeAll("!theme plain\n");
+        try writer.interface.writeAll("skinparam componentStyle rectangle\n\n");
+        try writer.interface.writeAll("title Module Contracts\n\n");
 
         // [...]
         var iter = self.contracts.iterator();
@@ -367,14 +369,14 @@ pub const ContractRegistry = struct {
             const contract = entry.value_ptr.*;
             const component_uml = try contract.generatePlantUml(allocator);
             defer allocator.free(component_uml);
-            try writer.writeAll(component_uml);
-            try writer.writeAll("\n");
+            try writer.interface.writeAll(component_uml);
+            try writer.interface.writeAll("\n");
         }
 
         // [...]Event[...]
         try self.generateEventRelations(writer);
 
-        try writer.writeAll("\n@enduml\n");
+        try writer.interface.writeAll("\n@enduml\n");
 
         return buf.toOwnedSlice();
     }

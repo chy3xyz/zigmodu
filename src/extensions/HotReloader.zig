@@ -48,6 +48,7 @@ pub const HotReloader = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.file_hashes.deinit();
+        self.* = undefined;
     }
 
     pub fn watchPath(self: *Self, path: []const u8) !void {

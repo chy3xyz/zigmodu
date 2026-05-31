@@ -61,6 +61,7 @@ pub const HttpClient = struct {
                 self.allocator.free(conn.host);
             }
             self.active_connections.deinit(self.allocator);
+            self.* = undefined;
         }
 
         pub fn acquire(self: *ConnectionPool, host: []const u8, port: u16) !Connection {
@@ -173,6 +174,7 @@ pub const HttpClient = struct {
             if (self.body) |body| {
                 self.allocator.free(body);
             }
+            self.* = undefined;
         }
 
         pub fn setHeader(self: *HttpRequest, key: []const u8, value: []const u8) !void {
@@ -209,6 +211,7 @@ pub const HttpClient = struct {
             }
             self.headers.deinit();
             self.allocator.free(self.body);
+            self.* = undefined;
         }
 
         pub fn isSuccess(self: HttpResponse) bool {
@@ -227,6 +230,7 @@ pub const HttpClient = struct {
 
     pub fn deinit(self: *Self) void {
         self.connection_pool.deinit();
+        self.* = undefined;
     }
 
     /// Send HTTP request (with retry)

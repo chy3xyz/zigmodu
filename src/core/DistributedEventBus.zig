@@ -75,6 +75,7 @@ pub const DistributedEventBus = struct {
             self.allocator.free(node.id);
         }
         self.nodes.deinit();
+        self.* = undefined;
     }
 
     /// Start listening for incoming connections

@@ -27,6 +27,7 @@ pub const ConnectionRegistry = struct {
 
     pub fn deinit(self: *Self) void {
         for (&self.shards) |*s| s.deinit();
+        self.* = undefined;
     }
 
     fn shard(self: *Self, user_id: u64) *Shard {
@@ -132,6 +133,7 @@ const Shard = struct {
         while (it.next()) |kv| self.by_user.allocator.destroy(kv.value_ptr.*);
         self.by_user.deinit();
         self.by_conn.deinit();
+        self.* = undefined;
     }
 
     fn nextId(self: *SelfShard) u32 {

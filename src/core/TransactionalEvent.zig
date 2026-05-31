@@ -40,6 +40,7 @@ pub const TransactionalEvent = struct {
         pub fn deinit(self: *TM) void {
             self.pending_events.deinit();
             self.committed_events.deinit();
+            self.* = undefined;
         }
 
         /// Begin a transaction
@@ -71,6 +72,7 @@ pub const TransactionalEvent = struct {
 
         pub fn deinit(self: *Transaction) void {
             self.events.deinit();
+            self.* = undefined;
         }
 
         /// Add event to transaction
@@ -133,6 +135,7 @@ pub const EventOutbox = struct {
             self.allocator.free(entry.event_type);
         }
         self.storage.deinit();
+        self.* = undefined;
     }
 
     /// Store event in outbox

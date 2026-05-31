@@ -109,6 +109,7 @@ pub const SagaOrchestrator = struct {
             if (inst.last_error) |le| self.allocator.free(le);
         }
         self.running_instances.deinit();
+        self.* = undefined;
     }
 
     /// [...] Saga [...]

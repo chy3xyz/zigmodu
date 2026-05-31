@@ -107,6 +107,7 @@ pub const Writer = struct {
 
     pub fn deinit(self: *Self) void {
         self.buf.deinit(self.allocator);
+        self.* = undefined;
     }
 
     pub fn writeHeader(self: *Self, headers: []const []const u8) !void {

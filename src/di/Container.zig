@@ -57,6 +57,7 @@ pub const Container = struct {
             entry.value_ptr.*.destroy(self.allocator);
         }
         self.services.deinit();
+        self.* = undefined;
     }
 
     pub fn register(self: *Self, comptime T: type, name: []const u8, instance: *T) !void {
@@ -143,6 +144,7 @@ pub const ScopedContainer = struct {
 
     pub fn deinit(self: *Self) void {
         self.local.deinit();
+        self.* = undefined;
     }
 
     pub fn register(self: *Self, comptime T: type, name: []const u8, instance: *T) !void {

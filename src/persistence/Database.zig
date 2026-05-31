@@ -56,6 +56,7 @@ pub const Database = struct {
                 allocator.free(col);
             }
             allocator.free(self.columns);
+            self.* = undefined;
         }
     };
 
@@ -169,6 +170,7 @@ pub const ConnectionPool = struct {
             self.allocator.destroy(conn);
         }
         self.connections.deinit();
+        self.* = undefined;
     }
 
     /// Acquire a connection from the pool

@@ -14,6 +14,7 @@ pub const DataPermissionContext = struct {
 
     pub fn deinit(self: *DataPermissionContext) void {
         if (self.dept_ids) |ids| self.allocator.free(ids);
+        self.* = undefined;
     }
 
     pub fn fromRoles(allocator: std.mem.Allocator, roles: []const Rbac.Role, self_dept_id: i64, user_id: i64) DataPermissionContext {

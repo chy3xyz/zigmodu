@@ -48,6 +48,7 @@ pub const EventStore = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.streams.deinit();
+        self.* = undefined;
     }
 
     /// Append event to stream
@@ -165,6 +166,7 @@ pub const SnapshotStore = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.snapshots.deinit();
+        self.* = undefined;
     }
 
     /// Save snapshot

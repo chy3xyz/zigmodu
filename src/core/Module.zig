@@ -63,6 +63,7 @@ pub const ApplicationModules = struct {
             order.deinit(self.allocator);
         }
         self.modules.deinit();
+        self.* = undefined;
     }
 };
 

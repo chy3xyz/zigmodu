@@ -63,6 +63,7 @@ pub const NatsClient = struct {
             self.allocator.free(entry.value_ptr.subject);
         }
         self.subscriptions.deinit();
+        self.* = undefined;
     }
 
     /// Establish TCP connection and send CONNECT frame.

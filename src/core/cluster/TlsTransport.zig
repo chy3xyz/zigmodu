@@ -40,6 +40,7 @@ pub const ClusterAuth = struct {
 
     pub fn deinit(self: *ClusterAuth) void {
         self.allocator.free(self.node_id);
+        self.* = undefined;
     }
 
     /// Sign a message payload with HMAC-SHA256 using the pre-shared key.

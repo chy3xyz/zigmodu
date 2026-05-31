@@ -55,6 +55,7 @@ pub const ClusterBootstrap = struct {
 
     pub fn deinit(self: *Self) void {
         self.stop();
+        self.* = undefined;
     }
 
     /// Start all cluster services.

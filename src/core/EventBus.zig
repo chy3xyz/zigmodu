@@ -21,6 +21,7 @@ fn ListenerSet(comptime CallbackType: type) type {
 
         pub fn deinit(self: *Self) void {
             self.list.deinit(self.allocator);
+            self.* = undefined;
         }
 
         pub fn add(self: *Self, callback: CallbackType) !void {
@@ -87,6 +88,7 @@ pub fn EventBus(comptime EventType: type) type {
                 entry.value_ptr.deinit();
             }
             self.listeners.deinit();
+            self.* = undefined;
         }
 
         pub fn subscribe(self: *Self, event_type: EventType, callback: CallbackType) !void {
@@ -166,6 +168,7 @@ pub fn TypedEventBus(comptime T: type) type {
 
         pub fn deinit(self: *Self) void {
             self.listeners.deinit();
+            self.* = undefined;
         }
     };
 }
@@ -190,6 +193,7 @@ pub fn ThreadSafeEventBus(comptime T: type) type {
 
         pub fn deinit(self: *Self) void {
             self.bus.deinit();
+            self.* = undefined;
         }
 
         pub fn subscribe(self: *Self, listener: TypedEventBus(T).CallbackType) !void {

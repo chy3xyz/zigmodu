@@ -58,6 +58,7 @@ pub const MessageQueue = struct {
                 self.allocator.free(topic);
             }
             self.topics.deinit(self.allocator);
+            self.* = undefined;
         }
 
         pub fn subscribe(self: *Consumer, topic: []const u8) !void {
@@ -84,6 +85,7 @@ pub const MessageQueue = struct {
                 entry.value_ptr.deinit(self.allocator);
             }
             self.queues.deinit();
+            self.* = undefined;
         }
 
         pub fn publish(self: *InMemoryBackend, msg: Message) !void {
@@ -125,6 +127,7 @@ pub const MessageQueue = struct {
 
         pub fn deinit(self: *NatsBackend) void {
             self.client.deinit();
+            self.* = undefined;
         }
 
         pub fn publish(self: *NatsBackend, msg: Message) !void {

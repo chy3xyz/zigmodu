@@ -87,6 +87,7 @@ pub const ConsistentHashPartitioner = struct {
             self.allocator.free(key.*);
         }
         self.nodes.deinit();
+        self.* = undefined;
     }
 
     /// Add a node to the hash ring

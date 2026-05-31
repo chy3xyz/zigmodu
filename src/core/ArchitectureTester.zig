@@ -44,6 +44,7 @@ pub const ArchitectureTester = struct {
             self.allocator.free(v.message);
         }
         self.violations.deinit(self.allocator);
+        self.* = undefined;
     }
 
     /// Add violation record

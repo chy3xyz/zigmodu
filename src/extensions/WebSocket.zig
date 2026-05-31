@@ -50,6 +50,7 @@ pub const WebSocketServer = struct {
             self.allocator.destroy(client);
         }
         self.clients.deinit();
+        self.* = undefined;
     }
 
     pub fn start(self: *Self) !void {
@@ -261,6 +262,7 @@ pub const WebSocketClient = struct {
     pub fn deinit(self: *Self) void {
         self.is_connected = false;
         self.stream.close(self.io);
+        self.* = undefined;
     }
 
     pub fn run(self: *Self) void {
@@ -405,6 +407,7 @@ pub const WebSocketMonitor = struct {
     pub fn deinit(self: *Self) void {
         self.stop();
         self.ws_server.deinit();
+        self.* = undefined;
     }
 
     pub fn start(self: *Self, modules: *ApplicationModules) !void {

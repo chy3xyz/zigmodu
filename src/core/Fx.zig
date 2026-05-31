@@ -54,6 +54,7 @@ pub fn Stream(comptime T: type) type {
 
         pub fn deinit(self: *Self) void {
             self.items.deinit(self.allocator);
+            self.* = undefined;
         }
 
         pub fn add(self: *Self, item: T) !void {

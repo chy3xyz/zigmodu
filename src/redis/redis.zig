@@ -39,6 +39,7 @@ pub const Redis = struct {
             s.close(self.io);
             self.stream = null;
         }
+        self.* = undefined;
     }
 
     /// Connect to Redis server
@@ -498,6 +499,7 @@ pub const RedisCluster = struct {
             self.allocator.free(cfg.host);
         }
         self.node_configs.deinit(self.allocator);
+        self.* = undefined;
     }
 
     pub fn addNode(self: *Self, host: []const u8, port: u16) !void {

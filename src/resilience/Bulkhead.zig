@@ -56,6 +56,7 @@ pub const Bulkhead = struct {
 
     pub fn deinit(self: *Self) void {
         self.allocator.free(self.name);
+        self.* = undefined;
     }
 
     /// [...]Semaphore
@@ -158,6 +159,7 @@ pub const BulkheadRegistry = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.bulkheads.deinit();
+        self.* = undefined;
     }
 
     pub fn getOrCreate(self: *Self, name: []const u8, max_concurrent: u32, max_queue: u32) !*Bulkhead {

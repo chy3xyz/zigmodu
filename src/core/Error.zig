@@ -134,6 +134,7 @@ pub const ErrorHandler = struct {
 
     pub fn deinit(self: *Self) void {
         self.handlers.deinit(self.allocator);
+        self.* = undefined;
     }
 
     pub fn register(self: *Self, error_code: ZigModuError, handler: *const fn (ErrorContext) void) !void {

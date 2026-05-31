@@ -32,6 +32,7 @@ pub const BufferPool = struct {
             self.allocator.free(buf);
         }
         self.free.deinit(self.allocator);
+        self.* = undefined;
     }
 
     /// Acquire a 4KB buffer from the pool.

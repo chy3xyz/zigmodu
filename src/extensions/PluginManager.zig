@@ -52,6 +52,7 @@ pub const PluginManager = struct {
             self.unloadPlugin(entry.value_ptr.name);
         }
         self.plugins.deinit();
+        self.* = undefined;
     }
 
     /// Load a plugin from file

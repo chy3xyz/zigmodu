@@ -112,6 +112,7 @@ pub const MenuTreeNode = struct {
             child.deinit(allocator);
         }
         self.children.deinit(allocator);
+        self.* = undefined;
     }
 };
 
@@ -139,6 +140,7 @@ pub const AuthInfo = struct {
             allocator.free(entry.key_ptr.*);
         }
         self.permissions.deinit();
+        self.* = undefined;
     }
 
     pub fn hasPermission(self: *const AuthInfo, perm: []const u8) bool {

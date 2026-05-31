@@ -258,6 +258,7 @@ pub const Context = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.attributes.deinit();
+        self.* = undefined;
     }
 
     /// Store an attribute on the context (for middleware data passing).
@@ -781,6 +782,7 @@ const ParsedRequest = struct {
         self.headers.deinit();
 
         if (self.body) |b| allocator.free(b);
+        self.* = undefined;
     }
 };
 
@@ -832,6 +834,7 @@ const TrieNode = struct {
             map.deinit();
         }
         allocator.destroy(self);
+        self.* = undefined;
     }
 
     /// Insert a child and conditionally upgrade to HashMap lookup.
@@ -896,6 +899,7 @@ const Router = struct {
             root.*.deinit(self.allocator);
         }
         self.roots.deinit();
+        self.* = undefined;
     }
 
     pub fn addRoute(self: *Router, route: Route) !void {
@@ -1170,6 +1174,7 @@ pub const Server = struct {
             }
         }
         self.ws_handlers.deinit();
+        self.* = undefined;
     }
 
     pub fn addRoute(self: *Server, route: Route) !void {

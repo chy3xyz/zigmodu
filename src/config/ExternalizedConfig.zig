@@ -70,6 +70,7 @@ pub const ExternalizedConfig = struct {
             self.allocator.free(watcher.filepath);
         }
         self.file_watchers.deinit(self.allocator);
+        self.* = undefined;
     }
 
     /// [...]

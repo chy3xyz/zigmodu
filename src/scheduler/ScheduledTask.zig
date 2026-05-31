@@ -48,6 +48,7 @@ pub const TaskScheduler = struct {
             self.allocator.free(task.name);
         }
         self.tasks.deinit(self.allocator);
+        self.* = undefined;
     }
 
     /// [...] Cron [...]

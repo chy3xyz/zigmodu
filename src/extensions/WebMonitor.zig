@@ -29,6 +29,7 @@ pub const WebMonitor = struct {
 
     pub fn deinit(self: *Self) void {
         self.stop();
+        self.* = undefined;
     }
 
     /// Start the web server
@@ -151,7 +152,7 @@ pub const WebMonitor = struct {
 
         var write_buf: [2048]u8 = undefined;
         var w = stream.writer(self.io, &write_buf);
-        _ = w.writeAll(response) catch {};
+        _ = w.interface.writeAll(response) catch {};
     }
 
     fn handleModules(self: *Self, stream: std.Io.net.Stream) void {
@@ -182,7 +183,7 @@ pub const WebMonitor = struct {
 
         var write_buf: [8192]u8 = undefined;
         var w = stream.writer(self.io, &write_buf);
-        _ = w.writeAll(response) catch {};
+        _ = w.interface.writeAll(response) catch {};
     }
 
     fn handleHealth(self: *Self, stream: std.Io.net.Stream) void {
@@ -193,7 +194,7 @@ pub const WebMonitor = struct {
 
         var write_buf: [256]u8 = undefined;
         var w = stream.writer(self.io, &write_buf);
-        _ = w.writeAll(response) catch {};
+        _ = w.interface.writeAll(response) catch {};
     }
 
     fn handleMetrics(self: *Self, stream: std.Io.net.Stream) void {
@@ -207,7 +208,7 @@ pub const WebMonitor = struct {
 
         var write_buf: [1024]u8 = undefined;
         var w = stream.writer(self.io, &write_buf);
-        _ = w.writeAll(response) catch {};
+        _ = w.interface.writeAll(response) catch {};
     }
 
     fn handle404(self: *Self, stream: std.Io.net.Stream) void {
@@ -218,7 +219,7 @@ pub const WebMonitor = struct {
 
         var write_buf: [256]u8 = undefined;
         var w = stream.writer(self.io, &write_buf);
-        _ = w.writeAll(response) catch {};
+        _ = w.interface.writeAll(response) catch {};
     }
 };
 

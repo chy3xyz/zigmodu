@@ -52,6 +52,7 @@ pub const FeatureFlagManager = struct {
         }
         self.flags.deinit();
         self.change_listeners.deinit(self.allocator);
+        self.* = undefined;
     }
 
     /// [...]

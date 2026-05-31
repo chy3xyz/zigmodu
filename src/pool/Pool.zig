@@ -85,6 +85,7 @@ pub fn Pool(comptime T: type) type {
                 self.destroyFn(node.conn);
             }
             self.idle_conns.deinit(self.allocator);
+            self.* = undefined;
         }
 
         /// Get a connection from the pool

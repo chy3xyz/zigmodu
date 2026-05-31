@@ -52,6 +52,7 @@ pub fn RollingWindow(comptime T: type) type {
 
         pub fn deinit(self: *Self) void {
             self.allocator.free(self.buckets);
+            self.* = undefined;
         }
 
         fn advance(self: *Self, now_ms: i64) void {
@@ -187,6 +188,7 @@ pub const AdaptiveShedder = struct {
     pub fn deinit(self: *Self) void {
         self.pass_counter.deinit();
         self.rt_counter.deinit();
+        self.* = undefined;
     }
 
     pub fn allow(self: *Self) errors.Error!Promise {

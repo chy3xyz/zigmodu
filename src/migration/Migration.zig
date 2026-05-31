@@ -74,6 +74,7 @@ pub const MigrationRunner = struct {
             self.allocator.free(h.checksum);
         }
         self.history.deinit(self.allocator);
+        self.* = undefined;
     }
 
     /// [...]

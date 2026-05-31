@@ -46,6 +46,7 @@ pub const CircuitBreaker = struct {
 
     pub fn deinit(self: *Self) void {
         self.allocator.free(self.name);
+        self.* = undefined;
     }
 
     /// Execute a protected call through the circuit breaker.
@@ -204,6 +205,7 @@ pub const CircuitBreakerRegistry = struct {
             entry.value_ptr.deinit();
         }
         self.breakers.deinit();
+        self.* = undefined;
     }
 
     /// [...]

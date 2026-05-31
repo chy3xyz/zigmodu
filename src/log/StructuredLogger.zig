@@ -54,6 +54,7 @@ pub const StructuredLogger = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.context.deinit();
+        self.* = undefined;
     }
 
     /// [...]Context[...]
@@ -167,6 +168,7 @@ pub const LogRotator = struct {
             file.close(self.io);
         }
         self.allocator.free(self.base_path);
+        self.* = undefined;
     }
 
     pub fn write(self: *Self, data: []const u8) !void {

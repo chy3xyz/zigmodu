@@ -57,6 +57,7 @@ pub fn ModulithTest(comptime modules: anytype) type {
             }
             self.event_captures.deinit();
             self.app.deinit();
+            self.* = undefined;
         }
 
         /// Start the test application
@@ -144,6 +145,7 @@ fn EventCapture(comptime T: type) type {
 
         pub fn deinit(self: *Self) void {
             self.events.deinit(self.allocator);
+            self.* = undefined;
         }
 
         pub fn capture(self: *Self, event: T) !void {

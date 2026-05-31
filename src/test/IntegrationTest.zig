@@ -56,6 +56,7 @@ pub const IntegrationTest = struct {
                     allocator.free(entry.value_ptr.*);
                 }
                 self.headers.deinit();
+                self.* = undefined;
             }
         };
 
@@ -86,6 +87,7 @@ pub const IntegrationTest = struct {
                 }
                 resp.headers.deinit();
             }
+            self.* = undefined;
         }
 
         pub fn setHeader(self: *HttpTestClient, key: []const u8, value: []const u8) !void {
@@ -175,6 +177,7 @@ pub const IntegrationTest = struct {
             // Note: values are *anyopaque so we cannot safely destroy them without type info.
             // Callers must manage their own data source lifecycles.
             self.data_sources.deinit();
+            self.* = undefined;
         }
 
         pub fn inTransaction(self: *DatabaseTestContext, comptime ResultType: type, action: fn () anyerror!ResultType) !ResultType {
@@ -213,6 +216,7 @@ pub const IntegrationTest = struct {
         pub fn deinit(self: *InstrumentationContext) void {
             self.metrics.deinit();
             self.tracer.deinit();
+            self.* = undefined;
         }
     };
 
@@ -276,6 +280,7 @@ pub const IntegrationTest = struct {
         if (self.app) |*app| {
             app.deinit();
         }
+        self.* = undefined;
     }
 
     pub fn registerService(self: *Self, name: []const u8, service: *anyopaque, comptime T: type) !void {
@@ -437,6 +442,7 @@ fn EventCapture(comptime T: type) type {
 
         pub fn deinit(self: *Self) void {
             self.events.deinit(self.allocator);
+            self.* = undefined;
         }
 
         pub fn capture(self: *Self, event: T) !void {

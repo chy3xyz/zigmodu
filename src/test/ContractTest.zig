@@ -111,6 +111,7 @@ pub const ContractTestRunner = struct {
             self.allocator.free(v.failures);
         }
         self.verifications.deinit(self.allocator);
+        self.* = undefined;
     }
 
     /// [...]

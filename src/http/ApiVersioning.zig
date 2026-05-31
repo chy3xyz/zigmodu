@@ -95,6 +95,7 @@ pub const ApiVersionRouter = struct {
 
     pub fn deinit(self: *Self) void {
         self.versions.deinit(self.allocator);
+        self.* = undefined;
     }
 
     /// [...]

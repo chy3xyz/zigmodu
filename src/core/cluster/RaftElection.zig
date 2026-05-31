@@ -143,6 +143,7 @@ pub const RaftElection = struct {
         self.peers.deinit(self.allocator);
         if (self.voted_for) |v| self.allocator.free(v);
         if (self.leader_id) |l| self.allocator.free(l);
+        self.* = undefined;
     }
 
     /// Main tick function - called periodically

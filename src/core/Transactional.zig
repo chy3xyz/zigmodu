@@ -171,6 +171,7 @@ pub const Transactional = struct {
 
         pub fn deinit(self: *Interceptor) void {
             self.attributes.deinit();
+            self.* = undefined;
         }
 
         /// [...]Transaction[...]
@@ -261,6 +262,7 @@ pub const Transactional = struct {
             self.ctx.transactions.deinit();
             const allocator = self.ctx.allocator;
             allocator.destroy(self.ctx);
+            self.* = undefined;
         }
 
         pub fn getManager(self: *InMemoryTransactionManager) TransactionManager {

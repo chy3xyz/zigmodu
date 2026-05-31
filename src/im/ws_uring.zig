@@ -64,6 +64,7 @@ pub const WsUring = struct {
             }
         }
         self.connections.deinit();
+        self.* = undefined;
     }
 
     /// Start the event loop in a dedicated thread.

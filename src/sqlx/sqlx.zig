@@ -97,6 +97,7 @@ pub const Rows = struct {
 
     pub fn deinit(self: *Rows) void {
         self.arena.deinit();
+        self.* = undefined;
     }
 };
 
@@ -1501,6 +1502,7 @@ const ConnPool = struct {
             conn.close();
         }
         self.idle.deinit(self.allocator);
+        self.* = undefined;
     }
 
     /// Reconnect and add a new idle connection to the pool
@@ -1744,6 +1746,7 @@ pub const Client = struct {
             self.pool = null;
         }
         if (self.conn) |*c| c.close();
+        self.* = undefined;
     }
 
     fn ensurePool(self: *Client) void {
@@ -2220,6 +2223,7 @@ pub const StringCache = struct {
         var key_iter = self.map.keyIterator();
         while (key_iter.next()) |k| self.allocator.free(k.*);
         self.map.deinit();
+        self.* = undefined;
     }
 
     pub fn get(self: *StringCache, key: []const u8) ?[]const u8 {
@@ -2500,6 +2504,7 @@ pub const Builder = struct {
         if (self.group_by_clause) |g| self.allocator.free(g);
         if (self.having_clause) |h| self.allocator.free(h);
         if (self.order_by_clause) |o| self.allocator.free(o);
+        self.* = undefined;
     }
 
     pub fn selectColumns(self: *Builder, columns: []const []const u8) *Builder {

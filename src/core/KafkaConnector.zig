@@ -74,6 +74,7 @@ pub const KafkaProducer = struct {
 
     pub fn deinit(self: *Self) void {
         self.topic_stats.deinit();
+        self.* = undefined;
     }
 
     /// [...] Kafka
@@ -149,6 +150,7 @@ pub const KafkaConsumer = struct {
             self.allocator.free(entry.value_ptr.topic);
         }
         self.subscriptions.deinit();
+        self.* = undefined;
     }
 
     /// [...] topic

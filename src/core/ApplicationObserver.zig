@@ -28,6 +28,7 @@ pub const ApplicationObserver = struct {
 
     pub fn deinit(self: *Self) void {
         self.listeners.deinit(self.allocator);
+        self.* = undefined;
     }
 
     pub fn addListener(self: *Self, listener: *const fn (Event) void) !void {

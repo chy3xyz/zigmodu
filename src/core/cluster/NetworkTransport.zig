@@ -23,6 +23,7 @@ pub const ClusterConnection = struct {
 
     pub fn deinit(self: *ClusterConnection) void {
         self.stream.close(self.io);
+        self.* = undefined;
     }
 
     /// Send a length-prefixed message.
@@ -68,6 +69,7 @@ pub const ClusterServer = struct {
 
     pub fn deinit(self: *ClusterServer) void {
         self.stop();
+        self.* = undefined;
     }
 
     /// Start listening. Accepts connections and passes them to the handler.

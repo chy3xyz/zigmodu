@@ -106,6 +106,7 @@ pub const DistributedTracer = struct {
                 event.attributes.deinit();
             }
             self.events.deinit(allocator);
+            self.* = undefined;
         }
 
         pub fn setAttribute(self: *Span, allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
@@ -145,6 +146,7 @@ pub const DistributedTracer = struct {
             self.allocator.destroy(span);
         }
         self.active_spans.deinit(self.allocator);
+        self.* = undefined;
     }
 
     /// Create new trace

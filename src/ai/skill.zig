@@ -55,6 +55,7 @@ pub const SkillRegistry = struct {
             self.allocator.free(entry.value_ptr.parameters);
         }
         self.tools.deinit();
+        self.* = undefined;
     }
 
     /// Register a tool. Duplicate names are replaced.
@@ -124,30 +125,30 @@ pub const SkillRegistry = struct {
         self.mutex.lock(self.io) catch return;
         defer self.mutex.unlock(self.io);
 
-        try writer.writeAll("[");
+        try writer.interface.writeAll("[");
         var first = true;
         var it = self.tools.iterator();
         while (it.next()) |entry| {
             const t = entry.value_ptr;
-            if (!first) try writer.writeAll(",");
+            if (!first) try writer.interface.writeAll(",");
             first = false;
             try writer.print("{{\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"description\":\"{s}\",\"parameters\":{{\"type\":\"object\",\"properties\":{{", .{ t.name, t.description });
             for (t.parameters, 0..) |p, pi| {
-                if (pi > 0) try writer.writeAll(",");
+                if (pi > 0) try writer.interface.writeAll(",");
                 try writer.print("\"{s}\":{{\"type\":\"{s}\",\"description\":\"{s}\"}}", .{ p.name, @tagName(p.type), p.description });
             }
-            try writer.writeAll("},\"required\":[");
+            try writer.interface.writeAll("},\"required\":[");
             var req_first = true;
             for (t.parameters) |p| {
                 if (p.required) {
-                    if (!req_first) try writer.writeAll(",");
+                    if (!req_first) try writer.interface.writeAll(",");
                     req_first = false;
                     try writer.print("\"{s}\"", .{p.name});
                 }
             }
-            try writer.writeAll("]}}}}");
+            try writer.interface.writeAll("]}}}}");
         }
-        try writer.writeAll("]");
+        try writer.interface.writeAll("]");
     }
 };
 

@@ -88,6 +88,7 @@ pub const ModuleListenerRegistry = struct {
 
     pub fn deinit(self: *Self) void {
         self.listeners.deinit();
+        self.* = undefined;
     }
 
     /// [...]
@@ -151,6 +152,7 @@ pub const EventExternalization = struct {
 
     pub fn deinit(self: *Self) void {
         self.externalizers.deinit(self.allocator);
+        self.* = undefined;
     }
 
     /// [...]

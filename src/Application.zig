@@ -97,6 +97,7 @@ pub const Application = struct {
         self.modules.deinit();
         self.shutdown_hooks.deinit(self.allocator);
         self.state = .stopped;
+        self.* = undefined;
     }
 
     /// Validate module dependencies (cold path — startup only).
@@ -252,7 +253,7 @@ pub const ApplicationBuilder = struct {
     }
 
     pub fn deinit(self: *ApplicationBuilder) void {
-        _ = self;
+        self.* = undefined;
     }
 
     pub fn withName(self: *ApplicationBuilder, name: []const u8) *ApplicationBuilder {

@@ -229,6 +229,7 @@ pub const PrometheusMetrics = struct {
             entry.value_ptr.values.deinit();
         }
         self.summaries.deinit();
+        self.* = undefined;
     }
 
     /// Create Counter

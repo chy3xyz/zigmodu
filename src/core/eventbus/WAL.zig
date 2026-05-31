@@ -87,6 +87,7 @@ pub const WAL = struct {
         self.allocator.free(self.current_segment.path);
         self.allocator.destroy(self.current_segment);
         self.segments.deinit(self.allocator);
+        self.* = undefined;
     }
 
     pub fn append(self: *Self, entry: WALEntry) !u64 {

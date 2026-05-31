@@ -119,6 +119,7 @@ pub const DLQ = struct {
                 self.allocator.free(s.db_path);
             },
         }
+        self.* = undefined;
     }
 
     /// Add a failed message to the DLQ

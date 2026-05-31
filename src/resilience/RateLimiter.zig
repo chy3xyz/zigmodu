@@ -25,6 +25,7 @@ pub const RateLimiter = struct {
 
     pub fn deinit(self: *Self) void {
         self.allocator.free(self.name);
+        self.* = undefined;
     }
 
     /// Try to acquire one token
@@ -127,6 +128,7 @@ pub const RateLimiterRegistry = struct {
             entry.value_ptr.deinit();
         }
         self.limiters.deinit();
+        self.* = undefined;
     }
 
     /// [...]
@@ -197,6 +199,7 @@ pub const SlidingWindowRateLimiter = struct {
     pub fn deinit(self: *Self) void {
         self.allocator.free(self.name);
         self.requests.deinit();
+        self.* = undefined;
     }
 
     /// [...]

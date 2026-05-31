@@ -60,6 +60,7 @@ pub const ShardRouter = struct {
         }
         self.allocator.free(self.pools);
         self.tenant_map.deinit();
+        self.* = undefined;
     }
 
     /// Configure the available shard pools.

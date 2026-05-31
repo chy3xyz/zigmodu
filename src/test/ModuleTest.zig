@@ -20,6 +20,7 @@ pub const ModuleTestContext = struct {
 
     pub fn deinit(self: *Self) void {
         self.modules.deinit();
+        self.* = undefined;
     }
 
     /// Register a mock module for testing

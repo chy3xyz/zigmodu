@@ -135,6 +135,7 @@ pub const SecurityScanner = struct {
             }
         }
         self.findings.deinit();
+        self.* = undefined;
     }
 
     /// [...]
@@ -402,6 +403,7 @@ pub const DependencyScanner = struct {
             }
         }
         self.vulnerability_db.deinit();
+        self.* = undefined;
     }
 
     /// [...]VulnerabilityInfo[...]
@@ -458,6 +460,7 @@ pub const SecurityConfigValidator = struct {
 
     pub fn deinit(self: *Self) void {
         self.checks.deinit();
+        self.* = undefined;
     }
 
     /// [...]
@@ -488,6 +491,7 @@ pub const SecurityConfigValidator = struct {
 
         pub fn deinit(self: *ValidationResult) void {
             self.failed_checks.deinit();
+            self.* = undefined;
         }
     };
 };

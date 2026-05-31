@@ -30,7 +30,7 @@ pub const SecurityModule = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        _ = self;
+        self.* = undefined;
     }
 
     /// JWT Token [...]

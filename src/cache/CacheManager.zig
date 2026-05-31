@@ -55,6 +55,7 @@ pub const CacheManager = struct {
             self.allocator.free(entry.value_ptr.value);
         }
         self.entries.deinit();
+        self.* = undefined;
     }
 
     pub fn set(self: *Self, key: []const u8, value: []const u8) !void {

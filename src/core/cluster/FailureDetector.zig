@@ -61,6 +61,7 @@ pub const AccrualFailureDetector = struct {
             entry.value_ptr.intervals_ms.deinit(self.allocator);
         }
         self.histories.deinit();
+        self.* = undefined;
     }
 
     /// Record a heartbeat from a node

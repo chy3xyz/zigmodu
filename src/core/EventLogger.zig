@@ -37,6 +37,7 @@ pub const EventLogger = struct {
             if (event.causation_id) |caid| self.allocator.free(caid);
         }
         self.events.deinit(self.allocator);
+        self.* = undefined;
     }
 
     pub fn log(self: *Self, event_type: []const u8, source_module: []const u8, payload: []const u8, correlation_id: ?[]const u8, causation_id: ?[]const u8) !void {
@@ -138,6 +139,7 @@ pub const TestEventCollector = struct {
             self.allocator.free(t);
         }
         self.event_types.deinit(self.allocator);
+        self.* = undefined;
     }
 
     pub fn collect(self: *Self, event: anytype, event_type: []const u8) !void {

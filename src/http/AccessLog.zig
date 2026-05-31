@@ -55,6 +55,7 @@ pub const AccessLogger = struct {
             if (entry.client_ip) |ip| self.allocator.free(ip);
         }
         self.entries.deinit(self.allocator);
+        self.* = undefined;
     }
 
     /// [...]

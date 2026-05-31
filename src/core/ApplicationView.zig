@@ -23,6 +23,7 @@ pub const ApplicationView = struct {
 
     pub fn deinit(self: *Self) void {
         self.module_states.deinit();
+        self.* = undefined;
     }
 
     pub fn setState(self: *Self, name: []const u8, state: ModuleState) void {

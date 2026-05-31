@@ -57,6 +57,7 @@ pub const DistributedTransactionManager = struct {
             tx.arena.deinit();
         }
         self.transactions.deinit();
+        self.* = undefined;
     }
 
     /// [...]Transaction
@@ -245,6 +246,7 @@ pub const TwoPhaseCommit = struct {
             self.allocator.free(coord.tx_id);
         }
         self.coordinators.deinit();
+        self.* = undefined;
     }
 
     /// Create coordinator
@@ -373,6 +375,7 @@ pub const TransactionLog = struct {
             }
         }
         self.entries.deinit(self.allocator);
+        self.* = undefined;
     }
 
     pub fn append(self: *TransactionLog, tx_id: []const u8, event: Event, alloc: std.mem.Allocator) !void {

@@ -35,6 +35,7 @@ pub const ConfigManager = struct {
                 },
                 else => {},
             }
+            self.* = undefined;
         }
     };
 
@@ -52,6 +53,7 @@ pub const ConfigManager = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.values.deinit();
+        self.* = undefined;
     }
 
     /// Load configuration from JSON file
@@ -183,7 +185,7 @@ pub const ConfigManager = struct {
     /// patterns (password, secret, token, key, auth) are masked with `***`.
     pub fn dump(self: *Self, writer: anytype) !void {
         const sensitive_patterns = [_][]const u8{ "password", "secret", "token", "key", "auth", "passwd", "pwd", "credential" };
-        try writer.writeAll("Configuration:\n");
+        try writer.interface.writeAll("Configuration:\n");
         var iter = self.values.iterator();
         while (iter.next()) |entry| {
             const key_lower = entry.key_ptr.*;
@@ -197,14 +199,14 @@ pub const ConfigManager = struct {
 
             try writer.print("  {s} = ", .{key_lower});
             if (is_sensitive) {
-                try writer.writeAll("\"***\"\n");
+                try writer.interface.writeAll("\"***\"\n");
             } else {
                 switch (entry.value_ptr.*) {
                     .string => |s| try writer.print("\"{s}\"\n", .{s}),
                     .integer => |i| try writer.print("{d}\n", .{i}),
                     .float => |f| try writer.print("{d}\n", .{f}),
                     .boolean => |b| try writer.print("{s}\n", .{if (b) "true" else "false"}),
-                    else => try writer.writeAll("<complex>\n"),
+                    else => try writer.interface.writeAll("<complex>\n"),
                 }
             }
         }

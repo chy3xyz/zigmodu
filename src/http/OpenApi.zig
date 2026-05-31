@@ -153,6 +153,7 @@ pub const OpenApiGenerator = struct {
 
         for (self.tags.items) |t| self.allocator.free(t);
         self.tags.deinit(self.allocator);
+        self.* = undefined;
     }
 
     /// [...] API endpoint

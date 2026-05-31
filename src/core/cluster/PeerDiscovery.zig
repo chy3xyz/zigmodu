@@ -62,6 +62,7 @@ pub const PeerDiscovery = struct {
     pub fn deinit(self: *Self, peers: []Peer) void {
         for (peers) |p| self.allocator.free(p.host);
         self.allocator.free(peers);
+        self.* = undefined;
     }
 };
 

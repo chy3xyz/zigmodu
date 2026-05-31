@@ -140,6 +140,7 @@ pub const Benchmark = struct {
             result.runs.deinit();
         }
         self.results.deinit();
+        self.* = undefined;
     }
 
     /// [...]Tests[...]
@@ -423,6 +424,7 @@ pub const BenchmarkSuite = struct {
             self.allocator.destroy(bench);
         }
         self.benchmarks.deinit();
+        self.* = undefined;
     }
 
     /// [...]Tests

@@ -142,6 +142,7 @@ pub const GrpcServiceRegistry = struct {
             self.allocator.free(svc_entry.value_ptr.name);
         }
         self.services.deinit();
+        self.* = undefined;
     }
 
     /// [...]
@@ -305,6 +306,7 @@ pub const GrpcClient = struct {
             self.allocator.free(entry.value_ptr.address);
         }
         self.endpoints.deinit();
+        self.* = undefined;
     }
 
     /// [...]
