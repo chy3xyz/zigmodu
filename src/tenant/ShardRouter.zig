@@ -56,6 +56,7 @@ pub const ShardRouter = struct {
             self.allocator.free(pool.host);
             self.allocator.free(pool.database);
             self.allocator.free(pool.username);
+            @memset(pool.password, 0); // Secure: zero credentials before free
             self.allocator.free(pool.password);
         }
         self.allocator.free(self.pools);

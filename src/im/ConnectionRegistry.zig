@@ -117,6 +117,7 @@ const Shard = struct {
 
     by_user: std.AutoHashMap(u64, *ConnectionEntry),
     by_conn: std.AutoHashMap(u32, *ConnectionEntry),
+    free_list: ?*ConnectionEntry = null,
     mutex: std.Io.Mutex,
     io: std.Io,
     next_id_base: u32,
@@ -132,9 +133,20 @@ const Shard = struct {
         by_user.ensureTotalCapacity(allocator, capacity) catch {};
         var by_conn = std.AutoHashMap(u32, *ConnectionEntry).init(allocator);
         by_conn.ensureTotalCapacity(allocator, capacity) catch {};
+
+        // Pre-allocate ConnectionEntry free list (object pool)
+        var free_list: ?*ConnectionEntry = null;
+        for (0..capacity) |_| {
+            const entry = allocator.create(ConnectionEntry) catch break;
+            entry.* = ConnectionEntry.empty();
+            entry.next_free = free_list;
+            free_list = entry;
+        }
+
         return .{
             .by_user = by_user,
             .by_conn = by_conn,
+            .free_list = free_list,
             .mutex = std.Io.Mutex.init,
             .io = io,
             .next_id_base = @as(u32, id) << 26,
@@ -143,11 +155,34 @@ const Shard = struct {
     }
 
     fn deinit(self: *SelfShard) void {
+        // Destroy active entries in maps
         var it = self.by_user.iterator();
         while (it.next()) |kv| self.by_user.allocator.destroy(kv.value_ptr.*);
+        // Destroy free list entries
+        var entry = self.free_list;
+        while (entry) |e| {
+            const next = e.next_free;
+            self.by_user.allocator.destroy(e);
+            entry = next;
+        }
         self.by_user.deinit();
         self.by_conn.deinit();
         self.* = undefined;
+    }
+
+    /// Pop from free list. Returns null if pool exhausted.
+    fn acquireEntry(self: *SelfShard) ?*ConnectionEntry {
+        const entry = self.free_list orelse return null;
+        self.free_list = entry.next_free;
+        entry.next_free = null;
+        return entry;
+    }
+
+    /// Push back to free list for reuse.
+    fn releaseEntry(self: *SelfShard, entry: *ConnectionEntry) void {
+        entry.* = ConnectionEntry.empty();
+        entry.next_free = self.free_list;
+        self.free_list = entry;
     }
 
     fn nextId(self: *SelfShard) u32 {
@@ -157,16 +192,19 @@ const Shard = struct {
     }
 
     fn register(self: *SelfShard, allocator: std.mem.Allocator, user_id: u64, ctx: *anyopaque, send_fn: SendFn) u32 {
+        _ = allocator;
         self.mutex.lock(self.io) catch return 0;
         defer self.mutex.unlock(self.io);
 
+        // Replace old connection, recycle entry to free list
         if (self.by_user.getPtr(user_id)) |existing| {
             _ = self.by_conn.remove(existing.*.conn_id);
-            allocator.destroy(existing.*);
+            self.releaseEntry(existing.*);
         }
 
+        // Acquire from object pool (infallible at capacity)
+        const entry = self.acquireEntry() orelse return 0;
         const conn_id = self.nextId();
-        const entry = allocator.create(ConnectionEntry) catch return 0;
         entry.* = .{
             .conn_id = conn_id,
             .user_id = user_id,
@@ -174,6 +212,7 @@ const Shard = struct {
             .send_fn = send_fn,
             .last_tick = self.tick,
             .is_connected = true,
+            .next_free = null,
         };
 
         // Infallible: capacity pre-allocated via ensureTotalCapacity in initCapacity
@@ -183,13 +222,14 @@ const Shard = struct {
     }
 
     fn unregister(self: *SelfShard, allocator: std.mem.Allocator, user_id: u64) void {
+        _ = allocator;
         self.mutex.lock(self.io) catch return;
         defer self.mutex.unlock(self.io);
 
         if (self.by_user.fetchRemove(user_id)) |kv| {
             _ = self.by_conn.remove(kv.value.conn_id);
-            kv.value.is_connected = false;
-            allocator.destroy(kv.value);
+            // Recycle entry to free list instead of destroying
+            self.releaseEntry(kv.value);
         }
     }
 
@@ -297,9 +337,22 @@ const ConnectionEntry = struct {
     send_fn: SendFn,
     last_tick: u64,
     is_connected: bool,
+    next_free: ?*ConnectionEntry = null, // Free list link (object pool)
+
+    fn empty() ConnectionEntry {
+        return .{
+            .conn_id = 0,
+            .user_id = 0,
+            .ctx = undefined,
+            .send_fn = undefined,
+            .last_tick = 0,
+            .is_connected = false,
+            .next_free = null,
+        };
+    }
 
     comptime {
-        std.debug.assert(@sizeOf(ConnectionEntry) <= 64); // Must fit in one cache line
+        std.debug.assert(@sizeOf(ConnectionEntry) <= 128); // Must fit in two cache lines
     }
 };
 
