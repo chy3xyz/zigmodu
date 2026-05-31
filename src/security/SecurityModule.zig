@@ -1,6 +1,7 @@
 const std = @import("std");
 const crypto = std.crypto;
 const Time = @import("../core/Time.zig");
+const api = @import("../api/Server.zig");
 
 /// Security module - [...]Encrypt[...]
 pub const SecurityModule = struct {
@@ -302,6 +303,36 @@ pub const SecurityModule = struct {
         return true;
     }
 };
+
+/// Rate-limited auth middleware — prevents brute-force attacks.
+/// Limits to `max_attempts` per `window_seconds`. Returns 429 on excess.
+pub fn authRateLimitMiddleware(
+    allocator: std.mem.Allocator,
+    max_attempts: u32,
+    window_seconds: u32,
+) !api.MiddlewareFn {
+    const limiter = try allocator.create(@import("../resilience/RateLimiter.zig").RateLimiter);
+    limiter.* = try @import("../resilience/RateLimiter.zig").RateLimiter.init(
+        allocator, "auth_rate_limit", max_attempts, max_attempts / window_seconds,
+    );
+    const S = struct {
+        fn handler(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
+            const lim: *@import("../resilience/RateLimiter.zig").RateLimiter = @ptrCast(@alignCast(user_data orelse return error.InternalError));
+            if (!lim.tryAcquire()) {
+                ctx.status_code = 429;
+                ctx.setHeader("Content-Type", "application/json") catch {};
+                ctx.setHeader("Retry-After", "60") catch {};
+                _ = ctx.stream.?.writer(ctx.io.?, &.{}{}).interface.writeAll(
+                    "{\"code\":429,\"msg\":\"Too many requests. Try again later.\"}",
+                ) catch {};
+                ctx.responded = true;
+                return;
+            }
+            try next(ctx, next, user_data);
+        }
+    };
+    return .{ .func = S.handler, .user_data = @ptrCast(@constCast(limiter)) };
+}
 
 /// [...] (Zig 0.16 timing_safe.eql [...]/[...])
 fn timingSafeSliceEql(a: []const u8, b: []const u8) bool {
