@@ -30,6 +30,7 @@ pub const RateLimiter = struct {
 
     /// Try to acquire one token
     pub fn tryAcquire(self: *Self) bool {
+        @branchHint(.likely);
         self.refill();
 
         if (self.current_tokens >= 1.0) {

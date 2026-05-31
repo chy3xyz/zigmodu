@@ -1,3 +1,5 @@
+//! Saga orchestrator — distributed transaction with compensating rollback steps.
+
 const std = @import("std");
 const Time = @import("../core/Time.zig");
 

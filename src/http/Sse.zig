@@ -1,3 +1,5 @@
+//! Server-Sent Events writer — RFC-compliant SSE streaming with heartbeat support.
+
 const std = @import("std");
 
 /// Server-Sent Events writer.

@@ -1,3 +1,5 @@
+//! Circuit breaker — CLOSED/OPEN/HALF_OPEN state machine with per-service breakers.
+
 const std = @import("std");
 const Time = @import("../core/Time.zig");
 
@@ -55,7 +57,9 @@ pub const CircuitBreaker = struct {
     /// wrap the CircuitBreaker in a Mutex or use one instance per fiber.
     pub fn call(self: *Self, operation: *const fn () anyerror!void) Result {
         // Hot path: CLOSED state (~99.9% of calls) skips the updateState syscall.
+        @branchHint(.likely);
         if (self.state != .CLOSED) {
+            @branchHint(.cold);
             self.updateState();
         }
 

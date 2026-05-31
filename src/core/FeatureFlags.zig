@@ -1,3 +1,5 @@
+//! Feature flags with percentage rollout, allowlists, and compile-time evaluation.
+
 const std = @import("std");
 const Time = @import("../core/Time.zig");
 
