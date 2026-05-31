@@ -197,6 +197,12 @@ const WALEntryHeader = packed struct {
     payload_len: u32,
     source_len: u32,
     _pad: u32 = 0,
+
+    comptime {
+        std.debug.assert(@sizeOf(WALEntryHeader) == 32);
+        std.debug.assert(@offsetOf(WALEntryHeader, "seq") == 0);
+        std.debug.assert(@offsetOf(WALEntryHeader, "_pad") == 28);
+    }
 };
 
 fn serializeEntry(entry: WALEntry, seq: u64, alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) !void {

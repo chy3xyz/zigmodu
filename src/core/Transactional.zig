@@ -238,6 +238,7 @@ pub const Transactional = struct {
 
         pub fn init(allocator: std.mem.Allocator) !InMemoryTransactionManager {
             const ctx = try allocator.create(TMContext);
+            errdefer allocator.destroy(ctx);
             ctx.* = .{
                 .transactions = std.array_list.Managed(Status).init(allocator),
                 .allocator = allocator,

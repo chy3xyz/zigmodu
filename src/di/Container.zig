@@ -13,6 +13,7 @@ const ServiceWrapper = struct {
     fn create(comptime T: type, instance: *T, allocator: std.mem.Allocator) !*ServiceWrapper {
         const type_name = @typeName(T);
         const wrapper = try allocator.create(ServiceWrapper);
+        errdefer allocator.destroy(wrapper);
         wrapper.* = .{
             .ptr = instance,
             .type_name = try allocator.dupe(u8, type_name),
@@ -62,6 +63,7 @@ pub const Container = struct {
 
     pub fn register(self: *Self, comptime T: type, name: []const u8, instance: *T) !void {
         const wrapper = try ServiceWrapper.create(T, instance, self.allocator);
+        errdefer wrapper.destroy(self.allocator);
         try self.services.put(name, wrapper);
     }
 
