@@ -32,10 +32,17 @@ pub const MemoryStore = struct {
     max_entries: usize = 10000,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) MemoryStore {
+        return initCapacity(allocator, io, 1000);
+    }
+
+    /// Init with capacity hint for pre-allocated HashMap storage.
+    pub fn initCapacity(allocator: std.mem.Allocator, io: std.Io, capacity: usize) MemoryStore {
+        var entries = std.StringHashMap(MemoryEntry).init(allocator);
+        entries.ensureTotalCapacity(allocator, capacity) catch {};
         return .{
             .allocator = allocator,
             .io = io,
-            .entries = std.StringHashMap(MemoryEntry).init(allocator),
+            .entries = entries,
             .mutex = std.Io.Mutex.init,
         };
     }
@@ -78,7 +85,7 @@ pub const MemoryStore = struct {
             return;
         }
 
-        try self.entries.put(owned_key, .{
+        self.entries.putAssumeCapacity(owned_key, .{
             .key = owned_key,
             .value = owned_value,
             .tenant_id = tenant_id,

@@ -39,10 +39,18 @@ pub const SkillRegistry = struct {
     mutex: std.Io.Mutex,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Self {
+        return initCapacity(allocator, io, 32);
+    }
+
+    /// Init with capacity hint (max registered tools). Pre-allocates
+    /// HashMap storage so runtime register() is infallible.
+    pub fn initCapacity(allocator: std.mem.Allocator, io: std.Io, capacity: usize) Self {
+        var tools = std.StringHashMap(Tool).init(allocator);
+        tools.ensureTotalCapacity(allocator, capacity) catch {};
         return .{
             .allocator = allocator,
             .io = io,
-            .tools = std.StringHashMap(Tool).init(allocator),
+            .tools = tools,
             .mutex = std.Io.Mutex.init,
         };
     }
@@ -80,7 +88,7 @@ pub const SkillRegistry = struct {
             .parameters = params,
             .handler = tool.handler,
         };
-        try self.tools.put(key, owned);
+        self.tools.putAssumeCapacity(key, owned);
     }
 
     /// Dispatch a tool call by name.

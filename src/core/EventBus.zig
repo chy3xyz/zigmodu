@@ -76,9 +76,17 @@ pub fn EventBus(comptime EventType: type) type {
         listeners: std.AutoHashMap(EventType, ListenerSet(CallbackType)),
 
         pub fn init(alloc: std.mem.Allocator) Self {
+            return initCapacity(alloc, 32);
+        }
+
+        /// Init with capacity hint (max distinct event types). Pre-allocates
+        /// HashMap storage so runtime subscribe() is infallible.
+        pub fn initCapacity(alloc: std.mem.Allocator, capacity: usize) Self {
+            var listeners = std.AutoHashMap(EventType, ListenerSet(CallbackType)).init(alloc);
+            listeners.ensureTotalCapacity(alloc, capacity) catch {};
             return .{
                 .allocator = alloc,
-                .listeners = std.AutoHashMap(EventType, ListenerSet(CallbackType)).init(alloc),
+                .listeners = listeners,
             };
         }
 
@@ -91,12 +99,13 @@ pub fn EventBus(comptime EventType: type) type {
             self.* = undefined;
         }
 
-        pub fn subscribe(self: *Self, event_type: EventType, callback: CallbackType) !void {
-            const result = try self.listeners.getOrPut(event_type);
+        /// Infallible subscribe — capacity pre-allocated in initCapacity.
+        pub fn subscribe(self: *Self, event_type: EventType, callback: CallbackType) void {
+            const result = self.listeners.getOrPutAssumeCapacity(event_type);
             if (!result.found_existing) {
                 result.value_ptr.* = ListenerSet(CallbackType).init(self.allocator);
             }
-            try result.value_ptr.add(callback);
+            result.value_ptr.addAssumeCapacity(callback);
         }
 
         pub fn unsubscribe(self: *Self, event_type: EventType, callback: CallbackType) void {

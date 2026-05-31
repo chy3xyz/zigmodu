@@ -14,13 +14,19 @@ pub const ConnectionRegistry = struct {
     shards: [SHARDS]Shard,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Self {
+        return initCapacity(allocator, io, 1024);
+    }
+
+    /// Init with capacity hint (max connections per shard). Pre-allocates
+    /// HashMap storage so runtime register() is infallible for map ops.
+    pub fn initCapacity(allocator: std.mem.Allocator, io: std.Io, capacity_per_shard: usize) Self {
         var self = Self{
             .allocator = allocator,
             .io = io,
             .shards = undefined,
         };
         for (&self.shards, 0..) |*s, i| {
-            s.* = Shard.init(allocator, io, @intCast(i));
+            s.* = Shard.initCapacity(allocator, io, @intCast(i), capacity_per_shard);
         }
         return self;
     }
@@ -118,9 +124,17 @@ const Shard = struct {
     id: u8,
 
     fn init(allocator: std.mem.Allocator, io: std.Io, id: u8) SelfShard {
+        return initCapacity(allocator, io, id, 1024);
+    }
+
+    fn initCapacity(allocator: std.mem.Allocator, io: std.Io, id: u8, capacity: usize) SelfShard {
+        var by_user = std.AutoHashMap(u64, *ConnectionEntry).init(allocator);
+        by_user.ensureTotalCapacity(allocator, capacity) catch {};
+        var by_conn = std.AutoHashMap(u32, *ConnectionEntry).init(allocator);
+        by_conn.ensureTotalCapacity(allocator, capacity) catch {};
         return .{
-            .by_user = std.AutoHashMap(u64, *ConnectionEntry).init(allocator),
-            .by_conn = std.AutoHashMap(u32, *ConnectionEntry).init(allocator),
+            .by_user = by_user,
+            .by_conn = by_conn,
             .mutex = std.Io.Mutex.init,
             .io = io,
             .next_id_base = @as(u32, id) << 26,
@@ -162,8 +176,9 @@ const Shard = struct {
             .is_connected = true,
         };
 
-        self.by_user.put(user_id, entry) catch { allocator.destroy(entry); return 0; };
-        self.by_conn.put(conn_id, entry) catch {};
+        // Infallible: capacity pre-allocated via ensureTotalCapacity in initCapacity
+        self.by_user.putAssumeCapacity(user_id, entry);
+        self.by_conn.putAssumeCapacity(conn_id, entry);
         return conn_id;
     }
 
