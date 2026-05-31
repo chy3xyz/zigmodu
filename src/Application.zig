@@ -1,3 +1,5 @@
+//! Application lifecycle — module loading, startup, and shutdown orchestration.
+
 const std = @import("std");
 const Time = @import("core/Time.zig");
 const api = @import("api/Module.zig");

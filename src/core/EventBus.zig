@@ -1,3 +1,5 @@
+//! Thread-safe event bus with typed event dispatch, infallible subscription model.
+
 const std = @import("std");
 
 /// ListenerSet for O(1) [...]/[...]

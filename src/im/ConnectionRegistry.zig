@@ -297,6 +297,10 @@ const ConnectionEntry = struct {
     send_fn: SendFn,
     last_tick: u64,
     is_connected: bool,
+
+    comptime {
+        std.debug.assert(@sizeOf(ConnectionEntry) <= 64); // Must fit in one cache line
+    }
 };
 
 // ── Tests ──

@@ -1,3 +1,5 @@
+//! Typed error handling — ZigModuError, ErrorContext, Result(T), HttpCode mapping.
+
 const std = @import("std");
 const Time = @import("Time.zig");
 
