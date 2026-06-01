@@ -189,24 +189,24 @@ pub const Context = struct {
     upgraded: bool = false,
 
     /// Per-request arena — eliminates ~20 heap allocs per request.
-    /// Init once per connection, reset between keep-alive requests.
-    request_arena: std.heap.ArenaAllocator,
+    /// Removed nested arena in Zig 0.17: ArenaAllocator.free() is no-op,
+    /// so inner arena deinit never returned memory to outer arena, causing OOM.
+    /// Now uses connFiber's arena allocator directly — arena.reset() between
+    /// requests handles all cleanup.
+    request_arena: ?std.heap.ArenaAllocator = null,
 
     // Middleware chain fields
     chain_middlewares: []const Middleware = &.{},
     chain_handler: *const fn (*Context) anyerror!void = undefined,
     chain_index: usize = 0,
 
-    /// Get arena allocator for request-scoped allocations (headers, params, body).
-    /// Falls back to main allocator if arena is exhausted.
+    /// Get allocator for request-scoped allocations (headers, params, body).
     pub fn arenaAlloc(self: *Context) std.mem.Allocator {
-        return self.request_arena.allocator();
+        return self.allocator;
     }
 
-    /// Reset the request arena between keep-alive requests.
+    /// Reset per-request state between keep-alive requests.
     pub fn resetArena(self: *Context) void {
-        _ = self.request_arena.reset(.retain_capacity);
-        // Re-init HashMaps with old allocator data cleared
         self.query.clearRetainingCapacity();
         self.params.clearRetainingCapacity();
         self.headers.clearRetainingCapacity();
@@ -216,33 +216,28 @@ pub const Context = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator, method: Method, path: []const u8) !Context {
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        const arena_alloc = arena.allocator();
         return Context{
             .allocator = allocator,
-            .request_arena = arena,
             .method = method,
             .path = path,
             .raw_path = path,
-            .query = std.StringHashMap([]const u8).init(arena_alloc),
-            .params = std.StringHashMap([]const u8).init(arena_alloc),
-            .headers = std.StringHashMap([]const u8).init(arena_alloc),
+            .query = std.StringHashMap([]const u8).init(allocator),
+            .params = std.StringHashMap([]const u8).init(allocator),
+            .headers = std.StringHashMap([]const u8).init(allocator),
             .response_body = std.ArrayList(u8).empty,
-            .response_headers = std.StringHashMap([]const u8).init(arena_alloc),
-            .attributes = std.StringHashMap([]const u8).init(arena_alloc),
+            .response_headers = std.StringHashMap([]const u8).init(allocator),
+            .attributes = std.StringHashMap([]const u8).init(allocator),
         };
     }
 
     pub fn deinit(self: *Context) void {
-        // Arena frees all request-scoped allocations at once — no individual free needed.
         self.query.deinit();
         self.params.deinit();
         self.headers.deinit();
         if (self.form) |*f| f.deinit();
-        self.response_body.deinit(self.request_arena.allocator());
+        self.response_body.deinit(self.allocator);
         self.response_headers.deinit();
         self.attributes.deinit();
-        self.request_arena.deinit();
         self.* = undefined;
     }
 
@@ -998,17 +993,7 @@ const Router = struct {
             }
         }
 
-        // Check if current node has a wildcard child (for /prefix/* matching /prefix)
-        if (current.wildcard_child) |wc| {
-            if (wc.route) |route| {
-                var params = std.StringHashMap([]const u8).init(allocator);
-                for (0..param_count) |i| {
-                    params.put(param_keys[i], param_vals[i]) catch {};
-                }
-                return MatchedRoute{ .route = route, .params = params };
-            }
-        }
-
+        // Exact route takes priority over wildcard child
         if (current.route) |route| {
             var params = std.StringHashMap([]const u8).init(allocator);
             for (0..param_count) |i| {
@@ -1023,6 +1008,17 @@ const Router = struct {
             };
         }
 
+        // Check if current node has a wildcard child (for /prefix/* matching /prefix)
+        if (current.wildcard_child) |wc| {
+            if (wc.route) |route| {
+                var params = std.StringHashMap([]const u8).init(allocator);
+                for (0..param_count) |i| {
+                    params.put(param_keys[i], param_vals[i]) catch {};
+                }
+                return MatchedRoute{ .route = route, .params = params };
+            }
+        }
+
         for (0..param_count) |i| {
             allocator.free(param_keys[i]);
             allocator.free(param_vals[i]);
@@ -1030,6 +1026,7 @@ const Router = struct {
         if (self.wildcards.get(method)) |wc| {
             return MatchedRoute{ .route = wc, .params = std.StringHashMap([]const u8).init(allocator) };
         }
+        std.log.debug("[Router] no match: {s} {s}", .{ method.toString(), path });
         return null;
     }
 };
@@ -1480,7 +1477,8 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
             }
         }
 
-        var matched = server.router.match(arena_alloc, request.method, request.path);
+        const matched_orig = server.router.match(arena_alloc, request.method, request.path);
+        var matched = matched_orig;
         if (matched) |*m| {
             defer {
                 var it = m.params.iterator();
@@ -1506,8 +1504,7 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                 }
             };
         } else {
-            // Run global middleware before 404 so CORS/recover/logging
-            // process every request (including OPTIONS preflight).
+            // Run global middleware before 404
             if (server.global_middleware.items.len > 0) {
                 server.executeWithMiddleware(&ctx, struct {
                     fn h(_: *Context) anyerror!void {}
@@ -2237,4 +2234,92 @@ test "queryInt parses valid integer" {
     try std.testing.expectEqual(@as(i64, 5), ctx.queryInt(i64, "page", 0));
     try std.testing.expectEqual(@as(i64, 20), ctx.queryInt(i64, "size", 10));
     try std.testing.expectEqual(@as(i64, 42), ctx.queryInt(i64, "missing", 42));
+}
+
+test "deep path matching with RouteGroup" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(std.testing.io, allocator, 0);
+    defer server.deinit();
+
+    // Simulate RouteGroup with deep prefix (exactly as user reports)
+    var dashboard_group = server.group("/test/overview/home");
+    try dashboard_group.get("/dashboard", struct {
+        fn handle(_: *Context) anyerror!void {}
+    }.handle, null);
+
+    var crm_group = server.group("/crm");
+    try crm_group.get("/statistics", struct {
+        fn handle(_: *Context) anyerror!void {}
+    }.handle, null);
+
+    var insurance_group = server.group("/insurance");
+    try insurance_group.get("/compensation-plan", struct {
+        fn handle(_: *Context) anyerror!void {}
+    }.handle, null);
+
+    // Existing 2-segment path (control)
+    var customer_group = server.group("/customer");
+    try customer_group.get("/summary", struct {
+        fn handle(_: *Context) anyerror!void {}
+    }.handle, null);
+
+    // Test: deep path (4 segments) should match
+    var m1 = server.router.match(allocator, .GET, "/test/overview/home/dashboard");
+    if (m1 == null) @panic("FAIL: /test/overview/home/dashboard returned 404");
+
+    // Test: 2-segment path should match
+    var m2 = server.router.match(allocator, .GET, "/customer/summary");
+    if (m2 == null) @panic("FAIL: /customer/summary returned 404");
+
+    // Test: 3-segment paths should match
+    var m3 = server.router.match(allocator, .GET, "/crm/statistics");
+    if (m3 == null) @panic("FAIL: /crm/statistics returned 404");
+
+    var m4 = server.router.match(allocator, .GET, "/insurance/compensation-plan");
+    if (m4 == null) @panic("FAIL: /insurance/compensation-plan returned 404");
+
+    // Clean up params
+    if (m1) |*m| m.params.deinit();
+    if (m2) |*m| m.params.deinit();
+    if (m3) |*m| m.params.deinit();
+    if (m4) |*m| m.params.deinit();
+}
+
+test "wildcard + exact route coexistence" {
+    const allocator = std.testing.allocator;
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    // Register exact route AND wildcard sibling (user's scenario)
+    try router.addRoute(.{
+        .method = .GET,
+        .path = "/crm/statistics",
+        .handler = struct { fn h(_: *Context) anyerror!void {} }.h,
+    });
+    try router.addRoute(.{
+        .method = .GET,
+        .path = "/crm/statistics/*",
+        .handler = struct { fn h(_: *Context) anyerror!void {} }.h,
+    });
+    try router.addRoute(.{
+        .method = .GET,
+        .path = "/insurance/compensation-plan",
+        .handler = struct { fn h(_: *Context) anyerror!void {} }.h,
+    });
+    try router.addRoute(.{
+        .method = .GET,
+        .path = "/insurance/compensation-plan/*",
+        .handler = struct { fn h(_: *Context) anyerror!void {} }.h,
+    });
+
+    // Exact paths must match
+    try std.testing.expect(router.match(allocator, .GET, "/crm/statistics") != null);
+    try std.testing.expect(router.match(allocator, .GET, "/insurance/compensation-plan") != null);
+
+    // Wildcard sub-paths must match
+    try std.testing.expect(router.match(allocator, .GET, "/crm/statistics/overview") != null);
+    try std.testing.expect(router.match(allocator, .GET, "/insurance/compensation-plan/list") != null);
+
+    // Wrong method must NOT match
+    try std.testing.expect(router.match(allocator, .POST, "/crm/statistics") == null);
 }

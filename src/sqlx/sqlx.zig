@@ -720,7 +720,10 @@ pub const PostgresConn = struct {
 
         for (args, 0..) |arg, i| {
             paramValues[i] = switch (arg) {
-                .null => null,
+                .null => blk: {
+                    paramLengths[i] = 0;
+                    break :blk null;
+                },
                 .int => |v| blk: {
                     const s = std.fmt.allocPrint(self.allocator, "{d}", .{v}) catch return null;
                     paramAllocs[i] = s;
@@ -780,7 +783,10 @@ pub const PostgresConn = struct {
 
         for (args, 0..) |arg, i| {
             paramValues[i] = switch (arg) {
-                .null => null,
+                .null => blk: {
+                    paramLengths[i] = 0;
+                    break :blk null;
+                },
                 .int => |v| blk: {
                     const s = std.fmt.allocPrint(self.allocator, "{d}", .{v}) catch return null;
                     paramAllocs[i] = s;
@@ -835,7 +841,10 @@ pub const PostgresConn = struct {
 
         for (args, 0..) |arg, i| {
             paramValues[i] = switch (arg) {
-                .null => null,
+                .null => blk: {
+                    paramLengths[i] = 0;
+                    break :blk null;
+                },
                 .int => |v| blk: {
                     const s = std.fmt.allocPrint(self.allocator, "{d}", .{v}) catch return null;
                     paramAllocs[i] = s;
