@@ -989,16 +989,6 @@ const Router = struct {
                 };
                 param_count += 1;
                 current = param_child;
-            } else if (current.findChild("*")) |wc| {
-                // Wildcard matched as fallback
-                if (wc.route) |route| {
-                    var params = std.StringHashMap([]const u8).init(allocator);
-                    for (0..param_count) |i| {
-                        params.put(param_keys[i], param_vals[i]) catch {};
-                    }
-                    return MatchedRoute{ .route = route, .params = params };
-                }
-                return null;
             } else {
                 for (0..param_count) |i| {
                     allocator.free(param_keys[i]);
