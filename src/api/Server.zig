@@ -216,7 +216,7 @@ pub const Context = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator, method: Method, path: []const u8) !Context {
-        const arena = std.heap.ArenaAllocator.init(allocator);
+        var arena = std.heap.ArenaAllocator.init(allocator);
         const arena_alloc = arena.allocator();
         return Context{
             .allocator = allocator,
@@ -775,6 +775,7 @@ const ParsedRequest = struct {
 const TrieNode = struct {
     segment: []const u8,
     is_param: bool,
+    is_wildcard: bool,
     param_name: ?[]const u8,
     route: ?Route,
     children: std.ArrayList(*TrieNode),
@@ -782,6 +783,8 @@ const TrieNode = struct {
     child_map: ?std.StringHashMap(*TrieNode) = null,
     /// Cached pointer to the first param child (at most one per node).
     param_child: ?*TrieNode = null,
+    /// Cached pointer to the wildcard child (at most one `*` per node).
+    wildcard_child: ?*TrieNode = null,
 
     const MAP_THRESHOLD: usize = 8;
 
@@ -790,6 +793,7 @@ const TrieNode = struct {
         node.* = .{
             .segment = try allocator.dupe(u8, segment),
             .is_param = std.mem.startsWith(u8, segment, "{"),
+            .is_wildcard = std.mem.eql(u8, segment, "*"),
             .param_name = null,
             .route = null,
             .children = std.ArrayList(*TrieNode).empty,
@@ -829,6 +833,10 @@ const TrieNode = struct {
         // Track param child for O(1) access
         if (child.is_param and self.param_child == null) {
             self.param_child = child;
+        }
+        // Track wildcard child for O(1) access
+        if (child.is_wildcard and self.wildcard_child == null) {
+            self.wildcard_child = child;
         }
 
         // Lazy upgrade to HashMap when children cross threshold
@@ -956,6 +964,19 @@ const Router = struct {
         while (parts.next()) |part| {
             if (part.len == 0) continue;
 
+            // Check wildcard child first — consumes all remaining path segments
+            if (current.wildcard_child) |wc| {
+                // Consume remaining parts into a single rest parameter
+                if (wc.route) |route| {
+                    var params = std.StringHashMap([]const u8).init(allocator);
+                    for (0..param_count) |i| {
+                        params.put(param_keys[i], param_vals[i]) catch {};
+                    }
+                    return MatchedRoute{ .route = route, .params = params };
+                }
+                return null;
+            }
+
             if (current.findChild(part)) |child| {
                 current = child;
             } else if (current.findParamChild()) |param_child| {
@@ -968,12 +989,33 @@ const Router = struct {
                 };
                 param_count += 1;
                 current = param_child;
+            } else if (current.findChild("*")) |wc| {
+                // Wildcard matched as fallback
+                if (wc.route) |route| {
+                    var params = std.StringHashMap([]const u8).init(allocator);
+                    for (0..param_count) |i| {
+                        params.put(param_keys[i], param_vals[i]) catch {};
+                    }
+                    return MatchedRoute{ .route = route, .params = params };
+                }
+                return null;
             } else {
                 for (0..param_count) |i| {
                     allocator.free(param_keys[i]);
                     allocator.free(param_vals[i]);
                 }
                 return null;
+            }
+        }
+
+        // Check if current node has a wildcard child (for /prefix/* matching /prefix)
+        if (current.wildcard_child) |wc| {
+            if (wc.route) |route| {
+                var params = std.StringHashMap([]const u8).init(allocator);
+                for (0..param_count) |i| {
+                    params.put(param_keys[i], param_vals[i]) catch {};
+                }
+                return MatchedRoute{ .route = route, .params = params };
             }
         }
 
@@ -1694,6 +1736,50 @@ test "route group" {
     // Route should exist at /api/v1/users
     const matched = server.router.match(allocator,.GET, "/api/v1/users");
     try std.testing.expect(matched != null);
+}
+
+test "wildcard route matching" {
+    const allocator = std.testing.allocator;
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    // Register wildcard routes
+    try router.addRoute(.{
+        .method = .GET,
+        .path = "/crm/statistics/*",
+        .handler = struct { fn h(_: *Context) anyerror!void {} }.h,
+    });
+    try router.addRoute(.{
+        .method = .GET,
+        .path = "/insurance/compensation-plan/*",
+        .handler = struct { fn h(_: *Context) anyerror!void {} }.h,
+    });
+    try router.addRoute(.{
+        .method = .GET,
+        .path = "/users/{id}",
+        .handler = struct { fn h(_: *Context) anyerror!void {} }.h,
+    });
+    try router.addRoute(.{
+        .method = .POST,
+        .path = "/api/data/*",
+        .handler = struct { fn h(_: *Context) anyerror!void {} }.h,
+    });
+
+    // Test: wildcard path matches sub-paths
+    try std.testing.expect(router.match(allocator, .GET, "/crm/statistics/overview") != null);
+    try std.testing.expect(router.match(allocator, .GET, "/crm/statistics/daily/report") != null);
+    try std.testing.expect(router.match(allocator, .GET, "/insurance/compensation-plan/2024") != null);
+    try std.testing.expect(router.match(allocator, .GET, "/insurance/compensation-plan/list/all") != null);
+
+    // Test: param route still works alongside wildcards
+    try std.testing.expect(router.match(allocator, .GET, "/users/42") != null);
+
+    // Test: POST wildcard works
+    try std.testing.expect(router.match(allocator, .POST, "/api/data/metrics") != null);
+
+    // Test: non-existent paths return null
+    try std.testing.expect(router.match(allocator, .GET, "/crm/unknown") == null);
+    try std.testing.expect(router.match(allocator, .GET, "/other/path") == null);
 }
 
 test "context response helpers" {
