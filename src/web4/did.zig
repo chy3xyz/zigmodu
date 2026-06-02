@@ -11,13 +11,13 @@ pub const DidKey = struct {
     did: []const u8, // "did:key:z..."
 
     /// Generate a new did:key identity using OS random.
-    pub fn generate(allocator: std.mem.Allocator, io: std.Io) Self {
+    pub fn generate(allocator: std.mem.Allocator, io: std.Io) !Self {
         const kp = std.crypto.sign.Ed25519.KeyPair.generate(io);
         var sk: [64]u8 = undefined;
         @memcpy(&sk, &kp.secret_key.bytes);
         var pk: [32]u8 = undefined;
         @memcpy(&pk, &kp.public_key.bytes);
-        const did = formatDidKey(allocator, pk) catch @panic("OOM");
+        const did = try formatDidKey(allocator, pk);
         return .{ .secret_key = sk, .public_key = pk, .did = did };
     }
 
@@ -186,7 +186,7 @@ pub fn issueCredential(allocator: std.mem.Allocator, issuer: *DidKey, vc: *Verif
 // Verify a credential's proof against the issuer's public key.
 test "resolve did:key round-trip" {
     const allocator = std.testing.allocator;
-    const did = DidKey.generate(allocator, std.testing.io);
+    const did = try DidKey.generate(allocator, std.testing.io);
     defer allocator.free(did.did);
     const resolved = try resolve(allocator, did.did);
     defer allocator.free(resolved.did);
@@ -207,7 +207,7 @@ pub fn verifyCredential(allocator: std.mem.Allocator, issuer: *DidKey, vc: *Veri
 
 test "did:key generate and document" {
     const allocator = std.testing.allocator;
-    var did = DidKey.generate(allocator, std.testing.io);
+    var did = try DidKey.generate(allocator, std.testing.io);
     defer allocator.free(did.did);
 
     try std.testing.expect(std.mem.startsWith(u8, did.did, "did:key:z"));
@@ -219,7 +219,7 @@ test "did:key generate and document" {
 
 test "did:key sign and verify" {
     const allocator = std.testing.allocator;
-    var did = DidKey.generate(allocator, std.testing.io);
+    var did = try DidKey.generate(allocator, std.testing.io);
     defer allocator.free(did.did);
 
     const sig = try did.sign(allocator, "hello world");
@@ -230,9 +230,9 @@ test "did:key sign and verify" {
 
 test "issue and verify credential" {
     const allocator = std.testing.allocator;
-    var issuer_did = DidKey.generate(allocator, std.testing.io);
+    var issuer_did = try DidKey.generate(allocator, std.testing.io);
     defer allocator.free(issuer_did.did);
-    const subject_did = DidKey.generate(allocator, std.testing.io);
+    const subject_did = try DidKey.generate(allocator, std.testing.io);
     defer allocator.free(subject_did.did);
 
     var vc = VerifiableCredential{

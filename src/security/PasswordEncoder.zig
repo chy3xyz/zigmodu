@@ -97,10 +97,9 @@ fn timingSafeSliceEql(a: []const u8, b: []const u8) bool {
     for (a, 0..) |x, i| {
         acc |= x ^ b[i];
     }
-    const s = @typeInfo(u8).int.bits;
-    const Cu = std.meta.Int(.unsigned, s);
-    const Cext = std.meta.Int(.unsigned, s + 1);
-    return @as(bool, @bitCast(@as(u1, @truncate((@as(Cext, @as(Cu, @bitCast(acc))) -% 1) >> s))));
+    // Constant-time zero detection: (acc_u9 - 1) >> 8 yields 1 iff acc == 0
+    const acc_u9: u9 = acc;
+    return @as(u1, @truncate((acc_u9 -% 1) >> 8)) == 0;
 }
 
 fn base64Encode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {

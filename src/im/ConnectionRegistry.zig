@@ -130,9 +130,9 @@ const Shard = struct {
 
     fn initCapacity(allocator: std.mem.Allocator, io: std.Io, id: u8, capacity: usize) SelfShard {
         var by_user = std.AutoHashMap(u64, *ConnectionEntry).init(allocator);
-        by_user.ensureTotalCapacity(allocator, capacity) catch {};
+        by_user.ensureTotalCapacity(@intCast(capacity)) catch {};
         var by_conn = std.AutoHashMap(u32, *ConnectionEntry).init(allocator);
-        by_conn.ensureTotalCapacity(allocator, capacity) catch {};
+        by_conn.ensureTotalCapacity(@intCast(capacity)) catch {};
 
         // Pre-allocate ConnectionEntry free list (object pool)
         var free_list: ?*ConnectionEntry = null;

@@ -46,7 +46,7 @@ pub const SkillRegistry = struct {
     /// HashMap storage so runtime register() is infallible.
     pub fn initCapacity(allocator: std.mem.Allocator, io: std.Io, capacity: usize) Self {
         var tools = std.StringHashMap(Tool).init(allocator);
-        tools.ensureTotalCapacity(allocator, capacity) catch {};
+        tools.ensureTotalCapacity(@intCast(capacity)) catch {};
         return .{
             .allocator = allocator,
             .io = io,

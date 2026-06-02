@@ -52,6 +52,10 @@ pub const Method = enum {
 /// HTTP handler function type
 pub const HandlerFn = *const fn (*Context) anyerror!void;
 
+/// Path rewriter: runs after Context init, before route matching.
+/// Can modify ctx.path to redirect route selection without client redirects.
+pub const PathRewriterFn = *const fn (*Context) void;
+
 /// Middleware function type with optional user data
 pub const MiddlewareFn = *const fn (*Context, HandlerFn, ?*anyopaque) anyerror!void;
 
@@ -490,7 +494,7 @@ pub const Context = struct {
             return error.InvalidJson;
         };
         defer parsed.deinit();
-        return deepCopy(parsed.value, self.allocator);
+        return try deepCopy(parsed.value, self.allocator);
     }
 
     /// Send JSON from struct.
@@ -1123,6 +1127,9 @@ pub const Server = struct {
     router: Router,
     global_middleware: std.ArrayList(Middleware),
     ws_handlers: std.StringHashMap(WsRoute),
+    /// Path rewriter callback (optional) — runs before router.match().
+    /// Use for ThinkPHP /api/* compat, legacy URL mapping, prefix stripping.
+    path_rewriter: ?PathRewriterFn = null,
     ws_buffer_pool: ?*BufferPool = null,
     ws_uring: ?*WsUring = null,
     name: []const u8,
@@ -1220,6 +1227,13 @@ pub const Server = struct {
 
     pub fn addMiddleware(self: *Server, mw: Middleware) !void {
         try self.global_middleware.append(self.allocator, mw);
+    }
+
+    /// Set a path rewriter callback. Runs after Context init, before router.match().
+    /// Use for legacy URL mapping, prefix stripping, ThinkPHP compat.
+    /// Must be called before server.start().
+    pub fn setPathRewriter(self: *Server, rewriter: PathRewriterFn) void {
+        self.path_rewriter = rewriter;
     }
 
     /// Wire the server into the Application's graceful-shutdown drain counter.
@@ -1403,6 +1417,12 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
 
         ctx.body = request.body;
         ctx.raw_path = request.raw_path;
+
+        // ── Path rewriter (runs before route matching) ──
+        if (server.path_rewriter) |rewriter| {
+            rewriter(&ctx);
+            request.path = ctx.path; // sync — router.match uses request.path
+        }
 
         // Parse form body
         if (request.body) |body| {
@@ -1597,33 +1617,33 @@ pub fn Json(comptime T: type) type {
 
 /// Deep-copy a parsed JSON value, duping all []const u8 fields
 /// to escape the parse arena lifetime. Supports nested structs.
-fn deepCopy(value: anytype, allocator: std.mem.Allocator) @TypeOf(value) {
+fn deepCopy(value: anytype, allocator: std.mem.Allocator) !@TypeOf(value) {
     const T = @TypeOf(value);
     if (comptime T == []const u8 or T == []u8) {
-        return allocator.dupe(u8, value) catch @panic("OOM");
+        return allocator.dupe(u8, value);
     }
     switch (@typeInfo(T)) {
         .@"struct" => |s| {
             var copy: T = undefined;
             inline for (s.fields) |f| {
-                @field(copy, f.name) = deepCopy(@field(value, f.name), allocator);
+                @field(copy, f.name) = try deepCopy(@field(value, f.name), allocator);
             }
             return copy;
         },
         .optional => {
-            if (value) |v| return deepCopy(v, allocator);
+            if (value) |v| return try deepCopy(v, allocator);
             return null;
         },
         .array => {
             var copy: T = undefined;
             for (value, 0..) |elem, i| {
-                copy[i] = deepCopy(elem, allocator);
+                copy[i] = try deepCopy(elem, allocator);
             }
             return copy;
         },
         .pointer => |p| {
             if (p.child == u8) {
-                return allocator.dupe(u8, value) catch @panic("OOM");
+                return allocator.dupe(u8, value);
             }
             return value;
         },
@@ -2322,4 +2342,38 @@ test "wildcard + exact route coexistence" {
 
     // Wrong method must NOT match
     try std.testing.expect(router.match(allocator, .POST, "/crm/statistics") == null);
+}
+
+test "path rewriter changes route selection" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(std.testing.io, allocator, 0);
+    defer server.deinit();
+
+    // Register route at rewritten path
+    _ = try server.addRoute(.{
+        .method = .GET,
+        .path = "/rewritten/path",
+        .handler = struct { fn h(_: *Context) anyerror!void {} }.h,
+    });
+
+    // Set rewriter: map /old/* → /rewritten/*
+    server.setPathRewriter(struct {
+        fn rewrite(ctx: *Context) void {
+            if (std.mem.startsWith(u8, ctx.path, "/old/")) {
+                // Allocate new path in arena — freed on request end
+                const suffix = ctx.path["/old/".len..];
+                ctx.path = std.fmt.allocPrint(ctx.allocator, "/rewritten/{s}", .{suffix}) catch return;
+            }
+        }
+    }.rewrite);
+
+    // Without rewriter, /old/path would 404. With rewriter, it matches /rewritten/path.
+    // Test only the router (connFiber not exercised in unit test)
+    var ctx = try Context.init(allocator, .GET, "/old/path");
+    defer ctx.deinit();
+    const rw = server.path_rewriter.?;
+    rw(&ctx);
+    const matched = server.router.match(allocator, .GET, ctx.path);
+    try std.testing.expect(matched != null);
+    if (matched) |*m| m.params.deinit();
 }

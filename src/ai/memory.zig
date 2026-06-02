@@ -38,7 +38,7 @@ pub const MemoryStore = struct {
     /// Init with capacity hint for pre-allocated HashMap storage.
     pub fn initCapacity(allocator: std.mem.Allocator, io: std.Io, capacity: usize) MemoryStore {
         var entries = std.StringHashMap(MemoryEntry).init(allocator);
-        entries.ensureTotalCapacity(allocator, capacity) catch {};
+        entries.ensureTotalCapacity(@intCast(capacity)) catch {};
         return .{
             .allocator = allocator,
             .io = io,

@@ -65,10 +65,9 @@ pub const ClusterAuth = struct {
         if (a.len != b.len) return false;
         var acc: u8 = 0;
         for (a, 0..) |x, i| acc |= x ^ b[i];
-        const s = @typeInfo(u8).int.bits;
-        const Cu = std.meta.Int(.unsigned, s);
-        const Cext = std.meta.Int(.unsigned, s + 1);
-        return @as(bool, @bitCast(@as(u1, @truncate((@as(Cext, @as(Cu, @bitCast(acc))) -% 1) >> s))));
+        // Constant-time zero detection: (acc_u9 - 1) >> 8 yields 1 iff acc == 0
+        const acc_u9: u9 = acc;
+        return @as(u1, @truncate((acc_u9 -% 1) >> 8)) == 0;
     }
 
     /// Verify a message signature.

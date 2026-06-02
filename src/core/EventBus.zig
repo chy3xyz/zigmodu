@@ -85,7 +85,7 @@ pub fn EventBus(comptime EventType: type) type {
         /// HashMap storage so runtime subscribe() is infallible.
         pub fn initCapacity(alloc: std.mem.Allocator, capacity: usize) Self {
             var listeners = std.AutoHashMap(EventType, ListenerSet(CallbackType)).init(alloc);
-            listeners.ensureTotalCapacity(alloc, capacity) catch {};
+            listeners.ensureTotalCapacity(@intCast(capacity)) catch {};
             return .{
                 .allocator = alloc,
                 .listeners = listeners,
