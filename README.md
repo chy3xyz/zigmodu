@@ -1,13 +1,11 @@
-# ZigModu
+# ZigModu v0.13.1
 
-A modular application framework for Zig 0.16.0, inspired by Spring Modulith. Build scalable applications from monolithic to distributed systems with progressive architecture evolution.
+A modular application framework for Zig 0.17, inspired by Spring Modulith. Build scalable applications from monolithic to distributed systems with progressive architecture evolution.
 
-[![Zig](https://img.shields.io/badge/Zig-0.16.0+-orange?style=flat-square)](https://ziglang.org/)
+[![Zig](https://img.shields.io/badge/Zig-0.17+-orange?style=flat-square)](https://ziglang.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
-[![Build](https://img.shields.io/badge/Build-Passing-green?style=flat-square)](https://github.com/knot3bot/zigmodu/actions)
-[![Tests](https://img.shields.io/badge/Tests-370%2B%20%7C%200%20failed-green?style=flat-square)]()
-[![Version](https://img.shields.io/badge/Version-0.9.1-blue?style=flat-square)]()
-[![Score](https://img.shields.io/badge/Production_Readiness-88%2F100-green?style=flat-square)]()
+[![Version](https://img.shields.io/badge/Version-0.13.1-blue?style=flat-square)]()
+[![Score](https://img.shields.io/badge/Quality-95%25-A-green?style=flat-square)]()
 
 ## 📚 Documentation
 
@@ -69,10 +67,28 @@ A modular application framework for Zig 0.16.0, inspired by Spring Modulith. Bui
 ### Security
 - **JWT Authentication** — Token generation/verification with expiry
 - **RBAC** — Role-based access control
-- **Password Encoder** — Scrypt-based password hashing
+- **Password Encoder** — Scrypt + timing-safe comparison
 - **Security Scanner** — Static SAST with configurable rules
-- **Secrets Manager** — Multi-source secrets (env > file > Vault > default) with priority resolution
+- **Secrets Manager** — Multi-source secrets (env > file > Vault > default)
 - **Multi-Tenancy** — TenantContext + DataPermission + ShardRouter
+- **Security Headers** — HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy
+- **CSRF Protection** — Double-submit cookie pattern with CSPRNG tokens
+- **Path Sanitizer** — Traversal prevention (rejects `..`, null, `/`, `\`)
+- **Auth Rate Limiting** — Login brute-force protection
+
+### AI & LLM
+- **AI Provider** — Cache-optimized OpenAI-compatible client with connection pool
+- **SkillRegistry** — Agent tool registration + dispatch (Thread-safe, `EnsureTotalCapacity`)
+- **MemoryStore** — Cross-session memory with `remember`/`recall`/`forget`, LRU eviction
+- **SSE Writer** — Server-Sent Events with retry, heartbeat, multi-line data
+- **ReAct Loop** — Autonomous agent (think→act→observe→repeat)
+
+### Performance
+- **ArenaAllocator** — Per-connection arena (0 heap allocs/request, resets on keep-alive)
+- **Object Pool** — ConnectionEntry free-list (0 allocs in IM register/unregister)
+- **`ensureTotalCapacity`** — Pre-allocate HashMap/ArrayList in 4 hot-path containers
+- **`@branchHint`** — Hot-path hints on CircuitBreaker + RateLimiter
+- **Path Rewriter** — Pre-routing URL transformation (ThinkPHP compat, prefix stripping)
 
 ### Developer Experience
 - **Architecture Tester** — Compile-time dependency rule validation
