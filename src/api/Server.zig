@@ -310,7 +310,7 @@ pub const Context = struct {
         const value_copy = try self.allocator.dupe(u8, value);
         // fetchPutAssumeCapacity atomically replaces; old arena memory
         // is NOT freed — arena reset at request end reclaims all.
-        _ = self.response_headers.fetchPutAssumeCapacity(key_copy, value_copy);
+        try self.response_headers.put(key_copy, value_copy);
     }
 
     /// Type-safe accessor for user_data. Replaces @ptrCast(@alignCast(...)).
