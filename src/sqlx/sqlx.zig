@@ -93,7 +93,10 @@ pub const Row = struct {
 /// Query results
 pub const Rows = struct {
     arena: std.heap.ArenaAllocator,
-    rows: []const Row,
+    /// Mutable — queryRows/queryRow update row.arena to point to this Rows.arena.
+    /// Using `[]Row` (not `[]const Row`) avoids @constCast which Zig 0.17-dev
+    /// may optimize away in certain monomorphized instances.
+    rows: []Row,
 
     pub fn deinit(self: *Rows) void {
         self.arena.deinit();
@@ -2002,7 +2005,7 @@ pub const Client = struct {
     pub fn queryRow(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !T {
         var rows = try self.query(sql_str, args);
         defer rows.deinit();
-        for (@constCast(rows.rows)) |*row| row.arena = &rows.arena;
+        for (&rows.rows) |*row| row.arena = &rows.arena;
         if (rows.rows.len == 0) return error.NotFound;
         return try rows.rows[0].scan(self.allocator, T);
     }
@@ -2015,7 +2018,7 @@ pub const Client = struct {
     pub fn queryRowPartial(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !T {
         var rows = try self.query(sql_str, args);
         defer rows.deinit();
-        for (@constCast(rows.rows)) |*row| row.arena = &rows.arena;
+        for (&rows.rows) |*row| row.arena = &rows.arena;
         if (rows.rows.len == 0) return error.NotFound;
         return try rows.rows[0].scanPartial(self.allocator, T);
     }
@@ -2029,7 +2032,7 @@ pub const Client = struct {
         var rows = try self.query(sql_str, args);
         defer rows.deinit();
         // Fixup: Arena was on driver stack; now in caller's Rows. Update Row.arena pointers.
-        for (@constCast(rows.rows)) |*row| row.arena = &rows.arena;
+        for (&rows.rows) |*row| row.arena = &rows.arena;
         // Precompute column→field index once per query (O(F*C) once, not per row)
         const indices = if (rows.rows.len > 0)
             try buildColumnIndices(T, rows.rows[0].columns)
@@ -2193,7 +2196,7 @@ pub const Transaction = struct {
     pub fn queryRows(self: *Transaction, allocator: std.mem.Allocator, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
         var rows = try self.query(allocator, sql_str, args);
         defer rows.deinit();
-        for (@constCast(rows.rows)) |*row| row.arena = &rows.arena;
+        for (&rows.rows) |*row| row.arena = &rows.arena;
         const indices = if (rows.rows.len > 0)
             try buildColumnIndices(T, rows.rows[0].columns)
         else
