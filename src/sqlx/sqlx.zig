@@ -127,7 +127,7 @@ pub const Conn = struct {
         exec: *const fn (ptr: *anyopaque, sql_str: []const u8, args: []const Value) errors.ResultT(ExecResult),
         close: *const fn (ptr: *anyopaque) void,
         ping: *const fn (ptr: *anyopaque) errors.Result,
-        befin: *const fn (ptr: *anyopaque) errors.Result,
+        begin: *const fn (ptr: *anyopaque) errors.Result,
         commit: *const fn (ptr: *anyopaque) errors.Result,
         rollback: *const fn (ptr: *anyopaque) errors.Result,
         prepare: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, sql_str: []const u8) errors.ResultT(Stmt),
@@ -171,10 +171,11 @@ pub const Conn = struct {
 /// Precompute struct-field → column-index mapping once per query.
 /// Eliminates O(F*C) string comparisons per row — each row scan
 /// becomes O(F) direct array indexing instead of O(F*C) linear probes.
-fn buildColumnIndices(comptime T: type, columns: []const []const u8) ![std.meta.fieldNames(T).len]?usize {
+fn buildColumnIndices(allocator: std.mem.Allocator, comptime T: type, columns: []const []const u8) ![]?usize {
     const names = std.meta.fieldNames(T);
-    const N = std.meta.fieldNames(T).len; var indices: [N]?usize = @splat(@as(?usize, null));
-    inline for (names, 0..) |name, fi| {
+    const indices = try allocator.alloc(?usize, names.len);
+    for (indices) |*idx| idx.* = null;
+    for (names, 0..) |name, fi| {
         for (columns, 0..) |col, ci| {
             if (std.mem.eql(u8, col, name)) {
                 indices[fi] = ci;
@@ -186,7 +187,7 @@ fn buildColumnIndices(comptime T: type, columns: []const []const u8) ![std.meta.
 }
 
 /// Scan a struct Row, optionally using precomputed column indices for O(1) field lookup.
-fn scanStruct(allocator: std.mem.Allocator, comptime T: type, row: Row, partial: bool, indices: ?[std.meta.fieldNames(T).len]?usize) !T {
+fn scanStruct(allocator: std.mem.Allocator, comptime T: type, row: Row, partial: bool, indices: ?[]?usize) !T {
     const info = @typeInfo(T);
     if (info != .@"struct") @compileError("scanStruct only supports structs, got " ++ @typeName(T));
 
@@ -484,7 +485,7 @@ pub const SQLiteConn = struct {
         if (self.db == null) return error.DatabaseError;
     }
 
-    fn befinFn(ptr: *anyopaque) errors.Result {
+    fn beginFn(ptr: *anyopaque) errors.Result {
         const self = @as(*SQLiteConn, @ptrCast(@alignCast(ptr)));
         const rc = sqlite3_c.sqlite3_exec(self.db, "BEGIN", null, null, null);
         if (rc != sqlite3_c.SQLITE_OK) return error.DatabaseError;
@@ -518,7 +519,7 @@ pub const SQLiteConn = struct {
                 .exec = execFn,
                 .close = closeFn,
                 .ping = pingFn,
-                .befin = befinFn,
+                .begin = beginFn,
                 .commit = commitFn,
                 .rollback = rollbackFn,
                 .prepare = prepareFn,
@@ -957,7 +958,7 @@ pub const PostgresConn = struct {
         if (self.conn == null or libpq_c.PQstatus(self.conn) != libpq_c.ConnStatusType.CONNECTION_OK) return error.DatabaseError;
     }
 
-    fn befinFn(ptr: *anyopaque) errors.Result {
+    fn beginFn(ptr: *anyopaque) errors.Result {
         const self = @as(*PostgresConn, @ptrCast(@alignCast(ptr)));
         const res = libpq_c.PQexec(self.conn, "BEGIN");
         defer libpq_c.PQclear(res);
@@ -994,7 +995,7 @@ pub const PostgresConn = struct {
                 .exec = execFn,
                 .close = closeFn,
                 .ping = pingFn,
-                .befin = befinFn,
+                .begin = beginFn,
                 .commit = commitFn,
                 .rollback = rollbackFn,
                 .prepare = prepareFn,
@@ -1166,7 +1167,7 @@ pub const MySqlConn = struct {
         if (res) |r| libmysql_c.mysql_free_result(r);
     }
 
-    fn befinFn(ptr: *anyopaque) errors.Result {
+    fn beginFn(ptr: *anyopaque) errors.Result {
         const self = @as(*MySqlConn, @ptrCast(@alignCast(ptr)));
         if (libmysql_c.mysql_real_query(self.mysql, "START TRANSACTION", 17) != 0) return error.DatabaseError;
         const res = libmysql_c.mysql_store_result(self.mysql);
@@ -1203,7 +1204,7 @@ pub const MySqlConn = struct {
                 .exec = execFn,
                 .close = closeFn,
                 .ping = pingFn,
-                .befin = befinFn,
+                .begin = beginFn,
                 .commit = commitFn,
                 .rollback = rollbackFn,
                 .prepare = prepareFn,
@@ -2035,7 +2036,7 @@ pub const Client = struct {
         for (rows.rows) |*row| row.arena = &rows.arena;
         // Precompute column→field index once per query (O(F*C) once, not per row)
         const indices = if (rows.rows.len > 0)
-            try buildColumnIndices(T, rows.rows[0].columns)
+            try buildColumnIndices(self.allocator, T, rows.rows[0].columns)
         else
             null;
         const result = try self.allocator.alloc(T, rows.rows.len);
@@ -2060,7 +2061,7 @@ pub const Client = struct {
         var rows = try self.query(sql_str, args);
         defer rows.deinit();
         const indices = if (rows.rows.len > 0)
-            try buildColumnIndices(T, rows.rows[0].columns)
+            try buildColumnIndices(self.allocator, T, rows.rows[0].columns)
         else
             null;
         const result = try self.allocator.alloc(T, rows.rows.len);
@@ -2198,7 +2199,7 @@ pub const Transaction = struct {
         defer rows.deinit();
         for (rows.rows) |*row| row.arena = &rows.arena;
         const indices = if (rows.rows.len > 0)
-            try buildColumnIndices(T, rows.rows[0].columns)
+            try buildColumnIndices(self.allocator, T, rows.rows[0].columns)
         else
             null;
         const result = try allocator.alloc(T, rows.rows.len);
