@@ -149,8 +149,8 @@ pub const Conn = struct {
         return self.vtable.ping(self.ptr);
     }
 
-    pub fn befin(self: Conn) errors.Result {
-        return self.vtable.befin(self.ptr);
+    pub fn begin(self: Conn) errors.Result {
+        return self.vtable.begin(self.ptr);
     }
 
     pub fn commit(self: Conn) errors.Result {
@@ -172,8 +172,8 @@ pub const Conn = struct {
 /// Eliminates O(F*C) string comparisons per row — each row scan
 /// becomes O(F) direct array indexing instead of O(F*C) linear probes.
 fn buildColumnIndices(comptime T: type, columns: []const []const u8) ![std.meta.fieldNames(T).len]?usize {
-    const fields = std.meta.fieldNames(T);
-    var indices: [fields.len]?usize = @splat(@as(?usize, null));
+    const names = std.meta.fieldNames(T);
+    const N = std.meta.fieldNames(T).len; var indices: [N]?usize = @splat(@as(?usize, null));
     inline for (names, 0..) |name, fi| {
         for (columns, 0..) |col, ci| {
             if (std.mem.eql(u8, col, name)) {
@@ -192,7 +192,7 @@ fn scanStruct(allocator: std.mem.Allocator, comptime T: type, row: Row, partial:
 
     var result: T = undefined;
     const fn_names = info.@"struct".field_names; const fn_types = info.@"struct".field_types; const fn_attrs = info.@"struct".field_attrs; inline for (fn_names, fn_types, fn_attrs, 0..) |fname, ft, _, fi| {
-        const FieldType = fft;
+        const FieldType = ft;
         const is_optional = @typeInfo(FieldType) == .optional;
         const BaseType = if (is_optional) @typeInfo(FieldType).optional.child else FieldType;
         const is_string = BaseType == []const u8;
@@ -348,12 +348,12 @@ fn valueToType(allocator: std.mem.Allocator, comptime T: type, val: Value) !T {
 pub fn freeScanned(allocator: std.mem.Allocator, comptime T: type, val: T) void {
     const info = @typeInfo(T);
     if (info != .@"struct") return;
-    inline for (info.@"struct".fields) |field| {
-        const FieldType = fft;
+    inline for (info.@"struct".field_names, info.@"struct".field_types) |fn2, fft2| {
+        const FieldType = fft2;
         if (FieldType == []const u8) {
-            allocator.free(@field(val, field.name));
+            allocator.free(@field(val, fn2));
         } else if (@typeInfo(FieldType) == .optional and @typeInfo(FieldType).optional.child == []const u8) {
-            if (@field(val, field.name)) |s| allocator.free(s);
+            if (@field(val, fn2)) |s| allocator.free(s);
         }
     }
 }
@@ -1955,7 +1955,7 @@ pub const Client = struct {
         return self.ping();
     }
 
-    pub fn befinTx(self: *Client) errors.Error!Transaction {
+    pub fn beginTx(self: *Client) errors.Error!Transaction {
         self.ensureBreaker();
         if (!self.cb.?.allow()) return errors.Error.CircuitBreakerOpen;
         self.ensurePool();
@@ -1967,7 +1967,7 @@ pub const Client = struct {
                 return errors.Error.DatabaseError;
             };
             errdefer p.release(conn);
-            conn.befin() catch |err| {
+            conn.begin() catch |err| {
                 if (!self.isAcceptable(err)) self.cb.?.recordFailure();
                 return errors.Error.DatabaseError;
             };
@@ -1979,7 +1979,7 @@ pub const Client = struct {
                 return errors.Error.DatabaseError;
             };
         }
-        self.conn.?.befin() catch {
+        self.conn.?.begin() catch {
             if (!self.isAcceptable(errors.DatabaseError.ConnectionFailed)) self.cb.?.recordFailure();
             return errors.Error.DatabaseError;
         };
@@ -1987,7 +1987,7 @@ pub const Client = struct {
     }
 
     pub fn transact(self: *Client, comptime T: type, fn_tx: *const fn (*Transaction) errors.ResultT(T)) errors.ResultT(T) {
-        var tx = try self.befinTx();
+        var tx = try self.beginTx();
         errdefer {
             tx.rollback() catch |err| std.log.err("[sqlx] Transaction rollback failed: {}", .{err});
             if (tx.pool) |p| p.release(tx.conn);
@@ -2005,7 +2005,7 @@ pub const Client = struct {
     pub fn queryRow(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !T {
         var rows = try self.query(sql_str, args);
         defer rows.deinit();
-        for (&rows.rows) |*row| row.arena = &rows.arena;
+        for (rows.rows) |*row| row.arena = &rows.arena;
         if (rows.rows.len == 0) return error.NotFound;
         return try rows.rows[0].scan(self.allocator, T);
     }
@@ -2018,7 +2018,7 @@ pub const Client = struct {
     pub fn queryRowPartial(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !T {
         var rows = try self.query(sql_str, args);
         defer rows.deinit();
-        for (&rows.rows) |*row| row.arena = &rows.arena;
+        for (rows.rows) |*row| row.arena = &rows.arena;
         if (rows.rows.len == 0) return error.NotFound;
         return try rows.rows[0].scanPartial(self.allocator, T);
     }
@@ -2032,7 +2032,7 @@ pub const Client = struct {
         var rows = try self.query(sql_str, args);
         defer rows.deinit();
         // Fixup: Arena was on driver stack; now in caller's Rows. Update Row.arena pointers.
-        for (&rows.rows) |*row| row.arena = &rows.arena;
+        for (rows.rows) |*row| row.arena = &rows.arena;
         // Precompute column→field index once per query (O(F*C) once, not per row)
         const indices = if (rows.rows.len > 0)
             try buildColumnIndices(T, rows.rows[0].columns)
@@ -2196,7 +2196,7 @@ pub const Transaction = struct {
     pub fn queryRows(self: *Transaction, allocator: std.mem.Allocator, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
         var rows = try self.query(allocator, sql_str, args);
         defer rows.deinit();
-        for (&rows.rows) |*row| row.arena = &rows.arena;
+        for (rows.rows) |*row| row.arena = &rows.arena;
         const indices = if (rows.rows.len > 0)
             try buildColumnIndices(T, rows.rows[0].columns)
         else
@@ -2224,13 +2224,13 @@ pub const Transaction = struct {
 
 fn deepCopyStruct(allocator: std.mem.Allocator, comptime T: type, src: T) !T {
     var dst = src;
-    inline for (@typeInfo(T).@"struct".fields) |field| {
-        const FieldType = fft;
+    inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |dcn2, dct2| {
+        const FieldType = dct2;
         if (FieldType == []const u8) {
-            @field(dst, field.name) = try allocator.dupe(u8, @field(src, field.name));
+            @field(dst, dcn2) = try allocator.dupe(u8, @field(src, dcn2));
         } else if (@typeInfo(FieldType) == .optional and @typeInfo(FieldType).optional.child == []const u8) {
-            if (@field(src, field.name)) |s| {
-                @field(dst, field.name) = try allocator.dupe(u8, s);
+            if (@field(src, dcn2)) |s| {
+                @field(dst, dcn2) = try allocator.dupe(u8, s);
             }
         }
     }
@@ -2989,7 +2989,7 @@ test "sqlite transaction commit" {
     try client.connect();
     _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
 
-    var tx = try client.befinTx();
+    var tx = try client.beginTx();
     const insert = try tx.exec("INSERT INTO users (name) VALUES (?1)", &.{.{ .string = "Bob" }});
     try std.testing.expectEqual(@as(u64, 1), insert.rows_affected);
     try tx.commit();
@@ -3007,7 +3007,7 @@ test "sqlite transaction rollback" {
     try client.connect();
     _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
 
-    var tx = try client.befinTx();
+    var tx = try client.beginTx();
     _ = try tx.exec("INSERT INTO users (name) VALUES (?1)", &.{.{ .string = "Charlie" }});
     try tx.rollback();
 
@@ -3314,13 +3314,13 @@ test "sqlite conn interface lifecycle" {
     try std.testing.expectEqual(@as(u64, 0), create.rows_affected);
 
     // Transaction commit through Conn interface
-    try conn.befin();
+    try conn.begin();
     const insert = try conn.exec("INSERT INTO lifecycle_test (id) VALUES (1)", &.{});
     try std.testing.expectEqual(@as(i64, 1), insert.last_insert_id.?);
     try conn.commit();
 
     // Transaction rollback through Conn interface
-    try conn.befin();
+    try conn.begin();
     _ = try conn.exec("INSERT INTO lifecycle_test (id) VALUES (2)", &.{});
     try conn.rollback();
 
