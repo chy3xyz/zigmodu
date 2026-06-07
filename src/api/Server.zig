@@ -519,24 +519,24 @@ pub const Context = struct {
         const t_info = @typeInfo(T);
         if (t_info != .@"struct") @compileError("T must be a struct");
 
-        inline for (t_info.@"struct".fields) |field| {
-            const has_source = @hasField(SourcesType, field.name);
+        inline for (t_info.@"struct".field_names, t_info.@"struct".field_types) |field_name, field_typ| {
+            const has_source = @hasField(SourcesType, field_name);
             if (!has_source) continue;
 
-            const source: FieldSource = @field(sources, field.name);
+            const source: FieldSource = @field(sources, field_name);
             const value_str: ?[]const u8 = switch (source) {
-                .path => self.params.get(field.name),
-                .query => self.query.get(field.name),
-                .form => if (self.form) |f| f.get(field.name) else null,
-                .header => self.headers.get(field.name),
+                .path => self.params.get(field_name),
+                .query => self.query.get(field_name),
+                .form => if (self.form) |f| f.get(field_name) else null,
+                .header => self.headers.get(field_name),
             };
 
             if (value_str) |v| {
-                @field(req, field.name) = try parseValue(field.type, v);
+                @field(req, field_name) = try parseValue(field_typ, v);
             } else {
                 // If field is optional, leave as null
-                if (@typeInfo(field.type) == .optional) {
-                    @field(req, field.name) = null;
+                if (@typeInfo(field_typ) == .optional) {
+                    @field(req, field_name) = null;
                 } else {
                     return error.MissingParameter;
                 }
@@ -1625,8 +1625,8 @@ fn deepCopy(value: anytype, allocator: std.mem.Allocator) !@TypeOf(value) {
     switch (@typeInfo(T)) {
         .@"struct" => |s| {
             var copy: T = undefined;
-            inline for (s.fields) |f| {
-                @field(copy, f.name) = try deepCopy(@field(value, f.name), allocator);
+            inline for (s.field_names) |f_name| {
+                @field(copy, f_name) = try deepCopy(@field(value, f_name), allocator);
             }
             return copy;
         },

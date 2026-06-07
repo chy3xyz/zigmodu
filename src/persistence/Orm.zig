@@ -105,20 +105,20 @@ pub fn Model(comptime T: type) type {
 
         pub const primary_key = blk: {
             if (@hasDecl(T, "sql_primary_key")) break :blk T.sql_primary_key;
-            for (info.@"struct".fields) |field| {
-                if (std.mem.eql(u8, field.name, "id")) break :blk "id";
+            for (info.@"struct".field_names) |fname| {
+                if (std.mem.eql(u8, fname, "id")) break :blk "id";
             }
-            for (info.@"struct".fields) |field| {
-                if (field.name.len > 3 and std.mem.endsWith(u8, field.name, "_id")) break :blk field.name;
+            for (info.@"struct".field_names) |fname| {
+                if (fname.len > 3 and std.mem.endsWith(u8, fname, "_id")) break :blk fname;
             }
-            break :blk info.@"struct".fields[0].name;
+            break :blk info.@"struct".field_names[0];
         };
 
         /// Struct field names (camelCase if model uses camelCase, otherwise snake_case)
         pub const fields = blk: {
             var names: []const []const u8 = &[_][]const u8{};
-            for (info.@"struct".fields) |field| {
-                names = names ++ .{field.name};
+            for (info.@"struct".field_names) |fname| {
+                names = names ++ .{fname};
             }
             break :blk names;
         };
@@ -126,8 +126,8 @@ pub fn Model(comptime T: type) type {
         /// SQL column names (always snake_case for camelCase models, otherwise same as fields)
         pub const sql_columns = if (camel) blk: {
             var names: []const []const u8 = &[_][]const u8{};
-            for (info.@"struct".fields) |field| {
-                names = names ++ .{camelToSnake(field.name)};
+            for (info.@"struct".field_names) |fname| {
+                names = names ++ .{camelToSnake(fname)};
             }
             break :blk names;
         } else fields;
@@ -140,23 +140,23 @@ fn fieldToBackendValue(comptime B: type, value: anytype) B.Value {
 
 fn structToBackendArgs(comptime B: type, comptime T: type, allocator: std.mem.Allocator, entity: T) ![]B.Value {
     const info = @typeInfo(T).@"struct";
-    const args = try allocator.alloc(B.Value, info.fields.len);
+    const args = try allocator.alloc(B.Value, info.field_names.len);
     errdefer allocator.free(args);
-    inline for (info.fields, 0..) |field, i| {
-        args[i] = fieldToBackendValue(B, @field(entity, field.name));
+    inline for (info.field_names, 0..) |fname, i| {
+        args[i] = fieldToBackendValue(B, @field(entity, fname));
     }
     return args;
 }
 
 fn structToBackendArgsWithId(comptime B: type, comptime T: type, allocator: std.mem.Allocator, entity: T, comptime pk: []const u8) ![]B.Value {
     const info = @typeInfo(T).@"struct";
-    const args = try allocator.alloc(B.Value, info.fields.len);
+    const args = try allocator.alloc(B.Value, info.field_names.len);
     errdefer allocator.free(args);
     var idx: usize = 0;
-    inline for (info.fields) |field| {
-        const is_pk = comptime std.mem.eql(u8, field.name, pk);
+    inline for (info.field_names) |fname| {
+        const is_pk = comptime std.mem.eql(u8, fname, pk);
         if (!is_pk) {
-            args[idx] = fieldToBackendValue(B, @field(entity, field.name));
+            args[idx] = fieldToBackendValue(B, @field(entity, fname));
             idx += 1;
         }
     }
@@ -351,17 +351,17 @@ pub fn Orm(comptime B: type) type {
                     var arg_list: std.ArrayList(B.Value) = std.ArrayList(B.Value).empty;
                     defer arg_list.deinit(alloc);
                     var first = true;
-                    inline for (info.fields, 0..) |field, i| {
-                        if (comptime std.mem.eql(u8, field.name, "id")) continue;
-                        if (comptime std.mem.eql(u8, field.name, "create_time")) continue;
-                        if (comptime std.mem.eql(u8, field.name, "update_time")) continue;
-                        if (comptime std.mem.eql(u8, field.name, "creator")) continue;
-                        if (comptime std.mem.eql(u8, field.name, "updater")) continue;
-                        if (comptime std.mem.eql(u8, field.name, "deleted")) continue;
+                    inline for (info.field_names, 0..) |fname, i| {
+                        if (comptime std.mem.eql(u8, fname, "id")) continue;
+                        if (comptime std.mem.eql(u8, fname, "create_time")) continue;
+                        if (comptime std.mem.eql(u8, fname, "update_time")) continue;
+                        if (comptime std.mem.eql(u8, fname, "creator")) continue;
+                        if (comptime std.mem.eql(u8, fname, "updater")) continue;
+                        if (comptime std.mem.eql(u8, fname, "deleted")) continue;
                         if (!first) try sql_buf.appendSlice(alloc, ", ");
                         first = false;
                         try sql_buf.appendSlice(alloc, cols[i]);
-                        try arg_list.append(alloc, fieldToBackendValue(B, @field(entity, field.name)));
+                        try arg_list.append(alloc, fieldToBackendValue(B, @field(entity, fname)));
                     }
                     try sql_buf.appendSlice(alloc, ") VALUES (");
                     for (0..arg_list.items.len) |j| {

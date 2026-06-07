@@ -171,12 +171,13 @@ pub const Conn = struct {
 /// Precompute struct-field → column-index mapping once per query.
 /// Eliminates O(F*C) string comparisons per row — each row scan
 /// becomes O(F) direct array indexing instead of O(F*C) linear probes.
-fn buildColumnIndices(comptime T: type, columns: []const []const u8) ![std.meta.fields(T).len]?usize {
-    const fields = std.meta.fields(T);
-    var indices: [fields.len]?usize = @splat(@as(?usize, null));
-    inline for (fields, 0..) |field, fi| {
+fn buildColumnIndices(allocator: std.mem.Allocator, comptime T: type, columns: []const []const u8) ![]?usize {
+    const names = std.meta.fieldNames(T);
+    const indices = try allocator.alloc(?usize, names.len);
+    for (indices) |*idx| idx.* = null;
+    for (names, 0..) |name, fi| {
         for (columns, 0..) |col, ci| {
-            if (std.mem.eql(u8, col, field.name)) {
+            if (std.mem.eql(u8, col, name)) {
                 indices[fi] = ci;
                 break;
             }
@@ -186,13 +187,13 @@ fn buildColumnIndices(comptime T: type, columns: []const []const u8) ![std.meta.
 }
 
 /// Scan a struct Row, optionally using precomputed column indices for O(1) field lookup.
-fn scanStruct(allocator: std.mem.Allocator, comptime T: type, row: Row, partial: bool, indices: ?[std.meta.fields(T).len]?usize) !T {
+fn scanStruct(allocator: std.mem.Allocator, comptime T: type, row: Row, partial: bool, indices: ?[]?usize) !T {
     const info = @typeInfo(T);
     if (info != .@"struct") @compileError("scanStruct only supports structs, got " ++ @typeName(T));
 
     var result: T = undefined;
-    inline for (info.@"struct".fields, 0..) |field, fi| {
-        const FieldType = field.type;
+    const fn_names = info.@"struct".field_names; const fn_types = info.@"struct".field_types; const fn_attrs = info.@"struct".field_attrs; inline for (fn_names, fn_types, fn_attrs, 0..) |fname, ft, _, fi| {
+        const FieldType = ft;
         const is_optional = @typeInfo(FieldType) == .optional;
         const BaseType = if (is_optional) @typeInfo(FieldType).optional.child else FieldType;
         const is_string = BaseType == []const u8;
@@ -204,41 +205,41 @@ fn scanStruct(allocator: std.mem.Allocator, comptime T: type, row: Row, partial:
                 const raw_val = row.values[c];
                 if (raw_val == null or raw_val.? == .null) {
                     if (is_optional) {
-                        @field(result, field.name) = null;
+                        @field(result, fname) = null;
                     } else if (partial) {
-                        @field(result, field.name) = &[_]u8{};
+                        @field(result, fname) = &[_]u8{};
                     } else {
                         return error.NotFound;
                     }
                 } else {
                     const str = raw_val.?.string;
-                    @field(result, field.name) = allocator.dupe(u8, str) catch return error.DatabaseError;
+                    @field(result, fname) = allocator.dupe(u8, str) catch return error.DatabaseError;
                 }
             } else {
                 // Fallback: linear scan (no column index provided)
                 found: {
                     for (row.columns, 0..) |col, ci2| {
-                        if (std.mem.eql(u8, col, field.name)) {
+                        if (std.mem.eql(u8, col, fname)) {
                             const raw_val = row.values[ci2];
                             if (raw_val == null or raw_val.? == .null) {
                                 if (is_optional) {
-                                    @field(result, field.name) = null;
+                                    @field(result, fname) = null;
                                 } else if (partial) {
-                                    @field(result, field.name) = &[_]u8{};
+                                    @field(result, fname) = &[_]u8{};
                                 } else {
                                     return error.NotFound;
                                 }
                             } else {
                                 const str = raw_val.?.string;
-                                @field(result, field.name) = allocator.dupe(u8, str) catch return error.DatabaseError;
+                                @field(result, fname) = allocator.dupe(u8, str) catch return error.DatabaseError;
                             }
                             break :found;
                         }
                     }
                     if (is_optional) {
-                        @field(result, field.name) = null;
+                        @field(result, fname) = null;
                     } else if (partial) {
-                        @field(result, field.name) = &[_]u8{};
+                        @field(result, fname) = &[_]u8{};
                     } else {
                         return error.NotFound;
                     }
@@ -256,24 +257,24 @@ fn scanStruct(allocator: std.mem.Allocator, comptime T: type, row: Row, partial:
                 }
             }
             break :blk null;
-        } else row.get(field.name);
+        } else row.get(fname);
 
         if (is_optional) {
             const ChildType = BaseType;
             if (val == null or val.? == .null) {
-                @field(result, field.name) = null;
+                @field(result, fname) = null;
             } else {
-                @field(result, field.name) = try valueToType(allocator, ChildType, val.?);
+                @field(result, fname) = try valueToType(allocator, ChildType, val.?);
             }
         } else {
             if (val == null or val.? == .null) {
                 if (partial) {
-                    @field(result, field.name) = std.mem.zeroes(FieldType);
+                    @field(result, fname) = std.mem.zeroes(FieldType);
                 } else {
                     return error.NotFound;
                 }
             } else {
-                @field(result, field.name) = try valueToType(allocator, FieldType, val.?);
+                @field(result, fname) = try valueToType(allocator, FieldType, val.?);
             }
         }
     }
@@ -348,12 +349,12 @@ fn valueToType(allocator: std.mem.Allocator, comptime T: type, val: Value) !T {
 pub fn freeScanned(allocator: std.mem.Allocator, comptime T: type, val: T) void {
     const info = @typeInfo(T);
     if (info != .@"struct") return;
-    inline for (info.@"struct".fields) |field| {
-        const FieldType = field.type;
+    inline for (info.@"struct".field_names, info.@"struct".field_types) |fn2, fft2| {
+        const FieldType = fft2;
         if (FieldType == []const u8) {
-            allocator.free(@field(val, field.name));
+            allocator.free(@field(val, fn2));
         } else if (@typeInfo(FieldType) == .optional and @typeInfo(FieldType).optional.child == []const u8) {
-            if (@field(val, field.name)) |s| allocator.free(s);
+            if (@field(val, fn2)) |s| allocator.free(s);
         }
     }
 }
@@ -903,13 +904,13 @@ pub const PostgresConn = struct {
         }
         if (count == 0) return allocZ(allocator, sql) catch null;
 
-        // Calculate exact size: original len minus ? chars plus $N replacements
+        // Calculate exact size: orifinal len minus ? chars plus $N replacements
         var exact: usize = sql.len - count;
         var n: usize = 0;
         while (n < count) : (n += 1) {
-            // Each ? becomes "$N" — 1 digit for N<10, 2 for <100, etc.
-            const digits = if (n + 1 < 10) @as(usize, 2) else if (n + 1 < 100) @as(usize, 3) else @as(usize, 4);
-            exact += digits;
+            // Each ? becomes "$N" — 1 difit for N<10, 2 for <100, etc.
+            const difits = if (n + 1 < 10) @as(usize, 2) else if (n + 1 < 100) @as(usize, 3) else @as(usize, 4);
+            exact += difits;
         }
 
         const buf = allocator.allocSentinel(u8, exact, 0) catch return null;
@@ -1547,7 +1548,7 @@ const ConnPool = struct {
         };
     }
 
-    /// Attempt to get a healthy connection with reconnect logic
+    /// Attempt to get a healthy connection with reconnect lofic
     fn getHealthyConn(self: *ConnPool) !Conn {
         var attempts: u32 = 0;
         while (attempts < self.max_reconnect_attempts) : (attempts += 1) {
@@ -2005,7 +2006,7 @@ pub const Client = struct {
     pub fn queryRow(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !T {
         var rows = try self.query(sql_str, args);
         defer rows.deinit();
-        for (&rows.rows) |*row| row.arena = &rows.arena;
+        for (rows.rows) |*row| row.arena = &rows.arena;
         if (rows.rows.len == 0) return error.NotFound;
         return try rows.rows[0].scan(self.allocator, T);
     }
@@ -2018,7 +2019,7 @@ pub const Client = struct {
     pub fn queryRowPartial(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !T {
         var rows = try self.query(sql_str, args);
         defer rows.deinit();
-        for (&rows.rows) |*row| row.arena = &rows.arena;
+        for (rows.rows) |*row| row.arena = &rows.arena;
         if (rows.rows.len == 0) return error.NotFound;
         return try rows.rows[0].scanPartial(self.allocator, T);
     }
@@ -2032,10 +2033,10 @@ pub const Client = struct {
         var rows = try self.query(sql_str, args);
         defer rows.deinit();
         // Fixup: Arena was on driver stack; now in caller's Rows. Update Row.arena pointers.
-        for (&rows.rows) |*row| row.arena = &rows.arena;
+        for (rows.rows) |*row| row.arena = &rows.arena;
         // Precompute column→field index once per query (O(F*C) once, not per row)
         const indices = if (rows.rows.len > 0)
-            try buildColumnIndices(T, rows.rows[0].columns)
+            try buildColumnIndices(self.allocator, T, rows.rows[0].columns)
         else
             null;
         const result = try self.allocator.alloc(T, rows.rows.len);
@@ -2060,7 +2061,7 @@ pub const Client = struct {
         var rows = try self.query(sql_str, args);
         defer rows.deinit();
         const indices = if (rows.rows.len > 0)
-            try buildColumnIndices(T, rows.rows[0].columns)
+            try buildColumnIndices(self.allocator, T, rows.rows[0].columns)
         else
             null;
         const result = try self.allocator.alloc(T, rows.rows.len);
@@ -2196,9 +2197,9 @@ pub const Transaction = struct {
     pub fn queryRows(self: *Transaction, allocator: std.mem.Allocator, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
         var rows = try self.query(allocator, sql_str, args);
         defer rows.deinit();
-        for (&rows.rows) |*row| row.arena = &rows.arena;
+        for (rows.rows) |*row| row.arena = &rows.arena;
         const indices = if (rows.rows.len > 0)
-            try buildColumnIndices(T, rows.rows[0].columns)
+            try buildColumnIndices(self.allocator, T, rows.rows[0].columns)
         else
             null;
         const result = try allocator.alloc(T, rows.rows.len);
@@ -2224,13 +2225,13 @@ pub const Transaction = struct {
 
 fn deepCopyStruct(allocator: std.mem.Allocator, comptime T: type, src: T) !T {
     var dst = src;
-    inline for (@typeInfo(T).@"struct".fields) |field| {
-        const FieldType = field.type;
+    inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |dcn2, dct2| {
+        const FieldType = dct2;
         if (FieldType == []const u8) {
-            @field(dst, field.name) = try allocator.dupe(u8, @field(src, field.name));
+            @field(dst, dcn2) = try allocator.dupe(u8, @field(src, dcn2));
         } else if (@typeInfo(FieldType) == .optional and @typeInfo(FieldType).optional.child == []const u8) {
-            if (@field(src, field.name)) |s| {
-                @field(dst, field.name) = try allocator.dupe(u8, s);
+            if (@field(src, dcn2)) |s| {
+                @field(dst, dcn2) = try allocator.dupe(u8, s);
             }
         }
     }
@@ -2301,7 +2302,7 @@ pub const CachedConn = struct {
             return try deepCopyStruct(self.allocator, T, parsed.value);
         }
         const result = try self.client.queryRow(T, sql_str, args);
-        const json = std.json.Stringify.valueAlloc(self.allocator, result, .{}) catch {
+        const json = std.json.Strinfify.valueAlloc(self.allocator, result, .{}) catch {
             return result;
         };
         defer self.allocator.free(json);
@@ -2326,7 +2327,7 @@ pub const CachedConn = struct {
             return try deepCopyStruct(self.allocator, T, parsed.value);
         }
         const result = try self.client.queryRowPartial(T, sql_str, args);
-        const json = std.json.Stringify.valueAlloc(self.allocator, result, .{}) catch {
+        const json = std.json.Strinfify.valueAlloc(self.allocator, result, .{}) catch {
             return result;
         };
         defer self.allocator.free(json);
@@ -2359,7 +2360,7 @@ pub const CachedConn = struct {
             return result;
         }
         const result = try self.client.queryRows(T, sql_str, args);
-        const json = std.json.Stringify.valueAlloc(self.allocator, result, .{}) catch {
+        const json = std.json.Strinfify.valueAlloc(self.allocator, result, .{}) catch {
             return result;
         };
         defer self.allocator.free(json);
@@ -2392,7 +2393,7 @@ pub const CachedConn = struct {
             return result;
         }
         const result = try self.client.queryRowsPartial(T, sql_str, args);
-        const json = std.json.Stringify.valueAlloc(self.allocator, result, .{}) catch {
+        const json = std.json.Strinfify.valueAlloc(self.allocator, result, .{}) catch {
             return result;
         };
         defer self.allocator.free(json);
