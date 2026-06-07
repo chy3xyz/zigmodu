@@ -289,6 +289,16 @@ fn valueToType(allocator: std.mem.Allocator, comptime T: type, val: Value) !T {
             .string => |s| std.fmt.parseInt(i32, s, 10) catch return error.DatabaseError,
             else => error.DatabaseError,
         },
+        i16 => switch (val) {
+            .int => |v| @intCast(v),
+            .string => |s| std.fmt.parseInt(i16, s, 10) catch return error.DatabaseError,
+            else => error.DatabaseError,
+        },
+        i8 => switch (val) {
+            .int => |v| @intCast(v),
+            .string => |s| std.fmt.parseInt(i8, s, 10) catch return error.DatabaseError,
+            else => error.DatabaseError,
+        },
         u64 => switch (val) {
             .int => |v| @intCast(v),
             .string => |s| std.fmt.parseInt(u64, s, 10) catch return error.DatabaseError,
@@ -297,6 +307,16 @@ fn valueToType(allocator: std.mem.Allocator, comptime T: type, val: Value) !T {
         u32 => switch (val) {
             .int => |v| @intCast(v),
             .string => |s| std.fmt.parseInt(u32, s, 10) catch return error.DatabaseError,
+            else => error.DatabaseError,
+        },
+        u16 => switch (val) {
+            .int => |v| @intCast(v),
+            .string => |s| std.fmt.parseInt(u16, s, 10) catch return error.DatabaseError,
+            else => error.DatabaseError,
+        },
+        u8 => switch (val) {
+            .int => |v| @intCast(v),
+            .string => |s| std.fmt.parseInt(u8, s, 10) catch return error.DatabaseError,
             else => error.DatabaseError,
         },
         f64 => switch (val) {
