@@ -21,8 +21,9 @@ pub const TenantInterceptor = struct {
     pub fn hasTenantField(comptime T: type) bool {
         const info = @typeInfo(T);
         if (info != .@"struct") return false;
-        inline for (info.@"struct".fields) |field| {
-            if (std.mem.eql(u8, field.name, TenantContext.TENANT_COLUMN)) return true;
+        inline for (info.@"struct".field_names, info.@"struct".field_types, info.@"struct".field_attrs, 0..) |field_name, field_typ, field_attr, fi| {
+            _ = field_typ; _ = field_attr; _ = fi;
+            if (std.mem.eql(u8, field_name, TenantContext.TENANT_COLUMN)) return true;
         }
         return false;
     }

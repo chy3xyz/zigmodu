@@ -96,9 +96,8 @@ pub const StructuredLogger = struct {
         // [...]
         const fields_info = @typeInfo(@TypeOf(fields));
         if (fields_info == .@"struct" and fields_info.@"struct".is_tuple == false) {
-            inline for (fields_info.@"struct".fields) |field| {
-                const key = field.name;
-                const value = @field(fields, field.name);
+            inline for (fields_info.@"struct".field_names) |key| {
+                const value = @field(fields, key);
                 const value_str = try std.fmt.allocPrint(self.allocator, "{any}", .{value});
                 try entry.fields.put(key, value_str);
             }

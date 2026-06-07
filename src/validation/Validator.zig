@@ -126,8 +126,7 @@ pub fn validateStruct(allocator: std.mem.Allocator, value: anytype, comptime rul
     const r_info = @typeInfo(RulesType);
     if (r_info != .@"struct") @compileError("rules must be a struct literal");
 
-    inline for (r_info.@"struct".fields) |r_field| {
-        const field_name = r_field.name;
+    inline for (r_info.@"struct".field_names) |field_name| {
         if (!@hasField(T, field_name)) {
             @compileError("validation rules contain unknown field: " ++ field_name);
         }
