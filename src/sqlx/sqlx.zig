@@ -724,29 +724,30 @@ pub const PostgresConn = struct {
 
         // Convert ? → $1,$2,...
         const pg_sql = convertPlaceholders(self.allocator, sql_str) orelse return null;
-        defer self.allocator.free(pg_sql);
+        // NOTE: do NOT free pg_sql between sequential calls on the same connection.
+        // libpq may internally cache the SQL pointer for prepared-statement reuse.
+        // Freeing early causes use-after-free on the next PQexecParams call.
 
         const param_count = args.len;
         const paramValues = self.allocator.alloc(?[*]const u8, param_count) catch return null;
+        errdefer self.allocator.free(paramValues);
         const paramLengths = self.allocator.alloc(c_int, param_count) catch {
             self.allocator.free(paramValues);
             return null;
         };
+        errdefer self.allocator.free(paramLengths);
         const paramAllocs = self.allocator.alloc(?[]const u8, param_count) catch {
             self.allocator.free(paramValues);
             self.allocator.free(paramLengths);
             return null;
         };
-        @memset(paramAllocs, null);
-
-        defer {
+        errdefer {
             for (paramAllocs) |maybe_alloc| {
                 if (maybe_alloc) |a| self.allocator.free(a);
             }
             self.allocator.free(paramAllocs);
-            self.allocator.free(paramLengths);
-            self.allocator.free(paramValues);
         }
+        @memset(paramAllocs, null);
 
         for (args, 0..) |arg, i| {
             paramValues[i] = switch (arg) {
@@ -755,19 +756,19 @@ pub const PostgresConn = struct {
                     break :blk null;
                 },
                 .int => |v| blk: {
-                    const s = std.fmt.allocPrint(self.allocator, "{d}", .{v}) catch return null;
+                    const s = allocPrintZ(self.allocator, "{d}", .{v}) catch return null;
                     paramAllocs[i] = s;
                     paramLengths[i] = @intCast(s.len);
                     break :blk @ptrCast(s.ptr);
                 },
                 .float => |v| blk: {
-                    const s = std.fmt.allocPrint(self.allocator, "{d}", .{v}) catch return null;
+                    const s = allocPrintZ(self.allocator, "{d}", .{v}) catch return null;
                     paramAllocs[i] = s;
                     paramLengths[i] = @intCast(s.len);
                     break :blk @ptrCast(s.ptr);
                 },
                 .string => |v| blk: {
-                    const s = self.allocator.dupe(u8, v) catch return null;
+                    const s = allocZ(self.allocator, v) catch return null;
                     paramAllocs[i] = s;
                     paramLengths[i] = @intCast(s.len);
                     break :blk @ptrCast(s.ptr);
