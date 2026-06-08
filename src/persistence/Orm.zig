@@ -236,7 +236,7 @@ fn buildSelectPage(allocator: std.mem.Allocator, table: []const u8, sql_cols: []
     defer buf.deinit(allocator);
     try buf.appendSlice(allocator, "SELECT ");
     try appendColumnList(&buf, allocator, sql_cols, fields, camel);
-    const offset = page * size;
+    const offset = if (page > 0) (page - 1) * size else 0;
     try buf.print(allocator, " FROM {s} LIMIT {d} OFFSET {d}", .{ table, size, offset });
     return allocator.dupe(u8, buf.items);
 }
@@ -331,7 +331,7 @@ pub fn Orm(comptime B: type) type {
                     const count_row = try self.orm.backend.queryRow(struct { count: i64 }, count_sql, args);
                     const total: usize = if (count_row) |c| @intCast(c.count) else 0;
 
-                    const offset = page * size;
+                    const offset = if (page > 0) (page - 1) * size else 0;
                     const data_sql = try std.fmt.allocPrint(alloc, "SELECT * FROM {s} {s} ORDER BY {s} DESC LIMIT {d},{d}", .{ meta.table_name, where_sql, meta.primary_key, offset, size });
                     defer alloc.free(data_sql);
                     const items = try self.orm.backend.queryRows(T, data_sql, args);

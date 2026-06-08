@@ -47,6 +47,12 @@ fn bufPrintZ(buf: []u8, comptime fmt: []const u8, args: anytype) ![:0]u8 {
     return buf[0..written.len :0];
 }
 
+/// Allocate a formatted null-terminated string.
+fn allocPrintZ(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ![:0]u8 {
+    const s = try std.fmt.allocPrint(allocator, fmt, args);
+    return try allocZ(allocator, s);
+}
+
 /// SQL value types for parameterized queries
 pub const Value = union(enum) {
     null,
@@ -1335,30 +1341,29 @@ pub const PostgresStmt = struct {
 
     fn execParamsPrepared(self: *PostgresStmt, args: []const Value) ?*libpq_c.PGresult {
         if (self.conn == null) return null;
-        const paramValues = self.allocator.alloc(?[*]const u8, args.len) catch return null;
+
+        // Arena holds all null-terminated string copies alive until PQexecPrepared completes
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        const paramValues = aa.alloc(?[*:0]const u8, args.len) catch return null;
         for (args, 0..) |arg, i| {
             paramValues[i] = switch (arg) {
                 .null => null,
-                .int => |v| blk: {
-                    const s = std.fmt.allocPrint(self.allocator, "{d}", .{v}) catch {
-                        self.allocator.free(paramValues);
-                        return null;
-                    };
-                    break :blk @ptrCast(s.ptr);
+                .int => |v| allocPrintZ(aa, "{d}", .{v}) catch {
+                    return null;
                 },
-                .float => |v| blk: {
-                    const s = std.fmt.allocPrint(self.allocator, "{d}", .{v}) catch {
-                        self.allocator.free(paramValues);
-                        return null;
-                    };
-                    break :blk @ptrCast(s.ptr);
+                .float => |v| allocPrintZ(aa, "{d}", .{v}) catch {
+                    return null;
                 },
-                .string => |v| @ptrCast(v.ptr),
-                .bool => |v| if (v) @ptrCast("t") else @ptrCast("f"),
+                .string => |v| allocZ(aa, v) catch {
+                    return null;
+                },
+                .bool => |v| if (v) @as(?[*:0]const u8, @ptrCast("t")) else @ptrCast("f"),
             };
         }
         const res = libpq_c.PQexecPrepared(self.conn, @ptrCast(self.name.ptr), @intCast(args.len), @ptrCast(paramValues.ptr), null, null, 0);
-        self.allocator.free(paramValues);
         return res;
     }
 
