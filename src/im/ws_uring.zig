@@ -1,6 +1,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+// io_uring opcode constants — defined locally because std.os.linux
+// does not expose them on all architectures (e.g. aarch64).
+const IORING_OP_READ: u8 = 22;
+const IORING_OP_WRITE: u8 = 23;
+
 const linux = if (builtin.os.tag == .linux) std.os.linux else struct {
     pub const fd_t = i32;
     pub const io_uring_cqe = extern struct { user_data: u64 = 0, res: i32 = 0, flags: u32 = 0 };
@@ -8,8 +13,6 @@ const linux = if (builtin.os.tag == .linux) std.os.linux else struct {
         opcode: u8 = 0, flags: u8 = 0, ioprio: u16 = 0, fd: i32 = 0,
         off: u64 = 0, addr: u64 = 0, len: u32 = 0, user_data: u64 = 0,
     };
-    pub const IORING_OP_READ: u8 = 22;
-    pub const IORING_OP_WRITE: u8 = 23;
     pub fn close(_: i32) void {}
     pub fn write(_: i32, _: [*]const u8, _: usize) usize { return 0; }
 };
@@ -143,7 +146,7 @@ pub const WsUring = struct {
         const sqe = try self.ring.get_sqe();
         const sqe_bytes: [*]u8 = @ptrCast(sqe);
         @memset(sqe_bytes[0..@sizeOf(linux.io_uring_sqe)], 0);
-        sqe.opcode = linux.IORING_OP_READ;
+        sqe.opcode = IORING_OP_READ;
         sqe.fd = conn.fd;
         sqe.addr = @intFromPtr(&conn.buf[conn.data_offset + conn.data_len]);
         sqe.len = @intCast(Conn.BufSize - conn.data_offset - conn.data_len);
