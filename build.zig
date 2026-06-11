@@ -24,6 +24,7 @@ fn detectPqPaths(b: *std.Build, allocator: std.mem.Allocator) CLibPaths {
             };
         }
     } else if (host_target.os.tag == .linux) {
+        const lib_dir = if (host_target.cpu.arch == .aarch64) "/usr/lib/aarch64-linux-gnu" else "/usr/lib/x86_64-linux-gnu";
         const candidates = &[_][]const u8{
             "/usr/include/postgresql",
             "/usr/include/pgsql",
@@ -31,10 +32,7 @@ fn detectPqPaths(b: *std.Build, allocator: std.mem.Allocator) CLibPaths {
         };
         for (candidates) |c| {
             if (dirExists(b, c)) {
-                return .{
-                    .include = c,
-                    .lib = "/usr/lib/x86_64-linux-gnu",
-                };
+                return .{ .include = c, .lib = lib_dir };
             }
         }
     }
@@ -63,6 +61,7 @@ fn detectMysqlPaths(b: *std.Build, allocator: std.mem.Allocator) CLibPaths {
             }
         }
     } else if (host_target.os.tag == .linux) {
+        const lib_dir = if (host_target.cpu.arch == .aarch64) "/usr/lib/aarch64-linux-gnu" else "/usr/lib/x86_64-linux-gnu";
         const candidates = &[_][]const u8{
             "/usr/include/mariadb",
             "/usr/include/mysql",
@@ -70,10 +69,7 @@ fn detectMysqlPaths(b: *std.Build, allocator: std.mem.Allocator) CLibPaths {
         };
         for (candidates) |c| {
             if (dirExists(b, c)) {
-                return .{
-                    .include = c,
-                    .lib = "/usr/lib/x86_64-linux-gnu",
-                };
+                return .{ .include = c, .lib = lib_dir };
             }
         }
     }
