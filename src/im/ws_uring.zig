@@ -146,7 +146,7 @@ pub const WsUring = struct {
         const sqe = try self.ring.get_sqe();
         const sqe_bytes: [*]u8 = @ptrCast(sqe);
         @memset(sqe_bytes[0..@sizeOf(linux.io_uring_sqe)], 0);
-        sqe.opcode = IORING_OP_READ;
+        sqe.opcode = if (@typeInfo(@TypeOf(sqe.opcode)) == .Enum) @enumFromInt(IORING_OP_READ) else IORING_OP_READ;
         sqe.fd = conn.fd;
         sqe.addr = @intFromPtr(&conn.buf[conn.data_offset + conn.data_len]);
         sqe.len = @intCast(Conn.BufSize - conn.data_offset - conn.data_len);
