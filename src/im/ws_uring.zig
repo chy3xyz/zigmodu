@@ -141,7 +141,8 @@ pub const WsUring = struct {
     /// Submit a 4KB read at the current buffer tail.
     fn submitRead(self: *Self, conn: *Conn) !void {
         const sqe = try self.ring.get_sqe();
-        @memset(std.mem.asBytes(&sqe), 0);
+        const sqe_bytes: [*]u8 = @ptrCast(sqe);
+        @memset(sqe_bytes[0..@sizeOf(linux.io_uring_sqe)], 0);
         sqe.opcode = linux.IORING_OP_READ;
         sqe.fd = conn.fd;
         sqe.addr = @intFromPtr(&conn.buf[conn.data_offset + conn.data_len]);
