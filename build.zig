@@ -116,11 +116,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Create and export the zigmodu module for dependent packages
+    // Create and export the zigmodu module for dependent packages.
+    // Zig 0.17-dev.813: @cImport no longer implicitly links libc.
     const zigmodu_mod = b.addModule("zigmodu", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
 
     linkDbLibs(zigmodu_mod, b);
