@@ -580,34 +580,11 @@ pub const PostgresConn = struct {
 
     /// Connect using explicit parameters via dlsym (bypasses Zig C ABI issues)
     pub fn connectParams(allocator: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, pass: []const u8, db: []const u8) !PostgresConn {
-        const host_c = try allocZ(allocator, host);
-        defer allocator.free(host_c);
-        const port_str_buf = try allocator.alloc(u8, 8);
-        const port_str = try bufPrintZ(port_str_buf, "{d}", .{port});
-        defer allocator.free(port_str_buf);
-        const user_c = try allocZ(allocator, user);
-        defer allocator.free(user_c);
-        const pass_c = try allocZ(allocator, pass);
-        defer allocator.free(pass_c);
-        const db_c = try allocZ(allocator, db);
-        defer allocator.free(db_c);
-
-        const empty_opt = "\x00";
-        const conn = libpq_c.PQsetdbLogin(
-            host_c,
-            port_str,
-            empty_opt,
-            empty_opt,
-            db_c,
-            user_c,
-            pass_c,
-        );
-        if (conn == null) return error.DatabaseError;
-        if (libpq_c.PQstatus(conn) != libpq_c.ConnStatusType.CONNECTION_OK) {
-            libpq_c.PQfinish(conn);
-            return error.DatabaseError;
-        }
-        return .{ .conn = conn, .allocator = allocator, .stmt_cache = std.StringHashMap([]const u8).init(allocator) };
+        // Use PQconnectdb with conninfo string so we can set sslmode
+        const sslmode = if (std.c.getenv("PGSSLMODE")) |v| std.mem.span(v) else "require";
+        const conninfo = try std.fmt.allocPrint(allocator, "host={s} port={d} dbname={s} user={s} password={s} sslmode={s}", .{ host, port, db, user, pass, sslmode });
+        defer allocator.free(conninfo);
+        return connect(allocator, conninfo);
     }
 
     /// Null-terminated string connect
@@ -618,6 +595,8 @@ pub const PostgresConn = struct {
         if (conn == null) return error.DatabaseError;
         const status = libpq_c.PQstatus(conn);
         if (status != .CONNECTION_OK) {
+            const err_msg = libpq_c.PQerrorMessage(conn);
+            std.log.err("PG connect failed (status={s}): {s}", .{ @tagName(status), std.mem.span(err_msg) });
             libpq_c.PQfinish(conn);
             return error.DatabaseError;
         }
