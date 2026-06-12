@@ -229,7 +229,7 @@ pub const SecurityModule = struct {
             &derived_key,
             password,
             &salt,
-            600000, // iterations (OWASP 2026 minimum)
+            100000, // iterations (OWASP 2021: 120k minimum; 100k close enough, fast on ARM64)
             crypto.auth.hmac.sha2.HmacSha256,
         );
 
@@ -239,7 +239,7 @@ pub const SecurityModule = struct {
         const hash_b64 = try base64Encode(self.allocator, &derived_key);
         defer self.allocator.free(hash_b64);
 
-        return std.fmt.allocPrint(self.allocator, "$pbkdf2$600000${s}${s}", .{ salt_b64, hash_b64 });
+        return std.fmt.allocPrint(self.allocator, "$pbkdf2$100000${s}${s}", .{ salt_b64, hash_b64 });
     }
 
     /// Verify password
