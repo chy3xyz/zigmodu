@@ -2019,11 +2019,7 @@ pub const Client = struct {
         defer rows.deinit();
         // Fixup: Arena was on driver stack; now in caller's Rows. Update Row.arena pointers.
         for (rows.rows) |*row| row.arena = &rows.arena;
-        // Precompute column→field index once per query (O(F*C) once, not per row)
-        const indices = if (rows.rows.len > 0)
-            try buildColumnIndices(self.allocator, T, rows.rows[0].columns)
-        else
-            null;
+        // buildColumnIndices removed — linear scan fallback (v0.13.15)
         const result = try self.allocator.alloc(T, rows.rows.len);
         var scanned_count: usize = 0;
         errdefer {
@@ -2031,7 +2027,7 @@ pub const Client = struct {
             self.allocator.free(result);
         }
         for (rows.rows, 0..) |row, i| {
-            result[i] = try scanStruct(self.allocator, T, row, false, indices);
+            result[i] = try scanStruct(self.allocator, T, row, false, null);
             scanned_count += 1;
         }
         return result;
@@ -2045,17 +2041,13 @@ pub const Client = struct {
     pub fn queryRowsPartial(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
         var rows = try self.query(sql_str, args);
         defer rows.deinit();
-        const indices = if (rows.rows.len > 0)
-            try buildColumnIndices(self.allocator, T, rows.rows[0].columns)
-        else
-            null;
         const result = try self.allocator.alloc(T, rows.rows.len);
         errdefer {
             for (result) |item| freeScanned(self.allocator, T, item);
             self.allocator.free(result);
         }
         for (rows.rows, 0..) |row, i| {
-            result[i] = try scanStruct(self.allocator, T, row, true, indices);
+            result[i] = try scanStruct(self.allocator, T, row, true, null);
         }
         return result;
     }
@@ -2183,17 +2175,13 @@ pub const Transaction = struct {
         var rows = try self.query(allocator, sql_str, args);
         defer rows.deinit();
         for (rows.rows) |*row| row.arena = &rows.arena;
-        const indices = if (rows.rows.len > 0)
-            try buildColumnIndices(self.allocator, T, rows.rows[0].columns)
-        else
-            null;
         const result = try allocator.alloc(T, rows.rows.len);
         errdefer {
             for (result) |item| freeScanned(allocator, T, item);
             allocator.free(result);
         }
         for (rows.rows, 0..) |row, i| {
-            result[i] = try scanStruct(allocator, T, row, false, indices);
+            result[i] = try scanStruct(allocator, T, row, false, null);
         }
         return result;
     }
