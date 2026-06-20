@@ -54,6 +54,7 @@ fn bufPrintZ(buf: []u8, comptime fmt: []const u8, args: anytype) ![:0]u8 {
 /// Allocate a formatted null-terminated string.
 fn allocPrintZ(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ![:0]u8 {
     const s = try std.fmt.allocPrint(allocator, fmt, args);
+    defer allocator.free(s);
     return try allocZ(allocator, s);
 }
 
@@ -713,17 +714,11 @@ pub const PostgresConn = struct {
             return null;
         };
         errdefer self.allocator.free(paramLengths);
-        const paramAllocs = self.allocator.alloc(?[]const u8, param_count) catch {
+        const paramAllocs = self.allocator.alloc(?[:0]const u8, param_count) catch {
             self.allocator.free(paramValues);
             self.allocator.free(paramLengths);
             return null;
         };
-        errdefer {
-            for (paramAllocs) |maybe_alloc| {
-                if (maybe_alloc) |a| self.allocator.free(a);
-            }
-            self.allocator.free(paramAllocs);
-        }
         defer {
             for (paramAllocs) |maybe_alloc| {
                 if (maybe_alloc) |a| self.allocator.free(a);
