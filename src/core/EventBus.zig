@@ -15,8 +15,10 @@ fn ListenerSet(comptime CallbackType: type) type {
         allocator: std.mem.Allocator,
 
         pub fn init(allocator: std.mem.Allocator) Self {
+            var list = std.ArrayList(CallbackType).empty;
+            list.ensureTotalCapacity(allocator, 4) catch {};
             return .{
-                .list = std.ArrayList(CallbackType).empty,
+                .list = list,
                 .allocator = allocator,
             };
         }
@@ -28,6 +30,10 @@ fn ListenerSet(comptime CallbackType: type) type {
 
         pub fn add(self: *Self, callback: CallbackType) !void {
             try self.list.append(self.allocator, callback);
+        }
+
+        pub fn addAssumeCapacity(self: *Self, callback: CallbackType) void {
+            self.list.appendAssumeCapacity(self.allocator, callback);
         }
 
         pub fn remove(self: *Self, callback: CallbackType) bool {

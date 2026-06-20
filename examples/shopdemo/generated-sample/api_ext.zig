@@ -11,7 +11,7 @@ pub const OrderApiExt = struct {
         return .{ .ext = ext };
     }
 
-    pub fn registerRoutes(self: *OrderApiExt, group: *zigmodu.http_server.RouteGroup) !void {
+    pub fn registerRoutes(self: *OrderApiExt, group: *zigmodu.http.RouteGroup) !void {
         _ = self;
         // Add custom routes:
         // try group.get("/order/custom", myHandler, @ptrCast(@alignCast(self)));

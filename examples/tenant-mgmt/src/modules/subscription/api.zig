@@ -1,6 +1,6 @@
 const std = @import("std");
 const zigmodu = @import("zigmodu");
-const Server = zigmodu.http_server;
+const http = zigmodu.http;
 
 pub fn SubscriptionApi(comptime Sv: type) type {
     return struct {
@@ -9,14 +9,14 @@ pub fn SubscriptionApi(comptime Sv: type) type {
 
         pub fn init(s: *Sv) Self { return .{ .svc = s }; }
 
-        pub fn registerRoutes(self: *Self, group: *Server.RouteGroup) !void {
+        pub fn registerRoutes(self: *Self, group: *http.RouteGroup) !void {
             try group.get("/plans", listPlans, @ptrCast(@alignCast(self)));
             try group.post("/subscriptions", subscribe, @ptrCast(@alignCast(self)));
             try group.get("/subscriptions/{tenant_id}", getSubscription, @ptrCast(@alignCast(self)));
             try group.delete("/subscriptions/{id}", cancelSubscription, @ptrCast(@alignCast(self)));
         }
 
-        fn listPlans(ctx: *Server.Context) !void {
+        fn listPlans(ctx: *http.Context) !void {
             const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
             const plans = self.svc.listPlans() catch {
                 try ctx.sendErrorResponse(500, 0, "Failed to list plans"); return;
@@ -36,7 +36,7 @@ pub fn SubscriptionApi(comptime Sv: type) type {
             try ctx.json(200, buf.items);
         }
 
-        fn subscribe(ctx: *Server.Context) !void {
+        fn subscribe(ctx: *http.Context) !void {
             const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
             const tenant_str = ctx.queryParam("tenant_id") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing tenant_id"); return;
@@ -60,7 +60,7 @@ pub fn SubscriptionApi(comptime Sv: type) type {
             try ctx.json(201, resp);
         }
 
-        fn getSubscription(ctx: *Server.Context) !void {
+        fn getSubscription(ctx: *http.Context) !void {
             const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
             const tenant_str = ctx.param("tenant_id") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing tenant_id"); return;
@@ -80,7 +80,7 @@ pub fn SubscriptionApi(comptime Sv: type) type {
             try ctx.json(200, resp);
         }
 
-        fn cancelSubscription(ctx: *Server.Context) !void {
+        fn cancelSubscription(ctx: *http.Context) !void {
             const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
             const id_str = ctx.param("id") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing subscription ID"); return;

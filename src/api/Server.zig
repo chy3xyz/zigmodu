@@ -2,6 +2,21 @@
 //!
 //! Provides HTTP server with routing, middleware, and handlers.
 //! Aligned with go-zero's rest package.
+//!
+//! STRUCTURE (monolith — intentionally NOT split; see docs/PRODUCTION_ROADMAP.md):
+//!   §A  Method, Route, RouteGroup, Ws callbacks
+//!   §B  Context — request/response, arena, bindJson, streaming
+//!   §C  StreamReader, ParsedRequest — HTTP/1.1 parsing
+//!   §D  TrieNode, Router — route matching, wildcards, params
+//!   §E  Server — listen, graceful drain, global middleware
+//!   §F  connFiber — per-connection lifecycle, WS upgrade
+//!   §G  deepCopy, unit/integration tests
+//!
+//! MAINTENANCE:
+//!   - New middleware kinds → src/api/Middleware.zig (not here).
+//!   - No SQL, tenant, or JWT logic in this file.
+//!   - PathRewriter: path rewrite only, no business routes.
+//!   - One PR per § block when possible; Context/connFiber changes need Middleware tests too.
 
 const std = @import("std");
 const WsFramer = @import("../im/WsFramer.zig").WsFramer;
@@ -211,12 +226,21 @@ pub const Context = struct {
 
     /// Reset per-request state between keep-alive requests.
     pub fn resetArena(self: *Context) void {
-        self.query.clearRetainingCapacity();
-        self.params.clearRetainingCapacity();
-        self.headers.clearRetainingCapacity();
-        self.attributes.clearRetainingCapacity();
-        self.response_headers.clearRetainingCapacity();
-        if (self.form) |*f| f.clearRetainingCapacity();
+        self.freeStringMap(&self.query);
+        self.freeStringMap(&self.params);
+        self.freeStringMap(&self.headers);
+        self.freeStringMap(&self.attributes);
+        self.freeStringMap(&self.response_headers);
+        if (self.form) |*f| self.freeStringMap(f);
+    }
+
+    fn freeStringMap(self: *Context, map: *std.StringHashMap([]const u8)) void {
+        var iter = map.iterator();
+        while (iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        map.clearRetainingCapacity();
     }
 
     pub fn init(allocator: std.mem.Allocator, method: Method, path: []const u8) !Context {
@@ -235,12 +259,20 @@ pub const Context = struct {
     }
 
     pub fn deinit(self: *Context) void {
+        self.freeStringMap(&self.query);
         self.query.deinit();
+        self.freeStringMap(&self.params);
         self.params.deinit();
+        self.freeStringMap(&self.headers);
         self.headers.deinit();
-        if (self.form) |*f| f.deinit();
+        if (self.form) |*f| {
+            self.freeStringMap(f);
+            f.deinit();
+        }
         self.response_body.deinit(self.allocator);
+        self.freeStringMap(&self.response_headers);
         self.response_headers.deinit();
+        self.freeStringMap(&self.attributes);
         self.attributes.deinit();
         self.* = undefined;
     }
@@ -822,7 +854,6 @@ const TrieNode = struct {
             map.deinit();
         }
         allocator.destroy(self);
-        self.* = undefined;
     }
 
     /// Insert a child and conditionally upgrade to HashMap lookup.
@@ -885,6 +916,13 @@ const Router = struct {
     }
 
     pub fn deinit(self: *Router) void {
+        var wc_iter = self.wildcards.iterator();
+        while (wc_iter.next()) |entry| {
+            self.allocator.free(entry.value_ptr.path);
+            if (entry.value_ptr.combined_middleware.len > 0) {
+                self.allocator.free(entry.value_ptr.combined_middleware);
+            }
+        }
         self.wildcards.deinit();
         var iter = self.roots.valueIterator();
         while (iter.next()) |root| {
@@ -1068,6 +1106,15 @@ fn collectRoutes(
 const MatchedRoute = struct {
     route: Route,
     params: std.StringHashMap([]const u8),
+
+    pub fn deinit(self: *MatchedRoute, allocator: std.mem.Allocator) void {
+        var it = self.params.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        self.params.deinit();
+    }
 };
 
 fn getStatusText(status: u16) []const u8 {
@@ -1741,14 +1788,25 @@ test "route group" {
     }.handle, null);
 
     // Route should exist at /api/v1/users
-    const matched = server.router.match(allocator,.GET, "/api/v1/users");
-    try std.testing.expect(matched != null);
+    var matched_opt = server.router.match(allocator, .GET, "/api/v1/users");
+    if (matched_opt) |*matched| {
+        defer matched.deinit(allocator);
+    } else {
+        try std.testing.expect(false);
+    }
 }
 
 test "wildcard route matching" {
     const allocator = std.testing.allocator;
     var router = Router.init(allocator);
     defer router.deinit();
+
+    const expectMatch = struct {
+        fn call(r: *Router, method: Method, path: []const u8) !void {
+            var matched = r.match(allocator, method, path) orelse return error.TestExpectedEqual;
+            defer matched.deinit(allocator);
+        }
+    }.call;
 
     // Register wildcard routes
     try router.addRoute(.{
@@ -1773,16 +1831,16 @@ test "wildcard route matching" {
     });
 
     // Test: wildcard path matches sub-paths
-    try std.testing.expect(router.match(allocator, .GET, "/crm/statistics/overview") != null);
-    try std.testing.expect(router.match(allocator, .GET, "/crm/statistics/daily/report") != null);
-    try std.testing.expect(router.match(allocator, .GET, "/insurance/compensation-plan/2024") != null);
-    try std.testing.expect(router.match(allocator, .GET, "/insurance/compensation-plan/list/all") != null);
+    try expectMatch(&router, .GET, "/crm/statistics/overview");
+    try expectMatch(&router, .GET, "/crm/statistics/daily/report");
+    try expectMatch(&router, .GET, "/insurance/compensation-plan/2024");
+    try expectMatch(&router, .GET, "/insurance/compensation-plan/list/all");
 
     // Test: param route still works alongside wildcards
-    try std.testing.expect(router.match(allocator, .GET, "/users/42") != null);
+    try expectMatch(&router, .GET, "/users/42");
 
     // Test: POST wildcard works
-    try std.testing.expect(router.match(allocator, .POST, "/api/data/metrics") != null);
+    try expectMatch(&router, .POST, "/api/data/metrics");
 
     // Test: non-existent paths return null
     try std.testing.expect(router.match(allocator, .GET, "/crm/unknown") == null);
@@ -2210,7 +2268,7 @@ test "deepCopy strings escape arena lifetime" {
 
     const S = struct { name: []const u8, age: i32 };
     const original = S{ .name = "alice", .age = 30 };
-    const copy = deepCopy(original, allocator);
+    const copy = try deepCopy(original, allocator);
     defer allocator.free(copy.name);
 
     // Verify deep copy produced independent memory
@@ -2221,7 +2279,7 @@ test "deepCopy strings escape arena lifetime" {
     // Verify nested struct copy
     const Outer = struct { inner: S, label: []const u8 };
     const outer = Outer{ .inner = S{ .name = "bob", .age = 25 }, .label = "test" };
-    const outer_copy = deepCopy(outer, allocator);
+    const outer_copy = try deepCopy(outer, allocator);
     defer allocator.free(outer_copy.inner.name);
     defer allocator.free(outer_copy.label);
 
@@ -2373,7 +2431,8 @@ test "path rewriter changes route selection" {
     defer ctx.deinit();
     const rw = server.path_rewriter.?;
     rw(&ctx);
-    const matched = server.router.match(allocator, .GET, ctx.path);
+    defer if (!std.mem.eql(u8, ctx.path, "/old/path")) allocator.free(ctx.path);
+    var matched = server.router.match(allocator, .GET, ctx.path);
+    defer if (matched) |*m| m.deinit(allocator);
     try std.testing.expect(matched != null);
-    if (matched) |*m| m.params.deinit();
 }

@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  ZIG_VERSION: "0.16.0"
+  ZIG_VERSION: "0.17.0"
 
 jobs:
   # ── Build & Test Matrix ────────────────────────
@@ -68,6 +68,9 @@ jobs:
       - name: Run tests
         run: zig build test
 
+      - name: Check canonical API imports
+        run: zig build check-api
+
       - name: Upload test logs
         if: failure()
         uses: actions/upload-artifact@v4
@@ -93,6 +96,25 @@ jobs:
       - name: Zig fmt check
         run: zig fmt --check src/
 
+  # ── Integration (full) ─────────────────────────
+  integration-full:
+    name: Integration (full)
+    runs-on: ubuntu-latest
+    needs: [build-and-test]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev libmariadb-dev libsqlite3-dev curl
+
+      - name: Run integration probes
+        run: HTTP_PORT=18080 bash scripts/ci-integration.sh
 
   # ── Benchmark ──────────────────────────────────
   benchmark:

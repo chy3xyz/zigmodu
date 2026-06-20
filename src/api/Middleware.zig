@@ -12,6 +12,8 @@
 
 const std = @import("std");
 const api = @import("Server.zig");
+const Time = @import("../core/Time.zig");
+const SecurityModule = @import("../security/SecurityModule.zig").SecurityModule;
 
 /// CORS middleware configuration
 pub const CorsConfig = struct {
@@ -215,14 +217,29 @@ fn verifyJwt(allocator: std.mem.Allocator, token: []const u8, secret: []const u8
     return std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
 }
 
+fn jwtExpired(parsed: std.json.Parsed(std.json.Value)) bool {
+    if (parsed.value != .object) return true;
+    const exp_val = parsed.value.object.get("exp") orelse return false;
+    const exp_i: i64 = switch (exp_val) {
+        .integer => |v| v,
+        .float => |v| @intFromFloat(v),
+        else => return true,
+    };
+    return Time.monotonicNowSeconds() > exp_i;
+}
+
 /// JWT auth middleware - validates Bearer token and stores claims in context user_data
 pub fn jwtAuth(secret: []const u8) api.Middleware {
+    const SecretStore = struct {
+        var stored: []const u8 = "";
+    };
+    SecretStore.stored = secret;
     return .{
         .func = struct {
             fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
                 const jwt_secret_ptr: *const []const u8 = @ptrCast(@alignCast(user_data.?));
                 const jwt_secret = jwt_secret_ptr.*;
-                const auth = ctx.headers.get("Authorization") orelse {
+                const auth = ctx.headers.get("authorization") orelse {
                     try ctx.sendError(401, "Unauthorized");
                     return;
                 };
@@ -236,12 +253,17 @@ pub fn jwtAuth(secret: []const u8) api.Middleware {
                     try ctx.sendError(401, "Unauthorized");
                     return;
                 };
-                defer parsed.deinit();
+                if (jwtExpired(parsed)) {
+                    parsed.deinit();
+                    try ctx.sendError(401, "Unauthorized");
+                    return;
+                }
                 ctx.user_data = @constCast(&parsed.value);
                 try next(ctx);
+                parsed.deinit();
             }
         }.mw,
-        .user_data = @ptrCast(@constCast(&secret)),
+        .user_data = @ptrCast(@constCast(&SecretStore.stored)),
     };
 }
 
@@ -255,8 +277,8 @@ pub fn csrf() api.Middleware {
                 switch (ctx.method) {
                     .GET, .HEAD, .OPTIONS => return next(ctx),
                     else => {
-                        const header_token = ctx.header("X-CSRF-Token") orelse "";
-                        const cookie_header = ctx.header("Cookie") orelse "";
+                        const header_token = ctx.header("x-csrf-token") orelse "";
+                        const cookie_header = ctx.header("cookie") orelse "";
                         // Extract csrf_token=... from Cookie header
                         var cookie_match = false;
                         var it = std.mem.splitScalar(u8, cookie_header, ';');
@@ -351,5 +373,158 @@ test "jwtAuth middleware rejects missing authorization" {
     try mw.func(&ctx, next, mw.user_data);
     try std.testing.expectEqual(@as(u16, 401), ctx.status_code);
     try std.testing.expect(ctx.responded);
+}
+
+fn putRequestHeader(ctx: *api.Context, key: []const u8, value: []const u8) !void {
+    const k = try ctx.allocator.dupe(u8, key);
+    errdefer ctx.allocator.free(k);
+    const v = try ctx.allocator.dupe(u8, value);
+    errdefer ctx.allocator.free(v);
+    try ctx.headers.put(k, v);
+}
+
+fn putBearerAuth(ctx: *api.Context, token: []const u8) !void {
+    const k = try ctx.allocator.dupe(u8, "authorization");
+    errdefer ctx.allocator.free(k);
+    const v = try std.fmt.allocPrint(ctx.allocator, "Bearer {s}", .{token});
+    errdefer ctx.allocator.free(v);
+    try ctx.headers.put(k, v);
+}
+
+test "jwtAuth middleware accepts valid token" {
+    const allocator = std.testing.allocator;
+    var sec = SecurityModule.init(allocator, "secret", 3600);
+    const token = try sec.generateToken("user-1", &.{});
+    defer allocator.free(token);
+
+    var ctx = try api.Context.init(allocator, .GET, "/test");
+    defer ctx.deinit();
+    try putBearerAuth(&ctx, token);
+
+    const S = struct {
+        var reached: bool = false;
+    };
+    S.reached = false;
+    const mw = jwtAuth("secret");
+    const next = struct {
+        fn n(c: *api.Context) anyerror!void {
+            _ = c;
+            S.reached = true;
+        }
+    }.n;
+
+    try mw.func(&ctx, next, mw.user_data);
+    try std.testing.expect(S.reached);
+    try std.testing.expect(!ctx.responded);
+}
+
+test "jwtAuth middleware rejects tampered token" {
+    const allocator = std.testing.allocator;
+    var sec = SecurityModule.init(allocator, "secret", 3600);
+    const token = try sec.generateToken("user-1", &.{});
+    defer allocator.free(token);
+
+    var tampered = try allocator.dupe(u8, token);
+    defer allocator.free(tampered);
+    if (tampered.len > 10) tampered[tampered.len - 5] +%= 1;
+
+    var ctx = try api.Context.init(allocator, .GET, "/test");
+    defer ctx.deinit();
+    try putBearerAuth(&ctx, tampered);
+
+    const mw = jwtAuth("secret");
+    const next = struct {
+        fn n(c: *api.Context) anyerror!void {
+            _ = c;
+        }
+    }.n;
+
+    try mw.func(&ctx, next, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 401), ctx.status_code);
+    try std.testing.expect(ctx.responded);
+}
+
+test "jwtAuth middleware rejects expired token" {
+    const allocator = std.testing.allocator;
+    var sec = SecurityModule.init(allocator, "secret", -1);
+    const token = try sec.generateToken("user-1", &.{});
+    defer allocator.free(token);
+
+    var ctx = try api.Context.init(allocator, .GET, "/test");
+    defer ctx.deinit();
+    try putBearerAuth(&ctx, token);
+
+    const mw = jwtAuth("secret");
+    const next = struct {
+        fn n(c: *api.Context) anyerror!void {
+            _ = c;
+        }
+    }.n;
+
+    try mw.func(&ctx, next, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 401), ctx.status_code);
+    try std.testing.expect(ctx.responded);
+}
+
+test "csrf middleware rejects POST without matching token" {
+    const allocator = std.testing.allocator;
+    var ctx = try api.Context.init(allocator, .POST, "/test");
+    defer ctx.deinit();
+
+    const mw = csrf();
+    const next = struct {
+        fn n(c: *api.Context) anyerror!void {
+            _ = c;
+        }
+    }.n;
+
+    try mw.func(&ctx, next, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 403), ctx.status_code);
+    try std.testing.expect(ctx.responded);
+}
+
+test "csrf middleware accepts POST with double-submit token" {
+    const allocator = std.testing.allocator;
+    var ctx = try api.Context.init(allocator, .POST, "/test");
+    defer ctx.deinit();
+    try putRequestHeader(&ctx, "x-csrf-token", "abc123");
+    try putRequestHeader(&ctx, "cookie", "csrf_token=abc123");
+
+    const S = struct {
+        var reached: bool = false;
+    };
+    S.reached = false;
+    const mw = csrf();
+    const next = struct {
+        fn n(c: *api.Context) anyerror!void {
+            _ = c;
+            S.reached = true;
+        }
+    }.n;
+
+    try mw.func(&ctx, next, mw.user_data);
+    try std.testing.expect(S.reached);
+    try std.testing.expect(!ctx.responded);
+}
+
+test "csrf middleware allows GET without token" {
+    const allocator = std.testing.allocator;
+    var ctx = try api.Context.init(allocator, .GET, "/test");
+    defer ctx.deinit();
+
+    const S = struct {
+        var reached: bool = false;
+    };
+    S.reached = false;
+    const mw = csrf();
+    const next = struct {
+        fn n(c: *api.Context) anyerror!void {
+            _ = c;
+            S.reached = true;
+        }
+    }.n;
+
+    try mw.func(&ctx, next, mw.user_data);
+    try std.testing.expect(S.reached);
 }
 

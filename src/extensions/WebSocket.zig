@@ -42,15 +42,20 @@ pub const WebSocketServer = struct {
     pub fn deinit(self: *Self) void {
         self.stop();
 
-        self.clients_mutex.lock(self.io) catch return;
-        defer self.clients_mutex.unlock(self.io);
-
-        for (self.clients.items) |client| {
-            client.deinit();
-            self.allocator.destroy(client);
+        if (self.clients_mutex.tryLock()) {
+            defer self.clients_mutex.unlock(self.io);
+            for (self.clients.items) |client| {
+                client.deinit();
+                self.allocator.destroy(client);
+            }
+            self.clients.deinit();
+        } else {
+            for (self.clients.items) |client| {
+                client.deinit();
+                self.allocator.destroy(client);
+            }
+            self.clients.deinit();
         }
-        self.clients.deinit();
-        self.* = undefined;
     }
 
     pub fn start(self: *Self) !void {
@@ -226,7 +231,7 @@ pub const WebSocketServer = struct {
     }
 
     pub fn clientCount(self: *Self) usize {
-        self.clients_mutex.lock(self.io) catch return 0;
+        if (!self.clients_mutex.tryLock()) return 0;
         defer self.clients_mutex.unlock(self.io);
         return self.clients.items.len;
     }

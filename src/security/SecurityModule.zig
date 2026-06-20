@@ -421,6 +421,17 @@ test "SecurityModule JWT generate and verify" {
     try std.testing.expect(payload.exp > 0);
 }
 
+test "SecurityModule JWT expired token" {
+    const allocator = std.testing.allocator;
+    var sec = SecurityModule.init(allocator, "secret", -1);
+
+    const token = try sec.generateToken("user-1", &.{});
+    defer allocator.free(token);
+
+    const result = sec.verifyToken(token);
+    try std.testing.expectError(error.TokenExpired, result);
+}
+
 test "SecurityModule JWT invalid signature" {
     const allocator = std.testing.allocator;
     var sec = SecurityModule.init(allocator, "secret-a", 3600);

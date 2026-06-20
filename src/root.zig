@@ -51,23 +51,22 @@ pub const ThreadSafeEventBus = @import("core/EventBus.zig").ThreadSafeEventBus;
 pub const Container = @import("di/Container.zig").Container;
 
 // ============================================================
-// 2. DOMAIN RE-EXPORTS (import individually for fast compilation)
+// 2. DOMAIN RE-EXPORTS (canonical — prefer these)
 // ============================================================
 pub const http = @import("http.zig");
 pub const data = @import("data.zig");
 pub const security = @import("security.zig");
 pub const observability = @import("observability.zig");
 
-// Convenience flat re-exports — avoid deep import paths:
-//   zmodu.sqlx  vs  zmodu.data.sqlx
-//   zmodu.orm   vs  zmodu.data.orm
-pub const sqlx = @import("sqlx/sqlx.zig");
-pub const orm = @import("persistence/Orm.zig");
-pub const SqlxBackend = @import("persistence/backends/SqlxBackend.zig").SqlxBackend;
-pub const http_server = @import("api/Server.zig");
-pub const PasswordEncoder = @import("security/PasswordEncoder.zig").PasswordEncoder;
-pub const SecurityModule = @import("security/SecurityModule.zig").SecurityModule;
-pub const Cache = @import("cache/Lru.zig").Cache;
+/// Deprecated flat aliases — remove in v0.14.0. Prefer domain imports above.
+pub const deprecated = @import("deprecated.zig");
+pub const http_server = deprecated.http_server;
+pub const sqlx = deprecated.sqlx;
+pub const orm = deprecated.orm;
+pub const SqlxBackend = deprecated.SqlxBackend;
+pub const PasswordEncoder = deprecated.PasswordEncoder;
+pub const SecurityModule = deprecated.SecurityModule;
+pub const Cache = deprecated.Cache;
 
 // ============================================================
 // 3. RESILIENCE

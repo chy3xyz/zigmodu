@@ -6,9 +6,11 @@
 const std = @import("std");
 const zigmodu = @import("zigmodu");
 
-const Server = zigmodu.http_server.Server;
-const Route = zigmodu.http_server.Route;
-const Context = zigmodu.http_server.Context;
+const http = zigmodu.http;
+
+const Server = http.Server;
+const Route = http.Route;
+const Context = http.Context;
 
 const NUM_CLIENTS: u32 = 32;
 const REQUESTS_PER_CLIENT: u32 = 50;

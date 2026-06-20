@@ -1,6 +1,6 @@
 const std = @import("std");
 const zigmodu = @import("zigmodu");
-const Server = zigmodu.http_server;
+const http = zigmodu.http;
 
 pub fn UserApi(comptime Service: type) type {
     return struct {
@@ -9,13 +9,13 @@ pub fn UserApi(comptime Service: type) type {
 
         pub fn init(svc: *Service) Self { return .{ .service = svc }; }
 
-        pub fn registerRoutes(self: *Self, group: *Server.RouteGroup) !void {
+        pub fn registerRoutes(self: *Self, group: *http.RouteGroup) !void {
             try group.get("/users", listUsers, @ptrCast(@alignCast(self)));
             try group.post("/users", createUser, @ptrCast(@alignCast(self)));
             try group.get("/users/{id}", getUser, @ptrCast(@alignCast(self)));
         }
 
-        fn listUsers(ctx: *Server.Context) !void {
+        fn listUsers(ctx: *http.Context) !void {
             const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
             const tenant_str = ctx.queryParam("tenant_id") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing 'tenant_id' query parameter");
@@ -46,7 +46,7 @@ pub fn UserApi(comptime Service: type) type {
             try ctx.json(200, buf.items);
         }
 
-        fn createUser(ctx: *Server.Context) !void {
+        fn createUser(ctx: *http.Context) !void {
             const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
             const tenant_id_str = ctx.queryParam("tenant_id") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing tenant_id"); return;
@@ -72,7 +72,7 @@ pub fn UserApi(comptime Service: type) type {
             try ctx.json(201, resp);
         }
 
-        fn getUser(ctx: *Server.Context) !void {
+        fn getUser(ctx: *http.Context) !void {
             const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
             const tenant_str = ctx.queryParam("tenant_id") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing tenant_id"); return;

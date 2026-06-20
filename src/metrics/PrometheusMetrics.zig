@@ -354,7 +354,7 @@ pub const PrometheusMetrics = struct {
             try buf.print("{s}_count {d}\n\n", .{ hist.name, hist.totalCount() });
         }
 
-        return buf.toOwnedSlice(allocator);
+        return try buf.toOwnedSlice();
     }
 
     /// Export this metrics registry as a pluggable MetricsBackend.

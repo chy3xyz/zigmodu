@@ -77,6 +77,8 @@ pub const ModuleInteractionVerifier = struct {
     pub fn deinit(self: *Self) void {
         for (self.rules.items) |rule| {
             self.allocator.free(rule.allowed_types);
+            if (rule.from_module) |m| self.allocator.free(m);
+            if (rule.to_module) |m| self.allocator.free(m);
             self.allocator.free(rule.description);
         }
         self.rules.deinit(self.allocator);

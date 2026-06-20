@@ -241,10 +241,10 @@ pub const ProtoParser = struct {
 
             if (std.mem.startsWith(u8, trimmed, "service ")) {
                 if (current_service) |svc| {
-                    const svc_copy = try allocator.dupe(u8, svc);
                     const methods = try current_methods.toOwnedSlice(allocator);
-                    try services.append(allocator, .{ .name = svc_copy, .methods = methods });
+                    try services.append(allocator, .{ .name = svc, .methods = methods });
                     current_methods = std.ArrayList(ProtoMethod).empty;
+                    current_service = null;
                 }
                 const svc_name = std.mem.trim(u8, trimmed["service ".len..], " \t{");
                 current_service = try allocator.dupe(u8, svc_name);

@@ -1,6 +1,6 @@
 const std = @import("std");
 const zigmodu = @import("zigmodu");
-const Server = zigmodu.http_server;
+const http = zigmodu.http;
 const service = @import("service.zig");
 
 /// Tenant API 层 — HTTP 路由处理
@@ -13,7 +13,7 @@ pub fn TenantApi(comptime Service: type) type {
             return .{ .service = svc };
         }
 
-        pub fn registerRoutes(self: *Self, group: *Server.RouteGroup) !void {
+        pub fn registerRoutes(self: *Self, group: *http.RouteGroup) !void {
             try group.get("/tenants", listTenants, @ptrCast(@alignCast(self)));
             try group.post("/tenants", createTenant, @ptrCast(@alignCast(self)));
             try group.get("/tenants/{id}", getTenant, @ptrCast(@alignCast(self)));
@@ -21,7 +21,7 @@ pub fn TenantApi(comptime Service: type) type {
             try group.delete("/tenants/{id}", suspendTenant, @ptrCast(@alignCast(self)));
         }
 
-        fn listTenants(ctx: *Server.Context) !void {
+        fn listTenants(ctx: *http.Context) !void {
             const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
             const tenants = self.service.listActive() catch {
                 try ctx.sendErrorResponse(500, 0, "Failed to list tenants");
@@ -45,7 +45,7 @@ pub fn TenantApi(comptime Service: type) type {
             try ctx.json(200, buf.items);
         }
 
-        fn createTenant(ctx: *Server.Context) !void {
+        fn createTenant(ctx: *http.Context) !void {
             const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
 
             const name = ctx.queryParam("name") orelse {
@@ -70,7 +70,7 @@ pub fn TenantApi(comptime Service: type) type {
             try ctx.json(201, resp);
         }
 
-        fn getTenant(ctx: *Server.Context) !void {
+        fn getTenant(ctx: *http.Context) !void {
             const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
             const id_str = ctx.param("id") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing tenant ID");
@@ -96,7 +96,7 @@ pub fn TenantApi(comptime Service: type) type {
             try ctx.json(200, resp);
         }
 
-        fn updateTier(ctx: *Server.Context) !void {
+        fn updateTier(ctx: *http.Context) !void {
             const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
             const id_str = ctx.param("id") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing tenant ID");
@@ -119,7 +119,7 @@ pub fn TenantApi(comptime Service: type) type {
             try ctx.json(200, "{\"status\":\"ok\"}");
         }
 
-        fn suspendTenant(ctx: *Server.Context) !void {
+        fn suspendTenant(ctx: *http.Context) !void {
             const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
             const id_str = ctx.param("id") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing tenant ID");

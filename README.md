@@ -1,10 +1,10 @@
-# ZigModu v0.13.1
+# ZigModu v0.13.15
 
 A modular application framework for Zig 0.17, inspired by Spring Modulith. Build scalable applications from monolithic to distributed systems with progressive architecture evolution.
 
 [![Zig](https://img.shields.io/badge/Zig-0.17+-orange?style=flat-square)](https://ziglang.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-0.13.1-blue?style=flat-square)]()
+[![Version](https://img.shields.io/badge/Version-0.13.15-blue?style=flat-square)]()
 [![Score](https://img.shields.io/badge/Quality-95%25-A-green?style=flat-square)]()
 
 ## 📚 Documentation
@@ -123,10 +123,9 @@ Each domain file is self-contained — importing `zmodu.http` does not compile `
 ### Prerequisites
 
 ```bash
-# Install Zig 0.16.0
-brew install zig@0.16.0  # macOS
-# or
-apt install zig=0.16.0   # Linux
+# Install Zig 0.17.0
+brew install zig          # macOS (or zigup / mlugg/setup-zig in CI)
+# CI pin: 0.17.0 — see .github/workflows/ci.yml
 ```
 
 ### Create Your First Module
@@ -179,8 +178,10 @@ pub fn main(init: std.process.Init) !void {
 ### Quick HTTP Server
 
 ```zig
-const Server = zigmodu.http_server.Server;
-const Context = zigmodu.http_server.Context;
+const http = zigmodu.http;
+
+const Server = http.Server;
+const Context = http.Context;
 
 pub fn main(init: std.process.Init) !void {
     var server = Server.init(init.io, init.gpa, 8080);
@@ -279,8 +280,9 @@ zigmodu/
 │   │   └── ModuleTest.zig
 │   └── validation/                    # Object validation
 ├── docs/                              # Documentation
-├── examples/                          # Example projects
-├── shopdemo/                          # Full reference app (42 modules, 152 tables)
+├── examples/                          # Runnable example projects
+│   ├── tenant-mgmt/                   # ★ Flagship: multi-tenant SaaS demo (CI integrated)
+│   └── shopdemo/                      # Schema + codegen sample (not a full runnable app)
 ├── tools/zmodu/                       # zmodu CLI code generator
 ├── Dockerfile                         # Multi-stage Docker build
 ├── docker-compose.yml                 # Full stack (PG + Redis + Vault + Jaeger)
@@ -308,7 +310,13 @@ See [Best Practices](docs/BEST_PRACTICES.md) for detailed evolution guide.
 zig build
 
 # Run tests
-zig build test
+ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test
+
+# API import gate (examples must use zmodu.http)
+zig build check-api
+
+# Integration probes (tenant-mgmt + stress test; needs curl)
+HTTP_PORT=18080 bash scripts/ci-integration.sh
 
 # Run example
 zig build run
@@ -331,13 +339,14 @@ docker compose --profile tracing up -d  # With Jaeger
 
 | Example | Description |
 |---------|-------------|
+| **[Tenant Mgmt](examples/tenant-mgmt/)** | **旗舰示例**：多租户 SaaS、中间件链、健康探针、`zigmodu.http` |
 | [Basic](examples/basic/) | Module fundamentals |
 | [Event-Driven](examples/event-driven/) | Publish-subscribe patterns |
 | [Testing](examples/testing/) | Test utilities |
-| [HTTP Stress Test](examples/http-stress-test/) | Concurrent connections |
+| [HTTP Stress Test](examples/http-stress-test/) | Concurrent load (CI integration) |
 | [Metaverse Creative](examples/metaverse-creative/) | Creative demo |
 | [Distributed](examples/distributed/) | Multi-node deployment |
-| [ShopDemo](shopdemo/) | Full e-commerce (42 modules, 790+ APIs) |
+| [ShopDemo](examples/shopdemo/) | **Codegen 参考**：152 表 schema + `generated-sample/`（需 zmodu CLI 生成完整应用） |
 
 ## 🤝 Contributing
 

@@ -1,20 +1,25 @@
 //! HTTP domain: server, middleware, client, OpenAPI, utilities.
 //! Import directly: `const http = @import("zigmodu").http;`
 //!
-//! Top-level aliases for common types:
-//!   http.Server, http.Context, http.RouteGroup, http.Middleware
+//! Canonical types (use these):
+//!   http.Server, http.Context, http.RouteGroup, http.Middleware, http.Route
+//!
+//! Deprecated: `http.http_server` — same module as above; removed from root in v0.14.0.
+//!   Prefer `http.Server` over `http.http_server.Server` or `zigmodu.http_server.Server`.
 
 const std = @import("std");
 
-pub const http_server = @import("api/Server.zig");
-pub const Server = @import("api/Server.zig").Server;
-pub const Context = @import("api/Server.zig").Context;
-pub const RouteGroup = @import("api/Server.zig").RouteGroup;
-pub const Route = @import("api/Server.zig").Route;
-pub const Middleware = @import("api/Server.zig").Middleware;
-pub const HandlerFn = @import("api/Server.zig").HandlerFn;
-pub const Method = @import("api/Server.zig").Method;
-pub const RouteInfo = @import("api/Server.zig").RouteInfo;
+const server_mod = @import("api/Server.zig");
+/// DEPRECATED v0.14.0: use `Server`, `Context`, etc. exported below.
+pub const http_server = server_mod;
+pub const Server = server_mod.Server;
+pub const Context = server_mod.Context;
+pub const RouteGroup = server_mod.RouteGroup;
+pub const Route = server_mod.Route;
+pub const Middleware = server_mod.Middleware;
+pub const HandlerFn = server_mod.HandlerFn;
+pub const Method = server_mod.Method;
+pub const RouteInfo = server_mod.RouteInfo;
 pub const http_middleware = @import("api/Middleware.zig");
 pub const tracing_middleware = @import("api/middleware/Tracing.zig");
 pub const validateRequest = @import("api/middleware/Validation.zig").validateRequest;
@@ -58,7 +63,7 @@ pub const recordIdempotencyResponse = @import("http/Idempotency.zig").recordIdem
 /// Request utility helpers.
 pub const RequestUtil = struct {
     /// Get client real IP (X-Real-IP > X-Forwarded-For > remote).
-    pub fn getRealIp(ctx: *http_server.Context) []const u8 {
+    pub fn getRealIp(ctx: *Context) []const u8 {
         if (ctx.getAttr("X-Real-IP")) |ip| return ip;
         if (ctx.getAttr("X-Forwarded-For")) |fwd| {
             if (std.mem.indexOf(u8, fwd, ",")) |pos| return std.mem.trim(u8, fwd[0..pos], &std.ascii.whitespace);
@@ -67,7 +72,7 @@ pub const RequestUtil = struct {
         return "unknown";
     }
     /// Check if AJAX/XMLHttpRequest.
-    pub fn isAjax(ctx: *http_server.Context) bool {
+    pub fn isAjax(ctx: *Context) bool {
         if (ctx.getAttr("X-Requested-With")) |v| return std.mem.eql(u8, v, "XMLHttpRequest");
         return false;
     }
@@ -76,15 +81,15 @@ pub const RequestUtil = struct {
 /// Unified response renderer (zfinal-style).
 pub const RenderExt = struct {
     /// {"success":true,"data":<value>}
-    pub fn success(ctx: *http_server.Context, data: anytype) !void {
+    pub fn success(ctx: *Context, data: anytype) !void {
         try ctx.jsonStruct(200, .{ .success = true, .data = data });
     }
     /// {"success":false,"err":"<message>"}
-    pub fn err(ctx: *http_server.Context, message: []const u8) !void {
+    pub fn err(ctx: *Context, message: []const u8) !void {
         try ctx.jsonStruct(200, .{ .success = false, .err = message });
     }
     /// {"success":true,"data":{"list":<list>,"total":N,"page":P,"pageSize":S,"totalPages":T}}
-    pub fn page(ctx: *http_server.Context, list: anytype, total: usize, page_num: usize, page_size: usize) !void {
+    pub fn page(ctx: *Context, list: anytype, total: usize, page_num: usize, page_size: usize) !void {
         try ctx.jsonStruct(200, .{ .success = true, .data = .{
             .list = list, .total = total, .page = page_num, .pageSize = page_size,
             .totalPages = (total + page_size - 1) / page_size,

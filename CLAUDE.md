@@ -1,61 +1,56 @@
 # CLAUDE.md — ZigModu Framework for Claude Code
 
 ## Project
-ZigModu v0.9.4 — modular app framework for Zig 0.16.0. 129 files, 420 tests, 92/100.
+ZigModu v0.13.15 — modular app framework for Zig 0.17.0. ~149 src files, 413 tests, ~92/100.
 
 ## Build & Test
 ```bash
-zig build              # compile
-zig build test         # run tests (417+)
-zig build docs         # generate docs
+zig build
+ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test   # 413 passed, 5 skipped
+zig build check-api                                    # examples API gate
+bash scripts/ci-integration.sh                         # tenant-mgmt + stress (HTTP_PORT=18080)
+zig build docs
 ```
 
 ## Architecture (5 domain files)
 ```
 src/http.zig          → zmodu.http.{Server, Context, RouteGroup, Middleware}
-src/data.zig          → zmodu.data.{sqlx, Repository, Client, orm, redis}
+src/data.zig          → zmodu.data.{Client, sqlx, orm, Repository, redis}
 src/security.zig      → zmodu.security.{SecurityModule, PasswordEncoder, SecretsManager}
 src/observability.zig → zmodu.observability.{PrometheusMetrics, DistributedTracer}
-src/root.zig          → top-level: Application, EventBus, Container, HttpCode, HealthEndpoint
+src/root.zig          → Application, EventBus, deprecated flat aliases (v0.14.0 remove)
 ```
 
-## Zig 0.16 Rules (top 5 mistakes to avoid)
+## Monolith maintenance (do NOT split without cause)
+- `src/sqlx/sqlx.zig`, `src/api/Server.zig` — § sections + rules in `docs/PRODUCTION_ROADMAP.md`
+
+## Zig 0.17 Rules (top 5 mistakes to avoid)
 1. `ArrayList(T).init(alloc)` → `ArrayList(T).empty`, pass alloc to each method
 2. `std.Thread.Mutex` → `std.Io.Mutex`, needs `io`: `.lock(io)`, `.unlock(io)`
 3. `std.time.milliTimestamp()` → `Time.monotonicNowMilliseconds()`
 4. `file.writeAll(x)` → `file.writeStreamingAll(io, x)`
-5. `std.os.getpid()` → `@intFromPtr(&seed)`
+5. Request headers are **lowercase** in `Context.headers` — use `"authorization"`, not `"Authorization"`
 
 ## Code Generation Rules
 - Module: `pub const info = zmodu.api.Module{...}` + `init() !void` + `deinit() void`
-- HTTP: `ctx.json(status, body)` NOT `sendSuccess/sendFail` (deprecated)
-- DB: `data.Client.open(alloc, io, cfg)` one-step, NOT init+connect
-- Router: `*` wildcard for catch-all, `{id}` for path params
+- HTTP: `const http = zmodu.http` — `ctx.json(status, body)` NOT `sendSuccess/sendFail`
+- DB: `data.Client` via `zmodu.data` — parameterized `?` placeholders only
+- Router: `*` wildcard, `{id}` path params; route paths without leading `/` in `addRoute`
 - Logging: `std.log.err/warn/info` with `{s}/{d}` format, never emoji
-- Secrets: never hardcode, use `zmodu.security.SecretsManager`
-- CORS: `http_middleware.cors(.{ .allow_origins = &.{"*"} })` — runs before 404
-
-## Common Bugs to Check
-- `catch {}` — replace with `catch |err| std.log.err(...)`
-- `bindJson` — deepCopy prevents UAF, strings are owned
-- `parsed.deinit()` after `return parsed.value` — always deep-copy
-- `ctx.headers.get("origin")` — already lowercase-normalized in parser
-- `page_allocator.create()` — use module-level `var` instead
+- Deprecated root aliases: `zigmodu.http_server` → `zigmodu.http` (removed v0.14.0)
 
 ## Key Files
 ```
-src/api/Server.zig      (1700L) — Context, Router, Server, connFiber
-src/api/Middleware.zig   (350L) — cors, jwtAuth, csrf, requestId, recover
-src/core/Error.zig       (330L) — ZigModuError, ErrorHandler, HttpCode, Result
-src/core/EventBus.zig    (240L) — TypedEventBus, ThreadSafeEventBus, UnifiedEventBus
-src/core/Time.zig         (90L) — monotonicNow, cachedNowSeconds, refreshCache
-src/sqlx/sqlx.zig       (2900L) — Client, Conn, Transaction, ORM helpers
-src/Application.zig      (540L) — builder, run(), lifecycle, graceful shutdown
+src/api/Server.zig      (~2400L) — Context, Router, Server, connFiber
+src/api/Middleware.zig   (~500L) — cors, jwtAuth, csrf, requestId, recover
+src/sqlx/sqlx.zig       (~3300L) — Client, ConnPool, PG/MySQL/SQLite
+src/Application.zig      (~540L) — builder, run(), graceful shutdown
+docs/PRODUCTION_ROADMAP.md — production phases + monolith boundaries
 ```
 
 ## Examples
 ```
-examples/shopdemo/      — 152-table e-commerce (42 modules)
-examples/cluster-demo/   — 3-node docker compose
-examples/http-stress-test/ — wrk benchmark
+examples/tenant-mgmt/     — flagship runnable demo (CI integration)
+examples/shopdemo/        — schema + generated-sample only (codegen reference)
+examples/http-stress-test/  — load test binary
 ```

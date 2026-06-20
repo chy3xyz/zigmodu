@@ -26,13 +26,18 @@ pub const BufferPool = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.mutex.lock(self.io) catch return;
+        if (!self.mutex.tryLock()) {
+            for (self.free.items) |buf| {
+                self.allocator.free(buf);
+            }
+            self.free.deinit(self.allocator);
+            return;
+        }
         defer self.mutex.unlock(self.io);
         for (self.free.items) |buf| {
             self.allocator.free(buf);
         }
         self.free.deinit(self.allocator);
-        self.* = undefined;
     }
 
     /// Acquire a 4KB buffer from the pool.

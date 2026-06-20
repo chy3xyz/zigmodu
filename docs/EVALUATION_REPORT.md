@@ -1,12 +1,15 @@
-# ZigModu 生产级评估报告 v3
+# ZigModu 生产级评估报告 v4
 
-**评估日期**: 2026-05-09
-**框架版本**: v0.8.0
-**Zig 版本**: 0.16.0
-**源代码文件**: 107 个 (.zig)
-**代码行数**: ~34,700 行
-**测试结果**: 332 passed, 5 skipped, 2 failed
-**参考应用**: ShopDemo — 42 模块 / 152 张表 / 790+ API / 484 文件
+**评估日期**: 2026-06-20  
+**框架版本**: v0.13.15  
+**Zig 版本**: 0.17.0  
+**源代码文件**: ~149 个 (`src/**/*.zig`)  
+**代码行数**: ~42,000 行  
+**测试结果**: **413 passed, 5 skipped, 0 failed**（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`）  
+**旗舰示例**: [`examples/tenant-mgmt/`](../examples/tenant-mgmt/) — 可运行、CI 集成探活  
+**参考 codegen**: [`examples/shopdemo/`](../examples/shopdemo/) — 152 表 schema + 生成样例（非完整可运行应用）
+
+> 上一版 v3（2026-05-09，v0.8.0 / Zig 0.16 / 332 tests）已过时；本版与 `docs/PRODUCTION_ROADMAP.md` 验收基线一致。
 
 ---
 
@@ -22,12 +25,12 @@
 | 6 | **可观测性** | 93 | 82 | +11 | Prometheus + Tracer + Logger + Health + Dashboard + Metrics MW + AccessLog |
 | 7 | **开发者体验** | 95 | 85 | +10 | ArchitectureTester + ContractTest + FeatureFlags + Validate MW + ApiVersioning + ProblemDetails |
 | 8 | **分布式** | 88 | 80 | +8 | Cluster + DistEventBus + 2PC + gRPC + Kafka + Saga |
-| 9 | **测试质量** | 95 | 90 | +5 | 332 tests (+106 from v0.7.0), 95% 覆盖率 |
+| 9 | **测试质量** | 93 | 95 | -2 | 413 tests，0 failed；CI smoke + integration-full |
 | 10 | **运维/DevOps** | 98 | 78 | +20 | Docker + Compose + CI/CD + K8s probes + Dashboard + Migrations |
 | 11 | **内存安全** | 92 | 88 | +4 | ptr UB 已修复, ArrayList 统一, 所有 timestamp 使用真实时间 |
-| 12 | **文档** | 95 | 80 | +15 | README/AGENTS/CHANGELOG/API/评估报告全面更新 |
+| 12 | **文档** | 90 | 95 | -5 | 路线图/API 迁移已对齐；本报告 v4 刷新 |
 
-> **综合评分: 94.5/100** — 从 v0.7.0 的 86 分提升 **+8.5 分**
+> **综合评分: ~92/100** — 较 v0.8.0 报告（94.5）口径更保守：ShopDemo 为 codegen 参考而非 shipped 应用；大文件未拆分靠维护边界支撑可维护性。
 
 ---
 
@@ -77,9 +80,11 @@ DevOps (5):          HotReloader, PluginManager, ArchitectureTester,
 DB 驱动 (3):         sqlite3_c, libpq_c, libmysql_c
 ```
 
-### ⚠️ 实验性 (tests disabled)
+### ⚠️ 实验性 / 样例边界
 ```
-DLQ, WAL — 代码已完成，测试因 Zig 0.16.0 ArrayList 类型推断问题被注释
+DLQ, WAL — 部分测试仍 skip（Zig 0.17 ArrayList 推断）
+examples/shopdemo/ — schema + generated-sample 代码生成演示，非完整 binary
+gRPC/Kafka wire — 部分为 placeholder，需真实 TCP 集成验证
 ```
 
 ---
@@ -92,7 +97,8 @@ v0.3.0:  189 tests  (HTTP + 弹性 + 安全)
 v0.6.4:  194 tests  (稳定化)
 v0.7.0:  226 tests  (时间戳修复 + API 统一)
 v0.8.0:  332 tests  (Phase 7-12 全部完成)
-         +106 tests  (+47%)
+v0.13.15: 413 tests  (Zig 0.17 迁移 + P0 修复 + 安全/集成门禁)
+         0 failed
 ```
 
 ---
@@ -179,29 +185,24 @@ v0.8.0:  332 tests  (Phase 7-12 全部完成)
 
 ---
 
-## 🎯 剩余差距 (94.5 → 97+)
+## 🎯 剩余差距 (92 → 95+)
 
 | # | 项目 | 影响 | 优先级 |
 |---|------|------|--------|
-| 1 | **DLQ/WAL 测试恢复** — 代码已完成，修复 ArrayList 推断问题即可 | 生产事件可靠性 | 中 |
-| 2 | **真实网络集成测试** — DistributedEventBus/ClusterMembership 在真实网络上验证 | 分布式可靠性 | 中 |
-| 3 | **并发压力测试** — 多线程 fuzzing/stress test | 并发正确性 | 低 |
-| 4 | **gRPC/Kafka wire protocol** — 当前为 placeholder, 需真实 TCP + 序列化 | 传输层完整性 | 中 |
-| 5 | **性能基准数据** — Benchmark.zig 有框架但缺数据 | 容量规划 | 低 |
-| 6 | **Pre-existing 2 failures** — DistributedTransactionManager saga + OutboxPoller | 测试完整性 | 低 |
+| 1 | **DLQ/WAL 测试恢复** — skip 用例恢复 | 事件可靠性 | 中 |
+| 2 | **真实 PG/MySQL CI** — 当前以 SQLite 单测为主 | 多 driver 回归 | 中 |
+| 3 | **gRPC/Kafka wire protocol** — placeholder → 真实 TCP | 传输层完整性 | 中 |
+| 4 | **ShopDemo 完整应用** — 从 codegen 样例到可 `zig build run` | 参考实现可信度 | 低 |
+| 5 | **性能基准数据** — Benchmark.zig 持续产出 | 容量规划 | 低 |
 
 ---
 
 ## 💡 结论
 
-**ZigModu v0.8.0 达到 94.5/100 生产级水平。**
+**ZigModu v0.13.15 在 Zig 0.17 上达到约 92/100 生产级水平**（文档可信、测试全绿、P0 生命周期问题已收敛）。
 
-从 v0.7.0 到 v0.8.0 的三阶段建设 (Phase 7-12) 使框架从 86 分提升至 94.5 分，新增 **11 个核心模块**、**106 个测试**、完整 Docker/CI/CD 栈和一个交互式 Dashboard。
+生产路线图阶段 1–5 已完成：编译/测试基线、API 域收敛、CI 两档、安全单测与 tenant-mgmt 集成探活。`sqlx.zig` / `Server.zig` 采用**分区 + 维护边界**而非物理拆分（见 `docs/PRODUCTION_ROADMAP.md`）。
 
-框架已具备支撑 ShopDemo 级（42 模块、152 表、790+ API）商业应用的全部能力：
-- **编译期安全**: 模块依赖、架构规则、结构体验证均在编译期执行
-- **运行时弹性**: 熔断、限流、隔离、重试、补偿完整覆盖
-- **生产运维**: Docker 部署、K8s 探针、灰度发布、密钥管理就绪
-- **开发者体验**: Dashboard 监控、OpenAPI 文档、合约测试、声明式验证
+**推荐学习路径**：先跑 `examples/tenant-mgmt`（模块 + 中间件 + HTTP）；再用 `examples/shopdemo/schema.sql` + zmodu CLI 理解大规模 modulith 生成。
 
-*评估完成时间: 2026-05-09*
+*评估完成时间: 2026-06-20*

@@ -279,16 +279,21 @@ pub const ConsistentHashPartitioner = struct {
         }
 
         // Handle remaining bytes
-        var k2: u64 = 0;
-        const remaining = len % 8;
-        if (remaining > 0) {
+        if (len > i) {
+            var k2: u64 = 0;
+            const remaining = len - i;
             const dest: [*]u8 = @ptrCast(&k2);
             @memcpy(dest[0..remaining], key[i..][0..remaining]);
+            k2 *%= c1;
+            k2 = (k2 << r) | (k2 >> (64 - r));
+            k2 *%= c2;
+            h ^= k2;
         }
 
-        h ^= @as(u64, @intCast(remaining));
+        h ^= @as(u64, @intCast(len));
         h ^= h >> r;
         h *%= m;
+        h ^= h >> r;
         return h;
     }
 
@@ -398,8 +403,9 @@ test "ConsistentHashPartitioner uniform distribution" {
 
         const node = partitioner.route(key);
         if (node) |n| {
-            const count = counts.getOrPut(n) catch continue;
-            count.value_ptr.* += 1;
+        const gop = counts.getOrPut(n) catch continue;
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
         }
     }
 

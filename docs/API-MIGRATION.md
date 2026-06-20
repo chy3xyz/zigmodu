@@ -87,3 +87,34 @@ pub fn main() !void {
 3. **Compile-time safety**: `scanModules()` validates dependencies at compile time
 4. **Graceful shutdown**: `app.run()` handles SIGINT/SIGTERM + drains in-flight requests
 5. **No VTable**: Direct function calls instead of indirect VTable dispatch
+
+## Domain Import Convergence (v0.13.15+)
+
+Canonical imports — use these in all new code:
+
+```zig
+const zmodu = @import("zigmodu");
+const http = zmodu.http;
+const data = zmodu.data;
+const sec = zmodu.security;
+const obs = zmodu.observability;
+```
+
+| Deprecated (remove v0.14.0) | Canonical replacement |
+|-----------------------------|------------------------|
+| `zigmodu.http_server.Server` | `zigmodu.http.Server` |
+| `zigmodu.http_server.Context` | `zigmodu.http.Context` |
+| `zigmodu.sqlx.Client` | `zigmodu.data.Client` |
+| `zigmodu.orm` | `zigmodu.data.orm` |
+| `zigmodu.SqlxBackend` | `zigmodu.data.SqlxBackend` |
+| `zigmodu.PasswordEncoder` | `zigmodu.security.PasswordEncoder` |
+| `zigmodu.SecurityModule` | `zigmodu.security.SecurityModule` |
+| `zigmodu.Cache` | `@import("cache/Lru.zig").Cache` (generic) |
+
+Flat aliases remain on `zigmodu` root via `zigmodu.deprecated` for one release cycle.
+See `src/deprecated.zig` for the full list and `REMOVAL_VERSION`.
+
+### HTTP responses
+
+Prefer `ctx.json(status, body)` or `ctx.jsonStruct(status, value)`.
+`ctx.sendSuccess` / `ctx.sendFail` are deprecated compat helpers (see `Server.zig`).

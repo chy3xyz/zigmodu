@@ -230,7 +230,13 @@ pub const OpenApiGenerator = struct {
         // paths
         try buf.appendSlice(self.allocator, "  \"paths\": {\n");
         var path_map = std.StringHashMap(std.ArrayList(*ApiEndpoint)).init(self.allocator);
-        defer path_map.deinit();
+        defer {
+            var it = path_map.iterator();
+            while (it.next()) |entry| {
+                entry.value_ptr.deinit(self.allocator);
+            }
+            path_map.deinit();
+        }
 
         for (self.endpoints.items) |*ep| {
             const gop = try path_map.getOrPut(ep.path);

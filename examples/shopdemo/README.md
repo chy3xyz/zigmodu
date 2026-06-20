@@ -1,4 +1,8 @@
-# ShopDemo — 152-table Modulith E-Commerce
+# ShopDemo — 152-table Modulith E-Commerce (codegen reference)
+
+> **能力边界**：本目录提供 **SQL schema**（`schema.sql`）与 **单模块生成样例**（`generated-sample/`）。  
+> 不是开箱即用的完整应用；完整 42 模块工程需用 [zmodu CLI](https://github.com/chy3xyz/zmodu) 自行 scaffold。  
+> **可运行旗舰示例**请见 [`../tenant-mgmt/`](../tenant-mgmt/)（多租户 SaaS，CI 集成探活）。
 
 Full-featured e-commerce schema demonstrating ZigModu's modulith architecture.
 Auto-partitioned into 30 modules by table prefix.

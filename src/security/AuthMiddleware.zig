@@ -15,7 +15,7 @@ pub fn jwtAuth(security: *SecurityModule, allocator: std.mem.Allocator) !api.Mid
     return .{
         .func = struct {
             fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
-                const auth_header = ctx.headers.get("Authorization") orelse {
+                const auth_header = ctx.headers.get("authorization") orelse {
                     try ctx.sendErrorResponse(401, 401, "Missing Authorization header");
                     return;
                 };
@@ -76,79 +76,64 @@ pub fn jwtAuth(security: *SecurityModule, allocator: std.mem.Allocator) !api.Mid
     };
 }
 
-/// Permission[...]Middleware — [...]Permission
-/// [...] jwtAuth [...]
-pub fn requirePermission(perm: []const u8) api.Middleware {
-    const perm_copy = std.heap.page_allocator.dupe(u8, perm) catch return .{
-        .func = struct {
-            fn mw(ctx: *api.Context, _: api.HandlerFn, _: ?*anyopaque) anyerror!void {
-                try ctx.sendErrorResponse(403, 403, "Permission check unavailable");
-            }
-        }.mw,
-    };
+/// Permission middleware — must run after jwtAuth.
+/// `perm` is captured at comptime (use a string literal).
+pub fn requirePermission(comptime perm: []const u8) api.Middleware {
     return .{
         .func = struct {
-            fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
-                const required = @as([]const u8, @ptrCast(@alignCast(user_data.?)));
+            fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
                 const auth = ctx.userData(Rbac.AuthInfo) orelse {
                     try ctx.sendErrorResponse(403, 403, "Authentication required before permission check");
                     return;
                 };
 
-                if (!auth.hasPermission(required)) {
+                if (!auth.hasPermission(perm)) {
                     try ctx.sendErrorResponse(403, 403, "Permission denied");
                     return;
                 }
                 try next(ctx);
             }
         }.mw,
-        .user_data = perm_copy.ptr,
     };
 }
 
-/// Permission[...] — [...]
-pub fn requireAnyPermission(perms: []const []const u8) !api.Middleware {
-    const perms_copy = std.heap.page_allocator.dupe([]const u8, perms) catch return error.OutOfMemory;
+/// Require any of the given permissions (comptime list of string literals).
+pub fn requireAnyPermission(comptime perms: []const []const u8) api.Middleware {
     return .{
         .func = struct {
-            fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
-                const required = @as([]const []const u8, @ptrCast(@alignCast(user_data.?)));
+            fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
                 const auth = ctx.userData(Rbac.AuthInfo) orelse {
                     try ctx.sendErrorResponse(403, 403, "Authentication required before permission check");
                     return;
                 };
 
-                if (!auth.hasAnyPermission(required)) {
+                if (!auth.hasAnyPermission(perms)) {
                     try ctx.sendErrorResponse(403, 403, "Permission denied");
                     return;
                 }
                 try next(ctx);
             }
         }.mw,
-        .user_data = @constCast(@ptrCast(perms_copy.ptr)),
     };
 }
 
-/// Permission[...] — [...]
-pub fn requireAllPermissions(perms: []const []const u8) !api.Middleware {
-    const perms_copy = std.heap.page_allocator.dupe([]const u8, perms) catch return error.OutOfMemory;
+/// Require all of the given permissions (comptime list of string literals).
+pub fn requireAllPermissions(comptime perms: []const []const u8) api.Middleware {
     return .{
         .func = struct {
-            fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
-                const required = @as([]const []const u8, @ptrCast(@alignCast(user_data.?)));
+            fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
                 const auth = ctx.userData(Rbac.AuthInfo) orelse {
                     try ctx.sendErrorResponse(403, 403, "Authentication required before permission check");
                     return;
                 };
 
-                if (!auth.hasAllPermissions(required)) {
+                if (!auth.hasAllPermissions(perms)) {
                     try ctx.sendErrorResponse(403, 403, "Permission denied");
                     return;
                 }
                 try next(ctx);
             }
         }.mw,
-        .user_data = @constCast(@ptrCast(perms_copy.ptr)),
     };
 }
 

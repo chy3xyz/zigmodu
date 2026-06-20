@@ -3,7 +3,7 @@ const zigmodu = @import("zigmodu");
 
 // ═══════════════════════════════════════════════════
 // Multi-Tenant Management System
-// ZigModu v0.8.0 Best Practice Demo
+// ZigModu v0.13.15 Best Practice Demo
 //
 // Architecture:
 //   HTTP → Middleware (JWT/Tenant/DataPermission) → API (Tenant/User/Subscription) → Service → Persistence → DB
@@ -48,7 +48,7 @@ pub fn main(init: std.process.Init) !void {
 
     std.log.info("╔══════════════════════════════════════════╗", .{});
     std.log.info("║  Multi-Tenant Management System          ║", .{});
-    std.log.info("║  ZigModu v0.8.0 — Best Practice Demo    ║", .{});
+    std.log.info("║  ZigModu v0.13.15 — Best Practice Demo  ║", .{});
     std.log.info("╚══════════════════════════════════════════╝", .{});
 
     // ── 1. Scan modules ────────────────────────────
@@ -87,10 +87,14 @@ pub fn main(init: std.process.Init) !void {
     var sub_api = subscription_mod.api.SubscriptionApi(@TypeOf(sub_svc)).init(&sub_svc);
 
     // ── 5. HTTP Server ──────────────────────────────
-    const port: u16 = 8080;
-    // In production, read from env: std.process.getEnvMap(allocator).get("HTTP_PORT")
+    const port: u16 = blk: {
+        if (init.environ_map.get("HTTP_PORT")) |p| {
+            break :blk std.fmt.parseInt(u16, p, 10) catch 18080;
+        }
+        break :blk 18080;
+    };
 
-    var server = zigmodu.http_server.Server.init(io, allocator, port);
+    var server = zigmodu.http.Server.init(io, allocator, port);
     defer server.deinit();
 
     // ── 6. Global Middleware ────────────────────────
@@ -109,21 +113,21 @@ pub fn main(init: std.process.Init) !void {
     // ── 8. Health endpoints ─────────────────────────
     try server.addRoute(.{
         .method = .GET,
-        .path = "/health/live",
+        .path = "health/live",
         .handler = struct {
-            fn handle(ctx: *zigmodu.http_server.Context) !void {
+            fn handle(ctx: *zigmodu.http.Context) !void {
                 try ctx.json(200, "{\"status\":\"UP\"}");
             }
         }.handle,
     });
 
     // ── 9. Dashboard ────────────────────────────────
-    zigmodu.Dashboard.system_info.module_count = 3;
-    zigmodu.Dashboard.system_info.test_passed = 332;
-    zigmodu.Dashboard.system_info.started_at = zigmodu.time.monotonicNowSeconds();
+    zigmodu.http.Dashboard.system_info.module_count = 3;
+    zigmodu.http.Dashboard.system_info.test_passed = 332;
+    zigmodu.http.Dashboard.system_info.started_at = zigmodu.time.monotonicNowSeconds();
     // Dashboard routes
-    try server.addRoute(.{ .method = .GET, .path = "/dashboard", .handler = struct {
-        fn handle(ctx: *zigmodu.http_server.Context) !void { try ctx.text(200, "Dashboard"); }
+    try server.addRoute(.{ .method = .GET, .path = "dashboard", .handler = struct {
+        fn handle(ctx: *zigmodu.http.Context) !void { try ctx.text(200, "Dashboard"); }
     }.handle });
 
     // ── 10. Start server ────────────────────────────

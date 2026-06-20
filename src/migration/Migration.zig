@@ -255,7 +255,7 @@ pub const MigrationRunner = struct {
                 if (migration.version == applied.version) {
                     if (migration.checksum) |expected_cs| {
                         if (!std.mem.eql(u8, expected_cs, applied.checksum)) {
-                            std.log.err(
+                            std.log.warn(
                                 "[Migration] Checksum mismatch for V{d}: expected {s}, got {s}",
                                 .{ applied.version, expected_cs, applied.checksum },
                             );

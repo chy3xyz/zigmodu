@@ -36,7 +36,15 @@ pub fn Cache(comptime K: type, comptime V: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            self.mutex.lock(self.io) catch return;
+            if (!self.mutex.tryLock()) {
+                var it = self.map.valueIterator();
+                while (it.next()) |node_ptr| {
+                    self.allocator.destroy(node_ptr.*);
+                }
+                self.map.deinit();
+                self.list = .{};
+                return;
+            }
             defer self.mutex.unlock(self.io);
 
             var it = self.map.valueIterator();
@@ -44,9 +52,7 @@ pub fn Cache(comptime K: type, comptime V: type) type {
                 self.allocator.destroy(node_ptr.*);
             }
             self.map.deinit();
-            // List nodes are owned by the Node structs, so no separate cleanup needed
             self.list = .{};
-            self.* = undefined;
         }
 
         /// Get value from cache (returns pointer to avoid copying)

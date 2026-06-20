@@ -11,19 +11,23 @@
 //!   const sql = try std.fmt.allocPrint(alloc, "SELECT * FROM users WHERE name = '{s}'", .{name});
 //!   client.query(sql, &.{}); // ← name may contain '; DROP TABLE users; --
 //!
-//! STRUCTURE (planned split, currently one file):
-//!   §1  Types        — Value, Row, Rows, ExecResult, Driver, Conn, Stmt   (~200L)
-//!   §2  SQLiteConn   — SQLite connection + VTable                          (~160L)
-//!   §3  PostgresConn — PostgreSQL connection + VTable                      (~240L)
-//!   §4  MySqlConn    — MySQL connection + VTable                           (~110L)
-//!   §5  PreparedStmt — SQLiteStmt, PostgresStmt, MySqlStmt                 (~270L)
-//!   §6  ConnPool     — Connection pool with circuit breaker                (~150L)
-//!   §7  Client       — Main client (init, query, exec, tx)                 (~500L)
-//!   §8  Transaction  — Transaction with rollback/savepoint                 (~100L)
-//!   §9  ORM Helpers  — Row scanning utilities                              (~100L)
-//!   §10 Tests        — ~40 test functions                                  (~900L)
+//! STRUCTURE (monolith — intentionally NOT split; see docs/PRODUCTION_ROADMAP.md):
+//!   §1  Types        — Value, Row, Rows, ExecResult, Driver, Conn, Stmt
+//!   §2  SQLiteConn   — SQLite connection + VTable
+//!   §3  PostgresConn — PostgreSQL connection + VTable
+//!   §4  MySqlConn    — MySQL connection + VTable
+//!   §5  PreparedStmt — SQLiteStmt, PostgresStmt, MySqlStmt
+//!   §6  ConnPool     — Connection pool with circuit breaker
+//!   §7  Client       — Main client (init, query, exec, tx)
+//!   §8  Transaction  — Transaction with rollback/savepoint
+//!   §9  ORM Helpers  — Row scanning utilities
+//!   §10 Tests
 //!
-//! TODO: extract §§1-6,8 into sqlx/{types,conn,pool,pg,mysql,sqlite,tx}.zig
+//! MAINTENANCE (do NOT grow this file without reading the roadmap):
+//!   - One PR should touch at most ONE § section.
+//!   - New DB driver → new file under sqlx/ (e.g. sqlx/foo_conn.zig), register here only.
+//!   - New ORM features → sqlx/orm.zig (or data layer), not ad-hoc helpers in §7.
+//!   - ConnPool / Row arena / stmt cache changes → full `zig build test` required.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -77,11 +81,7 @@ pub const Row = struct {
     pub fn get(self: Row, column: []const u8) ?Value {
         for (self.columns, 0..) |col, i| {
             if (std.mem.eql(u8, col, column)) {
-                const v = self.values[i] orelse return null;
-                switch (v) {
-                    .string => |s| return .{ .string = self.rowAllocator().dupe(u8, s) catch return null },
-                    else => return v,
-                }
+                return self.values[i];
             }
         }
         return null;
@@ -703,9 +703,7 @@ pub const PostgresConn = struct {
 
         // Convert ? → $1,$2,...
         const pg_sql = convertPlaceholders(self.allocator, sql_str) orelse return null;
-        // NOTE: do NOT free pg_sql between sequential calls on the same connection.
-        // libpq may internally cache the SQL pointer for prepared-statement reuse.
-        // Freeing early causes use-after-free on the next PQexecParams call.
+        defer self.allocator.free(pg_sql);
 
         const param_count = args.len;
         const paramValues = self.allocator.alloc(?[*]const u8, param_count) catch return null;
@@ -725,6 +723,14 @@ pub const PostgresConn = struct {
                 if (maybe_alloc) |a| self.allocator.free(a);
             }
             self.allocator.free(paramAllocs);
+        }
+        defer {
+            for (paramAllocs) |maybe_alloc| {
+                if (maybe_alloc) |a| self.allocator.free(a);
+            }
+            self.allocator.free(paramAllocs);
+            self.allocator.free(paramLengths);
+            self.allocator.free(paramValues);
         }
         @memset(paramAllocs, null);
 
@@ -1520,7 +1526,6 @@ const ConnPool = struct {
             conn.close();
         }
         self.idle.deinit(self.allocator);
-        self.* = undefined;
     }
 
     /// Reconnect and add a new idle connection to the pool
@@ -1571,9 +1576,12 @@ const ConnPool = struct {
         // Create new connection if under limit
         const current_active = self.active.load(.monotonic);
         if (current_active < self.max_open) {
-            self.mutex.unlock(self.io);
-            const conn = self.client.newConn() catch return error.ConnectionFailed;
             _ = self.active.fetchAdd(1, .monotonic);
+            self.mutex.unlock(self.io);
+            const conn = self.client.newConn() catch {
+                _ = self.active.fetchSub(1, .monotonic);
+                return error.ConnectionFailed;
+            };
             return conn;
         }
 
@@ -1692,13 +1700,34 @@ pub const Span = struct {
     }
 
     pub fn setAttribute(self: *Span, key: []const u8, value: []const u8) void {
-        self.attributes.put(key, value) catch {};
+        const alloc = std.heap.page_allocator;
+        const k = alloc.dupe(u8, key) catch return;
+        errdefer alloc.free(k);
+        const v = alloc.dupe(u8, value) catch {
+            alloc.free(k);
+            return;
+        };
+        self.attributes.put(k, v) catch {
+            alloc.free(k);
+            alloc.free(v);
+        };
+    }
+
+    pub fn deinit(self: *Span) void {
+        const alloc = std.heap.page_allocator;
+        var it = self.attributes.iterator();
+        while (it.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            alloc.free(entry.value_ptr.*);
+        }
+        self.attributes.deinit();
     }
 
     pub fn end(self: *Span) void {
         if (self.end_ns == null) {
             self.end_ns = 0;
         }
+        self.deinit();
     }
 };
 
@@ -1865,16 +1894,17 @@ pub const Client = struct {
         if (!self.cb.?.allow()) return error.CircuitBreakerOpen;
 
         const t0 = 0;
-        const result = self.doQuery(sql_str, args) catch |err| {
+        var rows = self.doQuery(sql_str, args) catch |err| {
             const elapsed: u64 = @intCast(0 - t0);
             if (self.metrics_callback) |cb| cb(elapsed, sql_str, false, @errorName(err));
             if (!self.isAcceptable(err)) self.cb.?.recordFailure();
             return err;
         };
+        for (rows.rows) |*row| row.arena = &rows.arena;
         const elapsed: u64 = @intCast(0 - t0);
         if (self.metrics_callback) |cb| cb(elapsed, sql_str, true, null);
         self.cb.?.recordSuccess();
-        return result;
+        return rows;
     }
 
     pub fn queryCtx(self: *Client, ctx: SqlContext, sql_str: []const u8, args: []const Value) !Rows {
@@ -2041,6 +2071,7 @@ pub const Client = struct {
     pub fn queryRowsPartial(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
         var rows = try self.query(sql_str, args);
         defer rows.deinit();
+        for (rows.rows) |*row| row.arena = &rows.arena;
         const result = try self.allocator.alloc(T, rows.rows.len);
         errdefer {
             for (result) |item| freeScanned(self.allocator, T, item);
@@ -2275,7 +2306,7 @@ pub const CachedConn = struct {
             return try deepCopyStruct(self.allocator, T, parsed.value);
         }
         const result = try self.client.queryRow(T, sql_str, args);
-        const json = std.json.Strinfify.valueAlloc(self.allocator, result, .{}) catch {
+        const json = std.json.Stringify.valueAlloc(self.allocator, result, .{}) catch {
             return result;
         };
         defer self.allocator.free(json);
@@ -2300,7 +2331,7 @@ pub const CachedConn = struct {
             return try deepCopyStruct(self.allocator, T, parsed.value);
         }
         const result = try self.client.queryRowPartial(T, sql_str, args);
-        const json = std.json.Strinfify.valueAlloc(self.allocator, result, .{}) catch {
+        const json = std.json.Stringify.valueAlloc(self.allocator, result, .{}) catch {
             return result;
         };
         defer self.allocator.free(json);
@@ -2333,7 +2364,7 @@ pub const CachedConn = struct {
             return result;
         }
         const result = try self.client.queryRows(T, sql_str, args);
-        const json = std.json.Strinfify.valueAlloc(self.allocator, result, .{}) catch {
+        const json = std.json.Stringify.valueAlloc(self.allocator, result, .{}) catch {
             return result;
         };
         defer self.allocator.free(json);
@@ -2366,7 +2397,7 @@ pub const CachedConn = struct {
             return result;
         }
         const result = try self.client.queryRowsPartial(T, sql_str, args);
-        const json = std.json.Strinfify.valueAlloc(self.allocator, result, .{}) catch {
+        const json = std.json.Stringify.valueAlloc(self.allocator, result, .{}) catch {
             return result;
         };
         defer self.allocator.free(json);
@@ -2870,6 +2901,25 @@ test "cached conn findOne" {
     const user2 = try cached.findOne(User, "user:1", "users", "name = ?1", &.{.{ .string = "WRONG" }});
     defer freeScanned(allocator, User, user2);
     try std.testing.expectEqualStrings("Alice", user2.name);
+}
+
+test "sqlite parameterized query treats injection payload as literal" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+
+    _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+    const malicious = "'; DROP TABLE users; --";
+    _ = try client.exec("INSERT INTO users (name) VALUES (?1)", &.{.{ .string = malicious }});
+
+    var rows = try client.query("SELECT id, name FROM users WHERE name = ?1", &.{.{ .string = malicious }});
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
+
+    var count_rows = try client.query("SELECT COUNT(*) AS cnt FROM users", &.{});
+    defer count_rows.deinit();
+    try std.testing.expectEqual(@as(i64, 1), count_rows.rows[0].get("cnt").?.int);
 }
 
 test "sqlite in-memory query and exec" {

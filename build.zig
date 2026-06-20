@@ -209,6 +209,22 @@ pub fn build(b: *std.Build) void {
     const docs_step = b.step("docs", "Generate documentation");
     docs_step.dependOn(&docs_run.step);
 
+    // Fail if examples reintroduce deprecated http_server imports
+    const check_api_cmd = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\if rg -q 'zigmodu\.http_server' examples/ 2>/dev/null; then
+        \\  echo "error: examples/ must use zigmodu.http, not zigmodu.http_server" >&2
+        \\  rg 'zigmodu\.http_server' examples/
+        \\  exit 1
+        \\fi
+    });
+    const check_api_step = b.step("check-api", "Ensure examples use canonical domain imports");
+    check_api_step.dependOn(&check_api_cmd.step);
+
+    const integration_cmd = b.addSystemCommand(&.{ "bash", "scripts/ci-integration.sh" });
+    const integration_step = b.step("integration", "Run tenant-mgmt + http-stress-test integration probes");
+    integration_step.dependOn(&integration_cmd.step);
+
     // ZModu CLI: now at https://github.com/chy3xyz/zmodu
     // Install: npm install -g @chy3xyz/zmodu
 }

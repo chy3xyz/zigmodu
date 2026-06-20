@@ -97,9 +97,7 @@ fn timingSafeSliceEql(a: []const u8, b: []const u8) bool {
     for (a, 0..) |x, i| {
         acc |= x ^ b[i];
     }
-    // Constant-time zero detection: (acc_u9 - 1) >> 8 yields 1 iff acc == 0
-    const acc_u9: u9 = acc;
-    return @as(u1, @truncate((acc_u9 -% 1) >> 8)) == 0;
+    return acc == 0;
 }
 
 fn base64Encode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {

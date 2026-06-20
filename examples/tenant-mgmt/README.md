@@ -1,6 +1,6 @@
 # Multi-Tenant Management System — ZigModu Best Practice Demo
 
-A complete multi-tenant SaaS management system built with ZigModu v0.8.0, demonstrating all framework best practices.
+A complete multi-tenant SaaS management system built with **ZigModu v0.13.15** / **Zig 0.17**, demonstrating framework best practices. This is the **flagship runnable example** (see `scripts/ci-integration.sh`).
 
 ## Architecture
 
@@ -58,15 +58,15 @@ src/modules/
 # 1. Navigate
 cd examples/tenant-mgmt
 
-# 2. Set environment
-export HTTP_PORT=8080
+# 2. Set environment (default 18080 if unset; avoid conflicting with :8080)
+export HTTP_PORT=18080
 
 # 3. Run
 zig build run
-# → Server starts on http://localhost:8080
+# → Server starts on http://localhost:18080
 
 # 4. Explore
-open http://localhost:8080/dashboard
+open http://localhost:18080/dashboard
 ```
 
 ## API Reference

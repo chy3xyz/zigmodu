@@ -25,7 +25,7 @@ defer app.stop();
 
 ## Critical Rules (MUST follow)
 
-### Zig 0.16.0 — what's REMOVED
+### Zig 0.17.0 — what's REMOVED
 | Removed | Replacement |
 |---------|-------------|
 | `std.Thread.sleep()` | busy-loop or `std.Io.sleep()` |
@@ -43,7 +43,7 @@ defer app.stop();
 | `buf.writer(allocator)` | `allocPrint + appendSlice` pattern |
 | `std.crypto.random.bytes()` | DELETED — use multi-source seed + Csprng |
 
-### Zig 0.16.0 — patterns to USE
+### Zig 0.17.0 — patterns to USE
 ```zig
 // ArrayList: .empty + explicit allocator
 var list = std.ArrayList(T).empty;
@@ -60,11 +60,8 @@ const file = try std.Io.Dir.cwd(io).createFile(io, path, .{});
 defer file.close(io);
 try file.writeStreamingAll(io, data);
 
-// Env vars: use std.process.Environ
-var iter = init.environ.iterator();
-while (iter.next()) |entry| {
-    if (std.mem.eql(u8, entry.key_ptr.*, "KEY")) { ... }
-}
+// Env vars: use init.environ_map in main (Zig 0.17 Init)
+if (init.environ_map.get("HTTP_PORT")) |p| { ... }
 
 // Time: always use Time.zig
 const now = Time.monotonicNowSeconds();
@@ -168,7 +165,22 @@ test "my test" {
 ```
 
 ## Version
-- Framework: v0.9.4
-- Zig: 0.16.0
-- Tests: ~420 passing, 0 failures
-- Score: 92/100 production readiness
+- Framework: **v0.13.15**
+- Zig: **0.17.0**
+- Tests: **413 passed**, 5 skipped, 0 failed
+- Roadmap: `docs/PRODUCTION_ROADMAP.md` (phases 1–5 ✅)
+- Score: ~92/100 (`docs/EVALUATION_REPORT.md` v4)
+
+## Learned User Preferences
+
+- Respond in 中文 for user-facing communication.
+- Do not create git commits unless the user explicitly asks.
+- Prefer the production-readiness plan without physically splitting `sqlx.zig` or `Server.zig`; use section comments plus `docs/PRODUCTION_ROADMAP.md` maintenance boundaries instead.
+- When generating framework code from SQL scripts (zmodu), follow zigmodu best practices for complete module output and place reusable templates in a dedicated templates folder.
+
+## Learned Workspace Facts
+
+- Project targets Zig 0.17.0; current release tag is v0.13.15 (GitHub `chy3xyz/zigmodu`, default branch `master`).
+- If Zig global cache fails in sandboxed runs, use `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`.
+- Production roadmap and monolith maintenance rules live in `docs/PRODUCTION_ROADMAP.md`.
+- Current test baseline: **413 passed**, 5 skipped with `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`.

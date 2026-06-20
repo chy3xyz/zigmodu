@@ -28,13 +28,25 @@ pub const ClusterMessage = struct {
 
     /// Serialize to JSON. Caller owns returned memory.
     pub fn toJson(self: *const ClusterMessage, allocator: std.mem.Allocator) ![]const u8 {
-        return try std.fmt.allocPrint(allocator, "{any}", .{std.json.fmt(self, .{})});
+        return try std.json.Stringify.valueAlloc(allocator, self, .{});
     }
 
-    /// Deserialize from JSON.
+    /// Deserialize from JSON. Caller owns returned string fields via `deinit`.
     pub fn fromJson(allocator: std.mem.Allocator, json: []const u8) !ClusterMessage {
-        const parsed = try std.json.parseFromSlice(ClusterMessage, allocator, json, .{});
-        return parsed.value;
+        var parsed = try std.json.parseFromSlice(ClusterMessage, allocator, json, .{ .allocate = .alloc_if_needed });
+        defer parsed.deinit();
+        return .{
+            .version = parsed.value.version,
+            .msg_type = parsed.value.msg_type,
+            .sender_id = try allocator.dupe(u8, parsed.value.sender_id),
+            .term = parsed.value.term,
+            .payload = if (parsed.value.payload) |p| try allocator.dupe(u8, p) else null,
+        };
+    }
+
+    pub fn deinit(self: *ClusterMessage, allocator: std.mem.Allocator) void {
+        allocator.free(self.sender_id);
+        if (self.payload) |p| allocator.free(p);
     }
 };
 
@@ -52,7 +64,8 @@ test "ClusterMessage JSON round-trip" {
 
     try std.testing.expect(std.mem.indexOf(u8, json, "vote_request") != null);
 
-    const parsed = try ClusterMessage.fromJson(allocator, json);
+    var parsed = try ClusterMessage.fromJson(allocator, json);
+    defer parsed.deinit(allocator);
     try std.testing.expectEqual(MessageType.vote_request, parsed.msg_type);
     try std.testing.expectEqual(@as(u64, 5), parsed.term);
 }

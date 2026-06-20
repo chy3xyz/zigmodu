@@ -206,7 +206,7 @@ pub const OutboxPoller = struct {
 
             if (new_retry_count >= entry.max_retries) {
                 // Max retries exhausted — mark as failed
-                std.log.err("[Outbox] Permanently failed: topic={s}, id={d}, error={s}", .{
+                std.log.warn("[Outbox] Permanently failed: topic={s}, id={d}, error={s}", .{
                     entry.topic, entry.id, err_msg,
                 });
                 if (self.error_handler_fn) |handler| {

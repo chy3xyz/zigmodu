@@ -44,12 +44,10 @@ pub const ClusterAuth = struct {
     }
 
     /// Sign a message payload with HMAC-SHA256 using the pre-shared key.
-    /// Returns hex-encoded signature. Caller owns returned memory.
+    /// Returns hex-encoded signature.
     pub fn sign(self: *ClusterAuth, payload: []const u8) ![64]u8 {
-        var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&self.pre_shared_key);
-        hmac.update(payload);
         var sig: [32]u8 = undefined;
-        hmac.final(&sig);
+        std.crypto.auth.hmac.sha2.HmacSha256.create(&sig, payload, &self.pre_shared_key);
 
         var hex: [64]u8 = undefined;
         const hex_chars = "0123456789abcdef";
@@ -64,17 +62,15 @@ pub const ClusterAuth = struct {
     fn timingSafeEql(a: []const u8, b: []const u8) bool {
         if (a.len != b.len) return false;
         var acc: u8 = 0;
-        for (a, 0..) |x, i| acc |= x ^ b[i];
-        // Constant-time zero detection: (acc_u9 - 1) >> 8 yields 1 iff acc == 0
-        const acc_u9: u9 = acc;
-        return @as(u1, @truncate((acc_u9 -% 1) >> 8)) == 0;
+        for (a, b) |x, y| acc |= x ^ y;
+        return acc == 0;
     }
 
     /// Verify a message signature.
     pub fn verify(self: *ClusterAuth, payload: []const u8, signature: []const u8) bool {
         const expected = self.sign(payload) catch return false;
         // Constant-time comparison to prevent timing oracle
-        return timingSafeEql(&expected, signature);
+        return timingSafeEql(expected[0..], signature);
     }
 };
 

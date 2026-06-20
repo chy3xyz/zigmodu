@@ -59,13 +59,10 @@ pub const WsUring = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.running.store(false, .monotonic);
+        if (self.thread) |t| t.join();
+        self.drainConnections(true);
         self.ring.deinit();
-        {
-            var it = self.connections.iterator();
-            while (it.next()) |kv| {
-                self.allocator.destroy(kv.value_ptr.*);
-            }
-        }
         self.connections.deinit();
         self.* = undefined;
     }
@@ -79,7 +76,10 @@ pub const WsUring = struct {
     /// Signal shutdown and wait for the event loop to exit.
     pub fn stop(self: *Self) void {
         self.running.store(false, .monotonic);
-        if (self.thread) |t| t.join();
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
     }
 
     /// Transfer a WS connection (after handshake) from fiber to io_uring.
@@ -132,13 +132,22 @@ pub const WsUring = struct {
             }
         }
 
-        // Cleanup
+        self.drainConnections(true);
+    }
+
+    fn drainConnections(self: *Self, notify_close: bool) void {
         var it = self.connections.iterator();
         while (it.next()) |kv| {
-            _ = linux.close(kv.key_ptr.*);
-            self.allocator.destroy(kv.value_ptr.*);
+            self.teardownConn(kv.value_ptr.*, kv.key_ptr.*, notify_close);
         }
         self.connections.clearRetainingCapacity();
+    }
+
+    fn teardownConn(self: *Self, conn: *Conn, fd: i32, notify_close: bool) void {
+        if (notify_close and conn.on_close != 0) conn.on_close(conn.session);
+        _ = self.connections.remove(fd);
+        _ = linux.close(fd);
+        self.allocator.destroy(conn);
     }
 
     /// Submit a 4KB read at the current buffer tail.
@@ -237,10 +246,7 @@ pub const WsUring = struct {
     }
 
     fn closeConn(self: *Self, conn: *Conn, fd: i32) void {
-        if (conn.on_close != 0) conn.on_close(conn.session);
-        _ = self.connections.remove(fd);
-        _ = linux.close(fd);
-        self.allocator.destroy(conn);
+        self.teardownConn(conn, fd, true);
     }
 };
 

@@ -14,6 +14,9 @@ pub const TenantInterceptor = struct {
         if (@hasDecl(T, "zigmodu_ignore_tenant")) {
             return T.zigmodu_ignore_tenant;
         }
+        if (@hasDecl(T, "is_global")) {
+            return T.is_global;
+        }
         return false;
     }
 

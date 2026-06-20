@@ -1,5 +1,5 @@
 //! Production-grade HTTP middlewares — tracing, rate limiting.
-//! Plugs into `zigmodu.http_server.Server.addMiddleware(...)`.
+//! Plugs into `zigmodu.http.Server.addMiddleware(...)`.
 //!
 //! Usage:
 //!   server.addMiddleware(zigmodu.http_middleware.tracing(&tracer));

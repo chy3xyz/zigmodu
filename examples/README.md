@@ -2,6 +2,23 @@
 
 This directory contains comprehensive examples demonstrating various features of ZigModu.
 
+## ★ Start here: Tenant Management (`examples/tenant-mgmt`)
+
+**Flagship runnable demo** — multi-tenant SaaS, middleware chain (tenant → JWT → data permission), `/health/live`, dashboard, and `zigmodu.http` canonical imports. Used by CI integration probes (`scripts/ci-integration.sh`).
+
+```bash
+cd examples/tenant-mgmt && HTTP_PORT=18080 zig build run
+curl http://127.0.0.1:18080/health/live
+```
+
+See [tenant-mgmt/README.md](tenant-mgmt/README.md) for full API reference.
+
+## ShopDemo boundary (`examples/shopdemo`)
+
+**Codegen reference only** — `schema.sql` + `generated-sample/` module output. Not a complete runnable app. Use [zmodu CLI](https://github.com/chy3xyz/zmodu) to scaffold a full 42-module project.
+
+---
+
 ## 📚 Example Index
 
 ### 1. Basic Example (`examples/basic`)
@@ -168,8 +185,10 @@ var reloader = zigmodu.HotReloader.init(allocator);
 
 **Key Concepts**:
 ```zig
-const Server = zigmodu.http_server.Server;
-const Context = zigmodu.http_server.Context;
+const http = zigmodu.http;
+
+const Server = http.Server;
+const Context = http.Context;
 
 var server = Server.init(io, allocator, 8080);
 try server.addRoute(.{ .method = .GET, .path = "/health",
