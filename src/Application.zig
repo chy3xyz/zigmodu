@@ -278,6 +278,14 @@ pub const ApplicationBuilder = struct {
         return self;
     }
 
+    /// Create a production `AppSecurity` bundle (wall-clock JWT) using this builder's io + allocator.
+    pub fn security(self: *ApplicationBuilder, jwt_secret: []const u8, token_expiry_seconds: i64) @import("security/AppSecurity.zig").AppSecurity {
+        return @import("security/AppSecurity.zig").AppSecurity.init(self.allocator, self.io, .{
+            .jwt_secret = jwt_secret,
+            .token_expiry_seconds = token_expiry_seconds,
+        });
+    }
+
     pub fn build(self: *ApplicationBuilder, comptime modules: anytype) !Application {
         return Application.init(
             self.io,

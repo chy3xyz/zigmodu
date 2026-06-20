@@ -14,21 +14,24 @@ pub fn tenantMiddleware() http.Middleware {
     }.handle };
 }
 
-/// JWT 认证中间件
-pub fn jwtAuthMiddleware(_: []const u8) http.Middleware {
-    return .{ .func = struct {
-        fn handle(ctx: *http.Context, next: http.HandlerFn, _: ?*anyopaque) anyerror!void {
-            if (std.mem.startsWith(u8, ctx.path, "/health") or std.mem.startsWith(u8, ctx.path, "health")) {
-                try next(ctx);
-                return;
+/// JWT 认证中间件 — 委托 `http_middleware.jwtAuthWithSecurity`，health 路径免鉴权。
+pub fn jwtAuthMiddleware(sec: *zigmodu.security.SecurityModule) http.Middleware {
+    const Store = struct {
+        var stored: *zigmodu.security.SecurityModule = undefined;
+    };
+    Store.stored = sec;
+    return .{
+        .func = struct {
+            fn handle(ctx: *http.Context, next: http.HandlerFn, _: ?*anyopaque) anyerror!void {
+                if (std.mem.startsWith(u8, ctx.path, "/health") or std.mem.startsWith(u8, ctx.path, "health")) {
+                    try next(ctx);
+                    return;
+                }
+                const inner = http.http_middleware.jwtAuthWithSecurity(Store.stored);
+                try inner.func(ctx, next, inner.user_data);
             }
-            if (ctx.header("authorization")) |_| {
-                try next(ctx);
-                return;
-            }
-            try ctx.sendErrorResponse(401, 0, "Missing Authorization header");
-        }
-    }.handle };
+        }.handle,
+    };
 }
 
 /// 数据权限中间件

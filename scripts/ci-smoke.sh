@@ -9,5 +9,6 @@ zig fmt --check src/
 zig build
 zig build test
 zig build check-api
+zig build check
 
 echo "smoke: OK"

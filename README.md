@@ -15,7 +15,7 @@ A modular application framework for Zig 0.17, inspired by Spring Modulith. Build
 | [Best Practices](docs/BEST_PRACTICES.md) | Architecture evolution from 1K to 1M+ DAU |
 | [API Reference](docs/API.md) | Detailed API documentation |
 | [Architecture](docs/ARCHITECTURE.md) | System design and patterns |
-| [Evaluation Report](docs/EVALUATION_REPORT.md) | Production readiness assessment (75/100) |
+| [Evaluation Report](docs/EVALUATION_REPORT.md) | Production readiness assessment (~95/100) |
 | [Examples](examples/) | Runnable example projects |
 | [ZModu CLI](https://github.com/chy3xyz/zmodu) | Code generator for modules, ORM, APIs (`npm i -g @chy3xyz/zmodu`) |
 
@@ -65,12 +65,12 @@ A modular application framework for Zig 0.17, inspired by Spring Modulith. Build
 - **Health Endpoints** — K8s-compatible liveness/readiness/module-health probes
 
 ### Security
-- **JWT Authentication** — Token generation/verification with expiry
-- **RBAC** — Role-based access control
+- **AppSecurity** — Production JWT (`initWithIo`, wall-clock exp, middleware helpers)
+- **JWT Authentication** — Unified verify via `SecurityModule`; RBAC optional
 - **Password Encoder** — Scrypt + timing-safe comparison
 - **Security Scanner** — Static SAST with configurable rules
 - **Secrets Manager** — Multi-source secrets (env > file > Vault > default)
-- **Multi-Tenancy** — TenantContext + DataPermission + ShardRouter
+- **Multi-Tenancy (optional)** — TenantContext + DataPermission + ShardRouter; skip for single-tenant
 - **Security Headers** — HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy
 - **CSRF Protection** — Double-submit cookie pattern with CSPRNG tokens
 - **Path Sanitizer** — Traversal prevention (rejects `..`, null, `/`, `\`)

@@ -16,15 +16,24 @@
 | **4** | **选做（默认跳过）** | **冻结大文件 + 分区文档 + 维护边界（见下文）** |
 | 5 | ✅ 已完成 | 集成/压测/安全测试 + CI 两档（smoke / full） |
 | 6 | ✅ 已完成 | README/评估报告/示例与宣传对齐 |
+| **7** | **✅ 已完成** | **JWT 统一 + AppSecurity + tenant-mgmt 真 JWT + CI token 生成** |
+| **8** | **✅ 已完成** | **评估 v5 (~95/100) + 多租户可选架构文档** |
 
 **验收基线（当前已达成）**
 
 ```bash
 zig build
-ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test   # 413+ passed, 5 skipped
+ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test   # 415+ passed, 5 skipped
 ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build check-api
+ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build check
 bash scripts/ci-integration.sh   # tenant-mgmt + http-stress-test（需 curl）
 ```
+
+---
+
+## 多租户：可选，非强制
+
+框架核心不假设多租户。`TenantContext` / `ShardRouter` / `DataPermission` 位于可选层；`examples/basic` 为零租户配置，`examples/tenant-mgmt` 为完整 SaaS 演示。详见 `docs/ARCHITECTURE.md` § Multi-Tenancy (Optional)。
 
 ---
 
@@ -128,4 +137,4 @@ bash scripts/ci-integration.sh   # tenant-mgmt + http-stress-test（需 curl）
 | 可维护性 | 8/10 | 靠 § 分区 + 边界规则，不靠文件数 |
 | 正确性 | 9+/10 | 测试全绿 + P0 清零 |
 | 文档可信 | 9/10 | 版本/测试数/示例一致 |
-| **综合** | **≥92/100** | 路线图阶段 1–6 已完成；文档与实测对齐 |
+| **综合** | **≥95/100** | 阶段 1–8 已完成；多租户可选 |

@@ -442,6 +442,41 @@ src/
         └── internal.zig
 ```
 
+## Multi-Tenancy (Optional)
+
+**多租户不是框架强制能力。** ZigModu 核心（`Application`、HTTP Server、SQLx、EventBus）可在完全不启用租户逻辑的情况下运行，例如 [`examples/basic/`](../examples/basic/) 就没有任何租户中间件或 `tenant_id` 过滤。
+
+多租户相关代码位于 **可选基础设施层**，按需接入：
+
+| 组件 | 路径 | 何时需要 |
+|------|------|----------|
+| `TenantContext` | `src/tenant/TenantContext.zig` | 请求级租户 ID；`ignore` / `IGNORE_TENANT_FIELD` 可跳过过滤 |
+| `TenantInterceptor` | `src/tenant/TenantInterceptor.zig` | ORM/SQL 自动追加 `tenant_id = ?` |
+| `ShardRouter` | `src/tenant/ShardRouter.zig` | 按租户路由到不同 DB 分片 |
+| `DataPermission` | `src/datapermission/` | 行级数据权限（与 RBAC 配合） |
+| JWT `aud` 租户声明 | `security.auth.jwtAuth` | 仅在使用 RBAC 中间件且 token 含租户时 |
+
+**典型组合：**
+
+```
+单租户应用（默认）
+  HTTP → jwtAuth / AppSecurity → handler → SQLx
+  （无 TenantContext，查询不带 tenant_id）
+
+多租户 SaaS（显式启用，见 examples/tenant-mgmt）
+  HTTP → [TenantMiddleware] → JWT → [DataPermission] → handler
+       → Service（显式传 app_id/tenant_id）→ SQL（WHERE tenant_id = ?）
+```
+
+要点：
+
+1. **不挂租户中间件 = 单租户**，与 Spring 里不用 `@TenantLine` 一样。
+2. **`TenantContext.isActive()`** 为 false 时，拦截器不注入条件。
+3. **JWT 默认** `generateToken(user, roles)` 的 `aud` 为 `"zigmodu-app"`，不是租户 ID；租户 claim 仅在 `generateTokenWithTenant` 或 RBAC 路径使用。
+4. **`examples/tenant-mgmt`** 是最佳实践演示，其中 `tenantMiddleware` / `dataPermissionMiddleware` 为可替换占位，生产环境按业务实现。
+
+认证（`AppSecurity` / `jwtAuth`）与多租户正交：可以只要 JWT 不要租户，也可以只要租户 header 不要 JWT（不推荐生产）。
+
 ## Conclusion
 
 ZigModu's architecture promotes:

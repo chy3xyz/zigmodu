@@ -221,6 +221,24 @@ pub fn build(b: *std.Build) void {
     const check_api_step = b.step("check-api", "Ensure examples use canonical domain imports");
     check_api_step.dependOn(&check_api_cmd.step);
 
+    const check_prod_cmd = b.addSystemCommand(&.{ "bash", "scripts/check-production.sh" });
+    const check_step = b.step("check", "Production gates: no bare catch {} in hot paths");
+    check_step.dependOn(&check_prod_cmd.step);
+
+    const gen_jwt_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/gen-jwt-token.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    gen_jwt_mod.addImport("zigmodu", zigmodu_mod);
+    const gen_jwt_exe = b.addExecutable(.{
+        .name = "gen-jwt-token",
+        .root_module = gen_jwt_mod,
+    });
+    b.installArtifact(gen_jwt_exe);
+    const gen_jwt_step = b.step("gen-jwt-token", "Build JWT token generator for CI probes");
+    gen_jwt_step.dependOn(b.getInstallStep());
+
     const integration_cmd = b.addSystemCommand(&.{ "bash", "scripts/ci-integration.sh" });
     const integration_step = b.step("integration", "Run tenant-mgmt + http-stress-test integration probes");
     integration_step.dependOn(&integration_cmd.step);

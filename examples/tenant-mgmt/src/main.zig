@@ -38,9 +38,8 @@ const tenant_mod = @import("modules/tenant/root.zig");
 const user_mod = @import("modules/user/root.zig");
 const subscription_mod = @import("modules/subscription/root.zig");
 const middleware = @import("middleware/root.zig");
-
-// ── Generic type placeholders (replace with SQLx in production) ──
-const DummyBackend = struct {};
+const db_backend = @import("db/backend.zig");
+const schema = @import("db/schema.zig");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -50,6 +49,16 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("║  Multi-Tenant Management System          ║", .{});
     std.log.info("║  ZigModu v0.13.15 — Best Practice Demo  ║", .{});
     std.log.info("╚══════════════════════════════════════════╝", .{});
+
+    const sqlite_path = init.environ_map.get("TENANT_MGMT_SQLITE") orelse ":memory:";
+    var db_client = zigmodu.data.Client.init(allocator, io, .{
+        .driver = .sqlite,
+        .sqlite_path = sqlite_path,
+    });
+    defer db_client.deinit();
+    try db_client.connect();
+    try schema.apply(&db_client);
+    std.log.info("[main] SQLite ready at {s}", .{sqlite_path});
 
     // ── 1. Scan modules ────────────────────────────
     var modules = try zigmodu.scanModules(allocator, .{
@@ -71,10 +80,10 @@ pub fn main(init: std.process.Init) !void {
     // ── 4. Assemble dependency chain ────────────────
     // Persistence → Service → API → HTTP Server
 
-    // Persistence layer
-    const tenant_persist = tenant_mod.persistence.TenantPersistence(DummyBackend).init(.{});
-    const user_persist = user_mod.persistence.UserPersistence(DummyBackend).init(.{});
-    const sub_persist = subscription_mod.persistence.SubscriptionPersistence(DummyBackend).init(.{});
+    const Backend = db_backend.Backend;
+    const tenant_persist = tenant_mod.persistence.TenantPersistence(Backend).init(allocator, &db_client);
+    const user_persist = user_mod.persistence.UserPersistence(Backend).init(&db_client);
+    const sub_persist = subscription_mod.persistence.SubscriptionPersistence(Backend).init(&db_client);
 
     // Service layer
     var tenant_svc = tenant_mod.service.TenantService(@TypeOf(tenant_persist)).init(allocator, tenant_persist);
@@ -98,9 +107,11 @@ pub fn main(init: std.process.Init) !void {
     defer server.deinit();
 
     // ── 6. Global Middleware ────────────────────────
+    const jwt_secret = init.environ_map.get("JWT_SECRET") orelse "dev-secret";
+    var app_sec = zigmodu.security.AppSecurity.init(allocator, io, .{ .jwt_secret = jwt_secret });
     // Order: tenant → JWT → data permission
     try server.addMiddleware(middleware.tenantMiddleware());
-    try server.addMiddleware(middleware.jwtAuthMiddleware("dev-secret"));
+    try server.addMiddleware(middleware.jwtAuthMiddleware(&app_sec.module));
     try server.addMiddleware(middleware.dataPermissionMiddleware());
 
     // ── 7. API Routes (v1) ──────────────────────────
@@ -123,7 +134,7 @@ pub fn main(init: std.process.Init) !void {
 
     // ── 9. Dashboard ────────────────────────────────
     zigmodu.http.Dashboard.system_info.module_count = 3;
-    zigmodu.http.Dashboard.system_info.test_passed = 332;
+    zigmodu.http.Dashboard.system_info.test_passed = 413;
     zigmodu.http.Dashboard.system_info.started_at = zigmodu.time.monotonicNowSeconds();
     // Dashboard routes
     try server.addRoute(.{ .method = .GET, .path = "dashboard", .handler = struct {

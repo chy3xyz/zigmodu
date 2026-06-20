@@ -3,6 +3,7 @@
 //! Provides Redis operations aligned with go-zero's redis functionality.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const errors = @import("../sqlx/errors.zig");
 
 /// Write command bytes to Redis stream (Zig 0.17 compat: stream.write removed).
@@ -604,9 +605,9 @@ pub const Lock = struct {
 };
 
 test "redis client" {
-    // Note: These tests require a running Redis server
-    // Skip in CI environment
-    if (true) return error.SkipZigTest;
+    // Requires a running Redis server; set REDIS_URL to enable (e.g. redis://127.0.0.1:6379).
+    const redis_url = if (builtin.os.tag == .windows) @as(?[]const u8, null) else if (std.c.getenv("REDIS_URL")) |ptr| std.mem.span(ptr) else null;
+    if (redis_url == null or redis_url.?.len == 0) return error.SkipZigTest;
 
     const cfg = RedisConfig{};
     var redis = try Redis.new(std.testing.allocator, std.testing.io, cfg);

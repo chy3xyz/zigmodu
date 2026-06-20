@@ -2,6 +2,8 @@
 
 A complete multi-tenant SaaS management system built with **ZigModu v0.13.15** / **Zig 0.17**, demonstrating framework best practices. This is the **flagship runnable example** (see `scripts/ci-integration.sh`).
 
+> **多租户是可选项。** 本示例演示 Tenant → JWT → DataPermission 中间链 + 表级 `tenant_id` 隔离。单租户应用可省略租户中间件，见 [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) § Multi-Tenancy (Optional) 与 [`examples/basic/`](../basic/)。
+
 ## Architecture
 
 ```
@@ -60,12 +62,17 @@ cd examples/tenant-mgmt
 
 # 2. Set environment (default 18080 if unset; avoid conflicting with :8080)
 export HTTP_PORT=18080
+export JWT_SECRET=dev-secret          # HS256 signing key (AppSecurity + wall clock)
+export TENANT_MGMT_SQLITE=:memory:   # or path to file
 
 # 3. Run
 zig build run
 # → Server starts on http://localhost:18080
 
-# 4. Explore
+# 4. Get a JWT for API calls (from repo root)
+# cd ../.. && zig build gen-jwt-token && JWT_SECRET=dev-secret ./zig-out/bin/gen-jwt-token
+
+# 5. Explore
 open http://localhost:18080/dashboard
 ```
 

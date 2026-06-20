@@ -2,6 +2,7 @@
 //! Import directly: `const security = @import("zigmodu").security;`
 
 pub const SecurityModule = @import("security/SecurityModule.zig").SecurityModule;
+pub const AppSecurity = @import("security/AppSecurity.zig").AppSecurity;
 pub const auth = @import("security/AuthMiddleware.zig");
 pub const Rbac = @import("security/Rbac.zig");
 pub const PasswordEncoder = @import("security/PasswordEncoder.zig").PasswordEncoder;

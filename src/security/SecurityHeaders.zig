@@ -25,7 +25,7 @@ pub fn securityHeadersMiddleware(headers: []const Header) api.MiddlewareFn {
         fn handler(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
             const hdrs: []const Header = @ptrCast(@alignCast(user_data orelse return error.InternalError));
             for (hdrs) |h| {
-                ctx.setHeader(h.name, h.value) catch {};
+                ctx.setHeader(h.name, h.value) catch |err| std.log.warn("[SecurityHeaders] setHeader failed: {}", .{err});
             }
             try next(ctx, next, user_data);
         }

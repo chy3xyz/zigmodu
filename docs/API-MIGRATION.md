@@ -114,6 +114,50 @@ const obs = zmodu.observability;
 Flat aliases remain on `zigmodu` root via `zigmodu.deprecated` for one release cycle.
 See `src/deprecated.zig` for the full list and `REMOVAL_VERSION`.
 
+## JWT & Security (v0.13.15+)
+
+Production apps should use **wall-clock** JWT expiry (not monotonic time).
+
+```zig
+const zmodu = @import("zigmodu");
+const sec = zmodu.security;
+
+// Recommended: builder helper (uses initWithIo internally)
+var b = zmodu.builder(allocator, io).withName("my-app");
+var app_sec = b.security("your-secret", 3600);
+try server.addMiddleware(app_sec.jwtMiddleware());
+
+// RBAC handlers (AuthInfo in ctx.user_data)
+const rbac_mw = try app_sec.rbacJwtMiddleware(allocator);
+try server.addMiddleware(rbac_mw);
+
+// Token issuance (same clock as verify when using AppSecurity)
+const token = try app_sec.generateToken("user-id", &.{ "admin" });
+defer allocator.free(token);
+```
+
+| API | Use when |
+|-----|----------|
+| `security.AppSecurity.init(allocator, io, .{ .jwt_secret = ... })` | Production HTTP server |
+| `http_middleware.jwtAuthWithSecurity(&sec.module)` | Manual wiring |
+| `http_middleware.jwtAuth("secret")` | Quick dev / tests (`ctx.io` enables wall clock) |
+| `security.auth.jwtAuth(&sec.module, allocator)` | RBAC + tenant claims |
+
+CI / local probes: `JWT_SECRET=dev-secret zig build gen-jwt-token && ./zig-out/bin/gen-jwt-token`
+
+## Multi-Tenancy (Optional)
+
+ZigModu **does not require** multi-tenancy. Core apps (`examples/basic`) run without `TenantContext` or `tenant_id` columns.
+
+| Need | Use |
+|------|-----|
+| Single-tenant API | `AppSecurity` + `jwtMiddleware()` only |
+| Row-level tenant isolation | `TenantContext` + explicit `WHERE tenant_id = ?` or `TenantInterceptor` |
+| JWT tenant claim | `generateTokenWithTenant` + `security.auth.jwtAuth` (RBAC) |
+| Full SaaS stack | See `examples/tenant-mgmt` |
+
+Skip tenant filtering: `TenantContext.ignoreTenant()` or struct field `zigmodu_ignore_tenant`.
+
 ### HTTP responses
 
 Prefer `ctx.json(status, body)` or `ctx.jsonStruct(status, value)`.

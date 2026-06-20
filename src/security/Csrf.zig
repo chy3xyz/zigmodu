@@ -37,10 +37,10 @@ pub const CsrfProtection = struct {
                             !std.mem.eql(u8, csrf.token[0..], cookie_token))
                         {
                             ctx.status_code = 403;
-                            ctx.setHeader("Content-Type", "application/json") catch {};
+                            ctx.setHeader("Content-Type", "application/json") catch |err| std.log.err("[CSRF] setHeader failed: {}", .{err});
                             _ = ctx.stream.?.writer(ctx.io.?, &.{}{}).interface.writeAll(
                                 "{\"code\":403,\"msg\":\"CSRF validation failed\"}",
-                            ) catch {};
+                            ) catch |err| std.log.err("[CSRF] write 403 body failed: {}", .{err});
                             ctx.responded = true;
                             return;
                         }
@@ -49,7 +49,7 @@ pub const CsrfProtection = struct {
                 }
 
                 // Set CSRF cookie on every response
-                ctx.setHeader("X-CSRF-Token", csrf.token[0..]) catch {};
+                ctx.setHeader("X-CSRF-Token", csrf.token[0..]) catch |err| std.log.warn("[CSRF] set token header failed: {}", .{err});
                 try next(ctx, next, user_data);
             }
         };

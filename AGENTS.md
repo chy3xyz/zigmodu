@@ -101,7 +101,7 @@ pub fn deinit() void {
 
 ### Security
 - Passwords: `sec.PasswordEncoder` (PBKDF2-HMAC-SHA256, 100K iterations)
-- JWT: `sec.SecurityModule` (HS256, timing-safe comparison)
+- JWT: `sec.AppSecurity.init(allocator, io, .{ .jwt_secret = ... })` + `jwtMiddleware()` (wall clock); RBAC via `sec.auth.jwtAuth`
 - Secrets: `sec.SecretsManager` (env > file > vault > default priority)
 - CSRF: `http_middleware.csrf()` double-submit cookie pattern
 - CSPRNG: multi-source entropy, never single-timestamp seed

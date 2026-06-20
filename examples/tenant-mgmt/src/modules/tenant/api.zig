@@ -27,6 +27,7 @@ pub fn TenantApi(comptime Service: type) type {
                 try ctx.sendErrorResponse(500, 0, "Failed to list tenants");
                 return;
             };
+            defer self.service.freeTenantList(tenants);
 
             var buf = std.ArrayList(u8).empty;
             defer buf.deinit(ctx.allocator);
