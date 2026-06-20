@@ -43,6 +43,8 @@ pub extern "c" fn PQgetisnull(res: ?*const PGresult, row: c_int, col: c_int) c_i
 pub extern "c" fn PQcmdTuples(res: ?*const PGresult) [*c]const u8;
 pub extern "c" fn PQoidValue(res: ?*const PGresult) Oid;
 pub extern "c" fn PQerrorMessage(conn: ?*const PGconn) [*c]const u8;
+pub extern "c" fn PQresultErrorField(res: ?*const PGresult, fieldcode: c_int) [*c]const u8;
+pub extern "c" fn PQresultErrorMessage(res: ?*const PGresult) [*c]const u8;
 pub extern "c" fn PQprepare(conn: ?*PGconn, stmtName: [*c]const u8, query: [*c]const u8, nParams: c_int, paramTypes: ?[*]const Oid) ?*PGresult;
 pub extern "c" fn PQexecPrepared(
     conn: ?*PGconn,

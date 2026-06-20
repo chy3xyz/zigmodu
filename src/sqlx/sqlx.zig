@@ -124,6 +124,89 @@ pub const Driver = enum {
     mysql,
 };
 
+/// Structured diagnostic for SQL errors — table and column are extracted from
+/// driver error messages when available (e.g. "UNIQUE constraint failed: users.email").
+pub const SqlDiagnostic = struct {
+    code: i32,
+    message: []const u8, // driver error message (borrowed, not owned)
+    constraint: ?[]const u8 = null, // e.g. "users.email" (SQLite), "users_email_key" (PG)
+    table: ?[]const u8 = null,
+    column: ?[]const u8 = null,
+};
+
+/// Parse SQLite error message to extract table/column from constraint failures.
+pub fn diagnoseSqlite(err_code: i32, err_msg: []const u8) SqlDiagnostic {
+    var diag = SqlDiagnostic{ .code = err_code, .message = err_msg };
+
+    if (err_code == 19) { // SQLITE_CONSTRAINT
+        // "UNIQUE constraint failed: table.column"
+        if (std.mem.indexOf(u8, err_msg, "UNIQUE constraint failed:")) |pos| {
+            const rest = std.mem.trim(u8, err_msg[pos + 24 ..], " \t\r\n");
+            if (rest.len > 0) {
+                diag.constraint = rest;
+                if (std.mem.indexOf(u8, rest, ".")) |dot| {
+                    diag.table = rest[0..dot];
+                    diag.column = rest[dot + 1 ..];
+                } else {
+                    diag.table = rest;
+                }
+            }
+        }
+        // "NOT NULL constraint failed: table.column"
+        if (std.mem.indexOf(u8, err_msg, "NOT NULL constraint failed:")) |pos| {
+            const rest = std.mem.trim(u8, err_msg[pos + 26 ..], " \t\r\n");
+            if (rest.len > 0) {
+                diag.constraint = rest;
+                if (std.mem.indexOf(u8, rest, ".")) |dot| {
+                    diag.table = rest[0..dot];
+                    diag.column = rest[dot + 1 ..];
+                } else {
+                    diag.table = rest;
+                }
+            }
+        }
+    } else if (err_code == 1) { // SQLITE_ERROR
+        // "no such table: xxx"
+        if (std.mem.indexOf(u8, err_msg, "no such table:")) |pos| {
+            const rest = std.mem.trim(u8, err_msg[pos + 14 ..], " \t\r\n");
+            if (rest.len > 0) {
+                diag.table = rest;
+            }
+        }
+    }
+    return diag;
+}
+
+/// PG_DIAG_* field codes (from postgres_ext.h)
+const PG_DIAG_SQLSTATE: c_int = 'C';
+const PG_DIAG_CONSTRAINT_NAME: c_int = 'n';
+const PG_DIAG_TABLE_NAME: c_int = 't';
+const PG_DIAG_COLUMN_NAME: c_int = 'c';
+
+/// Extract diagnostic info from a PostgreSQL PGresult after a failure.
+pub fn diagnosePostgres(result: ?*const libpq_c.PGresult) SqlDiagnostic {
+    var diag = SqlDiagnostic{ .code = 0, .message = "" };
+
+    const sqlstate = if (result) |r| std.mem.span(libpq_c.PQresultErrorField(r, PG_DIAG_SQLSTATE)) else "";
+    if (sqlstate.len > 0) {
+        diag.code = @intCast(sqlstate.len); // store sqlstate length in code for type compatibility
+    }
+
+    const msg = if (result) |r| std.mem.span(libpq_c.PQresultErrorMessage(r)) else "";
+    diag.message = msg;
+
+    if (result) |r| {
+        const constraint = std.mem.span(libpq_c.PQresultErrorField(r, PG_DIAG_CONSTRAINT_NAME));
+        if (constraint.len > 0) diag.constraint = constraint;
+        const table = std.mem.span(libpq_c.PQresultErrorField(r, PG_DIAG_TABLE_NAME));
+        if (table.len > 0) diag.table = table;
+        const column = std.mem.span(libpq_c.PQresultErrorField(r, PG_DIAG_COLUMN_NAME));
+        if (column.len > 0) diag.column = column;
+    }
+
+    return diag;
+}
+
 /// SQL connection interface
 pub const Conn = struct {
     ptr: *anyopaque,
@@ -396,6 +479,15 @@ pub const SQLiteConn = struct {
     allocator: std.mem.Allocator,
     /// LRU cache of prepared statements keyed by SQL string.
     stmt_cache: std.StringHashMap(*sqlite3_c.sqlite3_stmt),
+    magic: u32 = 0xDBDBDBDB,
+
+    fn guard(self: *const @This()) void {
+        if (self.magic != 0xDBDBDBDB) @panic("DB heap corruption detected (SQLite magic mismatch)");
+    }
+
+    fn poison(self: *@This()) void {
+        self.magic = 0xDEADDEAD;
+    }
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !SQLiteConn {
         var db: ?*sqlite3_c.sqlite3 = null;
@@ -415,6 +507,7 @@ pub const SQLiteConn = struct {
 
     /// Get or prepare a cached statement. Returns sqlite3_reset'd stmt ready for binding.
     fn getCachedStmt(self: *SQLiteConn, sql_str: []const u8) !*sqlite3_c.sqlite3_stmt {
+        self.guard();
         if (self.stmt_cache.get(sql_str)) |cached| {
             _ = sqlite3_c.sqlite3_reset(cached);
             // sqlite3_clear_bindings not in bindings
@@ -435,7 +528,17 @@ pub const SQLiteConn = struct {
         }
         var stmt: ?*sqlite3_c.sqlite3_stmt = null;
         const rc = sqlite3_c.sqlite3_prepare_v2(self.db, @ptrCast(sql_str.ptr), @intCast(sql_str.len), &stmt, null);
-        if (rc != sqlite3_c.SQLITE_OK or stmt == null) return error.DatabaseError;
+        if (rc != sqlite3_c.SQLITE_OK or stmt == null) {
+            const err_msg = std.mem.span(sqlite3_c.sqlite3_errmsg(self.db));
+            const ext_code = sqlite3_c.sqlite3_extended_errcode(self.db);
+            const diag = diagnoseSqlite(ext_code, err_msg);
+            if (ext_code == 1 and std.mem.indexOf(u8, err_msg, "no such table") != null) { // SQLITE_ERROR + no such table
+                std.log.err("SQLite not found: table={s}", .{diag.table orelse "?"});
+                return error.NotFound;
+            }
+            std.log.err("SQLite prepare error: code={d} msg={s}", .{ ext_code, err_msg });
+            return error.DatabaseError;
+        }
         const key = self.allocator.dupe(u8, sql_str) catch {
             _ = sqlite3_c.sqlite3_finalize(stmt);
             return error.DatabaseError;
@@ -447,6 +550,7 @@ pub const SQLiteConn = struct {
     fn queryFn(ptr: *anyopaque, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value) errors.ResultT(Rows) {
         _ = allocator;
         const self = @as(*SQLiteConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const arena_alloc = arena.allocator();
@@ -458,7 +562,8 @@ pub const SQLiteConn = struct {
         const col_count = sqlite3_c.sqlite3_column_count(stmt);
         var rows_list: std.ArrayList(Row) = std.ArrayList(Row).empty;
 
-        while (sqlite3_c.sqlite3_step(stmt) == sqlite3_c.SQLITE_ROW) {
+        var step_rc = sqlite3_c.sqlite3_step(stmt);
+        while (step_rc == sqlite3_c.SQLITE_ROW) {
             const columns = arena_alloc.alloc([]const u8, @intCast(col_count)) catch return error.DatabaseError;
             const values = arena_alloc.alloc(?Value, @intCast(col_count)) catch return error.DatabaseError;
             for (0..@intCast(col_count)) |i| {
@@ -469,6 +574,14 @@ pub const SQLiteConn = struct {
                 values[i] = readSQLiteValue(arena_alloc, stmt, @intCast(i));
             }
             rows_list.append(arena_alloc, .{ .arena = undefined, .columns = columns, .values = values }) catch return error.DatabaseError;
+            step_rc = sqlite3_c.sqlite3_step(stmt);
+        }
+        // Check if step ended with an error (not DONE)
+        if (step_rc != sqlite3_c.SQLITE_DONE) {
+            const err_msg = std.mem.span(sqlite3_c.sqlite3_errmsg(self.db));
+            const ext_code = sqlite3_c.sqlite3_extended_errcode(self.db);
+            std.log.err("SQLite query error: code={d} msg={s}", .{ ext_code, err_msg });
+            return error.DatabaseError;
         }
 
         const rows_slice = arena_alloc.alloc(Row, rows_list.items.len) catch return error.DatabaseError;
@@ -478,12 +591,23 @@ pub const SQLiteConn = struct {
 
     fn execFn(ptr: *anyopaque, sql_str: []const u8, args: []const Value) errors.ResultT(ExecResult) {
         const self = @as(*SQLiteConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
         const stmt = try self.getCachedStmt(sql_str);
 
         try bindSQLite(stmt, args);
 
         const step_rc = sqlite3_c.sqlite3_step(stmt);
-        if (step_rc != sqlite3_c.SQLITE_DONE and step_rc != sqlite3_c.SQLITE_ROW) return error.DatabaseError;
+        if (step_rc != sqlite3_c.SQLITE_DONE and step_rc != sqlite3_c.SQLITE_ROW) {
+            const err_msg = std.mem.span(sqlite3_c.sqlite3_errmsg(self.db));
+            const ext_code = sqlite3_c.sqlite3_extended_errcode(self.db);
+            const diag = diagnoseSqlite(ext_code, err_msg);
+            if (ext_code == 19) { // SQLITE_CONSTRAINT
+                std.log.err("SQLite constraint violation: table={s} column={s} msg={s}", .{ diag.table orelse "?", diag.column orelse "?", err_msg });
+                return error.ConstraintViolation;
+            }
+            std.log.err("SQLite exec error: code={d} msg={s}", .{ ext_code, err_msg });
+            return error.DatabaseError;
+        }
 
         return ExecResult{
             .last_insert_id = sqlite3_c.sqlite3_last_insert_rowid(self.db),
@@ -493,6 +617,7 @@ pub const SQLiteConn = struct {
 
     fn closeFn(ptr: *anyopaque) void {
         const self = @as(*SQLiteConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
         // Finalize all cached statements
         var it = self.stmt_cache.iterator();
         while (it.next()) |entry| {
@@ -504,34 +629,40 @@ pub const SQLiteConn = struct {
             _ = sqlite3_c.sqlite3_close(db);
             self.db = null;
         }
+        self.poison();
         self.allocator.destroy(self);
     }
 
     fn pingFn(ptr: *anyopaque) errors.Result {
         const self = @as(*SQLiteConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
         if (self.db == null) return error.DatabaseError;
     }
 
     fn beginFn(ptr: *anyopaque) errors.Result {
         const self = @as(*SQLiteConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
         const rc = sqlite3_c.sqlite3_exec(self.db, "BEGIN", null, null, null);
         if (rc != sqlite3_c.SQLITE_OK) return error.DatabaseError;
     }
 
     fn commitFn(ptr: *anyopaque) errors.Result {
         const self = @as(*SQLiteConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
         const rc = sqlite3_c.sqlite3_exec(self.db, "COMMIT", null, null, null);
         if (rc != sqlite3_c.SQLITE_OK) return error.DatabaseError;
     }
 
     fn rollbackFn(ptr: *anyopaque) errors.Result {
         const self = @as(*SQLiteConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
         const rc = sqlite3_c.sqlite3_exec(self.db, "ROLLBACK", null, null, null);
         if (rc != sqlite3_c.SQLITE_OK) return error.DatabaseError;
     }
 
     fn prepareFn(ptr: *anyopaque, allocator: std.mem.Allocator, sql_str: []const u8) errors.ResultT(Stmt) {
         const self = @as(*SQLiteConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
         const stmt = allocator.create(SQLiteStmt) catch return error.DatabaseError;
         errdefer allocator.destroy(stmt);
         stmt.* = SQLiteStmt.prepare(self.db, allocator, sql_str) catch return error.DatabaseError;
@@ -598,6 +729,15 @@ pub const PostgresConn = struct {
     /// LRU-style prepared statement cache: SQL text → statement name.
     stmt_cache: std.StringHashMap([]const u8),
     stmt_counter: u64 = 0,
+    magic: u32 = 0xDBDBDBDB,
+
+    fn guard(self: *const @This()) void {
+        if (self.magic != 0xDBDBDBDB) @panic("DB heap corruption detected (PG magic mismatch)");
+    }
+
+    fn poison(self: *@This()) void {
+        self.magic = 0xDEADDEAD;
+    }
 
     /// Connect using explicit parameters via dlsym (bypasses Zig C ABI issues)
     pub fn connectParams(allocator: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, pass: []const u8, db: []const u8) !PostgresConn {
@@ -626,6 +766,7 @@ pub const PostgresConn = struct {
 
     fn queryFn(ptr: *anyopaque, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value) errors.ResultT(Rows) {
         const self = @as(*PostgresConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
         const arena_alloc = arena.allocator();
@@ -641,6 +782,22 @@ pub const PostgresConn = struct {
         if (status != libpq_c.ExecStatusType.PGRES_TUPLES_OK) {
             const err_msg = std.mem.span(libpq_c.PQerrorMessage(self.conn));
             std.log.err("PG queryFn: status={d} sql={s} err={s}", .{ @intFromEnum(status), sql_str, err_msg });
+            if (status == libpq_c.ExecStatusType.PGRES_FATAL_ERROR) {
+                const diag = diagnosePostgres(res);
+                const sqlstate = std.mem.span(libpq_c.PQresultErrorField(res.?, PG_DIAG_SQLSTATE));
+                const db_err = errors.sqlStateToError(sqlstate);
+                switch (db_err) {
+                    error.ConstraintViolation => {
+                        std.log.err("PG constraint violation: table={s} column={s}", .{ diag.table orelse "?", diag.column orelse "?" });
+                        return error.ConstraintViolation;
+                    },
+                    error.NotFound => return error.NotFound,
+                    error.ConnectionFailed => return error.DatabaseConnectionFailed,
+                    error.SerializationFailure => return error.SerializationFailure,
+                    error.ReadOnlyViolation => return error.ReadOnlyViolation,
+                    else => return error.DatabaseError,
+                }
+            }
             return error.DatabaseError;
         }
 
@@ -674,6 +831,7 @@ pub const PostgresConn = struct {
 
     fn execFn(ptr: *anyopaque, sql_str: []const u8, args: []const Value) errors.ResultT(ExecResult) {
         const self = @as(*PostgresConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
         const res = execPrepared(self, sql_str, args);
         if (res == null) {
             std.log.err("PG execFn: execPrepared returned null sql={s}", .{sql_str});
@@ -685,6 +843,22 @@ pub const PostgresConn = struct {
         if (status != libpq_c.ExecStatusType.PGRES_COMMAND_OK and status != libpq_c.ExecStatusType.PGRES_TUPLES_OK) {
             const err_msg = std.mem.span(libpq_c.PQerrorMessage(self.conn));
             std.log.err("PG execFn: status={d} sql={s} err={s}", .{ @intFromEnum(status), sql_str, err_msg });
+            if (status == libpq_c.ExecStatusType.PGRES_FATAL_ERROR) {
+                const diag = diagnosePostgres(res.?);
+                const sqlstate = std.mem.span(libpq_c.PQresultErrorField(res.?, PG_DIAG_SQLSTATE));
+                const db_err = errors.sqlStateToError(sqlstate);
+                switch (db_err) {
+                    error.ConstraintViolation => {
+                        std.log.err("PG constraint violation: table={s} column={s}", .{ diag.table orelse "?", diag.column orelse "?" });
+                        return error.ConstraintViolation;
+                    },
+                    error.NotFound => return error.NotFound,
+                    error.ConnectionFailed => return error.DatabaseConnectionFailed,
+                    error.SerializationFailure => return error.SerializationFailure,
+                    error.ReadOnlyViolation => return error.ReadOnlyViolation,
+                    else => return error.DatabaseError,
+                }
+            }
             return error.DatabaseError;
         }
 
@@ -943,6 +1117,7 @@ pub const PostgresConn = struct {
 
     fn closeFn(ptr: *anyopaque) void {
         const self = @as(*PostgresConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
         // Deallocate all cached prepared statements
         var it = self.stmt_cache.iterator();
         while (it.next()) |entry| {
@@ -957,16 +1132,19 @@ pub const PostgresConn = struct {
             libpq_c.PQfinish(conn);
             self.conn = null;
         }
+        self.poison();
         self.allocator.destroy(self);
     }
 
     fn pingFn(ptr: *anyopaque) errors.Result {
         const self = @as(*PostgresConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
         if (self.conn == null or libpq_c.PQstatus(self.conn) != libpq_c.ConnStatusType.CONNECTION_OK) return error.DatabaseError;
     }
 
     fn beginFn(ptr: *anyopaque) errors.Result {
         const self = @as(*PostgresConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
         const res = libpq_c.PQexec(self.conn, "BEGIN");
         defer libpq_c.PQclear(res);
         if (libpq_c.PQresultStatus(res) != libpq_c.ExecStatusType.PGRES_COMMAND_OK) return error.DatabaseError;
@@ -974,6 +1152,7 @@ pub const PostgresConn = struct {
 
     fn commitFn(ptr: *anyopaque) errors.Result {
         const self = @as(*PostgresConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
         const res = libpq_c.PQexec(self.conn, "COMMIT");
         defer libpq_c.PQclear(res);
         if (libpq_c.PQresultStatus(res) != libpq_c.ExecStatusType.PGRES_COMMAND_OK) return error.DatabaseError;
@@ -981,6 +1160,7 @@ pub const PostgresConn = struct {
 
     fn rollbackFn(ptr: *anyopaque) errors.Result {
         const self = @as(*PostgresConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
         const res = libpq_c.PQexec(self.conn, "ROLLBACK");
         defer libpq_c.PQclear(res);
         if (libpq_c.PQresultStatus(res) != libpq_c.ExecStatusType.PGRES_COMMAND_OK) return error.DatabaseError;
@@ -988,6 +1168,7 @@ pub const PostgresConn = struct {
 
     fn prepareFn(ptr: *anyopaque, allocator: std.mem.Allocator, sql_str: []const u8) errors.ResultT(Stmt) {
         const self = @as(*PostgresConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
         const stmt = allocator.create(PostgresStmt) catch return error.DatabaseError;
         errdefer allocator.destroy(stmt);
         stmt.* = PostgresStmt.prepare(self.conn, allocator, sql_str) catch return error.DatabaseError;
@@ -1108,6 +1289,15 @@ fn mysqlReadRowsAfterQuery(mysql: ?*libmysql_c.MYSQL, arena: std.heap.ArenaAlloc
 pub const MySqlConn = struct {
     mysql: ?*libmysql_c.MYSQL,
     allocator: std.mem.Allocator,
+    magic: u32 = 0xDBDBDBDB,
+
+    fn guard(self: *const @This()) void {
+        if (self.magic != 0xDBDBDBDB) @panic("DB heap corruption detected (MySQL magic mismatch)");
+    }
+
+    fn poison(self: *@This()) void {
+        self.magic = 0xDEADDEAD;
+    }
 
     pub fn connect(allocator: std.mem.Allocator, host: []const u8, user: []const u8, password: []const u8, db: []const u8, port: u32) !MySqlConn {
         const mysql = libmysql_c.mysql_init(null);
@@ -1129,23 +1319,41 @@ pub const MySqlConn = struct {
 
     fn queryFn(ptr: *anyopaque, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value) errors.ResultT(Rows) {
         const self = @as(*MySqlConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
 
         const query = formatQuery(self.allocator, sql_str, args) catch return error.DatabaseError;
         defer self.allocator.free(query);
 
-        if (libmysql_c.mysql_real_query(self.mysql, @ptrCast(query.ptr), @intCast(query.len)) != 0) return error.DatabaseError;
+        if (libmysql_c.mysql_real_query(self.mysql, @ptrCast(query.ptr), @intCast(query.len)) != 0) {
+            const err_no = libmysql_c.mysql_errno(self.mysql);
+            const err_msg = std.mem.span(libmysql_c.mysql_error(self.mysql));
+            std.log.err("MySQL query error: errno={d} msg={s}", .{ err_no, err_msg });
+            if (err_no == 1062 or err_no == 1586) { // duplicate entry / constraint
+                return error.ConstraintViolation;
+            }
+            return error.DatabaseError;
+        }
 
         return mysqlReadRowsAfterQuery(self.mysql, arena);
     }
 
     fn execFn(ptr: *anyopaque, sql_str: []const u8, args: []const Value) errors.ResultT(ExecResult) {
         const self = @as(*MySqlConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
         const query = formatQuery(self.allocator, sql_str, args) catch return error.DatabaseError;
         defer self.allocator.free(query);
 
-        if (libmysql_c.mysql_real_query(self.mysql, @ptrCast(query.ptr), @intCast(query.len)) != 0) return error.DatabaseError;
+        if (libmysql_c.mysql_real_query(self.mysql, @ptrCast(query.ptr), @intCast(query.len)) != 0) {
+            const err_no = libmysql_c.mysql_errno(self.mysql);
+            const err_msg = std.mem.span(libmysql_c.mysql_error(self.mysql));
+            std.log.err("MySQL exec error: errno={d} msg={s}", .{ err_no, err_msg });
+            if (err_no == 1062 or err_no == 1586) { // duplicate entry / constraint
+                return error.ConstraintViolation;
+            }
+            return error.DatabaseError;
+        }
         // mysql_store_result returns NULL for DDL/DML (no result set). Only free if non-null.
         const res = libmysql_c.mysql_store_result(self.mysql);
         if (res != null) libmysql_c.mysql_free_result(res);
@@ -1158,15 +1366,18 @@ pub const MySqlConn = struct {
 
     fn closeFn(ptr: *anyopaque) void {
         const self = @as(*MySqlConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
         if (self.mysql) |mysql| {
             libmysql_c.mysql_close(mysql);
             self.mysql = null;
         }
+        self.poison();
         self.allocator.destroy(self);
     }
 
     fn pingFn(ptr: *anyopaque) errors.Result {
         const self = @as(*MySqlConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
         if (self.mysql == null) return error.DatabaseError;
         const rc = libmysql_c.mysql_real_query(self.mysql, "SELECT 1", @intCast("SELECT 1".len));
         if (rc != 0) return error.DatabaseError;
@@ -1176,6 +1387,7 @@ pub const MySqlConn = struct {
 
     fn beginFn(ptr: *anyopaque) errors.Result {
         const self = @as(*MySqlConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
         if (libmysql_c.mysql_real_query(self.mysql, "START TRANSACTION", 17) != 0) return error.DatabaseError;
         const res = libmysql_c.mysql_store_result(self.mysql);
         if (res != null) libmysql_c.mysql_free_result(res);
@@ -1183,6 +1395,7 @@ pub const MySqlConn = struct {
 
     fn commitFn(ptr: *anyopaque) errors.Result {
         const self = @as(*MySqlConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
         if (libmysql_c.mysql_real_query(self.mysql, "COMMIT", 6) != 0) return error.DatabaseError;
         const res = libmysql_c.mysql_store_result(self.mysql);
         if (res != null) libmysql_c.mysql_free_result(res);
@@ -1190,6 +1403,7 @@ pub const MySqlConn = struct {
 
     fn rollbackFn(ptr: *anyopaque) errors.Result {
         const self = @as(*MySqlConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
         if (libmysql_c.mysql_real_query(self.mysql, "ROLLBACK", 8) != 0) return error.DatabaseError;
         const res = libmysql_c.mysql_store_result(self.mysql);
         if (res != null) libmysql_c.mysql_free_result(res);
@@ -1197,6 +1411,7 @@ pub const MySqlConn = struct {
 
     fn prepareFn(ptr: *anyopaque, allocator: std.mem.Allocator, sql_str: []const u8) errors.ResultT(Stmt) {
         const self = @as(*MySqlConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
         const stmt = allocator.create(MySqlStmt) catch return error.DatabaseError;
         errdefer allocator.destroy(stmt);
         stmt.* = MySqlStmt.prepare(self.mysql, allocator, sql_str) catch return error.DatabaseError;
@@ -1642,6 +1857,46 @@ const ConnPool = struct {
             conn.close();
             _ = self.active.fetchSub(1, .monotonic);
         }
+    }
+
+    /// Ping all idle connections — returns false if any are dead.
+    pub fn ping(self: *ConnPool) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        var all_healthy = true;
+        var i: usize = 0;
+        while (i < self.idle.items.len) {
+            self.idle.items[i].ping() catch {
+                // Connection is dead — close it and remove from idle pool
+                self.idle.items[i].close();
+                _ = self.active.fetchSub(1, .monotonic);
+                _ = self.idle.swapRemove(i);
+                all_healthy = false;
+                continue;
+            };
+            i += 1;
+        }
+        return all_healthy;
+    }
+
+    /// Run keepAlive — ping all idle connections and log dead ones.
+    pub fn keepAlive(self: *ConnPool) void {
+        if (!self.ping()) {
+            std.log.warn("[ConnPool] keepAlive: some idle connections were dead and removed", .{});
+        }
+    }
+
+    /// Execute a function within a transaction, acquiring a connection from the pool.
+    /// The connection is automatically released after commit or rollback.
+    pub fn transaction(self: *ConnPool, comptime func: anytype, args: anytype) !@typeInfo(@TypeOf(func)).@"fn".return_type {
+        const conn = try self.acquire();
+        defer self.release(conn);
+        try conn.begin();
+        errdefer conn.rollback() catch |e| std.log.err("[ConnPool] tx rollback failed: {}", .{e});
+        const result = try @call(.auto, func, .{conn} ++ args);
+        try conn.commit();
+        return result;
     }
 };
 

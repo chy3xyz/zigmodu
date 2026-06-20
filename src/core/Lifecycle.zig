@@ -11,7 +11,22 @@ pub fn startAll(modules: *ApplicationModules) !void {
 
     const ordered_modules = try getSortedModules(modules);
 
-    for (ordered_modules) |module_name| {
+    var started_count: usize = 0;
+    errdefer {
+        // Stop already-started modules in REVERSE order on failure
+        var i: usize = started_count;
+        while (i > 0) {
+            i -= 1;
+            const module_name = ordered_modules[i];
+            const module = modules.get(module_name) orelse continue;
+            if (module.deinit_fn) |deinit| {
+                std.log.warn("Rolling back module: {s}", .{module_name});
+                deinit(module.ptr);
+            }
+        }
+    }
+
+    for (ordered_modules, 0..) |module_name, idx| {
         const module = modules.get(module_name) orelse continue;
 
         if (module.init_fn) |init| {
@@ -21,6 +36,7 @@ pub fn startAll(modules: *ApplicationModules) !void {
                 return ZigModuError.ModuleInitializationFailed;
             };
         }
+        started_count = idx + 1;
     }
 
     std.log.info("All {d} modules started successfully", .{ordered_modules.len});

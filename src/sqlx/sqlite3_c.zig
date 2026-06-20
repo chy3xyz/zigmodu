@@ -32,4 +32,5 @@ pub extern "c" fn sqlite3_bind_null(stmt: ?*sqlite3_stmt, idx: c_int) c_int;
 pub extern "c" fn sqlite3_changes(db: ?*sqlite3) c_int;
 pub extern "c" fn sqlite3_last_insert_rowid(db: ?*sqlite3) i64;
 pub extern "c" fn sqlite3_errmsg(db: ?*sqlite3) [*c]const u8;
+pub extern "c" fn sqlite3_extended_errcode(db: ?*sqlite3) c_int;
 pub extern "c" fn sqlite3_free(ptr: ?*anyopaque) void;

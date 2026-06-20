@@ -51,6 +51,9 @@ pub const ZigModuError = error{
     ConnectionPoolExhausted,
     PoolUnhealthy,
     DatabaseError,
+    ConstraintViolation,
+    SerializationFailure,
+    ReadOnlyViolation,
     RedisError,
 
     // [...]Error
