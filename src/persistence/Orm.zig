@@ -5,6 +5,7 @@
 //! satisfying the Backend trait can be plugged in at compile time.
 
 const std = @import("std");
+const sqlx = @import("../sqlx/sqlx.zig");
 
 /// Common value representation for ORM parameter binding
 pub const OrmValue = union(enum) {
@@ -257,6 +258,12 @@ pub fn PageResult(comptime T: type) type {
         page: usize,
         size: usize,
         total: usize,
+
+        /// Free all string fields in items and the items slice itself.
+        pub fn deinit(self: *const @This(), allocator: std.mem.Allocator) void {
+            for (self.items) |item| sqlx.freeScanned(allocator, T, item);
+            allocator.free(self.items);
+        }
     };
 }
 
@@ -274,7 +281,7 @@ pub fn Tx(comptime B: type) type {
             return self.backend.queryRowTx(self.tx, T, sql, args);
         }
 
-        pub fn queryRows(self: @This(), comptime T: type, sql: []const u8, args: []const B.Value) ![]T {
+        pub fn queryRows(self: @This(), comptime T: type, sql: []const u8, args: []const B.Value) !sqlx.QueryResult(T) {
             return self.backend.queryRowsTx(self.tx, T, sql, args);
         }
     };
@@ -303,7 +310,7 @@ pub fn Orm(comptime B: type) type {
                     return self.orm.backend.queryRow(T, sql, args);
                 }
 
-                pub fn findAll(self: @This()) ![]T {
+                pub fn findAll(self: @This()) !sqlx.QueryResult(T) {
                     const sql = try buildSelectAll(self.orm.backend.allocator, meta.table_name, meta.sql_columns, meta.fields, meta.camel_case);
                     defer self.orm.backend.allocator.free(sql);
                     return self.orm.backend.queryRows(T, sql, &.{});
@@ -319,9 +326,9 @@ pub fn Orm(comptime B: type) type {
                 pub fn findPage(self: @This(), page: usize, size: usize) !PageResult(T) {
                     const sql = try buildSelectPage(self.orm.backend.allocator, meta.table_name, meta.sql_columns, meta.fields, page, size, meta.camel_case);
                     defer self.orm.backend.allocator.free(sql);
-                    const items = try self.orm.backend.queryRows(T, sql, &.{});
+                    const result = try self.orm.backend.queryRows(T, sql, &.{});
                     const total = try self.count();
-                    return .{ .items = items, .page = page, .size = size, .total = total };
+                    return .{ .items = result.items, .page = page, .size = size, .total = total };
                 }
 
                 /// Filtered pagination with custom WHERE clause and args.
@@ -334,8 +341,8 @@ pub fn Orm(comptime B: type) type {
                     const offset = if (page > 0) (page - 1) * size else 0;
                     const data_sql = try std.fmt.allocPrint(alloc, "SELECT * FROM {s} {s} ORDER BY {s} DESC LIMIT {d},{d}", .{ meta.table_name, where_sql, meta.primary_key, offset, size });
                     defer alloc.free(data_sql);
-                    const items = try self.orm.backend.queryRows(T, data_sql, args);
-                    return .{ .items = items, .page = page, .size = size, .total = total };
+                    const result = try self.orm.backend.queryRows(T, data_sql, args);
+                    return .{ .items = result.items, .page = page, .size = size, .total = total };
                 }
 
                 pub fn insert(self: @This(), entity: T) !T {

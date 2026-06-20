@@ -366,6 +366,26 @@ pub fn freeScanned(allocator: std.mem.Allocator, comptime T: type, val: T) void 
     }
 }
 
+/// Owned query result — carries a []T slice and frees all string fields on deinit.
+/// Use `defer result.deinit(allocator)` to prevent memory leaks.
+///
+/// ```zig
+/// const result = try client.queryRowsOwned(User, "SELECT * FROM users", &.{});
+/// defer result.deinit(allocator);
+/// for (result.items) |user| { ... }
+/// ```
+pub fn QueryResult(comptime T: type) type {
+    return struct {
+        items: []T,
+
+        /// Recursively free all []const u8 / ?[]const u8 fields in every item, then free the slice.
+        pub fn deinit(self: *const @This(), allocator: std.mem.Allocator) void {
+            for (self.items) |item| freeScanned(allocator, T, item);
+            allocator.free(self.items);
+        }
+    };
+}
+
 // ==================== SQLite Implementation ====================
 
 /// Bounded prepared-statement cache (per connection, LRU eviction).
@@ -1539,7 +1559,7 @@ const ConnPool = struct {
         while (attempts < self.max_reconnect_attempts) : (attempts += 1) {
             const conn = self.client.newConn() catch {
                 if (attempts < self.max_reconnect_attempts - 1) {
-                    self.reconnect() catch {};
+                    self.reconnect() catch |err| std.log.warn("[ConnPool] reconnect failed: {}", .{err});
                 }
                 continue;
             };
@@ -1547,7 +1567,7 @@ const ConnPool = struct {
             conn.ping() catch {
                 conn.close();
                 if (attempts < self.max_reconnect_attempts - 1) {
-                    self.reconnect() catch {};
+                    self.reconnect() catch |err| std.log.warn("[ConnPool] reconnect failed: {}", .{err});
                 }
                 continue;
             };
@@ -2083,6 +2103,19 @@ pub const Client = struct {
         return self.queryRowsPartial(T, sql_str, args);
     }
 
+    /// Like queryRows but returns an owned QueryResult(T). Caller MUST `defer result.deinit(allocator)`.
+    pub fn queryRowsOwned(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !QueryResult(T) {
+        const items = try self.queryRows(T, sql_str, args);
+        return .{ .items = items };
+    }
+
+    /// Like queryRowsPartial but returns an owned QueryResult(T). Caller MUST `defer result.deinit(allocator)`.
+    pub fn queryRowsPartialOwned(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !QueryResult(T) {
+        const items = try self.queryRowsPartial(T, sql_str, args);
+        return .{ .items = items };
+    }
+
+    // TODO(v0.14): remove deinitQueryRows — use QueryResult(T).deinit() instead.
     pub fn deinitQueryRows(self: *Client, comptime T: type, items: []T) void {
         for (items) |item| freeScanned(self.allocator, T, item);
         self.allocator.free(items);
@@ -2117,6 +2150,12 @@ pub const Client = struct {
             try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s}", .{table});
         defer self.allocator.free(sql);
         return self.queryRows(T, sql, args);
+    }
+
+    /// Like findAll but returns an owned QueryResult(T). Caller MUST `defer result.deinit(allocator)`.
+    pub fn findAllOwned(self: *Client, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) !QueryResult(T) {
+        const items = try self.findAll(T, table, where_clause, args);
+        return .{ .items = items };
     }
 
     pub fn findAllCtx(self: *Client, ctx: SqlContext, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) ![]T {
@@ -2305,7 +2344,7 @@ pub const CachedConn = struct {
             return result;
         };
         defer self.allocator.free(json);
-        self.setCache(cache_key, json, self.ttl_sec) catch {};
+        self.setCache(cache_key, json, self.ttl_sec) catch |err| std.log.warn("[CachedConn] setCache failed: {}", .{err});
         return result;
     }
 
@@ -2330,7 +2369,7 @@ pub const CachedConn = struct {
             return result;
         };
         defer self.allocator.free(json);
-        self.setCache(cache_key, json, self.ttl_sec) catch {};
+        self.setCache(cache_key, json, self.ttl_sec) catch |err| std.log.warn("[CachedConn] setCache failed: {}", .{err});
         return result;
     }
 
@@ -2363,7 +2402,7 @@ pub const CachedConn = struct {
             return result;
         };
         defer self.allocator.free(json);
-        self.setCache(cache_key, json, self.ttl_sec) catch {};
+        self.setCache(cache_key, json, self.ttl_sec) catch |err| std.log.warn("[CachedConn] setCache failed: {}", .{err});
         return result;
     }
 
@@ -2396,7 +2435,7 @@ pub const CachedConn = struct {
             return result;
         };
         defer self.allocator.free(json);
-        self.setCache(cache_key, json, self.ttl_sec) catch {};
+        self.setCache(cache_key, json, self.ttl_sec) catch |err| std.log.warn("[CachedConn] setCache failed: {}", .{err});
         return result;
     }
 
@@ -2412,7 +2451,7 @@ pub const CachedConn = struct {
     pub fn exec(self: *CachedConn, cache_keys: []const []const u8, sql_str: []const u8, args: []const Value) !ExecResult {
         const result = try self.client.exec(sql_str, args);
         for (cache_keys) |key| {
-            self.delCache(key) catch {};
+            self.delCache(key) catch |err| std.log.warn("[CachedConn] delCache failed: {}", .{err});
         }
         return result;
     }

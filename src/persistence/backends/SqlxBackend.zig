@@ -37,8 +37,8 @@ pub const SqlxBackend = struct {
         return self.queryRow(T, sql_str, args);
     }
 
-    pub fn queryRows(self: @This(), comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
-        return self.client.queryRows(T, sql_str, args);
+    pub fn queryRows(self: @This(), comptime T: type, sql_str: []const u8, args: []const Value) !sqlx.QueryResult(T) {
+        return self.client.queryRowsOwned(T, sql_str, args);
     }
 
     pub fn exec(self: @This(), sql_str: []const u8, args: []const Value) !ExecResult {
@@ -68,7 +68,7 @@ pub const SqlxBackend = struct {
         return try rows.rows[0].scan(self.allocator, T);
     }
 
-    pub fn queryRowsTx(self: @This(), tx: *Tx, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
+    pub fn queryRowsTx(self: @This(), tx: *Tx, comptime T: type, sql_str: []const u8, args: []const Value) !sqlx.QueryResult(T) {
         var rows = try tx.query(self.allocator, sql_str, args);
         defer rows.deinit();
         const result = try self.allocator.alloc(T, rows.rows.len);
@@ -79,7 +79,7 @@ pub const SqlxBackend = struct {
         for (rows.rows, 0..) |row, i| {
             result[i] = try row.scan(self.allocator, T);
         }
-        return result;
+        return .{ .items = result };
     }
 };
 
@@ -120,9 +120,8 @@ test "ORM with SqlxBackend end-to-end (sqlite)" {
     // Find all
     _ = try repo.insert(.{ .id = 2, .name = "Bob", .age = 25 });
     const all = try repo.findAll();
-    defer allocator.free(all);
-    try std.testing.expectEqual(@as(usize, 2), all.len);
-    for (all) |u| allocator.free(u.name);
+    defer all.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), all.items.len);
 
     // Delete
     try repo.delete(@as(i64, 1));
