@@ -258,6 +258,17 @@ pub fn PageResult(comptime T: type) type {
         page: usize,
         size: usize,
         total: usize,
+        total_page: usize,
+
+        /// Returns true if there is a previous page.
+        pub fn hasPrevious(self: *const @This()) bool {
+            return self.page > 1;
+        }
+
+        /// Returns true if there is a next page.
+        pub fn hasNext(self: *const @This()) bool {
+            return self.page < self.total_page;
+        }
 
         /// Free all string fields in items and the items slice itself.
         pub fn deinit(self: *const @This(), allocator: std.mem.Allocator) void {
@@ -328,7 +339,8 @@ pub fn Orm(comptime B: type) type {
                     defer self.orm.backend.allocator.free(sql);
                     const result = try self.orm.backend.queryRows(T, sql, &.{});
                     const total = try self.count();
-                    return .{ .items = result.items, .page = page, .size = size, .total = total };
+                    const total_page = if (size > 0) (total + size - 1) / size else 0;
+                    return .{ .items = result.items, .page = page, .size = size, .total = total, .total_page = total_page };
                 }
 
                 /// Filtered pagination with custom WHERE clause and args.
@@ -342,7 +354,8 @@ pub fn Orm(comptime B: type) type {
                     const data_sql = try std.fmt.allocPrint(alloc, "SELECT * FROM {s} {s} ORDER BY {s} DESC LIMIT {d},{d}", .{ meta.table_name, where_sql, meta.primary_key, offset, size });
                     defer alloc.free(data_sql);
                     const result = try self.orm.backend.queryRows(T, data_sql, args);
-                    return .{ .items = result.items, .page = page, .size = size, .total = total };
+                    const total_page = if (size > 0) (total + size - 1) / size else 0;
+                    return .{ .items = result.items, .page = page, .size = size, .total = total, .total_page = total_page };
                 }
 
                 pub fn insert(self: @This(), entity: T) !T {

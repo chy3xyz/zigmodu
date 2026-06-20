@@ -112,6 +112,11 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Build options for compile-time configuration
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "log_level", b.option([]const u8, "log-level", "Compile-time log level (debug/info/warn/err)") orelse "debug");
+    const build_options_mod = build_options.createModule();
+
     // Create and export the zigmodu module for dependent packages.
     // Zig 0.17-dev.813: @cImport no longer implicitly links libc.
     const zigmodu_mod = b.addModule("zigmodu", .{
@@ -120,6 +125,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    zigmodu_mod.addImport("build_options", build_options_mod);
 
     linkDbLibs(zigmodu_mod, b);
 
@@ -146,6 +152,34 @@ pub fn build(b: *std.Build) void {
 
     // Test step - test the main library
     const test_step = b.step("test", "Run all tests");
+
+    // Proper build-system test (supports build_options and other generated modules)
+    const lib_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    lib_test_mod.addImport("build_options", build_options_mod);
+    linkDbLibs(lib_test_mod, b);
+    const lib_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+    });
+    const run_lib_tests = b.addRunArtifact(lib_tests);
+    test_step.dependOn(&run_lib_tests.step);
+
+    // Test log_level.zig separately (needs build_options module)
+    const log_level_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/log_level.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    log_level_test_mod.addImport("build_options", build_options_mod);
+    const log_level_tests = b.addTest(.{
+        .root_module = log_level_test_mod,
+    });
+    const run_log_level_tests = b.addRunArtifact(log_level_tests);
+    test_step.dependOn(&run_log_level_tests.step);
 
     // Build test arguments dynamically using detected library paths
     var test_args = std.array_list.Managed([]const u8).init(b.allocator);

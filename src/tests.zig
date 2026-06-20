@@ -201,6 +201,13 @@ test "compile all source files" {
 
     // Dashboard
     _ = @import("http/Dashboard.zig");
+
+    // Kit utilities
+    _ = @import("kit/array.zig");
+    _ = @import("kit/format.zig");
+    _ = @import("kit/io_instance.zig");
+    _ = @import("kit/json.zig");
+    _ = @import("kit/random.zig");
 }
 
 // ========================================
