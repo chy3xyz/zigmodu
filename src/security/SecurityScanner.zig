@@ -153,7 +153,7 @@ pub const SecurityScanner = struct {
             .severity = .CRITICAL,
             .category = .SECRETS,
             .check_fn = checkHardcodedSecret,
-        }) catch {};
+        }) catch |err| std.log.err("[SecurityScanner] registerRule SEC001 failed: {}", .{err});
 
         // SQL[...]
         self.registerRule(.{
@@ -163,7 +163,7 @@ pub const SecurityScanner = struct {
             .severity = .HIGH,
             .category = .INJECTION,
             .check_fn = checkSqlInjection,
-        }) catch {};
+        }) catch |err| std.log.err("[SecurityScanner] registerRule SEC002 failed: {}", .{err});
 
         // [...]HTTP[...]
         self.registerRule(.{
@@ -173,7 +173,7 @@ pub const SecurityScanner = struct {
             .severity = .MEDIUM,
             .category = .CONFIGURATION,
             .check_fn = checkInsecureHttp,
-        }) catch {};
+        }) catch |err| std.log.err("[SecurityScanner] registerRule SEC003 failed: {}", .{err});
 
         // [...]Encrypt[...]
         self.registerRule(.{
@@ -183,7 +183,7 @@ pub const SecurityScanner = struct {
             .severity = .HIGH,
             .category = .CRYPTOGRAPHY,
             .check_fn = checkWeakCrypto,
-        }) catch {};
+        }) catch |err| std.log.err("[SecurityScanner] registerRule SEC004 failed: {}", .{err});
 
         // Permission[...]
         self.registerRule(.{
@@ -193,7 +193,7 @@ pub const SecurityScanner = struct {
             .severity = .HIGH,
             .category = .PERMISSIONS,
             .check_fn = checkMissingAuth,
-        }) catch {};
+        }) catch |err| std.log.err("[SecurityScanner] registerRule SEC005 failed: {}", .{err});
     }
 
     /// [...]
@@ -478,7 +478,7 @@ pub const SecurityConfigValidator = struct {
         for (self.checks.items) |check| {
             if (!check.validate_fn()) {
                 result.passed = false;
-                result.failed_checks.append(check.name) catch {};
+                result.failed_checks.append(check.name) catch |err| std.log.err("[SecurityScanner] failed_checks append: {}", .{err});
             }
         }
 

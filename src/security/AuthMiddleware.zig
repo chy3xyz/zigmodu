@@ -20,10 +20,10 @@ pub fn jwtAuth(security: *SecurityModule, allocator: std.mem.Allocator) !api.Mid
                     return;
                 };
 
-                const token = if (std.mem.startsWith(u8, auth_header, "Bearer "))
-                    auth_header[7..]
-                else
-                    auth_header;
+                const token = SecurityModule.extractBearerToken(auth_header) orelse {
+                    try ctx.sendErrorResponse(401, 401, "Invalid Authorization header format");
+                    return;
+                };
 
                 // verifyToken returns JwtPayload directly
                 const payload = S.stored_security.verifyToken(token) catch {

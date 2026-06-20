@@ -30,6 +30,19 @@ pub const SecurityModule = struct {
         };
     }
 
+    /// Wall clock when `io` is set (production); monotonic fallback for unit tests.
+    fn nowSeconds(self: *const Self) i64 {
+        if (self.io) |io| return Time.wallClockSeconds(io);
+        return Time.monotonicNowSeconds();
+    }
+
+    /// Parse Bearer token from Authorization header (case-sensitive prefix per RFC 6750).
+    pub fn extractBearerToken(auth_header: []const u8) ?[]const u8 {
+        const prefix = "Bearer ";
+        if (std.mem.startsWith(u8, auth_header, prefix)) return auth_header[prefix.len..];
+        return null;
+    }
+
     pub fn deinit(self: *Self) void {
         self.* = undefined;
     }
@@ -93,7 +106,7 @@ pub const SecurityModule = struct {
         roles: []const []const u8,
         tenant_id: []const u8,
     ) ![]const u8 {
-        const now = if (self.io) |io| @as(i64, @intCast(@divTrunc(std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds, std.time.ns_per_s))) else Time.monotonicNowSeconds();
+        const now = self.nowSeconds();
         const exp = now + self.token_expiry_seconds;
 
         const header = JwtToken.JwtHeader{};
@@ -165,7 +178,7 @@ pub const SecurityModule = struct {
         defer parsed.deinit();
 
         // Check expiration
-        const now = if (self.io) |io| @as(i64, @intCast(@divTrunc(std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds, std.time.ns_per_s))) else Time.monotonicNowSeconds();
+        const now = self.nowSeconds();
         if (now > parsed.value.exp) {
             return error.TokenExpired;
         }
@@ -320,11 +333,11 @@ pub fn authRateLimitMiddleware(
             const lim: *@import("../resilience/RateLimiter.zig").RateLimiter = @ptrCast(@alignCast(user_data orelse return error.InternalError));
             if (!lim.tryAcquire()) {
                 ctx.status_code = 429;
-                ctx.setHeader("Content-Type", "application/json") catch {};
-                ctx.setHeader("Retry-After", "60") catch {};
+                ctx.setHeader("Content-Type", "application/json") catch |err| std.log.err("[RateLimit] setHeader failed: {}", .{err});
+                ctx.setHeader("Retry-After", "60") catch |err| std.log.err("[RateLimit] setHeader failed: {}", .{err});
                 _ = ctx.stream.?.writer(ctx.io.?, &.{}{}).interface.writeAll(
                     "{\"code\":429,\"msg\":\"Too many requests. Try again later.\"}",
-                ) catch {};
+                ) catch |err| std.log.err("[RateLimit] write 429 body failed: {}", .{err});
                 ctx.responded = true;
                 return;
             }
@@ -419,6 +432,20 @@ test "SecurityModule JWT generate and verify" {
     defer sec.freePayload(payload);
     try std.testing.expectEqualStrings("user-123", payload.sub);
     try std.testing.expect(payload.exp > 0);
+}
+
+test "SecurityModule initWithIo uses wall clock for exp" {
+    const allocator = std.testing.allocator;
+    var sec = SecurityModule.initWithIo(allocator, "secret", 3600, std.testing.io);
+    const token = try sec.generateToken("wall-clock-user", &.{});
+    defer allocator.free(token);
+
+    const payload = try sec.verifyToken(token);
+    defer sec.freePayload(payload);
+    try std.testing.expectEqualStrings("wall-clock-user", payload.sub);
+    const now = Time.wallClockSeconds(std.testing.io);
+    try std.testing.expect(payload.iat <= now + 2);
+    try std.testing.expect(payload.exp >= now);
 }
 
 test "SecurityModule JWT expired token" {

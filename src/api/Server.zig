@@ -1007,7 +1007,15 @@ const Router = struct {
                 if (wc.route) |route| {
                     var params = std.StringHashMap([]const u8).init(allocator);
                     for (0..param_count) |i| {
-                        params.put(param_keys[i], param_vals[i]) catch {};
+                        params.put(param_keys[i], param_vals[i]) catch |err| {
+                            std.log.err("[Router] wildcard param put failed: {}", .{err});
+                            for (0..param_count) |k| {
+                                allocator.free(param_keys[k]);
+                                allocator.free(param_vals[k]);
+                            }
+                            params.deinit();
+                            return null;
+                        };
                     }
                     return MatchedRoute{ .route = route, .params = params };
                 }
@@ -1038,12 +1046,13 @@ const Router = struct {
         // Exact route takes priority over wildcard child
         if (current.route) |route| {
             var params = std.StringHashMap([]const u8).init(allocator);
-            for (0..param_count) |i| {
-                params.put(param_keys[i], param_vals[i]) catch {
-                    allocator.free(param_keys[i]);
-                    allocator.free(param_vals[i]);
-                };
-            }
+                for (0..param_count) |i| {
+                    params.put(param_keys[i], param_vals[i]) catch |err| {
+                        std.log.err("[Router] param put failed: {}", .{err});
+                        allocator.free(param_keys[i]);
+                        allocator.free(param_vals[i]);
+                    };
+                }
             return MatchedRoute{
                 .route = route,
                 .params = params,
@@ -1055,7 +1064,15 @@ const Router = struct {
             if (wc.route) |route| {
                 var params = std.StringHashMap([]const u8).init(allocator);
                 for (0..param_count) |i| {
-                    params.put(param_keys[i], param_vals[i]) catch {};
+                    params.put(param_keys[i], param_vals[i]) catch |err| {
+                        std.log.err("[Router] wildcard param put failed: {}", .{err});
+                        for (0..param_count) |k| {
+                            allocator.free(param_keys[k]);
+                            allocator.free(param_vals[k]);
+                        }
+                        params.deinit();
+                        return null;
+                    };
                 }
                 return MatchedRoute{ .route = route, .params = params };
             }
@@ -1313,7 +1330,7 @@ pub const Server = struct {
         defer self.closeListener();
         // Reap any still-running connection fibers on exit so their futures
         // are released. Await (not cancel) so in-flight requests complete.
-        defer self.conn_group.await(self.io) catch {};
+        defer self.conn_group.await(self.io) catch |err| std.log.warn("[Server] conn_group await: {}", .{err});
 
         self.running.store(true, .monotonic);
         std.log.info("Server listening on port {d}", .{self.port});
@@ -1338,11 +1355,11 @@ pub const Server = struct {
         const rcvbuf: i32 = 2048;
         const sndbuf: i32 = 2048;
         const one: i32 = 1;
-        std.posix.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.RCVBUF, std.mem.asBytes(&rcvbuf)) catch {};
-        std.posix.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.SNDBUF, std.mem.asBytes(&sndbuf)) catch {};
-        std.posix.setsockopt(fd, std.c.IPPROTO.TCP, std.c.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
+        std.posix.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.RCVBUF, std.mem.asBytes(&rcvbuf)) catch |err| std.log.debug("[Server] setsockopt RCVBUF: {}", .{err});
+        std.posix.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.SNDBUF, std.mem.asBytes(&sndbuf)) catch |err| std.log.debug("[Server] setsockopt SNDBUF: {}", .{err});
+        std.posix.setsockopt(fd, std.c.IPPROTO.TCP, std.c.TCP.NODELAY, std.mem.asBytes(&one)) catch |err| std.log.debug("[Server] setsockopt TCP_NODELAY: {}", .{err});
         // Keepalive after 60s idle, probe every 15s
-        std.posix.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.KEEPALIVE, std.mem.asBytes(&one)) catch {};
+        std.posix.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.KEEPALIVE, std.mem.asBytes(&one)) catch |err| std.log.debug("[Server] setsockopt KEEPALIVE: {}", .{err});
     }
 
     pub fn stop(self: *Server) void {
@@ -1490,7 +1507,7 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                         // Perform handshake
                         var framer = WsFramer.init(stream, server.io);
                         framer.handshake(ws_key) catch {
-                            ctx.sendError(400, "WebSocket handshake failed") catch {};
+                            ctx.sendError(400, "WebSocket handshake failed") catch |e| std.log.err("[Server] WS handshake 400 failed: {}", .{e});
                             return;
                         };
                         ctx.upgraded = true;
@@ -1498,7 +1515,7 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                         // Call on_connect — gateway returns session pointer (null = reject)
                         const session = ws_route.on_connect(&ctx, @ptrCast(&framer));
                         if (session == null) {
-                            framer.writeClose() catch {};
+                            framer.writeClose() catch |err| std.log.err("[Server] WS writeClose on reject: {}", .{err});
                             if (@intFromPtr(ws_route.on_close) != 0) ws_route.on_close(null);
                             return;
                         }
@@ -1507,7 +1524,7 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                         if (server.ws_uring) |uring| {
                             const sock_fd = stream.socket.handle;
                             uring.adopt(sock_fd, session.?, ws_route.on_message, ws_route.on_close) catch {
-                                framer.writeClose() catch {};
+                                framer.writeClose() catch |err| std.log.err("[Server] WS writeClose on reject: {}", .{err});
                                 if (@intFromPtr(ws_route.on_close) != 0) ws_route.on_close(session.?);
                                 return;
                             };
@@ -1575,17 +1592,17 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
             if (server.global_middleware.items.len > 0) {
                 server.executeWithMiddleware(&ctx, struct {
                     fn h(_: *Context) anyerror!void {}
-                }.h, server.global_middleware.items) catch {};
+                }.h, server.global_middleware.items) catch |err| std.log.err("[Server] global middleware before 404: {}", .{err});
             }
             if (!ctx.responded) {
-                ctx.sendError(404, "Not Found") catch {};
+                ctx.sendError(404, "Not Found") catch |err| std.log.err("[Server] failed to send 404: {}", .{err});
             }
         }
 
         const current_time = std.Io.Timestamp.now(server.io, .real);
         const elapsed_ms = @divTrunc(current_time.nanoseconds - start_time.nanoseconds, std.time.ns_per_ms);
         if (elapsed_ms > server.request_timeout_ms and !ctx.responded) {
-            ctx.sendError(408, "Request Timeout") catch {};
+            ctx.sendError(408, "Request Timeout") catch |err| std.log.err("[Server] failed to send 408: {}", .{err});
         }
 
         if (ctx.responded and !ctx.streaming) {
@@ -1628,7 +1645,7 @@ fn writeErrorResponse(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.
     const body = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{message}) catch return;
     defer allocator.free(body);
 
-    writeResponse(io, stream, status, headers, body) catch {};
+    writeResponse(io, stream, status, headers, body) catch |err| std.log.err("[Server] writeErrorResponse failed: {}", .{err});
 }
 
 fn runMiddlewareChain(ctx: *Context) anyerror!void {

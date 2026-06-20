@@ -1,4 +1,5 @@
 const std = @import("std");
+const zigmodu = @import("zigmodu");
 const model = @import("model.zig");
 const persistence = @import("persistence.zig");
 const enums = @import("../../business/enums.zig");
@@ -14,13 +15,17 @@ pub fn TenantService(comptime Persistence: type) type {
             return .{ .allocator = allocator, .persistence = p };
         }
 
+        pub fn freeTenantList(self: *Self, tenants: []model.Tenant) void {
+            persistence.TenantPersistence(@TypeOf(self.persistence)).freeTenants(self.allocator, tenants);
+        }
+
         /// 创建租户 (带验证和默认值)
         pub fn create(self: *Self, name: []const u8, domain: []const u8, tier_str: []const u8) !model.Tenant {
             if (name.len < 2 or name.len > 100) return error.InvalidName;
             if (domain.len < 3 or !std.mem.containsAtLeast(u8, domain, 1, ".")) return error.InvalidDomain;
 
             const tier = enums.TenantTier.fromString(tier_str);
-            const now = 0;
+            const now: i64 = @intCast(zigmodu.time.monotonicNowSeconds());
 
             const tenant = model.Tenant{
                 .id = 0,
@@ -32,8 +37,10 @@ pub fn TenantService(comptime Persistence: type) type {
                 .updated_at = now,
             };
 
-            _ = try self.persistence.insert(tenant);
-            return tenant;
+            const id = try self.persistence.insert(tenant);
+            var created = tenant;
+            created.id = id;
+            return created;
         }
 
         /// 获取租户 (校验状态)
@@ -48,9 +55,10 @@ pub fn TenantService(comptime Persistence: type) type {
         /// 更新租户套餐
         pub fn updateTier(self: *Self, id: i64, tier_str: []const u8) !void {
             var tenant = (try self.getById(id)) orelse return error.TenantNotFound;
+            self.allocator.free(tenant.tier);
             const tier = enums.TenantTier.fromString(tier_str);
             tenant.tier = tier.toString();
-            tenant.updated_at = 0;
+            tenant.updated_at = @intCast(zigmodu.time.monotonicNowSeconds());
             try self.persistence.update(tenant);
         }
 
@@ -58,7 +66,7 @@ pub fn TenantService(comptime Persistence: type) type {
         pub fn suspendTenant(self: *Self, id: i64) !void {
             var tenant = (try self.getById(id)) orelse return error.TenantNotFound;
             tenant.status = @intFromEnum(enums.TenantStatus.suspended);
-            tenant.updated_at = 0;
+            tenant.updated_at = @intCast(zigmodu.time.monotonicNowSeconds());
             try self.persistence.update(tenant);
         }
 

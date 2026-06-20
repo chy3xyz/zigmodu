@@ -8,11 +8,12 @@
 //!   server.addMiddleware(zigmodu.http_middleware.requestId());
 //!   server.addMiddleware(zigmodu.http_middleware.cors(.{}));
 //!   server.addMiddleware(zigmodu.http_middleware.jwtAuth("my-secret"));
+//!   // Production (wall-clock exp): share a SecurityModule initialized with initWithIo
+//!   server.addMiddleware(zigmodu.http_middleware.jwtAuthWithSecurity(&sec));
 //!   server.addMiddleware(zigmodu.http_middleware.csrf());
 
 const std = @import("std");
 const api = @import("Server.zig");
-const Time = @import("../core/Time.zig");
 const SecurityModule = @import("../security/SecurityModule.zig").SecurityModule;
 
 /// CORS middleware configuration
@@ -167,68 +168,8 @@ pub fn recover() api.Middleware {
     };
 }
 
-/// JWT claims
-pub const Claims = struct {
-    sub: ?[]const u8 = null,
-    user_id: ?[]const u8 = null,
-    username: ?[]const u8 = null,
-    exp: ?i64 = null,
-    iat: ?i64 = null,
-};
-
-fn base64UrlDecode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    const pad_len = (4 - (input.len % 4)) % 4;
-    var padded = try allocator.alloc(u8, input.len + pad_len);
-    defer allocator.free(padded);
-    @memcpy(padded[0..input.len], input);
-    for (padded[input.len..]) |*b| b.* = '=';
-    const decoder = std.base64.url_safe.Decoder;
-    const size = try decoder.calcSizeForSlice(padded);
-    const out = try allocator.alloc(u8, size);
-    errdefer allocator.free(out);
-    try decoder.decode(out, padded);
-    return out;
-}
-
-/// Verify a JWT token using HMAC-SHA256. Returns decoded payload on success.
-fn verifyJwt(allocator: std.mem.Allocator, token: []const u8, secret: []const u8) !std.json.Parsed(std.json.Value) {
-    var parts_iter = std.mem.splitScalar(u8, token, '.');
-    const header_b64 = parts_iter.next() orelse return error.InvalidToken;
-    const payload_b64 = parts_iter.next() orelse return error.InvalidToken;
-    const sig_b64 = parts_iter.next() orelse return error.InvalidToken;
-    if (parts_iter.next() != null) return error.InvalidToken;
-
-    const signed_data = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ header_b64, payload_b64 });
-    defer allocator.free(signed_data);
-
-    var expected_sig: [32]u8 = undefined;
-    std.crypto.auth.hmac.sha2.HmacSha256.create(&expected_sig, signed_data, secret);
-
-    const sig_decoded = try base64UrlDecode(allocator, sig_b64);
-    defer allocator.free(sig_decoded);
-
-    if (sig_decoded.len < 32 or !std.crypto.timing_safe.eql([32]u8, expected_sig, sig_decoded[0..32].*)) {
-        return error.InvalidToken;
-    }
-
-    const payload_json = try base64UrlDecode(allocator, payload_b64);
-    defer allocator.free(payload_json);
-
-    return std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
-}
-
-fn jwtExpired(parsed: std.json.Parsed(std.json.Value)) bool {
-    if (parsed.value != .object) return true;
-    const exp_val = parsed.value.object.get("exp") orelse return false;
-    const exp_i: i64 = switch (exp_val) {
-        .integer => |v| v,
-        .float => |v| @intFromFloat(v),
-        else => return true,
-    };
-    return Time.monotonicNowSeconds() > exp_i;
-}
-
-/// JWT auth middleware - validates Bearer token and stores claims in context user_data
+/// JWT auth middleware — validates Bearer token via `SecurityModule.verifyToken`.
+/// Uses `ctx.io` for wall-clock expiry when set; falls back to monotonic in unit tests.
 pub fn jwtAuth(secret: []const u8) api.Middleware {
     const SecretStore = struct {
         var stored: []const u8 = "";
@@ -236,35 +177,49 @@ pub fn jwtAuth(secret: []const u8) api.Middleware {
     SecretStore.stored = secret;
     return .{
         .func = struct {
-            fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
-                const jwt_secret_ptr: *const []const u8 = @ptrCast(@alignCast(user_data.?));
-                const jwt_secret = jwt_secret_ptr.*;
-                const auth = ctx.headers.get("authorization") orelse {
-                    try ctx.sendError(401, "Unauthorized");
-                    return;
-                };
-                const prefix = "Bearer ";
-                if (!std.mem.startsWith(u8, auth, prefix)) {
-                    try ctx.sendError(401, "Unauthorized");
-                    return;
-                }
-                const token = auth[prefix.len..];
-                const parsed = verifyJwt(ctx.allocator, token, jwt_secret) catch {
-                    try ctx.sendError(401, "Unauthorized");
-                    return;
-                };
-                if (jwtExpired(parsed)) {
-                    parsed.deinit();
-                    try ctx.sendError(401, "Unauthorized");
-                    return;
-                }
-                ctx.user_data = @constCast(&parsed.value);
-                try next(ctx);
-                parsed.deinit();
+            fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
+                var sec = if (ctx.io) |io|
+                    SecurityModule.initWithIo(ctx.allocator, SecretStore.stored, 3600, io)
+                else
+                    SecurityModule.init(ctx.allocator, SecretStore.stored, 3600);
+                try verifyJwtAndNext(&sec, ctx, next);
             }
         }.mw,
-        .user_data = @ptrCast(@constCast(&SecretStore.stored)),
     };
+}
+
+/// JWT auth using a long-lived `SecurityModule` (prefer `initWithIo` in production).
+pub fn jwtAuthWithSecurity(security: *SecurityModule) api.Middleware {
+    const Store = struct {
+        var stored: *SecurityModule = undefined;
+    };
+    Store.stored = security;
+    return .{
+        .func = struct {
+            fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
+                try verifyJwtAndNext(Store.stored, ctx, next);
+            }
+        }.mw,
+    };
+}
+
+fn verifyJwtAndNext(sec: *SecurityModule, ctx: *api.Context, next: api.HandlerFn) !void {
+    const auth = ctx.headers.get("authorization") orelse {
+        try ctx.sendError(401, "Unauthorized");
+        return;
+    };
+    const token = SecurityModule.extractBearerToken(auth) orelse {
+        try ctx.sendError(401, "Unauthorized");
+        return;
+    };
+
+    const payload = sec.verifyToken(token) catch {
+        try ctx.sendError(401, "Unauthorized");
+        return;
+    };
+    defer sec.freePayload(payload);
+
+    try next(ctx);
 }
 
 /// CSRF protection using double-submit cookie pattern.
@@ -464,6 +419,30 @@ test "jwtAuth middleware rejects expired token" {
     try mw.func(&ctx, next, mw.user_data);
     try std.testing.expectEqual(@as(u16, 401), ctx.status_code);
     try std.testing.expect(ctx.responded);
+}
+
+test "jwtAuthWithSecurity uses wall clock from SecurityModule io" {
+    const allocator = std.testing.allocator;
+    var sec = SecurityModule.initWithIo(allocator, "secret", 3600, std.testing.io);
+    const token = try sec.generateToken("user-1", &.{});
+    defer allocator.free(token);
+
+    var ctx = try api.Context.init(allocator, .GET, "/test");
+    defer ctx.deinit();
+    ctx.io = std.testing.io;
+    try putBearerAuth(&ctx, token);
+
+    var reached = false;
+    const mw = jwtAuthWithSecurity(&sec);
+    const next = struct {
+        fn n(c: *api.Context) anyerror!void {
+            _ = c;
+        }
+    }.n;
+
+    try mw.func(&ctx, next, mw.user_data);
+    reached = !ctx.responded;
+    try std.testing.expect(reached);
 }
 
 test "csrf middleware rejects POST without matching token" {
