@@ -114,7 +114,15 @@ pub const DLQ = struct {
     /// Release all resources
     pub fn deinit(self: *Self) void {
         switch (self.storage) {
-            .memory => |*s| s.entries.deinit(self.allocator),
+            .memory => |*s| {
+                for (s.entries.items) |entry| {
+                    self.allocator.free(entry.original_topic);
+                    self.allocator.free(entry.payload);
+                    self.allocator.free(entry.error_type);
+                    self.allocator.free(entry.error_message);
+                }
+                s.entries.deinit(self.allocator);
+            },
             .sqlite => |*s| {
                 self.allocator.free(s.db_path);
             },
@@ -126,12 +134,22 @@ pub const DLQ = struct {
     pub fn push(self: *Self, msg: FailedMessage) !void {
         const now = Time.monotonicNowSeconds();
 
+        // Dup strings so DLQ owns the memory
+        const topic_copy = try self.allocator.dupe(u8, msg.topic);
+        errdefer self.allocator.free(topic_copy);
+        const payload_copy = try self.allocator.dupe(u8, msg.payload);
+        errdefer self.allocator.free(payload_copy);
+        const err_type_copy = try self.allocator.dupe(u8, msg.error_type);
+        errdefer self.allocator.free(err_type_copy);
+        const err_msg_copy = try self.allocator.dupe(u8, msg.error_message);
+        errdefer self.allocator.free(err_msg_copy);
+
         const entry = DLQEntry{
             .id = self.next_id,
-            .original_topic = msg.topic,
-            .payload = msg.payload,
-            .error_type = msg.error_type,
-            .error_message = msg.error_message,
+            .original_topic = topic_copy,
+            .payload = payload_copy,
+            .error_type = err_type_copy,
+            .error_message = err_msg_copy,
             .retry_count = msg.retry_count,
             .first_failed_at = now,
             .last_failed_at = now,
@@ -145,7 +163,11 @@ pub const DLQ = struct {
                 // Check size limit
                 if (self.config.max_size > 0 and s.entries.items.len >= self.config.max_size) {
                     // Remove oldest entry
-                    _ = s.entries.orderedRemove(0);
+                    const removed = s.entries.orderedRemove(0);
+                    self.allocator.free(removed.original_topic);
+                    self.allocator.free(removed.payload);
+                    self.allocator.free(removed.error_type);
+                    self.allocator.free(removed.error_message);
                 }
                 try s.entries.append(self.allocator, entry);
             },
@@ -229,7 +251,11 @@ pub const DLQ = struct {
                 while (i < s.entries.items.len) {
                     const age = now - s.entries.items[i].created_at;
                     if (age > max_age) {
-                        _ = s.entries.orderedRemove(i);
+                        const removed = s.entries.orderedRemove(i);
+                        self.allocator.free(removed.original_topic);
+                        self.allocator.free(removed.payload);
+                        self.allocator.free(removed.error_type);
+                        self.allocator.free(removed.error_message);
                         purged += 1;
                     } else {
                         i += 1;
@@ -278,7 +304,11 @@ pub const DLQ = struct {
             .memory => |*s| {
                 for (s.entries.items, 0..) |entry, i| {
                     if (entry.id == id) {
-                        _ = s.entries.orderedRemove(i);
+                        const removed = s.entries.orderedRemove(i);
+                        self.allocator.free(removed.original_topic);
+                        self.allocator.free(removed.payload);
+                        self.allocator.free(removed.error_type);
+                        self.allocator.free(removed.error_message);
                         return true;
                     }
                 }

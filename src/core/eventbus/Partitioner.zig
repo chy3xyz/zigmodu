@@ -167,6 +167,11 @@ pub const ConsistentHashPartitioner = struct {
         return self.extractPhysicalNode(entry.node_id);
     }
 
+    /// Alias for `route` — used by DistributedEventBus for event-key partitioning.
+    pub fn partition(self: *Self, event_key: []const u8) ?[]const u8 {
+        return self.route(event_key);
+    }
+
     /// Route a key with backup nodes
     ///
     /// Returns primary and backup nodes for redundancy.

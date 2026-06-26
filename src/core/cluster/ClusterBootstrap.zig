@@ -20,7 +20,8 @@ const DistributedEventBus = @import("../DistributedEventBus.zig").DistributedEve
 const RaftElection = @import("RaftElection.zig").RaftElection;
 const ElectionConfig = @import("RaftElection.zig").ElectionConfig;
 const VoteRequest = @import("RaftElection.zig").VoteRequest;
-const Heartbeat = @import("RaftElection.zig").Heartbeat;
+const AppendEntriesRequest = @import("RaftElection.zig").AppendEntriesRequest;
+const AppendEntriesResponse = @import("RaftElection.zig").AppendEntriesResponse;
 const ClusterMetrics = @import("ClusterMetrics.zig").ClusterMetrics;
 
 pub const BootstrapConfig = struct {
@@ -66,7 +67,8 @@ pub const ClusterBootstrap = struct {
             .local_port = self.config.port,
         });
         const peers = try disco.resolve();
-        defer disco.deinit(peers);
+        defer disco.deinitResolved(peers);
+        defer disco.deinit();
         self.metrics.setNodeCount(1 + peers.len);
 
         // 2. Create event bus (node communication backbone)
@@ -85,13 +87,17 @@ pub const ClusterBootstrap = struct {
         const S = struct {
             var transport_impl: ?struct {
                 sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
-                sendHeartbeat: *const fn (?[]const u8, []const u8, Heartbeat) void,
+                sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse,
             } = null;
         };
         if (S.transport_impl == null) {
             S.transport_impl = .{
                 .sendVoteRequest = struct { fn f(_: ?[]const u8, _: []const u8, _: VoteRequest) void {} }.f,
-                .sendHeartbeat = struct { fn f(_: ?[]const u8, _: []const u8, _: Heartbeat) void {} }.f,
+                .sendAppendEntries = struct {
+                    fn f(_: ?[]const u8, _: []const u8, _: AppendEntriesRequest) AppendEntriesResponse {
+                        return AppendEntriesResponse{ .term = 0, .success = false, .match_index = 0 };
+                    }
+                }.f,
             };
         }
         const election_transport: RaftElection.ElectionTransport = @constCast(@ptrCast(@alignCast(&S.transport_impl.?)));

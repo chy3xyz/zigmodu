@@ -64,6 +64,7 @@ test "compile all source files" {
     _ = @import("core/cluster/ClusterMetrics.zig");
     _ = @import("core/cluster/ClusterBootstrap.zig");
     _ = @import("core/cluster/ClusterHealth.zig");
+    _ = @import("core/cluster/LoadBalancer.zig");
     _ = @import("messaging/OutboxPublisher.zig");
     _ = @import("tenant/ShardRouter.zig");
 
@@ -98,6 +99,7 @@ test "compile all source files" {
     _ = @import("resilience/RateLimiter.zig");
     _ = @import("resilience/Retry.zig");
     _ = @import("resilience/LoadShedder.zig");
+    _ = @import("resilience/RedisRateLimiter.zig");
 
     // Scheduler
     _ = @import("scheduler/ScheduledTask.zig");
