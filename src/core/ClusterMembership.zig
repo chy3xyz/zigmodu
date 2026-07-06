@@ -1,3 +1,8 @@
+//! EXPERIMENTAL — gossip membership with local state tracking and failure
+//! detection. Bus subscription handling is a placeholder (`handleBusEvent`
+//! drops events because DistributedEventBus callbacks carry no context), so
+//! cross-node state convergence is NOT functional yet. Single-node use only.
+
 const std = @import("std");
 const Time = @import("Time.zig");
 const DistributedEventBus = @import("DistributedEventBus.zig").DistributedEventBus;
@@ -226,7 +231,7 @@ pub const ClusterMembership = struct {
                 if (is_dead) {
                     node.state = .failed;
                     if (self.on_node_leave_cb) |cb| cb(node.id);
-                    
+
                     if (self.current_leader) |leader| {
                         if (std.mem.eql(u8, leader, node.id)) {
                             self.allocator.free(leader);
@@ -242,18 +247,12 @@ pub const ClusterMembership = struct {
     fn broadcastEvent(self: *Self, event_type: EventType) !void {
         // Use a static-sized buffer on stack to avoid heap allocation per broadcast
         var buf: [1024]u8 = undefined;
-        
+
         var addr_buf: [64]u8 = undefined;
         const addr_str = try std.fmt.bufPrint(&addr_buf, "{any}", .{self.address});
         const host = if (std.mem.indexOf(u8, addr_str, ":")) |colon| addr_str[0..colon] else addr_str;
 
-        const payload = try std.fmt.bufPrint(&buf, "{{\"t\":{d},\"id\":\"{s}\",\"h\":\"{s}\",\"p\":{d},\"ts\":{d}}}", .{ 
-            @intFromEnum(event_type), 
-            self.node_id, 
-            host, 
-            self.address.ip4.port, 
-            Time.monotonicNowSeconds() 
-        });
+        const payload = try std.fmt.bufPrint(&buf, "{{\"t\":{d},\"id\":\"{s}\",\"h\":\"{s}\",\"p\":{d},\"ts\":{d}}}", .{ @intFromEnum(event_type), self.node_id, host, self.address.ip4.port, Time.monotonicNowSeconds() });
 
         try self.bus.publish("cluster.membership", payload);
     }
@@ -505,22 +504,38 @@ test "ClusterMembership node leave and rejoin" {
 
     // Add 2 nodes
     cluster.handleGossipEvent(.{
-        .event_type = .join, .node_id = "n1", .host = "127.0.0.1", .port = 1, .timestamp = 0,
+        .event_type = .join,
+        .node_id = "n1",
+        .host = "127.0.0.1",
+        .port = 1,
+        .timestamp = 0,
     });
     cluster.handleGossipEvent(.{
-        .event_type = .join, .node_id = "n2", .host = "127.0.0.1", .port = 2, .timestamp = 0,
+        .event_type = .join,
+        .node_id = "n2",
+        .host = "127.0.0.1",
+        .port = 2,
+        .timestamp = 0,
     });
     try std.testing.expectEqual(@as(usize, 3), cluster.getHealthyNodeCount());
 
     // Node leaves
     cluster.handleGossipEvent(.{
-        .event_type = .leave, .node_id = "n1", .host = "127.0.0.1", .port = 1, .timestamp = 0,
+        .event_type = .leave,
+        .node_id = "n1",
+        .host = "127.0.0.1",
+        .port = 1,
+        .timestamp = 0,
     });
     try std.testing.expectEqual(@as(usize, 2), cluster.getHealthyNodeCount());
 
     // Node rejoins
     cluster.handleGossipEvent(.{
-        .event_type = .join, .node_id = "n1", .host = "127.0.0.1", .port = 1, .timestamp = 0,
+        .event_type = .join,
+        .node_id = "n1",
+        .host = "127.0.0.1",
+        .port = 1,
+        .timestamp = 0,
     });
     try std.testing.expectEqual(@as(usize, 3), cluster.getHealthyNodeCount());
 }

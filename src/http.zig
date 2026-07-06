@@ -91,7 +91,10 @@ pub const RenderExt = struct {
     /// {"success":true,"data":{"list":<list>,"total":N,"page":P,"pageSize":S,"totalPages":T}}
     pub fn page(ctx: *Context, list: anytype, total: usize, page_num: usize, page_size: usize) !void {
         try ctx.jsonStruct(200, .{ .success = true, .data = .{
-            .list = list, .total = total, .page = page_num, .pageSize = page_size,
+            .list = list,
+            .total = total,
+            .page = page_num,
+            .pageSize = page_size,
             .totalPages = (total + page_size - 1) / page_size,
         } });
     }

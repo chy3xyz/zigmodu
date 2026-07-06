@@ -31,6 +31,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const Time = @import("../core/Time.zig");
 const errors = @import("errors.zig");
 const sqlite3_c = @import("sqlite3_c.zig");
 const libpq_c = @import("libpq_c.zig");
@@ -56,6 +57,37 @@ fn allocPrintZ(allocator: std.mem.Allocator, comptime fmt: []const u8, args: any
     const s = try std.fmt.allocPrint(allocator, fmt, args);
     defer allocator.free(s);
     return try allocZ(allocator, s);
+}
+
+/// Validates a SQL identifier (table/column name): `[A-Za-z_][A-Za-z0-9_.]*`.
+/// The dot allows schema-qualified names (`public.users`).
+pub fn validateIdentifier(name: []const u8) error{InvalidSqlIdentifier}!void {
+    if (name.len == 0 or name.len > 128) return error.InvalidSqlIdentifier;
+    for (name, 0..) |c, i| {
+        const ok = switch (c) {
+            'a'...'z', 'A'...'Z', '_' => true,
+            '0'...'9', '.' => i > 0,
+            else => false,
+        };
+        if (!ok) return error.InvalidSqlIdentifier;
+    }
+}
+
+/// Defense-in-depth check for SQL fragments interpolated into query strings
+/// (e.g. `where_clause` in findOne/findAll). Values MUST be passed via `?`
+/// placeholders + args — string literals, statement separators and comments
+/// are rejected to block injection through the fragment itself.
+pub fn validateSqlFragment(fragment: []const u8) error{UnsafeSqlFragment}!void {
+    if (fragment.len > 4096) return error.UnsafeSqlFragment;
+    var i: usize = 0;
+    while (i < fragment.len) : (i += 1) {
+        switch (fragment[i]) {
+            '\'', '"', ';', 0 => return error.UnsafeSqlFragment,
+            '-' => if (i + 1 < fragment.len and fragment[i + 1] == '-') return error.UnsafeSqlFragment,
+            '/' => if (i + 1 < fragment.len and fragment[i + 1] == '*') return error.UnsafeSqlFragment,
+            else => {},
+        }
+    }
 }
 
 /// SQL value types for parameterized queries
@@ -282,7 +314,10 @@ fn scanStruct(allocator: std.mem.Allocator, comptime T: type, row: Row, partial:
     if (info != .@"struct") @compileError("scanStruct only supports structs, got " ++ @typeName(T));
 
     var result: T = undefined;
-    const fn_names = info.@"struct".field_names; const fn_types = info.@"struct".field_types; const fn_attrs = info.@"struct".field_attrs; inline for (fn_names, fn_types, fn_attrs, 0..) |fname, ft, _, fi| {
+    const fn_names = info.@"struct".field_names;
+    const fn_types = info.@"struct".field_types;
+    const fn_attrs = info.@"struct".field_attrs;
+    inline for (fn_names, fn_types, fn_attrs, 0..) |fname, ft, _, fi| {
         const FieldType = ft;
         const is_optional = @typeInfo(FieldType) == .optional;
         const BaseType = if (is_optional) @typeInfo(FieldType).optional.child else FieldType;
@@ -1105,7 +1140,7 @@ pub const PostgresConn = struct {
                     allocator.free(buf);
                     return null;
                 };
-                @memcpy(buf[pos..pos + s.len], s);
+                @memcpy(buf[pos .. pos + s.len], s);
                 pos += s.len;
             } else {
                 buf[pos] = c;
@@ -1927,11 +1962,12 @@ pub fn defaultAcceptable(err: anyerror) bool {
 
 /// SQL context aligned with go-zero's context.Context usage for sqlx
 pub const SqlContext = struct {
+    /// Absolute deadline in monotonic milliseconds (see Time.monotonicNowMilliseconds).
     deadline_ms: ?i64 = null,
 
     pub fn isDone(self: SqlContext) bool {
         if (self.deadline_ms) |d| {
-            return 0 > d;
+            return Time.monotonicNowMilliseconds() > d;
         }
         return false;
     }
@@ -1941,7 +1977,7 @@ pub const SqlContext = struct {
     }
 
     pub fn withTimeout(timeout_ms: i64) SqlContext {
-        return .{ .deadline_ms = 0 + timeout_ms };
+        return .{ .deadline_ms = Time.monotonicNowMilliseconds() + timeout_ms };
     }
 };
 
@@ -1963,10 +1999,16 @@ pub const Span = struct {
     pub fn init(name: []const u8) Span {
         return .{
             .name = name,
-            .start_ns = 0,
+            .start_ns = Time.monotonicNow(),
             .end_ns = null,
             .attributes = std.StringHashMap([]const u8).init(std.heap.page_allocator),
         };
+    }
+
+    /// Span duration in nanoseconds; null until `end()` is called.
+    pub fn durationNs(self: *const Span) ?i128 {
+        const e = self.end_ns orelse return null;
+        return e - self.start_ns;
     }
 
     pub fn setAttribute(self: *Span, key: []const u8, value: []const u8) void {
@@ -1995,7 +2037,7 @@ pub const Span = struct {
 
     pub fn end(self: *Span) void {
         if (self.end_ns == null) {
-            self.end_ns = 0;
+            self.end_ns = Time.monotonicNow();
         }
         self.deinit();
     }
@@ -2377,6 +2419,8 @@ pub const Client = struct {
     }
 
     pub fn findOne(self: *Client, comptime T: type, table: []const u8, where_clause: []const u8, args: []const Value) !T {
+        try validateIdentifier(table);
+        try validateSqlFragment(where_clause);
         const sql = try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s} LIMIT 1", .{ table, where_clause });
         defer self.allocator.free(sql);
         return self.queryRow(T, sql, args);
@@ -2388,6 +2432,8 @@ pub const Client = struct {
     }
 
     pub fn findOnePartial(self: *Client, comptime T: type, table: []const u8, where_clause: []const u8, args: []const Value) !T {
+        try validateIdentifier(table);
+        try validateSqlFragment(where_clause);
         const sql = try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s} LIMIT 1", .{ table, where_clause });
         defer self.allocator.free(sql);
         return self.queryRowPartial(T, sql, args);
@@ -2399,6 +2445,8 @@ pub const Client = struct {
     }
 
     pub fn findAll(self: *Client, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) ![]T {
+        try validateIdentifier(table);
+        if (where_clause) |w| try validateSqlFragment(w);
         const sql = if (where_clause) |w|
             try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s}", .{ table, w })
         else
@@ -2419,6 +2467,8 @@ pub const Client = struct {
     }
 
     pub fn findAllPartial(self: *Client, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) ![]T {
+        try validateIdentifier(table);
+        if (where_clause) |w| try validateSqlFragment(w);
         const sql = if (where_clause) |w|
             try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s}", .{ table, w })
         else
@@ -2726,12 +2776,16 @@ pub const CachedConn = struct {
     }
 
     pub fn findOne(self: *CachedConn, comptime T: type, cache_key: []const u8, table: []const u8, where_clause: []const u8, args: []const Value) !T {
+        try validateIdentifier(table);
+        try validateSqlFragment(where_clause);
         const sql = try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s} LIMIT 1", .{ table, where_clause });
         defer self.allocator.free(sql);
         return self.queryRow(T, cache_key, sql, args);
     }
 
     pub fn findOneNoCache(self: *CachedConn, comptime T: type, table: []const u8, where_clause: []const u8, args: []const Value) !T {
+        try validateIdentifier(table);
+        try validateSqlFragment(where_clause);
         const sql = try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s} LIMIT 1", .{ table, where_clause });
         defer self.allocator.free(sql);
         return self.queryRowNoCache(T, sql, args);
@@ -2748,6 +2802,8 @@ pub const CachedConn = struct {
     }
 
     pub fn findAll(self: *CachedConn, comptime T: type, cache_key: []const u8, table: []const u8, where_clause: ?[]const u8, args: []const Value) ![]T {
+        try validateIdentifier(table);
+        if (where_clause) |w| try validateSqlFragment(w);
         const sql = if (where_clause) |w|
             try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s}", .{ table, w })
         else
@@ -2757,6 +2813,8 @@ pub const CachedConn = struct {
     }
 
     pub fn findAllNoCache(self: *CachedConn, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) ![]T {
+        try validateIdentifier(table);
+        if (where_clause) |w| try validateSqlFragment(w);
         const sql = if (where_clause) |w|
             try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s}", .{ table, w })
         else
@@ -3159,6 +3217,35 @@ test "client findOne and findAll" {
     const users = try client.findAll(User, "users", null, &.{});
     defer client.deinitQueryRows(User, users);
     try std.testing.expectEqual(@as(usize, 2), users.len);
+
+    // Injection attempts through table / where_clause are rejected.
+    try std.testing.expectError(error.InvalidSqlIdentifier, client.findAll(User, "users; DROP TABLE users", null, &.{}));
+    try std.testing.expectError(error.UnsafeSqlFragment, client.findOne(User, "users", "name = 'Alice' OR 1=1 --", &.{}));
+    try std.testing.expectError(error.UnsafeSqlFragment, client.findAll(User, "users", "1=1; DELETE FROM users", &.{}));
+}
+
+test "validateIdentifier and validateSqlFragment" {
+    // Valid identifiers
+    try validateIdentifier("users");
+    try validateIdentifier("public.users");
+    try validateIdentifier("_tmp_table1");
+
+    // Invalid identifiers
+    try std.testing.expectError(error.InvalidSqlIdentifier, validateIdentifier(""));
+    try std.testing.expectError(error.InvalidSqlIdentifier, validateIdentifier("1users"));
+    try std.testing.expectError(error.InvalidSqlIdentifier, validateIdentifier("users; DROP"));
+    try std.testing.expectError(error.InvalidSqlIdentifier, validateIdentifier("users--"));
+
+    // Valid fragments (parameterized)
+    try validateSqlFragment("name = ?1");
+    try validateSqlFragment("age > ? AND status = ?");
+    try validateSqlFragment("WHERE tenant_id = ? ORDER BY id");
+
+    // Unsafe fragments
+    try std.testing.expectError(error.UnsafeSqlFragment, validateSqlFragment("name = 'Alice'"));
+    try std.testing.expectError(error.UnsafeSqlFragment, validateSqlFragment("1=1; DROP TABLE users"));
+    try std.testing.expectError(error.UnsafeSqlFragment, validateSqlFragment("1=1 -- comment"));
+    try std.testing.expectError(error.UnsafeSqlFragment, validateSqlFragment("1=1 /* comment */"));
 }
 
 test "cached conn findOne" {

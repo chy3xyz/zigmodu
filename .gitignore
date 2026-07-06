@@ -43,6 +43,7 @@ docs/.doctrees/
 # Benchmark results
 benchmarks/results/
 *.bench
+bench-results.json
 
 # Temporary files
 *.tmp

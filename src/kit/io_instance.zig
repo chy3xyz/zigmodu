@@ -5,6 +5,6 @@ const builtin = @import("builtin");
 pub var io: std.Io = if (builtin.is_test) std.testing.io else undefined;
 
 /// Initialize Io from process init data (call in main).
-pub fn @"init"(init_data: std.process.Init) void {
+pub fn init(init_data: std.process.Init) void {
     io = init_data.io;
 }

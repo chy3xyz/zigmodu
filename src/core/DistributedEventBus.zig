@@ -163,14 +163,14 @@ pub const DistributedEventBus = struct {
         // Pre-allocate a large reusable buffer for the life of the connection
         var read_buf: [8192]u8 = undefined;
         var r = conn.reader(self.io, &read_buf);
-        
+
         // Use an Arena for parsing-related allocations that can be cleared per message
         var msg_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer msg_arena.deinit();
 
         while (self.is_running) {
             const ma = msg_arena.allocator();
-            
+
             // Fast read: directly into buffer
             const data = r.interface.readSliceShort(&read_buf) catch |err| {
                 if (self.is_running) std.log.debug("[DEB] Read error: {}", .{err});
@@ -194,7 +194,7 @@ pub const DistributedEventBus = struct {
                 // Deserialization failed — push to DLQ for later inspection
                 self.pushParseFailureToDlq(dlq, data) catch {};
             }
-            
+
             // Clear arena for next message - extremely fast
             _ = msg_arena.reset(.retain_capacity);
         }
@@ -204,14 +204,14 @@ pub const DistributedEventBus = struct {
     fn extractJsonValue(data: []const u8, key: []const u8) ?[]const u8 {
         const key_pos = std.mem.indexOf(u8, data, key) orelse return null;
         const remaining = data[key_pos + key.len ..];
-        
+
         // Skip : and optional whitespace/quotes
         var val_start: usize = 0;
         while (val_start < remaining.len and (remaining[val_start] == ':' or remaining[val_start] == ' ' or remaining[val_start] == '"')) : (val_start += 1) {}
-        
+
         var end = val_start;
         while (end < remaining.len and remaining[end] != '"' and remaining[end] != ',' and remaining[end] != '}') : (end += 1) {}
-        
+
         if (val_start >= end) return null;
         return remaining[val_start..end];
     }

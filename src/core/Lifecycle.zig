@@ -203,24 +203,39 @@ test "stopAll reverse dependency order" {
 
     const Base = struct {
         pub const info = @import("../api/Module.zig").Module{
-            .name = "base-s", .description = "B", .dependencies = &.{},
+            .name = "base-s",
+            .description = "B",
+            .dependencies = &.{},
         };
         pub fn init() !void {}
-        pub fn deinit() void { Ctx.deinit_order[Ctx.idx] = 'b'; Ctx.idx += 1; }
+        pub fn deinit() void {
+            Ctx.deinit_order[Ctx.idx] = 'b';
+            Ctx.idx += 1;
+        }
     };
     const Middle = struct {
         pub const info = @import("../api/Module.zig").Module{
-            .name = "middle-s", .description = "M", .dependencies = &.{"base-s"},
+            .name = "middle-s",
+            .description = "M",
+            .dependencies = &.{"base-s"},
         };
         pub fn init() !void {}
-        pub fn deinit() void { Ctx.deinit_order[Ctx.idx] = 'm'; Ctx.idx += 1; }
+        pub fn deinit() void {
+            Ctx.deinit_order[Ctx.idx] = 'm';
+            Ctx.idx += 1;
+        }
     };
     const Top = struct {
         pub const info = @import("../api/Module.zig").Module{
-            .name = "top-s", .description = "T", .dependencies = &.{"middle-s"},
+            .name = "top-s",
+            .description = "T",
+            .dependencies = &.{"middle-s"},
         };
         pub fn init() !void {}
-        pub fn deinit() void { Ctx.deinit_order[Ctx.idx] = 't'; Ctx.idx += 1; }
+        pub fn deinit() void {
+            Ctx.deinit_order[Ctx.idx] = 't';
+            Ctx.idx += 1;
+        }
     };
 
     var scanned = try @import("ModuleScanner.zig").scanModules(allocator, .{ Top, Middle, Base });

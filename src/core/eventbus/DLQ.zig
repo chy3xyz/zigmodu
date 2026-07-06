@@ -97,10 +97,10 @@ pub const DLQ = struct {
         const storage: Storage = switch (config.storage) {
             .memory => .{ .memory = .{
                 .entries = std.ArrayList(DLQEntry).empty,
-            }},
+            } },
             .sqlite => .{ .sqlite = .{
                 .db_path = try std.fmt.allocPrint(allocator, "{s}/dlq.db", .{"data"}),
-            }},
+            } },
         };
 
         return .{

@@ -170,17 +170,21 @@ pub const SecretsManager = struct {
         };
     }
 
-    /// [...] Vault [...] (placeholder — [...] HTTP [...])
+    /// EXPERIMENTAL placeholder — Vault HTTP client is NOT implemented.
+    /// Returns error.VaultNotImplemented so callers fail loudly instead of
+    /// silently proceeding without the expected secrets. Env/file/default
+    /// sources are fully functional; use those in production.
     pub fn loadFromVault(self: *Self, path: []const u8) !void {
         if (self.vault_config == null) {
             return error.VaultNotConfigured;
         }
 
-        std.log.info("[SecretsManager] Vault integration: would load secrets from {s}/v1/{s}/data/{s}", .{
+        std.log.warn("[SecretsManager] Vault HTTP integration not implemented: cannot load {s}/v1/{s}/data/{s}", .{
             self.vault_config.?.address,
             self.vault_config.?.mount_path,
             path,
         });
+        return error.VaultNotImplemented;
     }
 
     /// [...] ([...])
@@ -319,12 +323,10 @@ test "SecretsManager priority" {
     try sm.setDefault("TOKEN", "another_default");
     try std.testing.expectEqualStrings("default_token", sm.get("TOKEN").?);
 
-    try sm.setWithPriority(try allocator.dupe(u8, "TOKEN"),
-        try allocator.dupe(u8, "file_token"), .file);
+    try sm.setWithPriority(try allocator.dupe(u8, "TOKEN"), try allocator.dupe(u8, "file_token"), .file);
     try std.testing.expectEqualStrings("file_token", sm.get("TOKEN").?);
 
-    try sm.setWithPriority(try allocator.dupe(u8, "TOKEN"),
-        try allocator.dupe(u8, "env_token"), .env);
+    try sm.setWithPriority(try allocator.dupe(u8, "TOKEN"), try allocator.dupe(u8, "env_token"), .env);
     try std.testing.expectEqualStrings("env_token", sm.get("TOKEN").?);
 }
 
@@ -394,7 +396,8 @@ test "SecretsManager Vault config" {
     try sm.configureVault("https://vault.example.com:8200", "hvs.token123");
     try std.testing.expect(sm.vault_config != null);
 
-    _ = sm.loadFromVault("database/creds") catch |err| std.log.warn("[Secrets] Vault load skipped: {}", .{err});
+    // Vault HTTP client is a placeholder — must fail loudly, not silently no-op.
+    try std.testing.expectError(error.VaultNotImplemented, sm.loadFromVault("database/creds"));
 }
 
 test "SecretsManager export as env" {

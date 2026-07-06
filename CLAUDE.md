@@ -1,12 +1,12 @@
 # CLAUDE.md — ZigModu Framework for Claude Code
 
 ## Project
-ZigModu v0.13.15 — modular app framework for Zig 0.17.0. ~149 src files, 413 tests, ~92/100.
+ZigModu v0.13.15 — modular app framework for Zig 0.17.0. ~149 src files, 455 tests, ~95/100.
 
 ## Build & Test
 ```bash
 zig build
-ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test   # 413 passed, 5 skipped
+ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test   # 455 passed, 12 skipped
 zig build check-api                                    # examples API gate
 bash scripts/ci-integration.sh                         # tenant-mgmt + stress (HTTP_PORT=18080)
 zig build docs

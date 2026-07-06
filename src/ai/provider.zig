@@ -76,7 +76,10 @@ pub const AiProvider = struct {
     /// Enable rate limiting. tokens_per_sec: max requests per second.
     pub fn enableRateLimit(self: *AiProvider, io: std.Io, tokens_per_sec: u32) !void {
         const limiter = try @import("../resilience/RateLimiter.zig").RateLimiter.init(
-            self.allocator, "ai_provider", tokens_per_sec, tokens_per_sec,
+            self.allocator,
+            "ai_provider",
+            tokens_per_sec,
+            tokens_per_sec,
         );
         self.rate_limiter = .{ .limiter = limiter, .io = io, .mutex = std.Io.Mutex.init };
     }

@@ -100,7 +100,10 @@ pub const NatsClient = struct {
         // Read bytes until newline
         while (true) {
             var byte_buf: [1]u8 = undefined;
-            _ = stream.read(self.io, data: { var d: [1][]u8 = .{&byte_buf}; break :data &d; }) catch return error.ConnectionError;
+            _ = stream.read(self.io, data: {
+                var d: [1][]u8 = .{&byte_buf};
+                break :data &d;
+            }) catch return error.ConnectionError;
             if (byte_buf[0] == '\n') break;
             try info_line.append(self.allocator, byte_buf[0]);
         }
@@ -295,7 +298,10 @@ pub const NatsClient = struct {
             }
 
             // Non-blocking read
-            const n = s.read(self.io, data: { var d: [1][]u8 = .{&rbuf}; break :data &d; }) catch |err| {
+            const n = s.read(self.io, data: {
+                var d: [1][]u8 = .{&rbuf};
+                break :data &d;
+            }) catch |err| {
                 self.unsubscribeRaw(req_sid) catch {};
                 return err;
             };
@@ -368,7 +374,10 @@ pub const NatsClient = struct {
     pub fn poll(self: *Self) !usize {
         const s = self.stream orelse return error.NotConnected;
         var buf: [8192]u8 = undefined;
-        const n = s.read(self.io, data: { var d: [1][]u8 = .{&buf}; break :data &d; }) catch |err| return err;
+        const n = s.read(self.io, data: {
+            var d: [1][]u8 = .{&buf};
+            break :data &d;
+        }) catch |err| return err;
         if (n == 0) return 0;
 
         return try self.parseMessages(buf[0..n]);
@@ -383,7 +392,10 @@ pub const NatsClient = struct {
         try w.interface.flush();
 
         var rbuf: [128]u8 = undefined;
-        const n = s.read(self.io, data: { var d: [1][]u8 = .{&rbuf}; break :data &d; }) catch return error.ConnectionError;
+        const n = s.read(self.io, data: {
+            var d: [1][]u8 = .{&rbuf};
+            break :data &d;
+        }) catch return error.ConnectionError;
         if (n < 6 or !std.mem.eql(u8, rbuf[0..6], "PONG\r\n")) return error.ProtocolError;
     }
 

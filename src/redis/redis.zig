@@ -73,7 +73,10 @@ pub const Redis = struct {
             try writeCmd(&stream, self.io, cmd);
 
             var buf: [4096]u8 = undefined;
-            const n = stream.read(self.io, data: { var d: [1][]u8 = .{buf[0..]}; break :data &d; }) catch return error.RedisError;
+            const n = stream.read(self.io, data: {
+                var d: [1][]u8 = .{buf[0..]};
+                break :data &d;
+            }) catch return error.RedisError;
             const response = buf[0..n];
 
             // Parse bulk string response
@@ -108,7 +111,10 @@ pub const Redis = struct {
             try writeCmd(&stream, self.io, cmd);
 
             var buf: [256]u8 = undefined;
-            _ = stream.read(self.io, data: { var d: [1][]u8 = .{buf[0..]}; break :data &d; }) catch return error.RedisError;
+            _ = stream.read(self.io, data: {
+                var d: [1][]u8 = .{buf[0..]};
+                break :data &d;
+            }) catch return error.RedisError;
             return;
         }
         return error.RedisError;
@@ -123,7 +129,10 @@ pub const Redis = struct {
             try writeCmd(&stream, self.io, cmd);
 
             var buf: [256]u8 = undefined;
-            const n = stream.read(self.io, data: { var d: [1][]u8 = .{buf[0..]}; break :data &d; }) catch return error.RedisError;
+            const n = stream.read(self.io, data: {
+                var d: [1][]u8 = .{buf[0..]};
+                break :data &d;
+            }) catch return error.RedisError;
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {
@@ -140,15 +149,18 @@ pub const Redis = struct {
             var cmd_builder: std.ArrayList(u8) = std.ArrayList(u8).empty;
             defer cmd_builder.deinit(self.allocator);
 
-            try cmd_builder.print(self.allocator,"*{d}\r\n$3\r\nDEL\r\n", .{keys.len + 1});
+            try cmd_builder.print(self.allocator, "*{d}\r\n$3\r\nDEL\r\n", .{keys.len + 1});
             for (keys) |key| {
-                try cmd_builder.print(self.allocator,"${d}\r\n{s}\r\n", .{ key.len, key });
+                try cmd_builder.print(self.allocator, "${d}\r\n{s}\r\n", .{ key.len, key });
             }
 
             try writeCmd(&stream, self.io, cmd_builder.items);
 
             var buf: [256]u8 = undefined;
-            const n = stream.read(self.io, data: { var d: [1][]u8 = .{buf[0..]}; break :data &d; }) catch return error.RedisError;
+            const n = stream.read(self.io, data: {
+                var d: [1][]u8 = .{buf[0..]};
+                break :data &d;
+            }) catch return error.RedisError;
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {
@@ -168,7 +180,10 @@ pub const Redis = struct {
             try writeCmd(&stream, self.io, cmd);
 
             var buf: [256]u8 = undefined;
-            const n = stream.read(self.io, data: { var d: [1][]u8 = .{buf[0..]}; break :data &d; }) catch return error.RedisError;
+            const n = stream.read(self.io, data: {
+                var d: [1][]u8 = .{buf[0..]};
+                break :data &d;
+            }) catch return error.RedisError;
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {
@@ -188,7 +203,10 @@ pub const Redis = struct {
             try writeCmd(&stream, self.io, cmd);
 
             var buf: [256]u8 = undefined;
-            const n = stream.read(self.io, data: { var d: [1][]u8 = .{buf[0..]}; break :data &d; }) catch return error.RedisError;
+            const n = stream.read(self.io, data: {
+                var d: [1][]u8 = .{buf[0..]};
+                break :data &d;
+            }) catch return error.RedisError;
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {
@@ -208,7 +226,10 @@ pub const Redis = struct {
             try writeCmd(&stream, self.io, cmd);
 
             var buf: [256]u8 = undefined;
-            const n = stream.read(self.io, data: { var d: [1][]u8 = .{buf[0..]}; break :data &d; }) catch return error.RedisError;
+            const n = stream.read(self.io, data: {
+                var d: [1][]u8 = .{buf[0..]};
+                break :data &d;
+            }) catch return error.RedisError;
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {
@@ -228,7 +249,10 @@ pub const Redis = struct {
             try writeCmd(&stream, self.io, cmd);
 
             var buf: [256]u8 = undefined;
-            _ = stream.read(self.io, data: { var d: [1][]u8 = .{buf[0..]}; break :data &d; }) catch return error.RedisError;
+            _ = stream.read(self.io, data: {
+                var d: [1][]u8 = .{buf[0..]};
+                break :data &d;
+            }) catch return error.RedisError;
             return;
         }
         return error.RedisError;
@@ -243,7 +267,10 @@ pub const Redis = struct {
             try writeCmd(&stream, self.io, cmd);
 
             var buf: [256]u8 = undefined;
-            const n = stream.read(self.io, data: { var d: [1][]u8 = .{buf[0..]}; break :data &d; }) catch return error.RedisError;
+            const n = stream.read(self.io, data: {
+                var d: [1][]u8 = .{buf[0..]};
+                break :data &d;
+            }) catch return error.RedisError;
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {
@@ -266,7 +293,10 @@ pub const Redis = struct {
             try writeCmd(&stream, self.io, cmd);
 
             var buf: [256]u8 = undefined;
-            const n = stream.read(self.io, data: { var d: [1][]u8 = .{buf[0..]}; break :data &d; }) catch return error.RedisError;
+            const n = stream.read(self.io, data: {
+                var d: [1][]u8 = .{buf[0..]};
+                break :data &d;
+            }) catch return error.RedisError;
             const response = buf[0..n];
 
             if (response.len >= 3 and std.mem.eql(u8, response[0..3], "+OK")) {
@@ -285,7 +315,10 @@ pub const Redis = struct {
             try writeCmd(&stream, self.io, cmd);
 
             var buf: [256]u8 = undefined;
-            _ = stream.read(self.io, data: { var d: [1][]u8 = .{buf[0..]}; break :data &d; }) catch return error.RedisError;
+            _ = stream.read(self.io, data: {
+                var d: [1][]u8 = .{buf[0..]};
+                break :data &d;
+            }) catch return error.RedisError;
         }
         return;
     }
@@ -299,7 +332,10 @@ pub const Redis = struct {
             try writeCmd(&stream, self.io, cmd);
 
             var buf: [256]u8 = undefined;
-            const n = stream.read(self.io, data: { var d: [1][]u8 = .{buf[0..]}; break :data &d; }) catch return error.RedisError;
+            const n = stream.read(self.io, data: {
+                var d: [1][]u8 = .{buf[0..]};
+                break :data &d;
+            }) catch return error.RedisError;
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {
@@ -318,7 +354,10 @@ pub const Redis = struct {
             try writeCmd(&stream, self.io, cmd);
 
             var buf: [4096]u8 = undefined;
-            const n = stream.read(self.io, data: { var d: [1][]u8 = .{buf[0..]}; break :data &d; }) catch return error.RedisError;
+            const n = stream.read(self.io, data: {
+                var d: [1][]u8 = .{buf[0..]};
+                break :data &d;
+            }) catch return error.RedisError;
             const response = buf[0..n];
 
             if (response.len > 1) {
@@ -351,7 +390,10 @@ pub const Redis = struct {
             try writeCmd(&stream, self.io, cmd);
 
             var buf: [256]u8 = undefined;
-            const n = stream.read(self.io, data: { var d: [1][]u8 = .{buf[0..]}; break :data &d; }) catch return error.RedisError;
+            const n = stream.read(self.io, data: {
+                var d: [1][]u8 = .{buf[0..]};
+                break :data &d;
+            }) catch return error.RedisError;
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {
@@ -372,7 +414,10 @@ pub const Redis = struct {
             try writeCmd(&stream, self.io, cmd);
 
             var buf: [4096]u8 = undefined;
-            const n = stream.read(self.io, data: { var d: [1][]u8 = .{buf[0..]}; break :data &d; }) catch return error.RedisError;
+            const n = stream.read(self.io, data: {
+                var d: [1][]u8 = .{buf[0..]};
+                break :data &d;
+            }) catch return error.RedisError;
             const response = buf[0..n];
 
             if (response.len > 1) {
@@ -405,7 +450,10 @@ pub const Redis = struct {
             try writeCmd(&stream, self.io, cmd);
 
             var buf: [256]u8 = undefined;
-            const n = stream.read(self.io, data: { var d: [1][]u8 = .{buf[0..]}; break :data &d; }) catch return error.RedisError;
+            const n = stream.read(self.io, data: {
+                var d: [1][]u8 = .{buf[0..]};
+                break :data &d;
+            }) catch return error.RedisError;
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {

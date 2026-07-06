@@ -23,10 +23,21 @@ pub const Expression = struct {
             if (part.len == 0) continue;
             if (fi >= 5) return error.InvalidCronExpr;
             const target = switch (fi) {
-                0 => &self.minutes, 1 => &self.hours, 2 => &self.days, 3 => &self.months, 4 => &self.dows,
+                0 => &self.minutes,
+                1 => &self.hours,
+                2 => &self.days,
+                3 => &self.months,
+                4 => &self.dows,
                 else => unreachable,
             };
-            const max: u8 = switch (fi) { 0 => 59, 1 => 23, 2 => 31, 3 => 12, 4 => 6, else => unreachable };
+            const max: u8 = switch (fi) {
+                0 => 59,
+                1 => 23,
+                2 => 31,
+                3 => 12,
+                4 => 6,
+                else => unreachable,
+            };
             try parseField(part, target, max);
         }
         return self;
@@ -71,7 +82,7 @@ fn parseField(part: []const u8, target: []bool, max: u8) !void {
     while (sub.next()) |s| {
         if (std.mem.indexOfScalar(u8, s, '/')) |slash| {
             const base = s[0..slash];
-            const step_str = s[slash+1..];
+            const step_str = s[slash + 1 ..];
             const step = std.fmt.parseInt(u8, step_str, 10) catch return error.InvalidCronExpr;
             if (std.mem.eql(u8, base, "*")) {
                 var i: u8 = 0;
@@ -83,7 +94,7 @@ fn parseField(part: []const u8, target: []bool, max: u8) !void {
             }
         } else if (std.mem.indexOfScalar(u8, s, '-')) |dash| {
             const start_str = s[0..dash];
-            const end_str = s[dash+1..];
+            const end_str = s[dash + 1 ..];
             const start = std.fmt.parseInt(u8, start_str, 10) catch return error.InvalidCronExpr;
             const end = std.fmt.parseInt(u8, end_str, 10) catch return error.InvalidCronExpr;
             var i = start;

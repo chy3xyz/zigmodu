@@ -73,7 +73,7 @@ pub fn tracingWithTrace(header_name: []const u8) api.Middleware {
                 try next(ctx);
             }
         }.mw,
-        .user_data = @constCast(@ptrCast(header_name.ptr)),
+        .user_data = @ptrCast(@constCast(header_name.ptr)),
     };
 }
 
@@ -109,21 +109,18 @@ pub fn rateLimitPerClient(
     registry: *RateLimiterRegistry,
     key_extractor: *const fn (*api.Context) []const u8,
 ) api.Middleware {
-    const ctx_ptr = std.heap.page_allocator.create(struct {
-        registry: *RateLimiterRegistry,
-        extractor: *const fn (*api.Context) []const u8,
-    }) catch unreachable;
-    ctx_ptr.* = .{ .registry = registry, .extractor = key_extractor };
+    const S = struct {
+        var stored_registry: *RateLimiterRegistry = undefined;
+        var stored_extractor: *const fn (*api.Context) []const u8 = undefined;
+    };
+    S.stored_registry = registry;
+    S.stored_extractor = key_extractor;
 
     return .{
         .func = struct {
-            fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
-                const state = @as(*struct {
-                    registry: *RateLimiterRegistry,
-                    extractor: *const fn (*api.Context) []const u8,
-                }, @ptrCast(@alignCast(user_data.?)));
-                const client_key = state.extractor(ctx);
-                const lim = try state.registry.getOrCreateForClient(client_key, 100, 10);
+            fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
+                const client_key = S.stored_extractor(ctx);
+                const lim = try S.stored_registry.getOrCreateForClient(client_key, 100, 10);
                 if (!lim.tryAcquire()) {
                     try ctx.sendErrorResponse(429, 429, "Too Many Requests");
                     return;
@@ -131,7 +128,6 @@ pub fn rateLimitPerClient(
                 try next(ctx);
             }
         }.mw,
-        .user_data = @ptrCast(ctx_ptr),
     };
 }
 
@@ -155,7 +151,9 @@ pub fn circuitBreak(breaker: *CircutBreaker) api.Middleware {
                 // Execute downstream and track result
                 next(ctx) catch |err| {
                     _ = cb.call(struct {
-                        fn fail() anyerror!void { return error.BreakerFail; }
+                        fn fail() anyerror!void {
+                            return error.BreakerFail;
+                        }
                     }.fail);
                     return err;
                 };

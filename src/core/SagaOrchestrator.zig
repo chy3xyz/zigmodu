@@ -396,13 +396,17 @@ test "SagaOrchestrator register and execute success" {
 
     const Step1 = struct {
         var flag: *bool = undefined;
-        pub fn act() !void { flag.* = true; }
+        pub fn act() !void {
+            flag.* = true;
+        }
     };
     Step1.flag = &step1_executed;
 
     const Step2 = struct {
         var flag: *bool = undefined;
-        pub fn act() !void { flag.* = true; }
+        pub fn act() !void {
+            flag.* = true;
+        }
     };
     Step2.flag = &step2_executed;
 
@@ -443,7 +447,9 @@ test "SagaOrchestrator auto-compensation on failure" {
 
     const FailCompensation = struct {
         var flag: *bool = undefined;
-        pub fn comp() void { flag.* = true; }
+        pub fn comp() void {
+            flag.* = true;
+        }
     };
     FailCompensation.flag = &compensated;
 
@@ -554,7 +560,9 @@ test "SagaOrchestrator compensation reverse order" {
         var compensate_idx: usize = 0;
     };
 
-    const noopCompensate = struct { fn c() void {} }.c;
+    const noopCompensate = struct {
+        fn c() void {}
+    }.c;
     const saga_def = SagaOrchestrator.SagaDefinition{
         .name = "reverse-test",
         .steps = &.{
@@ -565,7 +573,9 @@ test "SagaOrchestrator compensation reverse order" {
                 fn f() anyerror!void {}
             }.f, .compensation = noopCompensate },
             .{ .name = "step-3", .action = struct {
-                fn f() anyerror!void { return error.SimulatedFailure; }
+                fn f() anyerror!void {
+                    return error.SimulatedFailure;
+                }
             }.f, .compensation = struct {
                 fn c() void {
                     Ctx.compensate_order[Ctx.compensate_idx] = "step-3-comp";
@@ -595,7 +605,9 @@ test "Saga persists step results to WAL" {
     var step_executed = false;
     const StepCtx = struct {
         var flag: *bool = undefined;
-        pub fn act() !void { flag.* = true; }
+        pub fn act() !void {
+            flag.* = true;
+        }
     };
     StepCtx.flag = &step_executed;
 

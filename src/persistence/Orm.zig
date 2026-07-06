@@ -344,7 +344,10 @@ pub fn Orm(comptime B: type) type {
                 }
 
                 /// Filtered pagination with custom WHERE clause and args.
+                /// `where_sql` must not contain string literals/comments/`;` —
+                /// pass values via `?` placeholders + `args` (see sqlx.validateSqlFragment).
                 pub fn findPageFiltered(self: @This(), alloc: std.mem.Allocator, where_sql: []const u8, args: []const B.Value, page: usize, size: usize) !PageResult(T) {
+                    try sqlx.validateSqlFragment(where_sql);
                     const count_sql = try std.fmt.allocPrint(alloc, "SELECT COUNT(*) as count FROM {s} {s}", .{ meta.table_name, where_sql });
                     defer alloc.free(count_sql);
                     const count_row = try self.orm.backend.queryRow(struct { count: i64 }, count_sql, args);

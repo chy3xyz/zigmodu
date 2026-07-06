@@ -92,7 +92,9 @@ pub const ClusterBootstrap = struct {
         };
         if (S.transport_impl == null) {
             S.transport_impl = .{
-                .sendVoteRequest = struct { fn f(_: ?[]const u8, _: []const u8, _: VoteRequest) void {} }.f,
+                .sendVoteRequest = struct {
+                    fn f(_: ?[]const u8, _: []const u8, _: VoteRequest) void {}
+                }.f,
                 .sendAppendEntries = struct {
                     fn f(_: ?[]const u8, _: []const u8, _: AppendEntriesRequest) AppendEntriesResponse {
                         return AppendEntriesResponse{ .term = 0, .success = false, .match_index = 0 };
@@ -100,7 +102,7 @@ pub const ClusterBootstrap = struct {
                 }.f,
             };
         }
-        const election_transport: RaftElection.ElectionTransport = @constCast(@ptrCast(@alignCast(&S.transport_impl.?)));
+        const election_transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&S.transport_impl.?)));
         const raft = try self.allocator.create(RaftElection);
         raft.* = try RaftElection.init(self.allocator, self.config.node_id, &.{}, election_cfg, &election_transport);
         self.raft = raft;
@@ -136,10 +138,18 @@ pub const ClusterBootstrap = struct {
         self.server.deinit();
     }
 
-    pub fn getMetrics(self: *Self) *ClusterMetrics { return &self.metrics; }
-    pub fn getEventBus(self: *Self) ?*DistributedEventBus { return self.bus; }
-    pub fn getMembership(self: *Self) ?*ClusterMembership { return self.membership; }
-    pub fn getRaft(self: *Self) ?*RaftElection { return self.raft; }
+    pub fn getMetrics(self: *Self) *ClusterMetrics {
+        return &self.metrics;
+    }
+    pub fn getEventBus(self: *Self) ?*DistributedEventBus {
+        return self.bus;
+    }
+    pub fn getMembership(self: *Self) ?*ClusterMembership {
+        return self.membership;
+    }
+    pub fn getRaft(self: *Self) ?*RaftElection {
+        return self.raft;
+    }
 };
 
 test "ClusterBootstrap initialization" {

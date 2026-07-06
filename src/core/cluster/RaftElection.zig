@@ -651,7 +651,7 @@ const TestCluster = struct {
                 .sendAppendEntries = sendAppendEntriesFn,
             });
 
-            const transport: RaftElection.ElectionTransport = @constCast(@ptrCast(@alignCast(&transports.items[i])));
+            const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transports.items[i])));
             const election = try RaftElection.init(allocator, my_id, peer_list.items, .{}, &transport);
             nodes.appendAssumeCapacity(Node{ .election = election });
 
@@ -944,7 +944,7 @@ test "RaftElection initialization" {
             }
         }).f,
     };
-    const transport: RaftElection.ElectionTransport = @constCast(@ptrCast(@alignCast(&transport_impl)));
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
 
     var election = try RaftElection.init(
         allocator,
@@ -977,7 +977,7 @@ test "RaftElection heartbeat resets leader info" {
             }
         }).f,
     };
-    const transport: RaftElection.ElectionTransport = @constCast(@ptrCast(@alignCast(&transport_impl)));
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
 
     var election = try RaftElection.init(
         allocator,
@@ -1021,7 +1021,7 @@ test "RaftElection vote request validation" {
             }
         }).f,
     };
-    const transport: RaftElection.ElectionTransport = @constCast(@ptrCast(@alignCast(&transport_impl)));
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
 
     var election = try RaftElection.init(
         allocator,
@@ -1061,18 +1061,24 @@ test "RaftElection rejects stale term vote" {
             }
         }).f,
     };
-    const transport: RaftElection.ElectionTransport = @constCast(@ptrCast(@alignCast(&transport_impl)));
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
 
     var election = try RaftElection.init(allocator, "node-a", &.{}, .{}, &transport);
     defer election.deinit();
 
     _ = try election.handleVoteRequest(.{
-        .term = 5, .candidate_id = "c1", .last_log_index = 1, .last_log_term = 1,
+        .term = 5,
+        .candidate_id = "c1",
+        .last_log_index = 1,
+        .last_log_term = 1,
     });
     try testing.expectEqual(@as(u64, 5), election.getTerm());
 
     const resp = try election.handleVoteRequest(.{
-        .term = 3, .candidate_id = "c2", .last_log_index = 1, .last_log_term = 1,
+        .term = 3,
+        .candidate_id = "c2",
+        .last_log_index = 1,
+        .last_log_term = 1,
     });
     try testing.expect(!resp.vote_granted);
 }
@@ -1094,7 +1100,7 @@ test "RaftElection split vote across three candidates" {
             }
         }).f,
     };
-    const transport: RaftElection.ElectionTransport = @constCast(@ptrCast(@alignCast(&transport_impl)));
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
 
     var e1 = try RaftElection.init(allocator, "n1", &.{}, .{}, &transport);
     defer e1.deinit();
@@ -1142,7 +1148,7 @@ test "RaftElection quorum calculation" {
             }
         }).f,
     };
-    const transport: RaftElection.ElectionTransport = @constCast(@ptrCast(@alignCast(&transport_impl)));
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
 
     // 3-node cluster: quorum = 2
     var e = try RaftElection.init(allocator, "n1", &.{}, .{}, &transport);

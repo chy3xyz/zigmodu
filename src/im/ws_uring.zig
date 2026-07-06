@@ -10,18 +10,34 @@ const linux = if (builtin.os.tag == .linux) std.os.linux else struct {
     pub const fd_t = i32;
     pub const io_uring_cqe = extern struct { user_data: u64 = 0, res: i32 = 0, flags: u32 = 0 };
     pub const io_uring_sqe = extern struct {
-        opcode: u8 = 0, flags: u8 = 0, ioprio: u16 = 0, fd: i32 = 0,
-        off: u64 = 0, addr: u64 = 0, len: u32 = 0, user_data: u64 = 0,
+        opcode: u8 = 0,
+        flags: u8 = 0,
+        ioprio: u16 = 0,
+        fd: i32 = 0,
+        off: u64 = 0,
+        addr: u64 = 0,
+        len: u32 = 0,
+        user_data: u64 = 0,
     };
     pub fn close(_: i32) void {}
-    pub fn write(_: i32, _: [*]const u8, _: usize) usize { return 0; }
+    pub fn write(_: i32, _: [*]const u8, _: usize) usize {
+        return 0;
+    }
 };
 const IoUring = if (builtin.os.tag == .linux) std.os.linux.IoUring else struct {
-    pub fn init(_: u16, _: u32) !@This() { return error.SystemOutdated; }
+    pub fn init(_: u16, _: u32) !@This() {
+        return error.SystemOutdated;
+    }
     pub fn deinit(_: *@This()) void {}
-    pub fn get_sqe(_: *@This()) !*linux.io_uring_sqe { return error.SubmissionQueueFull; }
-    pub fn submit(_: *@This()) !u32 { return 0; }
-    pub fn copy_cqes(_: *@This(), _: []linux.io_uring_cqe, _: u32) !u32 { return 0; }
+    pub fn get_sqe(_: *@This()) !*linux.io_uring_sqe {
+        return error.SubmissionQueueFull;
+    }
+    pub fn submit(_: *@This()) !u32 {
+        return 0;
+    }
+    pub fn copy_cqes(_: *@This(), _: []linux.io_uring_cqe, _: u32) !u32 {
+        return 0;
+    }
 };
 
 /// Callback types matching WsRoute in Server.zig
@@ -155,7 +171,11 @@ pub const WsUring = struct {
         const sqe = try self.ring.get_sqe();
         const sqe_bytes: [*]u8 = @ptrCast(sqe);
         @memset(sqe_bytes[0..@sizeOf(linux.io_uring_sqe)], 0);
-        if (@TypeOf(sqe.opcode) == u8) { sqe.opcode = IORING_OP_READ; } else { sqe.opcode = @enumFromInt(IORING_OP_READ); }
+        if (@TypeOf(sqe.opcode) == u8) {
+            sqe.opcode = IORING_OP_READ;
+        } else {
+            sqe.opcode = @enumFromInt(IORING_OP_READ);
+        }
         sqe.fd = conn.fd;
         sqe.addr = @intFromPtr(&conn.buf[conn.data_offset + conn.data_len]);
         sqe.len = @intCast(Conn.BufSize - conn.data_offset - conn.data_len);
@@ -212,7 +232,10 @@ pub const WsUring = struct {
             // Dispatch frame
             switch (opcode) {
                 0x1 => if (conn.on_message != 0) conn.on_message(conn.session, payload),
-                0x8 => { self.closeConn(conn, fd); return; },
+                0x8 => {
+                    self.closeConn(conn, fd);
+                    return;
+                },
                 0x9 => { // Ping → Pong
                     self.sendPong(fd, payload) catch {};
                 },

@@ -33,8 +33,7 @@ pub const WsFramer = struct {
         _ = std.base64.standard.Encoder.encode(&accept_key, &digest);
 
         var buf: [256]u8 = undefined;
-        const response = try std.fmt.bufPrint(&buf,
-            "HTTP/1.1 101 Switching Protocols\r\n" ++
+        const response = try std.fmt.bufPrint(&buf, "HTTP/1.1 101 Switching Protocols\r\n" ++
             "Upgrade: websocket\r\n" ++
             "Connection: Upgrade\r\n" ++
             "Sec-WebSocket-Accept: {s}\r\n" ++

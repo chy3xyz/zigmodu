@@ -283,7 +283,9 @@ pub const OpenApiGenerator = struct {
                     for (ep.params, 0..) |param, pi| {
                         const comma = if (pi < ep.params.len - 1) "," else "";
                         const req = if (param.required) "true" else "false";
-                        try S.emit(&buf, self.allocator,
+                        try S.emit(
+                            &buf,
+                            self.allocator,
                             "          {{ \"name\": \"{s}\", \"in\": \"{s}\", \"required\": {s}, \"schema\": {{ \"type\": \"{s}\" }} }}{s}\n",
                             .{ param.name, @tagName(param.location), req, param.param_type, comma },
                         );
@@ -295,7 +297,9 @@ pub const OpenApiGenerator = struct {
                 try buf.appendSlice(self.allocator, "        \"responses\": {\n");
                 for (ep.responses, 0..) |resp, ri| {
                     const comma = if (ri < ep.responses.len - 1) "," else "";
-                    try S.emit(&buf, self.allocator,
+                    try S.emit(
+                        &buf,
+                        self.allocator,
                         "          \"{d}\": {{ \"description\": \"{s}\" }}{s}\n",
                         .{ resp.status_code, resp.description, comma },
                     );

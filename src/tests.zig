@@ -109,6 +109,8 @@ test "compile all source files" {
     // Security
     _ = @import("security/SecurityModule.zig");
     _ = @import("security/SecurityScanner.zig");
+    _ = @import("security/AuthMiddleware.zig");
+    _ = @import("security/AppSecurity.zig");
 
     // Test
     _ = @import("test/Benchmark.zig");

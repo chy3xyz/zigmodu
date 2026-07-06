@@ -273,7 +273,7 @@ pub const ConsistentHashPartitioner = struct {
         // Process 8-byte chunks
         var i: usize = 0;
         while (i + 8 <= len) : (i += 8) {
-            var k: u64 = std.mem.readInt(u64, @as(*const [8]u8, @ptrCast(key[i..i+8].ptr)), .little);
+            var k: u64 = std.mem.readInt(u64, @as(*const [8]u8, @ptrCast(key[i .. i + 8].ptr)), .little);
             k *%= c1;
             k = (k << r) | (k >> (64 - r));
             k *%= c2;
@@ -316,7 +316,7 @@ pub const ConsistentHashPartitioner = struct {
         var i: usize = 0;
         while (i + 32 <= key.len) : (i += 32) {
             h +%= prime2;
-            h ^= self.hashFNV1a(key[i..i+32]) *% prime3;
+            h ^= self.hashFNV1a(key[i .. i + 32]) *% prime3;
             h = (h << 49) | (h >> 15);
             h +%= prime4;
         }
@@ -408,9 +408,9 @@ test "ConsistentHashPartitioner uniform distribution" {
 
         const node = partitioner.route(key);
         if (node) |n| {
-        const gop = counts.getOrPut(n) catch continue;
-        if (!gop.found_existing) gop.value_ptr.* = 0;
-        gop.value_ptr.* += 1;
+            const gop = counts.getOrPut(n) catch continue;
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* += 1;
         }
     }
 

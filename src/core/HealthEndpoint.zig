@@ -126,10 +126,14 @@ pub const HealthEndpoint = struct {
         return buf.toOwnedSlice(allocator);
     }
 
-        pub fn alwaysUp(_: ?*anyopaque) HealthStatus { return .UP; }
+    pub fn alwaysUp(_: ?*anyopaque) HealthStatus {
+        return .UP;
+    }
 
     /// Always-down check
-    pub fn alwaysDown(_: ?*anyopaque) HealthStatus { return .DOWN; }
+    pub fn alwaysDown(_: ?*anyopaque) HealthStatus {
+        return .DOWN;
+    }
 
     /// Database connectivity check with context.
     pub fn databaseCheck(ctx: ?*anyopaque) HealthStatus {
@@ -152,7 +156,9 @@ pub const HealthEndpoint = struct {
 
 /// Liveness probe — always UP while process is running.
 pub const LivenessProbe = struct {
-    pub fn check(_: ?*anyopaque) HealthEndpoint.HealthStatus { return .UP; }
+    pub fn check(_: ?*anyopaque) HealthEndpoint.HealthStatus {
+        return .UP;
+    }
 };
 
 /// Readiness probe — takes HealthEndpoint as context.
@@ -170,7 +176,9 @@ pub fn handleLiveness(ctx: *api.Context) anyerror!void {
 }
 
 pub fn handleReadiness(endpoint: *HealthEndpoint) api.HandlerFn {
-    const S = struct { var ep: *HealthEndpoint = undefined; };
+    const S = struct {
+        var ep: *HealthEndpoint = undefined;
+    };
     S.ep = endpoint;
     return struct {
         fn h(ctx: *api.Context) anyerror!void {

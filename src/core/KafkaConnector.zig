@@ -1,3 +1,8 @@
+//! EXPERIMENTAL — in-memory Kafka wire-format simulation. Produce/consume work
+//! against local buffers; NO real broker network I/O is implemented yet.
+//! Do not rely on this for production messaging — use the EventBus (in-process)
+//! or NATS/Fluvio connectors (real network) instead.
+
 const std = @import("std");
 const Time = @import("../core/Time.zig");
 
@@ -408,7 +413,13 @@ test "KafkaConsumer config" {
 test "KafkaWireFormat produce request" {
     const allocator = std.testing.allocator;
     const payload = try KafkaWireFormat.buildProduceRequest(
-        allocator, "orders", 0, null, "hello", 1, "zigmodu",
+        allocator,
+        "orders",
+        0,
+        null,
+        "hello",
+        1,
+        "zigmodu",
     );
     defer allocator.free(payload);
 

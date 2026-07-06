@@ -26,8 +26,20 @@ pub const AppSecurity = struct {
     }
 
     /// RBAC-aware JWT middleware (sets `Rbac.AuthInfo` in `ctx.user_data`).
+    /// Permissions stay empty — use `rbacJwtMiddlewareWithPermissions` when
+    /// requirePermission() checks are in the chain.
     pub fn rbacJwtMiddleware(self: *AppSecurity, allocator: std.mem.Allocator) !api.Middleware {
         return AuthMiddleware.jwtAuth(&self.module, allocator);
+    }
+
+    /// RBAC JWT middleware that also populates `AuthInfo.permissions` via `loader`
+    /// (typically a role→permission DB lookup), enabling requirePermission().
+    pub fn rbacJwtMiddlewareWithPermissions(
+        self: *AppSecurity,
+        allocator: std.mem.Allocator,
+        loader: AuthMiddleware.PermissionLoader,
+    ) !api.Middleware {
+        return AuthMiddleware.jwtAuthWithPermissions(&self.module, allocator, loader);
     }
 
     pub fn generateToken(self: *AppSecurity, user_id: []const u8, roles: []const []const u8) ![]const u8 {

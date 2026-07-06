@@ -2,7 +2,6 @@ const std = @import("std");
 
 /// HTTP 402 Payment Required — Web4 monetization protocol.
 /// Server returns 402 with invoice; client pays and retries with proof.
-
 pub const Currency = enum { usdc, eth, sol, btc };
 
 pub const Invoice = struct {

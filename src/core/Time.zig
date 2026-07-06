@@ -16,24 +16,35 @@ const builtin = @import("builtin");
 ///
 /// All subsystems (CircuitBreaker, RateLimiter, CacheManager, etc.) should call
 /// these functions instead of hardcoding `const now = 0`.
+/// Last-ditch fallback when no OS clock is available: a strictly increasing
+/// counter. Useless for measuring real durations, but preserves the
+/// monotonicity invariant that TTL / rate-limit / breaker logic relies on.
+var fallback_tick = std.atomic.Value(i64).init(1);
+
 /// Returns monotonic nanoseconds since an arbitrary epoch.
 /// Suitable for elapsed-time measurement, NOT wall-clock time.
 pub fn monotonicNow() i64 {
-    if (comptime builtin.os.tag == .linux or builtin.os.tag == .macos or builtin.os.tag == .freebsd) {
-        var ts: std.c.timespec = undefined;
-        const clock_id: std.c.clockid_t = switch (comptime builtin.os.tag) {
-            .macos => .MONOTONIC,
-            .linux => .MONOTONIC,
-            .freebsd => .MONOTONIC,
-            else => unreachable,
-        };
-        const rc = std.c.clock_gettime(clock_id, &ts);
-        if (rc == 0) {
-            return @as(i64, ts.sec) * std.time.ns_per_s + ts.nsec;
-        }
+    switch (comptime builtin.os.tag) {
+        .windows => {
+            // QueryPerformanceCounter is monotonic; convert ticks → ns.
+            const counter = std.os.windows.QueryPerformanceCounter();
+            const freq = std.os.windows.QueryPerformanceFrequency();
+            if (freq > 0) {
+                return @intCast(@divFloor(@as(i128, @intCast(counter)) * std.time.ns_per_s, @as(i128, @intCast(freq))));
+            }
+            return fallback_tick.fetchAdd(1, .monotonic);
+        },
+        .freestanding, .other, .uefi => return fallback_tick.fetchAdd(1, .monotonic),
+        else => {
+            // Any POSIX-ish libc target (linux, macos, *bsd, solaris, ...).
+            var ts: std.c.timespec = undefined;
+            const rc = std.c.clock_gettime(.MONOTONIC, &ts);
+            if (rc == 0) {
+                return @as(i64, ts.sec) * std.time.ns_per_s + ts.nsec;
+            }
+            return fallback_tick.fetchAdd(1, .monotonic);
+        },
     }
-    // Fallback: use epoch unix (not monotonic, but better than 0)
-    return @intCast(std.time.epoch.unix);
 }
 
 /// Returns monotonic time in seconds (integer).

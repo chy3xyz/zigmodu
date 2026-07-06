@@ -1,3 +1,8 @@
+//! EXPERIMENTAL — in-memory event store skeleton. Stream append/read and
+//! SnapshotStore save/load work, but event payload serialization and
+//! replay-with-handler are placeholders (`serializeEvent` returns empty,
+//! `replayStream` does not invoke the handler). Not production event sourcing.
+
 const std = @import("std");
 const Time = @import("Time.zig");
 

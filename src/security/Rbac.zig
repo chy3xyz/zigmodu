@@ -71,9 +71,15 @@ pub const Menu = struct {
     keep_alive: bool,
     always_show: bool,
 
-    pub fn isDir(self: Menu) bool { return self.menu_type == .dir; }
-    pub fn isMenu(self: Menu) bool { return self.menu_type == .menu; }
-    pub fn isButton(self: Menu) bool { return self.menu_type == .button; }
+    pub fn isDir(self: Menu) bool {
+        return self.menu_type == .dir;
+    }
+    pub fn isMenu(self: Menu) bool {
+        return self.menu_type == .menu;
+    }
+    pub fn isButton(self: Menu) bool {
+        return self.menu_type == .button;
+    }
 };
 
 /// Role-[...]
@@ -325,9 +331,9 @@ test "AuthInfo hasPermission" {
 
     try std.testing.expect(auth.hasPermission("read"));
     try std.testing.expect(!auth.hasPermission("delete"));
-    try std.testing.expect(auth.hasAnyPermission(&.{"delete", "read"}));
-    try std.testing.expect(auth.hasAllPermissions(&.{"read", "write"}));
-    try std.testing.expect(!auth.hasAllPermissions(&.{"read", "write", "admin"}));
+    try std.testing.expect(auth.hasAnyPermission(&.{ "delete", "read" }));
+    try std.testing.expect(auth.hasAllPermissions(&.{ "read", "write" }));
+    try std.testing.expect(!auth.hasAllPermissions(&.{ "read", "write", "admin" }));
 
     auth.deinit(allocator);
 }

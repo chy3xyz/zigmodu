@@ -66,18 +66,18 @@ pub const OutboxPublisher = struct {
     /// Build SQL to create the outbox table. Call once at startup.
     pub fn migrationSql() []const u8 {
         return
-            \\CREATE TABLE IF NOT EXISTS event_outbox (
-            \\    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-            \\    topic VARCHAR(255) NOT NULL,
-            \\    payload TEXT NOT NULL,
-            \\    status TINYINT NOT NULL DEFAULT 0,
-            \\    retry_count INT NOT NULL DEFAULT 0,
-            \\    max_retries INT NOT NULL DEFAULT 5,
-            \\    created_at BIGINT NOT NULL,
-            \\    updated_at BIGINT NOT NULL,
-            \\    error_message TEXT NULL,
-            \\    INDEX idx_status_created (status, created_at)
-            \\);
+        \\CREATE TABLE IF NOT EXISTS event_outbox (
+        \\    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        \\    topic VARCHAR(255) NOT NULL,
+        \\    payload TEXT NOT NULL,
+        \\    status TINYINT NOT NULL DEFAULT 0,
+        \\    retry_count INT NOT NULL DEFAULT 0,
+        \\    max_retries INT NOT NULL DEFAULT 5,
+        \\    created_at BIGINT NOT NULL,
+        \\    updated_at BIGINT NOT NULL,
+        \\    error_message TEXT NULL,
+        \\    INDEX idx_status_created (status, created_at)
+        \\);
         ;
     }
 

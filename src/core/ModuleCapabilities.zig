@@ -150,4 +150,3 @@ test "ModuleCapabilities register capability" {
     try cap.registerCapability(allocator, "consume", "payment.*");
     try std.testing.expectEqual(@as(usize, 2), cap.count());
 }
-

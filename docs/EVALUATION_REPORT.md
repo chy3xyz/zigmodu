@@ -3,7 +3,7 @@
 **评估日期**: 2026-06-20  
 **框架版本**: v0.13.15  
 **Zig 版本**: 0.17.0  
-**测试结果**: **415 passed, 5 skipped, 0 failed**（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`）  
+**测试结果**: **455 passed, 12 skipped, 0 failed**（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`）  
 **生产门禁**: `zig build check`（热路径禁止裸 `catch {}`）  
 **旗舰示例**: [`examples/tenant-mgmt/`](../examples/tenant-mgmt/) — SQLite 持久层 + 真 JWT + CI 业务断言  
 **参考 codegen**: [`examples/shopdemo/`](../examples/shopdemo/) — 152 表 schema + 生成样例（非完整可运行应用）
@@ -48,12 +48,14 @@
 
 ## 剩余差距 (95 → 98)
 
-| # | 项目 | 优先级 |
-|---|------|--------|
-| 1 | DLQ/WAL skip 用例恢复 | 中 |
-| 2 | gRPC/Kafka 真实 wire 集成 | 中 |
-| 3 | ShopDemo 可 `zig build run` | 低 |
-| 4 | 持续 Benchmark 基线入库 | 低 |
+| # | 项目 | 优先级 | 状态 |
+|---|------|--------|------|
+| 1 | 环境门控 skip 用例（Redis/NATS/PG/MySQL） | 中 | ✅ CI live-service job 覆盖（Fluvio/HttpClient-live 仍本地跳过） |
+| 2 | gRPC/Kafka 真实 wire 集成 | 中 | 已标注 EXPERIMENTAL，待实现 |
+| 3 | ShopDemo 可 `zig build run` | 低 | 待办 |
+| 4 | 持续 Benchmark 基线入库 | 低 | ✅ `zig build benchmark` 输出 `bench-results.json`，CI 基线告警已接通 |
+
+> 12 个 skipped 用例全部为环境门控（需要外部服务）：Redis ×3、NATS ×3、Fluvio ×2、PG/MySQL ×2、HttpClient live ×2。CI 中 `test-postgres` / `test-mysql` / `test-live-services` job 分别启用对应服务后执行。
 
 ---
 

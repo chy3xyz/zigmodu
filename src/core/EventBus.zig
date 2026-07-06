@@ -33,7 +33,7 @@ fn ListenerSet(comptime CallbackType: type) type {
         }
 
         pub fn addAssumeCapacity(self: *Self, callback: CallbackType) void {
-            self.list.appendAssumeCapacity(self.allocator, callback);
+            self.list.appendAssumeCapacity(callback);
         }
 
         pub fn remove(self: *Self, callback: CallbackType) bool {
@@ -286,9 +286,15 @@ test "TypedEventBus multi-subscriber" {
 
     const Ctx = struct {
         var sum: i32 = 0;
-        fn cb1(event: Event) void { sum += event.value; }
-        fn cb2(event: Event) void { sum += event.value * 2; }
-        fn cb3(event: Event) void { sum += event.value * 3; }
+        fn cb1(event: Event) void {
+            sum += event.value;
+        }
+        fn cb2(event: Event) void {
+            sum += event.value * 2;
+        }
+        fn cb3(event: Event) void {
+            sum += event.value * 3;
+        }
     };
 
     try bus.subscribe(Ctx.cb1);

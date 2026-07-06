@@ -17,7 +17,11 @@ pub const CsrfProtection = struct {
         var token_bytes: [TOKEN_LEN]u8 = undefined;
         std.Random.DefaultCsprng.init(io).fill(&token_bytes);
         var token: [TOKEN_LEN * 2]u8 = undefined;
-        _ = std.fmt.bufPrint(&token, "{s}", .{std.fmt.fmtSliceHexLower(&token_bytes)}) catch unreachable;
+        const hex = "0123456789abcdef";
+        for (token_bytes, 0..) |b, i| {
+            token[i * 2] = hex[b >> 4];
+            token[i * 2 + 1] = hex[b & 0x0f];
+        }
         return .{ .token = token };
     }
 

@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const api = @import("Server.zig");
+const Time = @import("../core/Time.zig");
 const SecurityModule = @import("../security/SecurityModule.zig").SecurityModule;
 
 /// CORS middleware configuration
@@ -44,9 +45,7 @@ pub fn cors(config: CorsConfig) api.Middleware {
                     origin_allowed = true; // Same-origin request
                 } else {
                     for (cfg.allow_origins) |allowed| {
-                        const matched = if (std.mem.eql(u8, allowed, "*")) true
-                            else if (std.mem.startsWith(u8, allowed, "*.")) std.mem.endsWith(u8, origin, allowed[1..])
-                            else std.mem.eql(u8, allowed, origin);
+                        const matched = if (std.mem.eql(u8, allowed, "*")) true else if (std.mem.startsWith(u8, allowed, "*.")) std.mem.endsWith(u8, origin, allowed[1..]) else std.mem.eql(u8, allowed, origin);
                         if (matched) {
                             origin_allowed = true;
                             break;
@@ -103,9 +102,9 @@ pub fn logging() api.Middleware {
     return .{
         .func = struct {
             fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
-                const start = 0;
+                const start_ms = Time.monotonicNowMilliseconds();
                 try next(ctx);
-                const elapsed = 0 - start;
+                const elapsed = Time.monotonicNowMilliseconds() - start_ms;
                 std.log.info("{s} {s} {d} {d}ms", .{
                     ctx.method.toString(),
                     ctx.raw_path,
@@ -136,14 +135,16 @@ pub fn maxBodySize(max_size: usize) api.Middleware {
     };
 }
 
-/// Request timeout middleware
+/// Request timeout middleware — marks the response 504 when the handler
+/// exceeded the budget (post-hoc: fiber-based handlers cannot be preempted).
 pub fn requestTimeout(timeout_ms: u64) api.Middleware {
     return .{
         .func = struct {
             fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
-                const deadline = 0 + @as(u64, @intFromPtr(user_data));
+                const budget_ms: i64 = @intCast(@intFromPtr(user_data));
+                const start_ms = Time.monotonicNowMilliseconds();
                 try next(ctx);
-                if (0 > deadline) {
+                if (Time.monotonicNowMilliseconds() - start_ms > budget_ms and !ctx.responded) {
                     ctx.status_code = 504;
                 }
             }
@@ -170,6 +171,11 @@ pub fn recover() api.Middleware {
 
 /// JWT auth middleware — validates Bearer token via `SecurityModule.verifyToken`.
 /// Uses `ctx.io` for wall-clock expiry when set; falls back to monotonic in unit tests.
+///
+/// The ephemeral `SecurityModule` here is a zero-allocation struct, so per-request
+/// construction is free. The expiry argument is irrelevant for verification (the
+/// token's own `exp` claim is checked) — it only matters for token GENERATION,
+/// so use `jwtAuthWithSecurity` / `AppSecurity` when you also issue tokens.
 pub fn jwtAuth(secret: []const u8) api.Middleware {
     const SecretStore = struct {
         var stored: []const u8 = "";
@@ -178,10 +184,11 @@ pub fn jwtAuth(secret: []const u8) api.Middleware {
     return .{
         .func = struct {
             fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
+                // Expiry 0: verification-only module, never generates tokens.
                 var sec = if (ctx.io) |io|
-                    SecurityModule.initWithIo(ctx.allocator, SecretStore.stored, 3600, io)
+                    SecurityModule.initWithIo(ctx.allocator, SecretStore.stored, 0, io)
                 else
-                    SecurityModule.init(ctx.allocator, SecretStore.stored, 3600);
+                    SecurityModule.init(ctx.allocator, SecretStore.stored, 0);
                 try verifyJwtAndNext(&sec, ctx, next);
             }
         }.mw,
@@ -506,4 +513,3 @@ test "csrf middleware allows GET without token" {
     try mw.func(&ctx, next, mw.user_data);
     try std.testing.expect(S.reached);
 }
-

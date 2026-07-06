@@ -79,16 +79,22 @@ fn buildInClause(allocator: std.mem.Allocator, comptime col: []const u8, ids: []
     @memcpy(buf[0..col.len], col);
     @memcpy(buf[col.len..pos], " IN (");
     for (ids, 0..) |_, i| {
-        if (i > 0) { buf[pos] = ','; buf[pos+1] = ' '; pos += 2; }
-        buf[pos] = '?'; pos += 1;
+        if (i > 0) {
+            buf[pos] = ',';
+            buf[pos + 1] = ' ';
+            pos += 2;
+        }
+        buf[pos] = '?';
+        pos += 1;
     }
-    buf[pos] = ')'; pos += 1;
+    buf[pos] = ')';
+    pos += 1;
     return allocator.dupe(u8, buf[0..pos]);
 }
 
 fn parseDeptIds(alloc: std.mem.Allocator, input: []const u8) ![]const i64 {
     var list = std.ArrayList(i64).empty;
-    const cleaned = if (input.len > 0 and input[0] == '[') input[1..input.len-1] else input;
+    const cleaned = if (input.len > 0 and input[0] == '[') input[1 .. input.len - 1] else input;
     var it = std.mem.tokenizeScalar(u8, cleaned, ',');
     while (it.next()) |token| {
         const trimmed = std.mem.trim(u8, token, " \t\n\r[]");
@@ -117,4 +123,3 @@ test "DataPermissionFilter buildWhere" {
     defer allocator.free(where.params);
     try std.testing.expect(where.clause.len > 0);
 }
-

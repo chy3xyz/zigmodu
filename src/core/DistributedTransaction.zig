@@ -386,7 +386,7 @@ pub const TransactionLog = struct {
                 .tx_id = try alloc.dupe(u8, s.tx_id),
                 .step_name = try alloc.dupe(u8, s.step_name),
                 .compensation_name = try alloc.dupe(u8, s.compensation_name),
-            }},
+            } },
             .commit => |id| Event{ .commit = try alloc.dupe(u8, id) },
             .abort => |id| Event{ .abort = try alloc.dupe(u8, id) },
             .compensate => |id| Event{ .compensate = try alloc.dupe(u8, id) },

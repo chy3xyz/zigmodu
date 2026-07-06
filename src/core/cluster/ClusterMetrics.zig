@@ -32,7 +32,9 @@ pub const ClusterMetrics = struct {
         };
     }
 
-    pub fn setNodeCount(self: *Self, n: u64) void { self.node_count.store(n, .monotonic); }
+    pub fn setNodeCount(self: *Self, n: u64) void {
+        self.node_count.store(n, .monotonic);
+    }
     pub fn incMessagesSent(self: *Self, bytes: u64) void {
         _ = self.messages_sent.fetchAdd(1, .monotonic);
         _ = self.bytes_sent.fetchAdd(bytes, .monotonic);
@@ -41,9 +43,15 @@ pub const ClusterMetrics = struct {
         _ = self.messages_received.fetchAdd(1, .monotonic);
         _ = self.bytes_received.fetchAdd(bytes, .monotonic);
     }
-    pub fn incMessagesFailed(self: *Self) void { _ = self.messages_failed.fetchAdd(1, .monotonic); }
-    pub fn setLeaderEpoch(self: *Self, epoch: u64) void { self.leader_epoch.store(epoch, .monotonic); }
-    pub fn setPartitionCount(self: *Self, n: u64) void { self.partition_count.store(n, .monotonic); }
+    pub fn incMessagesFailed(self: *Self) void {
+        _ = self.messages_failed.fetchAdd(1, .monotonic);
+    }
+    pub fn setLeaderEpoch(self: *Self, epoch: u64) void {
+        self.leader_epoch.store(epoch, .monotonic);
+    }
+    pub fn setPartitionCount(self: *Self, n: u64) void {
+        self.partition_count.store(n, .monotonic);
+    }
 
     /// Export in Prometheus text format.
     pub fn toPrometheus(self: *Self, allocator: std.mem.Allocator) ![]const u8 {

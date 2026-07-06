@@ -192,6 +192,42 @@ jobs:
           MYSQL_DATABASE: zigzero_test
         run: zig build test
 
+  # Runs the env-gated live-service tests (redis client, Redis rate limiter, NATS).
+  test-live-services:
+    name: Test (Redis + NATS live)
+    runs-on: ubuntu-latest
+    needs: [build-and-test]
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      nats:
+        image: nats:2
+        ports:
+          - 4222:4222
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev libmariadb-dev libsqlite3-dev
+
+      - name: Run live-service tests
+        env:
+          REDIS_URL: redis://127.0.0.1:6379
+          NATS_URL: nats://127.0.0.1:4222
+        run: zig build test
+
   # ── Benchmark ──────────────────────────────────
   benchmark:
     name: Benchmark

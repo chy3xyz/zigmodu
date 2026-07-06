@@ -383,7 +383,9 @@ test "3-node cluster with RaftElection quorum and event routing" {
     var received: u32 = 0;
     try bus2.subscribe("test.topic", struct {
         var count: u32 = 0;
-        fn handler(_: []const u8) void { count += 1; }
+        fn handler(_: []const u8) void {
+            count += 1;
+        }
     }.handler);
 
     try bus1.publish("test.topic", "hello from node-1");

@@ -25,21 +25,27 @@ pub fn pluralize(allocator: std.mem.Allocator, singular: []const u8) ![]const u8
     if (last == 's' or last == 'x' or last == 'z') return try std.fmt.allocPrint(allocator, "{s}es", .{singular});
     if (std.mem.endsWith(u8, singular, "ch") or std.mem.endsWith(u8, singular, "sh")) return try std.fmt.allocPrint(allocator, "{s}es", .{singular});
     if (last == 'y' and singular.len > 1 and !isVowel(singular[singular.len - 2])) {
-        const stem = singular[0..singular.len-1];
+        const stem = singular[0 .. singular.len - 1];
         return try std.fmt.allocPrint(allocator, "{s}ies", .{stem});
     }
     return try std.fmt.allocPrint(allocator, "{s}s", .{singular});
 }
 
 fn isVowel(c: u8) bool {
-    return switch (c) { 'a', 'e', 'i', 'o', 'u', 'A', 'E', 'I', 'O', 'U' => true, else => false };
+    return switch (c) {
+        'a', 'e', 'i', 'o', 'u', 'A', 'E', 'I', 'O', 'U' => true,
+        else => false,
+    };
 }
 
 /// Encode bytes as lowercase hex string. Caller owns result.
 pub fn hexEncode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     const hex = "0123456789abcdef";
     var out = try allocator.alloc(u8, data.len * 2);
-    for (data, 0..) |b, i| { out[i*2] = hex[b >> 4]; out[i*2+1] = hex[b & 0xf]; }
+    for (data, 0..) |b, i| {
+        out[i * 2] = hex[b >> 4];
+        out[i * 2 + 1] = hex[b & 0xf];
+    }
     return out;
 }
 

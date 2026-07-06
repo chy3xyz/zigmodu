@@ -987,6 +987,9 @@ const Router = struct {
         return result.toOwnedSlice(alloc);
     }
 
+    /// PERF: `allocator` should be the per-request arena (connFiber passes
+    /// `arena_alloc`) — params map + dupes are bump-allocated and bulk-freed
+    /// with the request, so no per-match heap traffic on the hot path.
     pub fn match(self: *const Router, allocator: std.mem.Allocator, method: Method, path: []const u8) ?MatchedRoute {
         const root = self.roots.get(method) orelse return null;
 
@@ -1046,13 +1049,13 @@ const Router = struct {
         // Exact route takes priority over wildcard child
         if (current.route) |route| {
             var params = std.StringHashMap([]const u8).init(allocator);
-                for (0..param_count) |i| {
-                    params.put(param_keys[i], param_vals[i]) catch |err| {
-                        std.log.err("[Router] param put failed: {}", .{err});
-                        allocator.free(param_keys[i]);
-                        allocator.free(param_vals[i]);
-                    };
-                }
+            for (0..param_count) |i| {
+                params.put(param_keys[i], param_vals[i]) catch |err| {
+                    std.log.err("[Router] param put failed: {}", .{err});
+                    allocator.free(param_keys[i]);
+                    allocator.free(param_vals[i]);
+                };
+            }
             return MatchedRoute{
                 .route = route,
                 .params = params,
@@ -1538,8 +1541,7 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                             else
                                 server.allocator.alloc(u8, 4096) catch break;
                             defer {
-                                if (server.ws_buffer_pool) |pool| pool.release(read_buf)
-                                else server.allocator.free(read_buf);
+                                if (server.ws_buffer_pool) |pool| pool.release(read_buf) else server.allocator.free(read_buf);
                             }
                             const frame = framer.readFrame(read_buf) catch break;
                             switch (frame.opcode) {
@@ -1829,22 +1831,30 @@ test "wildcard route matching" {
     try router.addRoute(.{
         .method = .GET,
         .path = "/crm/statistics/*",
-        .handler = struct { fn h(_: *Context) anyerror!void {} }.h,
+        .handler = struct {
+            fn h(_: *Context) anyerror!void {}
+        }.h,
     });
     try router.addRoute(.{
         .method = .GET,
         .path = "/insurance/compensation-plan/*",
-        .handler = struct { fn h(_: *Context) anyerror!void {} }.h,
+        .handler = struct {
+            fn h(_: *Context) anyerror!void {}
+        }.h,
     });
     try router.addRoute(.{
         .method = .GET,
         .path = "/users/{id}",
-        .handler = struct { fn h(_: *Context) anyerror!void {} }.h,
+        .handler = struct {
+            fn h(_: *Context) anyerror!void {}
+        }.h,
     });
     try router.addRoute(.{
         .method = .POST,
         .path = "/api/data/*",
-        .handler = struct { fn h(_: *Context) anyerror!void {} }.h,
+        .handler = struct {
+            fn h(_: *Context) anyerror!void {}
+        }.h,
     });
 
     // Test: wildcard path matches sub-paths
@@ -1981,7 +1991,7 @@ test "integration: router + handler + response" {
     });
 
     // 2. Simulate a matched request
-    var matched = server.router.match(allocator,.GET, "/users/99");
+    var matched = server.router.match(allocator, .GET, "/users/99");
     try std.testing.expect(matched != null);
 
     if (matched) |*m| {
@@ -2027,10 +2037,18 @@ test "router listRoutes" {
     var router = Router.init(allocator);
     defer router.deinit();
 
-    try router.addRoute(.{ .method = .GET, .path = "/health", .handler = struct { fn handle(_: *Context) !void {} }.handle });
-    try router.addRoute(.{ .method = .POST, .path = "/users", .handler = struct { fn handle(_: *Context) !void {} }.handle });
-    try router.addRoute(.{ .method = .GET, .path = "/users/{id}", .handler = struct { fn handle(_: *Context) !void {} }.handle });
-    try router.addRoute(.{ .method = .DELETE, .path = "/api/v1/admin/settings", .handler = struct { fn handle(_: *Context) !void {} }.handle });
+    try router.addRoute(.{ .method = .GET, .path = "/health", .handler = struct {
+        fn handle(_: *Context) !void {}
+    }.handle });
+    try router.addRoute(.{ .method = .POST, .path = "/users", .handler = struct {
+        fn handle(_: *Context) !void {}
+    }.handle });
+    try router.addRoute(.{ .method = .GET, .path = "/users/{id}", .handler = struct {
+        fn handle(_: *Context) !void {}
+    }.handle });
+    try router.addRoute(.{ .method = .DELETE, .path = "/api/v1/admin/settings", .handler = struct {
+        fn handle(_: *Context) !void {}
+    }.handle });
 
     const routes = try router.listRoutes(allocator);
     defer {
@@ -2094,7 +2112,7 @@ test "integration: router + global middleware + handler" {
     });
 
     // Simulate match
-    var matched = server.router.match(allocator,.GET, "/health");
+    var matched = server.router.match(allocator, .GET, "/health");
     try std.testing.expect(matched != null);
 
     if (matched) |*m| {
@@ -2167,7 +2185,7 @@ test "e2e: full middleware chain with error path" {
     // Test 1: happy path
     {
         Ctx.hit_count = 0;
-        var matched = server.router.match(allocator,.POST, "/items");
+        var matched = server.router.match(allocator, .POST, "/items");
         try std.testing.expect(matched != null);
         if (matched) |*m| {
             defer {
@@ -2189,14 +2207,14 @@ test "e2e: full middleware chain with error path" {
 
     // Test 2: route not found (404)
     {
-        const matched = server.router.match(allocator,.GET, "/nonexistent");
+        const matched = server.router.match(allocator, .GET, "/nonexistent");
         try std.testing.expect(matched == null);
     }
 
     // Test 3: panic handler returns 500
     {
         Ctx.hit_count = 0;
-        var matched = server.router.match(allocator,.GET, "/boom");
+        var matched = server.router.match(allocator, .GET, "/boom");
         try std.testing.expect(matched != null);
         if (matched) |*m| {
             defer {
@@ -2389,22 +2407,30 @@ test "wildcard + exact route coexistence" {
     try router.addRoute(.{
         .method = .GET,
         .path = "/crm/statistics",
-        .handler = struct { fn h(_: *Context) anyerror!void {} }.h,
+        .handler = struct {
+            fn h(_: *Context) anyerror!void {}
+        }.h,
     });
     try router.addRoute(.{
         .method = .GET,
         .path = "/crm/statistics/*",
-        .handler = struct { fn h(_: *Context) anyerror!void {} }.h,
+        .handler = struct {
+            fn h(_: *Context) anyerror!void {}
+        }.h,
     });
     try router.addRoute(.{
         .method = .GET,
         .path = "/insurance/compensation-plan",
-        .handler = struct { fn h(_: *Context) anyerror!void {} }.h,
+        .handler = struct {
+            fn h(_: *Context) anyerror!void {}
+        }.h,
     });
     try router.addRoute(.{
         .method = .GET,
         .path = "/insurance/compensation-plan/*",
-        .handler = struct { fn h(_: *Context) anyerror!void {} }.h,
+        .handler = struct {
+            fn h(_: *Context) anyerror!void {}
+        }.h,
     });
 
     // Exact paths must match
@@ -2428,7 +2454,9 @@ test "path rewriter changes route selection" {
     _ = try server.addRoute(.{
         .method = .GET,
         .path = "/rewritten/path",
-        .handler = struct { fn h(_: *Context) anyerror!void {} }.h,
+        .handler = struct {
+            fn h(_: *Context) anyerror!void {}
+        }.h,
     });
 
     // Set rewriter: map /old/* → /rewritten/*

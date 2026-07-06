@@ -1,3 +1,7 @@
+//! EXPERIMENTAL — gRPC types, status mapping, service registry and a proto
+//! parser skeleton. HTTP/2 transport is NOT implemented; calls are routed
+//! in-process. Use the HTTP JSON API for real cross-service communication.
+
 const std = @import("std");
 
 /// gRPC [...]
@@ -379,7 +383,9 @@ test "GrpcServiceRegistry list methods" {
 
     try registry.registerService("test.Service");
     try registry.registerMethod("test.Service", "Ping", .unary, struct {
-        fn h(_: GrpcRequest) !GrpcResponse { return GrpcResponse{ .payload = "pong", .status = .OK, .message = "" }; }
+        fn h(_: GrpcRequest) !GrpcResponse {
+            return GrpcResponse{ .payload = "pong", .status = .OK, .message = "" };
+        }
     }.h);
 
     const methods = try registry.listMethods();

@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Fail CI if bare `catch {}` appears in production hot paths (tests excluded by line cap).
+# Fail CI if banned error-handling patterns appear in production hot paths
+# (tests excluded by line cap):
+#   - bare `catch {}`        — swallows errors silently
+#   - `catch unreachable`    — turns runtime errors into panics
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -10,9 +13,9 @@ scan_range() {
   local file="$1"
   local max_line="$2"
   local hits
-  hits="$(awk -v max="$max_line" 'NR <= max && /catch \{\}/ {print FILENAME ":" NR ":" $0}' "$file" || true)"
+  hits="$(awk -v max="$max_line" 'NR <= max && (/catch \{\}/ || /catch unreachable/) {print FILENAME ":" NR ":" $0}' "$file" || true)"
   if [[ -n "$hits" ]]; then
-    echo "check-production: bare catch {} in ${file} (lines 1-${max_line}):" >&2
+    echo "check-production: banned catch pattern in ${file} (lines 1-${max_line}):" >&2
     echo "$hits" >&2
     fail=1
   fi
@@ -32,7 +35,7 @@ for f in src/security/*.zig; do
 done
 
 if [[ "$fail" -ne 0 ]]; then
-  echo "check-production: replace catch {} with logged catch |err| on I/O and DB paths" >&2
+  echo "check-production: replace catch {} / catch unreachable with logged catch |err| handling" >&2
   exit 1
 fi
 

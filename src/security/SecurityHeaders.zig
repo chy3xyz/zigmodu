@@ -30,5 +30,5 @@ pub fn securityHeadersMiddleware(headers: []const Header) api.MiddlewareFn {
             try next(ctx, next, user_data);
         }
     };
-    return .{ .func = S.handler, .user_data = @constCast(@ptrCast(headers.ptr)) };
+    return .{ .func = S.handler, .user_data = @ptrCast(@constCast(headers.ptr)) };
 }

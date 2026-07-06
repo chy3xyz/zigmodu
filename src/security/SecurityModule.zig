@@ -326,7 +326,10 @@ pub fn authRateLimitMiddleware(
 ) !api.MiddlewareFn {
     const limiter = try allocator.create(@import("../resilience/RateLimiter.zig").RateLimiter);
     limiter.* = try @import("../resilience/RateLimiter.zig").RateLimiter.init(
-        allocator, "auth_rate_limit", max_attempts, max_attempts / window_seconds,
+        allocator,
+        "auth_rate_limit",
+        max_attempts,
+        max_attempts / window_seconds,
     );
     const S = struct {
         fn handler(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {

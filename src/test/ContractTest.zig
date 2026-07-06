@@ -219,7 +219,8 @@ pub const ContractTestRunner = struct {
                 try buf.appendSlice(self.allocator, line);
 
                 for (v.failures) |f| {
-                    const detail = try std.fmt.allocPrint(self.allocator,
+                    const detail = try std.fmt.allocPrint(
+                        self.allocator,
                         "    - {s}: expected '{s}', got '{s}' ({s})\n",
                         .{ f.field, f.expected, f.actual, f.message },
                     );
@@ -229,7 +230,8 @@ pub const ContractTestRunner = struct {
             }
         }
 
-        const summary = try std.fmt.allocPrint(self.allocator,
+        const summary = try std.fmt.allocPrint(
+            self.allocator,
             "\n  Results: {d} passed, {d} failed, {d} total\n",
             .{ passed, failed, passed + failed },
         );
