@@ -165,7 +165,7 @@ test "my test" {
 ```
 
 ## Version
-- Framework: **v0.13.15**
+- Framework: **v0.14.1**
 - Zig: **0.17.0**
 - Tests: **455 passed**, 12 skipped, 0 failed
 - Roadmap: `docs/PRODUCTION_ROADMAP.md` (phases 1–5 ✅)
@@ -180,7 +180,7 @@ test "my test" {
 
 ## Learned Workspace Facts
 
-- Project targets Zig 0.17.0; current release tag is v0.13.15 (GitHub `chy3xyz/zigmodu`, default branch `master`).
+- Project targets Zig 0.17.0; current release tag is v0.14.1 (GitHub `chy3xyz/zigmodu`, default branch `master`).
 - If Zig global cache fails in sandboxed runs, use `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`.
 - Production roadmap and monolith maintenance rules live in `docs/PRODUCTION_ROADMAP.md`.
 - Current test baseline: **455 passed**, 12 skipped with `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`.

@@ -1,10 +1,10 @@
-# ZigModu v0.13.15
+# ZigModu v0.14.1
 
 A modular application framework for Zig 0.17, inspired by Spring Modulith. Build scalable applications from monolithic to distributed systems with progressive architecture evolution.
 
 [![Zig](https://img.shields.io/badge/Zig-0.17+-orange?style=flat-square)](https://ziglang.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-0.13.15-blue?style=flat-square)]()
+[![Version](https://img.shields.io/badge/Version-0.14.1-blue?style=flat-square)]()
 [![Score](https://img.shields.io/badge/Quality-95%25-A-green?style=flat-square)]()
 
 ## 📚 Documentation

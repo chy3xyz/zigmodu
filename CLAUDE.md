@@ -1,7 +1,7 @@
 # CLAUDE.md — ZigModu Framework for Claude Code
 
 ## Project
-ZigModu v0.13.15 — modular app framework for Zig 0.17.0. ~149 src files, 455 tests, ~95/100.
+ZigModu v0.14.1 — modular app framework for Zig 0.17.0. ~149 src files, 455 tests, ~95/100.
 
 ## Build & Test
 ```bash
