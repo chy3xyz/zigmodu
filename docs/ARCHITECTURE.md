@@ -2,7 +2,9 @@
 
 ## Overview
 
-ZigModu is designed around the concept of **modular architecture**, where an application is composed of loosely coupled, highly cohesive modules. This guide explains the architectural decisions and how to effectively use ZigModu in your projects.
+ZigModu is designed around the concept of **modular architecture** (modulith), where an application is composed of loosely coupled, highly cohesive modules. This guide explains the architectural decisions and how to effectively use ZigModu in your projects.
+
+**Day-one modulith + high-concurrency practices** (boundaries, fiber model, pooling, scale ladder): see **[MODULITH.md](MODULITH.md)** (中文专文).
 
 ## Core Concepts
 

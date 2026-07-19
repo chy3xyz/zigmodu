@@ -121,11 +121,11 @@ pub const Row = struct {
     }
 
     pub fn scan(self: Row, allocator: std.mem.Allocator, comptime T: type) !T {
-        return scanStruct(allocator, T, self, false, null);
+        return scanStruct(allocator, T, self, false, null, false);
     }
 
     pub fn scanPartial(self: Row, allocator: std.mem.Allocator, comptime T: type) !T {
-        return scanStruct(allocator, T, self, true, null);
+        return scanStruct(allocator, T, self, true, null, false);
     }
 };
 
@@ -308,8 +308,54 @@ fn buildColumnIndices(allocator: std.mem.Allocator, comptime T: type, columns: [
     return indices;
 }
 
+/// Scan all rows into []T using a one-shot column→field index map (O(F+C) setup, O(F) per row).
+/// String fields are duplicated into `allocator` (caller owns them via freeScanned).
+fn scanRowsToSlice(allocator: std.mem.Allocator, comptime T: type, rows: *Rows, partial: bool) ![]T {
+    for (rows.rows) |*row| row.arena = &rows.arena;
+
+    const indices: ?[]?usize = if (rows.rows.len > 0)
+        try buildColumnIndices(allocator, T, rows.rows[0].columns)
+    else
+        null;
+    defer if (indices) |idx| allocator.free(idx);
+
+    const result = try allocator.alloc(T, rows.rows.len);
+    var scanned_count: usize = 0;
+    errdefer {
+        for (result[0..scanned_count]) |item| freeScanned(allocator, T, item);
+        allocator.free(result);
+    }
+    for (rows.rows, 0..) |row, i| {
+        result[i] = try scanStruct(allocator, T, row, partial, indices, false);
+        scanned_count += 1;
+    }
+    return result;
+}
+
+/// Scan into QueryResult owning the Rows arena — string fields borrow arena memory (no second dupe).
+/// On success, steals `rows.arena`; caller must NOT call `rows.deinit()`.
+pub fn scanRowsToOwned(comptime T: type, rows: *Rows, partial: bool) !QueryResult(T) {
+    for (rows.rows) |*row| row.arena = &rows.arena;
+    const arena_alloc = rows.arena.allocator();
+
+    const indices: ?[]?usize = if (rows.rows.len > 0)
+        try buildColumnIndices(arena_alloc, T, rows.rows[0].columns)
+    else
+        null;
+
+    const result = try arena_alloc.alloc(T, rows.rows.len);
+    for (rows.rows, 0..) |row, i| {
+        result[i] = try scanStruct(arena_alloc, T, row, partial, indices, true);
+    }
+
+    const stolen = rows.arena;
+    rows.* = undefined;
+    return .{ .items = result, .arena = stolen };
+}
+
 /// Scan a struct Row, optionally using precomputed column indices for O(1) field lookup.
-fn scanStruct(allocator: std.mem.Allocator, comptime T: type, row: Row, partial: bool, indices: ?[]?usize) !T {
+/// When `borrow_strings` is true, []const u8 fields point into the row arena (no dupe).
+fn scanStruct(allocator: std.mem.Allocator, comptime T: type, row: Row, partial: bool, indices: ?[]?usize, borrow_strings: bool) !T {
     const info = @typeInfo(T);
     if (info != .@"struct") @compileError("scanStruct only supports structs, got " ++ @typeName(T));
 
@@ -338,7 +384,10 @@ fn scanStruct(allocator: std.mem.Allocator, comptime T: type, row: Row, partial:
                     }
                 } else {
                     const str = raw_val.?.string;
-                    @field(result, fname) = allocator.dupe(u8, str) catch return error.DatabaseError;
+                    @field(result, fname) = if (borrow_strings)
+                        str
+                    else
+                        allocator.dupe(u8, str) catch return error.DatabaseError;
                 }
             } else {
                 // Fallback: linear scan (no column index provided)
@@ -356,7 +405,10 @@ fn scanStruct(allocator: std.mem.Allocator, comptime T: type, row: Row, partial:
                                 }
                             } else {
                                 const str = raw_val.?.string;
-                                @field(result, fname) = allocator.dupe(u8, str) catch return error.DatabaseError;
+                                @field(result, fname) = if (borrow_strings)
+                                    str
+                                else
+                                    allocator.dupe(u8, str) catch return error.DatabaseError;
                             }
                             break :found;
                         }
@@ -373,14 +425,9 @@ fn scanStruct(allocator: std.mem.Allocator, comptime T: type, row: Row, partial:
             continue;
         }
 
-        // Non-string fields: use index if available, otherwise row.get()
+        // Non-string fields: borrow Value as-is (parseInt uses the arena string transiently).
         const val: ?Value = if (ci) |c| blk: {
-            if (row.values[c]) |v| {
-                switch (v) {
-                    .string => |s| break :blk .{ .string = allocator.dupe(u8, s) catch return error.DatabaseError },
-                    else => break :blk v,
-                }
-            }
+            if (row.values[c]) |v| break :blk v;
             break :blk null;
         } else row.get(fname);
 
@@ -484,22 +531,47 @@ pub fn freeScanned(allocator: std.mem.Allocator, comptime T: type, val: T) void 
     }
 }
 
-/// Owned query result — carries a []T slice and frees all string fields on deinit.
-/// Use `defer result.deinit(allocator)` to prevent memory leaks.
+/// Owned query result — prefers arena ownership (strings borrowed, single free on deinit).
+/// Legacy path (arena=null) frees per-string via freeScanned.
 ///
 /// ```zig
-/// const result = try client.queryRowsOwned(User, "SELECT * FROM users", &.{});
+/// var result = try client.queryRowsOwned(User, "SELECT * FROM users", &.{});
 /// defer result.deinit(allocator);
 /// for (result.items) |user| { ... }
 /// ```
 pub fn QueryResult(comptime T: type) type {
     return struct {
         items: []T,
+        /// When set, owns all string data (and the items slice). deinit frees the arena only.
+        arena: ?std.heap.ArenaAllocator = null,
 
-        /// Recursively free all []const u8 / ?[]const u8 fields in every item, then free the slice.
+        pub const TakeResult = struct { items: []T, arena: ?std.heap.ArenaAllocator };
+
+        /// Free owned memory. Accepts `*const @This()` so callers can keep the
+        /// idiomatic `const rows = try ...; defer rows.deinit(...);` pattern
+        /// under Zig 0.17's stricter const checking. The cast is safe because
+        /// QueryResult always owns its backing memory on the heap/stack and
+        /// the caller holds the only reference at this point.
         pub fn deinit(self: *const @This(), allocator: std.mem.Allocator) void {
+            const self_mut: *@This() = @constCast(self);
+            if (self_mut.arena) |*a| {
+                a.deinit();
+                self_mut.arena = null;
+                self_mut.items = &.{};
+                return;
+            }
             for (self.items) |item| freeScanned(allocator, T, item);
             allocator.free(self.items);
+            self_mut.items = &.{};
+        }
+
+        /// Transfer items + arena ownership out (e.g. into PageResult). Leaves self empty.
+        pub fn take(self: *const @This()) TakeResult {
+            const self_mut: *@This() = @constCast(self);
+            const out: TakeResult = .{ .items = self.items, .arena = self.arena };
+            self_mut.items = &.{};
+            self_mut.arena = null;
+            return out;
         }
     };
 }
@@ -540,25 +612,23 @@ pub const SQLiteConn = struct {
         return .{ .db = db, .allocator = allocator, .stmt_cache = std.StringHashMap(*sqlite3_c.sqlite3_stmt).init(allocator) };
     }
 
-    /// Get or prepare a cached statement. Returns sqlite3_reset'd stmt ready for binding.
+    /// Get or prepare a cached statement. Returns reset + clear_bindings stmt ready for binding.
     fn getCachedStmt(self: *SQLiteConn, sql_str: []const u8) !*sqlite3_c.sqlite3_stmt {
         self.guard();
         if (self.stmt_cache.get(sql_str)) |cached| {
             _ = sqlite3_c.sqlite3_reset(cached);
-            // sqlite3_clear_bindings not in bindings
+            _ = sqlite3_c.sqlite3_clear_bindings(cached);
             return cached;
         }
-        // Evict oldest if at capacity
+        // Evict one entry when at capacity
         if (self.stmt_cache.count() >= MAX_CACHED_STMTS) {
-            var oldest_key: ?[]const u8 = null;
             var it = self.stmt_cache.iterator();
             if (it.next()) |entry| {
-                oldest_key = entry.key_ptr.*;
-                _ = sqlite3_c.sqlite3_finalize(entry.value_ptr.*);
-            }
-            if (oldest_key) |k| {
-                _ = self.stmt_cache.remove(k);
-                self.allocator.free(k);
+                const old_key = entry.key_ptr.*;
+                if (self.stmt_cache.fetchRemove(old_key)) |kv| {
+                    _ = sqlite3_c.sqlite3_finalize(kv.value);
+                    self.allocator.free(kv.key);
+                }
             }
         }
         var stmt: ?*sqlite3_c.sqlite3_stmt = null;
@@ -597,18 +667,25 @@ pub const SQLiteConn = struct {
         const col_count = sqlite3_c.sqlite3_column_count(stmt);
         var rows_list: std.ArrayList(Row) = std.ArrayList(Row).empty;
 
+        // Column names are identical for every row — allocate once and share.
+        const shared_columns = arena_alloc.alloc([]const u8, @intCast(col_count)) catch return error.DatabaseError;
+        var names_ready = false;
+
         var step_rc = sqlite3_c.sqlite3_step(stmt);
         while (step_rc == sqlite3_c.SQLITE_ROW) {
-            const columns = arena_alloc.alloc([]const u8, @intCast(col_count)) catch return error.DatabaseError;
+            if (!names_ready) {
+                for (0..@intCast(col_count)) |i| {
+                    const raw_name = sqlite3_c.sqlite3_column_name(stmt, @intCast(i));
+                    const name_len = std.mem.len(raw_name);
+                    shared_columns[i] = arena_alloc.dupe(u8, raw_name[0..name_len]) catch return error.DatabaseError;
+                }
+                names_ready = true;
+            }
             const values = arena_alloc.alloc(?Value, @intCast(col_count)) catch return error.DatabaseError;
             for (0..@intCast(col_count)) |i| {
-                const raw_name = sqlite3_c.sqlite3_column_name(stmt, @intCast(i));
-                const name_len = std.mem.len(raw_name);
-                const name = raw_name[0..name_len];
-                columns[i] = arena_alloc.dupe(u8, name) catch return error.DatabaseError;
                 values[i] = readSQLiteValue(arena_alloc, stmt, @intCast(i));
             }
-            rows_list.append(arena_alloc, .{ .arena = undefined, .columns = columns, .values = values }) catch return error.DatabaseError;
+            rows_list.append(arena_alloc, .{ .arena = undefined, .columns = shared_columns, .values = values }) catch return error.DatabaseError;
             step_rc = sqlite3_c.sqlite3_step(stmt);
         }
         // Check if step ended with an error (not DONE)
@@ -758,6 +835,174 @@ fn readSQLiteValue(allocator: std.mem.Allocator, stmt: ?*sqlite3_c.sqlite3_stmt,
 /// Maximum cached prepared statements per PG connection.
 const PG_MAX_CACHED_STMTS = 64;
 
+/// `resultFormat` for PQexecParams / PQexecPrepared — binary wire format.
+const PG_RESULT_BINARY: c_int = 1;
+
+/// Common PostgreSQL type OIDs (pg_type).
+const PgOid = struct {
+    const bool_t: libpq_c.Oid = 16;
+    const bytea: libpq_c.Oid = 17;
+    const char_t: libpq_c.Oid = 18;
+    const name: libpq_c.Oid = 19;
+    const int8: libpq_c.Oid = 20;
+    const int2: libpq_c.Oid = 21;
+    const int4: libpq_c.Oid = 23;
+    const text: libpq_c.Oid = 25;
+    const json: libpq_c.Oid = 114;
+    const xml: libpq_c.Oid = 142;
+    const float4: libpq_c.Oid = 700;
+    const float8: libpq_c.Oid = 701;
+    const bpchar: libpq_c.Oid = 1042;
+    const varchar: libpq_c.Oid = 1043;
+    const date: libpq_c.Oid = 1082;
+    const timestamp: libpq_c.Oid = 1114;
+    const timestamptz: libpq_c.Oid = 1184;
+    const numeric: libpq_c.Oid = 1700;
+    const uuid: libpq_c.Oid = 2950;
+    const jsonb: libpq_c.Oid = 3802;
+};
+
+/// Decode one PG cell. Handles text (`PQexec`) and binary (`resultFormat=1`) results.
+fn pgReadCell(allocator: std.mem.Allocator, res: *libpq_c.PGresult, row: c_int, col: c_int) !?Value {
+    if (libpq_c.PQgetisnull(res, row, col) == 1) return null;
+
+    const raw = libpq_c.PQgetvalue(res, row, col);
+    const len: usize = @intCast(libpq_c.PQgetlength(res, row, col));
+    const bytes = raw[0..len];
+
+    // Text format (simple query / resultFormat=0): keep as string for scanStruct parsing.
+    if (libpq_c.PQfformat(res, col) == 0) {
+        return .{ .string = try allocator.dupe(u8, bytes) };
+    }
+
+    return @as(?Value, try pgDecodeBinary(allocator, libpq_c.PQftype(res, col), bytes));
+}
+
+/// Decode PostgreSQL binary column bytes into a Value.
+fn pgDecodeBinary(allocator: std.mem.Allocator, oid: libpq_c.Oid, bytes: []const u8) !Value {
+    switch (oid) {
+        PgOid.bool_t => {
+            if (bytes.len < 1) return error.DatabaseError;
+            return .{ .bool = bytes[0] != 0 };
+        },
+        PgOid.int2 => {
+            if (bytes.len < 2) return error.DatabaseError;
+            return .{ .int = std.mem.readInt(i16, bytes[0..2], .big) };
+        },
+        PgOid.int4 => {
+            if (bytes.len < 4) return error.DatabaseError;
+            return .{ .int = std.mem.readInt(i32, bytes[0..4], .big) };
+        },
+        PgOid.int8 => {
+            if (bytes.len < 8) return error.DatabaseError;
+            return .{ .int = std.mem.readInt(i64, bytes[0..8], .big) };
+        },
+        PgOid.float4 => {
+            if (bytes.len < 4) return error.DatabaseError;
+            const bits = std.mem.readInt(u32, bytes[0..4], .big);
+            return .{ .float = @as(f32, @bitCast(bits)) };
+        },
+        PgOid.float8 => {
+            if (bytes.len < 8) return error.DatabaseError;
+            const bits = std.mem.readInt(u64, bytes[0..8], .big);
+            return .{ .float = @as(f64, @bitCast(bits)) };
+        },
+        PgOid.text, PgOid.varchar, PgOid.bpchar, PgOid.name, PgOid.xml, PgOid.json, PgOid.char_t, PgOid.bytea => {
+            return .{ .string = try allocator.dupe(u8, bytes) };
+        },
+        PgOid.jsonb => {
+            // jsonb binary: 1-byte version (1) + utf8 json
+            if (bytes.len >= 1 and bytes[0] == 1) {
+                return .{ .string = try allocator.dupe(u8, bytes[1..]) };
+            }
+            return .{ .string = try allocator.dupe(u8, bytes) };
+        },
+        PgOid.uuid => {
+            if (bytes.len != 16) return error.DatabaseError;
+            const s = try std.fmt.allocPrint(allocator, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
+                bytes[0],  bytes[1],  bytes[2],  bytes[3],
+                bytes[4],  bytes[5],  bytes[6],  bytes[7],
+                bytes[8],  bytes[9],  bytes[10], bytes[11],
+                bytes[12], bytes[13], bytes[14], bytes[15],
+            });
+            return .{ .string = s };
+        },
+        PgOid.date => {
+            // days since 2000-01-01
+            if (bytes.len < 4) return error.DatabaseError;
+            const days = std.mem.readInt(i32, bytes[0..4], .big);
+            const s = try pgFormatDate(allocator, days);
+            return .{ .string = s };
+        },
+        PgOid.timestamp, PgOid.timestamptz => {
+            // microseconds since 2000-01-01 00:00:00
+            if (bytes.len < 8) return error.DatabaseError;
+            const us = std.mem.readInt(i64, bytes[0..8], .big);
+            const s = try pgFormatTimestamp(allocator, us);
+            return .{ .string = s };
+        },
+        else => {
+            // Unknown binary OID: keep raw bytes as string when UTF-8, else hex.
+            if (std.unicode.utf8ValidateSlice(bytes)) {
+                return .{ .string = try allocator.dupe(u8, bytes) };
+            }
+            const hex = try allocator.alloc(u8, 2 + bytes.len * 2);
+            hex[0] = '\\';
+            hex[1] = 'x';
+            const digits = "0123456789abcdef";
+            for (bytes, 0..) |b, i| {
+                hex[2 + i * 2] = digits[b >> 4];
+                hex[2 + i * 2 + 1] = digits[b & 0xf];
+            }
+            return .{ .string = hex };
+        },
+    }
+}
+
+/// Format PG date (days since 2000-01-01) as `YYYY-MM-DD`.
+fn pgFormatDate(allocator: std.mem.Allocator, days_since_2000: i32) ![]u8 {
+    // 2000-01-01 = Unix epoch day 10957 (days since 1970-01-01).
+    const unix_days: i64 = @as(i64, days_since_2000) + 10957;
+    // Civil from days (Howard Hinnant algorithm).
+    const z = unix_days + 719468;
+    const era: i64 = @divFloor(z, 146097);
+    const doe: u64 = @intCast(z - era * 146097);
+    const yoe: u64 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    var y: i64 = @as(i64, @intCast(yoe)) + era * 400;
+    const doy: u64 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const mp: u64 = (5 * doy + 2) / 153;
+    const d: u64 = doy - (153 * mp + 2) / 5 + 1;
+    const m: u64 = if (mp < 10) mp + 3 else mp - 9;
+    y += if (m <= 2) @as(i64, 1) else 0;
+    return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}", .{
+        @as(u32, @intCast(y)),
+        @as(u32, @intCast(m)),
+        @as(u32, @intCast(d)),
+    });
+}
+
+/// Format PG timestamp (µs since 2000-01-01) as ISO-8601 UTC `YYYY-MM-DDTHH:MM:SS.ffffff`.
+fn pgFormatTimestamp(allocator: std.mem.Allocator, us_since_2000: i64) ![]u8 {
+    const us_per_day: i64 = 86_400_000_000;
+    const days: i32 = @intCast(@divFloor(us_since_2000, us_per_day));
+    var us_rem = @mod(us_since_2000, us_per_day);
+    if (us_rem < 0) us_rem += us_per_day;
+    const date = try pgFormatDate(allocator, days);
+    defer allocator.free(date);
+    const secs = @divFloor(us_rem, 1_000_000);
+    const frac = @mod(us_rem, 1_000_000);
+    const h = @divFloor(secs, 3600);
+    const mi = @divFloor(@mod(secs, 3600), 60);
+    const s = @mod(secs, 60);
+    return std.fmt.allocPrint(allocator, "{s}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{
+        date,
+        @as(u32, @intCast(h)),
+        @as(u32, @intCast(mi)),
+        @as(u32, @intCast(s)),
+        @as(u32, @intCast(frac)),
+    });
+}
+
 pub const PostgresConn = struct {
     conn: ?*libpq_c.PGconn,
     allocator: std.mem.Allocator,
@@ -841,22 +1086,18 @@ pub const PostgresConn = struct {
 
         var rows_list: std.ArrayList(Row) = std.ArrayList(Row).empty;
 
+        const shared_columns = arena_alloc.alloc([]const u8, @intCast(n_cols)) catch return error.DatabaseError;
+        for (0..@intCast(n_cols)) |c| {
+            const name = std.mem.span(libpq_c.PQfname(res.?, @intCast(c)));
+            shared_columns[c] = arena_alloc.dupe(u8, name) catch return error.DatabaseError;
+        }
+
         for (0..@intCast(n_rows)) |r| {
-            const columns = arena_alloc.alloc([]const u8, @intCast(n_cols)) catch return error.DatabaseError;
             const values = arena_alloc.alloc(?Value, @intCast(n_cols)) catch return error.DatabaseError;
             for (0..@intCast(n_cols)) |c| {
-                const name = std.mem.span(libpq_c.PQfname(res.?, @intCast(c)));
-                columns[c] = arena_alloc.dupe(u8, name) catch return error.DatabaseError;
-                if (libpq_c.PQgetisnull(res.?, @intCast(r), @intCast(c)) == 1) {
-                    values[c] = null;
-                } else {
-                    const val = std.mem.span(libpq_c.PQgetvalue(res.?, @intCast(r), @intCast(c)));
-                    values[c] = .{ .string = arena_alloc.dupe(u8, val) catch return error.DatabaseError };
-                }
+                values[c] = pgReadCell(arena_alloc, res.?, @intCast(r), @intCast(c)) catch return error.DatabaseError;
             }
-            // Temporarily store arena_alloc; will be updated after Rows is created
-            // so that .allocator points to the moved arena, not the stack copy.
-            rows_list.append(arena_alloc, .{ .arena = undefined, .columns = columns, .values = values }) catch return error.DatabaseError;
+            rows_list.append(arena_alloc, .{ .arena = undefined, .columns = shared_columns, .values = values }) catch return error.DatabaseError;
         }
 
         const rows_slice = arena_alloc.alloc(Row, rows_list.items.len) catch return error.DatabaseError;
@@ -904,9 +1145,73 @@ pub const PostgresConn = struct {
 
     /// Execute with prepared statement caching. First call prepares and caches;
     /// subsequent calls reuse via PQexecPrepared (server-side).
+    /// Falls back to `execParamsDirect` on prepare failure or zero-arg queries.
     fn execPrepared(self: *PostgresConn, sql_str: []const u8, args: []const Value) ?*libpq_c.PGresult {
-        // Bypass prepared statement cache — use PQexecParams directly
-        return execParamsDirect(self, sql_str, args);
+        // No bind params → PQexec is enough (and avoids polluting the stmt cache).
+        if (args.len == 0) {
+            return execParamsDirect(self, sql_str, args);
+        }
+
+        // Cache key = original Zig SQL (`?` placeholders). Hit → PQexecPrepared.
+        if (self.stmt_cache.get(sql_str)) |stmt_name| {
+            if (self.execPreparedStmt(stmt_name, args)) |res| return res;
+            // Cached name may be stale after reconnect; drop and re-prepare below.
+            if (self.stmt_cache.fetchRemove(sql_str)) |kv| {
+                self.allocator.free(kv.key);
+                self.allocator.free(kv.value);
+            }
+        }
+
+        const pg_sql = convertPlaceholders(self.allocator, sql_str) orelse return execParamsDirect(self, sql_str, args);
+        defer self.allocator.free(pg_sql);
+
+        // Evict one entry when at capacity (HashMap iteration order ≈ insertion).
+        if (self.stmt_cache.count() >= PG_MAX_CACHED_STMTS) {
+            var it = self.stmt_cache.iterator();
+            if (it.next()) |entry| {
+                const old_key = entry.key_ptr.*;
+                if (self.stmt_cache.fetchRemove(old_key)) |kv| {
+                    var dealloc_buf: [80]u8 = undefined;
+                    if (bufPrintZ(&dealloc_buf, "DEALLOCATE {s}", .{kv.value})) |dealloc_sql| {
+                        if (self.conn) |c| {
+                            if (libpq_c.PQexec(c, @ptrCast(dealloc_sql.ptr))) |dr| libpq_c.PQclear(dr);
+                        }
+                    } else |_| {}
+                    self.allocator.free(kv.key);
+                    self.allocator.free(kv.value);
+                }
+            }
+        }
+
+        self.stmt_counter += 1;
+        var stmt_buf: [32]u8 = undefined;
+        const stmt_name_z = bufPrintZ(&stmt_buf, "zs_{d}", .{self.stmt_counter}) catch {
+            return execParamsDirect(self, sql_str, args);
+        };
+
+        const prep_res = libpq_c.PQprepare(self.conn, @ptrCast(stmt_name_z.ptr), @ptrCast(pg_sql.ptr), @intCast(args.len), null);
+        if (prep_res == null) return execParamsDirect(self, sql_str, args);
+        defer libpq_c.PQclear(prep_res.?);
+        if (libpq_c.PQresultStatus(prep_res.?) != libpq_c.ExecStatusType.PGRES_COMMAND_OK) {
+            const err = std.mem.span(libpq_c.PQerrorMessage(self.conn));
+            std.log.warn("PG PQprepare failed, falling back to PQexecParams: {s}", .{err});
+            return execParamsDirect(self, sql_str, args);
+        }
+
+        const sql_dup = self.allocator.dupe(u8, sql_str) catch {
+            return self.execPreparedStmt(stmt_name_z, args) orelse execParamsDirect(self, sql_str, args);
+        };
+        const stmt_name_dup = allocZ(self.allocator, stmt_name_z) catch {
+            self.allocator.free(sql_dup);
+            return self.execPreparedStmt(stmt_name_z, args) orelse execParamsDirect(self, sql_str, args);
+        };
+        self.stmt_cache.put(sql_dup, stmt_name_dup) catch {
+            self.allocator.free(sql_dup);
+            self.allocator.free(stmt_name_dup);
+            return self.execPreparedStmt(stmt_name_z, args) orelse execParamsDirect(self, sql_str, args);
+        };
+
+        return self.execPreparedStmt(stmt_name_dup, args);
     }
 
     /// Direct PQexecParams (no prepared statement cache).
@@ -989,7 +1294,7 @@ pub const PostgresConn = struct {
             };
         }
 
-        const res = libpq_c.PQexecParams(self.conn, @ptrCast(pg_sql.ptr), @intCast(param_count), null, @ptrCast(paramValues.ptr), @ptrCast(paramLengths.ptr), null, 0);
+        const res = libpq_c.PQexecParams(self.conn, @ptrCast(pg_sql.ptr), @intCast(param_count), null, @ptrCast(paramValues.ptr), @ptrCast(paramLengths.ptr), null, PG_RESULT_BINARY);
         if (res == null) {
             const err = std.mem.span(libpq_c.PQerrorMessage(self.conn));
             std.log.err("PG PQexecParams returned null: err={s}", .{err});
@@ -998,28 +1303,14 @@ pub const PostgresConn = struct {
     }
 
     /// Execute already-prepared statement.
+    /// Param strings live in a local arena until `PQexecPrepared` returns (heysen §1.1/§1.2).
     fn execPreparedStmt(self: *PostgresConn, stmt_name: []const u8, args: []const Value) ?*libpq_c.PGresult {
-        const param_count = args.len;
-        const paramValues = self.allocator.alloc(?[*]const u8, param_count) catch return null;
-        const paramLengths = self.allocator.alloc(c_int, param_count) catch {
-            self.allocator.free(paramValues);
-            return null;
-        };
-        const paramAllocs = self.allocator.alloc(?[]const u8, param_count) catch {
-            self.allocator.free(paramValues);
-            self.allocator.free(paramLengths);
-            return null;
-        };
-        @memset(paramAllocs, null);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
 
-        defer {
-            for (paramAllocs) |maybe_alloc| {
-                if (maybe_alloc) |a| self.allocator.free(a);
-            }
-            self.allocator.free(paramAllocs);
-            self.allocator.free(paramLengths);
-            self.allocator.free(paramValues);
-        }
+        const paramValues = aa.alloc(?[*:0]const u8, args.len) catch return null;
+        const paramLengths = aa.alloc(c_int, args.len) catch return null;
 
         for (args, 0..) |arg, i| {
             paramValues[i] = switch (arg) {
@@ -1028,29 +1319,37 @@ pub const PostgresConn = struct {
                     break :blk null;
                 },
                 .int => |v| blk: {
-                    const s = std.fmt.allocPrint(self.allocator, "{d}", .{v}) catch return null;
-                    paramAllocs[i] = s;
+                    const s = allocPrintZ(aa, "{d}", .{v}) catch return null;
                     paramLengths[i] = @intCast(s.len);
-                    break :blk @ptrCast(s.ptr);
+                    break :blk s.ptr;
                 },
                 .float => |v| blk: {
-                    const s = std.fmt.allocPrint(self.allocator, "{d}", .{v}) catch return null;
-                    paramAllocs[i] = s;
+                    const s = allocPrintZ(aa, "{d}", .{v}) catch return null;
                     paramLengths[i] = @intCast(s.len);
-                    break :blk @ptrCast(s.ptr);
+                    break :blk s.ptr;
                 },
                 .string => |v| blk: {
-                    paramLengths[i] = @intCast(v.len);
-                    break :blk @ptrCast(v.ptr);
+                    const s = allocZ(aa, v) catch return null;
+                    paramLengths[i] = @intCast(s.len);
+                    break :blk s.ptr;
                 },
                 .bool => |v| blk: {
                     paramLengths[i] = 1;
-                    break :blk if (v) @ptrCast("t") else @ptrCast("f");
+                    break :blk if (v) @as(?[*:0]const u8, @ptrCast("t")) else @ptrCast("f");
                 },
             };
         }
 
-        return libpq_c.PQexecPrepared(self.conn, @ptrCast(stmt_name.ptr), @intCast(param_count), @ptrCast(paramValues.ptr), @ptrCast(paramLengths.ptr), null, 0);
+        // Cached names are allocZ'd; stack names from bufPrintZ are also sentinel-terminated.
+        return libpq_c.PQexecPrepared(
+            self.conn,
+            @ptrCast(stmt_name.ptr),
+            @intCast(args.len),
+            @ptrCast(paramValues.ptr),
+            @ptrCast(paramLengths.ptr),
+            null,
+            PG_RESULT_BINARY,
+        );
     }
 
     /// Fallback: direct PQexecParams (no caching). Used when prepared stmt fails.
@@ -1110,7 +1409,7 @@ pub const PostgresConn = struct {
 
         const pg_sql = convertPlaceholders(self.allocator, sql_str) orelse return null;
         defer self.allocator.free(pg_sql);
-        return libpq_c.PQexecParams(self.conn, @ptrCast(pg_sql.ptr), @intCast(param_count), null, @ptrCast(paramValues.ptr), @ptrCast(paramLengths.ptr), null, 0);
+        return libpq_c.PQexecParams(self.conn, @ptrCast(pg_sql.ptr), @intCast(param_count), null, @ptrCast(paramValues.ptr), @ptrCast(paramLengths.ptr), null, PG_RESULT_BINARY);
     }
 
     fn convertPlaceholders(allocator: std.mem.Allocator, sql: []const u8) ?[:0]u8 {
@@ -1294,10 +1593,8 @@ fn mysqlReadRowsAfterQuery(mysql: ?*libmysql_c.MYSQL, arena: std.heap.ArenaAlloc
         for (0..n_rows) |_| {
             const row_data = libmysql_c.mysql_fetch_row(r);
             const lengths = libmysql_c.mysql_fetch_lengths(r);
-            const columns = arena_alloc.alloc([]const u8, n_cols) catch return error.DatabaseError;
             const values = arena_alloc.alloc(?Value, n_cols) catch return error.DatabaseError;
             for (0..n_cols) |c| {
-                columns[c] = arena_alloc.dupe(u8, field_names[c]) catch return error.DatabaseError;
                 if (row_data == null or row_data.?[c] == null) {
                     values[c] = null;
                 } else {
@@ -1306,7 +1603,8 @@ fn mysqlReadRowsAfterQuery(mysql: ?*libmysql_c.MYSQL, arena: std.heap.ArenaAlloc
                     values[c] = .{ .string = arena_alloc.dupe(u8, val) catch return error.DatabaseError };
                 }
             }
-            rows_list.append(arena_alloc, .{ .arena = undefined, .columns = columns, .values = values }) catch return error.DatabaseError;
+            // Share field_names across rows (same arena lifetime).
+            rows_list.append(arena_alloc, .{ .arena = undefined, .columns = field_names, .values = values }) catch return error.DatabaseError;
         }
 
         const rows_slice = arena_alloc.alloc(Row, rows_list.items.len) catch return error.DatabaseError;
@@ -1321,9 +1619,169 @@ fn mysqlReadRowsAfterQuery(mysql: ?*libmysql_c.MYSQL, arena: std.heap.ArenaAlloc
     return rows;
 }
 
+/// Map MySQL/MariaDB errno to ZigModu errors.
+fn mysqlErrnoToError(err_no: c_uint) errors.Error {
+    return switch (err_no) {
+        1062, 1586 => error.ConstraintViolation,
+        else => error.DatabaseError,
+    };
+}
+
+/// Bind `args` onto a prepared statement. Scratch storage lives in `arena`.
+fn mysqlBindParams(stmt: *libmysql_c.MYSQL_STMT, arena: std.mem.Allocator, args: []const Value) !void {
+    if (args.len == 0) return;
+    const binds = try arena.alloc(libmysql_c.MYSQL_BIND, args.len);
+    @memset(binds, .{});
+    const null_flags = try arena.alloc(libmysql_c.my_bool, args.len);
+    const lengths = try arena.alloc(c_ulong, args.len);
+    const int_bufs = try arena.alloc(i64, args.len);
+    const float_bufs = try arena.alloc(f64, args.len);
+    const bool_bufs = try arena.alloc(u8, args.len);
+
+    for (args, 0..) |arg, i| {
+        switch (arg) {
+            .null => {
+                null_flags[i] = 1;
+                binds[i].buffer_type = libmysql_c.MYSQL_TYPE_NULL;
+                binds[i].is_null = &null_flags[i];
+            },
+            .int => |v| {
+                null_flags[i] = 0;
+                int_bufs[i] = v;
+                binds[i].buffer_type = libmysql_c.MYSQL_TYPE_LONGLONG;
+                binds[i].buffer = @ptrCast(&int_bufs[i]);
+                binds[i].is_null = &null_flags[i];
+                binds[i].is_unsigned = 0;
+            },
+            .float => |v| {
+                null_flags[i] = 0;
+                float_bufs[i] = v;
+                binds[i].buffer_type = libmysql_c.MYSQL_TYPE_DOUBLE;
+                binds[i].buffer = @ptrCast(&float_bufs[i]);
+                binds[i].is_null = &null_flags[i];
+            },
+            .string => |s| {
+                null_flags[i] = 0;
+                lengths[i] = @intCast(s.len);
+                binds[i].buffer_type = libmysql_c.MYSQL_TYPE_STRING;
+                binds[i].buffer = @ptrCast(@constCast(s.ptr));
+                binds[i].buffer_length = @intCast(s.len);
+                binds[i].length = &lengths[i];
+                binds[i].is_null = &null_flags[i];
+            },
+            .bool => |v| {
+                null_flags[i] = 0;
+                bool_bufs[i] = if (v) 1 else 0;
+                binds[i].buffer_type = libmysql_c.MYSQL_TYPE_TINY;
+                binds[i].buffer = @ptrCast(&bool_bufs[i]);
+                binds[i].is_null = &null_flags[i];
+                binds[i].is_unsigned = 1;
+            },
+        }
+    }
+    if (libmysql_c.mysql_stmt_bind_param(stmt, binds.ptr) != 0) {
+        const err_no = libmysql_c.mysql_stmt_errno(stmt);
+        const err_msg = std.mem.span(libmysql_c.mysql_stmt_error(stmt));
+        std.log.err("MySQL stmt_bind_param error: errno={d} msg={s}", .{ err_no, err_msg });
+        return mysqlErrnoToError(err_no);
+    }
+}
+
+/// After successful `mysql_stmt_execute` for a result-producing statement, fetch rows as text.
+fn mysqlStmtReadRows(stmt: *libmysql_c.MYSQL_STMT, arena: std.heap.ArenaAllocator) errors.ResultT(Rows) {
+    var arena_mut = arena;
+    const arena_alloc = arena_mut.allocator();
+
+    if (libmysql_c.mysql_stmt_store_result(stmt) != 0) {
+        const err_no = libmysql_c.mysql_stmt_errno(stmt);
+        const err_msg = std.mem.span(libmysql_c.mysql_stmt_error(stmt));
+        std.log.err("MySQL stmt_store_result error: errno={d} msg={s}", .{ err_no, err_msg });
+        return mysqlErrnoToError(err_no);
+    }
+
+    const meta = libmysql_c.mysql_stmt_result_metadata(stmt) orelse {
+        // No metadata → treat as empty result set (should be rare after field_count > 0).
+        const empty = arena_alloc.alloc(Row, 0) catch return error.DatabaseError;
+        return Rows{ .arena = arena_mut, .rows = empty };
+    };
+    defer libmysql_c.mysql_free_result(meta);
+
+    const n_cols = libmysql_c.mysql_num_fields(meta);
+    const fields = libmysql_c.mysql_fetch_fields(meta) orelse return error.DatabaseError;
+
+    const shared_columns = arena_alloc.alloc([]const u8, n_cols) catch return error.DatabaseError;
+    const binds = arena_alloc.alloc(libmysql_c.MYSQL_BIND, n_cols) catch return error.DatabaseError;
+    @memset(binds, .{});
+    const null_flags = arena_alloc.alloc(libmysql_c.my_bool, n_cols) catch return error.DatabaseError;
+    const lengths = arena_alloc.alloc(c_ulong, n_cols) catch return error.DatabaseError;
+    const err_flags = arena_alloc.alloc(libmysql_c.my_bool, n_cols) catch return error.DatabaseError;
+
+    for (0..n_cols) |c| {
+        const field = fields[c];
+        const name = field.name[0..field.name_length];
+        shared_columns[c] = arena_alloc.dupe(u8, name) catch return error.DatabaseError;
+
+        // Prefer max_length after store_result; fall back to declared length / 256.
+        var buf_len: usize = @intCast(if (field.max_length > 0) field.max_length else field.length);
+        if (buf_len < 64) buf_len = 64;
+        if (buf_len > 1 << 20) buf_len = 1 << 20; // 1 MiB cap per column
+        buf_len += 1; // NUL room
+        const buf = arena_alloc.alloc(u8, buf_len) catch return error.DatabaseError;
+
+        binds[c].buffer_type = libmysql_c.MYSQL_TYPE_STRING;
+        binds[c].buffer = buf.ptr;
+        binds[c].buffer_length = @intCast(buf_len);
+        binds[c].length = &lengths[c];
+        binds[c].is_null = &null_flags[c];
+        binds[c].@"error" = &err_flags[c];
+    }
+
+    if (libmysql_c.mysql_stmt_bind_result(stmt, binds.ptr) != 0) {
+        const err_no = libmysql_c.mysql_stmt_errno(stmt);
+        const err_msg = std.mem.span(libmysql_c.mysql_stmt_error(stmt));
+        std.log.err("MySQL stmt_bind_result error: errno={d} msg={s}", .{ err_no, err_msg });
+        return mysqlErrnoToError(err_no);
+    }
+
+    var rows_list: std.ArrayList(Row) = .empty;
+    while (true) {
+        const rc = libmysql_c.mysql_stmt_fetch(stmt);
+        if (rc == 1) {
+            const err_no = libmysql_c.mysql_stmt_errno(stmt);
+            const err_msg = std.mem.span(libmysql_c.mysql_stmt_error(stmt));
+            std.log.err("MySQL stmt_fetch error: errno={d} msg={s}", .{ err_no, err_msg });
+            return mysqlErrnoToError(err_no);
+        }
+        if (rc == libmysql_c.MYSQL_NO_DATA) break;
+        // 0 = OK, MYSQL_DATA_TRUNCATED = truncated but still usable
+        if (rc != 0 and rc != libmysql_c.MYSQL_DATA_TRUNCATED) {
+            return error.DatabaseError;
+        }
+
+        const values = arena_alloc.alloc(?Value, n_cols) catch return error.DatabaseError;
+        for (0..n_cols) |c| {
+            if (null_flags[c] != 0) {
+                values[c] = null;
+            } else {
+                const len: usize = @intCast(lengths[c]);
+                const buf: [*]u8 = @ptrCast(binds[c].buffer.?);
+                values[c] = .{ .string = arena_alloc.dupe(u8, buf[0..len]) catch return error.DatabaseError };
+            }
+        }
+        rows_list.append(arena_alloc, .{ .arena = undefined, .columns = shared_columns, .values = values }) catch return error.DatabaseError;
+    }
+
+    const rows_slice = arena_alloc.alloc(Row, rows_list.items.len) catch return error.DatabaseError;
+    @memcpy(rows_slice, rows_list.items);
+    _ = libmysql_c.mysql_stmt_free_result(stmt);
+    return Rows{ .arena = arena_mut, .rows = rows_slice };
+}
+
 pub const MySqlConn = struct {
     mysql: ?*libmysql_c.MYSQL,
     allocator: std.mem.Allocator,
+    /// LRU-ish prepared-statement cache keyed by original SQL (`?` placeholders).
+    stmt_cache: std.StringHashMap(*libmysql_c.MYSQL_STMT),
     magic: u32 = 0xDBDBDBDB,
 
     fn guard(self: *const @This()) void {
@@ -1349,7 +1807,93 @@ pub const MySqlConn = struct {
             libmysql_c.mysql_close(mysql);
             return error.DatabaseError;
         }
-        return .{ .mysql = mysql, .allocator = allocator };
+        return .{
+            .mysql = mysql,
+            .allocator = allocator,
+            .stmt_cache = std.StringHashMap(*libmysql_c.MYSQL_STMT).init(allocator),
+        };
+    }
+
+    /// Get or prepare a cached statement. Returns reset stmt ready for binding.
+    fn getCachedStmt(self: *MySqlConn, sql_str: []const u8) !*libmysql_c.MYSQL_STMT {
+        self.guard();
+        if (self.stmt_cache.get(sql_str)) |cached| {
+            _ = libmysql_c.mysql_stmt_reset(cached);
+            _ = libmysql_c.mysql_stmt_free_result(cached);
+            return cached;
+        }
+        if (self.stmt_cache.count() >= MAX_CACHED_STMTS) {
+            var it = self.stmt_cache.iterator();
+            if (it.next()) |entry| {
+                const old_key = entry.key_ptr.*;
+                if (self.stmt_cache.fetchRemove(old_key)) |kv| {
+                    _ = libmysql_c.mysql_stmt_close(kv.value);
+                    self.allocator.free(kv.key);
+                }
+            }
+        }
+        const stmt = libmysql_c.mysql_stmt_init(self.mysql) orelse return error.DatabaseError;
+        if (libmysql_c.mysql_stmt_prepare(stmt, @ptrCast(sql_str.ptr), @intCast(sql_str.len)) != 0) {
+            const err_no = libmysql_c.mysql_stmt_errno(stmt);
+            const err_msg = std.mem.span(libmysql_c.mysql_stmt_error(stmt));
+            std.log.err("MySQL stmt_prepare error: errno={d} msg={s}", .{ err_no, err_msg });
+            _ = libmysql_c.mysql_stmt_close(stmt);
+            return mysqlErrnoToError(err_no);
+        }
+        const key = self.allocator.dupe(u8, sql_str) catch {
+            _ = libmysql_c.mysql_stmt_close(stmt);
+            return error.DatabaseError;
+        };
+        self.stmt_cache.put(key, stmt) catch {
+            self.allocator.free(key);
+            _ = libmysql_c.mysql_stmt_close(stmt);
+            return error.DatabaseError;
+        };
+        return stmt;
+    }
+
+    /// Execute via binary prepared statement. Returns `null` to signal formatQuery fallback.
+    fn execViaStmt(self: *MySqlConn, sql_str: []const u8, args: []const Value) !?ExecResult {
+        const stmt = self.getCachedStmt(sql_str) catch return null;
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        mysqlBindParams(stmt, scratch.allocator(), args) catch return null;
+        if (libmysql_c.mysql_stmt_execute(stmt) != 0) {
+            const err_no = libmysql_c.mysql_stmt_errno(stmt);
+            const err_msg = std.mem.span(libmysql_c.mysql_stmt_error(stmt));
+            std.log.err("MySQL stmt_execute error: errno={d} msg={s}", .{ err_no, err_msg });
+            return mysqlErrnoToError(err_no);
+        }
+        if (libmysql_c.mysql_stmt_field_count(stmt) > 0) {
+            _ = libmysql_c.mysql_stmt_store_result(stmt);
+            _ = libmysql_c.mysql_stmt_free_result(stmt);
+        }
+        return ExecResult{
+            .rows_affected = libmysql_c.mysql_stmt_affected_rows(stmt),
+            .last_insert_id = @intCast(libmysql_c.mysql_stmt_insert_id(stmt)),
+        };
+    }
+
+    /// Query via binary prepared statement. Returns `null` to signal formatQuery fallback.
+    fn queryViaStmt(self: *MySqlConn, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value) !?Rows {
+        const stmt = self.getCachedStmt(sql_str) catch return null;
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        mysqlBindParams(stmt, scratch.allocator(), args) catch return null;
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        if (libmysql_c.mysql_stmt_execute(stmt) != 0) {
+            const err_no = libmysql_c.mysql_stmt_errno(stmt);
+            const err_msg = std.mem.span(libmysql_c.mysql_stmt_error(stmt));
+            std.log.err("MySQL stmt_execute error: errno={d} msg={s}", .{ err_no, err_msg });
+            return mysqlErrnoToError(err_no);
+        }
+        if (libmysql_c.mysql_stmt_field_count(stmt) == 0) {
+            const empty = try arena.allocator().alloc(Row, 0);
+            return Rows{ .arena = arena, .rows = empty };
+        }
+        return try mysqlStmtReadRows(stmt, arena);
     }
 
     fn queryFn(ptr: *anyopaque, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value) errors.ResultT(Rows) {
@@ -1358,6 +1902,21 @@ pub const MySqlConn = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
 
+        // Zero-arg: skip prepare overhead.
+        if (args.len == 0) {
+            if (libmysql_c.mysql_real_query(self.mysql, @ptrCast(sql_str.ptr), @intCast(sql_str.len)) != 0) {
+                const err_no = libmysql_c.mysql_errno(self.mysql);
+                const err_msg = std.mem.span(libmysql_c.mysql_error(self.mysql));
+                std.log.err("MySQL query error: errno={d} msg={s}", .{ err_no, err_msg });
+                return mysqlErrnoToError(err_no);
+            }
+            return mysqlReadRowsAfterQuery(self.mysql, arena);
+        }
+
+        if (self.queryViaStmt(allocator, sql_str, args)) |maybe_rows| {
+            if (maybe_rows) |rows| return rows;
+        } else |err| return err;
+
         const query = formatQuery(self.allocator, sql_str, args) catch return error.DatabaseError;
         defer self.allocator.free(query);
 
@@ -1365,10 +1924,7 @@ pub const MySqlConn = struct {
             const err_no = libmysql_c.mysql_errno(self.mysql);
             const err_msg = std.mem.span(libmysql_c.mysql_error(self.mysql));
             std.log.err("MySQL query error: errno={d} msg={s}", .{ err_no, err_msg });
-            if (err_no == 1062 or err_no == 1586) { // duplicate entry / constraint
-                return error.ConstraintViolation;
-            }
-            return error.DatabaseError;
+            return mysqlErrnoToError(err_no);
         }
 
         return mysqlReadRowsAfterQuery(self.mysql, arena);
@@ -1377,17 +1933,28 @@ pub const MySqlConn = struct {
     fn execFn(ptr: *anyopaque, sql_str: []const u8, args: []const Value) errors.ResultT(ExecResult) {
         const self = @as(*MySqlConn, @ptrCast(@alignCast(ptr)));
         self.guard();
-        const query = formatQuery(self.allocator, sql_str, args) catch return error.DatabaseError;
-        defer self.allocator.free(query);
 
-        if (libmysql_c.mysql_real_query(self.mysql, @ptrCast(query.ptr), @intCast(query.len)) != 0) {
-            const err_no = libmysql_c.mysql_errno(self.mysql);
-            const err_msg = std.mem.span(libmysql_c.mysql_error(self.mysql));
-            std.log.err("MySQL exec error: errno={d} msg={s}", .{ err_no, err_msg });
-            if (err_no == 1062 or err_no == 1586) { // duplicate entry / constraint
-                return error.ConstraintViolation;
+        if (args.len == 0) {
+            if (libmysql_c.mysql_real_query(self.mysql, @ptrCast(sql_str.ptr), @intCast(sql_str.len)) != 0) {
+                const err_no = libmysql_c.mysql_errno(self.mysql);
+                const err_msg = std.mem.span(libmysql_c.mysql_error(self.mysql));
+                std.log.err("MySQL exec error: errno={d} msg={s}", .{ err_no, err_msg });
+                return mysqlErrnoToError(err_no);
             }
-            return error.DatabaseError;
+        } else {
+            if (self.execViaStmt(sql_str, args)) |maybe_res| {
+                if (maybe_res) |res| return res;
+            } else |err| return err;
+
+            const query = formatQuery(self.allocator, sql_str, args) catch return error.DatabaseError;
+            defer self.allocator.free(query);
+
+            if (libmysql_c.mysql_real_query(self.mysql, @ptrCast(query.ptr), @intCast(query.len)) != 0) {
+                const err_no = libmysql_c.mysql_errno(self.mysql);
+                const err_msg = std.mem.span(libmysql_c.mysql_error(self.mysql));
+                std.log.err("MySQL exec error: errno={d} msg={s}", .{ err_no, err_msg });
+                return mysqlErrnoToError(err_no);
+            }
         }
         // mysql_store_result returns NULL for DDL/DML (no result set). Only free if non-null.
         const res = libmysql_c.mysql_store_result(self.mysql);
@@ -1402,6 +1969,12 @@ pub const MySqlConn = struct {
     fn closeFn(ptr: *anyopaque) void {
         const self = @as(*MySqlConn, @ptrCast(@alignCast(ptr)));
         self.guard();
+        var it = self.stmt_cache.iterator();
+        while (it.next()) |entry| {
+            _ = libmysql_c.mysql_stmt_close(entry.value_ptr.*);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.stmt_cache.deinit();
         if (self.mysql) |mysql| {
             libmysql_c.mysql_close(mysql);
             self.mysql = null;
@@ -1614,7 +2187,7 @@ pub const PostgresStmt = struct {
                 .bool => |v| if (v) @as(?[*:0]const u8, @ptrCast("t")) else @ptrCast("f"),
             };
         }
-        const res = libpq_c.PQexecPrepared(self.conn, @ptrCast(self.name.ptr), @intCast(args.len), @ptrCast(paramValues.ptr), null, null, 0);
+        const res = libpq_c.PQexecPrepared(self.conn, @ptrCast(self.name.ptr), @intCast(args.len), @ptrCast(paramValues.ptr), null, null, PG_RESULT_BINARY);
         return res;
     }
 
@@ -1632,20 +2205,18 @@ pub const PostgresStmt = struct {
         const n_cols = libpq_c.PQnfields(res);
         var rows_list: std.ArrayList(Row) = std.ArrayList(Row).empty;
 
+        const shared_columns = arena_alloc.alloc([]const u8, @intCast(n_cols)) catch return error.DatabaseError;
+        for (0..@intCast(n_cols)) |c| {
+            const name = std.mem.span(libpq_c.PQfname(res, @intCast(c)));
+            shared_columns[c] = arena_alloc.dupe(u8, name) catch return error.DatabaseError;
+        }
+
         for (0..@intCast(n_rows)) |r| {
-            const columns = arena_alloc.alloc([]const u8, @intCast(n_cols)) catch return error.DatabaseError;
             const values = arena_alloc.alloc(?Value, @intCast(n_cols)) catch return error.DatabaseError;
             for (0..@intCast(n_cols)) |c| {
-                const name = std.mem.span(libpq_c.PQfname(res, @intCast(c)));
-                columns[c] = arena_alloc.dupe(u8, name) catch return error.DatabaseError;
-                if (libpq_c.PQgetisnull(res, @intCast(r), @intCast(c)) == 1) {
-                    values[c] = null;
-                } else {
-                    const val = std.mem.span(libpq_c.PQgetvalue(res, @intCast(r), @intCast(c)));
-                    values[c] = .{ .string = arena_alloc.dupe(u8, val) catch return error.DatabaseError };
-                }
+                values[c] = pgReadCell(arena_alloc, res, @intCast(r), @intCast(c)) catch return error.DatabaseError;
             }
-            rows_list.append(arena_alloc, .{ .arena = undefined, .columns = columns, .values = values }) catch return error.DatabaseError;
+            rows_list.append(arena_alloc, .{ .arena = undefined, .columns = shared_columns, .values = values }) catch return error.DatabaseError;
         }
         const rows_slice = arena_alloc.alloc(Row, rows_list.items.len) catch return error.DatabaseError;
         @memcpy(rows_slice, rows_list.items);
@@ -1698,42 +2269,75 @@ pub const PostgresStmt = struct {
 };
 
 pub const MySqlStmt = struct {
-    mysql: ?*libmysql_c.MYSQL,
-    sql: []const u8,
+    stmt: ?*libmysql_c.MYSQL_STMT,
     allocator: std.mem.Allocator,
 
     pub fn prepare(mysql: ?*libmysql_c.MYSQL, allocator: std.mem.Allocator, sql: []const u8) !MySqlStmt {
-        const sql_copy = try allocator.dupe(u8, sql);
-        return .{ .mysql = mysql, .sql = sql_copy, .allocator = allocator };
+        const stmt = libmysql_c.mysql_stmt_init(mysql) orelse return error.DatabaseError;
+        if (libmysql_c.mysql_stmt_prepare(stmt, @ptrCast(sql.ptr), @intCast(sql.len)) != 0) {
+            _ = libmysql_c.mysql_stmt_close(stmt);
+            return error.DatabaseError;
+        }
+        return .{ .stmt = stmt, .allocator = allocator };
     }
 
     fn queryFn(ptr: *anyopaque, allocator: std.mem.Allocator, args: []const Value) errors.ResultT(Rows) {
         const self = @as(*MySqlStmt, @ptrCast(@alignCast(ptr)));
+        const stmt = self.stmt orelse return error.DatabaseError;
+        _ = libmysql_c.mysql_stmt_reset(stmt);
+        _ = libmysql_c.mysql_stmt_free_result(stmt);
+
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        try mysqlBindParams(stmt, scratch.allocator(), args);
+
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
-
-        const query = formatQuery(self.allocator, self.sql, args) catch return error.DatabaseError;
-        defer self.allocator.free(query);
-        if (libmysql_c.mysql_real_query(self.mysql, @ptrCast(query.ptr), @intCast(query.len)) != 0) return error.DatabaseError;
-        return mysqlReadRowsAfterQuery(self.mysql, arena);
+        if (libmysql_c.mysql_stmt_execute(stmt) != 0) {
+            const err_no = libmysql_c.mysql_stmt_errno(stmt);
+            const err_msg = std.mem.span(libmysql_c.mysql_stmt_error(stmt));
+            std.log.err("MySQL stmt query error: errno={d} msg={s}", .{ err_no, err_msg });
+            return mysqlErrnoToError(err_no);
+        }
+        if (libmysql_c.mysql_stmt_field_count(stmt) == 0) {
+            const empty = try arena.allocator().alloc(Row, 0);
+            return Rows{ .arena = arena, .rows = empty };
+        }
+        return mysqlStmtReadRows(stmt, arena);
     }
 
     fn execFn(ptr: *anyopaque, args: []const Value) errors.ResultT(ExecResult) {
         const self = @as(*MySqlStmt, @ptrCast(@alignCast(ptr)));
-        const query = formatQuery(self.allocator, self.sql, args) catch return error.DatabaseError;
-        defer self.allocator.free(query);
-        if (libmysql_c.mysql_real_query(self.mysql, @ptrCast(query.ptr), @intCast(query.len)) != 0) return error.DatabaseError;
-        const res = libmysql_c.mysql_store_result(self.mysql);
-        if (res != null) libmysql_c.mysql_free_result(res);
+        const stmt = self.stmt orelse return error.DatabaseError;
+        _ = libmysql_c.mysql_stmt_reset(stmt);
+        _ = libmysql_c.mysql_stmt_free_result(stmt);
+
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        try mysqlBindParams(stmt, scratch.allocator(), args);
+
+        if (libmysql_c.mysql_stmt_execute(stmt) != 0) {
+            const err_no = libmysql_c.mysql_stmt_errno(stmt);
+            const err_msg = std.mem.span(libmysql_c.mysql_stmt_error(stmt));
+            std.log.err("MySQL stmt exec error: errno={d} msg={s}", .{ err_no, err_msg });
+            return mysqlErrnoToError(err_no);
+        }
+        if (libmysql_c.mysql_stmt_field_count(stmt) > 0) {
+            _ = libmysql_c.mysql_stmt_store_result(stmt);
+            _ = libmysql_c.mysql_stmt_free_result(stmt);
+        }
         return ExecResult{
-            .rows_affected = libmysql_c.mysql_affected_rows(self.mysql),
-            .last_insert_id = @intCast(libmysql_c.mysql_insert_id(self.mysql)),
+            .rows_affected = libmysql_c.mysql_stmt_affected_rows(stmt),
+            .last_insert_id = @intCast(libmysql_c.mysql_stmt_insert_id(stmt)),
         };
     }
 
     fn closeFn(ptr: *anyopaque) void {
         const self = @as(*MySqlStmt, @ptrCast(@alignCast(ptr)));
-        self.allocator.free(self.sql);
+        if (self.stmt) |s| {
+            _ = libmysql_c.mysql_stmt_close(s);
+            self.stmt = null;
+        }
         self.allocator.destroy(self);
     }
 
@@ -1829,46 +2433,55 @@ const ConnPool = struct {
     pub fn acquire(self: *ConnPool) !Conn {
         if (self.closed.load(.monotonic)) return error.ConnectionFailed;
 
-        self.mutex.lockUncancelable(self.io);
+        while (true) {
+            if (self.closed.load(.monotonic)) return error.ConnectionFailed;
 
-        // Try to get from idle pool
-        if (self.idle.items.len > 0) {
-            const conn = self.idle.pop().?;
-            self.mutex.unlock(self.io);
-            return conn;
-        }
+            self.mutex.lockUncancelable(self.io);
 
-        // Create new connection if under limit
-        const current_active = self.active.load(.monotonic);
-        if (current_active < self.max_open) {
-            _ = self.active.fetchAdd(1, .monotonic);
-            self.mutex.unlock(self.io);
-            const conn = self.client.newConn() catch {
-                _ = self.active.fetchSub(1, .monotonic);
-                return error.ConnectionFailed;
+            // Prefer idle connections — always ping before checkout.
+            if (self.idle.items.len > 0) {
+                const conn = self.idle.pop().?;
+                self.mutex.unlock(self.io);
+                conn.ping() catch {
+                    conn.close();
+                    _ = self.active.fetchSub(1, .monotonic);
+                    continue;
+                };
+                return conn;
+            }
+
+            // Create new connection if under limit
+            const current_active = self.active.load(.monotonic);
+            if (current_active < self.max_open) {
+                _ = self.active.fetchAdd(1, .monotonic);
+                self.mutex.unlock(self.io);
+                const conn = self.client.newConn() catch {
+                    _ = self.active.fetchSub(1, .monotonic);
+                    return error.ConnectionFailed;
+                };
+                return conn;
+            }
+
+            // Wait until a connection is released (honour max_wait_ms).
+            if (self.max_wait_ms == 0) {
+                self.mutex.unlock(self.io);
+                return error.Timeout;
+            }
+            const timeout: std.Io.Timeout = .{
+                .duration = .{
+                    .raw = .{ .nanoseconds = @as(i96, @intCast(self.max_wait_ms)) * 1_000_000 },
+                    .clock = .real,
+                },
             };
-            return conn;
-        }
-
-        // Wait for a connection to become available
-        while (self.idle.items.len == 0 and !self.closed.load(.monotonic)) {
-            self.cond.waitUncancelable(self.io, &self.mutex);
-        }
-
-        if (self.idle.items.len > 0) {
-            const conn = self.idle.pop().?;
-            self.mutex.unlock(self.io);
-            // final health check before returning
-            conn.ping() catch {
-                conn.close();
-                _ = self.active.fetchSub(1, .monotonic);
-                return error.PoolUnhealthy;
+            self.cond.waitTimeout(self.io, &self.mutex, timeout) catch |err| {
+                self.mutex.unlock(self.io);
+                return switch (err) {
+                    error.Timeout, error.Canceled => error.Timeout,
+                };
             };
-            return conn;
+            // Mutex re-acquired by waitTimeout; unlock and retry so ping path is shared.
+            self.mutex.unlock(self.io);
         }
-
-        self.mutex.unlock(self.io);
-        return error.Timeout;
     }
 
     pub fn release(self: *ConnPool, conn: Conn) void {
@@ -1947,8 +2560,8 @@ pub const Config = struct {
     password: []const u8 = "",
     sqlite_path: []const u8 = ":memory:",
     postgres_conninfo: []const u8 = "",
-    max_open_conns: u32 = 1,
-    max_idle_conns: u32 = 1,
+    max_open_conns: u32 = 8,
+    max_idle_conns: u32 = 4,
     max_wait_ms: u32 = 5000,
 };
 
@@ -2205,15 +2818,15 @@ pub const Client = struct {
         self.ensureBreaker();
         if (!self.cb.?.allow()) return error.CircuitBreakerOpen;
 
-        const t0 = 0;
+        const t0 = Time.monotonicNow();
         var rows = self.doQuery(sql_str, args) catch |err| {
-            const elapsed: u64 = @intCast(0 - t0);
+            const elapsed: u64 = @intCast(@max(@as(i64, 0), Time.monotonicNow() - t0));
             if (self.metrics_callback) |cb| cb(elapsed, sql_str, false, @errorName(err));
             if (!self.isAcceptable(err)) self.cb.?.recordFailure();
             return err;
         };
         for (rows.rows) |*row| row.arena = &rows.arena;
-        const elapsed: u64 = @intCast(0 - t0);
+        const elapsed: u64 = @intCast(@max(@as(i64, 0), Time.monotonicNow() - t0));
         if (self.metrics_callback) |cb| cb(elapsed, sql_str, true, null);
         self.cb.?.recordSuccess();
         return rows;
@@ -2239,14 +2852,14 @@ pub const Client = struct {
         self.ensureBreaker();
         if (!self.cb.?.allow()) return error.CircuitBreakerOpen;
 
-        const t0 = 0;
+        const t0 = Time.monotonicNow();
         const result = self.doExec(sql_str, args) catch |err| {
-            const elapsed: u64 = @intCast(0 - t0);
+            const elapsed: u64 = @intCast(@max(@as(i64, 0), Time.monotonicNow() - t0));
             if (self.metrics_callback) |cb| cb(elapsed, sql_str, false, @errorName(err));
             if (!self.isAcceptable(err)) self.cb.?.recordFailure();
             return err;
         };
-        const elapsed: u64 = @intCast(0 - t0);
+        const elapsed: u64 = @intCast(@max(@as(i64, 0), Time.monotonicNow() - t0));
         if (self.metrics_callback) |cb| cb(elapsed, sql_str, true, null);
         self.cb.?.recordSuccess();
         return result;
@@ -2359,20 +2972,7 @@ pub const Client = struct {
     pub fn queryRows(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
         var rows = try self.query(sql_str, args);
         defer rows.deinit();
-        // Fixup: Arena was on driver stack; now in caller's Rows. Update Row.arena pointers.
-        for (rows.rows) |*row| row.arena = &rows.arena;
-        // buildColumnIndices removed — linear scan fallback (v0.13.15)
-        const result = try self.allocator.alloc(T, rows.rows.len);
-        var scanned_count: usize = 0;
-        errdefer {
-            for (result[0..scanned_count]) |item| freeScanned(self.allocator, T, item);
-            self.allocator.free(result);
-        }
-        for (rows.rows, 0..) |row, i| {
-            result[i] = try scanStruct(self.allocator, T, row, false, null);
-            scanned_count += 1;
-        }
-        return result;
+        return scanRowsToSlice(self.allocator, T, &rows, false);
     }
 
     pub fn queryRowsCtx(self: *Client, ctx: SqlContext, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
@@ -2383,16 +2983,7 @@ pub const Client = struct {
     pub fn queryRowsPartial(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
         var rows = try self.query(sql_str, args);
         defer rows.deinit();
-        for (rows.rows) |*row| row.arena = &rows.arena;
-        const result = try self.allocator.alloc(T, rows.rows.len);
-        errdefer {
-            for (result) |item| freeScanned(self.allocator, T, item);
-            self.allocator.free(result);
-        }
-        for (rows.rows, 0..) |row, i| {
-            result[i] = try scanStruct(self.allocator, T, row, true, null);
-        }
-        return result;
+        return scanRowsToSlice(self.allocator, T, &rows, true);
     }
 
     pub fn queryRowsPartialCtx(self: *Client, ctx: SqlContext, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
@@ -2401,15 +2992,22 @@ pub const Client = struct {
     }
 
     /// Like queryRows but returns an owned QueryResult(T). Caller MUST `defer result.deinit(allocator)`.
+    /// Strings borrow the result arena (no per-field second copy).
     pub fn queryRowsOwned(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !QueryResult(T) {
-        const items = try self.queryRows(T, sql_str, args);
-        return .{ .items = items };
+        var rows = try self.query(sql_str, args);
+        return scanRowsToOwned(T, &rows, false) catch |err| {
+            rows.deinit();
+            return err;
+        };
     }
 
     /// Like queryRowsPartial but returns an owned QueryResult(T). Caller MUST `defer result.deinit(allocator)`.
     pub fn queryRowsPartialOwned(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !QueryResult(T) {
-        const items = try self.queryRowsPartial(T, sql_str, args);
-        return .{ .items = items };
+        var rows = try self.query(sql_str, args);
+        return scanRowsToOwned(T, &rows, true) catch |err| {
+            rows.deinit();
+            return err;
+        };
     }
 
     // TODO(v0.14): remove deinitQueryRows — use QueryResult(T).deinit() instead.
@@ -2457,8 +3055,14 @@ pub const Client = struct {
 
     /// Like findAll but returns an owned QueryResult(T). Caller MUST `defer result.deinit(allocator)`.
     pub fn findAllOwned(self: *Client, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) !QueryResult(T) {
-        const items = try self.findAll(T, table, where_clause, args);
-        return .{ .items = items };
+        try validateIdentifier(table);
+        if (where_clause) |w| try validateSqlFragment(w);
+        const sql = if (where_clause) |w|
+            try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s}", .{ table, w })
+        else
+            try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s}", .{table});
+        defer self.allocator.free(sql);
+        return self.queryRowsOwned(T, sql, args);
     }
 
     pub fn findAllCtx(self: *Client, ctx: SqlContext, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) ![]T {
@@ -2544,16 +3148,7 @@ pub const Transaction = struct {
     pub fn queryRows(self: *Transaction, allocator: std.mem.Allocator, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
         var rows = try self.query(allocator, sql_str, args);
         defer rows.deinit();
-        for (rows.rows) |*row| row.arena = &rows.arena;
-        const result = try allocator.alloc(T, rows.rows.len);
-        errdefer {
-            for (result) |item| freeScanned(allocator, T, item);
-            allocator.free(result);
-        }
-        for (rows.rows, 0..) |row, i| {
-            result[i] = try scanStruct(allocator, T, row, false, null);
-        }
-        return result;
+        return scanRowsToSlice(allocator, T, &rows, false);
     }
 
     pub fn prepare(self: *Transaction, allocator: std.mem.Allocator, sql_str: []const u8) !Stmt {
@@ -3575,6 +4170,53 @@ test "sqlite prepared statement" {
 test "sqlx value" {
     const v = Value{ .int = 42 };
     try std.testing.expectEqual(@as(i64, 42), v.int);
+}
+
+test "pgDecodeBinary scalars and uuid" {
+    const allocator = std.testing.allocator;
+
+    const b_true = try pgDecodeBinary(allocator, PgOid.bool_t, &[_]u8{1});
+    try std.testing.expect(b_true.bool);
+
+    var i2_buf: [2]u8 = undefined;
+    std.mem.writeInt(i16, &i2_buf, -7, .big);
+    const v_i2 = try pgDecodeBinary(allocator, PgOid.int2, &i2_buf);
+    try std.testing.expectEqual(@as(i64, -7), v_i2.int);
+
+    var i4_buf: [4]u8 = undefined;
+    std.mem.writeInt(i32, &i4_buf, 123456, .big);
+    const v_i4 = try pgDecodeBinary(allocator, PgOid.int4, &i4_buf);
+    try std.testing.expectEqual(@as(i64, 123456), v_i4.int);
+
+    var i8_buf: [8]u8 = undefined;
+    std.mem.writeInt(i64, &i8_buf, 9_007_199_254_740_991, .big);
+    const v_i8 = try pgDecodeBinary(allocator, PgOid.int8, &i8_buf);
+    try std.testing.expectEqual(@as(i64, 9_007_199_254_740_991), v_i8.int);
+
+    var f8_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &f8_buf, @as(u64, @bitCast(@as(f64, 3.5))), .big);
+    const v_f8 = try pgDecodeBinary(allocator, PgOid.float8, &f8_buf);
+    try std.testing.expectEqual(@as(f64, 3.5), v_f8.float);
+
+    const text = try pgDecodeBinary(allocator, PgOid.text, "hello");
+    defer allocator.free(text.string);
+    try std.testing.expectEqualStrings("hello", text.string);
+
+    const jsonb = try pgDecodeBinary(allocator, PgOid.jsonb, &[_]u8{ 1, '{', '}' });
+    defer allocator.free(jsonb.string);
+    try std.testing.expectEqualStrings("{}", jsonb.string);
+
+    const uuid_bytes = [_]u8{ 0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00 };
+    const uuid = try pgDecodeBinary(allocator, PgOid.uuid, &uuid_bytes);
+    defer allocator.free(uuid.string);
+    try std.testing.expectEqualStrings("550e8400-e29b-41d4-a716-446655440000", uuid.string);
+
+    // 2000-01-01 → days 0
+    var date_buf: [4]u8 = undefined;
+    std.mem.writeInt(i32, &date_buf, 0, .big);
+    const date = try pgDecodeBinary(allocator, PgOid.date, &date_buf);
+    defer allocator.free(date.string);
+    try std.testing.expectEqualStrings("2000-01-01", date.string);
 }
 
 test "postgres config init" {

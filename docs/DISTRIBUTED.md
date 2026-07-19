@@ -1,5 +1,7 @@
 # Distributed Modules — Production Readiness
 
+> Modulith day-one concurrency (single process, multi-instance, when to use RobustMQ): **[MODULITH.md](MODULITH.md)**.
+
 ## Status Overview
 
 All distributed modules are **Ready** for single-node testing and development.
@@ -8,12 +10,12 @@ For multi-node production, see the caveats below.
 | Module | Tests | Notes |
 |--------|:-----:|-------|
 | **FailureDetector** | 7 | Phi-accrual detector. Adaptive threshold. |
-| **KafkaConnector** | 7 | Producer/Consumer + wire format. Requires Kafka broker for full integration. |
+| **KafkaConnector** | 8+ | RobustMQ / Kafka TCP Produce+Fetch. Live test: `ROBUSTMQ_URL`/`KAFKA_BOOTSTRAP`. |
 | **SagaOrchestrator** | 6 | Auto-compensation with reverse-order rollback. |
 | **RaftElection** | 5 | Leader election + vote counting. Multi-candidate split-vote tested. |
 | **DistributedTransaction** | 4 | 2PC protocol (commit + abort). |
-| **ClusterMembership** | 4 | Gossip protocol + health checks. Join/leave/rejoin tested. |
-| **DistributedEventBus** | 3 | Cross-node pub/sub with heartbeat. |
+| **ClusterMembership** | 5 | Gossip over bus with `subscribeWithContext` (join/leave/heartbeat converge). |
+| **DistributedEventBus** | 3 | Cross-node pub/sub + soft backpressure (quarantine after send failures). |
 | **WAL** (eventbus/) | 2 | Write-ahead log. Zig 0.16 Io.Dir + binary serialization. |
 | **DLQ** (eventbus/) | 3 | Dead-letter queue. Expiry + requeue with cooldown. |
 | **Partitioner** | 3 | Consistent hash ring. Node add/remove + routing. |
@@ -22,16 +24,35 @@ For multi-node production, see the caveats below.
 
 ### Single-node: All modules are ready.
 
-### Multi-node (3-5 nodes):
-1. ✅ `ClusterMembership` — node discovery, gossip, health tracking
-2. ✅ `DistributedEventBus` — cross-node pub/sub
+### Multi-node (3-7 nodes):
+1. ✅ `ClusterMembership` — gossip converges via `DistributedEventBus.subscribeWithContext`
+2. ✅ `DistributedEventBus` — cross-node pub/sub with soft backpressure
 3. ✅ `RaftElection` — leader election (test with 3+ real nodes)
 4. ✅ `SagaOrchestrator` — compensation workflows
 5. ✅ `DistributedTransaction` — 2PC (add persistence for production durability)
-6. ✅ `KafkaConnector` — wire format ready (needs broker for full integration)
-7. 🔬 WAL/DLQ — add durability layer for event bus (requires Zig 0.16 fs API)
+6. ✅ `KafkaConnector` — Kafka wire client for **RobustMQ** (`initWithIo`, default `127.0.0.1:9092`)
+7. 🔬 WAL/DLQ — durability layer for event bus
 
-### Recommended cluster size: 3-5 nodes
+### Recommended cluster size: 3-7 nodes
+
+### RobustMQ messaging
+
+```zig
+var producer = zigmodu.KafkaProducer.initWithIo(allocator, io, .{
+    .bootstrap_servers = "127.0.0.1:9092", // RobustMQ Kafka listener
+    .client_id = "my-app",
+});
+defer producer.deinit();
+try producer.send(.{
+    .topic = "orders",
+    .key = null,
+    .value = payload,
+    .headers = &.{},
+    .timestamp = zigmodu.time.monotonicNowSeconds(),
+});
+```
+
+Live smoke test: `ROBUSTMQ_URL=127.0.0.1:9092 zig build test`
 
 ## Usage Example
 

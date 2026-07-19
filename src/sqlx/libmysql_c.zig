@@ -1,7 +1,12 @@
-//! MariaDB/MySQL C bindings (minimal)
+//! MariaDB/MySQL C bindings (minimal + prepared statements)
+//!
+//! MYSQL_BIND layout matches MariaDB Connector/C (`mariadb_stmt.h`), which
+//! build.zig prefers on macOS. Public field offsets align with MySQL 8 client
+//! for the members we set (length / is_null / buffer / buffer_type / …).
 
 pub const MYSQL = opaque {};
 pub const MYSQL_RES = opaque {};
+pub const MYSQL_STMT = opaque {};
 pub const MYSQL_ROW = ?[*]?[*]u8;
 pub const MYSQL_FIELD = extern struct {
     name: [*c]u8,
@@ -39,6 +44,40 @@ pub const MYSQL_TYPE_SHORT = 2;
 pub const MYSQL_TYPE_FLOAT = 4;
 pub const MYSQL_TYPE_BLOB = 252;
 
+/// MariaDB `my_bool` / C `_Bool` — 1 byte.
+pub const my_bool = u8;
+
+/// `MYSQL_NO_DATA` — mysql_stmt_fetch finished.
+pub const MYSQL_NO_DATA: c_int = 100;
+/// `MYSQL_DATA_TRUNCATED` — fetch indicated truncation.
+pub const MYSQL_DATA_TRUNCATED: c_int = 101;
+
+/// Prepared-statement bind buffer (MariaDB Connector/C layout).
+pub const MYSQL_BIND = extern struct {
+    length: ?*c_ulong = null,
+    is_null: ?*my_bool = null,
+    buffer: ?*anyopaque = null,
+    @"error": ?*my_bool = null,
+    u: extern union {
+        row_ptr: ?[*]u8,
+        indicator: ?[*]u8,
+    } = .{ .row_ptr = null },
+    store_param_func: ?*anyopaque = null,
+    fetch_result: ?*anyopaque = null,
+    skip_result: ?*anyopaque = null,
+    buffer_length: c_ulong = 0,
+    offset: c_ulong = 0,
+    length_value: c_ulong = 0,
+    flags: c_uint = 0,
+    pack_length: c_uint = 0,
+    buffer_type: c_int = 0,
+    error_value: my_bool = 0,
+    is_unsigned: my_bool = 0,
+    long_data_used: my_bool = 0,
+    is_null_value: my_bool = 0,
+    extension: ?*anyopaque = null,
+};
+
 pub extern "c" fn mysql_init(mysql: ?*MYSQL) ?*MYSQL;
 pub extern "c" fn mysql_real_connect(mysql: ?*MYSQL, host: [*c]const u8, user: [*c]const u8, passwd: [*c]const u8, db: [*c]const u8, port: c_uint, unix_socket: [*c]const u8, clientflag: c_ulong) ?*MYSQL;
 pub extern "c" fn mysql_close(sock: ?*MYSQL) void;
@@ -51,6 +90,7 @@ pub extern "c" fn mysql_fetch_lengths(res: ?*MYSQL_RES) [*c]c_ulong;
 pub extern "c" fn mysql_num_fields(res: ?*MYSQL_RES) c_uint;
 pub extern "c" fn mysql_num_rows(res: ?*MYSQL_RES) c_ulonglong;
 pub extern "c" fn mysql_fetch_field(res: ?*MYSQL_RES) ?*MYSQL_FIELD;
+pub extern "c" fn mysql_fetch_fields(res: ?*MYSQL_RES) ?[*]MYSQL_FIELD;
 pub extern "c" fn mysql_affected_rows(mysql: ?*MYSQL) c_ulonglong;
 pub extern "c" fn mysql_insert_id(mysql: ?*MYSQL) c_ulonglong;
 pub extern "c" fn mysql_error(mysql: ?*MYSQL) [*c]const u8;
@@ -61,3 +101,23 @@ pub extern "c" fn mysql_field_count(mysql: ?*MYSQL) c_uint;
 pub extern "c" fn mysql_autocommit(mysql: ?*MYSQL, auto_mode: bool) c_int;
 pub extern "c" fn mysql_commit(mysql: ?*MYSQL) c_int;
 pub extern "c" fn mysql_rollback(mysql: ?*MYSQL) c_int;
+
+// ---- Prepared statements ----
+pub extern "c" fn mysql_stmt_init(mysql: ?*MYSQL) ?*MYSQL_STMT;
+pub extern "c" fn mysql_stmt_prepare(stmt: ?*MYSQL_STMT, query: [*c]const u8, length: c_ulong) c_int;
+pub extern "c" fn mysql_stmt_bind_param(stmt: ?*MYSQL_STMT, bnd: [*]MYSQL_BIND) my_bool;
+pub extern "c" fn mysql_stmt_bind_result(stmt: ?*MYSQL_STMT, bnd: [*]MYSQL_BIND) my_bool;
+pub extern "c" fn mysql_stmt_execute(stmt: ?*MYSQL_STMT) c_int;
+pub extern "c" fn mysql_stmt_store_result(stmt: ?*MYSQL_STMT) c_int;
+pub extern "c" fn mysql_stmt_fetch(stmt: ?*MYSQL_STMT) c_int;
+pub extern "c" fn mysql_stmt_free_result(stmt: ?*MYSQL_STMT) my_bool;
+pub extern "c" fn mysql_stmt_close(stmt: ?*MYSQL_STMT) my_bool;
+pub extern "c" fn mysql_stmt_reset(stmt: ?*MYSQL_STMT) my_bool;
+pub extern "c" fn mysql_stmt_param_count(stmt: ?*MYSQL_STMT) c_ulong;
+pub extern "c" fn mysql_stmt_field_count(stmt: ?*MYSQL_STMT) c_uint;
+pub extern "c" fn mysql_stmt_affected_rows(stmt: ?*MYSQL_STMT) c_ulonglong;
+pub extern "c" fn mysql_stmt_insert_id(stmt: ?*MYSQL_STMT) c_ulonglong;
+pub extern "c" fn mysql_stmt_errno(stmt: ?*MYSQL_STMT) c_uint;
+pub extern "c" fn mysql_stmt_error(stmt: ?*MYSQL_STMT) [*c]const u8;
+pub extern "c" fn mysql_stmt_result_metadata(stmt: ?*MYSQL_STMT) ?*MYSQL_RES;
+pub extern "c" fn mysql_stmt_num_rows(stmt: ?*MYSQL_STMT) c_ulonglong;

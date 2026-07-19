@@ -1,7 +1,8 @@
-//! EXPERIMENTAL — gossip membership with local state tracking and failure
-//! detection. Bus subscription handling is a placeholder (`handleBusEvent`
-//! drops events because DistributedEventBus callbacks carry no context), so
-//! cross-node state convergence is NOT functional yet. Single-node use only.
+//! Cluster membership via gossip over DistributedEventBus.
+//!
+//! Uses `subscribeWithContext` so membership events update this node's table
+//! (join / heartbeat / leave / leader_election). Suitable for small clusters
+//! (documented guidance: 3–7 nodes) behind an external load balancer.
 
 const std = @import("std");
 const Time = @import("Time.zig");
@@ -22,8 +23,6 @@ pub const ClusterMembership = struct {
     failure_detector: ?*AccrualFailureDetector = null,
     nodes: std.StringHashMap(ClusterNode),
     is_running: bool,
-    gossip_thread: ?std.Thread,
-    health_check_thread: ?std.Thread,
     on_node_join_cb: ?*const fn ([]const u8, std.Io.net.IpAddress) void,
     on_node_leave_cb: ?*const fn ([]const u8) void,
     on_leader_change_cb: ?*const fn (?[]const u8) void,
@@ -94,8 +93,6 @@ pub const ClusterMembership = struct {
             .failure_detector = null,
             .nodes = nodes,
             .is_running = false,
-            .gossip_thread = null,
-            .health_check_thread = null,
             .on_node_join_cb = null,
             .on_node_leave_cb = null,
             .on_leader_change_cb = null,
@@ -125,6 +122,9 @@ pub const ClusterMembership = struct {
         self.* = undefined;
     }
 
+    /// Start membership: subscribe to gossip and announce join.
+    /// Drive periodic heartbeat/health via `runOnce()` (Zig 0.17 Io has no
+    /// blocking sleep; do not spawn OS threads with `std.Io.Mutex`).
     pub fn start(self: *Self, config: Config) !void {
         if (self.is_running) return;
 
@@ -133,11 +133,8 @@ pub const ClusterMembership = struct {
         self.node_timeout_ms = config.node_timeout_ms;
         self.is_running = true;
 
-        // Subscribe to bus events
-        try self.bus.subscribe("cluster.membership", handleBusEvent);
-
-        self.gossip_thread = try std.Thread.spawn(.{}, gossipLoop, .{self});
-        self.health_check_thread = try std.Thread.spawn(.{}, healthCheckLoop, .{self});
+        // Subscribe with context so gossip events mutate this instance.
+        try self.bus.subscribeWithContext("cluster.membership", @ptrCast(self), onBusEvent);
 
         // Announce join
         self.broadcastEvent(.join) catch |err| {
@@ -157,15 +154,7 @@ pub const ClusterMembership = struct {
 
         // Broadcast leave
         self.broadcastEvent(.leave) catch {};
-
-        if (self.gossip_thread) |t| {
-            t.join();
-            self.gossip_thread = null;
-        }
-        if (self.health_check_thread) |t| {
-            t.join();
-            self.health_check_thread = null;
-        }
+        self.bus.unsubscribeContext("cluster.membership", @ptrCast(self));
     }
 
     /// Run a single synchronous gossip + health check pass.
@@ -183,64 +172,48 @@ pub const ClusterMembership = struct {
         self.checkNodeHealth();
     }
 
-    fn gossipLoop(self: *Self) void {
-        while (self.is_running) {
-            // Record our own heartbeat for failure detection
-            if (self.failure_detector) |fd| {
-                fd.heartbeat(self.node_id) catch |err| {
-                    std.log.err("[ClusterMembership] Failed to record heartbeat: {}", .{err});
-                };
-            }
-            self.broadcastEvent(.heartbeat) catch |err| {
-                std.log.err("[ClusterMembership] Gossip error: {}", .{err});
-            };
-            // Note: Blocking sleep unavailable in Zig 0.16.0 sync context
-            break; // Exit in sync context
-        }
-    }
-
-    fn healthCheckLoop(self: *Self) void {
-        while (self.is_running) {
-            self.checkNodeHealth();
-            // Note: Blocking sleep unavailable in Zig 0.16.0 sync context
-            break; // Exit in sync context
-        }
-    }
-
     fn checkNodeHealth(self: *Self) void {
         const now = Time.monotonicNowSeconds();
         const timeout_secs = @divFloor(self.node_timeout_ms, 1000);
+        var should_broadcast_leader = false;
 
         self.mutex.lock(self.io) catch return;
-        defer self.mutex.unlock(self.io);
+        {
+            defer self.mutex.unlock(self.io);
 
-        var iter = self.nodes.iterator();
-        while (iter.next()) |entry| {
-            const node = entry.value_ptr;
-            if (std.mem.eql(u8, node.id, self.node_id)) continue; // Robust comparison
+            var iter = self.nodes.iterator();
+            while (iter.next()) |entry| {
+                const node = entry.value_ptr;
+                if (std.mem.eql(u8, node.id, self.node_id)) continue;
 
-            const elapsed = now - node.last_seen;
-            if (node.state == .healthy) {
-                const is_alive = if (self.failure_detector) |fd| fd.isAlive(node.id) else (elapsed <= timeout_secs);
-                if (!is_alive) {
-                    node.state = .suspect;
-                    std.log.warn("[Cluster] Node {s} suspect", .{node.id});
-                }
-            } else if (node.state == .suspect) {
-                const is_dead = if (self.failure_detector) |fd| !fd.isAlive(node.id) else (elapsed > timeout_secs * 2);
-                if (is_dead) {
-                    node.state = .failed;
-                    if (self.on_node_leave_cb) |cb| cb(node.id);
+                const elapsed = now - node.last_seen;
+                if (node.state == .healthy) {
+                    const is_alive = if (self.failure_detector) |fd| fd.isAlive(node.id) else (elapsed <= timeout_secs);
+                    if (!is_alive) {
+                        node.state = .suspect;
+                        std.log.warn("[Cluster] Node {s} suspect", .{node.id});
+                    }
+                } else if (node.state == .suspect) {
+                    const is_dead = if (self.failure_detector) |fd| !fd.isAlive(node.id) else (elapsed > timeout_secs * 2);
+                    if (is_dead) {
+                        node.state = .failed;
+                        if (self.on_node_leave_cb) |cb| cb(node.id);
 
-                    if (self.current_leader) |leader| {
-                        if (std.mem.eql(u8, leader, node.id)) {
-                            self.allocator.free(leader);
-                            self.current_leader = null;
-                            self.electLeaderLocked();
+                        if (self.current_leader) |leader| {
+                            if (std.mem.eql(u8, leader, node.id)) {
+                                self.allocator.free(leader);
+                                self.current_leader = null;
+                                should_broadcast_leader = self.electLeaderLocked();
+                            }
                         }
                     }
                 }
             }
+        }
+
+        // Never broadcast while holding mutex — publish invokes onBusEvent → handleGossipEvent.
+        if (should_broadcast_leader) {
+            self.broadcastEvent(.leader_election) catch {};
         }
     }
 
@@ -257,12 +230,53 @@ pub const ClusterMembership = struct {
         try self.bus.publish("cluster.membership", payload);
     }
 
-    fn handleBusEvent(event: DistributedEventBus.NetworkEvent) void {
-        _ = event;
-        // In a real implementation, parse the event and update node state
-        // For now, this is a placeholder since DistributedEventBus.subscribe
-        // takes a callback but doesn't pass context. In production, you'd use
-        // a context pointer or closure pattern.
+    fn onBusEvent(ctx: *anyopaque, event: DistributedEventBus.NetworkEvent) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        const gossip = parseGossipPayload(event.payload) orelse {
+            std.log.warn("[ClusterMembership] Ignoring malformed gossip payload from {s}", .{event.source_node});
+            return;
+        };
+        self.handleGossipEvent(gossip);
+    }
+
+    fn parseGossipPayload(payload: []const u8) ?GossipEvent {
+        // Payload format from broadcastEvent:
+        // {"t":N,"id":"...","h":"...","p":N,"ts":N}
+        const t = extractJsonInt(payload, "t") orelse return null;
+        const id = extractJsonString(payload, "id") orelse return null;
+        const host = extractJsonString(payload, "h") orelse return null;
+        const port_i = extractJsonInt(payload, "p") orelse return null;
+        const ts = extractJsonInt(payload, "ts") orelse return null;
+        if (t < 1 or t > 5) return null;
+        return .{
+            .event_type = @enumFromInt(@as(u8, @intCast(t))),
+            .node_id = id,
+            .host = host,
+            .port = @intCast(port_i),
+            .timestamp = ts,
+        };
+    }
+
+    fn extractJsonString(json: []const u8, key: []const u8) ?[]const u8 {
+        var key_buf: [32]u8 = undefined;
+        const needle = std.fmt.bufPrint(&key_buf, "\"{s}\":\"", .{key}) catch return null;
+        const pos = std.mem.indexOf(u8, json, needle) orelse return null;
+        const val_start = pos + needle.len;
+        const val_end = std.mem.indexOfScalarPos(u8, json, val_start, '"') orelse return null;
+        return json[val_start..val_end];
+    }
+
+    fn extractJsonInt(json: []const u8, key: []const u8) ?i64 {
+        var key_buf: [32]u8 = undefined;
+        const needle = std.fmt.bufPrint(&key_buf, "\"{s}\":", .{key}) catch return null;
+        const pos = std.mem.indexOf(u8, json, needle) orelse return null;
+        var i = pos + needle.len;
+        while (i < json.len and (json[i] == ' ' or json[i] == '\t')) : (i += 1) {}
+        var end = i;
+        if (end < json.len and json[end] == '-') end += 1;
+        while (end < json.len and json[end] >= '0' and json[end] <= '9') : (end += 1) {}
+        if (end == i) return null;
+        return std.fmt.parseInt(i64, json[i..end], 10) catch null;
     }
 
     pub fn handleGossipEvent(self: *Self, event: GossipEvent) void {
@@ -366,12 +380,21 @@ pub const ClusterMembership = struct {
     }
 
     pub fn electLeader(self: *Self) void {
-        self.mutex.lock(self.io) catch return;
-        defer self.mutex.unlock(self.io);
-        self.electLeaderLocked();
+        const should_broadcast = blk: {
+            self.mutex.lock(self.io) catch return;
+            defer self.mutex.unlock(self.io);
+            break :blk self.electLeaderLocked();
+        };
+        // broadcastEvent → publish → onBusEvent → handleGossipEvent locks mutex;
+        // Io.Mutex is not recursive — broadcast only after unlock.
+        if (should_broadcast) {
+            self.broadcastEvent(.leader_election) catch {};
+        }
     }
 
-    fn electLeaderLocked(self: *Self) void {
+    /// Update current_leader under lock. Returns true if caller should broadcast
+    /// `.leader_election` (this node is the new leader).
+    fn electLeaderLocked(self: *Self) bool {
         // Simple leader election: lowest node_id wins
         var leader_id: ?[]const u8 = null;
         var iter = self.nodes.iterator();
@@ -388,19 +411,17 @@ pub const ClusterMembership = struct {
                 if (self.current_leader) |old| {
                     self.allocator.free(old);
                 }
-                self.current_leader = self.allocator.dupe(u8, new_leader) catch return;
+                self.current_leader = self.allocator.dupe(u8, new_leader) catch return false;
                 std.log.info("[ClusterMembership] New leader elected: {s}", .{new_leader});
 
                 if (self.on_leader_change_cb) |cb| {
                     cb(self.current_leader);
                 }
 
-                // Broadcast leader election if we are the leader
-                if (std.mem.eql(u8, new_leader, self.node_id)) {
-                    self.broadcastEvent(.leader_election) catch {};
-                }
+                return std.mem.eql(u8, new_leader, self.node_id);
             }
         }
+        return false;
     }
 
     /// Set the failure detector for advanced health checking
@@ -434,18 +455,24 @@ pub const ClusterMembership = struct {
 // Tests
 // ========================================
 
-test "ClusterMembership initialization" {
+test "ClusterMembership bus gossip converges via subscribeWithContext" {
     const allocator = std.testing.allocator;
 
-    var bus = try DistributedEventBus.init(allocator, std.testing.io, "test-node");
+    var bus = try DistributedEventBus.init(allocator, std.testing.io, "bus-node");
     defer bus.deinit();
 
-    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 18081);
-    var cluster = try ClusterMembership.init(allocator, std.testing.io, "node-1", addr, &bus);
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 19001);
+    var cluster = try ClusterMembership.init(allocator, std.testing.io, "node-local", addr, &bus);
     defer cluster.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), cluster.getNodeCount());
-    try std.testing.expect(cluster.isLeader());
+    try cluster.start(.{});
+    defer cluster.stop();
+
+    // Simulate remote gossip arriving through the bus (same path as network receive).
+    try bus.publish("cluster.membership", "{\"t\":1,\"id\":\"node-remote\",\"h\":\"127.0.0.1\",\"p\":19002,\"ts\":1}");
+
+    try std.testing.expect(cluster.getNodeCount() >= 2);
+    try std.testing.expect(cluster.nodes.contains("node-remote"));
 }
 
 test "ClusterMembership leader election" {

@@ -30,6 +30,7 @@ src/root.zig          → Application, EventBus, deprecated flat aliases (v0.14.
 3. `std.time.milliTimestamp()` → `Time.monotonicNowMilliseconds()`
 4. `file.writeAll(x)` → `file.writeStreamingAll(io, x)`
 5. Request headers are **lowercase** in `Context.headers` — use `"authorization"`, not `"Authorization"`
+6. `std.hash.crc.Crc32Iscsi` → `std.hash.crc.@"CRC-32/ISCSI"` (Zig 0.17-dev≈1422+; Kafka CRC-32C)
 
 ## Code Generation Rules
 - Module: `pub const info = zmodu.api.Module{...}` + `init() !void` + `deinit() void`
@@ -46,6 +47,8 @@ src/api/Middleware.zig   (~500L) — cors, jwtAuth, csrf, requestId, recover
 src/sqlx/sqlx.zig       (~3300L) — Client, ConnPool, PG/MySQL/SQLite
 src/Application.zig      (~540L) — builder, run(), graceful shutdown
 docs/PRODUCTION_ROADMAP.md — production phases + monolith boundaries
+docs/MODULE_LAYERS.md — model / persistence.Tx / service Cmd (tenant-shop reference)
+docs/MODULITH.md — day-one modulith + high-concurrency practices
 ```
 
 ## Examples

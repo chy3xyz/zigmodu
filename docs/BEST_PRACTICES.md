@@ -1,9 +1,13 @@
 # ZigModu 最佳实践指南 (Best Practices Guide)
 
+> **Modulith 从第一天怎么写高并发应用**：见专文 [MODULITH.md](MODULITH.md)（边界、fiber、池化、规模阶梯、反模式）。  
+> **model / persistence / service / Tx 分层**：见专文 [MODULE_LAYERS.md](MODULE_LAYERS.md)（参考实现 `examples/tenant-shop`）。
+
 ## 📋 目录 (Table of Contents)
 
 - [渐进式架构演进路线图](#渐进式架构演进路线图)
 - [模块设计原则](#模块设计原则)
+- [领域分层（摘要）](#领域分层摘要)
 - [代码质量规范](#代码质量规范)
 - [错误处理](#错误处理)
 - [内存管理](#内存管理)
@@ -17,7 +21,20 @@
 
 ZigModu 核心设计理念：**从单体部署到分布式集群，随着用户规模增长平滑演进**。
 
-本节描述用户量增长驱动的架构演进，框架能力随阶段自动解锁。
+**起步请先读** [MODULITH.md](MODULITH.md) 与 [MODULE_LAYERS.md](MODULE_LAYERS.md)：五文件模块边界、Tx 工作单元、Day-1 连接池/Outbox、以及何时才拆独立进程。本节描述用户量增长驱动的架构演进，框架能力随阶段自动解锁。
+
+---
+
+### 领域分层（摘要）
+
+| 层 | 要点 |
+|----|------|
+| model | 行形状；状态枚举；不写 SQL |
+| persistence | `Persistence(Backend)` CRUD；同事务用 `pub const Tx` |
+| service | Cmd/Result；`beginTx` 编排 Tx；同事务写 outbox |
+| api/BFF | 解析与 JSON；禁止 SQL |
+
+完整规则与 `tenant-shop` 对照表 → **[MODULE_LAYERS.md](MODULE_LAYERS.md)**。
 
 ---
 

@@ -17,7 +17,7 @@ pub const DistributedEventBus = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     local_bus: TypedEventBus(NetworkEvent),
-    topic_callbacks: std.StringHashMap(std.ArrayList(*const fn (NetworkEvent) void)),
+    topic_callbacks: std.StringHashMap(std.ArrayList(TopicHandler)),
     nodes: ArrayList(Node),
     listener: ?std.Io.net.Server,
     is_running: bool,
@@ -31,6 +31,9 @@ pub const DistributedEventBus = struct {
     wal: ?*WAL = null,
     dlq: ?*DLQ = null,
 
+    /// Soft backpressure: skip fan-out after this many consecutive send failures per node.
+    max_send_failures: u32 = 8,
+
     pub const NetworkEvent = struct {
         topic: []const u8,
         payload: []const u8,
@@ -38,11 +41,28 @@ pub const DistributedEventBus = struct {
         timestamp: i64,
     };
 
+    /// Topic subscription handler — plain fn or context-carrying callback.
+    pub const TopicHandler = union(enum) {
+        plain: *const fn (NetworkEvent) void,
+        with_ctx: struct {
+            ctx: *anyopaque,
+            func: *const fn (*anyopaque, NetworkEvent) void,
+        },
+
+        fn invoke(self: TopicHandler, event: NetworkEvent) void {
+            switch (self) {
+                .plain => |f| f(event),
+                .with_ctx => |w| w.func(w.ctx, event),
+            }
+        }
+    };
+
     const Node = struct {
         id: []const u8,
         address: std.Io.net.IpAddress,
         socket: ?std.Io.net.Stream,
         last_seen: i64,
+        send_failures: u32 = 0,
     };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, node_id: []const u8) !Self {
@@ -52,7 +72,7 @@ pub const DistributedEventBus = struct {
             .allocator = allocator,
             .io = io,
             .local_bus = TypedEventBus(NetworkEvent).init(allocator),
-            .topic_callbacks = std.StringHashMap(std.ArrayList(*const fn (NetworkEvent) void)).init(allocator),
+            .topic_callbacks = std.StringHashMap(std.ArrayList(TopicHandler)).init(allocator),
             .nodes = ArrayList(Node).init(allocator),
             .listener = null,
             .is_running = false,
@@ -264,14 +284,28 @@ pub const DistributedEventBus = struct {
         var buf: [4096]u8 = undefined;
         const serialized = serializeEvent(event, &buf);
 
-        // Broadcast to all nodes
+        // Broadcast to all nodes with soft backpressure on failing sockets
         for (self.nodes.items) |*node| {
+            if (node.send_failures >= self.max_send_failures) continue;
             if (node.socket) |sock| {
                 var write_buf: [4096]u8 = undefined;
                 var w = sock.writer(self.io, &write_buf);
-                _ = w.interface.writeAll(serialized) catch |err| {
-                    std.log.err("[DistributedEventBus] Failed to send to node {s}: {}", .{ node.id, err });
+                w.interface.writeAll(serialized) catch |err| {
+                    node.send_failures += 1;
+                    std.log.err("[DistributedEventBus] Failed to send to node {s} (failures={d}): {}", .{ node.id, node.send_failures, err });
+                    if (node.send_failures >= self.max_send_failures) {
+                        std.log.warn("[DistributedEventBus] Quarantining node {s} after {d} send failures", .{ node.id, node.send_failures });
+                        sock.close(self.io);
+                        node.socket = null;
+                    }
+                    continue;
                 };
+                w.interface.flush() catch |err| {
+                    node.send_failures += 1;
+                    std.log.err("[DistributedEventBus] Flush to node {s} failed: {}", .{ node.id, err });
+                    continue;
+                };
+                node.send_failures = 0;
             }
         }
         // Also publish locally
@@ -281,34 +315,65 @@ pub const DistributedEventBus = struct {
 
     fn publishToTopic(self: *Self, event: NetworkEvent) void {
         if (self.topic_callbacks.get(event.topic)) |callbacks| {
-            for (callbacks.items) |callback| {
-                callback(event);
+            for (callbacks.items) |handler| {
+                handler.invoke(event);
             }
         }
     }
 
-    /// Subscribe to events on a specific topic
+    /// Subscribe to events on a specific topic (no context).
     pub fn subscribe(self: *Self, topic: []const u8, callback: *const fn (NetworkEvent) void) !void {
+        try self.subscribeHandler(topic, .{ .plain = callback });
+    }
+
+    /// Subscribe with an opaque context pointer — used by ClusterMembership etc.
+    pub fn subscribeWithContext(
+        self: *Self,
+        topic: []const u8,
+        ctx: *anyopaque,
+        callback: *const fn (*anyopaque, NetworkEvent) void,
+    ) !void {
+        try self.subscribeHandler(topic, .{ .with_ctx = .{ .ctx = ctx, .func = callback } });
+    }
+
+    fn subscribeHandler(self: *Self, topic: []const u8, handler: TopicHandler) !void {
         const topic_copy = try self.allocator.dupe(u8, topic);
         errdefer self.allocator.free(topic_copy);
 
         const gop = try self.topic_callbacks.getOrPut(topic_copy);
         if (!gop.found_existing) {
             gop.key_ptr.* = topic_copy;
-            gop.value_ptr.* = std.ArrayList(*const fn (NetworkEvent) void).empty;
+            gop.value_ptr.* = std.ArrayList(TopicHandler).empty;
         } else {
             self.allocator.free(topic_copy);
         }
-        try gop.value_ptr.append(self.allocator, callback);
+        try gop.value_ptr.append(self.allocator, handler);
     }
 
-    /// Unsubscribe from a topic
+    /// Unsubscribe a plain callback from a topic
     pub fn unsubscribe(self: *Self, topic: []const u8, callback: *const fn (NetworkEvent) void) void {
         if (self.topic_callbacks.getPtr(topic)) |callbacks| {
-            for (callbacks.items, 0..) |cb, i| {
-                if (cb == callback) {
-                    _ = callbacks.swapRemove(i);
-                    break;
+            for (callbacks.items, 0..) |h, i| {
+                switch (h) {
+                    .plain => |f| if (f == callback) {
+                        _ = callbacks.swapRemove(i);
+                        return;
+                    },
+                    .with_ctx => {},
+                }
+            }
+        }
+    }
+
+    pub fn unsubscribeContext(self: *Self, topic: []const u8, ctx: *anyopaque) void {
+        if (self.topic_callbacks.getPtr(topic)) |callbacks| {
+            for (callbacks.items, 0..) |h, i| {
+                switch (h) {
+                    .with_ctx => |w| if (w.ctx == ctx) {
+                        _ = callbacks.swapRemove(i);
+                        return;
+                    },
+                    .plain => {},
                 }
             }
         }

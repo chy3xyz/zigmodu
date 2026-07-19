@@ -170,6 +170,117 @@ fn structToBackendArgsWithId(comptime B: type, comptime T: type, allocator: std.
 // For camelCase models, sql_cols are snake_case (actual DB columns), fields are camelCase.
 // SELECT uses "sql_col AS field" so Row.scan matches struct field names.
 
+fn comptimeColumnList(comptime sql_cols: []const []const u8, comptime fields: []const []const u8, comptime camel: bool) []const u8 {
+    comptime {
+        var result: []const u8 = "";
+        for (sql_cols, 0..) |col, i| {
+            if (i > 0) result = result ++ ", ";
+            result = result ++ col;
+            if (camel and !std.mem.eql(u8, col, fields[i])) {
+                result = result ++ " AS \"" ++ fields[i] ++ "\"";
+            }
+        }
+        return result;
+    }
+}
+
+fn comptimeSelectById(
+    comptime table: []const u8,
+    comptime sql_cols: []const []const u8,
+    comptime fields: []const []const u8,
+    comptime pk: []const u8,
+    comptime camel: bool,
+) []const u8 {
+    return "SELECT " ++ comptimeColumnList(sql_cols, fields, camel) ++ " FROM " ++ table ++ " WHERE " ++ pk ++ " = ?";
+}
+
+fn comptimeSelectAll(
+    comptime table: []const u8,
+    comptime sql_cols: []const []const u8,
+    comptime fields: []const []const u8,
+    comptime camel: bool,
+) []const u8 {
+    return "SELECT " ++ comptimeColumnList(sql_cols, fields, camel) ++ " FROM " ++ table;
+}
+
+fn comptimeCount(comptime table: []const u8) []const u8 {
+    return "SELECT COUNT(*) AS count FROM " ++ table;
+}
+
+fn comptimeSelectPage(
+    comptime table: []const u8,
+    comptime sql_cols: []const []const u8,
+    comptime fields: []const []const u8,
+    comptime camel: bool,
+) []const u8 {
+    return "SELECT " ++ comptimeColumnList(sql_cols, fields, camel) ++ " FROM " ++ table ++ " LIMIT ? OFFSET ?";
+}
+
+fn comptimeSkipInsertField(comptime fname: []const u8) bool {
+    return std.mem.eql(u8, fname, "id") or
+        std.mem.eql(u8, fname, "create_time") or
+        std.mem.eql(u8, fname, "update_time") or
+        std.mem.eql(u8, fname, "creator") or
+        std.mem.eql(u8, fname, "updater") or
+        std.mem.eql(u8, fname, "deleted");
+}
+
+fn comptimeInsertArgCount(comptime fields: []const []const u8) usize {
+    @setEvalBranchQuota(100_000);
+    comptime {
+        var n: usize = 0;
+        for (fields) |fname| {
+            if (!comptimeSkipInsertField(fname)) n += 1;
+        }
+        return n;
+    }
+}
+
+fn comptimeInsert(
+    comptime table: []const u8,
+    comptime sql_cols: []const []const u8,
+    comptime fields: []const []const u8,
+) []const u8 {
+    comptime {
+        var cols: []const u8 = "";
+        var placeholders: []const u8 = "";
+        var first = true;
+        for (fields, 0..) |fname, i| {
+            if (comptimeSkipInsertField(fname)) continue;
+            if (!first) {
+                cols = cols ++ ", ";
+                placeholders = placeholders ++ ", ";
+            }
+            first = false;
+            cols = cols ++ sql_cols[i];
+            placeholders = placeholders ++ "?";
+        }
+        return "INSERT INTO " ++ table ++ " (" ++ cols ++ ") VALUES (" ++ placeholders ++ ")";
+    }
+}
+
+fn comptimeUpdate(
+    comptime table: []const u8,
+    comptime sql_cols: []const []const u8,
+    comptime pk: []const u8,
+) []const u8 {
+    comptime {
+        var set_clause: []const u8 = "";
+        var first = true;
+        for (sql_cols) |col| {
+            if (std.mem.eql(u8, col, pk)) continue;
+            if (!first) set_clause = set_clause ++ ", ";
+            first = false;
+            set_clause = set_clause ++ col ++ " = ?";
+        }
+        return "UPDATE " ++ table ++ " SET " ++ set_clause ++ " WHERE " ++ pk ++ " = ?";
+    }
+}
+
+fn comptimeDelete(comptime table: []const u8, comptime pk: []const u8) []const u8 {
+    return "DELETE FROM " ++ table ++ " WHERE " ++ pk ++ " = ?";
+}
+
 fn appendColumnList(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, sql_cols: []const []const u8, fields: []const []const u8, camel: bool) !void {
     for (sql_cols, 0..) |col, i| {
         if (i > 0) try buf.appendSlice(allocator, ", ");
@@ -259,6 +370,9 @@ pub fn PageResult(comptime T: type) type {
         size: usize,
         total: usize,
         total_page: usize,
+        /// When set, owns string data (and items slice) via QueryResult arena transfer.
+        /// Skips JSON serialization (contains comptime-only Allocator).
+        arena: ?std.heap.ArenaAllocator = null,
 
         /// Returns true if there is a previous page.
         pub fn hasPrevious(self: *const @This()) bool {
@@ -270,10 +384,35 @@ pub fn PageResult(comptime T: type) type {
             return self.page < self.total_page;
         }
 
-        /// Free all string fields in items and the items slice itself.
-        pub fn deinit(self: *const @This(), allocator: std.mem.Allocator) void {
+        /// Custom JSON serialization: skips the internal `arena` field
+        /// (which holds a comptime-only std.mem.Allocator) so `jsonStruct`
+        /// works under Zig 0.17's stricter comptime checks.
+        pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
+            try jws.beginObject();
+            try jws.objectField("items");
+            try jws.write(self.items);
+            try jws.objectField("page");
+            try jws.write(self.page);
+            try jws.objectField("size");
+            try jws.write(self.size);
+            try jws.objectField("total");
+            try jws.write(self.total);
+            try jws.objectField("total_page");
+            try jws.write(self.total_page);
+            try jws.endObject();
+        }
+
+        /// Free owned memory (arena preferred; else per-string freeScanned).
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            if (self.arena) |*a| {
+                a.deinit();
+                self.arena = null;
+                self.items = &.{};
+                return;
+            }
             for (self.items) |item| sqlx.freeScanned(allocator, T, item);
             allocator.free(self.items);
+            self.items = &.{};
         }
     };
 }
@@ -313,106 +452,118 @@ pub fn Orm(comptime B: type) type {
                 orm: *Self,
 
                 pub fn findById(self: @This(), id: anytype) !?T {
-                    const sql = try buildSelectById(self.orm.backend.allocator, meta.table_name, meta.sql_columns, meta.fields, meta.primary_key, meta.camel_case);
-                    defer self.orm.backend.allocator.free(sql);
-                    const args = try self.orm.backend.allocator.alloc(B.Value, 1);
-                    defer self.orm.backend.allocator.free(args);
-                    args[0] = B.fromOrmValue(toOrmValue(id));
-                    return self.orm.backend.queryRow(T, sql, args);
+                    const sql = comptime comptimeSelectById(meta.table_name, meta.sql_columns, meta.fields, meta.primary_key, meta.camel_case);
+                    var args = [_]B.Value{B.fromOrmValue(toOrmValue(id))};
+                    return self.orm.backend.queryRow(T, sql, &args);
                 }
 
                 pub fn findAll(self: @This()) !sqlx.QueryResult(T) {
-                    const sql = try buildSelectAll(self.orm.backend.allocator, meta.table_name, meta.sql_columns, meta.fields, meta.camel_case);
-                    defer self.orm.backend.allocator.free(sql);
+                    const sql = comptime comptimeSelectAll(meta.table_name, meta.sql_columns, meta.fields, meta.camel_case);
                     return self.orm.backend.queryRows(T, sql, &.{});
                 }
 
                 pub fn count(self: @This()) !usize {
-                    const sql = try buildCount(self.orm.backend.allocator, meta.table_name);
-                    defer self.orm.backend.allocator.free(sql);
+                    const sql = comptime comptimeCount(meta.table_name);
                     const result = try self.orm.backend.queryRow(struct { count: i64 }, sql, &.{});
                     return @intCast(result.?.count);
                 }
 
                 pub fn findPage(self: @This(), page: usize, size: usize) !PageResult(T) {
-                    const sql = try buildSelectPage(self.orm.backend.allocator, meta.table_name, meta.sql_columns, meta.fields, page, size, meta.camel_case);
-                    defer self.orm.backend.allocator.free(sql);
-                    const result = try self.orm.backend.queryRows(T, sql, &.{});
+                    const sql = comptime comptimeSelectPage(meta.table_name, meta.sql_columns, meta.fields, meta.camel_case);
+                    const offset: i64 = if (page > 0) @intCast((page - 1) * size) else 0;
+                    var args = [_]B.Value{
+                        B.fromOrmValue(.{ .int = @intCast(size) }),
+                        B.fromOrmValue(.{ .int = offset }),
+                    };
+                    var result = try self.orm.backend.queryRows(T, sql, &args);
+                    const owned = result.take();
                     const total = try self.count();
                     const total_page = if (size > 0) (total + size - 1) / size else 0;
-                    return .{ .items = result.items, .page = page, .size = size, .total = total, .total_page = total_page };
+                    return .{
+                        .items = owned.items,
+                        .arena = owned.arena,
+                        .page = page,
+                        .size = size,
+                        .total = total,
+                        .total_page = total_page,
+                    };
                 }
 
                 /// Filtered pagination with custom WHERE clause and args.
                 /// `where_sql` must not contain string literals/comments/`;` —
                 /// pass values via `?` placeholders + `args` (see sqlx.validateSqlFragment).
+                /// LIMIT/OFFSET are appended as bound parameters (portable across SQLite/PG/MySQL).
                 pub fn findPageFiltered(self: @This(), alloc: std.mem.Allocator, where_sql: []const u8, args: []const B.Value, page: usize, size: usize) !PageResult(T) {
                     try sqlx.validateSqlFragment(where_sql);
-                    const count_sql = try std.fmt.allocPrint(alloc, "SELECT COUNT(*) as count FROM {s} {s}", .{ meta.table_name, where_sql });
+                    const col_list = comptime comptimeColumnList(meta.sql_columns, meta.fields, meta.camel_case);
+
+                    const count_sql = try std.fmt.allocPrint(alloc, "SELECT COUNT(*) AS count FROM {s} {s}", .{ meta.table_name, where_sql });
                     defer alloc.free(count_sql);
                     const count_row = try self.orm.backend.queryRow(struct { count: i64 }, count_sql, args);
                     const total: usize = if (count_row) |c| @intCast(c.count) else 0;
 
-                    const offset = if (page > 0) (page - 1) * size else 0;
-                    const data_sql = try std.fmt.allocPrint(alloc, "SELECT * FROM {s} {s} ORDER BY {s} DESC LIMIT {d},{d}", .{ meta.table_name, where_sql, meta.primary_key, offset, size });
+                    const offset: i64 = if (page > 0) @intCast((page - 1) * size) else 0;
+                    const data_sql = try std.fmt.allocPrint(
+                        alloc,
+                        "SELECT {s} FROM {s} {s} ORDER BY {s} DESC LIMIT ? OFFSET ?",
+                        .{ col_list, meta.table_name, where_sql, meta.primary_key },
+                    );
                     defer alloc.free(data_sql);
-                    const result = try self.orm.backend.queryRows(T, data_sql, args);
+
+                    const all_args = try alloc.alloc(B.Value, args.len + 2);
+                    defer alloc.free(all_args);
+                    if (args.len > 0) @memcpy(all_args[0..args.len], args);
+                    all_args[args.len] = B.fromOrmValue(.{ .int = @intCast(size) });
+                    all_args[args.len + 1] = B.fromOrmValue(.{ .int = offset });
+
+                    var result = try self.orm.backend.queryRows(T, data_sql, all_args);
+                    const owned = result.take();
                     const total_page = if (size > 0) (total + size - 1) / size else 0;
-                    return .{ .items = result.items, .page = page, .size = size, .total = total, .total_page = total_page };
+                    return .{
+                        .items = owned.items,
+                        .arena = owned.arena,
+                        .page = page,
+                        .size = size,
+                        .total = total,
+                        .total_page = total_page,
+                    };
                 }
 
                 pub fn insert(self: @This(), entity: T) !T {
-                    // Skip id column (auto-generated) when building INSERT
-                    const alloc = self.orm.backend.allocator;
-                    const cols = meta.sql_columns;
-                    const info = @typeInfo(T).@"struct";
-                    var sql_buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
-                    defer sql_buf.deinit(alloc);
-                    try sql_buf.appendSlice(alloc, "INSERT INTO ");
-                    try sql_buf.appendSlice(alloc, meta.table_name);
-                    try sql_buf.appendSlice(alloc, " (");
-                    var arg_list: std.ArrayList(B.Value) = std.ArrayList(B.Value).empty;
-                    defer arg_list.deinit(alloc);
-                    var first = true;
-                    inline for (info.field_names, 0..) |fname, i| {
-                        if (comptime std.mem.eql(u8, fname, "id")) continue;
-                        if (comptime std.mem.eql(u8, fname, "create_time")) continue;
-                        if (comptime std.mem.eql(u8, fname, "update_time")) continue;
-                        if (comptime std.mem.eql(u8, fname, "creator")) continue;
-                        if (comptime std.mem.eql(u8, fname, "updater")) continue;
-                        if (comptime std.mem.eql(u8, fname, "deleted")) continue;
-                        if (!first) try sql_buf.appendSlice(alloc, ", ");
-                        first = false;
-                        try sql_buf.appendSlice(alloc, cols[i]);
-                        try arg_list.append(alloc, fieldToBackendValue(B, @field(entity, fname)));
+                    const sql = comptime comptimeInsert(meta.table_name, meta.sql_columns, meta.fields);
+                    const n = comptime comptimeInsertArgCount(meta.fields);
+                    var args: [n]B.Value = undefined;
+                    var idx: usize = 0;
+                    inline for (@typeInfo(T).@"struct".field_names) |fname| {
+                        if (comptime comptimeSkipInsertField(fname)) continue;
+                        args[idx] = fieldToBackendValue(B, @field(entity, fname));
+                        idx += 1;
                     }
-                    try sql_buf.appendSlice(alloc, ") VALUES (");
-                    for (0..arg_list.items.len) |j| {
-                        if (j > 0) try sql_buf.appendSlice(alloc, ", ");
-                        try sql_buf.appendSlice(alloc, "?");
-                    }
-                    try sql_buf.appendSlice(alloc, ")");
-                    const sql = try alloc.dupe(u8, sql_buf.items);
-                    defer alloc.free(sql);
-                    _ = try self.orm.backend.exec(sql, arg_list.items);
+                    _ = try self.orm.backend.exec(sql, args[0..idx]);
                     return entity;
                 }
 
                 pub fn update(self: @This(), entity: T) !void {
-                    const sql = try buildUpdate(self.orm.backend.allocator, meta.table_name, meta.sql_columns, meta.primary_key);
-                    defer self.orm.backend.allocator.free(sql);
-                    const args = try structToBackendArgsWithId(B, T, self.orm.backend.allocator, entity, meta.primary_key);
-                    defer self.orm.backend.allocator.free(args);
-                    _ = try self.orm.backend.exec(sql, args);
+                    const sql = comptime comptimeUpdate(meta.table_name, meta.sql_columns, meta.primary_key);
+                    const n = @typeInfo(T).@"struct".field_names.len;
+                    var args: [n]B.Value = undefined;
+                    var idx: usize = 0;
+                    inline for (@typeInfo(T).@"struct".field_names) |fname| {
+                        const is_pk = comptime std.mem.eql(u8, fname, meta.primary_key);
+                        if (!is_pk) {
+                            args[idx] = fieldToBackendValue(B, @field(entity, fname));
+                            idx += 1;
+                        }
+                    }
+                    args[idx] = fieldToBackendValue(B, @field(entity, meta.primary_key));
+                    idx += 1;
+                    _ = try self.orm.backend.exec(sql, args[0..idx]);
                 }
 
                 pub fn delete(self: @This(), id: anytype) !void {
-                    const sql = try buildDelete(self.orm.backend.allocator, meta.table_name, meta.primary_key);
-                    defer self.orm.backend.allocator.free(sql);
-                    const args = try self.orm.backend.allocator.alloc(B.Value, 1);
-                    defer self.orm.backend.allocator.free(args);
-                    args[0] = B.fromOrmValue(toOrmValue(id));
-                    _ = try self.orm.backend.exec(sql, args);
+                    const sql = comptime comptimeDelete(meta.table_name, meta.primary_key);
+                    var args = [_]B.Value{B.fromOrmValue(toOrmValue(id))};
+                    _ = try self.orm.backend.exec(sql, &args);
                 }
 
                 pub fn transact(self: @This(), comptime R: type, fn_tx: *const fn (*Tx(B)) anyerror!R) !R {

@@ -41,7 +41,7 @@ defer app.stop();
 | `ArrayList(T).init(alloc)` | `ArrayList(T).empty` + pass allocator to each method |
 | `file.writeAll(data)` | `file.writeStreamingAll(io, data)` |
 | `buf.writer(allocator)` | `allocPrint + appendSlice` pattern |
-| `std.crypto.random.bytes()` | DELETED — use multi-source seed + Csprng |
+| `std.hash.crc.Crc32Iscsi` | `std.hash.crc.@"CRC-32/ISCSI"` (0.17-dev≈1422+); use `@hasDecl` shim if supporting both |
 
 ### Zig 0.17.0 — patterns to USE
 ```zig
@@ -169,6 +169,8 @@ test "my test" {
 - Zig: **0.17.0**
 - Tests: **455 passed**, 12 skipped, 0 failed
 - Roadmap: `docs/PRODUCTION_ROADMAP.md` (phases 1–5 ✅)
+- Modulith day-one practices: `docs/MODULITH.md`
+- Domain layering (model / persistence.Tx / service Cmd): `docs/MODULE_LAYERS.md`
 - Score: ~95/100 (`docs/EVALUATION_REPORT.md` v5)
 
 ## Learned User Preferences

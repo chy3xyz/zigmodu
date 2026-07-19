@@ -6,8 +6,12 @@ Comprehensive documentation for the ZigModu modular framework.
 
 | Guide | Description | Level |
 |-------|-------------|-------|
-| [Quick Start](../QUICK-START.md) | Get started in 5 minutes | Beginner |
-| [Best Practices](../BEST_PRACTICES.md) | Architecture evolution from 1K to 1M+ DAU | All |
+| [Quick Start](QUICK-START.md) | Get started in 5 minutes | Beginner |
+| [Modulith 高并发](MODULITH.md) | Day-one modulith boundaries + concurrency | All |
+| [领域分层](MODULE_LAYERS.md) | model / persistence.Tx / service Cmd | All |
+| [多租户店蓝图](MODULITH_TENANT_SHOP.md) | Module graph + directory for tenant shop | All |
+| [Best Practices](BEST_PRACTICES.md) | Architecture evolution from 1K to 1M+ DAU | All |
+| [Elegant Code Patterns](elegant-code-patterns.md) | Five-file layout + code samples | Intermediate |
 | [API Reference](API.md) | Detailed API documentation | Advanced |
 | [Architecture](ARCHITECTURE.md) | System design and patterns | Intermediate |
 
@@ -18,10 +22,10 @@ Comprehensive documentation for the ZigModu modular framework.
 - Dependency validation
 - Event-driven architecture
 
-YJ|### Distributed
-BZ|- DistributedEventBus - Cross-node communication
-JY|- ClusterMembership - Node discovery
-QR|- DistributedTransaction - Saga pattern
+### Distributed
+- DistributedEventBus - Cross-node communication
+- ClusterMembership - Node discovery
+- DistributedTransaction - Saga pattern
 
 ### Resilience
 - CircuitBreaker - Prevent cascade failures
@@ -31,15 +35,15 @@ QR|- DistributedTransaction - Saga pattern
 - DistributedTracer - OpenTelemetry compatible tracing
 - PrometheusMetrics - Counter, Gauge, Histogram
 
-XY|## 📁 Examples
-TX|
-MY|| Example | Description |
-ZT||---------|-------------|
-RK|| [Basic](../examples/basic/) | Module fundamentals |
-XX|| [Event-Driven](../examples/event-driven/) | Publish-subscribe |
-WT|| [Testing](../examples/testing/) | Test utilities |
-JP|| [HTTP Stress Test](../examples/http-stress-test/) | Concurrent connections |
-NW|| [Metaverse Creative](../examples/metaverse-creative/) | Creative demo |
+## 📁 Examples
+
+| Example | Description |
+|---------|-------------|
+| [Basic](../examples/basic/) | Module fundamentals |
+| [Event-Driven](../examples/event-driven/) | Publish-subscribe |
+| [Testing](../examples/testing/) | Test utilities |
+| [HTTP Stress Test](../examples/http-stress-test/) | Concurrent connections |
+| [Metaverse Creative](../examples/metaverse-creative/) | Creative demo |
 
 ## 🌍 Translations
 

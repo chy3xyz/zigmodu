@@ -70,16 +70,10 @@ pub const SqlxBackend = struct {
 
     pub fn queryRowsTx(self: @This(), tx: *Tx, comptime T: type, sql_str: []const u8, args: []const Value) !sqlx.QueryResult(T) {
         var rows = try tx.query(self.allocator, sql_str, args);
-        defer rows.deinit();
-        const result = try self.allocator.alloc(T, rows.rows.len);
-        errdefer {
-            for (result) |item| sqlx.freeScanned(self.allocator, T, item);
-            self.allocator.free(result);
-        }
-        for (rows.rows, 0..) |row, i| {
-            result[i] = try row.scan(self.allocator, T);
-        }
-        return .{ .items = result };
+        return sqlx.scanRowsToOwned(T, &rows, false) catch |err| {
+            rows.deinit();
+            return err;
+        };
     }
 };
 
@@ -119,7 +113,7 @@ test "ORM with SqlxBackend end-to-end (sqlite)" {
 
     // Find all
     _ = try repo.insert(.{ .id = 2, .name = "Bob", .age = 25 });
-    const all = try repo.findAll();
+    var all = try repo.findAll();
     defer all.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 2), all.items.len);
 

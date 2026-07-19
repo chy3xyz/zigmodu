@@ -19,6 +19,7 @@ pub extern "c" fn sqlite3_prepare_v2(db: ?*sqlite3, sql: [*]const u8, nByte: c_i
 pub extern "c" fn sqlite3_step(stmt: ?*sqlite3_stmt) c_int;
 pub extern "c" fn sqlite3_finalize(stmt: ?*sqlite3_stmt) c_int;
 pub extern "c" fn sqlite3_reset(stmt: ?*sqlite3_stmt) c_int;
+pub extern "c" fn sqlite3_clear_bindings(stmt: ?*sqlite3_stmt) c_int;
 pub extern "c" fn sqlite3_column_count(stmt: ?*sqlite3_stmt) c_int;
 pub extern "c" fn sqlite3_column_name(stmt: ?*sqlite3_stmt, iCol: c_int) [*c]const u8;
 pub extern "c" fn sqlite3_column_type(stmt: ?*sqlite3_stmt, iCol: c_int) c_int;

@@ -235,6 +235,8 @@ pub const Context = struct {
     }
 
     fn freeStringMap(self: *Context, map: *std.StringHashMap([]const u8)) void {
+        // Safe for both GPA (tests) and ArenaAllocator (connFiber): Zig 0.17
+        // arena free is a no-op; GPA reclaims each key/value for leak-free tests.
         var iter = map.iterator();
         while (iter.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -282,6 +284,11 @@ pub const Context = struct {
         const k = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(k);
         const v = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(v);
+        if (self.attributes.fetchRemove(key)) |old| {
+            self.allocator.free(old.key);
+            self.allocator.free(old.value);
+        }
         try self.attributes.put(k, v);
     }
 
@@ -332,16 +339,19 @@ pub const Context = struct {
         return if (self.form) |f| f.get(key) else null;
     }
 
-    /// Set response header. All header allocations use per-request arena —
-    /// no individual free; arena reset handles cleanup per keep-alive cycle.
-    /// This avoids the use-after-free bug where GPA reuses a just-freed
-    /// pointer for the new `key_copy`, then `free(entry.key_ptr.*)` frees
-    /// the same pointer that `put()` just stored (0xaa garbage in debug mode).
+    /// Set response header. Keys/values are owned by the context allocator and
+    /// freed in `deinit` / `resetArena`. Replacing an existing header frees the
+    /// previous entry (GPA) or no-ops (arena).
     pub fn setHeader(self: *Context, key: []const u8, value: []const u8) !void {
         const key_copy = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(key_copy);
         const value_copy = try self.allocator.dupe(u8, value);
-        // fetchPutAssumeCapacity atomically replaces; old arena memory
-        // is NOT freed — arena reset at request end reclaims all.
+        errdefer self.allocator.free(value_copy);
+
+        if (self.response_headers.fetchRemove(key)) |old| {
+            self.allocator.free(old.key);
+            self.allocator.free(old.value);
+        }
         try self.response_headers.put(key_copy, value_copy);
     }
 

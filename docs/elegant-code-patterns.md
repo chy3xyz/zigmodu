@@ -1,16 +1,18 @@
 # Writing Elegant ZigModu Code — Patterns & Conventions
 
 > Companion to `best-practices-heysen-lessons.md`. Concrete code patterns, not just bug reports.
+> **Modulith day-one + concurrency playbook**: [MODULITH.md](MODULITH.md).
+> **Layering (model / persistence.Tx / service Cmd)**: [MODULE_LAYERS.md](MODULE_LAYERS.md).
 
 ## 1. Module Structure — One Pattern to Rule Them All
 
 Every module follows the same 5-file layout. No exceptions. No `ext/` directories.
 
 ```
-modules/<domain>/<entity>/
+modules/<domain>/
   model.zig        — Data struct, column mapping, JSON names
-  persistence.zig  — DB access only (SQL, params, exec)
-  service.zig      — Business logic (validation, orchestration)
+  persistence.zig  — DB access only (SQL, params, exec) + optional `pub const Tx`
+  service.zig      — Business logic (validation, orchestration, beginTx)
   api.zig          — HTTP handlers + route registration
   module.zig       — Lifecycle (init/deinit), dependency declaration
 ```
@@ -40,107 +42,75 @@ pub const Agent = struct {
 ```
 
 **Rules**:
-- `id` is always `?i64 = null` (auto-generated)
-- `tenant_id` is `i64 = 1` (default tenant)
-- String fields are `[]const u8` (required) or `?[]const u8 = null` (optional)
-- `json_names` maps EVERY field — never rely on default serialization
-- No business logic in model — pure data
+- Prefer explicit enums for status fields (map at service boundary)
+- String fields are `[]const u8` (required) or `?[]const u8 = null` (optional); document ownership
+- `json_names` when you need camelCase JSON — never rely on silent renames
+- No business logic in model — pure data (+ tiny pure helpers)
 
 ### persistence.zig — SQL Only, No Logic
 
 ```zig
-pub const AgentPersistence = struct {
-    backend: data.SqlxBackend,
+pub fn ProductPersistence(comptime Backend: type) type {
+    return struct {
+        db: Backend,
+        pub fn init(db: Backend) @This() {
+            return .{ .db = db };
+        }
 
-    pub fn init(backend: data.SqlxBackend) AgentPersistence {
-        return .{ .backend = backend };
-    }
+        pub fn findById(self: *@This(), tenant_id: i64, id: i64) !?Product {
+            return self.db.queryRowPartial(Product,
+                "SELECT ... FROM products WHERE tenant_id = ? AND id = ?",
+                &.{ .{ .int = tenant_id }, .{ .int = id } },
+            ) catch |err| switch (err) {
+                error.NotFound => null,
+                else => err,
+            };
+        }
+    };
+}
 
-    // ── Queries ──
-
-    pub fn listByTenant(self: *AgentPersistence, tid: i64, page: usize, size: usize) ![]Agent {
-        const offset = (page - 1) * size;
-        return self.backend.queryRows(Agent,
-            \\ SELECT id, tenant_id, agent_name, level_code, status
-            \\ FROM insurance_agents
-            \\ WHERE tenant_id = $1 AND deleted = 0
-            \\ ORDER BY id DESC LIMIT $2 OFFSET $3
-        , &.{.{ .int = tid }, .{ .int = @intCast(size) }, .{ .int = @intCast(offset) }});
-    }
-
-    // ── Mutations ──
-
-    pub fn insert(self: *AgentPersistence, a: Agent) !i64 {
-        const new_id = try self.nextId("insurance_agents");
-        _ = self.backend.client.exec(
-            \\ INSERT INTO insurance_agents (id, tenant_id, agent_name, level_code, status)
-            \\ VALUES ($1, $2, $3, $4, $5)
-        , &.{.{ .int = new_id }, .{ .int = a.tenant_id }, .{ .string = a.agent_name },
-            .{ .string = a.level_code orelse "" }, .{ .int = a.status orelse 1 }}) catch |err| {
-            std.log.err("Agent insert failed: {s}", .{@errorName(err)});
-            return error.DatabaseError;
-        };
-        return new_id;
-    }
-
-    pub fn update(self: *AgentPersistence, a: Agent) !void {
-        _ = self.backend.client.exec(
-            \\ UPDATE insurance_agents SET agent_name=$1, level_code=$2, status=$3
-            \\ WHERE id=$4 AND tenant_id=$5 AND deleted=0
-        , &.{.{ .string = a.agent_name }, .{ .string = a.level_code orelse "" },
-            .{ .int = a.status orelse 1 }, .{ .int = a.id orelse 0 }, .{ .int = a.tenant_id }}) catch |err| {
-            std.log.err("Agent update failed: {s}", .{@errorName(err)});
-            return error.DatabaseError;
-        };
-    }
-
-    pub fn delete(self: *AgentPersistence, id: i64) !void {
-        _ = self.backend.client.exec(
-            "UPDATE insurance_agents SET deleted=1 WHERE id=$1", &.{.{ .int = id }}) catch |err| {
-            std.log.err("Agent delete failed: {s}", .{@errorName(err)});
-            return error.DatabaseError;
-        };
+/// Same-transaction helpers for Unit-of-Work (checkout / pay).
+pub const Tx = struct {
+    pub fn reserve(tx: *data.sqlx.Transaction, tenant_id: i64, product_id: i64, qty: i64, now: i64) !void {
+        const res = try tx.exec(
+            "UPDATE inventory SET reserved = reserved + ? WHERE tenant_id = ? AND product_id = ? AND (qty - reserved) >= ?",
+            &.{ .{ .int = qty }, .{ .int = tenant_id }, .{ .int = product_id }, .{ .int = qty } },
+        );
+        if (res.rows_affected != 1) return error.ConstraintViolation;
     }
 };
 ```
 
 **Rules**:
-- ≤9 params per `exec()` call (PG driver limit)
-- Split large inserts/updates into multiple calls if needed
-- Always use `AND deleted=0` in WHERE clauses
-- Log errors before propagating — `catch |err| { log; return err; }`
+- Always parameterize with `?` (never string-concat user input)
+- Every tenant query includes `tenant_id`
+- `find*` → `!?T`; list/get → `![]T` / `!T`
+- `Tx.*` is SQL-only; business branching stays in service
+- Workflow services may `import` sibling `persistence.Tx` (see [MODULE_LAYERS.md](MODULE_LAYERS.md))
 - `catch {}` is banned — always propagate or log
 
 ### service.zig — Business Logic Hub
 
 ```zig
-pub const AgentService = struct {
-    persistence: *AgentPersistence,
+pub const CheckoutCmd = struct { tenant_id: i64, user_id: i64 };
+pub const CheckoutResult = struct { order_id: i64 };
 
-    pub fn init(p: *AgentPersistence) AgentService {
-        return .{ .persistence = p };
-    }
-
-    pub fn createAgent(self: *AgentService, a: Agent) !i64 {
-        if (a.agent_name.len == 0) return error.ValidationFailed;
-        return try self.persistence.insert(a);
-    }
-
-    pub fn updateAgent(self: *AgentService, a: Agent) !void {
-        if (a.agent_name.len == 0) return error.ValidationFailed;
-        try self.persistence.update(a);
-    }
-
-    pub fn deleteAgent(self: *AgentService, id: i64) !void {
-        try self.persistence.delete(id);
-    }
-};
+pub fn checkout(self: *OrderService, cmd: CheckoutCmd) !CheckoutResult {
+    var tx = try self.db.beginTx();
+    errdefer tx.rollback() catch |err| std.log.err("[order] rollback: {}", .{err});
+    try inventory.Tx.reserve(&tx, cmd.tenant_id, product_id, qty, now);
+    // insert order + outbox…
+    try tx.commit();
+    return .{ .order_id = id };
+}
 ```
 
 **Rules**:
 - All business validation lives here
-- Service orchestrates multiple persistence calls
-- Never import `http` or `Context` — service is transport-agnostic
+- Prefer **Cmd / Result** structs over long scalar arg lists
+- Service orchestrates `persistence` + `Tx`; never import `http` / `Context`
+- Timestamps set in service, not inside persistence
+- Side effects that must survive crash: same-TX **outbox**, not inline MQ
 
 ### api.zig — Thin HTTP Layer
 

@@ -30,19 +30,52 @@ pub const Redis = struct {
     config: RedisConfig,
     stream: ?std.Io.net.Stream = null,
     io: std.Io,
+    /// Optional connection pool (enabled when pool_size > 1).
+    pool: ?ConnPool = null,
+    pool_mu: std.Io.Mutex = .init,
+
+    const ConnPool = struct {
+        streams: []?std.Io.net.Stream,
+        in_use: []bool,
+
+        fn init(allocator: std.mem.Allocator, size: u32) !ConnPool {
+            const n = @max(size, 1);
+            const streams = try allocator.alloc(?std.Io.net.Stream, n);
+            @memset(streams, null);
+            const in_use = try allocator.alloc(bool, n);
+            @memset(in_use, false);
+            return .{ .streams = streams, .in_use = in_use };
+        }
+
+        fn deinit(self: *ConnPool, allocator: std.mem.Allocator, io: std.Io) void {
+            for (self.streams) |maybe| {
+                if (maybe) |s| s.close(io);
+            }
+            allocator.free(self.streams);
+            allocator.free(self.in_use);
+        }
+    };
 
     /// Create a new Redis client
     pub fn new(allocator: std.mem.Allocator, io: std.Io, cfg: RedisConfig) !Redis {
-        return Redis{
+        var client = Redis{
             .allocator = allocator,
             .config = cfg,
             .stream = null,
             .io = io,
         };
+        if (cfg.pool_size > 1) {
+            client.pool = try ConnPool.init(allocator, cfg.pool_size);
+        }
+        return client;
     }
 
     /// Deinitialize Redis client
     pub fn deinit(self: *Redis) void {
+        if (self.pool) |*p| {
+            p.deinit(self.allocator, self.io);
+            self.pool = null;
+        }
         if (self.stream) |s| {
             s.close(self.io);
             self.stream = null;
@@ -50,10 +83,42 @@ pub const Redis = struct {
         self.* = undefined;
     }
 
-    /// Connect to Redis server
+    /// Connect to Redis server (opens primary stream; pool fills on demand).
     pub fn connect(self: *Redis) !void {
         const address = std.Io.net.IpAddress.parseIp4(self.config.host, self.config.port) catch return error.RedisError;
         self.stream = address.connect(self.io, .{ .mode = .stream }) catch return error.RedisError;
+    }
+
+    /// Borrow a pooled connection (or the primary stream when pool_size <= 1).
+    fn acquireStream(self: *Redis) errors.ResultT(struct { stream: std.Io.net.Stream, pool_idx: ?usize }) {
+        if (self.pool) |*p| {
+            self.pool_mu.lock(self.io) catch return error.RedisError;
+            defer self.pool_mu.unlock(self.io);
+            for (p.streams, 0..) |*slot, i| {
+                if (p.in_use[i]) continue;
+                if (slot.*) |_| {
+                    p.in_use[i] = true;
+                    return .{ .stream = slot.*.?, .pool_idx = i };
+                }
+                const address = std.Io.net.IpAddress.parseIp4(self.config.host, self.config.port) catch return error.RedisError;
+                const s = address.connect(self.io, .{ .mode = .stream }) catch return error.RedisError;
+                slot.* = s;
+                p.in_use[i] = true;
+                return .{ .stream = s, .pool_idx = i };
+            }
+            return error.RedisError; // pool exhausted
+        }
+        const s = self.stream orelse return error.RedisError;
+        return .{ .stream = s, .pool_idx = null };
+    }
+
+    fn releaseStream(self: *Redis, pool_idx: ?usize) void {
+        const idx = pool_idx orelse return;
+        if (self.pool) |*p| {
+            self.pool_mu.lock(self.io) catch return;
+            defer self.pool_mu.unlock(self.io);
+            if (idx < p.in_use.len) p.in_use[idx] = false;
+        }
     }
 
     /// Disconnect from Redis server
@@ -66,7 +131,10 @@ pub const Redis = struct {
 
     /// Get a value by key
     pub fn get(self: *Redis, key: []const u8) errors.ResultT(?[]const u8) {
-        if (self.stream) |stream| {
+        const borrowed = try self.acquireStream();
+        defer self.releaseStream(borrowed.pool_idx);
+        const stream = borrowed.stream;
+        {
             const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$3\r\nGET\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
@@ -101,23 +169,22 @@ pub const Redis = struct {
 
     /// Set a value with expiration
     pub fn set(self: *Redis, key: []const u8, value: []const u8, ex_seconds: ?u32) errors.Result {
-        if (self.stream) |stream| {
-            const cmd = if (ex_seconds) |ex|
-                std.fmt.allocPrint(self.allocator, "*5\r\n$3\r\nSET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n$2\r\nEX\r\n${d}\r\n{d}\r\n", .{ key.len, key, value.len, value, std.fmt.count("{d}", .{ex}), ex }) catch return error.RedisError
-            else
-                std.fmt.allocPrint(self.allocator, "*3\r\n$3\r\nSET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{ key.len, key, value.len, value }) catch return error.RedisError;
-            defer self.allocator.free(cmd);
+        const borrowed = try self.acquireStream();
+        defer self.releaseStream(borrowed.pool_idx);
+        const stream = borrowed.stream;
+        const cmd = if (ex_seconds) |ex|
+            std.fmt.allocPrint(self.allocator, "*5\r\n$3\r\nSET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n$2\r\nEX\r\n${d}\r\n{d}\r\n", .{ key.len, key, value.len, value, std.fmt.count("{d}", .{ex}), ex }) catch return error.RedisError
+        else
+            std.fmt.allocPrint(self.allocator, "*3\r\n$3\r\nSET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{ key.len, key, value.len, value }) catch return error.RedisError;
+        defer self.allocator.free(cmd);
 
-            try writeCmd(&stream, self.io, cmd);
+        try writeCmd(&stream, self.io, cmd);
 
-            var buf: [256]u8 = undefined;
-            _ = stream.read(self.io, data: {
-                var d: [1][]u8 = .{buf[0..]};
-                break :data &d;
-            }) catch return error.RedisError;
-            return;
-        }
-        return error.RedisError;
+        var buf: [256]u8 = undefined;
+        _ = stream.read(self.io, data: {
+            var d: [1][]u8 = .{buf[0..]};
+            break :data &d;
+        }) catch return error.RedisError;
     }
 
     /// Set a value only if key doesn't exist

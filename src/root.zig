@@ -89,6 +89,7 @@ pub const KafkaProducer = @import("core/KafkaConnector.zig").KafkaProducer;
 pub const KafkaConsumer = @import("core/KafkaConnector.zig").KafkaConsumer;
 pub const KafkaEventBridge = @import("core/KafkaConnector.zig").KafkaEventBridge;
 pub const KafkaMessage = @import("core/KafkaConnector.zig").KafkaMessage;
+pub const RobustMQTransport = @import("core/KafkaConnector.zig").RobustMQTransport;
 pub const NatsClient = @import("messaging/Nats.zig").NatsClient;
 pub const NatsConfig = @import("messaging/Nats.zig").NatsConfig;
 pub const MessageQueue = @import("messaging/MessageQueue.zig").MessageQueue;

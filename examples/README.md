@@ -13,6 +13,15 @@ curl http://127.0.0.1:18080/health/live
 
 See [tenant-mgmt/README.md](tenant-mgmt/README.md) for full API reference.
 
+## Multi-Tenant Shop scaffold (`examples/tenant-shop`)
+
+**Modulith blueprint demo** — storefront domain graph from [`docs/MODULITH_TENANT_SHOP.md`](../docs/MODULITH_TENANT_SHOP.md). Week 1–2 runnable (`tenant` / `user` / `product` / `inventory`); cart/order/payment/BFF are status stubs.
+
+```bash
+cd examples/tenant-shop && HTTP_PORT=18090 zig build run
+curl http://127.0.0.1:18090/health/live
+```
+
 ## ShopDemo boundary (`examples/shopdemo`)
 
 **Codegen reference only** — `schema.sql` + `generated-sample/` module output. Not a complete runnable app. Use [zmodu CLI](https://github.com/chy3xyz/zmodu) to scaffold a full 42-module project.

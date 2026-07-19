@@ -12,6 +12,7 @@ A modular application framework for Zig 0.17, inspired by Spring Modulith. Build
 | Guide | Description |
 |-------|-------------|
 | [Quick Start](docs/QUICK-START.md) | Get started in 5 minutes |
+| [Modulith 高并发](docs/MODULITH.md) | Day-one modulith + high-concurrency practices |
 | [Best Practices](docs/BEST_PRACTICES.md) | Architecture evolution from 1K to 1M+ DAU |
 | [API Reference](docs/API.md) | Detailed API documentation |
 | [Architecture](docs/ARCHITECTURE.md) | System design and patterns |
