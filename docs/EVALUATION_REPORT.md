@@ -1,7 +1,7 @@
 # ZigModu 生产级评估报告 v5
 
 **评估日期**: 2026-06-20  
-**框架版本**: v0.14.2  
+**框架版本**: v0.14.3  
 **Zig 版本**: 0.17.0  
 **测试结果**: **464 passed, 13 skipped, 0 failed**（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`，2026-07-20 复测）  
 **生产门禁**: `zig build check`（热路径禁止裸 `catch {}`）  
@@ -62,7 +62,7 @@
 
 ## 结论
 
-ZigModu v0.14.2 在 Zig 0.17 上约 **95/100**。单租户应用直接使用 `Application` + HTTP + SQLx 即可；多租户通过 `TenantContext` / 中间件 / SQL 过滤**按需叠加**，见 [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) § Multi-Tenancy (Optional)。
+ZigModu v0.14.3 在 Zig 0.17 上约 **95/100**。单租户应用直接使用 `Application` + HTTP + SQLx 即可；多租户通过 `TenantContext` / 中间件 / SQL 过滤**按需叠加**，见 [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) § Multi-Tenancy (Optional)。
 
 **推荐路径**：`examples/basic`（无租户）→ `examples/tenant-mgmt`（可选多租户 + JWT）→ `shopdemo` schema（大规模 modulith 生成）。
 
