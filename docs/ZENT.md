@@ -1,7 +1,7 @@
 # ZigModu × zent 最佳实践
 
 **zent**: [chy3xyz/zent](https://github.com/chy3xyz/zent) — Zig 版 [ent](https://entgo.io/)（schema-as-code ORM）  
-**版本口径**: zent **v0.12.0+** · ZigModu **v0.14.2+** · Zig **≥ 0.17**  
+**版本口径**: zent **v0.12.0+** · ZigModu **v0.14.3+** · Zig **≥ 0.17**  
 **参考实现**: [`examples/zent-modulith/`](../examples/zent-modulith/)  
 **zent 自带示例**: `zig build run-start` / `run-complex` / `run-pool`（在 zent 仓库内）
 
