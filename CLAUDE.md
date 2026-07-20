@@ -48,6 +48,7 @@ src/sqlx/sqlx.zig       (~3300L) — Client, ConnPool, PG/MySQL/SQLite
 src/Application.zig      (~540L) — builder, run(), graceful shutdown
 docs/PRODUCTION_ROADMAP.md — production phases + monolith boundaries
 docs/MODULE_LAYERS.md — model / persistence.Tx / service Cmd (tenant-shop reference)
+docs/ZENT.md — ZigModu × zent orthogonal ORM practices (zent-modulith)
 docs/MODULITH.md — day-one modulith + high-concurrency practices
 ```
 

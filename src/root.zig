@@ -134,6 +134,8 @@ pub const web4 = @import("web4/web4.zig");
 pub const GrpcServiceRegistry = @import("extensions/GrpcTransport.zig").GrpcServiceRegistry;
 pub const GrpcClient = @import("extensions/GrpcTransport.zig").GrpcClient;
 pub const GrpcStatusCode = @import("extensions/GrpcTransport.zig").GrpcStatusCode;
+pub const GrpcFrame = @import("extensions/GrpcTransport.zig").GrpcFrame;
+pub const OwnedGrpcResponse = @import("extensions/GrpcTransport.zig").OwnedGrpcResponse;
 pub const ProtoParser = @import("extensions/GrpcTransport.zig").ProtoParser;
 
 // ============================================================

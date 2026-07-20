@@ -531,15 +531,53 @@ pub const TransportProtocol = enum {
 };
 ```
 
-### gRPC Transport
+### gRPC Transport (unary)
 
 ```zig
-pub const GrpcTransport = struct {
-    pub fn init(allocator: Allocator, endpoint: []const u8) !Self
-    pub fn deinit(self: *Self) void
-    pub fn call(self: *Self, method: []const u8, payload: []const u8) ![]const u8
-};
+// Local (modulith)
+var registry = zigmodu.GrpcServiceRegistry.init(allocator);
+defer registry.deinit();
+try registry.registerService("echo.Echo");
+try registry.registerMethod("echo.Echo", "Say", .unary, handler);
+
+var client = zigmodu.GrpcClient.init(allocator);
+defer client.deinit();
+client.bindLocal(&registry);
+var resp = try client.call("echo.Echo", "Say", proto_bytes);
+defer resp.deinit();
+
+// HTTP/1.1 application/grpc
+var net = zigmodu.GrpcClient.initWithIo(allocator, io);
+defer net.deinit();
+try net.registerEndpoint("echo.Echo", "127.0.0.1", 50051);
+var remote = try net.call("echo.Echo", "Say", proto_bytes);
+defer remote.deinit();
+
+// Framing helpers
+const framed = try zigmodu.GrpcFrame.encode(allocator, proto_bytes);
+defer allocator.free(framed);
+const payload = try zigmodu.GrpcFrame.decode(framed);
 ```
+
+HTTP unary server side: `registry.handleHttpUnary(path, body)` → set `grpc-status` / `grpc-message` headers + framed body.
+
+### SecretsManager (Vault KV v2)
+
+```zig
+var sm = zigmodu.security.SecretsManager.initWithIo(allocator, io);
+defer sm.deinit();
+try sm.configureVaultEx(.{
+    .address = "http://127.0.0.1:8200",
+    .token = "dev-root-token",
+    .mount_path = "secret",
+});
+try sm.loadFromVault("database/creds"); // GET /v1/secret/data/database/creds
+const host = sm.get("DB_HOST"); // priority: env > file > vault > default
+```
+
+- `applyVaultKvJson(body)` — unit-test / inject KV JSON without HTTP.
+- `https://` → `error.VaultTlsNotSupported` (plain HTTP only; use local Vault or TLS-terminating proxy).
+- Live smoke: `VAULT_ADDR` + `VAULT_TOKEN` (+ optional `VAULT_MOUNT` / `VAULT_SECRET_PATH`).
 
 ### MQTT Transport
 

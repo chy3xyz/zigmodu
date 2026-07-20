@@ -10,7 +10,8 @@ For multi-node production, see the caveats below.
 | Module | Tests | Notes |
 |--------|:-----:|-------|
 | **FailureDetector** | 7 | Phi-accrual detector. Adaptive threshold. |
-| **KafkaConnector** | 8+ | RobustMQ / Kafka TCP Produce+Fetch. Live test: `ROBUSTMQ_URL`/`KAFKA_BOOTSTRAP`. |
+| **KafkaConnector** | 12+ | RobustMQ / Kafka TCP Produce+Fetch + RecordBatch parse. Live: `ROBUSTMQ_URL`/`KAFKA_BOOTSTRAP`. |
+| **GrpcTransport** | 10+ | Unary framing + registry invoke + HTTP/1.1 `application/grpc`. Streaming → UNIMPLEMENTED. |
 | **SagaOrchestrator** | 6 | Auto-compensation with reverse-order rollback. |
 | **RaftElection** | 5 | Leader election + vote counting. Multi-candidate split-vote tested. |
 | **DistributedTransaction** | 4 | 2PC protocol (commit + abort). |

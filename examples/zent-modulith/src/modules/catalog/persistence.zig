@@ -1,0 +1,79 @@
+//! Persistence over zent Client — SQL stays inside zent builders.
+const std = @import("std");
+const zent = @import("zent");
+const model = @import("model.zig");
+
+const graph = zent.codegen.graph.buildGraph(&.{ model.Tenant, model.Product });
+pub const infos = graph.types;
+pub const Client = zent.codegen.client.Client(infos);
+pub const ProductInfo = infos[1];
+
+pub const CatalogStore = struct {
+    allocator: std.mem.Allocator,
+    client: Client,
+
+    pub fn init(allocator: std.mem.Allocator, driver: zent.sql_driver.Driver) CatalogStore {
+        return .{
+            .allocator = allocator,
+            .client = zent.codegen.client.makeClient(infos, allocator, driver),
+        };
+    }
+
+    pub fn createTenant(self: *CatalogStore, name: []const u8, domain: []const u8) !i64 {
+        var b = try self.client.tenant.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", name);
+        _ = try b.setFieldValue("domain", domain);
+        const row = try b.Save();
+        return row.id;
+    }
+
+    pub fn createProduct(self: *CatalogStore, tenant_id: i64, name: []const u8, price_cents: i64) !i64 {
+        var b = try self.client.product.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("tenant_id", tenant_id);
+        _ = try b.setFieldValue("name", name);
+        _ = try b.setFieldValue("price_cents", price_cents);
+        const row = try b.Save();
+        return row.id;
+    }
+
+    pub const ProductRow = struct {
+        id: i64,
+        tenant_id: i64,
+        name: []const u8,
+        price_cents: i64,
+    };
+
+    /// Caller owns returned slice + each `name`. Free with `freeProducts`.
+    pub fn listProducts(self: *CatalogStore, tenant_id: i64) ![]ProductRow {
+        var q = self.client.product.Query();
+        defer q.deinit();
+        const preds = self.client.product.predicates;
+        _ = try q.Where(.{preds.tenant_idEQ(.{ .int = tenant_id })});
+        var found = try q.All();
+        defer {
+            for (found.items) |*p| {
+                zent.codegen.deinitEntity(infos, ProductInfo, p, self.allocator);
+            }
+            found.deinit();
+        }
+
+        var out = try self.allocator.alloc(ProductRow, found.items.len);
+        errdefer self.allocator.free(out);
+        for (found.items, 0..) |p, i| {
+            out[i] = .{
+                .id = p.id,
+                .tenant_id = p.tenant_id,
+                .name = try self.allocator.dupe(u8, p.name),
+                .price_cents = p.price_cents,
+            };
+        }
+        return out;
+    }
+
+    pub fn freeProducts(self: *CatalogStore, rows: []ProductRow) void {
+        for (rows) |r| self.allocator.free(r.name);
+        self.allocator.free(rows);
+    }
+};

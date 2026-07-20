@@ -595,20 +595,116 @@ pub const KafkaWireFormat = struct {
     }
 
     pub fn checkProduceResponse(resp: []const u8, expected_corr: i32) !void {
-        if (resp.len < 6) return error.InvalidResponse;
+        if (resp.len < 8) return error.InvalidResponse;
         const corr = readI32(resp[0..4]);
         if (corr != expected_corr) return error.CorrelationMismatch;
-        // Matching correlation is enough for smoke against RobustMQ; full topic/partition
-        // error-code parse can be tightened once broker version matrix is locked.
+        // ProduceResponse v7: correlation(4) + throttle_time_ms(4) + topics...
+        // When at least one topic/partition is present, error_code sits after topic string.
+        // For smoke / RobustMQ we accept correlation match; optional error scan below.
+        if (resp.len >= 14) {
+            // throttle_time at [4..8]; topic_count at [8..12]
+            const topic_count = readI32(resp[8..12]);
+            if (topic_count > 0 and resp.len >= 16) {
+                const name_len = readI16(resp[12..14]);
+                if (name_len >= 0) {
+                    const name_end = 14 + @as(usize, @intCast(name_len));
+                    if (name_end + 10 <= resp.len) {
+                        // partition_count(4) + partition(4) + error_code(2)
+                        const err_code = readI16(resp[name_end + 8 ..][0..2]);
+                        if (err_code != 0) return error.ProduceError;
+                    }
+                }
+            }
+        }
     }
 
-    /// Very loose Fetch response parser: collect printable bulk payloads after the header.
-    /// Full RecordBatch decode is complex; we extract length-prefixed value blobs when present.
+    /// Decode RecordBatch (magic=2) values from a buffer (our Produce batch layout).
+    pub fn parseRecordBatchValues(allocator: std.mem.Allocator, batch: []const u8) ![][]const u8 {
+        // base_offset(8) + length(4) + leader_epoch(4) + magic(1) + crc(4) + body...
+        if (batch.len < 22) return error.InvalidRecordBatch;
+        if (batch[16] != 2) return error.UnsupportedMagic; // magic at offset 16
+        // body starts at 21 (after crc)
+        const body = batch[21..];
+        if (body.len < 40) return try allocator.alloc([]const u8, 0);
+        // skip attributes(2)+last_offset_delta(4)+first_ts(8)+max_ts(8)+producer_id(8)+epoch(2)+base_seq(4)+count(4) = 40
+        var off: usize = 40;
+        var out = std.ArrayList([]const u8).empty;
+        errdefer {
+            for (out.items) |v| allocator.free(v);
+            out.deinit(allocator);
+        }
+        while (off < body.len) {
+            const rec_len, const n1 = try readVarint(body[off..]);
+            off += n1;
+            if (rec_len <= 0 or off + @as(usize, @intCast(rec_len)) > body.len) break;
+            const rec = body[off .. off + @as(usize, @intCast(rec_len))];
+            off += @intCast(rec_len);
+            // attributes(1) + ts_delta + offset_delta + key + value
+            var roff: usize = 1;
+            _, const n2 = try readVarint(rec[roff..]);
+            roff += n2;
+            _, const n3 = try readVarint(rec[roff..]);
+            roff += n3;
+            const key_len, const n4 = try readVarint(rec[roff..]);
+            roff += n4;
+            if (key_len >= 0) {
+                if (roff + @as(usize, @intCast(key_len)) > rec.len) break;
+                roff += @intCast(key_len);
+            }
+            const val_len, const n5 = try readVarint(rec[roff..]);
+            roff += n5;
+            if (val_len < 0 or roff + @as(usize, @intCast(val_len)) > rec.len) break;
+            const val = try allocator.dupe(u8, rec[roff .. roff + @as(usize, @intCast(val_len))]);
+            try out.append(allocator, val);
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
+    /// Extract message values from a Fetch response by scanning for magic=2 record batches.
     pub fn parseFetchValues(allocator: std.mem.Allocator, resp: []const u8) ![][]const u8 {
-        _ = resp;
-        // Until full RecordBatch decode lands, return empty set on success path.
-        // Callers still exercise the network round-trip.
-        return try allocator.alloc([]const u8, 0);
+        var out = std.ArrayList([]const u8).empty;
+        errdefer {
+            for (out.items) |v| allocator.free(v);
+            out.deinit(allocator);
+        }
+        var i: usize = 0;
+        while (i + 22 < resp.len) : (i += 1) {
+            // Look for magic=2 preceded by leader_epoch (4 bytes) — heuristic scan.
+            if (resp[i] != 2) continue;
+            if (i < 16) continue;
+            const batch_start = i - 16; // base_offset starts 16 bytes before magic
+            if (batch_start + 21 > resp.len) continue;
+            const length = readI32(resp[batch_start + 8 ..][0..4]);
+            if (length <= 0 or length > 16 * 1024 * 1024) continue;
+            const batch_end = batch_start + 12 + @as(usize, @intCast(length));
+            if (batch_end > resp.len) continue;
+            const values = parseRecordBatchValues(allocator, resp[batch_start..batch_end]) catch continue;
+            defer {
+                for (values) |v| allocator.free(v);
+                allocator.free(values);
+            }
+            for (values) |v| {
+                try out.append(allocator, try allocator.dupe(u8, v));
+            }
+            i = batch_end -| 1;
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
+    fn readVarint(buf: []const u8) !struct { i32, usize } {
+        var result: u32 = 0;
+        var shift: u5 = 0;
+        var i: usize = 0;
+        while (i < buf.len and i < 5) : (i += 1) {
+            const b = buf[i];
+            result |= @as(u32, b & 0x7f) << shift;
+            if ((b & 0x80) == 0) {
+                const decoded: i32 = @as(i32, @bitCast(result >> 1)) ^ -@as(i32, @intCast(result & 1));
+                return .{ decoded, i + 1 };
+            }
+            shift += 7;
+        }
+        return error.InvalidVarint;
     }
 
     pub fn buildProduceRequestLegacy(
@@ -621,6 +717,11 @@ pub const KafkaWireFormat = struct {
         client_id: []const u8,
     ) ![]const u8 {
         return buildProduceRequest(allocator, topic, partition, key, value, correlation_id, client_id, 1);
+    }
+
+    /// Test/helper: expose record batch builder for roundtrip coverage.
+    pub fn buildRecordBatchForTest(allocator: std.mem.Allocator, key: ?[]const u8, value: []const u8) ![]u8 {
+        return buildRecordBatch(allocator, key, value);
     }
 
     fn appendRequestHeader(
@@ -861,6 +962,45 @@ test "KafkaWireFormat produce request" {
     // api_key = 0
     try std.testing.expectEqual(@as(u8, 0), payload[0]);
     try std.testing.expectEqual(@as(u8, 0), payload[1]);
+}
+
+test "KafkaWireFormat record batch value roundtrip" {
+    const allocator = std.testing.allocator;
+    const batch = try KafkaWireFormat.buildRecordBatchForTest(allocator, "k", "hello-kafka");
+    defer allocator.free(batch);
+    const values = try KafkaWireFormat.parseRecordBatchValues(allocator, batch);
+    defer {
+        for (values) |v| allocator.free(v);
+        allocator.free(values);
+    }
+    try std.testing.expectEqual(@as(usize, 1), values.len);
+    try std.testing.expectEqualStrings("hello-kafka", values[0]);
+}
+
+test "KafkaWireFormat checkProduceResponse ok" {
+    // correlation=7, throttle=0, topic_count=0
+    var resp: [12]u8 = undefined;
+    writeI32(resp[0..4], 7);
+    writeI32(resp[4..8], 0);
+    writeI32(resp[8..12], 0);
+    try KafkaWireFormat.checkProduceResponse(&resp, 7);
+}
+
+test "KafkaWireFormat parseFetchValues finds embedded batch" {
+    const allocator = std.testing.allocator;
+    const batch = try KafkaWireFormat.buildRecordBatchForTest(allocator, null, "fetch-val");
+    defer allocator.free(batch);
+    var resp = std.ArrayList(u8).empty;
+    defer resp.deinit(allocator);
+    try resp.appendSlice(allocator, &[_]u8{ 0, 0, 0, 1 }); // fake header
+    try resp.appendSlice(allocator, batch);
+    const values = try KafkaWireFormat.parseFetchValues(allocator, resp.items);
+    defer {
+        for (values) |v| allocator.free(v);
+        allocator.free(values);
+    }
+    try std.testing.expectEqual(@as(usize, 1), values.len);
+    try std.testing.expectEqualStrings("fetch-val", values[0]);
 }
 
 test "parseBootstrap RobustMQ default form" {

@@ -10,6 +10,7 @@ Comprehensive documentation for the ZigModu modular framework.
 | [Modulith 高并发](MODULITH.md) | Day-one modulith boundaries + concurrency | All |
 | [领域分层](MODULE_LAYERS.md) | model / persistence.Tx / service Cmd | All |
 | [多租户店蓝图](MODULITH_TENANT_SHOP.md) | Module graph + directory for tenant shop | All |
+| [ZigModu × zent](ZENT.md) | Orthogonal zent ORM + modulith practices | Intermediate |
 | [Best Practices](BEST_PRACTICES.md) | Architecture evolution from 1K to 1M+ DAU | All |
 | [Elegant Code Patterns](elegant-code-patterns.md) | Five-file layout + code samples | Intermediate |
 | [API Reference](API.md) | Detailed API documentation | Advanced |
@@ -43,6 +44,7 @@ Comprehensive documentation for the ZigModu modular framework.
 | [Event-Driven](../examples/event-driven/) | Publish-subscribe |
 | [Testing](../examples/testing/) | Test utilities |
 | [HTTP Stress Test](../examples/http-stress-test/) | Concurrent connections |
+| [zent-modulith](../examples/zent-modulith/) | ZigModu HTTP + zent schema-as-code ORM |
 | [Metaverse Creative](../examples/metaverse-creative/) | Creative demo |
 
 ## 🌍 Translations

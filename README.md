@@ -13,6 +13,7 @@ A modular application framework for Zig 0.17, inspired by Spring Modulith. Build
 |-------|-------------|
 | [Quick Start](docs/QUICK-START.md) | Get started in 5 minutes |
 | [Modulith 高并发](docs/MODULITH.md) | Day-one modulith + high-concurrency practices |
+| [ZigModu × zent](docs/ZENT.md) | Orthogonal zent ORM integration practices |
 | [Best Practices](docs/BEST_PRACTICES.md) | Architecture evolution from 1K to 1M+ DAU |
 | [API Reference](docs/API.md) | Detailed API documentation |
 | [Architecture](docs/ARCHITECTURE.md) | System design and patterns |
@@ -32,7 +33,7 @@ A modular application framework for Zig 0.17, inspired by Spring Modulith. Build
 ### HTTP & API
 - **HTTP Server** — Async fiber-based server (kqueue/io_uring), trie router, middleware chains
 - **WebSocket** — RFC 6455 server/client with origin validation and monitoring
-- **gRPC** ⚠️ — Service registry + Proto parser + 16 status codes (experimental)
+- **gRPC** — Unary framing + registry invoke + HTTP/1.1 `application/grpc` client (`GrpcFrame` / `GrpcClient.bindLocal`)
 - **OpenAPI** — 3.0/3.1 JSON document generator from route metadata
 - **Idempotency** — Request deduplication middleware with TTL-based store
 
@@ -70,7 +71,7 @@ A modular application framework for Zig 0.17, inspired by Spring Modulith. Build
 - **JWT Authentication** — Unified verify via `SecurityModule`; RBAC optional
 - **Password Encoder** — Scrypt + timing-safe comparison
 - **Security Scanner** — Static SAST with configurable rules
-- **Secrets Manager** — Multi-source secrets (env > file > Vault > default)
+- **Secrets Manager** — Multi-source secrets (env > file > Vault KV v2 HTTP > default)
 - **Multi-Tenancy (optional)** — TenantContext + DataPermission + ShardRouter; skip for single-tenant
 - **Security Headers** — HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy
 - **CSRF Protection** — Double-submit cookie pattern with CSPRNG tokens

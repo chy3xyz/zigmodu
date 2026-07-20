@@ -1,7 +1,7 @@
 # ZigModu 领域分层最佳实践（model / persistence / service）
 
 **适用**：ZigModu v0.14+ · Zig 0.17  
-**参考实现**：[`examples/tenant-shop/`](../examples/tenant-shop/)（checkout / pay / outbox 已按本规范落地）
+**参考实现**：[`examples/tenant-shop/`](../examples/tenant-shop/)（sqlx）；zent 栈见 [`examples/zent-modulith/`](../examples/zent-modulith/) + [ZENT.md](ZENT.md)
 
 相关文档：
 
@@ -10,6 +10,7 @@
 | [MODULITH.md](MODULITH.md) | 模块边界与并发 |
 | [elegant-code-patterns.md](elegant-code-patterns.md) | 五文件样例 |
 | [MODULITH_TENANT_SHOP.md](MODULITH_TENANT_SHOP.md) | 多租户店蓝图 |
+| [ZENT.md](ZENT.md) | zent ORM 正交接入（schema / Client / migrate） |
 | [BEST_PRACTICES.md](BEST_PRACTICES.md) | DAU 演进路线 |
 
 ---

@@ -3,12 +3,12 @@
 **评估日期**: 2026-06-20  
 **框架版本**: v0.14.2  
 **Zig 版本**: 0.17.0  
-**测试结果**: **455 passed, 12 skipped, 0 failed**（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`）  
+**测试结果**: **464 passed, 13 skipped, 0 failed**（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`，2026-07-20 复测）  
 **生产门禁**: `zig build check`（热路径禁止裸 `catch {}`）  
 **旗舰示例**: [`examples/tenant-mgmt/`](../examples/tenant-mgmt/) — SQLite 持久层 + 真 JWT + CI 业务断言  
 **参考 codegen**: [`examples/shopdemo/`](../examples/shopdemo/) — 152 表 schema + 生成样例（非完整可运行应用）
 
-> v4 → v5：JWT 统一（`SecurityModule.verifyToken`）、`AppSecurity` + wall clock、tenant-mgmt 真 JWT、CI `gen-jwt-token`、Postgres/MySQL CI job、多租户文档明确为**可选**。
+> v5 增量（2026-07-20）：gRPC unary / Kafka wire / Vault KV v2 HTTP 已落地；综合仍约 94–95。
 
 ---
 
@@ -17,7 +17,7 @@
 | # | 维度 | 得分 | v4 | Δ | 评价 |
 |---|------|:----:|:--:|:--:|------|
 | 1 | **核心框架** | 98 | 98 | — | Module 全生命周期闭环 |
-| 2 | **API & 传输** | 95 | 95 | — | HTTP + gRPC + Kafka + WS |
+| 2 | **API & 传输** | 96 | 95 | +1 | HTTP + gRPC unary（帧/本地/HTTP）+ Kafka wire |
 | 3 | **弹性模式** | 95 | 95 | — | CB + RL + Retry + Saga |
 | 4 | **数据层** | 96 | 95 | +1 | SQLite 旗舰示例 + PG/MySQL CI job |
 | 5 | **安全** | 97 | 95 | +2 | AppSecurity、JWT 单路径、wall clock exp |
@@ -51,7 +51,8 @@
 | # | 项目 | 优先级 | 状态 |
 |---|------|--------|------|
 | 1 | 环境门控 skip 用例（Redis/NATS/PG/MySQL） | 中 | ✅ CI live-service job 覆盖（Fluvio/HttpClient-live 仍本地跳过） |
-| 2 | gRPC/Kafka 真实 wire 集成 | 中 | 已标注 EXPERIMENTAL，待实现 |
+| 2 | gRPC streaming / HTTP/2 | 低 | Unary 已生产可用；streaming 返回 UNIMPLEMENTED |
+| 2b | Kafka Fetch 全量协议矩阵 | 低 | Produce + RecordBatch 解析已测；live 需 `KAFKA_BOOTSTRAP` |
 | 3 | ShopDemo 可 `zig build run` | 低 | 待办 |
 | 4 | 持续 Benchmark 基线入库 | 低 | ✅ `zig build benchmark` 输出 `bench-results.json`，CI 基线告警已接通 |
 

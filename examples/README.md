@@ -22,6 +22,15 @@ cd examples/tenant-shop && HTTP_PORT=18090 zig build run
 curl http://127.0.0.1:18090/health/live
 ```
 
+## ZigModu × zent (`examples/zent-modulith`)
+
+**Orthogonal ORM demo** — ZigModu `http.Server` + [zent](https://github.com/chy3xyz/zent) schema-as-code Client/migrate. Requires sibling checkout `../zent` (or adjust `build.zig.zon`). Practices: [`docs/ZENT.md`](../docs/ZENT.md).
+
+```bash
+cd examples/zent-modulith && HTTP_PORT=18100 zig build run
+curl http://127.0.0.1:18100/health/live
+```
+
 ## ShopDemo boundary (`examples/shopdemo`)
 
 **Codegen reference only** — `schema.sql` + `generated-sample/` module output. Not a complete runnable app. Use [zmodu CLI](https://github.com/chy3xyz/zmodu) to scaffold a full 42-module project.

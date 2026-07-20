@@ -13,6 +13,7 @@
 | [elegant-code-patterns.md](elegant-code-patterns.md) | 五文件布局与代码样例 |
 | [DISTRIBUTED.md](DISTRIBUTED.md) | 多实例 / RobustMQ / 集群注意点 |
 | [MODULITH_TENANT_SHOP.md](MODULITH_TENANT_SHOP.md) | **蓝图**：多租户店依赖图 + 目录清单 |
+| [ZENT.md](ZENT.md) | **zent**：schema-as-code ORM 与 ZigModu 正交集成 |
 | [best-practices-heysen-lessons.md](best-practices-heysen-lessons.md) | 生产踩坑（sqlx / ORM） |
 
 ---

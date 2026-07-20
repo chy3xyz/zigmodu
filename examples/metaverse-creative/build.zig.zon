@@ -1,17 +1,17 @@
 .{
     .name = .metaverse_creative,
-    .version = "0.1.0",
+    .version = "0.2.0",
     .fingerprint = 0xe59c3d8c04d4c4f,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        .zigmodu = .{
-            .path = "../..",
-        },
+        .zent = .{ .path = "../../../zent" },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
-        "modules",
+        "METHOD.md",
+        "README.md",
+        "dev.md",
     },
 }

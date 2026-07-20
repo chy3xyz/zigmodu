@@ -102,7 +102,7 @@ pub fn deinit() void {
 ### Security
 - Passwords: `sec.PasswordEncoder` (PBKDF2-HMAC-SHA256, 100K iterations)
 - JWT: `sec.AppSecurity.init(allocator, io, .{ .jwt_secret = ... })` + `jwtMiddleware()` (wall clock); RBAC via `sec.auth.jwtAuth`
-- Secrets: `sec.SecretsManager` (env > file > vault > default priority)
+- Secrets: `sec.SecretsManager` (env > file > vault KV v2 HTTP > default); `initWithIo` + `configureVault` / `loadFromVault`
 - CSRF: `http_middleware.csrf()` double-submit cookie pattern
 - CSPRNG: multi-source entropy, never single-timestamp seed
 
@@ -171,6 +171,7 @@ test "my test" {
 - Roadmap: `docs/PRODUCTION_ROADMAP.md` (phases 1–5 ✅)
 - Modulith day-one practices: `docs/MODULITH.md`
 - Domain layering (model / persistence.Tx / service Cmd): `docs/MODULE_LAYERS.md`
+- ZigModu × zent (orthogonal ORM): `docs/ZENT.md` · example `examples/zent-modulith/`
 - Score: ~95/100 (`docs/EVALUATION_REPORT.md` v5)
 
 ## Learned User Preferences
@@ -179,10 +180,16 @@ test "my test" {
 - Do not create git commits unless the user explicitly asks.
 - Prefer the production-readiness plan without physically splitting `sqlx.zig` or `Server.zig`; use section comments plus `docs/PRODUCTION_ROADMAP.md` maintenance boundaries instead.
 - When generating framework code from SQL scripts (zmodu), follow zigmodu best practices for complete module output and place reusable templates in a dedicated templates folder.
+- When refining architecture or best practices, land them in docs (`docs/ZENT.md`, `MODULITH.md`, `MODULE_LAYERS.md`, `BEST_PRACTICES.md`) rather than chat-only advice.
+- When restructuring examples, preserve existing domain/business logic unless explicitly asked to change it.
 
 ## Learned Workspace Facts
 
 - Project targets Zig 0.17.0; current release tag is v0.14.2 (GitHub `chy3xyz/zigmodu`, default branch `master`).
 - If Zig global cache fails in sandboxed runs, use `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`.
 - Production roadmap and monolith maintenance rules live in `docs/PRODUCTION_ROADMAP.md`.
-- Current test baseline: **455 passed**, 12 skipped with `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`.
+- Current test baseline: **468 passed**, 14 skipped with `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test` (after gRPC/Kafka/Vault hardening).
+- Optional data stack: [chy3xyz/zent](https://github.com/chy3xyz/zent) (v0.12+) is orthogonal to `data.sqlx` — modules may choose either independently, but do not mix drivers or share a transaction across them; see `docs/ZENT.md`.
+- zent reference apps: `examples/zent-modulith/` (minimal) and `examples/metaverse-creative/` (settlement/outbox creative-monetization demo).
+- gRPC unary (`GrpcTransport`) and Kafka wire (`KafkaConnector`) paths are no longer EXPERIMENTAL; gRPC streaming still returns `UNIMPLEMENTED`.
+- Vault secrets: `security.SecretsManager` supports HashiCorp KV v2 over plain HTTP (`initWithIo` + `configureVault` / `loadFromVault`); `https://` returns `VaultTlsNotSupported`.
