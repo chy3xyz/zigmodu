@@ -48,6 +48,7 @@ pub const ZigModuError = error{
     // [...]Error
     DatabaseConnectionFailed,
     QueryExecutionFailed,
+    QueryFailed,
     ConnectionPoolExhausted,
     PoolUnhealthy,
     DatabaseError,

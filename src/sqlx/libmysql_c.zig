@@ -42,7 +42,19 @@ pub const MYSQL_TYPE_VARCHAR = 15;
 pub const MYSQL_TYPE_TINY = 1;
 pub const MYSQL_TYPE_SHORT = 2;
 pub const MYSQL_TYPE_FLOAT = 4;
+pub const MYSQL_TYPE_TIMESTAMP = 7;
+pub const MYSQL_TYPE_DATE = 10;
+pub const MYSQL_TYPE_TIME = 11;
+pub const MYSQL_TYPE_DATETIME = 12;
+pub const MYSQL_TYPE_NEWDECIMAL = 246;
+pub const MYSQL_TYPE_TINY_BLOB = 249;
+pub const MYSQL_TYPE_MEDIUM_BLOB = 250;
+pub const MYSQL_TYPE_LONG_BLOB = 251;
 pub const MYSQL_TYPE_BLOB = 252;
+
+/// MYSQL_FIELD.flags — column flags
+pub const UNSIGNED_FLAG: c_uint = 32;
+pub const NOT_NULL_FLAG: c_uint = 1;
 
 /// MariaDB `my_bool` / C `_Bool` — 1 byte.
 pub const my_bool = u8;
@@ -51,6 +63,16 @@ pub const my_bool = u8;
 pub const MYSQL_NO_DATA: c_int = 100;
 /// `MYSQL_DATA_TRUNCATED` — fetch indicated truncation.
 pub const MYSQL_DATA_TRUNCATED: c_int = 101;
+
+/// mysql_options constants
+pub const MYSQL_OPT_CONNECT_TIMEOUT: c_int = 0;
+pub const MYSQL_OPT_READ_TIMEOUT: c_int = 11;
+pub const MYSQL_OPT_SSL_MODE: c_int = 1053;
+
+/// SSL mode enum values (mysql_options with MYSQL_OPT_SSL_MODE)
+pub const SSL_MODE_DISABLED: c_int = 1;
+pub const SSL_MODE_PREFERRED: c_int = 2;
+pub const SSL_MODE_REQUIRED: c_int = 3;
 
 /// Prepared-statement bind buffer (MariaDB Connector/C layout).
 pub const MYSQL_BIND = extern struct {
@@ -121,3 +143,8 @@ pub extern "c" fn mysql_stmt_errno(stmt: ?*MYSQL_STMT) c_uint;
 pub extern "c" fn mysql_stmt_error(stmt: ?*MYSQL_STMT) [*c]const u8;
 pub extern "c" fn mysql_stmt_result_metadata(stmt: ?*MYSQL_STMT) ?*MYSQL_RES;
 pub extern "c" fn mysql_stmt_num_rows(stmt: ?*MYSQL_STMT) c_ulonglong;
+
+// ---- Connection options ----
+pub extern "c" fn mysql_options(mysql: ?*MYSQL, option: c_int, arg: ?*const anyopaque) c_int;
+pub extern "c" fn mysql_set_character_set(mysql: ?*MYSQL, csname: [*c]const u8) c_int;
+pub extern "c" fn mysql_ping(mysql: ?*MYSQL) c_int;

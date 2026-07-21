@@ -239,6 +239,55 @@ pub fn diagnosePostgres(result: ?*const libpq_c.PGresult) SqlDiagnostic {
     return diag;
 }
 
+/// Parse MySQL error message to extract table/column from constraint failures.
+pub fn diagnoseMysql(err_no: c_uint, err_msg: []const u8) SqlDiagnostic {
+    var diag = SqlDiagnostic{ .code = @intCast(err_no), .message = err_msg };
+
+    // "Duplicate entry 'value' for key 'table.column'"
+    if (std.mem.indexOf(u8, err_msg, "Duplicate entry")) |pos| {
+        const rest = err_msg[pos..];
+        if (std.mem.indexOf(u8, rest, "for key '")) |key_pos| {
+            const key = rest[key_pos + 9 ..];
+            if (std.mem.indexOf(u8, key, "'")) |end_pos| {
+                const key_name = key[0..end_pos];
+                diag.constraint = key_name;
+                if (std.mem.indexOf(u8, key_name, ".")) |dot| {
+                    diag.table = key_name[0..dot];
+                    diag.column = key_name[dot + 1 ..];
+                } else {
+                    diag.table = key_name;
+                }
+            }
+        }
+    }
+    // "Column 'col' cannot be null"
+    if (std.mem.indexOf(u8, err_msg, "Column '")) |pos| {
+        const rest = err_msg[pos + 8 ..];
+        if (std.mem.indexOf(u8, rest, "'")) |end_pos| {
+            diag.column = rest[0..end_pos];
+        }
+    }
+    // "Table 'db.table' doesn't exist"
+    if (std.mem.indexOf(u8, err_msg, "Table '")) |pos| {
+        const rest = err_msg[pos + 7 ..];
+        if (std.mem.indexOf(u8, rest, "'")) |end_pos| {
+            const table_name = rest[0..end_pos];
+            if (std.mem.indexOf(u8, table_name, ".")) |dot| {
+                diag.table = table_name[dot + 1 ..];
+            } else {
+                diag.table = table_name;
+            }
+        }
+    }
+
+    // Log diagnostic details in error paths
+    if (diag.table != null or diag.column != null or diag.constraint != null) {
+        std.log.err("MySQL diagnostic: errno={d} table={?s} column={?s} constraint={?s}", .{ err_no, diag.table, diag.column, diag.constraint });
+    }
+
+    return diag;
+}
+
 /// SQL connection interface
 pub const Conn = struct {
     ptr: *anyopaque,
@@ -1837,10 +1886,32 @@ fn mysqlReadRowsAfterQuery(mysql: ?*libmysql_c.MYSQL, arena: std.heap.ArenaAlloc
 /// Map MySQL/MariaDB errno to ZigModu errors.
 fn mysqlErrnoToError(err_no: c_uint) errors.Error {
     return switch (err_no) {
-        1062, 1586 => error.ConstraintViolation,
+        // Constraint violations
+        1062, 1586 => error.ConstraintViolation, // ER_DUP_ENTRY, ER_DUP_ENTRY_WITH_KEY_NAME
+        1451, 1452, 1216, 1217 => error.ConstraintViolation, // FK violations
+        1048 => error.ConstraintViolation, // ER_BAD_NULL_ERROR
+        // Not found
+        1146 => error.NotFound, // ER_NO_SUCH_TABLE
+        1054 => error.NotFound, // ER_BAD_FIELD_ERROR
+        // Connection failures
+        2006, 2013, 2003 => error.DatabaseConnectionFailed, // ER_SERVER_GONE, ER_QUERY_INTERRUPTED, ER_CONN_HOST_ERROR
+        // Query failures
+        1064 => error.QueryFailed, // ER_PARSE_ERROR
+        // Default
         else => error.DatabaseError,
     };
 }
+
+/// Per-column bind buffer for binary result-set reading.
+const MysqlBindBuffer = union(enum) {
+    tiny: u8,
+    short: i16,
+    long: i32,
+    longlong: i64,
+    float: f32,
+    double: f64,
+    string: struct { buf: [4096]u8, len: usize = 0 },
+};
 
 /// Bind `args` onto a prepared statement. Scratch storage lives in `arena`.
 fn mysqlBindParams(stmt: *libmysql_c.MYSQL_STMT, arena: std.mem.Allocator, args: []const Value) !void {
@@ -1902,7 +1973,7 @@ fn mysqlBindParams(stmt: *libmysql_c.MYSQL_STMT, arena: std.mem.Allocator, args:
     }
 }
 
-/// After successful `mysql_stmt_execute` for a result-producing statement, fetch rows as text.
+/// After successful `mysql_stmt_execute` for a result-producing statement, fetch rows with binary decoding.
 fn mysqlStmtReadRows(stmt: *libmysql_c.MYSQL_STMT, arena: std.heap.ArenaAllocator) errors.ResultT(Rows) {
     var arena_mut = arena;
     const arena_alloc = arena_mut.allocator();
@@ -1930,23 +2001,93 @@ fn mysqlStmtReadRows(stmt: *libmysql_c.MYSQL_STMT, arena: std.heap.ArenaAllocato
     const null_flags = arena_alloc.alloc(libmysql_c.my_bool, n_cols) catch return error.DatabaseError;
     const lengths = arena_alloc.alloc(c_ulong, n_cols) catch return error.DatabaseError;
     const err_flags = arena_alloc.alloc(libmysql_c.my_bool, n_cols) catch return error.DatabaseError;
+    const bind_bufs = arena_alloc.alloc(MysqlBindBuffer, n_cols) catch return error.DatabaseError;
+    const is_unsigned_flags = arena_alloc.alloc(libmysql_c.my_bool, n_cols) catch return error.DatabaseError;
 
     for (0..n_cols) |c| {
         const field = fields[c];
         const name = field.name[0..field.name_length];
         shared_columns[c] = arena_alloc.dupe(u8, name) catch return error.DatabaseError;
 
-        // Prefer max_length after store_result; fall back to declared length / 256.
-        var buf_len: usize = @intCast(if (field.max_length > 0) field.max_length else field.length);
-        if (buf_len < 64) buf_len = 64;
-        if (buf_len > 1 << 20) buf_len = 1 << 20; // 1 MiB cap per column
-        buf_len += 1; // NUL room
-        const buf = arena_alloc.alloc(u8, buf_len) catch return error.DatabaseError;
+        const unsigned = (field.flags & libmysql_c.UNSIGNED_FLAG) != 0;
+        is_unsigned_flags[c] = if (unsigned) 1 else 0;
 
-        binds[c].buffer_type = libmysql_c.MYSQL_TYPE_STRING;
-        binds[c].buffer = buf.ptr;
-        binds[c].buffer_length = @intCast(buf_len);
-        binds[c].length = &lengths[c];
+        // Initialize bind buffer based on column type
+        bind_bufs[c] = switch (field.type) {
+            libmysql_c.MYSQL_TYPE_TINY => .{ .tiny = 0 },
+            libmysql_c.MYSQL_TYPE_SHORT => .{ .short = 0 },
+            libmysql_c.MYSQL_TYPE_LONG => .{ .long = 0 },
+            libmysql_c.MYSQL_TYPE_LONGLONG => .{ .longlong = 0 },
+            libmysql_c.MYSQL_TYPE_FLOAT => .{ .float = 0 },
+            libmysql_c.MYSQL_TYPE_DOUBLE => .{ .double = 0 },
+            else => blk: {
+                var buf: [4096]u8 = undefined;
+                @memset(&buf, 0);
+                break :blk .{ .string = .{ .buf = buf } };
+            },
+        };
+
+        // Set up bind descriptors per column type
+        switch (field.type) {
+            libmysql_c.MYSQL_TYPE_TINY => {
+                binds[c].buffer_type = libmysql_c.MYSQL_TYPE_TINY;
+                binds[c].buffer = @ptrCast(&bind_bufs[c].tiny);
+                binds[c].buffer_length = @sizeOf(u8);
+                binds[c].is_unsigned = is_unsigned_flags[c];
+            },
+            libmysql_c.MYSQL_TYPE_SHORT => {
+                binds[c].buffer_type = libmysql_c.MYSQL_TYPE_SHORT;
+                binds[c].buffer = @ptrCast(&bind_bufs[c].short);
+                binds[c].buffer_length = @sizeOf(i16);
+                binds[c].is_unsigned = is_unsigned_flags[c];
+            },
+            libmysql_c.MYSQL_TYPE_LONG => {
+                binds[c].buffer_type = libmysql_c.MYSQL_TYPE_LONG;
+                binds[c].buffer = @ptrCast(&bind_bufs[c].long);
+                binds[c].buffer_length = @sizeOf(i32);
+                binds[c].is_unsigned = is_unsigned_flags[c];
+            },
+            libmysql_c.MYSQL_TYPE_LONGLONG => {
+                binds[c].buffer_type = libmysql_c.MYSQL_TYPE_LONGLONG;
+                binds[c].buffer = @ptrCast(&bind_bufs[c].longlong);
+                binds[c].buffer_length = @sizeOf(i64);
+                binds[c].is_unsigned = is_unsigned_flags[c];
+            },
+            libmysql_c.MYSQL_TYPE_FLOAT => {
+                binds[c].buffer_type = libmysql_c.MYSQL_TYPE_FLOAT;
+                binds[c].buffer = @ptrCast(&bind_bufs[c].float);
+                binds[c].buffer_length = @sizeOf(f32);
+                binds[c].is_unsigned = 0;
+            },
+            libmysql_c.MYSQL_TYPE_DOUBLE => {
+                binds[c].buffer_type = libmysql_c.MYSQL_TYPE_DOUBLE;
+                binds[c].buffer = @ptrCast(&bind_bufs[c].double);
+                binds[c].buffer_length = @sizeOf(f64);
+                binds[c].is_unsigned = 0;
+            },
+            // BLOB types (249-252) and VARCHAR/VAR_STRING: bind as BLOB with length+ptr
+            libmysql_c.MYSQL_TYPE_BLOB,
+            libmysql_c.MYSQL_TYPE_TINY_BLOB,
+            libmysql_c.MYSQL_TYPE_MEDIUM_BLOB,
+            libmysql_c.MYSQL_TYPE_LONG_BLOB,
+            libmysql_c.MYSQL_TYPE_VAR_STRING,
+            libmysql_c.MYSQL_TYPE_VARCHAR,
+            => {
+                binds[c].buffer_type = libmysql_c.MYSQL_TYPE_BLOB;
+                binds[c].buffer = @ptrCast(&bind_bufs[c].string.buf);
+                binds[c].buffer_length = bind_bufs[c].string.buf.len;
+                binds[c].length = &lengths[c];
+                binds[c].is_unsigned = 0;
+            },
+            // DECIMAL, NEWDECIMAL, DATE, TIME, DATETIME, TIMESTAMP, and default: keep as STRING
+            else => {
+                binds[c].buffer_type = libmysql_c.MYSQL_TYPE_STRING;
+                binds[c].buffer = @ptrCast(&bind_bufs[c].string.buf);
+                binds[c].buffer_length = bind_bufs[c].string.buf.len;
+                binds[c].length = &lengths[c];
+                binds[c].is_unsigned = 0;
+            },
+        }
         binds[c].is_null = &null_flags[c];
         binds[c].@"error" = &err_flags[c];
     }
@@ -1978,9 +2119,48 @@ fn mysqlStmtReadRows(stmt: *libmysql_c.MYSQL_STMT, arena: std.heap.ArenaAllocato
             if (null_flags[c] != 0) {
                 values[c] = null;
             } else {
-                const len: usize = @intCast(lengths[c]);
-                const buf: [*]u8 = @ptrCast(binds[c].buffer.?);
-                values[c] = .{ .string = arena_alloc.dupe(u8, buf[0..len]) catch return error.DatabaseError };
+                values[c] = switch (fields[c].type) {
+                    libmysql_c.MYSQL_TYPE_TINY => blk: {
+                        if (is_unsigned_flags[c] != 0) {
+                            break :blk Value{ .int = @as(i64, bind_bufs[c].tiny) };
+                        } else {
+                            break :blk Value{ .int = @as(i64, @as(i8, @bitCast(bind_bufs[c].tiny))) };
+                        }
+                    },
+                    libmysql_c.MYSQL_TYPE_SHORT => blk: {
+                        if (is_unsigned_flags[c] != 0) {
+                            break :blk Value{ .int = @as(i64, @as(u16, @bitCast(bind_bufs[c].short))) };
+                        } else {
+                            break :blk Value{ .int = @as(i64, bind_bufs[c].short) };
+                        }
+                    },
+                    libmysql_c.MYSQL_TYPE_LONG => blk: {
+                        if (is_unsigned_flags[c] != 0) {
+                            break :blk Value{ .int = @as(i64, @as(u32, @bitCast(bind_bufs[c].long))) };
+                        } else {
+                            break :blk Value{ .int = @as(i64, bind_bufs[c].long) };
+                        }
+                    },
+                    libmysql_c.MYSQL_TYPE_LONGLONG => blk: {
+                        break :blk Value{ .int = bind_bufs[c].longlong };
+                    },
+                    libmysql_c.MYSQL_TYPE_FLOAT => Value{ .float = @as(f64, bind_bufs[c].float) },
+                    libmysql_c.MYSQL_TYPE_DOUBLE => Value{ .float = bind_bufs[c].double },
+                    // BLOB types: store as string (like bytea)
+                    libmysql_c.MYSQL_TYPE_BLOB,
+                    libmysql_c.MYSQL_TYPE_TINY_BLOB,
+                    libmysql_c.MYSQL_TYPE_MEDIUM_BLOB,
+                    libmysql_c.MYSQL_TYPE_LONG_BLOB,
+                    => blk: {
+                        const len: usize = @intCast(lengths[c]);
+                        break :blk Value{ .string = arena_alloc.dupe(u8, bind_bufs[c].string.buf[0..len]) catch return error.DatabaseError };
+                    },
+                    // STRING fallback (DECIMAL, DATE/TIME, VARCHAR, etc.)
+                    else => blk: {
+                        const len: usize = @intCast(lengths[c]);
+                        break :blk Value{ .string = arena_alloc.dupe(u8, bind_bufs[c].string.buf[0..len]) catch return error.DatabaseError };
+                    },
+                };
             }
         }
         rows_list.append(arena_alloc, .{ .arena = undefined, .columns = shared_columns, .values = values }) catch return error.DatabaseError;
@@ -2010,18 +2190,44 @@ pub const MySqlConn = struct {
     pub fn connect(allocator: std.mem.Allocator, host: []const u8, user: []const u8, password: []const u8, db: []const u8, port: u32) !MySqlConn {
         const mysql = libmysql_c.mysql_init(null);
         if (mysql == null) return error.DatabaseError;
+
+        // Connection timeouts (P1-5)
+        _ = libmysql_c.mysql_options(mysql, libmysql_c.MYSQL_OPT_CONNECT_TIMEOUT, @ptrCast(@constCast(&@as(c_uint, 10))));
+        _ = libmysql_c.mysql_options(mysql, libmysql_c.MYSQL_OPT_READ_TIMEOUT, @ptrCast(@constCast(&@as(c_uint, 30))));
+
+        // SSL/TLS support (P0-3)
+        const ssl_mode = if (std.c.getenv("MYSQL_SSL_MODE")) |v| std.mem.span(v) else "preferred";
+        if (std.mem.eql(u8, ssl_mode, "disabled")) {
+            // Don't set SSL
+        } else if (std.mem.eql(u8, ssl_mode, "required")) {
+            _ = libmysql_c.mysql_options(mysql, libmysql_c.MYSQL_OPT_SSL_MODE, @ptrCast(@constCast(&libmysql_c.SSL_MODE_REQUIRED)));
+        } else {
+            _ = libmysql_c.mysql_options(mysql, libmysql_c.MYSQL_OPT_SSL_MODE, @ptrCast(@constCast(&libmysql_c.SSL_MODE_PREFERRED)));
+        }
+
         // "" has ptr=null; mysql_real_connect interprets null as "no password".
         // Use "\x00" (null terminator only) as a null-terminated empty string instead.
         const password_cstr: [*c]const u8 = if (password.len > 0) @ptrCast(password.ptr) else @ptrCast("\x00");
         // Use Unix socket for localhost connections (avoids TCP auth issues with
         // caching_sha2_password which MariaDB Connector/C doesn't support with MySQL 8).
         const use_socket = std.mem.eql(u8, host, "localhost") or std.mem.eql(u8, host, "127.0.0.1");
-        const socket_path: [*c]const u8 = if (use_socket) @ptrCast("/tmp/mysql.sock") else @ptrCast("\x00");
+        // Socket path from MYSQL_UNIX_PORT env var, or default (P2-9)
+        const socket_path: [*c]const u8 = if (use_socket)
+            if (std.c.getenv("MYSQL_UNIX_PORT")) |sp| @ptrCast(sp) else @ptrCast("/tmp/mysql.sock")
+        else
+            @ptrCast("\x00");
         const conn = libmysql_c.mysql_real_connect(mysql, @ptrCast(host.ptr), @ptrCast(user.ptr), password_cstr, @ptrCast(db.ptr), @intCast(port), socket_path, 0);
         if (conn == null) {
+            const err_no = libmysql_c.mysql_errno(mysql);
+            const err_msg = std.mem.span(libmysql_c.mysql_error(mysql));
+            std.log.err("MySQL connect error: errno={d} msg={s}", .{ err_no, err_msg });
             libmysql_c.mysql_close(mysql);
             return error.DatabaseError;
         }
+
+        // Set charset to utf8mb4 (P1-6)
+        _ = libmysql_c.mysql_set_character_set(mysql, "utf8mb4");
+
         return .{
             .mysql = mysql,
             .allocator = allocator,
@@ -2202,10 +2408,7 @@ pub const MySqlConn = struct {
         const self = @as(*MySqlConn, @ptrCast(@alignCast(ptr)));
         self.guard();
         if (self.mysql == null) return error.DatabaseError;
-        const rc = libmysql_c.mysql_real_query(self.mysql, "SELECT 1", @intCast("SELECT 1".len));
-        if (rc != 0) return error.DatabaseError;
-        const res = libmysql_c.mysql_store_result(self.mysql);
-        if (res) |r| libmysql_c.mysql_free_result(r);
+        return if (libmysql_c.mysql_ping(self.mysql) == 0) {} else error.DatabaseError;
     }
 
     fn beginFn(ptr: *anyopaque) errors.Result {
@@ -3366,6 +3569,7 @@ pub const Transaction = struct {
 
     /// Create a savepoint with the given name.
     pub fn savepoint(self: *Transaction, name: []const u8) !void {
+        validateIdentifier(name) catch return error.DatabaseError;
         const sql = try std.fmt.allocPrint(self.allocator, "SAVEPOINT {s}", .{name});
         defer self.allocator.free(sql);
         _ = try self.exec(sql, &.{});
@@ -3373,6 +3577,7 @@ pub const Transaction = struct {
 
     /// Rollback to a previously created savepoint.
     pub fn rollbackTo(self: *Transaction, name: []const u8) !void {
+        validateIdentifier(name) catch return error.DatabaseError;
         const sql = try std.fmt.allocPrint(self.allocator, "ROLLBACK TO {s}", .{name});
         defer self.allocator.free(sql);
         _ = try self.exec(sql, &.{});
@@ -3380,6 +3585,7 @@ pub const Transaction = struct {
 
     /// Release a savepoint.
     pub fn releaseSavepoint(self: *Transaction, name: []const u8) !void {
+        validateIdentifier(name) catch return error.DatabaseError;
         const sql = try std.fmt.allocPrint(self.allocator, "RELEASE SAVEPOINT {s}", .{name});
         defer self.allocator.free(sql);
         _ = try self.exec(sql, &.{});
