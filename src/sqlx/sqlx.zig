@@ -907,6 +907,9 @@ fn pgDecodeBinary(allocator: std.mem.Allocator, oid: libpq_c.Oid, bytes: []const
             const bits = std.mem.readInt(u64, bytes[0..8], .big);
             return .{ .float = @as(f64, @bitCast(bits)) };
         },
+        PgOid.numeric => {
+            return pgDecodeNumeric(allocator, bytes);
+        },
         PgOid.text, PgOid.varchar, PgOid.bpchar, PgOid.name, PgOid.xml, PgOid.json, PgOid.char_t, PgOid.bytea => {
             return .{ .string = try allocator.dupe(u8, bytes) };
         },
@@ -957,6 +960,102 @@ fn pgDecodeBinary(allocator: std.mem.Allocator, oid: libpq_c.Oid, bytes: []const
             return .{ .string = hex };
         },
     }
+}
+
+/// Decode PostgreSQL numeric binary format (OID 1700).
+///
+/// Binary layout: int16 ndigits, int16 weight, uint16 sign, uint16 dscale, uint16 digits[ndigits].
+/// Each digit is base-10000. sign: 0x0000=positive, 0x4000=negative, 0xC000=NaN.
+///
+/// Strategy: expand every digit to 4 decimal digits, then insert the decimal point and strip
+/// superfluous trailing zeros. Returns a decimal string suitable for valueToType → f64/i64.
+fn pgDecodeNumeric(allocator: std.mem.Allocator, bytes: []const u8) !Value {
+    if (bytes.len < 8) return error.DatabaseError;
+    const ndigits = std.mem.readInt(i16, bytes[0..2], .big);
+    const weight = std.mem.readInt(i16, bytes[2..4], .big);
+    const sign = std.mem.readInt(u16, bytes[4..6], .big);
+    const dscale = std.mem.readInt(u16, bytes[6..8], .big);
+
+    if (sign == 0xC000) return .{ .string = try allocator.dupe(u8, "NaN") };
+    if (ndigits <= 0) return .{ .string = try allocator.dupe(u8, "0") };
+
+    const n: usize = @intCast(ndigits);
+    if (bytes.len < 8 + n * 2) return error.DatabaseError;
+
+    // Phase 1: expand each base-10000 digit into 4 decimal digits → flat digit list.
+    //   digits_before_dot = (weight + 1) * 4
+    //   dot position from left = digits_before_dot (0 = before first char, n*4 = after last)
+    const digits_before_dot: usize = if (weight >= 0) @intCast((@as(isize, @intCast(weight)) + 1) * 4) else 0;
+    const total_digits: usize = n * 4;
+    var dec = try allocator.alloc(u8, total_digits);
+    errdefer allocator.free(dec);
+
+    for (0..n) |di| {
+        const base: usize = di * 4;
+        var d = std.mem.readInt(u16, bytes[8 + di * 2 ..][0..2], .big);
+        dec[base + 3] = @intCast(d % 10 + '0'); d /= 10;
+        dec[base + 2] = @intCast(d % 10 + '0'); d /= 10;
+        dec[base + 1] = @intCast(d % 10 + '0'); d /= 10;
+        dec[base + 0] = @intCast(d + '0');
+    }
+
+    // Phase 2: build final string with sign, stripped leading zeros, decimal point.
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    const is_neg = sign == 0x4000;
+    if (is_neg) try out.append(allocator, '-');
+
+    // Find first non-zero digit index
+    var first_nonzero: usize = 0;
+    while (first_nonzero < total_digits and dec[first_nonzero] == '0') : (first_nonzero += 1) {}
+
+    if (first_nonzero >= total_digits) {
+        // All digits are zero → "0"
+        allocator.free(dec);
+        return .{ .string = try allocator.dupe(u8, "0") };
+    }
+
+    // If all significant digits are after the decimal point, we need a leading "0."
+    if (first_nonzero >= digits_before_dot) {
+        try out.append(allocator, '0');
+        try out.append(allocator, '.');
+
+        // Count: how many zeros between dot and first nonzero
+        const leading_zeros = first_nonzero - digits_before_dot;
+        // How many actual digit chars we'll output
+        const frac_avail = total_digits - first_nonzero;
+        // Cap total fraction output to dscale
+        const frac_chars = if (dscale > leading_zeros) @min(frac_avail, dscale - leading_zeros) else 0;
+
+        for (0..leading_zeros) |_| try out.append(allocator, '0');
+        for (0..frac_chars) |i| try out.append(allocator, dec[first_nonzero + i]);
+        const need = if (dscale > leading_zeros + frac_chars) dscale - leading_zeros - frac_chars else 0;
+        for (0..need) |_| try out.append(allocator, '0');
+    } else {
+        // Insert digits_before_dot integer digits, then ".", then remaining up to dscale
+        const int_end = @min(digits_before_dot, total_digits);
+        for (first_nonzero..int_end) |i| try out.append(allocator, dec[i]);
+
+        // Decimal part
+        if (dscale > 0) {
+            try out.append(allocator, '.');
+            const frac_start: usize = digits_before_dot;
+            const frac_end = @min(total_digits, frac_start + dscale);
+            var frac_printed: usize = 0;
+            for (frac_start..frac_end) |i| {
+                try out.append(allocator, dec[i]);
+                frac_printed += 1;
+            }
+            // Pad with zeros if not enough digits
+            const need = if (dscale > frac_printed) dscale - frac_printed else 0;
+            for (0..need) |_| try out.append(allocator, '0');
+        }
+    }
+
+    allocator.free(dec);
+    const result = try out.toOwnedSlice(allocator);
+    return .{ .string = result };
 }
 
 /// Format PG date (days since 2000-01-01) as `YYYY-MM-DD`.
@@ -4217,6 +4316,79 @@ test "pgDecodeBinary scalars and uuid" {
     const date = try pgDecodeBinary(allocator, PgOid.date, &date_buf);
     defer allocator.free(date.string);
     try std.testing.expectEqualStrings("2000-01-01", date.string);
+}
+
+test "pgDecodeNumeric integers" {
+    const allocator = std.testing.allocator;
+
+    // 123.45: ndigits=2, weight=0, sign=0, dscale=2
+    // digit[0]=123 (10000^0), digit[1]=4500 (10000^-1)
+    var buf: [12]u8 = undefined;
+    std.mem.writeInt(i16, buf[0..2], 2, .big);    // ndigits
+    std.mem.writeInt(i16, buf[2..4], 0, .big);    // weight
+    std.mem.writeInt(u16, buf[4..6], 0, .big);    // sign (positive)
+    std.mem.writeInt(u16, buf[6..8], 2, .big);    // dscale
+    std.mem.writeInt(u16, buf[8..10], 123, .big); // digit 0
+    std.mem.writeInt(u16, buf[10..12], 4500, .big);// digit 1
+    const v = try pgDecodeNumeric(allocator, &buf);
+    defer allocator.free(v.string);
+    try std.testing.expectEqualStrings("123.45", v.string);
+}
+
+test "pgDecodeNumeric negative" {
+    const allocator = std.testing.allocator;
+    // -789: ndigits=1, weight=0, sign=0x4000, dscale=0
+    var buf: [10]u8 = undefined;
+    std.mem.writeInt(i16, buf[0..2], 1, .big);    // ndigits
+    std.mem.writeInt(i16, buf[2..4], 0, .big);    // weight
+    std.mem.writeInt(u16, buf[4..6], 0x4000, .big);// sign (negative)
+    std.mem.writeInt(u16, buf[6..8], 0, .big);    // dscale
+    std.mem.writeInt(u16, buf[8..10], 789, .big); // digit
+    const v = try pgDecodeNumeric(allocator, &buf);
+    defer allocator.free(v.string);
+    try std.testing.expectEqualStrings("-789", v.string);
+}
+
+test "pgDecodeNumeric large integer" {
+    const allocator = std.testing.allocator;
+    // 10000: ndigits=2, weight=1, sign=0, dscale=0
+    // digits: 1, 0
+    var buf: [12]u8 = undefined;
+    std.mem.writeInt(i16, buf[0..2], 2, .big);    // ndigits
+    std.mem.writeInt(i16, buf[2..4], 1, .big);    // weight (=1 means 8 int digits before dot)
+    std.mem.writeInt(u16, buf[4..6], 0, .big);    // sign
+    std.mem.writeInt(u16, buf[6..8], 0, .big);    // dscale
+    std.mem.writeInt(u16, buf[8..10], 1, .big);   // digit 0
+    std.mem.writeInt(u16, buf[10..12], 0, .big);  // digit 1
+    const v = try pgDecodeNumeric(allocator, &buf);
+    defer allocator.free(v.string);
+    try std.testing.expectEqualStrings("10000", v.string);
+}
+
+test "pgDecodeNumeric pure fraction" {
+    const allocator = std.testing.allocator;
+    // 0.005: 0.005 = 50 * 10000^-1, so ndigits=1, weight=-1, sign=0, dscale=3
+    var buf: [10]u8 = undefined;
+    std.mem.writeInt(i16, buf[0..2], 1, .big);    // ndigits
+    std.mem.writeInt(i16, buf[2..4], -1, .big);   // weight
+    std.mem.writeInt(u16, buf[4..6], 0, .big);    // sign
+    std.mem.writeInt(u16, buf[6..8], 3, .big);    // dscale
+    std.mem.writeInt(u16, buf[8..10], 50, .big);  // digit = 50 (= 0.005 * 10000^1)
+    const v = try pgDecodeNumeric(allocator, &buf);
+    defer allocator.free(v.string);
+    try std.testing.expectEqualStrings("0.005", v.string);
+}
+
+test "pgDecodeNumeric NaN" {
+    const allocator = std.testing.allocator;
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(i16, buf[0..2], 0, .big);    // ndigits = 0
+    std.mem.writeInt(i16, buf[2..4], 0, .big);    // weight
+    std.mem.writeInt(u16, buf[4..6], 0xC000, .big);// sign = NaN
+    std.mem.writeInt(u16, buf[6..8], 0, .big);    // dscale
+    const v = try pgDecodeNumeric(allocator, &buf);
+    defer allocator.free(v.string);
+    try std.testing.expectEqualStrings("NaN", v.string);
 }
 
 test "postgres config init" {
