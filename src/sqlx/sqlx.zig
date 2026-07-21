@@ -221,7 +221,7 @@ pub fn diagnosePostgres(result: ?*const libpq_c.PGresult) SqlDiagnostic {
 
     const sqlstate = if (result) |r| std.mem.span(libpq_c.PQresultErrorField(r, PG_DIAG_SQLSTATE)) else "";
     if (sqlstate.len > 0) {
-        diag.code = @intCast(sqlstate.len); // store sqlstate length in code for type compatibility
+        diag.code = std.fmt.parseInt(i32, sqlstate, 10) catch 0;
     }
 
     const msg = if (result) |r| std.mem.span(libpq_c.PQresultErrorMessage(r)) else "";
@@ -855,11 +855,16 @@ const PgOid = struct {
     const bpchar: libpq_c.Oid = 1042;
     const varchar: libpq_c.Oid = 1043;
     const date: libpq_c.Oid = 1082;
+    const time: libpq_c.Oid = 1083;
     const timestamp: libpq_c.Oid = 1114;
     const timestamptz: libpq_c.Oid = 1184;
+    const interval: libpq_c.Oid = 1186;
+    const timetz: libpq_c.Oid = 1266;
     const numeric: libpq_c.Oid = 1700;
     const uuid: libpq_c.Oid = 2950;
     const jsonb: libpq_c.Oid = 3802;
+    const inet: libpq_c.Oid = 869;
+    const cidr: libpq_c.Oid = 650;
 };
 
 /// Decode one PG cell. Handles text (`PQexec`) and binary (`resultFormat=1`) results.
@@ -941,7 +946,44 @@ fn pgDecodeBinary(allocator: std.mem.Allocator, oid: libpq_c.Oid, bytes: []const
             // microseconds since 2000-01-01 00:00:00
             if (bytes.len < 8) return error.DatabaseError;
             const us = std.mem.readInt(i64, bytes[0..8], .big);
-            const s = try pgFormatTimestamp(allocator, us);
+            const is_tz = oid == PgOid.timestamptz;
+            const s = try pgFormatTimestamp(allocator, us, is_tz);
+            return .{ .string = s };
+        },
+        PgOid.interval => {
+            // Binary: int64 us (microseconds), int32 days, int32 months
+            if (bytes.len < 16) return error.DatabaseError;
+            const us = std.mem.readInt(i64, bytes[0..8], .big);
+            const days = std.mem.readInt(i32, bytes[8..12], .big);
+            const months = std.mem.readInt(i32, bytes[12..16], .big);
+            const s = try pgFormatInterval(allocator, months, days, us);
+            return .{ .string = s };
+        },
+        PgOid.time => {
+            // int64 microseconds since midnight
+            if (bytes.len < 8) return error.DatabaseError;
+            const us = std.mem.readInt(i64, bytes[0..8], .big);
+            const s = try pgFormatTime(allocator, us, 0);
+            return .{ .string = s };
+        },
+        PgOid.timetz => {
+            // int64 us + int32 tz_offset_seconds
+            if (bytes.len < 12) return error.DatabaseError;
+            const us = std.mem.readInt(i64, bytes[0..8], .big);
+            const tz_offset = std.mem.readInt(i32, bytes[8..12], .big);
+            const s = try pgFormatTime(allocator, us, tz_offset);
+            return .{ .string = s };
+        },
+        PgOid.inet, PgOid.cidr => {
+            // Binary: u8 family, u8 prefix_len, u8 is_cidr, u8 nbytes, u8 addr[nbytes]
+            if (bytes.len < 4) return error.DatabaseError;
+            const family = bytes[0];
+            const prefix_len = bytes[1];
+            const is_cidr = bytes[2] == 1;
+            const nbytes = bytes[3];
+            if (bytes.len < 4 + nbytes) return error.DatabaseError;
+            const addr = bytes[4 .. 4 + nbytes];
+            const s = try pgFormatInet(allocator, family, prefix_len, is_cidr, addr);
             return .{ .string = s };
         },
         else => {
@@ -1089,7 +1131,8 @@ fn pgFormatDate(allocator: std.mem.Allocator, days_since_2000: i32) ![]u8 {
 }
 
 /// Format PG timestamp (µs since 2000-01-01) as ISO-8601 UTC `YYYY-MM-DDTHH:MM:SS.ffffff`.
-fn pgFormatTimestamp(allocator: std.mem.Allocator, us_since_2000: i64) ![]u8 {
+/// When `is_tz` is true (timestamptz, OID 1184), appends `+00` suffix (PG stores timestamptz in UTC).
+fn pgFormatTimestamp(allocator: std.mem.Allocator, us_since_2000: i64, is_tz: bool) ![]u8 {
     const us_per_day: i64 = 86_400_000_000;
     const days: i32 = @intCast(@divFloor(us_since_2000, us_per_day));
     var us_rem = @mod(us_since_2000, us_per_day);
@@ -1101,6 +1144,15 @@ fn pgFormatTimestamp(allocator: std.mem.Allocator, us_since_2000: i64) ![]u8 {
     const h = @divFloor(secs, 3600);
     const mi = @divFloor(@mod(secs, 3600), 60);
     const s = @mod(secs, 60);
+    if (is_tz) {
+        return std.fmt.allocPrint(allocator, "{s}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}+00", .{
+            date,
+            @as(u32, @intCast(h)),
+            @as(u32, @intCast(mi)),
+            @as(u32, @intCast(s)),
+            @as(u32, @intCast(frac)),
+        });
+    }
     return std.fmt.allocPrint(allocator, "{s}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{
         date,
         @as(u32, @intCast(h)),
@@ -1108,6 +1160,122 @@ fn pgFormatTimestamp(allocator: std.mem.Allocator, us_since_2000: i64) ![]u8 {
         @as(u32, @intCast(s)),
         @as(u32, @intCast(frac)),
     });
+}
+
+/// Format PG interval (int32 months, int32 days, int64 microseconds) as ISO-8601 duration.
+/// When months/days > 0: `P[nY][nM][nD]T[nH][nM][nS]`; else: `HH:MM:SS.ffffff`.
+fn pgFormatInterval(allocator: std.mem.Allocator, months: i32, days: i32, us_total: i64) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    try buf.ensureTotalCapacity(allocator, 256);
+    errdefer buf.deinit(allocator);
+
+    if (months != 0 or days != 0) {
+        try buf.append(allocator, 'P');
+        if (months != 0) {
+            const s = try std.fmt.allocPrint(allocator, "{d}M", .{@abs(months)});
+            defer allocator.free(s);
+            try buf.appendSlice(allocator, s);
+        }
+        if (days != 0) {
+            const s = try std.fmt.allocPrint(allocator, "{d}D", .{@abs(days)});
+            defer allocator.free(s);
+            try buf.appendSlice(allocator, s);
+        }
+        if (us_total != 0) {
+            try buf.append(allocator, 'T');
+            try pgAppendTimePart(allocator, &buf, us_total);
+        }
+    } else {
+        try pgAppendTimePart(allocator, &buf, us_total);
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Append time part (HH:MM:SS.ffffff or -HH:MM:SS.ffffff) to an ArrayList.
+fn pgAppendTimePart(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), us_total: i64) !void {
+    var us = @abs(us_total);
+    if (us_total < 0) try buf.append(allocator, '-');
+
+    const h = @divFloor(@as(i64, @intCast(us)), 3_600_000_000);
+    us -= @as(u64, @intCast(h)) * 3_600_000_000;
+    const mi = @divFloor(@as(i64, @intCast(us)), 60_000_000);
+    us -= @as(u64, @intCast(mi)) * 60_000_000;
+    const s = @divFloor(@as(i64, @intCast(us)), 1_000_000);
+    const frac = us - @as(u64, @intCast(s)) * 1_000_000;
+    const time_str = try std.fmt.allocPrint(allocator, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{
+        @as(u32, @intCast(@abs(h))),
+        @as(u32, @intCast(@abs(mi))),
+        @as(u32, @intCast(@abs(s))),
+        @as(u32, @intCast(frac)),
+    });
+    defer allocator.free(time_str);
+    try buf.appendSlice(allocator, time_str);
+}
+
+/// Format PG time (µs since midnight) as `HH:MM:SS.ffffff` or `HH:MM:SS.ffffff±HH:MM`.
+fn pgFormatTime(allocator: std.mem.Allocator, us_since_midnight: i64, tz_offset_secs: i32) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    try buf.ensureTotalCapacity(allocator, 64);
+    errdefer buf.deinit(allocator);
+    try pgAppendTimePart(allocator, &buf, us_since_midnight);
+    if (tz_offset_secs != 0) {
+        const abs_offset = @abs(tz_offset_secs);
+        const tz_h = @divFloor(abs_offset, 3600);
+        const tz_m = @divFloor(@mod(abs_offset, 3600), 60);
+        const sign: u8 = if (tz_offset_secs >= 0) '+' else '-';
+        const tz_str = try std.fmt.allocPrint(allocator, "{c}{d:0>2}:{d:0>2}", .{ sign, tz_h, tz_m });
+        defer allocator.free(tz_str);
+        try buf.appendSlice(allocator, tz_str);
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Format PG inet/cidr binary as text representation.
+fn pgFormatInet(allocator: std.mem.Allocator, family: u8, prefix_len: u8, is_cidr: bool, addr: []const u8) ![]u8 {
+    if (family == 2) {
+        // AF_INET: 4 bytes
+        if (addr.len != 4) return error.DatabaseError;
+        // Mask network bits for CIDR
+        var masked = [_]u8{ 0, 0, 0, 0 };
+        @memcpy(&masked, addr);
+        if (is_cidr and prefix_len < 32) {
+            if (prefix_len == 0) {
+                @memset(&masked, 0);
+            } else {
+                const mask: u32 = @truncate(@as(u64, 0xFFFFFFFF) << @intCast(32 - prefix_len));
+                const host_bits = std.mem.readInt(u32, &masked, .big);
+                std.mem.writeInt(u32, &masked, host_bits & mask, .big);
+            }
+        }
+        return std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}/{d}", .{
+            masked[0], masked[1], masked[2], masked[3], prefix_len,
+        });
+    } else if (family == 3) {
+        // AF_INET6: 16 bytes
+        if (addr.len != 16) return error.DatabaseError;
+        var masked: [16]u8 = undefined;
+        @memcpy(&masked, addr);
+        if (is_cidr and prefix_len < 128) {
+            const byte_idx: usize = @intCast(prefix_len / 8);
+            const bit_in_byte: u8 = prefix_len % 8;
+            // Zero bytes at and after byte_idx, then restore partial byte prefix
+            for (byte_idx..16) |i| masked[i] = 0;
+            if (bit_in_byte > 0 and byte_idx < 16) {
+                // mask: keep top bit_in_byte bits, zero lower (8 - bit_in_byte) bits
+                const shift = @as(u3, @intCast(8 - bit_in_byte));
+                const m: u8 = @truncate(@as(u16, 0xFF) << shift);
+                masked[byte_idx] &= m;
+            }
+        }
+        return std.fmt.allocPrint(allocator, "{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}/{d}", .{
+            masked[0],  masked[1],  masked[2],  masked[3],
+            masked[4],  masked[5],  masked[6],  masked[7],
+            masked[8],  masked[9],  masked[10], masked[11],
+            masked[12], masked[13], masked[14], masked[15],
+            prefix_len,
+        });
+    }
+    return error.DatabaseError;
 }
 
 pub const PostgresConn = struct {
@@ -1457,66 +1625,6 @@ pub const PostgresConn = struct {
             null,
             PG_RESULT_BINARY,
         );
-    }
-
-    /// Fallback: direct PQexecParams (no caching). Used when prepared stmt fails.
-    fn execParams(self: *PostgresConn, sql_str: []const u8, args: []const Value) ?*libpq_c.PGresult {
-        if (self.conn == null) return null;
-
-        const param_count = args.len;
-        const paramValues = self.allocator.alloc(?[*]const u8, param_count) catch return null;
-        const paramLengths = self.allocator.alloc(c_int, param_count) catch {
-            self.allocator.free(paramValues);
-            return null;
-        };
-        const paramAllocs = self.allocator.alloc(?[]const u8, param_count) catch {
-            self.allocator.free(paramValues);
-            self.allocator.free(paramLengths);
-            return null;
-        };
-        @memset(paramAllocs, null);
-
-        defer {
-            for (paramAllocs) |maybe_alloc| {
-                if (maybe_alloc) |a| self.allocator.free(a);
-            }
-            self.allocator.free(paramAllocs);
-            self.allocator.free(paramLengths);
-            self.allocator.free(paramValues);
-        }
-
-        for (args, 0..) |arg, i| {
-            paramValues[i] = switch (arg) {
-                .null => blk: {
-                    paramLengths[i] = 0;
-                    break :blk null;
-                },
-                .int => |v| blk: {
-                    const s = std.fmt.allocPrint(self.allocator, "{d}", .{v}) catch return null;
-                    paramAllocs[i] = s;
-                    paramLengths[i] = @intCast(s.len);
-                    break :blk @ptrCast(s.ptr);
-                },
-                .float => |v| blk: {
-                    const s = std.fmt.allocPrint(self.allocator, "{d}", .{v}) catch return null;
-                    paramAllocs[i] = s;
-                    paramLengths[i] = @intCast(s.len);
-                    break :blk @ptrCast(s.ptr);
-                },
-                .string => |v| blk: {
-                    paramLengths[i] = @intCast(v.len);
-                    break :blk @ptrCast(v.ptr);
-                },
-                .bool => |v| blk: {
-                    paramLengths[i] = 1;
-                    break :blk if (v) @ptrCast("t") else @ptrCast("f");
-                },
-            };
-        }
-
-        const pg_sql = convertPlaceholders(self.allocator, sql_str) orelse return null;
-        defer self.allocator.free(pg_sql);
-        return libpq_c.PQexecParams(self.conn, @ptrCast(pg_sql.ptr), @intCast(param_count), null, @ptrCast(paramValues.ptr), @ptrCast(paramLengths.ptr), null, PG_RESULT_BINARY);
     }
 
     fn convertPlaceholders(allocator: std.mem.Allocator, sql: []const u8) ?[:0]u8 {
@@ -2918,7 +3026,13 @@ pub const Client = struct {
             return conn.query(self.allocator, sql_str, args);
         }
         if (self.conn == null) try self.connect();
-        return self.conn.?.query(self.allocator, sql_str, args);
+        return self.conn.?.query(self.allocator, sql_str, args) catch {
+            // Single-connection reconnect on failure
+            self.conn.?.close();
+            self.conn = null;
+            try self.connect();
+            return self.conn.?.query(self.allocator, sql_str, args);
+        };
     }
 
     pub fn query(self: *Client, sql_str: []const u8, args: []const Value) !Rows {
@@ -2952,7 +3066,13 @@ pub const Client = struct {
             return conn.exec(sql_str, args);
         }
         if (self.conn == null) try self.connect();
-        return self.conn.?.exec(sql_str, args);
+        return self.conn.?.exec(sql_str, args) catch {
+            // Single-connection reconnect on failure
+            self.conn.?.close();
+            self.conn = null;
+            try self.connect();
+            return self.conn.?.exec(sql_str, args);
+        };
     }
 
     pub fn exec(self: *Client, sql_str: []const u8, args: []const Value) !ExecResult {
@@ -3019,7 +3139,7 @@ pub const Client = struct {
                 if (!self.isAcceptable(err)) self.cb.?.recordFailure();
                 return errors.Error.DatabaseError;
             };
-            return Transaction{ .conn = conn, .pool = p };
+            return Transaction{ .conn = conn, .pool = p, .allocator = self.allocator };
         }
         if (self.conn == null) {
             self.connect() catch |err| {
@@ -3031,7 +3151,7 @@ pub const Client = struct {
             if (!self.isAcceptable(errors.DatabaseError.ConnectionFailed)) self.cb.?.recordFailure();
             return errors.Error.DatabaseError;
         };
-        return Transaction{ .conn = self.conn.? };
+        return Transaction{ .conn = self.conn.?, .allocator = self.allocator };
     }
 
     pub fn transact(self: *Client, comptime T: type, fn_tx: *const fn (*Transaction) errors.ResultT(T)) errors.ResultT(T) {
@@ -3198,6 +3318,7 @@ pub const Client = struct {
 pub const Transaction = struct {
     conn: Conn,
     pool: ?*ConnPool = null,
+    allocator: std.mem.Allocator,
 
     pub fn query(self: *Transaction, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value) !Rows {
         return self.conn.query(allocator, sql_str, args);
@@ -3241,6 +3362,27 @@ pub const Transaction = struct {
     pub fn rollbackCtx(self: *Transaction, ctx: SqlContext) !void {
         if (ctx.isDone()) return error.Timeout;
         return self.rollback();
+    }
+
+    /// Create a savepoint with the given name.
+    pub fn savepoint(self: *Transaction, name: []const u8) !void {
+        const sql = try std.fmt.allocPrint(self.allocator, "SAVEPOINT {s}", .{name});
+        defer self.allocator.free(sql);
+        _ = try self.exec(sql, &.{});
+    }
+
+    /// Rollback to a previously created savepoint.
+    pub fn rollbackTo(self: *Transaction, name: []const u8) !void {
+        const sql = try std.fmt.allocPrint(self.allocator, "ROLLBACK TO {s}", .{name});
+        defer self.allocator.free(sql);
+        _ = try self.exec(sql, &.{});
+    }
+
+    /// Release a savepoint.
+    pub fn releaseSavepoint(self: *Transaction, name: []const u8) !void {
+        const sql = try std.fmt.allocPrint(self.allocator, "RELEASE SAVEPOINT {s}", .{name});
+        defer self.allocator.free(sql);
+        _ = try self.exec(sql, &.{});
     }
 
     /// queryRow scans a single row into struct T (like Client.queryRow but on tx)
@@ -4397,6 +4539,77 @@ test "pgDecodeNumeric NaN" {
     const v = try pgDecodeNumeric(allocator, &buf);
     defer allocator.free(v.string);
     try std.testing.expectEqualStrings("NaN", v.string);
+}
+
+test "pgDecodeInterval basic" {
+    const allocator = std.testing.allocator;
+    // 1 month, 2 days, 3:04:05.000006
+    var buf: [16]u8 = undefined;
+    const total_us: i64 = (3 * 3600 + 4 * 60 + 5) * 1_000_000 + 6;
+    std.mem.writeInt(i64, buf[0..8], total_us, .big);   // microseconds
+    std.mem.writeInt(i32, buf[8..12], 2, .big);           // days
+    std.mem.writeInt(i32, buf[12..16], 1, .big);          // months
+    const v = try pgDecodeBinary(allocator, PgOid.interval, &buf);
+    defer allocator.free(v.string);
+    try std.testing.expectEqualStrings("P1M2DT03:04:05.000006", v.string);
+}
+
+test "pgDecodeInterval time only" {
+    const allocator = std.testing.allocator;
+    // 0 months, 0 days, 12:30:45.0
+    var buf: [16]u8 = undefined;
+    const total_us: i64 = (12 * 3600 + 30 * 60 + 45) * 1_000_000;
+    std.mem.writeInt(i64, buf[0..8], total_us, .big);
+    std.mem.writeInt(i32, buf[8..12], 0, .big);
+    std.mem.writeInt(i32, buf[12..16], 0, .big);
+    const v = try pgDecodeBinary(allocator, PgOid.interval, &buf);
+    defer allocator.free(v.string);
+    try std.testing.expectEqualStrings("12:30:45.000000", v.string);
+}
+
+test "pgDecodeTime basic" {
+    const allocator = std.testing.allocator;
+    // 23:59:59.123456
+    var buf: [8]u8 = undefined;
+    const us: i64 = (23 * 3600 + 59 * 60 + 59) * 1_000_000 + 123456;
+    std.mem.writeInt(i64, buf[0..8], us, .big);
+    const v = try pgDecodeBinary(allocator, PgOid.time, &buf);
+    defer allocator.free(v.string);
+    try std.testing.expectEqualStrings("23:59:59.123456", v.string);
+}
+
+test "pgDecodeInet basic" {
+    const allocator = std.testing.allocator;
+    // 192.168.1.1/24
+    var buf: [8]u8 = undefined;
+    buf[0] = 2;        // AF_INET
+    buf[1] = 24;       // prefix_len
+    buf[2] = 0;        // is_cidr = 0
+    buf[3] = 4;        // nbytes
+    buf[4] = 192;
+    buf[5] = 168;
+    buf[6] = 1;
+    buf[7] = 1;
+    const v = try pgDecodeBinary(allocator, PgOid.inet, &buf);
+    defer allocator.free(v.string);
+    try std.testing.expectEqualStrings("192.168.1.1/24", v.string);
+}
+
+test "pgDecodeCidr masking" {
+    const allocator = std.testing.allocator;
+    // 10.0.0.42/8 as CIDR → 10.0.0.0/8
+    var buf: [8]u8 = undefined;
+    buf[0] = 2;        // AF_INET
+    buf[1] = 8;        // prefix_len
+    buf[2] = 1;        // is_cidr = 1
+    buf[3] = 4;        // nbytes
+    buf[4] = 10;
+    buf[5] = 0;
+    buf[6] = 0;
+    buf[7] = 42;
+    const v = try pgDecodeBinary(allocator, PgOid.cidr, &buf);
+    defer allocator.free(v.string);
+    try std.testing.expectEqualStrings("10.0.0.0/8", v.string);
 }
 
 test "postgres config init" {
