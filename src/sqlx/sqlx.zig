@@ -328,6 +328,8 @@ pub fn diagnoseMysql(err_no: c_uint, err_msg: []const u8) SqlDiagnostic {
 pub const Conn = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// Monotonic creation time, tracked by the connection pool for lifetime eviction.
+    created_at_ms: ?i64 = null,
 
     pub const VTable = struct {
         query: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value) errors.ResultT(Rows),
@@ -2863,19 +2865,48 @@ pub const MySqlStmt = struct {
 // ==================== Connection Pool ====================
 
 const ConnPool = struct {
+    pub const PooledEntry = struct {
+        conn: Conn,
+        created_at_ms: i64,
+        idle_since_ms: ?i64 = null,
+    };
+
+    pub const Waiter = struct {
+        cond: std.Io.Condition,
+        ready: bool,
+        conn: Conn,
+    };
+
+    pub const PoolMetrics = struct {
+        total_acquired: u64,
+        total_released: u64,
+        total_evicted_lifetime: u64,
+        total_evicted_idle: u64,
+        current_active: u32,
+        current_idle: u32,
+        current_waiters: u32,
+    };
+
     allocator: std.mem.Allocator,
     client: *Client,
     max_open: u32,
     max_idle: u32,
     max_wait_ms: u32,
+    max_lifetime_ms: u64,
+    max_idle_time_ms: u64,
     max_reconnect_attempts: u32 = 3,
     reconnect_delay_ms: u32 = 100,
     active: std.atomic.Value(u32),
-    idle: std.ArrayList(Conn),
+    idle: std.ArrayList(PooledEntry),
+    waiters: std.ArrayList(*Waiter),
     mutex: std.Io.Mutex,
     cond: std.Io.Condition,
     closed: std.atomic.Value(bool),
     io: std.Io,
+    acquire_count: std.atomic.Value(u64),
+    release_count: std.atomic.Value(u64),
+    evict_lifetime_count: std.atomic.Value(u64),
+    evict_idle_count: std.atomic.Value(u64),
 
     pub fn init(allocator: std.mem.Allocator, client: *Client, max_open: u32, max_idle: u32, io: std.Io) ConnPool {
         return .{
@@ -2884,32 +2915,54 @@ const ConnPool = struct {
             .max_open = max_open,
             .max_idle = max_idle,
             .max_wait_ms = client.config.max_wait_ms,
+            .max_lifetime_ms = @as(u64, client.config.max_lifetime_secs) * 1000,
+            .max_idle_time_ms = @as(u64, client.config.max_idle_time_secs) * 1000,
             .active = std.atomic.Value(u32).init(0),
-            .idle = std.ArrayList(Conn).empty,
+            .idle = std.ArrayList(PooledEntry).empty,
+            .waiters = std.ArrayList(*Waiter).empty,
             .mutex = std.Io.Mutex.init,
             .cond = .init,
             .closed = std.atomic.Value(bool).init(false),
             .io = io,
+            .acquire_count = std.atomic.Value(u64).init(0),
+            .release_count = std.atomic.Value(u64).init(0),
+            .evict_lifetime_count = std.atomic.Value(u64).init(0),
+            .evict_idle_count = std.atomic.Value(u64).init(0),
         };
     }
 
     pub fn deinit(self: *ConnPool) void {
         self.closed.store(true, .monotonic);
+        // Wake any waiters waiting on a per-waiter condition.
+        self.mutex.lockUncancelable(self.io);
+        for (self.waiters.items) |waiter| {
+            waiter.ready = false;
+            waiter.cond.signal(self.io);
+        }
+        self.mutex.unlock(self.io);
         self.cond.broadcast(self.io);
+
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        for (self.idle.items) |*conn| {
-            conn.close();
+        for (self.idle.items) |*entry| {
+            entry.conn.close();
         }
         self.idle.deinit(self.allocator);
+        self.waiters.deinit(self.allocator);
     }
 
     /// Reconnect and add a new idle connection to the pool
     fn reconnect(self: *ConnPool) !void {
-        const conn = self.client.newConn() catch return;
+        var conn = self.client.newConn() catch return;
+        const now = Time.monotonicNowMilliseconds();
+        conn.created_at_ms = now;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.idle.append(self.allocator, conn) catch {
+        self.idle.append(self.allocator, .{
+            .conn = conn,
+            .created_at_ms = now,
+            .idle_since_ms = now,
+        }) catch {
             conn.close();
         };
     }
@@ -2917,32 +2970,48 @@ const ConnPool = struct {
     pub fn acquire(self: *ConnPool) !Conn {
         if (self.closed.load(.monotonic)) return error.ConnectionFailed;
 
+        self.mutex.lockUncancelable(self.io);
         while (true) {
-            if (self.closed.load(.monotonic)) return error.ConnectionFailed;
-
-            self.mutex.lockUncancelable(self.io);
+            if (self.closed.load(.monotonic)) {
+                self.mutex.unlock(self.io);
+                return error.ConnectionFailed;
+            }
 
             // Prefer idle connections — always ping before checkout.
-            if (self.idle.items.len > 0) {
-                const conn = self.idle.pop().?;
+            while (self.idle.items.len > 0) {
+                const entry = self.idle.pop().?;
+                const conn = entry.conn;
+                const created_at = entry.created_at_ms;
                 self.mutex.unlock(self.io);
                 conn.ping() catch {
                     conn.close();
                     _ = self.active.fetchSub(1, .monotonic);
+                    self.mutex.lockUncancelable(self.io);
                     continue;
                 };
+                const now = Time.monotonicNowMilliseconds();
+                if (self.max_lifetime_ms > 0 and now - created_at >= self.max_lifetime_ms) {
+                    conn.close();
+                    _ = self.active.fetchSub(1, .monotonic);
+                    _ = self.evict_lifetime_count.fetchAdd(1, .monotonic);
+                    self.mutex.lockUncancelable(self.io);
+                    continue;
+                }
+                _ = self.acquire_count.fetchAdd(1, .monotonic);
                 return conn;
             }
 
-            // Create new connection if under limit
+            // Create new connection if under limit.
             const current_active = self.active.load(.monotonic);
             if (current_active < self.max_open) {
                 _ = self.active.fetchAdd(1, .monotonic);
                 self.mutex.unlock(self.io);
-                const conn = self.client.newConn() catch {
+                var conn = self.client.newConn() catch {
                     _ = self.active.fetchSub(1, .monotonic);
                     return error.ConnectionFailed;
                 };
+                conn.created_at_ms = Time.monotonicNowMilliseconds();
+                _ = self.acquire_count.fetchAdd(1, .monotonic);
                 return conn;
             }
 
@@ -2957,18 +3026,45 @@ const ConnPool = struct {
                     .clock = .awake,
                 },
             };
-            self.cond.waitTimeout(self.io, &self.mutex, timeout) catch |err| {
+
+            var waiter: Waiter = .{
+                .cond = .init,
+                .ready = false,
+                .conn = undefined,
+            };
+            self.waiters.append(self.allocator, &waiter) catch {
+                self.mutex.unlock(self.io);
+                return error.ConnectionFailed;
+            };
+            waiter.cond.waitTimeout(self.io, &self.mutex, timeout) catch |err| {
+                // waitTimeout re-acquires the mutex before returning.
+                self.removeWaiter(&waiter);
                 self.mutex.unlock(self.io);
                 return switch (err) {
                     error.Timeout, error.Canceled => error.Timeout,
                 };
             };
-            // Mutex re-acquired by waitTimeout; unlock and retry so ping path is shared.
-            self.mutex.unlock(self.io);
+            // woken with mutex held
+            self.removeWaiter(&waiter);
+            if (waiter.ready) {
+                _ = self.acquire_count.fetchAdd(1, .monotonic);
+                return waiter.conn;
+            }
+            // Spurious wakeup or pool closed: loop and re-check state.
+        }
+    }
+
+    fn removeWaiter(self: *ConnPool, waiter: *Waiter) void {
+        for (self.waiters.items, 0..) |w, i| {
+            if (w == waiter) {
+                _ = self.waiters.orderedRemove(i);
+                return;
+            }
         }
     }
 
     pub fn release(self: *ConnPool, conn: Conn) void {
+        _ = self.release_count.fetchAdd(1, .monotonic);
         if (self.closed.load(.monotonic)) {
             conn.close();
             _ = self.active.fetchSub(1, .monotonic);
@@ -2977,9 +3073,32 @@ const ConnPool = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        // Return to idle pool if not full, otherwise close
+        // FIFO handoff to the oldest waiting acquire().
+        if (self.waiters.items.len > 0) {
+            const waiter = self.waiters.orderedRemove(0);
+            waiter.ready = true;
+            waiter.conn = conn;
+            waiter.cond.signal(self.io);
+            return;
+        }
+
+        // No waiters: evict if the connection exceeded its lifetime.
+        const now = Time.monotonicNowMilliseconds();
+        const created_at = conn.created_at_ms orelse now;
+        if (self.max_lifetime_ms > 0 and now - created_at >= self.max_lifetime_ms) {
+            conn.close();
+            _ = self.active.fetchSub(1, .monotonic);
+            _ = self.evict_lifetime_count.fetchAdd(1, .monotonic);
+            return;
+        }
+
+        // Return to idle pool if not full, otherwise close.
         if (self.idle.items.len < self.max_idle) {
-            self.idle.append(self.allocator, conn) catch {
+            self.idle.append(self.allocator, .{
+                .conn = conn,
+                .created_at_ms = created_at,
+                .idle_since_ms = now,
+            }) catch {
                 conn.close();
                 _ = self.active.fetchSub(1, .monotonic);
                 return;
@@ -2998,11 +3117,13 @@ const ConnPool = struct {
         if (target == 0) return;
         var conns = std.ArrayList(Conn).empty;
         defer {
-            for (conns.items) |*conn| conn.close();
+            for (conns.items) |*c| c.close();
             conns.deinit(self.allocator);
         }
+        const now = Time.monotonicNowMilliseconds();
         for (0..target) |_| {
-            const conn = self.client.newConn() catch return error.ConnectionFailed;
+            var conn = self.client.newConn() catch return error.ConnectionFailed;
+            conn.created_at_ms = now;
             conns.append(self.allocator, conn) catch {
                 conn.close();
                 return error.ConnectionFailed;
@@ -3011,7 +3132,11 @@ const ConnPool = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         for (conns.items) |conn| {
-            self.idle.append(self.allocator, conn) catch {
+            self.idle.append(self.allocator, .{
+                .conn = conn,
+                .created_at_ms = conn.created_at_ms orelse now,
+                .idle_since_ms = now,
+            }) catch {
                 conn.close();
                 continue;
             };
@@ -3028,9 +3153,9 @@ const ConnPool = struct {
         var all_healthy = true;
         var i: usize = 0;
         while (i < self.idle.items.len) {
-            self.idle.items[i].ping() catch {
-                // Connection is dead — close it and remove from idle pool
-                self.idle.items[i].close();
+            self.idle.items[i].conn.ping() catch {
+                // Connection is dead — close it and remove from idle pool.
+                self.idle.items[i].conn.close();
                 _ = self.active.fetchSub(1, .monotonic);
                 _ = self.idle.swapRemove(i);
                 all_healthy = false;
@@ -3041,11 +3166,46 @@ const ConnPool = struct {
         return all_healthy;
     }
 
-    /// Run keepAlive — ping all idle connections and log dead ones.
+    /// Run keepAlive — ping all idle connections, then evict any that have been idle too long.
     pub fn keepAlive(self: *ConnPool) void {
         if (!self.ping()) {
             std.log.warn("[ConnPool] keepAlive: some idle connections were dead and removed", .{});
         }
+        self.evictIdle();
+    }
+
+    fn evictIdle(self: *ConnPool) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        const now = Time.monotonicNowMilliseconds();
+        var i: usize = 0;
+        while (i < self.idle.items.len) {
+            const idle_since = self.idle.items[i].idle_since_ms orelse continue;
+            if (self.max_idle_time_ms > 0 and now - idle_since >= self.max_idle_time_ms) {
+                self.idle.items[i].conn.close();
+                _ = self.active.fetchSub(1, .monotonic);
+                _ = self.idle.swapRemove(i);
+                _ = self.evict_idle_count.fetchAdd(1, .monotonic);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    /// Current metrics snapshot (values are consistent with respect to the pool mutex).
+    pub fn metrics(self: *ConnPool) PoolMetrics {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return .{
+            .total_acquired = self.acquire_count.load(.monotonic),
+            .total_released = self.release_count.load(.monotonic),
+            .total_evicted_lifetime = self.evict_lifetime_count.load(.monotonic),
+            .total_evicted_idle = self.evict_idle_count.load(.monotonic),
+            .current_active = self.active.load(.monotonic),
+            .current_idle = @intCast(self.idle.items.len),
+            .current_waiters = @intCast(self.waiters.items.len),
+        };
     }
 
     /// Execute a function within a transaction, acquiring a connection from the pool.
@@ -3076,6 +3236,8 @@ pub const Config = struct {
     max_open_conns: u32 = 8,
     max_idle_conns: u32 = 4,
     max_wait_ms: u32 = 5000,
+    max_lifetime_secs: u32 = 3600,
+    max_idle_time_secs: u32 = 300,
 };
 
 /// Transaction options aligned with Go's sql.TxOptions.
@@ -5295,4 +5457,108 @@ test "sqlite connection pool warmup" {
     // Warmup should have created up to max_idle idle connections.
     try std.testing.expect(db.pool != null);
     try std.testing.expect(db.pool.?.idle.items.len > 0);
+}
+
+test "conn pool evicts idle connection after timeout" {
+    const allocator = std.testing.allocator;
+
+    var db = try Client.open(allocator, std.testing.io, .{
+        .driver = .sqlite,
+        .sqlite_path = ":memory:",
+        .max_open_conns = 2,
+        .max_idle_conns = 2,
+    });
+    defer db.deinit();
+
+    try std.testing.expect(db.pool != null);
+    // Client.open already warmed up max_idle_conns idle connections.
+    const before = db.pool.?.metrics();
+    try std.testing.expectEqual(@as(u32, 2), before.current_idle);
+    try std.testing.expectEqual(@as(u64, 0), before.total_evicted_idle);
+
+    // Use a 1 ms idle threshold and wait long enough for the warmed-up
+    // connections to exceed it before invoking keepAlive().
+    db.pool.?.max_idle_time_ms = 1;
+    std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(2), .awake) catch {};
+
+    db.pool.?.keepAlive();
+
+    const after = db.pool.?.metrics();
+    try std.testing.expectEqual(@as(u32, 0), after.current_idle);
+    try std.testing.expectEqual(@as(u64, 2), after.total_evicted_idle);
+}
+
+test "conn pool thread smoke" {
+    const allocator = std.testing.allocator;
+
+    var db = try Client.open(allocator, std.testing.io, .{
+        .driver = .sqlite,
+        .sqlite_path = ":memory:",
+        .max_open_conns = 4,
+        .max_idle_conns = 0,
+        .max_wait_ms = 5000,
+    });
+    defer db.deinit();
+
+    const pool = &db.pool.?;
+
+    const Worker = struct {
+        fn run(p: *ConnPool) void {
+            const c = p.acquire() catch return;
+            p.release(c);
+        }
+    };
+
+    var threads: [2]std.Thread = undefined;
+    for (&threads) |*t| {
+        t.* = try std.Thread.spawn(.{}, Worker.run, .{pool});
+    }
+    for (&threads) |*t| {
+        t.join();
+    }
+}
+
+test "conn pool release hands off to waiters in FIFO order" {
+    const allocator = std.testing.allocator;
+
+    var db = try Client.open(allocator, std.testing.io, .{
+        .driver = .sqlite,
+        .sqlite_path = ":memory:",
+        .max_open_conns = 2,
+        .max_idle_conns = 0,
+        .max_wait_ms = 5000,
+    });
+    defer db.deinit();
+
+    const pool = &db.pool.?;
+    const conn_a = try pool.acquire();
+    const conn_b = try pool.acquire();
+
+    // Simulate a FIFO wait queue directly. Each release() must hand the
+    // connection to the oldest waiter and set its ready flag.
+    var waiters: [3]ConnPool.Waiter = undefined;
+    for (&waiters) |*w| {
+        w.* = .{ .cond = .init, .ready = false, .conn = undefined };
+        try pool.waiters.append(allocator, w);
+    }
+    defer {
+        // Remove the dummy waiters so pool deinit sees an empty queue.
+        pool.waiters.items.len = 0;
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), pool.waiters.items.len);
+
+    pool.release(conn_a);
+    try std.testing.expect(waiters[0].ready);
+    try std.testing.expect(!waiters[1].ready);
+    try std.testing.expect(!waiters[2].ready);
+
+    pool.release(conn_b);
+    try std.testing.expect(waiters[1].ready);
+    try std.testing.expect(!waiters[2].ready);
+
+    // Close the connections that were handed to the dummy waiters so the
+    // pool's active count and the test allocator stay consistent.
+    waiters[0].conn.close();
+    waiters[1].conn.close();
 }
