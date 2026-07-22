@@ -35,6 +35,7 @@ pub const scanModules = @import("core/ModuleScanner.zig").scanModules;
 pub const validateModules = @import("core/ModuleValidator.zig").validateModules;
 pub const ModuleRuntime = @import("core/ModuleRuntime.zig").ModuleRuntime;
 pub const ModuleRegistry = @import("core/ModuleRegistry.zig").ModuleRegistry;
+pub const WorkerPool = @import("core/WorkerPool.zig").WorkerPool;
 pub const RuntimeOptions = @import("api/Module.zig").RuntimeOptions;
 /// DEPRECATED: use Application.start() / Application.stop() instead.
 pub const startAll = @import("core/Lifecycle.zig").startAll;
@@ -185,4 +186,5 @@ pub const ContractVerificationResult = @import("test/ContractTest.zig").Contract
 // ============================================================
 test {
     _ = @import("tests.zig");
+    _ = @import("core/WorkerPool.zig");
 }
