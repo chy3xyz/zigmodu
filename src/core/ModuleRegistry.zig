@@ -40,8 +40,13 @@ pub const ModuleRegistry = struct {
             if (!hasAnyProtection(options)) continue;
 
             const runtime = try self.allocator.create(ModuleRuntime);
-            errdefer self.allocator.destroy(runtime);
+            var initialized = false;
+            errdefer {
+                if (initialized) runtime.deinit();
+                self.allocator.destroy(runtime);
+            }
             runtime.* = try ModuleRuntime.init(self.allocator, info.name, options);
+            initialized = true;
             try self.runtimes.put(runtime.module_name, runtime);
         }
     }
@@ -57,7 +62,7 @@ pub const ModuleRegistry = struct {
         while (iter.next()) |entry| {
             const rt = entry.value_ptr.*;
             if (rt.options.max_concurrent > 0) {
-                total_db_max_open += rt.options.max_concurrent;
+                total_db_max_open = std.math.add(u32, total_db_max_open, rt.options.max_concurrent) catch return error.ConfigurationError;
             }
         }
         if (global_max_open > 0 and total_db_max_open > global_max_open) {
@@ -126,4 +131,62 @@ test "ModuleRegistry validateQuotas rejects overcommit" {
 
     try std.testing.expectError(error.ConfigurationError, registry.validateQuotas(50));
     try registry.validateQuotas(100);
+}
+
+test "ModuleRegistry validateQuotas rejects u32 overflow" {
+    const allocator = std.testing.allocator;
+    const half_plus_one = std.math.maxInt(u32) / 2 + 1;
+
+    const ModuleA = struct {
+        pub const info = api.Module{
+            .name = "a",
+            .description = "A",
+            .runtime = .{ .max_concurrent = half_plus_one },
+        };
+    };
+
+    const ModuleB = struct {
+        pub const info = api.Module{
+            .name = "b",
+            .description = "B",
+            .runtime = .{ .max_concurrent = half_plus_one },
+        };
+    };
+
+    var modules = try @import("ModuleScanner.zig").scanModules(allocator, .{ ModuleA, ModuleB });
+    defer modules.deinit();
+
+    var registry = ModuleRegistry.init(allocator);
+    defer registry.deinit();
+    try registry.initFromModules(&modules);
+
+    // Overflow itself must be reported as a configuration error even when no
+    // global limit is enforced.
+    try std.testing.expectError(error.ConfigurationError, registry.validateQuotas(0));
+}
+
+test "ModuleRegistry initFromModules cleans up on put failure" {
+    const allocator = std.testing.allocator;
+
+    const Module = struct {
+        pub const info = api.Module{
+            .name = "protected",
+            .description = "Protected",
+            .runtime = .{ .max_concurrent = 3 },
+        };
+    };
+
+    var modules = try @import("ModuleScanner.zig").scanModules(allocator, .{Module});
+    defer modules.deinit();
+
+    // Allocation layout for a module with only max_concurrent:
+    //   0. create(ModuleRuntime)
+    //   1. ModuleRuntime.init dupe(module_name)
+    //   2. Bulkhead.init dupe(name)
+    //   3. StringHashMap.put (first entry) -> fail here
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 3 });
+    var registry = ModuleRegistry.init(failing.allocator());
+    defer registry.deinit();
+
+    try std.testing.expectError(error.OutOfMemory, registry.initFromModules(&modules));
 }
