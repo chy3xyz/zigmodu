@@ -55,13 +55,10 @@ pub const WorkerPool = struct {
 
         var threads = std.ArrayList(std.Thread).empty;
         errdefer {
-            // On spawn failure: stop workers that already started, join them,
+            // On failure after workers have been spawned: stop them, join them,
             // then free the thread list. `shared` is still valid because this
             // errdefer runs before we return the WorkerPool value.
-            shared.mu.lock(shared.io) catch {};
-            shared.shutdown = true;
-            shared.cond.broadcast(shared.io);
-            shared.mu.unlock(shared.io);
+            signalShutdown(shared);
 
             for (threads.items) |thread| {
                 thread.join();
@@ -69,9 +66,10 @@ pub const WorkerPool = struct {
             threads.deinit(allocator);
         }
 
+        try threads.ensureTotalCapacity(allocator, worker_count);
         for (0..worker_count) |_| {
             const thread = try std.Thread.spawn(.{}, workerLoop, .{shared});
-            try threads.append(allocator, thread);
+            threads.appendAssumeCapacity(thread);
         }
 
         return .{
@@ -86,12 +84,7 @@ pub const WorkerPool = struct {
     /// `deinit` calls this automatically; call it explicitly if you need to
     /// stop accepting work before releasing the pool.
     pub fn shutdown(self: *Self) void {
-        const shared = self.shared;
-        shared.mu.lock(shared.io) catch return;
-        defer shared.mu.unlock(shared.io);
-
-        shared.shutdown = true;
-        shared.cond.broadcast(shared.io);
+        signalShutdown(self.shared);
     }
 
     pub fn deinit(self: *Self) void {
@@ -130,13 +123,16 @@ pub const WorkerPool = struct {
     fn workerLoop(shared: *Shared) void {
         while (true) {
             shared.mu.lock(shared.io) catch return;
+
             while (shared.queue.items.len == 0 and !shared.shutdown) {
                 shared.cond.wait(shared.io, &shared.mu) catch break;
             }
-            if (shared.queue.items.len == 0 and shared.shutdown) {
+
+            if (shared.queue.items.len == 0) {
                 shared.mu.unlock(shared.io);
                 return;
             }
+
             const task = shared.queue.orderedRemove(0);
             shared.mu.unlock(shared.io);
 
@@ -144,6 +140,14 @@ pub const WorkerPool = struct {
         }
     }
 };
+
+fn signalShutdown(shared: *WorkerPool.Shared) void {
+    shared.mu.lock(shared.io) catch return;
+    defer shared.mu.unlock(shared.io);
+
+    shared.shutdown = true;
+    shared.cond.broadcast(shared.io);
+}
 
 test "WorkerPool executes dispatched tasks" {
     const allocator = std.testing.allocator;
