@@ -165,6 +165,20 @@ pub const CursorOptions = struct {
     mode: CursorMode = .buffered,
 };
 
+/// Batch insert strategy.
+pub const BatchMode = enum {
+    /// Build a single multi-row `INSERT ... VALUES (...), (...)` statement.
+    sql,
+    /// Use driver-native batch protocols (MySQL prepared-statement multi-execute
+    /// or PostgreSQL `COPY FROM STDIN`).
+    protocol,
+};
+
+/// Options for `Client.batchInsertEx`.
+pub const BatchInsertOptions = struct {
+    mode: BatchMode = .sql,
+};
+
 /// Streaming cursor over a query result set.
 pub const Cursor = struct {
     state: State,
@@ -474,6 +488,9 @@ pub const Conn = struct {
         /// Optional driver-native streaming cursor. Null drivers fall back to
         /// buffering all rows in `queryCursor`.
         queryCursor: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value, opts: CursorOptions) errors.ResultT(Cursor) = null,
+        /// Optional driver-native batch insert. SQLite returns null to fall back
+        /// to the SQL mode; MySQL and PostgreSQL implement protocol-level batching.
+        batchInsert: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, columns: []const []const u8, rows: []const []const Value) errors.ResultT(ExecResult) = null,
     };
 
     pub fn query(self: Conn, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value) errors.ResultT(Rows) {
@@ -516,6 +533,13 @@ pub const Conn = struct {
         }
         const rows = try self.query(allocator, sql_str, args);
         return Cursor.init(rows);
+    }
+
+    pub fn batchInsert(self: Conn, allocator: std.mem.Allocator, table: []const u8, columns: []const []const u8, rows: []const []const Value) errors.ResultT(ExecResult) {
+        if (self.vtable.batchInsert) |bi| {
+            return bi(self.ptr, allocator, table, columns, rows);
+        }
+        return error.DatabaseError;
     }
 };
 
@@ -1065,6 +1089,15 @@ pub const SQLiteConn = struct {
         return Cursor.init(rows);
     }
 
+    fn batchInsertFn(ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, columns: []const []const u8, rows: []const []const Value) errors.ResultT(ExecResult) {
+        _ = ptr;
+        _ = allocator;
+        _ = table;
+        _ = columns;
+        _ = rows;
+        return error.DatabaseError; // Caller falls back to SQL mode.
+    }
+
     pub fn toConn(self: *SQLiteConn) Conn {
         return .{
             .ptr = self,
@@ -1078,6 +1111,7 @@ pub const SQLiteConn = struct {
                 .rollback = rollbackFn,
                 .prepare = prepareFn,
                 .queryCursor = queryCursorFn,
+                .batchInsert = batchInsertFn,
             },
         };
     }
@@ -1561,6 +1595,29 @@ fn pgFormatInet(allocator: std.mem.Allocator, family: u8, prefix_len: u8, is_cid
         });
     }
     return error.DatabaseError;
+}
+
+/// Escape a single value for PostgreSQL `COPY ... FROM STDIN WITH (FORMAT csv)`.
+fn appendCsvCell(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), value: []const u8) !void {
+    if (value.len == 0) {
+        return try buf.appendSlice(allocator, "\"\"");
+    }
+    var needs_quote = false;
+    for (value) |ch| {
+        if (ch == ',' or ch == '"' or ch == '\n' or ch == '\r') {
+            needs_quote = true;
+            break;
+        }
+    }
+    if (!needs_quote) {
+        return try buf.appendSlice(allocator, value);
+    }
+    try buf.append(allocator, '"');
+    for (value) |ch| {
+        if (ch == '"') try buf.append(allocator, '"');
+        try buf.append(allocator, ch);
+    }
+    try buf.append(allocator, '"');
 }
 
 pub const PostgresConn = struct {
@@ -2113,6 +2170,80 @@ pub const PostgresConn = struct {
         } } };
     }
 
+    /// Batch insert using PostgreSQL `COPY ... FROM STDIN WITH (FORMAT csv)`.
+    fn copyFrom(self: *PostgresConn, table: []const u8, columns: []const []const u8, rows: []const []const Value) errors.ResultT(ExecResult) {
+        validateIdentifier(table) catch return error.DatabaseError;
+        if (rows.len == 0) return ExecResult{};
+        if (columns.len == 0) return error.DatabaseError;
+        for (columns) |c| validateIdentifier(c) catch return error.DatabaseError;
+
+        var sql = std.ArrayList(u8).empty;
+        defer sql.deinit(self.allocator);
+        try sql.appendSlice(self.allocator, "COPY ");
+        try sql.appendSlice(self.allocator, table);
+        try sql.appendSlice(self.allocator, " (");
+        for (columns, 0..) |col, i| {
+            if (i > 0) try sql.appendSlice(self.allocator, ",");
+            try sql.appendSlice(self.allocator, col);
+        }
+        try sql.appendSlice(self.allocator, ") FROM STDIN WITH (FORMAT csv)");
+
+        const sql_z = allocZ(self.allocator, sql.items) catch return error.DatabaseError;
+        defer self.allocator.free(sql_z);
+
+        const begin = libpq_c.PQexec(self.conn, "BEGIN");
+        defer if (begin) |b| libpq_c.PQclear(b);
+        if (begin == null or libpq_c.PQresultStatus(begin.?) != libpq_c.ExecStatusType.PGRES_COMMAND_OK) return error.DatabaseError;
+
+        const res = libpq_c.PQexec(self.conn, @ptrCast(sql_z.ptr));
+        defer if (res) |r| libpq_c.PQclear(r);
+        if (res == null or libpq_c.PQresultStatus(res.?) != libpq_c.ExecStatusType.PGRES_COPY_IN) return error.DatabaseError;
+
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(self.allocator);
+        for (rows) |row| {
+            if (row.len != columns.len) return error.DatabaseError;
+            buf.items.len = 0;
+            for (row, 0..) |val, c| {
+                if (c > 0) try buf.append(self.allocator, ',');
+                switch (val) {
+                    .null => try buf.appendSlice(self.allocator, "\\N"),
+                    .int => |v| try buf.appendSlice(self.allocator, try std.fmt.allocPrint(scratch.allocator(), "{d}", .{v})),
+                    .float => |v| try buf.appendSlice(self.allocator, try std.fmt.allocPrint(scratch.allocator(), "{d}", .{v})),
+                    .string => |v| try appendCsvCell(self.allocator, &buf, v),
+                    .bool => |v| try buf.appendSlice(self.allocator, if (v) "t" else "f"),
+                }
+            }
+            try buf.appendSlice(self.allocator, "\n");
+            if (libpq_c.PQputCopyData(self.conn, @ptrCast(buf.items.ptr), @intCast(buf.items.len)) != 1) {
+                _ = libpq_c.PQputCopyEnd(self.conn, "copy data failed");
+                return error.DatabaseError;
+            }
+        }
+
+        if (libpq_c.PQputCopyEnd(self.conn, null) != 1) return error.DatabaseError;
+        const final = libpq_c.PQgetResult(self.conn);
+        defer if (final) |f| libpq_c.PQclear(f);
+        if (final == null or libpq_c.PQresultStatus(final.?) != libpq_c.ExecStatusType.PGRES_COMMAND_OK) return error.DatabaseError;
+
+        const commit = libpq_c.PQexec(self.conn, "COMMIT");
+        defer if (commit) |c| libpq_c.PQclear(c);
+        if (commit == null or libpq_c.PQresultStatus(commit.?) != libpq_c.ExecStatusType.PGRES_COMMAND_OK) return error.DatabaseError;
+
+        const cmd = std.mem.span(libpq_c.PQcmdTuples(final.?));
+        const affected = std.fmt.parseInt(u64, cmd, 10) catch 0;
+        return ExecResult{ .rows_affected = affected };
+    }
+
+    fn batchInsertFn(ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, columns: []const []const u8, rows: []const []const Value) errors.ResultT(ExecResult) {
+        _ = allocator;
+        const self = @as(*PostgresConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
+        return self.copyFrom(table, columns, rows);
+    }
+
     pub fn toConn(self: *PostgresConn) Conn {
         return .{
             .ptr = self,
@@ -2126,6 +2257,7 @@ pub const PostgresConn = struct {
                 .rollback = rollbackFn,
                 .prepare = prepareFn,
                 .queryCursor = queryCursorFn,
+                .batchInsert = batchInsertFn,
             },
         };
     }
@@ -2834,6 +2966,68 @@ pub const MySqlConn = struct {
         } } };
     }
 
+    /// Batch insert using a prepared statement executed once per row. This avoids
+    /// sending the SQL text repeatedly and keeps the binary wire format.
+    fn batchInsertPrepared(self: *MySqlConn, table: []const u8, columns: []const []const u8, rows: []const []const Value) errors.ResultT(ExecResult) {
+        validateIdentifier(table) catch return error.DatabaseError;
+        if (rows.len == 0) return ExecResult{};
+        if (columns.len == 0) return error.DatabaseError;
+        for (columns) |c| validateIdentifier(c) catch return error.DatabaseError;
+
+        var sql = std.ArrayList(u8).empty;
+        defer sql.deinit(self.allocator);
+        try sql.appendSlice(self.allocator, "INSERT INTO ");
+        try sql.appendSlice(self.allocator, table);
+        try sql.appendSlice(self.allocator, " (");
+        for (columns, 0..) |col, i| {
+            if (i > 0) try sql.appendSlice(self.allocator, ",");
+            try sql.appendSlice(self.allocator, col);
+        }
+        try sql.appendSlice(self.allocator, ") VALUES (");
+        for (0..columns.len) |c| {
+            if (c > 0) try sql.appendSlice(self.allocator, ",");
+            try sql.appendSlice(self.allocator, "?");
+        }
+        try sql.appendSlice(self.allocator, ")");
+
+        const stmt = libmysql_c.mysql_stmt_init(self.mysql) orelse return error.DatabaseError;
+        errdefer _ = libmysql_c.mysql_stmt_close(stmt);
+        if (libmysql_c.mysql_stmt_prepare(stmt, @ptrCast(sql.items.ptr), @intCast(sql.items.len)) != 0) {
+            const err_no = libmysql_c.mysql_stmt_errno(stmt);
+            const err_msg = std.mem.span(libmysql_c.mysql_stmt_error(stmt));
+            std.log.err("MySQL batch prepare error: errno={d} msg={s}", .{ err_no, err_msg });
+            return mysqlErrnoToError(err_no);
+        }
+        defer _ = libmysql_c.mysql_stmt_close(stmt);
+
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        var total_affected: u64 = 0;
+        var last_insert_id: i64 = 0;
+        for (rows) |row| {
+            if (row.len != columns.len) return error.DatabaseError;
+            mysqlBindParams(stmt, scratch.allocator(), row) catch return error.DatabaseError;
+            if (libmysql_c.mysql_stmt_execute(stmt) != 0) {
+                const err_no = libmysql_c.mysql_stmt_errno(stmt);
+                const err_msg = std.mem.span(libmysql_c.mysql_stmt_error(stmt));
+                std.log.err("MySQL batch execute error: errno={d} msg={s}", .{ err_no, err_msg });
+                return mysqlErrnoToError(err_no);
+            }
+            total_affected += libmysql_c.mysql_stmt_affected_rows(stmt);
+            if (last_insert_id == 0) last_insert_id = @intCast(libmysql_c.mysql_stmt_insert_id(stmt));
+            _ = libmysql_c.mysql_stmt_free_result(stmt);
+            _ = scratch.reset(.free_all);
+        }
+        return ExecResult{ .rows_affected = total_affected, .last_insert_id = if (last_insert_id == 0) null else last_insert_id };
+    }
+
+    fn batchInsertFn(ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, columns: []const []const u8, rows: []const []const Value) errors.ResultT(ExecResult) {
+        _ = allocator;
+        const self = @as(*MySqlConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
+        return self.batchInsertPrepared(table, columns, rows);
+    }
+
     pub fn toConn(self: *MySqlConn) Conn {
         return .{
             .ptr = self,
@@ -2847,6 +3041,7 @@ pub const MySqlConn = struct {
                 .rollback = rollbackFn,
                 .prepare = prepareFn,
                 .queryCursor = queryCursorFn,
+                .batchInsert = batchInsertFn,
             },
         };
     }
@@ -3976,6 +4171,47 @@ pub const Client = struct {
     pub fn batchInsertCtx(self: *Client, ctx: SqlContext, table: []const u8, columns: []const []const u8, rows: []const []const Value) !ExecResult {
         if (ctx.isDone()) return error.Timeout;
         return self.batchInsert(table, columns, rows);
+    }
+
+    /// Batch insert with explicit strategy. `.sql` (default) builds a single
+    /// multi-row INSERT; `.protocol` uses MySQL prepared-statement multi-execute
+    /// or PostgreSQL `COPY FROM STDIN`. SQLite always falls back to SQL mode.
+    pub fn batchInsertEx(self: *Client, table: []const u8, columns: []const []const u8, rows: []const []const Value, opts: BatchInsertOptions) !ExecResult {
+        // SQLite has no protocol-level batch insert; use the optimized SQL path.
+        // MySQL/PostgreSQL will attempt native batching and fall back on failure.
+        if (opts.mode == .sql or rows.len == 0 or self.config.driver == .sqlite) return self.batchInsert(table, columns, rows);
+
+        self.ensureBreaker();
+        if (!self.cb.?.allow()) return error.CircuitBreakerOpen;
+        self.ensurePool();
+
+        const t0 = Time.monotonicNow();
+        const result = self.doBatchInsert(table, columns, rows) catch |err| {
+            const elapsed: u64 = @intCast(@max(@as(i64, 0), Time.monotonicNow() - t0));
+            if (self.metrics_callback) |cb| cb(elapsed, table, false, @errorName(err));
+            if (!self.isAcceptable(err)) self.cb.?.recordFailure();
+            return err;
+        };
+        const elapsed: u64 = @intCast(@max(@as(i64, 0), Time.monotonicNow() - t0));
+        if (self.metrics_callback) |cb| cb(elapsed, table, true, null);
+        self.cb.?.recordSuccess();
+        return result;
+    }
+
+    fn doBatchInsert(self: *Client, table: []const u8, columns: []const []const u8, rows: []const []const Value) !ExecResult {
+        if (self.pool) |*p| {
+            const conn = try p.acquire();
+            defer p.release(conn);
+            return conn.batchInsert(self.allocator, table, columns, rows) catch |err| {
+                std.log.warn("[sqlx] protocol batch insert failed, falling back to SQL mode: {s}", .{@errorName(err)});
+                return self.batchInsert(table, columns, rows);
+            };
+        }
+        if (self.conn == null) try self.connect();
+        return self.conn.?.batchInsert(self.allocator, table, columns, rows) catch |err| {
+            std.log.warn("[sqlx] protocol batch insert failed, falling back to SQL mode: {s}", .{@errorName(err)});
+            return self.batchInsert(table, columns, rows);
+        };
     }
 
     fn doPing(self: *Client) !void {
@@ -5889,8 +6125,9 @@ test "conn pool release hands off to waiters in FIFO order" {
 
 test "sqlite buffered cursor iterates rows" {
     const allocator = std.testing.allocator;
-    var db = try Client.open(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var db = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer db.deinit();
+    try db.connect();
     _ = try db.exec("CREATE TABLE cur (id INTEGER PRIMARY KEY, name TEXT)", &.{});
     _ = try db.exec("INSERT INTO cur (name) VALUES (?), (?), (?)", &.{ Value{ .string = "a" }, Value{ .string = "b" }, Value{ .string = "c" } });
 
@@ -5910,8 +6147,9 @@ test "sqlite buffered cursor iterates rows" {
 
 test "sqlite streaming cursor falls back to buffered" {
     const allocator = std.testing.allocator;
-    var db = try Client.open(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var db = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer db.deinit();
+    try db.connect();
     _ = try db.exec("CREATE TABLE cur2 (id INTEGER PRIMARY KEY)", &.{});
     _ = try db.exec("INSERT INTO cur2 VALUES (1), (2)", &.{});
     var cursor = try db.queryCursorEx("SELECT id FROM cur2 ORDER BY id", &.{}, .{ .mode = .streaming });
@@ -5937,7 +6175,53 @@ test "postgres streaming cursor api compiles" {
     const allocator = std.testing.allocator;
     var db = try Client.open(allocator, std.testing.io, .{ .driver = .postgres, .host = "127.0.0.1", .user = "postgres", .password = "", .database = "test" });
     defer db.deinit();
-    var cursor = try db.queryCursorEx("SELECT 1 AS n", &.{});
+    var cursor = try db.queryCursorEx("SELECT 1 AS n", &.{}, .{ .mode = .streaming });
     defer cursor.deinit();
     _ = cursor.next();
+}
+
+test "sqlite batchInsertEx sql mode matches batchInsert" {
+    const allocator = std.testing.allocator;
+    var db = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer db.deinit();
+    try db.connect();
+    _ = try db.exec("CREATE TABLE batch (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+    const res = try db.batchInsertEx("batch", &.{"id", "name"}, &.{
+        &.{ Value{ .int = 1 }, Value{ .string = "a" } },
+        &.{ Value{ .int = 2 }, Value{ .string = "b" } },
+    }, .{ .mode = .sql });
+    try std.testing.expectEqual(@as(u64, 2), res.rows_affected);
+}
+
+test "sqlite batchInsertEx protocol mode routes to sql" {
+    const allocator = std.testing.allocator;
+    var db = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer db.deinit();
+    try db.connect();
+    _ = try db.exec("CREATE TABLE batch2 (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+    const res = try db.batchInsertEx("batch2", &.{"id", "name"}, &.{
+        &.{ Value{ .int = 1 }, Value{ .string = "a" } },
+        &.{ Value{ .int = 2 }, Value{ .string = "b" } },
+    }, .{ .mode = .protocol });
+    try std.testing.expectEqual(@as(u64, 2), res.rows_affected);
+}
+
+test "mysql batchInsertEx protocol mode api compiles" {
+    if (true) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var db = try Client.open(allocator, std.testing.io, .{ .driver = .mysql, .host = "127.0.0.1", .user = "root", .password = "", .database = "test" });
+    defer db.deinit();
+    _ = try db.batchInsertEx("t", &.{"c"}, &.{
+        &.{Value{ .int = 1 }},
+    }, .{ .mode = .protocol });
+}
+
+test "postgres batchInsertEx protocol mode api compiles" {
+    if (true) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var db = try Client.open(allocator, std.testing.io, .{ .driver = .postgres, .host = "127.0.0.1", .user = "postgres", .password = "", .database = "test" });
+    defer db.deinit();
+    _ = try db.batchInsertEx("t", &.{"c"}, &.{
+        &.{Value{ .int = 1 }},
+    }, .{ .mode = .protocol });
 }

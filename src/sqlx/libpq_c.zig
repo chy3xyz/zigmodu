@@ -12,10 +12,12 @@ pub const ExecStatusType = enum(c_int) {
     PGRES_EMPTY_QUERY = 0,
     PGRES_COMMAND_OK = 1,
     PGRES_TUPLES_OK = 2,
-    PGRES_BAD_RESPONSE = 3,
-    PGRES_NONFATAL_ERROR = 4,
-    PGRES_FATAL_ERROR = 5,
-    PGRES_COPY_BOTH = 6,
+    PGRES_COPY_OUT = 3,
+    PGRES_COPY_IN = 4,
+    PGRES_BAD_RESPONSE = 5,
+    PGRES_NONFATAL_ERROR = 6,
+    PGRES_FATAL_ERROR = 7,
+    PGRES_COPY_BOTH = 8,
     PGRES_SINGLE_TUPLE = 9,
 };
 
@@ -74,6 +76,8 @@ pub extern "c" fn PQsetSingleRowMode(conn: ?*PGconn) c_int;
 pub extern "c" fn PQgetResult(conn: ?*PGconn) ?*PGresult;
 pub extern "c" fn PQconsumeInput(conn: ?*PGconn) c_int;
 pub extern "c" fn PQisBusy(conn: ?*PGconn) c_int;
+pub extern "c" fn PQputCopyData(conn: ?*PGconn, buffer: [*c]const u8, nbytes: c_int) c_int;
+pub extern "c" fn PQputCopyEnd(conn: ?*PGconn, errormsg: [*c]const u8) c_int;
 pub extern "c" fn PQsetdbLogin(
     pghost: [*c]const u8,
     pgport: [*c]const u8,
