@@ -49,6 +49,7 @@ test "compile all source files" {
     _ = @import("core/ModuleListener.zig");
     _ = @import("core/ModuleScanner.zig");
     _ = @import("core/ModuleValidator.zig");
+    _ = @import("core/ModuleRuntime.zig");
     _ = @import("core/Transactional.zig");
     _ = @import("core/TransactionalEvent.zig");
     _ = @import("extensions/WebMonitor.zig");
