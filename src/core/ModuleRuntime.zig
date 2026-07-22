@@ -1,11 +1,13 @@
 //! Per-module runtime resource container.
-//! Holds the bulkhead, rate limiter, and circuit breaker for one module.
+//! Holds the bulkhead, rate limiter, circuit breaker, and optional worker pool for one module.
 
 const std = @import("std");
 const api = @import("../api/Module.zig");
 const Bulkhead = @import("../resilience/Bulkhead.zig").Bulkhead;
 const RateLimiter = @import("../resilience/RateLimiter.zig").RateLimiter;
 const CircuitBreaker = @import("../resilience/CircuitBreaker.zig").CircuitBreaker;
+const WorkerPool = @import("WorkerPool.zig").WorkerPool;
+const Task = @import("WorkerPool.zig").Task;
 
 pub const ModuleRuntime = struct {
     const Self = @This();
@@ -17,6 +19,7 @@ pub const ModuleRuntime = struct {
     bulkhead: ?Bulkhead,
     rate_limiter: ?RateLimiter,
     circuit_breaker: ?CircuitBreaker,
+    worker_pool: ?WorkerPool,
     mu: std.Io.Mutex,
 
     /// Thread-safety contract: all state-changing operations (`tryEnter`,
@@ -49,6 +52,11 @@ pub const ModuleRuntime = struct {
             });
         }
 
+        var worker_pool: ?WorkerPool = null;
+        if (options.worker_count > 0) {
+            worker_pool = try WorkerPool.init(allocator, io, name_copy, options.worker_count, options.worker_count * 8);
+        }
+
         return .{
             .allocator = allocator,
             .io = io,
@@ -57,6 +65,7 @@ pub const ModuleRuntime = struct {
             .bulkhead = bulkhead,
             .rate_limiter = rate_limiter,
             .circuit_breaker = circuit_breaker,
+            .worker_pool = worker_pool,
             .mu = std.Io.Mutex.init,
         };
     }
@@ -65,6 +74,7 @@ pub const ModuleRuntime = struct {
         if (self.bulkhead) |*bh| bh.deinit();
         if (self.rate_limiter) |*rl| rl.deinit();
         if (self.circuit_breaker) |*cb| cb.deinit();
+        if (self.worker_pool) |*wp| wp.deinit();
         self.allocator.free(self.module_name);
         self.* = undefined;
     }
@@ -121,6 +131,14 @@ pub const ModuleRuntime = struct {
         if (self.circuit_breaker) |*cb| {
             cb.onFailure();
         }
+    }
+
+    /// Dispatch a task on this module's worker pool. Returns false if no pool or queue full.
+    pub fn dispatchAsync(self: *Self, task: Task) bool {
+        if (self.worker_pool) |*wp| {
+            return wp.dispatch(task);
+        }
+        return false;
     }
 
     pub const Stats = struct {
@@ -304,4 +322,26 @@ test "ModuleRuntime concurrent tryEnter and release do not corrupt state" {
     const stats = rt.getStats();
     try std.testing.expectEqual(@as(u32, 0), stats.bulkhead_active);
     try std.testing.expect(total_successes > 0);
+}
+
+test "ModuleRuntime creates worker pool from worker_count" {
+    const allocator = std.testing.allocator;
+    var rt = try ModuleRuntime.init(allocator, std.testing.io, "worker", .{
+        .worker_count = 2,
+    });
+    defer rt.deinit();
+
+    const Ctx = struct {
+        var counter: std.atomic.Value(u32) = .init(0);
+        fn run(ctx: ?*anyopaque, io: std.Io) void {
+            _ = ctx;
+            _ = io;
+            _ = @This().counter.fetchAdd(1, .monotonic);
+        }
+    };
+
+    try std.testing.expect(rt.dispatchAsync(.{ .run = Ctx.run, .ctx = null }));
+    while (Ctx.counter.load(.monotonic) < 1) {
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
 }
