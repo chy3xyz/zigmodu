@@ -9,6 +9,8 @@ pub const ModuleInfo = struct {
     ptr: ?*anyopaque = null,
     init_fn: ?*const fn (?*anyopaque) anyerror!void = null,
     deinit_fn: ?*const fn (?*anyopaque) void = null,
+    /// Runtime resource options copied from the module's info at scan time.
+    runtime_options: api.RuntimeOptions = .{},
 
     /// Create a metadata-only ModuleInfo (ptr defaults to null).
     /// Use scanModules() for full registrations with init/deinit function pointers.
@@ -24,6 +26,7 @@ pub const ModuleInfo = struct {
             .ptr = null,
             .init_fn = null,
             .deinit_fn = null,
+            .runtime_options = .{},
         };
     }
 };

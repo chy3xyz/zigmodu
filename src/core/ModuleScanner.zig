@@ -36,6 +36,7 @@ pub fn scanModules(allocator: std.mem.Allocator, comptime modules: anytype) !App
             .ptr = @ptrCast(@constCast(&mod)),
             .init_fn = init_fn,
             .deinit_fn = deinit_fn,
+            .runtime_options = mod.info.runtime,
         });
     }
 
@@ -123,4 +124,31 @@ test "scanModules optional init/deinit" {
     const info = modules.get("nolife").?;
     try std.testing.expect(info.init_fn == null);
     try std.testing.expect(info.deinit_fn == null);
+}
+
+test "scanModules preserves runtime options" {
+    const allocator = std.testing.allocator;
+
+    const MockModule = struct {
+        pub const info = @import("../api/Module.zig").Module{
+            .name = "runtime-mock",
+            .description = "Runtime mock",
+            .dependencies = &.{},
+            .runtime = .{
+                .max_concurrent = 7,
+                .max_qps = 99,
+            },
+        };
+
+        pub fn init() !void {}
+        pub fn deinit() void {}
+    };
+
+    var modules = try scanModules(allocator, .{MockModule});
+    defer modules.deinit();
+
+    const info = modules.get("runtime-mock").?;
+    try std.testing.expectEqualStrings("runtime-mock", info.name);
+    try std.testing.expectEqual(@as(u32, 7), info.runtime_options.max_concurrent);
+    try std.testing.expectEqual(@as(u32, 99), info.runtime_options.max_qps);
 }
