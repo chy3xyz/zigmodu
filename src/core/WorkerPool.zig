@@ -2,7 +2,6 @@
 //! Tasks are submitted to a queue and executed by a fixed number of workers.
 
 const std = @import("std");
-const Time = @import("Time.zig");
 
 pub const Task = struct {
     run: *const fn (ctx: ?*anyopaque, io: std.Io) void,
@@ -55,7 +54,20 @@ pub const WorkerPool = struct {
         errdefer shared.queue.deinit(allocator);
 
         var threads = std.ArrayList(std.Thread).empty;
-        errdefer threads.deinit(allocator);
+        errdefer {
+            // On spawn failure: stop workers that already started, join them,
+            // then free the thread list. `shared` is still valid because this
+            // errdefer runs before we return the WorkerPool value.
+            shared.mu.lock(shared.io) catch {};
+            shared.shutdown = true;
+            shared.cond.broadcast(shared.io);
+            shared.mu.unlock(shared.io);
+
+            for (threads.items) |thread| {
+                thread.join();
+            }
+            threads.deinit(allocator);
+        }
 
         for (0..worker_count) |_| {
             const thread = try std.Thread.spawn(.{}, workerLoop, .{shared});
@@ -70,9 +82,20 @@ pub const WorkerPool = struct {
         };
     }
 
+    /// Signal workers to shut down. New dispatches are rejected after this.
+    /// `deinit` calls this automatically; call it explicitly if you need to
+    /// stop accepting work before releasing the pool.
+    pub fn shutdown(self: *Self) void {
+        const shared = self.shared;
+        shared.mu.lock(shared.io) catch return;
+        defer shared.mu.unlock(shared.io);
+
+        shared.shutdown = true;
+        shared.cond.broadcast(shared.io);
+    }
+
     pub fn deinit(self: *Self) void {
-        self.shared.shutdown = true;
-        self.shared.cond.broadcast(self.shared.io);
+        self.shutdown();
         for (self.threads.items) |thread| {
             thread.join();
         }
@@ -157,9 +180,36 @@ test "WorkerPool rejects when queue is full" {
         }
     };
 
-    var pool = try WorkerPool.init(allocator, std.testing.io, "full", 1, 1);
+    // Use worker_count=0 so no worker can dequeue the first task between the
+    // two dispatch calls. This makes the queue-full check deterministic.
+    var pool = try WorkerPool.init(allocator, std.testing.io, "full", 0, 1);
     defer pool.deinit();
 
     try std.testing.expect(pool.dispatch(.{ .run = Ctx.run, .ctx = null }));
     try std.testing.expect(!pool.dispatch(.{ .run = Ctx.run, .ctx = null }));
+}
+
+test "WorkerPool shutdown rejects new dispatches and drains queue" {
+    const allocator = std.testing.allocator;
+
+    const Ctx = struct {
+        var counter: std.atomic.Value(u32) = .init(0);
+        fn run(ctx: ?*anyopaque, io: std.Io) void {
+            _ = ctx;
+            _ = io;
+            _ = @This().counter.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var pool = try WorkerPool.init(allocator, std.testing.io, "shutdown", 2, 16);
+    defer pool.deinit();
+
+    try std.testing.expect(pool.dispatch(.{ .run = Ctx.run, .ctx = null }));
+    pool.shutdown();
+    try std.testing.expect(!pool.dispatch(.{ .run = Ctx.run, .ctx = null }));
+
+    while (Ctx.counter.load(.monotonic) < 1) {
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(u32, 1), Ctx.counter.load(.monotonic));
 }
