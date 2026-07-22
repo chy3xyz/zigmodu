@@ -428,38 +428,32 @@ const PG_DIAG_CONSTRAINT_NAME: c_int = 'n';
 const PG_DIAG_TABLE_NAME: c_int = 't';
 const PG_DIAG_COLUMN_NAME: c_int = 'c';
 
+/// Safely convert a C string pointer to a Zig slice without triggering std.mem.span(null) debug panic.
+pub inline fn cStrSpan(c_ptr: [*c]const u8) []const u8 {
+    if (c_ptr == null) return "";
+    return std.mem.span(c_ptr);
+}
+
 /// Extract diagnostic info from a PostgreSQL PGresult after a failure.
 pub fn diagnosePostgres(result: ?*const libpq_c.PGresult) SqlDiagnostic {
     var diag = SqlDiagnostic{ .code = 0, .message = "" };
 
-    const raw_sqlstate = if (result) |r| libpq_c.PQresultErrorField(r, PG_DIAG_SQLSTATE) else null;
-    const sqlstate = if (raw_sqlstate != null) std.mem.span(raw_sqlstate) else "";
+    const sqlstate = if (result) |r| cStrSpan(libpq_c.PQresultErrorField(r, PG_DIAG_SQLSTATE)) else "";
     if (sqlstate.len > 0) {
         diag.code = std.fmt.parseInt(i32, sqlstate, 10) catch 0;
     }
 
-    const raw_msg = if (result) |r| libpq_c.PQresultErrorMessage(r) else null;
-    diag.message = if (raw_msg != null) std.mem.span(raw_msg) else "";
+    diag.message = if (result) |r| cStrSpan(libpq_c.PQresultErrorMessage(r)) else "";
 
     if (result) |r| {
-        if (libpq_c.PQresultErrorField(r, PG_DIAG_CONSTRAINT_NAME)) |c| {
-            if (@intFromPtr(c) != 0) {
-                const constraint = std.mem.span(c);
-                if (constraint.len > 0) diag.constraint = constraint;
-            }
-        }
-        if (libpq_c.PQresultErrorField(r, PG_DIAG_TABLE_NAME)) |t| {
-            if (@intFromPtr(t) != 0) {
-                const table = std.mem.span(t);
-                if (table.len > 0) diag.table = table;
-            }
-        }
-        if (libpq_c.PQresultErrorField(r, PG_DIAG_COLUMN_NAME)) |col| {
-            if (@intFromPtr(col) != 0) {
-                const column = std.mem.span(col);
-                if (column.len > 0) diag.column = column;
-            }
-        }
+        const constraint = cStrSpan(libpq_c.PQresultErrorField(r, PG_DIAG_CONSTRAINT_NAME));
+        if (constraint.len > 0) diag.constraint = constraint;
+
+        const table = cStrSpan(libpq_c.PQresultErrorField(r, PG_DIAG_TABLE_NAME));
+        if (table.len > 0) diag.table = table;
+
+        const column = cStrSpan(libpq_c.PQresultErrorField(r, PG_DIAG_COLUMN_NAME));
+        if (column.len > 0) diag.column = column;
     }
 
     return diag;
@@ -1727,9 +1721,9 @@ pub const PostgresConn = struct {
             std.log.err("PG queryFn: status={d} sql={s} err={s}", .{ @intFromEnum(status), sql_str, err_msg });
             if (status == libpq_c.ExecStatusType.PGRES_FATAL_ERROR) {
                 const diag = diagnosePostgres(res);
-                const raw_sqlstate = libpq_c.PQresultErrorField(res.?, PG_DIAG_SQLSTATE);
-                const sqlstate = if (raw_sqlstate != null) std.mem.span(raw_sqlstate) else "";
+                const sqlstate = cStrSpan(libpq_c.PQresultErrorField(res.?, PG_DIAG_SQLSTATE));
                 const db_err = errors.sqlStateToError(sqlstate);
+
 
                 switch (db_err) {
                     error.ConstraintViolation => {
@@ -1753,9 +1747,10 @@ pub const PostgresConn = struct {
 
         const shared_columns = arena_alloc.alloc([]const u8, @intCast(n_cols)) catch return error.DatabaseError;
         for (0..@intCast(n_cols)) |c| {
-            const name = std.mem.span(libpq_c.PQfname(res.?, @intCast(c)));
+            const name = cStrSpan(libpq_c.PQfname(res.?, @intCast(c)));
             shared_columns[c] = arena_alloc.dupe(u8, name) catch return error.DatabaseError;
         }
+
 
         for (0..@intCast(n_rows)) |r| {
             const values = arena_alloc.alloc(?Value, @intCast(n_cols)) catch return error.DatabaseError;
@@ -1786,9 +1781,9 @@ pub const PostgresConn = struct {
             std.log.err("PG execFn: status={d} sql={s} err={s}", .{ @intFromEnum(status), sql_str, err_msg });
             if (status == libpq_c.ExecStatusType.PGRES_FATAL_ERROR) {
                 const diag = diagnosePostgres(res.?);
-                const raw_sqlstate = libpq_c.PQresultErrorField(res.?, PG_DIAG_SQLSTATE);
-                const sqlstate = if (raw_sqlstate != null) std.mem.span(raw_sqlstate) else "";
+                const sqlstate = cStrSpan(libpq_c.PQresultErrorField(res.?, PG_DIAG_SQLSTATE));
                 const db_err = errors.sqlStateToError(sqlstate);
+
 
                 switch (db_err) {
                     error.ConstraintViolation => {

@@ -145,11 +145,13 @@ pub const SecurityModule = struct {
 
     /// Validation JWT Token
     pub fn verifyToken(self: *Self, token_string: []const u8) !JwtToken.JwtPayload {
-        // Split token
+        // Split token (must be exactly 3 parts: header.payload.signature)
         var parts = std.mem.splitSequence(u8, token_string, ".");
         const header_b64 = parts.next() orelse return error.InvalidToken;
         const payload_b64 = parts.next() orelse return error.InvalidToken;
         const signature = parts.next() orelse return error.InvalidToken;
+        if (parts.next() != null) return error.InvalidToken;
+
 
         // Validate algorithm header (prevent alg confusion attacks)
         const header_json = try base64UrlDecode(self.allocator, header_b64);
@@ -504,3 +506,12 @@ test "SecurityModule role checking" {
     try std.testing.expect(SecurityModule.hasAllRoles(payload, &.{ "admin", "user" }));
     try std.testing.expect(!SecurityModule.hasAllRoles(payload, &.{ "admin", "guest" }));
 }
+
+test "SecurityModule rejects malformed tokens with extra parts" {
+    const allocator = std.testing.allocator;
+    var sec = SecurityModule.init(allocator, "secret", 3600);
+
+    const malformed = "header.payload.sig.extra_part";
+    try std.testing.expectError(error.InvalidToken, sec.verifyToken(malformed));
+}
+
