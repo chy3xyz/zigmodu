@@ -22,6 +22,15 @@ pub fn Pool(comptime T: type) type {
             last_used: i64,
         };
 
+        pub const PoolStats = struct {
+            active_count: u32,
+            idle_count: usize,
+            creation_count: u64,
+            eviction_count: u64,
+            total_wait_time_ms: u64,
+            timeout_count: u64,
+        };
+
         allocator: std.mem.Allocator,
         io: std.Io,
         createFn: *const fn () errors.ResultT(*T),
@@ -30,6 +39,10 @@ pub fn Pool(comptime T: type) type {
         min_idle: u32,
         max_active: u32,
         active_count: std.atomic.Value(u32),
+        creation_count: std.atomic.Value(u64),
+        eviction_count: std.atomic.Value(u64),
+        total_wait_time_ms: std.atomic.Value(u64),
+        timeout_count: std.atomic.Value(u64),
         idle_conns: std.ArrayList(Node),
         mutex: std.Io.Mutex,
         cond: std.Io.Condition,
@@ -53,12 +66,17 @@ pub fn Pool(comptime T: type) type {
                 .min_idle = config.min_idle,
                 .max_active = config.max_active,
                 .active_count = std.atomic.Value(u32).init(0),
+                .creation_count = std.atomic.Value(u64).init(0),
+                .eviction_count = std.atomic.Value(u64).init(0),
+                .total_wait_time_ms = std.atomic.Value(u64).init(0),
+                .timeout_count = std.atomic.Value(u64).init(0),
                 .idle_conns = std.ArrayList(Node).empty,
                 .mutex = std.Io.Mutex.init,
                 .cond = std.Io.Condition.init,
                 .max_wait_ms = config.max_wait_ms,
                 .closed = std.atomic.Value(bool).init(false),
             };
+
 
             // Pre-create min idle connections
             var i: u32 = 0;
@@ -69,7 +87,9 @@ pub fn Pool(comptime T: type) type {
                     .last_used = 0,
                 });
                 _ = pool.active_count.fetchAdd(1, .monotonic);
+                _ = pool.creation_count.fetchAdd(1, .monotonic);
             }
+
 
             return pool;
         }
@@ -103,6 +123,7 @@ pub fn Pool(comptime T: type) type {
                     }
                     self.destroyFn(n.conn);
                     _ = self.active_count.fetchSub(1, .monotonic);
+                    _ = self.eviction_count.fetchAdd(1, .monotonic);
                 }
             }
 
@@ -112,11 +133,11 @@ pub fn Pool(comptime T: type) type {
                 self.mutex.unlock(self.io);
                 const conn = try self.createFn();
                 _ = self.active_count.fetchAdd(1, .monotonic);
+                _ = self.creation_count.fetchAdd(1, .monotonic);
                 return conn;
             }
 
             // Wait for a connection to be released
-            // In Zig 0.16.0, Condition.timedWait API changed; using simple timeout loop
             var waited: u32 = 0;
             const step_ms: u32 = 10;
             while (self.idle_conns.items.len == 0 and waited < self.max_wait_ms) {
@@ -124,12 +145,15 @@ pub fn Pool(comptime T: type) type {
                 waited += step_ms;
             }
 
+            _ = self.total_wait_time_ms.fetchAdd(waited, .monotonic);
+
             if (self.idle_conns.items.len > 0) {
                 const node = self.idle_conns.pop();
                 self.mutex.unlock(self.io);
                 if (node) |n| return n.conn;
             }
 
+            _ = self.timeout_count.fetchAdd(1, .monotonic);
             self.mutex.unlock(self.io);
             return error.Timeout;
         }
@@ -150,6 +174,7 @@ pub fn Pool(comptime T: type) type {
                 self.mutex.unlock(self.io);
                 self.destroyFn(conn);
                 _ = self.active_count.fetchSub(1, .monotonic);
+                _ = self.eviction_count.fetchAdd(1, .monotonic);
                 return;
             };
             self.mutex.unlock(self.io);
@@ -167,6 +192,19 @@ pub fn Pool(comptime T: type) type {
             defer self.mutex.unlock(self.io);
             return self.idle_conns.items.len;
         }
+
+        /// Comprehensive pool status metrics
+        pub fn stats(self: *Self) PoolStats {
+            return .{
+                .active_count = self.active_count.load(.monotonic),
+                .idle_count = self.idle(),
+                .creation_count = self.creation_count.load(.monotonic),
+                .eviction_count = self.eviction_count.load(.monotonic),
+                .total_wait_time_ms = self.total_wait_time_ms.load(.monotonic),
+                .timeout_count = self.timeout_count.load(.monotonic),
+            };
+        }
+
     };
 }
 
@@ -229,5 +267,10 @@ test "connection pool" {
     try std.testing.expectEqual(@as(u32, 42), conn.*);
     pool.release(conn);
 
+    const st = pool.stats();
+    try std.testing.expect(st.creation_count >= 2);
+    try std.testing.expectEqual(@as(u64, 0), st.eviction_count);
+
     try std.testing.expect(create_count >= 2);
 }
+

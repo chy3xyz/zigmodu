@@ -113,6 +113,8 @@ test "compile all source files" {
     _ = @import("security/SecurityScanner.zig");
     _ = @import("security/AuthMiddleware.zig");
     _ = @import("security/AppSecurity.zig");
+    _ = @import("security/JwksKeyRing.zig");
+
 
     // Test
     _ = @import("test/Benchmark.zig");
@@ -122,6 +124,8 @@ test "compile all source files" {
 
     // Tracing
     _ = @import("tracing/DistributedTracer.zig");
+    _ = @import("tracing/OtlpExporter.zig");
+
 
     // Validation
     _ = @import("validation/ObjectValidator.zig");

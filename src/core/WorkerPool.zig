@@ -24,6 +24,20 @@ pub const WorkerPool = struct {
         cond: std.Io.Condition,
         shutdown: bool,
         max_pending: usize,
+        total_workers: usize,
+        active_workers: std.atomic.Value(usize),
+        completed_tasks: std.atomic.Value(u64),
+        rejected_tasks: std.atomic.Value(u64),
+    };
+
+    pub const WorkerPoolStats = struct {
+        pending_count: usize,
+        max_pending: usize,
+        active_workers: usize,
+        total_workers: usize,
+        completed_tasks: u64,
+        rejected_tasks: u64,
+        utilization_pct: f32,
     };
 
     allocator: std.mem.Allocator,
@@ -56,7 +70,12 @@ pub const WorkerPool = struct {
             .cond = .init,
             .shutdown = false,
             .max_pending = max_pending,
+            .total_workers = worker_count,
+            .active_workers = std.atomic.Value(usize).init(0),
+            .completed_tasks = std.atomic.Value(u64).init(0),
+            .rejected_tasks = std.atomic.Value(u64).init(0),
         };
+
         try shared.queue.ensureTotalCapacity(allocator, max_pending);
         errdefer shared.queue.deinit(allocator);
 
@@ -109,11 +128,16 @@ pub const WorkerPool = struct {
     /// Submit a task. Returns false if the queue is full or shutting down.
     pub fn dispatch(self: *Self, task: Task) bool {
         const shared = self.shared;
-        shared.mu.lock(shared.io) catch return false;
+        shared.mu.lock(shared.io) catch {
+            _ = shared.rejected_tasks.fetchAdd(1, .monotonic);
+            return false;
+        };
         defer shared.mu.unlock(shared.io);
 
-        if (shared.shutdown) return false;
-        if (shared.queue.items.len >= shared.max_pending) return false;
+        if (shared.shutdown or shared.queue.items.len >= shared.max_pending) {
+            _ = shared.rejected_tasks.fetchAdd(1, .monotonic);
+            return false;
+        }
 
         shared.queue.appendAssumeCapacity(task);
         shared.cond.signal(shared.io);
@@ -125,6 +149,32 @@ pub const WorkerPool = struct {
         shared.mu.lock(shared.io) catch return 0;
         defer shared.mu.unlock(shared.io);
         return shared.queue.items.len;
+    }
+
+    /// Retrieve runtime statistics of this worker pool
+    pub fn stats(self: *Self) WorkerPoolStats {
+        const shared = self.shared;
+        const pending = self.pendingCount();
+        const active = shared.active_workers.load(.monotonic);
+        const total = shared.total_workers;
+        const util = if (total > 0) @as(f32, @floatFromInt(active)) / @as(f32, @floatFromInt(total)) else 0.0;
+
+        return .{
+            .pending_count = pending,
+            .max_pending = shared.max_pending,
+            .active_workers = active,
+            .total_workers = total,
+            .completed_tasks = shared.completed_tasks.load(.monotonic),
+            .rejected_tasks = shared.rejected_tasks.load(.monotonic),
+            .utilization_pct = util,
+        };
+    }
+
+    /// Backpressure check: returns true if queue or worker capacity is above threshold_pct (0.0 to 1.0)
+    pub fn isOverloaded(self: *Self, threshold_pct: f32) bool {
+        const st = self.stats();
+        const pending_pct = if (st.max_pending > 0) @as(f32, @floatFromInt(st.pending_count)) / @as(f32, @floatFromInt(st.max_pending)) else 0.0;
+        return (st.utilization_pct >= threshold_pct) or (pending_pct >= threshold_pct);
     }
 
     fn workerLoop(shared: *Shared) void {
@@ -141,11 +191,15 @@ pub const WorkerPool = struct {
             }
 
             const task = shared.queue.orderedRemove(0);
+            _ = shared.active_workers.fetchAdd(1, .monotonic);
             shared.mu.unlock(shared.io);
 
             task.run(task.ctx, shared.io);
+            _ = shared.active_workers.fetchSub(1, .monotonic);
+            _ = shared.completed_tasks.fetchAdd(1, .monotonic);
         }
     }
+
 };
 
 fn signalShutdown(shared: *WorkerPool.Shared) void {
@@ -250,3 +304,32 @@ test "WorkerPool rejects worker_count above max_worker_count" {
     const pool = WorkerPool.init(allocator, std.testing.io, "huge", max_worker_count + 1, 1);
     try std.testing.expectError(error.ConfigurationError, pool);
 }
+
+test "WorkerPool stats and isOverloaded backpressure" {
+    const allocator = std.testing.allocator;
+
+    const Ctx = struct {
+        flag: std.atomic.Value(bool) = .init(false),
+        fn run(ctx: ?*anyopaque, io: std.Io) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            while (!self.flag.load(.acquire)) {
+                std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+            }
+        }
+    };
+
+    var ctx: Ctx = .{};
+    var pool = try WorkerPool.init(allocator, std.testing.io, "stats-test", 1, 1);
+
+    try std.testing.expect(pool.dispatch(.{ .run = Ctx.run, .ctx = &ctx }));
+    _ = pool.dispatch(.{ .run = Ctx.run, .ctx = &ctx });
+
+    const st = pool.stats();
+    try std.testing.expectEqual(@as(usize, 1), st.total_workers);
+    try std.testing.expect(pool.isOverloaded(0.50));
+
+    ctx.flag.store(true, .release);
+    pool.deinit();
+}
+
+

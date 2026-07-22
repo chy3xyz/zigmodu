@@ -78,6 +78,22 @@ pub const AppendEntriesResponse = struct {
     match_index: u64, // highest log index matched (for fast backtracking)
 };
 
+/// InstallSnapshot RPC request (leader → follower)
+pub const InstallSnapshotRequest = struct {
+    term: u64,
+    leader_id: []const u8,
+    last_included_index: u64,
+    last_included_term: u64,
+    offset: u64,
+    data: []const u8,
+    done: bool,
+};
+
+/// InstallSnapshot RPC response (follower → leader)
+pub const InstallSnapshotResponse = struct {
+    term: u64,
+};
+
 /// Raft
 ///
 /// Handles leader election and log replication within a Raft cluster.
@@ -91,6 +107,10 @@ pub const RaftElection = struct {
     current_term: u64 = 0,
     voted_for: ?[]const u8 = null,
     log: std.ArrayList(LogEntry),
+    last_included_index: u64 = 0,
+    last_included_term: u64 = 0,
+    snapshot_data: ?[]const u8 = null,
+
 
     // Volatile state (all servers)
     state: RaftState = .follower,
@@ -172,7 +192,9 @@ pub const RaftElection = struct {
         }
         self.peers.deinit(self.allocator);
         if (self.voted_for) |v| self.allocator.free(v);
+        if (self.snapshot_data) |s| self.allocator.free(s);
         // leader_id may alias local_id (from becomeLeader); only free when they differ
+
         if (self.leader_id) |l| {
             if (l.ptr != self.local_id.ptr) {
                 self.allocator.free(l);
@@ -571,7 +593,73 @@ pub const RaftElection = struct {
     }
 
     /// Get current state
+    /// Log compaction: Discard entries up to `up_to_index` and retain `snapshot_data`.
+    pub fn compactLog(self: *Self, up_to_index: u64, snapshot_bytes: []const u8) !void {
+        if (up_to_index <= self.last_included_index) return;
+        if (self.log.items.len == 0) return;
+
+        var target_idx: ?usize = null;
+        for (self.log.items, 0..) |entry, i| {
+            if (entry.index == up_to_index) {
+                target_idx = i;
+                self.last_included_term = entry.term;
+                break;
+            }
+        }
+
+        const idx = target_idx orelse return error.IndexNotFound;
+
+        // Free entries up to idx
+        for (0..idx + 1) |i| {
+            self.allocator.free(self.log.items[i].command);
+        }
+
+        const remaining = self.log.items.len - (idx + 1);
+        if (remaining > 0) {
+            std.mem.copyForwards(LogEntry, self.log.items[0..remaining], self.log.items[idx + 1 ..]);
+        }
+        self.log.items.len = remaining;
+
+
+        self.last_included_index = up_to_index;
+
+        if (self.snapshot_data) |s| self.allocator.free(s);
+        self.snapshot_data = try self.allocator.dupe(u8, snapshot_bytes);
+    }
+
+    /// Follower handles InstallSnapshot RPC from leader (§7 Log Compaction).
+    pub fn handleInstallSnapshot(self: *Self, req: InstallSnapshotRequest) !InstallSnapshotResponse {
+        if (req.term < self.current_term) {
+            return InstallSnapshotResponse{ .term = self.current_term };
+        }
+
+        if (req.term > self.current_term) {
+            self.current_term = req.term;
+        }
+        self.state = .follower;
+
+        if (req.last_included_index > self.last_included_index) {
+            // Free current log entries
+            for (self.log.items) |entry| {
+                self.allocator.free(entry.command);
+            }
+            self.log.clearRetainingCapacity();
+
+            self.last_included_index = req.last_included_index;
+            self.last_included_term = req.last_included_term;
+
+            if (self.snapshot_data) |s| self.allocator.free(s);
+            self.snapshot_data = try self.allocator.dupe(u8, req.data);
+
+            self.commit_index = @max(self.commit_index, req.last_included_index);
+            self.last_applied = @max(self.last_applied, req.last_included_index);
+        }
+
+        return InstallSnapshotResponse{ .term = self.current_term };
+    }
+
     pub fn getState(self: Self) RaftState {
+
         return self.state;
     }
 
@@ -1167,3 +1255,61 @@ test "RaftElection quorum calculation" {
     try testing.expectEqual(@as(usize, 1), e2.clusterSize());
     try testing.expectEqual(@as(usize, 1), e2.quorumSize());
 }
+
+test "RaftElection log compaction and InstallSnapshot" {
+    const allocator = testing.allocator;
+
+    const TransportImpl = struct {
+        sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
+        sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse,
+    };
+    var transport_impl = TransportImpl{
+        .sendVoteRequest = (struct {
+            fn f(_: ?[]const u8, _: []const u8, _: VoteRequest) void {}
+        }).f,
+        .sendAppendEntries = (struct {
+            fn f(_: ?[]const u8, _: []const u8, _: AppendEntriesRequest) AppendEntriesResponse {
+                return AppendEntriesResponse{ .term = 0, .success = false, .match_index = 0 };
+            }
+        }).f,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
+
+    var raft = try RaftElection.init(allocator, "node-1", &.{}, .{}, &transport);
+    defer raft.deinit();
+    raft.state = .leader;
+    raft.current_term = 1;
+
+    _ = try raft.appendEntry("cmd1");
+    _ = try raft.appendEntry("cmd2");
+    _ = try raft.appendEntry("cmd3");
+
+    try testing.expectEqual(@as(usize, 3), raft.log.items.len);
+
+    // Compact log up to index 2
+    try raft.compactLog(2, "snapshot-payload-at-2");
+
+    try testing.expectEqual(@as(u64, 2), raft.last_included_index);
+    try testing.expectEqual(@as(usize, 1), raft.log.items.len);
+    try testing.expectEqualStrings("snapshot-payload-at-2", raft.snapshot_data.?);
+
+    // Follower handle InstallSnapshot
+    var follower = try RaftElection.init(allocator, "node-2", &.{}, .{}, &transport);
+    defer follower.deinit();
+
+    const snap_req = InstallSnapshotRequest{
+        .term = 1,
+        .leader_id = "node-1",
+        .last_included_index = 10,
+        .last_included_term = 1,
+        .offset = 0,
+        .data = "follower-snapshot-data",
+        .done = true,
+    };
+
+    const snap_resp = try follower.handleInstallSnapshot(snap_req);
+    try testing.expectEqual(@as(u64, 1), snap_resp.term);
+    try testing.expectEqual(@as(u64, 10), follower.last_included_index);
+    try testing.expectEqualStrings("follower-snapshot-data", follower.snapshot_data.?);
+}
+

@@ -11,7 +11,9 @@ Comprehensive documentation for the ZigModu modular framework.
 | [领域分层](MODULE_LAYERS.md) | model / persistence.Tx / service Cmd | All |
 | [多租户店蓝图](MODULITH_TENANT_SHOP.md) | Module graph + directory for tenant shop | All |
 | [ZigModu × zent](ZENT.md) | Orthogonal zent ORM + modulith practices | Intermediate |
+| [zmodu CLI 生成器](ZMODU_CLI_INTEGRATION.md) | DDL schema generator + `@initialized` model + MCP | All |
 | [Best Practices](BEST_PRACTICES.md) | Architecture evolution from 1K to 1M+ DAU | All |
+
 | [Elegant Code Patterns](elegant-code-patterns.md) | Five-file layout + code samples | Intermediate |
 | [API Reference](API.md) | Detailed API documentation | Advanced |
 | [Architecture](ARCHITECTURE.md) | System design and patterns | Intermediate |

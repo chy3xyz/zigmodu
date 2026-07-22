@@ -18,6 +18,7 @@
 | 6 | ✅ 已完成 | README/评估报告/示例与宣传对齐 |
 | **7** | **✅ 已完成** | **JWT 统一 + AppSecurity + tenant-mgmt 真 JWT + CI token 生成** |
 | **8** | **✅ 已完成** | **评估 v5 (~95/100) + 多租户可选架构文档** |
+| **9** | **规划中** | **高阶传输(gRPC streaming/HTTP/2)、分布式容错(Raft 快照/Saga恢复)、Tooling与OTLP观测** |
 
 **验收基线（当前已达成）**
 
@@ -127,6 +128,30 @@ bash scripts/ci-integration.sh   # tenant-mgmt + http-stress-test（需 curl）
 - [x] 更新 `docs/EVALUATION_REPORT.md` v4（v0.13.15 / Zig 0.17 / 413 tests）。
 - [x] 旗舰示例 `examples/tenant-mgmt/`；README / examples 索引中 shopdemo 标为 codegen 参考。
 - [x] `CLAUDE.md` / `AGENTS.md` 同步 Zig 0.17 与 v0.13.15。
+
+### 阶段 9 — 高阶演进与深度改进路线 (演进中)
+
+1. **数据库层高阶优化 (✅ 已落地)**
+   - **MySQL 二进制协议类型适配**：补全 `NEWDECIMAL`, `DECIMAL`, `JSON`, `DATETIME`, `TIMESTAMP`, `DATE`, `TIME`, `ENUM`, `SET` 等二进制 prepared statement 精确解析与 `Value` 映射。
+   - **内存生命周期安全管理**：引入 `ManagedRows` RAII 自动释放封装与 `withRows` 作用域闭包，消除长连接与高 QPS 查询内存泄露风险。
+   - **连接池 ConnPool 可观测度与指标**：增加 `active_count`, `idle_count`, `creation_count`, `eviction_count`, `total_wait_time_ms`, `timeout_count` 指标统计与 `pool.stats()` 接口。
+2. **Modulith QPS 横向扩展与高并发控流 (✅ 已落地)**
+   - **WorkerPool & Runtime 实时度量**：支持 `pending_count`, `active_workers`, `completed_tasks`, `rejected_tasks`, `utilization_pct` 等指标捕获与 `wp.stats()`。
+   - **Redis 分布式限流降级保护**：`RedisRateLimiter` 实现 `allowWithFallback` 容灾逻辑，断连或异常时无缝降级至本地 `RateLimiter` 兜底。
+   - **级联背压 (Cascade Backpressure)**：在 `ModuleRuntime.tryEnter` 中整合 WorkerPool 载重检测（>90% 满载时实现快速拒绝，保护系统不雪崩）。
+3. **全链路可观测性 (Observability) 升级 (✅ 已落地)**
+   - **OpenTelemetry (OTLP) Exporter**：实现 `src/tracing/OtlpExporter.zig`，将 `DistributedTracer` 链路导出为标准 OTLP JSON 格式。
+   - **在 `observability.zig` 导出**：支持标准云原生 Trace / Span 上报。
+4. **工具链与生成器集成 (zmodu CLI) (✅ 已落地)**
+   - **`zmodu` 独立 CLI 集成**：编写 [`docs/ZMODU_CLI_INTEGRATION.md`](ZMODU_CLI_INTEGRATION.md)，打通 SQL DDL Schema 一键构建 `@initialized` 模版工程，全量支持 MCP Server 与 Modulith 六层分层生成。
+5. **协议传输层高阶演进 (gRPC Streaming & HTTP/2)**
+   - 补齐 HTTP/2 Framer / H2 Window Control，实现 gRPC Bidirectional Streaming。
+   - 丰富 Kafka Wire 协议矩阵（Consumer Group Rebalance 协议：Heartbeat/JoinGroup/SyncGroup）。
+6. **分布式状态机与容错增强 (✅ 已落地)**
+   - **Raft Log Compaction & InstallSnapshot**：在 [`src/core/cluster/RaftElection.zig`](../src/core/cluster/RaftElection.zig) 中实现 `InstallSnapshotRequest`/`Response` 协议，提供 `compactLog` 内存裁切与 Follower 快照覆盖能力，防止 Raft 日志无限增长。
+   - **Saga 事务协调器**：持续支持服务节点崩溃重启后的 WAL Recovery。
+
+
 
 ---
 

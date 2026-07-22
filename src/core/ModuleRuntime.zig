@@ -80,10 +80,15 @@ pub const ModuleRuntime = struct {
     }
 
     /// Try to acquire permission to execute one request/command.
-    /// Returns false if bulkhead, rate limit, or circuit breaker rejects.
+    /// Returns false if worker pool is severely overloaded, or bulkhead, rate limit, circuit breaker rejects.
     pub fn tryEnter(self: *Self) bool {
         self.mu.lock(self.io) catch return false;
         defer self.mu.unlock(self.io);
+
+        // Cascade backpressure check: fast drop if worker pool capacity is >90% exhausted
+        if (self.worker_pool) |*wp| {
+            if (wp.isOverloaded(0.90)) return false;
+        }
 
         if (self.bulkhead) |*bh| {
             if (!bh.tryAcquire()) return false;
@@ -106,6 +111,7 @@ pub const ModuleRuntime = struct {
 
         return true;
     }
+
 
     /// Release one bulkhead slot after execution.
     pub fn release(self: *Self) void {
@@ -146,7 +152,25 @@ pub const ModuleRuntime = struct {
         bulkhead_rejected: u64 = 0,
         rate_available: u32 = 0,
         cb_state: ?CircuitBreaker.State = null,
+        worker_pool: ?WorkerPool.WorkerPoolStats = null,
     };
+
+    /// Check if this module's WorkerPool is overloaded (threshold 0.0 ~ 1.0, e.g. 0.90)
+    pub fn isOverloaded(self: *Self, threshold_pct: f32) bool {
+        if (self.worker_pool) |*wp| {
+            return wp.isOverloaded(threshold_pct);
+        }
+        return false;
+    }
+
+    /// Retrieve worker pool stats if enabled.
+    pub fn getWorkerPoolStats(self: *Self) ?WorkerPool.WorkerPoolStats {
+        if (self.worker_pool) |*wp| {
+            return wp.stats();
+        }
+        return null;
+    }
+
 
     pub fn getStats(self: *Self) Stats {
         self.mu.lock(self.io) catch return .{};

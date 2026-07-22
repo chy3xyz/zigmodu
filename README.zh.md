@@ -30,32 +30,34 @@
 
 ### 分布式能力
 - **DistributedEventBus** - 跨节点事件通信
-- **ClusterMembership** - 节点发现与健康检查
+- **ClusterMembership & Raft** - 节点发现、Raft 选主与日志压缩 (`compactLog` / `InstallSnapshot`)
 ### 弹性模式
-- **熔断器** - 防止级联故障
-- **限流器** - 令牌桶算法
-- **重试策略** - 指数退避
+- **熔断器** - 三态防止级联故障
+- **限流器** - 令牌桶算法与 Redis 自动降级
+- **重试策略** - 指数退避与抖动
 
 ### 传输与API
-- **HTTP服务器** - 异步纤程服务器，支持路由和中间件
-### 可观测性
-- **分布式追踪** - OpenTelemetry兼容
-- **Prometheus指标** - Counter, Gauge, Histogram
-- **结构化日志** - JSON格式
+- **HTTP服务器** - 异步纤程服务器，支持路由、中间件与级联背压控流
+- **gRPC & Kafka** - gRPC Unary + Kafka Wire 协议与 EventBridge
 
-### 开发者体验
-- **热更新** - 运行时模块替换
-- **插件系统** - 动态扩展加载
-- **Web监控** - HTTP仪表板
-- **架构测试器** - 设计规则验证
+### 可观测性
+- **分布式追踪** - OpenTelemetry 兼容 (`OtlpExporter` 导出器)
+- **Prometheus指标** - Counter, Gauge, Histogram 与 HTTP 路由自动关联
+- **结构化日志** - JSON 格式与轮转
+- **深层健康检查** - 兼容 K8s liveness/readiness 探针与 Pool 水位
+
+### 安全与工具链 (DX)
+- **AppSecurity** - std.Io 墙钟 JWT 验证与 `JwksKeyRing` 动态密钥轮换
+- **zmodu 代码生成 CLI** - 内置项目脚手架与 MCP Server (`zig build zmodu`)
 
 ## 🚀 快速开始
 
 ### 前置要求
 
 ```bash
-# 安装 Zig 0.16.0
-brew install zig@0.16.0  # macOS
+# 安装 Zig 0.17.0
+brew install zig
+
 # 或
 apt install zig=0.16.0   # Linux
 ```

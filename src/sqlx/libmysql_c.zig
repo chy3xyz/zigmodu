@@ -42,15 +42,21 @@ pub const MYSQL_TYPE_VARCHAR = 15;
 pub const MYSQL_TYPE_TINY = 1;
 pub const MYSQL_TYPE_SHORT = 2;
 pub const MYSQL_TYPE_FLOAT = 4;
+pub const MYSQL_TYPE_DECIMAL = 0;
 pub const MYSQL_TYPE_TIMESTAMP = 7;
 pub const MYSQL_TYPE_DATE = 10;
 pub const MYSQL_TYPE_TIME = 11;
 pub const MYSQL_TYPE_DATETIME = 12;
+pub const MYSQL_TYPE_BIT = 16;
+pub const MYSQL_TYPE_JSON = 245;
 pub const MYSQL_TYPE_NEWDECIMAL = 246;
+pub const MYSQL_TYPE_ENUM = 247;
+pub const MYSQL_TYPE_SET = 248;
 pub const MYSQL_TYPE_TINY_BLOB = 249;
 pub const MYSQL_TYPE_MEDIUM_BLOB = 250;
 pub const MYSQL_TYPE_LONG_BLOB = 251;
 pub const MYSQL_TYPE_BLOB = 252;
+
 
 /// MYSQL_FIELD.flags — column flags
 pub const UNSIGNED_FLAG: c_uint = 32;

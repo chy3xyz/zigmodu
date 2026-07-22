@@ -56,7 +56,9 @@ pub const SecurityModule = struct {
         pub const JwtHeader = struct {
             alg: []const u8 = "HS256",
             typ: []const u8 = "JWT",
+            kid: ?[]const u8 = null,
         };
+
 
         pub const JwtPayload = struct {
             sub: []const u8, // subject (user id)
@@ -164,11 +166,12 @@ pub const SecurityModule = struct {
         defer self.allocator.free(expected_signature);
 
         // Constant-time comparison to prevent timing side-channel
-        if (signature.len > expected_signature.len or
-            !timingSafeSliceEql(signature, expected_signature[0..signature.len]))
+        if (signature.len != expected_signature.len or
+            !timingSafeSliceEql(signature, expected_signature))
         {
             return error.InvalidSignature;
         }
+
 
         // Decode payload
         const payload_json = try base64UrlDecode(self.allocator, payload_b64);

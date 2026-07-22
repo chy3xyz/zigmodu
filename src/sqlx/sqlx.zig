@@ -151,6 +151,38 @@ pub const Rows = struct {
     }
 };
 
+/// RAII managed wrapper for query results to guarantee memory release in current scope.
+pub const ManagedRows = struct {
+    rows: Rows,
+
+    pub fn init(rows: Rows) ManagedRows {
+        return .{ .rows = rows };
+    }
+
+    pub fn deinit(self: *ManagedRows) void {
+        self.rows.deinit();
+    }
+
+    pub fn get(self: *const ManagedRows) []const Row {
+        return self.rows.rows;
+    }
+
+    pub fn first(self: *const ManagedRows) ?*Row {
+        if (self.rows.rows.len == 0) return null;
+        return &self.rows.rows[0];
+    }
+};
+
+/// High-level scoped helper for fallible query processing with automatic deinit.
+pub fn withRows(client: *Client, sql: []const u8, args: []const Value, callback: anytype) !void {
+    var res = try client.queryRows(sql, args);
+    var rows = try res.unwrap();
+    defer rows.deinit();
+
+    try callback(&rows);
+}
+
+
 /// Cursor fetch mode.
 pub const CursorMode = enum {
     /// Materialize all rows upfront. Rows remain valid until `cursor.deinit()`.
@@ -2626,13 +2658,31 @@ fn mysqlStmtReadRows(stmt: *libmysql_c.MYSQL_STMT, arena: std.heap.ArenaAllocato
                     libmysql_c.MYSQL_TYPE_LONG_BLOB,
                     => blk: {
                         const len: usize = @intCast(lengths[c]);
-                        break :blk Value{ .string = arena_alloc.dupe(u8, bind_bufs[c].string.buf[0..len]) catch return error.DatabaseError };
+                        const safe_len = @min(len, bind_bufs[c].string.buf.len);
+                        break :blk Value{ .string = arena_alloc.dupe(u8, bind_bufs[c].string.buf[0..safe_len]) catch return error.DatabaseError };
                     },
-                    // STRING fallback (DECIMAL, DATE/TIME, VARCHAR, etc.)
+                    // Explicit handling for NEWDECIMAL, DECIMAL, JSON, DATETIME, TIMESTAMP, DATE, TIME, ENUM, SET & STRING fallback
+                    libmysql_c.MYSQL_TYPE_NEWDECIMAL,
+                    libmysql_c.MYSQL_TYPE_DECIMAL,
+                    libmysql_c.MYSQL_TYPE_JSON,
+                    libmysql_c.MYSQL_TYPE_DATETIME,
+                    libmysql_c.MYSQL_TYPE_TIMESTAMP,
+                    libmysql_c.MYSQL_TYPE_DATE,
+                    libmysql_c.MYSQL_TYPE_TIME,
+                    libmysql_c.MYSQL_TYPE_ENUM,
+                    libmysql_c.MYSQL_TYPE_SET,
+                    => blk: {
+                        const len: usize = @intCast(lengths[c]);
+                        const safe_len = @min(len, bind_bufs[c].string.buf.len);
+                        break :blk Value{ .string = arena_alloc.dupe(u8, bind_bufs[c].string.buf[0..safe_len]) catch return error.DatabaseError };
+                    },
+                    // STRING fallback (VARCHAR, CHAR, etc.)
                     else => blk: {
                         const len: usize = @intCast(lengths[c]);
-                        break :blk Value{ .string = arena_alloc.dupe(u8, bind_bufs[c].string.buf[0..len]) catch return error.DatabaseError };
+                        const safe_len = @min(len, bind_bufs[c].string.buf.len);
+                        break :blk Value{ .string = arena_alloc.dupe(u8, bind_bufs[c].string.buf[0..safe_len]) catch return error.DatabaseError };
                     },
+
                 };
             }
         }

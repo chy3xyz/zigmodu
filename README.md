@@ -60,7 +60,7 @@ A modular application framework for Zig 0.17, inspired by Spring Modulith. Build
 - **Sharding** — Tenant-aware ShardRouter with configurable pools
 
 ### Observability
-- **Distributed Tracing** — OpenTelemetry-compatible, Jaeger/Zipkin export
+- **Distributed Tracing** — OpenTelemetry-compatible (`OtlpExporter` for OTLP/JSON export)
 - **Prometheus Metrics** — Counter / Gauge (lock-free CAS) / Histogram / Summary
 - **Structured Logging** — JSON-formatted with log rotation and levels
 - **Auto Instrumentation** — Automatic lifecycle/event/API instrumentation
@@ -68,11 +68,16 @@ A modular application framework for Zig 0.17, inspired by Spring Modulith. Build
 
 ### Security
 - **AppSecurity** — Production JWT (`initWithIo`, wall-clock exp, middleware helpers)
+- **JWKS Key Rotation** — Dynamic multi-key management with `JwksKeyRing` & `kid` indexing
 - **JWT Authentication** — Unified verify via `SecurityModule`; RBAC optional
-- **Password Encoder** — Scrypt + timing-safe comparison
+- **Password Encoder** — PBKDF2-HMAC-SHA256 + timing-safe comparison
 - **Security Scanner** — Static SAST with configurable rules
 - **Secrets Manager** — Multi-source secrets (env > file > Vault KV v2 HTTP > default)
 - **Multi-Tenancy (optional)** — TenantContext + DataPermission + ShardRouter; skip for single-tenant
+
+### Tooling & CLI
+- **zmodu CLI** — Built-in code generator (`zig build zmodu`) supporting SQL DDL parsing, `@initialized` model & MCP Server
+
 - **Security Headers** — HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy
 - **CSRF Protection** — Double-submit cookie pattern with CSPRNG tokens
 - **Path Sanitizer** — Traversal prevention (rejects `..`, null, `/`, `\`)

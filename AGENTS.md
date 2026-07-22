@@ -21,7 +21,11 @@ var app = try zmodu.builder(allocator, io).withName("app").build(.{ModuleA, Modu
 defer app.deinit();
 try app.start();
 defer app.stop();
+
+// Built-in Codegen & MCP CLI (tools/zmodu)
+// zig build zmodu -- scaffold --sql schema.sql --name my_app
 ```
+
 
 ## Critical Rules (MUST follow)
 
@@ -165,14 +169,16 @@ test "my test" {
 ```
 
 ## Version
-- Framework: **v0.14.3**
+- Framework: **v0.14.8**
 - Zig: **0.17.0**
-- Tests: **455 passed**, 12 skipped, 0 failed
-- Roadmap: `docs/PRODUCTION_ROADMAP.md` (phases 1–5 ✅)
+
+- Tests: **518 passed**, 18 skipped, 0 failed
+- Roadmap: `docs/PRODUCTION_ROADMAP.md` (phases 1–9 ✅)
 - Modulith day-one practices: `docs/MODULITH.md`
 - Domain layering (model / persistence.Tx / service Cmd): `docs/MODULE_LAYERS.md`
+- Built-in Tooling: `tools/zmodu` (run with `zig build zmodu`) · guide `docs/ZMODU_CLI_INTEGRATION.md`
 - ZigModu × zent (orthogonal ORM): `docs/ZENT.md` · example `examples/zent-modulith/`
-- Score: ~95/100 (`docs/EVALUATION_REPORT.md` v5)
+- Score: ~98/100 (`docs/EVALUATION_REPORT.md` v5.3)
 
 ## Learned User Preferences
 
@@ -188,7 +194,8 @@ test "my test" {
 - Project targets Zig 0.17.0; current release tag is v0.14.3 (GitHub `chy3xyz/zigmodu`, default branch `master`).
 - If Zig global cache fails in sandboxed runs, use `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`.
 - Production roadmap and monolith maintenance rules live in `docs/PRODUCTION_ROADMAP.md`.
-- Current test baseline: **468 passed**, 14 skipped with `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test` (after gRPC/Kafka/Vault hardening).
+- Current test baseline: **518 passed**, 18 skipped with `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test` (after OtlpExporter, zmodu CLI, and Raft Log Compaction).
+
 - Optional data stack: [chy3xyz/zent](https://github.com/chy3xyz/zent) (v0.12+) is orthogonal to `data.sqlx` — modules may choose either independently, but do not mix drivers or share a transaction across them; see `docs/ZENT.md`.
 - zent reference apps: `examples/zent-modulith/` (minimal) and `examples/metaverse-creative/` (settlement/outbox creative-monetization demo).
 - gRPC unary (`GrpcTransport`) and Kafka wire (`KafkaConnector`) paths are no longer EXPERIMENTAL; gRPC streaming still returns `UNIMPLEMENTED`.

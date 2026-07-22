@@ -277,6 +277,27 @@ pub fn build(b: *std.Build) void {
     const integration_step = b.step("integration", "Run tenant-mgmt + http-stress-test integration probes");
     integration_step.dependOn(&integration_cmd.step);
 
-    // ZModu CLI: now at https://github.com/chy3xyz/zmodu
-    // Install: npm install -g @chy3xyz/zmodu
+    // Unified ZModu CLI Code Generator (built-in tool)
+    const zmodu_cli_mod = b.createModule(.{
+        .root_source_file = b.path("tools/zmodu/src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const zmodu_cli_exe = b.addExecutable(.{
+        .name = "zmodu",
+        .root_module = zmodu_cli_mod,
+    });
+    b.installArtifact(zmodu_cli_exe);
+
+    const run_zmodu_cmd = b.addRunArtifact(zmodu_cli_exe);
+    const zmodu_step = b.step("zmodu", "Build unified zmodu CLI code generator");
+    zmodu_step.dependOn(&run_zmodu_cmd.step);
+
+    // Include zmodu CLI test suite in `zig build test`
+    const zmodu_tests = b.addTest(.{
+        .root_module = zmodu_cli_mod,
+    });
+    const run_zmodu_tests = b.addRunArtifact(zmodu_tests);
+    test_step.dependOn(&run_zmodu_tests.step);
 }
+

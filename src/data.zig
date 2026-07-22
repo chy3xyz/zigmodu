@@ -8,7 +8,10 @@ pub const orm = @import("persistence/Orm.zig");
 pub const SqlxBackend = @import("persistence/backends/SqlxBackend.zig").SqlxBackend;
 pub const Repository = orm.Orm(SqlxBackend).Repository;
 pub const Client = @import("sqlx/sqlx.zig").Client;
+pub const ManagedRows = @import("sqlx/sqlx.zig").ManagedRows;
+pub const withRows = @import("sqlx/sqlx.zig").withRows;
 pub const pool = @import("pool/Pool.zig");
+
 pub const CacheManager = @import("cache/CacheManager.zig").CacheManager;
 pub const cache = @import("cache/Lru.zig");
 pub const CacheAside = @import("cache/CacheAside.zig").CacheAside;

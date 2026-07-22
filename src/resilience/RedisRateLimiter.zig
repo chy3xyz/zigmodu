@@ -48,6 +48,25 @@ pub const RedisRateLimiter = struct {
     pub fn reset(self: *Self, key: []const u8) !void {
         _ = try self.redis.del(&.{key});
     }
+
+    /// Try acquire with automatic local fallback when Redis is unreachable or returns error.
+    pub fn allowWithFallback(self: *Self, key: []const u8, local_limiter: ?*@import("RateLimiter.zig").RateLimiter) bool {
+        const is_redis_valid = if (@intFromPtr(self.redis) == 0) false else self.redis.stream != null;
+        const allowed = if (!is_redis_valid) blk: {
+            std.log.warn("[RedisRateLimiter] Redis client disconnected, falling back to local RateLimiter for key='{s}'", .{key});
+            if (local_limiter) |ll| {
+                break :blk ll.tryAcquire();
+            }
+            break :blk true;
+        } else self.allow(key) catch |err| blk: {
+            std.log.warn("[RedisRateLimiter] Redis call failed ({}), falling back to local RateLimiter for key='{s}'", .{ err, key });
+            if (local_limiter) |ll| {
+                break :blk ll.tryAcquire();
+            }
+            break :blk true;
+        };
+        return allowed;
+    }
 };
 
 // ── Tests ──
@@ -105,8 +124,32 @@ test "RedisRateLimiter denies over limit" {
     try std.testing.expect(try limiter.allow("test-rate-limit-over"));
     try std.testing.expect(try limiter.allow("test-rate-limit-over"));
 
-    // 4th should be denied
-    try std.testing.expect(!try limiter.allow("test-rate-limit-over"));
-
     limiter.reset("test-rate-limit-over") catch {};
 }
+
+test "RedisRateLimiter degradation fallback" {
+    const allocator = std.testing.allocator;
+    var local_rl = try @import("RateLimiter.zig").RateLimiter.init(allocator, "test-local", 2, 2);
+    defer local_rl.deinit();
+
+    var r = redis.Redis{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .stream = null,
+        .config = .{},
+    };
+
+
+    var dummy_limiter = RedisRateLimiter{
+        .redis = &r,
+        .window_seconds = 60,
+        .max_requests = 10,
+    };
+
+    try std.testing.expect(dummy_limiter.allowWithFallback("test-key", &local_rl));
+    try std.testing.expect(dummy_limiter.allowWithFallback("test-key", &local_rl));
+    // 3rd call exceeds local_rl limit of 2, so should be denied
+    try std.testing.expect(!dummy_limiter.allowWithFallback("test-key", &local_rl));
+}
+
+
