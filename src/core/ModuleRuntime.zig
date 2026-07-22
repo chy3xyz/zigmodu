@@ -76,7 +76,7 @@ pub const ModuleRuntime = struct {
         }
 
         if (self.circuit_breaker) |*cb| {
-            if (cb.getState() == .OPEN) {
+            if (!cb.canAccept()) {
                 if (self.bulkhead) |*bh| bh.release();
                 if (self.rate_limiter) |*rl| rl.reset();
                 return false;
@@ -160,4 +160,29 @@ test "ModuleRuntime disabled when options are zero" {
     for (0..10) |_| {
         try std.testing.expect(rt.tryEnter());
     }
+}
+
+test "ModuleRuntime rejects HALF_OPEN circuit breaker over limit" {
+    const allocator = std.testing.allocator;
+    var rt = try ModuleRuntime.init(allocator, "payment", .{
+        .max_concurrent = 1,
+        .max_qps = 0,
+        .cb_failure_threshold = 1,
+        .cb_success_threshold = 3,
+        .cb_timeout_seconds = 0,
+        .cb_half_open_max_calls = 2,
+    });
+    defer rt.deinit();
+
+    // One failure opens the circuit; with timeout=0 the next state check moves it to HALF_OPEN.
+    rt.recordFailure();
+    try std.testing.expectEqual(CircuitBreaker.State.HALF_OPEN, rt.circuit_breaker.?.getState());
+
+    // Exhaust the two half-open test calls without reaching success_threshold.
+    rt.recordSuccess();
+    rt.recordSuccess();
+    try std.testing.expectEqual(CircuitBreaker.State.HALF_OPEN, rt.circuit_breaker.?.getState());
+
+    // A new request must be rejected because the half-open budget is exhausted.
+    try std.testing.expect(!rt.tryEnter());
 }

@@ -51,30 +51,33 @@ pub const CircuitBreaker = struct {
         self.* = undefined;
     }
 
-    /// Execute a protected call through the circuit breaker.
-    ///
-    /// Thread safety: this method is NOT thread-safe. For concurrent access,
-    /// wrap the CircuitBreaker in a Mutex or use one instance per fiber.
-    pub fn call(self: *Self, operation: *const fn () anyerror!void) Result {
-        // Hot path: CLOSED state (~99.9% of calls) skips the updateState syscall.
+    /// Returns true if the breaker is currently allowing calls through.
+    /// Updates state for OPEN/HALF_OPEN transitions before deciding.
+    pub fn canAccept(self: *Self) bool {
         @branchHint(.likely);
         if (self.state != .CLOSED) {
             @branchHint(.cold);
             self.updateState();
         }
+        return switch (self.state) {
+            .OPEN => false,
+            .HALF_OPEN => self.success_count < self.config.half_open_max_calls,
+            .CLOSED => true,
+        };
+    }
 
-        switch (self.state) {
-            .OPEN => {
-                std.log.warn("Circuit breaker '{s}' is OPEN, rejecting call", .{self.name});
-                return .circuit_open;
-            },
-            .HALF_OPEN => {
-                if (self.success_count >= self.config.half_open_max_calls) {
-                    std.log.warn("Circuit breaker '{s}' HALF_OPEN limit reached", .{self.name});
-                    return .circuit_open;
-                }
-            },
-            .CLOSED => {},
+    /// Execute a protected call through the circuit breaker.
+    ///
+    /// Thread safety: this method is NOT thread-safe. For concurrent access,
+    /// wrap the CircuitBreaker in a Mutex or use one instance per fiber.
+    pub fn call(self: *Self, operation: *const fn () anyerror!void) Result {
+        if (!self.canAccept()) {
+            switch (self.state) {
+                .OPEN => std.log.warn("Circuit breaker '{s}' is OPEN, rejecting call", .{self.name}),
+                .HALF_OPEN => std.log.warn("Circuit breaker '{s}' HALF_OPEN limit reached", .{self.name}),
+                .CLOSED => unreachable,
+            }
+            return .circuit_open;
         }
 
         // [...]
