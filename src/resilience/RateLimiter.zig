@@ -85,6 +85,13 @@ pub const RateLimiter = struct {
         self.last_refill_time = Time.monotonicNowSeconds();
     }
 
+    /// Refund a single token that was previously acquired but not used.
+    /// The token count is capped at `max_tokens`.
+    pub fn release(self: *Self) void {
+        self.refill();
+        self.current_tokens = @min(@as(f64, @floatFromInt(self.max_tokens)), self.current_tokens + 1.0);
+    }
+
     /// [...]
     pub fn getStats(self: *Self) Stats {
         self.refill();

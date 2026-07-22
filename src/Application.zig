@@ -82,7 +82,7 @@ pub const Application = struct {
 
         var registry = ModuleRegistry.init(allocator);
         errdefer registry.deinit();
-        try registry.initFromModules(&modules);
+        try registry.initFromModules(io, &modules);
 
         return .{
             .io = io,

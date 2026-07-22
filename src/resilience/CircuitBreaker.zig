@@ -90,8 +90,9 @@ pub const CircuitBreaker = struct {
         return .success;
     }
 
-    /// [...]success
-    fn onSuccess(self: *Self) void {
+    /// Record a successful call. Public so external callers (e.g. `ModuleRuntime`)
+    /// can update breaker state without re-running `canAccept()`.
+    pub fn onSuccess(self: *Self) void {
         switch (self.state) {
             .CLOSED => {
                 // [...]Failure count
@@ -111,8 +112,9 @@ pub const CircuitBreaker = struct {
         }
     }
 
-    /// [...]failure
-    fn onFailure(self: *Self) void {
+    /// Record a failed call. Public so external callers (e.g. `ModuleRuntime`)
+    /// can update breaker state without re-running `canAccept()`.
+    pub fn onFailure(self: *Self) void {
         self.failure_count += 1;
         self.last_failure_time = Time.monotonicNowSeconds();
 

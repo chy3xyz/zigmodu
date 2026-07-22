@@ -31,7 +31,7 @@ pub const ModuleRegistry = struct {
     }
 
     /// Build runtimes for every module that declares runtime options.
-    pub fn initFromModules(self: *Self, modules: *ApplicationModules) !void {
+    pub fn initFromModules(self: *Self, io: std.Io, modules: *ApplicationModules) !void {
         var iter = modules.modules.iterator();
         while (iter.next()) |entry| {
             const info = entry.value_ptr.*;
@@ -45,7 +45,7 @@ pub const ModuleRegistry = struct {
                 if (initialized) runtime.deinit();
                 self.allocator.destroy(runtime);
             }
-            runtime.* = try ModuleRuntime.init(self.allocator, info.name, options);
+            runtime.* = try ModuleRuntime.init(self.allocator, io, info.name, options);
             initialized = true;
             try self.runtimes.put(runtime.module_name, runtime);
         }
@@ -57,16 +57,16 @@ pub const ModuleRegistry = struct {
 
     /// Optional global validation hook.
     pub fn validateQuotas(self: *Self, global_max_open: u32) !void {
-        var total_db_max_open: u32 = 0;
+        var total_max_concurrent: u32 = 0;
         var iter = self.runtimes.iterator();
         while (iter.next()) |entry| {
             const rt = entry.value_ptr.*;
             if (rt.options.max_concurrent > 0) {
-                total_db_max_open = std.math.add(u32, total_db_max_open, rt.options.max_concurrent) catch return error.ConfigurationError;
+                total_max_concurrent = std.math.add(u32, total_max_concurrent, rt.options.max_concurrent) catch return error.ConfigurationError;
             }
         }
-        if (global_max_open > 0 and total_db_max_open > global_max_open) {
-            std.log.warn("ModuleRuntime quota exceeds global capacity: {d} > {d}", .{ total_db_max_open, global_max_open });
+        if (global_max_open > 0 and total_max_concurrent > global_max_open) {
+            std.log.warn("ModuleRuntime quota exceeds global capacity: {d} > {d}", .{ total_max_concurrent, global_max_open });
             return error.ConfigurationError;
         }
     }
@@ -102,7 +102,7 @@ test "ModuleRegistry creates runtimes for protected modules" {
     var registry = ModuleRegistry.init(allocator);
     defer registry.deinit();
 
-    try registry.initFromModules(&modules);
+    try registry.initFromModules(std.testing.io, &modules);
 
     try std.testing.expect(registry.get("protected") != null);
     try std.testing.expect(registry.get("unprotected") == null);
@@ -127,7 +127,7 @@ test "ModuleRegistry validateQuotas rejects overcommit" {
 
     var registry = ModuleRegistry.init(allocator);
     defer registry.deinit();
-    try registry.initFromModules(&modules);
+    try registry.initFromModules(std.testing.io, &modules);
 
     try std.testing.expectError(error.ConfigurationError, registry.validateQuotas(50));
     try registry.validateQuotas(100);
@@ -158,7 +158,7 @@ test "ModuleRegistry validateQuotas rejects u32 overflow" {
 
     var registry = ModuleRegistry.init(allocator);
     defer registry.deinit();
-    try registry.initFromModules(&modules);
+    try registry.initFromModules(std.testing.io, &modules);
 
     // Overflow itself must be reported as a configuration error even when no
     // global limit is enforced.
@@ -179,14 +179,25 @@ test "ModuleRegistry initFromModules cleans up on put failure" {
     var modules = try @import("ModuleScanner.zig").scanModules(allocator, .{Module});
     defer modules.deinit();
 
-    // Allocation layout for a module with only max_concurrent:
-    //   0. create(ModuleRuntime)
-    //   1. ModuleRuntime.init dupe(module_name)
-    //   2. Bulkhead.init dupe(name)
-    //   3. StringHashMap.put (first entry) -> fail here
-    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 3 });
+    // First, discover how many allocations a successful run performs. Then fail
+    // the final allocation (currently the StringHashMap.put). This is robust
+    // against changes in the number of allocations that precede the put.
+    var counter = std.testing.FailingAllocator.init(allocator, .{
+        .fail_index = std.math.maxInt(usize),
+    });
+    {
+        var registry = ModuleRegistry.init(counter.allocator());
+        defer registry.deinit();
+        try registry.initFromModules(std.testing.io, &modules);
+    }
+    const successful_alloc_count = counter.alloc_index;
+    try std.testing.expect(successful_alloc_count > 0);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{
+        .fail_index = successful_alloc_count - 1,
+    });
     var registry = ModuleRegistry.init(failing.allocator());
     defer registry.deinit();
 
-    try std.testing.expectError(error.OutOfMemory, registry.initFromModules(&modules));
+    try std.testing.expectError(error.OutOfMemory, registry.initFromModules(std.testing.io, &modules));
 }

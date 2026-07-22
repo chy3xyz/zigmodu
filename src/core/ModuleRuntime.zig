@@ -11,13 +11,19 @@ pub const ModuleRuntime = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
+    io: std.Io,
     module_name: []const u8,
     options: api.RuntimeOptions,
     bulkhead: ?Bulkhead,
     rate_limiter: ?RateLimiter,
     circuit_breaker: ?CircuitBreaker,
+    mu: std.Io.Mutex,
 
-    pub fn init(allocator: std.mem.Allocator, name: []const u8, options: api.RuntimeOptions) !Self {
+    /// Thread-safety contract: all state-changing operations (`tryEnter`,
+    /// `release`, `recordSuccess`, `recordFailure`) are protected by an internal
+    /// `std.Io.Mutex`. It is therefore safe to call them concurrently from
+    /// multiple fibers/threads that share the same `std.Io` instance.
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, name: []const u8, options: api.RuntimeOptions) !Self {
         const name_copy = try allocator.dupe(u8, name);
         errdefer allocator.free(name_copy);
 
@@ -45,11 +51,13 @@ pub const ModuleRuntime = struct {
 
         return .{
             .allocator = allocator,
+            .io = io,
             .module_name = name_copy,
             .options = options,
             .bulkhead = bulkhead,
             .rate_limiter = rate_limiter,
             .circuit_breaker = circuit_breaker,
+            .mu = std.Io.Mutex.init,
         };
     }
 
@@ -64,6 +72,9 @@ pub const ModuleRuntime = struct {
     /// Try to acquire permission to execute one request/command.
     /// Returns false if bulkhead, rate limit, or circuit breaker rejects.
     pub fn tryEnter(self: *Self) bool {
+        self.mu.lock(self.io) catch return false;
+        defer self.mu.unlock(self.io);
+
         if (self.bulkhead) |*bh| {
             if (!bh.tryAcquire()) return false;
         }
@@ -78,7 +89,7 @@ pub const ModuleRuntime = struct {
         if (self.circuit_breaker) |*cb| {
             if (!cb.canAccept()) {
                 if (self.bulkhead) |*bh| bh.release();
-                if (self.rate_limiter) |*rl| rl.reset();
+                if (self.rate_limiter) |*rl| rl.release();
                 return false;
             }
         }
@@ -88,24 +99,27 @@ pub const ModuleRuntime = struct {
 
     /// Release one bulkhead slot after execution.
     pub fn release(self: *Self) void {
+        self.mu.lock(self.io) catch return;
+        defer self.mu.unlock(self.io);
+
         if (self.bulkhead) |*bh| bh.release();
     }
 
     pub fn recordSuccess(self: *Self) void {
+        self.mu.lock(self.io) catch return;
+        defer self.mu.unlock(self.io);
+
         if (self.circuit_breaker) |*cb| {
-            _ = cb.call(struct {
-                fn op() !void {}
-            }.op);
+            cb.onSuccess();
         }
     }
 
     pub fn recordFailure(self: *Self) void {
+        self.mu.lock(self.io) catch return;
+        defer self.mu.unlock(self.io);
+
         if (self.circuit_breaker) |*cb| {
-            _ = cb.call(struct {
-                fn op() !void {
-                    return error.ModuleFailure;
-                }
-            }.op);
+            cb.onFailure();
         }
     }
 
@@ -117,6 +131,9 @@ pub const ModuleRuntime = struct {
     };
 
     pub fn getStats(self: *Self) Stats {
+        self.mu.lock(self.io) catch return .{};
+        defer self.mu.unlock(self.io);
+
         var stats: Stats = .{};
         if (self.bulkhead) |*bh| {
             stats.bulkhead_active = bh.getActiveCount();
@@ -134,7 +151,7 @@ pub const ModuleRuntime = struct {
 
 test "ModuleRuntime with all protections" {
     const allocator = std.testing.allocator;
-    var rt = try ModuleRuntime.init(allocator, "order", .{
+    var rt = try ModuleRuntime.init(allocator, std.testing.io, "order", .{
         .max_concurrent = 2,
         .max_qps = 5,
         .cb_failure_threshold = 1,
@@ -154,7 +171,7 @@ test "ModuleRuntime with all protections" {
 
 test "ModuleRuntime disabled when options are zero" {
     const allocator = std.testing.allocator;
-    var rt = try ModuleRuntime.init(allocator, "user", .{});
+    var rt = try ModuleRuntime.init(allocator, std.testing.io, "user", .{});
     defer rt.deinit();
 
     for (0..10) |_| {
@@ -164,7 +181,7 @@ test "ModuleRuntime disabled when options are zero" {
 
 test "ModuleRuntime rejects HALF_OPEN circuit breaker over limit" {
     const allocator = std.testing.allocator;
-    var rt = try ModuleRuntime.init(allocator, "payment", .{
+    var rt = try ModuleRuntime.init(allocator, std.testing.io, "payment", .{
         .max_concurrent = 1,
         .max_qps = 0,
         .cb_failure_threshold = 1,
@@ -185,4 +202,106 @@ test "ModuleRuntime rejects HALF_OPEN circuit breaker over limit" {
 
     // A new request must be rejected because the half-open budget is exhausted.
     try std.testing.expect(!rt.tryEnter());
+}
+
+test "ModuleRuntime refunds rate limiter token when circuit breaker rejects" {
+    const allocator = std.testing.allocator;
+    var rt = try ModuleRuntime.init(allocator, std.testing.io, "refund-test", .{
+        .max_concurrent = 1,
+        .max_qps = 2,
+        .cb_failure_threshold = 1,
+        .cb_success_threshold = 3,
+        .cb_timeout_seconds = 0,
+        .cb_half_open_max_calls = 1,
+    });
+    defer rt.deinit();
+
+    // Consume one rate-limit token while the circuit is still CLOSED.
+    try std.testing.expect(rt.tryEnter());
+    rt.release();
+    try std.testing.expectEqual(@as(u32, 1), rt.rate_limiter.?.availableTokens());
+
+    // Open the circuit and exhaust the single HALF_OPEN test call.
+    rt.recordFailure();
+    try std.testing.expectEqual(CircuitBreaker.State.HALF_OPEN, rt.circuit_breaker.?.getState());
+    rt.recordSuccess();
+    try std.testing.expect(!rt.circuit_breaker.?.canAccept());
+
+    // tryEnter acquires a rate token, the breaker rejects, and the token is refunded.
+    try std.testing.expect(!rt.tryEnter());
+    try std.testing.expectEqual(@as(u32, 1), rt.rate_limiter.?.availableTokens());
+}
+
+test "ModuleRuntime recordSuccess and recordFailure drive breaker state" {
+    const allocator = std.testing.allocator;
+    var rt = try ModuleRuntime.init(allocator, std.testing.io, "state-test", .{
+        .max_concurrent = 1,
+        .max_qps = 0,
+        .cb_failure_threshold = 2,
+        .cb_success_threshold = 2,
+        .cb_timeout_seconds = 10,
+        .cb_half_open_max_calls = 3,
+    });
+    defer rt.deinit();
+
+    try std.testing.expectEqual(CircuitBreaker.State.CLOSED, rt.circuit_breaker.?.getState());
+
+    rt.recordFailure();
+    try std.testing.expectEqual(CircuitBreaker.State.CLOSED, rt.circuit_breaker.?.getState());
+
+    rt.recordFailure();
+    try std.testing.expectEqual(CircuitBreaker.State.OPEN, rt.circuit_breaker.?.state);
+
+    // Simulate the timeout expiring so the next state check moves to HALF_OPEN.
+    rt.circuit_breaker.?.last_failure_time = 0;
+    try std.testing.expectEqual(CircuitBreaker.State.HALF_OPEN, rt.circuit_breaker.?.getState());
+
+    // Two consecutive successes close it again.
+    rt.recordSuccess();
+    rt.recordSuccess();
+    try std.testing.expectEqual(CircuitBreaker.State.CLOSED, rt.circuit_breaker.?.getState());
+}
+
+test "ModuleRuntime concurrent tryEnter and release do not corrupt state" {
+    const allocator = std.testing.allocator;
+    var rt = try ModuleRuntime.init(allocator, std.testing.io, "concurrent-test", .{
+        .max_concurrent = 2,
+        .max_qps = 100,
+        .cb_failure_threshold = 0,
+    });
+    defer rt.deinit();
+
+    const Context = struct {
+        rt: *ModuleRuntime,
+        local_successes: usize,
+
+        fn run(ctx: *@This()) void {
+            var i: usize = 0;
+            while (i < 100) : (i += 1) {
+                if (ctx.rt.tryEnter()) {
+                    ctx.local_successes += 1;
+                    ctx.rt.release();
+                }
+            }
+        }
+    };
+
+    var contexts: [10]Context = undefined;
+    var threads: [10]std.Thread = undefined;
+
+    for (&contexts, &threads) |*ctx, *t| {
+        ctx.* = .{ .rt = &rt, .local_successes = 0 };
+        t.* = try std.Thread.spawn(.{}, Context.run, .{ctx});
+    }
+
+    for (&threads) |*t| t.join();
+
+    var total_successes: usize = 0;
+    for (&contexts) |*ctx| total_successes += ctx.local_successes;
+
+    // No slot should be leaked, and the total accepted calls must not exceed
+    // the per-thread budget because each successful enter is paired with a release.
+    const stats = rt.getStats();
+    try std.testing.expectEqual(@as(u32, 0), stats.bulkhead_active);
+    try std.testing.expect(total_successes > 0);
 }
