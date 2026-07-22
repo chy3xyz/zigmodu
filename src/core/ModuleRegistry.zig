@@ -74,7 +74,8 @@ pub const ModuleRegistry = struct {
     fn hasAnyProtection(options: api.RuntimeOptions) bool {
         return options.max_concurrent > 0 or
             options.max_qps > 0 or
-            options.cb_failure_threshold > 0;
+            options.cb_failure_threshold > 0 or
+            options.worker_count > 0;
     }
 };
 
@@ -200,4 +201,25 @@ test "ModuleRegistry initFromModules cleans up on put failure" {
     defer registry.deinit();
 
     try std.testing.expectError(error.OutOfMemory, registry.initFromModules(std.testing.io, &modules));
+}
+
+test "ModuleRegistry creates runtime for worker_count-only module" {
+    const allocator = std.testing.allocator;
+
+    const WorkerModule = struct {
+        pub const info = api.Module{
+            .name = "worker-only",
+            .description = "Worker only",
+            .runtime = .{ .worker_count = 3 },
+        };
+    };
+
+    var modules = try @import("ModuleScanner.zig").scanModules(allocator, .{WorkerModule});
+    defer modules.deinit();
+
+    var registry = ModuleRegistry.init(allocator);
+    defer registry.deinit();
+    try registry.initFromModules(std.testing.io, &modules);
+
+    try std.testing.expect(registry.get("worker-only") != null);
 }
