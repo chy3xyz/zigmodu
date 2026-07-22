@@ -10,6 +10,7 @@ const validateModules = @import("core/ModuleValidator.zig").validateModules;
 const Lifecycle = @import("core/Lifecycle.zig");
 const Documentation = @import("core/Documentation.zig");
 const ModuleRegistry = @import("core/ModuleRegistry.zig").ModuleRegistry;
+const ModuleRuntime = @import("core/ModuleRuntime.zig").ModuleRuntime;
 
 /// Atomic flag for graceful shutdown coordination (set by signal handler).
 var shutdown_requested = std.atomic.Value(bool).init(false);
@@ -77,6 +78,7 @@ pub const Application = struct {
         options: Config,
     ) !Self {
         var modules = try scanModules(allocator, modules_tuple);
+        errdefer modules.deinit();
 
         var registry = ModuleRegistry.init(allocator);
         errdefer registry.deinit();
@@ -178,7 +180,7 @@ pub const Application = struct {
     }
 
     /// Get module runtime by name
-    pub fn getModuleRuntime(self: *Self, name: []const u8) ?*@import("core/ModuleRuntime.zig").ModuleRuntime {
+    pub fn getModuleRuntime(self: *Self, name: []const u8) ?*ModuleRuntime {
         if (self.registry) |*r| return r.get(name);
         return null;
     }
@@ -592,6 +594,7 @@ test "Application builds ModuleRegistry from module runtime options" {
     const rt = app.getModuleRuntime("resilient");
     try std.testing.expect(rt != null);
     try std.testing.expect(rt.?.tryEnter());
+    rt.?.release();
 }
 
 test "e2e: in-flight counter tracks request lifecycle" {
