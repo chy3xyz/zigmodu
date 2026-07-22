@@ -106,6 +106,7 @@ pub extern "c" fn mysql_close(sock: ?*MYSQL) void;
 pub extern "c" fn mysql_query(mysql: ?*MYSQL, q: [*c]const u8) c_int;
 pub extern "c" fn mysql_real_query(mysql: ?*MYSQL, q: [*c]const u8, length: c_ulong) c_int;
 pub extern "c" fn mysql_store_result(mysql: ?*MYSQL) ?*MYSQL_RES;
+pub extern "c" fn mysql_use_result(mysql: ?*MYSQL) ?*MYSQL_RES;
 pub extern "c" fn mysql_free_result(res: ?*MYSQL_RES) void;
 pub extern "c" fn mysql_fetch_row(res: ?*MYSQL_RES) MYSQL_ROW;
 pub extern "c" fn mysql_fetch_lengths(res: ?*MYSQL_RES) [*c]c_ulong;

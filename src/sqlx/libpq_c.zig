@@ -15,6 +15,8 @@ pub const ExecStatusType = enum(c_int) {
     PGRES_BAD_RESPONSE = 3,
     PGRES_NONFATAL_ERROR = 4,
     PGRES_FATAL_ERROR = 5,
+    PGRES_COPY_BOTH = 6,
+    PGRES_SINGLE_TUPLE = 9,
 };
 
 pub const Oid = c_uint;
@@ -58,6 +60,20 @@ pub extern "c" fn PQexecPrepared(
     paramFormats: ?[*]const c_int,
     resultFormat: c_int,
 ) ?*PGresult;
+pub extern "c" fn PQsendQueryParams(
+    conn: ?*PGconn,
+    command: [*c]const u8,
+    nParams: c_int,
+    paramTypes: ?[*]const Oid,
+    paramValues: ?[*]const ?[*]const u8,
+    paramLengths: ?[*]const c_int,
+    paramFormats: ?[*]const c_int,
+    resultFormat: c_int,
+) c_int;
+pub extern "c" fn PQsetSingleRowMode(conn: ?*PGconn) c_int;
+pub extern "c" fn PQgetResult(conn: ?*PGconn) ?*PGresult;
+pub extern "c" fn PQconsumeInput(conn: ?*PGconn) c_int;
+pub extern "c" fn PQisBusy(conn: ?*PGconn) c_int;
 pub extern "c" fn PQsetdbLogin(
     pghost: [*c]const u8,
     pgport: [*c]const u8,

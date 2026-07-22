@@ -151,31 +151,162 @@ pub const Rows = struct {
     }
 };
 
-/// Streaming cursor over a Rows result set.
-/// Currently backed by Rows (all rows are materialized); the API is stable for
-/// future driver-native streaming implementations.
+/// Cursor fetch mode.
+pub const CursorMode = enum {
+    /// Materialize all rows upfront. Rows remain valid until `cursor.deinit()`.
+    buffered,
+    /// Fetch rows lazily from the driver. The row returned by `next()` is only
+    /// valid until the next call to `next()` or `deinit()`.
+    streaming,
+};
+
+/// Options for `Client.queryCursorEx`.
+pub const CursorOptions = struct {
+    mode: CursorMode = .buffered,
+};
+
+/// Streaming cursor over a query result set.
 pub const Cursor = struct {
-    rows: Rows,
+    state: State,
     pos: usize = 0,
 
+    const State = union(enum) {
+        buffered: Rows,
+        streaming_mysql: MySqlCursor,
+        streaming_pg: PgCursor,
+    };
+
     pub fn init(rows: Rows) Cursor {
-        return .{ .rows = rows };
+        return .{ .state = .{ .buffered = rows } };
     }
 
     pub fn deinit(self: *Cursor) void {
-        self.rows.deinit();
+        switch (self.state) {
+            .buffered => |*rows| rows.deinit(),
+            .streaming_mysql => |*c| c.deinit(),
+            .streaming_pg => |*c| c.deinit(),
+        }
         self.* = undefined;
     }
 
     pub fn next(self: *Cursor) ?*Row {
-        if (self.pos >= self.rows.rows.len) return null;
-        const row = &self.rows.rows[self.pos];
-        self.pos += 1;
-        return row;
+        switch (self.state) {
+            .buffered => |*rows| {
+                if (self.pos >= rows.rows.len) return null;
+                const row = &rows.rows[self.pos];
+                self.pos += 1;
+                return row;
+            },
+            .streaming_mysql => |*c| return c.next(),
+            .streaming_pg => |*c| return c.next(),
+        }
     }
 
     pub fn reset(self: *Cursor) void {
-        self.pos = 0;
+        switch (self.state) {
+            .buffered => self.pos = 0,
+            .streaming_mysql, .streaming_pg => {}, // forward-only
+        }
+    }
+};
+
+/// Driver-native streaming cursor for MySQL/MariaDB. Uses `mysql_use_result` so
+/// rows are pulled over the wire on demand. The active `Row` is invalidated by
+/// the next `next()` call.
+const MySqlCursor = struct {
+    mysql: ?*libmysql_c.MYSQL,
+    res: ?*libmysql_c.MYSQL_RES,
+    arena: std.heap.ArenaAllocator,
+    columns: []const []const u8,
+    row: Row,
+    eof: bool,
+
+    fn deinit(self: *MySqlCursor) void {
+        if (self.res) |r| libmysql_c.mysql_free_result(r);
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    fn next(self: *MySqlCursor) ?*Row {
+        if (self.eof or self.res == null) return null;
+        _ = self.arena.reset(.free_all);
+        const row_data = libmysql_c.mysql_fetch_row(self.res);
+        if (row_data == null) {
+            self.eof = true;
+            return null;
+        }
+        const row_ptr = row_data.?;
+        const lengths = libmysql_c.mysql_fetch_lengths(self.res);
+        const n_cols = self.columns.len;
+        const values = self.arena.allocator().alloc(?Value, n_cols) catch return null;
+        for (0..n_cols) |c| {
+            if (row_ptr[c] == null) {
+                values[c] = null;
+            } else {
+                const len = lengths[c];
+                const val = row_ptr[c].?[0..len];
+                values[c] = .{ .string = self.arena.allocator().dupe(u8, val) catch return null };
+            }
+        }
+        self.row = .{
+            .arena = &self.arena,
+            .columns = self.columns,
+            .values = values,
+        };
+        return &self.row;
+    }
+};
+
+/// Driver-native streaming cursor for PostgreSQL. Uses `PQsendQueryParams` +
+/// `PQsetSingleRowMode` so the server emits one row per result. The active `Row`
+/// is invalidated by the next `next()` call.
+const PgCursor = struct {
+    conn: ?*libpq_c.PGconn,
+    arena: std.heap.ArenaAllocator,
+    columns: []const []const u8,
+    row: Row,
+    current: ?*libpq_c.PGresult,
+    eof: bool,
+
+    fn deinit(self: *PgCursor) void {
+        if (self.current) |r| libpq_c.PQclear(r);
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    fn next(self: *PgCursor) ?*Row {
+        if (self.eof) return null;
+        _ = self.arena.reset(.free_all);
+        const res = self.current orelse {
+            self.eof = true;
+            return null;
+        };
+        const status = libpq_c.PQresultStatus(res);
+        if (status == libpq_c.ExecStatusType.PGRES_COMMAND_OK) {
+            libpq_c.PQclear(res);
+            self.current = null;
+            self.eof = true;
+            return null;
+        }
+        if (status != libpq_c.ExecStatusType.PGRES_TUPLES_OK and status != libpq_c.ExecStatusType.PGRES_SINGLE_TUPLE) {
+            libpq_c.PQclear(res);
+            self.current = null;
+            self.eof = true;
+            return null;
+        }
+        const n_cols = libpq_c.PQnfields(res);
+        const values = self.arena.allocator().alloc(?Value, @intCast(n_cols)) catch return null;
+        for (0..@intCast(n_cols)) |c| {
+            values[c] = pgReadCell(self.arena.allocator(), res, 0, @intCast(c)) catch return null;
+        }
+        self.row = .{
+            .arena = &self.arena,
+            .columns = self.columns,
+            .values = values,
+        };
+        libpq_c.PQclear(res);
+        self.current = libpq_c.PQgetResult(self.conn);
+        return &self.row;
     }
 };
 
@@ -340,6 +471,9 @@ pub const Conn = struct {
         commit: *const fn (ptr: *anyopaque) errors.Result,
         rollback: *const fn (ptr: *anyopaque) errors.Result,
         prepare: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, sql_str: []const u8) errors.ResultT(Stmt),
+        /// Optional driver-native streaming cursor. Null drivers fall back to
+        /// buffering all rows in `queryCursor`.
+        queryCursor: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value, opts: CursorOptions) errors.ResultT(Cursor) = null,
     };
 
     pub fn query(self: Conn, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value) errors.ResultT(Rows) {
@@ -374,6 +508,14 @@ pub const Conn = struct {
 
     pub fn prepare(self: Conn, allocator: std.mem.Allocator, sql_str: []const u8) errors.ResultT(Stmt) {
         return self.vtable.prepare(self.ptr, allocator, sql_str);
+    }
+
+    pub fn queryCursor(self: Conn, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value, opts: CursorOptions) errors.ResultT(Cursor) {
+        if (self.vtable.queryCursor) |qf| {
+            return qf(self.ptr, allocator, sql_str, args, opts);
+        }
+        const rows = try self.query(allocator, sql_str, args);
+        return Cursor.init(rows);
     }
 };
 
@@ -915,6 +1057,14 @@ pub const SQLiteConn = struct {
         return stmt.toStmt();
     }
 
+    fn queryCursorFn(ptr: *anyopaque, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value, opts: CursorOptions) errors.ResultT(Cursor) {
+        _ = opts;
+        const self = @as(*SQLiteConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
+        const rows = try queryFn(ptr, allocator, sql_str, args);
+        return Cursor.init(rows);
+    }
+
     pub fn toConn(self: *SQLiteConn) Conn {
         return .{
             .ptr = self,
@@ -927,6 +1077,7 @@ pub const SQLiteConn = struct {
                 .commit = commitFn,
                 .rollback = rollbackFn,
                 .prepare = prepareFn,
+                .queryCursor = queryCursorFn,
             },
         };
     }
@@ -1859,6 +2010,109 @@ pub const PostgresConn = struct {
         return stmt.toStmt();
     }
 
+    fn queryCursorFn(ptr: *anyopaque, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value, opts: CursorOptions) errors.ResultT(Cursor) {
+        const self = @as(*PostgresConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
+        if (opts.mode == .buffered) {
+            const rows = try queryFn(ptr, allocator, sql_str, args);
+            return Cursor.init(rows);
+        }
+
+        // Convert ? → $1,$2,... and null-terminate for libpq.
+        const pg_sql = if (args.len == 0) sql_str else convertPlaceholders(self.allocator, sql_str) orelse return error.DatabaseError;
+        defer if (args.len != 0) self.allocator.free(pg_sql);
+        const sql_z = allocZ(allocator, pg_sql) catch return error.DatabaseError;
+        defer allocator.free(sql_z);
+
+        // Build text parameter arrays. Owned by `allocator` and freed before return.
+        const paramValues = allocator.alloc(?[*]const u8, args.len) catch return error.DatabaseError;
+        defer allocator.free(paramValues);
+        const paramLengths = allocator.alloc(c_int, args.len) catch return error.DatabaseError;
+        defer allocator.free(paramLengths);
+        const paramAllocs = allocator.alloc(?[]u8, args.len) catch return error.DatabaseError;
+        defer {
+            for (paramAllocs) |maybe| {
+                if (maybe) |a| allocator.free(a);
+            }
+            allocator.free(paramAllocs);
+        }
+        @memset(paramAllocs, null);
+
+        for (args, 0..) |arg, i| {
+            paramValues[i] = switch (arg) {
+                .null => blk: {
+                    paramLengths[i] = 0;
+                    break :blk null;
+                },
+                .int => |v| blk: {
+                    const s = std.fmt.allocPrint(allocator, "{d}", .{v}) catch return error.DatabaseError;
+                    paramAllocs[i] = s;
+                    paramLengths[i] = @intCast(s.len);
+                    break :blk @ptrCast(s.ptr);
+                },
+                .float => |v| blk: {
+                    const s = std.fmt.allocPrint(allocator, "{d}", .{v}) catch return error.DatabaseError;
+                    paramAllocs[i] = s;
+                    paramLengths[i] = @intCast(s.len);
+                    break :blk @ptrCast(s.ptr);
+                },
+                .string => |v| blk: {
+                    const s = allocator.dupe(u8, v) catch return error.DatabaseError;
+                    paramAllocs[i] = s;
+                    paramLengths[i] = @intCast(s.len);
+                    break :blk @ptrCast(s.ptr);
+                },
+                .bool => |v| blk: {
+                    paramLengths[i] = 1;
+                    break :blk if (v) @ptrCast("t") else @ptrCast("f");
+                },
+            };
+        }
+
+        if (libpq_c.PQsendQueryParams(self.conn, @ptrCast(sql_z.ptr), @intCast(args.len), null, @ptrCast(paramValues.ptr), @ptrCast(paramLengths.ptr), null, 0) == 0) {
+            return error.DatabaseError;
+        }
+        _ = libpq_c.PQsetSingleRowMode(self.conn);
+        _ = libpq_c.PQconsumeInput(self.conn);
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        var first = libpq_c.PQgetResult(self.conn);
+        var columns: [][]u8 = &[_][]u8{};
+        var eof = false;
+        if (first) |r| {
+            const status = libpq_c.PQresultStatus(r);
+            if (status == libpq_c.ExecStatusType.PGRES_COMMAND_OK) {
+                libpq_c.PQclear(r);
+                first = null;
+                eof = true;
+            } else if (status == libpq_c.ExecStatusType.PGRES_TUPLES_OK or status == libpq_c.ExecStatusType.PGRES_SINGLE_TUPLE) {
+                const n_cols = libpq_c.PQnfields(r);
+                if (n_cols > 0) {
+                    columns = arena.allocator().alloc([]u8, @intCast(n_cols)) catch return error.DatabaseError;
+                    for (0..@intCast(n_cols)) |c| {
+                        const name = std.mem.span(libpq_c.PQfname(r, @intCast(c)));
+                        columns[c] = arena.allocator().dupe(u8, name) catch return error.DatabaseError;
+                    }
+                }
+            } else {
+                libpq_c.PQclear(r);
+                return error.DatabaseError;
+            }
+        } else {
+            eof = true;
+        }
+
+        return Cursor{ .state = .{ .streaming_pg = .{
+            .conn = self.conn,
+            .arena = arena,
+            .columns = columns,
+            .row = undefined,
+            .current = first,
+            .eof = eof,
+        } } };
+    }
+
     pub fn toConn(self: *PostgresConn) Conn {
         return .{
             .ptr = self,
@@ -1871,6 +2125,7 @@ pub const PostgresConn = struct {
                 .commit = commitFn,
                 .rollback = rollbackFn,
                 .prepare = prepareFn,
+                .queryCursor = queryCursorFn,
             },
         };
     }
@@ -2533,6 +2788,52 @@ pub const MySqlConn = struct {
         return stmt.toStmt();
     }
 
+    fn queryCursorFn(ptr: *anyopaque, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value, opts: CursorOptions) errors.ResultT(Cursor) {
+        const self = @as(*MySqlConn, @ptrCast(@alignCast(ptr)));
+        self.guard();
+        if (opts.mode == .buffered) {
+            const rows = try queryFn(ptr, allocator, sql_str, args);
+            return Cursor.init(rows);
+        }
+
+        const query = if (args.len == 0) sql_str else formatQuery(self.allocator, sql_str, args) catch return error.DatabaseError;
+        defer if (args.len != 0) self.allocator.free(query);
+        if (libmysql_c.mysql_real_query(self.mysql, @ptrCast(query.ptr), @intCast(query.len)) != 0) {
+            const err_no = libmysql_c.mysql_errno(self.mysql);
+            const err_msg = std.mem.span(libmysql_c.mysql_error(self.mysql));
+            std.log.err("MySQL streaming query error: errno={d} msg={s}", .{ err_no, err_msg });
+            return mysqlErrnoToError(err_no);
+        }
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const res = libmysql_c.mysql_use_result(self.mysql);
+        var columns: [][]u8 = &[_][]u8{};
+        var eof = false;
+        if (res) |r| {
+            const n_cols = libmysql_c.mysql_num_fields(r);
+            if (n_cols > 0) {
+                columns = arena.allocator().alloc([]u8, n_cols) catch return error.DatabaseError;
+                for (0..n_cols) |c| {
+                    const field = libmysql_c.mysql_fetch_field(r) orelse return error.DatabaseError;
+                    columns[c] = arena.allocator().dupe(u8, std.mem.span(field.name)) catch return error.DatabaseError;
+                }
+            }
+        } else {
+            if (libmysql_c.mysql_errno(self.mysql) != 0) return error.DatabaseError;
+            eof = true; // DML or empty result set
+        }
+
+        return Cursor{ .state = .{ .streaming_mysql = .{
+            .mysql = self.mysql,
+            .res = res,
+            .arena = arena,
+            .columns = columns,
+            .row = undefined,
+            .eof = eof,
+        } } };
+    }
+
     pub fn toConn(self: *MySqlConn) Conn {
         return .{
             .ptr = self,
@@ -2545,6 +2846,7 @@ pub const MySqlConn = struct {
                 .commit = commitFn,
                 .rollback = rollbackFn,
                 .prepare = prepareFn,
+                .queryCursor = queryCursorFn,
             },
         };
     }
@@ -3541,15 +3843,37 @@ pub const Client = struct {
         return self.query(sql_str, args);
     }
 
-    /// Query and return a Cursor for row-by-row iteration. Caller must `defer cursor.deinit()`.
+    /// Query and return a buffered Cursor for row-by-row iteration. Caller must `defer cursor.deinit()`.
     pub fn queryCursor(self: *Client, sql_str: []const u8, args: []const Value) !Cursor {
-        const rows = try self.query(sql_str, args);
-        return Cursor.init(rows);
+        return self.queryCursorEx(sql_str, args, .{});
     }
 
     pub fn queryCursorCtx(self: *Client, ctx: SqlContext, sql_str: []const u8, args: []const Value) !Cursor {
         if (ctx.isDone()) return error.Timeout;
         return self.queryCursor(sql_str, args);
+    }
+
+    /// Query and return a Cursor with explicit fetch mode. `.buffered` (default)
+    /// materializes all rows; `.streaming` fetches rows lazily and the row returned
+    /// by `next()` is only valid until the next `next()`/`deinit()`.
+    pub fn queryCursorEx(self: *Client, sql_str: []const u8, args: []const Value, opts: CursorOptions) !Cursor {
+        self.ensureBreaker();
+        if (!self.cb.?.allow()) return error.CircuitBreakerOpen;
+
+        self.ensurePool();
+        if (self.pool) |*p| {
+            const conn = try p.acquire();
+            defer p.release(conn);
+            return try conn.queryCursor(self.allocator, sql_str, args, opts);
+        }
+        if (self.conn == null) try self.connect();
+        return self.conn.?.queryCursor(self.allocator, sql_str, args, opts) catch |err| {
+            std.log.err("queryCursorEx failed, reconnecting: {s}", .{@errorName(err)});
+            self.conn.?.close();
+            self.conn = null;
+            try self.connect();
+            return self.conn.?.queryCursor(self.allocator, sql_str, args, opts);
+        };
     }
 
     fn doExec(self: *Client, sql_str: []const u8, args: []const Value) !ExecResult {
@@ -5561,4 +5885,59 @@ test "conn pool release hands off to waiters in FIFO order" {
     // pool's active count and the test allocator stay consistent.
     waiters[0].conn.close();
     waiters[1].conn.close();
+}
+
+test "sqlite buffered cursor iterates rows" {
+    const allocator = std.testing.allocator;
+    var db = try Client.open(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer db.deinit();
+    _ = try db.exec("CREATE TABLE cur (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+    _ = try db.exec("INSERT INTO cur (name) VALUES (?), (?), (?)", &.{ Value{ .string = "a" }, Value{ .string = "b" }, Value{ .string = "c" } });
+
+    var cursor = try db.queryCursor("SELECT id, name FROM cur ORDER BY id", &.{});
+    defer cursor.deinit();
+
+    var count: usize = 0;
+    while (cursor.next()) |row| {
+        count += 1;
+        const id = row.get("id").?.int;
+        const name = row.get("name").?.string;
+        try std.testing.expectEqual(@as(i64, @intCast(count)), id);
+        try std.testing.expect(name.len == 1);
+    }
+    try std.testing.expectEqual(@as(usize, 3), count);
+}
+
+test "sqlite streaming cursor falls back to buffered" {
+    const allocator = std.testing.allocator;
+    var db = try Client.open(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer db.deinit();
+    _ = try db.exec("CREATE TABLE cur2 (id INTEGER PRIMARY KEY)", &.{});
+    _ = try db.exec("INSERT INTO cur2 VALUES (1), (2)", &.{});
+    var cursor = try db.queryCursorEx("SELECT id FROM cur2 ORDER BY id", &.{}, .{ .mode = .streaming });
+    defer cursor.deinit();
+    try std.testing.expect(cursor.next().?.get("id").?.int == 1);
+    try std.testing.expect(cursor.next().?.get("id").?.int == 2);
+    try std.testing.expect(cursor.next() == null);
+}
+
+test "mysql streaming cursor api compiles" {
+    // Requires a live MySQL server; kept as a compile-time/API smoke test.
+    if (true) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var db = try Client.open(allocator, std.testing.io, .{ .driver = .mysql, .host = "127.0.0.1", .user = "root", .password = "", .database = "test" });
+    defer db.deinit();
+    var cursor = try db.queryCursorEx("SELECT 1 AS n", &.{});
+    defer cursor.deinit();
+    _ = cursor.next();
+}
+
+test "postgres streaming cursor api compiles" {
+    if (true) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var db = try Client.open(allocator, std.testing.io, .{ .driver = .postgres, .host = "127.0.0.1", .user = "postgres", .password = "", .database = "test" });
+    defer db.deinit();
+    var cursor = try db.queryCursorEx("SELECT 1 AS n", &.{});
+    defer cursor.deinit();
+    _ = cursor.next();
 }
