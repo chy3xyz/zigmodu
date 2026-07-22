@@ -54,7 +54,7 @@ pub const ModuleRuntime = struct {
 
         var worker_pool: ?WorkerPool = null;
         if (options.worker_count > 0) {
-            worker_pool = try WorkerPool.init(allocator, io, name_copy, options.worker_count, options.worker_count * 8);
+            worker_pool = try WorkerPool.init(allocator, io, name, options.worker_count, options.worker_count * 8);
         }
 
         return .{

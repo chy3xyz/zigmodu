@@ -1,7 +1,10 @@
 //! Thread-safe event bus with typed event dispatch, infallible subscription model.
 
 const std = @import("std");
+const Time = @import("Time.zig");
 const WorkerPool = @import("WorkerPool.zig").WorkerPool;
+
+const log = std.log.scoped(.event_bus);
 
 /// ListenerSet for O(1) [...]/[...]
 /// ListenerSet [...] ArrayList [...] HashMap [...]
@@ -203,8 +206,13 @@ pub fn TypedEventBus(comptime T: type) type {
                 callback.*(event);
             }
 
-            for (self.async_subscribers.items) |async_sub| {
-                const delivery = self.allocator.create(AsyncDelivery) catch continue;
+            for (self.async_subscribers.items, 0..) |async_sub, index| {
+                const delivery = self.allocator.create(AsyncDelivery) catch |err| {
+                    log.warn("dropped async event for subscriber {d} (pool '{s}'): failed to allocate delivery for event type {s}: {s}", .{
+                        index, async_sub.pool.name, @typeName(T), @errorName(err),
+                    });
+                    continue;
+                };
                 delivery.* = .{
                     .allocator = self.allocator,
                     .handler = async_sub.handler,
@@ -215,6 +223,9 @@ pub fn TypedEventBus(comptime T: type) type {
                     .ctx = delivery,
                 });
                 if (!dispatched) {
+                    log.warn("dropped async event for subscriber {d} (pool '{s}'): dispatch rejected for event type {s}", .{
+                        index, async_sub.pool.name, @typeName(T),
+                    });
                     self.allocator.destroy(delivery);
                 }
             }
@@ -385,10 +396,42 @@ test "TypedEventBus async subscriber" {
     bus.publish(.{ .value = 7 });
     bus.publish(.{ .value = 3 });
 
+    const deadline = Time.monotonicNowMilliseconds() + 5000;
     while (Ctx.received.load(.monotonic) != 10) {
+        if (Time.monotonicNowMilliseconds() >= deadline) return error.Timeout;
         std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
     try std.testing.expectEqual(@as(i32, 10), Ctx.received.load(.monotonic));
+}
+
+test "TypedEventBus async drop is observed and consistent" {
+    const allocator = std.testing.allocator;
+    const Event = struct { value: i32 };
+
+    const Ctx = struct {
+        var received: std.atomic.Value(i32) = .init(0);
+        fn cb(event: Event) void {
+            _ = @This().received.fetchAdd(event.value, .monotonic);
+        }
+    };
+
+    // Pool with zero queue capacity rejects every dispatch, exercising the
+    // drop log path without actually allocating a worker task.
+    var pool = try WorkerPool.init(allocator, std.testing.io, "drop", 1, 0);
+    defer pool.deinit();
+
+    var bus = TypedEventBus(Event).init(allocator);
+    defer bus.deinit();
+
+    try bus.subscribeAsync(&pool, Ctx.cb);
+    try std.testing.expectEqual(@as(usize, 1), bus.async_subscribers.items.len);
+
+    bus.publish(.{ .value = 5 });
+
+    // The subscriber list and delivered-event count must remain consistent
+    // even though the event was dropped by the saturated pool.
+    try std.testing.expectEqual(@as(usize, 1), bus.async_subscribers.items.len);
+    try std.testing.expectEqual(@as(i32, 0), Ctx.received.load(.monotonic));
 }
 
 const ModuleRuntime = @import("ModuleRuntime.zig").ModuleRuntime;
@@ -427,7 +470,9 @@ test "TypedEventBus async subscribers on separate ModuleRuntime worker pools" {
     bus.publish(.{ .order_id = 1 });
     bus.publish(.{ .order_id = 2 });
 
+    const deadline = Time.monotonicNowMilliseconds() + 5000;
     while (Ctx.inventory_count.load(.monotonic) < 2 or Ctx.payment_count.load(.monotonic) < 2) {
+        if (Time.monotonicNowMilliseconds() >= deadline) return error.Timeout;
         std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
 

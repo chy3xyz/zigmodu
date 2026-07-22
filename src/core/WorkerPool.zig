@@ -2,6 +2,9 @@
 //! Tasks are submitted to a queue and executed by a fixed number of workers.
 
 const std = @import("std");
+const Time = @import("Time.zig");
+
+pub const max_worker_count = 128;
 
 pub const Task = struct {
     run: *const fn (ctx: ?*anyopaque, io: std.Io) void,
@@ -35,6 +38,10 @@ pub const WorkerPool = struct {
         worker_count: u32,
         max_pending: usize,
     ) !Self {
+        if (worker_count == 0 or worker_count > max_worker_count) {
+            return error.ConfigurationError;
+        }
+
         const name_copy = try allocator.dupe(u8, name);
         errdefer allocator.free(name_copy);
 
@@ -168,7 +175,9 @@ test "WorkerPool executes dispatched tasks" {
         try std.testing.expect(pool.dispatch(.{ .run = Ctx.run, .ctx = null }));
     }
 
+    const deadline = Time.monotonicNowMilliseconds() + 5000;
     while (Ctx.counter.load(.monotonic) < 10) {
+        if (Time.monotonicNowMilliseconds() >= deadline) return error.Timeout;
         std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
     try std.testing.expectEqual(@as(u32, 10), Ctx.counter.load(.monotonic));
@@ -178,19 +187,29 @@ test "WorkerPool rejects when queue is full" {
     const allocator = std.testing.allocator;
 
     const Ctx = struct {
+        flag: std.atomic.Value(bool) = .init(false),
+
         fn run(ctx: ?*anyopaque, io: std.Io) void {
-            _ = ctx;
-            _ = io;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            while (!self.flag.load(.acquire)) {
+                std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+            }
         }
     };
 
-    // Use worker_count=0 so no worker can dequeue the first task between the
-    // two dispatch calls. This makes the queue-full check deterministic.
-    var pool = try WorkerPool.init(allocator, std.testing.io, "full", 0, 1);
-    defer pool.deinit();
+    // Keep the single worker busy until the test ends. With max_pending=1 the
+    // queue+worker capacity is at most two tasks, so the third dispatch is
+    // deterministically rejected.
+    var ctx: Ctx = .{};
+    var pool = try WorkerPool.init(allocator, std.testing.io, "full", 1, 1);
+    defer {
+        ctx.flag.store(true, .release);
+        pool.deinit();
+    }
 
-    try std.testing.expect(pool.dispatch(.{ .run = Ctx.run, .ctx = null }));
-    try std.testing.expect(!pool.dispatch(.{ .run = Ctx.run, .ctx = null }));
+    try std.testing.expect(pool.dispatch(.{ .run = Ctx.run, .ctx = &ctx }));
+    _ = pool.dispatch(.{ .run = Ctx.run, .ctx = &ctx }); // may accept or reject
+    try std.testing.expect(!pool.dispatch(.{ .run = Ctx.run, .ctx = &ctx }));
 }
 
 test "WorkerPool shutdown rejects new dispatches and drains queue" {
@@ -212,8 +231,22 @@ test "WorkerPool shutdown rejects new dispatches and drains queue" {
     pool.shutdown();
     try std.testing.expect(!pool.dispatch(.{ .run = Ctx.run, .ctx = null }));
 
+    const deadline = Time.monotonicNowMilliseconds() + 5000;
     while (Ctx.counter.load(.monotonic) < 1) {
+        if (Time.monotonicNowMilliseconds() >= deadline) return error.Timeout;
         std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
     try std.testing.expectEqual(@as(u32, 1), Ctx.counter.load(.monotonic));
+}
+
+test "WorkerPool rejects worker_count == 0" {
+    const allocator = std.testing.allocator;
+    const pool = WorkerPool.init(allocator, std.testing.io, "zero", 0, 1);
+    try std.testing.expectError(error.ConfigurationError, pool);
+}
+
+test "WorkerPool rejects worker_count above max_worker_count" {
+    const allocator = std.testing.allocator;
+    const pool = WorkerPool.init(allocator, std.testing.io, "huge", max_worker_count + 1, 1);
+    try std.testing.expectError(error.ConfigurationError, pool);
 }
