@@ -50,6 +50,7 @@ pub const RateLimiter = struct {
 
     /// Try to acquire multiple tokens
     pub fn tryAcquireMany(self: *Self, count: u32) bool {
+        if (count == 0) return true;
         self.refill();
 
         const needed = @as(f64, @floatFromInt(count));
@@ -60,6 +61,7 @@ pub const RateLimiter = struct {
 
         return false;
     }
+
 
     /// [...]tokens (uses cached timestamp — refill rate is per-second, ~1s staleness OK)
     fn refill(self: *Self) void {

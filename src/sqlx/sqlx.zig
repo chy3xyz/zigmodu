@@ -944,7 +944,7 @@ pub const SQLiteConn = struct {
         for (pragmas) |sql| {
             const rc = sqlite3_c.sqlite3_exec(db, sql.ptr, null, null, null);
             if (rc != sqlite3_c.SQLITE_OK) {
-                const msg = std.mem.span(sqlite3_c.sqlite3_errmsg(db));
+                const msg = cStrSpan(sqlite3_c.sqlite3_errmsg(db));
                 std.log.warn("SQLite PRAGMA failed: sql={s} msg={s}", .{ sql, msg });
                 return error.DatabaseError;
             }
@@ -1030,7 +1030,7 @@ pub const SQLiteConn = struct {
         }
         // Check if step ended with an error (not DONE)
         if (step_rc != sqlite3_c.SQLITE_DONE) {
-            const err_msg = std.mem.span(sqlite3_c.sqlite3_errmsg(self.db));
+            const err_msg = cStrSpan(sqlite3_c.sqlite3_errmsg(self.db));
             const ext_code = sqlite3_c.sqlite3_extended_errcode(self.db);
             std.log.err("SQLite query error: code={d} msg={s}", .{ ext_code, err_msg });
             return error.DatabaseError;
@@ -2756,7 +2756,7 @@ pub const MySqlConn = struct {
         const conn = libmysql_c.mysql_real_connect(mysql, @ptrCast(host.ptr), @ptrCast(user.ptr), password_cstr, @ptrCast(db.ptr), @intCast(port), socket_path, 0);
         if (conn == null) {
             const err_no = libmysql_c.mysql_errno(mysql);
-            const err_msg = std.mem.span(libmysql_c.mysql_error(mysql));
+            const err_msg = cStrSpan(libmysql_c.mysql_error(mysql));
             std.log.err("MySQL connect error: errno={d} msg={s}", .{ err_no, err_msg });
             libmysql_c.mysql_close(mysql);
             return error.DatabaseError;
