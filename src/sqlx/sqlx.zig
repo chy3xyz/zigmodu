@@ -106,14 +106,22 @@ pub const Row = struct {
     arena: *std.heap.ArenaAllocator,
     columns: []const []const u8,
     values: []const ?Value,
+    /// Single-entry lazy column-name → index cache for hot repeated lookups.
+    cached_col: ?[]const u8 = null,
+    cached_idx: usize = 0,
 
     pub fn rowAllocator(self: Row) std.mem.Allocator {
         return self.arena.allocator();
     }
 
-    pub fn get(self: Row, column: []const u8) ?Value {
+    pub fn get(self: *Row, column: []const u8) ?Value {
+        if (self.cached_col) |c| {
+            if (std.mem.eql(u8, c, column)) return self.values[self.cached_idx];
+        }
         for (self.columns, 0..) |col, i| {
             if (std.mem.eql(u8, col, column)) {
+                self.cached_col = column;
+                self.cached_idx = i;
                 return self.values[i];
             }
         }
@@ -140,6 +148,34 @@ pub const Rows = struct {
     pub fn deinit(self: *Rows) void {
         self.arena.deinit();
         self.* = undefined;
+    }
+};
+
+/// Streaming cursor over a Rows result set.
+/// Currently backed by Rows (all rows are materialized); the API is stable for
+/// future driver-native streaming implementations.
+pub const Cursor = struct {
+    rows: Rows,
+    pos: usize = 0,
+
+    pub fn init(rows: Rows) Cursor {
+        return .{ .rows = rows };
+    }
+
+    pub fn deinit(self: *Cursor) void {
+        self.rows.deinit();
+        self.* = undefined;
+    }
+
+    pub fn next(self: *Cursor) ?*Row {
+        if (self.pos >= self.rows.rows.len) return null;
+        const row = &self.rows.rows[self.pos];
+        self.pos += 1;
+        return row;
+    }
+
+    pub fn reset(self: *Cursor) void {
+        self.pos = 0;
     }
 };
 
@@ -305,7 +341,9 @@ pub const Conn = struct {
     };
 
     pub fn query(self: Conn, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value) errors.ResultT(Rows) {
-        return self.vtable.query(self.ptr, allocator, sql_str, args);
+        var rows = try self.vtable.query(self.ptr, allocator, sql_str, args);
+        for (rows.rows) |*row| row.arena = &rows.arena;
+        return rows;
     }
 
     pub fn exec(self: Conn, sql_str: []const u8, args: []const Value) errors.ResultT(ExecResult) {
@@ -478,7 +516,10 @@ fn scanStruct(allocator: std.mem.Allocator, comptime T: type, row: Row, partial:
         const val: ?Value = if (ci) |c| blk: {
             if (row.values[c]) |v| break :blk v;
             break :blk null;
-        } else row.get(fname);
+        } else val: {
+            var row_mut = row;
+            break :val row_mut.get(fname);
+        };
 
         if (is_optional) {
             const ChildType = BaseType;
@@ -630,11 +671,32 @@ pub fn QueryResult(comptime T: type) type {
 /// Bounded prepared-statement cache (per connection, LRU eviction).
 const MAX_CACHED_STMTS = 64;
 
+fn CachedStmt(comptime V: type) type {
+    return struct {
+        value: V,
+        last_used: u64,
+    };
+}
+
+fn findLruStmtKey(comptime V: type, cache: std.StringHashMap(CachedStmt(V))) ?[]const u8 {
+    var it = cache.iterator();
+    var lru_key: ?[]const u8 = null;
+    var lru_used: u64 = std.math.maxInt(u64);
+    while (it.next()) |entry| {
+        if (entry.value_ptr.last_used < lru_used) {
+            lru_used = entry.value_ptr.last_used;
+            lru_key = entry.key_ptr.*;
+        }
+    }
+    return lru_key;
+}
+
 pub const SQLiteConn = struct {
     db: ?*sqlite3_c.sqlite3,
     allocator: std.mem.Allocator,
     /// LRU cache of prepared statements keyed by SQL string.
-    stmt_cache: std.StringHashMap(*sqlite3_c.sqlite3_stmt),
+    stmt_cache: std.StringHashMap(CachedStmt(*sqlite3_c.sqlite3_stmt)),
+    stmt_counter: u64 = 0,
     magic: u32 = 0xDBDBDBDB,
 
     fn guard(self: *const @This()) void {
@@ -658,24 +720,44 @@ pub const SQLiteConn = struct {
             }
             return error.DatabaseError;
         }
-        return .{ .db = db, .allocator = allocator, .stmt_cache = std.StringHashMap(*sqlite3_c.sqlite3_stmt).init(allocator) };
+        errdefer _ = sqlite3_c.sqlite3_close(db.?);
+        try applySqlitePragmas(db.?);
+        return .{ .db = db, .allocator = allocator, .stmt_cache = std.StringHashMap(CachedStmt(*sqlite3_c.sqlite3_stmt)).init(allocator) };
+    }
+
+    fn applySqlitePragmas(db: *sqlite3_c.sqlite3) !void {
+        const pragmas = [_][:0]const u8{
+            "PRAGMA journal_mode=WAL",
+            "PRAGMA busy_timeout=5000",
+            "PRAGMA foreign_keys=ON",
+            "PRAGMA synchronous=NORMAL",
+            "PRAGMA cache_size=-8000",
+        };
+        for (pragmas) |sql| {
+            const rc = sqlite3_c.sqlite3_exec(db, sql.ptr, null, null, null);
+            if (rc != sqlite3_c.SQLITE_OK) {
+                const msg = std.mem.span(sqlite3_c.sqlite3_errmsg(db));
+                std.log.warn("SQLite PRAGMA failed: sql={s} msg={s}", .{ sql, msg });
+                return error.DatabaseError;
+            }
+        }
     }
 
     /// Get or prepare a cached statement. Returns reset + clear_bindings stmt ready for binding.
     fn getCachedStmt(self: *SQLiteConn, sql_str: []const u8) !*sqlite3_c.sqlite3_stmt {
         self.guard();
-        if (self.stmt_cache.get(sql_str)) |cached| {
-            _ = sqlite3_c.sqlite3_reset(cached);
-            _ = sqlite3_c.sqlite3_clear_bindings(cached);
-            return cached;
+        if (self.stmt_cache.getPtr(sql_str)) |entry| {
+            self.stmt_counter += 1;
+            entry.last_used = self.stmt_counter;
+            _ = sqlite3_c.sqlite3_reset(entry.value);
+            _ = sqlite3_c.sqlite3_clear_bindings(entry.value);
+            return entry.value;
         }
-        // Evict one entry when at capacity
+        // Evict LRU entry when at capacity.
         if (self.stmt_cache.count() >= MAX_CACHED_STMTS) {
-            var it = self.stmt_cache.iterator();
-            if (it.next()) |entry| {
-                const old_key = entry.key_ptr.*;
-                if (self.stmt_cache.fetchRemove(old_key)) |kv| {
-                    _ = sqlite3_c.sqlite3_finalize(kv.value);
+            if (findLruStmtKey(*sqlite3_c.sqlite3_stmt, self.stmt_cache)) |lru_key| {
+                if (self.stmt_cache.fetchRemove(lru_key)) |kv| {
+                    _ = sqlite3_c.sqlite3_finalize(kv.value.value);
                     self.allocator.free(kv.key);
                 }
             }
@@ -697,7 +779,8 @@ pub const SQLiteConn = struct {
             _ = sqlite3_c.sqlite3_finalize(stmt);
             return error.DatabaseError;
         };
-        try self.stmt_cache.put(key, stmt.?);
+        self.stmt_counter += 1;
+        try self.stmt_cache.put(key, .{ .value = stmt.?, .last_used = self.stmt_counter });
         return stmt.?;
     }
 
@@ -782,7 +865,7 @@ pub const SQLiteConn = struct {
         // Finalize all cached statements
         var it = self.stmt_cache.iterator();
         while (it.next()) |entry| {
-            _ = sqlite3_c.sqlite3_finalize(entry.value_ptr.*);
+            _ = sqlite3_c.sqlite3_finalize(entry.value_ptr.value);
             self.allocator.free(entry.key_ptr.*);
         }
         self.stmt_cache.deinit();
@@ -1331,7 +1414,7 @@ pub const PostgresConn = struct {
     conn: ?*libpq_c.PGconn,
     allocator: std.mem.Allocator,
     /// LRU-style prepared statement cache: SQL text → statement name.
-    stmt_cache: std.StringHashMap([]const u8),
+    stmt_cache: std.StringHashMap(CachedStmt([]const u8)),
     stmt_counter: u64 = 0,
     magic: u32 = 0xDBDBDBDB,
 
@@ -1365,7 +1448,7 @@ pub const PostgresConn = struct {
             libpq_c.PQfinish(conn);
             return error.DatabaseError;
         }
-        return .{ .conn = conn, .allocator = allocator, .stmt_cache = std.StringHashMap([]const u8).init(allocator) };
+        return .{ .conn = conn, .allocator = allocator, .stmt_cache = std.StringHashMap(CachedStmt([]const u8)).init(allocator) };
     }
 
     fn queryFn(ptr: *anyopaque, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value) errors.ResultT(Rows) {
@@ -1477,32 +1560,32 @@ pub const PostgresConn = struct {
         }
 
         // Cache key = original Zig SQL (`?` placeholders). Hit → PQexecPrepared.
-        if (self.stmt_cache.get(sql_str)) |stmt_name| {
-            if (self.execPreparedStmt(stmt_name, args)) |res| return res;
+        if (self.stmt_cache.getPtr(sql_str)) |entry| {
+            self.stmt_counter += 1;
+            entry.last_used = self.stmt_counter;
+            if (self.execPreparedStmt(entry.value, args)) |res| return res;
             // Cached name may be stale after reconnect; drop and re-prepare below.
             if (self.stmt_cache.fetchRemove(sql_str)) |kv| {
                 self.allocator.free(kv.key);
-                self.allocator.free(kv.value);
+                self.allocator.free(kv.value.value);
             }
         }
 
         const pg_sql = convertPlaceholders(self.allocator, sql_str) orelse return execParamsDirect(self, sql_str, args);
         defer self.allocator.free(pg_sql);
 
-        // Evict one entry when at capacity (HashMap iteration order ≈ insertion).
+        // Evict LRU entry when at capacity.
         if (self.stmt_cache.count() >= PG_MAX_CACHED_STMTS) {
-            var it = self.stmt_cache.iterator();
-            if (it.next()) |entry| {
-                const old_key = entry.key_ptr.*;
-                if (self.stmt_cache.fetchRemove(old_key)) |kv| {
+            if (findLruStmtKey([]const u8, self.stmt_cache)) |lru_key| {
+                if (self.stmt_cache.fetchRemove(lru_key)) |kv| {
                     var dealloc_buf: [80]u8 = undefined;
-                    if (bufPrintZ(&dealloc_buf, "DEALLOCATE {s}", .{kv.value})) |dealloc_sql| {
+                    if (bufPrintZ(&dealloc_buf, "DEALLOCATE {s}", .{kv.value.value})) |dealloc_sql| {
                         if (self.conn) |c| {
                             if (libpq_c.PQexec(c, @ptrCast(dealloc_sql.ptr))) |dr| libpq_c.PQclear(dr);
                         }
                     } else |_| {}
                     self.allocator.free(kv.key);
-                    self.allocator.free(kv.value);
+                    self.allocator.free(kv.value.value);
                 }
             }
         }
@@ -1529,7 +1612,8 @@ pub const PostgresConn = struct {
             self.allocator.free(sql_dup);
             return self.execPreparedStmt(stmt_name_z, args) orelse execParamsDirect(self, sql_str, args);
         };
-        self.stmt_cache.put(sql_dup, stmt_name_dup) catch {
+        self.stmt_counter += 1;
+        self.stmt_cache.put(sql_dup, .{ .value = stmt_name_dup, .last_used = self.stmt_counter }) catch {
             self.allocator.free(sql_dup);
             self.allocator.free(stmt_name_dup);
             return self.execPreparedStmt(stmt_name_z, args) orelse execParamsDirect(self, sql_str, args);
@@ -1720,10 +1804,10 @@ pub const PostgresConn = struct {
         var it = self.stmt_cache.iterator();
         while (it.next()) |entry| {
             var dealloc_buf: [64]u8 = undefined;
-            const sql = bufPrintZ(&dealloc_buf, "DEALLOCATE {s}", .{entry.value_ptr.*}) catch "";
+            const sql = bufPrintZ(&dealloc_buf, "DEALLOCATE {s}", .{entry.value_ptr.value}) catch "";
             if (self.conn != null) _ = libpq_c.PQexec(self.conn, @ptrCast(sql.ptr));
             self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.*);
+            self.allocator.free(entry.value_ptr.value);
         }
         self.stmt_cache.deinit();
         if (self.conn) |conn| {
@@ -2176,7 +2260,8 @@ pub const MySqlConn = struct {
     mysql: ?*libmysql_c.MYSQL,
     allocator: std.mem.Allocator,
     /// LRU-ish prepared-statement cache keyed by original SQL (`?` placeholders).
-    stmt_cache: std.StringHashMap(*libmysql_c.MYSQL_STMT),
+    stmt_cache: std.StringHashMap(CachedStmt(*libmysql_c.MYSQL_STMT)),
+    stmt_counter: u64 = 0,
     magic: u32 = 0xDBDBDBDB,
 
     fn guard(self: *const @This()) void {
@@ -2231,24 +2316,25 @@ pub const MySqlConn = struct {
         return .{
             .mysql = mysql,
             .allocator = allocator,
-            .stmt_cache = std.StringHashMap(*libmysql_c.MYSQL_STMT).init(allocator),
+            .stmt_cache = std.StringHashMap(CachedStmt(*libmysql_c.MYSQL_STMT)).init(allocator),
         };
     }
 
     /// Get or prepare a cached statement. Returns reset stmt ready for binding.
     fn getCachedStmt(self: *MySqlConn, sql_str: []const u8) !*libmysql_c.MYSQL_STMT {
         self.guard();
-        if (self.stmt_cache.get(sql_str)) |cached| {
-            _ = libmysql_c.mysql_stmt_reset(cached);
-            _ = libmysql_c.mysql_stmt_free_result(cached);
-            return cached;
+        if (self.stmt_cache.getPtr(sql_str)) |entry| {
+            self.stmt_counter += 1;
+            entry.last_used = self.stmt_counter;
+            _ = libmysql_c.mysql_stmt_reset(entry.value);
+            _ = libmysql_c.mysql_stmt_free_result(entry.value);
+            return entry.value;
         }
+        // Evict LRU entry when at capacity.
         if (self.stmt_cache.count() >= MAX_CACHED_STMTS) {
-            var it = self.stmt_cache.iterator();
-            if (it.next()) |entry| {
-                const old_key = entry.key_ptr.*;
-                if (self.stmt_cache.fetchRemove(old_key)) |kv| {
-                    _ = libmysql_c.mysql_stmt_close(kv.value);
+            if (findLruStmtKey(*libmysql_c.MYSQL_STMT, self.stmt_cache)) |lru_key| {
+                if (self.stmt_cache.fetchRemove(lru_key)) |kv| {
+                    _ = libmysql_c.mysql_stmt_close(kv.value.value);
                     self.allocator.free(kv.key);
                 }
             }
@@ -2265,7 +2351,8 @@ pub const MySqlConn = struct {
             _ = libmysql_c.mysql_stmt_close(stmt);
             return error.DatabaseError;
         };
-        self.stmt_cache.put(key, stmt) catch {
+        self.stmt_counter += 1;
+        self.stmt_cache.put(key, .{ .value = stmt, .last_used = self.stmt_counter }) catch {
             self.allocator.free(key);
             _ = libmysql_c.mysql_stmt_close(stmt);
             return error.DatabaseError;
@@ -2392,7 +2479,7 @@ pub const MySqlConn = struct {
         self.guard();
         var it = self.stmt_cache.iterator();
         while (it.next()) |entry| {
-            _ = libmysql_c.mysql_stmt_close(entry.value_ptr.*);
+            _ = libmysql_c.mysql_stmt_close(entry.value_ptr.value);
             self.allocator.free(entry.key_ptr.*);
         }
         self.stmt_cache.deinit();
@@ -2475,7 +2562,9 @@ pub const Stmt = struct {
     };
 
     pub fn query(self: Stmt, allocator: std.mem.Allocator, args: []const Value) errors.ResultT(Rows) {
-        return self.vtable.query(self.ptr, allocator, args);
+        var rows = try self.vtable.query(self.ptr, allocator, args);
+        for (rows.rows) |*row| row.arena = &rows.arena;
+        return rows;
     }
 
     pub fn exec(self: Stmt, args: []const Value) errors.ResultT(ExecResult) {
@@ -2825,29 +2914,6 @@ const ConnPool = struct {
         };
     }
 
-    /// Attempt to get a healthy connection with reconnect lofic
-    fn getHealthyConn(self: *ConnPool) !Conn {
-        var attempts: u32 = 0;
-        while (attempts < self.max_reconnect_attempts) : (attempts += 1) {
-            const conn = self.client.newConn() catch {
-                if (attempts < self.max_reconnect_attempts - 1) {
-                    self.reconnect() catch |err| std.log.warn("[ConnPool] reconnect failed: {}", .{err});
-                }
-                continue;
-            };
-            // health check: ping before returning
-            conn.ping() catch {
-                conn.close();
-                if (attempts < self.max_reconnect_attempts - 1) {
-                    self.reconnect() catch |err| std.log.warn("[ConnPool] reconnect failed: {}", .{err});
-                }
-                continue;
-            };
-            return conn;
-        }
-        return error.ConnectionFailed;
-    }
-
     pub fn acquire(self: *ConnPool) !Conn {
         if (self.closed.load(.monotonic)) return error.ConnectionFailed;
 
@@ -2888,7 +2954,7 @@ const ConnPool = struct {
             const timeout: std.Io.Timeout = .{
                 .duration = .{
                     .raw = .{ .nanoseconds = @as(i96, @intCast(self.max_wait_ms)) * 1_000_000 },
-                    .clock = .real,
+                    .clock = .awake,
                 },
             };
             self.cond.waitTimeout(self.io, &self.mutex, timeout) catch |err| {
@@ -2923,6 +2989,35 @@ const ConnPool = struct {
             conn.close();
             _ = self.active.fetchSub(1, .monotonic);
         }
+    }
+
+    /// Pre-create `count` idle connections (capped at `max_idle`).
+    pub fn warmup(self: *ConnPool, count: u32) !void {
+        if (self.closed.load(.monotonic)) return error.ConnectionFailed;
+        const target = @min(count, self.max_idle);
+        if (target == 0) return;
+        var conns = std.ArrayList(Conn).empty;
+        defer {
+            for (conns.items) |*conn| conn.close();
+            conns.deinit(self.allocator);
+        }
+        for (0..target) |_| {
+            const conn = self.client.newConn() catch return error.ConnectionFailed;
+            conns.append(self.allocator, conn) catch {
+                conn.close();
+                return error.ConnectionFailed;
+            };
+        }
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (conns.items) |conn| {
+            self.idle.append(self.allocator, conn) catch {
+                conn.close();
+                continue;
+            };
+            _ = self.active.fetchAdd(1, .monotonic);
+        }
+        conns.items.len = 0;
     }
 
     /// Ping all idle connections — returns false if any are dead.
@@ -2982,6 +3077,23 @@ pub const Config = struct {
     max_idle_conns: u32 = 4,
     max_wait_ms: u32 = 5000,
 };
+
+/// Transaction options aligned with Go's sql.TxOptions.
+pub const TxOptions = struct {
+    read_only: bool = false,
+    deferred: bool = false,
+};
+
+fn beginSql(driver: Driver, opts: TxOptions) []const u8 {
+    if (driver == .mysql) {
+        if (opts.read_only) return "START TRANSACTION READ ONLY";
+        return "START TRANSACTION";
+    }
+    if (opts.deferred and opts.read_only) return "BEGIN DEFERRED READ ONLY";
+    if (opts.deferred) return "BEGIN DEFERRED";
+    if (opts.read_only) return "BEGIN READ ONLY";
+    return "BEGIN";
+}
 
 /// SQL option function type aligned with go-zero's SqlOption
 pub const SqlOption = *const fn (*Client) void;
@@ -3106,6 +3218,12 @@ pub const Client = struct {
     pub fn open(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !Client {
         var client = Client.init(allocator, io, cfg);
         try client.connect();
+        client.ensurePool();
+        if (client.pool) |*p| {
+            p.warmup(cfg.max_idle_conns) catch |err| {
+                std.log.warn("[sqlx] connection warmup failed: {}", .{err});
+            };
+        }
         return client;
     }
 
@@ -3261,6 +3379,17 @@ pub const Client = struct {
         return self.query(sql_str, args);
     }
 
+    /// Query and return a Cursor for row-by-row iteration. Caller must `defer cursor.deinit()`.
+    pub fn queryCursor(self: *Client, sql_str: []const u8, args: []const Value) !Cursor {
+        const rows = try self.query(sql_str, args);
+        return Cursor.init(rows);
+    }
+
+    pub fn queryCursorCtx(self: *Client, ctx: SqlContext, sql_str: []const u8, args: []const Value) !Cursor {
+        if (ctx.isDone()) return error.Timeout;
+        return self.queryCursor(sql_str, args);
+    }
+
     fn doExec(self: *Client, sql_str: []const u8, args: []const Value) !ExecResult {
         self.ensurePool();
         if (self.pool) |*p| {
@@ -3300,6 +3429,69 @@ pub const Client = struct {
         return self.exec(sql_str, args);
     }
 
+    /// Execute the same statement multiple times with different argument sets.
+    /// Caller owns the returned slice and must free it with `allocator.free(results)`.
+    pub fn batchExec(self: *Client, sql_str: []const u8, rows: []const []const Value) ![]ExecResult {
+        const results = try self.allocator.alloc(ExecResult, rows.len);
+        errdefer self.allocator.free(results);
+        for (rows, 0..) |args, i| {
+            results[i] = try self.exec(sql_str, args);
+        }
+        return results;
+    }
+
+    pub fn batchExecCtx(self: *Client, ctx: SqlContext, sql_str: []const u8, rows: []const []const Value) ![]ExecResult {
+        if (ctx.isDone()) return error.Timeout;
+        return self.batchExec(sql_str, rows);
+    }
+
+    /// Build and execute a single multi-row INSERT for the given table/columns.
+    /// All drivers share the `?` placeholder; the caller must ensure `rows[i].len == columns.len`.
+    pub fn batchInsert(self: *Client, table: []const u8, columns: []const []const u8, rows: []const []const Value) !ExecResult {
+        try validateIdentifier(table);
+        if (rows.len == 0) return ExecResult{};
+        if (columns.len == 0) return error.DatabaseError;
+        for (columns) |c| try validateIdentifier(c);
+
+        // Flatten parameters: [row0col0, row0col1, ..., rowNcolM].
+        const total_args = rows.len * columns.len;
+        const flat_args = try self.allocator.alloc(Value, total_args);
+        defer self.allocator.free(flat_args);
+        var pos: usize = 0;
+        for (rows) |row| {
+            if (row.len != columns.len) return error.DatabaseError;
+            @memcpy(flat_args[pos .. pos + row.len], row);
+            pos += row.len;
+        }
+
+        // Build "INSERT INTO t (c1,c2) VALUES (?,?),(?,?),...".
+        var sql = std.ArrayList(u8).empty;
+        defer sql.deinit(self.allocator);
+        try sql.appendSlice(self.allocator, "INSERT INTO ");
+        try sql.appendSlice(self.allocator, table);
+        try sql.appendSlice(self.allocator, " (");
+        for (columns, 0..) |col, i| {
+            if (i > 0) try sql.appendSlice(self.allocator, ",");
+            try sql.appendSlice(self.allocator, col);
+        }
+        try sql.appendSlice(self.allocator, ") VALUES ");
+        for (0..rows.len) |r| {
+            if (r > 0) try sql.appendSlice(self.allocator, ",");
+            try sql.append(self.allocator, '(');
+            for (0..columns.len) |c| {
+                if (c > 0) try sql.appendSlice(self.allocator, ",");
+                try sql.appendSlice(self.allocator, "?");
+            }
+            try sql.append(self.allocator, ')');
+        }
+        return self.exec(sql.items, flat_args);
+    }
+
+    pub fn batchInsertCtx(self: *Client, ctx: SqlContext, table: []const u8, columns: []const []const u8, rows: []const []const Value) !ExecResult {
+        if (ctx.isDone()) return error.Timeout;
+        return self.batchInsert(table, columns, rows);
+    }
+
     fn doPing(self: *Client) !void {
         self.ensurePool();
         if (self.pool) |*p| {
@@ -3327,9 +3519,14 @@ pub const Client = struct {
     }
 
     pub fn beginTx(self: *Client) errors.Error!Transaction {
+        return self.beginTxOpts(.{});
+    }
+
+    pub fn beginTxOpts(self: *Client, opts: TxOptions) errors.Error!Transaction {
         self.ensureBreaker();
         if (!self.cb.?.allow()) return errors.Error.CircuitBreakerOpen;
         self.ensurePool();
+        const sql = beginSql(self.config.driver, opts);
         if (self.pool) |*p| {
             const conn = p.acquire() catch |err| {
                 if (err == error.ConnectionFailed) return errors.Error.DatabaseError;
@@ -3338,7 +3535,7 @@ pub const Client = struct {
                 return errors.Error.DatabaseError;
             };
             errdefer p.release(conn);
-            conn.begin() catch |err| {
+            _ = conn.exec(sql, &.{}) catch |err| {
                 if (!self.isAcceptable(err)) self.cb.?.recordFailure();
                 return errors.Error.DatabaseError;
             };
@@ -3350,8 +3547,8 @@ pub const Client = struct {
                 return errors.Error.DatabaseError;
             };
         }
-        self.conn.?.begin() catch {
-            if (!self.isAcceptable(errors.DatabaseError.ConnectionFailed)) self.cb.?.recordFailure();
+        _ = self.conn.?.exec(sql, &.{}) catch |err| {
+            if (!self.isAcceptable(err)) self.cb.?.recordFailure();
             return errors.Error.DatabaseError;
         };
         return Transaction{ .conn = self.conn.?, .allocator = self.allocator };
@@ -3378,7 +3575,9 @@ pub const Client = struct {
         defer rows.deinit();
         for (rows.rows) |*row| row.arena = &rows.arena;
         if (rows.rows.len == 0) return error.NotFound;
-        return try rows.rows[0].scan(self.allocator, T);
+        const indices = try buildColumnIndices(self.allocator, T, rows.rows[0].columns);
+        defer self.allocator.free(indices);
+        return try scanStruct(self.allocator, T, rows.rows[0], false, indices, false);
     }
 
     pub fn queryRowCtx(self: *Client, ctx: SqlContext, comptime T: type, sql_str: []const u8, args: []const Value) !T {
@@ -3391,7 +3590,9 @@ pub const Client = struct {
         defer rows.deinit();
         for (rows.rows) |*row| row.arena = &rows.arena;
         if (rows.rows.len == 0) return error.NotFound;
-        return try rows.rows[0].scanPartial(self.allocator, T);
+        const indices = try buildColumnIndices(self.allocator, T, rows.rows[0].columns);
+        defer self.allocator.free(indices);
+        return try scanStruct(self.allocator, T, rows.rows[0], true, indices, false);
     }
 
     pub fn queryRowPartialCtx(self: *Client, ctx: SqlContext, comptime T: type, sql_str: []const u8, args: []const Value) !T {
@@ -3633,19 +3834,24 @@ fn deepCopyStruct(allocator: std.mem.Allocator, comptime T: type, src: T) !T {
 
 /// Simple string cache for testing CachedConn
 pub const StringCache = struct {
+    const Entry = struct {
+        value: []const u8,
+        expires_at_ms: i64,
+    };
+
     allocator: std.mem.Allocator,
-    map: std.StringHashMap([]const u8),
+    map: std.StringHashMap(Entry),
 
     pub fn init(allocator: std.mem.Allocator) StringCache {
         return .{
             .allocator = allocator,
-            .map = std.StringHashMap([]const u8).init(allocator),
+            .map = std.StringHashMap(Entry).init(allocator),
         };
     }
 
     pub fn deinit(self: *StringCache) void {
         var iter = self.map.valueIterator();
-        while (iter.next()) |v| self.allocator.free(v.*);
+        while (iter.next()) |v| self.allocator.free(v.value);
         var key_iter = self.map.keyIterator();
         while (key_iter.next()) |k| self.allocator.free(k.*);
         self.map.deinit();
@@ -3653,27 +3859,36 @@ pub const StringCache = struct {
     }
 
     pub fn get(self: *StringCache, key: []const u8) ?[]const u8 {
-        const val = self.map.get(key) orelse return null;
-        return self.allocator.dupe(u8, val) catch null;
+        const entry = self.map.getEntry(key) orelse return null;
+        if (Time.monotonicNowMilliseconds() > entry.value_ptr.expires_at_ms) {
+            self.allocator.free(entry.value_ptr.value);
+            self.allocator.free(entry.key_ptr.*);
+            _ = self.map.removeByPtr(entry.key_ptr);
+            return null;
+        }
+        return self.allocator.dupe(u8, entry.value_ptr.value) catch null;
     }
 
     pub fn set(self: *StringCache, key: []const u8, value: []const u8, ttl_sec: u32) !void {
-        _ = ttl_sec;
         const k = try self.allocator.dupe(u8, key);
         const v = try self.allocator.dupe(u8, value);
         const entry = self.map.getEntry(k);
+        const expires_at_ms = if (ttl_sec == 0)
+            std.math.maxInt(i64)
+        else
+            Time.monotonicNowMilliseconds() + @as(i64, ttl_sec) * 1000;
         if (entry) |e| {
-            self.allocator.free(e.value_ptr.*);
-            e.value_ptr.* = v;
+            self.allocator.free(e.value_ptr.value);
+            e.value_ptr.* = .{ .value = v, .expires_at_ms = expires_at_ms };
             self.allocator.free(k);
         } else {
-            try self.map.put(k, v);
+            try self.map.put(k, .{ .value = v, .expires_at_ms = expires_at_ms });
         }
     }
 
     pub fn del(self: *StringCache, key: []const u8) void {
         if (self.map.fetchRemove(key)) |entry| {
-            self.allocator.free(entry.value);
+            self.allocator.free(entry.value.value);
             self.allocator.free(entry.key);
         }
     }
@@ -4345,7 +4560,7 @@ test "sqlite parameterized query treats injection payload as literal" {
 
     var count_rows = try client.query("SELECT COUNT(*) AS cnt FROM users", &.{});
     defer count_rows.deinit();
-    try std.testing.expectEqual(@as(i64, 1), count_rows.rows[0].get("cnt").?.int);
+    try std.testing.expectEqual(@as(i64, 1), (&count_rows.rows[0]).get("cnt").?.int);
 }
 
 test "sqlite in-memory query and exec" {
@@ -4365,8 +4580,8 @@ test "sqlite in-memory query and exec" {
     defer rows.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
-    try std.testing.expectEqual(@as(i64, 1), rows.rows[0].get("id").?.int);
-    if (rows.rows[0].get("name")) |name_val| {
+    try std.testing.expectEqual(@as(i64, 1), (&rows.rows[0]).get("id").?.int);
+    if ((&rows.rows[0]).get("name")) |name_val| {
         try std.testing.expectEqualStrings("Alice", name_val.string);
     } else return error.TestUnexpectedResult;
 }
@@ -4871,7 +5086,7 @@ test "postgres live connection" {
     defer rows.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
-    if (rows.rows[0].get("name")) |name_val| {
+    if ((&rows.rows[0]).get("name")) |name_val| {
         const name_str = name_val.string;
         try std.testing.expectEqualStrings("Alice", name_str);
     } else return error.TestUnexpectedResult;
@@ -4919,7 +5134,7 @@ test "mysql live connection" {
     defer rows.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
-    if (rows.rows[0].get("name")) |name_val| {
+    if ((&rows.rows[0]).get("name")) |name_val| {
         const name_str = name_val.string;
         try std.testing.expectEqualStrings("Alice", name_str);
         allocator.free(name_str);
@@ -4969,8 +5184,115 @@ test "sqlite conn interface lifecycle" {
     var rows = try conn.query(allocator, "SELECT id FROM lifecycle_test", &.{});
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
-    try std.testing.expectEqual(@as(i64, 1), rows.rows[0].get("id").?.int);
+    try std.testing.expectEqual(@as(i64, 1), (&rows.rows[0]).get("id").?.int);
 
     // Close connection (this frees the heap-allocated SQLiteConn)
     conn.close();
+}
+
+test "sqlite batchExec and batchInsert helpers" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+
+    _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+
+    const batch = [_][]const Value{
+        &.{ .{ .int = 1 }, .{ .string = "Alice" } },
+        &.{ .{ .int = 2 }, .{ .string = "Bob" } },
+        &.{ .{ .int = 3 }, .{ .string = "Carol" } },
+    };
+    const results = try client.batchExec("INSERT INTO users (id, name) VALUES (?1, ?2)", &batch);
+    defer allocator.free(results);
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+
+    const batch2 = [_][]const Value{
+        &.{ .{ .int = 4 }, .{ .string = "Dave" } },
+        &.{ .{ .int = 5 }, .{ .string = "Eve" } },
+    };
+    const insert = try client.batchInsert("users", &.{ "id", "name" }, &batch2);
+    try std.testing.expectEqual(@as(u64, 2), insert.rows_affected);
+
+    var rows = try client.queryCursor("SELECT id, name FROM users ORDER BY id", &.{});
+    defer rows.deinit();
+    var count: usize = 0;
+    while (rows.next()) |row| {
+        _ = (&row.*).get("id").?.int;
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 5), count);
+}
+
+test "sqlite Row.get caches repeated lookups" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+
+    _ = try client.exec("CREATE TABLE t (a INTEGER, b TEXT)", &.{});
+    _ = try client.exec("INSERT INTO t (a, b) VALUES (1, 'x')", &.{});
+
+    var rows = try client.query("SELECT a, b FROM t", &.{});
+    defer rows.deinit();
+    var row = rows.rows[0];
+    try std.testing.expectEqual(@as(i64, 1), row.get("a").?.int);
+    try std.testing.expectEqual(@as(i64, 1), row.get("a").?.int);
+    try std.testing.expectEqualStrings("x", row.get("b").?.string);
+}
+
+test "sqlite deferred transaction option" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+
+    _ = try client.exec("CREATE TABLE t (id INTEGER)", &.{});
+    _ = try client.exec("INSERT INTO t (id) VALUES (1)", &.{});
+
+    var tx = try client.beginTxOpts(.{ .deferred = true });
+    defer tx.rollback() catch {};
+    const n = try tx.queryRow(allocator, struct { id: i64 }, "SELECT id FROM t", &.{});
+    try std.testing.expectEqual(@as(i64, 1), n.id);
+}
+
+test "sqlite CachedConn respects TTL expiration" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+
+    _ = try client.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+    _ = try client.exec("INSERT INTO t (id, name) VALUES (1, 'Alice')", &.{});
+
+    var cache = StringCache.init(allocator);
+    defer cache.deinit();
+
+    const User = struct { id: i64, name: []const u8 };
+    var cached = CachedConn{ .allocator = allocator, .client = &client, .local_cache = &cache, .ttl_sec = 0 };
+
+    const user1 = try cached.queryRow(User, "u:1", "SELECT id, name FROM t WHERE id = 1", &.{});
+    defer freeScanned(allocator, User, user1);
+    try std.testing.expectEqualStrings("Alice", user1.name);
+
+    _ = try client.exec("UPDATE t SET name = 'Bob' WHERE id = 1", &.{});
+    const user2 = try cached.queryRow(User, "u:1", "SELECT id, name FROM t WHERE id = 1", &.{});
+    defer freeScanned(allocator, User, user2);
+    try std.testing.expectEqualStrings("Alice", user2.name);
+}
+
+test "sqlite connection pool warmup" {
+    const allocator = std.testing.allocator;
+
+    var db = try Client.open(allocator, std.testing.io, .{
+        .driver = .sqlite,
+        .sqlite_path = ":memory:",
+        .max_open_conns = 4,
+        .max_idle_conns = 2,
+    });
+    defer db.deinit();
+
+    // Warmup should have created up to max_idle idle connections.
+    try std.testing.expect(db.pool != null);
+    try std.testing.expect(db.pool.?.idle.items.len > 0);
 }
