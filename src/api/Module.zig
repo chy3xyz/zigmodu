@@ -53,6 +53,8 @@ pub const RuntimeOptions = struct {
     cb_timeout_seconds: u64 = 0,
     /// Max test calls in HALF_OPEN state.
     cb_half_open_max_calls: u32 = 0,
+    /// Number of dedicated async workers for this module. 0 = no dedicated pool.
+    worker_count: u32 = 0,
 };
 
 /// Application-level configuration
@@ -85,8 +87,10 @@ test "Module with runtime options" {
             .cb_success_threshold = 2,
             .cb_timeout_seconds = 10,
             .cb_half_open_max_calls = 3,
+            .worker_count = 4,
         },
     };
     try std.testing.expectEqual(@as(u32, 50), mod.runtime.max_concurrent);
     try std.testing.expectEqual(@as(u32, 1000), mod.runtime.max_qps);
+    try std.testing.expectEqual(@as(u32, 4), mod.runtime.worker_count);
 }
