@@ -9,6 +9,7 @@ const scanModules = @import("core/ModuleScanner.zig").scanModules;
 const validateModules = @import("core/ModuleValidator.zig").validateModules;
 const Lifecycle = @import("core/Lifecycle.zig");
 const Documentation = @import("core/Documentation.zig");
+const ModuleRegistry = @import("core/ModuleRegistry.zig").ModuleRegistry;
 
 /// Atomic flag for graceful shutdown coordination (set by signal handler).
 var shutdown_requested = std.atomic.Value(bool).init(false);
@@ -51,6 +52,7 @@ pub const Application = struct {
     state: State,
     io: std.Io,
     shutdown_hooks: std.ArrayList(*const fn () void),
+    registry: ?ModuleRegistry = null,
 
     pub const State = enum {
         initialized,
@@ -74,7 +76,11 @@ pub const Application = struct {
         comptime modules_tuple: anytype,
         options: Config,
     ) !Self {
-        const modules = try scanModules(allocator, modules_tuple);
+        var modules = try scanModules(allocator, modules_tuple);
+
+        var registry = ModuleRegistry.init(allocator);
+        errdefer registry.deinit();
+        try registry.initFromModules(&modules);
 
         return .{
             .io = io,
@@ -88,6 +94,7 @@ pub const Application = struct {
             },
             .state = .initialized,
             .shutdown_hooks = std.ArrayList(*const fn () void).empty,
+            .registry = registry,
         };
     }
 
@@ -96,6 +103,7 @@ pub const Application = struct {
         if (self.state == .started) {
             self.stop();
         }
+        if (self.registry) |*r| r.deinit();
         self.modules.deinit();
         self.shutdown_hooks.deinit(self.allocator);
         self.state = .stopped;
@@ -167,6 +175,12 @@ pub const Application = struct {
     /// Get module by name
     pub fn getModule(self: *Self, name: []const u8) ?ModuleInfo {
         return self.modules.get(name);
+    }
+
+    /// Get module runtime by name
+    pub fn getModuleRuntime(self: *Self, name: []const u8) ?*@import("core/ModuleRuntime.zig").ModuleRuntime {
+        if (self.registry) |*r| return r.get(name);
+        return null;
     }
 
     /// Check if application contains a module
@@ -557,6 +571,27 @@ test "e2e: Application smoke test with events and graceful drain" {
     app.stop();
     try std.testing.expectEqual(Application.State.stopped, app.getState());
     try std.testing.expect(E2eCtx.hook_called);
+}
+
+test "Application builds ModuleRegistry from module runtime options" {
+    const allocator = std.testing.allocator;
+
+    const ResilientModule = struct {
+        pub const info = api.Module{
+            .name = "resilient",
+            .description = "Resilient",
+            .runtime = .{ .max_concurrent = 5 },
+        };
+        pub fn init() !void {}
+        pub fn deinit() void {}
+    };
+
+    var app = try Application.init(std.testing.io, allocator, "runtime-app", .{ResilientModule}, .{});
+    defer app.deinit();
+
+    const rt = app.getModuleRuntime("resilient");
+    try std.testing.expect(rt != null);
+    try std.testing.expect(rt.?.tryEnter());
 }
 
 test "e2e: in-flight counter tracks request lifecycle" {
