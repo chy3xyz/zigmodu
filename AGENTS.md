@@ -172,7 +172,8 @@ test "my test" {
 - Framework: **v0.14.8**
 - Zig: **0.17.0**
 
-- Tests: **519 passed**, 18 skipped, 0 failed
+- Tests: **520 passed**, 18 skipped, 0 failed
+
 
 - Roadmap: `docs/PRODUCTION_ROADMAP.md` (phases 1–9 ✅)
 - Modulith day-one practices: `docs/MODULITH.md`

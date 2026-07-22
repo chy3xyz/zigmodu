@@ -150,7 +150,8 @@ pub const RouteGroup = struct {
         const full_path = try self.joinPath(self.server.allocator, path);
         defer self.server.allocator.free(full_path);
 
-        const dup_path = try self.server.allocator.dupe(u8, full_path);
+        const norm_path = if (full_path.len > 0 and full_path[0] == '/') full_path[1..] else full_path;
+        const dup_path = try self.server.allocator.dupe(u8, norm_path);
         try self.server.ws_handlers.put(dup_path, .{
             .on_connect = on_connect,
             .on_message = on_message,
@@ -158,6 +159,7 @@ pub const RouteGroup = struct {
             .user_data = user_data,
         });
     }
+
 };
 
 /// WebSocket connect callback: called after successful handshake.
@@ -1510,7 +1512,9 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
         }
 
         // ── WebSocket upgrade check ──
-        if (server.ws_handlers.get(request.path)) |ws_route| {
+        const ws_lookup_path = if (request.path.len > 0 and request.path[0] == '/') request.path[1..] else request.path;
+        if (server.ws_handlers.get(ws_lookup_path)) |ws_route| {
+
             if (std.mem.eql(u8, request.method.toString(), "GET")) {
                 const upgrade_hdr = ctx.headers.get("upgrade") orelse ctx.headers.get("Upgrade") orelse "";
                 if (std.ascii.eqlIgnoreCase(upgrade_hdr, "websocket")) {
@@ -2491,3 +2495,34 @@ test "path rewriter changes route selection" {
     defer if (matched) |*m| m.deinit(allocator);
     try std.testing.expect(matched != null);
 }
+
+test "WebSocket route path normalization handles leading slash variations" {
+    const allocator = std.testing.allocator;
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 8080 });
+    defer server.deinit();
+
+    var group = server.group("/app-api");
+    try group.ws("/ws/im", (struct {
+        fn connect(_: *Context, _: ?*anyopaque) ?*anyopaque {
+            return null;
+        }
+
+    }).connect, (struct {
+        fn message(_: ?*anyopaque, _: []const u8) void {}
+    }).message, (struct {
+        fn close(_: ?*anyopaque) void {}
+    }).close, null);
+
+
+    // Both "/app-api/ws/im" and "app-api/ws/im" should hit the normalized ws_handlers lookup key ("app-api/ws/im")
+    try std.testing.expect(server.ws_handlers.contains("app-api/ws/im"));
+
+    const path1 = "/app-api/ws/im";
+    const norm1 = if (path1.len > 0 and path1[0] == '/') path1[1..] else path1;
+    try std.testing.expect(server.ws_handlers.get(norm1) != null);
+
+    const path2 = "app-api/ws/im";
+    const norm2 = if (path2.len > 0 and path2[0] == '/') path2[1..] else path2;
+    try std.testing.expect(server.ws_handlers.get(norm2) != null);
+}
+

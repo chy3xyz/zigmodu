@@ -4,7 +4,8 @@
 **框架版本**: v0.14.8  
 
 **Zig 版本**: 0.17.0  
-**测试结果**: **519 passed, 18 skipped, 0 failed**（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`，2026-07-23 复测）  
+**测试结果**: **520 passed, 18 skipped, 0 failed**（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`，2026-07-23 复测）  
+
 
 **生产门禁**: `zig build check`（热路径禁止裸 `catch {}`）  
 **旗舰示例**: [`examples/tenant-mgmt/`](../examples/tenant-mgmt/) — SQLite 持久层 + 真 JWT + CI 业务断言  
