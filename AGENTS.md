@@ -169,8 +169,9 @@ test "my test" {
 ```
 
 ## Version
-- Framework: **v0.14.8**
+- Framework: **v0.14.9**
 - Zig: **0.17.0**
+
 
 - Tests: **521 passed**, 18 skipped, 0 failed
 

@@ -1,7 +1,8 @@
 # ZigModu 生产级评估报告 v5
 
 **评估日期**: 2026-06-20  
-**框架版本**: v0.14.8  
+**框架版本**: v0.14.9  
+
 
 **Zig 版本**: 0.17.0  
 **测试结果**: **521 passed, 18 skipped, 0 failed**（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`，2026-07-23 复测）  
