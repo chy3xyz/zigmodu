@@ -172,7 +172,8 @@ test "my test" {
 - Framework: **v0.14.8**
 - Zig: **0.17.0**
 
-- Tests: **518 passed**, 18 skipped, 0 failed
+- Tests: **519 passed**, 18 skipped, 0 failed
+
 - Roadmap: `docs/PRODUCTION_ROADMAP.md` (phases 1–9 ✅)
 - Modulith day-one practices: `docs/MODULITH.md`
 - Domain layering (model / persistence.Tx / service Cmd): `docs/MODULE_LAYERS.md`
