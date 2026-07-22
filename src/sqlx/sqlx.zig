@@ -432,21 +432,27 @@ const PG_DIAG_COLUMN_NAME: c_int = 'c';
 pub fn diagnosePostgres(result: ?*const libpq_c.PGresult) SqlDiagnostic {
     var diag = SqlDiagnostic{ .code = 0, .message = "" };
 
-    const sqlstate = if (result) |r| std.mem.span(libpq_c.PQresultErrorField(r, PG_DIAG_SQLSTATE)) else "";
+    const sqlstate = if (result) |r| (if (libpq_c.PQresultErrorField(r, PG_DIAG_SQLSTATE)) |s| std.mem.span(s) else "") else "";
     if (sqlstate.len > 0) {
         diag.code = std.fmt.parseInt(i32, sqlstate, 10) catch 0;
     }
 
-    const msg = if (result) |r| std.mem.span(libpq_c.PQresultErrorMessage(r)) else "";
+    const msg = if (result) |r| (if (libpq_c.PQresultErrorMessage(r)) |m| std.mem.span(m) else "") else "";
     diag.message = msg;
 
     if (result) |r| {
-        const constraint = std.mem.span(libpq_c.PQresultErrorField(r, PG_DIAG_CONSTRAINT_NAME));
-        if (constraint.len > 0) diag.constraint = constraint;
-        const table = std.mem.span(libpq_c.PQresultErrorField(r, PG_DIAG_TABLE_NAME));
-        if (table.len > 0) diag.table = table;
-        const column = std.mem.span(libpq_c.PQresultErrorField(r, PG_DIAG_COLUMN_NAME));
-        if (column.len > 0) diag.column = column;
+        if (libpq_c.PQresultErrorField(r, PG_DIAG_CONSTRAINT_NAME)) |c| {
+            const constraint = std.mem.span(c);
+            if (constraint.len > 0) diag.constraint = constraint;
+        }
+        if (libpq_c.PQresultErrorField(r, PG_DIAG_TABLE_NAME)) |t| {
+            const table = std.mem.span(t);
+            if (table.len > 0) diag.table = table;
+        }
+        if (libpq_c.PQresultErrorField(r, PG_DIAG_COLUMN_NAME)) |col| {
+            const column = std.mem.span(col);
+            if (column.len > 0) diag.column = column;
+        }
     }
 
     return diag;
