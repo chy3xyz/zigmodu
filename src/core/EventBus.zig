@@ -1,6 +1,7 @@
 //! Thread-safe event bus with typed event dispatch, infallible subscription model.
 
 const std = @import("std");
+const WorkerPool = @import("WorkerPool.zig").WorkerPool;
 
 /// ListenerSet for O(1) [...]/[...]
 /// ListenerSet [...] ArrayList [...] HashMap [...]
@@ -154,18 +155,42 @@ pub fn TypedEventBus(comptime T: type) type {
         const Self = @This();
         const CallbackType = *const fn (T) void;
 
+        const AsyncSubscriber = struct {
+            pool: *WorkerPool,
+            handler: CallbackType,
+        };
+
+        const AsyncDelivery = struct {
+            allocator: std.mem.Allocator,
+            handler: CallbackType,
+            event: T,
+
+            fn run(ctx: ?*anyopaque, io_arg: std.Io) void {
+                _ = io_arg;
+                const delivery: *AsyncDelivery = @ptrCast(@alignCast(ctx.?));
+                delivery.handler(delivery.event);
+                delivery.allocator.destroy(delivery);
+            }
+        };
+
         allocator: std.mem.Allocator,
         listeners: ListenerSet(CallbackType),
+        async_subscribers: std.ArrayList(AsyncSubscriber),
 
         pub fn init(alloc: std.mem.Allocator) Self {
             return .{
                 .allocator = alloc,
                 .listeners = ListenerSet(CallbackType).init(alloc),
+                .async_subscribers = std.ArrayList(AsyncSubscriber).empty,
             };
         }
 
         pub fn subscribe(self: *Self, listener: CallbackType) !void {
             try self.listeners.add(listener);
+        }
+
+        pub fn subscribeAsync(self: *Self, pool: *WorkerPool, handler: CallbackType) !void {
+            try self.async_subscribers.append(self.allocator, .{ .pool = pool, .handler = handler });
         }
 
         pub fn unsubscribe(self: *Self, listener: CallbackType) void {
@@ -177,6 +202,22 @@ pub fn TypedEventBus(comptime T: type) type {
             while (iter.next()) |callback| {
                 callback.*(event);
             }
+
+            for (self.async_subscribers.items) |async_sub| {
+                const delivery = self.allocator.create(AsyncDelivery) catch continue;
+                delivery.* = .{
+                    .allocator = self.allocator,
+                    .handler = async_sub.handler,
+                    .event = event,
+                };
+                const dispatched = async_sub.pool.dispatch(.{
+                    .run = AsyncDelivery.run,
+                    .ctx = delivery,
+                });
+                if (!dispatched) {
+                    self.allocator.destroy(delivery);
+                }
+            }
         }
 
         pub fn subscriberCount(self: *Self) usize {
@@ -185,6 +226,7 @@ pub fn TypedEventBus(comptime T: type) type {
 
         pub fn deinit(self: *Self) void {
             self.listeners.deinit();
+            self.async_subscribers.deinit(self.allocator);
             self.* = undefined;
         }
     };
@@ -217,6 +259,12 @@ pub fn ThreadSafeEventBus(comptime T: type) type {
             self.mu.lock(self.io) catch return;
             defer self.mu.unlock(self.io);
             try self.bus.subscribe(listener);
+        }
+
+        pub fn subscribeAsync(self: *Self, pool: *WorkerPool, listener: TypedEventBus(T).CallbackType) !void {
+            self.mu.lock(self.io) catch return;
+            defer self.mu.unlock(self.io);
+            try self.bus.subscribeAsync(pool, listener);
         }
 
         pub fn unsubscribe(self: *Self, listener: TypedEventBus(T).CallbackType) void {
@@ -314,4 +362,31 @@ test "TypedEventBus multi-subscriber" {
     bus.publish(.{ .value = 5 });
     // cb1 + cb3 = 5 + 15 = 20
     try std.testing.expectEqual(@as(i32, 20), Ctx.sum);
+}
+
+test "TypedEventBus async subscriber" {
+    const allocator = std.testing.allocator;
+    const Event = struct { value: i32 };
+
+    const Ctx = struct {
+        var received: std.atomic.Value(i32) = .init(0);
+        fn cb(event: Event) void {
+            _ = @This().received.fetchAdd(event.value, .monotonic);
+        }
+    };
+
+    var pool = try WorkerPool.init(allocator, std.testing.io, "bus", 2, 8);
+    defer pool.deinit();
+
+    var bus = TypedEventBus(Event).init(allocator);
+    defer bus.deinit();
+
+    try bus.subscribeAsync(&pool, Ctx.cb);
+    bus.publish(.{ .value = 7 });
+    bus.publish(.{ .value = 3 });
+
+    while (Ctx.received.load(.monotonic) != 10) {
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(i32, 10), Ctx.received.load(.monotonic));
 }
