@@ -390,3 +390,47 @@ test "TypedEventBus async subscriber" {
     }
     try std.testing.expectEqual(@as(i32, 10), Ctx.received.load(.monotonic));
 }
+
+const ModuleRuntime = @import("ModuleRuntime.zig").ModuleRuntime;
+
+test "TypedEventBus async subscribers on separate ModuleRuntime worker pools" {
+    const allocator = std.testing.allocator;
+    const Event = struct { order_id: u32 };
+
+    const Ctx = struct {
+        var inventory_count: std.atomic.Value(u32) = .init(0);
+        var payment_count: std.atomic.Value(u32) = .init(0);
+
+        fn onInventory(event: Event) void {
+            _ = event;
+            _ = inventory_count.fetchAdd(1, .monotonic);
+        }
+
+        fn onPayment(event: Event) void {
+            _ = event;
+            _ = payment_count.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var inventory_rt = try ModuleRuntime.init(allocator, std.testing.io, "inventory", .{ .worker_count = 2 });
+    defer inventory_rt.deinit();
+
+    var payment_rt = try ModuleRuntime.init(allocator, std.testing.io, "payment", .{ .worker_count = 2 });
+    defer payment_rt.deinit();
+
+    var bus = TypedEventBus(Event).init(allocator);
+    defer bus.deinit();
+
+    try bus.subscribeAsync(&inventory_rt.worker_pool.?, Ctx.onInventory);
+    try bus.subscribeAsync(&payment_rt.worker_pool.?, Ctx.onPayment);
+
+    bus.publish(.{ .order_id = 1 });
+    bus.publish(.{ .order_id = 2 });
+
+    while (Ctx.inventory_count.load(.monotonic) < 2 or Ctx.payment_count.load(.monotonic) < 2) {
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+
+    try std.testing.expectEqual(@as(u32, 2), Ctx.inventory_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 2), Ctx.payment_count.load(.monotonic));
+}
