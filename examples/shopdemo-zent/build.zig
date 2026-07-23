@@ -20,6 +20,13 @@ pub fn build(b: *std.Build) void {
     // Optional drivers used by zigmodu sqlx — keep build green even if unused here.
     linkOptionalDb(zigmodu_mod, b);
 
+    const helper_mod = b.createModule(.{
+        .root_source_file = b.path("../_shared/zent_helpers.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    helper_mod.addImport("zent", zent_mod);
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -27,6 +34,7 @@ pub fn build(b: *std.Build) void {
     });
     exe_mod.addImport("zigmodu", zigmodu_mod);
     exe_mod.addImport("zent", zent_mod);
+    exe_mod.addImport("zent_helpers", helper_mod);
 
     const exe = b.addExecutable(.{
         .name = "shopdemo-zent",

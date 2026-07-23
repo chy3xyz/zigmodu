@@ -1,6 +1,7 @@
 const std = @import("std");
 const zigmodu = @import("zigmodu");
 const zent = @import("zent");
+const zent_helpers = @import("zent_helpers");
 
 const catalog_module = @import("modules/catalog/module.zig");
 const catalog = @import("modules/catalog/root.zig");
@@ -21,12 +22,11 @@ pub fn main(init: std.process.Init) !void {
 
     // --- zent: open SQLite + migrate schema-as-code ---
     const sqlite_path = init.environ_map.get("ZENT_SQLITE") orelse ":memory:";
-    var drv = try zent.sql_sqlite.SQLiteDriver.open(allocator, sqlite_path);
-    defer drv.close();
-    try zent.sql_schema.migrateSchema(allocator, drv.asDriver(), catalog.persistence.infos);
+    var env = try zent_helpers.StoreEnv(zent.sql_sqlite.SQLiteDriver, catalog.persistence.infos).open(allocator, sqlite_path);
+    defer env.deinit();
     std.log.info("[zent] migrated schema at {s}", .{sqlite_path});
 
-    var store = catalog.persistence.CatalogStore.init(allocator, drv.asDriver());
+    var store = catalog.persistence.CatalogStore.init(allocator, env.client);
     var catalog_svc = catalog.service.CatalogService.init(&store);
     var catalog_api = catalog.api.CatalogApi(@TypeOf(catalog_svc)).init(&catalog_svc);
 

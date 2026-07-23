@@ -12,10 +12,10 @@ pub const CatalogStore = struct {
     allocator: std.mem.Allocator,
     client: Client,
 
-    pub fn init(allocator: std.mem.Allocator, driver: zent.sql_driver.Driver) CatalogStore {
+    pub fn init(allocator: std.mem.Allocator, client: Client) CatalogStore {
         return .{
             .allocator = allocator,
-            .client = zent.codegen.client.makeClient(infos, allocator, driver),
+            .client = client,
         };
     }
 

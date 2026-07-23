@@ -18,10 +18,10 @@ pub const OrderStore = struct {
     allocator: std.mem.Allocator,
     client: Client,
 
-    pub fn init(allocator: std.mem.Allocator, driver: zent.sql_driver.Driver) OrderStore {
+    pub fn init(allocator: std.mem.Allocator, client: Client) OrderStore {
         return .{
             .allocator = allocator,
-            .client = zent.codegen.client.makeClient(infos, allocator, driver),
+            .client = client,
         };
     }
 

@@ -1,6 +1,7 @@
 const std = @import("std");
 const zigmodu = @import("zigmodu");
 const zent = @import("zent");
+const zent_helpers = @import("zent_helpers");
 
 const order_module = @import("modules/order/module.zig");
 const order = @import("modules/order/root.zig");
@@ -23,12 +24,11 @@ pub fn main(init: std.process.Init) !void {
 
     // --- zent: open SQLite + migrate schema-as-code ---
     const sqlite_path = init.environ_map.get("SHOPDEMO_ZENT_SQLITE") orelse ":memory:";
-    var drv = try zent.sql_sqlite.SQLiteDriver.open(allocator, sqlite_path);
-    defer drv.close();
-    try zent.sql_schema.migrateSchema(allocator, drv.asDriver(), order.persistence.infos);
+    var env = try zent_helpers.StoreEnv(zent.sql_sqlite.SQLiteDriver, order.persistence.infos).open(allocator, sqlite_path);
+    defer env.deinit();
     std.log.info("[zent] migrated order schema at {s}", .{sqlite_path});
 
-    var store = order.persistence.OrderStore.init(allocator, drv.asDriver());
+    var store = order.persistence.OrderStore.init(allocator, env.client);
     var order_svc = order.service.OrderService.init(&store);
     var order_api = order.api.OrderApi(@TypeOf(order_svc)).init(&order_svc);
 
