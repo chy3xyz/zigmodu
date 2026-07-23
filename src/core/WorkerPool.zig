@@ -38,6 +38,47 @@ pub const WorkerPool = struct {
         completed_tasks: u64,
         rejected_tasks: u64,
         utilization_pct: f32,
+
+        /// Render as Prometheus text format with the given `pool` label.
+        /// Caller owns the returned slice and must `allocator.free(it)`.
+        pub fn toPrometheusFormat(
+            self: WorkerPoolStats,
+            allocator: std.mem.Allocator,
+            pool_name: []const u8,
+        ) ![]u8 {
+            var buf = std.array_list.Managed(u8).init(allocator);
+            errdefer buf.deinit();
+
+            try buf.print("# HELP zigmodu_workerpool_pending_tasks Tasks waiting in the worker pool queue.\n", .{});
+            try buf.print("# TYPE zigmodu_workerpool_pending_tasks gauge\n", .{});
+            try buf.print("zigmodu_workerpool_pending_tasks{{pool=\"{s}\"}} {d}\n\n", .{ pool_name, self.pending_count });
+
+            try buf.print("# HELP zigmodu_workerpool_max_pending Maximum queue capacity.\n", .{});
+            try buf.print("# TYPE zigmodu_workerpool_max_pending gauge\n", .{});
+            try buf.print("zigmodu_workerpool_max_pending{{pool=\"{s}\"}} {d}\n\n", .{ pool_name, self.max_pending });
+
+            try buf.print("# HELP zigmodu_workerpool_active_workers Workers currently executing a task.\n", .{});
+            try buf.print("# TYPE zigmodu_workerpool_active_workers gauge\n", .{});
+            try buf.print("zigmodu_workerpool_active_workers{{pool=\"{s}\"}} {d}\n\n", .{ pool_name, self.active_workers });
+
+            try buf.print("# HELP zigmodu_workerpool_total_workers Configured worker thread count.\n", .{});
+            try buf.print("# TYPE zigmodu_workerpool_total_workers gauge\n", .{});
+            try buf.print("zigmodu_workerpool_total_workers{{pool=\"{s}\"}} {d}\n\n", .{ pool_name, self.total_workers });
+
+            try buf.print("# HELP zigmodu_workerpool_completed_tasks_total Tasks that ran to completion.\n", .{});
+            try buf.print("# TYPE zigmodu_workerpool_completed_tasks_total counter\n", .{});
+            try buf.print("zigmodu_workerpool_completed_tasks_total{{pool=\"{s}\"}} {d}\n\n", .{ pool_name, self.completed_tasks });
+
+            try buf.print("# HELP zigmodu_workerpool_rejected_tasks_total Tasks rejected because queue was full or pool was shutting down.\n", .{});
+            try buf.print("# TYPE zigmodu_workerpool_rejected_tasks_total counter\n", .{});
+            try buf.print("zigmodu_workerpool_rejected_tasks_total{{pool=\"{s}\"}} {d}\n\n", .{ pool_name, self.rejected_tasks });
+
+            try buf.print("# HELP zigmodu_workerpool_utilization Fraction of workers currently active (0.0 to 1.0).\n", .{});
+            try buf.print("# TYPE zigmodu_workerpool_utilization gauge\n", .{});
+            try buf.print("zigmodu_workerpool_utilization{{pool=\"{s}\"}} {d:.3}\n", .{ pool_name, self.utilization_pct });
+
+            return buf.toOwnedSlice() catch unreachable;
+        }
     };
 
     allocator: std.mem.Allocator,
@@ -330,6 +371,28 @@ test "WorkerPool stats and isOverloaded backpressure" {
 
     ctx.flag.store(true, .release);
     pool.deinit();
+}
+
+test "WorkerPool stats toPrometheusFormat includes expected labels" {
+    const allocator = std.testing.allocator;
+    const st: WorkerPool.WorkerPoolStats = .{
+        .pending_count = 3,
+        .max_pending = 16,
+        .active_workers = 2,
+        .total_workers = 4,
+        .completed_tasks = 42,
+        .rejected_tasks = 1,
+        .utilization_pct = 0.500,
+    };
+
+    const out = try st.toPrometheusFormat(allocator, "demo");
+    defer allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "zigmodu_workerpool_pending_tasks{pool=\"demo\"} 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "zigmodu_workerpool_total_workers{pool=\"demo\"} 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "zigmodu_workerpool_completed_tasks_total{pool=\"demo\"} 42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "zigmodu_workerpool_rejected_tasks_total{pool=\"demo\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "zigmodu_workerpool_utilization{pool=\"demo\"} 0.500") != null);
 }
 
 

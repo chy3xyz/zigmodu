@@ -179,12 +179,16 @@ pub fn TypedEventBus(comptime T: type) type {
         allocator: std.mem.Allocator,
         listeners: ListenerSet(CallbackType),
         async_subscribers: std.ArrayList(AsyncSubscriber),
+        published_total: std.atomic.Value(u64),
+        dropped_async_total: std.atomic.Value(u64),
 
         pub fn init(alloc: std.mem.Allocator) Self {
             return .{
                 .allocator = alloc,
                 .listeners = ListenerSet(CallbackType).init(alloc),
                 .async_subscribers = std.ArrayList(AsyncSubscriber).empty,
+                .published_total = std.atomic.Value(u64).init(0),
+                .dropped_async_total = std.atomic.Value(u64).init(0),
             };
         }
 
@@ -201,6 +205,7 @@ pub fn TypedEventBus(comptime T: type) type {
         }
 
         pub fn publish(self: *Self, event: T) void {
+            _ = self.published_total.fetchAdd(1, .monotonic);
             var iter = self.listeners.iterator();
             while (iter.next()) |callback| {
                 callback.*(event);
@@ -208,6 +213,7 @@ pub fn TypedEventBus(comptime T: type) type {
 
             for (self.async_subscribers.items, 0..) |async_sub, index| {
                 const delivery = self.allocator.create(AsyncDelivery) catch |err| {
+                    _ = self.dropped_async_total.fetchAdd(1, .monotonic);
                     log.warn("dropped async event for subscriber {d} (pool '{s}'): failed to allocate delivery for event type {s}: {s}", .{
                         index, async_sub.pool.name, @typeName(T), @errorName(err),
                     });
@@ -223,6 +229,7 @@ pub fn TypedEventBus(comptime T: type) type {
                     .ctx = delivery,
                 });
                 if (!dispatched) {
+                    _ = self.dropped_async_total.fetchAdd(1, .monotonic);
                     log.warn("dropped async event for subscriber {d} (pool '{s}'): dispatch rejected for event type {s}", .{
                         index, async_sub.pool.name, @typeName(T),
                     });
@@ -233,6 +240,16 @@ pub fn TypedEventBus(comptime T: type) type {
 
         pub fn subscriberCount(self: *Self) usize {
             return self.listeners.count();
+        }
+
+        /// Total number of times `publish` was called.
+        pub fn publishedCount(self: *Self) u64 {
+            return self.published_total.load(.monotonic);
+        }
+
+        /// Total number of async events dropped because allocation or dispatch failed.
+        pub fn droppedAsyncCount(self: *Self) u64 {
+            return self.dropped_async_total.load(.monotonic);
         }
 
         pub fn deinit(self: *Self) void {
@@ -432,6 +449,33 @@ test "TypedEventBus async drop is observed and consistent" {
     // even though the event was dropped by the saturated pool.
     try std.testing.expectEqual(@as(usize, 1), bus.async_subscribers.items.len);
     try std.testing.expectEqual(@as(i32, 0), Ctx.received.load(.monotonic));
+}
+
+test "TypedEventBus publishedCount and droppedAsyncCount track publish and drops" {
+    const allocator = std.testing.allocator;
+    const Event = struct { value: i32 };
+
+    var bus = TypedEventBus(Event).init(allocator);
+    defer bus.deinit();
+
+    // A pool that rejects every dispatch (zero queue capacity) forces the
+    // "dispatch rejected" drop path.
+    var pool = try WorkerPool.init(allocator, std.testing.io, "metrics-drop", 1, 0);
+    defer pool.deinit();
+
+    try bus.subscribeAsync(&pool, struct {
+        fn cb(_: Event) void {}
+    }.cb);
+
+    try std.testing.expectEqual(@as(u64, 0), bus.publishedCount());
+    try std.testing.expectEqual(@as(u64, 0), bus.droppedAsyncCount());
+
+    bus.publish(.{ .value = 1 });
+    bus.publish(.{ .value = 2 });
+    bus.publish(.{ .value = 3 });
+
+    try std.testing.expectEqual(@as(u64, 3), bus.publishedCount());
+    try std.testing.expectEqual(@as(u64, 3), bus.droppedAsyncCount());
 }
 
 const ModuleRuntime = @import("ModuleRuntime.zig").ModuleRuntime;
