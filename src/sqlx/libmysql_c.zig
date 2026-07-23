@@ -139,6 +139,7 @@ pub extern "c" fn mysql_stmt_bind_result(stmt: ?*MYSQL_STMT, bnd: [*]MYSQL_BIND)
 pub extern "c" fn mysql_stmt_execute(stmt: ?*MYSQL_STMT) c_int;
 pub extern "c" fn mysql_stmt_store_result(stmt: ?*MYSQL_STMT) c_int;
 pub extern "c" fn mysql_stmt_fetch(stmt: ?*MYSQL_STMT) c_int;
+pub extern "c" fn mysql_stmt_fetch_column(stmt: ?*MYSQL_STMT, bind: [*c]MYSQL_BIND, column: c_uint, offset: c_ulong) c_int;
 pub extern "c" fn mysql_stmt_free_result(stmt: ?*MYSQL_STMT) my_bool;
 pub extern "c" fn mysql_stmt_close(stmt: ?*MYSQL_STMT) my_bool;
 pub extern "c" fn mysql_stmt_reset(stmt: ?*MYSQL_STMT) my_bool;
