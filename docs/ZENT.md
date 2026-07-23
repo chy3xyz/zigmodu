@@ -18,6 +18,10 @@
 4. [能力价值与业务场景](#4-能力价值与业务场景)
 5. [分层映射（对齐 MODULE_LAYERS）](#5-分层映射对齐-module_layers)
 6. [启动流水线](#6-启动流水线)
+   - [6.1 Testing](#61-testing)
+   - [6.2 Production: ConnPool](#62-production-connpool)
+   - [6.3 Observability](#63-observability)
+   - [6.4 Transactions](#64-transactions)
 7. [Schema / Edge 写法](#7-schema--edge-写法)
 8. [Persistence 契约](#8-persistence-契约)
 9. [Privacy 与 Hooks](#9-privacy-与-hooks)
@@ -30,6 +34,10 @@
 ---
 
 ## 1. 定位：正交，不要混栈
+
+> **Shared helper**：示例级生命周期和测试工具位于
+> [`examples/_shared/zent_helpers.zig`](../examples/_shared/zent_helpers.zig)。它只封装
+> `open → migrate → makeClient → deinit`，不属于 ZigModu core，也不改变 zent 与 `data.sqlx` 的正交边界。
 
 | 层 | 用 ZigModu | 用 zent |
 |----|------------|---------|
@@ -191,6 +199,86 @@ var client = zent.codegen.client.makeClient(graph.types, alloc, drv.asDriver());
 2. **Migrate**：默认保守；`drop_columns` / `allow_data_loss` 必须显式 `MigrateOptions`。
 3. **单连接 `:memory:`**：勿多连接拆库（与 sqlx 相同）。
 4. **启动顺序**：`open/pool → migrateSchema → makeClient → 注入 persistence → start modules → listen`。
+
+### 6.1 Testing
+
+示例级测试可以使用共享的 `TestEnv` 工厂。它为每个测试创建单连接内存 SQLite，避免测试之间共享状态；需要在同一测试中复用环境时，调用 `reset()` 删除所有 schema 表并重新迁移：
+
+```zig
+const Env = zent_helpers.TestEnv(infos);
+var env = try Env.init(std.testing.allocator);
+defer env.deinit();
+
+// Arrange / Act / Assert …
+try env.reset(); // 下一组断言从全新 schema 开始
+```
+
+`TestEnv` 是 `examples/_shared/zent_helpers.zig` 中的示例工具，不会把 zent 引入 ZigModu core。
+
+### 6.2 Production: ConnPool
+
+生产环境将连接池作为 zent driver 交给生成 Client；不要把池里的单个连接泄漏给模块。池会按 `min_connections` 预热，并通过 `asDriver()` 保持 Client 接口不变：
+
+```zig
+const SQLiteDriver = zent.sql_sqlite.SQLiteDriver;
+const Pool = zent.sql_pool.ConnPool(SQLiteDriver);
+var pool = try Pool.init(allocator, .{
+    .io = io,
+    .min_connections = 2,
+    .max_connections = 8,
+    .connect = struct {
+        fn open(a: std.mem.Allocator) !SQLiteDriver {
+            return SQLiteDriver.open(a, "app.db");
+        }
+    }.open,
+});
+defer pool.deinit();
+try zent.sql_schema.migrateSchema(allocator, pool.asDriver(), infos);
+var client = zent.codegen.client.makeClient(infos, allocator, pool.asDriver());
+```
+
+使用 pool 时，`:memory:` 只适合单连接测试；生产使用文件或服务器数据库。关闭池前必须确保没有并发 borrow / query 正在进行。
+
+### 6.3 Observability
+
+zent 的 `sql_logger.Logger` 回调没有额外 context 参数，因此最简单且无状态的适配器是转发到 ZigModu 的 `std.log` 后端（生产应用也可以在回调中转发到自己的 `StructuredLogger` 实例）：
+
+```zig
+fn onQuery(c: zent.sql_logger.LogContext) void {
+    std.log.debug("zent query [{s}] {s} ({d}us, {d} rows)", .{ c.table_name, c.sql, c.duration_us, c.rows_affected });
+}
+fn onExec(c: zent.sql_logger.LogContext) void {
+    std.log.debug("zent exec [{s}] {s} ({d}us, {d} rows)", .{ c.table_name, c.sql, c.duration_us, c.rows_affected });
+}
+fn onError(c: zent.sql_logger.LogContext) void {
+    std.log.err("zent SQL error [{s}] {s}: {any}", .{ c.table_name, c.sql, c.@"error" });
+}
+const logger = zent.sql_logger.Logger{ .onQuery = onQuery, .onExec = onExec, .onError = onError };
+zent.codegen.client.SetLogger(infos, &client, logger);
+```
+
+日志回调只应记录 SQL 元数据；不要输出密码、token 或敏感字段值。需要 trace 关联时，在 `LogContext.trace_id` 中传递应用层 trace id。
+
+### 6.4 Transactions
+
+跨实体写入使用同一个 `TxClient`。需要在一个大事务中局部回滚时，可通过底层 `Tx` 执行 SQL savepoint；最终仍然只 commit/rollback 一次并 `deinit` 一次：
+
+```zig
+var tx = try zent.codegen.client.beginTx(infos, client);
+defer tx.deinit();
+
+_ = try tx.tx.exec("SAVEPOINT order_item", &.{});
+// tx.client.order.Create() / tx.client.order_item.Create() …
+if (optional_item_error) {
+    _ = try tx.tx.exec("ROLLBACK TO SAVEPOINT order_item", &.{});
+    _ = try tx.tx.exec("RELEASE SAVEPOINT order_item", &.{});
+} else {
+    _ = try tx.tx.exec("RELEASE SAVEPOINT order_item", &.{});
+}
+try tx.commit();
+```
+
+出现不可恢复错误时调用 `tx.rollback()`（不要再调用 `commit()`）；savepoint 只提供局部回滚，不替代最外层事务的最终提交或回滚。
 
 ---
 
