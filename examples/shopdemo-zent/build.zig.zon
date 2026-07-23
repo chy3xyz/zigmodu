@@ -1,0 +1,16 @@
+.{
+    .name = .shopdemo_zent,
+    .version = "0.1.0",
+    .fingerprint = 0xc5fda7a0adafdfc4,
+    .minimum_zig_version = "0.17.0",
+    // Local sibling checkout: ../../../../zent relative to this file → zig_ws/zent
+    // CI / consumers: replace with git+https://github.com/chy3xyz/zent#v0.12.0
+    .dependencies = .{
+        .zent = .{ .path = "../../../zent" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
