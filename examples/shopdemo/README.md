@@ -1,26 +1,53 @@
-# ShopDemo — 152-table Modulith E-Commerce (codegen reference)
+# ShopDemo — Minimal Runnable ZigModu Example
 
-> **能力边界**：本目录提供 **SQL schema**（`schema.sql`）与 **单模块生成样例**（`generated-sample/`）。  
-> 不是开箱即用的完整应用；完整 42 模块工程需用 [zmodu CLI](https://github.com/chy3xyz/zmodu) 自行 scaffold。  
-> **可运行旗舰示例**请见 [`../tenant-mgmt/`](../tenant-mgmt/)（多租户 SaaS，CI 集成探活）。
+> **Scope**: This directory is now a **minimal runnable app** that uses only the single `order` module extracted from `generated-sample/`.  
+> The full 152-table e-commerce schema remains in `schema.sql`; generating all 30+ modules requires the [zmodu CLI](https://github.com/chy3xyz/zigmodu).
 
-Full-featured e-commerce schema demonstrating ZigModu's modulith architecture.
-Auto-partitioned into 30 modules by table prefix.
+## Quick Start
 
-## Generate
+```bash
+cd examples/shopdemo
+zig build run
+```
+
+The server listens on `0.0.0.0:8080` by default (override with `HTTP_PORT=...`).
+
+### Smoke test
+
+```bash
+curl -s http://127.0.0.1:8080/api/v1/orders
+# {"items":[],"page":0,"size":10,"total":0,"total_page":0}
+
+curl -s http://127.0.0.1:8080/health/live
+# {"status":"UP"}
+```
+
+## What is included
+
+| Path | Purpose |
+|------|---------|
+| `build.zig` / `build.zig.zon` | Build manifest copied and adapted from `examples/tenant-mgmt` |
+| `src/main.zig` | Entry point: SQLite client, schema application, module lifecycle, HTTP server |
+| `src/db/backend.zig` | Shared `*data.Client` backend alias |
+| `src/db/schema.zig` | SQLite DDL for the single `zmodu_order` table |
+| `src/modules/order/` | The `order` module migrated from `generated-sample/` |
+
+## Generating the full project
+
+The original `schema.sql` contains 152 tables across ~30 modules. To scaffold the complete project:
 
 ```bash
 # Install zmodu CLI
 npm install -g @chy3xyz/zmodu
 
-# Generate 30 modules from SQL schema
+# Generate all modules from SQL schema
 zmodu orm --sql schema.sql --out src/modules --enable-events --force
 
 # Full project scaffold (build.zig, main.zig, etc.)
 zmodu scaffold --sql schema.sql --name shopdemo --force
 ```
 
-## Module Map
+## Module Map (full schema)
 
 | Module | Tables | Domain |
 |--------|:------:|--------|
@@ -42,29 +69,11 @@ zmodu scaffold --sql schema.sql --name shopdemo --force
 ## Architecture
 
 ```
-src/modules/
-├── order/
-│   ├── model.zig          # Order, OrderLine, OrderPayment structs
-│   ├── persistence.zig    # data.orm.Orm(data.SqlxBackend) repositories
-│   ├── service.zig        # CRUD + event hooks
-│   ├── api.zig            # http.Context REST endpoints
-│   ├── events.zig         # TypedEventBus (--enable-events)
-│   ├── module.zig         # Lifecycle + health check
-│   └── root.zig           # Barrel re-exports
-├── user/
-├── product/
-└── ...
-```
-
-## Cross-Module Events
-
-With `--enable-events`, each module publishes domain events:
-
-```zig
-// order/events.zig
-pub const OrderCreated = struct { order_id: i64, timestamp_ms: i64 };
-pub const OrderEvent = union(enum) { OrderCreated: OrderCreated, ... };
-
-// product module subscribes
-order.events.bus.subscribe(.OrderCreated, product.onOrderCreated);
+src/modules/order/
+├── model.zig          # Order, OrderAddress, OrderProduct, ... structs
+├── persistence.zig    # data.Repository(T) repositories
+├── service.zig        # CRUD delegation + event hooks
+├── api.zig            # HTTP handlers under /api/v1/orders
+├── module.zig         # Module lifecycle contract
+└── root.zig           # Barrel re-exports
 ```
