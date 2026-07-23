@@ -1,11 +1,8 @@
 //! Dead Letter Queue (DLQ) for failed message handling
 //!
-//!
-//! ⚠️ WORK IN PROGRESS — not yet wired into DistributedEventBus.
-//! Tests are implemented but disabled pending integration.
-//!
-//! When message delivery fails after max retries, the message is moved to DLQ
-//! where it can be inspected, manually reprocessed, or automatically retried.
+//! Used by `DistributedEventBus` to store messages that failed delivery
+//! (e.g., after crossing `max_send_failures`) so they can be inspected,
+//! manually reprocessed, or automatically retried.
 //!
 //! Features:
 //! - In-memory and SQLite storage backends
@@ -188,7 +185,7 @@ pub const DLQ = struct {
     ///
     /// Returns the number of messages requeued.
     /// Only messages that have passed their cooldown period are requeued.
-    pub fn requeue(self: *Self, callback: *const fn (RequeuedMessage) void) !usize {
+    pub fn requeue(self: *Self, ctx: *anyopaque, callback: *const fn (*anyopaque, RequeuedMessage) void) !usize {
         const now = Time.monotonicNowSeconds();
         var requeued: usize = 0;
 
@@ -223,8 +220,8 @@ pub const DLQ = struct {
                     entry.last_failed_at = now;
                     entry.retry_count += 1;
 
-                    // Call callback
-                    callback(requeued_msg);
+                    // Call callback with caller-provided context
+                    callback(ctx, requeued_msg);
                     requeued += 1;
                     i += 1;
                 }
@@ -415,9 +412,9 @@ test "DLQ requeue respects cooldown" {
 
     // Requeue immediately should return 0 due to cooldown
     const noopCallback = struct {
-        fn cb(_: RequeuedMessage) void {}
+        fn cb(_: *anyopaque, _: RequeuedMessage) void {}
     }.cb;
-    const count = try dlq.requeue(&noopCallback);
+    const count = try dlq.requeue(@ptrFromInt(0x8), &noopCallback);
     try std.testing.expectEqual(@as(usize, 0), count);
 }
 

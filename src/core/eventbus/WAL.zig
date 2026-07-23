@@ -164,6 +164,7 @@ pub const WAL = struct {
                 const payload = try self.allocator.dupe(u8, content[offset + @sizeOf(WALEntryHeader) + header.topic_len..][0..header.payload_len]);
                 errdefer self.allocator.free(payload);
                 const source = try self.allocator.dupe(u8, content[offset + @sizeOf(WALEntryHeader) + header.topic_len + header.payload_len..][0..header.source_len]);
+                errdefer self.allocator.free(source);
                 try result.append(self.allocator, .{
                     .index = header.seq,
                     .timestamp_ms = header.timestamp_ms,
