@@ -2491,13 +2491,16 @@ fn mysqlBindParams(stmt: *libmysql_c.MYSQL_STMT, arena: std.mem.Allocator, args:
     }
 }
 
-/// Fetch a single oversized string column after `mysql_stmt_fetch` returned
-/// `MYSQL_DATA_TRUNCATED`. The returned slice is allocated in `arena_alloc`.
-fn mysqlFetchStringColumn(arena_alloc: std.mem.Allocator, stmt: *libmysql_c.MYSQL_STMT, col: usize, actual_len: usize) errors.ResultT([]u8) {
+/// Fetch a single oversized/binary column after `mysql_stmt_fetch` returned
+/// `MYSQL_DATA_TRUNCATED`. `field_type` is the original bound type (or field type)
+/// so binary BLOB columns are refetched without string coercion.
+/// The returned slice is allocated in `arena_alloc`.
+fn mysqlFetchStringColumn(arena_alloc: std.mem.Allocator, stmt: *libmysql_c.MYSQL_STMT, col: usize, actual_len: usize, field_type: c_int) errors.ResultT([]u8) {
     const temp = arena_alloc.alloc(u8, actual_len) catch return error.DatabaseError;
     var fetch_len: c_ulong = 0;
+    const buffer_type: c_int = if (field_type == 0) libmysql_c.MYSQL_TYPE_STRING else field_type;
     var fetch_bind: libmysql_c.MYSQL_BIND = .{
-        .buffer_type = libmysql_c.MYSQL_TYPE_STRING,
+        .buffer_type = buffer_type,
         .buffer = @ptrCast(temp.ptr),
         .buffer_length = @intCast(actual_len),
         .length = &fetch_len,
@@ -2508,6 +2511,18 @@ fn mysqlFetchStringColumn(arena_alloc: std.mem.Allocator, stmt: *libmysql_c.MYSQ
     const returned_len: usize = @intCast(fetch_len);
     if (returned_len > actual_len) return error.DatabaseError;
     return temp[0..returned_len];
+}
+
+/// Return a `Value.string` for a column, refetching oversized values on truncation.
+fn mysqlFetchStringValue(arena_alloc: std.mem.Allocator, stmt: *libmysql_c.MYSQL_STMT, col: usize, len: usize, rc: c_int, buf: []const u8, field_type: c_int) errors.ResultT(Value) {
+    if (len > buf.len) {
+        if (rc == libmysql_c.MYSQL_DATA_TRUNCATED) {
+            const full = try mysqlFetchStringColumn(arena_alloc, stmt, col, len, field_type);
+            return Value{ .string = full };
+        }
+        return error.DatabaseError;
+    }
+    return Value{ .string = arena_alloc.dupe(u8, buf[0..len]) catch return error.DatabaseError };
 }
 
 /// Validate a MySQL DECIMAL/NEWDECIMAL string. Returns the input unchanged on success.
@@ -2526,18 +2541,40 @@ fn mysqlParseDecimal(s: []const u8) errors.Error![]const u8 {
     return s;
 }
 
+fn isValidFractionalSeconds(s: []const u8, prefix_len: usize) bool {
+    if (s.len == prefix_len) return true;
+    if (s.len < prefix_len + 2) return false;
+    if (s[prefix_len] != '.') return false;
+    const frac = s[prefix_len + 1 ..];
+    if (frac.len == 0 or frac.len > 6) return false;
+    for (frac) |ch| if (ch < '0' or ch > '9') return false;
+    return true;
+}
+
 /// Validate a MySQL DATETIME/TIMESTAMP/DATE/TIME string. Returns the input unchanged on success.
 fn mysqlParseDateTime(s: []const u8) errors.Error![]const u8 {
     if (s.len < 8) return error.InvalidFormat;
+
+    // DATETIME / TIMESTAMP
     if (std.mem.indexOfScalar(u8, s, ' ') != null) {
         if (s.len < 19) return error.InvalidFormat;
         if (s[4] != '-' or s[7] != '-' or s[10] != ' ' or s[13] != ':' or s[16] != ':') return error.InvalidFormat;
-    } else if (std.mem.indexOfScalar(u8, s, '-') != null) {
-        if (s.len < 10) return error.InvalidFormat;
-        if (s[4] != '-' or s[7] != '-') return error.InvalidFormat;
-    } else {
-        if (s[2] != ':' or s[5] != ':') return error.InvalidFormat;
+        if (!isValidFractionalSeconds(s, 19)) return error.InvalidFormat;
+        return s;
     }
+
+    // DATE
+    if (s.len >= 10 and s[4] == '-' and s[7] == '-') {
+        if (!isValidFractionalSeconds(s, 10)) return error.InvalidFormat;
+        return s;
+    }
+
+    // TIME (optional leading '-')
+    const time_start: usize = if (s[0] == '-') 1 else 0;
+    const prefix_len = time_start + 8;
+    if (s.len < prefix_len) return error.InvalidFormat;
+    if (s[time_start + 2] != ':' or s[time_start + 5] != ':') return error.InvalidFormat;
+    if (!isValidFractionalSeconds(s, prefix_len)) return error.InvalidFormat;
     return s;
 }
 
@@ -2545,21 +2582,11 @@ fn mysqlParseDateTime(s: []const u8) errors.Error![]const u8 {
 fn mysqlParseJson(s: []const u8) errors.Error![]const u8 {
     const trimmed = std.mem.trim(u8, s, " \t\r\n");
     if (trimmed.len == 0) return error.InvalidFormat;
-    if ((trimmed[0] == '{' and trimmed[trimmed.len - 1] == '}') or
-        (trimmed[0] == '[' and trimmed[trimmed.len - 1] == ']'))
-    {
-        return s;
-    }
-    if (std.mem.eql(u8, trimmed, "null") or
-        std.mem.eql(u8, trimmed, "true") or
-        std.mem.eql(u8, trimmed, "false"))
-    {
-        return s;
-    }
-    for (trimmed) |ch| {
-        if (ch == '-' or ch == '+' or ch == '.' or ch == 'e' or ch == 'E' or (ch >= '0' and ch <= '9')) continue;
-        return error.InvalidFormat;
-    }
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), trimmed, .{}) catch return error.InvalidFormat;
+    parsed.deinit();
     return s;
 }
 
@@ -2741,19 +2768,8 @@ fn mysqlStmtReadRows(stmt: *libmysql_c.MYSQL_STMT, arena: std.heap.ArenaAllocato
                     libmysql_c.MYSQL_TYPE_TINY_BLOB,
                     libmysql_c.MYSQL_TYPE_MEDIUM_BLOB,
                     libmysql_c.MYSQL_TYPE_LONG_BLOB,
-                    => blk: {
-                        const len: usize = @intCast(lengths[c]);
-                        const buf = bind_bufs[c].string.buf;
-                        if (len > buf.len) {
-                            if (rc == libmysql_c.MYSQL_DATA_TRUNCATED) {
-                                const full = mysqlFetchStringColumn(arena_alloc, stmt, c, len) catch return error.DatabaseError;
-                                break :blk Value{ .string = full };
-                            }
-                            return error.DatabaseError;
-                        }
-                        break :blk Value{ .string = arena_alloc.dupe(u8, buf[0..len]) catch return error.DatabaseError };
-                    },
-                    // Explicit handling for NEWDECIMAL, DECIMAL, JSON, DATETIME, TIMESTAMP, DATE, TIME, ENUM, SET & STRING fallback
+                    => try mysqlFetchStringValue(arena_alloc, stmt, c, @intCast(lengths[c]), rc, bind_bufs[c].string.buf[0..], binds[c].buffer_type),
+                    // DECIMAL, JSON, temporal, ENUM/SET, and explicit STRING fallback
                     libmysql_c.MYSQL_TYPE_NEWDECIMAL,
                     libmysql_c.MYSQL_TYPE_DECIMAL,
                     libmysql_c.MYSQL_TYPE_JSON,
@@ -2764,31 +2780,9 @@ fn mysqlStmtReadRows(stmt: *libmysql_c.MYSQL_STMT, arena: std.heap.ArenaAllocato
                     libmysql_c.MYSQL_TYPE_ENUM,
                     libmysql_c.MYSQL_TYPE_SET,
                     libmysql_c.MYSQL_TYPE_STRING,
-                    => blk: {
-                        const len: usize = @intCast(lengths[c]);
-                        const buf = bind_bufs[c].string.buf;
-                        if (len > buf.len) {
-                            if (rc == libmysql_c.MYSQL_DATA_TRUNCATED) {
-                                const full = mysqlFetchStringColumn(arena_alloc, stmt, c, len) catch return error.DatabaseError;
-                                break :blk Value{ .string = full };
-                            }
-                            return error.DatabaseError;
-                        }
-                        break :blk Value{ .string = arena_alloc.dupe(u8, buf[0..len]) catch return error.DatabaseError };
-                    },
+                    => try mysqlFetchStringValue(arena_alloc, stmt, c, @intCast(lengths[c]), rc, bind_bufs[c].string.buf[0..], binds[c].buffer_type),
                     // Remaining string-like fallback
-                    else => blk: {
-                        const len: usize = @intCast(lengths[c]);
-                        const buf = bind_bufs[c].string.buf;
-                        if (len > buf.len) {
-                            if (rc == libmysql_c.MYSQL_DATA_TRUNCATED) {
-                                const full = mysqlFetchStringColumn(arena_alloc, stmt, c, len) catch return error.DatabaseError;
-                                break :blk Value{ .string = full };
-                            }
-                            return error.DatabaseError;
-                        }
-                        break :blk Value{ .string = arena_alloc.dupe(u8, buf[0..len]) catch return error.DatabaseError };
-                    },
+                    else => try mysqlFetchStringValue(arena_alloc, stmt, c, @intCast(lengths[c]), rc, bind_bufs[c].string.buf[0..], binds[c].buffer_type),
 
                 };
             }
@@ -5997,12 +5991,20 @@ test "mysqlParseDateTime accepts valid MySQL temporal strings" {
     try std.testing.expectEqualStrings("2024-03-15 14:30:00.123456", try mysqlParseDateTime("2024-03-15 14:30:00.123456"));
     try std.testing.expectEqualStrings("2024-03-15", try mysqlParseDateTime("2024-03-15"));
     try std.testing.expectEqualStrings("14:30:00", try mysqlParseDateTime("14:30:00"));
+    try std.testing.expectEqualStrings("-14:30:00", try mysqlParseDateTime("-14:30:00"));
+    try std.testing.expectEqualStrings("14:30:00.123", try mysqlParseDateTime("14:30:00.123"));
+    try std.testing.expectEqualStrings("-14:30:00.123456", try mysqlParseDateTime("-14:30:00.123456"));
 }
 
 test "mysqlParseDateTime rejects invalid temporal strings" {
     try std.testing.expectError(error.InvalidFormat, mysqlParseDateTime(""));
     try std.testing.expectError(error.InvalidFormat, mysqlParseDateTime("2024/03/15"));
     try std.testing.expectError(error.InvalidFormat, mysqlParseDateTime("14-30-00"));
+    try std.testing.expectError(error.InvalidFormat, mysqlParseDateTime("-2024-03-15"));
+    try std.testing.expectError(error.InvalidFormat, mysqlParseDateTime("2024-03-15 14:30:00."));
+    try std.testing.expectError(error.InvalidFormat, mysqlParseDateTime("2024-03-15 14:30:00.1234567"));
+    try std.testing.expectError(error.InvalidFormat, mysqlParseDateTime("2024-03-15 14:30:00x"));
+    try std.testing.expectError(error.InvalidFormat, mysqlParseDateTime("14:30:00."));
 }
 
 test "mysqlParseJson accepts valid MySQL JSON strings" {
@@ -6012,12 +6014,18 @@ test "mysqlParseJson accepts valid MySQL JSON strings" {
     try std.testing.expectEqualStrings("true", try mysqlParseJson("true"));
     try std.testing.expectEqualStrings("42", try mysqlParseJson("42"));
     try std.testing.expectEqualStrings("  {\"a\":1}  ", try mysqlParseJson("  {\"a\":1}  "));
+    try std.testing.expectEqualStrings("\"hello\"", try mysqlParseJson("\"hello\""));
+    try std.testing.expectEqualStrings("-3.14", try mysqlParseJson("-3.14"));
 }
 
 test "mysqlParseJson rejects invalid JSON strings" {
     try std.testing.expectError(error.InvalidFormat, mysqlParseJson(""));
     try std.testing.expectError(error.InvalidFormat, mysqlParseJson("not json"));
     try std.testing.expectError(error.InvalidFormat, mysqlParseJson("{\"a\":1"));
+    try std.testing.expectError(error.InvalidFormat, mysqlParseJson("42e"));
+    try std.testing.expectError(error.InvalidFormat, mysqlParseJson("1.2.3"));
+    try std.testing.expectError(error.InvalidFormat, mysqlParseJson("++1"));
+    try std.testing.expectError(error.InvalidFormat, mysqlParseJson("--1"));
 }
 
 test "mysql live connection" {
