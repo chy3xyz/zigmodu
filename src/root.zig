@@ -99,6 +99,12 @@ pub const NatsConfig = @import("messaging/Nats.zig").NatsConfig;
 pub const MessageQueue = @import("messaging/MessageQueue.zig").MessageQueue;
 pub const DistributedEventBus = @import("core/DistributedEventBus.zig").DistributedEventBus;
 pub const ClusterConfig = @import("core/DistributedEventBus.zig").ClusterConfig;
+pub const DLQ = @import("core/eventbus/DLQ.zig").DLQ;
+pub const DLQConfig = @import("core/eventbus/DLQ.zig").DLQConfig;
+pub const Partitioner = @import("core/eventbus/Partitioner.zig").ConsistentHashPartitioner;
+pub const PartitionerConfig = @import("core/eventbus/Partitioner.zig").PartitionerConfig;
+pub const WAL = @import("core/eventbus/WAL.zig").WAL;
+pub const WALConfig = @import("core/eventbus/WAL.zig").WALConfig;
 
 // ============================================================
 // 5. DISTRIBUTED

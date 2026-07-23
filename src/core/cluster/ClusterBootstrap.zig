@@ -81,6 +81,7 @@ pub const ClusterBootstrap = struct {
         const member = try self.allocator.create(ClusterMembership);
         member.* = try ClusterMembership.init(self.allocator, self.io, self.config.node_id, addr, bus);
         self.membership = member;
+        try member.start(.{});
 
         // 4. Create RaftElection (leader election)
         const election_cfg = ElectionConfig{};

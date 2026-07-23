@@ -198,6 +198,7 @@ pub const ClusterMembership = struct {
                     if (is_dead) {
                         node.state = .failed;
                         if (self.on_node_leave_cb) |cb| cb(node.id);
+                        self.bus.disconnectNode(node.id);
 
                         if (self.current_leader) |leader| {
                             if (std.mem.eql(u8, leader, node.id)) {
@@ -316,6 +317,9 @@ pub const ClusterMembership = struct {
             if (self.on_node_join_cb) |cb| {
                 cb(event.node_id, addr);
             }
+            self.bus.connectToNode(event.node_id, addr) catch |err| {
+                std.log.err("[ClusterMembership] Failed to connect event bus to node {s}: {}", .{ event.node_id, err });
+            };
         }
 
         if (event.event_type == .leave) {
@@ -325,6 +329,7 @@ pub const ClusterMembership = struct {
             if (self.on_node_leave_cb) |cb| {
                 cb(event.node_id);
             }
+            self.bus.disconnectNode(event.node_id);
         }
 
         if (event.event_type == .leader_election) {

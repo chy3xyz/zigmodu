@@ -126,9 +126,54 @@ pub const WAL = struct {
     }
 
     pub fn readFrom(self: *Self, start_seq: u64) ![]Entry {
-        _ = self;
-        _ = start_seq;
-        return &[_]Entry{};
+        var result = std.ArrayList(Entry).empty;
+        errdefer {
+            for (result.items) |entry| {
+                self.allocator.free(entry.topic);
+                self.allocator.free(entry.payload);
+                self.allocator.free(entry.source_node);
+            }
+            result.deinit(self.allocator);
+        }
+
+        // Read closed segments first, then the active segment.
+        for (self.segments.items) |seg| {
+            try self.readSegmentEntries(seg, start_seq, &result);
+        }
+        try self.readSegmentEntries(self.current_segment, start_seq, &result);
+
+        return try result.toOwnedSlice(self.allocator);
+    }
+
+    fn readSegmentEntries(self: *Self, seg: *Segment, start_seq: u64, result: *std.ArrayList(Entry)) !void {
+        if (seg.size_bytes == 0) return;
+
+        const content = try self.allocator.alloc(u8, seg.size_bytes);
+        defer self.allocator.free(content);
+
+        const read_len = try seg.file.readPositionalAll(self.io, content, 0);
+        var offset: usize = 0;
+        while (offset + @sizeOf(WALEntryHeader) <= read_len) {
+            const header: WALEntryHeader = @bitCast(content[offset..][0..@sizeOf(WALEntryHeader)].*);
+            const entry_size = @sizeOf(WALEntryHeader) + header.topic_len + header.payload_len + header.source_len;
+            if (offset + entry_size > read_len) break;
+
+            if (header.seq >= start_seq) {
+                const topic = try self.allocator.dupe(u8, content[offset + @sizeOf(WALEntryHeader)..][0..header.topic_len]);
+                errdefer self.allocator.free(topic);
+                const payload = try self.allocator.dupe(u8, content[offset + @sizeOf(WALEntryHeader) + header.topic_len..][0..header.payload_len]);
+                errdefer self.allocator.free(payload);
+                const source = try self.allocator.dupe(u8, content[offset + @sizeOf(WALEntryHeader) + header.topic_len + header.payload_len..][0..header.source_len]);
+                try result.append(self.allocator, .{
+                    .index = header.seq,
+                    .timestamp_ms = header.timestamp_ms,
+                    .topic = topic,
+                    .payload = payload,
+                    .source_node = source,
+                });
+            }
+            offset += entry_size;
+        }
     }
 
     pub fn getUncommittedEntries(self: *Self) ![]Entry {
@@ -263,4 +308,32 @@ test "WAL multi-append and commit tracking" {
 
     wal.markCommitted(3);
     try std.testing.expectEqual(@as(u64, 3), wal.lastCommittedIndex());
+}
+
+test "WAL readFrom replays entries from start sequence" {
+    const allocator = std.testing.allocator;
+
+    const config = WALConfig{ .dir_path = "wal_test_replay", .max_segment_size = 1024 * 1024 };
+    var wal = try WAL.init(allocator, std.testing.io, config);
+    defer wal.deinit();
+
+    _ = try wal.append(.{ .topic = "orders", .payload = "a", .source_node = "n1" });
+    _ = try wal.append(.{ .topic = "orders", .payload = "b", .source_node = "n1" });
+    _ = try wal.append(.{ .topic = "orders", .payload = "c", .source_node = "n1" });
+
+    wal.markCommitted(1);
+
+    const entries = try wal.readFrom(wal.lastCommittedIndex() + 1);
+    defer {
+        for (entries) |entry| {
+            allocator.free(entry.topic);
+            allocator.free(entry.payload);
+            allocator.free(entry.source_node);
+        }
+        allocator.free(entries);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqualStrings("b", entries[0].payload);
+    try std.testing.expectEqualStrings("c", entries[1].payload);
 }

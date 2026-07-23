@@ -7,6 +7,7 @@ const WAL = @import("eventbus/WAL.zig").WAL;
 const WALConfig = @import("eventbus/WAL.zig").WALConfig;
 const DLQ = @import("eventbus/DLQ.zig").DLQ;
 const DLQConfig = @import("eventbus/DLQ.zig").DLQConfig;
+const RequeuedMessage = @import("eventbus/DLQ.zig").RequeuedMessage;
 const Partitioner = @import("eventbus/Partitioner.zig").ConsistentHashPartitioner;
 
 /// Distributed Event Bus for cross-node communication
@@ -33,6 +34,12 @@ pub const DistributedEventBus = struct {
 
     /// Soft backpressure: skip fan-out after this many consecutive send failures per node.
     max_send_failures: u32 = 8,
+
+    /// True while the DLQ retry fiber is running.
+    dlq_retry_running: bool = false,
+
+    /// Global context for DLQ requeue callbacks. Only one bus runs the retry loop at a time.
+    var g_dlq_republish_bus: ?*Self = null;
 
     pub const NetworkEvent = struct {
         topic: []const u8,
@@ -119,6 +126,12 @@ pub const DistributedEventBus = struct {
         self.fiber_group.async(self.io, acceptLoop, .{self});
         self.heartbeat_thread = null;
         self.fiber_group.async(self.io, heartbeatLoop, .{self});
+
+        // Start DLQ retry fiber if a DLQ has been configured.
+        if (self.dlq != null and !self.dlq_retry_running) {
+            self.dlq_retry_running = true;
+            self.fiber_group.async(self.io, dlqRetryLoop, .{self});
+        }
     }
 
     pub fn stop(self: *Self) void {
@@ -210,9 +223,9 @@ pub const DistributedEventBus = struct {
 
                 // Local bus dispatch
                 self.local_bus.publish(event);
-            } else if (self.dlq) |dlq| {
+            } else if (self.dlq) |_| {
                 // Deserialization failed — push to DLQ for later inspection
-                self.pushParseFailureToDlq(dlq, data) catch {};
+                self.pushParseFailureToDlq(data) catch {};
             }
 
             // Clear arena for next message - extremely fast
@@ -252,15 +265,6 @@ pub const DistributedEventBus = struct {
 
     /// Publish event to all connected nodes
     pub fn publish(self: *Self, topic: []const u8, payload: []const u8) !void {
-        // Partition routing if partitioner is set
-        if (self.partitioner) |p| {
-            if (p.route(topic)) |target_node| {
-                std.log.info("[DistributedEventBus] Partitioned event '{s}' -> node {s}", .{ topic, target_node });
-            } else {
-                std.log.warn("[DistributedEventBus] No partition target for '{s}'", .{topic});
-            }
-        }
-
         // Write to WAL for crash recovery if configured
         if (self.wal) |w| {
             _ = w.append(.{
@@ -284,33 +288,81 @@ pub const DistributedEventBus = struct {
         var buf: [4096]u8 = undefined;
         const serialized = serializeEvent(event, &buf);
 
-        // Broadcast to all nodes with soft backpressure on failing sockets
-        for (self.nodes.items) |*node| {
-            if (node.send_failures >= self.max_send_failures) continue;
-            if (node.socket) |sock| {
-                var write_buf: [4096]u8 = undefined;
-                var w = sock.writer(self.io, &write_buf);
-                w.interface.writeAll(serialized) catch |err| {
-                    node.send_failures += 1;
-                    std.log.err("[DistributedEventBus] Failed to send to node {s} (failures={d}): {}", .{ node.id, node.send_failures, err });
-                    if (node.send_failures >= self.max_send_failures) {
-                        std.log.warn("[DistributedEventBus] Quarantining node {s} after {d} send failures", .{ node.id, node.send_failures });
-                        sock.close(self.io);
-                        node.socket = null;
+        // Route via partitioner if configured; otherwise broadcast.
+        var routed = false;
+        if (self.partitioner) |p| {
+            if (p.route(topic)) |target_node| {
+                if (std.mem.eql(u8, target_node, self.node_id)) {
+                    // This node owns the partition — skip network fan-out.
+                    routed = true;
+                } else {
+                    for (self.nodes.items) |*node| {
+                        if (std.mem.eql(u8, node.id, target_node)) {
+                            routed = self.sendToNode(node, topic, payload, serialized);
+                            break;
+                        }
                     }
-                    continue;
-                };
-                w.interface.flush() catch |err| {
-                    node.send_failures += 1;
-                    std.log.err("[DistributedEventBus] Flush to node {s} failed: {}", .{ node.id, err });
-                    continue;
-                };
-                node.send_failures = 0;
+                }
+                if (routed) {
+                    std.log.info("[DistributedEventBus] Partitioned event '{s}' -> node {s}", .{ topic, target_node });
+                } else {
+                    std.log.warn("[DistributedEventBus] Partition target '{s}' -> {s} unreachable, falling back to broadcast", .{ topic, target_node });
+                }
+            } else {
+                std.log.warn("[DistributedEventBus] No partition target for '{s}'", .{topic});
             }
         }
+
+        if (!routed) {
+            // Broadcast to all connected nodes with soft backpressure on failing sockets
+            for (self.nodes.items) |*node| {
+                _ = self.sendToNode(node, topic, payload, serialized);
+            }
+        }
+
         // Also publish locally
         self.publishToTopic(event);
         self.local_bus.publish(event);
+    }
+
+    /// Send a serialized event to a single node. Returns true on success.
+    /// On failure, increments the node failure counter and pushes the message to the DLQ.
+    fn sendToNode(self: *Self, node: *Node, topic: []const u8, payload: []const u8, serialized: []const u8) bool {
+        if (node.send_failures >= self.max_send_failures) return false;
+        if (node.socket) |sock| {
+            var write_buf: [4096]u8 = undefined;
+            var w = sock.writer(self.io, &write_buf);
+            w.interface.writeAll(serialized) catch |err| {
+                node.send_failures += 1;
+                self.pushToDlq(topic, payload, "SendError", self.sendErrorMessage(err)) catch |dlq_err| {
+                    std.log.err("[DistributedEventBus] DLQ push failed: {}", .{dlq_err});
+                };
+                std.log.err("[DistributedEventBus] Failed to send to node {s} (failures={d}): {}", .{ node.id, node.send_failures, err });
+                if (node.send_failures >= self.max_send_failures) {
+                    std.log.warn("[DistributedEventBus] Quarantining node {s} after {d} send failures", .{ node.id, node.send_failures });
+                    sock.close(self.io);
+                    node.socket = null;
+                }
+                return false;
+            };
+            w.interface.flush() catch |err| {
+                node.send_failures += 1;
+                self.pushToDlq(topic, payload, "SendError", self.sendErrorMessage(err)) catch |dlq_err| {
+                    std.log.err("[DistributedEventBus] DLQ push failed: {}", .{dlq_err});
+                };
+                std.log.err("[DistributedEventBus] Flush to node {s} failed: {}", .{ node.id, err });
+                return false;
+            };
+            node.send_failures = 0;
+            return true;
+        }
+        return false;
+    }
+
+    fn sendErrorMessage(self: *Self, err: anyerror) []const u8 {
+        _ = self;
+        var err_buf: [256]u8 = undefined;
+        return std.fmt.bufPrint(&err_buf, "Send failed: {}", .{err}) catch "Send failed";
     }
 
     fn publishToTopic(self: *Self, event: NetworkEvent) void {
@@ -398,6 +450,41 @@ pub const DistributedEventBus = struct {
         return self.nodes.items.len;
     }
 
+    /// Connect to a remote node. The node is registered for routing immediately;
+    /// the outbound socket is established opportunistically and may remain null.
+    pub fn connectToNode(self: *Self, node_id: []const u8, address: std.Io.net.IpAddress) !void {
+        // Prevent duplicate entries.
+        for (self.nodes.items) |node| {
+            if (std.mem.eql(u8, node.id, node_id)) return;
+        }
+
+        const id_copy = try self.allocator.dupe(u8, node_id);
+        errdefer self.allocator.free(id_copy);
+
+        var stream: ?std.Io.net.Stream = null;
+        stream = address.connect(self.io, .{ .mode = .stream }) catch |err| blk: {
+            std.log.warn("[DistributedEventBus] Connection to {s} at {any} failed: {}", .{ node_id, address, err });
+            break :blk null;
+        };
+        errdefer if (stream) |s| s.close(self.io);
+
+        try self.nodes.append(.{
+            .id = id_copy,
+            .address = address,
+            .socket = stream,
+            .last_seen = Time.monotonicNowSeconds(),
+            .send_failures = 0,
+        });
+
+        if (self.partitioner) |p| {
+            if (!p.nodes.contains(node_id)) {
+                p.addNode(node_id) catch |err| {
+                    std.log.err("[DistributedEventBus] Failed to add node {s} to partitioner: {}", .{ node_id, err });
+                };
+            }
+        }
+    }
+
     /// Disconnect from a node
     pub fn disconnectNode(self: *Self, node_id: []const u8) void {
         for (self.nodes.items, 0..) |*node, i| {
@@ -407,15 +494,41 @@ pub const DistributedEventBus = struct {
                 }
                 self.allocator.free(node.id);
                 _ = self.nodes.swapRemove(i);
+                if (self.partitioner) |p| {
+                    p.removeNode(node_id);
+                }
                 std.log.info("[DistributedEventBus] Disconnected from node {s}", .{node_id});
                 return;
             }
         }
     }
 
+    /// Return this node's identifier.
+    pub fn nodeId(self: *Self) []const u8 {
+        return self.node_id;
+    }
+
+    /// Total cluster size including this node.
+    pub fn clusterSize(self: *Self) usize {
+        return 1 + self.nodes.items.len;
+    }
+
     /// Set the consistent-hash partitioner for event routing
     pub fn setPartitioner(self: *Self, p: *Partitioner) void {
         self.partitioner = p;
+        // Ensure the ring reflects the current topology.
+        if (!p.nodes.contains(self.node_id)) {
+            p.addNode(self.node_id) catch |err| {
+                std.log.err("[DistributedEventBus] Failed to add self to partitioner: {}", .{err});
+            };
+        }
+        for (self.nodes.items) |node| {
+            if (!p.nodes.contains(node.id)) {
+                p.addNode(node.id) catch |err| {
+                    std.log.err("[DistributedEventBus] Failed to add node {s} to partitioner: {}", .{ node.id, err });
+                };
+            }
+        }
     }
 
     /// Set the write-ahead log for crash recovery
@@ -423,9 +536,49 @@ pub const DistributedEventBus = struct {
         self.wal = w;
     }
 
-    /// Set the dead-letter queue for failed messages
+    /// Set the dead-letter queue for failed messages and start the retry loop
+    /// if the bus is already running.
     pub fn setDlq(self: *Self, d: *DLQ) void {
         self.dlq = d;
+        if (self.is_running and !self.dlq_retry_running) {
+            self.dlq_retry_running = true;
+            self.fiber_group.async(self.io, dlqRetryLoop, .{self});
+        }
+    }
+
+    /// Periodic fiber that purges expired DLQ entries and requeues retryable ones.
+    fn dlqRetryLoop(self: *Self) void {
+        defer self.dlq_retry_running = false;
+        while (self.is_running) {
+            if (self.dlq) |dlq| {
+                _ = dlq.purgeExpired() catch |err| {
+                    std.log.err("[DistributedEventBus] DLQ purgeExpired failed: {}", .{err});
+                };
+                g_dlq_republish_bus = self;
+                defer g_dlq_republish_bus = null;
+                _ = dlq.requeue(&dlqRequeueCallback) catch |err| {
+                    std.log.err("[DistributedEventBus] DLQ requeue failed: {}", .{err});
+                };
+            } else break;
+            std.Io.sleep(self.io, .{ .nanoseconds = 1_000_000_000 }, .real) catch break; // 1 second
+        }
+    }
+
+    fn dlqRequeueCallback(msg: RequeuedMessage) void {
+        if (g_dlq_republish_bus) |bus| {
+            bus.publish(msg.topic, msg.payload) catch |err| {
+                std.log.err("[DistributedEventBus] DLQ requeue republish failed: {}", .{err});
+            };
+        }
+    }
+
+    /// Manually trigger a DLQ requeue cycle. Useful for tests and for callers
+    /// that want to retry failed messages on demand instead of waiting for the fiber.
+    pub fn requeueDlqEntries(self: *Self) !usize {
+        const dlq = self.dlq orelse return 0;
+        g_dlq_republish_bus = self;
+        defer g_dlq_republish_bus = null;
+        return dlq.requeue(&dlqRequeueCallback);
     }
 
     /// Replay events from WAL starting after the last committed position.
@@ -434,6 +587,14 @@ pub const DistributedEventBus = struct {
         const w = self.wal orelse return;
         const from_seq = w.lastCommittedIndex() + 1;
         const entries = try w.readFrom(from_seq);
+        defer {
+            for (entries) |entry| {
+                self.allocator.free(entry.topic);
+                self.allocator.free(entry.payload);
+                self.allocator.free(entry.source_node);
+            }
+            self.allocator.free(entries);
+        }
         for (entries) |entry| {
             const event = NetworkEvent{
                 .topic = entry.topic,
@@ -449,13 +610,18 @@ pub const DistributedEventBus = struct {
 
     /// Push raw data that failed deserialization into the DLQ.
     /// Used internally by handleConnection; also callable from tests.
-    fn pushParseFailureToDlq(self: *Self, dlq: *DLQ, raw_data: []const u8) !void {
-        _ = self;
+    fn pushParseFailureToDlq(self: *Self, raw_data: []const u8) !void {
+        try self.pushToDlq("unknown", raw_data, "ParseError", "Failed to deserialize event");
+    }
+
+    /// Push a failed message to the DLQ if one is configured.
+    fn pushToDlq(self: *Self, topic: []const u8, payload: []const u8, error_type: []const u8, error_message: []const u8) !void {
+        const dlq = self.dlq orelse return;
         dlq.push(.{
-            .topic = "unknown",
-            .payload = raw_data,
-            .error_type = "ParseError",
-            .error_message = "Failed to deserialize event",
+            .topic = topic,
+            .payload = payload,
+            .error_type = error_type,
+            .error_message = error_message,
             .retry_count = 0,
         }) catch |err| {
             std.log.err("[DistributedEventBus] DLQ push failed: {}", .{err});
@@ -576,7 +742,108 @@ test "DistributedEventBus DLQ on parse failure" {
     try std.testing.expectEqual(@as(usize, 0), dlq.size());
 
     // Simulate parse failure by pushing malformed data through the internal helper
-    try bus.pushParseFailureToDlq(&dlq, "garbage-non-json-data");
+    try bus.pushParseFailureToDlq("garbage-non-json-data");
 
     try std.testing.expectEqual(@as(usize, 1), dlq.size());
+}
+
+test "DistributedEventBus partitioner adds and removes nodes" {
+    const allocator = std.testing.allocator;
+
+    var partitioner = Partitioner.init(allocator, .{ .virtual_nodes_per_node = 10 });
+    defer partitioner.deinit();
+
+    var bus = try DistributedEventBus.init(allocator, std.testing.io, "node-1");
+    defer bus.deinit();
+
+    bus.setPartitioner(&partitioner);
+
+    // Self is registered automatically.
+    try std.testing.expectEqual(@as(usize, 1), partitioner.nodeCount());
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 19001);
+    try bus.connectToNode("node-2", addr);
+
+    try std.testing.expectEqual(@as(usize, 2), bus.clusterSize());
+    try std.testing.expectEqual(@as(usize, 2), partitioner.nodeCount());
+
+    bus.disconnectNode("node-2");
+
+    try std.testing.expectEqual(@as(usize, 1), bus.clusterSize());
+    try std.testing.expectEqual(@as(usize, 1), partitioner.nodeCount());
+
+    // Routing falls back to broadcast when the ring is empty.
+    try bus.publish("orders.created", "payload");
+}
+
+test "DistributedEventBus DLQ send failure and requeue republish" {
+    const allocator = std.testing.allocator;
+
+    var dlq = try DLQ.init(allocator, .{
+        .max_age_seconds = 60,
+        .retry_cooldown_seconds = 0,
+        .max_retries = 3,
+        .storage = .memory,
+    });
+    defer dlq.deinit();
+
+    var bus = try DistributedEventBus.init(allocator, std.testing.io, "dlq-replay");
+    defer bus.deinit();
+
+    bus.setDlq(&dlq);
+
+    var received: bool = false;
+    const Listener = struct {
+        var flag: *bool = undefined;
+        fn cb(evt: DistributedEventBus.NetworkEvent) void {
+            if (std.mem.eql(u8, evt.topic, "retry.topic") and std.mem.eql(u8, evt.payload, "retry-payload")) {
+                flag.* = true;
+            }
+        }
+    };
+    Listener.flag = &received;
+    try bus.subscribe("retry.topic", Listener.cb);
+
+    // Simulate a send failure landing in the DLQ.
+    try bus.pushToDlq("retry.topic", "retry-payload", "SendError", "simulated send failure");
+    try std.testing.expectEqual(@as(usize, 1), dlq.size());
+
+    // Requeue should republish through the bus, triggering the local subscriber.
+    const requeued = try bus.requeueDlqEntries();
+    try std.testing.expectEqual(@as(usize, 1), requeued);
+    try std.testing.expect(received);
+}
+
+test "DistributedEventBus WAL replay triggers local subscribers" {
+    const allocator = std.testing.allocator;
+
+    const wal_config = WALConfig{ .dir_path = "wal_test_deb", .max_segment_size = 1024 * 1024 };
+    var wal = try WAL.init(allocator, std.testing.io, wal_config);
+    defer wal.deinit();
+
+    var bus = try DistributedEventBus.init(allocator, std.testing.io, "wal-replay-bus");
+    defer bus.deinit();
+    bus.setWal(&wal);
+
+    var received: usize = 0;
+    const Listener = struct {
+        var count: *usize = undefined;
+        fn cb(evt: DistributedEventBus.NetworkEvent) void {
+            if (std.mem.eql(u8, evt.topic, "replay.topic")) {
+                count.* += 1;
+            }
+        }
+    };
+    Listener.count = &received;
+    try bus.subscribe("replay.topic", Listener.cb);
+
+    try bus.publish("replay.topic", "msg-1");
+    try bus.publish("replay.topic", "msg-2");
+
+    // Reset counter and replay only uncommitted entries.
+    received = 0;
+    wal.markCommitted(1);
+    try bus.replayFromWal();
+
+    try std.testing.expectEqual(@as(usize, 1), received);
 }
