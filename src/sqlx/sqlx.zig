@@ -173,16 +173,6 @@ pub const ManagedRows = struct {
     }
 };
 
-/// High-level scoped helper for fallible query processing with automatic deinit.
-pub fn withRows(client: *Client, sql: []const u8, args: []const Value, callback: anytype) !void {
-    var res = try client.queryRows(sql, args);
-    var rows = try res.unwrap();
-    defer rows.deinit();
-
-    try callback(&rows);
-}
-
-
 /// Cursor fetch mode.
 pub const CursorMode = enum {
     /// Materialize all rows upfront. Rows remain valid until `cursor.deinit()`.
@@ -4473,31 +4463,7 @@ pub const Client = struct {
         return self.queryRowPartial(T, sql_str, args);
     }
 
-    pub fn queryRows(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
-        var rows = try self.query(sql_str, args);
-        defer rows.deinit();
-        return scanRowsToSlice(self.allocator, T, &rows, false);
-    }
-
-    pub fn queryRowsCtx(self: *Client, ctx: SqlContext, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
-        if (ctx.isDone()) return error.Timeout;
-        return self.queryRows(T, sql_str, args);
-    }
-
-    pub fn queryRowsPartial(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
-        var rows = try self.query(sql_str, args);
-        defer rows.deinit();
-        return scanRowsToSlice(self.allocator, T, &rows, true);
-    }
-
-    pub fn queryRowsPartialCtx(self: *Client, ctx: SqlContext, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
-        if (ctx.isDone()) return error.Timeout;
-        return self.queryRowsPartial(T, sql_str, args);
-    }
-
-    /// Like queryRows but returns an owned QueryResult(T). Caller MUST `defer result.deinit(allocator)`.
-    /// Strings borrow the result arena (no per-field second copy).
-    pub fn queryRowsOwned(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !QueryResult(T) {
+    pub fn queryRows(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !QueryResult(T) {
         var rows = try self.query(sql_str, args);
         return scanRowsToOwned(T, &rows, false) catch |err| {
             rows.deinit();
@@ -4505,8 +4471,12 @@ pub const Client = struct {
         };
     }
 
-    /// Like queryRowsPartial but returns an owned QueryResult(T). Caller MUST `defer result.deinit(allocator)`.
-    pub fn queryRowsPartialOwned(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !QueryResult(T) {
+    pub fn queryRowsCtx(self: *Client, ctx: SqlContext, comptime T: type, sql_str: []const u8, args: []const Value) !QueryResult(T) {
+        if (ctx.isDone()) return error.Timeout;
+        return self.queryRows(T, sql_str, args);
+    }
+
+    pub fn queryRowsPartial(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !QueryResult(T) {
         var rows = try self.query(sql_str, args);
         return scanRowsToOwned(T, &rows, true) catch |err| {
             rows.deinit();
@@ -4514,10 +4484,20 @@ pub const Client = struct {
         };
     }
 
-    // TODO(v0.14): remove deinitQueryRows — use QueryResult(T).deinit() instead.
-    pub fn deinitQueryRows(self: *Client, comptime T: type, items: []T) void {
-        for (items) |item| freeScanned(self.allocator, T, item);
-        self.allocator.free(items);
+    pub fn queryRowsPartialCtx(self: *Client, ctx: SqlContext, comptime T: type, sql_str: []const u8, args: []const Value) !QueryResult(T) {
+        if (ctx.isDone()) return error.Timeout;
+        return self.queryRowsPartial(T, sql_str, args);
+    }
+
+    /// Like queryRows but returns an owned QueryResult(T). Caller MUST `defer result.deinit(allocator)`.
+    /// Strings borrow the result arena (no per-field second copy).
+    pub fn queryRowsOwned(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !QueryResult(T) {
+        return self.queryRows(T, sql_str, args);
+    }
+
+    /// Like queryRowsPartial but returns an owned QueryResult(T). Caller MUST `defer result.deinit(allocator)`.
+    pub fn queryRowsPartialOwned(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !QueryResult(T) {
+        return self.queryRowsPartial(T, sql_str, args);
     }
 
     pub fn findOne(self: *Client, comptime T: type, table: []const u8, where_clause: []const u8, args: []const Value) !T {
@@ -4546,7 +4526,7 @@ pub const Client = struct {
         return self.findOnePartial(T, table, where_clause, args);
     }
 
-    pub fn findAll(self: *Client, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) ![]T {
+    pub fn findAll(self: *Client, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) !QueryResult(T) {
         try validateIdentifier(table);
         if (where_clause) |w| try validateSqlFragment(w);
         const sql = if (where_clause) |w|
@@ -4559,22 +4539,15 @@ pub const Client = struct {
 
     /// Like findAll but returns an owned QueryResult(T). Caller MUST `defer result.deinit(allocator)`.
     pub fn findAllOwned(self: *Client, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) !QueryResult(T) {
-        try validateIdentifier(table);
-        if (where_clause) |w| try validateSqlFragment(w);
-        const sql = if (where_clause) |w|
-            try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s}", .{ table, w })
-        else
-            try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s}", .{table});
-        defer self.allocator.free(sql);
-        return self.queryRowsOwned(T, sql, args);
+        return self.findAll(T, table, where_clause, args);
     }
 
-    pub fn findAllCtx(self: *Client, ctx: SqlContext, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) ![]T {
+    pub fn findAllCtx(self: *Client, ctx: SqlContext, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) !QueryResult(T) {
         if (ctx.isDone()) return error.Timeout;
         return self.findAll(T, table, where_clause, args);
     }
 
-    pub fn findAllPartial(self: *Client, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) ![]T {
+    pub fn findAllPartial(self: *Client, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) !QueryResult(T) {
         try validateIdentifier(table);
         if (where_clause) |w| try validateSqlFragment(w);
         const sql = if (where_clause) |w|
@@ -4585,7 +4558,7 @@ pub const Client = struct {
         return self.queryRowsPartial(T, sql, args);
     }
 
-    pub fn findAllPartialCtx(self: *Client, ctx: SqlContext, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) ![]T {
+    pub fn findAllPartialCtx(self: *Client, ctx: SqlContext, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) !QueryResult(T) {
         if (ctx.isDone()) return error.Timeout;
         return self.findAllPartial(T, table, where_clause, args);
     }
@@ -4673,11 +4646,14 @@ pub const Transaction = struct {
         return try rows.rows[0].scan(allocator, T);
     }
 
-    /// queryRows scans all rows into []T (like Client.queryRows but on tx)
-    pub fn queryRows(self: *Transaction, allocator: std.mem.Allocator, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
+    /// queryRows scans all rows into an owned QueryResult(T) (like Client.queryRows but on tx).
+    /// Caller MUST `defer result.deinit(allocator)`.
+    pub fn queryRows(self: *Transaction, allocator: std.mem.Allocator, comptime T: type, sql_str: []const u8, args: []const Value) !QueryResult(T) {
         var rows = try self.query(allocator, sql_str, args);
-        defer rows.deinit();
-        return scanRowsToSlice(allocator, T, &rows, false);
+        return scanRowsToOwned(T, &rows, false) catch |err| {
+            rows.deinit();
+            return err;
+        };
     }
 
     pub fn prepare(self: *Transaction, allocator: std.mem.Allocator, sql_str: []const u8) !Stmt {
@@ -4825,23 +4801,23 @@ pub const CachedConn = struct {
         return self.queryRowPartial(T, cache_key, sql_str, args);
     }
 
-    pub fn queryRows(self: *CachedConn, comptime T: type, cache_key: []const u8, sql_str: []const u8, args: []const Value) ![]T {
+    pub fn queryRows(self: *CachedConn, comptime T: type, cache_key: []const u8, sql_str: []const u8, args: []const Value) !QueryResult(T) {
         if (self.getCache(cache_key)) |cached| {
             defer self.allocator.free(cached);
             var parsed = std.json.parseFromSlice([]T, self.allocator, cached, .{}) catch return error.DatabaseError;
             defer parsed.deinit();
-            const result = try self.allocator.alloc(T, parsed.value.len);
+            const items = try self.allocator.alloc(T, parsed.value.len);
             errdefer {
-                for (result) |item| freeScanned(self.allocator, T, item);
-                self.allocator.free(result);
+                for (items) |item| freeScanned(self.allocator, T, item);
+                self.allocator.free(items);
             }
             for (parsed.value, 0..) |item, i| {
-                result[i] = try deepCopyStruct(self.allocator, T, item);
+                items[i] = try deepCopyStruct(self.allocator, T, item);
             }
-            return result;
+            return .{ .items = items, .arena = null };
         }
         const result = try self.client.queryRows(T, sql_str, args);
-        const json = std.json.Stringify.valueAlloc(self.allocator, result, .{}) catch {
+        const json = std.json.Stringify.valueAlloc(self.allocator, result.items, .{}) catch {
             return result;
         };
         defer self.allocator.free(json);
@@ -4849,32 +4825,32 @@ pub const CachedConn = struct {
         return result;
     }
 
-    pub fn queryRowsNoCache(self: *CachedConn, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
+    pub fn queryRowsNoCache(self: *CachedConn, comptime T: type, sql_str: []const u8, args: []const Value) !QueryResult(T) {
         return self.client.queryRows(T, sql_str, args);
     }
 
-    pub fn queryRowsCtx(self: *CachedConn, ctx: SqlContext, comptime T: type, cache_key: []const u8, sql_str: []const u8, args: []const Value) ![]T {
+    pub fn queryRowsCtx(self: *CachedConn, ctx: SqlContext, comptime T: type, cache_key: []const u8, sql_str: []const u8, args: []const Value) !QueryResult(T) {
         if (ctx.isDone()) return error.Timeout;
         return self.queryRows(T, cache_key, sql_str, args);
     }
 
-    pub fn queryRowsPartial(self: *CachedConn, comptime T: type, cache_key: []const u8, sql_str: []const u8, args: []const Value) ![]T {
+    pub fn queryRowsPartial(self: *CachedConn, comptime T: type, cache_key: []const u8, sql_str: []const u8, args: []const Value) !QueryResult(T) {
         if (self.getCache(cache_key)) |cached| {
             defer self.allocator.free(cached);
             var parsed = std.json.parseFromSlice([]T, self.allocator, cached, .{}) catch return error.DatabaseError;
             defer parsed.deinit();
-            const result = try self.allocator.alloc(T, parsed.value.len);
+            const items = try self.allocator.alloc(T, parsed.value.len);
             errdefer {
-                for (result) |item| freeScanned(self.allocator, T, item);
-                self.allocator.free(result);
+                for (items) |item| freeScanned(self.allocator, T, item);
+                self.allocator.free(items);
             }
             for (parsed.value, 0..) |item, i| {
-                result[i] = try deepCopyStruct(self.allocator, T, item);
+                items[i] = try deepCopyStruct(self.allocator, T, item);
             }
-            return result;
+            return .{ .items = items, .arena = null };
         }
         const result = try self.client.queryRowsPartial(T, sql_str, args);
-        const json = std.json.Stringify.valueAlloc(self.allocator, result, .{}) catch {
+        const json = std.json.Stringify.valueAlloc(self.allocator, result.items, .{}) catch {
             return result;
         };
         defer self.allocator.free(json);
@@ -4882,11 +4858,11 @@ pub const CachedConn = struct {
         return result;
     }
 
-    pub fn queryRowsPartialNoCache(self: *CachedConn, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
+    pub fn queryRowsPartialNoCache(self: *CachedConn, comptime T: type, sql_str: []const u8, args: []const Value) !QueryResult(T) {
         return self.client.queryRowsPartial(T, sql_str, args);
     }
 
-    pub fn queryRowsPartialCtx(self: *CachedConn, ctx: SqlContext, comptime T: type, cache_key: []const u8, sql_str: []const u8, args: []const Value) ![]T {
+    pub fn queryRowsPartialCtx(self: *CachedConn, ctx: SqlContext, comptime T: type, cache_key: []const u8, sql_str: []const u8, args: []const Value) !QueryResult(T) {
         if (ctx.isDone()) return error.Timeout;
         return self.queryRowsPartial(T, cache_key, sql_str, args);
     }
@@ -4939,7 +4915,7 @@ pub const CachedConn = struct {
         return self.findOneNoCache(T, table, where_clause, args);
     }
 
-    pub fn findAll(self: *CachedConn, comptime T: type, cache_key: []const u8, table: []const u8, where_clause: ?[]const u8, args: []const Value) ![]T {
+    pub fn findAll(self: *CachedConn, comptime T: type, cache_key: []const u8, table: []const u8, where_clause: ?[]const u8, args: []const Value) !QueryResult(T) {
         try validateIdentifier(table);
         if (where_clause) |w| try validateSqlFragment(w);
         const sql = if (where_clause) |w|
@@ -4950,7 +4926,7 @@ pub const CachedConn = struct {
         return self.queryRows(T, cache_key, sql, args);
     }
 
-    pub fn findAllNoCache(self: *CachedConn, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) ![]T {
+    pub fn findAllNoCache(self: *CachedConn, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) !QueryResult(T) {
         try validateIdentifier(table);
         if (where_clause) |w| try validateSqlFragment(w);
         const sql = if (where_clause) |w|
@@ -4961,12 +4937,12 @@ pub const CachedConn = struct {
         return self.queryRowsNoCache(T, sql, args);
     }
 
-    pub fn findAllCtx(self: *CachedConn, ctx: SqlContext, comptime T: type, cache_key: []const u8, table: []const u8, where_clause: ?[]const u8, args: []const Value) ![]T {
+    pub fn findAllCtx(self: *CachedConn, ctx: SqlContext, comptime T: type, cache_key: []const u8, table: []const u8, where_clause: ?[]const u8, args: []const Value) !QueryResult(T) {
         if (ctx.isDone()) return error.Timeout;
         return self.findAll(T, cache_key, table, where_clause, args);
     }
 
-    pub fn findAllNoCacheCtx(self: *CachedConn, ctx: SqlContext, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) ![]T {
+    pub fn findAllNoCacheCtx(self: *CachedConn, ctx: SqlContext, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) !QueryResult(T) {
         if (ctx.isDone()) return error.Timeout;
         return self.findAllNoCache(T, table, where_clause, args);
     }
@@ -5353,8 +5329,8 @@ test "client findOne and findAll" {
     try std.testing.expectEqual(@as(i64, 1), user.id);
 
     const users = try client.findAll(User, "users", null, &.{});
-    defer client.deinitQueryRows(User, users);
-    try std.testing.expectEqual(@as(usize, 2), users.len);
+    defer users.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), users.items.len);
 
     // Injection attempts through table / where_clause are rejected.
     try std.testing.expectError(error.InvalidSqlIdentifier, client.findAll(User, "users; DROP TABLE users", null, &.{}));
@@ -5597,10 +5573,10 @@ test "sqlite queryRow and queryRows struct scan" {
     try std.testing.expectEqualStrings("Alice", user.name);
 
     const users = try client.queryRows(User, "SELECT id, name FROM users ORDER BY id", &.{});
-    defer client.deinitQueryRows(User, users);
-    try std.testing.expectEqual(@as(usize, 2), users.len);
-    try std.testing.expectEqualStrings("Alice", users[0].name);
-    try std.testing.expectEqualStrings("Bob", users[1].name);
+    defer users.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), users.items.len);
+    try std.testing.expectEqualStrings("Alice", users.items[0].name);
+    try std.testing.expectEqualStrings("Bob", users.items[1].name);
 }
 
 test "sqlite transact helper" {
@@ -5657,8 +5633,8 @@ test "sqlite connection pool" {
     };
 
     const users = try client.queryRows(User, "SELECT id, name FROM users ORDER BY id", &.{});
-    defer client.deinitQueryRows(User, users);
-    try std.testing.expectEqual(@as(usize, 2), users.len);
+    defer users.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), users.items.len);
 
     // Transaction through pool
     const affected = try client.transact(u64, struct {
