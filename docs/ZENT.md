@@ -1,7 +1,8 @@
 # ZigModu × zent 最佳实践
 
 **zent**: [chy3xyz/zent](https://github.com/chy3xyz/zent) — Zig 版 [ent](https://entgo.io/)（schema-as-code ORM）  
-**版本口径**: zent **v0.12.0+** · ZigModu **v0.14.3+** · Zig **≥ 0.17**  
+**版本口径**: zent **v0.13.0+** · ZigModu **v0.14.9+** · Zig **≥ 0.17**  
+
 **参考实现**: [`examples/zent-modulith/`](../examples/zent-modulith/)  
 **zent 自带示例**: `zig build run-start` / `run-complex` / `run-pool`（在 zent 仓库内）
 
@@ -374,16 +375,18 @@ zig_ws/
 
 ---
 
-## 14. 升级注意（zent 0.6 → 0.12）
+## 14. 升级注意（zent 0.6 → 0.12 → 0.13+）
 
-| 主题 | 动作 |
-|------|------|
-| Zig ≥ 0.17 | 与 ZigModu 对齐 |
-| `deinitEntity` 可变指针 | `&entity` |
-| 迁移表 `zent_schema_migrations` | 幂等；勿手删 |
-| Pool `max_wait_ms` | 改用 `max_retries` + backoff |
-| `build.zig.zon` fingerprint | `zig build` 提示值写入 |
-| CRC / std 滚动 | 跟 Zig 0.17-dev（见 AGENTS.md） |
+| 主题 | 动作 / 新特性 |
+|------|--------------|
+| **查询超时控制 (`withTimeout`)** | zent v0.13+ 支持 `client.product.Query().withTimeout(2000)`，通过 `ExecutionContext` 在底层 SQL 驱动触发超时下发（Postgres `statement_timeout` / MySQL `MAX_EXECUTION_TIME` / SQLite `deadline`），有效防止 ZigModu 异步 Fiber 场景下的长查询阻塞。 |
+| **MySQL 原生 Upsert** | `SaveOrUpdate` 升级为生成 `INSERT ... ON DUPLICATE KEY UPDATE` 原生 DDL，保持主键与关联子行原子更新。 |
+| **`deinitEntity` 可变指针** | `&entity` 统一清理内存 |
+| **迁移表 `zent_schema_migrations`** | 幂等；勿手删 |
+| **Pool `max_wait_ms`** | 改用 `max_retries` + backoff |
+| **`build.zig.zon` fingerprint** | `zig build` 提示值写入 |
+| **CRC / std 滚动** | 跟 Zig 0.17-dev（见 AGENTS.md） |
+
 
 ---
 
