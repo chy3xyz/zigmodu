@@ -4036,16 +4036,29 @@ pub const Client = struct {
     }
 
     /// One-step init + connect. Use instead of init() + connect().
+    ///
+    /// Pool creation is deferred to the first query via `ensurePool` so
+    /// `ConnPool.client` is bound to the caller's stable `*Client` address.
+    /// Creating the pool here then `return client` by value would leave
+    /// `pool.client` dangling at the temporary's old address (SIGSEGV in
+    /// `ensurePool` / `acquire` under `max_open_conns > 1`).
+    /// Call `warmPool()` on the assigned client if idle warmup is needed.
     pub fn open(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !Client {
         var client = Client.init(allocator, io, cfg);
         try client.connect();
-        client.ensurePool();
-        if (client.pool) |*p| {
-            p.warmup(cfg.max_idle_conns) catch |err| {
+        return client;
+    }
+
+    /// Create the connection pool (if configured) and optionally warm idle
+    /// connections. Must be called on the final `*Client` location (after
+    /// `open`/`init` has been stored into its long-lived variable).
+    pub fn warmPool(self: *Client) void {
+        self.ensurePool();
+        if (self.pool) |*p| {
+            p.warmup(self.config.max_idle_conns) catch |err| {
                 std.log.warn("[sqlx] connection warmup failed: {}", .{err});
             };
         }
-        return client;
     }
 
     pub fn withOptions(self: *Client, opts: []const SqlOption) void {
@@ -4079,7 +4092,13 @@ pub const Client = struct {
     }
 
     fn ensurePool(self: *Client) void {
-        if (self.config.max_open_conns > 1 and self.pool == null) {
+        if (self.pool) |*p| {
+            // Client may have been moved by value after the pool was created
+            // (e.g. historical open() path). Always rebind the back-pointer.
+            p.client = self;
+            return;
+        }
+        if (self.config.max_open_conns > 1) {
             self.pool = ConnPool.init(self.allocator, self, self.config.max_open_conns, self.config.max_idle_conns, self.io);
         }
     }
@@ -5863,6 +5882,16 @@ test "Client circuit breaker is eager (no lazy ensureBreaker)" {
     try std.testing.expectEqual(@as(u32, 1), client.cb.failure_count);
 }
 
+test "Client.pool offset is before cb (SqlxBackend ABI claim)" {
+    // pool precedes cb in source order; changing cb optionality cannot move pool.
+    try std.testing.expect(@offsetOf(Client, "pool") < @offsetOf(Client, "cb"));
+    // SqlxBackend is { allocator, *Client } — not an overlay on Client bytes.
+    const Backend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend;
+    try std.testing.expect(@sizeOf(Backend) < @sizeOf(Client));
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(Backend, "allocator"));
+    try std.testing.expect(@offsetOf(Backend, "client") > 0);
+}
+
 test "pgDecodeInterval basic" {
     const allocator = std.testing.allocator;
     // 1 month, 2 days, 3:04:05.000006
@@ -6280,10 +6309,31 @@ test "sqlite connection pool warmup" {
         .max_idle_conns = 2,
     });
     defer db.deinit();
+    db.warmPool();
 
     // Warmup should have created up to max_idle idle connections.
     try std.testing.expect(db.pool != null);
     try std.testing.expect(db.pool.?.idle.items.len > 0);
+    // Back-pointer must address the final Client, not a moved temporary.
+    try std.testing.expectEqual(@intFromPtr(&db), @intFromPtr(db.pool.?.client));
+}
+
+test "conn pool rebinds client pointer after value move" {
+    const allocator = std.testing.allocator;
+    var db = try Client.open(allocator, std.testing.io, .{
+        .driver = .sqlite,
+        .sqlite_path = ":memory:",
+        .max_open_conns = 3,
+        .max_idle_conns = 1,
+    });
+    defer db.deinit();
+    db.warmPool();
+    try std.testing.expect(db.pool != null);
+
+    // Simulate open()-by-value leave-behind: pool.client points at a dead address.
+    db.pool.?.client = @ptrFromInt(0x70);
+    db.ensurePool();
+    try std.testing.expectEqual(@intFromPtr(&db), @intFromPtr(db.pool.?.client));
 }
 
 test "conn pool evicts idle connection after timeout" {
@@ -6296,9 +6346,9 @@ test "conn pool evicts idle connection after timeout" {
         .max_idle_conns = 2,
     });
     defer db.deinit();
+    db.warmPool();
 
     try std.testing.expect(db.pool != null);
-    // Client.open already warmed up max_idle_conns idle connections.
     const before = db.pool.?.metrics();
     try std.testing.expectEqual(@as(u32, 2), before.current_idle);
     try std.testing.expectEqual(@as(u64, 0), before.total_evicted_idle);
@@ -6326,6 +6376,7 @@ test "conn pool thread smoke" {
         .max_wait_ms = 5000,
     });
     defer db.deinit();
+    db.warmPool();
 
     const pool = &db.pool.?;
 
@@ -6356,6 +6407,7 @@ test "conn pool release hands off to waiters in FIFO order" {
         .max_wait_ms = 5000,
     });
     defer db.deinit();
+    db.warmPool();
 
     const pool = &db.pool.?;
     const conn_a = try pool.acquire();
