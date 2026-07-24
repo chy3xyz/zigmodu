@@ -4010,9 +4010,8 @@ pub const Client = struct {
     config: Config,
     conn: ?Conn = null,
     pool: ?ConnPool = null,
-    /// Eagerly initialized in `init` — never lazy. Lazy `ensureBreaker` raced across
-    /// fibers/threads (torn `?CircuitBreaker` write → null `Io.vtable` → segfault on
-    /// the next `allow`/`record*`, often at low addresses like 0x1a0).
+    /// Eagerly initialized in `init` — never lazy. Does not store `Io`; call sites
+    /// pass `self.io` into allow/record* so futex waits use the live handle.
     cb: breaker.CircuitBreaker,
     acceptable: ?*const fn (anyerror) bool = null,
     /// Optional metrics callback (zero-cost when null)
@@ -4027,7 +4026,7 @@ pub const Client = struct {
             .config = cfg,
             .conn = null,
             .pool = null,
-            .cb = breaker.CircuitBreaker.new(io),
+            .cb = breaker.CircuitBreaker.new(),
             .acceptable = null,
             .metrics_callback = null,
             .tracer = null,
@@ -4143,15 +4142,15 @@ pub const Client = struct {
     }
 
     pub fn prepare(self: *Client, sql_str: []const u8) !Stmt {
-        if (!self.cb.allow()) return error.CircuitBreakerOpen;
+        if (!self.cb.allow(self.io)) return error.CircuitBreakerOpen;
         const conn = try self.newConn();
         errdefer conn.close();
         var stmt = self.newStmt(conn, sql_str) catch |err| {
-            if (!self.isAcceptable(err)) self.cb.recordFailure();
+            if (!self.isAcceptable(err)) self.cb.recordFailure(self.io);
             return err;
         };
         stmt.conn = conn;
-        self.cb.recordSuccess();
+        self.cb.recordSuccess(self.io);
         return stmt;
     }
 
@@ -4191,19 +4190,19 @@ pub const Client = struct {
     }
 
     pub fn query(self: *Client, sql_str: []const u8, args: []const Value) !Rows {
-        if (!self.cb.allow()) return error.CircuitBreakerOpen;
+        if (!self.cb.allow(self.io)) return error.CircuitBreakerOpen;
 
         const t0 = Time.monotonicNow();
         var rows = self.doQuery(sql_str, args) catch |err| {
             const elapsed: u64 = @intCast(@max(@as(i64, 0), Time.monotonicNow() - t0));
             if (self.metrics_callback) |cb| cb(elapsed, sql_str, false, @errorName(err));
-            if (!self.isAcceptable(err)) self.cb.recordFailure();
+            if (!self.isAcceptable(err)) self.cb.recordFailure(self.io);
             return err;
         };
         for (rows.rows) |*row| row.arena = &rows.arena;
         const elapsed: u64 = @intCast(@max(@as(i64, 0), Time.monotonicNow() - t0));
         if (self.metrics_callback) |cb| cb(elapsed, sql_str, true, null);
-        self.cb.recordSuccess();
+        self.cb.recordSuccess(self.io);
         return rows;
     }
 
@@ -4226,7 +4225,7 @@ pub const Client = struct {
     /// materializes all rows; `.streaming` fetches rows lazily and the row returned
     /// by `next()` is only valid until the next `next()`/`deinit()`.
     pub fn queryCursorEx(self: *Client, sql_str: []const u8, args: []const Value, opts: CursorOptions) !Cursor {
-        if (!self.cb.allow()) return error.CircuitBreakerOpen;
+        if (!self.cb.allow(self.io)) return error.CircuitBreakerOpen;
 
         self.ensurePool();
         if (self.pool) |*p| {
@@ -4262,18 +4261,18 @@ pub const Client = struct {
     }
 
     pub fn exec(self: *Client, sql_str: []const u8, args: []const Value) !ExecResult {
-        if (!self.cb.allow()) return error.CircuitBreakerOpen;
+        if (!self.cb.allow(self.io)) return error.CircuitBreakerOpen;
 
         const t0 = Time.monotonicNow();
         const result = self.doExec(sql_str, args) catch |err| {
             const elapsed: u64 = @intCast(@max(@as(i64, 0), Time.monotonicNow() - t0));
             if (self.metrics_callback) |cb| cb(elapsed, sql_str, false, @errorName(err));
-            if (!self.isAcceptable(err)) self.cb.recordFailure();
+            if (!self.isAcceptable(err)) self.cb.recordFailure(self.io);
             return err;
         };
         const elapsed: u64 = @intCast(@max(@as(i64, 0), Time.monotonicNow() - t0));
         if (self.metrics_callback) |cb| cb(elapsed, sql_str, true, null);
-        self.cb.recordSuccess();
+        self.cb.recordSuccess(self.io);
         return result;
     }
 
@@ -4352,19 +4351,19 @@ pub const Client = struct {
         // SQLite has no protocol-level batch insert; use the optimized SQL path.
         // MySQL/PostgreSQL will attempt native batching and fall back on failure.
         if (opts.mode == .sql or rows.len == 0 or self.config.driver == .sqlite) return self.batchInsert(table, columns, rows);
-        if (!self.cb.allow()) return error.CircuitBreakerOpen;
+        if (!self.cb.allow(self.io)) return error.CircuitBreakerOpen;
         self.ensurePool();
 
         const t0 = Time.monotonicNow();
         const result = self.doBatchInsert(table, columns, rows) catch |err| {
             const elapsed: u64 = @intCast(@max(@as(i64, 0), Time.monotonicNow() - t0));
             if (self.metrics_callback) |cb| cb(elapsed, table, false, @errorName(err));
-            if (!self.isAcceptable(err)) self.cb.recordFailure();
+            if (!self.isAcceptable(err)) self.cb.recordFailure(self.io);
             return err;
         };
         const elapsed: u64 = @intCast(@max(@as(i64, 0), Time.monotonicNow() - t0));
         if (self.metrics_callback) |cb| cb(elapsed, table, true, null);
-        self.cb.recordSuccess();
+        self.cb.recordSuccess(self.io);
         return result;
     }
 
@@ -4396,12 +4395,12 @@ pub const Client = struct {
     }
 
     pub fn ping(self: *Client) !void {
-        if (!self.cb.allow()) return error.CircuitBreakerOpen;
+        if (!self.cb.allow(self.io)) return error.CircuitBreakerOpen;
         self.doPing() catch |err| {
-            if (!self.isAcceptable(err)) self.cb.recordFailure();
+            if (!self.isAcceptable(err)) self.cb.recordFailure(self.io);
             return err;
         };
-        self.cb.recordSuccess();
+        self.cb.recordSuccess(self.io);
     }
 
     pub fn pingCtx(self: *Client, ctx: SqlContext) !void {
@@ -4414,7 +4413,7 @@ pub const Client = struct {
     }
 
     pub fn beginTxOpts(self: *Client, opts: TxOptions) errors.Error!Transaction {
-        if (!self.cb.allow()) return errors.Error.CircuitBreakerOpen;
+        if (!self.cb.allow(self.io)) return errors.Error.CircuitBreakerOpen;
         self.ensurePool();
         const sql = beginSql(self.config.driver, opts);
         if (self.pool) |*p| {
@@ -4426,7 +4425,7 @@ pub const Client = struct {
             };
             errdefer p.release(conn);
             _ = conn.exec(sql, &.{}) catch |err| {
-                if (!self.isAcceptable(err)) self.cb.recordFailure();
+                if (!self.isAcceptable(err)) self.cb.recordFailure(self.io);
                 return errors.Error.DatabaseError;
             };
             return Transaction{ .conn = conn, .pool = p, .allocator = self.allocator };
@@ -4438,7 +4437,7 @@ pub const Client = struct {
             };
         }
         _ = self.conn.?.exec(sql, &.{}) catch |err| {
-            if (!self.isAcceptable(err)) self.cb.recordFailure();
+            if (!self.isAcceptable(err)) self.cb.recordFailure(self.io);
             return errors.Error.DatabaseError;
         };
         return Transaction{ .conn = self.conn.?, .allocator = self.allocator };
@@ -5877,8 +5876,8 @@ test "Client circuit breaker is eager (no lazy ensureBreaker)" {
     var client = Client.init(std.testing.allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     // Must allow immediately — cb is fully initialized in init(), not on first query.
-    try std.testing.expect(client.cb.allow());
-    client.cb.recordFailure();
+    try std.testing.expect(client.cb.allow(client.io));
+    client.cb.recordFailure(client.io);
     try std.testing.expectEqual(@as(u32, 1), client.cb.failure_count);
 }
 

@@ -3,7 +3,11 @@
 const std = @import("std");
 const Time = @import("../core/Time.zig");
 
-/// Simple circuit breaker compatible with zigzero sqlx expectations
+/// Simple circuit breaker compatible with zigzero sqlx expectations.
+///
+/// Does not store `std.Io`: callers pass the live `Io` into `allow` /
+/// `recordSuccess` / `recordFailure` so futex waits always use a handle
+/// that outlives the call (typically `Client.io`).
 pub const CircuitBreaker = struct {
     const Self = @This();
 
@@ -15,17 +19,14 @@ pub const CircuitBreaker = struct {
     timeout_ms: u64 = 5000,
     last_failure_ms: i64 = 0,
     mutex: std.Io.Mutex = .init,
-    io: std.Io = undefined,
 
-    pub fn new(io: std.Io) Self {
-        return .{
-            .io = io,
-        };
+    pub fn new() Self {
+        return .{};
     }
 
-    pub fn allow(self: *Self) bool {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+    pub fn allow(self: *Self, io: std.Io) bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         switch (self.state) {
             .closed => return true,
@@ -42,9 +43,9 @@ pub const CircuitBreaker = struct {
         }
     }
 
-    pub fn recordSuccess(self: *Self) void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+    pub fn recordSuccess(self: *Self, io: std.Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         switch (self.state) {
             .closed => {
@@ -62,9 +63,9 @@ pub const CircuitBreaker = struct {
         }
     }
 
-    pub fn recordFailure(self: *Self) void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+    pub fn recordFailure(self: *Self, io: std.Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         self.failure_count += 1;
         self.last_failure_ms = Time.monotonicNowSeconds() * 1000;
