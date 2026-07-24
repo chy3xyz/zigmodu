@@ -46,8 +46,10 @@ fn allocZ(allocator: std.mem.Allocator, s: []const u8) ![:0]u8 {
 }
 
 /// Format into buffer with null terminator (replaces removed bufPrintZ in Zig 0.17).
+/// Reserves the last byte for `\0` so a full format never writes past `buf.len`.
 fn bufPrintZ(buf: []u8, comptime fmt: []const u8, args: anytype) ![:0]u8 {
-    const written = try std.fmt.bufPrint(buf, fmt, args);
+    if (buf.len == 0) return error.NoSpaceLeft;
+    const written = try std.fmt.bufPrint(buf[0 .. buf.len - 1], fmt, args);
     buf[written.len] = 0;
     return buf[0..written.len :0];
 }
@@ -1422,39 +1424,45 @@ fn pgDecodeNumeric(allocator: std.mem.Allocator, bytes: []const u8) !Value {
     }
     // Adjust: raw fnz is within dec; actual decimal position is first_decimal_pos + fnz
     const true_fnz = first_decimal_pos + fnz;
+    const dscale_usz: usize = @intCast(dscale);
 
-    // Phase 2: build output in a stack buffer
-    var out: [256]u8 = undefined;
-    var o: usize = 0;
-    if (is_neg) { out[o] = '-'; o += 1; }
+    // Phase 2: heap buffer (was fixed [256]u8 — overflowed on large numeric / high dscale).
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    // Upper bound: sign + int digits + '.' + dscale padding.
+    const cap_hint = 1 + total + dscale_usz + 2;
+    try out.ensureTotalCapacity(allocator, cap_hint);
+
+    if (is_neg) try out.append(allocator, '-');
 
     if (true_fnz >= digits_before_dot) {
         // Pure fraction: "0.00...xxx"
-        out[o] = '0'; o += 1;
-        out[o] = '.'; o += 1;
+        try out.append(allocator, '0');
+        try out.append(allocator, '.');
         const lead_zeros = true_fnz - digits_before_dot;
-        for (0..lead_zeros) |_| { out[o] = '0'; o += 1; }
-        const frac_chars = @min(total - fnz, @as(usize, @intCast(dscale)) - lead_zeros);
-        for (0..frac_chars) |i| { out[o] = dec.items[fnz + i]; o += 1; }
-        const need = if (@as(usize, @intCast(dscale)) > lead_zeros + frac_chars)
-            @as(usize, @intCast(dscale)) - lead_zeros - frac_chars else 0;
-        for (0..need) |_| { out[o] = '0'; o += 1; }
+        try out.appendNTimes(allocator, '0', lead_zeros);
+        const frac_room = if (lead_zeros < dscale_usz) dscale_usz - lead_zeros else 0;
+        const frac_chars = @min(total - fnz, frac_room);
+        try out.appendSlice(allocator, dec.items[fnz .. fnz + frac_chars]);
+        const padded = lead_zeros + frac_chars;
+        if (dscale_usz > padded) try out.appendNTimes(allocator, '0', dscale_usz - padded);
     } else {
         // Integer + optional fraction
         const int_chars = digits_before_dot - true_fnz;
         const int_out = @min(int_chars, total - fnz);
-        for (0..int_out) |i| { out[o] = dec.items[fnz + i]; o += 1; }
-        if (dscale > 0) {
-            out[o] = '.'; o += 1;
+        try out.appendSlice(allocator, dec.items[fnz .. fnz + int_out]);
+        if (dscale_usz > 0) {
+            try out.append(allocator, '.');
             const frac_avail = if (total > fnz + int_out) total - fnz - int_out else 0;
-            const frac_out = @min(frac_avail, @as(usize, @intCast(dscale)));
-            for (0..frac_out) |i| { out[o] = dec.items[fnz + int_out + i]; o += 1; }
-            for (frac_out..@as(usize, @intCast(dscale))) |_| { out[o] = '0'; o += 1; }
+            const frac_out = @min(frac_avail, dscale_usz);
+            try out.appendSlice(allocator, dec.items[fnz + int_out .. fnz + int_out + frac_out]);
+            if (frac_out < dscale_usz) try out.appendNTimes(allocator, '0', dscale_usz - frac_out);
         }
     }
 
     dec.deinit(allocator);
-    return .{ .string = try allocator.dupe(u8, out[0..o]) };
+    const owned = try out.toOwnedSlice(allocator);
+    return .{ .string = owned };
 }
 
 /// Format PG date (days since 2000-01-01) as `YYYY-MM-DD`.
@@ -1653,8 +1661,10 @@ fn appendCsvCell(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), value: [
 pub const PostgresConn = struct {
     conn: ?*libpq_c.PGconn,
     allocator: std.mem.Allocator,
-    /// LRU-style prepared statement cache: SQL text → statement name.
-    stmt_cache: std.StringHashMap(CachedStmt([]const u8)),
+    /// LRU-style prepared statement cache: SQL text → null-terminated statement name.
+    /// Values MUST stay `[:0]u8` (from `allocZ`): coercing to `[]const u8` then `free`
+    /// drops the sentinel and panics SafeAllocator with alloc=N+1 / free=N.
+    stmt_cache: std.StringHashMap(CachedStmt([:0]u8)),
     stmt_counter: u64 = 0,
     magic: u32 = 0xDBDBDBDB,
 
@@ -1688,7 +1698,7 @@ pub const PostgresConn = struct {
             libpq_c.PQfinish(conn);
             return error.DatabaseError;
         }
-        return .{ .conn = conn, .allocator = allocator, .stmt_cache = std.StringHashMap(CachedStmt([]const u8)).init(allocator) };
+        return .{ .conn = conn, .allocator = allocator, .stmt_cache = std.StringHashMap(CachedStmt([:0]u8)).init(allocator) };
     }
 
     fn queryFn(ptr: *anyopaque, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value) errors.ResultT(Rows) {
@@ -1821,7 +1831,7 @@ pub const PostgresConn = struct {
 
         // Evict LRU entry when at capacity.
         if (self.stmt_cache.count() >= PG_MAX_CACHED_STMTS) {
-            if (findLruStmtKey([]const u8, self.stmt_cache)) |lru_key| {
+            if (findLruStmtKey([:0]u8, self.stmt_cache)) |lru_key| {
                 if (self.stmt_cache.fetchRemove(lru_key)) |kv| {
                     var dealloc_buf: [80]u8 = undefined;
                     if (bufPrintZ(&dealloc_buf, "DEALLOCATE {s}", .{kv.value.value})) |dealloc_sql| {
@@ -1957,7 +1967,8 @@ pub const PostgresConn = struct {
 
     /// Execute already-prepared statement.
     /// Param strings live in a local arena until `PQexecPrepared` returns (heysen §1.1/§1.2).
-    fn execPreparedStmt(self: *PostgresConn, stmt_name: []const u8, args: []const Value) ?*libpq_c.PGresult {
+    /// `stmt_name` must be null-terminated (`[:0]const u8` or a `bufPrintZ` stack name).
+    fn execPreparedStmt(self: *PostgresConn, stmt_name: [:0]const u8, args: []const Value) ?*libpq_c.PGresult {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const aa = arena.allocator();
@@ -2110,10 +2121,17 @@ pub const PostgresConn = struct {
             return Cursor.init(rows);
         }
 
-        // Convert ? → $1,$2,... and null-terminate for libpq.
-        const pg_sql = if (args.len == 0) sql_str else convertPlaceholders(self.allocator, sql_str) orelse return error.DatabaseError;
-        defer if (args.len != 0) self.allocator.free(pg_sql);
-        const sql_z = allocZ(allocator, pg_sql) catch return error.DatabaseError;
+        // Convert ? → $1,$2,... then null-terminate for libpq.
+        // Keep branches separate: `if (a) []u8 else [:0]u8` coerces to []u8 and
+        // `free` then drops the sentinel (alloc=N+1 / free=N SafeAllocator panic).
+        const sql_z: [:0]u8 = blk: {
+            if (args.len == 0) {
+                break :blk allocZ(allocator, sql_str) catch return error.DatabaseError;
+            }
+            const pg_sql = convertPlaceholders(self.allocator, sql_str) orelse return error.DatabaseError;
+            defer self.allocator.free(pg_sql);
+            break :blk allocZ(allocator, pg_sql) catch return error.DatabaseError;
+        };
         defer allocator.free(sql_z);
 
         // Build text parameter arrays. Owned by `allocator` and freed before return.
@@ -5809,6 +5827,41 @@ test "pgDecodeNumeric NaN" {
     const v = try pgDecodeNumeric(allocator, &buf);
     defer allocator.free(v.string);
     try std.testing.expectEqualStrings("NaN", v.string);
+}
+
+test "pgDecodeNumeric exceeds former 256-byte stack buffer" {
+    const allocator = std.testing.allocator;
+    // 80 digit groups × 4 chars + sign + '.' + high dscale padding ≫ 256.
+    const ndigits: i16 = 80;
+    var buf: [8 + 80 * 2]u8 = undefined;
+    std.mem.writeInt(i16, buf[0..2], ndigits, .big);
+    std.mem.writeInt(i16, buf[2..4], ndigits - 1, .big); // weight → long integer part
+    std.mem.writeInt(u16, buf[4..6], 0x4000, .big); // negative
+    std.mem.writeInt(u16, buf[6..8], 40, .big); // dscale padding
+    for (0..@as(usize, @intCast(ndigits))) |i| {
+        std.mem.writeInt(u16, buf[8 + i * 2 ..][0..2], 1234, .big);
+    }
+    const v = try pgDecodeNumeric(allocator, &buf);
+    defer allocator.free(v.string);
+    try std.testing.expect(v.string.len > 256);
+    try std.testing.expect(v.string[0] == '-');
+}
+
+test "bufPrintZ reserves byte for null terminator" {
+    var buf: [4]u8 = undefined;
+    // Fits in 3 payload bytes + 1 sentinel.
+    const ok = try bufPrintZ(&buf, "{s}", .{"ab"});
+    try std.testing.expectEqualStrings("ab", ok);
+    try std.testing.expectEqual(@as(u8, 0), buf[2]);
+    // Would need 4 payload bytes — must fail instead of writing past buf.
+    try std.testing.expectError(error.NoSpaceLeft, bufPrintZ(&buf, "{s}", .{"abcd"}));
+}
+
+test "allocZ free keeps sentinel (stmt_cache contract)" {
+    const allocator = std.testing.allocator;
+    const name = try allocZ(allocator, "zs_1");
+    // Must free as [:0]u8 — coercing to []const u8 is the production panic.
+    allocator.free(name);
 }
 
 test "pgDecodeInterval basic" {
