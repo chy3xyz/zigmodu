@@ -176,6 +176,8 @@ test "compile all source files" {
     // gRPC Transport
     _ = @import("http/Http2.zig");
     _ = @import("http/Http2Server.zig");
+    _ = @import("http/Http2Tls.zig");
+    _ = @import("http/Hpack.zig");
     _ = @import("extensions/GrpcTransport.zig");
 
     // Kafka Connector

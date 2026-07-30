@@ -5,12 +5,16 @@
 //! - In-process dispatch via `GrpcServiceRegistry.invoke`
 //! - HTTP/1.1 + `application/grpc` unary (gRPC status in headers)
 //!
-//! Server streaming (landed):
+//! Server streaming:
 //! - `registerServerStreamMethod` + `GrpcStreamWriter`
 //! - HTTP/1.1 concatenated frames via `handleHttpServerStream`
 //! - HTTP/2 DATA+trailers packaging via `http.Http2.encodeGrpcServerStream`
 //!
-//! Client/bidi streaming still return `UNIMPLEMENTED` (need full duplex H2 session).
+//! Client / bidi streaming (client half-close model):
+//! - Request body = concatenated length-prefixed frames; then handler runs
+//! - `registerClientStreamMethod` / `registerBidiStreamMethod`
+//! - True interleaved duplex still needs a live H2 session pump
+//!
 //! Protobuf encode/decode stays in application code; this layer carries bytes.
 
 const std = @import("std");
@@ -174,6 +178,93 @@ pub const UnaryHandler = *const fn (request: GrpcRequest) anyerror!GrpcResponse;
 /// Server-streaming handler: write zero or more messages, then finish.
 pub const StreamHandler = *const fn (request: GrpcRequest, writer: *GrpcStreamWriter) anyerror!void;
 
+/// Client-streaming: read all client messages (after half-close), return one response.
+pub const ClientStreamHandler = *const fn (request: GrpcRequest, reader: *GrpcStreamReader) anyerror!GrpcResponse;
+
+/// Bidi: read client frames + write server frames (after client half-close on HTTP mapping).
+pub const BidiHandler = *const fn (request: GrpcRequest, reader: *GrpcStreamReader, writer: *GrpcStreamWriter) anyerror!void;
+
+/// Per-message bidi pump — called once per complete inbound frame (enables interleaved flush).
+pub const BidiPumpHandler = *const fn (request: GrpcRequest, msg: []const u8, writer: *GrpcStreamWriter) anyerror!void;
+
+/// Iterates length-prefixed gRPC frames in a concatenated body.
+pub const GrpcStreamReader = struct {
+    allocator: std.mem.Allocator,
+    data: []const u8,
+    offset: usize = 0,
+    count: usize = 0,
+
+    pub fn init(allocator: std.mem.Allocator, data: []const u8) GrpcStreamReader {
+        return .{ .allocator = allocator, .data = data };
+    }
+
+    /// Next message payload (slice into `data`), or null at EOF.
+    pub fn next(self: *GrpcStreamReader) !?[]const u8 {
+        if (self.offset >= self.data.len) return null;
+        const rem = self.data[self.offset..];
+        if (rem.len < 5) return error.IncompleteGrpcFrame;
+        if (rem[0] != 0) return error.CompressedNotSupported;
+        const len: u32 = (@as(u32, rem[1]) << 24) | (@as(u32, rem[2]) << 16) | (@as(u32, rem[3]) << 8) | rem[4];
+        if (5 + len > rem.len) return error.IncompleteGrpcFrame;
+        const payload = rem[5 .. 5 + len];
+        self.offset += 5 + @as(usize, len);
+        self.count += 1;
+        return payload;
+    }
+
+    pub fn remaining(self: *const GrpcStreamReader) usize {
+        return self.data.len - self.offset;
+    }
+};
+
+/// Growable reader for live H2 DATA (incomplete frames wait for more bytes).
+pub const GrpcStreamBuffer = struct {
+    allocator: std.mem.Allocator,
+    buf: std.ArrayList(u8) = .empty,
+    offset: usize = 0,
+    ended: bool = false,
+    count: usize = 0,
+
+    pub fn init(allocator: std.mem.Allocator) GrpcStreamBuffer {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *GrpcStreamBuffer) void {
+        self.buf.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn append(self: *GrpcStreamBuffer, data: []const u8) !void {
+        try self.buf.appendSlice(self.allocator, data);
+    }
+
+    pub fn markEnded(self: *GrpcStreamBuffer) void {
+        self.ended = true;
+    }
+
+    /// Returns next complete message, or null if need more data (or EOF when ended).
+    pub fn tryNext(self: *GrpcStreamBuffer) !?[]const u8 {
+        const rem = self.buf.items[self.offset..];
+        if (rem.len < 5) {
+            if (self.ended) {
+                if (rem.len == 0) return null;
+                return error.IncompleteGrpcFrame;
+            }
+            return null;
+        }
+        if (rem[0] != 0) return error.CompressedNotSupported;
+        const len: u32 = (@as(u32, rem[1]) << 24) | (@as(u32, rem[2]) << 16) | (@as(u32, rem[3]) << 8) | rem[4];
+        if (5 + len > rem.len) {
+            if (self.ended) return error.IncompleteGrpcFrame;
+            return null;
+        }
+        const payload = rem[5 .. 5 + len];
+        self.offset += 5 + @as(usize, len);
+        self.count += 1;
+        return payload;
+    }
+};
+
 /// Collects length-prefixed gRPC frames for server streaming.
 pub const GrpcStreamWriter = struct {
     allocator: std.mem.Allocator,
@@ -182,6 +273,9 @@ pub const GrpcStreamWriter = struct {
     message: []const u8 = "",
     message_owned: bool = false,
     count: usize = 0,
+    /// Optional live flush: called with each newly framed message (for H2 DATA interleaving).
+    on_flush: ?*const fn (user_ctx: ?*anyopaque, framed: []const u8) anyerror!void = null,
+    flush_ctx: ?*anyopaque = null,
 
     pub fn init(allocator: std.mem.Allocator) GrpcStreamWriter {
         return .{ .allocator = allocator };
@@ -198,6 +292,9 @@ pub const GrpcStreamWriter = struct {
         defer self.allocator.free(framed);
         try self.body.appendSlice(self.allocator, framed);
         self.count += 1;
+        if (self.on_flush) |flush| {
+            try flush(self.flush_ctx, framed);
+        }
     }
 
     pub fn finish(self: *GrpcStreamWriter, status: GrpcStatusCode, message: []const u8) !void {
@@ -227,6 +324,9 @@ pub const GrpcServiceRegistry = struct {
         method: GrpcMethod,
         unary_handler: ?UnaryHandler = null,
         stream_handler: ?StreamHandler = null,
+        client_stream_handler: ?ClientStreamHandler = null,
+        bidi_handler: ?BidiHandler = null,
+        bidi_pump_handler: ?BidiPumpHandler = null,
     };
 
     /// Result of HTTP unary handling (caller frees `body` and `grpc_message`).
@@ -301,8 +401,11 @@ pub const GrpcServiceRegistry = struct {
         method_type: GrpcMethod.MethodType,
         handler: UnaryHandler,
     ) !void {
-        if (method_type != .unary) return error.UseRegisterServerStreamMethod;
-        try self.putMethod(service_name, method_name, .unary, handler, null);
+        if (method_type != .unary) return error.UseTypedRegisterHelpers;
+        try self.putMethod(service_name, method_name, .{
+            .method_type = .unary,
+            .unary_handler = handler,
+        });
     }
 
     /// Register a server-streaming RPC (`StreamHandler` writes multiple messages).
@@ -312,16 +415,63 @@ pub const GrpcServiceRegistry = struct {
         method_name: []const u8,
         handler: StreamHandler,
     ) !void {
-        try self.putMethod(service_name, method_name, .server_streaming, null, handler);
+        try self.putMethod(service_name, method_name, .{
+            .method_type = .server_streaming,
+            .stream_handler = handler,
+        });
     }
+
+    pub fn registerClientStreamMethod(
+        self: *Self,
+        service_name: []const u8,
+        method_name: []const u8,
+        handler: ClientStreamHandler,
+    ) !void {
+        try self.putMethod(service_name, method_name, .{
+            .method_type = .client_streaming,
+            .client_stream_handler = handler,
+        });
+    }
+
+    pub fn registerBidiStreamMethod(
+        self: *Self,
+        service_name: []const u8,
+        method_name: []const u8,
+        handler: BidiHandler,
+    ) !void {
+        try self.putMethod(service_name, method_name, .{
+            .method_type = .bidi_streaming,
+            .bidi_handler = handler,
+        });
+    }
+
+    /// Register per-message bidi pump (interleaved: each inbound msg can flush outbound DATA).
+    pub fn registerBidiPumpMethod(
+        self: *Self,
+        service_name: []const u8,
+        method_name: []const u8,
+        handler: BidiPumpHandler,
+    ) !void {
+        try self.putMethod(service_name, method_name, .{
+            .method_type = .bidi_streaming,
+            .bidi_pump_handler = handler,
+        });
+    }
+
+    const PutOpts = struct {
+        method_type: GrpcMethod.MethodType,
+        unary_handler: ?UnaryHandler = null,
+        stream_handler: ?StreamHandler = null,
+        client_stream_handler: ?ClientStreamHandler = null,
+        bidi_handler: ?BidiHandler = null,
+        bidi_pump_handler: ?BidiPumpHandler = null,
+    };
 
     fn putMethod(
         self: *Self,
         service_name: []const u8,
         method_name: []const u8,
-        method_type: GrpcMethod.MethodType,
-        unary_handler: ?UnaryHandler,
-        stream_handler: ?StreamHandler,
+        opts: PutOpts,
     ) !void {
         const svc = self.services.getPtr(service_name) orelse return error.ServiceNotFound;
         const path = try std.fmt.allocPrint(self.allocator, "/{s}/{s}", .{ service_name, method_name });
@@ -336,10 +486,13 @@ pub const GrpcServiceRegistry = struct {
                 .path = path,
                 .service = svc_copy,
                 .method = meth_copy,
-                .method_type = method_type,
+                .method_type = opts.method_type,
             },
-            .unary_handler = unary_handler,
-            .stream_handler = stream_handler,
+            .unary_handler = opts.unary_handler,
+            .stream_handler = opts.stream_handler,
+            .client_stream_handler = opts.client_stream_handler,
+            .bidi_handler = opts.bidi_handler,
+            .bidi_pump_handler = opts.bidi_pump_handler,
         });
     }
 
@@ -495,6 +648,225 @@ pub const GrpcServiceRegistry = struct {
             .message_count = count,
             .http2_wire = h2,
         };
+    }
+
+    pub fn invokeClientStream(self: *Self, path: []const u8, framed_body: []const u8) !OwnedGrpcResponse {
+        const found = self.findMethod(path) orelse {
+            return OwnedGrpcResponse{
+                .payload = try self.allocator.dupe(u8, ""),
+                .status = .NOT_FOUND,
+                .message = try self.allocator.dupe(u8, "method not found"),
+                .allocator = self.allocator,
+            };
+        };
+        if (found.method.method_type != .client_streaming or found.client_stream_handler == null) {
+            return OwnedGrpcResponse{
+                .payload = try self.allocator.dupe(u8, ""),
+                .status = .UNIMPLEMENTED,
+                .message = try self.allocator.dupe(u8, "client streaming handler not registered"),
+                .allocator = self.allocator,
+            };
+        }
+        var reader = GrpcStreamReader.init(self.allocator, framed_body);
+        var metadata = std.StringHashMap([]const u8).init(self.allocator);
+        defer metadata.deinit();
+        const req = GrpcRequest{
+            .method = found.method,
+            .payload = framed_body,
+            .metadata = metadata,
+            .timeout_ms = 30_000,
+        };
+        const resp = found.client_stream_handler.?(req, &reader) catch |err| {
+            return OwnedGrpcResponse{
+                .payload = try self.allocator.dupe(u8, ""),
+                .status = .INTERNAL,
+                .message = try self.allocator.dupe(u8, @errorName(err)),
+                .allocator = self.allocator,
+            };
+        };
+        return OwnedGrpcResponse{
+            .payload = try self.allocator.dupe(u8, resp.payload),
+            .status = resp.status,
+            .message = try self.allocator.dupe(u8, resp.message),
+            .allocator = self.allocator,
+        };
+    }
+
+    pub fn invokeBidi(self: *Self, path: []const u8, framed_body: []const u8, writer: *GrpcStreamWriter) !void {
+        const found = self.findMethod(path) orelse {
+            try writer.finish(.NOT_FOUND, "method not found");
+            return;
+        };
+        if (found.method.method_type != .bidi_streaming or found.bidi_handler == null) {
+            try writer.finish(.UNIMPLEMENTED, "bidi handler not registered");
+            return;
+        }
+        var reader = GrpcStreamReader.init(self.allocator, framed_body);
+        var metadata = std.StringHashMap([]const u8).init(self.allocator);
+        defer metadata.deinit();
+        const req = GrpcRequest{
+            .method = found.method,
+            .payload = framed_body,
+            .metadata = metadata,
+            .timeout_ms = 30_000,
+        };
+        found.bidi_handler.?(req, &reader, writer) catch |err| {
+            try writer.finish(.INTERNAL, @errorName(err));
+            return;
+        };
+        if (!writer.message_owned) {
+            try writer.finish(writer.status, writer.message);
+        }
+    }
+
+    /// Client-streaming over HTTP: concatenated request frames → single response frame + optional H2 wire.
+    pub fn handleHttpClientStream(self: *Self, path: []const u8, body: []const u8, stream_id: u31) !HttpStreamResult {
+        const owned = try self.invokeClientStream(path, body);
+        const grpc_status = owned.status;
+        const http_status: u16 = if (grpc_status == .OK) 200 else grpc_status.toHttpCode();
+        const framed = try GrpcFrame.encode(self.allocator, owned.payload);
+        self.allocator.free(owned.payload);
+        const status_str = try std.fmt.allocPrint(self.allocator, "{d}", .{@intFromEnum(grpc_status)});
+        defer self.allocator.free(status_str);
+        const h2 = try Http2.encodeGrpcServerStream(self.allocator, stream_id, framed, status_str, owned.message);
+        return .{
+            .http_status = http_status,
+            .body = framed,
+            .grpc_status = grpc_status,
+            .grpc_message = owned.message,
+            .message_count = 1,
+            .http2_wire = h2,
+        };
+    }
+
+    /// Bidi over HTTP (client half-close then server stream).
+    pub fn handleHttpBidi(self: *Self, path: []const u8, body: []const u8, stream_id: u31) !HttpStreamResult {
+        var writer = GrpcStreamWriter.init(self.allocator);
+        errdefer writer.deinit();
+        try self.invokeBidi(path, body, &writer);
+
+        const status = writer.status;
+        const http_status: u16 = if (status == .OK) 200 else status.toHttpCode();
+        const msg_copy = try self.allocator.dupe(u8, writer.message);
+        const body_owned = try self.allocator.dupe(u8, writer.bytes());
+        const count = writer.count;
+        const status_str = try std.fmt.allocPrint(self.allocator, "{d}", .{@intFromEnum(status)});
+        defer self.allocator.free(status_str);
+        const h2 = try Http2.encodeGrpcServerStream(self.allocator, stream_id, body_owned, status_str, writer.message);
+        writer.deinit();
+
+        return .{
+            .http_status = http_status,
+            .body = body_owned,
+            .grpc_status = status,
+            .grpc_message = msg_copy,
+            .message_count = count,
+            .http2_wire = h2,
+        };
+    }
+
+    /// Drive bidi pump over a complete body (or live via `on_flush` on writer).
+    pub const FlushHook = struct {
+        cb: *const fn (user_ctx: ?*anyopaque, framed: []const u8) anyerror!void,
+        ctx: ?*anyopaque,
+    };
+
+    pub fn handleHttpBidiPump(
+        self: *Self,
+        path: []const u8,
+        body: []const u8,
+        stream_id: u31,
+        flush: ?FlushHook,
+    ) !HttpStreamResult {
+        const found = self.findMethod(path) orelse {
+            return .{
+                .http_status = 404,
+                .body = try GrpcFrame.encode(self.allocator, ""),
+                .grpc_status = .NOT_FOUND,
+                .grpc_message = try self.allocator.dupe(u8, "method not found"),
+                .message_count = 0,
+            };
+        };
+        const pump = found.bidi_pump_handler orelse {
+            return .{
+                .http_status = 501,
+                .body = try GrpcFrame.encode(self.allocator, ""),
+                .grpc_status = .UNIMPLEMENTED,
+                .grpc_message = try self.allocator.dupe(u8, "bidi pump handler not registered"),
+                .message_count = 0,
+            };
+        };
+
+        var writer = GrpcStreamWriter.init(self.allocator);
+        errdefer writer.deinit();
+        if (flush) |f| {
+            writer.on_flush = f.cb;
+            writer.flush_ctx = f.ctx;
+        }
+
+        var metadata = std.StringHashMap([]const u8).init(self.allocator);
+        defer metadata.deinit();
+        const req = GrpcRequest{
+            .method = found.method,
+            .payload = body,
+            .metadata = metadata,
+            .timeout_ms = 30_000,
+        };
+
+        var reader = GrpcStreamReader.init(self.allocator, body);
+        while (try reader.next()) |msg| {
+            pump(req, msg, &writer) catch |err| {
+                try writer.finish(.INTERNAL, @errorName(err));
+                break;
+            };
+        }
+        if (!writer.message_owned) {
+            try writer.finish(.OK, "");
+        }
+
+        const status = writer.status;
+        const http_status: u16 = if (status == .OK) 200 else status.toHttpCode();
+        const msg_copy = try self.allocator.dupe(u8, writer.message);
+        const body_owned = try self.allocator.dupe(u8, writer.bytes());
+        const count = writer.count;
+        const status_str = try std.fmt.allocPrint(self.allocator, "{d}", .{@intFromEnum(status)});
+        defer self.allocator.free(status_str);
+        // When live flush was used, http2_wire may only need trailers; still package full response for batch mode.
+        const h2 = if (flush == null)
+            try Http2.encodeGrpcServerStream(self.allocator, stream_id, body_owned, status_str, writer.message)
+        else
+            null;
+        writer.deinit();
+
+        return .{
+            .http_status = http_status,
+            .body = body_owned,
+            .grpc_status = status,
+            .grpc_message = msg_copy,
+            .message_count = count,
+            .http2_wire = h2,
+        };
+    }
+
+    /// Process one inbound message through a pump handler (live H2 DATA path).
+    pub fn pumpBidiMessage(self: *Self, path: []const u8, msg: []const u8, writer: *GrpcStreamWriter) !void {
+        const found = self.findMethod(path) orelse {
+            try writer.finish(.NOT_FOUND, "method not found");
+            return;
+        };
+        const pump = found.bidi_pump_handler orelse {
+            try writer.finish(.UNIMPLEMENTED, "bidi pump handler not registered");
+            return;
+        };
+        var metadata = std.StringHashMap([]const u8).init(self.allocator);
+        defer metadata.deinit();
+        const req = GrpcRequest{
+            .method = found.method,
+            .payload = msg,
+            .metadata = metadata,
+            .timeout_ms = 30_000,
+        };
+        try pump(req, msg, writer);
     }
 };
 
@@ -869,6 +1241,106 @@ test "server streaming invoke and HTTP/2 packaging" {
     var bad = try registry.invoke("/tick.Ticker/Watch", "");
     defer bad.deinit();
     try std.testing.expectEqual(GrpcStatusCode.UNIMPLEMENTED, bad.status);
+}
+
+test "client streaming aggregates frames" {
+    const allocator = std.testing.allocator;
+    var registry = GrpcServiceRegistry.init(allocator);
+    defer registry.deinit();
+    try registry.registerService("sum.Adder");
+    try registry.registerClientStreamMethod("sum.Adder", "Add", struct {
+        fn handler(_: GrpcRequest, reader: *GrpcStreamReader) !GrpcResponse {
+            while (try reader.next()) |_| {}
+            return .{ .payload = "3", .status = .OK, .message = "" };
+        }
+    }.handler);
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+    for ([_][]const u8{ "a", "bb", "ccc" }) |p| {
+        const f = try GrpcFrame.encode(allocator, p);
+        defer allocator.free(f);
+        try body.appendSlice(allocator, f);
+    }
+
+    var owned = try registry.invokeClientStream("/sum.Adder/Add", body.items);
+    defer owned.deinit();
+    try std.testing.expectEqual(GrpcStatusCode.OK, owned.status);
+    try std.testing.expectEqualStrings("3", owned.payload);
+
+    var result = try registry.handleHttpClientStream("/sum.Adder/Add", body.items, 3);
+    defer result.deinit(allocator);
+    try std.testing.expect(result.http2_wire != null);
+}
+
+test "bidi streaming echo each request frame" {
+    const allocator = std.testing.allocator;
+    var registry = GrpcServiceRegistry.init(allocator);
+    defer registry.deinit();
+    try registry.registerService("echo.Chat");
+    try registry.registerBidiStreamMethod("echo.Chat", "Chat", struct {
+        fn handler(_: GrpcRequest, reader: *GrpcStreamReader, writer: *GrpcStreamWriter) !void {
+            while (try reader.next()) |msg| {
+                try writer.send(msg);
+            }
+            try writer.finish(.OK, "");
+        }
+    }.handler);
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+    for ([_][]const u8{ "hi", "there" }) |p| {
+        const f = try GrpcFrame.encode(allocator, p);
+        defer allocator.free(f);
+        try body.appendSlice(allocator, f);
+    }
+
+    var writer = GrpcStreamWriter.init(allocator);
+    defer writer.deinit();
+    try registry.invokeBidi("/echo.Chat/Chat", body.items, &writer);
+    try std.testing.expectEqual(@as(usize, 2), writer.count);
+    try std.testing.expectEqual(GrpcStatusCode.OK, writer.status);
+
+    var result = try registry.handleHttpBidi("/echo.Chat/Chat", body.items, 5);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), result.message_count);
+    try std.testing.expect(result.http2_wire != null);
+}
+
+test "bidi pump echoes each message" {
+    const allocator = std.testing.allocator;
+    var registry = GrpcServiceRegistry.init(allocator);
+    defer registry.deinit();
+    try registry.registerService("echo.Chat");
+    try registry.registerBidiPumpMethod("echo.Chat", "Pump", struct {
+        fn handler(_: GrpcRequest, msg: []const u8, writer: *GrpcStreamWriter) !void {
+            try writer.send(msg);
+        }
+    }.handler);
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+    for ([_][]const u8{ "x", "y" }) |p| {
+        const f = try GrpcFrame.encode(allocator, p);
+        defer allocator.free(f);
+        try body.appendSlice(allocator, f);
+    }
+
+    var result = try registry.handleHttpBidiPump("/echo.Chat/Pump", body.items, 7, null);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), result.message_count);
+    try std.testing.expectEqual(GrpcStatusCode.OK, result.grpc_status);
+    try std.testing.expect(result.http2_wire != null);
+
+    var buf = GrpcStreamBuffer.init(allocator);
+    defer buf.deinit();
+    try buf.append(body.items);
+    buf.markEnded();
+    const a = (try buf.tryNext()).?;
+    const b = (try buf.tryNext()).?;
+    try std.testing.expectEqualStrings("x", a);
+    try std.testing.expectEqualStrings("y", b);
+    try std.testing.expect((try buf.tryNext()) == null);
 }
 
 test "ProtoParser detects stream keyword" {

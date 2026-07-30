@@ -63,4 +63,38 @@ cd "$ROOT/examples/http-stress-test"
 zig build -Doptimize=ReleaseSafe
 ./zig-out/bin/http-stress-test
 
+# ── ShopDemo smoke (order module, separate port) ──
+SHOP_PORT="${SHOPDEMO_HTTP_PORT:-18081}"
+SHOP_BASE="http://127.0.0.1:${SHOP_PORT}"
+
+echo "integration: build shopdemo"
+cd "$ROOT/examples/shopdemo"
+zig build -Doptimize=ReleaseSafe
+SHOP_BIN="$ROOT/examples/shopdemo/zig-out/bin/shopdemo"
+
+echo "integration: start shopdemo on :${SHOP_PORT}"
+HTTP_PORT="${SHOP_PORT}" "$SHOP_BIN" &
+SHOP_PID=$!
+# Extend trap to also stop shopdemo
+trap 'kill "$PID" "$SHOP_PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true; wait "$SHOP_PID" 2>/dev/null || true' EXIT
+
+wait_shop() {
+  local path="$1"
+  for _ in $(seq 1 40); do
+    if curl -sf "${SHOP_BASE}${path}" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "integration: timeout waiting for shopdemo ${path}" >&2
+  return 1
+}
+
+wait_shop "/health/live"
+SHOP_BODY="$(curl -sf "${SHOP_BASE}/health/live")"
+echo "$SHOP_BODY" | grep -q '"status":"UP"'
+
+SHOP_ORDERS="$(curl -sf "${SHOP_BASE}/api/v1/orders")"
+echo "$SHOP_ORDERS" | grep -q '"items"'
+
 echo "integration: OK"

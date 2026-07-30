@@ -144,11 +144,12 @@ bash scripts/ci-integration.sh   # tenant-mgmt + http-stress-test（需 curl）
    - **在 `observability.zig` 导出**：支持标准云原生 Trace / Span 上报。
 4. **工具链与生成器集成 (zmodu CLI) (✅ 已落地)**
    - **`zmodu` 独立 CLI 集成**：编写 [`docs/ZMODU_CLI_INTEGRATION.md`](ZMODU_CLI_INTEGRATION.md)，打通 SQL DDL Schema 一键构建 `@initialized` 模版工程，全量支持 MCP Server 与 Modulith 六层分层生成。
-5. **协议传输层高阶演进 (gRPC Streaming & HTTP/2)** — **部分落地（本轮加深）**
-   - HTTP/2：`Http2` 帧层 + `Http2Server.serveAfterPreface`；`Server.setHttp2Enabled(true)` 在 connFiber 探测 `PRI * HTTP/2.0`
-   - gRPC-over-H2：`Server.setGrpcRegistry` → unary / server-stream 分发
-   - Kafka Consumer Group **live**：`joinGroup`/`heartbeat`/`leaveGroup` 经 `RobustMQTransport.request`（无 broker 时离线 solo 分配）
-   - Client/bidi gRPC、完整 HPACK/多路复用仍为后续
+5. **协议传输层高阶演进 (gRPC Streaming & HTTP/2)** — **本轮加深（PRIORITY 加权调度）**
+   - HTTP/2：WINDOW_UPDATE + SETTINGS + **PRIORITY 依赖树** + **加权 fair 出站调度**（`PriorityTree` deficit WRR + `OutboundScheduler`）+ h2c Upgrade
+   - Kafka：`cooperative_sticky` + **`applyCooperativeAssignment` / `acknowledgeRevocation` 两阶段**（revoking → stable）
+   - TLS：sidecar ALPN（`Http2Tls`）；进程内 TLS server 仍待 Zig stdlib
+   - CI：tenant-mgmt + stress + shopdemo smoke
+   - 仍后续：进程内 TLS server、cooperative 与 broker 的完整 revoke 协议往返
 6. **分布式状态机与容错增强 (✅ 已落地)**
    - **Raft Log Compaction & InstallSnapshot**：在 [`src/core/cluster/RaftElection.zig`](../src/core/cluster/RaftElection.zig) 中实现 `InstallSnapshotRequest`/`Response` 协议，提供 `compactLog` 内存裁切与 Follower 快照覆盖能力，防止 Raft 日志无限增长。
    - **Saga 事务协调器**：持续支持服务节点崩溃重启后的 WAL Recovery。

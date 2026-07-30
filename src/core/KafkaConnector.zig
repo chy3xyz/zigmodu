@@ -51,6 +51,31 @@ pub const KafkaProducerConfig = struct {
     };
 };
 
+pub const PartitionAssignorKind = enum {
+    range,
+    round_robin,
+    sticky,
+    cooperative_sticky,
+
+    pub fn protocolName(self: PartitionAssignorKind) []const u8 {
+        return switch (self) {
+            .range => "range",
+            .round_robin => "roundrobin",
+            .sticky => "sticky",
+            .cooperative_sticky => "cooperative-sticky",
+        };
+    }
+};
+
+/// Parse config string into assignor kind (`cooperative_sticky`, `cooperative-sticky`, etc.).
+pub fn parsePartitionAssignorKind(s: []const u8) ?PartitionAssignorKind {
+    if (std.mem.eql(u8, s, "range")) return .range;
+    if (std.mem.eql(u8, s, "round_robin") or std.mem.eql(u8, s, "roundrobin")) return .round_robin;
+    if (std.mem.eql(u8, s, "sticky")) return .sticky;
+    if (std.mem.eql(u8, s, "cooperative_sticky") or std.mem.eql(u8, s, "cooperative-sticky")) return .cooperative_sticky;
+    return null;
+}
+
 pub const KafkaConsumerConfig = struct {
     bootstrap_servers: []const u8 = "127.0.0.1:9092",
     group_id: []const u8 = "zigmodu-group",
@@ -59,6 +84,9 @@ pub const KafkaConsumerConfig = struct {
     enable_auto_commit: bool = true,
     max_poll_records: usize = 500,
     session_timeout_ms: u64 = 45000,
+    /// Used by leader partition assignor when Metadata is unavailable.
+    default_partition_count: i32 = 3,
+    partition_assignor: PartitionAssignorKind = .range,
     offline: bool = false,
 };
 
@@ -73,6 +101,8 @@ pub const RobustMQTransport = struct {
     client_id: []const u8,
     host: []const u8,
     port: u16,
+    /// Set when redirected via FindCoordinator (owned).
+    owned_host: ?[]u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, bootstrap: []const u8, client_id: []const u8) !Self {
         const host, const port = try parseBootstrap(bootstrap);
@@ -87,6 +117,7 @@ pub const RobustMQTransport = struct {
 
     pub fn deinit(self: *Self) void {
         self.close();
+        if (self.owned_host) |h| self.allocator.free(h);
         self.* = undefined;
     }
 
@@ -95,6 +126,63 @@ pub const RobustMQTransport = struct {
             s.close(self.io);
             self.stream = null;
         }
+    }
+
+    /// Close current socket and connect to `host:port` (e.g. group coordinator).
+    pub fn reconnectTo(self: *Self, host: []const u8, port: u16) !void {
+        self.close();
+        if (self.owned_host) |h| self.allocator.free(h);
+        self.owned_host = try self.allocator.dupe(u8, host);
+        self.host = self.owned_host.?;
+        self.port = port;
+        try self.connect();
+    }
+
+    /// Metadata for the given topics (empty slice → all topics). Caller frees via `KafkaWireFormat.freeTopicMetaList`.
+    pub fn fetchMetadata(self: *Self, topics: []const []const u8) ![]KafkaWireFormat.TopicMeta {
+        try self.ensureConnected();
+        const corr = self.nextCorrelation();
+        const req = try KafkaWireFormat.buildMetadataRequest(self.allocator, topics, corr, self.client_id);
+        defer self.allocator.free(req);
+        const resp = try self.request(req);
+        defer self.allocator.free(resp);
+        return KafkaWireFormat.parseMetadataResponse(self.allocator, resp, corr);
+    }
+
+    /// Partition count for a single topic from Metadata; errors if topic missing or count invalid.
+    pub fn fetchTopicPartitions(self: *Self, topic: []const u8) !i32 {
+        const meta = try self.fetchMetadata(&.{topic});
+        defer KafkaWireFormat.freeTopicMetaList(self.allocator, meta);
+        for (meta) |m| {
+            if (std.mem.eql(u8, m.topic, topic)) {
+                if (m.partition_count <= 0) return error.InvalidPartitionCount;
+                return m.partition_count;
+            }
+        }
+        return error.TopicNotFound;
+    }
+
+    /// FindCoordinator + optional reconnect to returned host:port.
+    pub fn findCoordinator(self: *Self, group_id: []const u8) !KafkaWireFormat.CoordinatorInfo {
+        try self.ensureConnected();
+        const corr = self.nextCorrelation();
+        const req = try KafkaWireFormat.buildFindCoordinatorRequest(self.allocator, group_id, corr, self.client_id);
+        defer self.allocator.free(req);
+        const resp = try self.request(req);
+        defer self.allocator.free(resp);
+        const info = try KafkaWireFormat.parseFindCoordinatorResponse(self.allocator, resp, corr);
+        errdefer {
+            self.allocator.free(info.host);
+        }
+        if (info.error_code != 0) {
+            self.allocator.free(info.host);
+            return error.FindCoordinatorFailed;
+        }
+        const need_redirect = !std.mem.eql(u8, info.host, self.host) or info.port != @as(i32, self.port);
+        if (need_redirect) {
+            try self.reconnectTo(info.host, @intCast(info.port));
+        }
+        return info;
     }
 
     pub fn connect(self: *Self) !void {
@@ -364,12 +452,400 @@ pub const KafkaProducer = struct {
     }
 };
 
-/// In-process / offline consumer-group membership (Join → Sync → Heartbeat).
-/// Wire builders live in `KafkaWireFormat`; this tracks generation, member id, and assignments.
+/// Shared partition-assignment result for all assignors.
+pub const PartitionAssignor = struct {
+    pub const MemberPartitions = struct {
+        member_id: []const u8,
+        partitions: []i32,
+    };
+
+    pub fn freeAssignment(allocator: std.mem.Allocator, assignment: []MemberPartitions) void {
+        for (assignment) |mp| allocator.free(mp.partitions);
+        allocator.free(assignment);
+    }
+
+    pub fn assignByKind(
+        allocator: std.mem.Allocator,
+        kind: PartitionAssignorKind,
+        member_ids: []const []const u8,
+        partition_count: i32,
+        previous: []const StickyAssignor.PreviousAssignment,
+    ) ![]MemberPartitions {
+        return switch (kind) {
+            .range => RangeAssignor.assign(allocator, member_ids, partition_count),
+            .round_robin => RoundRobinAssignor.assign(allocator, member_ids, partition_count),
+            .sticky => StickyAssignor.assign(allocator, member_ids, partition_count, previous),
+            .cooperative_sticky => CooperativeStickyAssignor.assign(allocator, member_ids, partition_count, previous),
+        };
+    }
+
+    fn sortedMemberOrder(allocator: std.mem.Allocator, member_ids: []const []const u8) ![]usize {
+        var order = try allocator.alloc(usize, member_ids.len);
+        for (0..member_ids.len) |i| order[i] = i;
+        std.mem.sort(usize, order, member_ids, struct {
+            fn less(ctx: []const []const u8, a: usize, b: usize) bool {
+                return std.mem.order(u8, ctx[a], ctx[b]) == .lt;
+            }
+        }.less);
+        return order;
+    }
+};
+
+/// Kafka RangeAssignor: lexicographically sorted members get contiguous partition ranges.
+pub const RangeAssignor = struct {
+    pub const MemberPartitions = PartitionAssignor.MemberPartitions;
+
+    /// Caller frees via `freeAssignment`. `member_id` slices alias input.
+    pub fn assign(
+        allocator: std.mem.Allocator,
+        member_ids: []const []const u8,
+        partition_count: i32,
+    ) ![]MemberPartitions {
+        if (member_ids.len == 0 or partition_count <= 0) {
+            return try allocator.alloc(MemberPartitions, 0);
+        }
+
+        const order = try PartitionAssignor.sortedMemberOrder(allocator, member_ids);
+        defer allocator.free(order);
+
+        const n: i32 = @intCast(member_ids.len);
+        const base = @divTrunc(partition_count, n);
+        const rem = @rem(partition_count, n);
+
+        var out = try allocator.alloc(MemberPartitions, member_ids.len);
+        for (out) |*mp| {
+            mp.* = .{ .member_id = "", .partitions = try allocator.alloc(i32, 0) };
+        }
+        errdefer freeAssignment(allocator, out);
+
+        var p: i32 = 0;
+        for (order, 0..) |mi, rank| {
+            const count = base + if (rank < @as(usize, @intCast(rem))) @as(i32, 1) else @as(i32, 0);
+            const parts = try allocator.alloc(i32, @intCast(count));
+            var j: i32 = 0;
+            while (j < count) : (j += 1) {
+                parts[@intCast(j)] = p;
+                p += 1;
+            }
+            allocator.free(out[mi].partitions);
+            out[mi] = .{ .member_id = member_ids[mi], .partitions = parts };
+        }
+        return out;
+    }
+
+    pub fn freeAssignment(allocator: std.mem.Allocator, assignment: []MemberPartitions) void {
+        PartitionAssignor.freeAssignment(allocator, assignment);
+    }
+};
+
+/// RoundRobinAssignor: lexicographically sorted members receive partitions in round-robin order.
+pub const RoundRobinAssignor = struct {
+    pub const MemberPartitions = PartitionAssignor.MemberPartitions;
+
+    /// Caller frees via `freeAssignment`. `member_id` slices alias input.
+    pub fn assign(
+        allocator: std.mem.Allocator,
+        member_ids: []const []const u8,
+        partition_count: i32,
+    ) ![]MemberPartitions {
+        if (member_ids.len == 0 or partition_count <= 0) {
+            return try allocator.alloc(MemberPartitions, 0);
+        }
+
+        const order = try PartitionAssignor.sortedMemberOrder(allocator, member_ids);
+        defer allocator.free(order);
+
+        var lists = try allocator.alloc(std.ArrayList(i32), member_ids.len);
+        for (lists) |*list| list.* = .empty;
+        defer {
+            for (lists) |*list| list.deinit(allocator);
+            allocator.free(lists);
+        }
+
+        const n: i32 = @intCast(member_ids.len);
+        var p: i32 = 0;
+        while (p < partition_count) : (p += 1) {
+            const rank: usize = @intCast(@rem(p, n));
+            const mi = order[rank];
+            try lists[mi].append(allocator, p);
+        }
+
+        var out = try allocator.alloc(MemberPartitions, member_ids.len);
+        errdefer freeAssignment(allocator, out);
+        for (member_ids, 0..) |mid, mi| {
+            out[mi] = .{
+                .member_id = mid,
+                .partitions = try lists[mi].toOwnedSlice(allocator),
+            };
+        }
+        return out;
+    }
+
+    pub fn freeAssignment(allocator: std.mem.Allocator, assignment: []MemberPartitions) void {
+        PartitionAssignor.freeAssignment(allocator, assignment);
+    }
+};
+
+/// Simplified sticky assignor: retain prior ownership when member still present, then round-robin remainder.
+pub const StickyAssignor = struct {
+    pub const MemberPartitions = PartitionAssignor.MemberPartitions;
+
+    pub const PreviousAssignment = struct {
+        member_id: []const u8,
+        partitions: []const i32,
+    };
+
+    /// Caller frees via `freeAssignment`. `member_id` slices alias input; `previous` slices are borrowed.
+    pub fn assign(
+        allocator: std.mem.Allocator,
+        member_ids: []const []const u8,
+        partition_count: i32,
+        previous: []const PreviousAssignment,
+    ) ![]MemberPartitions {
+        if (member_ids.len == 0 or partition_count <= 0) {
+            return try allocator.alloc(MemberPartitions, 0);
+        }
+
+        const order = try PartitionAssignor.sortedMemberOrder(allocator, member_ids);
+        defer allocator.free(order);
+
+        var lists = try allocator.alloc(std.ArrayList(i32), member_ids.len);
+        for (lists) |*list| list.* = .empty;
+        defer {
+            for (lists) |*list| list.deinit(allocator);
+            allocator.free(lists);
+        }
+
+        var assigned = try allocator.alloc(bool, @intCast(partition_count));
+        @memset(assigned, false);
+        defer allocator.free(assigned);
+
+        for (previous) |prev| {
+            const mi = findMemberIndex(member_ids, prev.member_id) orelse continue;
+            for (prev.partitions) |part| {
+                if (part < 0 or part >= partition_count) continue;
+                const idx: usize = @intCast(part);
+                if (assigned[idx]) continue;
+                assigned[idx] = true;
+                try lists[mi].append(allocator, part);
+            }
+        }
+
+        var unassigned = std.ArrayList(i32).empty;
+        defer unassigned.deinit(allocator);
+        var p: i32 = 0;
+        while (p < partition_count) : (p += 1) {
+            const idx: usize = @intCast(p);
+            if (!assigned[idx]) try unassigned.append(allocator, p);
+        }
+
+        if (unassigned.items.len > 0) {
+            const n: i32 = @intCast(member_ids.len);
+            for (unassigned.items, 0..) |part, i| {
+                const rank: usize = @intCast(@rem(@as(i32, @intCast(i)), n));
+                const mi = order[rank];
+                try lists[mi].append(allocator, part);
+            }
+        }
+
+        var out = try allocator.alloc(MemberPartitions, member_ids.len);
+        errdefer freeAssignment(allocator, out);
+        for (member_ids, 0..) |mid, mi| {
+            out[mi] = .{
+                .member_id = mid,
+                .partitions = try lists[mi].toOwnedSlice(allocator),
+            };
+        }
+        return out;
+    }
+
+    fn findMemberIndex(member_ids: []const []const u8, member_id: []const u8) ?usize {
+        for (member_ids, 0..) |mid, i| {
+            if (std.mem.eql(u8, mid, member_id)) return i;
+        }
+        return null;
+    }
+
+    pub fn freeAssignment(allocator: std.mem.Allocator, assignment: []MemberPartitions) void {
+        PartitionAssignor.freeAssignment(allocator, assignment);
+    }
+};
+
+/// Cooperative sticky assignor: retain prior ownership, balance excess, expose revocations.
+pub const CooperativeStickyAssignor = struct {
+    pub const MemberPartitions = PartitionAssignor.MemberPartitions;
+    pub const PreviousAssignment = StickyAssignor.PreviousAssignment;
+
+    /// Caller frees via `freeAssignment`. `member_id` slices alias input; `previous` slices are borrowed.
+    pub fn assign(
+        allocator: std.mem.Allocator,
+        member_ids: []const []const u8,
+        partition_count: i32,
+        previous: []const PreviousAssignment,
+    ) ![]MemberPartitions {
+        if (member_ids.len == 0 or partition_count <= 0) {
+            return try allocator.alloc(MemberPartitions, 0);
+        }
+
+        const order = try PartitionAssignor.sortedMemberOrder(allocator, member_ids);
+        defer allocator.free(order);
+
+        var lists = try allocator.alloc(std.ArrayList(i32), member_ids.len);
+        for (lists) |*list| list.* = .empty;
+        defer {
+            for (lists) |*list| list.deinit(allocator);
+            allocator.free(lists);
+        }
+
+        var assigned = try allocator.alloc(bool, @intCast(partition_count));
+        @memset(assigned, false);
+        defer allocator.free(assigned);
+
+        for (previous) |prev| {
+            const mi = findMemberIndex(member_ids, prev.member_id) orelse continue;
+            for (prev.partitions) |part| {
+                if (part < 0 or part >= partition_count) continue;
+                const idx: usize = @intCast(part);
+                if (assigned[idx]) continue;
+                assigned[idx] = true;
+                try lists[mi].append(allocator, part);
+            }
+        }
+
+        var unassigned = std.ArrayList(i32).empty;
+        defer unassigned.deinit(allocator);
+        var p: i32 = 0;
+        while (p < partition_count) : (p += 1) {
+            const idx: usize = @intCast(p);
+            if (!assigned[idx]) try unassigned.append(allocator, p);
+        }
+
+        if (unassigned.items.len > 0) {
+            const n: i32 = @intCast(member_ids.len);
+            for (unassigned.items, 0..) |part, i| {
+                const rank: usize = @intCast(@rem(@as(i32, @intCast(i)), n));
+                const mi = order[rank];
+                try lists[mi].append(allocator, part);
+            }
+        }
+
+        for (lists) |*list| {
+            std.mem.sort(i32, list.items, {}, std.sort.asc(i32));
+        }
+
+        try balancePartitions(allocator, lists, order, partition_count, @intCast(member_ids.len));
+
+        var out = try allocator.alloc(MemberPartitions, member_ids.len);
+        errdefer freeAssignment(allocator, out);
+        for (member_ids, 0..) |mid, mi| {
+            out[mi] = .{
+                .member_id = mid,
+                .partitions = try lists[mi].toOwnedSlice(allocator),
+            };
+        }
+        return out;
+    }
+
+    /// Partitions present in `previous` but absent from `new_assignment` per member.
+    pub fn computeRevocations(
+        allocator: std.mem.Allocator,
+        previous: []const PreviousAssignment,
+        new_assignment: []const MemberPartitions,
+    ) ![]MemberPartitions {
+        var out = std.ArrayList(MemberPartitions).empty;
+        errdefer {
+            for (out.items) |mp| allocator.free(mp.partitions);
+            out.deinit(allocator);
+        }
+
+        for (previous) |prev| {
+            const new_parts = findMemberPartitions(new_assignment, prev.member_id) orelse &[_]i32{};
+            var revoked = std.ArrayList(i32).empty;
+            defer revoked.deinit(allocator);
+            for (prev.partitions) |part| {
+                var kept = false;
+                for (new_parts) |np| {
+                    if (np == part) {
+                        kept = true;
+                        break;
+                    }
+                }
+                if (!kept) try revoked.append(allocator, part);
+            }
+            if (revoked.items.len > 0) {
+                try out.append(allocator, .{
+                    .member_id = prev.member_id,
+                    .partitions = try revoked.toOwnedSlice(allocator),
+                });
+            }
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn balancePartitions(
+        allocator: std.mem.Allocator,
+        lists: []std.ArrayList(i32),
+        order: []const usize,
+        partition_count: i32,
+        member_count: usize,
+    ) !void {
+        const n: i32 = @intCast(member_count);
+        const target: i32 = @divTrunc(partition_count + n - 1, n);
+        const floor_count: i32 = @divTrunc(partition_count, n);
+
+        while (true) {
+            var donor_mi: ?usize = null;
+            var done = true;
+            for (order) |mi| {
+                const count: i32 = @intCast(lists[mi].items.len);
+                if (count > target) {
+                    donor_mi = mi;
+                    done = false;
+                    break;
+                }
+            }
+            if (done) break;
+
+            const mi = donor_mi.?;
+            const moved = lists[mi].orderedRemove(lists[mi].items.len - 1);
+
+            var recipient_mi: ?usize = null;
+            for (order) |ri| {
+                const count: i32 = @intCast(lists[ri].items.len);
+                if (count < floor_count) {
+                    recipient_mi = ri;
+                    break;
+                }
+            }
+            const dest = recipient_mi orelse mi;
+            try lists[dest].append(allocator, moved);
+            std.mem.sort(i32, lists[dest].items, {}, std.sort.asc(i32));
+        }
+    }
+
+    fn findMemberIndex(member_ids: []const []const u8, member_id: []const u8) ?usize {
+        for (member_ids, 0..) |mid, i| {
+            if (std.mem.eql(u8, mid, member_id)) return i;
+        }
+        return null;
+    }
+
+    fn findMemberPartitions(assignment: []const MemberPartitions, member_id: []const u8) ?[]const i32 {
+        for (assignment) |mp| {
+            if (std.mem.eql(u8, mp.member_id, member_id)) return mp.partitions;
+        }
+        return null;
+    }
+
+    pub fn freeAssignment(allocator: std.mem.Allocator, assignment: []MemberPartitions) void {
+        PartitionAssignor.freeAssignment(allocator, assignment);
+    }
+};
+
 pub const ConsumerGroupSession = struct {
     const Self = @This();
 
-    pub const State = enum { empty, joining, syncing, stable, leaving };
+    pub const State = enum { empty, joining, syncing, revoking, stable, leaving };
 
     pub const TopicAssignment = struct {
         topic: []const u8,
@@ -383,6 +859,9 @@ pub const ConsumerGroupSession = struct {
     state: State = .empty,
     is_leader: bool = false,
     assignments: std.ArrayList(TopicAssignment) = .empty,
+    pending_revocations: std.ArrayList(TopicAssignment) = .empty,
+    pending_assignment: std.ArrayList(TopicAssignment) = .empty,
+    rebalance_generation: i32 = 0,
     member_id_owned: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, group_id: []const u8) Self {
@@ -391,12 +870,18 @@ pub const ConsumerGroupSession = struct {
 
     pub fn deinit(self: *Self) void {
         if (self.member_id_owned) self.allocator.free(self.member_id);
-        for (self.assignments.items) |a| {
-            self.allocator.free(a.topic);
-            self.allocator.free(a.partitions);
-        }
-        self.assignments.deinit(self.allocator);
+        clearTopicAssignmentList(self.allocator, &self.assignments);
+        clearTopicAssignmentList(self.allocator, &self.pending_revocations);
+        clearTopicAssignmentList(self.allocator, &self.pending_assignment);
         self.* = undefined;
+    }
+
+    fn clearTopicAssignmentList(allocator: std.mem.Allocator, list: *std.ArrayList(TopicAssignment)) void {
+        for (list.items) |a| {
+            allocator.free(a.topic);
+            allocator.free(a.partitions);
+        }
+        list.deinit(allocator);
     }
 
     /// Offline join: assign self as leader of `topics` on partition 0 (solo consumer).
@@ -419,6 +904,143 @@ pub const ConsumerGroupSession = struct {
         self.state = .stable;
     }
 
+    /// Offline multi-member rebalance. Pass `assignor` (use `.range` for default Kafka behavior); sticky receives empty previous.
+    pub fn joinOfflineRebalance(
+        self: *Self,
+        member_id: []const u8,
+        all_members: []const []const u8,
+        topics: []const []const u8,
+        partition_count: i32,
+        assignor: PartitionAssignorKind,
+    ) !void {
+        var prior = try self.cloneTopicAssignments(self.assignments.items);
+        defer {
+            for (prior.items) |a| {
+                self.allocator.free(a.topic);
+                self.allocator.free(a.partitions);
+            }
+            prior.deinit(self.allocator);
+        }
+
+        self.state = .joining;
+        if (self.member_id_owned) self.allocator.free(self.member_id);
+        self.member_id = try self.allocator.dupe(u8, member_id);
+        self.member_id_owned = true;
+        self.generation_id = 1;
+        self.state = .syncing;
+        try self.clearAssignments();
+
+        const sorted = try self.allocator.alloc([]const u8, all_members.len);
+        defer self.allocator.free(sorted);
+        @memcpy(sorted, all_members);
+        std.mem.sort([]const u8, sorted, {}, struct {
+            fn less(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.less);
+        self.is_leader = sorted.len > 0 and std.mem.eql(u8, sorted[0], member_id);
+
+        var new_assign = std.ArrayList(TopicAssignment).empty;
+        defer {
+            for (new_assign.items) |a| {
+                self.allocator.free(a.topic);
+                self.allocator.free(a.partitions);
+            }
+            new_assign.deinit(self.allocator);
+        }
+
+        for (topics) |t| {
+            var topic_previous = std.ArrayList(StickyAssignor.PreviousAssignment).empty;
+            defer topic_previous.deinit(self.allocator);
+            if (assignor == .cooperative_sticky or assignor == .sticky) {
+                for (prior.items) |pa| {
+                    if (std.mem.eql(u8, pa.topic, t)) {
+                        try topic_previous.append(self.allocator, .{
+                            .member_id = member_id,
+                            .partitions = pa.partitions,
+                        });
+                    }
+                }
+            }
+
+            const plan = try PartitionAssignor.assignByKind(
+                self.allocator,
+                assignor,
+                all_members,
+                partition_count,
+                topic_previous.items,
+            );
+            defer PartitionAssignor.freeAssignment(self.allocator, plan);
+            for (plan) |mp| {
+                if (!std.mem.eql(u8, mp.member_id, member_id)) continue;
+                const topic_copy = try self.allocator.dupe(u8, t);
+                errdefer self.allocator.free(topic_copy);
+                const parts = try self.allocator.dupe(i32, mp.partitions);
+                try new_assign.append(self.allocator, .{ .topic = topic_copy, .partitions = parts });
+            }
+        }
+
+        if (assignor == .cooperative_sticky and prior.items.len > 0) {
+            var revocations = std.ArrayList(TopicAssignment).empty;
+            defer {
+                for (revocations.items) |a| {
+                    self.allocator.free(a.topic);
+                    self.allocator.free(a.partitions);
+                }
+                revocations.deinit(self.allocator);
+            }
+
+            for (topics) |t| {
+                var prev_parts: []const i32 = &.{};
+                for (prior.items) |pa| {
+                    if (std.mem.eql(u8, pa.topic, t)) {
+                        prev_parts = pa.partitions;
+                        break;
+                    }
+                }
+                if (prev_parts.len == 0) continue;
+
+                var new_parts: []i32 = &[_]i32{};
+                for (new_assign.items) |na| {
+                    if (std.mem.eql(u8, na.topic, t)) {
+                        new_parts = @constCast(na.partitions);
+                        break;
+                    }
+                }
+
+                const prev_one = [_]CooperativeStickyAssignor.PreviousAssignment{
+                    .{ .member_id = member_id, .partitions = prev_parts },
+                };
+                const new_one = [_]CooperativeStickyAssignor.MemberPartitions{
+                    .{ .member_id = member_id, .partitions = new_parts },
+                };
+                const topic_rev = try CooperativeStickyAssignor.computeRevocations(
+                    self.allocator,
+                    &prev_one,
+                    &new_one,
+                );
+                defer CooperativeStickyAssignor.freeAssignment(self.allocator, topic_rev);
+                for (topic_rev) |mp| {
+                    if (mp.partitions.len == 0) continue;
+                    const topic_copy = try self.allocator.dupe(u8, t);
+                    errdefer self.allocator.free(topic_copy);
+                    const parts = try self.allocator.dupe(i32, mp.partitions);
+                    try revocations.append(self.allocator, .{ .topic = topic_copy, .partitions = parts });
+                }
+            }
+
+            try self.applyCooperativeAssignment(new_assign.items, revocations.items);
+        } else {
+            for (new_assign.items) |a| {
+                const topic_copy = try self.allocator.dupe(u8, a.topic);
+                errdefer self.allocator.free(topic_copy);
+                const parts = try self.allocator.dupe(i32, a.partitions);
+                try self.assignments.append(self.allocator, .{ .topic = topic_copy, .partitions = parts });
+            }
+            self.state = .stable;
+        }
+    }
+
     pub fn heartbeatOffline(self: *Self) !void {
         if (self.state != .stable) return error.NotInGroup;
     }
@@ -438,7 +1060,167 @@ pub const ConsumerGroupSession = struct {
         self.assignments.clearRetainingCapacity();
     }
 
-    pub fn buildJoinRequest(self: *Self, topics: []const []const u8, session_timeout_ms: i32, correlation_id: i32, client_id: []const u8) ![]u8 {
+    fn clearPendingRevocations(self: *Self) void {
+        for (self.pending_revocations.items) |a| {
+            self.allocator.free(a.topic);
+            self.allocator.free(a.partitions);
+        }
+        self.pending_revocations.clearRetainingCapacity();
+    }
+
+    fn clearPendingAssignment(self: *Self) void {
+        for (self.pending_assignment.items) |a| {
+            self.allocator.free(a.topic);
+            self.allocator.free(a.partitions);
+        }
+        self.pending_assignment.clearRetainingCapacity();
+    }
+
+    fn cloneTopicAssignments(self: *Self, src: []const TopicAssignment) !std.ArrayList(TopicAssignment) {
+        var out = std.ArrayList(TopicAssignment).empty;
+        errdefer {
+            for (out.items) |a| {
+                self.allocator.free(a.topic);
+                self.allocator.free(a.partitions);
+            }
+            out.deinit(self.allocator);
+        }
+        for (src) |a| {
+            const topic_copy = try self.allocator.dupe(u8, a.topic);
+            errdefer self.allocator.free(topic_copy);
+            const parts = try self.allocator.dupe(i32, a.partitions);
+            try out.append(self.allocator, .{ .topic = topic_copy, .partitions = parts });
+        }
+        return out;
+    }
+
+    fn removePartitionsFromAssignments(self: *Self, revocations: []const TopicAssignment) !void {
+        for (revocations) |rev| {
+            for (self.assignments.items) |*assign| {
+                if (!std.mem.eql(u8, assign.topic, rev.topic)) continue;
+                var kept = std.ArrayList(i32).empty;
+                defer kept.deinit(self.allocator);
+                for (assign.partitions) |p| {
+                    var revoked = false;
+                    for (rev.partitions) |rp| {
+                        if (p == rp) {
+                            revoked = true;
+                            break;
+                        }
+                    }
+                    if (!revoked) try kept.append(self.allocator, p);
+                }
+                self.allocator.free(assign.partitions);
+                assign.partitions = try kept.toOwnedSlice(self.allocator);
+            }
+            // Drop empty topic rows.
+            var i: usize = 0;
+            while (i < self.assignments.items.len) {
+                if (self.assignments.items[i].partitions.len == 0) {
+                    const removed = self.assignments.orderedRemove(i);
+                    self.allocator.free(removed.topic);
+                    self.allocator.free(removed.partitions);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    fn mergeRevocations(self: *Self, revocations: []const TopicAssignment) !void {
+        for (revocations) |rev| {
+            var found: ?*TopicAssignment = null;
+            for (self.pending_revocations.items) |*pending| {
+                if (std.mem.eql(u8, pending.topic, rev.topic)) {
+                    found = pending;
+                    break;
+                }
+            }
+            if (found) |p| {
+                var merged = std.ArrayList(i32).empty;
+                defer merged.deinit(self.allocator);
+                for (p.partitions) |existing| try merged.append(self.allocator, existing);
+                for (rev.partitions) |rp| {
+                    var dup = false;
+                    for (merged.items) |m| {
+                        if (m == rp) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (!dup) try merged.append(self.allocator, rp);
+                }
+                self.allocator.free(p.partitions);
+                std.mem.sort(i32, merged.items, {}, std.sort.asc(i32));
+                p.partitions = try merged.toOwnedSlice(self.allocator);
+            } else {
+                const topic_copy = try self.allocator.dupe(u8, rev.topic);
+                errdefer self.allocator.free(topic_copy);
+                const parts = try self.allocator.dupe(i32, rev.partitions);
+                try self.pending_revocations.append(self.allocator, .{ .topic = topic_copy, .partitions = parts });
+            }
+        }
+    }
+
+    /// Cooperative rebalance: revoke first, then install `pending_assignment` after ack.
+    pub fn applyCooperativeAssignment(
+        self: *Self,
+        new_assign: []const TopicAssignment,
+        revocations: []const TopicAssignment,
+    ) !void {
+        self.rebalance_generation += 1;
+        self.clearPendingRevocations();
+        self.clearPendingAssignment();
+
+        var has_revoke = false;
+        for (revocations) |r| {
+            if (r.partitions.len > 0) {
+                has_revoke = true;
+                break;
+            }
+        }
+
+        if (!has_revoke) {
+            try self.clearAssignments();
+            for (new_assign) |a| {
+                const topic_copy = try self.allocator.dupe(u8, a.topic);
+                errdefer self.allocator.free(topic_copy);
+                const parts = try self.allocator.dupe(i32, a.partitions);
+                try self.assignments.append(self.allocator, .{ .topic = topic_copy, .partitions = parts });
+            }
+            self.state = .stable;
+            return;
+        }
+
+        try self.removePartitionsFromAssignments(revocations);
+        try self.mergeRevocations(revocations);
+        for (new_assign) |a| {
+            const topic_copy = try self.allocator.dupe(u8, a.topic);
+            errdefer self.allocator.free(topic_copy);
+            const parts = try self.allocator.dupe(i32, a.partitions);
+            try self.pending_assignment.append(self.allocator, .{ .topic = topic_copy, .partitions = parts });
+        }
+        self.state = .revoking;
+    }
+
+    /// After revocations are processed locally, install deferred assignment.
+    pub fn acknowledgeRevocation(self: *Self) !void {
+        if (self.pending_revocations.items.len == 0 and self.pending_assignment.items.len == 0) return;
+        self.clearPendingRevocations();
+        if (self.pending_assignment.items.len > 0) {
+            try self.clearAssignments();
+            for (self.pending_assignment.items) |a| {
+                const topic_copy = try self.allocator.dupe(u8, a.topic);
+                errdefer self.allocator.free(topic_copy);
+                const parts = try self.allocator.dupe(i32, a.partitions);
+                try self.assignments.append(self.allocator, .{ .topic = topic_copy, .partitions = parts });
+            }
+            self.clearPendingAssignment();
+        }
+        self.state = .stable;
+    }
+
+    pub fn buildJoinRequest(self: *Self, topics: []const []const u8, session_timeout_ms: i32, correlation_id: i32, client_id: []const u8, protocol_name: []const u8) ![]u8 {
         return KafkaWireFormat.buildJoinGroupRequest(
             self.allocator,
             self.group_id,
@@ -447,6 +1229,7 @@ pub const ConsumerGroupSession = struct {
             session_timeout_ms,
             correlation_id,
             client_id,
+            protocol_name,
         );
     }
 
@@ -550,8 +1333,34 @@ pub const KafkaConsumer = struct {
     }
 
     /// Join consumer group. Offline → solo partition-0 assignment.
-    /// Online → JoinGroup + SyncGroup over `RobustMQTransport`.
+    /// Online → FindCoordinator (cross-node redirect) + JoinGroup + configured partition assignor SyncGroup.
     pub fn joinGroup(self: *Self) !void {
+        var prior_member_id: ?[]const u8 = null;
+        var prior_assignments = std.ArrayList(ConsumerGroupSession.TopicAssignment).empty;
+        var prior_owned = false;
+        defer if (prior_owned) {
+            for (prior_assignments.items) |a| {
+                self.allocator.free(a.topic);
+                self.allocator.free(a.partitions);
+            }
+            prior_assignments.deinit(self.allocator);
+        };
+
+        if (self.config.partition_assignor == .sticky or self.config.partition_assignor == .cooperative_sticky) {
+            if (self.group) |old| {
+                if (old.state == .stable and old.assignments.items.len > 0) {
+                    prior_member_id = old.member_id;
+                    for (old.assignments.items) |a| {
+                        const topic_copy = try self.allocator.dupe(u8, a.topic);
+                        errdefer self.allocator.free(topic_copy);
+                        const parts = try self.allocator.dupe(i32, a.partitions);
+                        try prior_assignments.append(self.allocator, .{ .topic = topic_copy, .partitions = parts });
+                    }
+                    prior_owned = true;
+                }
+            }
+        }
+
         if (self.group) |*g| g.deinit();
 
         var topics = std.ArrayList([]const u8).empty;
@@ -573,6 +1382,9 @@ pub const KafkaConsumer = struct {
         session.state = .joining;
 
         const t = &self.transport.?;
+        const coord = try t.findCoordinator(self.config.group_id);
+        defer self.allocator.free(coord.host);
+
         const corr_join = t.nextCorrelationPublic();
         const join_req = try KafkaWireFormat.buildJoinGroupRequest(
             self.allocator,
@@ -582,6 +1394,7 @@ pub const KafkaConsumer = struct {
             @intCast(self.config.session_timeout_ms),
             corr_join,
             self.config.client_id,
+            self.config.partition_assignor.protocolName(),
         );
         defer self.allocator.free(join_req);
         const join_resp = try t.request(join_req);
@@ -591,6 +1404,11 @@ pub const KafkaConsumer = struct {
             self.allocator.free(joined.protocol);
             self.allocator.free(joined.leader_id);
             self.allocator.free(joined.member_id);
+            for (joined.members) |m| {
+                self.allocator.free(m.member_id);
+                self.allocator.free(m.metadata);
+            }
+            self.allocator.free(joined.members);
         }
         if (joined.error_code != 0) return error.JoinGroupFailed;
 
@@ -600,16 +1418,83 @@ pub const KafkaConsumer = struct {
         session.is_leader = std.mem.eql(u8, joined.leader_id, joined.member_id);
         session.state = .syncing;
 
-        // Leader: propose partition-0 for first topic to self; follower: empty assignments.
-        var assign_buf: ?[]u8 = null;
-        defer if (assign_buf) |b| self.allocator.free(b);
-        var assign_storage: [1]KafkaWireFormat.MemberAssignmentEntry = undefined;
-        const assignments: []const KafkaWireFormat.MemberAssignmentEntry = blk: {
-            if (!session.is_leader or topics.items.len == 0) break :blk &.{};
-            assign_buf = try KafkaWireFormat.buildMemberAssignment(self.allocator, topics.items[0], &.{0});
-            assign_storage[0] = .{ .member_id = session.member_id, .assignment = assign_buf.? };
-            break :blk assign_storage[0..1];
-        };
+        // Leader: partition assignor across all members for each subscribed topic.
+        var assign_bufs = std.ArrayList([]u8).empty;
+        defer {
+            for (assign_bufs.items) |b| self.allocator.free(b);
+            assign_bufs.deinit(self.allocator);
+        }
+        var assign_entries = std.ArrayList(KafkaWireFormat.MemberAssignmentEntry).empty;
+        defer assign_entries.deinit(self.allocator);
+
+        if (session.is_leader and topics.items.len > 0) {
+            var member_ids = std.ArrayList([]const u8).empty;
+            defer member_ids.deinit(self.allocator);
+            if (joined.members.len > 0) {
+                for (joined.members) |m| try member_ids.append(self.allocator, m.member_id);
+            } else {
+                try member_ids.append(self.allocator, session.member_id);
+            }
+
+            // Per member accumulate TopicPartitionSet then encode.
+            var per_member = try self.allocator.alloc(std.ArrayList(KafkaWireFormat.TopicPartitionSet), member_ids.items.len);
+            defer {
+                for (per_member) |*list| list.deinit(self.allocator);
+                self.allocator.free(per_member);
+            }
+            for (per_member) |*list| list.* = .empty;
+
+            // Owned partition slices for TopicPartitionSet lifetime.
+            var part_owned = std.ArrayList([]i32).empty;
+            defer {
+                for (part_owned.items) |p| self.allocator.free(p);
+                part_owned.deinit(self.allocator);
+            }
+
+            for (topics.items) |topic| {
+                const partition_count = t.fetchTopicPartitions(topic) catch |err| blk: {
+                    std.log.warn("[KafkaConsumer] Metadata for {s} failed ({s}), using default_partition_count={d}", .{
+                        topic,
+                        @errorName(err),
+                        self.config.default_partition_count,
+                    });
+                    break :blk self.config.default_partition_count;
+                };
+
+                var topic_previous = std.ArrayList(StickyAssignor.PreviousAssignment).empty;
+                defer topic_previous.deinit(self.allocator);
+                if (prior_member_id) |mid| {
+                    for (prior_assignments.items) |a| {
+                        if (std.mem.eql(u8, a.topic, topic)) {
+                            try topic_previous.append(self.allocator, .{
+                                .member_id = mid,
+                                .partitions = a.partitions,
+                            });
+                        }
+                    }
+                }
+
+                const plan = try PartitionAssignor.assignByKind(
+                    self.allocator,
+                    self.config.partition_assignor,
+                    member_ids.items,
+                    partition_count,
+                    topic_previous.items,
+                );
+                defer PartitionAssignor.freeAssignment(self.allocator, plan);
+                for (plan, 0..) |mp, mi| {
+                    const parts = try self.allocator.dupe(i32, mp.partitions);
+                    try part_owned.append(self.allocator, parts);
+                    try per_member[mi].append(self.allocator, .{ .topic = topic, .partitions = parts });
+                }
+            }
+
+            for (member_ids.items, 0..) |mid, mi| {
+                const encoded = try KafkaWireFormat.buildMemberAssignmentTopics(self.allocator, per_member[mi].items);
+                try assign_bufs.append(self.allocator, encoded);
+                try assign_entries.append(self.allocator, .{ .member_id = mid, .assignment = encoded });
+            }
+        }
 
         const corr_sync = t.nextCorrelationPublic();
         const sync_req = try KafkaWireFormat.buildSyncGroupRequest(
@@ -617,7 +1502,7 @@ pub const KafkaConsumer = struct {
             self.config.group_id,
             session.generation_id,
             session.member_id,
-            assignments,
+            assign_entries.items,
             corr_sync,
             self.config.client_id,
         );
@@ -630,18 +1515,114 @@ pub const KafkaConsumer = struct {
 
         try session.clearAssignments();
         if (synced.assignment.len > 0) {
-            const parsed = try KafkaWireFormat.parseMemberAssignment(self.allocator, synced.assignment);
-            try session.assignments.append(self.allocator, .{ .topic = parsed.topic, .partitions = parsed.partitions });
+            const all = try KafkaWireFormat.parseMemberAssignmentAll(self.allocator, synced.assignment);
+            defer self.allocator.free(all);
+            if (self.config.partition_assignor == .cooperative_sticky and prior_owned and prior_member_id != null) {
+                var revocations = std.ArrayList(ConsumerGroupSession.TopicAssignment).empty;
+                defer {
+                    for (revocations.items) |a| {
+                        self.allocator.free(a.topic);
+                        self.allocator.free(a.partitions);
+                    }
+                    revocations.deinit(self.allocator);
+                }
+                const mid = prior_member_id.?;
+                for (all) |new_a| {
+                    var prev_parts: []const i32 = &.{};
+                    for (prior_assignments.items) |pa| {
+                        if (std.mem.eql(u8, pa.topic, new_a.topic)) {
+                            prev_parts = pa.partitions;
+                            break;
+                        }
+                    }
+                    if (prev_parts.len == 0) continue;
+                    const prev_one = [_]CooperativeStickyAssignor.PreviousAssignment{
+                        .{ .member_id = mid, .partitions = prev_parts },
+                    };
+                    const new_one = [_]CooperativeStickyAssignor.MemberPartitions{
+                        .{ .member_id = session.member_id, .partitions = new_a.partitions },
+                    };
+                    const topic_rev = try CooperativeStickyAssignor.computeRevocations(
+                        self.allocator,
+                        &prev_one,
+                        &new_one,
+                    );
+                    defer CooperativeStickyAssignor.freeAssignment(self.allocator, topic_rev);
+                    for (topic_rev) |mp| {
+                        if (mp.partitions.len == 0) continue;
+                        const topic_copy = try self.allocator.dupe(u8, new_a.topic);
+                        errdefer self.allocator.free(topic_copy);
+                        const parts = try self.allocator.dupe(i32, mp.partitions);
+                        try revocations.append(self.allocator, .{ .topic = topic_copy, .partitions = parts });
+                    }
+                }
+                // Topics dropped entirely from subscription still need revocation scan.
+                for (prior_assignments.items) |pa| {
+                    var in_new = false;
+                    for (all) |na| {
+                        if (std.mem.eql(u8, na.topic, pa.topic)) {
+                            in_new = true;
+                            break;
+                        }
+                    }
+                    if (in_new) continue;
+                    const prev_one = [_]CooperativeStickyAssignor.PreviousAssignment{
+                        .{ .member_id = mid, .partitions = pa.partitions },
+                    };
+                    const new_one = [_]CooperativeStickyAssignor.MemberPartitions{
+                        .{ .member_id = session.member_id, .partitions = &.{} },
+                    };
+                    const topic_rev = try CooperativeStickyAssignor.computeRevocations(
+                        self.allocator,
+                        &prev_one,
+                        &new_one,
+                    );
+                    defer CooperativeStickyAssignor.freeAssignment(self.allocator, topic_rev);
+                    for (topic_rev) |mp| {
+                        if (mp.partitions.len == 0) continue;
+                        const topic_copy = try self.allocator.dupe(u8, pa.topic);
+                        errdefer self.allocator.free(topic_copy);
+                        const parts = try self.allocator.dupe(i32, mp.partitions);
+                        try revocations.append(self.allocator, .{ .topic = topic_copy, .partitions = parts });
+                    }
+                }
+
+                var owned_new = std.ArrayList(ConsumerGroupSession.TopicAssignment).empty;
+                defer {
+                    for (owned_new.items) |a| {
+                        self.allocator.free(a.topic);
+                        self.allocator.free(a.partitions);
+                    }
+                    owned_new.deinit(self.allocator);
+                }
+                for (all) |a| {
+                    const topic_copy = try self.allocator.dupe(u8, a.topic);
+                    errdefer self.allocator.free(topic_copy);
+                    const parts = try self.allocator.dupe(i32, a.partitions);
+                    try owned_new.append(self.allocator, .{ .topic = topic_copy, .partitions = parts });
+                }
+                try session.applyCooperativeAssignment(owned_new.items, revocations.items);
+                // Move ownership into session from `all` parse — free outer slice only.
+                for (all) |a| {
+                    self.allocator.free(a.topic);
+                    self.allocator.free(a.partitions);
+                }
+            } else {
+                for (all) |a| {
+                    try session.assignments.append(self.allocator, .{ .topic = a.topic, .partitions = a.partitions });
+                }
+            }
         } else if (topics.items.len > 0) {
-            // Fallback: offline-style assignment if broker returned empty
             try session.joinOffline(topics.items);
         }
         session.state = .stable;
         self.group = session;
-        std.log.info("[KafkaConsumer] joined group {s} generation={d} member={s}", .{
+        std.log.info("[KafkaConsumer] joined group {s} generation={d} member={s} coord={s}:{d}", .{
             self.config.group_id,
             self.group.?.generation_id,
             self.group.?.member_id,
+            coord.host,
+            coord.port,
         });
     }
 
@@ -687,6 +1668,12 @@ pub const KafkaConsumer = struct {
     pub fn assignedPartitions(self: *const Self) []const ConsumerGroupSession.TopicAssignment {
         if (self.group) |g| return g.assignments.items;
         return &.{};
+    }
+
+    /// Cooperative rebalance: commit deferred assignment after local partition revoke.
+    pub fn acknowledgeRevocation(self: *Self) !void {
+        const g = &(self.group orelse return);
+        try g.acknowledgeRevocation();
     }
 
     /// Poll RobustMQ once for each subscription (no-op in offline mode).
@@ -782,6 +1769,7 @@ pub const KafkaEventBridge = struct {
 pub const KafkaWireFormat = struct {
     const api_produce: i16 = 0;
     const api_fetch: i16 = 1;
+    const api_metadata: i16 = 3;
     const api_offset_commit: i16 = 8;
     const api_offset_fetch: i16 = 9;
     const api_find_coordinator: i16 = 10;
@@ -863,6 +1851,100 @@ pub const KafkaWireFormat = struct {
         return buf.toOwnedSlice(allocator);
     }
 
+    pub const TopicMeta = struct {
+        topic: []u8,
+        partition_count: i32,
+    };
+
+    pub fn freeTopicMetaList(allocator: std.mem.Allocator, list: []TopicMeta) void {
+        for (list) |m| allocator.free(m.topic);
+        allocator.free(list);
+    }
+
+    /// MetadataRequest v1: `[string] topics` (empty → all topics).
+    pub fn buildMetadataRequest(
+        allocator: std.mem.Allocator,
+        topics: []const []const u8,
+        correlation_id: i32,
+        client_id: []const u8,
+    ) ![]u8 {
+        var buf = std.ArrayList(u8).empty;
+        errdefer buf.deinit(allocator);
+        try appendRequestHeader(&buf, allocator, api_metadata, 1, correlation_id, client_id);
+        try appendI32(&buf, allocator, @intCast(topics.len));
+        for (topics) |t| try appendString(&buf, allocator, t);
+        return buf.toOwnedSlice(allocator);
+    }
+
+    /// MetadataResponse v1 (non-flexible). Caller frees via `freeTopicMetaList`.
+    pub fn parseMetadataResponse(allocator: std.mem.Allocator, resp: []const u8, expected_corr: i32) ![]TopicMeta {
+        if (resp.len < 8) return error.InvalidResponse;
+        if (readI32(resp[0..4]) != expected_corr) return error.CorrelationMismatch;
+        var off: usize = 8; // correlation + throttle_time_ms
+
+        if (off + 4 > resp.len) return error.InvalidResponse;
+        const broker_count = readI32(resp[off..][0..4]);
+        off += 4;
+        for (0..@as(usize, @intCast(broker_count))) |_| {
+            if (off + 4 > resp.len) return error.InvalidResponse;
+            off += 4; // node_id
+            _, const n1 = try readKafkaString(resp[off..]);
+            off += n1;
+            if (off + 4 > resp.len) return error.InvalidResponse;
+            off += 4; // port
+            _, const n2 = try readKafkaString(resp[off..]); // rack (v1+)
+            off += n2;
+        }
+
+        if (off + 4 > resp.len) return error.InvalidResponse;
+        const topic_count = readI32(resp[off..][0..4]);
+        off += 4;
+        if (topic_count < 0) return try allocator.alloc(TopicMeta, 0);
+
+        var out = try allocator.alloc(TopicMeta, @intCast(topic_count));
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |m| allocator.free(m.topic);
+            allocator.free(out);
+        }
+
+        for (0..@as(usize, @intCast(topic_count))) |ti| {
+            if (off + 2 > resp.len) return error.InvalidResponse;
+            off += 2; // topic error_code
+            const topic, const n1 = try readKafkaString(resp[off..]);
+            off += n1;
+            if (off + 1 > resp.len) return error.InvalidResponse;
+            off += 1; // is_internal (int8, v1+)
+            if (off + 4 > resp.len) return error.InvalidResponse;
+            const part_count = readI32(resp[off..][0..4]);
+            off += 4;
+
+            for (0..@as(usize, @intCast(part_count))) |_| {
+                if (off + 10 > resp.len) return error.InvalidResponse;
+                off += 2; // partition error_code
+                off += 4; // partition id
+                off += 4; // leader
+                if (off + 4 > resp.len) return error.InvalidResponse;
+                const repl_count = readI32(resp[off..][0..4]);
+                off += 4;
+                if (repl_count < 0 or off + @as(usize, @intCast(repl_count)) * 4 > resp.len) return error.InvalidResponse;
+                off += @as(usize, @intCast(repl_count)) * 4;
+                if (off + 4 > resp.len) return error.InvalidResponse;
+                const isr_count = readI32(resp[off..][0..4]);
+                off += 4;
+                if (isr_count < 0 or off + @as(usize, @intCast(isr_count)) * 4 > resp.len) return error.InvalidResponse;
+                off += @as(usize, @intCast(isr_count)) * 4;
+            }
+
+            out[ti] = .{
+                .topic = try allocator.dupe(u8, topic),
+                .partition_count = part_count,
+            };
+            filled += 1;
+        }
+        return out;
+    }
+
     // ── Consumer Group protocol (FindCoordinator / Join / Sync / Heartbeat / Leave / Offset*) ──
 
     pub fn buildFindCoordinatorRequest(
@@ -898,6 +1980,7 @@ pub const KafkaWireFormat = struct {
         session_timeout_ms: i32,
         correlation_id: i32,
         client_id: []const u8,
+        protocol_name: []const u8,
     ) ![]u8 {
         var buf = std.ArrayList(u8).empty;
         errdefer buf.deinit(allocator);
@@ -907,7 +1990,7 @@ pub const KafkaWireFormat = struct {
         try appendString(&buf, allocator, member_id);
         try appendString(&buf, allocator, "consumer"); // protocol_type
         try appendI32(&buf, allocator, 1); // protocols count
-        try appendString(&buf, allocator, "range"); // protocol name
+        try appendString(&buf, allocator, protocol_name);
         const meta = try buildSubscriptionMetadata(allocator, topics);
         defer allocator.free(meta);
         try appendBytes(&buf, allocator, meta);
@@ -916,13 +1999,24 @@ pub const KafkaWireFormat = struct {
 
     /// MemberAssignment v0 for SyncGroup.
     pub fn buildMemberAssignment(allocator: std.mem.Allocator, topic: []const u8, partitions: []const i32) ![]u8 {
+        return buildMemberAssignmentTopics(allocator, &.{.{ .topic = topic, .partitions = partitions }});
+    }
+
+    pub const TopicPartitionSet = struct {
+        topic: []const u8,
+        partitions: []const i32,
+    };
+
+    pub fn buildMemberAssignmentTopics(allocator: std.mem.Allocator, topics: []const TopicPartitionSet) ![]u8 {
         var buf = std.ArrayList(u8).empty;
         errdefer buf.deinit(allocator);
         try appendI16(&buf, allocator, 0); // version
-        try appendI32(&buf, allocator, 1); // topic count
-        try appendString(&buf, allocator, topic);
-        try appendI32(&buf, allocator, @intCast(partitions.len));
-        for (partitions) |p| try appendI32(&buf, allocator, p);
+        try appendI32(&buf, allocator, @intCast(topics.len));
+        for (topics) |t| {
+            try appendString(&buf, allocator, t.topic);
+            try appendI32(&buf, allocator, @intCast(t.partitions.len));
+            for (t.partitions) |p| try appendI32(&buf, allocator, p);
+        }
         try appendI32(&buf, allocator, 0); // user_data
         return buf.toOwnedSlice(allocator);
     }
@@ -1046,13 +2140,48 @@ pub const KafkaWireFormat = struct {
         try buf.appendSlice(allocator, data);
     }
 
-    /// Parse JoinGroupResponse v2 (non-flexible). Caller frees returned strings.
+    pub const CoordinatorInfo = struct {
+        error_code: i16,
+        node_id: i32,
+        host: []u8,
+        port: i32,
+    };
+
+    /// FindCoordinatorResponse v2. Caller frees `host`.
+    pub fn parseFindCoordinatorResponse(allocator: std.mem.Allocator, resp: []const u8, expected_corr: i32) !CoordinatorInfo {
+        if (resp.len < 14) return error.InvalidResponse;
+        if (readI32(resp[0..4]) != expected_corr) return error.CorrelationMismatch;
+        var off: usize = 4;
+        off += 4; // throttle
+        const error_code = readI16(resp[off..][0..2]);
+        off += 2;
+        const node_id = readI32(resp[off..][0..4]);
+        off += 4;
+        const host, const n1 = try readKafkaString(resp[off..]);
+        off += n1;
+        if (off + 4 > resp.len) return error.InvalidResponse;
+        const port = readI32(resp[off..][0..4]);
+        return .{
+            .error_code = error_code,
+            .node_id = node_id,
+            .host = try allocator.dupe(u8, host),
+            .port = port,
+        };
+    }
+
+    pub const JoinGroupMember = struct {
+        member_id: []u8,
+        metadata: []u8,
+    };
+
+    /// Parse JoinGroupResponse v2 (non-flexible). Caller frees strings + members.
     pub fn parseJoinGroupResponse(allocator: std.mem.Allocator, resp: []const u8, expected_corr: i32) !struct {
         error_code: i16,
         generation_id: i32,
         protocol: []u8,
         leader_id: []u8,
         member_id: []u8,
+        members: []JoinGroupMember,
     } {
         if (resp.len < 14) return error.InvalidResponse;
         if (readI32(resp[0..4]) != expected_corr) return error.CorrelationMismatch;
@@ -1067,13 +2196,56 @@ pub const KafkaWireFormat = struct {
         const leader_id, const n2 = try readKafkaString(resp[off..]);
         off += n2;
         const member_id, const n3 = try readKafkaString(resp[off..]);
-        _ = n3;
+        off += n3;
+
+        var members: []JoinGroupMember = &.{};
+        if (off + 4 <= resp.len) {
+            const count = readI32(resp[off..][0..4]);
+            off += 4;
+            if (count > 0) {
+                var list = try allocator.alloc(JoinGroupMember, @intCast(count));
+                errdefer {
+                    for (list) |m| {
+                        allocator.free(m.member_id);
+                        allocator.free(m.metadata);
+                    }
+                    allocator.free(list);
+                }
+                for (0..@as(usize, @intCast(count))) |i| {
+                    const mid, const nm = try readKafkaString(resp[off..]);
+                    off += nm;
+                    if (off + 4 > resp.len) return error.InvalidResponse;
+                    const meta_len = readI32(resp[off..][0..4]);
+                    off += 4;
+                    if (meta_len < 0) {
+                        list[i] = .{
+                            .member_id = try allocator.dupe(u8, mid),
+                            .metadata = try allocator.alloc(u8, 0),
+                        };
+                        continue;
+                    }
+                    if (off + @as(usize, @intCast(meta_len)) > resp.len) return error.InvalidResponse;
+                    list[i] = .{
+                        .member_id = try allocator.dupe(u8, mid),
+                        .metadata = try allocator.dupe(u8, resp[off .. off + @as(usize, @intCast(meta_len))]),
+                    };
+                    off += @intCast(meta_len);
+                }
+                members = list;
+            } else {
+                members = try allocator.alloc(JoinGroupMember, 0);
+            }
+        } else {
+            members = try allocator.alloc(JoinGroupMember, 0);
+        }
+
         return .{
             .error_code = error_code,
             .generation_id = generation_id,
             .protocol = try allocator.dupe(u8, protocol),
             .leader_id = try allocator.dupe(u8, leader_id),
             .member_id = try allocator.dupe(u8, member_id),
+            .members = members,
         };
     }
 
@@ -1100,24 +2272,59 @@ pub const KafkaWireFormat = struct {
 
     /// Parse MemberAssignment v0 → first topic + partitions (owned).
     pub fn parseMemberAssignment(allocator: std.mem.Allocator, data: []const u8) !struct { topic: []u8, partitions: []i32 } {
+        const all = try parseMemberAssignmentAll(allocator, data);
+        defer {
+            if (all.len > 1) {
+                for (all[1..]) |a| {
+                    allocator.free(a.topic);
+                    allocator.free(a.partitions);
+                }
+            }
+            allocator.free(all);
+        }
+        if (all.len == 0) return error.InvalidAssignment;
+        return .{ .topic = all[0].topic, .partitions = all[0].partitions };
+    }
+
+    pub const ParsedTopicAssignment = struct {
+        topic: []u8,
+        partitions: []i32,
+    };
+
+    /// Parse all topics from MemberAssignment v0. Caller frees each topic/partitions + the slice.
+    pub fn parseMemberAssignmentAll(allocator: std.mem.Allocator, data: []const u8) ![]ParsedTopicAssignment {
         if (data.len < 6) return error.InvalidAssignment;
         var off: usize = 2; // version
         const topic_count = readI32(data[off..][0..4]);
         off += 4;
-        if (topic_count <= 0) return error.InvalidAssignment;
-        const topic, const n1 = try readKafkaString(data[off..]);
-        off += n1;
-        if (off + 4 > data.len) return error.InvalidAssignment;
-        const part_count = readI32(data[off..][0..4]);
-        off += 4;
-        if (part_count < 0 or off + @as(usize, @intCast(part_count)) * 4 > data.len) return error.InvalidAssignment;
-        var parts = try allocator.alloc(i32, @intCast(part_count));
-        errdefer allocator.free(parts);
-        for (0..@as(usize, @intCast(part_count))) |i| {
-            parts[i] = readI32(data[off..][0..4]);
-            off += 4;
+        if (topic_count <= 0) return try allocator.alloc(ParsedTopicAssignment, 0);
+        var out = try allocator.alloc(ParsedTopicAssignment, @intCast(topic_count));
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |a| {
+                allocator.free(a.topic);
+                allocator.free(a.partitions);
+            }
+            allocator.free(out);
         }
-        return .{ .topic = try allocator.dupe(u8, topic), .partitions = parts };
+
+        for (0..@as(usize, @intCast(topic_count))) |ti| {
+            const topic, const n1 = try readKafkaString(data[off..]);
+            off += n1;
+            if (off + 4 > data.len) return error.InvalidAssignment;
+            const part_count = readI32(data[off..][0..4]);
+            off += 4;
+            if (part_count < 0 or off + @as(usize, @intCast(part_count)) * 4 > data.len) return error.InvalidAssignment;
+            var parts = try allocator.alloc(i32, @intCast(part_count));
+            errdefer allocator.free(parts);
+            for (0..@as(usize, @intCast(part_count))) |i| {
+                parts[i] = readI32(data[off..][0..4]);
+                off += 4;
+            }
+            out[ti] = .{ .topic = try allocator.dupe(u8, topic), .partitions = parts };
+            filled += 1;
+        }
+        return out;
     }
 
     fn readKafkaString(buf: []const u8) !struct { []const u8, usize } {
@@ -1577,7 +2784,7 @@ test "KafkaWireFormat consumer group requests" {
     try std.testing.expect(find.len > 10);
     try std.testing.expectEqual(@as(i16, 10), readI16(find[0..2])); // api_key FindCoordinator
 
-    const join = try KafkaWireFormat.buildJoinGroupRequest(allocator, "g1", "", &.{"orders"}, 45000, 2, "c1");
+    const join = try KafkaWireFormat.buildJoinGroupRequest(allocator, "g1", "", &.{"orders"}, 45000, 2, "c1", "range");
     defer allocator.free(join);
     try std.testing.expectEqual(@as(i16, 11), readI16(join[0..2]));
 
@@ -1602,6 +2809,10 @@ test "KafkaWireFormat consumer group requests" {
     const fetch = try KafkaWireFormat.buildOffsetFetchRequest(allocator, "g1", "orders", &.{0}, 7, "c1");
     defer allocator.free(fetch);
     try std.testing.expectEqual(@as(i16, 9), readI16(fetch[0..2]));
+
+    const meta = try KafkaWireFormat.buildMetadataRequest(allocator, &.{"orders"}, 8, "c1");
+    defer allocator.free(meta);
+    try std.testing.expectEqual(@as(i16, 3), readI16(meta[0..2]));
 }
 
 test "ConsumerGroupSession offline join heartbeat leave" {
@@ -1665,10 +2876,329 @@ test "KafkaWireFormat parseJoinGroupResponse synthetic" {
         allocator.free(parsed.protocol);
         allocator.free(parsed.leader_id);
         allocator.free(parsed.member_id);
+        for (parsed.members) |m| {
+            allocator.free(m.member_id);
+            allocator.free(m.metadata);
+        }
+        allocator.free(parsed.members);
     }
     try std.testing.expectEqual(@as(i16, 0), parsed.error_code);
     try std.testing.expectEqual(@as(i32, 7), parsed.generation_id);
     try std.testing.expectEqualStrings("member", parsed.member_id);
+}
+
+test "RangeAssignor divides partitions across members" {
+    const allocator = std.testing.allocator;
+    const plan = try RangeAssignor.assign(allocator, &.{ "m2", "m1", "m3" }, 5);
+    defer RangeAssignor.freeAssignment(allocator, plan);
+    try std.testing.expectEqual(@as(usize, 3), plan.len);
+    // Sorted: m1, m2, m3 → sizes 2, 2, 1
+    var m1_parts: ?[]i32 = null;
+    var m2_parts: ?[]i32 = null;
+    var m3_parts: ?[]i32 = null;
+    for (plan) |mp| {
+        if (std.mem.eql(u8, mp.member_id, "m1")) m1_parts = mp.partitions;
+        if (std.mem.eql(u8, mp.member_id, "m2")) m2_parts = mp.partitions;
+        if (std.mem.eql(u8, mp.member_id, "m3")) m3_parts = mp.partitions;
+    }
+    try std.testing.expectEqual(@as(usize, 2), m1_parts.?.len);
+    try std.testing.expectEqual(@as(usize, 2), m2_parts.?.len);
+    try std.testing.expectEqual(@as(usize, 1), m3_parts.?.len);
+    try std.testing.expectEqual(@as(i32, 0), m1_parts.?[0]);
+    try std.testing.expectEqual(@as(i32, 1), m1_parts.?[1]);
+}
+
+test "RoundRobinAssignor even split across members" {
+    const allocator = std.testing.allocator;
+    const plan = try RoundRobinAssignor.assign(allocator, &.{ "m2", "m1" }, 4);
+    defer RoundRobinAssignor.freeAssignment(allocator, plan);
+    try std.testing.expectEqual(@as(usize, 2), plan.len);
+    var m1_parts: ?[]i32 = null;
+    var m2_parts: ?[]i32 = null;
+    for (plan) |mp| {
+        if (std.mem.eql(u8, mp.member_id, "m1")) m1_parts = mp.partitions;
+        if (std.mem.eql(u8, mp.member_id, "m2")) m2_parts = mp.partitions;
+    }
+    // Sorted m1, m2 → p0→m1, p1→m2, p2→m1, p3→m2
+    try std.testing.expectEqual(@as(usize, 2), m1_parts.?.len);
+    try std.testing.expectEqual(@as(usize, 2), m2_parts.?.len);
+    try std.testing.expectEqual(@as(i32, 0), m1_parts.?[0]);
+    try std.testing.expectEqual(@as(i32, 2), m1_parts.?[1]);
+    try std.testing.expectEqual(@as(i32, 1), m2_parts.?[0]);
+    try std.testing.expectEqual(@as(i32, 3), m2_parts.?[1]);
+}
+
+test "StickyAssignor prefers previous ownership when member still present" {
+    const allocator = std.testing.allocator;
+    const previous = [_]StickyAssignor.PreviousAssignment{
+        .{ .member_id = "m1", .partitions = &.{ 0, 2 } },
+    };
+    const plan = try StickyAssignor.assign(allocator, &.{ "m2", "m1" }, 4, &previous);
+    defer StickyAssignor.freeAssignment(allocator, plan);
+    var m1_parts: ?[]i32 = null;
+    var m2_parts: ?[]i32 = null;
+    for (plan) |mp| {
+        if (std.mem.eql(u8, mp.member_id, "m1")) m1_parts = mp.partitions;
+        if (std.mem.eql(u8, mp.member_id, "m2")) m2_parts = mp.partitions;
+    }
+    try std.testing.expect(m1_parts != null);
+    try std.testing.expect(m2_parts != null);
+    // m1 keeps 0 and 2; remaining 1,3 round-robin → m1,m2 sorted → p1→m1, p3→m2
+    try std.testing.expectEqual(@as(usize, 3), m1_parts.?.len);
+    try std.testing.expectEqual(@as(i32, 0), m1_parts.?[0]);
+    try std.testing.expectEqual(@as(i32, 2), m1_parts.?[1]);
+    try std.testing.expectEqual(@as(i32, 1), m1_parts.?[2]);
+    try std.testing.expectEqual(@as(usize, 1), m2_parts.?.len);
+    try std.testing.expectEqual(@as(i32, 3), m2_parts.?[0]);
+}
+
+test "CooperativeStickyAssignor retains sticky then balances" {
+    const allocator = std.testing.allocator;
+    const previous = [_]CooperativeStickyAssignor.PreviousAssignment{
+        .{ .member_id = "m1", .partitions = &.{ 0, 1, 2 } },
+        .{ .member_id = "m2", .partitions = &.{ 3 } },
+    };
+    const plan = try CooperativeStickyAssignor.assign(allocator, &.{ "m1", "m2" }, 4, &previous);
+    defer CooperativeStickyAssignor.freeAssignment(allocator, plan);
+    var m1_parts: ?[]i32 = null;
+    var m2_parts: ?[]i32 = null;
+    for (plan) |mp| {
+        if (std.mem.eql(u8, mp.member_id, "m1")) m1_parts = mp.partitions;
+        if (std.mem.eql(u8, mp.member_id, "m2")) m2_parts = mp.partitions;
+    }
+    // Sticky keeps m1=[0,1,2], m2=[3]; balance moves highest (2) from m1 → m2 → [0,1] / [2,3]
+    try std.testing.expectEqual(@as(usize, 2), m1_parts.?.len);
+    try std.testing.expectEqual(@as(usize, 2), m2_parts.?.len);
+    try std.testing.expectEqual(@as(i32, 0), m1_parts.?[0]);
+    try std.testing.expectEqual(@as(i32, 1), m1_parts.?[1]);
+    try std.testing.expectEqual(@as(i32, 2), m2_parts.?[0]);
+    try std.testing.expectEqual(@as(i32, 3), m2_parts.?[1]);
+}
+
+test "CooperativeStickyAssignor computeRevocations when member loses partition" {
+    const allocator = std.testing.allocator;
+    const previous = [_]CooperativeStickyAssignor.PreviousAssignment{
+        .{ .member_id = "m1", .partitions = &.{ 0, 1, 2 } },
+        .{ .member_id = "m2", .partitions = &.{ 3 } },
+    };
+    var m1_new = [_]i32{ 0, 1 };
+    var m2_new = [_]i32{ 2, 3 };
+    const new_assignment = [_]CooperativeStickyAssignor.MemberPartitions{
+        .{ .member_id = "m1", .partitions = &m1_new },
+        .{ .member_id = "m2", .partitions = &m2_new },
+    };
+    const revocations = try CooperativeStickyAssignor.computeRevocations(allocator, &previous, &new_assignment);
+    defer CooperativeStickyAssignor.freeAssignment(allocator, revocations);
+    try std.testing.expectEqual(@as(usize, 1), revocations.len);
+    try std.testing.expectEqualStrings("m1", revocations[0].member_id);
+    try std.testing.expectEqual(@as(usize, 1), revocations[0].partitions.len);
+    try std.testing.expectEqual(@as(i32, 2), revocations[0].partitions[0]);
+}
+
+test "parsePartitionAssignorKind accepts cooperative_sticky" {
+    try std.testing.expectEqual(PartitionAssignorKind.cooperative_sticky, parsePartitionAssignorKind("cooperative_sticky").?);
+    try std.testing.expectEqual(PartitionAssignorKind.cooperative_sticky, parsePartitionAssignorKind("cooperative-sticky").?);
+    try std.testing.expectEqual(PartitionAssignorKind.range, parsePartitionAssignorKind("range").?);
+    try std.testing.expect(parsePartitionAssignorKind("unknown") == null);
+}
+
+test "PartitionAssignorKind protocolName for join group wire" {
+    try std.testing.expectEqualStrings("cooperative-sticky", PartitionAssignorKind.cooperative_sticky.protocolName());
+    try std.testing.expectEqualStrings("roundrobin", PartitionAssignorKind.round_robin.protocolName());
+    try std.testing.expectEqualStrings("sticky", PartitionAssignorKind.sticky.protocolName());
+}
+
+test "KafkaConsumerConfig default partition assignor is range" {
+    const cfg = KafkaConsumerConfig{};
+    try std.testing.expectEqual(PartitionAssignorKind.range, cfg.partition_assignor);
+    const allocator = std.testing.allocator;
+    const members = [_][]const u8{ "a", "b" };
+    const range_plan = try RangeAssignor.assign(allocator, &members, 4);
+    defer RangeAssignor.freeAssignment(allocator, range_plan);
+    const via_kind = try PartitionAssignor.assignByKind(allocator, cfg.partition_assignor, &members, 4, &.{});
+    defer PartitionAssignor.freeAssignment(allocator, via_kind);
+    for (range_plan, via_kind) |r, v| {
+        try std.testing.expectEqualStrings(r.member_id, v.member_id);
+        try std.testing.expectEqual(r.partitions.len, v.partitions.len);
+        for (r.partitions, v.partitions) |rp, vp| {
+            try std.testing.expectEqual(rp, vp);
+        }
+    }
+}
+
+test "ConsumerGroupSession cooperative applyCooperativeAssignment revoke then ack" {
+    const allocator = std.testing.allocator;
+    var session = ConsumerGroupSession.init(allocator, "g");
+    defer session.deinit();
+    const topic = try allocator.dupe(u8, "orders");
+    const parts = try allocator.alloc(i32, 2);
+    parts[0] = 0;
+    parts[1] = 1;
+    try session.assignments.append(allocator, .{ .topic = topic, .partitions = parts });
+    session.state = .stable;
+
+    const new_topic = try allocator.dupe(u8, "orders");
+    const new_parts = try allocator.alloc(i32, 1);
+    new_parts[0] = 1;
+    defer {
+        allocator.free(new_topic);
+        allocator.free(new_parts);
+    }
+    const new_assign = [_]ConsumerGroupSession.TopicAssignment{.{ .topic = new_topic, .partitions = new_parts }};
+
+    const rev_topic = try allocator.dupe(u8, "orders");
+    const rev_parts = try allocator.alloc(i32, 1);
+    rev_parts[0] = 0;
+    defer {
+        allocator.free(rev_topic);
+        allocator.free(rev_parts);
+    }
+    const revocations = [_]ConsumerGroupSession.TopicAssignment{.{ .topic = rev_topic, .partitions = rev_parts }};
+
+    try session.applyCooperativeAssignment(&new_assign, &revocations);
+    try std.testing.expectEqual(ConsumerGroupSession.State.revoking, session.state);
+    try std.testing.expectEqual(@as(usize, 1), session.pending_revocations.items.len);
+    try std.testing.expectEqual(@as(i32, 0), session.pending_revocations.items[0].partitions[0]);
+    try std.testing.expectEqual(@as(usize, 1), session.assignments.items.len);
+    try std.testing.expectEqual(@as(i32, 1), session.assignments.items[0].partitions[0]);
+
+    try session.acknowledgeRevocation();
+    try std.testing.expectEqual(ConsumerGroupSession.State.stable, session.state);
+    try std.testing.expectEqual(@as(usize, 0), session.pending_revocations.items.len);
+    try std.testing.expectEqual(@as(usize, 1), session.assignments.items.len);
+    try std.testing.expectEqual(@as(i32, 1), session.assignments.items[0].partitions[0]);
+}
+
+test "ConsumerGroupSession cooperative offline rebalance with prior" {
+    const allocator = std.testing.allocator;
+    const members = [_][]const u8{ "c-a", "c-b" };
+    var session = ConsumerGroupSession.init(allocator, "g");
+    defer session.deinit();
+    try session.joinOfflineRebalance("c-a", &members, &.{"orders"}, 2, .cooperative_sticky);
+    try std.testing.expectEqual(@as(usize, 1), session.assignments.items.len);
+    try std.testing.expectEqual(@as(usize, 1), session.assignments.items[0].partitions.len);
+    const first_part = session.assignments.items[0].partitions[0];
+
+    // Simulate member loss: only c-b remains; c-a should lose its partition cooperatively.
+    try session.joinOfflineRebalance("c-a", &.{"c-b"}, &.{"orders"}, 2, .cooperative_sticky);
+    if (session.state == .revoking) {
+        try std.testing.expect(session.pending_revocations.items.len > 0);
+        try session.acknowledgeRevocation();
+    }
+    try std.testing.expectEqual(ConsumerGroupSession.State.stable, session.state);
+    if (session.assignments.items.len > 0) {
+        for (session.assignments.items[0].partitions) |p| {
+            try std.testing.expect(p != first_part or members.len == 1);
+        }
+    }
+}
+
+test "ConsumerGroupSession multi-member offline rebalance" {
+    const allocator = std.testing.allocator;
+    const members = [_][]const u8{ "c-b", "c-a" };
+    var a = ConsumerGroupSession.init(allocator, "g");
+    defer a.deinit();
+    var b = ConsumerGroupSession.init(allocator, "g");
+    defer b.deinit();
+    try a.joinOfflineRebalance("c-a", &members, &.{"orders"}, 4, .range);
+    try b.joinOfflineRebalance("c-b", &members, &.{"orders"}, 4, .range);
+    try std.testing.expect(a.is_leader);
+    try std.testing.expect(!b.is_leader);
+    try std.testing.expectEqual(@as(usize, 1), a.assignments.items.len);
+    try std.testing.expectEqual(@as(usize, 2), a.assignments.items[0].partitions.len);
+    try std.testing.expectEqual(@as(usize, 2), b.assignments.items[0].partitions.len);
+    // No overlap
+    for (a.assignments.items[0].partitions) |pa| {
+        for (b.assignments.items[0].partitions) |pb| {
+            try std.testing.expect(pa != pb);
+        }
+    }
+}
+
+test "KafkaWireFormat buildMetadataRequest" {
+    const allocator = std.testing.allocator;
+    const req = try KafkaWireFormat.buildMetadataRequest(allocator, &.{ "orders", "payments" }, 3, "c1");
+    defer allocator.free(req);
+    try std.testing.expect(req.len > 10);
+    try std.testing.expectEqual(@as(i16, 3), readI16(req[0..2])); // api_key Metadata
+    try std.testing.expectEqual(@as(i16, 1), readI16(req[2..4])); // api_version
+}
+
+test "KafkaWireFormat parseMetadataResponse synthetic" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    var b4: [4]u8 = undefined;
+    var b2: [2]u8 = undefined;
+
+    writeI32(&b4, 11);
+    try buf.appendSlice(allocator, &b4); // correlation
+    writeI32(&b4, 0);
+    try buf.appendSlice(allocator, &b4); // throttle
+    writeI32(&b4, 0);
+    try buf.appendSlice(allocator, &b4); // brokers count
+    writeI32(&b4, 1);
+    try buf.appendSlice(allocator, &b4); // topics count
+
+    writeI16(&b2, 0);
+    try buf.appendSlice(allocator, &b2); // topic error_code
+    writeI16(&b2, 6);
+    try buf.appendSlice(allocator, &b2);
+    try buf.appendSlice(allocator, "orders");
+    try buf.append(allocator, 0); // is_internal
+    writeI32(&b4, 3);
+    try buf.appendSlice(allocator, &b4); // partition count
+
+    // Three minimal partition metadata entries (partition 0, 1, 2).
+    for (0..3) |p| {
+        writeI16(&b2, 0);
+        try buf.appendSlice(allocator, &b2); // partition error_code
+        writeI32(&b4, @intCast(p));
+        try buf.appendSlice(allocator, &b4); // partition id
+        writeI32(&b4, 1);
+        try buf.appendSlice(allocator, &b4); // leader
+        writeI32(&b4, 1);
+        try buf.appendSlice(allocator, &b4); // replicas count
+        writeI32(&b4, 1);
+        try buf.appendSlice(allocator, &b4); // replica id
+        writeI32(&b4, 1);
+        try buf.appendSlice(allocator, &b4); // isr count
+        writeI32(&b4, 1);
+        try buf.appendSlice(allocator, &b4); // isr id
+    }
+
+    const meta = try KafkaWireFormat.parseMetadataResponse(allocator, buf.items, 11);
+    defer KafkaWireFormat.freeTopicMetaList(allocator, meta);
+    try std.testing.expectEqual(@as(usize, 1), meta.len);
+    try std.testing.expectEqualStrings("orders", meta[0].topic);
+    try std.testing.expectEqual(@as(i32, 3), meta[0].partition_count);
+}
+
+test "parseFindCoordinatorResponse synthetic" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    var b4: [4]u8 = undefined;
+    var b2: [2]u8 = undefined;
+    writeI32(&b4, 9);
+    try buf.appendSlice(allocator, &b4);
+    writeI32(&b4, 0);
+    try buf.appendSlice(allocator, &b4);
+    writeI16(&b2, 0);
+    try buf.appendSlice(allocator, &b2);
+    writeI32(&b4, 1);
+    try buf.appendSlice(allocator, &b4); // node
+    writeI16(&b2, 9);
+    try buf.appendSlice(allocator, &b2);
+    try buf.appendSlice(allocator, "127.0.0.1");
+    writeI32(&b4, 9093);
+    try buf.appendSlice(allocator, &b4);
+
+    const info = try KafkaWireFormat.parseFindCoordinatorResponse(allocator, buf.items, 9);
+    defer allocator.free(info.host);
+    try std.testing.expectEqual(@as(i16, 0), info.error_code);
+    try std.testing.expectEqualStrings("127.0.0.1", info.host);
+    try std.testing.expectEqual(@as(i32, 9093), info.port);
 }
 
 test "RobustMQ live joinGroup" {

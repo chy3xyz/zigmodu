@@ -77,10 +77,10 @@ pub fn main(init: std.process.Init) !void {
 
     var io = threaded.io();
 
-    try mainFiber(&io, allocator);
+    try mainFiber(&io, allocator, init.environ_map);
 }
 
-fn mainFiber(io: *std.Io, allocator: std.mem.Allocator) !void {
+fn mainFiber(io: *std.Io, allocator: std.mem.Allocator, environ: *const std.process.Environ.Map) !void {
     const total_requests = NUM_CLIENTS * REQUESTS_PER_CLIENT;
 
     std.log.info("=== HTTP Server Stress Test ===", .{});
@@ -89,9 +89,19 @@ fn mainFiber(io: *std.Io, allocator: std.mem.Allocator) !void {
     std.log.info("Total requests: {}", .{total_requests});
     std.log.info("================================", .{});
 
-    // Initialize server
-    var server = Server.init(io.*, allocator, 8080);
+    // Initialize server (HTTP_PORT overrides; BENCH_HOLD=1 serves forever for external benches).
+    const listen_port: u16 = blk: {
+        if (environ.get("HTTP_PORT")) |p| {
+            break :blk std.fmt.parseInt(u16, p, 10) catch 8080;
+        }
+        break :blk 8080;
+    };
+    var server = Server.initWithConfig(io.*, allocator, .{
+        .port = listen_port,
+        .max_requests_per_conn = 100_000,
+    });
     defer server.deinit();
+    server.setHttp2Enabled(true);
 
     // Setup routes
     try server.addRoute(.{
@@ -129,7 +139,7 @@ fn mainFiber(io: *std.Io, allocator: std.mem.Allocator) !void {
     }.run, .{&server});
 
     const port = server.port;
-    std.log.info("Server listening on port {}", .{port});
+    std.log.info("Server listening on port {} (http2/h2c enabled)", .{port});
 
     // Wait for server to be ready
     var attempts: u32 = 0;
@@ -144,6 +154,13 @@ fn mainFiber(io: *std.Io, allocator: std.mem.Allocator) !void {
         };
         conn.close(io.*);
         break;
+    }
+
+    if (environ.get("BENCH_HOLD") != null) {
+        std.log.info("BENCH_HOLD: serving until killed", .{});
+        while (true) {
+            try std.Io.sleep(io.*, .{ .nanoseconds = 1 * std.time.ns_per_s }, .real);
+        }
     }
 
     // Prepare client tasks

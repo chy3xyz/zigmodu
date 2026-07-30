@@ -57,8 +57,9 @@
 | # | 项目 | 优先级 | 状态 |
 |---|------|--------|------|
 | 1 | 环境门控 skip 用例（Redis/NATS/PG/MySQL） | 中 | ✅ CI live-service job 覆盖（Fluvio/HttpClient-live 仍本地跳过） |
-| 2 | gRPC streaming / HTTP/2 | 部分 | Server streaming + `Http2` 帧层已落地；client/bidi 仍待完整双工 session |
-| 2b | Kafka Consumer Group | 部分 | Join/Sync/Heartbeat/Offset* wire + offline session；live rebalance 需 broker || 3 | ShopDemo 可 `zig build run` | 低 | 待办 |
+| 2 | gRPC streaming / HTTP/2 | 部分 | PRIORITY 依赖树 + 加权出站调度 + h2c Upgrade + 流控/SETTINGS；进程内 TLS 仍待 |
+| 2b | Kafka Consumer Group | 部分 | CooperativeSticky + 两阶段 revoke/ack；与 broker 完整协议往返仍可加深 |
+| 3 | ShopDemo 可 `zig build run` | 低 | ✅ + CI smoke（`ci-integration.sh`，`:18081`） |
 | 4 | 持续 Benchmark 基线入库 | 低 | ✅ `zig build benchmark` 输出 `bench-results.json`，CI 基线告警已接通 |
 
 > 12 个 skipped 用例全部为环境门控（需要外部服务）：Redis ×3、NATS ×3、Fluvio ×2、PG/MySQL ×2、HttpClient live ×2。CI 中 `test-postgres` / `test-mysql` / `test-live-services` job 分别启用对应服务后执行。

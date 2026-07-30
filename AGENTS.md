@@ -228,6 +228,8 @@ test "my test" {
 
 - Optional data stack: [chy3xyz/zent](https://github.com/chy3xyz/zent) (v0.12+) is orthogonal to `data.sqlx` — modules may choose either independently, but do not mix drivers or share a transaction across them; see `docs/ZENT.md`.
 - zent reference apps: `examples/zent-modulith/` (minimal) and `examples/metaverse-creative/` (settlement/outbox creative-monetization demo).
-- gRPC: unary + server streaming；HTTP/2 prior-knowledge：`server.setHttp2Enabled(true)` + `setGrpcRegistry(&reg)`
+- gRPC / HTTP/2：stream 四种 + pump；PRIORITY 存储；h2c Upgrade；WINDOW_UPDATE/SETTINGS；`Http2Tls` sidecar ALPN
+- Kafka CG：FindCoordinator + Metadata + assignor（含 cooperative_sticky）+ `acknowledgeRevocation` 两阶段
+- CI：`bash scripts/ci-integration.sh`（tenant-mgmt + stress + shopdemo）
 - Kafka Consumer Group: offline solo 或 live `joinGroup`/`heartbeat`/`leaveGroup`（需 `KAFKA_BOOTSTRAP`）
 - Vault secrets: `security.SecretsManager` supports HashiCorp KV v2 over plain HTTP (`initWithIo` + `configureVault` / `loadFromVault`); `https://` returns `VaultTlsNotSupported`.

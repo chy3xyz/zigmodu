@@ -58,6 +58,6 @@ docs/MODULITH.md — day-one modulith + high-concurrency practices
 ## Examples
 ```
 examples/tenant-mgmt/     — flagship runnable demo (CI integration)
-examples/shopdemo/        — schema + generated-sample only (codegen reference)
+examples/shopdemo/        — minimal runnable order module (+ CI smoke on :18081)
 examples/http-stress-test/  — load test binary
 ```

@@ -23,6 +23,9 @@ const WsFramer = @import("../im/WsFramer.zig").WsFramer;
 const BufferPool = @import("../im/BufferPool.zig").BufferPool;
 const WsUring = @import("../im/ws_uring.zig").WsUring;
 const Http2Server = @import("../http/Http2Server.zig");
+const Http2 = @import("../http/Http2.zig");
+const Http2Tls = @import("../http/Http2Tls.zig");
+const Hpack = @import("../http/Hpack.zig");
 const GrpcServiceRegistry = @import("../extensions/GrpcTransport.zig").GrpcServiceRegistry;
 
 /// HTTP method
@@ -1247,6 +1250,12 @@ pub const Server = struct {
     enable_http2: bool = false,
     /// Optional gRPC registry for HTTP/2 gRPC dispatch.
     grpc_registry: ?*GrpcServiceRegistry = null,
+    /// Optional non-gRPC HTTP/2 site handler (multiplexed streams).
+    http2_site_handler: ?Http2Server.SiteHandler = null,
+    /// When true, non-gRPC H2 requests use `handleForTest` / Router (same routes as HTTP/1.1).
+    http2_use_router: bool = true,
+    /// TLS front / ALPN intent (stdlib has no TLS server; use sidecar — see `http.Http2Tls`).
+    tls_front: Http2Tls.TlsFrontConfig = .{},
 
     pub const Config = struct {
         port: u16 = 8080,
@@ -1290,6 +1299,65 @@ pub const Server = struct {
 
     pub fn setGrpcRegistry(self: *Server, registry: ?*GrpcServiceRegistry) void {
         self.grpc_registry = registry;
+    }
+
+    pub fn setHttp2SiteHandler(self: *Server, handler: ?Http2Server.SiteHandler) void {
+        self.http2_site_handler = handler;
+    }
+
+    /// When enabled (default), H2 non-gRPC requests dispatch through the same Router as HTTP/1.1.
+    pub fn setHttp2UseRouter(self: *Server, enabled: bool) void {
+        self.http2_use_router = enabled;
+    }
+
+    /// Declare TLS terminator / ALPN intent (no in-process TLS server in Zig 0.17 stdlib).
+    pub fn setTlsFront(self: *Server, cfg: Http2Tls.TlsFrontConfig) void {
+        self.tls_front = cfg;
+    }
+
+    /// H2 site adapter: run `handleForTest` and map Context → SiteResponse.
+    fn http2RouterSiteHandler(
+        user_ctx: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        method_str: []const u8,
+        path: []const u8,
+        headers: []const Hpack.Header,
+        body: []const u8,
+    ) anyerror!Http2Server.SiteResponse {
+        const server: *Server = @ptrCast(@alignCast(user_ctx.?));
+        const method = Method.fromString(method_str);
+        var ctx = try Context.init(allocator, method, path);
+        errdefer ctx.deinit();
+
+        var body_owned: ?[]u8 = null;
+        defer if (body_owned) |b| allocator.free(b);
+        if (body.len > 0) {
+            body_owned = try allocator.dupe(u8, body);
+            ctx.body = body_owned;
+        }
+        for (headers) |h| {
+            if (h.name.len == 0 or h.name[0] == ':') continue;
+            const k = try allocator.dupe(u8, h.name);
+            errdefer allocator.free(k);
+            const v = try allocator.dupe(u8, h.value);
+            errdefer allocator.free(v);
+            try ctx.headers.put(k, v);
+        }
+
+        try server.handleForTest(&ctx);
+
+        const status = ctx.status_code;
+        const ctype_src = ctx.response_headers.get("content-type") orelse "application/octet-stream";
+        const ctype = try allocator.dupe(u8, ctype_src);
+        errdefer allocator.free(ctype);
+        const resp_body = try allocator.dupe(u8, ctx.response_body.items);
+        ctx.deinit();
+        return .{
+            .status = status,
+            .content_type = ctype,
+            .body = resp_body,
+            .content_type_owned = true,
+        };
     }
 
     /// Attach a shared buffer pool for WebSocket frame I/O.
@@ -1545,9 +1613,21 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
             if (!std.mem.eql(u8, RequestParser.trimCrlf(l3), "SM")) return;
             if (RequestParser.trimCrlf(l4).len != 0) return;
 
-            Http2Server.serveAfterPreface(server.io, stream, allocator, .{
+            // Reuse the same StreamReader for the H2 session (do not create a second
+            // reader on this stream). Any bytes already buffered after the preface
+            // stay in the reader and are consumed as frames.
+            Http2Server.serveAfterPrefacePrefetchReader(server.io, stream, allocator, .{
                 .grpc_registry = server.grpc_registry,
-            }) catch |err| {
+                .site_handler = if (server.http2_site_handler != null)
+                    server.http2_site_handler
+                else if (server.http2_use_router)
+                    Server.http2RouterSiteHandler
+                else
+                    null,
+                .site_user_ctx = server,
+                // One inbound frame per stream request is typical; leave headroom for SETTINGS/WINDOW_UPDATE/CONTINUATION.
+                .max_frames = @max(server.max_requests_per_conn * 16, 4096),
+            }, &.{}, &reader.reader.interface) catch |err| {
                 std.log.warn("[Server] HTTP/2 session ended: {s}", .{@errorName(err)});
             };
             return;
@@ -1555,8 +1635,7 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
 
         var request = parser.parseAfterRequestLine(&reader, first_line_raw, server.max_body_size) catch |err| {
             switch (err) {
-                error.ClientClosed => return,
-                error.ReadFailed => return,
+                error.ReadFailed, error.IncompleteBody => return,
                 else => {},
             }
             std.log.err("Parse error: {any}", .{err});
@@ -1609,6 +1688,33 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
             const ctype = ctx.headers.get("content-type") orelse "";
             if (std.mem.startsWith(u8, ctype, "application/x-www-form-urlencoded")) {
                 ctx.form = parseFormBody(arena_alloc, body) catch null;
+            }
+        }
+
+        // ── HTTP/2 cleartext upgrade (h2c, RFC 7540 §3.2) ──
+        if (server.enable_http2 and std.mem.eql(u8, request.method.toString(), "GET")) {
+            const upgrade_hdr = ctx.headers.get("upgrade") orelse "";
+            const conn_hdr = ctx.headers.get("connection") orelse "";
+            const h2_settings = ctx.headers.get("http2-settings");
+            if (Http2.isH2cUpgrade(upgrade_hdr, conn_hdr, h2_settings)) {
+                var wbuf: [256]u8 = undefined;
+                var w = stream.writer(server.io, &wbuf);
+                w.interface.writeAll("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n") catch return;
+                w.interface.flush() catch return;
+                Http2Server.serve(server.io, stream, allocator, .{
+                    .grpc_registry = server.grpc_registry,
+                    .site_handler = if (server.http2_site_handler != null)
+                        server.http2_site_handler
+                    else if (server.http2_use_router)
+                        Server.http2RouterSiteHandler
+                    else
+                        null,
+                    .site_user_ctx = server,
+                    .max_frames = @max(server.max_requests_per_conn * 16, 4096),
+                }) catch |err| {
+                    std.log.warn("[Server] HTTP/2 h2c upgrade session ended: {s}", .{@errorName(err)});
+                };
+                return;
             }
         }
 
