@@ -1,19 +1,16 @@
 # ZigModu 生产级评估报告 v5
 
-**评估日期**: 2026-06-20  
-**框架版本**: v0.14.9  
-
+**评估日期**: 2026-07-31  
+**框架版本**: v0.14.16  
 
 **Zig 版本**: 0.17.0  
-**测试结果**: **521 passed, 18 skipped, 0 failed**（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`，2026-07-23 复测）  
-
-
+**测试结果**: **659 passed, 19 skipped, 0 failed**（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`，2026-07-31 复测）  
 
 **生产门禁**: `zig build check`（热路径禁止裸 `catch {}`）  
 **旗舰示例**: [`examples/tenant-mgmt/`](../examples/tenant-mgmt/) — SQLite 持久层 + 真 JWT + CI 业务断言  
 **内置 CodeGen CLI**: [`tools/zmodu/`](../tools/zmodu/) — 支持 SQL DDL 解析、`@initialized` 开发模型与内置 MCP Server（`zig build zmodu`）
 
-> v5.3 增量（2026-07-23）：已完成 OpenTelemetry (`OtlpExporter`) 导出器落地、JwksKeyRing 多 Key 动态轮换、zmodu 代码生成与 MCP CLI 主仓内嵌统一维护，以及 Raft 日志压缩 (`compactLog`) 与 InstallSnapshot RPC 协议；综合评分升至 **~98/100**。
+> v5.5 增量（2026-07-31）：HTTP/2 `ConnWriter` 合并写/少 flush + 完整 GOAWAY/RST + pending 出站上限 + 流级错误隔离；PRIORITY 加权调度与 h2c StreamReader 复用保持；综合维持 **~98/100**。
 
 ---
 
@@ -22,20 +19,19 @@
 | # | 维度 | 得分 | v4 | Δ | 评价 |
 |---|------|:----:|:--:|:--:|------|
 | 1 | **核心框架** | 98 | 98 | — | Module 全生命周期闭环 + 级联背压 |
-| 2 | **API & 传输** | 97 | 95 | +2 | HTTP + gRPC unary + Kafka wire |
+| 2 | **API & 传输** | 97 | 95 | +2 | HTTP/1.1 + h2c + gRPC streams + Kafka wire |
 | 3 | **弹性模式** | 96 | 95 | +1 | CB + RL + Retry + Redis 容灾降级 |
 | 4 | **数据层** | 97 | 95 | +2 | SQLite 旗舰示例 + PG/MySQL 二进制解析 + ManagedRows |
 | 5 | **安全** | 98 | 95 | +3 | AppSecurity、JWT 单路径、JwksKeyRing 动态轮换 |
 | 6 | **可观测性** | 97 | 93 | +4 | Prometheus + OtlpExporter (OTLP/JSON) + Health Probe |
-| 7 | **开发者体验** | 98 | 95 | +3 | 内置 `zmodu` CLI（32 项生成测试）、`builder` API |
-| 8 | **分布式** | 93 | 88 | +5 | Cluster + DistEventBus + Raft Log Compaction & InstallSnapshot |
-| 9 | **测试质量** | 97 | 93 | +4 | 518 passed (0 leaks)；integration 含 JWT + CRUD 断言 |
+| 7 | **开发者体验** | 98 | 95 | +3 | 内置 `zmodu` CLI、`builder` API |
+| 8 | **分布式** | 93 | 88 | +5 | Cluster + DistEventBus + Raft Log Compaction |
+| 9 | **测试质量** | 97 | 93 | +4 | ~659 passed；integration 含 JWT + CRUD + shopdemo smoke |
 | 10 | **运维/DevOps** | 98 | 98 | — | CI matrix + integration-full + DB jobs |
 | 11 | **内存安全** | 96 | 92 | +4 | P0 泄漏修复 + 生产 check 门禁 |
-| 12 | **文档** | 97 | 90 | +7 | ZMODU CLI 指南、ZENT 说明、多租户可选说明 |
+| 12 | **文档** | 97 | 90 | +7 | ZMODU / ZENT / MODULITH / 多租户可选说明 |
 
-> **综合评分: ~98/100** — 路线图阶段 1–9 关键落地完成；多租户为可选模块，不启用即为单租户应用。
-
+> **综合评分: ~98/100** — 路线图阶段 1–9 主体落地；多租户为可选模块。
 
 ---
 
@@ -49,28 +45,28 @@
 | CI `DB=postgres` / `DB=mysql` | ✅ |
 | `zig build check` 热路径门禁 | ✅ |
 | 多租户能力文档化（可选，非强制） | ✅ |
+| h2c prior-knowledge + Router 复用 | ✅ |
+| PRIORITY 加权出站调度 | ✅ |
+| H2 ConnWriter + GOAWAY/RST + pending 上限 | ✅ |
 
 ---
 
-## 剩余差距 (95 → 98)
+## 剩余差距
 
 | # | 项目 | 优先级 | 状态 |
 |---|------|--------|------|
-| 1 | 环境门控 skip 用例（Redis/NATS/PG/MySQL） | 中 | ✅ CI live-service job 覆盖（Fluvio/HttpClient-live 仍本地跳过） |
-| 2 | gRPC streaming / HTTP/2 | 部分 | PRIORITY 依赖树 + 加权出站调度 + h2c Upgrade + 流控/SETTINGS；进程内 TLS 仍待 |
-| 2b | Kafka Consumer Group | 部分 | CooperativeSticky + 两阶段 revoke/ack；与 broker 完整协议往返仍可加深 |
-| 3 | ShopDemo 可 `zig build run` | 低 | ✅ + CI smoke（`ci-integration.sh`，`:18081`） |
-| 4 | 持续 Benchmark 基线入库 | 低 | ✅ `zig build benchmark` 输出 `bench-results.json`，CI 基线告警已接通 |
-
-> 12 个 skipped 用例全部为环境门控（需要外部服务）：Redis ×3、NATS ×3、Fluvio ×2、PG/MySQL ×2、HttpClient live ×2。CI 中 `test-postgres` / `test-mysql` / `test-live-services` job 分别启用对应服务后执行。
+| 1 | 环境门控 skip（Redis/NATS/PG/MySQL） | 中 | ✅ CI live-service job；Fluvio/HttpClient-live 仍本地跳过 |
+| 2 | gRPC streaming / HTTP/2 | 部分 | PRIORITY + 合并写 + GOAWAY/RST 隔离 + h2c；**H2 吞吐仍低于 H1**；进程内 TLS 仍待 |
+| 2b | Kafka Consumer Group | 部分 | CooperativeSticky + 两阶段 revoke/ack；broker 完整往返仍可加深 |
+| 3 | ShopDemo `zig build run` | 低 | ✅ + CI smoke |
+| 4 | Benchmark 基线 | 低 | ✅ `zig build benchmark`；H1/h2c 脚本 `scripts/bench_h1_h2.py` |
 
 ---
 
 ## 结论
 
-ZigModu v0.14.3 在 Zig 0.17 上约 **95/100**。单租户应用直接使用 `Application` + HTTP + SQLx 即可；多租户通过 `TenantContext` / 中间件 / SQL 过滤**按需叠加**，见 [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) § Multi-Tenancy (Optional)。
+ZigModu **v0.14.16** 在 Zig 0.17 上约 **98/100**。短请求本机场景优先 HTTP/1.1；h2c/gRPC 适合多路复用与流式。TLS 生产路径用 sidecar ALPN。
 
-**推荐路径**：`examples/basic`（无租户）→ `examples/tenant-mgmt`（可选多租户 + JWT）→ `shopdemo` schema（大规模 modulith 生成）。
+**推荐路径**：`examples/basic` → `examples/tenant-mgmt` → `shopdemo` / `zent-modulith`。
 
-*评估完成时间: 2026-07-23*
-
+*评估完成时间: 2026-07-31*

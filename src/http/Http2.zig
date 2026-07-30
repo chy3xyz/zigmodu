@@ -1,7 +1,7 @@
-//! HTTP/2 frame codec (RFC 7540) — framing + SETTINGS/DATA/HEADERS/WINDOW_UPDATE/PING/GOAWAY/RST.
+//! HTTP/2 frame codec (RFC 7540) — framing + SETTINGS/DATA/HEADERS/WINDOW_UPDATE/PING/GOAWAY/RST/PRIORITY.
 //!
-//! Scope: wire helpers for gRPC-over-H2. Not a full multiplexed connection manager
-//! (no priority tree, no push, simplified HPACK literal-only header blocks).
+//! Also hosts `PriorityTree` (dependency + weighted fair pick). Connection loop /
+//! HPACK live in `Http2Server.zig` / `Hpack.zig`.
 
 const std = @import("std");
 
@@ -20,6 +20,7 @@ pub const FlowControlError = error{
     FlowControlBlocked,
     InvalidSettingsPayload,
     InvalidInitialWindowSize,
+    InvalidFramePayload,
 };
 
 /// RFC 7540 §6.5.2 SETTINGS identifiers.
@@ -112,6 +113,23 @@ pub const FrameFlags = struct {
     pub const end_headers: u8 = 0x4;
     pub const padded: u8 = 0x8;
     pub const priority: u8 = 0x20;
+};
+
+/// RFC 7540 §7 error codes.
+pub const ErrorCode = struct {
+    pub const NO_ERROR: u32 = 0x0;
+    pub const PROTOCOL_ERROR: u32 = 0x1;
+    pub const INTERNAL_ERROR: u32 = 0x2;
+    pub const FLOW_CONTROL_ERROR: u32 = 0x3;
+    pub const SETTINGS_TIMEOUT: u32 = 0x4;
+    pub const STREAM_CLOSED: u32 = 0x5;
+    pub const FRAME_SIZE_ERROR: u32 = 0x6;
+    pub const REFUSED_STREAM: u32 = 0x7;
+    pub const CANCEL: u32 = 0x8;
+    pub const COMPRESSION_ERROR: u32 = 0x9;
+    pub const ENHANCE_YOUR_CALM: u32 = 0xa;
+    pub const INADEQUATE_SECURITY: u32 = 0xb;
+    pub const HTTP_1_1_REQUIRED: u32 = 0xc;
 };
 
 pub const FrameHeader = struct {
@@ -242,11 +260,13 @@ pub fn encodePing(allocator: std.mem.Allocator, ack: bool, opaque_data: [8]u8) !
 
 pub fn encodeRstStream(allocator: std.mem.Allocator, stream_id: u31, error_code: u32) ![]u8 {
     var payload: [4]u8 = undefined;
-    payload[0] = @truncate(error_code >> 24);
-    payload[1] = @truncate(error_code >> 16);
-    payload[2] = @truncate(error_code >> 8);
-    payload[3] = @truncate(error_code);
+    writeU32Be(&payload, error_code);
     return encodeFrame(allocator, .rst_stream, 0, stream_id, &payload);
+}
+
+pub fn decodeRstStream(payload: []const u8) FlowControlError!u32 {
+    if (payload.len != 4) return error.InvalidFramePayload;
+    return readU32Be(payload[0..4]);
 }
 
 pub fn encodeGoAway(allocator: std.mem.Allocator, last_stream_id: u31, error_code: u32, debug: []const u8) ![]u8 {
@@ -257,6 +277,30 @@ pub fn encodeGoAway(allocator: std.mem.Allocator, last_stream_id: u31, error_cod
     try appendU32(&body, allocator, error_code);
     try body.appendSlice(allocator, debug);
     return encodeFrame(allocator, .goaway, 0, 0, body.items);
+}
+
+pub const GoAwayInfo = struct {
+    last_stream_id: u31,
+    error_code: u32,
+    debug: []const u8,
+};
+
+pub fn decodeGoAway(payload: []const u8) FlowControlError!GoAwayInfo {
+    if (payload.len < 8) return error.InvalidFramePayload;
+    const last: u31 = @truncate(readU32Be(payload[0..4]) & 0x7fff_ffff);
+    const code = readU32Be(payload[4..8]);
+    return .{ .last_stream_id = last, .error_code = code, .debug = payload[8..] };
+}
+
+fn writeU32Be(out: *[4]u8, v: u32) void {
+    out[0] = @truncate(v >> 24);
+    out[1] = @truncate(v >> 16);
+    out[2] = @truncate(v >> 8);
+    out[3] = @truncate(v);
+}
+
+fn readU32Be(buf: *const [4]u8) u32 {
+    return (@as(u32, buf[0]) << 24) | (@as(u32, buf[1]) << 16) | (@as(u32, buf[2]) << 8) | buf[3];
 }
 
 pub fn encodeData(allocator: std.mem.Allocator, stream_id: u31, data: []const u8, end_stream: bool) ![]u8 {
@@ -875,4 +919,27 @@ test "encodeGrpcServerStream produces headers+data+trailers" {
     }
     try std.testing.expect(frames >= 3);
     try std.testing.expect(saw_data);
+}
+
+test "encodeRstStream decodeRstStream roundtrip" {
+    const allocator = std.testing.allocator;
+    const wire = try encodeRstStream(allocator, 9, ErrorCode.CANCEL);
+    defer allocator.free(wire);
+    const frame = try decodeFrame(wire);
+    try std.testing.expectEqual(FrameType.rst_stream, frame.header.typ);
+    try std.testing.expectEqual(@as(u31, 9), frame.header.stream_id);
+    try std.testing.expectEqual(ErrorCode.CANCEL, try decodeRstStream(frame.payload));
+}
+
+test "encodeGoAway decodeGoAway roundtrip with debug" {
+    const allocator = std.testing.allocator;
+    const wire = try encodeGoAway(allocator, 7, ErrorCode.NO_ERROR, "bye");
+    defer allocator.free(wire);
+    const frame = try decodeFrame(wire);
+    try std.testing.expectEqual(FrameType.goaway, frame.header.typ);
+    try std.testing.expectEqual(@as(u31, 0), frame.header.stream_id);
+    const info = try decodeGoAway(frame.payload);
+    try std.testing.expectEqual(@as(u31, 7), info.last_stream_id);
+    try std.testing.expectEqual(ErrorCode.NO_ERROR, info.error_code);
+    try std.testing.expectEqualStrings("bye", info.debug);
 }

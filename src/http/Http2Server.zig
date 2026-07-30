@@ -48,6 +48,69 @@ pub const ServeOptions = struct {
     site_user_ctx: ?*anyopaque = null,
     /// Max frames to process before returning (tests / idle cap).
     max_frames: usize = 256,
+    /// Cap concurrent pending outbound response streams (REFUSED_STREAM when exceeded).
+    max_pending_streams: usize = 64,
+    /// Cap total pending outbound wire bytes (ENHANCE_YOUR_CALM when exceeded).
+    max_pending_bytes: usize = 4 * 1024 * 1024,
+};
+
+/// Coalesces small writes and flushes once per drain/control batch.
+const ConnWriter = struct {
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    buf: [32 * 1024]u8 = undefined,
+    len: usize = 0,
+
+    fn init(io: std.Io, stream: std.Io.net.Stream) ConnWriter {
+        return .{ .io = io, .stream = stream };
+    }
+
+    fn write(self: *ConnWriter, data: []const u8) !void {
+        var rest = data;
+        while (rest.len > 0) {
+            const space = self.buf.len - self.len;
+            if (space == 0) try self.flush();
+            if (rest.len >= self.buf.len and self.len == 0) {
+                try self.writeDirect(rest);
+                return;
+            }
+            const n = @min(self.buf.len - self.len, rest.len);
+            @memcpy(self.buf[self.len..][0..n], rest[0..n]);
+            self.len += n;
+            rest = rest[n..];
+        }
+    }
+
+    fn writeFrame(self: *ConnWriter, typ: Http2.FrameType, flags: u8, stream_id: u31, payload: []const u8) !void {
+        if (payload.len > std.math.maxInt(u24)) return error.PayloadTooLarge;
+        var hdr: [9]u8 = undefined;
+        (Http2.FrameHeader{
+            .length = @intCast(payload.len),
+            .typ = typ,
+            .flags = flags,
+            .stream_id = stream_id,
+        }).encode(&hdr);
+        try self.write(&hdr);
+        try self.write(payload);
+    }
+
+    fn writeData(self: *ConnWriter, stream_id: u31, data: []const u8, end_stream: bool) !void {
+        const flags: u8 = if (end_stream) Http2.FrameFlags.end_stream else 0;
+        try self.writeFrame(.data, flags, stream_id, data);
+    }
+
+    fn writeDirect(self: *ConnWriter, data: []const u8) !void {
+        var wbuf: [8192]u8 = undefined;
+        var w = self.stream.writer(self.io, &wbuf);
+        try w.interface.writeAll(data);
+        try w.interface.flush();
+    }
+
+    fn flush(self: *ConnWriter) !void {
+        if (self.len == 0) return;
+        try self.writeDirect(self.buf[0..self.len]);
+        self.len = 0;
+    }
 };
 
 /// Serve one HTTP/2 connection: read client connection preface, then process frames.
@@ -99,23 +162,29 @@ pub fn serveAfterPrefacePrefetchReader(
     prefetch: []const u8,
     inbound: ?*std.Io.Reader,
 ) !void {
+    var writer = ConnWriter.init(io, stream);
+
     const settings = try Http2.encodeSettings(allocator, false, &.{
         .{ 0x3, 100 }, // MAX_CONCURRENT_STREAMS
         .{ 0x4, 65535 }, // INITIAL_WINDOW_SIZE
     });
     defer allocator.free(settings);
-    try writeAll(io, stream, settings);
+    try writer.write(settings);
+    try writer.flush();
 
     var hpack_dec = Hpack.Decoder.init(allocator);
     defer hpack_dec.deinit();
 
     var conn_flow = Http2.FlowControlState.init(Http2.default_initial_window_size);
     var conn_max_frame_size: u31 = 16384;
+    var last_peer_stream: u31 = 0;
+    var goaway_sent = false;
+    var reject_new_streams = false;
 
     var priority_tree = Http2.PriorityTree.init(allocator);
     defer priority_tree.deinit();
 
-    var outbound = OutboundScheduler.init(allocator);
+    var outbound = OutboundScheduler.init(allocator, opts.max_pending_streams, opts.max_pending_bytes);
     defer outbound.deinit();
 
     var streams = std.AutoHashMap(u31, StreamState).init(allocator);
@@ -136,32 +205,60 @@ pub fn serveAfterPrefacePrefetchReader(
         break :blk &local_reader_storage.interface;
     };
 
+    const drain_slice: usize = 8;
+
     var frames: usize = 0;
     while (frames < opts.max_frames) : (frames += 1) {
+        const inbound_ready = (prefetch_off < prefetch_buf.len) or (reader.bufferedLen() > 0);
+        if (!inbound_ready and outbound.pending.count() > 0) {
+            try outbound.drain(&writer, &priority_tree, &conn_flow, conn_max_frame_size, 0);
+            try writer.flush();
+        }
+
         const frame_buf = readFramePrefetch(reader, allocator, prefetch_buf, &prefetch_off) catch |err| switch (err) {
-            error.ConnectionClosed => return,
-            else => return err,
+            error.ConnectionClosed => {
+                try outbound.drain(&writer, &priority_tree, &conn_flow, conn_max_frame_size, 0);
+                try writer.flush();
+                return;
+            },
+            else => {
+                try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.PROTOCOL_ERROR, &goaway_sent);
+                return;
+            },
         };
         defer allocator.free(frame_buf);
 
-        const frame = try Http2.decodeFrame(frame_buf);
+        const frame = Http2.decodeFrame(frame_buf) catch {
+            try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.PROTOCOL_ERROR, &goaway_sent);
+            return;
+        };
+        if (frame.header.stream_id != 0 and frame.header.stream_id > last_peer_stream) {
+            last_peer_stream = frame.header.stream_id;
+        }
+
         switch (frame.header.typ) {
             .settings => {
                 if ((frame.header.flags & Http2.FrameFlags.ack) == 0) {
-                    const peer_settings = try Http2.decodeSettings(allocator, frame.payload);
+                    const peer_settings = Http2.decodeSettings(allocator, frame.payload) catch {
+                        try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.FRAME_SIZE_ERROR, &goaway_sent);
+                        return;
+                    };
                     defer allocator.free(peer_settings);
                     for (peer_settings) |s| {
                         switch (s.id) {
                             Http2.SettingsId.initial_window_size => {
                                 const new_initial: u31 = @intCast(s.value);
-                                try conn_flow.applyPeerInitialWindowSize(new_initial);
+                                conn_flow.applyPeerInitialWindowSize(new_initial) catch {
+                                    try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.FLOW_CONTROL_ERROR, &goaway_sent);
+                                    return;
+                                };
                                 var it = streams.valueIterator();
                                 while (it.next()) |st| {
-                                    try st.flow.applyPeerInitialWindowSize(new_initial);
+                                    st.flow.applyPeerInitialWindowSize(new_initial) catch {};
                                 }
                                 var pit = outbound.pending.valueIterator();
                                 while (pit.next()) |p| {
-                                    try p.flow.applyPeerInitialWindowSize(new_initial);
+                                    p.flow.applyPeerInitialWindowSize(new_initial) catch {};
                                 }
                             },
                             Http2.SettingsId.max_frame_size => {
@@ -172,30 +269,34 @@ pub fn serveAfterPrefacePrefetchReader(
                             else => {},
                         }
                     }
-                    const ack = try Http2.encodeSettings(allocator, true, &.{});
-                    defer allocator.free(ack);
-                    try writeAll(io, stream, ack);
+                    try writer.writeFrame(.settings, Http2.FrameFlags.ack, 0, &.{});
+                    try writer.flush();
                 }
             },
             .ping => {
                 if ((frame.header.flags & Http2.FrameFlags.ack) == 0 and frame.payload.len == 8) {
-                    var opaque_data: [8]u8 = undefined;
-                    @memcpy(&opaque_data, frame.payload[0..8]);
-                    const pong = try Http2.encodePing(allocator, true, opaque_data);
-                    defer allocator.free(pong);
-                    try writeAll(io, stream, pong);
+                    try writer.writeFrame(.ping, Http2.FrameFlags.ack, 0, frame.payload);
+                    try writer.flush();
                 }
             },
             .window_update => {
                 const increment = Http2.decodeWindowUpdate(frame.payload) catch continue;
                 if (frame.header.stream_id == 0) {
-                    conn_flow.applyWindowUpdate(increment) catch return;
+                    conn_flow.applyWindowUpdate(increment) catch {
+                        try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.FLOW_CONTROL_ERROR, &goaway_sent);
+                        return;
+                    };
                 } else if (streams.getPtr(frame.header.stream_id)) |st| {
-                    st.flow.applyWindowUpdate(increment) catch return;
+                    st.flow.applyWindowUpdate(increment) catch {
+                        try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, frame.header.stream_id, Http2.ErrorCode.FLOW_CONTROL_ERROR);
+                    };
                 } else if (outbound.pending.getPtr(frame.header.stream_id)) |p| {
-                    p.flow.applyWindowUpdate(increment) catch return;
+                    p.flow.applyWindowUpdate(increment) catch {
+                        try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, frame.header.stream_id, Http2.ErrorCode.FLOW_CONTROL_ERROR);
+                    };
                 }
-                try outbound.drain(io, stream, &priority_tree, &conn_flow, conn_max_frame_size);
+                try outbound.drain(&writer, &priority_tree, &conn_flow, conn_max_frame_size, drain_slice);
+                try writer.flush();
             },
             .priority => {
                 const sid = frame.header.stream_id;
@@ -209,17 +310,31 @@ pub fn serveAfterPrefacePrefetchReader(
             .rst_stream => {
                 const sid = frame.header.stream_id;
                 if (sid != 0) {
-                    outbound.cancel(sid);
-                    priority_tree.removeStream(sid);
-                    if (streams.fetchRemove(sid)) |kv| {
-                        var removed = kv;
-                        removed.value.deinit(allocator);
-                    }
+                    _ = Http2.decodeRstStream(frame.payload) catch {};
+                    abortStream(&outbound, &priority_tree, &streams, allocator, sid);
                 }
             },
-            .goaway => return,
+            .goaway => {
+                const info = Http2.decodeGoAway(frame.payload) catch {
+                    try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.PROTOCOL_ERROR, &goaway_sent);
+                    return;
+                };
+                reject_new_streams = true;
+                _ = info;
+                try outbound.drain(&writer, &priority_tree, &conn_flow, conn_max_frame_size, 0);
+                try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.NO_ERROR, &goaway_sent);
+                return;
+            },
             .headers => {
                 const sid = frame.header.stream_id;
+                if (sid == 0) {
+                    try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.PROTOCOL_ERROR, &goaway_sent);
+                    return;
+                }
+                if (reject_new_streams and !streams.contains(sid)) {
+                    try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, Http2.ErrorCode.REFUSED_STREAM);
+                    continue;
+                }
                 const gop = try streams.getOrPut(sid);
                 if (!gop.found_existing) gop.value_ptr.* = StreamState.init();
                 try priority_tree.ensureStream(sid);
@@ -231,46 +346,85 @@ pub fn serveAfterPrefacePrefetchReader(
                     }
                     break :blk stripped.header_block;
                 };
-                try gop.value_ptr.appendHeaders(allocator, header_chunk);
+                gop.value_ptr.appendHeaders(allocator, header_chunk) catch {
+                    try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, Http2.ErrorCode.INTERNAL_ERROR);
+                    continue;
+                };
                 if ((frame.header.flags & Http2.FrameFlags.end_headers) != 0) {
                     gop.value_ptr.headers_done = true;
-                    try gop.value_ptr.decodeHeaders(allocator, &hpack_dec);
-                    try maybeStartLiveBidi(io, stream, allocator, sid, gop.value_ptr, opts);
+                    gop.value_ptr.decodeHeaders(allocator, &hpack_dec) catch {
+                        try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, Http2.ErrorCode.COMPRESSION_ERROR);
+                        continue;
+                    };
+                    maybeStartLiveBidi(&writer, allocator, sid, gop.value_ptr, opts) catch |err| {
+                        try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, streamErrorFromAny(err));
+                        continue;
+                    };
                 }
                 if ((frame.header.flags & Http2.FrameFlags.end_stream) != 0) {
                     gop.value_ptr.end_stream = true;
                 }
                 if (gop.value_ptr.bidi_live) {
                     if (gop.value_ptr.end_stream) {
-                        try finishLiveBidi(io, stream, allocator, sid, gop.value_ptr, &conn_flow, opts);
-                        priority_tree.removeStream(sid);
-                        var removed = streams.fetchRemove(sid).?;
-                        removed.value.deinit(allocator);
+                        finishLiveBidi(&writer, allocator, sid, gop.value_ptr) catch |err| {
+                            try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, streamErrorFromAny(err));
+                            continue;
+                        };
+                        try writer.flush();
+                        abortStream(&outbound, &priority_tree, &streams, allocator, sid);
                     }
                 } else if (gop.value_ptr.ready()) {
-                    try finishStreamScheduled(io, stream, allocator, sid, gop.value_ptr, &conn_flow, conn_max_frame_size, opts, &priority_tree, &outbound);
-                    var removed = streams.fetchRemove(sid).?;
-                    removed.value.deinit(allocator);
+                    const more_inbound = (prefetch_off < prefetch_buf.len) or (reader.bufferedLen() > 0);
+                    finishStreamScheduled(&writer, allocator, sid, gop.value_ptr, &conn_flow, conn_max_frame_size, opts, &priority_tree, &outbound, more_inbound) catch |err| {
+                        try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, streamErrorFromAny(err));
+                        continue;
+                    };
+                    try writer.flush();
+                    if (streams.fetchRemove(sid)) |kv| {
+                        var removed = kv;
+                        removed.value.deinit(allocator);
+                    }
                     if (!outbound.pending.contains(sid)) priority_tree.removeStream(sid);
                 }
             },
             .continuation => {
                 const sid = frame.header.stream_id;
-                const st = streams.getPtr(sid) orelse continue;
-                try st.appendHeaders(allocator, frame.payload);
+                const st = streams.getPtr(sid) orelse {
+                    try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, Http2.ErrorCode.STREAM_CLOSED);
+                    continue;
+                };
+                st.appendHeaders(allocator, frame.payload) catch {
+                    try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, Http2.ErrorCode.INTERNAL_ERROR);
+                    continue;
+                };
                 if ((frame.header.flags & Http2.FrameFlags.end_headers) != 0) {
                     st.headers_done = true;
-                    try st.decodeHeaders(allocator, &hpack_dec);
-                    try maybeStartLiveBidi(io, stream, allocator, sid, st, opts);
+                    st.decodeHeaders(allocator, &hpack_dec) catch {
+                        try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, Http2.ErrorCode.COMPRESSION_ERROR);
+                        continue;
+                    };
+                    maybeStartLiveBidi(&writer, allocator, sid, st, opts) catch |err| {
+                        try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, streamErrorFromAny(err));
+                        continue;
+                    };
                     if (st.bidi_live and st.end_stream) {
-                        try finishLiveBidi(io, stream, allocator, sid, st, &conn_flow, opts);
-                        priority_tree.removeStream(sid);
-                        var removed = streams.fetchRemove(sid).?;
-                        removed.value.deinit(allocator);
+                        finishLiveBidi(&writer, allocator, sid, st) catch |err| {
+                            try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, streamErrorFromAny(err));
+                            continue;
+                        };
+                        try writer.flush();
+                        abortStream(&outbound, &priority_tree, &streams, allocator, sid);
                     } else if (st.ready()) {
-                        try finishStreamScheduled(io, stream, allocator, sid, st, &conn_flow, conn_max_frame_size, opts, &priority_tree, &outbound);
-                        var removed = streams.fetchRemove(sid).?;
-                        removed.value.deinit(allocator);
+                        const more_inbound = (prefetch_off < prefetch_buf.len) or (reader.bufferedLen() > 0);
+                        finishStreamScheduled(&writer, allocator, sid, st, &conn_flow, conn_max_frame_size, opts, &priority_tree, &outbound, more_inbound) catch |err| {
+                            try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, streamErrorFromAny(err));
+                            continue;
+                        };
+                        try writer.flush();
+                        if (streams.fetchRemove(sid)) |kv| {
+                            var removed = kv;
+                            removed.value.deinit(allocator);
+                        }
                         if (!outbound.pending.contains(sid)) priority_tree.removeStream(sid);
                     }
                 }
@@ -278,38 +432,124 @@ pub fn serveAfterPrefacePrefetchReader(
             .data => {
                 const sid = frame.header.stream_id;
                 const data_len: u31 = @intCast(frame.payload.len);
-                try onInboundData(io, stream, allocator, &conn_flow, 0, data_len);
-                const st = streams.getPtr(sid) orelse continue;
-                try onInboundData(io, stream, allocator, &st.flow, sid, data_len);
+                onInboundData(&writer, allocator, &conn_flow, 0, data_len) catch {
+                    try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.FLOW_CONTROL_ERROR, &goaway_sent);
+                    return;
+                };
+                const st = streams.getPtr(sid) orelse {
+                    try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, Http2.ErrorCode.STREAM_CLOSED);
+                    continue;
+                };
+                onInboundData(&writer, allocator, &st.flow, sid, data_len) catch {
+                    try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, Http2.ErrorCode.FLOW_CONTROL_ERROR);
+                    continue;
+                };
                 if ((frame.header.flags & Http2.FrameFlags.end_stream) != 0) {
                     st.end_stream = true;
                 }
                 if (st.bidi_live) {
-                    try pumpLiveBidiData(io, stream, allocator, sid, st, &conn_flow, conn_max_frame_size, opts, frame.payload);
+                    pumpLiveBidiData(&writer, allocator, sid, st, &conn_flow, conn_max_frame_size, opts, frame.payload) catch |err| {
+                        try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, streamErrorFromAny(err));
+                        continue;
+                    };
                     if (st.end_stream) {
-                        try finishLiveBidi(io, stream, allocator, sid, st, &conn_flow, opts);
-                        priority_tree.removeStream(sid);
-                        var removed = streams.fetchRemove(sid).?;
-                        removed.value.deinit(allocator);
+                        finishLiveBidi(&writer, allocator, sid, st) catch |err| {
+                            try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, streamErrorFromAny(err));
+                            continue;
+                        };
+                        try writer.flush();
+                        abortStream(&outbound, &priority_tree, &streams, allocator, sid);
                     }
                 } else {
-                    try st.appendData(allocator, frame.payload);
+                    st.appendData(allocator, frame.payload) catch {
+                        try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, Http2.ErrorCode.INTERNAL_ERROR);
+                        continue;
+                    };
                     if (st.ready()) {
-                        try finishStreamScheduled(io, stream, allocator, sid, st, &conn_flow, conn_max_frame_size, opts, &priority_tree, &outbound);
-                        var removed = streams.fetchRemove(sid).?;
-                        removed.value.deinit(allocator);
+                        const more_inbound = (prefetch_off < prefetch_buf.len) or (reader.bufferedLen() > 0);
+                        finishStreamScheduled(&writer, allocator, sid, st, &conn_flow, conn_max_frame_size, opts, &priority_tree, &outbound, more_inbound) catch |err| {
+                            try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, streamErrorFromAny(err));
+                            continue;
+                        };
+                        try writer.flush();
+                        if (streams.fetchRemove(sid)) |kv| {
+                            var removed = kv;
+                            removed.value.deinit(allocator);
+                        }
                         if (!outbound.pending.contains(sid)) priority_tree.removeStream(sid);
                     }
                 }
             },
             .push_promise => {},
         }
+
+        if (outbound.pending.count() > 0) {
+            const more_inbound = (prefetch_off < prefetch_buf.len) or (reader.bufferedLen() > 0);
+            const budget: usize = if (more_inbound or outbound.pending.count() > 1) drain_slice else 0;
+            try outbound.drain(&writer, &priority_tree, &conn_flow, conn_max_frame_size, budget);
+            try writer.flush();
+        }
     }
+
+    try outbound.drain(&writer, &priority_tree, &conn_flow, conn_max_frame_size, 0);
+    try writer.flush();
+}
+
+fn abortStream(
+    outbound: *OutboundScheduler,
+    tree: *Http2.PriorityTree,
+    streams: *std.AutoHashMap(u31, StreamState),
+    allocator: std.mem.Allocator,
+    sid: u31,
+) void {
+    outbound.cancel(sid);
+    tree.removeStream(sid);
+    if (streams.fetchRemove(sid)) |kv| {
+        var removed = kv;
+        removed.value.deinit(allocator);
+    }
+}
+
+fn resetStream(
+    writer: *ConnWriter,
+    allocator: std.mem.Allocator,
+    outbound: *OutboundScheduler,
+    tree: *Http2.PriorityTree,
+    streams: *std.AutoHashMap(u31, StreamState),
+    sid: u31,
+    code: u32,
+) !void {
+    abortStream(outbound, tree, streams, allocator, sid);
+    if (sid == 0) return;
+    const frame = try Http2.encodeRstStream(allocator, sid, code);
+    defer allocator.free(frame);
+    try writer.write(frame);
+    try writer.flush();
+}
+
+fn sendGoAway(
+    writer: *ConnWriter,
+    allocator: std.mem.Allocator,
+    last_stream_id: u31,
+    code: u32,
+    goaway_sent: *bool,
+) !void {
+    if (goaway_sent.*) {
+        try writer.flush();
+        return;
+    }
+    goaway_sent.* = true;
+    const frame = try Http2.encodeGoAway(allocator, last_stream_id, code, "");
+    defer allocator.free(frame);
+    try writer.write(frame);
+    try writer.flush();
 }
 
 /// Per-stream pending HTTP/2 wire (HEADERS/DATA/trailers) drained by PriorityTree WRR.
 const PendingOutbound = struct {
     wire: []u8,
+    /// Logical end of wire (may shrink after in-place DATA partial send).
+    end: usize,
     offset: usize = 0,
     flow: Http2.FlowControlState,
 
@@ -319,11 +559,15 @@ const PendingOutbound = struct {
     }
 
     fn remaining(self: *const PendingOutbound) []const u8 {
-        return self.wire[self.offset..];
+        return self.wire[self.offset..self.end];
     }
 
     fn done(self: *const PendingOutbound) bool {
-        return self.offset >= self.wire.len;
+        return self.offset >= self.end;
+    }
+
+    fn byteLen(self: *const PendingOutbound) usize {
+        return self.end -| self.offset;
     }
 };
 
@@ -331,11 +575,16 @@ const PendingOutbound = struct {
 const OutboundScheduler = struct {
     allocator: std.mem.Allocator,
     pending: std.AutoHashMap(u31, PendingOutbound),
+    pending_bytes: usize = 0,
+    max_streams: usize,
+    max_bytes: usize,
 
-    fn init(allocator: std.mem.Allocator) OutboundScheduler {
+    fn init(allocator: std.mem.Allocator, max_streams: usize, max_bytes: usize) OutboundScheduler {
         return .{
             .allocator = allocator,
             .pending = std.AutoHashMap(u31, PendingOutbound).init(allocator),
+            .max_streams = max_streams,
+            .max_bytes = max_bytes,
         };
     }
 
@@ -349,33 +598,47 @@ const OutboundScheduler = struct {
     fn cancel(self: *OutboundScheduler, stream_id: u31) void {
         if (self.pending.fetchRemove(stream_id)) |kv| {
             var p = kv.value;
+            self.pending_bytes -|= p.byteLen();
             p.deinit(self.allocator);
         }
     }
 
     fn enqueue(self: *OutboundScheduler, stream_id: u31, wire: []u8, flow: Http2.FlowControlState) !void {
-        // Take ownership of `wire`. Replace any prior pending for this stream.
         self.cancel(stream_id);
+        if (self.pending.count() >= self.max_streams) {
+            self.allocator.free(wire);
+            return error.PendingStreamsExceeded;
+        }
+        if (self.pending_bytes + wire.len > self.max_bytes) {
+            self.allocator.free(wire);
+            return error.PendingBytesExceeded;
+        }
+        self.pending_bytes += wire.len;
+        errdefer {
+            self.pending_bytes -|= wire.len;
+            self.allocator.free(wire);
+        }
         try self.pending.put(stream_id, .{
             .wire = wire,
+            .end = wire.len,
             .offset = 0,
             .flow = flow,
         });
     }
 
-    /// Drain pending streams until empty or flow-control blocked.
-    /// Each frame is chosen via `PriorityTree.pickNext` (deficit WRR) among ready streams.
     fn drain(
         self: *OutboundScheduler,
-        io: std.Io,
-        net_stream: std.Io.net.Stream,
+        writer: *ConnWriter,
         tree: *Http2.PriorityTree,
         conn_flow: *Http2.FlowControlState,
         conn_max_frame_size: u31,
+        max_frames: usize,
     ) !void {
+        var wrote_n: usize = 0;
         var guard: usize = 0;
         while (guard < 4096) : (guard += 1) {
             if (self.pending.count() == 0) return;
+            if (max_frames != 0 and wrote_n >= max_frames) return;
 
             var ready_buf: [64]u31 = undefined;
             var ready_n: usize = 0;
@@ -383,24 +646,28 @@ const OutboundScheduler = struct {
             while (it.next()) |e| {
                 if (e.value_ptr.done()) continue;
                 if (ready_n >= ready_buf.len) break;
-                // Eligible if next frame is non-DATA, or DATA with send window.
                 if (canSendNextFrame(e.value_ptr, conn_flow.send_window, conn_max_frame_size)) {
                     ready_buf[ready_n] = e.key_ptr.*;
                     ready_n += 1;
                 }
             }
-            if (ready_n == 0) return; // all blocked on flow control
+            if (ready_n == 0) return;
 
             const pick = (try tree.pickNext(ready_buf[0..ready_n])) orelse return;
             const p = self.pending.getPtr(pick) orelse continue;
-            const progress = try writeNextWireFrame(io, net_stream, self.allocator, conn_flow, &p.flow, pick, p, conn_max_frame_size);
+            const before = p.byteLen();
+            const progress = try writeNextWireFrame(writer, conn_flow, &p.flow, pick, p, conn_max_frame_size);
+            // After write, remaining bytes for this stream (0 if finished).
+            const after: usize = if (progress == .done) 0 else p.byteLen();
+            self.pending_bytes = self.pending_bytes - before + after;
             switch (progress) {
                 .blocked => return,
-                .wrote => {},
+                .wrote => wrote_n += 1,
                 .done => {
                     var removed = self.pending.fetchRemove(pick).?;
                     removed.value.deinit(self.allocator);
                     tree.removeStream(pick);
+                    wrote_n += 1;
                 },
             }
         }
@@ -417,9 +684,7 @@ fn canSendNextFrame(p: *PendingOutbound, conn_send_window: u31, conn_max_frame_s
 }
 
 fn writeNextWireFrame(
-    io: std.Io,
-    net_stream: std.Io.net.Stream,
-    allocator: std.mem.Allocator,
+    writer: *ConnWriter,
     conn_flow: *Http2.FlowControlState,
     stream_flow: *Http2.FlowControlState,
     stream_id: u31,
@@ -428,7 +693,7 @@ fn writeNextWireFrame(
 ) !enum { wrote, blocked, done } {
     const rem = pending.remaining();
     if (rem.len < 9) {
-        pending.offset = pending.wire.len;
+        pending.offset = pending.end;
         return .done;
     }
     const frame = try Http2.decodeFrame(rem);
@@ -437,41 +702,55 @@ fn writeNextWireFrame(
         const end_stream = (frame.header.flags & Http2.FrameFlags.end_stream) != 0;
         const max_chunk = maxOutboundChunk(stream_flow, conn_flow.send_window, conn_max_frame_size);
         if (frame.payload.len == 0) {
-            // Zero-length DATA does not consume flow-control window.
-            const d = try Http2.encodeData(allocator, stream_id, "", end_stream);
-            defer allocator.free(d);
-            try writeAll(io, net_stream, d);
+            try writer.writeData(stream_id, "", end_stream);
             pending.offset += frame_len;
             return if (pending.done()) .done else .wrote;
         }
         if (max_chunk == 0) return .blocked;
         const send_n: usize = @min(@as(usize, max_chunk), frame.payload.len);
         const is_last_of_frame = send_n == frame.payload.len;
-        const d = try Http2.encodeData(allocator, stream_id, frame.payload[0..send_n], end_stream and is_last_of_frame);
-        defer allocator.free(d);
-        try writeAll(io, net_stream, d);
+        try writer.writeData(stream_id, frame.payload[0..send_n], end_stream and is_last_of_frame);
         const sent: u31 = @intCast(send_n);
         stream_flow.consumeSend(sent);
         conn_flow.consumeSend(sent);
         if (is_last_of_frame) {
             pending.offset += frame_len;
         } else {
-            // Rebuild remaining DATA frame in-place after partial send.
-            const left = frame.payload[send_n..];
-            const new_frame = try Http2.encodeData(allocator, stream_id, left, end_stream);
-            defer allocator.free(new_frame);
-            const after = pending.wire[pending.offset + frame_len ..];
-            const new_wire = try std.mem.concat(allocator, u8, &.{ new_frame, after });
-            allocator.free(pending.wire);
-            pending.wire = new_wire;
-            pending.offset = 0;
+            shrinkDataFrameInPlace(pending, send_n);
         }
         return if (pending.done()) .done else .wrote;
     } else {
-        try writeAll(io, net_stream, rem[0..frame_len]);
+        try writer.write(rem[0..frame_len]);
         pending.offset += frame_len;
         return if (pending.done()) .done else .wrote;
     }
+}
+
+/// After a partial DATA send, shrink the current DATA frame in-place (no realloc).
+fn shrinkDataFrameInPlace(pending: *PendingOutbound, sent: usize) void {
+    const rem = pending.remaining();
+    const frame = Http2.decodeFrame(rem) catch return;
+    const old_plen = frame.payload.len;
+    if (sent >= old_plen) return;
+    const new_plen = old_plen - sent;
+    const old_frame_len = 9 + old_plen;
+    const new_frame_len = 9 + new_plen;
+    const base = pending.offset;
+    // Move unsent payload down.
+    std.mem.copyForwards(u8, pending.wire[base + 9 ..][0..new_plen], rem[9 + sent ..][0..new_plen]);
+    // Move trailing frames down.
+    const after_old = base + old_frame_len;
+    const after_len = pending.end - after_old;
+    if (after_len > 0) {
+        std.mem.copyForwards(u8, pending.wire[base + new_frame_len ..][0..after_len], pending.wire[after_old..][0..after_len]);
+    }
+    (Http2.FrameHeader{
+        .length = @intCast(new_plen),
+        .typ = .data,
+        .flags = rem[4],
+        .stream_id = frame.header.stream_id,
+    }).encode(pending.wire[base..][0..9]);
+    pending.end = base + new_frame_len + after_len;
 }
 
 const StreamState = struct {
@@ -547,9 +826,7 @@ const StreamState = struct {
 };
 
 const LiveFlushCtx = struct {
-    io: std.Io,
-    stream: std.Io.net.Stream,
-    allocator: std.mem.Allocator,
+    writer: *ConnWriter,
     stream_id: u31,
     conn_flow: *Http2.FlowControlState,
     stream_flow: *Http2.FlowControlState,
@@ -557,8 +834,7 @@ const LiveFlushCtx = struct {
 };
 
 fn onInboundData(
-    io: std.Io,
-    net_stream: std.Io.net.Stream,
+    writer: *ConnWriter,
     allocator: std.mem.Allocator,
     fc: *Http2.FlowControlState,
     window_stream_id: u31,
@@ -568,7 +844,7 @@ fn onInboundData(
     if (fc.consumeRecv(size)) |increment| {
         const wu = try Http2.encodeWindowUpdate(allocator, window_stream_id, increment);
         defer allocator.free(wu);
-        try writeAll(io, net_stream, wu);
+        try writer.write(wu);
     }
 }
 
@@ -578,9 +854,7 @@ fn maxOutboundChunk(stream_flow: *Http2.FlowControlState, conn_send_window: u31,
 }
 
 fn writeFlowControlledData(
-    io: std.Io,
-    net_stream: std.Io.net.Stream,
-    allocator: std.mem.Allocator,
+    writer: *ConnWriter,
     conn_flow: *Http2.FlowControlState,
     stream_flow: *Http2.FlowControlState,
     stream_id: u31,
@@ -595,9 +869,7 @@ fn writeFlowControlledData(
         const end = @min(off + max_chunk, body.len);
         const chunk = body[off..end];
         const is_last = end == body.len and end_stream;
-        const d = try Http2.encodeData(allocator, stream_id, chunk, is_last);
-        defer allocator.free(d);
-        try writeAll(io, net_stream, d);
+        try writer.writeData(stream_id, chunk, is_last);
         const sent: u31 = @intCast(chunk.len);
         stream_flow.consumeSend(sent);
         conn_flow.consumeSend(sent);
@@ -606,20 +878,17 @@ fn writeFlowControlledData(
     if (body.len == 0 and end_stream) {
         const max_chunk = maxOutboundChunk(stream_flow, conn_flow.send_window, conn_max_frame_size);
         if (max_chunk == 0) return error.FlowControlBlocked;
-        const d = try Http2.encodeData(allocator, stream_id, "", true);
-        defer allocator.free(d);
-        try writeAll(io, net_stream, d);
+        try writer.writeData(stream_id, "", true);
     }
 }
 
 fn liveFlushCb(user_ctx: ?*anyopaque, framed: []const u8) anyerror!void {
     const ctx: *LiveFlushCtx = @ptrCast(@alignCast(user_ctx.?));
-    try writeFlowControlledData(ctx.io, ctx.stream, ctx.allocator, ctx.conn_flow, ctx.stream_flow, ctx.stream_id, framed, false, ctx.conn_max_frame_size);
+    try writeFlowControlledData(ctx.writer, ctx.conn_flow, ctx.stream_flow, ctx.stream_id, framed, false, ctx.conn_max_frame_size);
 }
 
 fn maybeStartLiveBidi(
-    io: std.Io,
-    stream: std.Io.net.Stream,
+    writer: *ConnWriter,
     allocator: std.mem.Allocator,
     stream_id: u31,
     st: *StreamState,
@@ -645,12 +914,11 @@ fn maybeStartLiveBidi(
     defer allocator.free(block);
     const h = try Http2.encodeHeaders(allocator, stream_id, block, false, true);
     defer allocator.free(h);
-    try writeAll(io, stream, h);
+    try writer.write(h);
 }
 
 fn pumpLiveBidiData(
-    io: std.Io,
-    stream: std.Io.net.Stream,
+    writer: *ConnWriter,
     allocator: std.mem.Allocator,
     stream_id: u31,
     st: *StreamState,
@@ -662,38 +930,30 @@ fn pumpLiveBidiData(
     const reg = opts.grpc_registry orelse return;
     try st.grpc_buf.append(chunk);
     var flush_ctx = LiveFlushCtx{
-        .io = io,
-        .stream = stream,
-        .allocator = allocator,
+        .writer = writer,
         .stream_id = stream_id,
         .conn_flow = conn_flow,
         .stream_flow = &st.flow,
         .conn_max_frame_size = conn_max_frame_size,
     };
-    var writer = Grpc.GrpcStreamWriter.init(allocator);
-    defer writer.deinit();
-    writer.on_flush = liveFlushCb;
-    writer.flush_ctx = &flush_ctx;
+    var grpc_writer = Grpc.GrpcStreamWriter.init(allocator);
+    defer grpc_writer.deinit();
+    grpc_writer.on_flush = liveFlushCb;
+    grpc_writer.flush_ctx = &flush_ctx;
 
     while (try st.grpc_buf.tryNext()) |msg| {
-        try reg.pumpBidiMessage(st.path, msg, &writer);
-        if (writer.message_owned and writer.status != .OK) break;
+        try reg.pumpBidiMessage(st.path, msg, &grpc_writer);
+        if (grpc_writer.message_owned and grpc_writer.status != .OK) break;
     }
 }
 
 fn finishLiveBidi(
-    io: std.Io,
-    stream: std.Io.net.Stream,
+    writer: *ConnWriter,
     allocator: std.mem.Allocator,
     stream_id: u31,
     st: *StreamState,
-    conn_flow: *Http2.FlowControlState,
-    opts: ServeOptions,
 ) !void {
-    _ = opts;
-    _ = conn_flow;
     st.grpc_buf.markEnded();
-    // Drain any remaining complete frames (none expected if pumpLive already ran).
     const status_str = "0";
     const trailers = try Http2.encodeLiteralHeaderBlock(allocator, &.{
         .{ "grpc-status", status_str },
@@ -702,12 +962,11 @@ fn finishLiveBidi(
     defer allocator.free(trailers);
     const h = try Http2.encodeHeaders(allocator, stream_id, trailers, true, true);
     defer allocator.free(h);
-    try writeAll(io, stream, h);
+    try writer.write(h);
 }
 
 fn finishStreamScheduled(
-    io: std.Io,
-    stream: std.Io.net.Stream,
+    writer: *ConnWriter,
     allocator: std.mem.Allocator,
     stream_id: u31,
     st: *StreamState,
@@ -716,12 +975,22 @@ fn finishStreamScheduled(
     opts: ServeOptions,
     tree: *Http2.PriorityTree,
     outbound: *OutboundScheduler,
+    more_inbound: bool,
 ) !void {
     try tree.setPriority(stream_id, st.getPriority());
     const wire = try buildStreamResponseWire(allocator, stream_id, st, opts);
-    errdefer allocator.free(wire);
+    // enqueue takes ownership of wire (frees on refuse).
     try outbound.enqueue(stream_id, wire, st.flow);
-    try outbound.drain(io, stream, tree, conn_flow, conn_max_frame_size);
+    const budget: usize = if (more_inbound or outbound.pending.count() > 1) 8 else 0;
+    try outbound.drain(writer, tree, conn_flow, conn_max_frame_size, budget);
+}
+
+fn streamErrorFromAny(err: anyerror) u32 {
+    return switch (err) {
+        error.PendingStreamsExceeded => Http2.ErrorCode.REFUSED_STREAM,
+        error.PendingBytesExceeded => Http2.ErrorCode.ENHANCE_YOUR_CALM,
+        else => Http2.ErrorCode.INTERNAL_ERROR,
+    };
 }
 
 /// Build owned HTTP/2 response wire for a completed stream (HEADERS + DATA + optional trailers).
@@ -866,13 +1135,6 @@ fn readExactPrefetch(
     };
 }
 
-fn writeAll(io: std.Io, stream: std.Io.net.Stream, data: []const u8) !void {
-    var wbuf: [8192]u8 = undefined;
-    var w = stream.writer(io, &wbuf);
-    try w.interface.writeAll(data);
-    try w.interface.flush();
-}
-
 test "Hpack decode path via Decoder for site headers" {
     const allocator = std.testing.allocator;
     const block = try Http2.encodeLiteralHeaderBlock(allocator, &.{
@@ -981,4 +1243,79 @@ test "encodeSiteResponseWire is headers then data" {
     const f1 = try Http2.decodeFrame(wire[9 + f0.header.length ..]);
     try std.testing.expectEqual(Http2.FrameType.data, f1.header.typ);
     try std.testing.expectEqualStrings("ok", f1.payload);
+}
+
+// Regression for prior-knowledge h2c: SETTINGS+HEADERS that arrive with the preface
+// must be readable from a prefetch buffer (same bytes StreamReader would leave buffered).
+test "OutboundScheduler refuses over pending stream/byte caps" {
+    const allocator = std.testing.allocator;
+    const flow = Http2.FlowControlState.init(Http2.default_initial_window_size);
+
+    var by_streams = OutboundScheduler.init(allocator, 1, 1024 * 1024);
+    defer by_streams.deinit();
+    try by_streams.enqueue(1, try allocator.dupe(u8, "aaaa"), flow);
+    try std.testing.expectError(error.PendingStreamsExceeded, by_streams.enqueue(3, try allocator.dupe(u8, "bbbb"), flow));
+
+    var by_bytes = OutboundScheduler.init(allocator, 64, 8);
+    defer by_bytes.deinit();
+    try std.testing.expectError(error.PendingBytesExceeded, by_bytes.enqueue(1, try allocator.alloc(u8, 32), flow));
+}
+
+test "shrinkDataFrameInPlace keeps remaining DATA without realloc" {
+    const allocator = std.testing.allocator;
+    const wire = try Http2.encodeData(allocator, 7, "abcdefghij", true);
+    var pending = PendingOutbound{
+        .wire = wire,
+        .end = wire.len,
+        .offset = 0,
+        .flow = Http2.FlowControlState.init(Http2.default_initial_window_size),
+    };
+    defer pending.deinit(allocator);
+
+    shrinkDataFrameInPlace(&pending, 4);
+    const frame = try Http2.decodeFrame(pending.remaining());
+    try std.testing.expectEqual(Http2.FrameType.data, frame.header.typ);
+    try std.testing.expectEqualStrings("efghij", frame.payload);
+    try std.testing.expect((frame.header.flags & Http2.FrameFlags.end_stream) != 0);
+}
+
+test "streamErrorFromAny maps outbound backpressure codes" {
+    try std.testing.expectEqual(Http2.ErrorCode.REFUSED_STREAM, streamErrorFromAny(error.PendingStreamsExceeded));
+    try std.testing.expectEqual(Http2.ErrorCode.ENHANCE_YOUR_CALM, streamErrorFromAny(error.PendingBytesExceeded));
+    try std.testing.expectEqual(Http2.ErrorCode.INTERNAL_ERROR, streamErrorFromAny(error.OutOfMemory));
+}
+
+test "readFramePrefetch consumes SETTINGS then HEADERS from leftover buffer" {
+    const allocator = std.testing.allocator;
+    const settings = try Http2.encodeSettings(allocator, false, &.{.{ 0x3, 100 }});
+    defer allocator.free(settings);
+    var enc = Hpack.Encoder.init(allocator);
+    const block = try enc.encodeSmart(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/ping" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":authority", .value = "localhost" },
+    });
+    defer allocator.free(block);
+    const headers = try Http2.encodeHeaders(allocator, 1, block, true, true);
+    defer allocator.free(headers);
+    const leftover = try std.mem.concat(allocator, u8, &.{ settings, headers });
+    defer allocator.free(leftover);
+
+    // Reader that immediately EOFs — all frames must come from prefetch.
+    var r = std.Io.Reader.fixed(&.{});
+    var off: usize = 0;
+
+    const f0 = try readFramePrefetch(&r, allocator, leftover, &off);
+    defer allocator.free(f0);
+    const d0 = try Http2.decodeFrame(f0);
+    try std.testing.expectEqual(Http2.FrameType.settings, d0.header.typ);
+
+    const f1 = try readFramePrefetch(&r, allocator, leftover, &off);
+    defer allocator.free(f1);
+    const d1 = try Http2.decodeFrame(f1);
+    try std.testing.expectEqual(Http2.FrameType.headers, d1.header.typ);
+    try std.testing.expectEqual(@as(u31, 1), d1.header.stream_id);
+    try std.testing.expect((d1.header.flags & Http2.FrameFlags.end_stream) != 0);
+    try std.testing.expectEqual(leftover.len, off);
 }
