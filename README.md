@@ -60,7 +60,7 @@ A modular application framework for Zig 0.17, inspired by Spring Modulith. Build
 - **Sharding** — Tenant-aware ShardRouter with configurable pools
 
 ### Observability
-- **Distributed Tracing** — OpenTelemetry-compatible (`OtlpExporter` for OTLP/JSON export)
+- **Distributed Tracing** — OpenTelemetry-compatible (`OtlpExporter` OTLP/HTTP JSON + retries)
 - **Prometheus Metrics** — Counter / Gauge (lock-free CAS) / Histogram / Summary
 - **Structured Logging** — JSON-formatted with log rotation and levels
 - **Auto Instrumentation** — Automatic lifecycle/event/API instrumentation

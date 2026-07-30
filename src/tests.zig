@@ -127,6 +127,10 @@ test "compile all source files" {
     _ = @import("tracing/DistributedTracer.zig");
     _ = @import("tracing/OtlpExporter.zig");
 
+    // Web4 (DID + x402; payment verify fail-closed)
+    _ = @import("web4/web4.zig");
+    _ = @import("web4/x402.zig");
+
 
     // Validation
     _ = @import("validation/ObjectValidator.zig");

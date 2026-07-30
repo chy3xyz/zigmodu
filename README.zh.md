@@ -41,7 +41,7 @@
 - **gRPC & Kafka** - gRPC Unary + Kafka Wire 协议与 EventBridge
 
 ### 可观测性
-- **分布式追踪** - OpenTelemetry 兼容 (`OtlpExporter` 导出器)
+- **分布式追踪** - OpenTelemetry 兼容 (`OtlpExporter` OTLP/HTTP JSON 上报 + 重试)
 - **Prometheus指标** - Counter, Gauge, Histogram 与 HTTP 路由自动关联
 - **结构化日志** - JSON 格式与轮转
 - **深层健康检查** - 兼容 K8s liveness/readiness 探针与 Pool 水位

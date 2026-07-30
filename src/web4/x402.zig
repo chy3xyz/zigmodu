@@ -1,3 +1,9 @@
+//! EXPERIMENTAL — HTTP 402 / x402 monetization helpers.
+//!
+//! Payment verification is **fail-closed by default**. Production code must
+//! inject an explicit `PaymentVerifier` (on-chain check, allow-list, etc.).
+//! Never treat a bare `verifyPayment` / missing verifier as "paid".
+
 const std = @import("std");
 
 /// HTTP 402 Payment Required — Web4 monetization protocol.
@@ -41,18 +47,41 @@ pub const PaymentProof = struct {
     invoice_id: []const u8,
 };
 
-/// Verify payment proof (stub — override in ext/ with real blockchain verification).
-pub fn verifyPayment(proof: PaymentProof) bool {
-    _ = proof;
-    return true; // Always pass in stub. Replace with real verification.
+/// Pluggable verifier — required for any “paid” decision in production.
+pub const PaymentVerifier = *const fn (proof: PaymentProof) bool;
+
+/// Fail-closed default: always reject. Safe for accidental use in hot paths.
+pub fn verifyPaymentReject(_: PaymentProof) bool {
+    return false;
 }
 
-/// x402 middleware: check for valid payment proof. Returns true if paid.
+/// Dev-only: always accept. Must be passed explicitly — never the default.
+pub fn verifyPaymentAllowAll(_: PaymentProof) bool {
+    return true;
+}
+
+/// Verify with an explicit verifier (preferred API).
+pub fn verifyWith(verifier: PaymentVerifier, proof: PaymentProof) bool {
+    return verifier(proof);
+}
+
+/// Fail-closed convenience (same as `verifyPaymentReject`).
+/// Kept for call-site compatibility; does **not** accept payments.
+pub fn verifyPayment(proof: PaymentProof) bool {
+    return verifyPaymentReject(proof);
+}
+
+/// x402 middleware helper: check for valid payment proof.
+/// Uses fail-closed default verifier unless `verifier` is provided.
 pub fn checkPayment(allocator: std.mem.Allocator, headers: anytype) !bool {
+    return checkPaymentWith(allocator, headers, verifyPaymentReject);
+}
+
+pub fn checkPaymentWith(allocator: std.mem.Allocator, headers: anytype, verifier: PaymentVerifier) !bool {
     if (try parseProof(allocator, headers)) |proof| {
         defer allocator.free(proof.tx_hash);
         defer allocator.free(proof.invoice_id);
-        return verifyPayment(proof);
+        return verifyWith(verifier, proof);
     }
     return false;
 }
@@ -69,7 +98,13 @@ test "create invoice" {
     try std.testing.expectEqualStrings("inv-001", inv.id);
 }
 
-test "verify payment stub" {
+test "verify payment fail-closed by default" {
     const proof = PaymentProof{ .tx_hash = "0xabc...", .invoice_id = "inv-001" };
-    try std.testing.expect(verifyPayment(proof));
+    try std.testing.expect(!verifyPayment(proof));
+    try std.testing.expect(!verifyPaymentReject(proof));
+}
+
+test "verifyPaymentAllowAll is explicit opt-in" {
+    const proof = PaymentProof{ .tx_hash = "0xabc...", .invoice_id = "inv-001" };
+    try std.testing.expect(verifyWith(verifyPaymentAllowAll, proof));
 }

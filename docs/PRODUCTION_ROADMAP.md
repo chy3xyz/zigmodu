@@ -140,8 +140,8 @@ bash scripts/ci-integration.sh   # tenant-mgmt + http-stress-test（需 curl）
    - **Redis 分布式限流降级保护**：`RedisRateLimiter` 实现 `allowWithFallback` 容灾逻辑，断连或异常时无缝降级至本地 `RateLimiter` 兜底。
    - **级联背压 (Cascade Backpressure)**：在 `ModuleRuntime.tryEnter` 中整合 WorkerPool 载重检测（>90% 满载时实现快速拒绝，保护系统不雪崩）。
 3. **全链路可观测性 (Observability) 升级 (✅ 已落地)**
-   - **OpenTelemetry (OTLP) Exporter**：实现 `src/tracing/OtlpExporter.zig`，将 `DistributedTracer` 链路导出为标准 OTLP JSON 格式。
-   - **在 `observability.zig` 导出**：支持标准云原生 Trace / Span 上报。
+   - **OpenTelemetry (OTLP) Exporter**：`src/tracing/OtlpExporter.zig` — JSON 序列化 + **`exportSpans` OTLP/HTTP POST**（重试 429/5xx；`https://` 明确 `OtlpTlsNotSupported`）。
+   - **在 `observability.zig` 导出**：`OtlpExporter`；live 用例需 `OTLP_ENDPOINT`。
 4. **工具链与生成器集成 (zmodu CLI) (✅ 已落地)**
    - **`zmodu` 独立 CLI 集成**：编写 [`docs/ZMODU_CLI_INTEGRATION.md`](ZMODU_CLI_INTEGRATION.md)，打通 SQL DDL Schema 一键构建 `@initialized` 模版工程，全量支持 MCP Server 与 Modulith 六层分层生成。
 5. **协议传输层高阶演进 (gRPC Streaming & HTTP/2)** — **本轮加深（出站合并写 + GOAWAY/RST 隔离）**

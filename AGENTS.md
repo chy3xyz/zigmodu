@@ -194,21 +194,16 @@ test "my test" {
 ```
 
 ## Version
-- Framework: **v0.14.9**
+- Framework: **v0.14.16** (`build.zig.zon`)
 - Zig: **0.17.0**
-
-
-- Tests: **521 passed**, 18 skipped, 0 failed
-
-
-
+- Tests: **664+ passed**, 20 skipped, 0 failed (`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`)
 - Roadmap: `docs/PRODUCTION_ROADMAP.md` (phases 1–9 ✅)
 - Modulith day-one practices: `docs/MODULITH.md`
 - Domain layering (model / persistence.Tx / service Cmd): `docs/MODULE_LAYERS.md`
 - Built-in Tooling: `tools/zmodu` (run with `zig build zmodu`) · guide `docs/ZMODU_CLI_INTEGRATION.md`
 - ZigModu × zent (orthogonal ORM): `docs/ZENT.md` · example `examples/zent-modulith/`
 - Declarative HTTP routes: `docs/ROUTE_TABLE.md` — Zig-native comptime `routes` + `Router(State)` + `std.Io`; scaffold emits RouteSpec via `zmodu scaffold`
-- Score: ~98/100 (`docs/EVALUATION_REPORT.md` v5.3)
+- Score: ~98/100 (`docs/EVALUATION_REPORT.md` v5.6)
 
 ## Learned User Preferences
 
@@ -221,10 +216,12 @@ test "my test" {
 
 ## Learned Workspace Facts
 
-- Project targets Zig 0.17.0; current release tag is v0.14.3 (GitHub `chy3xyz/zigmodu`, default branch `master`).
+- Project targets Zig 0.17.0; package version **v0.14.16** (`build.zig.zon`; GitHub `chy3xyz/zigmodu`, default branch `master`).
 - If Zig global cache fails in sandboxed runs, use `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`.
 - Production roadmap and monolith maintenance rules live in `docs/PRODUCTION_ROADMAP.md`.
-- Current test baseline: **518 passed**, 18 skipped with `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test` (after OtlpExporter, zmodu CLI, and Raft Log Compaction).
+- Current test baseline: **664+ passed**, 20 skipped (`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`).
+- x402 payment verify is **fail-closed** by default; inject `PaymentVerifier` / `verifyPaymentAllowAll` only for explicit dev paths.
+- OTLP: `observability.OtlpExporter.exportSpans` POSTs JSON over `http://` with retries; `https://` → `OtlpTlsNotSupported` (same boundary as Vault).
 
 - Optional data stack: [chy3xyz/zent](https://github.com/chy3xyz/zent) (v0.12+) is orthogonal to `data.sqlx` — modules may choose either independently, but do not mix drivers or share a transaction across them; see `docs/ZENT.md`.
 - zent reference apps: `examples/zent-modulith/` (minimal) and `examples/metaverse-creative/` (settlement/outbox creative-monetization demo).

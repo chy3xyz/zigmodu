@@ -5553,7 +5553,7 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
         \\test "DID generate and resolve" { const did = zigmodu.web4.DidKey.generate(testing.allocator, testing.io); defer testing.allocator.free(did.did); const doc = try did.document(testing.allocator); defer testing.allocator.free(doc); try testing.expect(std.mem.indexOf(u8, doc, "did:key:z") != null); }
         \\test "DID sign verify roundtrip" { var did = zigmodu.web4.DidKey.generate(testing.allocator, testing.io); defer testing.allocator.free(did.did); const sig = try did.sign(testing.allocator, "test"); defer testing.allocator.free(sig); try testing.expect(try did.verify("test", sig)); }
         \\test "x402 invoice fields" { const inv = zigmodu.web4.x402.Invoice{ .id = "inv-1", .payee_did = "did:key:z...", .amount = 500000, .currency = .usdc, .deadline = 0, .description = "test" }; try testing.expectEqual(@as(u64, 500000), inv.amount); }
-        \\test "x402 payment stub" { const proof = zigmodu.web4.x402.PaymentProof{ .tx_hash = "0xabc", .invoice_id = "inv-1" }; try testing.expect(zigmodu.web4.x402.verifyPayment(proof)); }
+        \\test "x402 payment fail-closed" { const proof = zigmodu.web4.x402.PaymentProof{ .tx_hash = "0xabc", .invoice_id = "inv-1" }; try testing.expect(!zigmodu.web4.x402.verifyPayment(proof)); try testing.expect(zigmodu.web4.x402.verifyWith(zigmodu.web4.x402.verifyPaymentAllowAll, proof)); }
     , gen_opts);
 
     // ── README.md ──
@@ -5567,7 +5567,7 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
         \\## Monetization (x402)
         \\- POST /web4/invoice?tenantId=N&amount=N&currency=usdc — create invoice
         \\- GET /web4/invoices?tenantId=N — list invoices
-        \\- Middleware: pass x402-tx-hash + x402-invoice-id headers
+        \\- Middleware: pass x402-tx-hash + x402-invoice-id headers; inject PaymentVerifier (default fail-closed)
         \\## VC (Verifiable Credentials)
         \\- issueCredential(issuer, claims) — sign with Ed25519
         \\- verifyCredential(issuer, vc) — verify proof
