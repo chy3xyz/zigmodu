@@ -80,6 +80,15 @@ const now_ms = Time.monotonicNowMilliseconds();
 - Permissions: static `Rbac.RolePermissionTable` or DB `CatalogPermDb.loaderFromClient`
 - **Do not** use `security.auth.jwtAuth` / `rbacJwtMiddleware` with ComptimeRouter (they overwrite `ctx.user_data`)
 - Guide: `docs/ROUTE_TABLE.md`
+- **Extractors**: `http.extractPath` / `extractQuery` / `extractJson` / `extractJsonValidated`; field defaults apply when missing
+- **Errors**: `http.respondErr` + optional `http.setErrorMap`; RFC 7807 ProblemDetails
+- **Scope middleware**: `RouteGroup.use(mw)` or `http.Scoped(...).use(mw)` before `mount` / route methods
+- **Testkit**: `dispatch` / `dispatchOpts`, `signBearerToken`, `openMemorySqlite`, `tenantMiddleware`, `SseRecorder`
+- **SSE**: `http.sse(ctx)` + `SseSpec` / `sse_routes` or `RouteMeta.sse = true`
+- **Profiles**: `applyHttpDefaults` (CORS/requestId/recover/access/metrics) + `applyResilienceDefaults` (named CB/RL)
+- **OpenAPI**: `openApiParamsFromStruct` + `RouteMeta.openapi_params` (merged in catalog export)
+- **Outbox barrel**: `zigmodu.outbox.*`; idempotency → `http.idempotencyMiddleware` (header `idempotency-key`)
+- Backlog status: `docs/FRAMEWORK_BACKLOG.md`
 
 ### Imports
 - NEVER use `zigmodu.http_server` — use `zigmodu.http.Context`
@@ -116,6 +125,15 @@ pub fn deinit() void {
 - Secrets: `sec.SecretsManager` (env > file > vault KV v2 HTTP > default); `initWithIo` + `configureVault` / `loadFromVault`
 - CSRF: `http_middleware.csrf()` double-submit cookie pattern
 - CSPRNG: multi-source entropy, never single-timestamp seed
+
+### Multi-tenancy (optional)
+- Default SQL/model column is `tenant_id`. ZigShop-style schemas use `app_id` — call once at startup:
+  ```zig
+  zigmodu.setTenantColumn("app_id");
+  ```
+- Model field name must match the column (`app_id: i64`). `TenantInterceptor` appends `{column} = ?` via `tenantColumn()`.
+- Codegen: `zmodu scaffold|orm|add --tenant-column app_id` emits matching `WHERE` and scaffold `main` calls `setTenantColumn`.
+- Details: `docs/ARCHITECTURE.md` § Multi-Tenancy; CLI: `docs/ZMODU_CLI_INTEGRATION.md`
 
 ## Generated Code Patterns
 
@@ -210,5 +228,6 @@ test "my test" {
 
 - Optional data stack: [chy3xyz/zent](https://github.com/chy3xyz/zent) (v0.12+) is orthogonal to `data.sqlx` — modules may choose either independently, but do not mix drivers or share a transaction across them; see `docs/ZENT.md`.
 - zent reference apps: `examples/zent-modulith/` (minimal) and `examples/metaverse-creative/` (settlement/outbox creative-monetization demo).
-- gRPC unary (`GrpcTransport`) and Kafka wire (`KafkaConnector`) paths are no longer EXPERIMENTAL; gRPC streaming still returns `UNIMPLEMENTED`.
+- gRPC: unary + server streaming；HTTP/2 prior-knowledge：`server.setHttp2Enabled(true)` + `setGrpcRegistry(&reg)`
+- Kafka Consumer Group: offline solo 或 live `joinGroup`/`heartbeat`/`leaveGroup`（需 `KAFKA_BOOTSTRAP`）
 - Vault secrets: `security.SecretsManager` supports HashiCorp KV v2 over plain HTTP (`initWithIo` + `configureVault` / `loadFromVault`); `https://` returns `VaultTlsNotSupported`.

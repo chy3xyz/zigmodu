@@ -164,6 +164,7 @@ pub const AccessLogger = struct {
 
 /// Access logMiddleware — [...]
 pub fn accessLogMiddleware(logger: *AccessLogger) api.MiddlewareFn {
+    _ = logger;
     const S = struct {
         fn handler(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
             const log: *AccessLogger = @ptrCast(@alignCast(user_data orelse return error.InternalError));
@@ -175,7 +176,7 @@ pub fn accessLogMiddleware(logger: *AccessLogger) api.MiddlewareFn {
             const path = ctx.path;
             const body_len = if (ctx.body) |b| b.len else 0;
 
-            next(ctx, next, null) catch |err| {
+            next(ctx) catch |err| {
                 // [...]Error
                 const elapsed = Time.monotonicNowSeconds() - start;
                 log.log(.{
@@ -207,7 +208,7 @@ pub fn accessLogMiddleware(logger: *AccessLogger) api.MiddlewareFn {
         }
     };
 
-    return .{ .func = S.handler, .user_data = @ptrCast(@constCast(logger)) };
+    return S.handler;
 }
 
 const api = @import("../api/Server.zig");

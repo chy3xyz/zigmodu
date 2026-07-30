@@ -168,6 +168,60 @@ pub const SseWriter = struct {
     }
 };
 
+/// In-memory SSE recorder for unit tests (no socket). Same framing as `SseWriter`.
+pub const SseRecorder = struct {
+    allocator: std.mem.Allocator,
+    buf: std.ArrayList(u8) = .empty,
+    event_count: usize = 0,
+    last_id: ?[]const u8 = null,
+
+    pub fn init(allocator: std.mem.Allocator) SseRecorder {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *SseRecorder) void {
+        self.buf.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn bytes(self: *const SseRecorder) []const u8 {
+        return self.buf.items;
+    }
+
+    pub fn setId(self: *SseRecorder, id: []const u8) void {
+        self.last_id = id;
+    }
+
+    pub fn sendEvent(self: *SseRecorder, event: []const u8, data: []const u8) !void {
+        if (self.last_id) |id| {
+            try self.buf.appendSlice(self.allocator, "id: ");
+            try self.buf.appendSlice(self.allocator, id);
+            try self.buf.appendSlice(self.allocator, "\n");
+        }
+        try self.buf.appendSlice(self.allocator, "event: ");
+        try self.buf.appendSlice(self.allocator, event);
+        try self.buf.appendSlice(self.allocator, "\ndata: ");
+        try self.buf.appendSlice(self.allocator, data);
+        try self.buf.appendSlice(self.allocator, "\n\n");
+        self.event_count += 1;
+    }
+
+    pub fn sendData(self: *SseRecorder, data: []const u8) !void {
+        try self.buf.appendSlice(self.allocator, "data: ");
+        try self.buf.appendSlice(self.allocator, data);
+        try self.buf.appendSlice(self.allocator, "\n\n");
+        self.event_count += 1;
+    }
+
+    pub fn done(self: *SseRecorder) !void {
+        try self.sendEvent("done", "[DONE]");
+    }
+
+    pub fn heartbeat(self: *SseRecorder) !void {
+        try self.buf.appendSlice(self.allocator, ": ping\n");
+    }
+};
+
 test "SseWriter sendEvent" {
     // Unit test: validates SSE formatting
     const allocator = std.testing.allocator;
@@ -187,6 +241,21 @@ test "SseWriter sendEvent" {
     try buf.appendSlice(allocator, "\n\n");
 
     try std.testing.expectEqualStrings(expected, buf.items);
+}
+
+test "SseRecorder matches wire format" {
+    const allocator = std.testing.allocator;
+    var rec = SseRecorder.init(allocator);
+    defer rec.deinit();
+
+    rec.setId("7");
+    try rec.sendEvent("message", "{\"ok\":true}");
+    try rec.done();
+
+    try std.testing.expectEqual(@as(usize, 2), rec.event_count);
+    try std.testing.expect(std.mem.indexOf(u8, rec.bytes(), "id: 7\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rec.bytes(), "event: message\ndata: {\"ok\":true}\n\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rec.bytes(), "event: done\ndata: [DONE]\n\n") != null);
 }
 
 test "SseWriter sendMultiLine format" {

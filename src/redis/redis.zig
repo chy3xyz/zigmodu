@@ -7,10 +7,13 @@ const builtin = @import("builtin");
 const errors = @import("../sqlx/errors.zig");
 
 /// Write command bytes to Redis stream (Zig 0.17 compat: stream.write removed).
+/// Must flush: `Writer.writeAll` only fills the buffer; without flush the
+/// RESP command never reaches Redis and the subsequent read hangs forever.
 fn writeCmd(stream: *const std.Io.net.Stream, io: std.Io, cmd: []const u8) !void {
     var wbuf: [8192]u8 = undefined;
     var wstream = stream.writer(io, &wbuf);
     wstream.interface.writeAll(cmd) catch return error.RedisError;
+    wstream.interface.flush() catch return error.RedisError;
 }
 
 /// Redis configuration

@@ -22,6 +22,8 @@ const std = @import("std");
 const WsFramer = @import("../im/WsFramer.zig").WsFramer;
 const BufferPool = @import("../im/BufferPool.zig").BufferPool;
 const WsUring = @import("../im/ws_uring.zig").WsUring;
+const Http2Server = @import("../http/Http2Server.zig");
+const GrpcServiceRegistry = @import("../extensions/GrpcTransport.zig").GrpcServiceRegistry;
 
 /// HTTP method
 pub const Method = enum {
@@ -96,9 +98,24 @@ pub const Route = struct {
 pub const RouteGroup = struct {
     server: *Server,
     prefix: []const u8,
+    /// Scope-local middleware applied to routes registered through this group.
+    middleware: []const Middleware = &.{},
 
     pub fn init(server: *Server, prefix: []const u8) RouteGroup {
         return .{ .server = server, .prefix = prefix };
+    }
+
+    /// Append scope-local middleware (allocates on server; freed in Server.deinit).
+    pub fn use(self: RouteGroup, mw: Middleware) !RouteGroup {
+        const extended = try self.server.allocator.alloc(Middleware, self.middleware.len + 1);
+        @memcpy(extended[0..self.middleware.len], self.middleware);
+        extended[self.middleware.len] = mw;
+        try self.server.owned_route_mw.append(self.server.allocator, extended);
+        return .{
+            .server = self.server,
+            .prefix = self.prefix,
+            .middleware = extended,
+        };
     }
 
     fn joinPath(self: *const RouteGroup, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
@@ -117,6 +134,7 @@ pub const RouteGroup = struct {
             .method = method,
             .path = full_path,
             .handler = handler,
+            .middleware = self.middleware,
             .user_data = user_data,
         });
     }
@@ -690,7 +708,7 @@ const RequestParser = struct {
         return .{ .allocator = allocator };
     }
 
-    fn trimCrlf(line: []const u8) []const u8 {
+    pub fn trimCrlf(line: []const u8) []const u8 {
         var out = line;
         while (out.len > 0 and (out[out.len - 1] == '\n' or out[out.len - 1] == '\r')) {
             out = out[0 .. out.len - 1];
@@ -700,16 +718,14 @@ const RequestParser = struct {
 
     pub fn parse(self: *RequestParser, reader: *StreamReader, max_body_size: usize) !ParsedRequest {
         var buffer: [8192]u8 = undefined;
-
-        // Read request line. `takeDelimiter` returns a slice into the reader's
-        // internal buffer, which gets invalidated on the next read (rebase).
-        // Dupe it into the parser allocator so subsequent header reads don't
-        // clobber the method/path slices we derive from it.
-        //
-        // A `null` result here means the peer closed before sending anything —
-        // this is a benign end-of-connection, not a malformed request, so we
-        // surface it as a distinct error the caller can ignore silently.
         const request_line_raw_view = try reader.readUntilDelimiterOrEof(&buffer, '\n') orelse return error.ClientClosed;
+        return self.parseAfterRequestLine(reader, request_line_raw_view, max_body_size);
+    }
+
+    /// Continue HTTP/1.1 parse after the request line was already read (H2 preface probe).
+    pub fn parseAfterRequestLine(self: *RequestParser, reader: *StreamReader, request_line_raw_view: []const u8, max_body_size: usize) !ParsedRequest {
+        var buffer: [8192]u8 = undefined;
+
         const request_line_owned = try self.allocator.dupe(u8, trimCrlf(request_line_raw_view));
         const request_line = request_line_owned;
         if (request_line.len < 14) return error.InvalidRequest; // Minimum: "GET / HTTP/1.1"
@@ -767,11 +783,6 @@ const RequestParser = struct {
             if (content_len > max_body_size) return error.BodyTooLarge;
             if (content_len > 0) {
                 const body_buf = try self.allocator.alloc(u8, content_len);
-                // Read body bytes. After header parsing with takeDelimiter, the
-                // StreamReader's internal buffer may contain body residue. Use
-                // readSliceAll on the underlying stream — the buffer residue was
-                // from headers (which we've already consumed), and TCP stream
-                // position is correctly past headers.
                 const bytes_read = try reader.readAll(body_buf);
                 if (bytes_read == content_len) {
                     body = body_buf;
@@ -1230,6 +1241,12 @@ pub const Server = struct {
     request_timeout_ms: u32,
     max_requests_per_conn: usize,
     in_flight: ?*std.atomic.Value(u64) = null,
+    /// Allocated route-group / scoped middleware slices (RouteGroup.use, ComptimeRouter Scoped.use).
+    owned_route_mw: std.ArrayList([]const Middleware),
+    /// Prior-knowledge HTTP/2 (h2c). When true, connFiber detects `PRI * HTTP/2.0` preface.
+    enable_http2: bool = false,
+    /// Optional gRPC registry for HTTP/2 gRPC dispatch.
+    grpc_registry: ?*GrpcServiceRegistry = null,
 
     pub const Config = struct {
         port: u16 = 8080,
@@ -1262,7 +1279,17 @@ pub const Server = struct {
             .max_body_size = config.max_body_size,
             .request_timeout_ms = config.request_timeout_ms,
             .max_requests_per_conn = config.max_requests_per_conn,
+            .owned_route_mw = std.ArrayList([]const Middleware).empty,
         };
+    }
+
+    /// Enable prior-knowledge HTTP/2 cleartext (h2c). Pair with `setGrpcRegistry` for gRPC-over-H2.
+    pub fn setHttp2Enabled(self: *Server, enabled: bool) void {
+        self.enable_http2 = enabled;
+    }
+
+    pub fn setGrpcRegistry(self: *Server, registry: ?*GrpcServiceRegistry) void {
+        self.grpc_registry = registry;
     }
 
     /// Attach a shared buffer pool for WebSocket frame I/O.
@@ -1278,6 +1305,10 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
+        for (self.owned_route_mw.items) |slice| {
+            self.allocator.free(slice);
+        }
+        self.owned_route_mw.deinit(self.allocator);
         self.router.deinit();
         self.global_middleware.deinit(self.allocator);
         {
@@ -1339,6 +1370,39 @@ pub const Server = struct {
         ctx.chain_index = 0;
 
         try runMiddlewareChain(ctx);
+    }
+
+    /// Test-only dispatch: match route, copy params, run middleware + handler (no listen).
+    pub fn handleForTest(self: *Server, ctx: *Context) !void {
+        var matched = self.router.match(ctx.allocator, ctx.method, ctx.path);
+        if (matched) |*m| {
+            defer m.deinit(ctx.allocator);
+
+            var pit = m.params.iterator();
+            while (pit.next()) |entry| {
+                const key = try ctx.allocator.dupe(u8, entry.key_ptr.*);
+                const val = try ctx.allocator.dupe(u8, entry.value_ptr.*);
+                try ctx.params.put(key, val);
+            }
+
+            ctx.user_data = m.route.user_data;
+
+            self.executeWithMiddleware(ctx, m.route.handler, m.route.combined_middleware) catch |err| {
+                if (!ctx.responded) {
+                    try ctx.sendError(500, @errorName(err));
+                }
+            };
+            return;
+        }
+
+        if (self.global_middleware.items.len > 0) {
+            self.executeWithMiddleware(ctx, struct {
+                fn h(_: *Context) anyerror!void {}
+            }.h, self.global_middleware.items) catch {};
+        }
+        if (!ctx.responded) {
+            try ctx.sendError(404, "Not Found");
+        }
     }
 
     /// Start the async HTTP server.
@@ -1460,10 +1524,37 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
 
         const start_time = std.Io.Timestamp.now(server.io, .real);
 
-        var request = parser.parse(&reader, server.max_body_size) catch |err| {
+        // Prefetch first line — HTTP/2 prior-knowledge preface starts with PRI.
+        const first_line_raw = reader.readUntilDelimiterOrEof(&.{}, '\n') catch |err| {
             switch (err) {
-                // Peer closed before sending anything — keep-alive drain or
-                // readiness probe. Nothing to respond with; just exit the loop.
+                error.ReadFailed => return,
+                else => {
+                    writeErrorResponse(server.io, stream, arena_alloc, 400, "Bad Request");
+                    return;
+                },
+            }
+        } orelse return;
+        const first_line = RequestParser.trimCrlf(first_line_raw);
+
+        if (server.enable_http2 and std.mem.eql(u8, first_line, "PRI * HTTP/2.0")) {
+            // Consume remaining preface: empty line, "SM", empty line
+            const l2 = (reader.readUntilDelimiterOrEof(&.{}, '\n') catch return) orelse return;
+            const l3 = (reader.readUntilDelimiterOrEof(&.{}, '\n') catch return) orelse return;
+            const l4 = (reader.readUntilDelimiterOrEof(&.{}, '\n') catch return) orelse return;
+            if (RequestParser.trimCrlf(l2).len != 0) return;
+            if (!std.mem.eql(u8, RequestParser.trimCrlf(l3), "SM")) return;
+            if (RequestParser.trimCrlf(l4).len != 0) return;
+
+            Http2Server.serveAfterPreface(server.io, stream, allocator, .{
+                .grpc_registry = server.grpc_registry,
+            }) catch |err| {
+                std.log.warn("[Server] HTTP/2 session ended: {s}", .{@errorName(err)});
+            };
+            return;
+        }
+
+        var request = parser.parseAfterRequestLine(&reader, first_line_raw, server.max_body_size) catch |err| {
+            switch (err) {
                 error.ClientClosed => return,
                 error.ReadFailed => return,
                 else => {},

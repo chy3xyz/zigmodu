@@ -174,6 +174,8 @@ test "compile all source files" {
     _ = @import("http/OpenApi.zig");
 
     // gRPC Transport
+    _ = @import("http/Http2.zig");
+    _ = @import("http/Http2Server.zig");
     _ = @import("extensions/GrpcTransport.zig");
 
     // Kafka Connector
@@ -185,8 +187,15 @@ test "compile all source files" {
     // Contract Testing
     _ = @import("test/ContractTest.zig");
 
-    // RFC 7807 Problem Details
+    // RFC 7807 Problem Details + framework HTTP helpers
     _ = @import("http/ProblemDetails.zig");
+    _ = @import("api/Extract.zig");
+    _ = @import("http/Testkit.zig");
+    _ = @import("http/Profiles.zig");
+    _ = @import("http/Lifecycle.zig");
+    _ = @import("http/Sse.zig");
+    _ = @import("messaging/outbox.zig");
+    _ = @import("messaging/outbox_sample.zig");
 
     // Feature Flags
     _ = @import("core/FeatureFlags.zig");

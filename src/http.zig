@@ -27,6 +27,7 @@ pub const Auth = comptime_router.Auth;
 pub const RouteMeta = comptime_router.RouteMeta;
 pub const RouteSpec = comptime_router.RouteSpec;
 pub const WsSpec = comptime_router.WsSpec;
+pub const SseSpec = comptime_router.SseSpec;
 pub const TypedHandler = comptime_router.TypedHandler;
 pub const wrap = comptime_router.wrap;
 pub const assertNoDupes = comptime_router.assertNoDupes;
@@ -66,11 +67,47 @@ pub const ProblemDetails = @import("http/ProblemDetails.zig").ProblemDetails;
 pub const ValidationProblem = @import("http/ProblemDetails.zig").ValidationProblem;
 pub const IdempotencyStore = @import("http/Idempotency.zig").IdempotencyStore;
 pub const idempotencyMiddleware = @import("http/Idempotency.zig").idempotencyMiddleware;
+pub const Http2 = @import("http/Http2.zig");
 pub const ApiVersion = @import("http/ApiVersioning.zig").ApiVersion;
 pub const ApiVersionExtractor = @import("http/ApiVersioning.zig").ApiVersionExtractor;
 pub const ApiVersionRouter = @import("http/ApiVersioning.zig").ApiVersionRouter;
 pub const apiVersionMiddleware = @import("http/ApiVersioning.zig").apiVersionMiddleware;
 pub const SseWriter = @import("http/Sse.zig").SseWriter;
+/// Alias for SSE streaming handlers.
+pub const Sse = SseWriter;
+pub const SseRecorder = @import("http/Sse.zig").SseRecorder;
+
+/// Begin an SSE response (`Content-Type: text/event-stream`). Requires live `ctx.stream` + `ctx.io`.
+pub fn sse(ctx: *Context) !SseWriter {
+    return SseWriter.init(ctx);
+}
+
+pub const Extract = @import("api/Extract.zig");
+pub const extractQuery = Extract.extractQuery;
+pub const extractPath = Extract.extractPath;
+pub const extractJson = Extract.extractJson;
+pub const extractJsonValidated = Extract.extractJsonValidated;
+pub const openApiParamsFromStruct = Extract.openApiParamsFromStruct;
+pub const respondProblem = Extract.respondProblem;
+pub const respondErr = Extract.respondErr;
+pub const setErrorMap = Extract.setErrorMap;
+pub const clearErrorMap = Extract.clearErrorMap;
+pub const ErrorMapping = Extract.ErrorMapping;
+pub const FieldRules = Extract.FieldRules;
+
+pub const Testkit = @import("http/Testkit.zig");
+pub const Profiles = @import("http/Profiles.zig");
+pub const ProfileConfig = Profiles.ProfileConfig;
+pub const HttpProfileState = Profiles.HttpProfileState;
+pub const applyHttpDefaults = Profiles.applyHttpDefaults;
+pub const ResilienceDep = Profiles.ResilienceDep;
+pub const ResilienceProfileState = Profiles.ResilienceProfileState;
+pub const applyResilienceDefaults = Profiles.applyResilienceDefaults;
+
+pub const Lifecycle = @import("http/Lifecycle.zig");
+pub const ShutdownChecklist = Lifecycle.ShutdownChecklist;
+pub const requireEnv = Lifecycle.requireEnv;
+
 pub const Dashboard = @import("http/Dashboard.zig");
 pub const AccessLogger = @import("http/AccessLog.zig").AccessLogger;
 pub const accessLogMiddleware = @import("http/AccessLog.zig").accessLogMiddleware;

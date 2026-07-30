@@ -24,8 +24,10 @@
 在 `zigmodu` 根目录下直接构建与运行 `zmodu` CLI 工具：
 
 ```bash
-zig build zmodu -- --help
+zig build zmodu -- scaffold --sql ./schema.sql --name myapp --tenant-column app_id
 ```
+
+`--tenant-column`（默认 `tenant_id`）控制生成的 `WHERE` 与 scaffold `main` 里的 `zigmodu.setTenantColumn(...)`。模型字段须与列名一致（如 `app_id: i64`）。
 
 或安装到系统可执行路径：
 

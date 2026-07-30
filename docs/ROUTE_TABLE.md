@@ -262,6 +262,29 @@ try server.addRoute(.{
 
 WS：`pub const ws_routes = [_]http.WsSpec(State){ .{ .path = "ws", .on_connect = … } };`
 
+### SSE（Server-Sent Events）
+
+- 客户端：`Accept: text/event-stream`
+- Handler：`var sse = try http.sse(ctx);` 然后 `sendEvent` / `done`
+- 模块表：`pub const sse_routes = [_]http.SseSpec(State){ .{ .path = "stream", .handler = stream } };`
+- 或在普通 `routes` 行设 `meta = .{ .sse = true }`
+- Catalog：`is_sse=true` → OpenAPI description 标注 SSE
+- 额外 query/path 文档：`RouteMeta.openapi_params = &http.openApiParamsFromStruct(QueryDto, .query)`（与路径 `{id}` 合并导出）
+- 详见 `docs/FRAMEWORK_BACKLOG.md`
+
+### Typed extractors + scope middleware
+
+```zig
+const id = (try http.extractPath(ctx, .{ .id = u64 })).id;
+const page = (try http.extractQuery(ctx, .{ .page = u32, .size = u32 })).page;
+const body = try http.extractJson(ctx, CreateDto) catch return;
+try http.respondErr(ctx, err);
+
+var g = try server.group("admin-api").use(myMiddleware);
+```
+
+Extractors → `src/api/Extract.zig` · Testkit → `http.Testkit.dispatch`
+
 ---
 
 ## 8. Scaffold / zmodu

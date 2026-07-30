@@ -14,6 +14,7 @@ pub const HandlerFn = server_mod.HandlerFn;
 pub const Context = server_mod.Context;
 pub const Server = server_mod.Server;
 pub const RouteGroup = server_mod.RouteGroup;
+pub const Middleware = server_mod.Middleware;
 pub const WsConnectFn = server_mod.WsConnectFn;
 pub const WsMessageFn = server_mod.WsMessageFn;
 pub const WsCloseFn = server_mod.WsCloseFn;
@@ -33,6 +34,11 @@ pub const RouteMeta = struct {
     permission: ?[]const u8 = null,
     /// ModuleGate name; null → module's `module_name`.
     module: ?[]const u8 = null,
+    /// When true, route is Server-Sent Events (`Accept: text/event-stream`). Handler should call `http.sse(ctx)`.
+    sse: bool = false,
+    /// Extra OpenAPI params (typically from `http.openApiParamsFromStruct(QueryDto, .query)`).
+    /// Merged with path `{name}` segments in `RouteCatalog.exportOpenApi`.
+    openapi_params: []const OpenApi.ApiParam = &.{},
 };
 
 pub fn TypedHandler(comptime State: type) type {
@@ -64,6 +70,16 @@ pub fn WsSpec(comptime State: type) type {
     };
 }
 
+/// SSE route row; handler calls `http.sse(ctx)` then streams events.
+pub fn SseSpec(comptime State: type) type {
+    return struct {
+        path: []const u8,
+        handler: TypedHandler(State),
+        meta: RouteMeta = .{},
+        pub const state_type = State;
+    };
+}
+
 /// Bridge `fn(*Context,*State)` → existing `HandlerFn` (state via `ctx.user_data`).
 pub fn wrap(comptime State: type, comptime handler: TypedHandler(State)) HandlerFn {
     return struct {
@@ -82,6 +98,9 @@ pub const CatalogEntry = struct {
     module: []const u8,
     permission: ?[]const u8 = null,
     is_ws: bool = false,
+    is_sse: bool = false,
+    /// Borrowed comptime/static OpenAPI params from RouteMeta.
+    openapi_params: []const OpenApi.ApiParam = &.{},
 };
 
 pub const RouteCatalog = struct {
@@ -152,7 +171,7 @@ pub const RouteCatalog = struct {
                 .OPTIONS => .OPTIONS,
             };
 
-            var params_buf: [8]OpenApi.ApiParam = undefined;
+            var params_buf: [16]OpenApi.ApiParam = undefined;
             var param_count: usize = 0;
             var it = std.mem.splitScalar(u8, e.path, '/');
             while (it.next()) |seg| {
@@ -162,6 +181,20 @@ pub const RouteCatalog = struct {
                         .location = .path,
                         .required = true,
                     };
+                    param_count += 1;
+                }
+            }
+            for (e.openapi_params) |extra| {
+                if (param_count >= params_buf.len) break;
+                var dup = false;
+                for (params_buf[0..param_count]) |existing| {
+                    if (std.mem.eql(u8, existing.name, extra.name) and existing.location == extra.location) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) {
+                    params_buf[param_count] = extra;
                     param_count += 1;
                 }
             }
@@ -177,6 +210,8 @@ pub const RouteCatalog = struct {
             const summary = e.permission orelse e.module;
             const desc: []const u8 = if (e.is_ws)
                 "websocket"
+            else if (e.is_sse)
+                "text/event-stream (SSE)"
             else if (e.auth == .public)
                 "public"
             else
@@ -189,7 +224,7 @@ pub const RouteCatalog = struct {
                 .tags = &.{e.module},
                 .params = params_buf[0..param_count],
                 .responses = &.{
-                    .{ .status_code = 200, .description = if (e.is_ws) "Switching Protocols" else "OK" },
+                    .{ .status_code = 200, .description = if (e.is_ws) "Switching Protocols" else if (e.is_sse) "text/event-stream" else "OK" },
                     .{ .status_code = 401, .description = "Unauthorized" },
                 },
             });
@@ -332,7 +367,7 @@ fn joinPaths(allocator: std.mem.Allocator, parts: []const []const u8) ![]u8 {
 /// Does not include runtime scope prefixes (`/admin-api`); call once per scope group.
 pub fn assertNoDupes(comptime modules: anytype) void {
     comptime {
-        @setEvalBranchQuota(100_000);
+        @setEvalBranchQuota(5_000_000);
         var seen: []const []const u8 = &.{};
         for (modules) |Mod| {
             if (!@hasDecl(Mod, "routes")) @compileError(@typeName(Mod) ++ " missing pub const routes");
@@ -354,6 +389,17 @@ pub fn assertNoDupes(comptime modules: anytype) void {
                     for (seen) |s| {
                         if (std.mem.eql(u8, s, key)) {
                             @compileError("duplicate ws route: " ++ key);
+                        }
+                    }
+                    seen = seen ++ .{key};
+                }
+            }
+            if (@hasDecl(Mod, "sse_routes")) {
+                for (Mod.sse_routes) |spec| {
+                    const key = "SSE|GET|" ++ base ++ "/" ++ spec.path;
+                    for (seen) |s| {
+                        if (std.mem.eql(u8, s, key)) {
+                            @compileError("duplicate sse route: " ++ key);
                         }
                     }
                     seen = seen ++ .{key};
@@ -444,10 +490,24 @@ pub fn Scoped(comptime AppState: type) type {
     return struct {
         router: *Router(AppState),
         prefix: []const u8,
+        middleware: []const Middleware = &.{},
 
         const Self = @This();
 
-        /// Mount one modulith HTTP module: expands `Mod.routes` / optional `ws_routes`.
+        /// Append scope-local middleware (stored on server; freed in Server.deinit).
+        pub fn use(self: Self, mw: Middleware) !Self {
+            const extended = try self.router.server.allocator.alloc(Middleware, self.middleware.len + 1);
+            @memcpy(extended[0..self.middleware.len], self.middleware);
+            extended[self.middleware.len] = mw;
+            try self.router.server.owned_route_mw.append(self.router.server.allocator, extended);
+            return .{
+                .router = self.router,
+                .prefix = self.prefix,
+                .middleware = extended,
+            };
+        }
+
+        /// Mount one modulith HTTP module: expands `Mod.routes` / optional `ws_routes` / `sse_routes`.
         pub fn mount(self: *Self, comptime Mod: type, state: *Mod.State) !void {
             validateModule(Mod);
             const nest_path = comptime joinNestComptime(Mod.nest);
@@ -455,6 +515,7 @@ pub fn Scoped(comptime AppState: type) type {
             defer self.router.allocator.free(base);
 
             var group = self.router.server.group(base);
+            group.middleware = self.middleware;
             const state_ptr: ?*anyopaque = state;
 
             inline for (Mod.routes) |spec| {
@@ -471,7 +532,30 @@ pub fn Scoped(comptime AppState: type) type {
                     .module = module,
                     .permission = spec.meta.permission,
                     .is_ws = false,
+                    .is_sse = spec.meta.sse,
+                    .openapi_params = spec.meta.openapi_params,
                 });
+            }
+
+            if (@hasDecl(Mod, "sse_routes")) {
+                inline for (Mod.sse_routes) |spec| {
+                    const auth = resolveAuth(spec.meta, self.router.default_auth);
+                    const module = resolveModule(spec.meta, Mod.module_name);
+                    const bridged = wrap(Mod.State, spec.handler);
+                    try group.get(spec.path, bridged, state_ptr);
+
+                    const full = try joinPaths(self.router.allocator, &.{ base, spec.path });
+                    try self.router.catalog_buf.append(self.router.allocator, .{
+                        .method = .GET,
+                        .path = full,
+                        .auth = auth,
+                        .module = module,
+                        .permission = spec.meta.permission,
+                        .is_ws = false,
+                        .is_sse = true,
+                        .openapi_params = spec.meta.openapi_params,
+                    });
+                }
             }
 
             if (@hasDecl(Mod, "ws_routes")) {

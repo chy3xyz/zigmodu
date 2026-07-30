@@ -85,15 +85,20 @@ pub const load_shedder = @import("resilience/LoadShedder.zig");
 // ============================================================
 // 4. MESSAGING
 // ============================================================
-pub const OutboxPublisher = @import("messaging/OutboxPublisher.zig").OutboxPublisher;
-pub const OutboxPoller = @import("messaging/OutboxPublisher.zig").OutboxPoller;
-pub const OutboxEntry = @import("messaging/OutboxPublisher.zig").OutboxEntry;
-pub const OutboxConfig = @import("messaging/OutboxPublisher.zig").OutboxConfig;
+/// Thin barrel — `zigmodu.outbox.*` or direct root aliases below.
+pub const outbox = @import("messaging/outbox.zig");
+pub const OutboxPublisher = outbox.OutboxPublisher;
+pub const OutboxPoller = outbox.OutboxPoller;
+pub const OutboxEntry = outbox.OutboxEntry;
+pub const OutboxConfig = outbox.OutboxConfig;
+pub const OutboxStatus = outbox.OutboxStatus;
 pub const KafkaProducer = @import("core/KafkaConnector.zig").KafkaProducer;
 pub const KafkaConsumer = @import("core/KafkaConnector.zig").KafkaConsumer;
 pub const KafkaEventBridge = @import("core/KafkaConnector.zig").KafkaEventBridge;
 pub const KafkaMessage = @import("core/KafkaConnector.zig").KafkaMessage;
 pub const RobustMQTransport = @import("core/KafkaConnector.zig").RobustMQTransport;
+pub const ConsumerGroupSession = @import("core/KafkaConnector.zig").ConsumerGroupSession;
+pub const KafkaWireFormat = @import("core/KafkaConnector.zig").KafkaWireFormat;
 pub const NatsClient = @import("messaging/Nats.zig").NatsClient;
 pub const NatsConfig = @import("messaging/Nats.zig").NatsConfig;
 pub const MessageQueue = @import("messaging/MessageQueue.zig").MessageQueue;
@@ -121,7 +126,12 @@ pub const ShardRouter = @import("tenant/ShardRouter.zig").ShardRouter;
 pub const ShardPool = @import("tenant/ShardRouter.zig").ShardPool;
 pub const ShardConfig = @import("tenant/ShardRouter.zig").ShardConfig;
 pub const TenantContext = @import("tenant/TenantContext.zig").TenantContext;
+pub const setTenantColumn = @import("tenant/TenantContext.zig").setTenantColumn;
+pub const tenantColumn = @import("tenant/TenantContext.zig").tenantColumn;
+pub const TENANT_COLUMN = @import("tenant/TenantContext.zig").TENANT_COLUMN;
 pub const TenantInterceptor = @import("tenant/TenantInterceptor.zig").TenantInterceptor;
+pub const TenantRepository = @import("tenant/TenantInterceptor.zig").TenantRepository;
+pub const TenantRepositoryCol = @import("tenant/TenantInterceptor.zig").TenantRepositoryCol;
 pub const DataPermissionContext = @import("datapermission/DataPermission.zig").DataPermissionContext;
 pub const DataPermissionFilter = @import("datapermission/DataPermission.zig").DataPermissionFilter;
 pub const datapermission = @import("datapermission/DataPermission.zig");
@@ -145,8 +155,10 @@ pub const GrpcServiceRegistry = @import("extensions/GrpcTransport.zig").GrpcServ
 pub const GrpcClient = @import("extensions/GrpcTransport.zig").GrpcClient;
 pub const GrpcStatusCode = @import("extensions/GrpcTransport.zig").GrpcStatusCode;
 pub const GrpcFrame = @import("extensions/GrpcTransport.zig").GrpcFrame;
+pub const GrpcStreamWriter = @import("extensions/GrpcTransport.zig").GrpcStreamWriter;
 pub const OwnedGrpcResponse = @import("extensions/GrpcTransport.zig").OwnedGrpcResponse;
 pub const ProtoParser = @import("extensions/GrpcTransport.zig").ProtoParser;
+pub const Http2 = @import("http/Http2.zig");
 
 // ============================================================
 // 7. SCHEDULER

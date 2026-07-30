@@ -142,18 +142,17 @@ pub const IdempotencyStore = struct {
 };
 
 /// HTTP Idempotency middleware
-/// Prevent duplicate processing of same request[...]for[...]
+/// Prevent duplicate processing of same request for write methods.
 ///
 /// Usage:
-///   server.addMiddleware(.{ .func = idempotencyMiddleware(&store) });
+///   try server.addMiddleware(http.idempotencyMiddleware(&store));
 ///
-/// Client must send in request header `Idempotency-Key`
-pub fn idempotencyMiddleware(store: *IdempotencyStore) api.MiddlewareFn {
+/// Client must send request header `Idempotency-Key`.
+pub fn idempotencyMiddleware(store: *IdempotencyStore) api.Middleware {
     const S = struct {
         fn handler(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
-            _ = user_data;
+            const s: *IdempotencyStore = @ptrCast(@alignCast(user_data orelse return error.InternalError));
 
-            // [...]Idempotency
             const method = ctx.method.toString();
             const is_write = std.mem.eql(u8, method, "POST") or
                 std.mem.eql(u8, method, "PUT") or
@@ -161,37 +160,35 @@ pub fn idempotencyMiddleware(store: *IdempotencyStore) api.MiddlewareFn {
                 std.mem.eql(u8, method, "DELETE");
 
             if (!is_write) {
-                try next(ctx, next, null);
+                try next(ctx);
                 return;
             }
 
-            // [...]Idempotency[...]
-            const key = ctx.header("Idempotency-Key") orelse {
-                // [...]Idempotency[...]Non-critical ops can be omitted[...]
-                try next(ctx, next, null);
+            const key = ctx.header("idempotency-key") orelse {
+                try next(ctx);
                 return;
             };
 
-            // Check if[...]
-            if (store.get(key)) |existing| {
-                // Idempotency[...]
+            if (s.get(key)) |existing| {
                 try ctx.json(existing.status_code, existing.response);
                 return;
             }
 
-            // [...]
-            try next(ctx, next, null);
+            try next(ctx);
 
-            // [...]——Actual impl needs to intercept response body[...]
-            // [...] ctx [...]
+            if (ctx.responded and ctx.response_body.items.len > 0) {
+                s.store(key, ctx.response_body.items, ctx.status_code, 24 * 60 * 60) catch |err| {
+                    std.log.warn("idempotency store failed: {s}", .{@errorName(err)});
+                };
+            }
         }
     };
-    return S.handler;
+    return .{ .func = S.handler, .user_data = @ptrCast(store) };
 }
 
 /// [...]Idempotency middleware[...] Context[...]
 pub fn wrapContextWithIdempotency(ctx: *api.Context, store: *IdempotencyStore, ttl_seconds: u64) !void {
-    const key = ctx.header("Idempotency-Key") orelse return;
+    const key = ctx.header("idempotency-key") orelse return;
 
     // [...]
     if (store.has(key)) return;

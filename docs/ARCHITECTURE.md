@@ -452,8 +452,8 @@ src/
 
 | 组件 | 路径 | 何时需要 |
 |------|------|----------|
-| `TenantContext` | `src/tenant/TenantContext.zig` | 请求级租户 ID；`ignore` / `IGNORE_TENANT_FIELD` 可跳过过滤 |
-| `TenantInterceptor` | `src/tenant/TenantInterceptor.zig` | ORM/SQL 自动追加 `tenant_id = ?` |
+| `TenantContext` | `src/tenant/TenantContext.zig` | 请求级租户 ID；`setTenantColumn("app_id")` 可改 SQL 列名（默认 `tenant_id`） |
+| `TenantInterceptor` | `src/tenant/TenantInterceptor.zig` | ORM/SQL 自动追加 `{tenant_column} = ?` |
 | `ShardRouter` | `src/tenant/ShardRouter.zig` | 按租户路由到不同 DB 分片 |
 | `DataPermission` | `src/datapermission/` | 行级数据权限（与 RBAC 配合） |
 | JWT `aud` 租户声明 | `security.auth.jwtAuth` | 仅在使用 RBAC 中间件且 token 含租户时 |
@@ -467,15 +467,17 @@ src/
 
 多租户 SaaS（显式启用，见 examples/tenant-mgmt）
   HTTP → [TenantMiddleware] → JWT → [DataPermission] → handler
-       → Service（显式传 app_id/tenant_id）→ SQL（WHERE tenant_id = ?）
+       → Service（显式传 tenant 值）→ SQL（WHERE tenant_id|app_id = ?）
+  启动时可选：zigmodu.setTenantColumn("app_id")  // 与 schema 列名对齐
 ```
 
 要点：
 
 1. **不挂租户中间件 = 单租户**，与 Spring 里不用 `@TenantLine` 一样。
 2. **`TenantContext.isActive()`** 为 false 时，拦截器不注入条件。
-3. **JWT 默认** `generateToken(user, roles)` 的 `aud` 为 `"zigmodu-app"`，不是租户 ID；租户 claim 仅在 `generateTokenWithTenant` 或 RBAC 路径使用。
-4. **`examples/tenant-mgmt`** 是最佳实践演示，其中 `tenantMiddleware` / `dataPermissionMiddleware` 为可替换占位，生产环境按业务实现。
+3. **租户列名**：默认 `tenant_id`；ZigShop 等用 `app_id` 时调用 `setTenantColumn("app_id")`，且模型字段名与列名一致。`zmodu --tenant-column app_id` 生成对应 `WHERE` 与 `setTenantColumn`。
+4. **JWT 默认** `generateToken(user, roles)` 的 `aud` 为 `"zigmodu-app"`，不是租户 ID；租户 claim 仅在 `generateTokenWithTenant` 或 RBAC 路径使用。
+5. **`examples/tenant-mgmt`** 是最佳实践演示，其中 `tenantMiddleware` / `dataPermissionMiddleware` 为可替换占位，生产环境按业务实现。
 
 认证（`AppSecurity` / `jwtAuth`）与多租户正交：可以只要 JWT 不要租户，也可以只要租户 header 不要 JWT（不推荐生产）。
 

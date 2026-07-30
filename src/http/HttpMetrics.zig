@@ -6,6 +6,7 @@ const std = @import("std");
 ///   var collector = HttpMetricsCollector.init();
 ///   server.addMiddleware(.{ .func = httpMetricsMiddleware(&collector) });
 pub fn httpMetricsMiddleware(collector: *HttpMetricsCollector) api.MiddlewareFn {
+    _ = collector;
     const S = struct {
         fn handler(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
             const c: *HttpMetricsCollector = @ptrCast(@alignCast(user_data orelse return error.InternalError));
@@ -13,7 +14,7 @@ pub fn httpMetricsMiddleware(collector: *HttpMetricsCollector) api.MiddlewareFn 
 
             c.in_flight += 1;
 
-            next(ctx, next, null) catch |err| {
+            next(ctx) catch |err| {
                 c.in_flight -= 1;
                 const elapsed = @import("../core/Time.zig").monotonicNowSeconds() - start;
                 c.recordRequest(500, @floatFromInt(elapsed));
@@ -26,7 +27,7 @@ pub fn httpMetricsMiddleware(collector: *HttpMetricsCollector) api.MiddlewareFn 
         }
     };
 
-    return .{ .func = S.handler, .user_data = @ptrCast(@constCast(collector)) };
+    return S.handler;
 }
 
 /// HTTP Metrics collector (lightweight — no PrometheusMetrics dep)

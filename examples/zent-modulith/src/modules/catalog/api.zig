@@ -7,16 +7,28 @@ const service = @import("service.zig");
 pub fn CatalogApi(comptime Service: type) type {
     return struct {
         const Self = @This();
-        svc: *Service,
+        svc: *Service;
 
         pub const module_name = "catalog";
         pub const nest = .{};
         pub const State = Self;
 
+        const CreateTenantQ = struct { name: []const u8, domain: []const u8 };
+        const CreateProductQ = struct { tenant_id: i64, name: []const u8, price_cents: i64 = 0 };
+        const ListProductQ = struct { tenant_id: i64 };
+
+        const create_tenant_params = http.openApiParamsFromStruct(CreateTenantQ, .query);
+        const create_product_params = http.openApiParamsFromStruct(CreateProductQ, .query);
+        const list_product_params = http.openApiParamsFromStruct(ListProductQ, .query);
+
         pub const routes = [_]http.RouteSpec(State){
-            .{ .method = .POST, .path = "tenants", .handler = createTenant, .meta = .{ .auth = .public } },
-            .{ .method = .POST, .path = "products", .handler = createProduct, .meta = .{ .auth = .public } },
-            .{ .method = .GET, .path = "products", .handler = listProducts, .meta = .{ .auth = .public } },
+            .{ .method = .POST, .path = "tenants", .handler = createTenant, .meta = .{ .auth = .public, .openapi_params = &create_tenant_params } },
+            .{ .method = .POST, .path = "products", .handler = createProduct, .meta = .{ .auth = .public, .openapi_params = &create_product_params } },
+            .{ .method = .GET, .path = "products", .handler = listProducts, .meta = .{ .auth = .public, .openapi_params = &list_product_params } },
+        };
+
+        pub const sse_routes = [_]http.SseSpec(State){
+            .{ .path = "events", .handler = streamEvents, .meta = .{ .auth = .public } },
         };
 
         pub fn init(svc: *Service) Self {
@@ -24,54 +36,24 @@ pub fn CatalogApi(comptime Service: type) type {
         }
 
         fn createTenant(ctx: *http.Context, self: *State) !void {
-            const name = ctx.queryParam("name") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing name");
-                return;
-            };
-            const domain = ctx.queryParam("domain") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing domain");
-                return;
-            };
-            const id = self.svc.createTenant(name, domain) catch |err| {
-                try ctx.sendErrorResponse(400, 0, @errorName(err));
-                return;
-            };
+            const q = http.extractQuery(ctx, CreateTenantQ) catch |err| return http.respondErr(ctx, err);
+            const id = self.svc.createTenant(q.name, q.domain) catch |err| return http.respondErr(ctx, err);
             const resp = try std.fmt.allocPrint(ctx.allocator, "{{\"id\":{d}}}", .{id});
             defer ctx.allocator.free(resp);
             try ctx.json(201, resp);
         }
 
         fn createProduct(ctx: *http.Context, self: *State) !void {
-            const tid_s = ctx.queryParam("tenant_id") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing tenant_id");
-                return;
-            };
-            const name = ctx.queryParam("name") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing name");
-                return;
-            };
-            const price_s = ctx.queryParam("price_cents") orelse "0";
-            const tid = try std.fmt.parseInt(i64, tid_s, 10);
-            const price = try std.fmt.parseInt(i64, price_s, 10);
-            const id = self.svc.createProduct(tid, name, price) catch |err| {
-                try ctx.sendErrorResponse(400, 0, @errorName(err));
-                return;
-            };
+            const q = http.extractQuery(ctx, CreateProductQ) catch |err| return http.respondErr(ctx, err);
+            const id = self.svc.createProduct(q.tenant_id, q.name, q.price_cents) catch |err| return http.respondErr(ctx, err);
             const resp = try std.fmt.allocPrint(ctx.allocator, "{{\"id\":{d}}}", .{id});
             defer ctx.allocator.free(resp);
             try ctx.json(201, resp);
         }
 
         fn listProducts(ctx: *http.Context, self: *State) !void {
-            const tid_s = ctx.queryParam("tenant_id") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing tenant_id");
-                return;
-            };
-            const tid = try std.fmt.parseInt(i64, tid_s, 10);
-            const rows = self.svc.listProducts(tid) catch |err| {
-                try ctx.sendErrorResponse(400, 0, @errorName(err));
-                return;
-            };
+            const q = http.extractQuery(ctx, ListProductQ) catch |err| return http.respondErr(ctx, err);
+            const rows = self.svc.listProducts(q.tenant_id) catch |err| return http.respondErr(ctx, err);
             defer self.svc.freeProducts(rows);
 
             var buf = std.ArrayList(u8).empty;
@@ -87,6 +69,13 @@ pub fn CatalogApi(comptime Service: type) type {
             }
             try buf.appendSlice(ctx.allocator, "]}");
             try ctx.json(200, buf.items);
+        }
+
+        /// Demo SSE: one tick then done (requires live stream in production).
+        fn streamEvents(ctx: *http.Context, _: *State) !void {
+            var writer = try http.sse(ctx);
+            try writer.sendEvent("hello", "{\"source\":\"catalog\"}");
+            try writer.done();
         }
     };
 }

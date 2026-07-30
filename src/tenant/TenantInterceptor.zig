@@ -1,7 +1,8 @@
 const std = @import("std");
-const TenantContext = @import("TenantContext.zig");
+const tc_mod = @import("TenantContext.zig");
+const TenantContext = tc_mod.TenantContext;
 
-/// Tenant SQL interceptor — auto-injects tenant_id into ORM queries
+/// Tenant SQL interceptor — auto-injects tenant column into ORM queries.
 pub const TenantInterceptor = struct {
     allocator: std.mem.Allocator,
 
@@ -20,20 +21,17 @@ pub const TenantInterceptor = struct {
         return false;
     }
 
-    /// Check if struct has tenant_id field
+    /// True if struct has a common tenant field (`tenant_id` or `app_id`).
     pub fn hasTenantField(comptime T: type) bool {
-        const info = @typeInfo(T);
-        if (info != .@"struct") return false;
-        inline for (info.@"struct".field_names, info.@"struct".field_types, info.@"struct".field_attrs, 0..) |field_name, field_typ, field_attr, fi| {
-            _ = field_typ;
-            _ = field_attr;
-            _ = fi;
-            if (std.mem.eql(u8, field_name, TenantContext.TENANT_COLUMN)) return true;
-        }
-        return false;
+        return @hasField(T, "tenant_id") or @hasField(T, "app_id");
     }
 
-    /// Wrap SELECT query, auto-append AND tenant_id = ?
+    /// True if struct has the given tenant column field name.
+    pub fn hasTenantFieldNamed(comptime T: type, comptime col: []const u8) bool {
+        return @hasField(T, col);
+    }
+
+    /// Wrap SELECT query, auto-append AND {tenant_column} = ?
     pub fn wrapSelect(
         self: *TenantInterceptor,
         ctx: *const TenantContext,
@@ -44,20 +42,30 @@ pub const TenantInterceptor = struct {
         return try std.fmt.allocPrint(
             self.allocator,
             "{s} AND {s} = ?",
-            .{ sql, TenantContext.TENANT_COLUMN },
+            .{ sql, tc_mod.tenantColumn() },
         );
     }
 
-    /// Build tenant condition fragment for WHERE clause
+    /// Build tenant condition fragment for WHERE clause (uses active `tenantColumn()`).
     pub fn tenantWhere(ctx: *const TenantContext) ?[]const u8 {
         if (!ctx.isActive()) return null;
-        return "WHERE " ++ TenantContext.TENANT_COLUMN ++ " = ?";
+        return staticWhere(tc_mod.tenantColumn());
     }
 
-    /// Build AND tenant condition fragment
+    /// Build AND tenant condition fragment (uses active `tenantColumn()`).
     pub fn tenantAnd(ctx: *const TenantContext) ?[]const u8 {
         if (!ctx.isActive()) return null;
-        return "AND " ++ TenantContext.TENANT_COLUMN ++ " = ?";
+        return staticAnd(tc_mod.tenantColumn());
+    }
+
+    fn staticWhere(col: []const u8) []const u8 {
+        if (std.mem.eql(u8, col, "app_id")) return "WHERE app_id = ?";
+        return "WHERE tenant_id = ?";
+    }
+
+    fn staticAnd(col: []const u8) []const u8 {
+        if (std.mem.eql(u8, col, "app_id")) return "AND app_id = ?";
+        return "AND tenant_id = ?";
     }
 
     /// Get current tenant ID
@@ -66,20 +74,23 @@ pub const TenantInterceptor = struct {
     }
 };
 
-/// Tenant-aware ORM Repository helper — comptime checks
+/// Tenant-aware ORM Repository helper — comptime checks.
+/// `col` defaults to compile-time `TENANT_COLUMN` (`tenant_id`); pass `"app_id"` when needed.
 pub fn TenantRepository(comptime T: type) type {
-    return struct {
-        const Self = @This();
+    return TenantRepositoryCol(T, tc_mod.TENANT_COLUMN);
+}
 
+pub fn TenantRepositoryCol(comptime T: type, comptime col: []const u8) type {
+    return struct {
         /// Auto-append tenant condition before query
         pub fn buildTenantWhere(comptime base_where: []const u8) []const u8 {
             if (TenantInterceptor.isTenantIgnored(T)) return base_where;
-            if (!TenantInterceptor.hasTenantField(T)) return base_where;
+            if (!TenantInterceptor.hasTenantFieldNamed(T, col)) return base_where;
 
             if (base_where.len == 0) {
-                return "WHERE " ++ TenantContext.TENANT_COLUMN ++ " = ?";
+                return "WHERE " ++ col ++ " = ?";
             }
-            return base_where ++ " AND " ++ TenantContext.TENANT_COLUMN ++ " = ?";
+            return base_where ++ " AND " ++ col ++ " = ?";
         }
     };
 }
@@ -87,9 +98,12 @@ pub fn TenantRepository(comptime T: type) type {
 test "TenantInterceptor tenant field detection" {
     const T1 = struct { tenant_id: i64, name: []const u8 };
     const T2 = struct { id: i64, name: []const u8 };
+    const T3 = struct { app_id: i64, name: []const u8 };
 
     try std.testing.expect(TenantInterceptor.hasTenantField(T1));
     try std.testing.expect(!TenantInterceptor.hasTenantField(T2));
+    try std.testing.expect(TenantInterceptor.hasTenantField(T3));
+    try std.testing.expect(TenantInterceptor.hasTenantFieldNamed(T3, "app_id"));
 }
 
 test "TenantInterceptor isTenantIgnored" {
@@ -100,4 +114,23 @@ test "TenantInterceptor isTenantIgnored" {
 
     try std.testing.expect(TenantInterceptor.isTenantIgnored(Admin));
     try std.testing.expect(!TenantInterceptor.isTenantIgnored(User));
+}
+
+test "TenantInterceptor wrapSelect uses configured column" {
+    const allocator = std.testing.allocator;
+    const prev = tc_mod.tenantColumn();
+    defer tc_mod.setTenantColumn(prev);
+
+    tc_mod.setTenantColumn("app_id");
+    var ix = TenantInterceptor.init(allocator);
+    var ctx = TenantContext{ .tenant_id = 7 };
+    const wrapped = try ix.wrapSelect(&ctx, "SELECT * FROM products WHERE status = 1");
+    defer allocator.free(wrapped);
+    try std.testing.expectEqualStrings("SELECT * FROM products WHERE status = 1 AND app_id = ?", wrapped);
+}
+
+test "TenantRepositoryCol buildTenantWhere app_id" {
+    const Row = struct { app_id: i64, name: []const u8 };
+    const clause = TenantRepositoryCol(Row, "app_id").buildTenantWhere("");
+    try std.testing.expectEqualStrings("WHERE app_id = ?", clause);
 }

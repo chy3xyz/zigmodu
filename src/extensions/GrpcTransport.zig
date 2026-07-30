@@ -1,16 +1,21 @@
-//! gRPC unary transport for ZigModu.
+//! gRPC transport for ZigModu.
 //!
-//! Production surface (unary only):
+//! Unary (production):
 //! - Length-prefixed message framing (`GrpcFrame`)
 //! - In-process dispatch via `GrpcServiceRegistry.invoke`
 //! - HTTP/1.1 + `application/grpc` unary (gRPC status in headers)
-//! - Optional local registry binding for modulith same-process calls
 //!
-//! Streaming (server/client/bidi) returns `UNIMPLEMENTED` until HTTP/2 lands.
+//! Server streaming (landed):
+//! - `registerServerStreamMethod` + `GrpcStreamWriter`
+//! - HTTP/1.1 concatenated frames via `handleHttpServerStream`
+//! - HTTP/2 DATA+trailers packaging via `http.Http2.encodeGrpcServerStream`
+//!
+//! Client/bidi streaming still return `UNIMPLEMENTED` (need full duplex H2 session).
 //! Protobuf encode/decode stays in application code; this layer carries bytes.
 
 const std = @import("std");
 const HttpClient = @import("../http/HttpClient.zig").HttpClient;
+const Http2 = @import("../http/Http2.zig");
 
 /// gRPC method descriptor.
 pub const GrpcMethod = struct {
@@ -166,6 +171,47 @@ pub const GrpcFrame = struct {
 
 pub const UnaryHandler = *const fn (request: GrpcRequest) anyerror!GrpcResponse;
 
+/// Server-streaming handler: write zero or more messages, then finish.
+pub const StreamHandler = *const fn (request: GrpcRequest, writer: *GrpcStreamWriter) anyerror!void;
+
+/// Collects length-prefixed gRPC frames for server streaming.
+pub const GrpcStreamWriter = struct {
+    allocator: std.mem.Allocator,
+    body: std.ArrayList(u8) = .empty,
+    status: GrpcStatusCode = .OK,
+    message: []const u8 = "",
+    message_owned: bool = false,
+    count: usize = 0,
+
+    pub fn init(allocator: std.mem.Allocator) GrpcStreamWriter {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *GrpcStreamWriter) void {
+        self.body.deinit(self.allocator);
+        if (self.message_owned) self.allocator.free(self.message);
+        self.* = undefined;
+    }
+
+    pub fn send(self: *GrpcStreamWriter, payload: []const u8) !void {
+        const framed = try GrpcFrame.encode(self.allocator, payload);
+        defer self.allocator.free(framed);
+        try self.body.appendSlice(self.allocator, framed);
+        self.count += 1;
+    }
+
+    pub fn finish(self: *GrpcStreamWriter, status: GrpcStatusCode, message: []const u8) !void {
+        self.status = status;
+        if (self.message_owned) self.allocator.free(self.message);
+        self.message = try self.allocator.dupe(u8, message);
+        self.message_owned = true;
+    }
+
+    pub fn bytes(self: *const GrpcStreamWriter) []const u8 {
+        return self.body.items;
+    }
+};
+
 pub const GrpcServiceRegistry = struct {
     const Self = @This();
 
@@ -179,7 +225,8 @@ pub const GrpcServiceRegistry = struct {
 
     pub const RegisteredMethod = struct {
         method: GrpcMethod,
-        handler: UnaryHandler,
+        unary_handler: ?UnaryHandler = null,
+        stream_handler: ?StreamHandler = null,
     };
 
     /// Result of HTTP unary handling (caller frees `body` and `grpc_message`).
@@ -193,6 +240,24 @@ pub const GrpcServiceRegistry = struct {
         pub fn deinit(self: *HttpUnaryResult, allocator: std.mem.Allocator) void {
             allocator.free(self.body);
             allocator.free(self.grpc_message);
+            self.* = undefined;
+        }
+    };
+
+    /// Server-stream HTTP result (concatenated frames + status for trailers/headers).
+    pub const HttpStreamResult = struct {
+        http_status: u16,
+        body: []u8,
+        grpc_status: GrpcStatusCode,
+        grpc_message: []u8,
+        message_count: usize,
+        /// Optional HTTP/2 wire bytes (HEADERS+DATA+trailers). Caller frees if non-null.
+        http2_wire: ?[]u8 = null,
+
+        pub fn deinit(self: *HttpStreamResult, allocator: std.mem.Allocator) void {
+            allocator.free(self.body);
+            allocator.free(self.grpc_message);
+            if (self.http2_wire) |w| allocator.free(w);
             self.* = undefined;
         }
     };
@@ -236,6 +301,28 @@ pub const GrpcServiceRegistry = struct {
         method_type: GrpcMethod.MethodType,
         handler: UnaryHandler,
     ) !void {
+        if (method_type != .unary) return error.UseRegisterServerStreamMethod;
+        try self.putMethod(service_name, method_name, .unary, handler, null);
+    }
+
+    /// Register a server-streaming RPC (`StreamHandler` writes multiple messages).
+    pub fn registerServerStreamMethod(
+        self: *Self,
+        service_name: []const u8,
+        method_name: []const u8,
+        handler: StreamHandler,
+    ) !void {
+        try self.putMethod(service_name, method_name, .server_streaming, null, handler);
+    }
+
+    fn putMethod(
+        self: *Self,
+        service_name: []const u8,
+        method_name: []const u8,
+        method_type: GrpcMethod.MethodType,
+        unary_handler: ?UnaryHandler,
+        stream_handler: ?StreamHandler,
+    ) !void {
         const svc = self.services.getPtr(service_name) orelse return error.ServiceNotFound;
         const path = try std.fmt.allocPrint(self.allocator, "/{s}/{s}", .{ service_name, method_name });
         errdefer self.allocator.free(path);
@@ -251,18 +338,22 @@ pub const GrpcServiceRegistry = struct {
                 .method = meth_copy,
                 .method_type = method_type,
             },
-            .handler = handler,
+            .unary_handler = unary_handler,
+            .stream_handler = stream_handler,
         });
     }
 
-    pub fn findHandler(self: *Self, path: []const u8) ?struct { method: GrpcMethod, handler: UnaryHandler } {
+    pub fn findMethod(self: *Self, path: []const u8) ?RegisteredMethod {
         var svc_iter = self.services.iterator();
         while (svc_iter.next()) |svc_entry| {
-            if (svc_entry.value_ptr.methods.get(path)) |reg| {
-                return .{ .method = reg.method, .handler = reg.handler };
-            }
+            if (svc_entry.value_ptr.methods.get(path)) |reg| return reg;
         }
         return null;
+    }
+
+    pub fn findHandler(self: *Self, path: []const u8) ?struct { method: GrpcMethod, handler: UnaryHandler } {
+        const reg = self.findMethod(path) orelse return null;
+        return .{ .method = reg.method, .handler = reg.unary_handler orelse return null };
     }
 
     pub fn listMethods(self: *Self) ![]const GrpcMethod {
@@ -277,9 +368,9 @@ pub const GrpcServiceRegistry = struct {
         return result.toOwnedSlice(self.allocator);
     }
 
-    /// In-process unary invoke (no framing). Streaming methods → UNIMPLEMENTED.
+    /// In-process unary invoke (no framing). Streaming without stream handler → UNIMPLEMENTED.
     pub fn invoke(self: *Self, path: []const u8, payload: []const u8) !OwnedGrpcResponse {
-        const found = self.findHandler(path) orelse {
+        const found = self.findMethod(path) orelse {
             return OwnedGrpcResponse{
                 .payload = try self.allocator.dupe(u8, ""),
                 .status = .NOT_FOUND,
@@ -287,11 +378,11 @@ pub const GrpcServiceRegistry = struct {
                 .allocator = self.allocator,
             };
         };
-        if (found.method.method_type != .unary) {
+        if (found.method.method_type != .unary or found.unary_handler == null) {
             return OwnedGrpcResponse{
                 .payload = try self.allocator.dupe(u8, ""),
                 .status = .UNIMPLEMENTED,
-                .message = try self.allocator.dupe(u8, "only unary methods are supported"),
+                .message = try self.allocator.dupe(u8, "use invokeServerStream for streaming methods"),
                 .allocator = self.allocator,
             };
         }
@@ -304,7 +395,7 @@ pub const GrpcServiceRegistry = struct {
             .metadata = metadata,
             .timeout_ms = 30_000,
         };
-        const resp = found.handler(req) catch |err| {
+        const resp = found.unary_handler.?(req) catch |err| {
             return OwnedGrpcResponse{
                 .payload = try self.allocator.dupe(u8, ""),
                 .status = .INTERNAL,
@@ -318,6 +409,33 @@ pub const GrpcServiceRegistry = struct {
             .message = try self.allocator.dupe(u8, resp.message),
             .allocator = self.allocator,
         };
+    }
+
+    /// Drive a server-streaming handler into `writer`.
+    pub fn invokeServerStream(self: *Self, path: []const u8, payload: []const u8, writer: *GrpcStreamWriter) !void {
+        const found = self.findMethod(path) orelse {
+            try writer.finish(.NOT_FOUND, "method not found");
+            return;
+        };
+        if (found.method.method_type != .server_streaming or found.stream_handler == null) {
+            try writer.finish(.UNIMPLEMENTED, "server streaming handler not registered");
+            return;
+        }
+        var metadata = std.StringHashMap([]const u8).init(self.allocator);
+        defer metadata.deinit();
+        const req = GrpcRequest{
+            .method = found.method,
+            .payload = payload,
+            .metadata = metadata,
+            .timeout_ms = 30_000,
+        };
+        found.stream_handler.?(req, writer) catch |err| {
+            try writer.finish(.INTERNAL, @errorName(err));
+            return;
+        };
+        if (!writer.message_owned) {
+            try writer.finish(writer.status, writer.message);
+        }
     }
 
     /// Handle an HTTP/1.1 unary gRPC request body (framed) for `path`.
@@ -341,6 +459,41 @@ pub const GrpcServiceRegistry = struct {
             .body = framed,
             .grpc_status = grpc_status,
             .grpc_message = owned.message,
+        };
+    }
+
+    /// Server-streaming over HTTP: returns concatenated gRPC frames + optional H2 packaging.
+    pub fn handleHttpServerStream(self: *Self, path: []const u8, body: []const u8, stream_id: u31) !HttpStreamResult {
+        const payload = GrpcFrame.decode(body) catch {
+            return .{
+                .http_status = 400,
+                .body = try GrpcFrame.encode(self.allocator, ""),
+                .grpc_status = .INVALID_ARGUMENT,
+                .grpc_message = try self.allocator.dupe(u8, "invalid grpc frame"),
+                .message_count = 0,
+            };
+        };
+        var writer = GrpcStreamWriter.init(self.allocator);
+        errdefer writer.deinit();
+        try self.invokeServerStream(path, payload, &writer);
+
+        const status = writer.status;
+        const http_status: u16 = if (status == .OK) 200 else status.toHttpCode();
+        const msg_copy = try self.allocator.dupe(u8, writer.message);
+        const body_owned = try self.allocator.dupe(u8, writer.bytes());
+        const count = writer.count;
+        const status_str = try std.fmt.allocPrint(self.allocator, "{d}", .{@intFromEnum(status)});
+        defer self.allocator.free(status_str);
+        const h2 = try Http2.encodeGrpcServerStream(self.allocator, stream_id, body_owned, status_str, writer.message);
+        writer.deinit();
+
+        return .{
+            .http_status = http_status,
+            .body = body_owned,
+            .grpc_status = status,
+            .grpc_message = msg_copy,
+            .message_count = count,
+            .http2_wire = h2,
         };
     }
 };
@@ -381,16 +534,23 @@ pub const ProtoParser = struct {
                 const method_name = after_rpc[0..paren];
                 const input_start = paren + 1;
                 const input_end = std.mem.indexOfScalar(u8, after_rpc[input_start..], ')') orelse continue;
-                const input_type = after_rpc[input_start .. input_start + input_end];
+                const input_type_raw = after_rpc[input_start .. input_start + input_end];
                 const returns_pos = std.mem.indexOf(u8, after_rpc, "returns") orelse continue;
                 const output_paren = std.mem.indexOfScalar(u8, after_rpc[returns_pos..], '(') orelse continue;
                 const output_start = returns_pos + output_paren + 1;
                 const output_end = std.mem.indexOfScalar(u8, after_rpc[output_start..], ')') orelse continue;
-                const output_type = after_rpc[output_start .. output_start + output_end];
+                const output_type_raw = after_rpc[output_start .. output_start + output_end];
+                const in_trim = std.mem.trim(u8, input_type_raw, " \t");
+                const out_trim = std.mem.trim(u8, output_type_raw, " \t");
+                const in_stream = std.mem.startsWith(u8, in_trim, "stream ");
+                const out_stream = std.mem.startsWith(u8, out_trim, "stream ");
+                const input_type = if (in_stream) std.mem.trim(u8, in_trim["stream ".len..], " \t") else in_trim;
+                const output_type = if (out_stream) std.mem.trim(u8, out_trim["stream ".len..], " \t") else out_trim;
                 try current_methods.append(allocator, .{
                     .name = try allocator.dupe(u8, method_name),
                     .input_type = try allocator.dupe(u8, input_type),
                     .output_type = try allocator.dupe(u8, output_type),
+                    .is_streaming = in_stream or out_stream,
                 });
             }
         }
@@ -676,4 +836,61 @@ test "GrpcClient endpoint without io returns IoRequired" {
     defer client.deinit();
     try client.registerEndpoint("order.OrderService", "127.0.0.1", 50051);
     try std.testing.expectError(error.IoRequired, client.call("order.OrderService", "CreateOrder", ""));
+}
+
+test "server streaming invoke and HTTP/2 packaging" {
+    const allocator = std.testing.allocator;
+    var registry = GrpcServiceRegistry.init(allocator);
+    defer registry.deinit();
+    try registry.registerService("tick.Ticker");
+    try registry.registerServerStreamMethod("tick.Ticker", "Watch", struct {
+        fn handler(_: GrpcRequest, writer: *GrpcStreamWriter) !void {
+            try writer.send("one");
+            try writer.send("two");
+            try writer.finish(.OK, "");
+        }
+    }.handler);
+
+    var writer = GrpcStreamWriter.init(allocator);
+    defer writer.deinit();
+    try registry.invokeServerStream("/tick.Ticker/Watch", "", &writer);
+    try std.testing.expectEqual(@as(usize, 2), writer.count);
+    try std.testing.expectEqual(GrpcStatusCode.OK, writer.status);
+
+    const framed_in = try GrpcFrame.encode(allocator, "");
+    defer allocator.free(framed_in);
+    var result = try registry.handleHttpServerStream("/tick.Ticker/Watch", framed_in, 1);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), result.message_count);
+    try std.testing.expect(result.http2_wire != null);
+    try std.testing.expect(result.http2_wire.?.len > 0);
+
+    // unary invoke on stream method → UNIMPLEMENTED
+    var bad = try registry.invoke("/tick.Ticker/Watch", "");
+    defer bad.deinit();
+    try std.testing.expectEqual(GrpcStatusCode.UNIMPLEMENTED, bad.status);
+}
+
+test "ProtoParser detects stream keyword" {
+    const allocator = std.testing.allocator;
+    const proto =
+        \\service Chat {
+        \\  rpc Listen(ListenReq) returns (stream Event);
+        \\}
+    ;
+    const services = try ProtoParser.parse(allocator, proto);
+    defer {
+        for (services) |svc| {
+            allocator.free(svc.name);
+            for (svc.methods) |m| {
+                allocator.free(m.name);
+                allocator.free(m.input_type);
+                allocator.free(m.output_type);
+            }
+            allocator.free(svc.methods);
+        }
+        allocator.free(services);
+    }
+    try std.testing.expect(services[0].methods[0].is_streaming);
+    try std.testing.expectEqualStrings("Event", services[0].methods[0].output_type);
 }

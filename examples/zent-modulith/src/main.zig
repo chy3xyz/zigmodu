@@ -48,6 +48,14 @@ pub fn main(init: std.process.Init) !void {
     var server = zigmodu.http.Server.init(io, allocator, port);
     defer server.deinit();
 
+    var profile_state = zigmodu.http.HttpProfileState.init(allocator);
+    defer profile_state.deinit(allocator);
+    try zigmodu.http.applyHttpDefaults(&server, .{
+        .security_basics = true,
+        .access_log = false, // quieter for local demo
+        .metrics = false,
+    }, &profile_state);
+
     var catalog_slot: zigmodu.http.CatalogSlot = .{};
     defer catalog_slot.deinit();
     try server.addMiddleware(zigmodu.http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
@@ -90,6 +98,7 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("[main] listening http://127.0.0.1:{d}", .{port});
     std.log.info("[main] POST /api/v1/tenants?name=&domain=", .{});
     std.log.info("[main] POST /api/v1/products?tenant_id=&name=&price_cents=", .{});
+    std.log.info("[main] GET  /api/v1/events (SSE)", .{});
     std.log.info("[main] OpenAPI: http://127.0.0.1:{d}/openapi.json", .{port});
     try server.start();
 }

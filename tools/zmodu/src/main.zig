@@ -44,6 +44,8 @@ const GenOptions = struct {
     with_transactions: bool = false,
     with_redis: bool = false,
     with_websocket: bool = false,
+    /// SQL/model tenant column (`tenant_id` default, e.g. `app_id`).
+    tenant_column: []const u8 = "tenant_id",
 };
 
 const OrmCli = struct {
@@ -71,7 +73,8 @@ fn isOrmLongOption(token: []const u8) bool {
         std.mem.eql(u8, token, "--split") or
         std.mem.eql(u8, token, "--json-style") or
         std.mem.eql(u8, token, "--enable-events") or
-        std.mem.eql(u8, token, "--with-transactions");
+        std.mem.eql(u8, token, "--with-transactions") or
+        std.mem.eql(u8, token, "--tenant-column");
 }
 
 fn parseOrmCli(args: []const []const u8) ParseOrmCliResult {
@@ -126,6 +129,13 @@ fn parseOrmCli(args: []const []const u8) ParseOrmCliResult {
             opts.enable_events = true;
         } else if (std.mem.eql(u8, args[i], "--with-transactions")) {
             opts.with_transactions = true;
+        } else if (std.mem.eql(u8, args[i], "--tenant-column")) {
+            if (i + 1 >= args.len) return .{ .err_missing_value = "--tenant-column" };
+            const val = args[i + 1];
+            if (isOrmLongOption(val)) return .{ .err_missing_value = "--tenant-column" };
+            if (!isSafeTenantColumnIdent(val)) return .{ .err_unknown_flag = val };
+            opts.tenant_column = val;
+            i += 1;
         } else {
             return .{ .err_unknown_flag = args[i] };
         }
@@ -138,6 +148,16 @@ fn parseOrmCli(args: []const []const u8) ParseOrmCliResult {
         .backend = backend,
         .opts = opts,
     } };
+}
+
+fn isSafeTenantColumnIdent(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64) return false;
+    const c0 = name[0];
+    if (!((c0 >= 'A' and c0 <= 'Z') or (c0 >= 'a' and c0 <= 'z') or c0 == '_')) return false;
+    for (name[1..]) |c| {
+        if (!((c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '_')) return false;
+    }
+    return true;
 }
 
 fn trimTrailingNewlines(s: []const u8) []const u8 {
@@ -384,6 +404,8 @@ fn printUsage() void {
         \\  zmodu scaffold --from-db postgresql://user@host/db --name myapp
         \\  zmodu scaffold --from-db /path/to/db.sqlite --name myapp
         \\  zmodu scaffold --sql schema.sql --from-db sqlite:///db --name myapp
+        \\  zmodu scaffold --sql schema.sql --name myapp --tenant-column app_id
+        \\  zmodu orm --sql schema.sql --out src/modules --tenant-column app_id
         \\  zmodu migration add-users-table
         \\  zmodu migration add-index --dir src/migrations
         \\  zmodu health --out src/modules/app
@@ -1318,8 +1340,9 @@ fn generateAgentsMd(allocator: std.mem.Allocator, project_name: []const u8) ![]c
         \\```
         \\
         \\### Multi-Tenant Isolation
-        \\- Tables with `tenant_id` column auto-generate `listByTenant()` and `getByTenant()`
-        \\- Always filter by tenant_id in cross-tenant queries
+        \\- Tables with the tenant column (default `tenant_id`, or `--tenant-column app_id`) auto-generate `listByTenant()` / `getByTenant()`
+        \\- Always filter by that column in cross-tenant queries
+        \\- At runtime: `zigmodu.setTenantColumn("app_id")` so TenantInterceptor matches
         \\```zig
         \\const results = try svc.listUsers(page, size, tenant_id);
         \\const user = try svc.getUsersByTenant(id, tenant_id);
@@ -2822,7 +2845,7 @@ fn generateModulePersistence(allocator: std.mem.Allocator, module_name: []const 
     return buf.toOwnedSlice(allocator);
 }
 
-fn generateModuleService(allocator: std.mem.Allocator, module_name: []const u8, tables: []const TableDef, strip_prefix_len: usize, enable_events: bool, with_transactions: bool) ![]const u8 {
+fn generateModuleService(allocator: std.mem.Allocator, module_name: []const u8, tables: []const TableDef, strip_prefix_len: usize, enable_events: bool, with_transactions: bool, tenant_column: []const u8) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
@@ -2857,19 +2880,19 @@ fn generateModuleService(allocator: std.mem.Allocator, module_name: []const u8, 
         try buf.appendSlice(allocator, "        return try repo.findById(id);\n");
         try buf.appendSlice(allocator, "    }\n\n");
 
-        // Tenant-aware variants if table has tenant_id
+        // Tenant-aware variants if table has the configured tenant column
         const has_tenant = for (table.columns) |col| {
-            if (std.mem.eql(u8, col.name, "tenant_id")) break true;
+            if (std.mem.eql(u8, col.name, tenant_column)) break true;
         } else false;
         if (has_tenant) {
             try buf.print(allocator, "    pub fn {s}(self: *{s}Service, page: usize, size: usize, tenant_id: i64) !data.orm.PageResult(model.{s}) {{\n", .{ list_method, pascal_module, model_name });
             try buf.print(allocator, "        var repo = self.persistence.{s}Repo();\n", .{method_name});
-            try buf.print(allocator, "        return try repo.findPageFiltered(self.persistence.backend.allocator, \"WHERE tenant_id = ?\", &.{{zigmodu.data.sqlx.Value.int(tenant_id)}}, page, size);\n", .{});
+            try buf.print(allocator, "        return try repo.findPageFiltered(self.persistence.backend.allocator, \"WHERE {s} = ?\", &.{{zigmodu.data.sqlx.Value.int(tenant_id)}}, page, size);\n", .{tenant_column});
             try buf.appendSlice(allocator, "    }\n\n");
             try buf.print(allocator, "    pub fn get{s}ByTenant(self: *{s}Service, id: {s}, tenant_id: i64) !?model.{s} {{\n", .{ model_name, pascal_module, pk_type, model_name });
             try buf.print(allocator, "        var repo = self.persistence.{s}Repo();\n", .{method_name});
             try buf.appendSlice(allocator, "        const entity = try repo.findById(id);\n");
-            try buf.appendSlice(allocator, "        return if (entity != null and entity.?.tenant_id != null and entity.?.tenant_id.? == tenant_id) entity else null;\n");
+            try buf.print(allocator, "        return if (entity != null and entity.?.{s} != null and entity.?.{s}.? == tenant_id) entity else null;\n", .{ tenant_column, tenant_column });
             try buf.appendSlice(allocator, "    }\n\n");
         }
 
@@ -3163,7 +3186,7 @@ fn writeModuleFiles(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u
     try safeWrite(io, allocator, persistence_path, persistence_code, opts);
 
     if (!opts.data_only) {
-        const service_code = try generateModuleService(allocator, module_name, tables, strip_prefix_len, opts.enable_events, opts.with_transactions);
+        const service_code = try generateModuleService(allocator, module_name, tables, strip_prefix_len, opts.enable_events, opts.with_transactions, opts.tenant_column);
         defer allocator.free(service_code);
         const service_path = try std.fmt.allocPrint(allocator, "{s}/service.zig", .{module_dir});
         defer allocator.free(service_path);
@@ -3930,6 +3953,8 @@ const ScaffoldOpts = struct {
     with_aichat: bool = false,
     with_agent: bool = false,
     with_web4: bool = false,
+    /// SQL/model tenant column (`tenant_id` default, e.g. `app_id`).
+    tenant_column: []const u8 = "tenant_id",
 };
 
 fn parseScaffoldArgs(allocator: std.mem.Allocator, args: []const []const u8) !ScaffoldOpts {
@@ -3954,6 +3979,7 @@ fn parseScaffoldArgs(allocator: std.mem.Allocator, args: []const []const u8) !Sc
     var with_aichat: bool = false;
     var with_agent: bool = false;
     var with_web4: bool = false;
+    var tenant_column: []const u8 = "tenant_id";
 
     var db_dsn: ?[]const u8 = null;
 
@@ -4007,6 +4033,15 @@ fn parseScaffoldArgs(allocator: std.mem.Allocator, args: []const []const u8) !Sc
             with_agent = true;
         } else if (std.mem.eql(u8, args[i], "--with-web4")) {
             with_web4 = true;
+        } else if (std.mem.eql(u8, args[i], "--tenant-column")) {
+            if (i + 1 >= args.len) return error.CliUsage;
+            const val = args[i + 1];
+            if (!isSafeTenantColumnIdent(val)) {
+                std.log.err("--tenant-column must be a SQL identifier, got '{s}'", .{val});
+                return error.CliUsage;
+            }
+            tenant_column = val;
+            i += 1;
         } else if (std.mem.eql(u8, args[i], "--json-style")) {
             if (i + 1 >= args.len) return error.CliUsage;
             if (std.mem.eql(u8, args[i + 1], "camel")) json_style = .camel;
@@ -4046,6 +4081,7 @@ fn parseScaffoldArgs(allocator: std.mem.Allocator, args: []const []const u8) !Sc
         .with_aichat = with_aichat,
         .with_agent = with_agent,
         .with_web4 = with_web4,
+        .tenant_column = tenant_column,
     };
 }
 
@@ -4198,7 +4234,7 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
     // 4. Generate modules under src/modules/
     const modules_dir = try std.fmt.allocPrint(allocator, "{s}/src/modules", .{project_dir});
     defer allocator.free(modules_dir);
-    const gen_opts: GenOptions = .{ .dry_run = sopts.dry_run, .force = sopts.force, .json_style = sopts.json_style, .enable_events = sopts.with_events, .with_transactions = sopts.with_transactions };
+    const gen_opts: GenOptions = .{ .dry_run = sopts.dry_run, .force = sopts.force, .json_style = sopts.json_style, .enable_events = sopts.with_events, .with_transactions = sopts.with_transactions, .tenant_column = sopts.tenant_column };
 
     const scaffold_prefix_len = commonTablePrefix(tables);
 
@@ -7102,6 +7138,7 @@ fn cmdAdd(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
     var force: bool = false;
     var dry_run: bool = false;
     var json_style: JsonStyle = .snake;
+    var tenant_column: []const u8 = "tenant_id";
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -7112,6 +7149,15 @@ fn cmdAdd(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
             force = true;
         } else if (std.mem.eql(u8, args[i], "--dry-run")) {
             dry_run = true;
+        } else if (std.mem.eql(u8, args[i], "--tenant-column")) {
+            if (i + 1 >= args.len) return error.CliUsage;
+            const val = args[i + 1];
+            if (!isSafeTenantColumnIdent(val)) {
+                std.log.err("--tenant-column must be a SQL identifier, got '{s}'", .{val});
+                return error.CliUsage;
+            }
+            tenant_column = val;
+            i += 1;
         } else if (std.mem.eql(u8, args[i], "--json-style")) {
             if (i + 1 >= args.len) return error.CliUsage;
             if (std.mem.eql(u8, args[i + 1], "camel")) json_style = .camel;
@@ -7125,7 +7171,7 @@ fn cmdAdd(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
         std.log.err("zmodu add requires --sql <file>", .{});
         return error.CliUsage;
     }
-    const gen_opts: GenOptions = .{ .dry_run = dry_run, .force = force, .json_style = json_style };
+    const gen_opts: GenOptions = .{ .dry_run = dry_run, .force = force, .json_style = json_style, .tenant_column = tenant_column };
 
     // 1. Read and parse SQL
     const sql_content = std.Io.Dir.cwd().readFileAlloc(io, sql_path.?, allocator, std.Io.Limit.limited(100 * 1024 * 1024)) catch |err| {
@@ -7455,6 +7501,10 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
         \\    var db_client = try zigmodu.data.sqlx.Client.open(allocator, init.io, db_cfg);
         \\    defer db_client.deinit();
         \\    std.log.info("DB connected: {s}@{s}:{s}/{s}", .{ db_user, db_host, db_port, db_name });
+        \\
+    );
+    try buf.print(allocator, "    zigmodu.setTenantColumn(\"{s}\");\n", .{sopts.tenant_column});
+    try buf.appendSlice(allocator,
         \\
         \\    const backend = zigmodu.data.SqlxBackend{ .allocator = allocator, .client = &db_client };
         \\
@@ -8009,6 +8059,13 @@ test "generateZentSchema: TimeMixin when created_at present" {
     const table = TableDef{ .name = try a.dupe(u8, "log"), .columns = cols[0..], .foreign_keys = &.{} };
     const code = try generateZentSchema(a, "audit", &.{table});
     try std.testing.expect(std.mem.indexOf(u8, code, "TimeMixin") != null);
+}
+
+test "parseOrmCli: tenant-column app_id" {
+    const a = [_][]const u8{ "--sql", "s.sql", "--tenant-column", "app_id" };
+    const r = parseOrmCli(&a);
+    try std.testing.expect(r == .ok);
+    try std.testing.expectEqualStrings("app_id", r.ok.opts.tenant_column);
 }
 
 test "parseOrmCli: dry-run and force" {

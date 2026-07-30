@@ -14,12 +14,14 @@ zig build docs
 
 ## Architecture (5 domain files)
 ```
-src/http.zig          → zmodu.http.{Server, Context, RouteGroup, Middleware}
+src/http.zig          → zmodu.http.{Server, Context, RouteGroup, Middleware, sse, extract*, Testkit, applyHttpDefaults}
 src/data.zig          → zmodu.data.{Client, sqlx, orm, Repository, redis}
 src/security.zig      → zmodu.security.{SecurityModule, PasswordEncoder, SecretsManager}
 src/observability.zig → zmodu.observability.{PrometheusMetrics, DistributedTracer}
-src/root.zig          → Application, EventBus, deprecated flat aliases (v0.14.0 remove)
+src/root.zig          → Application, EventBus, outbox, deprecated flat aliases (v0.14.0 remove)
 ```
+
+HTTP ergonomics (see `docs/FRAMEWORK_BACKLOG.md`): extractors, ProblemDetails, scope MW, Testkit, profiles, SSE (`http.sse` / `sse_routes`), lifecycle helpers.
 
 ## Monolith maintenance (do NOT split without cause)
 - `src/sqlx/sqlx.zig`, `src/api/Server.zig` — § sections + rules in `docs/PRODUCTION_ROADMAP.md`
@@ -37,6 +39,7 @@ src/root.zig          → Application, EventBus, deprecated flat aliases (v0.14.
 - HTTP: `const http = zmodu.http` — `ctx.json(status, body)` NOT `sendSuccess/sendFail`
 - DB: `data.Client` via `zmodu.data` — parameterized `?` placeholders only
 - Router: `*` wildcard, `{id}` path params; route paths without leading `/` in `addRoute`
+- Tenant column: default `tenant_id`; for `app_id` use `zigmodu.setTenantColumn("app_id")` + `zmodu --tenant-column app_id` (see `docs/ARCHITECTURE.md`)
 - Logging: `std.log.err/warn/info` with `{s}/{d}` format, never emoji
 - Deprecated root aliases: `zigmodu.http_server` → `zigmodu.http` (removed v0.14.0)
 
