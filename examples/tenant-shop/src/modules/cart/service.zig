@@ -22,7 +22,7 @@ pub fn CartService(comptime Persistence: type) type {
             return .{ .id = id, .tenant_id = tenant_id, .user_id = user_id, .updated_at = now };
         }
 
-        pub fn listItems(self: *Self, tenant_id: i64, user_id: i64) ![]model.CartItem {
+        pub fn listItems(self: *Self, tenant_id: i64, user_id: i64) !zigmodu.data.sqlx.QueryResult(model.CartItem) {
             const cart = try self.getOrCreate(tenant_id, user_id);
             return try self.persistence.listItems(tenant_id, cart.id);
         }

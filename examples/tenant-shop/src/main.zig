@@ -137,21 +137,61 @@ pub fn main(init: std.process.Init) !void {
 
     const jwt_secret = init.environ_map.get("JWT_SECRET") orelse "dev-secret";
     var app_sec = zigmodu.security.AppSecurity.init(allocator, io, .{ .jwt_secret = jwt_secret });
+    var catalog_slot: zigmodu.http.CatalogSlot = .{};
+    defer catalog_slot.deinit();
+
     try server.addMiddleware(middleware.tenantMiddleware());
-    try server.addMiddleware(middleware.jwtAuthMiddleware(&app_sec.module));
+    try server.addMiddleware(middleware.jwtAuthMiddleware(&app_sec.module, &catalog_slot));
+    try server.addMiddleware(middleware.moduleGateMiddleware(&catalog_slot));
     try server.addMiddleware(middleware.dataPermissionMiddleware());
 
-    var v1 = server.group("/api/v1");
-    try tenant_api.registerRoutes(&v1);
-    try user_api.registerRoutes(&v1);
-    try product_api.registerRoutes(&v1);
-    try inventory_api.registerRoutes(&v1);
-    try cart_api.registerRoutes(&v1);
-    try order_api.registerRoutes(&v1);
-    try payment_api.registerRoutes(&v1);
-    try shop_bff_api.registerRoutes(&v1);
-    try outbox_http.registerRoutes(&v1);
-    try admin_bff_api.registerRoutes(&v1);
+    // ComptimeRouter — all modules via mountAll (smoke-friendly: default_auth = .public)
+    const AppState = struct {};
+    var app_state: AppState = .{};
+    const TenantApiT = @TypeOf(tenant_api);
+    const UserApiT = @TypeOf(user_api);
+    const ProductApiT = @TypeOf(product_api);
+    const InventoryApiT = @TypeOf(inventory_api);
+    const CartApiT = @TypeOf(cart_api);
+    const OrderApiT = @TypeOf(order_api);
+    const PaymentApiT = @TypeOf(payment_api);
+    const ShopBffApiT = @TypeOf(shop_bff_api);
+    const OutboxApiT = @TypeOf(outbox_http);
+    const AdminBffApiT = @TypeOf(admin_bff_api);
+    comptime zigmodu.http.assertNoDupes(.{
+        TenantApiT,   UserApiT,     ProductApiT, InventoryApiT, CartApiT,
+        OrderApiT,    PaymentApiT,  ShopBffApiT, OutboxApiT,    AdminBffApiT,
+    });
+
+    var router = zigmodu.http.Router(AppState).init(io, allocator, &server, &app_state);
+    defer router.deinit();
+    router.default_auth = .public;
+
+    var api_v1 = router.scope("/api/v1");
+    try api_v1.mountAll(.{
+        .{ .Mod = TenantApiT, .state = &tenant_api },
+        .{ .Mod = UserApiT, .state = &user_api },
+        .{ .Mod = ProductApiT, .state = &product_api },
+        .{ .Mod = InventoryApiT, .state = &inventory_api },
+        .{ .Mod = CartApiT, .state = &cart_api },
+        .{ .Mod = OrderApiT, .state = &order_api },
+        .{ .Mod = PaymentApiT, .state = &payment_api },
+        .{ .Mod = ShopBffApiT, .state = &shop_bff_api },
+        .{ .Mod = OutboxApiT, .state = &outbox_http },
+        .{ .Mod = AdminBffApiT, .state = &admin_bff_api },
+    });
+    catalog_slot.set(try router.finish());
+    std.log.info("[main] route catalog: {d} entries", .{catalog_slot.get().?.entries.len});
+
+    try server.addRoute(.{
+        .method = .GET,
+        .path = "openapi.json",
+        .handler = zigmodu.http.openApiFromCatalog(&catalog_slot, .{
+            .title = "tenant-shop",
+            .version = "0.1.0",
+            .description = "ComptimeRouter catalog (live)",
+        }),
+    });
 
     try server.addRoute(.{
         .method = .GET,

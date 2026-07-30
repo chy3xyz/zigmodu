@@ -1,4 +1,5 @@
 const std = @import("std");
+const zigmodu = @import("zigmodu");
 const model = @import("model.zig");
 
 pub fn SubscriptionPersistence(comptime Backend: type) type {
@@ -42,7 +43,7 @@ pub fn SubscriptionPersistence(comptime Backend: type) type {
             );
         }
 
-        pub fn findAllPlans(self: *Self) ![]model.Plan {
+        pub fn findAllPlans(self: *Self) !zigmodu.data.sqlx.QueryResult(model.Plan) {
             return try self.db.queryRowsPartial(model.Plan,
                 "SELECT id, name, max_users, max_storage, price, created_at FROM plans ORDER BY id",
                 &.{},

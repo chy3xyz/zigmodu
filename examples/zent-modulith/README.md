@@ -1,8 +1,8 @@
 # zent-modulith — ZigModu + zent
 
-Demonstrates **ZigModu** (Application / HTTP / modules) with **[zent](https://github.com/chy3xyz/zent)** v0.12+ as the schema-as-code data layer.
+Demonstrates **ZigModu** (Application / HTTP / **ComptimeRouter**) with **[zent](https://github.com/chy3xyz/zent)** v0.12+ as the schema-as-code data layer.
 
-See framework guide: [`docs/ZENT.md`](../../docs/ZENT.md)（选型、分层、Privacy/Hooks、反模式、检查清单）.
+See framework guides: [`docs/ZENT.md`](../../docs/ZENT.md) · [`docs/ROUTE_TABLE.md`](../../docs/ROUTE_TABLE.md).
 
 
 ## Prerequisites
@@ -30,6 +30,7 @@ HTTP_PORT=18100 zig build run
 
 ```bash
 curl -s http://127.0.0.1:18100/health/live
+curl -s http://127.0.0.1:18100/openapi.json | head
 curl -s -X POST 'http://127.0.0.1:18100/api/v1/tenants?name=Acme&domain=acme.test'
 curl -s -X POST 'http://127.0.0.1:18100/api/v1/products?tenant_id=1&name=Widget&price_cents=1999'
 curl -s 'http://127.0.0.1:18100/api/v1/products?tenant_id=1'
@@ -39,12 +40,12 @@ curl -s 'http://127.0.0.1:18100/api/v1/products?tenant_id=1'
 
 ```
 src/
-  main.zig                 # ZigModu HTTP + zent migrate/client
+  main.zig                 # ZigModu ComptimeRouter + zent migrate/client
   modules/catalog/
     model.zig              # zent Schema("Tenant"|"Product")
     persistence.zig        # zent Client wrappers
     service.zig            # validation / Cmd
-    api.zig                # HTTP
+    api.zig                # pub const routes (ComptimeRouter)
     module.zig             # ZigModu module contract
 ```
 

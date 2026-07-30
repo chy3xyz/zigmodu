@@ -119,6 +119,7 @@ pub const OpenApiGenerator = struct {
 
     pub fn deinit(self: *Self) void {
         for (self.endpoints.items) |ep| {
+            self.allocator.free(ep.path);
             self.allocator.free(ep.summary);
             self.allocator.free(ep.description);
             for (ep.tags) |t| self.allocator.free(t);
@@ -321,6 +322,8 @@ pub const OpenApiGenerator = struct {
     }
 
     fn cloneEndpoint(self: *Self, ep: ApiEndpoint) !ApiEndpoint {
+        const path_copy = try self.allocator.dupe(u8, ep.path);
+        errdefer self.allocator.free(path_copy);
         const summary_copy = try self.allocator.dupe(u8, ep.summary);
         errdefer self.allocator.free(summary_copy);
         const desc_copy = try self.allocator.dupe(u8, ep.description);
@@ -353,7 +356,7 @@ pub const OpenApiGenerator = struct {
 
         return .{
             .method = ep.method,
-            .path = ep.path,
+            .path = path_copy,
             .summary = summary_copy,
             .description = desc_copy,
             .tags = tags_copy,

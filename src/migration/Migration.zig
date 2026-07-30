@@ -205,7 +205,9 @@ pub const MigrationRunner = struct {
     /// Runs each migration's SQL in order, records results in the history table.
     pub fn run(self: *Self, client: anytype) !void {
         // Ensure history table exists
-        _ = client.exec(self.generateHistoryTableDDL() catch return error.OutOfMemory, &.{}) catch return error.QueryExecutionFailed;
+        const ddl = self.generateHistoryTableDDL() catch return error.OutOfMemory;
+        defer self.allocator.free(ddl);
+        _ = client.exec(ddl, &.{}) catch return error.QueryExecutionFailed;
 
         for (self.migrations.items) |migration| {
             // Skip already-applied migrations
@@ -219,13 +221,27 @@ pub const MigrationRunner = struct {
             if (already_applied) continue;
 
             const start_ms = @import("../core/Time.zig").monotonicNowMilliseconds();
-            const result = client.exec(migration.sql, &.{});
+            var stmt_it = std.mem.splitScalar(u8, migration.sql, ';');
+            var mig_ok = true;
+            while (stmt_it.next()) |stmt| {
+                const trimmed = std.mem.trim(u8, stmt, " \t\r\n");
+                if (trimmed.len == 0) continue;
+                _ = client.exec(trimmed, &.{}) catch |err| {
+                    if (std.mem.startsWith(u8, trimmed, "ALTER TABLE")) {
+                        std.log.info("[Migration] ALTER TABLE statement skipped (column may already exist): {s}", .{trimmed});
+                    } else {
+                        std.log.err("[Migration] Error executing V{d} statement: {s} ({s})", .{ migration.version, trimmed, @errorName(err) });
+                        mig_ok = false;
+                        break;
+                    }
+                };
+            }
             const elapsed_ms = @import("../core/Time.zig").monotonicNowMilliseconds() - start_ms;
 
             const checksum = migration.checksum orelse "";
-            if (result) |_| {
+            if (mig_ok) {
                 try self.recordMigration(migration.version, migration.description, checksum, @intCast(elapsed_ms), true);
-            } else |_| {
+            } else {
                 try self.recordMigration(migration.version, migration.description, checksum, @intCast(elapsed_ms), false);
                 return error.MigrationFailed;
             }

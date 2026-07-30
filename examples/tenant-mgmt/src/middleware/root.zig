@@ -14,27 +14,31 @@ pub fn tenantMiddleware() http.Middleware {
     }.handle };
 }
 
-/// JWT 认证中间件 — 委托 `http_middleware.jwtAuthWithSecurity`，health 路径免鉴权。
-pub fn jwtAuthMiddleware(sec: *zigmodu.security.SecurityModule) http.Middleware {
-    const Store = struct {
-        var stored: *zigmodu.security.SecurityModule = undefined;
-    };
-    Store.stored = sec;
-    return .{
-        .func = struct {
-            fn handle(ctx: *http.Context, next: http.HandlerFn, _: ?*anyopaque) anyerror!void {
-                if (std.mem.startsWith(u8, ctx.path, "/health") or std.mem.startsWith(u8, ctx.path, "health")) {
-                    try next(ctx);
-                    return;
-                }
-                const inner = http.http_middleware.jwtAuthWithSecurity(Store.stored);
-                try inner.func(ctx, next, inner.user_data);
-            }
-        }.handle,
-    };
+/// JWT + SQLite role→permission (`CatalogPermDb`) into `permissions` attr.
+pub fn jwtAuthMiddleware(
+    sec: *zigmodu.security.SecurityModule,
+    slot: *http.CatalogSlot,
+    db: *zigmodu.data.Client,
+) http.Middleware {
+    return http.jwtAuthFromCatalogWithPermissions(
+        sec,
+        slot,
+        zigmodu.security.CatalogPermDb.loaderFromClient(db),
+        .{},
+    );
 }
 
-/// 数据权限中间件
+/// ModuleGate: injects `module` attr from catalog; unknown paths allowed (API may 404 later).
+pub fn moduleGateMiddleware(slot: *http.CatalogSlot) http.Middleware {
+    return http.moduleGate(slot, .{ .unknown = .allow });
+}
+
+/// PermissionGate (RBAC): `RouteMeta.permission` must appear in loaded permission codes.
+pub fn permissionGateMiddleware(slot: *http.CatalogSlot) http.Middleware {
+    return http.permissionGateWith(slot, .{ .mode = .rbac });
+}
+
+/// 数据权限中间件（可读 ctx.getAttr("module") / ctx.getAttr("permissions")）
 pub fn dataPermissionMiddleware() http.Middleware {
     return .{ .func = struct {
         fn handle(ctx: *http.Context, next: http.HandlerFn, _: ?*anyopaque) anyerror!void {

@@ -211,6 +211,41 @@ pub fn jwtAuthWithSecurity(security: *SecurityModule) api.Middleware {
 }
 
 fn verifyJwtAndNext(sec: *SecurityModule, ctx: *api.Context, next: api.HandlerFn) !void {
+    try verifyJwtLoadPermsAndNext(sec, ctx, next, null);
+}
+
+fn joinCsv(allocator: std.mem.Allocator, parts: []const []const u8) ![]u8 {
+    if (parts.len == 0) return try allocator.dupe(u8, "");
+    var total: usize = 0;
+    for (parts, 0..) |p, i| {
+        total += p.len;
+        if (i > 0) total += 1;
+    }
+    const buf = try allocator.alloc(u8, total);
+    var off: usize = 0;
+    for (parts, 0..) |p, i| {
+        if (i > 0) {
+            buf[off] = ',';
+            off += 1;
+        }
+        @memcpy(buf[off..][0..p.len], p);
+        off += p.len;
+    }
+    return buf;
+}
+
+/// Optional: map JWT role names → fine-grained permission codes (CSV on `permissions` attr).
+pub const CatalogPermissionLoader = *const fn (
+    allocator: std.mem.Allocator,
+    roles: []const []const u8,
+) anyerror![]u8;
+
+fn verifyJwtLoadPermsAndNext(
+    sec: *SecurityModule,
+    ctx: *api.Context,
+    next: api.HandlerFn,
+    loader: ?CatalogPermissionLoader,
+) !void {
     const auth = ctx.headers.get("authorization") orelse {
         try ctx.sendError(401, "Unauthorized");
         return;
@@ -226,7 +261,261 @@ fn verifyJwtAndNext(sec: *SecurityModule, ctx: *api.Context, next: api.HandlerFn
     };
     defer sec.freePayload(payload);
 
+    try ctx.setAttr("user_id", payload.sub);
+    // Comma-separated roles for permissionGate(.roles) and CatalogPermissionLoader.
+    if (payload.roles.len > 0) {
+        const roles_csv = try joinCsv(ctx.allocator, payload.roles);
+        defer ctx.allocator.free(roles_csv);
+        try ctx.setAttr("roles", roles_csv);
+    } else {
+        try ctx.setAttr("roles", "");
+    }
+
+    if (loader) |load| {
+        const perms_csv = load(ctx.allocator, payload.roles) catch {
+            try ctx.sendError(500, "Failed to load permissions");
+            return;
+        };
+        defer ctx.allocator.free(perms_csv);
+        try ctx.setAttr("permissions", perms_csv);
+    }
+
     try next(ctx);
+}
+
+const comptime_router = @import("ComptimeRouter.zig");
+const Rbac = @import("../security/Rbac.zig");
+
+pub const JwtFromCatalogConfig = struct {
+    skip_prefixes: []const []const u8 = &.{ "health", "dashboard", "openapi.json" },
+};
+
+/// JWT that skips when catalog marks the route `.public`, or path matches skip_prefixes.
+/// Fill `slot` with `slot.set(try router.finish())` after mounts.
+pub fn jwtAuthFromCatalog(security: *SecurityModule, slot: *comptime_router.CatalogSlot, config: JwtFromCatalogConfig) api.Middleware {
+    const Store = struct {
+        var sec: *SecurityModule = undefined;
+        var catalog_slot: *comptime_router.CatalogSlot = undefined;
+        var cfg: JwtFromCatalogConfig = .{};
+    };
+    Store.sec = security;
+    Store.catalog_slot = slot;
+    Store.cfg = config;
+    return .{
+        .func = struct {
+            fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
+                if (comptime_router.pathHasSkipPrefix(ctx.path, Store.cfg.skip_prefixes)) {
+                    try next(ctx);
+                    return;
+                }
+                if (Store.catalog_slot.get()) |cat| {
+                    if (cat.isPublic(ctx.method, ctx.path)) {
+                        try next(ctx);
+                        return;
+                    }
+                }
+                try verifyJwtLoadPermsAndNext(Store.sec, ctx, next, null);
+            }
+        }.mw,
+    };
+}
+
+/// Like `jwtAuthFromCatalog`, but loads fine-grained permissions via `loader`
+/// into ctx attr `permissions` (CSV). Does **not** overwrite `ctx.user_data`
+/// (safe with ComptimeRouter). Pair with `permissionGateWith(..., .{ .mode = .rbac })`.
+pub fn jwtAuthFromCatalogWithPermissions(
+    security: *SecurityModule,
+    slot: *comptime_router.CatalogSlot,
+    loader: CatalogPermissionLoader,
+    config: JwtFromCatalogConfig,
+) api.Middleware {
+    const Store = struct {
+        var sec: *SecurityModule = undefined;
+        var catalog_slot: *comptime_router.CatalogSlot = undefined;
+        var cfg: JwtFromCatalogConfig = .{};
+        var load: CatalogPermissionLoader = undefined;
+    };
+    Store.sec = security;
+    Store.catalog_slot = slot;
+    Store.cfg = config;
+    Store.load = loader;
+    return .{
+        .func = struct {
+            fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
+                if (comptime_router.pathHasSkipPrefix(ctx.path, Store.cfg.skip_prefixes)) {
+                    try next(ctx);
+                    return;
+                }
+                if (Store.catalog_slot.get()) |cat| {
+                    if (cat.isPublic(ctx.method, ctx.path)) {
+                        try next(ctx);
+                        return;
+                    }
+                }
+                try verifyJwtLoadPermsAndNext(Store.sec, ctx, next, Store.load);
+            }
+        }.mw,
+    };
+}
+
+/// Build a `CatalogPermissionLoader` from a static `RolePermissionTable`.
+pub fn catalogLoaderFromTable(table: *const Rbac.RolePermissionTable) CatalogPermissionLoader {
+    const Holder = struct {
+        var tbl: *const Rbac.RolePermissionTable = undefined;
+        fn load(allocator: std.mem.Allocator, roles: []const []const u8) anyerror![]u8 {
+            return @This().tbl.permissionsCsv(allocator, roles);
+        }
+    };
+    Holder.tbl = table;
+    return Holder.load;
+}
+
+pub const ModuleGateConfig = struct {
+    allowed: ?[]const []const u8 = null,
+    unknown: enum { allow, deny } = .allow,
+    attr_key: []const u8 = "module",
+};
+
+/// Resolves catalog module → ctx attr; optional allow-list / deny-unknown.
+pub fn moduleGate(slot: *comptime_router.CatalogSlot, config: ModuleGateConfig) api.Middleware {
+    const Store = struct {
+        var catalog_slot: *comptime_router.CatalogSlot = undefined;
+        var cfg: ModuleGateConfig = .{};
+    };
+    Store.catalog_slot = slot;
+    Store.cfg = config;
+    return .{
+        .func = struct {
+            fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
+                const cat = Store.catalog_slot.get() orelse {
+                    try next(ctx);
+                    return;
+                };
+                if (cat.moduleFor(ctx.path)) |mod| {
+                    try ctx.setAttr(Store.cfg.attr_key, mod);
+                    if (Store.cfg.allowed) |allow| {
+                        var ok = false;
+                        for (allow) |a| {
+                            if (std.mem.eql(u8, a, mod)) {
+                                ok = true;
+                                break;
+                            }
+                        }
+                        if (!ok) {
+                            try ctx.sendError(403, "Module not allowed");
+                            return;
+                        }
+                    }
+                } else if (Store.cfg.unknown == .deny) {
+                    if (!comptime_router.pathHasSkipPrefix(ctx.path, &.{ "health", "dashboard", "openapi.json" })) {
+                        try ctx.sendError(404, "Unknown route module");
+                        return;
+                    }
+                }
+                try next(ctx);
+            }
+        }.mw,
+    };
+}
+
+fn rolesCsvHas(roles_csv: []const u8, want: []const u8) bool {
+    var it = std.mem.splitScalar(u8, roles_csv, ',');
+    while (it.next()) |r| {
+        const trimmed = std.mem.trim(u8, r, " \t");
+        if (trimmed.len > 0 and std.mem.eql(u8, trimmed, want)) return true;
+    }
+    return false;
+}
+
+/// `permission` may be a single code or OR-alternatives separated by `|`.
+pub fn permissionMatchesRoles(roles_csv: []const u8, permission: []const u8) bool {
+    var alts = std.mem.splitScalar(u8, permission, '|');
+    while (alts.next()) |alt| {
+        const want = std.mem.trim(u8, alt, " \t");
+        if (want.len > 0 and rolesCsvHas(roles_csv, want)) return true;
+    }
+    return false;
+}
+
+pub fn permissionMatchesAuthInfo(auth: *const Rbac.AuthInfo, permission: []const u8) bool {
+    var alts = std.mem.splitScalar(u8, permission, '|');
+    while (alts.next()) |alt| {
+        const want = std.mem.trim(u8, alt, " \t");
+        if (want.len > 0 and auth.hasPermission(want)) return true;
+    }
+    return false;
+}
+
+pub const PermissionMode = enum {
+    /// Match `RouteMeta.permission` against JWT role names (legacy v1.1).
+    roles,
+    /// Match against fine-grained permission codes (`permissions` attr and/or AuthInfo).
+    rbac,
+};
+
+pub const PermissionGateConfig = struct {
+    mode: PermissionMode = .roles,
+    /// Context attr holding comma-separated JWT roles (set by jwtAuth*).
+    role_attr: []const u8 = "roles",
+    /// Context attr holding comma-separated permission codes (set by jwtAuthFromCatalogWithPermissions).
+    permission_attr: []const u8 = "permissions",
+    /// When true, writes matched permission expression to ctx attr `permission`.
+    set_permission_attr: bool = true,
+};
+
+/// Enforces `RouteMeta.permission` (default mode = JWT roles, `|` = OR).
+/// Skips public routes and paths without a permission.
+pub fn permissionGate(slot: *comptime_router.CatalogSlot) api.Middleware {
+    return permissionGateWith(slot, .{});
+}
+
+pub fn permissionGateWith(slot: *comptime_router.CatalogSlot, config: PermissionGateConfig) api.Middleware {
+    const Store = struct {
+        var catalog_slot: *comptime_router.CatalogSlot = undefined;
+        var cfg: PermissionGateConfig = .{};
+    };
+    Store.catalog_slot = slot;
+    Store.cfg = config;
+    return .{
+        .func = struct {
+            fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
+                const cat = Store.catalog_slot.get() orelse {
+                    try next(ctx);
+                    return;
+                };
+                if (cat.isPublic(ctx.method, ctx.path)) {
+                    try next(ctx);
+                    return;
+                }
+                const perm = cat.permissionFor(ctx.method, ctx.path) orelse {
+                    try next(ctx);
+                    return;
+                };
+
+                const allowed = switch (Store.cfg.mode) {
+                    .roles => blk: {
+                        const roles = ctx.getAttr(Store.cfg.role_attr) orelse break :blk false;
+                        break :blk permissionMatchesRoles(roles, perm);
+                    },
+                    .rbac => blk: {
+                        if (ctx.authInfo(Rbac.AuthInfo)) |ai| {
+                            break :blk permissionMatchesAuthInfo(ai, perm);
+                        }
+                        const perms = ctx.getAttr(Store.cfg.permission_attr) orelse break :blk false;
+                        break :blk permissionMatchesRoles(perms, perm);
+                    },
+                };
+                if (!allowed) {
+                    try ctx.sendError(403, "Forbidden");
+                    return;
+                }
+                if (Store.cfg.set_permission_attr) {
+                    try ctx.setAttr("permission", perm);
+                }
+                try next(ctx);
+            }
+        }.mw,
+    };
 }
 
 /// CSRF protection using double-submit cookie pattern.
@@ -512,4 +801,205 @@ test "csrf middleware allows GET without token" {
 
     try mw.func(&ctx, next, mw.user_data);
     try std.testing.expect(S.reached);
+}
+
+test "jwtAuthFromCatalog skips public and skip_prefixes" {
+    const alloc = std.testing.allocator;
+    var entries = try alloc.alloc(comptime_router.CatalogEntry, 1);
+    entries[0] = .{
+        .method = .GET,
+        .path = try alloc.dupe(u8, "api/v1/open"),
+        .auth = .public,
+        .module = "open",
+    };
+    var slot: comptime_router.CatalogSlot = .{};
+    defer slot.deinit();
+    slot.set(.{ .allocator = alloc, .entries = entries });
+
+    var sec = SecurityModule.init(alloc, "test-secret", 3600);
+    const mw = jwtAuthFromCatalog(&sec, &slot, .{});
+    const next = struct {
+        fn n(_: *api.Context) anyerror!void {}
+    }.n;
+
+    var pub_ctx = try api.Context.init(alloc, .GET, "/api/v1/open");
+    defer pub_ctx.deinit();
+    try mw.func(&pub_ctx, next, null);
+    try std.testing.expect(!pub_ctx.responded);
+
+    var health_ctx = try api.Context.init(alloc, .GET, "/health/live");
+    defer health_ctx.deinit();
+    try mw.func(&health_ctx, next, null);
+    try std.testing.expect(!health_ctx.responded);
+
+    var priv_ctx = try api.Context.init(alloc, .GET, "/api/v1/secret");
+    defer priv_ctx.deinit();
+    try mw.func(&priv_ctx, next, null);
+    try std.testing.expectEqual(@as(u16, 401), priv_ctx.status_code);
+}
+
+test "moduleGate sets attr and can deny unknown" {
+    const alloc = std.testing.allocator;
+    var entries = try alloc.alloc(comptime_router.CatalogEntry, 1);
+    entries[0] = .{
+        .method = .GET,
+        .path = try alloc.dupe(u8, "api/v1/users"),
+        .auth = .jwt,
+        .module = "user",
+    };
+    var slot: comptime_router.CatalogSlot = .{};
+    defer slot.deinit();
+    slot.set(.{ .allocator = alloc, .entries = entries });
+
+    const mw = moduleGate(&slot, .{ .unknown = .deny });
+    const next = struct {
+        fn n(_: *api.Context) anyerror!void {}
+    }.n;
+
+    var ok_ctx = try api.Context.init(alloc, .GET, "/api/v1/users");
+    defer ok_ctx.deinit();
+    try mw.func(&ok_ctx, next, null);
+    try std.testing.expectEqualStrings("user", ok_ctx.getAttr("module").?);
+
+    var bad_ctx = try api.Context.init(alloc, .GET, "/api/v1/nope");
+    defer bad_ctx.deinit();
+    try mw.func(&bad_ctx, next, null);
+    try std.testing.expectEqual(@as(u16, 404), bad_ctx.status_code);
+}
+
+test "permissionGate requires role matching RouteMeta.permission" {
+    const alloc = std.testing.allocator;
+    var entries = try alloc.alloc(comptime_router.CatalogEntry, 1);
+    entries[0] = .{
+        .method = .DELETE,
+        .path = try alloc.dupe(u8, "api/v1/tenants/{id}"),
+        .auth = .jwt,
+        .module = "tenant",
+        .permission = "admin",
+    };
+    var slot: comptime_router.CatalogSlot = .{};
+    defer slot.deinit();
+    slot.set(.{ .allocator = alloc, .entries = entries });
+
+    const mw = permissionGate(&slot);
+    const next = struct {
+        fn n(_: *api.Context) anyerror!void {}
+    }.n;
+
+    var deny_ctx = try api.Context.init(alloc, .DELETE, "/api/v1/tenants/1");
+    defer deny_ctx.deinit();
+    try deny_ctx.setAttr("roles", "user");
+    try mw.func(&deny_ctx, next, null);
+    try std.testing.expectEqual(@as(u16, 403), deny_ctx.status_code);
+
+    var allow_ctx = try api.Context.init(alloc, .DELETE, "/api/v1/tenants/1");
+    defer allow_ctx.deinit();
+    try allow_ctx.setAttr("roles", "user,admin");
+    try mw.func(&allow_ctx, next, null);
+    try std.testing.expect(!allow_ctx.responded);
+    try std.testing.expectEqualStrings("admin", allow_ctx.getAttr("permission").?);
+}
+
+test "permissionMatchesRoles supports OR alternatives" {
+    try std.testing.expect(permissionMatchesRoles("user,owner", "admin|owner"));
+    try std.testing.expect(!permissionMatchesRoles("user", "admin|owner"));
+    try std.testing.expect(permissionMatchesRoles(" admin ", "admin"));
+}
+
+test "permissionGate accepts any OR alternative" {
+    const alloc = std.testing.allocator;
+    var entries = try alloc.alloc(comptime_router.CatalogEntry, 1);
+    entries[0] = .{
+        .method = .DELETE,
+        .path = try alloc.dupe(u8, "api/v1/tenants/{id}"),
+        .auth = .jwt,
+        .module = "tenant",
+        .permission = "admin|owner",
+    };
+    var slot: comptime_router.CatalogSlot = .{};
+    defer slot.deinit();
+    slot.set(.{ .allocator = alloc, .entries = entries });
+
+    const mw = permissionGate(&slot);
+    const next = struct {
+        fn n(_: *api.Context) anyerror!void {}
+    }.n;
+
+    var ok_ctx = try api.Context.init(alloc, .DELETE, "/api/v1/tenants/1");
+    defer ok_ctx.deinit();
+    try ok_ctx.setAttr("roles", "owner");
+    try mw.func(&ok_ctx, next, null);
+    try std.testing.expect(!ok_ctx.responded);
+}
+
+test "permissionGate rbac mode uses permissions attr not roles" {
+    const alloc = std.testing.allocator;
+    var entries = try alloc.alloc(comptime_router.CatalogEntry, 1);
+    entries[0] = .{
+        .method = .DELETE,
+        .path = try alloc.dupe(u8, "api/v1/tenants/{id}"),
+        .auth = .jwt,
+        .module = "tenant",
+        .permission = "tenant:suspend",
+    };
+    var slot: comptime_router.CatalogSlot = .{};
+    defer slot.deinit();
+    slot.set(.{ .allocator = alloc, .entries = entries });
+
+    const mw = permissionGateWith(&slot, .{ .mode = .rbac });
+    const next = struct {
+        fn n(_: *api.Context) anyerror!void {}
+    }.n;
+
+    // Has role admin but no permission code → deny
+    var deny_ctx = try api.Context.init(alloc, .DELETE, "/api/v1/tenants/1");
+    defer deny_ctx.deinit();
+    try deny_ctx.setAttr("roles", "admin");
+    try deny_ctx.setAttr("permissions", "tenant:read");
+    try mw.func(&deny_ctx, next, null);
+    try std.testing.expectEqual(@as(u16, 403), deny_ctx.status_code);
+
+    var allow_ctx = try api.Context.init(alloc, .DELETE, "/api/v1/tenants/1");
+    defer allow_ctx.deinit();
+    try allow_ctx.setAttr("roles", "user");
+    try allow_ctx.setAttr("permissions", "tenant:read,tenant:suspend");
+    try mw.func(&allow_ctx, next, null);
+    try std.testing.expect(!allow_ctx.responded);
+    try std.testing.expectEqualStrings("tenant:suspend", allow_ctx.getAttr("permission").?);
+}
+
+test "jwtAuthFromCatalogWithPermissions loads permission CSV" {
+    const alloc = std.testing.allocator;
+    var entries = try alloc.alloc(comptime_router.CatalogEntry, 1);
+    entries[0] = .{
+        .method = .GET,
+        .path = try alloc.dupe(u8, "api/v1/tenants"),
+        .auth = .jwt,
+        .module = "tenant",
+    };
+    var slot: comptime_router.CatalogSlot = .{};
+    defer slot.deinit();
+    slot.set(.{ .allocator = alloc, .entries = entries });
+
+    const table = Rbac.RolePermissionTable{ .rows = &.{
+        .{ .role = "admin", .permissions = &.{ Rbac.Permissions.tenant_suspend, Rbac.Permissions.tenant_read } },
+    } };
+    var sec = SecurityModule.init(alloc, "test-secret", 3600);
+    const token = try sec.generateToken("u1", &.{"admin"});
+    defer alloc.free(token);
+
+    const mw = jwtAuthFromCatalogWithPermissions(&sec, &slot, catalogLoaderFromTable(&table), .{});
+    const next = struct {
+        fn n(_: *api.Context) anyerror!void {}
+    }.n;
+
+    var ctx = try api.Context.init(alloc, .GET, "/api/v1/tenants");
+    defer ctx.deinit();
+    const auth_hdr = try std.fmt.allocPrint(alloc, "Bearer {s}", .{token});
+    defer alloc.free(auth_hdr);
+    try ctx.headers.put(try alloc.dupe(u8, "authorization"), try alloc.dupe(u8, auth_hdr));
+    try mw.func(&ctx, next, null);
+    try std.testing.expect(!ctx.responded);
+    const perms = ctx.getAttr("permissions").?;
+    try std.testing.expect(std.mem.indexOf(u8, perms, "tenant:suspend") != null);
 }

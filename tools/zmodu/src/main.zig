@@ -691,7 +691,7 @@ fn cmdNew(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
         \\2. model.zig — pub const X = struct { pub const sql_table_name, fields };
         \\3. persistence.zig — XRepo() accessors returning data.Repository(T)
         \\4. service.zig — XService with CRUD delegation + EventBus(T)
-        \\5. api.zig — XApi with registerRoutes() + resolve() helper
+        \\5. api.zig — XApi with `pub const routes` (ComptimeRouter) + typed handlers
         \\
         \\## Wiring (in src/main.zig)
         \\- Import: const <name> = @import("modules/<name>/module.zig");
@@ -2965,6 +2965,26 @@ fn pluralizeRoute(allocator: std.mem.Allocator, singular: []const u8) ![]const u
     return try std.fmt.allocPrint(allocator, "{s}s", .{singular});
 }
 
+fn formatNestTuple(allocator: std.mem.Allocator, module_name: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, ".{");
+    var first = true;
+    var it = std.mem.splitScalar(u8, module_name, '/');
+    while (it.next()) |seg| {
+        if (seg.len == 0) continue;
+        if (!first) try buf.appendSlice(allocator, ",");
+        try buf.print(allocator, " \"{s}\"", .{seg});
+        first = false;
+    }
+    try buf.appendSlice(allocator, " }");
+    return buf.toOwnedSlice(allocator);
+}
+
+fn gateNameFromModule(allocator: std.mem.Allocator, module_name: []const u8) ![]const u8 {
+    return try replaceChar(allocator, module_name, '/', '_');
+}
+
 fn generateModuleApi(allocator: std.mem.Allocator, module_name: []const u8, tables: []const TableDef, strip_prefix_len: usize) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
@@ -2975,16 +2995,30 @@ fn generateModuleApi(allocator: std.mem.Allocator, module_name: []const u8, tabl
     defer allocator.free(header);
     // Compute shared/ import path: flat → ../../shared, nested → ../../../shared, etc.
     var sp_depth: usize = 2;
-    for (module_name) |c| { if (c == '/') sp_depth += 1; }
+    for (module_name) |c| {
+        if (c == '/') sp_depth += 1;
+    }
     var sp_buf = std.ArrayList(u8).empty;
     defer sp_buf.deinit(allocator);
     var sp_i: usize = 0;
-    while (sp_i < sp_depth) : (sp_i += 1) { try sp_buf.appendSlice(allocator, "../"); }
+    while (sp_i < sp_depth) : (sp_i += 1) {
+        try sp_buf.appendSlice(allocator, "../");
+    }
     try sp_buf.appendSlice(allocator, "shared/");
     const header_with_shared = try replaceAllStr(allocator, header, "<<SHARED_IMPORT>>", sp_buf.items);
     defer allocator.free(header_with_shared);
-    try buf.appendSlice(allocator, header_with_shared);
 
+    const nest_tuple = try formatNestTuple(allocator, module_name);
+    defer allocator.free(nest_tuple);
+    const gate_name = try gateNameFromModule(allocator, module_name);
+    defer allocator.free(gate_name);
+    const header_nest = try replaceAllStr(allocator, header_with_shared, "<<NEST>>", nest_tuple);
+    defer allocator.free(header_nest);
+    const header_final = try replaceAllStr(allocator, header_nest, "<<GATE_NAME>>", gate_name);
+    defer allocator.free(header_final);
+    try buf.appendSlice(allocator, header_final);
+
+    // Route table entries
     for (tables) |table| {
         const effective_name = if (strip_prefix_len > 0 and strip_prefix_len < table.name.len)
             table.name[strip_prefix_len..]
@@ -2992,15 +3026,19 @@ fn generateModuleApi(allocator: std.mem.Allocator, module_name: []const u8, tabl
             table.name;
         const model_name = try toPascalCase(allocator, effective_name);
         defer allocator.free(model_name);
-        // Multi-table modules: use table name as PascalCase model
         const pl_sfx = if (std.mem.endsWith(u8, model_name, "s") or std.mem.endsWith(u8, model_name, "S")) "" else "s";
-        try buf.print(allocator, "        try group.get(\"/{s}/list\", list{s}{s}, @ptrCast(@alignCast(self)));\n", .{ module_name, model_name, pl_sfx });
-        try buf.print(allocator, "        try group.get(\"/{s}/get\", get{s}, @ptrCast(@alignCast(self)));\n", .{ module_name, model_name });
-        try buf.print(allocator, "        try group.post(\"/{s}/create\", create{s}, @ptrCast(@alignCast(self)));\n", .{ module_name, model_name });
-        try buf.print(allocator, "        try group.put(\"/{s}/update\", update{s}, @ptrCast(@alignCast(self)));\n", .{ module_name, model_name });
-        try buf.print(allocator, "        try group.delete(\"/{s}/delete\", delete{s}, @ptrCast(@alignCast(self)));\n", .{ module_name, model_name });
+        const path_prefix = if (tables.len == 1) "" else blk: {
+            break :blk try std.fmt.allocPrint(allocator, "{s}/", .{effective_name});
+        };
+        defer if (tables.len > 1) allocator.free(path_prefix);
+
+        try buf.print(allocator, "        .{{ .method = .GET, .path = \"{s}list\", .handler = list{s}{s} }},\n", .{ path_prefix, model_name, pl_sfx });
+        try buf.print(allocator, "        .{{ .method = .GET, .path = \"{s}get\", .handler = get{s} }},\n", .{ path_prefix, model_name });
+        try buf.print(allocator, "        .{{ .method = .POST, .path = \"{s}create\", .handler = create{s} }},\n", .{ path_prefix, model_name });
+        try buf.print(allocator, "        .{{ .method = .PUT, .path = \"{s}update\", .handler = update{s} }},\n", .{ path_prefix, model_name });
+        try buf.print(allocator, "        .{{ .method = .DELETE, .path = \"{s}delete\", .handler = delete{s} }},\n", .{ path_prefix, model_name });
     }
-    try buf.appendSlice(allocator, "    }\n\n");
+    try buf.appendSlice(allocator, "    };\n\n");
 
     for (tables) |table| {
         const effective_name = if (strip_prefix_len > 0 and strip_prefix_len < table.name.len)
@@ -3012,59 +3050,54 @@ fn generateModuleApi(allocator: std.mem.Allocator, module_name: []const u8, tabl
         const pl_sfx2 = if (std.mem.endsWith(u8, model_name, "s") or std.mem.endsWith(u8, model_name, "S")) "" else "s";
         const pk_is_str2 = pkIsString(table);
 
-        // list — GET /{plural}/list
-        try buf.print(allocator, "    fn list{s}{s}(ctx: *http.Context) !void {{\n", .{model_name, pl_sfx2});
-        try buf.appendSlice(allocator, "        const s = resolve(ctx);\n");
+        // list — GET .../list
+        try buf.print(allocator, "    fn list{s}{s}(ctx: *http.Context, self: *State) !void {{\n", .{ model_name, pl_sfx2 });
         try buf.appendSlice(allocator, "        const page = ctx.queryInt(usize, \"pageNo\", 1);\n");
         try buf.appendSlice(allocator, "        const size = ctx.queryInt(usize, \"pageSize\", 10);\n");
-        try buf.print(allocator, "        const result = try s.service.list{s}{s}(page, size);\n", .{model_name, pl_sfx2});
+        try buf.print(allocator, "        const result = try self.service.list{s}{s}(page, size);\n", .{ model_name, pl_sfx2 });
         try buf.appendSlice(allocator, "        try R.wrapList(ctx, result);\n");
         try buf.appendSlice(allocator, "    }\n\n");
 
-        // get — GET /{plural}/get?id=xxx
-        try buf.print(allocator, "    fn get{s}(ctx: *http.Context) !void {{\n", .{model_name});
-        try buf.appendSlice(allocator, "        const s = resolve(ctx);\n");
+        // get — GET .../get?id=
+        try buf.print(allocator, "    fn get{s}(ctx: *http.Context, self: *State) !void {{\n", .{model_name});
         if (pk_is_str2) {
             try buf.appendSlice(allocator, "        const id = try ctx.paramStr(\"id\");\n");
         } else {
             try buf.appendSlice(allocator, "        const id = ctx.queryInt(i64, \"id\", 0);\n");
         }
-        try buf.print(allocator, "        if (try s.service.get{s}(id)) |entity| {{\n", .{model_name});
+        try buf.print(allocator, "        if (try self.service.get{s}(id)) |entity| {{\n", .{model_name});
         try buf.appendSlice(allocator, "            try R.wrapOk(ctx, entity);\n");
         try buf.appendSlice(allocator, "        } else { try R.wrapErr(ctx, 1, \"not found\"); }\n");
         try buf.appendSlice(allocator, "    }\n\n");
 
-        // create — POST /{plural}/create
-        try buf.print(allocator, "    fn create{s}(ctx: *http.Context) !void {{\n", .{model_name});
-        try buf.appendSlice(allocator, "        const s = resolve(ctx);\n");
+        // create
+        try buf.print(allocator, "    fn create{s}(ctx: *http.Context, self: *State) !void {{\n", .{model_name});
         try buf.print(allocator, "        const entity = ctx.bindJson(model.{s}) catch {{\n", .{model_name});
         try buf.appendSlice(allocator, "            try R.wrapErr(ctx, 1, \"invalid body\");\n            return;\n        };\n");
-        try buf.print(allocator, "        s.service.validate{s}(entity) catch {{\n", .{model_name});
+        try buf.print(allocator, "        self.service.validate{s}(entity) catch {{\n", .{model_name});
         try buf.appendSlice(allocator, "            try R.wrapErr(ctx, 1, \"validation failed\");\n            return;\n        };\n");
-        try buf.print(allocator, "        const created = try s.service.create{s}(entity);\n", .{model_name});
+        try buf.print(allocator, "        const created = try self.service.create{s}(entity);\n", .{model_name});
         try buf.appendSlice(allocator, "        try R.wrapOk(ctx, created);\n");
         try buf.appendSlice(allocator, "    }\n\n");
 
-        // update — PUT /{plural}/update
-        try buf.print(allocator, "    fn update{s}(ctx: *http.Context) !void {{\n", .{model_name});
-        try buf.appendSlice(allocator, "        const s = resolve(ctx);\n");
+        // update
+        try buf.print(allocator, "    fn update{s}(ctx: *http.Context, self: *State) !void {{\n", .{model_name});
         try buf.print(allocator, "        const entity = ctx.bindJson(model.{s}) catch {{\n", .{model_name});
         try buf.appendSlice(allocator, "            try R.wrapErr(ctx, 1, \"invalid body\");\n            return;\n        };\n");
-        try buf.print(allocator, "        s.service.validate{s}(entity) catch {{\n", .{model_name});
+        try buf.print(allocator, "        self.service.validate{s}(entity) catch {{\n", .{model_name});
         try buf.appendSlice(allocator, "            try R.wrapErr(ctx, 1, \"validation failed\");\n            return;\n        };\n");
-        try buf.print(allocator, "        try s.service.update{s}(entity);\n", .{model_name});
+        try buf.print(allocator, "        try self.service.update{s}(entity);\n", .{model_name});
         try buf.appendSlice(allocator, "        try R.wrapSuccess(ctx);\n");
         try buf.appendSlice(allocator, "    }\n\n");
 
-        // delete — DELETE /{plural}/delete?id=xxx
-        try buf.print(allocator, "    fn delete{s}(ctx: *http.Context) !void {{\n", .{model_name});
-        try buf.appendSlice(allocator, "        const s = resolve(ctx);\n");
+        // delete
+        try buf.print(allocator, "    fn delete{s}(ctx: *http.Context, self: *State) !void {{\n", .{model_name});
         if (pk_is_str2) {
             try buf.appendSlice(allocator, "        const id = try ctx.paramStr(\"id\");\n");
         } else {
             try buf.appendSlice(allocator, "        const id = ctx.queryInt(i64, \"id\", 0);\n");
         }
-        try buf.print(allocator, "        try s.service.delete{s}(id);\n", .{model_name});
+        try buf.print(allocator, "        try self.service.delete{s}(id);\n", .{model_name});
         try buf.appendSlice(allocator, "        try R.wrapSuccess(ctx);\n");
         try buf.appendSlice(allocator, "    }\n\n");
     }
@@ -4996,20 +5029,50 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
         \\const sse_mod = @import("sse.zig");
         \\pub const AiChatApi = struct {
         \\    service: *service.AiChatService,
+        \\
+        \\    pub const module_name = "ai-chat";
+        \\    pub const nest = .{ "ai", "chat" };
+        \\    pub const State = @This();
+        \\
         \\    pub fn init(s: *service.AiChatService) AiChatApi { return .{ .service = s }; }
-        \\    fn resolve(ctx: *http.Context) *AiChatApi { return @ptrCast(@alignCast(ctx.user_data orelse unreachable)); }
-        \\    pub fn registerRoutes(self: *AiChatApi, group: *http.RouteGroup) !void {
-        \\        try group.post("/ai/chat/send", sendMessage, @ptrCast(@alignCast(self)));
-        \\        try group.get("/ai/chat/conversations", listConversations, @ptrCast(@alignCast(self)));
-        \\        try group.get("/ai/chat/messages", listMessages, @ptrCast(@alignCast(self)));
-        \\        try group.post("/ai/chat/conversations", createConversation, @ptrCast(@alignCast(self)));
-        \\        try group.delete("/ai/chat/conversations", deleteConversation, @ptrCast(@alignCast(self)));
+        \\
+        \\    pub const routes = [_]http.RouteSpec(State){
+        \\        .{ .method = .POST, .path = "send", .handler = sendMessage },
+        \\        .{ .method = .GET, .path = "conversations", .handler = listConversations },
+        \\        .{ .method = .GET, .path = "messages", .handler = listMessages },
+        \\        .{ .method = .POST, .path = "conversations", .handler = createConversation },
+        \\        .{ .method = .DELETE, .path = "conversations", .handler = deleteConversation },
+        \\    };
+        \\
+        \\    fn sendMessage(ctx: *http.Context, self: *State) !void {
+        \\        const content = ctx.body orelse { try R.wrapErr(ctx, 1, "empty body"); return; };
+        \\        const conv_id = ctx.queryInt(i64, "conversationId", 0);
+        \\        if (conv_id == 0) { try R.wrapErr(ctx, 1, "missing conversationId"); return; }
+        \\        const result = self.service.send(conv_id, content, null) catch { try R.wrapErr(ctx, .server_error, "AI error"); return; };
+        \\        try R.wrapOk(ctx, result);
         \\    }
-        \\    fn sendMessage(ctx: *http.Context) !void { const s = resolve(ctx); const content = ctx.body orelse { try R.wrapErr(ctx, 1, "empty body"); return; }; const conv_id = ctx.queryInt(i64, "conversationId", 0); if (conv_id == 0) { try R.wrapErr(ctx, 1, "missing conversationId"); return; } const result = s.service.send(conv_id, content, null) catch { try R.wrapErr(ctx, .server_error, "AI error"); return; }; try R.wrapOk(ctx, result); }
-        \\    fn listConversations(ctx: *http.Context) !void { const s = resolve(ctx); const page = ctx.queryInt(usize, "pageNo", 1); const size = ctx.queryInt(usize, "pageSize", 10); const r = try s.service.getConversations(page, size); try R.wrapList(ctx, r); }
-        \\    fn listMessages(ctx: *http.Context) !void { const s = resolve(ctx); const cid = ctx.queryInt(i64, "conversationId", 0); const page = ctx.queryInt(usize, "pageNo", 1); const size = ctx.queryInt(usize, "pageSize", 20); const r = try s.service.getHistory(cid, page, size); try R.wrapList(ctx, r); }
-        \\    fn createConversation(ctx: *http.Context) !void { const s = resolve(ctx); const title = ctx.queryStr("title", "New Chat"); const conv = try s.service.createConversation(title); try R.wrapOk(ctx, conv); }
-        \\    fn deleteConversation(ctx: *http.Context) !void { const s = resolve(ctx); _ = s; try R.wrapSuccess(ctx); }
+        \\    fn listConversations(ctx: *http.Context, self: *State) !void {
+        \\        const page = ctx.queryInt(usize, "pageNo", 1);
+        \\        const size = ctx.queryInt(usize, "pageSize", 10);
+        \\        const r = try self.service.getConversations(page, size);
+        \\        try R.wrapList(ctx, r);
+        \\    }
+        \\    fn listMessages(ctx: *http.Context, self: *State) !void {
+        \\        const cid = ctx.queryInt(i64, "conversationId", 0);
+        \\        const page = ctx.queryInt(usize, "pageNo", 1);
+        \\        const size = ctx.queryInt(usize, "pageSize", 20);
+        \\        const r = try self.service.getHistory(cid, page, size);
+        \\        try R.wrapList(ctx, r);
+        \\    }
+        \\    fn createConversation(ctx: *http.Context, self: *State) !void {
+        \\        const title = ctx.queryStr("title", "New Chat");
+        \\        const conv = try self.service.createConversation(title);
+        \\        try R.wrapOk(ctx, conv);
+        \\    }
+        \\    fn deleteConversation(ctx: *http.Context, self: *State) !void {
+        \\        _ = self;
+        \\        try R.wrapSuccess(ctx);
+        \\    }
         \\};
     , gen_opts);
 
@@ -5075,12 +5138,12 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
         \\## API
         \\| Method | Path | Description |
         \\|--------|------|-------------|
-        \\| POST | /ai/chat/send?conversationId=N | Send message (multi-turn context) |
-        \\| POST | /ai/chat/stream?conversationId=N | SSE streaming reply |
-        \\| GET | /ai/chat/conversations | List conversations |
-        \\| GET | /ai/chat/messages?conversationId=N | Message history |
-        \\| POST | /ai/chat/conversations | Create conversation |
-        \\| DELETE | /ai/chat/conversations?id=N | Delete conversation |
+        \\| POST | /admin-api/ai/chat/send?conversationId=N | Send message (multi-turn context) |
+        \\| GET | /admin-api/ai/chat/conversations | List conversations |
+        \\| GET | /admin-api/ai/chat/messages?conversationId=N | Message history |
+        \\| POST | /admin-api/ai/chat/conversations | Create conversation |
+        \\| DELETE | /admin-api/ai/chat/conversations?id=N | Delete conversation |
+        \\Routes via ComptimeRouter `pub const routes` (docs/ROUTE_TABLE.md).
         \\## Features
         \\- Multi-turn context loading
         \\- Cache-optimized message ordering (DeepSeek V4)
@@ -5206,18 +5269,48 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
     // ── api.zig ──
     const api_path = try std.fmt.allocPrint(allocator, "{s}/api.zig", .{dir}); defer allocator.free(api_path);
     try safeWrite(io, allocator, api_path,
-        \\const std = @import("std"); const zigmodu = @import("zigmodu"); const http = zigmodu.http; const service = @import("service.zig"); const R = @import("../../../shared/response.zig");
-        \\pub const AiAgentApi = struct { service: *service.AiAgentService,
+        \\const std = @import("std");
+        \\const zigmodu = @import("zigmodu");
+        \\const http = zigmodu.http;
+        \\const service = @import("service.zig");
+        \\const R = @import("../../../shared/response.zig");
+        \\pub const AiAgentApi = struct {
+        \\    service: *service.AiAgentService,
+        \\
+        \\    pub const module_name = "ai-agent";
+        \\    pub const nest = .{ "ai", "agent" };
+        \\    pub const State = @This();
+        \\
         \\    pub fn init(s: *service.AiAgentService) AiAgentApi { return .{ .service = s }; }
-        \\    fn resolve(ctx: *http.Context) *AiAgentApi { return @ptrCast(@alignCast(ctx.user_data orelse unreachable)); }
-        \\    pub fn registerRoutes(self: *AiAgentApi, group: *http.RouteGroup) !void {
-        \\        try group.post("/ai/agent/run", runAgent, @ptrCast(@alignCast(self)));
-        \\        try group.get("/ai/agent/runs", listRuns, @ptrCast(@alignCast(self)));
-        \\        try group.get("/ai/agent/runs/get", getRun, @ptrCast(@alignCast(self)));
+        \\
+        \\    pub const routes = [_]http.RouteSpec(State){
+        \\        .{ .method = .POST, .path = "run", .handler = runAgent, .meta = .{ .permission = "admin|agent" } },
+        \\        .{ .method = .GET, .path = "runs", .handler = listRuns },
+        \\        .{ .method = .GET, .path = "runs/get", .handler = getRun },
+        \\    };
+        \\
+        \\    fn runAgent(ctx: *http.Context, self: *State) !void {
+        \\        const goal = ctx.queryStr("goal", "");
+        \\        if (goal.len == 0) { try R.wrapErr(ctx, 1, "missing goal"); return; }
+        \\        var skill_ctx = zigmodu.ai.SkillContext{ .allocator = ctx.allocator };
+        \\        const result = self.service.run(goal, &skill_ctx) catch { try R.wrapErr(ctx, .server_error, "agent error"); return; };
+        \\        try R.wrapOk(ctx, result);
         \\    }
-        \\    fn runAgent(ctx: *http.Context) !void { const s = resolve(ctx); const goal = ctx.queryStr("goal", ""); if (goal.len == 0) { try R.wrapErr(ctx, 1, "missing goal"); return; } var skill_ctx = zigmodu.ai.SkillContext{ .allocator = ctx.allocator }; const result = s.service.run(goal, &skill_ctx) catch { try R.wrapErr(ctx, .server_error, "agent error"); return; }; try R.wrapOk(ctx, result); }
-        \\    fn listRuns(ctx: *http.Context) !void { const s = resolve(ctx); const page = ctx.queryInt(usize, "pageNo", 1); const size = ctx.queryInt(usize, "pageSize", 10); const tid = ctx.queryInt(i64, "tenantId", 0); const r = try s.service.getRuns(tid, page, size); try R.wrapList(ctx, r); }
-        \\    fn getRun(ctx: *http.Context) !void { const s = resolve(ctx); const id = ctx.queryInt(i64, "id", 0); if (try s.service.getRun(id)) |run| { try R.wrapOk(ctx, run); } else { try R.wrapErr(ctx, .not_found, "not found"); } }
+        \\    fn listRuns(ctx: *http.Context, self: *State) !void {
+        \\        const page = ctx.queryInt(usize, "pageNo", 1);
+        \\        const size = ctx.queryInt(usize, "pageSize", 10);
+        \\        const tid = ctx.queryInt(i64, "tenantId", 0);
+        \\        const r = try self.service.getRuns(tid, page, size);
+        \\        try R.wrapList(ctx, r);
+        \\    }
+        \\    fn getRun(ctx: *http.Context, self: *State) !void {
+        \\        const id = ctx.queryInt(i64, "id", 0);
+        \\        if (try self.service.getRun(id)) |run| {
+        \\            try R.wrapOk(ctx, run);
+        \\        } else {
+        \\            try R.wrapErr(ctx, .not_found, "not found");
+        \\        }
+        \\    }
         \\};
     , gen_opts);
 
@@ -5338,20 +5431,57 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
     // ── api.zig ──
     const ap = try std.fmt.allocPrint(allocator, "{s}/api.zig", .{dir}); defer allocator.free(ap);
     try safeWrite(io, allocator, ap,
-        \\const std = @import("std"); const zigmodu = @import("zigmodu"); const http = zigmodu.http; const service = @import("service.zig"); const model = @import("model.zig"); const R = @import("../../shared/response.zig");
-        \\pub const Web4Api = struct { service: *service.Web4Service,
+        \\const std = @import("std");
+        \\const zigmodu = @import("zigmodu");
+        \\const http = zigmodu.http;
+        \\const service = @import("service.zig");
+        \\const model = @import("model.zig");
+        \\const R = @import("../../shared/response.zig");
+        \\pub const Web4Api = struct {
+        \\    service: *service.Web4Service,
+        \\
+        \\    pub const module_name = "web4";
+        \\    pub const nest = .{"web4"};
+        \\    pub const State = @This();
+        \\
         \\    pub fn init(s: *service.Web4Service) Web4Api { return .{ .service = s }; }
-        \\    fn resolve(ctx: *http.Context) *Web4Api { return @ptrCast(@alignCast(ctx.user_data orelse unreachable)); }
-        \\    pub fn registerRoutes(self: *Web4Api, group: *http.RouteGroup) !void {
-        \\        try group.post("/web4/identity", createIdentity, @ptrCast(@alignCast(self)));
-        \\        try group.get("/web4/identity", getIdentity, @ptrCast(@alignCast(self)));
-        \\        try group.post("/web4/invoice", createInvoice, @ptrCast(@alignCast(self)));
-        \\        try group.get("/web4/invoices", listInvoices, @ptrCast(@alignCast(self)));
+        \\
+        \\    pub const routes = [_]http.RouteSpec(State){
+        \\        .{ .method = .POST, .path = "identity", .handler = createIdentity },
+        \\        .{ .method = .GET, .path = "identity", .handler = getIdentity },
+        \\        .{ .method = .POST, .path = "invoice", .handler = createInvoice },
+        \\        .{ .method = .GET, .path = "invoices", .handler = listInvoices },
+        \\    };
+        \\
+        \\    fn createIdentity(ctx: *http.Context, self: *State) !void {
+        \\        const tid = ctx.queryInt(i64, "tenantId", 0);
+        \\        const uid = ctx.queryInt(i64, "userId", 0);
+        \\        const ident = self.service.createIdentity(tid, uid) catch { try R.wrapErr(ctx, .server_error, "DID creation failed"); return; };
+        \\        try R.wrapOk(ctx, ident);
         \\    }
-        \\    fn createIdentity(ctx: *http.Context) !void { const s = resolve(ctx); const tid = ctx.queryInt(i64, "tenantId", 0); const uid = ctx.queryInt(i64, "userId", 0); const ident = s.service.createIdentity(tid, uid) catch { try R.wrapErr(ctx, .server_error, "DID creation failed"); return; }; try R.wrapOk(ctx, ident); }
-        \\    fn getIdentity(ctx: *http.Context) !void { const s = resolve(ctx); const tid = ctx.queryInt(i64, "tenantId", 0); const uid = ctx.queryInt(i64, "userId", 0); if (try s.service.getIdentity(tid, uid)) |i| { try R.wrapOk(ctx, i); } else { try R.wrapErr(ctx, .not_found, "not found"); } }
-        \\    fn createInvoice(ctx: *http.Context) !void { const s = resolve(ctx); const tid = ctx.queryInt(i64, "tenantId", 0); const amt = ctx.queryInt(i64, "amount", 0); const cur = ctx.queryStr("currency", "usdc"); const inv = s.service.createInvoice(tid, amt, cur, "did:key:z...") catch { try R.wrapErr(ctx, .server_error, "invoice failed"); return; }; try R.wrapOk(ctx, inv); }
-        \\    fn listInvoices(ctx: *http.Context) !void { const s = resolve(ctx); const tid = ctx.queryInt(i64, "tenantId", 0); const page = ctx.queryInt(usize, "pageNo", 1); const size = ctx.queryInt(usize, "pageSize", 10); const r = try s.service.getInvoices(tid, page, size); try R.wrapList(ctx, r); }
+        \\    fn getIdentity(ctx: *http.Context, self: *State) !void {
+        \\        const tid = ctx.queryInt(i64, "tenantId", 0);
+        \\        const uid = ctx.queryInt(i64, "userId", 0);
+        \\        if (try self.service.getIdentity(tid, uid)) |i| {
+        \\            try R.wrapOk(ctx, i);
+        \\        } else {
+        \\            try R.wrapErr(ctx, .not_found, "not found");
+        \\        }
+        \\    }
+        \\    fn createInvoice(ctx: *http.Context, self: *State) !void {
+        \\        const tid = ctx.queryInt(i64, "tenantId", 0);
+        \\        const amt = ctx.queryInt(i64, "amount", 0);
+        \\        const cur = ctx.queryStr("currency", "usdc");
+        \\        const inv = self.service.createInvoice(tid, amt, cur, "did:key:z...") catch { try R.wrapErr(ctx, .server_error, "invoice failed"); return; };
+        \\        try R.wrapOk(ctx, inv);
+        \\    }
+        \\    fn listInvoices(ctx: *http.Context, self: *State) !void {
+        \\        const tid = ctx.queryInt(i64, "tenantId", 0);
+        \\        const page = ctx.queryInt(usize, "pageNo", 1);
+        \\        const size = ctx.queryInt(usize, "pageSize", 10);
+        \\        const r = try self.service.getInvoices(tid, page, size);
+        \\        try R.wrapList(ctx, r);
+        \\    }
         \\};
     , gen_opts);
 
@@ -5613,11 +5743,10 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
             \\}
             \\```
             \\
-            \\### api.zig — Custom endpoints
+            \\### api.zig — Custom endpoints (ComptimeRouter)
             \\```zig
-            \\pub fn registerRoutes(self: *ImApi, group: *zigmodu.http.RouteGroup) !void {
-            \\    try group.get("/im/search", searchMessages, @ptrCast(@alignCast(self)));
-            \\}
+            \\// Add rows to `pub const routes` (docs/ROUTE_TABLE.md):
+            \\.{ .method = .GET, .path = "search", .handler = searchMessages },
             \\```
             \\
             \\### onMessage — Custom WS frame handling
@@ -5926,52 +6055,69 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
         \\const http = @import("zigmodu").http;
         \\const service = @import("service.zig");
         \\const model = @import("model.zig");
+        \\const gateway = @import("gateway.zig");
         \\const R = @import("../../shared/response.zig");
         \\
         \\pub const ImApi = struct {
         \\    service: *service.ImService,
+        \\    /// Set before mount so `ws_routes` can resolve the gateway.
+        \\    gateway: *gateway.ImGateway,
         \\
-        \\    pub fn init(svc: *service.ImService) ImApi { return .{ .service = svc }; }
+        \\    pub const module_name = "im";
+        \\    pub const nest = .{"im"};
+        \\    pub const State = @This();
         \\
-        \\    fn resolve(ctx: *http.Context) *ImApi {
-        \\        return @ptrCast(@alignCast(ctx.user_data orelse unreachable));
+        \\    pub fn init(svc: *service.ImService, gw: *gateway.ImGateway) ImApi {
+        \\        return .{ .service = svc, .gateway = gw };
         \\    }
         \\
-        \\    pub fn registerRoutes(self: *ImApi, group: *http.RouteGroup) !void {
-        \\        try group.get("/im/conversations", listConversations, @ptrCast(@alignCast(self)));
-        \\        try group.get("/im/messages", listMessages, @ptrCast(@alignCast(self)));
-        \\        try group.post("/im/send", sendMessage, @ptrCast(@alignCast(self)));
+        \\    pub const routes = [_]http.RouteSpec(State){
+        \\        .{ .method = .GET, .path = "conversations", .handler = listConversations },
+        \\        .{ .method = .GET, .path = "messages", .handler = listMessages },
+        \\        .{ .method = .POST, .path = "send", .handler = sendMessage },
+        \\    };
+        \\
+        \\    pub const ws_routes = [_]http.WsSpec(State){
+        \\        .{
+        \\            .path = "ws",
+        \\            .on_connect = wsConnect,
+        \\            .on_message = gateway.ImGateway.onMessage,
+        \\            .on_close = gateway.ImGateway.onClose,
+        \\            .meta = .{ .auth = .jwt },
+        \\        },
+        \\    };
+        \\
+        \\    fn wsConnect(ctx: *http.Context, framer: *anyopaque) ?*anyopaque {
+        \\        const self: *ImApi = @ptrCast(@alignCast(ctx.user_data orelse return null));
+        \\        return self.gateway.accept(ctx, framer);
         \\    }
         \\
-        \\    fn listConversations(ctx: *http.Context) !void {
-        \\        const s = resolve(ctx);
+        \\    fn listConversations(ctx: *http.Context, self: *State) !void {
         \\        const page = ctx.queryInt(usize, "pageNo", 1);
         \\        const size = ctx.queryInt(usize, "pageSize", 10);
         \\        const user_id = ctx.queryInt(i64, "userId", 0);
-        \\        const result = try s.service.getConversations(user_id, page, size);
+        \\        const result = try self.service.getConversations(user_id, page, size);
         \\        try R.wrapList(ctx, result);
         \\    }
         \\
-        \\    fn listMessages(ctx: *http.Context) !void {
-        \\        const s = resolve(ctx);
+        \\    fn listMessages(ctx: *http.Context, self: *State) !void {
         \\        const conv_id = ctx.queryInt(i64, "conversationId", 0);
         \\        const page = ctx.queryInt(usize, "pageNo", 1);
         \\        const size = ctx.queryInt(usize, "pageSize", 20);
-        \\        const result = try s.service.getMessages(conv_id, page, size);
+        \\        const result = try self.service.getMessages(conv_id, page, size);
         \\        try R.wrapList(ctx, result);
         \\    }
         \\
-        \\    fn sendMessage(ctx: *http.Context) !void {
-        \\        const s = resolve(ctx);
+        \\    fn sendMessage(ctx: *http.Context, self: *State) !void {
         \\        const msg = ctx.bindJson(model.Message) catch {
         \\            try R.wrapErr(ctx, .validation_failed, "invalid body");
         \\            return;
         \\        };
-        \\        s.service.validateMessage(msg) catch {
+        \\        self.service.validateMessage(msg) catch {
         \\            try R.wrapErr(ctx, .validation_failed, "validation failed");
         \\            return;
         \\        };
-        \\        const saved = try s.service.send(msg);
+        \\        const saved = try self.service.send(msg);
         \\        try R.wrapOk(ctx, saved);
         \\    }
         \\};
@@ -6074,28 +6220,32 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
         \\    }
         \\    pub fn deinit(self: *ImGateway) void { self.registry.deinit(); }
         \\    pub fn setMsgHandler(self: *ImGateway, handler: MsgHandler, ctx: *anyopaque) void { self.msg_handler = handler; self.msg_ctx = ctx; }
-        \\    pub fn register(self: *ImGateway, group: *http.RouteGroup, allocator: std.mem.Allocator) !void { _ = allocator; try group.ws("/im/ws", onConnect, onMessage, onClose, @ptrCast(@alignCast(self))); }
+        \\    /// Prefer ComptimeRouter `ImApi.ws_routes`; kept for manual RouteGroup wiring.
+        \\    pub fn register(self: *ImGateway, group: *http.RouteGroup, allocator: std.mem.Allocator) !void {
+        \\        _ = allocator;
+        \\        try group.ws("/im/ws", onConnect, onMessage, onClose, @ptrCast(@alignCast(self)));
+        \\    }
         \\    pub fn cleanup(self: *ImGateway) usize { return self.registry.tickAndCleanup(3); }
         \\
-        \\    fn onConnect(ctx: *http.Context, raw_framer: *anyopaque) ?*anyopaque {
-        \\        const gw: *ImGateway = @ptrCast(@alignCast(ctx.user_data orelse return null));
+        \\    /// Shared by legacy `register` and ComptimeRouter `ws_routes`.
+        \\    pub fn accept(self: *ImGateway, ctx: *http.Context, raw_framer: *anyopaque) ?*anyopaque {
         \\        const framer: *WsFramer = @ptrCast(@alignCast(raw_framer));
         \\
         \\        const user_id = ctx.queryInt(u64, "userId", 0);
         \\        if (user_id == 0) return null;
         \\
-        \\        const session = gw.allocator.create(WsSession) catch return null;
+        \\        const session = self.allocator.create(WsSession) catch return null;
         \\        session.* = .{
         \\            .user_id = user_id,
         \\            .conn_id = 0,
         \\            .framer = framer.*,
-        \\            .gateway = gw,
+        \\            .gateway = self,
         \\            .mutex = std.Io.Mutex.init,
         \\            .last_ping_tick = 0,
         \\        };
-        \\        const conn_id = gw.registry.register(user_id, @ptrCast(session), sendViaWsFramer);
+        \\        const conn_id = self.registry.register(user_id, @ptrCast(session), sendViaWsFramer);
         \\        if (conn_id == 0) {
-        \\            gw.allocator.destroy(session);
+        \\            self.allocator.destroy(session);
         \\            return null;
         \\        }
         \\        session.conn_id = conn_id;
@@ -6103,17 +6253,22 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
         \\        return @ptrCast(session);
         \\    }
         \\
+        \\    fn onConnect(ctx: *http.Context, raw_framer: *anyopaque) ?*anyopaque {
+        \\        const gw: *ImGateway = @ptrCast(@alignCast(ctx.user_data orelse return null));
+        \\        return gw.accept(ctx, raw_framer);
+        \\    }
+        \\
         \\    fn sendViaWsFramer(ctx: *anyopaque, msg: []const u8) anyerror!void {
         \\        const session: *WsSession = @ptrCast(@alignCast(ctx));
         \\        try session.send(msg);
         \\    }
         \\
-        \\    fn onMessage(session_ptr: ?*anyopaque, msg: []const u8) void {
+        \\    pub fn onMessage(session_ptr: ?*anyopaque, msg: []const u8) void {
         \\        const session: *WsSession = @ptrCast(@alignCast(session_ptr orelse return));
         \\        if (session.gateway.msg_handler) |h| h(session.gateway.msg_ctx.?, session.user_id, msg);
         \\    }
         \\
-        \\    fn onClose(session_ptr: ?*anyopaque) void {
+        \\    pub fn onClose(session_ptr: ?*anyopaque) void {
         \\        const session: *WsSession = @ptrCast(@alignCast(session_ptr orelse return));
         \\        std.log.info("[im] user {d} disconnected (conn={d})", .{ session.user_id, session.conn_id });
         \\        session.gateway.registry.unregisterByConn(session.conn_id);
@@ -7181,12 +7336,30 @@ fn wireModulesIntoMainZig(io: std.Io, allocator: std.mem.Allocator, new_modules:
         }
 
         // Insert routes before // -- Lifecycle --
+        // New scaffold: ComptimeRouter mount; legacy: registerRoutes.
         if (!inserted_routes and std.mem.eql(u8, trimmed, "// -- Lifecycle --")) {
             inserted_routes = true;
-            for (to_wire.items) |mod_name| {
-                const var_name = try replaceChar(allocator, mod_name, '/', '_');
-                defer allocator.free(var_name);
-                try out.print(allocator, "    try {s}_api.registerRoutes(&root);\n", .{var_name});
+            const use_mount = std.mem.indexOf(u8, main_content, "mountAll") != null or
+                std.mem.indexOf(u8, main_content, "// -- Routes (ComptimeRouter) --") != null;
+            if (use_mount) {
+                // Insert mount lines before finish()/catalog — best-effort: before Lifecycle.
+                for (to_wire.items) |mod_name| {
+                    const var_name = try replaceChar(allocator, mod_name, '/', '_');
+                    defer allocator.free(var_name);
+                    const pascal = try toPascalCase(allocator, var_name);
+                    defer allocator.free(pascal);
+                    if (isZigReserved(var_name)) {
+                        try out.print(allocator, "    try admin.mount({s}_mod.api.{s}Api, &{s}_api);\n", .{ var_name, pascal, var_name });
+                    } else {
+                        try out.print(allocator, "    try admin.mount({s}.api.{s}Api, &{s}_api);\n", .{ var_name, pascal, var_name });
+                    }
+                }
+            } else {
+                for (to_wire.items) |mod_name| {
+                    const var_name = try replaceChar(allocator, mod_name, '/', '_');
+                    defer allocator.free(var_name);
+                    try out.print(allocator, "    try {s}_api.registerRoutes(&root);\n", .{var_name});
+                }
             }
             try out.append(allocator, '\n');
         }
@@ -7237,7 +7410,7 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
     try buf.appendSlice(allocator,
         \\//! @initialized by zmodu — AI may modify
         \\//! ✅ Add business logic in service.zig
-        \\//! ✅ Add custom routes in api.zig registerRoutes()
+        \\//! ✅ Add custom routes in api.zig `pub const routes`
         \\
         \\const std = @import("std");
         \\const zigmodu = @import("zigmodu");
@@ -7326,6 +7499,55 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
         }
     }
 
+    // Plugin modules (ComptimeRouter) — init before mountAll/finish
+    if (sopts.with_websocket) {
+        try buf.appendSlice(allocator,
+            \\
+            \\    // ── IM (HTTP + WS via ComptimeRouter ws_routes) ──
+            \\    const im = @import("modules/im/module.zig");
+            \\    var im_p = im.persistence.ImPersistence.init(backend);
+            \\    var im_svc = im.service.ImService.init(&im_p);
+            \\    var im_gw = im.gateway.ImGateway.init(allocator, init.io);
+            \\    defer im_gw.deinit();
+            \\    var im_relay = im.relay.ImRelay.init(&im_gw.registry, allocator);
+            \\    im_svc.setRelay(@ptrCast(&im_relay), @ptrCast(&im.relay.ImRelay.deliver));
+            \\    var im_api = im.api.ImApi.init(&im_svc, &im_gw);
+            \\
+        );
+    }
+    if (sopts.with_aichat) {
+        try buf.appendSlice(allocator,
+            \\    // ── AI Chat ──
+            \\    const ai_chat = @import("modules/ai/chat/module.zig");
+            \\    var ai_chat_p = ai_chat.persistence.AiChatPersistence.init(backend);
+            \\    var ai_chat_svc = ai_chat.service.AiChatService.init(allocator, &ai_chat_p);
+            \\    var ai_chat_api = ai_chat.api.AiChatApi.init(&ai_chat_svc);
+            \\
+        );
+    }
+    if (sopts.with_agent) {
+        try buf.appendSlice(allocator,
+            \\    // ── AI Agent ──
+            \\    const ai_agent = @import("modules/ai/agent/module.zig");
+            \\    var skill_registry = zigmodu.ai.SkillRegistry.init(allocator, init.io);
+            \\    defer skill_registry.deinit();
+            \\    var ai_agent_p = ai_agent.persistence.AiAgentPersistence.init(backend);
+            \\    var ai_agent_svc = ai_agent.service.AiAgentService.init(&ai_agent_p, &skill_registry);
+            \\    var ai_agent_api = ai_agent.api.AiAgentApi.init(&ai_agent_svc);
+            \\
+        );
+    }
+    if (sopts.with_web4) {
+        try buf.appendSlice(allocator,
+            \\    // ── Web4: DID + x402 ──
+            \\    const web4 = @import("modules/web4/module.zig");
+            \\    var web4_p = web4.persistence.Web4Persistence.init(backend);
+            \\    var web4_svc = web4.service.Web4Service.init(&web4_p, allocator, init.io);
+            \\    var web4_api = web4.api.Web4Api.init(&web4_svc);
+            \\
+        );
+    }
+
     // HTTP server + health
     try buf.appendSlice(allocator,
         \\
@@ -7344,20 +7566,43 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
         \\
     );
 
-    // Auth middleware (after server)
+    // Auth middleware (after server) — catalog-aware JWT when --with-auth
+    try buf.appendSlice(allocator,
+        \\    var catalog_slot: zigmodu.http.CatalogSlot = .{};
+        \\    defer catalog_slot.deinit();
+        \\
+    );
     if (sopts.with_auth) {
         try buf.appendSlice(allocator,
-            \\    // -- Auth (AppSecurity + JWT) --
+            \\    // -- Auth (ComptimeRouter catalog + fine-grained RBAC) --
+            \\    // Prefer this stack over security.auth.jwtAuth* (legacy; overwrites user_data).
+            \\    // Replace role_perms with security.CatalogPermDb.loaderFromClient(&db) in production.
             \\    const jwt_secret = env.get("JWT_SECRET") orelse "changeme-in-production";
             \\    var app_sec = zigmodu.security.AppSecurity.init(allocator, init.io, .{ .jwt_secret = jwt_secret, .token_expiry_seconds = 3600 });
             \\    defer app_sec.module.deinit();
-            \\    try server.addMiddleware(try app_sec.rbacJwtMiddleware(allocator));
+            \\    const role_perms = zigmodu.security.Rbac.RolePermissionTable{ .rows = &.{
+            \\        .{ .role = "admin", .permissions = &.{ "system:admin", "system:write", "system:read" } },
+            \\        .{ .role = "user", .permissions = &.{ "system:read" } },
+            \\    } };
+            \\    try server.addMiddleware(zigmodu.http.jwtAuthFromCatalogWithPermissions(
+            \\        &app_sec.module,
+            \\        &catalog_slot,
+            \\        zigmodu.http.catalogLoaderFromTable(&role_perms),
+            \\        .{},
+            \\    ));
+            \\    try server.addMiddleware(zigmodu.http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
+            \\    try server.addMiddleware(zigmodu.http.permissionGateWith(&catalog_slot, .{ .mode = .rbac }));
             \\
             \\    // Rate limiter
             \\    var auth_limiter = try zigmodu.RateLimiter.init(allocator, "api", 1000, 100);
             \\    defer auth_limiter.deinit();
             \\    try server.addMiddleware(zigmodu.http.tracing_middleware.rateLimit(&auth_limiter));
             \\
+            \\
+        );
+    } else {
+        try buf.appendSlice(allocator,
+            \\    try server.addMiddleware(zigmodu.http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
             \\
         );
     }
@@ -7368,18 +7613,103 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
     }
 
     try buf.appendSlice(allocator,
-        \\    var root = server.group("/admin-api");
-        \\    try root.get("/health/live", healthLive, null);
-        \\    try root.get("/health/ready", healthReady, null);
+        \\    // Health (legacy RouteGroup — not part of module catalog)
+        \\    var health = server.group("/admin-api");
+        \\    try health.get("/health/live", healthLive, null);
+        \\    try health.get("/health/ready", healthReady, null);
         \\
+        \\    // -- Routes (ComptimeRouter) --
+        \\    const AppState = struct {};
+        \\    var app_state: AppState = .{};
         \\
     );
 
+    // assertNoDupes (SQL modules + optional plugins)
+    try buf.appendSlice(allocator, "    comptime zigmodu.http.assertNoDupes(.{");
+    var need_comma = false;
     for (module_names) |name| {
         const var_name = try replaceChar(allocator, name, '/', '_');
         defer allocator.free(var_name);
-        try buf.print(allocator, "    try {s}_api.registerRoutes(&root);\n", .{var_name});
+        const pascal = try toPascalCase(allocator, var_name);
+        defer allocator.free(pascal);
+        if (need_comma) try buf.appendSlice(allocator, ",");
+        if (isZigReserved(var_name)) {
+            try buf.print(allocator, " {s}_mod.api.{s}Api", .{ var_name, pascal });
+        } else {
+            try buf.print(allocator, " {s}.api.{s}Api", .{ var_name, pascal });
+        }
+        need_comma = true;
     }
+    if (sopts.with_websocket) {
+        if (need_comma) try buf.appendSlice(allocator, ",");
+        try buf.appendSlice(allocator, " im.api.ImApi");
+        need_comma = true;
+    }
+    if (sopts.with_aichat) {
+        if (need_comma) try buf.appendSlice(allocator, ",");
+        try buf.appendSlice(allocator, " ai_chat.api.AiChatApi");
+        need_comma = true;
+    }
+    if (sopts.with_agent) {
+        if (need_comma) try buf.appendSlice(allocator, ",");
+        try buf.appendSlice(allocator, " ai_agent.api.AiAgentApi");
+        need_comma = true;
+    }
+    if (sopts.with_web4) {
+        if (need_comma) try buf.appendSlice(allocator, ",");
+        try buf.appendSlice(allocator, " web4.api.Web4Api");
+    }
+    try buf.appendSlice(allocator, " });\n\n");
+
+    try buf.appendSlice(allocator,
+        \\    var router = zigmodu.http.Router(AppState).init(init.io, allocator, &server, &app_state);
+        \\    defer router.deinit();
+        \\    var admin = router.scope("/admin-api");
+        \\    try admin.mountAll(.{
+        \\
+    );
+    for (module_names) |name| {
+        const var_name = try replaceChar(allocator, name, '/', '_');
+        defer allocator.free(var_name);
+        const pascal = try toPascalCase(allocator, var_name);
+        defer allocator.free(pascal);
+        if (isZigReserved(var_name)) {
+            try buf.print(allocator, "        .{{ .Mod = {s}_mod.api.{s}Api, .state = &{s}_api }},\n", .{ var_name, pascal, var_name });
+        } else {
+            try buf.print(allocator, "        .{{ .Mod = {s}.api.{s}Api, .state = &{s}_api }},\n", .{ var_name, pascal, var_name });
+        }
+    }
+    if (sopts.with_websocket) {
+        try buf.appendSlice(allocator, "        .{ .Mod = im.api.ImApi, .state = &im_api },\n");
+    }
+    if (sopts.with_aichat) {
+        try buf.appendSlice(allocator, "        .{ .Mod = ai_chat.api.AiChatApi, .state = &ai_chat_api },\n");
+    }
+    if (sopts.with_agent) {
+        try buf.appendSlice(allocator, "        .{ .Mod = ai_agent.api.AiAgentApi, .state = &ai_agent_api },\n");
+    }
+    if (sopts.with_web4) {
+        try buf.appendSlice(allocator, "        .{ .Mod = web4.api.Web4Api, .state = &web4_api },\n");
+    }
+    try buf.appendSlice(allocator,
+        \\    });
+        \\    catalog_slot.set(try router.finish());
+        \\    try server.addRoute(.{
+        \\        .method = .GET,
+        \\        .path = "openapi.json",
+        \\        .handler = zigmodu.http.openApiFromCatalog(&catalog_slot, .{
+        \\            .title = "
+    );
+    try buf.appendSlice(allocator, project_name);
+    try buf.appendSlice(allocator,
+        \\",
+        \\            .version = "0.1.0",
+        \\            .description = "ComptimeRouter catalog (live)",
+        \\        }),
+        \\    });
+        \\    _ = catalog_slot.get();
+        \\
+    );
     // ── Capability flags ──
     if (sopts.with_events) {
         try buf.appendSlice(allocator, "\n    // -- EventBus --\n    var event_bus = zigmodu.EventBus(struct { id: i64 }).init(allocator);\n    defer event_bus.deinit();\n");
@@ -7397,54 +7727,8 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
     }
     if (sopts.with_websocket) {
         try buf.appendSlice(allocator,
-            \\    // ── IM WebSocket Gateway ──
-            \\    const im = @import("modules/im/module.zig");
-            \\    var im_p = im.persistence.ImPersistence.init(backend);
-            \\    var im_svc = im.service.ImService.init(&im_p);
-            \\    var im_api = im.api.ImApi.init(&im_svc);
-            \\    var im_gw = im.gateway.ImGateway.init(allocator, init.io);
-            \\    defer im_gw.deinit();
-            \\    var im_relay = im.relay.ImRelay.init(&im_gw.registry, allocator);
-            \\    im_svc.setRelay(@ptrCast(&im_relay), @ptrCast(&im.relay.ImRelay.deliver));
-            \\    try im_api.registerRoutes(&root);
-            \\    try im_gw.register(&root, allocator);
-            \\    // Periodic cleanup (every ~30s in production via cron/timer)
+            \\    // ── IM keepalive (WS already mounted via ImApi.ws_routes) ──
             \\    _ = im_gw.cleanup();
-            \\
-        );
-    }
-    if (sopts.with_aichat) {
-        try buf.appendSlice(allocator,
-            \\    // ── AI Chat ──
-            \\    const ai_chat = @import("modules/ai/chat/module.zig");
-            \\    var ai_chat_p = ai_chat.persistence.AiChatPersistence.init(backend);
-            \\    var ai_chat_svc = ai_chat.service.AiChatService.init(allocator, &ai_chat_p);
-            \\    var ai_chat_api = ai_chat.api.AiChatApi.init(&ai_chat_svc);
-            \\    try ai_chat_api.registerRoutes(&root);
-            \\
-        );
-    }
-    if (sopts.with_agent) {
-        try buf.appendSlice(allocator,
-            \\    // ── AI Agent ──
-            \\    const ai_agent = @import("modules/ai/agent/module.zig");
-            \\    var skill_registry = zigmodu.ai.SkillRegistry.init(allocator, init.io);
-            \\    defer skill_registry.deinit();
-            \\    var ai_agent_p = ai_agent.persistence.AiAgentPersistence.init(backend);
-            \\    var ai_agent_svc = ai_agent.service.AiAgentService.init(&ai_agent_p, &skill_registry);
-            \\    var ai_agent_api = ai_agent.api.AiAgentApi.init(&ai_agent_svc);
-            \\    try ai_agent_api.registerRoutes(&root);
-            \\
-        );
-    }
-    if (sopts.with_web4) {
-        try buf.appendSlice(allocator,
-            \\    // ── Web4: DID + x402 ──
-            \\    const web4 = @import("modules/web4/module.zig");
-            \\    var web4_p = web4.persistence.Web4Persistence.init(backend);
-            \\    var web4_svc = web4.service.Web4Service.init(&web4_p, allocator, init.io);
-            \\    var web4_api = web4.api.Web4Api.init(&web4_svc);
-            \\    try web4_api.registerRoutes(&root);
             \\
         );
     }
@@ -7591,6 +7875,71 @@ test "generateModule: aligns with zigmodu.api.Module + lifecycle" {
     try std.testing.expect(std.mem.indexOf(u8, code, ".is_internal = false") != null);
     try std.testing.expect(std.mem.indexOf(u8, code, "pub fn init() !void") != null);
     try std.testing.expect(std.mem.indexOf(u8, code, "pub fn deinit() void") != null);
+}
+
+test "formatNestTuple splits module path" {
+    const a = std.testing.allocator;
+    const flat = try formatNestTuple(a, "order");
+    defer a.free(flat);
+    try std.testing.expectEqualStrings(".{ \"order\" }", flat);
+    const nested = try formatNestTuple(a, "shop/order");
+    defer a.free(nested);
+    try std.testing.expectEqualStrings(".{ \"shop\", \"order\" }", nested);
+}
+
+test "generateModuleApi emits RouteSpec table and typed handlers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cols = [_]ColumnDef{.{
+        .name = try a.dupe(u8, "id"),
+        .col_type = .int,
+        .nullable = false,
+        .is_primary_key = true,
+        .is_unique = false,
+        .has_default = false,
+        .comment = null,
+    }};
+    const table = TableDef{ .name = try a.dupe(u8, "orders"), .columns = cols[0..], .foreign_keys = &.{} };
+    const code = try generateModuleApi(a, "order", &.{table}, 0);
+    try std.testing.expect(std.mem.indexOf(u8, code, "pub const routes = [_]http.RouteSpec(State)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "pub const nest = .{ \"order\" }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, ".path = \"list\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "fn listOrders(ctx: *http.Context, self: *State)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "registerRoutes") == null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "resolve(ctx)") == null);
+}
+
+test "generateScaffoldMainZig mounts plugins via ComptimeRouter" {
+    const a = std.testing.allocator;
+    const names = [_][]const u8{"order"};
+    const code = try generateScaffoldMainZig(a, "demo", &names, .{
+        .sql_path = null,
+        .project_name = "demo",
+        .out_dir = ".",
+        .force = false,
+        .dry_run = false,
+        .with_websocket = true,
+        .with_aichat = true,
+        .with_agent = true,
+        .with_web4 = true,
+        .with_auth = true,
+    });
+    defer a.free(code);
+    try std.testing.expect(std.mem.indexOf(u8, code, ".{ .Mod = im.api.ImApi, .state = &im_api }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, ".{ .Mod = ai_chat.api.AiChatApi, .state = &ai_chat_api }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, ".{ .Mod = ai_agent.api.AiAgentApi, .state = &ai_agent_api }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, ".{ .Mod = web4.api.Web4Api, .state = &web4_api }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "im.api.ImApi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "ImApi.init(&im_svc, &im_gw)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "openApiFromCatalog(&catalog_slot") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "im_gw.register") == null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "im_api.registerRoutes") == null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "ai_chat_api.registerRoutes") == null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "jwtAuthFromCatalogWithPermissions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "permissionGateWith(&catalog_slot, .{ .mode = .rbac })") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "RolePermissionTable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "permissionGate(&catalog_slot)") == null);
 }
 
 test "generateZentClient: buildGraph types on one line" {

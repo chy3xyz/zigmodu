@@ -10,7 +10,7 @@ pub fn InventoryService(comptime Persistence: type) type {
             return .{ .persistence = p };
         }
 
-        pub fn listByTenant(self: *Self, tenant_id: i64) ![]model.Inventory {
+        pub fn listByTenant(self: *Self, tenant_id: i64) !zigmodu.data.sqlx.QueryResult(model.Inventory) {
             return try self.persistence.findByTenant(tenant_id);
         }
 

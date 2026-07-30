@@ -34,7 +34,7 @@ pub fn CartPersistence(comptime Backend: type) type {
             return result.last_insert_id orelse return error.DatabaseError;
         }
 
-        pub fn listItems(self: *Self, tenant_id: i64, cart_id: i64) ![]model.CartItem {
+        pub fn listItems(self: *Self, tenant_id: i64, cart_id: i64) !data.sqlx.QueryResult(model.CartItem) {
             return try self.db.queryRowsPartial(model.CartItem,
                 "SELECT id, tenant_id, cart_id, product_id, qty FROM cart_items WHERE tenant_id = ? AND cart_id = ? ORDER BY id",
                 &.{ .{ .int = tenant_id }, .{ .int = cart_id } },
@@ -83,7 +83,7 @@ pub const Tx = struct {
         allocator: std.mem.Allocator,
         tenant_id: i64,
         cart_id: i64,
-    ) ![]model.CartItem {
+    ) !data.sqlx.QueryResult(model.CartItem) {
         return try tx.queryRows(allocator, model.CartItem,
             "SELECT id, tenant_id, cart_id, product_id, qty FROM cart_items WHERE tenant_id = ? AND cart_id = ?",
             &.{ .{ .int = tenant_id }, .{ .int = cart_id } },

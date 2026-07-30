@@ -70,8 +70,8 @@ pub fn TenantService(comptime Persistence: type) type {
             try self.persistence.update(tenant);
         }
 
-        /// 获取所有活跃租户
-        pub fn listActive(self: *Self) ![]model.Tenant {
+        /// 获取所有活跃租户（调用方 `defer result.deinit(allocator)`）
+        pub fn listActive(self: *Self) !zigmodu.data.sqlx.QueryResult(model.Tenant) {
             return try self.persistence.findAll();
         }
 

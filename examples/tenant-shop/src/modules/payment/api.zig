@@ -8,14 +8,18 @@ pub fn PaymentApi(comptime Service: type) type {
         const Self = @This();
         service: *Service,
 
+        pub const module_name = "payment";
+        pub const nest = .{"payments"};
+        pub const State = Self;
+
+        pub const routes = [_]http.RouteSpec(State){
+            .{ .method = .GET, .path = "", .handler = listPayments },
+            .{ .method = .POST, .path = "charge", .handler = charge },
+            .{ .method = .GET, .path = "status", .handler = status },
+        };
+
         pub fn init(svc: *Service) Self {
             return .{ .service = svc };
-        }
-
-        pub fn registerRoutes(self: *Self, group: *http.RouteGroup) !void {
-            try group.get("/payments", listPayments, @ptrCast(@alignCast(self)));
-            try group.post("/payments/charge", charge, @ptrCast(@alignCast(self)));
-            try group.get("/payments/status", status, null);
         }
 
         fn tenantId(ctx: *http.Context) !i64 {
@@ -29,18 +33,19 @@ pub fn PaymentApi(comptime Service: type) type {
             };
         }
 
-        fn listPayments(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn listPayments(ctx: *http.Context, self: *State) !void {
             const tid = try tenantId(ctx);
             const oid_s = ctx.queryParam("order_id") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing order_id");
                 return;
             };
             const oid = try std.fmt.parseInt(i64, oid_s, 10);
-            const rows = self.service.listByOrder(tid, oid) catch {
+            var rows_qr = self.service.listByOrder(tid, oid) catch {
                 try ctx.sendErrorResponse(500, 0, "Failed to list payments");
                 return;
             };
+            defer rows_qr.deinit(ctx.allocator);
+            const rows = rows_qr.items;
             var buf = std.ArrayList(u8).empty;
             defer buf.deinit(ctx.allocator);
             try buf.appendSlice(ctx.allocator, "{\"payments\":[");
@@ -56,8 +61,7 @@ pub fn PaymentApi(comptime Service: type) type {
             try ctx.json(200, buf.items);
         }
 
-        fn charge(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn charge(ctx: *http.Context, self: *State) !void {
             const tid = try tenantId(ctx);
             const oid_s = ctx.queryParam("order_id") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing order_id");
@@ -96,7 +100,7 @@ pub fn PaymentApi(comptime Service: type) type {
             try ctx.json(200, resp);
         }
 
-        fn status(ctx: *http.Context) !void {
+        fn status(ctx: *http.Context, _: *State) !void {
             try ctx.json(200, "{\"module\":\"payment\",\"status\":\"ok\"}");
         }
     };

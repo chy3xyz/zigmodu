@@ -12,7 +12,7 @@ pub fn InventoryPersistence(comptime Backend: type) type {
             return .{ .db = db };
         }
 
-        pub fn findByTenant(self: *Self, tenant_id: i64) ![]model.Inventory {
+        pub fn findByTenant(self: *Self, tenant_id: i64) !data.sqlx.QueryResult(model.Inventory) {
             return try self.db.queryRowsPartial(model.Inventory,
                 "SELECT id, tenant_id, product_id, qty, reserved, updated_at FROM inventory WHERE tenant_id = ? ORDER BY id",
                 &.{.{ .int = tenant_id }},

@@ -33,7 +33,7 @@ pub const OrderService = struct {
         };
     }
 
-    pub fn listByTenant(self: *Self, tenant_id: i64) ![]model.Order {
+    pub fn listByTenant(self: *Self, tenant_id: i64) !data.sqlx.QueryResult(model.Order) {
         return try self.store.listByTenant(tenant_id);
     }
 
@@ -42,8 +42,9 @@ pub const OrderService = struct {
         errdefer tx.rollback() catch |err| std.log.err("[order] rollback failed: {}", .{err});
 
         const cart = try cart_persist.Tx.findCart(&tx, self.allocator, cmd.tenant_id, cmd.user_id);
-        const items = try cart_persist.Tx.listItems(&tx, self.allocator, cmd.tenant_id, cart.id);
-        defer self.allocator.free(items);
+        var items_qr = try cart_persist.Tx.listItems(&tx, self.allocator, cmd.tenant_id, cart.id);
+        defer items_qr.deinit(self.allocator);
+        const items = items_qr.items;
         if (items.len == 0) return error.InvalidInput;
 
         var total: i64 = 0;

@@ -88,9 +88,18 @@ pub fn refreshCache() void {
 
 /// Returns wall-clock seconds via `std.Io` (async-compatible).
 /// Use this when you have access to an `std.Io` instance.
+///
+/// Prefer this over removed `std.posix.clock_gettime(.REALTIME, …)` / wall
+/// helpers for request timestamps (`collected_at`, audit logs, etc.).
 pub fn wallClockSeconds(io: std.Io) i64 {
     const ts = std.Io.Clock.Timestamp.now(io, .real);
     return @intCast(@divTrunc(ts.raw.nanoseconds, std.time.ns_per_s));
+}
+
+/// Returns wall-clock milliseconds via `std.Io` (async-compatible).
+pub fn wallClockMilliseconds(io: std.Io) i64 {
+    const ts = std.Io.Clock.Timestamp.now(io, .real);
+    return @intCast(@divTrunc(ts.raw.nanoseconds, std.time.ns_per_ms));
 }
 
 test "monotonicNow returns positive value" {

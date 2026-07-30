@@ -45,8 +45,11 @@ src/modules/
 | **Comptime Generics** | `TenantService(comptime Persistence: type)` |
 | **Tenant Isolation** | All queries scoped by `tenant_id`, X-Tenant-ID header |
 | **Error Handling** | RFC 7807 Problem Details via `zigmodu.sendProblem()` |
-| **Middleware Chain** | Tenant → JWT → DataPermission ordered middleware |
+| **Middleware Chain** | Tenant → JWT(+role→perm) → ModuleGate → PermissionGate(rbac) → DataPermission |
 | **API Versioning** | `/api/v1/` prefix with RouteGroup |
+| **ComptimeRouter** | All 3 modules: `routes` + `mountAll`; catalog drives JWT/ModuleGate/PermissionGate |
+| **RBAC** | `RolePermissionTable` (or `CatalogPermDb` for SQLite): JWT role → permission codes |
+| **OpenAPI** | Live `openApiFromCatalog` → `GET /openapi.json` |
 | **Health Probes** | `/health/live` for K8s liveness |
 | **Dashboard** | Interactive HTMX + Alpine.js + TailwindCSS dashboard at `/dashboard` |
 | **Business Enums** | Type-safe `TenantTier`, `UserRole`, `SubscriptionStatus` |
@@ -74,6 +77,10 @@ zig build run
 
 # 5. Explore
 open http://localhost:18080/dashboard
+curl -s http://localhost:18080/openapi.json | head
+# JWT with roles (admin/owner map to tenant:suspend):
+# JWT_SECRET=dev-secret JWT_ROLES=admin,user ./zig-out/bin/gen-jwt-token
+# JWT_SECRET=dev-secret JWT_ROLES=user ./zig-out/bin/gen-jwt-token  # DELETE → 403
 ```
 
 ## API Reference
@@ -85,7 +92,7 @@ open http://localhost:18080/dashboard
 | `POST` | `/api/v1/tenants?name=X&domain=Y&tier=free` | Create tenant |
 | `GET` | `/api/v1/tenants/{id}` | Get tenant details |
 | `PUT` | `/api/v1/tenants/{id}/tier?tier=pro` | Upgrade/downgrade tier |
-| `DELETE` | `/api/v1/tenants/{id}` | Suspend tenant |
+| `DELETE` | `/api/v1/tenants/{id}` | Suspend tenant (`permission=tenant:suspend`) |
 
 ### Users
 | Method | Endpoint | Description |

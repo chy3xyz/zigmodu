@@ -16,6 +16,23 @@ pub fn AdminBffApi(
         order_svc: *OrderService,
         poller: *Poller,
 
+        pub const module_name = "admin_bff";
+        pub const nest = .{"admin"};
+        pub const State = Self;
+
+        pub const routes = [_]http.RouteSpec(State){
+            .{ .method = .GET, .path = "products", .handler = listProducts },
+            .{ .method = .POST, .path = "products", .handler = createProduct },
+            .{ .method = .GET, .path = "inventory", .handler = listInventory },
+            .{ .method = .POST, .path = "inventory", .handler = setInventory },
+            .{ .method = .GET, .path = "orders", .handler = listOrders },
+            .{ .method = .GET, .path = "outbox", .handler = listOutbox },
+            .{ .method = .GET, .path = "outbox/dlq", .handler = listDlq },
+            .{ .method = .POST, .path = "outbox/drain", .handler = drainOutbox },
+            .{ .method = .POST, .path = "outbox/requeue", .handler = requeueOutbox },
+            .{ .method = .GET, .path = "status", .handler = status },
+        };
+
         pub fn init(
             product_svc: *ProductService,
             inventory_svc: *InventoryService,
@@ -30,19 +47,6 @@ pub fn AdminBffApi(
             };
         }
 
-        pub fn registerRoutes(self: *Self, group: *http.RouteGroup) !void {
-            try group.get("/admin/products", listProducts, @ptrCast(@alignCast(self)));
-            try group.post("/admin/products", createProduct, @ptrCast(@alignCast(self)));
-            try group.get("/admin/inventory", listInventory, @ptrCast(@alignCast(self)));
-            try group.post("/admin/inventory", setInventory, @ptrCast(@alignCast(self)));
-            try group.get("/admin/orders", listOrders, @ptrCast(@alignCast(self)));
-            try group.get("/admin/outbox", listOutbox, @ptrCast(@alignCast(self)));
-            try group.get("/admin/outbox/dlq", listDlq, @ptrCast(@alignCast(self)));
-            try group.post("/admin/outbox/drain", drainOutbox, @ptrCast(@alignCast(self)));
-            try group.post("/admin/outbox/requeue", requeueOutbox, @ptrCast(@alignCast(self)));
-            try group.get("/admin/status", status, null);
-        }
-
         fn tenantId(ctx: *http.Context) !i64 {
             const s = ctx.queryParam("tenant_id") orelse ctx.getAttr("tenant_id") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing tenant_id");
@@ -54,13 +58,14 @@ pub fn AdminBffApi(
             };
         }
 
-        fn listProducts(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn listProducts(ctx: *http.Context, self: *State) !void {
             const tid = try tenantId(ctx);
-            const products = self.product_svc.listByTenant(tid) catch {
+            var products_qr = self.product_svc.listByTenant(tid) catch {
                 try ctx.sendErrorResponse(500, 0, "Failed to list products");
                 return;
             };
+            defer products_qr.deinit(ctx.allocator);
+            const products = products_qr.items;
             var buf = std.ArrayList(u8).empty;
             defer buf.deinit(ctx.allocator);
             try buf.appendSlice(ctx.allocator, "{\"products\":[");
@@ -76,8 +81,7 @@ pub fn AdminBffApi(
             try ctx.json(200, buf.items);
         }
 
-        fn createProduct(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn createProduct(ctx: *http.Context, self: *State) !void {
             const tid = try tenantId(ctx);
             const name = ctx.queryParam("name") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing name");
@@ -96,13 +100,14 @@ pub fn AdminBffApi(
             try ctx.json(201, resp);
         }
 
-        fn listInventory(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn listInventory(ctx: *http.Context, self: *State) !void {
             const tid = try tenantId(ctx);
-            const rows = self.inventory_svc.listByTenant(tid) catch {
+            var rows_qr = self.inventory_svc.listByTenant(tid) catch {
                 try ctx.sendErrorResponse(500, 0, "Failed to list inventory");
                 return;
             };
+            defer rows_qr.deinit(ctx.allocator);
+            const rows = rows_qr.items;
             var buf = std.ArrayList(u8).empty;
             defer buf.deinit(ctx.allocator);
             try buf.appendSlice(ctx.allocator, "{\"inventory\":[");
@@ -118,8 +123,7 @@ pub fn AdminBffApi(
             try ctx.json(200, buf.items);
         }
 
-        fn setInventory(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn setInventory(ctx: *http.Context, self: *State) !void {
             const tid = try tenantId(ctx);
             const pid_s = ctx.queryParam("product_id") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing product_id");
@@ -138,13 +142,14 @@ pub fn AdminBffApi(
             try ctx.json(200, "{\"status\":\"ok\"}");
         }
 
-        fn listOrders(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn listOrders(ctx: *http.Context, self: *State) !void {
             const tid = try tenantId(ctx);
-            const orders = self.order_svc.listByTenant(tid) catch {
+            var orders_qr = self.order_svc.listByTenant(tid) catch {
                 try ctx.sendErrorResponse(500, 0, "Failed to list orders");
                 return;
             };
+            defer orders_qr.deinit(ctx.allocator);
+            const orders = orders_qr.items;
             var buf = std.ArrayList(u8).empty;
             defer buf.deinit(ctx.allocator);
             try buf.appendSlice(ctx.allocator, "{\"orders\":[");
@@ -160,26 +165,25 @@ pub fn AdminBffApi(
             try ctx.json(200, buf.items);
         }
 
-        fn listOutbox(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
-            const rows = self.poller.listRecent(50) catch {
+        fn listOutbox(ctx: *http.Context, self: *State) !void {
+            var rows_qr = self.poller.listRecent(50) catch {
                 try ctx.sendErrorResponse(500, 0, "outbox list failed");
                 return;
             };
-            try writeOutbox(ctx, rows);
+            defer rows_qr.deinit(ctx.allocator);
+            try writeOutbox(ctx, rows_qr.items);
         }
 
-        fn listDlq(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
-            const rows = self.poller.listByStatus("dlq", 50) catch {
+        fn listDlq(ctx: *http.Context, self: *State) !void {
+            var rows_qr = self.poller.listByStatus("dlq", 50) catch {
                 try ctx.sendErrorResponse(500, 0, "dlq list failed");
                 return;
             };
-            try writeOutbox(ctx, rows);
+            defer rows_qr.deinit(ctx.allocator);
+            try writeOutbox(ctx, rows_qr.items);
         }
 
-        fn drainOutbox(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn drainOutbox(ctx: *http.Context, self: *State) !void {
             const sim = ctx.queryParam("simulate_fail");
             const want_fail = if (sim) |s| std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "true") else false;
             self.poller.setSimulateFail(want_fail);
@@ -195,8 +199,7 @@ pub fn AdminBffApi(
             try ctx.json(200, resp);
         }
 
-        fn requeueOutbox(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn requeueOutbox(ctx: *http.Context, self: *State) !void {
             const id_s = ctx.queryParam("id") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing id");
                 return;
@@ -230,7 +233,7 @@ pub fn AdminBffApi(
             try ctx.json(200, buf.items);
         }
 
-        fn status(ctx: *http.Context) !void {
+        fn status(ctx: *http.Context, _: *State) !void {
             try ctx.json(200, "{\"bff\":\"admin\",\"status\":\"ok\"}");
         }
     };

@@ -8,14 +8,18 @@ pub fn OrderApi(comptime Service: type) type {
         const Self = @This();
         service: *Service,
 
+        pub const module_name = "order";
+        pub const nest = .{"orders"};
+        pub const State = Self;
+
+        pub const routes = [_]http.RouteSpec(State){
+            .{ .method = .GET, .path = "", .handler = listOrders },
+            .{ .method = .POST, .path = "checkout", .handler = checkout },
+            .{ .method = .GET, .path = "status", .handler = status },
+        };
+
         pub fn init(svc: *Service) Self {
             return .{ .service = svc };
-        }
-
-        pub fn registerRoutes(self: *Self, group: *http.RouteGroup) !void {
-            try group.get("/orders", listOrders, @ptrCast(@alignCast(self)));
-            try group.post("/orders/checkout", checkout, @ptrCast(@alignCast(self)));
-            try group.get("/orders/status", status, null);
         }
 
         fn tenantId(ctx: *http.Context) !i64 {
@@ -29,13 +33,14 @@ pub fn OrderApi(comptime Service: type) type {
             };
         }
 
-        fn listOrders(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn listOrders(ctx: *http.Context, self: *State) !void {
             const tid = try tenantId(ctx);
-            const orders = self.service.listByTenant(tid) catch {
+            var orders_qr = self.service.listByTenant(tid) catch {
                 try ctx.sendErrorResponse(500, 0, "Failed to list orders");
                 return;
             };
+            defer orders_qr.deinit(ctx.allocator);
+            const orders = orders_qr.items;
             var buf = std.ArrayList(u8).empty;
             defer buf.deinit(ctx.allocator);
             try buf.appendSlice(ctx.allocator, "{\"orders\":[");
@@ -51,8 +56,7 @@ pub fn OrderApi(comptime Service: type) type {
             try ctx.json(200, buf.items);
         }
 
-        fn checkout(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn checkout(ctx: *http.Context, self: *State) !void {
             const tid = try tenantId(ctx);
             const uid_s = ctx.queryParam("user_id") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing user_id");
@@ -76,11 +80,10 @@ pub fn OrderApi(comptime Service: type) type {
             try ctx.json(201, resp);
         }
 
-        fn status(ctx: *http.Context) !void {
+        fn status(ctx: *http.Context, _: *State) !void {
             try ctx.json(200, "{\"module\":\"order\",\"status\":\"ok\"}");
         }
     };
 }
 
-// Keep type alias usable when Service is concrete OrderService
 pub const DefaultOrderApi = OrderApi(service.OrderService);

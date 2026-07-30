@@ -84,11 +84,11 @@ pub const Poller = struct {
         defer self.allocator.free(sql);
 
         const rows = try self.db.queryRowsPartial(Row, sql, &.{});
-        defer self.allocator.free(rows);
+        defer rows.deinit(self.allocator);
 
         const force_fail = self.simulate_fail.load(.monotonic);
 
-        for (rows) |row| {
+        for (rows.items) |row| {
             const key_buf = try std.fmt.allocPrint(self.allocator, "{d}", .{row.tenant_id});
             defer self.allocator.free(key_buf);
 
@@ -144,7 +144,7 @@ pub const Poller = struct {
         return result;
     }
 
-    pub fn listRecent(self: *Self, limit: u32) ![]Row {
+    pub fn listRecent(self: *Self, limit: u32) !data.sqlx.QueryResult(Row) {
         const sql = try std.fmt.allocPrint(
             self.allocator,
             \\SELECT id, tenant_id, topic, payload, status, retry_count, max_retries, last_error, created_at, updated_at
@@ -156,7 +156,7 @@ pub const Poller = struct {
         return try self.db.queryRowsPartial(Row, sql, &.{});
     }
 
-    pub fn listByStatus(self: *Self, status: []const u8, limit: u32) ![]Row {
+    pub fn listByStatus(self: *Self, status: []const u8, limit: u32) !data.sqlx.QueryResult(Row) {
         const sql = try std.fmt.allocPrint(
             self.allocator,
             \\SELECT id, tenant_id, topic, payload, status, retry_count, max_retries, last_error, created_at, updated_at

@@ -9,14 +9,18 @@ pub fn ShopBffApi(comptime OrderService: type, comptime PaymentService: type) ty
         order_svc: *OrderService,
         payment_svc: *PaymentService,
 
+        pub const module_name = "shop_bff";
+        pub const nest = .{"shop"};
+        pub const State = Self;
+
+        pub const routes = [_]http.RouteSpec(State){
+            .{ .method = .POST, .path = "checkout", .handler = checkout },
+            .{ .method = .POST, .path = "pay", .handler = pay },
+            .{ .method = .GET, .path = "status", .handler = status },
+        };
+
         pub fn init(order_svc: *OrderService, payment_svc: *PaymentService) Self {
             return .{ .order_svc = order_svc, .payment_svc = payment_svc };
-        }
-
-        pub fn registerRoutes(self: *Self, group: *http.RouteGroup) !void {
-            try group.post("/shop/checkout", checkout, @ptrCast(@alignCast(self)));
-            try group.post("/shop/pay", pay, @ptrCast(@alignCast(self)));
-            try group.get("/shop/status", status, null);
         }
 
         fn tenantId(ctx: *http.Context) !i64 {
@@ -30,8 +34,7 @@ pub fn ShopBffApi(comptime OrderService: type, comptime PaymentService: type) ty
             };
         }
 
-        fn checkout(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn checkout(ctx: *http.Context, self: *State) !void {
             const tid = try tenantId(ctx);
             const uid_s = ctx.queryParam("user_id") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing user_id");
@@ -55,8 +58,7 @@ pub fn ShopBffApi(comptime OrderService: type, comptime PaymentService: type) ty
             try ctx.json(201, resp);
         }
 
-        fn pay(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn pay(ctx: *http.Context, self: *State) !void {
             const tid = try tenantId(ctx);
             const oid_s = ctx.queryParam("order_id") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing order_id");
@@ -95,7 +97,7 @@ pub fn ShopBffApi(comptime OrderService: type, comptime PaymentService: type) ty
             try ctx.json(200, resp);
         }
 
-        fn status(ctx: *http.Context) !void {
+        fn status(ctx: *http.Context, _: *State) !void {
             try ctx.json(200, "{\"bff\":\"shop\",\"status\":\"ok\"}");
         }
     };

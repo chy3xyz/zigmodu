@@ -27,7 +27,7 @@ pub fn UserService(comptime Persistence: type) type {
             return user;
         }
 
-        pub fn listByTenant(self: *Self, tenant_id: i64) ![]model.User {
+        pub fn listByTenant(self: *Self, tenant_id: i64) !@import("zigmodu").data.sqlx.QueryResult(model.User) {
             return try self.persistence.findByTenant(tenant_id);
         }
 

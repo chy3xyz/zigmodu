@@ -7,13 +7,17 @@ pub fn InventoryApi(comptime Service: type) type {
         const Self = @This();
         service: *Service,
 
+        pub const module_name = "inventory";
+        pub const nest = .{"inventory"};
+        pub const State = Self;
+
+        pub const routes = [_]http.RouteSpec(State){
+            .{ .method = .GET, .path = "", .handler = listInventory },
+            .{ .method = .POST, .path = "", .handler = setInventory },
+        };
+
         pub fn init(svc: *Service) Self {
             return .{ .service = svc };
-        }
-
-        pub fn registerRoutes(self: *Self, group: *http.RouteGroup) !void {
-            try group.get("/inventory", listInventory, @ptrCast(@alignCast(self)));
-            try group.post("/inventory", setInventory, @ptrCast(@alignCast(self)));
         }
 
         fn tenantId(ctx: *http.Context) !i64 {
@@ -27,13 +31,14 @@ pub fn InventoryApi(comptime Service: type) type {
             };
         }
 
-        fn listInventory(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn listInventory(ctx: *http.Context, self: *State) !void {
             const tid = try tenantId(ctx);
-            const rows = self.service.listByTenant(tid) catch {
+            var rows_qr = self.service.listByTenant(tid) catch {
                 try ctx.sendErrorResponse(500, 0, "Failed to list inventory");
                 return;
             };
+            defer rows_qr.deinit(ctx.allocator);
+            const rows = rows_qr.items;
             var buf = std.ArrayList(u8).empty;
             defer buf.deinit(ctx.allocator);
             try buf.appendSlice(ctx.allocator, "{\"inventory\":[");
@@ -49,8 +54,7 @@ pub fn InventoryApi(comptime Service: type) type {
             try ctx.json(200, buf.items);
         }
 
-        fn setInventory(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn setInventory(ctx: *http.Context, self: *State) !void {
             const tid = try tenantId(ctx);
             const pid_s = ctx.queryParam("product_id") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing product_id");

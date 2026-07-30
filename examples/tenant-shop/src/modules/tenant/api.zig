@@ -7,23 +7,27 @@ pub fn TenantApi(comptime Service: type) type {
         const Self = @This();
         service: *Service,
 
+        pub const module_name = "tenant";
+        pub const nest = .{"tenants"};
+        pub const State = Self;
+
+        pub const routes = [_]http.RouteSpec(State){
+            .{ .method = .GET, .path = "", .handler = listTenants },
+            .{ .method = .POST, .path = "", .handler = createTenant },
+            .{ .method = .GET, .path = "{id}", .handler = getTenant },
+        };
+
         pub fn init(svc: *Service) Self {
             return .{ .service = svc };
         }
 
-        pub fn registerRoutes(self: *Self, group: *http.RouteGroup) !void {
-            try group.get("/tenants", listTenants, @ptrCast(@alignCast(self)));
-            try group.post("/tenants", createTenant, @ptrCast(@alignCast(self)));
-            try group.get("/tenants/{id}", getTenant, @ptrCast(@alignCast(self)));
-        }
-
-        fn listTenants(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
-            const tenants = self.service.listActive() catch {
+        fn listTenants(ctx: *http.Context, self: *State) !void {
+            var tenants_qr = self.service.listActive() catch {
                 try ctx.sendErrorResponse(500, 0, "Failed to list tenants");
                 return;
             };
-            defer self.service.freeTenantList(tenants);
+            defer tenants_qr.deinit(ctx.allocator);
+            const tenants = tenants_qr.items;
 
             var buf = std.ArrayList(u8).empty;
             defer buf.deinit(ctx.allocator);
@@ -40,8 +44,7 @@ pub fn TenantApi(comptime Service: type) type {
             try ctx.json(200, buf.items);
         }
 
-        fn createTenant(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn createTenant(ctx: *http.Context, self: *State) !void {
             const name = ctx.queryParam("name") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing name");
                 return;
@@ -62,8 +65,7 @@ pub fn TenantApi(comptime Service: type) type {
             try ctx.json(201, resp);
         }
 
-        fn getTenant(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn getTenant(ctx: *http.Context, self: *State) !void {
             const id = try ctx.paramInt(i64, "id");
             const tenant = (try self.service.getById(id)) orelse {
                 try ctx.sendErrorResponse(404, 0, "Tenant not found");

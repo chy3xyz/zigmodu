@@ -8,7 +8,7 @@ const catalog = @import("modules/catalog/root.zig");
 
 // ═══════════════════════════════════════════════════
 // ZigModu Application + zent (ent-style) data layer
-// See docs/ZENT.md
+// See docs/ZENT.md · ComptimeRouter: docs/ROUTE_TABLE.md
 //
 // Run (requires sibling checkout of chy3xyz/zent):
 //   cd examples/zent-modulith && HTTP_PORT=18100 zig build run
@@ -18,7 +18,7 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
 
-    std.log.info("zent-modulith: ZigModu + zent demo starting", .{});
+    std.log.info("zent-modulith: ZigModu + zent demo starting (ComptimeRouter)", .{});
 
     // --- zent: open SQLite + migrate schema-as-code ---
     const sqlite_path = init.environ_map.get("ZENT_SQLITE") orelse ":memory:";
@@ -28,7 +28,8 @@ pub fn main(init: std.process.Init) !void {
 
     var store = catalog.persistence.CatalogStore.init(allocator, env.client);
     var catalog_svc = catalog.service.CatalogService.init(&store);
-    var catalog_api = catalog.api.CatalogApi(@TypeOf(catalog_svc)).init(&catalog_svc);
+    const CatalogApiT = catalog.api.CatalogApi(@TypeOf(catalog_svc));
+    var catalog_api = CatalogApiT.init(&catalog_svc);
 
     // --- ZigModu modules ---
     var modules = try zigmodu.scanModules(allocator, .{catalog_module});
@@ -47,8 +48,33 @@ pub fn main(init: std.process.Init) !void {
     var server = zigmodu.http.Server.init(io, allocator, port);
     defer server.deinit();
 
-    var v1 = server.group("/api/v1");
-    try catalog_api.registerRoutes(&v1);
+    var catalog_slot: zigmodu.http.CatalogSlot = .{};
+    defer catalog_slot.deinit();
+    try server.addMiddleware(zigmodu.http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
+
+    comptime zigmodu.http.assertNoDupes(.{CatalogApiT});
+
+    const AppState = struct {};
+    var app_state: AppState = .{};
+    var router = zigmodu.http.Router(AppState).init(io, allocator, &server, &app_state);
+    defer router.deinit();
+    router.default_auth = .public;
+
+    var api_v1 = router.scope("/api/v1");
+    try api_v1.mountAll(.{
+        .{ .Mod = CatalogApiT, .state = &catalog_api },
+    });
+    catalog_slot.set(try router.finish());
+
+    try server.addRoute(.{
+        .method = .GET,
+        .path = "openapi.json",
+        .handler = zigmodu.http.openApiFromCatalog(&catalog_slot, .{
+            .title = "zent-modulith",
+            .version = "0.1.0",
+            .description = "ComptimeRouter + zent catalog",
+        }),
+    });
 
     try server.addRoute(.{
         .method = .GET,
@@ -60,8 +86,10 @@ pub fn main(init: std.process.Init) !void {
         }.handle,
     });
 
+    std.log.info("[main] route catalog: {d} entries", .{catalog_slot.get().?.entries.len});
     std.log.info("[main] listening http://127.0.0.1:{d}", .{port});
     std.log.info("[main] POST /api/v1/tenants?name=&domain=", .{});
     std.log.info("[main] POST /api/v1/products?tenant_id=&name=&price_cents=", .{});
+    std.log.info("[main] OpenAPI: http://127.0.0.1:{d}/openapi.json", .{port});
     try server.start();
 }

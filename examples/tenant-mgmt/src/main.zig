@@ -47,7 +47,7 @@ pub fn main(init: std.process.Init) !void {
 
     std.log.info("╔══════════════════════════════════════════╗", .{});
     std.log.info("║  Multi-Tenant Management System          ║", .{});
-    std.log.info("║  ZigModu v0.13.15 — Best Practice Demo  ║", .{});
+    std.log.info("║  ZigModu — Best Practice Demo (ComptimeRouter: 3 modules)   ║", .{});
     std.log.info("╚══════════════════════════════════════════╝", .{});
 
     const sqlite_path = init.environ_map.get("TENANT_MGMT_SQLITE") orelse ":memory:";
@@ -58,6 +58,14 @@ pub fn main(init: std.process.Init) !void {
     defer db_client.deinit();
     try db_client.connect();
     try schema.apply(&db_client);
+    try zigmodu.security.CatalogPermDb.ensureSchema(&db_client);
+    try zigmodu.security.CatalogPermDb.grant(&db_client, "admin", zigmodu.security.Rbac.Permissions.tenant_read);
+    try zigmodu.security.CatalogPermDb.grant(&db_client, "admin", zigmodu.security.Rbac.Permissions.tenant_write);
+    try zigmodu.security.CatalogPermDb.grant(&db_client, "admin", zigmodu.security.Rbac.Permissions.tenant_suspend);
+    try zigmodu.security.CatalogPermDb.grant(&db_client, "owner", zigmodu.security.Rbac.Permissions.tenant_read);
+    try zigmodu.security.CatalogPermDb.grant(&db_client, "owner", zigmodu.security.Rbac.Permissions.tenant_write);
+    try zigmodu.security.CatalogPermDb.grant(&db_client, "owner", zigmodu.security.Rbac.Permissions.tenant_suspend);
+    try zigmodu.security.CatalogPermDb.grant(&db_client, "user", zigmodu.security.Rbac.Permissions.tenant_read);
     std.log.info("[main] SQLite ready at {s}", .{sqlite_path});
 
     // ── 1. Scan modules ────────────────────────────
@@ -106,20 +114,54 @@ pub fn main(init: std.process.Init) !void {
     var server = zigmodu.http.Server.init(io, allocator, port);
     defer server.deinit();
 
-    // ── 6. Global Middleware ────────────────────────
+    // ── 6. Global Middleware (catalog slot filled after mount) ──
     const jwt_secret = init.environ_map.get("JWT_SECRET") orelse "dev-secret";
     var app_sec = zigmodu.security.AppSecurity.init(allocator, io, .{ .jwt_secret = jwt_secret });
-    // Order: tenant → JWT → data permission
+    var catalog_slot: zigmodu.http.CatalogSlot = .{};
+    defer catalog_slot.deinit();
+    // Order: tenant → JWT(from catalog) → ModuleGate → data permission
     try server.addMiddleware(middleware.tenantMiddleware());
-    try server.addMiddleware(middleware.jwtAuthMiddleware(&app_sec.module));
+    try server.addMiddleware(middleware.jwtAuthMiddleware(&app_sec.module, &catalog_slot, &db_client));
+    try server.addMiddleware(middleware.moduleGateMiddleware(&catalog_slot));
+    try server.addMiddleware(middleware.permissionGateMiddleware(&catalog_slot));
     try server.addMiddleware(middleware.dataPermissionMiddleware());
 
-    // ── 7. API Routes (v1) ──────────────────────────
-    var v1 = server.group("/api/v1");
+    // ── 7. API Routes (v1) — all modules via ComptimeRouter ──
+    const AppState = struct {};
+    var app_state: AppState = .{};
+    const TenantApiT = @TypeOf(tenant_api);
+    const UserApiT = @TypeOf(user_api);
+    const SubApiT = @TypeOf(sub_api);
+    comptime zigmodu.http.assertNoDupes(.{ TenantApiT, UserApiT, SubApiT });
 
-    try tenant_api.registerRoutes(&v1);
-    try user_api.registerRoutes(&v1);
-    try sub_api.registerRoutes(&v1);
+    var router = zigmodu.http.Router(AppState).init(io, allocator, &server, &app_state);
+    defer router.deinit();
+
+    var api_v1 = router.scope("/api/v1");
+    try api_v1.mountAll(.{
+        .{ .Mod = TenantApiT, .state = &tenant_api },
+        .{ .Mod = UserApiT, .state = &user_api },
+        .{ .Mod = SubApiT, .state = &sub_api },
+    });
+
+    catalog_slot.set(try router.finish());
+    std.log.info("[main] route catalog: {d} entries; tenants={s} users={s} plans={s}", .{
+        catalog_slot.get().?.entries.len,
+        catalog_slot.get().?.moduleFor("/api/v1/tenants") orelse "?",
+        catalog_slot.get().?.moduleFor("/api/v1/users") orelse "?",
+        catalog_slot.get().?.moduleFor("/api/v1/plans") orelse "?",
+    });
+
+    // OpenAPI live from catalog (regenerates each request)
+    try server.addRoute(.{
+        .method = .GET,
+        .path = "openapi.json",
+        .handler = zigmodu.http.openApiFromCatalog(&catalog_slot, .{
+            .title = "tenant-mgmt",
+            .version = "0.1.0",
+            .description = "ComptimeRouter catalog (live)",
+        }),
+    });
 
     // ── 8. Health endpoints ─────────────────────────
     try server.addRoute(.{

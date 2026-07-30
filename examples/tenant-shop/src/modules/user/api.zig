@@ -7,13 +7,17 @@ pub fn UserApi(comptime Service: type) type {
         const Self = @This();
         service: *Service,
 
+        pub const module_name = "user";
+        pub const nest = .{"users"};
+        pub const State = Self;
+
+        pub const routes = [_]http.RouteSpec(State){
+            .{ .method = .GET, .path = "", .handler = listUsers },
+            .{ .method = .POST, .path = "", .handler = createUser },
+        };
+
         pub fn init(svc: *Service) Self {
             return .{ .service = svc };
-        }
-
-        pub fn registerRoutes(self: *Self, group: *http.RouteGroup) !void {
-            try group.get("/users", listUsers, @ptrCast(@alignCast(self)));
-            try group.post("/users", createUser, @ptrCast(@alignCast(self)));
         }
 
         fn requireTenantId(ctx: *http.Context) !i64 {
@@ -27,13 +31,14 @@ pub fn UserApi(comptime Service: type) type {
             };
         }
 
-        fn listUsers(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn listUsers(ctx: *http.Context, self: *State) !void {
             const tenant_id = try requireTenantId(ctx);
-            const users = self.service.listByTenant(tenant_id) catch {
+            var users_qr = self.service.listByTenant(tenant_id) catch {
                 try ctx.sendErrorResponse(500, 0, "Failed to list users");
                 return;
             };
+            defer users_qr.deinit(ctx.allocator);
+            const users = users_qr.items;
             var buf = std.ArrayList(u8).empty;
             defer buf.deinit(ctx.allocator);
             try buf.appendSlice(ctx.allocator, "{\"users\":[");
@@ -49,8 +54,7 @@ pub fn UserApi(comptime Service: type) type {
             try ctx.json(200, buf.items);
         }
 
-        fn createUser(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn createUser(ctx: *http.Context, self: *State) !void {
             const tenant_id = try requireTenantId(ctx);
             const username = ctx.queryParam("username") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing username");

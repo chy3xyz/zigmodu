@@ -22,7 +22,7 @@ pub fn ProductPersistence(comptime Backend: type) type {
             };
         }
 
-        pub fn findByTenant(self: *Self, tenant_id: i64) ![]model.Product {
+        pub fn findByTenant(self: *Self, tenant_id: i64) !data.sqlx.QueryResult(model.Product) {
             return try self.db.queryRowsPartial(model.Product,
                 "SELECT id, tenant_id, name, price_cents, status, created_at, updated_at FROM products WHERE tenant_id = ? AND status = 1 ORDER BY id",
                 &.{.{ .int = tenant_id }},

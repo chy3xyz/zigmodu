@@ -41,7 +41,7 @@ pub fn TenantService(comptime Persistence: type) type {
             return try self.persistence.findById(id);
         }
 
-        pub fn listActive(self: *Self) ![]model.Tenant {
+        pub fn listActive(self: *Self) !zigmodu.data.sqlx.QueryResult(model.Tenant) {
             return try self.persistence.findAll();
         }
     };

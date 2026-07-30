@@ -7,13 +7,17 @@ pub fn ProductApi(comptime Service: type) type {
         const Self = @This();
         service: *Service,
 
+        pub const module_name = "product";
+        pub const nest = .{"products"};
+        pub const State = Self;
+
+        pub const routes = [_]http.RouteSpec(State){
+            .{ .method = .GET, .path = "", .handler = listProducts },
+            .{ .method = .POST, .path = "", .handler = createProduct },
+        };
+
         pub fn init(svc: *Service) Self {
             return .{ .service = svc };
-        }
-
-        pub fn registerRoutes(self: *Self, group: *http.RouteGroup) !void {
-            try group.get("/products", listProducts, @ptrCast(@alignCast(self)));
-            try group.post("/products", createProduct, @ptrCast(@alignCast(self)));
         }
 
         fn tenantId(ctx: *http.Context) !i64 {
@@ -27,13 +31,14 @@ pub fn ProductApi(comptime Service: type) type {
             };
         }
 
-        fn listProducts(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn listProducts(ctx: *http.Context, self: *State) !void {
             const tid = try tenantId(ctx);
-            const products = self.service.listByTenant(tid) catch {
+            var products_qr = self.service.listByTenant(tid) catch {
                 try ctx.sendErrorResponse(500, 0, "Failed to list products");
                 return;
             };
+            defer products_qr.deinit(ctx.allocator);
+            const products = products_qr.items;
             var buf = std.ArrayList(u8).empty;
             defer buf.deinit(ctx.allocator);
             try buf.appendSlice(ctx.allocator, "{\"products\":[");
@@ -49,8 +54,7 @@ pub fn ProductApi(comptime Service: type) type {
             try ctx.json(200, buf.items);
         }
 
-        fn createProduct(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn createProduct(ctx: *http.Context, self: *State) !void {
             const tid = try tenantId(ctx);
             const name = ctx.queryParam("name") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing name");

@@ -11,7 +11,7 @@
    - `model.zig` — 结构体、数据表名定位、JSON field 名称与默认值。
    - `persistence.zig` — `Repository(T)` 数据存储与自定义 SQL 探针。
    - `service.zig` — 业务逻辑校验与 EventBus 消息事件发布。
-   - `api.zig` — REST API 路由映射与 `{id}` 规范处理器。
+   - `api.zig` — ComptimeRouter `pub const routes`（`http.RouteSpec`）+ typed handler；scaffold 经 `mountAll` 接线（见 [`ROUTE_TABLE.md`](ROUTE_TABLE.md)）。
    - `module.zig` — Module 生命期（`init` / `deinit`）与导出链。
 3. **内置 MCP Server 交互能力**：内置 Model Context Protocol (MCP) Server，AI 智能体可直接通过 MCP Tool (如 `scaffold`, `module`, `verify`, `sql_diff`) 与代码库联动。
 

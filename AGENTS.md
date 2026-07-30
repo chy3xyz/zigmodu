@@ -74,6 +74,13 @@ const now_ms = Time.monotonicNowMilliseconds();
 
 ## Architecture Rules
 
+### HTTP routing (ComptimeRouter — preferred)
+- Modules declare `pub const routes` + `module_name` + `nest`; wire with `http.Router.scope.mountAll`
+- Auth stack: `jwtAuthFromCatalogWithPermissions` + `permissionGateWith(.{ .mode = .rbac })`
+- Permissions: static `Rbac.RolePermissionTable` or DB `CatalogPermDb.loaderFromClient`
+- **Do not** use `security.auth.jwtAuth` / `rbacJwtMiddleware` with ComptimeRouter (they overwrite `ctx.user_data`)
+- Guide: `docs/ROUTE_TABLE.md`
+
 ### Imports
 - NEVER use `zigmodu.http_server` — use `zigmodu.http.Context`
 - NEVER use `zigmodu.orm.Orm(...)` — use `zigmodu.data.Repository(T)`
@@ -182,6 +189,7 @@ test "my test" {
 - Domain layering (model / persistence.Tx / service Cmd): `docs/MODULE_LAYERS.md`
 - Built-in Tooling: `tools/zmodu` (run with `zig build zmodu`) · guide `docs/ZMODU_CLI_INTEGRATION.md`
 - ZigModu × zent (orthogonal ORM): `docs/ZENT.md` · example `examples/zent-modulith/`
+- Declarative HTTP routes: `docs/ROUTE_TABLE.md` — Zig-native comptime `routes` + `Router(State)` + `std.Io`; scaffold emits RouteSpec via `zmodu scaffold`
 - Score: ~98/100 (`docs/EVALUATION_REPORT.md` v5.3)
 
 ## Learned User Preferences

@@ -9,15 +9,19 @@ pub fn OutboxApi(comptime Poller: type) type {
         const Self = @This();
         poller: *Poller,
 
+        pub const module_name = "outbox";
+        pub const nest = .{"outbox"};
+        pub const State = Self;
+
+        pub const routes = [_]http.RouteSpec(State){
+            .{ .method = .POST, .path = "drain", .handler = drain },
+            .{ .method = .GET, .path = "", .handler = list },
+            .{ .method = .GET, .path = "dlq", .handler = listDlq },
+            .{ .method = .POST, .path = "requeue", .handler = requeue },
+        };
+
         pub fn init(poller: *Poller) Self {
             return .{ .poller = poller };
-        }
-
-        pub fn registerRoutes(self: *Self, group: *http.RouteGroup) !void {
-            try group.post("/outbox/drain", drain, @ptrCast(@alignCast(self)));
-            try group.get("/outbox", list, @ptrCast(@alignCast(self)));
-            try group.get("/outbox/dlq", listDlq, @ptrCast(@alignCast(self)));
-            try group.post("/outbox/requeue", requeue, @ptrCast(@alignCast(self)));
         }
 
         fn writeRows(ctx: *http.Context, rows: []const outbox.Row) !void {
@@ -37,8 +41,7 @@ pub fn OutboxApi(comptime Poller: type) type {
             try ctx.json(200, buf.items);
         }
 
-        fn drain(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn drain(ctx: *http.Context, self: *State) !void {
             const sim = ctx.queryParam("simulate_fail");
             const want_fail = if (sim) |s| std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "true") else false;
             self.poller.setSimulateFail(want_fail);
@@ -55,34 +58,34 @@ pub fn OutboxApi(comptime Poller: type) type {
             try ctx.json(200, resp);
         }
 
-        fn list(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn list(ctx: *http.Context, self: *State) !void {
             if (ctx.queryParam("status")) |st| {
-                const rows = self.poller.listByStatus(st, 50) catch {
+                var rows_qr = self.poller.listByStatus(st, 50) catch {
                     try ctx.sendErrorResponse(500, 0, "outbox list failed");
                     return;
                 };
-                try writeRows(ctx, rows);
+                defer rows_qr.deinit(ctx.allocator);
+                try writeRows(ctx, rows_qr.items);
                 return;
             }
-            const rows = self.poller.listRecent(50) catch {
+            var rows_qr = self.poller.listRecent(50) catch {
                 try ctx.sendErrorResponse(500, 0, "outbox list failed");
                 return;
             };
-            try writeRows(ctx, rows);
+            defer rows_qr.deinit(ctx.allocator);
+            try writeRows(ctx, rows_qr.items);
         }
 
-        fn listDlq(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
-            const rows = self.poller.listByStatus("dlq", 50) catch {
+        fn listDlq(ctx: *http.Context, self: *State) !void {
+            var rows_qr = self.poller.listByStatus("dlq", 50) catch {
                 try ctx.sendErrorResponse(500, 0, "outbox dlq list failed");
                 return;
             };
-            try writeRows(ctx, rows);
+            defer rows_qr.deinit(ctx.allocator);
+            try writeRows(ctx, rows_qr.items);
         }
 
-        fn requeue(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn requeue(ctx: *http.Context, self: *State) !void {
             const id_s = ctx.queryParam("id") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing id");
                 return;

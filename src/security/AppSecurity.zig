@@ -25,15 +25,22 @@ pub const AppSecurity = struct {
         return http_middleware.jwtAuthWithSecurity(&self.module);
     }
 
-    /// RBAC-aware JWT middleware (sets `Rbac.AuthInfo` in `ctx.user_data`).
+    /// RBAC-aware JWT middleware (sets `Rbac.AuthInfo` in `ctx.user_data` **and** `auth_info`).
+    ///
+    /// **Legacy for non-ComptimeRouter apps.** Overwrites `ctx.user_data`, which conflicts
+    /// with ComptimeRouter module state. Prefer:
+    ///   `http.jwtAuthFromCatalogWithPermissions` + `http.permissionGateWith(.{ .mode = .rbac })`
+    /// (see `docs/ROUTE_TABLE.md`).
+    ///
     /// Permissions stay empty — use `rbacJwtMiddlewareWithPermissions` when
     /// requirePermission() checks are in the chain.
     pub fn rbacJwtMiddleware(self: *AppSecurity, allocator: std.mem.Allocator) !api.Middleware {
         return AuthMiddleware.jwtAuth(&self.module, allocator);
     }
 
-    /// RBAC JWT middleware that also populates `AuthInfo.permissions` via `loader`
-    /// (typically a role→permission DB lookup), enabling requirePermission().
+    /// Legacy RBAC JWT + PermissionLoader (same `user_data` caveat as `rbacJwtMiddleware`).
+    /// For ComptimeRouter use `http.jwtAuthFromCatalogWithPermissions` +
+    /// `security.CatalogPermDb.loaderFromClient` or `RolePermissionTable`.
     pub fn rbacJwtMiddlewareWithPermissions(
         self: *AppSecurity,
         allocator: std.mem.Allocator,

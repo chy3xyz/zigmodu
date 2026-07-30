@@ -16,7 +16,13 @@ const Rbac = @import("Rbac.zig");
 ///   }
 pub const PermissionLoader = *const fn (allocator: std.mem.Allocator, auth: *Rbac.AuthInfo) anyerror!void;
 
-/// JWT authentication middleware — verifies token, builds AuthInfo, stores it in ctx.user_data.
+/// JWT authentication middleware — verifies token, builds AuthInfo, stores it in
+/// `ctx.auth_info` and `ctx.user_data`.
+///
+/// **Legacy path** for apps that do not use ComptimeRouter. Prefer
+/// `http.jwtAuthFromCatalogWithPermissions` when handlers take state via `user_data`
+/// (see `docs/ROUTE_TABLE.md`).
+///
 /// NOTE: `AuthInfo.permissions` stays empty with this variant, so requirePermission()
 /// will always deny. Use `jwtAuthWithPermissions` when permission checks are needed.
 pub fn jwtAuth(security: *SecurityModule, allocator: std.mem.Allocator) !api.Middleware {
@@ -115,13 +121,15 @@ fn runJwtAuth(
         auth.role_ids = role_ids;
     }
 
-    // Store auth in context for downstream handlers
+    // Store auth for downstream middleware (auth_info) and legacy handlers (user_data).
     const auth_ptr = allocator.create(Rbac.AuthInfo) catch return error.OutOfMemory;
     auth_ptr.* = auth;
+    ctx.auth_info = @ptrCast(auth_ptr);
     ctx.user_data = @ptrCast(auth_ptr);
     defer {
         auth_ptr.deinit(allocator);
         allocator.destroy(auth_ptr);
+        ctx.auth_info = null;
     }
 
     // Populate permissions from roles (RBAC) before the handler chain runs.
@@ -142,7 +150,7 @@ pub fn requirePermission(comptime perm: []const u8) api.Middleware {
     return .{
         .func = struct {
             fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
-                const auth = ctx.userData(Rbac.AuthInfo) orelse {
+                const auth = getAuth(ctx) orelse {
                     try ctx.sendErrorResponse(403, 403, "Authentication required before permission check");
                     return;
                 };
@@ -162,7 +170,7 @@ pub fn requireAnyPermission(comptime perms: []const []const u8) api.Middleware {
     return .{
         .func = struct {
             fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
-                const auth = ctx.userData(Rbac.AuthInfo) orelse {
+                const auth = getAuth(ctx) orelse {
                     try ctx.sendErrorResponse(403, 403, "Authentication required before permission check");
                     return;
                 };
@@ -182,7 +190,7 @@ pub fn requireAllPermissions(comptime perms: []const []const u8) api.Middleware 
     return .{
         .func = struct {
             fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
-                const auth = ctx.userData(Rbac.AuthInfo) orelse {
+                const auth = getAuth(ctx) orelse {
                     try ctx.sendErrorResponse(403, 403, "Authentication required before permission check");
                     return;
                 };
@@ -197,8 +205,9 @@ pub fn requireAllPermissions(comptime perms: []const []const u8) api.Middleware 
     };
 }
 
-/// [...] ctx.user_data Get current AuthInfo[...] jwtAuth [...]
+/// [...] ctx.user_data / ctx.auth_info Get current AuthInfo[...] jwtAuth [...]
 pub fn getAuth(ctx: *api.Context) ?*Rbac.AuthInfo {
+    if (ctx.authInfo(Rbac.AuthInfo)) |a| return a;
     if (ctx.user_data) |data| {
         return @ptrCast(@alignCast(data));
     }

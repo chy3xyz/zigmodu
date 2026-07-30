@@ -30,7 +30,7 @@ pub const PaymentService = struct {
         };
     }
 
-    pub fn listByOrder(self: *Self, tenant_id: i64, order_id: i64) ![]model.Payment {
+    pub fn listByOrder(self: *Self, tenant_id: i64, order_id: i64) !data.sqlx.QueryResult(model.Payment) {
         return try self.store.listByOrder(tenant_id, order_id);
     }
 
@@ -57,8 +57,9 @@ pub const PaymentService = struct {
             return error.InvalidInput;
         }
 
-        const items = try order_persist.Tx.listItems(&tx, self.allocator, cmd.tenant_id, cmd.order_id);
-        defer self.allocator.free(items);
+        var items_qr = try order_persist.Tx.listItems(&tx, self.allocator, cmd.tenant_id, cmd.order_id);
+        defer items_qr.deinit(self.allocator);
+        const items = items_qr.items;
 
         const now: i64 = @intCast(zigmodu.time.monotonicNowSeconds());
         const pay_status = if (cmd.success)

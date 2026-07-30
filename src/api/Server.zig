@@ -105,6 +105,7 @@ pub const RouteGroup = struct {
         const pfx = std.mem.trim(u8, self.prefix, "/");
         const rel = std.mem.trim(u8, path, "/");
         if (pfx.len == 0) return allocator.dupe(u8, rel);
+        if (rel.len == 0) return allocator.dupe(u8, pfx);
         return std.fmt.allocPrint(allocator, "{s}/{s}", .{ pfx, rel });
     }
 
@@ -202,6 +203,9 @@ pub const Context = struct {
     response_headers: std.StringHashMap([]const u8),
     responded: bool = false,
     user_data: ?*anyopaque = null,
+    /// AuthInfo / opaque auth object for middleware. Separate from `user_data` so
+    /// ComptimeRouter route state and RBAC can coexist on one request.
+    auth_info: ?*anyopaque = null,
     attributes: std.StringHashMap([]const u8),
     validation_error_message: ?[]const u8 = null,
     stream: ?std.Io.net.Stream = null,
@@ -360,6 +364,15 @@ pub const Context = struct {
     /// Type-safe accessor for user_data. Replaces @ptrCast(@alignCast(...)).
     pub fn userData(self: *Context, comptime T: type) ?*T {
         return @ptrCast(@alignCast(self.user_data));
+    }
+
+    /// Type-safe accessor for auth_info (RBAC AuthInfo, etc.).
+    pub fn authInfo(self: *Context, comptime T: type) ?*T {
+        return @ptrCast(@alignCast(self.auth_info));
+    }
+
+    pub fn setAuthInfo(self: *Context, ptr: ?*anyopaque) void {
+        self.auth_info = ptr;
     }
 
     /// Stream a chunk of the response body. Call flushHeaders() first to send
@@ -1016,8 +1029,9 @@ const Router = struct {
         while (parts.next()) |part| {
             if (part.len == 0) continue;
 
-            // Check wildcard child first — consumes all remaining path segments
-            if (current.wildcard_child) |wc| {
+            if (current.findChild(part)) |child| {
+                current = child;
+            } else if (current.wildcard_child) |wc| {
                 // Consume remaining parts into a single rest parameter
                 if (wc.route) |route| {
                     var params = std.StringHashMap([]const u8).init(allocator);
@@ -1035,10 +1049,6 @@ const Router = struct {
                     return MatchedRoute{ .route = route, .params = params };
                 }
                 return null;
-            }
-
-            if (current.findChild(part)) |child| {
-                current = child;
             } else if (current.findParamChild()) |param_child| {
                 if (param_count >= MAX_PARAMS) return null;
                 param_keys[param_count] = allocator.dupe(u8, param_child.param_name.?) catch return null;

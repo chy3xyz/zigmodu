@@ -2,21 +2,34 @@ const std = @import("std");
 const zigmodu = @import("zigmodu");
 const http = zigmodu.http;
 
+/// User HTTP API — ComptimeRouter (`docs/ROUTE_TABLE.md`).
+/// Mount via `http.Router(...).scope("/api/v1").mount(UserApi(S), &api)`.
 pub fn UserApi(comptime Service: type) type {
     return struct {
         const Self = @This();
         service: *Service,
 
-        pub fn init(svc: *Service) Self { return .{ .service = svc }; }
+        pub const module_name = "user";
+        /// Relative to scope group → `/api/v1/users/...`
+        pub const nest = .{"users"};
+        pub const State = Self;
 
-        pub fn registerRoutes(self: *Self, group: *http.RouteGroup) !void {
-            try group.get("/users", listUsers, @ptrCast(@alignCast(self)));
-            try group.post("/users", createUser, @ptrCast(@alignCast(self)));
-            try group.get("/users/{id}", getUser, @ptrCast(@alignCast(self)));
+        pub const routes = [_]http.RouteSpec(State){
+            .{ .method = .GET, .path = "ping", .handler = ping, .meta = .{ .auth = .public } },
+            .{ .method = .GET, .path = "", .handler = listUsers },
+            .{ .method = .POST, .path = "", .handler = createUser },
+            .{ .method = .GET, .path = "{id}", .handler = getUser },
+        };
+
+        pub fn init(svc: *Service) Self {
+            return .{ .service = svc };
         }
 
-        fn listUsers(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
+        fn ping(ctx: *http.Context, _: *State) !void {
+            try ctx.json(200, "{\"pong\":true}");
+        }
+
+        fn listUsers(ctx: *http.Context, self: *State) !void {
             const tenant_str = ctx.queryParam("tenant_id") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing 'tenant_id' query parameter");
                 return;
@@ -26,10 +39,12 @@ pub fn UserApi(comptime Service: type) type {
                 return;
             };
 
-            const users = self.service.listByTenant(tenant_id) catch {
+            var users_qr = self.service.listByTenant(tenant_id) catch {
                 try ctx.sendErrorResponse(500, 0, "Failed to list users");
                 return;
             };
+            defer users_qr.deinit(ctx.allocator);
+            const users = users_qr.items;
 
             var buf = std.ArrayList(u8).empty;
             defer buf.deinit(ctx.allocator);
@@ -46,24 +61,28 @@ pub fn UserApi(comptime Service: type) type {
             try ctx.json(200, buf.items);
         }
 
-        fn createUser(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
+        fn createUser(ctx: *http.Context, self: *State) !void {
             const tenant_id_str = ctx.queryParam("tenant_id") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing tenant_id"); return;
+                try ctx.sendErrorResponse(400, 0, "Missing tenant_id");
+                return;
             };
             const tenant_id = std.fmt.parseInt(i64, tenant_id_str, 10) catch {
-                try ctx.sendErrorResponse(400, 0, "Invalid tenant_id"); return;
+                try ctx.sendErrorResponse(400, 0, "Invalid tenant_id");
+                return;
             };
             const username = ctx.queryParam("username") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing username"); return;
+                try ctx.sendErrorResponse(400, 0, "Missing username");
+                return;
             };
             const email = ctx.queryParam("email") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing email"); return;
+                try ctx.sendErrorResponse(400, 0, "Missing email");
+                return;
             };
             const role = ctx.queryParam("role") orelse "member";
 
             const user = self.service.create(tenant_id, username, email, role) catch |err| {
-                try ctx.sendErrorResponse(400, 0, @errorName(err)); return;
+                try ctx.sendErrorResponse(400, 0, @errorName(err));
+                return;
             };
             const resp = try std.fmt.allocPrint(ctx.allocator,
                 \\{{"id":{d},"tenant_id":{d},"username":"{s}","role":"{s}"}}
@@ -72,24 +91,29 @@ pub fn UserApi(comptime Service: type) type {
             try ctx.json(201, resp);
         }
 
-        fn getUser(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
+        fn getUser(ctx: *http.Context, self: *State) !void {
             const tenant_str = ctx.queryParam("tenant_id") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing tenant_id"); return;
+                try ctx.sendErrorResponse(400, 0, "Missing tenant_id");
+                return;
             };
             const tenant_id = std.fmt.parseInt(i64, tenant_str, 10) catch {
-                try ctx.sendErrorResponse(400, 0, "Invalid tenant_id"); return;
+                try ctx.sendErrorResponse(400, 0, "Invalid tenant_id");
+                return;
             };
             const id_str = ctx.param("id") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing user ID"); return;
+                try ctx.sendErrorResponse(400, 0, "Missing user ID");
+                return;
             };
             const user_id = std.fmt.parseInt(i64, id_str, 10) catch {
-                try ctx.sendErrorResponse(400, 0, "Invalid user ID"); return;
+                try ctx.sendErrorResponse(400, 0, "Invalid user ID");
+                return;
             };
             const user = self.service.getById(tenant_id, user_id) catch |err| {
-                try ctx.sendErrorResponse(404, 0, @errorName(err)); return;
+                try ctx.sendErrorResponse(404, 0, @errorName(err));
+                return;
             } orelse {
-                try ctx.sendErrorResponse(404, 0, "User not found"); return;
+                try ctx.sendErrorResponse(404, 0, "User not found");
+                return;
             };
             const resp = try std.fmt.allocPrint(ctx.allocator,
                 \\{{"id":{d},"tenant_id":{d},"username":"{s}","email":"{s}","role":"{s}","status":{d}}}

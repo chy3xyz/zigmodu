@@ -12,7 +12,7 @@ pub fn OrderPersistence(comptime Backend: type) type {
             return .{ .db = db };
         }
 
-        pub fn listByTenant(self: *Self, tenant_id: i64) ![]model.Order {
+        pub fn listByTenant(self: *Self, tenant_id: i64) !data.sqlx.QueryResult(model.Order) {
             return try self.db.queryRowsPartial(model.Order,
                 "SELECT id, tenant_id, user_id, status, total_cents, created_at, updated_at FROM orders WHERE tenant_id = ? ORDER BY id DESC",
                 &.{.{ .int = tenant_id }},
@@ -81,7 +81,7 @@ pub const Tx = struct {
         allocator: std.mem.Allocator,
         tenant_id: i64,
         order_id: i64,
-    ) ![]model.OrderItem {
+    ) !data.sqlx.QueryResult(model.OrderItem) {
         return try tx.queryRows(allocator, model.OrderItem,
             "SELECT id, tenant_id, order_id, product_id, qty, price_cents FROM order_items WHERE tenant_id = ? AND order_id = ?",
             &.{ .{ .int = tenant_id }, .{ .int = order_id } },

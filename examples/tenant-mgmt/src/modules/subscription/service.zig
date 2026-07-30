@@ -31,8 +31,8 @@ pub fn SubscriptionService(comptime Persistence: type) type {
             try self.persistence.updateStatus(subscription_id, enums.SubscriptionStatus.cancelled.toString());
         }
 
-        /// 列出所有可用套餐
-        pub fn listPlans(self: *Self) ![]model.Plan {
+        /// 列出所有可用套餐（调用方 `defer result.deinit(allocator)`）
+        pub fn listPlans(self: *Self) !@import("zigmodu").data.sqlx.QueryResult(model.Plan) {
             return try self.persistence.findAllPlans();
         }
     };

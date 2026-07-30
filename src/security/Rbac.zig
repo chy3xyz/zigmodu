@@ -306,6 +306,78 @@ pub const Permissions = struct {
     pub const system_tenant_create = "system:tenant:create";
     pub const system_tenant_update = "system:tenant:update";
     pub const system_tenant_delete = "system:tenant:delete";
+
+    /// tenant-mgmt / SaaS examples
+    pub const tenant_read = "tenant:read";
+    pub const tenant_write = "tenant:write";
+    pub const tenant_suspend = "tenant:suspend";
+};
+
+/// Maps JWT **role name** strings → fine-grained permission codes.
+/// Used by catalog JWT middleware (`jwtAuthFromCatalogWithPermissions`).
+pub const RolePermissionTable = struct {
+    rows: []const Row,
+
+    pub const Row = struct {
+        role: []const u8,
+        permissions: []const []const u8,
+    };
+
+    /// Collect unique permissions for the given role names into a owned CSV string.
+    pub fn permissionsCsv(self: RolePermissionTable, allocator: std.mem.Allocator, roles: []const []const u8) ![]u8 {
+        var list: std.ArrayList([]const u8) = .empty;
+        defer list.deinit(allocator);
+
+        for (roles) |role| {
+            for (self.rows) |row| {
+                if (!std.mem.eql(u8, row.role, role)) continue;
+                for (row.permissions) |p| {
+                    var dup = false;
+                    for (list.items) |existing| {
+                        if (std.mem.eql(u8, existing, p)) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (!dup) try list.append(allocator, p);
+                }
+            }
+        }
+
+        if (list.items.len == 0) return try allocator.dupe(u8, "");
+
+        var total: usize = 0;
+        for (list.items, 0..) |p, i| {
+            total += p.len;
+            if (i > 0) total += 1;
+        }
+        const buf = try allocator.alloc(u8, total);
+        var off: usize = 0;
+        for (list.items, 0..) |p, i| {
+            if (i > 0) {
+                buf[off] = ',';
+                off += 1;
+            }
+            @memcpy(buf[off..][0..p.len], p);
+            off += p.len;
+        }
+        return buf;
+    }
+
+    /// Insert permissions into an AuthInfo map (keys owned by `allocator`).
+    pub fn grantToAuthInfo(self: RolePermissionTable, allocator: std.mem.Allocator, auth: *AuthInfo, roles: []const []const u8) !void {
+        for (roles) |role| {
+            for (self.rows) |row| {
+                if (!std.mem.eql(u8, row.role, role)) continue;
+                for (row.permissions) |p| {
+                    if (auth.permissions.contains(p)) continue;
+                    const key = try allocator.dupe(u8, p);
+                    errdefer allocator.free(key);
+                    try auth.permissions.put(key, true);
+                }
+            }
+        }
+    }
 };
 
 // ── Tests ──
@@ -336,6 +408,18 @@ test "AuthInfo hasPermission" {
     try std.testing.expect(!auth.hasAllPermissions(&.{ "read", "write", "admin" }));
 
     auth.deinit(allocator);
+}
+
+test "RolePermissionTable maps roles to permission CSV" {
+    const allocator = std.testing.allocator;
+    const table = RolePermissionTable{ .rows = &.{
+        .{ .role = "admin", .permissions = &.{ Permissions.tenant_suspend, Permissions.tenant_write } },
+        .{ .role = "user", .permissions = &.{Permissions.tenant_read} },
+    } };
+    const csv = try table.permissionsCsv(allocator, &.{ "user", "admin" });
+    defer allocator.free(csv);
+    try std.testing.expect(std.mem.indexOf(u8, csv, Permissions.tenant_suspend) != null);
+    try std.testing.expect(std.mem.indexOf(u8, csv, Permissions.tenant_read) != null);
 }
 
 test "DataScope fromInt" {

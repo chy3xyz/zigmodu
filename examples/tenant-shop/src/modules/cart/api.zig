@@ -7,15 +7,19 @@ pub fn CartApi(comptime Service: type) type {
         const Self = @This();
         service: *Service,
 
+        pub const module_name = "cart";
+        pub const nest = .{"cart"};
+        pub const State = Self;
+
+        pub const routes = [_]http.RouteSpec(State){
+            .{ .method = .GET, .path = "", .handler = listCart },
+            .{ .method = .POST, .path = "items", .handler = addItem },
+            .{ .method = .DELETE, .path = "", .handler = clearCart },
+            .{ .method = .GET, .path = "status", .handler = status },
+        };
+
         pub fn init(svc: *Service) Self {
             return .{ .service = svc };
-        }
-
-        pub fn registerRoutes(self: *Self, group: *http.RouteGroup) !void {
-            try group.get("/cart", listCart, @ptrCast(@alignCast(self)));
-            try group.post("/cart/items", addItem, @ptrCast(@alignCast(self)));
-            try group.delete("/cart", clearCart, @ptrCast(@alignCast(self)));
-            try group.get("/cart/status", status, null);
         }
 
         fn requireIds(ctx: *http.Context) !struct { tenant_id: i64, user_id: i64 } {
@@ -33,13 +37,14 @@ pub fn CartApi(comptime Service: type) type {
             };
         }
 
-        fn listCart(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn listCart(ctx: *http.Context, self: *State) !void {
             const ids = try requireIds(ctx);
-            const items = self.service.listItems(ids.tenant_id, ids.user_id) catch {
+            var items_qr = self.service.listItems(ids.tenant_id, ids.user_id) catch {
                 try ctx.sendErrorResponse(500, 0, "Failed to list cart");
                 return;
             };
+            defer items_qr.deinit(ctx.allocator);
+            const items = items_qr.items;
             var buf = std.ArrayList(u8).empty;
             defer buf.deinit(ctx.allocator);
             try buf.appendSlice(ctx.allocator, "{\"items\":[");
@@ -55,8 +60,7 @@ pub fn CartApi(comptime Service: type) type {
             try ctx.json(200, buf.items);
         }
 
-        fn addItem(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn addItem(ctx: *http.Context, self: *State) !void {
             const ids = try requireIds(ctx);
             const pid_s = ctx.queryParam("product_id") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing product_id");
@@ -72,8 +76,7 @@ pub fn CartApi(comptime Service: type) type {
             try ctx.json(200, "{\"status\":\"ok\"}");
         }
 
-        fn clearCart(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn clearCart(ctx: *http.Context, self: *State) !void {
             const ids = try requireIds(ctx);
             self.service.clear(ids.tenant_id, ids.user_id) catch |err| {
                 try ctx.sendErrorResponse(400, 0, @errorName(err));
@@ -82,7 +85,7 @@ pub fn CartApi(comptime Service: type) type {
             try ctx.json(200, "{\"status\":\"ok\"}");
         }
 
-        fn status(ctx: *http.Context) !void {
+        fn status(ctx: *http.Context, _: *State) !void {
             try ctx.json(200, "{\"module\":\"cart\",\"status\":\"ok\"}");
         }
     };

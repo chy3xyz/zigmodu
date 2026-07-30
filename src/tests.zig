@@ -10,6 +10,7 @@ test "compile all source files" {
     _ = @import("api/middleware/Tracing.zig");
     _ = @import("api/Simplified.zig");
     _ = @import("api/Server.zig");
+    _ = @import("api/ComptimeRouter.zig");
 
     // Application
     _ = @import("Application.zig");
@@ -148,6 +149,7 @@ test "compile all source files" {
     // Pool
     _ = @import("pool/Pool.zig");
     _ = @import("security/Rbac.zig");
+    _ = @import("security/CatalogPermDb.zig");
     _ = @import("security/PasswordEncoder.zig");
     _ = @import("tenant/TenantContext.zig");
     _ = @import("tenant/TenantInterceptor.zig");

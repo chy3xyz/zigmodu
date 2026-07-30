@@ -842,6 +842,12 @@ pub fn QueryResult(comptime T: type) type {
         /// under Zig 0.17's stricter const checking. The cast is safe because
         /// QueryResult always owns its backing memory on the heap/stack and
         /// the caller holds the only reference at this point.
+        ///
+        /// Contract: call **either** `deinit` **or** per-row `freeScanned` +
+        /// `allocator.free(items)` — never both. When `arena != null`, `deinit`
+        /// frees the arena once; when `arena == null`, it `freeScanned`s every
+        /// row then frees the items slice. Doing `freeScanned` then `deinit`
+        /// is a double-free (heysen SIGABRT / SafeAllocator `len: 7` pattern).
         pub fn deinit(self: *const @This(), allocator: std.mem.Allocator) void {
             const self_mut: *@This() = @constCast(self);
             if (self_mut.arena) |*a| {
@@ -5865,11 +5871,15 @@ test "bufPrintZ reserves byte for null terminator" {
     try std.testing.expectError(error.NoSpaceLeft, bufPrintZ(&buf, "{s}", .{"abcd"}));
 }
 
-test "allocZ free keeps sentinel (stmt_cache contract)" {
+test "QueryResult.deinit frees strings once (arena=null path)" {
     const allocator = std.testing.allocator;
-    const name = try allocZ(allocator, "zs_1");
-    // Must free as [:0]u8 — coercing to []const u8 is the production panic.
-    allocator.free(name);
+    const Tiny = struct { name: []const u8 };
+    const name = try allocator.dupe(u8, "HS8529!"); // len 7 — matches production double-free size
+    const items = try allocator.alloc(Tiny, 1);
+    items[0] = .{ .name = name };
+    var qr = QueryResult(Tiny){ .items = items, .arena = null };
+    // Correct: deinit alone. Incorrect would be freeScanned then deinit (SIGABRT).
+    qr.deinit(allocator);
 }
 
 test "Client circuit breaker is eager (no lazy ensureBreaker)" {

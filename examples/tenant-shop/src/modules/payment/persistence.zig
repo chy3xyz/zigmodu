@@ -12,7 +12,7 @@ pub fn PaymentPersistence(comptime Backend: type) type {
             return .{ .db = db };
         }
 
-        pub fn listByOrder(self: *Self, tenant_id: i64, order_id: i64) ![]model.Payment {
+        pub fn listByOrder(self: *Self, tenant_id: i64, order_id: i64) !data.sqlx.QueryResult(model.Payment) {
             return try self.db.queryRowsPartial(model.Payment,
                 "SELECT id, tenant_id, order_id, idempotency_key, status, amount_cents, created_at FROM payments WHERE tenant_id = ? AND order_id = ? ORDER BY id",
                 &.{ .{ .int = tenant_id }, .{ .int = order_id } },

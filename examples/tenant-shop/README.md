@@ -1,5 +1,6 @@
 **Week 1–4 完整脚手架**：交易闭环 + admin 编排 + outbox 重试/DLQ → RobustMQ。  
-分层规范见 [`docs/MODULE_LAYERS.md`](../../docs/MODULE_LAYERS.md)。
+分层规范见 [`docs/MODULE_LAYERS.md`](../../docs/MODULE_LAYERS.md)。  
+路由：ComptimeRouter（`pub const routes` + `mountAll`）；OpenAPI：`/openapi.json`；JWT 可选（无 `Authorization` 时跳过，便于 smoke）。见 [`docs/ROUTE_TABLE.md`](../../docs/ROUTE_TABLE.md)。
 
 ## Run
 

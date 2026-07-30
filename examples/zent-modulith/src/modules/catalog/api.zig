@@ -3,23 +3,27 @@ const zigmodu = @import("zigmodu");
 const http = zigmodu.http;
 const service = @import("service.zig");
 
+/// Catalog HTTP API — ComptimeRouter (`docs/ROUTE_TABLE.md`).
 pub fn CatalogApi(comptime Service: type) type {
     return struct {
         const Self = @This();
         svc: *Service,
 
+        pub const module_name = "catalog";
+        pub const nest = .{};
+        pub const State = Self;
+
+        pub const routes = [_]http.RouteSpec(State){
+            .{ .method = .POST, .path = "tenants", .handler = createTenant, .meta = .{ .auth = .public } },
+            .{ .method = .POST, .path = "products", .handler = createProduct, .meta = .{ .auth = .public } },
+            .{ .method = .GET, .path = "products", .handler = listProducts, .meta = .{ .auth = .public } },
+        };
+
         pub fn init(svc: *Service) Self {
             return .{ .svc = svc };
         }
 
-        pub fn registerRoutes(self: *Self, group: *http.RouteGroup) !void {
-            try group.post("/tenants", createTenant, @ptrCast(@alignCast(self)));
-            try group.post("/products", createProduct, @ptrCast(@alignCast(self)));
-            try group.get("/products", listProducts, @ptrCast(@alignCast(self)));
-        }
-
-        fn createTenant(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn createTenant(ctx: *http.Context, self: *State) !void {
             const name = ctx.queryParam("name") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing name");
                 return;
@@ -37,8 +41,7 @@ pub fn CatalogApi(comptime Service: type) type {
             try ctx.json(201, resp);
         }
 
-        fn createProduct(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn createProduct(ctx: *http.Context, self: *State) !void {
             const tid_s = ctx.queryParam("tenant_id") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing tenant_id");
                 return;
@@ -59,8 +62,7 @@ pub fn CatalogApi(comptime Service: type) type {
             try ctx.json(201, resp);
         }
 
-        fn listProducts(ctx: *http.Context) !void {
-            const self: *Self = @ptrCast(@alignCast(ctx.user_data orelse return error.UnexpectedError));
+        fn listProducts(ctx: *http.Context, self: *State) !void {
             const tid_s = ctx.queryParam("tenant_id") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing tenant_id");
                 return;
