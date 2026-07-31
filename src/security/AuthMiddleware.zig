@@ -17,10 +17,11 @@ const Rbac = @import("Rbac.zig");
 pub const PermissionLoader = *const fn (allocator: std.mem.Allocator, auth: *Rbac.AuthInfo) anyerror!void;
 
 /// JWT authentication middleware — verifies token, builds AuthInfo, stores it in
-/// `ctx.auth_info` and `ctx.user_data`.
+/// `ctx.auth_info` only (does **not** touch `ctx.user_data`).
 ///
-/// **Legacy path** for apps that do not use ComptimeRouter. Prefer
-/// `http.jwtAuthFromCatalogWithPermissions` when handlers take state via `user_data`
+/// Safe with ComptimeRouter: route `*State` stays in `user_data`; read auth via
+/// `getAuth(ctx)` / `ctx.authInfo(Rbac.AuthInfo)`. Catalog stack
+/// (`http.jwtAuthFromCatalogWithPermissions`) remains preferred for new apps
 /// (see `docs/ROUTE_TABLE.md`).
 ///
 /// NOTE: `AuthInfo.permissions` stays empty with this variant, so requirePermission()
@@ -121,11 +122,10 @@ fn runJwtAuth(
         auth.role_ids = role_ids;
     }
 
-    // Store auth for downstream middleware (auth_info) and legacy handlers (user_data).
+    // Store auth only in auth_info — never overwrite user_data (ComptimeRouter State).
     const auth_ptr = allocator.create(Rbac.AuthInfo) catch return error.OutOfMemory;
     auth_ptr.* = auth;
     ctx.auth_info = @ptrCast(auth_ptr);
-    ctx.user_data = @ptrCast(auth_ptr);
     defer {
         auth_ptr.deinit(allocator);
         allocator.destroy(auth_ptr);
@@ -205,13 +205,10 @@ pub fn requireAllPermissions(comptime perms: []const []const u8) api.Middleware 
     };
 }
 
-/// [...] ctx.user_data / ctx.auth_info Get current AuthInfo[...] jwtAuth [...]
+/// Read AuthInfo set by `jwtAuth` / `jwtAuthWithPermissions` / `rbacJwtMiddleware*`.
+/// Only `ctx.auth_info` — never cast `user_data` (may be ComptimeRouter State).
 pub fn getAuth(ctx: *api.Context) ?*Rbac.AuthInfo {
-    if (ctx.authInfo(Rbac.AuthInfo)) |a| return a;
-    if (ctx.user_data) |data| {
-        return @ptrCast(@alignCast(data));
-    }
-    return null;
+    return ctx.authInfo(Rbac.AuthInfo);
 }
 
 fn testPutBearerAuth(ctx: *api.Context, token: []const u8) !void {
@@ -289,4 +286,36 @@ test "jwtAuth without loader leaves permissions empty (requirePermission denies)
     const auth_mw = try jwtAuth(&sec, allocator);
     try auth_mw.func(&ctx, S.checkPerms, auth_mw.user_data);
     try std.testing.expect(S.denied);
+}
+
+test "jwtAuth preserves ComptimeRouter user_data State" {
+    const allocator = std.testing.allocator;
+    var sec = SecurityModule.init(allocator, "test-secret", 3600);
+    const token = try sec.generateTokenWithTenant("42", &.{}, "1");
+    defer allocator.free(token);
+
+    const RouteState = struct { n: i32 };
+    var state = RouteState{ .n = 99 };
+
+    var ctx = try api.Context.init(allocator, .GET, "/page");
+    defer ctx.deinit();
+    ctx.user_data = @ptrCast(&state);
+    try testPutBearerAuth(&ctx, token);
+
+    const S = struct {
+        var saw_state: i32 = 0;
+        var saw_auth: bool = false;
+        fn handler(c: *api.Context) anyerror!void {
+            const st = c.userData(RouteState) orelse return error.MissingRouteState;
+            saw_state = st.n;
+            saw_auth = getAuth(c) != null;
+        }
+    };
+
+    const auth_mw = try jwtAuth(&sec, allocator);
+    try auth_mw.func(&ctx, S.handler, auth_mw.user_data);
+    try std.testing.expectEqual(@as(i32, 99), S.saw_state);
+    try std.testing.expect(S.saw_auth);
+    try std.testing.expect(ctx.userData(RouteState) != null);
+    try std.testing.expectEqual(@as(i32, 99), ctx.userData(RouteState).?.n);
 }

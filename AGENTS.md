@@ -78,7 +78,8 @@ const now_ms = Time.monotonicNowMilliseconds();
 - Modules declare `pub const routes` + `module_name` + `nest`; wire with `http.Router.scope.mountAll`
 - Auth stack: `jwtAuthFromCatalogWithPermissions` + `permissionGateWith(.{ .mode = .rbac })`
 - Permissions: static `Rbac.RolePermissionTable` or DB `CatalogPermDb.loaderFromClient`
-- **Do not** use `security.auth.jwtAuth` / `rbacJwtMiddleware` with ComptimeRouter (they overwrite `ctx.user_data`)
+- Multi-portal / PHP-compat: app-level identity issuer; map into `auth_info`/attrs — `docs/ROUTE_TABLE.md` §7.1 (no framework `type` claim)
+- Legacy `rbacJwtMiddleware` / `jwtAuth` now write **`auth_info` only** (safe with ComptimeRouter State); prefer catalog JWT+RBAC for new apps; never `@ptrCast(user_data)` as AuthInfo
 - Guide: `docs/ROUTE_TABLE.md`
 - **Extractors**: `http.extractPath` / `extractQuery` / `extractJson` / `extractJsonValidated`; field defaults apply when missing
 - **Errors**: `http.respondErr` + optional `http.setErrorMap`; RFC 7807 ProblemDetails

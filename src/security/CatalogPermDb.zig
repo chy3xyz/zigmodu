@@ -85,11 +85,12 @@ pub fn permissionsCsv(allocator: std.mem.Allocator, client: *sqlx.Client, roles:
 }
 
 /// Build a `CatalogPermissionLoader` bound to `client` (must outlive the middleware).
+/// Ignores `sub`/`aud` — maps JWT role names via `role_permission` only.
 pub fn loaderFromClient(client: *sqlx.Client) http_middleware.CatalogPermissionLoader {
     const Holder = struct {
         var db: *sqlx.Client = undefined;
-        fn load(allocator: std.mem.Allocator, roles: []const []const u8) anyerror![]u8 {
-            return permissionsCsv(allocator, @This().db, roles);
+        fn load(allocator: std.mem.Allocator, input: http_middleware.CatalogPermLoadInput) anyerror![]u8 {
+            return permissionsCsv(allocator, @This().db, input.roles);
         }
     };
     Holder.db = client;

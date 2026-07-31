@@ -2,7 +2,7 @@
 
 > 状态：**推荐栈已钉死；scaffold 默认 RBAC；zent-modulith / tenant-shop 已迁；tenant-mgmt 用 CatalogPermDb**。  
 > 推荐：`jwtAuthFromCatalogWithPermissions` + `permissionGateWith(.rbac)` + `RolePermissionTable` / `CatalogPermDb`。  
-> Legacy：`security.auth.jwtAuth*` / `AppSecurity.rbacJwtMiddleware*`（写 `user_data`，勿与 ComptimeRouter 混用）。  
+> Legacy：`security.auth.jwtAuth*` / `AppSecurity.rbacJwtMiddleware*` 现只写 **`auth_info`**，可与 ComptimeRouter `user_data` State 共存；读 auth 用 `getAuth` / `ctx.authInfo`，**勿再 `@ptrCast(user_data)` 当 AuthInfo**。  
 > 前提：未生产化，**不做**旧 URL 兼容。
 
 ---
@@ -12,12 +12,12 @@
 | | **ComptimeRouter（推荐）** | **Legacy AuthMiddleware** |
 |--|---------------------------|---------------------------|
 | JWT | `http.jwtAuthFromCatalogWithPermissions` | `security.auth.jwtAuth*` / `AppSecurity.rbacJwtMiddleware*` |
-| 权限 | attr `permissions` + `.mode = .rbac` | `AuthInfo` in **`user_data`** + `requirePermission` |
-| 状态共存 | ✅ 不碰 `user_data`（路由 State 可用） | ❌ 覆盖 `user_data`，与 typed handler 冲突 |
+| 权限 | attr `permissions` + `.mode = .rbac` | `AuthInfo` in **`auth_info`** + `requirePermission` / `getAuth` |
+| 状态共存 | ✅ 不碰 `user_data` | ✅ 亦不碰 `user_data`（State 保留） |
 | 权限来源 | `RolePermissionTable` 或 `CatalogPermDb.loaderFromClient` | `PermissionLoader`（数字 `role_ids`） |
 | 文档入口 | 本节 + §7 | `security/AuthMiddleware.zig` 头注释 |
 
-**新应用 / scaffold `--with-auth`：只用左列。**
+**新应用 / scaffold `--with-auth`：仍用左列**（catalog 权限码 + `permissionGate`）。右列适合已有 `requirePermission` 链、又挂了 ComptimeRouter 的迁移期。
 
 DB 权限表示例：
 
@@ -271,6 +271,102 @@ WS：`pub const ws_routes = [_]http.WsSpec(State){ .{ .path = "ws", .on_connect 
 - Catalog：`is_sse=true` → OpenAPI description 标注 SSE
 - 额外 query/path 文档：`RouteMeta.openapi_params = &http.openApiParamsFromStruct(QueryDto, .query)`（与路径 `{id}` 合并导出）
 - 详见 `docs/FRAMEWORK_BACKLOG.md`
+
+### 7.1 多端 / 自定义身份 claim（应用层扩展 · 最佳实践）
+
+框架 **不** 内置 `type=user|admin|shop_user|…` 枚举。多门户（C 端 / 店主 / 平台 / 供应商）用 **现有槽位** 扩展，避免第二套 JWT 核心模型。
+
+#### 分层（与现有组件对齐）
+
+```
+签发/验签（唯一源）
+  ├─ 新应用：AppSecurity / SecurityModule（sub/iss/aud/roles）
+  └─ PHP 兼容多商户：应用 identity 模块（可含 app_id、type；aud≡tenant）
+
+请求上下文（正交）
+  ├─ ctx.user_data     → ComptimeRouter *State（模块状态）
+  ├─ ctx.auth_info     → AuthInfo / 应用自定义身份对象（仅指针）
+  └─ ctx.attributes    → permissions CSV、可选 identity_kind / portal
+
+门禁（由粗到细）
+  ├─ RouteMeta.auth = .public | .jwt | .inherit
+  ├─ permissionGateWith(.rbac) ← 权限码（推荐）
+  ├─ permissionGate / .roles   ← roles 名（粗）
+  └─ 应用 require*Auth          ← 读写 type/portal（兼容期可保留）
+```
+
+#### 多业务主体 × 各自 RBAC（ZigShop 类 · 推荐模型）
+
+典型库表是 **多套同构、互不合并** 的 RBAC（shop / supplier / saas-admin），不是一张全局 `role_permission`。
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  ZigModu（通用）                                              │
+│  JWT: sub + aud(租户) + roles(门户粗身份)                      │
+│  Middleware: verify → CatalogPermissionLoader → permissions │
+│  Gate: RouteMeta.permission + permissionGateWith(.rbac)     │
+└───────────────────────────┬─────────────────────────────────┘
+                            │ loader 按门户选数据源
+        ┌───────────────────┼───────────────────┐
+        ▼                   ▼                   ▼
+   shop_* RBAC         supplier_* RBAC      admin role/access
+   (app_id)            (app_id+supplier_id) (saas)
+```
+
+| 层 | 谁拥有 | 框架是否内置 |
+|----|--------|--------------|
+| 门户身份 | JWT `roles` 如 `shop`/`supplier`/`admin` | ✅ 标准 claim |
+| 租户 | JWT `aud` | ✅ |
+| 主体内职务/菜单权限 | **应用自己的** `*_role` / `*_access` 表 | ❌ 不合并进框架表 |
+| HTTP 门禁 | `permissions` attr + catalog gate | ✅ |
+| 展开职务→权限码 | **应用** `CatalogPermissionLoader`（或等价中间件） | ✅ **扩展点**；见下 |
+
+**最佳实践：**
+
+1. **不要**把三套业务表迁进 `CatalogPermDb.role_permission`（那只适合简单单租户演示）。  
+2. **不要**在 JWT 塞全量 access 树（token 膨胀、撤权滞后）。  
+3. 登录只发 **门户 role + aud + sub**；每次请求由 loader **按 (portal, aud, sub)** 查对应表族，展开 path/码 → `permissions` CSV。  
+4. `RouteMeta.permission` 与各端 `access.path`（或规范化码）对齐；BFF scope 与门户 role 一致。  
+5. Super 账号（`is_super`）：loader 内短路为该门户全量权限或 `*` 约定。
+
+**框架 loader 入参（已补齐）：**  
+`CatalogPermissionLoader = fn(allocator, CatalogPermLoadInput) ![]u8`，其中 `CatalogPermLoadInput = { sub, aud, roles }`。  
+- 静态表 / `CatalogPermDb.loaderFromClient` **忽略** `sub`/`aud`，只映射 roles。  
+- 多主体应用用 `(sub, aud, roles)` 查 shop/supplier/admin 表族 → `permissions` CSV。  
+- JWT 验签后同时写入 `user_id`（sub）与 `tenant_id`（aud）。
+
+#### 三条路径（选一条作主路径，勿双签发）
+
+| 路径 | 适用 | 做法 |
+|------|------|------|
+| **A. Catalog 默认** | 新应用、tenant-mgmt 类 | `jwtAuthFromCatalogWithPermissions` + `permissionGateWith(.rbac)`；多端差异用 **permission 码**（如 `portal:shop`）或 role；**多主体 RBAC 用自定义 loader 接业务表** |
+| **B. 应用 identity** | 过渡 / 旧 PHP claim | 应用内签发验签；handler `require*Auth`；尽快迁 A |
+| **C. 适配桥** | 渐迁 B→A | 旧 claim 映射为 `roles`/`aud` 后再走 gate |
+
+#### 推荐约定（claim → 框架槽）
+
+| 业务概念 | 推荐落点 | 勿做 |
+|----------|----------|------|
+| 租户 / 店铺 | JWT `aud`（及 SQL 租户列） | 框架强制改名业务列 |
+| 门户 | JWT `roles`（粗） | 核心 JwtPayload 加必填 `type` |
+| 主体内 RBAC | 业务表 → loader → `permissions` | 三套表合成一张全局角色表 |
+| 细权限门禁 | `RouteMeta.permission` | 仅靠门户 role 守所有写接口 |
+| 模块 State | `user_data` | 鉴权对象写入 `user_data` |
+
+#### 演进阶梯（ZigShop 类）
+
+1. P0：框架 JWT + catalog gate；roles=门户。  
+2. Loader/中间件接 **shop_*** 表（试点 shop BFF）。  
+3. 同构接 supplier / admin 表族；补齐 admin 表 CREATE。  
+4. 去掉 handler 内重复验签与 JWT `type`。
+
+#### 刻意不做（框架边界）
+
+- 不在核心 JWT 增加必填 `type` enum / 多端枚举 API  
+- 不内置 `zigshop_shop_role` 一类业务表  
+- `CatalogPermDb` 保持可选简易后端，**不是**多主体 RBAC 的唯一实现  
+
+示例：`examples/tenant-mgmt`（单套 `CatalogPermDb`）；多主体见应用侧三套表 + loader（ZigShop）。
 
 ### Typed extractors + scope middleware
 

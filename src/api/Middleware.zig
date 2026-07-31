@@ -234,10 +234,22 @@ fn joinCsv(allocator: std.mem.Allocator, parts: []const []const u8) ![]u8 {
     return buf;
 }
 
-/// Optional: map JWT role names → fine-grained permission codes (CSV on `permissions` attr).
+/// Input for `CatalogPermissionLoader` — identity + portal roles after JWT verify.
+/// Simple loaders (static table / CatalogPermDb) may ignore `sub`/`aud`.
+/// Multi-realm apps (e.g. shop/supplier/admin RBAC tables) use them to query per-user grants.
+pub const CatalogPermLoadInput = struct {
+    /// JWT `sub` (user id string).
+    sub: []const u8,
+    /// JWT `aud` (tenant / app id string).
+    aud: []const u8,
+    /// JWT `roles` slice (portal / coarse roles).
+    roles: []const []const u8,
+};
+
+/// Optional: map identity + JWT roles → fine-grained permission codes (CSV on `permissions` attr).
 pub const CatalogPermissionLoader = *const fn (
     allocator: std.mem.Allocator,
-    roles: []const []const u8,
+    input: CatalogPermLoadInput,
 ) anyerror![]u8;
 
 fn verifyJwtLoadPermsAndNext(
@@ -262,6 +274,7 @@ fn verifyJwtLoadPermsAndNext(
     defer sec.freePayload(payload);
 
     try ctx.setAttr("user_id", payload.sub);
+    try ctx.setAttr("tenant_id", payload.aud);
     // Comma-separated roles for permissionGate(.roles) and CatalogPermissionLoader.
     if (payload.roles.len > 0) {
         const roles_csv = try joinCsv(ctx.allocator, payload.roles);
@@ -272,7 +285,11 @@ fn verifyJwtLoadPermsAndNext(
     }
 
     if (loader) |load| {
-        const perms_csv = load(ctx.allocator, payload.roles) catch {
+        const perms_csv = load(ctx.allocator, .{
+            .sub = payload.sub,
+            .aud = payload.aud,
+            .roles = payload.roles,
+        }) catch {
             try ctx.sendError(500, "Failed to load permissions");
             return;
         };
@@ -359,11 +376,12 @@ pub fn jwtAuthFromCatalogWithPermissions(
 }
 
 /// Build a `CatalogPermissionLoader` from a static `RolePermissionTable`.
+/// Ignores `sub`/`aud` (role→permission map only).
 pub fn catalogLoaderFromTable(table: *const Rbac.RolePermissionTable) CatalogPermissionLoader {
     const Holder = struct {
         var tbl: *const Rbac.RolePermissionTable = undefined;
-        fn load(allocator: std.mem.Allocator, roles: []const []const u8) anyerror![]u8 {
-            return @This().tbl.permissionsCsv(allocator, roles);
+        fn load(allocator: std.mem.Allocator, input: CatalogPermLoadInput) anyerror![]u8 {
+            return @This().tbl.permissionsCsv(allocator, input.roles);
         }
     };
     Holder.tbl = table;
@@ -985,7 +1003,7 @@ test "jwtAuthFromCatalogWithPermissions loads permission CSV" {
         .{ .role = "admin", .permissions = &.{ Rbac.Permissions.tenant_suspend, Rbac.Permissions.tenant_read } },
     } };
     var sec = SecurityModule.init(alloc, "test-secret", 3600);
-    const token = try sec.generateToken("u1", &.{"admin"});
+    const token = try sec.generateTokenWithTenant("u1", &.{"admin"}, "42");
     defer alloc.free(token);
 
     const mw = jwtAuthFromCatalogWithPermissions(&sec, &slot, catalogLoaderFromTable(&table), .{});
@@ -1000,6 +1018,64 @@ test "jwtAuthFromCatalogWithPermissions loads permission CSV" {
     try ctx.headers.put(try alloc.dupe(u8, "authorization"), try alloc.dupe(u8, auth_hdr));
     try mw.func(&ctx, next, null);
     try std.testing.expect(!ctx.responded);
+    try std.testing.expectEqualStrings("u1", ctx.getAttr("user_id").?);
+    try std.testing.expectEqualStrings("42", ctx.getAttr("tenant_id").?);
     const perms = ctx.getAttr("permissions").?;
     try std.testing.expect(std.mem.indexOf(u8, perms, "tenant:suspend") != null);
+}
+
+test "CatalogPermissionLoader receives sub and aud" {
+    const alloc = std.testing.allocator;
+    var entries = try alloc.alloc(comptime_router.CatalogEntry, 1);
+    entries[0] = .{
+        .method = .GET,
+        .path = try alloc.dupe(u8, "shop/products"),
+        .auth = .jwt,
+        .module = "shop",
+    };
+    var slot: comptime_router.CatalogSlot = .{};
+    defer slot.deinit();
+    slot.set(.{ .allocator = alloc, .entries = entries });
+
+    const S = struct {
+        var seen_sub: []u8 = &.{};
+        var seen_aud: []u8 = &.{};
+        var seen_role: []u8 = &.{};
+        fn load(allocator: std.mem.Allocator, input: CatalogPermLoadInput) anyerror![]u8 {
+            // Copy: payload slices are freed after verify returns.
+            if (seen_sub.len > 0) allocator.free(seen_sub);
+            if (seen_aud.len > 0) allocator.free(seen_aud);
+            if (seen_role.len > 0) allocator.free(seen_role);
+            seen_sub = try allocator.dupe(u8, input.sub);
+            seen_aud = try allocator.dupe(u8, input.aud);
+            seen_role = if (input.roles.len > 0) try allocator.dupe(u8, input.roles[0]) else &.{};
+            return try std.fmt.allocPrint(allocator, "portal:shop,shop.product:write@{s}/{s}", .{ input.aud, input.sub });
+        }
+    };
+
+    var sec = SecurityModule.init(alloc, "test-secret", 3600);
+    const token = try sec.generateTokenWithTenant("99", &.{"shop"}, "1001");
+    defer alloc.free(token);
+
+    const mw = jwtAuthFromCatalogWithPermissions(&sec, &slot, S.load, .{});
+    const next = struct {
+        fn n(_: *api.Context) anyerror!void {}
+    }.n;
+
+    var ctx = try api.Context.init(alloc, .GET, "/shop/products");
+    defer ctx.deinit();
+    const auth_hdr = try std.fmt.allocPrint(alloc, "Bearer {s}", .{token});
+    defer alloc.free(auth_hdr);
+    try ctx.headers.put(try alloc.dupe(u8, "authorization"), try alloc.dupe(u8, auth_hdr));
+    try mw.func(&ctx, next, null);
+    defer {
+        if (S.seen_sub.len > 0) alloc.free(S.seen_sub);
+        if (S.seen_aud.len > 0) alloc.free(S.seen_aud);
+        if (S.seen_role.len > 0) alloc.free(S.seen_role);
+    }
+    try std.testing.expectEqualStrings("99", S.seen_sub);
+    try std.testing.expectEqualStrings("1001", S.seen_aud);
+    try std.testing.expectEqualStrings("shop", S.seen_role);
+    const perms = ctx.getAttr("permissions").?;
+    try std.testing.expect(std.mem.indexOf(u8, perms, "1001/99") != null);
 }

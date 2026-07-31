@@ -781,6 +781,12 @@ pub fn processBatch(allocator: Allocator, items: []Item) !void {
 
 ## 🔒 安全实践
 
+### JWT / 多端身份（与路由栈）
+
+- **新应用**：`AppSecurity` + catalog JWT + `permissionGateWith(.rbac)`（见 `docs/ROUTE_TABLE.md` §7）。
+- **多门户 / PHP 兼容**：身份枚举留在**应用** identity 模块；用 `aud`/attr/`auth_info` 对接框架，**不要**改核心 JwtPayload 加 `type`（§7.1）。
+- **ComptimeRouter**：State 只在 `user_data`；鉴权只在 `auth_info` / attributes。
+
 ### 输入验证
 - **边界检查**：所有外部输入必须验证
 - **类型安全**：避免使用 anytype 和强制转型

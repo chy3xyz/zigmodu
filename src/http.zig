@@ -45,6 +45,7 @@ pub const jwtAuthFromCatalog = http_middleware.jwtAuthFromCatalog;
 pub const jwtAuthFromCatalogWithPermissions = http_middleware.jwtAuthFromCatalogWithPermissions;
 pub const catalogLoaderFromTable = http_middleware.catalogLoaderFromTable;
 pub const CatalogPermissionLoader = http_middleware.CatalogPermissionLoader;
+pub const CatalogPermLoadInput = http_middleware.CatalogPermLoadInput;
 pub const moduleGate = http_middleware.moduleGate;
 pub const permissionGate = http_middleware.permissionGate;
 pub const permissionGateWith = http_middleware.permissionGateWith;

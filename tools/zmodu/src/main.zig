@@ -7625,7 +7625,7 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
     if (sopts.with_auth) {
         try buf.appendSlice(allocator,
             \\    // -- Auth (ComptimeRouter catalog + fine-grained RBAC) --
-            \\    // Prefer this stack over security.auth.jwtAuth* (legacy; overwrites user_data).
+            \\    // Prefer catalog JWT+RBAC; legacy rbacJwtMiddleware also keeps user_data (auth_info only).
             \\    // Replace role_perms with security.CatalogPermDb.loaderFromClient(&db) in production.
             \\    const jwt_secret = env.get("JWT_SECRET") orelse "changeme-in-production";
             \\    var app_sec = zigmodu.security.AppSecurity.init(allocator, init.io, .{ .jwt_secret = jwt_secret, .token_expiry_seconds = 3600 });
