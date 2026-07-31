@@ -188,12 +188,32 @@ pub const OpenApiGenerator = struct {
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
 
-        // Helper: allocPrint → append → free
+        // Helper: allocPrint → append → free; emitEscaped for JSON string contents
         const S = struct {
             fn emit(target: *std.ArrayList(u8), alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
                 const s = try std.fmt.allocPrint(alloc, fmt, args);
                 defer alloc.free(s);
                 try target.appendSlice(alloc, s);
+            }
+            fn emitJsonStr(target: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) !void {
+                try target.append(alloc, '"');
+                for (s) |c| {
+                    switch (c) {
+                        '"' => try target.appendSlice(alloc, "\\\""),
+                        '\\' => try target.appendSlice(alloc, "\\\\"),
+                        '\n' => try target.appendSlice(alloc, "\\n"),
+                        '\r' => try target.appendSlice(alloc, "\\r"),
+                        '\t' => try target.appendSlice(alloc, "\\t"),
+                        else => {
+                            if (c < 0x20) {
+                                try emit(target, alloc, "\\u{x:0>4}", .{c});
+                            } else {
+                                try target.append(alloc, c);
+                            }
+                        },
+                    }
+                }
+                try target.append(alloc, '"');
             }
         };
 
@@ -208,9 +228,15 @@ pub const OpenApiGenerator = struct {
 
         // info
         try buf.appendSlice(self.allocator, "  \"info\": {\n");
-        try S.emit(&buf, self.allocator, "    \"title\": \"{s}\",\n", .{self.title});
-        try S.emit(&buf, self.allocator, "    \"version\": \"{s}\",\n", .{self.version});
-        try S.emit(&buf, self.allocator, "    \"description\": \"{s}\"\n", .{self.description});
+        try buf.appendSlice(self.allocator, "    \"title\": ");
+        try S.emitJsonStr(&buf, self.allocator, self.title);
+        try buf.appendSlice(self.allocator, ",\n");
+        try buf.appendSlice(self.allocator, "    \"version\": ");
+        try S.emitJsonStr(&buf, self.allocator, self.version);
+        try buf.appendSlice(self.allocator, ",\n");
+        try buf.appendSlice(self.allocator, "    \"description\": ");
+        try S.emitJsonStr(&buf, self.allocator, self.description);
+        try buf.appendSlice(self.allocator, "\n");
         try buf.appendSlice(self.allocator, "  },\n");
 
         // servers
@@ -261,11 +287,15 @@ pub const OpenApiGenerator = struct {
                 try S.emit(&buf, self.allocator, "      \"{s}\": {{\n", .{method});
 
                 // summary
-                try S.emit(&buf, self.allocator, "        \"summary\": \"{s}\",\n", .{ep.summary});
+                try buf.appendSlice(self.allocator, "        \"summary\": ");
+                try S.emitJsonStr(&buf, self.allocator, ep.summary);
+                try buf.appendSlice(self.allocator, ",\n");
 
                 // description
                 if (ep.description.len > 0) {
-                    try S.emit(&buf, self.allocator, "        \"description\": \"{s}\",\n", .{ep.description});
+                    try buf.appendSlice(self.allocator, "        \"description\": ");
+                    try S.emitJsonStr(&buf, self.allocator, ep.description);
+                    try buf.appendSlice(self.allocator, ",\n");
                 }
 
                 // tags
