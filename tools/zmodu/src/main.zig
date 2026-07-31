@@ -1,10 +1,17 @@
 // ZModu - Code generation tool for ZigModu
 const std = @import("std");
+const build_options = @import("build_options");
+
+/// Framework version from build.zig.zon, injected via build_options so the CLI
+/// can never drift from the package version.
+pub const ZMODU_VERSION: []const u8 = blk: {
+    const v = build_options.version;
+    break :blk std.fmt.comptimePrint("{d}.{d}.{d}", .{ v.major, v.minor, v.patch });
+};
 const Io = std.Io;
 const orm_tpl = @import("orm_tpl.zig");
 const mcp_server = @import("mcp_server.zig");
 
-pub const ZMODU_VERSION = "0.15.0";
 const verify_mod = @import("verify.zig");
 const sql_diff = @import("sql_diff.zig");
 const incremental = @import("incremental.zig");

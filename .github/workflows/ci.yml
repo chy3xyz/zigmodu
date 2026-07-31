@@ -109,6 +109,9 @@ jobs:
       - name: Zig fmt check
         run: zig fmt --check src tools examples
 
+      - name: Version consistency
+        run: bash scripts/check-version.sh
+
   examples:
     name: Build Examples
     runs-on: ubuntu-latest
@@ -120,6 +123,9 @@ jobs:
         with:
           repository: chy3xyz/zent
           path: ../zent
+          # Pin the exact commit used for local verification (v0.12.1 + the
+          # extern-c build fix) so example builds stay reproducible.
+          ref: 1efd9fb
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v1
@@ -363,6 +369,11 @@ jobs:
 
       - name: Install deps
         run: sudo apt-get install -y libpq-dev libmariadb-dev libsqlite3-dev
+
+      - name: Verify tag matches build.zig.zon
+        env:
+          REF_TAG: ${{ github.ref_name }}
+        run: bash scripts/check-release.sh
 
       - name: Build release
         run: zig build -Doptimize=ReleaseSafe

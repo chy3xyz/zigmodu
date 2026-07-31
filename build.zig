@@ -13,8 +13,10 @@ pub fn build(b: *std.Build) void {
     };
 
     // Build options for compile-time configuration
+    const package_zon = @import("build.zig.zon");
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "log_level", b.option([]const u8, "log-level", "Compile-time log level (debug/info/warn/err)") orelse "debug");
+    build_options.addOption(std.SemanticVersion, "version", std.SemanticVersion.parse(package_zon.version) catch unreachable);
     db_link.addToOptions(build_options, features);
     const build_options_mod = build_options.createModule();
 
@@ -154,6 +156,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    zmodu_cli_mod.addImport("build_options", build_options_mod);
     const zmodu_cli_exe = b.addExecutable(.{
         .name = "zmodu",
         .root_module = zmodu_cli_mod,

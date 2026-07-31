@@ -4,7 +4,7 @@
 
 [![Zig](https://img.shields.io/badge/Zig-0.17+-orange?style=flat-square)](https://ziglang.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-0.14.17-blue?style=flat-square)]()
+[![Version](https://img.shields.io/github/v/release/chy3xyz/zigmodu?style=flat-square)]()
 
 [English](README.md) | 中文
 
