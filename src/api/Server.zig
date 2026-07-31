@@ -359,9 +359,12 @@ pub const Context = struct {
         return self.query.get(key) orelse default;
     }
 
-    /// Get header
+    /// Get request header. Header names are case-insensitive (RFC 9110), so
+    /// `"User-Agent"` and `"user-agent"` resolve to the same value. Request
+    /// headers are normalized to lowercase at parse time; the exact-match fast
+    /// path covers lowercase keys, and a case-insensitive scan handles the rest.
     pub fn header(self: *const Context, key: []const u8) ?[]const u8 {
-        return self.headers.get(key);
+        return headerLookup(self.headers, key);
     }
 
     /// Get form value
@@ -1223,6 +1226,18 @@ fn writeResponse(io: std.Io, stream: std.Io.net.Stream, status: u16, headers: st
     // Body (already chunk-encoded if Transfer-Encoding: chunked)
     try w.interface.writeAll(body);
     try w.interface.flush();
+}
+
+/// Case-insensitive header lookup. Keys stored in the map (request headers are
+/// lowercased at parse time) are matched exactly first, then by
+/// `std.ascii.eqlIgnoreCase` so `ctx.header("X-Agent-Token")` works.
+fn headerLookup(headers: std.StringHashMap([]const u8), key: []const u8) ?[]const u8 {
+    if (headers.get(key)) |value| return value;
+    var it = headers.iterator();
+    while (it.next()) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, key)) return entry.value_ptr.*;
+    }
+    return null;
 }
 
 /// HTTP server — async fiber-based
@@ -2734,4 +2749,16 @@ test "WebSocket route path normalization handles leading slash variations" {
     const path2 = "app-api/ws/im";
     const norm2 = if (path2.len > 0 and path2[0] == '/') path2[1..] else path2;
     try std.testing.expect(server.ws_handlers.get(norm2) != null);
+}
+
+test "header lookup is case-insensitive" {
+    var headers = std.StringHashMap([]const u8).init(std.testing.allocator);
+    defer headers.deinit();
+    try headers.put("user-agent", "zigmodu-test");
+    try headers.put("x-tenant-id", "42");
+
+    try std.testing.expectEqualStrings("zigmodu-test", headerLookup(headers, "User-Agent").?);
+    try std.testing.expectEqualStrings("42", headerLookup(headers, "X-Tenant-ID").?);
+    try std.testing.expectEqualStrings("zigmodu-test", headerLookup(headers, "user-agent").?);
+    try std.testing.expect(headerLookup(headers, "content-type") == null);
 }

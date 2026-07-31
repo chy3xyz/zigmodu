@@ -2062,38 +2062,112 @@ pub const PostgresConn = struct {
         );
     }
 
+    /// Bytes consumed when `sql[i]` opens a string literal (`'...'` with `''`
+    /// escapes), quoted identifier (`"..."`), `--` line comment, or `/* ... */`
+    /// block comment; 0 when `sql[i]` is plain SQL text.
+    fn skipQuotedOrComment(sql: []const u8, i: usize) usize {
+        const c = sql[i];
+        if (c == '\'') {
+            var j = i + 1;
+            while (j < sql.len) {
+                if (sql[j] == '\'') {
+                    j += 1;
+                    if (j < sql.len and sql[j] == '\'') {
+                        j += 1; // escaped ''
+                        continue;
+                    }
+                    return j - i;
+                }
+                j += 1;
+            }
+            return sql.len - i; // unterminated — consume the rest
+        }
+        if (c == '"') {
+            var j = i + 1;
+            while (j < sql.len and sql[j] != '"') : (j += 1) {}
+            return if (j < sql.len) j + 1 - i else sql.len - i;
+        }
+        if (c == '-' and i + 1 < sql.len and sql[i + 1] == '-') {
+            var j = i;
+            while (j < sql.len and sql[j] != '\n') : (j += 1) {}
+            return j - i;
+        }
+        if (c == '/' and i + 1 < sql.len and sql[i + 1] == '*') {
+            var j = i + 2;
+            while (j + 1 < sql.len and !(sql[j] == '*' and sql[j + 1] == '/')) : (j += 1) {}
+            return if (j + 1 < sql.len) j + 2 - i else sql.len - i;
+        }
+        return 0;
+    }
+
+    /// Number of digits following a `?` placeholder at `sql[i]` (sqlite-style
+    /// `?N` numbering). The digits must be consumed so `?1` becomes `$1`, not
+    /// `$11`.
+    fn placeholderDigits(sql: []const u8, i: usize) usize {
+        var j = i + 1;
+        while (j < sql.len and std.ascii.isDigit(sql[j])) : (j += 1) {}
+        return j - i - 1;
+    }
+
+    /// Converts sqlite-style `?` / `?N` placeholders to PostgreSQL `$N`.
+    ///
+    /// Every placeholder is numbered sequentially in order of appearance and
+    /// trailing digits are consumed, so `?`, `?2`, `?` become `$1`, `$2`, `$3`.
+    /// Quoted strings, quoted identifiers, `--` comments and `/* */` comments
+    /// are skipped so `?` inside literals is never rewritten.
     fn convertPlaceholders(allocator: std.mem.Allocator, sql: []const u8) ?[:0]u8 {
+        // Pass 1: count placeholders and compute the exact output size.
         var count: usize = 0;
-        for (sql) |c| {
-            if (c == '?') count += 1;
+        var removed: usize = 0;
+        var added: usize = 0;
+        var i: usize = 0;
+        while (i < sql.len) {
+            const skipped = skipQuotedOrComment(sql, i);
+            if (skipped > 0) {
+                i += skipped;
+                continue;
+            }
+            if (sql[i] == '?') {
+                count += 1;
+                const digits = placeholderDigits(sql, i);
+                removed += 1 + digits;
+                var tmp: [24]u8 = undefined;
+                const s = std.fmt.bufPrint(&tmp, "${d}", .{count}) catch return null;
+                added += s.len;
+                i += 1 + digits;
+            } else {
+                i += 1;
+            }
         }
         if (count == 0) return allocZ(allocator, sql) catch null;
 
-        // Calculate exact size: orifinal len minus ? chars plus $N replacements
-        var exact: usize = sql.len - count;
-        var n: usize = 0;
-        while (n < count) : (n += 1) {
-            // Each ? becomes "$N" — 1 difit for N<10, 2 for <100, etc.
-            const difits = if (n + 1 < 10) @as(usize, 2) else if (n + 1 < 100) @as(usize, 3) else @as(usize, 4);
-            exact += difits;
-        }
-
-        const buf = allocator.allocSentinel(u8, exact, 0) catch return null;
+        // Pass 2: emit `$N`, consuming `?N` digits verbatim-skipped elsewhere.
+        const buf = allocator.allocSentinel(u8, sql.len - removed + added, 0) catch return null;
         var pos: usize = 0;
-        n = 0;
-        for (sql) |c| {
-            if (c == '?') {
+        var n: usize = 0;
+        i = 0;
+        while (i < sql.len) {
+            const skipped = skipQuotedOrComment(sql, i);
+            if (skipped > 0) {
+                @memcpy(buf[pos .. pos + skipped], sql[i .. i + skipped]);
+                pos += skipped;
+                i += skipped;
+                continue;
+            }
+            if (sql[i] == '?') {
                 n += 1;
-                var tmp: [5]u8 = undefined;
+                var tmp: [24]u8 = undefined;
                 const s = std.fmt.bufPrint(&tmp, "${d}", .{n}) catch {
                     allocator.free(buf);
                     return null;
                 };
                 @memcpy(buf[pos .. pos + s.len], s);
                 pos += s.len;
+                i += 1 + placeholderDigits(sql, i);
             } else {
-                buf[pos] = c;
+                buf[pos] = sql[i];
                 pos += 1;
+                i += 1;
             }
         }
         return buf[0..pos :0];
@@ -6619,4 +6693,37 @@ test "diagnosePostgres handles null result and missing error fields safely" {
     try std.testing.expect(diag_null.constraint == null);
     try std.testing.expect(diag_null.table == null);
     try std.testing.expect(diag_null.column == null);
+}
+
+test "convertPlaceholders maps ? and ?N to sequential $N" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { in: []const u8, want: []const u8 }{
+        .{ .in = "SELECT * FROM users WHERE username = ?1", .want = "SELECT * FROM users WHERE username = $1" },
+        .{ .in = "INSERT INTO t (a, b) VALUES (?1, ?2)", .want = "INSERT INTO t (a, b) VALUES ($1, $2)" },
+        .{ .in = "SELECT * FROM t WHERE a = ? AND b = ?2 AND c = ?", .want = "SELECT * FROM t WHERE a = $1 AND b = $2 AND c = $3" },
+        .{ .in = "UPDATE t SET a = ?12 WHERE id = ?", .want = "UPDATE t SET a = $1 WHERE id = $2" },
+        .{ .in = "SELECT * FROM t WHERE x = ?", .want = "SELECT * FROM t WHERE x = $1" },
+        .{ .in = "SELECT * FROM t", .want = "SELECT * FROM t" },
+    };
+    for (cases) |case| {
+        const got = PostgresConn.convertPlaceholders(allocator, case.in) orelse return error.TestUnexpectedResult;
+        defer allocator.free(got);
+        try std.testing.expectEqualStrings(case.want, got);
+    }
+}
+
+test "convertPlaceholders skips ? inside literals and comments" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { in: []const u8, want: []const u8 }{
+        .{ .in = "SELECT 'it''s ? fine' AS s, ? AS p", .want = "SELECT 'it''s ? fine' AS s, $1 AS p" },
+        .{ .in = "SELECT \"col?\" FROM t WHERE x = ?", .want = "SELECT \"col?\" FROM t WHERE x = $1" },
+        .{ .in = "SELECT 1 -- ? comment\nWHERE x = ?", .want = "SELECT 1 -- ? comment\nWHERE x = $1" },
+        .{ .in = "SELECT 1 /* ? block */ WHERE x = ?", .want = "SELECT 1 /* ? block */ WHERE x = $1" },
+        .{ .in = "SELECT '?', 'a''b?c' WHERE x = ?1", .want = "SELECT '?', 'a''b?c' WHERE x = $1" },
+    };
+    for (cases) |case| {
+        const got = PostgresConn.convertPlaceholders(allocator, case.in) orelse return error.TestUnexpectedResult;
+        defer allocator.free(got);
+        try std.testing.expectEqualStrings(case.want, got);
+    }
 }
