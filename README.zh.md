@@ -1,10 +1,10 @@
-# ZigModu v0.14.16
+# ZigModu v0.14.17
 
 一个为 Zig **0.17.0** 打造的模块化应用框架，受 Spring Modulith 启发。从单体架构到分布式系统，支持渐进式架构演进。
 
 [![Zig](https://img.shields.io/badge/Zig-0.17+-orange?style=flat-square)](https://ziglang.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-0.14.16-blue?style=flat-square)]()
+[![Version](https://img.shields.io/badge/Version-0.14.17-blue?style=flat-square)]()
 
 [English](README.md) | 中文
 
