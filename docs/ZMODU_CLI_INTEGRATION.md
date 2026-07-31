@@ -73,3 +73,22 @@ zmodu add --name order_item --sql ./schema.sql
    const obs = zmodu.observability;
    ```
 3. **数据库与事务模式**：生成的存储层可通过参数选择 `sqlx` (标准) 或 `zent` (正交 ORM) 作为后端，两套引擎独立运行。
+4. **驱动链接**：scaffold / `new` 写入的 `build.zig` 含 `.db = "…"`（默认 `sqlite`；`--from-db` 按 DSN 映射 `postgres` / `mysql` / `sqlite`）。勿再手链三库。详见 [SQLX_DRIVERS.md](SQLX_DRIVERS.md)。
+
+---
+
+## Scaffold 与 `-Ddb=` / `.db=`
+
+| 输入 | 生成 `.db=` |
+|------|-------------|
+| `zmodu new` / `--sql`（无 `--from-db`） | `sqlite` |
+| `--from-db postgresql://…` 或 `postgres://…` | `postgres` |
+| `--from-db mysql://…` | `mysql` |
+| 其它 / sqlite 路径 | `sqlite` |
+
+```bash
+zig build zmodu -- scaffold --from-db postgresql://user@localhost/db --name myapp
+# → build.zig 中 b.dependency("zigmodu", .{ .db = "postgres", ... })
+```
+
+运行时 DSN 与链接驱动必须一致；未链接的驱动会在 `Client.connect` 返回 `error.DriverNotEnabled`。

@@ -14,6 +14,7 @@
 | Day-1 并发 / 反模式 | `docs/MODULITH.md` |
 | 多租户列名 | `docs/ARCHITECTURE.md` § Multi-Tenancy |
 | zent ORM | `docs/ZENT.md`（勿与 sqlx 混事务） |
+| SQLx 驱动链接 | `docs/SQLX_DRIVERS.md`（`-Ddb=` / `.db=`） |
 | Extract / SSE / Testkit / Outbox | `docs/FRAMEWORK_BACKLOG.md` |
 | CLI 生成 | `docs/ZMODU_CLI_INTEGRATION.md` · `zig build zmodu -- scaffold …` |
 | LLM 对话模块（产品功能） | `docs/AI.md`（**不是** agent 指南） |
@@ -57,6 +58,7 @@ defer app.stop();
 | `ctx.json` / `http.respondErr` / extractors | `sendSuccess`/`sendFail`；拼用户输入进 SQL |
 | OTLP / Vault：`http://`；x402 **fail-closed** | 默认放行支付；假定 OTLP/Vault 已支持 `https://` |
 | `http.HttpClient`：`https://` 经 `std.http.Client`（AI/出站；`requestStream` HTTPS 真增量） | 仍对 Vault/OTLP 假定已支持 TLS |
+| WS：`on_message(session, msg, kind)` — **text+binary**（`WsFrameKind`）；`writeBinary`/`writeData` | 假定只收 0x1；丢弃 0x2（会破坏 OpenIM protobuf） |
 | sqlx：`Client.open` 后注意 pool/client 指针；CB 传 `io` | 在 ConnPool 上缓存失效的 `*Client` |
 | sqlx 驱动链接：`-Ddb=sqlite\|postgres\|mysql\|all`（默认 `all`） | 小系统用 `.db = "sqlite"`，勿默认三库全链 |
 
@@ -71,9 +73,9 @@ const zigmodu_dep = b.dependency("zigmodu", .{
 });
 ```
 
-框架自测必须用默认 `-Ddb=all`（`zig build test`）。窄化 `-Ddb=` 只适合应用/示例构建，不适合跑完整单元测试套件。
+框架自测必须用默认 `-Ddb=all`（`zig build test`）。窄化 `-Ddb=` 只适合应用/示例构建。
 
-路径依赖示例若需共用 `db_link.zig`：在 `examples/<name>/` 放指向 `../_shared/db_link.zig` 的符号链接（Windows 无 symlink 时可复制文件）。
+权威细则（取值表、stub、`DriverNotEnabled`、scaffold、symlink/Windows、体积预期）→ **[`docs/SQLX_DRIVERS.md`](docs/SQLX_DRIVERS.md)**。
 
 权威细则与接线样例 → `docs/BEST_PRACTICES.md`「JWT / 多端身份」· `docs/ROUTE_TABLE.md` §7。
 
@@ -293,7 +295,7 @@ bash scripts/ci-integration.sh   # tenant-mgmt + stress + shopdemo（-Ddb=sqlite
 - Do not create git commits unless the user explicitly asks.
 - Prefer the production-readiness plan without physically splitting `sqlx.zig` or `Server.zig`; use section comments plus `docs/PRODUCTION_ROADMAP.md` maintenance boundaries instead.
 - When generating framework code from SQL scripts (zmodu), follow zigmodu best practices for complete module output and place reusable templates in a dedicated templates folder.
-- When refining architecture or best practices, land them in docs (`docs/ZENT.md`, `MODULITH.md`, `MODULE_LAYERS.md`, `BEST_PRACTICES.md`, `ROUTE_TABLE.md`, **`AGENTS.md`**) rather than chat-only advice.
+- When refining architecture or best practices, land them in docs (`docs/ZENT.md`, `MODULITH.md`, `MODULE_LAYERS.md`, `BEST_PRACTICES.md`, `ROUTE_TABLE.md`, `SQLX_DRIVERS.md`, **`AGENTS.md`**) rather than chat-only advice.
 - When restructuring examples, preserve existing domain/business logic unless explicitly asked to change it.
 
 ## Learned Workspace Facts
@@ -303,5 +305,7 @@ bash scripts/ci-integration.sh   # tenant-mgmt + stress + shopdemo（-Ddb=sqlite
 - Auth Path A + `CatalogPermLoadInput` 已落地；legacy JWT 只写 `auth_info`。
 - x402 fail-closed；OTLP/Vault 仅 plain HTTP。
 - zent v0.13+ 与 `data.sqlx` 正交，勿混驱动/共享事务（`docs/ZENT.md`）。
-- CI：`bash scripts/ci-integration.sh`（tenant-mgmt + stress + shopdemo）。
+- SQLx 选择性链接：`-Ddb=` / `.db=`，默认 `all`；框架测试勿收窄；见 `docs/SQLX_DRIVERS.md`。
+- WS：`WsMessageFn` 含 `WsFrameKind`；fiber/io_uring 分发 text+binary（OpenIM protobuf OK）。
+- CI：`bash scripts/ci-integration.sh`（tenant-mgmt + stress + shopdemo，`-Ddb=sqlite`）。
 - 旗舰示例：`examples/tenant-mgmt`（CatalogPermDb）；多主体门户参考应用侧 Alignment 文档（如 ZigShop）。

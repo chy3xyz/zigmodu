@@ -3,6 +3,7 @@
 > **Modulith 从第一天怎么写高并发应用**：见专文 [MODULITH.md](MODULITH.md)（边界、fiber、池化、规模阶梯、反模式）。  
 > **model / persistence / service / Tx 分层**：见专文 [MODULE_LAYERS.md](MODULE_LAYERS.md)（参考实现 `examples/tenant-shop`）。  
 > **ZigModu × zent（schema / Client / privacy / 模块级选型）**：见专文 [ZENT.md](ZENT.md)（参考实现 `examples/zent-modulith`）。  
+> **SQLx 选择性驱动链接（`-Ddb=` / `.db=`）**：见专文 [SQLX_DRIVERS.md](SQLX_DRIVERS.md)。  
 > **HTTP 路由 + catalog JWT / RBAC**：见专文 [ROUTE_TABLE.md](ROUTE_TABLE.md) §7；可执行清单见下文「JWT / 多端身份」。  
 > **AI / Agent 写代码**：先读仓库根目录 [AGENTS.md](../AGENTS.md)（文档地图 + DO/DON'T）；方法论见 [AI_METHODOLOGY.md](AI_METHODOLOGY.md)。
 

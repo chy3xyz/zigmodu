@@ -22,6 +22,7 @@ Comprehensive documentation for the ZigModu modular framework.
 | [领域分层](MODULE_LAYERS.md) | model / persistence.Tx / service Cmd | All |
 | [多租户店蓝图](MODULITH_TENANT_SHOP.md) | Module graph + directory for tenant shop | All |
 | [ZigModu × zent](ZENT.md) | Orthogonal zent ORM + modulith practices | Intermediate |
+| [SQLx 驱动链接](SQLX_DRIVERS.md) | `-Ddb=` / `.db=` 选择性链接、stub、测试约定 | All |
 | [zmodu CLI 生成器](ZMODU_CLI_INTEGRATION.md) | DDL schema generator + `@initialized` model + MCP | All |
 | [Best Practices](BEST_PRACTICES.md) | Architecture evolution + JWT / auth checklist | All |
 | [Declarative Routes](ROUTE_TABLE.md) | ComptimeRouter + catalog JWT / RBAC gate (§7) | All |

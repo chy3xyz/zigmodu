@@ -1,6 +1,7 @@
 # ZigModu Best Practices — Lessons from Heysen SaaS
 
-> Derived from building a 68-module insurance brokerage platform (Zig 0.17.0 + zigmodu).
+> Derived from building a 68-module insurance brokerage platform (Zig 0.17.0 + zigmodu).  
+> 选择性驱动链接（减小部署依赖面）：[SQLX_DRIVERS.md](SQLX_DRIVERS.md)。
 
 ## 1. SQLx — PostgreSQL Driver
 

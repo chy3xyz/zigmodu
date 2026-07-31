@@ -87,6 +87,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .db = "sqlite", // link only what you need: sqlite|postgres|mysql|all
+        // 完整约定 → docs/SQLX_DRIVERS.md
     });
 
     const exe_mod = b.createModule(.{

@@ -17,6 +17,7 @@
 | [Modulith 高并发](docs/MODULITH.md) | 项目第一天：模块边界 + 高并发实践 |
 | [声明式路由](docs/ROUTE_TABLE.md) | ComptimeRouter + catalog JWT/RBAC |
 | [ZigModu × zent](docs/ZENT.md) | zent ORM 正交接入与最佳实践 |
+| [SQLx 驱动链接](docs/SQLX_DRIVERS.md) | `-Ddb=` / `.db=` 选择性链接 |
 | [最佳实践](docs/BEST_PRACTICES.md) | DAU 演进 + JWT / 多端身份清单 |
 | [API参考](docs/API.md) | 完整API文档 |
 | [架构设计](docs/ARCHITECTURE.md) | 系统设计与模式 |
@@ -53,6 +54,16 @@
 - **zmodu 代码生成 CLI** - 内置项目脚手架与 MCP Server (`zig build zmodu`)
 
 ## 🚀 快速开始
+
+应用依赖 zigmodu 时建议显式收窄 SQL 驱动（默认 `all` 会链三库）：
+
+```zig
+const zigmodu_dep = b.dependency("zigmodu", .{
+    .target = target,
+    .optimize = optimize,
+    .db = "sqlite", // 详见 docs/SQLX_DRIVERS.md
+});
+```
 
 ### 前置要求
 

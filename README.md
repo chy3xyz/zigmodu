@@ -34,7 +34,7 @@ A modular application framework for Zig 0.17, inspired by Spring Modulith. Build
 
 ### HTTP & API
 - **HTTP Server** — Async fiber-based server (kqueue/io_uring), trie router, middleware chains
-- **WebSocket** — RFC 6455 server/client with origin validation and monitoring
+- **WebSocket** — RFC 6455 server (text + **binary** data frames via `WsFrameKind`); origin validation and monitoring
 - **gRPC** — Unary framing + registry invoke + HTTP/1.1 `application/grpc` client (`GrpcFrame` / `GrpcClient.bindLocal`)
 - **OpenAPI** — 3.0/3.1 JSON document generator from route metadata
 - **Idempotency** — Request deduplication middleware with TTL-based store
@@ -134,7 +134,6 @@ Each domain file is self-contained — importing `zmodu.http` does not compile `
 Link only the database drivers you need (default remains `all` for compatibility):
 
 ```zig
-// In your app's build.zig
 const zigmodu_dep = b.dependency("zigmodu", .{
     .target = target,
     .optimize = optimize,
@@ -143,13 +142,11 @@ const zigmodu_dep = b.dependency("zigmodu", .{
 ```
 
 ```bash
-# Framework / example builds
-zig build -Ddb=sqlite
-# Framework unit tests must keep all drivers enabled (default)
-zig build test
+zig build -Ddb=sqlite          # apps / examples
+zig build test                 # framework tests: keep default all
 ```
 
-Disabled drivers compile to stubs; opening them at runtime returns `error.DriverNotEnabled` (HTTP → 400). Typical small apps on macOS arm64: `examples/basic` ReleaseSmall ~180KB stripped; SQLite-only vs all-drivers saves mainly shared-lib deps, not huge binary KB.
+Disabled drivers → C stubs; runtime `error.DriverNotEnabled` (HTTP 400). Full guide: **[docs/SQLX_DRIVERS.md](docs/SQLX_DRIVERS.md)**.
 
 ### Prerequisites
 

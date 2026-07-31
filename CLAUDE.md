@@ -8,9 +8,10 @@ ZigModu **v0.14.17** — modular app framework for Zig **0.17.0**. ~98/100 (`doc
 ## Build & Test
 ```bash
 zig build
-ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test   # 664+ passed, 20 skipped
+ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test   # 须默认 -Ddb=all
+zig build -Ddb=sqlite                                  # 应用/示例收窄驱动（见 docs/SQLX_DRIVERS.md）
 zig build check-api                                    # examples API gate
-bash scripts/ci-integration.sh                         # tenant-mgmt + stress + shopdemo
+bash scripts/ci-integration.sh                         # tenant-mgmt + stress + shopdemo（-Ddb=sqlite）
 zig build docs
 zig build zmodu -- scaffold --sql schema.sql --name my_app --with-auth
 ```

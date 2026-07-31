@@ -6,7 +6,7 @@
 **参考实现**: [`examples/zent-modulith/`](../examples/zent-modulith/)  
 **zent 自带示例**: `zig build run-start` / `run-complex` / `run-pool`（在 zent 仓库内）
 
-相关文档：[MODULE_LAYERS.md](MODULE_LAYERS.md) · [MODULITH.md](MODULITH.md) · [BEST_PRACTICES.md](BEST_PRACTICES.md) · [DATA / sqlx](../src/data.zig)
+相关文档：[MODULE_LAYERS.md](MODULE_LAYERS.md) · [MODULITH.md](MODULITH.md) · [BEST_PRACTICES.md](BEST_PRACTICES.md) · [SQLX_DRIVERS.md](SQLX_DRIVERS.md)（zigmodu 侧 `-Ddb=`）· [DATA / sqlx](../src/data.zig)
 
 ---
 
@@ -431,6 +431,8 @@ zig_ws/
   zigmodu/
   zent/          # git clone https://github.com/chy3xyz/zent.git
 ```
+
+**zigmodu 侧驱动链接**：`examples/zent-modulith` 等 path 依赖仍 `addImport("zigmodu")`，并用 `db_link.Features.sqlite_only`，避免 zigmodu sqlx 再链 libpq/mysql。业务只走 zent 时也建议如此。完整约定见 [SQLX_DRIVERS.md](SQLX_DRIVERS.md) §8。
 
 ---
 

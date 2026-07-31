@@ -2,12 +2,15 @@
 
 This directory contains comprehensive examples demonstrating various features of ZigModu.
 
+**DB linking**: most runnable examples use sqlite-only (`.db = "sqlite"` or `-Ddb=sqlite`). Path-dep apps share [`_shared/db_link.zig`](_shared/db_link.zig) via per-example symlinks. Full guide: [`docs/SQLX_DRIVERS.md`](../docs/SQLX_DRIVERS.md).
+
 ## ★ Start here: Tenant Management (`examples/tenant-mgmt`)
 
 **Flagship runnable demo** — multi-tenant SaaS, middleware chain (tenant → JWT → data permission), `/health/live`, dashboard, and `zigmodu.http` canonical imports. Used by CI integration probes (`scripts/ci-integration.sh`).
 
 ```bash
 cd examples/tenant-mgmt && HTTP_PORT=18080 zig build run
+# optional: zig build -Ddb=sqlite   # default for this example is already selectable
 curl http://127.0.0.1:18080/health/live
 ```
 

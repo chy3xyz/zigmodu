@@ -68,8 +68,8 @@ export HTTP_PORT=18080
 export JWT_SECRET=dev-secret          # HS256 signing key (AppSecurity + wall clock)
 export TENANT_MGMT_SQLITE=:memory:   # or path to file
 
-# 3. Run
-zig build run
+# 3. Run (sqlite-only by default via -Ddb=; see docs/SQLX_DRIVERS.md)
+zig build -Ddb=sqlite run
 # → Server starts on http://localhost:18080
 
 # 4. Get a JWT for API calls (from repo root)
@@ -124,8 +124,8 @@ curl -s http://localhost:18080/openapi.json | head
 # Docker
 docker compose -f ../../docker-compose.yml up -d
 
-# Or standalone binary
-zig build -Doptimize=ReleaseSafe
+# Or standalone binary (sqlite-only — see docs/SQLX_DRIVERS.md)
+zig build -Doptimize=ReleaseSafe -Ddb=sqlite
 ./zig-out/bin/tenant-mgmt
 ```
 

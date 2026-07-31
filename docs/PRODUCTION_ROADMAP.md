@@ -81,6 +81,7 @@ bash scripts/ci-integration.sh   # tenant-mgmt + http-stress-test（需 curl）
 2. **新数据库 driver**：新文件 `sqlx/<name>_conn.zig` + `sqlx.zig` 仅加 VTable 注册与 re-export。
 3. **禁止**在 sqlx.zig 增加与 HTTP、租户、缓存无关的业务逻辑。
 4. 修改 ConnPool / Row arena / stmt 复用路径时，**必须**跑全量 `zig build test`。
+5. **选择性链接**：用 `build_options.enable_*` + `sqlx/*_c_stub.zig` + `examples/_shared/db_link.zig`；**不要**为减体积拆 `sqlx.zig`。默认 `-Ddb=all`；消费者与测试约定见 [SQLX_DRIVERS.md](SQLX_DRIVERS.md)。
 
 ---
 
