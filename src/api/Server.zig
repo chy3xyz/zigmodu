@@ -1952,6 +1952,16 @@ fn deepCopy(value: anytype, allocator: std.mem.Allocator) !@TypeOf(value) {
             if (p.child == u8) {
                 return allocator.dupe(u8, value);
             }
+            // Slices of non-u8 (e.g. []struct, [][]const u8) must be deep-copied:
+            // the source points into the (freed) JSON parse buffer.
+            if (p.size == .slice) {
+                const Child = p.child;
+                var copy = try allocator.alloc(Child, value.len);
+                for (value, 0..) |elem, i| {
+                    copy[i] = try deepCopy(elem, allocator);
+                }
+                return copy;
+            }
             return value;
         },
         else => return value,
@@ -2562,6 +2572,34 @@ test "deepCopy strings escape arena lifetime" {
     try std.testing.expectEqualStrings("bob", outer_copy.inner.name);
     try std.testing.expectEqual(@as(i32, 25), outer_copy.inner.age);
     try std.testing.expectEqualStrings("test", outer_copy.label);
+}
+
+test "deepCopy non-u8 slices escape arena lifetime" {
+    const allocator = std.testing.allocator;
+
+    // Slice of structs: inner string pointers must be deep-copied.
+    const Row = struct { name: []const u8, id: i32 };
+    const rows = [_]Row{ .{ .name = "a", .id = 1 }, .{ .name = "bb", .id = 2 } };
+    const rows_slice: []const Row = &rows;
+    const rows_copy = try deepCopy(rows_slice, allocator);
+    defer allocator.free(rows_copy);
+    defer {
+        for (rows_copy) |r| allocator.free(r.name);
+    }
+    try std.testing.expectEqual(@as(usize, 2), rows_copy.len);
+    try std.testing.expectEqualStrings("a", rows_copy[0].name);
+    try std.testing.expect(rows_copy[0].name.ptr != rows[0].name.ptr);
+
+    // Slice of slices: inner buffers must be independent.
+    const tags = [_][]const u8{ "x", "yy" };
+    const tags_slice: []const []const u8 = &tags;
+    const tags_copy = try deepCopy(tags_slice, allocator);
+    defer allocator.free(tags_copy);
+    defer {
+        for (tags_copy) |t| allocator.free(t);
+    }
+    try std.testing.expectEqualStrings("yy", tags_copy[1]);
+    try std.testing.expect(tags_copy[1].ptr != tags[1].ptr);
 }
 
 test "queryInt returns default on missing param" {
