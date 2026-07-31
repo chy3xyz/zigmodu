@@ -45,7 +45,7 @@ pub const ZigModuError = error{
     TransactionAlreadyActive,
     NoActiveTransaction,
 
-    // [...]Error
+    // Database
     DatabaseConnectionFailed,
     QueryExecutionFailed,
     QueryFailed,
@@ -56,6 +56,8 @@ pub const ZigModuError = error{
     SerializationFailure,
     ReadOnlyViolation,
     RedisError,
+    /// SQL driver disabled at compile time (`-Ddb=` / `build_options.enable_*`).
+    DriverNotEnabled,
 
     // [...]Error
     NotFound,
@@ -199,6 +201,7 @@ pub fn toErrorContext(err: anyerror, message: []const u8) ErrorContext {
         error.FileNotFound => ZigModuError.ConfigFileNotFound,
         error.ConnectionRefused => ZigModuError.ConnectionRefused,
         error.ConnectionTimedOut => ZigModuError.ConnectionTimeout,
+        error.DriverNotEnabled => ZigModuError.DriverNotEnabled,
         else => ZigModuError.UnknownError,
     };
 
@@ -233,7 +236,7 @@ pub fn toHttpCode(err: ZigModuError) HttpCode {
 
         error.ConnectionTimeout, error.Timeout => .RequestTimeout,
 
-        error.InvalidInput, error.MissingRequiredField, error.InvalidFormat, error.ValidationFailed, error.ConfigurationError, error.ConfigParseError, error.ConfigValidationFailed => .BadRequest,
+        error.InvalidInput, error.MissingRequiredField, error.InvalidFormat, error.ValidationFailed, error.ConfigurationError, error.ConfigParseError, error.ConfigValidationFailed, error.DriverNotEnabled => .BadRequest,
 
         error.HttpError, error.ServerError => .ServerError,
 

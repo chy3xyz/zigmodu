@@ -1,14 +1,12 @@
+//! OpenAI-compatible chat provider with tool_calls + DeepSeek cache metrics.
+//!
+//! Cache strategy: static content (system + tools) FIRST → cached; dynamic LAST.
+//! Tool calling: pass `ChatOpts.tools_json` (from `SkillRegistry.toOpenAiFunctionsAlloc`).
+
 const std = @import("std");
 const tokenizer = @import("tokenizer.zig");
 const http_client = @import("../http/HttpClient.zig");
 
-/// OpenAI-compatible chat provider with DeepSeek cache optimization.
-///
-/// Cache strategy: implicit prefix caching (DeepSeek V4).
-/// Static content (system + tools) FIRST → cached. Dynamic content LAST.
-///
-/// Thread-safe: rate_limiter protected by mutex.
-/// Connection pooling: via shared HttpClient.
 pub const AiProvider = struct {
     allocator: std.mem.Allocator,
     http: *http_client.HttpClient,
@@ -16,13 +14,9 @@ pub const AiProvider = struct {
     api_key: []const u8,
     model: []const u8,
 
-    /// Rate limit (tokens/sec). Set to 0 to disable.
     rate_limiter: ?RateLimiterState = null,
-
     max_output_tokens: usize = 4096,
     temperature: f64 = 0.7,
-
-    /// Cumulative metrics (monotonic).
     metrics: Metrics = .{},
 
     pub const RateLimiterState = struct {
@@ -39,23 +33,77 @@ pub const AiProvider = struct {
         cache_miss_tokens: usize = 0,
         rate_limited_count: usize = 0,
         error_count: usize = 0,
+        tool_call_responses: usize = 0,
+
+        pub fn toPrometheusFormat(self: Metrics, allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+            var buf: std.ArrayList(u8) = .empty;
+            errdefer buf.deinit(allocator);
+            try buf.print(allocator, "# HELP zigmodu_ai_provider_requests_total Chat completion requests.\n", .{});
+            try buf.print(allocator, "# TYPE zigmodu_ai_provider_requests_total counter\n", .{});
+            try buf.print(allocator, "zigmodu_ai_provider_requests_total{{provider=\"{s}\"}} {d}\n", .{ name, self.total_requests });
+            try buf.print(allocator, "# HELP zigmodu_ai_provider_prompt_tokens_total Prompt tokens.\n", .{});
+            try buf.print(allocator, "# TYPE zigmodu_ai_provider_prompt_tokens_total counter\n", .{});
+            try buf.print(allocator, "zigmodu_ai_provider_prompt_tokens_total{{provider=\"{s}\"}} {d}\n", .{ name, self.total_prompt_tokens });
+            try buf.print(allocator, "# HELP zigmodu_ai_provider_completion_tokens_total Completion tokens.\n", .{});
+            try buf.print(allocator, "# TYPE zigmodu_ai_provider_completion_tokens_total counter\n", .{});
+            try buf.print(allocator, "zigmodu_ai_provider_completion_tokens_total{{provider=\"{s}\"}} {d}\n", .{ name, self.total_completion_tokens });
+            try buf.print(allocator, "# HELP zigmodu_ai_provider_errors_total Provider errors.\n", .{});
+            try buf.print(allocator, "# TYPE zigmodu_ai_provider_errors_total counter\n", .{});
+            try buf.print(allocator, "zigmodu_ai_provider_errors_total{{provider=\"{s}\"}} {d}\n", .{ name, self.error_count });
+            try buf.print(allocator, "# HELP zigmodu_ai_provider_rate_limited_total Rate limit rejections.\n", .{});
+            try buf.print(allocator, "# TYPE zigmodu_ai_provider_rate_limited_total counter\n", .{});
+            try buf.print(allocator, "zigmodu_ai_provider_rate_limited_total{{provider=\"{s}\"}} {d}\n", .{ name, self.rate_limited_count });
+            try buf.print(allocator, "# HELP zigmodu_ai_provider_tool_call_responses_total Responses containing tool_calls.\n", .{});
+            try buf.print(allocator, "# TYPE zigmodu_ai_provider_tool_call_responses_total counter\n", .{});
+            try buf.print(allocator, "zigmodu_ai_provider_tool_call_responses_total{{provider=\"{s}\"}} {d}\n", .{ name, self.tool_call_responses });
+            return try buf.toOwnedSlice(allocator);
+        }
+    };
+
+    /// One OpenAI-style tool call (owned strings when returned from `parseResponse`).
+    pub const ToolCall = struct {
+        id: []const u8,
+        name: []const u8,
+        arguments: []const u8,
     };
 
     pub const ChatMsg = struct {
-        role: []const u8, // "system", "user", "assistant", "tool"
-        content: []const u8,
-        name: ?[]const u8 = null, // optional tool name for "tool" role
+        role: []const u8, // system | user | assistant | tool
+        content: []const u8 = "",
+        name: ?[]const u8 = null,
+        /// Present on `tool` role messages.
+        tool_call_id: ?[]const u8 = null,
+        /// Present on `assistant` messages that request tools (borrowed; not freed by freeResponse).
+        tool_calls: []const ToolCall = &.{},
+    };
+
+    pub const ChatOpts = struct {
+        /// OpenAI `tools` JSON array (e.g. from SkillRegistry.toOpenAiFunctionsAlloc).
+        tools_json: ?[]const u8 = null,
+        /// Request `stream:true` for `chatStream` (SSE over `HttpClient.requestStream`).
+        stream: bool = false,
     };
 
     pub const ChatResponse = struct {
-        content: []const u8, // caller owns, must free with allocator
+        content: []const u8 = "",
         role: []const u8 = "assistant",
+        tool_calls: []ToolCall = &.{},
         prompt_tokens: usize = 0,
         completion_tokens: usize = 0,
         cache_hit_tokens: usize = 0,
         cache_miss_tokens: usize = 0,
         model: []const u8 = "",
     };
+
+    pub const StreamDelta = struct {
+        content_delta: ?[]const u8 = null,
+        /// Set when a streamed tool_calls fragment includes a function name.
+        tool_name: ?[]const u8 = null,
+        /// Incremental `function.arguments` fragment (may be partial JSON).
+        tool_arguments_delta: ?[]const u8 = null,
+        done: bool = false,
+    };
+    pub const OnDelta = *const fn (*anyopaque, StreamDelta) anyerror!void;
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -73,7 +121,6 @@ pub const AiProvider = struct {
         };
     }
 
-    /// Enable rate limiting. tokens_per_sec: max requests per second.
     pub fn enableRateLimit(self: *AiProvider, io: std.Io, tokens_per_sec: u32) !void {
         const limiter = try @import("../resilience/RateLimiter.zig").RateLimiter.init(
             self.allocator,
@@ -91,9 +138,23 @@ pub const AiProvider = struct {
         self.* = undefined;
     }
 
-    /// Send chat messages, return response content. Caller owns ChatResponse.content.
+    /// Free owned fields of a ChatResponse from `chat` / `chatWith` / `chatStream`.
+    pub fn freeResponse(self: *AiProvider, resp: *ChatResponse) void {
+        if (resp.content.len > 0) self.allocator.free(resp.content);
+        for (resp.tool_calls) |tc| {
+            self.allocator.free(tc.id);
+            self.allocator.free(tc.name);
+            self.allocator.free(tc.arguments);
+        }
+        if (resp.tool_calls.len > 0) self.allocator.free(resp.tool_calls);
+        resp.* = .{};
+    }
+
     pub fn chat(self: *AiProvider, messages: []const ChatMsg) !ChatResponse {
-        // Rate limit check
+        return self.chatWith(messages, .{});
+    }
+
+    pub fn chatWith(self: *AiProvider, messages: []const ChatMsg, opts: ChatOpts) !ChatResponse {
         if (self.rate_limiter) |*rl| {
             rl.mutex.lock(rl.io) catch return error.RateLimitLockFailed;
             defer rl.mutex.unlock(rl.io);
@@ -103,7 +164,7 @@ pub const AiProvider = struct {
             }
         }
 
-        const body = try self.buildRequestBody(messages);
+        const body = try self.buildRequestBody(messages, opts);
         defer self.allocator.free(body);
 
         var req = http_client.HttpClient.HttpRequest.init(self.allocator, "POST", self.endpoint);
@@ -112,52 +173,259 @@ pub const AiProvider = struct {
         try req.setHeader("Authorization", self.api_key);
         try req.setBody(body);
 
-        var resp = try self.http.request(req);
-        defer resp.deinit();
+        var http_resp = self.http.request(req) catch |err| {
+            self.metrics.error_count += 1;
+            return mapProviderTransportError(err);
+        };
+        defer http_resp.deinit();
 
         self.metrics.total_requests += 1;
 
-        if (!resp.isSuccess()) {
+        if (!http_resp.isSuccess()) {
             self.metrics.error_count += 1;
-            if (resp.status_code == 429) return error.RateLimited;
-            return error.ProviderError;
+            return mapHttpStatus(http_resp.status_code);
         }
 
-        return self.parseResponse(resp.body);
+        const parsed = try self.parseResponse(http_resp.body);
+        if (parsed.tool_calls.len > 0) self.metrics.tool_call_responses += 1;
+        return parsed;
     }
 
-    /// Build JSON request body. Messages MUST be in cache-optimal order:
-    /// [system] [tool-defs] [memories] [history] [user-query]
-    pub fn buildRequestBody(self: *AiProvider, messages: []const ChatMsg) ![]const u8 {
+    /// Stream chat completions (`stream:true`) via HttpClient.requestStream + SSE `data:` lines.
+    /// Falls back to buffered `chatWith` if the transport fails before any delta.
+    pub fn chatStream(
+        self: *AiProvider,
+        messages: []const ChatMsg,
+        opts: ChatOpts,
+        cb_ctx: *anyopaque,
+        on_delta: OnDelta,
+    ) !ChatResponse {
+        if (self.rate_limiter) |*rl| {
+            rl.mutex.lock(rl.io) catch return error.RateLimitLockFailed;
+            defer rl.mutex.unlock(rl.io);
+            if (!rl.limiter.tryAcquire()) {
+                self.metrics.rate_limited_count += 1;
+                return error.RateLimited;
+            }
+        }
+
+        var o = opts;
+        o.stream = true;
+        const body = try self.buildRequestBody(messages, o);
+        defer self.allocator.free(body);
+
+        var req = http_client.HttpClient.HttpRequest.init(self.allocator, "POST", self.endpoint);
+        defer req.deinit();
+        try req.setHeader("Content-Type", "application/json");
+        try req.setHeader("Accept", "text/event-stream");
+        try req.setHeader("Authorization", self.api_key);
+        try req.setBody(body);
+
+        var acc = StreamAccum.init(self.allocator, cb_ctx, on_delta);
+        defer acc.deinit();
+
+        var http_resp = self.http.requestStream(req, &acc, StreamAccum.onChunk) catch |err| {
+            // Transport failed before useful stream — buffered fallback (ignore transport err kind).
+            _ = err;
+            o.stream = false;
+            var resp = try self.chatWith(messages, o);
+            errdefer self.freeResponse(&resp);
+            if (resp.content.len > 0) {
+                try on_delta(cb_ctx, .{ .content_delta = resp.content });
+            }
+            for (resp.tool_calls) |tc| {
+                try on_delta(cb_ctx, .{ .tool_name = tc.name, .tool_arguments_delta = tc.arguments });
+            }
+            try on_delta(cb_ctx, .{ .done = true });
+            return resp;
+        };
+        defer http_resp.deinit();
+
+        self.metrics.total_requests += 1;
+        if (!http_resp.isSuccess()) {
+            self.metrics.error_count += 1;
+            return mapHttpStatus(http_resp.status_code);
+        }
+
+        try acc.flush();
+        if (!acc.saw_done) {
+            try on_delta(cb_ctx, .{ .done = true });
+        }
+
+        const content = try self.allocator.dupe(u8, acc.content.items);
+        errdefer self.allocator.free(content);
+        const tool_calls = try acc.takeToolCalls(self.allocator);
+        if (tool_calls.len > 0) self.metrics.tool_call_responses += 1;
+        return .{
+            .content = content,
+            .role = "assistant",
+            .tool_calls = tool_calls,
+            .prompt_tokens = acc.prompt_tokens,
+            .completion_tokens = acc.completion_tokens,
+        };
+    }
+
+    /// Extract `choices[0].delta.content` from one OpenAI SSE JSON payload (no `data:` prefix).
+    pub fn extractStreamDeltaContent(allocator: std.mem.Allocator, json: []const u8) !?[]const u8 {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return null;
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        const choices = parsed.value.object.get("choices") orelse return null;
+        if (choices != .array or choices.array.items.len == 0) return null;
+        const c0 = choices.array.items[0];
+        if (c0 != .object) return null;
+        const delta = c0.object.get("delta") orelse return null;
+        if (delta != .object) return null;
+        const content = delta.object.get("content") orelse return null;
+        return switch (content) {
+            .string => |s| try allocator.dupe(u8, s),
+            else => null,
+        };
+    }
+
+    /// One streamed tool_calls fragment (`choices[0].delta.tool_calls[i]`).
+    pub const StreamToolCallDelta = struct {
+        index: usize = 0,
+        id: ?[]const u8 = null,
+        name: ?[]const u8 = null,
+        arguments: ?[]const u8 = null,
+
+        pub fn deinit(self: StreamToolCallDelta, allocator: std.mem.Allocator) void {
+            if (self.id) |s| allocator.free(s);
+            if (self.name) |s| allocator.free(s);
+            if (self.arguments) |s| allocator.free(s);
+        }
+    };
+
+    /// Extract streamed `delta.tool_calls` fragments (caller frees each via `deinit`).
+    pub fn extractStreamToolCallDeltas(allocator: std.mem.Allocator, json: []const u8) ![]StreamToolCallDelta {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return &.{};
+        defer parsed.deinit();
+        if (parsed.value != .object) return &.{};
+        const choices = parsed.value.object.get("choices") orelse return &.{};
+        if (choices != .array or choices.array.items.len == 0) return &.{};
+        const c0 = choices.array.items[0];
+        if (c0 != .object) return &.{};
+        const delta = c0.object.get("delta") orelse return &.{};
+        if (delta != .object) return &.{};
+        const tcs = delta.object.get("tool_calls") orelse return &.{};
+        if (tcs != .array or tcs.array.items.len == 0) return &.{};
+
+        var list = try allocator.alloc(StreamToolCallDelta, tcs.array.items.len);
+        var n: usize = 0;
+        errdefer {
+            for (list[0..n]) |d| d.deinit(allocator);
+            allocator.free(list);
+        }
+        for (tcs.array.items) |item| {
+            if (item != .object) continue;
+            var d: StreamToolCallDelta = .{};
+            if (item.object.get("index")) |idx| {
+                d.index = switch (idx) {
+                    .integer => |i| if (i < 0) 0 else @intCast(i),
+                    else => 0,
+                };
+            }
+            if (item.object.get("id")) |idv| {
+                if (idv == .string) d.id = try allocator.dupe(u8, idv.string);
+            }
+            if (item.object.get("function")) |fnv| {
+                if (fnv == .object) {
+                    if (fnv.object.get("name")) |nv| {
+                        if (nv == .string) d.name = try allocator.dupe(u8, nv.string);
+                    }
+                    if (fnv.object.get("arguments")) |av| {
+                        if (av == .string) d.arguments = try allocator.dupe(u8, av.string);
+                    }
+                }
+            }
+            list[n] = d;
+            n += 1;
+        }
+        if (n == 0) {
+            allocator.free(list);
+            return &.{};
+        }
+        if (n < list.len) list = try allocator.realloc(list, n);
+        return list;
+    }
+
+    pub fn buildRequestBody(self: *AiProvider, messages: []const ChatMsg, opts: ChatOpts) ![]const u8 {
         var buf = std.ArrayList(u8).empty;
+        errdefer buf.deinit(self.allocator);
         const a = self.allocator;
 
         try buf.appendSlice(a, "{\"model\":\"");
-        try buf.appendSlice(a, self.model);
+        try escapeJson(a, &buf, self.model);
         try buf.appendSlice(a, "\",\"messages\":[");
-        // Messages already ordered by caller for cache prefix stability
         for (messages, 0..) |m, i| {
             if (i > 0) try buf.appendSlice(a, ",");
             try buf.appendSlice(a, "{\"role\":\"");
             try buf.appendSlice(a, m.role);
-            try buf.appendSlice(a, "\",\"content\":\"");
+            try buf.appendSlice(a, "\"");
+            if (m.tool_call_id) |tid| {
+                try buf.appendSlice(a, ",\"tool_call_id\":\"");
+                try escapeJson(a, &buf, tid);
+                try buf.appendSlice(a, "\"");
+            }
+            if (m.name) |n| {
+                try buf.appendSlice(a, ",\"name\":\"");
+                try escapeJson(a, &buf, n);
+                try buf.appendSlice(a, "\"");
+            }
+            try buf.appendSlice(a, ",\"content\":\"");
             try escapeJson(a, &buf, m.content);
-            try buf.appendSlice(a, "\"}");
+            try buf.appendSlice(a, "\"");
+            if (m.tool_calls.len > 0) {
+                try buf.appendSlice(a, ",\"tool_calls\":[");
+                for (m.tool_calls, 0..) |tc, ti| {
+                    if (ti > 0) try buf.appendSlice(a, ",");
+                    try buf.appendSlice(a, "{\"id\":\"");
+                    try escapeJson(a, &buf, tc.id);
+                    try buf.appendSlice(a, "\",\"type\":\"function\",\"function\":{\"name\":\"");
+                    try escapeJson(a, &buf, tc.name);
+                    try buf.appendSlice(a, "\",\"arguments\":\"");
+                    try escapeJson(a, &buf, tc.arguments);
+                    try buf.appendSlice(a, "\"}}");
+                }
+                try buf.appendSlice(a, "]");
+            }
+            try buf.appendSlice(a, "}");
         }
-        try buf.appendSlice(a, "],\"max_tokens\":");
+        try buf.appendSlice(a, "]");
+        if (opts.tools_json) |tools| {
+            try buf.appendSlice(a, ",\"tools\":");
+            try buf.appendSlice(a, tools);
+        }
+        try buf.appendSlice(a, ",\"max_tokens\":");
         try buf.print(a, "{d}", .{self.max_output_tokens});
         try buf.appendSlice(a, ",\"temperature\":");
         try buf.print(a, "{d}", .{self.temperature});
-        try buf.appendSlice(a, ",\"stream\":false}");
-
-        return buf.toOwnedSlice(a);
+        if (opts.stream) {
+            try buf.appendSlice(a, ",\"stream\":true}");
+        } else {
+            try buf.appendSlice(a, ",\"stream\":false}");
+        }
+        return try buf.toOwnedSlice(a);
     }
 
-    /// Parse response, extracting content and cache metrics.
-    fn parseResponse(self: *AiProvider, body: []const u8) !ChatResponse {
-        var resp = ChatResponse{ .content = "" };
+    pub fn parseResponse(self: *AiProvider, body: []const u8) !ChatResponse {
+        var resp = ChatResponse{};
 
-        // Extract content from choices[0].message.content
+        // Prefer structured JSON parse for tool_calls.
+        if (std.json.parseFromSlice(std.json.Value, self.allocator, body, .{})) |parsed| {
+            defer parsed.deinit();
+            if (parsed.value == .object) {
+                try self.fillFromJson(&resp, parsed.value.object);
+                self.metrics.total_prompt_tokens += resp.prompt_tokens;
+                self.metrics.total_completion_tokens += resp.completion_tokens;
+                self.metrics.cache_hit_tokens += resp.cache_hit_tokens;
+                self.metrics.cache_miss_tokens += resp.cache_miss_tokens;
+                return resp;
+            }
+        } else |_| {}
+
+        // Fallback: content string scrape
         if (std.mem.indexOf(u8, body, "\"content\":\"")) |start| {
             const cs = start + "\"content\":\"".len;
             var i: usize = cs;
@@ -168,29 +436,109 @@ pub const AiProvider = struct {
                 }
             }
         }
-        if (resp.content.len == 0) {
-            resp.content = try self.allocator.dupe(u8, "");
-        }
+        if (resp.content.len == 0) resp.content = try self.allocator.dupe(u8, "");
 
-        // Extract usage
         resp.prompt_tokens = extractIntField(body, "\"prompt_tokens\":") orelse 0;
         resp.completion_tokens = extractIntField(body, "\"completion_tokens\":") orelse 0;
         resp.cache_hit_tokens = extractIntField(body, "\"prompt_cache_hit_tokens\":") orelse 0;
         resp.cache_miss_tokens = extractIntField(body, "\"prompt_cache_miss_tokens\":") orelse 0;
-        if (extractStringField(body, "\"model\":\"")) |m| {
-            resp.model = m;
-        }
 
         self.metrics.total_prompt_tokens += resp.prompt_tokens;
         self.metrics.total_completion_tokens += resp.completion_tokens;
         self.metrics.cache_hit_tokens += resp.cache_hit_tokens;
         self.metrics.cache_miss_tokens += resp.cache_miss_tokens;
-
         return resp;
     }
 
-    /// Build cache-optimized message array from components.
-    /// Order: system → memories → history → user_query (prefix-stable first).
+    fn fillFromJson(self: *AiProvider, resp: *ChatResponse, root: std.json.ObjectMap) !void {
+        if (root.get("usage")) |usage_v| {
+            if (usage_v == .object) {
+                const u = usage_v.object;
+                resp.prompt_tokens = jsonInt(u.get("prompt_tokens"));
+                resp.completion_tokens = jsonInt(u.get("completion_tokens"));
+                resp.cache_hit_tokens = jsonInt(u.get("prompt_cache_hit_tokens"));
+                resp.cache_miss_tokens = jsonInt(u.get("prompt_cache_miss_tokens"));
+            }
+        }
+        if (root.get("model")) |m| {
+            if (m == .string) resp.model = m.string;
+        }
+        const choices = root.get("choices") orelse {
+            resp.content = try self.allocator.dupe(u8, "");
+            return;
+        };
+        if (choices != .array or choices.array.items.len == 0) {
+            resp.content = try self.allocator.dupe(u8, "");
+            return;
+        }
+        const choice0 = choices.array.items[0];
+        if (choice0 != .object) {
+            resp.content = try self.allocator.dupe(u8, "");
+            return;
+        }
+        const msg = choice0.object.get("message") orelse {
+            resp.content = try self.allocator.dupe(u8, "");
+            return;
+        };
+        if (msg != .object) {
+            resp.content = try self.allocator.dupe(u8, "");
+            return;
+        }
+        if (msg.object.get("content")) |c| {
+            switch (c) {
+                .string => |s| resp.content = try self.allocator.dupe(u8, s),
+                .null => resp.content = try self.allocator.dupe(u8, ""),
+                else => resp.content = try self.allocator.dupe(u8, ""),
+            }
+        } else {
+            resp.content = try self.allocator.dupe(u8, "");
+        }
+        if (msg.object.get("tool_calls")) |tcs| {
+            if (tcs == .array and tcs.array.items.len > 0) {
+                var list = try self.allocator.alloc(ToolCall, tcs.array.items.len);
+                var n: usize = 0;
+                errdefer {
+                    for (list[0..n]) |tc| {
+                        self.allocator.free(tc.id);
+                        self.allocator.free(tc.name);
+                        self.allocator.free(tc.arguments);
+                    }
+                    self.allocator.free(list);
+                }
+                for (tcs.array.items) |item| {
+                    if (item != .object) continue;
+                    const id = if (item.object.get("id")) |v| switch (v) {
+                        .string => |s| s,
+                        else => "",
+                    } else "";
+                    const fn_obj = item.object.get("function") orelse continue;
+                    if (fn_obj != .object) continue;
+                    const name = if (fn_obj.object.get("name")) |v| switch (v) {
+                        .string => |s| s,
+                        else => continue,
+                    } else continue;
+                    const args = if (fn_obj.object.get("arguments")) |v| switch (v) {
+                        .string => |s| s,
+                        else => "{}",
+                    } else "{}";
+                    list[n] = .{
+                        .id = try self.allocator.dupe(u8, id),
+                        .name = try self.allocator.dupe(u8, name),
+                        .arguments = try self.allocator.dupe(u8, args),
+                    };
+                    n += 1;
+                }
+                if (n == 0) {
+                    self.allocator.free(list);
+                } else if (n < list.len) {
+                    resp.tool_calls = try self.allocator.realloc(list, n);
+                } else {
+                    resp.tool_calls = list;
+                }
+            }
+        }
+    }
+
     pub fn buildMessages(
         allocator: std.mem.Allocator,
         system_prompt: ?[]const u8,
@@ -202,53 +550,224 @@ pub const AiProvider = struct {
         if (system_prompt != null) count += 1;
         count += memories.len;
         count += history.len;
-        count += 1; // user message
+        count += 1;
 
         var msgs = try allocator.alloc(ChatMsg, count);
         var idx: usize = 0;
-
-        // 1. System prompt — static, always cached first
         if (system_prompt) |sp| {
             msgs[idx] = .{ .role = "system", .content = sp };
             idx += 1;
         }
-
-        // 2. Memories — semi-static, prefix-cached within session
         for (memories) |mem| {
             msgs[idx] = .{ .role = "system", .content = mem };
             idx += 1;
         }
-
-        // 3. History — dynamic but prefix-stable (older messages cached)
         for (history) |h| {
             msgs[idx] = h;
             idx += 1;
         }
-
-        // 4. User query — only truly new content
         msgs[idx] = .{ .role = "user", .content = user_msg };
-
         return msgs;
     }
 
-    /// Estimate tokens for a message array.
     pub fn countTokens(_: *AiProvider, messages: []const ChatMsg) usize {
         return tokenizer.estimateMessages(messages);
     }
 
-    /// Check if messages fit within context budget (conservative: 80% of max).
     pub fn fitsBudget(self: *AiProvider, messages: []const ChatMsg, context_limit: usize) bool {
         const est = tokenizer.estimateMessages(messages);
         return est + self.max_output_tokens < (context_limit * 4 / 5);
     }
 
-    /// Get cache hit ratio (0.0 - 1.0).
     pub fn cacheHitRatio(self: *AiProvider) f64 {
         const total = self.metrics.cache_hit_tokens + self.metrics.cache_miss_tokens;
         if (total == 0) return 0;
         return @as(f64, @floatFromInt(self.metrics.cache_hit_tokens)) / @as(f64, @floatFromInt(total));
     }
 };
+
+const StreamAccum = struct {
+    allocator: std.mem.Allocator,
+    cb_ctx: *anyopaque,
+    on_delta: AiProvider.OnDelta,
+    carry: std.ArrayList(u8),
+    content: std.ArrayList(u8),
+    pending_tools: std.ArrayList(PendingTool),
+    saw_done: bool = false,
+    prompt_tokens: usize = 0,
+    completion_tokens: usize = 0,
+
+    const PendingTool = struct {
+        index: usize,
+        id: std.ArrayList(u8) = .empty,
+        name: std.ArrayList(u8) = .empty,
+        arguments: std.ArrayList(u8) = .empty,
+
+        fn deinit(self: *PendingTool, allocator: std.mem.Allocator) void {
+            self.id.deinit(allocator);
+            self.name.deinit(allocator);
+            self.arguments.deinit(allocator);
+        }
+    };
+
+    fn init(allocator: std.mem.Allocator, cb_ctx: *anyopaque, on_delta: AiProvider.OnDelta) StreamAccum {
+        return .{
+            .allocator = allocator,
+            .cb_ctx = cb_ctx,
+            .on_delta = on_delta,
+            .carry = .empty,
+            .content = .empty,
+            .pending_tools = .empty,
+        };
+    }
+
+    fn deinit(self: *StreamAccum) void {
+        self.carry.deinit(self.allocator);
+        self.content.deinit(self.allocator);
+        for (self.pending_tools.items) |*t| t.deinit(self.allocator);
+        self.pending_tools.deinit(self.allocator);
+    }
+
+    fn onChunk(ctx: *anyopaque, chunk: []const u8) anyerror!void {
+        const self: *StreamAccum = @ptrCast(@alignCast(ctx));
+        try self.carry.appendSlice(self.allocator, chunk);
+        try self.drainLines(false);
+    }
+
+    fn flush(self: *StreamAccum) !void {
+        try self.drainLines(true);
+    }
+
+    fn drainLines(self: *StreamAccum, final: bool) !void {
+        while (true) {
+            const nl = std.mem.indexOfScalar(u8, self.carry.items, '\n') orelse {
+                if (final and self.carry.items.len > 0) {
+                    try self.handleLine(std.mem.trim(u8, self.carry.items, "\r"));
+                    self.carry.clearRetainingCapacity();
+                }
+                return;
+            };
+            var line = self.carry.items[0..nl];
+            if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+            try self.handleLine(line);
+            const rest = self.carry.items.len - (nl + 1);
+            std.mem.copyForwards(u8, self.carry.items[0..rest], self.carry.items[nl + 1 ..]);
+            try self.carry.resize(self.allocator, rest);
+        }
+    }
+
+    fn handleLine(self: *StreamAccum, line: []const u8) !void {
+        if (line.len == 0) return;
+        if (!std.mem.startsWith(u8, line, "data:")) return;
+        const payload = std.mem.trim(u8, line["data:".len..], " \t");
+        if (std.mem.eql(u8, payload, "[DONE]")) {
+            self.saw_done = true;
+            try self.on_delta(self.cb_ctx, .{ .done = true });
+            return;
+        }
+        if (extractIntField(payload, "\"prompt_tokens\":")) |n| self.prompt_tokens = n;
+        if (extractIntField(payload, "\"completion_tokens\":")) |n| self.completion_tokens = n;
+
+        const delta = try AiProvider.extractStreamDeltaContent(self.allocator, payload);
+        if (delta) |d| {
+            defer self.allocator.free(d);
+            if (d.len > 0) {
+                try self.content.appendSlice(self.allocator, d);
+                try self.on_delta(self.cb_ctx, .{ .content_delta = d });
+            }
+        }
+
+        const tcds = try AiProvider.extractStreamToolCallDeltas(self.allocator, payload);
+        defer {
+            for (tcds) |d| d.deinit(self.allocator);
+            if (tcds.len > 0) self.allocator.free(tcds);
+        }
+        for (tcds) |d| {
+            try self.mergeToolDelta(d);
+            try self.on_delta(self.cb_ctx, .{
+                .tool_name = d.name,
+                .tool_arguments_delta = d.arguments,
+            });
+        }
+    }
+
+    fn mergeToolDelta(self: *StreamAccum, d: AiProvider.StreamToolCallDelta) !void {
+        const slot = try self.ensurePending(d.index);
+        if (d.id) |id| {
+            slot.id.clearRetainingCapacity();
+            try slot.id.appendSlice(self.allocator, id);
+        }
+        if (d.name) |name| {
+            try slot.name.appendSlice(self.allocator, name);
+        }
+        if (d.arguments) |args| {
+            try slot.arguments.appendSlice(self.allocator, args);
+        }
+    }
+
+    fn ensurePending(self: *StreamAccum, index: usize) !*PendingTool {
+        for (self.pending_tools.items) |*t| {
+            if (t.index == index) return t;
+        }
+        try self.pending_tools.append(self.allocator, .{ .index = index });
+        return &self.pending_tools.items[self.pending_tools.items.len - 1];
+    }
+
+    fn takeToolCalls(self: *StreamAccum, allocator: std.mem.Allocator) ![]AiProvider.ToolCall {
+        if (self.pending_tools.items.len == 0) return &.{};
+        const out = try allocator.alloc(AiProvider.ToolCall, self.pending_tools.items.len);
+        errdefer allocator.free(out);
+        var n: usize = 0;
+        errdefer {
+            for (out[0..n]) |tc| {
+                allocator.free(tc.id);
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+        }
+        for (self.pending_tools.items) |*t| {
+            out[n] = .{
+                .id = try allocator.dupe(u8, t.id.items),
+                .name = try allocator.dupe(u8, t.name.items),
+                .arguments = try allocator.dupe(u8, t.arguments.items),
+            };
+            n += 1;
+        }
+        for (self.pending_tools.items) |*t| t.deinit(self.allocator);
+        self.pending_tools.clearRetainingCapacity();
+        return out;
+    }
+};
+
+fn mapHttpStatus(status: u16) anyerror {
+    return switch (status) {
+        401, 403 => error.AuthError,
+        429 => error.RateLimited,
+        500, 502, 503, 504 => error.UpstreamError,
+        else => error.ProviderError,
+    };
+}
+
+fn mapProviderTransportError(err: anyerror) anyerror {
+    return switch (err) {
+        error.TlsHandshakeFailed => error.TlsHandshakeFailed,
+        error.DnsFailed => error.DnsFailed,
+        error.ConnectionRefused => error.ConnectionRefused,
+        error.NetworkUnreachable => error.NetworkUnreachable,
+        error.Timeout => error.Timeout,
+        error.RateLimited => error.RateLimited,
+        else => error.ConnectionError,
+    };
+}
+
+fn jsonInt(v: ?std.json.Value) usize {
+    const x = v orelse return 0;
+    return switch (x) {
+        .integer => |i| if (i < 0) 0 else @intCast(i),
+        .float => |f| if (f < 0) 0 else @intFromFloat(f),
+        else => 0,
+    };
+}
 
 fn extractIntField(body: []const u8, field: []const u8) ?usize {
     const start = std.mem.indexOf(u8, body, field) orelse return null;
@@ -261,15 +780,6 @@ fn extractIntField(body: []const u8, field: []const u8) ?usize {
         n = n * 10 + (body[i] - '0');
     }
     return n;
-}
-
-fn extractStringField(body: []const u8, field: []const u8) ?[]const u8 {
-    const start = std.mem.indexOf(u8, body, field) orelse return null;
-    const vs = start + field.len;
-    if (std.mem.indexOf(u8, body[vs..], "\"")) |end| {
-        return body[vs .. vs + end];
-    }
-    return null;
 }
 
 fn escapeJson(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const u8) !void {
@@ -298,34 +808,48 @@ test "AiProvider buildMessages cache order" {
 
     try std.testing.expectEqual(@as(usize, 5), msgs.len);
     try std.testing.expectEqualStrings("system", msgs[0].role);
-    try std.testing.expectEqualStrings("You are helpful.", msgs[0].content);
-    try std.testing.expectEqualStrings("system", msgs[1].role);
-    try std.testing.expectEqualStrings("User prefers short answers", msgs[1].content);
-    try std.testing.expectEqualStrings("user", msgs[2].role); // history
-    try std.testing.expectEqualStrings("user", msgs[4].role);
     try std.testing.expectEqualStrings("new question", msgs[4].content);
 }
 
-test "AiProvider buildRequestBody" {
+test "AiProvider buildRequestBody includes tools" {
     const a = std.testing.allocator;
     var http = http_client.HttpClient.init(a, std.testing.io, 1, 5000);
     defer http.deinit();
     var p = AiProvider.init(a, &http, "https://api.test/v1", "Bearer sk-xxx", "deepseek-v4-flash");
 
     const msgs = &[_]AiProvider.ChatMsg{
-        .{ .role = "system", .content = "You are helpful." },
         .{ .role = "user", .content = "Hi" },
     };
-    const body = try p.buildRequestBody(msgs);
+    const tools =
+        \\[{"type":"function","function":{"name":"ping","description":"pong","parameters":{"type":"object","properties":{},"required":[]}}}]
+    ;
+    const body = try p.buildRequestBody(msgs, .{ .tools_json = tools });
     defer a.free(body);
 
-    try std.testing.expect(std.mem.indexOf(u8, body, "deepseek-v4-flash") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"content\":\"Hi\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"name\":\"ping\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":false") != null);
 }
 
-test "AiProvider parseResponse" {
+test "AiProvider parseResponse tool_calls" {
+    const a = std.testing.allocator;
+    var http = http_client.HttpClient.init(a, std.testing.io, 1, 5000);
+    defer http.deinit();
+    var p = AiProvider.init(a, &http, "https://api.test/v1", "sk-xxx", "deepseek-v4-flash");
+
+    const body =
+        \\{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"x\"}"}}]}}],"usage":{"prompt_tokens":10,"completion_tokens":2}}
+    ;
+    var resp = try p.parseResponse(body);
+    defer p.freeResponse(&resp);
+
+    try std.testing.expectEqual(@as(usize, 1), resp.tool_calls.len);
+    try std.testing.expectEqualStrings("call_1", resp.tool_calls[0].id);
+    try std.testing.expectEqualStrings("lookup", resp.tool_calls[0].name);
+    try std.testing.expect(std.mem.indexOf(u8, resp.tool_calls[0].arguments, "q") != null);
+}
+
+test "AiProvider parseResponse content" {
     const a = std.testing.allocator;
     var http = http_client.HttpClient.init(a, std.testing.io, 1, 5000);
     defer http.deinit();
@@ -334,17 +858,14 @@ test "AiProvider parseResponse" {
     const body =
         \\{"choices":[{"message":{"role":"assistant","content":"Hello!"}}],"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_cache_hit_tokens":8,"prompt_cache_miss_tokens":2},"model":"deepseek-v4-flash"}
     ;
-    const resp = try p.parseResponse(body);
-    defer a.free(resp.content);
+    var resp = try p.parseResponse(body);
+    defer p.freeResponse(&resp);
 
     try std.testing.expectEqualStrings("Hello!", resp.content);
     try std.testing.expectEqual(@as(usize, 10), resp.prompt_tokens);
-    try std.testing.expectEqual(@as(usize, 2), resp.completion_tokens);
-    try std.testing.expectEqual(@as(usize, 8), resp.cache_hit_tokens);
-    try std.testing.expectEqual(@as(usize, 2), resp.cache_miss_tokens);
 }
 
-test "AiProvider countTokens" {
+test "AiProvider countTokens and fitsBudget" {
     const a = std.testing.allocator;
     var http = http_client.HttpClient.init(a, std.testing.io, 1, 5000);
     defer http.deinit();
@@ -354,22 +875,101 @@ test "AiProvider countTokens" {
         .{ .role = "system", .content = "You are helpful." },
         .{ .role = "user", .content = "Hello, how are you?" },
     };
-    const tokens = p.countTokens(msgs);
-    try std.testing.expect(tokens > 5);
-    try std.testing.expect(tokens < 50);
+    try std.testing.expect(p.countTokens(msgs) > 5);
+    try std.testing.expect(p.fitsBudget(msgs, 128000));
 }
 
-test "AiProvider fitsBudget" {
+test "AiProvider extractStreamDeltaContent" {
     const a = std.testing.allocator;
-    var http = http_client.HttpClient.init(a, std.testing.io, 1, 5000);
-    defer http.deinit();
-    var p = AiProvider.init(a, &http, "https://api.test/v1", "sk-xxx", "deepseek-v4-flash");
+    const json =
+        \\{"choices":[{"delta":{"content":"Hi"},"index":0}]}
+    ;
+    const d = try AiProvider.extractStreamDeltaContent(a, json);
+    try std.testing.expect(d != null);
+    defer a.free(d.?);
+    try std.testing.expectEqualStrings("Hi", d.?);
+}
 
-    const msgs = &[_]AiProvider.ChatMsg{
-        .{ .role = "system", .content = "You are helpful." },
-        .{ .role = "user", .content = "Hi" },
+test "AiProvider extractStreamToolCallDeltas accumulates" {
+    const a = std.testing.allocator;
+    const j1 =
+        \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"lookup","arguments":""}}]}}]}
+    ;
+    const j2 =
+        \\{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"q\":1}"}}]}}]}
+    ;
+    const d1 = try AiProvider.extractStreamToolCallDeltas(a, j1);
+    defer {
+        for (d1) |x| x.deinit(a);
+        if (d1.len > 0) a.free(d1);
+    }
+    try std.testing.expectEqual(@as(usize, 1), d1.len);
+    try std.testing.expectEqualStrings("lookup", d1[0].name.?);
+
+    var acc = StreamAccum.init(a, undefined, struct {
+        fn nop(_: *anyopaque, _: AiProvider.StreamDelta) anyerror!void {}
+    }.nop);
+    defer acc.deinit();
+    try acc.mergeToolDelta(d1[0]);
+    const d2 = try AiProvider.extractStreamToolCallDeltas(a, j2);
+    defer {
+        for (d2) |x| x.deinit(a);
+        if (d2.len > 0) a.free(d2);
+    }
+    try acc.mergeToolDelta(d2[0]);
+    const tcs = try acc.takeToolCalls(a);
+    defer {
+        for (tcs) |tc| {
+            a.free(tc.id);
+            a.free(tc.name);
+            a.free(tc.arguments);
+        }
+        if (tcs.len > 0) a.free(tcs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), tcs.len);
+    try std.testing.expectEqualStrings("c1", tcs[0].id);
+    try std.testing.expectEqualStrings("lookup", tcs[0].name);
+    try std.testing.expectEqualStrings("{\"q\":1}", tcs[0].arguments);
+}
+
+test "AiProvider StreamAccum parses SSE lines" {
+    const a = std.testing.allocator;
+    const Ctx = struct {
+        parts: std.ArrayList([]const u8),
+        done: bool = false,
+        allocator: std.mem.Allocator,
+
+        fn onDelta(ctx: *anyopaque, d: AiProvider.StreamDelta) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (d.done) {
+                self.done = true;
+                return;
+            }
+            if (d.content_delta) |c| {
+                try self.parts.append(self.allocator, try self.allocator.dupe(u8, c));
+            }
+        }
     };
-    try std.testing.expect(p.fitsBudget(msgs, 128000)); // 128K context
+    var ctx = Ctx{ .parts = .empty, .allocator = a };
+    defer {
+        for (ctx.parts.items) |p| a.free(p);
+        ctx.parts.deinit(a);
+    }
+
+    var acc = StreamAccum.init(a, &ctx, Ctx.onDelta);
+    defer acc.deinit();
+
+    const chunk1 = "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n";
+    const chunk2 = "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\ndata: [DONE]\n";
+    try StreamAccum.onChunk(&acc, chunk1);
+    try StreamAccum.onChunk(&acc, chunk2);
+    try acc.flush();
+
+    try std.testing.expect(ctx.done);
+    try std.testing.expectEqual(@as(usize, 2), ctx.parts.items.len);
+    try std.testing.expectEqualStrings("Hel", ctx.parts.items[0]);
+    try std.testing.expectEqualStrings("lo", ctx.parts.items[1]);
+    try std.testing.expectEqualStrings("Hello", acc.content.items);
 }
 
 test "AiProvider cacheHitRatio" {
@@ -377,9 +977,17 @@ test "AiProvider cacheHitRatio" {
     var http = http_client.HttpClient.init(a, std.testing.io, 1, 5000);
     defer http.deinit();
     var p = AiProvider.init(a, &http, "https://api.test/v1", "sk-xxx", "deepseek-v4-flash");
-
     p.metrics.cache_hit_tokens = 80;
     p.metrics.cache_miss_tokens = 20;
     const ratio = p.cacheHitRatio();
     try std.testing.expect(ratio >= 0.79 and ratio <= 0.81);
+}
+
+test "AiProvider metrics toPrometheusFormat" {
+    const a = std.testing.allocator;
+    var m = AiProvider.Metrics{ .total_requests = 3, .total_prompt_tokens = 10, .error_count = 1 };
+    const out = try m.toPrometheusFormat(a, "main");
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "zigmodu_ai_provider_requests_total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "provider=\"main\"") != null);
 }

@@ -106,7 +106,7 @@ pub const HealthEndpoint = struct {
     /// [...]JSON[...]
     pub fn toJson(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
         var buf = std.ArrayList(u8).empty;
-        const health = self.checkHealth();
+        var health = self.checkHealth();
         defer health.components.deinit();
         try buf.print(allocator, "{{\n  \"status\": \"{s}\"", .{@tagName(health.status)});
         try buf.print(allocator, ",\n  \"timestamp\": {d}", .{health.timestamp});

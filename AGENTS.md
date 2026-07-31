@@ -56,7 +56,24 @@ defer app.stop();
 | Legacy `rbacJwtMiddleware` / `jwtAuth` → 只读 `auth_info` | 新应用默认走 legacy 中间件 |
 | `ctx.json` / `http.respondErr` / extractors | `sendSuccess`/`sendFail`；拼用户输入进 SQL |
 | OTLP / Vault：`http://`；x402 **fail-closed** | 默认放行支付；假定 OTLP/Vault 已支持 `https://` |
+| `http.HttpClient`：`https://` 经 `std.http.Client`（AI/出站；`requestStream` HTTPS 真增量） | 仍对 Vault/OTLP 假定已支持 TLS |
 | sqlx：`Client.open` 后注意 pool/client 指针；CB 传 `io` | 在 ConnPool 上缓存失效的 `*Client` |
+| sqlx 驱动链接：`-Ddb=sqlite\|postgres\|mysql\|all`（默认 `all`） | 小系统用 `.db = "sqlite"`，勿默认三库全链 |
+
+### Selective SQL linking（消费者）
+
+```zig
+// build.zig — 只链实际用到的驱动（减小 dylib 依赖；ReleaseSmall 省几十 KB 量级）
+const zigmodu_dep = b.dependency("zigmodu", .{
+    .target = target,
+    .optimize = optimize,
+    .db = "sqlite", // 或 "postgres" | "mysql" | "sqlite,postgres" | "all"
+});
+```
+
+框架自测必须用默认 `-Ddb=all`（`zig build test`）。窄化 `-Ddb=` 只适合应用/示例构建，不适合跑完整单元测试套件。
+
+路径依赖示例若需共用 `db_link.zig`：在 `examples/<name>/` 放指向 `../_shared/db_link.zig` 的符号链接（Windows 无 symlink 时可复制文件）。
 
 权威细则与接线样例 → `docs/BEST_PRACTICES.md`「JWT / 多端身份」· `docs/ROUTE_TABLE.md` §7。
 
@@ -257,8 +274,10 @@ test "my test" {
 ```
 
 ```bash
+# Framework tests: keep default -Ddb=all (do not narrow drivers)
 ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test
-bash scripts/ci-integration.sh   # tenant-mgmt + stress + shopdemo
+# Apps/examples: zig build -Ddb=sqlite
+bash scripts/ci-integration.sh   # tenant-mgmt + stress + shopdemo（-Ddb=sqlite）
 ```
 
 ## Version

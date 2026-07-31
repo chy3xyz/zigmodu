@@ -33,11 +33,39 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Time = @import("../core/Time.zig");
 const errors = @import("errors.zig");
-const sqlite3_c = @import("sqlite3_c.zig");
-const libpq_c = @import("libpq_c.zig");
-const libmysql_c = @import("libmysql_c.zig");
 const breaker = @import("breaker.zig");
 
+const enable_sqlite = blk: {
+    const bo = @import("build_options");
+    break :blk if (@hasDecl(bo, "enable_sqlite")) bo.enable_sqlite else true;
+};
+const enable_postgres = blk: {
+    const bo = @import("build_options");
+    break :blk if (@hasDecl(bo, "enable_postgres")) bo.enable_postgres else true;
+};
+const enable_mysql = blk: {
+    const bo = @import("build_options");
+    break :blk if (@hasDecl(bo, "enable_mysql")) bo.enable_mysql else true;
+};
+
+const sqlite3_c = if (enable_sqlite) @import("sqlite3_c.zig") else @import("sqlite3_c_stub.zig");
+const libpq_c = if (enable_postgres) @import("libpq_c.zig") else @import("libpq_c_stub.zig");
+const libmysql_c = if (enable_mysql) @import("libmysql_c.zig") else @import("libmysql_c_stub.zig");
+
+/// Compile-time driver feature flags (from `-Ddb=` / `build_options`).
+pub const DriverFeatures = struct {
+    pub const sqlite = enable_sqlite;
+    pub const postgres = enable_postgres;
+    pub const mysql = enable_mysql;
+
+    pub fn isEnabled(d: Driver) bool {
+        return switch (d) {
+            .sqlite => sqlite,
+            .postgres => postgres,
+            .mysql => mysql,
+        };
+    }
+};
 /// Allocate null-terminated copy (replaces removed allocator.dupeZ in Zig 0.17).
 fn allocZ(allocator: std.mem.Allocator, s: []const u8) ![:0]u8 {
     const result = try allocator.allocSentinel(u8, s.len, 0);
@@ -4109,6 +4137,7 @@ pub const Client = struct {
     }
 
     fn newConn(self: *Client) !Conn {
+        if (!DriverFeatures.isEnabled(self.config.driver)) return error.DriverNotEnabled;
         switch (self.config.driver) {
             .sqlite => {
                 const sqlite = try self.allocator.create(SQLiteConn);
@@ -5244,13 +5273,32 @@ pub const Builder = struct {
 /// In CI: postgres job sets DB=postgres, mysql job sets DB=mysql,
 /// sqlite job leaves DB unset so all tests run.
 fn skipUnlessDb(comptime db: []const u8) !void {
+    if (comptime std.mem.eql(u8, db, "postgres")) {
+        if (!DriverFeatures.postgres) return error.SkipZigTest;
+    } else if (comptime std.mem.eql(u8, db, "mysql")) {
+        if (!DriverFeatures.mysql) return error.SkipZigTest;
+    } else if (comptime std.mem.eql(u8, db, "sqlite")) {
+        if (!DriverFeatures.sqlite) return error.SkipZigTest;
+    }
     const db_env = if (builtin.os.tag == .windows) "" else if (std.c.getenv("DB")) |ptr| std.mem.span(ptr) else return error.SkipZigTest;
     if (db_env.len == 0 or !std.mem.eql(u8, db_env, db)) {
         return error.SkipZigTest;
     }
 }
 
+test "DriverFeatures and DriverNotEnabled" {
+    try std.testing.expect(DriverFeatures.isEnabled(.sqlite) == DriverFeatures.sqlite);
+    try std.testing.expect(DriverFeatures.isEnabled(.postgres) == DriverFeatures.postgres);
+    try std.testing.expect(DriverFeatures.isEnabled(.mysql) == DriverFeatures.mysql);
+    if (DriverFeatures.postgres) return;
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .postgres, .host = "127.0.0.1" });
+    defer client.deinit();
+    try std.testing.expectError(error.DriverNotEnabled, client.connect());
+}
+
 test "cached conn queryRow and exec" {
+    if (!DriverFeatures.sqlite) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();

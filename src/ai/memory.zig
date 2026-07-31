@@ -7,6 +7,7 @@ fn monotonicNowSeconds() i64 {
 }
 
 /// Persistent memory entry — facts, preferences, lessons stored across sessions.
+/// `key` is the **logical** key (e.g. `user:pref:lang`); tenant/user live in fields.
 pub const MemoryEntry = struct {
     key: []const u8,
     value: []const u8,
@@ -17,8 +18,8 @@ pub const MemoryEntry = struct {
     last_accessed_at: i64 = 0,
 };
 
-/// Thread-safe in-memory store with optional persistence backend.
-/// Pattern: same mutex model as SkillRegistry, ConnectionRegistry.
+/// Thread-safe in-memory store. Map keys are composite `tenant\x1fuser\x1flogical`
+/// so the same logical key can coexist for different tenants/users.
 ///
 /// Usage:
 ///   var store = MemoryStore.init(allocator, io);
@@ -35,7 +36,6 @@ pub const MemoryStore = struct {
         return initCapacity(allocator, io, 1000);
     }
 
-    /// Init with capacity hint for pre-allocated HashMap storage.
     pub fn initCapacity(allocator: std.mem.Allocator, io: std.Io, capacity: usize) MemoryStore {
         var entries = std.StringHashMap(MemoryEntry).init(allocator);
         entries.ensureTotalCapacity(@intCast(capacity)) catch {};
@@ -51,42 +51,47 @@ pub const MemoryStore = struct {
         var it = self.entries.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.*.key);
-            self.allocator.free(entry.value_ptr.*.value);
+            self.allocator.free(entry.value_ptr.key);
+            self.allocator.free(entry.value_ptr.value);
         }
         self.entries.deinit();
         self.* = undefined;
     }
 
-    /// Store a fact. Key format: "namespace:category:detail" (e.g. "user:pref:lang").
+    fn storageKey(allocator: std.mem.Allocator, tenant_id: i64, user_id: i64, logical: []const u8) ![]u8 {
+        return std.fmt.allocPrint(allocator, "{d}\x1f{d}\x1f{s}", .{ tenant_id, user_id, logical });
+    }
+
+    /// Store a fact. Logical key format: "namespace:category:detail" (e.g. "user:pref:lang").
     pub fn remember(self: *MemoryStore, key: []const u8, value: []const u8, tenant_id: i64, user_id: i64) !void {
         self.mutex.lock(self.io) catch return;
         defer self.mutex.unlock(self.io);
 
-        // Evict oldest if at capacity
         if (self.entries.count() >= self.max_entries) {
             self.evictOldestLocked();
         }
 
         const now = monotonicNowSeconds();
-        const owned_key = try self.allocator.dupe(u8, key);
-        const owned_value = try self.allocator.dupe(u8, value);
+        const sk = try storageKey(self.allocator, tenant_id, user_id, key);
+        errdefer self.allocator.free(sk);
 
-        // Check if key exists — update if so
-        if (self.entries.getPtr(key)) |existing| {
-            self.allocator.free(existing.key);
+        if (self.entries.getPtr(sk)) |existing| {
+            self.allocator.free(sk);
+            const owned_value = try self.allocator.dupe(u8, value);
             self.allocator.free(existing.value);
-            existing.key = owned_key;
             existing.value = owned_value;
-            existing.tenant_id = tenant_id;
-            existing.user_id = user_id;
             existing.access_count += 1;
             existing.last_accessed_at = now;
             return;
         }
 
-        self.entries.putAssumeCapacity(owned_key, .{
-            .key = owned_key,
+        const owned_logical = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(owned_logical);
+        const owned_value = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(owned_value);
+
+        try self.entries.put(sk, .{
+            .key = owned_logical,
             .value = owned_value,
             .tenant_id = tenant_id,
             .user_id = user_id,
@@ -96,7 +101,7 @@ pub const MemoryStore = struct {
         });
     }
 
-    /// Recall facts matching a key prefix, scoped to tenant+user.
+    /// Recall facts matching a logical key prefix, scoped to tenant+user.
     /// Caller owns returned ArrayList memory.
     pub fn recall(
         self: *MemoryStore,
@@ -134,12 +139,15 @@ pub const MemoryStore = struct {
         return result;
     }
 
-    /// Remove a specific memory by key.
-    pub fn forget(self: *MemoryStore, key: []const u8) void {
+    /// Remove memory for logical key scoped to tenant+user.
+    pub fn forget(self: *MemoryStore, key: []const u8, tenant_id: i64, user_id: i64) void {
         self.mutex.lock(self.io) catch return;
         defer self.mutex.unlock(self.io);
 
-        if (self.entries.fetchRemove(key)) |kv| {
+        const sk = storageKey(self.allocator, tenant_id, user_id, key) catch return;
+        defer self.allocator.free(sk);
+
+        if (self.entries.fetchRemove(sk)) |kv| {
             self.allocator.free(kv.key);
             self.allocator.free(kv.value.key);
             self.allocator.free(kv.value.value);
@@ -176,11 +184,98 @@ pub const MemoryStore = struct {
         return buf.toOwnedSlice(allocator);
     }
 
-    /// Number of stored entries.
     pub fn count(self: *MemoryStore) usize {
         self.mutex.lock(self.io) catch return 0;
         defer self.mutex.unlock(self.io);
         return self.entries.count();
+    }
+
+    /// Snapshot all entries as JSON array (for simple file persistence). Caller frees.
+    pub fn dumpJson(self: *MemoryStore, allocator: std.mem.Allocator) ![]u8 {
+        self.mutex.lock(self.io) catch return error.LockFailed;
+        defer self.mutex.unlock(self.io);
+
+        const Dump = struct {
+            key: []const u8,
+            value: []const u8,
+            tenant_id: i64,
+            user_id: i64,
+            created_at: i64,
+            access_count: usize,
+            last_accessed_at: i64,
+        };
+
+        var rows = std.ArrayList(Dump).empty;
+        defer rows.deinit(allocator);
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            const e = entry.value_ptr.*;
+            try rows.append(allocator, .{
+                .key = e.key,
+                .value = e.value,
+                .tenant_id = e.tenant_id,
+                .user_id = e.user_id,
+                .created_at = e.created_at,
+                .access_count = e.access_count,
+                .last_accessed_at = e.last_accessed_at,
+            });
+        }
+        return try std.json.Stringify.valueAlloc(allocator, rows.items, .{});
+    }
+
+    /// Load entries from `dumpJson` output (merge/overwrite by composite key).
+    pub fn loadJson(self: *MemoryStore, json: []const u8) !void {
+        const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, json, .{});
+        defer parsed.deinit();
+        const arr = switch (parsed.value) {
+            .array => |a| a,
+            else => return error.InvalidMemoryDump,
+        };
+        for (arr.items) |item| {
+            const obj = switch (item) {
+                .object => |o| o,
+                else => continue,
+            };
+            const key = switch (obj.get("key") orelse continue) {
+                .string => |s| s,
+                else => continue,
+            };
+            const value = switch (obj.get("value") orelse continue) {
+                .string => |s| s,
+                else => continue,
+            };
+            const tenant_id: i64 = blk: {
+                const v = obj.get("tenant_id") orelse break :blk 0;
+                break :blk switch (v) {
+                    .integer => |n| n,
+                    else => 0,
+                };
+            };
+            const user_id: i64 = blk: {
+                const v = obj.get("user_id") orelse break :blk 0;
+                break :blk switch (v) {
+                    .integer => |n| n,
+                    else => 0,
+                };
+            };
+            try self.remember(key, value, tenant_id, user_id);
+        }
+    }
+
+    /// Persist snapshot to a relative path under cwd (`std.Io.Dir.cwd`).
+    pub fn saveToFile(self: *MemoryStore, path: []const u8) !void {
+        const json = try self.dumpJson(self.allocator);
+        defer self.allocator.free(json);
+        const file = try std.Io.Dir.cwd().createFile(self.io, path, .{});
+        defer file.close(self.io);
+        try file.writeStreamingAll(self.io, json);
+    }
+
+    /// Replace-merge from a JSON file written by `saveToFile`.
+    pub fn loadFromFile(self: *MemoryStore, path: []const u8) !void {
+        const json = try std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, std.Io.Limit.limited(16 * 1024 * 1024));
+        defer self.allocator.free(json);
+        try self.loadJson(json);
     }
 
     fn evictOldestLocked(self: *MemoryStore) void {
@@ -212,7 +307,7 @@ test "MemoryStore remember and recall" {
 
     try store.remember("user:pref:lang", "zh", 1, 42);
     try store.remember("user:pref:theme", "dark", 1, 42);
-    try store.remember("user:pref:lang", "en", 2, 99); // different user
+    try store.remember("user:pref:lang", "en", 2, 99); // same logical key, different tenant/user
 
     var results = try store.recall(a, "user:pref", 1, 42);
     defer {
@@ -224,6 +319,7 @@ test "MemoryStore remember and recall" {
     }
 
     try std.testing.expectEqual(@as(usize, 2), results.items.len);
+    try std.testing.expectEqual(@as(usize, 3), store.count());
 }
 
 test "MemoryStore forget" {
@@ -234,7 +330,7 @@ test "MemoryStore forget" {
     try store.remember("test:key", "value", 0, 0);
     try std.testing.expectEqual(@as(usize, 1), store.count());
 
-    store.forget("test:key");
+    store.forget("test:key", 0, 0);
     try std.testing.expectEqual(@as(usize, 0), store.count());
 }
 
@@ -262,7 +358,49 @@ test "MemoryStore capacity eviction" {
     try store.remember("k1", "v1", 0, 0);
     try store.remember("k2", "v2", 0, 0);
     try store.remember("k3", "v3", 0, 0);
-    try store.remember("k4", "v4", 0, 0); // triggers eviction
+    try store.remember("k4", "v4", 0, 0);
 
     try std.testing.expect(store.count() <= 3);
+}
+
+test "MemoryStore dumpJson loadJson roundtrip" {
+    const a = std.testing.allocator;
+    var store = MemoryStore.init(a, std.testing.io);
+    defer store.deinit();
+    try store.remember("user:pref:lang", "zh", 1, 42);
+
+    const json = try store.dumpJson(a);
+    defer a.free(json);
+
+    var store2 = MemoryStore.init(a, std.testing.io);
+    defer store2.deinit();
+    try store2.loadJson(json);
+    try std.testing.expectEqual(@as(usize, 1), store2.count());
+
+    var results = try store2.recall(a, "user:pref", 1, 42);
+    defer {
+        for (results.items) |e| {
+            a.free(e.key);
+            a.free(e.value);
+        }
+        results.deinit(a);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.items.len);
+    try std.testing.expectEqualStrings("zh", results.items[0].value);
+}
+
+test "MemoryStore saveToFile loadFromFile" {
+    const a = std.testing.allocator;
+    const path = "zigmodu-test-memory-store.json";
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var store = MemoryStore.init(a, std.testing.io);
+    defer store.deinit();
+    try store.remember("user:pref:lang", "zh", 1, 42);
+    try store.saveToFile(path);
+
+    var store2 = MemoryStore.init(a, std.testing.io);
+    defer store2.deinit();
+    try store2.loadFromFile(path);
+    try std.testing.expectEqual(@as(usize, 1), store2.count());
 }

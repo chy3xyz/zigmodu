@@ -1,4 +1,5 @@
 const std = @import("std");
+const Time = @import("../core/Time.zig");
 
 /// Parameter definition for a Tool — maps to JSON Schema for LLM function calling.
 pub const Param = struct {
@@ -15,6 +16,9 @@ pub const Tool = struct {
     name: []const u8,
     description: []const u8,
     parameters: []const Param,
+    /// Soft per-tool budget (ms). Handlers should poll `SkillContext.expired()`.
+    /// Post-return overrun also yields `error.ToolTimeout` (does not preempt).
+    timeout_ms: ?u64 = null,
     /// Handler: receives context + JSON value of arguments, returns JSON result.
     handler: *const fn (ctx: *SkillContext, args: std.json.Value) anyerror!std.json.Value,
 };
@@ -26,6 +30,23 @@ pub const SkillContext = struct {
     user_id: ?i64 = null,
     backend_ptr: ?*anyopaque = null, // *data.SqlxBackend for DB skills
     run_id: ?[]const u8 = null,
+    /// Absolute deadline from `Time.monotonicNowMilliseconds()`; set by dispatch.
+    deadline_ms: ?i64 = null,
+
+    pub fn expired(self: *const SkillContext) bool {
+        const d = self.deadline_ms orelse return false;
+        return Time.monotonicNowMilliseconds() > d;
+    }
+
+    pub fn checkDeadline(self: *const SkillContext) !void {
+        if (self.expired()) return error.ToolTimeout;
+    }
+};
+
+pub const DispatchOpts = struct {
+    allowlist: ?[]const []const u8 = null,
+    /// Override tool.timeout_ms for this call (cooperative + post-check).
+    timeout_ms: ?u64 = null,
 };
 
 /// Registry that aggregates Tool definitions from all modules.
@@ -86,18 +107,10 @@ pub const SkillRegistry = struct {
             .name = key,
             .description = tool.description,
             .parameters = params,
+            .timeout_ms = tool.timeout_ms,
             .handler = tool.handler,
         };
         self.tools.putAssumeCapacity(key, owned);
-    }
-
-    /// Dispatch a tool call by name.
-    pub fn dispatch(self: *Self, name: []const u8, ctx: *SkillContext, args: std.json.Value) !std.json.Value {
-        self.mutex.lock(self.io) catch return error.RegistryLockFailed;
-        defer self.mutex.unlock(self.io);
-
-        const tool = self.tools.get(name) orelse return error.ToolNotFound;
-        return try tool.handler(ctx, args);
     }
 
     /// Get a tool definition by name.
@@ -128,35 +141,118 @@ pub const SkillRegistry = struct {
         return n;
     }
 
-    /// Generate OpenAI-compatible function calling JSON.
-    pub fn toOpenAiFunctions(self: *Self, writer: anytype) !void {
-        self.mutex.lock(self.io) catch return;
+    /// Generate OpenAI-compatible tools JSON (owned slice).
+    pub fn toOpenAiFunctionsAlloc(self: *Self, allocator: std.mem.Allocator) ![]u8 {
+        self.mutex.lock(self.io) catch return error.RegistryLockFailed;
         defer self.mutex.unlock(self.io);
 
-        try writer.interface.writeAll("[");
+        var buf = std.ArrayList(u8).empty;
+        errdefer buf.deinit(allocator);
+        try buf.append(allocator, '[');
         var first = true;
         var it = self.tools.iterator();
         while (it.next()) |entry| {
             const t = entry.value_ptr;
-            if (!first) try writer.interface.writeAll(",");
+            if (!first) try buf.append(allocator, ',');
             first = false;
-            try writer.print("{{\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"description\":\"{s}\",\"parameters\":{{\"type\":\"object\",\"properties\":{{", .{ t.name, t.description });
+            try buf.print(allocator, "{{\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"description\":\"{s}\",\"parameters\":{{\"type\":\"object\",\"properties\":{{", .{ t.name, t.description });
             for (t.parameters, 0..) |p, pi| {
-                if (pi > 0) try writer.interface.writeAll(",");
-                try writer.print("\"{s}\":{{\"type\":\"{s}\",\"description\":\"{s}\"}}", .{ p.name, @tagName(p.type), p.description });
+                if (pi > 0) try buf.append(allocator, ',');
+                try buf.print(allocator, "\"{s}\":{{\"type\":\"{s}\",\"description\":\"{s}\"}}", .{ p.name, @tagName(p.type), p.description });
             }
-            try writer.interface.writeAll("},\"required\":[");
+            try buf.appendSlice(allocator, "},\"required\":[");
             var req_first = true;
             for (t.parameters) |p| {
                 if (p.required) {
-                    if (!req_first) try writer.interface.writeAll(",");
+                    if (!req_first) try buf.append(allocator, ',');
                     req_first = false;
-                    try writer.print("\"{s}\"", .{p.name});
+                    try buf.print(allocator, "\"{s}\"", .{p.name});
                 }
             }
-            try writer.interface.writeAll("]}}}}");
+            try buf.appendSlice(allocator, "]}}}}");
         }
-        try writer.interface.writeAll("]");
+        try buf.append(allocator, ']');
+        return try buf.toOwnedSlice(allocator);
+    }
+
+    /// Generate OpenAI-compatible function calling JSON via writer.interface.writeAll.
+    pub fn toOpenAiFunctions(self: *Self, writer: anytype) !void {
+        const json = try self.toOpenAiFunctionsAlloc(self.allocator);
+        defer self.allocator.free(json);
+        try writer.interface.writeAll(json);
+    }
+
+    /// Validate required parameters against a JSON object.
+    pub fn validateArgs(tool: Tool, args: std.json.Value) !void {
+        if (tool.parameters.len == 0) return;
+        if (args == .null) return error.MissingToolArg;
+        if (args != .object) return error.InvalidToolArgs;
+        for (tool.parameters) |p| {
+            if (p.required and args.object.get(p.name) == null) return error.MissingToolArg;
+        }
+    }
+
+    /// Dispatch with optional name allowlist (security boundary).
+    pub fn dispatchAllowed(
+        self: *Self,
+        name: []const u8,
+        ctx: *SkillContext,
+        args: std.json.Value,
+        allowlist: ?[]const []const u8,
+    ) !std.json.Value {
+        return self.dispatchWith(name, ctx, args, .{ .allowlist = allowlist });
+    }
+
+    /// Dispatch a tool call by name (validates required params).
+    pub fn dispatch(self: *Self, name: []const u8, ctx: *SkillContext, args: std.json.Value) !std.json.Value {
+        return self.dispatchWith(name, ctx, args, .{});
+    }
+
+    /// Dispatch with allowlist + cooperative timeout skeleton.
+    pub fn dispatchWith(
+        self: *Self,
+        name: []const u8,
+        ctx: *SkillContext,
+        args: std.json.Value,
+        opts: DispatchOpts,
+    ) !std.json.Value {
+        if (opts.allowlist) |al| {
+            var ok = false;
+            for (al) |n| {
+                if (std.mem.eql(u8, n, name)) {
+                    ok = true;
+                    break;
+                }
+            }
+            if (!ok) return error.ToolNotAllowed;
+        }
+
+        self.mutex.lock(self.io) catch return error.RegistryLockFailed;
+        const tool = self.tools.get(name) orelse {
+            self.mutex.unlock(self.io);
+            return error.ToolNotFound;
+        };
+        try validateArgs(tool, args);
+        const handler = tool.handler;
+        const budget = opts.timeout_ms orelse tool.timeout_ms;
+        self.mutex.unlock(self.io);
+
+        const prev_deadline = ctx.deadline_ms;
+        defer ctx.deadline_ms = prev_deadline;
+        const started = Time.monotonicNowMilliseconds();
+        if (budget) |ms| {
+            ctx.deadline_ms = started + @as(i64, @intCast(ms));
+        } else {
+            ctx.deadline_ms = null;
+        }
+
+        const result = try handler(ctx, args);
+        if (budget) |ms| {
+            const elapsed: u64 = @intCast(@max(Time.monotonicNowMilliseconds() - started, 0));
+            if (elapsed > ms) return error.ToolTimeout;
+        }
+        try ctx.checkDeadline();
+        return result;
     }
 };
 
@@ -188,7 +284,56 @@ test "SkillRegistry unknown tool" {
     try std.testing.expectError(error.ToolNotFound, reg.dispatch("nonexistent", &ctx, .null));
 }
 
+test "SkillRegistry allowlist and required args" {
+    const allocator = std.testing.allocator;
+    var reg = SkillRegistry.init(allocator, std.testing.io);
+    defer reg.deinit();
+
+    try reg.register(.{
+        .name = "echo",
+        .description = "echo",
+        .parameters = &.{.{ .name = "text", .type = .string, .description = "t", .required = true }},
+        .handler = echoHandler,
+    });
+
+    var ctx = SkillContext{ .allocator = allocator };
+    try std.testing.expectError(error.ToolNotAllowed, reg.dispatchAllowed("echo", &ctx, .null, &.{"other"}));
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"text\":\"hi\"}", .{});
+    defer parsed.deinit();
+    const ok = try reg.dispatchAllowed("echo", &ctx, parsed.value, &.{"echo"});
+    try std.testing.expectEqualStrings("hi", ok.string);
+}
+
+test "SkillRegistry cooperative deadline" {
+    const allocator = std.testing.allocator;
+    var reg = SkillRegistry.init(allocator, std.testing.io);
+    defer reg.deinit();
+
+    try reg.register(.{
+        .name = "slow",
+        .description = "checks deadline",
+        .parameters = &.{},
+        .timeout_ms = 1,
+        .handler = struct {
+            fn h(ctx: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+                ctx.deadline_ms = Time.monotonicNowMilliseconds() - 1;
+                try ctx.checkDeadline();
+                return .{ .string = "late" };
+            }
+        }.h,
+    });
+
+    var ctx = SkillContext{ .allocator = allocator };
+    try std.testing.expectError(error.ToolTimeout, reg.dispatch("slow", &ctx, .null));
+}
+
 fn pingHandler(ctx: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
     _ = ctx;
     return .{ .string = "pong" };
+}
+
+fn echoHandler(ctx: *SkillContext, args: std.json.Value) anyerror!std.json.Value {
+    _ = ctx;
+    return args.object.get("text").?;
 }

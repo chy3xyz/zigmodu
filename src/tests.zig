@@ -200,6 +200,15 @@ test "compile all source files" {
     _ = @import("http/Profiles.zig");
     _ = @import("http/Lifecycle.zig");
     _ = @import("http/Sse.zig");
+    _ = @import("ai/ai.zig");
+    _ = @import("ai/provider.zig");
+    _ = @import("ai/skill.zig");
+    _ = @import("ai/agent.zig");
+    _ = @import("ai/memory.zig");
+    _ = @import("ai/audit.zig");
+    _ = @import("ai/retriever.zig");
+    _ = @import("ai/quota.zig");
+    _ = @import("ai/tokenizer.zig");
     _ = @import("messaging/outbox.zig");
     _ = @import("messaging/outbox_sample.zig");
 

@@ -1,8 +1,14 @@
 const std = @import("std");
+const db_link = @import("db_link.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    const features = db_link.Features.sqlite_only;
+    const build_options = b.addOptions();
+    db_link.addToOptions(build_options, features);
+    const build_options_mod = build_options.createModule();
 
     const zent_dep = b.dependency("zent", .{
         .target = target,
@@ -16,9 +22,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    zigmodu_mod.linkSystemLibrary("sqlite3", .{});
-    // Optional drivers used by zigmodu sqlx — keep build green even if unused here.
-    linkOptionalDb(zigmodu_mod, b);
+    zigmodu_mod.addImport("build_options", build_options_mod);
+    db_link.link(zigmodu_mod, b, features);
 
     const helper_mod = b.createModule(.{
         .root_source_file = b.path("../_shared/zent_helpers.zig"),
@@ -46,22 +51,4 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     const run_step = b.step("run", "Run shopdemo-zent order API server");
     run_step.dependOn(&run_cmd.step);
-}
-
-fn dirExists(b: *std.Build, path: []const u8) bool {
-    std.Io.Dir.cwd().access(b.graph.io, path, .{}) catch return false;
-    return true;
-}
-
-fn linkOptionalDb(mod: *std.Build.Module, b: *std.Build) void {
-    if (dirExists(b, "/opt/homebrew/opt/libpq")) {
-        mod.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/libpq/include" });
-        mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/libpq/lib" });
-        mod.linkSystemLibrary("pq", .{});
-    }
-    if (dirExists(b, "/opt/homebrew/opt/mariadb-connector-c")) {
-        mod.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/mariadb-connector-c/include/mariadb" });
-        mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/mariadb-connector-c/lib" });
-        mod.linkSystemLibrary("mysqlclient", .{});
-    }
 }

@@ -13,6 +13,7 @@ pub fn build(b: *std.Build) void {
     const zigmodu_dep = b.dependency("zigmodu", .{
         .target = target,
         .optimize = optimize,
+        .db = "sqlite", // HTTP-only example — no postgres/mysql client libs
     });
     exe_mod.addImport("zigmodu", zigmodu_dep.module("zigmodu"));
 

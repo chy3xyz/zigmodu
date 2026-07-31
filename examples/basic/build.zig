@@ -15,6 +15,7 @@ pub fn build(b: *std.Build) void {
     const zigmodu_dep = b.dependency("zigmodu", .{
         .target = target,
         .optimize = optimize,
+        .db = "sqlite",
     });
     exe_mod.addImport("zigmodu", zigmodu_dep.module("zigmodu"));
 
@@ -27,9 +28,6 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
 
     const run_step = b.step("run", "Run the basic example");
     run_step.dependOn(&run_cmd.step);

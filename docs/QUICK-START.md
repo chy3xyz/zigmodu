@@ -83,13 +83,22 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const zigmodu_dep = b.dependency("zigmodu", .{
+        .target = target,
+        .optimize = optimize,
+        .db = "sqlite", // link only what you need: sqlite|postgres|mysql|all
+    });
+
+    const exe_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    exe_mod.addImport("zigmodu", zigmodu_dep.module("zigmodu"));
+
     const exe = b.addExecutable(.{
         .name = "myapp",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+        .root_module = exe_mod,
     });
 
     b.installArtifact(exe);

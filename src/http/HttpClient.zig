@@ -233,7 +233,14 @@ pub const HttpClient = struct {
         self.* = undefined;
     }
 
-    /// Send HTTP request (with retry)
+    const Target = struct {
+        host: []const u8,
+        port: u16,
+        path: []const u8,
+        is_tls: bool,
+    };
+
+    /// Send HTTP(S) request (with retry). HTTPS uses `std.http.Client` (TLS 1.3).
     pub fn request(self: *Self, req: HttpRequest) !HttpResponse {
         var last_error: anyerror = error.Unknown;
 
@@ -254,56 +261,216 @@ pub const HttpClient = struct {
         return last_error;
     }
 
-    fn executeRequest(self: *Self, req: HttpRequest) !HttpResponse {
-        // Parse URL
-        const parsed_url = try std.Uri.parse(req.url);
+    pub fn parseTarget(url: []const u8, host_buf: *[256]u8, path_buf: *[4096]u8) !Target {
+        const parsed_url = try std.Uri.parse(url);
+        const is_https = std.ascii.eqlIgnoreCase(parsed_url.scheme, "https");
+        const is_http = std.ascii.eqlIgnoreCase(parsed_url.scheme, "http");
+        if (!is_https and !is_http) return error.UnsupportedScheme;
+
         const host_component = parsed_url.host orelse return error.InvalidUrl;
-        var host_buf: [256]u8 = undefined;
-        const host = host_component.toRaw(&host_buf) catch return error.InvalidUrl;
+        const host = host_component.toRaw(host_buf) catch return error.InvalidUrl;
         const port: u16 = if (parsed_url.port) |p|
             if (p <= std.math.maxInt(u16)) @intCast(p) else return error.InvalidPort
+        else if (is_https)
+            443
         else
             80;
 
-        // Acquire connection
-        var conn = try self.connection_pool.acquire(host, port);
+        var path_tmp: [2048]u8 = undefined;
+        const path_only_raw = parsed_url.path.toRaw(&path_tmp) catch "/";
+        const path_base: []const u8 = if (path_only_raw.len == 0) "/" else path_only_raw;
+
+        if (parsed_url.query) |qcomp| {
+            var qbuf: [2048]u8 = undefined;
+            const qstr = qcomp.toRaw(&qbuf) catch return error.InvalidUrl;
+            const full = std.fmt.bufPrint(path_buf, "{s}?{s}", .{ path_base, qstr }) catch return error.InvalidUrl;
+            return .{ .host = host, .port = port, .path = full, .is_tls = is_https };
+        }
+        if (path_base.len > path_buf.len) return error.InvalidUrl;
+        @memcpy(path_buf[0..path_base.len], path_base);
+        return .{ .host = host, .port = port, .path = path_buf[0..path_base.len], .is_tls = is_https };
+    }
+
+    fn parseMethod(method: []const u8) std.http.Method {
+        if (std.ascii.eqlIgnoreCase(method, "GET")) return .GET;
+        if (std.ascii.eqlIgnoreCase(method, "POST")) return .POST;
+        if (std.ascii.eqlIgnoreCase(method, "PUT")) return .PUT;
+        if (std.ascii.eqlIgnoreCase(method, "DELETE")) return .DELETE;
+        if (std.ascii.eqlIgnoreCase(method, "PATCH")) return .PATCH;
+        if (std.ascii.eqlIgnoreCase(method, "HEAD")) return .HEAD;
+        return .GET;
+    }
+
+    /// HTTPS via std.http.Client (system CA bundle + TLS 1.3). Not pooled.
+    fn executeHttps(self: *Self, req: HttpRequest) !HttpResponse {
+        var client = std.http.Client{ .allocator = self.allocator, .io = self.connection_pool.io };
+        defer client.deinit();
+
+        var header_list = std.ArrayList(std.http.Header).empty;
+        defer header_list.deinit(self.allocator);
+        var iter = req.headers.iterator();
+        while (iter.next()) |entry| {
+            try header_list.append(self.allocator, .{ .name = entry.key_ptr.*, .value = entry.value_ptr.* });
+        }
+
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+
+        const result = client.fetch(.{
+            .location = .{ .url = req.url },
+            .method = parseMethod(req.method),
+            .payload = req.body,
+            .extra_headers = header_list.items,
+            .response_writer = &aw.writer,
+            .keep_alive = false,
+        }) catch |err| return mapHttpsError(err);
+
+        var resp = HttpResponse.init(self.allocator);
+        errdefer resp.deinit();
+        resp.status_code = @intFromEnum(result.status);
+        resp.body = try aw.toOwnedSlice();
+        return resp;
+    }
+
+    /// HTTPS incremental body stream via std.http.Client (read loop → on_chunk).
+    fn executeHttpsStream(self: *Self, req: HttpRequest, cb_ctx: *anyopaque, on_chunk: OnBodyChunk) !HttpResponse {
+        var client = std.http.Client{ .allocator = self.allocator, .io = self.connection_pool.io };
+        defer client.deinit();
+
+        var header_list = std.ArrayList(std.http.Header).empty;
+        defer header_list.deinit(self.allocator);
+        var iter = req.headers.iterator();
+        while (iter.next()) |entry| {
+            try header_list.append(self.allocator, .{ .name = entry.key_ptr.*, .value = entry.value_ptr.* });
+        }
+
+        const uri = std.Uri.parse(req.url) catch return error.InvalidUrl;
+        var https_req = client.request(parseMethod(req.method), uri, .{
+            .extra_headers = header_list.items,
+            .keep_alive = false,
+        }) catch |err| return mapHttpsError(err);
+        defer https_req.deinit();
+
+        if (req.body) |body| {
+            const body_owned = try self.allocator.dupe(u8, body);
+            defer self.allocator.free(body_owned);
+            https_req.sendBodyComplete(body_owned) catch |err| return mapHttpsError(err);
+        } else {
+            https_req.sendBodiless() catch |err| return mapHttpsError(err);
+        }
+
+        var response = https_req.receiveHead(&.{}) catch |err| return mapHttpsError(err);
+
+        var resp = HttpResponse.init(self.allocator);
+        errdefer resp.deinit();
+        resp.status_code = @intFromEnum(response.head.status);
+        resp.body = try self.allocator.dupe(u8, "");
+
+        var transfer_buf: [4096]u8 = undefined;
+        const body_reader = response.reader(&transfer_buf);
+        var chunk_buf: [8192]u8 = undefined;
+        while (true) {
+            const n = body_reader.readSliceShort(&chunk_buf) catch |err| switch (err) {
+                error.ReadFailed => {
+                    if (response.bodyErr()) |be| return mapHttpsError(be);
+                    return error.ConnectionError;
+                },
+                else => |e| return e,
+            };
+            if (n == 0) break;
+            try on_chunk(cb_ctx, chunk_buf[0..n]);
+        }
+        return resp;
+    }
+
+    fn mapHttpsError(err: anyerror) anyerror {
+        const name = @errorName(err);
+        if (std.mem.indexOf(u8, name, "Certificate") != null or
+            std.mem.indexOf(u8, name, "Tls") != null or
+            std.mem.eql(u8, name, "CertificateBundleLoadFailure"))
+        {
+            return error.TlsHandshakeFailed;
+        }
+        if (std.mem.eql(u8, name, "ConnectionRefused")) return error.ConnectionRefused;
+        if (std.mem.eql(u8, name, "NetworkUnreachable")) return error.NetworkUnreachable;
+        if (std.mem.indexOf(u8, name, "Host") != null or
+            std.mem.indexOf(u8, name, "Name") != null or
+            std.mem.eql(u8, name, "UnknownHostName"))
+        {
+            return error.DnsFailed;
+        }
+        if (std.mem.eql(u8, name, "ConnectionTimedOut") or std.mem.eql(u8, name, "Timeout")) {
+            return error.Timeout;
+        }
+        return error.ConnectionError;
+    }
+
+    fn executeRequest(self: *Self, req: HttpRequest) !HttpResponse {
+        var host_buf: [256]u8 = undefined;
+        var path_buf: [4096]u8 = undefined;
+        const target = try parseTarget(req.url, &host_buf, &path_buf);
+        if (target.is_tls) return self.executeHttps(req);
+
+        var conn = try self.connection_pool.acquire(target.host, target.port);
         defer self.connection_pool.release(conn);
 
-        // Build HTTP request
-        var path_buf: [4096]u8 = undefined;
-        const path_str = parsed_url.path.toRaw(&path_buf) catch "/";
-        const request_line = try std.fmt.allocPrint(self.allocator, "{s} {s} HTTP/1.1\r\n", .{ req.method, path_str });
-        defer self.allocator.free(request_line);
-
-        // Send request
         if (conn.stream) |stream| {
             var write_buf: [4096]u8 = undefined;
             var w = stream.writer(self.connection_pool.io, &write_buf);
-            _ = w.interface.writeAll(request_line) catch return error.ConnectionError;
-
-            // Send headers
-            var iter = req.headers.iterator();
-            while (iter.next()) |entry| {
-                const header_line = try std.fmt.allocPrint(self.allocator, "{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
-                defer self.allocator.free(header_line);
-                _ = w.interface.writeAll(header_line) catch return error.ConnectionError;
-            }
-
-            _ = w.interface.writeAll("\r\n") catch return error.ConnectionError;
-
-            // Send body
-            if (req.body) |body| {
-                _ = w.interface.writeAll(body) catch return error.ConnectionError;
-            }
-
-            // Read response (minimal: parse status line + headers + body)
+            try self.writeRequestHeaders(&w, req.method, target.path, target.host, target.port, &req.headers, req.body);
             const response = try self.readResponse(stream);
-
             conn.request_count += 1;
             return response;
         }
 
         return error.ConnectionError;
+    }
+
+    fn writeRequestHeaders(
+        self: *Self,
+        w: anytype,
+        method: []const u8,
+        path: []const u8,
+        host: []const u8,
+        port: u16,
+        headers: *const std.StringHashMap([]const u8),
+        body: ?[]const u8,
+    ) !void {
+        const request_line = try std.fmt.allocPrint(self.allocator, "{s} {s} HTTP/1.1\r\n", .{ method, path });
+        defer self.allocator.free(request_line);
+        _ = w.interface.writeAll(request_line) catch return error.ConnectionError;
+
+        var has_host = false;
+        var has_content_length = false;
+        var iter = headers.iterator();
+        while (iter.next()) |entry| {
+            if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "host")) has_host = true;
+            if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "content-length")) has_content_length = true;
+            const header_line = try std.fmt.allocPrint(self.allocator, "{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+            defer self.allocator.free(header_line);
+            _ = w.interface.writeAll(header_line) catch return error.ConnectionError;
+        }
+
+        if (!has_host) {
+            const host_line = if (port == 80 or port == 443)
+                try std.fmt.allocPrint(self.allocator, "Host: {s}\r\n", .{host})
+            else
+                try std.fmt.allocPrint(self.allocator, "Host: {s}:{d}\r\n", .{ host, port });
+            defer self.allocator.free(host_line);
+            _ = w.interface.writeAll(host_line) catch return error.ConnectionError;
+        }
+
+        if (!has_content_length) {
+            const len = if (body) |b| b.len else 0;
+            const cl = try std.fmt.allocPrint(self.allocator, "Content-Length: {d}\r\n", .{len});
+            defer self.allocator.free(cl);
+            _ = w.interface.writeAll(cl) catch return error.ConnectionError;
+        }
+
+        _ = w.interface.writeAll("\r\n") catch return error.ConnectionError;
+        if (body) |b| {
+            if (b.len > 0) _ = w.interface.writeAll(b) catch return error.ConnectionError;
+        }
     }
 
     fn readResponse(self: *Self, stream: std.Io.net.Stream) !HttpResponse {
@@ -375,6 +542,111 @@ pub const HttpClient = struct {
         return resp;
     }
 
+    /// Callback for streamed response body (decoded chunk payload, not raw TCP framing).
+    pub const OnBodyChunk = *const fn (ctx: *anyopaque, chunk: []const u8) anyerror!void;
+
+    /// Send HTTP request and stream the response body via `on_chunk` (no retry — streams are not idempotent).
+    /// Returned `HttpResponse.body` is empty; status/headers are filled. Caller still owns `deinit`.
+    pub fn requestStream(self: *Self, req: HttpRequest, cb_ctx: *anyopaque, on_chunk: OnBodyChunk) !HttpResponse {
+        return self.executeRequestStream(req, cb_ctx, on_chunk);
+    }
+
+    fn executeRequestStream(self: *Self, req: HttpRequest, cb_ctx: *anyopaque, on_chunk: OnBodyChunk) !HttpResponse {
+        var host_buf: [256]u8 = undefined;
+        var path_buf: [4096]u8 = undefined;
+        const target = try parseTarget(req.url, &host_buf, &path_buf);
+        if (target.is_tls) {
+            return self.executeHttpsStream(req, cb_ctx, on_chunk);
+        }
+
+        var conn = try self.connection_pool.acquire(target.host, target.port);
+        defer self.connection_pool.release(conn);
+
+        if (conn.stream) |stream| {
+            var write_buf: [4096]u8 = undefined;
+            var w = stream.writer(self.connection_pool.io, &write_buf);
+            try self.writeRequestHeaders(&w, req.method, target.path, target.host, target.port, &req.headers, req.body);
+            const response = try self.readResponseStreaming(stream, cb_ctx, on_chunk);
+            conn.request_count += 1;
+            return response;
+        }
+        return error.ConnectionError;
+    }
+
+    fn readResponseStreaming(self: *Self, stream: std.Io.net.Stream, cb_ctx: *anyopaque, on_chunk: OnBodyChunk) !HttpResponse {
+        var resp = HttpResponse.init(self.allocator);
+        errdefer resp.deinit();
+
+        var buf: [8192]u8 = undefined;
+        var read_buf: [8192]u8 = undefined;
+        var r = stream.reader(self.connection_pool.io, &read_buf);
+
+        const n = try r.interface.readSliceShort(&buf);
+        if (n == 0) return error.ConnectionError;
+        const raw = buf[0..n];
+
+        const header_end = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.InvalidResponse;
+        const head = raw[0..header_end];
+        const body_start = header_end + 4;
+
+        var line_it = std.mem.splitSequence(u8, head, "\r\n");
+        const status_line = line_it.next() orelse return error.InvalidResponse;
+        var parts = std.mem.splitScalar(u8, status_line, ' ');
+        _ = parts.next() orelse return error.InvalidResponse;
+        const status_str = parts.next() orelse return error.InvalidResponse;
+        resp.status_code = std.fmt.parseInt(u16, status_str, 10) catch return error.InvalidResponse;
+
+        var content_length: ?usize = null;
+        var chunked = false;
+        while (line_it.next()) |line| {
+            if (line.len == 0) break;
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const key_trim = std.mem.trim(u8, line[0..colon], " \t");
+            const val_trim = std.mem.trim(u8, line[colon + 1 ..], " \t");
+
+            const key = try self.allocator.dupe(u8, key_trim);
+            errdefer self.allocator.free(key);
+            const val = try self.allocator.dupe(u8, val_trim);
+            errdefer self.allocator.free(val);
+            try resp.headers.put(key, val);
+
+            if (std.ascii.eqlIgnoreCase(key_trim, "content-length")) {
+                content_length = std.fmt.parseInt(usize, val_trim, 10) catch null;
+            } else if (std.ascii.eqlIgnoreCase(key_trim, "transfer-encoding")) {
+                if (containsIgnoreCaseAscii(val_trim, "chunked")) chunked = true;
+            }
+        }
+
+        resp.body = try self.allocator.dupe(u8, "");
+        const initial = raw[body_start..];
+
+        if (chunked) {
+            try streamChunkedBody(&r.interface, &buf, initial, self.allocator, cb_ctx, on_chunk);
+        } else if (content_length) |cl| {
+            try streamContentLengthBody(&r.interface, &buf, initial, cl, cb_ctx, on_chunk);
+        } else {
+            try streamUntilEofBody(&r.interface, &buf, initial, cb_ctx, on_chunk);
+        }
+        return resp;
+    }
+
+    /// Decode a complete chunked-transfer buffer into contiguous body (unit-test helper).
+    pub fn decodeChunkedBuffer(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        var i: usize = 0;
+        while (i < data.len) {
+            const line_end = std.mem.indexOfPos(u8, data, i, "\r\n") orelse return error.InvalidChunked;
+            const size = std.fmt.parseInt(usize, data[i..line_end], 16) catch return error.InvalidChunked;
+            i = line_end + 2;
+            if (size == 0) break;
+            if (i + size + 2 > data.len) return error.IncompleteChunked;
+            try out.appendSlice(allocator, data[i .. i + size]);
+            i += size + 2;
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
     /// GET [...]
     pub fn get(self: *Self, url: []const u8) !HttpResponse {
         var req = HttpRequest.init(self.allocator, "GET", url);
@@ -407,6 +679,122 @@ pub const HttpClient = struct {
         return self.request(req);
     }
 };
+
+fn containsIgnoreCaseAscii(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i..][0..needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn streamContentLengthBody(
+    reader: anytype,
+    buf: []u8,
+    initial: []const u8,
+    content_length: usize,
+    cb_ctx: *anyopaque,
+    on_chunk: HttpClient.OnBodyChunk,
+) !void {
+    var copied: usize = 0;
+    if (initial.len > 0 and content_length > 0) {
+        const n = @min(initial.len, content_length);
+        if (n > 0) try on_chunk(cb_ctx, initial[0..n]);
+        copied = n;
+    }
+    while (copied < content_length) {
+        const more = try reader.readSliceShort(buf);
+        if (more == 0) return error.IncompleteBody;
+        const to_copy = @min(@as(usize, more), content_length - copied);
+        try on_chunk(cb_ctx, buf[0..to_copy]);
+        copied += to_copy;
+    }
+}
+
+fn streamUntilEofBody(
+    reader: anytype,
+    buf: []u8,
+    initial: []const u8,
+    cb_ctx: *anyopaque,
+    on_chunk: HttpClient.OnBodyChunk,
+) !void {
+    if (initial.len > 0) try on_chunk(cb_ctx, initial);
+    while (true) {
+        const more = try reader.readSliceShort(buf);
+        if (more == 0) break;
+        try on_chunk(cb_ctx, buf[0..more]);
+    }
+}
+
+fn streamChunkedBody(
+    reader: anytype,
+    buf: []u8,
+    initial: []const u8,
+    allocator: std.mem.Allocator,
+    cb_ctx: *anyopaque,
+    on_chunk: HttpClient.OnBodyChunk,
+) !void {
+    var carry: std.ArrayList(u8) = .empty;
+    defer carry.deinit(allocator);
+    try carry.appendSlice(allocator, initial);
+
+    while (true) {
+        while (std.mem.indexOf(u8, carry.items, "\r\n") == null) {
+            const more = try reader.readSliceShort(buf);
+            if (more == 0) return error.IncompleteChunked;
+            try carry.appendSlice(allocator, buf[0..more]);
+        }
+        const line_end = std.mem.indexOf(u8, carry.items, "\r\n").?;
+        const size = std.fmt.parseInt(usize, carry.items[0..line_end], 16) catch return error.InvalidChunked;
+        const after_line = line_end + 2;
+        // Drop size line
+        const rest_len = carry.items.len - after_line;
+        std.mem.copyForwards(u8, carry.items[0..rest_len], carry.items[after_line..]);
+        try carry.resize(allocator, rest_len);
+
+        if (size == 0) return;
+
+        while (carry.items.len < size + 2) {
+            const more = try reader.readSliceShort(buf);
+            if (more == 0) return error.IncompleteChunked;
+            try carry.appendSlice(allocator, buf[0..more]);
+        }
+        try on_chunk(cb_ctx, carry.items[0..size]);
+        const after_data = size + 2;
+        const rem = carry.items.len - after_data;
+        std.mem.copyForwards(u8, carry.items[0..rem], carry.items[after_data..]);
+        try carry.resize(allocator, rem);
+    }
+}
+
+test "HttpClient decodeChunkedBuffer" {
+    const a = std.testing.allocator;
+    const raw = "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+    const body = try HttpClient.decodeChunkedBuffer(a, raw);
+    defer a.free(body);
+    try std.testing.expectEqualStrings("hello world", body);
+}
+
+test "HttpClient parseTarget https defaults to 443" {
+    var host_buf: [256]u8 = undefined;
+    var path_buf: [4096]u8 = undefined;
+    const t = try HttpClient.parseTarget("https://api.example.com/v1/chat", &host_buf, &path_buf);
+    try std.testing.expect(t.is_tls);
+    try std.testing.expectEqual(@as(u16, 443), t.port);
+    try std.testing.expectEqualStrings("api.example.com", t.host);
+    try std.testing.expectEqualStrings("/v1/chat", t.path);
+}
+
+test "HttpClient parseTarget http path and query" {
+    var host_buf: [256]u8 = undefined;
+    var path_buf: [4096]u8 = undefined;
+    const t = try HttpClient.parseTarget("http://api.local:8080/v1/chat?x=1", &host_buf, &path_buf);
+    try std.testing.expectEqualStrings("api.local", t.host);
+    try std.testing.expectEqual(@as(u16, 8080), t.port);
+    try std.testing.expectEqualStrings("/v1/chat?x=1", t.path);
+}
 
 test "HttpClient RetryPolicy calculateDelay" {
     const policy = HttpClient.RetryPolicy.default();

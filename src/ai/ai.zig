@@ -2,9 +2,27 @@ pub const Tool = @import("skill.zig").Tool;
 pub const Param = @import("skill.zig").Param;
 pub const SkillContext = @import("skill.zig").SkillContext;
 pub const SkillRegistry = @import("skill.zig").SkillRegistry;
+pub const DispatchOpts = @import("skill.zig").DispatchOpts;
 
 pub const AiProvider = @import("provider.zig").AiProvider;
+pub const Agent = @import("agent.zig").Agent;
+pub const AgentResult = @import("agent.zig").AgentResult;
+pub const AgentHooks = @import("agent.zig").AgentHooks;
+pub const AgentMetrics = @import("agent.zig").AgentMetrics;
+pub const ToolApproval = @import("agent.zig").ToolApproval;
+
 pub const MemoryStore = @import("memory.zig").MemoryStore;
 pub const MemoryEntry = @import("memory.zig").MemoryEntry;
+
+pub const AgentAuditLog = @import("audit.zig").AgentAuditLog;
+pub const AuditEvent = @import("audit.zig").AuditEvent;
+pub const AuditKind = @import("audit.zig").AuditKind;
+
+pub const Retriever = @import("retriever.zig").Retriever;
+pub const RetrievedChunk = @import("retriever.zig").RetrievedChunk;
+pub const KeywordRetriever = @import("retriever.zig").KeywordRetriever;
+
+pub const TokenQuota = @import("quota.zig").TokenQuota;
+
 pub const estimateTokens = @import("tokenizer.zig").estimateTokens;
 pub const estimateMessages = @import("tokenizer.zig").estimateMessages;

@@ -28,7 +28,7 @@ AUTH="Authorization: Bearer ${TOKEN}"
 
 echo "integration: build tenant-mgmt"
 cd "$ROOT/examples/tenant-mgmt"
-zig build -Doptimize=ReleaseSafe
+zig build -Doptimize=ReleaseSafe -Ddb=sqlite
 BIN="$ROOT/examples/tenant-mgmt/zig-out/bin/tenant-mgmt"
 
 echo "integration: start tenant-mgmt on :${PORT}"
@@ -69,7 +69,7 @@ SHOP_BASE="http://127.0.0.1:${SHOP_PORT}"
 
 echo "integration: build shopdemo"
 cd "$ROOT/examples/shopdemo"
-zig build -Doptimize=ReleaseSafe
+zig build -Doptimize=ReleaseSafe -Ddb=sqlite
 SHOP_BIN="$ROOT/examples/shopdemo/zig-out/bin/shopdemo"
 
 echo "integration: start shopdemo on :${SHOP_PORT}"

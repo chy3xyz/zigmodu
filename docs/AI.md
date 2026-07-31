@@ -1,9 +1,59 @@
 # AI Chat Module — 使用指南
 
-> 本文档描述 **LLM 对话产品模块**（`zmodu scaffold --with-aichat`），不是 AI coding agent 指南。  
-> Agent 写 ZigModu 应用代码请读：[AGENTS.md](../AGENTS.md)。
+> 本文档描述 **LLM 对话 / Agent 产品能力**（`zmodu scaffold --with-aichat` / `--with-agent`）。  
+> 写 ZigModu 框架代码的 coding agent 请读：[AGENTS.md](../AGENTS.md)。  
+> `zmodu mcp` 是 **codegen** MCP 服务端，与运行时 `SkillRegistry` 正交。
 
-基于 zigmodu.ai 框架的 LLM 对话模块。支持多轮对话、跨会话记忆、SSE 流式输出、DeepSeek V4 缓存优化。
+## 核心 API（zigmodu.ai）
+
+| 类型 | 作用 |
+|------|------|
+| `AiProvider` | OpenAI 兼容 chat；`chatWith(..., .{ .tools_json })`；解析 `tool_calls`；`chatStream`（`requestStream` + SSE `data:`；失败则缓冲回退） |
+| `SkillRegistry` | 注册 Zig skill；`dispatch` / `dispatchAllowed` / `dispatchWith`（白名单 + 协作超时）；`toOpenAiFunctionsAlloc` |
+| `Agent` | ReAct：`provider` + `registry` → `run`；`hooks`（含 `on_tool_request` 人机门）/ `metrics` / `audit` / `retriever` / `quota`；`tool_timeout_ms` |
+| `MemoryStore` | 进程内记忆（复合键）；`dumpJson`/`loadJson`；`saveToFile`/`loadFromFile` |
+| `AgentAuditLog` | 工具调用 / run 生命周期环形审计 |
+| `Retriever` | RAG 可选接口；自带 `KeywordRetriever` 演示（非向量库） |
+| `TokenQuota` | 租户 token 配额骨架（`tryConsume` / `record` / Prometheus） |
+
+```zig
+var registry = zigmodu.ai.SkillRegistry.init(allocator, io);
+defer registry.deinit();
+try registry.register(.{ .name = "ping", .description = "pong", .parameters = &.{}, .handler = ping });
+
+var agent = zigmodu.ai.Agent{
+    .provider = &provider,
+    .registry = &registry,
+    .allowlist = &.{"ping"}, // 安全：只允许列出的工具
+    .tool_timeout_ms = 5_000, // 协作式超时（handler 应 checkDeadline）
+};
+var skill_ctx = zigmodu.ai.SkillContext{ .allocator = allocator };
+var result = try agent.run(allocator, "ping the system", &skill_ctx, 5);
+defer result.deinit(allocator);
+```
+
+**刻意不做**：默认任意 shell / 外部 MCP client。需要时自行 `register` 受控 handler。
+
+## 能力状态
+
+| 已落地 | 说明 |
+|--------|------|
+| Tool calling + ReAct `Agent` | `chatWith` / `tool_calls` ↔ `SkillRegistry` |
+| 协作式 skill 超时 | `Tool.timeout_ms` / `Agent.tool_timeout_ms` + `checkDeadline` |
+| `chatStream` SSE | `HttpClient.requestStream` + `data:` delta；流式 `tool_calls` 累积；失败缓冲回退 |
+| Memory 复合键 + 落盘 | `saveToFile` / `loadFromFile` |
+| HttpClient 出站 | `http://` 池化；`https://` 经 `std.http.Client`（系统 CA + TLS 1.3；HTTPS `requestStream` 真增量读循环） |
+| Prometheus 指标 | `AiProvider.Metrics` / `AgentMetrics` / `TokenQuota.toPrometheusFormat` |
+| 审计 | `Agent.audit = *AgentAuditLog`；scaffold Agent 写入 `ai_agent_run` |
+| 人机确认门 | `hooks.on_tool_request` → `ToolApproval.allow/deny` |
+| Retriever 注入 | `Agent.retriever` 在 run 时把检索结果并入 system prompt |
+| Token 配额 | `TokenQuota` 按 tenant 记用量；`Agent.quota` / chat scaffold `setQuota` |
+
+| 明确推迟 | 说明 |
+|----------|------|
+| 默认 shell / MCP client | 安全边界；自行注册受控 skill |
+| 抢占式 skill 超时 | 当前为协作 + 返回后检查，非取消 in-flight handler |
+| 向量库 / embedding | 通过 `Retriever` 自接；框架不内置 |
 
 ## 生成项目
 
@@ -26,8 +76,10 @@ src/modules/ai/chat/
 
 ## 初始化 Provider
 
+> `HttpClient` 支持 `https://`（`std.http.Client` + 系统 CA）。生产可直连 DeepSeek/OpenAI；也仍可用本地 TLS 终止代理。
+
 ```zig
-// 创建 HTTP 客户端（连接池复用，高并发友好）
+// 创建 HTTP 客户端（连接池复用；HTTPS 走 std TLS，不进明文池）
 var http_client = zigmodu.http.HttpClient.init(allocator, io, 10, 30000);
 defer http_client.deinit();
 
@@ -44,9 +96,12 @@ defer ai_provider.deinit();
 // 可选：开启限流（每秒 N 次请求）
 try ai_provider.enableRateLimit(io, 60);
 
-// 注入 service
-ai_chat_svc.setProvider(ai_provider);
+// 注入 service（指针；与 Agent 一致）
+ai_chat_svc.setProvider(&ai_provider);
 ai_chat_svc.setSystemPrompt("你是一个有用的助手");
+// 可选：租户配额
+// var quota = zigmodu.ai.TokenQuota.init(allocator, io, 1_000_000);
+// ai_chat_svc.setQuota(&quota);
 ```
 
 ## 完整 main.zig 示例
@@ -75,7 +130,7 @@ pub fn main() !void {
     );
     defer ai_provider.deinit();
     try ai_provider.enableRateLimit(std.testing.io, 60);
-    ai_chat_svc.setProvider(ai_provider);
+    ai_chat_svc.setProvider(&ai_provider);
     ai_chat_svc.setSystemPrompt("你是一个有用的助手");
 
     // Memory（可选）
@@ -151,11 +206,60 @@ for (recalled.items) |e| {
 const ctx = try memory.formatContext(allocator, "user:pref", tenant_id, user_id, 10);
 defer allocator.free(ctx);
 
-// 删除
-memory.forget("user:pref:lang");
+// 删除（须带 tenant/user，与 remember 同作用域）
+memory.forget("user:pref:lang", tenant_id, user_id);
+
+// 快照持久化（应用侧写文件）
+const snap = try memory.dumpJson(allocator);
+defer allocator.free(snap);
+try memory.loadJson(snap);
+
+// 或落盘（cwd 相对路径）
+try memory.saveToFile("memory.json");
+try memory.loadFromFile("memory.json");
 
 // 容量控制（默认 10000 条，LRU 淘汰）
 memory.max_entries = 50000;
+```
+
+## Agent 观测
+
+```zig
+var agent = zigmodu.ai.Agent{
+    .provider = &provider,
+    .registry = &registry,
+    .allowlist = &.{"ping"},
+    .hooks = .{
+        .on_tool = struct {
+            fn f(_: ?*anyopaque, name: []const u8, ok: bool) void {
+                std.log.info("tool {s} ok={}", .{ name, ok });
+            }
+        }.f,
+    },
+};
+// agent.metrics.runs / steps / tool_calls / tool_errors / max_steps_hits
+const prom = try agent.metrics.toPrometheusFormat(allocator, "ops");
+defer allocator.free(prom);
+
+// 审计
+var audit = try zigmodu.ai.AgentAuditLog.init(allocator, io, 256);
+defer audit.deinit();
+agent.audit = &audit;
+
+// 人机 / 策略门：拒绝危险工具
+agent.hooks.on_tool_request = struct {
+    fn f(_: ?*anyopaque, name: []const u8, _: []const u8) zigmodu.ai.ToolApproval {
+        if (std.mem.eql(u8, name, "delete_all")) return .deny;
+        return .allow;
+    }
+}.f;
+
+// RAG（可选）
+var kr = zigmodu.ai.KeywordRetriever.init(allocator);
+defer kr.deinit();
+try kr.add("pol", "Refunds within 14 days", "policy");
+const chunks = try kr.asRetriever().retrieve(allocator, "refund", 3);
+defer kr.asRetriever().free(allocator, chunks);
 ```
 
 ## 流式 vs 非流式

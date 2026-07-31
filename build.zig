@@ -1,120 +1,21 @@
 const std = @import("std");
-
-const CLibPaths = struct {
-    include: ?[]const u8 = null,
-    lib: ?[]const u8 = null,
-};
-
-fn detectPqPaths(b: *std.Build, allocator: std.mem.Allocator) CLibPaths {
-    if (b.graph.environ_map.get("PQ_INCLUDE")) |inc| {
-        return .{ .include = b.dupe(inc), .lib = b.graph.environ_map.get("PQ_LIB") };
-    }
-    const host_target = b.graph.host.result;
-    if (host_target.os.tag == .macos) {
-        if (dirExists(b, "/opt/homebrew/opt/libpq")) {
-            return .{
-                .include = "/opt/homebrew/opt/libpq/include",
-                .lib = "/opt/homebrew/opt/libpq/lib",
-            };
-        }
-        if (dirExists(b, "/usr/local/opt/libpq")) {
-            return .{
-                .include = "/usr/local/opt/libpq/include",
-                .lib = "/usr/local/opt/libpq/lib",
-            };
-        }
-    } else if (host_target.os.tag == .linux) {
-        const lib_dir = if (host_target.cpu.arch == .aarch64) "/usr/lib/aarch64-linux-gnu" else "/usr/lib/x86_64-linux-gnu";
-        const candidates = &[_][]const u8{
-            "/usr/include/postgresql",
-            "/usr/include/pgsql",
-            "/usr/pgsql/include",
-        };
-        for (candidates) |c| {
-            if (dirExists(b, c)) {
-                return .{ .include = c, .lib = lib_dir };
-            }
-        }
-    }
-    _ = allocator;
-    return .{};
-}
-
-fn detectMysqlPaths(b: *std.Build, allocator: std.mem.Allocator) CLibPaths {
-    if (b.graph.environ_map.get("MYSQL_INCLUDE")) |inc| {
-        return .{ .include = b.dupe(inc), .lib = b.graph.environ_map.get("MYSQL_LIB") };
-    }
-    const host_target = b.graph.host.result;
-    if (host_target.os.tag == .macos) {
-        const prefixes = &[_][]const u8{
-            "/opt/homebrew/opt/mariadb-connector-c",
-            "/usr/local/opt/mariadb-connector-c",
-            "/opt/homebrew/opt/mysql-client",
-            "/usr/local/opt/mysql-client",
-        };
-        for (prefixes) |prefix| {
-            if (dirExists(b, prefix)) {
-                return .{
-                    .include = b.fmt("{s}/include/mariadb", .{prefix}),
-                    .lib = b.fmt("{s}/lib", .{prefix}),
-                };
-            }
-        }
-    } else if (host_target.os.tag == .linux) {
-        const lib_dir = if (host_target.cpu.arch == .aarch64) "/usr/lib/aarch64-linux-gnu" else "/usr/lib/x86_64-linux-gnu";
-        const candidates = &[_][]const u8{
-            "/usr/include/mariadb",
-            "/usr/include/mysql",
-            "/usr/local/include/mariadb",
-        };
-        for (candidates) |c| {
-            if (dirExists(b, c)) {
-                return .{ .include = c, .lib = lib_dir };
-            }
-        }
-    }
-    _ = allocator;
-    return .{};
-}
-
-fn dirExists(b: *std.Build, path: []const u8) bool {
-    const io = b.graph.io;
-    const cwd = std.Io.Dir.cwd();
-    cwd.access(io, path, .{}) catch return false;
-    return true;
-}
-
-fn linkDbLibs(mod: *std.Build.Module, b: *std.Build) void {
-    const allocator = b.allocator;
-
-    const pq = detectPqPaths(b, allocator);
-    if (pq.include) |inc| {
-        mod.addSystemIncludePath(.{ .cwd_relative = inc });
-    }
-    if (pq.lib) |lib| {
-        mod.addLibraryPath(.{ .cwd_relative = lib });
-    }
-    mod.linkSystemLibrary("pq", .{});
-
-    const mysql = detectMysqlPaths(b, allocator);
-    if (mysql.include) |inc| {
-        mod.addSystemIncludePath(.{ .cwd_relative = inc });
-    }
-    if (mysql.lib) |lib| {
-        mod.addLibraryPath(.{ .cwd_relative = lib });
-    }
-    mod.linkSystemLibrary("mysqlclient", .{});
-
-    mod.linkSystemLibrary("sqlite3", .{});
-}
+const db_link = @import("examples/_shared/db_link.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const db_opt = b.option([]const u8, "db", "SQL drivers to link: all|sqlite|postgres|mysql (comma-list)") orelse "all";
+    // Framework `zig build test` expects `-Ddb=all` (default). Narrow `-Ddb=` skips linking
+    // but many unit tests still open SQLite `:memory:` and will fail without sqlite enabled.
+    const features = db_link.parseDb(db_opt) catch {
+        @panic("invalid -Ddb= value; use all|sqlite|postgres|mysql (comma-list ok)");
+    };
+
     // Build options for compile-time configuration
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "log_level", b.option([]const u8, "log-level", "Compile-time log level (debug/info/warn/err)") orelse "debug");
+    db_link.addToOptions(build_options, features);
     const build_options_mod = build_options.createModule();
 
     // Create and export the zigmodu module for dependent packages.
@@ -127,7 +28,7 @@ pub fn build(b: *std.Build) void {
     });
     zigmodu_mod.addImport("build_options", build_options_mod);
 
-    linkDbLibs(zigmodu_mod, b);
+    db_link.link(zigmodu_mod, b, features);
 
     // Create example executable
     const exe_mod = b.createModule(.{
@@ -161,7 +62,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     lib_test_mod.addImport("build_options", build_options_mod);
-    linkDbLibs(lib_test_mod, b);
+    db_link.link(lib_test_mod, b, features);
     const lib_tests = b.addTest(.{
         .root_module = lib_test_mod,
     });
@@ -180,36 +81,6 @@ pub fn build(b: *std.Build) void {
     });
     const run_log_level_tests = b.addRunArtifact(log_level_tests);
     test_step.dependOn(&run_log_level_tests.step);
-
-    // Build test arguments dynamically using detected library paths
-    var test_args = std.array_list.Managed([]const u8).init(b.allocator);
-    test_args.appendSlice(&.{
-        "zig",
-        "test",
-        "src/root.zig",
-        "-lpq",
-        "-lsqlite3",
-        "-lmysqlclient",
-    }) catch @panic("OOM");
-
-    const pq_test = detectPqPaths(b, b.allocator);
-    if (pq_test.include) |inc| {
-        test_args.append(b.fmt("-I{s}", .{inc})) catch @panic("OOM");
-    }
-    if (pq_test.lib) |lib| {
-        test_args.append(b.fmt("-L{s}", .{lib})) catch @panic("OOM");
-    }
-
-    const mysql_test = detectMysqlPaths(b, b.allocator);
-    if (mysql_test.include) |inc| {
-        test_args.append(b.fmt("-I{s}", .{inc})) catch @panic("OOM");
-    }
-    if (mysql_test.lib) |lib| {
-        test_args.append(b.fmt("-L{s}", .{lib})) catch @panic("OOM");
-    }
-
-    const zig_test_cmd = b.addSystemCommand(test_args.items);
-    test_step.dependOn(&zig_test_cmd.step);
 
     // Benchmark step
     const benchmark_mod = b.createModule(.{
@@ -300,4 +171,3 @@ pub fn build(b: *std.Build) void {
     const run_zmodu_tests = b.addRunArtifact(zmodu_tests);
     test_step.dependOn(&run_zmodu_tests.step);
 }
-

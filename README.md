@@ -129,6 +129,28 @@ const obs  = zmodu.observability; // Prometheus, Tracing, Logging
 
 Each domain file is self-contained — importing `zmodu.http` does not compile `sqlx` or `redis`.
 
+### Selective SQL driver linking
+
+Link only the database drivers you need (default remains `all` for compatibility):
+
+```zig
+// In your app's build.zig
+const zigmodu_dep = b.dependency("zigmodu", .{
+    .target = target,
+    .optimize = optimize,
+    .db = "sqlite", // or postgres | mysql | "sqlite,postgres" | all
+});
+```
+
+```bash
+# Framework / example builds
+zig build -Ddb=sqlite
+# Framework unit tests must keep all drivers enabled (default)
+zig build test
+```
+
+Disabled drivers compile to stubs; opening them at runtime returns `error.DriverNotEnabled` (HTTP → 400). Typical small apps on macOS arm64: `examples/basic` ReleaseSmall ~180KB stripped; SQLite-only vs all-drivers saves mainly shared-lib deps, not huge binary KB.
+
 ### Prerequisites
 
 ```bash
