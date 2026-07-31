@@ -806,27 +806,29 @@ test "HttpClient RetryPolicy calculateDelay" {
 test "HttpClient ConnectionPool acquire and release" {
     const allocator = std.testing.allocator;
     if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    // Real loopback listener so acquire() gets an actual connection.
+    const server_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try server_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = server.socket.address.getPort();
+
     var pool = HttpClient.ConnectionPool.init(allocator, std.testing.io, 2);
     defer pool.deinit();
 
-    // Acquire new connection
-    const conn = pool.acquire("127.0.0.1", 9999) catch |err| switch (err) {
-        error.ConnectionRefused => return error.SkipZigTest,
-        else => return err,
-    };
+    // Acquire new connection.
+    const conn = try pool.acquire("127.0.0.1", port);
     try std.testing.expectEqualStrings("127.0.0.1", conn.host);
-    try std.testing.expectEqual(@as(u16, 9999), conn.port);
+    try std.testing.expectEqual(port, conn.port);
 
-    // Release back to pool
+    // Release back to pool.
     pool.release(conn);
 
-    // Reacquire should reuse if alive
-    const conn2 = pool.acquire("127.0.0.1", 9999) catch |err| switch (err) {
-        error.ConnectionRefused => return error.SkipZigTest,
-        else => return err,
-    };
+    // Reacquire should reuse the idle connection.
+    const conn2 = try pool.acquire("127.0.0.1", port);
     try std.testing.expectEqualStrings("127.0.0.1", conn2.host);
-    try std.testing.expectEqual(@as(u16, 9999), conn2.port);
+    try std.testing.expectEqual(port, conn2.port);
+    try std.testing.expect(conn2.stream.?.socket.handle == conn.stream.?.socket.handle);
 
     pool.release(conn2);
 }
@@ -834,14 +836,17 @@ test "HttpClient ConnectionPool acquire and release" {
 test "HttpClient ConnectionPool exhaustion" {
     const allocator = std.testing.allocator;
     if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    const server_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try server_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = server.socket.address.getPort();
+
     var pool = HttpClient.ConnectionPool.init(allocator, std.testing.io, 1);
     defer pool.deinit();
 
-    const conn = pool.acquire("127.0.0.1", 9999) catch |err| switch (err) {
-        error.ConnectionRefused => return error.SkipZigTest,
-        else => return err,
-    };
-    const result = pool.acquire("127.0.0.1", 9999);
+    const conn = try pool.acquire("127.0.0.1", port);
+    const result = pool.acquire("127.0.0.1", port);
     try std.testing.expectError(error.PoolExhausted, result);
 
     pool.release(conn);

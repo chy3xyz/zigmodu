@@ -201,13 +201,14 @@ pub const DistributedEventBus = struct {
         while (self.is_running) {
             const ma = msg_arena.allocator();
 
-            // Fast read: directly into buffer
-            const data = r.interface.readSliceShort(&read_buf) catch |err| {
+            // Fast read: directly into buffer (readSliceShort returns byte count).
+            const n = r.interface.readSliceShort(&read_buf) catch |err| {
                 if (self.is_running) std.log.debug("[DEB] Read error: {}", .{err});
                 break;
             };
 
-            if (data.len == 0) break;
+            if (n == 0) break;
+            const data = read_buf[0..n];
 
             // Parse using our arena to avoid multiple tiny heap allocations
             if (parseEvent(ma, data)) |event| {

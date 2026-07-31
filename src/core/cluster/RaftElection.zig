@@ -814,16 +814,16 @@ const TestCluster = struct {
                         entries[entries.len - 1].index
                     else
                         prev_idx;
-                    leader.election.next_index.put(peer_id, matched + 1) catch {};
-                    leader.election.match_index.put(peer_id, matched) catch {};
+                    leader.election.next_index.put(peer_id, matched + 1) catch |err| std.log.err("[RaftElection] test next_index update failed: {}", .{err});
+                    leader.election.match_index.put(peer_id, matched) catch |err| std.log.err("[RaftElection] test match_index update failed: {}", .{err});
                     break;
                 } else {
                     // Decrement next_index and retry
                     if (next > 1) {
-                        leader.election.next_index.put(peer_id, next - 1) catch {};
+                        leader.election.next_index.put(peer_id, next - 1) catch |err| std.log.err("[RaftElection] test next_index backtrack failed: {}", .{err});
                     }
                     if (resp.match_index > 0) {
-                        leader.election.next_index.put(peer_id, @min(next - 1, resp.match_index + 1)) catch {};
+                        leader.election.next_index.put(peer_id, @min(next - 1, resp.match_index + 1)) catch |err| std.log.err("[RaftElection] test next_index hint update failed: {}", .{err});
                     }
                 }
             }
@@ -847,8 +847,8 @@ const TestCluster = struct {
         leader.election.match_index.clearRetainingCapacity();
         for (self.nodes.items, 0..) |node, node_idx| {
             if (node_idx == leader_idx) continue;
-            leader.election.next_index.put(node.election.local_id, last_idx + 1) catch {};
-            leader.election.match_index.put(node.election.local_id, 0) catch {};
+            leader.election.next_index.put(node.election.local_id, last_idx + 1) catch |err| std.log.err("[RaftElection] test next_index reset failed: {}", .{err});
+            leader.election.match_index.put(node.election.local_id, 0) catch |err| std.log.err("[RaftElection] test match_index reset failed: {}", .{err});
         }
 
         // Notify followers (they receive heartbeat)

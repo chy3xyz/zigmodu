@@ -88,11 +88,11 @@ fn testModuleLifecycle(allocator: std.mem.Allocator) !void {
     std.log.info("Test 1: Module Lifecycle", .{});
 
     // 使用 ModuleTestContext 测试模块
-    var ctx = try zigmodu.extensions.ModuleTestContext.init(allocator, "calculator");
+    var ctx = try zigmodu.ModuleTestContext.init(allocator, "calculator");
     defer ctx.deinit();
 
     // 注册模块
-    const mock = zigmodu.extensions.createMockModule(
+    const mock = zigmodu.createMockModule(
         "calculator",
         "Calculator for testing",
         &.{},
@@ -161,11 +161,11 @@ fn testCalculatorOperations(io: std.Io, allocator: std.mem.Allocator) !void {
 fn testWithMockModule(_: std.Io, allocator: std.mem.Allocator) !void {
     std.log.info("Test 3: Mock Module", .{});
 
-    var ctx = try zigmodu.extensions.ModuleTestContext.init(allocator, "mock_test");
+    var ctx = try zigmodu.ModuleTestContext.init(allocator, "mock_test");
     defer ctx.deinit();
 
     // 创建 mock 模块
-    const mock_calc = zigmodu.extensions.createMockModule(
+    const mock_calc = zigmodu.createMockModule(
         "mock_calculator",
         "Mock calculator for testing",
         &.{},

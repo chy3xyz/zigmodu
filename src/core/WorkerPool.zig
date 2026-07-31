@@ -77,7 +77,7 @@ pub const WorkerPool = struct {
             try buf.print("# TYPE zigmodu_workerpool_utilization gauge\n", .{});
             try buf.print("zigmodu_workerpool_utilization{{pool=\"{s}\"}} {d:.3}\n", .{ pool_name, self.utilization_pct });
 
-            return buf.toOwnedSlice() catch unreachable;
+            return buf.toOwnedSlice();
         }
     };
 

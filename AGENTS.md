@@ -284,7 +284,7 @@ bash scripts/ci-integration.sh   # tenant-mgmt + stress + shopdemo（-Ddb=sqlite
 
 ## Version
 - Framework: **v0.14.17** (`build.zig.zon`)
-- Zig: **0.17.0**
+- Zig: **0.17.0-dev.1422+e863bf3be**（CI 同款锁定版本，见 `.github/workflows/ci.yml` → `ZIG_VERSION`；避免 fmt 行为漂移）
 - Tests: **745+ passed**, 20 skipped（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`）
 - Score: ~98/100（`docs/EVALUATION_REPORT.md` v5.6）
 - Roadmap: `docs/PRODUCTION_ROADMAP.md`（phases 1–9 ✅）

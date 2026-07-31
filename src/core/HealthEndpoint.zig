@@ -81,7 +81,7 @@ pub const HealthEndpoint = struct {
                 .details = check.description,
             };
 
-            components.put(check.name, health) catch {};
+            components.put(check.name, health) catch |err| std.log.warn("[HealthEndpoint] component put failed: {}", .{err});
 
             // If any component is unhealthy[...]DOWN
             if (status != .UP) {

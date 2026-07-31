@@ -151,9 +151,9 @@ Disabled drivers → C stubs; runtime `error.DriverNotEnabled` (HTTP 400). Full 
 ### Prerequisites
 
 ```bash
-# Install Zig 0.17.0
+# Install the pinned Zig toolchain (CI uses the exact same dev build)
+# zigup 0.17.0-dev.1422+e863bf3be   (see .github/workflows/ci.yml → ZIG_VERSION)
 brew install zig          # macOS (or zigup / mlugg/setup-zig in CI)
-# CI pin: 0.17.0 — see .github/workflows/ci.yml
 ```
 
 ### Create Your First Module
@@ -342,6 +342,12 @@ ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test
 
 # API import gate (examples must use zmodu.http)
 zig build check-api
+
+# Production hot-path gate (no bare catch {} in hot modules)
+zig build check
+
+# Formatting gate (src + tools + examples)
+zig fmt --check src tools examples
 
 # Integration probes (tenant-mgmt + stress test; needs curl)
 HTTP_PORT=18080 bash scripts/ci-integration.sh

@@ -27,7 +27,7 @@ pub const ApplicationView = struct {
     }
 
     pub fn setState(self: *Self, name: []const u8, state: ModuleState) void {
-        self.module_states.put(name, state) catch {};
+        self.module_states.put(name, state) catch |err| std.log.warn("[ApplicationView] module state put failed: {}", .{err});
     }
 
     pub fn getState(self: *Self, name: []const u8) ?ModuleState {

@@ -197,6 +197,8 @@ pub const BenchmarkSuite = @import("test/Benchmark.zig").BenchmarkSuite;
 pub const ContractTestRunner = @import("test/ContractTest.zig").ContractTestRunner;
 pub const Contract = @import("test/ContractTest.zig").Contract;
 pub const ContractVerificationResult = @import("test/ContractTest.zig").ContractVerificationResult;
+pub const ModuleTestContext = @import("test/ModuleTest.zig").ModuleTestContext;
+pub const createMockModule = @import("test/ModuleTest.zig").createMockModule;
 
 // ============================================================
 // ============================================================

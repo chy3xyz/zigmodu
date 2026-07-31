@@ -20,7 +20,7 @@ fn ListenerSet(comptime CallbackType: type) type {
 
         pub fn init(allocator: std.mem.Allocator) Self {
             var list = std.ArrayList(CallbackType).empty;
-            list.ensureTotalCapacity(allocator, 4) catch {};
+            list.ensureTotalCapacity(allocator, 4) catch |err| std.log.warn("[EventBus] listener capacity prealloc failed: {}", .{err});
             return .{
                 .list = list,
                 .allocator = allocator,
@@ -95,7 +95,7 @@ pub fn EventBus(comptime EventType: type) type {
         /// HashMap storage so runtime subscribe() is infallible.
         pub fn initCapacity(alloc: std.mem.Allocator, capacity: usize) Self {
             var listeners = std.AutoHashMap(EventType, ListenerSet(CallbackType)).init(alloc);
-            listeners.ensureTotalCapacity(@intCast(capacity)) catch {};
+            listeners.ensureTotalCapacity(@intCast(capacity)) catch |err| std.log.warn("[EventBus] listeners capacity prealloc failed: {}", .{err});
             return .{
                 .allocator = alloc,
                 .listeners = listeners,

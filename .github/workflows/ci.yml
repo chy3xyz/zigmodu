@@ -14,7 +14,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  ZIG_VERSION: "0.17.0"
+  # Pin the exact toolchain used for local development so fmt/build behavior
+  # is reproducible in CI (dev builds are also fetchable by mlugg/setup-zig).
+  ZIG_VERSION: "0.17.0-dev.1422+e863bf3be"
 
 jobs:
   # ── Build & Test Matrix ────────────────────────
@@ -60,7 +62,7 @@ jobs:
           brew install libpq mariadb-connector-c sqlite3 || true
 
       - name: Check formatting
-        run: zig fmt --check src/
+        run: zig fmt --check src tools examples
 
       - name: Build library
         run: zig build
@@ -73,6 +75,14 @@ jobs:
 
       - name: Production hot-path gate
         run: zig build check
+
+      - name: Build framework examples
+        run: |
+          set -euo pipefail
+          for ex in basic distributed event-driven http-stress-test shopdemo tenant-mgmt tenant-shop testing; do
+            echo "== building examples/$ex =="
+            (cd "examples/$ex" && zig build)
+          done
 
       - name: Upload test logs
         if: failure()
@@ -97,7 +107,35 @@ jobs:
         run: sudo apt-get install -y libpq-dev libmariadb-dev libsqlite3-dev
 
       - name: Zig fmt check
-        run: zig fmt --check src/
+        run: zig fmt --check src tools examples
+
+  examples:
+    name: Build Examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout zent (zent-modulith sibling dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: chy3xyz/zent
+          path: ../zent
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev libmariadb-dev libsqlite3-dev
+
+      - name: Build all examples
+        run: |
+          set -euo pipefail
+          for ex in basic distributed event-driven http-stress-test shopdemo tenant-mgmt tenant-shop testing zent-modulith; do
+            echo "== building examples/$ex =="
+            (cd "examples/$ex" && zig build)
+          done
 
   # ── Integration (full) ─────────────────────────
   integration-full:
@@ -192,9 +230,10 @@ jobs:
           MYSQL_DATABASE: zigzero_test
         run: zig build test
 
-  # Runs the env-gated live-service tests (redis client, Redis rate limiter, NATS).
+  # Runs the env-gated live-service tests (redis client, Redis rate limiter,
+  # NATS, Kafka).
   test-live-services:
-    name: Test (Redis + NATS live)
+    name: Test (Redis + NATS + Kafka live)
     runs-on: ubuntu-latest
     needs: [build-and-test]
     services:
@@ -211,6 +250,18 @@ jobs:
         image: nats:2
         ports:
           - 4222:4222
+      kafka:
+        image: apache/kafka:3.7.2
+        ports:
+          - 9092:9092
+        env:
+          KAFKA_NODE_ID: 1
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://127.0.0.1:9092
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@127.0.0.1:9093
     steps:
       - uses: actions/checkout@v4
 
@@ -226,6 +277,7 @@ jobs:
         env:
           REDIS_URL: redis://127.0.0.1:6379
           NATS_URL: nats://127.0.0.1:4222
+          KAFKA_BOOTSTRAP: 127.0.0.1:9092
         run: zig build test
 
   # ── Benchmark ──────────────────────────────────
