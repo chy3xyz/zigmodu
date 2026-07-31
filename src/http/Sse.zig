@@ -1,6 +1,88 @@
 //! Server-Sent Events writer — RFC-compliant SSE streaming with heartbeat support.
+//!
+//! Lifecycle: `init` / `http.sse(ctx)` sets `ctx.responded` **and** `ctx.streaming`
+//! so `Server` skips the buffered `writeResponse` after the handler returns
+//! (same contract as `Context.startChunked`).
 
 const std = @import("std");
+
+/// Read `Last-Event-ID` from the request (EventSource reconnect). Header keys are lowercase.
+pub fn lastEventId(ctx: anytype) ?[]const u8 {
+    if (@hasDecl(@TypeOf(ctx.*), "header")) {
+        return ctx.header("last-event-id");
+    }
+    return ctx.headers.get("last-event-id");
+}
+
+/// Write SSE `data:` lines, splitting on `\n` (and stripping trailing `\r`).
+fn writeDataField(w: anytype, data: []const u8) !void {
+    if (data.len == 0) {
+        try w.interface.writeAll("data: \n");
+        return;
+    }
+    var start: usize = 0;
+    while (start <= data.len) {
+        const rest = data[start..];
+        if (rest.len == 0) break;
+        const nl = std.mem.indexOfScalar(u8, rest, '\n');
+        const line_raw = if (nl) |n| rest[0..n] else rest;
+        const line = if (line_raw.len > 0 and line_raw[line_raw.len - 1] == '\r')
+            line_raw[0 .. line_raw.len - 1]
+        else
+            line_raw;
+        try w.interface.writeAll("data: ");
+        try w.interface.writeAll(line);
+        try w.interface.writeAll("\n");
+        if (nl) |n| {
+            start += n + 1;
+            if (start == data.len) {
+                // Trailing newline → empty data line per common SSE usage
+                try w.interface.writeAll("data: \n");
+                break;
+            }
+        } else break;
+    }
+}
+
+fn appendDataField(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), data: []const u8) !void {
+    if (data.len == 0) {
+        try buf.appendSlice(allocator, "data: \n");
+        return;
+    }
+    var start: usize = 0;
+    while (start <= data.len) {
+        const rest = data[start..];
+        if (rest.len == 0) break;
+        const nl = std.mem.indexOfScalar(u8, rest, '\n');
+        const line_raw = if (nl) |n| rest[0..n] else rest;
+        const line = if (line_raw.len > 0 and line_raw[line_raw.len - 1] == '\r')
+            line_raw[0 .. line_raw.len - 1]
+        else
+            line_raw;
+        try buf.appendSlice(allocator, "data: ");
+        try buf.appendSlice(allocator, line);
+        try buf.appendSlice(allocator, "\n");
+        if (nl) |n| {
+            start += n + 1;
+            if (start == data.len) {
+                try buf.appendSlice(allocator, "data: \n");
+                break;
+            }
+        } else break;
+    }
+}
+
+/// Apply SSE response headers and streaming flags (no socket I/O).
+/// `Server` skips buffered `writeResponse` when `responded && streaming`.
+pub fn markSseResponse(ctx: anytype) !void {
+    ctx.status_code = 200;
+    try ctx.setHeader("Content-Type", "text/event-stream");
+    try ctx.setHeader("Cache-Control", "no-cache");
+    try ctx.setHeader("Connection", "keep-alive");
+    try ctx.setHeader("X-Accel-Buffering", "no"); // nginx
+    ctx.responded = true;
+    ctx.streaming = true;
+}
 
 /// Server-Sent Events writer.
 ///
@@ -8,7 +90,7 @@ const std = @import("std");
 /// Clients connect with EventSource API and auto-reconnect on disconnect.
 ///
 /// Usage:
-///   var sse = try zigmodu.http.SseWriter.init(ctx);
+///   var sse = try zigmodu.http.sse(ctx);
 ///   try sse.sendEvent("message", "hello");
 ///   try sse.sendEvent("update", json_data);
 ///   try sse.done();
@@ -23,14 +105,7 @@ pub const SseWriter = struct {
         const stream = ctx.stream orelse return error.NoStream;
         const io = ctx.io orelse return error.NoIo;
 
-        ctx.status_code = 200;
-        ctx.setHeader("Content-Type", "text/event-stream") catch {};
-        ctx.setHeader("Cache-Control", "no-cache") catch {};
-        ctx.setHeader("Connection", "keep-alive") catch {};
-        ctx.setHeader("X-Accel-Buffering", "no") catch {}; // nginx
-        ctx.responded = true;
-
-        // Flush headers to socket immediately
+        try markSseResponse(ctx);
         try flushHeaders(ctx, stream, io);
 
         return SseWriter{
@@ -45,7 +120,7 @@ pub const SseWriter = struct {
         return self.sendEvent(event, data);
     }
 
-    /// Send a named event with data.
+    /// Send a named event with data (multi-line `data` split into multiple `data:` lines).
     pub fn sendEvent(self: *SseWriter, event: []const u8, data: []const u8) !void {
         var buf: [4096]u8 = undefined;
         var w = self.stream.writer(self.io, &buf);
@@ -57,9 +132,9 @@ pub const SseWriter = struct {
         }
         try w.interface.writeAll("event: ");
         try w.interface.writeAll(event);
-        try w.interface.writeAll("\ndata: ");
-        try w.interface.writeAll(data);
-        try w.interface.writeAll("\n\n");
+        try w.interface.writeAll("\n");
+        try writeDataField(&w, data);
+        try w.interface.writeAll("\n");
         try w.interface.flush();
 
         self.event_count += 1;
@@ -75,9 +150,8 @@ pub const SseWriter = struct {
             try w.interface.writeAll(id);
             try w.interface.writeAll("\n");
         }
-        try w.interface.writeAll("data: ");
-        try w.interface.writeAll(data);
-        try w.interface.writeAll("\n\n");
+        try writeDataField(&w, data);
+        try w.interface.writeAll("\n");
         try w.interface.flush();
 
         self.event_count += 1;
@@ -108,16 +182,17 @@ pub const SseWriter = struct {
     }
 
     /// Set the event ID for reconnection. Subsequent events will include this ID.
-    /// Clients send `Last-Event-ID` header on reconnect.
+    /// Clients send `Last-Event-ID` header on reconnect — see `lastEventId(ctx)`.
     pub fn setId(self: *SseWriter, id: []const u8) void {
         self.last_id = id;
     }
 
     /// Send a retry directive (milliseconds). Client waits this long before reconnecting.
     pub fn sendRetry(self: *SseWriter, ms: u64) !void {
-        var buf: [128]u8 = undefined;
-        var w = self.stream.writer(self.io, &buf);
-        const retry_line = try std.fmt.bufPrint(&buf, "retry: {d}\n\n", .{ms});
+        var write_buf: [64]u8 = undefined;
+        var line_buf: [64]u8 = undefined;
+        var w = self.stream.writer(self.io, &write_buf);
+        const retry_line = try std.fmt.bufPrint(&line_buf, "retry: {d}\n\n", .{ms});
         try w.interface.writeAll(retry_line);
         try w.interface.flush();
     }
@@ -200,16 +275,15 @@ pub const SseRecorder = struct {
         }
         try self.buf.appendSlice(self.allocator, "event: ");
         try self.buf.appendSlice(self.allocator, event);
-        try self.buf.appendSlice(self.allocator, "\ndata: ");
-        try self.buf.appendSlice(self.allocator, data);
-        try self.buf.appendSlice(self.allocator, "\n\n");
+        try self.buf.appendSlice(self.allocator, "\n");
+        try appendDataField(self.allocator, &self.buf, data);
+        try self.buf.appendSlice(self.allocator, "\n");
         self.event_count += 1;
     }
 
     pub fn sendData(self: *SseRecorder, data: []const u8) !void {
-        try self.buf.appendSlice(self.allocator, "data: ");
-        try self.buf.appendSlice(self.allocator, data);
-        try self.buf.appendSlice(self.allocator, "\n\n");
+        try appendDataField(self.allocator, &self.buf, data);
+        try self.buf.appendSlice(self.allocator, "\n");
         self.event_count += 1;
     }
 
@@ -221,27 +295,6 @@ pub const SseRecorder = struct {
         try self.buf.appendSlice(self.allocator, ": ping\n");
     }
 };
-
-test "SseWriter sendEvent" {
-    // Unit test: validates SSE formatting
-    const allocator = std.testing.allocator;
-
-    var buf = std.ArrayList(u8).empty;
-    defer buf.deinit(allocator);
-
-    // Build a minimal SSE event manually to verify format
-    const event = "message";
-    const data = "hello world";
-    const expected = "event: message\ndata: hello world\n\n";
-
-    try buf.appendSlice(allocator, "event: ");
-    try buf.appendSlice(allocator, event);
-    try buf.appendSlice(allocator, "\ndata: ");
-    try buf.appendSlice(allocator, data);
-    try buf.appendSlice(allocator, "\n\n");
-
-    try std.testing.expectEqualStrings(expected, buf.items);
-}
 
 test "SseRecorder matches wire format" {
     const allocator = std.testing.allocator;
@@ -256,6 +309,15 @@ test "SseRecorder matches wire format" {
     try std.testing.expect(std.mem.indexOf(u8, rec.bytes(), "id: 7\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, rec.bytes(), "event: message\ndata: {\"ok\":true}\n\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, rec.bytes(), "event: done\ndata: [DONE]\n\n") != null);
+}
+
+test "SseRecorder splits multiline data" {
+    const allocator = std.testing.allocator;
+    var rec = SseRecorder.init(allocator);
+    defer rec.deinit();
+
+    try rec.sendEvent("update", "line1\nline2");
+    try std.testing.expectEqualStrings("event: update\ndata: line1\ndata: line2\n\n", rec.bytes());
 }
 
 test "SseWriter sendMultiLine format" {
@@ -282,24 +344,29 @@ test "SseWriter sendMultiLine format" {
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "data: {\"b\":2}") != null);
 }
 
-test "SseWriter retry format" {
+test "lastEventId reads lowercase header" {
+    const Context = @import("../api/Server.zig").Context;
     const allocator = std.testing.allocator;
+    var ctx = try Context.init(allocator, .GET, "events");
+    defer ctx.deinit();
 
-    var buf = std.ArrayList(u8).empty;
-    defer buf.deinit(allocator);
+    const k = try allocator.dupe(u8, "last-event-id");
+    const v = try allocator.dupe(u8, "42");
+    try ctx.headers.put(k, v);
 
-    try buf.appendSlice(allocator, "retry: 3000\n\n");
-
-    try std.testing.expectEqualStrings("retry: 3000\n\n", buf.items);
+    try std.testing.expectEqualStrings("42", lastEventId(&ctx).?);
 }
 
-test "SseWriter comment format" {
+test "markSseResponse sets streaming so Server skips buffered rewrite" {
+    const Context = @import("../api/Server.zig").Context;
     const allocator = std.testing.allocator;
+    var ctx = try Context.init(allocator, .GET, "events");
+    defer ctx.deinit();
 
-    var buf = std.ArrayList(u8).empty;
-    defer buf.deinit(allocator);
-
-    try buf.appendSlice(allocator, ": ping\n");
-
-    try std.testing.expectEqualStrings(": ping\n", buf.items);
+    try markSseResponse(&ctx);
+    try std.testing.expect(ctx.responded);
+    try std.testing.expect(ctx.streaming);
+    // Same predicate Server uses before writeResponse:
+    try std.testing.expect(!(ctx.responded and !ctx.streaming));
+    try std.testing.expectEqualStrings("text/event-stream", ctx.response_headers.get("Content-Type").?);
 }

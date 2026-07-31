@@ -118,7 +118,7 @@ const now_ms = Time.monotonicNowMilliseconds();
 - **Errors**: `respondErr` + optional `setErrorMap`（RFC 7807）
 - **Scope MW**: `RouteGroup.use` / `Scoped.use` before mount
 - **Testkit**: `dispatch` / `signBearerToken` / `openMemorySqlite` / `SseRecorder`
-- **SSE**: `http.sse(ctx)` + `SseSpec` / `sse_routes`
+- **SSE**: `http.sse(ctx)`（设 `streaming`）+ `SseSpec`/`sse_routes` + `lastEventId`
 - **Profiles**: `applyHttpDefaults` + `applyResilienceDefaults`
 - **OpenAPI**: `openApiParamsFromStruct` + `RouteMeta.openapi_params`
 - **Outbox**: `zigmodu.outbox.*`；幂等 `idempotencyMiddleware`（header `idempotency-key`）

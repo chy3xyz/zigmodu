@@ -266,12 +266,13 @@ WS：`pub const ws_routes = [_]http.WsSpec(State){ .{ .path = "ws", .on_connect 
 
 ### SSE（Server-Sent Events）
 
-- 客户端：`Accept: text/event-stream`
-- Handler：`var sse = try http.sse(ctx);` 然后 `sendEvent` / `done`
+- 客户端：`Accept: text/event-stream`（约定；路由不强制校验）
+- Handler：`var sse = try http.sse(ctx);` — 设置 `responded`+`streaming`，避免 Server 二次 `writeResponse`
+- 重连：`http.lastEventId(ctx)` 读 `last-event-id`；`sse.setId(...)` 写出 `id:`
 - 模块表：`pub const sse_routes = [_]http.SseSpec(State){ .{ .path = "stream", .handler = stream } };`
 - 或在普通 `routes` 行设 `meta = .{ .sse = true }`
 - Catalog：`is_sse=true` → OpenAPI description 标注 SSE
-- 额外 query/path 文档：`RouteMeta.openapi_params = &http.openApiParamsFromStruct(QueryDto, .query)`（与路径 `{id}` 合并导出）
+- 多行 payload：`sendEvent` 按 `\n` 拆成多行 `data:`
 - 详见 `docs/FRAMEWORK_BACKLOG.md`
 
 ### 7.1 多端 / 自定义身份 claim（应用层扩展 · 最佳实践）

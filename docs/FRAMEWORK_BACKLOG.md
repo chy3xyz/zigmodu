@@ -14,7 +14,7 @@ Monolith boundaries unchanged — see `docs/PRODUCTION_ROADMAP.md`.
 | 7 | Outbox / Idempotency | **Landed** | `zigmodu.outbox.*`, `idempotencyMiddleware` (+ sample tests) |
 | 8 | Config / health / shutdown | **Landed** | `requireEnv`, `ShutdownChecklist` |
 | 9 | OpenAPI ↔ extractors / SSE | **Landed** | `openApiParamsFromStruct` + `RouteMeta.openapi_params` merged in catalog |
-| + | **SSE first-class** | **Landed** | `http.sse`, `SseSpec` / `sse_routes`, `SseRecorder` |
+| + | **SSE first-class** | **Landed** | `http.sse` sets `streaming` (no double write); `SseSpec`/`sse_routes`; `lastEventId`; multiline `data:`; `SseRecorder` + live stream test |
 | + | Validation ↔ Extract | **Landed** | `extractJsonValidated(ctx, T, rules)` |
 | + | Example migration | **Landed** | `examples/zent-modulith` + `tools/zmodu/.../api_standalone.zig.tpl` |
 
@@ -97,7 +97,9 @@ See `src/messaging/outbox_sample.zig` for unit smoke tests.
 ```zig
 pub const sse_routes = [_]http.SseSpec(State){ .{ .path = "events", .handler = stream } };
 fn stream(ctx: *http.Context, _: *State) !void {
-    var w = try http.sse(ctx);
+    // Optional reconnect cursor:
+    // if (http.lastEventId(ctx)) |id| { ... }
+    var w = try http.sse(ctx); // sets responded+streaming (Server skips buffered rewrite)
     try w.sendEvent("tick", "{}");
     try w.done();
 }

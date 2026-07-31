@@ -80,8 +80,11 @@ pub const SseWriter = @import("http/Sse.zig").SseWriter;
 /// Alias for SSE streaming handlers.
 pub const Sse = SseWriter;
 pub const SseRecorder = @import("http/Sse.zig").SseRecorder;
+pub const lastEventId = @import("http/Sse.zig").lastEventId;
 
-/// Begin an SSE response (`Content-Type: text/event-stream`). Requires live `ctx.stream` + `ctx.io`.
+/// Begin an SSE response (`Content-Type: text/event-stream`).
+/// Sets `ctx.responded` and `ctx.streaming` so Server skips buffered `writeResponse`.
+/// Requires live `ctx.stream` + `ctx.io`.
 pub fn sse(ctx: *Context) !SseWriter {
     return SseWriter.init(ctx);
 }
