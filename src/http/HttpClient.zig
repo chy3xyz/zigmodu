@@ -418,12 +418,30 @@ pub const HttpClient = struct {
             var write_buf: [4096]u8 = undefined;
             var w = stream.writer(self.connection_pool.io, &write_buf);
             try self.writeRequestHeaders(&w, req.method, target.path, target.host, target.port, &req.headers, req.body);
+            // Buffered writer: the request must reach the peer before we start
+            // reading the response, otherwise both sides deadlock forever.
+            try w.interface.flush();
             const response = try self.readResponse(stream);
             conn.request_count += 1;
             return response;
         }
 
         return error.ConnectionError;
+    }
+
+    /// Wait up to `timeout_ms` for the socket to become readable so
+    /// `request()` cannot block indefinitely against a peer that never
+    /// responds. `timeout_ms == 0` disables the timeout.
+    fn waitForReadable(fd: std.posix.socket_t, timeout_ms: u64) !void {
+        if (timeout_ms == 0) return;
+        var fds = [_]std.posix.pollfd{.{
+            .fd = fd,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const capped: i32 = @intCast(@min(timeout_ms, std.math.maxInt(i32)));
+        const n = std.posix.poll(&fds, capped) catch return error.Timeout;
+        if (n == 0) return error.Timeout;
     }
 
     fn writeRequestHeaders(
@@ -481,6 +499,7 @@ pub const HttpClient = struct {
         var read_buf: [8192]u8 = undefined;
         var r = stream.reader(self.connection_pool.io, &read_buf);
 
+        try waitForReadable(stream.socket.handle, self.timeout_ms);
         const n = try r.interface.readSliceShort(&buf);
         if (n == 0) return error.ConnectionError;
         const raw = buf[0..n];
@@ -526,6 +545,7 @@ pub const HttpClient = struct {
         @memcpy(body_buf[0..copied], initial_body[0..copied]);
 
         while (copied < content_length) {
+            try waitForReadable(stream.socket.handle, self.timeout_ms);
             const more = try r.interface.readSliceShort(&buf);
             if (more == 0) break;
             const to_copy = @min(@as(usize, more), content_length - copied);
@@ -867,4 +887,106 @@ test "HttpClient HttpRequest and HttpResponse" {
     defer res.deinit();
     res.status_code = 201;
     try std.testing.expect(res.isSuccess());
+}
+
+test "HttpClient live request against loopback listener" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    const server_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try server_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = server.socket.address.getPort();
+
+    // Serve one request: read until end of headers, then reply and close.
+    // The socket read timeout keeps the test bounded if the request never
+    // arrives (regression guard for the missing flush bug).
+    const ServerCtx = struct {
+        server: *std.Io.net.Server,
+        fn run(ctx: *@This()) void {
+            const accepted = ctx.server.accept(std.testing.io) catch return;
+            defer accepted.close(std.testing.io);
+
+            var total: usize = 0;
+            var seen: [4096]u8 = undefined;
+            while (total < seen.len) {
+                // Raw reads keep this thread independent of the io scheduler
+                // (spawned-thread io reads can stall on some Io backends).
+                HttpClient.waitForReadable(accepted.socket.handle, 3000) catch break;
+                const n = std.posix.read(accepted.socket.handle, seen[total..]) catch break;
+                if (n == 0) break;
+                total += n;
+                if (std.mem.indexOf(u8, seen[0..total], "\r\n\r\n") != null) break;
+            }
+
+            const resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+            _ = std.posix.system.write(accepted.socket.handle, resp.ptr, resp.len);
+        }
+    };
+
+    var server_ctx = ServerCtx{ .server = &server };
+    const th = try std.Thread.spawn(.{}, ServerCtx.run, .{&server_ctx});
+    defer th.join();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/echo", .{port});
+
+    var client = HttpClient.init(allocator, std.testing.io, 2, 3000);
+    defer client.deinit();
+    var req = HttpClient.HttpRequest.init(allocator, "GET", url);
+    defer req.deinit();
+
+    var resp = try client.request(req);
+    defer resp.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+    try std.testing.expectEqualStrings("OK", resp.body);
+}
+
+test "HttpClient request times out against a stalled peer" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    const server_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try server_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = server.socket.address.getPort();
+
+    // Accept, read the request, then never send a response (stalled peer).
+    // The thread only exits when the client gives up and closes the socket.
+    const StallCtx = struct {
+        server: *std.Io.net.Server,
+        fn run(ctx: *@This()) void {
+            const accepted = ctx.server.accept(std.testing.io) catch return;
+            defer accepted.close(std.testing.io);
+            var total: usize = 0;
+            var seen: [4096]u8 = undefined;
+            while (total < seen.len) {
+                HttpClient.waitForReadable(accepted.socket.handle, 3000) catch break;
+                const n = std.posix.read(accepted.socket.handle, seen[total..]) catch break;
+                if (n == 0) break;
+                total += n;
+                if (std.mem.indexOf(u8, seen[0..total], "\r\n\r\n") != null) break;
+            }
+            var tail: [512]u8 = undefined;
+            while (true) {
+                const n = std.posix.read(accepted.socket.handle, &tail) catch break;
+                if (n == 0) break;
+            }
+        }
+    };
+
+    var stall_ctx = StallCtx{ .server = &server };
+    const th = try std.Thread.spawn(.{}, StallCtx.run, .{&stall_ctx});
+    defer th.join();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/never", .{port});
+
+    var client = HttpClient.init(allocator, std.testing.io, 2, 400);
+    defer client.deinit();
+    var req = HttpClient.HttpRequest.init(allocator, "GET", url);
+    defer req.deinit();
+
+    const err = client.request(req) catch |e| e;
+    try std.testing.expectEqual(error.Timeout, err);
 }
