@@ -748,6 +748,7 @@ test "DistributedEventBus DLQ on parse failure" {
 
 test "DistributedEventBus partitioner adds and removes nodes" {
     const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
 
     var partitioner = Partitioner.init(allocator, .{ .virtual_nodes_per_node = 10 });
     defer partitioner.deinit();
@@ -911,6 +912,7 @@ test "DistributedEventBus DLQ requeue routes to owning bus" {
 
 test "DistributedEventBus duplicate connect reconciles partitioner" {
     const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
 
     var partitioner = Partitioner.init(allocator, .{ .virtual_nodes_per_node = 10 });
     defer partitioner.deinit();

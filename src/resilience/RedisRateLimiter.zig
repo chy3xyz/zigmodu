@@ -139,7 +139,6 @@ test "RedisRateLimiter degradation fallback" {
         .config = .{},
     };
 
-
     var dummy_limiter = RedisRateLimiter{
         .redis = &r,
         .window_seconds = 60,
@@ -151,5 +150,3 @@ test "RedisRateLimiter degradation fallback" {
     // 3rd call exceeds local_rl limit of 2, so should be denied
     try std.testing.expect(!dummy_limiter.allowWithFallback("test-key", &local_rl));
 }
-
-

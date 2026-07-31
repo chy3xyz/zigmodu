@@ -112,7 +112,6 @@ pub const ModuleRuntime = struct {
         return true;
     }
 
-
     /// Release one bulkhead slot after execution.
     pub fn release(self: *Self) void {
         self.mu.lock(self.io) catch return;
@@ -170,7 +169,6 @@ pub const ModuleRuntime = struct {
         }
         return null;
     }
-
 
     pub fn getStats(self: *Self) Stats {
         self.mu.lock(self.io) catch return .{};

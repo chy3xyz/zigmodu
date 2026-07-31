@@ -181,7 +181,6 @@ pub const RouteGroup = struct {
             .user_data = user_data,
         });
     }
-
 };
 
 /// WebSocket connect callback: called after successful handshake.
@@ -1470,7 +1469,7 @@ pub const Server = struct {
         if (self.global_middleware.items.len > 0) {
             self.executeWithMiddleware(ctx, struct {
                 fn h(_: *Context) anyerror!void {}
-            }.h, self.global_middleware.items) catch {};
+            }.h, self.global_middleware.items) catch |err| std.log.err("[Server] global middleware on unmatched route failed: {}", .{err});
         }
         if (!ctx.responded) {
             try ctx.sendError(404, "Not Found");
@@ -1725,7 +1724,6 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
         // ── WebSocket upgrade check ──
         const ws_lookup_path = if (request.path.len > 0 and request.path[0] == '/') request.path[1..] else request.path;
         if (server.ws_handlers.get(ws_lookup_path)) |ws_route| {
-
             if (std.mem.eql(u8, request.method.toString(), "GET")) {
                 const upgrade_hdr = ctx.headers.get("upgrade") orelse ctx.headers.get("Upgrade") orelse "";
                 if (std.ascii.eqlIgnoreCase(upgrade_hdr, "websocket")) {
@@ -2720,13 +2718,11 @@ test "WebSocket route path normalization handles leading slash variations" {
         fn connect(_: *Context, _: ?*anyopaque) ?*anyopaque {
             return null;
         }
-
     }).connect, (struct {
         fn message(_: ?*anyopaque, _: []const u8, _: WsFrameKind) void {}
     }).message, (struct {
         fn close(_: ?*anyopaque) void {}
     }).close, null);
-
 
     // Both "/app-api/ws/im" and "app-api/ws/im" should hit the normalized ws_handlers lookup key ("app-api/ws/im")
     try std.testing.expect(server.ws_handlers.contains("app-api/ws/im"));

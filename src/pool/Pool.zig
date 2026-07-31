@@ -77,7 +77,6 @@ pub fn Pool(comptime T: type) type {
                 .closed = std.atomic.Value(bool).init(false),
             };
 
-
             // Pre-create min idle connections
             var i: u32 = 0;
             while (i < config.min_idle) : (i += 1) {
@@ -89,7 +88,6 @@ pub fn Pool(comptime T: type) type {
                 _ = pool.active_count.fetchAdd(1, .monotonic);
                 _ = pool.creation_count.fetchAdd(1, .monotonic);
             }
-
 
             return pool;
         }
@@ -204,7 +202,6 @@ pub fn Pool(comptime T: type) type {
                 .timeout_count = self.timeout_count.load(.monotonic),
             };
         }
-
     };
 }
 
@@ -273,4 +270,3 @@ test "connection pool" {
 
     try std.testing.expect(create_count >= 2);
 }
-

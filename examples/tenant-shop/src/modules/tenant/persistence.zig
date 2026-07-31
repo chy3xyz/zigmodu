@@ -24,7 +24,8 @@ pub fn TenantPersistence(comptime Backend: type) type {
         }
 
         pub fn findById(self: *Self, id: i64) !?model.Tenant {
-            return self.db.queryRowPartial(model.Tenant,
+            return self.db.queryRowPartial(
+                model.Tenant,
                 "SELECT id, name, domain, status, tier, created_at, updated_at FROM tenants WHERE id = ?",
                 &.{.{ .int = id }},
             ) catch |err| switch (err) {
@@ -34,7 +35,8 @@ pub fn TenantPersistence(comptime Backend: type) type {
         }
 
         pub fn findAll(self: *Self) !zigmodu.data.sqlx.QueryResult(model.Tenant) {
-            return try self.db.queryRowsPartial(model.Tenant,
+            return try self.db.queryRowsPartial(
+                model.Tenant,
                 "SELECT id, name, domain, status, tier, created_at, updated_at FROM tenants WHERE status = 1 ORDER BY id",
                 &.{},
             );

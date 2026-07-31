@@ -62,7 +62,6 @@ pub const RateLimiter = struct {
         return false;
     }
 
-
     /// [...]tokens (uses cached timestamp — refill rate is per-second, ~1s staleness OK)
     fn refill(self: *Self) void {
         const now = Time.cachedNowSeconds();

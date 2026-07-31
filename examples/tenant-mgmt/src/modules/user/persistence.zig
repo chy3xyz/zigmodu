@@ -12,14 +12,16 @@ pub fn UserPersistence(comptime Backend: type) type {
         }
 
         pub fn findByTenant(self: *Self, tenant_id: i64) !zigmodu.data.sqlx.QueryResult(model.User) {
-            return try self.db.queryRowsPartial(model.User,
+            return try self.db.queryRowsPartial(
+                model.User,
                 "SELECT id, tenant_id, username, email, password_hash, role, status, created_at, updated_at FROM users WHERE tenant_id = ?1 ORDER BY id",
                 &.{.{ .int = tenant_id }},
             );
         }
 
         pub fn findById(self: *Self, tenant_id: i64, user_id: i64) !?model.User {
-            return self.db.queryRowPartial(model.User,
+            return self.db.queryRowPartial(
+                model.User,
                 "SELECT id, tenant_id, username, email, password_hash, role, status, created_at, updated_at FROM users WHERE tenant_id = ?1 AND id = ?2",
                 &.{ .{ .int = tenant_id }, .{ .int = user_id } },
             ) catch |err| switch (err) {

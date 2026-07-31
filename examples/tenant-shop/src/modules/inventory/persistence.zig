@@ -13,14 +13,16 @@ pub fn InventoryPersistence(comptime Backend: type) type {
         }
 
         pub fn findByTenant(self: *Self, tenant_id: i64) !data.sqlx.QueryResult(model.Inventory) {
-            return try self.db.queryRowsPartial(model.Inventory,
+            return try self.db.queryRowsPartial(
+                model.Inventory,
                 "SELECT id, tenant_id, product_id, qty, reserved, updated_at FROM inventory WHERE tenant_id = ? ORDER BY id",
                 &.{.{ .int = tenant_id }},
             );
         }
 
         pub fn findByProduct(self: *Self, tenant_id: i64, product_id: i64) !?model.Inventory {
-            return self.db.queryRowPartial(model.Inventory,
+            return self.db.queryRowPartial(
+                model.Inventory,
                 "SELECT id, tenant_id, product_id, qty, reserved, updated_at FROM inventory WHERE tenant_id = ? AND product_id = ?",
                 &.{ .{ .int = tenant_id }, .{ .int = product_id } },
             ) catch |err| switch (err) {
@@ -58,7 +60,9 @@ pub const Tx = struct {
         tenant_id: i64,
         product_id: i64,
     ) !model.Inventory {
-        return try tx.queryRow(allocator, model.Inventory,
+        return try tx.queryRow(
+            allocator,
+            model.Inventory,
             "SELECT id, tenant_id, product_id, qty, reserved, updated_at FROM inventory WHERE tenant_id = ? AND product_id = ?",
             &.{ .{ .int = tenant_id }, .{ .int = product_id } },
         );

@@ -165,7 +165,8 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("  - NotificationModule.onOrderCreated\n", .{});
 
     // 创建应用
-    var app = try zigmodu.Application.init(init.io,
+    var app = try zigmodu.Application.init(
+        init.io,
         allocator,
         "event-driven-shop",
         .{ OrderModule, InventoryModule, PaymentModule, NotificationModule },

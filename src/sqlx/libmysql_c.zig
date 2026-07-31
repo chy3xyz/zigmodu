@@ -57,7 +57,6 @@ pub const MYSQL_TYPE_MEDIUM_BLOB = 250;
 pub const MYSQL_TYPE_LONG_BLOB = 251;
 pub const MYSQL_TYPE_BLOB = 252;
 
-
 /// MYSQL_FIELD.flags — column flags
 pub const UNSIGNED_FLAG: c_uint = 32;
 pub const NOT_NULL_FLAG: c_uint = 1;

@@ -180,7 +180,9 @@ pub fn main(init: std.process.Init) !void {
     zigmodu.http.Dashboard.system_info.started_at = zigmodu.time.monotonicNowSeconds();
     // Dashboard routes
     try server.addRoute(.{ .method = .GET, .path = "dashboard", .handler = struct {
-        fn handle(ctx: *zigmodu.http.Context) !void { try ctx.text(200, "Dashboard"); }
+        fn handle(ctx: *zigmodu.http.Context) !void {
+            try ctx.text(200, "Dashboard");
+        }
     }.handle });
 
     // ── 10. Start server ────────────────────────────

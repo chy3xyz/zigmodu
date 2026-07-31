@@ -116,12 +116,12 @@ test "compile all source files" {
     _ = @import("security/AppSecurity.zig");
     _ = @import("security/JwksKeyRing.zig");
 
-
     // Test
     _ = @import("test/Benchmark.zig");
     _ = @import("test/IntegrationTest.zig");
     _ = @import("test/ModulithTest.zig");
     _ = @import("test/ModuleTest.zig");
+    _ = @import("test/NetworkProbe.zig");
 
     // Tracing
     _ = @import("tracing/DistributedTracer.zig");
@@ -130,7 +130,6 @@ test "compile all source files" {
     // Web4 (DID + x402; payment verify fail-closed)
     _ = @import("web4/web4.zig");
     _ = @import("web4/x402.zig");
-
 
     // Validation
     _ = @import("validation/ObjectValidator.zig");

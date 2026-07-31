@@ -479,7 +479,6 @@ pub fn diagnosePostgres(result: ?*const libpq_c.PGresult) SqlDiagnostic {
     return diag;
 }
 
-
 /// Parse MySQL error message to extract table/column from constraint failures.
 pub fn diagnoseMysql(err_no: c_uint, err_msg: []const u8) SqlDiagnostic {
     var diag = SqlDiagnostic{ .code = @intCast(err_no), .message = err_msg };
@@ -1425,20 +1424,36 @@ fn pgDecodeNumeric(allocator: std.mem.Allocator, bytes: []const u8) !Value {
         }
         if (first_group == null) {
             first_group = di;
-            if (d >= 1000) { } // 4 chars, no leading zeros
-            else if (d >= 100) { first_decimal_pos += 1; }
-            else if (d >= 10) { first_decimal_pos += 2; }
-            else { first_decimal_pos += 3; }
+            if (d >= 1000) {} // 4 chars, no leading zeros
+            else if (d >= 100) {
+                first_decimal_pos += 1;
+            } else if (d >= 10) {
+                first_decimal_pos += 2;
+            } else {
+                first_decimal_pos += 3;
+            }
         }
         if (di == first_group.?) {
-            if (d >= 1000) { dec.appendAssumeCapacity(@intCast(d / 1000 + '0')); d %= 1000; }
-            if (d >= 100 or dec.items.len > 0) { dec.appendAssumeCapacity(@intCast(d / 100 + '0')); d %= 100; }
-            if (d >= 10 or dec.items.len > 0) { dec.appendAssumeCapacity(@intCast(d / 10 + '0')); d %= 10; }
+            if (d >= 1000) {
+                dec.appendAssumeCapacity(@intCast(d / 1000 + '0'));
+                d %= 1000;
+            }
+            if (d >= 100 or dec.items.len > 0) {
+                dec.appendAssumeCapacity(@intCast(d / 100 + '0'));
+                d %= 100;
+            }
+            if (d >= 10 or dec.items.len > 0) {
+                dec.appendAssumeCapacity(@intCast(d / 10 + '0'));
+                d %= 10;
+            }
             dec.appendAssumeCapacity(@intCast(d + '0'));
         } else {
-            dec.appendAssumeCapacity(@intCast(d / 1000 + '0')); d %= 1000;
-            dec.appendAssumeCapacity(@intCast(d / 100 + '0')); d %= 100;
-            dec.appendAssumeCapacity(@intCast(d / 10 + '0')); d %= 10;
+            dec.appendAssumeCapacity(@intCast(d / 1000 + '0'));
+            d %= 1000;
+            dec.appendAssumeCapacity(@intCast(d / 100 + '0'));
+            d %= 100;
+            dec.appendAssumeCapacity(@intCast(d / 10 + '0'));
+            d %= 10;
             dec.appendAssumeCapacity(@intCast(d + '0'));
         }
     }
@@ -1758,7 +1773,6 @@ pub const PostgresConn = struct {
                 const sqlstate = cStrSpan(libpq_c.PQresultErrorField(res.?, PG_DIAG_SQLSTATE));
                 const db_err = errors.sqlStateToError(sqlstate);
 
-
                 switch (db_err) {
                     error.ConstraintViolation => {
                         std.log.err("PG constraint violation: table={s} column={s}", .{ diag.table orelse "?", diag.column orelse "?" });
@@ -1784,7 +1798,6 @@ pub const PostgresConn = struct {
             const name = cStrSpan(libpq_c.PQfname(res.?, @intCast(c)));
             shared_columns[c] = arena_alloc.dupe(u8, name) catch return error.DatabaseError;
         }
-
 
         for (0..@intCast(n_rows)) |r| {
             const values = arena_alloc.alloc(?Value, @intCast(n_cols)) catch return error.DatabaseError;
@@ -1817,7 +1830,6 @@ pub const PostgresConn = struct {
                 const diag = diagnosePostgres(res.?);
                 const sqlstate = cStrSpan(libpq_c.PQresultErrorField(res.?, PG_DIAG_SQLSTATE));
                 const db_err = errors.sqlStateToError(sqlstate);
-
 
                 switch (db_err) {
                     error.ConstraintViolation => {
@@ -2825,7 +2837,6 @@ fn mysqlStmtReadRows(stmt: *libmysql_c.MYSQL_STMT, arena: std.heap.ArenaAllocato
                     => try mysqlFetchStringValue(arena_alloc, stmt, c, @intCast(lengths[c]), rc, bind_bufs[c].string.buf[0..], binds[c].buffer_type),
                     // Remaining string-like fallback
                     else => try mysqlFetchStringValue(arena_alloc, stmt, c, @intCast(lengths[c]), rc, bind_bufs[c].string.buf[0..], binds[c].buffer_type),
-
                 };
             }
         }
@@ -4205,7 +4216,6 @@ pub const Client = struct {
     fn newStmt(self: *Client, conn: Conn, sql_str: []const u8) !Stmt {
         return conn.prepare(self.allocator, sql_str);
     }
-
 
     fn doQuery(self: *Client, sql_str: []const u8, args: []const Value) !Rows {
         self.ensurePool();
@@ -5824,12 +5834,12 @@ test "pgDecodeNumeric integers" {
     // 123.45: ndigits=2, weight=0, sign=0, dscale=2
     // digit[0]=123 (10000^0), digit[1]=4500 (10000^-1)
     var buf: [12]u8 = undefined;
-    std.mem.writeInt(i16, buf[0..2], 2, .big);    // ndigits
-    std.mem.writeInt(i16, buf[2..4], 0, .big);    // weight
-    std.mem.writeInt(u16, buf[4..6], 0, .big);    // sign (positive)
-    std.mem.writeInt(u16, buf[6..8], 2, .big);    // dscale
+    std.mem.writeInt(i16, buf[0..2], 2, .big); // ndigits
+    std.mem.writeInt(i16, buf[2..4], 0, .big); // weight
+    std.mem.writeInt(u16, buf[4..6], 0, .big); // sign (positive)
+    std.mem.writeInt(u16, buf[6..8], 2, .big); // dscale
     std.mem.writeInt(u16, buf[8..10], 123, .big); // digit 0
-    std.mem.writeInt(u16, buf[10..12], 4500, .big);// digit 1
+    std.mem.writeInt(u16, buf[10..12], 4500, .big); // digit 1
     const v = try pgDecodeNumeric(allocator, &buf);
     defer allocator.free(v.string);
     try std.testing.expectEqualStrings("123.45", v.string);
@@ -5839,10 +5849,10 @@ test "pgDecodeNumeric negative" {
     const allocator = std.testing.allocator;
     // -789: ndigits=1, weight=0, sign=0x4000, dscale=0
     var buf: [10]u8 = undefined;
-    std.mem.writeInt(i16, buf[0..2], 1, .big);    // ndigits
-    std.mem.writeInt(i16, buf[2..4], 0, .big);    // weight
-    std.mem.writeInt(u16, buf[4..6], 0x4000, .big);// sign (negative)
-    std.mem.writeInt(u16, buf[6..8], 0, .big);    // dscale
+    std.mem.writeInt(i16, buf[0..2], 1, .big); // ndigits
+    std.mem.writeInt(i16, buf[2..4], 0, .big); // weight
+    std.mem.writeInt(u16, buf[4..6], 0x4000, .big); // sign (negative)
+    std.mem.writeInt(u16, buf[6..8], 0, .big); // dscale
     std.mem.writeInt(u16, buf[8..10], 789, .big); // digit
     const v = try pgDecodeNumeric(allocator, &buf);
     defer allocator.free(v.string);
@@ -5854,12 +5864,12 @@ test "pgDecodeNumeric large integer" {
     // 10000: ndigits=2, weight=1, sign=0, dscale=0
     // digits: 1, 0
     var buf: [12]u8 = undefined;
-    std.mem.writeInt(i16, buf[0..2], 2, .big);    // ndigits
-    std.mem.writeInt(i16, buf[2..4], 1, .big);    // weight (=1 means 8 int digits before dot)
-    std.mem.writeInt(u16, buf[4..6], 0, .big);    // sign
-    std.mem.writeInt(u16, buf[6..8], 0, .big);    // dscale
-    std.mem.writeInt(u16, buf[8..10], 1, .big);   // digit 0
-    std.mem.writeInt(u16, buf[10..12], 0, .big);  // digit 1
+    std.mem.writeInt(i16, buf[0..2], 2, .big); // ndigits
+    std.mem.writeInt(i16, buf[2..4], 1, .big); // weight (=1 means 8 int digits before dot)
+    std.mem.writeInt(u16, buf[4..6], 0, .big); // sign
+    std.mem.writeInt(u16, buf[6..8], 0, .big); // dscale
+    std.mem.writeInt(u16, buf[8..10], 1, .big); // digit 0
+    std.mem.writeInt(u16, buf[10..12], 0, .big); // digit 1
     const v = try pgDecodeNumeric(allocator, &buf);
     defer allocator.free(v.string);
     try std.testing.expectEqualStrings("10000", v.string);
@@ -5869,11 +5879,11 @@ test "pgDecodeNumeric pure fraction" {
     const allocator = std.testing.allocator;
     // 0.005: 0.005 = 50 * 10000^-1, so ndigits=1, weight=-1, sign=0, dscale=3
     var buf: [10]u8 = undefined;
-    std.mem.writeInt(i16, buf[0..2], 1, .big);    // ndigits
-    std.mem.writeInt(i16, buf[2..4], -1, .big);   // weight
-    std.mem.writeInt(u16, buf[4..6], 0, .big);    // sign
-    std.mem.writeInt(u16, buf[6..8], 3, .big);    // dscale
-    std.mem.writeInt(u16, buf[8..10], 50, .big);  // digit = 50 (= 0.005 * 10000^1)
+    std.mem.writeInt(i16, buf[0..2], 1, .big); // ndigits
+    std.mem.writeInt(i16, buf[2..4], -1, .big); // weight
+    std.mem.writeInt(u16, buf[4..6], 0, .big); // sign
+    std.mem.writeInt(u16, buf[6..8], 3, .big); // dscale
+    std.mem.writeInt(u16, buf[8..10], 50, .big); // digit = 50 (= 0.005 * 10000^1)
     const v = try pgDecodeNumeric(allocator, &buf);
     defer allocator.free(v.string);
     try std.testing.expectEqualStrings("0.005", v.string);
@@ -5882,10 +5892,10 @@ test "pgDecodeNumeric pure fraction" {
 test "pgDecodeNumeric NaN" {
     const allocator = std.testing.allocator;
     var buf: [8]u8 = undefined;
-    std.mem.writeInt(i16, buf[0..2], 0, .big);    // ndigits = 0
-    std.mem.writeInt(i16, buf[2..4], 0, .big);    // weight
-    std.mem.writeInt(u16, buf[4..6], 0xC000, .big);// sign = NaN
-    std.mem.writeInt(u16, buf[6..8], 0, .big);    // dscale
+    std.mem.writeInt(i16, buf[0..2], 0, .big); // ndigits = 0
+    std.mem.writeInt(i16, buf[2..4], 0, .big); // weight
+    std.mem.writeInt(u16, buf[4..6], 0xC000, .big); // sign = NaN
+    std.mem.writeInt(u16, buf[6..8], 0, .big); // dscale
     const v = try pgDecodeNumeric(allocator, &buf);
     defer allocator.free(v.string);
     try std.testing.expectEqualStrings("NaN", v.string);
@@ -5954,9 +5964,9 @@ test "pgDecodeInterval basic" {
     // 1 month, 2 days, 3:04:05.000006
     var buf: [16]u8 = undefined;
     const total_us: i64 = (3 * 3600 + 4 * 60 + 5) * 1_000_000 + 6;
-    std.mem.writeInt(i64, buf[0..8], total_us, .big);   // microseconds
-    std.mem.writeInt(i32, buf[8..12], 2, .big);           // days
-    std.mem.writeInt(i32, buf[12..16], 1, .big);          // months
+    std.mem.writeInt(i64, buf[0..8], total_us, .big); // microseconds
+    std.mem.writeInt(i32, buf[8..12], 2, .big); // days
+    std.mem.writeInt(i32, buf[12..16], 1, .big); // months
     const v = try pgDecodeBinary(allocator, PgOid.interval, &buf);
     defer allocator.free(v.string);
     try std.testing.expectEqualStrings("P1M2DT03:04:05.000006", v.string);
@@ -5990,10 +6000,10 @@ test "pgDecodeInet basic" {
     const allocator = std.testing.allocator;
     // 192.168.1.1/24
     var buf: [8]u8 = undefined;
-    buf[0] = 2;        // AF_INET
-    buf[1] = 24;       // prefix_len
-    buf[2] = 0;        // is_cidr = 0
-    buf[3] = 4;        // nbytes
+    buf[0] = 2; // AF_INET
+    buf[1] = 24; // prefix_len
+    buf[2] = 0; // is_cidr = 0
+    buf[3] = 4; // nbytes
     buf[4] = 192;
     buf[5] = 168;
     buf[6] = 1;
@@ -6007,10 +6017,10 @@ test "pgDecodeCidr masking" {
     const allocator = std.testing.allocator;
     // 10.0.0.42/8 as CIDR → 10.0.0.0/8
     var buf: [8]u8 = undefined;
-    buf[0] = 2;        // AF_INET
-    buf[1] = 8;        // prefix_len
-    buf[2] = 1;        // is_cidr = 1
-    buf[3] = 4;        // nbytes
+    buf[0] = 2; // AF_INET
+    buf[1] = 8; // prefix_len
+    buf[2] = 1; // is_cidr = 1
+    buf[3] = 4; // nbytes
     buf[4] = 10;
     buf[5] = 0;
     buf[6] = 0;
@@ -6562,7 +6572,7 @@ test "sqlite batchInsertEx sql mode matches batchInsert" {
     defer db.deinit();
     try db.connect();
     _ = try db.exec("CREATE TABLE batch (id INTEGER PRIMARY KEY, name TEXT)", &.{});
-    const res = try db.batchInsertEx("batch", &.{"id", "name"}, &.{
+    const res = try db.batchInsertEx("batch", &.{ "id", "name" }, &.{
         &.{ Value{ .int = 1 }, Value{ .string = "a" } },
         &.{ Value{ .int = 2 }, Value{ .string = "b" } },
     }, .{ .mode = .sql });
@@ -6575,7 +6585,7 @@ test "sqlite batchInsertEx protocol mode routes to sql" {
     defer db.deinit();
     try db.connect();
     _ = try db.exec("CREATE TABLE batch2 (id INTEGER PRIMARY KEY, name TEXT)", &.{});
-    const res = try db.batchInsertEx("batch2", &.{"id", "name"}, &.{
+    const res = try db.batchInsertEx("batch2", &.{ "id", "name" }, &.{
         &.{ Value{ .int = 1 }, Value{ .string = "a" } },
         &.{ Value{ .int = 2 }, Value{ .string = "b" } },
     }, .{ .mode = .protocol });
@@ -6610,4 +6620,3 @@ test "diagnosePostgres handles null result and missing error fields safely" {
     try std.testing.expect(diag_null.table == null);
     try std.testing.expect(diag_null.column == null);
 }
-

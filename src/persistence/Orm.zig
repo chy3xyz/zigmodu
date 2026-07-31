@@ -568,7 +568,7 @@ pub fn Orm(comptime B: type) type {
 
                 pub fn transact(self: @This(), comptime R: type, fn_tx: *const fn (*Tx(B)) anyerror!R) !R {
                     var tx = try self.orm.backend.beginTx();
-                    errdefer self.orm.backend.rollbackTx(&tx) catch {};
+                    errdefer self.orm.backend.rollbackTx(&tx) catch |err| std.log.warn("[Orm] tx rollback failed: {}", .{err});
                     var wrapper = Tx(B){ .backend = &self.orm.backend, .tx = &tx };
                     const result = try fn_tx(&wrapper);
                     try self.orm.backend.commitTx(&tx);

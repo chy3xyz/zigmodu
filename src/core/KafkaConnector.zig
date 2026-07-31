@@ -2820,7 +2820,7 @@ test "ConsumerGroupSession offline join heartbeat leave" {
     var session = ConsumerGroupSession.init(allocator, "demo-group");
     defer session.deinit();
 
-    try session.joinOffline(&.{"orders", "payments"});
+    try session.joinOffline(&.{ "orders", "payments" });
     try std.testing.expectEqual(ConsumerGroupSession.State.stable, session.state);
     try std.testing.expectEqual(@as(i32, 1), session.generation_id);
     try std.testing.expectEqual(@as(usize, 2), session.assignments.items.len);
@@ -2956,7 +2956,7 @@ test "CooperativeStickyAssignor retains sticky then balances" {
     const allocator = std.testing.allocator;
     const previous = [_]CooperativeStickyAssignor.PreviousAssignment{
         .{ .member_id = "m1", .partitions = &.{ 0, 1, 2 } },
-        .{ .member_id = "m2", .partitions = &.{ 3 } },
+        .{ .member_id = "m2", .partitions = &.{3} },
     };
     const plan = try CooperativeStickyAssignor.assign(allocator, &.{ "m1", "m2" }, 4, &previous);
     defer CooperativeStickyAssignor.freeAssignment(allocator, plan);
@@ -2979,7 +2979,7 @@ test "CooperativeStickyAssignor computeRevocations when member loses partition" 
     const allocator = std.testing.allocator;
     const previous = [_]CooperativeStickyAssignor.PreviousAssignment{
         .{ .member_id = "m1", .partitions = &.{ 0, 1, 2 } },
-        .{ .member_id = "m2", .partitions = &.{ 3 } },
+        .{ .member_id = "m2", .partitions = &.{3} },
     };
     var m1_new = [_]i32{ 0, 1 };
     var m2_new = [_]i32{ 2, 3 };

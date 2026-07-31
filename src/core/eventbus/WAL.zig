@@ -159,11 +159,11 @@ pub const WAL = struct {
             if (offset + entry_size > read_len) break;
 
             if (header.seq >= start_seq) {
-                const topic = try self.allocator.dupe(u8, content[offset + @sizeOf(WALEntryHeader)..][0..header.topic_len]);
+                const topic = try self.allocator.dupe(u8, content[offset + @sizeOf(WALEntryHeader) ..][0..header.topic_len]);
                 errdefer self.allocator.free(topic);
-                const payload = try self.allocator.dupe(u8, content[offset + @sizeOf(WALEntryHeader) + header.topic_len..][0..header.payload_len]);
+                const payload = try self.allocator.dupe(u8, content[offset + @sizeOf(WALEntryHeader) + header.topic_len ..][0..header.payload_len]);
                 errdefer self.allocator.free(payload);
-                const source = try self.allocator.dupe(u8, content[offset + @sizeOf(WALEntryHeader) + header.topic_len + header.payload_len..][0..header.source_len]);
+                const source = try self.allocator.dupe(u8, content[offset + @sizeOf(WALEntryHeader) + header.topic_len + header.payload_len ..][0..header.source_len]);
                 errdefer self.allocator.free(source);
                 try result.append(self.allocator, .{
                     .index = header.seq,
@@ -228,7 +228,7 @@ fn createSegment(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, id: 
 
 fn removeSegment(allocator: std.mem.Allocator, io: std.Io, seg: *WAL.Segment) !void {
     seg.file.close(io);
-    std.Io.Dir.cwd().deleteFile(io, seg.path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, seg.path) catch |err| std.log.warn("[WAL] segment delete failed: {}", .{err});
     allocator.free(seg.path);
     allocator.destroy(seg);
 }

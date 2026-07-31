@@ -646,7 +646,7 @@ pub const RedisCluster = struct {
 
     pub fn connect(self: *Self) !void {
         for (self.nodes.items) |*node| {
-            node.connect() catch {};
+            node.connect() catch |err| std.log.warn("[Redis] node connect failed: {}", .{err});
         }
     }
 

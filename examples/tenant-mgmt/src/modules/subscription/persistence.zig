@@ -12,7 +12,8 @@ pub fn SubscriptionPersistence(comptime Backend: type) type {
         }
 
         pub fn findByTenant(self: *Self, tenant_id: i64) !?model.Subscription {
-            return self.db.queryRowPartial(model.Subscription,
+            return self.db.queryRowPartial(
+                model.Subscription,
                 "SELECT id, tenant_id, plan_id, status, started_at, expires_at, created_at FROM subscriptions WHERE tenant_id = ?1 ORDER BY id DESC LIMIT 1",
                 &.{.{ .int = tenant_id }},
             ) catch |err| switch (err) {
@@ -44,7 +45,8 @@ pub fn SubscriptionPersistence(comptime Backend: type) type {
         }
 
         pub fn findAllPlans(self: *Self) !zigmodu.data.sqlx.QueryResult(model.Plan) {
-            return try self.db.queryRowsPartial(model.Plan,
+            return try self.db.queryRowsPartial(
+                model.Plan,
                 "SELECT id, name, max_users, max_storage, price, created_at FROM plans ORDER BY id",
                 &.{},
             );

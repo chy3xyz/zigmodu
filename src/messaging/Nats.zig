@@ -69,7 +69,7 @@ pub const NatsClient = struct {
         {
             var it = self.subscriptions.iterator();
             while (it.next()) |entry| {
-                self.unsubscribeRaw(entry.value_ptr.sid) catch {};
+                self.unsubscribeRaw(entry.value_ptr.sid) catch |err| std.log.warn("[Nats] unsubscribeRaw failed during deinit: {}", .{err});
                 self.allocator.free(entry.key_ptr.*);
                 self.allocator.free(entry.value_ptr.subject);
                 if (entry.value_ptr.queue_group) |qg| self.allocator.free(qg);
@@ -238,7 +238,7 @@ pub const NatsClient = struct {
     /// Unsubscribe from a subscription by its sid.
     pub fn unsubscribe(self: *Self, sid: u64) !void {
         // Send UNSUB command
-        self.unsubscribeRaw(sid) catch {};
+        self.unsubscribeRaw(sid) catch |err| std.log.warn("[Nats] unsubscribeRaw failed: {}", .{err});
 
         // Remove from local subscription map
         const key = try std.fmt.allocPrint(self.allocator, "{d}", .{sid});
@@ -293,7 +293,7 @@ pub const NatsClient = struct {
         while (true) {
             const now = Time.monotonicNowMilliseconds();
             if (now >= deadline) {
-                self.unsubscribeRaw(req_sid) catch {};
+                self.unsubscribeRaw(req_sid) catch |err| std.log.warn("[Nats] unsubscribeRaw failed on timeout: {}", .{err});
                 return error.Timeout;
             }
 
@@ -302,7 +302,7 @@ pub const NatsClient = struct {
                 var d: [1][]u8 = .{&rbuf};
                 break :data &d;
             }) catch |err| {
-                self.unsubscribeRaw(req_sid) catch {};
+                self.unsubscribeRaw(req_sid) catch |cleanup_err| std.log.warn("[Nats] unsubscribeRaw failed on read error: {}", .{cleanup_err});
                 return err;
             };
             if (n == 0) {
@@ -315,7 +315,7 @@ pub const NatsClient = struct {
 
             // Parse for MSG lines matching our inbox subscription
             if (try self.parseRequestResponse(rbuf[0..n], req_sid)) |resp| {
-                self.unsubscribeRaw(req_sid) catch {};
+                self.unsubscribeRaw(req_sid) catch |err| std.log.warn("[Nats] unsubscribeRaw failed after response: {}", .{err});
                 return resp;
             }
         }

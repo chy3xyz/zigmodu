@@ -122,8 +122,11 @@ fn parseOrmCli(args: []const []const u8) ParseOrmCliResult {
             if (i + 1 >= args.len) return .{ .err_missing_value = "--json-style" };
             const val = args[i + 1];
             if (isOrmLongOption(val)) return .{ .err_missing_value = "--json-style" };
-            if (std.mem.eql(u8, val, "camel")) { opts.json_style = .camel; }
-            else if (!std.mem.eql(u8, val, "snake")) { return .{ .err_unknown_flag = val }; }
+            if (std.mem.eql(u8, val, "camel")) {
+                opts.json_style = .camel;
+            } else if (!std.mem.eql(u8, val, "snake")) {
+                return .{ .err_unknown_flag = val };
+            }
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--enable-events")) {
             opts.enable_events = true;
@@ -1509,7 +1512,10 @@ fn safeWrite(io: std.Io, allocator: std.mem.Allocator, path: []const u8, content
 
 /// Legacy wrapper — delegates to safeWrite. Remove after migration complete.
 fn writeFileGen(io: std.Io, path: []const u8, content: []const u8, opts: GenOptions) !void {
-    _ = io; _ = path; _ = content; _ = opts;
+    _ = io;
+    _ = path;
+    _ = content;
+    _ = opts;
 }
 
 // ==================== ORM Code Generation ====================
@@ -1595,7 +1601,7 @@ fn parseKeyword(text: []const u8, i: *usize, keyword: []const u8) bool {
     skipWhitespaceAndComments(text, i);
     const end = i.* + keyword.len;
     if (end > text.len) return false;
-    const slice = text[i.* .. end];
+    const slice = text[i.*..end];
     if (!std.mem.eql(u8, &[_]u8{std.ascii.toUpper(slice[0])}, &[_]u8{std.ascii.toUpper(keyword[0])}) and slice.len != keyword.len) {
         // quick check
     }
@@ -1691,7 +1697,8 @@ fn parseColumnDef(allocator: std.mem.Allocator, text: []const u8) !ColumnDef {
             std.mem.startsWith(u8, ustr, "FOREIGN") or
             std.mem.startsWith(u8, ustr, "UNIQUE") or
             std.mem.startsWith(u8, ustr, "INDEX") or
-            std.mem.startsWith(u8, ustr, "KEY")) {
+            std.mem.startsWith(u8, ustr, "KEY"))
+        {
             return ColumnDef{ .name = try allocator.dupe(u8, ""), .col_type = .unknown, .nullable = true, .is_primary_key = false, .is_unique = false, .has_default = false, .comment = null };
         }
     }
@@ -1765,7 +1772,7 @@ fn parseColumns(allocator: std.mem.Allocator, text: []const u8, i: *usize) ![]Co
             }
             if (c == ',' and depth == 0) {
                 const col = try parseColumnDef(allocator, text[start..i.*]);
-                        if (col.name.len > 0) try cols.append(allocator, col) else allocator.free(col.name);
+                if (col.name.len > 0) try cols.append(allocator, col) else allocator.free(col.name);
                 i.* += 1;
                 start = i.*;
                 continue;
@@ -2267,7 +2274,9 @@ fn introspectDatabasePostgres(io: std.Io, allocator: std.mem.Allocator, host: []
     var titer = col_map.keyIterator();
     while (titer.next()) |k| try tnames.append(allocator, k.*);
     std.mem.sort([]const u8, tnames.items, {}, struct {
-        fn lt(_: void, a: []const u8, b: []const u8) bool { return std.mem.lessThan(u8, a, b); }
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
     }.lt);
 
     for (tnames.items) |tname| {
@@ -2580,8 +2589,8 @@ fn inferModuleDependencies(allocator: std.mem.Allocator, tables: []const TableDe
             const ref_module = try inferModuleName(allocator, fk.ref_table, strip_prefix_len);
             // Skip self-ref: same module, or singular/plural pair after merge
             const is_self = std.mem.eql(u8, ref_module, module_name) or
-                (module_name.len > 0 and ref_module.len == module_name.len + 1 and std.mem.startsWith(u8, ref_module, module_name) and ref_module[ref_module.len-1] == 's') or
-                (ref_module.len > 0 and module_name.len == ref_module.len + 1 and std.mem.startsWith(u8, module_name, ref_module) and module_name[module_name.len-1] == 's');
+                (module_name.len > 0 and ref_module.len == module_name.len + 1 and std.mem.startsWith(u8, ref_module, module_name) and ref_module[ref_module.len - 1] == 's') or
+                (ref_module.len > 0 and module_name.len == ref_module.len + 1 and std.mem.startsWith(u8, module_name, ref_module) and module_name[module_name.len - 1] == 's');
             if (!is_self) {
                 if (!seen.contains(ref_module)) {
                     try seen.put(ref_module, {});
@@ -2641,13 +2650,13 @@ fn groupTablesByModule(allocator: std.mem.Allocator, tables: []const TableDef) !
     var kit = module_map.keyIterator();
     while (kit.next()) |k| {
         const key = k.*;
-        if (key.len > 1 and key[key.len-1] == 's') {
-            const singular = key[0..key.len-1];
+        if (key.len > 1 and key[key.len - 1] == 's') {
+            const singular = key[0 .. key.len - 1];
             if (module_map.get(singular)) |_| try merge_keys.append(allocator, try allocator.dupe(u8, key));
         }
     }
     for (merge_keys.items) |key| {
-        const singular = key[0..key.len-1];
+        const singular = key[0 .. key.len - 1];
         if (module_map.getPtr(key)) |src| {
             var target = module_map.getPtr(singular).?;
             for (src.items) |t| try target.append(allocator, t);
@@ -2881,7 +2890,7 @@ fn generateModuleService(allocator: std.mem.Allocator, module_name: []const u8, 
         const method_name = try toCamelCase(allocator, effective_name);
         defer allocator.free(method_name);
         const list_sfx = if (std.mem.endsWith(u8, model_name, "s") or std.mem.endsWith(u8, model_name, "S")) "" else "s";
-        const list_method = try std.fmt.allocPrint(allocator, "list{s}{s}", .{model_name, list_sfx});
+        const list_method = try std.fmt.allocPrint(allocator, "list{s}{s}", .{ model_name, list_sfx });
         defer allocator.free(list_method);
 
         try buf.print(allocator, "    pub fn {s}(self: *{s}Service, page: usize, size: usize) !data.orm.PageResult(model.{s}) {{\n", .{ list_method, pascal_module, model_name });
@@ -2996,7 +3005,7 @@ fn pluralizeRoute(allocator: std.mem.Allocator, singular: []const u8) ![]const u
     if (last == 'y' and singular.len > 1) {
         const prev = singular[singular.len - 2];
         if (prev != 'a' and prev != 'e' and prev != 'i' and prev != 'o' and prev != 'u') {
-            const stem = singular[0..singular.len-1];
+            const stem = singular[0 .. singular.len - 1];
             return try std.fmt.allocPrint(allocator, "{s}ies", .{stem});
         }
     }
@@ -3182,7 +3191,6 @@ fn replaceChar(allocator: std.mem.Allocator, s: []const u8, from: u8, to: u8) ![
 
 /// Generate AI context index file (_ai.zig) for a module.
 /// Provides machine-readable metadata: dependencies, tables, API surface, extension points.
-
 fn writeModuleFiles(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u8, module_name: []const u8, tables: []const TableDef, opts: GenOptions, strip_prefix_len: usize) !void {
     const module_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ out_dir, module_name });
     defer allocator.free(module_dir);
@@ -3221,7 +3229,6 @@ fn writeModuleFiles(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u
         const module_path = try std.fmt.allocPrint(allocator, "{s}/module.zig", .{module_dir});
         defer allocator.free(module_path);
         try safeWrite(io, allocator, module_path, module_code, opts);
-
     }
 
     std.log.info("Generated module '{s}' at {s}/ with {d} table(s)", .{ module_name, module_dir, tables.len });
@@ -3247,7 +3254,8 @@ fn generateZentSchema(allocator: std.mem.Allocator, module_name: []const u8, tab
         var has_time_fields = false;
         for (table.columns) |col| {
             if (std.mem.eql(u8, col.name, "created_at") or
-                std.mem.eql(u8, col.name, "updated_at")) {
+                std.mem.eql(u8, col.name, "updated_at"))
+            {
                 has_time_fields = true;
                 break;
             }
@@ -3690,7 +3698,13 @@ fn cmdMigration(io: std.Io, allocator: std.mem.Allocator, args: []const []const 
     defer allocator.free(filepath);
 
     // Check if file exists (never overwrite migration files)
-    _ = std.Io.Dir.cwd().createFile(io, filepath, .{ .exclusive = true }) catch |err| { if (err == error.PathAlreadyExists) { std.log.err("Migration file already exists: {s}", .{filepath}); return error.RefuseOverwrite; } return err; };
+    _ = std.Io.Dir.cwd().createFile(io, filepath, .{ .exclusive = true }) catch |err| {
+        if (err == error.PathAlreadyExists) {
+            std.log.err("Migration file already exists: {s}", .{filepath});
+            return error.RefuseOverwrite;
+        }
+        return err;
+    };
     const content = try std.fmt.allocPrint(allocator,
         \\-- version: {d:0>4}{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>2}
         \\-- description: {s}
@@ -3880,8 +3894,6 @@ fn cmdConfig(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8)
     std.log.info("Created config validator: {s}", .{filepath});
 }
 
-
-
 // ── test: generate integration test scaffolding ──────────────────
 
 fn cmdTest(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -3896,7 +3908,8 @@ fn cmdTest(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--out")) {
             if (i + 1 >= args.len) return error.CliUsage;
-            out_dir = args[i + 1]; i += 1;
+            out_dir = args[i + 1];
+            i += 1;
         }
     }
 
@@ -3943,7 +3956,6 @@ fn cmdTest(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !
     try writeFile(io, fp, buf.items);
     std.log.info("Created test scaffold: {s}", .{fp});
 }
-
 
 // ── scaffold: one-shot SQL → full project ────────────────────────
 
@@ -4232,7 +4244,9 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
             try module_names.append(allocator, entry.key_ptr.*);
         }
         std.mem.sort([]const u8, module_names.items, {}, struct {
-            fn lt(_: void, a: []const u8, b: []const u8) bool { return std.mem.lessThan(u8, a, b); }
+            fn lt(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
         }.lt);
     }
 
@@ -4259,118 +4273,122 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
 
         // ext/ removed — AI modifies generated files directly.
         if (false) {
-        const ext_dir = try std.fmt.allocPrint(allocator, "{s}/{s}/ext", .{ modules_dir, mod_name });
-        defer allocator.free(ext_dir);
-        try ensureDirGen(io, ext_dir, gen_opts);
+            const ext_dir = try std.fmt.allocPrint(allocator, "{s}/{s}/ext", .{ modules_dir, mod_name });
+            defer allocator.free(ext_dir);
+            try ensureDirGen(io, ext_dir, gen_opts);
 
-        const var_name = try replaceChar(allocator, mod_name, '/', '_');
-        defer allocator.free(var_name);
-        const pascal_mod = try toPascalCase(allocator, mod_name);
-        defer allocator.free(pascal_mod);
-        const ext_svc = try std.fmt.allocPrint(allocator,
-            \\// {s} service extension — add custom business logic here.
-            \\// @initialized — AI may modify freely.
-            \\const std = @import("std");
-            \\const zigmodu = @import("zigmodu");
-            \\const ext_svc = @import("../service.zig");
-            \\
-            \\pub const {s}ServiceExt = struct {{
-            \\    svc: *ext_svc.{s}Service,
-            \\    backend: zigmodu.data.SqlxBackend,
-            \\
-            \\    pub fn init(svc: *ext_svc.{s}Service, backend: zigmodu.data.SqlxBackend) {s}ServiceExt {{
-            \\        return .{{ .svc = svc, .backend = backend }};
-            \\    }}
-            \\
-            \\    // Add your custom business methods here
-            \\}};
-            \\
-        , .{ mod_name, pascal_mod, pascal_mod, pascal_mod, pascal_mod });
-        defer allocator.free(ext_svc);
-        const ext_svc_path = try std.fmt.allocPrint(allocator, "{s}/service.zig", .{ ext_dir });
-        defer allocator.free(ext_svc_path);
-        if (!fileExists(io, ext_svc_path)) try safeWrite(io, allocator, ext_svc_path, ext_svc, gen_opts);
+            const var_name = try replaceChar(allocator, mod_name, '/', '_');
+            defer allocator.free(var_name);
+            const pascal_mod = try toPascalCase(allocator, mod_name);
+            defer allocator.free(pascal_mod);
+            const ext_svc = try std.fmt.allocPrint(allocator,
+                \\// {s} service extension — add custom business logic here.
+                \\// @initialized — AI may modify freely.
+                \\const std = @import("std");
+                \\const zigmodu = @import("zigmodu");
+                \\const ext_svc = @import("../service.zig");
+                \\
+                \\pub const {s}ServiceExt = struct {{
+                \\    svc: *ext_svc.{s}Service,
+                \\    backend: zigmodu.data.SqlxBackend,
+                \\
+                \\    pub fn init(svc: *ext_svc.{s}Service, backend: zigmodu.data.SqlxBackend) {s}ServiceExt {{
+                \\        return .{{ .svc = svc, .backend = backend }};
+                \\    }}
+                \\
+                \\    // Add your custom business methods here
+                \\}};
+                \\
+            , .{ mod_name, pascal_mod, pascal_mod, pascal_mod, pascal_mod });
+            defer allocator.free(ext_svc);
+            const ext_svc_path = try std.fmt.allocPrint(allocator, "{s}/service.zig", .{ext_dir});
+            defer allocator.free(ext_svc_path);
+            if (!fileExists(io, ext_svc_path)) try safeWrite(io, allocator, ext_svc_path, ext_svc, gen_opts);
 
-        // Generate ext/api.zig template per module
-        // Compute shared response.zig path for ext/ (one level deeper than API)
-        var ext_depth: usize = 3;
-        for (mod_name) |c| { if (c == '/') ext_depth += 1; }
-        var ext_path_buf = std.ArrayList(u8).empty;
-        defer ext_path_buf.deinit(allocator);
-        var ext_di: usize = 0;
-        while (ext_di < ext_depth) : (ext_di += 1) { try ext_path_buf.appendSlice(allocator, "../"); }
-        try ext_path_buf.appendSlice(allocator, "shared/response.zig");
-        const shared_ext_import = ext_path_buf.items;
+            // Generate ext/api.zig template per module
+            // Compute shared response.zig path for ext/ (one level deeper than API)
+            var ext_depth: usize = 3;
+            for (mod_name) |c| {
+                if (c == '/') ext_depth += 1;
+            }
+            var ext_path_buf = std.ArrayList(u8).empty;
+            defer ext_path_buf.deinit(allocator);
+            var ext_di: usize = 0;
+            while (ext_di < ext_depth) : (ext_di += 1) {
+                try ext_path_buf.appendSlice(allocator, "../");
+            }
+            try ext_path_buf.appendSlice(allocator, "shared/response.zig");
+            const shared_ext_import = ext_path_buf.items;
 
-        const ext_api = try std.fmt.allocPrint(allocator,
-            \\// {s} custom API endpoints — add business routes here.
-            \\// @initialized — AI may modify freely.
-            \\const std = @import("std");
-            \\const zigmodu = @import("zigmodu");
-            \\const http = zigmodu.http;
-            \\const R = @import("{s}");
-            \\const ext_svc = @import("service.zig");
-            \\
-            \\pub const {s}ApiExt = struct {{
-            \\    ext: *ext_svc.{s}ServiceExt,
-            \\
-            \\    pub fn init(ext: *ext_svc.{s}ServiceExt) {s}ApiExt {{
-            \\        return .{{ .ext = ext }};
-            \\    }}
-            \\
-            \\    pub fn registerRoutes(self: *{s}ApiExt, group: *zigmodu.http.RouteGroup) !void {{
-            \\        const p = "/{s}";
-            \\        try group.get(p ++ "/page", hPage, @ptrCast(@alignCast(self)));
-            \\        try group.delete(p ++ "/delete-list", hDeleteList, @ptrCast(@alignCast(self)));
-            \\        try group.get(p ++ "/list-all-simple", hSimple, @ptrCast(@alignCast(self)));
-            \\        try group.get(p ++ "/export-excel", hExport, @ptrCast(@alignCast(self)));
-            \\    }}
-            \\
-            \\    fn resolve2(ctx: *http.Context) *{s}ApiExt {{
-            \\        return @ptrCast(@alignCast(ctx.user_data orelse unreachable));
-            \\    }}
-            \\
-            \\    fn hPage(ctx: *http.Context) !void {{
-            \\        const s = resolve2(ctx);
-            \\        const pn = ctx.queryInt(usize, \"pageNo\", 1);
-            \\        const ps = ctx.queryInt(usize, \"pageSize\", 10);
-            \\        const r = s.ext.svc.list{s}(if (pn > 0) pn - 1 else 0, ps) catch {{ try R.wrapErr(ctx, .server_error, \"Query failed\"); return; }};
-            \\        try R.wrapList(ctx, r);
-            \\    }}
-            \\    fn hDeleteList(ctx: *http.Context) !void {{
-            \\        const s = resolve2(ctx);
-            \\        const ids = ctx.queryStr(\"ids\", \"\");
-            \\        if (ids.len == 0) {{ try R.wrapErr(ctx, 400, \"Missing ids\"); return; }}
-            \\        var it = std.mem.splitScalar(u8, ids, ',');
-            \\        while (it.next()) |id_str| {{
-            \\            const id = std.fmt.parseInt(i64, id_str, 10) catch continue;
-            \\            s.ext.svc.delete{s}(id) catch {{}};
-            \\        }}
-            \\        try R.wrapSuccess(ctx);
-            \\    }}
-            \\    fn hSimple(ctx: *http.Context) !void {{
-            \\        const s = resolve2(ctx);
-            \\        const r = s.ext.svc.list{s}(0, 1000) catch {{ try R.wrapErr(ctx, .server_error, \"Query failed\"); return; }};
-            \\        try R.wrapList(ctx, r);
-            \\    }}
-            \\    fn hExport(ctx: *http.Context) !void {{
-            \\        const s = resolve2(ctx);
-            \\        const r = s.ext.svc.list{s}(0, 10000) catch {{ try R.wrapErr(ctx, .server_error, \"Query failed\"); return; }};
-            \\        var buf = std.ArrayList(u8).empty;
-            \\        try buf.append(ctx.allocator, \"id,name\\n\");
-            \\        for (r.items) |item| {{ _ = item; try buf.appendSlice(ctx.allocator, \"\\n\"); }}
-            \\        ctx.setHeader(\"Content-Type\", \"text/csv; charset=utf-8\") catch {{}};
-            \\        ctx.setHeader(\"Content-Disposition\", \"attachment; filename=export.csv\") catch {{}};
-            \\        try ctx.text(200, buf.items);
-            \\    }}
-            \\}};
-            \\
-        , .{ mod_name, shared_ext_import, pascal_mod, pascal_mod, pascal_mod, pascal_mod, pascal_mod, mod_name, pascal_mod, pascal_mod, pascal_mod, pascal_mod, pascal_mod });
-        defer allocator.free(ext_api);
-    const ext_api_path = try std.fmt.allocPrint(allocator, "{s}/api.zig", .{ ext_dir });
-    defer allocator.free(ext_api_path);
-    if (!fileExists(io, ext_api_path)) try safeWrite(io, allocator, ext_api_path, ext_api, gen_opts);
-    } // if (false) — ext/ removed
+            const ext_api = try std.fmt.allocPrint(allocator,
+                \\// {s} custom API endpoints — add business routes here.
+                \\// @initialized — AI may modify freely.
+                \\const std = @import("std");
+                \\const zigmodu = @import("zigmodu");
+                \\const http = zigmodu.http;
+                \\const R = @import("{s}");
+                \\const ext_svc = @import("service.zig");
+                \\
+                \\pub const {s}ApiExt = struct {{
+                \\    ext: *ext_svc.{s}ServiceExt,
+                \\
+                \\    pub fn init(ext: *ext_svc.{s}ServiceExt) {s}ApiExt {{
+                \\        return .{{ .ext = ext }};
+                \\    }}
+                \\
+                \\    pub fn registerRoutes(self: *{s}ApiExt, group: *zigmodu.http.RouteGroup) !void {{
+                \\        const p = "/{s}";
+                \\        try group.get(p ++ "/page", hPage, @ptrCast(@alignCast(self)));
+                \\        try group.delete(p ++ "/delete-list", hDeleteList, @ptrCast(@alignCast(self)));
+                \\        try group.get(p ++ "/list-all-simple", hSimple, @ptrCast(@alignCast(self)));
+                \\        try group.get(p ++ "/export-excel", hExport, @ptrCast(@alignCast(self)));
+                \\    }}
+                \\
+                \\    fn resolve2(ctx: *http.Context) *{s}ApiExt {{
+                \\        return @ptrCast(@alignCast(ctx.user_data orelse unreachable));
+                \\    }}
+                \\
+                \\    fn hPage(ctx: *http.Context) !void {{
+                \\        const s = resolve2(ctx);
+                \\        const pn = ctx.queryInt(usize, \"pageNo\", 1);
+                \\        const ps = ctx.queryInt(usize, \"pageSize\", 10);
+                \\        const r = s.ext.svc.list{s}(if (pn > 0) pn - 1 else 0, ps) catch {{ try R.wrapErr(ctx, .server_error, \"Query failed\"); return; }};
+                \\        try R.wrapList(ctx, r);
+                \\    }}
+                \\    fn hDeleteList(ctx: *http.Context) !void {{
+                \\        const s = resolve2(ctx);
+                \\        const ids = ctx.queryStr(\"ids\", \"\");
+                \\        if (ids.len == 0) {{ try R.wrapErr(ctx, 400, \"Missing ids\"); return; }}
+                \\        var it = std.mem.splitScalar(u8, ids, ',');
+                \\        while (it.next()) |id_str| {{
+                \\            const id = std.fmt.parseInt(i64, id_str, 10) catch continue;
+                \\            s.ext.svc.delete{s}(id) catch {{}};
+                \\        }}
+                \\        try R.wrapSuccess(ctx);
+                \\    }}
+                \\    fn hSimple(ctx: *http.Context) !void {{
+                \\        const s = resolve2(ctx);
+                \\        const r = s.ext.svc.list{s}(0, 1000) catch {{ try R.wrapErr(ctx, .server_error, \"Query failed\"); return; }};
+                \\        try R.wrapList(ctx, r);
+                \\    }}
+                \\    fn hExport(ctx: *http.Context) !void {{
+                \\        const s = resolve2(ctx);
+                \\        const r = s.ext.svc.list{s}(0, 10000) catch {{ try R.wrapErr(ctx, .server_error, \"Query failed\"); return; }};
+                \\        var buf = std.ArrayList(u8).empty;
+                \\        try buf.append(ctx.allocator, \"id,name\\n\");
+                \\        for (r.items) |item| {{ _ = item; try buf.appendSlice(ctx.allocator, \"\\n\"); }}
+                \\        ctx.setHeader(\"Content-Type\", \"text/csv; charset=utf-8\") catch {{}};
+                \\        ctx.setHeader(\"Content-Disposition\", \"attachment; filename=export.csv\") catch {{}};
+                \\        try ctx.text(200, buf.items);
+                \\    }}
+                \\}};
+                \\
+            , .{ mod_name, shared_ext_import, pascal_mod, pascal_mod, pascal_mod, pascal_mod, pascal_mod, mod_name, pascal_mod, pascal_mod, pascal_mod, pascal_mod, pascal_mod });
+            defer allocator.free(ext_api);
+            const ext_api_path = try std.fmt.allocPrint(allocator, "{s}/api.zig", .{ext_dir});
+            defer allocator.free(ext_api_path);
+            if (!fileExists(io, ext_api_path)) try safeWrite(io, allocator, ext_api_path, ext_api, gen_opts);
+        } // if (false) — ext/ removed
     }
 
     // 4.5 Generate marketing module group (--with-marketing)
@@ -4864,7 +4882,8 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     try ensureDirGen(io, ext_dir, gen_opts);
 
     // ── module.zig ──
-    const mod_path = try std.fmt.allocPrint(allocator, "{s}/module.zig", .{dir}); defer allocator.free(mod_path);
+    const mod_path = try std.fmt.allocPrint(allocator, "{s}/module.zig", .{dir});
+    defer allocator.free(mod_path);
     try safeWrite(io, allocator, mod_path,
         \\//! AI Chat module — LLM-powered conversations
         \\const std = @import("std");
@@ -4887,7 +4906,8 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     , gen_opts);
 
     // ── model.zig ──
-    const model_path = try std.fmt.allocPrint(allocator, "{s}/model.zig", .{dir}); defer allocator.free(model_path);
+    const model_path = try std.fmt.allocPrint(allocator, "{s}/model.zig", .{dir});
+    defer allocator.free(model_path);
     try safeWrite(io, allocator, model_path,
         \\pub const AiConversation = struct {
         \\    pub const sql_table_name: []const u8 = "ai_conversation";
@@ -4903,7 +4923,8 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     , gen_opts);
 
     // ── persistence.zig ──
-    const pers_path = try std.fmt.allocPrint(allocator, "{s}/persistence.zig", .{dir}); defer allocator.free(pers_path);
+    const pers_path = try std.fmt.allocPrint(allocator, "{s}/persistence.zig", .{dir});
+    defer allocator.free(pers_path);
     try safeWrite(io, allocator, pers_path,
         \\const std = @import("std");
         \\const data = @import("zigmodu").data;
@@ -4917,7 +4938,8 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     , gen_opts);
 
     // ── provider.zig ──
-    const prov_path = try std.fmt.allocPrint(allocator, "{s}/provider.zig", .{dir}); defer allocator.free(prov_path);
+    const prov_path = try std.fmt.allocPrint(allocator, "{s}/provider.zig", .{dir});
+    defer allocator.free(prov_path);
     try safeWrite(io, allocator, prov_path,
         \\//! @initialized by zmodu — AI may modify freely
         \\const zigmodu = @import("zigmodu");
@@ -4927,7 +4949,8 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     , gen_opts);
 
     // ── sse.zig ──
-    const sse_path = try std.fmt.allocPrint(allocator, "{s}/sse.zig", .{dir}); defer allocator.free(sse_path);
+    const sse_path = try std.fmt.allocPrint(allocator, "{s}/sse.zig", .{dir});
+    defer allocator.free(sse_path);
     try safeWrite(io, allocator, sse_path,
         \\//! @initialized by zmodu — AI may modify freely
         \\const zigmodu = @import("zigmodu");
@@ -4935,7 +4958,8 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     , gen_opts);
 
     // ── service.zig ──
-    const svc_path = try std.fmt.allocPrint(allocator, "{s}/service.zig", .{dir}); defer allocator.free(svc_path);
+    const svc_path = try std.fmt.allocPrint(allocator, "{s}/service.zig", .{dir});
+    defer allocator.free(svc_path);
     try safeWrite(io, allocator, svc_path,
         \\const std = @import("std");
         \\const zigmodu = @import("zigmodu");
@@ -5075,7 +5099,8 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     , gen_opts);
 
     // ── api.zig ──
-    const api_path = try std.fmt.allocPrint(allocator, "{s}/api.zig", .{dir}); defer allocator.free(api_path);
+    const api_path = try std.fmt.allocPrint(allocator, "{s}/api.zig", .{dir});
+    defer allocator.free(api_path);
     try safeWrite(io, allocator, api_path,
         \\const std = @import("std");
         \\const http = @import("zigmodu").http;
@@ -5133,38 +5158,41 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     , gen_opts);
 
     // ── ext/service.zig ──
-    const esvc_path = try std.fmt.allocPrint(allocator, "{s}/ext/service.zig", .{dir}); defer allocator.free(esvc_path);
+    const esvc_path = try std.fmt.allocPrint(allocator, "{s}/ext/service.zig", .{dir});
+    defer allocator.free(esvc_path);
     if (false) {
-    if (!fileExists(io, esvc_path)) try safeWrite(io, allocator, esvc_path,
-        \\const std = @import("std");
-        \\const zigmodu = @import("zigmodu");
-        \\const ext_svc = @import("../service.zig");
-        \\pub const AiChatServiceExt = struct {
-        \\    svc: *ext_svc.AiChatService; backend: zigmodu.data.SqlxBackend;
-        \\    pub fn init(svc: *ext_svc.AiChatService, backend: zigmodu.data.SqlxBackend) AiChatServiceExt { return .{ .svc = svc, .backend = backend }; }
-        \\};
-    , gen_opts);
+        if (!fileExists(io, esvc_path)) try safeWrite(io, allocator, esvc_path,
+            \\const std = @import("std");
+            \\const zigmodu = @import("zigmodu");
+            \\const ext_svc = @import("../service.zig");
+            \\pub const AiChatServiceExt = struct {
+            \\    svc: *ext_svc.AiChatService; backend: zigmodu.data.SqlxBackend;
+            \\    pub fn init(svc: *ext_svc.AiChatService, backend: zigmodu.data.SqlxBackend) AiChatServiceExt { return .{ .svc = svc, .backend = backend }; }
+            \\};
+        , gen_opts);
     } // if(false) — ext/ removed
 
     // ── ext/api.zig ──
-    const eapi_path = try std.fmt.allocPrint(allocator, "{s}/ext/api.zig", .{dir}); defer allocator.free(eapi_path);
+    const eapi_path = try std.fmt.allocPrint(allocator, "{s}/ext/api.zig", .{dir});
+    defer allocator.free(eapi_path);
     if (false) {
-    if (!fileExists(io, eapi_path)) try safeWrite(io, allocator, eapi_path,
-        \\const std = @import("std");
-        \\const zigmodu = @import("zigmodu");
-        \\const http = zigmodu.http;
-        \\const R = @import("../../../../shared/response.zig");
-        \\const ext_svc = @import("service.zig");
-        \\pub const AiChatApiExt = struct {
-        \\    ext: *ext_svc.AiChatServiceExt;
-        \\    pub fn init(ext: *ext_svc.AiChatServiceExt) AiChatApiExt { return .{ .ext = ext }; }
-        \\    pub fn registerRoutes(self: *AiChatApiExt, group: *zigmodu.http.RouteGroup) !void { _ = self; _ = group; }
-        \\};
-    , gen_opts);
+        if (!fileExists(io, eapi_path)) try safeWrite(io, allocator, eapi_path,
+            \\const std = @import("std");
+            \\const zigmodu = @import("zigmodu");
+            \\const http = zigmodu.http;
+            \\const R = @import("../../../../shared/response.zig");
+            \\const ext_svc = @import("service.zig");
+            \\pub const AiChatApiExt = struct {
+            \\    ext: *ext_svc.AiChatServiceExt;
+            \\    pub fn init(ext: *ext_svc.AiChatServiceExt) AiChatApiExt { return .{ .ext = ext }; }
+            \\    pub fn registerRoutes(self: *AiChatApiExt, group: *zigmodu.http.RouteGroup) !void { _ = self; _ = group; }
+            \\};
+        , gen_opts);
     } // if(false) — ext/ removed
 
     // ── tests.zig ──
-    const test_path = try std.fmt.allocPrint(allocator, "{s}/tests.zig", .{dir}); defer allocator.free(test_path);
+    const test_path = try std.fmt.allocPrint(allocator, "{s}/tests.zig", .{dir});
+    defer allocator.free(test_path);
     if (!fileExists(io, test_path)) try safeWrite(io, allocator, test_path,
         \\const std = @import("std"); const testing = std.testing; const zigmodu = @import("zigmodu"); const model = @import("model.zig"); const provider = @import("provider.zig");
         \\test "model AiConversation defaults" { const c = model.AiConversation{ .id = null, .title = "test", .created_at = 0, .updated_at = 0 }; try testing.expectEqualStrings("deepseek-v4-flash", c.model); }
@@ -5175,7 +5203,8 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
     , gen_opts);
 
     // ── README.md ──
-    const rm_path = try std.fmt.allocPrint(allocator, "{s}/README.md", .{dir}); defer allocator.free(rm_path);
+    const rm_path = try std.fmt.allocPrint(allocator, "{s}/README.md", .{dir});
+    defer allocator.free(rm_path);
     if (!fileExists(io, rm_path)) try safeWrite(io, allocator, rm_path,
         \\# AI Chat Module
         \\Full docs: [zigmodu/docs/AI.md](https://github.com/chy3xyz/zigmodu/blob/main/docs/AI.md)
@@ -5213,13 +5242,16 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
 }
 
 fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []const u8, gen_opts: GenOptions) !void {
-    const dir = try std.fmt.allocPrint(allocator, "{s}/src/modules/ai/agent", .{project_dir}); defer allocator.free(dir);
+    const dir = try std.fmt.allocPrint(allocator, "{s}/src/modules/ai/agent", .{project_dir});
+    defer allocator.free(dir);
     try ensureDirGen(io, dir, gen_opts);
-    const ext_dir = try std.fmt.allocPrint(allocator, "{s}/ext", .{dir}); defer allocator.free(ext_dir);
+    const ext_dir = try std.fmt.allocPrint(allocator, "{s}/ext", .{dir});
+    defer allocator.free(ext_dir);
     try ensureDirGen(io, ext_dir, gen_opts);
 
     // ── module.zig ──
-    const mod_path = try std.fmt.allocPrint(allocator, "{s}/module.zig", .{dir}); defer allocator.free(mod_path);
+    const mod_path = try std.fmt.allocPrint(allocator, "{s}/module.zig", .{dir});
+    defer allocator.free(mod_path);
     try safeWrite(io, allocator, mod_path,
         \\const std = @import("std"); const zigmodu = @import("zigmodu");
         \\pub const info = zigmodu.api.Module{ .name = "ai/agent", .description = "AI Agent module", .dependencies = &.{}, .is_internal = false };
@@ -5231,7 +5263,8 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
     , gen_opts);
 
     // ── model.zig ──
-    const model_path = try std.fmt.allocPrint(allocator, "{s}/model.zig", .{dir}); defer allocator.free(model_path);
+    const model_path = try std.fmt.allocPrint(allocator, "{s}/model.zig", .{dir});
+    defer allocator.free(model_path);
     try safeWrite(io, allocator, model_path,
         \\pub const AgentRun = struct { pub const sql_table_name: []const u8 = "ai_agent_run";
         \\    id: ?i64 = null, tenant_id: i64, user_id: i64, goal: []const u8, status: []const u8 = "pending",
@@ -5245,7 +5278,8 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
     , gen_opts);
 
     // ── persistence.zig ──
-    const pers_path = try std.fmt.allocPrint(allocator, "{s}/persistence.zig", .{dir}); defer allocator.free(pers_path);
+    const pers_path = try std.fmt.allocPrint(allocator, "{s}/persistence.zig", .{dir});
+    defer allocator.free(pers_path);
     try safeWrite(io, allocator, pers_path,
         \\const std = @import("std"); const data = @import("zigmodu").data; const model = @import("model.zig");
         \\pub const AiAgentPersistence = struct { backend: data.SqlxBackend, orm: data.orm.Orm(data.SqlxBackend),
@@ -5256,7 +5290,8 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
     , gen_opts);
 
     // ── agent.zig ──
-    const ag_path = try std.fmt.allocPrint(allocator, "{s}/agent.zig", .{dir}); defer allocator.free(ag_path);
+    const ag_path = try std.fmt.allocPrint(allocator, "{s}/agent.zig", .{dir});
+    defer allocator.free(ag_path);
     try safeWrite(io, allocator, ag_path,
         \\//! Thin re-export of first-class zigmodu.ai.Agent (ReAct + tool_calls).
         \\const zigmodu = @import("zigmodu");
@@ -5267,7 +5302,8 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
     , gen_opts);
 
     // ── service.zig ──
-    const svc_path = try std.fmt.allocPrint(allocator, "{s}/service.zig", .{dir}); defer allocator.free(svc_path);
+    const svc_path = try std.fmt.allocPrint(allocator, "{s}/service.zig", .{dir});
+    defer allocator.free(svc_path);
     try safeWrite(io, allocator, svc_path,
         \\const std = @import("std");
         \\const zigmodu = @import("zigmodu");
@@ -5343,9 +5379,9 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
         \\};
     , gen_opts);
 
-
     // ── api.zig ──
-    const api_path = try std.fmt.allocPrint(allocator, "{s}/api.zig", .{dir}); defer allocator.free(api_path);
+    const api_path = try std.fmt.allocPrint(allocator, "{s}/api.zig", .{dir});
+    defer allocator.free(api_path);
     try safeWrite(io, allocator, api_path,
         \\const std = @import("std");
         \\const zigmodu = @import("zigmodu");
@@ -5394,30 +5430,33 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
     , gen_opts);
 
     // ── ext/service.zig ──
-    const esvc_path = try std.fmt.allocPrint(allocator, "{s}/ext/service.zig", .{dir}); defer allocator.free(esvc_path);
+    const esvc_path = try std.fmt.allocPrint(allocator, "{s}/ext/service.zig", .{dir});
+    defer allocator.free(esvc_path);
     if (false) {
-    if (!fileExists(io, esvc_path)) try safeWrite(io, allocator, esvc_path,
-        \\const std = @import("std"); const zigmodu = @import("zigmodu"); const ext_svc = @import("../service.zig");
-        \\pub const AiAgentServiceExt = struct { svc: *ext_svc.AiAgentService; backend: zigmodu.data.SqlxBackend;
-        \\    pub fn init(svc: *ext_svc.AiAgentService, backend: zigmodu.data.SqlxBackend) AiAgentServiceExt { return .{ .svc = svc, .backend = backend }; }
-        \\};
-    , gen_opts);
+        if (!fileExists(io, esvc_path)) try safeWrite(io, allocator, esvc_path,
+            \\const std = @import("std"); const zigmodu = @import("zigmodu"); const ext_svc = @import("../service.zig");
+            \\pub const AiAgentServiceExt = struct { svc: *ext_svc.AiAgentService; backend: zigmodu.data.SqlxBackend;
+            \\    pub fn init(svc: *ext_svc.AiAgentService, backend: zigmodu.data.SqlxBackend) AiAgentServiceExt { return .{ .svc = svc, .backend = backend }; }
+            \\};
+        , gen_opts);
     } // if(false) — ext/ removed
 
     // ── ext/api.zig ──
-    const eapi_path = try std.fmt.allocPrint(allocator, "{s}/ext/api.zig", .{dir}); defer allocator.free(eapi_path);
+    const eapi_path = try std.fmt.allocPrint(allocator, "{s}/ext/api.zig", .{dir});
+    defer allocator.free(eapi_path);
     if (false) {
-    if (!fileExists(io, eapi_path)) try safeWrite(io, allocator, eapi_path,
-        \\const std = @import("std"); const zigmodu = @import("zigmodu"); const http = zigmodu.http; const R = @import("../../../../shared/response.zig"); const ext_svc = @import("service.zig");
-        \\pub const AiAgentApiExt = struct { ext: *ext_svc.AiAgentServiceExt;
-        \\    pub fn init(ext: *ext_svc.AiAgentServiceExt) AiAgentApiExt { return .{ .ext = ext }; }
-        \\    pub fn registerRoutes(self: *AiAgentApiExt, group: *zigmodu.http.RouteGroup) !void { _ = self; _ = group; }
-        \\};
-    , gen_opts);
+        if (!fileExists(io, eapi_path)) try safeWrite(io, allocator, eapi_path,
+            \\const std = @import("std"); const zigmodu = @import("zigmodu"); const http = zigmodu.http; const R = @import("../../../../shared/response.zig"); const ext_svc = @import("service.zig");
+            \\pub const AiAgentApiExt = struct { ext: *ext_svc.AiAgentServiceExt;
+            \\    pub fn init(ext: *ext_svc.AiAgentServiceExt) AiAgentApiExt { return .{ .ext = ext }; }
+            \\    pub fn registerRoutes(self: *AiAgentApiExt, group: *zigmodu.http.RouteGroup) !void { _ = self; _ = group; }
+            \\};
+        , gen_opts);
     } // if(false) — ext/ removed
 
     // ── tests.zig ──
-    const test_path = try std.fmt.allocPrint(allocator, "{s}/tests.zig", .{dir}); defer allocator.free(test_path);
+    const test_path = try std.fmt.allocPrint(allocator, "{s}/tests.zig", .{dir});
+    defer allocator.free(test_path);
     if (!fileExists(io, test_path)) try safeWrite(io, allocator, test_path,
         \\const std = @import("std");
         \\const testing = std.testing;
@@ -5449,7 +5488,8 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
     , gen_opts);
 
     // ── README.md ──
-    const rm_path = try std.fmt.allocPrint(allocator, "{s}/README.md", .{dir}); defer allocator.free(rm_path);
+    const rm_path = try std.fmt.allocPrint(allocator, "{s}/README.md", .{dir});
+    defer allocator.free(rm_path);
     if (!fileExists(io, rm_path)) try safeWrite(io, allocator, rm_path,
         \\# AI Agent Module
         \\## ReAct execution loop: Think → Act → Observe → repeat
@@ -5460,13 +5500,16 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
 }
 
 fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []const u8, gen_opts: GenOptions) !void {
-    const dir = try std.fmt.allocPrint(allocator, "{s}/src/modules/web4", .{project_dir}); defer allocator.free(dir);
+    const dir = try std.fmt.allocPrint(allocator, "{s}/src/modules/web4", .{project_dir});
+    defer allocator.free(dir);
     try ensureDirGen(io, dir, gen_opts);
-    const ext_dir = try std.fmt.allocPrint(allocator, "{s}/ext", .{dir}); defer allocator.free(ext_dir);
+    const ext_dir = try std.fmt.allocPrint(allocator, "{s}/ext", .{dir});
+    defer allocator.free(ext_dir);
     try ensureDirGen(io, ext_dir, gen_opts);
 
     // ── module.zig ──
-    const m = try std.fmt.allocPrint(allocator, "{s}/module.zig", .{dir}); defer allocator.free(m);
+    const m = try std.fmt.allocPrint(allocator, "{s}/module.zig", .{dir});
+    defer allocator.free(m);
     try safeWrite(io, allocator, m,
         \\const std = @import("std"); const zigmodu = @import("zigmodu");
         \\pub const info = zigmodu.api.Module{ .name = "web4", .description = "Web4: DID identity + x402 monetization", .dependencies = &.{}, .is_internal = false };
@@ -5478,7 +5521,8 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
     , gen_opts);
 
     // ── model.zig ──
-    const mp = try std.fmt.allocPrint(allocator, "{s}/model.zig", .{dir}); defer allocator.free(mp);
+    const mp = try std.fmt.allocPrint(allocator, "{s}/model.zig", .{dir});
+    defer allocator.free(mp);
     try safeWrite(io, allocator, mp,
         \\pub const Web4Identity = struct { pub const sql_table_name: []const u8 = "web4_identity";
         \\    id: ?i64 = null, tenant_id: i64, user_id: i64, did: []const u8, did_doc: []const u8,
@@ -5492,7 +5536,8 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
     , gen_opts);
 
     // ── persistence.zig ──
-    const pp = try std.fmt.allocPrint(allocator, "{s}/persistence.zig", .{dir}); defer allocator.free(pp);
+    const pp = try std.fmt.allocPrint(allocator, "{s}/persistence.zig", .{dir});
+    defer allocator.free(pp);
     try safeWrite(io, allocator, pp,
         \\const std = @import("std"); const data = @import("zigmodu").data; const model = @import("model.zig");
         \\pub const Web4Persistence = struct { backend: data.SqlxBackend, orm: data.orm.Orm(data.SqlxBackend),
@@ -5503,7 +5548,8 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
     , gen_opts);
 
     // ── service.zig ──
-    const sp = try std.fmt.allocPrint(allocator, "{s}/service.zig", .{dir}); defer allocator.free(sp);
+    const sp = try std.fmt.allocPrint(allocator, "{s}/service.zig", .{dir});
+    defer allocator.free(sp);
     try safeWrite(io, allocator, sp,
         \\const std = @import("std"); const zigmodu = @import("zigmodu"); const model = @import("model.zig"); const persistence = @import("persistence.zig");
         \\pub const Web4Service = struct { persistence: *persistence.Web4Persistence, allocator: std.mem.Allocator, io: std.Io,
@@ -5525,7 +5571,8 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
     , gen_opts);
 
     // ── api.zig ──
-    const ap = try std.fmt.allocPrint(allocator, "{s}/api.zig", .{dir}); defer allocator.free(ap);
+    const ap = try std.fmt.allocPrint(allocator, "{s}/api.zig", .{dir});
+    defer allocator.free(ap);
     try safeWrite(io, allocator, ap,
         \\const std = @import("std");
         \\const zigmodu = @import("zigmodu");
@@ -5582,30 +5629,33 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
     , gen_opts);
 
     // ── ext/service.zig ──
-    const es = try std.fmt.allocPrint(allocator, "{s}/ext/service.zig", .{dir}); defer allocator.free(es);
+    const es = try std.fmt.allocPrint(allocator, "{s}/ext/service.zig", .{dir});
+    defer allocator.free(es);
     if (false) {
-    if (!fileExists(io, es)) try safeWrite(io, allocator, es,
-        \\const std = @import("std"); const zigmodu = @import("zigmodu"); const ext_svc = @import("../service.zig");
-        \\pub const Web4ServiceExt = struct { svc: *ext_svc.Web4Service; backend: zigmodu.data.SqlxBackend;
-        \\    pub fn init(svc: *ext_svc.Web4Service, backend: zigmodu.data.SqlxBackend) Web4ServiceExt { return .{ .svc = svc, .backend = backend }; }
-        \\};
-    , gen_opts);
+        if (!fileExists(io, es)) try safeWrite(io, allocator, es,
+            \\const std = @import("std"); const zigmodu = @import("zigmodu"); const ext_svc = @import("../service.zig");
+            \\pub const Web4ServiceExt = struct { svc: *ext_svc.Web4Service; backend: zigmodu.data.SqlxBackend;
+            \\    pub fn init(svc: *ext_svc.Web4Service, backend: zigmodu.data.SqlxBackend) Web4ServiceExt { return .{ .svc = svc, .backend = backend }; }
+            \\};
+        , gen_opts);
     } // if(false) — ext/ removed
 
     // ── ext/api.zig ──
-    const ea = try std.fmt.allocPrint(allocator, "{s}/ext/api.zig", .{dir}); defer allocator.free(ea);
+    const ea = try std.fmt.allocPrint(allocator, "{s}/ext/api.zig", .{dir});
+    defer allocator.free(ea);
     if (false) {
-    if (!fileExists(io, ea)) try safeWrite(io, allocator, ea,
-        \\const std = @import("std"); const zigmodu = @import("zigmodu"); const http = zigmodu.http; const R = @import("../../../shared/response.zig"); const ext_svc = @import("service.zig");
-        \\pub const Web4ApiExt = struct { ext: *ext_svc.Web4ServiceExt;
-        \\    pub fn init(ext: *ext_svc.Web4ServiceExt) Web4ApiExt { return .{ .ext = ext }; }
-        \\    pub fn registerRoutes(self: *Web4ApiExt, group: *zigmodu.http.RouteGroup) !void { _ = self; _ = group; }
-        \\};
-    , gen_opts);
+        if (!fileExists(io, ea)) try safeWrite(io, allocator, ea,
+            \\const std = @import("std"); const zigmodu = @import("zigmodu"); const http = zigmodu.http; const R = @import("../../../shared/response.zig"); const ext_svc = @import("service.zig");
+            \\pub const Web4ApiExt = struct { ext: *ext_svc.Web4ServiceExt;
+            \\    pub fn init(ext: *ext_svc.Web4ServiceExt) Web4ApiExt { return .{ .ext = ext }; }
+            \\    pub fn registerRoutes(self: *Web4ApiExt, group: *zigmodu.http.RouteGroup) !void { _ = self; _ = group; }
+            \\};
+        , gen_opts);
     } // if(false) — ext/ removed
 
     // ── tests.zig ──
-    const wt = try std.fmt.allocPrint(allocator, "{s}/tests.zig", .{dir}); defer allocator.free(wt);
+    const wt = try std.fmt.allocPrint(allocator, "{s}/tests.zig", .{dir});
+    defer allocator.free(wt);
     if (!fileExists(io, wt)) try safeWrite(io, allocator, wt,
         \\const std = @import("std"); const testing = std.testing; const zigmodu = @import("zigmodu"); const model = @import("model.zig");
         \\test "Web4Identity defaults" { const i = model.Web4Identity{ .id = null, .tenant_id = 1, .user_id = 1, .did = "did:key:z6Mk...", .did_doc = "{}", .public_key = "ed25519", .created_at = 0 }; try testing.expectEqual(@as(i64, 1), i.tenant_id); }
@@ -5617,7 +5667,8 @@ fn generateWeb4Module(io: std.Io, allocator: std.mem.Allocator, project_dir: []c
     , gen_opts);
 
     // ── README.md ──
-    const wr = try std.fmt.allocPrint(allocator, "{s}/README.md", .{dir}); defer allocator.free(wr);
+    const wr = try std.fmt.allocPrint(allocator, "{s}/README.md", .{dir});
+    defer allocator.free(wr);
     if (!fileExists(io, wr)) try safeWrite(io, allocator, wr,
         \\# Web4 Module — DID + x402
         \\## Identity (DID)
@@ -6363,57 +6414,57 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
     const ext_svc_path = try std.fmt.allocPrint(allocator, "{s}/ext/service.zig", .{im_dir});
     defer allocator.free(ext_svc_path);
     if (false) {
-    if (!fileExists(io, ext_svc_path)) {
-        try safeWrite(io, allocator, ext_svc_path,
-            \\// IM service extension — add custom business logic here.
-            \\// @initialized — AI may modify freely.
-            \\const std = @import("std");
-            \\const zigmodu = @import("zigmodu");
-            \\const ext_svc = @import("../service.zig");
-            \\
-            \\pub const ImServiceExt = struct {
-            \\    svc: *ext_svc.ImService,
-            \\    backend: zigmodu.data.SqlxBackend,
-            \\
-            \\    pub fn init(svc: *ext_svc.ImService, backend: zigmodu.data.SqlxBackend) ImServiceExt {
-            \\        return .{ .svc = svc, .backend = backend };
-            \\    }
-            \\};
-            \\
-        , gen_opts);
-    } // if(false) — ext/ removed
+        if (!fileExists(io, ext_svc_path)) {
+            try safeWrite(io, allocator, ext_svc_path,
+                \\// IM service extension — add custom business logic here.
+                \\// @initialized — AI may modify freely.
+                \\const std = @import("std");
+                \\const zigmodu = @import("zigmodu");
+                \\const ext_svc = @import("../service.zig");
+                \\
+                \\pub const ImServiceExt = struct {
+                \\    svc: *ext_svc.ImService,
+                \\    backend: zigmodu.data.SqlxBackend,
+                \\
+                \\    pub fn init(svc: *ext_svc.ImService, backend: zigmodu.data.SqlxBackend) ImServiceExt {
+                \\        return .{ .svc = svc, .backend = backend };
+                \\    }
+                \\};
+                \\
+            , gen_opts);
+        } // if(false) — ext/ removed
     }
 
     // ── ext/api.zig ──
     const ext_api_path = try std.fmt.allocPrint(allocator, "{s}/ext/api.zig", .{im_dir});
     defer allocator.free(ext_api_path);
     if (false) {
-    if (!fileExists(io, ext_api_path)) {
-        try safeWrite(io, allocator, ext_api_path,
-            \\// IM API extension — add custom endpoints here.
-            \\// @initialized — AI may modify freely.
-            \\const std = @import("std");
-            \\const zigmodu = @import("zigmodu");
-            \\const http = zigmodu.http;
-            \\const R = @import("../../../shared/response.zig");
-            \\const ext_svc = @import("service.zig");
-            \\
-            \\pub const ImApiExt = struct {
-            \\    ext: *ext_svc.ImServiceExt,
-            \\
-            \\    pub fn init(ext: *ext_svc.ImServiceExt) ImApiExt {
-            \\        return .{ .ext = ext };
-            \\    }
-            \\
-            \\    pub fn registerRoutes(self: *ImApi, group: *zigmodu.http.RouteGroup) !void {
-            \\        _ = self;
-            \\        _ = group;
-            \\        // Add custom IM routes here
-            \\    }
-            \\};
-            \\
-        , gen_opts);
-    } // if(false) — ext/ removed
+        if (!fileExists(io, ext_api_path)) {
+            try safeWrite(io, allocator, ext_api_path,
+                \\// IM API extension — add custom endpoints here.
+                \\// @initialized — AI may modify freely.
+                \\const std = @import("std");
+                \\const zigmodu = @import("zigmodu");
+                \\const http = zigmodu.http;
+                \\const R = @import("../../../shared/response.zig");
+                \\const ext_svc = @import("service.zig");
+                \\
+                \\pub const ImApiExt = struct {
+                \\    ext: *ext_svc.ImServiceExt,
+                \\
+                \\    pub fn init(ext: *ext_svc.ImServiceExt) ImApiExt {
+                \\        return .{ .ext = ext };
+                \\    }
+                \\
+                \\    pub fn registerRoutes(self: *ImApi, group: *zigmodu.http.RouteGroup) !void {
+                \\        _ = self;
+                \\        _ = group;
+                \\        // Add custom IM routes here
+                \\    }
+                \\};
+                \\
+            , gen_opts);
+        } // if(false) — ext/ removed
     }
 
     // ── tests.zig ──
@@ -6679,8 +6730,12 @@ fn generateLifeDir(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u8
     const life_dir = try std.fmt.allocPrint(allocator, "{s}/.life", .{out_dir});
     defer allocator.free(life_dir);
     try ensureDirGen(io, life_dir, gen_opts);
-    const td = try std.fmt.allocPrint(allocator, "{s}/tree", .{life_dir}); defer allocator.free(td); try ensureDirGen(io, td, gen_opts);
-    const md = try std.fmt.allocPrint(allocator, "{s}/memory", .{life_dir}); defer allocator.free(md); try ensureDirGen(io, md, gen_opts);
+    const td = try std.fmt.allocPrint(allocator, "{s}/tree", .{life_dir});
+    defer allocator.free(td);
+    try ensureDirGen(io, td, gen_opts);
+    const md = try std.fmt.allocPrint(allocator, "{s}/memory", .{life_dir});
+    defer allocator.free(md);
+    try ensureDirGen(io, md, gen_opts);
 
     // DNA.md — minimal birth record
     const dp = try std.fmt.allocPrint(allocator, "{s}/DNA.md", .{life_dir});
@@ -6690,8 +6745,10 @@ fn generateLifeDir(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u8
     try safeWrite(io, allocator, dp, dna.items, gen_opts);
 
     // manifest.json — compact
-    const mp = try std.fmt.allocPrint(allocator, "{s}/manifest.json", .{life_dir}); defer allocator.free(mp);
-    const mf_json = try std.fmt.allocPrint(allocator, "{{\"name\":\"{s}\",\"modules\":{d},\"tables\":{d},\"v\":\"0.1.0\"}}\n", .{ project_name, module_count, table_count }); defer allocator.free(mf_json);
+    const mp = try std.fmt.allocPrint(allocator, "{s}/manifest.json", .{life_dir});
+    defer allocator.free(mp);
+    const mf_json = try std.fmt.allocPrint(allocator, "{{\"name\":\"{s}\",\"modules\":{d},\"tables\":{d},\"v\":\"0.1.0\"}}\n", .{ project_name, module_count, table_count });
+    defer allocator.free(mf_json);
     try safeWrite(io, allocator, mp, mf_json, gen_opts);
 
     // tree/v0.1.0.md — genesis node
@@ -7189,7 +7246,8 @@ fn cmdAdd(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--sql")) {
             if (i + 1 >= args.len) return error.CliUsage;
-            sql_path = args[i + 1]; i += 1;
+            sql_path = args[i + 1];
+            i += 1;
         } else if (std.mem.eql(u8, args[i], "--force")) {
             force = true;
         } else if (std.mem.eql(u8, args[i], "--dry-run")) {
@@ -7235,9 +7293,16 @@ fn cmdAdd(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
     defer {
         for (tables) |t| {
             allocator.free(t.name);
-            for (t.columns) |c| { allocator.free(c.name); if (c.comment) |com| allocator.free(com); }
+            for (t.columns) |c| {
+                allocator.free(c.name);
+                if (c.comment) |com| allocator.free(com);
+            }
             allocator.free(t.columns);
-            for (t.foreign_keys) |fk| { allocator.free(fk.column_name); allocator.free(fk.ref_table); allocator.free(fk.ref_column); }
+            for (t.foreign_keys) |fk| {
+                allocator.free(fk.column_name);
+                allocator.free(fk.ref_table);
+                allocator.free(fk.ref_column);
+            }
             allocator.free(t.foreign_keys);
         }
         allocator.free(tables);
@@ -7264,7 +7329,9 @@ fn cmdAdd(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
         var iter = module_map.iterator();
         while (iter.next()) |entry| try module_names.append(allocator, entry.key_ptr.*);
         std.mem.sort([]const u8, module_names.items, {}, struct {
-            fn lt(_: void, a: []const u8, b: []const u8) bool { return std.mem.lessThan(u8, a, b); }
+            fn lt(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
         }.lt);
     }
 
@@ -7728,7 +7795,6 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
         );
     }
 
-
     if (sopts.with_resilience) {
         try buf.appendSlice(allocator, "    try health_endpoint.registerCheckWithContext(\"database\", \"DB connectivity\", zigmodu.HealthEndpoint.databaseCheck, @ptrCast(&db_client));\n");
     }
@@ -7911,10 +7977,10 @@ fn generateScaffoldTestsZig(allocator: std.mem.Allocator, module_names: []const 
         const pl_sfx = if (std.mem.endsWith(u8, pascal, "s") or std.mem.endsWith(u8, pascal, "S")) "" else "s";
         // Use "name" field if module likely has one; otherwise just test init
         const has_name = std.mem.indexOf(u8, var_name, "user") != null or
-                         std.mem.indexOf(u8, var_name, "product") != null or
-                         std.mem.indexOf(u8, var_name, "customer") != null or
-                         std.mem.indexOf(u8, var_name, "dept") != null or
-                         std.mem.indexOf(u8, var_name, "role") != null;
+            std.mem.indexOf(u8, var_name, "product") != null or
+            std.mem.indexOf(u8, var_name, "customer") != null or
+            std.mem.indexOf(u8, var_name, "dept") != null or
+            std.mem.indexOf(u8, var_name, "role") != null;
         if (has_name) {
             try buf.print(allocator,
                 \\test "integration: {s} CRUD" {{
@@ -8262,4 +8328,3 @@ test "inferModuleName from table list" {
     defer allocator.free(name);
     try std.testing.expectEqualStrings("ad_category", name);
 }
-

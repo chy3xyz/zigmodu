@@ -4,14 +4,16 @@ const http = zigmodu.http;
 
 /// 租户拦截中间件 — 从请求中提取 X-Tenant-ID 并设置 TenantContext
 pub fn tenantMiddleware() http.Middleware {
-    return .{ .func = struct {
-        fn handle(ctx: *http.Context, next: http.HandlerFn, _: ?*anyopaque) anyerror!void {
-            if (ctx.header("X-Tenant-ID")) |_| {
-                // 生产环境: 解析并设置 TenantContext
+    return .{
+        .func = struct {
+            fn handle(ctx: *http.Context, next: http.HandlerFn, _: ?*anyopaque) anyerror!void {
+                if (ctx.header("X-Tenant-ID")) |_| {
+                    // 生产环境: 解析并设置 TenantContext
+                }
+                try next(ctx);
             }
-            try next(ctx);
-        }
-    }.handle };
+        }.handle,
+    };
 }
 
 /// JWT + SQLite role→permission (`CatalogPermDb`) into `permissions` attr.

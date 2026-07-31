@@ -807,4 +807,3 @@ test "Hpack decodeString Huffman end-to-end via Decoder.decode" {
     try std.testing.expectEqualStrings(":authority", headers[0].name);
     try std.testing.expectEqualStrings("www.example.com", headers[0].value);
 }
-

@@ -159,8 +159,8 @@ pub fn main(init: std.process.Init) !void {
     const OutboxApiT = @TypeOf(outbox_http);
     const AdminBffApiT = @TypeOf(admin_bff_api);
     comptime zigmodu.http.assertNoDupes(.{
-        TenantApiT,   UserApiT,     ProductApiT, InventoryApiT, CartApiT,
-        OrderApiT,    PaymentApiT,  ShopBffApiT, OutboxApiT,    AdminBffApiT,
+        TenantApiT, UserApiT,    ProductApiT, InventoryApiT, CartApiT,
+        OrderApiT,  PaymentApiT, ShopBffApiT, OutboxApiT,    AdminBffApiT,
     });
 
     var router = zigmodu.http.Router(AppState).init(io, allocator, &server, &app_state);

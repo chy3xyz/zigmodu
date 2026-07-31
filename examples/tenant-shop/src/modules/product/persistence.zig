@@ -13,7 +13,8 @@ pub fn ProductPersistence(comptime Backend: type) type {
         }
 
         pub fn findById(self: *Self, tenant_id: i64, product_id: i64) !?model.Product {
-            return self.db.queryRowPartial(model.Product,
+            return self.db.queryRowPartial(
+                model.Product,
                 "SELECT id, tenant_id, name, price_cents, status, created_at, updated_at FROM products WHERE tenant_id = ? AND id = ?",
                 &.{ .{ .int = tenant_id }, .{ .int = product_id } },
             ) catch |err| switch (err) {
@@ -23,7 +24,8 @@ pub fn ProductPersistence(comptime Backend: type) type {
         }
 
         pub fn findByTenant(self: *Self, tenant_id: i64) !data.sqlx.QueryResult(model.Product) {
-            return try self.db.queryRowsPartial(model.Product,
+            return try self.db.queryRowsPartial(
+                model.Product,
                 "SELECT id, tenant_id, name, price_cents, status, created_at, updated_at FROM products WHERE tenant_id = ? AND status = 1 ORDER BY id",
                 &.{.{ .int = tenant_id }},
             );
@@ -53,7 +55,9 @@ pub const Tx = struct {
         tenant_id: i64,
         product_id: i64,
     ) !i64 {
-        const product = try tx.queryRow(allocator, model.Product,
+        const product = try tx.queryRow(
+            allocator,
+            model.Product,
             "SELECT id, tenant_id, name, price_cents, status, created_at, updated_at FROM products WHERE tenant_id = ? AND id = ?",
             &.{ .{ .int = tenant_id }, .{ .int = product_id } },
         );

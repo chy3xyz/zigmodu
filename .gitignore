@@ -76,4 +76,7 @@ profile/
 .env
 .env.local
 config.local.json
-wal_test_*/
+wal_test*/
+
+# Local tool output
+.codegraph/

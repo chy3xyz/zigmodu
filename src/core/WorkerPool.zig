@@ -240,7 +240,6 @@ pub const WorkerPool = struct {
             _ = shared.completed_tasks.fetchAdd(1, .monotonic);
         }
     }
-
 };
 
 fn signalShutdown(shared: *WorkerPool.Shared) void {
@@ -394,5 +393,3 @@ test "WorkerPool stats toPrometheusFormat includes expected labels" {
     try std.testing.expect(std.mem.indexOf(u8, out, "zigmodu_workerpool_rejected_tasks_total{pool=\"demo\"} 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "zigmodu_workerpool_utilization{pool=\"demo\"} 0.500") != null);
 }
-
-

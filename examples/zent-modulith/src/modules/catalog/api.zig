@@ -7,7 +7,7 @@ const service = @import("service.zig");
 pub fn CatalogApi(comptime Service: type) type {
     return struct {
         const Self = @This();
-        svc: *Service;
+        svc: *Service,
 
         pub const module_name = "catalog";
         pub const nest = .{};

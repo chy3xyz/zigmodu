@@ -4,7 +4,7 @@
 **框架版本**: v0.14.16  
 
 **Zig 版本**: 0.17.0  
-**测试结果**: **664+ passed, 20 skipped, 0 failed**（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`，2026-07-31 复测）  
+**测试结果**: **745+ passed, 20 skipped, 0 failed**（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`，2026-07-31 复测）  
 
 **生产门禁**: `zig build check`（热路径禁止裸 `catch {}`）  
 **旗舰示例**: [`examples/tenant-mgmt/`](../examples/tenant-mgmt/) — SQLite 持久层 + 真 JWT + CI 业务断言  
@@ -26,7 +26,7 @@
 | 6 | **可观测性** | 98 | 93 | +5 | Prometheus + OTLP/HTTP JSON 上报(重试) + Health Probe |
 | 7 | **开发者体验** | 98 | 95 | +3 | 内置 `zmodu` CLI、`builder` API |
 | 8 | **分布式** | 93 | 88 | +5 | Cluster + DistEventBus + Raft Log Compaction |
-| 9 | **测试质量** | 97 | 93 | +4 | ~664 passed；integration 含 JWT + CRUD + shopdemo smoke |
+| 9 | **测试质量** | 97 | 93 | +4 | ~745 passed；integration 含 JWT + CRUD + shopdemo smoke |
 | 10 | **运维/DevOps** | 98 | 98 | — | CI matrix + integration-full + DB jobs |
 | 11 | **内存安全** | 96 | 92 | +4 | P0 泄漏修复 + 生产 check 门禁 |
 | 12 | **文档** | 97 | 90 | +7 | ZMODU / ZENT / MODULITH / 多租户可选说明 |

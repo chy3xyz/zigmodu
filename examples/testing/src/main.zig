@@ -119,7 +119,8 @@ fn testModuleLifecycle(allocator: std.mem.Allocator) !void {
 fn testCalculatorOperations(io: std.Io, allocator: std.mem.Allocator) !void {
     std.log.info("Test 2: Calculator Operations", .{});
 
-    var app = try zigmodu.Application.init(io,
+    var app = try zigmodu.Application.init(
+        io,
         allocator,
         "test-app",
         .{CalculatorModule},
@@ -183,7 +184,8 @@ fn testWithMockModule(_: std.Io, allocator: std.mem.Allocator) !void {
 test "calculator basic operations" {
     const allocator = std.testing.allocator;
 
-    var app = try zigmodu.Application.init(std.testing.io,
+    var app = try zigmodu.Application.init(
+        std.testing.io,
         allocator,
         "test",
         .{CalculatorModule},
@@ -215,7 +217,8 @@ test "module dependency validation" {
     const allocator = std.testing.allocator;
 
     // 这应该成功，因为 calculator_service 依赖 calculator
-    var app = try zigmodu.Application.init(std.testing.io,
+    var app = try zigmodu.Application.init(
+        std.testing.io,
         allocator,
         "test",
         .{ CalculatorModule, CalculatorService },

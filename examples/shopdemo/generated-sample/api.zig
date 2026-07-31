@@ -809,5 +809,4 @@ pub const OrderApi = struct {
         try self.service.deleteZmoduOrderTrade(id);
         try ctx.json(204, "");
     }
-
 };

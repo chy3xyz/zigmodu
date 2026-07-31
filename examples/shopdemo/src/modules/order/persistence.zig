@@ -56,5 +56,4 @@ pub const OrderPersistence = struct {
     pub fn zmoduOrderTradeRepo(self: *OrderPersistence) data.Repository(model.ZmoduOrderTrade) {
         return .{ .orm = &self.orm };
     }
-
 };

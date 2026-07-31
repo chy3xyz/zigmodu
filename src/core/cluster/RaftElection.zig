@@ -111,7 +111,6 @@ pub const RaftElection = struct {
     last_included_term: u64 = 0,
     snapshot_data: ?[]const u8 = null,
 
-
     // Volatile state (all servers)
     state: RaftState = .follower,
     leader_id: ?[]const u8 = null,
@@ -401,16 +400,16 @@ pub const RaftElection = struct {
                     entries[entries.len - 1].index
                 else
                     prev_log_idx;
-                self.next_index.put(peer.id, matched + 1) catch {};
-                self.match_index.put(peer.id, matched) catch {};
+                self.next_index.put(peer.id, matched + 1) catch |err| std.log.err("[RaftElection] next_index update failed: {}", .{err});
+                self.match_index.put(peer.id, matched) catch |err| std.log.err("[RaftElection] match_index update failed: {}", .{err});
             } else {
                 // Decrement next_index for fast backtracking
                 if (next_idx > 1) {
-                    self.next_index.put(peer.id, next_idx - 1) catch {};
+                    self.next_index.put(peer.id, next_idx - 1) catch |err| std.log.err("[RaftElection] next_index backtrack failed: {}", .{err});
                 }
                 if (resp.match_index > 0) {
                     // Use follower's match_index hint for faster convergence
-                    self.next_index.put(peer.id, @min(next_idx - 1, resp.match_index + 1)) catch {};
+                    self.next_index.put(peer.id, @min(next_idx - 1, resp.match_index + 1)) catch |err| std.log.err("[RaftElection] next_index hint update failed: {}", .{err});
                 }
             }
         }
@@ -491,8 +490,8 @@ pub const RaftElection = struct {
         self.match_index.clearRetainingCapacity();
 
         for (self.peers.items) |peer| {
-            self.next_index.put(peer.id, last_log_idx + 1) catch {};
-            self.match_index.put(peer.id, 0) catch {};
+            self.next_index.put(peer.id, last_log_idx + 1) catch |err| std.log.err("[RaftElection] next_index reset failed: {}", .{err});
+            self.match_index.put(peer.id, 0) catch |err| std.log.err("[RaftElection] match_index reset failed: {}", .{err});
         }
 
         const now_ms = Time.monotonicNowMilliseconds();
@@ -504,7 +503,7 @@ pub const RaftElection = struct {
         });
 
         // Send initial heartbeat immediately (as AppendEntries with empty entries)
-        self.sendHeartbeats() catch {};
+        self.sendHeartbeats() catch |err| std.log.err("[RaftElection] initial heartbeat failed: {}", .{err});
     }
 
     /// Send heartbeats to all peers (AppendEntries with empty entries).
@@ -620,7 +619,6 @@ pub const RaftElection = struct {
         }
         self.log.items.len = remaining;
 
-
         self.last_included_index = up_to_index;
 
         if (self.snapshot_data) |s| self.allocator.free(s);
@@ -659,7 +657,6 @@ pub const RaftElection = struct {
     }
 
     pub fn getState(self: Self) RaftState {
-
         return self.state;
     }
 
@@ -1312,4 +1309,3 @@ test "RaftElection log compaction and InstallSnapshot" {
     try testing.expectEqual(@as(u64, 10), follower.last_included_index);
     try testing.expectEqualStrings("follower-snapshot-data", follower.snapshot_data.?);
 }
-

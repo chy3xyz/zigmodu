@@ -876,4 +876,3 @@ pub const ZmoduOrderTrade = struct {
         try jws.endObject();
     }
 };
-

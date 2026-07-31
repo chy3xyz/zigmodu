@@ -805,6 +805,7 @@ test "HttpClient RetryPolicy calculateDelay" {
 
 test "HttpClient ConnectionPool acquire and release" {
     const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
     var pool = HttpClient.ConnectionPool.init(allocator, std.testing.io, 2);
     defer pool.deinit();
 
@@ -832,6 +833,7 @@ test "HttpClient ConnectionPool acquire and release" {
 
 test "HttpClient ConnectionPool exhaustion" {
     const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
     var pool = HttpClient.ConnectionPool.init(allocator, std.testing.io, 1);
     defer pool.deinit();
 

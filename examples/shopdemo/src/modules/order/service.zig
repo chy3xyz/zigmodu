@@ -304,5 +304,4 @@ pub const OrderService = struct {
         var repo = self.persistence.zmoduOrderTradeRepo();
         return try repo.delete(id);
     }
-
 };

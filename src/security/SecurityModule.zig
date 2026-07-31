@@ -59,7 +59,6 @@ pub const SecurityModule = struct {
             kid: ?[]const u8 = null,
         };
 
-
         pub const JwtPayload = struct {
             sub: []const u8, // subject (user id)
             iss: []const u8, // issuer
@@ -152,7 +151,6 @@ pub const SecurityModule = struct {
         const signature = parts.next() orelse return error.InvalidToken;
         if (parts.next() != null) return error.InvalidToken;
 
-
         // Validate algorithm header (prevent alg confusion attacks)
         const header_json = try base64UrlDecode(self.allocator, header_b64);
         defer self.allocator.free(header_json);
@@ -173,7 +171,6 @@ pub const SecurityModule = struct {
         {
             return error.InvalidSignature;
         }
-
 
         // Decode payload
         const payload_json = try base64UrlDecode(self.allocator, payload_b64);
@@ -514,4 +511,3 @@ test "SecurityModule rejects malformed tokens with extra parts" {
     const malformed = "header.payload.sig.extra_part";
     try std.testing.expectError(error.InvalidToken, sec.verifyToken(malformed));
 }
-

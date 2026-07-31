@@ -19,9 +19,15 @@ pub fn UserService(comptime Persistence: type) type {
             const now = 0;
 
             const user = model.User{
-                .id = 0, .tenant_id = tenant_id, .username = username,
-                .email = email, .password_hash = "", .role = role.toString(),
-                .status = 1, .created_at = now, .updated_at = now,
+                .id = 0,
+                .tenant_id = tenant_id,
+                .username = username,
+                .email = email,
+                .password_hash = "",
+                .role = role.toString(),
+                .status = 1,
+                .created_at = now,
+                .updated_at = now,
             };
             _ = try self.persistence.insert(user);
             return user;

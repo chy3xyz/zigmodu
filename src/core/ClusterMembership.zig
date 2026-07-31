@@ -153,7 +153,7 @@ pub const ClusterMembership = struct {
         self.is_running = false;
 
         // Broadcast leave
-        self.broadcastEvent(.leave) catch {};
+        self.broadcastEvent(.leave) catch |err| std.log.warn("[ClusterMembership] broadcast leave failed: {}", .{err});
         self.bus.unsubscribeContext("cluster.membership", @ptrCast(self));
     }
 
@@ -214,7 +214,7 @@ pub const ClusterMembership = struct {
 
         // Never broadcast while holding mutex — publish invokes onBusEvent → handleGossipEvent.
         if (should_broadcast_leader) {
-            self.broadcastEvent(.leader_election) catch {};
+            self.broadcastEvent(.leader_election) catch |err| std.log.warn("[ClusterMembership] broadcast leader_election failed: {}", .{err});
         }
     }
 
@@ -291,7 +291,7 @@ pub const ClusterMembership = struct {
 
         // Record heartbeat in failure detector if available
         if (self.failure_detector) |fd| {
-            fd.heartbeat(event.node_id) catch {};
+            fd.heartbeat(event.node_id) catch |err| std.log.warn("[ClusterMembership] failure detector heartbeat failed: {}", .{err});
         }
 
         if (self.nodes.getPtr(event.node_id)) |node| {
@@ -393,7 +393,7 @@ pub const ClusterMembership = struct {
         // broadcastEvent → publish → onBusEvent → handleGossipEvent locks mutex;
         // Io.Mutex is not recursive — broadcast only after unlock.
         if (should_broadcast) {
-            self.broadcastEvent(.leader_election) catch {};
+            self.broadcastEvent(.leader_election) catch |err| std.log.warn("[ClusterMembership] broadcast leader_election failed: {}", .{err});
         }
     }
 
@@ -462,6 +462,7 @@ pub const ClusterMembership = struct {
 
 test "ClusterMembership bus gossip converges via subscribeWithContext" {
     const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
 
     var bus = try DistributedEventBus.init(allocator, std.testing.io, "bus-node");
     defer bus.deinit();
@@ -482,6 +483,7 @@ test "ClusterMembership bus gossip converges via subscribeWithContext" {
 
 test "ClusterMembership leader election" {
     const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
 
     var bus = try DistributedEventBus.init(allocator, std.testing.io, "test-node");
     defer bus.deinit();
@@ -507,6 +509,7 @@ test "ClusterMembership leader election" {
 
 test "ClusterMembership node health tracking" {
     const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
 
     var bus = try DistributedEventBus.init(allocator, std.testing.io, "test-node");
     defer bus.deinit();
@@ -528,6 +531,7 @@ test "ClusterMembership node health tracking" {
 
 test "ClusterMembership node leave and rejoin" {
     const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
     var bus = try DistributedEventBus.init(allocator, std.testing.io, "test-bus");
     defer bus.deinit();
     const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 18090);

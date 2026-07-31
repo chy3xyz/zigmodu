@@ -7,15 +7,21 @@ pub fn SubscriptionService(comptime Persistence: type) type {
         const Self = @This();
         persistence: Persistence,
 
-        pub fn init(p: Persistence) Self { return .{ .persistence = p }; }
+        pub fn init(p: Persistence) Self {
+            return .{ .persistence = p };
+        }
 
         /// 为租户创建订阅
         pub fn subscribe(self: *Self, tenant_id: i64, plan_id: i64) !model.Subscription {
             const now = 0;
             const sub = model.Subscription{
-                .id = 0, .tenant_id = tenant_id, .plan_id = plan_id,
-                .status = "active", .started_at = now,
-                .expires_at = now + 365 * 24 * 3600, .created_at = now,
+                .id = 0,
+                .tenant_id = tenant_id,
+                .plan_id = plan_id,
+                .status = "active",
+                .started_at = now,
+                .expires_at = now + 365 * 24 * 3600,
+                .created_at = now,
             };
             _ = try self.persistence.create(sub);
             return sub;

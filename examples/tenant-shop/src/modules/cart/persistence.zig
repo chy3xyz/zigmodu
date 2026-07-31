@@ -13,7 +13,8 @@ pub fn CartPersistence(comptime Backend: type) type {
         }
 
         pub fn findCart(self: *Self, tenant_id: i64, user_id: i64) !?model.Cart {
-            return self.db.queryRowPartial(model.Cart,
+            return self.db.queryRowPartial(
+                model.Cart,
                 "SELECT id, tenant_id, user_id, updated_at FROM carts WHERE tenant_id = ? AND user_id = ? LIMIT 1",
                 &.{ .{ .int = tenant_id }, .{ .int = user_id } },
             ) catch |err| switch (err) {
@@ -35,7 +36,8 @@ pub fn CartPersistence(comptime Backend: type) type {
         }
 
         pub fn listItems(self: *Self, tenant_id: i64, cart_id: i64) !data.sqlx.QueryResult(model.CartItem) {
-            return try self.db.queryRowsPartial(model.CartItem,
+            return try self.db.queryRowsPartial(
+                model.CartItem,
                 "SELECT id, tenant_id, cart_id, product_id, qty FROM cart_items WHERE tenant_id = ? AND cart_id = ? ORDER BY id",
                 &.{ .{ .int = tenant_id }, .{ .int = cart_id } },
             );
@@ -72,7 +74,9 @@ pub const Tx = struct {
         tenant_id: i64,
         user_id: i64,
     ) !model.Cart {
-        return try tx.queryRow(allocator, model.Cart,
+        return try tx.queryRow(
+            allocator,
+            model.Cart,
             "SELECT id, tenant_id, user_id, updated_at FROM carts WHERE tenant_id = ? AND user_id = ? LIMIT 1",
             &.{ .{ .int = tenant_id }, .{ .int = user_id } },
         );
@@ -84,7 +88,9 @@ pub const Tx = struct {
         tenant_id: i64,
         cart_id: i64,
     ) !data.sqlx.QueryResult(model.CartItem) {
-        return try tx.queryRows(allocator, model.CartItem,
+        return try tx.queryRows(
+            allocator,
+            model.CartItem,
             "SELECT id, tenant_id, cart_id, product_id, qty FROM cart_items WHERE tenant_id = ? AND cart_id = ?",
             &.{ .{ .int = tenant_id }, .{ .int = cart_id } },
         );
