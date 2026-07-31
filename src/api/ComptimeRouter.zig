@@ -18,6 +18,7 @@ pub const Middleware = server_mod.Middleware;
 pub const WsConnectFn = server_mod.WsConnectFn;
 pub const WsMessageFn = server_mod.WsMessageFn;
 pub const WsCloseFn = server_mod.WsCloseFn;
+pub const WsFrameKind = server_mod.WsFrameKind;
 
 /// Auth for a single route. `.inherit` resolves to nest/scoped default (`.jwt`).
 pub const Auth = enum {
@@ -796,7 +797,7 @@ test "mount records ws_routes in catalog" {
         fn onConnect(_: *Context, _: *anyopaque) ?*anyopaque {
             return null;
         }
-        fn onMessage(_: ?*anyopaque, _: []const u8) void {}
+        fn onMessage(_: ?*anyopaque, _: []const u8, _: WsFrameKind) void {}
         fn onClose(_: ?*anyopaque) void {}
         pub const routes = [_]RouteSpec(State){
             .{ .method = .GET, .path = "ping", .handler = noopHttp, .meta = .{ .auth = .public } },

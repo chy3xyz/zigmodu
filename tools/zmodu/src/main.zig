@@ -5730,7 +5730,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
             \\1. `GET /im/ws?userId=123` with `Upgrade: websocket` header
             \\2. Server handshake (RFC 6455) → `onConnect()` returns `WsSession` pointer
             \\3. `WsSession` registered in `ConnectionRegistry` with `user_id=123`
-            \\4. Read loop: text frames → `onMessage()`; ping → pong; close → `onClose()` cleanup
+            \\4. Read loop: text **and binary** frames → `onMessage(..., kind)`; ping → pong; close → `onClose()` cleanup
             \\
             \\## REST API
             \\
@@ -5763,8 +5763,8 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
             \\**Frames:**
             \\| Opcode | Direction | Purpose |
             \\|--------|-----------|---------|
-            \\| 0x1 (text) | client→server | Chat message, typing indicator, etc. |
-            \\| 0x1 (text) | server→client | Push notification (new message) |
+            \\| 0x1 (text) | client↔server | JSON chat / typing (default scaffold) |
+            \\| 0x2 (binary) | client↔server | Opaque bytes (protobuf / OpenIM-style); use `sendBinary` / `kind == .binary` |
             \\| 0x8 (close) | both | Normal disconnect |
             \\| 0x9 (ping) | either | Keepalive |
             \\| 0xA (pong) | either | Keepalive response |
@@ -5849,7 +5849,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
             \\Override the onMessage() function in gateway.zig:
             \\```zig
             \\// Parse JSON frames, dispatch to service methods
-            \\fn onMessage(session_ptr: ?*anyopaque, msg: []const u8) void { ... }
+            \\fn onMessage(session_ptr: ?*anyopaque, msg: []const u8, kind: zigmodu.http.WsFrameKind) void { ... }
             \\```
             \\
             \\## Key Types
@@ -6270,38 +6270,22 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
         \\    last_ping_tick: u64,
         \\
         \\    pub fn send(self: *WsSession, msg: []const u8) !void {
+        \\        try self.sendFrame(.text, msg);
+        \\    }
+        \\
+        \\    pub fn sendBinary(self: *WsSession, msg: []const u8) !void {
+        \\        try self.sendFrame(.binary, msg);
+        \\    }
+        \\
+        \\    pub fn sendFrame(self: *WsSession, kind: zigmodu.http.WsFrameKind, msg: []const u8) !void {
         \\        self.mutex.lock(self.framer.io) catch return error.NotConnected;
         \\        defer self.mutex.unlock(self.framer.io);
-        \\        // Small stack buffer for frame header write (10 bytes max).
-        \\        // For large payloads, Stream.Writer flushes buffer automatically.
-        \\        var wbuf: [256]u8 = undefined;
-        \\        var w = self.framer.stream.writer(self.framer.io, &wbuf);
-        \\        try writeFrameTo(&w, 0x1, msg);
+        \\        try self.framer.writeData(kind, msg);
         \\    }
         \\};
         \\
-        \\/// Write a WebSocket text frame directly to a Stream.Writer.
-        \\fn writeFrameTo(w: anytype, opcode: u8, payload: []const u8) !void {
-        \\    var header: [14]u8 = undefined;
-        \\    var hl: usize = 2;
-        \\    header[0] = 0x80 | opcode;
-        \\    if (payload.len < 126) {
-        \\        header[1] = @intCast(payload.len);
-        \\    } else if (payload.len < 65536) {
-        \\        header[1] = 126;
-        \\        std.mem.writeInt(u16, header[2..4], @intCast(payload.len), .big);
-        \\        hl = 4;
-        \\    } else {
-        \\        header[1] = 127;
-        \\        std.mem.writeInt(u64, header[2..10], @intCast(payload.len), .big);
-        \\        hl = 10;
-        \\    }
-        \\    try w.interface.writeAll(header[0..hl]);
-        \\    try w.interface.writeAll(payload);
-        \\    try w.interface.flush();
-        \\}
-        \\
-        \\/// Called by onMessage when a text frame arrives. user_id is the sender, msg is the JSON payload.
+        \\/// Called by onMessage when a data frame arrives. user_id is the sender; msg is payload bytes.
+        \\/// Text frames carry JSON (default scaffold); binary frames carry opaque bytes (e.g. protobuf).
         \\pub const MsgHandler = *const fn (ctx: *anyopaque, user_id: u64, msg: []const u8) void;
         \\
         \\pub const ImGateway = struct {
@@ -6359,7 +6343,8 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
         \\        try session.send(msg);
         \\    }
         \\
-        \\    pub fn onMessage(session_ptr: ?*anyopaque, msg: []const u8) void {
+        \\    pub fn onMessage(session_ptr: ?*anyopaque, msg: []const u8, kind: zigmodu.http.WsFrameKind) void {
+        \\        _ = kind; // .text = JSON IM; .binary = opaque (protobuf / OpenIM)
         \\        const session: *WsSession = @ptrCast(@alignCast(session_ptr orelse return));
         \\        if (session.gateway.msg_handler) |h| h(session.gateway.msg_ctx.?, session.user_id, msg);
         \\    }

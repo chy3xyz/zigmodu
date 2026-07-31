@@ -262,7 +262,8 @@ try server.addRoute(.{
 .{ .method = .DELETE, .path = "{id}", .handler = suspend, .meta = .{ .permission = "tenant:suspend" } },
 ```
 
-WS：`pub const ws_routes = [_]http.WsSpec(State){ .{ .path = "ws", .on_connect = … } };`
+WS：`pub const ws_routes = [_]http.WsSpec(State){ .{ .path = "ws", .on_connect = …, .on_message = … } };`  
+`on_message` 签名：`fn(session, msg, kind: http.WsFrameKind)` — **text (0x1) 与 binary (0x2) 均分发**（OpenIM protobuf 等）；写出用 `WsFramer.writeBinary` / `writeData`。
 
 ### SSE（Server-Sent Events）
 

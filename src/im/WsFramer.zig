@@ -1,5 +1,26 @@
 const std = @import("std");
 
+/// RFC 6455 data-frame kind (opcodes 0x1 / 0x2).
+pub const WsFrameKind = enum {
+    text,
+    binary,
+
+    pub fn fromOpcode(raw: u8) ?WsFrameKind {
+        return switch (raw) {
+            0x1 => .text,
+            0x2 => .binary,
+            else => null,
+        };
+    }
+
+    pub fn opcode(self: WsFrameKind) u8 {
+        return switch (self) {
+            .text => 0x1,
+            .binary => 0x2,
+        };
+    }
+};
+
 /// Minimal WebSocket frame reader/writer.
 pub const WsFramer = struct {
     stream: std.Io.net.Stream,
@@ -92,6 +113,16 @@ pub const WsFramer = struct {
         try self.writeFrame(0x1, payload);
     }
 
+    /// Write a binary frame (e.g. protobuf / OpenIM wire).
+    pub fn writeBinary(self: *WsFramer, payload: []const u8) !void {
+        try self.writeFrame(0x2, payload);
+    }
+
+    /// Write a data frame by kind.
+    pub fn writeData(self: *WsFramer, kind: WsFrameKind, payload: []const u8) !void {
+        try self.writeFrame(kind.opcode(), payload);
+    }
+
     /// Write an arbitrary frame. Uses pre-allocated write_buf if set.
     pub fn writeFrame(self: *WsFramer, opcode: u8, payload: []const u8) !void {
         var header: [14]u8 = undefined;
@@ -139,6 +170,14 @@ fn readFull(stream: std.Io.net.Stream, io: std.Io, buf: []u8) !void {
     var read_buf: [4096]u8 = undefined;
     var r = stream.reader(io, &read_buf);
     _ = try r.interface.readSliceAll(buf);
+}
+
+test "WsFrameKind opcode roundtrip" {
+    try std.testing.expectEqual(@as(u8, 0x1), WsFrameKind.text.opcode());
+    try std.testing.expectEqual(@as(u8, 0x2), WsFrameKind.binary.opcode());
+    try std.testing.expect(WsFrameKind.fromOpcode(0x1).? == .text);
+    try std.testing.expect(WsFrameKind.fromOpcode(0x2).? == .binary);
+    try std.testing.expect(WsFrameKind.fromOpcode(0x8) == null);
 }
 
 test "handshake" {

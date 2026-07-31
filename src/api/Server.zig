@@ -166,7 +166,7 @@ pub const RouteGroup = struct {
 
     /// Register a WebSocket upgrade endpoint.
     /// on_connect is called after successful handshake (user_data = route user_data).
-    /// on_message is called for each text frame received.
+    /// on_message is called for each **text (0x1) or binary (0x2)** data frame.
     /// on_close is called when the connection closes.
     pub fn ws(self: *RouteGroup, path: []const u8, on_connect: WsConnectFn, on_message: WsMessageFn, on_close: WsCloseFn, user_data: ?*anyopaque) !void {
         const full_path = try self.joinPath(self.server.allocator, path);
@@ -188,8 +188,12 @@ pub const RouteGroup = struct {
 /// Return session pointer (non-null accepts, null rejects).
 /// The session is opaque to the server; the gateway owns its lifetime.
 pub const WsConnectFn = *const fn (ctx: *Context, framer: *anyopaque) ?*anyopaque;
-/// WebSocket message callback: called for each text frame.
-pub const WsMessageFn = *const fn (session: ?*anyopaque, msg: []const u8) void;
+
+pub const WsFrameKind = @import("../im/WsFramer.zig").WsFrameKind;
+
+/// WebSocket message callback: text (0x1) and binary (0x2) data frames.
+/// `msg` is raw payload bytes (UTF-8 for text; opaque for binary, e.g. protobuf).
+pub const WsMessageFn = *const fn (session: ?*anyopaque, msg: []const u8, kind: WsFrameKind) void;
 /// WebSocket close callback: called when the connection closes.
 pub const WsCloseFn = *const fn (session: ?*anyopaque) void;
 
@@ -1530,7 +1534,7 @@ pub const Server = struct {
     /// services (HTTP + gRPC + cluster) in the same process.
     pub fn runInBackground(self: *Server) !std.Thread {
         self.running.store(true, .monotonic);
-        const handle = try std.Thread.spawn(.{ .stack_size = self.config.connection_stack_size }, runLoop, .{self});
+        const handle = try std.Thread.spawn(.{ .stack_size = 128 * 1024 }, runLoop, .{self});
         return handle;
     }
 
@@ -1766,8 +1770,11 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                             }
                             const frame = framer.readFrame(read_buf) catch break;
                             switch (frame.opcode) {
-                                0x1 => { // Text
-                                    if (@intFromPtr(ws_route.on_message) != 0) ws_route.on_message(session, frame.payload);
+                                0x1, 0x2 => { // Text / Binary (e.g. OpenIM protobuf)
+                                    if (@intFromPtr(ws_route.on_message) != 0) {
+                                        const kind = WsFrameKind.fromOpcode(frame.opcode).?;
+                                        ws_route.on_message(session, frame.payload, kind);
+                                    }
                                 },
                                 0x8 => break, // Close
                                 0x9 => { // Ping → Pong
@@ -2715,7 +2722,7 @@ test "WebSocket route path normalization handles leading slash variations" {
         }
 
     }).connect, (struct {
-        fn message(_: ?*anyopaque, _: []const u8) void {}
+        fn message(_: ?*anyopaque, _: []const u8, _: WsFrameKind) void {}
     }).message, (struct {
         fn close(_: ?*anyopaque) void {}
     }).close, null);
@@ -2732,4 +2739,3 @@ test "WebSocket route path normalization handles leading slash variations" {
     const norm2 = if (path2.len > 0 and path2[0] == '/') path2[1..] else path2;
     try std.testing.expect(server.ws_handlers.get(norm2) != null);
 }
-

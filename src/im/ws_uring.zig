@@ -41,7 +41,8 @@ const IoUring = if (builtin.os.tag == .linux) std.os.linux.IoUring else struct {
 };
 
 /// Callback types matching WsRoute in Server.zig
-pub const OnMessageFn = *const fn (session: ?*anyopaque, msg: []const u8) void;
+pub const WsFrameKind = @import("WsFramer.zig").WsFrameKind;
+pub const OnMessageFn = *const fn (session: ?*anyopaque, msg: []const u8, kind: WsFrameKind) void;
 pub const OnCloseFn = *const fn (session: ?*anyopaque) void;
 
 /// io_uring-based WebSocket event loop — Linux 5.1+ only.
@@ -231,7 +232,12 @@ pub const WsUring = struct {
 
             // Dispatch frame
             switch (opcode) {
-                0x1 => if (conn.on_message != 0) conn.on_message(conn.session, payload),
+                0x1, 0x2 => {
+                    if (conn.on_message != 0) {
+                        const kind = WsFrameKind.fromOpcode(opcode).?;
+                        conn.on_message(conn.session, payload, kind);
+                    }
+                },
                 0x8 => {
                     self.closeConn(conn, fd);
                     return;

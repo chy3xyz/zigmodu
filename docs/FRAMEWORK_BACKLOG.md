@@ -17,6 +17,7 @@ Monolith boundaries unchanged — see `docs/PRODUCTION_ROADMAP.md`.
 | + | **SSE first-class** | **Landed** | `http.sse` sets `streaming` (no double write); `SseSpec`/`sse_routes`; `lastEventId`; multiline `data:`; `SseRecorder` + live stream test |
 | + | Validation ↔ Extract | **Landed** | `extractJsonValidated(ctx, T, rules)` |
 | + | Example migration | **Landed** | `examples/zent-modulith` + `tools/zmodu/.../api_standalone.zig.tpl` |
+| + | **WS binary frames** | **Landed** | `WsFrameKind` + `on_message(..., kind)` text/binary; `WsFramer.writeBinary` |
 
 ---
 
