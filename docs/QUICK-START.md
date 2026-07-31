@@ -5,17 +5,14 @@ Get up and running with ZigModu in 5 minutes.
 ## Prerequisites
 
 ```bash
-# Install Zig 0.16.0
-brew install zig@0.16.0    # macOS
-# or
-sudo apt install zig=0.16.0  # Ubuntu/Debian
-# or download from https://ziglang.org/download/
+# Install Zig 0.17.0
+# https://ziglang.org/download/
 ```
 
 Verify installation:
 ```bash
 zig version
-# Should show: 0.16.0
+# Should show: 0.17.0
 ```
 
 ## Step 1: Create a Module
@@ -122,9 +119,11 @@ info: Application started successfully!
 | Tutorial | Description |
 |----------|-------------|
 | [Examples](examples/) | More complete examples |
-| [Best Practices](BEST_PRACTICES.md) | Architecture evolution |
-| [API Reference](docs/API.md) | Detailed API docs |
-| [Architecture](docs/ARCHITECTURE.md) | System design |
+| [Best Practices](BEST_PRACTICES.md) | Architecture + JWT / auth checklist |
+| [Declarative Routes](ROUTE_TABLE.md) | ComptimeRouter + catalog RBAC |
+| [AGENTS.md](../AGENTS.md) | AI agent handbook |
+| [API Reference](API.md) | Detailed API docs |
+| [Architecture](ARCHITECTURE.md) | System design |
 
 ## Common Commands
 

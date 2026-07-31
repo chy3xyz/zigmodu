@@ -1,63 +1,65 @@
 # CLAUDE.md — ZigModu Framework for Claude Code
 
 ## Project
-ZigModu v0.14.16 — modular app framework for Zig 0.17.0. ~98/100 (`docs/EVALUATION_REPORT.md`).
+ZigModu **v0.14.16** — modular app framework for Zig **0.17.0**. ~98/100 (`docs/EVALUATION_REPORT.md`).
+
+**AI 权威指南：[`AGENTS.md`](AGENTS.md)**（文档地图 + 近期栈 DO/DON'T）。冲突时以 AGENTS 为准。
 
 ## Build & Test
 ```bash
 zig build
 ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test   # 664+ passed, 20 skipped
 zig build check-api                                    # examples API gate
-bash scripts/ci-integration.sh                         # tenant-mgmt + stress (HTTP_PORT=18080)
+bash scripts/ci-integration.sh                         # tenant-mgmt + stress + shopdemo
 zig build docs
+zig build zmodu -- scaffold --sql schema.sql --name my_app --with-auth
 ```
 
 ## Architecture (5 domain files)
 ```
-src/http.zig          → zmodu.http.{Server, Context, RouteGroup, Middleware, sse, extract*, Testkit, applyHttpDefaults}
-src/data.zig          → zmodu.data.{Client, sqlx, orm, Repository, redis}
-src/security.zig      → zmodu.security.{SecurityModule, PasswordEncoder, SecretsManager}
-src/observability.zig → zmodu.observability.{PrometheusMetrics, DistributedTracer}
-src/root.zig          → Application, EventBus, outbox, deprecated flat aliases (v0.14.0 remove)
+src/http.zig          → Server, Context, Router, Middleware, sse, extract*, Testkit, applyHttpDefaults
+src/data.zig          → Client, sqlx, orm, Repository, redis
+src/security.zig      → AppSecurity, CatalogPermDb, PasswordEncoder, SecretsManager
+src/observability.zig → PrometheusMetrics, DistributedTracer, OtlpExporter
+src/root.zig          → Application, EventBus, outbox
 ```
 
-HTTP ergonomics (see `docs/FRAMEWORK_BACKLOG.md`): extractors, ProblemDetails, scope MW, Testkit, profiles, SSE (`http.sse` / `sse_routes`), lifecycle helpers.
+## AI 必守（近期升级）
+1. **路由**：`pub const routes` + `Router(State).mountAll` — 见 `docs/ROUTE_TABLE.md`
+2. **鉴权 Path A**：`jwtAuthFromCatalogWithPermissions` + `permissionGateWith(.rbac)`；签发用 `generateTokenWithTenant`
+3. **槽位**：`user_data` = `*State` only；鉴权在 attrs / `auth_info`；handler **勿**重复验 Bearer
+4. **多门户**：JWT `roles`=门户；业务 RBAC 用自定义 `CatalogPermissionLoader(CatalogPermLoadInput)`；**勿**加 JWT `type`
+5. **HTTP**：`ctx.json` / `respondErr` / extractors；**勿** `sendSuccess`/`sendFail`
+6. **租户列**：默认 `tenant_id`；`app_id` → `setTenantColumn("app_id")` + `--tenant-column app_id`
+7. **OTLP / Vault**：仅 `http://`；x402 **fail-closed**
 
-## Monolith maintenance (do NOT split without cause)
-- `src/sqlx/sqlx.zig`, `src/api/Server.zig` — § sections + rules in `docs/PRODUCTION_ROADMAP.md`
-
-## Zig 0.17 Rules (top 5 mistakes to avoid)
-1. `ArrayList(T).init(alloc)` → `ArrayList(T).empty`, pass alloc to each method
-2. `std.Thread.Mutex` → `std.Io.Mutex`, needs `io`: `.lock(io)`, `.unlock(io)`
-3. `std.time.milliTimestamp()` → `Time.monotonicNowMilliseconds()`
-4. `file.writeAll(x)` → `file.writeStreamingAll(io, x)`
-5. Request headers are **lowercase** in `Context.headers` — use `"authorization"`, not `"Authorization"`
-6. `std.hash.crc.Crc32Iscsi` → `std.hash.crc.@"CRC-32/ISCSI"` (Zig 0.17-dev≈1422+; Kafka CRC-32C)
+## Zig 0.17 Rules（易错）
+1. `ArrayList(T).init(alloc)` → `.empty` + 方法传 allocator
+2. `std.Thread.Mutex` → `std.Io.Mutex` + `.lock(io)` / `.unlock(io)`
+3. `milliTimestamp()` → `Time.monotonicNowMilliseconds()`
+4. `file.writeAll` → `file.writeStreamingAll(io, …)`
+5. Headers **lowercase**：`"authorization"`
+6. `Crc32Iscsi` → `std.hash.crc.@"CRC-32/ISCSI"`
 
 ## Code Generation Rules
-- Module: `pub const info = zmodu.api.Module{...}` + `init() !void` + `deinit() void`
-- HTTP: `const http = zmodu.http` — `ctx.json(status, body)` NOT `sendSuccess/sendFail`
-- DB: `data.Client` via `zmodu.data` — parameterized `?` placeholders only
-- Router: `*` wildcard, `{id}` path params; route paths without leading `/` in `addRoute`
-- Tenant column: default `tenant_id`; for `app_id` use `zigmodu.setTenantColumn("app_id")` + `zmodu --tenant-column app_id` (see `docs/ARCHITECTURE.md`)
-- Logging: `std.log.err/warn/info` with `{s}/{d}` format, never emoji
-- Deprecated root aliases: `zigmodu.http_server` → `zigmodu.http` (removed v0.14.0)
+- Module: `info` + `init`/`deinit`
+- DB: `data.Client` · 仅 `?` 占位符
+- Route paths：无前导 `/`（`addRoute` / RouteSpec.path）
+- Logging：`std.log.*` + `{s}/{d}`，无 emoji
+- 分层：`docs/MODULE_LAYERS.md`（model / persistence.Tx / service / api）
 
 ## Key Files
 ```
-src/api/Server.zig      (~2400L) — Context, Router, Server, connFiber
-src/api/Middleware.zig   (~500L) — cors, jwtAuth, csrf, requestId, recover
-src/sqlx/sqlx.zig       (~3300L) — Client, ConnPool, PG/MySQL/SQLite
-src/Application.zig      (~540L) — builder, run(), graceful shutdown
-docs/PRODUCTION_ROADMAP.md — production phases + monolith boundaries
-docs/MODULE_LAYERS.md — model / persistence.Tx / service Cmd (tenant-shop reference)
-docs/ZENT.md — ZigModu × zent orthogonal ORM practices (zent-modulith)
-docs/MODULITH.md — day-one modulith + high-concurrency practices
+src/api/Server.zig / Middleware.zig — HTTP + catalog JWT
+src/sqlx/sqlx.zig / Application.zig — DB + lifecycle
+docs/ROUTE_TABLE.md · BEST_PRACTICES.md · MODULE_LAYERS.md · MODULITH.md · ZENT.md
+docs/PRODUCTION_ROADMAP.md — monolith boundaries（勿无故拆 sqlx/Server）
 ```
 
 ## Examples
 ```
-examples/tenant-mgmt/     — flagship runnable demo (CI integration)
-examples/shopdemo/        — minimal runnable order module (+ CI smoke on :18081)
-examples/http-stress-test/  — load test binary
+examples/tenant-mgmt/       — flagship（CatalogPermDb + CI）
+examples/shopdemo/          — minimal order + CI smoke
+examples/zent-modulith/     — zent ORM
+examples/http-stress-test/  — load
 ```

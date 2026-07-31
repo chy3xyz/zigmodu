@@ -1,25 +1,27 @@
-# ZigModu v0.14.3
+# ZigModu v0.14.16
 
 A modular application framework for Zig 0.17, inspired by Spring Modulith. Build scalable applications from monolithic to distributed systems with progressive architecture evolution.
 
 [![Zig](https://img.shields.io/badge/Zig-0.17+-orange?style=flat-square)](https://ziglang.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-0.14.3-blue?style=flat-square)]()
-[![Score](https://img.shields.io/badge/Quality-95%25-A-green?style=flat-square)]()
+[![Version](https://img.shields.io/badge/Version-0.14.16-blue?style=flat-square)]()
+[![Score](https://img.shields.io/badge/Quality-98%25-A-green?style=flat-square)]()
 
 ## 📚 Documentation
 
 | Guide | Description |
 |-------|-------------|
+| [**AGENTS.md**](AGENTS.md) | **AI agent handbook** (DO/DON'T, Path A auth, ComptimeRouter) |
 | [Quick Start](docs/QUICK-START.md) | Get started in 5 minutes |
 | [Modulith 高并发](docs/MODULITH.md) | Day-one modulith + high-concurrency practices |
+| [Declarative Routes](docs/ROUTE_TABLE.md) | ComptimeRouter + catalog JWT/RBAC |
 | [ZigModu × zent](docs/ZENT.md) | Orthogonal zent ORM integration practices |
-| [Best Practices](docs/BEST_PRACTICES.md) | Architecture evolution from 1K to 1M+ DAU |
+| [Best Practices](docs/BEST_PRACTICES.md) | Architecture evolution + JWT checklist |
 | [API Reference](docs/API.md) | Detailed API documentation |
 | [Architecture](docs/ARCHITECTURE.md) | System design and patterns |
-| [Evaluation Report](docs/EVALUATION_REPORT.md) | Production readiness assessment (~95/100) |
+| [Evaluation Report](docs/EVALUATION_REPORT.md) | Production readiness assessment (~98/100) |
 | [Examples](examples/) | Runnable example projects |
-| [ZModu CLI](https://github.com/chy3xyz/zmodu) | Code generator for modules, ORM, APIs (`npm i -g @chy3xyz/zmodu`) |
+| [ZModu CLI](docs/ZMODU_CLI_INTEGRATION.md) | Built-in codegen (`zig build zmodu`) |
 
 ## ✨ Features
 

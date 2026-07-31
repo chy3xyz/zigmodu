@@ -2,7 +2,9 @@
 
 > **Modulith 从第一天怎么写高并发应用**：见专文 [MODULITH.md](MODULITH.md)（边界、fiber、池化、规模阶梯、反模式）。  
 > **model / persistence / service / Tx 分层**：见专文 [MODULE_LAYERS.md](MODULE_LAYERS.md)（参考实现 `examples/tenant-shop`）。  
-> **ZigModu × zent（schema / Client / privacy / 模块级选型）**：见专文 [ZENT.md](ZENT.md)（参考实现 `examples/zent-modulith`）。
+> **ZigModu × zent（schema / Client / privacy / 模块级选型）**：见专文 [ZENT.md](ZENT.md)（参考实现 `examples/zent-modulith`）。  
+> **HTTP 路由 + catalog JWT / RBAC**：见专文 [ROUTE_TABLE.md](ROUTE_TABLE.md) §7；可执行清单见下文「JWT / 多端身份」。  
+> **AI / Agent 写代码**：先读仓库根目录 [AGENTS.md](../AGENTS.md)（文档地图 + DO/DON'T）；方法论见 [AI_METHODOLOGY.md](AI_METHODOLOGY.md)。
 
 ## 📋 目录 (Table of Contents)
 
@@ -783,9 +785,98 @@ pub fn processBatch(allocator: Allocator, items: []Item) !void {
 
 ### JWT / 多端身份（与路由栈）
 
-- **新应用**：`AppSecurity` + catalog JWT + `permissionGateWith(.rbac)`（见 `docs/ROUTE_TABLE.md` §7）。
-- **多门户 / PHP 兼容**：身份枚举留在**应用** identity 模块；用 `aud`/attr/`auth_info` 对接框架，**不要**改核心 JwtPayload 加 `type`（§7.1）。
-- **ComptimeRouter**：State 只在 `user_data`；鉴权只在 `auth_info` / attributes。
+权威细则：[`ROUTE_TABLE.md`](ROUTE_TABLE.md) §7 + §7.1。此处为可执行摘要。
+
+#### 默认栈（路径 A · 新应用必选）
+
+```zig
+var app_sec = zigmodu.security.AppSecurity.init(allocator, io, .{
+    .jwt_secret = jwt_secret,
+    .token_expiry_seconds = 3600,
+});
+var catalog_slot: http.CatalogSlot = .{};
+defer catalog_slot.deinit();
+
+// 1) JWT + 权限展开（写入 attrs；不碰 user_data）
+try server.addMiddleware(http.jwtAuthFromCatalogWithPermissions(
+    &app_sec.module,
+    &catalog_slot,
+    // 简单应用：http.catalogLoaderFromTable(&table)
+    // 或：zigmodu.security.CatalogPermDb.loaderFromClient(&db)
+    // 多主体：自定义 CatalogPermissionLoader（见下）
+    http.catalogLoaderFromTable(&role_perm_table),
+    .{ .skip_prefixes = &.{ "api/health", "health", "dashboard", "openapi.json" } },
+));
+// 2) 可选：写入 module attr
+try server.addMiddleware(http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
+// 3) 门禁：RouteMeta.permission ⊆ permissions CSV
+try server.addMiddleware(http.permissionGateWith(&catalog_slot, .{ .mode = .rbac }));
+
+// … Router.mountAll …
+catalog_slot.set(try router.finish());
+```
+
+签发（唯一源）：
+
+```zig
+// aud = 租户；roles = 门户粗身份（勿塞全量菜单树）
+const token = try app_sec.module.generateTokenWithTenant(user_id_str, &.{ "shop" }, app_id_str);
+```
+
+路由元数据：
+
+```zig
+.{ .method = .GET, .path = "product/list", .handler = list,
+   .meta = .{ .auth = .jwt, .permission = "portal:shop" } }, // 或细码 tenant:suspend
+.{ .method = .POST, .path = "passport/login", .handler = login,
+   .meta = .{ .auth = .public } },
+```
+
+#### 上下文槽位（正交 · 勿混用）
+
+| 槽位 | 用途 | 禁止 |
+|------|------|------|
+| `ctx.user_data` | ComptimeRouter `*State` | 写入 AuthInfo / JWT 对象 |
+| `ctx.auth_info` | 可选 `Rbac.AuthInfo`（legacy `rbacJwtMiddleware`） | `@ptrCast(user_data)` 当 AuthInfo |
+| `ctx.attributes` | `user_id`/`tenant_id`/`roles`/`permissions` | 再验一遍 Bearer（gate 已做过） |
+
+Handler 只读 attrs / 应用侧薄 helper（如 `portal_auth.currentTenant`），**不要**在每个 handler 里 `extractAuth` 重复验签。
+
+#### 多门户 / 多套业务 RBAC
+
+框架 **不** 增加 JWT `type` 枚举。约定：
+
+| 概念 | Claim / 落点 |
+|------|----------------|
+| 谁 | `sub` → attr `user_id` |
+| 哪租户 | `aud` → attr `tenant_id`（SQL 列名可用 `app_id`） |
+| 哪门户 | `roles`：`user` / `shop` / `admin` / `supplier` |
+| 门户门禁 | `RouteMeta.permission = "portal:shop"` 等 |
+| 职务/菜单 | 应用表 → **自定义** `CatalogPermissionLoader` → `permissions` CSV |
+
+自定义 loader 签名（已含身份）：
+
+```zig
+fn load(allocator: Allocator, input: http.CatalogPermLoadInput) ![]u8 {
+    // input.sub / input.aud / input.roles
+    // 按 roles 选 shop_* / supplier_* / admin 表族展开 access.path
+    // 始终可附带 portal:* 码，便于粗门禁
+}
+```
+
+- 简单演示：`RolePermissionTable` / `CatalogPermDb`（**忽略** sub/aud）。  
+- 多商户后台：**不要**把三套业务表并进 `CatalogPermDb`。  
+- 参考：`examples/tenant-mgmt`（单套库表）；多主体应用见 ZigShop `docs/AUTH_FRAMEWORK_ALIGNMENT.md`（路径 A 已落地）。
+
+#### 刻意不做
+
+- 核心 `JwtPayload` 加必填 `type`  
+- 长期「应用自签 + 框架再验」双轨  
+- 把业务 `*_role` / `*_access` 内置进框架  
+
+#### Legacy 中间件
+
+`AppSecurity.rbacJwtMiddleware*` / `security.auth.jwtAuth*` 现只写 **`auth_info`**，可与 ComptimeRouter 共存；新代码仍优先 catalog + `permissionGateWith(.rbac)`。
 
 ### 输入验证
 - **边界检查**：所有外部输入必须验证

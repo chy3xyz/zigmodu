@@ -1,5 +1,8 @@
 # AI Chat Module — 使用指南
 
+> 本文档描述 **LLM 对话产品模块**（`zmodu scaffold --with-aichat`），不是 AI coding agent 指南。  
+> Agent 写 ZigModu 应用代码请读：[AGENTS.md](../AGENTS.md)。
+
 基于 zigmodu.ai 框架的 LLM 对话模块。支持多轮对话、跨会话记忆、SSE 流式输出、DeepSeek V4 缓存优化。
 
 ## 生成项目

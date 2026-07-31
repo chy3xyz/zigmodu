@@ -456,17 +456,19 @@ src/
 | `TenantInterceptor` | `src/tenant/TenantInterceptor.zig` | ORM/SQL 自动追加 `{tenant_column} = ?` |
 | `ShardRouter` | `src/tenant/ShardRouter.zig` | 按租户路由到不同 DB 分片 |
 | `DataPermission` | `src/datapermission/` | 行级数据权限（与 RBAC 配合） |
-| JWT `aud` 租户声明 | `security.auth.jwtAuth` | 仅在使用 RBAC 中间件且 token 含租户时 |
+| JWT `aud` 租户声明 | `http.jwtAuthFromCatalogWithPermissions` | 用 `generateTokenWithTenant`；attr `tenant_id`←`aud` |
+| Catalog RBAC gate | `permissionGateWith(.rbac)` | `RouteMeta.permission` ⊆ `permissions` CSV |
 
 **典型组合：**
 
 ```
 单租户应用（默认）
-  HTTP → jwtAuth / AppSecurity → handler → SQLx
+  HTTP → catalog JWT (+ optional permissionGate) → handler → SQLx
   （无 TenantContext，查询不带 tenant_id）
 
 多租户 SaaS（显式启用，见 examples/tenant-mgmt）
-  HTTP → [TenantMiddleware] → JWT → [DataPermission] → handler
+  HTTP → catalog JWT（aud→tenant_id attr）→ [moduleGate] → permissionGate(.rbac)
+       → [可选 TenantMiddleware / DataPermission] → handler
        → Service（显式传 tenant 值）→ SQL（WHERE tenant_id|app_id = ?）
   启动时可选：zigmodu.setTenantColumn("app_id")  // 与 schema 列名对齐
 ```
@@ -476,10 +478,11 @@ src/
 1. **不挂租户中间件 = 单租户**，与 Spring 里不用 `@TenantLine` 一样。
 2. **`TenantContext.isActive()`** 为 false 时，拦截器不注入条件。
 3. **租户列名**：默认 `tenant_id`；ZigShop 等用 `app_id` 时调用 `setTenantColumn("app_id")`，且模型字段名与列名一致。`zmodu --tenant-column app_id` 生成对应 `WHERE` 与 `setTenantColumn`。
-4. **JWT 默认** `generateToken(user, roles)` 的 `aud` 为 `"zigmodu-app"`，不是租户 ID；租户 claim 仅在 `generateTokenWithTenant` 或 RBAC 路径使用。
-5. **`examples/tenant-mgmt`** 是最佳实践演示，其中 `tenantMiddleware` / `dataPermissionMiddleware` 为可替换占位，生产环境按业务实现。
+4. **JWT 默认** `generateToken(user, roles)` 的 `aud` 为 `"zigmodu-app"`，不是租户 ID；租户 claim 用 `generateTokenWithTenant`；catalog 中间件写入 attr `tenant_id`。
+5. **`examples/tenant-mgmt`** 是最佳实践演示；鉴权栈见 [`ROUTE_TABLE.md`](ROUTE_TABLE.md) §7、[`BEST_PRACTICES.md`](BEST_PRACTICES.md)。
+6. Legacy `security.auth.jwtAuth` / `rbacJwtMiddleware` 仅写 `auth_info`；新应用优先 catalog 路径。
 
-认证（`AppSecurity` / `jwtAuth`）与多租户正交：可以只要 JWT 不要租户，也可以只要租户 header 不要 JWT（不推荐生产）。
+认证（`AppSecurity` + catalog JWT）与多租户正交：可以只要 JWT 不要租户，也可以只要租户 header 不要 JWT（不推荐生产）。
 
 ## Conclusion
 

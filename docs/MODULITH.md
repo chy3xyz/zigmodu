@@ -9,7 +9,9 @@
 |------|------|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 模块概念、分层、通信模式 |
 | [MODULE_LAYERS.md](MODULE_LAYERS.md) | **model / persistence / service / Tx 分层细则** |
-| [BEST_PRACTICES.md](BEST_PRACTICES.md) | 按 DAU 阶段演进（1K → 1M+） |
+| [BEST_PRACTICES.md](BEST_PRACTICES.md) | 按 DAU 阶段演进（1K → 1M+）+ JWT 可执行清单 |
+| [ROUTE_TABLE.md](ROUTE_TABLE.md) | ComptimeRouter + catalog JWT / RBAC |
+| [AGENTS.md](../AGENTS.md) | **AI 操作手册**（DO/DON'T） |
 | [elegant-code-patterns.md](elegant-code-patterns.md) | 五文件布局与代码样例 |
 | [DISTRIBUTED.md](DISTRIBUTED.md) | 多实例 / RobustMQ / 集群注意点 |
 | [MODULITH_TENANT_SHOP.md](MODULITH_TENANT_SHOP.md) | **蓝图**：多租户店依赖图 + 目录清单 |
@@ -167,7 +169,7 @@ pub fn main() !void {
 | 时间 | `Time.monotonicNowMilliseconds()`，不用已删除的 `milliTimestamp` |
 | 请求头 | `Context.headers` 键为**小写**（`authorization`） |
 | SQL | 仅 `?` 占位符；标识符校验，禁止拼接用户输入进表名 |
-| 安全 | 密码 / JWT / CSRF 走 `zmodu.security` |
+| 安全 | 密码 / CSRF → `zmodu.security`；JWT 门禁 → catalog 栈（`ROUTE_TABLE.md` §7） |
 | HTTP 响应 | `ctx.json(status, body)`，不用已弃用的 `sendSuccess`/`sendFail` |
 | 观测 | Prometheus `/metrics` + 关键路径延迟；压测用 `examples/http-stress-test` |
 
@@ -190,7 +192,7 @@ pub fn main() !void {
 - [ ] 域模块五文件布局 + `info.dependencies`
 - [ ] `main` 只组装：池、路由、中间件、模块列表
 - [ ] 写路径：service 事务 + 可选 Outbox；读路径可缓存
-- [ ] 全局中间件：recover / requestId / 限流 / JWT（按需）
+- [ ] 全局中间件：recover / requestId / 限流 / catalog JWT+permissionGate（按需，见 `ROUTE_TABLE.md` §7）
 - [ ] 单测按模块；集成 smoke（参考 `examples/tenant-mgmt`）
 - [ ] 文档写清：同步依赖 vs 异步事件各用在哪
 - [ ] `zig build test` 与 `bash scripts/ci-integration.sh` 可跑通

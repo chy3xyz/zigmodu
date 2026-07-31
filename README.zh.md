@@ -1,10 +1,10 @@
-# ZigModu
+# ZigModu v0.14.16
 
-一个为 Zig 0.16.0 打造的模块化应用框架，受 Spring Modulith 启发。从单体架构到分布式系统，支持渐进式架构演进。
+一个为 Zig **0.17.0** 打造的模块化应用框架，受 Spring Modulith 启发。从单体架构到分布式系统，支持渐进式架构演进。
 
-[![Zig](https://img.shields.io/badge/Zig-0.16.0+-orange?style=flat-square)](https://ziglang.org/)
+[![Zig](https://img.shields.io/badge/Zig-0.17+-orange?style=flat-square)](https://ziglang.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
-[![Build](https://img.shields.io/badge/Build-Passing-green?style=flat-square)](https://github.com/knot3bot/zigmodu/actions)
+[![Version](https://img.shields.io/badge/Version-0.14.16-blue?style=flat-square)]()
 
 [English](README.md) | 中文
 
@@ -12,10 +12,12 @@
 
 | 指南 | 描述 |
 |------|------|
+| [**AGENTS.md**](AGENTS.md) | **AI 操作手册**（DO/DON'T、Path A 鉴权、ComptimeRouter） |
 | [快速开始](docs/QUICK-START.md) | 5分钟入门 |
 | [Modulith 高并发](docs/MODULITH.md) | 项目第一天：模块边界 + 高并发实践 |
+| [声明式路由](docs/ROUTE_TABLE.md) | ComptimeRouter + catalog JWT/RBAC |
 | [ZigModu × zent](docs/ZENT.md) | zent ORM 正交接入与最佳实践 |
-| [最佳实践](docs/BEST_PRACTICES.md) | 从1K到1M+日活的架构演进 |
+| [最佳实践](docs/BEST_PRACTICES.md) | DAU 演进 + JWT / 多端身份清单 |
 | [API参考](docs/API.md) | 完整API文档 |
 | [架构设计](docs/ARCHITECTURE.md) | 系统设计与模式 |
 | [示例项目](examples/) | 可运行的示例 |
@@ -55,11 +57,8 @@
 ### 前置要求
 
 ```bash
-# 安装 Zig 0.17.0
-brew install zig
-
-# 或
-apt install zig=0.16.0   # Linux
+# 安装 Zig 0.17.0 — https://ziglang.org/download/
+brew install zig   # 或以官网包为准，确保 zig version → 0.17.0
 ```
 
 ### 创建第一个模块

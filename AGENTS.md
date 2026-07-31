@@ -1,15 +1,33 @@
 # ZigModu — AI Agent Guide
 
+> **面向 AI 的权威入口。** 写代码前先读本节「文档地图」与「近期栈 DO/DON'T」。  
+> 人类长文：`docs/BEST_PRACTICES.md` · 路由/鉴权细则：`docs/ROUTE_TABLE.md` §7。  
+> 哲学长文（可后读）：`docs/AI_METHODOLOGY.md`（以本文为准若冲突）。
+
+## 文档地图（按任务选读）
+
+| 任务 | 先读 |
+|------|------|
+| 新模块 / HTTP API | 本文 Critical Rules + `docs/ROUTE_TABLE.md` §1–4、§7 |
+| JWT / 多门户 / RBAC | `docs/ROUTE_TABLE.md` §7.1 + `docs/BEST_PRACTICES.md`「JWT / 多端身份」 |
+| model / Tx / service | `docs/MODULE_LAYERS.md` |
+| Day-1 并发 / 反模式 | `docs/MODULITH.md` |
+| 多租户列名 | `docs/ARCHITECTURE.md` § Multi-Tenancy |
+| zent ORM | `docs/ZENT.md`（勿与 sqlx 混事务） |
+| Extract / SSE / Testkit / Outbox | `docs/FRAMEWORK_BACKLOG.md` |
+| CLI 生成 | `docs/ZMODU_CLI_INTEGRATION.md` · `zig build zmodu -- scaffold …` |
+| LLM 对话模块（产品功能） | `docs/AI.md`（**不是** agent 指南） |
+
 ## Quick Reference
 
 ```zig
 const zmodu = @import("zigmodu");
 
 // Domain imports (canonical)
-const http = zmodu.http;       // Server, Context, RouteGroup
+const http = zmodu.http;       // Server, Context, Router, Middleware, extract*, sse
 const data = zmodu.data;       // SQLx, ORM, Cache, Redis
-const sec  = zmodu.security;   // Auth, RBAC, Secrets
-const obs  = zmodu.observability; // Metrics, Tracing, Logging
+const sec  = zmodu.security;   // AppSecurity, CatalogPermDb, Secrets
+const obs  = zmodu.observability; // Metrics, Tracing, OtlpExporter
 
 // Module definition (required contract)
 pub const info = zmodu.api.Module{ .name = "my-module", .description = "...", .dependencies = &.{} };
@@ -22,10 +40,25 @@ defer app.deinit();
 try app.start();
 defer app.stop();
 
-// Built-in Codegen & MCP CLI (tools/zmodu)
-// zig build zmodu -- scaffold --sql schema.sql --name my_app
+// Codegen: zig build zmodu -- scaffold --sql schema.sql --name my_app [--with-auth]
 ```
 
+## 近期栈 DO / DON'T（v0.14.x 升级后 · AI 必守）
+
+| DO | DON'T |
+|----|--------|
+| `pub const routes` + `Router(State).scope.mountAll` | 新模块只写 `RouteGroup.get/post` 当默认 |
+| Path A：`jwtAuthFromCatalogWithPermissions` + `permissionGateWith(.rbac)` | 应用自签 PHP 形 JWT 再在 handler 里验一遍 |
+| `generateTokenWithTenant(sub, roles, aud)`；roles=门户粗身份 | 在核心 JwtPayload 加 `type` enum；JWT 塞全量菜单树 |
+| 自定义 `CatalogPermissionLoader(allocator, CatalogPermLoadInput)` 接业务表 | 三套门户 RBAC 硬塞进 `CatalogPermDb` |
+| Handler 读 attrs：`user_id` / `tenant_id` / `permissions` | `@ptrCast(ctx.user_data)` 当 AuthInfo；handler 重复 Bearer 验签 |
+| `user_data` = ComptimeRouter `*State` only | 把 AuthInfo / JWT 对象写入 `user_data` |
+| Legacy `rbacJwtMiddleware` / `jwtAuth` → 只读 `auth_info` | 新应用默认走 legacy 中间件 |
+| `ctx.json` / `http.respondErr` / extractors | `sendSuccess`/`sendFail`；拼用户输入进 SQL |
+| OTLP / Vault：`http://`；x402 **fail-closed** | 默认放行支付；假定 OTLP/Vault 已支持 `https://` |
+| sqlx：`Client.open` 后注意 pool/client 指针；CB 传 `io` | 在 ConnPool 上缓存失效的 `*Client` |
+
+权威细则与接线样例 → `docs/BEST_PRACTICES.md`「JWT / 多端身份」· `docs/ROUTE_TABLE.md` §7。
 
 ## Critical Rules (MUST follow)
 
@@ -76,20 +109,20 @@ const now_ms = Time.monotonicNowMilliseconds();
 
 ### HTTP routing (ComptimeRouter — preferred)
 - Modules declare `pub const routes` + `module_name` + `nest`; wire with `http.Router.scope.mountAll`
-- Auth stack: `jwtAuthFromCatalogWithPermissions` + `permissionGateWith(.{ .mode = .rbac })`
-- Permissions: static `Rbac.RolePermissionTable` or DB `CatalogPermDb.loaderFromClient`
-- Multi-portal / PHP-compat: app-level identity issuer; map into `auth_info`/attrs — `docs/ROUTE_TABLE.md` §7.1 (no framework `type` claim)
-- Legacy `rbacJwtMiddleware` / `jwtAuth` now write **`auth_info` only** (safe with ComptimeRouter State); prefer catalog JWT+RBAC for new apps; never `@ptrCast(user_data)` as AuthInfo
-- Guide: `docs/ROUTE_TABLE.md`
-- **Extractors**: `http.extractPath` / `extractQuery` / `extractJson` / `extractJsonValidated`; field defaults apply when missing
-- **Errors**: `http.respondErr` + optional `http.setErrorMap`; RFC 7807 ProblemDetails
-- **Scope middleware**: `RouteGroup.use(mw)` or `http.Scoped(...).use(mw)` before `mount` / route methods
-- **Testkit**: `dispatch` / `dispatchOpts`, `signBearerToken`, `openMemorySqlite`, `tenantMiddleware`, `SseRecorder`
-- **SSE**: `http.sse(ctx)` + `SseSpec` / `sse_routes` or `RouteMeta.sse = true`
-- **Profiles**: `applyHttpDefaults` (CORS/requestId/recover/access/metrics) + `applyResilienceDefaults` (named CB/RL)
-- **OpenAPI**: `openApiParamsFromStruct` + `RouteMeta.openapi_params` (merged in catalog export)
-- **Outbox barrel**: `zigmodu.outbox.*`; idempotency → `http.idempotencyMiddleware` (header `idempotency-key`)
-- Backlog status: `docs/FRAMEWORK_BACKLOG.md`
+- Auth stack (Path A): `jwtAuthFromCatalogWithPermissions` + `permissionGateWith(.{ .mode = .rbac })` + optional `moduleGate`
+- Permissions: `catalogLoaderFromTable` / `CatalogPermDb.loaderFromClient`，或多主体自定义 loader（`CatalogPermLoadInput{ sub, aud, roles }`）
+- Multi-portal: JWT `roles` = 门户；业务 RBAC → `permissions` CSV + `portal:*` — §7.1（**无**框架 `type` claim）
+- Attrs: middleware 写 `user_id`/`tenant_id`/`permissions`；handler **只读 attrs**
+- Legacy JWT 中间件只写 **`auth_info`**；禁止 `@ptrCast(user_data)` 当 AuthInfo
+- **Extractors**: `extractPath` / `extractQuery` / `extractJson` / `extractJsonValidated`
+- **Errors**: `respondErr` + optional `setErrorMap`（RFC 7807）
+- **Scope MW**: `RouteGroup.use` / `Scoped.use` before mount
+- **Testkit**: `dispatch` / `signBearerToken` / `openMemorySqlite` / `SseRecorder`
+- **SSE**: `http.sse(ctx)` + `SseSpec` / `sse_routes`
+- **Profiles**: `applyHttpDefaults` + `applyResilienceDefaults`
+- **OpenAPI**: `openApiParamsFromStruct` + `RouteMeta.openapi_params`
+- **Outbox**: `zigmodu.outbox.*`；幂等 `idempotencyMiddleware`（header `idempotency-key`）
+- Guide: `docs/ROUTE_TABLE.md` · recipes: `docs/FRAMEWORK_BACKLOG.md`
 
 ### Imports
 - NEVER use `zigmodu.http_server` — use `zigmodu.http.Context`
@@ -99,20 +132,14 @@ const now_ms = Time.monotonicNowMilliseconds();
 
 ### Module lifecycle
 ```zig
-// Every module MUST satisfy this contract:
 pub const info = zmodu.api.Module{
     .name = "order",
     .description = "Order management module",
     .dependencies = &.{"user", "product"},  // module names, NOT import paths
 };
 
-pub fn init() !void {
-    // Called at startup in dependency order (deps before dependents)
-}
-
-pub fn deinit() void {
-    // Called at shutdown in REVERSE dependency order
-}
+pub fn init() !void {}   // deps before dependents
+pub fn deinit() void {}  // reverse order
 ```
 
 ### Error handling
@@ -122,46 +149,78 @@ pub fn deinit() void {
 
 ### Security
 - Passwords: `sec.PasswordEncoder` (PBKDF2-HMAC-SHA256, 100K iterations)
-- JWT: `sec.AppSecurity.init(allocator, io, .{ .jwt_secret = ... })` + `jwtMiddleware()` (wall clock); RBAC via `sec.auth.jwtAuth`
-- Secrets: `sec.SecretsManager` (env > file > vault KV v2 HTTP > default); `initWithIo` + `configureVault` / `loadFromVault`
-- CSRF: `http_middleware.csrf()` double-submit cookie pattern
+- JWT (new apps): `AppSecurity` + `generateTokenWithTenant` + catalog JWT + `permissionGateWith(.rbac)`
+- JWT (legacy only): `rbacJwtMiddleware*` / `sec.auth.jwtAuth*` → `auth_info` only
+- Secrets: `SecretsManager`（env > file > vault KV v2 **HTTP**）；`https://` → `VaultTlsNotSupported`
+- CSRF: `http_middleware.csrf()` double-submit cookie
 - CSPRNG: multi-source entropy, never single-timestamp seed
+- x402: fail-closed；dev 才注入 `verifyPaymentAllowAll`
 
 ### Multi-tenancy (optional)
-- Default SQL/model column is `tenant_id`. ZigShop-style schemas use `app_id` — call once at startup:
+- Default column `tenant_id`；ZigShop 风格用 `app_id`：
   ```zig
   zigmodu.setTenantColumn("app_id");
   ```
-- Model field name must match the column (`app_id: i64`). `TenantInterceptor` appends `{column} = ?` via `tenantColumn()`.
-- Codegen: `zmodu scaffold|orm|add --tenant-column app_id` emits matching `WHERE` and scaffold `main` calls `setTenantColumn`.
-- Details: `docs/ARCHITECTURE.md` § Multi-Tenancy; CLI: `docs/ZMODU_CLI_INTEGRATION.md`
+- 模型字段名必须与列名一致；codegen：`zmodu … --tenant-column app_id`
+- JWT `aud` → catalog 中间件写 attr `tenant_id`（SQL 列名可仍是 `app_id`）
+- Details: `docs/ARCHITECTURE.md` § Multi-Tenancy
+
+### Observability / protocols (recent)
+- OTLP: `OtlpExporter.exportSpans` → `http://` + retries；`https://` → `OtlpTlsNotSupported`
+- gRPC：unary + stream 四态；HTTP/2 priority / h2c / `Http2Tls` sidecar ALPN
+- Kafka CG：assignor（含 cooperative_sticky）+ `acknowledgeRevocation`；live 需 `KAFKA_BOOTSTRAP`
 
 ## Generated Code Patterns
 
-### HTTP API handler
+### HTTP — ComptimeRouter（默认生成这个）
+
 ```zig
 const http = @import("zigmodu").http;
 
-pub fn registerRoutes(group: *http.RouteGroup) !void {
-    try group.get("/users/{id}", getUser, null);
+pub fn OrderApi(comptime Service: type) type {
+    return struct {
+        const Self = @This();
+        service: *Service;
+        pub const module_name = "order";
+        pub const nest = .{"orders"};
+        pub const State = Self;
+
+        pub const routes = [_]http.RouteSpec(State){
+            .{ .method = .GET, .path = "{id}", .handler = getOrder, .meta = .{ .auth = .jwt } },
+            .{ .method = .DELETE, .path = "{id}", .handler = cancel, .meta = .{ .permission = "order:cancel" } },
+            .{ .method = .POST, .path = "login", .handler = login, .meta = .{ .auth = .public } },
+        };
+
+        fn getOrder(ctx: *http.Context, self: *State) !void {
+            const id = try ctx.paramInt("id");
+            // tenant: ctx.getAttr("tenant_id") — 勿再验 Bearer
+            _ = self;
+            _ = id;
+            try ctx.json(200, .{ .ok = true });
+        }
+        fn cancel(ctx: *http.Context, _: *State) !void { try ctx.json(200, .{ .ok = true }); }
+        fn login(ctx: *http.Context, _: *State) !void { try ctx.json(200, .{ .token = "..." }); }
+    };
 }
 
+// main: CatalogSlot → jwtAuthFromCatalogWithPermissions → permissionGateWith(.rbac)
+//       → router.scope.mountAll(.{ order_api, ... }) → catalog_slot.set(try router.finish())
+```
+
+### HTTP — Legacy RouteGroup（仅兼容旧代码）
+
+```zig
+try group.get("users/{id}", getUser, null); // 路径无前导 /
 fn getUser(ctx: *http.Context) !void {
     const id = try ctx.paramInt("id");
-    const page = ctx.queryInt("page", 0);
-    // Use ctx.json(200, body) — NOT ctx.sendSuccess/sendFail (deprecated)
+    try ctx.json(200, .{ .id = id }); // NOT sendSuccess/sendFail
 }
 ```
 
 ### Database
 ```zig
-const data = @import("zigmodu").data;
-
-// One-step init (preferred)
 var db = try data.Client.open(allocator, io, .{ .driver = .sqlite, .path = "app.db" });
 defer db.deinit();
-
-// Repository pattern
 const repo = data.Repository(model.User){ .backend = backend };
 const users = try repo.list(page, size);
 ```
@@ -174,37 +233,40 @@ bus.publish(.{ .id = 42 });
 ```
 
 ## File Organization
+
 ```
 src/modules/{name}/
-├── model.zig          # Structs, table mappings
-├── persistence.zig    # Repository / data access
-├── service.zig        # Business logic
-├── api.zig            # HTTP handlers (registerRoutes)
-├── events.zig         # EventBus types + publisher
-├── module.zig         # Module lifecycle + dependencies
-└── root.zig           # Barrel re-exports
+├── model.zig          # 行形状、枚举；不写 SQL
+├── persistence.zig    # 参数化 SQL；可选 pub const Tx
+├── service.zig        # Cmd/Result；beginTx；写 outbox
+├── api.zig            # routes / handlers；禁止 SQL
+├── events.zig         # EventBus 类型（可选）
+├── module.zig         # info + init/deinit
+└── root.zig           # barrel
 ```
 
+无 `ext/`、`handler.zig`、`service_ext.zig` 分裂层（除非既有仓库已有）。
+
 ## Testing
+
 ```zig
 test "my test" {
     const allocator = std.testing.allocator;
-    // Use std.testing.io for I/O-dependent tests
-    // Use std.testing.tmpDir() for file-dependent tests
+    // std.testing.io · tmpDir · http.Testkit.dispatch / signBearerToken
 }
+```
+
+```bash
+ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test
+bash scripts/ci-integration.sh   # tenant-mgmt + stress + shopdemo
 ```
 
 ## Version
 - Framework: **v0.14.16** (`build.zig.zon`)
 - Zig: **0.17.0**
-- Tests: **664+ passed**, 20 skipped, 0 failed (`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`)
-- Roadmap: `docs/PRODUCTION_ROADMAP.md` (phases 1–9 ✅)
-- Modulith day-one practices: `docs/MODULITH.md`
-- Domain layering (model / persistence.Tx / service Cmd): `docs/MODULE_LAYERS.md`
-- Built-in Tooling: `tools/zmodu` (run with `zig build zmodu`) · guide `docs/ZMODU_CLI_INTEGRATION.md`
-- ZigModu × zent (orthogonal ORM): `docs/ZENT.md` · example `examples/zent-modulith/`
-- Declarative HTTP routes: `docs/ROUTE_TABLE.md` — Zig-native comptime `routes` + `Router(State)` + `std.Io`; scaffold emits RouteSpec via `zmodu scaffold`
-- Score: ~98/100 (`docs/EVALUATION_REPORT.md` v5.6)
+- Tests: **664+ passed**, 20 skipped（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`）
+- Score: ~98/100（`docs/EVALUATION_REPORT.md` v5.6）
+- Roadmap: `docs/PRODUCTION_ROADMAP.md`（phases 1–9 ✅）
 
 ## Learned User Preferences
 
@@ -212,22 +274,15 @@ test "my test" {
 - Do not create git commits unless the user explicitly asks.
 - Prefer the production-readiness plan without physically splitting `sqlx.zig` or `Server.zig`; use section comments plus `docs/PRODUCTION_ROADMAP.md` maintenance boundaries instead.
 - When generating framework code from SQL scripts (zmodu), follow zigmodu best practices for complete module output and place reusable templates in a dedicated templates folder.
-- When refining architecture or best practices, land them in docs (`docs/ZENT.md`, `MODULITH.md`, `MODULE_LAYERS.md`, `BEST_PRACTICES.md`) rather than chat-only advice.
+- When refining architecture or best practices, land them in docs (`docs/ZENT.md`, `MODULITH.md`, `MODULE_LAYERS.md`, `BEST_PRACTICES.md`, `ROUTE_TABLE.md`, **`AGENTS.md`**) rather than chat-only advice.
 - When restructuring examples, preserve existing domain/business logic unless explicitly asked to change it.
 
 ## Learned Workspace Facts
 
-- Project targets Zig 0.17.0; package version **v0.14.16** (`build.zig.zon`; GitHub `chy3xyz/zigmodu`, default branch `master`).
-- If Zig global cache fails in sandboxed runs, use `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`.
-- Production roadmap and monolith maintenance rules live in `docs/PRODUCTION_ROADMAP.md`.
-- Current test baseline: **664+ passed**, 20 skipped (`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`).
-- x402 payment verify is **fail-closed** by default; inject `PaymentVerifier` / `verifyPaymentAllowAll` only for explicit dev paths.
-- OTLP: `observability.OtlpExporter.exportSpans` POSTs JSON over `http://` with retries; `https://` → `OtlpTlsNotSupported` (same boundary as Vault).
-
-- Optional data stack: [chy3xyz/zent](https://github.com/chy3xyz/zent) (v0.12+) is orthogonal to `data.sqlx` — modules may choose either independently, but do not mix drivers or share a transaction across them; see `docs/ZENT.md`.
-- zent reference apps: `examples/zent-modulith/` (minimal) and `examples/metaverse-creative/` (settlement/outbox creative-monetization demo).
-- gRPC / HTTP/2：stream 四种 + pump；PRIORITY 存储；h2c Upgrade；WINDOW_UPDATE/SETTINGS；`Http2Tls` sidecar ALPN
-- Kafka CG：FindCoordinator + Metadata + assignor（含 cooperative_sticky）+ `acknowledgeRevocation` 两阶段
-- CI：`bash scripts/ci-integration.sh`（tenant-mgmt + stress + shopdemo）
-- Kafka Consumer Group: offline solo 或 live `joinGroup`/`heartbeat`/`leaveGroup`（需 `KAFKA_BOOTSTRAP`）
-- Vault secrets: `security.SecretsManager` supports HashiCorp KV v2 over plain HTTP (`initWithIo` + `configureVault` / `loadFromVault`); `https://` returns `VaultTlsNotSupported`.
+- Package **v0.14.16** · Zig **0.17.0** · GitHub `chy3xyz/zigmodu` · branch `master`.
+- Sandbox cache：`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`.
+- Auth Path A + `CatalogPermLoadInput` 已落地；legacy JWT 只写 `auth_info`。
+- x402 fail-closed；OTLP/Vault 仅 plain HTTP。
+- zent v0.13+ 与 `data.sqlx` 正交，勿混驱动/共享事务（`docs/ZENT.md`）。
+- CI：`bash scripts/ci-integration.sh`（tenant-mgmt + stress + shopdemo）。
+- 旗舰示例：`examples/tenant-mgmt`（CatalogPermDb）；多主体门户参考应用侧 Alignment 文档（如 ZigShop）。

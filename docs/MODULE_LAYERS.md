@@ -11,7 +11,9 @@
 | [elegant-code-patterns.md](elegant-code-patterns.md) | 五文件样例 |
 | [MODULITH_TENANT_SHOP.md](MODULITH_TENANT_SHOP.md) | 多租户店蓝图 |
 | [ZENT.md](ZENT.md) | zent ORM 正交接入（schema / Client / migrate） |
-| [BEST_PRACTICES.md](BEST_PRACTICES.md) | DAU 演进路线 |
+| [BEST_PRACTICES.md](BEST_PRACTICES.md) | DAU 演进 + JWT / 多端身份 |
+| [ROUTE_TABLE.md](ROUTE_TABLE.md) | ComptimeRouter + catalog 鉴权门禁 |
+| [AGENTS.md](../AGENTS.md) | AI 操作手册 |
 
 ---
 

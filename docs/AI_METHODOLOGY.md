@@ -2,7 +2,10 @@
 
 > 基于 Spring Modulith 架构哲学 + Zig 编译期能力 + AI 协作实践
 >
-> 版本：1.0 | ZigModu v0.7.0 | Zig 0.16.0
+> 版本：1.1 | ZigModu **v0.14.16** | Zig **0.17.0**
+>
+> **操作手册（写代码先读）**：仓库根目录 [`AGENTS.md`](../AGENTS.md) — 文档地图、近期栈 DO/DON'T、ComptimeRouter / Path A 鉴权。  
+> 本文讲**为什么**；与 AGENTS / `ROUTE_TABLE` / `MODULE_LAYERS` 冲突时，以那三份为准。
 
 ---
 
@@ -85,17 +88,19 @@ ZigModu AI 编程循环：
 
 AI 的上下文窗口和推理能力有一个"甜蜜点"：**约 100-300 行的单一职责代码**。
 
-ZigModu 的模块结构天然匹配这个粒度：
+ZigModu 的模块结构天然匹配这个粒度（五文件 · 见 `MODULE_LAYERS.md`）：
 
 ```
 src/modules/order/
-├── module.zig      ←  30-50 行：声明层（info + init/deinit 骨架）
-├── api.zig         ←  50-100行：公开接口
-├── handler.zig     ←  100-200行：业务逻辑
-└── test.zig        ←  50-100行：模块级测试
+├── module.zig       ←  30-50 行：info + init/deinit
+├── model.zig        ←  行形状 / 枚举
+├── persistence.zig  ←  SQL + 可选 Tx
+├── service.zig      ←  业务编排
+├── api.zig          ←  ComptimeRouter `routes` + handlers
+└── root.zig         ←  barrel
 ```
 
-每个文件都在 AI 的 context sweet spot 内。
+每个文件都在 AI 的 context sweet spot 内。**不要**再生成 `handler.zig` / `service_ext.zig` / `ext/`（除非仓库已有）。
 
 ### 2.2 模块的"三明治结构"
 
@@ -103,19 +108,15 @@ ZigModu 模块遵循一个 AI 友好的三层结构：
 
 ```
 ┌──────────────────────────────────────┐
-│  1. 声明层 (Declaration Layer)       │  ← AI 生成：定义你是谁
-│     info: Module { name, deps }      │     编译期验证：依赖存在？
-│     init() !void                     │
-│     deinit() void                    │
+│  1. 声明层 (Declaration Layer)       │  ← info + init/deinit
+│     info: Module { name, deps }      │
 ├──────────────────────────────────────┤
-│  2. 实现层 (Implementation Layer)    │  ← AI 生成：定义你做什么
-│     公开函数 → api.zig               │     人工审查：业务逻辑正确性
-│     内部函数 → internal.zig          │
-│     事件处理 → handler.zig           │
+│  2. 实现层 (Implementation Layer)    │
+│     model → persistence → service    │
+│     api.zig：pub const routes        │  ← ComptimeRouter（默认）
 ├──────────────────────────────────────┤
-│  3. 测试层 (Verification Layer)      │  ← AI 生成：证明你正确
-│     test "模块名 - 场景"             │     zig build test 自动运行
-│     ModuleTestContext 集成测试       │
+│  3. 测试层 (Verification Layer)      │
+│     test "…" + Testkit.dispatch      │
 └──────────────────────────────────────┘
 ```
 
@@ -410,6 +411,20 @@ src/modules/order/module.zig:15:32: note: expected type '[]const u8'
 
 ## 六、AI 常见反模式与纠正
 
+### 6.0 反模式：鉴权 / 路由「旧习惯」（v0.14 后最高频）
+
+| ❌ AI 常写 | ✅ 正确 |
+|-----------|--------|
+| 新模块只用 `RouteGroup.get` | `pub const routes` + `mountAll`（`ROUTE_TABLE.md`） |
+| handler 里 `extractAuth` / 再验 JWT | gate 已过 → 读 `user_id`/`tenant_id`/`permissions` attrs |
+| `@ptrCast(ctx.user_data)` → AuthInfo | `user_data` = Router State；auth → attrs 或 `auth_info` |
+| JWT claim 加 `type=admin` | `roles`=门户 + `RouteMeta.permission` / loader |
+| 双签发（应用 PHP token + 框架 token） | 唯一源：`AppSecurity.generateTokenWithTenant` |
+| 三套业务 RBAC 并进 `CatalogPermDb` | 自定义 `CatalogPermissionLoader` |
+| `sendSuccess` / 大写 `Authorization` header key | `ctx.json`；header 键 **小写** |
+
+完整 DO/DON'T → [`AGENTS.md`](../AGENTS.md)。
+
 ### 6.1 反模式：循环依赖
 
 **AI 容易犯的错误**：模块 A 依赖 B，模块 B 依赖 A
@@ -546,15 +561,16 @@ zmodu api users --module user  # → src/modules/user/api.zig
 
 ```
 src/modules/<name>/
-├── module.zig       ← AI 必读：模块声明和生命周期
-├── api.zig          ← AI 必读：公开接口定义
-├── handler.zig      ← AI 生成：事件处理器
-├── internal.zig     ← AI 可读：内部实现（不暴露）
-├── types.zig        ← AI 可读：模块专属类型定义
-└── test.zig         ← AI 生成：测试用例
+├── module.zig       ← 声明与生命周期
+├── model.zig        ← 行形状
+├── persistence.zig  ← SQL / Tx
+├── service.zig      ← 业务
+├── api.zig          ← routes + handlers
+├── events.zig       ← 可选
+└── root.zig         ← barrel
 ```
 
-**AI prompt 公约**：在 prompt 中引用模块时，使用路径 `src/modules/<name>/module.zig`，AI 能定位到声明层和实现层。
+**AI prompt 公约**：引用 `src/modules/<name>/api.zig` 的 `routes` 与 `src/modules/<name>/module.zig` 的 `info`；鉴权接线看 `main` + `AGENTS.md` Path A。
 
 ---
 
@@ -677,12 +693,14 @@ AI 每生成一段代码后，应自问：
 
 ## 参考
 
-- [ZigModu Architecture Guide](ARCHITECTURE.md)
-- [ZigModu Best Practices](BEST_PRACTICES.md)
-- [Zig 0.16.0 Language Reference](https://ziglang.org/documentation/0.16.0/)
+- [AGENTS.md](../AGENTS.md) — **AI 操作手册**
+- [ROUTE_TABLE.md](ROUTE_TABLE.md) — ComptimeRouter + catalog JWT
+- [MODULE_LAYERS.md](MODULE_LAYERS.md) — 领域分层
+- [BEST_PRACTICES.md](BEST_PRACTICES.md) — DAU + 鉴权清单
+- [ARCHITECTURE.md](ARCHITECTURE.md)
+- [Zig 0.17.0 Language Reference](https://ziglang.org/documentation/0.17.0/)
 - [Spring Modulith Reference](https://docs.spring.io/spring-modulith/reference/)
-- [Hayashibara et al. "The φ Accrual Failure Detector"](https://www.researchgate.net/publication/221034039_The_φ_Accrual_Failure_Detector)
 
 ---
 
-*方法论是一个活文档。每次 AI 协作中发现新模式或反模式，应更新本文档。*
+*方法论是活文档。与 AGENTS 冲突时更新本节或修订 AGENTS；新反模式优先记入 AGENTS「DO/DON'T」。*

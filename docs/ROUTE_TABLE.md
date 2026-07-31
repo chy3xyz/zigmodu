@@ -1,7 +1,9 @@
 # Router（Zig-native）— comptime × 泛型 × std.Io × Modulith
 
 > 状态：**推荐栈已钉死；scaffold 默认 RBAC；zent-modulith / tenant-shop 已迁；tenant-mgmt 用 CatalogPermDb**。  
-> 推荐：`jwtAuthFromCatalogWithPermissions` + `permissionGateWith(.rbac)` + `RolePermissionTable` / `CatalogPermDb`。  
+> 推荐：`jwtAuthFromCatalogWithPermissions` + `permissionGateWith(.rbac)` + `RolePermissionTable` / `CatalogPermDb` / 自定义 `CatalogPermissionLoader`。  
+> 多门户 / 多主体 RBAC 最佳实践摘要：[`BEST_PRACTICES.md`](BEST_PRACTICES.md)「JWT / 多端身份」；细则 §7.1。  
+> **AI**：[`AGENTS.md`](../AGENTS.md) DO/DON'T + 本文 §7；勿把 AuthInfo 写入 `user_data`。  
 > Legacy：`security.auth.jwtAuth*` / `AppSecurity.rbacJwtMiddleware*` 现只写 **`auth_info`**，可与 ComptimeRouter `user_data` State 共存；读 auth 用 `getAuth` / `ctx.authInfo`，**勿再 `@ptrCast(user_data)` 当 AuthInfo**。  
 > 前提：未生产化，**不做**旧 URL 兼容。
 
@@ -274,25 +276,26 @@ WS：`pub const ws_routes = [_]http.WsSpec(State){ .{ .path = "ws", .on_connect 
 
 ### 7.1 多端 / 自定义身份 claim（应用层扩展 · 最佳实践）
 
-框架 **不** 内置 `type=user|admin|shop_user|…` 枚举。多门户（C 端 / 店主 / 平台 / 供应商）用 **现有槽位** 扩展，避免第二套 JWT 核心模型。
+框架 **不** 内置 `type=user|admin|shop_user|…` 枚举。多门户（C 端 / 店主 / 平台 / 供应商）用 **现有槽位** 扩展，避免第二套 JWT 核心模型。  
+可执行清单与接线样例亦见 [`BEST_PRACTICES.md`](BEST_PRACTICES.md)「JWT / 多端身份」。
 
 #### 分层（与现有组件对齐）
 
 ```
-签发/验签（唯一源）
-  ├─ 新应用：AppSecurity / SecurityModule（sub/iss/aud/roles）
-  └─ PHP 兼容多商户：应用 identity 模块（可含 app_id、type；aud≡tenant）
+签发/验签（唯一源 · 路径 A）
+  └─ AppSecurity / SecurityModule（sub / iss / aud / roles）
+     登录只发门户 roles + aud + sub；勿塞全量菜单树
 
 请求上下文（正交）
   ├─ ctx.user_data     → ComptimeRouter *State（模块状态）
-  ├─ ctx.auth_info     → AuthInfo / 应用自定义身份对象（仅指针）
-  └─ ctx.attributes    → permissions CSV、可选 identity_kind / portal
+  ├─ ctx.auth_info     → 可选 AuthInfo（legacy rbacJwt；读 getAuth）
+  └─ ctx.attributes    → user_id、tenant_id、roles、permissions CSV
 
 门禁（由粗到细）
   ├─ RouteMeta.auth = .public | .jwt | .inherit
-  ├─ permissionGateWith(.rbac) ← 权限码（推荐）
-  ├─ permissionGate / .roles   ← roles 名（粗）
-  └─ 应用 require*Auth          ← 读写 type/portal（兼容期可保留）
+  ├─ permissionGateWith(.rbac) ← permissions 码（推荐；含 portal:*）
+  ├─ permissionGate / .roles   ← JWT roles 名（粗）
+  └─ 应用薄 helper              ← 只读 attrs（勿再验签）
 ```
 
 #### 多业务主体 × 各自 RBAC（ZigShop 类 · 推荐模型）
@@ -315,33 +318,34 @@ WS：`pub const ws_routes = [_]http.WsSpec(State){ .{ .path = "ws", .on_connect 
 
 | 层 | 谁拥有 | 框架是否内置 |
 |----|--------|--------------|
-| 门户身份 | JWT `roles` 如 `shop`/`supplier`/`admin` | ✅ 标准 claim |
+| 门户身份 | JWT `roles` 如 `shop`/`supplier`/`admin`/`user` | ✅ 标准 claim |
 | 租户 | JWT `aud` | ✅ |
 | 主体内职务/菜单权限 | **应用自己的** `*_role` / `*_access` 表 | ❌ 不合并进框架表 |
 | HTTP 门禁 | `permissions` attr + catalog gate | ✅ |
-| 展开职务→权限码 | **应用** `CatalogPermissionLoader`（或等价中间件） | ✅ **扩展点**；见下 |
+| 展开职务→权限码 | **应用** `CatalogPermissionLoader` | ✅ **扩展点** |
 
 **最佳实践：**
 
 1. **不要**把三套业务表迁进 `CatalogPermDb.role_permission`（那只适合简单单租户演示）。  
 2. **不要**在 JWT 塞全量 access 树（token 膨胀、撤权滞后）。  
 3. 登录只发 **门户 role + aud + sub**；每次请求由 loader **按 (portal, aud, sub)** 查对应表族，展开 path/码 → `permissions` CSV。  
-4. `RouteMeta.permission` 与各端 `access.path`（或规范化码）对齐；BFF scope 与门户 role 一致。  
-5. Super 账号（`is_super`）：loader 内短路为该门户全量权限或 `*` 约定。
+4. `RouteMeta.permission` 与各端 `access.path`（或规范化码 / `portal:*`）对齐；BFF scope 与门户 role 一致。  
+5. Super 账号（`is_super`）：loader 内短路为该门户全量权限或约定码。  
+6. Handler **禁止**新增重复 Bearer 验签；gate 通过后只读 `user_id` / `tenant_id` / `permissions`。
 
-**框架 loader 入参（已补齐）：**  
-`CatalogPermissionLoader = fn(allocator, CatalogPermLoadInput) ![]u8`，其中 `CatalogPermLoadInput = { sub, aud, roles }`。  
+**框架 loader 入参：**  
+`CatalogPermissionLoader = fn(allocator, CatalogPermLoadInput) ![]u8`，`CatalogPermLoadInput = { sub, aud, roles }`（导出：`http.CatalogPermLoadInput`）。  
 - 静态表 / `CatalogPermDb.loaderFromClient` **忽略** `sub`/`aud`，只映射 roles。  
-- 多主体应用用 `(sub, aud, roles)` 查 shop/supplier/admin 表族 → `permissions` CSV。  
-- JWT 验签后同时写入 `user_id`（sub）与 `tenant_id`（aud）。
+- 多主体应用用 `(sub, aud, roles)` 查业务表族 → `permissions` CSV。  
+- JWT 验签后写入 `user_id`（sub）与 `tenant_id`（aud）。
 
 #### 三条路径（选一条作主路径，勿双签发）
 
 | 路径 | 适用 | 做法 |
 |------|------|------|
-| **A. Catalog 默认** | 新应用、tenant-mgmt 类 | `jwtAuthFromCatalogWithPermissions` + `permissionGateWith(.rbac)`；多端差异用 **permission 码**（如 `portal:shop`）或 role；**多主体 RBAC 用自定义 loader 接业务表** |
-| **B. 应用 identity** | 过渡 / 旧 PHP claim | 应用内签发验签；handler `require*Auth`；尽快迁 A |
-| **C. 适配桥** | 渐迁 B→A | 旧 claim 映射为 `roles`/`aud` 后再走 gate |
+| **A. Catalog 默认** | **所有新应用**、tenant-mgmt、ZigShop 目标态 | `AppSecurity` + `jwtAuthFromCatalogWithPermissions` + `permissionGateWith(.rbac)`；多端用 **permission 码** / roles；多主体 RBAC 用自定义 loader |
+| **B. 应用 identity** | 遗留过渡（勿新开） | 应用内签发验签；尽快迁 A |
+| **C. 适配桥** | 仅渐迁 B→A | 旧 claim 映射为 `roles`/`aud` 后再走 gate |
 
 #### 推荐约定（claim → 框架槽）
 
@@ -353,12 +357,14 @@ WS：`pub const ws_routes = [_]http.WsSpec(State){ .{ .path = "ws", .on_connect 
 | 细权限门禁 | `RouteMeta.permission` | 仅靠门户 role 守所有写接口 |
 | 模块 State | `user_data` | 鉴权对象写入 `user_data` |
 
-#### 演进阶梯（ZigShop 类）
+#### 演进阶梯（多 BFF 应用）
 
-1. P0：框架 JWT + catalog gate；roles=门户。  
-2. Loader/中间件接 **shop_*** 表（试点 shop BFF）。  
-3. 同构接 supplier / admin 表族；补齐 admin 表 CREATE。  
-4. 去掉 handler 内重复验签与 JWT `type`。
+1. P0：`AppSecurity` + catalog JWT/gate；loader（静态或 DB）；登录发框架 token。  
+2. P1：试点一个 BFF：`portal:*` + 路由 meta；handler 改读 attrs。  
+3. P2：批改其余门户 / BFF。  
+4. P3：删除应用侧 PHP 形签发/验签；只保留 password/OAuth 等业务逻辑。  
+
+参考落地：ZigShop `docs/AUTH_FRAMEWORK_ALIGNMENT.md`（路径 A · P0–P3）。
 
 #### 刻意不做（框架边界）
 
@@ -366,7 +372,7 @@ WS：`pub const ws_routes = [_]http.WsSpec(State){ .{ .path = "ws", .on_connect 
 - 不内置 `zigshop_shop_role` 一类业务表  
 - `CatalogPermDb` 保持可选简易后端，**不是**多主体 RBAC 的唯一实现  
 
-示例：`examples/tenant-mgmt`（单套 `CatalogPermDb`）；多主体见应用侧三套表 + loader（ZigShop）。
+示例：`examples/tenant-mgmt`（单套 `CatalogPermDb`）；多主体见应用自定义 loader（ZigShop）。
 
 ### Typed extractors + scope middleware
 

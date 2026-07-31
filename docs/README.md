@@ -2,6 +2,17 @@
 
 Comprehensive documentation for the ZigModu modular framework.
 
+## 🤖 For AI agents
+
+| Doc | Role |
+|-----|------|
+| [**AGENTS.md**](../AGENTS.md) | **Canonical** — doc map, DO/DON'T, ComptimeRouter, Path A auth |
+| [CLAUDE.md](../CLAUDE.md) | Compact Claude Code rules (points to AGENTS) |
+| [AI_METHODOLOGY.md](AI_METHODOLOGY.md) | Why modulith + AI; anti-patterns (philosophy) |
+| [ROUTE_TABLE.md](ROUTE_TABLE.md) §7 | Auth / RBAC detail |
+| [BEST_PRACTICES.md](BEST_PRACTICES.md) | DAU + JWT checklist |
+| [AI.md](AI.md) | LLM **chat product** module (`--with-aichat`) — not agent ops |
+
 ## 📚 Core Guides
 
 | Guide | Description | Level |
@@ -12,11 +23,12 @@ Comprehensive documentation for the ZigModu modular framework.
 | [多租户店蓝图](MODULITH_TENANT_SHOP.md) | Module graph + directory for tenant shop | All |
 | [ZigModu × zent](ZENT.md) | Orthogonal zent ORM + modulith practices | Intermediate |
 | [zmodu CLI 生成器](ZMODU_CLI_INTEGRATION.md) | DDL schema generator + `@initialized` model + MCP | All |
-| [Best Practices](BEST_PRACTICES.md) | Architecture evolution from 1K to 1M+ DAU | All |
-
+| [Best Practices](BEST_PRACTICES.md) | Architecture evolution + JWT / auth checklist | All |
+| [Declarative Routes](ROUTE_TABLE.md) | ComptimeRouter + catalog JWT / RBAC gate (§7) | All |
 | [Elegant Code Patterns](elegant-code-patterns.md) | Five-file layout + code samples | Intermediate |
 | [API Reference](API.md) | Detailed API documentation | Advanced |
 | [Architecture](ARCHITECTURE.md) | System design and patterns | Intermediate |
+| [Framework Backlog](FRAMEWORK_BACKLOG.md) | Extractors / SSE / Testkit recipes | Intermediate |
 
 ## 🔧 Features
 
