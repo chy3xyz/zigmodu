@@ -88,6 +88,7 @@ test "compile all source files" {
     _ = @import("messaging/Nats.zig");
     _ = @import("messaging/MessageQueue.zig");
     _ = @import("messaging/FluvioConnector.zig");
+    _ = @import("messaging/FluvioNative.zig");
 
     // Metrics
     _ = @import("metrics/AutoInstrumentation.zig");

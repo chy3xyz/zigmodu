@@ -26,6 +26,17 @@ pub const FluvioConfig = struct {
     timeout_ms: u64 = 10_000,
 };
 
+/// Pluggable delivery transport. `null` uses the `fluvio` CLI; apps can
+/// inject a native transport (see `FluvioNative.zig`) or their own protocol
+/// implementation (e.g. the full Fluvio SC/SPU wire protocol).
+pub const Transport = struct {
+    ptr: *anyopaque,
+    produceFn: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io, topic: []const u8, key: []const u8, value: []const u8) anyerror!void,
+    consumeFn: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io, topic: []const u8, offset: i64) anyerror![]Record,
+    listTopicsFn: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) anyerror![]const []const u8,
+    createTopicFn: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io, name: []const u8, partitions: u16) anyerror!void,
+};
+
 pub const FluvioConnector = struct {
     const Self = @This();
 
@@ -33,6 +44,8 @@ pub const FluvioConnector = struct {
     io: std.Io,
     config: FluvioConfig,
     cli_available: bool = false,
+    /// When set, all operations go through this transport instead of the CLI.
+    transport: ?Transport = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: FluvioConfig) !Self {
         var self = Self{
@@ -55,6 +68,9 @@ pub const FluvioConnector = struct {
 
     /// Produce a record to a topic. Format: key \t value per line.
     pub fn produce(self: *Self, topic: []const u8, key: []const u8, value: []const u8) !void {
+        if (self.transport) |t| {
+            return t.produceFn(t.ptr, self.allocator, self.io, topic, key, value);
+        }
         if (!self.cli_available) {
             return self.stubProduce(topic, key, value);
         }
@@ -81,6 +97,9 @@ pub const FluvioConnector = struct {
     /// Uses `fluvio consume <topic> -B -o <offset>` (from-beginning + offset).
     /// Caller owns returned memory.
     pub fn consume(self: *Self, topic: []const u8, offset: i64) ![]Record {
+        if (self.transport) |t| {
+            return t.consumeFn(t.ptr, self.allocator, self.io, topic, offset);
+        }
         if (!self.cli_available) {
             return self.stubConsume(offset);
         }
@@ -107,6 +126,9 @@ pub const FluvioConnector = struct {
     /// List all topics.
     /// Caller owns returned memory.
     pub fn listTopics(self: *Self) ![]const []const u8 {
+        if (self.transport) |t| {
+            return t.listTopicsFn(t.ptr, self.allocator, self.io);
+        }
         if (!self.cli_available) {
             return self.stubListTopics();
         }
@@ -129,6 +151,9 @@ pub const FluvioConnector = struct {
 
     /// Create a new topic with the given number of partitions.
     pub fn createTopic(self: *Self, name: []const u8, partitions: u16) !void {
+        if (self.transport) |t| {
+            return t.createTopicFn(t.ptr, self.allocator, self.io, name, partitions);
+        }
         if (!self.cli_available) {
             return self.stubCreateTopic(name, partitions);
         }

@@ -46,3 +46,53 @@ pub const MetricsBackend = struct {
         self.vtable.histogramObserve(handle, v);
     }
 };
+
+test "MetricsBackend routes calls through the vtable" {
+    const State = struct {
+        var counter_created: usize = 0;
+        var incs: u64 = 0;
+        var gauge_value: f64 = 0;
+        var observed: f64 = 0;
+    };
+    const Impl = struct {
+        fn createCounter(_: *anyopaque, _: []const u8, _: []const u8) anyerror!*anyopaque {
+            State.counter_created += 1;
+            return @ptrCast(@constCast(&State.counter_created));
+        }
+        fn createGauge(_: *anyopaque, _: []const u8, _: []const u8) anyerror!*anyopaque {
+            return @ptrCast(@constCast(&State.gauge_value));
+        }
+        fn createHistogram(_: *anyopaque, _: []const u8, _: []const u8, _: []const f64) anyerror!*anyopaque {
+            return @ptrCast(@constCast(&State.observed));
+        }
+        fn counterInc(_: *anyopaque, _: u64) void {
+            State.incs += 1;
+        }
+        fn counterAdd(_: *anyopaque, _: u64) void {
+            State.incs += 1;
+        }
+        fn gaugeSet(_: *anyopaque, _: f64) void {}
+        fn gaugeInc(_: *anyopaque) void {}
+        fn gaugeDec(_: *anyopaque) void {}
+        fn histogramObserve(_: *anyopaque, _: f64) void {}
+    };
+    var dummy: u8 = 0;
+    var backend = MetricsBackend{
+        .ptr = &dummy,
+        .vtable = &.{
+            .createCounter = Impl.createCounter,
+            .createGauge = Impl.createGauge,
+            .createHistogram = Impl.createHistogram,
+            .counterInc = Impl.counterInc,
+            .counterAdd = Impl.counterAdd,
+            .gaugeSet = Impl.gaugeSet,
+            .gaugeInc = Impl.gaugeInc,
+            .gaugeDec = Impl.gaugeDec,
+            .histogramObserve = Impl.histogramObserve,
+        },
+    };
+    _ = try backend.createCounter("req", "requests");
+    _ = try backend.createGauge("mem", "memory");
+    _ = try backend.createHistogram("lat", "latency", &.{ 1, 2 });
+    try std.testing.expectEqual(@as(usize, 1), State.counter_created);
+}

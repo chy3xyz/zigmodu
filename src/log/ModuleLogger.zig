@@ -55,3 +55,15 @@ pub const LogScope = struct {
         };
     }
 };
+
+test "ModuleLogger and LogScope construct and log" {
+    const logger = ModuleLogger.init("order");
+    try std.testing.expectEqualStrings("order", logger.module_name);
+    logger.debug("debug {d}", .{1});
+    logger.info("info {s}", .{"x"});
+    logger.warn("warn {d}", .{2});
+
+    const Scope = LogScope.scope("payments");
+    Scope.info("scoped {d}", .{3});
+    Scope.debug("scoped debug", .{});
+}
