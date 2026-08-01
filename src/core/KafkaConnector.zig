@@ -102,6 +102,8 @@ pub const RobustMQTransport = struct {
     client_id: []const u8,
     host: []const u8,
     port: u16,
+    reader_buf: [8192]u8 = undefined,
+    reader: ?sockread.Reader = null,
     /// Set when redirected via FindCoordinator (owned).
     owned_host: ?[]u8 = null,
 
@@ -127,6 +129,7 @@ pub const RobustMQTransport = struct {
             s.close(self.io);
             self.stream = null;
         }
+        self.reader = null;
     }
 
     /// Close current socket and connect to `host:port` (e.g. group coordinator).
@@ -276,23 +279,27 @@ pub const RobustMQTransport = struct {
         const s = self.stream orelse return error.NotConnected;
         var size_be: [4]u8 = undefined;
         writeI32(&size_be, @intCast(payload.len));
-        var wbuf: [8192]u8 = undefined;
-        var w = s.writer(self.io, &wbuf);
-        try w.interface.writeAll(&size_be);
-        try w.interface.writeAll(payload);
-        try w.interface.flush();
+        // 4-byte size + body in one syscall (writev).
+        try sockread.writevAll(s, &.{ &size_be, payload });
     }
 
     fn readFrame(self: *Self) ![]u8 {
-        const s = self.stream orelse return error.NotConnected;
         var size_buf: [4]u8 = undefined;
-        try readExact(s, self.io, &size_buf);
+        try self.readFull(&size_buf);
         const size = readI32(&size_buf);
         if (size <= 0 or size > 16 * 1024 * 1024) return error.InvalidFrame;
         const buf = try self.allocator.alloc(u8, @intCast(size));
         errdefer self.allocator.free(buf);
-        try readExact(s, self.io, buf);
+        try self.readFull(buf);
         return buf;
+    }
+
+    fn readFull(self: *Self, out: []u8) !void {
+        if (self.reader == null) {
+            const s = self.stream orelse return error.NotConnected;
+            self.reader = sockread.Reader.init(s, &self.reader_buf);
+        }
+        try self.reader.?.readFull(out);
     }
 
     fn sendApiVersions(self: *Self) !void {
@@ -319,11 +326,6 @@ fn parseBootstrap(bootstrap: []const u8) !struct { []const u8, u16 } {
         return .{ host, port };
     }
     return .{ trimmed, 9092 };
-}
-
-fn readExact(stream: std.Io.net.Stream, io: std.Io, buf: []u8) !void {
-    _ = io;
-    try sockread.readFull(stream, buf);
 }
 
 fn writeI32(out: *[4]u8, v: i32) void {

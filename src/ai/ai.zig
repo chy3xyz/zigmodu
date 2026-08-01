@@ -21,6 +21,8 @@ pub const AuditKind = @import("audit.zig").AuditKind;
 pub const ScheduledTask = @import("schedule.zig").ScheduledTask;
 pub const registerScheduleSkills = @import("schedule.zig").registerScheduleSkills;
 
+pub const business = @import("business.zig");
+
 pub const Retriever = @import("retriever.zig").Retriever;
 pub const RetrievedChunk = @import("retriever.zig").RetrievedChunk;
 pub const KeywordRetriever = @import("retriever.zig").KeywordRetriever;

@@ -22,12 +22,18 @@ pub const WsFrameKind = enum {
 };
 
 /// Minimal WebSocket frame reader/writer.
+const sockread = @import("../core/sockread.zig");
+
 pub const WsFramer = struct {
     stream: std.Io.net.Stream,
     io: std.Io,
     /// Optional pre-allocated write buffer for frame output.
-    /// If null, writeFrame stack-allocates a 4KB buffer per call.
+    /// Retained for API compatibility; writeFrame now emits via one `writev`.
     write_buf: ?[]u8 = null,
+    /// Persistent read buffer so frame header/mask/payload come from one
+    /// syscall instead of one per field.
+    read_buf: [8192]u8 = undefined,
+    reader: ?sockread.Reader = null,
 
     pub fn init(stream: std.Io.net.Stream, io: std.Io) WsFramer {
         return .{ .stream = stream, .io = io };
@@ -75,7 +81,7 @@ pub const WsFramer = struct {
     /// Read one WebSocket frame. `buf` must be at least 4KB (caller provided).
     pub fn readFrame(self: *WsFramer, buf: []u8) !Frame {
         var header: [2]u8 = undefined;
-        try readFull(self.stream, self.io, &header);
+        try self.readFull(&header);
 
         const opcode = header[0] & 0x0F;
         const masked = (header[1] & 0x80) != 0;
@@ -83,21 +89,21 @@ pub const WsFramer = struct {
 
         if (payload_len == 126) {
             var ext: [2]u8 = undefined;
-            try readFull(self.stream, self.io, &ext);
+            try self.readFull(&ext);
             payload_len = @intCast(std.mem.readInt(u16, &ext, .big));
         } else if (payload_len == 127) {
             var ext: [8]u8 = undefined;
-            try readFull(self.stream, self.io, &ext);
+            try self.readFull(&ext);
             payload_len = @intCast(std.mem.readInt(u64, &ext, .big));
         }
 
         var mask_key: [4]u8 = undefined;
         if (masked) {
-            try readFull(self.stream, self.io, &mask_key);
+            try self.readFull(&mask_key);
         }
 
         if (payload_len > buf.len) return error.PayloadTooLarge;
-        try readFull(self.stream, self.io, buf[0..payload_len]);
+        try self.readFull(buf[0..payload_len]);
 
         if (masked) {
             for (buf[0..payload_len], 0..) |*b, i| {
@@ -106,6 +112,13 @@ pub const WsFramer = struct {
         }
 
         return .{ .opcode = opcode, .payload = buf[0..payload_len], .payload_len = payload_len };
+    }
+
+    fn readFull(self: *WsFramer, out: []u8) !void {
+        if (self.reader == null) {
+            self.reader = sockread.Reader.init(self.stream, &self.read_buf);
+        }
+        try self.reader.?.readFull(out);
     }
 
     /// Write a text frame.
@@ -141,18 +154,8 @@ pub const WsFramer = struct {
             header_len = 10;
         }
 
-        if (self.write_buf) |buf| {
-            var w = self.stream.writer(self.io, buf);
-            try w.interface.writeAll(header[0..header_len]);
-            try w.interface.writeAll(payload);
-            try w.interface.flush();
-        } else {
-            var write_buf: [4096]u8 = undefined;
-            var w = self.stream.writer(self.io, &write_buf);
-            try w.interface.writeAll(header[0..header_len]);
-            try w.interface.writeAll(payload);
-            try w.interface.flush();
-        }
+        // Header + payload in one syscall (writev).
+        try sockread.writevAll(self.stream, &.{ header[0..header_len], payload });
     }
 
     /// Write a pong frame.
@@ -165,15 +168,6 @@ pub const WsFramer = struct {
         try self.writeFrame(0x8, &.{});
     }
 };
-
-fn readFull(stream: std.Io.net.Stream, io: std.Io, buf: []u8) !void {
-    // Raw posix poll+read instead of `io.operate(net_read)`: with the Threaded
-    // Io shared across the accept thread, worker fibers and the client thread,
-    // io-based socket reads can block forever even when data is already in the
-    // kernel buffer (observed on macOS). Raw reads are immune to that.
-    _ = io;
-    try @import("../core/sockread.zig").readFull(stream, buf);
-}
 
 test "WsFrameKind opcode roundtrip" {
     try std.testing.expectEqual(@as(u8, 0x1), WsFrameKind.text.opcode());

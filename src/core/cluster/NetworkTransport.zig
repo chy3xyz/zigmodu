@@ -32,8 +32,7 @@ pub const ClusterConnection = struct {
         var len_buf: [4]u8 = undefined;
         const len: u32 = @intCast(payload.len);
         std.mem.writeInt(u32, len_buf[0..], len, .big);
-        try sockread.writeFull(self.stream, &len_buf);
-        try sockread.writeFull(self.stream, payload);
+        try sockread.writevAll(self.stream, &.{ &len_buf, payload });
     }
 
     /// Receive a length-prefixed message. Caller owns returned memory.

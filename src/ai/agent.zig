@@ -250,6 +250,7 @@ pub const Agent = struct {
                     log.record(.tool_ok, tc.name, "", skill_ctx.tenant_id orelse 0, skill_ctx.user_id orelse 0);
                 }
                 const result_s = try std.json.Stringify.valueAlloc(allocator, result, .{});
+                skill_mod.freeValue(allocator, result);
                 try owned_strs.append(allocator, result_s);
                 const tid = try allocator.dupe(u8, tc.id);
                 try owned_strs.append(allocator, tid);

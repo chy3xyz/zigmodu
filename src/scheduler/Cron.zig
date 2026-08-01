@@ -178,6 +178,31 @@ pub const Scheduler = struct {
         return self.jobs.items.len;
     }
 
+    /// Duplicated names of registered jobs (caller frees each entry and the
+    /// slice). Thread-safe.
+    pub fn listJobNames(self: *Scheduler, allocator: std.mem.Allocator) ![][]const u8 {
+        self.mutex.lock(self.io) catch return error.SchedulerLockFailed;
+        defer self.mutex.unlock(self.io);
+        const out = try allocator.alloc([]const u8, self.jobs.items.len);
+        errdefer allocator.free(out);
+        for (self.jobs.items, 0..) |job, i| out[i] = try allocator.dupe(u8, job.name);
+        return out;
+    }
+
+    /// Remove a job by name. Returns true when removed. Thread-safe.
+    pub fn cancelJob(self: *Scheduler, name: []const u8) bool {
+        self.mutex.lock(self.io) catch return false;
+        defer self.mutex.unlock(self.io);
+        for (self.jobs.items, 0..) |job, i| {
+            if (std.mem.eql(u8, job.name, name)) {
+                self.allocator.free(job.name);
+                _ = self.jobs.swapRemove(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// Stop the scheduler
     pub fn stop(self: *Scheduler) void {
         self.running.store(false, .monotonic);

@@ -30,6 +30,9 @@ pub const SkillContext = struct {
     user_id: ?i64 = null,
     backend_ptr: ?*anyopaque = null, // *data.SqlxBackend for DB skills
     run_id: ?[]const u8 = null,
+    /// Optional capability pointer for builtin skills (e.g. *Cron.Scheduler
+    /// for the schedule bridge). Set by the caller before dispatch.
+    userdata: ?*anyopaque = null,
     /// Absolute deadline from `Time.monotonicNowMilliseconds()`; set by dispatch.
     deadline_ms: ?i64 = null,
 
@@ -48,6 +51,29 @@ pub const DispatchOpts = struct {
     /// Override tool.timeout_ms for this call (cooperative + post-check).
     timeout_ms: ?u64 = null,
 };
+
+/// Free a dispatch result produced by a skill handler. Convention: handlers
+/// own every string in the result (dupe literals and row values with the
+/// SkillContext allocator); object keys are freed by ObjectMap.put semantics.
+pub fn freeValue(allocator: std.mem.Allocator, v: std.json.Value) void {
+    var value = v;
+    switch (value) {
+        .string => |s| allocator.free(s),
+        .array => |*arr| {
+            for (arr.items) |item| freeValue(allocator, item);
+            arr.deinit();
+        },
+        .object => |*obj| {
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                freeValue(allocator, entry.value_ptr.*);
+            }
+            obj.deinit(allocator);
+        },
+        else => {},
+    }
+}
 
 /// Registry that aggregates Tool definitions from all modules.
 /// Thread-safe via std.Io.Mutex (same fiber model as ConnectionRegistry).

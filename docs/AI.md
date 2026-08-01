@@ -377,13 +377,19 @@ var scheduler = Scheduler.init(allocator, io);
 try scheduler.start();
 defer scheduler.stop();
 
-// 3) 把两个 skill 注册进 Agent 的 SkillRegistry
-try ai.registerScheduleSkills(&registry, &scheduler, &tasks);
+// 3) 打包能力（调度器 + 可排程任务白名单）并注册 schedule skills
+var sched_ctx = ai.ScheduleCtx{ .scheduler = &scheduler, .tasks = &tasks };
+try ai.registerScheduleSkills(&registry);
+// 每次 dispatch/run 前：skill_ctx.userdata = @ptrCast(&sched_ctx)
 
 // Agent 现在可以通过工具调用：
 //   list_schedulable_tasks → ["daily_report", "health_check"]
 //   schedule_job { "task": "daily_report", "expr": "0 9 * * *" } → 每天 09:00
+//   list_jobs / cancel_job → 查看/取消已排任务
 ```
+
+内置业务 skill（`db.query` / `entity.lookup` / `entity.list`，只读参数化 SQL +
+实体白名单 + 租户隔离）见 [docs/AI_SKILLS.md](AI_SKILLS.md)。
 
 要点：
 
