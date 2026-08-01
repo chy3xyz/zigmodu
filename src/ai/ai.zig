@@ -27,6 +27,7 @@ pub const Budget = @import("budget.zig").Budget;
 pub const workflow = @import("workflow.zig");
 pub const WorkflowMetrics = @import("workflow.zig").WorkflowMetrics;
 pub const observability = @import("observability.zig");
+pub const run_audit = @import("run_audit.zig");
 pub const trigger = @import("trigger.zig");
 pub const hierarchy = @import("hierarchy.zig");
 pub const context = @import("context.zig");

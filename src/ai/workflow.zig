@@ -12,6 +12,7 @@ const agent_mod = @import("agent.zig");
 const tokenizer = @import("tokenizer.zig");
 const Budget = @import("budget.zig").Budget;
 const WAL = @import("../core/eventbus/WAL.zig").WAL;
+const Time = @import("../core/Time.zig");
 
 pub const AiProvider = provider_mod.AiProvider;
 pub const SkillRegistry = skill_mod.SkillRegistry;
@@ -145,6 +146,8 @@ pub const Workflow = struct {
     /// Approval flow used by `.approval` steps (required when such a step
     /// exists).
     approval_flow: ?*@import("approval.zig").ApprovalFlow = null,
+    /// Optional durable run-audit store; every run / resume writes one row.
+    audit: ?*@import("run_audit.zig").RunAuditStore = null,
 
     pub fn init(registry: *SkillRegistry, steps: []const Step) Workflow {
         return .{ .registry = registry, .steps = steps };
@@ -186,6 +189,7 @@ pub const Workflow = struct {
     /// failure (status `.failed`) instead of erroring, so callers can inspect
     /// which steps completed.
     pub fn run(self: Workflow, allocator: std.mem.Allocator, ctx: *SkillContext) !WorkflowResult {
+        const started_ms = Time.monotonicNowMilliseconds();
         var result = WorkflowResult{
             .status = .completed,
             .steps = std.ArrayList(StepRecord).empty,
@@ -196,6 +200,9 @@ pub const Workflow = struct {
         defer completed.deinit();
         if (self.metrics) |m| m.runs += 1;
         try self.runSteps(allocator, ctx, 0, &completed, &result);
+        if (self.audit) |a| {
+            try @import("run_audit.zig").recordRun(a, allocator, ctx, self.run_id, .workflow, @tagName(result.status), result.steps.items.len, Time.monotonicNowMilliseconds() - started_ms);
+        }
         return result;
     }
 
@@ -203,6 +210,7 @@ pub const Workflow = struct {
     /// then continues from the first unpersisted one. Requires `wal` and
     /// `run_id`.
     pub fn resumeRun(self: Workflow, allocator: std.mem.Allocator, ctx: *SkillContext, run_id: []const u8) !WorkflowResult {
+        const started_ms = Time.monotonicNowMilliseconds();
         const w = self.wal orelse return error.WalRequired;
         var result = WorkflowResult{
             .status = .completed,
@@ -242,11 +250,22 @@ pub const Workflow = struct {
         }
         if (replayed_failed) {
             result.status = .failed;
+            if (self.audit) |a| {
+                try @import("run_audit.zig").recordRun(a, allocator, ctx, run_id, .workflow, @tagName(result.status), result.steps.items.len, Time.monotonicNowMilliseconds() - started_ms);
+            }
             return result;
         }
-        if (next_index >= self.steps.len) return result;
+        if (next_index >= self.steps.len) {
+            if (self.audit) |a| {
+                try @import("run_audit.zig").recordRun(a, allocator, ctx, run_id, .workflow, @tagName(result.status), result.steps.items.len, Time.monotonicNowMilliseconds() - started_ms);
+            }
+            return result;
+        }
         if (self.metrics) |m| m.runs += 1;
         try self.runSteps(allocator, ctx, next_index, &completed, &result);
+        if (self.audit) |a| {
+            try @import("run_audit.zig").recordRun(a, allocator, ctx, run_id, .workflow, @tagName(result.status), result.steps.items.len, Time.monotonicNowMilliseconds() - started_ms);
+        }
         return result;
     }
 
@@ -813,6 +832,44 @@ test "workflow approval gate resumes after the human approves" {
     try std.testing.expectEqual(@as(usize, 2), resumed.steps.items.len);
     try std.testing.expectEqualStrings("review", resumed.steps.items[0].name);
     try std.testing.expectEqualStrings("publish", resumed.steps.items[1].name);
+}
+
+test "workflow records run audit automatically" {
+    const allocator = std.testing.allocator;
+    var client = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    var backend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend{ .allocator = allocator, .client = &client };
+    var store = @import("run_audit.zig").RunAuditStore.init(allocator, &backend);
+    try store.migrate();
+
+    var registry = try setupPingRegistry(allocator);
+    defer registry.deinit();
+    var ctx = SkillContext{ .allocator = allocator, .tenant_id = 7 };
+    const steps = [_]Step{
+        .{ .name = "a", .kind = .{ .skill = .{ .name = "ping", .args = .{ .object = .{} } } } },
+        .{ .name = "b", .kind = .{ .skill = .{ .name = "ping", .args = .{ .object = .{} } } } },
+    };
+    var wf = Workflow.init(&registry, &steps);
+    wf.audit = &store;
+    wf.run_id = "run-audit-1";
+    var result = try wf.run(allocator, &ctx);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), try store.count());
+    var entries = std.ArrayList(@import("run_audit.zig").RunAuditEntry).empty;
+    defer {
+        for (entries.items) |e| {
+            allocator.free(e.run_id);
+            allocator.free(e.status);
+        }
+        entries.deinit(allocator);
+    }
+    try store.list(allocator, &entries, null, 7, 10);
+    try std.testing.expectEqual(@as(usize, 1), entries.items.len);
+    try std.testing.expectEqualStrings("run-audit-1", entries.items[0].run_id);
+    try std.testing.expectEqualStrings("completed", entries.items[0].status);
+    try std.testing.expectEqual(@as(usize, 2), entries.items[0].steps);
 }
 
 test "workflow marks a failing step and stops" {

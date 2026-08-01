@@ -172,6 +172,12 @@ LLM 决策基于实际业务上下文而非空泛通用判断。
 三组指标合并为一份 Prometheus 文档（挂指针 + 名字即可），一个 `/metrics`
 端点即可覆盖整个 AI 栈（tenant-ai 示例的 `GET /api/ai/metrics` 即演示）。
 
+**运行审计**：`zigmodu.ai.run_audit.RunAuditStore` 把每次 workflow/agent/
+approval 运行（run_id、kind、status、租户、步骤数、耗时）持久化到 SQL 表；
+挂到 `Workflow.audit` 后 run/resume 自动写一条。`list(kind, tenant, limit)`
+支持按类型/租户过滤（tenant-ai 的 `GET /api/ai/runs` 即演示租户隔离的
+运行历史）。
+
 ## 边界（不做）
 
 无界自主循环（每轮有限步骤 + 预算 + 可中止）；不新增 shell/MCP 能力。

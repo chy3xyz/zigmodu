@@ -10,6 +10,7 @@
 //!   - orchestration (`Workflow` driving the registered skills)
 //!   - workflow metrics (`WorkflowMetrics`) + graph export (`toMermaid`)
 //!   - aggregated AI metrics (`AiMetrics`) at `GET /api/ai/metrics`
+//!   - durable run audit (`RunAuditStore`) at `GET /api/ai/runs`
 //!
 //! HTTP API (X-Tenant-ID header; defaults to tenant 1):
 //!   GET  /api/ai/kpi?metric=paid_revenue
@@ -21,6 +22,7 @@
 //!   POST /api/ai/workflow/run
 //!   GET  /api/ai/workflow/graph
 //!   GET  /api/ai/metrics
+//!   GET  /api/ai/runs
 //!
 //! Run:  cd examples/tenant-ai && zig build run
 //! Test: zig build test  (asserts tenant isolation end-to-end)
@@ -62,6 +64,7 @@ const TenantAiApp = struct {
     registry: *ai.SkillRegistry,
     wf_metrics: *ai.WorkflowMetrics,
     ai_metrics: *ai.observability.AiMetrics,
+    audit: *ai.run_audit.RunAuditStore,
 
     /// Pick the metric definition for (tenant_id, name). The example registers
     /// one definition per tenant; apps can also build tenant-specific SQL.
@@ -118,6 +121,7 @@ fn TenantAiApi(comptime ComptimeState: type) type {
             .{ .method = .POST, .path = "workflow/run", .handler = workflowRun },
             .{ .method = .GET, .path = "workflow/graph", .handler = workflowGraph },
             .{ .method = .GET, .path = "metrics", .handler = metrics },
+            .{ .method = .GET, .path = "runs", .handler = runs },
         };
 
         fn tenantOf(ctx: *http.Context) !i64 {
@@ -230,6 +234,9 @@ fn TenantAiApi(comptime ComptimeState: type) type {
             };
             var wf = ai.workflow.Workflow.init(self.app.registry, &steps);
             wf.metrics = self.app.wf_metrics;
+            wf.audit = self.app.audit;
+            wf.run_id = try std.fmt.allocPrint(ctx.allocator, "wf-{d}-{d}", .{ tid, zigmodu.Time.monotonicNowMilliseconds() });
+            defer ctx.allocator.free(wf.run_id);
             var sctx = ai.SkillContext{ .allocator = ctx.allocator, .tenant_id = tid, .userdata = self.app.kpi_ctx };
             var result = try wf.run(ctx.allocator, &sctx);
             defer result.deinit();
@@ -266,6 +273,30 @@ fn TenantAiApi(comptime ComptimeState: type) type {
             try ctx.setHeader("Content-Type", "text/plain; version=0.0.4");
             try ctx.text(200, body);
         }
+
+        fn runs(ctx: *http.Context, self: *State) !void {
+            const tid = try tenantOf(ctx);
+            var entries = std.ArrayList(ai.run_audit.RunAuditEntry).empty;
+            defer {
+                for (entries.items) |e| {
+                    ctx.allocator.free(e.run_id);
+                    ctx.allocator.free(e.status);
+                }
+                entries.deinit(ctx.allocator);
+            }
+            try self.app.audit.list(ctx.allocator, &entries, null, tid, 20);
+            var buf = std.ArrayList(u8).empty;
+            defer buf.deinit(ctx.allocator);
+            try buf.print(ctx.allocator, "{{\"tenant\":{d},\"runs\":[", .{tid});
+            var first = true;
+            for (entries.items) |e| {
+                if (!first) try buf.appendSlice(ctx.allocator, ",");
+                first = false;
+                try buf.print(ctx.allocator, "{{\"run_id\":\"{s}\",\"kind\":\"{s}\",\"status\":\"{s}\",\"steps\":{d},\"duration_ms\":{d}}}", .{ e.run_id, @tagName(e.kind), e.status, e.steps, e.duration_ms });
+            }
+            try buf.appendSlice(ctx.allocator, "]}");
+            try ctx.json(200, buf.items);
+        }
     };
 }
 
@@ -299,6 +330,8 @@ fn run(allocator: std.mem.Allocator, io: std.Io, serve: bool) !void {
     };
     var kpi_ctx = ai.kpi.KpiCtx{ .backend = &backend, .metrics = &kpi_metrics };
     var wf_metrics = ai.WorkflowMetrics{};
+    var audit_store = ai.run_audit.RunAuditStore.init(allocator, &backend);
+    try audit_store.migrate();
     var quota = ai.TokenQuota.init(allocator, io, 100000);
     defer quota.deinit();
     var ai_metrics = ai.observability.AiMetrics{
@@ -320,6 +353,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, serve: bool) !void {
         .approval = undefined,
         .wf_metrics = &wf_metrics,
         .ai_metrics = &ai_metrics,
+        .audit = &audit_store,
     };
 
     // Approval flow: <= 1000 auto-approves, above escalates (per tenant).

@@ -23,6 +23,7 @@ pub const getInFlightCounter = @import("Application.zig").getInFlightCounter;
 pub const api = @import("api/Module.zig");
 
 pub const ZigModuError = @import("core/Error.zig").ZigModuError;
+pub const Time = @import("core/Time.zig");
 pub const ErrorContext = @import("core/Error.zig").ErrorContext;
 pub const ErrorHandler = @import("core/Error.zig").ErrorHandler;
 pub const Result = @import("core/Error.zig").Result;
