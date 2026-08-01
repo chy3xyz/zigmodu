@@ -69,7 +69,10 @@ capability is isolated per tenant (via `X-Tenant-ID` middleware →
   1000, escalate above, persisted per tenant);
 - `GET  /api/ai/approvals` + `POST /api/ai/approvals/{run_id}/approve` —
   per-tenant human approval queue (tenants cannot see/resolve each other's);
-- `POST /api/ai/workflow/run` — orchestration running the registered skills.
+- `POST /api/ai/workflow/run` — orchestration running the registered skills
+  (with `WorkflowMetrics`);
+- `GET  /api/ai/workflow/graph` — Mermaid graph of the step pipeline
+  (including the approval gate).
 
 ```bash
 cd examples/tenant-ai && zig build run

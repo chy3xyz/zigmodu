@@ -8,6 +8,7 @@
 //!   - human approval queue (`ApprovalFlow` + `PersistentApprovalQueue`,
 //!     tenant_id column — tenants never see each other's pending items)
 //!   - orchestration (`Workflow` driving the registered skills)
+//!   - workflow metrics (`WorkflowMetrics`) + graph export (`toMermaid`)
 //!
 //! HTTP API (X-Tenant-ID header; defaults to tenant 1):
 //!   GET  /api/ai/kpi?metric=paid_revenue
@@ -17,6 +18,7 @@
 //!   GET  /api/ai/approvals
 //!   POST /api/ai/approvals/{run_id}/approve
 //!   POST /api/ai/workflow/run
+//!   GET  /api/ai/workflow/graph
 //!
 //! Run:  cd examples/tenant-ai && zig build run
 //! Test: zig build test  (asserts tenant isolation end-to-end)
@@ -56,6 +58,7 @@ const TenantAiApp = struct {
     kpi_ctx: *ai.kpi.KpiCtx,
     approval: *ai.approval.ApprovalFlow,
     registry: *ai.SkillRegistry,
+    wf_metrics: *ai.WorkflowMetrics,
 
     /// Pick the metric definition for (tenant_id, name). The example registers
     /// one definition per tenant; apps can also build tenant-specific SQL.
@@ -110,6 +113,7 @@ fn TenantAiApi(comptime ComptimeState: type) type {
             .{ .method = .GET, .path = "approvals", .handler = approvals },
             .{ .method = .POST, .path = "approvals/{run_id}/approve", .handler = approvalDecide },
             .{ .method = .POST, .path = "workflow/run", .handler = workflowRun },
+            .{ .method = .GET, .path = "workflow/graph", .handler = workflowGraph },
         };
 
         fn tenantOf(ctx: *http.Context) !i64 {
@@ -221,6 +225,7 @@ fn TenantAiApi(comptime ComptimeState: type) type {
                 } } } } },
             };
             var wf = ai.workflow.Workflow.init(self.app.registry, &steps);
+            wf.metrics = self.app.wf_metrics;
             var sctx = ai.SkillContext{ .allocator = ctx.allocator, .tenant_id = tid, .userdata = self.app.kpi_ctx };
             var result = try wf.run(ctx.allocator, &sctx);
             defer result.deinit();
@@ -236,6 +241,19 @@ fn TenantAiApi(comptime ComptimeState: type) type {
             }
             try out.appendSlice(ctx.allocator, "]}");
             try ctx.json(200, out.items);
+        }
+
+        fn workflowGraph(ctx: *http.Context, self: *State) !void {
+            const steps = [_]ai.workflow.Step{
+                .{ .name = "kpi-step", .kind = .{ .skill = .{ .name = "kpi.query", .args = .{ .object = .{} } } } },
+                .{ .name = "review", .kind = .{ .approval = .{ .subject = "order-refund", .amount = 5000 } } },
+                .{ .name = "publish", .kind = .{ .skill = .{ .name = "kpi.query", .args = .{ .object = .{} } } }, .depends_on = &.{"review"} },
+            };
+            var wf = ai.workflow.Workflow.init(self.app.registry, &steps);
+            const mermaid = try wf.toMermaid(ctx.allocator);
+            defer ctx.allocator.free(mermaid);
+            try ctx.setHeader("Content-Type", "text/plain");
+            try ctx.text(200, mermaid);
         }
     };
 }
@@ -269,6 +287,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, serve: bool) !void {
         .{ .name = "paid_revenue", .description = "paid revenue", .sql = "SELECT SUM(amount) AS value FROM orders WHERE tenant_id = 2 AND status = 'paid'" },
     };
     var kpi_ctx = ai.kpi.KpiCtx{ .backend = &backend, .metrics = &kpi_metrics };
+    var wf_metrics = ai.WorkflowMetrics{};
 
     var registry = ai.SkillRegistry.init(allocator, io);
     defer registry.deinit();
@@ -282,6 +301,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, serve: bool) !void {
         .registry = &registry,
         .kpi_ctx = &kpi_ctx,
         .approval = undefined,
+        .wf_metrics = &wf_metrics,
     };
 
     // Approval flow: <= 1000 auto-approves, above escalates (per tenant).
@@ -311,6 +331,8 @@ fn run(allocator: std.mem.Allocator, io: std.Io, serve: bool) !void {
 
     if (serve) {
         std.debug.print("tenant-ai listening on :18088 (X-Tenant-ID: 1|2)\n", .{});
+        std.debug.print("try: curl -H 'X-Tenant-ID: 1' http://127.0.0.1:18088/api/ai/workflow/run\n", .{});
+        std.debug.print("     curl http://127.0.0.1:18088/api/ai/workflow/graph\n", .{});
         try server.start();
     }
 }
@@ -380,4 +402,34 @@ test "tenant-ai isolates KPI, alerts and approvals per tenant" {
     defer ai.freeValue(allocator, res);
     defer ai.freeValue(allocator, .{ .object = args_map });
     try std.testing.expectEqual(@as(f64, 150), res.object.get("value").?.float);
+
+    // Workflow with metrics + graph export (arena keeps step args tidy).
+    var wf_arena = std.heap.ArenaAllocator.init(allocator);
+    defer wf_arena.deinit();
+    const wa = wf_arena.allocator();
+    var wf_metrics = ai.WorkflowMetrics{};
+    const EscalateAlways = struct {
+        fn decide(_: std.mem.Allocator, _: *ai.SkillContext, _: []const u8, _: i64, _: usize, _: []const u8, _: []const u8, _: *[]const u8) anyerror!ai.approval.ApprovalDecision {
+            return .escalated;
+        }
+    };
+    var gate_flow = ai.approval.ApprovalFlow.init(allocator, &backend, EscalateAlways.decide);
+    const wf_steps = [_]ai.workflow.Step{
+        .{ .name = "kpi-step", .kind = .{ .skill = .{ .name = "kpi.query", .args = .{ .object = blk: {
+            var o = std.json.ObjectMap{};
+            try putOwned(&o, wa, "metric", .{ .string = try wa.dupe(u8, "paid_revenue") });
+            break :blk o;
+        } } } } },
+        .{ .name = "review", .kind = .{ .approval = .{ .subject = "order-refund", .amount = 5000 } } },
+    };
+    var wf = ai.workflow.Workflow.init(&registry, &wf_steps);
+    wf.metrics = &wf_metrics;
+    wf.approval_flow = &gate_flow;
+    var wf_result = try wf.run(wa, &sctx);
+    defer wf_result.deinit();
+    try std.testing.expectEqual(ai.workflow.RunStatus.pending_human, wf_result.status);
+    try std.testing.expectEqual(@as(usize, 1), wf_metrics.runs);
+
+    const mermaid = try wf.toMermaid(wa);
+    try std.testing.expect(std.mem.indexOf(u8, mermaid, "review (approval)") != null);
 }
