@@ -173,4 +173,21 @@ pub fn build(b: *std.Build) void {
     });
     const run_zmodu_tests = b.addRunArtifact(zmodu_tests);
     test_step.dependOn(&run_zmodu_tests.step);
+
+    // Dead-code analyzer unit tests live in the deadcode/ submodule; include
+    // them explicitly so `zig build test` covers the analyzer itself.
+    const dc_analyze_mod = b.createModule(.{
+        .root_source_file = b.path("tools/zmodu/src/deadcode/analyze.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const dc_analyze_tests = b.addTest(.{ .root_module = dc_analyze_mod });
+    test_step.dependOn(&b.addRunArtifact(dc_analyze_tests).step);
+    const dc_scanner_mod = b.createModule(.{
+        .root_source_file = b.path("tools/zmodu/src/deadcode/scanner.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const dc_scanner_tests = b.addTest(.{ .root_module = dc_scanner_mod });
+    test_step.dependOn(&b.addRunArtifact(dc_scanner_tests).step);
 }

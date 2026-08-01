@@ -493,7 +493,21 @@ fn addDecl(
         .end_tok = ast.lastToken(node),
     });
     try an.file_maps[fi].decl_sites.put(name_tok, idx);
-    try an.file_maps[fi].name_map.put(name, idx);
+    // Test declarations use their string name (e.g. `test "foo"`), which is a
+    // display name, not a referencable identifier. Container members are
+    // referenced via '.' and must never shadow a top-level declaration of the
+    // same name (e.g. `const deadcode = @import(...)` + `enum { deadcode }`).
+    // Both cases would otherwise resolve references to the wrong decl and
+    // misreport the top-level declaration as dead.
+    if (kind != .test_decl) {
+        if (parent != null) {
+            if (!an.file_maps[fi].name_map.contains(name)) {
+                try an.file_maps[fi].name_map.put(name, idx);
+            }
+        } else {
+            try an.file_maps[fi].name_map.put(name, idx);
+        }
+    }
     try an.file_maps[fi].decl_indices.append(an.alloc, idx);
     return idx;
 }
@@ -872,6 +886,44 @@ test "single file: unused declarations and transitive dead code" {
     try std.testing.expectEqual(@as(usize, 6), result.summary.decls);
     try std.testing.expectEqual(@as(usize, 2), result.summary.live);
     try std.testing.expectEqual(@as(usize, 4), result.summary.dead);
+}
+
+test "test name equal to function name does not shadow references" {
+    const files = [_]File{
+        .{ .path = "/proj/main.zig", .display_path = "main.zig", .source =
+        \\const std = @import("std");
+        \\fn trimTrailingNewlines(s: []const u8) []const u8 { return s; }
+        \\pub fn main() void {
+        \\    _ = trimTrailingNewlines;
+        \\}
+        \\test "trimTrailingNewlines" {
+        \\    try std.testing.expectEqualStrings("foo", trimTrailingNewlines("foo"));
+        \\}
+        },
+    };
+    var result = try analyze(std.testing.allocator, &files, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 0), result.findings.len);
+}
+
+test "container member does not shadow a same-named top-level import" {
+    const files = [_]File{
+        .{ .path = "/proj/main.zig", .display_path = "main.zig", .source =
+        \\const deadcode = @import("h.zig");
+        \\const Command = enum { ai, deadcode };
+        \\pub fn main() void {
+        \\    _ = Command.deadcode;
+        \\    _ = Command.ai;
+        \\    _ = deadcode.run();
+        \\}
+        },
+        .{ .path = "/proj/h.zig", .display_path = "h.zig", .source =
+        \\pub fn run() u8 { return 0; }
+        },
+    };
+    var result = try analyze(std.testing.allocator, &files, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 0), result.findings.len);
 }
 
 test "containers: unused fields, variants, methods" {
