@@ -356,3 +356,38 @@ ai_provider.temperature = 0.7;         // 温度
 - OpenAI /v1/chat/completions
 - Ollama /api/chat (localhost)
 - 任何 OpenAI 兼容端点
+
+## 与 Scheduler 集成（AI → cron 薄桥）
+
+框架提供**受控的排程桥**：Agent 只能把**预先注册的命名任务**挂到 cron 表达式上，
+LLM 永远不提供代码（保持「受控执行」姿态）。桥接方向：`zigmodu.ai.registerScheduleSkills`。
+
+```zig
+const Scheduler = zigmodu.cron.Scheduler;
+const ai = zigmodu.ai;
+
+// 1) 预注册可排程任务（纯 Zig 函数）
+const tasks = [_]ai.ScheduledTask{
+    .{ .name = "daily_report", .description = "生成每日报告", .task = dailyReport, .context = &app },
+    .{ .name = "health_check", .description = "巡检服务健康", .task = healthCheck, .context = &app },
+};
+
+// 2) 启动线程化调度器（周期 tick；addJob 线程安全）
+var scheduler = Scheduler.init(allocator, io);
+try scheduler.start();
+defer scheduler.stop();
+
+// 3) 把两个 skill 注册进 Agent 的 SkillRegistry
+try ai.registerScheduleSkills(&registry, &scheduler, &tasks);
+
+// Agent 现在可以通过工具调用：
+//   list_schedulable_tasks → ["daily_report", "health_check"]
+//   schedule_job { "task": "daily_report", "expr": "0 9 * * *" } → 每天 09:00
+```
+
+要点：
+
+- `Scheduler` 是线程化的：`start()` 起后台线程，每秒 tick 一次，按分钟粒度触发 cron 任务；`addJob` 与 `tick` 互斥保护，可随时加任务。
+- `schedule_job` 只接受**已注册任务名 + cron 表达式**；未知任务返回 `error.TaskNotFound`。
+- 另一个方向（cron → AI）：`Scheduler` 的 task 里直接同步调用 `AiProvider.chat/chatStream` 即可（如定时摘要）；注意 HTTP 出站在线程内的 io 使用约束（见 ZIGMODU_NOTES 第 3 条）。
+- 旧的 `ScheduledTask.TaskScheduler` 已标注废弃（`start()` 从不循环、`calculateNextCronRun` 为占位），将在 v1.0 移除。

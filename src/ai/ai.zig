@@ -18,6 +18,9 @@ pub const AgentAuditLog = @import("audit.zig").AgentAuditLog;
 pub const AuditEvent = @import("audit.zig").AuditEvent;
 pub const AuditKind = @import("audit.zig").AuditKind;
 
+pub const ScheduledTask = @import("schedule.zig").ScheduledTask;
+pub const registerScheduleSkills = @import("schedule.zig").registerScheduleSkills;
+
 pub const Retriever = @import("retriever.zig").Retriever;
 pub const RetrievedChunk = @import("retriever.zig").RetrievedChunk;
 pub const KeywordRetriever = @import("retriever.zig").KeywordRetriever;

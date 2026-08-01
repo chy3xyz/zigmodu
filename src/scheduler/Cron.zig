@@ -108,38 +108,55 @@ fn parseField(part: []const u8, target: []bool, max: u8) !void {
 
 /// Scheduled job
 pub const Job = struct {
-    name: []const u8,
+    name: []const u8, // owned by the scheduler (duped in addJob)
     schedule: Expression,
     task: *const fn (*anyopaque) void,
     context: *anyopaque,
     last_run: i64,
 };
 
-/// Cron scheduler
+/// Cron scheduler — periodic execution on a background thread.
+/// Thread-safe: `addJob` may be called from any thread while the loop runs.
 pub const Scheduler = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     jobs: std.ArrayList(Job),
+    mutex: std.Io.Mutex,
     running: std.atomic.Value(bool),
     thread: ?std.Thread = null,
+    tick_interval_ms: u64,
 
-    pub fn init(allocator: std.mem.Allocator) Scheduler {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) Scheduler {
         return .{
             .allocator = allocator,
-            .jobs = .{},
+            .io = io,
+            .jobs = std.ArrayList(Job).empty,
+            .mutex = std.Io.Mutex.init,
             .running = std.atomic.Value(bool).init(false),
+            .thread = null,
+            .tick_interval_ms = 1000,
         };
     }
 
     pub fn deinit(self: *Scheduler) void {
         self.stop();
+        self.mutex.lock(self.io) catch {};
+        for (self.jobs.items) |job| self.allocator.free(job.name);
         self.jobs.deinit(self.allocator);
+        self.mutex.unlock(self.io);
         self.* = undefined;
     }
 
-    /// Add a job to the scheduler
+    /// Add a job to the scheduler. The name is copied, so the caller may reuse
+    /// or free its buffer afterwards. Safe from any thread (mutex-protected
+    /// against the background loop).
     pub fn addJob(self: *Scheduler, name: []const u8, schedule: Expression, task: *const fn (*anyopaque) void, context: *anyopaque) !void {
+        const name_copy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_copy);
+        self.mutex.lock(self.io) catch return error.SchedulerLockFailed;
+        defer self.mutex.unlock(self.io);
         try self.jobs.append(self.allocator, .{
-            .name = name,
+            .name = name_copy,
             .schedule = schedule,
             .task = task,
             .context = context,
@@ -154,6 +171,13 @@ pub const Scheduler = struct {
         self.thread = try std.Thread.spawn(.{}, runLoop, .{self});
     }
 
+    /// Number of registered jobs (thread-safe).
+    pub fn jobCount(self: *Scheduler) usize {
+        self.mutex.lock(self.io) catch return 0;
+        defer self.mutex.unlock(self.io);
+        return self.jobs.items.len;
+    }
+
     /// Stop the scheduler
     pub fn stop(self: *Scheduler) void {
         self.running.store(false, .monotonic);
@@ -163,33 +187,34 @@ pub const Scheduler = struct {
         }
     }
 
+    /// Run one scheduling pass for the given instant. Public so callers and
+    /// tests can drive scheduling deterministically (the background loop calls
+    /// this once per tick).
+    pub fn tick(self: *Scheduler, now: i64) void {
+        self.mutex.lock(self.io) catch return;
+        defer self.mutex.unlock(self.io);
+        const minute_start = @divFloor(now, 60) * 60;
+        for (self.jobs.items) |*job| {
+            if (job.schedule.matches(now) and job.last_run < minute_start) {
+                job.task(job.context);
+                job.last_run = now;
+            }
+        }
+    }
+
     fn runLoop(self: *Scheduler) void {
         while (self.running.load(.monotonic)) {
-            const now = Time.monotonicNowSeconds();
-            for (self.jobs.items) |*job| {
-                if (job.schedule.matches(now) and job.last_run < @divFloor(now, 60) * 60) {
-                    job.task(job.context);
-                    job.last_run = now;
-                }
-            }
-            // Note: Blocking sleep unavailable in Zig 0.16.0 sync context
-            break;
+            self.tick(Time.monotonicNowSeconds());
+            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(@intCast(self.tick_interval_ms)), .real) catch {};
         }
     }
 };
 
-/// Run a task every N seconds
-pub fn every(seconds: u64, task: *const fn (*anyopaque) void, context: *anyopaque) void {
-    const start = Time.monotonicNowSeconds();
-    while (true) {
-        const now = Time.monotonicNowSeconds();
-        if (now - start >= @as(i64, @intCast(seconds))) {
-            task(context);
-            break;
-        }
-        // Note: Blocking sleep unavailable in Zig 0.16.0 sync context
-        break;
-    }
+/// Block for `seconds`, then run `task` once (blocking helper).
+/// Use `Scheduler` for recurring jobs.
+pub fn every(io: std.Io, seconds: u64, task: *const fn (*anyopaque) void, context: *anyopaque) void {
+    std.Io.sleep(io, std.Io.Duration.fromSeconds(@intCast(seconds)), .real) catch {};
+    task(context);
 }
 
 test "cron parse wildcard" {
@@ -222,4 +247,51 @@ test "cron parse range" {
     try std.testing.expect(expr.hours[9]);
     try std.testing.expect(expr.hours[17]);
     try std.testing.expect(!expr.hours[8]);
+}
+
+test "scheduler tick fires a matching job once per minute" {
+    const allocator = std.testing.allocator;
+    var count: usize = 0;
+    const T = struct {
+        fn run(ptr: *anyopaque) void {
+            const c: *usize = @ptrCast(@alignCast(ptr));
+            c.* += 1;
+        }
+    };
+
+    var scheduler = Scheduler.init(allocator, std.testing.io);
+    defer scheduler.deinit();
+    const expr = try Expression.parse("* * * * *");
+    try scheduler.addJob("every-minute", expr, T.run, &count);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.jobCount());
+
+    const now = Time.monotonicNowSeconds();
+    scheduler.tick(now);
+    try std.testing.expectEqual(@as(usize, 1), count);
+    scheduler.tick(now);
+    try std.testing.expectEqual(@as(usize, 1), count); // same minute: no re-run
+    scheduler.tick(now + 60);
+    try std.testing.expectEqual(@as(usize, 2), count); // next minute: runs again
+}
+
+test "scheduler start and stop lifecycle" {
+    var scheduler = Scheduler.init(std.testing.allocator, std.testing.io);
+    defer scheduler.deinit();
+    try scheduler.start();
+    try std.testing.expect(scheduler.running.load(.monotonic));
+    std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(50), .real) catch {};
+    scheduler.stop();
+    try std.testing.expect(!scheduler.running.load(.monotonic));
+}
+
+test "every runs the task after the delay" {
+    var count: usize = 0;
+    const T = struct {
+        fn run(ptr: *anyopaque) void {
+            const c: *usize = @ptrCast(@alignCast(ptr));
+            c.* += 1;
+        }
+    };
+    every(std.testing.io, 0, T.run, &count);
+    try std.testing.expectEqual(@as(usize, 1), count);
 }

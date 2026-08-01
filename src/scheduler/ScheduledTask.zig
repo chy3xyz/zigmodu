@@ -1,3 +1,8 @@
+//! DEPRECATED — use `scheduler/Cron.zig` (threaded, io-based periodic
+//! `Scheduler`) plus `ai/schedule.zig` for the AI bridge. This file's
+//! `start()` never loops and `calculateNextCronRun` is a placeholder; kept
+//! for transition only and scheduled for removal in v1.0.
+
 const std = @import("std");
 const Time = @import("../core/Time.zig");
 
