@@ -695,6 +695,61 @@ test "workflow approval step gates on human decision" {
     try std.testing.expectEqual(@as(usize, 1), gate_result.steps.items.len);
 }
 
+test "workflow approval gate resumes after the human approves" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var client = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    _ = try client.exec(
+        "CREATE TABLE event_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, payload TEXT, status INTEGER DEFAULT 0, retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 5, created_at INTEGER, updated_at INTEGER, error_message TEXT)",
+        &.{},
+    );
+    var backend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend{ .allocator = allocator, .client = &client };
+
+    const EscalateAlways = struct {
+        fn decide(_: std.mem.Allocator, _: *SkillContext, _: []const u8, _: i64, _: usize, _: []const u8, _: []const u8, _: *[]const u8) anyerror!@import("approval.zig").ApprovalDecision {
+            return .escalated;
+        }
+    };
+    var flow = @import("approval.zig").ApprovalFlow.init(allocator, &backend, EscalateAlways.decide);
+
+    const wal_dir = "ai_wf_wal_approval";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, wal_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, wal_dir) catch {};
+    var wal = try WAL.init(allocator, std.testing.io, .{ .dir_path = wal_dir, .max_segment_size = 1024 * 1024 });
+    defer wal.deinit();
+
+    var registry = try setupPingRegistry(allocator);
+    defer registry.deinit();
+    var ctx = SkillContext{ .allocator = a };
+    const steps = [_]Step{
+        .{ .name = "review", .kind = .{ .approval = .{ .subject = "order-9", .amount = 50000 } } },
+        .{ .name = "publish", .kind = .{ .skill = .{ .name = "ping", .args = .{ .object = .{} } } } },
+    };
+    var wf = Workflow.init(&registry, &steps);
+    wf.approval_flow = &flow;
+    wf.wal = &wal;
+    wf.run_id = "run-approval";
+
+    // Run 1: the gate escalates → pending_human; the review step is persisted.
+    var first = try wf.run(allocator, &ctx);
+    defer first.deinit();
+    try std.testing.expectEqual(RunStatus.pending_human, first.status);
+    try std.testing.expectEqual(@as(usize, 1), first.steps.items.len);
+
+    // Human approves; resume continues from the persisted gate (skips review).
+    var resumed = try wf.resumeRun(allocator, &ctx, "run-approval");
+    defer resumed.deinit();
+    try std.testing.expectEqual(RunStatus.completed, resumed.status);
+    try std.testing.expectEqual(@as(usize, 2), resumed.steps.items.len);
+    try std.testing.expectEqualStrings("review", resumed.steps.items[0].name);
+    try std.testing.expectEqualStrings("publish", resumed.steps.items[1].name);
+}
+
 test "workflow marks a failing step and stops" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
