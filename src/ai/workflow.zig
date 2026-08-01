@@ -11,6 +11,7 @@ const skill_mod = @import("skill.zig");
 const agent_mod = @import("agent.zig");
 const tokenizer = @import("tokenizer.zig");
 const Budget = @import("budget.zig").Budget;
+const WAL = @import("../core/eventbus/WAL.zig").WAL;
 
 pub const AiProvider = provider_mod.AiProvider;
 pub const SkillRegistry = skill_mod.SkillRegistry;
@@ -96,6 +97,10 @@ pub const Workflow = struct {
     on_escalate: ?EscalateFn = null,
     /// Goal/context passed to the verifier.
     goal: []const u8 = "",
+    /// Optional WAL for per-step persistence (crash recovery / resume).
+    wal: ?*WAL = null,
+    /// Identifier used to namespace persisted step records.
+    run_id: []const u8 = "",
 
     pub fn init(registry: *SkillRegistry, steps: []const Step) Workflow {
         return .{ .registry = registry, .steps = steps };
@@ -111,11 +116,63 @@ pub const Workflow = struct {
             .allocator = allocator,
         };
         errdefer result.deinit();
+        try self.runSteps(allocator, ctx, 0, &result);
+        return result;
+    }
 
+    /// Resume a run from its persisted step records: replays completed steps,
+    /// then continues from the first unpersisted one. Requires `wal` and
+    /// `run_id`.
+    pub fn resumeRun(self: Workflow, allocator: std.mem.Allocator, ctx: *SkillContext, run_id: []const u8) !WorkflowResult {
+        const w = self.wal orelse return error.WalRequired;
+        var result = WorkflowResult{
+            .status = .completed,
+            .steps = std.ArrayList(StepRecord).empty,
+            .allocator = allocator,
+        };
+        errdefer result.deinit();
+
+        const entries = try w.readFrom(0);
+        defer {
+            for (entries) |e| {
+                allocator.free(e.topic);
+                allocator.free(e.payload);
+                allocator.free(e.source_node);
+            }
+            allocator.free(entries);
+        }
+
+        var next_index: usize = 0;
+        var replayed_failed = false;
+        for (entries) |e| {
+            if (!std.mem.eql(u8, e.source_node, run_id)) continue;
+            const parsed = std.json.parseFromSlice(StepRecordJson, allocator, e.payload, .{}) catch continue;
+            defer parsed.deinit();
+            const rec = parsed.value;
+            if (rec.index >= next_index) next_index = rec.index + 1;
+            try result.steps.append(allocator, .{
+                .name = try allocator.dupe(u8, rec.name),
+                .status = if (std.mem.eql(u8, rec.status, "failed")) .failed else .completed,
+                .error_message = if (rec.err_msg) |em| try allocator.dupe(u8, em) else null,
+                .output = if (rec.output) |o| try allocator.dupe(u8, o) else "",
+            });
+            if (std.mem.eql(u8, rec.status, "failed")) replayed_failed = true;
+        }
+        if (replayed_failed) {
+            result.status = .failed;
+            return result;
+        }
+        if (next_index >= self.steps.len) return result;
+        try self.runSteps(allocator, ctx, next_index, &result);
+        return result;
+    }
+
+    fn runSteps(self: Workflow, allocator: std.mem.Allocator, ctx: *SkillContext, start: usize, result: *WorkflowResult) !void {
         var step_index: usize = 0;
+        step_index = start;
         while (step_index < self.steps.len) : (step_index += 1) {
             const step = self.steps[step_index];
-            var outcome = try self.executeStep(allocator, ctx, step, &result);
+            var outcome = try self.executeStep(allocator, ctx, step, step_index, result);
             if (outcome == null) {
                 try self.maybeEscalate(ctx, .step_failed, step.name, allocator);
                 result.status = .failed;
@@ -138,7 +195,7 @@ pub const Workflow = struct {
                             result.status = .failed;
                             break;
                         }
-                        outcome = try self.executeStep(allocator, ctx, step, &result);
+                        outcome = try self.executeStep(allocator, ctx, step, step_index, result);
                         if (outcome == null) {
                             try self.maybeEscalate(ctx, .step_failed, step.name, allocator);
                             result.status = .failed;
@@ -150,7 +207,6 @@ pub const Workflow = struct {
                 }
             }
         }
-        return result;
     }
 
     /// Run a step with its retry budget; appends the record to `result`.
@@ -160,6 +216,7 @@ pub const Workflow = struct {
         allocator: std.mem.Allocator,
         ctx: *SkillContext,
         step: Step,
+        step_index: usize,
         result: *WorkflowResult,
     ) !?StepOutcome {
         var attempts: usize = 0;
@@ -174,6 +231,7 @@ pub const Workflow = struct {
                 .status = .completed,
                 .output = outcome.output,
             });
+            try self.persistStep(allocator, step_index, step.name, "completed", null, outcome.output);
             return outcome;
         }
         try result.steps.append(allocator, .{
@@ -184,7 +242,46 @@ pub const Workflow = struct {
             else
                 null,
         });
+        try self.persistStep(
+            allocator,
+            step_index,
+            step.name,
+            "failed",
+            if (last_err != error.Unknown) @errorName(last_err) else null,
+            "",
+        );
         return null;
+    }
+
+    const StepRecordJson = struct {
+        run_id: []const u8,
+        index: usize,
+        name: []const u8,
+        status: []const u8,
+        err_msg: ?[]const u8 = null,
+        output: ?[]const u8 = null,
+    };
+
+    fn persistStep(
+        self: Workflow,
+        allocator: std.mem.Allocator,
+        step_index: usize,
+        name: []const u8,
+        status: []const u8,
+        err_msg: ?[]const u8,
+        output: []const u8,
+    ) !void {
+        if (self.wal == null or self.run_id.len == 0) return;
+        const json = try std.json.Stringify.valueAlloc(allocator, StepRecordJson{
+            .run_id = self.run_id,
+            .index = step_index,
+            .name = name,
+            .status = status,
+            .err_msg = err_msg,
+            .output = if (output.len > 0) output else null,
+        }, .{});
+        defer allocator.free(json);
+        _ = try self.wal.?.append(.{ .topic = "ai.workflow", .payload = json, .source_node = self.run_id });
     }
 
     fn maybeEscalate(
@@ -444,4 +541,111 @@ test "workflow escalates when a step fails after retries" {
 
     try std.testing.expectEqual(RunStatus.failed, result.status);
     try std.testing.expectEqual(EscalateReason.step_failed, state.escalated.?);
+}
+
+const PingSkill = struct {
+    fn ping(ctx: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+        var out = std.json.ObjectMap{};
+        try out.put(ctx.allocator, try ctx.allocator.dupe(u8, "ok"), .{ .bool = true });
+        return .{ .object = out };
+    }
+};
+
+fn setupPingRegistry(allocator: std.mem.Allocator) !SkillRegistry {
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    try registry.register(.{
+        .name = "ping",
+        .description = "pong",
+        .parameters = &.{},
+        .handler = PingSkill.ping,
+    });
+    return registry;
+}
+
+test "workflow persists steps to WAL and resume replays them" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const wal_dir = "ai_wf_wal_test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, wal_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, wal_dir) catch {};
+    var wal = try WAL.init(allocator, std.testing.io, .{ .dir_path = wal_dir, .max_segment_size = 1024 * 1024 });
+    defer wal.deinit();
+
+    var registry = try setupPingRegistry(allocator);
+    defer registry.deinit();
+    var ctx = SkillContext{ .allocator = a };
+
+    const steps = [_]Step{
+        .{ .name = "step-a", .kind = .{ .skill = .{ .name = "ping", .args = .{ .object = .{} } } } },
+        .{ .name = "step-b", .kind = .{ .skill = .{ .name = "ping", .args = .{ .object = .{} } } } },
+    };
+    var wf = Workflow.init(&registry, &steps);
+    wf.wal = &wal;
+    wf.run_id = "run-1";
+
+    var result = try wf.run(allocator, &ctx);
+    defer result.deinit();
+    try std.testing.expectEqual(RunStatus.completed, result.status);
+    try std.testing.expectEqual(@as(usize, 2), result.steps.items.len);
+
+    var resumed = try wf.resumeRun(allocator, &ctx, "run-1");
+    defer resumed.deinit();
+    try std.testing.expectEqual(RunStatus.completed, resumed.status);
+    try std.testing.expectEqual(@as(usize, 2), resumed.steps.items.len);
+    try std.testing.expectEqualStrings("step-a", resumed.steps.items[0].name);
+    try std.testing.expect(std.mem.indexOf(u8, resumed.steps.items[1].output, "\"ok\":true") != null);
+}
+
+test "workflow resume continues from the last persisted step" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const wal_dir = "ai_wf_wal_test2";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, wal_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, wal_dir) catch {};
+    var wal = try WAL.init(allocator, std.testing.io, .{ .dir_path = wal_dir, .max_segment_size = 1024 * 1024 });
+    defer wal.deinit();
+
+    // Simulate a crash after step 0: only one completed record persisted.
+    const Rec = struct {
+        run_id: []const u8,
+        index: usize,
+        name: []const u8,
+        status: []const u8,
+        err_msg: ?[]const u8,
+        output: ?[]const u8,
+    };
+    const json = try std.json.Stringify.valueAlloc(allocator, Rec{
+        .run_id = "run-2",
+        .index = 0,
+        .name = "step-a",
+        .status = "completed",
+        .err_msg = null,
+        .output = "partial",
+    }, .{});
+    defer allocator.free(json);
+    _ = try wal.append(.{ .topic = "ai.workflow", .payload = json, .source_node = "run-2" });
+
+    var registry = try setupPingRegistry(allocator);
+    defer registry.deinit();
+    var ctx = SkillContext{ .allocator = a };
+    const steps = [_]Step{
+        .{ .name = "step-a", .kind = .{ .skill = .{ .name = "ping", .args = .{ .object = .{} } } } },
+        .{ .name = "step-b", .kind = .{ .skill = .{ .name = "ping", .args = .{ .object = .{} } } } },
+    };
+    var wf = Workflow.init(&registry, &steps);
+    wf.wal = &wal;
+
+    var resumed = try wf.resumeRun(allocator, &ctx, "run-2");
+    defer resumed.deinit();
+    try std.testing.expectEqual(RunStatus.completed, resumed.status);
+    try std.testing.expectEqual(@as(usize, 2), resumed.steps.items.len);
+    try std.testing.expectEqualStrings("partial", resumed.steps.items[0].output);
+    try std.testing.expectEqualStrings("step-b", resumed.steps.items[1].name);
+    try std.testing.expectEqual(StepStatus.completed, resumed.steps.items[1].status);
 }

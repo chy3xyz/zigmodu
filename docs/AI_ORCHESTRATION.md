@@ -34,17 +34,15 @@ defer result.deinit();
 
 ### 后续（P1）
 
-- **WAL 持久化 + `resume(run_id)`**：每步记录写 WAL，崩溃后从最后完成步骤续跑
-  （幂等重放）；
 - **`AgentTrigger` 触发编排**：cron（Scheduler 已桥接）/ EventBus 事件 /
   Webhook → run → 结果回写 outbox；
 - **子 Agent / 分层编排**：planner 拆任务 → executor 并行（复用 `Io.Group`
   并发模型）→ 聚合，失败隔离；
-- **反射自检 + 转人工**：完成后质量门重试；超预算/不确定/高权限操作挂起转
-  人工、审批后恢复。
 
 ### 已落地（本轮）
 
+- **WAL 持久化 + `resumeRun(run_id)`**：每步完成后写入 WAL（`Workflow.wal` +
+  `run_id`），崩溃后从最后已持久化步骤续跑（回放已完成步骤 → 继续剩余）；
 - **反射质量门**：`Workflow.reflection`（`VerifyFn`）+ `max_reviews`——最终步骤
   输出不达标自动重跑最后一步，仍不达标升级为失败；
 - **转人工钩子**：`Workflow.on_escalate`（`EscalateFn`），步骤失败（重试后）、
