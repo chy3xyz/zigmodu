@@ -44,9 +44,13 @@ curl http://127.0.0.1:18100/health/live
 3. **approve** — `ApprovalFlow` auto-approves small refunds, escalates large ones;
 4. **notify** — `NotificationHub` delivers a summary to a sink + outbox;
 5. **audit** — `OutboxConsumer` polls and dispatches every written event.
+6. **human queue** — escalated runs land in a `PersistentApprovalQueue` exposed
+   over HTTP by `ApprovalApi` (mounted at `/api/approvals`).
 
 ```bash
-cd examples/ai-ops && zig build run     # prints the pipeline trace
+cd examples/ai-ops && zig build run     # prints the trace, then serves :18087
+curl http://127.0.0.1:18087/api/approvals/pending
+curl -X POST http://127.0.0.1:18087/api/approvals/order-2/approve
 zig build test                          # asserts every stage
 ```
 

@@ -13,13 +13,15 @@
 //! the loop.
 //!
 //! Run:  zig build run        (prints the pipeline trace)
-//! Test: zig build test       (asserts every stage)
+//!       then curl http://127.0.0.1:18087/api/approvals/pending
+//! Test: zig build test       (asserts every stage + the approval API)
 
 const std = @import("std");
 const zigmodu = @import("zigmodu");
 
 const ai = zigmodu.ai;
 const sqlx = zigmodu.data.sqlx;
+const http = zigmodu.http;
 
 /// Notification sink: appends the delivered JSON body to a caller-provided
 /// buffer (via `userdata`).
@@ -44,7 +46,7 @@ const outbox_table_sql =
 ;
 
 pub fn main(init: std.process.Init) !void {
-    const res = try runPipeline(init.gpa, init.io, true);
+    const res = try runDemo(init.gpa, init.io, true, true);
     init.gpa.free(res.diagnosis_cause);
 }
 
@@ -56,9 +58,13 @@ const PipelineResult = struct {
     small_status: ai.approval.ApprovalStatus,
     notify_delivered: usize,
     outbox_consumed: usize,
+    queue: *ai.approval_store.PersistentApprovalQueue,
 };
 
-fn runPipeline(allocator: std.mem.Allocator, io: std.Io, verbose: bool) !PipelineResult {
+/// Full demo: pipeline + persistent approval queue + HTTP API. When
+/// `serve` is true the HTTP server blocks; tests pass false and dispatch the
+/// handlers directly against the router instead.
+fn runDemo(allocator: std.mem.Allocator, io: std.Io, verbose: bool, serve: bool) !PipelineResult {
     var client = sqlx.Client.init(allocator, io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
@@ -75,6 +81,9 @@ fn runPipeline(allocator: std.mem.Allocator, io: std.Io, verbose: bool) !Pipelin
     var backend = zigmodu.data.SqlxBackend{ .allocator = allocator, .client = &client };
     var outbox = zigmodu.outbox.OutboxPublisher.init(allocator, .{ .max_retries = 3 });
     var ctx = ai.SkillContext{ .allocator = allocator };
+
+    var approval_queue = ai.approval_store.PersistentApprovalQueue.init(allocator, &backend);
+    try approval_queue.migrate();
 
     // ── 1. Detect ─────────────────────────────────────────────────────────
     const alert_rules = [_]ai.alerts.AlertRule{
@@ -141,6 +150,8 @@ fn runPipeline(allocator: std.mem.Allocator, io: std.Io, verbose: bool) !Pipelin
     };
     var approval = ai.approval.ApprovalFlow.init(allocator, &backend, Policy.decide);
     approval.outbox = &outbox;
+    approval.on_escalated = ai.approval_store.queuedEscalationPersistent;
+    approval.escalated_userdata = &approval_queue;
     var large = try approval.submit(allocator, &ctx, "order-2", 50000, &steps);
     defer large.deinit(allocator);
     var small = try approval.submit(allocator, &ctx, "order-1", 100, &steps);
@@ -189,21 +200,52 @@ fn runPipeline(allocator: std.mem.Allocator, io: std.Io, verbose: bool) !Pipelin
         std.debug.print("\n--- demo complete: detect → diagnose → approve → notify → audit ---\n", .{});
     }
 
-    const out = PipelineResult{
+    // ── 6. Human approval queue HTTP API (mounted, optional serve) ────────
+    const ApprovalApi = ai.approval_api.ApprovalApi(ai.approval_store.PersistentApprovalQueue);
+    var api = ApprovalApi{ .queue = &approval_queue };
+    var server = http.Server.init(io, allocator, 18087);
+    defer server.deinit();
+    const AppState = struct {};
+    var app: AppState = .{};
+    var router = http.Router(AppState).init(io, allocator, &server, &app);
+    defer router.deinit();
+    var v1 = router.scope("/api");
+    try v1.mount(ApprovalApi, &api);
+    var catalog = try router.finish();
+    defer catalog.deinit();
+
+    if (verbose) {
+        std.debug.print("6. queue    : {d} pending approval(s); API GET /api/approvals/pending  POST /api/approvals/{{id}}/approve|reject\n", .{try approval_queue.count()});
+    }
+    if (serve) {
+        try server.start();
+        return PipelineResult{ .alerts = alerts, .diagnosis_cause = "", .large_status = large.status, .small_status = small.status, .notify_delivered = report.delivered, .outbox_consumed = poll.delivered, .queue = &approval_queue };
+    } else {
+        try std.testing.expect(catalog.findEntry(.GET, "api/approvals/pending") != null);
+        var matched = server.router.match(allocator, .POST, "/api/approvals/order-2/approve") orelse return error.RouteNotFound;
+        defer matched.deinit(allocator);
+        var http_ctx = try http.Context.init(allocator, .POST, "/api/approvals/order-2/approve");
+        defer http_ctx.deinit();
+        http_ctx.user_data = matched.route.user_data;
+        var pit = matched.params.iterator();
+        while (pit.next()) |p| try http_ctx.params.put(try allocator.dupe(u8, p.key_ptr.*), try allocator.dupe(u8, p.value_ptr.*));
+        try matched.route.handler(&http_ctx);
+        try std.testing.expectEqual(@as(usize, 0), try approval_queue.count());
+    }
+    return .{
         .alerts = alerts,
         .diagnosis_cause = try allocator.dupe(u8, diag.causes[0]),
         .large_status = large.status,
         .small_status = small.status,
         .notify_delivered = report.delivered,
         .outbox_consumed = poll.delivered,
+        .queue = &approval_queue,
     };
-    // The duplicated cause must outlive this frame's deferred frees.
-    return out;
 }
 
 test "ai-ops end-to-end pipeline" {
     const allocator = std.testing.allocator;
-    const res = try runPipeline(allocator, std.testing.io, false);
+    const res = try runDemo(allocator, std.testing.io, false, false);
     defer allocator.free(res.diagnosis_cause);
     try std.testing.expectEqual(@as(usize, 1), res.alerts);
     try std.testing.expectEqualStrings("payment gateway rejected both charges", res.diagnosis_cause);
