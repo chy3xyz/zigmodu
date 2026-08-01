@@ -32,13 +32,11 @@ defer result.deinit();
 超支 `.stop` 提前终止（`AgentResult.budget_exhausted` / 运行状态
 `.budget_exhausted`）或 `.warn` 继续。`Agent.budget` 可挂到单个 Agent 上。
 
-### 后续（P1）
-
-- **子 Agent / 分层编排**：planner 拆任务 → executor 并行（复用 `Io.Group`
-  并发模型）→ 聚合，失败隔离；
-
 ### 已落地（本轮）
 
+- **`zigmodu.ai.hierarchy` 分层编排**：planner 拆目标为子任务 → executor 并行
+  （`std.Io.Group` 按 `max_parallel` 分波）→ 聚合；部分失败标记
+  `.partial_failed`；planner/executor 均为回调，可接 Agent/Workflow；
 - **`zigmodu.ai.trigger` 触发编排**：`fire(input)`（事件/Webhook 源直接调用）+
   `registerCron(scheduler, name, expr, input)`（定时源，上下文由 Trigger 持有）+
   可选 outbox 回写（`outbox` + `backend` 配置后每次 run 追加
