@@ -10,7 +10,10 @@
 const std = @import("std");
 const api = @import("../api/Server.zig");
 const x402_mod = @import("x402.zig");
+const x402_store_mod = @import("x402_store.zig");
 const did_mod = @import("did.zig");
+const challenge_mod = @import("challenge.zig");
+const security_mod = @import("../security/AppSecurity.zig");
 
 /// Config for `x402Middleware`. `verifier` must be the production payment
 /// verifier (on-chain check, allow-list); the helper stays fail-closed when
@@ -27,6 +30,9 @@ pub const X402Config = struct {
     amount: u64 = 1000000,
     currency: x402_mod.Currency = .usdc,
     description: []const u8 = "Web4 API access",
+    /// When set, invoices are persisted and proofs are redeemed exactly once
+    /// (idempotent anti-replay); otherwise the `verifier` callback is used.
+    store: ?*x402_store_mod.X402Store = null,
 };
 
 /// x402 payment gate: no proof → 402 + invoice; invalid proof → 403; valid →
@@ -47,6 +53,19 @@ pub fn x402Middleware(cfg: *X402Config) api.Middleware {
                         try ctx.sendError(402, "missing invoice id");
                         return;
                     };
+                    if (c.store) |st| {
+                        switch (try st.redeem(invoice_id, tx)) {
+                            .redeemed => {
+                                try ctx.setAttr("x402_paid", "true");
+                                try next(ctx);
+                                return;
+                            },
+                            .already_used, .not_found, .expired => {
+                                try ctx.sendError(410, "invoice not redeemable");
+                                return;
+                            },
+                        }
+                    }
                     const proof = x402_mod.PaymentProof{
                         .tx_hash = try ctx.allocator.dupe(u8, tx),
                         .invoice_id = try ctx.allocator.dupe(u8, invoice_id),
@@ -65,15 +84,19 @@ pub fn x402Middleware(cfg: *X402Config) api.Middleware {
                 }
                 const invoice = if (c.on_invoice) |f|
                     try f(ctx, ctx.allocator)
-                else
-                    x402_mod.Invoice{
-                        .id = c.invoice_id,
+                else blk: {
+                    var id_buf: [64]u8 = undefined;
+                    const id = try std.fmt.bufPrint(&id_buf, "{s}-{d}", .{ c.invoice_id, @import("../core/Time.zig").monotonicNowMilliseconds() });
+                    break :blk x402_mod.Invoice{
+                        .id = id,
                         .payee_did = c.payee_did,
                         .amount = c.amount,
                         .currency = c.currency,
                         .deadline = @import("../core/Time.zig").monotonicNowSeconds() + 3600,
                         .description = c.description,
                     };
+                };
+                if (c.store) |st| try st.create(invoice);
                 try x402_mod.writePaymentRequired(ctx, ctx.allocator, invoice);
             }
         }.mw,
@@ -89,6 +112,13 @@ pub const DidAuthConfig = struct {
     signature_header: []const u8 = "x-did-signature",
     /// When set, only paths starting with this prefix require DID auth.
     path_prefix: ?[]const u8 = null,
+    /// When set, `x-did-message` must be a challenge issued by the store and
+    /// is consumed after one successful verification (anti-replay).
+    challenge_store: ?*challenge_mod.ChallengeStore = null,
+    /// When set, a JWT for the authenticated DID is issued and returned in the
+    /// `x-did-token` response header — so the client can continue on the
+    /// framework's JWT middleware chain.
+    jwt_issuer: ?*security_mod.AppSecurity = null,
 };
 
 /// did:key authentication: verifies a signature over `message`; on success
@@ -112,6 +142,12 @@ pub fn didAuthMiddleware(cfg: *DidAuthConfig) api.Middleware {
                     try ctx.sendError(401, "missing message");
                     return;
                 };
+                if (c.challenge_store) |cs| {
+                    if (!cs.verifyAndConsume(ctx.allocator, did, message)) {
+                        try ctx.sendError(401, "invalid or expired challenge");
+                        return;
+                    }
+                }
                 const sig_b64 = ctx.header(c.signature_header) orelse {
                     try ctx.sendError(401, "missing signature");
                     return;
@@ -138,6 +174,11 @@ pub fn didAuthMiddleware(cfg: *DidAuthConfig) api.Middleware {
                 }
                 try ctx.setAttr("did", did);
                 try ctx.setAttr("user_id", did);
+                if (c.jwt_issuer) |sec| {
+                    const token = try sec.generateToken(did, &.{});
+                    defer ctx.allocator.free(token);
+                    try ctx.setHeader("x-did-token", token);
+                }
                 try next(ctx);
             }
         }.mw,
@@ -177,4 +218,50 @@ test "x402Middleware allows valid proofs" {
     try std.testing.expect(State.reached);
     try std.testing.expectEqual(@as(u16, 200), ctx.status_code);
     try std.testing.expect(!ctx.responded);
+}
+
+test "didAuthMiddleware with challenge store rejects replayed challenges" {
+    const allocator = std.testing.allocator;
+    var store = challenge_mod.ChallengeStore.init(allocator, std.testing.io);
+    defer store.deinit();
+    var cfg = DidAuthConfig{ .challenge_store = &store };
+    const mw = didAuthMiddleware(&cfg);
+
+    var key = try did_mod.DidKey.generate(allocator, std.testing.io);
+    defer allocator.free(key.did);
+    const challenge = try store.issue(allocator, key.did);
+    defer allocator.free(challenge);
+    const sig = try key.sign(allocator, challenge);
+    defer allocator.free(sig);
+    const enc = std.base64.standard.Encoder;
+    const b64 = try allocator.alloc(u8, enc.calcSize(sig.len));
+    defer allocator.free(b64);
+    _ = enc.encode(b64, sig);
+
+    const State = struct {
+        var reached: usize = 0;
+    };
+    const Handler = struct {
+        fn h(_: *api.Context) anyerror!void {
+            State.reached += 1;
+        }
+    };
+
+    var ctx1 = try api.Context.init(allocator, .GET, "/api/identity");
+    defer ctx1.deinit();
+    try ctx1.headers.put(try allocator.dupe(u8, "x-did"), try allocator.dupe(u8, key.did));
+    try ctx1.headers.put(try allocator.dupe(u8, "x-did-message"), try allocator.dupe(u8, challenge));
+    try ctx1.headers.put(try allocator.dupe(u8, "x-did-signature"), try allocator.dupe(u8, b64));
+    try mw.func(&ctx1, Handler.h, mw.user_data);
+    try std.testing.expectEqual(@as(usize, 1), State.reached);
+
+    // Replay of the same challenge must fail (already consumed).
+    var ctx2 = try api.Context.init(allocator, .GET, "/api/identity");
+    defer ctx2.deinit();
+    try ctx2.headers.put(try allocator.dupe(u8, "x-did"), try allocator.dupe(u8, key.did));
+    try ctx2.headers.put(try allocator.dupe(u8, "x-did-message"), try allocator.dupe(u8, challenge));
+    try ctx2.headers.put(try allocator.dupe(u8, "x-did-signature"), try allocator.dupe(u8, b64));
+    try mw.func(&ctx2, Handler.h, mw.user_data);
+    try std.testing.expectEqual(@as(usize, 1), State.reached);
+    try std.testing.expectEqual(@as(u16, 401), ctx2.status_code);
 }

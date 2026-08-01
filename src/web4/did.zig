@@ -169,6 +169,7 @@ pub const VerifiableCredential = struct {
 /// Issue a verifiable credential: sign claims with issuer's DID key.
 pub fn issueCredential(allocator: std.mem.Allocator, issuer: *DidKey, vc: *VerifiableCredential) !void {
     var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
     try buf.appendSlice(allocator, vc.issuer);
     try buf.appendSlice(allocator, vc.subject);
     for (vc.claims) |c| {
@@ -196,6 +197,7 @@ test "resolve did:key round-trip" {
 pub fn verifyCredential(allocator: std.mem.Allocator, issuer: *DidKey, vc: *VerifiableCredential) !bool {
     if (vc.proof == null) return false;
     var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
     try buf.appendSlice(allocator, vc.issuer);
     try buf.appendSlice(allocator, vc.subject);
     for (vc.claims) |c| {
@@ -244,4 +246,8 @@ test "issue and verify credential" {
     try issueCredential(allocator, &issuer_did, &vc);
     try std.testing.expect(vc.proof != null);
     try std.testing.expect(try verifyCredential(allocator, &issuer_did, &vc));
+    if (vc.proof) |p| {
+        allocator.free(p.verification_method);
+        allocator.free(p.signature);
+    }
 }

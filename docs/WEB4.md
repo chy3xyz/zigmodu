@@ -51,6 +51,38 @@ try server.addMiddleware(web4.middleware.didAuthMiddleware(&did_cfg));
 
 `path_prefix` 使全局中间件可以按路由生效；不设置则保护全部路径。
 
+### 生产加固
+
+**invoice 持久化 + 幂等核销（防重放）**：`zigmodu.web4.x402_store.X402Store`
+（SQL 表）创建 invoice 落库；proof 到达时 `redeem(invoice_id, tx_hash)`
+**每个 invoice 恰好核销一次**——重复 proof 返回 `already_used`（410），
+未知/过期分别返回 `not_found` / `expired`。挂到中间件：
+
+```zig
+var store = web4.x402_store.X402Store.init(allocator, &backend);
+try store.migrate();
+var x402_cfg = web4.middleware.X402Config{
+    .store = &store,             // 替代裸 verifier：落库 + 核销
+    .path_prefix = "/api/paid",
+};
+```
+
+**DID 一次性 challenge（防重放）**：`zigmodu.web4.challenge.ChallengeStore`
+签发短时随机 challenge，`verifyAndConsume` 每个 challenge 只接受一次：
+
+```zig
+var challenges = web4.challenge.ChallengeStore.init(allocator, io);
+defer challenges.deinit();
+var did_cfg = web4.middleware.DidAuthConfig{
+    .path_prefix = "/api/identity",
+    .challenge_store = &challenges,   // 签名前必须先通过一次性 challenge
+};
+```
+
+**DID → JWT 串联**：`DidAuthConfig.jwt_issuer` 挂 `AppSecurity` 后，认证成功
+自动签发 JWT 于 `x-did-token` 响应头——客户端可继续走框架 JWT 中间件链
+（`jwtAuthFromCatalogWithPermissions` / RBAC）。
+
 ## 4. 示例
 
 ```bash
