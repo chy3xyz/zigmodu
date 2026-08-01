@@ -125,6 +125,12 @@ WAL 持久化、转人工在 DAG 下同样生效；反射质量门当前应用�
 `POST /approvals/{id}/reject`（后两者 `permission = approval:decide`）。
 队列为应用持有的小存储，需要跨重启时配对 outbox consumer/数据库。
 
+**持久化版**：`zigmodu.ai.approval_store.PersistentApprovalQueue` 与内存版
+同接口（`push` / `listPending` / `resolve` / `count`），但落 SQL 表
+（`migrate()` 建表，重启不丢、可审计）；`queuedEscalationPersistent` 是
+对应的 escalation hook。`ApprovalApi` 泛型化后对两种队列开箱即用
+（`ApprovalApi(ApprovalQueue)` 或 `ApprovalApi(PersistentApprovalQueue)`）。
+
 ### LLM 默认策略（开箱即用）
 
 `zigmodu.ai.llm` 提供 LLM-backed 策略回调：`llmDiagnose`（异常归因：

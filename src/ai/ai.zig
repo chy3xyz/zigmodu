@@ -36,6 +36,7 @@ pub const risk = @import("risk.zig");
 pub const recon = @import("recon.zig");
 pub const approval = @import("approval.zig");
 pub const approval_api = @import("approval_api.zig");
+pub const approval_store = @import("approval_store.zig");
 pub const llm = @import("llm.zig");
 pub const notify = @import("notify.zig");
 pub const kpi = @import("kpi.zig");

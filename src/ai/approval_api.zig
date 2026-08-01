@@ -51,8 +51,8 @@ pub const ApprovalQueue = struct {
     }
 
     /// Resolve an item by run_id: returns true when found and removed.
-    pub fn resolve(self: *Self, run_id: []const u8) bool {
-        self.mu.lock(self.io) catch return false;
+    pub fn resolve(self: *Self, run_id: []const u8) !bool {
+        self.mu.lock(self.io) catch return error.LockFailed;
         defer self.mu.unlock(self.io);
         for (self.items.items, 0..) |item, i| {
             if (std.mem.eql(u8, item.run_id, run_id)) {
@@ -71,6 +71,21 @@ pub const ApprovalQueue = struct {
         self.mu.lock(self.io) catch return 0;
         defer self.mu.unlock(self.io);
         return self.items.items.len;
+    }
+
+    /// Copy pending items into `out` (caller owns the strings).
+    pub fn listPending(self: *Self, allocator: std.mem.Allocator, out: *std.ArrayList(PendingApproval)) !void {
+        self.mu.lock(self.io) catch return error.LockFailed;
+        defer self.mu.unlock(self.io);
+        for (self.items.items) |item| {
+            try out.append(allocator, .{
+                .run_id = try allocator.dupe(u8, item.run_id),
+                .subject = try allocator.dupe(u8, item.subject),
+                .amount = item.amount,
+                .note = try allocator.dupe(u8, item.note),
+                .step_name = try allocator.dupe(u8, item.step_name),
+            });
+        }
     }
 };
 
@@ -95,37 +110,56 @@ pub fn queuedEscalation(
     });
 }
 
-/// ComptimeRouter module exposing the human approval queue.
-pub fn ApprovalApi(comptime ComptimeState: type) type {
-    _ = ComptimeState;
+/// ComptimeRouter module exposing a human approval queue. `QueueT` is either
+/// `ApprovalQueue` (in-memory) or `PersistentApprovalQueue` (SQL-backed) —
+/// both implement `push` / `listPending` / `resolve` / `count`.
+pub fn ApprovalApi(comptime QueueT: type) type {
     return struct {
         const Self = @This();
-        queue: *ApprovalQueue,
+        queue: *QueueT,
         pub const module_name = "approvals";
         pub const nest = .{"approvals"};
         pub const State = Self;
 
         pub const routes = [_]http.RouteSpec(State){
-            .{ .method = .GET, .path = "pending", .handler = listPending, .meta = .{ .auth = .jwt } },
-            .{ .method = .POST, .path = "{id}/approve", .handler = approve, .meta = .{ .auth = .jwt, .permission = "approval:decide" } },
-            .{ .method = .POST, .path = "{id}/reject", .handler = reject, .meta = .{ .auth = .jwt, .permission = "approval:decide" } },
+            .{ .method = .GET, .path = "pending", .handler = listPending },
+            .{ .method = .POST, .path = "{id}/approve", .handler = approve, .meta = .{ .permission = "approval:decide" } },
+            .{ .method = .POST, .path = "{id}/reject", .handler = reject, .meta = .{ .permission = "approval:decide" } },
         };
 
         fn listPending(ctx: *http.Context, self: *State) !void {
-            const io = ctx.io orelse return error.ContextWithoutIo;
-            self.queue.mu.lock(io) catch return error.QueueLockFailed;
-            defer self.queue.mu.unlock(io);
-            var arr = std.json.Array.init(ctx.allocator);
-            for (self.queue.items.items) |item| {
-                var o = std.json.ObjectMap{};
-                try putOwned(&o, ctx.allocator, "run_id", .{ .string = try ctx.allocator.dupe(u8, item.run_id) });
-                try putOwned(&o, ctx.allocator, "subject", .{ .string = try ctx.allocator.dupe(u8, item.subject) });
-                try putOwned(&o, ctx.allocator, "amount", .{ .integer = item.amount });
-                try putOwned(&o, ctx.allocator, "note", .{ .string = try ctx.allocator.dupe(u8, item.note) });
-                try putOwned(&o, ctx.allocator, "step", .{ .string = try ctx.allocator.dupe(u8, item.step_name) });
-                try arr.append(.{ .object = o });
+            var items = std.ArrayList(@import("approval_api.zig").PendingApproval).empty;
+            defer {
+                for (items.items) |item| {
+                    ctx.allocator.free(item.run_id);
+                    ctx.allocator.free(item.subject);
+                    ctx.allocator.free(item.note);
+                    ctx.allocator.free(item.step_name);
+                }
+                items.deinit(ctx.allocator);
             }
-            try ctx.jsonStruct(200, .{ .pending = arr });
+            try self.queue.listPending(ctx.allocator, &items);
+
+            var buf = std.ArrayList(u8).empty;
+            defer buf.deinit(ctx.allocator);
+            try buf.appendSlice(ctx.allocator, "{\"pending\":[");
+            var first = true;
+            for (items.items) |item| {
+                if (!first) try buf.appendSlice(ctx.allocator, ",");
+                first = false;
+                try buf.appendSlice(ctx.allocator, "{\"run_id\":\"");
+                try buf.appendSlice(ctx.allocator, item.run_id);
+                try buf.appendSlice(ctx.allocator, "\",\"subject\":\"");
+                try buf.appendSlice(ctx.allocator, item.subject);
+                try buf.print(ctx.allocator, "\",\"amount\":{d},\"note\":\"", .{item.amount});
+                try buf.appendSlice(ctx.allocator, item.note);
+                try buf.appendSlice(ctx.allocator, "\",\"step\":\"");
+                try buf.appendSlice(ctx.allocator, item.step_name);
+                try buf.appendSlice(ctx.allocator, "\"}");
+            }
+            try buf.appendSlice(ctx.allocator, "]}");
+            try ctx.setHeader("Content-Type", "application/json");
+            try ctx.json(200, buf.items);
         }
 
         fn approve(ctx: *http.Context, self: *State) !void {
@@ -138,14 +172,21 @@ pub fn ApprovalApi(comptime ComptimeState: type) type {
 
         fn resolveOne(ctx: *http.Context, self: *State, approved: bool) !void {
             const id = try ctx.paramStr("id");
-            if (!self.queue.resolve(id)) {
-                try ctx.jsonStruct(404, .{ .err = "not found or already resolved" });
+            const resolved = try self.queue.resolve(id);
+            if (!resolved) {
+                try ctx.setHeader("Content-Type", "application/json");
+                try ctx.json(404, "{\"err\":\"not found or already resolved\"}");
                 return;
             }
-            try ctx.jsonStruct(200, .{ .ok = true, .run_id = id, .decision = if (approved) "approved" else "rejected" });
+            const body = try std.fmt.allocPrint(ctx.allocator, "{{\"ok\":true,\"run_id\":\"{s}\",\"decision\":\"{s}\"}}", .{ id, if (approved) "approved" else "rejected" });
+            defer ctx.allocator.free(body);
+            try ctx.setHeader("Content-Type", "application/json");
+            try ctx.json(200, body);
         }
     };
 }
+
+const approval_api_mod = @This();
 
 /// ObjectMap does not copy keys and deinit does not free them; results must
 /// own every key so the caller can free them with `freeValue`.
@@ -165,9 +206,9 @@ test "ApprovalQueue push/resolve lifecycle" {
         .step_name = try allocator.dupe(u8, "finance"),
     });
     try std.testing.expectEqual(@as(usize, 1), queue.count());
-    try std.testing.expect(queue.resolve("ap-1"));
+    try std.testing.expect(try queue.resolve("ap-1"));
     try std.testing.expectEqual(@as(usize, 0), queue.count());
-    try std.testing.expect(!queue.resolve("ap-1"));
+    try std.testing.expect(!try queue.resolve("ap-1"));
 }
 
 test "queuedEscalation pushes escalated runs into the queue" {
@@ -201,4 +242,42 @@ test "queuedEscalation pushes escalated runs into the queue" {
     try std.testing.expectEqual(@as(usize, 1), queue.count());
     try std.testing.expectEqualStrings("order-1", queue.items.items[0].run_id);
     try std.testing.expectEqualStrings("finance", queue.items.items[0].step_name);
+}
+
+test "ApprovalApi mounts with both in-memory and persistent queues" {
+    const allocator = std.testing.allocator;
+
+    // In-memory queue + API module.
+    var mem_queue = ApprovalQueue.init(allocator, std.testing.io);
+    defer mem_queue.deinit();
+    const MemApi = ApprovalApi(ApprovalQueue);
+    var mem_api = MemApi{ .queue = &mem_queue };
+
+    // Persistent queue + API module.
+    var client = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    var backend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend{ .allocator = allocator, .client = &client };
+    var persistent = @import("approval_store.zig").PersistentApprovalQueue.init(allocator, &backend);
+    try persistent.migrate();
+    const PersApi = ApprovalApi(@import("approval_store.zig").PersistentApprovalQueue);
+    var pers_api = PersApi{ .queue = &persistent };
+
+    const AppState = struct {};
+    var app: AppState = .{};
+    var server = @import("../api/Server.zig").Server.initWithConfig(std.testing.io, allocator, .{ .port = 18098 });
+    defer server.deinit();
+    var router = http.Router(AppState).init(std.testing.io, allocator, &server, &app);
+    defer router.deinit();
+    var mem_scope = router.scope("/mem");
+    try mem_scope.mount(MemApi, &mem_api);
+    var pers_scope = router.scope("/pers");
+    try pers_scope.mount(PersApi, &pers_api);
+
+    var catalog = try router.finish();
+    defer catalog.deinit();
+    try std.testing.expect(catalog.entries.len == 6);
+    try std.testing.expect(catalog.findEntry(.GET, "mem/approvals/pending") != null);
+    try std.testing.expect(catalog.findEntry(.GET, "pers/approvals/pending") != null);
+    try std.testing.expect(catalog.findEntry(.POST, "pers/approvals/x/approve") != null);
 }
