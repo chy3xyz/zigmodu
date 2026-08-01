@@ -144,6 +144,10 @@ WAL 持久化、转人工在 DAG 下同样生效；反射质量门当前应用�
 对应的 escalation hook。`ApprovalApi` 泛型化后对两种队列开箱即用
 （`ApprovalApi(ApprovalQueue)` 或 `ApprovalApi(PersistentApprovalQueue)`）。
 
+**技能桥**：`registerApprovalRequestSkills` 暴露 `approval.request`
+（subject + amount，链/策略应用注册）——workflow 的 `.agent` 步骤内的 Agent
+可直接发起审批，人工处理后 `resumeRun` 继续编排。
+
 ### LLM 默认策略（开箱即用）
 
 `zigmodu.ai.llm` 提供 LLM-backed 策略回调：`llmDiagnose`（异常归因：

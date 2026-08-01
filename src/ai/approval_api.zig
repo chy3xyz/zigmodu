@@ -10,6 +10,8 @@ const std = @import("std");
 const http = @import("../http.zig");
 const approval = @import("approval.zig");
 const SkillContext = @import("skill.zig").SkillContext;
+const SkillRegistry = @import("skill.zig").SkillRegistry;
+const freeValue = @import("skill.zig").freeValue;
 
 pub const PendingApproval = struct {
     run_id: []const u8,
@@ -112,6 +114,44 @@ pub fn queuedEscalation(
         .amount = amount,
         .note = try allocator.dupe(u8, note),
         .step_name = try allocator.dupe(u8, step_name),
+    });
+}
+
+/// Capability bundle for the `approval.request` skill bridge. The caller owns
+/// this value and sets `SkillContext.userdata = &ctx` before dispatch.
+pub const ApprovalCtx = struct {
+    flow: *approval.ApprovalFlow,
+    steps: []const approval.ApprovalStep,
+};
+
+/// Register `approval.request` — an Agent inside a workflow can submit an
+/// approval request (subject + amount); the chain and policy stay
+/// app-registered. Returns run_id + status.
+pub fn registerApprovalRequestSkills(registry: *SkillRegistry) !void {
+    try registry.register(.{
+        .name = "approval.request",
+        .description = "Submit a business request through the app-registered approval chain; returns the approval run id and status (approved / pending_human / rejected)",
+        .parameters = &.{
+            .{ .name = "subject", .type = .string, .description = "What is being approved", .required = true },
+            .{ .name = "amount", .type = .number, .description = "Amount involved", .required = true },
+        },
+        .handler = struct {
+            fn h(sctx: *SkillContext, args: std.json.Value) anyerror!std.json.Value {
+                try sctx.checkDeadline();
+                const ac: *ApprovalCtx = @ptrCast(@alignCast(sctx.userdata orelse return error.ApprovalNotConfigured));
+                const obj = args.object;
+                const subject_v = obj.get("subject") orelse return error.InvalidArguments;
+                const amount_v = obj.get("amount") orelse return error.InvalidArguments;
+                if (subject_v != .string or amount_v != .float) return error.InvalidArguments;
+
+                var result = try ac.flow.submit(sctx.allocator, sctx, subject_v.string, @intFromFloat(amount_v.float), ac.steps);
+                defer result.deinit(sctx.allocator);
+                var out = std.json.ObjectMap{};
+                try putOwned(&out, sctx.allocator, "run_id", .{ .string = try sctx.allocator.dupe(u8, result.run_id) });
+                try putOwned(&out, sctx.allocator, "status", .{ .string = try sctx.allocator.dupe(u8, @tagName(result.status)) });
+                return .{ .object = out };
+            }
+        }.h,
     });
 }
 
@@ -293,4 +333,44 @@ test "ApprovalApi mounts with both in-memory and persistent queues" {
     try std.testing.expect(catalog.findEntry(.GET, "mem/approvals/pending") != null);
     try std.testing.expect(catalog.findEntry(.GET, "pers/approvals/pending") != null);
     try std.testing.expect(catalog.findEntry(.POST, "pers/approvals/x/approve") != null);
+}
+
+test "approval.request skill submits and reports the chain status" {
+    const allocator = std.testing.allocator;
+    var client = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    _ = try client.exec(
+        "CREATE TABLE event_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, payload TEXT, status INTEGER DEFAULT 0, retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 5, created_at INTEGER, updated_at INTEGER, error_message TEXT)",
+        &.{},
+    );
+    var backend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend{ .allocator = allocator, .client = &client };
+    var queue = ApprovalQueue.init(allocator, std.testing.io);
+    defer queue.deinit();
+
+    const Escalate = struct {
+        fn policy(_: std.mem.Allocator, _: *SkillContext, _: []const u8, _: i64, _: usize, _: []const u8, _: []const u8, _: *[]const u8) anyerror!approval.ApprovalDecision {
+            return .escalated;
+        }
+    };
+    var flow = approval.ApprovalFlow.init(allocator, &backend, Escalate.policy);
+    flow.on_escalated = queuedEscalation;
+    flow.escalated_userdata = &queue;
+    const steps = [_]approval.ApprovalStep{.{ .name = "finance" }};
+    var ac = ApprovalCtx{ .flow = &flow, .steps = &steps };
+
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    try registerApprovalRequestSkills(&registry);
+    var sctx = SkillContext{ .allocator = allocator, .userdata = &ac };
+    var args_map = std.json.ObjectMap{};
+    try putOwned(&args_map, allocator, "subject", .{ .string = try allocator.dupe(u8, "order-7") });
+    try putOwned(&args_map, allocator, "amount", .{ .float = 9000 });
+
+    const res = try registry.dispatch("approval.request", &sctx, .{ .object = args_map });
+    defer freeValue(allocator, res);
+    defer freeValue(allocator, .{ .object = args_map });
+    try std.testing.expectEqualStrings("pending_human", res.object.get("status").?.string);
+    try std.testing.expectEqual(@as(usize, 1), queue.count());
+    try std.testing.expectEqualStrings("order-7", queue.items.items[0].run_id);
 }
