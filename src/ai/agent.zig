@@ -11,6 +11,7 @@ const retriever_mod = @import("retriever.zig");
 const quota_mod = @import("quota.zig");
 const tokenizer = @import("tokenizer.zig");
 const Budget = @import("budget.zig").Budget;
+const ContextManager = @import("context.zig").ContextManager;
 
 pub const AiProvider = provider_mod.AiProvider;
 pub const SkillRegistry = skill_mod.SkillRegistry;
@@ -102,6 +103,8 @@ pub const Agent = struct {
     /// Optional hard task budget: reserved before each LLM step; when exhausted
     /// in `.stop` mode the run ends early with `budget_exhausted` set.
     budget: ?*Budget = null,
+    /// Optional conversation context manager (auto-compact long histories).
+    context: ?*ContextManager = null,
 
     pub fn run(
         self: *Agent,
@@ -127,6 +130,8 @@ pub const Agent = struct {
             for (owned_strs.items) |s| allocator.free(s);
             owned_strs.deinit(allocator);
         }
+        var summary: ?[]const u8 = null;
+        defer if (summary) |s| allocator.free(s);
 
         var system_content: []const u8 = self.system_prompt;
         if (self.retriever) |r| {
@@ -161,6 +166,13 @@ pub const Agent = struct {
         var steps: usize = 0;
         var budget_stopped = false;
         while (steps < max_steps) : (steps += 1) {
+            if (self.context) |cm| {
+                if (cm.shouldCompact(messages.items)) {
+                    const new_msgs = try cm.manage(allocator, messages.items, &summary);
+                    messages.deinit(allocator);
+                    messages = new_msgs;
+                }
+            }
             if (self.budget) |b| {
                 const est = tokenizer.estimateMessages(messages.items);
                 if (!b.tryConsume(est)) {

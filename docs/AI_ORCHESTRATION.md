@@ -34,6 +34,9 @@ defer result.deinit();
 
 ### 已落地（本轮）
 
+- **`zigmodu.ai.context` 上下文管理**：按 token 阈值自动压缩长对话——旧消息
+  交给 `SummarizeFn` 摘要（或直接丢弃）作为 system 消息前置，保留最近窗口；
+  `Agent.context` 已接入（循环内自动触发）；
 - **`zigmodu.ai.hierarchy` 分层编排**：planner 拆目标为子任务 → executor 并行
   （`std.Io.Group` 按 `max_parallel` 分波）→ 聚合；部分失败标记
   `.partial_failed`；planner/executor 均为回调，可接 Agent/Workflow；
@@ -50,7 +53,6 @@ defer result.deinit();
 
 ### P2
 
-- **上下文管理**：长对话按 token 阈值自动摘要折叠；
 - **运行时控制**：`AgentHandle`（cancel/pause/resume + 进度查询）+ 每步 trace
   span（复用 OTLP）。
 
