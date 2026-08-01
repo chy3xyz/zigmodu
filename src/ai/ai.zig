@@ -3,6 +3,7 @@ pub const Param = @import("skill.zig").Param;
 pub const SkillContext = @import("skill.zig").SkillContext;
 pub const SkillRegistry = @import("skill.zig").SkillRegistry;
 pub const DispatchOpts = @import("skill.zig").DispatchOpts;
+pub const freeValue = @import("skill.zig").freeValue;
 
 pub const AiProvider = @import("provider.zig").AiProvider;
 pub const Agent = @import("agent.zig").Agent;

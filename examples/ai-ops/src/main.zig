@@ -215,7 +215,7 @@ fn runDemo(allocator: std.mem.Allocator, io: std.Io, verbose: bool, serve: bool)
     defer catalog.deinit();
 
     if (verbose) {
-        std.debug.print("6. queue    : {d} pending approval(s); API GET /api/approvals/pending  POST /api/approvals/{{id}}/approve|reject\n", .{try approval_queue.count()});
+        std.debug.print("6. queue    : {d} pending approval(s); API GET /api/approvals/pending  POST /api/approvals/{{id}}/approve|reject\n", .{try approval_queue.count(null)});
     }
     if (serve) {
         try server.start();
@@ -230,7 +230,7 @@ fn runDemo(allocator: std.mem.Allocator, io: std.Io, verbose: bool, serve: bool)
         var pit = matched.params.iterator();
         while (pit.next()) |p| try http_ctx.params.put(try allocator.dupe(u8, p.key_ptr.*), try allocator.dupe(u8, p.value_ptr.*));
         try matched.route.handler(&http_ctx);
-        try std.testing.expectEqual(@as(usize, 0), try approval_queue.count());
+        try std.testing.expectEqual(@as(usize, 0), try approval_queue.count(null));
     }
     return .{
         .alerts = alerts,

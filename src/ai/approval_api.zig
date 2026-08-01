@@ -17,6 +17,8 @@ pub const PendingApproval = struct {
     amount: i64,
     note: []const u8,
     step_name: []const u8,
+    /// Optional tenant scope for multi-tenant deployments.
+    tenant_id: ?i64 = null,
 };
 
 /// Thread-safe in-memory queue of escalated approvals. The queue owns the
@@ -51,7 +53,8 @@ pub const ApprovalQueue = struct {
     }
 
     /// Resolve an item by run_id: returns true when found and removed.
-    pub fn resolve(self: *Self, run_id: []const u8) !bool {
+    pub fn resolve(self: *Self, run_id: []const u8, _tenant_id: ?i64) !bool {
+        _ = _tenant_id;
         self.mu.lock(self.io) catch return error.LockFailed;
         defer self.mu.unlock(self.io);
         for (self.items.items, 0..) |item, i| {
@@ -74,7 +77,8 @@ pub const ApprovalQueue = struct {
     }
 
     /// Copy pending items into `out` (caller owns the strings).
-    pub fn listPending(self: *Self, allocator: std.mem.Allocator, out: *std.ArrayList(PendingApproval)) !void {
+    pub fn listPending(self: *Self, allocator: std.mem.Allocator, out: *std.ArrayList(PendingApproval), _tenant_id: ?i64) !void {
+        _ = _tenant_id;
         self.mu.lock(self.io) catch return error.LockFailed;
         defer self.mu.unlock(self.io);
         for (self.items.items) |item| {
@@ -84,6 +88,7 @@ pub const ApprovalQueue = struct {
                 .amount = item.amount,
                 .note = try allocator.dupe(u8, item.note),
                 .step_name = try allocator.dupe(u8, item.step_name),
+                .tenant_id = item.tenant_id,
             });
         }
     }
@@ -138,7 +143,11 @@ pub fn ApprovalApi(comptime QueueT: type) type {
                 }
                 items.deinit(ctx.allocator);
             }
-            try self.queue.listPending(ctx.allocator, &items);
+            const tenant_id = blk: {
+                const h = ctx.header("X-Tenant-ID") orelse break :blk null;
+                break :blk std.fmt.parseInt(i64, h, 10) catch null;
+            };
+            try self.queue.listPending(ctx.allocator, &items, tenant_id);
 
             var buf = std.ArrayList(u8).empty;
             defer buf.deinit(ctx.allocator);
@@ -172,7 +181,11 @@ pub fn ApprovalApi(comptime QueueT: type) type {
 
         fn resolveOne(ctx: *http.Context, self: *State, approved: bool) !void {
             const id = try ctx.paramStr("id");
-            const resolved = try self.queue.resolve(id);
+            const tenant_id = blk: {
+                const h = ctx.header("X-Tenant-ID") orelse break :blk null;
+                break :blk std.fmt.parseInt(i64, h, 10) catch null;
+            };
+            const resolved = try self.queue.resolve(id, tenant_id);
             if (!resolved) {
                 try ctx.setHeader("Content-Type", "application/json");
                 try ctx.json(404, "{\"err\":\"not found or already resolved\"}");
@@ -206,9 +219,9 @@ test "ApprovalQueue push/resolve lifecycle" {
         .step_name = try allocator.dupe(u8, "finance"),
     });
     try std.testing.expectEqual(@as(usize, 1), queue.count());
-    try std.testing.expect(try queue.resolve("ap-1"));
+    try std.testing.expect(try queue.resolve("ap-1", null));
     try std.testing.expectEqual(@as(usize, 0), queue.count());
-    try std.testing.expect(!try queue.resolve("ap-1"));
+    try std.testing.expect(!try queue.resolve("ap-1", null));
 }
 
 test "queuedEscalation pushes escalated runs into the queue" {

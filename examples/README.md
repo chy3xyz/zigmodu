@@ -56,6 +56,28 @@ zig build test                          # asserts every stage
 
 Covered in [docs/AI_ORCHESTRATION.md](../docs/AI_ORCHESTRATION.md).
 
+## Multi-tenant AI (`examples/tenant-ai`)
+
+**Tenant-scoped AI operations** — two tenants share one app; every AI
+capability is isolated per tenant (via `X-Tenant-ID` middleware →
+`SkillContext.tenant_id`):
+
+- `GET  /api/ai/kpi?metric=paid_revenue` — per-tenant KPI (`kpi.query`);
+- `GET  /api/ai/report` — tenant-filtered Markdown business report;
+- `GET  /api/ai/alerts` — tenant-filtered alert rules;
+- `POST /api/ai/approval/submit?amount=N` — approval chain (auto-approve ≤
+  1000, escalate above, persisted per tenant);
+- `GET  /api/ai/approvals` + `POST /api/ai/approvals/{run_id}/approve` —
+  per-tenant human approval queue (tenants cannot see/resolve each other's);
+- `POST /api/ai/workflow/run` — orchestration running the registered skills.
+
+```bash
+cd examples/tenant-ai && zig build run
+curl -H "X-Tenant-ID: 1" "http://127.0.0.1:18088/api/ai/kpi?metric=paid_revenue"   # 150
+curl -H "X-Tenant-ID: 2" "http://127.0.0.1:18088/api/ai/kpi?metric=paid_revenue"   # 9000
+zig build test                          # asserts isolation end-to-end
+```
+
 ## ShopDemo boundary (`examples/shopdemo`)
 
 **Codegen reference only** — `schema.sql` + `generated-sample/` module output. Not a complete runnable app. Use [zmodu CLI](https://github.com/chy3xyz/zmodu) to scaffold a full 42-module project.
