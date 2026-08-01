@@ -17,16 +17,19 @@ pub fn ApplicationModuleListener(comptime EventType: type) type {
         config: Config,
         handler: *const fn (EventType) anyerror!void,
         event_bus: *EventBus(EventType),
+        event_type: EventType,
 
         pub fn init(
             event_bus: *EventBus(EventType),
             handler: *const fn (EventType) anyerror!void,
             config: Config,
+            event_type: EventType,
         ) Self {
             return .{
                 .event_bus = event_bus,
                 .handler = handler,
                 .config = config,
+                .event_type = event_type,
             };
         }
 
@@ -34,26 +37,18 @@ pub fn ApplicationModuleListener(comptime EventType: type) type {
         pub fn subscribe(self: *Self) !void {
             const handler_ptr = self.handler;
 
-            // [...]
-            const wrapped_handler = if (self.config.async_mode)
-                struct {
-                    fn wrapper(event: EventType) void {
-                        handler_ptr(event) catch |err| {
-                            std.log.err("Event handler failed: {}", .{err});
-                        };
+            const S = struct {
+                var current_handler: ?*const fn (EventType) anyerror!void = null;
+                fn wrapper(event: EventType, _: *anyopaque) void {
+                    if (current_handler) |h| {
+                        h(event) catch |err| std.log.err("Event handler failed: {}", .{err});
                     }
-                }.wrapper
-            else
-                struct {
-                    fn wrapper(event: EventType) void {
-                        handler_ptr(event) catch |err| {
-                            std.log.err("Event handler failed: {}", .{err});
-                        };
-                    }
-                }.wrapper;
+                }
+            };
+            S.current_handler = handler_ptr;
+            _ = self.config.async_mode; // delivery mode is informational
 
-            // [...]
-            try self.event_bus.subscribe(wrapped_handler);
+            self.event_bus.subscribe(self.event_type, S.wrapper);
         }
 
         /// [...]
@@ -128,6 +123,36 @@ pub const ModuleListenerRegistry = struct {
         return result;
     }
 };
+
+test "ApplicationModuleListener subscribes and receives published events" {
+    const EventType = enum { order_created, order_cancelled };
+    var bus = EventBus(EventType).init(std.testing.allocator);
+    defer bus.deinit();
+    const State = struct {
+        var handled: ?EventType = null;
+    };
+    const Listener = ApplicationModuleListener(EventType);
+    var listener = Listener.init(
+        &bus,
+        struct {
+            fn h(event: EventType) anyerror!void {
+                State.handled = event;
+            }
+        }.h,
+        .{ .async_mode = false },
+        .order_created,
+    );
+    try listener.subscribe();
+
+    var payload: u8 = 0;
+    bus.publish(.order_created, &payload);
+    try std.testing.expectEqual(EventType.order_created, State.handled.?);
+
+    // A different event type does not reach this listener.
+    State.handled = null;
+    bus.publish(.order_cancelled, &payload);
+    try std.testing.expectEqual(@as(?EventType, null), State.handled);
+}
 
 /// Event[...]
 /// [...]Eventpublish[...]Message queue[...]

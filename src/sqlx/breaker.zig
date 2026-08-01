@@ -84,3 +84,44 @@ pub const CircuitBreaker = struct {
         }
     }
 };
+
+test "CircuitBreaker opens after threshold failures and rejects" {
+    var cb = CircuitBreaker.new();
+    cb.failure_threshold = 3;
+    try std.testing.expect(cb.allow(std.testing.io));
+    cb.recordFailure(std.testing.io);
+    cb.recordFailure(std.testing.io);
+    try std.testing.expect(cb.allow(std.testing.io));
+    cb.recordFailure(std.testing.io);
+    try std.testing.expect(!cb.allow(std.testing.io)); // open
+}
+
+test "CircuitBreaker half-opens after timeout and closes on success" {
+    var cb = CircuitBreaker.new();
+    cb.failure_threshold = 2;
+    cb.timeout_ms = 1000;
+    cb.recordFailure(std.testing.io);
+    cb.recordFailure(std.testing.io);
+    try std.testing.expect(!cb.allow(std.testing.io)); // open
+
+    // Force the timeout to have elapsed.
+    cb.last_failure_ms = @import("../core/Time.zig").monotonicNowSeconds() * 1000 - 5000;
+    try std.testing.expect(cb.allow(std.testing.io)); // half-open
+
+    cb.recordSuccess(std.testing.io);
+    try std.testing.expect(cb.allow(std.testing.io)); // still half-open (1/2)
+    cb.recordSuccess(std.testing.io);
+    try std.testing.expect(cb.allow(std.testing.io)); // closed again
+}
+
+test "CircuitBreaker half-open failure re-opens" {
+    var cb = CircuitBreaker.new();
+    cb.failure_threshold = 1;
+    cb.timeout_ms = 1000;
+    cb.recordFailure(std.testing.io);
+    try std.testing.expect(!cb.allow(std.testing.io)); // open
+    cb.last_failure_ms = @import("../core/Time.zig").monotonicNowSeconds() * 1000 - 5000;
+    try std.testing.expect(cb.allow(std.testing.io)); // half-open
+    cb.recordFailure(std.testing.io);
+    try std.testing.expect(!cb.allow(std.testing.io)); // back to open
+}
