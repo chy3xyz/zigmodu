@@ -38,6 +38,7 @@ pub const approval = @import("approval.zig");
 pub const notify = @import("notify.zig");
 pub const kpi = @import("kpi.zig");
 pub const sla = @import("sla.zig");
+pub const diagnose = @import("diagnose.zig");
 
 pub const Retriever = @import("retriever.zig").Retriever;
 pub const RetrievedChunk = @import("retriever.zig").RetrievedChunk;

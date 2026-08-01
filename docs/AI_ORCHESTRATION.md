@@ -76,6 +76,10 @@ WAL 持久化、转人工在 DAG 下同样生效；反射质量门当前应用�
     的单调钟截止时间，`check()` 按 cron 节奏评估——截止前进入 warn 窗口触发
     提醒，超时触发 breach；事件进 `on_sla` 回调（可接 `ai.notify`）+ outbox
     （`ai.sla`），把「等处理」变成主动运营。
+  - `zigmodu.ai.diagnose.DiagnosisFlow`——异常归因诊断：给定异常（来自
+    `alerts`/`recon`/`sla`/应用代码），先跑配置的 evidence SQL 收集证据，
+    再交给 `diagnose` 回调（可接 LLM/规则引擎）产出根因 + 建议动作，
+    结果写回 outbox（`ai.diagnose`）。
 - **`zigmodu.ai.AgentHandle` 运行时控制**：协作式 cancel / pause / 进度计数
   （原子标志，Agent 每步边界检查）；`Agent.tracer` + `parent_span` 可选创建
   run 级 trace span（复用 DistributedTracer）；
