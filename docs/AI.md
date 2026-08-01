@@ -396,4 +396,5 @@ try ai.registerScheduleSkills(&registry);
 - `Scheduler` 是线程化的：`start()` 起后台线程，每秒 tick 一次，按分钟粒度触发 cron 任务；`addJob` 与 `tick` 互斥保护，可随时加任务。
 - `schedule_job` 只接受**已注册任务名 + cron 表达式**；未知任务返回 `error.TaskNotFound`。
 - 另一个方向（cron → AI）：`Scheduler` 的 task 里直接同步调用 `AiProvider.chat/chatStream` 即可（如定时摘要）；注意 HTTP 出站在线程内的 io 使用约束（见 ZIGMODU_NOTES 第 3 条）。
-- 旧的 `ScheduledTask.TaskScheduler` 已标注废弃（`start()` 从不循环、`calculateNextCronRun` 为占位），将在 v1.0 移除。
+- `ScheduledTask.TaskScheduler`（旧占位实现）**已移除**；调度统一走
+  `Scheduler`（线程化）与 `zigmodu.ai.registerScheduleSkills` 技能桥。

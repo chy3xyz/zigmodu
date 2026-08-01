@@ -28,13 +28,24 @@
 `*ScheduleCtx`）：`list_schedulable_tasks` / `schedule_job` / `list_jobs` /
 `cancel_job`。
 
+## P0 · 业务技能（✅ 已落地）
+
+| Skill | 说明 | 注册 |
+|-------|------|------|
+| `kpi.query` | 查询应用注册的经营指标（`KpiCtx` 按名 + 可租户隔离） | `ai.kpi.registerKpiSkills` |
+| `approval.request` | 经应用注册的审批链提交审批（subject + amount），转人工入队 | `ai.approval_api.registerApprovalRequestSkills` |
+| `notification.send` | 向具名渠道投递通知（webhook / sink / outbox），渠道白名单 | `ai.notify.registerNotifySkills` |
+
+技能目录可导出：`zigmodu.ai.skill_export.toSkillsJson / toOpenApi`
+（运行时，tenant-ai 暴露于 `GET /api/ai/skills`），或 `zmodu ai
+export-skills / openapi`（CLI，内置目录）。
+
 ## P1 · 业务动作（规划中，默认人机门 + 幂等）
 
 | Skill | 说明 |
 |-------|------|
 | `entity.create/update` | Repository 写操作；权限码校验 + 租户字段强制 |
 | `command.execute` | 经 outbox 提交业务命令（幂等键 = run_id），返回事件 ID |
-| `notification.send` | NATS/Kafka/Webhook，目标白名单 |
 | `report.generate` | 聚合查询 → CSV/JSON 报告 |
 
 ## P2 · 管理/运维（规划中，默认关闭）

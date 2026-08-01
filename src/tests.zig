@@ -291,3 +291,45 @@ test "domain imports: security" {
 test "domain imports: observability" {
     _ = @import("observability.zig");
 }
+
+test "ai barrel exposes the public AI API surface" {
+    const ai = @import("ai/ai.zig");
+    // Orchestration
+    _ = ai.workflow.Workflow;
+    _ = ai.WorkflowMetrics;
+    _ = ai.trigger.Trigger;
+    _ = ai.hierarchy;
+    _ = ai.context;
+    _ = ai.AgentHandle;
+    _ = ai.bridge.OutboxWorkflowBridge;
+    // LLM-backed policies + RAG
+    _ = ai.llm.LlmPolicyCtx;
+    _ = ai.llm.llmApprove;
+    _ = ai.llm.llmDiagnose;
+    _ = ai.llm.llmRiskDecide;
+    _ = ai.llm.llmVerify;
+    // Business tools
+    _ = ai.reporter.BusinessReporter;
+    _ = ai.alerts.BusinessAlert;
+    _ = ai.ticket.TicketFlow;
+    _ = ai.refund.RefundFlow;
+    _ = ai.risk.RiskReview;
+    _ = ai.recon.ReconCheck;
+    _ = ai.approval.ApprovalFlow;
+    _ = ai.approval_api.ApprovalQueue;
+    _ = ai.approval_store.PersistentApprovalQueue;
+    _ = ai.notify.NotificationHub;
+    _ = ai.kpi.KpiMetric;
+    _ = ai.sla.SlaTracker;
+    _ = ai.diagnose.DiagnosisFlow;
+    // Skills, export, observability, audit
+    _ = ai.SkillRegistry;
+    _ = ai.business;
+    _ = ai.schedule;
+    _ = ai.skill_export.toOpenApi;
+    _ = ai.skill_export.toSkillsJson;
+    _ = ai.observability.AiMetrics;
+    _ = ai.run_audit.RunAuditStore;
+    _ = ai.freeValue;
+    _ = ai.TokenQuota;
+}

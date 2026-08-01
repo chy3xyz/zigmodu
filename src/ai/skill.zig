@@ -19,6 +19,10 @@ pub const Tool = struct {
     /// Soft per-tool budget (ms). Handlers should poll `SkillContext.expired()`.
     /// Post-return overrun also yields `error.ToolTimeout` (does not preempt).
     timeout_ms: ?u64 = null,
+    /// Required permission code (e.g. `approval:decide`). When set, dispatch
+    /// refuses with `error.PermissionDenied` unless `SkillContext.permissions`
+    /// contains it.
+    required_permission: ?[]const u8 = null,
     /// Handler: receives context + JSON value of arguments, returns JSON result.
     handler: *const fn (ctx: *SkillContext, args: std.json.Value) anyerror!std.json.Value,
 };
@@ -33,6 +37,9 @@ pub const SkillContext = struct {
     /// Optional capability pointer for builtin skills (e.g. *Cron.Scheduler
     /// for the schedule bridge). Set by the caller before dispatch.
     userdata: ?*anyopaque = null,
+    /// Permission codes granted to this context (checked against
+    /// `Tool.required_permission`).
+    permissions: []const []const u8 = &.{},
     /// Absolute deadline from `Time.monotonicNowMilliseconds()`; set by dispatch.
     deadline_ms: ?i64 = null,
 
@@ -134,6 +141,7 @@ pub const SkillRegistry = struct {
             .description = tool.description,
             .parameters = params,
             .timeout_ms = tool.timeout_ms,
+            .required_permission = tool.required_permission,
             .handler = tool.handler,
         };
         self.tools.putAssumeCapacity(key, owned);
@@ -258,6 +266,19 @@ pub const SkillRegistry = struct {
             self.mutex.unlock(self.io);
             return error.ToolNotFound;
         };
+        if (tool.required_permission) |perm| {
+            var granted = false;
+            for (ctx.permissions) |p| {
+                if (std.mem.eql(u8, p, perm)) {
+                    granted = true;
+                    break;
+                }
+            }
+            if (!granted) {
+                self.mutex.unlock(self.io);
+                return error.PermissionDenied;
+            }
+        }
         try validateArgs(tool, args);
         const handler = tool.handler;
         const budget = opts.timeout_ms orelse tool.timeout_ms;
@@ -308,6 +329,31 @@ test "SkillRegistry unknown tool" {
 
     var ctx = SkillContext{ .allocator = allocator };
     try std.testing.expectError(error.ToolNotFound, reg.dispatch("nonexistent", &ctx, .null));
+}
+
+test "SkillRegistry required_permission gates dispatch" {
+    const allocator = std.testing.allocator;
+    var reg = SkillRegistry.init(allocator, std.testing.io);
+    defer reg.deinit();
+    try reg.register(.{
+        .name = "approve",
+        .description = "approve",
+        .parameters = &.{},
+        .required_permission = "approval:decide",
+        .handler = struct {
+            fn h(_: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+                return .{ .bool = true };
+            }
+        }.h,
+    });
+
+    var no_perm = SkillContext{ .allocator = allocator };
+    try std.testing.expectError(error.PermissionDenied, reg.dispatch("approve", &no_perm, .null));
+
+    const perms = [_][]const u8{"approval:decide"};
+    var with_perm = SkillContext{ .allocator = allocator, .permissions = &perms };
+    const res = try reg.dispatch("approve", &with_perm, .null);
+    try std.testing.expectEqual(@as(bool, true), res.bool);
 }
 
 test "SkillRegistry allowlist and required args" {

@@ -7,6 +7,7 @@ const std = @import("std");
 const provider_mod = @import("provider.zig");
 const skill_mod = @import("skill.zig");
 const audit_mod = @import("audit.zig");
+const run_audit_mod = @import("run_audit.zig");
 const retriever_mod = @import("retriever.zig");
 const quota_mod = @import("quota.zig");
 const tokenizer = @import("tokenizer.zig");
@@ -103,6 +104,8 @@ pub const Agent = struct {
     hooks: AgentHooks = .{},
     metrics: AgentMetrics = .{},
     audit: ?*AgentAuditLog = null,
+    /// Optional durable run-audit store; every run writes one row (kind=agent).
+    audit_store: ?*run_audit_mod.RunAuditStore = null,
     /// Optional RAG: retrieve(goal) and prepend formatted context to the system message.
     retriever: ?Retriever = null,
     retrieve_top_k: usize = 5,
@@ -131,6 +134,7 @@ pub const Agent = struct {
         if (self.audit) |log| {
             log.record(.run_start, "", goal, skill_ctx.tenant_id orelse 0, skill_ctx.user_id orelse 0);
         }
+        const started_ms = @import("../core/Time.zig").monotonicNowMilliseconds();
 
         const tools_json = try self.registry.toOpenAiFunctionsAlloc(allocator);
         defer allocator.free(tools_json);
@@ -229,6 +233,7 @@ pub const Agent = struct {
                 if (self.audit) |log| {
                     log.record(.run_finish, "", resp.content, skill_ctx.tenant_id orelse 0, skill_ctx.user_id orelse 0);
                 }
+                try self.recordRunAudit(allocator, skill_ctx, steps + 1, started_ms, if (budget_stopped) "budget_exhausted" else if (canceled_stopped) "canceled" else "completed");
                 const answer = try allocator.dupe(u8, resp.content);
                 return .{ .answer = answer, .steps = steps + 1, .owned_answer = true, .budget_exhausted = budget_stopped, .canceled = canceled_stopped };
             }
@@ -332,8 +337,31 @@ pub const Agent = struct {
         if (self.audit) |log| {
             log.record(.run_max_steps, "", "max_steps exceeded", skill_ctx.tenant_id orelse 0, skill_ctx.user_id orelse 0);
         }
+        try self.recordRunAudit(allocator, skill_ctx, steps, started_ms, "max_steps");
         const timeout_msg = try allocator.dupe(u8, "Agent stopped: max_steps exceeded");
         return .{ .answer = timeout_msg, .steps = steps, .owned_answer = true, .budget_exhausted = budget_stopped, .canceled = canceled_stopped };
+    }
+
+    fn recordRunAudit(
+        self: *Agent,
+        allocator: std.mem.Allocator,
+        skill_ctx: *SkillContext,
+        steps: usize,
+        started_ms: i64,
+        status: []const u8,
+    ) !void {
+        const store = self.audit_store orelse return;
+        const now_ms = @import("../core/Time.zig").monotonicNowMilliseconds();
+        const run_id = try std.fmt.allocPrint(allocator, "agent-{d}", .{now_ms});
+        defer allocator.free(run_id);
+        try store.record(.{
+            .run_id = run_id,
+            .kind = .agent,
+            .status = status,
+            .tenant_id = skill_ctx.tenant_id,
+            .steps = steps,
+            .duration_ms = now_ms - started_ms,
+        });
     }
 };
 
@@ -341,6 +369,38 @@ test "AgentResult deinit frees owned answer" {
     const a = std.testing.allocator;
     var r = AgentResult{ .answer = try a.dupe(u8, "done"), .steps = 1, .owned_answer = true };
     r.deinit(a);
+}
+
+test "Agent recordRunAudit persists agent runs" {
+    const allocator = std.testing.allocator;
+    var client = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    var backend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend{ .allocator = allocator, .client = &client };
+    var store = run_audit_mod.RunAuditStore.init(allocator, &backend);
+    try store.migrate();
+
+    var agent = Agent{
+        .provider = undefined,
+        .registry = undefined,
+        .audit_store = &store,
+    };
+    var sctx = SkillContext{ .allocator = allocator, .tenant_id = 3 };
+    try agent.recordRunAudit(allocator, &sctx, 4, @import("../core/Time.zig").monotonicNowMilliseconds(), "completed");
+
+    try std.testing.expectEqual(@as(usize, 1), try store.count());
+    var entries = std.ArrayList(run_audit_mod.RunAuditEntry).empty;
+    defer {
+        for (entries.items) |e| {
+            allocator.free(e.run_id);
+            allocator.free(e.status);
+        }
+        entries.deinit(allocator);
+    }
+    try store.list(allocator, &entries, .agent, 3, 10);
+    try std.testing.expectEqual(@as(usize, 1), entries.items.len);
+    try std.testing.expectEqualStrings("completed", entries.items[0].status);
+    try std.testing.expectEqual(@as(usize, 4), entries.items[0].steps);
 }
 
 test "SkillRegistry tools json for agent" {

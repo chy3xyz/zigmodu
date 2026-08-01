@@ -21,6 +21,7 @@ pub const AuditKind = @import("audit.zig").AuditKind;
 
 pub const ScheduledTask = @import("schedule.zig").ScheduledTask;
 pub const registerScheduleSkills = @import("schedule.zig").registerScheduleSkills;
+pub const schedule = @import("schedule.zig");
 
 pub const business = @import("business.zig");
 pub const Budget = @import("budget.zig").Budget;

@@ -131,6 +131,7 @@ pub fn registerApprovalRequestSkills(registry: *SkillRegistry) !void {
     try registry.register(.{
         .name = "approval.request",
         .description = "Submit a business request through the app-registered approval chain; returns the approval run id and status (approved / pending_human / rejected)",
+        .required_permission = "approval:decide",
         .parameters = &.{
             .{ .name = "subject", .type = .string, .description = "What is being approved", .required = true },
             .{ .name = "amount", .type = .number, .description = "Amount involved", .required = true },
@@ -362,7 +363,8 @@ test "approval.request skill submits and reports the chain status" {
     var registry = SkillRegistry.init(allocator, std.testing.io);
     defer registry.deinit();
     try registerApprovalRequestSkills(&registry);
-    var sctx = SkillContext{ .allocator = allocator, .userdata = &ac };
+    const perms = [_][]const u8{"approval:decide"};
+    var sctx = SkillContext{ .allocator = allocator, .userdata = &ac, .permissions = &perms };
     var args_map = std.json.ObjectMap{};
     try putOwned(&args_map, allocator, "subject", .{ .string = try allocator.dupe(u8, "order-7") });
     try putOwned(&args_map, allocator, "amount", .{ .float = 9000 });

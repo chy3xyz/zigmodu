@@ -12,6 +12,9 @@ pub const OpenApiOpts = struct {
     version: []const u8 = "1.0.0",
     /// Path prefix applied to every operation (default: `/skills`).
     base_path: []const u8 = "/skills",
+    /// When set (e.g. "BearerAuth"), the document declares an HTTP bearer
+    /// security scheme and every operation requires it.
+    security_scheme: ?[]const u8 = null,
 };
 
 /// Compact catalog: `{"skills":[{name, description, parameters:[{name,type,description,required}]}]}`.
@@ -59,6 +62,17 @@ pub fn toOpenApi(registry: *SkillRegistry, allocator: std.mem.Allocator, opts: O
     try putString(&info, a, "title", opts.title);
     try putString(&info, a, "version", opts.version);
     try doc.put(a, try a.dupe(u8, "info"), .{ .object = info });
+
+    if (opts.security_scheme) |scheme_name| {
+        var http_scheme = std.json.ObjectMap{};
+        try putString(&http_scheme, a, "type", "http");
+        try putString(&http_scheme, a, "scheme", "bearer");
+        var schemes = std.json.ObjectMap{};
+        try schemes.put(a, try a.dupe(u8, scheme_name), .{ .object = http_scheme });
+        var components = std.json.ObjectMap{};
+        try components.put(a, try a.dupe(u8, "securitySchemes"), .{ .object = schemes });
+        try doc.put(a, try a.dupe(u8, "components"), .{ .object = components });
+    }
     var paths = std.json.ObjectMap{};
 
     var names = std.ArrayList([]const u8).empty;
@@ -105,6 +119,14 @@ pub fn toOpenApi(registry: *SkillRegistry, allocator: std.mem.Allocator, opts: O
         var responses = std.json.ObjectMap{};
         try responses.put(a, try a.dupe(u8, "200"), .{ .object = ok });
         try op.put(a, try a.dupe(u8, "responses"), .{ .object = responses });
+
+        if (opts.security_scheme) |scheme_name| {
+            var req = std.json.ObjectMap{};
+            try req.put(a, try a.dupe(u8, scheme_name), .{ .array = std.json.Array.init(a) });
+            var security = std.json.Array.init(a);
+            try security.append(.{ .object = req });
+            try op.put(a, try a.dupe(u8, "security"), .{ .array = security });
+        }
 
         var post = std.json.ObjectMap{};
         try post.put(a, try a.dupe(u8, "post"), .{ .object = op });
@@ -176,4 +198,13 @@ test "toSkillsJson and toOpenApi render a registry" {
     defer doc_parsed.deinit();
     try std.testing.expectEqualStrings("3.0.3", doc_parsed.value.object.get("openapi").?.string);
     try std.testing.expect(doc_parsed.value.object.get("paths").?.object.get("/skills/kpi.query") != null);
+
+    const secured = try toOpenApi(&registry, allocator, .{ .security_scheme = "BearerAuth" });
+    defer allocator.free(secured);
+    var secured_parsed = try std.json.parseFromSlice(std.json.Value, allocator, secured, .{});
+    defer secured_parsed.deinit();
+    const components = secured_parsed.value.object.get("components").?.object;
+    try std.testing.expect(components.get("securitySchemes").?.object.get("BearerAuth") != null);
+    const op = secured_parsed.value.object.get("paths").?.object.get("/skills/kpi.query").?.object.get("post").?.object;
+    try std.testing.expect(op.get("security") != null);
 }

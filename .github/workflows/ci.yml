@@ -84,6 +84,20 @@ jobs:
             (cd "examples/$ex" && zig build)
           done
 
+      - name: zmodu ai CLI smoke (export-skills + openapi)
+        run: |
+          set -euo pipefail
+          ./zig-out/bin/zmodu ai export-skills --out /tmp/skills.json
+          ./zig-out/bin/zmodu ai openapi --in /tmp/skills.json --out /tmp/openapi.json
+          python3 - <<'EOF'
+          import json
+          sk = json.load(open('/tmp/skills.json'))
+          assert len(sk['skills']) > 0, 'skills catalog is empty'
+          doc = json.load(open('/tmp/openapi.json'))
+          assert doc['openapi'] == '3.0.3'
+          assert len(doc['paths']) == len(sk['skills'])
+          EOF
+
       - name: Upload test logs
         if: failure()
         uses: actions/upload-artifact@v4
