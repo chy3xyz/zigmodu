@@ -61,17 +61,16 @@ fn run(init: std.process.Init) !void {
     const api_key = init.environ_map.get("LLM_API_KEY") orelse "";
     const model = init.environ_map.get("LLM_MODEL") orelse "gpt-4o-mini";
 
-    var policy_ctx: ai.llm.LlmPolicyCtx = undefined;
-    if (api_key.len == 0) {
+    var http = zigmodu.http.HttpClient.init(allocator, io, 4, 30000);
+    defer http.deinit();
+    var provider = ai.AiProvider.init(allocator, &http, endpoint, api_key, model);
+    var policy_ctx = if (api_key.len == 0) blk: {
         std.debug.print("== demo mode: no LLM_API_KEY, using fake json_fn ==\n\n", .{});
-        policy_ctx = .{ .json_fn = fakeJson };
-    } else {
+        break :blk ai.llm.LlmPolicyCtx{ .json_fn = fakeJson };
+    } else blk: {
         std.debug.print("== real mode: {s} ({s}) ==\n\n", .{ model, endpoint });
-        var http = zigmodu.http.HttpClient.init(allocator, io, 4, 30000);
-        defer http.deinit();
-        var provider = ai.AiProvider.init(allocator, &http, endpoint, api_key, model);
-        policy_ctx = .{ .provider = &provider };
-    }
+        break :blk ai.llm.LlmPolicyCtx{ .provider = &provider };
+    };
     var ctx = ai.SkillContext{ .allocator = allocator, .userdata = &policy_ctx };
 
     // 1. Approval decision.

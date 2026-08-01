@@ -56,8 +56,36 @@ pub fn llmJson(
 
     const trimmed = std.mem.trim(u8, resp.content, " \n\t");
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{});
-    errdefer parsed.deinit();
-    return parsed.value;
+    defer parsed.deinit();
+    // The parsed tree lives in an arena; deep-copy it into independent
+    // allocations so callers can release it with `freeValue`.
+    return deepCopyJson(allocator, parsed.value);
+}
+
+fn deepCopyJson(allocator: std.mem.Allocator, v: std.json.Value) !std.json.Value {
+    return switch (v) {
+        .string => |s| .{ .string = try allocator.dupe(u8, s) },
+        .array => |*arr| blk: {
+            var out = std.json.Array.init(allocator);
+            errdefer out.deinit();
+            for (arr.items) |item| try out.append(try deepCopyJson(allocator, item));
+            break :blk .{ .array = out };
+        },
+        .object => |*obj| blk: {
+            var out = std.json.ObjectMap{};
+            errdefer freeValue(allocator, .{ .object = out });
+            var it = obj.iterator();
+            while (it.next()) |e| {
+                const key = try allocator.dupe(u8, e.key_ptr.*);
+                errdefer allocator.free(key);
+                const val = try deepCopyJson(allocator, e.value_ptr.*);
+                errdefer freeValue(allocator, val);
+                try out.put(allocator, key, val);
+            }
+            break :blk .{ .object = out };
+        },
+        else => v,
+    };
 }
 
 /// Retrieve top-k chunks and render them as a "Business context:" block.
@@ -350,4 +378,55 @@ test "llmDiagnose parses summary, causes and actions" {
     try std.testing.expectEqual(@as(usize, 1), causes.items.len);
     try std.testing.expectEqualStrings("bad credentials", causes.items[0]);
     try std.testing.expectEqualStrings("rotate credentials", actions.items[0]);
+}
+
+test "llmApprove works end-to-end against a mock OpenAI endpoint" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    const server_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try server_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = server.socket.address.getPort();
+
+    const ServerCtx = struct {
+        server: *std.Io.net.Server,
+        fn run(ctx: *@This()) void {
+            const accepted = ctx.server.accept(std.testing.io) catch return;
+            defer accepted.close(std.testing.io);
+            var total: usize = 0;
+            var seen: [8192]u8 = undefined;
+            while (total < seen.len) {
+                var fds = [_]std.posix.pollfd{.{ .fd = accepted.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+                _ = std.posix.poll(&fds, 3000) catch break;
+                if (fds[0].revents == 0) break;
+                const n = std.posix.read(accepted.socket.handle, seen[total..]) catch break;
+                if (n == 0) break;
+                total += n;
+                if (std.mem.indexOf(u8, seen[0..total], "\r\n\r\n") != null) break;
+            }
+            const body = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"{\\\"decision\\\":\\\"approve\\\",\\\"note\\\":\\\"ok by mock\\\"}\"}}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":6}}";
+            var buf: [512]u8 = undefined;
+            const resp = std.fmt.bufPrint(&buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch return;
+            _ = std.posix.system.write(accepted.socket.handle, resp.ptr, resp.len);
+        }
+    };
+    var server_ctx = ServerCtx{ .server = &server };
+    const th = try std.Thread.spawn(.{}, ServerCtx.run, .{&server_ctx});
+    defer th.join();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/v1/chat/completions", .{port});
+    var http = @import("../http/HttpClient.zig").HttpClient.init(allocator, std.testing.io, 1, 5000);
+    defer http.deinit();
+    var provider = AiProvider.init(allocator, &http, url, "Bearer sk-mock", "mock-model");
+
+    // Real chain: provider.chat (HTTP) → llmJson parse → policy decision.
+    var policy_ctx = LlmPolicyCtx{ .provider = &provider };
+    var ctx = SkillContext{ .allocator = allocator, .userdata = &policy_ctx };
+    var note: []const u8 = "";
+    const decision = try llmApprove(allocator, &ctx, "order-1", 100, 0, "ops", "", &note);
+    defer if (note.len > 0) allocator.free(note);
+    try std.testing.expectEqual(approval_mod.ApprovalDecision.approved, decision);
+    try std.testing.expectEqualStrings("ok by mock", note);
 }
