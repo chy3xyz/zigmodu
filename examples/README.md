@@ -81,6 +81,21 @@ curl -H "X-Tenant-ID: 2" "http://127.0.0.1:18088/api/ai/kpi?metric=paid_revenue"
 zig build test                          # asserts isolation end-to-end
 ```
 
+## LLM-Powered Policies (`examples/llm-policies`)
+
+**Real wiring for `zigmodu.ai.llm`** — connects `AiProvider` to the built-in
+LLM policies (`llmApprove` / `llmRiskDecide` / `llmDiagnose` / `llmVerify`),
+exactly as documented in [docs/LLM_POLICIES.md](../docs/LLM_POLICIES.md):
+
+```bash
+cd examples/llm-policies
+zig build test                          # fake json_fn — no network
+LLM_ENDPOINT=... LLM_API_KEY='Bearer sk-...' LLM_MODEL=... zig build run
+```
+
+Without credentials the demo falls back to an injected fake `json_fn` and
+still exercises every policy; with credentials it calls the real model.
+
 ## ShopDemo boundary (`examples/shopdemo`)
 
 **Codegen reference only** — `schema.sql` + `generated-sample/` module output. Not a complete runnable app. Use [zmodu CLI](https://github.com/chy3xyz/zmodu) to scaffold a full 42-module project.

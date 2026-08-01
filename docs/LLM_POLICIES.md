@@ -1,0 +1,149 @@
+# LLM 策略真实接线（LLM-Powered Policies）
+
+> `zigmodu.ai.llm` 提供开箱即用的 LLM-backed 策略：审批、风控、异常归因、
+> workflow 质量门。本文是**真实接线**指南——从 `AiProvider` 初始化到把
+> 策略挂进 `ApprovalFlow` / `RiskReview` / `DiagnosisFlow` / `Workflow.reflection`，
+> 含完整代码与验证方法。配套可编译示例：[`examples/llm-policies`](../examples/llm-policies)。
+
+## 1. 前置：AiProvider
+
+所有 LLM 策略共用同一个 `AiProvider`（OpenAI 兼容 chat completions）：
+
+```zig
+const zigmodu = @import("zigmodu");
+
+// HTTP 客户端（HTTPS 走 std.http.Client；超时毫秒）
+var http = zigmodu.http.HttpClient.init(allocator, io, 4, 30000);
+defer http.deinit();
+
+// endpoint 是完整的 chat/completions URL；api_key 是 Authorization 头的完整值
+var provider = zigmodu.ai.AiProvider.init(
+    allocator,
+    &http,
+    "https://api.openai.com/v1/chat/completions", // 或 DeepSeek / vLLM / Ollama 兼容端点
+    "Bearer sk-...",                              // 环境变量注入，勿硬编码
+    "gpt-4o-mini",                                // 或 deepseek-chat 等
+);
+```
+
+生产建议：endpoint / key / model 从 `init.environ_map` 读取（见 `docs/BEST_PRACTICES.md`）。
+
+## 2. LlmPolicyCtx：策略共享配置
+
+```zig
+var policy_ctx = zigmodu.ai.llm.LlmPolicyCtx{
+    .provider = &provider,          // 真实模型
+    // .json_fn = ...               // 测试时注入 fake（不填则用 provider）
+    .system_hint = "公司审批政策：单笔>10万必须 CFO 签字。", // 附加 system 指导
+    // .retriever = ...,            // 可选 RAG（见 §5）
+    // .retrieval_query = "approval policy for large orders",
+};
+```
+
+每个策略回调都从 `SkillContext.userdata` 取 `LlmPolicyCtx`：
+
+```zig
+var ctx = zigmodu.ai.SkillContext{
+    .allocator = allocator,
+    .tenant_id = 1,          // 多租户示例会把它用于隔离
+    .userdata = &policy_ctx, // ← 关键
+};
+```
+
+## 3. 挂进各 Flow
+
+### 审批（ApprovalFlow）
+
+```zig
+var approval = zigmodu.ai.approval.ApprovalFlow.init(allocator, &backend, zigmodu.ai.llm.llmApprove);
+approval.outbox = &outbox;                       // 审计写回（可选）
+approval.on_escalated = ...;                     // 转人工入队（可选，见 AI_ORCHESTRATION.md）
+var result = try approval.submit(allocator, &ctx, "order-42", 150000, &steps);
+```
+
+模型返回 `{"decision":"approve|escalate|reject","note":"..."}`；
+**模型失败 / JSON 非法时安全回退 `escalated`**，绝不静默放行。
+
+### 风控（RiskReview）
+
+```zig
+var risk = zigmodu.ai.risk.RiskReview.init(allocator, &backend);
+risk.rules = &rules;             // SQL 规则累加风险分
+risk.decide = zigmodu.ai.llm.llmRiskDecide;  // LLM 决策
+var out = try risk.review(allocator, &ctx, "order-42");
+```
+
+### 异常归因（DiagnosisFlow）
+
+```zig
+var diag = zigmodu.ai.diagnose.DiagnosisFlow.init(allocator, &backend, zigmodu.ai.llm.llmDiagnose);
+diag.evidence_queries = &queries; // 证据 SQL → prompt
+diag.outbox = &outbox;
+var res = try diag.run(allocator, &ctx, .{ .source = "alert", .subject = "orders", .severity = .critical, .description = "..." });
+```
+
+### Workflow 质量门（Workflow.reflection）
+
+```zig
+wf.reflection = zigmodu.ai.llm.llmVerify;  // 模型判断最终输出是否达标
+wf.goal = "产出一份含退款金额的 Markdown 报告";
+wf.max_reviews = 2;                        // 不达标重跑上限
+```
+
+## 4. 验证：无模型跑通（json_fn 注入）
+
+`LlmPolicyCtx.json_fn` 让策略在**没有真实模型**时也可测（框架自带测试即用此法）：
+
+```zig
+const FakeJson = struct {
+    fn f(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!std.json.Value {
+        var obj = std.json.ObjectMap{};
+        try obj.put(a, try a.dupe(u8, "decision"), .{ .string = try a.dupe(u8, "approve") });
+        return .{ .object = obj };
+    }
+};
+var policy_ctx = zigmodu.ai.llm.LlmPolicyCtx{ .json_fn = FakeJson.f };
+var ctx = zigmodu.ai.SkillContext{ .allocator = allocator, .userdata = &policy_ctx };
+// 之后正常调 approval.submit / risk.review / diag.run —— 断言结果即可。
+```
+
+## 5. 可选：RAG 业务上下文
+
+`LlmPolicyCtx.retriever` 把 top-k 检索块注入策略 prompt（政策、历史、playbook）：
+
+```zig
+var policy_ctx = zigmodu.ai.llm.LlmPolicyCtx{
+    .provider = &provider,
+    .retriever = my_retriever,               // 实现 zigmodu.ai.retriever.Retriever 接口
+    .retrieval_query = "approval policy for large orders",
+    .top_k = 3,
+};
+// 框架自带 KeywordRetriever 可做 demo；生产接自己的向量库（应用侧）。
+```
+
+## 6. 端到端冒烟
+
+```bash
+# examples/llm-policies —— 设置真实凭据后运行
+cd examples/llm-policies
+LLM_ENDPOINT=https://api.openai.com/v1/chat/completions \
+LLM_API_KEY='Bearer sk-...' \
+LLM_MODEL=gpt-4o-mini \
+zig build run
+```
+
+程序会依次跑：审批（llmApprove）→ 风控（llmRiskDecide）→ 诊断（llmDiagnose）→
+质量门（llmVerify），打印每个策略的真实模型响应。未配置 key 时优雅降级为
+`json_fn` 演示（escalate/approve 回退），保证 `zig build test` 恒绿。
+
+## 7. 行为契约速查
+
+| 策略 | 模型返回 | 失败回退 |
+|------|----------|----------|
+| `llmApprove` | `{"decision":"approve\|escalate\|reject","note":"..."}` | `escalated` + note |
+| `llmRiskDecide` | `{"decision":"approve\|escalate\|reject"}` | `escalate` |
+| `llmDiagnose` | `{"summary","causes":[],"actions":[]}` | 返回 `error.MalformedLlmResponse` |
+| `llmVerify` | `{"pass":bool,"reason":"..."}` | `false`（触发重跑/升级） |
+
+安全原则：**拿不准就转人工，绝不静默批准**。所有策略都遵守 deadline
+（`SkillContext.checkDeadline` / `deadline_ms`），长任务不会被模型拖死。

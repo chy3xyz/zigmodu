@@ -119,7 +119,7 @@ pub fn llmDiagnose(
     defer freeValue(allocator, json);
     const obj = json.object;
 
-    out_summary.* = try allocator.dupe(u8, obj.get("summary") orelse return error.MalformedLlmResponse);
+    out_summary.* = try allocator.dupe(u8, (obj.get("summary") orelse return error.MalformedLlmResponse).string);
     const causes = (obj.get("causes") orelse return error.MalformedLlmResponse).array;
     for (causes.items) |c| try out_causes.append(allocator, try allocator.dupe(u8, c.string));
     const actions = (obj.get("actions") orelse return error.MalformedLlmResponse).array;
@@ -221,6 +221,18 @@ fn fakeJson(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: []con
     return .{ .object = obj };
 }
 
+fn diagnoseJson(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!std.json.Value {
+    var obj = std.json.ObjectMap{};
+    try putOwned(&obj, allocator, "summary", .{ .string = try allocator.dupe(u8, "gateway rejected") });
+    var causes = std.json.Array.init(allocator);
+    try causes.append(.{ .string = try allocator.dupe(u8, "bad credentials") });
+    try putOwned(&obj, allocator, "causes", .{ .array = causes });
+    var actions = std.json.Array.init(allocator);
+    try actions.append(.{ .string = try allocator.dupe(u8, "rotate credentials") });
+    try putOwned(&obj, allocator, "actions", .{ .array = actions });
+    return .{ .object = obj };
+}
+
 fn putOwned(obj: *std.json.ObjectMap, allocator: std.mem.Allocator, key: []const u8, value: std.json.Value) !void {
     try obj.put(allocator, try allocator.dupe(u8, key), value);
 }
@@ -314,4 +326,28 @@ test "llmVerify fails conservatively when the model errors" {
     var policy_ctx = LlmPolicyCtx{ .json_fn = FailJson.f };
     var ctx = SkillContext{ .allocator = allocator, .userdata = &policy_ctx };
     try std.testing.expect(!try llmVerify(&ctx, "goal", "output", allocator));
+}
+
+test "llmDiagnose parses summary, causes and actions" {
+    const allocator = std.testing.allocator;
+    var policy_ctx = LlmPolicyCtx{ .json_fn = diagnoseJson };
+    var ctx = SkillContext{ .allocator = allocator, .userdata = &policy_ctx };
+    var causes = std.ArrayList([]const u8).empty;
+    defer {
+        for (causes.items) |c| allocator.free(c);
+        causes.deinit(allocator);
+    }
+    var actions = std.ArrayList([]const u8).empty;
+    defer {
+        for (actions.items) |a| allocator.free(a);
+        actions.deinit(allocator);
+    }
+    var summary: []const u8 = "";
+    defer if (summary.len > 0) allocator.free(summary);
+    const evidence = [_]diagnose_mod.EvidenceBlock{};
+    try llmDiagnose(allocator, &ctx, .{ .source = "alert", .subject = "orders", .severity = .critical, .description = "spike" }, &evidence, &causes, &actions, &summary);
+    try std.testing.expectEqualStrings("gateway rejected", summary);
+    try std.testing.expectEqual(@as(usize, 1), causes.items.len);
+    try std.testing.expectEqualStrings("bad credentials", causes.items[0]);
+    try std.testing.expectEqualStrings("rotate credentials", actions.items[0]);
 }
