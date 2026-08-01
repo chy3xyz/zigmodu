@@ -68,6 +68,10 @@ WAL 持久化、转人工在 DAG 下同样生效；反射质量门当前应用�
     （邮件/IM/站内信回调，`userdata` + `call` 模式）、无渠道时事务性 outbox
     持久化兜底（`ai.notify`）；`registerNotifySkills` 暴露 `notification.send`
     技能桥（LLM 只提供 channel/title/body，渠道目标由应用注册并可白名单）。
+  - `zigmodu.ai.kpi.KpiMetric` + `kpi.query`——经营指标：应用注册具名指标
+    （name → SQL → value 列），`kpi.query` 技能桥让 LLM 直接回答
+    「本周营收/退款率多少」；指标定义与 SQL 语义由应用持有，LLM 只能按名查询，
+    另有程序化 `Kpi.query`。
 - **`zigmodu.ai.AgentHandle` 运行时控制**：协作式 cancel / pause / 进度计数
   （原子标志，Agent 每步边界检查）；`Agent.tracer` + `parent_span` 可选创建
   run 级 trace span（复用 DistributedTracer）；
