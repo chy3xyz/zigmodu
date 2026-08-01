@@ -22,6 +22,8 @@ pub const ScheduledTask = @import("schedule.zig").ScheduledTask;
 pub const registerScheduleSkills = @import("schedule.zig").registerScheduleSkills;
 
 pub const business = @import("business.zig");
+pub const Budget = @import("budget.zig").Budget;
+pub const workflow = @import("workflow.zig");
 
 pub const Retriever = @import("retriever.zig").Retriever;
 pub const RetrievedChunk = @import("retriever.zig").RetrievedChunk;
