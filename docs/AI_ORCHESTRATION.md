@@ -57,6 +57,12 @@ WAL 持久化、转人工在 DAG 下同样生效；反射质量门当前应用�
     key 对比（missing / extra / mismatch 三态），逐条 `on_diff` 回调 +
     outbox 汇总（`ai.recon`，CLEAN/DRIFT）+ Markdown 差异报告
     （`renderReport`）；配合 cron trigger 做定时对账。
+  - `zigmodu.ai.approval.ApprovalFlow`——多级审批链：请求按配置的步骤列表
+    逐级审批，每步由 `policy` 回调（可接 LLM/RBAC/规则引擎）决定
+    approved / escalated / rejected，首次拒绝或转人工即停；逐步 + 终态事件
+    写回事务性 outbox（`ai.approval`）作为审计与人工队列。
+    `registerApprovalSkills` 暴露 `approval.submit` 技能桥（LLM 只提供
+    subject/amount/request，审批链与策略由应用注册），默认策略为全部转人工。
 - **`zigmodu.ai.AgentHandle` 运行时控制**：协作式 cancel / pause / 进度计数
   （原子标志，Agent 每步边界检查）；`Agent.tracer` + `parent_span` 可选创建
   run 级 trace span（复用 DistributedTracer）；
