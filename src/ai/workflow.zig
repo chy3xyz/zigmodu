@@ -36,6 +36,25 @@ pub const Step = struct {
 pub const StepStatus = enum { pending, running, completed, failed };
 pub const RunStatus = enum { completed, failed, budget_exhausted };
 
+pub const EscalateReason = enum { step_failed, budget_exhausted, verification_failed };
+
+/// Verify the final output; return false to trigger a review re-run.
+pub const VerifyFn = *const fn (
+    ctx: *SkillContext,
+    goal: []const u8,
+    output: []const u8,
+    allocator: std.mem.Allocator,
+) anyerror!bool;
+
+/// Called when the workflow cannot proceed (step failure, budget exhaustion,
+/// persistent verification failure) so the app can escalate to a human.
+pub const EscalateFn = *const fn (
+    ctx: *SkillContext,
+    reason: EscalateReason,
+    step: ?[]const u8,
+    allocator: std.mem.Allocator,
+) anyerror!void;
+
 pub const StepRecord = struct {
     name: []const u8,
     status: StepStatus,
@@ -70,6 +89,13 @@ pub const Workflow = struct {
     registry: *SkillRegistry,
     budget: ?*Budget = null,
     steps: []const Step,
+    /// Reflection quality gate on the final step's output.
+    reflection: ?VerifyFn = null,
+    max_reviews: usize = 1,
+    /// Human-escalation hook for unrecoverable outcomes.
+    on_escalate: ?EscalateFn = null,
+    /// Goal/context passed to the verifier.
+    goal: []const u8 = "",
 
     pub fn init(registry: *SkillRegistry, steps: []const Step) Workflow {
         return .{ .registry = registry, .steps = steps };
@@ -86,45 +112,89 @@ pub const Workflow = struct {
         };
         errdefer result.deinit();
 
-        var budget_exhausted = false;
-        for (self.steps) |step| {
-            var attempts: usize = 0;
-            var last_err: anyerror = error.Unknown;
-            var outcome: ?StepOutcome = null;
-
-            while (attempts <= step.retry) : (attempts += 1) {
-                outcome = self.runStep(allocator, ctx, step) catch |err| {
-                    last_err = err;
-                    continue;
-                };
-                break;
-            }
-
-            if (outcome) |o| {
-                try result.steps.append(allocator, .{
-                    .name = try allocator.dupe(u8, step.name),
-                    .status = .completed,
-                    .output = o.output,
-                });
-                budget_exhausted = budget_exhausted or o.budget_exhausted;
-                if (o.budget_exhausted) {
-                    result.status = .budget_exhausted;
-                    break;
-                }
-            } else {
-                try result.steps.append(allocator, .{
-                    .name = try allocator.dupe(u8, step.name),
-                    .status = .failed,
-                    .error_message = if (last_err != error.Unknown)
-                        try allocator.dupe(u8, @errorName(last_err))
-                    else
-                        null,
-                });
+        var step_index: usize = 0;
+        while (step_index < self.steps.len) : (step_index += 1) {
+            const step = self.steps[step_index];
+            var outcome = try self.executeStep(allocator, ctx, step, &result);
+            if (outcome == null) {
+                try self.maybeEscalate(ctx, .step_failed, step.name, allocator);
                 result.status = .failed;
                 break;
             }
+            if (outcome.?.budget_exhausted) {
+                try self.maybeEscalate(ctx, .budget_exhausted, step.name, allocator);
+                result.status = .budget_exhausted;
+                break;
+            }
+
+            // Reflection quality gate on the final step.
+            if (step_index == self.steps.len - 1) {
+                if (self.reflection) |vf| {
+                    var reviews: usize = 0;
+                    var verified = try vf(ctx, self.goal, outcome.?.output, allocator);
+                    while (!verified) : (reviews += 1) {
+                        if (reviews >= self.max_reviews) {
+                            try self.maybeEscalate(ctx, .verification_failed, step.name, allocator);
+                            result.status = .failed;
+                            break;
+                        }
+                        outcome = try self.executeStep(allocator, ctx, step, &result);
+                        if (outcome == null) {
+                            try self.maybeEscalate(ctx, .step_failed, step.name, allocator);
+                            result.status = .failed;
+                            break;
+                        }
+                        verified = try vf(ctx, self.goal, outcome.?.output, allocator);
+                    }
+                    if (result.status == .failed) break;
+                }
+            }
         }
         return result;
+    }
+
+    /// Run a step with its retry budget; appends the record to `result`.
+    /// Returns null when all attempts failed (record is marked failed).
+    fn executeStep(
+        self: Workflow,
+        allocator: std.mem.Allocator,
+        ctx: *SkillContext,
+        step: Step,
+        result: *WorkflowResult,
+    ) !?StepOutcome {
+        var attempts: usize = 0;
+        var last_err: anyerror = error.Unknown;
+        while (attempts <= step.retry) : (attempts += 1) {
+            const outcome = self.runStep(allocator, ctx, step) catch |err| {
+                last_err = err;
+                continue;
+            };
+            try result.steps.append(allocator, .{
+                .name = try allocator.dupe(u8, step.name),
+                .status = .completed,
+                .output = outcome.output,
+            });
+            return outcome;
+        }
+        try result.steps.append(allocator, .{
+            .name = try allocator.dupe(u8, step.name),
+            .status = .failed,
+            .error_message = if (last_err != error.Unknown)
+                try allocator.dupe(u8, @errorName(last_err))
+            else
+                null,
+        });
+        return null;
+    }
+
+    fn maybeEscalate(
+        self: Workflow,
+        ctx: *SkillContext,
+        reason: EscalateReason,
+        step: ?[]const u8,
+        allocator: std.mem.Allocator,
+    ) !void {
+        if (self.on_escalate) |cb| try cb(ctx, reason, step, allocator);
     }
 
     fn runStep(self: Workflow, allocator: std.mem.Allocator, ctx: *SkillContext, step: Step) !StepOutcome {
@@ -239,4 +309,139 @@ test "workflow marks a failing step and stops" {
     try std.testing.expectEqual(@as(usize, 1), result.steps.items.len);
     try std.testing.expectEqual(StepStatus.failed, result.steps.items[0].status);
     try std.testing.expectEqualStrings("Boom", result.steps.items[0].error_message.?);
+}
+
+const RefState = struct {
+    verify_calls: usize = 0,
+    escalated: ?EscalateReason = null,
+};
+const RefHooks = struct {
+    fn verify(ctx: *SkillContext, goal: []const u8, output: []const u8, allocator: std.mem.Allocator) anyerror!bool {
+        _ = goal;
+        _ = output;
+        _ = allocator;
+        const st: *RefState = @ptrCast(@alignCast(ctx.userdata.?));
+        st.verify_calls += 1;
+        return st.verify_calls >= 2;
+    }
+    fn escalate(ctx: *SkillContext, reason: EscalateReason, step: ?[]const u8, allocator: std.mem.Allocator) anyerror!void {
+        _ = step;
+        _ = allocator;
+        const st: *RefState = @ptrCast(@alignCast(ctx.userdata.?));
+        st.escalated = reason;
+    }
+    fn verifyAlwaysFail(_: *SkillContext, _: []const u8, _: []const u8, _: std.mem.Allocator) anyerror!bool {
+        return false;
+    }
+};
+
+test "workflow reflection re-runs the final step until verified" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var state = RefState{};
+    const T = struct {
+        fn ping(ctx: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+            var out = std.json.ObjectMap{};
+            try out.put(ctx.allocator, try ctx.allocator.dupe(u8, "ok"), .{ .bool = true });
+            return .{ .object = out };
+        }
+    };
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    try registry.register(.{
+        .name = "ping",
+        .description = "pong",
+        .parameters = &.{},
+        .handler = T.ping,
+    });
+
+    var ctx = SkillContext{ .allocator = a, .userdata = @ptrCast(&state) };
+    const steps = [_]Step{
+        .{ .name = "plan", .kind = .{ .skill = .{ .name = "ping", .args = .{ .object = .{} } } } },
+        .{ .name = "final", .kind = .{ .skill = .{ .name = "ping", .args = .{ .object = .{} } } } },
+    };
+    var wf = Workflow.init(&registry, &steps);
+    wf.reflection = RefHooks.verify;
+    wf.max_reviews = 2;
+    wf.goal = "produce a report";
+
+    var result = try wf.run(allocator, &ctx);
+    defer result.deinit();
+
+    try std.testing.expectEqual(RunStatus.completed, result.status);
+    try std.testing.expectEqual(@as(usize, 3), result.steps.items.len); // plan + final + final(review)
+    try std.testing.expectEqual(@as(usize, 2), state.verify_calls);
+    try std.testing.expect(state.escalated == null);
+}
+
+test "workflow escalates on persistent verification failure" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var state = RefState{};
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    try registry.register(.{
+        .name = "ok",
+        .description = "succeeds",
+        .parameters = &.{},
+        .handler = struct {
+            fn ok(ctx: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+                var out = std.json.ObjectMap{};
+                try out.put(ctx.allocator, try ctx.allocator.dupe(u8, "ok"), .{ .bool = true });
+                return .{ .object = out };
+            }
+        }.ok,
+    });
+
+    var ctx = SkillContext{ .allocator = a, .userdata = @ptrCast(&state) };
+    const steps = [_]Step{.{ .name = "final", .kind = .{ .skill = .{ .name = "ok", .args = .{ .object = .{} } } } }};
+    var wf = Workflow.init(&registry, &steps);
+    wf.reflection = RefHooks.verifyAlwaysFail;
+    wf.max_reviews = 0;
+    wf.on_escalate = RefHooks.escalate;
+
+    var result = try wf.run(allocator, &ctx);
+    defer result.deinit();
+
+    try std.testing.expectEqual(RunStatus.failed, result.status);
+    try std.testing.expectEqual(EscalateReason.verification_failed, state.escalated.?);
+}
+
+test "workflow escalates when a step fails after retries" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var state = RefState{};
+    const T = struct {
+        fn boom(_: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+            return error.Boom;
+        }
+    };
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    try registry.register(.{
+        .name = "boom",
+        .description = "fails",
+        .parameters = &.{},
+        .handler = T.boom,
+    });
+
+    var ctx = SkillContext{ .allocator = a, .userdata = @ptrCast(&state) };
+    const steps = [_]Step{.{ .name = "step", .kind = .{ .skill = .{ .name = "boom", .args = .{ .object = .{} } } } }};
+    var wf = Workflow.init(&registry, &steps);
+    wf.on_escalate = RefHooks.escalate;
+
+    var result = try wf.run(allocator, &ctx);
+    defer result.deinit();
+
+    try std.testing.expectEqual(RunStatus.failed, result.status);
+    try std.testing.expectEqual(EscalateReason.step_failed, state.escalated.?);
 }
