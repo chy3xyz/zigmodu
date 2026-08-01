@@ -209,6 +209,7 @@ test "compile all source files" {
     _ = @import("ai/workflow.zig");
     _ = @import("ai/observability.zig");
     _ = @import("ai/run_audit.zig");
+    _ = @import("ai/skill_export.zig");
     _ = @import("ai/trigger.zig");
     _ = @import("ai/hierarchy.zig");
     _ = @import("ai/context.zig");

@@ -15,6 +15,7 @@ const mcp_server = @import("mcp_server.zig");
 const verify_mod = @import("verify.zig");
 const sql_diff = @import("sql_diff.zig");
 const incremental = @import("incremental.zig");
+const ai_cli = @import("ai_cli.zig");
 
 const Command = enum {
     new,
@@ -35,6 +36,7 @@ const Command = enum {
     mcp,
     verify,
     diff,
+    ai,
     help,
     version,
 };
@@ -254,6 +256,7 @@ fn runCommand(io: std.Io, allocator: std.mem.Allocator, command: Command, cmd_ar
         .mcp => try cmdMcp(io, allocator),
         .verify => try cmdVerify(io, allocator, cmd_args),
         .diff => try cmdDiff(io, allocator, cmd_args),
+        .ai => try cmdAi(io, allocator, cmd_args),
         .help => {
             if (cmd_args.len != 0) {
                 std.log.err("`zmodu help` does not accept arguments (got {d}).", .{cmd_args.len});
@@ -364,6 +367,7 @@ fn parseCommand(cmd: []const u8) ?Command {
     if (std.mem.eql(u8, cmd, "mcp")) return .mcp;
     if (std.mem.eql(u8, cmd, "verify")) return .verify;
     if (std.mem.eql(u8, cmd, "diff")) return .diff;
+    if (std.mem.eql(u8, cmd, "ai")) return .ai;
     if (std.mem.eql(u8, cmd, "help")) return .help;
     if (std.mem.eql(u8, cmd, "version")) return .version;
     if (std.mem.eql(u8, cmd, "--help")) return .help;
@@ -397,6 +401,7 @@ fn printUsage() void {
         \\  mcp            Start MCP server (for AI agent integration)
         \\  verify [dir]   Verify project compiles and has correct structure
         \\  diff <old> <new>  Compare two SQL files, show table-level changes
+        \\  ai                AI skill registry: export-skills | openapi
         \\  generate <t>   Alias: generate module|event|api|orm [...]
         \\  help            Show help
         \\  version         Show version
@@ -519,6 +524,52 @@ fn cmdUpgrade(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8
 
 fn cmdMcp(io: std.Io, allocator: std.mem.Allocator) !void {
     try mcp_server.start(io, allocator);
+}
+
+fn cmdAi(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len == 0) {
+        std.log.err("usage: zmodu ai export-skills [--out <file>] | zmodu ai openapi --in <skills.json> [--out <file>]", .{});
+        return error.CliUsage;
+    }
+    if (std.mem.eql(u8, args[0], "export-skills")) {
+        var out_path: ?[]const u8 = null;
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "--out")) {
+                if (i + 1 >= args.len) return error.CliUsage;
+                out_path = args[i + 1];
+                i += 1;
+            } else {
+                return error.CliUsage;
+            }
+        }
+        try ai_cli.exportSkills(io, allocator, out_path);
+    } else if (std.mem.eql(u8, args[0], "openapi")) {
+        var in_path: ?[]const u8 = null;
+        var out_path: ?[]const u8 = null;
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "--in")) {
+                if (i + 1 >= args.len) return error.CliUsage;
+                in_path = args[i + 1];
+                i += 1;
+            } else if (std.mem.eql(u8, args[i], "--out")) {
+                if (i + 1 >= args.len) return error.CliUsage;
+                out_path = args[i + 1];
+                i += 1;
+            } else {
+                return error.CliUsage;
+            }
+        }
+        const input = in_path orelse {
+            std.log.err("zmodu ai openapi requires --in <skills.json>", .{});
+            return error.CliUsage;
+        };
+        try ai_cli.openapi(io, allocator, input, out_path);
+    } else {
+        std.log.err("unknown zmodu ai subcommand: {s}", .{args[0]});
+        return error.CliUsage;
+    }
 }
 
 fn cmdVerify(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {

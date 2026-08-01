@@ -73,6 +73,8 @@ capability is isolated per tenant (via `X-Tenant-ID` middleware →
   (with `WorkflowMetrics`);
 - `GET  /api/ai/workflow/graph` — Mermaid graph of the step pipeline
   (including the approval gate).
+- `GET  /api/ai/skills` + `GET /api/ai/skills/openapi` — live skill catalog
+  and OpenAPI export of the registered AI skills.
 
 ```bash
 cd examples/tenant-ai && zig build run

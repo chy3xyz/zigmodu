@@ -11,6 +11,7 @@
 //!   - workflow metrics (`WorkflowMetrics`) + graph export (`toMermaid`)
 //!   - aggregated AI metrics (`AiMetrics`) at `GET /api/ai/metrics`
 //!   - durable run audit (`RunAuditStore`) at `GET /api/ai/runs`
+//!   - skill catalog + OpenAPI export at `GET /api/ai/skills[.openapi]`
 //!
 //! HTTP API (X-Tenant-ID header; defaults to tenant 1):
 //!   GET  /api/ai/kpi?metric=paid_revenue
@@ -23,6 +24,8 @@
 //!   GET  /api/ai/workflow/graph
 //!   GET  /api/ai/metrics
 //!   GET  /api/ai/runs
+//!   GET  /api/ai/skills            (JSON catalog)
+//!   GET  /api/ai/skills/openapi    (OpenAPI 3.0 doc)
 //!
 //! Run:  cd examples/tenant-ai && zig build run
 //! Test: zig build test  (asserts tenant isolation end-to-end)
@@ -122,6 +125,8 @@ fn TenantAiApi(comptime ComptimeState: type) type {
             .{ .method = .GET, .path = "workflow/graph", .handler = workflowGraph },
             .{ .method = .GET, .path = "metrics", .handler = metrics },
             .{ .method = .GET, .path = "runs", .handler = runs },
+            .{ .method = .GET, .path = "skills", .handler = skills },
+            .{ .method = .GET, .path = "skills/openapi", .handler = skillsOpenApi },
         };
 
         fn tenantOf(ctx: *http.Context) !i64 {
@@ -296,6 +301,18 @@ fn TenantAiApi(comptime ComptimeState: type) type {
             }
             try buf.appendSlice(ctx.allocator, "]}");
             try ctx.json(200, buf.items);
+        }
+
+        fn skills(ctx: *http.Context, self: *State) !void {
+            const body = try ai.skill_export.toSkillsJson(self.app.registry, ctx.allocator);
+            defer ctx.allocator.free(body);
+            try ctx.json(200, body);
+        }
+
+        fn skillsOpenApi(ctx: *http.Context, self: *State) !void {
+            const body = try ai.skill_export.toOpenApi(self.app.registry, ctx.allocator, .{});
+            defer ctx.allocator.free(body);
+            try ctx.json(200, body);
         }
     };
 }

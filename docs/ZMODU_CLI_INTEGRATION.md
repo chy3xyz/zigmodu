@@ -60,6 +60,23 @@ zmodu add --name order_item --sql ./schema.sql
 
 ---
 
+### 4. AI 技能注册表（`zmodu ai`）
+
+```bash
+# 导出内置 AI 技能目录（JSON，与 zigmodu.ai.skill_export.toSkillsJson 同构）
+zmodu ai export-skills --out skills.json
+
+# 把技能目录（内置或应用导出的）转换为 OpenAPI 3.0 文档
+zmodu ai openapi --in skills.json --out openapi.json
+```
+
+每个技能对应一个 `POST /skills/{name}` 操作，参数从注册表推导
+（`properties` + `required`）。应用侧可直接用
+`zigmodu.ai.skill_export.toSkillsJson / toOpenApi` 在运行时导出（tenant-ai
+示例暴露于 `GET /api/ai/skills` 与 `GET /api/ai/skills/openapi`）。
+
+---
+
 ## 最佳实践规范
 
 在整合使用 `zmodu` 生成代码时，必须遵守 ZigModu 生产规范：
