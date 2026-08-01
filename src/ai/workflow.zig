@@ -26,6 +26,10 @@ pub const StepKind = union(enum) {
     skill: struct { name: []const u8, args: std.json.Value },
     /// A full ReAct agent run (tools allowed).
     agent: struct { goal: []const u8, max_steps: usize },
+    /// Human-in-the-loop gate: run an approval flow for this step; the run
+    /// stops with `.pending_human` when the flow escalates (resume after the
+    /// human decides re-runs this step with the same policy).
+    approval: struct { subject: []const u8, amount: i64 },
 };
 
 pub const Step = struct {
@@ -38,7 +42,7 @@ pub const Step = struct {
 };
 
 pub const StepStatus = enum { pending, running, completed, failed };
-pub const RunStatus = enum { completed, failed, budget_exhausted };
+pub const RunStatus = enum { completed, failed, budget_exhausted, pending_human };
 
 pub const EscalateReason = enum { step_failed, budget_exhausted, verification_failed };
 
@@ -112,6 +116,7 @@ pub const WorkflowMetrics = struct {
 const StepOutcome = struct {
     output: []const u8,
     budget_exhausted: bool = false,
+    pending_human: bool = false,
 };
 
 pub const Workflow = struct {
@@ -137,6 +142,9 @@ pub const Workflow = struct {
     run_id: []const u8 = "",
     /// Optional metrics sink; updated on every run / resume when set.
     metrics: ?*WorkflowMetrics = null,
+    /// Approval flow used by `.approval` steps (required when such a step
+    /// exists).
+    approval_flow: ?*@import("approval.zig").ApprovalFlow = null,
 
     pub fn init(registry: *SkillRegistry, steps: []const Step) Workflow {
         return .{ .registry = registry, .steps = steps };
@@ -258,6 +266,10 @@ pub const Workflow = struct {
                 result.status = .budget_exhausted;
                 break;
             }
+            if (outcome.?.pending_human) {
+                result.status = .pending_human;
+                break;
+            }
 
             // Reflection quality gate on the final step.
             if (step_index == self.steps.len - 1) {
@@ -366,6 +378,9 @@ pub const Workflow = struct {
                         try self.appendFailed(result, allocator, st.step, st.index, st.last_err);
                         try self.maybeEscalate(ctx, .step_failed, st.step.name, allocator);
                         result.status = .failed;
+                    }
+                    if (st.outcome) |o| {
+                        if (o.pending_human) result.status = .pending_human;
                     }
                 }
                 for (states) |st| allocator.destroy(st);
@@ -532,6 +547,17 @@ pub const Workflow = struct {
                     .budget_exhausted = ar.budget_exhausted,
                 };
             },
+            .approval => |s| blk: {
+                const flow = self.approval_flow orelse return error.ApprovalFlowRequired;
+                const steps = [_]@import("approval.zig").ApprovalStep{.{ .name = step.name }};
+                var result = try flow.submit(allocator, ctx, s.subject, s.amount, &steps);
+                defer result.deinit(allocator);
+                switch (result.status) {
+                    .approved => break :blk .{ .output = try allocator.dupe(u8, "approved") },
+                    .rejected => return error.ApprovalRejected,
+                    .pending_human => break :blk .{ .output = try allocator.dupe(u8, "pending_human"), .pending_human = true },
+                }
+            },
         };
     }
 };
@@ -625,6 +651,48 @@ test "workflow metrics track runs, steps and escalations" {
     defer allocator.free(prom);
     try std.testing.expect(std.mem.indexOf(u8, prom, "zigmodu_ai_workflow_runs_total{workflow=\"wf\"} 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, prom, "status=\"failed\"} 1") != null);
+}
+
+test "workflow approval step gates on human decision" {
+    const allocator = std.testing.allocator;
+    var client = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    _ = try client.exec(
+        "CREATE TABLE event_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, payload TEXT, status INTEGER DEFAULT 0, retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 5, created_at INTEGER, updated_at INTEGER, error_message TEXT)",
+        &.{},
+    );
+    var backend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend{ .allocator = allocator, .client = &client };
+    const Policy = struct {
+        fn decide(_: std.mem.Allocator, _: *SkillContext, _: []const u8, amount: i64, _: usize, _: []const u8, _: []const u8, _: *[]const u8) anyerror!@import("approval.zig").ApprovalDecision {
+            return if (amount <= 1000) .approved else .escalated;
+        }
+    };
+    var flow = @import("approval.zig").ApprovalFlow.init(allocator, &backend, Policy.decide);
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    var ctx = SkillContext{ .allocator = allocator };
+
+    // Approved gate → completed.
+    const ok_steps = [_]Step{
+        .{ .name = "review", .kind = .{ .approval = .{ .subject = "order-1", .amount = 100 } } },
+    };
+    var ok_wf = Workflow.init(&registry, &ok_steps);
+    ok_wf.approval_flow = &flow;
+    var ok_result = try ok_wf.run(allocator, &ctx);
+    defer ok_result.deinit();
+    try std.testing.expectEqual(RunStatus.completed, ok_result.status);
+
+    // Escalated gate → pending_human, run stops.
+    const gate_steps = [_]Step{
+        .{ .name = "review", .kind = .{ .approval = .{ .subject = "order-2", .amount = 99999 } } },
+    };
+    var gate_wf = Workflow.init(&registry, &gate_steps);
+    gate_wf.approval_flow = &flow;
+    var gate_result = try gate_wf.run(allocator, &ctx);
+    defer gate_result.deinit();
+    try std.testing.expectEqual(RunStatus.pending_human, gate_result.status);
+    try std.testing.expectEqual(@as(usize, 1), gate_result.steps.items.len);
 }
 
 test "workflow marks a failing step and stops" {

@@ -26,6 +26,12 @@ defer result.deinit();
 特性：每步记录（status/error/output）、步骤级重试（`retry`）、失败即停并返回
 部分结果（status `.failed`）、共享预算超支即停（status `.budget_exhausted`）。
 
+**人工审批门（human-in-the-loop）**：步骤类型新增 `.approval`
+（`{ subject, amount }`），`Workflow.approval_flow` 挂上 `ApprovalFlow` 后，
+该步骤即走审批链——approved 继续执行，rejected 记步骤失败，转人工时 run
+以 `.pending_human` 停止（前序步骤已持久化）；人工在审批队列处理完毕后
+`resumeRun` 继续（审批步骤按同一策略重跑）。
+
 **线性 ↔ DAG 混合**：默认按声明顺序线性执行；给步骤加 `depends_on`（依赖的步骤
 名列表）即自动切换为 **DAG 执行**——就绪步骤（依赖全部完成）按 `max_parallel`
 并行波次执行（`std.Io.Group`），环检测返回 `error.CyclicDependency`。预算、
