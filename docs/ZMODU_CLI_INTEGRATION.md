@@ -77,6 +77,28 @@ zmodu ai openapi --in skills.json --out openapi.json
 
 ---
 
+### 5. 死代码检查（`zmodu deadcode`）
+
+```bash
+# 扫描当前项目（默认跳过 .gitignore / .git / .zig-cache / zig-out）
+zmodu deadcode
+
+# 二进制模式：main 是入口，同时报告从未被 import 的模块
+zmodu deadcode -b
+
+# CI 友好：JSON 输出 + 退出码（0 干净 / 1 有发现 / 2 扫描失败）
+zmodu deadcode -j
+```
+
+机制参考 [zdeadcode](https://github.com/chy3xyz/zdeadcode)（rustc `dead_code`
+lint 风格的可达性分析）：报告未使用的顶层 `fn`/`const`/`var`、容器字段、
+枚举变体、方法、嵌套类型与从未 import 的模块；roots 为 `pub` 声明、
+`export` 符号、`test` 块、`@export` 目标与（二进制模式）`main`。Zig 编译器
+本身不报告这些（例如结构体未用字段、枚举未用变体），本项目仓库扫描即发现
+约 9% 潜在死声明，可作为 CI 门禁。完整参数见 `zmodu deadcode --help`。
+
+---
+
 ## 最佳实践规范
 
 在整合使用 `zmodu` 生成代码时，必须遵守 ZigModu 生产规范：

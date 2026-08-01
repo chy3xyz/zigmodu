@@ -16,6 +16,7 @@ const verify_mod = @import("verify.zig");
 const sql_diff = @import("sql_diff.zig");
 const incremental = @import("incremental.zig");
 const ai_cli = @import("ai_cli.zig");
+const deadcode = @import("deadcode.zig");
 
 const Command = enum {
     new,
@@ -37,6 +38,7 @@ const Command = enum {
     verify,
     diff,
     ai,
+    deadcode,
     help,
     version,
 };
@@ -257,6 +259,7 @@ fn runCommand(io: std.Io, allocator: std.mem.Allocator, command: Command, cmd_ar
         .verify => try cmdVerify(io, allocator, cmd_args),
         .diff => try cmdDiff(io, allocator, cmd_args),
         .ai => try cmdAi(io, allocator, cmd_args),
+        .deadcode => cmdDeadcode(io, allocator, cmd_args),
         .help => {
             if (cmd_args.len != 0) {
                 std.log.err("`zmodu help` does not accept arguments (got {d}).", .{cmd_args.len});
@@ -368,6 +371,7 @@ fn parseCommand(cmd: []const u8) ?Command {
     if (std.mem.eql(u8, cmd, "verify")) return .verify;
     if (std.mem.eql(u8, cmd, "diff")) return .diff;
     if (std.mem.eql(u8, cmd, "ai")) return .ai;
+    if (std.mem.eql(u8, cmd, "deadcode")) return .deadcode;
     if (std.mem.eql(u8, cmd, "help")) return .help;
     if (std.mem.eql(u8, cmd, "version")) return .version;
     if (std.mem.eql(u8, cmd, "--help")) return .help;
@@ -402,6 +406,7 @@ fn printUsage() void {
         \\  verify [dir]   Verify project compiles and has correct structure
         \\  diff <old> <new>  Compare two SQL files, show table-level changes
         \\  ai                AI skill registry: export-skills | openapi
+        \\  deadcode          Scan for unused declarations (dead code)
         \\  generate <t>   Alias: generate module|event|api|orm [...]
         \\  help            Show help
         \\  version         Show version
@@ -570,6 +575,11 @@ fn cmdAi(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !vo
         std.log.err("unknown zmodu ai subcommand: {s}", .{args[0]});
         return error.CliUsage;
     }
+}
+
+fn cmdDeadcode(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) void {
+    const code = deadcode.run(io, allocator, args);
+    if (code != 0) std.process.exit(code);
 }
 
 fn cmdVerify(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {

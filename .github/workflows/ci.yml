@@ -98,6 +98,23 @@ jobs:
           assert len(doc['paths']) == len(sk['skills'])
           EOF
 
+      - name: zmodu deadcode CLI smoke
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/dc_fixture
+          cat > /tmp/dc_fixture/main.zig <<'ZIG'
+          fn unused_fn() void {}
+          pub fn main() void {}
+          ZIG
+          set +e
+          out=$(./zig-out/bin/zmodu deadcode -b /tmp/dc_fixture/main.zig)
+          code=$?
+          set -e
+          [ "$code" -eq 1 ] || { echo "expected exit 1, got $code"; exit 1; }
+          echo "$out" | grep -q "unused_fn" || { echo "missing unused_fn in output"; exit 1; }
+          ./zig-out/bin/zmodu deadcode -j /tmp/dc_fixture/main.zig > /tmp/dc.json || true
+          python3 -c "import json; d=json.load(open('/tmp/dc.json')); assert len(d['dead_declarations']) >= 1"
+
       - name: Upload test logs
         if: failure()
         uses: actions/upload-artifact@v4
