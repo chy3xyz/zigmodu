@@ -110,6 +110,29 @@ WAL 持久化、转人工在 DAG 下同样生效；反射质量门当前应用�
 `ai.alert`）的 outbox 回写都可被它消费，配合 `ai.trigger` 即可形成
 「业务事件 → outbox → 消费者/人工队列」的完整闭环。
 
+### 事件驱动编排（outbox → workflow）
+
+`zigmodu.ai.bridge.OutboxWorkflowBridge` 把 outbox 条目按 topic（精确或前缀）
+路由进 `ai.trigger` 的 `fire(input)`（run_fn 通常驱动 `Workflow`）——cron、
+进程内 fire、outbox 事件三种触发源至此统一；运行结果再经 trigger 自身的 outbox
+回写闭环。
+
+### 人工审批队列（HTTP）
+
+`zigmodu.ai.approval_api` 提供内存审批队列：`ApprovalFlow.on_escalated` 挂上
+`queuedEscalation` 后，转人工的运行自动入队；`ApprovalApi` ComptimeRouter 模块
+暴露 `GET /approvals/pending`、`POST /approvals/{id}/approve`、
+`POST /approvals/{id}/reject`（后两者 `permission = approval:decide`）。
+队列为应用持有的小存储，需要跨重启时配对 outbox consumer/数据库。
+
+### LLM 默认策略（开箱即用）
+
+`zigmodu.ai.llm` 提供 LLM-backed 策略回调：`llmDiagnose`（异常归因：
+summary/causes/actions）、`llmApprove`（审批：approve/escalate/reject +
+note）、`llmRiskDecide`（风控决策）。把 `SkillContext.userdata` 指向
+`LlmPolicyCtx{ .provider, .json_fn, .system_hint }` 即可直接挂到对应 Flow；
+模型失败或返回非法 JSON 时**安全回退到 escalate**，绝不静默放行。
+
 ## 边界（不做）
 
 无界自主循环（每轮有限步骤 + 预算 + 可中止）；不新增 shell/MCP 能力。

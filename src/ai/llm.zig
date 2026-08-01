@@ -1,0 +1,192 @@
+//! LLM-backed default policies ("开箱即用"): wire `DiagnosisFlow` /
+//! `ApprovalFlow` / `RiskReview` to an `AiProvider` with these built-in
+//! callbacks instead of writing your own. Each policy prompts the model for
+//! a small JSON object and parses it; failures fall back to a safe default
+//! (escalate / escalate) so a flaky model never silently approves.
+
+const std = @import("std");
+const provider_mod = @import("provider.zig");
+const SkillContext = @import("skill.zig").SkillContext;
+const freeValue = @import("skill.zig").freeValue;
+const diagnose_mod = @import("diagnose.zig");
+const approval_mod = @import("approval.zig");
+const risk_mod = @import("risk.zig");
+
+pub const AiProvider = provider_mod.AiProvider;
+
+/// JSON round-trip used by the policies (real provider or test fake).
+pub const LlmJsonFn = *const fn (
+    userdata: *anyopaque,
+    allocator: std.mem.Allocator,
+    system: []const u8,
+    user: []const u8,
+) anyerror!std.json.Value;
+
+/// Shared capability bundle for the LLM-backed policies. `userdata` of the
+/// `SkillContext` passed to the flow must point to this value.
+pub const LlmPolicyCtx = struct {
+    provider: ?*AiProvider = null,
+    json_fn: LlmJsonFn = llmJson,
+    /// Optional extra system-prompt guidance (e.g. company policy).
+    system_hint: []const u8 = "",
+};
+
+/// Default implementation: chat with the provider and parse its JSON reply.
+pub fn llmJson(
+    userdata: *anyopaque,
+    allocator: std.mem.Allocator,
+    system: []const u8,
+    user: []const u8,
+) anyerror!std.json.Value {
+    const pc: *LlmPolicyCtx = @ptrCast(@alignCast(userdata));
+    const provider = pc.provider orelse return error.LlmNotConfigured;
+
+    const messages = [_]provider_mod.AiProvider.ChatMsg{
+        .{ .role = "system", .content = system },
+        .{ .role = "user", .content = user },
+    };
+    var resp = try provider.chat(&messages);
+    defer provider.freeResponse(&resp);
+
+    const trimmed = std.mem.trim(u8, resp.content, " \n\t");
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{});
+    errdefer parsed.deinit();
+    return parsed.value;
+}
+
+/// Diagnosis policy: asks the model for `{"summary","causes":[],"actions":[]}`
+/// and fills the flow's out-arrays (strings owned by the flow).
+pub fn llmDiagnose(
+    allocator: std.mem.Allocator,
+    ctx: *SkillContext,
+    case: diagnose_mod.AnomalyCase,
+    evidence: []const diagnose_mod.EvidenceBlock,
+    out_causes: *std.ArrayList([]const u8),
+    out_actions: *std.ArrayList([]const u8),
+    out_summary: *[]const u8,
+) anyerror!void {
+    const pc: *LlmPolicyCtx = @ptrCast(@alignCast(ctx.userdata orelse return error.LlmNotConfigured));
+
+    var evidence_buf = std.ArrayList(u8).empty;
+    defer evidence_buf.deinit(allocator);
+    for (evidence) |e| {
+        try evidence_buf.appendSlice(allocator, e.name);
+        try evidence_buf.appendSlice(allocator, ":\n");
+        try evidence_buf.appendSlice(allocator, e.markdown);
+        try evidence_buf.appendSlice(allocator, "\n");
+    }
+
+    const user = try std.fmt.allocPrint(
+        allocator,
+        "Anomaly: source={s} subject={s} severity={s} description={s}\n\nEvidence:\n{s}\nRespond with JSON only: {{\"summary\":\"...\",\"causes\":[\"...\"],\"actions\":[\"...\"]}}",
+        .{ case.source, case.subject, @tagName(case.severity), case.description, evidence_buf.items },
+    );
+    defer allocator.free(user);
+
+    const json = try pc.json_fn(pc, allocator, "You are a senior SRE diagnosing business anomalies. Output only JSON.", user);
+    defer freeValue(allocator, json);
+    const obj = json.object;
+
+    out_summary.* = try allocator.dupe(u8, obj.get("summary") orelse return error.MalformedLlmResponse);
+    const causes = (obj.get("causes") orelse return error.MalformedLlmResponse).array;
+    for (causes.items) |c| try out_causes.append(allocator, try allocator.dupe(u8, c.string));
+    const actions = (obj.get("actions") orelse return error.MalformedLlmResponse).array;
+    for (actions.items) |a| try out_actions.append(allocator, try allocator.dupe(u8, a.string));
+}
+
+/// Approval policy: asks the model for `{"decision":"approve|escalate|reject",
+/// "note":"..."}`. Malformed or unknown decisions fall back to `escalated`.
+pub fn llmApprove(
+    allocator: std.mem.Allocator,
+    ctx: *SkillContext,
+    subject: []const u8,
+    amount: i64,
+    step_index: usize,
+    step_name: []const u8,
+    context_block: []const u8,
+    out_note: *[]const u8,
+) anyerror!approval_mod.ApprovalDecision {
+    const pc: *LlmPolicyCtx = @ptrCast(@alignCast(ctx.userdata orelse return error.LlmNotConfigured));
+    const user = try std.fmt.allocPrint(
+        allocator,
+        "Approval request: subject={s} amount={d} step={d}:{s}\nContext:\n{s}\nRespond with JSON only: {{\"decision\":\"approve|escalate|reject\",\"note\":\"...\"}}",
+        .{ subject, amount, step_index, step_name, context_block },
+    );
+    defer allocator.free(user);
+
+    const json = pc.json_fn(pc, allocator, "You are an approval officer. Output only JSON.", user) catch {
+        out_note.* = try allocator.dupe(u8, "LLM unavailable; escalated for human review");
+        return .escalated;
+    };
+    defer freeValue(allocator, json);
+    const obj = json.object;
+    const decision = (obj.get("decision") orelse return .escalated).string;
+    if (obj.get("note")) |n| out_note.* = try allocator.dupe(u8, n.string);
+
+    if (std.mem.eql(u8, decision, "approve")) return .approved;
+    if (std.mem.eql(u8, decision, "reject")) return .rejected;
+    return .escalated;
+}
+
+/// Risk decision policy: asks the model whether to approve / escalate / reject
+/// given the risk score and level. Malformed responses fall back to `escalate`.
+pub fn llmRiskDecide(
+    allocator: std.mem.Allocator,
+    ctx: *SkillContext,
+    subject: []const u8,
+    score: i32,
+    level: risk_mod.RiskLevel,
+) anyerror!risk_mod.RiskDecision {
+    const pc: *LlmPolicyCtx = @ptrCast(@alignCast(ctx.userdata orelse return error.LlmNotConfigured));
+    const user = try std.fmt.allocPrint(
+        allocator,
+        "Risk review: subject={s} score={d} level={s}\nRespond with JSON only: {{\"decision\":\"approve|escalate|reject\"}}",
+        .{ subject, score, @tagName(level) },
+    );
+    defer allocator.free(user);
+
+    const json = pc.json_fn(pc, allocator, "You are a risk officer. Output only JSON.", user) catch return .escalate;
+    defer freeValue(allocator, json);
+    const decision = (json.object.get("decision") orelse return .escalate).string;
+    if (std.mem.eql(u8, decision, "approve")) return .approve;
+    if (std.mem.eql(u8, decision, "reject")) return .reject;
+    return .escalate;
+}
+
+fn fakeJson(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!std.json.Value {
+    var obj = std.json.ObjectMap{};
+    try putOwned(&obj, allocator, "decision", .{ .string = try allocator.dupe(u8, "approve") });
+    try putOwned(&obj, allocator, "note", .{ .string = try allocator.dupe(u8, "ok by policy") });
+    return .{ .object = obj };
+}
+
+fn putOwned(obj: *std.json.ObjectMap, allocator: std.mem.Allocator, key: []const u8, value: std.json.Value) !void {
+    try obj.put(allocator, try allocator.dupe(u8, key), value);
+}
+
+test "llmApprove approves with a canned model response" {
+    const allocator = std.testing.allocator;
+    var policy_ctx = LlmPolicyCtx{ .json_fn = fakeJson };
+    var ctx = SkillContext{ .allocator = allocator, .userdata = &policy_ctx };
+    var note: []const u8 = "";
+    const decision = try llmApprove(allocator, &ctx, "order-1", 9000, 0, "finance", "context", &note);
+    try std.testing.expectEqual(approval_mod.ApprovalDecision.approved, decision);
+    try std.testing.expectEqualStrings("ok by policy", note);
+    allocator.free(note);
+}
+
+test "llmApprove falls back to escalate when the model fails" {
+    const allocator = std.testing.allocator;
+    const FailJson = struct {
+        fn f(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!std.json.Value {
+            return error.ProviderUnreachable;
+        }
+    };
+    var policy_ctx = LlmPolicyCtx{ .json_fn = FailJson.f };
+    var ctx = SkillContext{ .allocator = allocator, .userdata = &policy_ctx };
+    var note: []const u8 = "";
+    const decision = try llmApprove(allocator, &ctx, "order-1", 9000, 0, "finance", "", &note);
+    try std.testing.expectEqual(approval_mod.ApprovalDecision.escalated, decision);
+    try std.testing.expect(std.mem.indexOf(u8, note, "escalated") != null);
+    allocator.free(note);
+}

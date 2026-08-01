@@ -70,10 +70,26 @@ pub const ApprovalResult = struct {
     }
 };
 
+/// Signature for the human-escalation hook on `ApprovalFlow`.
+pub const EscalatedFn = *const fn (
+    userdata: *anyopaque,
+    allocator: std.mem.Allocator,
+    ctx: *SkillContext,
+    subject: []const u8,
+    amount: i64,
+    step_name: []const u8,
+    note: []const u8,
+) anyerror!void;
+
 pub const ApprovalFlow = struct {
     allocator: std.mem.Allocator,
     backend: *SqlxBackend,
     policy: DecidePolicyFn,
+    /// Optional hook fired when a step escalates to a human (e.g. push the
+    /// run into a human approval queue). Strings are call-scoped; the hook
+    /// must copy anything it keeps.
+    on_escalated: ?EscalatedFn = null,
+    escalated_userdata: *anyopaque = undefined,
     outbox: ?*OutboxPublisher = null,
     outbox_topic: []const u8 = "ai.approval",
     /// Optional reporter queries rendered as context for the policy callback.
@@ -128,6 +144,7 @@ pub const ApprovalFlow = struct {
                 break;
             }
             if (decision == .escalated) {
+                if (self.on_escalated) |cb| try cb(self.escalated_userdata, allocator, ctx, subject, amount, step.name, note);
                 status = .pending_human;
                 break;
             }

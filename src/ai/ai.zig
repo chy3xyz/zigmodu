@@ -35,10 +35,13 @@ pub const refund = @import("refund.zig");
 pub const risk = @import("risk.zig");
 pub const recon = @import("recon.zig");
 pub const approval = @import("approval.zig");
+pub const approval_api = @import("approval_api.zig");
+pub const llm = @import("llm.zig");
 pub const notify = @import("notify.zig");
 pub const kpi = @import("kpi.zig");
 pub const sla = @import("sla.zig");
 pub const diagnose = @import("diagnose.zig");
+pub const bridge = @import("bridge.zig");
 
 pub const Retriever = @import("retriever.zig").Retriever;
 pub const RetrievedChunk = @import("retriever.zig").RetrievedChunk;
