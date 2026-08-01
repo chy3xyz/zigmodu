@@ -34,6 +34,24 @@ cd examples/zent-modulith && HTTP_PORT=18100 zig build run
 curl http://127.0.0.1:18100/health/live
 ```
 
+## AI operations pipeline (`examples/ai-ops`)
+
+**Built-in AI business tools end-to-end** — chains detect → diagnose → approve
+→ notify → audit in one runnable flow:
+
+1. **detect** — `BusinessAlert` SQL rule finds failed orders;
+2. **diagnose** — `DiagnosisFlow` gathers evidence and names likely causes;
+3. **approve** — `ApprovalFlow` auto-approves small refunds, escalates large ones;
+4. **notify** — `NotificationHub` delivers a summary to a sink + outbox;
+5. **audit** — `OutboxConsumer` polls and dispatches every written event.
+
+```bash
+cd examples/ai-ops && zig build run     # prints the pipeline trace
+zig build test                          # asserts every stage
+```
+
+Covered in [docs/AI_ORCHESTRATION.md](../docs/AI_ORCHESTRATION.md).
+
 ## ShopDemo boundary (`examples/shopdemo`)
 
 **Codegen reference only** — `schema.sql` + `generated-sample/` module output. Not a complete runnable app. Use [zmodu CLI](https://github.com/chy3xyz/zmodu) to scaffold a full 42-module project.

@@ -1,0 +1,10 @@
+.{
+    .name = .ai_ops_example,
+    .version = "0.1.0",
+    .fingerprint = 0x842dbfaee7af955e,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .zigmodu = .{ .path = "../.." },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
