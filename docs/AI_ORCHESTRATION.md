@@ -34,13 +34,15 @@ defer result.deinit();
 
 ### 后续（P1）
 
-- **`AgentTrigger` 触发编排**：cron（Scheduler 已桥接）/ EventBus 事件 /
-  Webhook → run → 结果回写 outbox；
 - **子 Agent / 分层编排**：planner 拆任务 → executor 并行（复用 `Io.Group`
   并发模型）→ 聚合，失败隔离；
 
 ### 已落地（本轮）
 
+- **`zigmodu.ai.trigger` 触发编排**：`fire(input)`（事件/Webhook 源直接调用）+
+  `registerCron(scheduler, name, expr, input)`（定时源，上下文由 Trigger 持有）+
+  可选 outbox 回写（`outbox` + `backend` 配置后每次 run 追加
+  `{run_id, ok, message}` 到事务性 outbox）；
 - **WAL 持久化 + `resumeRun(run_id)`**：每步完成后写入 WAL（`Workflow.wal` +
   `run_id`），崩溃后从最后已持久化步骤续跑（回放已完成步骤 → 继续剩余）；
 - **反射质量门**：`Workflow.reflection`（`VerifyFn`）+ `max_reviews`——最终步骤
