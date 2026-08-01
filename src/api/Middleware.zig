@@ -573,6 +573,91 @@ pub fn csrf() api.Middleware {
     };
 }
 
+/// Security response header pair.
+pub const SecurityHeader = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+/// Production-grade default security headers (HSTS, frame/type protections,
+/// CSP, referrer policy).
+pub const defaultSecurityHeaders = [_]SecurityHeader{
+    .{ .name = "Strict-Transport-Security", .value = "max-age=31536000; includeSubDomains" },
+    .{ .name = "X-Frame-Options", .value = "DENY" },
+    .{ .name = "X-Content-Type-Options", .value = "nosniff" },
+    .{ .name = "Referrer-Policy", .value = "strict-origin-when-cross-origin" },
+    .{ .name = "X-Permitted-Cross-Domain-Policies", .value = "none" },
+    .{ .name = "X-Download-Options", .value = "noopen" },
+    .{ .name = "X-DNS-Prefetch-Control", .value = "off" },
+};
+
+/// Injects security response headers on every response. `null` uses the
+/// built-in defaults; pass a custom slice for a tailored policy.
+pub fn securityHeaders(headers: ?[]const SecurityHeader) api.Middleware {
+    const S = struct {
+        var stored: []const SecurityHeader = &.{};
+        fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
+            const hdrs: []const SecurityHeader = if (stored.len > 0) stored else &defaultSecurityHeaders;
+            for (hdrs) |h| {
+                try ctx.setHeader(h.name, h.value);
+            }
+            try next(ctx);
+        }
+    };
+    S.stored = if (headers) |h| h else &.{};
+    return .{ .func = S.mw };
+}
+
+test "csrf rejects state-changing requests without a matching token" {
+    const allocator = std.testing.allocator;
+    const mw = csrf();
+    var ctx = try api.Context.init(allocator, .POST, "/api/orders");
+    defer ctx.deinit();
+    try ctx.headers.put(try allocator.dupe(u8, "cookie"), try allocator.dupe(u8, "csrf_token=abc"));
+    try mw.func(&ctx, struct {
+        fn h(_: *api.Context) anyerror!void {}
+    }.h, null);
+    try std.testing.expectEqual(@as(u16, 403), ctx.status_code);
+    try std.testing.expect(ctx.responded);
+}
+
+test "csrf allows matching double-submit tokens" {
+    const allocator = std.testing.allocator;
+    const mw = csrf();
+    var ctx = try api.Context.init(allocator, .POST, "/api/orders");
+    defer ctx.deinit();
+    try ctx.headers.put(try allocator.dupe(u8, "cookie"), try allocator.dupe(u8, "csrf_token=tok123"));
+    try ctx.headers.put(try allocator.dupe(u8, "x-csrf-token"), try allocator.dupe(u8, "tok123"));
+    const State = struct {
+        var reached = false;
+    };
+    try mw.func(&ctx, struct {
+        fn h(_: *api.Context) anyerror!void {
+            State.reached = true;
+        }
+    }.h, null);
+    try std.testing.expect(State.reached);
+    try std.testing.expectEqual(@as(u16, 200), ctx.status_code);
+}
+
+test "securityHeaders injects defaults and calls through" {
+    const allocator = std.testing.allocator;
+    const mw = securityHeaders(null);
+    var ctx = try api.Context.init(allocator, .GET, "/");
+    defer ctx.deinit();
+    const State = struct {
+        var reached = false;
+    };
+    try mw.func(&ctx, struct {
+        fn h(_: *api.Context) anyerror!void {
+            State.reached = true;
+        }
+    }.h, mw.user_data);
+    try std.testing.expect(State.reached);
+    try std.testing.expect(ctx.response_headers.get("Strict-Transport-Security") != null);
+    try std.testing.expect(ctx.response_headers.get("X-Frame-Options") != null);
+}
+
 test "cors middleware sets headers" {
     const allocator = std.testing.allocator;
     var ctx = try api.Context.init(allocator, .GET, "/test");

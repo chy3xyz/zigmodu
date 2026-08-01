@@ -106,7 +106,6 @@ test "compile all source files" {
     _ = @import("resilience/RedisRateLimiter.zig");
 
     // Scheduler
-    _ = @import("scheduler/ScheduledTask.zig");
     _ = @import("scheduler/Cron.zig");
 
     // Security

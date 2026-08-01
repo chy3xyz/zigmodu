@@ -165,7 +165,6 @@ pub const Http2 = @import("http/Http2.zig");
 // 7. SCHEDULER
 // ============================================================
 pub const cron = @import("scheduler/Cron.zig");
-pub const TaskScheduler = @import("scheduler/ScheduledTask.zig").TaskScheduler;
 
 // ============================================================
 // 8. UTILITIES

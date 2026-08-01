@@ -154,6 +154,38 @@ pub const HealthEndpoint = struct {
     }
 };
 
+test "HealthEndpoint aggregates UP/DOWN checks and renders JSON" {
+    const allocator = std.testing.allocator;
+    var endpoint = HealthEndpoint.init(allocator);
+    defer endpoint.deinit();
+
+    try endpoint.registerCheck("db", "database reachable", struct {
+        fn check(_: ?*anyopaque) HealthEndpoint.HealthStatus {
+            return .UP;
+        }
+    }.check);
+    try endpoint.registerCheck("cache", "cache reachable", struct {
+        fn check(_: ?*anyopaque) HealthEndpoint.HealthStatus {
+            return .DOWN;
+        }
+    }.check);
+
+    var details = endpoint.checkHealth();
+    defer {
+        // Keys are borrowed from the endpoint's check registry (freed by
+        // `endpoint.deinit`); only the map itself is owned here.
+        details.components.deinit();
+    }
+    try std.testing.expectEqual(HealthEndpoint.HealthStatus.DOWN, details.status);
+    try std.testing.expect(details.components.get("db") != null);
+    try std.testing.expect(details.components.get("cache") != null);
+
+    const json = try endpoint.toJson(allocator);
+    defer allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "DOWN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "database reachable") != null);
+}
+
 /// Liveness probe — always UP while process is running.
 pub const LivenessProbe = struct {
     pub fn check(_: ?*anyopaque) HealthEndpoint.HealthStatus {
