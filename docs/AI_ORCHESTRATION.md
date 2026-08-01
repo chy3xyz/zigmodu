@@ -25,6 +25,8 @@ defer result.deinit();
 
 特性：每步记录（status/error/output）、步骤级重试（`retry`）、失败即停并返回
 部分结果（status `.failed`）、共享预算超支即停（status `.budget_exhausted`）。
+`Workflow.toMermaid` 把步骤渲染为 Mermaid `flowchart`（线性用隐式顺序边，
+DAG 用依赖边，节点标注 kind），便于把编排结构直接嵌入文档/看板。
 
 **人工审批门（human-in-the-loop）**：步骤类型新增 `.approval`
 （`{ subject, amount }`），`Workflow.approval_flow` 挂上 `ApprovalFlow` 后，

@@ -150,6 +150,38 @@ pub const Workflow = struct {
         return .{ .registry = registry, .steps = steps };
     }
 
+    /// Render the workflow as a Mermaid `flowchart TD` graph (nodes annotated
+    /// with their step kind; dependency edges for DAG steps, implicit order
+    /// edges for linear steps). Caller owns the string.
+    pub fn toMermaid(self: Workflow, allocator: std.mem.Allocator) ![]const u8 {
+        var buf = std.ArrayList(u8).empty;
+        errdefer buf.deinit(allocator);
+        try buf.appendSlice(allocator, "flowchart TD\n");
+        for (self.steps) |step| {
+            const kind = switch (step.kind) {
+                .llm => "llm",
+                .skill => "skill",
+                .agent => "agent",
+                .approval => "approval",
+            };
+            try buf.print(allocator, "  {s}[\"{s} ({s})\"]\n", .{ step.name, step.name, kind });
+        }
+        if (self.hasDeps()) {
+            for (self.steps) |step| {
+                for (step.depends_on) |dep| {
+                    try buf.print(allocator, "  {s} --> {s}\n", .{ dep, step.name });
+                }
+            }
+        } else {
+            var prev: ?[]const u8 = null;
+            for (self.steps) |step| {
+                if (prev) |p| try buf.print(allocator, "  {s} --> {s}\n", .{ p, step.name });
+                prev = step.name;
+            }
+        }
+        return buf.toOwnedSlice(allocator);
+    }
+
     /// Execute all steps sequentially. Returns a partial result on step
     /// failure (status `.failed`) instead of erroring, so callers can inspect
     /// which steps completed.
@@ -651,6 +683,39 @@ test "workflow metrics track runs, steps and escalations" {
     defer allocator.free(prom);
     try std.testing.expect(std.mem.indexOf(u8, prom, "zigmodu_ai_workflow_runs_total{workflow=\"wf\"} 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, prom, "status=\"failed\"} 1") != null);
+}
+
+test "workflow toMermaid renders linear and DAG graphs" {
+    const allocator = std.testing.allocator;
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+
+    const linear = [_]Step{
+        .{ .name = "a", .kind = .{ .skill = .{ .name = "ping", .args = .{ .object = .{} } } } },
+        .{ .name = "b", .kind = .{ .approval = .{ .subject = "x", .amount = 1 } } },
+        .{ .name = "c", .kind = .{ .skill = .{ .name = "ping", .args = .{ .object = .{} } } } },
+    };
+    var lwf = Workflow.init(&registry, &linear);
+    const l = try lwf.toMermaid(allocator);
+    defer allocator.free(l);
+    try std.testing.expect(std.mem.indexOf(u8, l, "flowchart TD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, l, "b[\"b (approval)\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, l, "a --> b") != null);
+    try std.testing.expect(std.mem.indexOf(u8, l, "b --> c") != null);
+
+    const dag = [_]Step{
+        .{ .name = "start", .kind = .{ .skill = .{ .name = "ping", .args = .{ .object = .{} } } } },
+        .{ .name = "left", .kind = .{ .skill = .{ .name = "ping", .args = .{ .object = .{} } } }, .depends_on = &.{"start"} },
+        .{ .name = "right", .kind = .{ .skill = .{ .name = "ping", .args = .{ .object = .{} } } }, .depends_on = &.{"start"} },
+        .{ .name = "join", .kind = .{ .skill = .{ .name = "ping", .args = .{ .object = .{} } } }, .depends_on = &.{ "left", "right" } },
+    };
+    var dwf = Workflow.init(&registry, &dag);
+    const d = try dwf.toMermaid(allocator);
+    defer allocator.free(d);
+    try std.testing.expect(std.mem.indexOf(u8, d, "start --> left") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "left --> join") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "right --> join") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "start --> left") != null);
 }
 
 test "workflow approval step gates on human decision" {
