@@ -35,6 +35,7 @@ pub const refund = @import("refund.zig");
 pub const risk = @import("risk.zig");
 pub const recon = @import("recon.zig");
 pub const approval = @import("approval.zig");
+pub const notify = @import("notify.zig");
 
 pub const Retriever = @import("retriever.zig").Retriever;
 pub const RetrievedChunk = @import("retriever.zig").RetrievedChunk;

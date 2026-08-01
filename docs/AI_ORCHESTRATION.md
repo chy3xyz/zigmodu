@@ -63,6 +63,11 @@ WAL 持久化、转人工在 DAG 下同样生效；反射质量门当前应用�
     写回事务性 outbox（`ai.approval`）作为审计与人工队列。
     `registerApprovalSkills` 暴露 `approval.submit` 技能桥（LLM 只提供
     subject/amount/request，审批链与策略由应用注册），默认策略为全部转人工。
+  - `zigmodu.ai.notify.NotificationHub`——通知分发：消息投递到具名渠道——
+    webhook（走 `HttpClient`，HTTP 2xx 才算送达）、自定义 sink
+    （邮件/IM/站内信回调，`userdata` + `call` 模式）、无渠道时事务性 outbox
+    持久化兜底（`ai.notify`）；`registerNotifySkills` 暴露 `notification.send`
+    技能桥（LLM 只提供 channel/title/body，渠道目标由应用注册并可白名单）。
 - **`zigmodu.ai.AgentHandle` 运行时控制**：协作式 cancel / pause / 进度计数
   （原子标志，Agent 每步边界检查）；`Agent.tracer` + `parent_span` 可选创建
   run 级 trace span（复用 DistributedTracer）；
