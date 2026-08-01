@@ -139,6 +139,11 @@ note）、`llmRiskDecide`（风控决策）。把 `SkillContext.userdata` 指向
 `LlmPolicyCtx{ .provider, .json_fn, .system_hint }` 即可直接挂到对应 Flow；
 模型失败或返回非法 JSON 时**安全回退到 escalate**，绝不静默放行。
 
+**RAG 上下文注入**：`LlmPolicyCtx` 可选挂 `retriever`（应用侧检索器，框架不
+内置向量库）+ `retrieval_query`，`buildContext` 会把 top-k 检索块
+（如审批政策、历史处置、playbook）注入三个策略的 prompt——
+LLM 决策基于实际业务上下文而非空泛通用判断。
+
 ## 边界（不做）
 
 无界自主循环（每轮有限步骤 + 预算 + 可中止）；不新增 shell/MCP 能力。

@@ -27,6 +27,12 @@ pub const LlmJsonFn = *const fn (
 pub const LlmPolicyCtx = struct {
     provider: ?*AiProvider = null,
     json_fn: LlmJsonFn = llmJson,
+    /// Optional RAG retriever: its top-k chunks are injected into the policy
+    /// prompts as business context (policies, history, playbooks...).
+    retriever: ?@import("retriever.zig").Retriever = null,
+    /// Query used for retrieval (e.g. "approval policy for high-value orders").
+    retrieval_query: []const u8 = "",
+    top_k: usize = 3,
     /// Optional extra system-prompt guidance (e.g. company policy).
     system_hint: []const u8 = "",
 };
@@ -54,6 +60,30 @@ pub fn llmJson(
     return parsed.value;
 }
 
+/// Retrieve top-k chunks and render them as a "Business context:" block.
+/// Returns "" when no retriever is configured or retrieval yields nothing.
+pub fn buildContext(pc: *LlmPolicyCtx, allocator: std.mem.Allocator) ![]const u8 {
+    const retriever = pc.retriever orelse return "";
+    const chunks = try retriever.retrieve(allocator, pc.retrieval_query, pc.top_k);
+    defer retriever.free(allocator, chunks);
+    if (chunks.len == 0) return "";
+
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "Business context:\n");
+    for (chunks) |c| {
+        try buf.appendSlice(allocator, "- ");
+        if (c.source.len > 0) {
+            try buf.appendSlice(allocator, "[");
+            try buf.appendSlice(allocator, c.source);
+            try buf.appendSlice(allocator, "] ");
+        }
+        try buf.appendSlice(allocator, c.text);
+        try buf.appendSlice(allocator, "\n");
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
 /// Diagnosis policy: asks the model for `{"summary","causes":[],"actions":[]}`
 /// and fills the flow's out-arrays (strings owned by the flow).
 pub fn llmDiagnose(
@@ -76,10 +106,12 @@ pub fn llmDiagnose(
         try evidence_buf.appendSlice(allocator, "\n");
     }
 
+    const rag_block = try buildContext(pc, allocator);
+    defer if (rag_block.len > 0) allocator.free(rag_block);
     const user = try std.fmt.allocPrint(
         allocator,
-        "Anomaly: source={s} subject={s} severity={s} description={s}\n\nEvidence:\n{s}\nRespond with JSON only: {{\"summary\":\"...\",\"causes\":[\"...\"],\"actions\":[\"...\"]}}",
-        .{ case.source, case.subject, @tagName(case.severity), case.description, evidence_buf.items },
+        "Anomaly: source={s} subject={s} severity={s} description={s}\n\n{s}Evidence:\n{s}\nRespond with JSON only: {{\"summary\":\"...\",\"causes\":[\"...\"],\"actions\":[\"...\"]}}",
+        .{ case.source, case.subject, @tagName(case.severity), case.description, rag_block, evidence_buf.items },
     );
     defer allocator.free(user);
 
@@ -103,14 +135,17 @@ pub fn llmApprove(
     amount: i64,
     step_index: usize,
     step_name: []const u8,
-    context_block: []const u8,
+    _context_block: []const u8,
     out_note: *[]const u8,
 ) anyerror!approval_mod.ApprovalDecision {
     const pc: *LlmPolicyCtx = @ptrCast(@alignCast(ctx.userdata orelse return error.LlmNotConfigured));
+    _ = _context_block;
+    const rag_block = try buildContext(pc, allocator);
+    defer if (rag_block.len > 0) allocator.free(rag_block);
     const user = try std.fmt.allocPrint(
         allocator,
-        "Approval request: subject={s} amount={d} step={d}:{s}\nContext:\n{s}\nRespond with JSON only: {{\"decision\":\"approve|escalate|reject\",\"note\":\"...\"}}",
-        .{ subject, amount, step_index, step_name, context_block },
+        "Approval request: subject={s} amount={d} step={d}:{s}\n{s}Respond with JSON only: {{\"decision\":\"approve|escalate|reject\",\"note\":\"...\"}}",
+        .{ subject, amount, step_index, step_name, rag_block },
     );
     defer allocator.free(user);
 
@@ -138,10 +173,12 @@ pub fn llmRiskDecide(
     level: risk_mod.RiskLevel,
 ) anyerror!risk_mod.RiskDecision {
     const pc: *LlmPolicyCtx = @ptrCast(@alignCast(ctx.userdata orelse return error.LlmNotConfigured));
+    const context_block = try buildContext(pc, allocator);
+    defer if (context_block.len > 0) allocator.free(context_block);
     const user = try std.fmt.allocPrint(
         allocator,
-        "Risk review: subject={s} score={d} level={s}\nRespond with JSON only: {{\"decision\":\"approve|escalate|reject\"}}",
-        .{ subject, score, @tagName(level) },
+        "Risk review: subject={s} score={d} level={s}\n{s}Respond with JSON only: {{\"decision\":\"approve|escalate|reject\"}}",
+        .{ subject, score, @tagName(level), context_block },
     );
     defer allocator.free(user);
 
@@ -162,6 +199,39 @@ fn fakeJson(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: []con
 
 fn putOwned(obj: *std.json.ObjectMap, allocator: std.mem.Allocator, key: []const u8, value: std.json.Value) !void {
     try obj.put(allocator, try allocator.dupe(u8, key), value);
+}
+
+test "buildContext injects retrieved policy chunks into the approval prompt" {
+    const allocator = std.testing.allocator;
+
+    var retriever = @import("retriever.zig").KeywordRetriever.init(allocator);
+    defer retriever.deinit();
+    try retriever.add("policy-1", "approval policy: large orders above 100000 always need CFO approval.", "approval-policy");
+    const retriever_iface = retriever.asRetriever();
+
+    const Capture = struct {
+        var seen_prompt: []const u8 = "";
+        fn f(_: *anyopaque, a: std.mem.Allocator, _: []const u8, user: []const u8) anyerror!std.json.Value {
+            seen_prompt = try a.dupe(u8, user);
+            var obj = std.json.ObjectMap{};
+            try putOwned(&obj, a, "decision", .{ .string = try a.dupe(u8, "escalate") });
+            return .{ .object = obj };
+        }
+    };
+
+    var policy_ctx = LlmPolicyCtx{
+        .json_fn = Capture.f,
+        .retriever = retriever_iface,
+        .retrieval_query = "approval policy",
+    };
+    var ctx = SkillContext{ .allocator = allocator, .userdata = &policy_ctx };
+    var note: []const u8 = "";
+    const decision = try llmApprove(allocator, &ctx, "order-1", 150000, 0, "finance", "", &note);
+    defer allocator.free(note);
+    defer allocator.free(Capture.seen_prompt);
+    try std.testing.expectEqual(approval_mod.ApprovalDecision.escalated, decision);
+    try std.testing.expect(std.mem.indexOf(u8, Capture.seen_prompt, "approval policy: large orders above 100000 always need CFO approval.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, Capture.seen_prompt, "approval-policy") != null);
 }
 
 test "llmApprove approves with a canned model response" {
