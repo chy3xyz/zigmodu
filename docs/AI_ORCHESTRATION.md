@@ -72,6 +72,10 @@ WAL 持久化、转人工在 DAG 下同样生效；反射质量门当前应用�
     （name → SQL → value 列），`kpi.query` 技能桥让 LLM 直接回答
     「本周营收/退款率多少」；指标定义与 SQL 语义由应用持有，LLM 只能按名查询，
     另有程序化 `Kpi.query`。
+  - `zigmodu.ai.sla.SlaTracker`——SLA/时效管理：跟踪业务项（工单/审批/退款）
+    的单调钟截止时间，`check()` 按 cron 节奏评估——截止前进入 warn 窗口触发
+    提醒，超时触发 breach；事件进 `on_sla` 回调（可接 `ai.notify`）+ outbox
+    （`ai.sla`），把「等处理」变成主动运营。
 - **`zigmodu.ai.AgentHandle` 运行时控制**：协作式 cancel / pause / 进度计数
   （原子标志，Agent 每步边界检查）；`Agent.tracer` + `parent_span` 可选创建
   run 级 trace span（复用 DistributedTracer）；
