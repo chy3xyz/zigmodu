@@ -168,6 +168,10 @@ LLM 决策基于实际业务上下文而非空泛通用判断。
 （反射重跑次数），`toPrometheusFormat` 导出 `zigmodu_ai_workflow_*` 指标；
 与 `AgentMetrics`、`TokenQuota` 一样可直接接入框架 metrics 端点。
 
+`zigmodu.ai.observability.AiMetrics` 聚合器把 workflow / agent / token-quota
+三组指标合并为一份 Prometheus 文档（挂指针 + 名字即可），一个 `/metrics`
+端点即可覆盖整个 AI 栈（tenant-ai 示例的 `GET /api/ai/metrics` 即演示）。
+
 ## 边界（不做）
 
 无界自主循环（每轮有限步骤 + 预算 + 可中止）；不新增 shell/MCP 能力。

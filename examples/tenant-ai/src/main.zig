@@ -9,6 +9,7 @@
 //!     tenant_id column — tenants never see each other's pending items)
 //!   - orchestration (`Workflow` driving the registered skills)
 //!   - workflow metrics (`WorkflowMetrics`) + graph export (`toMermaid`)
+//!   - aggregated AI metrics (`AiMetrics`) at `GET /api/ai/metrics`
 //!
 //! HTTP API (X-Tenant-ID header; defaults to tenant 1):
 //!   GET  /api/ai/kpi?metric=paid_revenue
@@ -19,6 +20,7 @@
 //!   POST /api/ai/approvals/{run_id}/approve
 //!   POST /api/ai/workflow/run
 //!   GET  /api/ai/workflow/graph
+//!   GET  /api/ai/metrics
 //!
 //! Run:  cd examples/tenant-ai && zig build run
 //! Test: zig build test  (asserts tenant isolation end-to-end)
@@ -59,6 +61,7 @@ const TenantAiApp = struct {
     approval: *ai.approval.ApprovalFlow,
     registry: *ai.SkillRegistry,
     wf_metrics: *ai.WorkflowMetrics,
+    ai_metrics: *ai.observability.AiMetrics,
 
     /// Pick the metric definition for (tenant_id, name). The example registers
     /// one definition per tenant; apps can also build tenant-specific SQL.
@@ -114,6 +117,7 @@ fn TenantAiApi(comptime ComptimeState: type) type {
             .{ .method = .POST, .path = "approvals/{run_id}/approve", .handler = approvalDecide },
             .{ .method = .POST, .path = "workflow/run", .handler = workflowRun },
             .{ .method = .GET, .path = "workflow/graph", .handler = workflowGraph },
+            .{ .method = .GET, .path = "metrics", .handler = metrics },
         };
 
         fn tenantOf(ctx: *http.Context) !i64 {
@@ -255,6 +259,13 @@ fn TenantAiApi(comptime ComptimeState: type) type {
             try ctx.setHeader("Content-Type", "text/plain");
             try ctx.text(200, mermaid);
         }
+
+        fn metrics(ctx: *http.Context, self: *State) !void {
+            const body = try self.app.ai_metrics.toPrometheusFormat(ctx.allocator);
+            defer ctx.allocator.free(body);
+            try ctx.setHeader("Content-Type", "text/plain; version=0.0.4");
+            try ctx.text(200, body);
+        }
     };
 }
 
@@ -288,6 +299,12 @@ fn run(allocator: std.mem.Allocator, io: std.Io, serve: bool) !void {
     };
     var kpi_ctx = ai.kpi.KpiCtx{ .backend = &backend, .metrics = &kpi_metrics };
     var wf_metrics = ai.WorkflowMetrics{};
+    var quota = ai.TokenQuota.init(allocator, io, 100000);
+    defer quota.deinit();
+    var ai_metrics = ai.observability.AiMetrics{
+        .workflow = &wf_metrics,
+        .quota = &quota,
+    };
 
     var registry = ai.SkillRegistry.init(allocator, io);
     defer registry.deinit();
@@ -302,6 +319,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, serve: bool) !void {
         .kpi_ctx = &kpi_ctx,
         .approval = undefined,
         .wf_metrics = &wf_metrics,
+        .ai_metrics = &ai_metrics,
     };
 
     // Approval flow: <= 1000 auto-approves, above escalates (per tenant).
