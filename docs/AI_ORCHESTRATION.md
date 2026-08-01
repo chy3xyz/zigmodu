@@ -40,6 +40,11 @@ WAL 持久化、转人工在 DAG 下同样生效；反射质量门当前应用�
 
 ### 已落地（本轮）
 
+- **业务价值工具**：
+  - `zigmodu.ai.reporter.BusinessReporter`——配置化 SQL 查询 → Markdown 经营简报
+    （配合 `trigger.registerCron` + outbox 即可每日定时推送）；
+  - `zigmodu.ai.alerts.BusinessAlert`——规则化 SQL 巡检，任一规则命中即触发
+    预警（`on_alert` 回调 + outbox 回写），配合 cron trigger 做异常预警。
 - **`zigmodu.ai.AgentHandle` 运行时控制**：协作式 cancel / pause / 进度计数
   （原子标志，Agent 每步边界检查）；`Agent.tracer` + `parent_span` 可选创建
   run 级 trace span（复用 DistributedTracer）；
