@@ -32,6 +32,9 @@ pub const Step = struct {
     name: []const u8,
     kind: StepKind,
     retry: usize = 0,
+    /// DAG dependency: run only after these step names complete. Empty keeps
+    /// linear (declaration order) semantics.
+    depends_on: []const []const u8 = &.{},
 };
 
 pub const StepStatus = enum { pending, running, completed, failed };
@@ -88,6 +91,10 @@ pub const Workflow = struct {
     /// Only required when a step uses `.llm` or `.agent`.
     provider: ?*AiProvider = null,
     registry: *SkillRegistry,
+    /// Required for DAG (parallel wave) execution.
+    io: std.Io = undefined,
+    /// Max steps run concurrently in a DAG wave.
+    max_parallel: usize = 4,
     budget: ?*Budget = null,
     steps: []const Step,
     /// Reflection quality gate on the final step's output.
@@ -116,7 +123,9 @@ pub const Workflow = struct {
             .allocator = allocator,
         };
         errdefer result.deinit();
-        try self.runSteps(allocator, ctx, 0, &result);
+        var completed = std.StringHashMap(void).init(allocator);
+        defer completed.deinit();
+        try self.runSteps(allocator, ctx, 0, &completed, &result);
         return result;
     }
 
@@ -143,6 +152,8 @@ pub const Workflow = struct {
         }
 
         var next_index: usize = 0;
+        var completed = std.StringHashMap(void).init(allocator);
+        defer completed.deinit();
         var replayed_failed = false;
         for (entries) |e| {
             if (!std.mem.eql(u8, e.source_node, run_id)) continue;
@@ -157,27 +168,60 @@ pub const Workflow = struct {
                 .output = if (rec.output) |o| try allocator.dupe(u8, o) else "",
             });
             if (std.mem.eql(u8, rec.status, "failed")) replayed_failed = true;
+            if (std.mem.eql(u8, rec.status, "completed")) try completed.put(rec.name, {});
         }
         if (replayed_failed) {
             result.status = .failed;
             return result;
         }
         if (next_index >= self.steps.len) return result;
-        try self.runSteps(allocator, ctx, next_index, &result);
+        try self.runSteps(allocator, ctx, next_index, &completed, &result);
         return result;
     }
 
-    fn runSteps(self: Workflow, allocator: std.mem.Allocator, ctx: *SkillContext, start: usize, result: *WorkflowResult) !void {
+    fn hasDeps(self: Workflow) bool {
+        for (self.steps) |s| {
+            if (s.depends_on.len > 0) return true;
+        }
+        return false;
+    }
+
+    /// Linear when no step declares dependencies; DAG (dependency-aware,
+    /// parallel waves) otherwise.
+    fn runSteps(
+        self: Workflow,
+        allocator: std.mem.Allocator,
+        ctx: *SkillContext,
+        start: usize,
+        completed: *std.StringHashMap(void),
+        result: *WorkflowResult,
+    ) !void {
+        if (self.hasDeps()) {
+            return self.runDag(allocator, ctx, completed, result);
+        }
+        return self.runLinear(allocator, ctx, start, completed, result);
+    }
+
+    fn runLinear(
+        self: Workflow,
+        allocator: std.mem.Allocator,
+        ctx: *SkillContext,
+        start: usize,
+        completed: *std.StringHashMap(void),
+        result: *WorkflowResult,
+    ) !void {
         var step_index: usize = 0;
         step_index = start;
         while (step_index < self.steps.len) : (step_index += 1) {
             const step = self.steps[step_index];
+            if (completed.contains(step.name)) continue;
             var outcome = try self.executeStep(allocator, ctx, step, step_index, result);
             if (outcome == null) {
                 try self.maybeEscalate(ctx, .step_failed, step.name, allocator);
                 result.status = .failed;
                 break;
             }
+            try completed.put(step.name, {});
             if (outcome.?.budget_exhausted) {
                 try self.maybeEscalate(ctx, .budget_exhausted, step.name, allocator);
                 result.status = .budget_exhausted;
@@ -209,6 +253,96 @@ pub const Workflow = struct {
         }
     }
 
+    const DagState = struct {
+        wf: Workflow,
+        allocator: std.mem.Allocator,
+        ctx: SkillContext,
+        step: Step,
+        index: usize,
+        outcome: ?StepOutcome = null,
+        last_err: anyerror = error.Unknown,
+    };
+
+    fn dagTask(st: *DagState) void {
+        st.outcome = st.wf.attemptStep(st.allocator, &st.ctx, st.step) catch |err| blk: {
+            st.last_err = err;
+            break :blk null;
+        };
+    }
+
+    /// Dependency-aware execution: ready steps (all deps completed) run in
+    /// parallel waves of `max_parallel`; records/persistence are appended on
+    /// the calling thread after each wave. Cycles return error.CyclicDependency.
+    fn runDag(
+        self: Workflow,
+        allocator: std.mem.Allocator,
+        ctx: *SkillContext,
+        completed: *std.StringHashMap(void),
+        result: *WorkflowResult,
+    ) !void {
+        var remaining: usize = self.steps.len;
+        for (self.steps) |s| {
+            if (completed.contains(s.name)) remaining -= 1;
+        }
+
+        while (remaining > 0) {
+            var ready = std.ArrayList(usize).empty;
+            defer ready.deinit(allocator);
+            for (self.steps, 0..) |s, i| {
+                if (completed.contains(s.name)) continue;
+                var deps_ok = true;
+                for (s.depends_on) |d| {
+                    if (!completed.contains(d)) {
+                        deps_ok = false;
+                        break;
+                    }
+                }
+                if (deps_ok) try ready.append(allocator, i);
+            }
+            if (ready.items.len == 0) return error.CyclicDependency;
+
+            var wave: usize = 0;
+            while (wave < ready.items.len) : (wave += self.max_parallel) {
+                const end = @min(ready.items.len, wave + self.max_parallel);
+                const count = end - wave;
+                const states = try allocator.alloc(*DagState, count);
+                defer allocator.free(states);
+                var group = std.Io.Group.init;
+                for (ready.items[wave..end], 0..) |idx, k| {
+                    const st = try allocator.create(DagState);
+                    st.* = .{
+                        .wf = self,
+                        .allocator = allocator,
+                        .ctx = ctx.*,
+                        .step = self.steps[idx],
+                        .index = idx,
+                    };
+                    states[k] = st;
+                    group.async(self.io, dagTask, .{st});
+                }
+                try group.await(self.io);
+
+                for (states) |st| {
+                    if (st.outcome) |o| {
+                        try self.appendCompleted(result, allocator, st.step, st.index, o);
+                        try completed.put(st.step.name, {});
+                        if (o.budget_exhausted) {
+                            try self.maybeEscalate(ctx, .budget_exhausted, st.step.name, allocator);
+                            result.status = .budget_exhausted;
+                        }
+                    } else {
+                        try self.appendFailed(result, allocator, st.step, st.index, st.last_err);
+                        try self.maybeEscalate(ctx, .step_failed, st.step.name, allocator);
+                        result.status = .failed;
+                    }
+                }
+                for (states) |st| allocator.destroy(st);
+                if (result.status != .completed) return;
+            }
+            remaining -= ready.items.len;
+        }
+    }
+
     /// Run a step with its retry budget; appends the record to `result`.
     /// Returns null when all attempts failed (record is marked failed).
     fn executeStep(
@@ -219,6 +353,22 @@ pub const Workflow = struct {
         step_index: usize,
         result: *WorkflowResult,
     ) !?StepOutcome {
+        const outcome = self.attemptStep(allocator, ctx, step) catch |err| {
+            try self.appendFailed(result, allocator, step, step_index, err);
+            return null;
+        };
+        try self.appendCompleted(result, allocator, step, step_index, outcome);
+        return outcome;
+    }
+
+    /// Run a step with its retry budget; does not record anything (records are
+    /// appended by the caller — needed for parallel DAG waves).
+    fn attemptStep(
+        self: Workflow,
+        allocator: std.mem.Allocator,
+        ctx: *SkillContext,
+        step: Step,
+    ) !StepOutcome {
         var attempts: usize = 0;
         var last_err: anyerror = error.Unknown;
         while (attempts <= step.retry) : (attempts += 1) {
@@ -226,14 +376,35 @@ pub const Workflow = struct {
                 last_err = err;
                 continue;
             };
-            try result.steps.append(allocator, .{
-                .name = try allocator.dupe(u8, step.name),
-                .status = .completed,
-                .output = outcome.output,
-            });
-            try self.persistStep(allocator, step_index, step.name, "completed", null, outcome.output);
             return outcome;
         }
+        return last_err;
+    }
+
+    fn appendCompleted(
+        self: Workflow,
+        result: *WorkflowResult,
+        allocator: std.mem.Allocator,
+        step: Step,
+        step_index: usize,
+        outcome: StepOutcome,
+    ) !void {
+        try result.steps.append(allocator, .{
+            .name = try allocator.dupe(u8, step.name),
+            .status = .completed,
+            .output = outcome.output,
+        });
+        try self.persistStep(allocator, step_index, step.name, "completed", null, outcome.output);
+    }
+
+    fn appendFailed(
+        self: Workflow,
+        result: *WorkflowResult,
+        allocator: std.mem.Allocator,
+        step: Step,
+        step_index: usize,
+        last_err: anyerror,
+    ) !void {
         try result.steps.append(allocator, .{
             .name = try allocator.dupe(u8, step.name),
             .status = .failed,
@@ -250,7 +421,6 @@ pub const Workflow = struct {
             if (last_err != error.Unknown) @errorName(last_err) else null,
             "",
         );
-        return null;
     }
 
     const StepRecordJson = struct {
@@ -648,4 +818,68 @@ test "workflow resume continues from the last persisted step" {
     try std.testing.expectEqualStrings("partial", resumed.steps.items[0].output);
     try std.testing.expectEqualStrings("step-b", resumed.steps.items[1].name);
     try std.testing.expectEqual(StepStatus.completed, resumed.steps.items[1].status);
+}
+
+test "workflow runs a DAG respecting dependencies" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var registry = try setupPingRegistry(allocator);
+    defer registry.deinit();
+    var ctx = SkillContext{ .allocator = a };
+
+    const steps = [_]Step{
+        .{ .name = "a", .kind = .{ .skill = .{ .name = "ping", .args = .{ .object = .{} } } } },
+        .{ .name = "b", .kind = .{ .skill = .{ .name = "ping", .args = .{ .object = .{} } } }, .depends_on = &.{"a"} },
+        .{ .name = "c", .kind = .{ .skill = .{ .name = "ping", .args = .{ .object = .{} } } }, .depends_on = &.{"a"} },
+        .{ .name = "d", .kind = .{ .skill = .{ .name = "ping", .args = .{ .object = .{} } } }, .depends_on = &.{ "b", "c" } },
+    };
+    var wf = Workflow.init(&registry, &steps);
+    wf.io = std.testing.io;
+    wf.max_parallel = 2;
+
+    var result = try wf.run(allocator, &ctx);
+    defer result.deinit();
+
+    try std.testing.expectEqual(RunStatus.completed, result.status);
+    try std.testing.expectEqual(@as(usize, 4), result.steps.items.len);
+    for (result.steps.items) |rec| {
+        try std.testing.expectEqual(StepStatus.completed, rec.status);
+    }
+    // Dependency order: b/c appear after a, d appears after b and c.
+    var a_idx: ?usize = null;
+    var b_idx: ?usize = null;
+    var c_idx: ?usize = null;
+    var d_idx: ?usize = null;
+    for (result.steps.items, 0..) |rec, i| {
+        if (std.mem.eql(u8, rec.name, "a")) a_idx = i;
+        if (std.mem.eql(u8, rec.name, "b")) b_idx = i;
+        if (std.mem.eql(u8, rec.name, "c")) c_idx = i;
+        if (std.mem.eql(u8, rec.name, "d")) d_idx = i;
+    }
+    try std.testing.expect(a_idx.? < b_idx.? and a_idx.? < c_idx.?);
+    try std.testing.expect(b_idx.? < d_idx.? and c_idx.? < d_idx.?);
+}
+
+test "workflow detects cyclic dependencies" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var registry = try setupPingRegistry(allocator);
+    defer registry.deinit();
+    var ctx = SkillContext{ .allocator = a };
+
+    const steps = [_]Step{
+        .{ .name = "x", .kind = .{ .skill = .{ .name = "ping", .args = .{ .object = .{} } } }, .depends_on = &.{"y"} },
+        .{ .name = "y", .kind = .{ .skill = .{ .name = "ping", .args = .{ .object = .{} } } }, .depends_on = &.{"x"} },
+    };
+    var wf = Workflow.init(&registry, &steps);
+    wf.io = std.testing.io;
+
+    const err = wf.run(allocator, &ctx) catch |e| e;
+    try std.testing.expectEqual(error.CyclicDependency, err);
 }

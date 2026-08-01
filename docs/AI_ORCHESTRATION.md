@@ -26,6 +26,12 @@ defer result.deinit();
 特性：每步记录（status/error/output）、步骤级重试（`retry`）、失败即停并返回
 部分结果（status `.failed`）、共享预算超支即停（status `.budget_exhausted`）。
 
+**线性 ↔ DAG 混合**：默认按声明顺序线性执行；给步骤加 `depends_on`（依赖的步骤
+名列表）即自动切换为 **DAG 执行**——就绪步骤（依赖全部完成）按 `max_parallel`
+并行波次执行（`std.Io.Group`），环检测返回 `error.CyclicDependency`。预算、
+WAL 持久化、转人工在 DAG 下同样生效；反射质量门当前应用于线性路径的最终步骤
+（DAG 汇点可用后续线性步骤校验）。
+
 ### `zigmodu.ai.Budget` — 任务级 token 预算
 
 硬预留（`tryConsume`），非事后记账：多步任务/Agent 每步 LLM 前预留 token，
@@ -56,5 +62,4 @@ defer result.deinit();
 
 ## 边界（不做）
 
-无界自主循环（每轮有限步骤 + 预算 + 可中止）；不内置 DAG 工作流引擎（复用
-Saga 状态机即可）；不新增 shell/MCP 能力。
+无界自主循环（每轮有限步骤 + 预算 + 可中止）；不新增 shell/MCP 能力。
