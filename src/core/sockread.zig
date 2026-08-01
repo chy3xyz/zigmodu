@@ -39,6 +39,21 @@ pub fn readFull(stream: std.Io.net.Stream, buf: []u8) !void {
     }
 }
 
+/// Write all of `bytes` (loops on partial writes so frames are never split).
+pub fn writeFull(stream: std.Io.net.Stream, bytes: []const u8) !void {
+    var sent: usize = 0;
+    while (sent < bytes.len) {
+        const rc = std.posix.system.write(stream.socket.handle, bytes[sent..].ptr, bytes[sent..].len);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => {},
+            else => return error.ConnectionError,
+        }
+        const n: usize = @intCast(rc);
+        if (n == 0) return error.ConnectionClosed;
+        sent += n;
+    }
+}
+
 test "readSome returns EOF on closed socketpair" {
     var fds: [2]std.posix.socket_t = undefined;
     const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
