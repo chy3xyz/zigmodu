@@ -47,6 +47,9 @@ WAL 持久化、转人工在 DAG 下同样生效；反射质量门当前应用�
     预警（`on_alert` 回调 + outbox 回写），配合 cron trigger 做异常预警。
   - `zigmodu.ai.ticket.TicketFlow`——工单分诊：上下文查询（复用 BusinessReporter）
     → 分类 → 草稿回复 → 发送/人工审批门（`on_send`）→ outbox 回写。
+  - `zigmodu.ai.refund.RefundFlow`——退款补偿编排：校验 → 审批 → 退款命令
+    （事务性 outbox）→ 通知；通知失败自动发补偿命令（`refund.reverse`），并暴露
+    `compensate()` 供下游失败时人工/自动冲正。
 - **`zigmodu.ai.AgentHandle` 运行时控制**：协作式 cancel / pause / 进度计数
   （原子标志，Agent 每步边界检查）；`Agent.tracer` + `parent_span` 可选创建
   run 级 trace span（复用 DistributedTracer）；

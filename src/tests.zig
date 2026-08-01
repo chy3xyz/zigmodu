@@ -214,6 +214,7 @@ test "compile all source files" {
     _ = @import("ai/reporter.zig");
     _ = @import("ai/alerts.zig");
     _ = @import("ai/ticket.zig");
+    _ = @import("ai/refund.zig");
     _ = @import("ai/memory.zig");
     _ = @import("ai/audit.zig");
     _ = @import("ai/retriever.zig");
