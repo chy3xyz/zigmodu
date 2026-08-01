@@ -40,6 +40,11 @@ SELECT ... FROM users WHERE username = ?1 LIMIT 1
 - 顺带修复 `timeout_ms` 存储但从未生效的问题：`readResponse` 每次读前用 `posix.poll` 等待可读，超时返回 `error.Timeout`（新增 `waitForReadable`），服务端假死/Content-Length 虚高时不再无限阻塞；
 - 新增两个端到端回归测试：真实 loopback 请求（防 flush 回归）与假死对端超时（防超时回归）。
 
-**附带发现（std.Io 使用约束）**：在**自行 spawn 的 OS 线程**里用 `std.Io` 的 reader 读 socket 可能永远拿不到数据（客户端已 flush 的字节确实到达内核缓冲，但 io reader 读不到）；同一线程内 io 读写、以及跨线程用裸 `std.posix.read` 均正常。框架自身 Server 走 fiber 调度不受影响；如需在线程内做 socket 服务，建议用裸 posix 读写。
+**附带发现（std.Io 使用约束，2026-08-01 实测定性）**：**当同一个 Threaded io 被多个线程共享时，io 的 socket 读会永久阻塞——即使 `poll` 已返回可读、`MSG_PEEK` 也确认数据在内核缓冲**（macOS 实测：客户端裸读立刻返回 129 字节，io reader 的 `readv` 在同一 fd 上挂死）。影响面：
+
+- **fiber 模式 WebSocket 读**：`connFiber` 运行在 io worker 线程，`WsFramer.readFrame` 走 `io.operate(net_read)` → 读挂起 → `on_message` / ping/close 无响应、`on_close` 不触发；写路径（握手/welcome）正常。**已修复**：WS 两处读循环改为 `posix.poll + posix.read`（`im/WsFramer.zig`、`extensions/WebSocket.zig`），并新增端到端回归测试。
+- **全量审计（2026-08-01）**：同一风险（「写请求 → 阻塞等响应」的 io 读，多线程共享 io 下可能挂死）已统一收敛到新工具 `core/sockread.zig`（`readSome`/`readFull` = `posix.poll + posix.read`），覆盖：Redis 响应（16 处）、NATS（4 处）、Kafka `readExact`、`DistributedEventBus` 连接循环、`ClusterConnection.recv`（顺带修复 4 字节头可能半包的问题）、HttpClient `readResponse`/流式 body。**仍走 io 读但实测正常**（数据在 accept 时已就绪、非长阻塞）：HTTP 请求行读取（`Server.zig` `StreamReader`）、WebMonitor/WebSocket 升级请求读取、Http2Server 帧读取（复杂缓冲，留待验证）。
+- 同一线程内独占使用 io 时读写均正常（HttpClient 主线程对 python 服务 OK）；跨线程用裸 `posix.read` 也正常。
+- 结论：这是 zigmodu 0.14.17 所用 `std.Io`（Threaded）在多线程共享下的环境/实现限制，非迁移引入；**socket 读建议绕开 io、用裸 posix poll+read**（服务端 WS、HttpClient 超时均已采用该模式）。
 
 **规避（devs_monitor agent 已采用）**：独立客户端用 `std.http.Client.fetch(...)`（zigmodu HTTPS 路径同款 API，阻塞式可用）——修复后 `zigmodu.http.HttpClient` 的纯 HTTP 路径也可在普通 main 中直接使用。

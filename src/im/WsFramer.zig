@@ -167,9 +167,12 @@ pub const WsFramer = struct {
 };
 
 fn readFull(stream: std.Io.net.Stream, io: std.Io, buf: []u8) !void {
-    var read_buf: [4096]u8 = undefined;
-    var r = stream.reader(io, &read_buf);
-    _ = try r.interface.readSliceAll(buf);
+    // Raw posix poll+read instead of `io.operate(net_read)`: with the Threaded
+    // Io shared across the accept thread, worker fibers and the client thread,
+    // io-based socket reads can block forever even when data is already in the
+    // kernel buffer (observed on macOS). Raw reads are immune to that.
+    _ = io;
+    try @import("../core/sockread.zig").readFull(stream, buf);
 }
 
 test "WsFrameKind opcode roundtrip" {

@@ -7,6 +7,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Time = @import("../core/Time.zig");
+const sockread = @import("../core/sockread.zig");
 
 pub const NatsConfig = struct {
     url: []const u8 = "localhost",
@@ -100,10 +101,8 @@ pub const NatsClient = struct {
         // Read bytes until newline
         while (true) {
             var byte_buf: [1]u8 = undefined;
-            _ = stream.read(self.io, data: {
-                var d: [1][]u8 = .{&byte_buf};
-                break :data &d;
-            }) catch return error.ConnectionError;
+            const got = sockread.readSome(stream, &byte_buf) catch return error.ConnectionError;
+            if (got == 0) return error.ConnectionClosed;
             if (byte_buf[0] == '\n') break;
             try info_line.append(self.allocator, byte_buf[0]);
         }
@@ -297,11 +296,7 @@ pub const NatsClient = struct {
                 return error.Timeout;
             }
 
-            // Non-blocking read
-            const n = s.read(self.io, data: {
-                var d: [1][]u8 = .{&rbuf};
-                break :data &d;
-            }) catch |err| {
+            const n = sockread.readSome(s, &rbuf) catch |err| {
                 self.unsubscribeRaw(req_sid) catch |cleanup_err| std.log.warn("[Nats] unsubscribeRaw failed on read error: {}", .{cleanup_err});
                 return err;
             };
@@ -374,10 +369,7 @@ pub const NatsClient = struct {
     pub fn poll(self: *Self) !usize {
         const s = self.stream orelse return error.NotConnected;
         var buf: [8192]u8 = undefined;
-        const n = s.read(self.io, data: {
-            var d: [1][]u8 = .{&buf};
-            break :data &d;
-        }) catch |err| return err;
+        const n = sockread.readSome(s, &buf) catch |err| return err;
         if (n == 0) return 0;
 
         return try self.parseMessages(buf[0..n]);
@@ -392,10 +384,7 @@ pub const NatsClient = struct {
         try w.interface.flush();
 
         var rbuf: [128]u8 = undefined;
-        const n = s.read(self.io, data: {
-            var d: [1][]u8 = .{&rbuf};
-            break :data &d;
-        }) catch return error.ConnectionError;
+        const n = sockread.readSome(s, &rbuf) catch return error.ConnectionError;
         if (n < 6 or !std.mem.eql(u8, rbuf[0..6], "PONG\r\n")) return error.ProtocolError;
     }
 

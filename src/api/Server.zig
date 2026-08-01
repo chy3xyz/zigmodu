@@ -2800,3 +2800,109 @@ test "header lookup is case-insensitive" {
     try std.testing.expectEqualStrings("zigmodu-test", headerLookup(headers, "user-agent").?);
     try std.testing.expect(headerLookup(headers, "content-type") == null);
 }
+
+const WsE2eState = struct {
+    messages: usize = 0,
+    pings: usize = 0,
+    closed: bool = false,
+};
+var ws_e2e_state = WsE2eState{};
+
+test "WebSocket fiber path receives client frames and fires on_close" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    ws_e2e_state = .{};
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0 });
+    defer server.deinit();
+    var group = server.group("");
+    try group.ws("ws", (struct {
+        fn connect(_: *Context, _: ?*anyopaque) ?*anyopaque {
+            return @ptrCast(&ws_e2e_state);
+        }
+    }).connect, (struct {
+        fn message(session: ?*anyopaque, _: []const u8, _: WsFrameKind) void {
+            const st: *WsE2eState = @ptrCast(@alignCast(session.?));
+            st.messages += 1;
+        }
+    }).message, (struct {
+        fn close(session: ?*anyopaque) void {
+            const st: *WsE2eState = @ptrCast(@alignCast(session.?));
+            st.closed = true;
+        }
+    }).close, null);
+
+    // Fiber path: connFiber runs on an io worker thread while the accept loop
+    // runs on this spawned thread.
+    const th = try std.Thread.spawn(.{ .stack_size = 128 * 1024 }, struct {
+        fn run(s: *Server) void {
+            s.start() catch {};
+        }
+    }.run, .{&server});
+    defer th.join();
+
+    var port: u16 = 0;
+    var tries: usize = 0;
+    while (tries < 200) : (tries += 1) {
+        if (server.listener) |*l| {
+            port = l.socket.address.getPort();
+            break;
+        }
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    try std.testing.expect(port != 0);
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+    var stream = try addr.connect(std.testing.io, .{ .mode = .stream });
+    var closed_early = false;
+    defer if (!closed_early) stream.close(std.testing.io);
+
+    // Handshake.
+    var wbuf: [512]u8 = undefined;
+    var w = stream.writer(std.testing.io, &wbuf);
+    const handshake = "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+    try w.interface.writeAll(handshake);
+    try w.interface.flush();
+
+    // Read the 101 with raw poll+read (io-based reads can hang when the io is
+    // shared across threads — see im/WsFramer.zig readFull).
+    var fds = [_]std.posix.pollfd{.{
+        .fd = stream.socket.handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = try std.posix.poll(&fds, 3000);
+    try std.testing.expect(ready > 0);
+    var resp: [512]u8 = undefined;
+    const n = try std.posix.read(stream.socket.handle, &resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp[0..n], "101") != null);
+
+    // Send a masked text frame "hi".
+    var frame_buf: [64]u8 = undefined;
+    const payload = "hi";
+    const mask: [4]u8 = .{ 1, 2, 3, 4 };
+    frame_buf[0] = 0x81;
+    frame_buf[1] = 0x80 | @as(u8, @intCast(payload.len));
+    frame_buf[2..6].* = mask;
+    for (payload, 0..) |c, i| frame_buf[6 + i] = c ^ mask[i % 4];
+    try w.interface.writeAll(frame_buf[0 .. 6 + payload.len]);
+    try w.interface.flush();
+
+    // Wait (bounded) for on_message.
+    tries = 0;
+    while (ws_e2e_state.messages == 0 and tries < 300) : (tries += 1) {
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), ws_e2e_state.messages);
+
+    // Closing the client must trigger on_close on the server fiber.
+    stream.close(std.testing.io);
+    closed_early = true;
+    tries = 0;
+    while (!ws_e2e_state.closed and tries < 300) : (tries += 1) {
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    try std.testing.expect(ws_e2e_state.closed);
+
+    server.stop();
+}

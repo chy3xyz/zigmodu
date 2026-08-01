@@ -1,5 +1,6 @@
 const std = @import("std");
 const Time = @import("../core/Time.zig");
+const sockread = @import("../core/sockread.zig");
 
 /// HTTP client with connection pool and retry
 pub const HttpClient = struct {
@@ -496,11 +497,9 @@ pub const HttpClient = struct {
         errdefer resp.deinit();
 
         var buf: [8192]u8 = undefined;
-        var read_buf: [8192]u8 = undefined;
-        var r = stream.reader(self.connection_pool.io, &read_buf);
 
         try waitForReadable(stream.socket.handle, self.timeout_ms);
-        const n = try r.interface.readSliceShort(&buf);
+        const n = std.posix.read(stream.socket.handle, &buf) catch return error.ConnectionError;
         if (n == 0) return error.ConnectionError;
         const raw = buf[0..n];
 
@@ -546,7 +545,7 @@ pub const HttpClient = struct {
 
         while (copied < content_length) {
             try waitForReadable(stream.socket.handle, self.timeout_ms);
-            const more = try r.interface.readSliceShort(&buf);
+            const more = std.posix.read(stream.socket.handle, &buf) catch return error.ConnectionError;
             if (more == 0) break;
             const to_copy = @min(@as(usize, more), content_length - copied);
             @memcpy(body_buf[copied..][0..to_copy], buf[0..to_copy]);
@@ -598,10 +597,8 @@ pub const HttpClient = struct {
         errdefer resp.deinit();
 
         var buf: [8192]u8 = undefined;
-        var read_buf: [8192]u8 = undefined;
-        var r = stream.reader(self.connection_pool.io, &read_buf);
 
-        const n = try r.interface.readSliceShort(&buf);
+        const n = try sockread.readSome(stream, &buf);
         if (n == 0) return error.ConnectionError;
         const raw = buf[0..n];
 
@@ -641,11 +638,11 @@ pub const HttpClient = struct {
         const initial = raw[body_start..];
 
         if (chunked) {
-            try streamChunkedBody(&r.interface, &buf, initial, self.allocator, cb_ctx, on_chunk);
+            try streamChunkedBody(stream, &buf, initial, self.allocator, cb_ctx, on_chunk);
         } else if (content_length) |cl| {
-            try streamContentLengthBody(&r.interface, &buf, initial, cl, cb_ctx, on_chunk);
+            try streamContentLengthBody(stream, &buf, initial, cl, cb_ctx, on_chunk);
         } else {
-            try streamUntilEofBody(&r.interface, &buf, initial, cb_ctx, on_chunk);
+            try streamUntilEofBody(stream, &buf, initial, cb_ctx, on_chunk);
         }
         return resp;
     }
@@ -711,7 +708,7 @@ fn containsIgnoreCaseAscii(haystack: []const u8, needle: []const u8) bool {
 }
 
 fn streamContentLengthBody(
-    reader: anytype,
+    stream: std.Io.net.Stream,
     buf: []u8,
     initial: []const u8,
     content_length: usize,
@@ -725,7 +722,7 @@ fn streamContentLengthBody(
         copied = n;
     }
     while (copied < content_length) {
-        const more = try reader.readSliceShort(buf);
+        const more = try sockread.readSome(stream, buf);
         if (more == 0) return error.IncompleteBody;
         const to_copy = @min(@as(usize, more), content_length - copied);
         try on_chunk(cb_ctx, buf[0..to_copy]);
@@ -734,7 +731,7 @@ fn streamContentLengthBody(
 }
 
 fn streamUntilEofBody(
-    reader: anytype,
+    stream: std.Io.net.Stream,
     buf: []u8,
     initial: []const u8,
     cb_ctx: *anyopaque,
@@ -742,14 +739,14 @@ fn streamUntilEofBody(
 ) !void {
     if (initial.len > 0) try on_chunk(cb_ctx, initial);
     while (true) {
-        const more = try reader.readSliceShort(buf);
+        const more = try sockread.readSome(stream, buf);
         if (more == 0) break;
         try on_chunk(cb_ctx, buf[0..more]);
     }
 }
 
 fn streamChunkedBody(
-    reader: anytype,
+    stream: std.Io.net.Stream,
     buf: []u8,
     initial: []const u8,
     allocator: std.mem.Allocator,
@@ -762,7 +759,7 @@ fn streamChunkedBody(
 
     while (true) {
         while (std.mem.indexOf(u8, carry.items, "\r\n") == null) {
-            const more = try reader.readSliceShort(buf);
+            const more = try sockread.readSome(stream, buf);
             if (more == 0) return error.IncompleteChunked;
             try carry.appendSlice(allocator, buf[0..more]);
         }
@@ -777,7 +774,7 @@ fn streamChunkedBody(
         if (size == 0) return;
 
         while (carry.items.len < size + 2) {
-            const more = try reader.readSliceShort(buf);
+            const more = try sockread.readSome(stream, buf);
             if (more == 0) return error.IncompleteChunked;
             try carry.appendSlice(allocator, buf[0..more]);
         }

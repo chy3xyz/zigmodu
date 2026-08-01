@@ -10,6 +10,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Time = @import("../core/Time.zig");
+const sockread = @import("sockread.zig");
 
 pub const KafkaMessage = struct {
     topic: []const u8,
@@ -321,15 +322,8 @@ fn parseBootstrap(bootstrap: []const u8) !struct { []const u8, u16 } {
 }
 
 fn readExact(stream: std.Io.net.Stream, io: std.Io, buf: []u8) !void {
-    var filled: usize = 0;
-    while (filled < buf.len) {
-        const n = stream.read(io, data: {
-            var d: [1][]u8 = .{buf[filled..]};
-            break :data &d;
-        }) catch return error.ConnectionError;
-        if (n == 0) return error.ConnectionClosed;
-        filled += n;
-    }
+    _ = io;
+    try sockread.readFull(stream, buf);
 }
 
 fn writeI32(out: *[4]u8, v: i32) void {

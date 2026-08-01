@@ -1,5 +1,6 @@
 const std = @import("std");
 const Time = @import("Time.zig");
+const sockread = @import("sockread.zig");
 const TypedEventBus = @import("EventBus.zig").TypedEventBus;
 const ArrayList = std.array_list.Managed;
 
@@ -190,10 +191,6 @@ pub const DistributedEventBus = struct {
     fn handleConnection(self: *Self, conn: std.Io.net.Stream) void {
         defer conn.close(self.io);
 
-        // Pre-allocate a large reusable buffer for the life of the connection
-        var read_buf: [8192]u8 = undefined;
-        var r = conn.reader(self.io, &read_buf);
-
         // Use an Arena for parsing-related allocations that can be cleared per message
         var msg_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer msg_arena.deinit();
@@ -201,8 +198,10 @@ pub const DistributedEventBus = struct {
         while (self.is_running) {
             const ma = msg_arena.allocator();
 
-            // Fast read: directly into buffer (readSliceShort returns byte count).
-            const n = r.interface.readSliceShort(&read_buf) catch |err| {
+            // Raw read: io-based socket reads can hang when the io is shared
+            // across threads (see core/sockread.zig).
+            var read_buf: [8192]u8 = undefined;
+            const n = sockread.readSome(conn, &read_buf) catch |err| {
                 if (self.is_running) std.log.debug("[DEB] Read error: {}", .{err});
                 break;
             };

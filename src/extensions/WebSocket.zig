@@ -306,7 +306,10 @@ pub const WebSocketClient = struct {
     };
 
     fn readFull(r: *std.Io.net.Stream.Reader, buf: []u8) !void {
-        _ = try r.interface.readSliceAll(buf);
+        // Raw posix reads keep the fiber WS read loop working when the Io is
+        // shared across threads (io-based socket reads can block forever even
+        // with data available — see im/WsFramer.zig readFull).
+        try @import("../core/sockread.zig").readFull(r.stream, buf);
     }
 
     fn readFrame(self: *Self, r: *std.Io.net.Stream.Reader, buf: []u8) !Frame {

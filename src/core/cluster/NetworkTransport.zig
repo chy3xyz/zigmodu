@@ -7,6 +7,7 @@
 //! Protocol: 4-byte big-endian length + JSON payload
 
 const std = @import("std");
+const sockread = @import("../sockread.zig");
 
 /// Maximum message size (1MB) to prevent memory exhaustion.
 pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
@@ -38,13 +39,13 @@ pub const ClusterConnection = struct {
     /// Receive a length-prefixed message. Caller owns returned memory.
     pub fn recv(self: *ClusterConnection, buf: *std.ArrayList(u8)) ![]const u8 {
         var len_buf: [4]u8 = undefined;
-        _ = try self.stream.read(self.io, &len_buf);
+        try sockread.readFull(self.stream, &len_buf);
         const msg_len = std.mem.readInt(u32, &len_buf, .big);
 
         if (msg_len > MAX_MESSAGE_SIZE) return error.MessageTooLarge;
 
         try buf.resize(self.allocator, msg_len);
-        _ = try self.stream.read(self.io, buf.items[0..msg_len]);
+        try sockread.readFull(self.stream, buf.items[0..msg_len]);
         return buf.items[0..msg_len];
     }
 };
