@@ -32,6 +32,8 @@ pub const reporter = @import("reporter.zig");
 pub const alerts = @import("alerts.zig");
 pub const ticket = @import("ticket.zig");
 pub const refund = @import("refund.zig");
+pub const risk = @import("risk.zig");
+pub const recon = @import("recon.zig");
 
 pub const Retriever = @import("retriever.zig").Retriever;
 pub const RetrievedChunk = @import("retriever.zig").RetrievedChunk;

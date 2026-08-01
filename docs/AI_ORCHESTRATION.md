@@ -50,6 +50,13 @@ WAL 持久化、转人工在 DAG 下同样生效；反射质量门当前应用�
   - `zigmodu.ai.refund.RefundFlow`——退款补偿编排：校验 → 审批 → 退款命令
     （事务性 outbox）→ 通知；通知失败自动发补偿命令（`refund.reverse`），并暴露
     `compensate()` 供下游失败时人工/自动冲正。
+  - `zigmodu.ai.risk.RiskReview`——风控审核：规则化 SQL 命中累加风险分
+    （可配 `DecideFn` 接 LLM/策略）→ 分档（low/medium/high）→ 决策
+    （approve/escalate/reject）→ outbox 回写 `ai.risk`，供人工复核队列消费。
+  - `zigmodu.ai.recon.ReconCheck`——数据对账巡检：源/目标两个 SQL 快照按
+    key 对比（missing / extra / mismatch 三态），逐条 `on_diff` 回调 +
+    outbox 汇总（`ai.recon`，CLEAN/DRIFT）+ Markdown 差异报告
+    （`renderReport`）；配合 cron trigger 做定时对账。
 - **`zigmodu.ai.AgentHandle` 运行时控制**：协作式 cancel / pause / 进度计数
   （原子标志，Agent 每步边界检查）；`Agent.tracer` + `parent_span` 可选创建
   run 级 trace span（复用 DistributedTracer）；
