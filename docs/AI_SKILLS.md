@@ -40,23 +40,26 @@
 （运行时，tenant-ai 暴露于 `GET /api/ai/skills`），或 `zmodu ai
 export-skills / openapi`（CLI，内置目录）。
 
-## P1 · 业务动作（规划中，默认人机门 + 幂等）
+## P1 · 业务动作（✅ 已落地，默认人机门 + 幂等）
 
-| Skill | 说明 |
-|-------|------|
-| `entity.create/update` | Repository 写操作；权限码校验 + 租户字段强制 |
-| `command.execute` | 经 outbox 提交业务命令（幂等键 = run_id），返回事件 ID |
-| `report.generate` | 聚合查询 → CSV/JSON 报告 |
+`zigmodu.ai.actions.registerWriteSkills / registerCommandSkills /
+registerReportSkills`（`userdata` 传对应 Ctx；`SkillContext.permissions` 需含
+权限码）：
+
+| Skill | 说明 | 权限 |
+|-------|------|------|
+| `entity.create/update` | 白名单实体写操作；仅可写列白名单（`EntitySpec.writable`）、租户列由上下文强制（模型不可传）、主键禁止 | `entity:write` |
+| `command.execute` | 经事务性 outbox 提交应用注册命令；幂等键 = `SkillContext.run_id`（缺失拒绝），返回 event_id | `command:execute` |
+| `report.generate` | 应用注册聚合查询 → CSV / JSON（行数上限 100，只读） | — |
 
 ## P2 · 管理/运维（规划中，默认关闭）
 
 `admin.user.manage` / `admin.tenant.provision` / `admin.cache.invalidate`（禁通配）/
 `admin.config.get/set` / `audit.export`。
 
-## 配套增强（规划中）
+## 配套增强（✅ 已落地）
 
-- `Tool.required_permission`：dispatch 层按权限码校验（复用 CatalogPermDb）；
-- `command.execute` 幂等键复用 `SkillContext.run_id`。
+- `Tool.required_permission`：dispatch 层按权限码校验（`error.PermissionDenied`）。
 
 ## 边界（不做）
 

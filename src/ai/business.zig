@@ -27,6 +27,10 @@ pub const EntitySpec = struct {
     /// Column name carrying the tenant id. When set and the SkillContext has a
     /// tenant_id, every lookup/list is automatically scoped to that tenant.
     tenant_column: ?[]const u8 = null,
+    /// Columns the LLM may write via `entity.create` / `entity.update`
+    /// (whitelist; empty = no write access). The tenant column is always
+    /// forced by the framework, never accepted from the model.
+    writable: []const []const u8 = &.{},
 };
 
 fn isValidIdentifier(s: []const u8) bool {
