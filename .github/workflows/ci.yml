@@ -79,7 +79,7 @@ jobs:
       - name: Build framework examples
         run: |
           set -euo pipefail
-          for ex in ai-ops tenant-ai llm-policies basic distributed event-driven http-stress-test shopdemo tenant-mgmt tenant-shop testing; do
+          for ex in ai-ops tenant-ai llm-policies web4 basic distributed event-driven http-stress-test shopdemo tenant-mgmt tenant-shop testing; do
             echo "== building examples/$ex =="
             (cd "examples/$ex" && zig build)
           done
@@ -169,7 +169,7 @@ jobs:
       - name: Build all examples
         run: |
           set -euo pipefail
-          for ex in ai-ops tenant-ai llm-policies basic distributed event-driven http-stress-test shopdemo tenant-mgmt tenant-shop testing zent-modulith; do
+          for ex in ai-ops tenant-ai llm-policies web4 basic distributed event-driven http-stress-test shopdemo tenant-mgmt tenant-shop testing zent-modulith; do
             echo "== building examples/$ex =="
             (cd "examples/$ex" && zig build)
           done

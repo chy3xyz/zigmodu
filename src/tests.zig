@@ -130,6 +130,7 @@ test "compile all source files" {
     // Web4 (DID + x402; payment verify fail-closed)
     _ = @import("web4/web4.zig");
     _ = @import("web4/x402.zig");
+    _ = @import("web4/middleware.zig");
 
     // Validation
     _ = @import("validation/ObjectValidator.zig");

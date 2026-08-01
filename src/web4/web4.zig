@@ -5,3 +5,4 @@ pub const issueCredential = @import("did.zig").issueCredential;
 pub const verifyCredential = @import("did.zig").verifyCredential;
 
 pub const x402 = @import("x402.zig");
+pub const middleware = @import("middleware.zig");

@@ -98,6 +98,23 @@ LLM_ENDPOINT=... LLM_API_KEY='Bearer sk-...' LLM_MODEL=... zig build run
 Without credentials the demo falls back to an injected fake `json_fn` and
 still exercises every policy; with credentials it calls the real model.
 
+## Web4 (DID + x402) (`examples/web4`)
+
+**DID identity + HTTP 402 payment gating** — two protected routes on one
+server using `zigmodu.web4.middleware`:
+
+- `GET /api/paywall` — x402 gate: no proof → `402` + invoice; valid proof → `200`
+  (dev verifier accepts; production injects an on-chain/allow-list verifier);
+- `GET /api/identity` — did:key auth: missing/invalid signature → `401`;
+  valid signature (`x-did` / `x-did-message` / `x-did-signature`) → `200`.
+
+```bash
+cd examples/web4 && zig build run
+zig build test                          # asserts 402→200 and 401→200 flows
+```
+
+Covered in [docs/WEB4.md](../docs/WEB4.md).
+
 ## ShopDemo boundary (`examples/shopdemo`)
 
 **Codegen reference only** — `schema.sql` + `generated-sample/` module output. Not a complete runnable app. Use [zmodu CLI](https://github.com/chy3xyz/zmodu) to scaffold a full 42-module project.
