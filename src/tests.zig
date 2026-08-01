@@ -225,6 +225,7 @@ test "compile all source files" {
     _ = @import("ai/quota.zig");
     _ = @import("ai/tokenizer.zig");
     _ = @import("messaging/outbox.zig");
+    _ = @import("messaging/OutboxConsumer.zig");
     _ = @import("messaging/outbox_sample.zig");
 
     // Feature Flags

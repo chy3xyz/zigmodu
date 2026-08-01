@@ -88,6 +88,16 @@ WAL 持久化、转人工在 DAG 下同样生效；反射质量门当前应用�
 - **转人工钩子**：`Workflow.on_escalate`（`EscalateFn`），步骤失败（重试后）、
   预算超支、验证持续失败三种原因回调应用层。
 
+## P0/P1 · outbox 消费闭环
+
+`zigmodu.outbox.OutboxConsumer` 补齐事务性 outbox 的**读侧**：轮询 pending
+条目（可按 topic 过滤）→ 分发到注册的 handler（`userdata + call`，topic/payload
+为调用期稳定的副本）→ 生命周期推进 pending → processing → delivered，失败则
+`retry_count++`（`error_message` 记录），耗尽重试后置 failed（DLQ 语义）。
+所有 AI 业务工具（`ai.approval` / `ai.recon` / `ai.notify` / `ai.risk` /
+`ai.alert`）的 outbox 回写都可被它消费，配合 `ai.trigger` 即可形成
+「业务事件 → outbox → 消费者/人工队列」的完整闭环。
+
 ## 边界（不做）
 
 无界自主循环（每轮有限步骤 + 预算 + 可中止）；不新增 shell/MCP 能力。
