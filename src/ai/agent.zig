@@ -12,6 +12,8 @@ const quota_mod = @import("quota.zig");
 const tokenizer = @import("tokenizer.zig");
 const Budget = @import("budget.zig").Budget;
 const ContextManager = @import("context.zig").ContextManager;
+const AgentHandle = @import("handle.zig").AgentHandle;
+const DistributedTracer = @import("../tracing/DistributedTracer.zig").DistributedTracer;
 
 pub const AiProvider = provider_mod.AiProvider;
 pub const SkillRegistry = skill_mod.SkillRegistry;
@@ -26,10 +28,12 @@ pub const AgentResult = struct {
     owned_answer: bool = false,
     /// Set when the run stopped early because the task budget was exhausted.
     budget_exhausted: bool = false,
+    /// Set when the run stopped early because the handle was canceled.
+    canceled: bool = false,
 
     pub fn deinit(self: *AgentResult, allocator: std.mem.Allocator) void {
         if (self.owned_answer and self.answer.len > 0) allocator.free(self.answer);
-        self.* = .{ .answer = "", .steps = 0, .budget_exhausted = false };
+        self.* = .{ .answer = "", .steps = 0, .budget_exhausted = false, .canceled = false };
     }
 };
 
@@ -57,6 +61,7 @@ pub const AgentMetrics = struct {
     tool_denied: usize = 0,
     max_steps_hits: usize = 0,
     budget_exhausted: usize = 0,
+    canceled: usize = 0,
 
     pub fn toPrometheusFormat(self: AgentMetrics, allocator: std.mem.Allocator, name: []const u8) ![]u8 {
         var buf: std.ArrayList(u8) = .empty;
@@ -82,6 +87,9 @@ pub const AgentMetrics = struct {
         try buf.print(allocator, "# HELP zigmodu_ai_agent_budget_exhausted_total Runs stopped by budget exhaustion.\n", .{});
         try buf.print(allocator, "# TYPE zigmodu_ai_agent_budget_exhausted_total counter\n", .{});
         try buf.print(allocator, "zigmodu_ai_agent_budget_exhausted_total{{agent=\"{s}\"}} {d}\n", .{ name, self.budget_exhausted });
+        try buf.print(allocator, "# HELP zigmodu_ai_agent_canceled_total Runs canceled via AgentHandle.\n", .{});
+        try buf.print(allocator, "# TYPE zigmodu_ai_agent_canceled_total counter\n", .{});
+        try buf.print(allocator, "zigmodu_ai_agent_canceled_total{{agent=\"{s}\"}} {d}\n", .{ name, self.canceled });
         return try buf.toOwnedSlice(allocator);
     }
 };
@@ -105,6 +113,11 @@ pub const Agent = struct {
     budget: ?*Budget = null,
     /// Optional conversation context manager (auto-compact long histories).
     context: ?*ContextManager = null,
+    /// Optional cooperative runtime control (cancel / pause / progress).
+    handle: ?*AgentHandle = null,
+    /// Optional distributed tracing (creates a run span when set with a parent).
+    tracer: ?*DistributedTracer = null,
+    parent_span: ?*DistributedTracer.Span = null,
 
     pub fn run(
         self: *Agent,
@@ -165,7 +178,22 @@ pub const Agent = struct {
 
         var steps: usize = 0;
         var budget_stopped = false;
+        var canceled_stopped = false;
+        var span: ?*DistributedTracer.Span = null;
+        if (self.tracer) |tr| {
+            if (self.parent_span) |p| span = try tr.startSpan(p, "ai.agent.run");
+        }
+        defer if (span) |s| s.end();
         while (steps < max_steps) : (steps += 1) {
+            if (self.handle) |h| {
+                if (h.isCanceled()) {
+                    self.metrics.canceled += 1;
+                    canceled_stopped = true;
+                    break;
+                }
+                h.waitIfPaused();
+                h.recordStep();
+            }
             if (self.context) |cm| {
                 if (cm.shouldCompact(messages.items)) {
                     const new_msgs = try cm.manage(allocator, messages.items, &summary);
@@ -202,7 +230,7 @@ pub const Agent = struct {
                     log.record(.run_finish, "", resp.content, skill_ctx.tenant_id orelse 0, skill_ctx.user_id orelse 0);
                 }
                 const answer = try allocator.dupe(u8, resp.content);
-                return .{ .answer = answer, .steps = steps + 1, .owned_answer = true, .budget_exhausted = budget_stopped };
+                return .{ .answer = answer, .steps = steps + 1, .owned_answer = true, .budget_exhausted = budget_stopped, .canceled = canceled_stopped };
             }
 
             const tc_copy = try allocator.alloc(AiProvider.ToolCall, resp.tool_calls.len);
@@ -305,7 +333,7 @@ pub const Agent = struct {
             log.record(.run_max_steps, "", "max_steps exceeded", skill_ctx.tenant_id orelse 0, skill_ctx.user_id orelse 0);
         }
         const timeout_msg = try allocator.dupe(u8, "Agent stopped: max_steps exceeded");
-        return .{ .answer = timeout_msg, .steps = steps, .owned_answer = true, .budget_exhausted = budget_stopped };
+        return .{ .answer = timeout_msg, .steps = steps, .owned_answer = true, .budget_exhausted = budget_stopped, .canceled = canceled_stopped };
     }
 };
 

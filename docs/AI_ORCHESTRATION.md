@@ -34,6 +34,9 @@ defer result.deinit();
 
 ### 已落地（本轮）
 
+- **`zigmodu.ai.AgentHandle` 运行时控制**：协作式 cancel / pause / 进度计数
+  （原子标志，Agent 每步边界检查）；`Agent.tracer` + `parent_span` 可选创建
+  run 级 trace span（复用 DistributedTracer）；
 - **`zigmodu.ai.context` 上下文管理**：按 token 阈值自动压缩长对话——旧消息
   交给 `SummarizeFn` 摘要（或直接丢弃）作为 system 消息前置，保留最近窗口；
   `Agent.context` 已接入（循环内自动触发）；
@@ -50,11 +53,6 @@ defer result.deinit();
   输出不达标自动重跑最后一步，仍不达标升级为失败；
 - **转人工钩子**：`Workflow.on_escalate`（`EscalateFn`），步骤失败（重试后）、
   预算超支、验证持续失败三种原因回调应用层。
-
-### P2
-
-- **运行时控制**：`AgentHandle`（cancel/pause/resume + 进度查询）+ 每步 trace
-  span（复用 OTLP）。
 
 ## 边界（不做）
 
