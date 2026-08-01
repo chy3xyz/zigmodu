@@ -144,6 +144,13 @@ note）、`llmRiskDecide`（风控决策）。把 `SkillContext.userdata` 指向
 （如审批政策、历史处置、playbook）注入三个策略的 prompt——
 LLM 决策基于实际业务上下文而非空泛通用判断。
 
+## 观测性
+
+`zigmodu.ai.WorkflowMetrics`（挂到 `Workflow.metrics`）在每次 run/resume 时
+累计 `runs` / `completed_steps` / `failed_steps` / `escalations` / `reviews`
+（反射重跑次数），`toPrometheusFormat` 导出 `zigmodu_ai_workflow_*` 指标；
+与 `AgentMetrics`、`TokenQuota` 一样可直接接入框架 metrics 端点。
+
 ## 边界（不做）
 
 无界自主循环（每轮有限步骤 + 预算 + 可中止）；不新增 shell/MCP 能力。

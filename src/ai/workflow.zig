@@ -82,6 +82,33 @@ pub const WorkflowResult = struct {
     }
 };
 
+/// Aggregated counters for workflow runs. Attach via `Workflow.metrics`; the
+/// counters are updated on every run / resume, including DAG waves.
+pub const WorkflowMetrics = struct {
+    runs: usize = 0,
+    completed_steps: usize = 0,
+    failed_steps: usize = 0,
+    escalations: usize = 0,
+    /// Reflection quality-gate re-runs.
+    reviews: usize = 0,
+
+    pub fn toPrometheusFormat(self: WorkflowMetrics, allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        try buf.print(allocator, "# HELP zigmodu_ai_workflow_runs_total Workflow runs started.\n", .{});
+        try buf.print(allocator, "# TYPE zigmodu_ai_workflow_runs_total counter\n", .{});
+        try buf.print(allocator, "zigmodu_ai_workflow_runs_total{{workflow=\"{s}\"}} {d}\n", .{ name, self.runs });
+        try buf.print(allocator, "# TYPE zigmodu_ai_workflow_steps_total counter\n", .{});
+        try buf.print(allocator, "zigmodu_ai_workflow_steps_total{{workflow=\"{s}\",status=\"completed\"}} {d}\n", .{ name, self.completed_steps });
+        try buf.print(allocator, "zigmodu_ai_workflow_steps_total{{workflow=\"{s}\",status=\"failed\"}} {d}\n", .{ name, self.failed_steps });
+        try buf.print(allocator, "# TYPE zigmodu_ai_workflow_escalations_total counter\n", .{});
+        try buf.print(allocator, "zigmodu_ai_workflow_escalations_total{{workflow=\"{s}\"}} {d}\n", .{ name, self.escalations });
+        try buf.print(allocator, "# TYPE zigmodu_ai_workflow_reviews_total counter\n", .{});
+        try buf.print(allocator, "zigmodu_ai_workflow_reviews_total{{workflow=\"{s}\"}} {d}\n", .{ name, self.reviews });
+        return try buf.toOwnedSlice(allocator);
+    }
+};
+
 const StepOutcome = struct {
     output: []const u8,
     budget_exhausted: bool = false,
@@ -108,6 +135,8 @@ pub const Workflow = struct {
     wal: ?*WAL = null,
     /// Identifier used to namespace persisted step records.
     run_id: []const u8 = "",
+    /// Optional metrics sink; updated on every run / resume when set.
+    metrics: ?*WorkflowMetrics = null,
 
     pub fn init(registry: *SkillRegistry, steps: []const Step) Workflow {
         return .{ .registry = registry, .steps = steps };
@@ -125,6 +154,7 @@ pub const Workflow = struct {
         errdefer result.deinit();
         var completed = std.StringHashMap(void).init(allocator);
         defer completed.deinit();
+        if (self.metrics) |m| m.runs += 1;
         try self.runSteps(allocator, ctx, 0, &completed, &result);
         return result;
     }
@@ -175,6 +205,7 @@ pub const Workflow = struct {
             return result;
         }
         if (next_index >= self.steps.len) return result;
+        if (self.metrics) |m| m.runs += 1;
         try self.runSteps(allocator, ctx, next_index, &completed, &result);
         return result;
     }
@@ -234,6 +265,7 @@ pub const Workflow = struct {
                     var reviews: usize = 0;
                     var verified = try vf(ctx, self.goal, outcome.?.output, allocator);
                     while (!verified) : (reviews += 1) {
+                        if (self.metrics) |m| m.reviews += 1;
                         if (reviews >= self.max_reviews) {
                             try self.maybeEscalate(ctx, .verification_failed, step.name, allocator);
                             result.status = .failed;
@@ -389,6 +421,7 @@ pub const Workflow = struct {
         step_index: usize,
         outcome: StepOutcome,
     ) !void {
+        if (self.metrics) |m| m.completed_steps += 1;
         try result.steps.append(allocator, .{
             .name = try allocator.dupe(u8, step.name),
             .status = .completed,
@@ -405,6 +438,7 @@ pub const Workflow = struct {
         step_index: usize,
         last_err: anyerror,
     ) !void {
+        if (self.metrics) |m| m.failed_steps += 1;
         try result.steps.append(allocator, .{
             .name = try allocator.dupe(u8, step.name),
             .status = .failed,
@@ -461,6 +495,7 @@ pub const Workflow = struct {
         step: ?[]const u8,
         allocator: std.mem.Allocator,
     ) !void {
+        if (self.metrics) |m| m.escalations += 1;
         if (self.on_escalate) |cb| try cb(ctx, reason, step, allocator);
     }
 
@@ -541,6 +576,55 @@ test "workflow runs skill steps and records results" {
     try std.testing.expectEqual(StepStatus.completed, result.steps.items[1].status);
     try std.testing.expectEqual(@as(usize, 2), count);
     try std.testing.expect(std.mem.indexOf(u8, result.steps.items[1].output, "\"count\":2") != null);
+}
+
+test "workflow metrics track runs, steps and escalations" {
+    const allocator = std.testing.allocator;
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    const Ok = struct {
+        fn h(ctx: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+            return .{ .string = try ctx.allocator.dupe(u8, "ok") };
+        }
+    };
+    try registry.register(.{ .name = "ok", .description = "", .parameters = &.{}, .handler = Ok.h });
+    const Fail = struct {
+        fn h(_: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+            return error.Boom;
+        }
+    };
+    try registry.register(.{ .name = "boom", .description = "", .parameters = &.{}, .handler = Fail.h });
+
+    var metrics = WorkflowMetrics{};
+    var ctx = SkillContext{ .allocator = allocator };
+
+    const good_steps = [_]Step{
+        .{ .name = "a", .kind = .{ .skill = .{ .name = "ok", .args = .{ .object = .{} } } } },
+        .{ .name = "b", .kind = .{ .skill = .{ .name = "ok", .args = .{ .object = .{} } } } },
+    };
+    var good = Workflow.init(&registry, &good_steps);
+    good.metrics = &metrics;
+    var good_result = try good.run(allocator, &ctx);
+    defer good_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metrics.runs);
+    try std.testing.expectEqual(@as(usize, 2), metrics.completed_steps);
+
+    const bad_steps = [_]Step{
+        .{ .name = "a", .kind = .{ .skill = .{ .name = "ok", .args = .{ .object = .{} } } } },
+        .{ .name = "bad", .kind = .{ .skill = .{ .name = "boom", .args = .{ .object = .{} } } }, .retry = 1 },
+    };
+    var bad = Workflow.init(&registry, &bad_steps);
+    bad.metrics = &metrics;
+    var bad_result = try bad.run(allocator, &ctx);
+    defer bad_result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), metrics.runs);
+    try std.testing.expectEqual(@as(usize, 1), metrics.failed_steps);
+    try std.testing.expectEqual(@as(usize, 1), metrics.escalations);
+
+    const prom = try metrics.toPrometheusFormat(allocator, "wf");
+    defer allocator.free(prom);
+    try std.testing.expect(std.mem.indexOf(u8, prom, "zigmodu_ai_workflow_runs_total{workflow=\"wf\"} 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prom, "status=\"failed\"} 1") != null);
 }
 
 test "workflow marks a failing step and stops" {
