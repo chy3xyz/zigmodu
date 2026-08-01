@@ -106,6 +106,11 @@ WAL 持久化、转人工在 DAG 下同样生效；反射质量门当前应用�
 - **转人工钩子**：`Workflow.on_escalate`（`EscalateFn`），步骤失败（重试后）、
   预算超支、验证持续失败三种原因回调应用层。
 
+  `ai.llm.llmVerify` 是现成的 LLM-backed 验证器（可直接赋给
+  `Workflow.reflection`）：让模型判断输出是否达成目标（`{"pass":...}`），
+  模型失败/非法响应保守返回 false 触发重跑；配合 `LlmPolicyCtx` 的
+  `json_fn` 注入即可测试。
+
 ## P0/P1 · outbox 消费闭环
 
 `zigmodu.outbox.OutboxConsumer` 补齐事务性 outbox 的**读侧**：轮询 pending

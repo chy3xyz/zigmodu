@@ -190,6 +190,30 @@ pub fn llmRiskDecide(
     return .escalate;
 }
 
+/// LLM-backed quality gate for `Workflow.reflection` (matches `VerifyFn`):
+/// asks the model whether `output` satisfies `goal` and returns
+/// `{"pass":true|false}`. Model failures and malformed responses return
+/// `false` (conservative — the step is re-run / escalated).
+pub fn llmVerify(
+    ctx: *SkillContext,
+    goal: []const u8,
+    output: []const u8,
+    allocator: std.mem.Allocator,
+) anyerror!bool {
+    const pc: *LlmPolicyCtx = @ptrCast(@alignCast(ctx.userdata orelse return error.LlmNotConfigured));
+    const user = try std.fmt.allocPrint(
+        allocator,
+        "Goal: {s}\n\nOutput:\n{s}\n\nRespond with JSON only: {{\"pass\":true,\"reason\":\"...\"}}",
+        .{ goal, output },
+    );
+    defer allocator.free(user);
+
+    const json = pc.json_fn(pc, allocator, "You verify whether an AI output meets a goal. Output only JSON.", user) catch return false;
+    defer freeValue(allocator, json);
+    const pass = (json.object.get("pass") orelse return false).bool;
+    return pass;
+}
+
 fn fakeJson(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!std.json.Value {
     var obj = std.json.ObjectMap{};
     try putOwned(&obj, allocator, "decision", .{ .string = try allocator.dupe(u8, "approve") });
@@ -259,4 +283,35 @@ test "llmApprove falls back to escalate when the model fails" {
     try std.testing.expectEqual(approval_mod.ApprovalDecision.escalated, decision);
     try std.testing.expect(std.mem.indexOf(u8, note, "escalated") != null);
     allocator.free(note);
+}
+
+test "llmVerify gates on the model's judgement" {
+    const allocator = std.testing.allocator;
+    const Gate = struct {
+        var pass: bool = false;
+        fn f(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!std.json.Value {
+            var obj = std.json.ObjectMap{};
+            try putOwned(&obj, a, "pass", .{ .bool = @This().pass });
+            return .{ .object = obj };
+        }
+    };
+    var policy_ctx = LlmPolicyCtx{ .json_fn = Gate.f };
+    var ctx = SkillContext{ .allocator = allocator, .userdata = &policy_ctx };
+
+    Gate.pass = true;
+    try std.testing.expect(try llmVerify(&ctx, "goal", "output", allocator));
+    Gate.pass = false;
+    try std.testing.expect(!try llmVerify(&ctx, "goal", "output", allocator));
+}
+
+test "llmVerify fails conservatively when the model errors" {
+    const allocator = std.testing.allocator;
+    const FailJson = struct {
+        fn f(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!std.json.Value {
+            return error.ProviderUnreachable;
+        }
+    };
+    var policy_ctx = LlmPolicyCtx{ .json_fn = FailJson.f };
+    var ctx = SkillContext{ .allocator = allocator, .userdata = &policy_ctx };
+    try std.testing.expect(!try llmVerify(&ctx, "goal", "output", allocator));
 }
