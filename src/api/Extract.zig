@@ -216,6 +216,38 @@ pub fn respondErr(ctx: *Context, err: anyerror) !void {
     try respondProblem(ctx, status, detail);
 }
 
+/// Collect a slice of entities into an owned DTO slice via a comptime
+/// converter. `convert` returns DTO values (borrowed strings stay valid as
+/// long as the source entities outlive the DTOs; allocate + own when needed).
+/// Caller frees the returned slice.
+pub fn toDtoList(
+    allocator: std.mem.Allocator,
+    items: anytype,
+    comptime Dto: type,
+    comptime convert: *const fn (@typeInfo(@TypeOf(items)).pointer.child) Dto,
+) ![]Dto {
+    const out = try allocator.alloc(Dto, items.len);
+    errdefer allocator.free(out);
+    for (items, 0..) |e, i| out[i] = convert(e);
+    return out;
+}
+
+test "toDtoList maps entities to DTOs" {
+    const allocator = std.testing.allocator;
+    const Src = struct { id: i64, name: []const u8 };
+    const Dto = struct { id: i64 };
+    const src = [_]Src{ .{ .id = 1, .name = "a" }, .{ .id = 2, .name = "b" } };
+    const slice: []const Src = &src;
+    const out = try toDtoList(allocator, slice, Dto, struct {
+        fn c(e: Src) Dto {
+            return .{ .id = e.id };
+        }
+    }.c);
+    defer allocator.free(out);
+    try std.testing.expectEqual(@as(usize, 2), out.len);
+    try std.testing.expectEqual(@as(i64, 2), out[1].id);
+}
+
 // ── tests ──
 
 test "extractPath ints and strings" {

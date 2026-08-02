@@ -95,6 +95,11 @@ pub fn sse(ctx: *Context) !SseWriter {
 }
 
 pub const Extract = @import("api/Extract.zig");
+pub const page = @import("http/Page.zig");
+pub const PageParams = page.PageParams;
+pub const PageOpts = page.PageOpts;
+pub const PageEnvelope = page.Envelope;
+pub const sendPaged = page.sendPaged;
 pub const extractQuery = Extract.extractQuery;
 pub const extractPath = Extract.extractPath;
 pub const extractJson = Extract.extractJson;
