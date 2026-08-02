@@ -1,8 +1,10 @@
-//! EXPERIMENTAL — HTTP 402 / x402 monetization helpers.
+//! HTTP 402 / x402 monetization helpers (production-ready).
 //!
 //! Payment verification is **fail-closed by default**. Production code must
 //! inject an explicit `PaymentVerifier` (on-chain check, allow-list, etc.).
 //! Never treat a bare `verifyPayment` / missing verifier as "paid".
+//! For persisted, exactly-once redemption use `x402_store.X402Store` with
+//! `middleware.x402Middleware` (see docs/WEB4.md).
 
 const std = @import("std");
 

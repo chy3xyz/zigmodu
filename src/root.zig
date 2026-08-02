@@ -64,14 +64,6 @@ pub const security = @import("security.zig");
 pub const observability = @import("observability.zig");
 
 /// Deprecated flat aliases — remove in v0.14.0. Prefer domain imports above.
-pub const deprecated = @import("deprecated.zig");
-pub const http_server = deprecated.http_server;
-pub const sqlx = deprecated.sqlx;
-pub const orm = deprecated.orm;
-pub const SqlxBackend = deprecated.SqlxBackend;
-pub const PasswordEncoder = deprecated.PasswordEncoder;
-pub const SecurityModule = deprecated.SecurityModule;
-pub const Cache = deprecated.Cache;
 
 // ============================================================
 // 3. RESILIENCE

@@ -16,7 +16,7 @@ test "order - module compiles" {
 
 test "order - persistence init stub" {
     // Integration test: requires live DB backend
-    // const backend = zigmodu.SqlxBackend{ .allocator = std.testing.allocator, .client = undefined };
+    // const backend = zigmodu.data.SqlxBackend{ .allocator = std.testing.allocator, .client = undefined };
     // var p = persistence.OrderPersistence.init(backend);
     try std.testing.expect(true);
 }

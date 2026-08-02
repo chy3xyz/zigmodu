@@ -111,8 +111,11 @@ const obs = zmodu.observability;
 | `zigmodu.SecurityModule` | `zigmodu.security.SecurityModule` |
 | `zigmodu.Cache` | `@import("cache/Lru.zig").Cache` (generic) |
 
-Flat aliases remain on `zigmodu` root via `zigmodu.deprecated` for one release cycle.
-See `src/deprecated.zig` for the full list and `REMOVAL_VERSION`.
+The flat aliases (`zigmodu.http_server`, `zigmodu.sqlx`, `zigmodu.orm`,
+`zigmodu.SqlxBackend`, `zigmodu.PasswordEncoder`, `zigmodu.SecurityModule`,
+`zigmodu.Cache`) and the `zigmodu.deprecated` namespace were **removed in
+v0.15.1** (the planned removal version was v0.14.0). Use the canonical domain
+imports: `zigmodu.http`, `zigmodu.data`, `zigmodu.security`, `zigmodu.cache`.
 
 ## JWT & Security (v0.13.15+)
 

@@ -6,9 +6,9 @@ const order_svc = @import("service.zig");
 
 pub const OrderServiceExt = struct {
     svc: *order_svc.OrderService,
-    backend: zigmodu.SqlxBackend,
+    backend: zigmodu.data.SqlxBackend,
 
-    pub fn init(svc: *order_svc.OrderService, backend: zigmodu.SqlxBackend) OrderServiceExt {
+    pub fn init(svc: *order_svc.OrderService, backend: zigmodu.data.SqlxBackend) OrderServiceExt {
         return .{ .svc = svc, .backend = backend };
     }
 
