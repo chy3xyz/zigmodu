@@ -283,11 +283,22 @@ bash scripts/ci-integration.sh   # tenant-mgmt + stress + shopdemo（-Ddb=sqlite
 ```
 
 ## Version
-- Framework: **v0.15.2** (`build.zig.zon`)
+- Framework: **v0.15.3** (`build.zig.zon`)
 - Zig: **0.17.0-dev.1422+e863bf3be**（CI 同款锁定版本，见 `.github/workflows/ci.yml` → `ZIG_VERSION`；避免 fmt 行为漂移）
 - Tests: **820+ passed**, 18 skipped（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`）
 - Score: ~98/100（`docs/EVALUATION_REPORT.md` v5.6）
 - Roadmap: `docs/PRODUCTION_ROADMAP.md`（phases 1–9 ✅）
+
+### Release 流程（强制）
+- 发布一律走 `bash scripts/release.sh <x.y.z> [--push]`：自动 bump 全部版本引用
+  （`build.zig.zon` / `src/ai/mcp.zig` / README* / CLAUDE.md / AGENTS.md /
+  AI_METHODOLOGY.md）、promote CHANGELOG `[Unreleased]`、跑门禁
+  （fmt + 全量测试 + deadcode）、commit + annotated tag，收尾断言 tag 与
+  包内 version 一致。
+- 推 tag 前本地先过 `bash scripts/check-release-tag.sh`；CI 的 `release-verify`
+  job 会在任何 `v*` tag push 时复核（tag == `build.zig.zon` version，且
+  CHANGELOG 有条目）。两者任一失败 = 发布无效。
+- 业务项目发布前置门禁：`zmodu ci`（build + fmt + verify + audit + deadcode）。
 
 ## Learned User Preferences
 
@@ -300,7 +311,7 @@ bash scripts/ci-integration.sh   # tenant-mgmt + stress + shopdemo（-Ddb=sqlite
 
 ## Learned Workspace Facts
 
-- Package **v0.15.2** · Zig **0.17.0** · GitHub `chy3xyz/zigmodu` · branch `master`.
+- Package **v0.15.3** · Zig **0.17.0** · GitHub `chy3xyz/zigmodu` · branch `master`.
 - Sandbox cache：`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`.
 - Auth Path A + `CatalogPermLoadInput` 已落地；legacy JWT 只写 `auth_info`。
 - x402 fail-closed；OTLP/Vault 仅 plain HTTP。

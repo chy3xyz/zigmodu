@@ -1,4 +1,4 @@
-# ZigModu v0.15.2
+# ZigModu v0.15.3
 
 A modular application framework for Zig 0.17, inspired by Spring Modulith. Build scalable applications from monolithic to distributed systems with progressive architecture evolution.
 

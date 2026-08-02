@@ -475,3 +475,15 @@ jobs:
           LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           LLM_MODEL: ${{ secrets.LLM_MODEL }}
+
+  # ── Release tag consistency ─────────────────────────
+  # Runs only when a v* tag is pushed: the tag version must equal the package
+  # version in build.zig.zon and have a matching CHANGELOG section.
+  release-verify:
+    name: Release tag consistency
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify tag matches package version
+        run: bash scripts/check-release-tag.sh
