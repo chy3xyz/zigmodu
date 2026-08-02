@@ -83,6 +83,8 @@ jobs:
             echo "== building examples/$ex =="
             (cd "examples/$ex" && zig build)
           done
+          echo "== building examples/zfsaas/backend =="
+          (cd examples/zfsaas/backend && zig build)
 
       - name: zmodu ai CLI smoke (export-skills + openapi)
         run: |
@@ -201,6 +203,8 @@ jobs:
             echo "== building examples/$ex =="
             (cd "examples/$ex" && zig build)
           done
+          echo "== building examples/zfsaas/backend =="
+          (cd examples/zfsaas/backend && zig build)
 
   # ── Integration (full) ─────────────────────────
   integration-full:

@@ -1,0 +1,27 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1779313620411,
+      "tag": "0000_init-db",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1779313620412,
+      "tag": "0001_saas_core",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1779313620413,
+      "tag": "0002_webhook_events",
+      "breakpoints": true
+    }
+  ]
+}

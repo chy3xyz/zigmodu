@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: saas
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      SESSION_SECRET: ci-session-secret-change-me-please-32c
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/saas
+      PUBLIC_APP_URL: http://localhost:3000
+      EMAIL_MOCK: 'true'
+      NODE_ENV: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Migrate database
+        run: npm run db:migrate
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run check:types
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Install Playwright
+        run: npx playwright install --with-deps chromium
+
+      - name: Build
+        run: npm run build
+
+      - name: E2E
+        run: npm run test:e2e

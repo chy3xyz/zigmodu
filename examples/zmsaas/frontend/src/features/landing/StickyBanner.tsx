@@ -1,0 +1,9 @@
+import type { ParentProps } from 'solid-js';
+
+export function StickyBanner(props: ParentProps) {
+  return (
+    <div class="sticky top-0 z-50 bg-primary p-4 text-center text-lg font-semibold text-primary-foreground [&_a]:text-fuchsia-500 [&_a:hover]:text-indigo-500">
+      {props.children}
+    </div>
+  );
+}

@@ -19,6 +19,8 @@ const ai_cli = @import("ai_cli.zig");
 const deadcode = @import("deadcode.zig");
 const audit_mod = @import("audit.zig");
 const ci_mod = @import("ci.zig");
+const saas_mod = @import("saas.zig");
+const market_mod = @import("market.zig");
 
 const Command = enum {
     new,
@@ -43,6 +45,8 @@ const Command = enum {
     audit,
     graph,
     ci,
+    saas,
+    market,
     deadcode,
     help,
     version,
@@ -159,7 +163,6 @@ fn parseOrmCli(args: []const []const u8) ParseOrmCliResult {
             return .{ .err_unknown_flag = args[i] };
         }
     }
-
     return .{ .ok = .{
         .sql_path = sql_path,
         .out_dir = out_dir,
@@ -267,6 +270,8 @@ fn runCommand(io: std.Io, allocator: std.mem.Allocator, command: Command, cmd_ar
         .audit => cmdAudit(io, allocator, cmd_args),
         .graph => try cmdGraph(io, allocator, cmd_args),
         .ci => cmdCi(io, allocator, cmd_args),
+        .saas => try cmdSaas(io, allocator, cmd_args),
+        .market => cmdMarket(io, allocator, cmd_args),
         .deadcode => cmdDeadcode(io, allocator, cmd_args),
         .help => {
             if (cmd_args.len != 0) {
@@ -381,6 +386,8 @@ fn parseCommand(cmd: []const u8) ?Command {
     if (std.mem.eql(u8, cmd, "audit")) return .audit;
     if (std.mem.eql(u8, cmd, "graph")) return .graph;
     if (std.mem.eql(u8, cmd, "ci")) return .ci;
+    if (std.mem.eql(u8, cmd, "saas")) return .saas;
+    if (std.mem.eql(u8, cmd, "market")) return .market;
     if (std.mem.eql(u8, cmd, "ai")) return .ai;
     if (std.mem.eql(u8, cmd, "deadcode")) return .deadcode;
     if (std.mem.eql(u8, cmd, "help")) return .help;
@@ -420,6 +427,8 @@ fn printUsage() void {
         \\  audit [dir]       Best-practice audit: architecture rules + business lint
         \\  graph [dir]       Render module dependency graph (Mermaid)
         \\  ci [dir]          One-shot gate: build + fmt + verify + audit + deadcode
+        \\  saas <model.json>  SaaS backend module from a business model (org-scoped)
+        \\  market             Curated module catalog: list | search <q> | info <id>
         \\  deadcode          Scan for unused declarations (dead code)
         \\  generate <t>   Alias: generate module|event|api|orm [...]
         \\  help            Show help
@@ -637,6 +646,77 @@ fn cmdGraph(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) 
 fn cmdCi(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) void {
     const code = ci_mod.run(io, allocator, args);
     if (code != 0) std.process.exit(code);
+}
+
+/// `zmodu saas <model.json> [--out <dir>] [--tenant-column <col>] [--dry-run] [--force]`
+/// — emit an org-scoped schema from a business model and feed it to the
+/// canonical `zmodu orm` pipeline (model/persistence/service/api + routes).
+fn cmdSaas(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len == 0 or args[0].len == 0) {
+        std.log.err("Usage: zmodu saas <model.json> [--out <dir>] [--tenant-column <col>] [--dry-run] [--force]", .{});
+        return error.CliUsage;
+    }
+    const model_path = args[0];
+    var out_dir: []const u8 = "src/modules";
+    var tenant_col: []const u8 = "org_id";
+    var dry_run = false;
+    var force = false;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--out")) {
+            if (i + 1 >= args.len) return error.CliUsage;
+            i += 1;
+            out_dir = args[i];
+        } else if (std.mem.eql(u8, args[i], "--tenant-column")) {
+            if (i + 1 >= args.len) return error.CliUsage;
+            i += 1;
+            tenant_col = args[i];
+        } else if (std.mem.eql(u8, args[i], "--dry-run")) {
+            dry_run = true;
+        } else if (std.mem.eql(u8, args[i], "--force")) {
+            force = true;
+        } else {
+            return error.CliUsage;
+        }
+    }
+    const model_json = Io.Dir.cwd().readFileAlloc(io, model_path, allocator, Io.Limit.limited(4 * 1024 * 1024)) catch |err| {
+        std.log.err("Cannot read model '{s}': {s}", .{ model_path, @errorName(err) });
+        return error.CliUsage;
+    };
+    defer allocator.free(model_json);
+
+    const schema_sql = saas_mod.emitSchemaSql(allocator, model_json) catch |err| {
+        std.log.err("Invalid business model '{s}': {s}", .{ model_path, @errorName(err) });
+        return error.CliUsage;
+    };
+    defer allocator.free(schema_sql);
+
+    const schema_path = try std.fs.path.join(allocator, &.{ out_dir, "saas-schema.sql" });
+    defer allocator.free(schema_path);
+    if (!dry_run) {
+        Io.Dir.cwd().createDirPath(io, out_dir) catch {};
+        const file = try Io.Dir.cwd().createFile(io, schema_path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, schema_sql);
+    }
+    std.log.info("saas: schema written to {s}", .{schema_path});
+
+    if (dry_run) {
+        std.log.info("saas: dry-run — schema written, module generation skipped", .{});
+        return;
+    }
+    try saas_mod.generateModule(io, allocator, model_json, out_dir);
+    std.log.info("saas: mount + auth wiring per docs/ROUTE_TABLE.md §7 (jwtAuthFromCatalogWithPermissions + permissionGate)", .{});
+}
+
+fn cmdMarket(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) void {
+    const code = market_mod.run(io, allocator, args);
+    if (code != 0) std.process.exit(code);
+}
+
+test "cli submodule coverage gates (saas + market)" {
+    _ = @import("saas.zig");
+    _ = @import("market.zig");
 }
 
 fn cmdVerify(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -1582,21 +1662,19 @@ fn generateAgentsMd(allocator: std.mem.Allocator, project_name: []const u8) ![]c
 }
 
 fn generateMainZig(allocator: std.mem.Allocator, project_name: []const u8) ![]const u8 {
-    _ = project_name;
-    return try allocator.dupe(u8,
+    const tpl =
         \\const std = @import("std");
         \\const zigmodu = @import("zigmodu");
         \\
-        \\pub fn main(init: std.process.Init) !void {
-        \\    const allocator = init.gpa;
-        \\
-        \\    std.log.info("Application '{s}' started!", .{project_name});
+        \\pub fn main(_: std.process.Init) !void {
+        \\    std.log.info("Application '{{PROJECT_NAME}}' started!", .{});
         \\
         \\    // TODO: Add your modules via `zmodu module <name>`
         \\    // Then wire them in: var app = try zigmodu.builder(allocator, init.io).build(.{...});
         \\}
         \\
-    );
+    ;
+    return replaceAllStr(allocator, tpl, "{{PROJECT_NAME}}", project_name);
 }
 
 fn generateModule(allocator: std.mem.Allocator, module_name: []const u8) ![]const u8 {
@@ -7031,6 +7109,7 @@ fn generateLifeDir(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u8
     const dp = try std.fmt.allocPrint(allocator, "{s}/DNA.md", .{life_dir});
     defer allocator.free(dp);
     var dna: std.ArrayList(u8) = .empty;
+    defer dna.deinit(allocator);
     try dna.print(allocator, "# {s}\ngenesis: zmodu scaffold\ntables: {d}\nmodules: {d}\nframework: zigmodu v0.13.9\nzig: 0.17.0\n", .{ project_name, table_count, module_count });
     try safeWrite(io, allocator, dp, dna.items, gen_opts);
 
@@ -7045,6 +7124,7 @@ fn generateLifeDir(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u8
     const tpath = try std.fmt.allocPrint(allocator, "{s}/v0.1.0.md", .{td});
     defer allocator.free(tpath);
     var tree_buf: std.ArrayList(u8) = .empty;
+    defer tree_buf.deinit(allocator);
     try tree_buf.print(allocator, "# v0.1.0 genesis\nzmodu scaffold\n{d} tables → {d} modules\n", .{ table_count, module_count });
     try safeWrite(io, allocator, tpath, tree_buf.items, gen_opts);
 

@@ -131,6 +131,38 @@ legacy 演示，可用基线逐步治理。
 
 ---
 
+## `zmodu market` — 模块市场（Phase 1 策展目录 + Phase 2 远程发现/安装）
+
+模块市场分阶段：**Phase 1** 是本地策展目录
+（`tools/zmodu/src/marketplace/catalog.json`，`schema_version: 1`），登记值得
+引用的 example / plugin，先解决可发现性；**Phase 2** 增加远程发现与安装——
+`update` 拉取远程索引合并进本地浏览，`install` 把条目源码复制进项目。签名、
+build.zig.zon 自动写入与 CI 回归钩子仍延后（ADR-016）——先有质量门
+（ADR-014 / `zmodu ci`）再谈扩张，避免在版本纪律稳定前引入"下载并执行第三方
+代码"的信任面。
+
+```bash
+zmodu market list                      # 列出全部策展条目（本地 + 已缓存远程索引）
+zmodu market search saas               # id/name/summary/tags 大小写不敏感匹配
+zmodu market info example/zmsaas       # 单个条目详情
+zmodu market update                    # 拉取远程索引 -> .zmodu/market-index.json
+zmodu market update --index <url>      # 自定义索引源
+zmodu market install example/basic --dir ./vendor [--dry-run] [--verify]
+zmodu market list --json               # 机器可读 JSON
+zmodu market list --catalog <path>     # 用外部目录文件替代内嵌目录
+```
+
+条目字段：`id`（`example/<name>` 或 `plugin/<name>`）、`kind`、`path`、
+`summary`、`tags`、`min_version`、`doc`、`status`（plugin stub 为 `"stub"`）。
+
+| 阶段 | 发现模块 | 安装 | 信任 | 门槛 |
+|------|----------|------|------|------|
+| Phase 1（已完成） | `zmodu market search … --json` | 读 `path` 参考接线（或 `zmodu saas`/`scaffold` 生成） | 本地策展 | — |
+| Phase 2（本轮） | `market update` 远程索引（合并浏览） | `market install <id> --dir … [--dry-run] [--verify]` 复制源码树（跳过 node_modules/.git 等） | 本地策展 + URL 来源 | `--verify` 就地 `zig build` |
+| Phase 2c（ADR-016，未做） | 远程索引升级 | `install` 自动写 `build.zig.zon` | 签名包 | 要求 `zmodu ci` 绿 + catalog schema 版本化 |
+
+新增官方示例的流程：先合入 `examples/`（保证示例构建绿），再往 catalog 加一行。
+
 ## `zmodu ci` — 一站式质量门禁
 
 一条命令跑完全部门禁（面向 CI 或本地提交流程）：

@@ -1,0 +1,216 @@
+{
+  "Index": {
+    "meta_title": "SaaS SolidJS - Build and scale multi-tenant SaaS with SolidStart",
+    "meta_description": "Production-ready SolidStart starter with auth, organizations, Stripe billing, Resend email, and English/Chinese i18n."
+  },
+  "Navbar": {
+    "sign_in": "Sign in",
+    "sign_up": "Sign up",
+    "dashboard": "Dashboard",
+    "features": "Features",
+    "pricing": "Pricing",
+    "faq": "FAQ",
+    "github": "GitHub"
+  },
+  "LocaleSwitcher": {
+    "button_label": "Change language"
+  },
+  "DemoBanner": {
+    "text": "Live demo of SaaS SolidJS —",
+    "cta": "Open the dashboard"
+  },
+  "Hero": {
+    "follow_github": "Star chy3xyz/saas-solidjs on GitHub",
+    "title": "The perfect <important>SaaS SolidJS</important> starter to build and scale your business with ease.",
+    "description": "Auth, organizations, Stripe subscriptions, and Resend email — a SolidStart foundation ready for production.",
+    "primary_button": "Start free",
+    "secondary_button": "Star on GitHub"
+  },
+  "Features": {
+    "section_subtitle": "Product",
+    "section_title": "Everything you need to ship SaaS",
+    "section_description": "Multi-tenant building blocks wired for real customers — not just a demo shell.",
+    "feature1_title": "Secure auth",
+    "feature1_description": "Email/password sessions, verification, and password reset with hashed tokens.",
+    "feature2_title": "Organizations & RBAC",
+    "feature2_description": "Invite members, assign admin/member roles, and keep tenants isolated.",
+    "feature3_title": "Stripe billing",
+    "feature3_description": "Checkout, Customer Portal, and webhooks that sync subscription status.",
+    "feature4_title": "Transactional email",
+    "feature4_description": "Resend-powered invites, verification, and reset flows with en/zh templates.",
+    "feature5_title": "English & 中文",
+    "feature5_description": "SSR-aware locale switching with dictionaries for marketing and dashboard.",
+    "feature6_title": "Postgres + Drizzle",
+    "feature6_description": "Typed schema, migrations, and PGLite for local development without Docker."
+  },
+  "Pricing": {
+    "section_subtitle": "Pricing",
+    "section_title": "Simple plans for every team",
+    "section_description": "Start free. Upgrade when you need more seats and capacity.",
+    "button_text": "Get started",
+    "upgrade_text": "Upgrade"
+  },
+  "PricingPlans": {
+    "free_plan_name": "Free",
+    "premium_plan_name": "Premium",
+    "enterprise_plan_name": "Enterprise"
+  },
+  "PricingCard": {
+    "free_plan_description": "For individuals",
+    "premium_plan_description": "For small teams",
+    "enterprise_plan_description": "For industry leaders",
+    "plan_price": "${price}",
+    "plan_interval_month": "/ month",
+    "plan_interval_year": "/ year"
+  },
+  "PricingFeatures": {
+    "feature_team_member": "Up to {number} team members",
+    "feature_website": "Up to {number} websites",
+    "feature_storage": "{number} GB of storage",
+    "feature_transfer": "{number} TB of transfer",
+    "feature_email_support": "Email support"
+  },
+  "SponsorLogos": {
+    "sponsored_by": "Tech stack"
+  },
+  "FAQ": {
+    "section_subtitle": "FAQ",
+    "section_title": "Questions, answered",
+    "section_description": "What teams usually ask before adopting this starter.",
+    "q1": "Is this production ready?",
+    "a1": "Yes — Postgres-backed auth, organization RBAC, Stripe subscriptions, Resend email, CSRF protection, and rate limiting are included.",
+    "q2": "Do I need Docker locally?",
+    "a2": "No. Run PGLite with npm run db-server, or point DATABASE_URL at Neon/Postgres.",
+    "q3": "How does billing work?",
+    "a3": "Admins start Checkout from Pricing or Billing. Stripe webhooks update your subscriptions table; Customer Portal handles upgrades and cancellations.",
+    "q4": "Can I invite teammates?",
+    "a4": "Yes. Admins invite by email, members accept via a secure token link, and you can resend or revoke pending invites.",
+    "q5": "Which languages are supported?",
+    "a5": "English and Chinese out of the box. Locale follows cookie/SSR and maps into email and Stripe Checkout where possible.",
+    "q6": "Can I replace the auth system later?",
+    "a6": "The session layer is self-contained. You can keep it, or swap providers later without rewriting org and billing modules."
+  },
+  "CTA": {
+    "title": "Ready to launch?",
+    "description": "Create an account and spin up your first organization in minutes.",
+    "button_text": "Create your account"
+  },
+  "Footer": {
+    "features": "Features",
+    "pricing": "Pricing",
+    "faq": "FAQ",
+    "github": "GitHub",
+    "community": "Community",
+    "terms_of_service": "Terms of Service",
+    "privacy_policy": "Privacy Policy",
+    "footer_text": "© {year} {name}."
+  },
+  "SignIn": {
+    "meta_title": "Sign in",
+    "meta_description": "Sign in to your account.",
+    "forgot_password": "Forgot password?",
+    "no_account": "No account?",
+    "email": "Email",
+    "password": "Password"
+  },
+  "SignUp": {
+    "meta_title": "Sign up",
+    "meta_description": "Create your account.",
+    "have_account": "Already have an account?",
+    "name": "Name",
+    "email": "Email",
+    "password": "Password"
+  },
+  "ForgotPassword": {
+    "meta_title": "Forgot password",
+    "title": "Reset your password",
+    "description": "We will email you a reset link.",
+    "submit": "Send reset link",
+    "sent": "If an account exists, a reset email has been sent."
+  },
+  "ResetPassword": {
+    "meta_title": "Reset password",
+    "title": "Choose a new password",
+    "submit": "Update password"
+  },
+  "VerifyEmail": {
+    "meta_title": "Verify email",
+    "title": "Verify your email",
+    "submit": "Verify",
+    "banner": "Please verify your email to unlock invites and billing.",
+    "resend": "Resend verification"
+  },
+  "DashboardLayout": {
+    "meta_title": "SaaS SolidJS Dashboard",
+    "meta_description": "Manage your organization.",
+    "home": "Home",
+    "members": "Members",
+    "settings": "Settings",
+    "billing": "Billing",
+    "premium": "Premium"
+  },
+  "DashboardIndexPage": {
+    "title_bar": "Dashboard",
+    "title_bar_description": "Welcome to your dashboard",
+    "message_state_title": "Let's get started",
+    "message_state_description": "Customize this page by editing <code>src/routes/dashboard/index.tsx</code>."
+  },
+  "UserProfilePage": {
+    "title_bar": "User Profile",
+    "title_bar_description": "View and manage your user profile",
+    "save_profile": "Save profile",
+    "change_password": "Change password",
+    "current_password": "Current password",
+    "new_password": "New password"
+  },
+  "OrganizationProfilePage": {
+    "title_bar": "Organization settings",
+    "title_bar_description": "Manage your organization",
+    "org_name": "Organization name",
+    "save": "Save",
+    "danger_zone": "Danger zone",
+    "danger_zone_description": "Leave this organization or permanently delete it.",
+    "leave": "Leave organization",
+    "delete": "Delete organization",
+    "delete_confirm": "Type the organization name to confirm"
+  },
+  "MembersPage": {
+    "title_bar": "Members",
+    "title_bar_description": "Invite and manage organization members",
+    "invite": "Invite member",
+    "email": "Email",
+    "role": "Role",
+    "remove": "Remove",
+    "pending": "Pending invitations",
+    "resend": "Resend",
+    "revoke": "Revoke"
+  },
+  "BillingPage": {
+    "title_bar": "Billing",
+    "title_bar_description": "Manage your subscription",
+    "current_plan": "Current plan",
+    "status": "Status",
+    "manage": "Manage billing",
+    "upgrade_premium": "Upgrade to Premium",
+    "upgrade_enterprise": "Upgrade to Enterprise",
+    "period_end": "Current period ends",
+    "not_configured": "Stripe is not configured. Set STRIPE_SECRET_KEY and price IDs to enable upgrades."
+  },
+  "InvitePage": {
+    "meta_title": "Accept invitation",
+    "title": "Join organization",
+    "accept": "Accept invitation",
+    "create_account": "Create account to join"
+  },
+  "PremiumPage": {
+    "title_bar": "Premium feature",
+    "title_bar_description": "Example page gated by an active subscription",
+    "body": "You are seeing this because your organization has an active or trialing subscription.",
+    "status": "Subscription status"
+  },
+  "Onboarding": {
+    "title": "Choose an organization",
+    "create": "Create & continue",
+    "create_label": "Create organization"
+  }
+}

@@ -1,0 +1,125 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "id": "example/zmsaas",
+      "name": "zmsaas",
+      "kind": "example",
+      "path": "examples/zmsaas",
+      "summary": "SaaS business framework reference: zigmodu backend (org-scoped CRUD) + SolidStart frontend",
+      "tags": ["saas", "multi-tenant", "solidstart", "crud", "frontend"],
+      "min_version": "0.15.4",
+      "doc": "examples/zmsaas/README.md"
+    },
+    {
+      "id": "example/tenant-mgmt",
+      "name": "tenant-mgmt",
+      "kind": "example",
+      "path": "examples/tenant-mgmt",
+      "summary": "Multi-tenant management: JWT/RBAC catalog auth stack (Path A) + tenant/user/subscription modules",
+      "tags": ["multi-tenant", "auth", "rbac", "jwt", "catalog"],
+      "min_version": "0.15.0",
+      "doc": "examples/tenant-mgmt/README.md"
+    },
+    {
+      "id": "example/ai-ops",
+      "name": "ai-ops",
+      "kind": "example",
+      "path": "examples/ai-ops",
+      "summary": "Full AI pipeline: skills, workflows, LLM policies, RAG, approval chains",
+      "tags": ["ai", "workflow", "llm", "skills", "rag"],
+      "min_version": "0.15.0",
+      "doc": "examples/ai-ops/README.md"
+    },
+    {
+      "id": "example/llm-policies",
+      "name": "llm-policies",
+      "kind": "example",
+      "path": "examples/llm-policies",
+      "summary": "LLM policy real-wiring: llmApprove / llmRiskDecide / llmDiagnose / llmVerify against a real provider",
+      "tags": ["ai", "llm", "policy", "deepseek", "openai"],
+      "min_version": "0.15.0",
+      "doc": "docs/LLM_POLICIES.md"
+    },
+    {
+      "id": "example/mcp-server",
+      "name": "mcp-server",
+      "kind": "example",
+      "path": "examples/mcp-server",
+      "summary": "SkillRegistry → MCP bridge over stdio: expose framework AI skills to Claude/Codex",
+      "tags": ["mcp", "ai", "skills", "stdio"],
+      "min_version": "0.15.2",
+      "doc": "docs/MCP.md"
+    },
+    {
+      "id": "example/web4",
+      "name": "web4",
+      "kind": "example",
+      "path": "examples/web4",
+      "summary": "Web4 production path: x402 payment middleware + DID auth + invoice redemption",
+      "tags": ["web4", "x402", "did", "payment"],
+      "min_version": "0.15.0",
+      "doc": "docs/WEB4.md"
+    },
+    {
+      "id": "example/tenant-shop",
+      "name": "tenant-shop",
+      "kind": "example",
+      "path": "examples/tenant-shop",
+      "summary": "BFF-style multi-tenant shop: order/cart/inventory/payment modules with org scoping",
+      "tags": ["ecommerce", "multi-tenant", "bff", "crud"],
+      "min_version": "0.15.0",
+      "doc": "examples/tenant-shop/README.md"
+    },
+    {
+      "id": "example/shopdemo",
+      "name": "shopdemo",
+      "kind": "example",
+      "path": "examples/shopdemo",
+      "summary": "Legacy shop demo (intentionally not best-practice; good baseline/audit playground)",
+      "tags": ["ecommerce", "legacy", "audit"],
+      "min_version": "0.14.0",
+      "doc": "examples/shopdemo/README.md"
+    },
+    {
+      "id": "example/basic",
+      "name": "basic",
+      "kind": "example",
+      "path": "examples/basic",
+      "summary": "Minimal e-commerce module composition + Application API (start here)",
+      "tags": ["starter", "minimal", "application"],
+      "min_version": "0.14.0",
+      "doc": "examples/basic/README.md"
+    },
+    {
+      "id": "plugin/wechat-pay",
+      "name": "wechat-pay",
+      "kind": "plugin",
+      "path": null,
+      "summary": "WeChat Pay SDK stub (P0 — not implemented)",
+      "tags": ["payment", "wechat", "stub"],
+      "min_version": "0.15.0",
+      "status": "stub"
+    },
+    {
+      "id": "plugin/aliyun-oss",
+      "name": "aliyun-oss",
+      "kind": "plugin",
+      "path": null,
+      "summary": "Alibaba Cloud OSS stub (P1 — not implemented)",
+      "tags": ["storage", "oss", "stub"],
+      "min_version": "0.15.0",
+      "status": "stub"
+    },
+    {
+      "id": "plugin/apns",
+      "name": "apns",
+      "kind": "plugin",
+      "path": null,
+      "summary": "Apple Push Notification stub (P1 — not implemented)",
+      "tags": ["push", "apns", "stub"],
+      "min_version": "0.15.0",
+      "status": "stub"
+    }
+  ]
+}

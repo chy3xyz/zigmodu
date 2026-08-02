@@ -8,6 +8,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **`zmodu market` Phase 2：远程发现 + 安装闭环**: `market update`（std.http 拉取
+  远程索引 → `.zmodu/market-index.json`，坏缓存自动忽略、tmp+rename 原子写入）、
+  `list/search/info` 改为本地 + 远程合并浏览（按 id 去重）、`market install
+  <id> --dir … [--dry-run] [--verify]`（递归复制源码树，跳过 node_modules/.git/
+  .output/.zig-cache 等；verify 就地跑 `zig build`）。签名、build.zig.zon 自动
+  写入、CI 回归钩子留在 ADR-016（Phase 2c）。4 个新单测（合并去重 + copyTree
+  跳过 junk 目录），CLI 套件 50 pass。docs/ZMODU_CLI_INTEGRATION 更新阶段表。
+- **`zmodu market` 模块市场（Phase 1 本地策展目录）**: `tools/zmodu/src/
+  marketplace/catalog.json`（schema_version 1）登记 12 个策展条目（zmsaas /
+  tenant-mgmt / ai-ops / llm-policies / mcp-server / web4 / tenant-shop /
+  shopdemo / basic + wechat-pay / aliyun-oss / apns stub）；`zmodu market
+  list|search <q>|info <id>` 支持 `--json` 与 `--catalog PATH` 外部目录。设计
+  取舍（ADR-015 式）：Phase 1 只做可发现性，远程 registry/自动安装/签名包
+  延后（质量门优先）。2 个单测并入 CLI 套件；docs/ZMODU_CLI_INTEGRATION 补
+  章节。
+- **zsaas — SaaS 业务框架（zigmodu 后端 + saas-solidjs 前端）**: 新增 `zsaas/`
+  目录。同一份业务模型 JSON 生成两端：后端 `zmodu saas <model.json>` 产出
+  org 隔离的 zigmodu 模块（model/persistence/service/api/module/root 六文件、
+  参数化 SQL 强制 `org_id` 租户过滤、ComptimeRouter `.auth=.jwt` + permission
+  门控、ctx.json、saas-schema.sql 迁移产物），生成模块已在真实 zigmodu 工程
+  编译通过；前端 `scripts/gen-business.mjs` 生成 SolidStart 管理页（列表/新建/
+  编辑/删除 + i18n + 导航）+ `zmoduFetch` REST client（`/api/v1/<entity>`，
+  Bearer 鉴权），tsc 全绿；`scripts/check-gen.mjs` 自检。
+  **一键新建前后端**：`scripts/create-project.mjs <model.json> --name <app>` 同时
+  创建 zigmodu 后端工程（自动把 zigmodu 依赖指向本地仓库，规避 `zmodu new`
+  的旧 tag 占位 hash）与 saas-solidjs 前端工程（模板复制 + 业务页面），端到端
+  验证：后端 `zig build` 编译通过 + `zmodu verify` 全过、前端页面生成、零泄漏。
+  顺带修复 `zmodu new` 的既有 bug：生成 main.zig 引用未定义 `project_name`、
+  未使用 allocator/init，以及 `generateLifeDir` 两处 ArrayList 泄漏。
 - **AI key 轮换 bug 修复（审查发现）**: (1) `AiProvider` 自动换 key 重试后，调用方
   旧 lease 指向已失败的 key——`mgr.onSuccess(lease)` 会把刚 429 的 key 重置回
   健康、撤销冷却；新增 `provider.reportSuccess()` / `reportError(kind)` 用当前

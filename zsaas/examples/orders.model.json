@@ -1,0 +1,16 @@
+{
+  "entities": [
+    {
+      "name": "orders",
+      "label": "Orders",
+      "description": "Customer orders",
+      "writeRole": "admin",
+      "fields": [
+        { "name": "customer", "type": "string", "required": true, "label": "Customer" },
+        { "name": "amount", "type": "number", "label": "Amount" },
+        { "name": "status", "type": "string", "default": "pending", "label": "Status" },
+        { "name": "notes", "type": "text", "label": "Notes" }
+      ]
+    }
+  ]
+}

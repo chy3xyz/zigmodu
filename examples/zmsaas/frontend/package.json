@@ -1,0 +1,72 @@
+{
+  "name": "saas-solidjs",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chy3xyz/saas-solidjs.git"
+  },
+  "homepage": "https://github.com/chy3xyz/saas-solidjs",
+  "bugs": {
+    "url": "https://github.com/chy3xyz/saas-solidjs/issues"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "vite dev",
+    "dev:full": "npm run db:migrate && vite dev",
+    "build": "vite build",
+    "start": "node .output/server/index.mjs",
+    "preview": "vite preview",
+    "clean": "rimraf .output dist coverage .vinxi",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "check:types": "tsc --noEmit --pretty",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
+    "db-server": "node scripts/db-server.mjs",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "dotenv -c -- drizzle-kit migrate",
+    "db:studio": "drizzle-kit studio"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.5.4",
+    "@electric-sql/pglite-socket": "^0.2.7",
+    "@kobalte/core": "^0.13.12",
+    "@solid-primitives/i18n": "^2.2.1",
+    "@solidjs/meta": "^0.29.4",
+    "@solidjs/router": "^1.0.0",
+    "@solidjs/start": "^2.0.0-rc.6",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "drizzle-orm": "^0.45.2",
+    "lucide-solid": "^0.544.0",
+    "nitro": "^3.0.260610-beta",
+    "pg": "^8.21.0",
+    "resend": "^6.18.1",
+    "solid-js": "^1.9.14",
+    "stripe": "^22.4.0",
+    "tailwind-merge": "^3.6.0",
+    "vite": "^8.0.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.0",
+    "@playwright/test": "^1.61.0",
+    "@solidjs/testing-library": "^0.8.10",
+    "@tailwindcss/vite": "^4.1.13",
+    "@types/node": "^25.9.3",
+    "@types/pg": "^8.20.0",
+    "dotenv-cli": "^11.0.0",
+    "drizzle-kit": "^0.31.10",
+    "eslint": "^9.39.5",
+    "globals": "^16.4.0",
+    "jsdom": "^26.1.0",
+    "rimraf": "^6.1.3",
+    "tailwindcss": "^4.1.13",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.65.0",
+    "vite-plugin-solid": "^2.11.10",
+    "vitest": "^3.2.4"
+  }
+}
