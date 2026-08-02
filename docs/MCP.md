@@ -28,6 +28,18 @@ var ctx = ai.SkillContext{
 try ai.mcp.serveStdio(io, allocator, &registry, ctx);
 ```
 
+完整可运行示例见 `examples/mcp-server`（KPI 技能 + SQLite 内存库 + ping），
+本地冒烟：
+
+```bash
+cd examples/mcp-server && zig build
+cd ../.. && python3 scripts/mcp-client-test.py examples/mcp-server/zig-out/bin/mcp-server
+```
+
+客户端脚本会跑真实 stdio MCP 会话：`initialize`（协议 2024-11-05）→
+`tools/list` → `tools/call kpi.query`（断言 tenant 1 的 SUM=5100）→
+`tools/call ping`（"pong"），并校验服务端零泄漏。
+
 ## MCP 方法
 
 - `initialize` → 协议版本 + `capabilities.tools`；

@@ -187,6 +187,7 @@ fn serveLine(
     } else if (std.mem.eql(u8, method, "tools/call")) {
         const params = root.get("params") orelse return rpcError(allocator, id, -32602, "Missing params");
         const result = try handleToolCall(registry, ctx, params);
+        defer freeValue(ctx.allocator, result);
         return rpcSuccess(allocator, a, id, result);
     } else if (std.mem.eql(u8, method, "notifications/initialized")) {
         return if (id == null) allocator.dupe(u8, "") else rpcError(allocator, id, -32601, "Method not found");
