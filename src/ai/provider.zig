@@ -224,9 +224,8 @@ pub const AiProvider = struct {
         var acc = StreamAccum.init(self.allocator, cb_ctx, on_delta);
         defer acc.deinit();
 
-        var http_resp = self.http.requestStream(req, &acc, StreamAccum.onChunk) catch |err| {
+        var http_resp = self.http.requestStream(req, &acc, StreamAccum.onChunk) catch {
             // Transport failed before useful stream — buffered fallback (ignore transport err kind).
-            _ = err;
             o.stream = false;
             var resp = try self.chatWith(messages, o);
             errdefer self.freeResponse(&resp);

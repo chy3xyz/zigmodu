@@ -417,9 +417,9 @@ fn extractModuleInfo(
         if (std.mem.indexOf(u8, line, ".description = \"")) |pos| {
             description = readQuoted(line, pos + ".description = \"".len) orelse "";
         }
-        if (std.mem.indexOf(u8, line, ".dependencies = &.{")) |_| {
+        if (std.mem.indexOf(u8, line, ".dependencies = &.{")) |dep_pos| {
             // Collect quoted names on this line and following lines until '}'.
-            var cur = line;
+            var cur = line[dep_pos + ".dependencies = &.{".len ..];
             var done = false;
             while (!done) {
                 var rest = cur;
@@ -578,9 +578,37 @@ fn lintFile(
 ) !void {
     var lines = std.mem.splitScalar(u8, content, '\n');
     var idx: usize = 1;
+    // Track an unused `catch |X|` capture to report `_ = X;` a few lines later.
+    var pending_catch: ?[]const u8 = null;
+    var pending_line: usize = 0;
     while (lines.next()) |line| : (idx += 1) {
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0 or std.mem.startsWith(u8, trimmed, "//")) continue;
+
+        // b11 — unused catch capture (`catch |err| { _ = err;` → `catch {`).
+        if (!config.disabled.contains("b11")) {
+            if (pending_catch) |name| {
+                if (idx - pending_line <= 15 and std.mem.indexOf(u8, line, "_ = ") != null and
+                    std.mem.indexOf(u8, line, name) != null and
+                    std.mem.indexOf(u8, line, ";") != null)
+                {
+                    try pushViolation(violations, allocator, "b11", rel_path, pending_line, "unused catch capture — write `catch {{` (Zig 0.17 discards the error set)", .{});
+                    pending_catch = null;
+                }
+                if (idx - pending_line > 15) pending_catch = null;
+            }
+            if (std.mem.indexOf(u8, line, "catch |_|")) |_| {
+                try pushViolation(violations, allocator, "b11", rel_path, idx, "unused catch capture — write `catch {{` (Zig 0.17 discards the error set)", .{});
+            } else if (std.mem.indexOf(u8, line, "catch |")) |cpos| {
+                const rest = line[cpos + "catch |".len ..];
+                const name_end = std.mem.indexOfScalar(u8, rest, '|') orelse continue;
+                const name = rest[0..name_end];
+                if (name.len > 0 and name[0] != '_') {
+                    pending_catch = name;
+                    pending_line = idx;
+                }
+            }
+        }
 
         // b1 / b2 — SQL in handler/model files.
         if (std.mem.eql(u8, file_name, "api.zig")) {
@@ -1058,6 +1086,7 @@ test "audit business lint flags anti-patterns" {
     try lintFile(allocator, "api.zig", "const auth = ctx.getHeader(\"Authorization\");\n", "src/modules/x/api.zig", &cfg, &violations);
     try lintFile(allocator, "service.zig", "client.exec(sql, &.{}) catch {};\n", "src/modules/x/service.zig", &cfg, &violations);
     try lintFile(allocator, "service.zig", "client.exec(sql, &.{}) catch |err| {};\n", "src/modules/x/service.zig", &cfg, &violations);
+    try lintFile(allocator, "service.zig", "x() catch |err| {\n  _ = err;\n  return;\n};\n", "src/modules/x/service.zig", &cfg, &violations);
 
     var rules = std.StringHashMap(usize).init(allocator);
     defer rules.deinit();
@@ -1076,6 +1105,7 @@ test "audit business lint flags anti-patterns" {
     try std.testing.expectEqual(@as(usize, 1), rules.get("b8").?);
     try std.testing.expectEqual(@as(usize, 1), rules.get("b9").?);
     try std.testing.expectEqual(@as(usize, 2), rules.get("b10").?);
+    try std.testing.expectEqual(@as(usize, 1), rules.get("b11").?);
 }
 
 test "audit rules config disables rules" {

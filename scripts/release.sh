@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# One-shot release: bump the package version everywhere, regenerate the
-# fingerprint, run all quality gates, then commit + tag (+ push with --push).
+# One-shot release: bump the package version everywhere, run all quality
+# gates, then commit + tag (+ push with --push).
+#
+# Note: .fingerprint is the package's permanent identity — Zig docs say it is
+# generated once and never changes (changing it has security/trust
+# implications). release.sh intentionally leaves it untouched.
 #
 # Usage: scripts/release.sh <x.y.z> [--push]
 set -euo pipefail
@@ -55,29 +59,18 @@ if ! grep -q "^## \[Unreleased\]" CHANGELOG.md; then
 fi
 perl -0pi -e "s/## \[Unreleased\]/## [$VERSION] - $(date +%F)/" CHANGELOG.md
 
-# 3. Regenerate the fingerprint if the compiler expects a different value.
-OLD_FP=$(sed -n 's/.*\.fingerprint = \(0x[0-9a-f]*\).*/\1/p' build.zig.zon | head -1)
-out=$(zig build 2>&1 || true)
-hint=$(printf '%s\n' "$out" | grep -iE 'fingerprint' | grep -oE '0x[0-9a-f]{16}' | head -1 || true)
-if [ -n "$hint" ] && [ "$hint" != "$OLD_FP" ]; then
-    perl -0pi -e "s/\.fingerprint = $OLD_FP/.fingerprint = $hint/" build.zig.zon
-    echo "fingerprint: $OLD_FP -> $hint"
-else
-    echo "fingerprint unchanged: $OLD_FP"
-fi
-
-# 4. Quality gates.
+# 3. Quality gates.
 echo "-- gates --"
 zig fmt --check src tools examples
 ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test --summary all
 bash scripts/check-deadcode.sh
 
-# 5. Commit + tag.
+# 4. Commit + tag.
 git add -A
 git commit -m "chore(release): v$VERSION"
 git tag -a "v$VERSION" -m "v$VERSION"
 
-# 6. Final assertion: tag must match the package version.
+# 5. Final assertion: tag must match the package version.
 bash scripts/check-release-tag.sh
 echo "release v$VERSION ready"
 

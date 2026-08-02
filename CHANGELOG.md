@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **git 依赖打包修复 + catch 反模式规则**: (1) `build.zig.zon` 的 `.paths` 增加
+  `examples/_shared`——git+https 依赖按 `.paths` 打包，此前 `_shared`（及整个
+  examples/）不会出现在拉取包里，业务方换版本必须重打 zig-pkg workaround，现
+  已根治（`zig fetch` 后包内自带 `db_link.zig` / `zent_helpers.zig`）；(2) audit
+  新增 `b11` 规则：未使用 catch 捕获（`catch |err| { _ = err; }` / `catch |_|` →
+  应写 `catch {`），并修复 `src/ai/provider.zig` 存量；(3) `scripts/release.sh`
+  移除 fingerprint 重算步骤——按 Zig 文档 fingerprint 是包永久身份、同包永不改
+  （改了有信任/安全影响）；docs/SQLX_DRIVERS.md 补充 git 消费者说明。
+
 ## [0.15.3] - 2026-08-02
 
 ### Changed

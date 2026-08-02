@@ -123,6 +123,11 @@ examples/<name>/db_link.zig  →  symlink → ../_shared/db_link.zig
 
 改链接逻辑只改 `_shared/db_link.zig`；各 example 的 symlink 自动跟上。
 
+> **git 依赖消费者**：`build.zig.zon` 的 `.paths` 已包含 `examples/_shared`，
+> 因此通过 `git+https://…zigmodu` 拉取的包内自带 `examples/_shared/db_link.zig`
+> 与 `zent_helpers.zig`，无需再从源码 clone 复制（换版本也无需重打 workaround）。
+> 若消费者直接引用，路径为 `<zigmodu_pkg>/examples/_shared/db_link.zig`。
+
 环境变量（可选）：`PQ_INCLUDE` / `PQ_LIB`、`MYSQL_INCLUDE` / `MYSQL_LIB`（或 `db_link` 内 macOS Homebrew 探测）。
 
 ---

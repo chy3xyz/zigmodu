@@ -111,7 +111,8 @@ lint 风格的可达性分析）：报告未使用的顶层 `fn`/`const`/`var`�
   `@ptrCast(ctx.user_data)`、legacy `sendSuccess`/`sendFail`、banned 导入
   （`zigmodu.http_server` / `orm.Orm` / `PasswordEncoder`）、已移除的 Zig
   0.17 API（`std.Thread.Mutex` 等）、跨模块直接文件导入、handler 手工解析
-  Authorization/Bearer、空 `catch {}` 吞错。规则可用
+  Authorization/Bearer、空 `catch {}` 吞错、未使用 catch 捕获
+  （`catch |err| { _ = err; }` → 应写 `catch {`）。规则可用
   `.zmodu/rules.json` 按项目开关。
 
 ```bash
