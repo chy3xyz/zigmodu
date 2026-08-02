@@ -490,6 +490,213 @@ test "Agent.run executes a full tool-call loop against a mock provider" {
     try std.testing.expect(hooks_calls >= 1);
 }
 
+const MockAgentServer = struct {
+    server: std.Io.net.Server,
+    calls: *std.atomic.Value(u32),
+    allocator: std.mem.Allocator,
+    state: *State,
+    thread: std.Thread,
+
+    const State = struct {
+        server: std.Io.net.Server,
+        calls: *std.atomic.Value(u32),
+    };
+
+    fn start(allocator: std.mem.Allocator, io: std.Io, comptime body_for: fn (u32) []const u8) !MockAgentServer {
+        const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        const server = try addr.listen(io, .{ .reuse_address = true });
+        const calls = try allocator.create(std.atomic.Value(u32));
+        calls.* = .init(0);
+        const state = try allocator.create(State);
+        state.* = .{ .server = server, .calls = calls };
+        const S = struct {
+            fn run(ctx: *State) void {
+                const accepted = ctx.server.accept(std.testing.io) catch return;
+                defer accepted.close(std.testing.io);
+                var buf: [8192]u8 = undefined;
+                while (true) {
+                    var fds = [_]std.posix.pollfd{.{ .fd = accepted.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+                    _ = std.posix.poll(&fds, 3000) catch break;
+                    if (fds[0].revents == 0) continue;
+                    const n = std.posix.read(accepted.socket.handle, &buf) catch break;
+                    if (n == 0) break;
+                    const body = body_for(ctx.calls.fetchAdd(1, .monotonic));
+                    var hbuf: [2048]u8 = undefined;
+                    const resp = std.fmt.bufPrint(&hbuf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch break;
+                    _ = std.posix.system.write(accepted.socket.handle, resp.ptr, resp.len);
+                }
+            }
+        };
+        const th = try std.Thread.spawn(.{}, S.run, .{state});
+        return .{ .server = server, .calls = calls, .allocator = allocator, .state = state, .thread = th };
+    }
+
+    fn port(self: *const MockAgentServer) u16 {
+        return self.server.socket.address.getPort();
+    }
+
+    fn deinit(self: *MockAgentServer) void {
+        self.thread.join();
+        self.server.deinit(std.testing.io);
+        self.allocator.destroy(self.calls);
+        self.allocator.destroy(self.state);
+    }
+};
+
+const mock_tool_call_body =
+    \\{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"ping","arguments":"{}"}}]}}],"usage":{"prompt_tokens":40,"completion_tokens":20}}
+;
+const mock_final_body =
+    \\{"choices":[{"message":{"role":"assistant","content":"done"}}],"usage":{"prompt_tokens":40,"completion_tokens":5}}
+;
+
+test "Agent.run compacts long context via the ContextManager" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = try MockAgentServer.start(allocator, std.testing.io, struct {
+        fn f(call: u32) []const u8 {
+            return if (call < 4) mock_tool_call_body else mock_final_body;
+        }
+    }.f);
+    defer server.deinit();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/v1/chat/completions", .{server.port()});
+    var http = @import("../http/HttpClient.zig").HttpClient.init(allocator, std.testing.io, 1, 5000);
+    defer http.deinit();
+    var provider = provider_mod.AiProvider.init(allocator, &http, url, "Bearer sk", "mock");
+
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    try registry.register(.{
+        .name = "ping",
+        .description = "pong",
+        .parameters = &.{},
+        .handler = struct {
+            fn h(c: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+                var obj = std.json.ObjectMap{};
+                try obj.put(c.allocator, try c.allocator.dupe(u8, "ok"), .{ .bool = true });
+                return .{ .object = obj };
+            }
+        }.h,
+    });
+
+    var cm = @import("context.zig").ContextManager{ .max_tokens = 90, .keep_recent_tokens = 40 };
+    const State = struct {
+        var summaries: usize = 0;
+    };
+    cm.summarize = struct {
+        fn f(a: std.mem.Allocator, _: []const @import("context.zig").ChatMsg, summary: *[]const u8) anyerror!void {
+            State.summaries += 1;
+            summary.* = try a.dupe(u8, "compacted");
+        }
+    }.f;
+    var agent = Agent{ .provider = &provider, .registry = &registry, .context = &cm };
+    var sctx = SkillContext{ .allocator = allocator };
+    var result = try agent.run(allocator, "question", &sctx, 8);
+    defer result.deinit(allocator);
+    try std.testing.expectEqualStrings("done", result.answer);
+    try std.testing.expect(State.summaries >= 1);
+}
+
+test "Agent.run stops early when the budget is exhausted" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = try MockAgentServer.start(allocator, std.testing.io, struct {
+        fn f(_: u32) []const u8 {
+            return mock_tool_call_body;
+        }
+    }.f);
+    defer server.deinit();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/v1/chat/completions", .{server.port()});
+    var http = @import("../http/HttpClient.zig").HttpClient.init(allocator, std.testing.io, 1, 5000);
+    defer http.deinit();
+    var provider = provider_mod.AiProvider.init(allocator, &http, url, "Bearer sk", "mock");
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    try registry.register(.{
+        .name = "ping",
+        .description = "pong",
+        .parameters = &.{},
+        .handler = struct {
+            fn h(c: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+                var obj = std.json.ObjectMap{};
+                try obj.put(c.allocator, try c.allocator.dupe(u8, "ok"), .{ .bool = true });
+                return .{ .object = obj };
+            }
+        }.h,
+    });
+
+    // Tiny budget: the first reservation succeeds, the next loop iteration fails.
+    var budget = @import("budget.zig").Budget.init(50);
+    var agent = Agent{ .provider = &provider, .registry = &registry, .budget = &budget };
+    var sctx = SkillContext{ .allocator = allocator };
+    var result = try agent.run(allocator, "q", &sctx, 8);
+    defer result.deinit(allocator);
+    try std.testing.expect(result.budget_exhausted);
+    try std.testing.expectEqual(@as(usize, 1), agent.metrics.budget_exhausted);
+}
+
+test "Agent.run stops when a cancel is requested mid-run" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = try MockAgentServer.start(allocator, std.testing.io, struct {
+        fn f(call: u32) []const u8 {
+            return if (call < 3) mock_tool_call_body else mock_final_body;
+        }
+    }.f);
+    defer server.deinit();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/v1/chat/completions", .{server.port()});
+    var http = @import("../http/HttpClient.zig").HttpClient.init(allocator, std.testing.io, 1, 5000);
+    defer http.deinit();
+    var provider = provider_mod.AiProvider.init(allocator, &http, url, "Bearer sk", "mock");
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    try registry.register(.{
+        .name = "ping",
+        .description = "pong",
+        .parameters = &.{},
+        .handler = struct {
+            fn h(c: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+                var obj = std.json.ObjectMap{};
+                try obj.put(c.allocator, try c.allocator.dupe(u8, "ok"), .{ .bool = true });
+                return .{ .object = obj };
+            }
+        }.h,
+    });
+
+    const State = struct {
+        var handle: ?*@import("handle.zig").AgentHandle = null;
+    };
+    var handle = @import("handle.zig").AgentHandle.init();
+    State.handle = &handle;
+    var agent = Agent{
+        .provider = &provider,
+        .registry = &registry,
+        .handle = &handle,
+        .hooks = .{
+            .on_step = struct {
+                fn cb(_: ?*anyopaque, _: usize, _: usize) void {
+                    // Cancel after the first step so the next loop iteration stops.
+                    if (State.handle) |h| h.requestCancel();
+                }
+            }.cb,
+        },
+    };
+    var sctx = SkillContext{ .allocator = allocator };
+    var result = try agent.run(allocator, "q", &sctx, 8);
+    defer result.deinit(allocator);
+    try std.testing.expect(result.canceled);
+    try std.testing.expectEqual(@as(usize, 1), agent.metrics.canceled);
+}
+
 test "SkillRegistry tools json for agent" {
     const a = std.testing.allocator;
     var reg = SkillRegistry.init(a, std.testing.io);

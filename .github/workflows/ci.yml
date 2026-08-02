@@ -424,3 +424,29 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: zigmodu-${{ github.ref_name }}-linux-x86_64.tar.gz
+
+  # ── AI real-provider smoke (optional; runs only when LLM_API_KEY is set) ──
+  ai-real-provider:
+    name: AI real-provider smoke
+    runs-on: ubuntu-latest
+    if: ${{ env.LLM_API_KEY != '' }}
+    env:
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
+      LLM_MODEL: ${{ secrets.LLM_MODEL }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Install deps
+        run: sudo apt-get install -y libsqlite3-dev
+      - name: Build llm-policies example
+        run: (cd examples/llm-policies && zig build)
+      - name: Run real-provider policy smoke
+        run: (cd examples/llm-policies && ./zig-out/bin/llm-policies)
+        env:
+          LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}

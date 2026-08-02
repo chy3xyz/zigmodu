@@ -704,3 +704,19 @@ AI 每生成一段代码后，应自问：
 ---
 
 *方法论是活文档。与 AGENTS 冲突时更新本节或修订 AGENTS；新反模式优先记入 AGENTS「DO/DON'T」。*
+
+## AI 能力索引（2026-08）
+
+框架侧 AI 栈（规划与现状见 `docs/AI_SKILLS.md` / `docs/AI_ORCHESTRATION.md`）：
+
+- **技能注册表出口**：OpenAI functions（`SkillRegistry.toOpenAiFunctionsAlloc`）、
+  OpenAPI（`ai.skill_export.toOpenApi`）、CLI（`zmodu ai`）、**MCP**
+  （`ai.mcp.serveStdio`，LLM 平台经 MCP 直接调用技能）；
+- **写操作技能**：`ai.actions`（entity.create/update、command.execute、
+  report.generate）——租户列强制、可写列白名单、outbox 幂等；
+- **管理技能**：`ai.admin`（admin.cache/config/audit/user/tenant）——默认关闭、
+  权限码 + allowlist 双门控；
+- **LLM 策略**：`ai.llm`（llmApprove / llmRiskDecide / llmDiagnose / llmVerify，
+  失败安全回退 escalate）+ RAG 注入；真实接线见 `docs/LLM_POLICIES.md`；
+- **编排与审计**：`ai.workflow`（线性/DAG/审批门/WAL/反射/指标/图）、
+  `ai.run_audit.RunAuditStore`（workflow+agent 落库）、`ai.observability.AiMetrics`。
