@@ -115,6 +115,9 @@ jobs:
           ./zig-out/bin/zmodu deadcode -j /tmp/dc_fixture/main.zig > /tmp/dc.json || true
           python3 -c "import json; d=json.load(open('/tmp/dc.json')); assert len(d['dead_declarations']) >= 1"
 
+      - name: Dead-code baseline gate
+        run: bash scripts/check-deadcode.sh
+
       - name: Upload test logs
         if: failure()
         uses: actions/upload-artifact@v4

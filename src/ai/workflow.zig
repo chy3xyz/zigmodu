@@ -834,6 +834,46 @@ test "workflow approval gate resumes after the human approves" {
     try std.testing.expectEqualStrings("publish", resumed.steps.items[1].name);
 }
 
+test "workflow approval gate stops a DAG run at pending_human" {
+    const allocator = std.testing.allocator;
+    var client = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    _ = try client.exec(
+        "CREATE TABLE event_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, payload TEXT, status INTEGER DEFAULT 0, retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 5, created_at INTEGER, updated_at INTEGER, error_message TEXT)",
+        &.{},
+    );
+    var backend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend{ .allocator = allocator, .client = &client };
+    const Escalate = struct {
+        fn decide(_: std.mem.Allocator, _: *SkillContext, _: []const u8, _: i64, _: usize, _: []const u8, _: []const u8, _: *[]const u8) anyerror!@import("approval.zig").ApprovalDecision {
+            return .escalated;
+        }
+    };
+    var flow = @import("approval.zig").ApprovalFlow.init(allocator, &backend, Escalate.decide);
+    var registry = try setupPingRegistry(allocator);
+    defer registry.deinit();
+    var ctx = SkillContext{ .allocator = allocator };
+
+    const steps = [_]Step{
+        .{ .name = "prepare", .kind = .{ .skill = .{ .name = "ping", .args = .{ .object = .{} } } } },
+        .{ .name = "left", .kind = .{ .skill = .{ .name = "ping", .args = .{ .object = .{} } } }, .depends_on = &.{"prepare"} },
+        .{ .name = "right", .kind = .{ .skill = .{ .name = "ping", .args = .{ .object = .{} } } }, .depends_on = &.{"prepare"} },
+        .{ .name = "gate", .kind = .{ .approval = .{ .subject = "order-9", .amount = 90000 } }, .depends_on = &.{ "left", "right" } },
+        .{ .name = "publish", .kind = .{ .skill = .{ .name = "ping", .args = .{ .object = .{} } } }, .depends_on = &.{"gate"} },
+    };
+    var wf = Workflow.init(&registry, &steps);
+    wf.approval_flow = &flow;
+    wf.io = std.testing.io;
+    var result = try wf.run(allocator, &ctx);
+    defer result.deinit();
+
+    try std.testing.expectEqual(RunStatus.pending_human, result.status);
+    // prepare/left/right completed; gate reached but pending; publish never ran.
+    try std.testing.expectEqual(@as(usize, 4), result.steps.items.len);
+    try std.testing.expectEqualStrings("gate", result.steps.items[3].name);
+    try std.testing.expectEqual(StepStatus.completed, result.steps.items[3].status);
+}
+
 test "workflow records run audit automatically" {
     const allocator = std.testing.allocator;
     var client = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });

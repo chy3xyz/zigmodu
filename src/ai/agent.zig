@@ -403,6 +403,93 @@ test "Agent recordRunAudit persists agent runs" {
     try std.testing.expectEqual(@as(usize, 4), entries.items[0].steps);
 }
 
+test "Agent.run executes a full tool-call loop against a mock provider" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    const server_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try server_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = server.socket.address.getPort();
+
+    const ServerCtx = struct {
+        server: *std.Io.net.Server,
+        calls: *std.atomic.Value(u32),
+        fn run(ctx: *@This()) void {
+            const accepted = ctx.server.accept(std.testing.io) catch return;
+            defer accepted.close(std.testing.io);
+            var buf: [8192]u8 = undefined;
+            while (true) {
+                var fds = [_]std.posix.pollfd{.{ .fd = accepted.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+                _ = std.posix.poll(&fds, 3000) catch break;
+                if (fds[0].revents == 0) continue;
+                const n = std.posix.read(accepted.socket.handle, &buf) catch break;
+                if (n == 0) break;
+                const call = ctx.calls.fetchAdd(1, .monotonic);
+                const body = if (call == 0)
+                    "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"ping\",\"arguments\":\"{}\"}}]}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}"
+                else
+                    "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"final answer\"}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}";
+                var hbuf: [1024]u8 = undefined;
+                const resp = std.fmt.bufPrint(&hbuf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch break;
+                _ = std.posix.system.write(accepted.socket.handle, resp.ptr, resp.len);
+            }
+        }
+    };
+    var call_count = std.atomic.Value(u32).init(0);
+    var server_ctx = ServerCtx{ .server = &server, .calls = &call_count };
+    const th = try std.Thread.spawn(.{}, ServerCtx.run, .{&server_ctx});
+    defer th.join();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/v1/chat/completions", .{port});
+    var http = @import("../http/HttpClient.zig").HttpClient.init(allocator, std.testing.io, 1, 5000);
+    defer http.deinit();
+    var provider = provider_mod.AiProvider.init(allocator, &http, url, "Bearer sk-mock", "mock-model");
+
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    const State = struct {
+        var pinged: usize = 0;
+    };
+    try registry.register(.{
+        .name = "ping",
+        .description = "pong",
+        .parameters = &.{},
+        .handler = struct {
+            fn h(_: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+                State.pinged += 1;
+                var obj = std.json.ObjectMap{};
+                try obj.put(allocator, try allocator.dupe(u8, "ok"), .{ .bool = true });
+                return .{ .object = obj };
+            }
+        }.h,
+    });
+
+    var hooks_calls: usize = 0;
+    var agent = Agent{
+        .provider = &provider,
+        .registry = &registry,
+        .hooks = .{
+            .ctx = &hooks_calls,
+            .on_tool = struct {
+                fn cb(ctx: ?*anyopaque, _: []const u8, _: bool) void {
+                    const p: *usize = @ptrCast(@alignCast(ctx.?));
+                    p.* += 1;
+                }
+            }.cb,
+        },
+    };
+    var sctx = SkillContext{ .allocator = allocator, .tenant_id = 1 };
+    var result = try agent.run(allocator, "answer the question", &sctx, 5);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqualStrings("final answer", result.answer);
+    try std.testing.expectEqual(@as(usize, 1), State.pinged);
+    try std.testing.expectEqual(@as(usize, 1), agent.metrics.tool_calls);
+    try std.testing.expect(hooks_calls >= 1);
+}
+
 test "SkillRegistry tools json for agent" {
     const a = std.testing.allocator;
     var reg = SkillRegistry.init(a, std.testing.io);
