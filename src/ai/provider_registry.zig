@@ -102,11 +102,12 @@ pub const ProviderRegistry = struct {
     ) !void {
         self.mutex.lock(io) catch return error.LockFailed;
         defer self.mutex.unlock(io);
-        try self.registerLocked(name, endpoint, api_keys, opts);
+        try self.registerLocked(io, name, endpoint, api_keys, opts);
     }
 
     fn registerLocked(
         self: *Self,
+        io: std.Io,
         name: []const u8,
         endpoint: []const u8,
         api_keys: []const []const u8,
@@ -122,7 +123,7 @@ pub const ProviderRegistry = struct {
         const owned_fallbacks = try self.allocator.alloc([]const u8, opts.fallback_providers.len);
         errdefer self.allocator.free(owned_fallbacks);
         for (opts.fallback_providers, 0..) |f, i| owned_fallbacks[i] = try self.allocator.dupe(u8, f);
-        var pool = try KeyPool.init(self.allocator, api_keys, opts.pool_opts);
+        var pool = try KeyPool.init(self.allocator, io, name, api_keys, opts.pool_opts);
         errdefer pool.deinit();
 
         const entry = ProviderEntry{

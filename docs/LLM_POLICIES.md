@@ -145,6 +145,7 @@ zig build run
 | 文件 | 职责 |
 |------|------|
 | `ai/key_pool.zig` | key 池：round-robin 健康 key、429/配额指数冷却退避、连续 401 自动禁用、恢复与观测 |
+| `ai/cooldown_store.zig` | 冷却状态存储接口：内存实现（默认）+ Redis 实现（跨进程、fail-open 本地镜像回退） |
 | `ai/provider_registry.zig` | provider 注册表：endpoint + key 池 + 模型路由 + fallback provider 链（provider 轮换） |
 | `ai/provider.zig` | 挂池：`bindKeyPool` 后 `chat`/`chatWith` 在 401/403/402/429 自动换 key 重试一次 |
 | `ai/module.zig` | `AiKeyManager`：`ProviderConfig`（api_keys + 生命周期）+ `providerFor` 便捷构造 |
@@ -173,12 +174,32 @@ try mgr.applyConfig(&.{
 var provider = try mgr.providerFor(allocator, http, "deepseek-v4-flash");
 // chat/chatWith 遇 401/403/402/429 自动换池内下一个健康 key 并重试一次；
 // 连续 401 会禁用该 key，池耗尽时自动降级到 openai provider。
+// 反馈用 provider 自身（可能已内部换 key）：provider.reportSuccess() /
+// provider.reportError(.rate_limit)，不要用旧 lease 的 onSuccess（会重置失败 key）。
 ```
 
 错误分类：`KeyErrorKind.fromHttpStatus(401/403/402/429/5xx)`，或手动传
 `.auth` / `.rate_limit` / `.quota` / `.server` / `.network` / `.timeout`。
 观测：`mgr.listProviders(io, allocator)` 返回每个 provider/key 的
 status/failures/调用与错误计数快照；`enableKey` / `enableProvider` 支持人工介入。
+
+### 跨进程 cooldown（多实例共享同一批 key）
+
+单实例（一个进程多 fiber）默认走内存 `MemoryCooldownStore`，零依赖。水平扩容
+多实例共享同一批 key 时，用 Redis 协调冷却/禁用状态（否则实例 A 冷却的 key，
+实例 B–N 不知情继续打 429，且 401 禁用阈值会被放大 N 倍）：
+
+```zig
+var redis_store = try zigmodu.ai.RedisCooldownStore.init(allocator, io, &redis_client);
+defer redis_store.deinit();
+var store = redis_store.asStore();
+mgr.setSharedStore(&store); // 之后注册的 provider 池都走 Redis 冷却
+```
+
+实现：`SET key 1 EX ttl`（冷却/禁用按 TTL 过期，无需时钟对齐）、
+`INCR + EXPIRE`（失败计数）、`DEL`（恢复）；Redis 不可用时 **fail-open**
+回退本地镜像并 warn（对齐 `RedisRateLimiter` 先例），key 轮换不会因基础设施
+故障而阻塞。key 形如 `zigmodu:llm:key:<provider>:<idx>`。
 
 | 策略 | 模型返回 | 失败回退 |
 |------|----------|----------|

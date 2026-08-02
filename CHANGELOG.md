@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **AI key 轮换 bug 修复（审查发现）**: (1) `AiProvider` 自动换 key 重试后，调用方
+  旧 lease 指向已失败的 key——`mgr.onSuccess(lease)` 会把刚 429 的 key 重置回
+  健康、撤销冷却；新增 `provider.reportSuccess()` / `reportError(kind)` 用当前
+  key 反馈，providerFor 文档同步；(2) `RedisCooldownStore` 冷却标记（SET）与
+  失败计数（INCR）共用同一 key，cool 会覆盖计数——拆分为 `:fail` 子键，失败数
+  跨进程准确；(3) `chatWith` 传输层错误补上报 `.network` 给池（chatStream 已有）。
+  新增外部共享 store 路由单测（套件 838 pass）。
+- **跨进程 KeyPool cooldown（CooldownStore）**: 新增 `ai/cooldown_store.zig`——
+  `CooldownStore` 接口（isCooling/cool/bumpFailures/reset）+ `MemoryCooldownStore`
+  （默认，单进程零依赖）+ `RedisCooldownStore`（跨进程：SET EX / INCR+EXPIRE /
+  DEL，fail-open 本地镜像回退，对齐 RedisRateLimiter 先例）。`KeyPool` 的冷却/
+  失败/禁用状态改为经 store 读写（多实例共享 key 时协调一致），计数器仍留本地
+  观测；`AiKeyManager.setSharedStore` 一键接入。3 个新单测（套件 837 pass），
+  docs/LLM_POLICIES.md §8 补跨进程接线。
+
 ## [0.15.4] - 2026-08-02
 
 ### Changed

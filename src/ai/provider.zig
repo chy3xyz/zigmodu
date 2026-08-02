@@ -149,6 +149,32 @@ pub const AiProvider = struct {
         self.pool_io = io;
     }
 
+    /// The key index currently serving this provider (may differ from the
+    /// original lease after an auto-rotation inside `chatWith`).
+    pub fn currentKeyIndex(self: *const AiProvider) ?usize {
+        return self.key_index;
+    }
+
+    /// Report success for the key that actually served the request. Prefer
+    /// this over `mgr.onSuccess(lease)` when the provider may have rotated
+    /// keys internally — the lease would reset the failed key.
+    pub fn reportSuccess(self: *AiProvider) void {
+        if (self.key_pool) |pool| {
+            if (self.pool_io) |pio| {
+                if (self.key_index) |idx| pool.onSuccess(pio, idx);
+            }
+        }
+    }
+
+    /// Report a failure for the key that actually served the request.
+    pub fn reportError(self: *AiProvider, kind: key_pool.KeyErrorKind) void {
+        if (self.key_pool) |pool| {
+            if (self.pool_io) |pio| {
+                if (self.key_index) |idx| pool.onError(pio, idx, kind);
+            }
+        }
+    }
+
     pub fn deinit(self: *AiProvider) void {
         if (self.rate_limiter) |*rl| {
             rl.limiter.deinit();
@@ -197,6 +223,7 @@ pub const AiProvider = struct {
 
             var http_resp = self.http.request(req) catch |err| {
                 self.metrics.error_count += 1;
+                if (self.key_pool != null) self.reportError(.network);
                 return mapProviderTransportError(err);
             };
             defer http_resp.deinit();

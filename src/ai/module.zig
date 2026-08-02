@@ -16,6 +16,9 @@ pub const KeyPool = provider_registry.KeyPool;
 pub const KeyErrorKind = provider_registry.KeyErrorKind;
 pub const ProviderLease = provider_registry.ProviderLease;
 pub const ProviderInfo = provider_registry.ProviderInfo;
+pub const CooldownStore = @import("cooldown_store.zig").CooldownStore;
+pub const MemoryCooldownStore = @import("cooldown_store.zig").MemoryCooldownStore;
+pub const RedisCooldownStore = @import("cooldown_store.zig").RedisCooldownStore;
 
 /// Declarative provider config: name + endpoint + api_keys + models.
 pub const ProviderConfig = struct {
@@ -34,6 +37,7 @@ pub const AiKeyManager = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     registry: provider_registry.ProviderRegistry,
+    shared_store: ?CooldownStore = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Self {
         return .{
@@ -55,7 +59,7 @@ pub const AiKeyManager = struct {
                 .models = cfg.models,
                 .fallback_providers = cfg.fallback_providers,
                 .enabled = cfg.enabled,
-                .pool_opts = cfg.pool_opts,
+                .pool_opts = self.poolOpts(cfg.pool_opts),
             });
         }
     }
@@ -65,8 +69,20 @@ pub const AiKeyManager = struct {
             .models = cfg.models,
             .fallback_providers = cfg.fallback_providers,
             .enabled = cfg.enabled,
-            .pool_opts = cfg.pool_opts,
+            .pool_opts = self.poolOpts(cfg.pool_opts),
         });
+    }
+
+    /// Cross-process cooldown store (e.g. RedisCooldownStore). Must outlive
+    /// the manager. Applied to every provider pool registered afterwards.
+    pub fn setSharedStore(self: *Self, store: *CooldownStore) void {
+        self.shared_store = store.*;
+    }
+
+    fn poolOpts(self: *Self, base: key_pool.Options) key_pool.Options {
+        var o = base;
+        if (self.shared_store) |*s| o.shared_store = s;
+        return o;
     }
 
     /// Provider rotation (fallback chain) + key rotation (pool), by model.
@@ -84,7 +100,10 @@ pub const AiKeyManager = struct {
 
     /// Acquire a lease and return an `AiProvider` bound to the pool, so
     /// `chat`/`chatWith` rotate the key on 401/403/402/429 and retry once.
-    /// The manager must outlive the provider.
+    /// The manager must outlive the provider. Feedback after the call:
+    /// use `provider.reportSuccess()` / `provider.reportError(kind)` — the
+    /// provider may have rotated keys internally, so the original lease would
+    /// point at the failed key.
     pub fn providerFor(
         self: *Self,
         allocator: std.mem.Allocator,

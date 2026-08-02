@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const Time = @import("../core/Time.zig");
+const cooldown_store = @import("cooldown_store.zig");
 
 pub const KeyStatus = enum { healthy, cooling, disabled };
 
@@ -50,7 +51,6 @@ pub const ApiKey = struct {
     key: []const u8, // owned by the pool
     status: KeyStatus = .healthy,
     failures: u32 = 0,
-    cooling_until_ms: i64 = 0,
     total_calls: u64 = 0,
     total_errors: u64 = 0,
 };
@@ -70,7 +70,13 @@ pub const KeyStats = struct {
 pub const Options = struct {
     cooldown_base_ms: i64 = 5_000,
     cooldown_max_ms: i64 = 120_000,
+    /// TTL for an auth-banned key (default 1h).
+    ban_ttl_ms: i64 = 3_600_000,
     auth_fail_threshold: u32 = 3,
+    /// Cross-process shared cooldown/failure state. When set, the pool reads
+    /// and writes cooldown/ban/failures through this store (e.g. Redis) so
+    /// multiple instances sharing the same keys coordinate.
+    shared_store: ?*cooldown_store.CooldownStore = null,
     /// Injectable clock for tests (defaults to the framework monotonic clock).
     now_fn: *const fn () i64 = Time.monotonicNowMilliseconds,
 };
@@ -79,12 +85,23 @@ pub const KeyPool = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
+    io: std.Io,
+    /// Provider name — prefixes cooldown store keys ("<name>:<index>").
+    name: []const u8,
     keys: std.ArrayList(ApiKey),
+    store: cooldown_store.CooldownStore,
+    mem_store: ?*cooldown_store.MemoryCooldownStore = null,
     mutex: std.Io.Mutex,
     opts: Options,
     rr_index: usize = 0,
 
-    pub fn init(allocator: std.mem.Allocator, keys: []const []const u8, opts: Options) !KeyPool {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        name: []const u8,
+        keys: []const []const u8,
+        opts: Options,
+    ) !KeyPool {
         var owned = std.ArrayList(ApiKey).empty;
         errdefer {
             for (owned.items) |k| allocator.free(k.key);
@@ -94,17 +111,44 @@ pub const KeyPool = struct {
             if (k.len == 0) return error.EmptyApiKey;
             try owned.append(allocator, .{ .key = try allocator.dupe(u8, k) });
         }
-        return .{
+        if (opts.shared_store) |shared| {
+            return .{
+                .allocator = allocator,
+                .io = io,
+                .name = name,
+                .keys = owned,
+                .store = shared.*,
+                .mutex = std.Io.Mutex.init,
+                .opts = opts,
+            };
+        }
+        var pool = KeyPool{
             .allocator = allocator,
+            .io = io,
+            .name = name,
             .keys = owned,
             .mutex = std.Io.Mutex.init,
             .opts = opts,
+            .store = undefined,
+            .mem_store = null,
         };
+        // Heap-allocate the internal store so its address survives the
+        // by-value return of this struct.
+        const mem = try allocator.create(cooldown_store.MemoryCooldownStore);
+        errdefer allocator.destroy(mem);
+        mem.* = cooldown_store.MemoryCooldownStore.initWithOptions(allocator, io, .{ .now_fn = opts.now_fn });
+        pool.mem_store = mem;
+        pool.store = mem.asStore();
+        return pool;
     }
 
     pub fn deinit(self: *Self) void {
         for (self.keys.items) |k| self.allocator.free(k.key);
         self.keys.deinit(self.allocator);
+        if (self.mem_store) |m| {
+            m.deinit();
+            self.allocator.destroy(m);
+        }
         self.* = undefined;
     }
 
@@ -118,13 +162,13 @@ pub const KeyPool = struct {
     pub fn acquire(self: *Self, io: std.Io) !?KeyLease {
         self.mutex.lock(io) catch return error.LockFailed;
         defer self.mutex.unlock(io);
-        const now = self.opts.now_fn();
         const klen = self.keys.items.len;
         if (klen == 0) return null;
         for (0..klen) |step| {
             const idx = (self.rr_index + step) % klen;
             const key = &self.keys.items[idx];
-            if (key.status == .healthy or (key.status == .cooling and key.cooling_until_ms <= now)) {
+            var kbuf: [128]u8 = undefined;
+            if (key.status != .disabled and !self.store.isCooling(self.keyStr(idx, &kbuf))) {
                 if (key.status == .cooling) key.status = .healthy; // recovered
                 self.rr_index = (idx + 1) % klen;
                 return .{ .key = key.key, .key_index = idx };
@@ -139,7 +183,8 @@ pub const KeyPool = struct {
         const key = self.keyPtrLocked(key_index) orelse return;
         key.total_calls += 1;
         key.failures = 0;
-        key.cooling_until_ms = 0;
+        var kbuf: [128]u8 = undefined;
+        self.store.reset(self.keyStr(key_index, &kbuf));
         if (key.status != .disabled) key.status = .healthy;
     }
 
@@ -150,26 +195,27 @@ pub const KeyPool = struct {
         self.mutex.lock(io) catch return;
         defer self.mutex.unlock(io);
         const key = self.keyPtrLocked(key_index) orelse return;
-        const now = self.opts.now_fn();
         key.total_errors += 1;
-        key.failures += 1;
+        var kbuf: [128]u8 = undefined;
+        const k = self.keyStr(key_index, &kbuf);
+        key.failures = self.store.bumpFailures(k);
         switch (kind) {
             .auth => {
                 if (key.failures >= self.opts.auth_fail_threshold) {
                     key.status = .disabled;
-                    key.cooling_until_ms = std.math.maxInt(i64);
+                    self.store.cool(k, self.opts.ban_ttl_ms);
                 } else {
                     key.status = .cooling;
-                    key.cooling_until_ms = now + self.backoffMs(key.failures);
+                    self.store.cool(k, self.backoffMs(key.failures));
                 }
             },
             .rate_limit, .quota, .server, .network, .timeout => {
                 key.status = .cooling;
-                key.cooling_until_ms = now + self.backoffMs(key.failures);
+                self.store.cool(k, self.backoffMs(key.failures));
             },
             .unknown => {
                 key.status = .cooling;
-                key.cooling_until_ms = now + self.opts.cooldown_base_ms;
+                self.store.cool(k, self.opts.cooldown_base_ms);
             },
         }
     }
@@ -181,7 +227,8 @@ pub const KeyPool = struct {
         const key = self.keyPtrLocked(key_index) orelse return error.KeyNotFound;
         key.status = .healthy;
         key.failures = 0;
-        key.cooling_until_ms = 0;
+        var kbuf: [128]u8 = undefined;
+        self.store.reset(self.keyStr(key_index, &kbuf));
     }
 
     /// Snapshot per-key stats (owned by the caller).
@@ -206,6 +253,12 @@ pub const KeyPool = struct {
         return &self.keys.items[key_index];
     }
 
+    /// Logical cooldown-store key: "<provider>:<key_index>". Writes into the
+    /// caller-provided buffer (the store copies or reads it synchronously).
+    fn keyStr(self: *Self, key_index: usize, buf: []u8) []const u8 {
+        return std.fmt.bufPrint(buf, "{s}:{d}", .{ self.name, key_index }) catch self.name;
+    }
+
     fn backoffMs(self: *Self, failures: u32) i64 {
         const exponent: u32 = @min(failures -| 1, 6);
         const delay = self.opts.cooldown_base_ms * (@as(i64, 1) << @intCast(exponent));
@@ -221,7 +274,7 @@ fn fakeNow() i64 {
 }
 
 fn testPool(allocator: std.mem.Allocator, keys: []const []const u8) !KeyPool {
-    return KeyPool.init(allocator, keys, .{
+    return KeyPool.init(allocator, std.testing.io, "test", keys, .{
         .cooldown_base_ms = 1_000,
         .cooldown_max_ms = 8_000,
         .now_fn = fakeNow,
@@ -300,4 +353,25 @@ test "KeyErrorKind fromHttpStatus + retryable" {
     try std.testing.expect(KeyErrorKind.auth.isKeyRetryable());
     try std.testing.expect(KeyErrorKind.rate_limit.isKeyRetryable());
     try std.testing.expect(!KeyErrorKind.server.isKeyRetryable());
+}
+
+test "pool routes cooldown through an external shared store" {
+    const allocator = std.testing.allocator;
+    fake_now = 1_000_000;
+    var shared = cooldown_store.MemoryCooldownStore.initWithOptions(allocator, std.testing.io, .{ .now_fn = fakeNow });
+    defer shared.deinit();
+    var shared_store = shared.asStore();
+    var pool = try KeyPool.init(allocator, std.testing.io, "shared", &.{"sk-a"}, .{
+        .cooldown_base_ms = 1_000,
+        .cooldown_max_ms = 8_000,
+        .now_fn = fakeNow,
+        .shared_store = &shared_store,
+    });
+    defer pool.deinit();
+
+    const l = (try pool.acquire(std.testing.io)).?;
+    pool.onError(std.testing.io, l.key_index, .rate_limit);
+    try std.testing.expectEqual(@as(?KeyLease, null), try pool.acquire(std.testing.io));
+    // External store knows the key is cooling (cross-process visibility).
+    try std.testing.expect(shared.asStore().isCooling("shared:0"));
 }
