@@ -25,6 +25,7 @@ pub const schedule = @import("schedule.zig");
 
 pub const business = @import("business.zig");
 pub const actions = @import("actions.zig");
+pub const admin = @import("admin.zig");
 pub const Budget = @import("budget.zig").Budget;
 pub const workflow = @import("workflow.zig");
 pub const WorkflowMetrics = @import("workflow.zig").WorkflowMetrics;

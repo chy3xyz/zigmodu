@@ -52,10 +52,18 @@ registerReportSkills`（`userdata` 传对应 Ctx；`SkillContext.permissions` �
 | `command.execute` | 经事务性 outbox 提交应用注册命令；幂等键 = `SkillContext.run_id`（缺失拒绝），返回 event_id | `command:execute` |
 | `report.generate` | 应用注册聚合查询 → CSV / JSON（行数上限 100，只读） | — |
 
-## P2 · 管理/运维（规划中，默认关闭）
+## P2 · 管理/运维（✅ 已落地，默认关闭）
 
-`admin.user.manage` / `admin.tenant.provision` / `admin.cache.invalidate`（禁通配）/
-`admin.config.get/set` / `audit.export`。
+`zigmodu.ai.admin.registerAdminSkills`（`userdata` 传 `AdminCtx`；权限码
+`admin:cache` / `admin:config` / `admin:audit` / `admin:user` / `admin:tenant`；
+**必须显式加入 Agent allowlist 才可达**）：
+
+| Skill | 说明 |
+|-------|------|
+| `admin.cache.invalidate` / `admin.cache.clear` | 白名单缓存；key 禁通配（`*`/`?`），`all=true` 才允许整体清空 |
+| `admin.config.get` / `admin.config.set` | 白名单配置；`set` 仅限 mutable 键（`ConfigStore`） |
+| `admin.audit.export` | 查询 RunAuditStore（可选 kind/tenant/limit 过滤） |
+| `admin.user.manage` / `admin.tenant.provision` | 委托应用回调（框架不实现业务用户/租户逻辑） |
 
 ## 配套增强（✅ 已落地）
 
