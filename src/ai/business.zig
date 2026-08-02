@@ -139,8 +139,10 @@ pub fn registerBusinessSkills(
                     count += 1;
                 }
                 var out = std.json.ObjectMap{};
-                try out.put(ctx.allocator, "rows", .{ .array = rows });
-                try out.put(ctx.allocator, "count", .{ .integer = @intCast(count) });
+                // Keys must be allocator-owned: freeValue releases every key,
+                // and ObjectMap.put stores keys by reference (no copy).
+                try out.put(ctx.allocator, try ctx.allocator.dupe(u8, "rows"), .{ .array = rows });
+                try out.put(ctx.allocator, try ctx.allocator.dupe(u8, "count"), .{ .integer = @intCast(count) });
                 return .{ .object = out };
             }
         }.h,
@@ -260,8 +262,10 @@ pub fn registerBusinessSkills(
                     count += 1;
                 }
                 var out = std.json.ObjectMap{};
-                try out.put(ctx.allocator, "rows", .{ .array = rows });
-                try out.put(ctx.allocator, "count", .{ .integer = @intCast(count) });
+                // Keys must be allocator-owned: freeValue releases every key,
+                // and ObjectMap.put stores keys by reference (no copy).
+                try out.put(ctx.allocator, try ctx.allocator.dupe(u8, "rows"), .{ .array = rows });
+                try out.put(ctx.allocator, try ctx.allocator.dupe(u8, "count"), .{ .integer = @intCast(count) });
                 return .{ .object = out };
             }
         }.h,
@@ -297,6 +301,48 @@ test "db.query runs a parameterized SELECT and caps rows" {
     const rows = res.object.get("rows").?.array.items;
     try std.testing.expectEqualStrings("alice", rows[0].object.get("name").?.string);
     try std.testing.expectEqualStrings("carol", rows[1].object.get("name").?.string);
+}
+
+test "db.query/entity.list results are freeValue-safe (no literal keys)" {
+    const allocator = std.testing.allocator;
+    var client = sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, tenant_id INTEGER)", &.{});
+    _ = try client.exec("INSERT INTO users (name, tenant_id) VALUES ('alice', 1), ('bob', 2)", &.{});
+
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    const entities = [_]EntitySpec{.{ .name = "user", .table = "users", .pk = "id", .tenant_column = "tenant_id" }};
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    try registerBusinessSkills(&registry, &entities);
+
+    // ctx.allocator must be a real tracking allocator (not an arena) so
+    // freeValue on the result exercises every key/value ownership.
+    var ctx = SkillContext{ .allocator = allocator, .backend_ptr = &backend, .tenant_id = 1 };
+
+    var db_args = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"sql\":\"SELECT name FROM users WHERE tenant_id = ?\",\"args\":[1]}",
+        .{},
+    );
+    defer db_args.deinit();
+    const q = try registry.dispatch("db.query", &ctx, db_args.value);
+    defer freeValue(allocator, q);
+    try std.testing.expectEqual(@as(i64, 1), q.object.get("count").?.integer);
+    try std.testing.expectEqualStrings("alice", q.object.get("rows").?.array.items[0].object.get("name").?.string);
+
+    var list_args = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"entity\":\"user\",\"filters\":{\"name\":\"alice\"}}",
+        .{},
+    );
+    defer list_args.deinit();
+    const l = try registry.dispatch("entity.list", &ctx, list_args.value);
+    defer freeValue(allocator, l);
+    try std.testing.expectEqual(@as(i64, 1), l.object.get("count").?.integer);
 }
 
 test "db.query rejects non-SELECT and free-form literals" {

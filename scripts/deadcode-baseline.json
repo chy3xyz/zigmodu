@@ -1,13 +1,6 @@
 {
   "items": [
     {
-      "file": "src/ai/business.zig",
-      "line": 15,
-      "kind": "constant",
-      "name": "freeValue",
-      "parent": null
-    },
-    {
       "file": "src/ai/schedule.zig",
       "line": 14,
       "kind": "constant",
