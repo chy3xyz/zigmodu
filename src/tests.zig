@@ -210,6 +210,7 @@ test "compile all source files" {
     _ = @import("ai/business.zig");
     _ = @import("ai/actions.zig");
     _ = @import("ai/admin.zig");
+    _ = @import("ai/mcp.zig");
     _ = @import("ai/budget.zig");
     _ = @import("ai/workflow.zig");
     _ = @import("ai/observability.zig");
