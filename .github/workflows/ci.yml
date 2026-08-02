@@ -115,6 +115,31 @@ jobs:
           ./zig-out/bin/zmodu deadcode -j /tmp/dc_fixture/main.zig > /tmp/dc.json || true
           python3 -c "import json; d=json.load(open('/tmp/dc.json')); assert len(d['dead_declarations']) >= 1"
 
+      - name: zmodu audit CLI smoke (best-practice checker)
+        run: |
+          set -euo pipefail
+          for ex in tenant-mgmt tenant-shop basic ai-ops; do
+            ./zig-out/bin/zmodu audit "examples/$ex" -j | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['pass'], d"
+          done
+          # graph renders module nodes + edges
+          ./zig-out/bin/zmodu graph examples/tenant-shop | grep -q "order --> tenant"
+          # diff --migration emits a Flyway file
+          cp examples/shopdemo/schema.sql /tmp/mig_old.sql
+          printf '\nCREATE TABLE audit_log (id INTEGER PRIMARY KEY, action TEXT NOT NULL);\n' >> /tmp/mig_old.sql
+          mkdir -p /tmp/mig_out
+          ./zig-out/bin/zmodu diff /tmp/mig_old.sql examples/shopdemo/schema.sql --migration drop-audit-log --dir /tmp/mig_out >/dev/null
+          ls /tmp/mig_out/V*.sql >/dev/null
+          # rules config disables a rule
+          mkdir -p /tmp/rc_fixture/.zmodu
+          printf '{"max_deps":9,"disabled":["b4"]}\n' > /tmp/rc_fixture/.zmodu/rules.json
+          ./zig-out/bin/zmodu audit /tmp/rc_fixture -j | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['pass']"
+          # one-shot ci gate passes on a clean example
+          ./zig-out/bin/zmodu ci examples/basic | grep -q "summary: PASS"
+          # legacy example must be baselinable: --update then pass
+          ./zig-out/bin/zmodu audit examples/shopdemo --update >/dev/null
+          ./zig-out/bin/zmodu audit examples/shopdemo -j | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['pass'] and d['baseline']['suppressed']>0"
+          rm -rf examples/shopdemo/.zmodu
+
       - name: Dead-code baseline gate
         run: bash scripts/check-deadcode.sh
 

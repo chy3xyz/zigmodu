@@ -5,6 +5,7 @@ const mcp_types = @import("mcp_types.zig");
 const verify_mod = @import("verify.zig");
 const main_mod = @import("main.zig");
 const sql_diff = @import("sql_diff.zig");
+const audit_mod = @import("audit.zig");
 
 /// Start the MCP server loop on stdin/stdout.
 /// Blocks until stdin is closed.
@@ -117,6 +118,12 @@ fn buildToolsList(allocator: std.mem.Allocator, id: ?i64) !std.json.Value {
         .{ .name = "old_sql", .type = "string", .desc = "Path to the old SQL file" },
         .{ .name = "new_sql", .type = "string", .desc = "Path to the new SQL file" },
     }));
+    try tools.append(try makeToolSchema(allocator, "zmodu_audit", "Run the best-practice audit (architecture rules + business lint) on a project", &.{
+        .{ .name = "project_dir", .type = "string", .desc = "Path to the project directory" },
+    }));
+    try tools.append(try makeToolSchema(allocator, "zmodu_graph", "Render the module dependency graph as Mermaid", &.{
+        .{ .name = "project_dir", .type = "string", .desc = "Path to the project directory" },
+    }));
 
     var result: std.json.ObjectMap = .{};
     try result.put(allocator, "tools", .{ .array = tools });
@@ -142,6 +149,10 @@ fn buildToolsCallResponse(io: Io, allocator: std.mem.Allocator, id: ?i64, params
         try callVerify(io, allocator, arguments)
     else if (std.mem.eql(u8, tool_name, "zmodu_diff"))
         try callDiff(io, allocator, arguments)
+    else if (std.mem.eql(u8, tool_name, "zmodu_audit"))
+        try callAudit(io, allocator, arguments)
+    else if (std.mem.eql(u8, tool_name, "zmodu_graph"))
+        try callGraph(io, allocator, arguments)
     else
         return buildErrorResponseValue(allocator, id, -32602, "Unknown tool");
 
@@ -294,6 +305,34 @@ fn callVerify(io: Io, allocator: std.mem.Allocator, arguments: ?std.json.Value) 
     try parts.appendSlice(allocator, "]}");
 
     return parts.toOwnedSlice(allocator);
+}
+
+fn callAudit(io: Io, allocator: std.mem.Allocator, arguments: ?std.json.Value) ![]const u8 {
+    var project_dir: []const u8 = ".";
+    if (arguments) |a| {
+        if (a.object.get("project_dir")) |v| {
+            project_dir = v.string;
+        }
+    }
+    return audit_mod.auditJsonFor(io, allocator, project_dir) catch |err| {
+        return std.fmt.allocPrint(allocator, "{{\"error\":\"audit failed: {}\"}}", .{err});
+    };
+}
+
+fn callGraph(io: Io, allocator: std.mem.Allocator, arguments: ?std.json.Value) ![]const u8 {
+    var project_dir: []const u8 = ".";
+    if (arguments) |a| {
+        if (a.object.get("project_dir")) |v| {
+            project_dir = v.string;
+        }
+    }
+    const mermaid = audit_mod.renderMermaid(io, allocator, project_dir) catch |err| {
+        return std.fmt.allocPrint(allocator, "{{\"error\":\"graph failed: {}\"}}", .{err});
+    };
+    defer allocator.free(mermaid);
+    const esc = try jsonEscape(allocator, mermaid);
+    defer allocator.free(esc);
+    return std.fmt.allocPrint(allocator, "{{\"mermaid\":\"{s}\"}}", .{esc});
 }
 
 fn callDiff(io: Io, allocator: std.mem.Allocator, arguments: ?std.json.Value) ![]const u8 {

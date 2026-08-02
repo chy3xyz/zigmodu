@@ -17,6 +17,8 @@ const sql_diff = @import("sql_diff.zig");
 const incremental = @import("incremental.zig");
 const ai_cli = @import("ai_cli.zig");
 const deadcode = @import("deadcode.zig");
+const audit_mod = @import("audit.zig");
+const ci_mod = @import("ci.zig");
 
 const Command = enum {
     new,
@@ -38,6 +40,9 @@ const Command = enum {
     verify,
     diff,
     ai,
+    audit,
+    graph,
+    ci,
     deadcode,
     help,
     version,
@@ -259,6 +264,9 @@ fn runCommand(io: std.Io, allocator: std.mem.Allocator, command: Command, cmd_ar
         .verify => try cmdVerify(io, allocator, cmd_args),
         .diff => try cmdDiff(io, allocator, cmd_args),
         .ai => try cmdAi(io, allocator, cmd_args),
+        .audit => cmdAudit(io, allocator, cmd_args),
+        .graph => try cmdGraph(io, allocator, cmd_args),
+        .ci => cmdCi(io, allocator, cmd_args),
         .deadcode => cmdDeadcode(io, allocator, cmd_args),
         .help => {
             if (cmd_args.len != 0) {
@@ -370,6 +378,9 @@ fn parseCommand(cmd: []const u8) ?Command {
     if (std.mem.eql(u8, cmd, "mcp")) return .mcp;
     if (std.mem.eql(u8, cmd, "verify")) return .verify;
     if (std.mem.eql(u8, cmd, "diff")) return .diff;
+    if (std.mem.eql(u8, cmd, "audit")) return .audit;
+    if (std.mem.eql(u8, cmd, "graph")) return .graph;
+    if (std.mem.eql(u8, cmd, "ci")) return .ci;
     if (std.mem.eql(u8, cmd, "ai")) return .ai;
     if (std.mem.eql(u8, cmd, "deadcode")) return .deadcode;
     if (std.mem.eql(u8, cmd, "help")) return .help;
@@ -406,6 +417,9 @@ fn printUsage() void {
         \\  verify [dir]   Verify project compiles and has correct structure
         \\  diff <old> <new>  Compare two SQL files, show table-level changes
         \\  ai                AI skill registry: export-skills | openapi
+        \\  audit [dir]       Best-practice audit: architecture rules + business lint
+        \\  graph [dir]       Render module dependency graph (Mermaid)
+        \\  ci [dir]          One-shot gate: build + fmt + verify + audit + deadcode
         \\  deadcode          Scan for unused declarations (dead code)
         \\  generate <t>   Alias: generate module|event|api|orm [...]
         \\  help            Show help
@@ -582,6 +596,49 @@ fn cmdDeadcode(io: std.Io, allocator: std.mem.Allocator, args: []const []const u
     if (code != 0) std.process.exit(code);
 }
 
+fn cmdAudit(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) void {
+    const code = audit_mod.run(io, allocator, args);
+    if (code != 0) std.process.exit(code);
+}
+
+fn cmdGraph(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
+    var dir: []const u8 = ".";
+    var out_path: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--out")) {
+            if (i + 1 >= args.len) return error.CliUsage;
+            i += 1;
+            out_path = args[i];
+        } else if (args[i].len > 0 and args[i][0] == '-') {
+            return error.CliUsage;
+        } else {
+            dir = args[i];
+        }
+    }
+
+    const mermaid = try audit_mod.renderMermaid(io, allocator, dir);
+    defer allocator.free(mermaid);
+    if (out_path) |p| {
+        const file = try std.Io.Dir.cwd().createFile(io, p, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, mermaid);
+        std.log.info("module graph written to {s}", .{p});
+    } else {
+        var out_buf: [4096]u8 = undefined;
+        var out_file = std.Io.File.stdout();
+        var out_writer = out_file.writer(io, &out_buf);
+        const stdout = &out_writer.interface;
+        try stdout.writeAll(mermaid);
+        try stdout.flush();
+    }
+}
+
+fn cmdCi(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) void {
+    const code = ci_mod.run(io, allocator, args);
+    if (code != 0) std.process.exit(code);
+}
+
 fn cmdVerify(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
     const project_dir = if (args.len > 0) args[0] else ".";
     const report = try verify_mod.verifyProject(allocator, io, project_dir);
@@ -615,11 +672,27 @@ fn cmdVerify(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8)
 
 fn cmdDiff(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 2) {
-        std.log.err("Usage: zmodu diff <old.sql> <new.sql>", .{});
+        std.log.err("Usage: zmodu diff <old.sql> <new.sql> [--migration <name>] [--dir <migrations-dir>]", .{});
         return error.CliUsage;
     }
     const old_path = args[0];
     const new_path = args[1];
+    var migration_name: ?[]const u8 = null;
+    var migrations_dir: []const u8 = "src/migrations";
+    var i: usize = 2;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--migration")) {
+            if (i + 1 >= args.len) return error.CliUsage;
+            i += 1;
+            migration_name = args[i];
+        } else if (std.mem.eql(u8, args[i], "--dir")) {
+            if (i + 1 >= args.len) return error.CliUsage;
+            i += 1;
+            migrations_dir = args[i];
+        } else {
+            return error.CliUsage;
+        }
+    }
 
     const old_sql = Io.Dir.cwd().readFileAlloc(io, old_path, allocator, Io.Limit.limited(10 * 1024 * 1024)) catch |err| {
         std.log.err("Cannot read {s}: {}", .{ old_path, err });
@@ -662,8 +735,8 @@ fn cmdDiff(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !
         try stdout.writeAll("{\"changed_tables\":0,\"diffs\":[]}\n");
     } else {
         try stdout.print("{{\"changed_tables\":{d},\"diffs\":[", .{diffs.len});
-        for (diffs, 0..) |d, i| {
-            if (i > 0) try stdout.writeByte(',');
+        for (diffs, 0..) |d, idx| {
+            if (idx > 0) try stdout.writeByte(',');
             const change_str = switch (d.change_type) {
                 .added => "added",
                 .removed => "removed",
@@ -674,6 +747,27 @@ fn cmdDiff(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !
         try stdout.writeAll("]}\n");
     }
     try stdout.flush();
+
+    if (migration_name) |name| {
+        const sql = try renderMigrationSql(allocator, old_tables, new_tables, diffs);
+        defer allocator.free(sql);
+        if (sql.len == 0) {
+            std.log.info("diff: no SQL statements to migrate", .{});
+            return;
+        }
+        try std.Io.Dir.cwd().createDirPath(io, migrations_dir);
+        const stamp = migrationStamp(wallClockSeconds());
+        const filename = try std.fmt.allocPrint(allocator, "V{d:0>4}{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>2}__{s}.sql", .{
+            stamp[0], stamp[1], stamp[2], stamp[3], stamp[4], stamp[5], name,
+        });
+        defer allocator.free(filename);
+        const filepath = try std.fs.path.join(allocator, &.{ migrations_dir, filename });
+        defer allocator.free(filepath);
+        const file = try std.Io.Dir.cwd().createFile(io, filepath, .{ .exclusive = true });
+        defer file.close(io);
+        try file.writeStreamingAll(io, sql);
+        std.log.info("migration written: {s}", .{filepath});
+    }
 }
 
 fn cmdNew(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -1892,6 +1986,7 @@ pub fn parseSqlSchema(allocator: std.mem.Allocator, sql: []const u8) ![]TableDef
         if (parseKeyword(sql, &i, "CREATE")) {
             if (parseKeyword(sql, &i, "TABLE")) {
                 const table_name = try parseIdentifier(allocator, sql, &i);
+                errdefer allocator.free(table_name);
                 skipWhitespaceAndComments(sql, &i);
                 if (i < sql.len and sql[i] == '(') {
                     i += 1;
@@ -1902,6 +1997,10 @@ pub fn parseSqlSchema(allocator: std.mem.Allocator, sql: []const u8) ![]TableDef
                     // Mark table-level PRIMARY KEY columns
                     markPrimaryKeyColumns(allocator, sql, body_start, body_end, columns);
                     try tables.append(allocator, .{ .name = table_name, .columns = columns, .foreign_keys = fks });
+                } else {
+                    // Not a table definition (e.g. `CREATE TABLE IF NOT EXISTS`)
+                    // — the parsed name is not part of any table.
+                    allocator.free(table_name);
                 }
             }
         } else {
@@ -3712,39 +3811,7 @@ fn cmdMigration(io: std.Io, allocator: std.mem.Allocator, args: []const []const 
         return err;
     };
 
-    // Generate timestamp YYYYMMDDHHMMSS
-    const now_epoch = std.time.epoch.unix;
-    const epoch_seconds: u64 = @intCast(now_epoch);
-    const seconds_per_day: u64 = 86400;
-    const days_since_epoch = epoch_seconds / seconds_per_day;
-
-    // Simple date calculation (good enough for migration timestamps)
-    var remaining_days = days_since_epoch;
-    var year: u64 = 1970;
-    while (true) {
-        const days_in_year = if ((year % 4 == 0 and year % 100 != 0) or year % 400 == 0) @as(u64, 366) else @as(u64, 365);
-        if (remaining_days < days_in_year) break;
-        remaining_days -= days_in_year;
-        year += 1;
-    }
-
-    const month_days_normal = [_]u64{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
-    const month_days_leap = [_]u64{ 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
-    const leap = (year % 4 == 0 and year % 100 != 0) or year % 400 == 0;
-    const month_days = if (leap) &month_days_leap else &month_days_normal;
-
-    var month: u64 = 1;
-    for (month_days) |md| {
-        if (remaining_days < md) break;
-        remaining_days -= md;
-        month += 1;
-    }
-    const day = remaining_days + 1;
-
-    const secs_in_day = epoch_seconds % seconds_per_day;
-    const hour = (secs_in_day / 3600) % 24;
-    const minute = (secs_in_day / 60) % 60;
-    const second = secs_in_day % 60;
+    const stamp = migrationStamp(wallClockSeconds());
 
     // Sanitize description for filename
     var safe_name = std.ArrayList(u8).empty;
@@ -3758,7 +3825,7 @@ fn cmdMigration(io: std.Io, allocator: std.mem.Allocator, args: []const []const 
     }
 
     const filename = try std.fmt.allocPrint(allocator, "V{d:0>4}{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>2}__{s}.sql", .{
-        year, month, day, hour, minute, second, safe_name.items,
+        stamp[0], stamp[1], stamp[2], stamp[3], stamp[4], stamp[5], safe_name.items,
     });
     defer allocator.free(filename);
 
@@ -3780,12 +3847,167 @@ fn cmdMigration(io: std.Io, allocator: std.mem.Allocator, args: []const []const 
         \\
         \\-- TODO: write migration SQL here
         \\
-    , .{ year, month, day, hour, minute, second, description });
+    , .{ stamp[0], stamp[1], stamp[2], stamp[3], stamp[4], stamp[5], description });
     defer allocator.free(content);
 
     try writeFile(io, filepath, content);
 
     std.log.info("Created migration: {s}", .{filepath});
+}
+
+/// YYYYMMDDHHMMSS parts from epoch seconds (shared by migration + diff).
+fn migrationStamp(epoch_seconds: u64) [6]u64 {
+    const seconds_per_day: u64 = 86400;
+    const days_since_epoch = epoch_seconds / seconds_per_day;
+
+    var remaining_days = days_since_epoch;
+    var year: u64 = 1970;
+    while (true) {
+        const days_in_year = if ((year % 4 == 0 and year % 100 != 0) or year % 400 == 0) @as(u64, 366) else @as(u64, 365);
+        if (remaining_days < days_in_year) break;
+        remaining_days -= days_in_year;
+        year += 1;
+    }
+
+    const month_days_normal = [_]u64{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    const month_days_leap = [_]u64{ 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    const leap = (year % 4 == 0 and year % 100 != 0) or year % 400 == 0;
+    const month_days = if (leap) &month_days_leap else &month_days_normal;
+
+    var remaining = remaining_days;
+    var month: u64 = 1;
+    for (month_days) |md| {
+        if (remaining < md) break;
+        remaining -= md;
+        month += 1;
+    }
+    const day = remaining + 1;
+
+    const secs_in_day = epoch_seconds % seconds_per_day;
+    const hour = (secs_in_day / 3600) % 24;
+    const minute = (secs_in_day / 60) % 60;
+    const second = secs_in_day % 60;
+    return .{ year, month, day, hour, minute, second };
+}
+
+/// Current wall-clock epoch seconds (REALTIME; Windows via FILETIME).
+fn wallClockSeconds() u64 {
+    if (@import("builtin").os.tag == .windows) {
+        var ft: std.os.windows.FILETIME = undefined;
+        std.os.windows.GetSystemTimeAsFileTime(&ft);
+        const t = (@as(u64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+        return @intCast(t / 10000000 -| 11644473600);
+    }
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.REALTIME, &ts) == 0) {
+        return @intCast(@max(ts.sec, 0));
+    }
+    return 0;
+}
+
+fn sqlColumnType(col_type: ColumnType) []const u8 {
+    return switch (col_type) {
+        .int => "INTEGER",
+        .string => "TEXT",
+        .bool => "INTEGER",
+        .float => "REAL",
+        .datetime => "TEXT",
+        .unknown => "TEXT",
+    };
+}
+
+fn findTable(tables: []const TableDef, name: []const u8) ?*const TableDef {
+    for (tables) |*t| {
+        if (std.mem.eql(u8, t.name, name)) return t;
+    }
+    return null;
+}
+
+fn findColumn(table: *const TableDef, name: []const u8) ?*const ColumnDef {
+    for (table.columns) |*c| {
+        if (std.mem.eql(u8, c.name, name)) return c;
+    }
+    return null;
+}
+
+/// Render Flyway-style SQL for a table diff (added/removed/modified). Owned.
+fn renderMigrationSql(
+    allocator: std.mem.Allocator,
+    old_tables: []const TableDef,
+    new_tables: []const TableDef,
+    diffs: []const sql_diff.TableDiff,
+) ![]const u8 {
+    _ = old_tables;
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+
+    for (diffs) |d| {
+        switch (d.change_type) {
+            .added => {
+                const new_t = findTable(new_tables, d.table_name) orelse continue;
+                try buf.appendSlice(allocator, "CREATE TABLE ");
+                try buf.appendSlice(allocator, d.table_name);
+                try buf.appendSlice(allocator, " (\n");
+                for (new_t.columns, 0..) |col, ci| {
+                    if (ci > 0) try buf.appendSlice(allocator, ",\n");
+                    try buf.appendSlice(allocator, "  ");
+                    try buf.appendSlice(allocator, col.name);
+                    try buf.appendSlice(allocator, " ");
+                    try buf.appendSlice(allocator, sqlColumnType(col.col_type));
+                    if (col.is_primary_key) try buf.appendSlice(allocator, " PRIMARY KEY");
+                    if (!col.nullable and !col.is_primary_key) try buf.appendSlice(allocator, " NOT NULL");
+                    if (col.is_unique) try buf.appendSlice(allocator, " UNIQUE");
+                }
+                try buf.appendSlice(allocator, "\n);\n");
+            },
+            .removed => {
+                try buf.appendSlice(allocator, "DROP TABLE ");
+                try buf.appendSlice(allocator, d.table_name);
+                try buf.appendSlice(allocator, ";\n");
+            },
+            .modified => {
+                for (d.column_changes) |cc| {
+                    try buf.appendSlice(allocator, "ALTER TABLE ");
+                    try buf.appendSlice(allocator, d.table_name);
+                    switch (cc.change_type) {
+                        .added => {
+                            const new_t = findTable(new_tables, d.table_name) orelse continue;
+                            const col = findColumn(new_t, cc.column_name) orelse continue;
+                            try buf.appendSlice(allocator, " ADD COLUMN ");
+                            try buf.appendSlice(allocator, cc.column_name);
+                            try buf.appendSlice(allocator, " ");
+                            try buf.appendSlice(allocator, sqlColumnType(col.col_type));
+                            if (!col.nullable) try buf.appendSlice(allocator, " NOT NULL");
+                        },
+                        .removed => {
+                            try buf.appendSlice(allocator, " DROP COLUMN ");
+                            try buf.appendSlice(allocator, cc.column_name);
+                        },
+                        .type_changed => {
+                            try buf.appendSlice(allocator, " ALTER COLUMN ");
+                            try buf.appendSlice(allocator, cc.column_name);
+                            try buf.appendSlice(allocator, " TYPE ");
+                            try buf.appendSlice(allocator, if (cc.new_type) |nt| nt else "TEXT");
+                        },
+                        .nullable_changed => {
+                            try buf.appendSlice(allocator, " ALTER COLUMN ");
+                            try buf.appendSlice(allocator, cc.column_name);
+                            const new_t = findTable(new_tables, d.table_name) orelse continue;
+                            const col = findColumn(new_t, cc.column_name) orelse continue;
+                            try buf.appendSlice(allocator, if (col.nullable) " DROP NOT NULL" else " SET NOT NULL");
+                        },
+                        .default_changed => {
+                            try buf.appendSlice(allocator, " ALTER COLUMN ");
+                            try buf.appendSlice(allocator, cc.column_name);
+                            try buf.appendSlice(allocator, " SET DEFAULT NULL -- review manually");
+                        },
+                    }
+                    try buf.appendSlice(allocator, ";\n");
+                }
+            },
+        }
+    }
+    return buf.toOwnedSlice(allocator);
 }
 
 // ── health: generate health check endpoint boilerplate ──────────────
@@ -8140,6 +8362,50 @@ test "formatNestTuple splits module path" {
     const nested = try formatNestTuple(a, "shop/order");
     defer a.free(nested);
     try std.testing.expectEqualStrings(".{ \"shop\", \"order\" }", nested);
+}
+
+test "renderMigrationSql emits CREATE/ALTER/DROP statements" {
+    const allocator = std.testing.allocator;
+    const old_tables = [_]TableDef{
+        .{ .name = "users", .columns = &.{}, .foreign_keys = &.{} },
+    };
+    var users_cols = [_]ColumnDef{
+        .{ .name = "id", .col_type = .int, .nullable = false, .is_primary_key = true, .is_unique = false, .has_default = false, .comment = null },
+        .{ .name = "email", .col_type = .string, .nullable = true, .is_primary_key = false, .is_unique = false, .has_default = false, .comment = null },
+    };
+    var audit_cols = [_]ColumnDef{
+        .{ .name = "id", .col_type = .int, .nullable = false, .is_primary_key = true, .is_unique = false, .has_default = false, .comment = null },
+        .{ .name = "action", .col_type = .string, .nullable = false, .is_primary_key = false, .is_unique = false, .has_default = false, .comment = null },
+    };
+    const new_tables = [_]TableDef{
+        .{
+            .name = "users",
+            .columns = &users_cols,
+            .foreign_keys = &.{},
+        },
+        .{
+            .name = "audit_log",
+            .columns = &audit_cols,
+            .foreign_keys = &.{},
+        },
+    };
+    var email_change = [_]sql_diff.ColumnChange{.{ .column_name = "email", .change_type = .added }};
+    const diffs = [_]sql_diff.TableDiff{
+        .{ .table_name = "audit_log", .change_type = .added },
+        .{
+            .table_name = "users",
+            .change_type = .modified,
+            .column_changes = &email_change,
+        },
+        .{ .table_name = "legacy", .change_type = .removed },
+    };
+
+    const sql = try renderMigrationSql(allocator, &old_tables, &new_tables, &diffs);
+    defer allocator.free(sql);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "CREATE TABLE audit_log") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "ADD COLUMN email") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "DROP TABLE legacy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "PRIMARY KEY") != null);
 }
 
 test "generateModuleApi emits RouteSpec table and typed handlers" {

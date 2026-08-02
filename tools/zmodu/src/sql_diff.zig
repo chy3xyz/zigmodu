@@ -140,17 +140,18 @@ fn diffColumns(allocator: std.mem.Allocator, old_cols: []const main_mod.ColumnDe
 test "diffTables detects added table" {
     const allocator = std.testing.allocator;
     const old_tables = [_]main_mod.TableDef{};
+    var new_cols = [_]main_mod.ColumnDef{.{
+        .name = "id",
+        .col_type = .int,
+        .nullable = false,
+        .is_primary_key = true,
+        .is_unique = false,
+        .has_default = false,
+        .comment = null,
+    }};
     const new_tables = [_]main_mod.TableDef{.{
         .name = "users",
-        .columns = &[_]main_mod.ColumnDef{.{
-            .name = "id",
-            .col_type = .int,
-            .nullable = false,
-            .is_primary_key = true,
-            .is_unique = false,
-            .has_default = false,
-            .comment = null,
-        }},
+        .columns = &new_cols,
         .foreign_keys = &.{},
     }};
 
@@ -178,7 +179,7 @@ test "diffTables detects removed table" {
 
 test "diffTables detects added column" {
     const allocator = std.testing.allocator;
-    const old_cols = [_]main_mod.ColumnDef{.{
+    var old_cols = [_]main_mod.ColumnDef{.{
         .name = "id",
         .col_type = .int,
         .nullable = false,
@@ -187,7 +188,7 @@ test "diffTables detects added column" {
         .has_default = false,
         .comment = null,
     }};
-    const new_cols = [_]main_mod.ColumnDef{
+    var new_cols = [_]main_mod.ColumnDef{
         .{ .name = "id", .col_type = .int, .nullable = false, .is_primary_key = true, .is_unique = false, .has_default = false, .comment = null },
         .{ .name = "email", .col_type = .string, .nullable = true, .is_primary_key = false, .is_unique = false, .has_default = false, .comment = null },
     };
@@ -208,7 +209,7 @@ test "diffTables detects added column" {
 
 test "diffTables detects type change" {
     const allocator = std.testing.allocator;
-    const old_cols = [_]main_mod.ColumnDef{.{
+    var old_cols = [_]main_mod.ColumnDef{.{
         .name = "val",
         .col_type = .int,
         .nullable = false,
@@ -217,7 +218,7 @@ test "diffTables detects type change" {
         .has_default = false,
         .comment = null,
     }};
-    const new_cols = [_]main_mod.ColumnDef{.{
+    var new_cols = [_]main_mod.ColumnDef{.{
         .name = "val",
         .col_type = .string,
         .nullable = false,
@@ -240,7 +241,7 @@ test "diffTables detects type change" {
 
 test "diffTables no changes produces empty diff" {
     const allocator = std.testing.allocator;
-    const cols = [_]main_mod.ColumnDef{.{
+    var cols = [_]main_mod.ColumnDef{.{
         .name = "id",
         .col_type = .int,
         .nullable = false,

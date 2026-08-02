@@ -326,17 +326,21 @@ pub fn init() !void {
 **目标**：确保持续符合模块化架构原则
 
 ```zig
-// ArchitectureTester：自动验证模块边界
+// ArchitectureTester：自动验证模块边界（zigmodu.ArchitectureTester，已导出）
 test "architecture - no illegal dependencies" {
-    var tester = zigmodu.ArchitectureTester.init(allocator);
+    var modules = zigmodu.ApplicationModules.init(allocator);
+    defer modules.deinit();
+    // 注册模块：modules.register(...)（name + deps）
+    var tester = zigmodu.ArchitectureTester.init(allocator, &modules);
     defer tester.deinit();
 
-    // AI 写规则，框架自动检查
-    try tester.verifyNoCyclicDependencies();
-    try tester.verifyModuleBoundary("order", &.{"inventory", "user"});
-    try tester.verifyNoInternalAccess("order", "inventory.internal");
+    try std.testing.expect(try tester.verify()); // runDefaultRules: 自依赖/循环/描述/命名/依赖上限
 }
 ```
+
+业务侧源码级检查：`zmodu audit [dir]` 对 `src/modules/**` 跑架构规则 +
+反模式 lint（handler SQL、非参数化 SQL、`@ptrCast(user_data)`、banned/removed
+API、跨模块文件导入），支持 `.zmodu/audit-baseline.json` 基线。
 
 **AI 的价值**：生成架构测试规则，框架自动执行，形成持续保障。
 

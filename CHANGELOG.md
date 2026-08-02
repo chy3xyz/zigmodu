@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **`zmodu audit` 业务最佳实践检查器**: 新 CLI 命令，两组规则——architecture
+  （模块自依赖/循环依赖/缺失描述/命名规范/依赖上限/未知依赖/base 模块依赖，
+  与 `zigmodu.ArchitectureTester` 默认规则对齐）与 business（handler/model 含
+  SQL、非参数化 SQL、`@ptrCast(ctx.user_data)`、legacy sendSuccess/sendFail、
+  banned 导入、已移除 Zig 0.17 API、跨模块直接文件导入）。支持 `-j` JSON、
+  `--group`/`--max-deps`/`--base-modules`、`.zmodu/audit-baseline.json` 基线
+  （与 deadcode 同语义，`--update` 收缩）；CLI 单测 4 个并入 `zig build test`。
+  同时把 `zigmodu.ArchitectureTester` 导出到 root（修复与
+  docs/AI_METHODOLOGY.md 的断点），docs/ZMODU_CLI_INTEGRATION.md 补章节。
+- **zmodu 工具链增强（P0/P1 落地）**: (1) `zmodu ci` 一站式门禁——`zig build`
+  → `fmt --check` → `verify` → `audit` → `deadcode`，单命令面向 CI；(2)
+  `zmodu graph [dir] [--out]` 输出模块依赖 Mermaid 图；(3) `zmodu diff old.sql
+  new.sql --migration <name>` 自动生成 Flyway 迁移 SQL（CREATE/ALTER/DROP），
+  并修复迁移时间戳恒为 `V19700101000000` 的既有 bug（改用 REALTIME 时钟）；(4)
+  audit 规则配置 `.zmodu/rules.json`（`max_deps` / `disabled`）与两条新规则
+  `b9`（handler 手工解析 Authorization/Bearer）、`b10`（空 catch 吞错）；(5)
+  MCP server 新增 `zmodu_audit` / `zmodu_graph` 工具；(6) 修复既有 bug：
+  `verify` 字面量 details 被 free 导致的无效释放崩溃、`module_integrity` warn
+  details 泄漏、`parseSqlSchema` 对 `CREATE TABLE IF NOT EXISTS` 的表名泄漏、
+  sql_diff 测试 const 数组协变编译错误（此前 zmodu CLI 测试产物为缓存旧态）。
+
 ## [0.15.2] - 2026-08-02
 
 ### Changed

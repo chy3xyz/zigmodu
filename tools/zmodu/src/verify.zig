@@ -38,6 +38,9 @@ pub fn verifyProject(allocator: std.mem.Allocator, io: Io, project_dir: []const 
         .details = try std.fmt.allocPrint(allocator, "check error: {}", .{err}),
     };
     try checks.append(allocator, integrity);
+    if (integrity.status == .warn) {
+        if (integrity.details) |d| try warns.append(allocator, d);
+    }
     if (integrity.status == .fail) {
         if (integrity.details) |d| try errs.append(allocator, d);
     }
@@ -94,13 +97,13 @@ fn checkModuleIntegrity(allocator: std.mem.Allocator, io: Io, project_dir: []con
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const modules_path = std.fmt.bufPrint(&path_buf, "{s}/src/modules", .{project_dir}) catch
-        return CheckResult{ .name = "module_integrity", .status = .fail, .details = "path too long" };
+        return CheckResult{ .name = "module_integrity", .status = .fail, .details = try allocator.dupe(u8, "path too long") };
 
     const dir = Dir.cwd().openDir(io, modules_path, .{ .iterate = true }) catch |err| {
         if (err == error.FileNotFound) {
-            return CheckResult{ .name = "module_integrity", .status = .warn, .details = "src/modules/ directory not found (new project?)" };
+            return CheckResult{ .name = "module_integrity", .status = .warn, .details = try allocator.dupe(u8, "src/modules/ directory not found (new project?)") };
         }
-        return CheckResult{ .name = "module_integrity", .status = .fail, .details = "cannot open src/modules/" };
+        return CheckResult{ .name = "module_integrity", .status = .fail, .details = try allocator.dupe(u8, "cannot open src/modules/") };
     };
     defer dir.close(io);
 
@@ -147,10 +150,10 @@ fn checkModuleIntegrity(allocator: std.mem.Allocator, io: Io, project_dir: []con
 fn checkImportConsistency(allocator: std.mem.Allocator, io: Io, project_dir: []const u8) !CheckResult {
     var src_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = std.fmt.bufPrint(&src_buf, "{s}/src", .{project_dir}) catch
-        return CheckResult{ .name = "import_consistency", .status = .warn, .details = "path too long" };
+        return CheckResult{ .name = "import_consistency", .status = .warn, .details = try allocator.dupe(u8, "path too long") };
 
     const src_dir = Dir.cwd().openDir(io, src_path, .{ .iterate = true }) catch
-        return CheckResult{ .name = "import_consistency", .status = .warn, .details = "src/ directory not found" };
+        return CheckResult{ .name = "import_consistency", .status = .warn, .details = try allocator.dupe(u8, "src/ directory not found") };
     defer src_dir.close(io);
 
     var missing_list = std.ArrayList(u8).empty;
@@ -169,7 +172,7 @@ fn checkImportConsistency(allocator: std.mem.Allocator, io: Io, project_dir: []c
     return CheckResult{
         .name = "import_consistency",
         .status = .pass,
-        .details = "all imports resolved",
+        .details = try allocator.dupe(u8, "all imports resolved"),
     };
 }
 

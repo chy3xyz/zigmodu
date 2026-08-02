@@ -99,6 +99,81 @@ lint 风格的可达性分析）：报告未使用的顶层 `fn`/`const`/`var`�
 
 ---
 
+## `zmodu audit` — 业务最佳实践检查
+
+针对业务代码（`src/modules/**`）的规则检查器，两组规则：
+
+- **architecture**：模块自依赖、循环依赖、缺失描述、命名规范
+  （小写字母/数字/`-`/`_`）、依赖数量上限（默认 5）、未知依赖（拼写错误）、
+  base 模块依赖业务模块（`--base-modules core,http` 时启用）——与框架内
+  `zigmodu.ArchitectureTester` 的默认规则对齐（静态源码扫描版）；
+- **business**：handler/model 含 SQL、非参数化 SQL（字符串字面量拼接）、
+  `@ptrCast(ctx.user_data)`、legacy `sendSuccess`/`sendFail`、banned 导入
+  （`zigmodu.http_server` / `orm.Orm` / `PasswordEncoder`）、已移除的 Zig
+  0.17 API（`std.Thread.Mutex` 等）、跨模块直接文件导入、handler 手工解析
+  Authorization/Bearer、空 `catch {}` 吞错。规则可用
+  `.zmodu/rules.json` 按项目开关。
+
+```bash
+zmodu audit                      # 全部规则，默认目录 "."
+zmodu audit -g business          # 只跑业务 lint
+zmodu audit --max-deps 8 -j      # 依赖上限 8 + JSON 输出
+zmodu audit --base-modules core,http   # 启用 base 模块规则
+zmodu audit --update             # 写入/更新 .zmodu/audit-baseline.json
+```
+
+基线语义与 `deadcode` 一致：新增违规使命令失败（exit 1），已入基线条目被
+抑制，条目消失视为移除；`--update` 收缩基线。`-j` 输出机器可读 JSON
+（pass / 分组计数 / violations / baseline 统计）。仓库示例中
+`tenant-mgmt`、`tenant-shop`、`basic`、`ai-ops` 全量通过；`shopdemo` 为
+legacy 演示，可用基线逐步治理。
+
+---
+
+## `zmodu ci` — 一站式质量门禁
+
+一条命令跑完全部门禁（面向 CI 或本地提交流程）：
+
+```bash
+zmodu ci [dir]      # zig build → fmt --check → verify → audit → deadcode
+```
+
+任何一步失败退出码 1，全部通过退出码 0。业务项目可在 GitHub Actions 里
+直接 `zmodu ci`，无需再拼多段脚本。
+
+## `zmodu graph` — 模块依赖图（Mermaid）
+
+复用 audit 的模块提取，输出 Mermaid 依赖图：
+
+```bash
+zmodu graph [dir]            # stdout
+zmodu graph --out docs/modules.md   # 写入文件（可进 CI 自动更新架构图）
+```
+
+## `zmodu diff --migration` — schema 演进闭环
+
+`diff` 现在可以直接产出 Flyway 迁移文件：
+
+```bash
+zmodu diff old.sql new.sql --migration add-audit-log [--dir src/migrations]
+```
+
+自动生成 `V{YYYYMMDDHHMMSS}__add-audit-log.sql`（CREATE/ALTER/DROP 语句），
+与 `zmodu migration` 同名规范一致。顺带修复了迁移时间戳恒为
+`V19700101000000` 的既有 bug（改用 REALTIME 时钟）。
+
+## audit 规则配置（`.zmodu/rules.json`）
+
+按项目开关规则 / 调阈值：
+
+```json
+{ "max_deps": 8, "disabled": ["b3", "b9"] }
+```
+
+CLI `--max-deps` 优先于配置文件，配置文件优先于内置默认值。
+
+---
+
 ## 最佳实践规范
 
 在整合使用 `zmodu` 生成代码时，必须遵守 ZigModu 生产规范：

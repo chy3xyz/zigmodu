@@ -46,6 +46,7 @@ pub const generateDocs = @import("core/Documentation.zig").generateDocs;
 pub const Documentation = @import("core/Documentation.zig");
 pub const ModuleContract = @import("core/ModuleContract.zig").ModuleContract;
 pub const ContractRegistry = @import("core/ModuleContract.zig").ContractRegistry;
+pub const ArchitectureTester = @import("core/ArchitectureTester.zig").ArchitectureTester;
 pub const ModuleInteractionVerifier = @import("core/ModuleInteractionVerifier.zig").ModuleInteractionVerifier;
 pub const InteractionType = @import("core/ModuleInteractionVerifier.zig").ModuleInteractionVerifier.InteractionType;
 
