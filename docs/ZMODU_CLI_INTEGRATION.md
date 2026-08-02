@@ -60,6 +60,67 @@ zmodu add --name order_item --sql ./schema.sql
 
 ---
 
+### 3b. 零样板 CRUD（`zmodu saas` 生成 + `http.CrudApi`）
+
+`zmodu saas` 生成的业务模块，API 层已收敛成一行声明——list/get/create/
+update/delete 五个 handler 由框架 `zigmodu.http.CrudApi(Entity, Service, opts)`
+自动生成：
+
+```zig
+// api.zig（生成物）—— 整份文件即一行注册
+const zigmodu = @import("zigmodu");
+const model = @import("model.zig");
+const service = @import("service.zig");
+
+pub const OrdersApi = zigmodu.http.CrudApi(model.Orders, service.OrdersService, .{});
+```
+
+生成的路由与元数据（`nest`/`module_name` 取自 Service）：
+
+| 方法 | 路径 | 权限 | 说明 |
+|------|------|------|------|
+| GET | `{nest}` | `<module>:read` | 分页列表（`PageParams` 钳制 page/page_size） |
+| POST | `{nest}` | `<module>:write` | 创建（`bindJson` + `tenant_id` 注入） |
+| GET | `{nest}/{id}` | `<module>:read` | 详情（404 信封） |
+| PUT | `{nest}/{id}` | `<module>:write` | 更新 |
+| DELETE | `{nest}/{id}` | `<module>:write` | 删除 |
+
+- 默认 `.auth = .jwt`；`CrudOpts{ .public = true }` 切公开（同时去掉权限 meta）。
+- `CrudOpts{ .permission = "crm.order" }` 覆盖权限前缀。
+- 分页信封默认 `{code, items, total}`；`CrudOpts.envelope` 可选
+  `.plain` / `.ruoyi`（RuoYi 兼容 `{code,msg,data}`）。
+
+Service 只需 duck-typed `list/get/create/update/delete` + `module_name`/`nest`：
+
+- 生成器输出带 `validate` 钩子的薄 service（保留业务扩展点，如写 outbox、加事件）；
+- 想要「透传归零 + CRUD 即事件源」的项目可直接组合
+  `zigmodu.data.CrudService(Entity, Persistence)`：写操作自动 publish
+  `CrudEvent{created,updated,deleted}`，无需手写事件发布代码。
+
+```zig
+// service.zig —— CrudService 事件源组合
+const impl = zigmodu.data.CrudService(model.Orders, persistence.OrdersPersistence);
+
+pub const OrdersService = struct {
+    pub const module_name = "orders";
+    pub const nest = .{"orders"};
+    impl: impl,
+
+    pub fn init(p: *persistence.OrdersPersistence) @This() {
+        var s = .{ .impl = impl.init(p) };
+        s.impl.validate = &validate; // 可选校验钩子
+        return s;
+    }
+    // list/get/create/update/delete 各一行转发到 self.impl，写操作自动发事件
+};
+```
+
+响应收敛配套：`http.PageParams.parse(ctx, .{ .max_page_size = 100 })` 统一分页解析，
+`Extract.toDto/respondDto` 按同名字段约定映射 DTO（白名单天然隐藏
+`secret`/`org_id` 等列），`Extract.toDtoList` 做列表收集。
+
+---
+
 ### 4. AI 技能注册表（`zmodu ai`）
 
 ```bash

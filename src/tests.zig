@@ -289,10 +289,12 @@ test "compile all source files" {
 // ========================================
 test "domain imports: http" {
     _ = @import("http.zig");
+    _ = @import("api/Crud.zig");
 }
 
 test "domain imports: data" {
     _ = @import("data.zig");
+    _ = @import("data/CrudService.zig");
 }
 
 test "domain imports: security" {

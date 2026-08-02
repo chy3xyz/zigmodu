@@ -600,6 +600,26 @@ pub fn deinit() void {
 }
 ```
 
+### 零样板 CRUD（autoCrud）
+标准租户 CRUD（list/get/create/update/delete）不需要手写 handler：
+
+```zig
+// api.zig —— 整份文件一行注册
+pub const OrdersApi = zigmodu.http.CrudApi(model.Orders, service.OrdersService, .{});
+```
+
+- 自动生成 5 条路由，JWT + `<module>:read`/`<module>:write` 权限 meta；
+- `tenant_id` 从 attrs 注入（勿在 handler 里再验 Bearer）；
+- 分页走 `PageParams.parse`（page_size 钳制，杜绝 0 拉全表）；
+- 事件源：service 组合 `data.CrudService(Entity, Persistence)` 后，写操作自动
+  publish `CrudEvent{created,updated,deleted}`，业务订阅即可（发通知/审计/外发），
+  无需手写事件发布；
+- 响应白名单：`Extract.toDto/respondDto` 按同名字段约定映射，天然隐藏
+  `secret`/`org_id` 等列；`toDtoList` 收集列表。
+
+适用边界：规则简单的 CRUD 模块直接用；需要复杂业务编排（多表事务、状态机、
+审批流）时保留 service 内手写 Cmd，autoCrud 只覆盖纯增删改查面。
+
 ## 🧪 代码质量规范
 
 ### 命名约定

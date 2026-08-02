@@ -289,7 +289,8 @@ fn verifyJwtLoadPermsAndNext(
             .sub = payload.sub,
             .aud = payload.aud,
             .roles = payload.roles,
-        }) catch {
+        }) catch |err| {
+            std.log.err("jwt perm loader failed: {s}", .{@errorName(err)});
             try ctx.sendError(500, "Failed to load permissions");
             return;
         };

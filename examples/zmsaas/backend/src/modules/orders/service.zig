@@ -9,6 +9,9 @@ pub const OrdersService = struct {
     pub fn init(p: *persistence.OrdersPersistence) @This() {
         return .{ .persistence = p };
     }
+    pub const module_name = "orders";
+    pub const nest = .{"orders"};
+
     pub fn list(self: *@This(), allocator: std.mem.Allocator, org_id: i64, page: usize, size: usize) !std.ArrayList(model.Orders) {
         return self.persistence.list(allocator, org_id, page, size);
     }

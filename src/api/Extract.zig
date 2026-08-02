@@ -248,6 +248,39 @@ test "toDtoList maps entities to DTOs" {
     try std.testing.expectEqual(@as(i64, 2), out[1].id);
 }
 
+/// Convention-based DTO mapping: copy same-name fields from `src` into a Dto
+/// struct. Dto fields must exist on the source (or carry a default value);
+/// anything else is a compile error — this keeps the output contract explicit.
+pub fn toDto(comptime Dto: type, src: anytype) Dto {
+    const info = @typeInfo(Dto);
+    if (info != .@"struct") @compileError("toDto target must be a struct");
+    var out: Dto = undefined;
+    inline for (info.@"struct".field_names, info.@"struct".field_types, info.@"struct".field_attrs) |field_name, field_type, attrs| {
+        if (@hasField(@TypeOf(src), field_name)) {
+            @field(out, field_name) = @field(src, field_name);
+        } else if (comptime attrs.defaultValue(field_type)) |def| {
+            @field(out, field_name) = def;
+        } else {
+            @compileError("Dto field '" ++ field_name ++ "' is missing on the source type");
+        }
+    }
+    return out;
+}
+
+/// Respond with the convention-mapped DTO (e.g. hide internal columns).
+pub fn respondDto(ctx: *Context, src: anytype, comptime Dto: type) !void {
+    try ctx.jsonStruct(200, toDto(Dto, src));
+}
+
+test "toDto maps same-name fields and hides extras" {
+    const Src = struct { id: i64, name: []const u8, secret: []const u8 };
+    const Dto = struct { id: i64, name: []const u8 };
+    const src = Src{ .id = 5, .name = "alice", .secret = "hidden" };
+    const dto = toDto(Dto, src);
+    try std.testing.expectEqual(@as(i64, 5), dto.id);
+    try std.testing.expectEqualStrings("alice", dto.name);
+}
+
 // ── tests ──
 
 test "extractPath ints and strings" {
