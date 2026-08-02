@@ -79,7 +79,21 @@ pub fn sqlStateToError(sql_state: SqlState) DatabaseError {
     if (std.mem.eql(u8, sql_state, "42703")) return error.QueryFailed;
     if (std.mem.eql(u8, sql_state, "42S02")) return error.QueryFailed;
     if (std.mem.eql(u8, sql_state, "42S22")) return error.QueryFailed;
+    if (std.mem.eql(u8, sql_state, "57014")) return error.Timeout;
+    if (std.mem.eql(u8, sql_state, "53300")) return error.TooManyConnections;
     return error.Other;
+}
+
+test "sqlStateToError maps known SQLStates and falls back to Other" {
+    try std.testing.expectEqual(error.ConnectionFailed, sqlStateToError("08006"));
+    try std.testing.expectEqual(error.SerializationFailure, sqlStateToError("40001"));
+    try std.testing.expectEqual(error.ReadOnlyViolation, sqlStateToError("25001"));
+    try std.testing.expectEqual(error.ConstraintViolation, sqlStateToError("23505"));
+    try std.testing.expectEqual(error.NotFound, sqlStateToError("02000"));
+    try std.testing.expectEqual(error.QueryFailed, sqlStateToError("42P01"));
+    try std.testing.expectEqual(error.Timeout, sqlStateToError("57014"));
+    try std.testing.expectEqual(error.TooManyConnections, sqlStateToError("53300"));
+    try std.testing.expectEqual(error.Other, sqlStateToError("XX000"));
 }
 
 /// Check if a DatabaseError is acceptable (should not trip circuit breaker)

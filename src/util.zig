@@ -70,3 +70,49 @@ pub const HashKit = struct {
         return hexEncode(allocator, &h);
     }
 };
+
+test "randomHex produces hex strings of the requested length" {
+    const allocator = std.testing.allocator;
+    const hex = try randomHex(allocator, 16);
+    defer allocator.free(hex);
+    try std.testing.expectEqual(@as(usize, 16), hex.len);
+    for (hex) |c| {
+        try std.testing.expect(std.mem.indexOfScalar(u8, "0123456789abcdef", c) != null);
+    }
+    const uuid = try randomUuid(allocator);
+    defer allocator.free(uuid);
+    try std.testing.expectEqual(@as(usize, 32), uuid.len);
+}
+
+test "pluralize applies english rules" {
+    const allocator = std.testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "order", "orders" },
+        .{ "box", "boxes" },
+        .{ "buzz", "buzzes" },
+        .{ "match", "matches" },
+        .{ "dish", "dishes" },
+        .{ "category", "categories" },
+        .{ "key", "keys" }, // vowel before y
+    };
+    for (cases) |c| {
+        const got = try pluralize(allocator, c[0]);
+        defer allocator.free(got);
+        try std.testing.expectEqualStrings(c[1], got);
+    }
+}
+
+test "hexEncode and HashKit match known vectors" {
+    const allocator = std.testing.allocator;
+    const hex = try hexEncode(allocator, "abc");
+    defer allocator.free(hex);
+    try std.testing.expectEqualStrings("616263", hex);
+
+    const md5 = try HashKit.md5(allocator, "abc");
+    defer allocator.free(md5);
+    try std.testing.expectEqualStrings("900150983cd24fb0d6963f7d28e17f72", md5);
+
+    const sha256 = try HashKit.sha256Hex(allocator, "abc");
+    defer allocator.free(sha256);
+    try std.testing.expectEqualStrings("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", sha256);
+}

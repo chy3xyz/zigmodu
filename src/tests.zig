@@ -273,6 +273,7 @@ test "compile all source files" {
     _ = @import("kit/array.zig");
     _ = @import("kit/format.zig");
     _ = @import("kit/io_instance.zig");
+    _ = @import("util.zig");
     _ = @import("kit/json.zig");
     _ = @import("kit/random.zig");
 }
