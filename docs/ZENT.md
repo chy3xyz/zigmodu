@@ -75,6 +75,13 @@ ZigModu **核心库不强制依赖 zent**；应用或示例按需 path/url 引�
 
 **一句话**：编排与消息归 ZigModu；领域图与行级策略归 zent；简单表与存量 SQL 归 sqlx。
 
+**多租户边界**：`TenantContext`（租户来源：JWT / 中间件 → 运行时 id）是
+引擎无关的，sqlx 与 zent 模块都直接用；行级隔离按引擎走惯用法，**不要跨引擎
+混用**——sqlx 模块用框架的 `TenantInterceptor` / `DataPermission`
+（字符串 SQL 拦截，`zigmodu.tenant` / `zigmodu.datapermission`），zent 模块用
+Privacy Filter 或显式 `tenant_id` predicate（§8 / §9）。两套都做 = 双重租户
+真相源，谁为准会打架。
+
 ---
 
 ## 3. 模块级独立选型
