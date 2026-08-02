@@ -204,6 +204,9 @@ test "compile all source files" {
     _ = @import("http/Sse.zig");
     _ = @import("ai/ai.zig");
     _ = @import("ai/provider.zig");
+    _ = @import("ai/key_pool.zig");
+    _ = @import("ai/provider_registry.zig");
+    _ = @import("ai/module.zig");
     _ = @import("ai/skill.zig");
     _ = @import("ai/agent.zig");
     _ = @import("ai/schedule.zig");

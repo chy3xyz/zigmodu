@@ -138,6 +138,48 @@ zig build run
 
 ## 7. 行为契约速查
 
+## 8. AiKeyManager：provider + key 轮换（高并发）
+
+`zigmodu.ai.AiKeyManager` 是 `AiProvider` 的上游供给层，分四层文件：
+
+| 文件 | 职责 |
+|------|------|
+| `ai/key_pool.zig` | key 池：round-robin 健康 key、429/配额指数冷却退避、连续 401 自动禁用、恢复与观测 |
+| `ai/provider_registry.zig` | provider 注册表：endpoint + key 池 + 模型路由 + fallback provider 链（provider 轮换） |
+| `ai/provider.zig` | 挂池：`bindKeyPool` 后 `chat`/`chatWith` 在 401/403/402/429 自动换 key 重试一次 |
+| `ai/module.zig` | `AiKeyManager`：`ProviderConfig`（api_keys + 生命周期）+ `providerFor` 便捷构造 |
+
+簿记用 `std.Io.Mutex` 保护（微秒级），HTTP 调用不持锁，可高并发。
+
+```zig
+var mgr = zigmodu.ai.AiKeyManager.init(allocator, io);
+defer mgr.deinit();
+try mgr.applyConfig(&.{
+    .{
+        .name = "deepseek",
+        .endpoint = "https://api.deepseek.com/v1/chat/completions",
+        .api_keys = &.{ "sk-a", "sk-b" },
+        .models = &.{"deepseek-v4-flash"},
+        .fallback_providers = &.{"openai"},
+    },
+    .{
+        .name = "openai",
+        .endpoint = "https://api.openai.com/v1/chat/completions",
+        .api_keys = &.{"sk-o1"},
+        .models = &.{"deepseek-v4-flash"},
+    },
+});
+
+var provider = try mgr.providerFor(allocator, http, "deepseek-v4-flash");
+// chat/chatWith 遇 401/403/402/429 自动换池内下一个健康 key 并重试一次；
+// 连续 401 会禁用该 key，池耗尽时自动降级到 openai provider。
+```
+
+错误分类：`KeyErrorKind.fromHttpStatus(401/403/402/429/5xx)`，或手动传
+`.auth` / `.rate_limit` / `.quota` / `.server` / `.network` / `.timeout`。
+观测：`mgr.listProviders(io, allocator)` 返回每个 provider/key 的
+status/failures/调用与错误计数快照；`enableKey` / `enableProvider` 支持人工介入。
+
 | 策略 | 模型返回 | 失败回退 |
 |------|----------|----------|
 | `llmApprove` | `{"decision":"approve\|escalate\|reject","note":"..."}` | `escalated` + note |

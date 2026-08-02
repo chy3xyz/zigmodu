@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **AI AiKeyManager（provider + key 轮换，四层结构）**: `ai/key_pool.zig`
+  （key 池：round-robin、429/配额指数冷却、连续 401 禁用、恢复与观测）、
+  `ai/provider_registry.zig`（provider 注册表：endpoint + key 池 + 模型路由 +
+  fallback provider 链）、`ai/provider.zig` 挂池（`bindKeyPool` 后
+  chat/chatWith 对 401/403/402/429 自动换 key 重试一次）、`ai/module.zig`
+  （`AiKeyManager`：`ProviderConfig` api_keys 配置 + 生命周期 +
+  `providerFor`）。簿记 `std.Io.Mutex` 保护、HTTP 调用不持锁，适合高并发；
+  10 个单测并入框架套件（834 pass）。docs/LLM_POLICIES.md §8 更新为四层接线。
 - **git 依赖打包修复 + catch 反模式规则**: (1) `build.zig.zon` 的 `.paths` 增加
   `examples/_shared`——git+https 依赖按 `.paths` 打包，此前 `_shared`（及整个
   examples/）不会出现在拉取包里，业务方换版本必须重打 zig-pkg workaround，现

@@ -6,6 +6,15 @@ pub const DispatchOpts = @import("skill.zig").DispatchOpts;
 pub const freeValue = @import("skill.zig").freeValue;
 
 pub const AiProvider = @import("provider.zig").AiProvider;
+pub const key_pool = @import("key_pool.zig");
+pub const KeyPool = key_pool.KeyPool;
+pub const KeyLease = key_pool.KeyLease;
+pub const KeyErrorKind = key_pool.KeyErrorKind;
+pub const provider_registry = @import("provider_registry.zig");
+pub const ProviderRegistry = provider_registry.ProviderRegistry;
+pub const ProviderLease = provider_registry.ProviderLease;
+pub const AiKeyManager = @import("module.zig").AiKeyManager;
+pub const ai_key_module = @import("module.zig");
 pub const Agent = @import("agent.zig").Agent;
 pub const AgentResult = @import("agent.zig").AgentResult;
 pub const AgentHooks = @import("agent.zig").AgentHooks;

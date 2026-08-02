@@ -6,6 +6,7 @@
 const std = @import("std");
 const tokenizer = @import("tokenizer.zig");
 const http_client = @import("../http/HttpClient.zig");
+const key_pool = @import("key_pool.zig");
 
 pub const AiProvider = struct {
     allocator: std.mem.Allocator,
@@ -13,6 +14,14 @@ pub const AiProvider = struct {
     endpoint: []const u8,
     api_key: []const u8,
     model: []const u8,
+
+    /// Optional key pool for automatic key rotation on 401/403/429/402.
+    /// When set (via `bindKeyPool`), a key-retryable failure swaps `api_key`
+    /// to the next healthy key and retries once. The pool must outlive this
+    /// provider (leased keys are borrowed).
+    key_pool: ?*key_pool.KeyPool = null,
+    key_index: ?usize = null,
+    pool_io: ?std.Io = null,
 
     rate_limiter: ?RateLimiterState = null,
     max_output_tokens: usize = 4096,
@@ -131,6 +140,15 @@ pub const AiProvider = struct {
         self.rate_limiter = .{ .limiter = limiter, .io = io, .mutex = std.Io.Mutex.init };
     }
 
+    /// Bind a key pool and the key currently leased from it. `chat`/`chatWith`
+    /// will report failures to the pool and, for key-retryable statuses,
+    /// rotate to a fresh key and retry once.
+    pub fn bindKeyPool(self: *AiProvider, io: std.Io, pool: *key_pool.KeyPool, key_index: usize) void {
+        self.key_pool = pool;
+        self.key_index = key_index;
+        self.pool_io = io;
+    }
+
     pub fn deinit(self: *AiProvider) void {
         if (self.rate_limiter) |*rl| {
             rl.limiter.deinit();
@@ -164,31 +182,48 @@ pub const AiProvider = struct {
             }
         }
 
-        const body = try self.buildRequestBody(messages, opts);
-        defer self.allocator.free(body);
+        // Key-rotation retry loop: on a key-retryable failure (401/403/402/429)
+        // swap `api_key` to the pool's next healthy key and retry once.
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            const body = try self.buildRequestBody(messages, opts);
+            defer self.allocator.free(body);
 
-        var req = http_client.HttpClient.HttpRequest.init(self.allocator, "POST", self.endpoint);
-        defer req.deinit();
-        try req.setHeader("Content-Type", "application/json");
-        try req.setHeader("Authorization", self.api_key);
-        try req.setBody(body);
+            var req = http_client.HttpClient.HttpRequest.init(self.allocator, "POST", self.endpoint);
+            defer req.deinit();
+            try req.setHeader("Content-Type", "application/json");
+            try req.setHeader("Authorization", self.api_key);
+            try req.setBody(body);
 
-        var http_resp = self.http.request(req) catch |err| {
-            self.metrics.error_count += 1;
-            return mapProviderTransportError(err);
-        };
-        defer http_resp.deinit();
+            var http_resp = self.http.request(req) catch |err| {
+                self.metrics.error_count += 1;
+                return mapProviderTransportError(err);
+            };
+            defer http_resp.deinit();
 
-        self.metrics.total_requests += 1;
+            self.metrics.total_requests += 1;
 
-        if (!http_resp.isSuccess()) {
-            self.metrics.error_count += 1;
-            return mapHttpStatus(http_resp.status_code);
+            if (!http_resp.isSuccess()) {
+                self.metrics.error_count += 1;
+                const kind = key_pool.KeyErrorKind.fromHttpStatus(http_resp.status_code);
+                if (self.key_pool) |pool| {
+                    const pio = self.pool_io orelse return mapHttpStatus(http_resp.status_code);
+                    if (self.key_index) |idx| pool.onError(pio, idx, kind);
+                    if (attempt == 0 and kind.isKeyRetryable()) {
+                        if (try pool.acquire(pio)) |lease| {
+                            self.api_key = lease.key;
+                            self.key_index = lease.key_index;
+                            continue; // retry once with the rotated key
+                        }
+                    }
+                }
+                return mapHttpStatus(http_resp.status_code);
+            }
+
+            const parsed = try self.parseResponse(http_resp.body);
+            if (parsed.tool_calls.len > 0) self.metrics.tool_call_responses += 1;
+            return parsed;
         }
-
-        const parsed = try self.parseResponse(http_resp.body);
-        if (parsed.tool_calls.len > 0) self.metrics.tool_call_responses += 1;
-        return parsed;
     }
 
     /// Stream chat completions (`stream:true`) via HttpClient.requestStream + SSE `data:` lines.
@@ -226,6 +261,11 @@ pub const AiProvider = struct {
 
         var http_resp = self.http.requestStream(req, &acc, StreamAccum.onChunk) catch {
             // Transport failed before useful stream — buffered fallback (ignore transport err kind).
+            if (self.key_pool) |pool| {
+                if (self.pool_io) |pio| {
+                    if (self.key_index) |idx| pool.onError(pio, idx, .network);
+                }
+            }
             o.stream = false;
             var resp = try self.chatWith(messages, o);
             errdefer self.freeResponse(&resp);
@@ -243,6 +283,13 @@ pub const AiProvider = struct {
         self.metrics.total_requests += 1;
         if (!http_resp.isSuccess()) {
             self.metrics.error_count += 1;
+            if (self.key_pool) |pool| {
+                if (self.pool_io) |pio| {
+                    if (self.key_index) |idx| {
+                        pool.onError(pio, idx, key_pool.KeyErrorKind.fromHttpStatus(http_resp.status_code));
+                    }
+                }
+            }
             return mapHttpStatus(http_resp.status_code);
         }
 
