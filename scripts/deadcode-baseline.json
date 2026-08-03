@@ -205,13 +205,6 @@
     },
     {
       "file": "src/sqlx/sqlx.zig",
-      "line": 627,
-      "kind": "function",
-      "name": "scanRowsToSlice",
-      "parent": null
-    },
-    {
-      "file": "src/sqlx/sqlx.zig",
       "line": 3673,
       "kind": "field",
       "name": "reconnect_delay_ms",
@@ -240,14 +233,14 @@
     },
     {
       "file": "tools/zmodu/src/main.zig",
-      "line": 1546,
+      "line": 1719,
       "kind": "function",
       "name": "hasUncommittedChanges",
       "parent": null
     },
     {
       "file": "tools/zmodu/src/main.zig",
-      "line": 1582,
+      "line": 1755,
       "kind": "function",
       "name": "writeFileGen",
       "parent": null

@@ -4640,6 +4640,21 @@ pub const Client = struct {
         return self.queryRows(T, sql_str, args);
     }
 
+    /// Scan all rows into an owned slice using `allocator`: strings are
+    /// duplicated and the column→field index is built **once** per query
+    /// (O(F+C) setup, O(F) per row) — faster than per-row `Row.scan` for
+    /// large result sets while keeping column-name mapping safety.
+    ///
+    /// Ownership: the returned slice and each item's string fields live in
+    /// `allocator`. Caller frees with `freeScanned` per item plus
+    /// `allocator.free(slice)` — or transfer items into a collection and free
+    /// only the slice buffer (strings then belong to the collection).
+    pub fn queryRowsSlice(self: *Client, allocator: std.mem.Allocator, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
+        var rows = try self.query(sql_str, args);
+        defer rows.deinit();
+        return scanRowsToSlice(allocator, T, &rows, false);
+    }
+
     /// Like queryRowsPartial but returns an owned QueryResult(T). Caller MUST `defer result.deinit(allocator)`.
     pub fn queryRowsPartialOwned(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !QueryResult(T) {
         return self.queryRowsPartial(T, sql_str, args);

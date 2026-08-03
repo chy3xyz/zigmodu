@@ -223,24 +223,31 @@ fn emitPersistence(allocator: std.mem.Allocator, e: *const Entity, P: []const u8
 
     // list
     try appendPrint(allocator, &buf, "    pub fn list(self: *@This(), allocator: std.mem.Allocator, org_id: i64, page: usize, size: usize) !std.ArrayList(model.{s}) {{\n", .{P});
-    try buf.appendSlice(allocator, "        var out = std.ArrayList(model.");
-    try buf.appendSlice(allocator, P);
     try buf.appendSlice(allocator,
-        \\).empty;
-        \\        errdefer out.deinit(allocator);
-        \\        var cursor = try self.backend.client.queryCursorEx("SELECT id, org_id,
+        \\        const rows = try self.backend.client.queryRowsSlice(allocator, model.
     );
+    try buf.appendSlice(allocator, P);
+    try buf.appendSlice(allocator, ", \"SELECT id, org_id, ");
     try buf.appendSlice(allocator, col_list);
     try buf.appendSlice(allocator, ", created_at, updated_at FROM ");
     try buf.appendSlice(allocator, e.name);
-    try appendPrint(allocator, &buf, " WHERE org_id = ? ORDER BY id DESC LIMIT ? OFFSET ?\", &.{{ .{{ .int = org_id }}, .{{ .int = @intCast(size) }}, .{{ .int = @intCast((page -| 1) * size) }} }}, .{{}});\n", .{});
+    try appendPrint(allocator, &buf, " WHERE org_id = ? ORDER BY id DESC LIMIT ? OFFSET ?\", &.{{ .{{ .int = org_id }}, .{{ .int = @intCast(size) }}, .{{ .int = @intCast((page -| 1) * size) }} }});\n", .{});
     try buf.appendSlice(allocator,
-        \\        defer cursor.deinit();
-        \\        while (cursor.next()) |row| try out.append(allocator, try row.scan(allocator, model.
+        \\        defer allocator.free(rows);
+        \\        var out = std.ArrayList(model.
     );
     try buf.appendSlice(allocator, P);
     try buf.appendSlice(allocator,
-        \\));
+        \\).empty;
+        \\        errdefer {
+        \\            for (rows) |item| data.sqlx.freeScanned(allocator, model.
+    );
+    try buf.appendSlice(allocator, P);
+    try buf.appendSlice(allocator,
+        \\, item);
+        \\            out.deinit(allocator);
+        \\        }
+        \\        for (rows) |e| try out.append(allocator, e);
         \\        return out;
         \\    }
         \\
@@ -249,14 +256,24 @@ fn emitPersistence(allocator: std.mem.Allocator, e: *const Entity, P: []const u8
     // get
     try appendPrint(allocator, &buf, "    pub fn get(self: *@This(), allocator: std.mem.Allocator, org_id: i64, id: i64) !?model.{s} {{\n", .{P});
     try buf.appendSlice(allocator,
-        \\        var cursor = try self.backend.client.queryCursorEx("SELECT id, org_id,
+        \\        const rows = try self.backend.client.queryRowsSlice(allocator, model.
     );
+    try buf.appendSlice(allocator, P);
+    try buf.appendSlice(allocator, ", \"SELECT id, org_id, ");
     try buf.appendSlice(allocator, col_list);
     try buf.appendSlice(allocator, ", created_at, updated_at FROM ");
     try buf.appendSlice(allocator, e.name);
-    try buf.appendSlice(allocator, " WHERE org_id = ? AND id = ? LIMIT 1\", &.{ .{ .int = org_id }, .{ .int = id } }, .{});\n        defer cursor.deinit();\n        return if (cursor.next()) |row| try row.scan(allocator, model.");
+    try buf.appendSlice(allocator, " WHERE org_id = ? AND id = ? LIMIT 1\", &.{ .{ .int = org_id }, .{ .int = id } });\n");
+    try buf.appendSlice(allocator,
+        \\        if (rows.len == 0) {
+        \\            allocator.free(rows);
+        \\            return null;
+        \\        }
+        \\        const result = rows[0];
+        \\        for (rows[1..]) |item| data.sqlx.freeScanned(allocator, model.
+    );
     try buf.appendSlice(allocator, P);
-    try buf.appendSlice(allocator, ") else null;\n    }\n\n");
+    try buf.appendSlice(allocator, ", item);\n        allocator.free(rows);\n        return result;\n    }\n\n");
 
     // create
     try appendPrint(allocator, &buf, "    pub fn create(self: *@This(), e: model.{s}) !i64 {{\n", .{P});

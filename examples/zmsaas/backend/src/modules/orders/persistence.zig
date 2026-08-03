@@ -12,17 +12,26 @@ pub const OrdersPersistence = struct {
     }
 
     pub fn list(self: *@This(), allocator: std.mem.Allocator, org_id: i64, page: usize, size: usize) !std.ArrayList(model.Orders) {
+        const rows = try self.backend.client.queryRowsSlice(allocator, model.Orders, "SELECT id, org_id, customer, amount, status, notes, created_at, updated_at FROM orders WHERE org_id = ? ORDER BY id DESC LIMIT ? OFFSET ?", &.{ .{ .int = org_id }, .{ .int = @intCast(size) }, .{ .int = @intCast((page -| 1) * size) } });
+        defer allocator.free(rows);
         var out = std.ArrayList(model.Orders).empty;
-        errdefer out.deinit(allocator);
-        var cursor = try self.backend.client.queryCursorEx("SELECT id, org_id,customer, amount, status, notes, created_at, updated_at FROM orders WHERE org_id = ? ORDER BY id DESC LIMIT ? OFFSET ?", &.{ .{ .int = org_id }, .{ .int = @intCast(size) }, .{ .int = @intCast((page -| 1) * size) } }, .{});
-        defer cursor.deinit();
-        while (cursor.next()) |row| try out.append(allocator, try row.scan(allocator, model.Orders));
+        errdefer {
+            for (rows) |item| data.sqlx.freeScanned(allocator, model.Orders, item);
+            out.deinit(allocator);
+        }
+        for (rows) |e| try out.append(allocator, e);
         return out;
     }
     pub fn get(self: *@This(), allocator: std.mem.Allocator, org_id: i64, id: i64) !?model.Orders {
-        var cursor = try self.backend.client.queryCursorEx("SELECT id, org_id,customer, amount, status, notes, created_at, updated_at FROM orders WHERE org_id = ? AND id = ? LIMIT 1", &.{ .{ .int = org_id }, .{ .int = id } }, .{});
-        defer cursor.deinit();
-        return if (cursor.next()) |row| try row.scan(allocator, model.Orders) else null;
+        const rows = try self.backend.client.queryRowsSlice(allocator, model.Orders, "SELECT id, org_id, customer, amount, status, notes, created_at, updated_at FROM orders WHERE org_id = ? AND id = ? LIMIT 1", &.{ .{ .int = org_id }, .{ .int = id } });
+        if (rows.len == 0) {
+            allocator.free(rows);
+            return null;
+        }
+        const result = rows[0];
+        for (rows[1..]) |item| data.sqlx.freeScanned(allocator, model.Orders, item);
+        allocator.free(rows);
+        return result;
     }
 
     pub fn create(self: *@This(), e: model.Orders) !i64 {
