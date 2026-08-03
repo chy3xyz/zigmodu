@@ -3,7 +3,6 @@ const std = @import("std");
 const data = @import("zigmodu").data;
 const Time = @import("zigmodu").Time;
 const model = @import("model.zig");
-const V = data.sqlx.Value;
 
 pub const OrdersPersistence = struct {
     backend: *data.SqlxBackend,
@@ -17,13 +16,13 @@ pub const OrdersPersistence = struct {
         errdefer out.deinit(allocator);
         var cursor = try self.backend.client.queryCursorEx("SELECT id, org_id,customer, amount, status, notes, created_at, updated_at FROM orders WHERE org_id = ? ORDER BY id DESC LIMIT ? OFFSET ?", &.{ .{ .int = org_id }, .{ .int = @intCast(size) }, .{ .int = @intCast((page -| 1) * size) } }, .{});
         defer cursor.deinit();
-        while (cursor.next()) |row| try out.append(allocator, try scan(allocator, row));
+        while (cursor.next()) |row| try out.append(allocator, try row.scan(allocator, model.Orders));
         return out;
     }
     pub fn get(self: *@This(), allocator: std.mem.Allocator, org_id: i64, id: i64) !?model.Orders {
         var cursor = try self.backend.client.queryCursorEx("SELECT id, org_id,customer, amount, status, notes, created_at, updated_at FROM orders WHERE org_id = ? AND id = ? LIMIT 1", &.{ .{ .int = org_id }, .{ .int = id } }, .{});
         defer cursor.deinit();
-        return if (cursor.next()) |row| try scan(allocator, row) else null;
+        return if (cursor.next()) |row| try row.scan(allocator, model.Orders) else null;
     }
 
     pub fn create(self: *@This(), e: model.Orders) !i64 {
@@ -39,18 +38,5 @@ pub const OrdersPersistence = struct {
 
     pub fn delete(self: *@This(), org_id: i64, id: i64) !void {
         _ = try self.backend.client.exec("DELETE FROM orders WHERE id = ? AND org_id = ?", &.{ .{ .int = id }, .{ .int = org_id } });
-    }
-
-    fn scan(allocator: std.mem.Allocator, row: *data.sqlx.Row) !model.Orders {
-        return .{
-            .id = row.values[0].?.int,
-            .org_id = row.values[1].?.int,
-            .customer = try allocator.dupe(u8, row.values[2].?.string),
-            .amount = row.values[3].?.int,
-            .status = try allocator.dupe(u8, row.values[4].?.string),
-            .notes = try allocator.dupe(u8, row.values[5].?.string),
-            .created_at = row.values[6].?.int,
-            .updated_at = row.values[7].?.int,
-        };
     }
 };

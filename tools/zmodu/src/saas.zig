@@ -191,12 +191,6 @@ fn emitModel(allocator: std.mem.Allocator, e: *const Entity, P: []const u8) ![]c
 
 /// Generate a scan expression for one field at `row.values[idx]`:
 /// returns the Zig expression producing the field value (owned via allocator).
-fn scanExpr(allocator: std.mem.Allocator, f: *const Field, idx: usize) ![]const u8 {
-    if (std.mem.eql(u8, f.field_type, "number")) return std.fmt.allocPrint(allocator, "row.values[{d}].?.int", .{idx});
-    if (std.mem.eql(u8, f.field_type, "boolean")) return std.fmt.allocPrint(allocator, "row.values[{d}].?.bool", .{idx});
-    return std.fmt.allocPrint(allocator, "try allocator.dupe(u8, row.values[{d}].?.string)", .{idx});
-}
-
 fn emitPersistence(allocator: std.mem.Allocator, e: *const Entity, P: []const u8) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
@@ -216,7 +210,6 @@ fn emitPersistence(allocator: std.mem.Allocator, e: *const Entity, P: []const u8
         \\const data = @import("zigmodu").data;
         \\const Time = @import("zigmodu").Time;
         \\const model = @import("model.zig");
-        \\const V = data.sqlx.Value;
         \\
         \\pub const
     );
@@ -243,7 +236,11 @@ fn emitPersistence(allocator: std.mem.Allocator, e: *const Entity, P: []const u8
     try appendPrint(allocator, &buf, " WHERE org_id = ? ORDER BY id DESC LIMIT ? OFFSET ?\", &.{{ .{{ .int = org_id }}, .{{ .int = @intCast(size) }}, .{{ .int = @intCast((page -| 1) * size) }} }}, .{{}});\n", .{});
     try buf.appendSlice(allocator,
         \\        defer cursor.deinit();
-        \\        while (cursor.next()) |row| try out.append(allocator, try scan(allocator, row));
+        \\        while (cursor.next()) |row| try out.append(allocator, try row.scan(allocator, model.
+    );
+    try buf.appendSlice(allocator, P);
+    try buf.appendSlice(allocator,
+        \\));
         \\        return out;
         \\    }
         \\
@@ -257,7 +254,9 @@ fn emitPersistence(allocator: std.mem.Allocator, e: *const Entity, P: []const u8
     try buf.appendSlice(allocator, col_list);
     try buf.appendSlice(allocator, ", created_at, updated_at FROM ");
     try buf.appendSlice(allocator, e.name);
-    try buf.appendSlice(allocator, " WHERE org_id = ? AND id = ? LIMIT 1\", &.{ .{ .int = org_id }, .{ .int = id } }, .{});\n        defer cursor.deinit();\n        return if (cursor.next()) |row| try scan(allocator, row) else null;\n    }\n\n");
+    try buf.appendSlice(allocator, " WHERE org_id = ? AND id = ? LIMIT 1\", &.{ .{ .int = org_id }, .{ .int = id } }, .{});\n        defer cursor.deinit();\n        return if (cursor.next()) |row| try row.scan(allocator, model.");
+    try buf.appendSlice(allocator, P);
+    try buf.appendSlice(allocator, ") else null;\n    }\n\n");
 
     // create
     try appendPrint(allocator, &buf, "    pub fn create(self: *@This(), e: model.{s}) !i64 {{\n", .{P});
@@ -319,21 +318,7 @@ fn emitPersistence(allocator: std.mem.Allocator, e: *const Entity, P: []const u8
     try buf.appendSlice(allocator, e.name);
     try buf.appendSlice(allocator, " WHERE id = ? AND org_id = ?\", &.{ .{ .int = id }, .{ .int = org_id } });\n    }\n\n");
 
-    // scan
-    try buf.appendSlice(allocator, "    fn scan(allocator: std.mem.Allocator, row: *data.sqlx.Row) !model.");
-    try buf.appendSlice(allocator, P);
-    try buf.appendSlice(allocator, " {\n        return .{\n            .id = row.values[0].?.int,\n            .org_id = row.values[1].?.int,\n");
-    for (e.fields, 0..) |f, i| {
-        try buf.appendSlice(allocator, "            .");
-        try buf.appendSlice(allocator, f.name);
-        try buf.appendSlice(allocator, " = ");
-        const expr = try scanExpr(allocator, &f, i + 2);
-        defer allocator.free(expr);
-        try buf.appendSlice(allocator, expr);
-        try buf.appendSlice(allocator, ",\n");
-    }
-    try buf.appendSlice(allocator, "            .created_at = row.values[");
-    try appendPrint(allocator, &buf, "{d}].?.int,\n            .updated_at = row.values[{d}].?.int,\n        }};\n    }}\n}};\n", .{ e.fields.len + 2, e.fields.len + 3 });
+    try buf.appendSlice(allocator, "};\n");
     return buf.toOwnedSlice(allocator);
 }
 
@@ -369,7 +354,18 @@ fn emitService(allocator: std.mem.Allocator, e: *const Entity, P: []const u8) ![
             try buf.appendSlice(allocator, ".len == 0) return error.ValidationFailed;\n");
         }
     }
-    try buf.appendSlice(allocator, "    }\n};\n");
+    try buf.appendSlice(allocator,
+        \\    }
+        \\
+        \\    /// Multi-statement atomic writes: runs `f` inside a transaction
+        \\    /// (rollback on error) — custom business methods needing cross-table
+        \\    /// consistency use this instead of hand-rolling begin/commit/rollback.
+        \\    pub fn transact(self: *@This(), comptime T: type, f: *const fn (*zigmodu.data.sqlx.Transaction) zigmodu.ZigModuError!T) zigmodu.ZigModuError!T {
+        \\        return self.persistence.backend.client.transact(T, f);
+        \\    }
+        \\};
+        \\
+    );
     return buf.toOwnedSlice(allocator);
 }
 
@@ -391,6 +387,155 @@ fn emitApi(allocator: std.mem.Allocator, e: *const Entity, P: []const u8) ![]con
     try buf.appendSlice(allocator, ", service.");
     try buf.appendSlice(allocator, P);
     try buf.appendSlice(allocator, "Service, .{});\n");
+    return buf.toOwnedSlice(allocator);
+}
+
+fn emitTests(allocator: std.mem.Allocator, e: *const Entity, P: []const u8) ![]const u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    try appendPrint(allocator, &buf, "//! Generated by zmodu saas — {s} smoke test (in-memory sqlite)\n", .{e.name});
+    try buf.appendSlice(allocator,
+        \\const std = @import("std");
+        \\const zigmodu = @import("zigmodu");
+        \\const model = @import("model.zig");
+        \\const persistence = @import("persistence.zig");
+        \\const service = @import("service.zig");
+        \\
+    );
+    try appendPrint(allocator, &buf, "test \"{s} persistence + CrudService round-trip\" {{\n", .{e.name});
+    try buf.appendSlice(allocator,
+        \\    const allocator = std.testing.allocator;
+        \\    var client = zigmodu.data.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+        \\    defer client.deinit();
+        \\    try client.connect();
+        \\    _ = try client.exec("CREATE TABLE
+    );
+    try buf.appendSlice(allocator, " ");
+    try buf.appendSlice(allocator, e.name);
+    try buf.appendSlice(allocator, " (id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER NOT NULL, ");
+    for (e.fields) |f| {
+        try buf.appendSlice(allocator, f.name);
+        try buf.appendSlice(allocator, " ");
+        if (std.mem.eql(u8, f.field_type, "number") or std.mem.eql(u8, f.field_type, "boolean")) {
+            try buf.appendSlice(allocator, "INTEGER");
+        } else {
+            try buf.appendSlice(allocator, "TEXT");
+        }
+        try buf.appendSlice(allocator, " NOT NULL, ");
+    }
+    try buf.appendSlice(allocator, "created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)\", &.{});\n\n");
+    try buf.appendSlice(allocator,
+        \\    var backend = zigmodu.data.SqlxBackend{ .allocator = allocator, .client = &client };
+        \\    var persist = persistence.
+    );
+    try buf.appendSlice(allocator, P);
+    try buf.appendSlice(allocator, "Persistence.init(&backend);\n    var svc = service.");
+    try buf.appendSlice(allocator, P);
+    try buf.appendSlice(allocator, "Service.init(&persist);\n\n");
+    try buf.appendSlice(allocator,
+        \\    var bus = zigmodu.TypedEventBus(zigmodu.data.CrudEvent(model.
+    );
+    try buf.appendSlice(allocator, P);
+    try buf.appendSlice(allocator,
+        \\)).init(allocator);
+        \\    defer bus.deinit();
+        \\    svc.crud.setEventBus(&bus);
+        \\
+    );
+    // create with sample values (validate hook runs for required strings)
+    try buf.appendSlice(allocator, "    const id = try svc.crud.create(.{ .org_id = 1, ");
+    for (e.fields) |f| {
+        try buf.appendSlice(allocator, ".");
+        try buf.appendSlice(allocator, f.name);
+        try buf.appendSlice(allocator, " = ");
+        if (std.mem.eql(u8, f.field_type, "number")) {
+            try buf.appendSlice(allocator, "100");
+        } else if (std.mem.eql(u8, f.field_type, "boolean")) {
+            try buf.appendSlice(allocator, "true");
+        } else {
+            try buf.appendSlice(allocator, "\"alice\"");
+        }
+        try buf.appendSlice(allocator, ", ");
+    }
+    try buf.appendSlice(allocator, "});\n");
+    try buf.appendSlice(allocator,
+        \\    try std.testing.expect(id > 0);
+        \\    try std.testing.expectEqual(@as(u64, 1), bus.publishedCount());
+        \\
+        \\    var items = try svc.crud.list(allocator, 1, 1, 10);
+        \\    defer items.deinit(allocator);
+        \\    for (items.items) |item| zigmodu.data.sqlx.freeScanned(allocator, model.
+    );
+    try buf.appendSlice(allocator, P);
+    try buf.appendSlice(allocator,
+        \\, item);
+        \\    try std.testing.expectEqual(@as(usize, 1), items.items.len);
+        \\
+        \\    const got = (try svc.crud.get(allocator, 1, id)).?;
+        \\    defer zigmodu.data.sqlx.freeScanned(allocator, model.
+    );
+    try buf.appendSlice(allocator, P);
+    try buf.appendSlice(allocator,
+        \\, got);
+        \\    try std.testing.expectEqual(id, got.id);
+        \\
+        \\    var updated = got;
+        \\    updated.org_id = 1;
+        \\    try svc.crud.update(updated, 1);
+        \\    try std.testing.expectEqual(@as(u64, 2), bus.publishedCount());
+        \\
+        \\    try svc.crud.delete(1, id);
+        \\    try std.testing.expectEqual(@as(u64, 3), bus.publishedCount());
+        \\
+        \\    const tx_id = try svc.transact(i64, struct {
+        \\        fn f(tx: *zigmodu.data.sqlx.Transaction) zigmodu.ZigModuError!i64 {
+        \\            _ = tx;
+        \\            return 42;
+        \\        }
+        \\    }.f);
+        \\    try std.testing.expectEqual(@as(i64, 42), tx_id);
+        \\}
+        \\
+    );
+    // negative validation test when a required string/text field exists
+    var has_required_string = false;
+    for (e.fields) |f| {
+        if (f.required and (std.mem.eql(u8, f.field_type, "string") or std.mem.eql(u8, f.field_type, "text"))) {
+            has_required_string = true;
+            break;
+        }
+    }
+    if (has_required_string) {
+        var required_field: []const u8 = "";
+        for (e.fields) |f| {
+            if (f.required and (std.mem.eql(u8, f.field_type, "string") or std.mem.eql(u8, f.field_type, "text"))) {
+                required_field = f.name;
+                break;
+            }
+        }
+        try appendPrint(allocator, &buf, "test \"{s} validate rejects empty required fields\" {{\n", .{e.name});
+        try buf.appendSlice(allocator,
+            \\    const allocator = std.testing.allocator;
+            \\    var client = zigmodu.data.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+            \\    defer client.deinit();
+            \\    try client.connect();
+            \\    var backend = zigmodu.data.SqlxBackend{ .allocator = allocator, .client = &client };
+            \\    var persist = persistence.
+        );
+        try buf.appendSlice(allocator, P);
+        try buf.appendSlice(allocator, "Persistence.init(&backend);\n    var svc = service.");
+        try buf.appendSlice(allocator, P);
+        try buf.appendSlice(allocator,
+            \\Service.init(&persist);
+            \\    try std.testing.expectError(error.ValidationFailed, svc.crud.create(.{ .org_id = 1, .
+        );
+        try buf.appendSlice(allocator, required_field);
+        try buf.appendSlice(allocator,
+            \\ = "" }));
+            \\}
+            \\
+        );
+    }
     return buf.toOwnedSlice(allocator);
 }
 
@@ -448,6 +593,7 @@ pub fn generateModule(
             .{ .name = "persistence.zig", .content = try emitPersistence(allocator, e, P) },
             .{ .name = "service.zig", .content = try emitService(allocator, e, P) },
             .{ .name = "api.zig", .content = try emitApi(allocator, e, P) },
+            .{ .name = "tests.zig", .content = try emitTests(allocator, e, P) },
         };
         for (pairs) |pair| {
             const file_path = try std.fs.path.join(allocator, &.{ mod_dir, pair.name });

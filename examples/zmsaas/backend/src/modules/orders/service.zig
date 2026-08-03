@@ -32,4 +32,11 @@ pub const OrdersService = struct {
         updated.status = "cancelled";
         try self.crud.update(updated, org_id);
     }
+
+    /// Multi-statement atomic writes: runs `f` inside a transaction
+    /// (rollback on error) — custom business methods needing cross-table
+    /// consistency use this instead of hand-rolling begin/commit/rollback.
+    pub fn transact(self: *@This(), comptime T: type, f: *const fn (*zigmodu.data.sqlx.Transaction) zigmodu.ZigModuError!T) zigmodu.ZigModuError!T {
+        return self.persistence.backend.client.transact(T, f);
+    }
 };

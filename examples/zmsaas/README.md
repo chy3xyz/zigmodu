@@ -46,6 +46,10 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/orders
 
 无 token → 401；token 只访问自己 `org_id` 的数据（种子 org 1）。
 
+后端自测：`cd examples/zmsaas/backend && zig build test` —— 跑生成的模块冒烟
+（内存 sqlite CRUD + validate 负向 + transact），读路径走 typed
+`row.scan`（按列名映射，无手写列下标）。
+
 ## 自定义业务逻辑演示
 
 在生成代码之上叠加了三类扩展（框架能力，非生成物）：

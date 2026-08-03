@@ -96,6 +96,8 @@ Service 只需 duck-typed `list/get/create/update/delete` + `module_name`/`nest`
 - 想要「透传归零 + CRUD 即事件源」的项目可直接组合
   `zigmodu.data.CrudService(Entity, Persistence)`：写操作自动 publish
   `CrudEvent{created,updated,deleted}`，无需手写事件发布代码。
+- 生成 service 另带 `transact(T, f)` 透传：多表业务方法直接
+  `try self.transact(...)`，不用手写 begin/commit/rollback。
 
 ```zig
 // service.zig（生成物）—— CrudService 零透传组合
@@ -118,6 +120,15 @@ pub const OrdersService = struct {
 响应收敛配套：`http.PageParams.parse(ctx, .{ .max_page_size = 100 })` 统一分页解析，
 `Extract.toDto/respondDto` 按同名字段约定映射 DTO（白名单天然隐藏
 `secret`/`org_id` 等列），`Extract.toDtoList` 做列表收集。
+
+生成代码质量（减少错误率）：
+
+- persistence 用 typed `row.scan(allocator, model.X)`（按**列名**映射，替代手写
+  `scan()` 的列下标取值——增列/改列顺序不再静默错位）；
+- 每个模块自动产出 `tests.zig`（内存 sqlite 的 CRUD 冒烟 + validate 负向 +
+  transact 冒烟），项目 build.zig 加一个 test step 即接入 `zig build test`；
+- `CrudOpts.dto` 让 list/get 响应自动走 DTO 白名单；
+- `CrudOpts.bulk` 增加 `POST {nest}/bulk`（JSON 数组批量创建，一次 RTT）。
 
 前端同源产出：同一个 `orders.model.json` 可再跑
 `node zsaas/scripts/gen-business.mjs orders.model.json <frontend>`，生成

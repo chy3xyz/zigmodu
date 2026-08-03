@@ -611,14 +611,19 @@ pub const OrdersApi = zigmodu.http.CrudApi(model.Orders, service.OrdersService, 
 - 自动生成 5 条路由，JWT + `<module>:read`/`<module>:write` 权限 meta；
 - `tenant_id` 从 attrs 注入（勿在 handler 里再验 Bearer）；
 - 分页走 `PageParams.parse`（page_size 钳制，杜绝 0 拉全表）；
+- 响应白名单：`CrudOpts{ .dto = OrderDto }` 后 list/get 自动经 `toDto`
+  映射（隐藏 `org_id`/`secret` 等内部列）；批量导入开
+  `CrudOpts{ .bulk = true }` 获得 `POST {nest}/bulk`（一次 RTT）；
 - 事件源：service 组合 `data.CrudService(Entity, Persistence)` 后，写操作自动
   publish `CrudEvent{created,updated,deleted}`，业务订阅即可（发通知/审计/外发），
   无需手写事件发布；
 - 零透传：service 声明 `pub const impl = data.CrudService(Entity, P)` 与
   `crud: impl` 字段后，`CrudApi` 自动直通（无需再写 5 个转发方法）；
   生成的 service 只有接线 + `validate` 钩子（`zmodu saas` 已按此产出）；
-- 响应白名单：`Extract.toDto/respondDto` 按同名字段约定映射，天然隐藏
-  `secret`/`org_id` 等列；`toDtoList` 收集列表。
+- 读路径用 typed `row.scan(allocator, Model)`（按列名映射），禁止手写
+  `scan()` 列下标取值——列顺序变化会静默错位；
+- 多写一致性：`svc.transact(T, f)` 事务封装（生成物自带），避免手写
+  begin/commit/rollback 遗漏。
 
 适用边界：规则简单的 CRUD 模块直接用；需要复杂业务编排（多表事务、状态机、
 审批流）时保留 service 内手写 Cmd，autoCrud 只覆盖纯增删改查面。

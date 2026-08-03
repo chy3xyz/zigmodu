@@ -113,6 +113,9 @@ pub const setErrorMap = Extract.setErrorMap;
 pub const clearErrorMap = Extract.clearErrorMap;
 pub const ErrorMapping = Extract.ErrorMapping;
 pub const FieldRules = Extract.FieldRules;
+pub const toDto = Extract.toDto;
+pub const toDtoList = Extract.toDtoList;
+pub const respondDto = Extract.respondDto;
 
 pub const Testkit = @import("http/Testkit.zig");
 pub const Profiles = @import("http/Profiles.zig");

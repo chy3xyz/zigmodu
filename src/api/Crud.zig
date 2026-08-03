@@ -22,6 +22,14 @@ pub const CrudOpts = struct {
     /// Permission base (default: Service.module_name) → "<base>:read"/"<base>:write".
     permission: ?[]const u8 = null,
     public: bool = false,
+    /// Response DTO whitelist: when set, list/get serialize a convention-
+    /// mapped DTO (Extract.toDto) instead of the raw entity — internal
+    /// columns (org_id, created_at, secret…) stay out of the wire format.
+    dto: ?type = null,
+    /// Add a POST {nest}/bulk endpoint accepting a JSON array of entities
+    /// (one round-trip for import-style workloads). Rows are inserted
+    /// sequentially through the service (validate + CrudEvent per row).
+    bulk: bool = false,
 };
 
 pub fn CrudApi(comptime Entity: type, comptime Service: type, comptime opts: CrudOpts) type {
@@ -50,12 +58,15 @@ pub fn CrudApi(comptime Entity: type, comptime Service: type, comptime opts: Cru
         const read_meta = http.RouteMeta{ .auth = auth, .permission = if (opts.public) null else read_perm };
         const write_meta = http.RouteMeta{ .auth = auth, .permission = if (opts.public) null else write_perm };
 
-        pub const routes = [_]http.RouteSpec(State){
-            .{ .method = .GET, .path = "", .handler = list, .meta = read_meta },
-            .{ .method = .POST, .path = "", .handler = create, .meta = write_meta },
-            .{ .method = .GET, .path = "{id}", .handler = get, .meta = read_meta },
-            .{ .method = .PUT, .path = "{id}", .handler = update, .meta = write_meta },
-            .{ .method = .DELETE, .path = "{id}", .handler = remove, .meta = write_meta },
+        pub const routes = blk: {
+            var route_list: [if (opts.bulk) 6 else 5]http.RouteSpec(State) = undefined;
+            route_list[0] = .{ .method = .GET, .path = "", .handler = list, .meta = read_meta };
+            route_list[1] = .{ .method = .POST, .path = "", .handler = create, .meta = write_meta };
+            route_list[2] = .{ .method = .GET, .path = "{id}", .handler = get, .meta = read_meta };
+            route_list[3] = .{ .method = .PUT, .path = "{id}", .handler = update, .meta = write_meta };
+            route_list[4] = .{ .method = .DELETE, .path = "{id}", .handler = remove, .meta = write_meta };
+            if (opts.bulk) route_list[5] = .{ .method = .POST, .path = "bulk", .handler = bulkCreate, .meta = write_meta };
+            break :blk route_list;
         };
 
         fn tenantId(ctx: *http.Context) !i64 {
@@ -107,7 +118,14 @@ pub fn CrudApi(comptime Entity: type, comptime Service: type, comptime opts: Cru
             const params = page_mod.PageParams.parse(ctx, .{});
             var items = listImpl(self, ctx.allocator, org_id, params.page, params.page_size) catch |err| return http.respondErr(ctx, err);
             defer items.deinit(ctx.allocator);
-            try page_mod.sendPaged(ctx, items.items, items.items.len, params, opts.envelope);
+            if (comptime opts.dto) |DtoT| {
+                const dtos = try ctx.allocator.alloc(DtoT, items.items.len);
+                errdefer ctx.allocator.free(dtos);
+                for (items.items, 0..) |e, i| dtos[i] = http.toDto(DtoT, e);
+                try page_mod.sendPaged(ctx, dtos, items.items.len, params, opts.envelope);
+            } else {
+                try page_mod.sendPaged(ctx, items.items, items.items.len, params, opts.envelope);
+            }
         }
 
         fn get(ctx: *http.Context, self: *State) !void {
@@ -115,7 +133,11 @@ pub fn CrudApi(comptime Entity: type, comptime Service: type, comptime opts: Cru
             const id = try ctx.paramInt(i64, "id");
             const entity = getImpl(self, ctx.allocator, org_id, id) catch |err| return http.respondErr(ctx, err);
             if (entity) |e| {
-                try ctx.jsonStruct(200, .{ .code = 0, .data = e });
+                if (comptime opts.dto) |DtoT| {
+                    try ctx.jsonStruct(200, .{ .code = 0, .data = http.toDto(DtoT, e) });
+                } else {
+                    try ctx.jsonStruct(200, .{ .code = 0, .data = e });
+                }
             } else {
                 try ctx.jsonStruct(404, .{ .code = 404, .msg = "not found" });
             }
@@ -127,6 +149,20 @@ pub fn CrudApi(comptime Entity: type, comptime Service: type, comptime opts: Cru
             entity.org_id = org_id;
             const id = createImpl(self, entity) catch |err| return http.respondErr(ctx, err);
             try ctx.jsonStruct(200, .{ .code = 0, .id = id });
+        }
+
+        fn bulkCreate(ctx: *http.Context, self: *State) !void {
+            const org_id = try tenantId(ctx);
+            const entities = ctx.bindJson([]Entity) catch return ctx.jsonStruct(400, .{ .code = 400, .msg = "invalid body" });
+            var ids = std.ArrayList(i64).empty;
+            defer ids.deinit(ctx.allocator);
+            for (entities) |raw| {
+                var e = raw;
+                e.org_id = org_id;
+                const id = createImpl(self, e) catch |err| return http.respondErr(ctx, err);
+                try ids.append(ctx.allocator, id);
+            }
+            try ctx.jsonStruct(200, .{ .code = 0, .ids = ids.items });
         }
 
         fn update(ctx: *http.Context, self: *State) !void {
@@ -249,6 +285,16 @@ test "CrudApi routes through embedded impl (zero passthrough)" {
     var svc = TestImplService.init();
     var api = Api.init(&svc);
     _ = &api;
+}
+
+test "CrudApi bulk option adds the bulk endpoint" {
+    const Api = CrudApi(TestEntity, TestService, .{ .bulk = true });
+    try std.testing.expectEqual(@as(usize, 6), Api.routes.len);
+    try std.testing.expectEqualStrings("bulk", Api.routes[5].path);
+    try std.testing.expect(Api.routes[5].method == .POST);
+
+    const Plain = CrudApi(TestEntity, TestService, .{});
+    try std.testing.expectEqual(@as(usize, 5), Plain.routes.len);
 }
 
 test "CrudApi honors permission override and public flag" {
