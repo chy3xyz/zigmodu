@@ -1,7 +1,7 @@
 # ZigModu × zent 最佳实践
 
 **zent**: [chy3xyz/zent](https://github.com/chy3xyz/zent) — Zig 版 [ent](https://entgo.io/)（schema-as-code ORM）  
-**版本口径**: zent **v0.13.0+** · ZigModu **v0.14.9+** · Zig **≥ 0.17**  
+**版本口径**: zent **v0.27.0+**（示例与本文按最新发布 v0.27.0 演示；最低兼容 v0.13 起）· ZigModu **v0.14.9+** · Zig **≥ 0.17**  
 
 **参考实现**: [`examples/zent-modulith/`](../examples/zent-modulith/)  
 **zent 自带示例**: `zig build run-start` / `run-complex` / `run-pool`（在 zent 仓库内）
@@ -181,6 +181,15 @@ Application / http
 | 关注/好友/点赞 | `edge.To/From` + `graph.neighbors` | m2m 邻居查询（has/with 谓词）覆盖"我关注的人发的动态"。 |
 | 时间戳自动维护 | `TimeMixin` + v0.22 | `created_at`/`updated_at` 列自动获得 epoch `DEFAULT`（方言感知）；`UpdateBuilder` 自动刷新 `updated_at`（显式设置优先）。 |
 | 边排序 / 每父限量 | `edge.To(...).OrderBy("created_at").Desc().Limit(10)` | 预加载列表按目标列排序；每父 `LIMIT` 用 `ROW_NUMBER() OVER (PARTITION BY fk …)`（O2M/O2O；M2M/M2O 声明 limit 报 `UnsupportedEdgeLimit`）。显式 FK 用 `.Field("post_id")` 绑定（v0.22 修复）。 |
+| 边过滤 | `edge.To(...).WhereRaw("\"hidden\" = ?", &.{.{ .bool = false }})` | 预加载邻居先过滤再排序/限量（v0.23）；例如 feed 只加载可见评论。 |
+| 复合 keyset 游标 | `q.CursorKeyset("created_at", .{.int = ts}, id, desc)` + `Limit(n)` | `WHERE (col > ?) OR (col = ? AND id > ?) ORDER BY col, id`（v0.23）；同秒平局跨页不丢，自动补 id 决胜。 |
+| 嵌套事务 | `beginTx` 内再 `beginTx` | 同一连接自动降级 `SAVEPOINT`（v0.24）；内层 rollback 只回滚内层写入，适合服务编排。 |
+| 提交后回调 / 事务事件 | `tx.afterCommit(...)` + `enqueueEvent` / `takePendingEvents` | v0.24：提交成功后才投递（outbox/审计/通知），回滚不触发。 |
+| 分布式 ID | `core.id.uuidv4() / uuidv7(now_ms)` + `field.UUID("id")` | v0.24：uuid 主键、跨分片安全、时间有序适合游标。 |
+| 敏感字段掩码 | `zent.codegen.toMaskedJson(...)` | v0.24+（根导出 v0.27）：`Sensitive()` 字段输出 `"***"`，禁止直接序列化实体。 |
+| 审计用户 / 内置校验 | `AuditMixin` + `NotEmpty/Length/Email/Phone/Custom` | v0.25：`created_by/updated_by` 自动填 `PrivacyContext.user_id`；校验在 Create/Update 自动执行。 |
+| 软删恢复 / 批量软删 | `DeleteBuilder.Restore(id)` / `BulkDelete` + `IN` | v0.25/v0.26：恢复清 `deleted_at`；批量软删一条 UPDATE 置位。 |
+| 列投影 / 批量插入 | `q.Select(&.{"id","name"})` / `CrudService.insertMany` | v0.26/v0.24：跳过 text/blob 大字段；批量写一条语句。 |
 
 ### 4.7 复杂报表与 join 边界（架构取舍）
 
@@ -428,7 +437,7 @@ pub const CatalogStore = struct {
 
 ## 11. 依赖接入
 
-zent **v0.12** 提供 `build.zig.zon`（模块名 `zent`）。
+zent **v0.27.0** 提供 `build.zig.zon`（模块名 `zent`，path 依赖本地 checkout 开发）。
 
 **本地 sibling（开发）：**
 
@@ -447,7 +456,7 @@ exe_mod.addImport("zent", zent_dep.module("zent"));
 
 ```zon
 .zent = .{
-    .url = "https://github.com/chy3xyz/zent/archive/refs/tags/v0.12.0.tar.gz",
+    .url = "https://github.com/chy3xyz/zent/archive/refs/tags/v0.27.0.tar.gz",
     .hash = "<zig fetch 后填入>",
 },
 ```
@@ -493,7 +502,7 @@ zig_ws/
 
 ---
 
-## 14. 升级注意（zent 0.6 → 0.12 → 0.13+）
+## 14. 升级注意（zent 0.6 → 0.12 → 0.13 → 0.27）
 
 | 主题 | 动作 / 新特性 |
 |------|--------------|
@@ -504,6 +513,13 @@ zig_ws/
 | **Pool `max_wait_ms`** | 改用 `max_retries` + backoff |
 | **`build.zig.zon` fingerprint** | `zig build` 提示值写入 |
 | **CRC / std 滚动** | 跟 Zig 0.17-dev（见 AGENTS.md） |
+| **v0.21 原子表达式** | `setExprArgs`：`SET stock = stock - ? WHERE id = ? AND stock >= ?`，`rows_affected == 0` 即库存不足，防超卖。 |
+| **v0.22 时间戳自动维护** | `.time` 列获得方言感知 epoch `DEFAULT`；`UpdateBuilder` 自动刷新 `updated_at`。 |
+| **v0.23 边过滤 / keyset 游标** | `WhereRaw` 过滤邻居；`CursorKeyset` 复合 `(col, id)` 游标平局不丢。 |
+| **v0.24 嵌套事务 / afterCommit / uuid / 掩码** | `beginTx` 内再 `beginTx` 降级 savepoint；`afterCommit` + `enqueueEvent`；`uuidv7` 主键；`toMaskedJson` 敏感掩码。 |
+| **v0.25 审计用户 / 校验器 / 恢复** | `AuditMixin` 自动填 `created_by/updated_by`；`NotEmpty/Length/Email/Phone/Custom` 自动校验；`Restore` 恢复软删。 |
+| **v0.26 投影 / 批量软删** | `Select(cols)` 列投影跳过 text/blob；soft-delete 实体 `BulkDelete` 一条 UPDATE 置位；`or_in` 值语义谓词修悬垂。 |
+| **v0.27 根导出补全** | `codegen.toMaskedJson` 根导出；optional 字段 create/get/update/bulk 全路径修复。 |
 
 
 ---
