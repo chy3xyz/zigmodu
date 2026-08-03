@@ -117,6 +117,23 @@ curl -s -X POST 'http://127.0.0.1:18100/api/v1/inventory/decrement?product_id=1&
 curl -s http://127.0.0.1:18100/api/v1/feed/authors
 ```
 
+**审计 / 校验 / 投影 / 批量 / 软删（v0.25-0.26 能力）**
+
+```bash
+# 创建时校验器自动执行（name NotEmpty+Length），审计字段自动填 user 1
+curl -s -X POST 'http://127.0.0.1:18100/api/v1/products?tenant_id=1' \
+  -H 'Content-Type: application/json' -d '{"name":"widget","price_cents":99,"description":"big"}'
+# 投影列表（跳过 description 大字段）
+curl -s 'http://127.0.0.1:18100/api/v1/products/summary'
+# 批量插入（CrudService.insertMany，一条语句）
+curl -s -X POST 'http://127.0.0.1:18100/api/v1/products/batch' \
+  -H 'Content-Type: application/json' -d '[{"tenant_id":1,"name":"b1","price_cents":10}]'
+# 软删 + 恢复（Post）
+curl -s -X DELETE 'http://127.0.0.1:18100/api/v1/feed/1'
+curl -s 'http://127.0.0.1:18100/api/v1/feed/trashed'
+curl -s -X POST 'http://127.0.0.1:18100/api/v1/feed/1/restore'
+```
+
 ## zent 新特性演示
 
 - **paged()**：泛型 list 即 `GET /api/v1/products?tenant_id=1&page=1&page_size=2`

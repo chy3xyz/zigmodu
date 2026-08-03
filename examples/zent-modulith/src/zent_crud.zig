@@ -64,11 +64,16 @@ pub fn CrudApi(
         for (info.fields) |f| {
             if (f.is_id or std.mem.eql(u8, f.name, opts.tenant_col)) continue;
             names[i] = (f.name)[0..f.name.len :0];
-            types[i] = f.zig_type;
+            types[i] = if (f.optional) ?f.zig_type else f.zig_type;
             attrs[i] = .{
-                .default_value_ptr = null,
+                // @Struct fields with a null default are treated as required
+                // by std.json - optional fields need an explicit null default.
+                .default_value_ptr = if (f.optional)
+                    @ptrCast(&@as(?f.zig_type, null))
+                else
+                    null,
                 .@"comptime" = false,
-                .@"align" = @alignOf(f.zig_type),
+                .@"align" = @alignOf(types[i]),
             };
             i += 1;
         }

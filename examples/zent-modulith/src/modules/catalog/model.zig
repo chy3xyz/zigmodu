@@ -14,9 +14,15 @@ pub const Tenant = Schema("Tenant", .{
 pub const Product = Schema("Product", .{
     .fields = &.{
         field.Int("tenant_id"),
-        field.String("name"),
+        // Validators run automatically on create/update (v0.25).
+        field.String("name").NotEmpty().Length(1, 100),
         field.Int("price_cents"),
+        // Large optional field: list endpoints can project it away.
+        field.String("description").Optional(),
     },
+    // AuditMixin auto-fills created_by/updated_by from the client's
+    // PrivacyContext.user_id (v0.25).
+    .mixins = &.{zent.core.mixin.AuditMixin},
 });
 
 /// Data-scope demo entity: row-level access controlled by
@@ -47,6 +53,9 @@ pub const Post = Schema("Post", .{
     },
     // Per-parent eager load: newest 2 comments per post (edge order/limit).
     .edges = &.{edge.To("comments", Comment).Field("post_id").OrderBy("id").Desc().Limit(2)},
+    // Soft delete + restore demo (v0.26).
+    .mixins = &.{zent.core.mixin.SoftDeleteMixin},
+    .soft_delete = true,
 });
 
 pub const Author = Schema("Author", .{

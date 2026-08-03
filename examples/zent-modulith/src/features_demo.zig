@@ -87,6 +87,9 @@ pub fn FeedApi(comptime Client: type) type {
 
         pub const routes = [_]http.RouteSpec(State){
             .{ .method = .GET, .path = "authors", .handler = authors, .meta = .{ .auth = .public } },
+            .{ .method = .GET, .path = "trashed", .handler = trashed, .meta = .{ .auth = .public } },
+            .{ .method = .DELETE, .path = "{post_id}", .handler = softDeletePost, .meta = .{ .auth = .public } },
+            .{ .method = .POST, .path = "{post_id}/restore", .handler = restorePost, .meta = .{ .auth = .public } },
         };
 
         fn authors(ctx: *http.Context, self: *State) !void {
@@ -99,6 +102,120 @@ pub fn FeedApi(comptime Client: type) type {
                 rows.deinit();
             }
             try ctx.jsonStruct(200, .{ .authors = rows.items });
+        }
+
+        fn softDeletePost(ctx: *http.Context, self: *State) !void {
+            const post_id = try ctx.paramInt(i64, "post_id");
+            var d = self.client.post.Delete();
+            defer d.deinit();
+            _ = try d.Where(.{self.client.post.predicates.idEQ(.{ .int = post_id })});
+            const affected = try d.Exec(); // soft delete (deleted_at = now)
+            if (affected == 0) return http.respondErr(ctx, error.NotFound);
+            try ctx.jsonStruct(200, .{ .deleted = post_id });
+        }
+
+        fn restorePost(ctx: *http.Context, self: *State) !void {
+            const post_id = try ctx.paramInt(i64, "post_id");
+            var d = self.client.post.Delete();
+            defer d.deinit();
+            if (!try d.Restore(post_id)) return http.respondErr(ctx, error.NotFound);
+            try ctx.jsonStruct(200, .{ .restored = post_id });
+        }
+
+        fn trashed(ctx: *http.Context, self: *State) !void {
+            var q = self.client.post.Query();
+            defer q.deinit();
+            _ = q.WithTrashed();
+            const rows = try q.All();
+            defer {
+                for (rows.items) |*p| zent.codegen.deinitEntity(persist.infos, persist.PostInfo, p, self.client.allocator);
+                rows.deinit();
+            }
+            try ctx.jsonStruct(200, .{ .trashed = rows.items });
+        }
+    };
+}
+
+/// GET /api/v1/products/summary — column projection (v0.26) skips the large
+/// optional description field; unselected fields serialize as zero values.
+pub fn SummaryApi(comptime Client: type) type {
+    return struct {
+        const Self = @This();
+
+        client: *Client,
+
+        pub const module_name = "catalog";
+        pub const nest = .{"products"};
+        pub const State = Self;
+
+        pub fn init(client: *Client) Self {
+            return .{ .client = client };
+        }
+
+        pub const routes = [_]http.RouteSpec(State){
+            .{ .method = .GET, .path = "summary", .handler = summary, .meta = .{ .auth = .public } },
+        };
+
+        fn summary(ctx: *http.Context, self: *State) !void {
+            var q = self.client.product.Query();
+            defer q.deinit();
+            _ = q.Select(&.{ "id", "name", "price_cents" });
+            const rows = try q.All();
+            defer {
+                for (rows.items) |*p| zent.codegen.deinitEntity(persist.infos, persist.ProductInfo, p, self.client.allocator);
+                rows.deinit();
+            }
+            try ctx.jsonStruct(200, .{ .summaries = rows.items });
+        }
+    };
+}
+
+/// POST /api/v1/products/batch — CrudService.insertMany (one INSERT
+/// statement for many rows, v0.25).
+pub fn BatchApi(comptime Crud: type) type {
+    return struct {
+        const Self = @This();
+
+        crud: *Crud,
+
+        pub const module_name = "catalog";
+        pub const nest = .{"products"};
+        pub const State = Self;
+
+        pub fn init(crud: *Crud) Self {
+            return .{ .crud = crud };
+        }
+
+        const BatchItem = struct {
+            tenant_id: i64,
+            name: []const u8,
+            price_cents: i64,
+        };
+
+        pub const routes = [_]http.RouteSpec(State){
+            .{ .method = .POST, .path = "batch", .handler = batch, .meta = .{ .auth = .public } },
+        };
+
+        fn batch(ctx: *http.Context, self: *State) !void {
+            const Entity = zent.codegen.entity(persist.infos, persist.ProductInfo);
+            const items = ctx.bindJson([]BatchItem) catch return ctx.json(400, "{\"error\":\"invalid body\"}");
+            var entities = std.ArrayList(Entity).empty;
+            defer entities.deinit(ctx.allocator);
+            for (items) |it| {
+                try entities.append(ctx.allocator, .{
+                    .id = 0,
+                    .tenant_id = it.tenant_id,
+                    .name = it.name,
+                    .price_cents = it.price_cents,
+                    .description = null,
+                    .created_by = null,
+                    .updated_by = null,
+                    .edges = .{},
+                });
+            }
+            var ids = self.crud.insertMany(entities.items) catch |err| return http.respondErr(ctx, err);
+            defer ids.deinit();
+            try ctx.jsonStruct(201, .{ .ids = ids.items });
         }
     };
 }

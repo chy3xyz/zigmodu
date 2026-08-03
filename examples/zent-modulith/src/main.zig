@@ -37,9 +37,10 @@ pub fn main(init: std.process.Init) !void {
 
     // Generic CRUD: one declaration = the five standard routes over the zent
     // CrudService. Tenant comes from the query string in this public demo
-    // (real deployments switch to .attr with the JWT middleware).
+    // (real deployments switch to .attr with the JWT middleware). The client
+    // carries a privacy context so AuditMixin auto-fills created_by/updated_by.
     const ProductCrud = zent.crud.CrudService(catalog.persistence.infos, catalog.persistence.ProductInfo, "tenant_id");
-    var product_crud = ProductCrud.init(allocator, store.client.product);
+    var product_crud = ProductCrud.init(allocator, store.client.product.withContext(.{ .user_id = 1 }));
     const ProductApiT = zent_crud.CrudApi(catalog.persistence.infos, catalog.persistence.ProductInfo, .{
         .module_name = "catalog",
         .nest = &.{"products"},
@@ -122,6 +123,10 @@ pub fn main(init: std.process.Init) !void {
     var inventory_api = InventoryApiT.init(&env.client);
     const FeedApiT = features_demo.FeedApi(@TypeOf(env.client));
     var feed_api = FeedApiT.init(&env.client);
+    const SummaryApiT = features_demo.SummaryApi(@TypeOf(env.client));
+    var summary_api = SummaryApiT.init(&env.client);
+    const BatchApiT = features_demo.BatchApi(@TypeOf(product_crud));
+    var batch_api = BatchApiT.init(&product_crud);
 
     // Outbox demo: transactional enqueue + on-demand/cron dispatch.
     var outbox_dispatcher = outbox_demo.Dispatcher{
@@ -200,7 +205,7 @@ pub fn main(init: std.process.Init) !void {
     defer catalog_slot.deinit();
     try server.addMiddleware(zigmodu.http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
 
-    comptime zigmodu.http.assertNoDupes(.{ CatalogApiT, ProductApiT, OutboxApiT, DocApiT, InventoryApiT, FeedApiT });
+    comptime zigmodu.http.assertNoDupes(.{ CatalogApiT, ProductApiT, OutboxApiT, DocApiT, InventoryApiT, FeedApiT, SummaryApiT, BatchApiT });
 
     const AppState = struct {};
     var app_state: AppState = .{};
@@ -215,6 +220,8 @@ pub fn main(init: std.process.Init) !void {
         .{ .Mod = OutboxApiT, .state = &outbox_api },
         .{ .Mod = InventoryApiT, .state = &inventory_api },
         .{ .Mod = FeedApiT, .state = &feed_api },
+        .{ .Mod = SummaryApiT, .state = &summary_api },
+        .{ .Mod = BatchApiT, .state = &batch_api },
     });
     var docs_scope = try api_v1.use(.{ .func = data_scope_demo.scopeMiddleware });
     try docs_scope.mount(DocApiT, &doc_api);
