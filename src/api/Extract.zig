@@ -183,7 +183,16 @@ pub const ErrorMapping = struct {
     status: u16,
 };
 
+/// Localized error detail: respondErr reads Accept-Language and uses `zh`
+/// when the request prefers Chinese, otherwise `en` (fallback @errorName).
+pub const ErrorLocalization = struct {
+    err: anyerror,
+    zh: []const u8,
+    en: []const u8,
+};
+
 var custom_error_map: []const ErrorMapping = &.{};
+var error_localizations: []const ErrorLocalization = &.{};
 
 /// Install process-wide error map (call once at startup). Slice must outlive the server.
 pub fn setErrorMap(map: []const ErrorMapping) void {
@@ -194,25 +203,38 @@ pub fn clearErrorMap() void {
     custom_error_map = &.{};
 }
 
+/// Register per-language error details (app-level; static slices recommended).
+pub fn setErrorLocalizations(msgs: []const ErrorLocalization) void {
+    error_localizations = msgs;
+}
+
+fn localizedDetail(ctx: *Context, err: anyerror) []const u8 {
+    if (error_localizations.len == 0) return @errorName(err);
+    const lang = ctx.header("Accept-Language") orelse "";
+    const zh = std.mem.indexOf(u8, lang, "zh") != null;
+    for (error_localizations) |m| {
+        if (m.err == err) return if (zh) m.zh else m.en;
+    }
+    return @errorName(err);
+}
+
 /// Map common handler errors to HTTP status + ProblemDetails.
 pub fn respondErr(ctx: *Context, err: anyerror) !void {
-    for (custom_error_map) |m| {
-        if (m.err == err) {
-            const detail = if (m.status >= 500) "Internal server error" else @errorName(err);
-            try respondProblem(ctx, m.status, detail);
-            return;
+    const status: u16 = blk: {
+        for (custom_error_map) |m| {
+            if (m.err == err) break :blk m.status;
         }
-    }
-    const status: u16 = switch (err) {
-        error.InvalidInput, error.ValidationFailed, error.MissingParameter, error.BadRequest, error.InvalidJson => 400,
-        error.Unauthorized, error.AuthenticationFailed, error.InvalidToken, error.TokenExpired => 401,
-        error.Forbidden, error.AuthorizationFailed => 403,
-        error.NotFound => 404,
-        error.Conflict, error.AlreadyExists => 409,
-        error.OutOfMemory => 500,
-        else => 500,
+        break :blk switch (err) {
+            error.InvalidInput, error.ValidationFailed, error.MissingParameter, error.BadRequest, error.InvalidJson => 400,
+            error.Unauthorized, error.AuthenticationFailed, error.InvalidToken, error.TokenExpired => 401,
+            error.Forbidden, error.AuthorizationFailed => 403,
+            error.NotFound => 404,
+            error.Conflict, error.AlreadyExists => 409,
+            error.OutOfMemory => 500,
+            else => 500,
+        };
     };
-    const detail = if (status >= 500) "Internal server error" else @errorName(err);
+    const detail = if (status >= 500) "Internal server error" else localizedDetail(ctx, err);
     try respondProblem(ctx, status, detail);
 }
 
@@ -369,6 +391,27 @@ test "respondErr uses custom error map" {
 
     try respondErr(&ctx, error.TooManyRequests);
     try std.testing.expectEqual(@as(u16, 429), ctx.status_code);
+}
+
+test "respondErr localizes detail by Accept-Language" {
+    const allocator = std.testing.allocator;
+    const zh = [_]ErrorLocalization{
+        .{ .err = error.ValidationFailed, .zh = "校验失败", .en = "Validation failed" },
+    };
+    setErrorLocalizations(&zh);
+    defer setErrorLocalizations(&.{}); // reset
+
+    var ctx_zh = try Context.init(allocator, .GET, "/x");
+    defer ctx_zh.deinit();
+    // 请求头（setHeader 写响应头；ctx.header() 读请求头）
+    try ctx_zh.headers.put(try allocator.dupe(u8, "accept-language"), try allocator.dupe(u8, "zh-CN"));
+    try respondErr(&ctx_zh, error.ValidationFailed);
+    try std.testing.expect(std.mem.indexOf(u8, ctx_zh.response_body.items, "校验失败") != null);
+
+    var ctx_en = try Context.init(allocator, .GET, "/x");
+    defer ctx_en.deinit();
+    try respondErr(&ctx_en, error.ValidationFailed);
+    try std.testing.expect(std.mem.indexOf(u8, ctx_en.response_body.items, "Validation failed") != null);
 }
 
 test "openApiParamsFromStruct marks optionals and defaults" {

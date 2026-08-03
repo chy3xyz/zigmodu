@@ -64,6 +64,8 @@ pub const ShardApi = struct {
 
     pub const routes = [_]zigmodu.http.RouteSpec(State){
         .{ .method = .GET, .path = "route", .handler = routeInfo, .meta = .{ .auth = .jwt, .permission = "orders:read" } },
+        .{ .method = .GET, .path = "load", .handler = shardLoad, .meta = .{ .auth = .jwt, .permission = "orders:read" } },
+        .{ .method = .POST, .path = "rebalance", .handler = rebalance, .meta = .{ .auth = .jwt, .permission = "orders:write" } },
         .{ .method = .POST, .path = "orders", .handler = createOrder, .meta = .{ .auth = .jwt, .permission = "orders:write" } },
         .{ .method = .GET, .path = "orders", .handler = listOrders, .meta = .{ .auth = .jwt, .permission = "orders:read" } },
     };
@@ -94,49 +96,77 @@ pub const ShardApi = struct {
         const idx = self.shardFor(org_id) orelse return error.NotFound;
         const client = &self.clients[idx];
 
-        // 数据权限：JWT roles → DataPermissionContext → buildWhere(region, owner_id)。
-        // admin → .all → 无过滤；user → .self_ → owner_id = JWT sub。
-        const roles_csv = ctx.getAttr("roles") orelse "";
+        // 数据权限：中间件已把角色→作用域解析进 data_scope attr（统一下沉），
+        // 这里只消费："self" → owner_id = JWT user_id，否则全量。
+        const scope = ctx.getAttr("data_scope") orelse "all";
         const user_id = std.fmt.parseInt(i64, ctx.getAttr("user_id") orelse "0", 10) catch 0;
-        const scope: zigmodu.security.Rbac.DataScope = if (std.mem.indexOf(u8, roles_csv, "admin") != null) .all else .self_;
-        const roles = [_]zigmodu.security.Rbac.Role{
-            .{
-                .id = 1,
-                .name = "r",
-                .code = "r",
-                .sort = 0,
-                .status = 1,
-                .type = 1,
-                .remark = "",
-                .data_scope = scope,
-                .data_scope_dept_ids = null,
-                .tenant_id = org_id,
-            },
-        };
-        var dp = zigmodu.datapermission.DataPermissionContext.fromRoles(ctx.allocator, &roles, 0, user_id);
-        defer dp.deinit();
-        const filter = dp.buildWhere(ctx.allocator, "region", "owner_id");
-        // NOTE: .all/.self_ 子句是 comptime 静态串（不可 free）；只有
-        // .dept_custom 走 allocPrint，arena 回收即可。
 
         var sql = std.ArrayList(u8).empty;
         defer sql.deinit(ctx.allocator);
         try sql.appendSlice(ctx.allocator, "SELECT id, org_id, owner_id, region, customer, amount FROM shard_orders WHERE org_id = ?");
-        if (filter) |f| {
-            try sql.appendSlice(ctx.allocator, " AND ");
-            try sql.appendSlice(ctx.allocator, f.clause);
+        if (std.mem.eql(u8, scope, "self")) {
+            try sql.appendSlice(ctx.allocator, " AND owner_id = ?");
         }
         try sql.appendSlice(ctx.allocator, " ORDER BY id DESC");
 
         var args = std.ArrayList(zigmodu.data.sqlx.Value).empty;
         defer args.deinit(ctx.allocator);
         try args.append(ctx.allocator, .{ .int = org_id });
-        if (filter) |f| {
-            for (f.params) |p| try args.append(ctx.allocator, .{ .int = p });
+        if (std.mem.eql(u8, scope, "self")) {
+            try args.append(ctx.allocator, .{ .int = user_id });
         }
 
         var result = try client.queryRows(ShardOrder, sql.items, args.items);
         defer result.deinit(ctx.allocator);
         try ctx.jsonStruct(200, .{ .code = 0, .shard = idx, .items = result.items });
+    }
+
+    fn countOrders(client: *zigmodu.data.Client) !i64 {
+        return (try client.queryRow(struct { total: i64 }, "SELECT COUNT(*) AS total FROM shard_orders", &.{})).total;
+    }
+
+    fn shardLoad(ctx: *zigmodu.http.Context, self: *State) !void {
+        const a = try countOrders(&self.clients[0]);
+        const b = try countOrders(&self.clients[1]);
+        try ctx.jsonStruct(200, .{ .code = 0, .shards = .{ .shard_a = a, .shard_b = b } });
+    }
+
+    /// 负载驱动的再平衡：把 org_id 迁移到更轻的分片（数据随迁）。
+    /// 稳定规则：仅当 `目标行数 + 本租户行数 < 当前行数`（迁移真正改善负载）
+    /// 才迁移，否则保持现状——避免整租户移动在双分片间来回振荡。
+    /// 跨分片无法单事务，采用 读旧→写新→删旧 两阶段（生产加幂等键）。
+    fn rebalance(ctx: *zigmodu.http.Context, self: *State) !void {
+        const org_id = ctx.queryInt(i64, "org_id", 1);
+        const from = self.shardFor(org_id) orelse return error.NotFound;
+        const cnt_a = try countOrders(&self.clients[0]);
+        const cnt_b = try countOrders(&self.clients[1]);
+        const to: u16 = if (cnt_b < cnt_a) 1 else 0;
+        const n_rows = try countOrdersFor(&self.clients[from], org_id);
+        const from_count = if (from == 0) cnt_a else cnt_b;
+        const to_count = if (to == 0) cnt_a else cnt_b;
+        if (to == from or to_count + n_rows >= from_count) {
+            try ctx.jsonStruct(200, .{ .code = 0, .org_id = org_id, .from = from, .to = to, .migrated = 0, .balanced = true });
+            return;
+        }
+        var rows = try self.clients[from].queryRows(ShardOrder, "SELECT id, org_id, owner_id, region, customer, amount FROM shard_orders WHERE org_id = ?", &.{.{ .int = org_id }});
+        defer rows.deinit(ctx.allocator);
+        var migrated: usize = 0;
+        for (rows.items) |r| {
+            _ = try self.clients[to].exec("INSERT INTO shard_orders (org_id, owner_id, region, customer, amount) VALUES (?, ?, ?, ?, ?)", &.{
+                .{ .int = r.org_id },
+                .{ .int = r.owner_id },
+                .{ .string = r.region },
+                .{ .string = r.customer },
+                .{ .int = r.amount },
+            });
+            migrated += 1;
+        }
+        _ = try self.clients[from].exec("DELETE FROM shard_orders WHERE org_id = ?", &.{.{ .int = org_id }});
+        try self.router.assignTenant(org_id, to);
+        try ctx.jsonStruct(200, .{ .code = 0, .org_id = org_id, .from = from, .to = to, .migrated = migrated, .balanced = true });
+    }
+
+    fn countOrdersFor(client: *zigmodu.data.Client, org_id: i64) !i64 {
+        return (try client.queryRow(struct { total: i64 }, "SELECT COUNT(*) AS total FROM shard_orders WHERE org_id = ?", &.{.{ .int = org_id }})).total;
     }
 };

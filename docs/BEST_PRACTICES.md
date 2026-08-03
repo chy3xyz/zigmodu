@@ -630,6 +630,9 @@ pub const OrdersApi = zigmodu.http.CrudApi(model.Orders, service.OrdersService, 
 - 可观测一行开：`server.addMiddleware(zigmodu.http.tracingMiddleware())`
   注入 `x-trace-id` + 请求耗时日志（`rateLimitMiddleware` 同款）；autoCrud
   路由与自定义路由一并生效，业务代码无需埋点。
+- 多语言错误：`http.setErrorLocalizations(&.{.{ .err = error.ValidationFailed,
+  .zh = "校验失败", .en = "Validation failed" }})` 后，`respondErr` 按
+  `Accept-Language` 返回中文/英文 detail（覆盖 autoCrud 与自定义路由）。
 
 适用边界：规则简单的 CRUD 模块直接用；需要复杂业务编排（多表事务、状态机、
 审批流）时保留 service 内手写 Cmd，autoCrud 只覆盖纯增删改查面。

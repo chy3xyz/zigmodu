@@ -99,8 +99,22 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/orders
   `login?role=user&uid=42` 签发 user（`DataPermissionContext.fromRoles` +
   `buildWhere("region","owner_id")` 的 `.self_` 作用域：只见本人行）。
   实测 admin 见全部、user(42) 只见 owner_id=42，跨分片一致。
+  角色→作用域解析已下沉到统一 `dataPermissionMiddleware`（写 `data_scope`
+  attr），handler 只消费，不再各自推导。
+- **分片负载/再平衡**：`GET /shard/load` 显示每分片行数；
+  `POST /shard/rebalance?org_id=N` 在「目标分片 + 本租户行数 < 当前分片行数」
+  时把租户连同数据迁到更轻分片并更新路由（稳定规则，避免振荡）。
+  实测：22/14 → org1 迁移 4 行 → 18/18 均衡；再次调用保持不变。
 - 生产：分片为 PG/MySQL 时直接用 `ShardRouter.buildSqlxConfig(pool)` 建连接；
   数据权限可下沉到 TenantInterceptor/中间件统一注入。
+
+## 多语言错误消息
+
+框架 `respondErr` 原生支持本地化：`http.setErrorLocalizations(&.{
+  .{ .err = error.ValidationFailed, .zh = "校验失败", .en = "Validation failed" }, … })`
+后，请求带 `Accept-Language: zh` 时所有走 `respondErr` 的错误（autoCrud、
+自定义路由全覆盖）返回中文 detail，否则英文/`@errorName`。实测：
+`zh → "校验失败"`、`en → "Validation failed"`、`zh 409 → "状态冲突"`。
 
 ## 前端 CRUD 收敛（DataTable / EntityForm）
 

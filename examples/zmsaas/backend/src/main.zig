@@ -51,6 +51,14 @@ pub fn main(init: std.process.Init) !void {
     const jwt_secret = init.environ_map.get("JWT_SECRET") orelse "zmsaas-dev-secret";
     var app_sec = zigmodu.security.AppSecurity.init(allocator, io, .{ .jwt_secret = jwt_secret });
     auth_mod.g_sec = &app_sec;
+    // 多语言错误：respondErr 读 Accept-Language，zh 返回中文 detail。
+    zigmodu.http.setErrorLocalizations(&.{
+        .{ .err = error.ValidationFailed, .zh = "校验失败", .en = "Validation failed" },
+        .{ .err = error.NotFound, .zh = "资源不存在", .en = "Not found" },
+        .{ .err = error.Conflict, .zh = "状态冲突", .en = "State conflict" },
+        .{ .err = error.Unauthorized, .zh = "未登录或登录已过期", .en = "Unauthorized" },
+        .{ .err = error.InvalidJson, .zh = "请求体格式错误", .en = "Invalid request body" },
+    });
     var catalog_slot: zigmodu.http.CatalogSlot = .{};
     defer catalog_slot.deinit();
     try server.addMiddleware(middleware.tenantMiddleware());

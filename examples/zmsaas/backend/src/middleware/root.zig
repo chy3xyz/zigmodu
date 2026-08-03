@@ -40,10 +40,15 @@ pub fn permissionGateMiddleware(slot: *http.CatalogSlot) http.Middleware {
     return http.permissionGateWith(slot, .{ .mode = .rbac });
 }
 
-/// 数据权限中间件（可读 ctx.getAttr("module") / ctx.getAttr("permissions")）
+/// 数据权限中间件（统一下沉）：从 JWT attrs（roles/user_id）解析数据作用域，
+/// 写入 `data_scope` attr（"all" | "self"）。所有 handler 统一消费该 attr，
+/// 不再各自从 roles 推导——角色→作用域的决策只在这里做一次。
 pub fn dataPermissionMiddleware() http.Middleware {
     return .{ .func = struct {
         fn handle(ctx: *http.Context, next: http.HandlerFn, _: ?*anyopaque) anyerror!void {
+            const roles_csv = ctx.getAttr("roles") orelse "";
+            const scope: []const u8 = if (std.mem.indexOf(u8, roles_csv, "admin") != null) "all" else "self";
+            try ctx.setAttr("data_scope", scope);
             try next(ctx);
         }
     }.handle };
