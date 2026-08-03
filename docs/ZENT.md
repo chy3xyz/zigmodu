@@ -170,6 +170,25 @@ Application / http
 
 `tenant-shop` 核心痛点是编排与消息 → **sqlx 更合适**；同一应用里「商品–类目–标签 + 店员只能改本店 + 软删审计」→ **该模块用 zent**。
 
+### 4.6 商城 / 社交场景补充能力（v0.20+）
+
+| 场景 | 用法 | 说明 |
+|------|------|------|
+| 库存防超卖（原子扣减） | `u.setExprArgs("stock", "stock - ?", &.{.{.int = n}})` + `Where(idEQ, stockGTE)` | `?` 由表达式参数绑定（SET 先于 WHERE 入参）；`rows_affected == 0` 即库存不足。纯乐观锁（读改写 + version）在高并发下有争抢，秒杀优先走原子表达式。 |
+| 乐观锁更新 | `field.Version()` | Update/Delete 自动 `WHERE version = ?` + `version = version + 1`，冲突返回 `OptimisticLockConflict`。 |
+| 批量写 / upsert | `BulkInsertBuilder.SaveOrUpdate`（zent）；`data.bulk.insertMany`（zigmodu sqlx） | 下单商品明细 N 次 round-trip → 1 次。 |
+| 两级关系预加载 | `q.WithEdge("posts.comments")` | 一次主查询 + 每级一次 IN 邻居查询；第三级为编译错误（终点无 edges 容器），逐层手动查询即可。 |
+| 关注/好友/点赞 | `edge.To/From` + `graph.neighbors` | m2m 邻居查询（has/with 谓词）覆盖"我关注的人发的动态"。 |
+
+### 4.7 复杂报表与 join 边界（架构取舍）
+
+zent 是 ent-style：**关系走 Edges 预加载，不做跨表 JOIN 查询**（无 join builder）。
+商城对账、经营报表等需要 `ORDER BY` 多表聚合/join 的场景，按以下边界处理：
+
+1. **优先**：`client.product.Query()` 拿本表数据 + `WithEdge` 组装，或 `CountBy` / `Sum` / `GroupBy` 做单表聚合。
+2. **复杂报表**：用 zent driver 裸 SQL（`client.driver.query(...)`）或 zigmodu `data.sqlx` 写 JOIN —— **不要在 zent 与 sqlx 之间共享事务**（见 §1 定位；报表只读连接可独立）。
+3. 报表查询建议独立 `report/` 模块持有自己的 `sqlx.Client`，与写路径（zent）解耦，避免把复杂 SQL 混进 domain 模块。
+
 ---
 
 ## 5. 分层映射（对齐 MODULE_LAYERS）
