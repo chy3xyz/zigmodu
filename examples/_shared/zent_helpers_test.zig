@@ -22,7 +22,7 @@ test "TestEnv initializes and deinitializes an isolated store" {
     var env = try Env.init(std.testing.allocator);
     defer env.deinit();
 
-    try std.testing.expectEqual(@as(i64, 0), try countRows(env.store.driver.asDriver()));
+    try std.testing.expectEqual(@as(i64, 0), try countRows(env.store.driver_ptr.asDriver()));
 }
 
 test "StoreEnv inMemory migrates a tiny schema" {
@@ -30,7 +30,7 @@ test "StoreEnv inMemory migrates a tiny schema" {
     var env = try Env.inMemory(std.testing.allocator);
     defer env.deinit();
 
-    var rows = try env.driver.asDriver().query(
+    var rows = try env.driver().query(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'test_entity'",
         &.{},
     );
@@ -43,14 +43,14 @@ test "TestEnv reset clears data before re-migrating" {
     var env = try Env.init(std.testing.allocator);
     defer env.deinit();
 
-    _ = try env.store.driver.asDriver().exec(
+    _ = try env.store.driver().exec(
         "INSERT INTO test_entity (name) VALUES (?)",
         &.{.{ .string = "before reset" }},
     );
-    try std.testing.expectEqual(@as(i64, 1), try countRows(env.store.driver.asDriver()));
+    try std.testing.expectEqual(@as(i64, 1), try countRows(env.store.driver()));
 
     try env.reset();
-    try std.testing.expectEqual(@as(i64, 0), try countRows(env.store.driver.asDriver()));
+    try std.testing.expectEqual(@as(i64, 0), try countRows(env.store.driver()));
 }
 
 test "StoreEnv deinit is idempotent" {
