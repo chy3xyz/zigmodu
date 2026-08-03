@@ -25,7 +25,9 @@ pub const usage =
     \\                cross-module file imports, manual Bearer, swallowed
     \\                errors, unused catch capture, service CRUD passthrough
     \\                (use data.CrudService), bare raw-entity responses
-    \\                (use DTO whitelists)
+    \\                (use DTO whitelists), missing module tests, hand-written
+    \\                column-index scan (use typed row.scan), multi-write
+    \\                service methods without a transaction
     \\
     \\Options:
     \\  -j, --json              machine-readable JSON output
@@ -556,6 +558,12 @@ fn collectBusiness(
         const mod_dir = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
         defer mod_dir.close(io);
 
+        // b14 — autoCrud modules must ship tests (generated `tests.zig` or
+        // hand-written `test "…"` blocks). Scoped to modules using
+        // http.CrudApi / data.CrudService so hand-written legacy modules
+        // (tenant-mgmt/tenant-shop style) aren't gated before migration.
+        var module_has_test = false;
+        var module_uses_autocrud = false;
         var f_it = mod_dir.iterate();
         while (try f_it.next(io)) |f| {
             if (f.kind != .file or !std.mem.endsWith(u8, f.name, ".zig")) continue;
@@ -566,7 +574,18 @@ fn collectBusiness(
 
             const rel_display = std.fs.path.join(allocator, &.{ "src", "modules", entry.name, f.name }) catch continue;
             defer allocator.free(rel_display);
+            if (std.mem.indexOf(u8, content, "test \"") != null or std.mem.indexOf(u8, content, "test {") != null) {
+                module_has_test = true;
+            }
+            if (std.mem.indexOf(u8, content, "CrudApi(") != null or std.mem.indexOf(u8, content, "CrudService(") != null) {
+                module_uses_autocrud = true;
+            }
             try lintFile(allocator, f.name, content, rel_display, config, violations);
+        }
+        if (module_uses_autocrud and !module_has_test and !config.disabled.contains("b14")) {
+            const mod_rel = try std.fs.path.join(allocator, &.{ "src", "modules", entry.name });
+            defer allocator.free(mod_rel);
+            try pushViolation(violations, allocator, "b14", mod_rel, 1, "autoCrud module has no tests — add a smoke test (generated projects ship tests.zig; run via zig build test)", .{});
         }
     }
 }
@@ -587,9 +606,40 @@ fn lintFile(
     // Track a CRUD-named service fn to catch a pure passthrough body (b12).
     var pending_fn: ?[]const u8 = null;
     var pending_fn_line: usize = 0;
+    // b16 — multi-write methods must run inside a transaction.
+    var fn_write_count: usize = 0;
+    var fn_tx_seen = false;
+    var fn_open = false;
+    var fn_open_line: usize = 0;
+    var fn_open_name: ?[]const u8 = null;
     while (lines.next()) |line| : (idx += 1) {
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0 or std.mem.startsWith(u8, trimmed, "//")) continue;
+
+        // b16 — track the current service method: count write calls, look for
+        // a transaction, and flag 2+ writes without one when the method ends.
+        if (std.mem.eql(u8, file_name, "service.zig") and !config.disabled.contains("b16")) {
+            if (pubFnName(trimmed)) |fn_name| {
+                try flushMultiWrite(fn_open, fn_open_name, fn_open_line, fn_write_count, fn_tx_seen, rel_path, allocator, violations);
+                fn_open = true;
+                fn_open_name = fn_name;
+                fn_open_line = idx;
+                fn_write_count = 0;
+                fn_tx_seen = false;
+            } else if (fn_open) {
+                if (containsAny(line, &.{ "transact", "beginTx", ".begin(" }) or
+                    std.mem.indexOf(u8, line, "tx.") != null)
+                {
+                    fn_tx_seen = true;
+                }
+                if (isWriteCall(line)) fn_write_count += 1;
+                if (std.mem.eql(u8, trimmed, "}")) {
+                    try flushMultiWrite(fn_open, fn_open_name, fn_open_line, fn_write_count, fn_tx_seen, rel_path, allocator, violations);
+                    fn_open = false;
+                    fn_open_name = null;
+                }
+            }
+        }
 
         // b11 — unused catch capture (`catch |err| { _ = err;` → `catch {`).
         if (!config.disabled.contains("b11")) {
@@ -719,7 +769,49 @@ fn lintFile(
                 try pushViolation(violations, allocator, "b13", rel_path, idx, "handler serializes raw value '{s}' — respond through a DTO (Extract.toDto/respondDto hides internal columns)", .{payload});
             }
         }
+
+        // b15 — hand-written column-index scan: `row.values[N]` / `fn scan(`.
+        // Prefer typed `row.scan(allocator, Model)` (column-name mapping).
+        if (std.mem.eql(u8, file_name, "persistence.zig") and !config.disabled.contains("b15")) {
+            if (std.mem.indexOf(u8, line, "row.values[") != null or
+                (std.mem.indexOf(u8, line, "fn scan(") != null and std.mem.indexOf(u8, line, "row.scan") == null))
+            {
+                try pushViolation(violations, allocator, "b15", rel_path, idx, "hand-written column-index scan — use typed row.scan(allocator, Model) (column-name mapping, immune to column reorder)", .{});
+            }
+        }
     }
+    try flushMultiWrite(fn_open, fn_open_name, fn_open_line, fn_write_count, fn_tx_seen, rel_path, allocator, violations);
+}
+
+fn flushMultiWrite(
+    fn_open: bool,
+    fn_name: ?[]const u8,
+    fn_line: usize,
+    write_count: usize,
+    tx_seen: bool,
+    rel_path: []const u8,
+    allocator: std.mem.Allocator,
+    violations: *std.ArrayList(Violation),
+) !void {
+    if (fn_open and write_count >= 2 and !tx_seen) {
+        try pushViolation(violations, allocator, "b16", rel_path, fn_line, "service method '{s}' performs {d} writes without a transaction — wrap in self.transact(...) / beginTx", .{ fn_name.?, write_count });
+    }
+}
+
+/// A write-shaped call inside a service method: a persistence write helper or
+/// a CrudService write (create/update/delete). Reads (list/get/query) don't
+/// count — they don't need a transaction.
+fn isWriteCall(line: []const u8) bool {
+    const prefixes = [_][]const u8{ "self.crud.", "self.persistence." };
+    const write_names = [_][]const u8{ "create", "insert", "update", "delete", "upsert", "save", "exec" };
+    for (prefixes) |prefix| {
+        const pos = std.mem.indexOf(u8, line, prefix) orelse continue;
+        const after = line[pos + prefix.len ..];
+        for (write_names) |name| {
+            if (std.mem.startsWith(u8, after, name) and after.len >= name.len and after[name.len] == '(') return true;
+        }
+    }
+    return false;
 }
 
 fn isCrudName(name: []const u8) bool {
@@ -1209,6 +1301,14 @@ test "audit business lint flags anti-patterns" {
     try lintFile(allocator, "api.zig", "try ctx.jsonStruct(200, e);\n", "src/modules/x/api.zig", &cfg, &violations);
     // b13 negative — struct literal envelopes are fine.
     try lintFile(allocator, "api.zig", "try ctx.jsonStruct(200, .{ .code = 0, .data = e });\n", "src/modules/x/api.zig", &cfg, &violations);
+    // b15 — hand-written column-index scan in persistence.zig.
+    try lintFile(allocator, "persistence.zig", "    const raw = row.values[2].?.int;\n", "src/modules/x/persistence.zig", &cfg, &violations);
+    // b15 negative — typed scan by column name is fine.
+    try lintFile(allocator, "persistence.zig", "        while (cursor.next()) |row| try out.append(allocator, try row.scan(allocator, model.X));\n", "src/modules/x/persistence.zig", &cfg, &violations);
+    // b16 — two writes in one service method without a transaction.
+    try lintFile(allocator, "service.zig", "pub fn ship(self: *@This(), org_id: i64, id: i64) !void {\n    try self.crud.update(.{ .id = id }, org_id);\n    try self.persistence.exec(\"UPDATE x SET y = ?\", &.{.{ .int = 1 }});\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b16 negative — transact() marks the method transactional.
+    try lintFile(allocator, "service.zig", "pub fn atomic(self: *@This(), id: i64) !void {\n    return self.transact(void, struct {\n        fn f(tx: *zigmodu.data.sqlx.Transaction) zigmodu.ZigModuError!void {\n            _ = tx;\n            return {};\n        }\n    }.f);\n}\n", "src/modules/x/service.zig", &cfg, &violations);
 
     var rules = std.StringHashMap(usize).init(allocator);
     defer rules.deinit();
@@ -1230,6 +1330,8 @@ test "audit business lint flags anti-patterns" {
     try std.testing.expectEqual(@as(usize, 1), rules.get("b11").?);
     try std.testing.expectEqual(@as(usize, 2), rules.get("b12").?);
     try std.testing.expectEqual(@as(usize, 1), rules.get("b13").?);
+    try std.testing.expectEqual(@as(usize, 1), rules.get("b15").?);
+    try std.testing.expectEqual(@as(usize, 1), rules.get("b16").?);
 }
 
 test "audit rules config disables rules" {

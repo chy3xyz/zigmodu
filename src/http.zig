@@ -61,6 +61,8 @@ pub const permissionMatchesAuthInfo = http_middleware.permissionMatchesAuthInfo;
 pub const JwtFromCatalogConfig = http_middleware.JwtFromCatalogConfig;
 pub const ModuleGateConfig = http_middleware.ModuleGateConfig;
 pub const tracing_middleware = @import("api/middleware/Tracing.zig");
+pub const tracingMiddleware = @import("api/middleware/Tracing.zig").tracing;
+pub const rateLimitMiddleware = @import("api/middleware/Tracing.zig").rateLimit;
 pub const validateRequest = @import("api/middleware/Validation.zig").validateRequest;
 pub const validationMiddleware = @import("api/middleware/Validation.zig").validationMiddleware;
 

@@ -2,7 +2,7 @@
 //! Plugs into `zigmodu.http.Server.addMiddleware(...)`.
 //!
 //! Usage:
-//!   server.addMiddleware(zigmodu.http_middleware.tracing(&tracer));
+//!   server.addMiddleware(zigmodu.http.tracingMiddleware());
 //!   server.addMiddleware(zigmodu.http_middleware.rateLimit(&limiter));
 
 const std = @import("std");

@@ -46,6 +46,8 @@ pub fn main(init: std.process.Init) !void {
     var catalog_slot: zigmodu.http.CatalogSlot = .{};
     defer catalog_slot.deinit();
     try server.addMiddleware(middleware.tenantMiddleware());
+    // 请求级可观测：注入 x-trace-id + 记录耗时（一行启用，全路由生效）。
+    try server.addMiddleware(zigmodu.http.tracingMiddleware());
     try server.addMiddleware(middleware.jwtAuthMiddleware(&app_sec.module, &catalog_slot, &db_client));
     try server.addMiddleware(middleware.moduleGateMiddleware(&catalog_slot));
     try server.addMiddleware(middleware.permissionGateMiddleware(&catalog_slot));

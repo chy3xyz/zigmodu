@@ -130,6 +130,9 @@ pub const OrdersService = struct {
 - `CrudOpts.dto` 让 list/get 响应自动走 DTO 白名单；
 - `CrudOpts.bulk` 增加 `POST {nest}/bulk`（JSON 数组批量创建，一次 RTT）。
 
+可观测：`server.addMiddleware(zigmodu.http.tracingMiddleware())` 一行启用
+`x-trace-id` 注入与请求耗时日志（示例见 `examples/zmsaas/backend/src/main.zig`）。
+
 前端同源产出：同一个 `orders.model.json` 可再跑
 `node zsaas/scripts/gen-business.mjs orders.model.json <frontend>`，生成
 `src/models/Orders.ts`（类型 + 字段 schema）与
@@ -200,7 +203,10 @@ lint 风格的可达性分析）：报告未使用的顶层 `fn`/`const`/`var`�
   方法（list/get/create/update/delete 只转发 `self.persistence.*` → 建议
   `data.CrudService(Entity, Persistence)`，写操作自动发事件）、api 层裸实体
   响应（`ctx.jsonStruct(200, e)` 直接序列化 model → 建议
-  `Extract.toDto/respondDto` 白名单隐藏内部列）。规则可用
+  `Extract.toDto/respondDto` 白名单隐藏内部列）、模块缺测试（应带
+  `tests.zig` 冒烟）、persistence 手写列下标 scan（`row.values[N]` → 应
+  `row.scan(allocator, Model)` 按列名映射）、service 方法多写无事务
+  （2+ 次写应包 `self.transact(...)`）。规则可用
   `.zmodu/rules.json` 按项目开关。
 
 ```bash

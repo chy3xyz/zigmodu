@@ -624,6 +624,9 @@ pub const OrdersApi = zigmodu.http.CrudApi(model.Orders, service.OrdersService, 
   `scan()` 列下标取值——列顺序变化会静默错位；
 - 多写一致性：`svc.transact(T, f)` 事务封装（生成物自带），避免手写
   begin/commit/rollback 遗漏。
+- 可观测一行开：`server.addMiddleware(zigmodu.http.tracingMiddleware())`
+  注入 `x-trace-id` + 请求耗时日志（`rateLimitMiddleware` 同款）；autoCrud
+  路由与自定义路由一并生效，业务代码无需埋点。
 
 适用边界：规则简单的 CRUD 模块直接用；需要复杂业务编排（多表事务、状态机、
 审批流）时保留 service 内手写 Cmd，autoCrud 只覆盖纯增删改查面。
