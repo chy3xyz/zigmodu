@@ -108,13 +108,67 @@ curl -s -X POST 'http://127.0.0.1:18100/api/v1/inventory/decrement?product_id=1&
 curl -s -X POST 'http://127.0.0.1:18100/api/v1/inventory/decrement?product_id=1&qty=80'  # 409 insufficient_stock
 ```
 
-**两级嵌套预加载（`WithEdge("posts.comments")`）**：主查询 + 每级一次 IN
-邻居查询，返回 Author → posts → comments 嵌套 JSON。`comments` 边声明了
-`OrderBy("id").Desc().Limit(2)`——每篇 post 只带**最新 2 条**评论（每父
-`LIMIT` 走窗口函数 `ROW_NUMBER() OVER (PARTITION BY …)`）。
+**两级嵌套预加载 + 边过滤（`WithEdge("posts.comments")` + `WhereRaw`）**：
+主查询 + 每级一次 IN 邻居查询，返回 Author → posts → comments 嵌套
+JSON。`comments` 边声明了 `WhereRaw("\"hidden\" = ?", false)` + 
+`OrderBy("id").Desc().Limit(2)`——每篇 post 只带**最新 2 条可见**评论
+（过滤先于排序/限量，每父 `LIMIT` 走窗口函数 `ROW_NUMBER() OVER
+(PARTITION BY …)`；种子数据里有一条 hidden 的 spam 评论永不加载）。
 
 ```bash
 curl -s http://127.0.0.1:18100/api/v1/feed/authors
+```
+
+## 事务编排 / 分布式 ID / 游标 / 批量软删（v0.23–0.26）
+
+**下单事务编排（`beginTx` 嵌套 savepoint + `afterCommit` 事件收集）**：
+`POST /api/v1/orders` 演示 v0.24 的三件套——外层 `beginTx` 建订单，
+内层 `beginTx`（同一连接自动降级为 `SAVEPOINT`）做原子库存扣减（不足时
+只回滚 savepoint、整单回滚返回 409），`enqueueEvent` 收集事务内事件，
+`afterCommit` 钩子在提交成功后恰好一次 `takePendingEvents` 投递。
+
+```bash
+# 先建商品（订单总额 = 单价 × qty）
+curl -s -X POST 'http://127.0.0.1:18100/api/v1/products?tenant_id=1' \
+  -H 'Content-Type: application/json' -d '{"name":"Widget","price_cents":1999}'
+# 下单：库存 100→97，events_delivered=2（order.created + stock.decremented）
+curl -s -X POST 'http://127.0.0.1:18100/api/v1/orders?product_id=1&qty=3'
+# 库存不足：409，且不产生订单行、库存不变
+curl -s -X POST 'http://127.0.0.1:18100/api/v1/orders?product_id=1&qty=100'
+curl -s 'http://127.0.0.1:18100/api/v1/orders/1'
+```
+
+**分布式 ID + 敏感掩码（uuidv7 + `toMaskedJson`）**：`Account` 用
+`field.UUID("id")` 主键，服务端生成时间有序 uuidv7（跨分片安全）；
+`api_key` 声明 `.Sensitive()`，读接口必须走 `toMaskedJson` 输出 `"***"`，
+直接把 entity 序列化会泄漏密钥。
+
+```bash
+curl -s -X POST 'http://127.0.0.1:18100/api/v1/accounts?name=bob&api_key=sk-bob-9'
+curl -s 'http://127.0.0.1:18100/api/v1/accounts/<返回的uuid>'
+# -> {"id":"…","name":"bob","api_key":"***"}
+```
+
+**复合 keyset 游标（`CursorKeyset`）**：`GET /api/v1/feed/comments` 按
+`(created_at, id)` 游标分页，`WHERE (created_at > ?) OR (created_at = ? AND
+id > ?)`——同一秒写入的评论（种子数据故意制造平局）跨页不丢。`page_size=1`
+翻第二页时，平局的第二条评论仍会返回。
+
+```bash
+curl -s 'http://127.0.0.1:18100/api/v1/feed/comments?page_size=1'
+# page 1 -> nice post (created_at=100, id=1)；next_cursor_ts=100, next_cursor_id=1
+curl -s 'http://127.0.0.1:18100/api/v1/feed/comments?cursor_ts=100&cursor_id=1&page_size=1'
+# page 2 -> thanks (created_at=100, id=2) —— 平局行没被跳过
+```
+
+**批量软删（`BulkDelete` + `IN`）**：`POST /api/v1/feed/bulk-delete` 一次
+UPDATE 把所有 id 的 `deleted_at` 置位（Post 是 soft_delete 实体），随后
+`/feed/trashed` 可见、`/{id}/restore` 可恢复。
+
+```bash
+curl -s -X POST 'http://127.0.0.1:18100/api/v1/feed/bulk-delete' \
+  -H 'Content-Type: application/json' -d '{"ids":[1,2]}'
+curl -s 'http://127.0.0.1:18100/api/v1/feed/trashed'
 ```
 
 **审计 / 校验 / 投影 / 批量 / 软删（v0.25-0.26 能力）**
@@ -157,6 +211,7 @@ src/
   outbox_demo.zig          # outbox 事务入队 + dispatch（HTTP + cron）
   data_scope_demo.zig      # scope 中间件 + DocApi（行级权限）
   features_demo.zig        # 原子库存扣减 + 两级预加载（feed）
+  tx_demo.zig              # 下单事务编排 + uuidv7 账户/敏感掩码
   modules/catalog/
   model.zig              # zent Schema("Tenant"|"Product")
   persistence.zig        # zent Client wrappers

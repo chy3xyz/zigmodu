@@ -1,6 +1,10 @@
-//! Commerce + social demos for the two zent capabilities added in v0.21:
-//! atomic expression updates (`setExprArgs`, oversell-safe stock decrement)
-//! and two-level nested eager loading (`WithEdge("posts.comments")`).
+//! Commerce + social demos for zent v0.21-v0.26:
+//!   - atomic expression updates (`setExprArgs`, oversell-safe stock
+//!     decrement) and two-level nested eager loading (`WithEdge`);
+//!   - edge filtering (`WhereRaw`) + per-parent order/limit;
+//!   - composite keyset pagination (`CursorKeyset`) that survives ties;
+//!   - bulk soft delete (`BulkDelete` + chunk-safe `IN`);
+//!   - column projection (`Select`) and batch insert (`insertMany`).
 
 const std = @import("std");
 const zigmodu = @import("zigmodu");
@@ -87,7 +91,9 @@ pub fn FeedApi(comptime Client: type) type {
 
         pub const routes = [_]http.RouteSpec(State){
             .{ .method = .GET, .path = "authors", .handler = authors, .meta = .{ .auth = .public } },
+            .{ .method = .GET, .path = "comments", .handler = comments, .meta = .{ .auth = .public } },
             .{ .method = .GET, .path = "trashed", .handler = trashed, .meta = .{ .auth = .public } },
+            .{ .method = .POST, .path = "bulk-delete", .handler = bulkDelete, .meta = .{ .auth = .public } },
             .{ .method = .DELETE, .path = "{post_id}", .handler = softDeletePost, .meta = .{ .auth = .public } },
             .{ .method = .POST, .path = "{post_id}/restore", .handler = restorePost, .meta = .{ .auth = .public } },
         };
@@ -102,6 +108,64 @@ pub fn FeedApi(comptime Client: type) type {
                 rows.deinit();
             }
             try ctx.jsonStruct(200, .{ .authors = rows.items });
+        }
+
+        const CommentsCursorQ = struct {
+            cursor_ts: i64 = 0,
+            cursor_id: i64 = 0,
+            page_size: i64 = 2,
+            desc: []const u8 = "",
+        };
+
+        /// Composite keyset pagination (v0.23): `WHERE (created_at > ?) OR
+        /// (created_at = ? AND id > ?) ORDER BY created_at, id` — ties on the
+        /// cursor column (same-second comments) are never dropped between
+        /// pages. The response carries the next cursor to continue.
+        fn comments(ctx: *http.Context, self: *State) !void {
+            const q = http.extractQuery(ctx, CommentsCursorQ) catch |err| return http.respondErr(ctx, err);
+            const desc = std.mem.eql(u8, q.desc, "1") or std.mem.eql(u8, q.desc, "true") or std.mem.eql(u8, q.desc, "desc");
+            const page_size: usize = @intCast(@max(1, @min(50, q.page_size)));
+
+            var qb = self.client.comment.Query();
+            defer qb.deinit();
+            // Only visible comments (mirrors the eager edge filter).
+            _ = try qb.Where(.{self.client.comment.predicates.hiddenEQ(.{ .bool = false })});
+            if (q.cursor_ts != 0 or q.cursor_id != 0) {
+                _ = qb.CursorKeyset("created_at", .{ .int = q.cursor_ts }, q.cursor_id, desc);
+            } else {
+                _ = try qb.OrderBy(&.{ .{ .column = .{ .name = "created_at", .desc = desc } }, .{ .column = .{ .name = "id", .desc = desc } } });
+            }
+            _ = qb.Limit(page_size);
+
+            const rows = try qb.All();
+            defer {
+                for (rows.items) |*c| zent.codegen.deinitEntity(persist.infos, persist.CommentInfo, c, self.client.allocator);
+                rows.deinit();
+            }
+            const CommentEntity = zent.codegen.entity(persist.infos, persist.CommentInfo);
+            const last: ?CommentEntity = if (rows.items.len > 0) rows.items[rows.items.len - 1] else null;
+            try ctx.jsonStruct(200, .{
+                .items = rows.items,
+                .next_cursor_ts = if (last) |l| l.created_at else q.cursor_ts,
+                .next_cursor_id = if (last) |l| l.id else q.cursor_id,
+            });
+        }
+
+        const BulkDeleteBody = struct { ids: []i64 };
+
+        /// Bulk soft delete (v0.26): one UPDATE sets deleted_at for every id
+        /// in the IN list (chunk-safe; Post is a soft_delete entity).
+        fn bulkDelete(ctx: *http.Context, self: *State) !void {
+            const body = ctx.bindJson(BulkDeleteBody) catch return ctx.json(400, "{\"error\":\"invalid body\"}");
+            if (body.ids.len == 0) return ctx.json(400, "{\"error\":\"ids required\"}");
+            const values = try ctx.allocator.alloc(zent.sql.Value, body.ids.len);
+            defer ctx.allocator.free(values);
+            for (body.ids, 0..) |id, i| values[i] = .{ .int = id };
+            var d = try self.client.post.BulkDelete();
+            defer d.deinit();
+            _ = try d.Where(.{zent.sql.In("id", values)});
+            const affected = try d.Exec();
+            try ctx.jsonStruct(200, .{ .soft_deleted = affected });
         }
 
         fn softDeletePost(ctx: *http.Context, self: *State) !void {

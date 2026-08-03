@@ -6,6 +6,7 @@ const zent_crud = @import("zent_crud.zig");
 const outbox_demo = @import("outbox_demo.zig");
 const data_scope_demo = @import("data_scope_demo.zig");
 const features_demo = @import("features_demo.zig");
+const tx_demo = @import("tx_demo.zig");
 
 const catalog_module = @import("modules/catalog/module.zig");
 const catalog = @import("modules/catalog/root.zig");
@@ -93,20 +94,39 @@ pub fn main(init: std.process.Init) !void {
         defer zent.codegen.deinitEntity(catalog.persistence.infos, catalog.persistence.PostInfo, &row, allocator);
         break :id row.id;
     };
-    inline for (.{ .{ post_a, "nice post" }, .{ post_a, "thanks" }, .{ post_b, "cool" } }) |seed| {
+    // Comments carry explicit created_at values so the keyset-cursor demo has
+    // same-second ties, and one hidden "spam" comment so the eager edge
+    // filter (WhereRaw hidden=false) is observable.
+    inline for (.{ .{ post_a, "nice post", 100, false }, .{ post_a, "thanks", 100, false }, .{ post_b, "cool", 200, false } }) |seed| {
         var b = try env.client.comment.Create();
         defer b.deinit();
         _ = try b.setFieldValue("post_id", seed[0]);
         _ = try b.setFieldValue("body", seed[1]);
+        _ = try b.setFieldValue("created_at", @as(i64, seed[2]));
+        _ = try b.setFieldValue("hidden", @as(bool, seed[3]));
         var row = try b.Save();
         zent.codegen.deinitEntity(catalog.persistence.infos, catalog.persistence.CommentInfo, &row, allocator);
     }
-    // Third comment on post_a so the Limit(2) is observable (newest two only).
+    // Third visible comment on post_a so the edge Limit(2) is observable
+    // (newest two visible only)…
     {
         var b = try env.client.comment.Create();
         defer b.deinit();
         _ = try b.setFieldValue("post_id", post_a);
         _ = try b.setFieldValue("body", "third");
+        _ = try b.setFieldValue("created_at", @as(i64, 300));
+        _ = try b.setFieldValue("hidden", @as(bool, false));
+        var row = try b.Save();
+        zent.codegen.deinitEntity(catalog.persistence.infos, catalog.persistence.CommentInfo, &row, allocator);
+    }
+    // …and a hidden "spam" comment that must never be eager-loaded.
+    {
+        var b = try env.client.comment.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("post_id", post_a);
+        _ = try b.setFieldValue("body", "spam");
+        _ = try b.setFieldValue("created_at", @as(i64, 400));
+        _ = try b.setFieldValue("hidden", @as(bool, true));
         var row = try b.Save();
         zent.codegen.deinitEntity(catalog.persistence.infos, catalog.persistence.CommentInfo, &row, allocator);
     }
@@ -118,6 +138,22 @@ pub fn main(init: std.process.Init) !void {
         var row = try b.Save();
         zent.codegen.deinitEntity(catalog.persistence.infos, catalog.persistence.InventoryInfo, &row, allocator);
     }
+    // Distributed-id demo: account with a time-ordered uuidv7 primary key and
+    // a Sensitive api_key (never serialized raw).
+    {
+        var uuid_buf: [36]u8 = undefined;
+        const ts = std.Io.Timestamp.now(init.io, .real);
+        const now_ms: i64 = @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_ms));
+        const id_str = zent.core.id.format(zent.core.id.uuidv7(now_ms), &uuid_buf);
+        var b = try env.client.account.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("id", id_str);
+        _ = try b.setFieldValue("name", "alice-api");
+        _ = try b.setFieldValue("api_key", "sk-live-secret-123");
+        var row = try b.Save();
+        zent.codegen.deinitEntity(catalog.persistence.infos, catalog.persistence.AccountInfo, &row, allocator);
+        std.log.info("[seed] account id={s} (api_key masked on read)", .{id_str});
+    }
 
     const InventoryApiT = features_demo.InventoryApi(@TypeOf(env.client));
     var inventory_api = InventoryApiT.init(&env.client);
@@ -127,6 +163,10 @@ pub fn main(init: std.process.Init) !void {
     var summary_api = SummaryApiT.init(&env.client);
     const BatchApiT = features_demo.BatchApi(@TypeOf(product_crud));
     var batch_api = BatchApiT.init(&product_crud);
+    const OrderApiT = tx_demo.OrderApi(@TypeOf(env.client));
+    var order_api = OrderApiT.init(&env.client);
+    const AccountApiT = tx_demo.AccountApi(@TypeOf(env.client));
+    var account_api = AccountApiT.init(&env.client, io);
 
     // Outbox demo: transactional enqueue + on-demand/cron dispatch.
     var outbox_dispatcher = outbox_demo.Dispatcher{
@@ -205,7 +245,7 @@ pub fn main(init: std.process.Init) !void {
     defer catalog_slot.deinit();
     try server.addMiddleware(zigmodu.http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
 
-    comptime zigmodu.http.assertNoDupes(.{ CatalogApiT, ProductApiT, OutboxApiT, DocApiT, InventoryApiT, FeedApiT, SummaryApiT, BatchApiT });
+    comptime zigmodu.http.assertNoDupes(.{ CatalogApiT, ProductApiT, OutboxApiT, DocApiT, InventoryApiT, FeedApiT, SummaryApiT, BatchApiT, OrderApiT, AccountApiT });
 
     const AppState = struct {};
     var app_state: AppState = .{};
@@ -222,6 +262,8 @@ pub fn main(init: std.process.Init) !void {
         .{ .Mod = FeedApiT, .state = &feed_api },
         .{ .Mod = SummaryApiT, .state = &summary_api },
         .{ .Mod = BatchApiT, .state = &batch_api },
+        .{ .Mod = OrderApiT, .state = &order_api },
+        .{ .Mod = AccountApiT, .state = &account_api },
     });
     var docs_scope = try api_v1.use(.{ .func = data_scope_demo.scopeMiddleware });
     try docs_scope.mount(DocApiT, &doc_api);
@@ -257,6 +299,12 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("[main] GET  /api/v1/docs?user_id=&tenant_id=&scope=self_|dept_only|dept_custom&dept_ids=", .{});
     std.log.info("[main] POST /api/v1/inventory/decrement?product_id=1&qty= (atomic stock, oversell-safe)", .{});
     std.log.info("[main] GET  /api/v1/feed/authors (two-level WithEdge posts.comments)", .{});
+    std.log.info("[main] GET  /api/v1/feed/comments?cursor_ts=&cursor_id=&page_size=&desc= (composite keyset)", .{});
+    std.log.info("[main] POST /api/v1/feed/bulk-delete (body {{\"ids\":[...]}}) (bulk soft delete)", .{});
+    std.log.info("[main] POST /api/v1/orders?product_id=1&qty= (tx: order + savepoint stock + afterCommit events)", .{});
+    std.log.info("[main] GET  /api/v1/orders/<id>", .{});
+    std.log.info("[main] POST /api/v1/accounts?name=&api_key= (uuidv7 id)", .{});
+    std.log.info("[main] GET  /api/v1/accounts/<uuid> (toMaskedJson)", .{});
     std.log.info("[main] GET  /api/v1/events (SSE)", .{});
     std.log.info("[main] OpenAPI: http://127.0.0.1:{d}/openapi.json", .{port});
     try server.start();

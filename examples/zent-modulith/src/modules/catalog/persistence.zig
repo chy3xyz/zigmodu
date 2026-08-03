@@ -12,6 +12,8 @@ const graph = zent.codegen.graph.buildGraph(&.{
     model.Post,
     model.Comment,
     model.Inventory,
+    model.Order,
+    model.Account,
 });
 pub const infos = graph.types;
 pub const Client = zent.codegen.client.Client(infos);
@@ -22,6 +24,8 @@ pub const AuthorInfo = infos[4];
 pub const PostInfo = infos[5];
 pub const CommentInfo = infos[6];
 pub const InventoryInfo = infos[7];
+pub const OrderInfo = infos[8];
+pub const AccountInfo = infos[9];
 
 pub const CatalogStore = struct {
     allocator: std.mem.Allocator,

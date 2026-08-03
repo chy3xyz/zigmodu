@@ -43,6 +43,11 @@ pub const Comment = Schema("Comment", .{
     .fields = &.{
         field.Int("post_id"),
         field.String("body"),
+        // Edge-filter demo (v0.23): hidden comments are never eager-loaded.
+        field.Bool("hidden"),
+        // v0.22 audit timestamps: dialect-aware epoch DEFAULT; explicit
+        // values are honored (used by the keyset-cursor demo below).
+        field.Time("created_at"),
     },
 });
 
@@ -51,8 +56,15 @@ pub const Post = Schema("Post", .{
         field.Int("author_id"),
         field.String("title"),
     },
-    // Per-parent eager load: newest 2 comments per post (edge order/limit).
-    .edges = &.{edge.To("comments", Comment).Field("post_id").OrderBy("id").Desc().Limit(2)},
+    // Per-parent eager load: newest 2 *visible* comments per post — the
+    // WhereRaw filter (v0.23) applies before order/limit, so limits rank
+    // filtered rows only.
+    .edges = &.{edge.To("comments", Comment)
+        .Field("post_id")
+        .WhereRaw("\"hidden\" = ?", &.{.{ .bool = false }})
+        .OrderBy("id")
+        .Desc()
+        .Limit(2)},
     // Soft delete + restore demo (v0.26).
     .mixins = &.{zent.core.mixin.SoftDeleteMixin},
     .soft_delete = true,
@@ -70,5 +82,30 @@ pub const Inventory = Schema("Inventory", .{
         field.Int("product_id"),
         field.Int("stock"),
         field.Version("version"),
+    },
+});
+
+/// Transaction-orchestration demo (v0.24): order placement runs an outer
+/// transaction, an inner savepoint (re-entrant beginTx) for the stock
+/// decrement, and collects events delivered after commit.
+pub const Order = Schema("Order", .{
+    .fields = &.{
+        field.Int("tenant_id"),
+        field.Int("product_id"),
+        field.Int("qty"),
+        field.Int("total_cents"),
+        field.String("status"),
+        field.Time("created_at"),
+    },
+});
+
+/// Distributed-id + sensitive-masking demo (v0.24): uuid primary key
+/// (time-ordered uuidv7) and a Sensitive api_key that must never be
+/// serialized raw — APIs use `toMaskedJson`.
+pub const Account = Schema("Account", .{
+    .fields = &.{
+        field.UUID("id"),
+        field.String("name"),
+        field.String("api_key").Sensitive(),
     },
 });
