@@ -1,0 +1,141 @@
+import { Title } from '@solidjs/meta';
+import { createEffect, createSignal, Show } from 'solid-js';
+import { DataTable, type ColumnDef } from '@/components/data/DataTable';
+import { EntityForm } from '@/components/data/EntityForm';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { createApiClient, login, type ApiClient } from '@/libs/apiClient';
+import { orderFields, type Order } from '@/models/Orders';
+
+const API_URL = import.meta.env.VITE_API_URL ?? 'http://127.0.0.1:18080/api/v1';
+
+const statusTone: Record<string, string> = {
+  pending: 'bg-yellow-100 text-yellow-800',
+  paid: 'bg-green-100 text-green-800',
+  cancelled: 'bg-red-100 text-red-800',
+};
+
+const columns: ColumnDef<Order>[] = [
+  { key: 'id', header: 'ID' },
+  { key: 'customer', header: 'Customer' },
+  { key: 'amount', header: 'Amount', render: (o) => `¥${(o.amount / 100).toFixed(2)}` },
+  {
+    key: 'status',
+    header: 'Status',
+    render: (o) => <Badge class={statusTone[o.status]}>{o.status}</Badge>,
+  },
+  { key: 'notes', header: 'Notes' },
+  { key: 'updated_at', header: 'Updated', render: (o) => new Date(o.updated_at * 1000).toLocaleString() },
+];
+
+export default function OrdersPage() {
+  const [client, setClient] = createSignal<ApiClient | null>(null);
+  const [rows, setRows] = createSignal<Order[]>([]);
+  const [total, setTotal] = createSignal(0);
+  const [page, setPage] = createSignal(1);
+  const [loading, setLoading] = createSignal(true);
+  const [formError, setFormError] = createSignal<string | null>(null);
+  const [editing, setEditing] = createSignal<Order | null>(null);
+  const [showCreate, setShowCreate] = createSignal(false);
+
+  async function refresh(c: ApiClient) {
+    setLoading(true);
+    try {
+      const result = await c.list<Order>('orders', { page: page(), page_size: 20 });
+      setRows(result.items);
+      setTotal(result.total);
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : 'Failed to load orders');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function init() {
+    try {
+      const token = await login(API_URL);
+      const c = createApiClient(API_URL, () => token);
+      setClient(c);
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : 'Backend unavailable');
+    }
+  }
+
+  // Boot: login once, then refresh on every client/page change (page() is
+  // read synchronously inside refresh, so Solid tracks it for re-fetch).
+  createEffect(() => {
+    if (!client()) {
+      void init();
+      return;
+    }
+    void refresh(client()!);
+  });
+
+  async function submitForm(raw: Record<string, string>) {
+    const c = client();
+    if (!c) return;
+    const body = {
+      customer: raw.customer,
+      amount: Number(raw.amount),
+      status: raw.status,
+      notes: raw.notes ?? '',
+    };
+    if (editing()) {
+      await c.update('orders', editing()!.id, body);
+    } else {
+      await c.create('orders', body);
+    }
+    setEditing(null);
+    setShowCreate(false);
+    await refresh(c);
+  }
+
+  async function remove(row: Order) {
+    const c = client();
+    if (!c) return;
+    if (!window.confirm(`Delete order #${row.id}?`)) return;
+    await c.remove('orders', row.id);
+    await refresh(c);
+  }
+
+  return (
+    <>
+      <Title>Orders</Title>
+      <div class="mb-6 flex items-center justify-between">
+        <div>
+          <h1 class="text-2xl font-semibold">Orders</h1>
+          <p class="text-sm text-muted-foreground">zigmodu autoCrud + DataTable / EntityForm</p>
+        </div>
+        <Button onClick={() => { setShowCreate(true); setEditing(null); }}>New Order</Button>
+      </div>
+      <Show when={formError()}>
+        <p class="mb-4 rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">{formError()}</p>
+      </Show>
+      <Show when={showCreate() || editing()}>
+        <div class="mb-6 rounded-lg border bg-card p-5">
+          <h2 class="mb-4 text-lg font-semibold">{editing() ? `Edit Order #${editing()!.id}` : 'New Order'}</h2>
+          <EntityForm
+            fields={orderFields}
+            initial={editing() ?? undefined}
+            submitLabel={editing() ? 'Save' : 'Create'}
+            onSubmit={submitForm}
+            onCancel={() => { setShowCreate(false); setEditing(null); }}
+          />
+        </div>
+      </Show>
+      <DataTable
+        columns={columns}
+        rows={rows()}
+        total={total()}
+        page={page()}
+        pageSize={20}
+        loading={loading()}
+        rowKey={(o) => o.id}
+        onEdit={setEditing}
+        onDelete={remove}
+        emptyText="No orders yet"
+        onPageChange={(p) => setPage(p)}
+      />
+    </>
+  );
+}

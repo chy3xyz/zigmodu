@@ -173,7 +173,11 @@ lint 风格的可达性分析）：报告未使用的顶层 `fn`/`const`/`var`�
   （`zigmodu.http_server` / `orm.Orm` / `PasswordEncoder`）、已移除的 Zig
   0.17 API（`std.Thread.Mutex` 等）、跨模块直接文件导入、handler 手工解析
   Authorization/Bearer、空 `catch {}` 吞错、未使用 catch 捕获
-  （`catch |err| { _ = err; }` → 应写 `catch {`）。规则可用
+  （`catch |err| { _ = err; }` → 应写 `catch {`）、service 层纯透传 CRUD
+  方法（list/get/create/update/delete 只转发 `self.persistence.*` → 建议
+  `data.CrudService(Entity, Persistence)`，写操作自动发事件）、api 层裸实体
+  响应（`ctx.jsonStruct(200, e)` 直接序列化 model → 建议
+  `Extract.toDto/respondDto` 白名单隐藏内部列）。规则可用
   `.zmodu/rules.json` 按项目开关。
 
 ```bash

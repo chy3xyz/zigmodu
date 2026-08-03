@@ -22,7 +22,10 @@ pub const usage =
     \\                dependency limit, unknown/base-module dependencies
     \\  business      handler/model SQL, non-parameterized SQL, @ptrCast
     \\                user_data, sendSuccess/sendFail, banned/removed APIs,
-    \\                cross-module file imports
+    \\                cross-module file imports, manual Bearer, swallowed
+    \\                errors, unused catch capture, service CRUD passthrough
+    \\                (use data.CrudService), bare raw-entity responses
+    \\                (use DTO whitelists)
     \\
     \\Options:
     \\  -j, --json              machine-readable JSON output
@@ -581,6 +584,9 @@ fn lintFile(
     // Track an unused `catch |X|` capture to report `_ = X;` a few lines later.
     var pending_catch: ?[]const u8 = null;
     var pending_line: usize = 0;
+    // Track a CRUD-named service fn to catch a pure passthrough body (b12).
+    var pending_fn: ?[]const u8 = null;
+    var pending_fn_line: usize = 0;
     while (lines.next()) |line| : (idx += 1) {
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0 or std.mem.startsWith(u8, trimmed, "//")) continue;
@@ -678,7 +684,111 @@ fn lintFile(
         if (isEmptyCatch(line) and !config.disabled.contains("b10")) {
             try pushViolation(violations, allocator, "b10", rel_path, idx, "empty catch block swallows errors — log and propagate (ZigModuError)", .{});
         }
+
+        // b12 — pure CRUD passthrough in service.zig: a list/get/create/
+        // update/delete method whose whole body forwards to
+        // `self.persistence.<sameName>(...)`. Prefer
+        // `data.CrudService(Entity, Persistence)` (writes auto-publish
+        // CrudEvent) or keep the service only when it adds real logic.
+        if (std.mem.eql(u8, file_name, "service.zig") and !config.disabled.contains("b12")) {
+            if (pubFnName(trimmed)) |fn_name| {
+                pending_fn = null;
+                const crudish = isCrudName(fn_name);
+                if (crudish) {
+                    if (isSameLinePassthrough(trimmed, fn_name)) {
+                        try pushViolation(violations, allocator, "b12", rel_path, idx, "pure passthrough service method '{s}' — consider data.CrudService(Entity, Persistence) (writes auto-publish CrudEvent)", .{fn_name});
+                    } else {
+                        pending_fn = fn_name;
+                        pending_fn_line = idx;
+                    }
+                }
+            } else if (pending_fn) |fn_name| {
+                if (idx - pending_fn_line <= 1 and isPurePassthrough(trimmed, fn_name)) {
+                    try pushViolation(violations, allocator, "b12", rel_path, pending_fn_line, "pure passthrough service method '{s}' — consider data.CrudService(Entity, Persistence) (writes auto-publish CrudEvent)", .{fn_name});
+                }
+                pending_fn = null;
+            }
+        }
+
+        // b13 — bare entity response in api.zig: handler serializes a raw
+        // model value straight through jsonStruct instead of a DTO
+        // whitelist. Route responses through Extract.toDto/respondDto to
+        // hide internal columns (secret/org_id/…).
+        if (std.mem.eql(u8, file_name, "api.zig") and !config.disabled.contains("b13")) {
+            if (bareJsonStructArg(trimmed)) |payload| {
+                try pushViolation(violations, allocator, "b13", rel_path, idx, "handler serializes raw value '{s}' — respond through a DTO (Extract.toDto/respondDto hides internal columns)", .{payload});
+            }
+        }
     }
+}
+
+fn isCrudName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "list") or
+        std.mem.eql(u8, name, "get") or
+        std.mem.eql(u8, name, "create") or
+        std.mem.eql(u8, name, "update") or
+        std.mem.eql(u8, name, "delete");
+}
+
+/// Extract the declared function name from `pub fn NAME(`.
+fn pubFnName(line: []const u8) ?[]const u8 {
+    const p = std.mem.indexOf(u8, line, "pub fn ") orelse return null;
+    const rest = std.mem.trim(u8, line[p + "pub fn ".len ..], " \t");
+    const paren = std.mem.indexOfScalar(u8, rest, '(') orelse return null;
+    const name = rest[0..paren];
+    if (!isIdent(name)) return null;
+    return name;
+}
+
+fn isIdent(s: []const u8) bool {
+    if (s.len == 0) return false;
+    if (!std.ascii.isAlphabetic(s[0]) and s[0] != '_') return false;
+    for (s[1..]) |c| if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
+    return true;
+}
+
+/// True when `line` is a single statement forwarding to
+/// `self.persistence.<fn_name>(` (with `return` or `try` in the prefix).
+fn isPurePassthrough(line: []const u8, fn_name: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    if (trimmed.len == 0 or std.mem.startsWith(u8, trimmed, "//")) return false;
+    const needle = "self.persistence.";
+    const pos = std.mem.indexOf(u8, trimmed, needle) orelse return false;
+    if (!std.mem.endsWith(u8, trimmed, ";")) return false;
+    const after = trimmed[pos + needle.len ..];
+    if (!std.mem.startsWith(u8, after, fn_name)) return false;
+    if (after.len < fn_name.len or after[fn_name.len] != '(') return false;
+    const before = trimmed[0..pos];
+    return std.mem.indexOf(u8, before, "return") != null or std.mem.indexOf(u8, before, "try") != null;
+}
+
+/// Same-line variant: `pub fn list(...) !T { return self.persistence.list(...); }`.
+fn isSameLinePassthrough(line: []const u8, fn_name: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    if (std.mem.indexOfScalar(u8, trimmed, '{') == null) return false;
+    if (!std.mem.endsWith(u8, trimmed, "}")) return false;
+    const body = std.mem.trimEnd(u8, trimmed[0 .. trimmed.len - 1], " \t");
+    return isPurePassthrough(body, fn_name);
+}
+
+/// When a `ctx.jsonStruct(` call's payload is a bare identifier (not a struct
+/// literal / field access / call), return that identifier for rule b13.
+fn bareJsonStructArg(line: []const u8) ?[]const u8 {
+    const p = std.mem.indexOf(u8, line, "ctx.jsonStruct(") orelse return null;
+    const rest = line[p + "ctx.jsonStruct(".len ..];
+    const comma = std.mem.indexOfScalar(u8, rest, ',') orelse return null;
+    var payload = std.mem.trim(u8, rest[comma + 1 ..], " \t");
+    // Strip the statement terminator / closing paren: `ctx.jsonStruct(200, e);`
+    while (payload.len > 0 and (payload[payload.len - 1] == ')' or payload[payload.len - 1] == ';')) {
+        payload = payload[0 .. payload.len - 1];
+    }
+    if (payload.len == 0) return null;
+    if (payload[0] == '{' or payload[0] == '.' or payload[0] == '&' or
+        payload[0] == '"' or payload[0] == '[' or payload[0] == '@') return null;
+    for (payload) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_') return null;
+    }
+    return payload;
 }
 
 fn isEmptyCatch(line: []const u8) bool {
@@ -688,8 +798,10 @@ fn isEmptyCatch(line: []const u8) bool {
     const after = std.mem.trim(u8, trimmed[c + 5 ..], " \t");
     // catch |err| {} / catch |_| {} / catch |e| { } (empty body)
     if (after.len >= 2 and after[0] == '|') {
-        const bar = std.mem.indexOf(u8, after, "|") orelse return false;
-        const body = std.mem.trim(u8, after[bar + 1 ..], " \t");
+        const close = std.mem.indexOfScalarPos(u8, after, 1, '|') orelse return false;
+        var body = std.mem.trim(u8, after[close + 1 ..], " \t");
+        if (std.mem.endsWith(u8, body, ";")) body = body[0 .. body.len - 1];
+        body = std.mem.trimEnd(u8, body, " \t");
         return body.len == 2 and body[0] == '{' and body[1] == '}';
     }
     return false;
@@ -1024,7 +1136,7 @@ test "audit name validation" {
 
 test "audit architecture rules flag self/unknown/missing-description" {
     const allocator = std.testing.allocator;
-    const modules = [_]ModuleRec{
+    var modules = [_]ModuleRec{
         .{
             .name = try allocator.dupe(u8, "alpha"),
             .description = try allocator.dupe(u8, ""),
@@ -1045,7 +1157,7 @@ test "audit architecture rules flag self/unknown/missing-description" {
             .info_line = 3,
         },
     };
-    defer for (modules) |*m| m.deinit(allocator);
+    defer for (&modules) |*m| m.deinit(allocator);
 
     var violations = std.ArrayList(Violation).empty;
     defer {
@@ -1076,7 +1188,7 @@ test "audit business lint flags anti-patterns" {
     }
 
     try lintFile(allocator, "api.zig", "const r = try client.queryRows(T, sql, args);\n", "src/modules/x/api.zig", &cfg, &violations);
-    try lintFile(allocator, "model.zig", "const sql = \"SELECT * FROM t\";\n", "src/modules/x/model.zig", &cfg, &violations);
+    try lintFile(allocator, "model.zig", "const r = try client.queryRows(T, sql, args);\n", "src/modules/x/model.zig", &cfg, &violations);
     try lintFile(allocator, "persistence.zig", "SELECT * FROM users WHERE name = 'alice'\n", "src/modules/x/persistence.zig", &cfg, &violations);
     try lintFile(allocator, "service.zig", "const auth = @ptrCast(@alignCast(ctx.user_data));\n", "src/modules/x/service.zig", &cfg, &violations);
     try lintFile(allocator, "api.zig", "try sendFail(ctx, 500, \"x\");\n", "src/modules/x/api.zig", &cfg, &violations);
@@ -1087,6 +1199,16 @@ test "audit business lint flags anti-patterns" {
     try lintFile(allocator, "service.zig", "client.exec(sql, &.{}) catch {};\n", "src/modules/x/service.zig", &cfg, &violations);
     try lintFile(allocator, "service.zig", "client.exec(sql, &.{}) catch |err| {};\n", "src/modules/x/service.zig", &cfg, &violations);
     try lintFile(allocator, "service.zig", "x() catch |err| {\n  _ = err;\n  return;\n};\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b12 — pure CRUD passthrough service method (next-line body).
+    try lintFile(allocator, "service.zig", "pub fn list(self: *@This(), allocator: std.mem.Allocator, org_id: i64, page: usize, size: usize) !std.ArrayList(T) {\n    return self.persistence.list(allocator, org_id, page, size);\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b12 — same-line body passthrough.
+    try lintFile(allocator, "service.zig", "pub fn get(self: *@This(), a: std.mem.Allocator, o: i64, id: i64) !?T { return self.persistence.get(a, o, id); }\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b12 negative — validate adds logic, so this is not a pure passthrough.
+    try lintFile(allocator, "service.zig", "pub fn create(self: *@This(), e: T) !i64 {\n    try self.validate(e);\n    return self.persistence.create(e);\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b13 — bare entity response in api.zig.
+    try lintFile(allocator, "api.zig", "try ctx.jsonStruct(200, e);\n", "src/modules/x/api.zig", &cfg, &violations);
+    // b13 negative — struct literal envelopes are fine.
+    try lintFile(allocator, "api.zig", "try ctx.jsonStruct(200, .{ .code = 0, .data = e });\n", "src/modules/x/api.zig", &cfg, &violations);
 
     var rules = std.StringHashMap(usize).init(allocator);
     defer rules.deinit();
@@ -1106,6 +1228,8 @@ test "audit business lint flags anti-patterns" {
     try std.testing.expectEqual(@as(usize, 1), rules.get("b9").?);
     try std.testing.expectEqual(@as(usize, 2), rules.get("b10").?);
     try std.testing.expectEqual(@as(usize, 1), rules.get("b11").?);
+    try std.testing.expectEqual(@as(usize, 2), rules.get("b12").?);
+    try std.testing.expectEqual(@as(usize, 1), rules.get("b13").?);
 }
 
 test "audit rules config disables rules" {

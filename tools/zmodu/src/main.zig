@@ -714,9 +714,10 @@ fn cmdMarket(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8)
     if (code != 0) std.process.exit(code);
 }
 
-test "cli submodule coverage gates (saas + market)" {
+test "cli submodule coverage gates (saas + market + audit)" {
     _ = @import("saas.zig");
     _ = @import("market.zig");
+    _ = @import("audit.zig");
 }
 
 fn cmdVerify(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
