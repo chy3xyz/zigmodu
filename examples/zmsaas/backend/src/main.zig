@@ -92,7 +92,7 @@ pub fn main(init: std.process.Init) !void {
     var actions_api = orders_mod.api.OrdersActionsApi.init(&svc);
     var ops_api = ops.OpsApi.init(&db_client);
     const shard_dir = init.environ_map.get("ZFSAAS_SHARD_DIR") orelse "/tmp";
-    var shard_api = try shard.ShardApi.init(allocator, io, shard_dir);
+    var shard_api = try shard.ShardApi.init(allocator, io, shard_dir, &db_client);
     var auth_api = auth_mod.AuthApi{};
 
     // CRUD 即事件源：写操作（含自定义 cancel 走的 crud.update）自动 publish，

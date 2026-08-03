@@ -100,11 +100,16 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/orders
   `buildWhere("region","owner_id")` 的 `.self_` 作用域：只见本人行）。
   实测 admin 见全部、user(42) 只见 owner_id=42，跨分片一致。
   角色→作用域解析已下沉到统一 `dataPermissionMiddleware`（写 `data_scope`
-  attr），handler 只消费，不再各自推导。
+  attr）；SQL 注入用框架 `DataPermissionInterceptor`（镜像 TenantInterceptor，
+  由 `DataPermissionContext` 产出 scope 子句），handler 不再手写过滤条件。
 - **分片负载/再平衡**：`GET /shard/load` 显示每分片行数；
   `POST /shard/rebalance?org_id=N` 在「目标分片 + 本租户行数 < 当前分片行数」
   时把租户连同数据迁到更轻分片并更新路由（稳定规则，避免振荡）。
   实测：22/14 → org1 迁移 4 行 → 18/18 均衡；再次调用保持不变。
+  幂等：`key` 参数 + `rebalance_events` 表（V4 迁移）——同 key 重放直接返回
+  存储结果（实测 `idempotent:true` 不重跑）；行级用
+  `(org_id, source_id)` 唯一索引 + `INSERT OR IGNORE`，部分失败重试不重复
+  （实测迁移后无重复行）。
 - 生产：分片为 PG/MySQL 时直接用 `ShardRouter.buildSqlxConfig(pool)` 建连接；
   数据权限可下沉到 TenantInterceptor/中间件统一注入。
 

@@ -10,6 +10,7 @@ pub fn apply(client: *data.Client, allocator: std.mem.Allocator) !void {
     try runner.addMigration(1, "orders", @embedFile("migrations/V1__orders.sql"));
     try runner.addMigration(2, "order_events", @embedFile("migrations/V2__order_events.sql"));
     try runner.addMigration(3, "event_outbox", @embedFile("migrations/V3__event_outbox.sql"));
+    try runner.addMigration(4, "rebalance_events", @embedFile("migrations/V4__rebalance_events.sql"));
     try runner.run(client);
 
     // Seed one org so login has data to list.
