@@ -26,7 +26,7 @@ pub fn main(init: std.process.Init) !void {
     });
     defer db_client.deinit();
     try db_client.connect();
-    try schema.apply(&db_client);
+    try schema.apply(&db_client, allocator);
     try schema.grants(&db_client);
     std.log.info("[zmsaas] sqlite ready at {s}", .{sqlite_path});
 
@@ -48,6 +48,21 @@ pub fn main(init: std.process.Init) !void {
     try server.addMiddleware(middleware.tenantMiddleware());
     // 请求级可观测：注入 x-trace-id + 记录耗时（一行启用，全路由生效）。
     try server.addMiddleware(zigmodu.http.tracingMiddleware());
+    // 请求计数（Prometheus 格式，GET /metrics 暴露）。
+    var metrics = zigmodu.observability.PrometheusMetrics.init(allocator);
+    defer metrics.deinit();
+    const req_counter = try metrics.createCounter("http_requests_total", "Total HTTP requests");
+    try server.addMiddleware(.{
+        .func = struct {
+            fn mw(ctx: *zigmodu.http.Context, next: zigmodu.http.HandlerFn, user_data: ?*anyopaque) anyerror!void {
+                const c: *zigmodu.observability.PrometheusMetrics.Counter = @ptrCast(@alignCast(user_data orelse return error.NoMetrics));
+                c.inc();
+                try next(ctx);
+            }
+        }.mw,
+        .user_data = @ptrCast(@constCast(req_counter)),
+    });
+    try metrics.registerMetricsRoute(&server);
     try server.addMiddleware(middleware.jwtAuthMiddleware(&app_sec.module, &catalog_slot, &db_client));
     try server.addMiddleware(middleware.moduleGateMiddleware(&catalog_slot));
     try server.addMiddleware(middleware.permissionGateMiddleware(&catalog_slot));
@@ -95,6 +110,31 @@ pub fn main(init: std.process.Init) !void {
         }.handle,
     });
 
+    // Readiness：/health/ready 汇总注册的健康检查（含 DB 连通性）。
+    var health = zigmodu.HealthEndpoint.init(allocator);
+    defer health.deinit();
+    try health.registerCheckWithContext("db", "sqlite connectivity", dbCheck, &db_client);
+    try server.addRoute(.{
+        .method = .GET,
+        .path = "health/ready",
+        .handler = struct {
+            fn handle(ctx: *zigmodu.http.Context) !void {
+                const h: *zigmodu.HealthEndpoint = @ptrCast(@alignCast(ctx.user_data orelse return error.NoHealth));
+                const body = try h.toJson(ctx.allocator);
+                defer ctx.allocator.free(body);
+                try ctx.setHeader("Content-Type", "application/json");
+                try ctx.text(200, body);
+            }
+        }.handle,
+        .user_data = &health,
+    });
+
     std.log.info("[zmsaas] http://0.0.0.0:{d}/api/v1/orders (JWT required)", .{port});
     try server.start();
+}
+
+fn dbCheck(user_data: ?*anyopaque) zigmodu.HealthEndpoint.HealthStatus {
+    const client: *zigmodu.data.Client = @ptrCast(@alignCast(user_data orelse return .DOWN));
+    _ = client.queryRow(struct { one: i64 }, "SELECT 1 AS one", &.{}) catch return .DOWN;
+    return .UP;
 }

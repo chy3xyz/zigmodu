@@ -41,7 +41,7 @@ pub const OrdersActionsApi = struct {
         const org_str = ctx.getAttr("tenant_id") orelse return error.Unauthorized;
         const org_id = std.fmt.parseInt(i64, org_str, 10) catch return error.Unauthorized;
         const id = try ctx.paramInt(i64, "id");
-        self.service.fulfill(org_id, id) catch |err| return zigmodu.http.respondErr(ctx, err);
+        self.service.fulfill(ctx.allocator, org_id, id) catch |err| return zigmodu.http.respondErr(ctx, err);
         try ctx.jsonStruct(200, .{ .code = 0, .status = "paid" });
     }
 };

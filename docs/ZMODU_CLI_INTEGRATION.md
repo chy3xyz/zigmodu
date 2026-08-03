@@ -139,6 +139,11 @@ pub const OrdersService = struct {
 可观测：`server.addMiddleware(zigmodu.http.tracingMiddleware())` 一行启用
 `x-trace-id` 注入与请求耗时日志（示例见 `examples/zmsaas/backend/src/main.zig`）。
 
+运维标配（见 `examples/zmsaas`）：版本化迁移走
+`data.MigrationRunner`（history 落库、重启幂等）、`/health/ready` 健康检查、
+`/metrics` Prometheus 指标、事务性 outbox 写入（`OutboxPublisher.buildInsert`
+ 在业务事务内调用，投递侧接 `OutboxPoller/OutboxConsumer`）。
+
 自定义代码重放：`zmodu saas` 重新生成会覆盖 model/persistence/service/api/
 module/root 五个文件；`examples/zmsaas/scripts/reapply-custom.py` 一键恢复示例
 的自定义层（DTO/actions/transact 方法），工作流 = 重新生成 → reapply → 构建。

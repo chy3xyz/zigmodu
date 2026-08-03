@@ -1,30 +1,16 @@
-//! zmsaas — database schema (orders business module + RBAC grants)
+//! zmsaas — versioned schema (MigrationRunner) + RBAC grants.
+//! DDL 走框架 MigrationRunner（history 表 + checksum），不再手写 apply 循环。
 const std = @import("std");
 const zigmodu = @import("zigmodu");
 const data = zigmodu.data;
 
-pub fn apply(client: *data.Client) !void {
-    const ddl = [_][]const u8{
-        \\CREATE TABLE IF NOT EXISTS orders (
-        \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
-        \\  org_id INTEGER NOT NULL,
-        \\  customer TEXT NOT NULL,
-        \\  amount INTEGER,
-        \\  status TEXT,
-        \\  notes TEXT,
-        \\  created_at INTEGER NOT NULL,
-        \\  updated_at INTEGER NOT NULL
-        \\)
-        ,
-        \\CREATE TABLE IF NOT EXISTS order_events (
-        \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
-        \\  order_id INTEGER NOT NULL,
-        \\  action TEXT NOT NULL,
-        \\  created_at INTEGER NOT NULL
-        \\)
-        ,
-    };
-    for (ddl) |sql| _ = try client.exec(sql, &.{});
+pub fn apply(client: *data.Client, allocator: std.mem.Allocator) !void {
+    var runner = data.MigrationRunner.init(allocator);
+    defer runner.deinit();
+    try runner.addMigration(1, "orders", @embedFile("migrations/V1__orders.sql"));
+    try runner.addMigration(2, "order_events", @embedFile("migrations/V2__order_events.sql"));
+    try runner.addMigration(3, "event_outbox", @embedFile("migrations/V3__event_outbox.sql"));
+    try runner.run(client);
 
     // Seed one org so login has data to list.
     _ = try client.exec(

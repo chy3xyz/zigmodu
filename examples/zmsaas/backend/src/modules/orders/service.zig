@@ -38,11 +38,13 @@ pub const OrdersService = struct {
     /// 真实的多写事务演示：CAS 状态更新（pending→paid）+ 审计插入，同一事务
     /// 内完成，任一失败整体回滚。回调携带运行时上下文（transactWith）。
     /// 状态不符（非 pending）→ Conflict(409)，不写审计行。
-    pub const FulfillCtx = struct { org_id: i64, id: i64, now: i64 };
+    pub const FulfillCtx = struct { allocator: std.mem.Allocator, org_id: i64, id: i64, now: i64, payload: []const u8 };
 
-    pub fn fulfill(self: *@This(), org_id: i64, id: i64) !void {
+    pub fn fulfill(self: *@This(), allocator: std.mem.Allocator, org_id: i64, id: i64) !void {
         const now = zigmodu.Time.monotonicNowSeconds();
-        const ok = try self.transactWith(bool, FulfillCtx, FulfillCtx{ .org_id = org_id, .id = id, .now = now }, struct {
+        const payload = try std.fmt.allocPrint(allocator, "{{\"order_id\":{d},\"action\":\"fulfilled\"}}", .{id});
+        defer allocator.free(payload);
+        const ok = try self.transactWith(bool, FulfillCtx, FulfillCtx{ .allocator = allocator, .org_id = org_id, .id = id, .now = now, .payload = payload }, struct {
             fn f(tx: *zigmodu.data.sqlx.Transaction, c: FulfillCtx) zigmodu.ZigModuError!bool {
                 const res = try tx.exec("UPDATE orders SET status = ?, updated_at = ? WHERE id = ? AND org_id = ? AND status = ?", &.{
                     .{ .string = "paid" },
@@ -56,6 +58,16 @@ pub const OrdersService = struct {
                     .{ .int = c.id },
                     .{ .string = "fulfilled" },
                     .{ .int = c.now },
+                });
+                // 事务性 outbox：与业务写同一事务提交，投递至少一次。
+                var publisher = zigmodu.outbox.OutboxPublisher.init(c.allocator, .{});
+                const insert = try publisher.buildInsert("order.fulfilled", c.payload);
+                _ = try tx.exec(insert.sql, &.{
+                    .{ .string = insert.params.topic },
+                    .{ .string = insert.params.payload },
+                    .{ .int = @intCast(insert.params.max_retries) },
+                    .{ .int = insert.params.created_at },
+                    .{ .int = insert.params.updated_at },
                 });
                 return true;
             }

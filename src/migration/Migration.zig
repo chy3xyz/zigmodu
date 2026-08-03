@@ -208,6 +208,9 @@ pub const MigrationRunner = struct {
         const ddl = self.generateHistoryTableDDL() catch return error.OutOfMemory;
         defer self.allocator.free(ddl);
         _ = client.exec(ddl, &.{}) catch return error.QueryExecutionFailed;
+        // Load previously applied migrations from the DB — a fresh runner must
+        // not re-run them (history is persisted, not just in-memory).
+        try self.loadHistory(client);
 
         for (self.migrations.items) |migration| {
             // Skip already-applied migrations
@@ -241,11 +244,50 @@ pub const MigrationRunner = struct {
             const checksum = migration.checksum orelse "";
             if (mig_ok) {
                 try self.recordMigration(migration.version, migration.description, checksum, @intCast(elapsed_ms), true);
+                try self.insertHistoryRecord(client, migration.version, migration.description, checksum, @intCast(elapsed_ms), true);
             } else {
                 try self.recordMigration(migration.version, migration.description, checksum, @intCast(elapsed_ms), false);
+                try self.insertHistoryRecord(client, migration.version, migration.description, checksum, @intCast(elapsed_ms), false);
                 return error.MigrationFailed;
             }
         }
+    }
+
+    /// Load applied migrations from the history table into `self.history`.
+    pub fn loadHistory(self: *Self, client: anytype) !void {
+        const sql = try std.fmt.allocPrint(self.allocator, "SELECT version, description, applied_at, checksum, execution_time_ms, success FROM {s} ORDER BY version", .{self.history_table});
+        defer self.allocator.free(sql);
+        var result = try client.queryRows(AppliedMigration, sql, &.{});
+        defer result.deinit(self.allocator);
+        for (result.items) |h| {
+            // queryRows strings borrow the result arena — dup into our own
+            // allocator so history survives result.deinit.
+            const desc = try self.allocator.dupe(u8, h.description);
+            errdefer self.allocator.free(desc);
+            const cs = try self.allocator.dupe(u8, h.checksum);
+            try self.history.append(self.allocator, .{
+                .version = h.version,
+                .description = desc,
+                .applied_at = h.applied_at,
+                .checksum = cs,
+                .execution_time_ms = h.execution_time_ms,
+                .success = h.success,
+            });
+        }
+    }
+
+    /// Persist one applied-migration record so restarts skip it.
+    fn insertHistoryRecord(self: *Self, client: anytype, version: i64, description: []const u8, checksum: []const u8, elapsed_ms: u64, success: bool) !void {
+        const sql = try std.fmt.allocPrint(self.allocator, "INSERT INTO {s} (version, description, applied_at, checksum, execution_time_ms, success) VALUES (?, ?, ?, ?, ?, ?)", .{self.history_table});
+        defer self.allocator.free(sql);
+        _ = try client.exec(sql, &.{
+            .{ .int = version },
+            .{ .string = description },
+            .{ .int = Time.monotonicNowSeconds() },
+            .{ .string = checksum },
+            .{ .int = @intCast(elapsed_ms) },
+            .{ .bool = success },
+        });
     }
 
     /// [...]Migration history[...] SQL
@@ -467,6 +509,43 @@ test "MigrationRunner checksum validation" {
 
     const valid = try runner.validateChecksums();
     try std.testing.expect(!valid);
+}
+
+test "MigrationRunner persists history and skips applied on re-run" {
+    const allocator = std.testing.allocator;
+    const sqlx = @import("../sqlx/sqlx.zig");
+    var client = sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+
+    {
+        var runner = MigrationRunner.init(allocator);
+        defer runner.deinit();
+        try runner.addMigration(20260101000000, "orders", "CREATE TABLE orders (id INTEGER PRIMARY KEY);");
+        try runner.run(&client);
+        try std.testing.expectEqual(@as(usize, 1), runner.getAppliedCount());
+    }
+    {
+        // A fresh runner on the same database must load V1 as applied and
+        // skip re-running it (history count stays 1, no duplicate record).
+        var runner2 = MigrationRunner.init(allocator);
+        defer runner2.deinit();
+        try runner2.addMigration(20260101000000, "orders", "CREATE TABLE orders (id INTEGER PRIMARY KEY);");
+        try runner2.run(&client);
+        try std.testing.expectEqual(@as(usize, 1), runner2.getAppliedCount());
+        var rows = try client.queryRows(struct { version: i64 }, "SELECT version FROM _zigmodu_migrations", &.{});
+        defer rows.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 1), rows.items.len);
+    }
+    {
+        // An added migration on top applies while V1 stays skipped → 2 applied.
+        var runner3 = MigrationRunner.init(allocator);
+        defer runner3.deinit();
+        try runner3.addMigration(20260101000000, "orders", "CREATE TABLE orders (id INTEGER PRIMARY KEY);");
+        try runner3.addMigration(20260102000000, "indexes", "CREATE INDEX idx_orders_id ON orders (id);");
+        try runner3.run(&client);
+        try std.testing.expectEqual(@as(usize, 2), runner3.getAppliedCount());
+    }
 }
 
 test "MigrationRunner add with rollback" {

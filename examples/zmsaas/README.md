@@ -72,6 +72,17 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/orders
 重新生成：`zmodu saas …` 后运行
 `python3 examples/zmsaas/scripts/reapply-custom.py` 一键恢复自定义层。
 
+## 运维面（基础框架标配）
+
+- **版本化迁移**：DDL 走 `MigrationRunner`（`db/migrations/V1..V3__*.sql`），
+  history 落 `_zigmodu_migrations`，重启幂等（实测重启后仍 3 条记录）；
+- **健康检查**：`GET /health/live` + `GET /health/ready`（含 DB 连通性检查）；
+- **指标**：`GET /metrics` Prometheus 格式（`http_requests_total`，请求计数
+  中间件）；tracing 的 `x-trace-id` 一直开着；
+- **事务性 outbox**：`fulfill` 在业务事务内同时写 `event_outbox`
+  （`order.fulfilled` 事件），投递至少一次；投递侧可接
+  `zigmodu.outbox.OutboxPoller/OutboxConsumer`。
+
 ## 前端 CRUD 收敛（DataTable / EntityForm）
 
 `/dashboard/orders` 演示了「数据驱动 CRUD」：页面不手写表格行/表单控件，

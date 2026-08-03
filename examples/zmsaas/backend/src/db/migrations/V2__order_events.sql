@@ -1,0 +1,6 @@
+CREATE TABLE IF NOT EXISTS order_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_id INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
