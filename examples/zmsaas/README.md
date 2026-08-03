@@ -81,7 +81,11 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/orders
   中间件）；tracing 的 `x-trace-id` 一直开着；
 - **事务性 outbox**：`fulfill` 在业务事务内同时写 `event_outbox`
   （`order.fulfilled` 事件），投递至少一次；投递侧可接
-  `zigmodu.outbox.OutboxPoller/OutboxConsumer`。
+  `POST /api/v1/outbox/flush`（`src/ops.zig`，单线程安全）演示一轮投递：
+  pending → processing → delivered（实测 status 0→2）；生产把
+  `deliverPending` 挂到 cron 周期任务或 DistributedEventBus 消费者。
+- **前端真实登录态**：orders 页 token 存 sessionStorage，未登录显示登录表单，
+  登出清态；401 时错误提示。生产把 SolidStart 会话兑换成带租户/角色的 JWT。
 
 ## 前端 CRUD 收敛（DataTable / EntityForm）
 

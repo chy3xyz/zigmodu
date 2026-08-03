@@ -26,7 +26,12 @@ const columns: ColumnDef<Orders>[] = [
 ];
 
 export default function OrdersPage() {
-  const [client, setClient] = createSignal<ApiClient | null>(null);
+  // 真实登录态：token 持久化到 sessionStorage，getToken 闭包每次请求读取。
+  // 生产环境应把 SolidStart 会话兑换成带租户/角色的 zmodu JWT。
+  const [token, setToken] = createSignal<string | null>(
+    typeof sessionStorage !== 'undefined' ? sessionStorage.getItem('zmodu_token') : null,
+  );
+  const client: ApiClient = createApiClient(API_URL, () => token());
   const [rows, setRows] = createSignal<Orders[]>([]);
   const [total, setTotal] = createSignal(0);
   const [page, setPage] = createSignal(1);
@@ -49,29 +54,31 @@ export default function OrdersPage() {
     }
   }
 
-  async function init() {
+  // 已登录才拉数据；token/page 变化都会触发刷新。
+  createEffect(() => {
+    if (!token()) return;
+    void refresh(client);
+  });
+
+  async function signIn() {
     try {
-      const token = await login(API_URL);
-      const c = createApiClient(API_URL, () => token);
-      setClient(c);
+      const t = await login(API_URL);
+      sessionStorage.setItem('zmodu_token', t);
+      setToken(t);
+      setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Backend unavailable');
+      setError(err instanceof Error ? err.message : 'Login failed');
     }
   }
 
-  // Boot: login once, then refresh on every client/page change (page() is
-  // read synchronously inside refresh, so Solid tracks it for re-fetch).
-  createEffect(() => {
-    if (!client()) {
-      void init();
-      return;
-    }
-    void refresh(client()!);
-  });
+  function signOut() {
+    sessionStorage.removeItem('zmodu_token');
+    setToken(null);
+    setRows([]);
+    setTotal(0);
+  }
 
   async function submitForm(raw: Record<string, string>) {
-    const c = client();
-    if (!c) return;
     const body = {
       customer: raw.customer ?? '',
       amount: raw.amount === '' ? undefined : Number(raw.amount),
@@ -79,85 +86,101 @@ export default function OrdersPage() {
       notes: raw.notes ?? '',
     };
     if (editing()) {
-      await c.update('orders', editing()!.id, body);
+      await client.update('orders', editing()!.id, body);
     } else {
-      await c.create('orders', body);
+      await client.create('orders', body);
     }
     setEditing(null);
     setShowCreate(false);
-    await refresh(c);
+    await refresh(client);
   }
 
   async function remove(row: Orders) {
-    const c = client();
-    if (!c) return;
     if (!window.confirm(`Delete orders #${row.id}?`)) return;
-    await c.remove('orders', row.id);
-    await refresh(c);
+    await client.remove('orders', row.id);
+    await refresh(client);
   }
 
   async function bulkCreate() {
-    const c = client();
-    if (!c) return;
     const items = bulkText().split('\n').filter(Boolean).map((line) => {
       const [customer, amount, status] = line.split('|');
       return { customer: customer.trim(), amount: Number(amount), status: (status ?? 'pending').trim() };
     });
-    const ids = await c.createMany('orders', items);
+    const ids = await client.createMany('orders', items);
     setBulkText('');
     setError(`bulk created ids: ${ids.join(', ')}`);
-    await refresh(c);
+    await refresh(client);
   }
 
   return (
     <>
       <Title>Orders</Title>
-      <div class="mb-6 flex items-center justify-between">
-        <div>
-          <h1 class="text-2xl font-semibold">Orders</h1>
-          <p class="text-sm text-muted-foreground">Customer orders</p>
+      <Show when={token()} fallback={(
+        <div class="mx-auto mt-20 w-full max-w-sm rounded-xl border bg-card p-6 shadow-sm">
+          <h1 class="mb-4 text-center text-xl font-semibold">Sign in to zmodu</h1>
+          <p class="mb-4 text-center text-sm text-muted-foreground">
+            演示 Bearer 登录态生命周期；生产用 SolidStart 会话兑换带租户/角色的 JWT
+          </p>
+          <form class="space-y-4" onSubmit={(e) => { e.preventDefault(); void signIn(); }}>
+            <input name="username" placeholder="username (demo)" class="w-full rounded-md border bg-background px-3 py-2 text-sm" />
+            <input name="password" type="password" placeholder="password (demo)" class="w-full rounded-md border bg-background px-3 py-2 text-sm" />
+            <Button type="submit" class="w-full">Sign in</Button>
+          </form>
+          <Show when={error()}>
+            <p class="mt-3 text-center text-sm text-destructive">{error()}</p>
+          </Show>
         </div>
-        <Button onClick={() => { setShowCreate(true); setEditing(null); }}>New Orders</Button>
-      </div>
-      <Show when={error()}>
-        <p class="mb-4 rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">{error()}</p>
-      </Show>
-      <Show when={showCreate() || editing()}>
+      )}>
+        <div class="mb-6 flex items-center justify-between">
+          <div>
+            <h1 class="text-2xl font-semibold">Orders</h1>
+            <p class="text-sm text-muted-foreground">Customer orders</p>
+          </div>
+          <div class="flex items-center gap-2">
+            <Button variant="outline" onClick={signOut}>Sign out</Button>
+            <Button onClick={() => { setShowCreate(true); setEditing(null); }}>New Orders</Button>
+          </div>
+        </div>
+        <Show when={error()}>
+          <p class="mb-4 rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">{error()}</p>
+        </Show>
+        <Show when={showCreate() || editing()}>
+          <div class="mb-6 rounded-lg border bg-card p-5">
+            <h2 class="mb-4 text-lg font-semibold">{editing() ? `Edit orders #${editing()!.id}` : 'New orders'}</h2>
+            <EntityForm
+              fields={OrdersFields}
+              initial={editing() ?? undefined}
+              submitLabel={editing() ? 'Save' : 'Create'}
+              onSubmit={submitForm}
+              onCancel={() => { setShowCreate(false); setEditing(null); }}
+            />
+          </div>
+        </Show>
         <div class="mb-6 rounded-lg border bg-card p-5">
-          <h2 class="mb-4 text-lg font-semibold">{editing() ? `Edit orders #${editing()!.id}` : 'New orders'}</h2>
-          <EntityForm
-            fields={OrdersFields}
-            initial={editing() ?? undefined}
-            submitLabel={editing() ? 'Save' : 'Create'}
-            onSubmit={submitForm}
-            onCancel={() => { setShowCreate(false); setEditing(null); }}
+          <h2 class="mb-2 text-lg font-semibold">Bulk create (POST /orders/bulk)</h2>
+          <p class="mb-2 text-sm text-muted-foreground">每行一条：customer|amount|status（一次 RTT）</p>
+          <textarea
+            value={bulkText()}
+            rows={3}
+            onInput={(e) => setBulkText(e.currentTarget.value)}
+            class="mb-3 w-full rounded-md border bg-background px-3 py-2 text-sm font-mono"
           />
+          <Button onClick={bulkCreate}>Bulk Create</Button>
         </div>
-      </Show>
-      <div class="mb-6 rounded-lg border bg-card p-5">
-        <h2 class="mb-2 text-lg font-semibold">Bulk create (POST /orders/bulk)</h2>
-        <p class="mb-2 text-sm text-muted-foreground">每行一条：customer|amount|status（一次 RTT）</p>
-        <textarea
-          value={bulkText()}
-          rows={3}
-          onInput={(e) => setBulkText(e.currentTarget.value)}
-          class="mb-3 w-full rounded-md border bg-background px-3 py-2 text-sm font-mono"
+        <DataTable
+          columns={columns}
+          rows={rows()}
+          total={total()}
+          page={page()}
+          pageSize={20}
+          loading={loading()}
+          rowKey={(r) => r.id}
+          onEdit={setEditing}
+          onDelete={remove}
+          emptyText="No orders yet"
+          onPageChange={(p) => setPage(p)}
         />
-        <Button onClick={bulkCreate}>Bulk Create</Button>
-      </div>
-      <DataTable
-        columns={columns}
-        rows={rows()}
-        total={total()}
-        page={page()}
-        pageSize={20}
-        loading={loading()}
-        rowKey={(r) => r.id}
-        onEdit={setEditing}
-        onDelete={remove}
-        emptyText="No orders yet"
-        onPageChange={(p) => setPage(p)}
-      />
+      </Show>
     </>
   );
 }

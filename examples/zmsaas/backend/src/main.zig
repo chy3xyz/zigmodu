@@ -14,6 +14,7 @@ const orders_mod = @import("modules/orders/root.zig");
 const auth_mod = @import("auth/root.zig");
 const middleware = @import("middleware/root.zig");
 const schema = @import("db/schema.zig");
+const ops = @import("ops.zig");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -74,6 +75,7 @@ pub fn main(init: std.process.Init) !void {
     var svc = orders_mod.service.OrdersService.init(&persist);
     var api = orders_mod.api.OrdersApi.init(&svc);
     var actions_api = orders_mod.api.OrdersActionsApi.init(&svc);
+    var ops_api = ops.OpsApi.init(&db_client);
     var auth_api = auth_mod.AuthApi{};
 
     // CRUD 即事件源：写操作（含自定义 cancel 走的 crud.update）自动 publish，
@@ -87,8 +89,9 @@ pub fn main(init: std.process.Init) !void {
     var app_state: AppState = .{};
     const OrdersApiT = @TypeOf(api);
     const OrdersActionsApiT = @TypeOf(actions_api);
+    const OpsApiT = @TypeOf(ops_api);
     const AuthApiT = @TypeOf(auth_api);
-    comptime zigmodu.http.assertNoDupes(.{ OrdersApiT, OrdersActionsApiT, AuthApiT });
+    comptime zigmodu.http.assertNoDupes(.{ OrdersApiT, OrdersActionsApiT, OpsApiT, AuthApiT });
     var router = zigmodu.http.Router(AppState).init(io, allocator, &server, &app_state);
     defer router.deinit();
     var api_v1 = router.scope("/api/v1");
@@ -96,6 +99,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .Mod = AuthApiT, .state = &auth_api },
         .{ .Mod = OrdersApiT, .state = &api },
         .{ .Mod = OrdersActionsApiT, .state = &actions_api },
+        .{ .Mod = OpsApiT, .state = &ops_api },
     });
     catalog_slot.set(try router.finish());
     std.log.info("[zmsaas] route catalog: {d} entries", .{catalog_slot.get().?.entries.len});
