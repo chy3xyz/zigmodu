@@ -11,6 +11,7 @@ pub const OrdersPersistence = struct {
     pub fn init(b: *data.SqlxBackend) OrdersPersistence {
         return .{ .backend = b };
     }
+
     pub fn list(self: *@This(), allocator: std.mem.Allocator, org_id: i64, page: usize, size: usize) !std.ArrayList(model.Orders) {
         var out = std.ArrayList(model.Orders).empty;
         errdefer out.deinit(allocator);

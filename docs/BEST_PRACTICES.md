@@ -614,6 +614,9 @@ pub const OrdersApi = zigmodu.http.CrudApi(model.Orders, service.OrdersService, 
 - 事件源：service 组合 `data.CrudService(Entity, Persistence)` 后，写操作自动
   publish `CrudEvent{created,updated,deleted}`，业务订阅即可（发通知/审计/外发），
   无需手写事件发布；
+- 零透传：service 声明 `pub const impl = data.CrudService(Entity, P)` 与
+  `crud: impl` 字段后，`CrudApi` 自动直通（无需再写 5 个转发方法）；
+  生成的 service 只有接线 + `validate` 钩子（`zmodu saas` 已按此产出）；
 - 响应白名单：`Extract.toDto/respondDto` 按同名字段约定映射，天然隐藏
   `secret`/`org_id` 等列；`toDtoList` 收集列表。
 

@@ -98,26 +98,33 @@ Service 只需 duck-typed `list/get/create/update/delete` + `module_name`/`nest`
   `CrudEvent{created,updated,deleted}`，无需手写事件发布代码。
 
 ```zig
-// service.zig —— CrudService 事件源组合
-const impl = zigmodu.data.CrudService(model.Orders, persistence.OrdersPersistence);
-
+// service.zig（生成物）—— CrudService 零透传组合
 pub const OrdersService = struct {
     pub const module_name = "orders";
     pub const nest = .{"orders"};
-    impl: impl,
+    pub const impl = zigmodu.data.CrudService(model.Orders, persistence.OrdersPersistence);
+    crud: impl,
 
     pub fn init(p: *persistence.OrdersPersistence) @This() {
-        var s = .{ .impl = impl.init(p) };
-        s.impl.validate = &validate; // 可选校验钩子
-        return s;
+        var self: @This() = .{ .crud = impl.init(p) };
+        self.crud.validate = &validate; // 可选校验钩子
+        return self;
     }
-    // list/get/create/update/delete 各一行转发到 self.impl，写操作自动发事件
+    // 无 list/get/create/update/delete 透传：CrudApi 探测到 `impl` 类型后
+    // 直接路由到 self.crud，写操作自动 publish CrudEvent{created,updated,deleted}
 };
 ```
 
 响应收敛配套：`http.PageParams.parse(ctx, .{ .max_page_size = 100 })` 统一分页解析，
 `Extract.toDto/respondDto` 按同名字段约定映射 DTO（白名单天然隐藏
 `secret`/`org_id` 等列），`Extract.toDtoList` 做列表收集。
+
+前端同源产出：同一个 `orders.model.json` 可再跑
+`node zsaas/scripts/gen-business.mjs orders.model.json <frontend>`，生成
+`src/models/Orders.ts`（类型 + 字段 schema）与
+`src/routes/dashboard/orders/index.tsx`（DataTable + EntityForm 数据驱动 CRUD
+页，直接对接后端 autoCrud）。共享脚手架（`libs/apiClient.ts`、
+`components/data/DataTable.tsx`、`EntityForm.tsx`）已随 `examples/zmsaas` 提供。
 
 ---
 

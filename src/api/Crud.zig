@@ -3,7 +3,10 @@
 //! metas, `PageParams` clamping and a configurable paged envelope. Service
 //! must expose duck-typed `list/get/create/update/delete` (see
 //! `data.CrudService` for the generic implementation) plus
-//! `module_name`/`nest` consts.
+//! `module_name`/`nest` consts. Zero-passthrough form: when the Service
+//! declares `pub const impl = data.CrudService(Entity, P);` (type) and a
+//! `crud: impl` field of that type, CrudApi calls through to it directly,
+//! so the service file only carries wiring + an optional validate hook.
 
 const std = @import("std");
 const http = @import("../http.zig");
@@ -25,6 +28,10 @@ pub fn CrudApi(comptime Entity: type, comptime Service: type, comptime opts: Cru
         const Self = @This();
 
         service: *Service,
+
+        // Effective CRUD backend: the embedded CrudService when present,
+        // otherwise the service itself (duck-typed methods).
+        const Svc = if (@hasDecl(Service, "impl")) Service.impl else Service;
 
         pub const module_name = Service.module_name;
         pub const nest = Service.nest;
@@ -51,10 +58,17 @@ pub fn CrudApi(comptime Entity: type, comptime Service: type, comptime opts: Cru
             return std.fmt.parseInt(i64, s, 10);
         }
 
+        fn svc(self: *State) *Svc {
+            if (comptime @hasDecl(Service, "impl")) {
+                return &self.service.crud;
+            }
+            return self.service;
+        }
+
         fn list(ctx: *http.Context, self: *State) !void {
             const org_id = try tenantId(ctx);
             const params = page_mod.PageParams.parse(ctx, .{});
-            var items = try self.service.list(ctx.allocator, org_id, params.page, params.page_size);
+            var items = svc(self).list(ctx.allocator, org_id, params.page, params.page_size) catch |err| return http.respondErr(ctx, err);
             defer items.deinit(ctx.allocator);
             try page_mod.sendPaged(ctx, items.items, items.items.len, params, opts.envelope);
         }
@@ -62,7 +76,7 @@ pub fn CrudApi(comptime Entity: type, comptime Service: type, comptime opts: Cru
         fn get(ctx: *http.Context, self: *State) !void {
             const org_id = try tenantId(ctx);
             const id = try ctx.paramInt(i64, "id");
-            const entity = try self.service.get(ctx.allocator, org_id, id);
+            const entity = svc(self).get(ctx.allocator, org_id, id) catch |err| return http.respondErr(ctx, err);
             if (entity) |e| {
                 try ctx.jsonStruct(200, .{ .code = 0, .data = e });
             } else {
@@ -74,7 +88,7 @@ pub fn CrudApi(comptime Entity: type, comptime Service: type, comptime opts: Cru
             const org_id = try tenantId(ctx);
             var entity = ctx.bindJson(Entity) catch return ctx.jsonStruct(400, .{ .code = 400, .msg = "invalid body" });
             entity.org_id = org_id;
-            const id = try self.service.create(entity);
+            const id = svc(self).create(entity) catch |err| return http.respondErr(ctx, err);
             try ctx.jsonStruct(200, .{ .code = 0, .id = id });
         }
 
@@ -84,14 +98,14 @@ pub fn CrudApi(comptime Entity: type, comptime Service: type, comptime opts: Cru
             var entity = ctx.bindJson(Entity) catch return ctx.jsonStruct(400, .{ .code = 400, .msg = "invalid body" });
             entity.id = id;
             entity.org_id = org_id;
-            try self.service.update(entity, org_id);
+            svc(self).update(entity, org_id) catch |err| return http.respondErr(ctx, err);
             try ctx.jsonStruct(200, .{ .code = 0 });
         }
 
         fn remove(ctx: *http.Context, self: *State) !void {
             const org_id = try tenantId(ctx);
             const id = try ctx.paramInt(i64, "id");
-            try self.service.delete(org_id, id);
+            svc(self).delete(org_id, id) catch |err| return http.respondErr(ctx, err);
             try ctx.jsonStruct(200, .{ .code = 0 });
         }
     };
@@ -122,6 +136,35 @@ const TestService = struct {
     pub fn delete(_: *@This(), _: i64, _: i64) !void {}
 };
 
+// Zero-passthrough form: CrudApi must route through the embedded `impl`
+// field (a data.CrudService-compatible type) instead of requiring the
+// service itself to expose list/get/create/update/delete.
+const TestCrudImpl = struct {
+    pub fn list(_: *@This(), _: std.mem.Allocator, _: i64, _: usize, _: usize) !std.ArrayList(TestEntity) {
+        return std.ArrayList(TestEntity).empty;
+    }
+    pub fn get(_: *@This(), allocator: std.mem.Allocator, _: i64, id: i64) !?TestEntity {
+        _ = allocator;
+        return .{ .id = id };
+    }
+    pub fn create(_: *@This(), _: TestEntity) !i64 {
+        return 9;
+    }
+    pub fn update(_: *@This(), _: TestEntity, _: i64) !void {}
+    pub fn delete(_: *@This(), _: i64, _: i64) !void {}
+};
+
+const TestImplService = struct {
+    pub const module_name = "widgets";
+    pub const nest = .{"widgets"};
+    pub const impl = TestCrudImpl;
+    crud: TestCrudImpl,
+
+    pub fn init() @This() {
+        return .{ .crud = .{} };
+    }
+};
+
 test "CrudApi generates five routes with permission metas" {
     const Api = CrudApi(TestEntity, TestService, .{});
     try std.testing.expectEqual(@as(usize, 5), Api.routes.len);
@@ -130,6 +173,15 @@ test "CrudApi generates five routes with permission metas" {
     try std.testing.expectEqualStrings("widgets:read", Api.routes[0].meta.permission.?);
     try std.testing.expectEqualStrings("widgets:write", Api.routes[1].meta.permission.?);
     try std.testing.expect(Api.routes[0].meta.auth == .jwt);
+}
+
+test "CrudApi routes through embedded impl (zero passthrough)" {
+    const Api = CrudApi(TestEntity, TestImplService, .{});
+    try std.testing.expectEqual(@as(usize, 5), Api.routes.len);
+    try std.testing.expectEqualStrings("widgets:read", Api.routes[0].meta.permission.?);
+    var svc = TestImplService.init();
+    var api = Api.init(&svc);
+    _ = &api;
 }
 
 test "CrudApi honors permission override and public flag" {

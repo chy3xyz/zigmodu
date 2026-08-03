@@ -120,7 +120,7 @@ jobs:
       - name: zmodu audit CLI smoke (best-practice checker)
         run: |
           set -euo pipefail
-          for ex in tenant-mgmt tenant-shop basic ai-ops; do
+          for ex in tenant-mgmt tenant-shop basic ai-ops zmsaas/backend; do
             ./zig-out/bin/zmodu audit "examples/$ex" -j | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['pass'], d"
           done
           # graph renders module nodes + edges

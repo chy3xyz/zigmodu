@@ -7,8 +7,13 @@
       "writeRole": "admin",
       "fields": [
         { "name": "customer", "type": "string", "required": true, "label": "Customer" },
-        { "name": "amount", "type": "number", "label": "Amount" },
-        { "name": "status", "type": "string", "default": "pending", "label": "Status" },
+        { "name": "amount", "type": "number", "label": "Amount (分)" },
+        { "name": "status", "type": "string", "default": "pending", "label": "Status",
+          "options": [
+            { "value": "pending", "label": "Pending" },
+            { "value": "paid", "label": "Paid" },
+            { "value": "cancelled", "label": "Cancelled" }
+          ] },
         { "name": "notes", "type": "text", "label": "Notes" }
       ]
     }

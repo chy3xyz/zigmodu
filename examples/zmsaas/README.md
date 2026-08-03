@@ -68,3 +68,5 @@ node zsaas/scripts/gen-business.mjs zsaas/examples/orders.model.json examples/zm
 ```
 
 新增实体 → 追加到模型文件 → 两端重新生成（schema 记得同步 `db/schema.zig`）。
+字段若需要下拉/枚举，在模型 JSON 的字段上加 `"options": [{"value","label"}]`，
+前后端生成都会自动变成 select 控件 + Badge 列。
