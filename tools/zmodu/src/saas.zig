@@ -222,19 +222,25 @@ fn emitPersistence(allocator: std.mem.Allocator, e: *const Entity, P: []const u8
     try buf.appendSlice(allocator, "    }\n\n");
 
     // list
-    try appendPrint(allocator, &buf, "    pub fn list(self: *@This(), org_id: i64, page: usize, size: usize) !data.ResultSet(model.{s}) {{\n", .{P});
-    try buf.appendSlice(allocator,
-        \\        var result = try self.backend.client.queryRows(model.
-    );
-    try buf.appendSlice(allocator, P);
-    try buf.appendSlice(allocator, ", \"SELECT id, org_id, ");
+    try appendPrint(allocator, &buf, "    pub fn list(self: *@This(), org_id: i64, page: usize, size: usize, sort: ?data.SortSpec) !data.ResultSet(model.{s}) {{\n", .{P});
+    try buf.appendSlice(allocator, "        const total = (try self.backend.client.queryRow(struct { total: i64 }, \"SELECT COUNT(*) AS total FROM ");
+    try buf.appendSlice(allocator, e.name);
+    try buf.appendSlice(allocator, " WHERE org_id = ?\", &.{ .{ .int = org_id } })).total;\n");
+    try buf.appendSlice(allocator, "        var sql_buf: [512]u8 = undefined;\n        const sql = if (sort) |s| blk: {\n            break :blk std.fmt.bufPrint(&sql_buf, \"SELECT id, org_id, ");
     try buf.appendSlice(allocator, col_list);
     try buf.appendSlice(allocator, ", created_at, updated_at FROM ");
     try buf.appendSlice(allocator, e.name);
-    try appendPrint(allocator, &buf, " WHERE org_id = ? ORDER BY id DESC LIMIT ? OFFSET ?\", &.{{ .{{ .int = org_id }}, .{{ .int = @intCast(size) }}, .{{ .int = @intCast((page -| 1) * size) }} }});\n", .{});
+    try buf.appendSlice(allocator, " WHERE org_id = ? ORDER BY {s} {s} LIMIT ? OFFSET ?\", .{ s.column, if (s.desc) \"DESC\" else \"ASC\" }) catch return error.InvalidInput;\n        } else \"SELECT id, org_id, ");
+    try buf.appendSlice(allocator, col_list);
+    try buf.appendSlice(allocator, ", created_at, updated_at FROM ");
+    try buf.appendSlice(allocator, e.name);
+    try buf.appendSlice(allocator, " WHERE org_id = ? ORDER BY id DESC LIMIT ? OFFSET ?\";\n");
+    try buf.appendSlice(allocator, "        var result = try self.backend.client.queryRows(model.");
+    try buf.appendSlice(allocator, P);
+    try buf.appendSlice(allocator, ", sql, &.{ .{ .int = org_id }, .{ .int = @intCast(size) }, .{ .int = @intCast((page -| 1) * size) } });\n");
     try buf.appendSlice(allocator,
         \\        const take = result.take();
-        \\        return .{ .items = take.items, .arena = take.arena };
+        \\        return .{ .items = take.items, .total = @intCast(total), .arena = take.arena };
         \\    }
         \\
     );
@@ -366,6 +372,9 @@ fn emitService(allocator: std.mem.Allocator, e: *const Entity, P: []const u8) ![
         \\    pub fn transact(self: *@This(), comptime T: type, f: *const fn (*zigmodu.data.sqlx.Transaction) zigmodu.ZigModuError!T) zigmodu.ZigModuError!T {
         \\        return self.persistence.backend.client.transact(T, f);
         \\    }
+        \\    pub fn transactWith(self: *@This(), comptime T: type, comptime Ctx: type, ctx: Ctx, f: *const fn (*zigmodu.data.sqlx.Transaction, Ctx) zigmodu.ZigModuError!T) zigmodu.ZigModuError!T {
+        \\        return self.persistence.backend.client.transactWith(T, Ctx, ctx, f);
+        \\    }
         \\};
         \\
     );
@@ -465,7 +474,7 @@ fn emitTests(allocator: std.mem.Allocator, e: *const Entity, P: []const u8) ![]c
         \\    try std.testing.expect(id > 0);
         \\    try std.testing.expectEqual(@as(u64, 1), bus.publishedCount());
         \\
-        \\    var items = try svc.crud.list(1, 1, 10);
+        \\    var items = try svc.crud.list(1, 1, 10, null);
         \\    defer items.deinit(allocator);
         \\    try std.testing.expectEqual(@as(usize, 1), items.items.len);
         \\

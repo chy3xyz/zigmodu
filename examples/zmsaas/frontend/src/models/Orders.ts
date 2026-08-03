@@ -3,13 +3,10 @@
 
 export type Orders = {
   id: number;
-  org_id: number;
   customer: string;
   amount?: number;
   status?: string;
   notes?: string;
-  created_at: number;
-  updated_at: number;
 };
 
 export type OrdersField = {

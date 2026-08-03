@@ -611,6 +611,8 @@ pub const OrdersApi = zigmodu.http.CrudApi(model.Orders, service.OrdersService, 
 - 自动生成 5 条路由，JWT + `<module>:read`/`<module>:write` 权限 meta；
 - `tenant_id` 从 attrs 注入（勿在 handler 里再验 Bearer）；
 - 分页走 `PageParams.parse`（page_size 钳制，杜绝 0 拉全表）；
+- 分页 `total` 是真实 COUNT（生成 list 内建）；排序走
+  `CrudOpts.sortable` 白名单（`sort=<列>&order=asc|desc`，防注入）；
 - 响应白名单：`CrudOpts{ .dto = OrderDto }` 后 list/get 自动经 `toDto`
   映射（隐藏 `org_id`/`secret` 等内部列）；批量导入开
   `CrudOpts{ .bulk = true }` 获得 `POST {nest}/bulk`（一次 RTT）；

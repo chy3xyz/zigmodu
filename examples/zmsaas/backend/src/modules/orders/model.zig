@@ -11,3 +11,13 @@ pub const Orders = struct {
     created_at: i64 = 0,
     updated_at: i64 = 0,
 };
+
+/// Response DTO whitelist (CrudOpts.dto): list/get 只暴露业务字段，
+/// `org_id`/`created_at`/`updated_at` 等内部列不上 wire。
+pub const OrdersDto = struct {
+    id: i64 = 0,
+    customer: []const u8 = "",
+    amount: i64 = 0,
+    status: []const u8 = "",
+    notes: []const u8 = "",
+};

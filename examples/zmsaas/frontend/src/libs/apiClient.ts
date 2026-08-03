@@ -12,6 +12,7 @@ export type ApiEnvelope<T = unknown> = {
   total?: number;
   data?: T;
   id?: number;
+  ids?: number[];
 };
 
 export type PagedResult<T> = {
@@ -24,6 +25,7 @@ export type ApiClient = {
   list: <T>(path: string, params?: Record<string, string | number>) => Promise<PagedResult<T>>;
   get: <T>(path: string, id: string | number) => Promise<T>;
   create: (path: string, body: unknown) => Promise<number>;
+  createMany: (path: string, items: unknown[]) => Promise<number[]>;
   update: (path: string, id: string | number, body: unknown) => Promise<void>;
   remove: (path: string, id: string | number) => Promise<void>;
 };
@@ -72,6 +74,10 @@ export function createApiClient(baseUrl: string, getToken: () => string | null):
     async create(path: string, body: unknown): Promise<number> {
       const env = await request<ApiEnvelope>(path, { method: 'POST', body: JSON.stringify(body) });
       return env.id ?? 0;
+    },
+    async createMany(path: string, items: unknown[]): Promise<number[]> {
+      const env = await request<ApiEnvelope>(`${path}/bulk`, { method: 'POST', body: JSON.stringify(items) });
+      return env.ids ?? [];
     },
     async update(path: string, id: string | number, body: unknown): Promise<void> {
       await request<ApiEnvelope>(`${path}/${id}`, { method: 'PUT', body: JSON.stringify(body) });

@@ -131,10 +131,17 @@ pub const OrdersService = struct {
 - 每个模块自动产出 `tests.zig`（内存 sqlite 的 CRUD 冒烟 + validate 负向 +
   transact 冒烟），项目 build.zig 加一个 test step 即接入 `zig build test`；
 - `CrudOpts.dto` 让 list/get 响应自动走 DTO 白名单；
-- `CrudOpts.bulk` 增加 `POST {nest}/bulk`（JSON 数组批量创建，一次 RTT）。
+- `CrudOpts.bulk` 增加 `POST {nest}/bulk`（JSON 数组批量创建，一次 RTT）；
+- `CrudOpts.sortable` 让 list 支持 `sort=<列>&order=asc|desc`（列名白名单，
+  非白名单忽略，防 ORDER BY 注入）；
+- 分页 `total` 是真实 COUNT（生成 list 内建 COUNT + LIMIT/OFFSET，不再是页长）。
 
 可观测：`server.addMiddleware(zigmodu.http.tracingMiddleware())` 一行启用
 `x-trace-id` 注入与请求耗时日志（示例见 `examples/zmsaas/backend/src/main.zig`）。
+
+自定义代码重放：`zmodu saas` 重新生成会覆盖 model/persistence/service/api/
+module/root 五个文件；`examples/zmsaas/scripts/reapply-custom.py` 一键恢复示例
+的自定义层（DTO/actions/transact 方法），工作流 = 重新生成 → reapply → 构建。
 
 前端同源产出：同一个 `orders.model.json` 可再跑
 `node zsaas/scripts/gen-business.mjs orders.model.json <frontend>`，生成

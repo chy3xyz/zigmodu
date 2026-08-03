@@ -6,6 +6,7 @@
 const std = @import("std");
 const server_mod = @import("../api/Server.zig");
 const Context = server_mod.Context;
+const data = @import("../data.zig");
 
 pub const PageOpts = struct {
     default_page_size: usize = 20,
@@ -25,6 +26,24 @@ pub const PageParams = struct {
         return .{ .page = page, .page_size = page_size };
     }
 };
+
+/// Parse `sort=<column>&order=asc|desc` against a caller-provided whitelist.
+/// Returns null when sort is absent, malformed, or not whitelisted — callers
+/// treat that as "default ordering" (never reflect arbitrary input into SQL).
+pub fn parseSort(ctx: *const Context, whitelist: []const []const u8) ?data.SortSpec {
+    if (ctx.queryStr("sort", "").len == 0) return null;
+    const col = ctx.queryStr("sort", "");
+    var allowed = false;
+    for (whitelist) |c| {
+        if (std.mem.eql(u8, c, col)) {
+            allowed = true;
+            break;
+        }
+    }
+    if (!allowed) return null;
+    const order = ctx.queryStr("order", "asc");
+    return .{ .column = col, .desc = std.mem.eql(u8, order, "desc") };
+}
 
 pub const Envelope = enum {
     /// `{ "list": [...], "total": N, "page": P, "pageSize": S }`

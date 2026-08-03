@@ -28,7 +28,7 @@ test "orders persistence + CrudService round-trip" {
     try std.testing.expect(id > 0);
     try std.testing.expectEqual(@as(u64, 1), bus.publishedCount());
 
-    var items = try svc.crud.list(1, 1, 10);
+    var items = try svc.crud.list(1, 1, 10, null);
     defer items.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 1), items.items.len);
 

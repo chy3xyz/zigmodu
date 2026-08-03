@@ -4,7 +4,11 @@ const zigmodu = @import("zigmodu");
 const model = @import("model.zig");
 const service = @import("service.zig");
 
-pub const OrdersApi = zigmodu.http.CrudApi(model.Orders, service.OrdersService, .{});
+pub const OrdersApi = zigmodu.http.CrudApi(model.Orders, service.OrdersService, .{
+    .dto = model.OrdersDto,
+    .bulk = true,
+    .sortable = &.{ "id", "amount", "status" },
+});
 
 // Custom endpoints coexist with autoCrud: same nest, disjoint paths. Mounted
 // alongside OrdersApi in main.zig (assertNoDupes only rejects duplicate
@@ -22,6 +26,7 @@ pub const OrdersActionsApi = struct {
 
     pub const routes = [_]zigmodu.http.RouteSpec(State){
         .{ .method = .POST, .path = "{id}/cancel", .handler = cancel, .meta = .{ .auth = .jwt, .permission = "orders:write" } },
+        .{ .method = .POST, .path = "{id}/fulfill", .handler = fulfill, .meta = .{ .auth = .jwt, .permission = "orders:write" } },
     };
 
     fn cancel(ctx: *zigmodu.http.Context, self: *State) !void {
@@ -30,5 +35,13 @@ pub const OrdersActionsApi = struct {
         const id = try ctx.paramInt(i64, "id");
         self.service.cancel(ctx.allocator, org_id, id) catch |err| return zigmodu.http.respondErr(ctx, err);
         try ctx.jsonStruct(200, .{ .code = 0, .status = "cancelled" });
+    }
+
+    fn fulfill(ctx: *zigmodu.http.Context, self: *State) !void {
+        const org_str = ctx.getAttr("tenant_id") orelse return error.Unauthorized;
+        const org_id = std.fmt.parseInt(i64, org_str, 10) catch return error.Unauthorized;
+        const id = try ctx.paramInt(i64, "id");
+        self.service.fulfill(org_id, id) catch |err| return zigmodu.http.respondErr(ctx, err);
+        try ctx.jsonStruct(200, .{ .code = 0, .status = "paid" });
     }
 };

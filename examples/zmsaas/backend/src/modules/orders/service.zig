@@ -19,6 +19,8 @@ pub const OrdersService = struct {
 
     pub fn validate(e: model.Orders) anyerror!void {
         if (e.customer.len == 0) return error.ValidationFailed;
+        if (e.amount <= 0) return error.ValidationFailed; // 金额必须为正
+        if (e.status.len == 0) return error.ValidationFailed;
     }
 
     /// Custom business logic — state machine: only `pending` orders can be
@@ -33,10 +35,41 @@ pub const OrdersService = struct {
         try self.crud.update(updated, org_id);
     }
 
+    /// 真实的多写事务演示：CAS 状态更新（pending→paid）+ 审计插入，同一事务
+    /// 内完成，任一失败整体回滚。回调携带运行时上下文（transactWith）。
+    /// 状态不符（非 pending）→ Conflict(409)，不写审计行。
+    pub const FulfillCtx = struct { org_id: i64, id: i64, now: i64 };
+
+    pub fn fulfill(self: *@This(), org_id: i64, id: i64) !void {
+        const now = zigmodu.Time.monotonicNowSeconds();
+        const ok = try self.transactWith(bool, FulfillCtx, FulfillCtx{ .org_id = org_id, .id = id, .now = now }, struct {
+            fn f(tx: *zigmodu.data.sqlx.Transaction, c: FulfillCtx) zigmodu.ZigModuError!bool {
+                const res = try tx.exec("UPDATE orders SET status = ?, updated_at = ? WHERE id = ? AND org_id = ? AND status = ?", &.{
+                    .{ .string = "paid" },
+                    .{ .int = c.now },
+                    .{ .int = c.id },
+                    .{ .int = c.org_id },
+                    .{ .string = "pending" },
+                });
+                if (res.rows_affected != 1) return false;
+                _ = try tx.exec("INSERT INTO order_events (order_id, action, created_at) VALUES (?, ?, ?)", &.{
+                    .{ .int = c.id },
+                    .{ .string = "fulfilled" },
+                    .{ .int = c.now },
+                });
+                return true;
+            }
+        }.f);
+        if (!ok) return error.Conflict;
+    }
+
     /// Multi-statement atomic writes: runs `f` inside a transaction
     /// (rollback on error) — custom business methods needing cross-table
     /// consistency use this instead of hand-rolling begin/commit/rollback.
     pub fn transact(self: *@This(), comptime T: type, f: *const fn (*zigmodu.data.sqlx.Transaction) zigmodu.ZigModuError!T) zigmodu.ZigModuError!T {
         return self.persistence.backend.client.transact(T, f);
+    }
+    pub fn transactWith(self: *@This(), comptime T: type, comptime Ctx: type, ctx: Ctx, f: *const fn (*zigmodu.data.sqlx.Transaction, Ctx) zigmodu.ZigModuError!T) zigmodu.ZigModuError!T {
+        return self.persistence.backend.client.transactWith(T, Ctx, ctx, f);
     }
 };

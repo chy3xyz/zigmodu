@@ -37,4 +37,16 @@ describe('apiClient', () => {
     const client = createApiClient('http://api.test', () => null);
     await expect(client.list('orders')).rejects.toThrow('Unauthorized');
   });
+
+  it('createMany posts an array to the bulk endpoint', async () => {
+    stubFetch((url, init) => {
+      expect(url).toBe('http://api.test/orders/bulk');
+      const body = JSON.parse(String(init?.body));
+      expect(body).toEqual([{ customer: 'a' }, { customer: 'b' }]);
+      return { status: 200, body: { code: 0, ids: [7, 8] } };
+    });
+    const client = createApiClient('http://api.test', () => null);
+    const ids = await client.createMany('orders', [{ customer: 'a' }, { customer: 'b' }]);
+    expect(ids).toEqual([7, 8]);
+  });
 });

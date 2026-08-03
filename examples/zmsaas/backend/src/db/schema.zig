@@ -16,6 +16,13 @@ pub fn apply(client: *data.Client) !void {
         \\  updated_at INTEGER NOT NULL
         \\)
         ,
+        \\CREATE TABLE IF NOT EXISTS order_events (
+        \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+        \\  order_id INTEGER NOT NULL,
+        \\  action TEXT NOT NULL,
+        \\  created_at INTEGER NOT NULL
+        \\)
+        ,
     };
     for (ddl) |sql| _ = try client.exec(sql, &.{});
 

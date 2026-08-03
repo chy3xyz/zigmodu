@@ -11,10 +11,15 @@ pub const OrdersPersistence = struct {
         return .{ .backend = b };
     }
 
-    pub fn list(self: *@This(), org_id: i64, page: usize, size: usize) !data.ResultSet(model.Orders) {
-        var result = try self.backend.client.queryRows(model.Orders, "SELECT id, org_id, customer, amount, status, notes, created_at, updated_at FROM orders WHERE org_id = ? ORDER BY id DESC LIMIT ? OFFSET ?", &.{ .{ .int = org_id }, .{ .int = @intCast(size) }, .{ .int = @intCast((page -| 1) * size) } });
+    pub fn list(self: *@This(), org_id: i64, page: usize, size: usize, sort: ?data.SortSpec) !data.ResultSet(model.Orders) {
+        const total = (try self.backend.client.queryRow(struct { total: i64 }, "SELECT COUNT(*) AS total FROM orders WHERE org_id = ?", &.{.{ .int = org_id }})).total;
+        var sql_buf: [512]u8 = undefined;
+        const sql = if (sort) |s| blk: {
+            break :blk std.fmt.bufPrint(&sql_buf, "SELECT id, org_id, customer, amount, status, notes, created_at, updated_at FROM orders WHERE org_id = ? ORDER BY {s} {s} LIMIT ? OFFSET ?", .{ s.column, if (s.desc) "DESC" else "ASC" }) catch return error.InvalidInput;
+        } else "SELECT id, org_id, customer, amount, status, notes, created_at, updated_at FROM orders WHERE org_id = ? ORDER BY id DESC LIMIT ? OFFSET ?";
+        var result = try self.backend.client.queryRows(model.Orders, sql, &.{ .{ .int = org_id }, .{ .int = @intCast(size) }, .{ .int = @intCast((page -| 1) * size) } });
         const take = result.take();
-        return .{ .items = take.items, .arena = take.arena };
+        return .{ .items = take.items, .total = @intCast(total), .arena = take.arena };
     }
     pub fn get(self: *@This(), allocator: std.mem.Allocator, org_id: i64, id: i64) !?model.Orders {
         const rows = try self.backend.client.queryRowsSlice(allocator, model.Orders, "SELECT id, org_id, customer, amount, status, notes, created_at, updated_at FROM orders WHERE org_id = ? AND id = ? LIMIT 1", &.{ .{ .int = org_id }, .{ .int = id } });

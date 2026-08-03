@@ -39,8 +39,8 @@ pub fn CrudService(comptime Entity: type, comptime P: type) type {
 
         /// Arena-backed read: items borrow one arena (no per-string copy) —
         /// callers `defer result.deinit(allocator)` once.
-        pub fn list(self: *Self, org_id: i64, page: usize, size: usize) !result_set.ResultSet(Entity) {
-            return self.persistence.list(org_id, page, size);
+        pub fn list(self: *Self, org_id: i64, page: usize, size: usize, sort: ?result_set.SortSpec) !result_set.ResultSet(Entity) {
+            return self.persistence.list(org_id, page, size, sort);
         }
 
         pub fn get(self: *Self, allocator: std.mem.Allocator, org_id: i64, id: i64) !?Entity {
@@ -80,7 +80,7 @@ const FakePersistence = struct {
     updated: bool = false,
     deleted: bool = false,
 
-    pub fn list(_: *@This(), _: i64, _: usize, _: usize) !result_set.ResultSet(FakeEntity) {
+    pub fn list(_: *@This(), _: i64, _: usize, _: usize, _: ?result_set.SortSpec) !result_set.ResultSet(FakeEntity) {
         return result_set.ResultSet(FakeEntity).fromOwned(&[_]FakeEntity{}, null);
     }
     pub fn get(_: *@This(), allocator: std.mem.Allocator, _: i64, id: i64) !?FakeEntity {

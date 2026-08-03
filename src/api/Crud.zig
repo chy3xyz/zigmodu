@@ -31,6 +31,9 @@ pub const CrudOpts = struct {
     /// (one round-trip for import-style workloads). Rows are inserted
     /// sequentially through the service (validate + CrudEvent per row).
     bulk: bool = false,
+    /// Allowed ORDER BY columns for the list endpoint (`sort=<col>&order=
+    /// asc|desc`). Empty = no sorting. Anything not whitelisted is ignored.
+    sortable: []const []const u8 = &.{},
 };
 
 pub fn CrudApi(comptime Entity: type, comptime Service: type, comptime opts: CrudOpts) type {
@@ -85,9 +88,9 @@ pub fn CrudApi(comptime Entity: type, comptime Service: type, comptime opts: Cru
         // Custom-method-first dispatch: a wrapper-declared CRUD method wins,
         // otherwise fall back to the embedded CrudService.
         const custom_list = @hasDecl(Service, "list");
-        fn listImpl(self: *State, org_id: i64, page: usize, size: usize) !data.ResultSet(Entity) {
-            if (comptime custom_list) return self.service.list(org_id, page, size);
-            return svc(self).list(org_id, page, size);
+        fn listImpl(self: *State, org_id: i64, page: usize, size: usize, sort: ?data.SortSpec) !data.ResultSet(Entity) {
+            if (comptime custom_list) return self.service.list(org_id, page, size, sort);
+            return svc(self).list(org_id, page, size, sort);
         }
 
         const custom_get = @hasDecl(Service, "get");
@@ -117,15 +120,16 @@ pub fn CrudApi(comptime Entity: type, comptime Service: type, comptime opts: Cru
         fn list(ctx: *http.Context, self: *State) !void {
             const org_id = try tenantId(ctx);
             const params = page_mod.PageParams.parse(ctx, .{});
-            var result = listImpl(self, org_id, params.page, params.page_size) catch |err| return http.respondErr(ctx, err);
+            const sort = if (opts.sortable.len > 0) page_mod.parseSort(ctx, opts.sortable) else null;
+            var result = listImpl(self, org_id, params.page, params.page_size, sort) catch |err| return http.respondErr(ctx, err);
             defer result.deinit(ctx.allocator);
             if (comptime opts.dto) |DtoT| {
                 const dtos = try ctx.allocator.alloc(DtoT, result.items.len);
                 errdefer ctx.allocator.free(dtos);
                 for (result.items, 0..) |e, i| dtos[i] = http.toDto(DtoT, e);
-                try page_mod.sendPaged(ctx, dtos, result.items.len, params, opts.envelope);
+                try page_mod.sendPaged(ctx, dtos, result.total, params, opts.envelope);
             } else {
-                try page_mod.sendPaged(ctx, result.items, result.items.len, params, opts.envelope);
+                try page_mod.sendPaged(ctx, result.items, result.total, params, opts.envelope);
             }
         }
 
@@ -196,7 +200,7 @@ const TestService = struct {
     pub const module_name = "widgets";
     pub const nest = .{"widgets"};
 
-    pub fn list(_: *@This(), _: i64, _: usize, _: usize) !data.ResultSet(TestEntity) {
+    pub fn list(_: *@This(), _: i64, _: usize, _: usize, _: ?data.SortSpec) !data.ResultSet(TestEntity) {
         return data.ResultSet(TestEntity).fromOwned(&[_]TestEntity{}, null);
     }
     pub fn get(_: *@This(), allocator: std.mem.Allocator, _: i64, id: i64) !?TestEntity {
@@ -214,7 +218,7 @@ const TestService = struct {
 // field (a data.CrudService-compatible type) instead of requiring the
 // service itself to expose list/get/create/update/delete.
 const TestCrudImpl = struct {
-    pub fn list(_: *@This(), _: i64, _: usize, _: usize) !data.ResultSet(TestEntity) {
+    pub fn list(_: *@This(), _: i64, _: usize, _: usize, _: ?data.SortSpec) !data.ResultSet(TestEntity) {
         return data.ResultSet(TestEntity).fromOwned(&[_]TestEntity{}, null);
     }
     pub fn get(_: *@This(), allocator: std.mem.Allocator, _: i64, id: i64) !?TestEntity {

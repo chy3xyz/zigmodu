@@ -4573,6 +4573,20 @@ pub const Client = struct {
         return result;
     }
 
+    /// transact with a runtime context passed to the callback — the
+    /// single-parameter form can't capture business values (order id,
+    /// tenant, timestamps), so multi-write business methods use this.
+    pub fn transactWith(self: *Client, comptime T: type, comptime Ctx: type, ctx: Ctx, fn_tx: *const fn (*Transaction, Ctx) errors.ResultT(T)) errors.ResultT(T) {
+        var tx = try self.beginTx();
+        errdefer {
+            tx.rollback() catch |err| std.log.err("[sqlx] Transaction rollback failed: {}", .{err});
+            if (tx.pool) |p| p.release(tx.conn);
+        }
+        const result = try fn_tx(&tx, ctx);
+        try tx.commit();
+        return result;
+    }
+
     pub fn transactCtx(self: *Client, ctx: SqlContext, comptime T: type, fn_tx: *const fn (*Transaction) errors.ResultT(T)) errors.ResultT(T) {
         if (ctx.isDone()) return error.Timeout;
         return self.transact(T, fn_tx);

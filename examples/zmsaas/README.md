@@ -62,6 +62,15 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/orders
   （含 cancel 走的 update）自动 publish，日志/通知/审计/外发与主流程解耦。
 - **CRUD 方法覆盖**：service 声明同名方法即优先于内嵌 CrudService（可
   `self.crud.*` 复用基础行为）；未覆盖的仍零透传直通。
+- **事务多写**：`POST /api/v1/orders/{id}/fulfill` —— `transactWith` 在单事务
+  内完成 CAS 状态更新（pending→paid）+ 审计插入（`order_events`），状态不符
+  返回 409，任一失败整体回滚。
+- **DTO/批量/排序**：list/get 走 `OrdersDto` 白名单（内部列不上 wire）；
+  `POST /orders/bulk` 批量创建；list 支持 `sort=amount&order=desc`
+  （列名白名单防注入）；`total` 为真实 COUNT。
+
+重新生成：`zmodu saas …` 后运行
+`python3 examples/zmsaas/scripts/reapply-custom.py` 一键恢复自定义层。
 
 ## 前端 CRUD 收敛（DataTable / EntityForm）
 

@@ -23,7 +23,6 @@ const columns: ColumnDef<Orders>[] = [
   { key: 'amount', header: 'Amount (分)', render: (r) => String(r.amount) },
   { key: 'status', header: 'Status', render: (r) => <Badge class={toneFor(String(r.status))}>{String(r.status)}</Badge> },
   { key: 'notes', header: 'Notes' },
-  { key: 'updated_at', header: 'Updated', render: (r) => new Date(r.updated_at * 1000).toLocaleString() },
 ];
 
 export default function OrdersPage() {
@@ -35,6 +34,7 @@ export default function OrdersPage() {
   const [error, setError] = createSignal<string | null>(null);
   const [editing, setEditing] = createSignal<Orders | null>(null);
   const [showCreate, setShowCreate] = createSignal(false);
+  const [bulkText, setBulkText] = createSignal('acme-bulk|1000|pending\nbeta-bulk|2000|pending');
 
   async function refresh(c: ApiClient) {
     setLoading(true);
@@ -96,6 +96,19 @@ export default function OrdersPage() {
     await refresh(c);
   }
 
+  async function bulkCreate() {
+    const c = client();
+    if (!c) return;
+    const items = bulkText().split('\n').filter(Boolean).map((line) => {
+      const [customer, amount, status] = line.split('|');
+      return { customer: customer.trim(), amount: Number(amount), status: (status ?? 'pending').trim() };
+    });
+    const ids = await c.createMany('orders', items);
+    setBulkText('');
+    setError(`bulk created ids: ${ids.join(', ')}`);
+    await refresh(c);
+  }
+
   return (
     <>
       <Title>Orders</Title>
@@ -121,6 +134,17 @@ export default function OrdersPage() {
           />
         </div>
       </Show>
+      <div class="mb-6 rounded-lg border bg-card p-5">
+        <h2 class="mb-2 text-lg font-semibold">Bulk create (POST /orders/bulk)</h2>
+        <p class="mb-2 text-sm text-muted-foreground">每行一条：customer|amount|status（一次 RTT）</p>
+        <textarea
+          value={bulkText()}
+          rows={3}
+          onInput={(e) => setBulkText(e.currentTarget.value)}
+          class="mb-3 w-full rounded-md border bg-background px-3 py-2 text-sm font-mono"
+        />
+        <Button onClick={bulkCreate}>Bulk Create</Button>
+      </div>
       <DataTable
         columns={columns}
         rows={rows()}
