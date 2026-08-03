@@ -15,18 +15,25 @@ const auth_mod = @import("auth/root.zig");
 const middleware = @import("middleware/root.zig");
 const schema = @import("db/schema.zig");
 const ops = @import("ops.zig");
+const shard = @import("shard.zig");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
 
     const sqlite_path = init.environ_map.get("ZFSAAS_SQLITE") orelse ":memory:";
+    // 文件 DB 用连接池（cron outbox 后台线程与请求线程共用，线程安全）；
+    // :memory: 每连接独立库，保持单连接。
+    const pooled = !std.mem.eql(u8, sqlite_path, ":memory:");
     var db_client = zigmodu.data.Client.init(allocator, io, .{
         .driver = .sqlite,
         .sqlite_path = sqlite_path,
+        .max_open_conns = if (pooled) 4 else 1,
+        .max_idle_conns = if (pooled) 2 else 1,
     });
     defer db_client.deinit();
     try db_client.connect();
+    db_client.warmPool();
     try schema.apply(&db_client, allocator);
     try schema.grants(&db_client);
     std.log.info("[zmsaas] sqlite ready at {s}", .{sqlite_path});
@@ -76,6 +83,8 @@ pub fn main(init: std.process.Init) !void {
     var api = orders_mod.api.OrdersApi.init(&svc);
     var actions_api = orders_mod.api.OrdersActionsApi.init(&svc);
     var ops_api = ops.OpsApi.init(&db_client);
+    const shard_dir = init.environ_map.get("ZFSAAS_SHARD_DIR") orelse "/tmp";
+    var shard_api = try shard.ShardApi.init(allocator, io, shard_dir);
     var auth_api = auth_mod.AuthApi{};
 
     // CRUD 即事件源：写操作（含自定义 cancel 走的 crud.update）自动 publish，
@@ -90,8 +99,9 @@ pub fn main(init: std.process.Init) !void {
     const OrdersApiT = @TypeOf(api);
     const OrdersActionsApiT = @TypeOf(actions_api);
     const OpsApiT = @TypeOf(ops_api);
+    const ShardApiT = @TypeOf(shard_api);
     const AuthApiT = @TypeOf(auth_api);
-    comptime zigmodu.http.assertNoDupes(.{ OrdersApiT, OrdersActionsApiT, OpsApiT, AuthApiT });
+    comptime zigmodu.http.assertNoDupes(.{ OrdersApiT, OrdersActionsApiT, OpsApiT, ShardApiT, AuthApiT });
     var router = zigmodu.http.Router(AppState).init(io, allocator, &server, &app_state);
     defer router.deinit();
     var api_v1 = router.scope("/api/v1");
@@ -100,6 +110,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .Mod = OrdersApiT, .state = &api },
         .{ .Mod = OrdersActionsApiT, .state = &actions_api },
         .{ .Mod = OpsApiT, .state = &ops_api },
+        .{ .Mod = ShardApiT, .state = &shard_api },
     });
     catalog_slot.set(try router.finish());
     std.log.info("[zmsaas] route catalog: {d} entries", .{catalog_slot.get().?.entries.len});
@@ -134,7 +145,30 @@ pub fn main(init: std.process.Init) !void {
     });
 
     std.log.info("[zmsaas] http://0.0.0.0:{d}/api/v1/orders (JWT required)", .{port});
+
+    // ── Outbox cron 投递（文件 DB + 池化 client）──────────────
+    var outbox_scheduler: ?zigmodu.cron.Scheduler = null;
+    if (pooled) {
+        var sched = zigmodu.cron.Scheduler.init(allocator, io);
+        const expr = try zigmodu.cron.Expression.parse("* * * * *");
+        const OutboxCtx = struct { allocator: std.mem.Allocator, client: *zigmodu.data.Client };
+        const outbox_ctx = try allocator.create(OutboxCtx);
+        outbox_ctx.* = .{ .allocator = allocator, .client = &db_client };
+        try sched.addJob("outbox", expr, outboxCronTick, outbox_ctx);
+        try sched.start();
+        outbox_scheduler = sched;
+        std.log.info("[zmsaas] outbox cron worker started (every minute, pooled client)", .{});
+    }
+    defer if (outbox_scheduler) |*s| s.stop();
+
     try server.start();
+}
+
+fn outboxCronTick(user_data: *anyopaque) void {
+    const ctx: *struct { allocator: std.mem.Allocator, client: *zigmodu.data.Client } = @ptrCast(@alignCast(user_data));
+    ops.deliverPending(ctx.allocator, ctx.client) catch |err| {
+        std.log.err("[outbox] cron delivery failed: {s}", .{@errorName(err)});
+    };
 }
 
 fn dbCheck(user_data: ?*anyopaque) zigmodu.HealthEndpoint.HealthStatus {

@@ -84,8 +84,23 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/orders
   `POST /api/v1/outbox/flush`（`src/ops.zig`，单线程安全）演示一轮投递：
   pending → processing → delivered（实测 status 0→2）；生产把
   `deliverPending` 挂到 cron 周期任务或 DistributedEventBus 消费者。
+  文件 DB 模式下自动启动 **cron 周期投递**（每分钟，`Scheduler` 后台线程 +
+  池化 client 保证线程安全）：`fulfill` 后无需 flush，一个周期内自动
+  delivered（实测 status 0→2）。
 - **前端真实登录态**：orders 页 token 存 sessionStorage，未登录显示登录表单，
   登出清态；401 时错误提示。生产把 SolidStart 会话兑换成带租户/角色的 JWT。
+
+## 多租户纵深（shard + 数据权限）
+
+- **ShardRouter 分片**：`GET /api/v1/shard/route?org_id=N` 演示租户→分片路由
+  （org 1→shard_a，org 2→shard_b）；`POST /api/v1/shard/orders` 把订单写到
+  租户所在分片（两个 sqlite 文件），`GET /api/v1/shard/orders` 从分片读回。
+- **数据权限**：列表按 JWT 角色过滤——`login` 默认 admin（全量），
+  `login?role=user&uid=42` 签发 user（`DataPermissionContext.fromRoles` +
+  `buildWhere("region","owner_id")` 的 `.self_` 作用域：只见本人行）。
+  实测 admin 见全部、user(42) 只见 owner_id=42，跨分片一致。
+- 生产：分片为 PG/MySQL 时直接用 `ShardRouter.buildSqlxConfig(pool)` 建连接；
+  数据权限可下沉到 TenantInterceptor/中间件统一注入。
 
 ## 前端 CRUD 收敛（DataTable / EntityForm）
 
