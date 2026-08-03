@@ -62,6 +62,40 @@ curl -s -X DELETE 'http://127.0.0.1:18100/api/v1/products/1?tenant_id=1'
 自定义端点（counts/search/bulk/SSE）与泛型 CRUD 同 `module_name`/`nest`
 共存，`assertNoDupes` 只拦截重复 method+path。
 
+## Outbox（事务性事件 + cron 投递）
+
+`zent.outbox.Outbox` 演示：事件行与业务写在同一事务里
+（`beginTx → enqueueTx → commit`），提交后 `dispatch` 至少一次投递，失败自动
+重试（attempts+1），超 `max_attempts` 标记 failed。
+
+```bash
+# 事务入队（与业务变更原子提交）
+curl -s -X POST 'http://127.0.0.1:18100/api/v1/outbox/enqueue?aggregate_type=product&aggregate_id=1&event_type=product.created&payload=%7B%22id%22%3A1%7D'
+# 手动投递（cron 每分钟自动投递，需要 ZENT_SQLITE=文件路径）
+curl -s -X POST 'http://127.0.0.1:18100/api/v1/outbox/dispatch'
+```
+
+后台 cron 使用**独立连接**（file-backed SQLite），不与请求 fiber 共享 driver；
+`:memory:` 模式会告警并跳过 cron（手动 dispatch 仍可用）。
+
+## Data-scope 行级权限（中间件下沉）
+
+`Doc` schema 挂了 `zent.data_scope.Policy`：scope 中间件从请求解析出
+`user_id/tenant_id/scope/self_dept_id/dept_ids` 写入 attrs，handler 构建
+`DataScopeFilter` 并通过 scoped zent client 查询——行级过滤发生在 SQL 层，
+缺上下文直接 `PrivacyDenied`。
+
+```bash
+# self_：只看 owner_id = user_id 的行
+curl -s 'http://127.0.0.1:18100/api/v1/docs?user_id=1&tenant_id=1&scope=self_'
+# dept_custom：只看 dept_ids 命中行
+curl -s 'http://127.0.0.1:18100/api/v1/docs?user_id=1&tenant_id=1&scope=dept_custom&dept_ids=9'
+# dept_only：看本部门行
+curl -s 'http://127.0.0.1:18100/api/v1/docs?user_id=1&tenant_id=1&scope=dept_only&self_dept_id=3'
+# all：全量
+curl -s 'http://127.0.0.1:18100/api/v1/docs?user_id=1&tenant_id=1&scope=all'
+```
+
 ## zent 新特性演示
 
 - **paged()**：泛型 list 即 `GET /api/v1/products?tenant_id=1&page=1&page_size=2`
@@ -82,6 +116,8 @@ curl -s -X DELETE 'http://127.0.0.1:18100/api/v1/products/1?tenant_id=1'
 ```
 src/
   main.zig                 # ZigModu ComptimeRouter + zent migrate/client
+  outbox_demo.zig          # outbox 事务入队 + dispatch（HTTP + cron）
+  data_scope_demo.zig      # scope 中间件 + DocApi（行级权限）
   modules/catalog/
   model.zig              # zent Schema("Tenant"|"Product")
   persistence.zig        # zent Client wrappers

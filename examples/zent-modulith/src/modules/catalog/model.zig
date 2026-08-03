@@ -17,3 +17,15 @@ pub const Product = Schema("Product", .{
         field.Int("price_cents"),
     },
 });
+
+/// Data-scope demo entity: row-level access controlled by
+/// `zent.data_scope.Policy` (owner_id / dept_id scopes).
+pub const Doc = Schema("Doc", .{
+    .fields = &.{
+        field.Int("tenant_id"),
+        field.Int("owner_id"),
+        field.Int("dept_id"),
+        field.String("title"),
+    },
+    .policy = zent.data_scope.Policy,
+});

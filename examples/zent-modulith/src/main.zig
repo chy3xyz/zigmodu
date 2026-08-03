@@ -3,6 +3,8 @@ const zigmodu = @import("zigmodu");
 const zent = @import("zent");
 const zent_helpers = @import("zent_helpers");
 const zent_crud = @import("zent_crud.zig");
+const outbox_demo = @import("outbox_demo.zig");
+const data_scope_demo = @import("data_scope_demo.zig");
 
 const catalog_module = @import("modules/catalog/module.zig");
 const catalog = @import("modules/catalog/root.zig");
@@ -45,6 +47,70 @@ pub fn main(init: std.process.Init) !void {
     });
     var product_api = ProductApiT.init(&product_crud);
 
+    // Data-scope demo: Doc carries zent.data_scope.Policy, so creates need a
+    // context (seed with an .all scope; real requests get one from the
+    // scope middleware).
+    var seed_scope = zent.data_scope.DataScopeFilter.init("dept_id", "owner_id", .all, .{});
+    const seed_doc = env.client.doc.withContext(seed_scope.context(.{ .tenant_id = 1 }));
+    inline for (.{ .{ 1, 1, 3, "alice-notes" }, .{ 1, 1, 3, "alice-roi" }, .{ 1, 2, 9, "bob-report" } }) |seed| {
+        var b = try seed_doc.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("tenant_id", @as(i64, seed[0]));
+        _ = try b.setFieldValue("owner_id", @as(i64, seed[1]));
+        _ = try b.setFieldValue("dept_id", @as(i64, seed[2]));
+        _ = try b.setFieldValue("title", seed[3]);
+        var row = try b.Save();
+        zent.codegen.deinitEntity(catalog.persistence.infos, catalog.persistence.DocInfo, &row, allocator);
+    }
+
+    // Outbox demo: transactional enqueue + on-demand/cron dispatch.
+    var outbox_dispatcher = outbox_demo.Dispatcher{
+        .allocator = allocator,
+        .client = &env.client,
+        .io = io,
+    };
+    const OutboxApiT = outbox_demo.OutboxDemoApi();
+    var outbox_api = OutboxApiT.init(&outbox_dispatcher);
+
+    // Data-scope demo API (scope middleware fills attrs; handler queries
+    // through the scoped zent client).
+    const DocApiT = data_scope_demo.DocApi(@TypeOf(env.client));
+    var doc_api = DocApiT.init(&env.client);
+
+    // Outbox cron: dispatch pending events every minute. The background
+    // thread uses its OWN connection (file-backed SQLite only), so it never
+    // shares a driver with request fibers.
+    var cron_driver: ?zent.sql_sqlite.SQLiteDriver = null;
+    var cron_client: ?catalog.persistence.Client = null;
+    if (std.mem.eql(u8, sqlite_path, ":memory:")) {
+        std.log.warn("[cron] in-memory DB: outbox cron disabled (set ZENT_SQLITE=/path/db.sqlite to enable)", .{});
+    } else {
+        cron_driver = try zent.sql_sqlite.SQLiteDriver.open(allocator, sqlite_path);
+        cron_client = zent.codegen.client.makeClient(catalog.persistence.infos, allocator, cron_driver.?.asDriver());
+    }
+    const CronCtx = struct {
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        client: ?*catalog.persistence.Client,
+    };
+    var cron_ctx = CronCtx{
+        .allocator = allocator,
+        .io = io,
+        .client = if (cron_client) |*c| c else null,
+    };
+    var cron = zigmodu.cron.Scheduler.init(allocator, io);
+    defer cron.deinit();
+    try cron.addJob("outbox-dispatch", try zigmodu.cron.Expression.parse("* * * * *"), struct {
+        fn run(ctx: ?*anyopaque) void {
+            const c: *CronCtx = @ptrCast(@alignCast(ctx.?));
+            if (c.client) |cl| {
+                var disp = outbox_demo.Dispatcher{ .allocator = c.allocator, .client = cl, .io = c.io };
+                _ = disp.dispatchOnce() catch |err| std.log.err("[cron] outbox dispatch failed: {s}", .{@errorName(err)});
+            }
+        }
+    }.run, &cron_ctx);
+    try cron.start();
+
     // --- ZigModu modules ---
     var modules = try zigmodu.scanModules(allocator, .{catalog_module});
     defer modules.deinit();
@@ -74,7 +140,7 @@ pub fn main(init: std.process.Init) !void {
     defer catalog_slot.deinit();
     try server.addMiddleware(zigmodu.http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
 
-    comptime zigmodu.http.assertNoDupes(.{ CatalogApiT, ProductApiT });
+    comptime zigmodu.http.assertNoDupes(.{ CatalogApiT, ProductApiT, OutboxApiT, DocApiT });
 
     const AppState = struct {};
     var app_state: AppState = .{};
@@ -86,7 +152,10 @@ pub fn main(init: std.process.Init) !void {
     try api_v1.mountAll(.{
         .{ .Mod = CatalogApiT, .state = &catalog_api },
         .{ .Mod = ProductApiT, .state = &product_api },
+        .{ .Mod = OutboxApiT, .state = &outbox_api },
     });
+    var docs_scope = try api_v1.use(.{ .func = data_scope_demo.scopeMiddleware });
+    try docs_scope.mount(DocApiT, &doc_api);
     catalog_slot.set(try router.finish());
 
     try server.addRoute(.{
@@ -114,6 +183,9 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("[main] POST /api/v1/tenants?name=&domain=", .{});
     std.log.info("[main] CrudApi: GET/POST /api/v1/products?tenant_id= (paged list / create)", .{});
     std.log.info("[main] CrudApi: GET/PUT/DELETE /api/v1/products/<id>?tenant_id=", .{});
+    std.log.info("[main] POST /api/v1/outbox/enqueue?aggregate_type=&aggregate_id=&event_type=&payload=", .{});
+    std.log.info("[main] POST /api/v1/outbox/dispatch (manual; cron every minute when file-backed)", .{});
+    std.log.info("[main] GET  /api/v1/docs?user_id=&tenant_id=&scope=self_|dept_only|dept_custom&dept_ids=", .{});
     std.log.info("[main] GET  /api/v1/events (SSE)", .{});
     std.log.info("[main] OpenAPI: http://127.0.0.1:{d}/openapi.json", .{port});
     try server.start();
