@@ -620,8 +620,9 @@ pub const OrdersApi = zigmodu.http.CrudApi(model.Orders, service.OrdersService, 
 - 零透传：service 声明 `pub const impl = data.CrudService(Entity, P)` 与
   `crud: impl` 字段后，`CrudApi` 自动直通（无需再写 5 个转发方法）；
   生成的 service 只有接线 + `validate` 钩子（`zmodu saas` 已按此产出）；
-- 读路径用 `queryRowsSlice(allocator, Model, sql, args)`（按列名映射、索引
-  每查询建一次），禁止手写 `scan()` 列下标取值——列顺序变化会静默错位；
+- 读路径禁止手写 `scan()` 列下标取值——列顺序变化会静默错位；分页列表用
+  arena-backed `data.ResultSet`（`queryRows.take()`，字符串零拷贝、`deinit`
+  一次释放），单行用 `queryRowsSlice`（按列名映射、索引每查询建一次）；
 - 多写一致性：`svc.transact(T, f)` 事务封装（生成物自带），避免手写
   begin/commit/rollback 遗漏。
 - 可观测一行开：`server.addMiddleware(zigmodu.http.tracingMiddleware())`

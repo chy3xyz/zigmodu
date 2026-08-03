@@ -222,9 +222,9 @@ fn emitPersistence(allocator: std.mem.Allocator, e: *const Entity, P: []const u8
     try buf.appendSlice(allocator, "    }\n\n");
 
     // list
-    try appendPrint(allocator, &buf, "    pub fn list(self: *@This(), allocator: std.mem.Allocator, org_id: i64, page: usize, size: usize) !std.ArrayList(model.{s}) {{\n", .{P});
+    try appendPrint(allocator, &buf, "    pub fn list(self: *@This(), org_id: i64, page: usize, size: usize) !data.ResultSet(model.{s}) {{\n", .{P});
     try buf.appendSlice(allocator,
-        \\        const rows = try self.backend.client.queryRowsSlice(allocator, model.
+        \\        var result = try self.backend.client.queryRows(model.
     );
     try buf.appendSlice(allocator, P);
     try buf.appendSlice(allocator, ", \"SELECT id, org_id, ");
@@ -233,22 +233,8 @@ fn emitPersistence(allocator: std.mem.Allocator, e: *const Entity, P: []const u8
     try buf.appendSlice(allocator, e.name);
     try appendPrint(allocator, &buf, " WHERE org_id = ? ORDER BY id DESC LIMIT ? OFFSET ?\", &.{{ .{{ .int = org_id }}, .{{ .int = @intCast(size) }}, .{{ .int = @intCast((page -| 1) * size) }} }});\n", .{});
     try buf.appendSlice(allocator,
-        \\        defer allocator.free(rows);
-        \\        var out = std.ArrayList(model.
-    );
-    try buf.appendSlice(allocator, P);
-    try buf.appendSlice(allocator,
-        \\).empty;
-        \\        errdefer {
-        \\            for (rows) |item| data.sqlx.freeScanned(allocator, model.
-    );
-    try buf.appendSlice(allocator, P);
-    try buf.appendSlice(allocator,
-        \\, item);
-        \\            out.deinit(allocator);
-        \\        }
-        \\        for (rows) |e| try out.append(allocator, e);
-        \\        return out;
+        \\        const take = result.take();
+        \\        return .{ .items = take.items, .arena = take.arena };
         \\    }
         \\
     );
@@ -479,13 +465,8 @@ fn emitTests(allocator: std.mem.Allocator, e: *const Entity, P: []const u8) ![]c
         \\    try std.testing.expect(id > 0);
         \\    try std.testing.expectEqual(@as(u64, 1), bus.publishedCount());
         \\
-        \\    var items = try svc.crud.list(allocator, 1, 1, 10);
+        \\    var items = try svc.crud.list(1, 1, 10);
         \\    defer items.deinit(allocator);
-        \\    for (items.items) |item| zigmodu.data.sqlx.freeScanned(allocator, model.
-    );
-    try buf.appendSlice(allocator, P);
-    try buf.appendSlice(allocator,
-        \\, item);
         \\    try std.testing.expectEqual(@as(usize, 1), items.items.len);
         \\
         \\    const got = (try svc.crud.get(allocator, 1, id)).?;

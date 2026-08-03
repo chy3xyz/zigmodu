@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const event_bus = @import("../core/EventBus.zig");
+const result_set = @import("ResultSet.zig");
 
 pub fn CrudEvent(comptime Entity: type) type {
     _ = Entity;
@@ -36,8 +37,10 @@ pub fn CrudService(comptime Entity: type, comptime P: type) type {
             if (self.event_bus) |bus| bus.publish(e);
         }
 
-        pub fn list(self: *Self, allocator: std.mem.Allocator, org_id: i64, page: usize, size: usize) !std.ArrayList(Entity) {
-            return self.persistence.list(allocator, org_id, page, size);
+        /// Arena-backed read: items borrow one arena (no per-string copy) —
+        /// callers `defer result.deinit(allocator)` once.
+        pub fn list(self: *Self, org_id: i64, page: usize, size: usize) !result_set.ResultSet(Entity) {
+            return self.persistence.list(org_id, page, size);
         }
 
         pub fn get(self: *Self, allocator: std.mem.Allocator, org_id: i64, id: i64) !?Entity {
@@ -77,8 +80,8 @@ const FakePersistence = struct {
     updated: bool = false,
     deleted: bool = false,
 
-    pub fn list(_: *@This(), _: std.mem.Allocator, _: i64, _: usize, _: usize) !std.ArrayList(FakeEntity) {
-        return std.ArrayList(FakeEntity).empty;
+    pub fn list(_: *@This(), _: i64, _: usize, _: usize) !result_set.ResultSet(FakeEntity) {
+        return result_set.ResultSet(FakeEntity).fromOwned(&[_]FakeEntity{}, null);
     }
     pub fn get(_: *@This(), allocator: std.mem.Allocator, _: i64, id: i64) !?FakeEntity {
         _ = allocator;

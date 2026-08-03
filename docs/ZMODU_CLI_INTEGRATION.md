@@ -123,9 +123,11 @@ pub const OrdersService = struct {
 
 生成代码质量（减少错误率）：
 
-- persistence 读路径用 `queryRowsSlice(allocator, model.X, sql, args)`：
-  按**列名**映射（替代手写 `scan()` 的列下标取值——增列/改列顺序不再静默
-  错位），且列名索引**每查询只建一次**（大结果集比逐行 `row.scan` 快）；
+- persistence 分页列表返回 arena-backed `data.ResultSet`（`queryRows.take()`
+  字符串零拷贝，`defer result.deinit(allocator)` 一次释放——10k 行实测
+  ~2.2ms，比逐行 dup 快 ~30%）；单行 `get` 用 `queryRowsSlice`
+  （按**列名**映射，替代手写 `scan()` 列下标取值——增列/改列顺序不再静默
+  错位，索引每查询只建一次）；
 - 每个模块自动产出 `tests.zig`（内存 sqlite 的 CRUD 冒烟 + validate 负向 +
   transact 冒烟），项目 build.zig 加一个 test step 即接入 `zig build test`；
 - `CrudOpts.dto` 让 list/get 响应自动走 DTO 白名单；

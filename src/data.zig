@@ -9,6 +9,7 @@ pub const SqlxBackend = @import("persistence/backends/SqlxBackend.zig").SqlxBack
 pub const Repository = orm.Orm(SqlxBackend).Repository;
 pub const CrudService = @import("data/CrudService.zig").CrudService;
 pub const CrudEvent = @import("data/CrudService.zig").CrudEvent;
+pub const ResultSet = @import("data/ResultSet.zig").ResultSet;
 pub const Client = @import("sqlx/sqlx.zig").Client;
 pub const ManagedRows = @import("sqlx/sqlx.zig").ManagedRows;
 pub const pool = @import("pool/Pool.zig");

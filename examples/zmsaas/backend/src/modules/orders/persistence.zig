@@ -11,16 +11,10 @@ pub const OrdersPersistence = struct {
         return .{ .backend = b };
     }
 
-    pub fn list(self: *@This(), allocator: std.mem.Allocator, org_id: i64, page: usize, size: usize) !std.ArrayList(model.Orders) {
-        const rows = try self.backend.client.queryRowsSlice(allocator, model.Orders, "SELECT id, org_id, customer, amount, status, notes, created_at, updated_at FROM orders WHERE org_id = ? ORDER BY id DESC LIMIT ? OFFSET ?", &.{ .{ .int = org_id }, .{ .int = @intCast(size) }, .{ .int = @intCast((page -| 1) * size) } });
-        defer allocator.free(rows);
-        var out = std.ArrayList(model.Orders).empty;
-        errdefer {
-            for (rows) |item| data.sqlx.freeScanned(allocator, model.Orders, item);
-            out.deinit(allocator);
-        }
-        for (rows) |e| try out.append(allocator, e);
-        return out;
+    pub fn list(self: *@This(), org_id: i64, page: usize, size: usize) !data.ResultSet(model.Orders) {
+        var result = try self.backend.client.queryRows(model.Orders, "SELECT id, org_id, customer, amount, status, notes, created_at, updated_at FROM orders WHERE org_id = ? ORDER BY id DESC LIMIT ? OFFSET ?", &.{ .{ .int = org_id }, .{ .int = @intCast(size) }, .{ .int = @intCast((page -| 1) * size) } });
+        const take = result.take();
+        return .{ .items = take.items, .arena = take.arena };
     }
     pub fn get(self: *@This(), allocator: std.mem.Allocator, org_id: i64, id: i64) !?model.Orders {
         const rows = try self.backend.client.queryRowsSlice(allocator, model.Orders, "SELECT id, org_id, customer, amount, status, notes, created_at, updated_at FROM orders WHERE org_id = ? AND id = ? LIMIT 1", &.{ .{ .int = org_id }, .{ .int = id } });

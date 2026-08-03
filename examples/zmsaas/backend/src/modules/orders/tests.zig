@@ -28,9 +28,8 @@ test "orders persistence + CrudService round-trip" {
     try std.testing.expect(id > 0);
     try std.testing.expectEqual(@as(u64, 1), bus.publishedCount());
 
-    var items = try svc.crud.list(allocator, 1, 1, 10);
+    var items = try svc.crud.list(1, 1, 10);
     defer items.deinit(allocator);
-    for (items.items) |item| zigmodu.data.sqlx.freeScanned(allocator, model.Orders, item);
     try std.testing.expectEqual(@as(usize, 1), items.items.len);
 
     const got = (try svc.crud.get(allocator, 1, id)).?;
