@@ -109,7 +109,9 @@ curl -s -X POST 'http://127.0.0.1:18100/api/v1/inventory/decrement?product_id=1&
 ```
 
 **两级嵌套预加载（`WithEdge("posts.comments")`）**：主查询 + 每级一次 IN
-邻居查询，返回 Author → posts → comments 嵌套 JSON。
+邻居查询，返回 Author → posts → comments 嵌套 JSON。`comments` 边声明了
+`OrderBy("id").Desc().Limit(2)`——每篇 post 只带**最新 2 条**评论（每父
+`LIMIT` 走窗口函数 `ROW_NUMBER() OVER (PARTITION BY …)`）。
 
 ```bash
 curl -s http://127.0.0.1:18100/api/v1/feed/authors

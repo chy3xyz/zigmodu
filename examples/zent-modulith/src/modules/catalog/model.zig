@@ -45,7 +45,8 @@ pub const Post = Schema("Post", .{
         field.Int("author_id"),
         field.String("title"),
     },
-    .edges = &.{edge.To("comments", Comment)},
+    // Per-parent eager load: newest 2 comments per post (edge order/limit).
+    .edges = &.{edge.To("comments", Comment).Field("post_id").OrderBy("id").Desc().Limit(2)},
 });
 
 pub const Author = Schema("Author", .{

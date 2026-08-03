@@ -179,6 +179,8 @@ Application / http
 | 批量写 / upsert | `BulkInsertBuilder.SaveOrUpdate`（zent）；`data.bulk.insertMany`（zigmodu sqlx） | 下单商品明细 N 次 round-trip → 1 次。 |
 | 两级关系预加载 | `q.WithEdge("posts.comments")` | 一次主查询 + 每级一次 IN 邻居查询；第三级为编译错误（终点无 edges 容器），逐层手动查询即可。 |
 | 关注/好友/点赞 | `edge.To/From` + `graph.neighbors` | m2m 邻居查询（has/with 谓词）覆盖"我关注的人发的动态"。 |
+| 时间戳自动维护 | `TimeMixin` + v0.22 | `created_at`/`updated_at` 列自动获得 epoch `DEFAULT`（方言感知）；`UpdateBuilder` 自动刷新 `updated_at`（显式设置优先）。 |
+| 边排序 / 每父限量 | `edge.To(...).OrderBy("created_at").Desc().Limit(10)` | 预加载列表按目标列排序；每父 `LIMIT` 用 `ROW_NUMBER() OVER (PARTITION BY fk …)`（O2M/O2O；M2M/M2O 声明 limit 报 `UnsupportedEdgeLimit`）。显式 FK 用 `.Field("post_id")` 绑定（v0.22 修复）。 |
 
 ### 4.7 复杂报表与 join 边界（架构取舍）
 

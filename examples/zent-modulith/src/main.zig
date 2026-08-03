@@ -100,6 +100,15 @@ pub fn main(init: std.process.Init) !void {
         var row = try b.Save();
         zent.codegen.deinitEntity(catalog.persistence.infos, catalog.persistence.CommentInfo, &row, allocator);
     }
+    // Third comment on post_a so the Limit(2) is observable (newest two only).
+    {
+        var b = try env.client.comment.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("post_id", post_a);
+        _ = try b.setFieldValue("body", "third");
+        var row = try b.Save();
+        zent.codegen.deinitEntity(catalog.persistence.infos, catalog.persistence.CommentInfo, &row, allocator);
+    }
     {
         var b = try env.client.inventory.Create();
         defer b.deinit();
