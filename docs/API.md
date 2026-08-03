@@ -1155,11 +1155,29 @@ pub const Database = struct {
 
 pub fn Repository(comptime T: type) type {
     pub fn findById(self: *Self, id: i64) !?T
-    pub fn save(self: *Self, entity: T) !void
+    pub fn findByIds(self: *Self, allocator: Allocator, ids: anytype) !QueryResult(T)  // WHERE pk IN (…) 一次 round-trip
+    pub fn insert(self: *Self, entity: T) !T
+    pub fn insertMany(self: *Self, allocator: Allocator, entities: []const T) !void    // 多行 VALUES (?,?),(?,?) 一次 round-trip
+    pub fn upsertMany(self: *Self, allocator: Allocator, entities: []const T, conflict_columns: []const []const u8) !void
+    pub fn update(self: *Self, entity: T) !void
     pub fn delete(self: *Self, id: i64) !void
     pub fn findAll(self: *Self, buf: []T) ![]T
 }
 ```
+
+`data.bulk` (`src/sqlx/Bulk.zig`) 提供底层批量写助手，供手写 SQL 代码直接使用
+（`sqlx.Client` / `Transaction` / `SqlxBackend` 均可作为 exec 目标）：
+
+```zig
+pub const bulk = zigmodu.data.bulk;
+_ = try bulk.insertMany(alloc, &client, "order_product", &.{ "order_id", "sku" }, &rows, .sqlite, .{
+    .conflict_columns = &.{"id"},
+}); // upsert 后缀：SQLite/PG → ON CONFLICT ("id") DO UPDATE SET …；MySQL → ON DUPLICATE KEY UPDATE
+```
+
+批量写是 API 演进而非范式问题：手写 sqlx 与 Repository 两条路径共用同一
+生成器；对 zigshop 这类裸 sqlx 项目，换用 `bulk.insertMany` 即可把
+下单商品从 N 次 round-trip 降为 1 次，无需引入 zent。
 
 ### Cluster Membership
 

@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const sqlx = @import("../sqlx/sqlx.zig");
+const bulk = @import("../sqlx/Bulk.zig");
 
 /// Common value representation for ORM parameter binding
 pub const OrmValue = union(enum) {
@@ -236,6 +237,58 @@ fn comptimeInsertArgCount(comptime fields: []const []const u8) usize {
     }
 }
 
+fn comptimeInsertArgCountUpsert(comptime fields: []const []const u8) usize {
+    @setEvalBranchQuota(100_000);
+    comptime {
+        var n: usize = 0;
+        for (fields) |fname| {
+            if (!comptimeSkipUpsertField(fname)) n += 1;
+        }
+        return n;
+    }
+}
+
+/// SQL columns actually written by INSERT (field order preserved, skipping
+/// generated/audit fields like id/create_time).
+fn comptimeInsertColumns(
+    comptime sql_cols: []const []const u8,
+    comptime fields: []const []const u8,
+) []const []const u8 {
+    comptime {
+        var result: []const []const u8 = &.{};
+        for (fields, 0..) |fname, i| {
+            if (comptimeSkipInsertField(fname)) continue;
+            result = result ++ &[_][]const u8{sql_cols[i]};
+        }
+        return result;
+    }
+}
+
+/// Upsert writes the conflict key too (id), so ON CONFLICT can match; only
+/// audit columns (create_time/update_time/creator/updater/deleted) are
+/// skipped.
+fn comptimeSkipUpsertField(comptime fname: []const u8) bool {
+    return std.mem.eql(u8, fname, "create_time") or
+        std.mem.eql(u8, fname, "update_time") or
+        std.mem.eql(u8, fname, "creator") or
+        std.mem.eql(u8, fname, "updater") or
+        std.mem.eql(u8, fname, "deleted");
+}
+
+fn comptimeUpsertColumns(
+    comptime sql_cols: []const []const u8,
+    comptime fields: []const []const u8,
+) []const []const u8 {
+    comptime {
+        var result: []const []const u8 = &.{};
+        for (fields, 0..) |fname, i| {
+            if (comptimeSkipUpsertField(fname)) continue;
+            result = result ++ &[_][]const u8{sql_cols[i]};
+        }
+        return result;
+    }
+}
+
 fn comptimeInsert(
     comptime table: []const u8,
     comptime sql_cols: []const []const u8,
@@ -457,6 +510,31 @@ pub fn Orm(comptime B: type) type {
                     return self.orm.backend.queryRow(T, sql, &args);
                 }
 
+                /// Batch lookup: `WHERE pk IN (?,?,…)` in one round-trip.
+                /// Result order follows the DB, not the input order.
+                pub fn findByIds(self: @This(), allocator: std.mem.Allocator, ids: anytype) !sqlx.QueryResult(T) {
+                    if (ids.len == 0) return error.EmptyIds;
+                    const cols = comptime comptimeColumnList(meta.sql_columns, meta.fields, meta.camel_case);
+                    var buf = std.ArrayList(u8).empty;
+                    defer buf.deinit(allocator);
+                    try buf.appendSlice(allocator, "SELECT ");
+                    try buf.appendSlice(allocator, cols);
+                    try buf.appendSlice(allocator, " FROM ");
+                    try buf.appendSlice(allocator, meta.table_name);
+                    try buf.appendSlice(allocator, " WHERE ");
+                    try buf.appendSlice(allocator, meta.primary_key);
+                    try buf.appendSlice(allocator, " IN (");
+                    for (0..ids.len) |i| {
+                        if (i > 0) try buf.appendSlice(allocator, ",");
+                        try buf.appendSlice(allocator, "?");
+                    }
+                    try buf.appendSlice(allocator, ")");
+                    const args = try allocator.alloc(B.Value, ids.len);
+                    defer allocator.free(args);
+                    for (ids, 0..) |id, i| args[i] = B.fromOrmValue(toOrmValue(id));
+                    return self.orm.backend.queryRows(T, buf.items, args);
+                }
+
                 pub fn findAll(self: @This()) !sqlx.QueryResult(T) {
                     const sql = comptime comptimeSelectAll(meta.table_name, meta.sql_columns, meta.fields, meta.camel_case);
                     return self.orm.backend.queryRows(T, sql, &.{});
@@ -543,6 +621,98 @@ pub fn Orm(comptime B: type) type {
                     return entity;
                 }
 
+                /// Multi-row INSERT in one round-trip (VALUES (?,?),(?,?)…).
+                pub fn insertMany(self: @This(), allocator: std.mem.Allocator, entities: []const T) !void {
+                    if (entities.len == 0) return;
+                    const columns = comptime comptimeInsertColumns(meta.sql_columns, meta.fields);
+                    const rows = try self.rowsFromEntities(allocator, entities);
+                    defer {
+                        for (rows) |r| allocator.free(r);
+                        allocator.free(rows);
+                    }
+                    _ = try bulk.insertMany(allocator, self.orm.backend, meta.table_name, columns, rows, .sqlite, null);
+                }
+
+                /// Multi-row upsert (INSERT … ON CONFLICT DO UPDATE /
+                /// ON DUPLICATE KEY UPDATE) in one round-trip. Requires a
+                /// backend exposing `dialect()` (e.g. data.SqlxBackend).
+                pub fn upsertMany(
+                    self: @This(),
+                    allocator: std.mem.Allocator,
+                    entities: []const T,
+                    conflict_columns: []const []const u8,
+                ) !void {
+                    if (entities.len == 0) return;
+                    if (!@hasDecl(@TypeOf(self.orm.backend), "dialect")) {
+                        @compileError("upsertMany requires a backend exposing dialect() (e.g. data.SqlxBackend)");
+                    }
+                    const columns = comptime comptimeUpsertColumns(meta.sql_columns, meta.fields);
+                    const rows = try self.rowsFromEntitiesUpsert(allocator, entities);
+                    defer {
+                        for (rows) |r| allocator.free(r);
+                        allocator.free(rows);
+                    }
+                    _ = try bulk.insertMany(
+                        allocator,
+                        self.orm.backend,
+                        meta.table_name,
+                        columns,
+                        rows,
+                        self.orm.backend.dialect(),
+                        .{ .conflict_columns = conflict_columns },
+                    );
+                }
+
+                /// Build one Value slice per entity (insert-column order).
+                fn rowsFromEntities(self: @This(), allocator: std.mem.Allocator, entities: []const T) ![]const []const B.Value {
+                    _ = self;
+                    const n_cols = comptime comptimeInsertArgCount(meta.fields);
+                    const rows = try allocator.alloc([]const B.Value, entities.len);
+                    var filled: usize = 0;
+                    errdefer {
+                        for (rows[0..filled]) |r| allocator.free(r);
+                        allocator.free(rows);
+                    }
+                    for (entities, 0..) |e, i| {
+                        const row = try allocator.alloc(B.Value, n_cols);
+                        var idx: usize = 0;
+                        inline for (@typeInfo(T).@"struct".field_names) |fname| {
+                            if (comptime comptimeSkipInsertField(fname)) continue;
+                            row[idx] = fieldToBackendValue(B, @field(e, fname));
+                            idx += 1;
+                        }
+                        rows[i] = row;
+                        filled += 1;
+                    }
+                    return rows;
+                }
+
+                /// Like rowsFromEntities but keeps the conflict key (id) and
+                /// only skips audit columns — order matches
+                /// comptimeUpsertColumns.
+                fn rowsFromEntitiesUpsert(self: @This(), allocator: std.mem.Allocator, entities: []const T) ![]const []const B.Value {
+                    _ = self;
+                    const n_cols = comptime comptimeInsertArgCountUpsert(meta.fields);
+                    const rows = try allocator.alloc([]const B.Value, entities.len);
+                    var filled: usize = 0;
+                    errdefer {
+                        for (rows[0..filled]) |r| allocator.free(r);
+                        allocator.free(rows);
+                    }
+                    for (entities, 0..) |e, i| {
+                        const row = try allocator.alloc(B.Value, n_cols);
+                        var idx: usize = 0;
+                        inline for (@typeInfo(T).@"struct".field_names) |fname| {
+                            if (comptime comptimeSkipUpsertField(fname)) continue;
+                            row[idx] = fieldToBackendValue(B, @field(e, fname));
+                            idx += 1;
+                        }
+                        rows[i] = row;
+                        filled += 1;
+                    }
+                    return rows;
+                }
+
                 pub fn update(self: @This(), entity: T) !void {
                     const sql = comptime comptimeUpdate(meta.table_name, meta.sql_columns, meta.primary_key);
                     const n = @typeInfo(T).@"struct".field_names.len;
@@ -627,4 +797,54 @@ test "SQL builders" {
     const del = try buildDelete(allocator, "users", "id");
     defer allocator.free(del);
     try std.testing.expectEqualStrings("DELETE FROM users WHERE id = ?", del);
+}
+
+test "Repository insertMany / upsertMany / findByIds end-to-end (sqlite)" {
+    const allocator = std.testing.allocator;
+    const data = @import("../data.zig");
+
+    const Product = struct {
+        pub const sql_table_name: []const u8 = "bulk_product";
+        id: i64,
+        sku: []const u8,
+        price_cents: i64,
+    };
+
+    var client = try data.Client.open(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    _ = try client.exec(
+        "CREATE TABLE bulk_product (id INTEGER PRIMARY KEY, sku TEXT NOT NULL, price_cents INTEGER NOT NULL)",
+        &.{},
+    );
+    const backend = data.SqlxBackend{ .allocator = allocator, .client = &client };
+    var orm: data.orm.Orm(data.SqlxBackend) = undefined;
+    orm.backend = backend;
+    const Repo = data.Repository(Product);
+    const repo = Repo{ .orm = &orm };
+
+    // Multi-row insert in one round-trip.
+    const products = [_]Product{
+        .{ .id = 0, .sku = "SKU-1", .price_cents = 100 },
+        .{ .id = 0, .sku = "SKU-2", .price_cents = 200 },
+        .{ .id = 0, .sku = "SKU-3", .price_cents = 300 },
+    };
+    try repo.insertMany(allocator, &products);
+    try std.testing.expectEqual(@as(usize, 3), try repo.count());
+
+    // Batch lookup in one round-trip.
+    var found = try repo.findByIds(allocator, &[_]i64{ 2, 1 });
+    defer found.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), found.items.len);
+
+    // Upsert: update SKU-2, insert SKU-4 (single statement).
+    const upserts = [_]Product{
+        .{ .id = 2, .sku = "SKU-2", .price_cents = 250 },
+        .{ .id = 4, .sku = "SKU-4", .price_cents = 400 },
+    };
+    try repo.upsertMany(allocator, &upserts, &.{"id"});
+    try std.testing.expectEqual(@as(usize, 4), try repo.count());
+
+    const by_id = (try repo.findById(@as(i64, 2))).?;
+    try std.testing.expectEqual(@as(i64, 250), by_id.price_cents);
+    std.testing.allocator.free(by_id.sku);
 }

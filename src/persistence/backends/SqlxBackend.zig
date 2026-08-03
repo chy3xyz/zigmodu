@@ -45,6 +45,11 @@ pub const SqlxBackend = struct {
         return self.client.exec(sql_str, args);
     }
 
+    /// Driver dialect for dialect-aware SQL generation (bulk upsert).
+    pub fn dialect(self: @This()) sqlx.Driver {
+        return self.client.config.driver;
+    }
+
     pub fn beginTx(self: @This()) !Tx {
         return self.client.beginTx();
     }
