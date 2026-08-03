@@ -2,6 +2,7 @@ const std = @import("std");
 const zigmodu = @import("zigmodu");
 const http = zigmodu.http;
 const service = @import("service.zig");
+const persist = @import("persistence.zig");
 
 /// Catalog HTTP API — ComptimeRouter (`docs/ROUTE_TABLE.md`).
 pub fn CatalogApi(comptime Service: type) type {
@@ -16,15 +17,25 @@ pub fn CatalogApi(comptime Service: type) type {
         const CreateTenantQ = struct { name: []const u8, domain: []const u8 };
         const CreateProductQ = struct { tenant_id: i64, name: []const u8, price_cents: i64 = 0 };
         const ListProductQ = struct { tenant_id: i64 };
+        const PagedProductQ = struct { tenant_id: i64, page: usize = 1, size: usize = 20 };
+        const SearchProductQ = struct { tenant_id: i64, q: []const u8 };
+        // bulk = 按 id upsert（id 必填：插入新行或更新既有行）。
+        const BulkProduct = struct { id: i64, tenant_id: i64, name: []const u8, price_cents: i64 = 0 };
 
         const create_tenant_params = http.openApiParamsFromStruct(CreateTenantQ, .query);
         const create_product_params = http.openApiParamsFromStruct(CreateProductQ, .query);
         const list_product_params = http.openApiParamsFromStruct(ListProductQ, .query);
+        const paged_product_params = http.openApiParamsFromStruct(PagedProductQ, .query);
+        const search_product_params = http.openApiParamsFromStruct(SearchProductQ, .query);
 
         pub const routes = [_]http.RouteSpec(State){
             .{ .method = .POST, .path = "tenants", .handler = createTenant, .meta = .{ .auth = .public, .openapi_params = &create_tenant_params } },
             .{ .method = .POST, .path = "products", .handler = createProduct, .meta = .{ .auth = .public, .openapi_params = &create_product_params } },
             .{ .method = .GET, .path = "products", .handler = listProducts, .meta = .{ .auth = .public, .openapi_params = &list_product_params } },
+            .{ .method = .GET, .path = "products/paged", .handler = listProductsPaged, .meta = .{ .auth = .public, .openapi_params = &paged_product_params } },
+            .{ .method = .GET, .path = "products/counts", .handler = countProducts, .meta = .{ .auth = .public } },
+            .{ .method = .GET, .path = "products/search", .handler = searchProducts, .meta = .{ .auth = .public, .openapi_params = &search_product_params } },
+            .{ .method = .POST, .path = "products/bulk", .handler = upsertProducts, .meta = .{ .auth = .public } },
         };
 
         pub const sse_routes = [_]http.SseSpec(State){
@@ -69,6 +80,84 @@ pub fn CatalogApi(comptime Service: type) type {
             }
             try buf.appendSlice(ctx.allocator, "]}");
             try ctx.json(200, buf.items);
+        }
+
+        fn writeProductsJson(ctx: *http.Context, rows: []const persist.CatalogStore.ProductRow) !void {
+            var buf = std.ArrayList(u8).empty;
+            defer buf.deinit(ctx.allocator);
+            try buf.appendSlice(ctx.allocator, "{\"products\":[");
+            for (rows, 0..) |r, i| {
+                if (i > 0) try buf.appendSlice(ctx.allocator, ",");
+                const entry = try std.fmt.allocPrint(ctx.allocator,
+                    \\{{"id":{d},"tenant_id":{d},"name":"{s}","price_cents":{d}}}
+                , .{ r.id, r.tenant_id, r.name, r.price_cents });
+                defer ctx.allocator.free(entry);
+                try buf.appendSlice(ctx.allocator, entry);
+            }
+            try buf.appendSlice(ctx.allocator, "]}");
+            try ctx.json(200, buf.items);
+        }
+
+        fn listProductsPaged(ctx: *http.Context, self: *State) !void {
+            const q = http.extractQuery(ctx, PagedProductQ) catch |err| return http.respondErr(ctx, err);
+            var paged = self.svc.listProductsPaged(q.tenant_id, q.page, q.size) catch |err| return http.respondErr(ctx, err);
+            defer paged.deinit(ctx.allocator);
+            var buf = std.ArrayList(u8).empty;
+            defer buf.deinit(ctx.allocator);
+            try buf.appendSlice(ctx.allocator, "{\"total\":");
+            const total_str = try std.fmt.allocPrint(ctx.allocator, "{d}", .{paged.total});
+            defer ctx.allocator.free(total_str);
+            try buf.appendSlice(ctx.allocator, total_str);
+            try buf.appendSlice(ctx.allocator, ",\"products\":[");
+            for (paged.items, 0..) |r, i| {
+                if (i > 0) try buf.appendSlice(ctx.allocator, ",");
+                const entry = try std.fmt.allocPrint(ctx.allocator,
+                    \\{{"id":{d},"tenant_id":{d},"name":"{s}","price_cents":{d}}}
+                , .{ r.id, r.tenant_id, r.name, r.price_cents });
+                defer ctx.allocator.free(entry);
+                try buf.appendSlice(ctx.allocator, entry);
+            }
+            try buf.appendSlice(ctx.allocator, "]}");
+            try ctx.json(200, buf.items);
+        }
+
+        fn countProducts(ctx: *http.Context, self: *State) !void {
+            const rows = self.svc.countProductsByTenant() catch |err| return http.respondErr(ctx, err);
+            defer ctx.allocator.free(rows);
+            var buf = std.ArrayList(u8).empty;
+            defer buf.deinit(ctx.allocator);
+            try buf.appendSlice(ctx.allocator, "{\"counts\":[");
+            for (rows, 0..) |r, i| {
+                if (i > 0) try buf.appendSlice(ctx.allocator, ",");
+                const entry = try std.fmt.allocPrint(ctx.allocator, "{{\"tenant_id\":{d},\"count\":{d}}}", .{ r.tenant_id, r.count });
+                defer ctx.allocator.free(entry);
+                try buf.appendSlice(ctx.allocator, entry);
+            }
+            try buf.appendSlice(ctx.allocator, "]}");
+            try ctx.json(200, buf.items);
+        }
+
+        fn searchProducts(ctx: *http.Context, self: *State) !void {
+            const q = http.extractQuery(ctx, SearchProductQ) catch |err| return http.respondErr(ctx, err);
+            const rows = self.svc.searchProducts(q.tenant_id, q.q) catch |err| return http.respondErr(ctx, err);
+            defer self.svc.freeProducts(rows);
+            try writeProductsJson(ctx, rows);
+        }
+
+        fn upsertProducts(ctx: *http.Context, self: *State) !void {
+            const items = ctx.bindJson([]BulkProduct) catch return ctx.json(400, "{\"error\":\"invalid body\"}");
+            var rows = std.ArrayList(persist.CatalogStore.ProductRow).empty;
+            defer rows.deinit(ctx.allocator);
+            for (items) |it| {
+                try rows.append(ctx.allocator, .{
+                    .id = it.id,
+                    .tenant_id = it.tenant_id,
+                    .name = it.name,
+                    .price_cents = it.price_cents,
+                });
+            }
+            self.svc.upsertProducts(rows.items) catch |err| return http.respondErr(ctx, err);
+            try ctx.json(200, "{\"ok\":true}");
         }
 
         /// Demo SSE: one tick then done (requires live stream in production).

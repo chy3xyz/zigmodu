@@ -6,7 +6,11 @@ const zent = @import("zent");
 pub fn StoreEnv(comptime Driver: type, comptime Infos: anytype) type {
     return struct {
         allocator: std.mem.Allocator,
-        driver: Driver,
+        /// Driver is heap-allocated so its address is stable: the generated
+        /// Client stores `Driver.ptr` (a pointer to this instance), and
+        /// StoreEnv is returned/copied by value — a stack-allocated driver
+        /// would leave the client's ptr dangling after the move.
+        driver_ptr: *Driver,
         client: zent.codegen.client.Client(Infos),
         owns_driver: bool,
 
@@ -28,27 +32,30 @@ pub fn StoreEnv(comptime Driver: type, comptime Infos: anytype) type {
             path: []const u8,
             opts: zent.sql_schema.MigrateOptions,
         ) !Self {
-            var driver = try Driver.open(allocator, path);
-            errdefer driver.close();
+            const driver_ptr = try allocator.create(Driver);
+            errdefer allocator.destroy(driver_ptr);
+            driver_ptr.* = try Driver.open(allocator, path);
+            errdefer driver_ptr.close();
 
             try zent.sql_schema.migrateSchemaWithOptions(
                 allocator,
-                driver.asDriver(),
+                driver_ptr.asDriver(),
                 Infos,
                 opts,
             );
 
             return .{
                 .allocator = allocator,
-                .driver = driver,
-                .client = zent.codegen.client.makeClient(Infos, allocator, driver.asDriver()),
+                .driver_ptr = driver_ptr,
+                .client = zent.codegen.client.makeClient(Infos, allocator, driver_ptr.asDriver()),
                 .owns_driver = true,
             };
         }
 
         pub fn deinit(self: *Self) void {
             if (self.owns_driver) {
-                self.driver.close();
+                self.driver_ptr.close();
+                self.allocator.destroy(self.driver_ptr);
                 self.owns_driver = false;
             }
         }
@@ -77,7 +84,7 @@ pub fn TestEnv(comptime schemas: anytype) type {
 
         /// Drop every schema table and the migration history, then migrate.
         pub fn reset(self: *Self) !void {
-            const driver = self.store.driver.asDriver();
+            const driver = self.store.driver_ptr.asDriver();
             inline for (schemas) |info| {
                 const drop_sql = "DROP TABLE IF EXISTS \"" ++ info.table_name ++ "\"";
                 _ = try driver.exec(drop_sql, &.{});

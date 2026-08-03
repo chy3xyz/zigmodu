@@ -761,8 +761,8 @@ const RequestParser = struct {
             while (qiter.next()) |param| {
                 if (param.len == 0) continue;
                 if (std.mem.indexOf(u8, param, "=")) |eq_pos| {
-                    const key = try self.allocator.dupe(u8, param[0..eq_pos]);
-                    const value = try self.allocator.dupe(u8, param[eq_pos + 1 ..]);
+                    const key = try percentDecode(self.allocator, param[0..eq_pos]);
+                    const value = try percentDecode(self.allocator, param[eq_pos + 1 ..]);
                     try query_map.put(key, value);
                 }
             }
@@ -813,6 +813,58 @@ const RequestParser = struct {
         };
     }
 };
+
+fn hexVal(c: u8) u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => 0,
+    };
+}
+
+/// RFC 3986 percent-decode (query form): `%XX` → byte, `+` → space.
+fn percentDecode(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+    var out_len: usize = 0;
+    var i: usize = 0;
+    while (i < input.len) : (i += 1) {
+        if (input[i] == '%' and i + 2 < input.len and std.ascii.isHex(input[i + 1]) and std.ascii.isHex(input[i + 2])) {
+            i += 2;
+        }
+        out_len += 1;
+    }
+    const out = try allocator.alloc(u8, out_len);
+    i = 0;
+    var o: usize = 0;
+    while (i < input.len) : (i += 1) {
+        const c = input[i];
+        if (c == '%' and i + 2 < input.len and std.ascii.isHex(input[i + 1]) and std.ascii.isHex(input[i + 2])) {
+            out[o] = (hexVal(input[i + 1]) << 4) | hexVal(input[i + 2]);
+            i += 2;
+        } else if (c == '+') {
+            out[o] = ' ';
+        } else {
+            out[o] = c;
+        }
+        o += 1;
+    }
+    return out;
+}
+
+test "percentDecode decodes query values" {
+    const allocator = std.testing.allocator;
+    const decoded = try percentDecode(allocator, "100%25off");
+    defer allocator.free(decoded);
+    try std.testing.expectEqualStrings("100%off", decoded);
+
+    const spaced = try percentDecode(allocator, "widget+pro");
+    defer allocator.free(spaced);
+    try std.testing.expectEqualStrings("widget pro", spaced);
+
+    const plain = try percentDecode(allocator, "hello");
+    defer allocator.free(plain);
+    try std.testing.expectEqualStrings("hello", plain);
+}
 
 const ParsedRequest = struct {
     method: Method,

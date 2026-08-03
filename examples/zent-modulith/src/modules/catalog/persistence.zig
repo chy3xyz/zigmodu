@@ -76,4 +76,88 @@ pub const CatalogStore = struct {
         for (rows) |r| self.allocator.free(r.name);
         self.allocator.free(rows);
     }
+
+    pub const PagedProducts = struct {
+        items: []ProductRow,
+        total: i64,
+        pub fn deinit(self: *PagedProducts, allocator: std.mem.Allocator) void {
+            for (self.items) |r| allocator.free(r.name);
+            allocator.free(self.items);
+        }
+    };
+
+    /// zent paged(): 一条 count + 一条 limit/offset，统一释放。
+    pub fn listProductsPaged(self: *CatalogStore, tenant_id: i64, page: usize, size: usize) !PagedProducts {
+        var q = self.client.product.Query();
+        defer q.deinit();
+        const preds = self.client.product.predicates;
+        _ = try q.Where(.{preds.tenant_idEQ(.{ .int = tenant_id })});
+        var paged = try q.paged(page, size);
+        defer paged.deinit();
+        var out = try self.allocator.alloc(ProductRow, paged.items.items.len);
+        errdefer self.allocator.free(out);
+        for (paged.items.items, 0..) |*p, i| {
+            out[i] = .{
+                .id = p.id,
+                .tenant_id = p.tenant_id,
+                .name = try self.allocator.dupe(u8, p.name),
+                .price_cents = p.price_cents,
+            };
+        }
+        return .{ .items = out, .total = paged.total };
+    }
+
+    pub const CountRow = struct { tenant_id: i64, count: i64 };
+
+    /// zent CountBy(): 单条 GROUP BY 替代 N 次 Count。
+    pub fn countProductsByTenant(self: *CatalogStore) ![]CountRow {
+        var q = self.client.product.Query();
+        defer q.deinit();
+        var counts = try q.CountBy("tenant_id");
+        defer counts.deinit();
+        const out = try self.allocator.alloc(CountRow, counts.items.len);
+        for (counts.items, 0..) |g, i| out[i] = .{ .tenant_id = g.key, .count = g.count };
+        return out;
+    }
+
+    /// zent ContainsEscaped：LIKE 通配符在渲染期转义，用户输入 % _ 按字面匹配。
+    pub fn searchProducts(self: *CatalogStore, tenant_id: i64, needle: []const u8) ![]ProductRow {
+        var q = self.client.product.Query();
+        defer q.deinit();
+        const preds = self.client.product.predicates;
+        _ = try q.Where(.{ preds.tenant_idEQ(.{ .int = tenant_id }), preds.nameContainsEscaped(needle) });
+        var found = try q.All();
+        defer {
+            for (found.items) |*p| {
+                zent.codegen.deinitEntity(infos, ProductInfo, p, self.allocator);
+            }
+            found.deinit();
+        }
+        var out = try self.allocator.alloc(ProductRow, found.items.len);
+        errdefer self.allocator.free(out);
+        for (found.items, 0..) |*p, i| {
+            out[i] = .{
+                .id = p.id,
+                .tenant_id = p.tenant_id,
+                .name = try self.allocator.dupe(u8, p.name),
+                .price_cents = p.price_cents,
+            };
+        }
+        return out;
+    }
+
+    /// zent BulkInsert.SaveOrUpdate：批量 upsert，一次多行 SQL。
+    pub fn upsertProducts(self: *CatalogStore, rows: []const ProductRow) !void {
+        var b = try self.client.product.BulkInsert();
+        defer b.deinit();
+        for (rows) |r| {
+            _ = try b.setFieldValue("id", r.id);
+            _ = try b.setFieldValue("tenant_id", r.tenant_id);
+            _ = try b.setFieldValue("name", r.name);
+            _ = try b.setFieldValue("price_cents", r.price_cents);
+            _ = try b.Next();
+        }
+        var ids = try b.SaveOrUpdate();
+        defer ids.deinit();
+    }
 };

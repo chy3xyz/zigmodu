@@ -26,4 +26,22 @@ pub const CatalogService = struct {
     pub fn freeProducts(self: *CatalogService, rows: []persist.CatalogStore.ProductRow) void {
         self.store.freeProducts(rows);
     }
+
+    pub fn listProductsPaged(self: *CatalogService, tenant_id: i64, page: usize, size: usize) !persist.CatalogStore.PagedProducts {
+        if (tenant_id <= 0) return error.InvalidInput;
+        return try self.store.listProductsPaged(tenant_id, page, size);
+    }
+
+    pub fn countProductsByTenant(self: *CatalogService) ![]persist.CatalogStore.CountRow {
+        return try self.store.countProductsByTenant();
+    }
+
+    pub fn searchProducts(self: *CatalogService, tenant_id: i64, needle: []const u8) ![]persist.CatalogStore.ProductRow {
+        if (tenant_id <= 0 or needle.len == 0) return error.InvalidInput;
+        return try self.store.searchProducts(tenant_id, needle);
+    }
+
+    pub fn upsertProducts(self: *CatalogService, rows: []const persist.CatalogStore.ProductRow) !void {
+        return try self.store.upsertProducts(rows);
+    }
 };
