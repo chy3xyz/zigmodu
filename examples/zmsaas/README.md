@@ -46,6 +46,19 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/orders
 
 无 token → 401；token 只访问自己 `org_id` 的数据（种子 org 1）。
 
+## 自定义业务逻辑演示
+
+在生成代码之上叠加了三类扩展（框架能力，非生成物）：
+
+- **状态机端点**：`POST /api/v1/orders/{id}/cancel` —— service 自定义
+  `cancel()`（仅 `pending` 可取消，复用 `crud.get/crud.update`，零新 SQL），
+  api.zig 同 nest 挂第二个 `OrdersActionsApi`（`assertNoDupes` 只查
+  method+path 重复）；非法状态返回 409。
+- **事件订阅**：`modules/orders/events.zig` 订阅 `CrudEvent`，写操作
+  （含 cancel 走的 update）自动 publish，日志/通知/审计/外发与主流程解耦。
+- **CRUD 方法覆盖**：service 声明同名方法即优先于内嵌 CrudService（可
+  `self.crud.*` 复用基础行为）；未覆盖的仍零透传直通。
+
 ## 前端 CRUD 收敛（DataTable / EntityForm）
 
 `/dashboard/orders` 演示了「数据驱动 CRUD」：页面不手写表格行/表单控件，

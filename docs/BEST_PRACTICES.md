@@ -623,6 +623,52 @@ pub const OrdersApi = zigmodu.http.CrudApi(model.Orders, service.OrdersService, 
 适用边界：规则简单的 CRUD 模块直接用；需要复杂业务编排（多表事务、状态机、
 审批流）时保留 service 内手写 Cmd，autoCrud 只覆盖纯增删改查面。
 
+### 自定义业务逻辑（扩展点）
+autoCrud 之上加业务逻辑，按复杂度选档，全部向后兼容：
+
+1. **输入校验** — 生成 service 的 `validate(e)` 钩子（create/update 自动调用）。
+2. **CRUD 方法覆盖** — 在 service 里声明同名方法即优先于内嵌 impl：
+   ```zig
+   // create 需要额外副作用（如写 outbox、扣库存）时：
+   pub fn create(self: *@This(), e: model.Orders) !i64 {
+       const id = try self.crud.create(e);   // 基础行为 + validate + CrudEvent
+       try self.persistence.afterCreateHook(org_id_of(e), id); // 自定义 SQL
+       return id;
+   }
+   ```
+   未覆盖的方法仍直通 `self.crud`（零透传不回归）。
+3. **自定义端点** — 同 `module_name`/`nest` 挂第二个 Api 结构（路径不重叠即可，
+   `assertNoDupes` 只查 method+path 重复）：
+   ```zig
+   pub const OrdersActionsApi = struct {
+       pub const module_name = "orders";
+       pub const nest = .{"orders"};
+       pub const State = @This();
+       service: *service.OrdersService,
+       pub const routes = [_]zigmodu.http.RouteSpec(State){
+           .{ .method = .POST, .path = "{id}/cancel", .handler = cancel,
+             .meta = .{ .auth = .jwt, .permission = "orders:write" } },
+       };
+       // handler：读 attrs 的 tenant_id → self.service.cancel(...) → respondErr 映射
+   };
+   ```
+   状态机、多表事务、审批流等同步逻辑放 service 方法；`crud.get/crud.update`
+   可复用基础读写（事件照发），需要新 SQL 时用保留的 `self.persistence` 指针
+   写参数化语句。
+4. **解耦副作用** — 订阅 `CrudEvent{created,updated,deleted}`（含自定义方法内
+   复用 `crud.create/update/delete` 的路径）：
+   ```zig
+   var bus = zigmodu.TypedEventBus(zigmodu.data.CrudEvent(model.Orders)).init(allocator);
+   defer bus.deinit();
+   try bus.subscribe(module.events.onOrderEvent);
+   svc.crud.setEventBus(&bus);   // 通知/审计/外发/积分，与主流程解耦
+   ```
+
+参考实现：`examples/zmsaas/backend`（`POST /orders/{id}/cancel` 状态机 +
+`events.zig` 订阅）。注意：`zmodu saas` 重新生成会覆盖
+model/persistence/service/api/module/root 五个文件，自定义逻辑可放在
+`events.zig` 等独立文件（生成器不写）或重新生成后重放差异。
+
 ## 🧪 代码质量规范
 
 ### 命名约定

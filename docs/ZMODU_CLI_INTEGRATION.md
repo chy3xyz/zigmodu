@@ -126,6 +126,11 @@ pub const OrdersService = struct {
 页，直接对接后端 autoCrud）。共享脚手架（`libs/apiClient.ts`、
 `components/data/DataTable.tsx`、`EntityForm.tsx`）已随 `examples/zmsaas` 提供。
 
+业务逻辑扩展：生成物之上按需叠加——service 声明同名 CRUD 方法即覆盖内嵌
+CrudService（可调 `self.crud.*` 复用基础行为 + 事件），自定义端点以同 nest
+挂第二个 Api 结构（路径不重叠），解耦副作用订阅 `CrudEvent`；完整示例见
+`examples/zmsaas`（`POST /orders/{id}/cancel` 状态机 + `events.zig`）。
+
 ---
 
 ### 4. AI 技能注册表（`zmodu ai`）

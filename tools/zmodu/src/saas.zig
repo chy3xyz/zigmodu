@@ -355,10 +355,12 @@ fn emitService(allocator: std.mem.Allocator, e: *const Entity, P: []const u8) ![
     try appendPrint(allocator, &buf, "    pub const module_name = \"{s}\";\n", .{e.name});
     try appendPrint(allocator, &buf, "    pub const nest = .{{\"{s}\"}};\n", .{e.name});
     try appendPrint(allocator, &buf, "    pub const impl = zigmodu.data.CrudService(model.{s}, persistence.{s}Persistence);\n", .{ P, P });
-    try buf.appendSlice(allocator, "    crud: impl,\n\n");
+    try buf.appendSlice(allocator, "    crud: impl,\n    persistence: *persistence.");
+    try buf.appendSlice(allocator, P);
+    try buf.appendSlice(allocator, "Persistence,\n\n");
     try buf.appendSlice(allocator, "    pub fn init(p: *persistence.");
     try buf.appendSlice(allocator, P);
-    try buf.appendSlice(allocator, "Persistence) @This() {\n        var self: @This() = .{ .crud = impl.init(p) };\n        self.crud.validate = &validate;\n        return self;\n    }\n\n");
+    try buf.appendSlice(allocator, "Persistence) @This() {\n        var self: @This() = .{ .crud = impl.init(p), .persistence = p };\n        self.crud.validate = &validate;\n        return self;\n    }\n\n");
     try appendPrint(allocator, &buf, "    pub fn validate(e: model.{s}) anyerror!void {{\n", .{P});
     for (e.fields) |f| {
         if (f.required and (std.mem.eql(u8, f.field_type, "string") or std.mem.eql(u8, f.field_type, "text"))) {

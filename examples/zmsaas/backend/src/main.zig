@@ -56,19 +56,29 @@ pub fn main(init: std.process.Init) !void {
     var persist = orders_mod.persistence.OrdersPersistence.init(&backend);
     var svc = orders_mod.service.OrdersService.init(&persist);
     var api = orders_mod.api.OrdersApi.init(&svc);
+    var actions_api = orders_mod.api.OrdersActionsApi.init(&svc);
     var auth_api = auth_mod.AuthApi{};
+
+    // CRUD 即事件源：写操作（含自定义 cancel 走的 crud.update）自动 publish，
+    // 订阅方做解耦副作用（日志/通知/审计/外发）。
+    var order_bus = zigmodu.TypedEventBus(zigmodu.data.CrudEvent(orders_mod.model.Orders)).init(allocator);
+    defer order_bus.deinit();
+    try order_bus.subscribe(orders_mod.events.onOrderEvent);
+    svc.crud.setEventBus(&order_bus);
 
     const AppState = struct {};
     var app_state: AppState = .{};
     const OrdersApiT = @TypeOf(api);
+    const OrdersActionsApiT = @TypeOf(actions_api);
     const AuthApiT = @TypeOf(auth_api);
-    comptime zigmodu.http.assertNoDupes(.{ OrdersApiT, AuthApiT });
+    comptime zigmodu.http.assertNoDupes(.{ OrdersApiT, OrdersActionsApiT, AuthApiT });
     var router = zigmodu.http.Router(AppState).init(io, allocator, &server, &app_state);
     defer router.deinit();
     var api_v1 = router.scope("/api/v1");
     try api_v1.mountAll(.{
         .{ .Mod = AuthApiT, .state = &auth_api },
         .{ .Mod = OrdersApiT, .state = &api },
+        .{ .Mod = OrdersActionsApiT, .state = &actions_api },
     });
     catalog_slot.set(try router.finish());
     std.log.info("[zmsaas] route catalog: {d} entries", .{catalog_slot.get().?.entries.len});

@@ -9,14 +9,27 @@ pub const OrdersService = struct {
     pub const nest = .{"orders"};
     pub const impl = zigmodu.data.CrudService(model.Orders, persistence.OrdersPersistence);
     crud: impl,
+    persistence: *persistence.OrdersPersistence,
 
     pub fn init(p: *persistence.OrdersPersistence) @This() {
-        var self: @This() = .{ .crud = impl.init(p) };
+        var self: @This() = .{ .crud = impl.init(p), .persistence = p };
         self.crud.validate = &validate;
         return self;
     }
 
     pub fn validate(e: model.Orders) anyerror!void {
         if (e.customer.len == 0) return error.ValidationFailed;
+    }
+
+    /// Custom business logic — state machine: only `pending` orders can be
+    /// cancelled. Reuses the base path (crud.get + crud.update) so the write
+    /// still runs `validate` and publishes CrudEvent.updated, with zero new
+    /// SQL. Called from OrdersActionsApi `POST {id}/cancel`.
+    pub fn cancel(self: *@This(), allocator: std.mem.Allocator, org_id: i64, id: i64) !void {
+        const e = (try self.crud.get(allocator, org_id, id)) orelse return error.NotFound;
+        if (!std.mem.eql(u8, e.status, "pending")) return error.Conflict;
+        var updated = e;
+        updated.status = "cancelled";
+        try self.crud.update(updated, org_id);
     }
 };
