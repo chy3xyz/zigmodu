@@ -2,6 +2,7 @@ const std = @import("std");
 const zigmodu = @import("zigmodu");
 const zent = @import("zent");
 const zent_helpers = @import("zent_helpers");
+const zent_crud = @import("zent_crud.zig");
 
 const catalog_module = @import("modules/catalog/module.zig");
 const catalog = @import("modules/catalog/root.zig");
@@ -30,6 +31,19 @@ pub fn main(init: std.process.Init) !void {
     var catalog_svc = catalog.service.CatalogService.init(&store);
     const CatalogApiT = catalog.api.CatalogApi(@TypeOf(catalog_svc));
     var catalog_api = CatalogApiT.init(&catalog_svc);
+
+    // Generic CRUD: one declaration = the five standard routes over the zent
+    // CrudService. Tenant comes from the query string in this public demo
+    // (real deployments switch to .attr with the JWT middleware).
+    const ProductCrud = zent.crud.CrudService(catalog.persistence.infos, catalog.persistence.ProductInfo, "tenant_id");
+    var product_crud = ProductCrud.init(allocator, store.client.product);
+    const ProductApiT = zent_crud.CrudApi(catalog.persistence.infos, catalog.persistence.ProductInfo, .{
+        .module_name = "catalog",
+        .nest = &.{"products"},
+        .tenant_col = "tenant_id",
+        .tenant_source = .query,
+    });
+    var product_api = ProductApiT.init(&product_crud);
 
     // --- ZigModu modules ---
     var modules = try zigmodu.scanModules(allocator, .{catalog_module});
@@ -60,7 +74,7 @@ pub fn main(init: std.process.Init) !void {
     defer catalog_slot.deinit();
     try server.addMiddleware(zigmodu.http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
 
-    comptime zigmodu.http.assertNoDupes(.{CatalogApiT});
+    comptime zigmodu.http.assertNoDupes(.{ CatalogApiT, ProductApiT });
 
     const AppState = struct {};
     var app_state: AppState = .{};
@@ -71,6 +85,7 @@ pub fn main(init: std.process.Init) !void {
     var api_v1 = router.scope("/api/v1");
     try api_v1.mountAll(.{
         .{ .Mod = CatalogApiT, .state = &catalog_api },
+        .{ .Mod = ProductApiT, .state = &product_api },
     });
     catalog_slot.set(try router.finish());
 
@@ -97,7 +112,8 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("[main] route catalog: {d} entries", .{catalog_slot.get().?.entries.len});
     std.log.info("[main] listening http://127.0.0.1:{d}", .{port});
     std.log.info("[main] POST /api/v1/tenants?name=&domain=", .{});
-    std.log.info("[main] POST /api/v1/products?tenant_id=&name=&price_cents=", .{});
+    std.log.info("[main] CrudApi: GET/POST /api/v1/products?tenant_id= (paged list / create)", .{});
+    std.log.info("[main] CrudApi: GET/PUT/DELETE /api/v1/products/<id>?tenant_id=", .{});
     std.log.info("[main] GET  /api/v1/events (SSE)", .{});
     std.log.info("[main] OpenAPI: http://127.0.0.1:{d}/openapi.json", .{port});
     try server.start();

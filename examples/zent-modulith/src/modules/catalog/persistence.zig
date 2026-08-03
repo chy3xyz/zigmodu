@@ -28,16 +28,6 @@ pub const CatalogStore = struct {
         return row.id;
     }
 
-    pub fn createProduct(self: *CatalogStore, tenant_id: i64, name: []const u8, price_cents: i64) !i64 {
-        var b = try self.client.product.Create();
-        defer b.deinit();
-        _ = try b.setFieldValue("tenant_id", tenant_id);
-        _ = try b.setFieldValue("name", name);
-        _ = try b.setFieldValue("price_cents", price_cents);
-        const row = try b.Save();
-        return row.id;
-    }
-
     pub const ProductRow = struct {
         id: i64,
         tenant_id: i64,
@@ -45,66 +35,9 @@ pub const CatalogStore = struct {
         price_cents: i64,
     };
 
-    /// Caller owns returned slice + each `name`. Free with `freeProducts`.
-    pub fn listProducts(self: *CatalogStore, tenant_id: i64) ![]ProductRow {
-        var q = self.client.product.Query();
-        defer q.deinit();
-        const preds = self.client.product.predicates;
-        _ = try q.Where(.{preds.tenant_idEQ(.{ .int = tenant_id })});
-        var found = try q.All();
-        defer {
-            for (found.items) |*p| {
-                zent.codegen.deinitEntity(infos, ProductInfo, p, self.allocator);
-            }
-            found.deinit();
-        }
-
-        var out = try self.allocator.alloc(ProductRow, found.items.len);
-        errdefer self.allocator.free(out);
-        for (found.items, 0..) |p, i| {
-            out[i] = .{
-                .id = p.id,
-                .tenant_id = p.tenant_id,
-                .name = try self.allocator.dupe(u8, p.name),
-                .price_cents = p.price_cents,
-            };
-        }
-        return out;
-    }
-
     pub fn freeProducts(self: *CatalogStore, rows: []ProductRow) void {
         for (rows) |r| self.allocator.free(r.name);
         self.allocator.free(rows);
-    }
-
-    pub const PagedProducts = struct {
-        items: []ProductRow,
-        total: i64,
-        pub fn deinit(self: *PagedProducts, allocator: std.mem.Allocator) void {
-            for (self.items) |r| allocator.free(r.name);
-            allocator.free(self.items);
-        }
-    };
-
-    /// zent paged(): 一条 count + 一条 limit/offset，统一释放。
-    pub fn listProductsPaged(self: *CatalogStore, tenant_id: i64, page: usize, size: usize) !PagedProducts {
-        var q = self.client.product.Query();
-        defer q.deinit();
-        const preds = self.client.product.predicates;
-        _ = try q.Where(.{preds.tenant_idEQ(.{ .int = tenant_id })});
-        var paged = try q.paged(page, size);
-        defer paged.deinit();
-        var out = try self.allocator.alloc(ProductRow, paged.items.items.len);
-        errdefer self.allocator.free(out);
-        for (paged.items.items, 0..) |*p, i| {
-            out[i] = .{
-                .id = p.id,
-                .tenant_id = p.tenant_id,
-                .name = try self.allocator.dupe(u8, p.name),
-                .price_cents = p.price_cents,
-            };
-        }
-        return .{ .items = out, .total = paged.total };
     }
 
     pub const CountRow = struct { tenant_id: i64, count: i64 };
