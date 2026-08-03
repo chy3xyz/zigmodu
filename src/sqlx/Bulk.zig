@@ -44,6 +44,8 @@ pub fn buildInsertMany(
     dialect: Dialect,
     upsert: ?UpsertOpts,
 ) ![]u8 {
+    if (row_count == 0) return error.EmptyRows;
+    if (columns.len == 0) return error.EmptyColumns;
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
 
@@ -80,6 +82,7 @@ fn appendUpsertSuffix(
 ) !void {
     const update_cols = opts.update_columns orelse try nonConflictColumns(allocator, columns, opts.conflict_columns);
     defer if (opts.update_columns == null) allocator.free(update_cols);
+    if (update_cols.len == 0) return error.EmptyUpsertColumns;
 
     switch (dialect) {
         .mysql => {
@@ -166,6 +169,9 @@ pub fn insertMany(
     dialect: Dialect,
     upsert: ?UpsertOpts,
 ) !sqlx.ExecResult {
+    for (rows) |r| {
+        if (r.len != columns.len) return error.ColumnCountMismatch;
+    }
     const sql = try buildInsertMany(allocator, table, columns, rows.len, dialect, upsert);
     defer allocator.free(sql);
     const args = try flattenArgs(allocator, rows);
@@ -204,6 +210,16 @@ test "buildInsertMany mysql upsert suffix" {
     try testing.expectEqualStrings(
         "INSERT INTO t (id, name) VALUES (?,?) ON DUPLICATE KEY UPDATE name=VALUES(name)",
         sql,
+    );
+}
+
+test "buildInsertMany rejects empty rows / columns / update list" {
+    try testing.expectError(error.EmptyRows, buildInsertMany(testing.allocator, "t", &.{"a"}, 0, .sqlite, null));
+    try testing.expectError(error.EmptyColumns, buildInsertMany(testing.allocator, "t", &.{}, 1, .sqlite, null));
+    // All columns are conflict columns -> nothing to update.
+    try testing.expectError(
+        error.EmptyUpsertColumns,
+        buildInsertMany(testing.allocator, "t", &.{"id"}, 1, .sqlite, .{ .conflict_columns = &.{"id"} }),
     );
 }
 

@@ -1155,7 +1155,7 @@ pub const Database = struct {
 
 pub fn Repository(comptime T: type) type {
     pub fn findById(self: *Self, id: i64) !?T
-    pub fn findByIds(self: *Self, allocator: Allocator, ids: anytype) !QueryResult(T)  // WHERE pk IN (…) 一次 round-trip
+    pub fn findByIds(self: *Self, allocator: Allocator, ids: []const i64) !QueryResult(T)  // WHERE pk IN (…) 一次 round-trip
     pub fn insert(self: *Self, entity: T) !T
     pub fn insertMany(self: *Self, allocator: Allocator, entities: []const T) !void    // 多行 VALUES (?,?),(?,?) 一次 round-trip
     pub fn upsertMany(self: *Self, allocator: Allocator, entities: []const T, conflict_columns: []const []const u8) !void

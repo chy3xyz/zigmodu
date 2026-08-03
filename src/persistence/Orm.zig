@@ -512,7 +512,7 @@ pub fn Orm(comptime B: type) type {
 
                 /// Batch lookup: `WHERE pk IN (?,?,…)` in one round-trip.
                 /// Result order follows the DB, not the input order.
-                pub fn findByIds(self: @This(), allocator: std.mem.Allocator, ids: anytype) !sqlx.QueryResult(T) {
+                pub fn findByIds(self: @This(), allocator: std.mem.Allocator, ids: []const i64) !sqlx.QueryResult(T) {
                     if (ids.len == 0) return error.EmptyIds;
                     const cols = comptime comptimeColumnList(meta.sql_columns, meta.fields, meta.camel_case);
                     var buf = std.ArrayList(u8).empty;
@@ -531,7 +531,7 @@ pub fn Orm(comptime B: type) type {
                     try buf.appendSlice(allocator, ")");
                     const args = try allocator.alloc(B.Value, ids.len);
                     defer allocator.free(args);
-                    for (ids, 0..) |id, i| args[i] = B.fromOrmValue(toOrmValue(id));
+                    for (0..ids.len) |i| args[i] = B.fromOrmValue(toOrmValue(ids[i]));
                     return self.orm.backend.queryRows(T, buf.items, args);
                 }
 
@@ -832,7 +832,7 @@ test "Repository insertMany / upsertMany / findByIds end-to-end (sqlite)" {
     try std.testing.expectEqual(@as(usize, 3), try repo.count());
 
     // Batch lookup in one round-trip.
-    var found = try repo.findByIds(allocator, &[_]i64{ 2, 1 });
+    var found = try repo.findByIds(allocator, &.{ @as(i64, 2), @as(i64, 1) });
     defer found.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 2), found.items.len);
 
