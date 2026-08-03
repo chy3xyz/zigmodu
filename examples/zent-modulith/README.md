@@ -96,6 +96,25 @@ curl -s 'http://127.0.0.1:18100/api/v1/docs?user_id=1&tenant_id=1&scope=dept_onl
 curl -s 'http://127.0.0.1:18100/api/v1/docs?user_id=1&tenant_id=1&scope=all'
 ```
 
+## 商城/社交能力（v0.21）
+
+**原子库存扣减（`setExprArgs`，防超卖）**：一条语句完成
+`SET stock = stock - ? WHERE id = ? AND stock >= ?`，`rows_affected == 0`
+即库存不足（409）。
+
+```bash
+curl -s http://127.0.0.1:18100/api/v1/inventory/1          # {"stock":100,...}
+curl -s -X POST 'http://127.0.0.1:18100/api/v1/inventory/decrement?product_id=1&qty=30'
+curl -s -X POST 'http://127.0.0.1:18100/api/v1/inventory/decrement?product_id=1&qty=80'  # 409 insufficient_stock
+```
+
+**两级嵌套预加载（`WithEdge("posts.comments")`）**：主查询 + 每级一次 IN
+邻居查询，返回 Author → posts → comments 嵌套 JSON。
+
+```bash
+curl -s http://127.0.0.1:18100/api/v1/feed/authors
+```
+
 ## zent 新特性演示
 
 - **paged()**：泛型 list 即 `GET /api/v1/products?tenant_id=1&page=1&page_size=2`
@@ -118,6 +137,7 @@ src/
   main.zig                 # ZigModu ComptimeRouter + zent migrate/client
   outbox_demo.zig          # outbox 事务入队 + dispatch（HTTP + cron）
   data_scope_demo.zig      # scope 中间件 + DocApi（行级权限）
+  features_demo.zig        # 原子库存扣减 + 两级预加载（feed）
   modules/catalog/
   model.zig              # zent Schema("Tenant"|"Product")
   persistence.zig        # zent Client wrappers

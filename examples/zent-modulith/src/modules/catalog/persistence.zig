@@ -3,12 +3,25 @@ const std = @import("std");
 const zent = @import("zent");
 const model = @import("model.zig");
 
-const graph = zent.codegen.graph.buildGraph(&.{ model.Tenant, model.Product, model.Doc, zent.outbox.OutboxMessage });
+const graph = zent.codegen.graph.buildGraph(&.{
+    model.Tenant,
+    model.Product,
+    model.Doc,
+    zent.outbox.OutboxMessage,
+    model.Author,
+    model.Post,
+    model.Comment,
+    model.Inventory,
+});
 pub const infos = graph.types;
 pub const Client = zent.codegen.client.Client(infos);
 pub const ProductInfo = infos[1];
 pub const DocInfo = infos[2];
 pub const OutboxInfo = infos[3];
+pub const AuthorInfo = infos[4];
+pub const PostInfo = infos[5];
+pub const CommentInfo = infos[6];
+pub const InventoryInfo = infos[7];
 
 pub const CatalogStore = struct {
     allocator: std.mem.Allocator,

@@ -5,6 +5,7 @@ const zent_helpers = @import("zent_helpers");
 const zent_crud = @import("zent_crud.zig");
 const outbox_demo = @import("outbox_demo.zig");
 const data_scope_demo = @import("data_scope_demo.zig");
+const features_demo = @import("features_demo.zig");
 
 const catalog_module = @import("modules/catalog/module.zig");
 const catalog = @import("modules/catalog/root.zig");
@@ -62,6 +63,56 @@ pub fn main(init: std.process.Init) !void {
         var row = try b.Save();
         zent.codegen.deinitEntity(catalog.persistence.infos, catalog.persistence.DocInfo, &row, allocator);
     }
+
+    // Commerce + social demos: Inventory (atomic stock decrement) and a
+    // two-level feed (Author -> posts -> comments).
+    const alice_id = id: {
+        var b = try env.client.author.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "alice");
+        var row = try b.Save();
+        defer zent.codegen.deinitEntity(catalog.persistence.infos, catalog.persistence.AuthorInfo, &row, allocator);
+        break :id row.id;
+    };
+    const post_a = id: {
+        var b = try env.client.post.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("author_id", alice_id);
+        _ = try b.setFieldValue("title", "hello-zent");
+        var row = try b.Save();
+        defer zent.codegen.deinitEntity(catalog.persistence.infos, catalog.persistence.PostInfo, &row, allocator);
+        break :id row.id;
+    };
+    const post_b = id: {
+        var b = try env.client.post.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("author_id", alice_id);
+        _ = try b.setFieldValue("title", "nested-edges");
+        var row = try b.Save();
+        defer zent.codegen.deinitEntity(catalog.persistence.infos, catalog.persistence.PostInfo, &row, allocator);
+        break :id row.id;
+    };
+    inline for (.{ .{ post_a, "nice post" }, .{ post_a, "thanks" }, .{ post_b, "cool" } }) |seed| {
+        var b = try env.client.comment.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("post_id", seed[0]);
+        _ = try b.setFieldValue("body", seed[1]);
+        var row = try b.Save();
+        zent.codegen.deinitEntity(catalog.persistence.infos, catalog.persistence.CommentInfo, &row, allocator);
+    }
+    {
+        var b = try env.client.inventory.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("product_id", @as(i64, 1));
+        _ = try b.setFieldValue("stock", @as(i64, 100));
+        var row = try b.Save();
+        zent.codegen.deinitEntity(catalog.persistence.infos, catalog.persistence.InventoryInfo, &row, allocator);
+    }
+
+    const InventoryApiT = features_demo.InventoryApi(@TypeOf(env.client));
+    var inventory_api = InventoryApiT.init(&env.client);
+    const FeedApiT = features_demo.FeedApi(@TypeOf(env.client));
+    var feed_api = FeedApiT.init(&env.client);
 
     // Outbox demo: transactional enqueue + on-demand/cron dispatch.
     var outbox_dispatcher = outbox_demo.Dispatcher{
@@ -140,7 +191,7 @@ pub fn main(init: std.process.Init) !void {
     defer catalog_slot.deinit();
     try server.addMiddleware(zigmodu.http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
 
-    comptime zigmodu.http.assertNoDupes(.{ CatalogApiT, ProductApiT, OutboxApiT, DocApiT });
+    comptime zigmodu.http.assertNoDupes(.{ CatalogApiT, ProductApiT, OutboxApiT, DocApiT, InventoryApiT, FeedApiT });
 
     const AppState = struct {};
     var app_state: AppState = .{};
@@ -153,6 +204,8 @@ pub fn main(init: std.process.Init) !void {
         .{ .Mod = CatalogApiT, .state = &catalog_api },
         .{ .Mod = ProductApiT, .state = &product_api },
         .{ .Mod = OutboxApiT, .state = &outbox_api },
+        .{ .Mod = InventoryApiT, .state = &inventory_api },
+        .{ .Mod = FeedApiT, .state = &feed_api },
     });
     var docs_scope = try api_v1.use(.{ .func = data_scope_demo.scopeMiddleware });
     try docs_scope.mount(DocApiT, &doc_api);
@@ -186,6 +239,8 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("[main] POST /api/v1/outbox/enqueue?aggregate_type=&aggregate_id=&event_type=&payload=", .{});
     std.log.info("[main] POST /api/v1/outbox/dispatch (manual; cron every minute when file-backed)", .{});
     std.log.info("[main] GET  /api/v1/docs?user_id=&tenant_id=&scope=self_|dept_only|dept_custom&dept_ids=", .{});
+    std.log.info("[main] POST /api/v1/inventory/decrement?product_id=1&qty= (atomic stock, oversell-safe)", .{});
+    std.log.info("[main] GET  /api/v1/feed/authors (two-level WithEdge posts.comments)", .{});
     std.log.info("[main] GET  /api/v1/events (SSE)", .{});
     std.log.info("[main] OpenAPI: http://127.0.0.1:{d}/openapi.json", .{port});
     try server.start();
