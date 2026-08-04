@@ -99,7 +99,11 @@ pub const StructuredLogger = struct {
             inline for (fields_info.@"struct".field_names) |key| {
                 const value = @field(fields, key);
                 const value_str = try std.fmt.allocPrint(self.allocator, "{any}", .{value});
-                try entry.fields.put(key, value_str);
+                // `key` is a comptime string literal (read-only memory) — dupe
+                // it before inserting: the defer above frees every map key.
+                const key_copy = try self.allocator.dupe(u8, key);
+                errdefer self.allocator.free(key_copy);
+                try entry.fields.put(key_copy, value_str);
             }
         }
 
@@ -252,6 +256,26 @@ test "StructuredLogger basic" {
 
     try logger.withField("app", "test");
     try logger.info("Test message", .{});
+}
+
+test "StructuredLogger struct fields keys are owned" {
+    // Regression: keys coming from struct fields are comptime string
+    // literals (read-only memory). They must be duped before map insert —
+    // the entry deinit frees every key, and freeing a literal crashes.
+    const allocator = std.testing.allocator;
+
+    const tmp_file = try std.Io.Dir.cwd().createFile(std.testing.io, "zigmodu_test_log.tmp", .{});
+    defer {
+        tmp_file.close(std.testing.io);
+        std.Io.Dir.cwd().deleteFile(std.testing.io, "zigmodu_test_log.tmp") catch {};
+    }
+
+    var logger = StructuredLogger.init(allocator, std.testing.io, .DEBUG, .{ .file = tmp_file });
+    defer logger.deinit();
+
+    // Non-empty struct fields — previously aborted freeing the literal keys.
+    try logger.info("user event", .{ .user_id = 42, .action = "login" });
+    try logger.err("boom", .{ .code = 500, .message = "upstream timeout" });
 }
 
 test "LogLevel ordering" {
