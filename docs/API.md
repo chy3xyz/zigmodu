@@ -625,7 +625,7 @@ ZigModu provides an async fiber-based HTTP server built on `std.Io`. It supports
 
 
 
-`zigmodu.http_server.Server` — Main async HTTP server.
+`zigmodu.http.Server` — Main async HTTP server.
 
 
 
@@ -685,9 +685,9 @@ const zigmodu = @import("zigmodu");
 
 
 
-const Server = zigmodu.http_server.Server;
+const Server = zigmodu.http.Server;
 
-const Context = zigmodu.http_server.Context;
+const Context = zigmodu.http.Context;
 
 
 
@@ -955,9 +955,9 @@ const std = @import("std");
 
 const zigmodu = @import("zigmodu");
 
-const Server = zigmodu.http_server.Server;
+const Server = zigmodu.http.Server;
 
-const Context = zigmodu.http_server.Context;
+const Context = zigmodu.http.Context;
 
 
 

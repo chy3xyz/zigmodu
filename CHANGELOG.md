@@ -13,6 +13,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   技能所有权/权限/超时规范、安全清单、观测调试）；`docs/README.md` 索引补全
   AI 编排/技能/LLM 策略/MCP 文档；AGENTS.md 文档地图加「AI 业务接入」入口；
   AI.md 顶部指向新指南；AI_SKILLS.md 补「开发自定义技能」指引。
+- **queryRow 系字符串所有权契约落地**: `queryRow` / `queryRowPartial` 文档
+  明确返回 **owned** 字符串（dupe 进 client allocator，row arena 返回前已释放；
+  调用方须 `freeScanned`，否则泄漏）；新增显式命名别名 `queryRowOwned` /
+  `queryRowPartialOwned`；新增 arena-借用 RAII 变体 `queryRowBorrowed` /
+  `queryRowPartialBorrowed`（`BorrowedRow.deinit()` 一次释放、无需逐字段
+  free；CachedConn 提供无缓存直通）。
+- **audit 规则修正**: b10 豁免 `errdefer` / `rollback` 上下文里的 best-effort
+  空 `catch {}`（事务回滚不再误报为吞错）；新增 b17 检查 owned `queryRow*`
+  结果在函数内既未 `freeScanned` 也未 `return` 委托的泄漏点。
+- **CrudApi 多租户 attr 可配置**: `CrudOpts` 新增 `tenant_attr`（默认
+  `"tenant_id"`，即 catalog JWT 中间件 aud→attr 标准桥）；多门户场景可配置
+  其他 attr 名。
+- **Outbox 多租户支持**: `event_outbox` 迁移 SQL 内置可空 `tenant_id` 列
+  （向后兼容）；新增 `buildInsertForTenant(topic, payload, tenant_id)`；
+  `OutboxEntry` 与 `buildSelectPending` 带 `tenant_id`。
+- **Repository 租户感知查询**: 新增 `findPageForTenant` / `findByIdsForTenant`
+  / `findPageFilteredForTenant` / `countForTenant`（comptime 列名；模型缺租户
+  字段时编译期报错，fail-closed）；原有方法签名不变。
+- **API.md 旧别名清理**: `zigmodu.http_server.*` 示例统一为 `zigmodu.http.*`。
 
 ## [0.15.7] - 2026-08-04
 
