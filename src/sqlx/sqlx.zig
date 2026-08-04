@@ -203,6 +203,29 @@ pub const ManagedRows = struct {
     }
 };
 
+/// RAII wrapper for a single scanned row whose `[]const u8` fields borrow an
+/// arena owned by this wrapper (no per-field dupe, no `freeScanned` needed).
+/// The value is valid until `deinit()`; `get()` returns a shallow copy (string
+/// pointers still point into the arena). Prefer `queryRowBorrowed` /
+/// `queryRowPartialBorrowed` when the row is consumed within a scope.
+pub fn BorrowedRow(comptime T: type) type {
+    return struct {
+        value: T,
+        arena: std.heap.ArenaAllocator,
+
+        pub fn deinit(self: *@This()) void {
+            self.arena.deinit();
+            self.* = undefined;
+        }
+
+        /// Shallow copy of the scanned row. String fields remain valid until
+        /// `deinit()`.
+        pub fn get(self: *const @This()) T {
+            return self.value;
+        }
+    };
+}
+
 /// Cursor fetch mode.
 pub const CursorMode = enum {
     /// Materialize all rows upfront. Rows remain valid until `cursor.deinit()`.
@@ -4592,6 +4615,12 @@ pub const Client = struct {
         return self.transact(T, fn_tx);
     }
 
+    /// Scan the first row into `T`. `[]const u8` / `?[]const u8` fields are
+    /// **owned copies** allocated from the client's allocator — the row arena
+    /// is released before returning, so strings are never borrowed from it.
+    /// The caller owns the returned string fields and must free them once done
+    /// (e.g. `defer freeScanned(allocator, T, row)`), otherwise they leak.
+    /// Scalar fields are copied by value and need no freeing.
     pub fn queryRow(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !T {
         var rows = try self.query(sql_str, args);
         defer rows.deinit();
@@ -4602,11 +4631,41 @@ pub const Client = struct {
         return try scanStruct(self.allocator, T, rows.rows[0], false, indices, false);
     }
 
+    /// Same implementation as `queryRow` — the explicit name makes the
+    /// ownership contract self-evident: string fields are owned copies from
+    /// the client's allocator and must be freed by the caller
+    /// (`freeScanned`). For scope-local use prefer `queryRowBorrowed`, which
+    /// returns an arena-backed RAII row with nothing to free.
+    pub const queryRowOwned = queryRow;
+
+    /// Arena-borrowed RAII variant of `queryRow`: returns a `BorrowedRow(T)`
+    /// that owns the scan arena; `[]const u8` fields point **into** that arena
+    /// (no dupe). Strings stay valid until `BorrowedRow.deinit()`, which
+    /// releases everything — no `freeScanned` needed. Use when the row is
+    /// consumed within a scope.
+    pub fn queryRowBorrowed(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !BorrowedRow(T) {
+        var rows = try self.query(sql_str, args);
+        errdefer rows.deinit();
+        for (rows.rows) |*row| row.arena = &rows.arena;
+        if (rows.rows.len == 0) return error.NotFound;
+        const indices = try buildColumnIndices(self.allocator, T, rows.rows[0].columns);
+        defer self.allocator.free(indices);
+        const arena_alloc = rows.arena.allocator();
+        const value = try scanStruct(arena_alloc, T, rows.rows[0], false, indices, true);
+        const stolen = rows.arena;
+        return .{ .value = value, .arena = stolen };
+    }
+
     pub fn queryRowCtx(self: *Client, ctx: SqlContext, comptime T: type, sql_str: []const u8, args: []const Value) !T {
         if (ctx.isDone()) return error.Timeout;
         return self.queryRow(T, sql_str, args);
     }
 
+    /// Partial-scan variant of `queryRow`: columns missing from the result set
+    /// are zeroed (non-optional string fields become `""`, optionals `null`)
+    /// instead of failing. Same ownership contract as `queryRow` — string
+    /// fields are owned copies from the client's allocator; the caller must
+    /// free them (e.g. `defer freeScanned(allocator, T, row)`).
     pub fn queryRowPartial(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !T {
         var rows = try self.query(sql_str, args);
         defer rows.deinit();
@@ -4615,6 +4674,29 @@ pub const Client = struct {
         const indices = try buildColumnIndices(self.allocator, T, rows.rows[0].columns);
         defer self.allocator.free(indices);
         return try scanStruct(self.allocator, T, rows.rows[0], true, indices, false);
+    }
+
+    /// Same implementation as `queryRowPartial` — the explicit name makes the
+    /// ownership contract self-evident: string fields are owned copies from
+    /// the client's allocator and must be freed by the caller
+    /// (`freeScanned`). For scope-local use prefer `queryRowPartialBorrowed`.
+    pub const queryRowPartialOwned = queryRowPartial;
+
+    /// Arena-borrowed RAII variant of `queryRowPartial`: returns a
+    /// `BorrowedRow(T)` that owns the scan arena; `[]const u8` fields point
+    /// **into** that arena (no dupe). Missing columns are zeroed as in
+    /// `queryRowPartial`. Strings stay valid until `BorrowedRow.deinit()`.
+    pub fn queryRowPartialBorrowed(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !BorrowedRow(T) {
+        var rows = try self.query(sql_str, args);
+        errdefer rows.deinit();
+        for (rows.rows) |*row| row.arena = &rows.arena;
+        if (rows.rows.len == 0) return error.NotFound;
+        const indices = try buildColumnIndices(self.allocator, T, rows.rows[0].columns);
+        defer self.allocator.free(indices);
+        const arena_alloc = rows.arena.allocator();
+        const value = try scanStruct(arena_alloc, T, rows.rows[0], true, indices, true);
+        const stolen = rows.arena;
+        return .{ .value = value, .arena = stolen };
     }
 
     pub fn queryRowPartialCtx(self: *Client, ctx: SqlContext, comptime T: type, sql_str: []const u8, args: []const Value) !T {
@@ -4943,6 +5025,13 @@ pub const CachedConn = struct {
 
     pub fn queryRowNoCache(self: *CachedConn, comptime T: type, sql_str: []const u8, args: []const Value) !T {
         return self.client.queryRow(T, sql_str, args);
+    }
+
+    /// Arena-borrowed variant — deliberately bypasses the JSON cache: the
+    /// returned strings point into an arena owned by `BorrowedRow`, which is
+    /// incompatible with caching. See `Client.queryRowBorrowed`.
+    pub fn queryRowBorrowed(self: *CachedConn, comptime T: type, sql_str: []const u8, args: []const Value) !BorrowedRow(T) {
+        return self.client.queryRowBorrowed(T, sql_str, args);
     }
 
     pub fn queryRowCtx(self: *CachedConn, ctx: SqlContext, comptime T: type, cache_key: []const u8, sql_str: []const u8, args: []const Value) !T {
@@ -5743,6 +5832,72 @@ test "sqlite queryRowPartial struct scan" {
     try std.testing.expectEqual(@as(i64, 1), user.id);
     try std.testing.expectEqualStrings("Alice", user.name);
     try std.testing.expectEqual(@as(usize, 0), user.bio.len);
+}
+
+test "sqlite queryRowBorrowed RAII arena borrow" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+
+    try client.connect();
+    _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+    _ = try client.exec("INSERT INTO users (name) VALUES (?1)", &.{.{ .string = "Alice" }});
+
+    const User = struct {
+        id: i64,
+        name: []const u8,
+    };
+
+    // Borrowed variant: strings point into the wrapper-owned arena, freed
+    // together by deinit — no freeScanned needed.
+    var row = try client.queryRowBorrowed(User, "SELECT id, name FROM users WHERE name = ?1", &.{.{ .string = "Alice" }});
+    defer row.deinit();
+    const user = row.get();
+    try std.testing.expectEqual(@as(i64, 1), user.id);
+    try std.testing.expectEqualStrings("Alice", user.name);
+}
+
+test "sqlite queryRowPartialBorrowed zeroes missing columns" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+
+    try client.connect();
+    _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+    _ = try client.exec("INSERT INTO users (name) VALUES (?1)", &.{.{ .string = "Alice" }});
+
+    const PartialUser = struct {
+        id: i64,
+        name: []const u8,
+        bio: []const u8, // missing in DB, should be zeroed
+    };
+
+    var row = try client.queryRowPartialBorrowed(PartialUser, "SELECT id, name FROM users WHERE name = ?1", &.{.{ .string = "Alice" }});
+    defer row.deinit();
+    const user = row.get();
+    try std.testing.expectEqual(@as(i64, 1), user.id);
+    try std.testing.expectEqualStrings("Alice", user.name);
+    try std.testing.expectEqual(@as(usize, 0), user.bio.len);
+}
+
+test "sqlite queryRowOwned alias has owned-string contract" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+
+    try client.connect();
+    _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+    _ = try client.exec("INSERT INTO users (name) VALUES (?1)", &.{.{ .string = "Alice" }});
+
+    const User = struct {
+        id: i64,
+        name: []const u8,
+    };
+
+    const user = try client.queryRowOwned(User, "SELECT id, name FROM users WHERE name = ?1", &.{.{ .string = "Alice" }});
+    defer freeScanned(allocator, User, user); // owned → caller frees
+    try std.testing.expectEqual(@as(i64, 1), user.id);
+    try std.testing.expectEqualStrings("Alice", user.name);
 }
 
 test "sqlite queryRow and queryRows struct scan" {

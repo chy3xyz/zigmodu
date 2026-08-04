@@ -217,6 +217,37 @@ fn comptimeSelectPage(
     return "SELECT " ++ comptimeColumnList(sql_cols, fields, camel) ++ " FROM " ++ table ++ " LIMIT ? OFFSET ?";
 }
 
+fn comptimeSelectPageForTenant(
+    comptime table: []const u8,
+    comptime sql_cols: []const []const u8,
+    comptime fields: []const []const u8,
+    comptime camel: bool,
+    comptime col: []const u8,
+) []const u8 {
+    return "SELECT " ++ comptimeColumnList(sql_cols, fields, camel) ++ " FROM " ++ table ++ " WHERE " ++ col ++ " = ? LIMIT ? OFFSET ?";
+}
+
+fn comptimeCountForTenant(comptime table: []const u8, comptime col: []const u8) []const u8 {
+    return "SELECT COUNT(*) AS count FROM " ++ table ++ " WHERE " ++ col ++ " = ?";
+}
+
+/// Tenant-scoped repository methods filter by `col`; fail at compile time when
+/// the model lacks the tenant field instead of silently skipping the filter.
+fn comptimeRequireTenantField(comptime T: type, comptime col: []const u8) void {
+    if (!@hasField(T, col)) {
+        @compileError("tenant-scoped repository method called for model without field '" ++ col ++ "' — add the tenant column to the model or use the non-tenant variant");
+    }
+}
+
+/// Build `WHERE {col} = ?` (empty `where_sql`) or `{where_sql} AND {col} = ?`.
+/// Caller owns the returned slice.
+fn tenantClause(allocator: std.mem.Allocator, comptime col: []const u8, where_sql: []const u8) ![]const u8 {
+    if (where_sql.len == 0) {
+        return std.fmt.allocPrint(allocator, "WHERE {s} = ?", .{col});
+    }
+    return std.fmt.allocPrint(allocator, "{s} AND {s} = ?", .{ where_sql, col });
+}
+
 fn comptimeSkipInsertField(comptime fname: []const u8) bool {
     return std.mem.eql(u8, fname, "id") or
         std.mem.eql(u8, fname, "create_time") or
@@ -535,6 +566,36 @@ pub fn Orm(comptime B: type) type {
                     return self.orm.backend.queryRows(T, buf.items, args);
                 }
 
+                /// Tenant-scoped batch lookup: `WHERE pk IN (?,…) AND {col} = ?`.
+                /// `col` is the tenant column name (`"tenant_id"` or `"app_id"`);
+                /// compile-time error when the model lacks that field.
+                pub fn findByIdsForTenant(self: @This(), comptime col: []const u8, allocator: std.mem.Allocator, tenant_id: i64, ids: []const i64) !sqlx.QueryResult(T) {
+                    comptime comptimeRequireTenantField(T, col);
+                    if (ids.len == 0) return error.EmptyIds;
+                    const cols = comptime comptimeColumnList(meta.sql_columns, meta.fields, meta.camel_case);
+                    var buf = std.ArrayList(u8).empty;
+                    defer buf.deinit(allocator);
+                    try buf.appendSlice(allocator, "SELECT ");
+                    try buf.appendSlice(allocator, cols);
+                    try buf.appendSlice(allocator, " FROM ");
+                    try buf.appendSlice(allocator, meta.table_name);
+                    try buf.appendSlice(allocator, " WHERE ");
+                    try buf.appendSlice(allocator, meta.primary_key);
+                    try buf.appendSlice(allocator, " IN (");
+                    for (0..ids.len) |i| {
+                        if (i > 0) try buf.appendSlice(allocator, ",");
+                        try buf.appendSlice(allocator, "?");
+                    }
+                    try buf.appendSlice(allocator, ") AND ");
+                    try buf.appendSlice(allocator, col);
+                    try buf.appendSlice(allocator, " = ?");
+                    const args = try allocator.alloc(B.Value, ids.len + 1);
+                    defer allocator.free(args);
+                    for (0..ids.len) |i| args[i] = B.fromOrmValue(toOrmValue(ids[i]));
+                    args[ids.len] = B.fromOrmValue(.{ .int = tenant_id });
+                    return self.orm.backend.queryRows(T, buf.items, args);
+                }
+
                 pub fn findAll(self: @This()) !sqlx.QueryResult(T) {
                     const sql = comptime comptimeSelectAll(meta.table_name, meta.sql_columns, meta.fields, meta.camel_case);
                     return self.orm.backend.queryRows(T, sql, &.{});
@@ -567,6 +628,41 @@ pub fn Orm(comptime B: type) type {
                     };
                 }
 
+                /// Tenant-scoped pagination: `SELECT … WHERE {col} = ? LIMIT ?
+                /// OFFSET ?` plus a tenant-scoped COUNT for `total`. `col` is
+                /// the tenant column name (`"tenant_id"` or `"app_id"`);
+                /// compile-time error when the model lacks that field.
+                pub fn findPageForTenant(self: @This(), comptime col: []const u8, tenant_id: i64, page: usize, size: usize) !PageResult(T) {
+                    comptime comptimeRequireTenantField(T, col);
+                    const sql = comptime comptimeSelectPageForTenant(meta.table_name, meta.sql_columns, meta.fields, meta.camel_case, col);
+                    const offset: i64 = if (page > 0) @intCast((page - 1) * size) else 0;
+                    var args = [_]B.Value{
+                        B.fromOrmValue(.{ .int = tenant_id }),
+                        B.fromOrmValue(.{ .int = @intCast(size) }),
+                        B.fromOrmValue(.{ .int = offset }),
+                    };
+                    var result = try self.orm.backend.queryRows(T, sql, &args);
+                    const owned = result.take();
+                    const total = try self.countForTenant(col, tenant_id);
+                    const total_page = if (size > 0) (total + size - 1) / size else 0;
+                    return .{
+                        .items = owned.items,
+                        .arena = owned.arena,
+                        .page = page,
+                        .size = size,
+                        .total = total,
+                        .total_page = total_page,
+                    };
+                }
+
+                /// Tenant-scoped row count: `SELECT COUNT(*) FROM {t} WHERE {col} = ?`.
+                pub fn countForTenant(self: @This(), comptime col: []const u8, tenant_id: i64) !usize {
+                    comptime comptimeRequireTenantField(T, col);
+                    const sql = comptime comptimeCountForTenant(meta.table_name, col);
+                    const result = try self.orm.backend.queryRow(struct { count: i64 }, sql, &.{.{ .int = tenant_id }});
+                    return @intCast(result.?.count);
+                }
+
                 /// Filtered pagination with custom WHERE clause and args.
                 /// `where_sql` must not contain string literals/comments/`;` —
                 /// pass values via `?` placeholders + `args` (see sqlx.validateSqlFragment).
@@ -593,6 +689,56 @@ pub fn Orm(comptime B: type) type {
                     if (args.len > 0) @memcpy(all_args[0..args.len], args);
                     all_args[args.len] = B.fromOrmValue(.{ .int = @intCast(size) });
                     all_args[args.len + 1] = B.fromOrmValue(.{ .int = offset });
+
+                    var result = try self.orm.backend.queryRows(T, data_sql, all_args);
+                    const owned = result.take();
+                    const total_page = if (size > 0) (total + size - 1) / size else 0;
+                    return .{
+                        .items = owned.items,
+                        .arena = owned.arena,
+                        .page = page,
+                        .size = size,
+                        .total = total,
+                        .total_page = total_page,
+                    };
+                }
+
+                /// Tenant-scoped filtered pagination: prepends `{col} = ?` to
+                /// the WHERE clause (when `where_sql` is empty, filters only by
+                /// tenant). Same `where_sql` contract as `findPageFiltered`
+                /// (full `WHERE …` clause, may be empty; values via `?`
+                /// placeholders + args). `col` is the tenant column name;
+                /// compile-time error when the model lacks that field.
+                pub fn findPageFilteredForTenant(self: @This(), comptime col: []const u8, alloc: std.mem.Allocator, tenant_id: i64, where_sql: []const u8, args: []const B.Value, page: usize, size: usize) !PageResult(T) {
+                    comptime comptimeRequireTenantField(T, col);
+                    try sqlx.validateSqlFragment(where_sql);
+                    const col_list = comptime comptimeColumnList(meta.sql_columns, meta.fields, meta.camel_case);
+
+                    const count_clause = try tenantClause(alloc, col, where_sql);
+                    defer alloc.free(count_clause);
+                    const count_sql = try std.fmt.allocPrint(alloc, "SELECT COUNT(*) AS count FROM {s} {s}", .{ meta.table_name, count_clause });
+                    defer alloc.free(count_sql);
+                    const count_args = try alloc.alloc(B.Value, args.len + 1);
+                    defer alloc.free(count_args);
+                    if (args.len > 0) @memcpy(count_args[0..args.len], args);
+                    count_args[args.len] = B.fromOrmValue(.{ .int = tenant_id });
+                    const count_row = try self.orm.backend.queryRow(struct { count: i64 }, count_sql, count_args);
+                    const total: usize = if (count_row) |c| @intCast(c.count) else 0;
+
+                    const offset: i64 = if (page > 0) @intCast((page - 1) * size) else 0;
+                    const data_sql = try std.fmt.allocPrint(
+                        alloc,
+                        "SELECT {s} FROM {s} {s} ORDER BY {s} DESC LIMIT ? OFFSET ?",
+                        .{ col_list, meta.table_name, count_clause, meta.primary_key },
+                    );
+                    defer alloc.free(data_sql);
+
+                    const all_args = try alloc.alloc(B.Value, args.len + 3);
+                    defer alloc.free(all_args);
+                    if (args.len > 0) @memcpy(all_args[0..args.len], args);
+                    all_args[args.len] = B.fromOrmValue(.{ .int = tenant_id });
+                    all_args[args.len + 1] = B.fromOrmValue(.{ .int = @intCast(size) });
+                    all_args[args.len + 2] = B.fromOrmValue(.{ .int = offset });
 
                     var result = try self.orm.backend.queryRows(T, data_sql, all_args);
                     const owned = result.take();
@@ -847,4 +993,65 @@ test "Repository insertMany / upsertMany / findByIds end-to-end (sqlite)" {
     const by_id = (try repo.findById(@as(i64, 2))).?;
     try std.testing.expectEqual(@as(i64, 250), by_id.price_cents);
     std.testing.allocator.free(by_id.sku);
+}
+
+test "Repository tenant-scoped methods filter by tenant column (sqlite)" {
+    const allocator = std.testing.allocator;
+    const data = @import("../data.zig");
+
+    const TenantProduct = struct {
+        pub const sql_table_name: []const u8 = "tenant_product";
+        id: i64,
+        sku: []const u8,
+        price_cents: i64,
+        tenant_id: i64,
+    };
+
+    var client = try data.Client.open(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    _ = try client.exec(
+        "CREATE TABLE tenant_product (id INTEGER PRIMARY KEY, sku TEXT NOT NULL, price_cents INTEGER NOT NULL, tenant_id INTEGER NOT NULL)",
+        &.{},
+    );
+    const rows = [_]struct { id: i64, sku: []const u8, price: i64, tenant: i64 }{
+        .{ .id = 1, .sku = "T1-A", .price = 100, .tenant = 1 },
+        .{ .id = 2, .sku = "T1-B", .price = 200, .tenant = 1 },
+        .{ .id = 3, .sku = "T2-A", .price = 100, .tenant = 2 },
+        .{ .id = 4, .sku = "T2-B", .price = 200, .tenant = 2 },
+    };
+    for (rows) |r| {
+        _ = try client.exec(
+            "INSERT INTO tenant_product (id, sku, price_cents, tenant_id) VALUES (?1, ?2, ?3, ?4)",
+            &.{ .{ .int = r.id }, .{ .string = r.sku }, .{ .int = r.price }, .{ .int = r.tenant } },
+        );
+    }
+
+    const backend = data.SqlxBackend{ .allocator = allocator, .client = &client };
+    var orm: data.orm.Orm(data.SqlxBackend) = undefined;
+    orm.backend = backend;
+    const Repo = data.Repository(TenantProduct);
+    const repo = Repo{ .orm = &orm };
+
+    // findPageForTenant: rows and total are tenant-scoped.
+    var page = try repo.findPageForTenant("tenant_id", 1, 1, 10);
+    defer if (page.arena) |*a| a.deinit();
+    try std.testing.expectEqual(@as(usize, 2), page.items.len);
+    try std.testing.expectEqual(@as(usize, 2), page.total);
+
+    // countForTenant.
+    try std.testing.expectEqual(@as(usize, 2), try repo.countForTenant("tenant_id", 1));
+    try std.testing.expectEqual(@as(usize, 2), try repo.countForTenant("tenant_id", 2));
+
+    // findByIdsForTenant: ids from other tenants are not returned.
+    var found = try repo.findByIdsForTenant("tenant_id", allocator, 1, &.{ @as(i64, 1), @as(i64, 3) });
+    defer found.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), found.items.len);
+    try std.testing.expectEqual(@as(i64, 1), found.items[0].id);
+
+    // findPageFilteredForTenant: WHERE + tenant combine.
+    var filtered = try repo.findPageFilteredForTenant("tenant_id", allocator, 1, "WHERE price_cents > ?", &.{.{ .int = 100 }}, 1, 10);
+    defer if (filtered.arena) |*a| a.deinit();
+    try std.testing.expectEqual(@as(usize, 1), filtered.items.len);
+    try std.testing.expectEqualStrings("T1-B", filtered.items[0].sku);
+    try std.testing.expectEqual(@as(usize, 1), filtered.total);
 }

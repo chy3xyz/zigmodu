@@ -112,7 +112,7 @@ test "TicketFlow triages with context and writes to outbox" {
     defer client.deinit();
     try client.connect();
     _ = try client.exec(
-        "CREATE TABLE event_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, payload TEXT, status INTEGER DEFAULT 0, retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 5, created_at INTEGER, updated_at INTEGER, error_message TEXT)",
+        "CREATE TABLE event_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, payload TEXT, status INTEGER DEFAULT 0, tenant_id INTEGER, retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 5, created_at INTEGER, updated_at INTEGER, error_message TEXT)",
         &.{},
     );
     _ = try client.exec("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT, plan TEXT)", &.{});

@@ -18,6 +18,7 @@ pub const OutboxEntry = struct {
     id: i64,
     topic: []const u8,
     payload: []const u8,
+    tenant_id: ?i64 = null,
     status: OutboxStatus,
     retry_count: u32,
     max_retries: u32,
@@ -64,12 +65,16 @@ pub const OutboxPublisher = struct {
     }
 
     /// Build SQL to create the outbox table. Call once at startup.
+    /// `tenant_id` is nullable for backwards compatibility with single-tenant
+    /// deployments; multi-tenant SaaS should scope writes via
+    /// `buildInsertForTenant` and filter readers by the column.
     pub fn migrationSql() []const u8 {
         return
         \\CREATE TABLE IF NOT EXISTS event_outbox (
         \\    id BIGINT AUTO_INCREMENT PRIMARY KEY,
         \\    topic VARCHAR(255) NOT NULL,
         \\    payload TEXT NOT NULL,
+        \\    tenant_id BIGINT NULL,
         \\    status TINYINT NOT NULL DEFAULT 0,
         \\    retry_count INT NOT NULL DEFAULT 0,
         \\    max_retries INT NOT NULL DEFAULT 5,
@@ -81,7 +86,20 @@ pub const OutboxPublisher = struct {
         ;
     }
 
-    /// Generate the INSERT SQL for an outbox entry.
+    /// Generate the INSERT SQL for an outbox entry (tenant-scoped variant).
+    /// Caller should execute this within a transaction alongside business data.
+    pub fn buildInsertForTenant(
+        self: *Self,
+        topic: []const u8,
+        payload: []const u8,
+        tenant_id: i64,
+    ) !OutboxInsert {
+        var insert = try self.buildInsert(topic, payload);
+        insert.params.tenant_id = tenant_id;
+        return insert;
+    }
+
+    /// Generate the INSERT SQL for an outbox entry (no tenant).
     /// Caller should execute this within a transaction alongside business data.
     pub fn buildInsert(
         self: *Self,
@@ -92,12 +110,13 @@ pub const OutboxPublisher = struct {
 
         return OutboxInsert{
             .sql =
-            \\INSERT INTO event_outbox (topic, payload, status, retry_count, max_retries, created_at, updated_at)
-            \\VALUES (?, ?, 0, 0, ?, ?, ?)
+            \\INSERT INTO event_outbox (topic, payload, tenant_id, status, retry_count, max_retries, created_at, updated_at)
+            \\VALUES (?, ?, ?, 0, 0, ?, ?, ?)
             ,
             .params = .{
                 .topic = topic,
                 .payload = payload,
+                .tenant_id = null,
                 .max_retries = self.config.max_retries,
                 .created_at = now,
                 .updated_at = now,
@@ -111,6 +130,7 @@ pub const OutboxPublisher = struct {
         params: struct {
             topic: []const u8,
             payload: []const u8,
+            tenant_id: ?i64 = null,
             max_retries: u32,
             created_at: i64,
             updated_at: i64,
@@ -151,7 +171,7 @@ pub const OutboxPoller = struct {
     pub fn buildSelectPending(self: *Self) ![]const u8 {
         return std.fmt.allocPrint(
             self.allocator,
-            "SELECT id, topic, payload, status, retry_count, max_retries, created_at, updated_at, error_message FROM {s} WHERE status IN (0, 1) AND retry_count < max_retries ORDER BY created_at ASC LIMIT {d}",
+            "SELECT id, topic, payload, tenant_id, status, retry_count, max_retries, created_at, updated_at, error_message FROM {s} WHERE status IN (0, 1) AND retry_count < max_retries ORDER BY created_at ASC LIMIT {d}",
             .{ self.outbox_table, self.config.batch_size },
         );
     }
@@ -252,6 +272,15 @@ test "OutboxPublisher buildInsert" {
     try std.testing.expect(insert.sql.len > 0);
     try std.testing.expectEqualStrings("order.created", insert.params.topic);
     try std.testing.expectEqualStrings("{\"id\":1}", insert.params.payload);
+    try std.testing.expect(insert.params.tenant_id == null);
+}
+
+test "OutboxPublisher buildInsertForTenant" {
+    const allocator = std.testing.allocator;
+    var publisher = OutboxPublisher.init(allocator, .{});
+    const insert = try publisher.buildInsertForTenant("order.created", "{\"id\":1}", 42);
+    try std.testing.expectEqual(@as(?i64, 42), insert.params.tenant_id);
+    try std.testing.expect(std.mem.indexOf(u8, insert.sql, "tenant_id") != null);
 }
 
 test "OutboxPublisher migrationSql" {
@@ -259,6 +288,7 @@ test "OutboxPublisher migrationSql" {
     try std.testing.expect(std.mem.indexOf(u8, sql, "CREATE TABLE IF NOT EXISTS event_outbox") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "PRIMARY KEY") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "idx_status_created") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "tenant_id BIGINT NULL") != null);
 }
 
 test "OutboxPoller build queries" {

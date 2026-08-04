@@ -34,6 +34,11 @@ pub const CrudOpts = struct {
     /// Allowed ORDER BY columns for the list endpoint (`sort=<col>&order=
     /// asc|desc`). Empty = no sorting. Anything not whitelisted is ignored.
     sortable: []const []const u8 = &.{},
+    /// Context attribute carrying the tenant id. Default `"tenant_id"` is
+    /// populated by the catalog JWT middleware from the JWT `aud` claim
+    /// (`Middleware.zig`); override for multi-portal setups where a different
+    /// attribute name is injected.
+    tenant_attr: []const u8 = "tenant_id",
 };
 
 pub fn CrudApi(comptime Entity: type, comptime Service: type, comptime opts: CrudOpts) type {
@@ -74,7 +79,7 @@ pub fn CrudApi(comptime Entity: type, comptime Service: type, comptime opts: Cru
         };
 
         fn tenantId(ctx: *http.Context) !i64 {
-            const s = ctx.getAttr("tenant_id") orelse return error.Unauthorized;
+            const s = ctx.getAttr(opts.tenant_attr) orelse return error.Unauthorized;
             return std.fmt.parseInt(i64, s, 10);
         }
 
@@ -311,4 +316,20 @@ test "CrudApi honors permission override and public flag" {
     const Pub = CrudApi(TestEntity, TestService, .{ .public = true });
     try std.testing.expect(Pub.routes[0].meta.permission == null);
     try std.testing.expect(Pub.routes[0].meta.auth == .public);
+}
+
+test "CrudApi tenantId reads configurable tenant_attr" {
+    const allocator = std.testing.allocator;
+    const Api = CrudApi(TestEntity, TestService, .{ .tenant_attr = "org_id" });
+
+    var ctx = try http.Context.init(allocator, .GET, "/widgets");
+    defer ctx.deinit();
+    try ctx.setAttr("org_id", "42");
+    try std.testing.expectEqual(@as(i64, 42), try Api.tenantId(&ctx));
+
+    // Default attr name is not read when overridden — unauthorized.
+    var ctx2 = try http.Context.init(allocator, .GET, "/widgets");
+    defer ctx2.deinit();
+    try ctx2.setAttr("tenant_id", "42");
+    try std.testing.expectError(error.Unauthorized, Api.tenantId(&ctx2));
 }
