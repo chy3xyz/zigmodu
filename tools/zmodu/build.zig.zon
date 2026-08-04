@@ -1,0 +1,13 @@
+.{
+    .name = .zmodu_cli,
+    // Keep in sync with the root build.zig.zon — scripts/release.sh bumps both.
+    .version = "0.15.7",
+    .fingerprint = 0x331a61aac3b3213d,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
