@@ -88,6 +88,12 @@ pub const ModuleRec = struct {
 pub const RuleConfig = struct {
     max_deps: usize = 5,
     disabled: std.StringHashMap(void) = undefined,
+    /// Model type symbol table: `pub const NAME = struct { … }` → whether the
+    /// struct body mentions a `[]const u8` field. Populated by the audit
+    /// runner from `src/modules/*/model.zig`; used by b17 to skip named types
+    /// that own no strings (scalar rows cannot leak). `null` = conservative
+    /// (report everything).
+    model_symbols: ?*const std.StringHashMap(bool) = null,
 
     pub fn deinit(self: *RuleConfig, allocator: std.mem.Allocator) void {
         var it = self.disabled.iterator();
@@ -552,6 +558,35 @@ fn collectBusiness(
     };
     defer dir.close(io);
 
+    // Build the struct symbol table first: top-level `const X = struct { … }`
+    // in every module source file (model.zig, persistence.zig, service.zig,
+    // …) → whether the body has a `[]const u8` string field. b17 uses it to
+    // skip named types that own no strings (scalar rows).
+    var model_symbols = std.StringHashMap(bool).init(allocator);
+    defer {
+        var kit = model_symbols.iterator();
+        while (kit.next()) |e| allocator.free(e.key_ptr.*);
+        model_symbols.deinit();
+    }
+    var scan_it = dir.iterate();
+    while (try scan_it.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        const scan_dir = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+        defer scan_dir.close(io);
+        var sf_it = scan_dir.iterate();
+        while (try sf_it.next(io)) |f| {
+            if (f.kind != .file or !std.mem.endsWith(u8, f.name, ".zig")) continue;
+            const rel = std.fs.path.join(allocator, &.{ modules_path, entry.name, f.name }) catch continue;
+            defer allocator.free(rel);
+            const content = Dir.cwd().readFileAlloc(io, rel, allocator, Io.Limit.limited(4 * 1024 * 1024)) catch continue;
+            defer allocator.free(content);
+            try collectModelStructs(allocator, content, &model_symbols);
+        }
+    }
+    var effective_cfg = config.*;
+    effective_cfg.model_symbols = &model_symbols;
+    const lint_cfg = &effective_cfg;
+
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
         if (entry.kind != .directory) continue;
@@ -580,7 +615,7 @@ fn collectBusiness(
             if (std.mem.indexOf(u8, content, "CrudApi(") != null or std.mem.indexOf(u8, content, "CrudService(") != null) {
                 module_uses_autocrud = true;
             }
-            try lintFile(allocator, f.name, content, rel_display, config, violations);
+            try lintFile(allocator, f.name, content, rel_display, lint_cfg, violations);
         }
         if (module_uses_autocrud and !module_has_test and !config.disabled.contains("b14")) {
             const mod_rel = try std.fs.path.join(allocator, &.{ "src", "modules", entry.name });
@@ -612,6 +647,21 @@ fn lintFile(
     var fn_open = false;
     var fn_open_line: usize = 0;
     var fn_open_name: ?[]const u8 = null;
+    // b17 — owned-string queryRow* results must be freed (freeScanned) or the
+    // caller leaks; scope-local code should prefer queryRowBorrowed instead.
+    var qr_count: usize = 0;
+    var qr_fs_count: usize = 0;
+    var qr_return_count: usize = 0;
+    var qr_first_line: usize = 0;
+    // `const x = queryRow(...)` whose value is delegated via the next-line
+    // `return x;` — ownership transfers, no leak at this call site.
+    var pending_qr_var: ?[]const u8 = null;
+    // Inside a `return .{ … };` assembly that may borrow the pending var whole.
+    var in_return_assembly = false;
+    // A queryRow* call whose first argument starts on the NEXT line (e.g.
+    // `queryRow(\n struct {cnt: i64}, …)`); resolved there (cross-line inline
+    // struct → scalar check; otherwise count normally).
+    var pending_qr_open_line: usize = 0;
     while (lines.next()) |line| : (idx += 1) {
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0 or std.mem.startsWith(u8, trimmed, "//")) continue;
@@ -637,6 +687,101 @@ fn lintFile(
                     try flushMultiWrite(fn_open, fn_open_name, fn_open_line, fn_write_count, fn_tx_seen, rel_path, allocator, violations);
                     fn_open = false;
                     fn_open_name = null;
+                }
+            }
+        }
+
+        // b17 — owned-string queryRow* results never freed: `queryRow` /
+        // `queryRowPartial` return string fields dupe'd into the client's
+        // allocator, so each call site must `freeScanned` them (or delegate
+        // ownership via `return`). Scope-local code should prefer the RAII
+        // `queryRowBorrowed` (arena owned by the wrapper, nothing to free).
+        // Heuristic is per-fn and heuristic: flag when a service/persistence
+        // fn has owned queryRow* calls, no freeScanned anywhere in it, and
+        // doesn't `return` all of them.
+        if ((std.mem.eql(u8, file_name, "service.zig") or std.mem.eql(u8, file_name, "persistence.zig")) and !config.disabled.contains("b17")) {
+            if (pubFnName(trimmed)) |_| {
+                try flushOwnedRow(qr_count, qr_fs_count, qr_return_count, qr_first_line, rel_path, allocator, violations);
+                qr_count = 0;
+                qr_fs_count = 0;
+                qr_return_count = 0;
+                qr_first_line = 0;
+            } else {
+                // Delegate pattern: `const x = queryRow(...); return x;` —
+                // the following line(s) decide whether ownership transfers
+                // (direct `return x;`, a `return .{ … x … };` assembly, or an
+                // intermediate `const y = .{ … x … }; return y;` chain).
+                if (pending_qr_var) |v| {
+                    if (in_return_assembly) {
+                        if (isWholeVarAssign(line, v)) qr_return_count += 1;
+                        if (std.mem.endsWith(u8, trimmed, "};")) {
+                            in_return_assembly = false;
+                            pending_qr_var = null;
+                        }
+                    } else if (isReturnVar(trimmed, v)) {
+                        qr_return_count += 1;
+                        pending_qr_var = null;
+                    } else if (std.mem.indexOf(u8, line, "return .{") != null) {
+                        in_return_assembly = true;
+                        if (isWholeVarAssign(line, v)) qr_return_count += 1;
+                        if (std.mem.endsWith(u8, trimmed, "};")) {
+                            in_return_assembly = false;
+                            pending_qr_var = null;
+                        }
+                    } else if (constAssignedVar(line)) |alias| {
+                        // Intermediate assembly/alias: ownership follows the
+                        // alias until it is returned (or used elsewhere).
+                        pending_qr_var = if (isWholeVarAssign(line, v)) alias else null;
+                    } else {
+                        pending_qr_var = null;
+                    }
+                }
+                if (std.mem.indexOf(u8, line, "freeScanned") != null) qr_fs_count += 1;
+                // Cross-line queryRow* call: first argument starts next line.
+                if (pending_qr_open_line > 0) {
+                    if (std.mem.startsWith(u8, trimmed, "struct {")) {
+                        if (!isScalarInlineStruct(line)) {
+                            if (qr_count == 0) qr_first_line = pending_qr_open_line;
+                            qr_count += 1;
+                            if (isReturnOfOwnedQueryRow(trimmed)) qr_return_count += 1;
+                        }
+                    } else if (!namedTypeHasNoString(line, config.model_symbols)) {
+                        if (qr_count == 0) qr_first_line = pending_qr_open_line;
+                        qr_count += 1;
+                        if (isReturnOfOwnedQueryRow(trimmed)) qr_return_count += 1;
+                    }
+                    pending_qr_open_line = 0;
+                }
+                if (isOwnedQueryRowCall(line)) {
+                    if (queryRowFirstArgOpen(line)) {
+                        // First argument on the next line — resolve there.
+                        // `return try …queryRow(` transfers ownership outright,
+                        // regardless of where the type lands; don't cancel the
+                        // delegation by deferring to the next line.
+                        pending_qr_open_line = if (isReturnOfOwnedQueryRow(trimmed)) 0 else idx;
+                    } else if (isScalarInlineStruct(line) or namedTypeHasNoString(line, config.model_symbols)) {
+                        // Inline `struct { … }` without `[]const u8` fields
+                        // (e.g. `struct { count: i64 }`, `[]i64` slices), or a
+                        // named type the symbol table knows to be string-free:
+                        // row owns no strings — nothing to free.
+                    } else {
+                        if (qr_count == 0) qr_first_line = idx;
+                        qr_count += 1;
+                        if (isReturnOfOwnedQueryRow(trimmed)) {
+                            qr_return_count += 1;
+                        } else if (constAssignedVar(line)) |name| {
+                            pending_qr_var = name;
+                        }
+                    }
+                }
+                if (std.mem.eql(u8, trimmed, "}")) {
+                    try flushOwnedRow(qr_count, qr_fs_count, qr_return_count, qr_first_line, rel_path, allocator, violations);
+                    qr_count = 0;
+                    qr_fs_count = 0;
+                    qr_return_count = 0;
+                    qr_first_line = 0;
+                    in_return_assembly = false;
+                    pending_qr_open_line = 0;
                 }
             }
         }
@@ -730,8 +875,14 @@ fn lintFile(
             try pushViolation(violations, allocator, "b9", rel_path, idx, "handler parses Authorization/Bearer manually — use jwtAuthFromCatalogWithPermissions middleware + attrs", .{});
         }
 
-        // b10 — swallowed errors.
-        if (isEmptyCatch(line) and !config.disabled.contains("b10")) {
+        // b10 — swallowed errors. Empty catches on `errdefer` cleanup and
+        // transaction `rollback` are best-effort by nature (the original
+        // error is what matters, the rollback failure is secondary), so they
+        // are idiomatic rather than swallowed errors and get exempted.
+        if (isEmptyCatch(line) and
+            !containsAny(line, &.{ "errdefer", "rollback" }) and
+            !config.disabled.contains("b10"))
+        {
             try pushViolation(violations, allocator, "b10", rel_path, idx, "empty catch block swallows errors — log and propagate (ZigModuError)", .{});
         }
 
@@ -781,6 +932,7 @@ fn lintFile(
         }
     }
     try flushMultiWrite(fn_open, fn_open_name, fn_open_line, fn_write_count, fn_tx_seen, rel_path, allocator, violations);
+    try flushOwnedRow(qr_count, qr_fs_count, qr_return_count, qr_first_line, rel_path, allocator, violations);
 }
 
 fn flushMultiWrite(
@@ -795,6 +947,194 @@ fn flushMultiWrite(
 ) !void {
     if (fn_open and write_count >= 2 and !tx_seen) {
         try pushViolation(violations, allocator, "b16", rel_path, fn_line, "service method '{s}' performs {d} writes without a transaction — wrap in self.transact(...) / beginTx", .{ fn_name.?, write_count });
+    }
+}
+
+/// b17 — flush the per-fn owned-string bookkeeping: report when the fn used
+/// owned `queryRow*` calls but neither freed them (`freeScanned`) nor
+/// delegated every result via `return`.
+fn flushOwnedRow(
+    qr_count: usize,
+    qr_fs_count: usize,
+    qr_return_count: usize,
+    qr_first_line: usize,
+    rel_path: []const u8,
+    allocator: std.mem.Allocator,
+    violations: *std.ArrayList(Violation),
+) !void {
+    if (qr_count > 0 and qr_fs_count == 0 and qr_return_count < qr_count) {
+        try pushViolation(violations, allocator, "b17", rel_path, qr_first_line, "queryRow/queryRowPartial returns owned strings never freed here — call freeScanned(allocator, T, row) or use queryRowBorrowed (RAII arena, nothing to free)", .{});
+    }
+}
+
+/// Owned-string single-row query calls (the caller owns the returned string
+/// fields). Excludes `queryRows*` (QueryResult arena contract) and
+/// `queryRowBorrowed` (RAII, nothing to free).
+fn isOwnedQueryRowCall(line: []const u8) bool {
+    const needles = [_][]const u8{ ".queryRowOwned(", ".queryRowPartialOwned(", ".queryRowPartial(", ".queryRow(" };
+    for (needles) |n| {
+        if (std.mem.indexOf(u8, line, n) != null) return true;
+    }
+    return false;
+}
+
+/// True when the whole trimmed line delegates the owned result via `return`,
+/// e.g. `return self.db.queryRow(...)` — ownership transfers to the caller.
+fn isReturnOfOwnedQueryRow(trimmed: []const u8) bool {
+    if (!std.mem.startsWith(u8, trimmed, "return ")) return false;
+    return isOwnedQueryRowCall(trimmed);
+}
+
+/// True for `return x;` (whole value delegated, no trailing expression).
+fn isReturnVar(trimmed: []const u8, name: []const u8) bool {
+    if (!std.mem.startsWith(u8, trimmed, "return ")) return false;
+    const rest = std.mem.trim(u8, trimmed["return ".len..], " \t");
+    if (!std.mem.startsWith(u8, rest, name)) return false;
+    const after = rest[name.len..];
+    return after.len == 0 or (after.len == 1 and after[0] == ';');
+}
+
+/// Extract the variable name from `const x = …` (or `var x = …`). Returns
+/// null when the line is not a simple const/var assignment.
+fn constAssignedVar(line: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    const prefix_len: usize = if (std.mem.startsWith(u8, trimmed, "const "))
+        "const ".len
+    else if (std.mem.startsWith(u8, trimmed, "var "))
+        "var ".len
+    else
+        return null;
+    const rest = std.mem.trim(u8, trimmed[prefix_len..], " \t");
+    const eq = std.mem.indexOf(u8, rest, " =") orelse return null;
+    const name = std.mem.trim(u8, rest[0..eq], " \t");
+    if (!isIdent(name)) return null;
+    return name;
+}
+
+/// True when the line passes an inline anonymous struct to a query call that
+/// has no slice/string fields — e.g. `queryRow(struct { count: i64 }, …)`.
+/// Heuristic: slice/string types always contain `[`; scalar types never do.
+/// Multi-line struct literals are not recognized (conservatively reported).
+/// True when the inline anonymous struct passed to a query call has NO
+/// `[]const u8` string fields — the only fields `freeScanned` ever frees.
+/// `[]i64`, `[]u8`, scalars, etc. own nothing, so such rows cannot leak.
+/// Heuristic: `[]const u8` (incl. `?[]const u8` / `[]const []const u8`) is the
+/// exact string-slice spelling; anything else is not a freed string field.
+/// Multi-line struct literals are not recognized (conservatively reported).
+fn isScalarInlineStruct(line: []const u8) bool {
+    const start = std.mem.indexOf(u8, line, "struct {") orelse return false;
+    const brace = start + "struct {".len - 1; // position of '{'
+    const close = std.mem.indexOfScalarPos(u8, line, brace + 1, '}') orelse return false;
+    const body = line[brace + 1 .. close];
+    return std.mem.indexOf(u8, body, "[]const u8") == null;
+}
+
+/// True when `name` is assigned whole inside a return assembly, e.g.
+/// `.product = p,` / `= p }` — but not `.id = p.id` (field borrow) or
+/// `= p[i]` (slice element).
+fn isWholeVarAssign(line: []const u8, name: []const u8) bool {
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, line, search_from, name)) |pos| {
+        // preceding non-space char must be '='
+        var i = pos;
+        while (i > 0 and (line[i - 1] == ' ' or line[i - 1] == '\t')) i -= 1;
+        if (i > 0 and line[i - 1] == '=') {
+            const after = if (pos + name.len < line.len) line[pos + name.len] else ' ';
+            switch (after) {
+                ',', '}', ';', ' ', '\t' => return true,
+                else => {},
+            }
+        }
+        search_from = pos + name.len;
+    }
+    return false;
+}
+
+/// Extract the first-argument type name of a queryRow* call: `model.Product`
+/// → `Product`. Returns null for inline `struct { … }` args (handled by
+/// `isScalarInlineStruct`) and non-identifier args.
+fn queryRowTypeName(line: []const u8) ?[]const u8 {
+    const needles = [_][]const u8{ ".queryRowOwned(", ".queryRowPartialOwned(", ".queryRowPartial(", ".queryRow(" };
+    var arg_start: ?usize = null;
+    for (needles) |n| {
+        if (std.mem.indexOf(u8, line, n)) |pos| {
+            arg_start = pos + n.len;
+            break;
+        }
+    }
+    const s = arg_start orelse return null;
+    const after = line[s..];
+    if (std.mem.startsWith(u8, after, "struct")) return null;
+    const comma = std.mem.indexOfScalar(u8, after, ',') orelse return null;
+    const arg = std.mem.trim(u8, after[0..comma], " \t");
+    const dot = std.mem.lastIndexOfScalar(u8, arg, '.') orelse {
+        if (!isIdent(arg)) return null;
+        return arg;
+    };
+    const name = arg[dot + 1 ..];
+    if (!isIdent(name)) return null;
+    return name;
+}
+
+/// True when the queryRow* call's FIRST argument does not start/end on this
+/// line (nothing after `queryRow(` before end-of-line, e.g. a trailing `(`),
+/// so the type lands on the next line.
+fn queryRowFirstArgOpen(line: []const u8) bool {
+    const needles = [_][]const u8{ ".queryRowOwned(", ".queryRowPartialOwned(", ".queryRowPartial(", ".queryRow(" };
+    for (needles) |n| {
+        if (std.mem.indexOf(u8, line, n)) |pos| {
+            const after = line[pos + n.len ..];
+            return std.mem.indexOfScalar(u8, after, ',') == null;
+        }
+    }
+    return false;
+}
+
+/// When the model symbol table knows the named type and it has no `[]const u8`
+/// field, the row owns no strings and cannot leak. Unknown types are reported
+/// (conservative).
+fn namedTypeHasNoString(line: []const u8, symbols: ?*const std.StringHashMap(bool)) bool {
+    const symbols_ptr = symbols orelse return false;
+    const type_name = queryRowTypeName(line) orelse return false;
+    if (symbols_ptr.get(type_name)) |has_string| {
+        return !has_string;
+    }
+    return false;
+}
+
+/// Scan a module source file for `const NAME = struct { … }` declarations
+/// (top-level, optionally `pub`) and record whether the struct body mentions
+/// a `[]const u8` string field (the only field kind `freeScanned` frees).
+/// Heuristic: body lines between the declaration line and the closing `};`.
+/// Indented (`fn`-local) structs are ignored. Keys are duplicated into `out`
+/// (caller frees on deinit); re-declarations overwrite without leaking.
+fn collectModelStructs(allocator: std.mem.Allocator, content: []const u8, out: *std.StringHashMap(bool)) !void {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    var pending_name: ?[]const u8 = null;
+    var has_string = false;
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (pending_name) |name| {
+            if (std.mem.indexOf(u8, trimmed, "[]const u8") != null) has_string = true;
+            if (std.mem.startsWith(u8, trimmed, "};")) {
+                const new_key = try allocator.dupe(u8, name);
+                const gop = try out.getOrPut(new_key);
+                if (gop.found_existing) allocator.free(new_key);
+                gop.value_ptr.* = has_string;
+                pending_name = null;
+            }
+        } else if (line.len > 0 and line[0] != ' ' and line[0] != '\t' and
+            std.mem.indexOf(u8, line, "const ") != null and
+            std.mem.indexOf(u8, line, "= struct") != null)
+        {
+            const p = std.mem.indexOf(u8, line, "const ") orelse continue;
+            const rest = std.mem.trim(u8, line[p + "const ".len ..], " \t");
+            const eq = std.mem.indexOf(u8, rest, " = ") orelse continue;
+            const name = rest[0..eq];
+            if (!isIdent(name)) continue;
+            pending_name = name;
+            has_string = std.mem.indexOf(u8, line, "[]const u8") != null;
+        }
     }
 }
 
@@ -1290,6 +1630,9 @@ test "audit business lint flags anti-patterns" {
     try lintFile(allocator, "api.zig", "const auth = ctx.getHeader(\"Authorization\");\n", "src/modules/x/api.zig", &cfg, &violations);
     try lintFile(allocator, "service.zig", "client.exec(sql, &.{}) catch {};\n", "src/modules/x/service.zig", &cfg, &violations);
     try lintFile(allocator, "service.zig", "client.exec(sql, &.{}) catch |err| {};\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b10 negative — errdefer rollback is best-effort cleanup, not a swallowed error.
+    try lintFile(allocator, "service.zig", "errdefer tx.rollback() catch {};\n", "src/modules/x/service.zig", &cfg, &violations);
+    try lintFile(allocator, "service.zig", "errdefer conn.close(io) catch {};\n", "src/modules/x/service.zig", &cfg, &violations);
     try lintFile(allocator, "service.zig", "x() catch |err| {\n  _ = err;\n  return;\n};\n", "src/modules/x/service.zig", &cfg, &violations);
     // b12 — pure CRUD passthrough service method (next-line body).
     try lintFile(allocator, "service.zig", "pub fn list(self: *@This(), allocator: std.mem.Allocator, org_id: i64, page: usize, size: usize) !std.ArrayList(T) {\n    return self.persistence.list(allocator, org_id, page, size);\n}\n", "src/modules/x/service.zig", &cfg, &violations);
@@ -1309,6 +1652,39 @@ test "audit business lint flags anti-patterns" {
     try lintFile(allocator, "service.zig", "pub fn ship(self: *@This(), org_id: i64, id: i64) !void {\n    try self.crud.update(.{ .id = id }, org_id);\n    try self.persistence.exec(\"UPDATE x SET y = ?\", &.{.{ .int = 1 }});\n}\n", "src/modules/x/service.zig", &cfg, &violations);
     // b16 negative — transact() marks the method transactional.
     try lintFile(allocator, "service.zig", "pub fn atomic(self: *@This(), id: i64) !void {\n    return self.transact(void, struct {\n        fn f(tx: *zigmodu.data.sqlx.Transaction) zigmodu.ZigModuError!void {\n            _ = tx;\n            return {};\n        }\n    }.f);\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b17 — owned queryRow result never freed: only a field is returned,
+    // the owned strings leak.
+    try lintFile(allocator, "service.zig", "pub fn getProductId(self: *@This(), id: i64) !i64 {\n    const p = try self.db.queryRow(model.Product, \"SELECT * FROM products WHERE id = ?\", &.{.{ .int = id }});\n    return p.id;\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b17 — inline struct row with a string field, never freed.
+    try lintFile(allocator, "service.zig", "pub fn getName(self: *@This(), id: i64) ![]const u8 {\n    const r = try self.db.queryRow(struct { name: []const u8 }, \"SELECT name FROM products WHERE id = ?\", &.{.{ .int = id }});\n    return r.name;\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b17 negative — `const p = queryRow(...); return p;` delegates ownership.
+    try lintFile(allocator, "service.zig", "pub fn getProduct(self: *@This(), id: i64) !model.Product {\n    const p = try self.db.queryRow(model.Product, \"SELECT * FROM products WHERE id = ?\", &.{.{ .int = id }});\n    return p;\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b17 negative — scalar inline struct row owns no strings.
+    try lintFile(allocator, "service.zig", "pub fn getCount(self: *@This(), id: i64) !i64 {\n    const r = try self.db.queryRow(struct { count: i64 }, \"SELECT COUNT(*) AS count FROM products WHERE id = ?\", &.{.{ .int = id }});\n    return r.count;\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b17 negative — slice fields that are NOT `[]const u8` (e.g. `[]i64`,
+    // `[]u8`) are never freed by freeScanned, so they cannot leak.
+    try lintFile(allocator, "service.zig", "pub fn getIds(self: *@This(), id: i64) ![]i64 {\n    const r = try self.db.queryRow(struct { ids: []i64 }, \"SELECT ids FROM products WHERE id = ?\", &.{.{ .int = id }});\n    return r.ids;\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    try lintFile(allocator, "service.zig", "pub fn getRaw(self: *@This(), id: i64) ![]u8 {\n    const r = try self.db.queryRow(struct { raw: []u8 }, \"SELECT raw FROM products WHERE id = ?\", &.{.{ .int = id }});\n    return r.raw;\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b17 negative — freeScanned present in the same fn.
+    try lintFile(allocator, "service.zig", "pub fn getProduct(self: *@This(), id: i64) !model.Product {\n    const p = try self.db.queryRow(model.Product, \"SELECT * FROM products WHERE id = ?\", &.{.{ .int = id }});\n    defer freeScanned(self.allocator, model.Product, p);\n    return p;\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b17 negative — ownership delegated via `return self.db.queryRow(...)`.
+    try lintFile(allocator, "service.zig", "pub fn getProduct(self: *@This(), id: i64) !model.Product {\n    return self.db.queryRow(model.Product, \"SELECT * FROM products WHERE id = ?\", &.{.{ .int = id }});\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b17 negative — RAII borrowed variant needs no freeing.
+    try lintFile(allocator, "service.zig", "pub fn getProduct(self: *@This(), id: i64) !model.Product {\n    var row = try self.db.queryRowBorrowed(model.Product, \"SELECT * FROM products WHERE id = ?\", &.{.{ .int = id }});\n    defer row.deinit();\n    return row.get();\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b17 negative — assembly return borrows the whole value (single line).
+    try lintFile(allocator, "service.zig", "pub fn getDetail(self: *@This(), id: i64) !Detail {\n    const p = try self.db.queryRow(model.Product, \"SELECT * FROM products WHERE id = ?\", &.{.{ .int = id }});\n    return .{ .product = p, .ts = 1 };\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b17 negative — assembly return borrows the whole value (multi line).
+    try lintFile(allocator, "service.zig", "pub fn getDetail(self: *@This(), id: i64) !Detail {\n    const p = try self.db.queryRow(model.Product, \"SELECT * FROM products WHERE id = ?\", &.{.{ .int = id }});\n    return .{\n        .product = p,\n        .ts = 1,\n    };\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b17 — assembly return only borrows a field → strings leak.
+    try lintFile(allocator, "service.zig", "pub fn getMeta(self: *@This(), id: i64) !Meta {\n    const p = try self.db.queryRow(model.Product, \"SELECT * FROM products WHERE id = ?\", &.{.{ .int = id }});\n    return .{ .id = p.id };\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b17 negative — cross-line inline struct (type on the next line), scalar.
+    try lintFile(allocator, "service.zig", "pub fn getCnt(self: *@This(), id: i64) !i64 {\n    const r = try self.db.queryRow(\n        struct { cnt: i64 },\n        \"SELECT COUNT(*) AS cnt FROM products WHERE id = ?\",\n        &.{.{ .int = id }},\n    );\n    return r.cnt;\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b17 negative — intermediate assembly: `var detail = .{ … p … }; return detail;`.
+    try lintFile(allocator, "service.zig", "pub fn getDetail(self: *@This(), id: i64) !Detail {\n    const p = try self.db.queryRow(model.Product, \"SELECT * FROM products WHERE id = ?\", &.{.{ .int = id }});\n    var detail = .{ .product = p, .ts = 1 };\n    return detail;\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b17 negative — cross-line type + single-line `return try queryRow(`:
+    // ownership transfers regardless of where the type lands (regression:
+    // this must stay exempt even though the type is on the next line).
+    try lintFile(allocator, "service.zig", "pub fn getGrade(self: *@This(), id: i64) !model.UserGradeRow {\n    return try self.db.queryRowPartial(\n        model.UserGradeRow,\n        \"SELECT grade_id FROM grades WHERE id = ?\",\n        &.{.{ .int = id }},\n    );\n}\n", "src/modules/x/service.zig", &cfg, &violations);
 
     var rules = std.StringHashMap(usize).init(allocator);
     defer rules.deinit();
@@ -1332,6 +1708,83 @@ test "audit business lint flags anti-patterns" {
     try std.testing.expectEqual(@as(usize, 1), rules.get("b13").?);
     try std.testing.expectEqual(@as(usize, 1), rules.get("b15").?);
     try std.testing.expectEqual(@as(usize, 1), rules.get("b16").?);
+    try std.testing.expectEqual(@as(usize, 3), rules.get("b17").?);
+}
+
+test "audit b17 honors named model symbol table" {
+    const allocator = std.testing.allocator;
+
+    var symbols = std.StringHashMap(bool).init(allocator);
+    defer {
+        var kit = symbols.iterator();
+        while (kit.next()) |e| allocator.free(e.key_ptr.*);
+        symbols.deinit();
+    }
+    try symbols.put(try allocator.dupe(u8, "ScalarOnly"), false);
+    try symbols.put(try allocator.dupe(u8, "User"), true);
+
+    var cfg = RuleConfig{};
+    cfg.disabled = std.StringHashMap(void).init(allocator);
+    defer cfg.deinit(allocator);
+    cfg.model_symbols = &symbols;
+
+    var violations = std.ArrayList(Violation).empty;
+    defer {
+        for (violations.items) |*v| v.deinit(allocator);
+        violations.deinit(allocator);
+    }
+
+    // Named type known to have no `[]const u8` fields → no leak possible,
+    // even though only a field is returned.
+    try lintFile(allocator, "service.zig", "pub fn getScalar(self: *@This(), id: i64) !i64 {\n    const s = try self.db.queryRow(model.ScalarOnly, \"SELECT * FROM scalars WHERE id = ?\", &.{.{ .int = id }});\n    return s.id;\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // Named type with a string field, never freed → still flagged.
+    try lintFile(allocator, "service.zig", "pub fn getUser(self: *@This(), id: i64) !i64 {\n    const u = try self.db.queryRow(model.User, \"SELECT * FROM users WHERE id = ?\", &.{.{ .int = id }});\n    return u.id;\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+
+    var rules = std.StringHashMap(usize).init(allocator);
+    defer rules.deinit();
+    for (violations.items) |v| {
+        const gop = try rules.getOrPut(v.rule);
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), rules.get("b17").?);
+}
+
+test "audit collectModelStructs builds symbol table" {
+    const allocator = std.testing.allocator;
+    const content =
+        \\pub const User = struct {
+        \\    id: i64,
+        \\    name: []const u8,
+        \\};
+        \\
+        \\const CartRow = struct {
+        \\    id: i64,
+        \\};
+        \\
+        \\pub fn helper() void {
+        \\    const Local = struct { name: []const u8 };
+        \\    _ = Local;
+        \\}
+        \\
+        \\const Unclosed = struct {
+        \\
+    ;
+
+    var symbols = std.StringHashMap(bool).init(allocator);
+    defer {
+        var kit = symbols.iterator();
+        while (kit.next()) |e| allocator.free(e.key_ptr.*);
+        symbols.deinit();
+    }
+    try collectModelStructs(allocator, content, &symbols);
+
+    try std.testing.expect(symbols.get("User").?); // has []const u8
+    try std.testing.expect(!symbols.get("CartRow").?); // scalar
+    // fn-local (indented) structs are not collected.
+    try std.testing.expect(symbols.get("Local") == null);
+    // Unclosed struct must not crash or leak the pending name.
+    try std.testing.expect(symbols.get("Unclosed") == null);
 }
 
 test "audit rules config disables rules" {
