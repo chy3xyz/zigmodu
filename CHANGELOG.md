@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **AI 开发文档完善**: 新增 `docs/AI_DEV_GUIDE.md`（业务接入全链路：KeyManager →
+  Provider → 自定义 Skill → Agent/Workflow → HTTP/cron/outbox/MCP 接线、
+  技能所有权/权限/超时规范、安全清单、观测调试）；`docs/README.md` 索引补全
+  AI 编排/技能/LLM 策略/MCP 文档；AGENTS.md 文档地图加「AI 业务接入」入口；
+  AI.md 顶部指向新指南；AI_SKILLS.md 补「开发自定义技能」指引。
+
 ## [0.15.7] - 2026-08-04
 
 ### Changed

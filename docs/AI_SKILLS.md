@@ -69,6 +69,14 @@ registerReportSkills`（`userdata` 传对应 Ctx；`SkillContext.permissions` �
 
 - `Tool.required_permission`：dispatch 层按权限码校验（`error.PermissionDenied`）。
 
+## 开发自定义技能
+
+业务自己的技能（查询/写动作/审批桥）与内置技能同一套 `Tool` 契约：参数自动
+映射 JSON Schema、返回值所有权归 `ctx.allocator`（调用方 `ai.freeValue` 深
+释放）、`required_permission` + `allowlist` 双重收口、`checkDeadline` 协作
+超时。完整代码模板与选型（Agent / Workflow / LLM 策略 / MCP 桥）见
+[`AI_DEV_GUIDE.md`](AI_DEV_GUIDE.md) §3–§5。
+
 ## 边界（不做）
 
 不内置 shell / 任意 URL 抓取 / 裸 SQL 写 / 跨租户访问；管理类 skill 必须显式

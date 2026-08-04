@@ -12,6 +12,11 @@ Comprehensive documentation for the ZigModu modular framework.
 | [ROUTE_TABLE.md](ROUTE_TABLE.md) §7 | Auth / RBAC detail |
 | [BEST_PRACTICES.md](BEST_PRACTICES.md) | DAU + JWT checklist |
 | [AI.md](AI.md) | LLM **chat product** module (`--with-aichat`) — not agent ops |
+| [AI_DEV_GUIDE.md](AI_DEV_GUIDE.md) | **AI 开发指南**：KeyManager → Provider → Skill → Agent/Workflow → 接入（HTTP/cron/outbox/MCP） |
+| [AI_SKILLS.md](AI_SKILLS.md) | 内置 AI 技能目录（db.query / kpi / approval / admin…） |
+| [AI_ORCHESTRATION.md](AI_ORCHESTRATION.md) | Workflow 编排（线性/DAG/审批门/WAL 恢复/触发/审计） |
+| [LLM_POLICIES.md](LLM_POLICIES.md) | LLM 策略真实接线（审批/风控/诊断/质量门 + KeyPool） |
+| [MCP.md](MCP.md) | SkillRegistry → MCP 桥（外部 LLM 平台调用框架技能） |
 
 ## 📚 Core Guides
 
