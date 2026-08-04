@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.15.8] - 2026-08-05
 
 ### Changed
 - **AI 开发文档完善**: 新增 `docs/AI_DEV_GUIDE.md`（业务接入全链路：KeyManager →
