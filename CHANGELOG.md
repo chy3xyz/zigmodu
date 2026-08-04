@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **AiProvider reasoning_content 支持**: `ChatResponse` 新增
+  `reasoning_content` 字段（推理模型如 DeepSeek-R1 的思维链），非流式
+  `message.reasoning_content` 与流式 `delta.reasoning_content` 均解析；
+  `StreamDelta` 新增 `reasoning_delta`，`chatStream`/buffered fallback
+  透出；`freeResponse` 同步释放。已用真实 deepseek-reasoner 集成验证。
+
 ## [0.15.8] - 2026-08-05
 
 ### Changed

@@ -95,6 +95,9 @@ pub const AiProvider = struct {
 
     pub const ChatResponse = struct {
         content: []const u8 = "",
+        /// Reasoning/thinking-chain text from reasoning models (DeepSeek-R1,
+        /// Qwen, …); empty for non-reasoning models. Owned like `content`.
+        reasoning_content: []const u8 = "",
         role: []const u8 = "assistant",
         tool_calls: []ToolCall = &.{},
         prompt_tokens: usize = 0,
@@ -106,6 +109,8 @@ pub const AiProvider = struct {
 
     pub const StreamDelta = struct {
         content_delta: ?[]const u8 = null,
+        /// Incremental `reasoning_content` fragment (reasoning models only).
+        reasoning_delta: ?[]const u8 = null,
         /// Set when a streamed tool_calls fragment includes a function name.
         tool_name: ?[]const u8 = null,
         /// Incremental `function.arguments` fragment (may be partial JSON).
@@ -185,6 +190,7 @@ pub const AiProvider = struct {
     /// Free owned fields of a ChatResponse from `chat` / `chatWith` / `chatStream`.
     pub fn freeResponse(self: *AiProvider, resp: *ChatResponse) void {
         if (resp.content.len > 0) self.allocator.free(resp.content);
+        if (resp.reasoning_content.len > 0) self.allocator.free(resp.reasoning_content);
         for (resp.tool_calls) |tc| {
             self.allocator.free(tc.id);
             self.allocator.free(tc.name);
@@ -296,6 +302,9 @@ pub const AiProvider = struct {
             o.stream = false;
             var resp = try self.chatWith(messages, o);
             errdefer self.freeResponse(&resp);
+            if (resp.reasoning_content.len > 0) {
+                try on_delta(cb_ctx, .{ .reasoning_delta = resp.reasoning_content });
+            }
             if (resp.content.len > 0) {
                 try on_delta(cb_ctx, .{ .content_delta = resp.content });
             }
@@ -327,10 +336,13 @@ pub const AiProvider = struct {
 
         const content = try self.allocator.dupe(u8, acc.content.items);
         errdefer self.allocator.free(content);
+        const reasoning = try self.allocator.dupe(u8, acc.reasoning.items);
+        errdefer self.allocator.free(reasoning);
         const tool_calls = try acc.takeToolCalls(self.allocator);
         if (tool_calls.len > 0) self.metrics.tool_call_responses += 1;
         return .{
             .content = content,
+            .reasoning_content = reasoning,
             .role = "assistant",
             .tool_calls = tool_calls,
             .prompt_tokens = acc.prompt_tokens,
@@ -340,6 +352,17 @@ pub const AiProvider = struct {
 
     /// Extract `choices[0].delta.content` from one OpenAI SSE JSON payload (no `data:` prefix).
     pub fn extractStreamDeltaContent(allocator: std.mem.Allocator, json: []const u8) !?[]const u8 {
+        return extractStreamDeltaStringField(allocator, json, "content");
+    }
+
+    /// Extract `choices[0].delta.reasoning_content` from one SSE payload
+    /// (reasoning models only; null when absent).
+    pub fn extractStreamDeltaReasoning(allocator: std.mem.Allocator, json: []const u8) !?[]const u8 {
+        return extractStreamDeltaStringField(allocator, json, "reasoning_content");
+    }
+
+    /// Shared `choices[0].delta.<field>` string extractor (caller frees).
+    fn extractStreamDeltaStringField(allocator: std.mem.Allocator, json: []const u8, field: []const u8) !?[]const u8 {
         const parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return null;
         defer parsed.deinit();
         if (parsed.value != .object) return null;
@@ -349,7 +372,7 @@ pub const AiProvider = struct {
         if (c0 != .object) return null;
         const delta = c0.object.get("delta") orelse return null;
         if (delta != .object) return null;
-        const content = delta.object.get("content") orelse return null;
+        const content = delta.object.get(field) orelse return null;
         return switch (content) {
             .string => |s| try allocator.dupe(u8, s),
             else => null,
@@ -566,6 +589,10 @@ pub const AiProvider = struct {
         } else {
             resp.content = try self.allocator.dupe(u8, "");
         }
+        // Reasoning models (DeepSeek-R1, Qwen, …) put the thinking chain in
+        // `message.reasoning_content`. Mirror the content handling exactly.
+        const reasoning = try readMsgStringField(msg.object, "reasoning_content", self.allocator);
+        resp.reasoning_content = reasoning;
         if (msg.object.get("tool_calls")) |tcs| {
             if (tcs == .array and tcs.array.items.len > 0) {
                 var list = try self.allocator.alloc(ToolCall, tcs.array.items.len);
@@ -610,6 +637,16 @@ pub const AiProvider = struct {
                 }
             }
         }
+    }
+
+    /// Read a string field from an assistant message object, duplicating it
+    /// into `allocator`; missing / null / non-string → owned `""` (no error).
+    fn readMsgStringField(msg: std.json.ObjectMap, key: []const u8, allocator: std.mem.Allocator) ![]const u8 {
+        const v = msg.get(key) orelse return try allocator.dupe(u8, "");
+        return switch (v) {
+            .string => |s| try allocator.dupe(u8, s),
+            else => try allocator.dupe(u8, ""),
+        };
     }
 
     pub fn buildMessages(
@@ -665,6 +702,7 @@ const StreamAccum = struct {
     on_delta: AiProvider.OnDelta,
     carry: std.ArrayList(u8),
     content: std.ArrayList(u8),
+    reasoning: std.ArrayList(u8),
     pending_tools: std.ArrayList(PendingTool),
     saw_done: bool = false,
     prompt_tokens: usize = 0,
@@ -690,6 +728,7 @@ const StreamAccum = struct {
             .on_delta = on_delta,
             .carry = .empty,
             .content = .empty,
+            .reasoning = .empty,
             .pending_tools = .empty,
         };
     }
@@ -697,6 +736,7 @@ const StreamAccum = struct {
     fn deinit(self: *StreamAccum) void {
         self.carry.deinit(self.allocator);
         self.content.deinit(self.allocator);
+        self.reasoning.deinit(self.allocator);
         for (self.pending_tools.items) |*t| t.deinit(self.allocator);
         self.pending_tools.deinit(self.allocator);
     }
@@ -747,6 +787,15 @@ const StreamAccum = struct {
             if (d.len > 0) {
                 try self.content.appendSlice(self.allocator, d);
                 try self.on_delta(self.cb_ctx, .{ .content_delta = d });
+            }
+        }
+
+        const rdelta = try AiProvider.extractStreamDeltaReasoning(self.allocator, payload);
+        if (rdelta) |d| {
+            defer self.allocator.free(d);
+            if (d.len > 0) {
+                try self.reasoning.appendSlice(self.allocator, d);
+                try self.on_delta(self.cb_ctx, .{ .reasoning_delta = d });
             }
         }
 
@@ -936,6 +985,77 @@ test "AiProvider parseResponse content" {
 
     try std.testing.expectEqualStrings("Hello!", resp.content);
     try std.testing.expectEqual(@as(usize, 10), resp.prompt_tokens);
+    // Non-reasoning model: reasoning_content is empty, not garbage.
+    try std.testing.expectEqual(@as(usize, 0), resp.reasoning_content.len);
+}
+
+test "AiProvider parseResponse reasoning_content" {
+    const a = std.testing.allocator;
+    var http = http_client.HttpClient.init(a, std.testing.io, 1, 5000);
+    defer http.deinit();
+    var p = AiProvider.init(a, &http, "https://api.test/v1", "sk-xxx", "deepseek-r1");
+
+    const body =
+        \\{"choices":[{"message":{"role":"assistant","content":"Final answer","reasoning_content":"Let me think step by step"}}],"usage":{"prompt_tokens":12,"completion_tokens":4}}
+    ;
+    var resp = try p.parseResponse(body);
+    defer p.freeResponse(&resp);
+
+    try std.testing.expectEqualStrings("Final answer", resp.content);
+    try std.testing.expectEqualStrings("Let me think step by step", resp.reasoning_content);
+}
+
+test "AiProvider extractStreamDeltaReasoning" {
+    const a = std.testing.allocator;
+    const json =
+        \\{"choices":[{"delta":{"reasoning_content":"chain of thought"},"index":0}]}
+    ;
+    const d = try AiProvider.extractStreamDeltaReasoning(a, json);
+    try std.testing.expect(d != null);
+    defer a.free(d.?);
+    try std.testing.expectEqualStrings("chain of thought", d.?);
+
+    // Absent field → null (non-reasoning stream deltas).
+    const plain =
+        \\{"choices":[{"delta":{"content":"Hi"}}]}
+    ;
+    try std.testing.expect((try AiProvider.extractStreamDeltaReasoning(a, plain)) == null);
+}
+
+test "AiProvider StreamAccum accumulates reasoning_content" {
+    const a = std.testing.allocator;
+    const Ctx = struct {
+        parts: std.ArrayList([]const u8),
+        allocator: std.mem.Allocator,
+
+        fn onDelta(ctx: *anyopaque, d: AiProvider.StreamDelta) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (d.reasoning_delta) |c| {
+                try self.parts.append(self.allocator, try self.allocator.dupe(u8, c));
+            }
+        }
+    };
+    var ctx = Ctx{ .parts = .empty, .allocator = a };
+    defer {
+        for (ctx.parts.items) |p| a.free(p);
+        ctx.parts.deinit(a);
+    }
+
+    var acc = StreamAccum.init(a, &ctx, Ctx.onDelta);
+    defer acc.deinit();
+
+    const chunk1 = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Let me\"}}]}\n";
+    const chunk2 = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" think\"}}]}\ndata: [DONE]\n";
+    try StreamAccum.onChunk(&acc, chunk1);
+    try StreamAccum.onChunk(&acc, chunk2);
+    try acc.flush();
+
+    try std.testing.expectEqual(@as(usize, 2), ctx.parts.items.len);
+    try std.testing.expectEqualStrings("Let me", ctx.parts.items[0]);
+    try std.testing.expectEqualStrings(" think", ctx.parts.items[1]);
+    try std.testing.expectEqualStrings("Let me think", acc.reasoning.items);
+    // Non-reasoning chunks leave reasoning empty.
+    try std.testing.expectEqualStrings("", acc.content.items);
 }
 
 test "AiProvider countTokens and fitsBudget" {
