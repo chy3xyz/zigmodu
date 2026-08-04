@@ -37,7 +37,11 @@ pub fn cors(config: CorsConfig) api.Middleware {
         .func = struct {
             fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
                 const cfg: *const CorsConfig = &S.stored;
-                const origin = ctx.headers.get("Origin") orelse "";
+                // `header()` is case-insensitive (RFC 9110): request header keys are
+                // lowercased at parse time, so `ctx.headers.get("Origin")` would never
+                // match a browser's `Origin:` header and every origin would be treated
+                // as same-origin. Regression test: "cors matches Origin case-insensitively".
+                const origin = ctx.header("Origin") orelse "";
 
                 // Validate origin against whitelist; reject if not allowed
                 var origin_allowed = false;
@@ -675,6 +679,44 @@ test "cors middleware sets headers" {
     try mw.func(&ctx, next, mw.user_data);
     try std.testing.expectEqualStrings("*", ctx.response_headers.get("Access-Control-Allow-Origin").?);
     try std.testing.expectEqualStrings("GET,POST,PUT,DELETE,PATCH,HEAD,OPTIONS", ctx.response_headers.get("Access-Control-Allow-Methods").?);
+}
+
+test "cors matches Origin case-insensitively (lowercased request headers)" {
+    const allocator = std.testing.allocator;
+    var ctx = try api.Context.init(allocator, .GET, "/api/v1/users");
+    defer ctx.deinit();
+    // Request header keys are lowercased at parse time; a browser's
+    // `Origin:` header arrives with key "origin".
+    try ctx.headers.put(try allocator.dupe(u8, "origin"), try allocator.dupe(u8, "https://app.example.com"));
+
+    const mw = cors(.{ .allow_origins = &.{"https://app.example.com"} });
+    const next = struct {
+        fn n(c: *api.Context) anyerror!void {
+            _ = c;
+        }
+    }.n;
+
+    try mw.func(&ctx, next, mw.user_data);
+    try std.testing.expectEqualStrings("https://app.example.com", ctx.response_headers.get("Access-Control-Allow-Origin").?);
+    try std.testing.expectEqualStrings("Origin", ctx.response_headers.get("Vary").?);
+}
+
+test "cors rejects origins outside the allow-list with 403" {
+    const allocator = std.testing.allocator;
+    var ctx = try api.Context.init(allocator, .GET, "/api/v1/users");
+    defer ctx.deinit();
+    try ctx.headers.put(try allocator.dupe(u8, "origin"), try allocator.dupe(u8, "https://evil.example.com"));
+
+    const mw = cors(.{ .allow_origins = &.{"https://app.example.com"} });
+    const next = struct {
+        fn n(c: *api.Context) anyerror!void {
+            _ = c;
+        }
+    }.n;
+
+    try mw.func(&ctx, next, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 403), ctx.status_code);
+    try std.testing.expect(ctx.responded);
 }
 
 test "maxBodySize middleware rejects large payload" {
