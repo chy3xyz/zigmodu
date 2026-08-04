@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Bulk writes（`Repository` + `data.bulk`）**: `Repository.insertMany` /
+  `upsertMany` 一条多行 SQL（SQLite/PG `ON CONFLICT ("id") DO UPDATE SET`、
+  MySQL `ON DUPLICATE KEY UPDATE`，冲突 SET 默认除 id 外全列）；
+  `Repository.findByIds` 单次 round-trip `WHERE pk IN (…)` 取代循环单行；
+  `data.bulk` 方言感知批量 INSERT builder + 参数扁平化，exec 目标兼容
+  Client/Transaction/SqlxBackend（新增 `SqlxBackend.dialect()`）。空行 /
+  空列 / all-conflict upsert 均有守卫 + 回归测试（套件 858 pass），
+  docs/API.md 补 Repository + bulk 参考。
+- **zent-modulith 示例按 zent v0.27 能力沉淀**: 原子表达式防超卖、两级预加载
+  + 边过滤/每父排序限量、复合 keyset 游标（平局不丢）、嵌套事务（savepoint）
+  + `afterCommit` 事务事件、uuidv7 主键 + 敏感字段掩码、审计/校验/投影/
+  批量插入/批量软删全链路 HTTP 演示；`tx_demo.zig` 下单编排（库存不足 409
+  且整单回滚、事件提交后恰好一次投递）。文档同步：docs/ZENT.md 版本口径升至
+  zent **v0.27.0+**（远程依赖示例 v0.27.0，升级注意补 v0.21–v0.27 要点）；
+  AGENTS.md 工作区事实更新；两个 zent 示例依赖注释指向 `#v0.27.0`。
 - **`zmodu market` Phase 2：远程发现 + 安装闭环**: `market update`（std.http 拉取
   远程索引 → `.zmodu/market-index.json`，坏缓存自动忽略、tmp+rename 原子写入）、
   `list/search/info` 改为本地 + 远程合并浏览（按 id 去重）、`market install
