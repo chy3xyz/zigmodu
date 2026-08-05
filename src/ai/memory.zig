@@ -1,10 +1,5 @@
 const std = @import("std");
-
-var _tick: i64 = 0;
-fn monotonicNowSeconds() i64 {
-    _tick += 1;
-    return _tick;
-}
+const Time = @import("../core/Time.zig");
 
 /// Persistent memory entry — facts, preferences, lessons stored across sessions.
 /// `key` is the **logical** key (e.g. `user:pref:lang`); tenant/user live in fields.
@@ -71,7 +66,7 @@ pub const MemoryStore = struct {
             self.evictOldestLocked();
         }
 
-        const now = monotonicNowSeconds();
+        const now = Time.monotonicNowSeconds();
         const sk = try storageKey(self.allocator, tenant_id, user_id, key);
         errdefer self.allocator.free(sk);
 
@@ -114,7 +109,7 @@ pub const MemoryStore = struct {
         defer self.mutex.unlock(self.io);
 
         var result = std.ArrayList(MemoryEntry).empty;
-        const now = monotonicNowSeconds();
+        const now = Time.monotonicNowSeconds();
 
         var it = self.entries.iterator();
         while (it.next()) |entry| {

@@ -11,6 +11,10 @@ const run_audit_mod = @import("run_audit.zig");
 const retriever_mod = @import("retriever.zig");
 const quota_mod = @import("quota.zig");
 const tokenizer = @import("tokenizer.zig");
+
+/// Monotonic sequence so `agent-<ms>-<seq>` run ids never collide, even for
+/// concurrent runs in the same millisecond.
+var run_id_seq = std.atomic.Value(u32).init(0);
 const Budget = @import("budget.zig").Budget;
 const ContextManager = @import("context.zig").ContextManager;
 const AgentHandle = @import("handle.zig").AgentHandle;
@@ -370,7 +374,8 @@ pub const Agent = struct {
     ) !void {
         const store = self.audit_store orelse return;
         const now_ms = @import("../core/Time.zig").monotonicNowMilliseconds();
-        const run_id = try std.fmt.allocPrint(allocator, "agent-{d}", .{now_ms});
+        const seq = run_id_seq.fetchAdd(1, .monotonic);
+        const run_id = try std.fmt.allocPrint(allocator, "agent-{d}-{d}", .{ now_ms, seq });
         defer allocator.free(run_id);
         try store.record(.{
             .run_id = run_id,
