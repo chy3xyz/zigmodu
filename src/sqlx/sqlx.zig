@@ -208,6 +208,11 @@ pub const ManagedRows = struct {
 /// The value is valid until `deinit()`; `get()` returns a shallow copy (string
 /// pointers still point into the arena). Prefer `queryRowBorrowed` /
 /// `queryRowPartialBorrowed` when the row is consumed within a scope.
+///
+/// **Lifetime contract: a `BorrowedRow` must not escape its function scope**
+/// — strings point into the wrapper-owned arena, so returning it (or storing
+/// it beyond `deinit()`) leaves the caller with dangling pointers. For
+/// cross-scope returns use the owned `queryRow`/`queryRowOwned` + `freeScanned`.
 pub fn BorrowedRow(comptime T: type) type {
     return struct {
         value: T,
@@ -858,6 +863,20 @@ fn valueToType(allocator: std.mem.Allocator, comptime T: type, val: Value) !T {
     };
 }
 
+/// Compile-time: does `T` have any `[]const u8` / `?[]const u8` field?
+/// Used by `queryScalar` (string-free requirement) and exposed as
+/// `QueryResult(T).has_strings` for callers that want to branch on whether a
+/// row owns string data.
+pub fn typeHasStrings(comptime T: type) bool {
+    const info = @typeInfo(T);
+    if (info != .@"struct") return false;
+    inline for (info.@"struct".field_types) |ft| {
+        if (ft == []const u8) return true;
+        if (@typeInfo(ft) == .optional and @typeInfo(ft).optional.child == []const u8) return true;
+    }
+    return false;
+}
+
 pub fn freeScanned(allocator: std.mem.Allocator, comptime T: type, val: T) void {
     const info = @typeInfo(T);
     if (info != .@"struct") return;
@@ -884,6 +903,9 @@ pub fn QueryResult(comptime T: type) type {
         items: []T,
         /// When set, owns all string data (and the items slice). deinit frees the arena only.
         arena: ?std.heap.ArenaAllocator = null,
+        /// Whether `T` contains `[]const u8` fields (compile-time; callers can
+        /// skip per-row freeing when false).
+        pub const has_strings = typeHasStrings(T);
 
         pub const TakeResult = struct { items: []T, arena: ?std.heap.ArenaAllocator };
 
@@ -4699,6 +4721,22 @@ pub const Client = struct {
         return .{ .value = value, .arena = stolen };
     }
 
+    /// One-shot scalar query: scans the first row and frees the owned strings
+    /// internally, returning a plain value copy — no `freeScanned` needed by
+    /// the caller. Requires a **string-free** `T` (scalars / numeric structs);
+    /// models with `[]const u8` fields hit a compile error (use `queryRow` /
+    /// `queryRowOwned` / `queryRowBorrowed` instead). `NotFound` → `null`.
+    pub fn queryScalar(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !?T {
+        comptime if (typeHasStrings(T)) {
+            @compileError("queryScalar requires a string-free type — use queryRow / queryRowOwned / queryRowBorrowed for models with []const u8 fields");
+        };
+        const row = self.queryRow(T, sql_str, args) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        return row; // freeScanned is a no-op for string-free T
+    }
+
     pub fn queryRowPartialCtx(self: *Client, ctx: SqlContext, comptime T: type, sql_str: []const u8, args: []const Value) !T {
         if (ctx.isDone()) return error.Timeout;
         return self.queryRowPartial(T, sql_str, args);
@@ -5898,6 +5936,34 @@ test "sqlite queryRowOwned alias has owned-string contract" {
     defer freeScanned(allocator, User, user); // owned → caller frees
     try std.testing.expectEqual(@as(i64, 1), user.id);
     try std.testing.expectEqualStrings("Alice", user.name);
+}
+
+test "typeHasStrings detects []const u8 fields" {
+    const S = struct { a: i64, b: []const u8 };
+    const N = struct { a: i64, b: i64 };
+    const O = struct { a: ?[]const u8 };
+    try std.testing.expect(typeHasStrings(S));
+    try std.testing.expect(!typeHasStrings(N));
+    try std.testing.expect(typeHasStrings(O));
+    try std.testing.expect(!typeHasStrings(i64));
+}
+
+test "sqlite queryScalar returns value copy for string-free T" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+
+    try client.connect();
+    _ = try client.exec("CREATE TABLE items (id INTEGER PRIMARY KEY, price INTEGER NOT NULL)", &.{});
+    _ = try client.exec("INSERT INTO items (id, price) VALUES (?1, ?2)", &.{ .{ .int = 1 }, .{ .int = 100 } });
+
+    const ItemRow = struct { id: i64, price: i64 };
+    const val = try client.queryScalar(ItemRow, "SELECT id, price FROM items WHERE id = ?1", &.{.{ .int = 1 }});
+    try std.testing.expect(val != null);
+    try std.testing.expectEqual(@as(i64, 100), val.?.price);
+
+    // NotFound → null, no freeing needed.
+    try std.testing.expect((try client.queryScalar(ItemRow, "SELECT id, price FROM items WHERE id = ?1", &.{.{ .int = 999 }})) == null);
 }
 
 test "sqlite queryRow and queryRows struct scan" {

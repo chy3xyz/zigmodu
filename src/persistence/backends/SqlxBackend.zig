@@ -41,6 +41,23 @@ pub const SqlxBackend = struct {
         return self.client.queryRowsOwned(T, sql_str, args);
     }
 
+    /// Arena-borrowed single row: strings point into the returned
+    /// `BorrowedRow`'s arena; `deinit()` frees everything (no freeScanned).
+    pub fn queryRowBorrowed(self: @This(), comptime T: type, sql_str: []const u8, args: []const Value) !sqlx.BorrowedRow(T) {
+        return self.client.queryRowBorrowed(T, sql_str, args);
+    }
+
+    /// Partial-scan arena-borrowed single row (missing columns zeroed).
+    pub fn queryRowPartialBorrowed(self: @This(), comptime T: type, sql_str: []const u8, args: []const Value) !sqlx.BorrowedRow(T) {
+        return self.client.queryRowPartialBorrowed(T, sql_str, args);
+    }
+
+    /// One-shot scalar query (string-free `T` only; owned strings freed
+    /// internally). See `sqlx.Client.queryScalar`.
+    pub fn queryScalar(self: @This(), comptime T: type, sql_str: []const u8, args: []const Value) !?T {
+        return self.client.queryScalar(T, sql_str, args);
+    }
+
     pub fn exec(self: @This(), sql_str: []const u8, args: []const Value) !ExecResult {
         return self.client.exec(sql_str, args);
     }
