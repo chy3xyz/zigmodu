@@ -484,6 +484,10 @@ pub const PermissionGateConfig = struct {
     permission_attr: []const u8 = "permissions",
     /// When true, writes matched permission expression to ctx attr `permission`.
     set_permission_attr: bool = true,
+    /// When true, routes without a `RouteMeta.permission` are DENIED (403)
+    /// instead of passing through. Public routes always pass. Default
+    /// `false` = allow-unannotated (current behavior).
+    deny_by_default: bool = false,
 };
 
 /// Enforces `RouteMeta.permission` (default mode = JWT roles, `|` = OR).
@@ -511,6 +515,10 @@ pub fn permissionGateWith(slot: *comptime_router.CatalogSlot, config: Permission
                     return;
                 }
                 const perm = cat.permissionFor(ctx.method, ctx.path) orelse {
+                    if (Store.cfg.deny_by_default) {
+                        try ctx.sendError(403, "Forbidden");
+                        return;
+                    }
                     try next(ctx);
                     return;
                 };
