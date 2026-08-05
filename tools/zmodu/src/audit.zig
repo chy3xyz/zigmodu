@@ -875,12 +875,13 @@ fn lintFile(
             try pushViolation(violations, allocator, "b9", rel_path, idx, "handler parses Authorization/Bearer manually — use jwtAuthFromCatalogWithPermissions middleware + attrs", .{});
         }
 
-        // b10 — swallowed errors. Empty catches on `errdefer` cleanup and
-        // transaction `rollback` are best-effort by nature (the original
-        // error is what matters, the rollback failure is secondary), so they
-        // are idiomatic rather than swallowed errors and get exempted.
+        // b10 — swallowed errors. Empty catches on `errdefer` cleanup,
+        // transaction `rollback`, and `sendError` (best-effort response
+        // write, e.g. SSE disconnect) are best-effort by nature — the
+        // original error is what matters, the cleanup failure is secondary —
+        // so they are idiomatic rather than swallowed errors and exempted.
         if (isEmptyCatch(line) and
-            !containsAny(line, &.{ "errdefer", "rollback" }) and
+            !containsAny(line, &.{ "errdefer", "rollback", "sendError" }) and
             !config.disabled.contains("b10"))
         {
             try pushViolation(violations, allocator, "b10", rel_path, idx, "empty catch block swallows errors — log and propagate (ZigModuError)", .{});
@@ -1633,6 +1634,8 @@ test "audit business lint flags anti-patterns" {
     // b10 negative — errdefer rollback is best-effort cleanup, not a swallowed error.
     try lintFile(allocator, "service.zig", "errdefer tx.rollback() catch {};\n", "src/modules/x/service.zig", &cfg, &violations);
     try lintFile(allocator, "service.zig", "errdefer conn.close(io) catch {};\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b10 negative — sendError is best-effort (SSE disconnect / client gone).
+    try lintFile(allocator, "service.zig", "sse.sendError(500, \"boom\") catch {};\n", "src/modules/x/service.zig", &cfg, &violations);
     try lintFile(allocator, "service.zig", "x() catch |err| {\n  _ = err;\n  return;\n};\n", "src/modules/x/service.zig", &cfg, &violations);
     // b12 — pure CRUD passthrough service method (next-line body).
     try lintFile(allocator, "service.zig", "pub fn list(self: *@This(), allocator: std.mem.Allocator, org_id: i64, page: usize, size: usize) !std.ArrayList(T) {\n    return self.persistence.list(allocator, org_id, page, size);\n}\n", "src/modules/x/service.zig", &cfg, &violations);
