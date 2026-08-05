@@ -60,8 +60,10 @@ pub fn tracingWithTrace(header_name: []const u8) api.Middleware {
         .func = struct {
             fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
                 const hdr: []const u8 = @ptrCast(@alignCast(user_data.?));
-                // Propagate incoming trace-id if present
-                if (ctx.headers.get(hdr)) |incoming_trace| {
+                // Propagate incoming trace-id if present. `header()` is
+                // case-insensitive: request header keys are lowercased at
+                // parse time, so `get("X-Trace-Id")` would never match.
+                if (ctx.header(hdr)) |incoming_trace| {
                     try ctx.setHeader("x-trace-id", incoming_trace);
                 } else {
                     const now_ns: u64 = @intCast(Time.monotonicNow());
