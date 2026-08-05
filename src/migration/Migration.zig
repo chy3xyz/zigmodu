@@ -1,6 +1,90 @@
 const std = @import("std");
 const Time = @import("../core/Time.zig");
 
+/// Split a migration script into statements on `;`, ignoring semicolons inside:
+///   - single-quoted strings (`'...'`, `''` escape)
+///   - double-quoted identifiers (`"..."`)
+///   - line comments (`-- …`) and block comments (`/* … */`)
+///   - dollar-quoted bodies (`$$…$$` / `$tag$…$tag$`) — PL/pgSQL functions,
+///     triggers and DO blocks contain internal semicolons
+/// Returns owned slices (caller frees each + the slice).
+fn splitSqlStatements(allocator: std.mem.Allocator, sql: []const u8) ![][]const u8 {
+    var out = std.ArrayList([]const u8).empty;
+    errdefer {
+        for (out.items) |s| allocator.free(s);
+        out.deinit(allocator);
+    }
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < sql.len) {
+        switch (sql[i]) {
+            '\'' => {
+                i += 1;
+                while (i < sql.len) {
+                    if (sql[i] == '\'') {
+                        if (i + 1 < sql.len and sql[i + 1] == '\'') {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            },
+            '"' => {
+                i += 1;
+                while (i < sql.len and sql[i] != '"') i += 1;
+                if (i < sql.len) i += 1;
+            },
+            '-' => {
+                if (i + 1 < sql.len and sql[i + 1] == '-') {
+                    while (i < sql.len and sql[i] != '\n') i += 1;
+                } else i += 1;
+            },
+            '/' => {
+                if (i + 1 < sql.len and sql[i + 1] == '*') {
+                    i += 2;
+                    while (i + 1 < sql.len and !(sql[i] == '*' and sql[i + 1] == '/')) i += 1;
+                    i += 2;
+                } else i += 1;
+            },
+            '$' => {
+                if (dollarQuoteTagLen(sql, i)) |tag_len| {
+                    const tag = sql[i .. i + tag_len];
+                    i += tag_len;
+                    if (std.mem.indexOfPos(u8, sql, i, tag)) |close| {
+                        i = close + tag.len;
+                    } else {
+                        i = sql.len;
+                    }
+                } else i += 1;
+            },
+            ';' => {
+                const stmt = std.mem.trim(u8, sql[start..i], " \t\r\n");
+                if (stmt.len > 0) try out.append(allocator, try allocator.dupe(u8, stmt));
+                i += 1;
+                start = i;
+            },
+            else => i += 1,
+        }
+    }
+    const tail = std.mem.trim(u8, sql[start..], " \t\r\n");
+    if (tail.len > 0) try out.append(allocator, try allocator.dupe(u8, tail));
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Length of a dollar-quote opening tag at `pos` (`$$` or `$tag$`, tag =
+/// alphanumerics/underscore), or null. `$1`-style parameter placeholders do
+/// not match (no trailing `$`).
+fn dollarQuoteTagLen(sql: []const u8, pos: usize) ?usize {
+    if (sql[pos] != '$') return null;
+    var j = pos + 1;
+    while (j < sql.len and (std.ascii.isAlphanumeric(sql[j]) or sql[j] == '_')) j += 1;
+    if (j < sql.len and sql[j] == '$') return j + 1 - pos;
+    return null;
+}
+
 /// Database migration[...]
 pub const MigrationEntry = struct {
     /// [...] ([...]: YYYYMMDDHHMMSS)
@@ -224,9 +308,15 @@ pub const MigrationRunner = struct {
             if (already_applied) continue;
 
             const start_ms = @import("../core/Time.zig").monotonicNowMilliseconds();
-            var stmt_it = std.mem.splitScalar(u8, migration.sql, ';');
+            // Semicolon-aware splitter: PL/pgSQL bodies ($$…$$), quoted
+            // strings, identifiers and comments keep their internal `;`.
+            const stmts = try splitSqlStatements(self.allocator, migration.sql);
+            defer {
+                for (stmts) |s| self.allocator.free(s);
+                self.allocator.free(stmts);
+            }
             var mig_ok = true;
-            while (stmt_it.next()) |stmt| {
+            for (stmts) |stmt| {
                 const trimmed = std.mem.trim(u8, stmt, " \t\r\n");
                 if (trimmed.len == 0) continue;
                 _ = client.exec(trimmed, &.{}) catch |err| {
@@ -593,4 +683,47 @@ test "MigrationLoader parse migration file content" {
     try std.testing.expectEqualStrings("Create users table", result.description);
     try std.testing.expect(std.mem.containsAtLeast(u8, result.sql, 1, "CREATE TABLE"));
     try std.testing.expectEqualStrings("DROP TABLE users;", result.rollback_sql.?);
+}
+
+test "splitSqlStatements handles quotes, comments and dollar quotes" {
+    const allocator = std.testing.allocator;
+    const sql =
+        \\CREATE TABLE a (id INT);
+        \\INSERT INTO t VALUES ('x;y');
+        \\CREATE TABLE "semi;colon" (id INT);
+        \\-- comment ; ignored
+        \\/* block ; comment */
+        \\SELECT 1;
+        \\CREATE FUNCTION f() RETURNS void AS $$ BEGIN PERFORM 1; END; $$ LANGUAGE plpgsql;
+        \\SELECT 2
+    ;
+    const stmts = try splitSqlStatements(allocator, sql);
+    defer {
+        for (stmts) |s| allocator.free(s);
+        allocator.free(stmts);
+    }
+    try std.testing.expectEqual(@as(usize, 6), stmts.len);
+    try std.testing.expect(std.mem.indexOf(u8, stmts[1], "'x;y'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stmts[2], "\"semi;colon\"") != null);
+    // PL/pgSQL body keeps its internal semicolons.
+    try std.testing.expect(std.mem.indexOf(u8, stmts[4], "BEGIN PERFORM 1; END;") != null);
+    // Trailing statement without a semicolon is preserved.
+    try std.testing.expectEqualStrings("SELECT 2", stmts[5]);
+}
+
+test "splitSqlStatements dollar-tag and parameter placeholder" {
+    const allocator = std.testing.allocator;
+    const sql =
+        \\DO $fn$ BEGIN EXECUTE 'x;y'; END; $fn$;
+        \\SELECT $1;
+    ;
+    const stmts = try splitSqlStatements(allocator, sql);
+    defer {
+        for (stmts) |s| allocator.free(s);
+        allocator.free(stmts);
+    }
+    try std.testing.expectEqual(@as(usize, 2), stmts.len);
+    try std.testing.expect(std.mem.indexOf(u8, stmts[0], "BEGIN EXECUTE 'x;y'; END;") != null);
+    // $1 is a parameter placeholder, not a dollar-quote tag.
+    try std.testing.expectEqualStrings("SELECT $1", stmts[1]);
 }

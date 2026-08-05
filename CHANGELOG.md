@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **StructuredLogger**: struct-field keys（comptime 字面量）入 map 前 dupe，消除
+  释放只读内存导致的 ABRT。
+- **ForTenant × camelCase**: 租户字段检查按模型 camel_case 推导（新增
+  `snakeToCamel`），`findPageForTenant` 等在 camelCase 模型上可用。
+- **Migration 切分**: 替换裸 `;` 切分为状态机（引号/注释/美元引号感知），
+  支持含 PL/pgSQL 函数、触发器、DO 块的迁移脚本。
+
+### Added
+- **Repository ForTenant 全方法集**: `findByIdForTenant` / `findAllForTenant` /
+  `updateForTenant` / `deleteForTenant`（rows-affected 守卫：跨租户操作返回
+  0 行，`== 0 → NotFound` 模式可用）；`Tx(B)` 提供事务内
+  `deleteForTenant` / `updateForTenant`。
+- **软删读过滤**: 模型含 `deleted` 字段时所有读方法（含 ForTenant 变体）自动
+  追加 `AND deleted = 0`；无该字段的模型零影响。
+- **自动时间戳（opt-in）**: 模型声明 `sql_auto_timestamps = true` 时 insert
+  自动填 `create_time`/`update_time`、update 刷新 `update_time`。
+- **SqlxBackend borrowed 透传 + queryScalar**: `queryRowBorrowed` /
+  `queryRowPartialBorrowed` / `queryScalar`（字符串类型编译期拒绝、自动释放）；
+  `typeHasStrings(T)` / `QueryResult(T).has_strings` 编译期元数据。
+- **Outbox 方言化**: `migrationSqlWithDialect`（mysql/postgres/sqlite）。
+- **PermissionGate `deny_by_default`**: 未标注 permission 的路由可配置 403。
+- **audit b10**: 豁免 best-effort `sendError`（SSE 断连等）。
+
 ## [0.15.9] - 2026-08-05
 
 ### Added
