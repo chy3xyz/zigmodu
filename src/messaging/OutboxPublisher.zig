@@ -53,6 +53,13 @@ pub const OutboxConfig = struct {
     stale_threshold_seconds: u64 = 300,
 };
 
+/// Outbox table DDL dialect.
+pub const OutboxDialect = enum {
+    mysql,
+    postgres,
+    sqlite,
+};
+
 /// OutboxPublisher — embedded within a business service, writes to outbox table.
 pub const OutboxPublisher = struct {
     const Self = @This();
@@ -64,26 +71,64 @@ pub const OutboxPublisher = struct {
         return .{ .allocator = allocator, .config = config };
     }
 
-    /// Build SQL to create the outbox table. Call once at startup.
+    /// Build SQL to create the outbox table (MySQL dialect, backwards
+    /// compatible default). Call once at startup.
+    pub fn migrationSql() []const u8 {
+        return migrationSqlWithDialect(.mysql);
+    }
+
+    /// Build SQL to create the outbox table for the given dialect.
     /// `tenant_id` is nullable for backwards compatibility with single-tenant
     /// deployments; multi-tenant SaaS should scope writes via
     /// `buildInsertForTenant` and filter readers by the column.
-    pub fn migrationSql() []const u8 {
-        return
-        \\CREATE TABLE IF NOT EXISTS event_outbox (
-        \\    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-        \\    topic VARCHAR(255) NOT NULL,
-        \\    payload TEXT NOT NULL,
-        \\    tenant_id BIGINT NULL,
-        \\    status TINYINT NOT NULL DEFAULT 0,
-        \\    retry_count INT NOT NULL DEFAULT 0,
-        \\    max_retries INT NOT NULL DEFAULT 5,
-        \\    created_at BIGINT NOT NULL,
-        \\    updated_at BIGINT NOT NULL,
-        \\    error_message TEXT NULL,
-        \\    INDEX idx_status_created (status, created_at)
-        \\);
-        ;
+    pub fn migrationSqlWithDialect(dialect: OutboxDialect) []const u8 {
+        return switch (dialect) {
+            .mysql =>
+            \\CREATE TABLE IF NOT EXISTS event_outbox (
+            \\    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            \\    topic VARCHAR(255) NOT NULL,
+            \\    payload TEXT NOT NULL,
+            \\    tenant_id BIGINT NULL,
+            \\    status TINYINT NOT NULL DEFAULT 0,
+            \\    retry_count INT NOT NULL DEFAULT 0,
+            \\    max_retries INT NOT NULL DEFAULT 5,
+            \\    created_at BIGINT NOT NULL,
+            \\    updated_at BIGINT NOT NULL,
+            \\    error_message TEXT NULL,
+            \\    INDEX idx_status_created (status, created_at)
+            \\);
+            ,
+            .postgres =>
+            \\CREATE TABLE IF NOT EXISTS event_outbox (
+            \\    id BIGSERIAL PRIMARY KEY,
+            \\    topic VARCHAR(255) NOT NULL,
+            \\    payload TEXT NOT NULL,
+            \\    tenant_id BIGINT NULL,
+            \\    status SMALLINT NOT NULL DEFAULT 0,
+            \\    retry_count INT NOT NULL DEFAULT 0,
+            \\    max_retries INT NOT NULL DEFAULT 5,
+            \\    created_at BIGINT NOT NULL,
+            \\    updated_at BIGINT NOT NULL,
+            \\    error_message TEXT NULL
+            \\);
+            \\CREATE INDEX IF NOT EXISTS idx_status_created ON event_outbox (status, created_at);
+            ,
+            .sqlite =>
+            \\CREATE TABLE IF NOT EXISTS event_outbox (
+            \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\    topic TEXT NOT NULL,
+            \\    payload TEXT NOT NULL,
+            \\    tenant_id INTEGER NULL,
+            \\    status INTEGER NOT NULL DEFAULT 0,
+            \\    retry_count INTEGER NOT NULL DEFAULT 0,
+            \\    max_retries INTEGER NOT NULL DEFAULT 5,
+            \\    created_at INTEGER NOT NULL,
+            \\    updated_at INTEGER NOT NULL,
+            \\    error_message TEXT NULL
+            \\);
+            \\CREATE INDEX IF NOT EXISTS idx_status_created ON event_outbox (status, created_at);
+            ,
+        };
     }
 
     /// Generate the INSERT SQL for an outbox entry (tenant-scoped variant).
@@ -289,6 +334,20 @@ test "OutboxPublisher migrationSql" {
     try std.testing.expect(std.mem.indexOf(u8, sql, "PRIMARY KEY") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "idx_status_created") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "tenant_id BIGINT NULL") != null);
+}
+
+test "OutboxPublisher migrationSql dialects" {
+    const pg = OutboxPublisher.migrationSqlWithDialect(.postgres);
+    try std.testing.expect(std.mem.indexOf(u8, pg, "BIGSERIAL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pg, "tenant_id BIGINT NULL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pg, "CREATE INDEX IF NOT EXISTS idx_status_created") != null);
+
+    const sqlite = OutboxPublisher.migrationSqlWithDialect(.sqlite);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite, "AUTOINCREMENT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite, "tenant_id INTEGER NULL") != null);
+
+    const mysql = OutboxPublisher.migrationSqlWithDialect(.mysql);
+    try std.testing.expectEqualStrings(OutboxPublisher.migrationSql(), mysql);
 }
 
 test "OutboxPoller build queries" {
