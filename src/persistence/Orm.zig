@@ -7,6 +7,7 @@
 const std = @import("std");
 const sqlx = @import("../sqlx/sqlx.zig");
 const bulk = @import("../sqlx/Bulk.zig");
+const Time = @import("../core/Time.zig");
 
 /// Common value representation for ORM parameter binding
 pub const OrmValue = union(enum) {
@@ -214,8 +215,9 @@ fn comptimeSelectById(
     comptime fields: []const []const u8,
     comptime pk: []const u8,
     comptime camel: bool,
+    comptime soft_delete: bool,
 ) []const u8 {
-    return "SELECT " ++ comptimeColumnList(sql_cols, fields, camel) ++ " FROM " ++ table ++ " WHERE " ++ pk ++ " = ?";
+    return "SELECT " ++ comptimeColumnList(sql_cols, fields, camel) ++ " FROM " ++ table ++ " WHERE " ++ pk ++ " = ?" ++ (if (soft_delete) " AND deleted = 0" else "");
 }
 
 fn comptimeSelectAll(
@@ -223,12 +225,13 @@ fn comptimeSelectAll(
     comptime sql_cols: []const []const u8,
     comptime fields: []const []const u8,
     comptime camel: bool,
+    comptime soft_delete: bool,
 ) []const u8 {
-    return "SELECT " ++ comptimeColumnList(sql_cols, fields, camel) ++ " FROM " ++ table;
+    return "SELECT " ++ comptimeColumnList(sql_cols, fields, camel) ++ " FROM " ++ table ++ (if (soft_delete) " WHERE deleted = 0" else "");
 }
 
-fn comptimeCount(comptime table: []const u8) []const u8 {
-    return "SELECT COUNT(*) AS count FROM " ++ table;
+fn comptimeCount(comptime table: []const u8, comptime soft_delete: bool) []const u8 {
+    return "SELECT COUNT(*) AS count FROM " ++ table ++ (if (soft_delete) " WHERE deleted = 0" else "");
 }
 
 fn comptimeSelectPage(
@@ -236,8 +239,9 @@ fn comptimeSelectPage(
     comptime sql_cols: []const []const u8,
     comptime fields: []const []const u8,
     comptime camel: bool,
+    comptime soft_delete: bool,
 ) []const u8 {
-    return "SELECT " ++ comptimeColumnList(sql_cols, fields, camel) ++ " FROM " ++ table ++ " LIMIT ? OFFSET ?";
+    return "SELECT " ++ comptimeColumnList(sql_cols, fields, camel) ++ " FROM " ++ table ++ (if (soft_delete) " WHERE deleted = 0" else "") ++ " LIMIT ? OFFSET ?";
 }
 
 fn comptimeSelectPageForTenant(
@@ -246,12 +250,13 @@ fn comptimeSelectPageForTenant(
     comptime fields: []const []const u8,
     comptime camel: bool,
     comptime col: []const u8,
+    comptime soft_delete: bool,
 ) []const u8 {
-    return "SELECT " ++ comptimeColumnList(sql_cols, fields, camel) ++ " FROM " ++ table ++ " WHERE " ++ col ++ " = ? LIMIT ? OFFSET ?";
+    return "SELECT " ++ comptimeColumnList(sql_cols, fields, camel) ++ " FROM " ++ table ++ " WHERE " ++ col ++ " = ?" ++ (if (soft_delete) " AND deleted = 0" else "") ++ " LIMIT ? OFFSET ?";
 }
 
-fn comptimeCountForTenant(comptime table: []const u8, comptime col: []const u8) []const u8 {
-    return "SELECT COUNT(*) AS count FROM " ++ table ++ " WHERE " ++ col ++ " = ?";
+fn comptimeCountForTenant(comptime table: []const u8, comptime col: []const u8, comptime soft_delete: bool) []const u8 {
+    return "SELECT COUNT(*) AS count FROM " ++ table ++ " WHERE " ++ col ++ " = ?" ++ (if (soft_delete) " AND deleted = 0" else "");
 }
 
 /// Tenant-scoped repository methods filter by `col` (a SQL column name, e.g.
@@ -274,21 +279,29 @@ fn tenantClause(allocator: std.mem.Allocator, comptime col: []const u8, where_sq
     return std.fmt.allocPrint(allocator, "{s} AND {s} = ?", .{ where_sql, col });
 }
 
-fn comptimeSkipInsertField(comptime fname: []const u8) bool {
-    return std.mem.eql(u8, fname, "id") or
-        std.mem.eql(u8, fname, "create_time") or
-        std.mem.eql(u8, fname, "update_time") or
-        std.mem.eql(u8, fname, "creator") or
-        std.mem.eql(u8, fname, "updater") or
-        std.mem.eql(u8, fname, "deleted");
+/// Runtime WHERE fragment for filtered reads: caller's `where_sql` plus
+/// soft-delete. Returns an owned slice when the model has a `deleted` field
+/// (caller frees); otherwise returns `where_sql` borrowed (no free).
+fn effectiveWhere(allocator: std.mem.Allocator, comptime T: type, where_sql: []const u8) ![]const u8 {
+    if (!@hasField(T, "deleted")) return where_sql;
+    if (where_sql.len == 0) return try allocator.dupe(u8, "WHERE deleted = 0");
+    return try std.fmt.allocPrint(allocator, "{s} AND deleted = 0", .{where_sql});
 }
 
-fn comptimeInsertArgCount(comptime fields: []const []const u8) usize {
+fn comptimeSkipInsertField(comptime fname: []const u8, comptime auto_ts: bool) bool {
+    return std.mem.eql(u8, fname, "id") or
+        std.mem.eql(u8, fname, "creator") or
+        std.mem.eql(u8, fname, "updater") or
+        std.mem.eql(u8, fname, "deleted") or
+        ((std.mem.eql(u8, fname, "create_time") or std.mem.eql(u8, fname, "update_time")) and !auto_ts);
+}
+
+fn comptimeInsertArgCount(comptime fields: []const []const u8, comptime auto_ts: bool) usize {
     @setEvalBranchQuota(100_000);
     comptime {
         var n: usize = 0;
         for (fields) |fname| {
-            if (!comptimeSkipInsertField(fname)) n += 1;
+            if (!comptimeSkipInsertField(fname, auto_ts)) n += 1;
         }
         return n;
     }
@@ -310,11 +323,12 @@ fn comptimeInsertArgCountUpsert(comptime fields: []const []const u8) usize {
 fn comptimeInsertColumns(
     comptime sql_cols: []const []const u8,
     comptime fields: []const []const u8,
+    comptime auto_ts: bool,
 ) []const []const u8 {
     comptime {
         var result: []const []const u8 = &.{};
         for (fields, 0..) |fname, i| {
-            if (comptimeSkipInsertField(fname)) continue;
+            if (comptimeSkipInsertField(fname, auto_ts)) continue;
             result = result ++ &[_][]const u8{sql_cols[i]};
         }
         return result;
@@ -350,13 +364,14 @@ fn comptimeInsert(
     comptime table: []const u8,
     comptime sql_cols: []const []const u8,
     comptime fields: []const []const u8,
+    comptime auto_ts: bool,
 ) []const u8 {
     comptime {
         var cols: []const u8 = "";
         var placeholders: []const u8 = "";
         var first = true;
         for (fields, 0..) |fname, i| {
-            if (comptimeSkipInsertField(fname)) continue;
+            if (comptimeSkipInsertField(fname, auto_ts)) continue;
             if (!first) {
                 cols = cols ++ ", ";
                 placeholders = placeholders ++ ", ";
@@ -544,6 +559,50 @@ pub fn Tx(comptime B: type) type {
         pub fn queryRows(self: @This(), comptime T: type, sql: []const u8, args: []const B.Value) !sqlx.QueryResult(T) {
             return self.backend.queryRowsTx(self.tx, T, sql, args);
         }
+
+        /// Transactional tenant-scoped delete: `DELETE FROM {t} WHERE pk = ?
+        /// AND {col} = ?`. Returns rows affected — 0 when the row belongs to
+        /// another tenant (guarded no-op). `col` is the SQL tenant column
+        /// name; compile-time error when the model lacks that field.
+        pub fn deleteForTenant(self: @This(), comptime T: type, comptime col: []const u8, tenant_id: i64, id: anytype) !u64 {
+            const meta = Model(T);
+            comptime comptimeRequireTenantField(T, col, meta.camel_case);
+            const sql = comptime comptimeDelete(meta.table_name, meta.primary_key) ++ " AND " ++ col ++ " = ?";
+            var args = [_]B.Value{ B.fromOrmValue(toOrmValue(id)), B.fromOrmValue(.{ .int = tenant_id }) };
+            const res = try self.exec(sql, &args);
+            return res.rows_affected;
+        }
+
+        /// Transactional tenant-scoped update: `UPDATE {t} SET … WHERE pk = ?
+        /// AND {col} = ?`. Returns rows affected — 0 when the row belongs to
+        /// another tenant (guarded no-op).
+        pub fn updateForTenant(self: @This(), comptime T: type, comptime col: []const u8, tenant_id: i64, entity: T) !u64 {
+            const meta = Model(T);
+            comptime comptimeRequireTenantField(T, col, meta.camel_case);
+            const auto_ts = comptime @hasDecl(T, "sql_auto_timestamps") and T.sql_auto_timestamps;
+            const sql = comptime comptimeUpdate(meta.table_name, meta.sql_columns, meta.primary_key) ++ " AND " ++ col ++ " = ?";
+            const n = @typeInfo(T).@"struct".field_names.len;
+            var args: [n + 1]B.Value = undefined;
+            var idx: usize = 0;
+            const now = Time.monotonicNowSeconds();
+            inline for (@typeInfo(T).@"struct".field_names) |fname| {
+                const is_pk = comptime std.mem.eql(u8, fname, meta.primary_key);
+                if (!is_pk) {
+                    if (auto_ts and std.mem.eql(u8, fname, "update_time")) {
+                        args[idx] = B.fromOrmValue(.{ .int = now });
+                    } else {
+                        args[idx] = fieldToBackendValue(B, @field(entity, fname));
+                    }
+                    idx += 1;
+                }
+            }
+            args[idx] = fieldToBackendValue(B, @field(entity, meta.primary_key));
+            idx += 1;
+            args[idx] = B.fromOrmValue(.{ .int = tenant_id });
+            idx += 1;
+            const res = try self.exec(sql, args[0..idx]);
+            return res.rows_affected;
+        }
     };
 }
 
@@ -562,7 +621,7 @@ pub fn Orm(comptime B: type) type {
                 orm: *Self,
 
                 pub fn findById(self: @This(), id: anytype) !?T {
-                    const sql = comptime comptimeSelectById(meta.table_name, meta.sql_columns, meta.fields, meta.primary_key, meta.camel_case);
+                    const sql = comptime comptimeSelectById(meta.table_name, meta.sql_columns, meta.fields, meta.primary_key, meta.camel_case, @hasField(T, "deleted"));
                     var args = [_]B.Value{B.fromOrmValue(toOrmValue(id))};
                     return self.orm.backend.queryRow(T, sql, &args);
                 }
@@ -572,7 +631,7 @@ pub fn Orm(comptime B: type) type {
                 /// model lacks that field.
                 pub fn findByIdForTenant(self: @This(), comptime col: []const u8, tenant_id: i64, id: anytype) !?T {
                     comptime comptimeRequireTenantField(T, col, meta.camel_case);
-                    const sql = comptime comptimeSelectById(meta.table_name, meta.sql_columns, meta.fields, meta.primary_key, meta.camel_case) ++ " AND " ++ col ++ " = ?";
+                    const sql = comptime comptimeSelectById(meta.table_name, meta.sql_columns, meta.fields, meta.primary_key, meta.camel_case, @hasField(T, "deleted")) ++ " AND " ++ col ++ " = ?";
                     var args = [_]B.Value{ B.fromOrmValue(toOrmValue(id)), B.fromOrmValue(.{ .int = tenant_id }) };
                     return self.orm.backend.queryRow(T, sql, &args);
                 }
@@ -596,6 +655,7 @@ pub fn Orm(comptime B: type) type {
                         try buf.appendSlice(allocator, "?");
                     }
                     try buf.appendSlice(allocator, ")");
+                    if (@hasField(T, "deleted")) try buf.appendSlice(allocator, " AND deleted = 0");
                     const args = try allocator.alloc(B.Value, ids.len);
                     defer allocator.free(args);
                     for (0..ids.len) |i| args[i] = B.fromOrmValue(toOrmValue(ids[i]));
@@ -625,6 +685,7 @@ pub fn Orm(comptime B: type) type {
                     try buf.appendSlice(allocator, ") AND ");
                     try buf.appendSlice(allocator, col);
                     try buf.appendSlice(allocator, " = ?");
+                    if (@hasField(T, "deleted")) try buf.appendSlice(allocator, " AND deleted = 0");
                     const args = try allocator.alloc(B.Value, ids.len + 1);
                     defer allocator.free(args);
                     for (0..ids.len) |i| args[i] = B.fromOrmValue(toOrmValue(ids[i]));
@@ -633,25 +694,25 @@ pub fn Orm(comptime B: type) type {
                 }
 
                 pub fn findAll(self: @This()) !sqlx.QueryResult(T) {
-                    const sql = comptime comptimeSelectAll(meta.table_name, meta.sql_columns, meta.fields, meta.camel_case);
+                    const sql = comptime comptimeSelectAll(meta.table_name, meta.sql_columns, meta.fields, meta.camel_case, @hasField(T, "deleted"));
                     return self.orm.backend.queryRows(T, sql, &.{});
                 }
 
                 /// Tenant-scoped full scan: `SELECT … FROM {t} WHERE {col} = ?`.
                 pub fn findAllForTenant(self: @This(), comptime col: []const u8, tenant_id: i64) !sqlx.QueryResult(T) {
                     comptime comptimeRequireTenantField(T, col, meta.camel_case);
-                    const sql = comptime comptimeSelectAll(meta.table_name, meta.sql_columns, meta.fields, meta.camel_case) ++ " WHERE " ++ col ++ " = ?";
+                    const sql = comptime comptimeSelectAll(meta.table_name, meta.sql_columns, meta.fields, meta.camel_case, @hasField(T, "deleted")) ++ " WHERE " ++ col ++ " = ?";
                     return self.orm.backend.queryRows(T, sql, &.{.{ .int = tenant_id }});
                 }
 
                 pub fn count(self: @This()) !usize {
-                    const sql = comptime comptimeCount(meta.table_name);
+                    const sql = comptime comptimeCount(meta.table_name, @hasField(T, "deleted"));
                     const result = try self.orm.backend.queryRow(struct { count: i64 }, sql, &.{});
                     return @intCast(result.?.count);
                 }
 
                 pub fn findPage(self: @This(), page: usize, size: usize) !PageResult(T) {
-                    const sql = comptime comptimeSelectPage(meta.table_name, meta.sql_columns, meta.fields, meta.camel_case);
+                    const sql = comptime comptimeSelectPage(meta.table_name, meta.sql_columns, meta.fields, meta.camel_case, @hasField(T, "deleted"));
                     const offset: i64 = if (page > 0) @intCast((page - 1) * size) else 0;
                     var args = [_]B.Value{
                         B.fromOrmValue(.{ .int = @intCast(size) }),
@@ -677,7 +738,7 @@ pub fn Orm(comptime B: type) type {
                 /// compile-time error when the model lacks that field.
                 pub fn findPageForTenant(self: @This(), comptime col: []const u8, tenant_id: i64, page: usize, size: usize) !PageResult(T) {
                     comptime comptimeRequireTenantField(T, col, meta.camel_case);
-                    const sql = comptime comptimeSelectPageForTenant(meta.table_name, meta.sql_columns, meta.fields, meta.camel_case, col);
+                    const sql = comptime comptimeSelectPageForTenant(meta.table_name, meta.sql_columns, meta.fields, meta.camel_case, col, @hasField(T, "deleted"));
                     const offset: i64 = if (page > 0) @intCast((page - 1) * size) else 0;
                     var args = [_]B.Value{
                         B.fromOrmValue(.{ .int = tenant_id }),
@@ -701,7 +762,7 @@ pub fn Orm(comptime B: type) type {
                 /// Tenant-scoped row count: `SELECT COUNT(*) FROM {t} WHERE {col} = ?`.
                 pub fn countForTenant(self: @This(), comptime col: []const u8, tenant_id: i64) !usize {
                     comptime comptimeRequireTenantField(T, col, meta.camel_case);
-                    const sql = comptime comptimeCountForTenant(meta.table_name, col);
+                    const sql = comptime comptimeCountForTenant(meta.table_name, col, @hasField(T, "deleted"));
                     const result = try self.orm.backend.queryRow(struct { count: i64 }, sql, &.{.{ .int = tenant_id }});
                     return @intCast(result.?.count);
                 }
@@ -714,7 +775,9 @@ pub fn Orm(comptime B: type) type {
                     try sqlx.validateSqlFragment(where_sql);
                     const col_list = comptime comptimeColumnList(meta.sql_columns, meta.fields, meta.camel_case);
 
-                    const count_sql = try std.fmt.allocPrint(alloc, "SELECT COUNT(*) AS count FROM {s} {s}", .{ meta.table_name, where_sql });
+                    const eff_where = try effectiveWhere(alloc, T, where_sql);
+                    defer if (@hasField(T, "deleted")) alloc.free(eff_where);
+                    const count_sql = try std.fmt.allocPrint(alloc, "SELECT COUNT(*) AS count FROM {s} {s}", .{ meta.table_name, eff_where });
                     defer alloc.free(count_sql);
                     const count_row = try self.orm.backend.queryRow(struct { count: i64 }, count_sql, args);
                     const total: usize = if (count_row) |c| @intCast(c.count) else 0;
@@ -723,7 +786,7 @@ pub fn Orm(comptime B: type) type {
                     const data_sql = try std.fmt.allocPrint(
                         alloc,
                         "SELECT {s} FROM {s} {s} ORDER BY {s} DESC LIMIT ? OFFSET ?",
-                        .{ col_list, meta.table_name, where_sql, meta.primary_key },
+                        .{ col_list, meta.table_name, eff_where, meta.primary_key },
                     );
                     defer alloc.free(data_sql);
 
@@ -759,7 +822,9 @@ pub fn Orm(comptime B: type) type {
 
                     const count_clause = try tenantClause(alloc, col, where_sql);
                     defer alloc.free(count_clause);
-                    const count_sql = try std.fmt.allocPrint(alloc, "SELECT COUNT(*) AS count FROM {s} {s}", .{ meta.table_name, count_clause });
+                    const eff_where = try effectiveWhere(alloc, T, count_clause);
+                    defer if (@hasField(T, "deleted")) alloc.free(eff_where);
+                    const count_sql = try std.fmt.allocPrint(alloc, "SELECT COUNT(*) AS count FROM {s} {s}", .{ meta.table_name, eff_where });
                     defer alloc.free(count_sql);
                     const count_args = try alloc.alloc(B.Value, args.len + 1);
                     defer alloc.free(count_args);
@@ -772,7 +837,7 @@ pub fn Orm(comptime B: type) type {
                     const data_sql = try std.fmt.allocPrint(
                         alloc,
                         "SELECT {s} FROM {s} {s} ORDER BY {s} DESC LIMIT ? OFFSET ?",
-                        .{ col_list, meta.table_name, count_clause, meta.primary_key },
+                        .{ col_list, meta.table_name, eff_where, meta.primary_key },
                     );
                     defer alloc.free(data_sql);
 
@@ -797,23 +862,34 @@ pub fn Orm(comptime B: type) type {
                 }
 
                 pub fn insert(self: @This(), entity: T) !T {
-                    const sql = comptime comptimeInsert(meta.table_name, meta.sql_columns, meta.fields);
-                    const n = comptime comptimeInsertArgCount(meta.fields);
+                    const auto_ts = comptime @hasDecl(T, "sql_auto_timestamps") and T.sql_auto_timestamps;
+                    var e = entity;
+                    const sql = comptime comptimeInsert(meta.table_name, meta.sql_columns, meta.fields, auto_ts);
+                    const n = comptime comptimeInsertArgCount(meta.fields, auto_ts);
                     var args: [n]B.Value = undefined;
                     var idx: usize = 0;
+                    const now = Time.monotonicNowSeconds();
                     inline for (@typeInfo(T).@"struct".field_names) |fname| {
-                        if (comptime comptimeSkipInsertField(fname)) continue;
-                        args[idx] = fieldToBackendValue(B, @field(entity, fname));
+                        if (comptime comptimeSkipInsertField(fname, auto_ts)) continue;
+                        if (auto_ts and (std.mem.eql(u8, fname, "create_time") or std.mem.eql(u8, fname, "update_time"))) {
+                            args[idx] = B.fromOrmValue(.{ .int = now });
+                        } else {
+                            args[idx] = fieldToBackendValue(B, @field(e, fname));
+                        }
                         idx += 1;
                     }
                     _ = try self.orm.backend.exec(sql, args[0..idx]);
-                    return entity;
+                    if (auto_ts) {
+                        if (@hasField(T, "create_time")) e.create_time = now;
+                        if (@hasField(T, "update_time")) e.update_time = now;
+                    }
+                    return e;
                 }
 
                 /// Multi-row INSERT in one round-trip (VALUES (?,?),(?,?)…).
                 pub fn insertMany(self: @This(), allocator: std.mem.Allocator, entities: []const T) !void {
                     if (entities.len == 0) return;
-                    const columns = comptime comptimeInsertColumns(meta.sql_columns, meta.fields);
+                    const columns = comptime comptimeInsertColumns(meta.sql_columns, meta.fields, false);
                     const rows = try self.rowsFromEntities(allocator, entities);
                     defer {
                         for (rows) |r| allocator.free(r);
@@ -855,7 +931,7 @@ pub fn Orm(comptime B: type) type {
                 /// Build one Value slice per entity (insert-column order).
                 fn rowsFromEntities(self: @This(), allocator: std.mem.Allocator, entities: []const T) ![]const []const B.Value {
                     _ = self;
-                    const n_cols = comptime comptimeInsertArgCount(meta.fields);
+                    const n_cols = comptime comptimeInsertArgCount(meta.fields, false);
                     const rows = try allocator.alloc([]const B.Value, entities.len);
                     var filled: usize = 0;
                     errdefer {
@@ -866,7 +942,7 @@ pub fn Orm(comptime B: type) type {
                         const row = try allocator.alloc(B.Value, n_cols);
                         var idx: usize = 0;
                         inline for (@typeInfo(T).@"struct".field_names) |fname| {
-                            if (comptime comptimeSkipInsertField(fname)) continue;
+                            if (comptime comptimeSkipInsertField(fname, false)) continue;
                             row[idx] = fieldToBackendValue(B, @field(e, fname));
                             idx += 1;
                         }
@@ -903,14 +979,20 @@ pub fn Orm(comptime B: type) type {
                 }
 
                 pub fn update(self: @This(), entity: T) !void {
+                    const auto_ts = comptime @hasDecl(T, "sql_auto_timestamps") and T.sql_auto_timestamps;
                     const sql = comptime comptimeUpdate(meta.table_name, meta.sql_columns, meta.primary_key);
                     const n = @typeInfo(T).@"struct".field_names.len;
                     var args: [n]B.Value = undefined;
                     var idx: usize = 0;
+                    const now = Time.monotonicNowSeconds();
                     inline for (@typeInfo(T).@"struct".field_names) |fname| {
                         const is_pk = comptime std.mem.eql(u8, fname, meta.primary_key);
                         if (!is_pk) {
-                            args[idx] = fieldToBackendValue(B, @field(entity, fname));
+                            if (auto_ts and std.mem.eql(u8, fname, "update_time")) {
+                                args[idx] = B.fromOrmValue(.{ .int = now });
+                            } else {
+                                args[idx] = fieldToBackendValue(B, @field(entity, fname));
+                            }
                             idx += 1;
                         }
                     }
@@ -925,14 +1007,20 @@ pub fn Orm(comptime B: type) type {
                 /// error.NotFound;` style-guard their migrations.
                 pub fn updateForTenant(self: @This(), comptime col: []const u8, tenant_id: i64, entity: T) !u64 {
                     comptime comptimeRequireTenantField(T, col, meta.camel_case);
+                    const auto_ts = comptime @hasDecl(T, "sql_auto_timestamps") and T.sql_auto_timestamps;
                     const sql = comptime comptimeUpdate(meta.table_name, meta.sql_columns, meta.primary_key) ++ " AND " ++ col ++ " = ?";
                     const n = @typeInfo(T).@"struct".field_names.len;
                     var args: [n + 1]B.Value = undefined;
                     var idx: usize = 0;
+                    const now = Time.monotonicNowSeconds();
                     inline for (@typeInfo(T).@"struct".field_names) |fname| {
                         const is_pk = comptime std.mem.eql(u8, fname, meta.primary_key);
                         if (!is_pk) {
-                            args[idx] = fieldToBackendValue(B, @field(entity, fname));
+                            if (auto_ts and std.mem.eql(u8, fname, "update_time")) {
+                                args[idx] = B.fromOrmValue(.{ .int = now });
+                            } else {
+                                args[idx] = fieldToBackendValue(B, @field(entity, fname));
+                            }
                             idx += 1;
                         }
                     }
@@ -1216,4 +1304,180 @@ test "Repository tenant methods work with camelCase models" {
     // …in-tenant delete removes it (1 row).
     try std.testing.expectEqual(@as(u64, 1), try repo.deleteForTenant("tenant_id", 2, @as(i64, 2)));
     try std.testing.expect((try repo.findByIdForTenant("tenant_id", 2, @as(i64, 2))) == null);
+
+    // Transactional variants keep the same guard semantics inside a tx.
+    try repo.transact(void, struct {
+        fn f(tx: *data.orm.Tx(data.SqlxBackend)) anyerror!void {
+            // cross-tenant delete in tx → 0 rows.
+            try std.testing.expectEqual(@as(u64, 0), try tx.deleteForTenant(CamelProduct, "tenant_id", 2, @as(i64, 1)));
+            // in-tenant update in tx → 1 row.
+            try std.testing.expectEqual(@as(u64, 1), try tx.updateForTenant(CamelProduct, "tenant_id", 1, .{ .id = 1, .sku = "C-T1x", .tenantId = 1 }));
+        }
+    }.f);
+    const updated = (try repo.findByIdForTenant("tenant_id", 1, @as(i64, 1))).?;
+    try std.testing.expectEqualStrings("C-T1x", updated.sku);
+    allocator.free(updated.sku);
+}
+
+test "Repository soft-delete filters deleted rows from reads" {
+    const allocator = std.testing.allocator;
+    const data = @import("../data.zig");
+
+    // Model with a `deleted` audit column → reads append AND deleted = 0.
+    const SoftTask = struct {
+        pub const sql_table_name: []const u8 = "soft_task";
+        id: i64,
+        title: []const u8,
+        deleted: i64,
+    };
+
+    var client = try data.Client.open(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    _ = try client.exec(
+        "CREATE TABLE soft_task (id INTEGER PRIMARY KEY, title TEXT NOT NULL, deleted INTEGER NOT NULL DEFAULT 0)",
+        &.{},
+    );
+    const rows = [_]struct { id: i64, title: []const u8, deleted: i64 }{
+        .{ .id = 1, .title = "live-1", .deleted = 0 },
+        .{ .id = 2, .title = "gone-2", .deleted = 1 },
+        .{ .id = 3, .title = "live-3", .deleted = 0 },
+    };
+    for (rows) |r| {
+        _ = try client.exec(
+            "INSERT INTO soft_task (id, title, deleted) VALUES (?1, ?2, ?3)",
+            &.{ .{ .int = r.id }, .{ .string = r.title }, .{ .int = r.deleted } },
+        );
+    }
+
+    const backend = data.SqlxBackend{ .allocator = allocator, .client = &client };
+    var orm: data.orm.Orm(data.SqlxBackend) = undefined;
+    orm.backend = backend;
+    const Repo = data.Repository(SoftTask);
+    const repo = Repo{ .orm = &orm };
+
+    // findById skips soft-deleted rows.
+    try std.testing.expect((try repo.findById(@as(i64, 2))) == null);
+    const live = (try repo.findById(@as(i64, 1))).?;
+    try std.testing.expectEqualStrings("live-1", live.title);
+    allocator.free(live.title);
+
+    // findByIds / findAll / count all exclude deleted.
+    var by_ids = try repo.findByIds(allocator, &.{ @as(i64, 1), @as(i64, 2), @as(i64, 3) });
+    defer by_ids.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), by_ids.items.len);
+
+    var all = try repo.findAll();
+    defer all.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), all.items.len);
+    try std.testing.expectEqual(@as(usize, 2), try repo.count());
+
+    // findPage / findPageFiltered exclude deleted.
+    var page = try repo.findPage(1, 10);
+    defer if (page.arena) |*a| a.deinit();
+    try std.testing.expectEqual(@as(usize, 2), page.items.len);
+    try std.testing.expectEqual(@as(usize, 2), page.total);
+
+    var filtered = try repo.findPageFiltered(allocator, "WHERE id > ?", &.{.{ .int = 0 }}, 1, 10);
+    defer if (filtered.arena) |*a| a.deinit();
+    try std.testing.expectEqual(@as(usize, 2), filtered.items.len);
+    try std.testing.expectEqual(@as(usize, 2), filtered.total);
+
+    // Tenant variant also filters deleted (model has tenant field here).
+    const SoftTenant = struct {
+        pub const sql_table_name: []const u8 = "soft_tenant";
+        id: i64,
+        title: []const u8,
+        deleted: i64,
+        tenant_id: i64,
+    };
+    _ = try client.exec(
+        "CREATE TABLE soft_tenant (id INTEGER PRIMARY KEY, title TEXT NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, tenant_id INTEGER NOT NULL)",
+        &.{},
+    );
+    for (rows) |r| {
+        _ = try client.exec(
+            "INSERT INTO soft_tenant (id, title, deleted, tenant_id) VALUES (?1, ?2, ?3, ?4)",
+            &.{ .{ .int = r.id }, .{ .string = r.title }, .{ .int = r.deleted }, .{ .int = 7 } },
+        );
+    }
+    const RepoT = data.Repository(SoftTenant);
+    const repoT = RepoT{ .orm = &orm };
+    var tpage = try repoT.findPageForTenant("tenant_id", 7, 1, 10);
+    defer if (tpage.arena) |*a| a.deinit();
+    try std.testing.expectEqual(@as(usize, 2), tpage.items.len);
+    try std.testing.expectEqual(@as(usize, 2), tpage.total);
+    try std.testing.expectEqual(@as(usize, 2), try repoT.countForTenant("tenant_id", 7));
+    try std.testing.expect((try repoT.findByIdForTenant("tenant_id", 7, @as(i64, 2))) == null);
+}
+
+test "Repository soft-delete opt-out: models without deleted are unaffected" {
+    const allocator = std.testing.allocator;
+    const data = @import("../data.zig");
+
+    const Plain = struct {
+        pub const sql_table_name: []const u8 = "plain_row";
+        id: i64,
+        title: []const u8,
+    };
+
+    var client = try data.Client.open(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    _ = try client.exec("CREATE TABLE plain_row (id INTEGER PRIMARY KEY, title TEXT NOT NULL)", &.{});
+    _ = try client.exec("INSERT INTO plain_row (id, title) VALUES (?1, ?2)", &.{ .{ .int = 1 }, .{ .string = "x" } });
+
+    const backend = data.SqlxBackend{ .allocator = allocator, .client = &client };
+    var orm: data.orm.Orm(data.SqlxBackend) = undefined;
+    orm.backend = backend;
+    const repo = data.Repository(Plain){ .orm = &orm };
+
+    try std.testing.expectEqual(@as(usize, 1), try repo.count());
+    const all = try repo.findAll();
+    defer all.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), all.items.len);
+}
+
+test "Repository auto timestamps fill create_time/update_time (opt-in)" {
+    const allocator = std.testing.allocator;
+    const data = @import("../data.zig");
+
+    const Audited = struct {
+        pub const sql_table_name: []const u8 = "audited_row";
+        pub const sql_auto_timestamps = true;
+        id: i64,
+        title: []const u8,
+        create_time: i64,
+        update_time: i64,
+    };
+
+    var client = try data.Client.open(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    _ = try client.exec(
+        "CREATE TABLE audited_row (id INTEGER PRIMARY KEY, title TEXT NOT NULL, create_time INTEGER NOT NULL DEFAULT 0, update_time INTEGER NOT NULL DEFAULT 0)",
+        &.{},
+    );
+
+    const backend = data.SqlxBackend{ .allocator = allocator, .client = &client };
+    var orm: data.orm.Orm(data.SqlxBackend) = undefined;
+    orm.backend = backend;
+    const Repo = data.Repository(Audited);
+    const repo = Repo{ .orm = &orm };
+
+    // insert fills create_time/update_time from the clock.
+    const inserted = try repo.insert(.{ .id = 1, .title = "a", .create_time = 0, .update_time = 0 });
+    try std.testing.expect(inserted.create_time > 0);
+    try std.testing.expect(inserted.update_time > 0);
+    try std.testing.expectEqual(inserted.create_time, inserted.update_time);
+
+    const after_insert = (try repo.findById(@as(i64, 1))).?;
+    try std.testing.expect(after_insert.create_time > 0);
+    try std.testing.expectEqual(after_insert.create_time, after_insert.update_time);
+    allocator.free(after_insert.title);
+
+    // update refreshes update_time only; create_time stays.
+    const orig_create = inserted.create_time;
+    try repo.update(.{ .id = 1, .title = "a2", .create_time = orig_create, .update_time = 0 });
+    const after_update = (try repo.findById(@as(i64, 1))).?;
+    try std.testing.expect(after_update.update_time >= after_update.create_time);
+    try std.testing.expectEqual(orig_create, after_update.create_time);
+    allocator.free(after_update.title);
 }
