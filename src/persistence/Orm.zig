@@ -567,6 +567,16 @@ pub fn Orm(comptime B: type) type {
                     return self.orm.backend.queryRow(T, sql, &args);
                 }
 
+                /// Tenant-scoped single lookup: `WHERE pk = ? AND {col} = ?`.
+                /// `col` is the tenant column name; compile-time error when the
+                /// model lacks that field.
+                pub fn findByIdForTenant(self: @This(), comptime col: []const u8, tenant_id: i64, id: anytype) !?T {
+                    comptime comptimeRequireTenantField(T, col, meta.camel_case);
+                    const sql = comptime comptimeSelectById(meta.table_name, meta.sql_columns, meta.fields, meta.primary_key, meta.camel_case) ++ " AND " ++ col ++ " = ?";
+                    var args = [_]B.Value{ B.fromOrmValue(toOrmValue(id)), B.fromOrmValue(.{ .int = tenant_id }) };
+                    return self.orm.backend.queryRow(T, sql, &args);
+                }
+
                 /// Batch lookup: `WHERE pk IN (?,?,…)` in one round-trip.
                 /// Result order follows the DB, not the input order.
                 pub fn findByIds(self: @This(), allocator: std.mem.Allocator, ids: []const i64) !sqlx.QueryResult(T) {
@@ -625,6 +635,13 @@ pub fn Orm(comptime B: type) type {
                 pub fn findAll(self: @This()) !sqlx.QueryResult(T) {
                     const sql = comptime comptimeSelectAll(meta.table_name, meta.sql_columns, meta.fields, meta.camel_case);
                     return self.orm.backend.queryRows(T, sql, &.{});
+                }
+
+                /// Tenant-scoped full scan: `SELECT … FROM {t} WHERE {col} = ?`.
+                pub fn findAllForTenant(self: @This(), comptime col: []const u8, tenant_id: i64) !sqlx.QueryResult(T) {
+                    comptime comptimeRequireTenantField(T, col, meta.camel_case);
+                    const sql = comptime comptimeSelectAll(meta.table_name, meta.sql_columns, meta.fields, meta.camel_case) ++ " WHERE " ++ col ++ " = ?";
+                    return self.orm.backend.queryRows(T, sql, &.{.{ .int = tenant_id }});
                 }
 
                 pub fn count(self: @This()) !usize {
@@ -902,10 +919,46 @@ pub fn Orm(comptime B: type) type {
                     _ = try self.orm.backend.exec(sql, args[0..idx]);
                 }
 
+                /// Tenant-scoped update: `UPDATE {t} SET … WHERE pk = ? AND {col} = ?`.
+                /// Returns rows affected — 0 when the row belongs to another
+                /// tenant (guarded no-op), so callers can `if (== 0) return
+                /// error.NotFound;` style-guard their migrations.
+                pub fn updateForTenant(self: @This(), comptime col: []const u8, tenant_id: i64, entity: T) !u64 {
+                    comptime comptimeRequireTenantField(T, col, meta.camel_case);
+                    const sql = comptime comptimeUpdate(meta.table_name, meta.sql_columns, meta.primary_key) ++ " AND " ++ col ++ " = ?";
+                    const n = @typeInfo(T).@"struct".field_names.len;
+                    var args: [n + 1]B.Value = undefined;
+                    var idx: usize = 0;
+                    inline for (@typeInfo(T).@"struct".field_names) |fname| {
+                        const is_pk = comptime std.mem.eql(u8, fname, meta.primary_key);
+                        if (!is_pk) {
+                            args[idx] = fieldToBackendValue(B, @field(entity, fname));
+                            idx += 1;
+                        }
+                    }
+                    args[idx] = fieldToBackendValue(B, @field(entity, meta.primary_key));
+                    idx += 1;
+                    args[idx] = B.fromOrmValue(.{ .int = tenant_id });
+                    idx += 1;
+                    const res = try self.orm.backend.exec(sql, args[0..idx]);
+                    return res.rows_affected;
+                }
+
                 pub fn delete(self: @This(), id: anytype) !void {
                     const sql = comptime comptimeDelete(meta.table_name, meta.primary_key);
                     var args = [_]B.Value{B.fromOrmValue(toOrmValue(id))};
                     _ = try self.orm.backend.exec(sql, &args);
+                }
+
+                /// Tenant-scoped delete: `DELETE FROM {t} WHERE pk = ? AND {col} = ?`.
+                /// Returns rows affected — 0 when the row belongs to another
+                /// tenant (guarded no-op).
+                pub fn deleteForTenant(self: @This(), comptime col: []const u8, tenant_id: i64, id: anytype) !u64 {
+                    comptime comptimeRequireTenantField(T, col, meta.camel_case);
+                    const sql = comptime comptimeDelete(meta.table_name, meta.primary_key) ++ " AND " ++ col ++ " = ?";
+                    var args = [_]B.Value{ B.fromOrmValue(toOrmValue(id)), B.fromOrmValue(.{ .int = tenant_id }) };
+                    const res = try self.orm.backend.exec(sql, &args);
+                    return res.rows_affected;
                 }
 
                 pub fn transact(self: @This(), comptime R: type, fn_tx: *const fn (*Tx(B)) anyerror!R) !R {
@@ -1131,4 +1184,36 @@ test "Repository tenant methods work with camelCase models" {
     defer found.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 1), found.items.len);
     try std.testing.expectEqual(@as(i64, 1), found.items[0].id);
+
+    // findByIdForTenant: row belongs to tenant 1; tenant 2 must not see it.
+    const by_id = (try repo.findByIdForTenant("tenant_id", 1, @as(i64, 1))).?;
+    try std.testing.expectEqualStrings("C-T1", by_id.sku);
+    allocator.free(by_id.sku);
+    try std.testing.expect((try repo.findByIdForTenant("tenant_id", 2, @as(i64, 1))) == null);
+
+    // findAllForTenant: only that tenant's rows.
+    var all = try repo.findAllForTenant("tenant_id", 2);
+    defer all.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), all.items.len);
+    try std.testing.expectEqualStrings("C-T2", all.items[0].sku);
+
+    // updateForTenant: cross-tenant update must not touch the row (0 rows).
+    try std.testing.expectEqual(@as(u64, 0), try repo.updateForTenant("tenant_id", 1, .{ .id = 2, .sku = "HACK", .tenantId = 1 }));
+    const row2 = (try repo.findByIdForTenant("tenant_id", 2, @as(i64, 2))).?;
+    try std.testing.expectEqualStrings("C-T2", row2.sku);
+    allocator.free(row2.sku);
+    // In-tenant update applies (1 row).
+    try std.testing.expectEqual(@as(u64, 1), try repo.updateForTenant("tenant_id", 2, .{ .id = 2, .sku = "C-T2b", .tenantId = 2 }));
+    const row2b = (try repo.findByIdForTenant("tenant_id", 2, @as(i64, 2))).?;
+    try std.testing.expectEqualStrings("C-T2b", row2b.sku);
+    allocator.free(row2b.sku);
+
+    // deleteForTenant: cross-tenant delete is a guarded no-op (0 rows)…
+    try std.testing.expectEqual(@as(u64, 0), try repo.deleteForTenant("tenant_id", 1, @as(i64, 2)));
+    const still = try repo.findByIdForTenant("tenant_id", 2, @as(i64, 2));
+    try std.testing.expect(still != null);
+    if (still) |s| allocator.free(s.sku);
+    // …in-tenant delete removes it (1 row).
+    try std.testing.expectEqual(@as(u64, 1), try repo.deleteForTenant("tenant_id", 2, @as(i64, 2)));
+    try std.testing.expect((try repo.findByIdForTenant("tenant_id", 2, @as(i64, 2))) == null);
 }
