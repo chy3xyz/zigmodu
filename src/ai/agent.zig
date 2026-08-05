@@ -27,6 +27,10 @@ pub const AgentResult = struct {
     answer: []const u8,
     steps: usize,
     owned_answer: bool = false,
+    /// Reasoning/thinking chain from reasoning models (empty when absent).
+    /// Owned when `owned_reasoning` is set.
+    reasoning: []const u8 = "",
+    owned_reasoning: bool = false,
     /// Set when the run stopped early because the task budget was exhausted.
     budget_exhausted: bool = false,
     /// Set when the run stopped early because the handle was canceled.
@@ -34,6 +38,7 @@ pub const AgentResult = struct {
 
     pub fn deinit(self: *AgentResult, allocator: std.mem.Allocator) void {
         if (self.owned_answer and self.answer.len > 0) allocator.free(self.answer);
+        if (self.owned_reasoning and self.reasoning.len > 0) allocator.free(self.reasoning);
         self.* = .{ .answer = "", .steps = 0, .budget_exhausted = false, .canceled = false };
     }
 };
@@ -235,7 +240,20 @@ pub const Agent = struct {
                 }
                 try self.recordRunAudit(allocator, skill_ctx, steps + 1, started_ms, if (budget_stopped) "budget_exhausted" else if (canceled_stopped) "canceled" else "completed");
                 const answer = try allocator.dupe(u8, resp.content);
-                return .{ .answer = answer, .steps = steps + 1, .owned_answer = true, .budget_exhausted = budget_stopped, .canceled = canceled_stopped };
+                // Surface the reasoning chain from reasoning models.
+                const reasoning = if (resp.reasoning_content.len > 0)
+                    try allocator.dupe(u8, resp.reasoning_content)
+                else
+                    "";
+                return .{
+                    .answer = answer,
+                    .steps = steps + 1,
+                    .owned_answer = true,
+                    .reasoning = reasoning,
+                    .owned_reasoning = reasoning.len > 0,
+                    .budget_exhausted = budget_stopped,
+                    .canceled = canceled_stopped,
+                };
             }
 
             const tc_copy = try allocator.alloc(AiProvider.ToolCall, resp.tool_calls.len);
@@ -429,7 +447,7 @@ test "Agent.run executes a full tool-call loop against a mock provider" {
                 const body = if (call == 0)
                     "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"ping\",\"arguments\":\"{}\"}}]}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}"
                 else
-                    "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"final answer\"}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}";
+                    "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"final answer\",\"reasoning_content\":\"chain of thought\"}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}";
                 var hbuf: [1024]u8 = undefined;
                 const resp = std.fmt.bufPrint(&hbuf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch break;
                 _ = std.posix.system.write(accepted.socket.handle, resp.ptr, resp.len);
@@ -485,6 +503,8 @@ test "Agent.run executes a full tool-call loop against a mock provider" {
     defer result.deinit(allocator);
 
     try std.testing.expectEqualStrings("final answer", result.answer);
+    // Reasoning chain surfaces through Agent.run() to the caller.
+    try std.testing.expectEqualStrings("chain of thought", result.reasoning);
     try std.testing.expectEqual(@as(usize, 1), State.pinged);
     try std.testing.expectEqual(@as(usize, 1), agent.metrics.tool_calls);
     try std.testing.expect(hooks_calls >= 1);
