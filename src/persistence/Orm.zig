@@ -65,7 +65,7 @@ fn snakeCase(comptime name: []const u8) []const u8 {
 /// e.g. "userName" → "user_name", "deptId" → "dept_id", "id" → "id"
 pub fn camelToSnake(comptime input: []const u8) []const u8 {
     @setEvalBranchQuota(2000);
-    comptime var buf: [256]u8 = @splat(0);
+    var buf: [256]u8 = @splat(0);
     var idx: usize = 0;
     for (input) |c| {
         if (c >= 'A' and c <= 'Z') {
@@ -77,8 +77,31 @@ pub fn camelToSnake(comptime input: []const u8) []const u8 {
         }
         idx += 1;
     }
-    const result = buf[0..idx];
-    return result;
+    const out: [idx]u8 = buf[0..idx].*;
+    return out[0..];
+}
+
+/// Convert snake_case to camelCase at comptime.
+/// e.g. "tenant_id" → "tenantId", "app_id" → "appId", "id" → "id"
+pub fn snakeToCamel(comptime input: []const u8) []const u8 {
+    @setEvalBranchQuota(2000);
+    var buf: [256]u8 = @splat(0);
+    var idx: usize = 0;
+    var upper_next = false;
+    for (input) |c| {
+        if (c == '_') {
+            upper_next = true;
+        } else if (upper_next) {
+            buf[idx] = if (c >= 'a' and c <= 'z') c - ('a' - 'A') else c;
+            idx += 1;
+            upper_next = false;
+        } else {
+            buf[idx] = c;
+            idx += 1;
+        }
+    }
+    const out: [idx]u8 = buf[0..idx].*;
+    return out[0..];
 }
 
 /// Check if the model type has sql_column_style = .camelCase
@@ -231,11 +254,14 @@ fn comptimeCountForTenant(comptime table: []const u8, comptime col: []const u8) 
     return "SELECT COUNT(*) AS count FROM " ++ table ++ " WHERE " ++ col ++ " = ?";
 }
 
-/// Tenant-scoped repository methods filter by `col`; fail at compile time when
-/// the model lacks the tenant field instead of silently skipping the filter.
-fn comptimeRequireTenantField(comptime T: type, comptime col: []const u8) void {
-    if (!@hasField(T, col)) {
-        @compileError("tenant-scoped repository method called for model without field '" ++ col ++ "' — add the tenant column to the model or use the non-tenant variant");
+/// Tenant-scoped repository methods filter by `col` (a SQL column name, e.g.
+/// `"tenant_id"` / `"app_id"`); fail at compile time when the model lacks the
+/// tenant field instead of silently skipping the filter. `camel` models map
+/// camelCase fields to snake_case columns, so the field name is derived.
+fn comptimeRequireTenantField(comptime T: type, comptime col: []const u8, comptime camel: bool) void {
+    const field = if (camel) snakeToCamel(col) else col;
+    if (!@hasField(T, field)) {
+        @compileError("tenant-scoped repository method called for model without field '" ++ field ++ "' (column '" ++ col ++ "') — add the tenant column to the model or use the non-tenant variant");
     }
 }
 
@@ -570,7 +596,7 @@ pub fn Orm(comptime B: type) type {
                 /// `col` is the tenant column name (`"tenant_id"` or `"app_id"`);
                 /// compile-time error when the model lacks that field.
                 pub fn findByIdsForTenant(self: @This(), comptime col: []const u8, allocator: std.mem.Allocator, tenant_id: i64, ids: []const i64) !sqlx.QueryResult(T) {
-                    comptime comptimeRequireTenantField(T, col);
+                    comptime comptimeRequireTenantField(T, col, meta.camel_case);
                     if (ids.len == 0) return error.EmptyIds;
                     const cols = comptime comptimeColumnList(meta.sql_columns, meta.fields, meta.camel_case);
                     var buf = std.ArrayList(u8).empty;
@@ -633,7 +659,7 @@ pub fn Orm(comptime B: type) type {
                 /// the tenant column name (`"tenant_id"` or `"app_id"`);
                 /// compile-time error when the model lacks that field.
                 pub fn findPageForTenant(self: @This(), comptime col: []const u8, tenant_id: i64, page: usize, size: usize) !PageResult(T) {
-                    comptime comptimeRequireTenantField(T, col);
+                    comptime comptimeRequireTenantField(T, col, meta.camel_case);
                     const sql = comptime comptimeSelectPageForTenant(meta.table_name, meta.sql_columns, meta.fields, meta.camel_case, col);
                     const offset: i64 = if (page > 0) @intCast((page - 1) * size) else 0;
                     var args = [_]B.Value{
@@ -657,7 +683,7 @@ pub fn Orm(comptime B: type) type {
 
                 /// Tenant-scoped row count: `SELECT COUNT(*) FROM {t} WHERE {col} = ?`.
                 pub fn countForTenant(self: @This(), comptime col: []const u8, tenant_id: i64) !usize {
-                    comptime comptimeRequireTenantField(T, col);
+                    comptime comptimeRequireTenantField(T, col, meta.camel_case);
                     const sql = comptime comptimeCountForTenant(meta.table_name, col);
                     const result = try self.orm.backend.queryRow(struct { count: i64 }, sql, &.{.{ .int = tenant_id }});
                     return @intCast(result.?.count);
@@ -710,7 +736,7 @@ pub fn Orm(comptime B: type) type {
                 /// placeholders + args). `col` is the tenant column name;
                 /// compile-time error when the model lacks that field.
                 pub fn findPageFilteredForTenant(self: @This(), comptime col: []const u8, alloc: std.mem.Allocator, tenant_id: i64, where_sql: []const u8, args: []const B.Value, page: usize, size: usize) !PageResult(T) {
-                    comptime comptimeRequireTenantField(T, col);
+                    comptime comptimeRequireTenantField(T, col, meta.camel_case);
                     try sqlx.validateSqlFragment(where_sql);
                     const col_list = comptime comptimeColumnList(meta.sql_columns, meta.fields, meta.camel_case);
 
@@ -1054,4 +1080,55 @@ test "Repository tenant-scoped methods filter by tenant column (sqlite)" {
     try std.testing.expectEqual(@as(usize, 1), filtered.items.len);
     try std.testing.expectEqualStrings("T1-B", filtered.items[0].sku);
     try std.testing.expectEqual(@as(usize, 1), filtered.total);
+}
+
+test "Repository tenant methods work with camelCase models" {
+    const allocator = std.testing.allocator;
+    const data = @import("../data.zig");
+
+    // camelCase field `tenantId` maps to snake_case column `tenant_id`.
+    const CamelProduct = struct {
+        pub const sql_table_name: []const u8 = "camel_product";
+        pub const sql_column_style = .camelCase;
+        id: i64,
+        sku: []const u8,
+        tenantId: i64,
+    };
+
+    var client = try data.Client.open(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    _ = try client.exec(
+        "CREATE TABLE camel_product (id INTEGER PRIMARY KEY, sku TEXT NOT NULL, tenant_id INTEGER NOT NULL)",
+        &.{},
+    );
+    const rows = [_]struct { id: i64, sku: []const u8, tenant: i64 }{
+        .{ .id = 1, .sku = "C-T1", .tenant = 1 },
+        .{ .id = 2, .sku = "C-T2", .tenant = 2 },
+    };
+    for (rows) |r| {
+        _ = try client.exec(
+            "INSERT INTO camel_product (id, sku, tenant_id) VALUES (?1, ?2, ?3)",
+            &.{ .{ .int = r.id }, .{ .string = r.sku }, .{ .int = r.tenant } },
+        );
+    }
+
+    const backend = data.SqlxBackend{ .allocator = allocator, .client = &client };
+    var orm: data.orm.Orm(data.SqlxBackend) = undefined;
+    orm.backend = backend;
+    const Repo = data.Repository(CamelProduct);
+    const repo = Repo{ .orm = &orm };
+
+    // `col` is the SQL column name; the field check derives `tenantId`.
+    var page = try repo.findPageForTenant("tenant_id", 1, 1, 10);
+    defer if (page.arena) |*a| a.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.items.len);
+    try std.testing.expectEqualStrings("C-T1", page.items[0].sku);
+    try std.testing.expectEqual(@as(usize, 1), page.total);
+
+    try std.testing.expectEqual(@as(usize, 1), try repo.countForTenant("tenant_id", 1));
+
+    var found = try repo.findByIdsForTenant("tenant_id", allocator, 1, &.{ @as(i64, 1), @as(i64, 2) });
+    defer found.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), found.items.len);
+    try std.testing.expectEqual(@as(i64, 1), found.items[0].id);
 }
