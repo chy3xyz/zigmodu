@@ -626,6 +626,16 @@ pub fn Orm(comptime B: type) type {
                     return self.orm.backend.queryRow(T, sql, &args);
                 }
 
+                /// Soft-delete escape hatch: like `findById` but WITHOUT the
+                /// `AND deleted = 0` filter — returns soft-deleted rows too.
+                /// Use for restore / audit queries; the normal read paths keep
+                /// filtering automatically.
+                pub fn findByIdIgnoringSoftDelete(self: @This(), id: anytype) !?T {
+                    const sql = comptime comptimeSelectById(meta.table_name, meta.sql_columns, meta.fields, meta.primary_key, meta.camel_case, false);
+                    var args = [_]B.Value{B.fromOrmValue(toOrmValue(id))};
+                    return self.orm.backend.queryRow(T, sql, &args);
+                }
+
                 /// Tenant-scoped single lookup: `WHERE pk = ? AND {col} = ?`.
                 /// `col` is the tenant column name; compile-time error when the
                 /// model lacks that field.
@@ -695,6 +705,14 @@ pub fn Orm(comptime B: type) type {
 
                 pub fn findAll(self: @This()) !sqlx.QueryResult(T) {
                     const sql = comptime comptimeSelectAll(meta.table_name, meta.sql_columns, meta.fields, meta.camel_case, @hasField(T, "deleted"));
+                    return self.orm.backend.queryRows(T, sql, &.{});
+                }
+
+                /// Soft-delete escape hatch: like `findAll` but WITHOUT the
+                /// `WHERE deleted = 0` filter — includes soft-deleted rows.
+                /// Use for restore / audit queries.
+                pub fn findAllIncludingSoftDelete(self: @This()) !sqlx.QueryResult(T) {
+                    const sql = comptime comptimeSelectAll(meta.table_name, meta.sql_columns, meta.fields, meta.camel_case, false);
                     return self.orm.backend.queryRows(T, sql, &.{});
                 }
 
@@ -1376,6 +1394,14 @@ test "Repository soft-delete filters deleted rows from reads" {
     defer if (page.arena) |*a| a.deinit();
     try std.testing.expectEqual(@as(usize, 2), page.items.len);
     try std.testing.expectEqual(@as(usize, 2), page.total);
+
+    // Soft-delete escape hatches see deleted rows (restore / audit path).
+    const gone = (try repo.findByIdIgnoringSoftDelete(@as(i64, 2))).?;
+    try std.testing.expectEqualStrings("gone-2", gone.title);
+    allocator.free(gone.title);
+    var all_incl = try repo.findAllIncludingSoftDelete();
+    defer all_incl.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 3), all_incl.items.len);
 
     var filtered = try repo.findPageFiltered(allocator, "WHERE id > ?", &.{.{ .int = 0 }}, 1, 10);
     defer if (filtered.arena) |*a| a.deinit();
