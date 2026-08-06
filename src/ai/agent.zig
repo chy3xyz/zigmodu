@@ -249,14 +249,11 @@ pub const Agent = struct {
                     }
                 }
             }
-            // TODO(#4): switch to chatStream + DeltaBridge to stream deltas to
-            // AgentHooks.on_delta. VERIFIED against the real DeepSeek API
-            // (content deltas + done + aggregation match; 2026-08). The switch
-            // is 3-5 lines, but the framework's mock server cannot drive
-            // requestStream (connection semantics hang — 3 schemes tried), so
-            // the Agent mock tests would all stall. Land the switch once an
-            // SSE-capable mock harness exists.
-            var resp = try self.provider.chatWith(messages.items, .{ .tools_json = tools_json });
+            // Stream deltas to AgentHooks.on_delta (side channel for SSE UIs)
+            // while aggregating the full response internally — ReAct still
+            // decides on the complete tool_calls.
+            var delta_bridge = DeltaBridge{ .target = self.hooks.ctx, .cb = self.hooks.on_delta };
+            var resp = try self.provider.chatStream(messages.items, .{ .tools_json = tools_json }, &delta_bridge, DeltaBridge.onDelta);
             defer self.provider.freeResponse(&resp);
 
             if (self.quota) |q| {
@@ -493,11 +490,11 @@ test "Agent.run executes a full tool-call loop against a mock provider" {
                     if (n == 0) break;
                     const call = ctx.calls.fetchAdd(1, .monotonic);
                     const body = if (call == 0)
-                        "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"ping\",\"arguments\":\"{}\"}}]}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}"
+                        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"ping\",\"arguments\":\"{}\"}}]}}]}\n\ndata: [DONE]\n\n"
                     else
-                        "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"final answer\",\"reasoning_content\":\"chain of thought\"}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2},\"model\":\"mock-model\"}";
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"final answer\",\"reasoning_content\":\"chain of thought\"}}],\"model\":\"mock-model\"}\n\ndata: [DONE]\n\n";
                     var hbuf: [1024]u8 = undefined;
-                    const resp = std.fmt.bufPrint(&hbuf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch break;
+                    const resp = std.fmt.bufPrint(&hbuf, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch break;
                     _ = std.posix.system.write(accepted.socket.handle, resp.ptr, resp.len);
                 }
             }
@@ -593,7 +590,7 @@ const MockAgentServer = struct {
                     if (n == 0) break;
                     const body = body_for(ctx.calls.fetchAdd(1, .monotonic));
                     var hbuf: [2048]u8 = undefined;
-                    const resp = std.fmt.bufPrint(&hbuf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch break;
+                    const resp = std.fmt.bufPrint(&hbuf, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch break;
                     _ = std.posix.system.write(accepted.socket.handle, resp.ptr, resp.len);
                 }
             }
@@ -615,10 +612,16 @@ const MockAgentServer = struct {
 };
 
 const mock_tool_call_body =
-    \\{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"ping","arguments":"{}"}}]}}],"usage":{"prompt_tokens":40,"completion_tokens":20}}
+    \\data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"ping","arguments":"{}"}}]}}]}
+    \\
+    \\data: [DONE]
+    \\
 ;
 const mock_final_body =
-    \\{"choices":[{"message":{"role":"assistant","content":"done"}}],"usage":{"prompt_tokens":40,"completion_tokens":5}}
+    \\data: {"choices":[{"delta":{"content":"done"}}]}
+    \\
+    \\data: [DONE]
+    \\
 ;
 
 test "Agent.run compacts long context via the ContextManager" {

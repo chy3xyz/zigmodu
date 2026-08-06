@@ -433,6 +433,14 @@ pub const HttpClient = struct {
     /// Wait up to `timeout_ms` for the socket to become readable so
     /// `request()` cannot block indefinitely against a peer that never
     /// responds. `timeout_ms == 0` disables the timeout.
+    /// Blocking read (waitForReadable + posix.read). The streaming path must
+    /// not use fiber-based sockread.readSome outside an async context — it
+    /// hangs on local HTTP (non-TLS) connections.
+    fn blockingRead(stream: std.Io.net.Stream, buf: []u8, timeout_ms: u64) !usize {
+        try waitForReadable(stream.socket.handle, timeout_ms);
+        return std.posix.read(stream.socket.handle, buf) catch return error.ConnectionError;
+    }
+
     fn waitForReadable(fd: std.posix.socket_t, timeout_ms: u64) !void {
         if (timeout_ms == 0) return;
         var fds = [_]std.posix.pollfd{.{
@@ -585,6 +593,10 @@ pub const HttpClient = struct {
             var write_buf: [4096]u8 = undefined;
             var w = stream.writer(self.connection_pool.io, &write_buf);
             try self.writeRequestHeaders(&w, req.method, target.path, target.host, target.port, &req.headers, req.body);
+            // Buffered writer: flush before reading, otherwise the peer waits
+            // for a request that never leaves the buffer — deadlock (the
+            // non-streaming path flushes too; this was the local-HTTP hang).
+            try w.interface.flush();
             const response = try self.readResponseStreaming(stream, cb_ctx, on_chunk);
             conn.request_count += 1;
             return response;
@@ -598,7 +610,7 @@ pub const HttpClient = struct {
 
         var buf: [8192]u8 = undefined;
 
-        const n = try sockread.readSome(stream, &buf);
+        const n = try blockingRead(stream, &buf, self.timeout_ms);
         if (n == 0) return error.ConnectionError;
         const raw = buf[0..n];
 
@@ -638,11 +650,11 @@ pub const HttpClient = struct {
         const initial = raw[body_start..];
 
         if (chunked) {
-            try streamChunkedBody(stream, &buf, initial, self.allocator, cb_ctx, on_chunk);
+            try streamChunkedBody(stream, &buf, initial, self.allocator, self.timeout_ms, cb_ctx, on_chunk);
         } else if (content_length) |cl| {
-            try streamContentLengthBody(stream, &buf, initial, cl, cb_ctx, on_chunk);
+            try streamContentLengthBody(stream, &buf, initial, cl, self.timeout_ms, cb_ctx, on_chunk);
         } else {
-            try streamUntilEofBody(stream, &buf, initial, cb_ctx, on_chunk);
+            try streamUntilEofBody(stream, &buf, initial, self.timeout_ms, cb_ctx, on_chunk);
         }
         return resp;
     }
@@ -712,6 +724,7 @@ fn streamContentLengthBody(
     buf: []u8,
     initial: []const u8,
     content_length: usize,
+    timeout_ms: u64,
     cb_ctx: *anyopaque,
     on_chunk: HttpClient.OnBodyChunk,
 ) !void {
@@ -722,7 +735,7 @@ fn streamContentLengthBody(
         copied = n;
     }
     while (copied < content_length) {
-        const more = try sockread.readSome(stream, buf);
+        const more = try HttpClient.blockingRead(stream, buf, timeout_ms);
         if (more == 0) return error.IncompleteBody;
         const to_copy = @min(@as(usize, more), content_length - copied);
         try on_chunk(cb_ctx, buf[0..to_copy]);
@@ -734,12 +747,13 @@ fn streamUntilEofBody(
     stream: std.Io.net.Stream,
     buf: []u8,
     initial: []const u8,
+    timeout_ms: u64,
     cb_ctx: *anyopaque,
     on_chunk: HttpClient.OnBodyChunk,
 ) !void {
     if (initial.len > 0) try on_chunk(cb_ctx, initial);
     while (true) {
-        const more = try sockread.readSome(stream, buf);
+        const more = try HttpClient.blockingRead(stream, buf, timeout_ms);
         if (more == 0) break;
         try on_chunk(cb_ctx, buf[0..more]);
     }
@@ -750,6 +764,7 @@ fn streamChunkedBody(
     buf: []u8,
     initial: []const u8,
     allocator: std.mem.Allocator,
+    timeout_ms: u64,
     cb_ctx: *anyopaque,
     on_chunk: HttpClient.OnBodyChunk,
 ) !void {
@@ -759,7 +774,7 @@ fn streamChunkedBody(
 
     while (true) {
         while (std.mem.indexOf(u8, carry.items, "\r\n") == null) {
-            const more = try sockread.readSome(stream, buf);
+            const more = try HttpClient.blockingRead(stream, buf, timeout_ms);
             if (more == 0) return error.IncompleteChunked;
             try carry.appendSlice(allocator, buf[0..more]);
         }
@@ -774,7 +789,7 @@ fn streamChunkedBody(
         if (size == 0) return;
 
         while (carry.items.len < size + 2) {
-            const more = try sockread.readSome(stream, buf);
+            const more = try HttpClient.blockingRead(stream, buf, timeout_ms);
             if (more == 0) return error.IncompleteChunked;
             try carry.appendSlice(allocator, buf[0..more]);
         }

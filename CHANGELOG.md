@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **HttpClient.requestStream 本地 HTTP 挂起（根治）**: `executeRequestStream`
+  写请求后漏 `flush`（请求停在缓冲、与 server 死锁）；流式读取改
+  `waitForReadable + posix.read`（同步调用链兼容）。此前本地 HTTP mock
+  全挂（真实 HTTPS 因走 std.http.Client 正常）——现本地 SSE mock 可用。
+
+### Added
+- **Agent 流式正式落地（TODO #4）**: `Agent.run` 主循环切换到
+  `chatStream + DeltaBridge`——`AgentHooks.on_delta` 真实触发（旁路推送
+  content/reasoning delta，内部仍聚合完整响应供 ReAct 决策）。Agent mock
+  测试全部改为 SSE 响应并恢复通过。
+
 ## [0.15.15] - 2026-08-06
 
 ### Added
