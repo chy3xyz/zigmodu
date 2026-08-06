@@ -250,8 +250,12 @@ pub const Agent = struct {
                 }
             }
             // TODO(#4): switch to chatStream + DeltaBridge to stream deltas to
-            // AgentHooks.on_delta (side channel); keep chatWith until the SSE
-            // mock/integration path is verified.
+            // AgentHooks.on_delta. VERIFIED against the real DeepSeek API
+            // (content deltas + done + aggregation match; 2026-08). The switch
+            // is 3-5 lines, but the framework's mock server cannot drive
+            // requestStream (connection semantics hang — 3 schemes tried), so
+            // the Agent mock tests would all stall. Land the switch once an
+            // SSE-capable mock harness exists.
             var resp = try self.provider.chatWith(messages.items, .{ .tools_json = tools_json });
             defer self.provider.freeResponse(&resp);
 

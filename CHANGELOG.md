@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Agent 流式切换验证记录**: `Agent.run` 的 chatStream 切换已用真实 DeepSeek
+  API 验证（content delta 旁路推送 + done + 聚合一致）；因框架 mock 基建
+  无法驱动 requestStream（本地 HTTP 挂起，Content-Length/chunked 均复现，
+  真实 HTTPS 正常——已记录为 requestStream 本地路径 bug 候选），切换保留
+  TODO 待 SSE mock harness 或修复后落地。
+
 ## [0.15.12] - 2026-08-06
 
 ### Added
