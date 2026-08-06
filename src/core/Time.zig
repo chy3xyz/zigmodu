@@ -27,9 +27,14 @@ pub fn monotonicNow() i64 {
     switch (comptime builtin.os.tag) {
         .windows => {
             // QueryPerformanceCounter is monotonic; convert ticks → ns.
-            const counter = std.os.windows.QueryPerformanceCounter();
-            const freq = std.os.windows.QueryPerformanceFrequency();
-            if (freq > 0) {
+            // zig 0.17 removed std.os.windows.QueryPerformanceCounter — call
+            // the ntdll entry points directly.
+            const ntdll = std.os.windows.ntdll;
+            var counter: std.os.windows.LARGE_INTEGER = undefined;
+            var freq: std.os.windows.LARGE_INTEGER = undefined;
+            if (ntdll.RtlQueryPerformanceCounter(&counter) != .FALSE and
+                ntdll.RtlQueryPerformanceFrequency(&freq) != .FALSE and freq > 0)
+            {
                 return @intCast(@divFloor(@as(i128, @intCast(counter)) * std.time.ns_per_s, @as(i128, @intCast(freq))));
             }
             return fallback_tick.fetchAdd(1, .monotonic);
