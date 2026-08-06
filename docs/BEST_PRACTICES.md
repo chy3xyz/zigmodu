@@ -869,6 +869,42 @@ pub fn processBatch(allocator: Allocator, items: []Item) !void {
 - **缓冲区复用**：复用大缓冲区避免频繁分配
 - **避免装箱**：优先使用值类型而非引用类型
 
+
+## 💱 事务范式（伪事务警示）
+
+**伪事务（最常见的事务缺陷）**：`beginTx()` 之后事务内的写仍用
+`backend.exec()` / `client.exec()` —— 那走的是池连接**自动提交**，`rollback`
+无效，资金/积分/状态类链路会出现部分写入残留。
+
+正确两种范式：
+
+1. **回调式（推荐，防呆）**：`Client.transact` / `Repository.transact` ——
+   回调返回即 commit，出错自动 rollback（errdefer），结构上不可能漏：
+
+   ```zig
+   try repo.transact(void, struct {
+       fn f(tx: *data.orm.Tx(data.SqlxBackend)) anyerror!void {
+           try tx.exec("UPDATE orders SET status = ? WHERE id = ?", &.{.{ .int = 1 }, .{ .int = 42 }});
+           try tx.exec("INSERT INTO event_outbox ...", &.{});
+       }
+   }.f);
+   ```
+
+2. **三件套（需要显式控制时）**：
+
+   ```zig
+   var tx = try client.beginTx();
+   defer tx.rollback() catch {};   // 出错兜底回滚
+   try tx.exec("UPDATE ...", &.{});
+   try tx.commit();                // 全部成功才提交
+   ```
+
+**铁律**：`beginTx()` 之后一切读写**走 tx 句柄**（`tx.exec` / `tx.queryRow` /
+`tx.queryRowPartial`），不要混用 `backend.exec`（池连接、非事务）。事务内查询优先
+`tx.queryRowPartial`（缺失列置零，与 `Client.queryRowPartial` 同契约）。多写方法
+的遗漏由 `zmodu audit` 的 b16 规则兜底（默认开启）。
+
+
 ## 🔒 安全实践
 
 ### JWT / 多端身份（与路由栈）

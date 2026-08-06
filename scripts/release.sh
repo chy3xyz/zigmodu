@@ -60,6 +60,20 @@ if ! grep -q "^## \[Unreleased\]" CHANGELOG.md; then
 fi
 perl -0pi -e "s/## \[Unreleased\]/## [$VERSION] - $(date +%F)/" CHANGELOG.md
 
+# 1b. Verify every version reference actually bumped — perl -pi silently
+#     no-ops when the old value doesn't match, which left README stuck at an
+#     old version across releases (0.15.4 -> 0.15.10 drift).
+for f in README.md README.zh.md; do
+    if ! grep -q "v$VERSION" "$f"; then
+        echo "FAIL: $f does not reference v$VERSION (stale version bump?)"
+        exit 1
+    fi
+done
+if ! grep -q "v$VERSION" CLAUDE.md || ! grep -q "v$VERSION" AGENTS.md; then
+    echo "FAIL: docs version references not updated to v$VERSION"
+    exit 1
+fi
+
 # 3. Quality gates.
 echo "-- gates --"
 zig fmt --check src tools examples

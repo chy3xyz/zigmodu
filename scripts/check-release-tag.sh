@@ -40,4 +40,9 @@ if ! grep -q '\.fingerprint' build.zig.zon; then
     exit 1
 fi
 
+if ! grep -q "v$Z" README.md; then
+    echo "FAIL: README.md does not reference v$Z"
+    exit 1
+fi
+
 echo "OK: tag $V matches package version $Z (fingerprint present)"
