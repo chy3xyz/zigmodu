@@ -1241,6 +1241,23 @@ zig build docs
 - **避免**：基准测试识别瓶颈
 - **优化**：算法优化、缓存、批处理
 
+### Threaded Io 下的同步阻塞（handler 内禁 `posix.poll/read`）
+- **背景**：服务端 handler 跑在 **Threaded Io 的 fiber（io 线程）**上。同步阻塞调用
+  （`std.posix.poll` / `std.posix.read` / 忙等）会**阻塞整个 io 线程**——所有
+  并发请求共享该线程，一次阻塞 = 全局停顿（表现为超时 / ProviderError / 假死）。
+- **对比**：`std.testing.io` 与独立调用线程没有 io 线程概念，同样的同步代码
+  "看起来正常"——这是"live 测试通过、服务端挂"类问题的典型根源。
+- **正确姿势**：
+  - 出站 HTTP：一律走 `http.HttpClient`（内部已封装 io 异步路径；真实
+    DeepSeek/OpenAI 流式在 Threaded Io 下实测通过）。
+  - 其他网络/等待：使用 `io` 的异步 API（`io.timeout` / fiber 语义），不要
+    自己 `posix.poll`。
+  - 纯计算（无阻塞）不受影响。
+- **诊断**：若服务端出现"单请求挂起拖垮全部"且 live 测试正常 → 查 handler 链路
+  里是否有同步阻塞 I/O；`@TypeOf(io)` 打印确认是否为 Threaded。
+- **契约**：框架层不强制禁止（工具链兼容），但**应用层默认禁止**在 handler /
+  中间件 / Agent 工具回调里做同步阻塞 I/O。
+
 ## 📊 质量指标
 
 ### 代码质量

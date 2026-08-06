@@ -151,6 +151,43 @@ bash scripts/ci-integration.sh   # tenant-mgmt + http-stress-test（需 curl）
    - TLS：sidecar ALPN（`Http2Tls`）；进程内 TLS server 仍待 Zig stdlib
    - CI：tenant-mgmt + stress + shopdemo smoke；H1/h2c 对比脚本 `scripts/bench_h1_h2.py`
    - 仍后续：H2 吞吐进一步对齐 H1（HPACK/alloc 池）、进程内 TLS、cooperative 与 broker 完整 revoke 往返
+
+### 决策记录：gRPC「一等公民」≠ modulith 近期投入
+
+**结论（2026-08）：维持「能力预留 + 文档定位」，不做 TLS 主路径/网关/生态一等公民化。**
+
+gRPC 的价值与**通信距离**成正比，modulith 的核心通信都在**进程内**：
+
+| 场景 | modulith 现实 | gRPC 价值 |
+|------|--------------|:--------:|
+| 模块间调用 | 直接调用 / EventBus / outbox，不走网络 | ❌ 纯序列化开销 |
+| 单体多副本扩展 | 共享 DB / Redis / 队列，无服务间 API | ❌ 不需要 |
+| 对外 REST | 已有一等 HTTP/1.1 + h2c | 低（生态/代理友好性 REST 更优） |
+| **演进拆分出口** | 拆分后才出现服务间契约 | ✅ **唯一高价值点，但发生在后期** |
+
+**现状**：h2c + unary/stream 四态 + HTTP/2 priority 已在（阶段 5 ✅）——缺的是"一等公民"包装。拆分时真正的瓶颈是**数据归属/事务边界**（saga 等，阶段 6 已铺垫），协议反而是最简单的部分。
+
+**三档投入策略**：
+- **保持（推荐，≈0 成本）**：现有能力不退化；`TLS：sidecar ALPN` 维持现状（进程内 TLS 待 Zig stdlib）
+- **验证（中成本）**：出现实际拆分计划时，补一个"拆分为两个 gRPC 服务"示例证明出口可行
+- **一等公民（高成本）**：**暂缓**——TLS 主路径 + 网关 + 生态对齐，等拆分需求出现再启动
+
+### 决策记录：拆分出口 = 事件契约 + outbox（对齐 Spring Modulith）
+
+**2026-08 对照核实**：Spring Modulith 无真正分布式（无 RPC/服务发现），其演进出口是
+**进程内事件 → 事务性 outbox 外部化**（`event_publication` 表 + 异步转发 Kafka/RabbitMQ/JMS，
+严格 outbox 到 2.1 才引入且靠第三方 Namastack/JobRunr）。zigmodu 已原生对齐且更强：
+`OutboxPublisher`（业务事务内写 `event_outbox` + 同事务提交 → 轮询投递 → retry/DLQ/多租户/三方言）+ `DistributedEventBus`（WAL + 一致哈希，Spring 没有）。
+
+**因此拆分出口的下一步是补 outbox 治理差距（中成本，拆分前做）**：
+- **显式重发 API**：按失败时间/次数策略 `resubmit()`（Spring 有
+  `FailedEventPublications.resubmit()` + Staleness Monitor；zigmodu 目前只有
+  retry + DLQ + `stale_threshold_seconds` 自动机制，缺手动治理入口）
+- 事件契约显式边界：`@Externalized` 式 payload/routing 映射（当前 outbox 事件直接投递，
+  无"内部事件 → 对外稳定契约"的映射层）
+- 这两项落地后，modulith → 分布式拆分的出口即与 Spring 最佳实践完全对齐，且无需 gRPC。
+
+
 6. **分布式状态机与容错增强 (✅ 已落地)**
    - **Raft Log Compaction & InstallSnapshot**：在 [`src/core/cluster/RaftElection.zig`](../src/core/cluster/RaftElection.zig) 中实现 `InstallSnapshotRequest`/`Response` 协议，提供 `compactLog` 内存裁切与 Follower 快照覆盖能力，防止 Raft 日志无限增长。
    - **Saga 事务协调器**：持续支持服务节点崩溃重启后的 WAL Recovery。

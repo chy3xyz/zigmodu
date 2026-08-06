@@ -1,10 +1,10 @@
 # ZigModu 生产级评估报告 v5
 
-**评估日期**: 2026-07-31  
-**框架版本**: v0.14.16  
+**评估日期**: 2026-08-07  
+**框架版本**: v0.15.19  
 
 **Zig 版本**: 0.17.0  
-**测试结果**: **814+ passed, 18 skipped, 0 failed**（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`，2026-08-02 复测）  
+**测试结果**: **875+ passed, 18 skipped, 0 failed**（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`，2026-08-07 复测）  
 
 **生产门禁**: `zig build check`（热路径禁止裸 `catch {}`）  
 **旗舰示例**: [`examples/tenant-mgmt/`](../examples/tenant-mgmt/) — SQLite 持久层 + 真 JWT + CI 业务断言  
@@ -12,6 +12,7 @@
 
 > v5.6 增量（2026-07-31）：x402 支付校验 **fail-closed**；`OtlpExporter.exportSpans` OTLP/HTTP JSON 上报 + 重试；AGENTS/CLAUDE 版本与测试基线对齐；综合维持 **~98/100**。
 > v5.7 增量（2026-08-02）：Web4 中间件 + 持久化发票核销/防重放 + DID challenge/JWT；安全组件核合（删两套坏实现）；EventStore 产品化；Fluvio 原生 transport；零测试组件补测（814+）；修复 8+ 处延迟编译坏实现。
+> v5.8 增量（2026-08-07，v0.15.16→0.15.19）：**Agent.run 流式化落地**（TODO #4：chatStream + on_delta 旁路，mock SSE 基建驱动 `requestStream`，真实 DeepSeek API 验证通过）；**tools_json 非法 JSON 修复**（`SkillRegistry.toOpenAiFunctionsAlloc` 多 `}` → DeepSeek 400，测试补 `std.json.parse` 合法性断言）；**Metrics 原子化**（`fetchAdd`/`load`，并发计数不丢更新 + `toStats()` 快照读取）；**jwt-ver 会话吊销**（`generateTokenWithTenantAndVersion`/`tokenVersionGuard`，上游化）；**b17 增强**（标量类型感知 + 命名符号表 + 跨行 return 委托识别，真实泄漏清零）；**Repository ForTenant 六方法补全**（含 update/delete rows_affected 守卫）+ **soft-delete 自动过滤**（`deleted` 字段 opt-in）；**SqlxBackend borrowed 透传**（`queryRowBorrowed`/`queryScalar`）；**PermissionGate deny_by_default**；**outbox 方言化**（mysql/pg/sqlite）；migrate 生成 quota 运行时化（zent v0.29.2 协作）；综合维持 **~98/100**（虚分换实分：400 级 bug 与并发缺陷已实测修复）。
 
 ---
 
@@ -32,7 +33,7 @@
 | 11 | **内存安全** | 96 | 92 | +4 | P0 泄漏修复 + 生产 check 门禁 |
 | 12 | **文档** | 97 | 90 | +7 | ZMODU / ZENT / MODULITH / 多租户可选说明 |
 
-> **综合评分: ~98/100** — 路线图阶段 1–9 主体落地；多租户为可选模块。v5.6 补齐 OTLP 上报与 x402 安全默认。
+> **综合评分: ~98/100** — 路线图阶段 1–9 主体落地；多租户为可选模块。v5.6 补齐 OTLP 上报与 x402 安全默认；v5.8 将虚分换成实测实分（tools_json 400 级修复、Metrics 并发修复、Agent 流式真实 API 验证）。
 
 ---
 
