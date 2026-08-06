@@ -66,6 +66,8 @@ pub const SecurityModule = struct {
             exp: i64, // expiration time
             iat: i64, // issued at
             roles: []const []const u8, // user roles
+            /// Credential version for server-side revocation (0 = legacy token).
+            ver: i64 = 0,
         };
 
         /// [...] JWT Token [...]
@@ -107,6 +109,18 @@ pub const SecurityModule = struct {
         roles: []const []const u8,
         tenant_id: []const u8,
     ) ![]const u8 {
+        return self.generateTokenWithTenantAndVersion(user_id, roles, tenant_id, 0);
+    }
+
+    /// Like `generateTokenWithTenant` but carries a credential version so the
+    /// application can revoke tokens server-side (bump the user's version).
+    pub fn generateTokenWithTenantAndVersion(
+        self: *Self,
+        user_id: []const u8,
+        roles: []const []const u8,
+        tenant_id: []const u8,
+        ver: i64,
+    ) ![]const u8 {
         const now = self.nowSeconds();
         const exp = now + self.token_expiry_seconds;
 
@@ -118,6 +132,7 @@ pub const SecurityModule = struct {
             .exp = exp,
             .iat = now,
             .roles = roles,
+            .ver = ver,
         };
 
         // Create signature base
@@ -204,6 +219,7 @@ pub const SecurityModule = struct {
             .exp = parsed.value.exp,
             .iat = parsed.value.iat,
             .roles = roles,
+            .ver = parsed.value.ver,
         };
     }
 
@@ -510,4 +526,24 @@ test "SecurityModule rejects malformed tokens with extra parts" {
 
     const malformed = "header.payload.sig.extra_part";
     try std.testing.expectError(error.InvalidToken, sec.verifyToken(malformed));
+}
+
+test "SecurityModule token credential version roundtrip" {
+    const allocator = std.testing.allocator;
+    var sec = SecurityModule.init(allocator, "my-secret-key", 3600);
+
+    // Legacy path carries ver=0.
+    const legacy = try sec.generateTokenWithTenant("user-1", &.{"user"}, "tenant-1");
+    defer allocator.free(legacy);
+    const lp = try sec.verifyToken(legacy);
+    defer sec.freePayload(lp);
+    try std.testing.expectEqual(@as(i64, 0), lp.ver);
+
+    // Versioned path carries the credential version (server-side revocation).
+    const v = try sec.generateTokenWithTenantAndVersion("user-1", &.{"user"}, "tenant-1", 7);
+    defer allocator.free(v);
+    const p = try sec.verifyToken(v);
+    defer sec.freePayload(p);
+    try std.testing.expectEqual(@as(i64, 7), p.ver);
+    try std.testing.expectEqualStrings("user-1", p.sub);
 }

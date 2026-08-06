@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **JWT 凭据版本（服务端会话吊销）**: `JwtPayload.ver` claim +
+  `generateTokenWithTenantAndVersion`（`generateTokenWithTenant` 委派
+  ver=0 兼容）。应用侧可 `payload.ver != users.token_version` 判定吊销
+  （踢人）。修复 `verifyToken` 重建 payload 时漏拷 `ver` 的隐藏 bug；
+  含 ver 往返测试。
+
 ## [0.15.13] - 2026-08-06
 
 ### Changed
