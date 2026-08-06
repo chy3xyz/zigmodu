@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.18] - 2026-08-07
+
+### Fixed
+- **tools_json 非法 JSON**: `SkillRegistry.toOpenAiFunctionsAlloc` 每个工具
+  多输出一个 `}`（`appendSlice` 字面 `]}}}}` vs `print` 的 `{{` 转义混用），
+  导致 DeepSeek/OpenAI 对工具定义报 400 → ProviderError。已改为 `]}}}`，
+  并给生成器测试补 `std.json.parse` 合法性断言防回归。
+
 ## [0.15.17] - 2026-08-07
 
 ### Added
