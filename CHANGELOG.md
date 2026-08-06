@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **examples/zent-modulith**: 依赖升级 **zent v0.29.3**（bool scan / WhereIn
+  Zig 0.17 / defaultValueStr quota 修复）；改用 `git+https#v0.29.3` tag 依赖
+  （tarball archive hash 不稳定，git tag 内容哈希稳定且锚定更规范）。
+
 ## [0.15.20] - 2026-08-07
 
 ### Added
