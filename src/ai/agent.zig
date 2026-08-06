@@ -815,6 +815,13 @@ test "SkillRegistry tools json for agent" {
     const json = try reg.toOpenAiFunctionsAlloc(a);
     defer a.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"ping\"") != null);
+    // The generated tools_json must be VALID JSON — DeepSeek/OpenAI reject
+    // malformed tool definitions with a 400 (surfaces as ProviderError).
+    const parsed = std.json.parseFromSlice(std.json.Value, a, json, .{}) catch |err| {
+        std.debug.print("INVALID tools_json: {s}\n{s}\n", .{ @errorName(err), json });
+        return err;
+    };
+    defer parsed.deinit();
 }
 
 test "ToolApproval enum" {

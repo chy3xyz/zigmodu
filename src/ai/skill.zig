@@ -203,7 +203,7 @@ pub const SkillRegistry = struct {
                     try buf.print(allocator, "\"{s}\"", .{p.name});
                 }
             }
-            try buf.appendSlice(allocator, "]}}}}");
+            try buf.appendSlice(allocator, "]}}}");
         }
         try buf.append(allocator, ']');
         return try buf.toOwnedSlice(allocator);
