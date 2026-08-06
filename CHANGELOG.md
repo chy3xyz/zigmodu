@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **CircuitBreaker 上下文感知调用**: `callWithContext(ctx, operation)` —
+  熔断有状态调用（如 `*AiProvider`），补上"函数指针无法捕获调用方状态"
+  的缺口；`call` 保持兼容。含上下文透传/失败/trip 测试。
+
 ## [0.15.14] - 2026-08-06
 
 ### Added

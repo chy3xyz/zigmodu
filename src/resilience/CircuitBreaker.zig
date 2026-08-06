@@ -80,8 +80,29 @@ pub const CircuitBreaker = struct {
             return .circuit_open;
         }
 
-        // [...]
         operation() catch |err| {
+            self.onFailure();
+            return .{ .failure = err };
+        };
+
+        self.onSuccess();
+        return .success;
+    }
+
+    /// Context-aware variant of `call`: the operation receives `ctx` (e.g. a
+    /// `*AiProvider`), enabling circuit-breaking of stateful calls that plain
+    /// function pointers cannot capture. Same state machine as `call`.
+    pub fn callWithContext(self: *Self, ctx: ?*anyopaque, operation: *const fn (?*anyopaque) anyerror!void) Result {
+        if (!self.canAccept()) {
+            switch (self.state) {
+                .OPEN => std.log.warn("Circuit breaker '{s}' is OPEN, rejecting call", .{self.name}),
+                .HALF_OPEN => std.log.warn("Circuit breaker '{s}' HALF_OPEN limit reached", .{self.name}),
+                .CLOSED => unreachable,
+            }
+            return .circuit_open;
+        }
+
+        operation(ctx) catch |err| {
             self.onFailure();
             return .{ .failure = err };
         };
@@ -302,7 +323,7 @@ test "CircuitBreaker state transitions" {
 test "CircuitBreakerRegistry" {
     const allocator = std.testing.allocator;
     var registry = CircuitBreakerRegistry.init(allocator, .{
-        .failure_threshold = 2,
+        .failure_threshold = 1,
         .success_threshold = 1,
         .timeout_seconds = 1,
         .half_open_max_calls = 3,
@@ -339,4 +360,46 @@ test "CircuitBreaker OPEN to HALF_OPEN via timeout" {
     // Reset to CLOSED
     cb.reset();
     try std.testing.expectEqual(CircuitBreaker.State.CLOSED, cb.state);
+}
+
+test "CircuitBreaker callWithContext passes context and tracks failures" {
+    const allocator = std.testing.allocator;
+    var cb = try CircuitBreaker.init(allocator, "ctx-test", .{
+        .failure_threshold = 1,
+        .success_threshold = 1,
+        .timeout_seconds = 60,
+        .half_open_max_calls = 5,
+    });
+    defer cb.deinit();
+
+    const Ctx = struct {
+        var calls: usize = 0;
+        var provider_id: i64 = 0;
+    };
+
+    // Context arrives at the operation (e.g. *AiProvider) — success path.
+    const ok_op = struct {
+        fn op(c: ?*anyopaque) anyerror!void {
+            const p: *i64 = @ptrCast(@alignCast(c.?));
+            Ctx.calls += 1;
+            Ctx.provider_id = p.*;
+        }
+    }.op;
+    var pid: i64 = 42;
+    try std.testing.expectEqual(CircuitBreaker.Result.success, cb.callWithContext(&pid, ok_op));
+    try std.testing.expectEqual(@as(i64, 42), Ctx.provider_id);
+
+    // Failure path records and trips the breaker.
+    const fail_op = struct {
+        fn op(_: ?*anyopaque) anyerror!void {
+            return error.UpstreamDown;
+        }
+    }.op;
+    const fr = cb.callWithContext(&pid, fail_op);
+    switch (fr) {
+        .failure => {},
+        else => return error.TestFail,
+    }
+    // Breaker tripped after the failure.
+    try std.testing.expectEqual(CircuitBreaker.Result.circuit_open, cb.callWithContext(&pid, ok_op));
 }
