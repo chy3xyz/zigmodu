@@ -35,36 +35,36 @@ pub const AiProvider = struct {
     };
 
     pub const Metrics = struct {
-        total_requests: usize = 0,
-        total_prompt_tokens: usize = 0,
-        total_completion_tokens: usize = 0,
-        cache_hit_tokens: usize = 0,
-        cache_miss_tokens: usize = 0,
-        rate_limited_count: usize = 0,
-        error_count: usize = 0,
-        tool_call_responses: usize = 0,
+        total_requests: std.atomic.Value(usize) = .init(0),
+        total_prompt_tokens: std.atomic.Value(usize) = .init(0),
+        total_completion_tokens: std.atomic.Value(usize) = .init(0),
+        cache_hit_tokens: std.atomic.Value(usize) = .init(0),
+        cache_miss_tokens: std.atomic.Value(usize) = .init(0),
+        rate_limited_count: std.atomic.Value(usize) = .init(0),
+        error_count: std.atomic.Value(usize) = .init(0),
+        tool_call_responses: std.atomic.Value(usize) = .init(0),
 
         pub fn toPrometheusFormat(self: Metrics, allocator: std.mem.Allocator, name: []const u8) ![]u8 {
             var buf: std.ArrayList(u8) = .empty;
             errdefer buf.deinit(allocator);
             try buf.print(allocator, "# HELP zigmodu_ai_provider_requests_total Chat completion requests.\n", .{});
             try buf.print(allocator, "# TYPE zigmodu_ai_provider_requests_total counter\n", .{});
-            try buf.print(allocator, "zigmodu_ai_provider_requests_total{{provider=\"{s}\"}} {d}\n", .{ name, self.total_requests });
+            try buf.print(allocator, "zigmodu_ai_provider_requests_total{{provider=\"{s}\"}} {d}\n", .{ name, self.total_requests.load(.monotonic) });
             try buf.print(allocator, "# HELP zigmodu_ai_provider_prompt_tokens_total Prompt tokens.\n", .{});
             try buf.print(allocator, "# TYPE zigmodu_ai_provider_prompt_tokens_total counter\n", .{});
-            try buf.print(allocator, "zigmodu_ai_provider_prompt_tokens_total{{provider=\"{s}\"}} {d}\n", .{ name, self.total_prompt_tokens });
+            try buf.print(allocator, "zigmodu_ai_provider_prompt_tokens_total{{provider=\"{s}\"}} {d}\n", .{ name, self.total_prompt_tokens.load(.monotonic) });
             try buf.print(allocator, "# HELP zigmodu_ai_provider_completion_tokens_total Completion tokens.\n", .{});
             try buf.print(allocator, "# TYPE zigmodu_ai_provider_completion_tokens_total counter\n", .{});
-            try buf.print(allocator, "zigmodu_ai_provider_completion_tokens_total{{provider=\"{s}\"}} {d}\n", .{ name, self.total_completion_tokens });
+            try buf.print(allocator, "zigmodu_ai_provider_completion_tokens_total{{provider=\"{s}\"}} {d}\n", .{ name, self.total_completion_tokens.load(.monotonic) });
             try buf.print(allocator, "# HELP zigmodu_ai_provider_errors_total Provider errors.\n", .{});
             try buf.print(allocator, "# TYPE zigmodu_ai_provider_errors_total counter\n", .{});
-            try buf.print(allocator, "zigmodu_ai_provider_errors_total{{provider=\"{s}\"}} {d}\n", .{ name, self.error_count });
+            try buf.print(allocator, "zigmodu_ai_provider_errors_total{{provider=\"{s}\"}} {d}\n", .{ name, self.error_count.load(.monotonic) });
             try buf.print(allocator, "# HELP zigmodu_ai_provider_rate_limited_total Rate limit rejections.\n", .{});
             try buf.print(allocator, "# TYPE zigmodu_ai_provider_rate_limited_total counter\n", .{});
-            try buf.print(allocator, "zigmodu_ai_provider_rate_limited_total{{provider=\"{s}\"}} {d}\n", .{ name, self.rate_limited_count });
+            try buf.print(allocator, "zigmodu_ai_provider_rate_limited_total{{provider=\"{s}\"}} {d}\n", .{ name, self.rate_limited_count.load(.monotonic) });
             try buf.print(allocator, "# HELP zigmodu_ai_provider_tool_call_responses_total Responses containing tool_calls.\n", .{});
             try buf.print(allocator, "# TYPE zigmodu_ai_provider_tool_call_responses_total counter\n", .{});
-            try buf.print(allocator, "zigmodu_ai_provider_tool_call_responses_total{{provider=\"{s}\"}} {d}\n", .{ name, self.tool_call_responses });
+            try buf.print(allocator, "zigmodu_ai_provider_tool_call_responses_total{{provider=\"{s}\"}} {d}\n", .{ name, self.tool_call_responses.load(.monotonic) });
             return try buf.toOwnedSlice(allocator);
         }
     };
@@ -210,7 +210,7 @@ pub const AiProvider = struct {
             rl.mutex.lock(rl.io) catch return error.RateLimitLockFailed;
             defer rl.mutex.unlock(rl.io);
             if (!rl.limiter.tryAcquire()) {
-                self.metrics.rate_limited_count += 1;
+                _ = self.metrics.rate_limited_count.fetchAdd(1, .monotonic);
                 return error.RateLimited;
             }
         }
@@ -235,16 +235,16 @@ pub const AiProvider = struct {
             try req.setBody(body);
 
             var http_resp = self.http.request(req) catch |err| {
-                self.metrics.error_count += 1;
+                _ = self.metrics.error_count.fetchAdd(1, .monotonic);
                 if (self.key_pool != null) self.reportError(.network);
                 return mapProviderTransportError(err);
             };
             defer http_resp.deinit();
 
-            self.metrics.total_requests += 1;
+            _ = self.metrics.total_requests.fetchAdd(1, .monotonic);
 
             if (!http_resp.isSuccess()) {
-                self.metrics.error_count += 1;
+                _ = self.metrics.error_count.fetchAdd(1, .monotonic);
                 const kind = key_pool.KeyErrorKind.fromHttpStatus(http_resp.status_code);
                 if (self.key_pool) |pool| {
                     const pio = self.pool_io orelse return mapHttpStatus(http_resp.status_code);
@@ -261,7 +261,7 @@ pub const AiProvider = struct {
             }
 
             const parsed = try self.parseResponse(http_resp.body);
-            if (parsed.tool_calls.len > 0) self.metrics.tool_call_responses += 1;
+            if (parsed.tool_calls.len > 0) _ = self.metrics.tool_call_responses.fetchAdd(1, .monotonic);
             return parsed;
         }
     }
@@ -279,7 +279,7 @@ pub const AiProvider = struct {
             rl.mutex.lock(rl.io) catch return error.RateLimitLockFailed;
             defer rl.mutex.unlock(rl.io);
             if (!rl.limiter.tryAcquire()) {
-                self.metrics.rate_limited_count += 1;
+                _ = self.metrics.rate_limited_count.fetchAdd(1, .monotonic);
                 return error.RateLimited;
             }
         }
@@ -323,9 +323,9 @@ pub const AiProvider = struct {
         };
         defer http_resp.deinit();
 
-        self.metrics.total_requests += 1;
+        _ = self.metrics.total_requests.fetchAdd(1, .monotonic);
         if (!http_resp.isSuccess()) {
-            self.metrics.error_count += 1;
+            _ = self.metrics.error_count.fetchAdd(1, .monotonic);
             if (self.key_pool) |pool| {
                 if (self.pool_io) |pio| {
                     if (self.key_index) |idx| {
@@ -348,7 +348,7 @@ pub const AiProvider = struct {
         const model = try self.allocator.dupe(u8, acc.model.items);
         errdefer self.allocator.free(model);
         const tool_calls = try acc.takeToolCalls(self.allocator);
-        if (tool_calls.len > 0) self.metrics.tool_call_responses += 1;
+        if (tool_calls.len > 0) _ = self.metrics.tool_call_responses.fetchAdd(1, .monotonic);
         return .{
             .content = content,
             .reasoning_content = reasoning,
@@ -523,10 +523,10 @@ pub const AiProvider = struct {
             defer parsed.deinit();
             if (parsed.value == .object) {
                 try self.fillFromJson(&resp, parsed.value.object);
-                self.metrics.total_prompt_tokens += resp.prompt_tokens;
-                self.metrics.total_completion_tokens += resp.completion_tokens;
-                self.metrics.cache_hit_tokens += resp.cache_hit_tokens;
-                self.metrics.cache_miss_tokens += resp.cache_miss_tokens;
+                _ = self.metrics.total_prompt_tokens.fetchAdd(resp.prompt_tokens, .monotonic);
+                _ = self.metrics.total_completion_tokens.fetchAdd(resp.completion_tokens, .monotonic);
+                _ = self.metrics.cache_hit_tokens.fetchAdd(resp.cache_hit_tokens, .monotonic);
+                _ = self.metrics.cache_miss_tokens.fetchAdd(resp.cache_miss_tokens, .monotonic);
                 return resp;
             }
         } else |err| {
@@ -551,10 +551,10 @@ pub const AiProvider = struct {
         resp.cache_hit_tokens = extractIntField(body, "\"prompt_cache_hit_tokens\":") orelse 0;
         resp.cache_miss_tokens = extractIntField(body, "\"prompt_cache_miss_tokens\":") orelse 0;
 
-        self.metrics.total_prompt_tokens += resp.prompt_tokens;
-        self.metrics.total_completion_tokens += resp.completion_tokens;
-        self.metrics.cache_hit_tokens += resp.cache_hit_tokens;
-        self.metrics.cache_miss_tokens += resp.cache_miss_tokens;
+        _ = self.metrics.total_prompt_tokens.fetchAdd(resp.prompt_tokens, .monotonic);
+        _ = self.metrics.total_completion_tokens.fetchAdd(resp.completion_tokens, .monotonic);
+        _ = self.metrics.cache_hit_tokens.fetchAdd(resp.cache_hit_tokens, .monotonic);
+        _ = self.metrics.cache_miss_tokens.fetchAdd(resp.cache_miss_tokens, .monotonic);
         return resp;
     }
 
@@ -703,9 +703,9 @@ pub const AiProvider = struct {
     }
 
     pub fn cacheHitRatio(self: *AiProvider) f64 {
-        const total = self.metrics.cache_hit_tokens + self.metrics.cache_miss_tokens;
+        const total = self.metrics.cache_hit_tokens.load(.monotonic) + self.metrics.cache_miss_tokens.load(.monotonic);
         if (total == 0) return 0;
-        return @as(f64, @floatFromInt(self.metrics.cache_hit_tokens)) / @as(f64, @floatFromInt(total));
+        return @as(f64, @floatFromInt(self.metrics.cache_hit_tokens.load(.monotonic))) / @as(f64, @floatFromInt(total));
     }
 };
 
@@ -1202,15 +1202,15 @@ test "AiProvider cacheHitRatio" {
     var http = http_client.HttpClient.init(a, std.testing.io, 1, 5000);
     defer http.deinit();
     var p = AiProvider.init(a, &http, "https://api.test/v1", "sk-xxx", "deepseek-v4-flash");
-    p.metrics.cache_hit_tokens = 80;
-    p.metrics.cache_miss_tokens = 20;
+    p.metrics.cache_hit_tokens.store(80, .monotonic);
+    p.metrics.cache_miss_tokens.store(20, .monotonic);
     const ratio = p.cacheHitRatio();
     try std.testing.expect(ratio >= 0.79 and ratio <= 0.81);
 }
 
 test "AiProvider metrics toPrometheusFormat" {
     const a = std.testing.allocator;
-    var m = AiProvider.Metrics{ .total_requests = 3, .total_prompt_tokens = 10, .error_count = 1 };
+    var m = AiProvider.Metrics{ .total_requests = .init(3), .total_prompt_tokens = .init(10), .error_count = .init(1) };
     const out = try m.toPrometheusFormat(a, "main");
     defer a.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "zigmodu_ai_provider_requests_total") != null);

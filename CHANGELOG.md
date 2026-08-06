@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Metrics 原子化**: `AiProvider.Metrics` 与 `AgentMetrics` 全字段改
+  `std.atomic.Value(usize)`（threaded io 多 fiber 并发计数不再丢更新）。
+- **audit b18 伪事务拦截**: `beginTx()` 后同函数仍用池连接 `client/backend
+  exec` 静态报错——事务内读写必须走 tx 句柄（`tx.exec`/`execTx`），否则
+  rollback 无效（自动提交）。
+- **`RateLimiterRegistry` barrel 导出**（此前漏导出）。
+
+### Changed
+- **Lifecycle 文档统一**: QUICK-START/API.md 主 API 改为
+  `Application.start/stop`，`startAll/stopAll` 标注为底层 Lifecycle。
+
 ## [0.15.11] - 2026-08-06
 
 ### Fixed

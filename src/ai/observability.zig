@@ -45,7 +45,7 @@ pub const AiMetrics = struct {
 test "AiMetrics merges workflow, agent and quota series" {
     const allocator = std.testing.allocator;
     var wf = WorkflowMetrics{ .runs = 3, .completed_steps = 7 };
-    var agent = AgentMetrics{ .runs = 2, .steps = 5 };
+    var agent = AgentMetrics{ .runs = .init(2), .steps = .init(5) };
     var quota = TokenQuota.init(allocator, std.testing.io, 100);
     defer quota.deinit();
     try quota.record(1, 30, 30);

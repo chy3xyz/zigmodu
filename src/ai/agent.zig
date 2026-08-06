@@ -86,42 +86,42 @@ const DeltaBridge = struct {
 };
 
 pub const AgentMetrics = struct {
-    runs: usize = 0,
-    steps: usize = 0,
-    tool_calls: usize = 0,
-    tool_errors: usize = 0,
-    tool_denied: usize = 0,
-    max_steps_hits: usize = 0,
-    budget_exhausted: usize = 0,
-    canceled: usize = 0,
+    runs: std.atomic.Value(usize) = .init(0),
+    steps: std.atomic.Value(usize) = .init(0),
+    tool_calls: std.atomic.Value(usize) = .init(0),
+    tool_errors: std.atomic.Value(usize) = .init(0),
+    tool_denied: std.atomic.Value(usize) = .init(0),
+    max_steps_hits: std.atomic.Value(usize) = .init(0),
+    budget_exhausted: std.atomic.Value(usize) = .init(0),
+    canceled: std.atomic.Value(usize) = .init(0),
 
     pub fn toPrometheusFormat(self: AgentMetrics, allocator: std.mem.Allocator, name: []const u8) ![]u8 {
         var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(allocator);
         try buf.print(allocator, "# HELP zigmodu_ai_agent_runs_total Agent run invocations.\n", .{});
         try buf.print(allocator, "# TYPE zigmodu_ai_agent_runs_total counter\n", .{});
-        try buf.print(allocator, "zigmodu_ai_agent_runs_total{{agent=\"{s}\"}} {d}\n", .{ name, self.runs });
+        try buf.print(allocator, "zigmodu_ai_agent_runs_total{{agent=\"{s}\"}} {d}\n", .{ name, self.runs.load(.monotonic) });
         try buf.print(allocator, "# HELP zigmodu_ai_agent_steps_total LLM steps executed.\n", .{});
         try buf.print(allocator, "# TYPE zigmodu_ai_agent_steps_total counter\n", .{});
-        try buf.print(allocator, "zigmodu_ai_agent_steps_total{{agent=\"{s}\"}} {d}\n", .{ name, self.steps });
+        try buf.print(allocator, "zigmodu_ai_agent_steps_total{{agent=\"{s}\"}} {d}\n", .{ name, self.steps.load(.monotonic) });
         try buf.print(allocator, "# HELP zigmodu_ai_agent_tool_calls_total Tool dispatches.\n", .{});
         try buf.print(allocator, "# TYPE zigmodu_ai_agent_tool_calls_total counter\n", .{});
-        try buf.print(allocator, "zigmodu_ai_agent_tool_calls_total{{agent=\"{s}\"}} {d}\n", .{ name, self.tool_calls });
+        try buf.print(allocator, "zigmodu_ai_agent_tool_calls_total{{agent=\"{s}\"}} {d}\n", .{ name, self.tool_calls.load(.monotonic) });
         try buf.print(allocator, "# HELP zigmodu_ai_agent_tool_errors_total Tool dispatch failures.\n", .{});
         try buf.print(allocator, "# TYPE zigmodu_ai_agent_tool_errors_total counter\n", .{});
-        try buf.print(allocator, "zigmodu_ai_agent_tool_errors_total{{agent=\"{s}\"}} {d}\n", .{ name, self.tool_errors });
+        try buf.print(allocator, "zigmodu_ai_agent_tool_errors_total{{agent=\"{s}\"}} {d}\n", .{ name, self.tool_errors.load(.monotonic) });
         try buf.print(allocator, "# HELP zigmodu_ai_agent_tool_denied_total Tools denied by approval gate.\n", .{});
         try buf.print(allocator, "# TYPE zigmodu_ai_agent_tool_denied_total counter\n", .{});
-        try buf.print(allocator, "zigmodu_ai_agent_tool_denied_total{{agent=\"{s}\"}} {d}\n", .{ name, self.tool_denied });
+        try buf.print(allocator, "zigmodu_ai_agent_tool_denied_total{{agent=\"{s}\"}} {d}\n", .{ name, self.tool_denied.load(.monotonic) });
         try buf.print(allocator, "# HELP zigmodu_ai_agent_max_steps_hits_total Runs stopped by max_steps.\n", .{});
         try buf.print(allocator, "# TYPE zigmodu_ai_agent_max_steps_hits_total counter\n", .{});
-        try buf.print(allocator, "zigmodu_ai_agent_max_steps_hits_total{{agent=\"{s}\"}} {d}\n", .{ name, self.max_steps_hits });
+        try buf.print(allocator, "zigmodu_ai_agent_max_steps_hits_total{{agent=\"{s}\"}} {d}\n", .{ name, self.max_steps_hits.load(.monotonic) });
         try buf.print(allocator, "# HELP zigmodu_ai_agent_budget_exhausted_total Runs stopped by budget exhaustion.\n", .{});
         try buf.print(allocator, "# TYPE zigmodu_ai_agent_budget_exhausted_total counter\n", .{});
-        try buf.print(allocator, "zigmodu_ai_agent_budget_exhausted_total{{agent=\"{s}\"}} {d}\n", .{ name, self.budget_exhausted });
+        try buf.print(allocator, "zigmodu_ai_agent_budget_exhausted_total{{agent=\"{s}\"}} {d}\n", .{ name, self.budget_exhausted.load(.monotonic) });
         try buf.print(allocator, "# HELP zigmodu_ai_agent_canceled_total Runs canceled via AgentHandle.\n", .{});
         try buf.print(allocator, "# TYPE zigmodu_ai_agent_canceled_total counter\n", .{});
-        try buf.print(allocator, "zigmodu_ai_agent_canceled_total{{agent=\"{s}\"}} {d}\n", .{ name, self.canceled });
+        try buf.print(allocator, "zigmodu_ai_agent_canceled_total{{agent=\"{s}\"}} {d}\n", .{ name, self.canceled.load(.monotonic) });
         return try buf.toOwnedSlice(allocator);
     }
 };
@@ -161,7 +161,7 @@ pub const Agent = struct {
         max_steps: usize,
     ) !AgentResult {
         if (max_steps == 0) return error.InvalidMaxSteps;
-        self.metrics.runs += 1;
+        _ = self.metrics.runs.fetchAdd(1, .monotonic);
         if (self.audit) |log| {
             log.record(.run_start, "", goal, skill_ctx.tenant_id orelse 0, skill_ctx.user_id orelse 0);
         }
@@ -222,7 +222,7 @@ pub const Agent = struct {
         while (steps < max_steps) : (steps += 1) {
             if (self.handle) |h| {
                 if (h.isCanceled()) {
-                    self.metrics.canceled += 1;
+                    _ = self.metrics.canceled.fetchAdd(1, .monotonic);
                     canceled_stopped = true;
                     break;
                 }
@@ -241,7 +241,7 @@ pub const Agent = struct {
                 if (!b.tryConsume(est)) {
                     switch (b.mode) {
                         .stop => {
-                            self.metrics.budget_exhausted += 1;
+                            _ = self.metrics.budget_exhausted.fetchAdd(1, .monotonic);
                             budget_stopped = true;
                             break;
                         },
@@ -259,7 +259,7 @@ pub const Agent = struct {
                 try q.record(skill_ctx.tenant_id orelse 0, resp.prompt_tokens, resp.completion_tokens);
             }
 
-            self.metrics.steps += 1;
+            _ = self.metrics.steps.fetchAdd(1, .monotonic);
             if (self.hooks.on_step) |cb| cb(self.hooks.ctx, steps + 1, resp.tool_calls.len);
 
             if (resp.tool_calls.len == 0) {
@@ -313,11 +313,11 @@ pub const Agent = struct {
             });
 
             for (tc_copy) |tc| {
-                self.metrics.tool_calls += 1;
+                _ = self.metrics.tool_calls.fetchAdd(1, .monotonic);
 
                 if (self.hooks.on_tool_request) |cb| {
                     if (cb(self.hooks.ctx, tc.name, tc.arguments) == .deny) {
-                        self.metrics.tool_denied += 1;
+                        _ = self.metrics.tool_denied.fetchAdd(1, .monotonic);
                         if (self.hooks.on_tool) |tcb| tcb(self.hooks.ctx, tc.name, false);
                         if (self.audit) |log| {
                             log.record(.tool_denied, tc.name, "denied", skill_ctx.tenant_id orelse 0, skill_ctx.user_id orelse 0);
@@ -354,7 +354,7 @@ pub const Agent = struct {
                     .allowlist = self.allowlist,
                     .timeout_ms = self.tool_timeout_ms,
                 }) catch |err| {
-                    self.metrics.tool_errors += 1;
+                    _ = self.metrics.tool_errors.fetchAdd(1, .monotonic);
                     if (self.hooks.on_tool) |cb| cb(self.hooks.ctx, tc.name, false);
                     if (self.audit) |log| {
                         log.record(.tool_err, tc.name, @errorName(err), skill_ctx.tenant_id orelse 0, skill_ctx.user_id orelse 0);
@@ -388,7 +388,7 @@ pub const Agent = struct {
             }
         }
 
-        self.metrics.max_steps_hits += 1;
+        _ = self.metrics.max_steps_hits.fetchAdd(1, .monotonic);
         if (self.hooks.on_finish) |cb| cb(self.hooks.ctx, steps, true);
         if (self.audit) |log| {
             log.record(.run_max_steps, "", "max_steps exceeded", skill_ctx.tenant_id orelse 0, skill_ctx.user_id orelse 0);
@@ -553,7 +553,7 @@ test "Agent.run executes a full tool-call loop against a mock provider" {
     // Actual model from the response surfaces too.
     try std.testing.expectEqualStrings("mock-model", result.model);
     try std.testing.expectEqual(@as(usize, 1), State.pinged);
-    try std.testing.expectEqual(@as(usize, 1), agent.metrics.tool_calls);
+    try std.testing.expectEqual(@as(usize, 1), agent.metrics.tool_calls.load(.monotonic));
     try std.testing.expect(hooks_calls >= 1);
 }
 
@@ -705,7 +705,7 @@ test "Agent.run stops early when the budget is exhausted" {
     var result = try agent.run(allocator, "q", &sctx, 8);
     defer result.deinit(allocator);
     try std.testing.expect(result.budget_exhausted);
-    try std.testing.expectEqual(@as(usize, 1), agent.metrics.budget_exhausted);
+    try std.testing.expectEqual(@as(usize, 1), agent.metrics.budget_exhausted.load(.monotonic));
 }
 
 test "Agent.run stops when a cancel is requested mid-run" {
@@ -761,7 +761,7 @@ test "Agent.run stops when a cancel is requested mid-run" {
     var result = try agent.run(allocator, "q", &sctx, 8);
     defer result.deinit(allocator);
     try std.testing.expect(result.canceled);
-    try std.testing.expectEqual(@as(usize, 1), agent.metrics.canceled);
+    try std.testing.expectEqual(@as(usize, 1), agent.metrics.canceled.load(.monotonic));
 }
 
 test "SkillRegistry tools json for agent" {
