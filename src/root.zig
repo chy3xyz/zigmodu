@@ -72,6 +72,7 @@ pub const observability = @import("observability.zig");
 // ============================================================
 pub const CircuitBreaker = @import("resilience/CircuitBreaker.zig").CircuitBreaker;
 pub const RateLimiter = @import("resilience/RateLimiter.zig").RateLimiter;
+pub const RateLimiterRegistry = @import("resilience/RateLimiter.zig").RateLimiterRegistry;
 pub const Bulkhead = @import("resilience/Bulkhead.zig").Bulkhead;
 pub const BulkheadRegistry = @import("resilience/Bulkhead.zig").BulkheadRegistry;
 pub const retry = @import("resilience/Retry.zig");
