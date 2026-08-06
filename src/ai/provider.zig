@@ -44,6 +44,34 @@ pub const AiProvider = struct {
         error_count: std.atomic.Value(usize) = .init(0),
         tool_call_responses: std.atomic.Value(usize) = .init(0),
 
+        /// Plain-field snapshot for external readers — avoids touching atomic
+        /// `.load()` per field (and the `{d}` compile error when a Value is
+        /// passed to a formatter directly).
+        pub fn toStats(self: Metrics) Stats {
+            return .{
+                .total_requests = self.total_requests.load(.monotonic),
+                .total_prompt_tokens = self.total_prompt_tokens.load(.monotonic),
+                .total_completion_tokens = self.total_completion_tokens.load(.monotonic),
+                .cache_hit_tokens = self.cache_hit_tokens.load(.monotonic),
+                .cache_miss_tokens = self.cache_miss_tokens.load(.monotonic),
+                .rate_limited_count = self.rate_limited_count.load(.monotonic),
+                .error_count = self.error_count.load(.monotonic),
+                .tool_call_responses = self.tool_call_responses.load(.monotonic),
+            };
+        }
+
+        /// Non-atomic mirror of `Metrics` for external readers / logging.
+        pub const Stats = struct {
+            total_requests: usize = 0,
+            total_prompt_tokens: usize = 0,
+            total_completion_tokens: usize = 0,
+            cache_hit_tokens: usize = 0,
+            cache_miss_tokens: usize = 0,
+            rate_limited_count: usize = 0,
+            error_count: usize = 0,
+            tool_call_responses: usize = 0,
+        };
+
         pub fn toPrometheusFormat(self: Metrics, allocator: std.mem.Allocator, name: []const u8) ![]u8 {
             var buf: std.ArrayList(u8) = .empty;
             errdefer buf.deinit(allocator);

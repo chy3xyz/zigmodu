@@ -95,6 +95,33 @@ pub const AgentMetrics = struct {
     budget_exhausted: std.atomic.Value(usize) = .init(0),
     canceled: std.atomic.Value(usize) = .init(0),
 
+    /// Plain-field snapshot for external readers (avoids per-field `.load()`
+    /// and the `{d}`-on-Value compile error).
+    pub fn toStats(self: AgentMetrics) Stats {
+        return .{
+            .runs = self.runs.load(.monotonic),
+            .steps = self.steps.load(.monotonic),
+            .tool_calls = self.tool_calls.load(.monotonic),
+            .tool_errors = self.tool_errors.load(.monotonic),
+            .tool_denied = self.tool_denied.load(.monotonic),
+            .max_steps_hits = self.max_steps_hits.load(.monotonic),
+            .budget_exhausted = self.budget_exhausted.load(.monotonic),
+            .canceled = self.canceled.load(.monotonic),
+        };
+    }
+
+    /// Non-atomic mirror of `AgentMetrics` for external readers / logging.
+    pub const Stats = struct {
+        runs: usize = 0,
+        steps: usize = 0,
+        tool_calls: usize = 0,
+        tool_errors: usize = 0,
+        tool_denied: usize = 0,
+        max_steps_hits: usize = 0,
+        budget_exhausted: usize = 0,
+        canceled: usize = 0,
+    };
+
     pub fn toPrometheusFormat(self: AgentMetrics, allocator: std.mem.Allocator, name: []const u8) ![]u8 {
         var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(allocator);
