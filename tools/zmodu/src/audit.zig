@@ -635,6 +635,9 @@ fn lintFile(
 ) !void {
     var lines = std.mem.splitScalar(u8, content, '\n');
     var idx: usize = 1;
+    // Row count before this call — line-level exemption filtering below only
+    // touches violations this invocation produced.
+    const prior_count = violations.items.len;
     // Track an unused `catch |X|` capture to report `_ = X;` a few lines later.
     var pending_catch: ?[]const u8 = null;
     var pending_line: usize = 0;
@@ -824,7 +827,7 @@ fn lintFile(
 
         // b3 — non-parameterized SQL in persistence/service.
         if (std.mem.eql(u8, file_name, "persistence.zig") or std.mem.eql(u8, file_name, "service.zig")) {
-            if (looksLikeSql(line) and std.mem.indexOf(u8, line, "'") != null and !config.disabled.contains("b3")) {
+            if (looksLikeSql(line) and hasNonEmptyStringLiteral(line) and !config.disabled.contains("b3")) {
                 try pushViolation(violations, allocator, "b3", rel_path, idx, "SQL statement contains string literals — use ? placeholders with bound args", .{});
             }
         }
@@ -934,6 +937,42 @@ fn lintFile(
     }
     try flushMultiWrite(fn_open, fn_open_name, fn_open_line, fn_write_count, fn_tx_seen, rel_path, allocator, violations);
     try flushOwnedRow(qr_count, qr_fs_count, qr_return_count, qr_first_line, rel_path, allocator, violations);
+
+    // Line-level exemptions: a source line ending with `// audit: ignore`
+    // (all rules) or `// audit: ignore b13,b17` (specific rules) drops the
+    // violations reported for that exact line — the precise alternative to
+    // rule-level `--disable` (too broad) and baseline absorption (noisy).
+    // Only violations added by THIS call are considered (violations is shared
+    // across lintFile calls; a later content must not re-judge earlier rows).
+    var vi: usize = prior_count;
+    while (vi < violations.items.len) {
+        const v = &violations.items[vi];
+        if (lineHasIgnore(content, v.line, v.rule)) {
+            v.deinit(allocator);
+            _ = violations.orderedRemove(vi);
+        } else {
+            vi += 1;
+        }
+    }
+}
+
+/// True when the source `line_no` (1-based, in `content`) carries an
+/// `// audit: ignore` marker covering `rule` — bare marker ignores all rules.
+fn lineHasIgnore(content: []const u8, line_no: usize, rule: []const u8) bool {
+    var it = std.mem.splitScalar(u8, content, '\n');
+    var idx: usize = 1;
+    while (it.next()) |l| : (idx += 1) {
+        if (idx != line_no) continue;
+        const cpos = std.mem.indexOf(u8, l, "// audit: ignore") orelse return false;
+        const rest = std.mem.trim(u8, l[cpos + "// audit: ignore".len ..], " \t");
+        if (rest.len == 0) return true;
+        var rit = std.mem.tokenizeAny(u8, rest, ", \t");
+        while (rit.next()) |r| {
+            if (std.mem.eql(u8, r, rule)) return true;
+        }
+        return false;
+    }
+    return false;
 }
 
 fn flushMultiWrite(
@@ -1252,6 +1291,24 @@ fn looksLikeSql(line: []const u8) bool {
     var it = std.mem.splitScalar(u8, needle, '|');
     while (it.next()) |kw| {
         if (containsIgnoreCase(line, kw)) return true;
+    }
+    return false;
+}
+
+/// True when the line contains a **non-empty** string literal (`'…'` with
+/// content). Empty `''` — used for aliases/defaults like `'' as spec_sku_id`
+/// — is not an injection vector, so it doesn't trigger b3.
+fn hasNonEmptyStringLiteral(line: []const u8) bool {
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        if (line[i] != '\'') continue;
+        // `''` = empty literal (or an escaped quote inside one); either way
+        // the first quote has no content after it.
+        if (i + 1 < line.len and line[i + 1] == '\'') {
+            i += 1;
+            continue;
+        }
+        return true;
     }
     return false;
 }
@@ -1623,6 +1680,8 @@ test "audit business lint flags anti-patterns" {
     try lintFile(allocator, "api.zig", "const r = try client.queryRows(T, sql, args);\n", "src/modules/x/api.zig", &cfg, &violations);
     try lintFile(allocator, "model.zig", "const r = try client.queryRows(T, sql, args);\n", "src/modules/x/model.zig", &cfg, &violations);
     try lintFile(allocator, "persistence.zig", "SELECT * FROM users WHERE name = 'alice'\n", "src/modules/x/persistence.zig", &cfg, &violations);
+    // b3 negative — empty string literal (alias/default) is not an injection vector.
+    try lintFile(allocator, "persistence.zig", "SELECT '' AS spec_sku_id FROM skus WHERE id = ?\n", "src/modules/x/persistence.zig", &cfg, &violations);
     try lintFile(allocator, "service.zig", "const auth = @ptrCast(@alignCast(ctx.user_data));\n", "src/modules/x/service.zig", &cfg, &violations);
     try lintFile(allocator, "api.zig", "try sendFail(ctx, 500, \"x\");\n", "src/modules/x/api.zig", &cfg, &violations);
     try lintFile(allocator, "root.zig", "const z = @import(\"zigmodu.http_server\");\n", "src/modules/x/root.zig", &cfg, &violations);
@@ -1806,4 +1865,33 @@ test "audit rules config disables rules" {
     try lintFile(allocator, "api.zig", "const auth = @ptrCast(@alignCast(ctx.user_data));\n", "src/modules/x/api.zig", &cfg, &violations);
     try lintFile(allocator, "api.zig", "const auth = ctx.getHeader(\"Authorization\");\n", "src/modules/x/api.zig", &cfg, &violations);
     try std.testing.expectEqual(@as(usize, 0), violations.items.len);
+}
+
+test "audit line-level ignore comment suppresses that line's violations" {
+    const allocator = std.testing.allocator;
+    var cfg = RuleConfig{};
+    cfg.disabled = std.StringHashMap(void).init(allocator);
+    defer cfg.deinit(allocator);
+
+    var violations = std.ArrayList(Violation).empty;
+    defer {
+        for (violations.items) |*v| v.deinit(allocator);
+        violations.deinit(allocator);
+    }
+
+    // Line with `// audit: ignore b10` — the swallowed-error catch is exempt.
+    try lintFile(allocator, "service.zig", "client.exec(sql, &.{}) catch {}; // audit: ignore b10\n", "src/modules/x/service.zig", &cfg, &violations);
+    // Same pattern without the marker still reports.
+    try lintFile(allocator, "service.zig", "client.exec(sql, &.{}) catch {};\n", "src/modules/x/service.zig", &cfg, &violations);
+    // Bare `// audit: ignore` ignores every rule on that line.
+    try lintFile(allocator, "service.zig", "client.exec(sql, &.{}) catch {}; // audit: ignore\n", "src/modules/x/service.zig", &cfg, &violations);
+
+    var rules = std.StringHashMap(usize).init(allocator);
+    defer rules.deinit();
+    for (violations.items) |v| {
+        const gop = try rules.getOrPut(v.rule);
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), rules.get("b10").?);
 }
