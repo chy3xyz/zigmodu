@@ -208,6 +208,29 @@ pub const MigrationRunner = struct {
         });
     }
 
+    /// Record a migration as already applied **without executing it** — for
+    /// bootstrapping an existing database whose migrations were applied
+    /// manually (e.g. legacy `psql -f` runs). Requires the history table.
+    pub fn markApplied(self: *Self, client: anytype, version: i64) !void {
+        const ddl = self.generateHistoryTableDDL() catch return error.OutOfMemory;
+        defer self.allocator.free(ddl);
+        _ = client.exec(ddl, &.{}) catch return error.QueryExecutionFailed;
+
+        var description: []const u8 = "marked applied";
+        var checksum: []const u8 = "";
+        for (self.migrations.items) |m| {
+            if (m.version == version) {
+                description = m.description;
+                checksum = m.checksum orelse "";
+                break;
+            }
+        }
+        try self.insertHistoryRecord(client, version, description, checksum, 0, true);
+        // Reload from DB so the in-memory history reflects the bootstrap
+        // without double-counting (loadHistory replaces the snapshot).
+        try self.loadHistory(client);
+    }
+
     /// Get pending migration list
     pub fn getPendingMigrations(self: *Self, buf: []MigrationEntry) []MigrationEntry {
         var count: usize = 0;
@@ -296,6 +319,16 @@ pub const MigrationRunner = struct {
         // not re-run them (history is persisted, not just in-memory).
         try self.loadHistory(client);
 
+        // Fail fast on duplicate versions in the registered list: the second
+        // occurrence would otherwise be skipped as "already applied" after the
+        // first one executes, silently dropping a migration.
+        var seen = std.AutoHashMap(i64, void).init(self.allocator);
+        defer seen.deinit();
+        for (self.migrations.items) |migration| {
+            if (seen.contains(migration.version)) return error.DuplicateVersion;
+            try seen.put(migration.version, {});
+        }
+
         for (self.migrations.items) |migration| {
             // Skip already-applied migrations
             var already_applied = false;
@@ -345,6 +378,14 @@ pub const MigrationRunner = struct {
 
     /// Load applied migrations from the history table into `self.history`.
     pub fn loadHistory(self: *Self, client: anytype) !void {
+        // The DB history is the authoritative snapshot — replace, don't append
+        // (markApplied + run can both load). Free the previously loaded
+        // entries first (deinit only sees what remains after this).
+        for (self.history.items) |h| {
+            self.allocator.free(h.description);
+            self.allocator.free(h.checksum);
+        }
+        self.history.clearRetainingCapacity();
         const sql = try std.fmt.allocPrint(self.allocator, "SELECT version, description, applied_at, checksum, execution_time_ms, success FROM {s} ORDER BY version", .{self.history_table});
         defer self.allocator.free(sql);
         var result = try client.queryRows(AppliedMigration, sql, &.{});
@@ -726,4 +767,39 @@ test "splitSqlStatements dollar-tag and parameter placeholder" {
     try std.testing.expect(std.mem.indexOf(u8, stmts[0], "BEGIN EXECUTE 'x;y'; END;") != null);
     // $1 is a parameter placeholder, not a dollar-quote tag.
     try std.testing.expectEqualStrings("SELECT $1", stmts[1]);
+}
+
+test "MigrationRunner rejects duplicate versions" {
+    const allocator = std.testing.allocator;
+    const sqlx = @import("../sqlx/sqlx.zig");
+    var client = sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+
+    var runner = MigrationRunner.init(allocator);
+    defer runner.deinit();
+    try runner.addMigration(1, "a", "SELECT 1;");
+    try runner.addMigration(1, "b", "SELECT 2;"); // same version — must fail fast
+
+    try std.testing.expectError(error.DuplicateVersion, runner.run(&client));
+}
+
+test "MigrationRunner markApplied bootstraps existing migrations" {
+    const allocator = std.testing.allocator;
+    const sqlx = @import("../sqlx/sqlx.zig");
+    var client = sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+
+    var runner = MigrationRunner.init(allocator);
+    defer runner.deinit();
+    try runner.addMigration(20260101000000, "orders", "CREATE TABLE orders (id INTEGER PRIMARY KEY);");
+
+    // Mark as applied without executing; a subsequent run skips it.
+    try runner.markApplied(&client, 20260101000000);
+    try std.testing.expectEqual(@as(usize, 1), runner.getAppliedCount());
+    try runner.run(&client);
+    try std.testing.expectEqual(@as(usize, 1), runner.getAppliedCount());
+    var pending: [8]MigrationEntry = undefined;
+    try std.testing.expectEqual(@as(usize, 0), runner.getPendingMigrations(&pending).len);
 }
