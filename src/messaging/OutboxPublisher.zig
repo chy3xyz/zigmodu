@@ -181,6 +181,101 @@ pub const OutboxPublisher = struct {
             updated_at: i64,
         },
     };
+
+    /// Policy for explicitly resubmitting failed (DLQ) outbox entries —
+    /// mirrors Spring Modulith's `FailedEventPublications.resubmit()` +
+    /// staleness monitor: only entries matching the criteria move back to
+    /// `pending` and are picked up by the poller again.
+    pub const OutboxResubmitPolicy = struct {
+        /// Only resubmit entries whose final `retry_count` is <= this.
+        /// `null` = no limit (all failed entries).
+        max_attempts: ?u32 = null,
+        /// Only resubmit entries last updated at least this many seconds ago.
+        /// `null` = no time gate (resubmit immediately).
+        older_than_seconds: ?u64 = null,
+        /// Restrict to one tenant's entries. `null` = all tenants.
+        tenant_id: ?i64 = null,
+    };
+
+    /// Build the resubmit UPDATE: failed entries → pending with a fresh
+    /// retry budget. Caller executes it and can report rows_affected.
+    /// `now_ms` is the monotonic clock value used for the staleness gate.
+    pub fn buildResubmit(self: *Self, policy: OutboxResubmitPolicy, now_ms: i64) ![]const u8 {
+        var sql = std.ArrayList(u8).empty;
+        defer sql.deinit(self.allocator);
+        try sql.appendSlice(self.allocator, "UPDATE event_outbox SET status = 0, retry_count = 0, error_message = NULL, updated_at = ");
+        var num_buf: [24]u8 = undefined;
+        try sql.appendSlice(self.allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{@divTrunc(now_ms, 1000)}));
+        try sql.appendSlice(self.allocator, " WHERE status = 3");
+        if (policy.max_attempts) |m| {
+            try sql.appendSlice(self.allocator, " AND retry_count <= ");
+            try sql.appendSlice(self.allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{m}));
+        }
+        if (policy.older_than_seconds) |secs| {
+            try sql.appendSlice(self.allocator, " AND updated_at <= ");
+            try sql.appendSlice(self.allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{@divTrunc(now_ms, 1000) - @as(i64, @intCast(secs))}));
+        }
+        if (policy.tenant_id) |t| {
+            try sql.appendSlice(self.allocator, " AND tenant_id = ");
+            try sql.appendSlice(self.allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{t}));
+        }
+        return sql.toOwnedSlice(self.allocator);
+    }
+
+    /// External contract mapping: internal topic → stable external topic.
+    /// Mirrors Spring Modulith's `@Externalized("$target::$key")` — the
+    /// internal domain event name is replaced by the contract exposed to
+    /// downstream consumers, so topic renames don't break subscribers.
+    pub const ExternalTopicMapping = struct {
+        internal: []const u8,
+        external: []const u8,
+    };
+
+    /// Result of `externalize` — the insert plus ownership info so the
+    /// caller can free allocated topic/payload (the envelope is always
+    /// allocated; the topic only when remapped).
+    pub const ExternalizedInsert = struct {
+        insert: OutboxInsert,
+        topic_owned: bool = false,
+
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            if (self.topic_owned) allocator.free(self.insert.params.topic);
+            allocator.free(self.insert.params.payload); // envelope always owned
+        }
+    };
+
+    /// Apply externalization to a publish: map the internal topic to its
+    /// external contract and wrap the payload in a stable envelope
+    /// `{"event":"<external>","data":<payload>}`. Caller executes
+    /// `result.insert` inside the business transaction and calls
+    /// `result.deinit(allocator)` after binding.
+    pub fn externalize(
+        self: *Self,
+        topic: []const u8,
+        payload: []const u8,
+        tenant_id: ?i64,
+        mappings: []const ExternalTopicMapping,
+    ) !ExternalizedInsert {
+        var external_topic = topic;
+        for (mappings) |m| {
+            if (std.mem.eql(u8, m.internal, topic)) {
+                external_topic = m.external;
+                break;
+            }
+        }
+        const topic_owned = !std.mem.eql(u8, external_topic, topic);
+        var owned_topic: ?[]const u8 = null;
+        if (topic_owned) {
+            owned_topic = try self.allocator.dupe(u8, external_topic);
+            external_topic = owned_topic.?;
+        }
+        const envelope = try std.fmt.allocPrint(self.allocator, "{{\"event\":\"{s}\",\"data\":{s}}}", .{ external_topic, payload });
+        const insert = if (tenant_id) |t|
+            try self.buildInsertForTenant(external_topic, envelope, t)
+        else
+            try self.buildInsert(external_topic, envelope);
+        return .{ .insert = insert, .topic_owned = topic_owned };
+    }
 };
 
 /// OutboxPoller — background task that reads from outbox and publishes events.
@@ -348,6 +443,58 @@ test "OutboxPublisher migrationSql dialects" {
 
     const mysql = OutboxPublisher.migrationSqlWithDialect(.mysql);
     try std.testing.expectEqualStrings(OutboxPublisher.migrationSql(), mysql);
+}
+
+test "OutboxPublisher buildResubmit full reset" {
+    const allocator = std.testing.allocator;
+    var publisher = OutboxPublisher.init(allocator, .{});
+    const sql = try publisher.buildResubmit(.{}, 1_000_000);
+    defer allocator.free(sql);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "SET status = 0, retry_count = 0, error_message = NULL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "WHERE status = 3") != null);
+    // No policy → no extra WHERE clauses.
+    try std.testing.expect(std.mem.indexOf(u8, sql, "AND retry_count") == null);
+}
+
+test "OutboxPublisher buildResubmit honors policy" {
+    const allocator = std.testing.allocator;
+    var publisher = OutboxPublisher.init(allocator, .{});
+    const now_ms: i64 = 1_000_000;
+    const sql = try publisher.buildResubmit(.{
+        .max_attempts = 3,
+        .older_than_seconds = 60,
+        .tenant_id = 42,
+    }, now_ms);
+    defer allocator.free(sql);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "AND retry_count <= 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "AND updated_at <= 940") != null); // 1000 - 60
+    try std.testing.expect(std.mem.indexOf(u8, sql, "AND tenant_id = 42") != null);
+}
+
+test "OutboxPublisher externalize maps topic and wraps envelope" {
+    const allocator = std.testing.allocator;
+    var publisher = OutboxPublisher.init(allocator, .{});
+    const mappings = [_]OutboxPublisher.ExternalTopicMapping{
+        .{ .internal = "order.created", .external = "orders.created.v1" },
+    };
+    var ext = try publisher.externalize("order.created", "{\"id\":1}", 7, &mappings);
+    defer ext.deinit(allocator);
+    try std.testing.expectEqualStrings("orders.created.v1", ext.insert.params.topic);
+    try std.testing.expect(std.mem.indexOf(u8, ext.insert.params.payload, "{\"event\":\"orders.created.v1\",\"data\":{\"id\":1}}") != null);
+    try std.testing.expectEqual(@as(?i64, 7), ext.insert.params.tenant_id);
+    try std.testing.expect(ext.topic_owned);
+}
+
+test "OutboxPublisher externalize passthrough when unmapped" {
+    const allocator = std.testing.allocator;
+    var publisher = OutboxPublisher.init(allocator, .{});
+    const mappings = [_]OutboxPublisher.ExternalTopicMapping{
+        .{ .internal = "order.created", .external = "orders.created.v1" },
+    };
+    var ext = try publisher.externalize("other.event", "{\"x\":1}", null, &mappings);
+    defer ext.deinit(allocator);
+    try std.testing.expectEqualStrings("other.event", ext.insert.params.topic);
+    try std.testing.expect(!ext.topic_owned);
 }
 
 test "OutboxPoller build queries" {

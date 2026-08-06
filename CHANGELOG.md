@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Outbox 拆分出口治理**（对齐 Spring Modulith 决策记录）：
+  - `OutboxPublisher.buildResubmit(policy)` 显式重发 API——failed/DLQ 条目按
+    `max_attempts` / `older_than_seconds` / `tenant_id` 策略回 pending 重投
+    （对齐 `FailedEventPublications.resubmit()` + Staleness Monitor）。
+  - `OutboxPublisher.externalize(...)` 事件契约映射层——内部 topic →
+    对外稳定契约 + `{"event","data"}` 信封（对齐 `@Externalized`）。
+- **audit b17**：`collectModelStructs` 收集缩进局部 `const X = struct` 与
+  单行 struct——函数内局部标量行类型误报消除（22 处边界收口）。
+
+### Changed
+- **docs**：EVALUATION_REPORT v5.8（Agent 流式化/tools_json/Metrics 原子化等
+  实分重估）；BEST_PRACTICES 新增「Threaded Io 下同步阻塞」契约；
+  PRODUCTION_ROADMAP 新增 gRPC「一等公民≠近期投入」与「拆分出口=事件契约+
+  outbox」两条决策记录。
+
 ## [0.15.19] - 2026-08-07
 
 ### Changed

@@ -1182,8 +1182,7 @@ fn collectModelStructs(allocator: std.mem.Allocator, content: []const u8, out: *
                 gop.value_ptr.* = has_string;
                 pending_name = null;
             }
-        } else if (line.len > 0 and line[0] != ' ' and line[0] != '\t' and
-            std.mem.indexOf(u8, line, "const ") != null and
+        } else if (std.mem.indexOf(u8, line, "const ") != null and
             std.mem.indexOf(u8, line, "= struct") != null)
         {
             const p = std.mem.indexOf(u8, line, "const ") orelse continue;
@@ -1193,6 +1192,15 @@ fn collectModelStructs(allocator: std.mem.Allocator, content: []const u8, out: *
             if (!isIdent(name)) continue;
             pending_name = name;
             has_string = std.mem.indexOf(u8, line, "[]const u8") != null;
+            // Single-line struct (`const X = struct { … };`) — finalize now;
+            // the multi-line `};` terminator never appears on this line.
+            if (std.mem.indexOf(u8, line, "};") != null) {
+                const new_key = try allocator.dupe(u8, name);
+                const gop = try out.getOrPut(new_key);
+                if (gop.found_existing) allocator.free(new_key);
+                gop.value_ptr.* = has_string;
+                pending_name = null;
+            }
         }
     }
 }
@@ -1808,6 +1816,28 @@ test "audit business lint flags anti-patterns" {
     try std.testing.expectEqual(@as(usize, 1), rules.get("b18").?);
 }
 
+test "audit collectModelStructs picks up indented local const structs" {
+    const allocator = std.testing.allocator;
+    var symbols = std.StringHashMap(bool).init(allocator);
+    defer {
+        var kit = symbols.iterator();
+        while (kit.next()) |e| allocator.free(e.key_ptr.*);
+        symbols.deinit();
+    }
+    const content =
+        \\pub fn f() i64 {
+        \\    const CR = struct { cnt: i64 };
+        \\    const r = try db.queryRow(CR, "SELECT COUNT(*) AS cnt FROM t", &.{});
+        \\    return r.cnt;
+        \\}
+        \\const User = struct { name: []const u8 };
+    ;
+    try collectModelStructs(allocator, content, &symbols);
+    try std.testing.expectEqual(@as(usize, 2), symbols.count());
+    try std.testing.expect(!symbols.get("CR").?);
+    try std.testing.expect(symbols.get("User").?);
+}
+
 test "audit b17 honors named model symbol table" {
     const allocator = std.testing.allocator;
 
@@ -1878,8 +1908,9 @@ test "audit collectModelStructs builds symbol table" {
 
     try std.testing.expect(symbols.get("User").?); // has []const u8
     try std.testing.expect(!symbols.get("CartRow").?); // scalar
-    // fn-local (indented) structs are not collected.
-    try std.testing.expect(symbols.get("Local") == null);
+    // fn-local (indented) structs ARE collected now — b17 uses the table to
+    // skip named scalar row types declared inside service functions.
+    try std.testing.expect(symbols.get("Local").?);
     // Unclosed struct must not crash or leak the pending name.
     try std.testing.expect(symbols.get("Unclosed") == null);
 }
