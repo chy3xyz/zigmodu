@@ -40,18 +40,22 @@ if [ -z "$OLD" ]; then
     exit 1
 fi
 if [ "$OLD" = "$VERSION" ]; then
-    echo "FAIL: version already $VERSION"
-    exit 1
+    echo "release: $VERSION already current — idempotent re-run, skipping bump"
+    SKIP_BUMP=1
+else
+    echo "release: $OLD -> $VERSION"
+    SKIP_BUMP=0
 fi
-echo "release: $OLD -> $VERSION"
 
 # 1. Bump version in every reference.
+if [ "$SKIP_BUMP" != "1" ]; then
 perl -0pi -e "s/\.version = \"$OLD\"/.version = \"$VERSION\"/" build.zig.zon
 perl -0pi -e "s/\.version = \"$OLD\"/.version = \"$VERSION\"/" tools/zmodu/build.zig.zon
 perl -0pi -e "s/\"version\", \"$OLD\"/\"version\", \"$VERSION\"/" src/ai/mcp.zig
 perl -0pi -e "s/# ZigModu v$OLD/# ZigModu v$VERSION/" README.md README.zh.md
 perl -0pi -e "s/ZigModu \*\*v$OLD\*\*/ZigModu **v$VERSION**/" CLAUDE.md docs/AI_METHODOLOGY.md
 perl -0pi -e "s/\*\*v$OLD\*\*/**v$VERSION**/g" AGENTS.md
+fi
 
 # 2. CHANGELOG: promote Unreleased to the new version.
 if ! grep -q "^## \[Unreleased\]" CHANGELOG.md; then
