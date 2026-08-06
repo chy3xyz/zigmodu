@@ -27,16 +27,15 @@ pub const CorsConfig = struct {
 
 /// CORS middleware — config stored at module scope to avoid heap allocation.
 pub fn cors(config: CorsConfig) api.Middleware {
-    // Module-level storage: single allocation lived for server lifetime.
-    // Zig 0.16: avoid page_allocator.create/unreachable pattern.
-    const S = struct {
-        var stored: CorsConfig = .{};
-    };
-    S.stored = config;
+    // Per-instance configuration on `user_data` (allocated once, process
+    // lifetime): multiple Servers / registrations with different configs no
+    // longer overwrite each other via module-level statics.
+    const cfg = std.heap.page_allocator.create(CorsConfig) catch unreachable;
+    cfg.* = config;
     return .{
         .func = struct {
-            fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
-                const cfg: *const CorsConfig = &S.stored;
+            fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
+                const c: *const CorsConfig = @ptrCast(@alignCast(user_data.?));
                 // `header()` is case-insensitive (RFC 9110): request header keys are
                 // lowercased at parse time, so `ctx.headers.get("Origin")` would never
                 // match a browser's `Origin:` header and every origin would be treated
@@ -48,7 +47,7 @@ pub fn cors(config: CorsConfig) api.Middleware {
                 if (std.mem.eql(u8, origin, "")) {
                     origin_allowed = true; // Same-origin request
                 } else {
-                    for (cfg.allow_origins) |allowed| {
+                    for (c.allow_origins) |allowed| {
                         const matched = if (std.mem.eql(u8, allowed, "*")) true else if (std.mem.startsWith(u8, allowed, "*.")) std.mem.endsWith(u8, origin, allowed[1..]) else std.mem.eql(u8, allowed, origin);
                         if (matched) {
                             origin_allowed = true;
@@ -63,15 +62,15 @@ pub fn cors(config: CorsConfig) api.Middleware {
                     return;
                 }
 
-                if (cfg.allow_origins.len > 0 and !std.mem.eql(u8, cfg.allow_origins[0], "*")) {
+                if (c.allow_origins.len > 0 and !std.mem.eql(u8, c.allow_origins[0], "*")) {
                     try ctx.setHeader("Access-Control-Allow-Origin", origin);
                     try ctx.setHeader("Vary", "Origin");
-                } else if (cfg.allow_origins.len > 0) {
-                    try ctx.setHeader("Access-Control-Allow-Origin", cfg.allow_origins[0]);
+                } else if (c.allow_origins.len > 0) {
+                    try ctx.setHeader("Access-Control-Allow-Origin", c.allow_origins[0]);
                 }
-                try ctx.setHeader("Access-Control-Allow-Methods", cfg.allow_methods);
-                try ctx.setHeader("Access-Control-Allow-Headers", cfg.allow_headers);
-                const max_age_str = try std.fmt.allocPrint(ctx.allocator, "{d}", .{cfg.max_age});
+                try ctx.setHeader("Access-Control-Allow-Methods", c.allow_methods);
+                try ctx.setHeader("Access-Control-Allow-Headers", c.allow_headers);
+                const max_age_str = try std.fmt.allocPrint(ctx.allocator, "{d}", .{c.max_age});
                 defer ctx.allocator.free(max_age_str);
                 try ctx.setHeader("Access-Control-Max-Age", max_age_str);
                 if (ctx.method == .OPTIONS) {
@@ -82,6 +81,7 @@ pub fn cors(config: CorsConfig) api.Middleware {
                 try next(ctx);
             }
         }.mw,
+        .user_data = cfg,
     };
 }
 
@@ -181,36 +181,33 @@ pub fn recover() api.Middleware {
 /// token's own `exp` claim is checked) — it only matters for token GENERATION,
 /// so use `jwtAuthWithSecurity` / `AppSecurity` when you also issue tokens.
 pub fn jwtAuth(secret: []const u8) api.Middleware {
-    const SecretStore = struct {
-        var stored: []const u8 = "";
-    };
-    SecretStore.stored = secret;
+    const secret_copy = std.heap.page_allocator.create([]const u8) catch unreachable;
+    secret_copy.* = secret;
     return .{
         .func = struct {
-            fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
+            fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
+                const stored: []const u8 = @as(*const []const u8, @ptrCast(@alignCast(user_data.?))).*;
                 // Expiry 0: verification-only module, never generates tokens.
                 var sec = if (ctx.io) |io|
-                    SecurityModule.initWithIo(ctx.allocator, SecretStore.stored, 0, io)
+                    SecurityModule.initWithIo(ctx.allocator, stored, 0, io)
                 else
-                    SecurityModule.init(ctx.allocator, SecretStore.stored, 0);
+                    SecurityModule.init(ctx.allocator, stored, 0);
                 try verifyJwtAndNext(&sec, ctx, next);
             }
         }.mw,
+        .user_data = @ptrCast(secret_copy),
     };
 }
 
 /// JWT auth using a long-lived `SecurityModule` (prefer `initWithIo` in production).
 pub fn jwtAuthWithSecurity(security: *SecurityModule) api.Middleware {
-    const Store = struct {
-        var stored: *SecurityModule = undefined;
-    };
-    Store.stored = security;
     return .{
         .func = struct {
-            fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
-                try verifyJwtAndNext(Store.stored, ctx, next);
+            fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
+                try verifyJwtAndNext(@ptrCast(@alignCast(user_data.?)), ctx, next);
             }
         }.mw,
+        .user_data = security,
     };
 }
 
@@ -316,29 +313,30 @@ pub const JwtFromCatalogConfig = struct {
 /// Fill `slot` with `slot.set(try router.finish())` after mounts.
 pub fn jwtAuthFromCatalog(security: *SecurityModule, slot: *comptime_router.CatalogSlot, config: JwtFromCatalogConfig) api.Middleware {
     const Store = struct {
-        var sec: *SecurityModule = undefined;
-        var catalog_slot: *comptime_router.CatalogSlot = undefined;
-        var cfg: JwtFromCatalogConfig = .{};
+        sec: *SecurityModule,
+        catalog_slot: *comptime_router.CatalogSlot,
+        cfg: JwtFromCatalogConfig,
     };
-    Store.sec = security;
-    Store.catalog_slot = slot;
-    Store.cfg = config;
+    const stored = std.heap.page_allocator.create(Store) catch unreachable;
+    stored.* = .{ .sec = security, .catalog_slot = slot, .cfg = config };
     return .{
         .func = struct {
-            fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
-                if (comptime_router.pathHasSkipPrefix(ctx.path, Store.cfg.skip_prefixes)) {
+            fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
+                const st: *const Store = @ptrCast(@alignCast(user_data.?));
+                if (comptime_router.pathHasSkipPrefix(ctx.path, st.cfg.skip_prefixes)) {
                     try next(ctx);
                     return;
                 }
-                if (Store.catalog_slot.get()) |cat| {
+                if (st.catalog_slot.get()) |cat| {
                     if (cat.isPublic(ctx.method, ctx.path)) {
                         try next(ctx);
                         return;
                     }
                 }
-                try verifyJwtLoadPermsAndNext(Store.sec, ctx, next, null);
+                try verifyJwtLoadPermsAndNext(st.sec, ctx, next, null);
             }
         }.mw,
+        .user_data = stored,
     };
 }
 
@@ -352,36 +350,40 @@ pub fn jwtAuthFromCatalogWithPermissions(
     config: JwtFromCatalogConfig,
 ) api.Middleware {
     const Store = struct {
-        var sec: *SecurityModule = undefined;
-        var catalog_slot: *comptime_router.CatalogSlot = undefined;
-        var cfg: JwtFromCatalogConfig = .{};
-        var load: CatalogPermissionLoader = undefined;
+        sec: *SecurityModule,
+        catalog_slot: *comptime_router.CatalogSlot,
+        cfg: JwtFromCatalogConfig,
+        load: CatalogPermissionLoader,
     };
-    Store.sec = security;
-    Store.catalog_slot = slot;
-    Store.cfg = config;
-    Store.load = loader;
+    const stored = std.heap.page_allocator.create(Store) catch unreachable;
+    stored.* = .{ .sec = security, .catalog_slot = slot, .cfg = config, .load = loader };
     return .{
         .func = struct {
-            fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
-                if (comptime_router.pathHasSkipPrefix(ctx.path, Store.cfg.skip_prefixes)) {
+            fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
+                const st: *const Store = @ptrCast(@alignCast(user_data.?));
+                if (comptime_router.pathHasSkipPrefix(ctx.path, st.cfg.skip_prefixes)) {
                     try next(ctx);
                     return;
                 }
-                if (Store.catalog_slot.get()) |cat| {
+                if (st.catalog_slot.get()) |cat| {
                     if (cat.isPublic(ctx.method, ctx.path)) {
                         try next(ctx);
                         return;
                     }
                 }
-                try verifyJwtLoadPermsAndNext(Store.sec, ctx, next, Store.load);
+                try verifyJwtLoadPermsAndNext(st.sec, ctx, next, st.load);
             }
         }.mw,
+        .user_data = stored,
     };
 }
 
 /// Build a `CatalogPermissionLoader` from a static `RolePermissionTable`.
 /// Ignores `sub`/`aud` (role→permission map only).
+/// Note: a `CatalogPermissionLoader` is a plain fn (no user_data context), so
+/// this keeps a module-level table reference — safe in practice because the
+/// table is a process-wide singleton. For multi-instance isolation pass a
+/// custom loader closure instead.
 pub fn catalogLoaderFromTable(table: *const Rbac.RolePermissionTable) CatalogPermissionLoader {
     const Holder = struct {
         var tbl: *const Rbac.RolePermissionTable = undefined;
@@ -402,21 +404,22 @@ pub const ModuleGateConfig = struct {
 /// Resolves catalog module → ctx attr; optional allow-list / deny-unknown.
 pub fn moduleGate(slot: *comptime_router.CatalogSlot, config: ModuleGateConfig) api.Middleware {
     const Store = struct {
-        var catalog_slot: *comptime_router.CatalogSlot = undefined;
-        var cfg: ModuleGateConfig = .{};
+        catalog_slot: *comptime_router.CatalogSlot,
+        cfg: ModuleGateConfig,
     };
-    Store.catalog_slot = slot;
-    Store.cfg = config;
+    const stored = std.heap.page_allocator.create(Store) catch unreachable;
+    stored.* = .{ .catalog_slot = slot, .cfg = config };
     return .{
         .func = struct {
-            fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
-                const cat = Store.catalog_slot.get() orelse {
+            fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
+                const st: *const Store = @ptrCast(@alignCast(user_data.?));
+                const cat = st.catalog_slot.get() orelse {
                     try next(ctx);
                     return;
                 };
                 if (cat.moduleFor(ctx.path)) |mod| {
-                    try ctx.setAttr(Store.cfg.attr_key, mod);
-                    if (Store.cfg.allowed) |allow| {
+                    try ctx.setAttr(st.cfg.attr_key, mod);
+                    if (st.cfg.allowed) |allow| {
                         var ok = false;
                         for (allow) |a| {
                             if (std.mem.eql(u8, a, mod)) {
@@ -429,7 +432,7 @@ pub fn moduleGate(slot: *comptime_router.CatalogSlot, config: ModuleGateConfig) 
                             return;
                         }
                     }
-                } else if (Store.cfg.unknown == .deny) {
+                } else if (st.cfg.unknown == .deny) {
                     if (!comptime_router.pathHasSkipPrefix(ctx.path, &.{ "health", "dashboard", "openapi.json" })) {
                         try ctx.sendError(404, "Unknown route module");
                         return;
@@ -438,6 +441,7 @@ pub fn moduleGate(slot: *comptime_router.CatalogSlot, config: ModuleGateConfig) 
                 try next(ctx);
             }
         }.mw,
+        .user_data = stored,
     };
 }
 
@@ -727,6 +731,33 @@ test "cors rejects origins outside the allow-list with 403" {
     try std.testing.expect(ctx.responded);
 }
 
+test "cors instances with different configs stay isolated (no static overwrite)" {
+    const allocator = std.testing.allocator;
+    const next = struct {
+        fn n(c: *api.Context) anyerror!void {
+            _ = c;
+        }
+    }.n;
+
+    // Register the first instance, then a second with a different whitelist.
+    // With the old module-level static storage, mw_b would overwrite mw_a's
+    // config and a.example.com would be rejected.
+    const mw_a = cors(.{ .allow_origins = &.{"https://a.example.com"} });
+    const mw_b = cors(.{ .allow_origins = &.{"https://b.example.com"} });
+
+    var ctx_a = try api.Context.init(allocator, .GET, "/api/v1/users");
+    defer ctx_a.deinit();
+    try ctx_a.headers.put(try allocator.dupe(u8, "origin"), try allocator.dupe(u8, "https://a.example.com"));
+    try mw_a.func(&ctx_a, next, mw_a.user_data);
+    try std.testing.expectEqualStrings("https://a.example.com", ctx_a.response_headers.get("Access-Control-Allow-Origin").?);
+
+    var ctx_b = try api.Context.init(allocator, .GET, "/api/v1/users");
+    defer ctx_b.deinit();
+    try ctx_b.headers.put(try allocator.dupe(u8, "origin"), try allocator.dupe(u8, "https://b.example.com"));
+    try mw_b.func(&ctx_b, next, mw_b.user_data);
+    try std.testing.expectEqualStrings("https://b.example.com", ctx_b.response_headers.get("Access-Control-Allow-Origin").?);
+}
+
 test "maxBodySize middleware rejects large payload" {
     const allocator = std.testing.allocator;
     var ctx = try api.Context.init(allocator, .POST, "/test");
@@ -978,17 +1009,17 @@ test "jwtAuthFromCatalog skips public and skip_prefixes" {
 
     var pub_ctx = try api.Context.init(alloc, .GET, "/api/v1/open");
     defer pub_ctx.deinit();
-    try mw.func(&pub_ctx, next, null);
+    try mw.func(&pub_ctx, next, mw.user_data);
     try std.testing.expect(!pub_ctx.responded);
 
     var health_ctx = try api.Context.init(alloc, .GET, "/health/live");
     defer health_ctx.deinit();
-    try mw.func(&health_ctx, next, null);
+    try mw.func(&health_ctx, next, mw.user_data);
     try std.testing.expect(!health_ctx.responded);
 
     var priv_ctx = try api.Context.init(alloc, .GET, "/api/v1/secret");
     defer priv_ctx.deinit();
-    try mw.func(&priv_ctx, next, null);
+    try mw.func(&priv_ctx, next, mw.user_data);
     try std.testing.expectEqual(@as(u16, 401), priv_ctx.status_code);
 }
 
@@ -1012,12 +1043,12 @@ test "moduleGate sets attr and can deny unknown" {
 
     var ok_ctx = try api.Context.init(alloc, .GET, "/api/v1/users");
     defer ok_ctx.deinit();
-    try mw.func(&ok_ctx, next, null);
+    try mw.func(&ok_ctx, next, mw.user_data);
     try std.testing.expectEqualStrings("user", ok_ctx.getAttr("module").?);
 
     var bad_ctx = try api.Context.init(alloc, .GET, "/api/v1/nope");
     defer bad_ctx.deinit();
-    try mw.func(&bad_ctx, next, null);
+    try mw.func(&bad_ctx, next, mw.user_data);
     try std.testing.expectEqual(@as(u16, 404), bad_ctx.status_code);
 }
 
@@ -1043,13 +1074,13 @@ test "permissionGate requires role matching RouteMeta.permission" {
     var deny_ctx = try api.Context.init(alloc, .DELETE, "/api/v1/tenants/1");
     defer deny_ctx.deinit();
     try deny_ctx.setAttr("roles", "user");
-    try mw.func(&deny_ctx, next, null);
+    try mw.func(&deny_ctx, next, mw.user_data);
     try std.testing.expectEqual(@as(u16, 403), deny_ctx.status_code);
 
     var allow_ctx = try api.Context.init(alloc, .DELETE, "/api/v1/tenants/1");
     defer allow_ctx.deinit();
     try allow_ctx.setAttr("roles", "user,admin");
-    try mw.func(&allow_ctx, next, null);
+    try mw.func(&allow_ctx, next, mw.user_data);
     try std.testing.expect(!allow_ctx.responded);
     try std.testing.expectEqualStrings("admin", allow_ctx.getAttr("permission").?);
 }
@@ -1082,7 +1113,7 @@ test "permissionGate accepts any OR alternative" {
     var ok_ctx = try api.Context.init(alloc, .DELETE, "/api/v1/tenants/1");
     defer ok_ctx.deinit();
     try ok_ctx.setAttr("roles", "owner");
-    try mw.func(&ok_ctx, next, null);
+    try mw.func(&ok_ctx, next, mw.user_data);
     try std.testing.expect(!ok_ctx.responded);
 }
 
@@ -1110,14 +1141,14 @@ test "permissionGate rbac mode uses permissions attr not roles" {
     defer deny_ctx.deinit();
     try deny_ctx.setAttr("roles", "admin");
     try deny_ctx.setAttr("permissions", "tenant:read");
-    try mw.func(&deny_ctx, next, null);
+    try mw.func(&deny_ctx, next, mw.user_data);
     try std.testing.expectEqual(@as(u16, 403), deny_ctx.status_code);
 
     var allow_ctx = try api.Context.init(alloc, .DELETE, "/api/v1/tenants/1");
     defer allow_ctx.deinit();
     try allow_ctx.setAttr("roles", "user");
     try allow_ctx.setAttr("permissions", "tenant:read,tenant:suspend");
-    try mw.func(&allow_ctx, next, null);
+    try mw.func(&allow_ctx, next, mw.user_data);
     try std.testing.expect(!allow_ctx.responded);
     try std.testing.expectEqualStrings("tenant:suspend", allow_ctx.getAttr("permission").?);
 }
@@ -1152,7 +1183,7 @@ test "jwtAuthFromCatalogWithPermissions loads permission CSV" {
     const auth_hdr = try std.fmt.allocPrint(alloc, "Bearer {s}", .{token});
     defer alloc.free(auth_hdr);
     try ctx.headers.put(try alloc.dupe(u8, "authorization"), try alloc.dupe(u8, auth_hdr));
-    try mw.func(&ctx, next, null);
+    try mw.func(&ctx, next, mw.user_data);
     try std.testing.expect(!ctx.responded);
     try std.testing.expectEqualStrings("u1", ctx.getAttr("user_id").?);
     try std.testing.expectEqualStrings("42", ctx.getAttr("tenant_id").?);
@@ -1203,7 +1234,7 @@ test "CatalogPermissionLoader receives sub and aud" {
     const auth_hdr = try std.fmt.allocPrint(alloc, "Bearer {s}", .{token});
     defer alloc.free(auth_hdr);
     try ctx.headers.put(try alloc.dupe(u8, "authorization"), try alloc.dupe(u8, auth_hdr));
-    try mw.func(&ctx, next, null);
+    try mw.func(&ctx, next, mw.user_data);
     defer {
         if (S.seen_sub.len > 0) alloc.free(S.seen_sub);
         if (S.seen_aud.len > 0) alloc.free(S.seen_aud);

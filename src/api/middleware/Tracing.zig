@@ -112,17 +112,18 @@ pub fn rateLimitPerClient(
     key_extractor: *const fn (*api.Context) []const u8,
 ) api.Middleware {
     const S = struct {
-        var stored_registry: *RateLimiterRegistry = undefined;
-        var stored_extractor: *const fn (*api.Context) []const u8 = undefined;
+        stored_registry: *RateLimiterRegistry,
+        stored_extractor: *const fn (*api.Context) []const u8,
     };
-    S.stored_registry = registry;
-    S.stored_extractor = key_extractor;
+    const stored = std.heap.page_allocator.create(S) catch unreachable;
+    stored.* = .{ .stored_registry = registry, .stored_extractor = key_extractor };
 
     return .{
         .func = struct {
-            fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
-                const client_key = S.stored_extractor(ctx);
-                const lim = try S.stored_registry.getOrCreateForClient(client_key, 100, 10);
+            fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
+                const s: *const S = @ptrCast(@alignCast(user_data.?));
+                const client_key = s.stored_extractor(ctx);
+                const lim = try s.stored_registry.getOrCreateForClient(client_key, 100, 10);
                 if (!lim.tryAcquire()) {
                     try ctx.sendErrorResponse(429, 429, "Too Many Requests");
                     return;
@@ -130,6 +131,7 @@ pub fn rateLimitPerClient(
                 try next(ctx);
             }
         }.mw,
+        .user_data = stored,
     };
 }
 
