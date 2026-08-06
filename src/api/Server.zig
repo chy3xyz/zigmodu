@@ -1792,9 +1792,9 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
         const ws_lookup_path = if (request.path.len > 0 and request.path[0] == '/') request.path[1..] else request.path;
         if (server.ws_handlers.get(ws_lookup_path)) |ws_route| {
             if (std.mem.eql(u8, request.method.toString(), "GET")) {
-                const upgrade_hdr = ctx.headers.get("upgrade") orelse ctx.headers.get("Upgrade") orelse "";
+                const upgrade_hdr = ctx.headers.get("upgrade") orelse "";
                 if (std.ascii.eqlIgnoreCase(upgrade_hdr, "websocket")) {
-                    const ws_key = ctx.headers.get("sec-websocket-key") orelse ctx.headers.get("Sec-WebSocket-Key") orelse "";
+                    const ws_key = ctx.headers.get("sec-websocket-key") orelse "";
                     if (ws_key.len > 0) {
                         ctx.user_data = ws_route.user_data;
                         // Perform handshake

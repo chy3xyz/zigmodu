@@ -64,7 +64,8 @@ pub const data = @import("data.zig");
 pub const security = @import("security.zig");
 pub const observability = @import("observability.zig");
 
-/// Deprecated flat aliases — remove in v0.14.0. Prefer domain imports above.
+/// Legacy flat aliases for backwards compatibility — prefer the domain
+/// imports above (http.zig / data.zig / security.zig / observability.zig).
 
 // ============================================================
 // 3. RESILIENCE
