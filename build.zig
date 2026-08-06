@@ -5,11 +5,11 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const db_opt = b.option([]const u8, "db", "SQL drivers to link: all|sqlite|postgres|mysql (comma-list)") orelse "all";
+    const db_opt = b.option([]const u8, "db", "SQL drivers to link: all|sqlite|postgres|mysql|none (comma-list)") orelse "all";
     // Framework `zig build test` expects `-Ddb=all` (default). Narrow `-Ddb=` skips linking
     // but many unit tests still open SQLite `:memory:` and will fail without sqlite enabled.
     const features = db_link.parseDb(db_opt) catch {
-        @panic("invalid -Ddb= value; use all|sqlite|postgres|mysql (comma-list ok)");
+        @panic("invalid -Ddb= value; use all|sqlite|postgres|mysql|none (comma-list ok)");
     };
 
     // Build options for compile-time configuration

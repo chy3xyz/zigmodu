@@ -1,6 +1,6 @@
 # SQLx 选择性驱动链接（`-Ddb=` / `.db=`）
 
-ZigModu 默认链接 **sqlite + postgres + mysql**（`-Ddb=all`），保证旧项目与框架自测兼容。小系统 / 单驱动部署应收窄链接，减少系统库依赖与部署面。
+ZigModu 默认链接 **sqlite + postgres + mysql**（`-Ddb=all`），保证旧项目与框架自测兼容。小系统 / 单驱动部署应收窄链接，减少系统库依赖与部署面。`-Ddb=none` 全不链驱动（sqlx 走 stub，`DriverNotEnabled` 守卫运行时生效）——用于无 DB 的二进制（如 Windows 交叉编译 agent）或纯测试桩。
 
 **实现**：`examples/_shared/db_link.zig` · `build_options.enable_*` · `src/sqlx/*_c_stub.zig` · `sqlx.DriverFeatures`  
 **相关**：[`data.sqlx`](../src/data.zig) · [PRODUCTION_ROADMAP.md](PRODUCTION_ROADMAP.md)（sqlx 维护边界）· [ZENT.md](ZENT.md)（正交 ORM，仍可能链 libsqlite3）

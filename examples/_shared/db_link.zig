@@ -23,6 +23,7 @@ pub fn parseDb(s: []const u8) ParseError!Features {
     const trimmed = std.mem.trim(u8, s, " \t\r\n");
     if (trimmed.len == 0) return error.InvalidDbOption;
     if (std.mem.eql(u8, trimmed, "all")) return Features.all;
+    if (std.mem.eql(u8, trimmed, "none") or std.mem.eql(u8, trimmed, "off")) return .{};
 
     var features: Features = .{};
     var it = std.mem.splitScalar(u8, trimmed, ',');
