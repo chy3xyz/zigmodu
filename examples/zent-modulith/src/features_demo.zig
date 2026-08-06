@@ -10,6 +10,29 @@ const std = @import("std");
 const zigmodu = @import("zigmodu");
 const http = zigmodu.http;
 const zent = @import("zent");
+
+/// Serialize a zent entity array as a JSON array via zent's toMaskedJson —
+/// raw entities cannot go through ctx.jsonStruct: the injected json_arena /
+/// Allocator field makes std.json walk comptime-only fn pointers under
+/// zig 0.17-dev.1422.
+fn maskedArrayJson(
+    allocator: std.mem.Allocator,
+    comptime infos: []const zent.codegen.graph.TypeInfo,
+    comptime info: zent.codegen.graph.TypeInfo,
+    items: []const zent.codegen.entity(infos, info),
+) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, '[');
+    for (items, 0..) |item, i| {
+        if (i > 0) try buf.appendSlice(allocator, ",");
+        const piece = try zent.codegen.toMaskedJson(allocator, infos, info, item);
+        defer allocator.free(piece);
+        try buf.appendSlice(allocator, piece);
+    }
+    try buf.append(allocator, ']');
+    return try buf.toOwnedSlice(allocator);
+}
 const persist = @import("modules/catalog/persistence.zig");
 
 /// InventoryApi: GET /api/v1/inventory/{product_id} and
@@ -107,7 +130,11 @@ pub fn FeedApi(comptime Client: type) type {
                 for (rows.items) |*a| zent.codegen.deinitEntity(persist.infos, persist.AuthorInfo, a, self.client.allocator);
                 rows.deinit();
             }
-            try ctx.jsonStruct(200, .{ .authors = rows.items });
+            const arr = try maskedArrayJson(self.client.allocator, persist.infos, persist.AuthorInfo, rows.items);
+            defer self.client.allocator.free(arr);
+            const body = try std.fmt.allocPrint(self.client.allocator, "{{\"authors\":{s}}}", .{arr});
+            defer self.client.allocator.free(body);
+            try ctx.json(200, body);
         }
 
         const CommentsCursorQ = struct {
@@ -144,11 +171,15 @@ pub fn FeedApi(comptime Client: type) type {
             }
             const CommentEntity = zent.codegen.entity(persist.infos, persist.CommentInfo);
             const last: ?CommentEntity = if (rows.items.len > 0) rows.items[rows.items.len - 1] else null;
-            try ctx.jsonStruct(200, .{
-                .items = rows.items,
-                .next_cursor_ts = if (last) |l| l.created_at else q.cursor_ts,
-                .next_cursor_id = if (last) |l| l.id else q.cursor_id,
+            const arr = try maskedArrayJson(self.client.allocator, persist.infos, persist.CommentInfo, rows.items);
+            defer self.client.allocator.free(arr);
+            const body = try std.fmt.allocPrint(self.client.allocator, "{{\"items\":{s},\"next_cursor_ts\":{d},\"next_cursor_id\":{d}}}", .{
+                arr,
+                if (last) |l| l.created_at else q.cursor_ts,
+                if (last) |l| l.id else q.cursor_id,
             });
+            defer self.client.allocator.free(body);
+            try ctx.json(200, body);
         }
 
         const BulkDeleteBody = struct { ids: []i64 };
@@ -195,7 +226,11 @@ pub fn FeedApi(comptime Client: type) type {
                 for (rows.items) |*p| zent.codegen.deinitEntity(persist.infos, persist.PostInfo, p, self.client.allocator);
                 rows.deinit();
             }
-            try ctx.jsonStruct(200, .{ .trashed = rows.items });
+            const arr = try maskedArrayJson(self.client.allocator, persist.infos, persist.PostInfo, rows.items);
+            defer self.client.allocator.free(arr);
+            const body = try std.fmt.allocPrint(self.client.allocator, "{{\"trashed\":{s}}}", .{arr});
+            defer self.client.allocator.free(body);
+            try ctx.json(200, body);
         }
     };
 }
@@ -229,7 +264,11 @@ pub fn SummaryApi(comptime Client: type) type {
                 for (rows.items) |*p| zent.codegen.deinitEntity(persist.infos, persist.ProductInfo, p, self.client.allocator);
                 rows.deinit();
             }
-            try ctx.jsonStruct(200, .{ .summaries = rows.items });
+            const arr = try maskedArrayJson(self.client.allocator, persist.infos, persist.ProductInfo, rows.items);
+            defer self.client.allocator.free(arr);
+            const body = try std.fmt.allocPrint(self.client.allocator, "{{\"summaries\":{s}}}", .{arr});
+            defer self.client.allocator.free(body);
+            try ctx.json(200, body);
         }
     };
 }

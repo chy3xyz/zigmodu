@@ -3,8 +3,9 @@
     .version = "0.1.0",
     .fingerprint = 0xc54e175ac68cb232,
     .minimum_zig_version = "0.17.0",
-    // Local sibling checkout: ../../../../zent relative to this file → zig_ws/zent
-    // CI / consumers: replace with git+https://github.com/chy3xyz/zent#v0.27.0
+    // zent v0.29.1 (sibling checkout) — compiles under zig 0.17-dev.1567.
+    // Pinned alternative: .zent = .{ .url = "git+https://github.com/chy3xyz/zent#v0.29.1",
+    //              .hash = "<zig fetch git+https://github.com/chy3xyz/zent#v0.29.1>" }
     .dependencies = .{
         .zent = .{ .path = "../../../zent" },
     },
