@@ -656,6 +656,9 @@ fn lintFile(
     var qr_fs_count: usize = 0;
     var qr_return_count: usize = 0;
     var qr_first_line: usize = 0;
+    // b18 — pseudo-transaction guard: beginTx() followed by a pool-connection
+    // exec in the same fn (auto-commit, rollback no-op).
+    var b18_begin_seen = false;
     // `const x = queryRow(...)` whose value is delegated via the next-line
     // `return x;` — ownership transfers, no leak at this call site.
     var pending_qr_var: ?[]const u8 = null;
@@ -668,6 +671,22 @@ fn lintFile(
     while (lines.next()) |line| : (idx += 1) {
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0 or std.mem.startsWith(u8, trimmed, "//")) continue;
+
+        // b18 — pseudo-transaction: beginTx() then a pool-connection exec.
+        // Writing via client/backend after beginTx auto-commits on the pool
+        // connection; tx.rollback() becomes a no-op. Everything inside the
+        // transaction must go through the tx handle (tx.exec / execTx).
+        if ((std.mem.eql(u8, file_name, "service.zig") or std.mem.eql(u8, file_name, "persistence.zig")) and !config.disabled.contains("b18")) {
+            if (pubFnName(trimmed)) |_| {
+                b18_begin_seen = false;
+            } else {
+                if (std.mem.indexOf(u8, line, "beginTx") != null) b18_begin_seen = true;
+                if (b18_begin_seen and isPoolExec(line)) {
+                    try pushViolation(violations, allocator, "b18", rel_path, idx, "beginTx() 后仍用池连接 exec — 事务内读写必须走 tx 句柄 (tx.exec / backend.execTx)，否则自动提交且 rollback 无效（伪事务）", .{});
+                    b18_begin_seen = false;
+                }
+            }
+        }
 
         // b16 — track the current service method: count write calls, look for
         // a transaction, and flag 2+ writes without one when the method ends.
@@ -1176,6 +1195,15 @@ fn collectModelStructs(allocator: std.mem.Allocator, content: []const u8, out: *
             has_string = std.mem.indexOf(u8, line, "[]const u8") != null;
         }
     }
+}
+
+/// True when the line executes SQL on the pool connection (not the tx
+/// handle): client.exec / backend.exec / self.db.exec / self.client.exec,
+/// excluding `tx.exec` / `execTx` variants.
+fn isPoolExec(line: []const u8) bool {
+    if (std.mem.indexOf(u8, line, ".exec(") == null) return false;
+    if (std.mem.indexOf(u8, line, "tx.exec") != null) return false;
+    return containsAny(line, &.{ "client.exec", "backend.exec", "self.db.exec", ".client.exec" });
 }
 
 /// A write-shaped call inside a service method: a persistence write helper or
@@ -1695,6 +1723,12 @@ test "audit business lint flags anti-patterns" {
     try lintFile(allocator, "service.zig", "errdefer conn.close(io) catch {};\n", "src/modules/x/service.zig", &cfg, &violations);
     // b10 negative — sendError is best-effort (SSE disconnect / client gone).
     try lintFile(allocator, "service.zig", "sse.sendError(500, \"boom\") catch {};\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b18 — pseudo-transaction: beginTx then pool exec.
+    try lintFile(allocator, "service.zig", "pub fn pay(self: *@This(), id: i64) !void {\n    _ = try self.client.beginTx();\n    _ = self.db.exec(\"UPDATE orders SET paid = 1 WHERE id = ?\", &.{});\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b18 negative — tx handle exec inside the transaction is fine.
+    try lintFile(allocator, "service.zig", "pub fn pay(self: *@This(), id: i64) !void {\n    var tx = try self.client.beginTx();\n    _ = tx.exec(\"UPDATE orders SET paid = 1 WHERE id = ?\", &.{});\n    try tx.commit();\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b18 negative — pool exec without beginTx is not a pseudo-transaction.
+    try lintFile(allocator, "service.zig", "pub fn touch(self: *@This(), id: i64) !void {\n    _ = self.db.exec(\"UPDATE orders SET touched = 1 WHERE id = ?\", &.{});\n}\n", "src/modules/x/service.zig", &cfg, &violations);
     try lintFile(allocator, "service.zig", "x() catch |err| {\n  _ = err;\n  return;\n};\n", "src/modules/x/service.zig", &cfg, &violations);
     // b12 — pure CRUD passthrough service method (next-line body).
     try lintFile(allocator, "service.zig", "pub fn list(self: *@This(), allocator: std.mem.Allocator, org_id: i64, page: usize, size: usize) !std.ArrayList(T) {\n    return self.persistence.list(allocator, org_id, page, size);\n}\n", "src/modules/x/service.zig", &cfg, &violations);
@@ -1771,6 +1805,7 @@ test "audit business lint flags anti-patterns" {
     try std.testing.expectEqual(@as(usize, 1), rules.get("b15").?);
     try std.testing.expectEqual(@as(usize, 1), rules.get("b16").?);
     try std.testing.expectEqual(@as(usize, 3), rules.get("b17").?);
+    try std.testing.expectEqual(@as(usize, 1), rules.get("b18").?);
 }
 
 test "audit b17 honors named model symbol table" {
