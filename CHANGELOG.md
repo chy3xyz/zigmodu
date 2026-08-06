@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **examples/zent-modulith**: 依赖从本地 sibling path 改为固定 git
+  tarball **zent v0.29.2**（含 migrate 生成 quota 运行时化修复）。
+  `.gitignore` 忽略 zig 0.17 的 `zig-pkg/` 包缓存目录。
+
 ## [0.15.18] - 2026-08-07
 
 ### Fixed
