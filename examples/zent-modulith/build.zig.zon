@@ -3,11 +3,13 @@
     .version = "0.1.0",
     .fingerprint = 0xc54e175ac68cb232,
     .minimum_zig_version = "0.17.0",
-    // zent v0.29.1 (sibling checkout) — compiles under zig 0.17-dev.1567.
-    // Pinned alternative: .zent = .{ .url = "git+https://github.com/chy3xyz/zent#v0.29.1",
-    //              .hash = "<zig fetch git+https://github.com/chy3xyz/zent#v0.29.1>" }
+    // Pinned to zent v0.29.2 (tarball). For local development against a
+    // sibling checkout, replace with: .zent = .{ .path = "../../../zent" }.
     .dependencies = .{
-        .zent = .{ .path = "../../../zent" },
+        .zent = .{
+            .url = "https://github.com/chy3xyz/zent/archive/refs/tags/v0.29.2.tar.gz",
+            .hash = "zent-0.29.2-oiur-5A8DQDi5yAu7T9_80BrgdF2sAt5ii1VOm4TNsyi",
+        },
     },
     .paths = .{
         "build.zig",

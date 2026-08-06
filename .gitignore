@@ -80,3 +80,4 @@ wal_test*/
 
 # Local tool output
 .codegraph/
+zig-pkg
