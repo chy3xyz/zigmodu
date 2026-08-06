@@ -345,11 +345,14 @@ pub const AiProvider = struct {
         errdefer self.allocator.free(content);
         const reasoning = try self.allocator.dupe(u8, acc.reasoning.items);
         errdefer self.allocator.free(reasoning);
+        const model = try self.allocator.dupe(u8, acc.model.items);
+        errdefer self.allocator.free(model);
         const tool_calls = try acc.takeToolCalls(self.allocator);
         if (tool_calls.len > 0) self.metrics.tool_call_responses += 1;
         return .{
             .content = content,
             .reasoning_content = reasoning,
+            .model = model,
             .role = "assistant",
             .tool_calls = tool_calls,
             .prompt_tokens = acc.prompt_tokens,
@@ -526,7 +529,9 @@ pub const AiProvider = struct {
                 self.metrics.cache_miss_tokens += resp.cache_miss_tokens;
                 return resp;
             }
-        } else |_| {}
+        } else |err| {
+            std.log.warn("[AiProvider] response JSON parse failed, falling back to content scrape: {}", .{err});
+        }
 
         // Fallback: content string scrape
         if (std.mem.indexOf(u8, body, "\"content\":\"")) |start| {
@@ -711,6 +716,7 @@ const StreamAccum = struct {
     carry: std.ArrayList(u8),
     content: std.ArrayList(u8),
     reasoning: std.ArrayList(u8),
+    model: std.ArrayList(u8),
     pending_tools: std.ArrayList(PendingTool),
     saw_done: bool = false,
     prompt_tokens: usize = 0,
@@ -737,6 +743,7 @@ const StreamAccum = struct {
             .carry = .empty,
             .content = .empty,
             .reasoning = .empty,
+            .model = .empty,
             .pending_tools = .empty,
         };
     }
@@ -745,6 +752,7 @@ const StreamAccum = struct {
         self.carry.deinit(self.allocator);
         self.content.deinit(self.allocator);
         self.reasoning.deinit(self.allocator);
+        self.model.deinit(self.allocator);
         for (self.pending_tools.items) |*t| t.deinit(self.allocator);
         self.pending_tools.deinit(self.allocator);
     }
@@ -788,6 +796,10 @@ const StreamAccum = struct {
         }
         if (extractIntField(payload, "\"prompt_tokens\":")) |n| self.prompt_tokens = n;
         if (extractIntField(payload, "\"completion_tokens\":")) |n| self.completion_tokens = n;
+        if (extractStringField(payload, "\"model\":")) |m| {
+            self.model.clearRetainingCapacity();
+            try self.model.appendSlice(self.allocator, m);
+        }
 
         const delta = try AiProvider.extractStreamDeltaContent(self.allocator, payload);
         if (delta) |d| {
@@ -910,6 +922,18 @@ fn extractIntField(body: []const u8, field: []const u8) ?usize {
         n = n * 10 + (body[i] - '0');
     }
     return n;
+}
+
+/// Extract a JSON string field value, e.g. `"model":"deepseek-chat"`.
+/// Returns the value (not owned) or null when absent.
+fn extractStringField(body: []const u8, field: []const u8) ?[]const u8 {
+    const start = std.mem.indexOf(u8, body, field) orelse return null;
+    var i = start + field.len;
+    while (i < body.len and (body[i] == ' ' or body[i] == '\t')) : (i += 1) {}
+    if (i >= body.len or body[i] != '"') return null;
+    const vs = i + 1;
+    const end = std.mem.indexOfScalarPos(u8, body, vs, '"') orelse return null;
+    return body[vs..end];
 }
 
 fn escapeJson(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const u8) !void {

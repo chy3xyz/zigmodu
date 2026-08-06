@@ -235,7 +235,10 @@ pub const Workflow = struct {
         var replayed_failed = false;
         for (entries) |e| {
             if (!std.mem.eql(u8, e.source_node, run_id)) continue;
-            const parsed = std.json.parseFromSlice(StepRecordJson, allocator, e.payload, .{}) catch continue;
+            const parsed = std.json.parseFromSlice(StepRecordJson, allocator, e.payload, .{}) catch |err| {
+                std.log.warn("[Workflow] WAL entry skipped (bad JSON on node {s}): {}", .{ e.source_node, err });
+                continue;
+            };
             defer parsed.deinit();
             const rec = parsed.value;
             if (rec.index >= next_index) next_index = rec.index + 1;

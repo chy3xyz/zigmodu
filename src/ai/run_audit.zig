@@ -18,6 +18,8 @@ pub const RunAuditEntry = struct {
     tenant_id: ?i64 = null,
     steps: usize = 0,
     duration_ms: i64 = 0,
+    /// Actual model that served the run (empty when unknown / not captured).
+    model: ?[]const u8 = null,
 };
 
 pub const RunAuditStore = struct {
@@ -34,18 +36,30 @@ pub const RunAuditStore = struct {
     pub fn migrate(self: *Self) !void {
         const sql = try std.fmt.allocPrint(
             self.allocator,
-            "CREATE TABLE IF NOT EXISTS {s} (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, tenant_id INTEGER, steps INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS {s} (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, tenant_id INTEGER, steps INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, model TEXT)",
             .{self.table},
         );
         defer self.allocator.free(sql);
         _ = try self.backend.exec(sql, &.{});
+        // Existing installs predate the `model` column (CREATE IF NOT EXISTS
+        // does not add columns). Probe first (fresh tables already have it),
+        // then best-effort ALTER for legacy tables.
+        const probe = try std.fmt.allocPrint(self.allocator, "SELECT model FROM {s} LIMIT 0", .{self.table});
+        defer self.allocator.free(probe);
+        if (self.backend.exec(probe, &.{})) |_| {
+            // column already exists
+        } else |_| {
+            const alter = try std.fmt.allocPrint(self.allocator, "ALTER TABLE {s} ADD COLUMN model TEXT", .{self.table});
+            defer self.allocator.free(alter);
+            _ = self.backend.exec(alter, &.{}) catch {};
+        }
     }
 
     pub fn record(self: *Self, entry: RunAuditEntry) !void {
         const now = Time.monotonicNowSeconds();
         const sql = try std.fmt.allocPrint(
             self.allocator,
-            "INSERT INTO {s} (run_id, kind, status, tenant_id, steps, duration_ms, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO {s} (run_id, kind, status, tenant_id, steps, duration_ms, created_at, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             .{self.table},
         );
         defer self.allocator.free(sql);
@@ -57,6 +71,7 @@ pub const RunAuditStore = struct {
             .{ .int = @intCast(entry.steps) },
             .{ .int = entry.duration_ms },
             .{ .int = now },
+            if (entry.model) |m| .{ .string = m } else .null,
         });
     }
 
@@ -88,11 +103,11 @@ pub const RunAuditStore = struct {
 
         const sql = if (where.items.len > 0) try std.fmt.allocPrint(
             allocator,
-            "SELECT run_id, kind, status, tenant_id, steps, duration_ms FROM {s} WHERE {s} ORDER BY id DESC LIMIT {d}",
+            "SELECT run_id, kind, status, tenant_id, steps, duration_ms, model FROM {s} WHERE {s} ORDER BY id DESC LIMIT {d}",
             .{ self.table, where.items, limit },
         ) else try std.fmt.allocPrint(
             allocator,
-            "SELECT run_id, kind, status, tenant_id, steps, duration_ms FROM {s} ORDER BY id DESC LIMIT {d}",
+            "SELECT run_id, kind, status, tenant_id, steps, duration_ms, model FROM {s} ORDER BY id DESC LIMIT {d}",
             .{ self.table, limit },
         );
         defer allocator.free(sql);
@@ -107,6 +122,7 @@ pub const RunAuditStore = struct {
                 .tenant_id = if (row.get("tenant_id")) |t| t.int else null,
                 .steps = @intCast(row.get("steps").?.int),
                 .duration_ms = row.get("duration_ms").?.int,
+                .model = if (row.get("model")) |m| try allocator.dupe(u8, m.string) else null,
             });
         }
     }
@@ -139,6 +155,7 @@ test "RunAuditStore records, filters and lists run history" {
         for (all.items) |e| {
             allocator.free(e.run_id);
             allocator.free(e.status);
+            if (e.model) |m| allocator.free(m);
         }
         all.deinit(allocator);
     }
@@ -150,6 +167,7 @@ test "RunAuditStore records, filters and lists run history" {
         for (wf_only.items) |e| {
             allocator.free(e.run_id);
             allocator.free(e.status);
+            if (e.model) |m| allocator.free(m);
         }
         wf_only.deinit(allocator);
     }

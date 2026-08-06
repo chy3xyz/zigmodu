@@ -67,6 +67,22 @@ pub const AgentHooks = struct {
     on_tool_request: ?*const fn (ctx: ?*anyopaque, name: []const u8, arguments: []const u8) ToolApproval = null,
     on_tool: ?*const fn (ctx: ?*anyopaque, name: []const u8, ok: bool) void = null,
     on_finish: ?*const fn (ctx: ?*anyopaque, steps: usize, max_steps_hit: bool) void = null,
+    /// Streamed deltas (content/reasoning/tool fragments) pushed as they
+    /// arrive — a side channel for typing-indicator / SSE UIs. The run still
+    /// aggregates the full response internally (ReAct needs it to decide on
+    /// tool calls).
+    on_delta: ?*const fn (ctx: ?*anyopaque, delta: provider_mod.AiProvider.StreamDelta) anyerror!void = null,
+};
+
+/// Bridges chatStream's per-chunk callback to `AgentHooks.on_delta`.
+const DeltaBridge = struct {
+    target: ?*anyopaque,
+    cb: ?*const fn (?*anyopaque, provider_mod.AiProvider.StreamDelta) anyerror!void,
+
+    fn onDelta(ud: *anyopaque, d: provider_mod.AiProvider.StreamDelta) anyerror!void {
+        const b: *DeltaBridge = @ptrCast(@alignCast(ud));
+        if (b.cb) |cb| try cb(b.target, d);
+    }
 };
 
 pub const AgentMetrics = struct {
@@ -233,6 +249,9 @@ pub const Agent = struct {
                     }
                 }
             }
+            // TODO(#4): switch to chatStream + DeltaBridge to stream deltas to
+            // AgentHooks.on_delta (side channel); keep chatWith until the SSE
+            // mock/integration path is verified.
             var resp = try self.provider.chatWith(messages.items, .{ .tools_json = tools_json });
             defer self.provider.freeResponse(&resp);
 
@@ -248,7 +267,7 @@ pub const Agent = struct {
                 if (self.audit) |log| {
                     log.record(.run_finish, "", resp.content, skill_ctx.tenant_id orelse 0, skill_ctx.user_id orelse 0);
                 }
-                try self.recordRunAudit(allocator, skill_ctx, steps + 1, started_ms, if (budget_stopped) "budget_exhausted" else if (canceled_stopped) "canceled" else "completed");
+                try self.recordRunAudit(allocator, skill_ctx, steps + 1, started_ms, if (budget_stopped) "budget_exhausted" else if (canceled_stopped) "canceled" else "completed", if (resp.model.len > 0) resp.model else null);
                 const answer = try allocator.dupe(u8, resp.content);
                 // Surface the reasoning chain from reasoning models.
                 const reasoning = if (resp.reasoning_content.len > 0)
@@ -323,7 +342,8 @@ pub const Agent = struct {
                     if (tc.arguments.len == 0 or std.mem.eql(u8, tc.arguments, "{}")) {
                         break :blk .{ .object = .{} };
                     }
-                    const parsed = std.json.parseFromSlice(std.json.Value, allocator, tc.arguments, .{}) catch {
+                    const parsed = std.json.parseFromSlice(std.json.Value, allocator, tc.arguments, .{}) catch |err| {
+                        std.log.warn("[Agent] tool arguments JSON parse failed (name={s}): {}", .{ tc.name, err });
                         break :blk .{ .object = .{} };
                     };
                     parsed_opt = parsed;
@@ -373,7 +393,7 @@ pub const Agent = struct {
         if (self.audit) |log| {
             log.record(.run_max_steps, "", "max_steps exceeded", skill_ctx.tenant_id orelse 0, skill_ctx.user_id orelse 0);
         }
-        try self.recordRunAudit(allocator, skill_ctx, steps, started_ms, "max_steps");
+        try self.recordRunAudit(allocator, skill_ctx, steps, started_ms, "max_steps", null);
         const timeout_msg = try allocator.dupe(u8, "Agent stopped: max_steps exceeded");
         return .{ .answer = timeout_msg, .steps = steps, .owned_answer = true, .budget_exhausted = budget_stopped, .canceled = canceled_stopped };
     }
@@ -385,6 +405,7 @@ pub const Agent = struct {
         steps: usize,
         started_ms: i64,
         status: []const u8,
+        model: ?[]const u8,
     ) !void {
         const store = self.audit_store orelse return;
         const now_ms = @import("../core/Time.zig").monotonicNowMilliseconds();
@@ -397,6 +418,7 @@ pub const Agent = struct {
             .status = status,
             .tenant_id = skill_ctx.tenant_id,
             .steps = steps,
+            .model = model,
             .duration_ms = now_ms - started_ms,
         });
     }
@@ -423,7 +445,7 @@ test "Agent recordRunAudit persists agent runs" {
         .audit_store = &store,
     };
     var sctx = SkillContext{ .allocator = allocator, .tenant_id = 3 };
-    try agent.recordRunAudit(allocator, &sctx, 4, @import("../core/Time.zig").monotonicNowMilliseconds(), "completed");
+    try agent.recordRunAudit(allocator, &sctx, 4, @import("../core/Time.zig").monotonicNowMilliseconds(), "completed", "deepseek-chat");
 
     try std.testing.expectEqual(@as(usize, 1), try store.count());
     var entries = std.ArrayList(run_audit_mod.RunAuditEntry).empty;
@@ -431,6 +453,7 @@ test "Agent recordRunAudit persists agent runs" {
         for (entries.items) |e| {
             allocator.free(e.run_id);
             allocator.free(e.status);
+            if (e.model) |m| allocator.free(m);
         }
         entries.deinit(allocator);
     }
@@ -438,6 +461,7 @@ test "Agent recordRunAudit persists agent runs" {
     try std.testing.expectEqual(@as(usize, 1), entries.items.len);
     try std.testing.expectEqualStrings("completed", entries.items[0].status);
     try std.testing.expectEqual(@as(usize, 4), entries.items[0].steps);
+    try std.testing.expectEqualStrings("deepseek-chat", entries.items[0].model.?);
 }
 
 test "Agent.run executes a full tool-call loop against a mock provider" {
@@ -453,23 +477,25 @@ test "Agent.run executes a full tool-call loop against a mock provider" {
         server: *std.Io.net.Server,
         calls: *std.atomic.Value(u32),
         fn run(ctx: *@This()) void {
-            const accepted = ctx.server.accept(std.testing.io) catch return;
-            defer accepted.close(std.testing.io);
-            var buf: [8192]u8 = undefined;
-            while (true) {
-                var fds = [_]std.posix.pollfd{.{ .fd = accepted.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
-                _ = std.posix.poll(&fds, 3000) catch break;
-                if (fds[0].revents == 0) continue;
-                const n = std.posix.read(accepted.socket.handle, &buf) catch break;
-                if (n == 0) break;
-                const call = ctx.calls.fetchAdd(1, .monotonic);
-                const body = if (call == 0)
-                    "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"ping\",\"arguments\":\"{}\"}}]}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}"
-                else
-                    "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"final answer\",\"reasoning_content\":\"chain of thought\"}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2},\"model\":\"mock-model\"}";
-                var hbuf: [1024]u8 = undefined;
-                const resp = std.fmt.bufPrint(&hbuf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch break;
-                _ = std.posix.system.write(accepted.socket.handle, resp.ptr, resp.len);
+            while (ctx.calls.load(.monotonic) < 2) {
+                const accepted = ctx.server.accept(std.testing.io) catch return;
+                defer accepted.close(std.testing.io);
+                var buf: [8192]u8 = undefined;
+                while (true) {
+                    var fds = [_]std.posix.pollfd{.{ .fd = accepted.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+                    _ = std.posix.poll(&fds, 3000) catch break;
+                    if (fds[0].revents == 0) continue;
+                    const n = std.posix.read(accepted.socket.handle, &buf) catch break;
+                    if (n == 0) break;
+                    const call = ctx.calls.fetchAdd(1, .monotonic);
+                    const body = if (call == 0)
+                        "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"ping\",\"arguments\":\"{}\"}}]}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}"
+                    else
+                        "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"final answer\",\"reasoning_content\":\"chain of thought\"}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2},\"model\":\"mock-model\"}";
+                    var hbuf: [1024]u8 = undefined;
+                    const resp = std.fmt.bufPrint(&hbuf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch break;
+                    _ = std.posix.system.write(accepted.socket.handle, resp.ptr, resp.len);
+                }
             }
         }
     };
