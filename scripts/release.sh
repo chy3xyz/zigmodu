@@ -58,11 +58,14 @@ perl -0pi -e "s/\*\*v$OLD\*\*/**v$VERSION**/g" AGENTS.md
 fi
 
 # 2. CHANGELOG: promote Unreleased to the new version.
-if ! grep -q "^## \[Unreleased\]" CHANGELOG.md; then
+if grep -q "^## \[Unreleased\]" CHANGELOG.md; then
+    perl -0pi -e "s/## \[Unreleased\]/## [$VERSION] - $(date +%F)/" CHANGELOG.md
+elif [ "$SKIP_BUMP" = "1" ]; then
+    echo "CHANGELOG already promoted to [$VERSION]"
+else
     echo "FAIL: CHANGELOG.md has no [Unreleased] section"
     exit 1
 fi
-perl -0pi -e "s/## \[Unreleased\]/## [$VERSION] - $(date +%F)/" CHANGELOG.md
 
 # 1b. Verify every version reference actually bumped — perl -pi silently
 #     no-ops when the old value doesn't match, which left README stuck at an
