@@ -191,6 +191,7 @@ pub const AiProvider = struct {
     pub fn freeResponse(self: *AiProvider, resp: *ChatResponse) void {
         if (resp.content.len > 0) self.allocator.free(resp.content);
         if (resp.reasoning_content.len > 0) self.allocator.free(resp.reasoning_content);
+        if (resp.model.len > 0) self.allocator.free(resp.model);
         for (resp.tool_calls) |tc| {
             self.allocator.free(tc.id);
             self.allocator.free(tc.name);
@@ -213,7 +214,13 @@ pub const AiProvider = struct {
                 return error.RateLimited;
             }
         }
+        return self.chatWithInner(messages, opts);
+    }
 
+    /// No rate-limit acquire — internal path shared by `chatWith` (called
+    /// after the acquire above) and `chatStream`'s buffered fallback, so a
+    /// failed stream doesn't consume a second quota.
+    fn chatWithInner(self: *AiProvider, messages: []const ChatMsg, opts: ChatOpts) !ChatResponse {
         // Key-rotation retry loop: on a key-retryable failure (401/403/402/429)
         // swap `api_key` to the pool's next healthy key and retry once.
         var attempt: usize = 0;
@@ -300,7 +307,7 @@ pub const AiProvider = struct {
                 }
             }
             o.stream = false;
-            var resp = try self.chatWith(messages, o);
+            var resp = try self.chatWithInner(messages, o);
             errdefer self.freeResponse(&resp);
             if (resp.reasoning_content.len > 0) {
                 try on_delta(cb_ctx, .{ .reasoning_delta = resp.reasoning_content });
@@ -557,7 +564,8 @@ pub const AiProvider = struct {
             }
         }
         if (root.get("model")) |m| {
-            if (m == .string) resp.model = m.string;
+            // dupe: the parsed JSON arena is freed before the response is used.
+            if (m == .string) resp.model = try self.allocator.dupe(u8, m.string);
         }
         const choices = root.get("choices") orelse {
             resp.content = try self.allocator.dupe(u8, "");

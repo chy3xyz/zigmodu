@@ -35,6 +35,11 @@ pub const AgentResult = struct {
     /// Owned when `owned_reasoning` is set.
     reasoning: []const u8 = "",
     owned_reasoning: bool = false,
+    /// Actual model that produced the final answer (from the response; may
+    /// differ from the configured model under provider aliasing/failover).
+    /// Owned when `owned_model` is set.
+    model: []const u8 = "",
+    owned_model: bool = false,
     /// Set when the run stopped early because the task budget was exhausted.
     budget_exhausted: bool = false,
     /// Set when the run stopped early because the handle was canceled.
@@ -43,6 +48,7 @@ pub const AgentResult = struct {
     pub fn deinit(self: *AgentResult, allocator: std.mem.Allocator) void {
         if (self.owned_answer and self.answer.len > 0) allocator.free(self.answer);
         if (self.owned_reasoning and self.reasoning.len > 0) allocator.free(self.reasoning);
+        if (self.owned_model and self.model.len > 0) allocator.free(self.model);
         self.* = .{ .answer = "", .steps = 0, .budget_exhausted = false, .canceled = false };
     }
 };
@@ -249,12 +255,20 @@ pub const Agent = struct {
                     try allocator.dupe(u8, resp.reasoning_content)
                 else
                     "";
+                // Surface the actual model that answered (may differ from the
+                // configured one under provider aliasing/failover).
+                const model = if (resp.model.len > 0)
+                    try allocator.dupe(u8, resp.model)
+                else
+                    "";
                 return .{
                     .answer = answer,
                     .steps = steps + 1,
                     .owned_answer = true,
                     .reasoning = reasoning,
                     .owned_reasoning = reasoning.len > 0,
+                    .model = model,
+                    .owned_model = model.len > 0,
                     .budget_exhausted = budget_stopped,
                     .canceled = canceled_stopped,
                 };
@@ -452,7 +466,7 @@ test "Agent.run executes a full tool-call loop against a mock provider" {
                 const body = if (call == 0)
                     "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"ping\",\"arguments\":\"{}\"}}]}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}"
                 else
-                    "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"final answer\",\"reasoning_content\":\"chain of thought\"}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}";
+                    "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"final answer\",\"reasoning_content\":\"chain of thought\"}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2},\"model\":\"mock-model\"}";
                 var hbuf: [1024]u8 = undefined;
                 const resp = std.fmt.bufPrint(&hbuf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch break;
                 _ = std.posix.system.write(accepted.socket.handle, resp.ptr, resp.len);
@@ -510,6 +524,8 @@ test "Agent.run executes a full tool-call loop against a mock provider" {
     try std.testing.expectEqualStrings("final answer", result.answer);
     // Reasoning chain surfaces through Agent.run() to the caller.
     try std.testing.expectEqualStrings("chain of thought", result.reasoning);
+    // Actual model from the response surfaces too.
+    try std.testing.expectEqualStrings("mock-model", result.model);
     try std.testing.expectEqual(@as(usize, 1), State.pinged);
     try std.testing.expectEqual(@as(usize, 1), agent.metrics.tool_calls);
     try std.testing.expect(hooks_calls >= 1);
