@@ -158,6 +158,23 @@ pub const RouteCatalog = struct {
         return e.permission;
     }
 
+    /// All distinct permission expressions across the catalog (borrowed from
+    /// the entries; valid while the catalog lives). For menu↔route permission
+    /// audits / validation scripts. Caller frees the returned slice only.
+    pub fn allPermissions(self: *const RouteCatalog, allocator: std.mem.Allocator) ![]const []const u8 {
+        var out = std.ArrayList([]const u8).empty;
+        errdefer out.deinit(allocator);
+        var seen = std.StringHashMap(void).init(allocator);
+        defer seen.deinit();
+        for (self.entries) |e| {
+            const p = e.permission orelse continue;
+            if (seen.contains(p)) continue;
+            try seen.put(p, {});
+            try out.append(allocator, p);
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
     /// Feed catalog rows into OpenApiGenerator (tags = module; `{name}` → path params).
     /// WebSocket upgrades are exported as GET with description `websocket`.
     pub fn exportOpenApi(self: *const RouteCatalog, gen: *OpenApi.OpenApiGenerator) !void {
@@ -827,4 +844,42 @@ test "mount records ws_routes in catalog" {
     }
     try std.testing.expect(saw_ws);
     try std.testing.expect(server.ws_handlers.contains("admin-api/im/ws") or server.ws_handlers.count() == 1);
+}
+
+test "catalog allPermissions returns distinct permission expressions" {
+    const alloc = std.testing.allocator;
+    var entries = try alloc.alloc(CatalogEntry, 3);
+    entries[0] = .{
+        .method = .GET,
+        .path = try alloc.dupe(u8, "api/v1/policies"),
+        .auth = .jwt,
+        .module = "policy",
+        .permission = try alloc.dupe(u8, "policy:view"),
+    };
+    entries[1] = .{
+        .method = .POST,
+        .path = try alloc.dupe(u8, "api/v1/policies"),
+        .auth = .jwt,
+        .module = "policy",
+        .permission = try alloc.dupe(u8, "policy:write"),
+    };
+    entries[2] = .{
+        .method = .GET,
+        .path = try alloc.dupe(u8, "api/v1/policies/{id}"),
+        .auth = .jwt,
+        .module = "policy",
+        .permission = try alloc.dupe(u8, "policy:view"), // duplicate
+    };
+    var catalog = RouteCatalog{ .allocator = alloc, .entries = entries };
+    defer {
+        // deinit frees paths only; the permission dupes are test-owned.
+        for (entries) |e| alloc.free(e.permission.?);
+        catalog.deinit();
+    }
+
+    const perms = try catalog.allPermissions(alloc);
+    defer alloc.free(perms);
+    try std.testing.expectEqual(@as(usize, 2), perms.len);
+    try std.testing.expectEqualStrings("policy:view", perms[0]);
+    try std.testing.expectEqualStrings("policy:write", perms[1]);
 }

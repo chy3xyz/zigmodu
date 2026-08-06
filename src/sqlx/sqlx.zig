@@ -4940,6 +4940,15 @@ pub const Transaction = struct {
         return try rows.rows[0].scan(allocator, T);
     }
 
+    /// Partial-scan variant of `queryRow` on a transaction: missing columns
+    /// are zeroed instead of failing (like `Client.queryRowPartial`).
+    pub fn queryRowPartial(self: *Transaction, allocator: std.mem.Allocator, comptime T: type, sql_str: []const u8, args: []const Value) !T {
+        var rows = try self.query(allocator, sql_str, args);
+        defer rows.deinit();
+        if (rows.rows.len == 0) return error.NotFound;
+        return try rows.rows[0].scanPartial(allocator, T);
+    }
+
     /// queryRows scans all rows into an owned QueryResult(T) (like Client.queryRows but on tx).
     /// Caller MUST `defer result.deinit(allocator)`.
     pub fn queryRows(self: *Transaction, allocator: std.mem.Allocator, comptime T: type, sql_str: []const u8, args: []const Value) !QueryResult(T) {
@@ -6976,4 +6985,28 @@ test "convertPlaceholders skips ? inside literals and comments" {
         defer allocator.free(got);
         try std.testing.expectEqualStrings(case.want, got);
     }
+}
+
+test "sqlite transaction queryRowPartial zeroes missing columns" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+
+    try client.connect();
+    _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+    _ = try client.exec("INSERT INTO users (name) VALUES (?1)", &.{.{ .string = "Alice" }});
+
+    const PartialUser = struct {
+        id: i64,
+        name: []const u8,
+        bio: []const u8, // missing in DB, should be zeroed
+    };
+
+    var tx = try client.beginTx();
+    defer tx.rollback() catch {};
+    const user = try tx.queryRowPartial(allocator, PartialUser, "SELECT id, name FROM users WHERE name = ?1", &.{.{ .string = "Alice" }});
+    defer freeScanned(allocator, PartialUser, user);
+    try std.testing.expectEqual(@as(i64, 1), user.id);
+    try std.testing.expectEqualStrings("Alice", user.name);
+    try std.testing.expectEqual(@as(usize, 0), user.bio.len);
 }
