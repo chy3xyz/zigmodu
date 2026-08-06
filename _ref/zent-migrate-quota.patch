@@ -1,0 +1,85 @@
+diff --git a/src/sql/schema/migrate.zig b/src/sql/schema/migrate.zig
+index c163e89..82eb066 100644
+--- a/src/sql/schema/migrate.zig
++++ b/src/sql/schema/migrate.zig
+@@ -36,9 +36,14 @@ fn unixTimestamp() i64 {
+ /// The version is derived from the bytes of the key using a
+ /// linear congruential hash. The 31-bit mask keeps it positive and
+ /// within MySQL's signed INTEGER range (32-bit).
+-fn computeMigrationVersion(comptime table: []const u8, comptime op: []const u8, comptime target: []const u8) i64 {
+-    @setEvalBranchQuota(50000);
+-    comptime var h: u64 = 14_695_981_039_346_656_037;
++fn computeMigrationVersion(table: []const u8, op: []const u8, target: []const u8) i64 {
++    // Runtime FNV-1a-style hash — deterministic, so version numbers are
++    // identical to the previous comptime version (applied records stay
++    // valid). Keeping this out of comptime avoids per-table/per-op codegen
++    // explosion: the whole migrate loop is `inline for (infos)`, so a
++    // comptime version instantiated a hash loop for every table × op and
++    // blew the fmt eval branch quota at ~25 tables.
++    var h: u64 = 14_695_981_039_346_656_037;
+     for (table) |b| {
+         h ^= b;
+         h *%= 1_099_511_628_211;
+@@ -1159,7 +1164,7 @@ pub fn migrateSchemaWithOptions(
+     // stale and we must re-create the table.
+     inline for (infos) |info| {
+         if (info.is_view) {
+-            const version = comptime computeMigrationVersion(info.table_name, "create_view", "");
++            const version = computeMigrationVersion(info.table_name, "create_view", "");
+             if (!versionContains(applied, version)) {
+                 const sql = try createViewSQL(info, dialect);
+                 defer std.heap.page_allocator.free(sql);
+@@ -1181,7 +1186,7 @@ pub fn migrateSchemaWithOptions(
+             }
+         } else {
+             const table = comptime tableFromTypeInfoCrossRef(info, infos);
+-            const version = comptime computeMigrationVersion(info.table_name, "create_table", "");
++            const version = computeMigrationVersion(info.table_name, "create_table", "");
+             if (!versionContains(applied, version)) {
+                 const sql = try createTableSQL(table, dialect);
+                 defer std.heap.page_allocator.free(sql);
+@@ -1212,7 +1217,7 @@ pub fn migrateSchemaWithOptions(
+         inline for (info.edges) |e| {
+             if (e.relation == .m2m and e.through == null) {
+                 const jtable = comptime junctionTableForEdge(e, info);
+-                const version = comptime computeMigrationVersion(jtable.name, "create_junction", "");
++                const version = computeMigrationVersion(jtable.name, "create_junction", "");
+                 if (!versionContains(applied, version)) {
+                     const sql = try createTableSQL(jtable, dialect);
+                     defer std.heap.page_allocator.free(sql);
+@@ -1254,7 +1259,7 @@ pub fn migrateSchemaWithOptions(
+         defer freeExistingColumns(allocator, &existing_cols);
+ 
+         inline for (table.columns) |col| {
+-            const version = comptime computeMigrationVersion(info.table_name, "add_column", col.name);
++            const version = computeMigrationVersion(info.table_name, "add_column", col.name);
+             if (!columnExists(existing_cols.items, col.name)) {
+                 const sql = try alterTableAddColumnSQL(allocator, table.name, col, dialect);
+                 defer allocator.free(sql);
+@@ -1296,7 +1301,7 @@ pub fn migrateSchemaWithOptions(
+                     if (!std.mem.eql(u8, db_norm, schema_norm)) {
+                         // Skip ALTER TYPE on SQLite (unsupported natively).
+                         if (dialect.name[0] != 's') {
+-                            const version = comptime computeMigrationVersion(info.table_name, "alter_type", col.name);
++                            const version = computeMigrationVersion(info.table_name, "alter_type", col.name);
+                             if (!versionContains(applied, version)) {
+                                 const sql = try alterColumnTypeSQL(allocator, table.name, col.name, col.sql_type, dialect);
+                                 defer allocator.free(sql);
+@@ -1319,7 +1324,7 @@ pub fn migrateSchemaWithOptions(
+                 .unique = idx.unique,
+             };
+             if (!indexExists(existing_idxs.items, idx_def.name)) {
+-                const version = comptime computeMigrationVersion(info.table_name, "create_index", idx.name);
++                const version = computeMigrationVersion(info.table_name, "create_index", idx.name);
+                 const sql = try createIndexSQL(idx_def, table.name, dialect);
+                 defer std.heap.page_allocator.free(sql);
+                 _ = try tx_drv.exec(sql, &.{});
+@@ -1670,7 +1675,7 @@ pub fn rollbackFilesWithOptions(
+ // ------------------------------------------------------------------
+ 
+ test "Migration version uses stable positive FNV-1a hash" {
+-    const version = comptime computeMigrationVersion("user", "add_column", "email");
++    const version = computeMigrationVersion("user", "add_column", "email");
+     try std.testing.expectEqual(@as(i64, 1_157_043_292), version);
+     try std.testing.expect(version >= 0);
+     try std.testing.expect(version <= std.math.maxInt(i32));

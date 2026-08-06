@@ -2,7 +2,7 @@
 
 > 基于 Spring Modulith 架构哲学 + Zig 编译期能力 + AI 协作实践
 >
-> 版本：1.1 | ZigModu **v0.15.18** | Zig **0.17.0**
+> 版本：1.1 | ZigModu **v0.15.19** | Zig **0.17.0**
 >
 > **操作手册（写代码先读）**：仓库根目录 [`AGENTS.md`](../AGENTS.md) — 文档地图、近期栈 DO/DON'T、ComptimeRouter / Path A 鉴权。  
 > 本文讲**为什么**；与 AGENTS / `ROUTE_TABLE` / `MODULE_LAYERS` 冲突时，以那三份为准。
