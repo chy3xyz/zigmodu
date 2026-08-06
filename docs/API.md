@@ -85,19 +85,21 @@ pub fn validateModules(modules: *ApplicationModules) !void
 
 ### Lifecycle Management
 
-#### `zigmodu.startAll`
+#### `Application.start` / `Application.stop`（推荐）
 
-Start all modules in dependency order.
+启动/停止整个应用（依赖顺序启动、逆序停止，内部调用 Lifecycle）。
+
+```zig
+pub fn start(self: *Self) !void
+pub fn stop(self: *Self) void
+```
+
+#### `zigmodu.startAll` / `zigmodu.stopAll`（底层 Lifecycle）
+
+`Application.start/stop` 的内部实现；直接使用需自行管理模块生命周期。
 
 ```zig
 pub fn startAll(modules: *ApplicationModules) !void
-```
-
-#### `zigmodu.stopAll`
-
-Stop all modules in reverse dependency order.
-
-```zig
 pub fn stopAll(modules: *ApplicationModules) void
 ```
 

@@ -64,9 +64,9 @@ pub fn main(init: std.process.Init) !void {
     // Generate documentation (optional)
     try zigmodu.generateDocs(&modules, "modules.puml", allocator);
 
-    // Start all modules
-    try zigmodu.startAll(&modules);
-    defer zigmodu.stopAll(&modules);
+    // Start the application (wraps Lifecycle.startAll in dependency order)
+    try app.start();
+    defer app.stop();
 
     std.log.info("Application started successfully!", .{});
 }
