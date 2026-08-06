@@ -1,6 +1,5 @@
 const std = @import("std");
 const Time = @import("../core/Time.zig");
-const sockread = @import("../core/sockread.zig");
 
 /// HTTP client with connection pool and retry
 pub const HttpClient = struct {
