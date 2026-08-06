@@ -635,7 +635,7 @@ pub const GrpcServiceRegistry = struct {
         const msg_copy = try self.allocator.dupe(u8, writer.message);
         const body_owned = try self.allocator.dupe(u8, writer.bytes());
         const count = writer.count;
-        const status_str = try std.fmt.allocPrint(self.allocator, "{d}", .{@intFromEnum(status)});
+        const status_str = try std.fmt.allocPrint(self.allocator, "{d}", .{@backingInt(status)});
         defer self.allocator.free(status_str);
         const h2 = try Http2.encodeGrpcServerStream(self.allocator, stream_id, body_owned, status_str, writer.message);
         writer.deinit();
@@ -726,7 +726,7 @@ pub const GrpcServiceRegistry = struct {
         const http_status: u16 = if (grpc_status == .OK) 200 else grpc_status.toHttpCode();
         const framed = try GrpcFrame.encode(self.allocator, owned.payload);
         self.allocator.free(owned.payload);
-        const status_str = try std.fmt.allocPrint(self.allocator, "{d}", .{@intFromEnum(grpc_status)});
+        const status_str = try std.fmt.allocPrint(self.allocator, "{d}", .{@backingInt(grpc_status)});
         defer self.allocator.free(status_str);
         const h2 = try Http2.encodeGrpcServerStream(self.allocator, stream_id, framed, status_str, owned.message);
         return .{
@@ -750,7 +750,7 @@ pub const GrpcServiceRegistry = struct {
         const msg_copy = try self.allocator.dupe(u8, writer.message);
         const body_owned = try self.allocator.dupe(u8, writer.bytes());
         const count = writer.count;
-        const status_str = try std.fmt.allocPrint(self.allocator, "{d}", .{@intFromEnum(status)});
+        const status_str = try std.fmt.allocPrint(self.allocator, "{d}", .{@backingInt(status)});
         defer self.allocator.free(status_str);
         const h2 = try Http2.encodeGrpcServerStream(self.allocator, stream_id, body_owned, status_str, writer.message);
         writer.deinit();
@@ -829,7 +829,7 @@ pub const GrpcServiceRegistry = struct {
         const msg_copy = try self.allocator.dupe(u8, writer.message);
         const body_owned = try self.allocator.dupe(u8, writer.bytes());
         const count = writer.count;
-        const status_str = try std.fmt.allocPrint(self.allocator, "{d}", .{@intFromEnum(status)});
+        const status_str = try std.fmt.allocPrint(self.allocator, "{d}", .{@backingInt(status)});
         defer self.allocator.free(status_str);
         // When live flush was used, http2_wire may only need trailers; still package full response for batch mode.
         const h2 = if (flush == null)

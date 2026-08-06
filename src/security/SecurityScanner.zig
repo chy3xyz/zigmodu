@@ -84,7 +84,7 @@ pub const SecurityScanner = struct {
         }
 
         pub fn isHigherOrEqual(self: Severity, other: Severity) bool {
-            return @intFromEnum(self) <= @intFromEnum(other);
+            return @backingInt(self) <= @backingInt(other);
         }
     };
 
@@ -199,7 +199,7 @@ pub const SecurityScanner = struct {
     /// [...]
     pub fn scanSourceCode(self: *Self, file_path: []const u8, source_code: []const u8) !void {
         for (self.rules.items) |rule| {
-            if (@intFromEnum(rule.severity) > @intFromEnum(self.config.min_severity)) {
+            if (@backingInt(rule.severity) > @backingInt(self.config.min_severity)) {
                 continue;
             }
 

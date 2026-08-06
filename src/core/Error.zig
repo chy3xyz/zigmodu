@@ -263,7 +263,7 @@ pub fn toJson(allocator: std.mem.Allocator, err: ErrorResponse) ![]u8 {
 /// Convenience: create JSON from ZigModuError + message
 pub fn fromError(allocator: std.mem.Allocator, err: ZigModuError, message: []const u8) ![]u8 {
     const resp = ErrorResponse{
-        .code = @intFromEnum(toHttpCode(err)),
+        .code = @backingInt(toHttpCode(err)),
         .message = message,
     };
     return toJson(allocator, resp);

@@ -175,7 +175,7 @@ pub const WsUring = struct {
         if (@TypeOf(sqe.opcode) == u8) {
             sqe.opcode = IORING_OP_READ;
         } else {
-            sqe.opcode = @enumFromInt(IORING_OP_READ);
+            sqe.opcode = @fromBackingInt(@intCast(IORING_OP_READ));
         }
         sqe.fd = conn.fd;
         sqe.addr = @intFromPtr(&conn.buf[conn.data_offset + conn.data_len]);

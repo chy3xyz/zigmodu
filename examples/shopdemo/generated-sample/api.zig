@@ -79,12 +79,12 @@ pub const OrderApi = struct {
         const size_str = ctx.query.get("size") orelse "10";
         const page = std.fmt.parseInt(usize, page_str, 10) catch {
             std.log.warn("[order] list: invalid page", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid page");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid page");
             return;
         };
         const size = std.fmt.parseInt(usize, size_str, 10) catch {
             std.log.warn("[order] list: invalid size", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid size");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid size");
             return;
         };
         const result = try self.service.listZmoduOrders(page, size);
@@ -95,12 +95,12 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const id_str = ctx.params.get("id") orelse {
             std.log.warn("[order] get: missing id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "missing id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "missing id");
             return;
         };
         const id = std.fmt.parseInt(i64, id_str, 10) catch {
             std.log.warn("[order] get: invalid id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid id");
             return;
         };
         const entity = try self.service.getZmoduOrder(id);
@@ -111,7 +111,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const entity = ctx.bindJson(model.ZmoduOrder) catch {
             std.log.warn("[order] create: invalid body", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid body");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid body");
             return;
         };
         const created = try self.service.createZmoduOrder(entity);
@@ -122,7 +122,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const entity = ctx.bindJson(model.ZmoduOrder) catch {
             std.log.warn("[order] update: invalid body", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid body");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid body");
             return;
         };
         try self.service.updateZmoduOrder(entity);
@@ -133,7 +133,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const id_str = ctx.params.get("id") orelse {
             std.log.warn("[order] delete: missing id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid id");
             return;
         };
         try self.service.deleteZmoduOrder(id);
@@ -146,12 +146,12 @@ pub const OrderApi = struct {
         const size_str = ctx.query.get("size") orelse "10";
         const page = std.fmt.parseInt(usize, page_str, 10) catch {
             std.log.warn("[order] list: invalid page", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid page");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid page");
             return;
         };
         const size = std.fmt.parseInt(usize, size_str, 10) catch {
             std.log.warn("[order] list: invalid size", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid size");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid size");
             return;
         };
         const result = try self.service.listZmoduOrderAddresss(page, size);
@@ -162,12 +162,12 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const id_str = ctx.params.get("id") orelse {
             std.log.warn("[order] get: missing id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "missing id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "missing id");
             return;
         };
         const id = std.fmt.parseInt(i64, id_str, 10) catch {
             std.log.warn("[order] get: invalid id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid id");
             return;
         };
         const entity = try self.service.getZmoduOrderAddress(id);
@@ -178,7 +178,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const entity = ctx.bindJson(model.ZmoduOrderAddress) catch {
             std.log.warn("[order] create: invalid body", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid body");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid body");
             return;
         };
         const created = try self.service.createZmoduOrderAddress(entity);
@@ -189,7 +189,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const entity = ctx.bindJson(model.ZmoduOrderAddress) catch {
             std.log.warn("[order] update: invalid body", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid body");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid body");
             return;
         };
         try self.service.updateZmoduOrderAddress(entity);
@@ -200,7 +200,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const id_str = ctx.params.get("id") orelse {
             std.log.warn("[order] delete: missing id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid id");
             return;
         };
         try self.service.deleteZmoduOrderAddress(id);
@@ -213,12 +213,12 @@ pub const OrderApi = struct {
         const size_str = ctx.query.get("size") orelse "10";
         const page = std.fmt.parseInt(usize, page_str, 10) catch {
             std.log.warn("[order] list: invalid page", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid page");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid page");
             return;
         };
         const size = std.fmt.parseInt(usize, size_str, 10) catch {
             std.log.warn("[order] list: invalid size", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid size");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid size");
             return;
         };
         const result = try self.service.listZmoduOrderAdvances(page, size);
@@ -229,12 +229,12 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const id_str = ctx.params.get("id") orelse {
             std.log.warn("[order] get: missing id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "missing id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "missing id");
             return;
         };
         const id = std.fmt.parseInt(i64, id_str, 10) catch {
             std.log.warn("[order] get: invalid id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid id");
             return;
         };
         const entity = try self.service.getZmoduOrderAdvance(id);
@@ -245,7 +245,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const entity = ctx.bindJson(model.ZmoduOrderAdvance) catch {
             std.log.warn("[order] create: invalid body", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid body");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid body");
             return;
         };
         const created = try self.service.createZmoduOrderAdvance(entity);
@@ -256,7 +256,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const entity = ctx.bindJson(model.ZmoduOrderAdvance) catch {
             std.log.warn("[order] update: invalid body", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid body");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid body");
             return;
         };
         try self.service.updateZmoduOrderAdvance(entity);
@@ -267,7 +267,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const id_str = ctx.params.get("id") orelse {
             std.log.warn("[order] delete: missing id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid id");
             return;
         };
         try self.service.deleteZmoduOrderAdvance(id);
@@ -280,12 +280,12 @@ pub const OrderApi = struct {
         const size_str = ctx.query.get("size") orelse "10";
         const page = std.fmt.parseInt(usize, page_str, 10) catch {
             std.log.warn("[order] list: invalid page", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid page");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid page");
             return;
         };
         const size = std.fmt.parseInt(usize, size_str, 10) catch {
             std.log.warn("[order] list: invalid size", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid size");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid size");
             return;
         };
         const result = try self.service.listZmoduOrderDeliverys(page, size);
@@ -296,12 +296,12 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const id_str = ctx.params.get("id") orelse {
             std.log.warn("[order] get: missing id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "missing id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "missing id");
             return;
         };
         const id = std.fmt.parseInt(i64, id_str, 10) catch {
             std.log.warn("[order] get: invalid id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid id");
             return;
         };
         const entity = try self.service.getZmoduOrderDelivery(id);
@@ -312,7 +312,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const entity = ctx.bindJson(model.ZmoduOrderDelivery) catch {
             std.log.warn("[order] create: invalid body", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid body");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid body");
             return;
         };
         const created = try self.service.createZmoduOrderDelivery(entity);
@@ -323,7 +323,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const entity = ctx.bindJson(model.ZmoduOrderDelivery) catch {
             std.log.warn("[order] update: invalid body", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid body");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid body");
             return;
         };
         try self.service.updateZmoduOrderDelivery(entity);
@@ -334,7 +334,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const id_str = ctx.params.get("id") orelse {
             std.log.warn("[order] delete: missing id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid id");
             return;
         };
         try self.service.deleteZmoduOrderDelivery(id);
@@ -347,12 +347,12 @@ pub const OrderApi = struct {
         const size_str = ctx.query.get("size") orelse "10";
         const page = std.fmt.parseInt(usize, page_str, 10) catch {
             std.log.warn("[order] list: invalid page", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid page");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid page");
             return;
         };
         const size = std.fmt.parseInt(usize, size_str, 10) catch {
             std.log.warn("[order] list: invalid size", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid size");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid size");
             return;
         };
         const result = try self.service.listZmoduOrderExtracts(page, size);
@@ -363,12 +363,12 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const id_str = ctx.params.get("id") orelse {
             std.log.warn("[order] get: missing id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "missing id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "missing id");
             return;
         };
         const id = std.fmt.parseInt(i64, id_str, 10) catch {
             std.log.warn("[order] get: invalid id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid id");
             return;
         };
         const entity = try self.service.getZmoduOrderExtract(id);
@@ -379,7 +379,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const entity = ctx.bindJson(model.ZmoduOrderExtract) catch {
             std.log.warn("[order] create: invalid body", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid body");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid body");
             return;
         };
         const created = try self.service.createZmoduOrderExtract(entity);
@@ -390,7 +390,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const entity = ctx.bindJson(model.ZmoduOrderExtract) catch {
             std.log.warn("[order] update: invalid body", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid body");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid body");
             return;
         };
         try self.service.updateZmoduOrderExtract(entity);
@@ -401,7 +401,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const id_str = ctx.params.get("id") orelse {
             std.log.warn("[order] delete: missing id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid id");
             return;
         };
         try self.service.deleteZmoduOrderExtract(id);
@@ -414,12 +414,12 @@ pub const OrderApi = struct {
         const size_str = ctx.query.get("size") orelse "10";
         const page = std.fmt.parseInt(usize, page_str, 10) catch {
             std.log.warn("[order] list: invalid page", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid page");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid page");
             return;
         };
         const size = std.fmt.parseInt(usize, size_str, 10) catch {
             std.log.warn("[order] list: invalid size", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid size");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid size");
             return;
         };
         const result = try self.service.listZmoduOrderProducts(page, size);
@@ -430,12 +430,12 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const id_str = ctx.params.get("id") orelse {
             std.log.warn("[order] get: missing id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "missing id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "missing id");
             return;
         };
         const id = std.fmt.parseInt(i64, id_str, 10) catch {
             std.log.warn("[order] get: invalid id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid id");
             return;
         };
         const entity = try self.service.getZmoduOrderProduct(id);
@@ -446,7 +446,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const entity = ctx.bindJson(model.ZmoduOrderProduct) catch {
             std.log.warn("[order] create: invalid body", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid body");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid body");
             return;
         };
         const created = try self.service.createZmoduOrderProduct(entity);
@@ -457,7 +457,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const entity = ctx.bindJson(model.ZmoduOrderProduct) catch {
             std.log.warn("[order] update: invalid body", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid body");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid body");
             return;
         };
         try self.service.updateZmoduOrderProduct(entity);
@@ -468,7 +468,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const id_str = ctx.params.get("id") orelse {
             std.log.warn("[order] delete: missing id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid id");
             return;
         };
         try self.service.deleteZmoduOrderProduct(id);
@@ -481,12 +481,12 @@ pub const OrderApi = struct {
         const size_str = ctx.query.get("size") orelse "10";
         const page = std.fmt.parseInt(usize, page_str, 10) catch {
             std.log.warn("[order] list: invalid page", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid page");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid page");
             return;
         };
         const size = std.fmt.parseInt(usize, size_str, 10) catch {
             std.log.warn("[order] list: invalid size", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid size");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid size");
             return;
         };
         const result = try self.service.listZmoduOrderRefunds(page, size);
@@ -497,12 +497,12 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const id_str = ctx.params.get("id") orelse {
             std.log.warn("[order] get: missing id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "missing id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "missing id");
             return;
         };
         const id = std.fmt.parseInt(i64, id_str, 10) catch {
             std.log.warn("[order] get: invalid id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid id");
             return;
         };
         const entity = try self.service.getZmoduOrderRefund(id);
@@ -513,7 +513,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const entity = ctx.bindJson(model.ZmoduOrderRefund) catch {
             std.log.warn("[order] create: invalid body", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid body");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid body");
             return;
         };
         const created = try self.service.createZmoduOrderRefund(entity);
@@ -524,7 +524,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const entity = ctx.bindJson(model.ZmoduOrderRefund) catch {
             std.log.warn("[order] update: invalid body", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid body");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid body");
             return;
         };
         try self.service.updateZmoduOrderRefund(entity);
@@ -535,7 +535,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const id_str = ctx.params.get("id") orelse {
             std.log.warn("[order] delete: missing id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid id");
             return;
         };
         try self.service.deleteZmoduOrderRefund(id);
@@ -548,12 +548,12 @@ pub const OrderApi = struct {
         const size_str = ctx.query.get("size") orelse "10";
         const page = std.fmt.parseInt(usize, page_str, 10) catch {
             std.log.warn("[order] list: invalid page", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid page");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid page");
             return;
         };
         const size = std.fmt.parseInt(usize, size_str, 10) catch {
             std.log.warn("[order] list: invalid size", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid size");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid size");
             return;
         };
         const result = try self.service.listZmoduOrderRefundAddresss(page, size);
@@ -564,12 +564,12 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const id_str = ctx.params.get("id") orelse {
             std.log.warn("[order] get: missing id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "missing id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "missing id");
             return;
         };
         const id = std.fmt.parseInt(i64, id_str, 10) catch {
             std.log.warn("[order] get: invalid id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid id");
             return;
         };
         const entity = try self.service.getZmoduOrderRefundAddress(id);
@@ -580,7 +580,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const entity = ctx.bindJson(model.ZmoduOrderRefundAddress) catch {
             std.log.warn("[order] create: invalid body", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid body");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid body");
             return;
         };
         const created = try self.service.createZmoduOrderRefundAddress(entity);
@@ -591,7 +591,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const entity = ctx.bindJson(model.ZmoduOrderRefundAddress) catch {
             std.log.warn("[order] update: invalid body", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid body");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid body");
             return;
         };
         try self.service.updateZmoduOrderRefundAddress(entity);
@@ -602,7 +602,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const id_str = ctx.params.get("id") orelse {
             std.log.warn("[order] delete: missing id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid id");
             return;
         };
         try self.service.deleteZmoduOrderRefundAddress(id);
@@ -615,12 +615,12 @@ pub const OrderApi = struct {
         const size_str = ctx.query.get("size") orelse "10";
         const page = std.fmt.parseInt(usize, page_str, 10) catch {
             std.log.warn("[order] list: invalid page", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid page");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid page");
             return;
         };
         const size = std.fmt.parseInt(usize, size_str, 10) catch {
             std.log.warn("[order] list: invalid size", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid size");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid size");
             return;
         };
         const result = try self.service.listZmoduOrderRefundImages(page, size);
@@ -631,12 +631,12 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const id_str = ctx.params.get("id") orelse {
             std.log.warn("[order] get: missing id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "missing id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "missing id");
             return;
         };
         const id = std.fmt.parseInt(i64, id_str, 10) catch {
             std.log.warn("[order] get: invalid id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid id");
             return;
         };
         const entity = try self.service.getZmoduOrderRefundImage(id);
@@ -647,7 +647,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const entity = ctx.bindJson(model.ZmoduOrderRefundImage) catch {
             std.log.warn("[order] create: invalid body", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid body");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid body");
             return;
         };
         const created = try self.service.createZmoduOrderRefundImage(entity);
@@ -658,7 +658,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const entity = ctx.bindJson(model.ZmoduOrderRefundImage) catch {
             std.log.warn("[order] update: invalid body", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid body");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid body");
             return;
         };
         try self.service.updateZmoduOrderRefundImage(entity);
@@ -669,7 +669,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const id_str = ctx.params.get("id") orelse {
             std.log.warn("[order] delete: missing id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid id");
             return;
         };
         try self.service.deleteZmoduOrderRefundImage(id);
@@ -682,12 +682,12 @@ pub const OrderApi = struct {
         const size_str = ctx.query.get("size") orelse "10";
         const page = std.fmt.parseInt(usize, page_str, 10) catch {
             std.log.warn("[order] list: invalid page", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid page");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid page");
             return;
         };
         const size = std.fmt.parseInt(usize, size_str, 10) catch {
             std.log.warn("[order] list: invalid size", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid size");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid size");
             return;
         };
         const result = try self.service.listZmoduOrderSettleds(page, size);
@@ -698,12 +698,12 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const id_str = ctx.params.get("id") orelse {
             std.log.warn("[order] get: missing id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "missing id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "missing id");
             return;
         };
         const id = std.fmt.parseInt(i64, id_str, 10) catch {
             std.log.warn("[order] get: invalid id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid id");
             return;
         };
         const entity = try self.service.getZmoduOrderSettled(id);
@@ -714,7 +714,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const entity = ctx.bindJson(model.ZmoduOrderSettled) catch {
             std.log.warn("[order] create: invalid body", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid body");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid body");
             return;
         };
         const created = try self.service.createZmoduOrderSettled(entity);
@@ -725,7 +725,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const entity = ctx.bindJson(model.ZmoduOrderSettled) catch {
             std.log.warn("[order] update: invalid body", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid body");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid body");
             return;
         };
         try self.service.updateZmoduOrderSettled(entity);
@@ -736,7 +736,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const id_str = ctx.params.get("id") orelse {
             std.log.warn("[order] delete: missing id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid id");
             return;
         };
         try self.service.deleteZmoduOrderSettled(id);
@@ -749,12 +749,12 @@ pub const OrderApi = struct {
         const size_str = ctx.query.get("size") orelse "10";
         const page = std.fmt.parseInt(usize, page_str, 10) catch {
             std.log.warn("[order] list: invalid page", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid page");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid page");
             return;
         };
         const size = std.fmt.parseInt(usize, size_str, 10) catch {
             std.log.warn("[order] list: invalid size", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid size");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid size");
             return;
         };
         const result = try self.service.listZmoduOrderTrades(page, size);
@@ -765,12 +765,12 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const id_str = ctx.params.get("id") orelse {
             std.log.warn("[order] get: missing id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "missing id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "missing id");
             return;
         };
         const id = std.fmt.parseInt(i64, id_str, 10) catch {
             std.log.warn("[order] get: invalid id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid id");
             return;
         };
         const entity = try self.service.getZmoduOrderTrade(id);
@@ -781,7 +781,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const entity = ctx.bindJson(model.ZmoduOrderTrade) catch {
             std.log.warn("[order] create: invalid body", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid body");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid body");
             return;
         };
         const created = try self.service.createZmoduOrderTrade(entity);
@@ -792,7 +792,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const entity = ctx.bindJson(model.ZmoduOrderTrade) catch {
             std.log.warn("[order] update: invalid body", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid body");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid body");
             return;
         };
         try self.service.updateZmoduOrderTrade(entity);
@@ -803,7 +803,7 @@ pub const OrderApi = struct {
         const self: *OrderApi = @ptrCast(@alignCast(ctx.user_data orelse return error.InternalError));
         const id_str = ctx.params.get("id") orelse {
             std.log.warn("[order] delete: missing id", .{});
-            try ctx.sendErrorResponse(400, @intFromEnum(zigmodu.HttpCode.BadRequest), "invalid id");
+            try ctx.sendErrorResponse(400, @backingInt(zigmodu.HttpCode.BadRequest), "invalid id");
             return;
         };
         try self.service.deleteZmoduOrderTrade(id);

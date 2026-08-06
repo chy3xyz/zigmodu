@@ -31,7 +31,7 @@ pub fn TenantService(comptime Persistence: type) type {
                 .id = 0,
                 .name = name,
                 .domain = domain,
-                .status = @intFromEnum(enums.TenantStatus.active),
+                .status = @backingInt(enums.TenantStatus.active),
                 .tier = tier.toString(),
                 .created_at = now,
                 .updated_at = now,
@@ -47,7 +47,7 @@ pub fn TenantService(comptime Persistence: type) type {
         pub fn getById(self: *Self, id: i64) !?model.Tenant {
             const tenant = try self.persistence.findById(id);
             if (tenant) |t| {
-                if (t.status != @intFromEnum(enums.TenantStatus.active)) return error.TenantSuspended;
+                if (t.status != @backingInt(enums.TenantStatus.active)) return error.TenantSuspended;
             }
             return tenant;
         }
@@ -65,7 +65,7 @@ pub fn TenantService(comptime Persistence: type) type {
         /// 暂停租户
         pub fn suspendTenant(self: *Self, id: i64) !void {
             var tenant = (try self.getById(id)) orelse return error.TenantNotFound;
-            tenant.status = @intFromEnum(enums.TenantStatus.suspended);
+            tenant.status = @backingInt(enums.TenantStatus.suspended);
             tenant.updated_at = @intCast(zigmodu.time.monotonicNowSeconds());
             try self.persistence.update(tenant);
         }

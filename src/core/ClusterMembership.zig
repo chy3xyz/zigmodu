@@ -226,7 +226,7 @@ pub const ClusterMembership = struct {
         const addr_str = try std.fmt.bufPrint(&addr_buf, "{any}", .{self.address});
         const host = if (std.mem.indexOf(u8, addr_str, ":")) |colon| addr_str[0..colon] else addr_str;
 
-        const payload = try std.fmt.bufPrint(&buf, "{{\"t\":{d},\"id\":\"{s}\",\"h\":\"{s}\",\"p\":{d},\"ts\":{d}}}", .{ @intFromEnum(event_type), self.node_id, host, self.address.ip4.port, Time.monotonicNowSeconds() });
+        const payload = try std.fmt.bufPrint(&buf, "{{\"t\":{d},\"id\":\"{s}\",\"h\":\"{s}\",\"p\":{d},\"ts\":{d}}}", .{ @backingInt(event_type), self.node_id, host, self.address.ip4.port, Time.monotonicNowSeconds() });
 
         try self.bus.publish("cluster.membership", payload);
     }
@@ -250,7 +250,7 @@ pub const ClusterMembership = struct {
         const ts = extractJsonInt(payload, "ts") orelse return null;
         if (t < 1 or t > 5) return null;
         return .{
-            .event_type = @enumFromInt(@as(u8, @intCast(t))),
+            .event_type = @fromBackingInt(@intCast(@as(u8, @intCast(t)))),
             .node_id = id,
             .host = host,
             .port = @intCast(port_i),

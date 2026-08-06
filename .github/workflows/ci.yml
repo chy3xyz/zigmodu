@@ -16,7 +16,7 @@ concurrency:
 env:
   # Pin the exact toolchain used for local development so fmt/build behavior
   # is reproducible in CI (dev builds are also fetchable by mlugg/setup-zig).
-  ZIG_VERSION: "0.17.0-dev.1422+e863bf3be"
+  ZIG_VERSION: "0.17.0-dev.1567+f0354179a"
 
 jobs:
   # ── Build & Test Matrix ────────────────────────

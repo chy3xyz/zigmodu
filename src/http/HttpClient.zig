@@ -328,7 +328,7 @@ pub const HttpClient = struct {
 
         var resp = HttpResponse.init(self.allocator);
         errdefer resp.deinit();
-        resp.status_code = @intFromEnum(result.status);
+        resp.status_code = @backingInt(result.status);
         resp.body = try aw.toOwnedSlice();
         return resp;
     }
@@ -364,7 +364,7 @@ pub const HttpClient = struct {
 
         var resp = HttpResponse.init(self.allocator);
         errdefer resp.deinit();
-        resp.status_code = @intFromEnum(response.head.status);
+        resp.status_code = @backingInt(response.head.status);
         resp.body = try self.allocator.dupe(u8, "");
 
         var transfer_buf: [4096]u8 = undefined;

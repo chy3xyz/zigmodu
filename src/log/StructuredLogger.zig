@@ -66,7 +66,7 @@ pub const StructuredLogger = struct {
 
     /// [...]
     pub fn log(self: *Self, level: LogLevel, message: []const u8, fields: anytype) !void {
-        if (@intFromEnum(level) < @intFromEnum(self.level)) {
+        if (@backingInt(level) < @backingInt(self.level)) {
             return;
         }
 
@@ -281,8 +281,8 @@ test "StructuredLogger struct fields keys are owned" {
 test "LogLevel ordering" {
     const testing = std.testing;
 
-    try testing.expect(@intFromEnum(LogLevel.DEBUG) < @intFromEnum(LogLevel.INFO));
-    try testing.expect(@intFromEnum(LogLevel.INFO) < @intFromEnum(LogLevel.WARN));
-    try testing.expect(@intFromEnum(LogLevel.WARN) < @intFromEnum(LogLevel.ERROR));
-    try testing.expect(@intFromEnum(LogLevel.ERROR) < @intFromEnum(LogLevel.FATAL));
+    try testing.expect(@backingInt(LogLevel.DEBUG) < @backingInt(LogLevel.INFO));
+    try testing.expect(@backingInt(LogLevel.INFO) < @backingInt(LogLevel.WARN));
+    try testing.expect(@backingInt(LogLevel.WARN) < @backingInt(LogLevel.ERROR));
+    try testing.expect(@backingInt(LogLevel.ERROR) < @backingInt(LogLevel.FATAL));
 }

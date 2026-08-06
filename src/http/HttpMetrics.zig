@@ -69,12 +69,12 @@ pub const HttpMetricsCollector = struct {
         self.max_duration_seconds = @max(self.max_duration_seconds, duration_seconds);
 
         const bucket: usize = switch (status) {
-            100...199 => @intFromEnum(StatusBucket.info),
-            200...299 => @intFromEnum(StatusBucket.success),
-            300...399 => @intFromEnum(StatusBucket.redirect),
-            400...499 => @intFromEnum(StatusBucket.client_error),
-            500...599 => @intFromEnum(StatusBucket.server_error),
-            else => @intFromEnum(StatusBucket.unknown),
+            100...199 => @backingInt(StatusBucket.info),
+            200...299 => @backingInt(StatusBucket.success),
+            300...399 => @backingInt(StatusBucket.redirect),
+            400...499 => @backingInt(StatusBucket.client_error),
+            500...599 => @backingInt(StatusBucket.server_error),
+            else => @backingInt(StatusBucket.unknown),
         };
         self.status_counts[bucket] += 1;
     }
@@ -110,9 +110,9 @@ pub const HttpMetricsCollector = struct {
 
         try Emit.f(&buf, allocator, "  Total Requests:    {d}\n", .{self.request_count});
         try Emit.f(&buf, allocator, "  In Flight:         {d}\n", .{self.in_flight});
-        try Emit.f(&buf, allocator, "  2xx Responses:     {d}\n", .{self.status_counts[@intFromEnum(StatusBucket.success)]});
-        try Emit.f(&buf, allocator, "  4xx Responses:     {d}\n", .{self.status_counts[@intFromEnum(StatusBucket.client_error)]});
-        try Emit.f(&buf, allocator, "  5xx Responses:     {d}\n", .{self.status_counts[@intFromEnum(StatusBucket.server_error)]});
+        try Emit.f(&buf, allocator, "  2xx Responses:     {d}\n", .{self.status_counts[@backingInt(StatusBucket.success)]});
+        try Emit.f(&buf, allocator, "  4xx Responses:     {d}\n", .{self.status_counts[@backingInt(StatusBucket.client_error)]});
+        try Emit.f(&buf, allocator, "  5xx Responses:     {d}\n", .{self.status_counts[@backingInt(StatusBucket.server_error)]});
         try Emit.f(&buf, allocator, "  Avg Duration:      {d:.3}ms\n", .{self.avgDuration() * 1000});
         try Emit.f(&buf, allocator, "  Min Duration:      {d:.3}ms\n", .{self.min_duration_seconds * 1000});
         try Emit.f(&buf, allocator, "  Max Duration:      {d:.3}ms\n", .{self.max_duration_seconds * 1000});
@@ -137,9 +137,9 @@ test "HttpMetricsCollector record and stats" {
     collector.recordRequest(201, 0.015);
 
     try std.testing.expectEqual(@as(u64, 5), collector.request_count);
-    try std.testing.expectEqual(@as(u64, 3), collector.status_counts[@intFromEnum(HttpMetricsCollector.StatusBucket.success)]);
-    try std.testing.expectEqual(@as(u64, 1), collector.status_counts[@intFromEnum(HttpMetricsCollector.StatusBucket.client_error)]);
-    try std.testing.expectEqual(@as(u64, 1), collector.status_counts[@intFromEnum(HttpMetricsCollector.StatusBucket.server_error)]);
+    try std.testing.expectEqual(@as(u64, 3), collector.status_counts[@backingInt(HttpMetricsCollector.StatusBucket.success)]);
+    try std.testing.expectEqual(@as(u64, 1), collector.status_counts[@backingInt(HttpMetricsCollector.StatusBucket.client_error)]);
+    try std.testing.expectEqual(@as(u64, 1), collector.status_counts[@backingInt(HttpMetricsCollector.StatusBucket.server_error)]);
 }
 
 test "HttpMetricsCollector avg duration" {

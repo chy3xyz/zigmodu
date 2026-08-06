@@ -38,7 +38,7 @@ pub const LOG_LEVEL: LogLevel = blk: {
 
 /// Returns true if the given level meets or exceeds the compile-time minimum.
 pub fn logLevelAtLeast(level: LogLevel) bool {
-    return @intFromEnum(level) >= @intFromEnum(LOG_LEVEL);
+    return @backingInt(level) >= @backingInt(LOG_LEVEL);
 }
 
 test "logLevelAtLeast" {
@@ -46,15 +46,15 @@ test "logLevelAtLeast" {
     // At minimum, LOG_LEVEL itself should always pass.
     try std.testing.expect(logLevelAtLeast(LOG_LEVEL));
     // Higher severity levels should also pass.
-    if (@intFromEnum(LOG_LEVEL) <= @intFromEnum(LogLevel.err)) {
+    if (@backingInt(LOG_LEVEL) <= @backingInt(LogLevel.err)) {
         try std.testing.expect(logLevelAtLeast(.err));
     }
 }
 
 test "LogLevel ordering" {
-    try std.testing.expect(@intFromEnum(LogLevel.debug) < @intFromEnum(LogLevel.info));
-    try std.testing.expect(@intFromEnum(LogLevel.info) < @intFromEnum(LogLevel.warn));
-    try std.testing.expect(@intFromEnum(LogLevel.warn) < @intFromEnum(LogLevel.err));
+    try std.testing.expect(@backingInt(LogLevel.debug) < @backingInt(LogLevel.info));
+    try std.testing.expect(@backingInt(LogLevel.info) < @backingInt(LogLevel.warn));
+    try std.testing.expect(@backingInt(LogLevel.warn) < @backingInt(LogLevel.err));
 }
 
 test "LogLevel fromString" {

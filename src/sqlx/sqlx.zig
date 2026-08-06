@@ -1812,7 +1812,7 @@ pub const PostgresConn = struct {
         const status = libpq_c.PQresultStatus(res.?);
         if (status != libpq_c.ExecStatusType.PGRES_TUPLES_OK) {
             const err_msg = std.mem.span(libpq_c.PQerrorMessage(self.conn));
-            std.log.err("PG queryFn: status={d} sql={s} err={s}", .{ @intFromEnum(status), sql_str, err_msg });
+            std.log.err("PG queryFn: status={d} sql={s} err={s}", .{ @backingInt(status), sql_str, err_msg });
             if (status == libpq_c.ExecStatusType.PGRES_FATAL_ERROR) {
                 const diag = diagnosePostgres(res);
                 const sqlstate = cStrSpan(libpq_c.PQresultErrorField(res.?, PG_DIAG_SQLSTATE));
@@ -1870,7 +1870,7 @@ pub const PostgresConn = struct {
         const status = libpq_c.PQresultStatus(res.?);
         if (status != libpq_c.ExecStatusType.PGRES_COMMAND_OK and status != libpq_c.ExecStatusType.PGRES_TUPLES_OK) {
             const err_msg = std.mem.span(libpq_c.PQerrorMessage(self.conn));
-            std.log.err("PG execFn: status={d} sql={s} err={s}", .{ @intFromEnum(status), sql_str, err_msg });
+            std.log.err("PG execFn: status={d} sql={s} err={s}", .{ @backingInt(status), sql_str, err_msg });
             if (status == libpq_c.ExecStatusType.PGRES_FATAL_ERROR) {
                 const diag = diagnosePostgres(res.?);
                 const sqlstate = cStrSpan(libpq_c.PQresultErrorField(res.?, PG_DIAG_SQLSTATE));

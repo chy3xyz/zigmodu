@@ -1043,7 +1043,7 @@ fn buildStreamResponseWire(
             }
             var unary = try reg.handleHttpUnary(path, st.data.items);
             defer unary.deinit(allocator);
-            const status_str = try std.fmt.allocPrint(allocator, "{d}", .{@intFromEnum(unary.grpc_status)});
+            const status_str = try std.fmt.allocPrint(allocator, "{d}", .{@backingInt(unary.grpc_status)});
             defer allocator.free(status_str);
             return try Http2.encodeGrpcServerStream(allocator, stream_id, unary.body, status_str, unary.grpc_message);
         }

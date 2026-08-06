@@ -26,7 +26,7 @@ pub fn TenantService(comptime Persistence: type) type {
                 .id = 0,
                 .name = name,
                 .domain = domain,
-                .status = @intFromEnum(enums.TenantStatus.active),
+                .status = @backingInt(enums.TenantStatus.active),
                 .tier = tier.toString(),
                 .created_at = now,
                 .updated_at = now,

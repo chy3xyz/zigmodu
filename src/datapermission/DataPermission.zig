@@ -22,7 +22,7 @@ pub const DataPermissionContext = struct {
         if (roles.len == 0) return ctx;
         var widest = roles[0];
         for (roles[1..]) |role| {
-            if (@intFromEnum(role.data_scope) < @intFromEnum(widest.data_scope)) widest = role;
+            if (@backingInt(role.data_scope) < @backingInt(widest.data_scope)) widest = role;
         }
         ctx.scope = widest.data_scope;
         if (widest.data_scope == .dept_custom) {

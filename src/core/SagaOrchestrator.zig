@@ -313,7 +313,7 @@ pub const SagaOrchestrator = struct {
         const payload = std.fmt.bufPrint(&payload_buf, "{s}|{s}|{d}|{d}|{d}", .{
             inst.id,
             inst.saga_name,
-            @intFromEnum(inst.status),
+            @backingInt(inst.status),
             inst.current_step,
             inst.started_at,
         }) catch {
@@ -351,7 +351,7 @@ pub const SagaOrchestrator = struct {
             const started_at_str = parts.next() orelse continue;
 
             const status_int = std.fmt.parseInt(u8, status_int_str, 10) catch continue;
-            const status: SagaStatus = @enumFromInt(status_int);
+            const status: SagaStatus = @fromBackingInt(@intCast(status_int));
             const current_step = std.fmt.parseInt(usize, current_step_str, 10) catch continue;
             const started_at = std.fmt.parseInt(i64, started_at_str, 10) catch continue;
 

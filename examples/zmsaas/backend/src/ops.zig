@@ -36,7 +36,7 @@ pub fn deliverPending(allocator: std.mem.Allocator, client: *zigmodu.data.Client
             .id = entry.id,
             .topic = entry.topic,
             .payload = entry.payload,
-            .status = @enumFromInt(entry.status),
+            .status = @fromBackingInt(@intCast(entry.status)),
             .retry_count = entry.retry_count,
             .max_retries = entry.max_retries,
             .created_at = entry.created_at,
