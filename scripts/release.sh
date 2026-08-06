@@ -89,8 +89,16 @@ bash scripts/check-deadcode.sh
 
 # 4. Commit + tag.
 git add -A
-git commit -m "chore(release): v$VERSION"
-git tag -a "v$VERSION" -m "v$VERSION"
+if git diff --cached --quiet; then
+    echo "release: no working-tree changes to commit (idempotent re-run)"
+else
+    git commit -m "chore(release): v$VERSION"
+fi
+if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+    echo "release: tag v$VERSION already exists"
+else
+    git tag -a "v$VERSION" -m "v$VERSION"
+fi
 
 # 5. Final assertion: tag must match the package version.
 bash scripts/check-release-tag.sh
