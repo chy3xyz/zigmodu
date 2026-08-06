@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Time.zig**: Windows 时钟改用 `ntdll.RtlQueryPerformanceCounter`（本版 std 已移除 `std.os.windows.QueryPerformanceCounter`）。
+- **README 版本漂移**: release.sh 的 perl bump 静默失配导致 README 停在 v0.15.4；补版本引用一致性校验（release.sh + check-release-tag.sh）。
+- **静默吞错补日志**: provider JSON 降级 / Agent 工具参数 / Workflow WAL 坏条目。
+- **Migration**: `run()` 重复 version 现 fail-fast（`error.DuplicateVersion`）；`loadHistory` 改为 DB 权威快照（修 markApplied+run 双算）。
+
+### Added
+- **中间件多实例隔离**: cors/jwtAuth/jwtAuthFromCatalog*/moduleGate/rateLimitPerClient 配置改存 `user_data`（page_allocator 一次性分配），同进程多 Server 不再互相覆盖。
+- **`Transaction.queryRowPartial`**（事务内缺失列置零）；**`RouteCatalog.allPermissions()`**（菜单↔路由权限比对）。
+- **Migration `markApplied(version)`**（bootstrap 旧库，不执行 SQL）。
+- **audit 行级豁免**（`// audit: ignore` / `// audit: ignore b13`）与 **b3 精确化**（空字符串字面量不误报注入）。
+- **`AgentHooks.on_delta`** + `chatStream` model 透出 + run_audit `model` 列（AgentResult.model 联动）。
+- **事务范式文档**（BEST_PRACTICES.md：伪事务警示 + transact/三件套两种范式）。
+
+### Changed
+- **examples/zent-modulith**: 适配 zent v0.29.1（实体序列化改 `toMaskedJson`，跳过 json_arena/Allocator 注入字段）。
+
 ## [0.15.10] - 2026-08-05
 
 ### Fixed
