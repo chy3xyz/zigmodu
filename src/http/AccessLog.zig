@@ -26,6 +26,13 @@ pub const AccessLogger = struct {
     allocator: std.mem.Allocator,
     entries: std.ArrayList(LogEntry),
     max_entries: usize,
+    /// 共享于连接线程之间 → 增删必须持锁（否则并发 append 竞争损坏 ArrayList）。
+    /// 临界区仅内存操作（不 yield），用 tryLock + 自旋即可（无需 io 上下文）。
+    mutex: std.Io.Mutex = .init,
+
+    fn lock(self: *Self) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
 
     pub const LogEntry = struct {
         timestamp: i64,
@@ -48,6 +55,8 @@ pub const AccessLogger = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.lock();
+        defer self.mutex.state.store(.unlocked, .release);
         for (self.entries.items) |entry| {
             self.allocator.free(entry.method);
             self.allocator.free(entry.path);
@@ -60,6 +69,8 @@ pub const AccessLogger = struct {
 
     /// [...]
     pub fn log(self: *Self, entry: LogEntry) !void {
+        self.lock();
+        defer self.mutex.state.store(.unlocked, .release);
         const method_copy = try self.allocator.dupe(u8, entry.method);
         errdefer self.allocator.free(method_copy);
         const path_copy = try self.allocator.dupe(u8, entry.path);
@@ -89,16 +100,22 @@ pub const AccessLogger = struct {
 
     /// [...]
     pub fn getEntries(self: *Self) []const LogEntry {
+        self.lock();
+        defer self.mutex.state.store(.unlocked, .release);
         return self.entries.items;
     }
 
     /// [...]
     pub fn count(self: *Self) usize {
+        self.lock();
+        defer self.mutex.state.store(.unlocked, .release);
         return self.entries.items.len;
     }
 
     /// [...]
     pub fn filterByStatus(self: *Self, buf: []LogEntry, status: u16) []LogEntry {
+        self.lock();
+        defer self.mutex.state.store(.unlocked, .release);
         var n: usize = 0;
         for (self.entries.items) |entry| {
             if (entry.status == status and n < buf.len) {
@@ -111,6 +128,8 @@ pub const AccessLogger = struct {
 
     /// [...]
     pub fn filterByPath(self: *Self, buf: []LogEntry, prefix: []const u8) []LogEntry {
+        self.lock();
+        defer self.mutex.state.store(.unlocked, .release);
         var n: usize = 0;
         for (self.entries.items) |entry| {
             if (std.mem.startsWith(u8, entry.path, prefix) and n < buf.len) {
@@ -123,6 +142,8 @@ pub const AccessLogger = struct {
 
     /// [...] JSON [...]
     pub fn toJson(self: *Self) ![]const u8 {
+        self.lock();
+        defer self.mutex.state.store(.unlocked, .release);
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
 
