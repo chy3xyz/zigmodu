@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **libpq 同步查询永久挂死**（Threaded Io）：`SO_RCVTIMEO` socket 读超时
+  （`Config.query_timeout_ms`，默认 30s）+ `connect_timeout=10`——同步
+  `PQexec*` 挂起不再永久卡死 fiber；超时后连接由池 ping / 重连回收。
+- **ConnPool 等待不可中断**：acquire 池满等待改 50ms 分段 futex——响应
+  fiber 取消与池关闭；slice 超时继续等待至 `max_wait_ms`（语义不变）。
+
 ## [0.15.21] - 2026-08-07
 
 ### Changed
