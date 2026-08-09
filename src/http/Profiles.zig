@@ -85,16 +85,12 @@ fn metricsMiddleware(collector: *HttpMetrics.HttpMetricsCollector) server_mod.Mi
             const c: *HttpMetrics.HttpMetricsCollector = @ptrCast(@alignCast(user_data orelse return error.InternalError));
             const Time = @import("../core/Time.zig");
             const start = Time.monotonicNowSeconds();
-            c.in_flight += 1;
+            c.beginRequest();
             next(ctx) catch |err| {
-                c.in_flight -= 1;
-                const elapsed = Time.monotonicNowSeconds() - start;
-                c.recordRequest(ctx.status_code, @floatFromInt(elapsed));
+                c.endRequest(500, @floatFromInt(Time.monotonicNowSeconds() - start));
                 return err;
             };
-            c.in_flight -= 1;
-            const elapsed = Time.monotonicNowSeconds() - start;
-            c.recordRequest(if (ctx.responded) ctx.status_code else 200, @floatFromInt(elapsed));
+            c.endRequest(if (ctx.responded) ctx.status_code else 200, @floatFromInt(Time.monotonicNowSeconds() - start));
         }
     };
     return .{ .func = S.handler, .user_data = @ptrCast(collector) };

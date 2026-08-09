@@ -12,18 +12,15 @@ pub fn httpMetricsMiddleware(collector: *HttpMetricsCollector) api.MiddlewareFn 
             const c: *HttpMetricsCollector = @ptrCast(@alignCast(user_data orelse return error.InternalError));
             const start = @import("../core/Time.zig").monotonicNowSeconds();
 
-            c.in_flight += 1;
+            c.beginRequest();
 
             next(ctx) catch |err| {
-                c.in_flight -= 1;
-                const elapsed = @import("../core/Time.zig").monotonicNowSeconds() - start;
-                c.recordRequest(500, @floatFromInt(elapsed));
+                c.endRequest(500, @floatFromInt(@import("../core/Time.zig").monotonicNowSeconds() - start));
                 return err;
             };
 
-            c.in_flight -= 1;
-            const elapsed = @import("../core/Time.zig").monotonicNowSeconds() - start;
-            c.recordRequest(200, @floatFromInt(elapsed));
+            const status: u16 = if (ctx.responded) ctx.status_code else 200;
+            c.endRequest(status, @floatFromInt(@import("../core/Time.zig").monotonicNowSeconds() - start));
         }
     };
 
@@ -47,6 +44,12 @@ pub const HttpMetricsCollector = struct {
     max_duration_seconds: f64 = 0,
     /// In-flight request count
     in_flight: u64 = 0,
+    /// 共享于连接线程之间 → 计数必须持锁。临界区仅算术，无 yield，自旋即可。
+    mutex: std.Io.Mutex = .init,
+
+    fn lock(self: *Self) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
 
     const StatusBucket = enum(usize) {
         info = 0, // 1xx
@@ -61,8 +64,38 @@ pub const HttpMetricsCollector = struct {
         return .{};
     }
 
-    /// Record one request
+    /// Mark a request started (thread-safe).
+    pub fn beginRequest(self: *Self) void {
+        self.lock();
+        defer self.mutex.state.store(.unlocked, .release);
+        self.in_flight += 1;
+    }
+
+    /// Mark a request finished and record its status/duration (thread-safe).
+    pub fn endRequest(self: *Self, status: u16, duration_seconds: f64) void {
+        self.lock();
+        defer self.mutex.state.store(.unlocked, .release);
+        if (self.in_flight > 0) self.in_flight -= 1;
+        self.request_count += 1;
+        self.total_duration_seconds += duration_seconds;
+        self.min_duration_seconds = @min(self.min_duration_seconds, duration_seconds);
+        self.max_duration_seconds = @max(self.max_duration_seconds, duration_seconds);
+
+        const bucket: usize = switch (status) {
+            100...199 => @backingInt(StatusBucket.info),
+            200...299 => @backingInt(StatusBucket.success),
+            300...399 => @backingInt(StatusBucket.redirect),
+            400...499 => @backingInt(StatusBucket.client_error),
+            500...599 => @backingInt(StatusBucket.server_error),
+            else => @backingInt(StatusBucket.unknown),
+        };
+        self.status_counts[bucket] += 1;
+    }
+
+    /// Record one request (backward-compatible: counters only, no in_flight).
     pub fn recordRequest(self: *Self, status: u16, duration_seconds: f64) void {
+        self.lock();
+        defer self.mutex.state.store(.unlocked, .release);
         self.request_count += 1;
         self.total_duration_seconds += duration_seconds;
         self.min_duration_seconds = @min(self.min_duration_seconds, duration_seconds);
@@ -81,18 +114,37 @@ pub const HttpMetricsCollector = struct {
 
     /// Average latency
     pub fn avgDuration(self: *Self) f64 {
+        self.lock();
+        defer self.mutex.state.store(.unlocked, .release);
         if (self.request_count == 0) return 0;
         return self.total_duration_seconds / @as(f64, @floatFromInt(self.request_count));
     }
 
     /// Request rate (req/s — caller provides elapsed_seconds)
     pub fn requestRate(self: *Self, elapsed_seconds: f64) f64 {
+        self.lock();
+        defer self.mutex.state.store(.unlocked, .release);
         if (elapsed_seconds == 0) return 0;
         return @as(f64, @floatFromInt(self.request_count)) / elapsed_seconds;
     }
 
+    /// Snapshot current counts (thread-safe).
+    pub fn snapshot(self: *Self) struct { request_count: u64, status_counts: [6]u64, in_flight: u64, min_duration_seconds: f64, max_duration_seconds: f64 } {
+        self.lock();
+        defer self.mutex.state.store(.unlocked, .release);
+        return .{
+            .request_count = self.request_count,
+            .status_counts = self.status_counts,
+            .in_flight = self.in_flight,
+            .min_duration_seconds = self.min_duration_seconds,
+            .max_duration_seconds = self.max_duration_seconds,
+        };
+    }
+
     /// Generate human-readable report
     pub fn generateReport(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
+        self.lock();
+        defer self.mutex.state.store(.unlocked, .release);
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(allocator);
 
