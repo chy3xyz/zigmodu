@@ -30,6 +30,10 @@ pub fn PQfinish(_: ?*PGconn) void {}
 pub fn PQstatus(_: ?*const PGconn) ConnStatusType {
     return .CONNECTION_BAD;
 }
+
+pub fn PQsocket(_: ?*const PGconn) c_int {
+    return -1; // no real socket in stub mode
+}
 pub fn PQexec(_: ?*PGconn, _: [*c]const u8) ?*PGresult {
     return null;
 }

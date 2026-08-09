@@ -1755,6 +1755,11 @@ fn appendCsvCell(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), value: [
 pub const PostgresConn = struct {
     conn: ?*libpq_c.PGconn,
     allocator: std.mem.Allocator,
+    /// Socket read timeout (ms); 0 = disabled. Applied via SO_RCVTIMEO so
+    /// synchronous PQexec*/PQgetResult reads cannot hang forever. NOTE: this
+    /// is a per-read idle timeout (kernel), not a whole-query deadline — a
+    /// slow-but-progressing query is not cut off.
+    query_timeout_ms: u32 = 0,
     /// LRU-style prepared statement cache: SQL text → null-terminated statement name.
     /// Values MUST stay `[:0]u8` (from `allocZ`): coercing to `[]const u8` then `free`
     /// drops the sentinel and panics SafeAllocator with alloc=N+1 / free=N.
@@ -1771,16 +1776,16 @@ pub const PostgresConn = struct {
     }
 
     /// Connect using explicit parameters via dlsym (bypasses Zig C ABI issues)
-    pub fn connectParams(allocator: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, pass: []const u8, db: []const u8) !PostgresConn {
+    pub fn connectParams(allocator: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, pass: []const u8, db: []const u8, query_timeout_ms: u32) !PostgresConn {
         // Use PQconnectdb with conninfo string so we can set sslmode
         const sslmode = if (std.c.getenv("PGSSLMODE")) |v| std.mem.span(v) else "require";
-        const conninfo = try std.fmt.allocPrint(allocator, "host={s} port={d} dbname={s} user={s} password={s} sslmode={s}", .{ host, port, db, user, pass, sslmode });
+        const conninfo = try std.fmt.allocPrint(allocator, "host={s} port={d} dbname={s} user={s} password={s} sslmode={s} connect_timeout=10", .{ host, port, db, user, pass, sslmode });
         defer allocator.free(conninfo);
-        return connect(allocator, conninfo);
+        return connect(allocator, conninfo, query_timeout_ms);
     }
 
     /// Null-terminated string connect
-    pub fn connect(allocator: std.mem.Allocator, conninfo: []const u8) !PostgresConn {
+    pub fn connect(allocator: std.mem.Allocator, conninfo: []const u8, query_timeout_ms: u32) !PostgresConn {
         const null_terminated = try allocZ(allocator, conninfo);
         defer allocator.free(null_terminated);
         const conn = libpq_c.PQconnectdb(null_terminated);
@@ -1792,7 +1797,25 @@ pub const PostgresConn = struct {
             libpq_c.PQfinish(conn);
             return error.DatabaseError;
         }
-        return .{ .conn = conn, .allocator = allocator, .stmt_cache = std.StringHashMap(CachedStmt([:0]u8)).init(allocator) };
+        applySocketTimeout(conn.?, query_timeout_ms);
+        return .{ .conn = conn, .allocator = allocator, .query_timeout_ms = query_timeout_ms, .stmt_cache = std.StringHashMap(CachedStmt([:0]u8)).init(allocator) };
+    }
+
+    /// Apply SO_RCVTIMEO to the libpq socket so synchronous PQexec* reads
+    /// cannot block a worker thread forever (Threaded Io M:N fibers). A
+    /// timed-out read leaves the connection in an indeterminate state — the
+    /// pool's ping / single-conn reconnect paths recover it on next use.
+    fn applySocketTimeout(conn: *libpq_c.PGconn, timeout_ms: u32) void {
+        if (timeout_ms == 0) return;
+        const fd = libpq_c.PQsocket(conn);
+        if (fd < 0) return;
+        var tv = std.posix.timeval{
+            .sec = @intCast(@divTrunc(@as(i64, @intCast(timeout_ms)), 1000)),
+            .usec = @intCast((timeout_ms % 1000) * 1000),
+        };
+        std.posix.setsockopt(@intCast(fd), std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch |err| {
+            std.log.warn("[sqlx] PG SO_RCVTIMEO apply failed: {s}", .{@errorName(err)});
+        };
     }
 
     fn queryFn(ptr: *anyopaque, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value) errors.ResultT(Rows) {
@@ -3836,16 +3859,16 @@ const ConnPool = struct {
             }
 
             // Wait until a connection is released (honour max_wait_ms).
+            // Waits are sliced (50ms) so the fiber responds to cancellation
+            // (io.checkCancel) and pool close between slices — a single long
+            // futex wait on Threaded Io would be uninterruptible. The FIFO
+            // waiter handoff in `release` still wakes the waiter immediately
+            // via its condition variable.
             if (self.max_wait_ms == 0) {
                 self.mutex.unlock(self.io);
                 return error.Timeout;
             }
-            const timeout: std.Io.Timeout = .{
-                .duration = .{
-                    .raw = .{ .nanoseconds = @as(i96, @intCast(self.max_wait_ms)) * 1_000_000 },
-                    .clock = .awake,
-                },
-            };
+            const slice_ns: i96 = 50_000_000; // 50ms per futex slice
 
             var waiter: Waiter = .{
                 .cond = .init,
@@ -3856,21 +3879,39 @@ const ConnPool = struct {
                 self.mutex.unlock(self.io);
                 return error.ConnectionFailed;
             };
-            waiter.cond.waitTimeout(self.io, &self.mutex, timeout) catch |err| {
-                // waitTimeout re-acquires the mutex before returning.
-                self.removeWaiter(&waiter);
-                self.mutex.unlock(self.io);
-                return switch (err) {
-                    error.Timeout, error.Canceled => error.Timeout,
-                };
-            };
-            // woken with mutex held
-            self.removeWaiter(&waiter);
-            if (waiter.ready) {
-                _ = self.acquire_count.fetchAdd(1, .monotonic);
-                return waiter.conn;
+            var waited_ms: u64 = 0;
+            while (waited_ms < self.max_wait_ms) {
+                const slice_woken = waiter.cond.waitTimeout(self.io, &self.mutex, .{
+                    .duration = .{ .raw = .{ .nanoseconds = slice_ns }, .clock = .awake },
+                });
+                if (slice_woken) |_| {} else |err| switch (err) {
+                    // A slice timeout is NOT an overall failure — keep
+                    // waiting until max_wait_ms. Cancellation aborts now
+                    // (waitTimeout re-acquires the mutex before returning).
+                    error.Timeout => {},
+                    error.Canceled => {
+                        self.removeWaiter(&waiter);
+                        self.mutex.unlock(self.io);
+                        return error.Timeout;
+                    },
+                }
+                // Woken with mutex held: released conn handoff, slice timeout,
+                // or spurious wakeup.
+                if (waiter.ready) {
+                    self.removeWaiter(&waiter);
+                    _ = self.acquire_count.fetchAdd(1, .monotonic);
+                    return waiter.conn;
+                }
+                if (self.closed.load(.monotonic)) {
+                    self.removeWaiter(&waiter);
+                    self.mutex.unlock(self.io);
+                    return error.ConnectionFailed;
+                }
+                waited_ms += 50;
             }
-            // Spurious wakeup or pool closed: loop and re-check state.
+            self.removeWaiter(&waiter);
+            self.mutex.unlock(self.io);
+            return error.Timeout;
         }
     }
 
@@ -4058,6 +4099,10 @@ pub const Config = struct {
     max_wait_ms: u32 = 5000,
     max_lifetime_secs: u32 = 3600,
     max_idle_time_secs: u32 = 300,
+    /// libpq socket read timeout (ms). 0 = disabled. Guards against a hung
+    /// synchronous PQexec* permanently wedging a fiber/worker thread — the
+    /// query fails with error.Timeout and the connection is re-established.
+    query_timeout_ms: u32 = 30000,
 };
 
 /// Transaction options aligned with Go's sql.TxOptions.
@@ -4279,7 +4324,7 @@ pub const Client = struct {
                 const pg: *PostgresConn = try self.allocator.create(PostgresConn);
                 errdefer self.allocator.destroy(pg);
                 if (self.config.postgres_conninfo.len > 0) {
-                    pg.* = try PostgresConn.connect(self.allocator, self.config.postgres_conninfo);
+                    pg.* = try PostgresConn.connect(self.allocator, self.config.postgres_conninfo, self.config.query_timeout_ms);
                 } else {
                     pg.* = try PostgresConn.connectParams(
                         self.allocator,
@@ -4288,6 +4333,7 @@ pub const Client = struct {
                         self.config.username,
                         self.config.password,
                         self.config.database,
+                        self.config.query_timeout_ms,
                     );
                 }
                 return pg.toConn();

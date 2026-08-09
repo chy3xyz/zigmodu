@@ -154,3 +154,39 @@ zent 使用自己的 SQLite / 驱动栈，与 `data.sqlx` **正交**（见 [ZENT
 - [ ] 生产镜像只安装对应客户端库（sqlite 系统库 / libpq / mysqlclient）  
 - [ ] CI 应用构建使用收窄 `-Ddb=`；框架 PR 测试保持 `all`  
 - [ ] 误开未链接驱动时能收到 `DriverNotEnabled`（而非动态链接器错误）  
+
+---
+
+## 11. 已知限制：libpq 同步查询 × Threaded Io（已修复）
+
+**状态**：已修复（v0.15.22 待发）；完整 async 化列为后续。两个互补缺陷：
+
+### 11.1 libpq 同步查询无超时 → fiber 永久挂死
+
+- **现象**：`queryRowPartial` / `queryRow` 偶发**单 fiber 永久挂死**（server 其他请求正常）。
+  曾被误归因于"0 行结果"，实际 0 行只是触发时机巧合——libpq 同步返回与行数无关
+  （`queryRowPartial` 0 行走 `error.NotFound` + `defer rows.deinit()`，清理完整）。
+- **根因**：Postgres 查询全部同步 `PQexec` / `PQexecParams` / `PQexecPrepared`，
+  **无任何超时**（无 `PQsetnonblocking` / `PQexecTimeout`）。Threaded Io 是 M:N
+  fiber 池，fiber 内同步阻塞**不可被 io 取消**——单次挂起（网络抖动、服务器慢、
+  连接被并发复用导致协议错乱）即永久卡死该 fiber。
+- **修复（v0.15.22）**：`SO_RCVTIMEO` socket 读超时（`Config.query_timeout_ms`，
+  默认 30s，0=禁用）——内核级 per-read 空闲超时，同步 `PQexec*` 不再能永久
+  挂死；`connect_timeout=10` 覆盖连接阶段；超时后连接由池 ping / 单连接重连
+  路径回收。完整非阻塞化（`PQsetnonblocking` + 轮询）列为后续优化。
+
+### 11.2 ConnPool 等待 × Threaded Io worker 耗尽 → 间歇性 Timeout
+
+- **机制**：`std.Io.Mutex`/`Condition` 在 Threaded 下基于 `Thread.futexWait`
+  （真 OS futex，**阻塞整个 worker 线程**，非 fiber 让出）。`ConnPool.acquire`
+  池满路径 `waiter.cond.waitTimeout(...)`——并发数 > worker 线程数（CPU 数）且
+  池满时，所有 worker 阻塞在 futex 等待唤醒，release 的 fiber 无空闲 worker 可
+  调度 → 等待者只能靠 `max_wait_ms` 超时自醒 → **高并发下间歇性 `error.Timeout`**
+  （本应成功放行）。
+- **修复（v0.15.22）**：等待改 **50ms 分段 futex** + 段间响应取消/池关闭
+  （原单次长 futex 不可中断）；`max_wait_ms` 语义不变。注意 Threaded Io
+  M:N 模型下 fiber 等待仍占用 worker——高并发（>CPU 数）池满场景的彻底
+  解决需整体查询链 async 化（后续大项）。
+- **通用教训**：Threaded Io 的 fiber 内**任何**同步阻塞（`posix.poll/read`、
+  `mutex.lock`、同步 libpq）都可能阻塞 worker——应用层默认禁止（见
+  `docs/BEST_PRACTICES.md`「Threaded Io 下的同步阻塞」）。  

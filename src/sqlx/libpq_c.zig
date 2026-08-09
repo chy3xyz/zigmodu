@@ -26,6 +26,7 @@ pub const Oid = c_uint;
 pub extern "c" fn PQconnectdb(conninfo: [*c]const u8) ?*PGconn;
 pub extern "c" fn PQfinish(conn: ?*PGconn) void;
 pub extern "c" fn PQstatus(conn: ?*const PGconn) ConnStatusType;
+pub extern "c" fn PQsocket(conn: ?*const PGconn) c_int;
 pub extern "c" fn PQexec(conn: ?*PGconn, command: [*c]const u8) ?*PGresult;
 pub extern "c" fn PQexecParams(
     conn: ?*PGconn,
