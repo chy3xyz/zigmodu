@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **AccessLogger 线程安全**：全局中间件被所有连接线程共享，并发 `log()`
+  append 同一 ArrayList 触发数据竞争 → SafeAllocator panic → 服务崩溃
+  （并发 ≥10 即现）——已加锁。
+- **HttpMetrics 线程安全**：`HttpMetricsCollector` 加自旋锁
+  （beginRequest/endRequest/recordRequest/snapshot）；`metricsMiddleware`
+  改用守卫的 begin/endRequest（原先裸改 `in_flight`）。
 - **libpq 同步查询永久挂死**（Threaded Io）：`SO_RCVTIMEO` socket 读超时
   （`Config.query_timeout_ms`，默认 30s）+ `connect_timeout=10`——同步
   `PQexec*` 挂起不再永久卡死 fiber；超时后连接由池 ping / 重连回收。
