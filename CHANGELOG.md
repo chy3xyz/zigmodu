@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **examples/zent-modulith**: 依赖升级 **zent v0.29.4**（pool UAF 修复——
+  Rows 持有连接至 deinit；Sum f64；From edge FK 去重；codegen quota 1M）。
+
 ### Fixed
 - **AccessLogger 线程安全**：全局中间件被所有连接线程共享，并发 `log()`
   append 同一 ArrayList 触发数据竞争 → SafeAllocator panic → 服务崩溃
