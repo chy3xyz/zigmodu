@@ -286,6 +286,92 @@ pub fn openApiFromCatalog(slot: *CatalogSlot, config: OpenApiFromCatalogConfig) 
     }.handle;
 }
 
+/// Standalone handler serving an interactive Swagger UI HTML page pointing to `spec_url`.
+pub fn swaggerUiHandler(comptime spec_url: []const u8) HandlerFn {
+    return struct {
+        fn handle(ctx: *Context) anyerror!void {
+            const html =
+                \\<!DOCTYPE html>
+                \\<html lang="en">
+                \\<head>
+                \\  <meta charset="utf-8" />
+                \\  <meta name="viewport" content="width=device-width, initial-scale=1" />
+                \\  <title>API Documentation</title>
+                \\  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" />
+                \\</head>
+                \\<body>
+                \\  <div id="swagger-ui"></div>
+                \\  <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js" charset="UTF-8"></script>
+                \\  <script>
+                \\    window.onload = () => {
+                \\      window.ui = SwaggerUIBundle({
+                \\        url: "
+            ++ spec_url ++
+                \\",
+                \\        dom_id: '#swagger-ui',
+                \\      });
+                \\    };
+                \\  </script>
+                \\</body>
+                \\</html>
+            ;
+            try ctx.html(200, html);
+        }
+    }.handle;
+}
+
+/// Standalone handler serving an interactive Scalar API Reference HTML page pointing to `spec_url`.
+pub fn scalarUiHandler(comptime spec_url: []const u8) HandlerFn {
+    return struct {
+        fn handle(ctx: *Context) anyerror!void {
+            const html =
+                \\<!doctype html>
+                \\<html>
+                \\  <head>
+                \\    <title>API Reference</title>
+                \\    <meta charset="utf-8" />
+                \\    <meta name="viewport" content="width=device-width, initial-scale=1" />
+                \\  </head>
+                \\  <body>
+                \\    <script id="api-reference" data-url="
+            ++ spec_url ++
+                \\"></script>
+                \\    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
+                \\  </body>
+                \\</html>
+            ;
+            try ctx.html(200, html);
+        }
+    }.handle;
+}
+
+/// Adapter to turn a 1-arg `HandlerFn` (`fn(*Context)`) into a 2-arg `TypedHandler(State)` (`fn(*Context, *State)`).
+pub fn wrapHandler(comptime State: type, handler: HandlerFn) TypedHandler(State) {
+    const Store = struct {
+        var fn_ptr: HandlerFn = undefined;
+    };
+    Store.fn_ptr = handler;
+    return struct {
+        fn adapter(ctx: *Context, _: *State) anyerror!void {
+            return Store.fn_ptr(ctx);
+        }
+    }.adapter;
+}
+
+/// Zero-boilerplate RouteSpec tuple for mounting OpenAPI JSON + Swagger UI + Scalar UI.
+/// Returns 3 routes (`openapi.json`, `docs`, `scalar`) preconfigured for public access.
+pub fn openApiRoutes(
+    comptime State: type,
+    slot: *CatalogSlot,
+    config: OpenApiFromCatalogConfig,
+) [3]RouteSpec(State) {
+    return [_]RouteSpec(State){
+        .{ .method = .GET, .path = "openapi.json", .handler = wrapHandler(State, openApiFromCatalog(slot, config)), .meta = .{ .auth = .public } },
+        .{ .method = .GET, .path = "docs", .handler = wrapHandler(State, swaggerUiHandler("openapi.json")), .meta = .{ .auth = .public } },
+        .{ .method = .GET, .path = "scalar", .handler = wrapHandler(State, scalarUiHandler("openapi.json")), .meta = .{ .auth = .public } },
+    };
+}
+
 /// Filled after `router.finish()`; middleware holds a pointer and reads once set.
 pub const CatalogSlot = struct {
     catalog: ?RouteCatalog = null,
@@ -882,4 +968,18 @@ test "catalog allPermissions returns distinct permission expressions" {
     try std.testing.expectEqual(@as(usize, 2), perms.len);
     try std.testing.expectEqualStrings("policy:view", perms[0]);
     try std.testing.expectEqualStrings("policy:write", perms[1]);
+}
+
+test "openApiRoutes generates 3 public UI and spec routes" {
+    const State = struct {};
+    var slot = CatalogSlot{};
+    defer slot.deinit();
+    const routes = openApiRoutes(State, &slot, .{ .title = "Test App" });
+    try std.testing.expectEqual(@as(usize, 3), routes.len);
+    try std.testing.expectEqualStrings("openapi.json", routes[0].path);
+    try std.testing.expectEqualStrings("docs", routes[1].path);
+    try std.testing.expectEqualStrings("scalar", routes[2].path);
+    try std.testing.expect(routes[0].meta.auth == .public);
+    try std.testing.expect(routes[1].meta.auth == .public);
+    try std.testing.expect(routes[2].meta.auth == .public);
 }

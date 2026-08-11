@@ -58,7 +58,7 @@ pub const ServeOptions = struct {
 const ConnWriter = struct {
     io: std.Io,
     stream: std.Io.net.Stream,
-    buf: [32 * 1024]u8 = undefined,
+    buf: [64 * 1024]u8 = undefined,
     len: usize = 0,
 
     fn init(io: std.Io, stream: std.Io.net.Stream) ConnWriter {
@@ -100,16 +100,17 @@ const ConnWriter = struct {
     }
 
     fn writeDirect(self: *ConnWriter, data: []const u8) !void {
-        var wbuf: [8192]u8 = undefined;
-        var w = self.stream.writer(self.io, &wbuf);
+        var dummy_buf: [4096]u8 = undefined;
+        var w = self.stream.writer(self.io, &dummy_buf);
         try w.interface.writeAll(data);
         try w.interface.flush();
     }
 
     fn flush(self: *ConnWriter) !void {
         if (self.len == 0) return;
-        try self.writeDirect(self.buf[0..self.len]);
+        const to_write = self.buf[0..self.len];
         self.len = 0;
+        try self.writeDirect(to_write);
     }
 };
 
@@ -487,7 +488,7 @@ pub fn serveAfterPrefacePrefetchReader(
             const more_inbound = (prefetch_off < prefetch_buf.len) or (reader.bufferedLen() > 0);
             const budget: usize = if (more_inbound or outbound.pending.count() > 1) drain_slice else 0;
             try outbound.drain(&writer, &priority_tree, &conn_flow, conn_max_frame_size, budget);
-            try writer.flush();
+            if (!more_inbound) try writer.flush();
         }
     }
 
@@ -639,6 +640,31 @@ const OutboundScheduler = struct {
         while (guard < 4096) : (guard += 1) {
             if (self.pending.count() == 0) return;
             if (max_frames != 0 and wrote_n >= max_frames) return;
+
+            if (self.pending.count() == 1) {
+                var single_it = self.pending.iterator();
+                if (single_it.next()) |e| {
+                    const stream_id = e.key_ptr.*;
+                    const p = e.value_ptr;
+                    if (!p.done() and canSendNextFrame(p, conn_flow.send_window, conn_max_frame_size)) {
+                        const before = p.byteLen();
+                        const progress = try writeNextWireFrame(writer, conn_flow, &p.flow, stream_id, p, conn_max_frame_size);
+                        const after: usize = if (progress == .done) 0 else p.byteLen();
+                        self.pending_bytes = self.pending_bytes - before + after;
+                        switch (progress) {
+                            .blocked => return,
+                            .wrote => wrote_n += 1,
+                            .done => {
+                                var removed = self.pending.fetchRemove(stream_id).?;
+                                removed.value.deinit(self.allocator);
+                                tree.removeStream(stream_id);
+                                wrote_n += 1;
+                            },
+                        }
+                        continue;
+                    }
+                }
+            }
 
             var ready_buf: [64]u31 = undefined;
             var ready_n: usize = 0;

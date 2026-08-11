@@ -44,6 +44,10 @@ pub const CatalogSlot = comptime_router.CatalogSlot;
 pub const pathHasSkipPrefix = comptime_router.pathHasSkipPrefix;
 pub const openApiFromCatalog = comptime_router.openApiFromCatalog;
 pub const OpenApiFromCatalogConfig = comptime_router.OpenApiFromCatalogConfig;
+pub const swaggerUiHandler = comptime_router.swaggerUiHandler;
+pub const scalarUiHandler = comptime_router.scalarUiHandler;
+pub const openApiRoutes = comptime_router.openApiRoutes;
+pub const wrapHandler = comptime_router.wrapHandler;
 
 pub const http_middleware = @import("api/Middleware.zig");
 pub const jwtAuthFromCatalog = http_middleware.jwtAuthFromCatalog;

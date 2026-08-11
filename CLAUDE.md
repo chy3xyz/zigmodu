@@ -1,7 +1,7 @@
 # CLAUDE.md — ZigModu Framework for Claude Code
 
 ## Project
-ZigModu **v0.15.22** — modular app framework for Zig **0.17.0**. ~98/100 (`docs/EVALUATION_REPORT.md`).
+ZigModu **v0.15.23** — modular app framework for Zig **0.17.0**. ~98/100 (`docs/EVALUATION_REPORT.md`).
 
 **AI 权威指南：[`AGENTS.md`](AGENTS.md)**（文档地图 + 近期栈 DO/DON'T）。冲突时以 AGENTS 为准。
 

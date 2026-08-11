@@ -140,7 +140,7 @@ const now_ms = Time.monotonicNowMilliseconds();
 - **Testkit**: `dispatch` / `signBearerToken` / `openMemorySqlite` / `SseRecorder`
 - **SSE**: `http.sse(ctx)`（设 `streaming`）+ `SseSpec`/`sse_routes` + `lastEventId`
 - **Profiles**: `applyHttpDefaults` + `applyResilienceDefaults`
-- **OpenAPI**: `openApiParamsFromStruct` + `RouteMeta.openapi_params`
+- **OpenAPI**: `openApiParamsFromStruct` + `RouteMeta.openapi_params`；`openApiRoutes` / `swaggerUiHandler` / `scalarUiHandler` HTML 零配置一键挂载 UI
 - **Outbox**: `zigmodu.outbox.*`；幂等 `idempotencyMiddleware`（header `idempotency-key`）
 - Guide: `docs/ROUTE_TABLE.md` · recipes: `docs/FRAMEWORK_BACKLOG.md`
 
@@ -284,7 +284,7 @@ bash scripts/ci-integration.sh   # tenant-mgmt + stress + shopdemo（-Ddb=sqlite
 ```
 
 ## Version
-- Framework: **v0.15.22** (`build.zig.zon`)
+- Framework: **v0.15.23** (`build.zig.zon`)
 - Zig: **0.17.0-dev.1422+e863bf3be**（CI 同款锁定版本，见 `.github/workflows/ci.yml` → `ZIG_VERSION`；避免 fmt 行为漂移）
 - Tests: **820+ passed**, 18 skipped（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`）
 - Score: ~98/100（`docs/EVALUATION_REPORT.md` v5.6）
@@ -312,11 +312,11 @@ bash scripts/ci-integration.sh   # tenant-mgmt + stress + shopdemo（-Ddb=sqlite
 
 ## Learned Workspace Facts
 
-- Package **v0.15.22** · Zig **0.17.0** · GitHub `chy3xyz/zigmodu` · branch `master`.
+- Package **v0.15.23** · Zig **0.17.0** · GitHub `chy3xyz/zigmodu` · branch `master`.
 - Sandbox cache：`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`.
 - Auth Path A + `CatalogPermLoadInput` 已落地；legacy JWT 只写 `auth_info`。
 - x402 fail-closed；OTLP/Vault 仅 plain HTTP。
-- zent v0.27+ 与 `data.sqlx` 正交，勿混驱动/共享事务（`docs/ZENT.md`）；`examples/zent-modulith` 按 v0.27 能力演示（v0.13 起向后兼容）。
+- zent v0.29.5+ 与 `data.sqlx` 正交，勿混驱动/共享事务（`docs/ZENT.md`）；`examples/zent-modulith` 按 v0.29.5 能力演示（v0.13 起向后兼容）。
 - SQLx 选择性链接：`-Ddb=` / `.db=`，默认 `all`；框架测试勿收窄；见 `docs/SQLX_DRIVERS.md`。
 - WS：`WsMessageFn` 含 `WsFrameKind`；fiber/io_uring 分发 text+binary（OpenIM protobuf OK）。
 - CI：`bash scripts/ci-integration.sh`（tenant-mgmt + stress + shopdemo，`-Ddb=sqlite`）。

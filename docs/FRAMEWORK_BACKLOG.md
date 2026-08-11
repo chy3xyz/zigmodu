@@ -18,6 +18,7 @@ Monolith boundaries unchanged — see `docs/PRODUCTION_ROADMAP.md`.
 | + | Validation ↔ Extract | **Landed** | `extractJsonValidated(ctx, T, rules)` |
 | + | Example migration | **Landed** | `examples/zent-modulith` + `tools/zmodu/.../api_standalone.zig.tpl` |
 | + | **WS binary frames** | **Landed** | `WsFrameKind` + `on_message(..., kind)` text/binary; `WsFramer.writeBinary` |
+| + | **OpenAPI UI Suite** | **Landed** | `http.swaggerUiHandler`, `http.scalarUiHandler`, `http.openApiRoutes` zero-config HTML embed & one-line route tuple |
 
 ---
 

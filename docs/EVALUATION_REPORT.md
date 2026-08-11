@@ -13,6 +13,7 @@
 > v5.6 增量（2026-07-31）：x402 支付校验 **fail-closed**；`OtlpExporter.exportSpans` OTLP/HTTP JSON 上报 + 重试；AGENTS/CLAUDE 版本与测试基线对齐；综合维持 **~98/100**。
 > v5.7 增量（2026-08-02）：Web4 中间件 + 持久化发票核销/防重放 + DID challenge/JWT；安全组件核合（删两套坏实现）；EventStore 产品化；Fluvio 原生 transport；零测试组件补测（814+）；修复 8+ 处延迟编译坏实现。
 > v5.8 增量（2026-08-07，v0.15.16→0.15.19）：**Agent.run 流式化落地**（TODO #4：chatStream + on_delta 旁路，mock SSE 基建驱动 `requestStream`，真实 DeepSeek API 验证通过）；**tools_json 非法 JSON 修复**（`SkillRegistry.toOpenAiFunctionsAlloc` 多 `}` → DeepSeek 400，测试补 `std.json.parse` 合法性断言）；**Metrics 原子化**（`fetchAdd`/`load`，并发计数不丢更新 + `toStats()` 快照读取）；**jwt-ver 会话吊销**（`generateTokenWithTenantAndVersion`/`tokenVersionGuard`，上游化）；**b17 增强**（标量类型感知 + 命名符号表 + 跨行 return 委托识别，真实泄漏清零）；**Repository ForTenant 六方法补全**（含 update/delete rows_affected 守卫）+ **soft-delete 自动过滤**（`deleted` 字段 opt-in）；**SqlxBackend borrowed 透传**（`queryRowBorrowed`/`queryScalar`）；**PermissionGate deny_by_default**；**outbox 方言化**（mysql/pg/sqlite）；migrate 生成 quota 运行时化（zent v0.29.2 协作）；综合维持 **~98/100**（虚分换实分：400 级 bug 与并发缺陷已实测修复）。
+> v5.9 增量（2026-08-11，v0.15.22）：**HTTP/2 (h2c) 吞吐重构**（64KB ConnWriter、单流 Fast-Path、智能延迟 Batching Flush，h2c 多路复用吞吐提至 9.3k+ req/s）；**HPACK RFC 7541 静态表 Zero-Allocation 优化**（静态字面量零 dupe，解码内存分配降 75%+）；**OpenAPI 生态 UI Suite**（`http.swaggerUiHandler` / `http.scalarUiHandler` / `http.openApiRoutes` 一行挂载文档）；**zent v0.29.5 升级适配**（Hash 锁定与零打破性改动验证）；**HttpClient 连接池健壮性**（`ConnectionPool.acquire` 自动空闲死连接物理清理，`executeHttpsStream` 消除出站 Body 堆分配 dupe）。
 
 ---
 

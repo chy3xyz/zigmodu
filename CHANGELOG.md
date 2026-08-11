@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.23] - 2026-08-11
+
+### Added
+- **Swagger UI / Scalar UI 路由**：`swaggerUiHandler` / `scalarUiHandler` /
+  `openApiRoutes` / `wrapHandler`（ComptimeRouter + `http.zig` 导出）——OpenAPI
+  文档可直接在浏览器渲染。
+- **`Context.html(status, data)`**：HTML 响应助手（自动 `text/html; charset=utf-8`）。
+
+### Changed
+- **HTTP/2 增强**：Hpack / Http2Server / HttpClient 迭代（含客户端路径调整）。
+- **examples/zent-modulith**: 依赖升级 **zent v0.29.5**（`git+https#v0.29.5`，
+  hash `zent-0.29.5-oiur-70vDgA9kXdpRrJUN1MRmz721OldWiTrrOJKSNF6`，ORM 迭代与
+  适配更新）。
+
 ## [0.15.22] - 2026-08-10
 
 ### Changed

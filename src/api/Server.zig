@@ -498,6 +498,14 @@ pub const Context = struct {
         self.responded = true;
     }
 
+    /// Set HTML response
+    pub fn html(self: *Context, status: u16, data: []const u8) !void {
+        self.status_code = status;
+        try self.setHeader("Content-Type", "text/html; charset=utf-8");
+        try self.response_body.appendSlice(self.allocator, data);
+        self.responded = true;
+    }
+
     /// Send error response
     pub fn sendError(self: *Context, status: u16, message: []const u8) !void {
         self.status_code = status;

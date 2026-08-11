@@ -637,6 +637,10 @@ pub const OrdersApi = zigmodu.http.CrudApi(model.Orders, service.OrdersService, 
   user_col)`（镜像 TenantInterceptor）由 `DataPermissionContext` 产出 scope
   子句（`.all` 返回 null、`.self_` 生成 `user_col = ?`、`.dept_*` 生成 IN）；
   中间件解析角色→作用域，handler 只把注入的子句拼进查询——不手写过滤。
+- 零配置交互式 API 文档：`http.openApiRoutes(State, &slot, .{ .title = "App" })`
+  一行接入 `/openapi.json`、`/docs` (Swagger UI) 与 `/scalar` (Scalar UI)
+  公开路由组；亦可使用 `http.swaggerUiHandler("spec.json")` 或
+  `http.scalarUiHandler("spec.json")` 单独挂载。
 
 适用边界：规则简单的 CRUD 模块直接用；需要复杂业务编排（多表事务、状态机、
 审批流）时保留 service 内手写 Cmd，autoCrud 只覆盖纯增删改查面。

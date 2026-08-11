@@ -68,13 +68,23 @@ pub const HttpClient = struct {
             self.mutex.lock(self.io) catch return error.ServerError;
             defer self.mutex.unlock(self.io);
 
-            // Find idle connection
-            for (self.idle_connections.items, 0..) |conn, i| {
-                if (std.mem.eql(u8, conn.host, host) and conn.port == port and conn.isAlive()) {
-                    const connection = self.idle_connections.swapRemove(i);
-                    try self.active_connections.append(self.allocator, connection);
-                    return connection;
+            // Find idle connection & evict stale ones
+            var idx: usize = 0;
+            while (idx < self.idle_connections.items.len) {
+                const conn = self.idle_connections.items[idx];
+                if (std.mem.eql(u8, conn.host, host) and conn.port == port) {
+                    if (conn.isAlive()) {
+                        const connection = self.idle_connections.swapRemove(idx);
+                        try self.active_connections.append(self.allocator, connection);
+                        return connection;
+                    } else {
+                        const dead = self.idle_connections.swapRemove(idx);
+                        if (dead.stream) |stream| stream.close(self.io);
+                        self.allocator.free(dead.host);
+                        continue;
+                    }
                 }
+                idx += 1;
             }
 
             // Create new connection
@@ -352,9 +362,7 @@ pub const HttpClient = struct {
         defer https_req.deinit();
 
         if (req.body) |body| {
-            const body_owned = try self.allocator.dupe(u8, body);
-            defer self.allocator.free(body_owned);
-            https_req.sendBodyComplete(body_owned) catch |err| return mapHttpsError(err);
+            https_req.sendBodyComplete(@constCast(body)) catch |err| return mapHttpsError(err);
         } else {
             https_req.sendBodiless() catch |err| return mapHttpsError(err);
         }

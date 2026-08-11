@@ -507,15 +507,17 @@ pub const Decoder = struct {
                 const idx, const n = try decodeInt(block[i..], 7);
                 i += n;
                 const h = try self.lookup(idx);
+                const is_static = idx < static_table.len;
                 try out.append(self.allocator, .{
-                    .name = try self.allocator.dupe(u8, h.name),
-                    .value = try self.allocator.dupe(u8, h.value),
+                    .name = if (is_static) h.name else try self.allocator.dupe(u8, h.name),
+                    .value = if (is_static) h.value else try self.allocator.dupe(u8, h.value),
                 });
                 continue;
             }
             if (b & 0x40 != 0) {
                 const name_idx, const n0 = try decodeInt(block[i..], 6);
                 i += n0;
+                const name_is_static = name_idx > 0 and name_idx < static_table.len;
                 const name = if (name_idx == 0) blk: {
                     const ds = try decodeString(self.allocator, block[i..]);
                     i += ds.consumed;
@@ -526,19 +528,20 @@ pub const Decoder = struct {
                 i += value_ds.consumed;
                 defer if (value_ds.owned) self.allocator.free(@constCast(value_ds.value));
                 const value = value_ds.value;
-                const name_owned = try self.allocator.dupe(u8, name);
-                errdefer self.allocator.free(name_owned);
-                const value_owned = try self.allocator.dupe(u8, value);
-                errdefer self.allocator.free(value_owned);
-                try self.pushDynamic(name_owned, value_owned);
+
+                const dyn_name = try self.allocator.dupe(u8, name);
+                const dyn_value = try self.allocator.dupe(u8, value);
+                try self.pushDynamic(dyn_name, dyn_value);
+
                 try out.append(self.allocator, .{
-                    .name = try self.allocator.dupe(u8, name_owned),
-                    .value = try self.allocator.dupe(u8, value_owned),
+                    .name = if (name_is_static) name else try self.allocator.dupe(u8, name),
+                    .value = try self.allocator.dupe(u8, value),
                 });
                 continue;
             }
             const name_idx, const n0 = try decodeInt(block[i..], 4);
             i += n0;
+            const name_is_static = name_idx > 0 and name_idx < static_table.len;
             const name = if (name_idx == 0) blk: {
                 const ds = try decodeString(self.allocator, block[i..]);
                 i += ds.consumed;
@@ -550,7 +553,7 @@ pub const Decoder = struct {
             defer if (value_ds.owned) self.allocator.free(@constCast(value_ds.value));
             const value = value_ds.value;
             try out.append(self.allocator, .{
-                .name = try self.allocator.dupe(u8, name),
+                .name = if (name_is_static) name else try self.allocator.dupe(u8, name),
                 .value = try self.allocator.dupe(u8, value),
             });
         }
@@ -585,10 +588,18 @@ pub const Decoder = struct {
     }
 };
 
+fn isStaticSlice(slice: []const u8) bool {
+    for (static_table) |st| {
+        if (slice.ptr == st.name.ptr and slice.len == st.name.len) return true;
+        if (slice.ptr == st.value.ptr and slice.len == st.value.len) return true;
+    }
+    return false;
+}
+
 pub fn freeHeaders(allocator: std.mem.Allocator, headers: []Header) void {
     for (headers) |h| {
-        allocator.free(h.name);
-        allocator.free(h.value);
+        if (!isStaticSlice(h.name)) allocator.free(@constCast(h.name));
+        if (!isStaticSlice(h.value)) allocator.free(@constCast(h.value));
     }
     allocator.free(headers);
 }
