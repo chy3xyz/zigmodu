@@ -2,12 +2,15 @@ name: ZigModu CI/CD
 
 on:
   push:
-    branches: [main, develop]
+    branches: [master, main, develop]
     paths-ignore: ['docs/**', '*.md']
   pull_request:
-    branches: [main]
+    branches: [master, main]
   release:
     types: [published]
+  # Manual trigger for debugging workflow-level failures (0s runs with no
+  # jobs) without needing a code push.
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
