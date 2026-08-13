@@ -296,6 +296,13 @@ fn comptimeSkipInsertField(comptime fname: []const u8, comptime auto_ts: bool) b
         ((std.mem.eql(u8, fname, "create_time") or std.mem.eql(u8, fname, "update_time")) and !auto_ts);
 }
 
+/// Whether a struct field's type is optional (`?T`). Compile-time only — the
+/// undefined operand is never evaluated.
+fn isNullableField(comptime T: type, comptime fname: []const u8) bool {
+    const F = @TypeOf(@field(@as(T, undefined), fname));
+    return @typeInfo(F) == .optional;
+}
+
 fn comptimeInsertArgCount(comptime fields: []const []const u8, comptime auto_ts: bool) usize {
     @setEvalBranchQuota(100_000);
     comptime {
@@ -904,6 +911,48 @@ pub fn Orm(comptime B: type) type {
                     return e;
                 }
 
+                /// INSERT that omits columns whose value is null — letting the
+                /// DB `DEFAULT` (if any) take over. Non-nullable fields are
+                /// always written. This is opt-in: the default `insert` keeps
+                /// writing explicit NULLs (full-coverage semantics).
+                pub fn insertOmitNulls(self: @This(), allocator: std.mem.Allocator, entity: T) !T {
+                    const auto_ts = comptime @hasDecl(T, "sql_auto_timestamps") and T.sql_auto_timestamps;
+                    var e = entity;
+                    var cols = std.ArrayList(u8).empty;
+                    defer cols.deinit(allocator);
+                    var vals = std.ArrayList(u8).empty;
+                    defer vals.deinit(allocator);
+                    var args = std.ArrayList(B.Value).empty;
+                    defer args.deinit(allocator);
+                    const now = Time.monotonicNowSeconds();
+                    inline for (@typeInfo(T).@"struct".field_names, 0..) |fname, i| {
+                        if (comptime comptimeSkipInsertField(fname, auto_ts)) continue;
+                        const val = @field(e, fname);
+                        const write_it = if (comptime isNullableField(T, fname)) val != null else true;
+                        if (write_it) {
+                            if (cols.items.len > 0) {
+                                try cols.appendSlice(allocator, ", ");
+                                try vals.appendSlice(allocator, ", ");
+                            }
+                            try cols.appendSlice(allocator, meta.sql_columns[i]);
+                            try vals.appendSlice(allocator, "?");
+                            if (auto_ts and (std.mem.eql(u8, fname, "create_time") or std.mem.eql(u8, fname, "update_time"))) {
+                                try args.append(allocator, B.fromOrmValue(.{ .int = now }));
+                            } else {
+                                try args.append(allocator, fieldToBackendValue(B, val));
+                            }
+                        }
+                    }
+                    const sql = try std.fmt.allocPrint(allocator, "INSERT INTO {s} ({s}) VALUES ({s})", .{ meta.table_name, cols.items, vals.items });
+                    defer allocator.free(sql);
+                    _ = try self.orm.backend.exec(sql, args.items);
+                    if (auto_ts) {
+                        if (@hasField(T, "create_time")) e.create_time = now;
+                        if (@hasField(T, "update_time")) e.update_time = now;
+                    }
+                    return e;
+                }
+
                 /// Multi-row INSERT in one round-trip (VALUES (?,?),(?,?)…).
                 pub fn insertMany(self: @This(), allocator: std.mem.Allocator, entities: []const T) !void {
                     if (entities.len == 0) return;
@@ -1017,6 +1066,40 @@ pub fn Orm(comptime B: type) type {
                     args[idx] = fieldToBackendValue(B, @field(entity, meta.primary_key));
                     idx += 1;
                     _ = try self.orm.backend.exec(sql, args[0..idx]);
+                }
+
+                /// Partial UPDATE: only SET columns whose value is non-null —
+                /// nullable fields left null keep their current DB value. The
+                /// primary key is always used for the WHERE clause. Opt-in; the
+                /// default `update` keeps full-coverage (null clears) semantics.
+                pub fn updatePartial(self: @This(), allocator: std.mem.Allocator, entity: T) !void {
+                    const auto_ts = comptime @hasDecl(T, "sql_auto_timestamps") and T.sql_auto_timestamps;
+                    var set_clause = std.ArrayList(u8).empty;
+                    defer set_clause.deinit(allocator);
+                    var args = std.ArrayList(B.Value).empty;
+                    defer args.deinit(allocator);
+                    const now = Time.monotonicNowSeconds();
+                    inline for (@typeInfo(T).@"struct".field_names, 0..) |fname, i| {
+                        const is_pk = comptime std.mem.eql(u8, fname, meta.primary_key);
+                        if (is_pk) continue;
+                        const val = @field(entity, fname);
+                        const write_it = if (comptime isNullableField(T, fname)) val != null else true;
+                        if (write_it) {
+                            if (set_clause.items.len > 0) try set_clause.appendSlice(allocator, ", ");
+                            try set_clause.appendSlice(allocator, meta.sql_columns[i]);
+                            try set_clause.appendSlice(allocator, " = ?");
+                            if (auto_ts and std.mem.eql(u8, fname, "update_time")) {
+                                try args.append(allocator, B.fromOrmValue(.{ .int = now }));
+                            } else {
+                                try args.append(allocator, fieldToBackendValue(B, val));
+                            }
+                        }
+                    }
+                    if (set_clause.items.len == 0) return; // nothing to update
+                    try args.append(allocator, fieldToBackendValue(B, @field(entity, meta.primary_key)));
+                    const sql = try std.fmt.allocPrint(allocator, "UPDATE {s} SET {s} WHERE {s} = ?", .{ meta.table_name, set_clause.items, meta.primary_key });
+                    defer allocator.free(sql);
+                    _ = try self.orm.backend.exec(sql, args.items);
                 }
 
                 /// Tenant-scoped update: `UPDATE {t} SET … WHERE pk = ? AND {col} = ?`.
@@ -1178,6 +1261,43 @@ test "Repository insertMany / upsertMany / findByIds end-to-end (sqlite)" {
     const by_id = (try repo.findById(@as(i64, 2))).?;
     try std.testing.expectEqual(@as(i64, 250), by_id.price_cents);
     std.testing.allocator.free(by_id.sku);
+}
+
+test "Repository insertOmitNulls lets DB DEFAULT take over (sqlite)" {
+    const allocator = std.testing.allocator;
+    const data = @import("../data.zig");
+
+    const NullableRow = struct {
+        pub const sql_table_name: []const u8 = "nullable_row";
+        id: i64,
+        name: ?[]const u8,
+        note: ?[]const u8,
+    };
+
+    var client = try data.Client.open(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    _ = try client.exec("CREATE TABLE nullable_row (id INTEGER PRIMARY KEY, name TEXT DEFAULT 'anon', note TEXT)", &.{});
+    _ = try client.exec("INSERT INTO nullable_row (id, name, note) VALUES (1, 'orig', 'n1')", &.{});
+
+    const backend = data.SqlxBackend{ .allocator = allocator, .client = &client };
+    var orm: data.orm.Orm(data.SqlxBackend) = undefined;
+    orm.backend = backend;
+    const Repo = data.Repository(NullableRow);
+    const repo = Repo{ .orm = &orm };
+
+    // insertOmitNulls: name=null → column omitted → DB DEFAULT 'anon' applies.
+    const e = NullableRow{ .id = 2, .name = null, .note = "n2" };
+    _ = try repo.insertOmitNulls(allocator, e);
+    const got = (try repo.findById(@as(i64, 2))).?;
+    try std.testing.expectEqualStrings("anon", got.name.?);
+    try std.testing.expectEqualStrings("n2", got.note.?);
+
+    // updatePartial: note=null → name kept at current value; note stays.
+    const e2 = NullableRow{ .id = 2, .name = null, .note = "updated" };
+    try repo.updatePartial(allocator, e2);
+    const got2 = (try repo.findById(@as(i64, 2))).?;
+    try std.testing.expectEqualStrings("anon", got2.name.?); // untouched
+    try std.testing.expectEqualStrings("updated", got2.note.?);
 }
 
 test "Repository tenant-scoped methods filter by tenant column (sqlite)" {

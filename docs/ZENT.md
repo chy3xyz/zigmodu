@@ -218,6 +218,32 @@ Persistence **dupe 成普通 DTO** 再交给上层（见 `zent-modulith`），�
 
 ---
 
+## 5.1 ORM 写模式差异（nullable + DB DEFAULT）
+
+两种 ORM 的**写入语义**不同，混用时最容易踩的坑是「nullable 字段显式写 NULL 覆盖 DB DEFAULT」：
+
+| | zigmodu（sqlx Repository） | zent（Create/UpdateBuilder） |
+|---|---|---|
+| 写模式 | **entity 全字段**：`insert(entity)` 把 struct 所有列写入 | **builder**：`Create.setFieldValue` / `Update.set` 显式设字段 |
+| nullable + null | 显式写 `NULL` → 覆盖 DB `DEFAULT` | **不写入**（未 `set` 的字段不进 SQL）→ `DEFAULT` 天然生效 |
+| INSERT 部分字段 | 需 `insertOmitNulls(allocator, entity)`（v0.15.25 新增） | 天然支持 |
+| UPDATE 部分更新 | 需 `updatePartial(allocator, entity)`（v0.15.25 新增） | 天然 partial（`set` 只写已设字段） |
+
+**关键**：zent 的 `CreateBuilder.saveInternal` 只 `for (self.values.items)`（显式 setValue 过的字段），未设置的列完全不在 INSERT 里——所以 zent **不存在**「nullable 覆盖 DEFAULT」的问题。
+
+**zigmodu 侧**：默认 `insert`/`update` 保持全字段语义（`null` = 显式清空，便于完整覆盖）；要「DEFAULT 接管 / 部分更新」用 opt-in 变体：
+
+```zig
+// zigmodu — 省略 nullable-null 列，DB DEFAULT 接管
+_ = try repo.insertOmitNulls(allocator, entity);
+// zigmodu — 只改非 null 字段（部分更新，null 保持原值）
+try repo.updatePartial(allocator, entity);
+```
+
+zent 侧无需改动（builder 模式天然规避）。
+
+---
+
 ## 6. 启动流水线
 
 最小路径：
