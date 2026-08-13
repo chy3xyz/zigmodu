@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Repository opt-in 部分写入**（方案 C）：
+  - `insertOmitNulls(allocator, entity)` — nullable 且为 null 的列省略，
+    让 DB `DEFAULT` 接管（默认 `insert` 仍写显式 NULL 全量覆盖）。
+  - `updatePartial(allocator, entity)` — 只 SET 非 null 字段（null 保持
+    原值），pk 恒用于 WHERE。
+  - 文档：`docs/ZENT.md` §5.1 对照 zent（builder 模式天然规避此问题）。
+
 ## [0.15.24] - 2026-08-13
 
 ### Added
