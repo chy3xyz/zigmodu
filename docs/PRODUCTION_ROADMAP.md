@@ -172,6 +172,22 @@ gRPC 的价值与**通信距离**成正比，modulith 的核心通信都在**进
 - **验证（中成本）**：出现实际拆分计划时，补一个"拆分为两个 gRPC 服务"示例证明出口可行
 - **一等公民（高成本）**：**暂缓**——TLS 主路径 + 网关 + 生态对齐，等拆分需求出现再启动
 
+### 下一阶段 backlog（2026-08-11 评估）
+
+**P0（阻塞）**
+- CI 系统性 0s failure（8-03 起 260+ run）——分支 bug 已修（master），仍需
+  GitHub Actions 服务端排查（禁用/配额）；测试基建依赖 CI/独立 runner。
+
+**P1（质量/正确性）**
+- ConnPool 等待完整 async 化（现为 50ms 分段缓解，M:N worker 耗尽未根治）。
+- libpq 非阻塞化（`PQsetnonblocking`+轮询；现 SO_RCVTIMEO 有界超时仍占 worker）。
+- b17 剩余误报收敛（命名标量/多行 struct body 边界，22 处，真实泄漏已清零）。
+- Migration barrel 导出（F2）→ 弃用业务侧自研 migrate.sh（已补 `pub const migration`）。
+
+**P2（增强/按需）**
+- AI 流式 tool_calls 增量组装；refresh token；OTLP/Vault TLS（当前 http-only）；
+  Windows CI 矩阵；zmodu marketplace/CLI 深化。
+
 ### 决策记录：拆分出口 = 事件契约 + outbox（对齐 Spring Modulith）
 
 **2026-08 对照核实**：Spring Modulith 无真正分布式（无 RPC/服务发现），其演进出口是

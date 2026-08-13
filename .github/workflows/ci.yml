@@ -22,6 +22,22 @@ env:
   ZIG_VERSION: "0.17.0-dev.1567+f0354179a"
 
 jobs:
+  # ── Windows cross-compile (no DB drivers) ──────
+  # Guards the Windows-only compile branches (ioctlsocket/WSAPoll/inode
+  # intCast etc.) and the -Ddb=none driver-free path without needing the
+  # Windows CI runner or system DB libraries.
+  windows-cross:
+    name: Windows cross-compile (-Ddb=none)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Cross-compile library (driver-free)
+        run: zig build -Ddb=none -Dtarget=x86_64-windows
+
   # ── Build & Test Matrix ────────────────────────
   build-and-test:
     name: Build & Test (${{ matrix.os }})

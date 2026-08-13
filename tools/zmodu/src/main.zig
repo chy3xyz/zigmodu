@@ -222,7 +222,10 @@ pub fn main(init: std.process.Init) !void {
     var args = std.ArrayList([]const u8).empty;
     defer args.deinit(allocator);
     {
-        var iter = init.minimal.args.iterate();
+        // Windows args need an allocator (UTF-16 -> UTF-8); init() is a
+        // compile error there.
+        var iter = try init.minimal.args.iterateAllocator(allocator);
+        defer iter.deinit();
         while (iter.next()) |arg| {
             try args.append(allocator, arg);
         }
@@ -239,14 +242,15 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
-    runCommand(init.io, allocator, command, args.items[2..]) catch |err| switch (err) {
+    const home = if (init.environ_map.get("HOME")) |v| v else "";
+    runCommand(init.io, allocator, command, args.items[2..], home) catch |err| switch (err) {
         error.CliUsage => std.process.exit(2),
         error.RefuseOverwrite => std.process.exit(3),
         else => |e| return e,
     };
 }
 
-fn runCommand(io: std.Io, allocator: std.mem.Allocator, command: Command, cmd_args: []const []const u8) !void {
+fn runCommand(io: std.Io, allocator: std.mem.Allocator, command: Command, cmd_args: []const []const u8, home: []const u8) !void {
     switch (command) {
         .new => try cmdNew(io, allocator, cmd_args),
         .module => try cmdModule(io, allocator, cmd_args),
@@ -262,7 +266,7 @@ fn runCommand(io: std.Io, allocator: std.mem.Allocator, command: Command, cmd_ar
         .@"test" => try cmdTest(io, allocator, cmd_args),
         .plugin => try cmdPlugin(io, allocator, cmd_args),
         .life => try cmdLife(io, allocator, cmd_args),
-        .upgrade => try cmdUpgrade(io, allocator, cmd_args),
+        .upgrade => try cmdUpgrade(io, allocator, cmd_args, home),
         .mcp => try cmdMcp(io, allocator),
         .verify => try cmdVerify(io, allocator, cmd_args),
         .diff => try cmdDiff(io, allocator, cmd_args),
@@ -470,7 +474,7 @@ fn printVersion() void {
     std.log.info("zmodu v{s}", .{ZMODU_VERSION});
 }
 
-fn cmdUpgrade(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn cmdUpgrade(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8, home: []const u8) !void {
     _ = args;
 
     // Resolve zmodu source directory
@@ -492,7 +496,6 @@ fn cmdUpgrade(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8
 
     // 2. Try HOME-relative common paths
     if (src_dir == null) {
-        const home = if (std.c.getenv("HOME")) |ptr| std.mem.sliceTo(ptr, 0) else "";
         const candidates = [_][]const u8{
             "w4_proj/zig_ws/zmodu",
             "zmodu",
@@ -3972,9 +3975,11 @@ fn migrationStamp(epoch_seconds: u64) [6]u64 {
 /// Current wall-clock epoch seconds (REALTIME; Windows via FILETIME).
 fn wallClockSeconds() u64 {
     if (@import("builtin").os.tag == .windows) {
-        var ft: std.os.windows.FILETIME = undefined;
-        std.os.windows.GetSystemTimeAsFileTime(&ft);
-        const t = (@as(u64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+        // RtlGetSystemTimePrecise returns a LARGE_INTEGER in 100ns units
+        // since 1601-01-01 (FILETIME epoch), same as GetSystemTimeAsFileTime
+        // (which was removed from std.os.windows in this Zig version).
+        const li = std.os.windows.ntdll.RtlGetSystemTimePrecise();
+        const t: u64 = @bitCast(li);
         return @intCast(t / 10000000 -| 11644473600);
     }
     var ts: std.c.timespec = undefined;

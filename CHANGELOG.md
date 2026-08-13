@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **migration barrel 导出（F2）**: `zigmodu.migration` 全量导出
+  MigrationRunner/Entry/Applied/Status/Loader——业务侧可弃用自研 migrate.sh。
+
+### Fixed
+- **zmodu CLI Windows 交叉编译 3 处修复**: `wallClockSeconds` 用
+  `RtlGetSystemTimePrecise`（原 `GetSystemTimeAsFileTime` 已从 std 移除）；
+  `std.c.getenv` → `init.environ_map`（避免 libc 依赖）；args 迭代
+  `iterate()` → `iterateAllocator`（Windows UTF-16 需 allocator）+ deinit。
+
+### Changed
+- **CI**: 新增 `windows-cross` job（`-Ddb=none -Dtarget=x86_64-windows`
+  守护 Windows 分支）；push/pull_request branches 补 `master`（默认分支）。
+- **examples/zent-modulith**: 依赖升级 **zent v0.29.8**（benchmark canary
+  + outbox/shard/mysql-driver 测试补强 + docs 治理）。
+
 ## [0.15.23] - 2026-08-11
 
 ### Added
