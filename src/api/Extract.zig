@@ -108,6 +108,72 @@ pub fn extractJsonValidated(ctx: *Context, comptime T: type, comptime rules: any
     return try deepCopyValue(parsed.value, ctx.allocator);
 }
 
+/// Loose JSON extraction: field names match snake_case or camelCase
+/// (`user_name` ↔ `userName`), `null` treats the field as absent (zero
+/// default), missing fields stay at zero. Escape hatch for clients sending
+/// camelCase JSON or `"id": null` for create requests.
+pub fn extractJsonLoose(ctx: *Context, comptime T: type) !T {
+    if (ctx.body == null) {
+        try respondProblem(ctx, 400, "Request body required");
+        return error.InvalidJson;
+    }
+    var parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, ctx.body.?, .{ .ignore_unknown_fields = true }) catch {
+        try respondProblem(ctx, 400, "Invalid JSON body");
+        return error.InvalidJson;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        try respondProblem(ctx, 400, "JSON body must be an object");
+        return error.InvalidJson;
+    }
+    var result = std.mem.zeroes(T);
+    inline for (@typeInfo(T).@"struct".field_names) |fname| {
+        const F = @TypeOf(@field(result, fname));
+        if (findLooseField(parsed.value.object, fname)) |matched| {
+            if (matched != .null) {
+                var field_parsed = std.json.parseFromValue(F, ctx.allocator, matched, .{}) catch {
+                    try respondProblem(ctx, 400, "Invalid JSON body");
+                    return error.InvalidJson;
+                };
+                defer field_parsed.deinit();
+                @field(result, fname) = try deepCopyValue(field_parsed.value, ctx.allocator);
+            }
+        }
+    }
+    return result;
+}
+
+/// Whether two field names are equivalent ignoring underscores and case.
+fn namesEquivalent(a: []const u8, b: []const u8) bool {
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < a.len and j < b.len) {
+        if (a[i] == '_') {
+            i += 1;
+            continue;
+        }
+        if (b[j] == '_') {
+            j += 1;
+            continue;
+        }
+        if (std.ascii.toLower(a[i]) != std.ascii.toLower(b[j])) return false;
+        i += 1;
+        j += 1;
+    }
+    while (i < a.len and a[i] == '_') i += 1;
+    while (j < b.len and b[j] == '_') j += 1;
+    return i == a.len and j == b.len;
+}
+
+/// Find a JSON object entry whose key is name-equivalent to `fname`.
+fn findLooseField(obj: std.json.ObjectMap, fname: []const u8) ?std.json.Value {
+    var it = obj.iterator();
+    while (it.next()) |e| {
+        if (namesEquivalent(e.key_ptr.*, fname)) return e.value_ptr.*;
+    }
+    return null;
+}
+
 fn deepCopyValue(value: anytype, allocator: std.mem.Allocator) !@TypeOf(value) {
     const T = @TypeOf(value);
     if (comptime T == []const u8 or T == []u8) {

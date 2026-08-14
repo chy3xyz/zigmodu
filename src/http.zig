@@ -112,6 +112,7 @@ pub const extractQuery = Extract.extractQuery;
 pub const extractPath = Extract.extractPath;
 pub const extractJson = Extract.extractJson;
 pub const extractJsonValidated = Extract.extractJsonValidated;
+pub const extractJsonLoose = Extract.extractJsonLoose;
 pub const openApiParamsFromStruct = Extract.openApiParamsFromStruct;
 pub const respondProblem = Extract.respondProblem;
 pub const respondErr = Extract.respondErr;

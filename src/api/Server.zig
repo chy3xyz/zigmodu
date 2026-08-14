@@ -589,6 +589,38 @@ pub const Context = struct {
         return try deepCopy(parsed.value, self.allocator);
     }
 
+    /// Loose JSON binding: field names match either snake_case or camelCase
+    /// (`user_name` ↔ `userName`), `null` values are treated as absent
+    /// (field keeps its zero default), and missing fields are left at zero.
+    /// This is the escape hatch for clients that send camelCase JSON or
+    /// `"id": null` for create requests — std.json's strict binding would
+    /// reject both (MissingField / type error).
+    pub fn bindJsonLoose(self: *const Context, comptime T: type) !T {
+        if (self.body == null) return error.NoBody;
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, self.body.?, .{ .ignore_unknown_fields = true }) catch |err| {
+            std.log.err("bindJsonLoose({s}) failed: {s}", .{ @typeName(T), @errorName(err) });
+            return error.InvalidJson;
+        };
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidJson;
+
+        var result = std.mem.zeroes(T);
+        inline for (@typeInfo(T).@"struct".field_names) |fname| {
+            const F = @TypeOf(@field(result, fname));
+            if (findLooseField(parsed.value.object, fname)) |matched| {
+                if (matched != .null) { // null → zero default
+                    var field_parsed = std.json.parseFromValue(F, self.allocator, matched, .{}) catch |err| {
+                        std.log.err("bindJsonLoose({s}) field '{s}': {s}", .{ @typeName(T), fname, @errorName(err) });
+                        return error.InvalidJson;
+                    };
+                    defer field_parsed.deinit();
+                    @field(result, fname) = try deepCopy(field_parsed.value, self.allocator);
+                }
+            }
+        }
+        return result;
+    }
+
     /// Send JSON from struct.
     pub fn jsonStruct(self: *Context, status: u16, value: anytype) !void {
         self.status_code = status;
@@ -1984,6 +2016,39 @@ pub fn Json(comptime T: type) type {
 
 /// Deep-copy a parsed JSON value, duping all []const u8 fields
 /// to escape the parse arena lifetime. Supports nested structs.
+/// Whether two field names are equivalent ignoring underscores and case:
+/// `user_name` == `userName` == `USERNAME`. Used by bindJsonLoose so clients
+/// can send snake_case or camelCase JSON regardless of the struct spelling.
+fn namesEquivalent(a: []const u8, b: []const u8) bool {
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < a.len and j < b.len) {
+        if (a[i] == '_') {
+            i += 1;
+            continue;
+        }
+        if (b[j] == '_') {
+            j += 1;
+            continue;
+        }
+        if (std.ascii.toLower(a[i]) != std.ascii.toLower(b[j])) return false;
+        i += 1;
+        j += 1;
+    }
+    while (i < a.len and a[i] == '_') i += 1;
+    while (j < b.len and b[j] == '_') j += 1;
+    return i == a.len and j == b.len;
+}
+
+/// Find a JSON object entry whose key is name-equivalent to `fname`.
+fn findLooseField(obj: std.json.ObjectMap, fname: []const u8) ?std.json.Value {
+    var it = obj.iterator();
+    while (it.next()) |e| {
+        if (namesEquivalent(e.key_ptr.*, fname)) return e.value_ptr.*;
+    }
+    return null;
+}
+
 fn deepCopy(value: anytype, allocator: std.mem.Allocator) !@TypeOf(value) {
     const T = @TypeOf(value);
     if (comptime T == []const u8 or T == []u8) {
@@ -2735,6 +2800,23 @@ test "deep path matching with RouteGroup" {
     if (m2) |*m| m.params.deinit();
     if (m3) |*m| m.params.deinit();
     if (m4) |*m| m.params.deinit();
+}
+
+test "bindJsonLoose matches camelCase, skips null, defaults missing" {
+    const allocator = std.testing.allocator;
+    var ctx = try Context.init(allocator, .POST, "/");
+    defer ctx.deinit();
+    ctx.body = "{\"userName\":\"alice\",\"id\":null,\"age\":30}";
+
+    const Req = struct {
+        user_name: []const u8 = "anon", // snake struct field
+        id: ?i64 = 7,
+        age: i64 = 0,
+    };
+    const req = try ctx.bindJsonLoose(Req);
+    try std.testing.expectEqualStrings("alice", req.user_name); // camelCase matched
+    try std.testing.expectEqual(@as(?i64, 7), req.id); // null → default kept
+    try std.testing.expectEqual(@as(i64, 30), req.age); // exact match
 }
 
 test "wildcard + exact route coexistence" {

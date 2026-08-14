@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **宽松 JSON 绑定**（camelCase 拒收 + id:null 两个 bug 的框架侧根治）：
+  - `Context.bindJsonLoose(T)` — 字段名 snake_case↔camelCase 双向匹配
+    （`user_name` ↔ `userName`），`null` 视为缺失（零值默认），缺字段不报
+    MissingField。
+  - `http.extractJsonLoose(ctx, T)` — 同语义的 canonical extractor。
+  - 默认 `bindJson`/`extractJson` 保持严格语义不变；存量 handler 只需把
+    方法名换成 Loose 变体（sed 即可）。
+
 ## [0.15.25] - 2026-08-13
 
 ### Added
