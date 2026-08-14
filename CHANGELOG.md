@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.15.26] - 2026-08-14
 
 ### Added
 - **宽松 JSON 绑定**（camelCase 拒收 + id:null 两个 bug 的框架侧根治）：
