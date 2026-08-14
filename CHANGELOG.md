@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Repository INSERT 回填自增 id**：`insert` / `insertOmitNulls` 现在把
+  DB 生成的 `last_insert_id`（SQLite/MySQL）或 Postgres `SELECT lastval()`
+  写回 `entity.id`（上游 PR：heysen_saas `orm-insert-id` 补丁合并，含
+  `@hasDecl(B, "dialect")` 守卫与更完整的 `insert` 覆盖）。
+- **对称 rows_affected 守卫**：`deleteByIdReturning(id) !u64` 与
+  `updateReturning(entity) !u64`——0 表示记录不存在（乐观锁/NotFound 守卫），
+  对齐既有 `deleteForTenant`/`updateForTenant`。
+
 ## [0.15.26] - 2026-08-14
 
 ### Added

@@ -886,6 +886,26 @@ pub fn Orm(comptime B: type) type {
                     };
                 }
 
+                /// Write the DB-generated primary key back into `e.id` after an
+                /// INSERT. SQLite/MySQL populate `ExecResult.last_insert_id`;
+                /// the Postgres driver leaves it null, so follow up with
+                /// `SELECT lastval()` (safe: per-request session, this INSERT is
+                /// the most recent sequence advance).
+                fn writeBackInsertedId(self: @This(), e: *T, exec_result: anytype) !void {
+                    if (exec_result.last_insert_id) |id| {
+                        if (@hasField(T, "id")) e.id = id;
+                        return;
+                    }
+                    if (!@hasField(T, "id")) return;
+                    if (comptime @hasDecl(B, "dialect")) {
+                        if (self.orm.backend.dialect() == .postgres) {
+                            const Wrapper = struct { id: i64 };
+                            const row = (try self.orm.backend.queryRow(Wrapper, "SELECT lastval() AS id", &.{})) orelse Wrapper{ .id = 0 };
+                            if (row.id > 0) e.id = row.id;
+                        }
+                    }
+                }
+
                 pub fn insert(self: @This(), entity: T) !T {
                     const auto_ts = comptime @hasDecl(T, "sql_auto_timestamps") and T.sql_auto_timestamps;
                     var e = entity;
@@ -903,7 +923,8 @@ pub fn Orm(comptime B: type) type {
                         }
                         idx += 1;
                     }
-                    _ = try self.orm.backend.exec(sql, args[0..idx]);
+                    const exec_result = try self.orm.backend.exec(sql, args[0..idx]);
+                    try self.writeBackInsertedId(&e, exec_result);
                     if (auto_ts) {
                         if (@hasField(T, "create_time")) e.create_time = now;
                         if (@hasField(T, "update_time")) e.update_time = now;
@@ -945,7 +966,8 @@ pub fn Orm(comptime B: type) type {
                     }
                     const sql = try std.fmt.allocPrint(allocator, "INSERT INTO {s} ({s}) VALUES ({s})", .{ meta.table_name, cols.items, vals.items });
                     defer allocator.free(sql);
-                    _ = try self.orm.backend.exec(sql, args.items);
+                    const exec_result = try self.orm.backend.exec(sql, args.items);
+                    try self.writeBackInsertedId(&e, exec_result);
                     if (auto_ts) {
                         if (@hasField(T, "create_time")) e.create_time = now;
                         if (@hasField(T, "update_time")) e.update_time = now;
@@ -1068,6 +1090,33 @@ pub fn Orm(comptime B: type) type {
                     _ = try self.orm.backend.exec(sql, args[0..idx]);
                 }
 
+                /// UPDATE returning rows affected — 0 means the primary key did
+                /// not match any row (enables optimistic-lock / NotFound checks
+                /// without a separate read). Mirrors `updateForTenant`.
+                pub fn updateReturning(self: @This(), entity: T) !u64 {
+                    const auto_ts = comptime @hasDecl(T, "sql_auto_timestamps") and T.sql_auto_timestamps;
+                    const sql = comptime comptimeUpdate(meta.table_name, meta.sql_columns, meta.primary_key);
+                    const n = @typeInfo(T).@"struct".field_names.len;
+                    var args: [n]B.Value = undefined;
+                    var idx: usize = 0;
+                    const now = Time.monotonicNowSeconds();
+                    inline for (@typeInfo(T).@"struct".field_names) |fname| {
+                        const is_pk = comptime std.mem.eql(u8, fname, meta.primary_key);
+                        if (!is_pk) {
+                            if (auto_ts and std.mem.eql(u8, fname, "update_time")) {
+                                args[idx] = B.fromOrmValue(.{ .int = now });
+                            } else {
+                                args[idx] = fieldToBackendValue(B, @field(entity, fname));
+                            }
+                            idx += 1;
+                        }
+                    }
+                    args[idx] = fieldToBackendValue(B, @field(entity, meta.primary_key));
+                    idx += 1;
+                    const res = try self.orm.backend.exec(sql, args[0..idx]);
+                    return res.rows_affected;
+                }
+
                 /// Partial UPDATE: only SET columns whose value is non-null —
                 /// nullable fields left null keep their current DB value. The
                 /// primary key is always used for the WHERE clause. Opt-in; the
@@ -1137,6 +1186,15 @@ pub fn Orm(comptime B: type) type {
                     const sql = comptime comptimeDelete(meta.table_name, meta.primary_key);
                     var args = [_]B.Value{B.fromOrmValue(toOrmValue(id))};
                     _ = try self.orm.backend.exec(sql, &args);
+                }
+
+                /// DELETE returning rows affected — 0 means the primary key did
+                /// not match any row. Mirrors `deleteForTenant`.
+                pub fn deleteByIdReturning(self: @This(), id: anytype) !u64 {
+                    const sql = comptime comptimeDelete(meta.table_name, meta.primary_key);
+                    var args = [_]B.Value{B.fromOrmValue(toOrmValue(id))};
+                    const res = try self.orm.backend.exec(sql, &args);
+                    return res.rows_affected;
                 }
 
                 /// Tenant-scoped delete: `DELETE FROM {t} WHERE pk = ? AND {col} = ?`.
@@ -1298,6 +1356,35 @@ test "Repository insertOmitNulls lets DB DEFAULT take over (sqlite)" {
     const got2 = (try repo.findById(@as(i64, 2))).?;
     try std.testing.expectEqualStrings("anon", got2.name.?); // untouched
     try std.testing.expectEqualStrings("updated", got2.note.?);
+}
+
+test "Repository insert writes back DB-generated id (sqlite)" {
+    const allocator = std.testing.allocator;
+    const data = @import("../data.zig");
+
+    const AutoRow = struct {
+        pub const sql_table_name: []const u8 = "auto_row";
+        id: i64,
+        name: []const u8,
+    };
+
+    var client = try data.Client.open(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    _ = try client.exec("CREATE TABLE auto_row (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)", &.{});
+
+    const backend = data.SqlxBackend{ .allocator = allocator, .client = &client };
+    var orm: data.orm.Orm(data.SqlxBackend) = undefined;
+    orm.backend = backend;
+    const Repo = data.Repository(AutoRow);
+    const repo = Repo{ .orm = &orm };
+
+    const inserted = try repo.insert(.{ .id = 0, .name = "a" });
+    try std.testing.expect(inserted.id > 0); // last_insert_id written back
+    const got = (try repo.findById(inserted.id)).?;
+    try std.testing.expectEqualStrings("a", got.name);
+
+    const inserted2 = try repo.insertOmitNulls(allocator, .{ .id = 0, .name = "b" });
+    try std.testing.expect(inserted2.id > inserted.id);
 }
 
 test "Repository tenant-scoped methods filter by tenant column (sqlite)" {
