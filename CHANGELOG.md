@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **分布式限流**：`data.redis_rate_limit.RateLimiter` —— Redis INCR + 首次
+  EXPIRE 固定窗口（跨实例共享），fail-closed（Redis 不可用 → error，不静默
+  放行）。`max=0` 立即拒绝。
+- **跨实例 WS fanout 接线文档**：`DistributedEventBus` 订阅 → 本地
+  `WebSocketServer.broadcast`（任意实例 publish → 全集群广播），无需新组件。
+
 ## [0.15.27] - 2026-08-14
 
 ### Added

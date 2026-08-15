@@ -198,8 +198,7 @@ const async_bus = zigmodu.extensions.AsyncEventBus.init(allocator);
 
 | 能力 | 作用 | 引入方式 |
 |------|------|----------|
-| DistributedEventBus | 跨实例事件通信 | `zigmodu.core.DistributedEventBus` |
-| ClusterMembership | 节点发现与健康检查 | `zigmodu.core.ClusterMembership` |
+| DistributedEventBus | 跨实例事件通信 | `zigmodu.core.DistributedEventBus` || ClusterMembership | 节点发现与健康检查 | `zigmodu.core.ClusterMembership` |
 | Session 共享 | 分布式会话 | Redis Session Store |
 | 负载均衡 | 请求分发 | Nginx/Envoy |
 
@@ -211,7 +210,6 @@ try cluster.start(.{
     .seed_nodes = &.{"node-1", "node-2"},
     .gossip_interval_ms = 1000,
 });
-
 // 分布式事件发布
 try bus.publish("order.created", event_data);
 ```
@@ -275,6 +273,7 @@ try bus.publish("order.created", event_data);
 |------|----------|------|
 | 断路器 | `zigmodu.resilience.CircuitBreaker` | 5次失败，30秒半开 |
 | 限流 | `zigmodu.resilience.RateLimiter` | 令牌桶 1000/s |
+| 分布式限流 | `zigmodu.data.redis_rate_limit.RateLimiter` | Redis INCR+EXPIRE 固定窗口（跨实例，fail-closed）|
 | 分布式追踪 | `zigmodu.tracing.DistributedTracer` | Jaeger 导出 |
 | 指标收集 | `zigmodu.metrics.PrometheusMetrics` | /metrics 端点 |
 | gRPC | `zigmodu.core.TransportProtocols.GrpcTransport` | HTTP/2 |
@@ -289,6 +288,27 @@ var cb = try CircuitBreaker.init(allocator, "order-service", .{
 });
 
 var limiter = try RateLimiter.init(allocator, "api", 1000, 100);
+
+// 分布式限流（跨实例共享固定窗口；Redis 不可用 → error，fail-closed）
+var redis = try data.redis.Redis.init(allocator);
+defer redis.deinit();
+try redis.connect("127.0.0.1", 6379, .{});
+var dist_limiter = data.redis_rate_limit.RateLimiter.init(&redis);
+const allowed = dist_limiter.allow("login:user-1", 5, 60) catch |err| {
+    // fail-closed：限流后端不可用时不放行，按拒绝处理
+    std.log.warn("rate limiter backend down: {s}", .{@errorName(err)});
+    return error.RateLimited;
+};
+if (!allowed) return error.RateLimited;
+
+// 跨实例 WebSocket fanout：任意实例 publish → 全集群所有实例本地 broadcast
+try bus.subscribeWithContext("ws.fanout", &ws_server, struct {
+    fn onEvent(ctx: ?*anyopaque, ev: NetworkEvent) void {
+        const s: *WebSocketServer = @ptrCast(@alignCast(ctx.?));
+        s.broadcast(ev.payload);
+    }
+}.onEvent);
+try bus.publish("ws.fanout", "{\"type\":\"notice\"}");
 
 // 分布式追踪
 var tracer = try DistributedTracer.init(allocator, "order-service", "prod");

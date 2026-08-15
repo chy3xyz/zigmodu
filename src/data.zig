@@ -4,6 +4,7 @@
 pub const sqlx = @import("sqlx/sqlx.zig");
 pub const CachedConn = @import("sqlx/sqlx.zig").CachedConn;
 pub const redis = @import("redis/redis.zig");
+pub const redis_rate_limit = @import("redis/RateLimiter.zig");
 pub const orm = @import("persistence/Orm.zig");
 pub const bulk = @import("sqlx/Bulk.zig");
 pub const SqlxBackend = @import("persistence/backends/SqlxBackend.zig").SqlxBackend;
