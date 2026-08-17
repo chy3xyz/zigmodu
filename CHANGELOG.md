@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.29] - 2026-08-17
+
+### Fixed
+- **SQLx arena ownership clarity**: `QueryResult` (sqlx.zig) now documents the arena contract explicitly and exposes a new `deinitArena()` method that takes no allocator. The arena path of `deinit(allocator)` ignores the `allocator` argument and uses the arena's own backing allocator (captured at scan time). When callers mix allocator identities and pass a different allocator than the one backing the arena, `ReleaseSafe`'s `SafeAllocator` rejects the free; `deinitArena()` makes the intent explicit and removes the ambiguity that produced the heysen `len: 7` panic in nested-allocator chains.
+
 ## [0.15.28] - 2026-08-15
 
 ### Added

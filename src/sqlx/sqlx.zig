@@ -920,6 +920,14 @@ pub fn QueryResult(comptime T: type) type {
         /// frees the arena once; when `arena == null`, it `freeScanned`s every
         /// row then frees the items slice. Doing `freeScanned` then `deinit`
         /// is a double-free (heysen SIGABRT / SafeAllocator `len: 7` pattern).
+        ///
+        /// On the arena path the `allocator` argument is **ignored** — the arena
+        /// was created with its own backing allocator (the connection / client's
+        /// allocator) and `ArenaAllocator.deinit` uses that one internally.
+        /// Passing a different allocator here is a misuse: the caller has mixed
+        /// allocator identities and the SafeAllocator-backed backing allocator
+        /// will reject memory freed through the wrong path. For arena-backed
+        /// results prefer `deinitArena()`, which makes the intent explicit.
         pub fn deinit(self: *const @This(), allocator: std.mem.Allocator) void {
             const self_mut: *@This() = @constCast(self);
             if (self_mut.arena) |*a| {
@@ -931,6 +939,28 @@ pub fn QueryResult(comptime T: type) type {
             for (self.items) |item| freeScanned(allocator, T, item);
             allocator.free(self.items);
             self_mut.items = &.{};
+        }
+
+        /// Free an arena-backed QueryResult without taking an allocator.
+        /// Preferred over `deinit(any_allocator)` when the result owns an arena
+        /// (the common path returned by `queryRowsOwned` / `scanRowsToOwned`).
+        /// The arena's backing allocator — captured at scan time — releases the
+        /// arena's internal buffer, so the caller cannot influence or confuse
+        /// the free path by passing a different allocator.
+        ///
+        /// Calling this on a slice-backed result (arena == null) is a bug:
+        /// per-row strings would leak. We debug-panic to surface it loudly
+        /// rather than silently leak.
+        pub fn deinitArena(self: *const @This()) void {
+            const self_mut: *@This() = @constCast(self);
+            if (self_mut.arena) |*a| {
+                a.deinit();
+                self_mut.arena = null;
+                self_mut.items = &.{};
+                return;
+            }
+            @panic("deinitArena called on a slice-backed QueryResult (arena == null); "
+                ++ "use deinit(allocator) for the slice path");
         }
 
         /// Transfer items + arena ownership out (e.g. into PageResult). Leaves self empty.
