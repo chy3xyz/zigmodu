@@ -1575,6 +1575,14 @@ fn pgDecodeNumeric(allocator: std.mem.Allocator, bytes: []const u8) !Value {
         const int_chars = digits_before_dot - true_fnz;
         const int_out = @min(int_chars, total - fnz);
         try out.appendSlice(allocator, dec.items[fnz .. fnz + int_out]);
+        // PG may strip trailing zero base-10000 groups from numeric values, so
+        // `ndigits` can be less than `weight + 1`. When that happens, the integer
+        // part needs left-padding zeros to fill the higher base-10000 groups.
+        // Example: digits=[10], weight=1 → 10 * 10000^1 = 100000 needs 4 zeros
+        // padded after the "10" to produce "100000". Without this, 100000 → "10".
+        if (int_out < int_chars) {
+            try out.appendNTimes(allocator, '0', int_chars - int_out);
+        }
         if (dscale_usz > 0) {
             try out.append(allocator, '.');
             const frac_avail = if (total > fnz + int_out) total - fnz - int_out else 0;
@@ -6309,6 +6317,94 @@ test "pgDecodeNumeric NaN" {
     defer allocator.free(v.string);
     try std.testing.expectEqualStrings("NaN", v.string);
 }
+
+test "pgDecodeNumeric 100000 base-10000 boundary" {
+    const allocator = std.testing.allocator;
+    // 100000: ndigits=2, weight=1, sign=0, dscale=0, digits=[10, 0]
+    var buf: [12]u8 = undefined;
+    std.mem.writeInt(i16, buf[0..2], 2, .big);
+    std.mem.writeInt(i16, buf[2..4], 1, .big);
+    std.mem.writeInt(u16, buf[4..6], 0, .big);
+    std.mem.writeInt(u16, buf[6..8], 0, .big);
+    std.mem.writeInt(u16, buf[8..10], 10, .big);
+    std.mem.writeInt(u16, buf[10..12], 0, .big);
+    const v = try pgDecodeNumeric(allocator, &buf);
+    defer allocator.free(v.string);
+    try std.testing.expectEqualStrings("100000", v.string);
+}
+
+test "pgDecodeNumeric 800000 base-10000 boundary" {
+    const allocator = std.testing.allocator;
+    var buf: [12]u8 = undefined;
+    std.mem.writeInt(i16, buf[0..2], 2, .big);
+    std.mem.writeInt(i16, buf[2..4], 1, .big);
+    std.mem.writeInt(u16, buf[4..6], 0, .big);
+    std.mem.writeInt(u16, buf[6..8], 0, .big);
+    std.mem.writeInt(u16, buf[8..10], 80, .big);
+    std.mem.writeInt(u16, buf[10..12], 0, .big);
+    const v = try pgDecodeNumeric(allocator, &buf);
+    defer allocator.free(v.string);
+    try std.testing.expectEqualStrings("800000", v.string);
+}
+
+test "pgDecodeNumeric 1000000 base-10000 boundary" {
+    const allocator = std.testing.allocator;
+    // 1000000: ndigits=2, weight=1, digits=[100, 0]
+    var buf: [12]u8 = undefined;
+    std.mem.writeInt(i16, buf[0..2], 2, .big);
+    std.mem.writeInt(i16, buf[2..4], 1, .big);
+    std.mem.writeInt(u16, buf[4..6], 0, .big);
+    std.mem.writeInt(u16, buf[6..8], 0, .big);
+    std.mem.writeInt(u16, buf[8..10], 100, .big);
+    std.mem.writeInt(u16, buf[10..12], 0, .big);
+    const v = try pgDecodeNumeric(allocator, &buf);
+    defer allocator.free(v.string);
+    try std.testing.expectEqualStrings("1000000", v.string);
+}
+
+test "pgDecodeNumeric 100000 stripped (PG may drop trailing zero groups)" {
+    // PG stores numeric in a compressed form that strips trailing zero base-10000
+    // groups. 100000 = 10 * 10000^1 can be sent as ndigits=1, weight=1, digits=[10].
+    // The decoder must pad "10" with 4 zeros to reach "100000".
+    const allocator = std.testing.allocator;
+    var buf: [10]u8 = undefined;
+    std.mem.writeInt(i16, buf[0..2], 1, .big);
+    std.mem.writeInt(i16, buf[2..4], 1, .big);
+    std.mem.writeInt(u16, buf[4..6], 0, .big);
+    std.mem.writeInt(u16, buf[6..8], 0, .big);
+    std.mem.writeInt(u16, buf[8..10], 10, .big);
+    const v = try pgDecodeNumeric(allocator, &buf);
+    defer allocator.free(v.string);
+    try std.testing.expectEqualStrings("100000", v.string);
+}
+
+test "pgDecodeNumeric 800000 stripped" {
+    const allocator = std.testing.allocator;
+    var buf: [10]u8 = undefined;
+    std.mem.writeInt(i16, buf[0..2], 1, .big);
+    std.mem.writeInt(i16, buf[2..4], 1, .big);
+    std.mem.writeInt(u16, buf[4..6], 0, .big);
+    std.mem.writeInt(u16, buf[6..8], 0, .big);
+    std.mem.writeInt(u16, buf[8..10], 80, .big);
+    const v = try pgDecodeNumeric(allocator, &buf);
+    defer allocator.free(v.string);
+    try std.testing.expectEqualStrings("800000", v.string);
+}
+
+test "pgDecodeNumeric 10000 stripped single digit" {
+    const allocator = std.testing.allocator;
+    var buf: [10]u8 = undefined;
+    std.mem.writeInt(i16, buf[0..2], 1, .big);
+    std.mem.writeInt(i16, buf[2..4], 1, .big);
+    std.mem.writeInt(u16, buf[4..6], 0, .big);
+    std.mem.writeInt(u16, buf[6..8], 0, .big);
+    std.mem.writeInt(u16, buf[8..10], 1, .big);
+    const v = try pgDecodeNumeric(allocator, &buf);
+    defer allocator.free(v.string);
+    try std.testing.expectEqualStrings("10000", v.string);
+}
+
+
 
 test "pgDecodeNumeric exceeds former 256-byte stack buffer" {
     const allocator = std.testing.allocator;
