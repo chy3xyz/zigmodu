@@ -10,7 +10,7 @@ const sockread = @import("../core/sockread.zig");
 /// Write command bytes to Redis stream (Zig 0.17 compat: stream.write removed).
 /// Must flush: `Writer.writeAll` only fills the buffer; without flush the
 /// RESP command never reaches Redis and the subsequent read hangs forever.
-fn writeCmd(stream: *const std.Io.net.Stream, io: std.Io, cmd: []const u8) !void {
+fn writeCmd(stream: *const std.Io.net.Stream, io: std.Io, cmd: []const u8) errors.Result {
     var wbuf: [8192]u8 = undefined;
     var wstream = stream.writer(io, &wbuf);
     wstream.interface.writeAll(cmd) catch return error.RedisError;
@@ -187,7 +187,9 @@ pub const Redis = struct {
 
     /// Set a value only if key doesn't exist
     pub fn setNX(self: *Redis, key: []const u8, value: []const u8) errors.ResultT(bool) {
-        if (self.stream) |stream| {
+        const borrowed = self.acquireStream() catch return false;
+        defer self.releaseStream(borrowed.pool_idx);
+        const stream = borrowed.stream;
             const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$5\r\nSETNX\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{ key.len, key, value.len, value }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
@@ -201,13 +203,14 @@ pub const Redis = struct {
                 const val = std.fmt.parseInt(i32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return false;
                 return val == 1;
             }
-        }
         return false;
     }
 
     /// Delete keys
     pub fn del(self: *Redis, keys: []const []const u8) errors.ResultT(u32) {
-        if (self.stream) |stream| {
+        const borrowed = self.acquireStream() catch return 0;
+        defer self.releaseStream(borrowed.pool_idx);
+        const stream = borrowed.stream;
             var cmd_builder: std.ArrayList(u8) = std.ArrayList(u8).empty;
             defer cmd_builder.deinit(self.allocator);
 
@@ -226,13 +229,14 @@ pub const Redis = struct {
                 const val = std.fmt.parseInt(u32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
                 return val;
             }
-        }
         return 0;
     }
 
     /// Check if key exists
     pub fn exists(self: *Redis, key: []const u8) errors.ResultT(bool) {
-        if (self.stream) |stream| {
+        const borrowed = self.acquireStream() catch return false;
+        defer self.releaseStream(borrowed.pool_idx);
+        const stream = borrowed.stream;
             const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$6\r\nEXISTS\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
@@ -246,13 +250,14 @@ pub const Redis = struct {
                 const val = std.fmt.parseInt(i32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return false;
                 return val == 1;
             }
-        }
         return false;
     }
 
     /// Increment a value
     pub fn incr(self: *Redis, key: []const u8) errors.ResultT(i64) {
-        if (self.stream) |stream| {
+        const borrowed = self.acquireStream() catch return error.RedisError;
+        defer self.releaseStream(borrowed.pool_idx);
+        const stream = borrowed.stream;
             const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$4\r\nINCR\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
@@ -266,13 +271,14 @@ pub const Redis = struct {
                 const val = std.fmt.parseInt(i64, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
                 return val;
             }
-        }
         return error.RedisError;
     }
 
     /// Decrement a value
     pub fn decr(self: *Redis, key: []const u8) errors.ResultT(i64) {
-        if (self.stream) |stream| {
+        const borrowed = self.acquireStream() catch return error.RedisError;
+        defer self.releaseStream(borrowed.pool_idx);
+        const stream = borrowed.stream;
             const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$4\r\nDECR\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
@@ -286,13 +292,14 @@ pub const Redis = struct {
                 const val = std.fmt.parseInt(i64, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
                 return val;
             }
-        }
         return error.RedisError;
     }
 
     /// Expire a key
     pub fn expire(self: *Redis, key: []const u8, seconds: u32) errors.Result {
-        if (self.stream) |stream| {
+        const borrowed = self.acquireStream() catch return error.RedisError;
+        defer self.releaseStream(borrowed.pool_idx);
+        const stream = borrowed.stream;
             const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$6\r\nEXPIRE\r\n${d}\r\n{s}\r\n${d}\r\n{d}\r\n", .{ key.len, key, std.fmt.count("{d}", .{seconds}), seconds }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
@@ -301,13 +308,13 @@ pub const Redis = struct {
             var buf: [256]u8 = undefined;
             _ = sockread.readSome(stream, &buf) catch return error.RedisError;
             return;
-        }
-        return error.RedisError;
     }
 
     /// Get remaining TTL
     pub fn ttl(self: *Redis, key: []const u8) errors.ResultT(i64) {
-        if (self.stream) |stream| {
+        const borrowed = self.acquireStream() catch return -1;
+        defer self.releaseStream(borrowed.pool_idx);
+        const stream = borrowed.stream;
             const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$3\r\nTTL\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
@@ -321,20 +328,26 @@ pub const Redis = struct {
                 const val = std.fmt.parseInt(i64, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
                 return val;
             }
-        }
         return -1;
     }
 
     /// Acquire a distributed lock
     pub fn lock(self: *Redis, key: []const u8, value: []const u8, ttl_seconds: u32) errors.ResultT(bool) {
-        if (self.stream) |stream| {
+        const borrowed = self.acquireStream() catch return false;
+        defer self.releaseStream(borrowed.pool_idx);
+        const stream = borrowed.stream;
             const px = ttl_seconds * 1000;
-            const cmd = std.fmt.allocPrint(self.allocator, "*5\r\n$3\r\nSET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n$2\r\nNX\r\n$2\r\nPX\r\n${d}\r\n{d}\r\n", .{
-                key.len, key, value.len, value, std.fmt.count("{d}", .{px}), px,
-            }) catch return error.RedisError;
-            defer self.allocator.free(cmd);
+            const px_len = std.fmt.count("{d}", .{px});
+            var cmd_builder: std.ArrayList(u8) = std.ArrayList(u8).empty;
+            defer cmd_builder.deinit(self.allocator);
+            // RESP array of 6 bulk strings: SET, key, value, NX, PX, <px-ms>.
+            try cmd_builder.print(self.allocator, "*6\r\n$3\r\nSET\r\n", .{});
+            try cmd_builder.print(self.allocator, "${d}\r\n{s}\r\n", .{ key.len, key });
+            try cmd_builder.print(self.allocator, "${d}\r\n{s}\r\n", .{ value.len, value });
+            try cmd_builder.print(self.allocator, "$2\r\nNX\r\n$2\r\nPX\r\n", .{});
+            try cmd_builder.print(self.allocator, "${d}\r\n{d}\r\n", .{ px_len, px });
 
-            try writeCmd(&stream, self.io, cmd);
+            try writeCmd(&stream, self.io, cmd_builder.items);
 
             var buf: [256]u8 = undefined;
             const n = sockread.readSome(stream, &buf) catch return error.RedisError;
@@ -343,13 +356,14 @@ pub const Redis = struct {
             if (response.len >= 3 and std.mem.eql(u8, response[0..3], "+OK")) {
                 return true;
             }
-        }
         return false;
     }
 
     /// Release a distributed lock
     pub fn unlock(self: *Redis, key: []const u8) errors.Result {
-        if (self.stream) |stream| {
+        const borrowed = self.acquireStream() catch return;
+        defer self.releaseStream(borrowed.pool_idx);
+        const stream = borrowed.stream;
             const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$3\r\nDEL\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
@@ -357,13 +371,14 @@ pub const Redis = struct {
 
             var buf: [256]u8 = undefined;
             _ = sockread.readSome(stream, &buf) catch return error.RedisError;
-        }
         return;
     }
 
     /// List operations
     pub fn lPush(self: *Redis, key: []const u8, value: []const u8) errors.ResultT(u32) {
-        if (self.stream) |stream| {
+        const borrowed = self.acquireStream() catch return error.RedisError;
+        defer self.releaseStream(borrowed.pool_idx);
+        const stream = borrowed.stream;
             const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$5\r\nLPUSH\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{ key.len, key, value.len, value }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
@@ -377,12 +392,13 @@ pub const Redis = struct {
                 const val = std.fmt.parseInt(u32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
                 return val;
             }
-        }
         return error.RedisError;
     }
 
     pub fn rPop(self: *Redis, key: []const u8) errors.ResultT(?[]const u8) {
-        if (self.stream) |stream| {
+        const borrowed = self.acquireStream() catch return error.RedisError;
+        defer self.releaseStream(borrowed.pool_idx);
+        const stream = borrowed.stream;
             const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$4\r\nRPOP\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
@@ -407,13 +423,14 @@ pub const Redis = struct {
                     return value;
                 }
             }
-        }
         return error.RedisError;
     }
 
     /// Hash operations
     pub fn hSet(self: *Redis, key: []const u8, field: []const u8, value: []const u8) errors.ResultT(bool) {
-        if (self.stream) |stream| {
+        const borrowed = self.acquireStream() catch return error.RedisError;
+        defer self.releaseStream(borrowed.pool_idx);
+        const stream = borrowed.stream;
             const cmd = std.fmt.allocPrint(self.allocator, "*4\r\n$4\r\nHSET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{
                 key.len, key, field.len, field, value.len, value,
             }) catch return error.RedisError;
@@ -429,12 +446,13 @@ pub const Redis = struct {
                 const val = std.fmt.parseInt(i32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return 0;
                 return val == 1;
             }
-        }
         return false;
     }
 
     pub fn hGet(self: *Redis, key: []const u8, field: []const u8) errors.ResultT(?[]const u8) {
-        if (self.stream) |stream| {
+        const borrowed = self.acquireStream() catch return error.RedisError;
+        defer self.releaseStream(borrowed.pool_idx);
+        const stream = borrowed.stream;
             const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$4\r\nHGET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{
                 key.len, key, field.len, field,
             }) catch return error.RedisError;
@@ -461,13 +479,14 @@ pub const Redis = struct {
                     return value;
                 }
             }
-        }
         return error.RedisError;
     }
 
     /// Pub/Sub
     pub fn publish(self: *Redis, channel: []const u8, message: []const u8) errors.ResultT(u32) {
-        if (self.stream) |stream| {
+        const borrowed = self.acquireStream() catch return error.RedisError;
+        defer self.releaseStream(borrowed.pool_idx);
+        const stream = borrowed.stream;
             const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$7\r\nPUBLISH\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{
                 channel.len, channel, message.len, message,
             }) catch return error.RedisError;
@@ -483,7 +502,6 @@ pub const Redis = struct {
                 const val = std.fmt.parseInt(u32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
                 return val;
             }
-        }
         return error.RedisError;
     }
 };
@@ -680,7 +698,13 @@ test "redis client" {
     const redis_url = if (builtin.os.tag == .windows) @as(?[]const u8, null) else if (std.c.getenv("REDIS_URL")) |ptr| std.mem.span(ptr) else null;
     if (redis_url == null or redis_url.?.len == 0) return error.SkipZigTest;
 
-    const cfg = RedisConfig{};
+    // parseIp4 only accepts literal IPv4, so derive the host from REDIS_URL
+    // (e.g. redis://192.168.107.3:6379 -> 192.168.107.3).
+    const raw = redis_url.?;
+    const after_scheme = if (std.mem.startsWith(u8, raw, "redis://")) raw["redis://".len..] else raw;
+    const host = if (std.mem.indexOfScalar(u8, after_scheme, ':')) |i| after_scheme[0..i] else after_scheme;
+
+    const cfg = RedisConfig{ .host = host };
     var redis = try Redis.new(std.testing.allocator, std.testing.io, cfg);
     defer redis.deinit();
 
@@ -698,6 +722,51 @@ test "redis client" {
     // Test lock
     const acquired = try Lock.acquire(&redis, "test_lock", "token123", 10);
     try std.testing.expect(acquired);
+}
+
+/// Worker used by the concurrent-incr test: INCR one key, ignoring errors
+/// (caller asserts the final count so any lost increment fails the test).
+fn concurrentIncrWorker(r: *Redis, k: []const u8) void {
+    _ = r.incr(k) catch {};
+}
+
+test "redis concurrent incr" {
+    // Requires a running Redis server; set REDIS_URL to enable
+    // (e.g. redis://127.0.0.1:6379). Spawns many threads that concurrently
+    // INCR the same key through the connection pool and asserts the final
+    // value equals the thread count — i.e. no two commands ever interleave
+    // on a shared socket, and the pool hands out exclusive connections.
+    const redis_url = if (builtin.os.tag == .windows) @as(?[]const u8, null) else if (std.c.getenv("REDIS_URL")) |ptr| std.mem.span(ptr) else null;
+    if (redis_url == null or redis_url.?.len == 0) return error.SkipZigTest;
+
+    const raw = redis_url.?;
+    const after_scheme = if (std.mem.startsWith(u8, raw, "redis://")) raw["redis://".len..] else raw;
+    const host = if (std.mem.indexOfScalar(u8, after_scheme, ':')) |i| after_scheme[0..i] else after_scheme;
+
+    const threads_n: usize = 64;
+    // Pool larger than the thread count so acquireStream never exhausts.
+    const cfg = RedisConfig{ .host = host, .pool_size = 128 };
+    var redis = try Redis.new(std.testing.allocator, std.testing.io, cfg);
+    defer redis.deinit();
+    try redis.connect();
+
+    const key = "zigmodu_concurrent_incr_test";
+    _ = redis.del(&[_][]const u8{key}) catch {};
+
+    var threads: [threads_n]std.Thread = undefined;
+    for (&threads) |*t| {
+        t.* = try std.Thread.spawn(.{}, concurrentIncrWorker, .{ &redis, key });
+    }
+    for (&threads) |*t| t.join();
+
+    const final_val = try redis.get(key);
+    if (final_val) |v| {
+        defer std.testing.allocator.free(v);
+        const parsed = std.fmt.parseInt(i64, v, 10) catch unreachable;
+        try std.testing.expectEqual(@as(i64, threads_n), parsed);
+    } else {
+        try std.testing.expect(false); // key should exist with value == threads_n
+    }
 }
 
 test "resp protocol parsing" {
