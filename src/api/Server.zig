@@ -1640,7 +1640,11 @@ pub const Server = struct {
     /// services (HTTP + gRPC + cluster) in the same process.
     pub fn runInBackground(self: *Server) !std.Thread {
         self.running.store(true, .monotonic);
-        const handle = try std.Thread.spawn(.{ .stack_size = 128 * 1024 }, runLoop, .{self});
+        // NB: on aarch64 glibc (ubuntu 22.04 arm64) `pthread_create` rejects a
+        // custom `stack_size` ≤ 256 KiB with EINVAL (PTHREAD_STACK_MIN is 128 KiB
+        // there, and the guard page eats into it). 2 MiB is the smallest size we
+        // measured to succeed; use that instead of the original 128 KiB.
+        const handle = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, runLoop, .{self});
         return handle;
     }
 

@@ -198,7 +198,7 @@ pub const Redis = struct {
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {
-                const val = std.fmt.parseInt(i32, response[1..], 10) catch return false;
+                const val = std.fmt.parseInt(i32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return false;
                 return val == 1;
             }
         }
@@ -223,7 +223,7 @@ pub const Redis = struct {
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {
-                const val = std.fmt.parseInt(u32, response[1..], 10) catch return error.RedisError;
+                const val = std.fmt.parseInt(u32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
                 return val;
             }
         }
@@ -243,7 +243,7 @@ pub const Redis = struct {
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {
-                const val = std.fmt.parseInt(i32, response[1..], 10) catch return false;
+                const val = std.fmt.parseInt(i32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return false;
                 return val == 1;
             }
         }
@@ -263,7 +263,7 @@ pub const Redis = struct {
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {
-                const val = std.fmt.parseInt(i64, response[1..], 10) catch return error.RedisError;
+                const val = std.fmt.parseInt(i64, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
                 return val;
             }
         }
@@ -283,7 +283,7 @@ pub const Redis = struct {
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {
-                const val = std.fmt.parseInt(i64, response[1..], 10) catch return error.RedisError;
+                const val = std.fmt.parseInt(i64, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
                 return val;
             }
         }
@@ -318,7 +318,7 @@ pub const Redis = struct {
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {
-                const val = std.fmt.parseInt(i64, response[1..], 10) catch return error.RedisError;
+                const val = std.fmt.parseInt(i64, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
                 return val;
             }
         }
@@ -374,7 +374,7 @@ pub const Redis = struct {
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {
-                const val = std.fmt.parseInt(u32, response[1..], 10) catch return error.RedisError;
+                const val = std.fmt.parseInt(u32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
                 return val;
             }
         }
@@ -426,7 +426,7 @@ pub const Redis = struct {
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {
-                const val = std.fmt.parseInt(i32, response[1..], 10) catch return 0;
+                const val = std.fmt.parseInt(i32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return 0;
                 return val == 1;
             }
         }
@@ -480,7 +480,7 @@ pub const Redis = struct {
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {
-                const val = std.fmt.parseInt(u32, response[1..], 10) catch return error.RedisError;
+                const val = std.fmt.parseInt(u32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
                 return val;
             }
         }
