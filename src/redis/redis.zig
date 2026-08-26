@@ -190,19 +190,19 @@ pub const Redis = struct {
         const borrowed = self.acquireStream() catch return false;
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
-            const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$5\r\nSETNX\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{ key.len, key, value.len, value }) catch return error.RedisError;
-            defer self.allocator.free(cmd);
+        const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$5\r\nSETNX\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{ key.len, key, value.len, value }) catch return error.RedisError;
+        defer self.allocator.free(cmd);
 
-            try writeCmd(&stream, self.io, cmd);
+        try writeCmd(&stream, self.io, cmd);
 
-            var buf: [256]u8 = undefined;
-            const n = sockread.readSome(stream, &buf) catch return error.RedisError;
-            const response = buf[0..n];
+        var buf: [256]u8 = undefined;
+        const n = sockread.readSome(stream, &buf) catch return error.RedisError;
+        const response = buf[0..n];
 
-            if (response.len > 1 and response[0] == ':') {
-                const val = std.fmt.parseInt(i32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return false;
-                return val == 1;
-            }
+        if (response.len > 1 and response[0] == ':') {
+            const val = std.fmt.parseInt(i32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return false;
+            return val == 1;
+        }
         return false;
     }
 
@@ -211,24 +211,24 @@ pub const Redis = struct {
         const borrowed = self.acquireStream() catch return 0;
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
-            var cmd_builder: std.ArrayList(u8) = std.ArrayList(u8).empty;
-            defer cmd_builder.deinit(self.allocator);
+        var cmd_builder: std.ArrayList(u8) = std.ArrayList(u8).empty;
+        defer cmd_builder.deinit(self.allocator);
 
-            try cmd_builder.print(self.allocator, "*{d}\r\n$3\r\nDEL\r\n", .{keys.len + 1});
-            for (keys) |key| {
-                try cmd_builder.print(self.allocator, "${d}\r\n{s}\r\n", .{ key.len, key });
-            }
+        try cmd_builder.print(self.allocator, "*{d}\r\n$3\r\nDEL\r\n", .{keys.len + 1});
+        for (keys) |key| {
+            try cmd_builder.print(self.allocator, "${d}\r\n{s}\r\n", .{ key.len, key });
+        }
 
-            try writeCmd(&stream, self.io, cmd_builder.items);
+        try writeCmd(&stream, self.io, cmd_builder.items);
 
-            var buf: [256]u8 = undefined;
-            const n = sockread.readSome(stream, &buf) catch return error.RedisError;
-            const response = buf[0..n];
+        var buf: [256]u8 = undefined;
+        const n = sockread.readSome(stream, &buf) catch return error.RedisError;
+        const response = buf[0..n];
 
-            if (response.len > 1 and response[0] == ':') {
-                const val = std.fmt.parseInt(u32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
-                return val;
-            }
+        if (response.len > 1 and response[0] == ':') {
+            const val = std.fmt.parseInt(u32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
+            return val;
+        }
         return 0;
     }
 
@@ -237,19 +237,19 @@ pub const Redis = struct {
         const borrowed = self.acquireStream() catch return false;
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
-            const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$6\r\nEXISTS\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
-            defer self.allocator.free(cmd);
+        const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$6\r\nEXISTS\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
+        defer self.allocator.free(cmd);
 
-            try writeCmd(&stream, self.io, cmd);
+        try writeCmd(&stream, self.io, cmd);
 
-            var buf: [256]u8 = undefined;
-            const n = sockread.readSome(stream, &buf) catch return error.RedisError;
-            const response = buf[0..n];
+        var buf: [256]u8 = undefined;
+        const n = sockread.readSome(stream, &buf) catch return error.RedisError;
+        const response = buf[0..n];
 
-            if (response.len > 1 and response[0] == ':') {
-                const val = std.fmt.parseInt(i32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return false;
-                return val == 1;
-            }
+        if (response.len > 1 and response[0] == ':') {
+            const val = std.fmt.parseInt(i32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return false;
+            return val == 1;
+        }
         return false;
     }
 
@@ -258,19 +258,19 @@ pub const Redis = struct {
         const borrowed = self.acquireStream() catch return error.RedisError;
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
-            const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$4\r\nINCR\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
-            defer self.allocator.free(cmd);
+        const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$4\r\nINCR\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
+        defer self.allocator.free(cmd);
 
-            try writeCmd(&stream, self.io, cmd);
+        try writeCmd(&stream, self.io, cmd);
 
-            var buf: [256]u8 = undefined;
-            const n = sockread.readSome(stream, &buf) catch return error.RedisError;
-            const response = buf[0..n];
+        var buf: [256]u8 = undefined;
+        const n = sockread.readSome(stream, &buf) catch return error.RedisError;
+        const response = buf[0..n];
 
-            if (response.len > 1 and response[0] == ':') {
-                const val = std.fmt.parseInt(i64, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
-                return val;
-            }
+        if (response.len > 1 and response[0] == ':') {
+            const val = std.fmt.parseInt(i64, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
+            return val;
+        }
         return error.RedisError;
     }
 
@@ -279,19 +279,19 @@ pub const Redis = struct {
         const borrowed = self.acquireStream() catch return error.RedisError;
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
-            const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$4\r\nDECR\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
-            defer self.allocator.free(cmd);
+        const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$4\r\nDECR\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
+        defer self.allocator.free(cmd);
 
-            try writeCmd(&stream, self.io, cmd);
+        try writeCmd(&stream, self.io, cmd);
 
-            var buf: [256]u8 = undefined;
-            const n = sockread.readSome(stream, &buf) catch return error.RedisError;
-            const response = buf[0..n];
+        var buf: [256]u8 = undefined;
+        const n = sockread.readSome(stream, &buf) catch return error.RedisError;
+        const response = buf[0..n];
 
-            if (response.len > 1 and response[0] == ':') {
-                const val = std.fmt.parseInt(i64, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
-                return val;
-            }
+        if (response.len > 1 and response[0] == ':') {
+            const val = std.fmt.parseInt(i64, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
+            return val;
+        }
         return error.RedisError;
     }
 
@@ -300,14 +300,14 @@ pub const Redis = struct {
         const borrowed = self.acquireStream() catch return error.RedisError;
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
-            const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$6\r\nEXPIRE\r\n${d}\r\n{s}\r\n${d}\r\n{d}\r\n", .{ key.len, key, std.fmt.count("{d}", .{seconds}), seconds }) catch return error.RedisError;
-            defer self.allocator.free(cmd);
+        const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$6\r\nEXPIRE\r\n${d}\r\n{s}\r\n${d}\r\n{d}\r\n", .{ key.len, key, std.fmt.count("{d}", .{seconds}), seconds }) catch return error.RedisError;
+        defer self.allocator.free(cmd);
 
-            try writeCmd(&stream, self.io, cmd);
+        try writeCmd(&stream, self.io, cmd);
 
-            var buf: [256]u8 = undefined;
-            _ = sockread.readSome(stream, &buf) catch return error.RedisError;
-            return;
+        var buf: [256]u8 = undefined;
+        _ = sockread.readSome(stream, &buf) catch return error.RedisError;
+        return;
     }
 
     /// Get remaining TTL
@@ -315,19 +315,19 @@ pub const Redis = struct {
         const borrowed = self.acquireStream() catch return -1;
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
-            const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$3\r\nTTL\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
-            defer self.allocator.free(cmd);
+        const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$3\r\nTTL\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
+        defer self.allocator.free(cmd);
 
-            try writeCmd(&stream, self.io, cmd);
+        try writeCmd(&stream, self.io, cmd);
 
-            var buf: [256]u8 = undefined;
-            const n = sockread.readSome(stream, &buf) catch return error.RedisError;
-            const response = buf[0..n];
+        var buf: [256]u8 = undefined;
+        const n = sockread.readSome(stream, &buf) catch return error.RedisError;
+        const response = buf[0..n];
 
-            if (response.len > 1 and response[0] == ':') {
-                const val = std.fmt.parseInt(i64, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
-                return val;
-            }
+        if (response.len > 1 and response[0] == ':') {
+            const val = std.fmt.parseInt(i64, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
+            return val;
+        }
         return -1;
     }
 
@@ -336,26 +336,26 @@ pub const Redis = struct {
         const borrowed = self.acquireStream() catch return false;
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
-            const px = ttl_seconds * 1000;
-            const px_len = std.fmt.count("{d}", .{px});
-            var cmd_builder: std.ArrayList(u8) = std.ArrayList(u8).empty;
-            defer cmd_builder.deinit(self.allocator);
-            // RESP array of 6 bulk strings: SET, key, value, NX, PX, <px-ms>.
-            try cmd_builder.print(self.allocator, "*6\r\n$3\r\nSET\r\n", .{});
-            try cmd_builder.print(self.allocator, "${d}\r\n{s}\r\n", .{ key.len, key });
-            try cmd_builder.print(self.allocator, "${d}\r\n{s}\r\n", .{ value.len, value });
-            try cmd_builder.print(self.allocator, "$2\r\nNX\r\n$2\r\nPX\r\n", .{});
-            try cmd_builder.print(self.allocator, "${d}\r\n{d}\r\n", .{ px_len, px });
+        const px = ttl_seconds * 1000;
+        const px_len = std.fmt.count("{d}", .{px});
+        var cmd_builder: std.ArrayList(u8) = std.ArrayList(u8).empty;
+        defer cmd_builder.deinit(self.allocator);
+        // RESP array of 6 bulk strings: SET, key, value, NX, PX, <px-ms>.
+        try cmd_builder.print(self.allocator, "*6\r\n$3\r\nSET\r\n", .{});
+        try cmd_builder.print(self.allocator, "${d}\r\n{s}\r\n", .{ key.len, key });
+        try cmd_builder.print(self.allocator, "${d}\r\n{s}\r\n", .{ value.len, value });
+        try cmd_builder.print(self.allocator, "$2\r\nNX\r\n$2\r\nPX\r\n", .{});
+        try cmd_builder.print(self.allocator, "${d}\r\n{d}\r\n", .{ px_len, px });
 
-            try writeCmd(&stream, self.io, cmd_builder.items);
+        try writeCmd(&stream, self.io, cmd_builder.items);
 
-            var buf: [256]u8 = undefined;
-            const n = sockread.readSome(stream, &buf) catch return error.RedisError;
-            const response = buf[0..n];
+        var buf: [256]u8 = undefined;
+        const n = sockread.readSome(stream, &buf) catch return error.RedisError;
+        const response = buf[0..n];
 
-            if (response.len >= 3 and std.mem.eql(u8, response[0..3], "+OK")) {
-                return true;
-            }
+        if (response.len >= 3 and std.mem.eql(u8, response[0..3], "+OK")) {
+            return true;
+        }
         return false;
     }
 
@@ -364,13 +364,13 @@ pub const Redis = struct {
         const borrowed = self.acquireStream() catch return;
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
-            const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$3\r\nDEL\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
-            defer self.allocator.free(cmd);
+        const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$3\r\nDEL\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
+        defer self.allocator.free(cmd);
 
-            try writeCmd(&stream, self.io, cmd);
+        try writeCmd(&stream, self.io, cmd);
 
-            var buf: [256]u8 = undefined;
-            _ = sockread.readSome(stream, &buf) catch return error.RedisError;
+        var buf: [256]u8 = undefined;
+        _ = sockread.readSome(stream, &buf) catch return error.RedisError;
         return;
     }
 
@@ -379,19 +379,19 @@ pub const Redis = struct {
         const borrowed = self.acquireStream() catch return error.RedisError;
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
-            const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$5\r\nLPUSH\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{ key.len, key, value.len, value }) catch return error.RedisError;
-            defer self.allocator.free(cmd);
+        const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$5\r\nLPUSH\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{ key.len, key, value.len, value }) catch return error.RedisError;
+        defer self.allocator.free(cmd);
 
-            try writeCmd(&stream, self.io, cmd);
+        try writeCmd(&stream, self.io, cmd);
 
-            var buf: [256]u8 = undefined;
-            const n = sockread.readSome(stream, &buf) catch return error.RedisError;
-            const response = buf[0..n];
+        var buf: [256]u8 = undefined;
+        const n = sockread.readSome(stream, &buf) catch return error.RedisError;
+        const response = buf[0..n];
 
-            if (response.len > 1 and response[0] == ':') {
-                const val = std.fmt.parseInt(u32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
-                return val;
-            }
+        if (response.len > 1 and response[0] == ':') {
+            const val = std.fmt.parseInt(u32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
+            return val;
+        }
         return error.RedisError;
     }
 
@@ -399,30 +399,30 @@ pub const Redis = struct {
         const borrowed = self.acquireStream() catch return error.RedisError;
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
-            const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$4\r\nRPOP\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
-            defer self.allocator.free(cmd);
+        const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$4\r\nRPOP\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
+        defer self.allocator.free(cmd);
 
-            try writeCmd(&stream, self.io, cmd);
+        try writeCmd(&stream, self.io, cmd);
 
-            var buf: [4096]u8 = undefined;
-            const n = sockread.readSome(stream, &buf) catch return error.RedisError;
-            const response = buf[0..n];
+        var buf: [4096]u8 = undefined;
+        const n = sockread.readSome(stream, &buf) catch return error.RedisError;
+        const response = buf[0..n];
 
-            if (response.len > 1) {
-                if (response[0] == '$') {
-                    if (response[1] == '-') {
-                        return null;
-                    }
-                    var end_idx: usize = 1;
-                    while (end_idx < response.len and response[end_idx] != '\r') : (end_idx += 1) {}
-                    const len = std.fmt.parseInt(i32, response[1..end_idx], 10) catch return error.RedisError;
-                    if (len <= 0) return null;
-
-                    const value_start = end_idx + 2;
-                    const value = self.allocator.dupe(u8, response[value_start..@min(value_start + @as(usize, @intCast(len)), response.len)]) catch return error.RedisError;
-                    return value;
+        if (response.len > 1) {
+            if (response[0] == '$') {
+                if (response[1] == '-') {
+                    return null;
                 }
+                var end_idx: usize = 1;
+                while (end_idx < response.len and response[end_idx] != '\r') : (end_idx += 1) {}
+                const len = std.fmt.parseInt(i32, response[1..end_idx], 10) catch return error.RedisError;
+                if (len <= 0) return null;
+
+                const value_start = end_idx + 2;
+                const value = self.allocator.dupe(u8, response[value_start..@min(value_start + @as(usize, @intCast(len)), response.len)]) catch return error.RedisError;
+                return value;
             }
+        }
         return error.RedisError;
     }
 
@@ -431,21 +431,21 @@ pub const Redis = struct {
         const borrowed = self.acquireStream() catch return error.RedisError;
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
-            const cmd = std.fmt.allocPrint(self.allocator, "*4\r\n$4\r\nHSET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{
-                key.len, key, field.len, field, value.len, value,
-            }) catch return error.RedisError;
-            defer self.allocator.free(cmd);
+        const cmd = std.fmt.allocPrint(self.allocator, "*4\r\n$4\r\nHSET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{
+            key.len, key, field.len, field, value.len, value,
+        }) catch return error.RedisError;
+        defer self.allocator.free(cmd);
 
-            try writeCmd(&stream, self.io, cmd);
+        try writeCmd(&stream, self.io, cmd);
 
-            var buf: [256]u8 = undefined;
-            const n = sockread.readSome(stream, &buf) catch return error.RedisError;
-            const response = buf[0..n];
+        var buf: [256]u8 = undefined;
+        const n = sockread.readSome(stream, &buf) catch return error.RedisError;
+        const response = buf[0..n];
 
-            if (response.len > 1 and response[0] == ':') {
-                const val = std.fmt.parseInt(i32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return 0;
-                return val == 1;
-            }
+        if (response.len > 1 and response[0] == ':') {
+            const val = std.fmt.parseInt(i32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return 0;
+            return val == 1;
+        }
         return false;
     }
 
@@ -453,32 +453,32 @@ pub const Redis = struct {
         const borrowed = self.acquireStream() catch return error.RedisError;
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
-            const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$4\r\nHGET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{
-                key.len, key, field.len, field,
-            }) catch return error.RedisError;
-            defer self.allocator.free(cmd);
+        const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$4\r\nHGET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{
+            key.len, key, field.len, field,
+        }) catch return error.RedisError;
+        defer self.allocator.free(cmd);
 
-            try writeCmd(&stream, self.io, cmd);
+        try writeCmd(&stream, self.io, cmd);
 
-            var buf: [4096]u8 = undefined;
-            const n = sockread.readSome(stream, &buf) catch return error.RedisError;
-            const response = buf[0..n];
+        var buf: [4096]u8 = undefined;
+        const n = sockread.readSome(stream, &buf) catch return error.RedisError;
+        const response = buf[0..n];
 
-            if (response.len > 1) {
-                if (response[0] == '$') {
-                    if (response[1] == '-') {
-                        return null;
-                    }
-                    var end_idx: usize = 1;
-                    while (end_idx < response.len and response[end_idx] != '\r') : (end_idx += 1) {}
-                    const len = std.fmt.parseInt(i32, response[1..end_idx], 10) catch return error.RedisError;
-                    if (len <= 0) return null;
-
-                    const value_start = end_idx + 2;
-                    const value = self.allocator.dupe(u8, response[value_start..@min(value_start + @as(usize, @intCast(len)), response.len)]) catch return error.RedisError;
-                    return value;
+        if (response.len > 1) {
+            if (response[0] == '$') {
+                if (response[1] == '-') {
+                    return null;
                 }
+                var end_idx: usize = 1;
+                while (end_idx < response.len and response[end_idx] != '\r') : (end_idx += 1) {}
+                const len = std.fmt.parseInt(i32, response[1..end_idx], 10) catch return error.RedisError;
+                if (len <= 0) return null;
+
+                const value_start = end_idx + 2;
+                const value = self.allocator.dupe(u8, response[value_start..@min(value_start + @as(usize, @intCast(len)), response.len)]) catch return error.RedisError;
+                return value;
             }
+        }
         return error.RedisError;
     }
 
@@ -487,21 +487,21 @@ pub const Redis = struct {
         const borrowed = self.acquireStream() catch return error.RedisError;
         defer self.releaseStream(borrowed.pool_idx);
         const stream = borrowed.stream;
-            const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$7\r\nPUBLISH\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{
-                channel.len, channel, message.len, message,
-            }) catch return error.RedisError;
-            defer self.allocator.free(cmd);
+        const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$7\r\nPUBLISH\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{
+            channel.len, channel, message.len, message,
+        }) catch return error.RedisError;
+        defer self.allocator.free(cmd);
 
-            try writeCmd(&stream, self.io, cmd);
+        try writeCmd(&stream, self.io, cmd);
 
-            var buf: [256]u8 = undefined;
-            const n = sockread.readSome(stream, &buf) catch return error.RedisError;
-            const response = buf[0..n];
+        var buf: [256]u8 = undefined;
+        const n = sockread.readSome(stream, &buf) catch return error.RedisError;
+        const response = buf[0..n];
 
-            if (response.len > 1 and response[0] == ':') {
-                const val = std.fmt.parseInt(u32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
-                return val;
-            }
+        if (response.len > 1 and response[0] == ':') {
+            const val = std.fmt.parseInt(u32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
+            return val;
+        }
         return error.RedisError;
     }
 };
