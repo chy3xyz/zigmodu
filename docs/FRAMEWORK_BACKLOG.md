@@ -3,6 +3,10 @@
 Status tracker for framework ergonomics improvements (Zig 0.17).  
 Monolith boundaries unchanged — see `docs/PRODUCTION_ROADMAP.md`.
 
+**Consumer-driven open items (zapi / ThinkPHP port):** see
+[`ISSUES_FROM_ZAPI.md`](ISSUES_FROM_ZAPI.md) (auth catalog, envelope dialect,
+typed identity). Sibling ORM backlog: `zig_ws/zent/docs/ISSUES_FROM_ZAPI.md`.
+
 | # | Item | Status | Entry point |
 |---|------|--------|-------------|
 | 1 | Typed extractors (Path / Query / Json) | **Landed** | `http.extractPath/Query/Json` + field defaults → `src/api/Extract.zig` |

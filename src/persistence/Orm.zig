@@ -1347,6 +1347,10 @@ test "Repository insertOmitNulls lets DB DEFAULT take over (sqlite)" {
     const e = NullableRow{ .id = 2, .name = null, .note = "n2" };
     _ = try repo.insertOmitNulls(allocator, e);
     const got = (try repo.findById(@as(i64, 2))).?;
+    defer {
+        if (got.name) |s| allocator.free(s);
+        if (got.note) |s| allocator.free(s);
+    }
     try std.testing.expectEqualStrings("anon", got.name.?);
     try std.testing.expectEqualStrings("n2", got.note.?);
 
@@ -1354,6 +1358,10 @@ test "Repository insertOmitNulls lets DB DEFAULT take over (sqlite)" {
     const e2 = NullableRow{ .id = 2, .name = null, .note = "updated" };
     try repo.updatePartial(allocator, e2);
     const got2 = (try repo.findById(@as(i64, 2))).?;
+    defer {
+        if (got2.name) |s| allocator.free(s);
+        if (got2.note) |s| allocator.free(s);
+    }
     try std.testing.expectEqualStrings("anon", got2.name.?); // untouched
     try std.testing.expectEqualStrings("updated", got2.note.?);
 }
@@ -1381,6 +1389,7 @@ test "Repository insert writes back DB-generated id (sqlite)" {
     const inserted = try repo.insert(.{ .id = 0, .name = "a" });
     try std.testing.expect(inserted.id > 0); // last_insert_id written back
     const got = (try repo.findById(inserted.id)).?;
+    defer allocator.free(got.name);
     try std.testing.expectEqualStrings("a", got.name);
 
     const inserted2 = try repo.insertOmitNulls(allocator, .{ .id = 0, .name = "b" });

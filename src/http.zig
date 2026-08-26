@@ -20,6 +20,10 @@ pub const Middleware = server_mod.Middleware;
 pub const HandlerFn = server_mod.HandlerFn;
 pub const Method = server_mod.Method;
 pub const RouteInfo = server_mod.RouteInfo;
+/// Typed request identity + typed Context getters (M5/M11).
+pub const Identity = server_mod.Identity;
+/// Response envelope dialect for `ctx.ok/fail/unauth/paginated` (M6).
+pub const EnvelopeDialect = server_mod.EnvelopeDialect;
 
 /// Comptime / generic route table (see `docs/ROUTE_TABLE.md`).
 pub const comptime_router = @import("api/ComptimeRouter.zig");
@@ -55,6 +59,25 @@ pub const jwtAuthFromCatalogWithPermissions = http_middleware.jwtAuthFromCatalog
 pub const catalogLoaderFromTable = http_middleware.catalogLoaderFromTable;
 pub const CatalogPermissionLoader = http_middleware.CatalogPermissionLoader;
 pub const CatalogPermLoadInput = http_middleware.CatalogPermLoadInput;
+// Pluggable catalog auth (M1/M3): any AuthBackend + catalog-sole bypass truth.
+pub const AuthBackend = http_middleware.AuthBackend;
+pub const authFromCatalog = http_middleware.authFromCatalog;
+pub const AuthFromCatalogConfig = http_middleware.AuthFromCatalogConfig;
+pub const jwtBackend = http_middleware.jwtBackend;
+pub const jwtBackendWithPermissions = http_middleware.jwtBackendWithPermissions;
+// Auth rejection envelope hook (M4).
+pub const AuthRejectFn = http_middleware.AuthRejectFn;
+pub const defaultReject = http_middleware.defaultReject;
+pub const envelopeReject = http_middleware.envelopeReject;
+// Token extractors (M12) + tenant resolver (M7).
+pub const TokenSource = http_middleware.TokenSource;
+pub const extractBearer = http_middleware.extractBearer;
+pub const extractHeaderToken = http_middleware.extractHeaderToken;
+pub const extractQueryToken = http_middleware.extractQueryToken;
+pub const extractFormToken = http_middleware.extractFormToken;
+pub const extractTokenAny = http_middleware.extractTokenAny;
+pub const tenantResolver = http_middleware.tenantResolver;
+pub const TenantResolverConfig = http_middleware.TenantResolverConfig;
 pub const moduleGate = http_middleware.moduleGate;
 pub const permissionGate = http_middleware.permissionGate;
 pub const permissionGateWith = http_middleware.permissionGateWith;
@@ -127,6 +150,9 @@ pub const toDtoList = Extract.toDtoList;
 pub const respondDto = Extract.respondDto;
 
 pub const Testkit = @import("http/Testkit.zig");
+/// Meta ↔ runtime auth audit (M2): `auditAuthCoverage(alloc, &server, &slot)`.
+pub const auditAuthCoverage = Testkit.auditAuthCoverage;
+pub const AuthAuditMismatch = Testkit.AuthAuditMismatch;
 pub const Profiles = @import("http/Profiles.zig");
 pub const ProfileConfig = Profiles.ProfileConfig;
 pub const HttpProfileState = Profiles.HttpProfileState;

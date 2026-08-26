@@ -109,9 +109,10 @@ pub fn extractJsonValidated(ctx: *Context, comptime T: type, comptime rules: any
 }
 
 /// Loose JSON extraction: field names match snake_case or camelCase
-/// (`user_name` ↔ `userName`), `null` treats the field as absent (zero
-/// default), missing fields stay at zero. Escape hatch for clients sending
-/// camelCase JSON or `"id": null` for create requests.
+/// (`user_name` ↔ `userName`), `null` treats the field as absent (declared
+/// default kept), missing fields keep their declared defaults (fields without
+/// defaults are zeroed). Escape hatch for clients sending camelCase JSON or
+/// `"id": null` for create requests.
 pub fn extractJsonLoose(ctx: *Context, comptime T: type) !T {
     if (ctx.body == null) {
         try respondProblem(ctx, 400, "Request body required");
@@ -126,9 +127,12 @@ pub fn extractJsonLoose(ctx: *Context, comptime T: type) !T {
         try respondProblem(ctx, 400, "JSON body must be an object");
         return error.InvalidJson;
     }
-    var result = std.mem.zeroes(T);
-    inline for (@typeInfo(T).@"struct".field_names) |fname| {
-        const F = @TypeOf(@field(result, fname));
+    var result: T = undefined;
+    const sinfo = @typeInfo(T).@"struct";
+    var filled: [sinfo.field_names.len]bool = undefined;
+    inline for (sinfo.field_names, sinfo.field_types, 0..) |fname, F, i| {
+        filled[i] = false;
+        @field(result, fname) = std.mem.zeroes(F);
         if (findLooseField(parsed.value.object, fname)) |matched| {
             if (matched != .null) {
                 var field_parsed = std.json.parseFromValue(F, ctx.allocator, matched, .{}) catch {
@@ -137,6 +141,15 @@ pub fn extractJsonLoose(ctx: *Context, comptime T: type) !T {
                 };
                 defer field_parsed.deinit();
                 @field(result, fname) = try deepCopyValue(field_parsed.value, ctx.allocator);
+                filled[i] = true;
+            }
+        }
+    }
+    // Unmatched fields keep declared defaults (deep-copied → uniformly owned).
+    inline for (sinfo.field_names, sinfo.field_types, sinfo.field_attrs, 0..) |fname, F, attrs, i| {
+        if (!filled[i]) {
+            if (attrs.defaultValue(F)) |d| {
+                @field(result, fname) = try deepCopyValue(d, ctx.allocator);
             }
         }
     }

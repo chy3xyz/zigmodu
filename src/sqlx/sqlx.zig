@@ -959,8 +959,7 @@ pub fn QueryResult(comptime T: type) type {
                 self_mut.items = &.{};
                 return;
             }
-            @panic("deinitArena called on a slice-backed QueryResult (arena == null); "
-                ++ "use deinit(allocator) for the slice path");
+            @panic("deinitArena called on a slice-backed QueryResult (arena == null); " ++ "use deinit(allocator) for the slice path");
         }
 
         /// Transfer items + arena ownership out (e.g. into PageResult). Leaves self empty.
@@ -6403,8 +6402,6 @@ test "pgDecodeNumeric 10000 stripped single digit" {
     defer allocator.free(v.string);
     try std.testing.expectEqualStrings("10000", v.string);
 }
-
-
 
 test "pgDecodeNumeric exceeds former 256-byte stack buffer" {
     const allocator = std.testing.allocator;

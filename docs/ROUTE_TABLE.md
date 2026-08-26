@@ -376,6 +376,61 @@ WS：`pub const ws_routes = [_]http.WsSpec(State){ .{ .path = "ws", .on_connect 
 
 示例：`examples/tenant-mgmt`（单套 `CatalogPermDb`）；多主体见应用自定义 loader（ZigShop）。
 
+### 7.2 可插拔 AuthBackend / 身份与信封（v0.15.31+）
+
+源自 `docs/ISSUES_FROM_ZAPI.md`（zapi 落地反馈）：
+
+- **Catalog 是唯一 bypass 真相（M1/M3）**：`authFromCatalog(&slot, backend, .{})` 包住任意
+  `AuthBackend`（`verifyFn(ctx) → ?Identity`），只有 `RouteMeta.auth == .public`（或 legacy
+  skip-prefix）才跳过验签 —— 消费端**不要再维护** `public_paths.zig` 之类的并行清单。
+  内置 `http.jwtBackend(&sec)` / `http.jwtBackendWithPermissions(&sec, loader)`（≡
+  `jwtAuthFromCatalogWithPermissions`）；Redis/token-service 等自定义后端实现同一形状即可。
+- **拒绝信封钩子（M4）**：`JwtFromCatalogConfig.reject` / `PermissionGateConfig.reject` /
+  `AuthFromCatalogConfig.reject` 接受 `AuthRejectFn`；`http.envelopeReject(.thinkphp)` 让
+  401 直接产出 `{code:-1,msg,data}`，无需 fork 中间件。
+- **类型化身份（M5）**：handler 用 `ctx.userId()` / `ctx.userIdInt(i64)` /
+  `ctx.requireUserId()`（`error.Unauthorized`）/ `ctx.tenantId()` / `ctx.rolesCsv()`；
+  中间件写 `ctx.setIdentity(.{ .user_id, .tenant_id, .roles })`。删掉应用侧
+  `requireLogin` / `currentUid` 复制件。另有 `ctx.getAttrInt(T, key)` /
+  `ctx.getAttrEnum(E, key)`（M11）。
+- **信封方言（M6）**：`ctx.setEnvelope(.thinkphp | .ruoyi | .default)` 后用
+  `ctx.ok(json)` / `ctx.okValue(v)` / `ctx.fail(msg)` / `ctx.failCode(code, msg)` /
+  `ctx.unauth(msg)` / `ctx.paginated(items, total)`（RuoYi 分页为 `{code,msg,rows,total}`）。
+- **租户中间件（M7）**：`http.tenantResolver(.{ .require = true })` 按 `AppID`/`appid`/
+  `X-Tenant-Id` 头或 `app_id` query 写 `tenant_id` attr；JWT `aud` 已存在时默认优先。
+- **路由级门户 roles（M8）**：`RouteMeta.roles = "admin|ops"`（`|` = OR），
+  `permissionGateWith` 在细粒度 permission 之前先按身份 roles 拦截 —— 替代应用里
+  硬编码的 path-prefix → role 表。
+- **Token 提取器（M12）**：`http.extractBearer(ctx)` / `extractHeaderToken(ctx, "x-token")` /
+  `extractQueryToken` / `extractFormToken` / `extractTokenAny(ctx, &.{ .bearer, .x_token })`。
+- **meta ↔ runtime 审计（M2）**：测试里
+  `http.Testkit.auditAuthCoverage(alloc, &server, &slot)` 无凭证分发全部 catalog 路由，
+  返回漂移清单（非 public 必须 401、public 不得 401）；空切片 = 通过，可直接接入 CI。
+
+### 7.3 Resilience profiles 接线（M9）
+
+`applyHttpDefaults` 只装安全/可观测中间件；**限流熔断是按依赖的**，必须显式
+attach 才会生效（zapi 类应用常漏）：
+
+```zig
+var http_state = http.HttpProfileState.init(allocator);
+defer http_state.deinit(allocator);
+try http.applyHttpDefaults(&server, .{}, &http_state);
+
+// 按依赖声明限额：db / payment / 下游 API
+var res = try http.ResilienceProfileState.init(allocator, &.{
+    .{ .name = "db", .max_qps = 200 },
+    .{ .name = "payment", .max_qps = 50, .failure_threshold = 3 },
+});
+defer res.deinit();
+
+// handler / service 里取用（与 catalog 支付、DB slot 配对）：
+const cb = res.breaker("payment").?;   // CircuitBreaker
+const rl = res.limiter("payment").?;   // RateLimiter（单节点；全局限流用 data.redis_rate_limit）
+```
+
+多实例全局阈值 → `data.redis_rate_limit.RateLimiter`（Redis 共享窗口，fail-closed）。
+
 ### Typed extractors + scope middleware
 
 ```zig

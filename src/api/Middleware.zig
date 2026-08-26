@@ -17,6 +17,32 @@ const api = @import("Server.zig");
 const Time = @import("../core/Time.zig");
 const SecurityModule = @import("../security/SecurityModule.zig").SecurityModule;
 
+/// Consumer hook for auth rejections: renders the 401/403/500 body in any
+/// envelope dialect without forking middleware. Default = `ctx.sendError`.
+pub const AuthRejectFn = *const fn (ctx: *api.Context, status: u16, message: []const u8) anyerror!void;
+
+/// Default rejection renderer (current behavior): `{"code":status,"msg":…,"data":null}`.
+pub fn defaultReject(ctx: *api.Context, status: u16, message: []const u8) anyerror!void {
+    try ctx.sendError(status, message);
+}
+
+/// Rejection renderer for an envelope dialect: 401 → `ctx.unauth` (ThinkPHP
+/// `{code:-1}` etc.); other statuses keep the HTTP status with an aligned code.
+pub fn envelopeReject(dialect: api.EnvelopeDialect) AuthRejectFn {
+    const S = struct {
+        var d: api.EnvelopeDialect = .default;
+        fn reject(ctx: *api.Context, status: u16, message: []const u8) anyerror!void {
+            if (status == 401) {
+                ctx.setEnvelope(d);
+                return ctx.unauth(message);
+            }
+            try ctx.respondEnvelope(status, @intCast(status), message, "null");
+        }
+    };
+    S.d = dialect;
+    return S.reject;
+}
+
 /// CORS middleware configuration
 pub const CorsConfig = struct {
     allow_origins: []const []const u8 = &.{"*"},
@@ -212,7 +238,7 @@ pub fn jwtAuthWithSecurity(security: *SecurityModule) api.Middleware {
 }
 
 fn verifyJwtAndNext(sec: *SecurityModule, ctx: *api.Context, next: api.HandlerFn) !void {
-    try verifyJwtLoadPermsAndNext(sec, ctx, next, null);
+    try verifyJwtLoadPermsAndNext(sec, ctx, next, null, defaultReject);
 }
 
 fn joinCsv(allocator: std.mem.Allocator, parts: []const []const u8) ![]u8 {
@@ -258,18 +284,19 @@ fn verifyJwtLoadPermsAndNext(
     ctx: *api.Context,
     next: api.HandlerFn,
     loader: ?CatalogPermissionLoader,
+    reject: AuthRejectFn,
 ) !void {
     const auth = ctx.headers.get("authorization") orelse {
-        try ctx.sendError(401, "Unauthorized");
+        try reject(ctx, 401, "Unauthorized");
         return;
     };
     const token = SecurityModule.extractBearerToken(auth) orelse {
-        try ctx.sendError(401, "Unauthorized");
+        try reject(ctx, 401, "Unauthorized");
         return;
     };
 
     const payload = sec.verifyToken(token) catch {
-        try ctx.sendError(401, "Unauthorized");
+        try reject(ctx, 401, "Unauthorized");
         return;
     };
     defer sec.freePayload(payload);
@@ -292,7 +319,7 @@ fn verifyJwtLoadPermsAndNext(
             .roles = payload.roles,
         }) catch |err| {
             std.log.err("jwt perm loader failed: {s}", .{@errorName(err)});
-            try ctx.sendError(500, "Failed to load permissions");
+            try reject(ctx, 500, "Failed to load permissions");
             return;
         };
         defer ctx.allocator.free(perms_csv);
@@ -307,6 +334,9 @@ const Rbac = @import("../security/Rbac.zig");
 
 pub const JwtFromCatalogConfig = struct {
     skip_prefixes: []const []const u8 = &.{ "health", "dashboard", "openapi.json" },
+    /// Rejection renderer (default: `{"code":status,"msg":…,"data":null}`).
+    /// Use `envelopeReject(.thinkphp)` etc. for consumer envelope dialects.
+    reject: AuthRejectFn = defaultReject,
 };
 
 /// JWT that skips when catalog marks the route `.public`, or path matches skip_prefixes.
@@ -333,7 +363,7 @@ pub fn jwtAuthFromCatalog(security: *SecurityModule, slot: *comptime_router.Cata
                         return;
                     }
                 }
-                try verifyJwtLoadPermsAndNext(st.sec, ctx, next, null);
+                try verifyJwtLoadPermsAndNext(st.sec, ctx, next, null, st.cfg.reject);
             }
         }.mw,
         .user_data = stored,
@@ -371,7 +401,7 @@ pub fn jwtAuthFromCatalogWithPermissions(
                         return;
                     }
                 }
-                try verifyJwtLoadPermsAndNext(st.sec, ctx, next, st.load);
+                try verifyJwtLoadPermsAndNext(st.sec, ctx, next, st.load, st.cfg.reject);
             }
         }.mw,
         .user_data = stored,
@@ -393,6 +423,250 @@ pub fn catalogLoaderFromTable(table: *const Rbac.RolePermissionTable) CatalogPer
     };
     Holder.tbl = table;
     return Holder.load;
+}
+
+// ── Pluggable auth backends (catalog = sole bypass truth) ────────────────
+
+/// Pluggable auth backend: verify a request and, on success, write identity
+/// via `ctx.setIdentity(...)` (attrs are duped, so token payloads can be
+/// freed inside `verifyFn`) and return true. Return false when
+/// unauthenticated — the catalog wrapper emits the configured reject
+/// envelope. JWT is one backend (`jwtBackend`); Redis/token-service schemes
+/// implement the same shape. Keeping attr writes inside the backend avoids
+/// any ownership transfer across the verify boundary.
+pub const AuthBackend = struct {
+    verifyFn: *const fn (ctx: *api.Context, user_data: ?*anyopaque) anyerror!bool,
+    user_data: ?*anyopaque = null,
+    /// Optional: load fine-grained permission codes after verify (CSV on the
+    /// `permissions` attr). See `CatalogPermissionLoader`.
+    loadPermissions: ?CatalogPermissionLoader = null,
+
+    pub fn verify(self: *const AuthBackend, ctx: *api.Context) anyerror!bool {
+        return self.verifyFn(ctx, self.user_data);
+    }
+};
+
+pub const AuthFromCatalogConfig = struct {
+    skip_prefixes: []const []const u8 = &.{ "health", "dashboard", "openapi.json" },
+    /// Rejection renderer (default: `{"code":status,"msg":…,"data":null}`).
+    reject: AuthRejectFn = defaultReject,
+};
+
+/// Catalog-driven auth around any `AuthBackend`: a request is skipped iff the
+/// route catalog marks `(method, path)` `.public` (or matches a legacy
+/// skip-prefix) — the catalog is the sole bypass truth, no parallel path
+/// lists. On success sets identity attrs (`user_id` / `tenant_id` / `roles`)
+/// and the optional `permissions` CSV; pair with `permissionGateWith`.
+pub fn authFromCatalog(slot: *comptime_router.CatalogSlot, backend: AuthBackend, config: AuthFromCatalogConfig) api.Middleware {
+    const Store = struct {
+        catalog_slot: *comptime_router.CatalogSlot,
+        backend: AuthBackend,
+        cfg: AuthFromCatalogConfig,
+    };
+    const stored = std.heap.page_allocator.create(Store) catch unreachable;
+    stored.* = .{ .catalog_slot = slot, .backend = backend, .cfg = config };
+    return .{
+        .func = struct {
+            fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
+                const st: *const Store = @ptrCast(@alignCast(user_data.?));
+                if (comptime_router.pathHasSkipPrefix(ctx.path, st.cfg.skip_prefixes)) {
+                    try next(ctx);
+                    return;
+                }
+                if (st.catalog_slot.get()) |cat| {
+                    if (cat.isPublic(ctx.method, ctx.path)) {
+                        try next(ctx);
+                        return;
+                    }
+                }
+                const authed = st.backend.verify(ctx) catch |err| {
+                    std.log.err("auth backend verify failed: {s}", .{@errorName(err)});
+                    try st.cfg.reject(ctx, 401, "Unauthorized");
+                    return;
+                };
+                if (!authed) {
+                    try st.cfg.reject(ctx, 401, "Unauthorized");
+                    return;
+                }
+                if (st.backend.loadPermissions) |load| {
+                    var roles_list = std.ArrayList([]const u8).empty;
+                    defer roles_list.deinit(ctx.allocator);
+                    if (ctx.rolesCsv()) |csv| {
+                        var it = std.mem.splitScalar(u8, csv, ',');
+                        while (it.next()) |r| {
+                            const trimmed = std.mem.trim(u8, r, " \t");
+                            if (trimmed.len > 0) try roles_list.append(ctx.allocator, trimmed);
+                        }
+                    }
+                    const perms_csv = load(ctx.allocator, .{
+                        .sub = ctx.userId() orelse "",
+                        .aud = ctx.tenantId() orelse "",
+                        .roles = roles_list.items,
+                    }) catch |err| {
+                        std.log.err("auth perm loader failed: {s}", .{@errorName(err)});
+                        try st.cfg.reject(ctx, 500, "Failed to load permissions");
+                        return;
+                    };
+                    defer ctx.allocator.free(perms_csv);
+                    try ctx.setAttr("permissions", perms_csv);
+                }
+                try next(ctx);
+            }
+        }.mw,
+        .user_data = stored,
+    };
+}
+
+// ── Token extractors ──────────────────────────────────────────────────────
+
+/// Common token carrier locations, tried in order by `extractTokenAny`.
+pub const TokenSource = enum {
+    /// `Authorization: Bearer <token>`.
+    bearer,
+    /// `X-Token: <token>` header (ThinkPHP-style; optional Bearer prefix stripped).
+    x_token,
+    /// `?token=` query parameter.
+    query,
+    /// `token=` form field (application/x-www-form-urlencoded body).
+    form,
+};
+
+/// Bearer token from the `Authorization` header.
+pub fn extractBearer(ctx: *const api.Context) ?[]const u8 {
+    const auth = ctx.headers.get("authorization") orelse return null;
+    return SecurityModule.extractBearerToken(auth);
+}
+
+/// Token from an arbitrary header (e.g. `x-token`); an optional `Bearer `
+/// prefix is stripped. Returns null when the header is absent or empty.
+pub fn extractHeaderToken(ctx: *const api.Context, name: []const u8) ?[]const u8 {
+    const v = ctx.header(name) orelse return null;
+    if (v.len == 0) return null;
+    return SecurityModule.extractBearerToken(v) orelse v;
+}
+
+/// Token from a query parameter (borrowed from the parsed query map).
+pub fn extractQueryToken(ctx: *const api.Context, key: []const u8) ?[]const u8 {
+    const v = ctx.queryParam(key) orelse return null;
+    return if (v.len == 0) null else v;
+}
+
+/// Token from a form field (borrowed from the parsed form map).
+pub fn extractFormToken(ctx: *const api.Context, key: []const u8) ?[]const u8 {
+    const v = ctx.formValue(key) orelse return null;
+    return if (v.len == 0) null else v;
+}
+
+/// First non-empty token across `sources`, in order.
+pub fn extractTokenAny(ctx: *const api.Context, sources: []const TokenSource) ?[]const u8 {
+    for (sources) |s| {
+        const tok: ?[]const u8 = switch (s) {
+            .bearer => extractBearer(ctx),
+            .x_token => extractHeaderToken(ctx, "x-token"),
+            .query => extractQueryToken(ctx, "token"),
+            .form => extractFormToken(ctx, "token"),
+        };
+        if (tok) |t| return t;
+    }
+    return null;
+}
+
+// ── Built-in JWT backend ──────────────────────────────────────────────────
+
+/// Built-in JWT `AuthBackend` over `SecurityModule`; accepts Bearer and
+/// `X-Token` carriers. Pair with `authFromCatalog` (+ `permissionGateWith`).
+pub fn jwtBackend(security: *SecurityModule) AuthBackend {
+    return .{
+        .user_data = security,
+        .verifyFn = struct {
+            fn verify(ctx: *api.Context, user_data: ?*anyopaque) anyerror!bool {
+                const sec: *SecurityModule = @ptrCast(@alignCast(user_data.?));
+                const token = extractTokenAny(ctx, &.{ .bearer, .x_token }) orelse return false;
+                const payload = sec.verifyToken(token) catch return false;
+                defer sec.freePayload(payload);
+                const roles_csv = try joinCsv(ctx.allocator, payload.roles);
+                defer ctx.allocator.free(roles_csv);
+                try ctx.setIdentity(.{
+                    .user_id = payload.sub,
+                    .tenant_id = payload.aud,
+                    .roles = roles_csv,
+                });
+                return true;
+            }
+        }.verify,
+    };
+}
+
+/// `jwtBackend` + fine-grained permission loading — the generic equivalent of
+/// `jwtAuthFromCatalogWithPermissions`.
+pub fn jwtBackendWithPermissions(security: *SecurityModule, loader: CatalogPermissionLoader) AuthBackend {
+    var b = jwtBackend(security);
+    b.loadPermissions = loader;
+    return b;
+}
+
+// ── Tenant resolver ───────────────────────────────────────────────────────
+
+pub const TenantResolverConfig = struct {
+    /// Headers tried in order (lookup is case-insensitive): ThinkPHP-style
+    /// `AppID`/`appid`, then common tenant headers.
+    headers: []const []const u8 = &.{ "appid", "app-id", "x-tenant-id" },
+    /// Query keys tried after headers.
+    query_keys: []const []const u8 = &.{"app_id"},
+    /// Context attr written on resolution.
+    attr_key: []const u8 = "tenant_id",
+    /// When true, an unresolved tenant rejects with 400 via `reject`.
+    require: bool = false,
+    /// When false (default), an existing attr (e.g. JWT `aud`) wins.
+    override_existing: bool = false,
+    reject: AuthRejectFn = defaultReject,
+};
+
+/// Resolves tenant from `AppID`/`appid`/`X-Tenant-Id` headers or `app_id`
+/// query param into the `tenant_id` attr (M7). Register before handlers that
+/// call `ctx.tenantId()`; with JWT auth, register after it so `aud` wins
+/// unless `override_existing` is set.
+pub fn tenantResolver(config: TenantResolverConfig) api.Middleware {
+    const stored = std.heap.page_allocator.create(TenantResolverConfig) catch unreachable;
+    stored.* = config;
+    return .{
+        .func = struct {
+            fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
+                const cfg: *const TenantResolverConfig = @ptrCast(@alignCast(user_data.?));
+                if (!cfg.override_existing and ctx.getAttr(cfg.attr_key) != null) {
+                    try next(ctx);
+                    return;
+                }
+                var resolved: ?[]const u8 = null;
+                for (cfg.headers) |name| {
+                    if (ctx.header(name)) |v| {
+                        if (v.len > 0) {
+                            resolved = v;
+                            break;
+                        }
+                    }
+                }
+                if (resolved == null) {
+                    for (cfg.query_keys) |key| {
+                        if (ctx.queryParam(key)) |v| {
+                            if (v.len > 0) {
+                                resolved = v;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (resolved) |v| {
+                    try ctx.setAttr(cfg.attr_key, v);
+                } else if (cfg.require) {
+                    try cfg.reject(ctx, 400, "Missing tenant");
+                    return;
+                }
+                try next(ctx);
+            }
+        }.mw,
+        .user_data = stored,
+    };
 }
 
 pub const ModuleGateConfig = struct {
@@ -492,6 +766,8 @@ pub const PermissionGateConfig = struct {
     /// instead of passing through. Public routes always pass. Default
     /// `false` = allow-unannotated (current behavior).
     deny_by_default: bool = false,
+    /// Rejection renderer (default: `{"code":status,"msg":…,"data":null}`).
+    reject: AuthRejectFn = defaultReject,
 };
 
 /// Enforces `RouteMeta.permission` (default mode = JWT roles, `|` = OR).
@@ -518,9 +794,18 @@ pub fn permissionGateWith(slot: *comptime_router.CatalogSlot, config: Permission
                     try next(ctx);
                     return;
                 }
+                // Route-level portal roles (RouteMeta.roles, `|` = OR): matched
+                // against the identity roles attr before fine-grained permission.
+                if (cat.rolesFor(ctx.method, ctx.path)) |route_roles| {
+                    const roles = ctx.getAttr(Store.cfg.role_attr) orelse "";
+                    if (!permissionMatchesRoles(roles, route_roles)) {
+                        try Store.cfg.reject(ctx, 403, "Forbidden");
+                        return;
+                    }
+                }
                 const perm = cat.permissionFor(ctx.method, ctx.path) orelse {
                     if (Store.cfg.deny_by_default) {
-                        try ctx.sendError(403, "Forbidden");
+                        try Store.cfg.reject(ctx, 403, "Forbidden");
                         return;
                     }
                     try next(ctx);
@@ -541,7 +826,7 @@ pub fn permissionGateWith(slot: *comptime_router.CatalogSlot, config: Permission
                     },
                 };
                 if (!allowed) {
-                    try ctx.sendError(403, "Forbidden");
+                    try Store.cfg.reject(ctx, 403, "Forbidden");
                     return;
                 }
                 if (Store.cfg.set_permission_attr) {
@@ -1245,4 +1530,162 @@ test "CatalogPermissionLoader receives sub and aud" {
     try std.testing.expectEqualStrings("shop", S.seen_role);
     const perms = ctx.getAttr("permissions").?;
     try std.testing.expect(std.mem.indexOf(u8, perms, "1001/99") != null);
+}
+
+test "authFromCatalog wraps a custom backend; catalog is sole bypass truth" {
+    const alloc = std.testing.allocator;
+    var entries = try alloc.alloc(comptime_router.CatalogEntry, 2);
+    entries[0] = .{ .method = .GET, .path = try alloc.dupe(u8, "api/open"), .auth = .public, .module = "open" };
+    entries[1] = .{ .method = .POST, .path = try alloc.dupe(u8, "api/orders"), .auth = .jwt, .module = "order" };
+    var slot: comptime_router.CatalogSlot = .{};
+    defer slot.deinit();
+    slot.set(.{ .allocator = alloc, .entries = entries });
+
+    // Redis/token-service style backend: accepts `X-Token: good` only.
+    const backend = AuthBackend{
+        .verifyFn = struct {
+            fn verify(ctx: *api.Context, _: ?*anyopaque) anyerror!bool {
+                const tok = extractHeaderToken(ctx, "x-token") orelse return false;
+                if (!std.mem.eql(u8, tok, "good")) return false;
+                try ctx.setIdentity(.{ .user_id = "u-7", .tenant_id = "shop-1", .roles = "admin" });
+                return true;
+            }
+        }.verify,
+    };
+    const mw = authFromCatalog(&slot, backend, .{ .reject = envelopeReject(.thinkphp) });
+    const next = struct {
+        fn n(_: *api.Context) anyerror!void {}
+    }.n;
+
+    // public route passes without any token
+    var pub_ctx = try api.Context.init(alloc, .GET, "/api/open");
+    defer pub_ctx.deinit();
+    try mw.func(&pub_ctx, next, mw.user_data);
+    try std.testing.expect(!pub_ctx.responded);
+
+    // protected route without token → 401 in ThinkPHP envelope
+    var no_ctx = try api.Context.init(alloc, .POST, "/api/orders");
+    defer no_ctx.deinit();
+    try mw.func(&no_ctx, next, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 401), no_ctx.status_code);
+    try std.testing.expectEqualStrings("{\"code\":-1,\"msg\":\"Unauthorized\",\"data\":null}", no_ctx.response_body.items);
+
+    // protected route with valid token → identity attrs set
+    var ok_ctx = try api.Context.init(alloc, .POST, "/api/orders");
+    defer ok_ctx.deinit();
+    try ok_ctx.headers.put(try alloc.dupe(u8, "x-token"), try alloc.dupe(u8, "good"));
+    try mw.func(&ok_ctx, next, mw.user_data);
+    try std.testing.expect(!ok_ctx.responded);
+    try std.testing.expectEqualStrings("u-7", ok_ctx.userId().?);
+    try std.testing.expectEqualStrings("shop-1", ok_ctx.tenantId().?);
+    try std.testing.expectEqualStrings("admin", ok_ctx.rolesCsv().?);
+}
+
+test "authFromCatalog with jwtBackend verifies real tokens" {
+    const alloc = std.testing.allocator;
+    var entries = try alloc.alloc(comptime_router.CatalogEntry, 1);
+    entries[0] = .{ .method = .GET, .path = try alloc.dupe(u8, "api/me"), .auth = .jwt, .module = "user" };
+    var slot: comptime_router.CatalogSlot = .{};
+    defer slot.deinit();
+    slot.set(.{ .allocator = alloc, .entries = entries });
+
+    var sec = SecurityModule.init(alloc, "test-secret", 3600);
+    const token = try sec.generateTokenWithTenant("42", &.{"admin"}, "tenant-a");
+    defer alloc.free(token);
+
+    const mw = authFromCatalog(&slot, jwtBackend(&sec), .{});
+    const next = struct {
+        fn n(_: *api.Context) anyerror!void {}
+    }.n;
+
+    var ctx = try api.Context.init(alloc, .GET, "/api/me");
+    defer ctx.deinit();
+    try putBearerAuth(&ctx, token);
+    try mw.func(&ctx, next, mw.user_data);
+    try std.testing.expect(!ctx.responded);
+    try std.testing.expectEqual(@as(?i64, 42), ctx.userIdInt(i64));
+    try std.testing.expectEqualStrings("tenant-a", ctx.tenantId().?);
+
+    var bad = try api.Context.init(alloc, .GET, "/api/me");
+    defer bad.deinit();
+    try mw.func(&bad, next, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 401), bad.status_code);
+}
+
+test "tenantResolver resolves header/query and respects existing attr" {
+    const alloc = std.testing.allocator;
+    const next = struct {
+        fn n(_: *api.Context) anyerror!void {}
+    }.n;
+
+    const mw = tenantResolver(.{});
+    var ctx = try api.Context.init(alloc, .POST, "/api/orders");
+    defer ctx.deinit();
+    try ctx.headers.put(try alloc.dupe(u8, "appid"), try alloc.dupe(u8, "shop-9"));
+    try mw.func(&ctx, next, mw.user_data);
+    try std.testing.expectEqualStrings("shop-9", ctx.tenantId().?);
+
+    // existing attr (e.g. JWT aud) wins by default
+    var ctx2 = try api.Context.init(alloc, .POST, "/api/orders");
+    defer ctx2.deinit();
+    try ctx2.setAttr("tenant_id", "jwt-tenant");
+    try ctx2.headers.put(try alloc.dupe(u8, "appid"), try alloc.dupe(u8, "shop-9"));
+    try mw.func(&ctx2, next, mw.user_data);
+    try std.testing.expectEqualStrings("jwt-tenant", ctx2.tenantId().?);
+
+    // require → 400 when unresolved
+    const mw_req = tenantResolver(.{ .require = true });
+    var ctx3 = try api.Context.init(alloc, .POST, "/api/orders");
+    defer ctx3.deinit();
+    try mw_req.func(&ctx3, next, mw_req.user_data);
+    try std.testing.expectEqual(@as(u16, 400), ctx3.status_code);
+}
+
+test "token extractors cover bearer, x-token, query" {
+    const alloc = std.testing.allocator;
+    var ctx = try api.Context.init(alloc, .GET, "/");
+    defer ctx.deinit();
+
+    try std.testing.expect(extractTokenAny(&ctx, &.{ .bearer, .x_token, .query }) == null);
+    try ctx.query.put(try alloc.dupe(u8, "token"), try alloc.dupe(u8, "q-tok"));
+    try std.testing.expectEqualStrings("q-tok", extractTokenAny(&ctx, &.{ .bearer, .query }).?);
+    try ctx.headers.put(try alloc.dupe(u8, "x-token"), try alloc.dupe(u8, "x-tok"));
+    try std.testing.expectEqualStrings("x-tok", extractTokenAny(&ctx, &.{ .x_token, .query }).?);
+    try ctx.headers.put(try alloc.dupe(u8, "authorization"), try alloc.dupe(u8, "Bearer b-tok"));
+    try std.testing.expectEqualStrings("b-tok", extractTokenAny(&ctx, &.{ .bearer, .x_token }).?);
+    // bare header value without Bearer prefix is accepted as-is
+    try std.testing.expectEqualStrings("x-tok", extractHeaderToken(&ctx, "x-token").?);
+}
+
+test "permissionGate enforces RouteMeta.roles before permission" {
+    const alloc = std.testing.allocator;
+    var entries = try alloc.alloc(comptime_router.CatalogEntry, 1);
+    entries[0] = .{
+        .method = .GET,
+        .path = try alloc.dupe(u8, "admin-api/setting"),
+        .auth = .jwt,
+        .module = "setting",
+        .roles = "admin|ops",
+    };
+    var slot: comptime_router.CatalogSlot = .{};
+    defer slot.deinit();
+    slot.set(.{ .allocator = alloc, .entries = entries });
+
+    const mw = permissionGateWith(&slot, .{ .reject = envelopeReject(.thinkphp) });
+    const next = struct {
+        fn n(_: *api.Context) anyerror!void {}
+    }.n;
+
+    var deny = try api.Context.init(alloc, .GET, "/admin-api/setting");
+    defer deny.deinit();
+    try deny.setAttr("roles", "cashier");
+    try mw.func(&deny, next, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 403), deny.status_code);
+    try std.testing.expectEqualStrings("{\"code\":403,\"msg\":\"Forbidden\",\"data\":null}", deny.response_body.items);
+
+    var allow = try api.Context.init(alloc, .GET, "/admin-api/setting");
+    defer allow.deinit();
+    try allow.setAttr("roles", "ops");
+    try mw.func(&allow, next, mw.user_data);
+    try std.testing.expect(!allow.responded);
 }

@@ -45,6 +45,9 @@ pub const ApiEndpoint = struct {
     request_body: ?RequestBody = null,
     responses: []const ApiResponse = &.{},
     deprecated: bool = false,
+    /// When true (and generator `bearer_auth` is on), the operation gets
+    /// `"security": [{"bearerAuth": []}]`. Set from catalog `auth != .public`.
+    requires_auth: bool = false,
 };
 
 /// Request body[...]
@@ -93,6 +96,9 @@ pub const OpenApiGenerator = struct {
     description: []const u8,
     base_path: []const u8,
     api_version: OpenApiVersion,
+    /// When true, emits `components.securitySchemes.bearerAuth` (http/bearer,
+    /// JWT) and per-operation `security` for endpoints with `requires_auth`.
+    bearer_auth: bool = false,
 
     endpoints: std.ArrayList(ApiEndpoint),
     schemas: std.ArrayList(ApiSchema),
@@ -324,6 +330,11 @@ pub const OpenApiGenerator = struct {
                     try buf.appendSlice(self.allocator, "        ],\n");
                 }
 
+                // security (M14): non-public endpoints require bearerAuth
+                if (self.bearer_auth and ep.requires_auth) {
+                    try buf.appendSlice(self.allocator, "        \"security\": [ { \"bearerAuth\": [] } ],\n");
+                }
+
                 // responses
                 try buf.appendSlice(self.allocator, "        \"responses\": {\n");
                 for (ep.responses, 0..) |resp, ri| {
@@ -344,7 +355,28 @@ pub const OpenApiGenerator = struct {
             const close_path = if (path_idx < path_map.count() - 1) "    },\n" else "    }\n";
             try buf.appendSlice(self.allocator, close_path);
         }
-        try buf.appendSlice(self.allocator, "  }\n");
+
+        // components.securitySchemes (M14): only when bearer auth is enabled
+        // and at least one endpoint actually requires it.
+        var any_auth = false;
+        if (self.bearer_auth) {
+            for (self.endpoints.items) |ep| {
+                if (ep.requires_auth) {
+                    any_auth = true;
+                    break;
+                }
+            }
+        }
+        if (any_auth) {
+            try buf.appendSlice(self.allocator, "  },\n");
+            try buf.appendSlice(self.allocator, "  \"components\": {\n");
+            try buf.appendSlice(self.allocator, "    \"securitySchemes\": {\n");
+            try buf.appendSlice(self.allocator, "      \"bearerAuth\": { \"type\": \"http\", \"scheme\": \"bearer\", \"bearerFormat\": \"JWT\" }\n");
+            try buf.appendSlice(self.allocator, "    }\n");
+            try buf.appendSlice(self.allocator, "  }\n");
+        } else {
+            try buf.appendSlice(self.allocator, "  }\n");
+        }
 
         try buf.appendSlice(self.allocator, "}\n");
 
@@ -393,6 +425,7 @@ pub const OpenApiGenerator = struct {
             .params = params_copy,
             .responses = resp_copy,
             .deprecated = ep.deprecated,
+            .requires_auth = ep.requires_auth,
         };
     }
 
@@ -540,4 +573,53 @@ test "OpenApiGenerator OpenAPI 3.1" {
     defer allocator.free(json);
 
     try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "3.1.0"));
+}
+
+test "OpenApiGenerator bearer_auth emits securitySchemes and per-op security" {
+    const allocator = std.testing.allocator;
+    var gen = OpenApiGenerator.init(allocator, "API", "1.0.0", "desc");
+    defer gen.deinit();
+    gen.bearer_auth = true;
+
+    try gen.addEndpoint(.{
+        .method = .GET,
+        .path = "/api/me",
+        .summary = "me",
+        .requires_auth = true,
+        .responses = &.{.{ .status_code = 200, .description = "OK" }},
+    });
+    try gen.addEndpoint(.{
+        .method = .GET,
+        .path = "/health",
+        .summary = "health",
+        .responses = &.{.{ .status_code = 200, .description = "OK" }},
+    });
+
+    const json = try gen.generate();
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"securitySchemes\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"bearerAuth\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"bearerFormat\": \"JWT\""));
+    // exactly one operation carries the security requirement
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"security\": [ { \"bearerAuth\": [] } ]"));
+}
+
+test "OpenApiGenerator without bearer_auth omits components" {
+    const allocator = std.testing.allocator;
+    var gen = OpenApiGenerator.init(allocator, "API", "1.0.0", "desc");
+    defer gen.deinit();
+
+    try gen.addEndpoint(.{
+        .method = .GET,
+        .path = "/api/me",
+        .summary = "me",
+        .requires_auth = true,
+        .responses = &.{.{ .status_code = 200, .description = "OK" }},
+    });
+
+    const json = try gen.generate();
+    defer allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "securitySchemes") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"security\"") == null);
 }

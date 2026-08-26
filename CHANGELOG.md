@@ -5,6 +5,61 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.31] - 2026-08-26
+
+### Added
+- **可插拔 AuthBackend + catalog 唯一 bypass 真相**（ISSUES_FROM_ZAPI M1/M3）：
+  `http.authFromCatalog(&slot, backend, .{})` 包住任意 `AuthBackend`
+  （`verifyFn(ctx) → ?Identity`），仅 `RouteMeta.auth == .public` 跳过验签；
+  内置 `http.jwtBackend(&sec)` / `http.jwtBackendWithPermissions(&sec, loader)`
+  （≡ `jwtAuthFromCatalogWithPermissions`）。消费端可删除并行 `public_paths` 清单。
+- **认证拒绝信封钩子**（M4）：`JwtFromCatalogConfig.reject` /
+  `PermissionGateConfig.reject` / `AuthFromCatalogConfig.reject` 接受
+  `AuthRejectFn`；`http.envelopeReject(.thinkphp)` 让 401 产出
+  `{code:-1,msg,data:null}`，无需 fork 中间件。
+- **类型化身份与属性读取**（M5/M11）：`ctx.setIdentity` / `ctx.identity()` /
+  `ctx.userId()` / `ctx.userIdInt(T)` / `ctx.requireUserId()` /
+  `ctx.requireUserIdInt(T)` / `ctx.tenantId()` / `ctx.rolesCsv()`，及
+  `ctx.getAttrInt(T, key)` / `ctx.getAttrEnum(E, key)`。
+- **响应信封方言**（M6）：`http.EnvelopeDialect`（`.default` / `.thinkphp` /
+  `.ruoyi`）+ `ctx.setEnvelope` + `ctx.ok` / `ctx.okValue` / `ctx.fail` /
+  `ctx.failCode` / `ctx.unauth` / `ctx.paginated`（RuoYi 分页为
+  `{code,msg,rows,total}`；msg 一律 JSON 转义）。
+- **租户解析中间件**（M7）：`http.tenantResolver(.{ .require = … })` 按
+  `AppID`/`appid`/`X-Tenant-Id` 头或 `app_id` query 写 `tenant_id` attr；
+  JWT `aud` 已存在时默认优先（可 `override_existing`）。
+- **路由级门户 roles**（M8）：`RouteMeta.roles = "admin|ops"`（`|` = OR），
+  `permissionGateWith` 在细粒度 permission 之前按身份 roles 拦截；catalog
+  新增 `rolesFor`。
+- **Token 提取器**（M12）：`http.TokenSource` + `extractBearer` /
+  `extractHeaderToken` / `extractQueryToken` / `extractFormToken` /
+  `extractTokenAny`（Bearer / X-Token / query / form）。
+- **meta ↔ runtime 认证审计**（M2）：`http.Testkit.auditAuthCoverage(alloc,
+  &server, &slot)` 无凭证分发全部 catalog 路由，返回漂移清单（`{param}` 段
+  以 `1` 分发；WS/SSE 跳过）；空切片 = 通过，可接入 CI。
+- **OpenAPI securitySchemes**（M14）：`OpenApiGenerator.bearer_auth` +
+  `ApiEndpoint.requires_auth`；catalog 导出自动标注非 public 路由
+  `security: [{bearerAuth: []}]`，并生成
+  `components.securitySchemes.bearerAuth`（http/bearer/JWT）。
+  `OpenApiFromCatalogConfig.bearer_auth` 默认开启。
+
+### Documentation
+- `docs/ROUTE_TABLE.md` 新增 §7.2（AuthBackend / 身份 / 信封）与
+  §7.3（Resilience profiles 接线，M9）。
+- `docs/ISSUES_FROM_ZAPI.md` 状态更新：M1–M9、M11、M12、M14 landed；
+  M10 deferred（dispatch 层改动大，M6 已覆盖主要诉求）、M13 declined（审美性）。
+
+### Fixed
+- **HttpMetricsCollector.generateReport 自死锁**：持锁（非递归自旋锁）期间调用
+  会再次加锁的公开方法 `avgDuration()`，`tryLock` 失败导致 100% CPU 永久自旋
+  （也是 `zig build test` 卡 853/929 的根因——该死锁长期掩盖了后续测试的真实
+  结果）。改为持锁内联计算均值。
+- **bindJsonLoose / extractJsonLoose 丢字段默认值**：原实现用
+  `std.mem.zeroes(T)` 初始化，`"id": null` 或缺字段时声明的默认值（如
+  `id: ?i64 = 7`）被抹成零值。改为两段式：先填匹配字段，再给未匹配字段
+  回填**声明默认值**（切片默认值同样 deep-copy，返回值所有字段统一自有，
+  可一致释放）。同步修复相关测试的字符串泄漏。
+
 ## [0.15.30] - 2026-08-17
 
 ### Fixed

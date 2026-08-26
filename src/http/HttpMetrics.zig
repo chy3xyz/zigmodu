@@ -156,6 +156,13 @@ pub const HttpMetricsCollector = struct {
             }
         };
 
+        // Inline avg: calling the public avgDuration() here would re-enter
+        // lock() while held — the spinlock is non-recursive and would hang.
+        const avg_ms = if (self.request_count == 0)
+            0
+        else
+            (self.total_duration_seconds / @as(f64, @floatFromInt(self.request_count))) * 1000;
+
         try buf.appendSlice(allocator, "═══════════════════════════════════\n");
         try buf.appendSlice(allocator, "  HTTP Metrics Report\n");
         try buf.appendSlice(allocator, "═══════════════════════════════════\n\n");
@@ -165,7 +172,7 @@ pub const HttpMetricsCollector = struct {
         try Emit.f(&buf, allocator, "  2xx Responses:     {d}\n", .{self.status_counts[@backingInt(StatusBucket.success)]});
         try Emit.f(&buf, allocator, "  4xx Responses:     {d}\n", .{self.status_counts[@backingInt(StatusBucket.client_error)]});
         try Emit.f(&buf, allocator, "  5xx Responses:     {d}\n", .{self.status_counts[@backingInt(StatusBucket.server_error)]});
-        try Emit.f(&buf, allocator, "  Avg Duration:      {d:.3}ms\n", .{self.avgDuration() * 1000});
+        try Emit.f(&buf, allocator, "  Avg Duration:      {d:.3}ms\n", .{avg_ms});
         try Emit.f(&buf, allocator, "  Min Duration:      {d:.3}ms\n", .{self.min_duration_seconds * 1000});
         try Emit.f(&buf, allocator, "  Max Duration:      {d:.3}ms\n", .{self.max_duration_seconds * 1000});
 

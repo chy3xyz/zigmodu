@@ -204,6 +204,31 @@ pub const WsRoute = struct {
 };
 
 /// Field source for auto parameter binding
+/// Canonical request identity, written by auth middleware
+/// (`jwtAuthFromCatalog*`, `authFromCatalog`) as context attrs.
+/// Handlers read it via the typed getters (`userId`, `requireUserId`, …)
+/// instead of raw `getAttr("user_id")` strings.
+pub const Identity = struct {
+    user_id: ?[]const u8 = null,
+    tenant_id: ?[]const u8 = null,
+    /// Comma-separated portal / coarse roles (JWT `roles`).
+    roles: ?[]const u8 = null,
+};
+
+/// Response envelope dialect for the `ok` / `fail` / `unauth` / `paginated`
+/// Context helpers and auth-rejection rendering (see `http.envelopeReject`).
+pub const EnvelopeDialect = enum {
+    /// ZigModu CommonResult: ok `{code:0,msg:"ok",data}`; fail `{code:1,…}`;
+    /// unauth HTTP 401 `{code:401,…}`; paged `{code:0,…,data:{list,total}}`.
+    default,
+    /// ThinkPHP: ok `{code:1,msg:"success",data}`; fail `{code:0,…}`;
+    /// unauth HTTP 401 `{code:-1,…}`; paged `{code:1,…,data:{list,total}}`.
+    thinkphp,
+    /// RuoYi: ok `{code:0,msg:"success",data}`; fail `{code:500,…}`;
+    /// unauth HTTP 401 `{code:401,…}`; paged `{code:0,msg,rows,total}`.
+    ruoyi,
+};
+
 pub const FieldSource = enum {
     path,
     query,
@@ -236,6 +261,8 @@ pub const Context = struct {
     io: ?std.Io = null,
     streaming: bool = false,
     upgraded: bool = false,
+    /// Envelope dialect used by `ok` / `fail` / `unauth` / `paginated`.
+    envelope: EnvelopeDialect = .default,
 
     /// Per-request arena — eliminates ~20 heap allocs per request.
     /// Removed nested arena in Zig 0.17: ArenaAllocator.free() is no-op,
@@ -400,6 +427,147 @@ pub const Context = struct {
 
     pub fn setAuthInfo(self: *Context, ptr: ?*anyopaque) void {
         self.auth_info = ptr;
+    }
+
+    // ── Typed identity (canonical attrs) ────────────────────────────────
+
+    /// Write identity attrs (`user_id` / `tenant_id` / `roles`). Auth
+    /// middleware calls this after verification; `null` fields are skipped.
+    pub fn setIdentity(self: *Context, id: Identity) !void {
+        if (id.user_id) |v| try self.setAttr("user_id", v);
+        if (id.tenant_id) |v| try self.setAttr("tenant_id", v);
+        if (id.roles) |v| try self.setAttr("roles", v);
+    }
+
+    /// Snapshot of the identity attrs (any field may be absent).
+    pub fn identity(self: *const Context) Identity {
+        return .{
+            .user_id = self.getAttr("user_id"),
+            .tenant_id = self.getAttr("tenant_id"),
+            .roles = self.getAttr("roles"),
+        };
+    }
+
+    /// Authenticated user id (string), or null when unauthenticated.
+    pub fn userId(self: *const Context) ?[]const u8 {
+        return self.getAttr("user_id");
+    }
+
+    /// Authenticated user id parsed as integer, or null when absent/invalid.
+    pub fn userIdInt(self: *const Context, comptime T: type) ?T {
+        const v = self.userId() orelse return null;
+        return std.fmt.parseInt(T, v, 10) catch null;
+    }
+
+    /// Authenticated user id or `error.Unauthorized` — replaces the
+    /// `requireLogin` / `currentUid` helper copies in consumers.
+    pub fn requireUserId(self: *const Context) ![]const u8 {
+        return self.userId() orelse error.Unauthorized;
+    }
+
+    /// Authenticated user id as integer or `error.Unauthorized`.
+    pub fn requireUserIdInt(self: *const Context, comptime T: type) !T {
+        return self.userIdInt(T) orelse error.Unauthorized;
+    }
+
+    /// Tenant / app id (JWT `aud` or tenant middleware), or null.
+    pub fn tenantId(self: *const Context) ?[]const u8 {
+        return self.getAttr("tenant_id");
+    }
+
+    /// Comma-separated portal roles, or null.
+    pub fn rolesCsv(self: *const Context) ?[]const u8 {
+        return self.getAttr("roles");
+    }
+
+    // ── Typed attr getters ──────────────────────────────────────────────
+
+    /// Attribute parsed as integer, or null when absent/invalid.
+    pub fn getAttrInt(self: *const Context, comptime T: type, key: []const u8) ?T {
+        const v = self.getAttr(key) orelse return null;
+        return std.fmt.parseInt(T, v, 10) catch null;
+    }
+
+    /// Attribute mapped to an enum by name, or null when absent/unknown.
+    pub fn getAttrEnum(self: *const Context, comptime E: type, key: []const u8) ?E {
+        const v = self.getAttr(key) orelse return null;
+        return std.meta.stringToEnum(E, v);
+    }
+
+    // ── Envelope dialect helpers ────────────────────────────────────────
+
+    /// Select the envelope dialect for `ok` / `fail` / `unauth` / `paginated`.
+    pub fn setEnvelope(self: *Context, dialect: EnvelopeDialect) void {
+        self.envelope = dialect;
+    }
+
+    /// Low-level envelope writer: `{"code":code,"msg":msg,"data":data_json}`
+    /// with `msg` JSON-escaped and `data_json` embedded raw (pass `"null"`).
+    pub fn respondEnvelope(self: *Context, http_status: u16, code: i32, msg: []const u8, data_json: []const u8) !void {
+        const msg_json = try std.json.Stringify.valueAlloc(self.allocator, msg, .{});
+        defer self.allocator.free(msg_json);
+        const body = try std.fmt.allocPrint(self.allocator, "{{\"code\":{d},\"msg\":{s},\"data\":{s}}}", .{ code, msg_json, data_json });
+        defer self.allocator.free(body);
+        try self.json(http_status, body);
+    }
+
+    /// Success envelope per `ctx.envelope`. `data_json` is raw JSON.
+    pub fn ok(self: *Context, data_json: []const u8) !void {
+        switch (self.envelope) {
+            .default => try self.respondEnvelope(200, 0, "ok", data_json),
+            .thinkphp => try self.respondEnvelope(200, 1, "success", data_json),
+            .ruoyi => try self.respondEnvelope(200, 0, "success", data_json),
+        }
+    }
+
+    /// Success envelope serializing any Zig value as `data`.
+    pub fn okValue(self: *Context, value: anytype) !void {
+        const json_str = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
+        defer self.allocator.free(json_str);
+        try self.ok(json_str);
+    }
+
+    /// Business failure per dialect (HTTP 200; code 1 / 0 / 500).
+    pub fn fail(self: *Context, msg: []const u8) !void {
+        switch (self.envelope) {
+            .default => try self.respondEnvelope(200, 1, msg, "null"),
+            .thinkphp => try self.respondEnvelope(200, 0, msg, "null"),
+            .ruoyi => try self.respondEnvelope(200, 500, msg, "null"),
+        }
+    }
+
+    /// Failure with an explicit business code (HTTP 200).
+    pub fn failCode(self: *Context, code: i32, msg: []const u8) !void {
+        try self.respondEnvelope(200, code, msg, "null");
+    }
+
+    /// Unauthenticated per dialect: HTTP 401 with code 401 / -1 / 401.
+    pub fn unauth(self: *Context, msg: []const u8) !void {
+        switch (self.envelope) {
+            .default, .ruoyi => try self.respondEnvelope(401, 401, msg, "null"),
+            .thinkphp => try self.respondEnvelope(401, -1, msg, "null"),
+        }
+    }
+
+    /// Paged envelope: default/thinkphp `{…,data:{list,total}}`;
+    /// ruoyi `{code:0,msg,rows,total}` (RuoYi TableDataInfo shape).
+    pub fn paginated(self: *Context, items: anytype, total: usize) !void {
+        const items_json = try std.json.Stringify.valueAlloc(self.allocator, items, .{});
+        defer self.allocator.free(items_json);
+        switch (self.envelope) {
+            .default, .thinkphp => {
+                const code: i32 = if (self.envelope == .thinkphp) 1 else 0;
+                const msg: []const u8 = if (self.envelope == .thinkphp) "success" else "ok";
+                const data = try std.fmt.allocPrint(self.allocator, "{{\"list\":{s},\"total\":{d}}}", .{ items_json, total });
+                defer self.allocator.free(data);
+                try self.respondEnvelope(200, code, msg, data);
+            },
+            .ruoyi => {
+                const body = try std.fmt.allocPrint(self.allocator, "{{\"code\":0,\"msg\":\"success\",\"rows\":{s},\"total\":{d}}}", .{ items_json, total });
+                defer self.allocator.free(body);
+                try self.json(200, body);
+            },
+        }
     }
 
     /// Stream a chunk of the response body. Call flushHeaders() first to send
@@ -591,10 +759,15 @@ pub const Context = struct {
 
     /// Loose JSON binding: field names match either snake_case or camelCase
     /// (`user_name` ↔ `userName`), `null` values are treated as absent
-    /// (field keeps its zero default), and missing fields are left at zero.
+    /// (field keeps its declared default), and missing fields keep their
+    /// declared defaults (only fields without defaults are zeroed).
     /// This is the escape hatch for clients that send camelCase JSON or
     /// `"id": null` for create requests — std.json's strict binding would
     /// reject both (MissingField / type error).
+    ///
+    /// Ownership: every slice field in the returned value is owned by the
+    /// context allocator — declared defaults are deep-copied too, so callers
+    /// can free uniformly.
     pub fn bindJsonLoose(self: *const Context, comptime T: type) !T {
         if (self.body == null) return error.NoBody;
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, self.body.?, .{ .ignore_unknown_fields = true }) catch |err| {
@@ -604,17 +777,31 @@ pub const Context = struct {
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidJson;
 
-        var result = std.mem.zeroes(T);
-        inline for (@typeInfo(T).@"struct".field_names) |fname| {
-            const F = @TypeOf(@field(result, fname));
+        // Pass 1: zero-init + fill matched fields (deep-copied, owned).
+        // Pass 2: unmatched fields with declared defaults get the default
+        // (deep-copied too, so every slice field is uniformly owned).
+        const s = @typeInfo(T).@"struct";
+        var result: T = undefined;
+        var filled: [s.field_names.len]bool = undefined;
+        inline for (s.field_names, s.field_types, 0..) |fname, F, i| {
+            filled[i] = false;
+            @field(result, fname) = std.mem.zeroes(F);
             if (findLooseField(parsed.value.object, fname)) |matched| {
-                if (matched != .null) { // null → zero default
+                if (matched != .null) { // null → keep declared default
                     var field_parsed = std.json.parseFromValue(F, self.allocator, matched, .{}) catch |err| {
                         std.log.err("bindJsonLoose({s}) field '{s}': {s}", .{ @typeName(T), fname, @errorName(err) });
                         return error.InvalidJson;
                     };
                     defer field_parsed.deinit();
                     @field(result, fname) = try deepCopy(field_parsed.value, self.allocator);
+                    filled[i] = true;
+                }
+            }
+        }
+        inline for (s.field_names, s.field_types, s.field_attrs, 0..) |fname, F, attrs, i| {
+            if (!filled[i]) {
+                if (attrs.defaultValue(F)) |d| {
+                    @field(result, fname) = try deepCopy(d, self.allocator);
                 }
             }
         }
@@ -2818,6 +3005,7 @@ test "bindJsonLoose matches camelCase, skips null, defaults missing" {
         age: i64 = 0,
     };
     const req = try ctx.bindJsonLoose(Req);
+    defer allocator.free(req.user_name); // all slice fields are owned (defaults duped too)
     try std.testing.expectEqualStrings("alice", req.user_name); // camelCase matched
     try std.testing.expectEqual(@as(?i64, 7), req.id); // null → default kept
     try std.testing.expectEqual(@as(i64, 30), req.age); // exact match
@@ -3051,4 +3239,72 @@ test "WebSocket fiber path receives client frames and fires on_close" {
     try std.testing.expect(ws_e2e_state.closed);
 
     server.stop();
+}
+
+test "typed identity getters read canonical attrs" {
+    const allocator = std.testing.allocator;
+    var ctx = try Context.init(allocator, .GET, "/");
+    defer ctx.deinit();
+
+    try std.testing.expect(ctx.userId() == null);
+    try std.testing.expectError(error.Unauthorized, ctx.requireUserId());
+
+    try ctx.setIdentity(.{ .user_id = "42", .tenant_id = "shop1", .roles = "admin,ops" });
+    try std.testing.expectEqualStrings("42", ctx.userId().?);
+    try std.testing.expectEqual(@as(?i64, 42), ctx.userIdInt(i64));
+    try std.testing.expectEqual(@as(i64, 42), try ctx.requireUserIdInt(i64));
+    try std.testing.expectEqualStrings("shop1", ctx.tenantId().?);
+    try std.testing.expectEqualStrings("admin,ops", ctx.rolesCsv().?);
+
+    const snap = ctx.identity();
+    try std.testing.expectEqualStrings("42", snap.user_id.?);
+    try std.testing.expectEqualStrings("shop1", snap.tenant_id.?);
+}
+
+test "typed attr getters parse int and enum" {
+    const allocator = std.testing.allocator;
+    const Portal = enum { admin, shop };
+    var ctx = try Context.init(allocator, .GET, "/");
+    defer ctx.deinit();
+
+    try ctx.setAttr("level", "7");
+    try ctx.setAttr("portal", "shop");
+    try ctx.setAttr("bad", "NaN");
+    try std.testing.expectEqual(@as(?u32, 7), ctx.getAttrInt(u32, "level"));
+    try std.testing.expectEqual(@as(?Portal, .shop), ctx.getAttrEnum(Portal, "portal"));
+    try std.testing.expect(ctx.getAttrInt(u32, "bad") == null);
+    try std.testing.expect(ctx.getAttrEnum(Portal, "bad") == null);
+    try std.testing.expect(ctx.getAttrInt(u32, "missing") == null);
+}
+
+test "envelope dialects render expected shapes" {
+    const allocator = std.testing.allocator;
+    var ctx = try Context.init(allocator, .GET, "/");
+    defer ctx.deinit();
+
+    // default (CommonResult)
+    try ctx.ok("{\"a\":1}");
+    try std.testing.expectEqualStrings("{\"code\":0,\"msg\":\"ok\",\"data\":{\"a\":1}}", ctx.response_body.items);
+
+    ctx.response_body.clearRetainingCapacity();
+    ctx.setEnvelope(.thinkphp);
+    try ctx.fail("余额不足");
+    try std.testing.expectEqualStrings("{\"code\":0,\"msg\":\"余额不足\",\"data\":null}", ctx.response_body.items);
+
+    ctx.response_body.clearRetainingCapacity();
+    try ctx.unauth("请先登录");
+    try std.testing.expectEqual(@as(u16, 401), ctx.status_code);
+    try std.testing.expectEqualStrings("{\"code\":-1,\"msg\":\"请先登录\",\"data\":null}", ctx.response_body.items);
+
+    ctx.response_body.clearRetainingCapacity();
+    ctx.setEnvelope(.ruoyi);
+    const Item = struct { id: u32 };
+    try ctx.paginated(&[_]Item{.{ .id = 1 }}, 9);
+    try std.testing.expectEqualStrings("{\"code\":0,\"msg\":\"success\",\"rows\":[{\"id\":1}],\"total\":9}", ctx.response_body.items);
+
+    // msg with quotes must be JSON-escaped
+    ctx.response_body.clearRetainingCapacity();
+    ctx.setEnvelope(.default);
+    try ctx.failCode(42, "say \"hi\"");
+    try std.testing.expectEqualStrings("{\"code\":42,\"msg\":\"say \\\"hi\\\"\",\"data\":null}", ctx.response_body.items);
 }

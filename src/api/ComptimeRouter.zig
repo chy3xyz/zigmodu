@@ -33,6 +33,11 @@ pub const RouteMeta = struct {
     /// `|` = OR. With `permissionGate` default mode, matched against JWT **roles**;
     /// with `.mode = .rbac`, matched against loaded permission codes.
     permission: ?[]const u8 = null,
+    /// Portal / coarse role gate (`|` = OR, e.g. `"admin|ops"`), enforced by
+    /// `permissionGateWith` against the identity `roles` attr before the
+    /// fine-grained `permission` check. Replaces hardcoded path-prefix → role
+    /// maps in consumers.
+    roles: ?[]const u8 = null,
     /// ModuleGate name; null → module's `module_name`.
     module: ?[]const u8 = null,
     /// When true, route is Server-Sent Events (`Accept: text/event-stream`). Handler should call `http.sse(ctx)`.
@@ -98,6 +103,8 @@ pub const CatalogEntry = struct {
     auth: Auth,
     module: []const u8,
     permission: ?[]const u8 = null,
+    /// Portal / coarse role gate from `RouteMeta.roles` (`|` = OR).
+    roles: ?[]const u8 = null,
     is_ws: bool = false,
     is_sse: bool = false,
     /// Borrowed comptime/static OpenAPI params from RouteMeta.
@@ -156,6 +163,12 @@ pub const RouteCatalog = struct {
     pub fn permissionFor(self: *const RouteCatalog, method: Method, path: []const u8) ?[]const u8 {
         const e = self.findEntry(method, path) orelse return null;
         return e.permission;
+    }
+
+    /// Portal / coarse role expression from `RouteMeta.roles` (`|` = OR).
+    pub fn rolesFor(self: *const RouteCatalog, method: Method, path: []const u8) ?[]const u8 {
+        const e = self.findEntry(method, path) orelse return null;
+        return e.roles;
     }
 
     /// All distinct permission expressions across the catalog (borrowed from
@@ -234,6 +247,14 @@ pub const RouteCatalog = struct {
                 "public"
             else
                 "jwt";
+            // 401 is only meaningful for authenticated routes (M14).
+            var resp_buf: [2]OpenApi.ApiResponse = undefined;
+            resp_buf[0] = .{ .status_code = 200, .description = if (e.is_ws) "Switching Protocols" else if (e.is_sse) "text/event-stream" else "OK" };
+            var resp_count: usize = 1;
+            if (e.auth != .public) {
+                resp_buf[1] = .{ .status_code = 401, .description = "Unauthorized" };
+                resp_count = 2;
+            }
             try gen.addEndpoint(.{
                 .method = method,
                 .path = oapi_path,
@@ -241,10 +262,8 @@ pub const RouteCatalog = struct {
                 .description = desc,
                 .tags = &.{e.module},
                 .params = params_buf[0..param_count],
-                .responses = &.{
-                    .{ .status_code = 200, .description = if (e.is_ws) "Switching Protocols" else if (e.is_sse) "text/event-stream" else "OK" },
-                    .{ .status_code = 401, .description = "Unauthorized" },
-                },
+                .requires_auth = e.auth != .public,
+                .responses = resp_buf[0..resp_count],
             });
         }
     }
@@ -254,6 +273,9 @@ pub const OpenApiFromCatalogConfig = struct {
     title: []const u8,
     version: []const u8 = "1.0.0",
     description: []const u8 = "",
+    /// Emit `components.securitySchemes.bearerAuth` + per-operation `security`
+    /// for non-public routes (default on; public routes carry no requirement).
+    bearer_auth: bool = true,
 };
 
 /// Live OpenAPI JSON handler: regenerates from `CatalogSlot` on each request.
@@ -264,11 +286,13 @@ pub fn openApiFromCatalog(slot: *CatalogSlot, config: OpenApiFromCatalogConfig) 
         var title: []const u8 = "";
         var version: []const u8 = "";
         var description: []const u8 = "";
+        var bearer_auth: bool = true;
     };
     Store.catalog_slot = slot;
     Store.title = config.title;
     Store.version = config.version;
     Store.description = config.description;
+    Store.bearer_auth = config.bearer_auth;
     return struct {
         fn handle(ctx: *Context) anyerror!void {
             const cat = Store.catalog_slot.get() orelse {
@@ -277,6 +301,7 @@ pub fn openApiFromCatalog(slot: *CatalogSlot, config: OpenApiFromCatalogConfig) 
             };
             var gen = OpenApi.OpenApiGenerator.init(ctx.allocator, Store.title, Store.version, Store.description);
             defer gen.deinit();
+            gen.bearer_auth = Store.bearer_auth;
             try cat.exportOpenApi(&gen);
             const json = try gen.generate();
             defer ctx.allocator.free(json);
@@ -635,6 +660,7 @@ pub fn Scoped(comptime AppState: type) type {
                     .auth = auth,
                     .module = module,
                     .permission = spec.meta.permission,
+                    .roles = spec.meta.roles,
                     .is_ws = false,
                     .is_sse = spec.meta.sse,
                     .openapi_params = spec.meta.openapi_params,
@@ -655,6 +681,7 @@ pub fn Scoped(comptime AppState: type) type {
                         .auth = auth,
                         .module = module,
                         .permission = spec.meta.permission,
+                        .roles = spec.meta.roles,
                         .is_ws = false,
                         .is_sse = true,
                         .openapi_params = spec.meta.openapi_params,
@@ -676,6 +703,7 @@ pub fn Scoped(comptime AppState: type) type {
                         .auth = auth,
                         .module = module,
                         .permission = spec.meta.permission,
+                        .roles = spec.meta.roles,
                         .is_ws = true,
                     });
                 }
