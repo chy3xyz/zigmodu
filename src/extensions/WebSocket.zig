@@ -22,6 +22,10 @@ pub const WebSocketServer = struct {
     on_connect_cb: ?*const fn (*WebSocketClient) void,
     on_message_cb: ?*const fn (*WebSocketClient, []const u8) void,
     allowed_origins: []const []const u8 = &.{},
+    /// Max WebSocket frame payload, in bytes. Frames larger than this are
+    /// rejected with `PayloadTooLarge`. Explicit contract (was previously
+    /// implied by a hard-coded 4096-byte stack buffer in `WebSocketClient.run`).
+    max_frame_size: usize = 4096,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, port: u16) Self {
         return .{
@@ -37,6 +41,11 @@ pub const WebSocketServer = struct {
             .on_connect_cb = null,
             .on_message_cb = null,
         };
+    }
+
+    /// Override the max inbound frame payload (default 4096).
+    pub fn setMaxFrameSize(self: *Self, size: usize) void {
+        self.max_frame_size = size;
     }
 
     pub fn deinit(self: *Self) void {
@@ -116,6 +125,7 @@ pub const WebSocketServer = struct {
             const response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
             var write_buf: [256]u8 = undefined;
             var w = conn.writer(self.io, &write_buf);
+            // Best-effort: a failed write means the peer is already gone.
             _ = w.interface.writeAll(response) catch {};
             return;
         };
@@ -134,6 +144,8 @@ pub const WebSocketServer = struct {
                     const response = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
                     var write_buf: [256]u8 = undefined;
                     var w = conn.writer(self.io, &write_buf);
+                    // Best-effort: the peer is being rejected anyway; a failed
+                    // write only means the socket is already gone.
                     _ = w.interface.writeAll(response) catch {};
                     return;
                 }
@@ -271,11 +283,17 @@ pub const WebSocketClient = struct {
     }
 
     pub fn run(self: *Self) void {
-        var buf: [4096]u8 = undefined;
+        // Buffer sized to the server's configured max frame size, so the
+        // explicit limit and the actual read capacity can't drift apart.
+        const buf = self.allocator.alloc(u8, self.server.max_frame_size) catch {
+            self.is_connected = false;
+            return;
+        };
+        defer self.allocator.free(buf);
         var read_buf: [4096]u8 = undefined;
         var r = self.stream.reader(self.io, &read_buf);
         while (self.is_connected) {
-            const frame = self.readFrame(&r, &buf) catch |err| {
+            const frame = self.readFrame(&r, buf) catch |err| {
                 if (self.is_connected) {
                     std.log.debug("[WebSocketClient] Frame read error: {}", .{err});
                 }
@@ -293,7 +311,12 @@ pub const WebSocketClient = struct {
                     break;
                 },
                 0x9 => { // Ping
-                    self.sendPong() catch {};
+                    // A failed pong means the connection is dead; the next
+                    // read/heartbeat will surface it — no recovery possible
+                    // here, but log it so operators see flapping links.
+                    self.sendPong() catch |err| {
+                        std.log.debug("[ws] pong send failed: {}", .{err});
+                    };
                 },
                 else => {},
             }
@@ -313,7 +336,6 @@ pub const WebSocketClient = struct {
     }
 
     fn readFrame(self: *Self, r: *std.Io.net.Stream.Reader, buf: []u8) !Frame {
-        _ = self;
         var header: [2]u8 = undefined;
         try readFull(r, &header);
 
@@ -336,7 +358,7 @@ pub const WebSocketClient = struct {
             try readFull(r, &mask_key);
         }
 
-        if (payload_len > buf.len) return error.PayloadTooLarge;
+        if (payload_len > self.server.max_frame_size) return error.PayloadTooLarge;
         try readFull(r, buf[0..payload_len]);
 
         if (masked) {

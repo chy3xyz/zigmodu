@@ -280,35 +280,41 @@ pub const OpenApiFromCatalogConfig = struct {
 
 /// Live OpenAPI JSON handler: regenerates from `CatalogSlot` on each request.
 /// Register after `catalog_slot.set(try router.finish())`.
-pub fn openApiFromCatalog(slot: *CatalogSlot, config: OpenApiFromCatalogConfig) HandlerFn {
-    const Store = struct {
-        var catalog_slot: *CatalogSlot = undefined;
-        var title: []const u8 = "";
-        var version: []const u8 = "";
-        var description: []const u8 = "";
-        var bearer_auth: bool = true;
+/// Runtime backing store for the OpenAPI catalog handler. Hoisted to
+/// container level so the handler fn itself stays comptime-known (required by
+/// `wrapHandler`); one OpenAPI endpoint per app, so a single store is enough.
+/// NOTE: registering `openApiFromCatalog` twice overwrites the first — one
+/// catalog slot per application by design (module Gate is app-wide anyway).
+const OpenApiRouteStore = struct {
+    var catalog_slot: *CatalogSlot = undefined;
+    var title: []const u8 = "";
+    var version: []const u8 = "";
+    var description: []const u8 = "";
+    var bearer_auth: bool = true;
+};
+
+fn openApiCatalogHandler(ctx: *Context) anyerror!void {
+    const cat = OpenApiRouteStore.catalog_slot.get() orelse {
+        try ctx.sendError(503, "Route catalog not ready");
+        return;
     };
-    Store.catalog_slot = slot;
-    Store.title = config.title;
-    Store.version = config.version;
-    Store.description = config.description;
-    Store.bearer_auth = config.bearer_auth;
-    return struct {
-        fn handle(ctx: *Context) anyerror!void {
-            const cat = Store.catalog_slot.get() orelse {
-                try ctx.sendError(503, "Route catalog not ready");
-                return;
-            };
-            var gen = OpenApi.OpenApiGenerator.init(ctx.allocator, Store.title, Store.version, Store.description);
-            defer gen.deinit();
-            gen.bearer_auth = Store.bearer_auth;
-            try cat.exportOpenApi(&gen);
-            const json = try gen.generate();
-            defer ctx.allocator.free(json);
-            try ctx.setHeader("Content-Type", "application/json");
-            try ctx.json(200, json);
-        }
-    }.handle;
+    var gen = OpenApi.OpenApiGenerator.init(ctx.allocator, OpenApiRouteStore.title, OpenApiRouteStore.version, OpenApiRouteStore.description);
+    defer gen.deinit();
+    gen.bearer_auth = OpenApiRouteStore.bearer_auth;
+    try cat.exportOpenApi(&gen);
+    const json = try gen.generate();
+    defer ctx.allocator.free(json);
+    try ctx.setHeader("Content-Type", "application/json");
+    try ctx.json(200, json);
+}
+
+pub fn openApiFromCatalog(slot: *CatalogSlot, config: OpenApiFromCatalogConfig) HandlerFn {
+    OpenApiRouteStore.catalog_slot = slot;
+    OpenApiRouteStore.title = config.title;
+    OpenApiRouteStore.version = config.version;
+    OpenApiRouteStore.description = config.description;
+    OpenApiRouteStore.bearer_auth = config.bearer_auth;
+    return openApiCatalogHandler;
 }
 
 /// Standalone handler serving an interactive Swagger UI HTML page pointing to `spec_url`.
@@ -371,14 +377,13 @@ pub fn scalarUiHandler(comptime spec_url: []const u8) HandlerFn {
 }
 
 /// Adapter to turn a 1-arg `HandlerFn` (`fn(*Context)`) into a 2-arg `TypedHandler(State)` (`fn(*Context, *State)`).
-pub fn wrapHandler(comptime State: type, handler: HandlerFn) TypedHandler(State) {
-    const Store = struct {
-        var fn_ptr: HandlerFn = undefined;
-    };
-    Store.fn_ptr = handler;
+/// `handler` must be comptime: a runtime `var` store would be shared by every
+/// wrapper of the same `State` (last write wins) and cannot be evaluated when
+/// the route table is built at comptime.
+pub fn wrapHandler(comptime State: type, comptime handler: HandlerFn) TypedHandler(State) {
     return struct {
         fn adapter(ctx: *Context, _: *State) anyerror!void {
-            return Store.fn_ptr(ctx);
+            return handler(ctx);
         }
     }.adapter;
 }
@@ -390,8 +395,9 @@ pub fn openApiRoutes(
     slot: *CatalogSlot,
     config: OpenApiFromCatalogConfig,
 ) [3]RouteSpec(State) {
+    _ = openApiFromCatalog(slot, config); // fills OpenApiRouteStore at runtime
     return [_]RouteSpec(State){
-        .{ .method = .GET, .path = "openapi.json", .handler = wrapHandler(State, openApiFromCatalog(slot, config)), .meta = .{ .auth = .public } },
+        .{ .method = .GET, .path = "openapi.json", .handler = wrapHandler(State, openApiCatalogHandler), .meta = .{ .auth = .public } },
         .{ .method = .GET, .path = "docs", .handler = wrapHandler(State, swaggerUiHandler("openapi.json")), .meta = .{ .auth = .public } },
         .{ .method = .GET, .path = "scalar", .handler = wrapHandler(State, scalarUiHandler("openapi.json")), .meta = .{ .auth = .public } },
     };
@@ -1010,4 +1016,28 @@ test "openApiRoutes generates 3 public UI and spec routes" {
     try std.testing.expect(routes[0].meta.auth == .public);
     try std.testing.expect(routes[1].meta.auth == .public);
     try std.testing.expect(routes[2].meta.auth == .public);
+}
+
+test "wrapHandler captures each handler independently (no shared store)" {
+    const State = struct {};
+    const S = struct {
+        var called: u8 = 0;
+        fn h1(_: *Context) anyerror!void {
+            called = 1;
+        }
+        fn h2(_: *Context) anyerror!void {
+            called = 2;
+        }
+    };
+    const a1 = wrapHandler(State, S.h1);
+    const a2 = wrapHandler(State, S.h2);
+    var state = State{};
+    // Regression: a runtime `var Store.fn_ptr` was shared by every wrapper of
+    // the same State, so all adapters dispatched to the last-stored handler.
+    try a1(undefined, &state);
+    try std.testing.expectEqual(@as(u8, 1), S.called);
+    try a2(undefined, &state);
+    try std.testing.expectEqual(@as(u8, 2), S.called);
+    try a1(undefined, &state);
+    try std.testing.expectEqual(@as(u8, 1), S.called);
 }

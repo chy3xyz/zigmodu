@@ -17,12 +17,26 @@ pub const Product = Schema("Product", .{
         // Validators run automatically on create/update (v0.25).
         field.String("name").NotEmpty().Length(1, 100),
         field.Int("price_cents"),
+        // Exact money column (v0.31): PG NUMERIC / MySQL DECIMAL(38,10) /
+        // SQLite TEXT — scanned as owned text, never truncated to f64.
+        field.Decimal("price"),
         // Large optional field: list endpoints can project it away.
         field.String("description").Optional(),
     },
     // AuditMixin auto-fills created_by/updated_by from the client's
     // PrivacyContext.user_id (v0.25).
     .mixins = &.{zent.core.mixin.AuditMixin},
+});
+
+/// Upsert demo (v0.30): business-key idempotent writes — a payment callback
+/// or delivery retry re-runs the same `SaveOrUpdateOn(&.{"sku"})` without
+/// creating duplicates.
+pub const SkuStock = Schema("SkuStock", .{
+    .fields = &.{
+        field.String("sku").Unique(),
+        field.Int("stock"),
+        field.Decimal("price"),
+    },
 });
 
 /// Data-scope demo entity: row-level access controlled by

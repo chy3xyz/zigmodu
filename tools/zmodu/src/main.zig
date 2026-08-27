@@ -2691,6 +2691,37 @@ fn introspectDatabaseMysql(io: std.Io, allocator: std.mem.Allocator, host: []con
 }
 
 /// Extract FOREIGN KEY references from raw SQL body text.
+/// Well-known column-modifier tokens that the inline-REFERENCES backtrack
+/// can mistake for the column name. Matched case-insensitively on the whole
+/// token.
+fn isColumnModifier(token: []const u8) bool {
+    const modifiers = [_][]const u8{ "NOT", "NULL", "DEFAULT", "UNIQUE", "PRIMARY", "KEY", "AUTOINCREMENT", "UNSIGNED", "CHECK" };
+    var buf: [32]u8 = undefined;
+    if (token.len == 0 or token.len > buf.len) return false;
+    const upper = std.ascii.upperString(buf[0..token.len], token);
+    for (modifiers) |m| {
+        if (std.mem.eql(u8, upper, m)) return true;
+    }
+    return false;
+}
+
+/// The trailing whitespace-separated word of `s`, or null when `s` is a
+/// single word.
+fn lastWord(s: []const u8) ?[]const u8 {
+    const start = lastWordStart(s) orelse return null;
+    return std.mem.trim(u8, s[start..], " \t");
+}
+
+/// Index just past the last space/tab in `s` (i.e. start of the final word),
+/// or null when `s` has no inner whitespace.
+fn lastWordStart(s: []const u8) ?usize {
+    var idx: ?usize = null;
+    for (s, 0..) |c, i| {
+        if (c == ' ' or c == '\t') idx = i + 1;
+    }
+    return idx;
+}
+
 fn extractForeignKeys(allocator: std.mem.Allocator, sql: []const u8, body_start: usize, body_end: usize) ![]ForeignKey {
     var fks: std.ArrayList(ForeignKey) = std.ArrayList(ForeignKey).empty;
     const body = sql[body_start..@min(body_end, sql.len)];
@@ -2713,7 +2744,9 @@ fn extractForeignKeys(allocator: std.mem.Allocator, sql: []const u8, body_start:
             j += 1;
             const col_start = j;
             while (j < rest.len and rest[j] != ')') j += 1;
-            const col_name = try allocator.dupe(u8, std.mem.trim(u8, rest[col_start..j], " \t\n\r`"));
+            const trimmed_end = std.mem.trimEnd(u8, rest[col_start..j], " \t\n\r`");
+            const trimmed_start = std.mem.trimStart(u8, trimmed_end, " \t\n\r`");
+            const col_name = try allocator.dupe(u8, trimmed_start);
             j += 1;
 
             // Find REFERENCES
@@ -2785,22 +2818,45 @@ fn extractForeignKeys(allocator: std.mem.Allocator, sql: []const u8, body_start:
             var col_end: usize = ref_idx;
             while (col_end > 0 and (body[col_end - 1] == ' ' or body[col_end - 1] == '\t' or body[col_end - 1] == '\n')) col_end -= 1;
             if (col_end == 0) continue;
-            // Skip type definition: backtrack past word(s) until we hit a comma, paren, or line start
+            // A ')' right before REFERENCES means this is a table-level
+            // `FOREIGN KEY (cols) REFERENCES …` clause already handled by the
+            // first pass — do not re-parse it as an inline reference.
+            if (body[col_end - 1] == ')') continue;
+            // Skip type definition: backtrack to the enclosing comma, open
+            // paren or line start — the run may hold several modifier words
+            // (`user_id INTEGER NOT NULL REFERENCES x`), so don't stop after
+            // the first space.
             var col_start = col_end;
-            var word_count: usize = 0;
             while (col_start > 0) {
                 const c = body[col_start - 1];
                 if (c == ',' or c == '(' or c == '\n') break;
-                if (c == ' ' or c == '\t') {
-                    if (word_count >= 1) break; // past the type, now at space before column name
-                    word_count += 1;
-                }
                 col_start -= 1;
             }
             // Skip leading whitespace/punctuation
             while (col_start < col_end and (body[col_start] == ' ' or body[col_start] == '\t' or body[col_start] == '\n' or body[col_start] == ',' or body[col_start] == '(')) col_start += 1;
-            const col_name = std.mem.trim(u8, body[col_start..col_end], " \t\n\r`");
+            // The backtrack above cannot know how many type/modifier words
+            // precede REFERENCES (`user_id INTEGER NOT NULL REFERENCES x`).
+            // Take the whole run, then peel modifier words off the tail; the
+            // next-to-last survivor is the column name (the innermost word
+            // before modifiers is the SQL type).
+            var col_name = std.mem.trim(u8, body[col_start..col_end], " \t\n\r`,");
             if (col_name.len == 0) continue;
+            if (lastWord(col_name)) |lw| {
+                if (isColumnModifier(lw)) {
+                    // Peel trailing modifier words.
+                    while (lastWord(col_name)) |tail_lw| {
+                        if (!isColumnModifier(tail_lw)) break;
+                        const cut = lastWordStart(col_name) orelse break;
+                        col_name = std.mem.trimEnd(u8, col_name[0..cut], " \t");
+                    }
+                    // Now the tail is "<name> <TYPE>" — drop the type word to
+                    // keep only the identifier. If nothing remains before the
+                    // type (e.g. line started with the type), skip this ref.
+                    const tcut = lastWordStart(col_name) orelse continue;
+                    col_name = std.mem.trimEnd(u8, col_name[0..tcut], " \t");
+                    if (col_name.len == 0) continue;
+                }
+            }
             // Skip if already covered by FOREIGN KEY
             if (ref_seen.contains(col_name)) continue;
             ref_seen.put(col_name, {}) catch {};
@@ -3510,7 +3566,7 @@ fn generateZentSchema(allocator: std.mem.Allocator, module_name: []const u8, tab
             }
         }
 
-        try buf.print(allocator, "const {s} = Schema(\"{s}\", .{{", .{ schema_name, schema_name });
+        try buf.print(allocator, "pub const {s} = Schema(\"{s}\", .{{", .{ schema_name, schema_name });
         try buf.appendSlice(allocator, "\n    .fields = &.{\n");
 
         for (table.columns) |col| {
@@ -3540,16 +3596,23 @@ fn generateZentSchema(allocator: std.mem.Allocator, module_name: []const u8, tab
                 try field_buf.appendSlice(allocator, ".Unique()");
             }
 
-            if (is_pk) {
-                try field_buf.appendSlice(allocator, ".Required()");
-            } else if (!col.nullable) {
-                try field_buf.appendSlice(allocator, ".Required()");
-            } else {
+            // zent fields are NOT NULL (required) by default — only nullable
+            // columns opt out via .Optional(). (No `.Required()` in zent ≥0.13.)
+            if (col.nullable and !is_pk) {
                 try field_buf.appendSlice(allocator, ".Optional()");
             }
 
             if (col.has_default) {
-                try field_buf.appendSlice(allocator, ".Default(\"\")");
+                // Parser only keeps has_default (no literal); emit a
+                // type-correct zero default so generated DDL stays valid on
+                // PG/MySQL (a string "" default on Int is invalid there).
+                const dflt = switch (col.col_type) {
+                    .int => ".Default(0)",
+                    .float => ".Default(0.0)",
+                    .bool => ".Default(false)",
+                    else => ".Default(\"\")",
+                };
+                try field_buf.appendSlice(allocator, dflt);
             }
 
             try field_buf.appendSlice(allocator, ",\n");
@@ -3560,6 +3623,22 @@ fn generateZentSchema(allocator: std.mem.Allocator, module_name: []const u8, tab
 
         if (has_time_fields) {
             try buf.appendSlice(allocator, "    .mixins = &.{zent.core.mixin.TimeMixin},\n");
+        }
+
+        // Foreign keys → zent edges (M2O on this table): each REFERENCES
+        // becomes an explicit `.Field(fk_column)` edge so the graph, eager
+        // loading and predicates light up without hand-editing the schema.
+        // Edge names use the FK column with the `_id` suffix stripped.
+        if (table.foreign_keys.len > 0) {
+            try buf.appendSlice(allocator, "    .edges = &.{\n");
+            for (table.foreign_keys) |fk| {
+                const ref_pascal = try toPascalCase(allocator, fk.ref_table);
+                defer allocator.free(ref_pascal);
+                var edge_name: []const u8 = fk.column_name;
+                if (std.mem.endsWith(u8, fk.column_name, "_id")) edge_name = fk.column_name[0 .. fk.column_name.len - 3];
+                try buf.print(allocator, "        edge.From(\"{s}\", {s}).Field(\"{s}\"),\n", .{ edge_name, ref_pascal, fk.column_name });
+            }
+            try buf.appendSlice(allocator, "    },\n");
         }
 
         try buf.appendSlice(allocator, "});\n\n");
@@ -3582,9 +3661,9 @@ fn generateZentClient(allocator: std.mem.Allocator, module_name: []const u8, tab
         const schema_name = try toPascalCase(allocator, table.name);
         defer allocator.free(schema_name);
         if (idx == tables.len - 1) {
-            try buf.print(allocator, "{s}", .{schema_name});
+            try buf.print(allocator, "schemas.{s}", .{schema_name});
         } else {
-            try buf.print(allocator, "{s}, ", .{schema_name});
+            try buf.print(allocator, "schemas.{s}, ", .{schema_name});
         }
     }
 
@@ -8564,7 +8643,7 @@ test "generateZentClient: buildGraph types on one line" {
     }};
     const table = TableDef{ .name = try a.dupe(u8, "line_item"), .columns = cols[0..], .foreign_keys = &.{} };
     const code = try generateZentClient(a, "order", &.{table});
-    try std.testing.expect(std.mem.indexOf(u8, code, "buildGraph(&.{ LineItem });") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "buildGraph(&.{ schemas.LineItem });") != null);
     try std.testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, code, "buildGraph(&.{\n"));
 }
 
@@ -8586,7 +8665,7 @@ test "generateZentClient: two tables comma-separated" {
         .{ .name = try a.dupe(u8, "beta"), .columns = cols[0..], .foreign_keys = &.{} },
     };
     const code = try generateZentClient(a, "mix", &tables);
-    try std.testing.expect(std.mem.indexOf(u8, code, "buildGraph(&.{ Alpha, Beta });") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "buildGraph(&.{ schemas.Alpha, schemas.Beta });") != null);
 }
 
 test "generateZentSchema: TimeMixin when created_at present" {

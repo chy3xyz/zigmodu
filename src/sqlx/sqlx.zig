@@ -4264,6 +4264,10 @@ pub const Client = struct {
     metrics_callback: ?MetricsCallback = null,
     /// Optional tracer for OpenTelemetry-compatible spans (zero-cost when null)
     tracer: ?*const Tracer = null,
+    /// Read-replica client (read/write splitting). `query`-family methods
+    /// route here when set; `exec`/`beginTx`/batch writes always hit the
+    /// primary. Replica failures transparently fall back to the primary.
+    replica: ?*Client = null,
     io: std.Io,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, cfg: Config) Client {
@@ -4318,6 +4322,25 @@ pub const Client = struct {
 
     pub fn withTracer(self: *Client, t: *const Tracer) void {
         self.tracer = t;
+    }
+
+    /// Register a read-replica client: `query`/`queryRow`/`queryRows` and the
+    /// cursor family route to it, while writes and transactions stay on this
+    /// (primary) client. The replica is an ordinary `Client` — build it with
+    /// its own `Config` (usually a read-only user + replica host) and treat
+    /// it as long-lived as the primary. On any replica failure the read is
+    /// retried once against the primary, so stale-or-down replicas degrade
+    /// to single-primary behavior instead of failing requests.
+    pub fn withReplica(self: *Client, replica: *Client) void {
+        self.replica = replica;
+    }
+
+    /// Read-routing inner gate: returns the replica when one is registered
+    /// and its circuit breaker allows traffic; null means "use primary".
+    fn readTarget(self: *Client) ?*Client {
+        const r = self.replica orelse return null;
+        if (!r.cb.allow(r.io)) return null;
+        return r;
     }
 
     fn isAcceptable(self: *Client, err: anyerror) bool {
@@ -4437,6 +4460,16 @@ pub const Client = struct {
     }
 
     pub fn query(self: *Client, sql_str: []const u8, args: []const Value) !Rows {
+        // Read/write splitting: route pure reads to the replica when one is
+        // registered. A replica failure falls back to the primary read so a
+        // stale replica degrades instead of erroring.
+        if (self.readTarget()) |r| {
+            return r.query(sql_str, args) catch |err| {
+                std.log.warn("[sqlx] replica read failed ({s}), falling back to primary", .{@errorName(err)});
+                return self.query(sql_str, args);
+            };
+        }
+
         if (!self.cb.allow(self.io)) return error.CircuitBreakerOpen;
 
         const t0 = Time.monotonicNow();
@@ -4472,6 +4505,13 @@ pub const Client = struct {
     /// materializes all rows; `.streaming` fetches rows lazily and the row returned
     /// by `next()` is only valid until the next `next()`/`deinit()`.
     pub fn queryCursorEx(self: *Client, sql_str: []const u8, args: []const Value, opts: CursorOptions) !Cursor {
+        // Read/write splitting (same fallback semantics as `query`).
+        if (self.readTarget()) |r| {
+            return r.queryCursorEx(sql_str, args, opts) catch |err| {
+                std.log.warn("[sqlx] replica cursor failed ({s}), falling back to primary", .{@errorName(err)});
+                return self.queryCursorEx(sql_str, args, opts);
+            };
+        }
         if (!self.cb.allow(self.io)) return error.CircuitBreakerOpen;
 
         self.ensurePool();
@@ -5627,6 +5667,72 @@ test "DriverFeatures and DriverNotEnabled" {
     var client = Client.init(allocator, std.testing.io, .{ .driver = .postgres, .host = "127.0.0.1" });
     defer client.deinit();
     try std.testing.expectError(error.DriverNotEnabled, client.connect());
+}
+
+test "read replica routes reads and keeps writes on primary" {
+    if (!DriverFeatures.sqlite) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    // Primary holds the real table; the "replica" is a second in-memory DB
+    // seeded with different data so we can observe which side served a read.
+    var primary = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer primary.deinit();
+    var replica = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer replica.deinit();
+
+    for ([_]*Client{ &primary, &replica }) |c| {
+        _ = try c.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+    }
+    _ = try primary.exec("INSERT INTO users (name) VALUES ('primary-row')", &.{});
+    _ = try replica.exec("INSERT INTO users (name) VALUES ('replica-row')", &.{});
+
+    // Without a replica registered: reads hit primary.
+    const before = try primary.queryRow(struct { name: []const u8 }, "SELECT name FROM users", &.{});
+    defer freeScanned(allocator, @TypeOf(before), before);
+    try std.testing.expectEqualStrings("primary-row", before.name);
+
+    primary.withReplica(&replica);
+
+    // Reads now route to the replica.
+    const r1 = try primary.queryRow(struct { name: []const u8 }, "SELECT name FROM users", &.{});
+    defer freeScanned(allocator, @TypeOf(r1), r1);
+    try std.testing.expectEqualStrings("replica-row", r1.name);
+
+    var rows = try primary.query("SELECT name FROM users", &.{});
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
+    try std.testing.expectEqualStrings("replica-row", rows.rows[0].get("name").?.string);
+
+    // Writes always go to the primary — replica never sees them.
+    _ = try primary.exec("INSERT INTO users (name) VALUES ('written-via-primary')", &.{});
+    const prim_names = try replica.queryRow(struct { n: i64 }, "SELECT COUNT(*) AS n FROM users WHERE name = 'written-via-primary'", &.{});
+    defer freeScanned(allocator, @TypeOf(prim_names), prim_names);
+    try std.testing.expectEqual(@as(i64, 0), prim_names.n);
+
+    // Transactions bypass the replica (same primary connection).
+    var tx = try primary.beginTx();
+    errdefer tx.rollback() catch {};
+    _ = try tx.exec("INSERT INTO users (name) VALUES ('tx-row')", &.{});
+    try tx.commit();
+}
+
+test "read replica failure falls back to primary" {
+    if (!DriverFeatures.sqlite) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var primary = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer primary.deinit();
+    var dead_replica = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = "/nonexistent-dir-must-fail/replica.db" });
+    defer dead_replica.deinit();
+
+    _ = try primary.exec("CREATE TABLE t (v TEXT)", &.{});
+    _ = try primary.exec("INSERT INTO t (v) VALUES ('from-primary')", &.{});
+
+    primary.withReplica(&dead_replica);
+    // Replica open would fail → query falls back to the primary transparently.
+    const row = try primary.queryRow(struct { v: []const u8 }, "SELECT v FROM t", &.{});
+    defer freeScanned(allocator, @TypeOf(row), row);
+    try std.testing.expectEqualStrings("from-primary", row.v);
 }
 
 test "cached conn queryRow and exec" {

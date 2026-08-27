@@ -4,6 +4,6 @@
 
 const std = @import("std");
 const zent = @import("zent");
+const schemas = @import("schema.zig");
 
-pub fn makeClient(allocator: std.mem.Allocator, drv: anytype) !zent.codegen.client.Client {
-    const graph = comptime zent.codegen.graph.buildGraph(&.{ 
+const graph = zent.codegen.graph.buildGraph(&.{ 

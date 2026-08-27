@@ -936,6 +936,14 @@ const StreamReader = struct {
     }
 };
 
+/// HTTP request header limits (header-bomb DoS guard).
+pub const HeaderLimits = struct {
+    /// Maximum number of header lines accepted per request.
+    max_count: usize = 100,
+    /// Maximum combined byte size of all header lines.
+    max_total_bytes: usize = 16 * 1024,
+};
+
 /// HTTP request parser
 const RequestParser = struct {
     allocator: std.mem.Allocator,
@@ -952,14 +960,14 @@ const RequestParser = struct {
         return out;
     }
 
-    pub fn parse(self: *RequestParser, reader: *StreamReader, max_body_size: usize) !ParsedRequest {
+    pub fn parse(self: *RequestParser, reader: *StreamReader, max_body_size: usize, header_limits: HeaderLimits) !ParsedRequest {
         var buffer: [8192]u8 = undefined;
         const request_line_raw_view = try reader.readUntilDelimiterOrEof(&buffer, '\n') orelse return error.ClientClosed;
-        return self.parseAfterRequestLine(reader, request_line_raw_view, max_body_size);
+        return self.parseAfterRequestLine(reader, request_line_raw_view, max_body_size, header_limits);
     }
 
     /// Continue HTTP/1.1 parse after the request line was already read (H2 preface probe).
-    pub fn parseAfterRequestLine(self: *RequestParser, reader: *StreamReader, request_line_raw_view: []const u8, max_body_size: usize) !ParsedRequest {
+    pub fn parseAfterRequestLine(self: *RequestParser, reader: *StreamReader, request_line_raw_view: []const u8, max_body_size: usize, header_limits: HeaderLimits) !ParsedRequest {
         var buffer: [8192]u8 = undefined;
 
         const request_line_owned = try self.allocator.dupe(u8, trimCrlf(request_line_raw_view));
@@ -997,10 +1005,17 @@ const RequestParser = struct {
 
         // Parse headers
         var headers = std.StringHashMap([]const u8).init(self.allocator);
+        var header_count: usize = 0;
+        var header_bytes: usize = 0;
         while (true) {
             const line_raw = try reader.readUntilDelimiterOrEof(&buffer, '\n') orelse return error.InvalidRequest;
             const header_line = trimCrlf(line_raw);
             if (header_line.len == 0) break;
+
+            header_count += 1;
+            header_bytes += header_line.len;
+            if (header_count > header_limits.max_count) return error.TooManyHeaders;
+            if (header_bytes > header_limits.max_total_bytes) return error.TooManyHeaders;
 
             if (std.mem.indexOf(u8, header_line, ": ")) |colon_pos| {
                 const key_raw = try self.allocator.dupe(u8, header_line[0..colon_pos]);
@@ -1540,6 +1555,7 @@ pub const Server = struct {
     max_body_size: usize,
     request_timeout_ms: u32,
     max_requests_per_conn: usize,
+    header_limits: HeaderLimits,
     in_flight: ?*std.atomic.Value(u64) = null,
     /// Allocated route-group / scoped middleware slices (RouteGroup.use, ComptimeRouter Scoped.use).
     owned_route_mw: std.ArrayList([]const Middleware),
@@ -1560,6 +1576,7 @@ pub const Server = struct {
         max_body_size: usize = 8 * 1024 * 1024,
         request_timeout_ms: u32 = 30000,
         max_requests_per_conn: usize = 100,
+        header_limits: HeaderLimits = .{},
         /// Per-connection thread stack size. Default 128KB suffices for HTTP handlers.
         /// Lower = more concurrent connections. Raise if handlers need deep recursion.
         connection_stack_size: usize = 128 * 1024,
@@ -1585,6 +1602,7 @@ pub const Server = struct {
             .max_body_size = config.max_body_size,
             .request_timeout_ms = config.request_timeout_ms,
             .max_requests_per_conn = config.max_requests_per_conn,
+            .header_limits = config.header_limits,
             .owned_route_mw = std.ArrayList([]const Middleware).empty,
         };
     }
@@ -1934,14 +1952,14 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
             return;
         }
 
-        var request = parser.parseAfterRequestLine(&reader, first_line_raw, server.max_body_size) catch |err| {
+        var request = parser.parseAfterRequestLine(&reader, first_line_raw, server.max_body_size, server.header_limits) catch |err| {
             switch (err) {
                 error.ReadFailed, error.IncompleteBody => return,
                 else => {},
             }
             std.log.err("Parse error: {any}", .{err});
-            const msg = if (err == error.BodyTooLarge) "Payload Too Large" else "Bad Request";
-            const status: u16 = if (err == error.BodyTooLarge) 413 else 400;
+            const msg = if (err == error.BodyTooLarge) "Payload Too Large" else if (err == error.TooManyHeaders) "Request Header Fields Too Large" else "Bad Request";
+            const status: u16 = if (err == error.BodyTooLarge) 413 else if (err == error.TooManyHeaders) 431 else 400;
             writeErrorResponse(server.io, stream, arena_alloc, status, msg);
             return;
         };
@@ -3133,6 +3151,12 @@ test "header lookup is case-insensitive" {
     try std.testing.expectEqualStrings("42", headerLookup(headers, "X-Tenant-ID").?);
     try std.testing.expectEqualStrings("zigmodu-test", headerLookup(headers, "user-agent").?);
     try std.testing.expect(headerLookup(headers, "content-type") == null);
+}
+
+test "HeaderLimits defaults are sane" {
+    const h = HeaderLimits{};
+    try std.testing.expect(h.max_count > 0 and h.max_count <= 1024);
+    try std.testing.expect(h.max_total_bytes > 0 and h.max_total_bytes <= 1024 * 1024);
 }
 
 const WsE2eState = struct {

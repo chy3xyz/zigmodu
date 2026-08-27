@@ -16,7 +16,7 @@
 | [快速开始](docs/QUICK-START.md) | 5分钟入门 |
 | [Modulith 高并发](docs/MODULITH.md) | 项目第一天：模块边界 + 高并发实践 |
 | [声明式路由](docs/ROUTE_TABLE.md) | ComptimeRouter + catalog JWT/RBAC |
-| [ZigModu × zent](docs/ZENT.md) | zent ORM 正交接入与最佳实践 |
+| [ZigModu × zent](docs/ZENT.md) | **电商/社交主推组合**：zent ORM 正交接入与最佳实践 |
 | [SQLx 驱动链接](docs/SQLX_DRIVERS.md) | `-Ddb=` / `.db=` 选择性链接 |
 | [最佳实践](docs/BEST_PRACTICES.md) | DAU 演进 + JWT / 多端身份清单 |
 | [API参考](docs/API.md) | 完整API文档 |

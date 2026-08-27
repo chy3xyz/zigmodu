@@ -1,7 +1,8 @@
 # ZigModu × zent 最佳实践
 
 **zent**: [chy3xyz/zent](https://github.com/chy3xyz/zent) — Zig 版 [ent](https://entgo.io/)（schema-as-code ORM）  
-**版本口径**: zent **v0.29.5+**（示例与本文按最新发布 v0.29.5 演示；最低兼容 v0.13 起）· ZigModu **v0.15.22+** · Zig **≥ 0.17**  
+**版本口径**: zent **v0.32.0**（示例与本文按最新发布 v0.32.0 演示；最低兼容 v0.13 起）· ZigModu **v0.15.22+** · Zig **≥ 0.17**  
+**主推组合**: **电商 / 社交类项目默认选 ZigModu + zent**（见 §2 决策表与 §4.8 场景能力矩阵）；只有存量 SQL 繁重、报表主导或 DBA 强管控的项目才默认 sqlx。
 
 **参考实现**: [`examples/zent-modulith/`](../examples/zent-modulith/)  
 **zent 自带示例**: `zig build run-start` / `run-complex` / `run-pool`（在 zent 仓库内）
@@ -68,12 +69,14 @@ ZigModu **核心库不强制依赖 zent**；应用或示例按需 path/url 引�
 
 | 需求 | 建议 |
 |------|------|
+| **电商（商品/订单/库存/多店铺）** | **zent（主推）**：领域图密 + 金额精确（`field.Decimal`）+ 幂等 upsert + 行级隔离 |
+| **社交（关注/feed/点赞/私信）** | **zent（主推）**：关系图一等公民 + 边预加载/过滤/排序 + Privacy 可见性 |
 | 快速 CRUD、已有 SQL、报表/复杂手写查询 | **sqlx**（`zigmodu.data`） |
 | 关系图密、codegen Client、migrate、privacy、hooks | **zent** |
-| 下单→支付→Outbox→消息编排 | **sqlx + ZigModu EventBus**（与 ORM 选型正交） |
+| 下单→支付→Outbox→消息编排 | **sqlx 或 zent + ZigModu EventBus**（编排与 ORM 选型正交） |
 | 同进程两套都用 | **按模块选型**（见 §3） |
 
-**一句话**：编排与消息归 ZigModu；领域图与行级策略归 zent；简单表与存量 SQL 归 sqlx。
+**一句话**：编排与消息归 ZigModu；领域图与行级策略归 zent；简单表与存量 SQL 归 sqlx。电商/社交新项目的领域模块**默认 zent**，报表/对账等边缘读路径可单开 sqlx 只读模块（§4.7）。
 
 **多租户边界**：`TenantContext`（租户来源：JWT / 中间件 → 运行时 id）是
 引擎无关的，sqlx 与 zent 模块都直接用；行级隔离按引擎走惯用法，**不要跨引擎
@@ -200,6 +203,36 @@ zent 是 ent-style：**关系走 Edges 预加载，不做跨表 JOIN 查询**（
 2. **复杂报表**：用 zent driver 裸 SQL（`client.driver.query(...)`）或 zigmodu `data.sqlx` 写 JOIN —— **不要在 zent 与 sqlx 之间共享事务**（见 §1 定位；报表只读连接可独立）。
 3. 报表查询建议独立 `report/` 模块持有自己的 `sqlx.Client`，与写路径（zent）解耦，避免把复杂 SQL 混进 domain 模块。
 
+### 4.8 电商 / 社交主推能力矩阵（zent v0.30–v0.32）
+
+这两版把电商/社交最常见的「钱、幂等、列表、可见性」四类痛点补成了一等能力，是主推组合的直接理由：
+
+**电商**
+
+| 场景 | 用法 | 说明 |
+|------|------|------|
+| 金额精确存储 | `field.Decimal("price")` | PG `NUMERIC` / MySQL `DECIMAL(38,10)` / SQLite `TEXT`；扫描为 `[]const u8`，**不再静默截断成 f64**。迁移自 `Float` 金额列时按 zent `UPGRADING.md` 处理存量数据。 |
+| 业务键幂等写入 | `CreateBuilder.SaveOrUpdateOn(&.{"order_no"})` | 支付回调/重试安全：PG/SQLite `ON CONFLICT (cols) DO UPDATE`、MySQL ODKU；冲突目标显式，不靠猜主键。 |
+| 防重复插入 | `SaveIgnore()` | MySQL `INSERT IGNORE` / PG `ON CONFLICT DO NOTHING`：券领取、唯一收藏等「插过就算」场景。 |
+| 订单列表不丢单 | `q.WithEdgeOptions("payment", .{ .join = .inner })` | eager edge 走 schema 感知 EXISTS inner-join，`Limit` 在边过滤**之后**生效——「只列已支付订单」不再因 limit skew 少返回。 |
+| 从共享池开事务 | `zent.codegen.beginTxFromDriver(infos, pool.asDriver(), alloc)` | 无 root Client 也能开类型化 `TxClient`；重入自动降级 savepoint（§6.4）。 |
+
+**社交**
+
+| 场景 | 用法 | 说明 |
+|------|------|------|
+| feed 关系过滤 | `WithEdgeOptions("author", .{ .join = .inner })` + Privacy Filter | 「我关注的人的动态」在 SQL 层过滤，避免拉回再筛。 |
+| 聚合 DTO 直出 | `sql.SelectExpr("COUNT(*)", "like_count")` + `Selector.addColumn` + `Row.columnIndex("like_count")` | 点赞数/评论数随主查询一次返回，alias 三方言带引号；配 `sql.OrderExprSql` 排序。 |
+| 请求级实体生命周期 | `codegen.ManagedEntity` / `managedEntity` + `dupeEntityTo(arena, …)` | allocator 绑定实体，teardown 不会选错 allocator；HTTP handler 里深拷贝（含 typed JSON、两级边）进请求 arena，响应结束一把放。 |
+| NULL 安全读取 | `Row.tryGetInt/tryGetText/…` | 返回 `error.NullColumn` 而不是静默零值——统计列、可空外键不再读错。 |
+
+**通用**
+
+| 场景 | 用法 | 说明 |
+|------|------|------|
+| 借出字符串统一释放 | `crud_helpers.freeOwnedStrings` | escape-ledger 场景成批释放 owned 字符串。 |
+| MySQL LIKE 转义 | `ContainsEscaped` | v0.30 起 ESCAPE 用 `!`（`\` 是 MySQL 字符串转义符，会污染 LIKE 模式）。 |
+
 ---
 
 ## 5. 分层映射（对齐 MODULE_LAYERS）
@@ -323,6 +356,10 @@ zent.codegen.client.SetLogger(infos, &client, logger);
 日志回调只应记录 SQL 元数据；不要输出密码、token 或敏感字段值。需要 trace 关联时，在 `LogContext.trace_id` 中传递应用层 trace id。
 
 ### 6.4 Transactions
+
+zent v0.31+ 支持不经 root Client、直接从共享 Driver/连接池开类型化事务：
+`zent.codegen.beginTxFromDriver(infos, pool.asDriver(), alloc)`（重入调用自动降级 savepoint）——
+定时任务、事件消费者等没有 root Client 的路径优先用它。
 
 跨实体写入使用同一个 `TxClient`。需要在一个大事务中局部回滚时，可通过底层 `Tx` 执行 SQL savepoint；最终仍然只 commit/rollback 一次并 `deinit` 一次：
 
@@ -456,6 +493,7 @@ pub const CatalogStore = struct {
 | `driver.Tx` / `TxClient` | commit/rollback 后**恰好一次** `deinit` |
 | `deinitEntity` | 传 **可变指针** `&entity`（非 `*const`） |
 | DTO 字符串 | persistence `dupe`；上层 `free*` |
+| 请求域深拷贝（v0.31） | `dupeEntityTo(req_arena, …)` 深拷贝字段/typed JSON/两级边进请求 arena，响应结束统一释放；`managedEntity` 绑定 owning allocator，杜绝 teardown 选错 allocator |
 
 错误：persistence 上抛领域/驱动错误；api 映射为 HTTP 状态与文案，不吞 I/O / DB 错误。
 
@@ -463,7 +501,7 @@ pub const CatalogStore = struct {
 
 ## 11. 依赖接入
 
-zent **v0.27.0** 提供 `build.zig.zon`（模块名 `zent`，path 依赖本地 checkout 开发）。
+zent **v0.32.0** 提供 `build.zig.zon`（模块名 `zent`，path 依赖本地 checkout 开发）。
 
 **本地 sibling（开发）：**
 
@@ -482,7 +520,7 @@ exe_mod.addImport("zent", zent_dep.module("zent"));
 
 ```zon
 .zent = .{
-    .url = "https://github.com/chy3xyz/zent/archive/refs/tags/v0.27.0.tar.gz",
+    .url = "https://github.com/chy3xyz/zent/archive/refs/tags/v0.32.0.tar.gz",
     .hash = "<zig fetch 后填入>",
 },
 ```
@@ -528,10 +566,14 @@ zig_ws/
 
 ---
 
-## 14. 升级注意（zent 0.6 → 0.12 → 0.13 → 0.27）
+## 14. 升级注意（zent 0.6 → 0.12 → 0.13 → 0.27 → 0.31）
 
 | 主题 | 动作 / 新特性 |
 |------|--------------|
+| **v0.31 精确金额 / 边 inner-join / 池上事务** | `field.Decimal`（PG NUMERIC / MySQL DECIMAL(38,10)，扫描为 owned `[]const u8`）；`WithEdgeOptions(.{ .join = .inner })` 消除 eager-load limit skew；`beginTxFromDriver` 从共享 Driver/池直开 `TxClient`；`ManagedEntity`/`dupeEntityTo` allocator 安全 teardown；`SelectExpr`/`OrderExprSql`/`Row.columnIndex` 别名 DTO 映射。 |
+| **v0.30 显式冲突目标 upsert** | `SaveOrUpdateOn(conflict_columns)`（PG/SQLite `ON CONFLICT (cols)`、MySQL ODKU）与 `SaveIgnore()`；`Row.tryGet*` NULL 显式报错；**MySQL `ContainsEscaped` ESCAPE 改为 `!`**（旧 `\` 会污染 LIKE 模式，自查依赖该行为的查询）。 |
+| **v0.29 约束错误分类 / JSONValue / ⚠️ Time 列类型** | `UniqueViolation`/`NotNullViolation`/`ForeignKeyViolation` 三方言统一（不再误报 `NotFound`）；`field.JSONValue` 无类型 JSON 文档；**`field.Time` 全方言改 BIGINT epoch 秒（PG 原为 TIMESTAMPTZ，存量 PG 表需迁移列类型）**；`WhereEntQL` 支持 `has/not_has(edge)`；Privacy 按操作（OnCreate/OnQuery…）生效。 |
+| **v0.28 JSON 所有权统一** | 查询/预加载路径的 JSON 解析进 per-entity arena，由 `deinitEntity` 释放；调用方不要再自行 free scan 出的 JSON。 |
 | **查询超时控制 (`withTimeout`)** | zent v0.13+ 支持 `client.product.Query().withTimeout(2000)`，通过 `ExecutionContext` 在底层 SQL 驱动触发超时下发（Postgres `statement_timeout` / MySQL `MAX_EXECUTION_TIME` / SQLite `deadline`），有效防止 ZigModu 异步 Fiber 场景下的长查询阻塞。 |
 | **MySQL 原生 Upsert** | `SaveOrUpdate` 升级为生成 `INSERT ... ON DUPLICATE KEY UPDATE` 原生 DDL，保持主键与关联子行原子更新。 |
 | **`deinitEntity` 可变指针** | `&entity` 统一清理内存 |

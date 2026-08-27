@@ -125,6 +125,8 @@ pub const HttpClient = struct {
             if (conn.isAlive()) {
                 var released_conn = conn;
                 released_conn.last_used = Time.monotonicNowSeconds();
+                // Best-effort: OOM while pooling just drops the connection
+                // (same outcome as the dead-connection branch below).
                 self.idle_connections.append(self.allocator, released_conn) catch {};
             } else {
                 if (conn.stream) |stream| {

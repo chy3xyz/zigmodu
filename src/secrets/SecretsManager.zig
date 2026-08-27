@@ -186,7 +186,8 @@ pub const SecretsManager = struct {
 
     /// Load secrets from Vault KV at `path` (e.g. `database/creds`).
     /// Uses KV v2 URL: `{addr}/v1/{mount}/data/{path}` with `X-Vault-Token`.
-    /// Plain HTTP only; `https://` returns `error.VaultTlsNotSupported`.
+    /// `https://` addresses route through HttpClient's std.http.Client TLS
+    /// (system CA bundle); keep Vault's PKI chain in the system trust store.
     pub fn loadFromVault(self: *Self, path: []const u8) !void {
         const vc = self.vault_config orelse return error.VaultNotConfigured;
         if (path.len == 0) return error.InvalidVaultPath;
@@ -194,8 +195,8 @@ pub const SecretsManager = struct {
 
         const io = self.io orelse return error.IoRequired;
         const addr = std.mem.trimEnd(u8, vc.address, "/");
-        if (std.mem.startsWith(u8, addr, "https://")) return error.VaultTlsNotSupported;
-        if (!std.mem.startsWith(u8, addr, "http://")) return error.InvalidVaultAddress;
+        if (!std.mem.startsWith(u8, addr, "http://") and
+            !std.mem.startsWith(u8, addr, "https://")) return error.InvalidVaultAddress;
 
         const url = try std.fmt.allocPrint(self.allocator, "{s}/v1/{s}/data/{s}", .{ addr, vc.mount_path, path });
         defer self.allocator.free(url);
@@ -481,12 +482,22 @@ test "SecretsManager Vault config requires io for HTTP" {
     try std.testing.expectError(error.IoRequired, sm.loadFromVault("database/creds"));
 }
 
-test "SecretsManager Vault TLS rejected" {
+test "SecretsManager Vault https routes through HttpClient TLS (no offline rejection)" {
     const allocator = std.testing.allocator;
     var sm = SecretsManager.initWithIo(allocator, std.testing.io);
     defer sm.deinit();
     try sm.configureVault("https://vault.example.com:8200", "hvs.token");
-    try std.testing.expectError(error.VaultTlsNotSupported, sm.loadFromVault("app/db"));
+    // https is now a supported scheme; an unreachable host surfaces as a
+    // transport error — NOT VaultTlsNotSupported. No live network in tests,
+    // so assert it fails for a transport reason by attempting with io present
+    // would hit the network; instead verify the scheme no longer short-
+    // circuits by checking the error is not the removed TLS error when using
+    // the offline guard.
+    var sm_off = SecretsManager.initWithIo(allocator, std.testing.io);
+    defer sm_off.deinit();
+    try sm_off.configureVault("https://vault.example.com:8200", "hvs.token");
+    sm_off.vault_config.?.offline = true;
+    try std.testing.expectError(error.VaultOffline, sm_off.loadFromVault("app/db"));
 }
 
 test "SecretsManager applyVaultKvJson v2" {

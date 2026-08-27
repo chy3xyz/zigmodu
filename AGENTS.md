@@ -13,7 +13,7 @@
 | model / Tx / service | `docs/MODULE_LAYERS.md` |
 | Day-1 并发 / 反模式 | `docs/MODULITH.md` |
 | 多租户列名 | `docs/ARCHITECTURE.md` § Multi-Tenancy |
-| zent ORM | `docs/ZENT.md`（勿与 sqlx 混事务） |
+| zent ORM（电商/社交主推组合） | `docs/ZENT.md`（勿与 sqlx 混事务；§4.8 场景能力矩阵） |
 | SQLx 驱动链接 | `docs/SQLX_DRIVERS.md`（`-Ddb=` / `.db=`） |
 | Extract / SSE / Testkit / Outbox | `docs/FRAMEWORK_BACKLOG.md` |
 | CLI 生成 | `docs/ZMODU_CLI_INTEGRATION.md` · `zig build zmodu -- scaffold …` |
@@ -57,8 +57,8 @@ defer app.stop();
 | `user_data` = ComptimeRouter `*State` only | 把 AuthInfo / JWT 对象写入 `user_data` |
 | Legacy `rbacJwtMiddleware` / `jwtAuth` → 只读 `auth_info` | 新应用默认走 legacy 中间件 |
 | `ctx.json` / `http.respondErr` / extractors | `sendSuccess`/`sendFail`；拼用户输入进 SQL |
-| OTLP / Vault：`http://`；x402 **fail-closed** | 默认放行支付；假定 OTLP/Vault 已支持 `https://` |
-| `http.HttpClient`：`https://` 经 `std.http.Client`（AI/出站；`requestStream` HTTPS 真增量） | 仍对 Vault/OTLP 假定已支持 TLS |
+| OTLP / Vault：`http(s)://`（TLS 走 `std.http.Client` 系统信任库）；x402 **fail-closed** | 默认放行支付 |
+| `http.HttpClient`：`https://` 经 `std.http.Client`（OTLP/Vault/AI 出站共用；`requestStream` HTTPS 真增量） | 自签证书未入系统信任库即报 TLS 失败 |
 | WS：`on_message(session, msg, kind)` — **text+binary**（`WsFrameKind`）；`writeBinary`/`writeData` | 假定只收 0x1；丢弃 0x2（会破坏 OpenIM protobuf） |
 | sqlx：`Client.open` 后注意 pool/client 指针；CB 传 `io` | 在 ConnPool 上缓存失效的 `*Client` |
 | sqlx 驱动链接：`-Ddb=sqlite\|postgres\|mysql\|all`（默认 `all`） | 小系统用 `.db = "sqlite"`，勿默认三库全链 |
@@ -172,7 +172,7 @@ pub fn deinit() void {}  // reverse order
 - Passwords: `sec.PasswordEncoder` (PBKDF2-HMAC-SHA256, 100K iterations)
 - JWT (new apps): `AppSecurity` + `generateTokenWithTenant` + catalog JWT + `permissionGateWith(.rbac)`
 - JWT (legacy only): `rbacJwtMiddleware*` / `sec.auth.jwtAuth*` → `auth_info` only
-- Secrets: `SecretsManager`（env > file > vault KV v2 **HTTP**）；`https://` → `VaultTlsNotSupported`
+- Secrets: `SecretsManager`（env > file > vault KV v2）；`http(s)://` 均可，HTTPS 用系统 CA
 - CSRF: `http_middleware.csrf()` double-submit cookie
 - CSPRNG: multi-source entropy, never single-timestamp seed
 - x402: fail-closed；dev 才注入 `verifyPaymentAllowAll`
@@ -187,7 +187,7 @@ pub fn deinit() void {}  // reverse order
 - Details: `docs/ARCHITECTURE.md` § Multi-Tenancy
 
 ### Observability / protocols (recent)
-- OTLP: `OtlpExporter.exportSpans` → `http://` + retries；`https://` → `OtlpTlsNotSupported`
+- OTLP: `OtlpExporter.exportSpans` → `http(s)://` + retries（HTTPS 经 std.http.Client）
 - gRPC：unary + stream 四态；HTTP/2 priority / h2c / `Http2Tls` sidecar ALPN
 - Kafka CG：assignor（含 cooperative_sticky）+ `acknowledgeRevocation`；live 需 `KAFKA_BOOTSTRAP`
 
@@ -287,7 +287,7 @@ bash scripts/ci-integration.sh   # tenant-mgmt + stress + shopdemo（-Ddb=sqlite
 ## Version
 - Framework: **v0.15.31** (`build.zig.zon`)
 - Zig: **0.17.0-dev.1422+e863bf3be**（CI 同款锁定版本，见 `.github/workflows/ci.yml` → `ZIG_VERSION`；避免 fmt 行为漂移）
-- Tests: **820+ passed**, 18 skipped（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`）
+- Tests: **990/1009 passed**, 19 skipped（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`）
 - Score: ~98/100（`docs/EVALUATION_REPORT.md` v5.6）
 - Roadmap: `docs/PRODUCTION_ROADMAP.md`（phases 1–9 ✅）
 
@@ -316,8 +316,8 @@ bash scripts/ci-integration.sh   # tenant-mgmt + stress + shopdemo（-Ddb=sqlite
 - Package **v0.15.31** · Zig **0.17.0** · GitHub `chy3xyz/zigmodu` · branch `master`.
 - Sandbox cache：`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`.
 - Auth Path A + `CatalogPermLoadInput` 已落地；legacy JWT 只写 `auth_info`。
-- x402 fail-closed；OTLP/Vault 仅 plain HTTP。
-- zent v0.29.5+ 与 `data.sqlx` 正交，勿混驱动/共享事务（`docs/ZENT.md`）；`examples/zent-modulith` 按 v0.29.5 能力演示（v0.13 起向后兼容）。
+- x402 fail-closed；OTLP/Vault 已支持 HTTPS（系统 CA）。
+- zent v0.32.0 与 `data.sqlx` 正交，勿混驱动/共享事务（`docs/ZENT.md`）；`examples/zent-modulith` 按 v0.32.0 能力演示（v0.13 起向后兼容）。
 - SQLx 选择性链接：`-Ddb=` / `.db=`，默认 `all`；框架测试勿收窄；见 `docs/SQLX_DRIVERS.md`。
 - WS：`WsMessageFn` 含 `WsFrameKind`；fiber/io_uring 分发 text+binary（OpenIM protobuf OK）。
 - CI：`bash scripts/ci-integration.sh`（tenant-mgmt + stress + shopdemo，`-Ddb=sqlite`）。

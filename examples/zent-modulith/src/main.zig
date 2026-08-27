@@ -163,6 +163,10 @@ pub fn main(init: std.process.Init) !void {
     var summary_api = SummaryApiT.init(&env.client);
     const BatchApiT = features_demo.BatchApi(@TypeOf(product_crud));
     var batch_api = BatchApiT.init(&product_crud);
+    const UpsertApiT = features_demo.UpsertApi(@TypeOf(env.client));
+    var upsert_api = UpsertApiT.init(&env.client);
+    const FeedModernApiT = features_demo.FeedModernApi(@TypeOf(env.client));
+    var feed_modern_api = FeedModernApiT.init(&env.client);
     const OrderApiT = tx_demo.OrderApi(@TypeOf(env.client));
     var order_api = OrderApiT.init(&env.client);
     const AccountApiT = tx_demo.AccountApi(@TypeOf(env.client));
@@ -245,7 +249,7 @@ pub fn main(init: std.process.Init) !void {
     defer catalog_slot.deinit();
     try server.addMiddleware(zigmodu.http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
 
-    comptime zigmodu.http.assertNoDupes(.{ CatalogApiT, ProductApiT, OutboxApiT, DocApiT, InventoryApiT, FeedApiT, SummaryApiT, BatchApiT, OrderApiT, AccountApiT });
+    comptime zigmodu.http.assertNoDupes(.{ CatalogApiT, ProductApiT, OutboxApiT, DocApiT, InventoryApiT, FeedApiT, SummaryApiT, BatchApiT, UpsertApiT, FeedModernApiT, OrderApiT, AccountApiT });
 
     const AppState = struct {};
     var app_state: AppState = .{};
@@ -262,6 +266,8 @@ pub fn main(init: std.process.Init) !void {
         .{ .Mod = FeedApiT, .state = &feed_api },
         .{ .Mod = SummaryApiT, .state = &summary_api },
         .{ .Mod = BatchApiT, .state = &batch_api },
+        .{ .Mod = UpsertApiT, .state = &upsert_api },
+        .{ .Mod = FeedModernApiT, .state = &feed_modern_api },
         .{ .Mod = OrderApiT, .state = &order_api },
         .{ .Mod = AccountApiT, .state = &account_api },
     });
@@ -306,6 +312,8 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("[main] POST /api/v1/accounts?name=&api_key= (uuidv7 id)", .{});
     std.log.info("[main] GET  /api/v1/accounts/<uuid> (toMaskedJson)", .{});
     std.log.info("[main] GET  /api/v1/events (SSE)", .{});
+    std.log.info("[main] PUT  /api/v1/sku-stock (v0.30 SaveOrUpdateOn upsert + v0.31 field.Decimal)", .{});
+    std.log.info("[main] GET  /api/v1/feed2/authors-with-posts (v0.31 WithEdgeOptions inner join, arena copies)", .{});
     std.log.info("[main] OpenAPI: http://127.0.0.1:{d}/openapi.json", .{port});
     try server.start();
 }

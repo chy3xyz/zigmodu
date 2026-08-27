@@ -85,10 +85,9 @@ pub const OtlpExporter = struct {
     }
 
     pub fn postJsonWithRetry(self: *Self, io: std.Io, json: []const u8, opts: ExportOptions) !void {
-        if (std.mem.startsWith(u8, self.endpoint_url, "https://")) {
-            return error.OtlpTlsNotSupported;
-        }
-        if (!std.mem.startsWith(u8, self.endpoint_url, "http://")) {
+        if (!std.mem.startsWith(u8, self.endpoint_url, "http://") and
+            !std.mem.startsWith(u8, self.endpoint_url, "https://"))
+        {
             return error.InvalidOtlpEndpoint;
         }
 
@@ -158,11 +157,19 @@ test "OtlpExporter isRetryableStatus" {
     try std.testing.expect(!OtlpExporter.isRetryableStatus(400));
 }
 
-test "OtlpExporter rejects https endpoint" {
+test "OtlpExporter accepts https endpoint (routes via HttpClient TLS)" {
     const allocator = std.testing.allocator;
     var exporter = try OtlpExporter.init(allocator, "svc", "https://collector.example/v1/traces");
     defer exporter.deinit();
-    try std.testing.expectError(error.OtlpTlsNotSupported, exporter.postJsonWithRetry(std.testing.io, "{}", .{}));
+    // No live network in unit tests: an unreachable collector surfaces as a
+    // transport error, NOT OtlpTlsNotSupported — https is now a supported
+    // scheme routed through std.http.Client.
+    if (exporter.postJsonWithRetry(std.testing.io, "{}", .{ .max_retries = 0 })) |_| {
+        return error.ExpectedFailure;
+    } else |err| {
+        try std.testing.expect(err != error.OtlpTlsNotSupported);
+        try std.testing.expect(err != error.InvalidOtlpEndpoint);
+    }
 }
 
 test "OtlpExporter live HTTP export" {

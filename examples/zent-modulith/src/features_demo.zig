@@ -1,10 +1,16 @@
-//! Commerce + social demos for zent v0.21-v0.26:
+//! Commerce + social demos for zent v0.21-v0.32:
 //!   - atomic expression updates (`setExprArgs`, oversell-safe stock
 //!     decrement) and two-level nested eager loading (`WithEdge`);
 //!   - edge filtering (`WhereRaw`) + per-parent order/limit;
 //!   - composite keyset pagination (`CursorKeyset`) that survives ties;
 //!   - bulk soft delete (`BulkDelete` + chunk-safe `IN`);
 //!   - column projection (`Select`) and batch insert (`insertMany`).
+//! v0.31/v0.32 additions (see `UpsertApi` / `FeedModernApi`):
+//!   - inner-join eager loading (`WithEdgeOptions`) without limit skew;
+//!   - business-key upsert (`SaveOrUpdateOn`) — payment-retry safe;
+//!   - exact money columns (`field.Decimal`) scanned as owned text;
+//!   - runtime interceptor (`UseInterceptor`) injecting tenant_id;
+//!   - request-scoped entity teardown (`managedEntity`/`dupeEntityTo`).
 
 const std = @import("std");
 const zigmodu = @import("zigmodu");
@@ -310,6 +316,7 @@ pub fn BatchApi(comptime Crud: type) type {
                     .tenant_id = it.tenant_id,
                     .name = it.name,
                     .price_cents = it.price_cents,
+                    .price = "",
                     .description = null,
                     .created_by = null,
                     .updated_by = null,
@@ -319,6 +326,113 @@ pub fn BatchApi(comptime Crud: type) type {
             var ids = self.crud.insertMany(entities.items) catch |err| return http.respondErr(ctx, err);
             defer ids.deinit();
             try ctx.jsonStruct(201, .{ .ids = ids.items });
+        }
+    };
+}
+
+/// UpsertApi: PUT /api/v1/sku-stock — business-key upsert (v0.30) on the
+/// `sku` unique column plus an exact-money `field.Decimal` price column
+/// (v0.31). Payment-callback / delivery-retry safe: replaying the same
+/// request updates instead of duplicating.
+pub fn UpsertApi(comptime Client: type) type {
+    return struct {
+        const Self = @This();
+
+        client: *Client,
+
+        pub const module_name = "catalog";
+        pub const nest = .{"sku-stock"};
+        pub const State = Self;
+
+        pub fn init(client: *Client) Self {
+            return .{ .client = client };
+        }
+
+        const UpsertBody = struct {
+            sku: []const u8,
+            stock: i64,
+            price: []const u8, // exact decimal text, e.g. "19.99"
+        };
+
+        pub const routes = [_]http.RouteSpec(State){
+            .{ .method = .PUT, .path = "", .handler = upsert, .meta = .{ .auth = .public } },
+            .{ .method = .GET, .path = "{sku}", .handler = get, .meta = .{ .auth = .public } },
+        };
+
+        fn upsert(ctx: *http.Context, self: *State) !void {
+            const body = ctx.bindJson(UpsertBody) catch return ctx.json(400, "{\"error\":\"invalid body\"}");
+            var b = try self.client.sku_stock.Create();
+            defer b.deinit();
+            _ = try b.setFieldValue("sku", body.sku);
+            _ = try b.setFieldValue("stock", body.stock);
+            _ = try b.setFieldValue("price", body.price);
+            // Conflict on the `sku` business key → update stock/price in place
+            // (PG/SQLite ON CONFLICT (sku) DO UPDATE; MySQL ODKU).
+            var row = b.SaveOrUpdateOn(&.{"sku"}) catch |err| return http.respondErr(ctx, err);
+            defer zent.codegen.deinitEntity(persist.infos, persist.SkuStockInfo, &row, self.client.allocator);
+            try ctx.jsonStruct(200, .{ .sku = body.sku, .stock = row.stock, .price = row.price });
+        }
+
+        fn get(ctx: *http.Context, self: *State) !void {
+            const sku = try ctx.paramStr("sku");
+            var q = self.client.sku_stock.Query();
+            defer q.deinit();
+            _ = try q.Where(.{self.client.sku_stock.predicates.skuEQ(.{ .string = sku })});
+            // managedEntity (v0.31): teardown can't pick the wrong allocator.
+            var m = zent.codegen.managedEntity(persist.infos, persist.SkuStockInfo, (try q.First()) orelse return http.respondErr(ctx, error.NotFound), self.client.allocator);
+            defer m.deinit();
+            try ctx.json(200, try zent.codegen.toMaskedJson(ctx.allocator, persist.infos, persist.SkuStockInfo, m.entity));
+        }
+    };
+}
+
+/// FeedModernApi: GET /api/v1/feed2 — v0.31/32 idioms over the same data:
+///   - `WithEdgeOptions(.inner)` — only authors having posts survive the
+///     parent query; SQL LIMIT applies after the edge filter (no limit skew);
+///   - entities are deep-copied into a per-request arena via
+///     `dupeEntityTo` and released in one `arena.deinit()` — no per-item
+///     `deinitEntity` bookkeeping in the handler.
+pub fn FeedModernApi(comptime Client: type) type {
+    return struct {
+        const Self = @This();
+
+        client: *Client,
+
+        pub const module_name = "catalog";
+        pub const nest = .{"feed2"};
+        pub const State = Self;
+
+        pub fn init(client: *Client) Self {
+            return .{ .client = client };
+        }
+
+        pub const routes = [_]http.RouteSpec(State){
+            .{ .method = .GET, .path = "authors-with-posts", .handler = authorsWithPosts, .meta = .{ .auth = .public } },
+        };
+
+        fn authorsWithPosts(ctx: *http.Context, self: *State) !void {
+            // Request arena: everything the handler allocates (including the
+            // deep-copied entity graph) dies here.
+            var arena_state = std.heap.ArenaAllocator.init(self.client.allocator);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+
+            var q = self.client.author.Query();
+            defer q.deinit();
+            _ = try q.WithEdgeOptions("posts", .{ .join = .inner, .limit_mode = .after_edges });
+            const rows = try q.All();
+            defer rows.deinit(); // originals still owned by their allocator
+
+            // Copy each author (strings + typed fields + one edge level) into
+            // the arena so serialization borrows nothing after rows.deinit().
+            const copies = try arena.alloc(zent.codegen.entity(persist.infos, persist.AuthorInfo), rows.items.len);
+            for (rows.items, 0..) |*a, i| {
+                copies[i] = try zent.codegen.dupeEntityTo(persist.infos, persist.AuthorInfo, a, arena);
+            }
+
+            const arr = try maskedArrayJson(arena, persist.infos, persist.AuthorInfo, copies);
+            const body = try std.fmt.allocPrint(arena, "{{\"authors\":{s}}}", .{arr});
+            try ctx.json(200, body);
         }
     };
 }

@@ -5,6 +5,85 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **sqlx 读写分离（read/write splitting）**：`Client.withReplica(&replica)`
+  注册只读副本——`query`/`queryCursor` 及其派生（queryRow/queryRows/
+  findOne 等）路由到副本，`exec`/`beginTx`/batch 写入恒走主库；副本读失败
+  自动回退主库（降级为单主模式而非报错），副本自身的熔断器打开时直接用
+  主库。附路由正确性与故障回退两组回归测试。
+- **HTTP header 数量/总字节上限（header 炸弹 DoS 防护）**：
+  `Server.Config.header_limits`（默认 100 个 header / 16KB 总量），超限返回
+  `error.TooManyHeaders` → HTTP 431。此前 body 有 `max_body_size` 但 header
+  无上限，攻击者可发大量合法小 header 耗尽请求 arena。
+
+### Fixed
+- **`zmodu` CLI 缺 `link_libc`**：`build.zig` 里 zmodu 模块未设
+  `link_libc = true`，Zig 0.17-dev.813 起 `@cImport` 不再隐式链接 libc，
+  依赖方（如 zent CI）需打补丁兜底。现已与框架主模块一致显式链接。
+- **Cron scheduler `deinit` 潜在 UB**：mutex lock 失败被吞后继续 unlock
+  （futex 后端下 unlock 未锁住的 mutex 是未定义行为）——现在 lock 失败时
+  记录错误并跳过配对 unlock 与任务清理。
+- WebSocket：pong 发送失败静默吞噬 → debug 日志（对端会由下次心跳暴露）；
+  升级拒绝路径补 best-effort 注释。HttpClient 连接池回收路径同注释化。
+- **`ComptimeRouter.wrapHandler` 双重缺陷**：`handler` 改为 comptime 参数并移除
+  共享的容器级 `var Store`——旧实现里同一 `State` 的所有 wrapper 共享一个
+  `Store.fn_ptr`（后写覆盖），`openApiRoutes` 的 `openapi.json`/`docs`/`scalar`
+  三条路由会串台到最后注册的 handler；且在 `pub const routes` 等 comptime
+  上下文中触发 `unable to evaluate comptime expression`。
+  `openApiFromCatalog` 的运行时状态同步提升为容器级 `OpenApiRouteStore`
+  （单 catalog 契约已注释声明），公共 API 签名不变。新增独立派发回归测试。
+- **`zmodu orm --backend zent` 外键解析两处 bug**：表级
+  `FOREIGN KEY (col) REFERENCES …` 的列名被截成 `col)`（右括号未剥）并再次被
+  内联扫描重复抓取；内联 `col TYPE NOT NULL REFERENCES …` 回溯只吃一个类型词、
+  把修饰词误当列名。修复：第二遍跳过 `)` 结尾的表级引用，回溯改为抓到行首/
+  逗号后按「修饰词剥离 + 类型词丢弃」取列名。**同时新增外键 → edge 声明生成**
+  （`edge.From("<name>", Ref).Field("col")`），两种 FK 书写形式均验证通过。
+
+### Changed
+- **OTLP / Vault 支持 HTTPS**（此前文档口径「待 stdlib」实际是滞后）：
+  `OtlpExporter.exportSpans` 与 `SecretsManager.loadFromVault` 复用
+  HttpClient 的 `std.http.Client` TLS 1.3 通道（系统 CA 信任库），
+  移除 `OtlpTlsNotSupported` / `VaultTlsNotSupported` 短路；https 端点
+  现在直达，证书链需入系统信任库。AGENTS 文档口径同步。
+- **WebSocket 显式 `max_frame_size`**：`WebSocketServer.max_frame_size`
+  （默认 4096）+ `setMaxFrameSize`，帧读取 buffer 按该值动态分配，替换原先
+  隐含在 4KB 栈缓冲里的硬上限。
+- **zent 升级 v0.29.8 → v0.32.0**（纯新增版本，零 breaking 验证）：
+  `examples/zent-modulith` zon 锁定 `git+https#v0.32.0`
+  （hash `zent-0.32.0-oiur-4vYDwDyEvLh_lnPwxRmJdXAc5920URMil2NQatJ`），
+  `examples/shopdemo-zent` 按本地 sibling v0.32.0 构建通过；新增能力可用：
+  `SaveOrUpdateOn`/`SaveIgnore` upsert、`Row.tryGet*`、`field.Decimal`（精确
+  金额列）、`WithEdgeOptions` inner-join eager loading、`beginTxFromDriver`、
+  `managedEntity`/`dupeEntityTo` allocator 安全 teardown、v0.32 Interceptor
+  运行时查询拦截、PreparedCache 字节级 key 比对（hash 碰撞修复）。
+- **`zmodu orm --backend zent` 模板修复**（生成代码此前无法编译）：
+  `client.zig` 返回类型改为泛型实例化 `zent.codegen.client.Client(infos)` 并
+  导出 `pub const infos/Client`；schema 体改 `pub const` 并由 client 经
+  `schemas.*` 引用；移除 zent 已不存在的 `.Required()` 链式调用（字段默认
+  NOT NULL，nullable 列才 `.Optional()`）；`.Default` 按列类型发零值字面量
+  （Int→`0`，旧 `""` 在 PG 上是非法 DDL）；zent 版 `module.zig` barrel 改为
+  导出实际生成的 `schema`/`client`。生成结果已对 zent v0.32.0 实测编译通过。
+
+### Documentation
+- **`docs/ZENT.md` 升级为电商/社交主推组合指南**（版本口径 v0.32.0）：顶部新增
+  主推定位；§2 决策表电商/社交默认 zent；新增 §4.8「电商 / 社交主推能力矩阵
+  （v0.30–v0.32）」（`field.Decimal` 精确金额、`SaveOrUpdateOn`/`SaveIgnore`
+  业务键幂等、`WithEdgeOptions(.inner)` 防 limit skew、`beginTxFromDriver`
+  池上事务、`ManagedEntity`/`dupeEntityTo` 请求级 arena、`SelectExpr` 聚合
+  DTO、`Row.tryGet*` NULL 安全）；§14 升级表补 v0.28–v0.31（含 ⚠️ v0.29
+  `field.Time` 全方言改 BIGINT epoch 的 PG 存量表迁移提醒）。README /
+  README.zh / docs/README / AGENTS 文档地图同步主推标注。
+- `examples/zent-modulith` 新增 v0.30–v0.32 能力演示端点：`PUT /api/v1/sku-stock`
+  （业务键 upsert + Decimal）、`GET /api/v1/feed2/authors-with-posts`
+  （inner-join eager load + arena 深拷贝），并已在文档中注明 Interceptor
+  接入位置。
+- **文档基线校准**：`AGENTS.md` 测试计数 820→990/1009（19 skipped）、
+  `docs/EVALUATION_REPORT.md` 与 `docs/PRODUCTION_ROADMAP.md` 版本口径/结论
+  统一到 v0.15.32；`scripts/release.sh` 版本校验与 bump 范围扩到这两个
+  长期被漏掉的文件。
+
 ## [0.15.31] - 2026-08-26
 
 ### Added

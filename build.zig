@@ -155,6 +155,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tools/zmodu/src/main.zig"),
         .target = target,
         .optimize = optimize,
+        // Zig 0.17-dev.813: @cImport no longer implicitly links libc. The
+        // CLI exercises sqlite/process paths, so it needs the same explicit
+        // link as the framework module.
+        .link_libc = true,
     });
     zmodu_cli_mod.addImport("build_options", build_options_mod);
     const zmodu_cli_exe = b.addExecutable(.{

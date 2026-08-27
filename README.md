@@ -15,7 +15,7 @@ A modular application framework for Zig 0.17, inspired by Spring Modulith. Build
 | [Quick Start](docs/QUICK-START.md) | Get started in 5 minutes |
 | [Modulith 高并发](docs/MODULITH.md) | Day-one modulith + high-concurrency practices |
 | [Declarative Routes](docs/ROUTE_TABLE.md) | ComptimeRouter + catalog JWT/RBAC |
-| [ZigModu × zent](docs/ZENT.md) | Orthogonal zent ORM integration practices |
+| [ZigModu × zent](docs/ZENT.md) | **电商/社交主推组合**：zent ORM 集成最佳实践 |
 | [Best Practices](docs/BEST_PRACTICES.md) | Architecture evolution + JWT checklist |
 | [API Reference](docs/API.md) | Detailed API documentation |
 | [Architecture](docs/ARCHITECTURE.md) | System design and patterns |

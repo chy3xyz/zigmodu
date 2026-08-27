@@ -140,10 +140,19 @@ pub const Scheduler = struct {
 
     pub fn deinit(self: *Scheduler) void {
         self.stop();
-        self.mutex.lock(self.io) catch {};
-        for (self.jobs.items) |job| self.allocator.free(job.name);
-        self.jobs.deinit(self.allocator);
-        self.mutex.unlock(self.io);
+        // Lock failure here means the mutex is corrupted or the io is gone;
+        // unlocking an unlocked mutex is UB in the futex backend, so record
+        // and skip the paired unlock (and cleanup) in that case.
+        var locked = true;
+        self.mutex.lock(self.io) catch {
+            locked = false;
+            std.log.err("[cron] scheduler deinit: mutex lock failed; skipping job cleanup", .{});
+        };
+        if (locked) {
+            for (self.jobs.items) |job| self.allocator.free(job.name);
+            self.jobs.deinit(self.allocator);
+            self.mutex.unlock(self.io);
+        }
         self.* = undefined;
     }
 
