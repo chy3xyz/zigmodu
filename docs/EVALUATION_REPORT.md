@@ -1,7 +1,7 @@
 # ZigModu 生产级评估报告 v5
 
 **评估日期**: 2026-08-27  
-**框架版本**: v0.15.32  
+**框架版本**: v0.15.33  
 
 **Zig 版本**: 0.17.0  
 **测试结果**: **990/1009 passed, 19 skipped, 0 failed**（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`，2026-08-27 复测）  
@@ -72,7 +72,7 @@
 
 ## 结论
 
-ZigModu **v0.15.32** 在 Zig 0.17 上约 **98/100**。短请求本机场景优先 HTTP/1.1；h2c/gRPC 适合多路复用与流式。TLS 生产路径用 sidecar ALPN，OTLP/Vault 出站 HTTPS 经系统 CA。
+ZigModu **v0.15.33** 在 Zig 0.17 上约 **98/100**。短请求本机场景优先 HTTP/1.1；h2c/gRPC 适合多路复用与流式。TLS 生产路径用 sidecar ALPN，OTLP/Vault 出站 HTTPS 经系统 CA。
 
 **推荐路径**：`examples/basic` → `examples/tenant-mgmt` → `shopdemo` / `zent-modulith`。
 
