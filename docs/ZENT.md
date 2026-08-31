@@ -1,7 +1,7 @@
 # ZigModu × zent 最佳实践
 
 **zent**: [chy3xyz/zent](https://github.com/chy3xyz/zent) — Zig 版 [ent](https://entgo.io/)（schema-as-code ORM）  
-**版本口径**: zent **v0.32.1**（示例与本文按最新发布 v0.32.0 演示；最低兼容 v0.13 起）· ZigModu **v0.15.22+** · Zig **≥ 0.17**  
+**版本口径**: zent **v0.32.2**（示例与本文按最新发布 v0.32.0 演示；最低兼容 v0.13 起）· ZigModu **v0.15.22+** · Zig **≥ 0.17**  
 **主推组合**: **电商 / 社交类项目默认选 ZigModu + zent**（见 §2 决策表与 §4.8 场景能力矩阵）；只有存量 SQL 繁重、报表主导或 DBA 强管控的项目才默认 sqlx。
 
 **参考实现**: [`examples/zent-modulith/`](../examples/zent-modulith/)  
@@ -520,7 +520,7 @@ exe_mod.addImport("zent", zent_dep.module("zent"));
 
 ```zon
 .zent = .{
-    .url = "https://github.com/chy3xyz/zent/archive/refs/tags/v0.32.1.tar.gz",
+    .url = "https://github.com/chy3xyz/zent/archive/refs/tags/v0.32.2.tar.gz",
     .hash = "<zig fetch 后填入>",
 },
 ```

@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **zent 升级 v0.32.1 → v0.32.2**（纯修复，零 breaking）：v0.32.2 修复连接池
+  use-after-free（`swapRemove` 移动尾元素导致借出指针被污染，空闲驱逐后
+  health-check 段错误）、MySQL 非整数主键 upsert（字符串/UUID PK 回退
+  `VALUES(pk)` 而非 `LAST_INSERT_ID`）、多线程池测试改用线程安全 allocator。
+  `examples/zent-modulith` zon 锁定 `git+https#v0.32.2`（hash
+  `zent-0.32.2-oiur-xP7DwCyv9mm_lt74G6jR5qmlJYBW6hGBJ3bkXUv`），文档版本口径同步。
+
 ## [0.15.33] - 2026-08-31
 
 ### Fixed
