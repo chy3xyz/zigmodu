@@ -100,7 +100,14 @@ pub const WebSocketServer = struct {
                     }
                     continue;
                 };
-                self.fiber_group.async(self.io, handleConnection, .{ self, conn });
+                // `concurrent` (not `async`): handleConnection is a blocking
+                // read loop — `async`'s eager fallback at async_limit would
+                // run it on the accept thread and freeze accept forever.
+                self.fiber_group.concurrent(self.io, handleConnection, .{ self, conn }) catch |err| {
+                    std.log.warn("[WebSocketServer] connection rejected (concurrent limit): {}", .{err});
+                    conn.close(self.io);
+                    continue;
+                };
             }
         }
     }

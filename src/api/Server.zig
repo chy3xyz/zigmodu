@@ -1814,7 +1814,24 @@ pub const Server = struct {
                 continue;
             };
 
-            self.conn_group.async(self.io, connFiber, .{ self, stream, self.allocator });
+            // Use `concurrent`, NOT `async`, to dispatch the connection fiber.
+            //
+            // `Group.async` has backpressure semantics: when `busy_count`
+            // reaches `async_limit` (default cpu_count-1) it falls back to
+            // `groupAsyncEager` — running connFiber synchronously on *this*
+            // (accept-loop) thread. connFiber is a keep-alive read loop that
+            // blocks on `readv` until the peer sends the next request, so a
+            // single idle keep-alive client could then occupy the accept
+            // thread forever and freeze the whole server (accept stops, every
+            // new connection times out). `concurrent` has a `concurrent_limit`
+            // (default `.unlimited`) and never falls back to eager execution:
+            // at the limit it returns an error we can reject the connection
+            // with, instead of hijacking the accept loop.
+            self.conn_group.concurrent(self.io, connFiber, .{ self, stream, self.allocator }) catch |err| {
+                std.log.warn("[Server] connection rejected (concurrent limit): {}", .{err});
+                stream.close(self.io);
+                continue;
+            };
         }
     }
 

@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **accept 循环被 keep-alive 连接卡死（服务器整体停止 accept 的挂死）**：
+  `Server.start` 原先用 `conn_group.async` 派发 connFiber。`std.Io.Threaded`
+  的 `groupAsync` 在 `busy_count >= async_limit`（默认 cpu_count-1）时回退为
+  `groupAsyncEager`——在 accept 线程上同步执行 connFiber。connFiber 是
+  keep-alive 读循环，客户端挂机不发下一请求时永久阻塞在 `readv`，accept
+  循环从此被占死、对所有新连接静默。修复：改用 `conn_group.concurrent`
+  （默认 `concurrent_limit = .unlimited`，**不会 eager 回退**，超限时返回
+  错误而非劫持调用线程）；超限时拒绝该连接并继续 accept。同类隐患一并修复：
+  `WebSocket.zig` / `DistributedEventBus.zig` 的 accept 循环派发
+  handleConnection 同样由 `async` 改为 `concurrent`。
+
+### Changed
+- **zent 升级 v0.32.0 → v0.32.1**（纯新增 + CI 修复，零 breaking）：v0.32.1
+  新增 interceptor 多租户查询改写示例与 eager/upsert 基准，并修复四个既有
+  CI 失败；已 pin zigmodu v0.15.32 并移除其 libc 补丁。`examples/zent-modulith`
+  zon 锁定 `git+https#v0.32.1`（hash `zent-0.32.1-oiur-3jiDwAri-…`），
+  文档版本口径同步 v0.32.1。
+
 ## [0.15.32] - 2026-08-27
 
 ### Added

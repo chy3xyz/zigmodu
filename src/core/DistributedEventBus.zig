@@ -153,8 +153,15 @@ pub const DistributedEventBus = struct {
                     continue;
                 };
 
-                // Handle connection asynchronously in the shared group.
-                self.fiber_group.async(self.io, handleConnection, .{ self, conn });
+                // Handle connection in the shared group. Use `concurrent` (not
+                // `async`): handleConnection blocks on peer reads, and `async`'s
+                // eager fallback at async_limit would run it on the accept
+                // thread and freeze the accept loop.
+                self.fiber_group.concurrent(self.io, handleConnection, .{ self, conn }) catch |err| {
+                    std.log.warn("[DistributedEventBus] connection rejected (concurrent limit): {}", .{err});
+                    conn.close(self.io);
+                    continue;
+                };
             }
         }
     }
