@@ -88,7 +88,7 @@ pub fn deinit() void {}
 | 场景 | 方式 | 说明 |
 |------|------|------|
 | 同事务、强一致 | service 编排 + 依赖模块 **`persistence.Tx`** | 例如下单预留库存；见 [MODULE_LAYERS.md](MODULE_LAYERS.md) |
-| 跨域副作用 | **EventBus** / Outbox | 例如 `OrderCreated` → 发邮件、积分 |
+| 跨域副作用 | **EventBus** / Outbox | 例如 `OrderCreated` → 发邮件、积分；接线规则见 [EVENTS_DI.md](EVENTS_DI.md) |
 | 跨实例异步 | **RobustMQ**（Kafka wire） | 见 [DISTRIBUTED.md](DISTRIBUTED.md) |
 
 禁止：业务模块互相 `import` 对方的非 Tx persistence 做随意读写；禁止 handler 里写 SQL。同事务工作流可 import 兄弟模块的 **`persistence.Tx`（仅 SQL）**。
@@ -146,6 +146,7 @@ pub fn main() !void {
 
     // 基础设施在 main / foundation 注入，业务模块只拿接口
     // try wireDb(&app); try wireRedis(&app); try registerRoutes(...);
+    // 共享服务/事件总线：builder.withService + 模块 initWith(ctx)，见 docs/EVENTS_DI.md
 
     try app.start();
     defer app.stop();

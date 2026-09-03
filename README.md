@@ -14,6 +14,7 @@ A modular application framework for Zig 0.17, inspired by Spring Modulith. Build
 | [**AGENTS.md**](AGENTS.md) | **AI agent handbook** (DO/DON'T, Path A auth, ComptimeRouter) |
 | [Quick Start](docs/QUICK-START.md) | Get started in 5 minutes |
 | [Modulith 高并发](docs/MODULITH.md) | Day-one modulith + high-concurrency practices |
+| [Events & DI](docs/EVENTS_DI.md) | `initWith(ctx)` + `app.eventBus` + container freeze |
 | [Declarative Routes](docs/ROUTE_TABLE.md) | ComptimeRouter + catalog JWT/RBAC |
 | [ZigModu × zent](docs/ZENT.md) | **电商/社交主推组合**：zent ORM 集成最佳实践 |
 | [Best Practices](docs/BEST_PRACTICES.md) | Architecture evolution + JWT checklist |
@@ -27,9 +28,9 @@ A modular application framework for Zig 0.17, inspired by Spring Modulith. Build
 
 ### Core Framework
 - **Module System** — Declarative module definition with compile-time dependency validation
-- **Lifecycle Management** — Automatic init/deinit orchestration in dependency order
-- **Dependency Injection** — Type-safe container with compile-time hash checking (CRC32)
-- **Event System** — TypedEventBus + DistributedEventBus + TransactionalEvent + Outbox pattern
+- **Lifecycle Management** — Automatic init/deinit orchestration in dependency order; modules opt into framework facilities via `initWith(ctx)`
+- **Dependency Injection** — Type-safe container built into `Application`: register at startup (`withService` / `registerBorrowed`), frozen after `start()`, lock-free reads thereafter
+- **Event System** — Application-wide `EventRegistry` hands out thread-safe per-type buses (`app.eventBus(T)`); plus TypedEventBus, TransactionalEvent + Outbox pattern
 - **Application Builder** — Fluent API with shutdown hooks and graceful termination
 
 ### HTTP & API
@@ -44,7 +45,7 @@ A modular application framework for Zig 0.17, inspired by Spring Modulith. Build
 - **Rate Limiter** — Token bucket with per-client overrides
 - **Retry Policy** — Exponential backoff with configurable jitter
 - **Load Shedder** — Adaptive concurrency limiting
-- **Saga Orchestrator** — Automatic compensation with reverse-order rollback + step logging
+- **Saga Orchestrator** ⚠️ — Automatic compensation with reverse-order rollback + step logging (experimental)
 
 ### Data & Persistence
 - **SQLx** — PostgreSQL / MySQL / SQLite with connection pooling + circuit breaker
@@ -55,7 +56,7 @@ A modular application framework for Zig 0.17, inspired by Spring Modulith. Build
 - **Connection Pool** — Generic resource pool with health checking
 
 ### Distributed Systems
-- **DistributedEventBus** — Cross-node event pub/sub with heartbeat
+- **DistributedEventBus** ⚠️ — Cross-node event pub/sub with heartbeat (experimental)
 - **ClusterMembership** ⚠️ — Gossip-based node discovery + health check (experimental)
 - **DistributedTransaction** ⚠️ — 2PC + Saga patterns (experimental, needs persistence)
 - **Kafka Connector** — Producer/Consumer with topic stats + EventBridge
@@ -152,7 +153,7 @@ Disabled drivers → C stubs; runtime `error.DriverNotEnabled` (HTTP 400). Full 
 
 ```bash
 # Install the pinned Zig toolchain (CI uses the exact same dev build)
-# zigup 0.17.0-dev.1422+e863bf3be   (see .github/workflows/ci.yml → ZIG_VERSION)
+# zigup 0.17.0-dev.1567+f0354179a   (see .github/workflows/ci.yml → ZIG_VERSION)
 brew install zig          # macOS (or zigup / mlugg/setup-zig in CI)
 ```
 
@@ -202,6 +203,29 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("Application started!", .{});
 }
 ```
+
+### Events & DI (Application built-in)
+
+```zig
+// Module opts into framework facilities via initWith(ctx):
+pub fn initWith(ctx: *zmodu.ModuleContext) !void {
+    const bus = try ctx.eventBus(OrderEvent);            // shared thread-safe bus
+    const cfg = ctx.service(AppConfig, "config") orelse
+        return error.MissingService;                     // fail fast at startup
+    _ = bus; _ = cfg;
+}
+
+// main wires shared services; container freezes after start():
+var app = try zmodu.builder(allocator, io)
+    .withService(AppConfig, "config", &config)           // borrowed: not destroyed by container
+    .build(.{OrderModule});
+try app.start();                                          // initWith runs → services frozen
+
+const bus = try app.eventBus(OrderEvent);                // ThreadSafeEventBus only
+try bus.subscribe(auditListener);
+```
+
+Full rules and anti-patterns: [docs/EVENTS_DI.md](docs/EVENTS_DI.md) · runnable wiring: `examples/shopdemo`.
 
 ### Quick HTTP Server
 
@@ -256,6 +280,8 @@ zigmodu/
 │   │   ├── ModuleValidator.zig        # Dependency validation
 │   │   ├── ModuleInteractionVerifier.zig  # Interaction model verification
 │   │   ├── EventBus.zig               # Type-safe event bus
+│   │   ├── EventRegistry.zig          # Per-type shared buses (thread-safe only)
+│   │   ├── ModuleContext.zig          # Startup context: events + services + io
 │   │   ├── DistributedEventBus.zig    # Cross-node event bus
 │   │   ├── Lifecycle.zig              # startAll/stopAll
 │   │   ├── Time.zig                   # Monotonic time utility

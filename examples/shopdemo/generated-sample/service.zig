@@ -8,13 +8,13 @@ const persistence = @import("persistence.zig");
 
 pub const OrderService = struct {
     persistence: *persistence.OrderPersistence,
-    event_bus: ?*zigmodu.TypedEventBus(OrderEvent) = null,
+    event_bus: ?*zigmodu.ThreadSafeEventBus(OrderEvent) = null,
 
     pub fn init(p: *persistence.OrderPersistence) OrderService {
         return .{ .persistence = p };
     }
 
-    pub fn withEvents(self: *OrderService, bus: *zigmodu.TypedEventBus(OrderEvent)) void {
+    pub fn withEvents(self: *OrderService, bus: *zigmodu.ThreadSafeEventBus(OrderEvent)) void {
         self.event_bus = bus;
     }
 

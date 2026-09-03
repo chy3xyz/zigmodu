@@ -15,13 +15,13 @@ pub const <<PASCAL_MODULE>>Event = union(enum) {
 
 pub const <<PASCAL_MODULE>>Service = struct {
     persistence: *persistence.<<PASCAL_MODULE>>Persistence,
-    event_bus: ?*zigmodu.TypedEventBus(<<PASCAL_MODULE>>Event) = null,
+    event_bus: ?*zigmodu.ThreadSafeEventBus(<<PASCAL_MODULE>>Event) = null,
 
     pub fn init(p: *persistence.<<PASCAL_MODULE>>Persistence) <<PASCAL_MODULE>>Service {
         return .{ .persistence = p };
     }
 
-    pub fn withEvents(self: *<<PASCAL_MODULE>>Service, bus: *zigmodu.TypedEventBus(<<PASCAL_MODULE>>Event)) void {
+    pub fn withEvents(self: *<<PASCAL_MODULE>>Service, bus: *zigmodu.ThreadSafeEventBus(<<PASCAL_MODULE>>Event)) void {
         self.event_bus = bus;
     }
 

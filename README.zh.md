@@ -15,6 +15,7 @@
 | [**AGENTS.md**](AGENTS.md) | **AI 操作手册**（DO/DON'T、Path A 鉴权、ComptimeRouter） |
 | [快速开始](docs/QUICK-START.md) | 5分钟入门 |
 | [Modulith 高并发](docs/MODULITH.md) | 项目第一天：模块边界 + 高并发实践 |
+| [事件与 DI](docs/EVENTS_DI.md) | `initWith(ctx)` + `app.eventBus` + 容器 freeze 最佳实践 |
 | [声明式路由](docs/ROUTE_TABLE.md) | ComptimeRouter + catalog JWT/RBAC |
 | [ZigModu × zent](docs/ZENT.md) | **电商/社交主推组合**：zent ORM 正交接入与最佳实践 |
 | [SQLx 驱动链接](docs/SQLX_DRIVERS.md) | `-Ddb=` / `.db=` 选择性链接 |
@@ -28,12 +29,13 @@
 ### 核心框架
 - **模块系统** - 声明式模块定义与元数据
 - **依赖验证** - 编译期依赖检查
-- **生命周期管理** - 自动初始化/清理
-- **事件驱动** - 类型安全的事件总线
+- **生命周期管理** - 自动初始化/清理；模块可声明 `initWith(ctx)` 接收框架设施
+- **依赖注入** - Application 内置类型安全容器：启动期注册（`withService` / 借用注册），`start()` 后 freeze，运行期无锁只读
+- **事件驱动** - Application 级 `EventRegistry` 只发放线程安全的按类型总线（`app.eventBus(T)`）；另含 TransactionalEvent + Outbox
 
 ### 分布式能力
-- **DistributedEventBus** - 跨节点事件通信
-- **ClusterMembership & Raft** - 节点发现、Raft 选主与日志压缩 (`compactLog` / `InstallSnapshot`)
+- **DistributedEventBus** ⚠️ - 跨节点事件通信（experimental）
+- **ClusterMembership & Raft** ⚠️ - 节点发现、Raft 选主与日志压缩 (`compactLog` / `InstallSnapshot`)（experimental）
 ### 弹性模式
 - **熔断器** - 三态防止级联故障
 - **限流器** - 令牌桶算法与 Redis 自动降级
@@ -119,6 +121,29 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
+### 事件与 DI（Application 内置）
+
+```zig
+// 模块通过 initWith(ctx) 接收框架设施：
+pub fn initWith(ctx: *zmodu.ModuleContext) !void {
+    const bus = try ctx.eventBus(OrderEvent);            // 共享线程安全总线
+    const cfg = ctx.service(AppConfig, "config") orelse
+        return error.MissingService;                     // 启动期 fail-fast
+    _ = bus; _ = cfg;
+}
+
+// main 组装共享服务；start() 完成后容器冻结：
+var app = try zmodu.builder(allocator, io)
+    .withService(AppConfig, "config", &config)           // 借用注册：容器不销毁
+    .build(.{OrderModule});
+try app.start();                                          // initWith 运行 → 容器 freeze
+
+const bus = try app.eventBus(OrderEvent);                // 仅 ThreadSafeEventBus
+try bus.subscribe(auditListener);
+```
+
+完整规则与反模式：[docs/EVENTS_DI.md](docs/EVENTS_DI.md) · 可运行接线：`examples/shopdemo`。
+
 ### 构建与运行
 
 ```bash
@@ -155,6 +180,8 @@ zigmodu/
 │   ├── core/           # 核心框架
 │   │   ├── Module.zig
 │   │   ├── EventBus.zig
+│   │   ├── EventRegistry.zig   # 按类型共享总线（仅线程安全版）
+│   │   ├── ModuleContext.zig   # 启动上下文：事件 + 服务 + io
 │   │   ├── Lifecycle.zig
 │   │   └── ...
 │   ├── extensions/      # 扩展功能

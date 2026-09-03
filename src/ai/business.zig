@@ -118,7 +118,7 @@ pub fn registerBusinessSkills(
                 if (sql_value != .string) return error.InvalidArguments;
                 const sql = std.mem.trim(u8, sql_value.string, " \t\r\n");
                 if (sql.len < 6 or !std.ascii.eqlIgnoreCase(sql[0..6], "SELECT")) return error.ReadOnlyQueryRequired;
-                try sqlx.validateSqlFragment(sql); // rejects literals/comments/`;` — forces ? args
+                try sqlx.validateSqlStatement(sql); // rejects literals/comments/`;` — forces ? args
 
                 const limit: usize = if (obj.get("limit")) |lv| blk: {
                     if (lv != .integer) return error.InvalidArguments;

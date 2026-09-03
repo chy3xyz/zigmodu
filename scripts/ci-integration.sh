@@ -58,6 +58,18 @@ echo "$LIST_BODY" | grep -q '"tier":"free"'
 CODE="$(curl -s -o /dev/null -w '%{http_code}' -H "${AUTH}" "${BASE}/api/v1/plans")"
 [[ "$CODE" == "200" ]]
 
+echo "integration: tenant isolation probes"
+# JWT without aud + no X-Tenant-ID → missing tenant context
+CODE="$(curl -s -o /dev/null -w '%{http_code}' -H "${AUTH}" "${BASE}/api/v1/users")"
+[[ "$CODE" == "401" ]]
+# X-Tenant-ID fallback (no aud in token) → scoped list
+CODE="$(curl -s -o /dev/null -w '%{http_code}' -H "${AUTH}" -H "X-Tenant-ID: 1" "${BASE}/api/v1/users")"
+[[ "$CODE" == "200" ]]
+# JWT aud=1 vs X-Tenant-ID: 2 → conflict rejected
+TENANT_TOKEN="$(JWT_AUD=1 "$JWT_BIN")"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${TENANT_TOKEN}" -H "X-Tenant-ID: 2" "${BASE}/api/v1/users")"
+[[ "$CODE" == "403" ]]
+
 echo "integration: http-stress-test"
 cd "$ROOT/examples/http-stress-test"
 zig build -Doptimize=ReleaseSafe

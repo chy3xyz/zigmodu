@@ -1,5 +1,6 @@
 const std = @import("std");
 const api = @import("../api/Module.zig");
+const ModuleContext = @import("ModuleContext.zig").ModuleContext;
 
 pub const ModuleInfo = struct {
     name: []const u8,
@@ -8,6 +9,9 @@ pub const ModuleInfo = struct {
     /// Module instance pointer. Null for metadata-only registrations (e.g. tests).
     ptr: ?*anyopaque = null,
     init_fn: ?*const fn (?*anyopaque) anyerror!void = null,
+    /// Preferred startup hook when a `ModuleContext` is available
+    /// (`Lifecycle.startAllWith`): wraps the module's `initWith(ctx)`.
+    init_ctx_fn: ?*const fn (?*anyopaque, *ModuleContext) anyerror!void = null,
     deinit_fn: ?*const fn (?*anyopaque) void = null,
     /// Runtime resource options copied from the module's info at scan time.
     runtime_options: api.RuntimeOptions = .{},

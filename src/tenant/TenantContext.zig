@@ -14,6 +14,17 @@ pub const TenantContext = struct {
         return self.tenant_id;
     }
 
+    /// Bridge from the HTTP attr pathway: build a context from the
+    /// `tenant_id` attr value (JWT `aud` or tenant middleware output).
+    /// Returns null when the attr is absent/invalid/non-positive — callers
+    /// must treat null as "no verified tenant", never as "skip filtering".
+    pub fn fromAttr(attr_value: ?[]const u8) ?TenantContext {
+        const raw = attr_value orelse return null;
+        const id = std.fmt.parseInt(i64, raw, 10) catch return null;
+        if (id <= 0) return null;
+        return .{ .tenant_id = id };
+    }
+
     /// Temporarily ignore tenant filtering (like @TenantIgnore annotation)
     pub fn ignoreTenant(self: *TenantContext) void {
         self.ignore = true;
@@ -27,13 +38,6 @@ pub const TenantContext = struct {
         return self.tenant_id > 0 and !self.ignore;
     }
 };
-
-/// Global default tenant context (non-concurrent use)
-var default_context = TenantContext{};
-
-pub fn getDefault() *TenantContext {
-    return &default_context;
-}
 
 /// Compile-time default SQL column (`tenant_id`). Prefer `tenantColumn()` after `setTenantColumn`.
 pub const TENANT_COLUMN = "tenant_id";
@@ -82,4 +86,16 @@ test "setTenantColumn rejects unsafe identifiers" {
 
     setTenantColumn("app_id; drop");
     try std.testing.expectEqualStrings(prev, tenantColumn());
+}
+
+test "TenantContext.fromAttr bridges the HTTP attr pathway" {
+    const ctx = TenantContext.fromAttr("42").?;
+    try std.testing.expectEqual(@as(i64, 42), ctx.get());
+    try std.testing.expect(ctx.isActive());
+
+    try std.testing.expect(TenantContext.fromAttr(null) == null);
+    try std.testing.expect(TenantContext.fromAttr("") == null);
+    try std.testing.expect(TenantContext.fromAttr("abc") == null);
+    try std.testing.expect(TenantContext.fromAttr("0") == null);
+    try std.testing.expect(TenantContext.fromAttr("-3") == null);
 }

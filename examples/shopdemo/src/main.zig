@@ -34,6 +34,19 @@ pub fn main(init: std.process.Init) !void {
     defer app.stop();
     std.log.info("[main] Application '{s}' started", .{app.config.name});
 
+    // Shared event bus from the application registry (ThreadSafeEventBus):
+    // the order service publishes, this listener handles side effects.
+    const order_bus = try app.eventBus(order_mod.service.OrderEvent);
+    try order_bus.subscribe(struct {
+        fn onOrderEvent(e: order_mod.service.OrderEvent) void {
+            switch (e) {
+                .created => |c| std.log.info("[event] order created id={d}", .{c.id}),
+                .updated => |u| std.log.info("[event] order updated id={d}", .{u.id}),
+                .deleted => |d| std.log.info("[event] order deleted id={d}", .{d.id}),
+            }
+        }
+    }.onOrderEvent);
+
     const Backend = db_backend.Backend;
     _ = Backend;
 
@@ -43,6 +56,7 @@ pub fn main(init: std.process.Init) !void {
     };
     var order_persist = order_mod.persistence.OrderPersistence.init(backend);
     var order_svc = order_mod.service.OrderService.init(&order_persist);
+    order_svc.withEvents(order_bus);
     var order_api = order_mod.api.OrderApi.init(&order_svc);
 
     const port: u16 = blk: {

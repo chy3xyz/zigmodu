@@ -1,6 +1,7 @@
 const std = @import("std");
 const ApplicationModules = @import("./Module.zig").ApplicationModules;
 const ModuleInfo = @import("./Module.zig").ModuleInfo;
+const ModuleContext = @import("ModuleContext.zig").ModuleContext;
 
 /// Compile-time module scanner that extracts module metadata and performs topological sort
 pub fn scanModules(allocator: std.mem.Allocator, comptime modules: anytype) !ApplicationModules {
@@ -14,6 +15,18 @@ pub fn scanModules(allocator: std.mem.Allocator, comptime modules: anytype) !App
                 fn wrapper(ptr: ?*anyopaque) anyerror!void {
                     _ = ptr;
                     try mod.init();
+                }
+            }.wrapper
+        else
+            null;
+
+        // Optional richer hook: `pub fn initWith(ctx: *ModuleContext) !void`
+        // gives the module access to the shared EventRegistry + DI container.
+        const init_ctx_fn = if (@hasDecl(mod, "initWith"))
+            struct {
+                fn wrapper(ptr: ?*anyopaque, ctx: *ModuleContext) anyerror!void {
+                    _ = ptr;
+                    try mod.initWith(ctx);
                 }
             }.wrapper
         else
@@ -35,6 +48,7 @@ pub fn scanModules(allocator: std.mem.Allocator, comptime modules: anytype) !App
             .deps = mod.info.dependencies,
             .ptr = @ptrCast(@constCast(&mod)),
             .init_fn = init_fn,
+            .init_ctx_fn = init_ctx_fn,
             .deinit_fn = deinit_fn,
             .runtime_options = mod.info.runtime,
         });

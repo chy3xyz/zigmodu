@@ -43,9 +43,9 @@ src/modules/
 |----------|---------------|
 | **Module System** | 3 modules, each with 6 standardized files |
 | **Comptime Generics** | `TenantService(comptime Persistence: type)` |
-| **Tenant Isolation** | All queries scoped by `tenant_id`, X-Tenant-ID header |
+| **Tenant Isolation** | All queries scoped by `tenant_id`; tenant context from JWT `aud` or `X-Tenant-ID` header (never URL query) |
 | **Error Handling** | RFC 7807 Problem Details via `zigmodu.sendProblem()` |
-| **Middleware Chain** | Tenant → JWT(+role→perm) → ModuleGate → PermissionGate(rbac) → DataPermission |
+| **Middleware Chain** | JWT(+role→perm) → Tenant resolution → ModuleGate → PermissionGate(rbac) → DataPermission |
 | **API Versioning** | `/api/v1/` prefix with RouteGroup |
 | **ComptimeRouter** | All 3 modules: `routes` + `mountAll`; catalog drives JWT/ModuleGate/PermissionGate |
 | **RBAC** | `RolePermissionTable` (or `CatalogPermDb` for SQLite): JWT role → permission codes |
@@ -95,18 +95,20 @@ curl -s http://localhost:18080/openapi.json | head
 | `DELETE` | `/api/v1/tenants/{id}` | Suspend tenant (`permission=tenant:suspend`) |
 
 ### Users
+Tenant context comes from JWT `aud` or the `X-Tenant-ID` header (never `?tenant_id=` — client-tamperable):
+
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/api/v1/users?tenant_id=1` | List users in tenant |
-| `POST` | `/api/v1/users?tenant_id=1&username=X&email=Y&role=admin` | Create user |
-| `GET` | `/api/v1/users/{id}?tenant_id=1` | Get user (tenant-isolated) |
+| `GET` | `/api/v1/users` + `X-Tenant-ID: 1` | List users in tenant |
+| `POST` | `/api/v1/users?username=X&email=Y&role=admin` + `X-Tenant-ID: 1` | Create user |
+| `GET` | `/api/v1/users/{id}` + `X-Tenant-ID: 1` | Get user (tenant-isolated) |
 
 ### Subscriptions
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/api/v1/plans` | List available plans |
-| `POST` | `/api/v1/subscriptions?tenant_id=1&plan_id=2` | Subscribe tenant |
-| `GET` | `/api/v1/subscriptions/{tenant_id}` | Get tenant subscription |
+| `POST` | `/api/v1/subscriptions?plan_id=2` + `X-Tenant-ID: 1` | Subscribe tenant |
+| `GET` | `/api/v1/subscriptions/{tenant_id}` + matching tenant context | Get tenant subscription (403 on cross-tenant) |
 | `DELETE` | `/api/v1/subscriptions/{id}` | Cancel subscription |
 
 ### System

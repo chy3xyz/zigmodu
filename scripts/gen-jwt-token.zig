@@ -1,6 +1,6 @@
 //! Emit a signed JWT for CI / local probes.
 //! Usage: JWT_SECRET=dev-secret ./zig-out/bin/gen-jwt-token
-//! Optional: JWT_SUB=ci-user JWT_ROLES=admin,user
+//! Optional: JWT_SUB=ci-user JWT_ROLES=admin,user JWT_AUD=1
 const std = @import("std");
 const zmodu = @import("zigmodu");
 const SecurityModule = zmodu.security.SecurityModule;
@@ -26,7 +26,10 @@ pub fn main(init: std.process.Init) !void {
     } else &.{ "admin", "user" };
 
     var sec = SecurityModule.initWithIo(allocator, secret, 3600, init.io);
-    const token = try sec.generateToken(sub, roles);
+    const token = if (init.environ_map.get("JWT_AUD")) |aud|
+        try sec.generateTokenWithTenant(sub, roles, aud)
+    else
+        try sec.generateToken(sub, roles);
     defer allocator.free(token);
 
     const stdout = std.Io.File.stdout();

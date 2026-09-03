@@ -1,6 +1,7 @@
 const std = @import("std");
 const zigmodu = @import("zigmodu");
 const http = zigmodu.http;
+const middleware = @import("../../middleware/root.zig");
 
 /// User HTTP API — ComptimeRouter (`docs/ROUTE_TABLE.md`).
 /// Mount via `http.Router(...).scope("/api/v1").mount(UserApi(S), &api)`.
@@ -30,14 +31,7 @@ pub fn UserApi(comptime Service: type) type {
         }
 
         fn listUsers(ctx: *http.Context, self: *State) !void {
-            const tenant_str = ctx.queryParam("tenant_id") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing 'tenant_id' query parameter");
-                return;
-            };
-            const tenant_id = std.fmt.parseInt(i64, tenant_str, 10) catch {
-                try ctx.sendErrorResponse(400, 0, "Invalid tenant_id");
-                return;
-            };
+            const tenant_id = middleware.requireTenantId(ctx) catch return;
 
             var users_qr = self.service.listByTenant(tenant_id) catch {
                 try ctx.sendErrorResponse(500, 0, "Failed to list users");
@@ -62,14 +56,7 @@ pub fn UserApi(comptime Service: type) type {
         }
 
         fn createUser(ctx: *http.Context, self: *State) !void {
-            const tenant_id_str = ctx.queryParam("tenant_id") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing tenant_id");
-                return;
-            };
-            const tenant_id = std.fmt.parseInt(i64, tenant_id_str, 10) catch {
-                try ctx.sendErrorResponse(400, 0, "Invalid tenant_id");
-                return;
-            };
+            const tenant_id = middleware.requireTenantId(ctx) catch return;
             const username = ctx.queryParam("username") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing username");
                 return;
@@ -92,14 +79,7 @@ pub fn UserApi(comptime Service: type) type {
         }
 
         fn getUser(ctx: *http.Context, self: *State) !void {
-            const tenant_str = ctx.queryParam("tenant_id") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing tenant_id");
-                return;
-            };
-            const tenant_id = std.fmt.parseInt(i64, tenant_str, 10) catch {
-                try ctx.sendErrorResponse(400, 0, "Invalid tenant_id");
-                return;
-            };
+            const tenant_id = middleware.requireTenantId(ctx) catch return;
             const id_str = ctx.param("id") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing user ID");
                 return;

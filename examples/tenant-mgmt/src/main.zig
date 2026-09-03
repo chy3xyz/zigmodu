@@ -17,9 +17,9 @@ const zigmodu = @import("zigmodu");
 //   GET  /api/v1/tenants/{id}         → Get tenant detail
 //   PUT  /api/v1/tenants/{id}/tier    → Update tenant tier
 //   DEL  /api/v1/tenants/{id}         → Suspend tenant
-//   GET  /api/v1/users?tenant_id=X    → List users in tenant
-//   POST /api/v1/users                → Create user in tenant
-//   GET  /api/v1/users/{id}?tenant_id=X → Get user (isolated)
+//   GET  /api/v1/users              → List users in tenant (X-Tenant-ID / JWT aud)
+//   POST /api/v1/users              → Create user in tenant
+//   GET  /api/v1/users/{id}         → Get user (isolated by tenant context)
 //   GET  /api/v1/plans                → List available plans
 //   POST /api/v1/subscriptions        → Create subscription
 //   GET  /api/v1/subscriptions/{id}   → Get tenant subscription
@@ -119,9 +119,9 @@ pub fn main(init: std.process.Init) !void {
     var app_sec = zigmodu.security.AppSecurity.init(allocator, io, .{ .jwt_secret = jwt_secret });
     var catalog_slot: zigmodu.http.CatalogSlot = .{};
     defer catalog_slot.deinit();
-    // Order: tenant → JWT(from catalog) → ModuleGate → data permission
-    try server.addMiddleware(middleware.tenantMiddleware());
+    // Order: JWT(from catalog) → tenant resolution → ModuleGate → RBAC → data permission
     try server.addMiddleware(middleware.jwtAuthMiddleware(&app_sec.module, &catalog_slot, &db_client));
+    try server.addMiddleware(middleware.tenantMiddleware());
     try server.addMiddleware(middleware.moduleGateMiddleware(&catalog_slot));
     try server.addMiddleware(middleware.permissionGateMiddleware(&catalog_slot));
     try server.addMiddleware(middleware.dataPermissionMiddleware());

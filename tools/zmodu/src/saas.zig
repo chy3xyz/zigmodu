@@ -445,11 +445,11 @@ fn emitTests(allocator: std.mem.Allocator, e: *const Entity, P: []const u8) ![]c
     try buf.appendSlice(allocator, P);
     try buf.appendSlice(allocator, "Service.init(&persist);\n\n");
     try buf.appendSlice(allocator,
-        \\    var bus = zigmodu.TypedEventBus(zigmodu.data.CrudEvent(model.
+        \\    var bus = zigmodu.ThreadSafeEventBus(zigmodu.data.CrudEvent(model.
     );
     try buf.appendSlice(allocator, P);
     try buf.appendSlice(allocator,
-        \\)).init(allocator);
+        \\)).init(allocator, std.testing.io);
         \\    defer bus.deinit();
         \\    svc.crud.setEventBus(&bus);
         \\

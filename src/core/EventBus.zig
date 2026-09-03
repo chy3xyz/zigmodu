@@ -1,4 +1,9 @@
-//! Thread-safe event bus with typed event dispatch, infallible subscription model.
+//! Typed event dispatch with infallible subscription model.
+//!
+//! `EventBus` / `TypedEventBus` are NOT thread-safe — use them from a single
+//! thread (or a single fiber with no concurrent access). For concurrent
+//! publishers/subscribers, use `ThreadSafeEventBus`, which guards every
+//! operation with a mutex.
 
 const std = @import("std");
 const Time = @import("Time.zig");
@@ -79,6 +84,7 @@ fn ListenerSet(comptime CallbackType: type) type {
     };
 }
 
+/// NOT thread-safe. For concurrent access, use `ThreadSafeEventBus`.
 pub fn EventBus(comptime EventType: type) type {
     return struct {
         const Self = @This();
@@ -153,6 +159,7 @@ pub fn EventBus(comptime EventType: type) type {
     };
 }
 
+/// NOT thread-safe. For concurrent access, use `ThreadSafeEventBus`.
 pub fn TypedEventBus(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -317,11 +324,17 @@ pub fn ThreadSafeEventBus(comptime T: type) type {
             defer self.mu.unlock(self.io);
             return self.bus.subscriberCount();
         }
+
+        pub fn publishedCount(self: *Self) u64 {
+            self.mu.lock(self.io) catch return 0;
+            defer self.mu.unlock(self.io);
+            return self.bus.publishedCount();
+        }
     };
 }
 
 /// Unified event bus — always typed. For untyped usage, pass `void`.
-/// Generated code should use `EventBus(MyEvent)` for type safety.
+/// Single-threaded only; concurrent publishers must use `ThreadSafeEventBus`.
 pub fn UnifiedEventBus(comptime T: type) type {
     return TypedEventBus(T);
 }

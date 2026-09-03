@@ -173,26 +173,7 @@ bus.publish(.{ .order_id = 123, .total = 99.99 });
 
 ---
 
-### 3. Dependency Injection (`examples/dependency-injection`)
-**Demonstrates**: Container and service management
-
-- Service registration
-- Type-safe retrieval
-- Dependency resolution
-- Scoped containers
-
-**Key Concepts**:
-```zig
-var container = Container.init(allocator);
-try container.register(Database, "db", &db);
-const db = container.get(Database, "db");
-```
-
-**Run**: `cd examples/dependency-injection && zig build run`
-
----
-
-### 4. Testing Example (`examples/testing`)
+### 3. Testing Example (`examples/testing`)
 **Demonstrates**: Module testing and mocking
 
 - ModuleTestContext
@@ -212,70 +193,7 @@ ctx.stop();
 
 ---
 
-### 5. Architecture Validation (`examples/architecture`)
-**Demonstrates**: Architecture testing and rules
-
-- Dependency validation
-- Cycle detection
-- Custom architecture rules
-- Documentation generation
-
-**Key Concepts**:
-```zig
-var tester = ArchitectureTester.init(allocator, &modules);
-try tester.ruleNoCircularDependencies();
-try tester.ruleLimitedDependencies(5);
-```
-
-**Run**: `cd examples/architecture && zig build run`
-
----
-
-### 6. v0.2.0 Feature Showcase (`examples/v2-showcase`)
-**Demonstrates**: All new features introduced in ZigModu v0.2.0
-
-- Simplified API (`App`, `Module`, `ModuleImpl`)
-- Distributed Event Bus (cross-node communication)
-- Web Monitor (HTTP interface for module monitoring)
-- Plugin System (dynamic plugin loading framework)
-- Hot Reloading (file watching and module reloading)
-
-**Key Concepts**:
-```zig
-var app = zigmodu.App.init(allocator);
-var bus = zigmodu.DistributedEventBus.init(allocator);
-var monitor = zigmodu.WebMonitor.init(allocator, 3000);
-var plugins = zigmodu.PluginManager.init(allocator, "./plugins");
-var reloader = zigmodu.HotReloader.init(allocator);
-```
-
-**Run**: `cd examples/v2-showcase && zig build run`
-**Test**: `cd examples/v2-showcase && zig build test`
-
----
-
-### 7. Complete Application (`examples/ecommerce`)
-**Demonstrates**: Real-world complex application
-
-- Multiple modules
-- Event-driven architecture
-- DI container
-- Configuration management
-- Testing strategy
-
-**Features**:
-- User management
-- Product catalog
-- Shopping cart
-- Order processing
-- Payment handling
-- Inventory management
-
-**Run**: `cd examples/ecommerce && zig build run`
-
----
-
-### 8. HTTP Server Stress Test (`examples/http-stress-test`)
+### 4. HTTP Server Stress Test (`examples/http-stress-test`)
 **Demonstrates**: Async HTTP server capabilities
 
 - Concurrent connection handling
@@ -348,14 +266,13 @@ zig build test
 
 ### Intermediate
 4. Explore **Event-Driven Example** for decoupled architecture
-5. Study **DI Example** for service management
-6. Review **Testing Example** for quality assurance
+5. Review **Testing Example** for quality assurance
+6. Study **tenant-mgmt** for JWT + RBAC + tenant isolation
 
 ### Advanced
-7. Implement **Architecture Validation** in your project
-8. Explore **v0.2.0 Feature Showcase** for distributed events, plugins, hot reloading, and web monitoring
-9. Build a **Complete Application** using all features
-10. Contribute new examples!
+7. Run the **HTTP Stress Test** and inspect its fiber architecture
+8. Build a **Complete Application** using all features
+9. Contribute new examples!
 
 ---
 
@@ -534,11 +451,8 @@ pub fn main(init: std.process.Init) !void {
 |---------|-------|------------|--------|
 | Basic | 150 | Beginner | ✅ Ready |
 | Event-Driven | 200 | Intermediate | ✅ Ready |
-| DI | 180 | Intermediate | ✅ Ready |
 | Testing | 120 | Intermediate | ✅ Ready |
-| Architecture | 160 | Advanced | 🚧 WIP |
-| v2-showcase | 300 | Advanced | ✅ Ready |
-| E-commerce | 500+ | Advanced | 🚧 WIP |
+| HTTP Stress Test | 300 | Advanced | ✅ Ready |
 
 ---
 

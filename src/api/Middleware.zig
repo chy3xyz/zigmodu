@@ -302,7 +302,9 @@ fn verifyJwtLoadPermsAndNext(
     defer sec.freePayload(payload);
 
     try ctx.setAttr("user_id", payload.sub);
-    try ctx.setAttr("tenant_id", payload.aud);
+    // Only set tenant attr when aud is present — an empty-string attr would
+    // shadow the X-Tenant-ID fallback path and fail downstream int parsing.
+    if (payload.aud.len > 0) try ctx.setAttr("tenant_id", payload.aud);
     // Comma-separated roles for permissionGate(.roles) and CatalogPermissionLoader.
     if (payload.roles.len > 0) {
         const roles_csv = try joinCsv(ctx.allocator, payload.roles);
@@ -588,7 +590,7 @@ pub fn jwtBackend(security: *SecurityModule) AuthBackend {
                 defer ctx.allocator.free(roles_csv);
                 try ctx.setIdentity(.{
                     .user_id = payload.sub,
-                    .tenant_id = payload.aud,
+                    .tenant_id = if (payload.aud.len > 0) payload.aud else null,
                     .roles = roles_csv,
                 });
                 return true;

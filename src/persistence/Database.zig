@@ -1,8 +1,12 @@
 const std = @import("std");
 
 /// Database abstraction layer
-/// Provides repository pattern and transaction management
-/// Compatible with SQLite, PostgreSQL via external drivers
+/// Provides transaction management and connection pooling.
+/// Compatible with SQLite, PostgreSQL via external drivers.
+///
+/// NOTE: the canonical repository lives in `Orm.zig` (`data.Repository(T)`);
+/// the legacy stub `Repository` here was removed — it had no tenant-scoped
+/// variants and no real implementations.
 pub const Database = struct {
     const Self = @This();
 
@@ -110,44 +114,6 @@ pub const Transaction = struct {
     }
 };
 
-/// Repository pattern for entity persistence
-pub fn Repository(comptime T: type) type {
-    return struct {
-        const Self = @This();
-
-        db: *Database,
-        table_name: []const u8,
-
-        /// Find entity by ID
-        pub fn findById(self: *Self, id: i64) !?T {
-            _ = self;
-            _ = id;
-            // Implementation would query database and map to T
-            return null;
-        }
-
-        /// Save entity
-        pub fn save(self: *Self, entity: T) !void {
-            _ = self;
-            _ = entity;
-            // Implementation would insert or update
-        }
-
-        /// Delete entity
-        pub fn delete(self: *Self, id: i64) !void {
-            _ = self;
-            _ = id;
-            // Implementation would delete from database
-        }
-
-        /// Find all entities
-        pub fn findAll(self: *Self, buf: []T) ![]T {
-            _ = self;
-            return buf[0..0];
-        }
-    };
-}
-
 /// Connection pool for database connections
 pub const ConnectionPool = struct {
     const Self = @This();
@@ -199,15 +165,4 @@ test "Database abstraction structure" {
     _ = Database.QueryResult;
     _ = Database.QueryParams;
     _ = Database.VTable;
-}
-
-test "Repository pattern" {
-    const TestEntity = struct {
-        id: i64,
-        name: []const u8,
-    };
-
-    // Verify Repository type can be instantiated with proper types
-    const RepoType = Repository(TestEntity);
-    _ = RepoType;
 }

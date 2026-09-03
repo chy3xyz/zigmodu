@@ -11,6 +11,9 @@ const Lifecycle = @import("core/Lifecycle.zig");
 const Documentation = @import("core/Documentation.zig");
 const ModuleRegistry = @import("core/ModuleRegistry.zig").ModuleRegistry;
 const ModuleRuntime = @import("core/ModuleRuntime.zig").ModuleRuntime;
+const EventRegistry = @import("core/EventRegistry.zig").EventRegistry;
+const ModuleContext = @import("core/ModuleContext.zig").ModuleContext;
+const Container = @import("di/Container.zig").Container;
 
 /// Atomic flag for graceful shutdown coordination (set by signal handler).
 var shutdown_requested = std.atomic.Value(bool).init(false);
@@ -54,6 +57,13 @@ pub const Application = struct {
     io: std.Io,
     shutdown_hooks: std.ArrayList(*const fn () void),
     registry: ?ModuleRegistry = null,
+    /// Shared per-type event buses (`ThreadSafeEventBus` only). Modules grab
+    /// buses in `initWith(ctx)`; handlers/tests via `app.eventBus(T)`.
+    events: EventRegistry,
+    /// Application service container. Modules register during `start()`;
+    /// frozen once startup completes — afterwards `get` is a lock-free read
+    /// safe for concurrent handlers.
+    services: Container,
 
     pub const State = enum {
         initialized,
@@ -97,6 +107,8 @@ pub const Application = struct {
             .state = .initialized,
             .shutdown_hooks = std.ArrayList(*const fn () void).empty,
             .registry = registry,
+            .events = EventRegistry.init(allocator, io),
+            .services = Container.init(allocator),
         };
     }
 
@@ -106,6 +118,8 @@ pub const Application = struct {
             self.stop();
         }
         if (self.registry) |*r| r.deinit();
+        self.events.deinit();
+        self.services.deinit();
         self.modules.deinit();
         self.shutdown_hooks.deinit(self.allocator);
         self.state = .stopped;
@@ -142,8 +156,18 @@ pub const Application = struct {
             }
         }
 
-        // Start modules
-        try Lifecycle.startAll(&self.modules);
+        // Start modules — each may declare initWith(ctx) to receive the
+        // shared EventRegistry + DI container (classic init() still works).
+        var module_ctx = ModuleContext{
+            .allocator = self.allocator,
+            .io = self.io,
+            .events = &self.events,
+            .services = &self.services,
+        };
+        try Lifecycle.startAllWith(&self.modules, &module_ctx);
+        // Startup wiring complete: further registration is rejected, and
+        // service lookups become lock-free reads for concurrent handlers.
+        self.services.freeze();
         self.state = .started;
 
         std.log.info("Application '{s}' started successfully", .{self.config.name});
@@ -198,6 +222,16 @@ pub const Application = struct {
     /// Register a hook to be called during graceful shutdown (reverse order).
     pub fn onShutdown(self: *Self, hook: *const fn () void) !void {
         try self.shutdown_hooks.append(self.allocator, hook);
+    }
+
+    /// Get or create the shared thread-safe bus for event type `T`.
+    pub fn eventBus(self: *Self, comptime T: type) !*@import("core/EventBus.zig").ThreadSafeEventBus(T) {
+        return self.events.bus(T);
+    }
+
+    /// Typed service lookup from the application container.
+    pub fn service(self: *Self, comptime T: type, name: []const u8) ?*T {
+        return self.services.get(T, name);
     }
 
     /// Run the application blocking until SIGINT/SIGTERM.
@@ -262,15 +296,27 @@ pub const ApplicationBuilder = struct {
     docs_path: ?[]const u8 = null,
     auto_generate_docs: bool = false,
     io: std.Io,
+    /// Services pre-registered into `Application.services` by `build()`
+    /// (borrowed — the caller keeps ownership and must outlive the app).
+    pending_services: std.ArrayList(PendingService),
+
+    const PendingService = struct {
+        name: []const u8,
+        ptr: *anyopaque,
+        register_fn: *const fn (*Container, []const u8, *anyopaque) anyerror!void,
+    };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) ApplicationBuilder {
         return .{
             .allocator = allocator,
             .io = io,
+            .pending_services = std.ArrayList(PendingService).empty,
         };
     }
 
     pub fn deinit(self: *ApplicationBuilder) void {
+        for (self.pending_services.items) |p| self.allocator.free(p.name);
+        self.pending_services.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -302,8 +348,28 @@ pub const ApplicationBuilder = struct {
         });
     }
 
+    /// Pre-register a borrowed service into the application container.
+    /// The instance is caller-owned (stack or externally managed) and must
+    /// outlive the application; modules retrieve it in `initWith(ctx)` via
+    /// `ctx.service(T, name)`.
+    pub fn withService(self: *ApplicationBuilder, comptime T: type, name: []const u8, instance: *T) !*ApplicationBuilder {
+        const owned_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned_name);
+        try self.pending_services.append(self.allocator, .{
+            .name = owned_name,
+            .ptr = instance,
+            .register_fn = struct {
+                fn f(c: *Container, n: []const u8, p: *anyopaque) anyerror!void {
+                    const typed: *T = @ptrCast(@alignCast(p));
+                    try c.registerBorrowed(T, n, typed);
+                }
+            }.f,
+        });
+        return self;
+    }
+
     pub fn build(self: *ApplicationBuilder, comptime modules: anytype) !Application {
-        return Application.init(
+        var app = try Application.init(
             self.io,
             self.allocator,
             self.app_name,
@@ -314,6 +380,11 @@ pub const ApplicationBuilder = struct {
                 .docs_path = self.docs_path,
             },
         );
+        errdefer app.deinit();
+        for (self.pending_services.items) |p| {
+            try p.register_fn(&app.services, p.name, p.ptr);
+        }
+        return app;
     }
 };
 
@@ -595,6 +666,60 @@ test "Application builds ModuleRegistry from module runtime options" {
     try std.testing.expect(rt != null);
     try std.testing.expect(rt.?.tryEnter());
     rt.?.release();
+}
+
+test "e2e: Application events + services wiring through ModuleContext" {
+    const allocator = std.testing.allocator;
+
+    const OrderEvent = struct { id: i64 };
+    const FakeDb = struct { connected: bool = true };
+
+    const Ctx = struct {
+        var saw_db: bool = false;
+        var received: i64 = 0;
+        fn onOrder(e: OrderEvent) void {
+            received = e.id;
+        }
+    };
+
+    const Orders = struct {
+        pub const info = api.Module{
+            .name = "orders",
+            .description = "Publishes via shared bus",
+            .dependencies = &.{},
+        };
+        pub fn initWith(ctx: *ModuleContext) !void {
+            // DI: service pre-registered by the builder is visible
+            const db = ctx.service(FakeDb, "db") orelse return error.MissingService;
+            Ctx.saw_db = db.connected;
+            // Events: shared thread-safe bus from the registry
+            const bus = try ctx.eventBus(OrderEvent);
+            try bus.subscribe(Ctx.onOrder);
+            bus.publish(.{ .id = 9 });
+        }
+        pub fn deinit() void {}
+    };
+
+    var db = FakeDb{};
+    var b = ApplicationBuilder.init(allocator, std.testing.io);
+    defer b.deinit();
+
+    var app = try (try b.withName("wired-app").withService(FakeDb, "db", &db)).build(.{Orders});
+    defer app.deinit();
+
+    try app.start();
+    try std.testing.expect(Ctx.saw_db);
+    try std.testing.expectEqual(@as(i64, 9), Ctx.received);
+
+    // After start the container is frozen
+    try std.testing.expectError(error.ContainerFrozen, app.services.registerBorrowed(FakeDb, "late", &db));
+
+    // The same bus is reachable from outside (handlers, tests)
+    const bus = try app.eventBus(OrderEvent);
+    bus.publish(.{ .id = 10 });
+    try std.testing.expectEqual(@as(i64, 10), Ctx.received);
+
+    app.stop();
 }
 
 test "e2e: in-flight counter tracks request lifecycle" {

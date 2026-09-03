@@ -4,13 +4,17 @@ const ServiceWrapper = struct {
     ptr: *anyopaque,
     type_name: []const u8,
     type_hash: u64, // Add type hash for runtime validation
+    /// true → the container destroys the instance on remove/deinit
+    /// (instance must come from `allocator.create`); false → borrowed,
+    /// only the wrapper is freed.
+    owned: bool,
     vtable: *const VTable,
 
     const VTable = struct {
         destroy: *const fn (*anyopaque, std.mem.Allocator) void,
     };
 
-    fn create(comptime T: type, instance: *T, allocator: std.mem.Allocator) !*ServiceWrapper {
+    fn create(comptime T: type, instance: *T, allocator: std.mem.Allocator, owned: bool) !*ServiceWrapper {
         const type_name = @typeName(T);
         const wrapper = try allocator.create(ServiceWrapper);
         errdefer allocator.destroy(wrapper);
@@ -18,6 +22,7 @@ const ServiceWrapper = struct {
             .ptr = instance,
             .type_name = try allocator.dupe(u8, type_name),
             .type_hash = comptime std.hash.Crc32.hash(type_name), // Compile-time type hash calculation
+            .owned = owned,
             .vtable = &comptime VTable{
                 .destroy = struct {
                     fn destroy(service_ptr: *anyopaque, alloc: std.mem.Allocator) void {
@@ -32,7 +37,7 @@ const ServiceWrapper = struct {
 
     fn destroy(self: *ServiceWrapper, allocator: std.mem.Allocator) void {
         allocator.free(self.type_name);
-        self.vtable.destroy(self.ptr, allocator);
+        if (self.owned) self.vtable.destroy(self.ptr, allocator);
         allocator.destroy(self);
     }
 };
@@ -43,6 +48,10 @@ pub const Container = struct {
     allocator: std.mem.Allocator,
     services: std.StringHashMap(*ServiceWrapper),
     deinitialized: bool = false,
+    /// Once frozen, register/remove are rejected and `get` is a lock-free
+    /// read — safe for concurrent handlers because the map never mutates.
+    /// Application freezes its container after all modules have started.
+    frozen: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
@@ -61,8 +70,27 @@ pub const Container = struct {
         self.* = undefined;
     }
 
+    /// Freeze the container: further registration is rejected with
+    /// `error.ContainerFrozen`. Call once the startup wiring is complete.
+    pub fn freeze(self: *Self) void {
+        self.frozen = true;
+    }
+
+    /// Register an owned service — the container destroys `instance` (which
+    /// must come from `allocator.create`) on remove/deinit.
     pub fn register(self: *Self, comptime T: type, name: []const u8, instance: *T) !void {
-        const wrapper = try ServiceWrapper.create(T, instance, self.allocator);
+        if (self.frozen) return error.ContainerFrozen;
+        const wrapper = try ServiceWrapper.create(T, instance, self.allocator, true);
+        errdefer wrapper.destroy(self.allocator);
+        try self.services.put(name, wrapper);
+    }
+
+    /// Register a borrowed service (stack-allocated or externally owned
+    /// instance). The container never destroys it; the caller must outlive
+    /// the container.
+    pub fn registerBorrowed(self: *Self, comptime T: type, name: []const u8, instance: *T) !void {
+        if (self.frozen) return error.ContainerFrozen;
+        const wrapper = try ServiceWrapper.create(T, instance, self.allocator, false);
         errdefer wrapper.destroy(self.allocator);
         try self.services.put(name, wrapper);
     }
@@ -119,6 +147,10 @@ pub const Container = struct {
     }
 
     pub fn remove(self: *Self, name: []const u8) void {
+        if (self.frozen) {
+            std.log.warn("Container is frozen; ignoring remove('{s}')", .{name});
+            return;
+        }
         if (self.services.fetchRemove(name)) |kv| {
             kv.value.destroy(self.allocator);
         }
@@ -224,4 +256,38 @@ test "ScopedContainer parent resolution" {
     try std.testing.expect(scoped.contains("svc"));
     const retrieved = scoped.get(SvcType, "svc").?;
     try std.testing.expectEqual(@as(i32, 10), retrieved.value);
+}
+
+test "Container freeze rejects further registration" {
+    const allocator = std.testing.allocator;
+
+    var container = Container.init(allocator);
+    defer container.deinit();
+
+    const SvcType = struct { id: i32 = 1 };
+    const svc = try allocator.create(SvcType);
+    svc.* = .{};
+    try container.register(SvcType, "svc", svc);
+    container.freeze();
+
+    const svc2 = try allocator.create(SvcType);
+    defer allocator.destroy(svc2);
+    try std.testing.expectError(error.ContainerFrozen, container.register(SvcType, "svc2", svc2));
+    try std.testing.expectError(error.ContainerFrozen, container.registerBorrowed(SvcType, "svc2", svc2));
+
+    // Reads still work after freeze
+    try std.testing.expect(container.get(SvcType, "svc") != null);
+    container.remove("svc"); // no-op while frozen
+    try std.testing.expect(container.contains("svc"));
+}
+
+test "Container registerBorrowed does not destroy the instance" {
+    const allocator = std.testing.allocator;
+
+    var borrowed_instance: i64 = 7; // stack-allocated: would be UB if container destroyed it
+    var container = Container.init(allocator);
+    try container.registerBorrowed(i64, "n", &borrowed_instance);
+    try std.testing.expectEqual(@as(i64, 7), container.get(i64, "n").?.*);
+    container.deinit(); // must only free the wrapper
+    try std.testing.expectEqual(@as(i64, 7), borrowed_instance);
 }

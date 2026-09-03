@@ -1,6 +1,7 @@
 const std = @import("std");
 const zigmodu = @import("zigmodu");
 const http = zigmodu.http;
+const middleware = @import("../../middleware/root.zig");
 
 /// Subscription + plans HTTP API — ComptimeRouter (`docs/ROUTE_TABLE.md`).
 /// Two resources under one module (`plans` + `subscriptions`); nest is empty so
@@ -48,14 +49,7 @@ pub fn SubscriptionApi(comptime Sv: type) type {
         }
 
         fn subscribe(ctx: *http.Context, self: *State) !void {
-            const tenant_str = ctx.queryParam("tenant_id") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing tenant_id");
-                return;
-            };
-            const tenant_id = std.fmt.parseInt(i64, tenant_str, 10) catch {
-                try ctx.sendErrorResponse(400, 0, "Invalid tenant_id");
-                return;
-            };
+            const tenant_id = middleware.requireTenantId(ctx) catch return;
             const plan_str = ctx.queryParam("plan_id") orelse {
                 try ctx.sendErrorResponse(400, 0, "Missing plan_id");
                 return;
@@ -76,14 +70,17 @@ pub fn SubscriptionApi(comptime Sv: type) type {
         }
 
         fn getSubscription(ctx: *http.Context, self: *State) !void {
-            const tenant_str = ctx.param("tenant_id") orelse {
-                try ctx.sendErrorResponse(400, 0, "Missing tenant_id");
-                return;
-            };
-            const tenant_id = std.fmt.parseInt(i64, tenant_str, 10) catch {
+            const tenant_id = middleware.requireTenantId(ctx) catch return;
+            // 路径中的 {tenant_id} 只是资源标识，必须与已验证的租户上下文一致，
+            // 否则改路径即可跨租户读取订阅。
+            const path_tenant = ctx.paramInt(i64, "tenant_id") catch {
                 try ctx.sendErrorResponse(400, 0, "Invalid tenant_id");
                 return;
             };
+            if (path_tenant != tenant_id) {
+                try ctx.sendErrorResponse(403, 0, "Cross-tenant access denied");
+                return;
+            }
             const sub = self.svc.getByTenant(tenant_id) catch |err| {
                 try ctx.sendErrorResponse(500, 0, @errorName(err));
                 return;

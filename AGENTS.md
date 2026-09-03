@@ -12,6 +12,7 @@
 | JWT / 多门户 / RBAC | `docs/ROUTE_TABLE.md` §7.1 + `docs/BEST_PRACTICES.md`「JWT / 多端身份」 |
 | model / Tx / service | `docs/MODULE_LAYERS.md` |
 | Day-1 并发 / 反模式 | `docs/MODULITH.md` |
+| 模块间事件 / DI 注入 | `docs/EVENTS_DI.md`（`initWith(ctx)` + `app.eventBus` + freeze） |
 | 多租户列名 | `docs/ARCHITECTURE.md` § Multi-Tenancy |
 | zent ORM（电商/社交主推组合） | `docs/ZENT.md`（勿与 sqlx 混事务；§4.8 场景能力矩阵） |
 | SQLx 驱动链接 | `docs/SQLX_DRIVERS.md`（`-Ddb=` / `.db=`） |
@@ -248,9 +249,15 @@ const users = try repo.list(page, size);
 
 ### Events
 ```zig
-var bus = zmodu.EventBus(MyEvent).init(allocator);
-try bus.subscribe(myHandler);
-bus.publish(.{ .id = 42 });
+// 应用级共享总线（ThreadSafeEventBus，Application 持有）：
+// 模块在 initWith(ctx) 里取总线/注册服务；容器在 start() 完成后冻结。
+pub fn initWith(ctx: *zmodu.ModuleContext) !void {
+    const bus = try ctx.eventBus(MyEvent);
+    try bus.subscribe(myHandler);
+    const db = ctx.service(sqlx.Client, "db"); // Builder.withService 预注册
+}
+// 外部（handler/测试）: const bus = try app.eventBus(MyEvent); bus.publish(.{ .id = 42 });
+// 单线程局部用途才用裸 EventBus/TypedEventBus（非线程安全）。
 ```
 
 ## File Organization
@@ -286,8 +293,8 @@ bash scripts/ci-integration.sh   # tenant-mgmt + stress + shopdemo（-Ddb=sqlite
 
 ## Version
 - Framework: **v0.15.34** (`build.zig.zon`)
-- Zig: **0.17.0-dev.1422+e863bf3be**（CI 同款锁定版本，见 `.github/workflows/ci.yml` → `ZIG_VERSION`；避免 fmt 行为漂移）
-- Tests: **990/1009 passed**, 19 skipped（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`）
+- Zig: **0.17.0-dev.1567+f0354179a**（CI 同款锁定版本，见 `.github/workflows/ci.yml` → `ZIG_VERSION`；避免 fmt 行为漂移）
+- Tests: **1000/1019 passed**, 19 skipped（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`）
 - Score: ~98/100（`docs/EVALUATION_REPORT.md` v5.6）
 - Roadmap: `docs/PRODUCTION_ROADMAP.md`（phases 1–9 ✅）
 
@@ -317,7 +324,7 @@ bash scripts/ci-integration.sh   # tenant-mgmt + stress + shopdemo（-Ddb=sqlite
 - Sandbox cache：`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`.
 - Auth Path A + `CatalogPermLoadInput` 已落地；legacy JWT 只写 `auth_info`。
 - x402 fail-closed；OTLP/Vault 已支持 HTTPS（系统 CA）。
-- zent v0.32.2 与 `data.sqlx` 正交，勿混驱动/共享事务（`docs/ZENT.md`）；`examples/zent-modulith` 按 v0.32.2 能力演示（v0.13 起向后兼容）。
+- zent v0.33.0 与 `data.sqlx` 正交，勿混驱动/共享事务（`docs/ZENT.md`）；`examples/zent-modulith` 按 v0.33.0 能力演示（v0.13 起向后兼容）。v0.32.3 起 sqlite 单连接访问串行化（`Rows` 持锁至 `deinit()`）；v0.33.0 起 `UseInterceptor` 覆盖 Create/BulkInsert（create 上 `whereEq` = 缺省才填）——升级后先审计存量拦截器（`docs/ZENT.md` §14）。
 - SQLx 选择性链接：`-Ddb=` / `.db=`，默认 `all`；框架测试勿收窄；见 `docs/SQLX_DRIVERS.md`。
 - WS：`WsMessageFn` 含 `WsFrameKind`；fiber/io_uring 分发 text+binary（OpenIM protobuf OK）。
 - CI：`bash scripts/ci-integration.sh`（tenant-mgmt + stress + shopdemo，`-Ddb=sqlite`）。

@@ -54,6 +54,8 @@ pub const Event = @import("core/Event.zig").Event;
 pub const EventBus = @import("core/EventBus.zig").EventBus;
 pub const TypedEventBus = @import("core/EventBus.zig").TypedEventBus;
 pub const ThreadSafeEventBus = @import("core/EventBus.zig").ThreadSafeEventBus;
+pub const EventRegistry = @import("core/EventRegistry.zig").EventRegistry;
+pub const ModuleContext = @import("core/ModuleContext.zig").ModuleContext;
 pub const Container = @import("di/Container.zig").Container;
 
 // ============================================================

@@ -8354,7 +8354,7 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
     );
     // ── Capability flags ──
     if (sopts.with_events) {
-        try buf.appendSlice(allocator, "\n    // -- EventBus --\n    var event_bus = zigmodu.EventBus(struct { id: i64 }).init(allocator);\n    defer event_bus.deinit();\n");
+        try buf.appendSlice(allocator, "\n    // -- EventBus (thread-safe; handlers publish concurrently) --\n    var event_bus = zigmodu.ThreadSafeEventBus(struct { id: i64 }).init(allocator, init.io);\n    defer event_bus.deinit();\n");
     }
 
     if (sopts.with_resilience) {

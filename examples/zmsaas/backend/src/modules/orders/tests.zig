@@ -15,7 +15,7 @@ test "orders persistence + CrudService round-trip" {
     var persist = persistence.OrdersPersistence.init(&backend);
     var svc = service.OrdersService.init(&persist);
 
-    var bus = zigmodu.TypedEventBus(zigmodu.data.CrudEvent(model.Orders)).init(allocator);
+    var bus = zigmodu.ThreadSafeEventBus(zigmodu.data.CrudEvent(model.Orders)).init(allocator, std.testing.io);
     defer bus.deinit();
     svc.crud.setEventBus(&bus);
     const id = try svc.crud.create(.{

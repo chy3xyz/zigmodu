@@ -1,9 +1,18 @@
 const std = @import("std");
 const ApplicationModules = @import("./Module.zig").ApplicationModules;
 const ModuleInfo = @import("./Module.zig").ModuleInfo;
+const ModuleContext = @import("ModuleContext.zig").ModuleContext;
 const ZigModuError = @import("./Error.zig").ZigModuError;
 
+/// Classic startup path (no framework facilities handed to modules).
 pub fn startAll(modules: *ApplicationModules) !void {
+    return startAllWith(modules, null);
+}
+
+/// Startup with a `ModuleContext`: modules declaring `initWith(ctx)` receive
+/// the shared EventRegistry + DI container; others fall back to `init()`.
+/// A module that declares ONLY `initWith` cannot be started without a context.
+pub fn startAllWith(modules: *ApplicationModules, ctx: ?*ModuleContext) !void {
     if (modules.modules.count() == 0) {
         std.log.warn("No modules to start", .{});
         return;
@@ -29,8 +38,25 @@ pub fn startAll(modules: *ApplicationModules) !void {
     for (ordered_modules, 0..) |module_name, idx| {
         const module = modules.get(module_name) orelse continue;
 
-        if (module.init_fn) |init| {
-            std.log.debug("Starting module: {s}", .{module_name});
+        std.log.debug("Starting module: {s}", .{module_name});
+        if (module.init_ctx_fn) |init_ctx| {
+            const c = ctx orelse {
+                if (module.init_fn) |init| {
+                    init(module.ptr) catch |err| {
+                        std.log.err("Failed to start module '{s}': {s}", .{ module_name, @errorName(err) });
+                        return ZigModuError.ModuleInitializationFailed;
+                    };
+                    started_count = idx + 1;
+                    continue;
+                }
+                std.log.warn("Module '{s}' declares only initWith(ctx) but no ModuleContext was provided", .{module_name});
+                return ZigModuError.ModuleInitializationFailed;
+            };
+            init_ctx(module.ptr, c) catch |err| {
+                std.log.err("Failed to start module '{s}': {s}", .{ module_name, @errorName(err) });
+                return ZigModuError.ModuleInitializationFailed;
+            };
+        } else if (module.init_fn) |init| {
             init(module.ptr) catch |err| {
                 std.log.err("Failed to start module '{s}': {s}", .{ module_name, @errorName(err) });
                 return ZigModuError.ModuleInitializationFailed;
@@ -246,4 +272,121 @@ test "stopAll reverse dependency order" {
     stopAll(&scanned);
     // Deinit order must be reverse of init: Top → Middle → Base
     try std.testing.expectEqualStrings("tmb", &Ctx.deinit_order);
+}
+
+test "startAllWith passes ModuleContext to initWith modules" {
+    const allocator = std.testing.allocator;
+
+    const E = struct { n: i64 };
+    const Ctx = struct {
+        var got_ctx: bool = false;
+        var published: i64 = 0;
+        fn onEvent(e: E) void {
+            published = e.n;
+        }
+    };
+
+    const Eventful = struct {
+        pub const info = @import("../api/Module.zig").Module{
+            .name = "eventful",
+            .description = "Uses ModuleContext",
+            .dependencies = &.{},
+        };
+        pub fn initWith(ctx: *ModuleContext) !void {
+            Ctx.got_ctx = true;
+            const bus = try ctx.eventBus(E);
+            try bus.subscribe(Ctx.onEvent);
+            bus.publish(.{ .n = 7 });
+        }
+        pub fn deinit() void {}
+    };
+
+    var scanned = try @import("ModuleScanner.zig").scanModules(allocator, .{Eventful});
+    defer scanned.deinit();
+
+    var registry = @import("EventRegistry.zig").EventRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    var services = @import("../di/Container.zig").Container.init(allocator);
+    defer services.deinit();
+
+    var ctx = ModuleContext{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .events = &registry,
+        .services = &services,
+    };
+
+    try startAllWith(&scanned, &ctx);
+    try std.testing.expect(Ctx.got_ctx);
+    try std.testing.expectEqual(@as(i64, 7), Ctx.published);
+    stopAll(&scanned);
+}
+
+test "startAllWith falls back to init when module declares both hooks" {
+    const allocator = std.testing.allocator;
+
+    const Ctx = struct {
+        var hook: u8 = 0;
+    };
+
+    const Both = struct {
+        pub const info = @import("../api/Module.zig").Module{
+            .name = "both-hooks",
+            .description = "Declares init and initWith",
+            .dependencies = &.{},
+        };
+        pub fn init() !void {
+            Ctx.hook = 1;
+        }
+        pub fn initWith(ctx: *ModuleContext) !void {
+            _ = ctx;
+            Ctx.hook = 2;
+        }
+        pub fn deinit() void {}
+    };
+
+    var scanned = try @import("ModuleScanner.zig").scanModules(allocator, .{Both});
+    defer scanned.deinit();
+
+    var registry = @import("EventRegistry.zig").EventRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    var services = @import("../di/Container.zig").Container.init(allocator);
+    defer services.deinit();
+    var ctx = ModuleContext{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .events = &registry,
+        .services = &services,
+    };
+
+    // With context: initWith wins (init must not also run)
+    try startAllWith(&scanned, &ctx);
+    try std.testing.expectEqual(@as(u8, 2), Ctx.hook);
+    stopAll(&scanned);
+
+    // Without context: falls back to plain init
+    Ctx.hook = 0;
+    try startAll(&scanned);
+    try std.testing.expectEqual(@as(u8, 1), Ctx.hook);
+}
+
+test "initWith-only module fails to start without a context" {
+    const allocator = std.testing.allocator;
+
+    const OnlyCtx = struct {
+        pub const info = @import("../api/Module.zig").Module{
+            .name = "only-ctx",
+            .description = "initWith only",
+            .dependencies = &.{},
+        };
+        pub fn initWith(ctx: *ModuleContext) !void {
+            _ = ctx;
+        }
+        pub fn deinit() void {}
+    };
+
+    var scanned = try @import("ModuleScanner.zig").scanModules(allocator, .{OnlyCtx});
+    defer scanned.deinit();
+
+    try std.testing.expectError(ZigModuError.ModuleInitializationFailed, startAll(&scanned));
 }

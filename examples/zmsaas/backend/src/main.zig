@@ -97,7 +97,7 @@ pub fn main(init: std.process.Init) !void {
 
     // CRUD 即事件源：写操作（含自定义 cancel 走的 crud.update）自动 publish，
     // 订阅方做解耦副作用（日志/通知/审计/外发）。
-    var order_bus = zigmodu.TypedEventBus(zigmodu.data.CrudEvent(orders_mod.model.Orders)).init(allocator);
+    var order_bus = zigmodu.ThreadSafeEventBus(zigmodu.data.CrudEvent(orders_mod.model.Orders)).init(allocator, io);
     defer order_bus.deinit();
     try order_bus.subscribe(orders_mod.events.onOrderEvent);
     svc.crud.setEventBus(&order_bus);

@@ -5,6 +5,91 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+- **`validateSqlFragment` 黑名单加固**（`src/sqlx/sqlx.zig`）：新增拒绝反引号
+  （MySQL 标识符引用）、`#` 注释、`*/` 闭合注释，以及整词匹配（大小写不敏感）
+  的语句关键字 `UNION` / `SELECT` / `INSERT` / `UPDATE` / `DELETE` / `DROP` /
+  `ALTER` / `CREATE` / `ATTACH` / `DETACH` / `PRAGMA` / `EXEC` / `EXECUTE` /
+  `TRUNCATE` / `GRANT` / `REVOKE` / `REPLACE`。标识符内子串（如
+  `updated_at`、`selection`）不误伤；`IN (?, ?)` 等括号谓词不受影响。
+  值仍必须走 `?` 占位符——此为纵深防御而非主防线。
+- **JWT 空 `aud` 不再写入 `tenant_id` attr**（`src/api/Middleware.zig`）：
+  原先空串 attr 会遮蔽 `X-Tenant-ID` 回退路径并让下游 int 解析失败；
+  现在 `aud` 为空时 attr 缺省（`ctx.tenantId()` 返回 null）。
+
+### Changed
+- **EventBus 线程安全语义澄清**（`src/core/EventBus.zig`）：文件头原注释自称
+  "Thread-safe" 与事实相反，已修正；`EventBus` / `TypedEventBus` /
+  `UnifiedEventBus` 均显式标注 NOT thread-safe，并发场景指向
+  `ThreadSafeEventBus`。`ThreadSafeEventBus` 新增 `publishedCount()`。
+- **`CrudService.setEventBus` 改收 `*ThreadSafeEventBus`**（`src/data/CrudService.zig`）：
+  CRUD 事件在 HTTP handler 线程发布，原 `*TypedEventBus` 无同步保护。
+  zmodu 代码模板（`service_header.zig.tpl`、smoke 脚手架、`saas` 生成器）
+  同步默认生成 `ThreadSafeEventBus`。
+- **`tenant-mgmt` 示例落地真实租户隔离**：租户中间件从空壳改为
+  JWT `aud` 优先、`X-Tenant-ID` 头回退（dev 路径）、两者冲突 403；
+  user/subscription handler 改经 `requireTenantId(ctx)` 读 attr，
+  不再信任 `?tenant_id=` query；`GET /subscriptions/{tenant_id}` 校验路径
+  租户与上下文一致，跨租户 403。中间件顺序修正为 JWT → tenant。
+  `ci-integration.sh` 新增三条租户隔离探针（401/200/403）。
+- **`check-production.sh` 门禁覆盖全文**：`Server.zig` / `sqlx.zig` 的硬编码
+  行号截断（1700/2739）改为与其它热路径一致的动态截断（首个 `test "` 行），
+  消除后半文件不受约束的盲区；扩扫后当前零违规。
+- **README**：`DistributedEventBus` / `SagaOrchestrator`（及 zh 版
+  ClusterMembership & Raft）补 ⚠️ experimental 标注；`examples/README.md`
+  移除四个不存在的幽灵示例章节（dependency-injection / architecture /
+  v2-showcase / ecommerce）并同步学习路径与统计表。
+- `gen-jwt-token` 支持 `JWT_AUD`（生成带 `aud` 的 token，供租户探针使用）。
+- **EventBus / DI 接入 Application**（闭环"主推抽象未接线"）：新增
+  `core/EventRegistry.zig`（按 `@typeName(T)` 类型擦除的 get-or-create
+  注册表，只发放 `ThreadSafeEventBus`）与 `core/ModuleContext.zig`
+  （`allocator`/`io`/`events`/`services`）。模块可选声明
+  `pub fn initWith(ctx: *ModuleContext) !void`——`ModuleScanner` 编译期
+  探测（`@hasDecl`）、`Lifecycle.startAllWith` 优先调用（与 `init` 并存时
+  只调 `initWith`；仅 `initWith` 而无 ctx 时启动失败并回滚）。
+  `Application` 持有 `events` + `services`，`start()` 完成后
+  `services.freeze()`（之后 `get` 为无锁只读、注册报 `ContainerFrozen`）；
+  新增 `app.eventBus(T)` / `app.service(T, name)` 与
+  `Builder.withService(T, name, ptr)`（借用注册，容器不销毁实例）。
+  `di.Container` 新增 `registerBorrowed`（修复栈指针注册被 deinit 销毁的
+  所有权陷阱）。shopdemo 成为首个真实使用者：order 服务经
+  `app.eventBus(OrderEvent)` 接线并在 create 时发布事件。最佳实践文档：
+  `docs/EVENTS_DI.md`（MODULITH.md §2.3/§4 与 AGENTS.md 文档地图已交叉引用）。
+
+### Changed
+- **zent 适配 v0.32.3**（sqlite 连接访问串行化修复，公共 API 无签名变化）：
+  `examples/zent-modulith` pin 升至 `v0.32.3` tag；`docs/ZENT.md`
+  版本口径与远程 zon 样例同步，§14 新增升级条目（`Rows` 持锁至
+  `deinit()`、遍历完立即释放）；`AGENTS.md` / 示例 zon 注释同步。
+  `examples/metaverse-creative` 修复 libpq 链接：`src/db.zig` 引用
+  `zent.sql_postgres`，而 zent 在检测到 libpq 头文件时接入 `pg_c` 却
+  不链库本体——`_shared/db_link.zig` 新增 `linkDetected()`（检测到才
+  链接），示例 build.zig 经它为 `zent_mod` 链接 pq。
+  `examples/zent-modulith/README.md` 的 products 载荷补必填的
+  `price`（Decimal 列）字段。
+- **zent 适配 v0.33.0**（`UseInterceptor` 覆盖 Create/BulkInsert——create
+  上 `whereEq` 语义为"缺省才填"，显式值保留）：`examples/zent-modulith`
+  pin 升至 `v0.33.0` tag，并落地真实拦截器演示路由
+  `GET/POST /api/v1/tenant-injection`（`features_demo.InterceptorApi`）：
+  独立 client + 哨兵租户 777，create 缺省填充、查询透明限定，验证
+  v0.33.0 写路径拦截在消费端生效（此前头注释宣称该演示但实际未实现）。
+  `docs/ZENT.md` §14 新增升级条目（**存量拦截器升级后会开始影响写入，
+  需先审计**）；README 补对应章节。⚠️ 排障记录：Zig 0.17-dev 增量缓存
+  对 path/fetch 依赖的模块变更可能不失效——升级依赖后行为未变时先删
+  示例的 `.zig-cache` 再重建（本次实测：symbol 探针证明二进制里是旧版
+  zent，清缓存后一次性通过）。
+
+### Removed
+- **`persistence/Database.zig` 的 stub `Repository(T)`**：纯空壳
+  （所有方法 no-op）且无任何租户变体，与 `Orm.zig` 的 `Repository(T)`
+  同名并存易误用。零调用点，直接删除。规范入口仍是 `data.Repository(T)`。
+- **`TenantContext.getDefault()`**：返回非原子可变全局指针、标注
+  "non-concurrent use" 且零调用点，属待触发隐患。新增
+  `TenantContext.fromAttr(?[]const u8) ?TenantContext` 桥接 HTTP attr
+  通路与 TenantContext 类型（attr 缺失/非法/非正数 → null）。
+
 ## [0.15.34] - 2026-08-31
 
 ### Changed

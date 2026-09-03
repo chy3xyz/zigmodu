@@ -15,19 +15,26 @@ pub const OrderEvent = union(enum) {
 
 pub const OrderService = struct {
     persistence: *persistence.OrderPersistence,
-    event_bus: ?*zigmodu.TypedEventBus(OrderEvent) = null,
+    event_bus: ?*zigmodu.ThreadSafeEventBus(OrderEvent) = null,
 
     pub fn init(p: *persistence.OrderPersistence) OrderService {
         return .{ .persistence = p };
     }
 
-    pub fn withEvents(self: *OrderService, bus: *zigmodu.TypedEventBus(OrderEvent)) void {
+    pub fn withEvents(self: *OrderService, bus: *zigmodu.ThreadSafeEventBus(OrderEvent)) void {
         self.event_bus = bus;
     }
 
     // Event hooks — emit after persistence operations:
     fn afterCreate(self: *OrderService, entity: anytype) void {
-        if (self.event_bus) |bus| bus.publish(.{ .created = .{ .id = entity.id } });
+        const T = @TypeOf(entity);
+        const id: i64 = if (@hasField(T, "id"))
+            entity.id
+        else if (@hasField(T, "order_id"))
+            entity.order_id
+        else
+            0;
+        if (self.event_bus) |bus| bus.publish(.{ .created = .{ .id = id } });
     }
 
     pub fn listZmoduOrders(self: *OrderService, page: usize, size: usize) !data.orm.PageResult(model.ZmoduOrder) {
@@ -42,7 +49,9 @@ pub const OrderService = struct {
 
     pub fn createZmoduOrder(self: *OrderService, entity: model.ZmoduOrder) !model.ZmoduOrder {
         var repo = self.persistence.zmoduOrderRepo();
-        return try repo.insert(entity);
+        const created = try repo.insert(entity);
+        self.afterCreate(created);
+        return created;
     }
 
     pub fn updateZmoduOrder(self: *OrderService, entity: model.ZmoduOrder) !void {

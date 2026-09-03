@@ -103,21 +103,66 @@ pub fn validateIdentifier(name: []const u8) error{InvalidSqlIdentifier}!void {
     }
 }
 
-/// Defense-in-depth check for SQL fragments interpolated into query strings
-/// (e.g. `where_clause` in findOne/findAll). Values MUST be passed via `?`
-/// placeholders + args — string literals, statement separators and comments
-/// are rejected to block injection through the fragment itself.
-pub fn validateSqlFragment(fragment: []const u8) error{UnsafeSqlFragment}!void {
-    if (fragment.len > 4096) return error.UnsafeSqlFragment;
+/// Statement keywords rejected as whole tokens (case-insensitive) inside SQL
+/// fragments. Fragments are WHERE-style predicates; a statement keyword means
+/// the caller is smuggling a second statement or subquery, not a predicate.
+const banned_fragment_keywords = [_][]const u8{
+    "union",   "select",   "insert", "update", "delete",  "drop",
+    "alter",   "create",   "attach", "detach", "pragma",  "exec",
+    "execute", "truncate", "grant",  "revoke", "replace",
+};
+
+/// Character-level bans shared by fragment and statement validation:
+/// string literals, statement separators, comments and identifier quoting.
+fn validateSqlChars(sql: []const u8) error{UnsafeSqlFragment}!void {
     var i: usize = 0;
-    while (i < fragment.len) : (i += 1) {
-        switch (fragment[i]) {
-            '\'', '"', ';', 0 => return error.UnsafeSqlFragment,
-            '-' => if (i + 1 < fragment.len and fragment[i + 1] == '-') return error.UnsafeSqlFragment,
-            '/' => if (i + 1 < fragment.len and fragment[i + 1] == '*') return error.UnsafeSqlFragment,
+    while (i < sql.len) : (i += 1) {
+        switch (sql[i]) {
+            '\'', '"', '`', ';', '#', 0 => return error.UnsafeSqlFragment,
+            '-' => if (i + 1 < sql.len and sql[i + 1] == '-') return error.UnsafeSqlFragment,
+            '/' => if (i + 1 < sql.len and (sql[i + 1] == '*' or sql[i + 1] == '/')) return error.UnsafeSqlFragment,
+            '*' => if (i + 1 < sql.len and sql[i + 1] == '/') return error.UnsafeSqlFragment,
             else => {},
         }
     }
+}
+
+/// Defense-in-depth check for SQL fragments interpolated into query strings
+/// (e.g. `where_clause` in findOne/findAll). Values MUST be passed via `?`
+/// placeholders + args — string literals, statement separators, comments,
+/// identifier quoting (backticks) and statement keywords (`UNION`, `SELECT`,
+/// ...) are rejected to block injection through the fragment itself.
+pub fn validateSqlFragment(fragment: []const u8) error{UnsafeSqlFragment}!void {
+    if (fragment.len > 4096) return error.UnsafeSqlFragment;
+    try validateSqlChars(fragment);
+    var i: usize = 0;
+    while (i < fragment.len) : (i += 1) {
+        switch (fragment[i]) {
+            'a'...'z', 'A'...'Z', '_' => {
+                const start = i;
+                while (i + 1 < fragment.len) : (i += 1) {
+                    const n = fragment[i + 1];
+                    if (!((n >= 'a' and n <= 'z') or (n >= 'A' and n <= 'Z') or (n >= '0' and n <= '9') or n == '_')) break;
+                }
+                const tok = fragment[start .. i + 1];
+                for (banned_fragment_keywords) |kw| {
+                    if (std.ascii.eqlIgnoreCase(tok, kw)) return error.UnsafeSqlFragment;
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+/// Statement-context variant for full read-only statements (e.g. the AI
+/// `db.query` skill, which additionally requires a leading `SELECT`):
+/// applies the character-level bans (literals / comments / separators /
+/// backticks) but no keyword ban — a full statement legitimately starts
+/// with `SELECT` and may contain subqueries. Callers must enforce the
+/// read-only verb themselves before/after calling this.
+pub fn validateSqlStatement(sql: []const u8) error{UnsafeSqlFragment}!void {
+    if (sql.len > 4096) return error.UnsafeSqlFragment;
+    try validateSqlChars(sql);
 }
 
 /// SQL value types for parameterized queries
@@ -5872,12 +5917,32 @@ test "validateIdentifier and validateSqlFragment" {
     try validateSqlFragment("name = ?1");
     try validateSqlFragment("age > ? AND status = ?");
     try validateSqlFragment("WHERE tenant_id = ? ORDER BY id");
+    try validateSqlFragment("id IN (?, ?, ?)");
+    try validateSqlFragment("selection = ? AND updated_at > ?"); // banned substrings inside identifiers are fine
 
     // Unsafe fragments
     try std.testing.expectError(error.UnsafeSqlFragment, validateSqlFragment("name = 'Alice'"));
     try std.testing.expectError(error.UnsafeSqlFragment, validateSqlFragment("1=1; DROP TABLE users"));
     try std.testing.expectError(error.UnsafeSqlFragment, validateSqlFragment("1=1 -- comment"));
     try std.testing.expectError(error.UnsafeSqlFragment, validateSqlFragment("1=1 /* comment */"));
+    // Identifier quoting / MySQL comment / closing block comment
+    try std.testing.expectError(error.UnsafeSqlFragment, validateSqlFragment("name = `admin`"));
+    try std.testing.expectError(error.UnsafeSqlFragment, validateSqlFragment("1=1 # comment"));
+    try std.testing.expectError(error.UnsafeSqlFragment, validateSqlFragment("1=1 */"));
+    // Statement keywords (case-insensitive, whole-token)
+    try std.testing.expectError(error.UnsafeSqlFragment, validateSqlFragment("1=1 UNION SELECT password FROM users"));
+    try std.testing.expectError(error.UnsafeSqlFragment, validateSqlFragment("1=1 union all select 1"));
+    try std.testing.expectError(error.UnsafeSqlFragment, validateSqlFragment("id = (SELECT id FROM users)"));
+    try std.testing.expectError(error.UnsafeSqlFragment, validateSqlFragment("1=1; drop table users"));
+}
+
+test "validateSqlStatement allows full SELECT but bans literals/comments" {
+    try validateSqlStatement("SELECT id, name FROM users WHERE tenant_id = ?1");
+    try validateSqlStatement("SELECT id FROM (SELECT id FROM users) AS t WHERE t.id = ?");
+    try std.testing.expectError(error.UnsafeSqlFragment, validateSqlStatement("SELECT * FROM users WHERE name = 'x'"));
+    try std.testing.expectError(error.UnsafeSqlFragment, validateSqlStatement("SELECT 1; DROP TABLE users"));
+    try std.testing.expectError(error.UnsafeSqlFragment, validateSqlStatement("SELECT 1 -- tail"));
+    try std.testing.expectError(error.UnsafeSqlFragment, validateSqlStatement("SELECT `pw` FROM users"));
 }
 
 test "cached conn findOne" {

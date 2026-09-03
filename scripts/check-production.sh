@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Fail CI if banned error-handling patterns appear in production hot paths
-# (tests excluded by line cap):
+# (test blocks excluded by truncating at the first `test "` line):
 #   - bare `catch {}`        — swallows errors silently
 #   - `catch unreachable`    — turns runtime errors into panics
 set -euo pipefail
@@ -21,14 +21,12 @@ scan_range() {
   fi
 }
 
-# Server/sqlx caps are explicit: keep the whole production hot-path section
-# scanned even if tests are added later (line caps below are deliberate).
-scan_range src/api/Server.zig 1700
-scan_range src/sqlx/sqlx.zig 2739
-
-# Hot-path modules: production error handling must never swallow errors.
-# Test code is excluded automatically by the first `test "` line.
+# Server/sqlx are scanned with the same dynamic rule as every other hot path:
+# production code up to the first `test "` block. Hard-coded line caps used to
+# silently exempt 49%/62% of these files — do not reintroduce them.
 HOT_PATHS=(
+  src/api/Server.zig
+  src/sqlx/sqlx.zig
   src/redis/redis.zig
   src/messaging/Nats.zig
   src/core/ClusterMembership.zig

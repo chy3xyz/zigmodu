@@ -37,6 +37,8 @@ test "compile all source files" {
     _ = @import("core/Error.zig");
     _ = @import("core/Event.zig");
     _ = @import("core/EventBus.zig");
+    _ = @import("core/EventRegistry.zig");
+    _ = @import("core/ModuleContext.zig");
     _ = @import("core/EventLogger.zig");
     _ = @import("core/EventPublisher.zig");
     _ = @import("core/EventStore.zig");

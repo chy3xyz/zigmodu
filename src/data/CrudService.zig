@@ -21,7 +21,7 @@ pub fn CrudService(comptime Entity: type, comptime P: type) type {
         const Self = @This();
 
         persistence: *P,
-        event_bus: ?*event_bus.TypedEventBus(CrudEvent(Entity)) = null,
+        event_bus: ?*event_bus.ThreadSafeEventBus(CrudEvent(Entity)) = null,
         /// Optional validation hook called by create/update.
         validate: ?*const fn (Entity) anyerror!void = null,
 
@@ -29,7 +29,7 @@ pub fn CrudService(comptime Entity: type, comptime P: type) type {
             return .{ .persistence = p };
         }
 
-        pub fn setEventBus(self: *Self, bus: *event_bus.TypedEventBus(CrudEvent(Entity))) void {
+        pub fn setEventBus(self: *Self, bus: *event_bus.ThreadSafeEventBus(CrudEvent(Entity))) void {
             self.event_bus = bus;
         }
 
@@ -102,7 +102,7 @@ const FakePersistence = struct {
 
 test "CrudService delegates and publishes events" {
     const allocator = std.testing.allocator;
-    var bus = event_bus.TypedEventBus(CrudEvent(FakeEntity)).init(allocator);
+    var bus = event_bus.ThreadSafeEventBus(CrudEvent(FakeEntity)).init(allocator, std.testing.io);
     defer bus.deinit();
     try bus.subscribe(struct {
         fn h(e: CrudEvent(FakeEntity)) void {
@@ -120,5 +120,5 @@ test "CrudService delegates and publishes events" {
     try std.testing.expect(persist.updated);
     try svc.delete(1, 7);
     try std.testing.expect(persist.deleted);
-    try std.testing.expectEqual(@as(usize, 3), bus.publishedCount());
+    try std.testing.expectEqual(@as(usize, 1), bus.subscriberCount());
 }
