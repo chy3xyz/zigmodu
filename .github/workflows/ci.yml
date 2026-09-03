@@ -34,9 +34,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Setup Zig
-        uses: mlugg/setup-zig@v1
-        with:
-          version: ${{ env.ZIG_VERSION }}
+        # mlugg/setup-zig@v1 builds old-pattern URLs (zig-<os>-<arch>) that
+        # 404 for current dev builds; download the tarball from ziglang.org
+        # directly using the arch-first name. Old dev builds get
+        # garbage-collected — bump ZIG_VERSION when this 404s again.
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux) ART="zig-x86_64-linux" ;;
+            macOS) ART="zig-aarch64-macos" ;;
+            *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
+          esac
+          curl -fsSL "https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
+          echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
       - name: Cross-compile library (driver-free)
         run: zig build -Ddb=none -Dtarget=x86_64-windows
 
@@ -48,19 +60,26 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        include:
-          - os: ubuntu-latest
-            zig-bin: zig-linux-x86_64
-          - os: macos-latest
-            zig-bin: zig-macos-aarch64
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v1
-        with:
-          version: ${{ env.ZIG_VERSION }}
+        # mlugg/setup-zig@v1 builds old-pattern URLs (zig-<os>-<arch>) that
+        # 404 for current dev builds; download the tarball from ziglang.org
+        # directly using the arch-first name. Old dev builds get
+        # garbage-collected — bump ZIG_VERSION when this 404s again.
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux) ART="zig-x86_64-linux" ;;
+            macOS) ART="zig-aarch64-macos" ;;
+            *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
+          esac
+          curl -fsSL "https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
+          echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
 
       - name: Cache Zig deps
         uses: actions/cache@v4
@@ -181,9 +200,21 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v1
-        with:
-          version: ${{ env.ZIG_VERSION }}
+        # mlugg/setup-zig@v1 builds old-pattern URLs (zig-<os>-<arch>) that
+        # 404 for current dev builds; download the tarball from ziglang.org
+        # directly using the arch-first name. Old dev builds get
+        # garbage-collected — bump ZIG_VERSION when this 404s again.
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux) ART="zig-x86_64-linux" ;;
+            macOS) ART="zig-aarch64-macos" ;;
+            *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
+          esac
+          curl -fsSL "https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
+          echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
 
       - name: Install deps
         run: sudo apt-get install -y libpq-dev libmariadb-dev libsqlite3-dev
@@ -204,9 +235,21 @@ jobs:
       # violated the workspace sandbox and pinned a stale v0.12.1-era commit.
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v1
-        with:
-          version: ${{ env.ZIG_VERSION }}
+        # mlugg/setup-zig@v1 builds old-pattern URLs (zig-<os>-<arch>) that
+        # 404 for current dev builds; download the tarball from ziglang.org
+        # directly using the arch-first name. Old dev builds get
+        # garbage-collected — bump ZIG_VERSION when this 404s again.
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux) ART="zig-x86_64-linux" ;;
+            macOS) ART="zig-aarch64-macos" ;;
+            *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
+          esac
+          curl -fsSL "https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
+          echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
 
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y libpq-dev libmariadb-dev libsqlite3-dev
@@ -231,9 +274,21 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v1
-        with:
-          version: ${{ env.ZIG_VERSION }}
+        # mlugg/setup-zig@v1 builds old-pattern URLs (zig-<os>-<arch>) that
+        # 404 for current dev builds; download the tarball from ziglang.org
+        # directly using the arch-first name. Old dev builds get
+        # garbage-collected — bump ZIG_VERSION when this 404s again.
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux) ART="zig-x86_64-linux" ;;
+            macOS) ART="zig-aarch64-macos" ;;
+            *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
+          esac
+          curl -fsSL "https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
+          echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
 
       - name: Install system deps
         run: sudo apt-get update && sudo apt-get install -y libpq-dev libmariadb-dev libsqlite3-dev curl
@@ -264,9 +319,21 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v1
-        with:
-          version: ${{ env.ZIG_VERSION }}
+        # mlugg/setup-zig@v1 builds old-pattern URLs (zig-<os>-<arch>) that
+        # 404 for current dev builds; download the tarball from ziglang.org
+        # directly using the arch-first name. Old dev builds get
+        # garbage-collected — bump ZIG_VERSION when this 404s again.
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux) ART="zig-x86_64-linux" ;;
+            macOS) ART="zig-aarch64-macos" ;;
+            *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
+          esac
+          curl -fsSL "https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
+          echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
 
       - name: Install system deps
         run: sudo apt-get update && sudo apt-get install -y libpq-dev libmariadb-dev libsqlite3-dev
@@ -298,9 +365,21 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v1
-        with:
-          version: ${{ env.ZIG_VERSION }}
+        # mlugg/setup-zig@v1 builds old-pattern URLs (zig-<os>-<arch>) that
+        # 404 for current dev builds; download the tarball from ziglang.org
+        # directly using the arch-first name. Old dev builds get
+        # garbage-collected — bump ZIG_VERSION when this 404s again.
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux) ART="zig-x86_64-linux" ;;
+            macOS) ART="zig-aarch64-macos" ;;
+            *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
+          esac
+          curl -fsSL "https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
+          echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
 
       - name: Install system deps
         run: sudo apt-get update && sudo apt-get install -y libpq-dev libmariadb-dev libsqlite3-dev
@@ -350,9 +429,21 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v1
-        with:
-          version: ${{ env.ZIG_VERSION }}
+        # mlugg/setup-zig@v1 builds old-pattern URLs (zig-<os>-<arch>) that
+        # 404 for current dev builds; download the tarball from ziglang.org
+        # directly using the arch-first name. Old dev builds get
+        # garbage-collected — bump ZIG_VERSION when this 404s again.
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux) ART="zig-x86_64-linux" ;;
+            macOS) ART="zig-aarch64-macos" ;;
+            *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
+          esac
+          curl -fsSL "https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
+          echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
 
       - name: Install system deps
         run: sudo apt-get update && sudo apt-get install -y libpq-dev libmariadb-dev libsqlite3-dev
@@ -373,9 +464,21 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v1
-        with:
-          version: ${{ env.ZIG_VERSION }}
+        # mlugg/setup-zig@v1 builds old-pattern URLs (zig-<os>-<arch>) that
+        # 404 for current dev builds; download the tarball from ziglang.org
+        # directly using the arch-first name. Old dev builds get
+        # garbage-collected — bump ZIG_VERSION when this 404s again.
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux) ART="zig-x86_64-linux" ;;
+            macOS) ART="zig-aarch64-macos" ;;
+            *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
+          esac
+          curl -fsSL "https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
+          echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
 
       - name: Install deps
         run: sudo apt-get install -y libpq-dev libmariadb-dev libsqlite3-dev
@@ -441,9 +544,21 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v1
-        with:
-          version: ${{ env.ZIG_VERSION }}
+        # mlugg/setup-zig@v1 builds old-pattern URLs (zig-<os>-<arch>) that
+        # 404 for current dev builds; download the tarball from ziglang.org
+        # directly using the arch-first name. Old dev builds get
+        # garbage-collected — bump ZIG_VERSION when this 404s again.
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux) ART="zig-x86_64-linux" ;;
+            macOS) ART="zig-aarch64-macos" ;;
+            *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
+          esac
+          curl -fsSL "https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
+          echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
 
       - name: Install deps
         run: sudo apt-get install -y libpq-dev libmariadb-dev libsqlite3-dev
@@ -485,9 +600,21 @@ jobs:
         if: ${{ env.LLM_API_KEY != '' }}
       - name: Setup Zig
         if: ${{ env.LLM_API_KEY != '' }}
-        uses: mlugg/setup-zig@v1
-        with:
-          version: ${{ env.ZIG_VERSION }}
+        # mlugg/setup-zig@v1 builds old-pattern URLs (zig-<os>-<arch>) that
+        # 404 for current dev builds; download the tarball from ziglang.org
+        # directly using the arch-first name. Old dev builds get
+        # garbage-collected — bump ZIG_VERSION when this 404s again.
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux) ART="zig-x86_64-linux" ;;
+            macOS) ART="zig-aarch64-macos" ;;
+            *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
+          esac
+          curl -fsSL "https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
+          echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
       - name: Install deps
         if: ${{ env.LLM_API_KEY != '' }}
         run: sudo apt-get install -y libsqlite3-dev
