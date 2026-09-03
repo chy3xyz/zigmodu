@@ -18,8 +18,10 @@ concurrency:
 
 env:
   # Pin the exact toolchain used for local development so fmt/build behavior
-  # is reproducible in CI (dev builds are also fetchable by mlugg/setup-zig).
-  ZIG_VERSION: "0.17.0-dev.1567+f0354179a"
+  # is reproducible in CI. NOTE: ziglang mirrors garbage-collect old dev
+  # builds — dev.1567 404'd and broke Setup Zig; when that recurs, bump to
+  # the current master dev build and verify locally first.
+  ZIG_VERSION: "0.17.0-dev.1970+67f39b551"
 
 jobs:
   # ── Windows cross-compile (no DB drivers) ──────
@@ -197,15 +199,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Checkout zent (zent-modulith sibling dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: chy3xyz/zent
-          path: ../zent
-          # Pin the exact commit used for local verification (v0.12.1 + the
-          # extern-c build fix) so example builds stay reproducible.
-          ref: 1efd9fb
+      # No sibling zent checkout: zent-modulith pins zent via git tag in its
+      # build.zig.zon (v0.33.0); the old actions/checkout into ../zent both
+      # violated the workspace sandbox and pinned a stale v0.12.1-era commit.
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v1
