@@ -477,22 +477,29 @@ jobs:
   ai-real-provider:
     name: AI real-provider smoke
     runs-on: ubuntu-latest
-    if: ${{ env.LLM_API_KEY != '' }}
+    # secrets/env are NOT available in a job-level `if` (GitHub rejects the
+    # whole workflow with "Unrecognized named-value: 'env'"). Gate per-step
+    # instead: env context is populated by the time steps evaluate.
     env:
       LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
       LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
       LLM_MODEL: ${{ secrets.LLM_MODEL }}
     steps:
       - uses: actions/checkout@v4
+        if: ${{ env.LLM_API_KEY != '' }}
       - name: Setup Zig
+        if: ${{ env.LLM_API_KEY != '' }}
         uses: mlugg/setup-zig@v1
         with:
           version: ${{ env.ZIG_VERSION }}
       - name: Install deps
+        if: ${{ env.LLM_API_KEY != '' }}
         run: sudo apt-get install -y libsqlite3-dev
       - name: Build llm-policies example
+        if: ${{ env.LLM_API_KEY != '' }}
         run: (cd examples/llm-policies && zig build)
       - name: Run real-provider policy smoke
+        if: ${{ env.LLM_API_KEY != '' }}
         run: (cd examples/llm-policies && ./zig-out/bin/llm-policies)
         env:
           LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
