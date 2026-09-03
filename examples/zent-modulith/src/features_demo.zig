@@ -9,7 +9,9 @@
 //!   - inner-join eager loading (`WithEdgeOptions`) without limit skew;
 //!   - business-key upsert (`SaveOrUpdateOn`) — payment-retry safe;
 //!   - exact money columns (`field.Decimal`) scanned as owned text;
-//!   - runtime interceptor (`UseInterceptor`) injecting tenant_id;
+//!   - runtime interceptor (`UseInterceptor`, v0.33) filling tenant_id
+//!     on create (if-missing) and scoping queries — see `InterceptorApi`
+//!     at the bottom of this file (`/api/v1/tenant-injection`);
 //!   - request-scoped entity teardown (`managedEntity`/`dupeEntityTo`).
 
 const std = @import("std");
@@ -432,6 +434,90 @@ pub fn FeedModernApi(comptime Client: type) type {
 
             const arr = try maskedArrayJson(arena, persist.infos, persist.AuthorInfo, copies);
             const body = try std.fmt.allocPrint(arena, "{{\"authors\":{s}}}", .{arr});
+            try ctx.json(200, body);
+        }
+    };
+}
+
+/// InterceptorApi: zent v0.33 runtime-interceptor demo over a DEDICATED
+/// client (the shared client keeps explicit-tenant semantics for the other
+/// routes). A fixed sentinel tenant is carried in the interceptor ctx:
+///   - create: an omitted `tenant_id` column is filled if-missing (v0.33);
+///     an explicit value would be kept;
+///   - query: the same predicate transparently scopes the list — the handler
+///     issues no `Where` of its own.
+pub fn InterceptorApi(comptime Client: type) type {
+    return struct {
+        const Self = @This();
+
+        client: *Client,
+
+        pub const module_name = "catalog";
+        pub const nest = .{"tenant-injection"};
+        pub const State = Self;
+
+        /// Fixed sentinel tenant injected by the interceptor (read-only ctx,
+        /// safe for concurrent handlers).
+        pub const sentinel_tenant: i64 = 777;
+
+        pub fn init(client: *Client) Self {
+            return .{ .client = client };
+        }
+
+        /// Interceptor instance bound to `tenant` — register with
+        /// `zent.codegen.client.UseInterceptor(infos, &client, interceptor(&t))`.
+        pub fn interceptor(tenant: *const i64) zent.runtime.intercept.Interceptor {
+            return .{
+                .ctx = @constCast(tenant),
+                .intercept = struct {
+                    fn f(ctx: ?*anyopaque, view: *zent.runtime.intercept.QueryView) anyerror!void {
+                        const id: *i64 = @ptrCast(@alignCast(ctx.?));
+                        try view.whereEq("tenant_id", .{ .int = id.* });
+                    }
+                }.f,
+            };
+        }
+
+        const CreateBody = struct {
+            name: []const u8,
+            price_cents: i64,
+            price: []const u8, // exact decimal text, e.g. "19.99"
+        };
+
+        pub const routes = [_]http.RouteSpec(State){
+            .{ .method = .GET, .path = "", .handler = list, .meta = .{ .auth = .public } },
+            .{ .method = .POST, .path = "", .handler = create, .meta = .{ .auth = .public } },
+        };
+
+        fn create(ctx: *http.Context, self: *State) !void {
+            const body = ctx.bindJson(CreateBody) catch |err| return http.respondErr(ctx, err);
+            var b = try self.client.product.Create();
+            defer b.deinit();
+            // tenant_id intentionally omitted — the interceptor fills it.
+            _ = try b.setFieldValue("name", body.name);
+            _ = try b.setFieldValue("price_cents", body.price_cents);
+            _ = try b.setFieldValue("price", body.price);
+            var row = b.Save() catch |err| {
+                std.log.err("[tenant-injection] create failed: {s}", .{@errorName(err)});
+                return http.respondErr(ctx, err);
+            };
+            defer zent.codegen.deinitEntity(persist.infos, persist.ProductInfo, &row, self.client.allocator);
+            try ctx.jsonStruct(201, .{ .id = row.id, .tenant_id = row.tenant_id, .name = row.name });
+        }
+
+        fn list(ctx: *http.Context, self: *State) !void {
+            // No explicit Where — the interceptor scopes to the sentinel tenant.
+            var q = self.client.product.Query();
+            defer q.deinit();
+            const rows = q.All() catch |err| return http.respondErr(ctx, err);
+            defer {
+                for (rows.items) |*p| zent.codegen.deinitEntity(persist.infos, persist.ProductInfo, p, self.client.allocator);
+                rows.deinit();
+            }
+            const arr = try maskedArrayJson(self.client.allocator, persist.infos, persist.ProductInfo, rows.items);
+            defer self.client.allocator.free(arr);
+            const body = try std.fmt.allocPrint(self.client.allocator, "{{\"tenant\":{d},\"items\":{s}}}", .{ sentinel_tenant, arr });
+            defer self.client.allocator.free(body);
             try ctx.json(200, body);
         }
     };

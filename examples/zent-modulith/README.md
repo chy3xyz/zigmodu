@@ -1,6 +1,6 @@
 # zent-modulith — ZigModu + zent
 
-Demonstrates **ZigModu** (Application / HTTP / **ComptimeRouter**) with **[zent](https://github.com/chy3xyz/zent)** v0.32.2 as the schema-as-code data layer (demos span v0.21–v0.32 capabilities).
+Demonstrates **ZigModu** (Application / HTTP / **ComptimeRouter**) with **[zent](https://github.com/chy3xyz/zent)** v0.33.0 as the schema-as-code data layer (demos span v0.21–v0.32 capabilities).
 
 See framework guides: [`docs/ZENT.md`](../../docs/ZENT.md) · [`docs/ROUTE_TABLE.md`](../../docs/ROUTE_TABLE.md).
 
@@ -33,7 +33,7 @@ curl -s http://127.0.0.1:18100/health/live
 curl -s http://127.0.0.1:18100/openapi.json | head
 curl -s -X POST 'http://127.0.0.1:18100/api/v1/tenants?name=Acme&domain=acme.test'
 curl -s -X POST 'http://127.0.0.1:18100/api/v1/products?tenant_id=1' \
-  -H 'Content-Type: application/json' -d '{"name":"Widget","price_cents":1999}'
+  -H 'Content-Type: application/json' -d '{"name":"Widget","price_cents":1999,"price":"19.99"}'
 curl -s 'http://127.0.0.1:18100/api/v1/products?tenant_id=1&page=1&page_size=20'
 curl -s 'http://127.0.0.1:18100/api/v1/products/1?tenant_id=1'
 ```
@@ -51,11 +51,11 @@ list/create/get/update/delete 五条路由（ComptimeRouter），内部包
 curl -s 'http://127.0.0.1:18100/api/v1/products?tenant_id=1&page_size=10000'
 # create（JSON body；tenant 来自 query/attr，不入 body）
 curl -s -X POST 'http://127.0.0.1:18100/api/v1/products?tenant_id=1' \
-  -H 'Content-Type: application/json' -d '{"name":"Widget","price_cents":1999}'
+  -H 'Content-Type: application/json' -d '{"name":"Widget","price_cents":1999,"price":"19.99"}'
 # get / update / delete（跨租户访问返回 404）
 curl -s 'http://127.0.0.1:18100/api/v1/products/1?tenant_id=1'
 curl -s -X PUT 'http://127.0.0.1:18100/api/v1/products/1?tenant_id=1' \
-  -H 'Content-Type: application/json' -d '{"name":"Widget Pro","price_cents":2199}'
+  -H 'Content-Type: application/json' -d '{"name":"Widget Pro","price_cents":2199,"price":"21.99"}'
 curl -s -X DELETE 'http://127.0.0.1:18100/api/v1/products/1?tenant_id=1'
 ```
 
@@ -127,10 +127,25 @@ curl -s http://127.0.0.1:18100/api/v1/feed/authors
 只回滚 savepoint、整单回滚返回 409），`enqueueEvent` 收集事务内事件，
 `afterCommit` 钩子在提交成功后恰好一次 `takePendingEvents` 投递。
 
+## 运行时拦截器（zent v0.33 `UseInterceptor`）
+
+`/api/v1/tenant-injection` 使用一条**独立** client，注册固定哨兵租户（777）的
+拦截器：create 时缺省的 `tenant_id` 被自动填充（显式值保留），查询无需手写
+`Where` 即被透明限定到该租户。其它路由共享的 client 不受拦截器影响。
+
+```bash
+# create：body 不含 tenant_id，拦截器填充 777
+curl -s -X POST 'http://127.0.0.1:18100/api/v1/tenant-injection' \
+  -H 'Content-Type: application/json' -d '{"name":"Injected","price_cents":500,"price":"5.00"}'
+# list：无显式 Where，拦截器透明限定 tenant 777
+curl -s 'http://127.0.0.1:18100/api/v1/tenant-injection'
+```
+
+
 ```bash
 # 先建商品（订单总额 = 单价 × qty）
 curl -s -X POST 'http://127.0.0.1:18100/api/v1/products?tenant_id=1' \
-  -H 'Content-Type: application/json' -d '{"name":"Widget","price_cents":1999}'
+  -H 'Content-Type: application/json' -d '{"name":"Widget","price_cents":1999,"price":"19.99"}'
 # 下单：库存 100→97，events_delivered=2（order.created + stock.decremented）
 curl -s -X POST 'http://127.0.0.1:18100/api/v1/orders?product_id=1&qty=3'
 # 库存不足：409，且不产生订单行、库存不变
@@ -176,7 +191,7 @@ curl -s 'http://127.0.0.1:18100/api/v1/feed/trashed'
 ```bash
 # 创建时校验器自动执行（name NotEmpty+Length），审计字段自动填 user 1
 curl -s -X POST 'http://127.0.0.1:18100/api/v1/products?tenant_id=1' \
-  -H 'Content-Type: application/json' -d '{"name":"widget","price_cents":99,"description":"big"}'
+  -H 'Content-Type: application/json' -d '{"name":"widget","price_cents":99,"price":"0.99","description":"big"}'
 # 投影列表（跳过 description 大字段）
 curl -s 'http://127.0.0.1:18100/api/v1/products/summary'
 # 批量插入（CrudService.insertMany，一条语句）

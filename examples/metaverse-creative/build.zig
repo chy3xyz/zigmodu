@@ -15,6 +15,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const zent_mod = zent_dep.module("zent");
+    // src/db.zig references zent.sql_postgres; zent wires its pg_c binding
+    // when libpq headers are present but never links the library itself —
+    // link it here so PQ symbols resolve (no-op when libpq is absent).
+    db_link.linkDetected(zent_mod, b, .{ .postgres = true });
 
     const zigmodu_mod = b.addModule("zigmodu", .{
         .root_source_file = b.path("../../src/root.zig"),

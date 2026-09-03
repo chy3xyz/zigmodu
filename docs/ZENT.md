@@ -1,7 +1,7 @@
 # ZigModu × zent 最佳实践
 
 **zent**: [chy3xyz/zent](https://github.com/chy3xyz/zent) — Zig 版 [ent](https://entgo.io/)（schema-as-code ORM）  
-**版本口径**: zent **v0.32.2**（示例与本文按最新发布 v0.32.0 演示；最低兼容 v0.13 起）· ZigModu **v0.15.22+** · Zig **≥ 0.17**  
+**版本口径**: zent **v0.33.0**（拦截器覆盖 Create/BulkInsert + sqlite 串行化，见 §14；示例与本文按最新发布演示；最低兼容 v0.13 起）· ZigModu **v0.15.22+** · Zig **≥ 0.17**  
 **主推组合**: **电商 / 社交类项目默认选 ZigModu + zent**（见 §2 决策表与 §4.8 场景能力矩阵）；只有存量 SQL 繁重、报表主导或 DBA 强管控的项目才默认 sqlx。
 
 **参考实现**: [`examples/zent-modulith/`](../examples/zent-modulith/)  
@@ -520,7 +520,7 @@ exe_mod.addImport("zent", zent_dep.module("zent"));
 
 ```zon
 .zent = .{
-    .url = "https://github.com/chy3xyz/zent/archive/refs/tags/v0.32.2.tar.gz",
+    .url = "https://github.com/chy3xyz/zent/archive/refs/tags/v0.33.0.tar.gz",
     .hash = "<zig fetch 后填入>",
 },
 ```
@@ -566,10 +566,12 @@ zig_ws/
 
 ---
 
-## 14. 升级注意（zent 0.6 → 0.12 → 0.13 → 0.27 → 0.31）
+## 14. 升级注意（zent 0.6 → 0.12 → 0.13 → 0.27 → 0.31 → 0.32.3）
 
 | 主题 | 动作 / 新特性 |
 |------|--------------|
+| **v0.33.0 拦截器覆盖写路径** | `UseInterceptor` 现在也拦截 `Create`/`BulkInsert`：`whereEq` 在 create 上语义为"缺省才填"（显式值保留），无该字段的表仍报 `UnknownField`。**自查存量拦截器**：v0.32 里只影响查询/更新/删除的拦截器，升级后会开始影响写入——这正是把租户注入收敛到拦截器的正确时机（见 `examples/zent-modulith` 的 `tenant-injection` 演示路由）。⚠️ 升级依赖后若行为未变，删 `.zig-cache` 重建——Zig 0.17-dev 增量缓存可能用过期的 path/fetch 依赖模块（本次适配实测踩中）。 |
+| **v0.32.3 sqlite 连接串行化** | `SQLiteDriver` 内置 RecursiveMutex，所有连接访问串行——修复并发请求下 `sqlite3_prepare_v2` SEGV。**消费侧注意**：① `query()` 返回的 `Rows` 持有锁直到 `Rows.deinit()`，遍历完立即释放，不要持锁做慢操作（如同步 HTTP 调用）；② 单连接 sqlite 的并发吞吐本质是串行的，写重场景考虑 `beginTxFromDriver` + 池或换 PG/MySQL；③ 公共 API 无签名变化，纯升级即可。 |
 | **v0.31 精确金额 / 边 inner-join / 池上事务** | `field.Decimal`（PG NUMERIC / MySQL DECIMAL(38,10)，扫描为 owned `[]const u8`）；`WithEdgeOptions(.{ .join = .inner })` 消除 eager-load limit skew；`beginTxFromDriver` 从共享 Driver/池直开 `TxClient`；`ManagedEntity`/`dupeEntityTo` allocator 安全 teardown；`SelectExpr`/`OrderExprSql`/`Row.columnIndex` 别名 DTO 映射。 |
 | **v0.30 显式冲突目标 upsert** | `SaveOrUpdateOn(conflict_columns)`（PG/SQLite `ON CONFLICT (cols)`、MySQL ODKU）与 `SaveIgnore()`；`Row.tryGet*` NULL 显式报错；**MySQL `ContainsEscaped` ESCAPE 改为 `!`**（旧 `\` 会污染 LIKE 模式，自查依赖该行为的查询）。 |
 | **v0.29 约束错误分类 / JSONValue / ⚠️ Time 列类型** | `UniqueViolation`/`NotNullViolation`/`ForeignKeyViolation` 三方言统一（不再误报 `NotFound`）；`field.JSONValue` 无类型 JSON 文档；**`field.Time` 全方言改 BIGINT epoch 秒（PG 原为 TIMESTAMPTZ，存量 PG 表需迁移列类型）**；`WhereEntQL` 支持 `has/not_has(edge)`；Privacy 按操作（OnCreate/OnQuery…）生效。 |

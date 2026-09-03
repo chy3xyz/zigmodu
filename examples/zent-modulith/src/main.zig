@@ -172,6 +172,20 @@ pub fn main(init: std.process.Init) !void {
     const AccountApiT = tx_demo.AccountApi(@TypeOf(env.client));
     var account_api = AccountApiT.init(&env.client, io);
 
+    // Interceptor demo (zent v0.33): a DEDICATED client over the same driver
+    // whose interceptor carries a fixed sentinel tenant — omitted tenant_id
+    // is filled on create, queries are transparently scoped. The shared
+    // client above keeps explicit-tenant semantics for the other routes.
+    var injection_client = zent.codegen.client.makeClient(catalog.persistence.infos, allocator, env.driver());
+    const injection_tenant: i64 = features_demo.InterceptorApi(@TypeOf(injection_client)).sentinel_tenant;
+    try zent.codegen.client.UseInterceptor(
+        catalog.persistence.infos,
+        &injection_client,
+        features_demo.InterceptorApi(@TypeOf(injection_client)).interceptor(&injection_tenant),
+    );
+    const InterceptorApiT = features_demo.InterceptorApi(@TypeOf(injection_client));
+    var interceptor_api = InterceptorApiT.init(&injection_client);
+
     // Outbox demo: transactional enqueue + on-demand/cron dispatch.
     var outbox_dispatcher = outbox_demo.Dispatcher{
         .allocator = allocator,
@@ -270,6 +284,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .Mod = FeedModernApiT, .state = &feed_modern_api },
         .{ .Mod = OrderApiT, .state = &order_api },
         .{ .Mod = AccountApiT, .state = &account_api },
+        .{ .Mod = InterceptorApiT, .state = &interceptor_api },
     });
     var docs_scope = try api_v1.use(.{ .func = data_scope_demo.scopeMiddleware });
     try docs_scope.mount(DocApiT, &doc_api);

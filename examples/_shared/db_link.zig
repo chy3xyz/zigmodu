@@ -175,3 +175,35 @@ pub fn link(mod: *std.Build.Module, b: *std.Build, features: Features) void {
         mod.linkSystemLibrary("sqlite3", .{});
     }
 }
+
+/// Like `link`, but postgres/mysql are linked only when their headers are
+/// actually detected on the host. Use for modules (e.g. zent's exported
+/// module) whose C bindings are wired conditionally by their own build
+/// script: linking an absent library would fail on machines without it.
+pub fn linkDetected(mod: *std.Build.Module, b: *std.Build, features: Features) void {
+    if (features.postgres) {
+        const pq = detectPqPaths(b);
+        if (pq.include) |inc| {
+            mod.addSystemIncludePath(.{ .cwd_relative = inc });
+            if (pq.lib) |lib| {
+                mod.addLibraryPath(.{ .cwd_relative = lib });
+            }
+            mod.linkSystemLibrary("pq", .{});
+        }
+    }
+
+    if (features.mysql) {
+        const mysql = detectMysqlPaths(b);
+        if (mysql.include) |inc| {
+            mod.addSystemIncludePath(.{ .cwd_relative = inc });
+            if (mysql.lib) |lib| {
+                mod.addLibraryPath(.{ .cwd_relative = lib });
+            }
+            mod.linkSystemLibrary("mysqlclient", .{});
+        }
+    }
+
+    if (features.sqlite) {
+        mod.linkSystemLibrary("sqlite3", .{});
+    }
+}
