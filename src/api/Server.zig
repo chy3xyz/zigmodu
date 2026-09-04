@@ -1903,6 +1903,13 @@ pub const Server = struct {
     fn closeListener(self: *Server) void {
         if (self.listener_closing.swap(true, .acq_rel)) return;
         if (self.listener) |*l| {
+            // Linux: close() does NOT wake a thread blocked in accept() — the
+            // kernel keeps the socket alive for the in-flight call, so the
+            // accept loop would hang forever. shutdown() on a listening socket
+            // makes the blocked accept fail with EINVAL immediately.
+            // Errors are expected (ENOTCONN on macOS); the return is a raw
+            // c_int since Zig 0.17 removed std.posix.shutdown.
+            _ = std.c.shutdown(l.socket.handle, std.c.SHUT.RDWR);
             l.deinit(self.io);
             self.listener = null;
         }
