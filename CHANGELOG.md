@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Server `stop()` 在 Linux 上唤醒阻塞的 `accept()`**（`src/api/Server.zig`
+  `closeListener`）：先 `shutdown(SHUT_RDWR)` 再 close。Linux 下 close 不会
+  中断阻塞中的 accept（内核为进行中的调用保持 socket 存活），accept 循环
+  永不退出、`join` 死锁——ubuntu CI `Run tests` 曾因此挂起 50 分钟。
+- **WS fiber 测试自定义栈 128KB → 2MB**（`src/api/Server.zig`）：glibc
+  aarch64 `PTHREAD_STACK_MIN=131072` 恰为 128KB，TLS 无空间导致
+  `pthread_create` EINVAL（std 内 unreachable panic）。
+- **示例内存泄漏（audit b17）**：tenant-mgmt `getById` 结果在
+  updateTier/suspendTenant/getTenant 三处从未释放；updateTier 混用静态
+  字符串破坏 owned 语义（统一改为 dupe + defer freeTenant）。
+  tenant-shop `Tx.priceCents` 改用 `freeScanned`。
+
+### CI
+- **CI 全链路修复并首次全绿**：job 级 `if` 误用 `env` 上下文导致工作流
+  历史上从未调度（0s 失败）；mlugg/setup-zig 旧式 URL 404（改为直接从
+  ziglang.org 下载 arch-first tarball，Zig pin 升至 0.17.0-dev.1970）；
+  ubuntu 缺 `libmariadb-dev-compat`（`libmysqlclient.so` 由该包提供）；
+  示例路径 `zfsaas`→`zmsaas` 改名未同步；integration / mysql /
+  live-service 三个 job 失败时上传日志 artifact 便于诊断。
+
 ## [0.15.35] - 2026-09-03
 
 ### Security
