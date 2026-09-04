@@ -94,7 +94,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libpq-dev libmariadb-dev libsqlite3-dev
+          sudo apt-get install -y libpq-dev libmariadb-dev libmariadb-dev-compat libsqlite3-dev
 
       - name: Install system deps (macOS)
         if: runner.os == 'macOS'
@@ -123,8 +123,8 @@ jobs:
             echo "== building examples/$ex =="
             (cd "examples/$ex" && zig build)
           done
-          echo "== building examples/zfsaas/backend =="
-          (cd examples/zfsaas/backend && zig build)
+          echo "== building examples/zmsaas/backend =="
+          (cd examples/zmsaas/backend && zig build)
 
       - name: zmodu ai CLI smoke (export-skills + openapi)
         run: |
@@ -217,7 +217,7 @@ jobs:
           echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
 
       - name: Install deps
-        run: sudo apt-get install -y libpq-dev libmariadb-dev libsqlite3-dev
+        run: sudo apt-get install -y libpq-dev libmariadb-dev libmariadb-dev-compat libsqlite3-dev
 
       - name: Zig fmt check
         run: zig fmt --check src tools examples
@@ -252,7 +252,7 @@ jobs:
           echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
 
       - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y libpq-dev libmariadb-dev libsqlite3-dev
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev libmariadb-dev libmariadb-dev-compat libsqlite3-dev
 
       - name: Build all examples
         run: |
@@ -261,8 +261,8 @@ jobs:
             echo "== building examples/$ex =="
             (cd "examples/$ex" && zig build)
           done
-          echo "== building examples/zfsaas/backend =="
-          (cd examples/zfsaas/backend && zig build)
+          echo "== building examples/zmsaas/backend =="
+          (cd examples/zmsaas/backend && zig build)
 
   # ── Integration (full) ─────────────────────────
   integration-full:
@@ -291,7 +291,7 @@ jobs:
           echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
 
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y libpq-dev libmariadb-dev libsqlite3-dev curl
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev libmariadb-dev libmariadb-dev-compat libsqlite3-dev curl
 
       - name: Run integration probes
         run: HTTP_PORT=18080 bash scripts/ci-integration.sh
@@ -336,7 +336,7 @@ jobs:
           echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
 
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y libpq-dev libmariadb-dev libsqlite3-dev
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev libmariadb-dev libmariadb-dev-compat libsqlite3-dev
 
       - name: Run postgres tests
         env:
@@ -382,7 +382,7 @@ jobs:
           echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
 
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y libpq-dev libmariadb-dev libsqlite3-dev
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev libmariadb-dev libmariadb-dev-compat libsqlite3-dev
 
       - name: Run mysql tests
         env:
@@ -446,7 +446,7 @@ jobs:
           echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
 
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y libpq-dev libmariadb-dev libsqlite3-dev
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev libmariadb-dev libmariadb-dev-compat libsqlite3-dev
 
       - name: Run live-service tests
         env:
@@ -481,7 +481,7 @@ jobs:
           echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
 
       - name: Install deps
-        run: sudo apt-get install -y libpq-dev libmariadb-dev libsqlite3-dev
+        run: sudo apt-get install -y libpq-dev libmariadb-dev libmariadb-dev-compat libsqlite3-dev
 
       - name: Run benchmarks
         run: zig build benchmark -Doptimize=ReleaseFast
@@ -561,7 +561,7 @@ jobs:
           echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
 
       - name: Install deps
-        run: sudo apt-get install -y libpq-dev libmariadb-dev libsqlite3-dev
+        run: sudo apt-get install -y libpq-dev libmariadb-dev libmariadb-dev-compat libsqlite3-dev
 
       - name: Verify tag matches build.zig.zon
         env:
