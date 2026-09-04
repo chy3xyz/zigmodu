@@ -1,0 +1,17 @@
+.git
+.zig-cache
+.zig-global-cache
+zig-out
+docs
+_ref
+.code-review-graph
+.codegraph
+.cursor
+.reasonix
+.remember
+.sisyphus
+.superpowers
+wal_test*
+zsaas
+*.md
+!README.md
