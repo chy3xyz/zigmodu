@@ -304,7 +304,15 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libpq-dev libmariadb-dev libmariadb-dev-compat libsqlite3-dev curl
 
       - name: Run integration probes
-        run: HTTP_PORT=18080 bash scripts/ci-integration.sh
+        run: HTTP_PORT=18080 bash scripts/ci-integration.sh 2>&1 | tee "$RUNNER_TEMP/integration.log"
+
+      - name: Upload integration log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-log
+          path: ${{ runner.temp }}/integration.log
+          retention-days: 7
 
   # ── DB driver matrix (live postgres/mysql tests) ──
   test-postgres:
@@ -401,7 +409,15 @@ jobs:
           MYSQL_USER: root
           MYSQL_PASSWORD: secret
           MYSQL_DATABASE: zigzero_test
-        run: zig build test
+        run: zig build test 2>&1 | tee "$RUNNER_TEMP/mysql-test.log"
+
+      - name: Upload mysql test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysql-test-log
+          path: ${{ runner.temp }}/mysql-test.log
+          retention-days: 7
 
   # Runs the env-gated live-service tests (redis client, Redis rate limiter,
   # NATS, Kafka).
@@ -463,7 +479,15 @@ jobs:
           REDIS_URL: redis://127.0.0.1:6379
           NATS_URL: nats://127.0.0.1:4222
           KAFKA_BOOTSTRAP: 127.0.0.1:9092
-        run: zig build test
+        run: zig build test 2>&1 | tee "$RUNNER_TEMP/live-test.log"
+
+      - name: Upload live-service test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-test-log
+          path: ${{ runner.temp }}/live-test.log
+          retention-days: 7
 
   # ── Benchmark ──────────────────────────────────
   benchmark:
