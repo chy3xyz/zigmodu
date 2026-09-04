@@ -580,6 +580,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: [docker]
     if: github.event_name == 'release'
+    # Uploading assets to the release needs contents:write (default token is
+    # read-only in this repo).
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -615,7 +619,7 @@ jobs:
         run: |
           mkdir -p release
           cp -r zig-out/bin release/
-          cp -r zig-out/lib release/
+          # no zig-out/lib: `zig build` only installs bin/
           cp README.md CHANGELOG.md LICENSE release/ 2>/dev/null || true
           tar -czf zigmodu-${{ github.ref_name }}-linux-x86_64.tar.gz -C release .
 
