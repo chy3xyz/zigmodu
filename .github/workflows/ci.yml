@@ -535,6 +535,12 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build-and-test, lint]
     if: github.event_name == 'release'
+    # Pushing to ghcr.io needs packages:write — the default GITHUB_TOKEN is
+    # read-only in this repo (first release push was denied with "installation
+    # not allowed to Create organization package").
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
