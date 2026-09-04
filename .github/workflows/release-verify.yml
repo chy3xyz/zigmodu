@@ -1,0 +1,19 @@
+name: Release Verify
+
+# Tag pushes do not trigger ci.yml (its on.push has a branches-only filter,
+# and paths-ignore would skip doc-only tag commits anyway), so the tag/version
+# consistency gate lives here. Runs on every v* tag push: the tag version must
+# equal build.zig.zon .version and have a matching CHANGELOG section.
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release-verify:
+    name: Release tag consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify tag matches package version
+        run: bash scripts/check-release-tag.sh
