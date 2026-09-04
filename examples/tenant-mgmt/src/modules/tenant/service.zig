@@ -19,6 +19,11 @@ pub fn TenantService(comptime Persistence: type) type {
             persistence.TenantPersistence(@TypeOf(self.persistence)).freeTenants(self.allocator, tenants);
         }
 
+        /// 释放 getById 返回的租户（persistence 返回 owned 字符串）。
+        pub fn freeTenant(self: *Self, tenant: model.Tenant) void {
+            persistence.TenantPersistence(@TypeOf(self.persistence)).freeTenant(self.allocator, tenant);
+        }
+
         /// 创建租户 (带验证和默认值)
         pub fn create(self: *Self, name: []const u8, domain: []const u8, tier_str: []const u8) !model.Tenant {
             if (name.len < 2 or name.len > 100) return error.InvalidName;
@@ -55,9 +60,12 @@ pub fn TenantService(comptime Persistence: type) type {
         /// 更新租户套餐
         pub fn updateTier(self: *Self, id: i64, tier_str: []const u8) !void {
             var tenant = (try self.getById(id)) orelse return error.TenantNotFound;
-            self.allocator.free(tenant.tier);
+            defer self.freeTenant(tenant);
+            // toString() 返回静态字符串——先 dupe 保持 tier 字段 owned 语义一致
             const tier = enums.TenantTier.fromString(tier_str);
-            tenant.tier = tier.toString();
+            const owned_tier = try self.allocator.dupe(u8, tier.toString());
+            self.allocator.free(tenant.tier);
+            tenant.tier = owned_tier;
             tenant.updated_at = @intCast(zigmodu.time.monotonicNowSeconds());
             try self.persistence.update(tenant);
         }
@@ -65,6 +73,7 @@ pub fn TenantService(comptime Persistence: type) type {
         /// 暂停租户
         pub fn suspendTenant(self: *Self, id: i64) !void {
             var tenant = (try self.getById(id)) orelse return error.TenantNotFound;
+            defer self.freeTenant(tenant);
             tenant.status = @backingInt(enums.TenantStatus.suspended);
             tenant.updated_at = @intCast(zigmodu.time.monotonicNowSeconds());
             try self.persistence.update(tenant);

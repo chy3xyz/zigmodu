@@ -23,6 +23,7 @@ pub fn TenantPersistence(comptime Backend: type) type {
             allocator.free(tenants);
         }
 
+        /// 返回 owned Tenant — 调用方负责 `freeTenant(allocator, tenant)` 释放字符串。
         pub fn findById(self: *Self, id: i64) !?model.Tenant {
             const tenant = self.db.queryRowPartial(
                 model.Tenant,
@@ -35,6 +36,7 @@ pub fn TenantPersistence(comptime Backend: type) type {
             return tenant;
         }
 
+        /// 返回 owned Tenant — 调用方负责 `freeTenant(allocator, tenant)` 释放字符串。
         pub fn findByDomain(self: *Self, domain: []const u8) !?model.Tenant {
             const tenant = self.db.queryRowPartial(
                 model.Tenant,

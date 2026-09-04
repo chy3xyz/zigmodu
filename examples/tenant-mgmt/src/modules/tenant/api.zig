@@ -89,6 +89,7 @@ pub fn TenantApi(comptime Service: type) type {
                 try ctx.sendErrorResponse(404, 0, "Tenant not found");
                 return;
             };
+            defer self.service.freeTenant(tenant);
 
             const resp = try std.fmt.allocPrint(ctx.allocator,
                 \\{{"id":{d},"name":"{s}","domain":"{s}","tier":"{s}","status":{d}}}

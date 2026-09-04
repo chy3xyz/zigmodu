@@ -61,7 +61,7 @@ pub const Tx = struct {
             "SELECT id, tenant_id, name, price_cents, status, created_at, updated_at FROM products WHERE tenant_id = ? AND id = ?",
             &.{ .{ .int = tenant_id }, .{ .int = product_id } },
         );
-        defer allocator.free(product.name);
+        defer data.sqlx.freeScanned(allocator, model.Product, product);
         return product.price_cents;
     }
 };
