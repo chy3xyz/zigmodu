@@ -3208,8 +3208,10 @@ test "WebSocket fiber path receives client frames and fires on_close" {
     }).close, null);
 
     // Fiber path: connFiber runs on an io worker thread while the accept loop
-    // runs on this spawned thread.
-    const th = try std.Thread.spawn(.{ .stack_size = 128 * 1024 }, struct {
+    // runs on this spawned thread. NOTE: glibc aarch64 PTHREAD_STACK_MIN is
+    // 128 KiB and pthread_create needs TLS headroom beyond that — a custom
+    // stack_size near the minimum returns EINVAL (panic in std). Use 2 MiB.
+    const th = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, struct {
         fn run(s: *Server) void {
             s.start() catch {};
         }

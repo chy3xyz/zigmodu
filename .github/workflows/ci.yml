@@ -108,7 +108,17 @@ jobs:
         run: zig build
 
       - name: Run tests
-        run: zig build test
+        run: zig build test 2>&1 | tee "$RUNNER_TEMP/test-output.log"
+
+      # Log download via API needs admin rights; artifacts are the reliable
+      # way to inspect failures from automation.
+      - name: Upload test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-${{ matrix.os }}
+          path: ${{ runner.temp }}/test-output.log
+          retention-days: 7
 
       - name: Check canonical API imports
         run: zig build check-api
