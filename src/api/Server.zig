@@ -1541,6 +1541,7 @@ pub const Server = struct {
     port: u16,
     router: Router,
     global_middleware: std.ArrayList(Middleware),
+    default_404: ?HandlerFn = null,
     ws_handlers: std.StringHashMap(WsRoute),
     /// Path rewriter callback (optional) — runs before router.match().
     /// Use for ThinkPHP /api/* compat, legacy URL mapping, prefix stripping.
@@ -2163,7 +2164,11 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                 }.h, server.global_middleware.items) catch |err| std.log.err("[Server] global middleware before 404: {}", .{err});
             }
             if (!ctx.responded) {
-                ctx.sendError(404, "Not Found") catch |err| std.log.err("[Server] failed to send 404: {}", .{err});
+                if (server.default_404) |nf| {
+                    nf(&ctx) catch |err| std.log.err("[Server] default_404 handler failed: {}", .{err});
+                } else {
+                    ctx.sendError(404, "Not Found") catch |err| std.log.err("[Server] failed to send 404: {}", .{err});
+                }
             }
         }
 
