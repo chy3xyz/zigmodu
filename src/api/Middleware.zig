@@ -675,6 +675,9 @@ pub const ModuleGateConfig = struct {
     allowed: ?[]const []const u8 = null,
     unknown: enum { allow, deny } = .allow,
     attr_key: []const u8 = "module",
+    /// Path prefixes exempt from `unknown = .deny` (infra routes living outside
+    /// the ComptimeRouter catalog, e.g. health/metrics probes).
+    skip_prefixes: []const []const u8 = &.{ "health", "dashboard", "openapi.json" },
 };
 
 /// Resolves catalog module → ctx attr; optional allow-list / deny-unknown.
@@ -709,7 +712,7 @@ pub fn moduleGate(slot: *comptime_router.CatalogSlot, config: ModuleGateConfig) 
                         }
                     }
                 } else if (st.cfg.unknown == .deny) {
-                    if (!comptime_router.pathHasSkipPrefix(ctx.path, &.{ "health", "dashboard", "openapi.json" })) {
+                    if (!comptime_router.pathHasSkipPrefix(ctx.path, st.cfg.skip_prefixes)) {
                         try ctx.sendError(404, "Unknown route module");
                         return;
                     }
