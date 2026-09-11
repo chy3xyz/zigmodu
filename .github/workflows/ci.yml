@@ -367,7 +367,11 @@ jobs:
           PGconninfo: host=localhost port=5432 dbname=postgres user=postgres password=postgres
           # Opt-in real-database coverage for the postgres dialect (the
           # DistributedLock table lock; SQLite-only runs skip it).
+          # PGSSLMODE=disable: the sqlx PG driver defaults to `require`, and the
+          # service container below has no TLS. Production keeps the secure
+          # default; this only relaxes the throwaway test database.
           ZIGMODU_TEST_PG: "1"
+          PGSSLMODE: disable
           PGHOST: localhost
           PGPORT: "5432"
           PGUSER: postgres
@@ -571,6 +575,10 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auto-push: true
           alert-threshold: '150%'
+          # The repo has no gh-pages branch yet; without this the action dies
+          # on `git fetch … gh-pages` (job never ran until the branch guard was
+          # fixed, so this surfaced only now).
+          skip-fetch-gh-pages: true
 
   # ── Docker Build ──────────────────────────────
   docker:
