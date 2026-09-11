@@ -1,5 +1,6 @@
 const std = @import("std");
 const Time = @import("../core/Time.zig");
+const DistributedLock = @import("../core/DistributedLock.zig");
 
 /// Split a migration script into statements on `;`, ignoring semicolons inside:
 ///   - single-quoted strings (`'...'`, `''` escape)
@@ -134,6 +135,11 @@ pub const MigrationRunner = struct {
     history: std.ArrayList(AppliedMigration),
     /// Migration history[...]
     history_table: []const u8,
+    /// Cross-instance guard so a rolling deploy cannot apply the same DDL
+    /// twice. Default null = no guard (single instance / local dev).
+    lock: ?DistributedLock.Lock = null,
+    lock_ttl_ms: u64 = 300_000,
+    lock_name: []const u8 = "zigmodu:migration",
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
@@ -159,6 +165,15 @@ pub const MigrationRunner = struct {
         }
         self.history.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    /// Guard `run()` with a cross-instance lock. `ttl_ms` must exceed the
+    /// slowest migration: it is the window after which a crashed holder's lock
+    /// is considered stale and may be taken over. The lock object must outlive
+    /// the runner.
+    pub fn setLock(self: *Self, lock: DistributedLock.Lock, ttl_ms: u64) void {
+        self.lock = lock;
+        self.lock_ttl_ms = ttl_ms;
     }
 
     /// [...]
@@ -311,6 +326,16 @@ pub const MigrationRunner = struct {
     /// Execute all pending migrations against a database client.
     /// Runs each migration's SQL in order, records results in the history table.
     pub fn run(self: *Self, client: anytype) !void {
+        // Cross-instance guard first: two replicas starting together must not
+        // race on the history table or the DDL itself.
+        var locked = false;
+        if (self.lock) |l| {
+            const acquired = try l.tryAcquire(self.lock_name, self.lock_ttl_ms);
+            if (!acquired) return error.MigrationLocked;
+            locked = true;
+        }
+        defer if (locked) self.lock.?.release(self.lock_name);
+
         // Ensure history table exists
         const ddl = self.generateHistoryTableDDL() catch return error.OutOfMemory;
         defer self.allocator.free(ddl);
@@ -802,4 +827,43 @@ test "MigrationRunner markApplied bootstraps existing migrations" {
     try std.testing.expectEqual(@as(usize, 1), runner.getAppliedCount());
     var pending: [8]MigrationEntry = undefined;
     try std.testing.expectEqual(@as(usize, 0), runner.getPendingMigrations(&pending).len);
+}
+
+test "migration: a second replica refuses to run while the lock is held" {
+    const allocator = std.testing.allocator;
+    const SqlClient = @import("../sqlx/sqlx.zig").Client;
+    var db = SqlClient.init(allocator, std.testing.io, .{
+        .driver = .sqlite,
+        .sqlite_path = ":memory:",
+        .max_open_conns = 1,
+        .max_idle_conns = 1,
+    });
+    defer db.deinit();
+
+    var runner = MigrationRunner.init(allocator);
+    defer runner.deinit();
+    try runner.addMigration(20260101000000, "create widget", "CREATE TABLE widget (id INTEGER PRIMARY KEY)");
+
+    var lock = try DistributedLock.SqlLock(@TypeOf(db)).init(allocator, std.testing.io, &db, "zmodu_migration_lock", .sqlite);
+    defer lock.deinit();
+    runner.setLock(lock.lock(), 300_000);
+
+    // Another replica holds the migration lock (mid-run, or crashed with an
+    // unexpired TTL): this replica must not touch the schema.
+    var other = try DistributedLock.SqlLock(@TypeOf(db)).init(allocator, std.testing.io, &db, "zmodu_migration_lock", .sqlite);
+    defer other.deinit();
+    try std.testing.expect(try other.lock().tryAcquire("zigmodu:migration", 300_000));
+
+    try std.testing.expectError(error.MigrationLocked, runner.run(&db));
+
+    // Lock free again → the migration applies and the slot is released.
+    other.lock().release("zigmodu:migration");
+    try runner.run(&db);
+    try std.testing.expectEqual(@as(usize, 1), runner.getAppliedCount());
+    try std.testing.expect(try other.lock().tryAcquire("zigmodu:migration", 300_000));
+
+    // Idempotent: a second run with the history persisted is a no-op.
+    runner.lock = null;
+    try runner.run(&db);
+    try std.testing.expectEqual(@as(usize, 1), runner.getAppliedCount());
 }

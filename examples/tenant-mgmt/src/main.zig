@@ -114,6 +114,24 @@ pub fn main(init: std.process.Init) !void {
     var server = zigmodu.http.Server.init(io, allocator, port);
     defer server.deinit();
 
+    // ── 5b. 生产一行接入（必须在任何 addRoute / mountAll 之前）──
+    //    连接背压 + 安全/观测中间件 + GET /metrics（按路由模板的黄金信号）
+    //    + GET /health/live + /health/ready。见 docs/ROUTE_TABLE.md §7.4。
+    var profile = zigmodu.http.ProductionProfileState.init(allocator);
+    defer profile.deinit(allocator);
+    try zigmodu.http.productionProfile(&server, .{
+        .max_connections = 4096,
+        .over_limit_response = .close,
+        .header_timeout_ms = 10_000,
+        .http = .{
+            // 显式列出来源：生产别用 "*"（profile 会告警）。
+            .cors_origin = "http://localhost:5173",
+            .access_log = false, // CI 集成测试里保持安静
+            .metrics = true,
+        },
+        .dashboard = false, // 本示例自己有 /dashboard 路由
+    }, &profile);
+
     // ── 6. Global Middleware (catalog slot filled after mount) ──
     const jwt_secret = init.environ_map.get("JWT_SECRET") orelse "dev-secret";
     var app_sec = zigmodu.security.AppSecurity.init(allocator, io, .{ .jwt_secret = jwt_secret });
@@ -164,15 +182,7 @@ pub fn main(init: std.process.Init) !void {
     });
 
     // ── 8. Health endpoints ─────────────────────────
-    try server.addRoute(.{
-        .method = .GET,
-        .path = "health/live",
-        .handler = struct {
-            fn handle(ctx: *zigmodu.http.Context) !void {
-                try ctx.json(200, "{\"status\":\"UP\"}");
-            }
-        }.handle,
-    });
+    // 由 productionProfile 挂出：GET /health/live（进程）+ GET /health/ready（依赖）。
 
     // ── 9. Dashboard ────────────────────────────────
     zigmodu.http.Dashboard.system_info.module_count = 3;

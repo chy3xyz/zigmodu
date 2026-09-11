@@ -33,8 +33,26 @@ pub fn main(init: std.process.Init) !void {
     });
     defer db_client.deinit();
     try db_client.connect();
+
+    // ── 启动预检：宁可拒绝启动，也不要带着占位 secret / 连不上的库上线 ──
+    // 预检失败只记录 finding（不 panic），最后统一决定是否继续。
+    var env_ctx = zigmodu.Preflight.EnvCheck.fromMap(
+        init.environ_map,
+        &.{ "JWT_SECRET", "ZFSAAS_SHARD_DIR" },
+    );
+    var secret_ctx = zigmodu.Preflight.SecretCheck{ .secret = init.environ_map.get("JWT_SECRET") orelse "" };
+    var clock_ctx = zigmodu.Preflight.ClockCheck{ .io = io };
+    var preflight = zigmodu.Preflight.run(allocator, &.{
+        zigmodu.Preflight.envCheck(&env_ctx),
+        zigmodu.Preflight.secretCheck(&secret_ctx),
+        zigmodu.Preflight.dbCheck(&db_client),
+        zigmodu.Preflight.clockCheck(&clock_ctx),
+    });
+    defer preflight.deinit();
+    preflight.log();
+    if (!preflight.ok()) return error.PreflightFailed;
     db_client.warmPool();
-    try schema.apply(&db_client, allocator);
+    try schema.apply(&db_client, allocator, io);
     try schema.grants(&db_client);
     std.log.info("[zmsaas] sqlite ready at {s}", .{sqlite_path});
 
@@ -78,6 +96,42 @@ pub fn main(init: std.process.Init) !void {
         }.mw,
         .user_data = @ptrCast(@constCast(req_counter)),
     });
+    // 业务面黄金信号：池饱和度 + outbox 积压。两者都在**抓取时**采样，
+    // 不需要后台线程（ScrapeHook 在渲染前调用一次）。
+    const pool_active = try metrics.createGauge("db_pool_active", "Active pooled DB connections");
+    const pool_idle = try metrics.createGauge("db_pool_idle", "Idle pooled DB connections");
+    const pool_waiters = try metrics.createGauge("db_pool_waiters", "Requests waiting for a DB connection");
+    const outbox_pending = try metrics.createGauge("outbox_pending", "Outbox entries waiting to be delivered");
+    const ScrapeCtx = struct {
+        db: *zigmodu.data.Client,
+        active: *zigmodu.observability.PrometheusMetrics.Gauge,
+        idle: *zigmodu.observability.PrometheusMetrics.Gauge,
+        waiters: *zigmodu.observability.PrometheusMetrics.Gauge,
+        outbox: *zigmodu.observability.PrometheusMetrics.Gauge,
+
+        fn sample(ud: ?*anyopaque) void {
+            const c: *@This() = @ptrCast(@alignCast(ud.?));
+            if (c.db.poolMetrics()) |pm| {
+                c.active.set(@floatFromInt(pm.current_active));
+                c.idle.set(@floatFromInt(pm.current_idle));
+                c.waiters.set(@floatFromInt(pm.current_waiters));
+            }
+            const Row = struct { n: i64 };
+            var rows = c.db.queryRows(Row, "SELECT COUNT(*) AS n FROM event_outbox WHERE status IN (0, 1)", &.{}) catch return;
+            defer rows.deinit(c.db.allocator);
+            if (rows.items.len > 0) c.outbox.set(@floatFromInt(@max(0, rows.items[0].n)));
+        }
+    };
+    const scrape_ctx = try allocator.create(ScrapeCtx);
+    scrape_ctx.* = .{
+        .db = &db_client,
+        .active = pool_active,
+        .idle = pool_idle,
+        .waiters = pool_waiters,
+        .outbox = outbox_pending,
+    };
+    metrics.setScrapeHook(ScrapeCtx.sample, scrape_ctx);
+
     try metrics.registerMetricsRoute(&server);
     try server.addMiddleware(middleware.jwtAuthMiddleware(&app_sec.module, &catalog_slot, &db_client));
     try server.addMiddleware(middleware.moduleGateMiddleware(&catalog_slot));
@@ -158,6 +212,17 @@ pub fn main(init: std.process.Init) !void {
     var outbox_scheduler: ?zigmodu.cron.Scheduler = null;
     if (pooled) {
         var sched = zigmodu.cron.Scheduler.init(allocator, io);
+        // One replica drains the outbox per minute: without the lock every
+        // replica would deliver the same batch (duplicate side effects).
+        var cron_lock = try zigmodu.DistributedLock.SqlLock(@TypeOf(db_client)).init(
+            allocator,
+            io,
+            &db_client,
+            "zigmodu_cron_lock",
+            .sqlite,
+        );
+        defer cron_lock.deinit();
+        sched.setLock(cron_lock.lock(), 120_000);
         const expr = try zigmodu.cron.Expression.parse("* * * * *");
         const OutboxCtx = struct { allocator: std.mem.Allocator, client: *zigmodu.data.Client };
         const outbox_ctx = try allocator.create(OutboxCtx);

@@ -160,6 +160,10 @@ pub const applyHttpDefaults = Profiles.applyHttpDefaults;
 pub const ResilienceDep = Profiles.ResilienceDep;
 pub const ResilienceProfileState = Profiles.ResilienceProfileState;
 pub const applyResilienceDefaults = Profiles.applyResilienceDefaults;
+pub const ProductionConfig = Profiles.ProductionConfig;
+pub const ProductionProfileState = Profiles.ProductionProfileState;
+/// One-call production hardening (backpressure + security + metrics + probes).
+pub const productionProfile = Profiles.productionProfile;
 
 pub const Lifecycle = @import("http/Lifecycle.zig");
 pub const ShutdownChecklist = Lifecycle.ShutdownChecklist;

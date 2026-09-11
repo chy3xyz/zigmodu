@@ -8,7 +8,8 @@
 //!       .module_name = "catalog",
 //!       .nest = .{"products"},
 //!       .tenant_col = "tenant_id",
-//!       .tenant_source = .query, // or .attr (JWT middleware writes it)
+//!       .tenant_source = .attr, // JWT middleware writes it; .query trusts
+//!                               // the client and is dev-demo only
 //!   });
 //!   // main: ProductApi.init(&product_crud) where product_crud is a
 //!   // zent.crud.CrudService(infos, ProductInfo, "tenant_id").
@@ -26,7 +27,9 @@ const zent = @import("zent");
 pub const TenantSource = enum {
     /// Read `tenant_id` from the request context attr (JWT middleware).
     attr,
-    /// Read `tenant_id` from the query string (public/API-key demos).
+    /// Read `tenant_id` from the query string. The client picks the tenant,
+    /// so this is only acceptable for public demos — never in production
+    /// (audit rule b22 flags it).
     query,
 };
 

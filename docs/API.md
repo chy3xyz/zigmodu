@@ -13,9 +13,11 @@ Complete API reference for the ZigModu modular framework.
 5. [Event System](#event-system)
 6. [Resilience](#resilience)
 7. [Observability](#observability)
-8. [Transport](#transport)
-9. [Security](#security)
-10. [Testing](#testing)
+8. [HTTP Server & Profiles](#http-server--profiles)
+9. [Transport](#transport)
+10. [Security](#security)
+11. [Testing](#testing)
+12. [Hardening primitives](#hardening-primitives)
 
 ---
 
@@ -513,6 +515,237 @@ pub fn debug(self: *Self, message: []const u8, fields: anytype) !void
 pub fn info(self: *Self, message: []const u8, fields: anytype) !void
 pub fn warn(self: *Self, message: []const u8, fields: anytype) !void
 pub fn err(self: *Self, message: []const u8, fields: anytype) !void
+```
+
+---
+
+## HTTP Server & Profiles
+
+### `zigmodu.http.Server`
+
+```zig
+pub fn init(io: std.Io, allocator: std.mem.Allocator, port: u16) Server
+pub fn initWithConfig(io: std.Io, allocator: std.mem.Allocator, config: Config) Server
+pub fn fromEnv(io: std.Io, allocator: std.mem.Allocator, env: std.process.Environ) !Server
+pub fn start(self: *Server) !void          // blocks; runs the accept loop
+pub fn stop(self: *Server) void
+pub fn deinit(self: *Server) void
+pub fn addMiddleware(self: *Server, mw: Middleware) !void
+pub fn addRoute(self: *Server, route: Route) !void
+pub fn group(self: *Server, prefix: []const u8) RouteGroup
+pub fn withGracefulDrain(self: *Server, counter: *std.atomic.Value(u64)) void
+```
+
+#### `Server.Config`
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `port` | `8080` | listen port |
+| `name` | `"zigmodu-api"` | server name |
+| `max_body_size` | `8 MiB` | body limit (413 over) |
+| `request_timeout_ms` | `30000` | **handler stage** budget |
+| `max_requests_per_conn` | `100` | keep-alive reuse cap |
+| `header_limits` | `.{ .max_count = 100, .max_total_bytes = 16 KiB }` | header-bomb guard |
+| `connection_stack_size` | `128 KiB` | per-connection stack |
+| `max_connections` | `0` (unlimited) | concurrent accepted connections; over the limit the socket is closed |
+| `over_limit_response` | `.close` | `.close` = cheapest, `.unavailable` = raw-socket `503` first |
+| `header_timeout_ms` | `10_000` | request line + headers deadline (slowloris); `0` disables; cleared once headers are read |
+| `ws_write_timeout_ms` | `0` (unbounded) | `SO_SNDTIMEO` for WebSocket writes; on timeout the frame fails with `error.WriteTimeout` and the socket is shut down |
+
+Environment equivalents (`fromEnv`): `HTTP_PORT`, `HTTP_MAX_BODY`,
+`HTTP_MAX_CONNECTIONS`, `HTTP_HEADER_TIMEOUT_MS`, `WS_WRITE_TIMEOUT_MS`.
+
+### `zigmodu.http.productionProfile`
+
+One call: backpressure + security/observability middleware + `/metrics` +
+liveness/readiness probes (+ optional dashboard).
+
+```zig
+pub const ProductionConfig = struct {
+    max_connections: usize = 0,
+    over_limit_response: Server.OverLimitResponse = .close,
+    header_timeout_ms: u32 = 10_000,
+    request_timeout_ms: ?u32 = null,
+    http: ProfileConfig = .{},
+    prometheus: bool = true,
+    metrics_path: []const u8 = "/metrics",
+    health: bool = true,
+    liveness_path: []const u8 = "health/live",
+    readiness_path: []const u8 = "health/ready",
+    dashboard: bool = false,
+    tracing: bool = true,
+};
+
+pub const ProductionProfileState = struct {
+    pub fn init(allocator: std.mem.Allocator) ProductionProfileState
+    pub fn deinit(self: *ProductionProfileState, allocator: std.mem.Allocator) void
+};
+
+pub fn productionProfile(server: *Server, cfg: ProductionConfig, state: *ProductionProfileState) !void
+```
+
+**Ordering constraint**: `Server.addRoute` snapshots the global middleware chain at
+registration time, so `productionProfile` must run **before** any
+`server.addRoute` / `router.mountAll`. `state` must outlive the server.
+
+Golden signals created by default (label-free, fixed cardinality):
+
+| Metric | Type |
+|--------|------|
+| `http_requests_total` | counter |
+| `http_responses_2xx_total` / `_3xx_` / `_4xx_` / `_5xx_` | counters |
+| `http_request_duration_milliseconds` | histogram (1/5/10/25/50/100/250/500/1000/2500/5000 ms) |
+
+Thresholds, PromQL and the Grafana dashboard: [`OBSERVABILITY.md`](OBSERVABILITY.md).
+
+### Existing profiles
+
+| Symbol | Purpose |
+|--------|---------|
+| `applyHttpDefaults(server, ProfileConfig, *HttpProfileState)` | CORS / request-id / recover / access log / in-memory metrics middleware only |
+| `ResilienceProfileState.init(allocator, deps)` / `applyResilienceDefaults` | per-dependency `CircuitBreaker` + `RateLimiter` holders — nothing is enforced until handlers use `breaker(name)` / `limiter(name)` |
+
+### `zigmodu.http.PrometheusMetrics`
+
+```zig
+pub fn init(allocator: std.mem.Allocator) Self
+pub fn createCounter(self: *Self, name: []const u8, help: []const u8) !*Counter
+pub fn createGauge(self: *Self, name: []const u8, help: []const u8) !*Gauge
+pub fn createHistogram(self: *Self, name: []const u8, help: []const u8, buckets: []const f64) !*Histogram
+pub fn toPrometheusFormat(self: *Self, allocator: std.mem.Allocator) ![]const u8
+pub fn registerMetricsRoute(self: *Self, server: anytype) !void            // GET /metrics
+pub fn registerMetricsRoutePath(self: *Self, server: anytype, path: []const u8) !void
+```
+
+---
+
+## Hardening primitives
+
+### `zigmodu.FrozenMap` / `zigmodu.FrozenStringMap`
+
+Build-time-populated, run-time read-only maps for app-level shared registries.
+Fill during startup, `freeze()` before serving; afterwards reads are lock-free
+and safe for any number of concurrent readers, and writes fail with
+`error.Frozen` instead of racing a resize (the `panic: incorrect alignment`
+class).
+
+```zig
+pub fn FrozenMap(comptime K: type, comptime V: type) type
+pub fn FrozenStringMap(comptime V: type) type
+// methods: init(allocator), deinit(), freeze(), isFrozen(), put(K, V), remove(K),
+//          get(K) ?V, contains(K), count(), iterator()
+```
+
+### `zigmodu.panicHook`
+
+Request-aware panic handler. The server records `METHOD /path` into a threadlocal
+slot before dispatch; on panic the hook prints it to stderr (no allocation)
+before delegating to `std.debug.defaultPanic`.
+
+```zig
+// in the application root file (the one with `main`):
+const zmodu = @import("zigmodu");
+pub const panic = zmodu.panicHook;
+```
+
+A panic still aborts the process — the hook is the *diagnosis* half. Recovery
+comes from a supervisor (`Restart=always`, k8s `restartPolicy: Always`); see
+[`BEST_PRACTICES.md`](BEST_PRACTICES.md)「韧性」and
+[`PRODUCTION_ROADMAP.md`](PRODUCTION_ROADMAP.md) for the prefork boundary.
+
+### Metrics with bounded labels
+
+```zig
+pub fn createCounterFamily(self, name, help, label, max_series: usize, io: std.Io) !*CounterFamily
+pub fn createHistogramFamily(self, name, help, label, max_series: usize, buckets: []const f64, io: std.Io) !*HistogramFamily
+// family.get(label_value) -> *Counter / *Histogram   (cap → shared "__other__" series)
+pub fn setScrapeHook(self, hook: ?ScrapeHook, userdata: ?*anyopaque) void  // sampled at scrape time
+```
+
+Labels must be low-cardinality by construction: `productionProfile` labels the
+golden signals with `Context.route_template` (the matched pattern), never the raw
+path. See [`OBSERVABILITY.md`](OBSERVABILITY.md).
+
+### `zigmodu.outbox.OutboxConsumer`
+
+```zig
+pub fn setMetrics(self: *Self, metrics: *PrometheusMetrics) !void   // selected/delivered/failed + pending gauge
+pub fn pendingCount(self: *Self) !u64
+pub fn refreshPending(self: *Self) void
+pub fn startPolling(self: *Self, io: std.Io, interval_ms: u64) !void
+pub fn stopPolling(self: *Self) void
+pub fn pollOnce(self: *Self) !PollStats
+```
+
+### `zigmodu.Preflight`
+
+Startup checks that turn "it broke at 3am" into "it refused to start".
+
+```zig
+pub const Severity = enum { warn, fatal };
+pub const Check = struct { name, severity = .fatal, run, ctx };
+pub const Report = struct { pub fn ok(self) bool; pub fn log(self) void; pub fn deinit(self) void };
+pub fn run(allocator, checks: []const Check) Report
+
+// ready-made probes
+pub fn envCheck(*EnvCheck) Check                     // EnvCheck.fromMap(init.environ_map, names)
+pub fn secretCheck(*SecretCheck) Check               // rejects placeholders / < min_len
+pub fn dbCheck(client: anytype) Check                // SELECT 1
+pub fn migrationCheck(*MigrationCheck) Check         // pending > 0 → error
+pub fn clockCheck(*ClockCheck) Check                 // wall-clock sanity
+```
+
+Checks never panic and are isolated: one failure does not hide the others.
+See [`BEST_PRACTICES.md`](BEST_PRACTICES.md)「上线前预检」.
+
+### `zigmodu.security.JwksKeyRing` (key rotation)
+
+`SecurityModule.setKeyring(&ring)` makes new tokens carry `kid`; verification
+uses the key the token names and rejects unknown kids (`error.UnknownKeyId`).
+Rotate by adding a new primary key and keeping the old one in the ring until
+its tokens expire.
+
+### `zigmodu.DistributedLock`
+
+Cross-instance mutual exclusion for background work (cron jobs, migrations).
+
+```zig
+pub const Lock = struct {
+    pub fn tryAcquire(self: Lock, name: []const u8, ttl_ms: u64) anyerror!bool
+    pub fn release(self: Lock, name: []const u8) void
+};
+pub const NoopLock = struct { pub fn lock(self: *NoopLock) Lock };
+pub const Dialect = enum { sqlite, postgres, mysql };
+pub fn SqlLock(comptime Client: type) type // init(allocator, io, client, table, dialect)
+```
+
+Consumers: `cron.Scheduler.setLock(lock, ttl_ms)` (key `cron:<job>`) and
+`data.MigrationRunner.setLock(lock, ttl_ms)` (key `zigmodu:migration`, returns
+`error.MigrationLocked` when another instance holds it).
+
+Coverage: SQLite in-memory, plus a real PostgreSQL 17 test gated on
+`ZIGMODU_TEST_PG=1` (CI's `test-postgres` job sets it, along with `PGHOST` /
+`PGPORT` / `PGUSER` / `PGPASSWORD` / `PGDATABASE`). The MySQL variant
+(`INSERT IGNORE`) is implemented but still awaits a real-server test. Claiming is one atomic
+statement (`ON CONFLICT DO NOTHING` / `INSERT IGNORE`), so contention is
+`rows_affected == 0`, not an error; a crashed holder is reaped after `ttl_ms`.
+See [`BEST_PRACTICES.md`](BEST_PRACTICES.md)「多副本后台任务」.
+
+### `zigmodu.NetworkProbe`
+
+```zig
+pub fn available() bool   // loopback TCP usable?
+```
+
+Used by socket-dependent tests to `return error.SkipZigTest` in sandboxes.
+`zig build test -Dnet-tests=false` forces it to `false` so the whole suite skips
+network cases.
+
+### `zigmodu.im.WsFramer` (outbound control)
+
+```zig
+pub fn setSendTimeout(self: *WsFramer, timeout_ms: u32) void  // 0 = unbounded
+pub fn isWritable(self: *WsFramer) bool                       // O(1) send-buffer probe
 ```
 
 ---

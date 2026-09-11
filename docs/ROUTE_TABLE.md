@@ -431,6 +431,57 @@ const rl = res.limiter("payment").?;   // RateLimiter（单节点；全局限流
 
 多实例全局阈值 → `data.redis_rate_limit.RateLimiter`（Redis 共享窗口，fail-closed）。
 
+### 7.4 生产接线：`productionProfile` 与**顺序约束**
+
+`applyHttpDefaults` 只是中间件散件；生产入口是
+`http.productionProfile(&server, cfg, &state)`（背压 + 安全/观测中间件 +
+`/metrics` + `/health/*`，可选 dashboard）。
+
+```zig
+var server = zigmodu.http.Server.init(io, allocator, 8080);
+var profile = zigmodu.http.ProductionProfileState.init(allocator);
+defer profile.deinit(allocator);
+
+try zigmodu.http.productionProfile(&server, .{
+    .max_connections = 4096,        // 0 = 不限；超限 .close 或 .unavailable(503)
+    .header_timeout_ms = 10_000,    // 请求行+header deadline（slowloris）
+}, &profile);                       // ← 必须在下面任何一条之前
+
+// 然后才是路由注册 / ComptimeRouter
+var api_v1 = router.scope("/api/v1");
+try api_v1.mountAll(.{ ... });
+catalog_slot.set(try router.finish());
+```
+
+**顺序约束（违反会静默失效）**：`Server.addRoute` 在**注册时**把当时的
+`global_middleware` 快照进该路由的 `combined_middleware`
+（`src/api/Server.zig`）。因此 profile 必须挂在**所有** `addRoute` /
+`mountAll` / `mount` **之前**，否则后挂的全局中间件对已注册路由不生效
+（只有未命中路由的 global chain 例外）。
+
+同理，`state` 必须**活得比 Server 久**（CORS backing 存储与探针 handler 都
+指向它）——放栈上 + `defer state.deinit(allocator)`。
+
+**背压三层分工**（别只设一个就当防住了）：
+
+| 层 | 开关 | 管什么 |
+|----|------|--------|
+| 连接 | `max_connections` / `over_limit_response` | accept 洪泛、fd/内存耗尽 |
+| 头部 | `header_timeout_ms` | slowloris（慢速滴 header）；header 读完即解除，不误杀慢上传 |
+| 请求 | `request_timeout_ms` | handler 执行时长 |
+| WS 出站 | `ws_write_timeout_ms` + `WsFramer.isWritable()` | 不读的慢客户端阻塞写线程 |
+
+指标 / 告警 / Grafana：[`OBSERVABILITY.md`](OBSERVABILITY.md)；
+TLS 边车与守护拓扑：[`../examples/production-deploy/`](../examples/production-deploy/)。
+
+配套的两件事（都在同一批加固里，别只做 profile）：
+
+- **启动预检**：`zigmodu.Preflight.run(...)` 检查必填 env、占位 JWT secret、
+  DB 连通、待应用迁移、时钟偏移；`!report.ok()` 就拒绝启动。
+  见 [`BEST_PRACTICES.md`](BEST_PRACTICES.md)「上线前预检」。
+- **密钥轮换**：`app_sec.module.setKeyring(&ring)` 让 token 带 `kid`，新旧密钥
+  双验；否则换 secret 只能全员重登。见同文「JWT 密钥轮换」。
+
 ### Typed extractors + scope middleware
 
 ```zig

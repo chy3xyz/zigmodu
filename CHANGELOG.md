@@ -7,7 +7,154 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **zent 适配 v0.33.0 → v0.37.0**：`examples/zent-modulith` 的 pin 升到发布 tag
+  （`git+…?ref=v0.37.0#d36edb7`）。新版本带来：池 `max_wait_ms` 真正阻塞等待
+  （默认 0 = 旧语义）、嵌套预加载每层一次查询（消除 N+1）、outbox 认领式派发
+  （可并发 dispatcher）、迁移默认加锁 + checksum 校验、`StorageKey` 字段↔列名映射、
+  `queryTargetsByValue`（UUID 主键也可遍历边）、`BulkInsert` 按参数上限分片、
+  参数化原生谓词 `sql.RawArgs`、聚合助手、upsert 自定义表达式、边写入
+  （`AddEdgeIDs`/`RemoveEdgeIDs`/`SetEdgeIDs`/`ClearEdge`）。
+- **补齐 v0.36 的崩溃恢复语义**：`examples/zent-modulith` 的 dispatcher 每次派发前
+  调 `Outbox.requeueStale(..., 300)`，把"认领后派发进程死掉"遗留的 `processing`
+  行放回 `pending`（否则这些行永久卡住）。
+- 文档同步：`docs/ZENT.md` 版本口径与 §14 兼容表（新增 0.34–0.37 四条升级注意）、
+  `AGENTS.md` 已知事实、`examples/zent-modulith/README.md`、
+  `examples/{shopdemo-zent,metaverse-creative}/build.zig.zon` 注释。
+
+### Docs
+- **最佳实践补全**：`docs/BEST_PRACTICES.md` 新增「生产就绪检查清单」（进程/HTTP/数据并发/
+  可观测/验证发布五组，每条都标注承接它的能力）与「数据访问选型（zent / sqlx）」；
+  修复目录与正文脱节（补上韧性/背压/预检/kid/迁移恢复/多副本/工具/陷阱/升级/协作等条目）并
+  删除一处重复的「模块设计原则」标题残片。
+- **`docs/ZENT.md` 新增 §15「v0.34–v0.37 实战用法与边界」**：逐能力给出"什么时候用 /
+  什么时候不要用"，含 12 条易踩点（金额聚合用 `AggregateText`、边写入要包 `beginTx`、
+  `requeueStale` 阈值须大于最长发布时间、池 `deinit` 静默期、预加载目标不带租户作用域、
+  SQLite 表达式 upsert 换实现等）；§14 标题与目录对齐到 0.37。
+
+### Added
+- **故障注入测试**（`src/test/FaultInjection.zig`）：走完整 HTTP 链路验证韧性行为，
+  而不只是状态机单测 —— 下游挂 → 两次失败后熔断 → **后续请求不再打下游**（断言
+  调用计数不增长）→ 恢复窗口后半开探测 → 成功即闭合恢复；限流器 2 令牌后回 429。
+- **契约门禁**（`src/test/ContractGate.zig`）：注册接口承诺（状态/响应体片段/头），
+  经真实路由 dispatch 后逐条校验，漂移即构建失败；负例验证漂移会被报告而不是
+  静默通过。`ContractVerificationResult` 新增 `deinit`（此前所有权无处释放）。
+- **真实 PostgreSQL 的锁验证**：`DistributedLock` 的 `.postgres` 方言在 PG 17 上
+  实测通过（双 owner 互斥、释放移交、过期回收）；经 `ZIGMODU_TEST_PG=1` 门控，
+  CI 的 `test-postgres` job 已带上该变量与 PG 环境变量。
+- **迁移失败恢复指引**：`docs/BEST_PRACTICES.md` 新增运维小节，写清 `success=false`
+  重试语义、部分生效要求幂等、`ALTER TABLE` 失败被跳过的代价，及现场查询 SQL。
+- **CI 夜间 soak job**：`schedule`（每天 03:17 UTC）+ 手动触发，
+  `zig build soak -Dsoak-clients=64 -Dsoak-iterations=200`，带 30 分钟超时。
+  跨租户泄漏与冻结注册表并发断言终于有了持续运行的场地（默认 push/PR 不跑，
+  保持反馈速度）。
+- **旗舰示例改用生产配置**：`examples/tenant-mgmt` 从手工拼中间件切到
+  `http.productionProfile`（连接背压 + 安全/观测中间件 + `/metrics` +
+  `/health/live` + `/health/ready`，删掉自带 health 路由避免重复）。
+- **路由标签归一化**：ComptimeRouter 的模式不带前导 `/`，而 server 级路由带 ——
+  指标标签统一补 `/`，避免同一接口裂成两条序列。
+- **`zigmodu.Preflight`**（`src/core/Preflight.zig`）：启动预检，把"凌晨三点炸"变成
+  "拒绝启动"。内置 `envCheck`（缺必填变量）/ `secretCheck`（占位或过短的 JWT
+  secret）/ `dbCheck`（SELECT 1）/ `migrationCheck`（有待应用迁移）/
+  `clockCheck`（时钟偏移）；`Severity.warn` 只告警，检查之间互不影响，不 panic。
+  参考接线见 `examples/zmsaas/backend/src/main.zig`。
+- **JWT 密钥轮换（kid）**：`SecurityModule.setKeyring(&JwksKeyRing)` —— 新 token 头部
+  带 `kid`，验签按 `kid` 取密钥，旧密钥留在环里即可无缝轮换；未知 `kid` 返回
+  `error.UnknownKeyId`（不退化成"用主密钥试一下"）。不设 keyring 时行为不变（无 kid）。
+- **CORS 通配符告警**：`productionProfile` 在 `cors_origin = "*"` 时打 warn。
+- **受限基数的指标标签**：`PrometheusMetrics.createCounterFamily` /
+  `createHistogramFamily`（单标签 + 硬上限，超额统一进 `route="__other__"`）。
+  `productionProfile` 的黄金信号全部按 **`ctx.route_template`**（匹配到的模式，
+  不是带 id 的原始 path）打标签 —— 终于能回答"哪个接口在慢"。
+  新增 `Context.route_template`，在两处分发点（`handleForTest` / connFiber）设置。
+- **业务面黄金信号**：
+  - `OutboxConsumer.setMetrics(metrics)` → `outbox_selected_total` /
+    `outbox_delivered_total` / `outbox_failed_total` / `outbox_pending`；
+    `pendingCount()` 查积压，`startPolling(io, interval_ms)` 内置后台轮询
+    （取代手工 cron），失败计数 `consecutive_failures`。
+  - `PrometheusMetrics.setScrapeHook(hook, userdata)`：**抓取时采样**，无需后台
+    线程即可刷新连接池/积压等 gauge。
+  - `Client.poolMetrics()`：暴露已有的 `ConnPool.PoolMetrics`
+    （active / idle / waiters / 各项计数）。
+- **`zigmodu.DistributedLock`**（`src/core/DistributedLock.zig`）：后台任务的跨实例互斥。
+  接口 `Lock.tryAcquire(name, ttl_ms)` / `release(name)` + `NoopLock`（默认，保持
+  单进程行为）+ `SqlLock(Client)`（表锁，`.sqlite` / `.postgres` 用
+  `ON CONFLICT DO NOTHING`、`.mysql` 用 `INSERT IGNORE`，靠 `rows_affected`
+  判定抢占，争用不是错误）。持有者崩溃后由 `ttl_ms` 过期回收。表名做标识符校验。
+- **cron 跨实例互斥**：`Scheduler.setLock(lock, ttl_ms)` —— N 副本部署时每个 job
+  每分钟只在一个副本上执行（`cron:<job>` 为锁名）；未设锁时行为与之前完全一致。
+- **迁移跨实例锁**：`MigrationRunner.setLock(lock, ttl_ms)` —— 滚动发布时并发实例
+  不会再抢着建历史表/执行 DDL；抢不到锁返回 `error.MigrationLocked`。
+- **`http.productionProfile()`**（`src/http/Profiles.zig`，导出
+  `zmodu.http.productionProfile` / `ProductionConfig` / `ProductionProfileState`）：
+  一行接齐生产配置 —— 连接背压（`max_connections` / `over_limit_response` /
+  `header_timeout_ms` / `request_timeout_ms`）、安全与观测中间件
+  （CORS + request-id + recover + security headers + tracing + access log）、
+  `GET /metrics`、`GET /health/live` + `/health/ready`、可选 dashboard。
+  路径可配。**必须在 `router.mountAll` / `addRoute` 之前调用**（`addRoute` 会在
+  注册时快照全局中间件链）。
+- **黄金信号指标**：`productionProfile` 默认维护 `http_requests_total`、
+  `http_responses_{2xx,3xx,4xx,5xx}_total` 与
+  `http_request_duration_milliseconds` 直方图（1ms–5s 固定桶）。
+- **`docs/OBSERVABILITY.md`** + **`docs/grafana/zigmodu-overview.json`**
+  （7 面板）：PromQL 速查、告警阈值起点、Prometheus/K8s 抓取配置、上线自检。
+- **生产部署参考** `examples/production-deploy/`：nginx / Envoy TLS 终结 +
+  h2c 反代、docker-compose、K8s（探针/HPA/Prometheus 注解）、systemd
+  （`Restart=always`）、多阶段 Dockerfile。
+- **WebSocket 出站背压**：`Server.Config.ws_write_timeout_ms`（`SO_SNDTIMEO`，
+  0 = 旧行为）+ `WsFramer.isWritable()` 水位探测。超时写返回
+  `error.WriteTimeout` 并 shutdown 连接，慢客户端不再无限阻塞写线程。
+- **`PrometheusMetrics.registerMetricsRoutePath`**：可自定义 metrics 路径。
+- **`-Dnet-tests=false`**：沙箱环境跳过全部依赖 loopback 的测试（统一经
+  `NetworkProbe.available()` 收口）。
+- **`zmodu.NetworkProbe`** 导出。
+- **连接级背压与慢连接防护**（`src/api/Server.zig`）：`Config.max_connections`
+  （0 = 不限）+ `over_limit_response`（`.close` / `.unavailable` 回 503，走裸
+  socket 写以免阻塞 accept 线程）、`Config.header_timeout_ms`（请求行 + header
+  阶段总 deadline，超时回 408；header 读完后立即解除，不误杀慢速上传）。支持
+  `HTTP_MAX_CONNECTIONS` / `HTTP_HEADER_TIMEOUT_MS` 环境变量。连接计数
+  `active_connections` 在 accept 时预留、fiber 退出时释放。
+- **并发浸泡测试**：`zig build soak`（`-Dsoak-clients` / `-Dsoak-iterations`）。
+  真实 socket 的 N 并发 × M 租户压测，断言跨租户读取为 0、FrozenMap 在并发读 +
+  拒写下不撕裂、连接计数回落 0。刻意不挂在 `zig build test` 上。
+- **audit b22**：拦截 `.tenant_source = .query`（客户端可篡改的租户来源）。
+- **`zmodu.NetworkProbe`** 导出（受限沙箱里 socket 测试的跳过探针）。
+- **`FrozenMap` / `FrozenStringMap`**（`src/core/FrozenMap.zig`，导出
+  `zmodu.FrozenMap/FrozenStringMap`）：启动期填充、`freeze()` 后只读的
+  共享注册表容器。冻结后读无锁、任意并发安全；写返回 `error.Frozen`。
+  针对 worker 池上并发 put/resize 撕裂 HashMap 元数据导致读者
+  `panic: incorrect alignment` 的崩溃类别。
+- **panic 钩子**（`src/api/PanicHook.zig`，导出 `zmodu.panicHook`）：
+  Server 在 dispatch 前将当前请求 `METHOD /path` 写入 threadlocal，
+  panic 时先输出该上下文（无分配、固定缓冲）再走
+  `std.debug.defaultPanic`。应用 root 一行接入：
+  `pub const panic = zmodu.panicHook;`。
+- **`zmodu audit` 新规则**（`tools/zmodu/src/audit.zig`）：
+  b19 请求路径裸 panic（`@panic` / 语句级 `unreachable;`）、
+  b20 文件作用域共享可变 HashMap（建议 FrozenMap）、
+  b21 请求路径裸 `@alignCast`（豁免 `ctx.user_data` 与
+  `@alignCast(self)` 单例注册）。
+
+### Security
+- **zent-modulith 示例不再信任客户端租户**：`zent_crud.CrudApi` 的
+  `.tenant_source` 由 `.query` 改为 `.attr`，products 五条路由接入
+  `jwtAuthFromCatalog`（租户取自 JWT `aud` claim）。此前改一个 URL 参数
+  `?tenant_id=` 即可跨租户读取。配套新增 dev-only 取 token 路由
+  （`ZENT_DEV_TOKEN=1` 才挂载，明确标注为后门）与 README 更新。
+
 ### Fixed
+- **CI benchmark job 从未执行**（`.github/workflows/ci.yml`）：`if` 只匹配
+  `refs/heads/main`，而默认分支是 `master` → 性能回归门禁（`alert-threshold`
+  150%）形同虚设。与其它 job 一致改为 `main || master`。
+- **`HealthEndpoint.handleReadiness` 编译错误**（`const details` 却调用
+  `components.deinit(*Self)`）——任何调用方都会编译失败，readiness 端点不可用。
+- **`Dashboard.registerRoutes` 两处编译错误**：`handleModules` 的 `allocPrint`
+  缺参数元组、`get` 需要 `*RouteGroup`。`productionProfile(.dashboard = true)`
+  暴露了它们。
+- **`config` 模块的 `readToEndAlloc` 失效 API**（`YamlToml` ×2 /
+  `ConfigManager` / `TomlLoader`）：Zig 0.17 已移除该方法，`parseFile` /
+  `loadJson` / `loadFile` 属于"导出但一用就编译失败"的公开 API，现改用
+  `Dir.readFileAlloc`，并补 `YamlParser.parseFile` 端到端测试。
 - **Server `stop()` 在 Linux 上唤醒阻塞的 `accept()`**（`src/api/Server.zig`
   `closeListener`）：先 `shutdown(SHUT_RDWR)` 再 close。Linux 下 close 不会
   中断阻塞中的 accept（内核为进行中的调用保持 socket 存活），accept 循环

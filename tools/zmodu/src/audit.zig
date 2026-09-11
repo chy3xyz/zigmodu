@@ -688,6 +688,56 @@ fn lintFile(
             }
         }
 
+        // b19 — bare panic in the request path: api/service/persistence run on
+        // the shared worker pool, so a panic aborts the whole process and
+        // kills every in-flight request, not just the buggy one. Return an
+        // error instead (handler → respondErr / error propagation).
+        // Idiomatic switch-prong exhaustiveness (`=> unreachable,`) is fine;
+        // we flag statement form (`catch unreachable;`, `unreachable;`) and
+        // explicit `@panic(...)`.
+        if ((std.mem.eql(u8, file_name, "api.zig") or std.mem.eql(u8, file_name, "service.zig") or std.mem.eql(u8, file_name, "persistence.zig")) and !config.disabled.contains("b19")) {
+            if (std.mem.indexOf(u8, trimmed, "@panic(") != null or std.mem.endsWith(u8, trimmed, "unreachable;")) {
+                try pushViolation(violations, allocator, "b19", rel_path, idx, "请求路径裸 panic — panic 会终止整个进程（拖垮全部在途请求）；改为返回错误（handler 用 respondErr / 错误传播），确实不可能的分支用 // audit: ignore b19 注明", .{});
+            }
+        }
+
+        // b20 — app-level shared mutable HashMap at file scope: concurrent
+        // put/resize from the worker pool tears map metadata and crashes
+        // readers (panic: incorrect alignment). Fill at startup, then
+        // freeze() (zmodu.FrozenMap/FrozenStringMap) or guard with a mutex.
+        if ((std.mem.eql(u8, file_name, "api.zig") or std.mem.eql(u8, file_name, "service.zig") or std.mem.eql(u8, file_name, "persistence.zig")) and !config.disabled.contains("b20")) {
+            const file_scope_var = std.mem.startsWith(u8, line, "var ") or std.mem.startsWith(u8, line, "pub var ");
+            if (file_scope_var and std.mem.indexOf(u8, line, "HashMap") != null and std.mem.indexOf(u8, line, "FrozenMap") == null) {
+                try pushViolation(violations, allocator, "b20", rel_path, idx, "文件作用域共享可变 HashMap — worker 池并发 put/resize 会撕裂元数据导致读者崩溃；改用 zmodu.FrozenMap/FrozenStringMap（启动期填充后 freeze）或加互斥锁", .{});
+            }
+        }
+
+        // b21 — bare @alignCast in the request path: the classic source of
+        // `panic: incorrect alignment` is a pointer into a map/arena that was
+        // reallocated or torn by a concurrent writer. Each @alignCast must
+        // carry a provenance justification (// audit: ignore b21 + comment).
+        // The sanctioned casts are exempt: `ctx.user_data` (ComptimeRouter
+        // *State) and `@alignCast(self)` (API singleton → user_data at
+        // route-registration time; the singleton outlives the server).
+        if ((std.mem.eql(u8, file_name, "api.zig") or std.mem.eql(u8, file_name, "service.zig") or std.mem.eql(u8, file_name, "persistence.zig")) and !config.disabled.contains("b21")) {
+            if (std.mem.indexOf(u8, trimmed, "@alignCast(") != null and
+                std.mem.indexOf(u8, trimmed, "user_data") == null and
+                std.mem.indexOf(u8, trimmed, "@alignCast(self)") == null)
+            {
+                try pushViolation(violations, allocator, "b21", rel_path, idx, "请求路径裸 @alignCast — 指针来源必须是稳定内存；跨线程共享 map 的值指针在 resize 时会撕裂（panic: incorrect alignment）。确认来源后用 // audit: ignore b21 并注释出处", .{});
+            }
+        }
+
+        // b22 — client-chosen tenant: `.tenant_source = .query` (zent-modulith
+        // CrudApi) reads the tenant from a URL parameter, so anyone can switch
+        // tenants by editing the URL. Use `.attr` with the JWT middleware,
+        // which fills it from the verified token's `aud` claim.
+        if (!config.disabled.contains("b22")) {
+            if (std.mem.indexOf(u8, trimmed, "tenant_source = .query") != null) {
+                try pushViolation(violations, allocator, "b22", rel_path, idx, "租户来源取自 query 参数（客户端可任意篡改，改一个 URL 即可跨租户读）— 改为 .attr 并由 JWT 中间件注入；仅公开 demo 可用 // audit: ignore b22 豁免", .{});
+            }
+        }
+
         // b16 — track the current service method: count write calls, look for
         // a transaction, and flag 2+ writes without one when the method ends.
         if (std.mem.eql(u8, file_name, "service.zig") and !config.disabled.contains("b16")) {
@@ -1789,6 +1839,24 @@ test "audit business lint flags anti-patterns" {
     // ownership transfers regardless of where the type lands (regression:
     // this must stay exempt even though the type is on the next line).
     try lintFile(allocator, "service.zig", "pub fn getGrade(self: *@This(), id: i64) !model.UserGradeRow {\n    return try self.db.queryRowPartial(\n        model.UserGradeRow,\n        \"SELECT grade_id FROM grades WHERE id = ?\",\n        &.{.{ .int = id }},\n    );\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b19 — bare panic in the request path.
+    try lintFile(allocator, "api.zig", "fn handler(ctx: *http.Context, self: *State) !void {\n    const s = self.service.get() catch @panic(\"boom\");\n    _ = s;\n}\n", "src/modules/x/api.zig", &cfg, &violations);
+    // b19 — statement-form unreachable in service.
+    try lintFile(allocator, "service.zig", "pub fn f(self: *@This(), x: i64) !void {\n    _ = self;\n    if (x == 1) unreachable;\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b19 negative — switch-prong exhaustiveness is idiomatic, not flagged.
+    try lintFile(allocator, "service.zig", "pub fn g(self: *@This(), e: E) i64 {\n    _ = self;\n    return switch (e) {\n        .a => 1,\n        .b => unreachable,\n    };\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b20 — file-scope shared mutable HashMap.
+    try lintFile(allocator, "service.zig", "var adapters = std.StringHashMap(Adapter).init(std.heap.page_allocator);\npub fn f() void {}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b20 negative — fn-local map is fine.
+    try lintFile(allocator, "service.zig", "pub fn f(allocator: std.mem.Allocator) !void {\n    var m = std.AutoHashMap(u32, u32).init(allocator);\n    defer m.deinit();\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b20 negative — FrozenMap is the sanctioned pattern.
+    try lintFile(allocator, "service.zig", "var adapters = zmodu.FrozenStringMap(Adapter).init(std.heap.page_allocator);\npub fn f() void {}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b21 — bare @alignCast in the request path.
+    try lintFile(allocator, "api.zig", "fn handler(ctx: *http.Context, self: *State) !void {\n    const p: *Header = @alignCast(@ptrCast(self.raw));\n    _ = p;\n}\n", "src/modules/x/api.zig", &cfg, &violations);
+    // b22 — tenant taken from the client-controlled query string.
+    try lintFile(allocator, "zent_crud.zig", "const A = CrudApi(infos, Info, .{ .tenant_source = .query });\n", "src/modules/x/zent_crud.zig", &cfg, &violations);
+    // b22 negative — .attr (JWT-provided tenant) is the sanctioned form.
+    try lintFile(allocator, "zent_crud.zig", "const A = CrudApi(infos, Info, .{ .tenant_source = .attr });\n", "src/modules/x/zent_crud.zig", &cfg, &violations);
 
     var rules = std.StringHashMap(usize).init(allocator);
     defer rules.deinit();
@@ -1814,6 +1882,10 @@ test "audit business lint flags anti-patterns" {
     try std.testing.expectEqual(@as(usize, 1), rules.get("b16").?);
     try std.testing.expectEqual(@as(usize, 3), rules.get("b17").?);
     try std.testing.expectEqual(@as(usize, 1), rules.get("b18").?);
+    try std.testing.expectEqual(@as(usize, 2), rules.get("b19").?);
+    try std.testing.expectEqual(@as(usize, 1), rules.get("b20").?);
+    try std.testing.expectEqual(@as(usize, 1), rules.get("b21").?);
+    try std.testing.expectEqual(@as(usize, 1), rules.get("b22").?);
 }
 
 test "audit collectModelStructs picks up indented local const structs" {

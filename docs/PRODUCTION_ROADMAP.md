@@ -24,7 +24,7 @@
 
 ```bash
 zig build
-ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test   # 415+ passed, 5 skipped
+ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test   # 961/981 passed, 20 skipped（计数以 AGENTS.md 为准）
 ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build check-api
 ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build check
 bash scripts/ci-integration.sh   # tenant-mgmt + http-stress-test（需 curl）
@@ -178,6 +178,27 @@ gRPC 的价值与**通信距离**成正比，modulith 的核心通信都在**进
 - CI 系统性 0s failure（8-03 起 260+ run）——分支 bug 已修（master），仍需
   GitHub Actions 服务端排查（禁用/配额）；测试基建依赖 CI/独立 runner。
 
+**已完成（2026-09 加固批次）**
+- ✅ 连接级背压 `max_connections` / `over_limit_response` + header 阶段 deadline
+  `header_timeout_ms`（slowloris）；环境变量 `HTTP_MAX_CONNECTIONS` /
+  `HTTP_HEADER_TIMEOUT_MS`。
+- ✅ 生产一键配置 `http.productionProfile`（背压 + 中间件 + `/metrics` 黄金信号
+  + `/health/*`），顺序约束见 `ROUTE_TABLE.md` §7.4。
+- ✅ WS 出站背压 `ws_write_timeout_ms`（`SO_SNDTIMEO`）+ `WsFramer.isWritable()`。
+- ✅ 并发浸泡测试 `zig build soak`；沙箱隔离 `-Dnet-tests=false`。
+- ✅ 观测闭环：`docs/OBSERVABILITY.md` + `docs/grafana/zigmodu-overview.json`。
+- ✅ 部署参考拓扑 `examples/production-deploy/`（nginx/Envoy/k8s/systemd）。
+- ✅ 韧性三件套：`FrozenMap` / `panicHook` / audit b19–b22。
+- ✅ 启动预检 `Preflight`（env / 占位 secret / DB / 待应用迁移 / 时钟）；
+  JWT `kid` 轮换（`JwksKeyRing` + `setKeyring`，未知 kid 拒绝）；CORS 通配符告警。
+- ✅ 业务面可观测：outbox 积压/投递指标 + 内置轮询、DB 池指标、抓取时采样钩子、
+  指标按 `ctx.route_template` 受限基数打标签。
+- ✅ 故障注入测试（熔断/限流走完整 HTTP 链路）与契约门禁模板
+  （`src/test/FaultInjection.zig` · `src/test/ContractGate.zig`）。
+- ✅ `DistributedLock` 的 `.postgres` 方言在真实 PG 上验证（`ZIGMODU_TEST_PG=1`，
+  CI `test-postgres` 已接入）；`.mysql` 仍待真实库验证。
+- ✅ 旗舰示例 `tenant-mgmt` 改为 `productionProfile`；CI 增加夜间 soak job。
+
 **P1（质量/正确性）**
 - ConnPool 等待完整 async 化（现为 50ms 分段缓解，M:N worker 耗尽未根治）。
 - libpq 非阻塞化（`PQsetnonblocking`+轮询；现 SO_RCVTIMEO 有界超时仍占 worker）。
@@ -185,8 +206,64 @@ gRPC 的价值与**通信距离**成正比，modulith 的核心通信都在**进
 - Migration barrel 导出（F2）→ 弃用业务侧自研 migrate.sh（已补 `pub const migration`）。
 
 **P2（增强/按需）**
-- AI 流式 tool_calls 增量组装；refresh token；OTLP/Vault TLS（当前 http-only）；
-  Windows CI 矩阵；zmodu marketplace/CLI 深化。
+- AI 流式 tool_calls 增量组装；refresh token；Windows CI 矩阵；
+  zmodu marketplace/CLI 深化。
+- 待办：`src/ai` 抽独立包（前置条件见下文「`src/ai` 边界」）· 第三方独立安全审计
+  （无法由框架自身完成）。
+
+### 单进程单点与原位隔离（prefork）— 记录在案的已知边界
+
+**现状（v0.15.36）**：整个后端是一个进程；请求由 io fiber 承载在共享 worker
+池上。因此**任何请求路径上的 panic 都会终止全部在途请求**——这不是可以靠
+框架代码消除的属性（Zig 的 panic 不可捕获），只能通过三层缓解：
+
+1. **少 panic**：`zmodu audit` b19/b20/b21（请求路径裸 panic / 共享可变
+   HashMap / 裸 `@alignCast`）+ `FrozenMap`（启动期填充、运行期只读）。
+2. **panic 可查**：`zmodu.panicHook` 在 panic 时先输出当前请求的
+   `METHOD /path`，把"进程为什么死"变成可定位事件。
+3. **进程可恢复**：supervisor 重启（systemd `Restart=always`、k8s
+   `restartPolicy: Always`、容器编排策略）。
+
+**未做（本路线图的正式条目）**：**prefork 多进程**——父进程监听并 accept，
+N 个 worker 子进程各自持有独立地址空间与 io 实例。届时单请求崩溃只损失一个
+worker（在途连接断开并重试），其余 worker 继续服务，panic 钩子的 stderr 归属
+到具体 worker pid。这是"一个 bug 只影响一个请求"的唯一结构性解法。
+
+**前置条件（未满足，故不排期实现）**
+- 子进程崩溃后的连接语义（keep-alive 断连、idempotency-key 重放的边界）需要
+  与应用层约定，框架不能单方面决定。
+- 共享状态需重新定义：进程内 EventBus / 内存缓存 / 连接池在 prefork 下变成
+  per-worker（或必须外置 Redis/NATS），这会改变 modulith 的默认假设。
+- 需要 sofile/std.Io 在 fork 后重置的验证（`std.Io.Threaded` 的线程池不可继承）。
+
+**因此当前的官方建议**：单进程 + 无状态实例水平扩展 + 状态外置
+（Postgres/Redis）+ 跨域副作用走 Outbox；把 prefork 当作"单机密度与故障
+隔离"的增强项，而非可用性的必要前提。
+
+### `src/ai` 边界：11% 行数的可剔离域
+
+**事实（2026-09）**：`src/ai/` = 42 个文件 / 12,216 行（约占框架 11%），提供
+Agent / Workflow / Skill / MCP / LLM 策略等**业务产品能力**，不是后端框架内核。
+
+**当前边界状态（已核实并由测试守护）**：
+- 四个规范域文件（`http.zig` / `data.zig` / `security.zig` / `observability.zig`）
+  **零** `ai/` 引用；只有 `root.zig` 有一个惰性 `pub const ai = @import("ai/ai.zig")`。
+- 由于 Zig 惰性分析，**不 import `zmodu.ai` 的消费者不会编译这 12k 行**——
+  边界是结构性的，不靠纪律。回归守卫见 `src/tests.zig`
+  「domain modules stay independent of the optional src/ai domain」。
+- 使用者：`examples/ai-ops`、`llm-policies`、`mcp-server`、`tenant-ai` 四个示例。
+
+**为什么仍建议最终抽成独立包**：
+- 版本节奏不同：LLM/Agent 侧 API 变动快，框架侧求稳，同仓同版本号会互相拖累。
+- 依赖方向不干净：AI 域天然想依赖 HTTP/Data，而后端使用者不想为不用的大块买单
+  （编译时间、审计面、`docs/AI*.md` 的认知负担）。
+
+**抽取前置条件**（未满足，故不排期）：
+1. 明确 `zmodu.ai` 对核心域的依赖清单，并把它降为"仅公开 API"（不碰内部类型）。
+2. 给 `ai` 定义自己的 `build.zig.zon` 与版本线，示例改为独立依赖。
+3. 确认没有消费者从 `zigmodu.ai` 反向依赖框架内部（当前示例均只用公开面）。
+
+**当下结论**：保持同仓但**守住边界**；不要往核心域加 `ai` 引用。
 
 ### 决策记录：拆分出口 = 事件契约 + outbox（对齐 Spring Modulith）
 

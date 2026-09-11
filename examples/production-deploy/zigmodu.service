@@ -1,0 +1,30 @@
+# systemd unit — the "supervisor" half of the resilience story.
+# A Zig panic aborts the process; Restart=always is what keeps the service up.
+[Unit]
+Description=ZigModu API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zigmodu
+WorkingDirectory=/opt/zigmodu
+Environment=HTTP_PORT=8080
+Environment=HTTP_MAX_CONNECTIONS=4096
+Environment=HTTP_HEADER_TIMEOUT_MS=10000
+Environment=WS_WRITE_TIMEOUT_MS=10000
+# Secrets come from the environment file (0600), not from the unit.
+EnvironmentFile=/etc/zigmodu/env
+ExecStart=/opt/zigmodu/bin/api
+Restart=always
+RestartSec=1
+# Do not let a restart loop hammer the box.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+# Connection backpressure needs headroom above max_connections.
+LimitNOFILE=65535
+# Panic messages (with the request context from zmodu.panicHook) go to journald:
+#   journalctl -u zigmodu -p err -b
+
+[Install]
+WantedBy=multi-user.target

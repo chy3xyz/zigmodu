@@ -6,6 +6,11 @@ pub const PrometheusMetrics = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
+    scrape_hook: ?ScrapeHook,
+    scrape_userdata: ?*anyopaque,
+    /// Bounded-cardinality labeled series (see `createCounterFamily`).
+    counter_families: std.ArrayList(*CounterFamily),
+    histogram_families: std.ArrayList(*HistogramFamily),
     counters: std.StringHashMap(Counter),
     gauges: std.StringHashMap(Gauge),
     histograms: std.StringHashMap(Histogram),
@@ -184,9 +189,202 @@ pub const PrometheusMetrics = struct {
         }
     };
 
+    /// A counter split by one label, with a hard series cap. Values beyond the
+    /// cap collapse into a single `__other__` series, so a dynamic label value
+    /// can never make a scrape (or memory) unbounded.
+    pub const CounterFamily = struct {
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        mutex: std.Io.Mutex = .init,
+        name: []const u8,
+        help: []const u8,
+        label: []const u8,
+        max_series: usize,
+        series: std.StringHashMap(*Counter),
+        overflow: Counter,
+        overflow_used: bool = false,
+
+        /// Series handle for `label_value` (creates it on first use, up to
+        /// `max_series`). Never fails: on allocation pressure it degrades to
+        /// the shared overflow counter.
+        pub fn get(self: *CounterFamily, label_value: []const u8) *Counter {
+            self.mutex.lock(self.io) catch return &self.overflow;
+            defer self.mutex.unlock(self.io);
+            if (self.series.get(label_value)) |c| return c;
+            if (self.series.count() >= self.max_series) {
+                self.overflow_used = true;
+                return &self.overflow;
+            }
+            const key = self.allocator.dupe(u8, label_value) catch {
+                self.overflow_used = true;
+                return &self.overflow;
+            };
+            const counter = self.allocator.create(Counter) catch {
+                self.allocator.free(key);
+                self.overflow_used = true;
+                return &self.overflow;
+            };
+            counter.* = .{
+                .name = self.name,
+                .help = self.help,
+                .value = std.atomic.Value(u64).init(0),
+                .labels = std.StringHashMap([]const u8).init(self.allocator),
+            };
+            self.series.put(key, counter) catch {
+                self.allocator.free(key);
+                self.allocator.destroy(counter);
+                self.overflow_used = true;
+                return &self.overflow;
+            };
+            return counter;
+        }
+
+        fn render(self: *CounterFamily, buf: *std.array_list.Managed(u8)) !void {
+            try buf.print("# HELP {s} {s}\n", .{ self.name, self.help });
+            try buf.print("# TYPE {s} counter\n", .{self.name});
+            var it = self.series.iterator();
+            while (it.next()) |entry| {
+                try buf.print("{s}{{{s}=\"{s}\"}} {d}\n", .{
+                    self.name, self.label, entry.key_ptr.*, entry.value_ptr.*.value.load(.monotonic),
+                });
+            }
+            if (self.overflow_used) {
+                try buf.print("{s}{{{s}=\"__other__\"}} {d}\n", .{
+                    self.name, self.label, self.overflow.value.load(.monotonic),
+                });
+            }
+            try buf.print("\n", .{});
+        }
+
+        fn deinit(self: *CounterFamily) void {
+            self.overflow.labels.deinit();
+            var it = self.series.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                entry.value_ptr.*.labels.deinit();
+                self.allocator.destroy(entry.value_ptr.*);
+            }
+            self.series.deinit();
+            self.allocator.free(self.name);
+            self.allocator.free(self.help);
+            self.allocator.free(self.label);
+            self.allocator.destroy(self);
+        }
+    };
+
+    /// Histogram split by one label, with the same bounded-series rule as
+    /// `CounterFamily`.
+    pub const HistogramFamily = struct {
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        mutex: std.Io.Mutex = .init,
+        name: []const u8,
+        help: []const u8,
+        label: []const u8,
+        max_series: usize,
+        buckets: []f64,
+        series: std.StringHashMap(*Histogram),
+        overflow: Histogram,
+        overflow_used: bool = false,
+
+        pub fn get(self: *HistogramFamily, label_value: []const u8) *Histogram {
+            self.mutex.lock(self.io) catch return &self.overflow;
+            defer self.mutex.unlock(self.io);
+            if (self.series.get(label_value)) |h| return h;
+            if (self.series.count() >= self.max_series) {
+                self.overflow_used = true;
+                return &self.overflow;
+            }
+            const key = self.allocator.dupe(u8, label_value) catch {
+                self.overflow_used = true;
+                return &self.overflow;
+            };
+            const hist = self.allocator.create(Histogram) catch {
+                self.allocator.free(key);
+                self.overflow_used = true;
+                return &self.overflow;
+            };
+            hist.* = .{
+                .name = self.name,
+                .help = self.help,
+                .buckets = std.array_list.Managed(f64).init(self.allocator),
+                .counts = std.array_list.Managed(u64).init(self.allocator),
+            };
+            for (self.buckets) |b| {
+                hist.buckets.append(b) catch {
+                    hist.buckets.deinit();
+                    hist.counts.deinit();
+                    self.allocator.free(key);
+                    self.allocator.destroy(hist);
+                    self.overflow_used = true;
+                    return &self.overflow;
+                };
+                hist.counts.append(0) catch {};
+            }
+            self.series.put(key, hist) catch {
+                hist.buckets.deinit();
+                hist.counts.deinit();
+                self.allocator.free(key);
+                self.allocator.destroy(hist);
+                self.overflow_used = true;
+                return &self.overflow;
+            };
+            return hist;
+        }
+
+        fn render(self: *HistogramFamily, buf: *std.array_list.Managed(u8)) !void {
+            try buf.print("# HELP {s} {s}\n", .{ self.name, self.help });
+            try buf.print("# TYPE {s} histogram\n", .{self.name});
+            var it = self.series.iterator();
+            while (it.next()) |entry| {
+                try renderHistogram(buf, entry.value_ptr.*, self.label, entry.key_ptr.*);
+            }
+            if (self.overflow_used) {
+                try renderHistogram(buf, &self.overflow, self.label, "__other__");
+            }
+            try buf.print("\n", .{});
+        }
+
+        fn deinit(self: *HistogramFamily) void {
+            self.overflow.buckets.deinit();
+            self.overflow.counts.deinit();
+            var it = self.series.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                entry.value_ptr.*.buckets.deinit();
+                entry.value_ptr.*.counts.deinit();
+                self.allocator.destroy(entry.value_ptr.*);
+            }
+            self.series.deinit();
+            self.allocator.free(self.name);
+            self.allocator.free(self.help);
+            self.allocator.free(self.label);
+            self.allocator.free(self.buckets);
+            self.allocator.destroy(self);
+        }
+    };
+
+    fn renderHistogram(buf: *std.array_list.Managed(u8), hist: *const Histogram, label: []const u8, label_value: []const u8) !void {
+        for (hist.buckets.items, hist.counts.items) |bucket, count| {
+            try buf.print("{s}_bucket{{{s}=\"{s}\",le=\"{d:.3}\"}} {d}\n", .{ hist.name, label, label_value, bucket, count });
+        }
+        try buf.print("{s}_bucket{{{s}=\"{s}\",le=\"+Inf\"}} {d}\n", .{ hist.name, label, label_value, hist.totalCount() });
+        try buf.print("{s}_sum{{{s}=\"{s}\"}} {d:.6}\n", .{ hist.name, label, label_value, hist.sum() });
+        try buf.print("{s}_count{{{s}=\"{s}\"}} {d}\n", .{ hist.name, label, label_value, hist.totalCount() });
+    }
+
+    /// Called at the start of every scrape, before rendering. Use it to
+    /// refresh gauges that are cheap to sample but expensive to keep fresh
+    /// (DB pool saturation, outbox backlog) — no background thread needed.
+    pub const ScrapeHook = *const fn (userdata: ?*anyopaque) void;
+
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
             .allocator = allocator,
+            .scrape_hook = null,
+            .scrape_userdata = null,
+            .counter_families = std.ArrayList(*CounterFamily).empty,
+            .histogram_families = std.ArrayList(*HistogramFamily).empty,
             .counters = std.StringHashMap(Counter).init(allocator),
             .gauges = std.StringHashMap(Gauge).init(allocator),
             .histograms = std.StringHashMap(Histogram).init(allocator),
@@ -194,7 +392,17 @@ pub const PrometheusMetrics = struct {
         };
     }
 
+    pub fn setScrapeHook(self: *Self, hook: ?ScrapeHook, userdata: ?*anyopaque) void {
+        self.scrape_hook = hook;
+        self.scrape_userdata = userdata;
+    }
+
     pub fn deinit(self: *Self) void {
+        for (self.counter_families.items) |f| f.deinit();
+        self.counter_families.deinit(self.allocator);
+        for (self.histogram_families.items) |f| f.deinit();
+        self.histogram_families.deinit(self.allocator);
+
         // Free all metrics
         var counter_iter = self.counters.iterator();
         while (counter_iter.next()) |entry| {
@@ -318,8 +526,15 @@ pub const PrometheusMetrics = struct {
 
     /// Generate Prometheus-format metrics output
     pub fn toPrometheusFormat(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
+        if (self.scrape_hook) |hook| hook(self.scrape_userdata);
         var buf = std.array_list.Managed(u8).init(allocator);
         defer buf.deinit();
+
+        // Labeled families (bounded cardinality; overflow collapses into
+        // a single `__other__` series so a hostile/dynamic label value can
+        // never blow up the scrape).
+        for (self.counter_families.items) |f| try f.render(&buf);
+        for (self.histogram_families.items) |f| try f.render(&buf);
 
         // Counters
         var counter_iter = self.counters.iterator();
@@ -468,13 +683,84 @@ pub const PrometheusMetrics = struct {
         }
     };
 
+    /// Bounded-cardinality counter split by a single label.
+    /// `max_series` caps distinct label values; extra ones share `__other__`.
+    pub fn createCounterFamily(self: *Self, name: []const u8, help: []const u8, label: []const u8, max_series: usize, io: std.Io) !*CounterFamily {
+        const f = try self.allocator.create(CounterFamily);
+        errdefer self.allocator.destroy(f);
+        const name_copy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_copy);
+        const help_copy = try self.allocator.dupe(u8, help);
+        errdefer self.allocator.free(help_copy);
+        const label_copy = try self.allocator.dupe(u8, label);
+        errdefer self.allocator.free(label_copy);
+        f.* = .{
+            .allocator = self.allocator,
+            .io = io,
+            .name = name_copy,
+            .help = help_copy,
+            .label = label_copy,
+            .max_series = @max(1, max_series),
+            .series = std.StringHashMap(*Counter).init(self.allocator),
+            .overflow = .{
+                .name = name_copy,
+                .help = help_copy,
+                .value = std.atomic.Value(u64).init(0),
+                .labels = std.StringHashMap([]const u8).init(self.allocator),
+            },
+        };
+        try self.counter_families.append(self.allocator, f);
+        return f;
+    }
+
+    /// Bounded-cardinality histogram split by a single label.
+    pub fn createHistogramFamily(self: *Self, name: []const u8, help: []const u8, label: []const u8, max_series: usize, buckets: []const f64, io: std.Io) !*HistogramFamily {
+        const f = try self.allocator.create(HistogramFamily);
+        errdefer self.allocator.destroy(f);
+        const name_copy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_copy);
+        const help_copy = try self.allocator.dupe(u8, help);
+        errdefer self.allocator.free(help_copy);
+        const label_copy = try self.allocator.dupe(u8, label);
+        errdefer self.allocator.free(label_copy);
+        const buckets_copy = try self.allocator.dupe(f64, buckets);
+        errdefer self.allocator.free(buckets_copy);
+        f.* = .{
+            .allocator = self.allocator,
+            .io = io,
+            .name = name_copy,
+            .help = help_copy,
+            .label = label_copy,
+            .max_series = @max(1, max_series),
+            .buckets = buckets_copy,
+            .series = std.StringHashMap(*Histogram).init(self.allocator),
+            .overflow = .{
+                .name = name_copy,
+                .help = help_copy,
+                .buckets = std.array_list.Managed(f64).init(self.allocator),
+                .counts = std.array_list.Managed(u64).init(self.allocator),
+            },
+        };
+        for (buckets) |b| {
+            try f.overflow.buckets.append(b);
+            try f.overflow.counts.append(0);
+        }
+        try self.histogram_families.append(self.allocator, f);
+        return f;
+    }
+
     /// Convenience: register /metrics route on a server with Prometheus text format.
     /// Usage: try metrics.registerMetricsRoute(&server);
     pub fn registerMetricsRoute(self: *Self, server: anytype) !void {
+        try self.registerMetricsRoutePath(server, "/metrics");
+    }
+
+    /// Same as `registerMetricsRoute` with a caller-chosen path.
+    pub fn registerMetricsRoutePath(self: *Self, server: anytype, path: []const u8) !void {
         const ptr: *anyopaque = @ptrCast(self);
         try server.addRoute(.{
             .method = .GET,
-            .path = "/metrics",
+            .path = path,
             .handler = struct {
                 fn handle(ctx: *api.Context) anyerror!void {
                     const m: *PrometheusMetrics = @ptrCast(@alignCast(ctx.user_data orelse return error.NoMetrics));
@@ -609,4 +895,69 @@ test "MetricsBackend adapter" {
 
     const gauge = metrics.getGauge("backend_gauge").?;
     try std.testing.expectEqual(@as(f64, 42.0), gauge.get());
+}
+
+test "counter family caps cardinality and collapses the overflow" {
+    const allocator = std.testing.allocator;
+    var m = PrometheusMetrics.init(allocator);
+    defer m.deinit();
+
+    const family = try m.createCounterFamily("http_requests_total", "Total requests", "route", 2, std.testing.io);
+    family.get("/a").inc();
+    family.get("/b").inc();
+    family.get("/b").inc();
+    family.get("/c").inc();
+    family.get("/d").inc();
+    family.get("/d").inc();
+
+    const text = try m.toPrometheusFormat(allocator);
+    defer allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "http_requests_total{route=\"/a\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "http_requests_total{route=\"/b\"} 2") != null);
+    // Everything past the cap shares one series — a dynamic label value can
+    // never grow the scrape or the memory without bound.
+    try std.testing.expect(std.mem.indexOf(u8, text, "http_requests_total{route=\"__other__\"} 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "route=\"/c\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "route=\"/d\"") == null);
+}
+
+test "histogram family renders per-label buckets" {
+    const allocator = std.testing.allocator;
+    var m = PrometheusMetrics.init(allocator);
+    defer m.deinit();
+
+    const buckets = [_]f64{ 10, 100 };
+    const family = try m.createHistogramFamily("http_request_duration_milliseconds", "latency", "route", 8, &buckets, std.testing.io);
+    family.get("/orders/{id}").observe(5);
+    family.get("/orders/{id}").observe(50);
+    family.get("/orders/{id}").observe(500);
+
+    const text = try m.toPrometheusFormat(allocator);
+    defer allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "http_request_duration_milliseconds_bucket{route=\"/orders/{id}\",le=\"10.000\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "http_request_duration_milliseconds_bucket{route=\"/orders/{id}\",le=\"100.000\"} 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "http_request_duration_milliseconds_bucket{route=\"/orders/{id}\",le=\"+Inf\"} 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "http_request_duration_milliseconds_count{route=\"/orders/{id}\"} 3") != null);
+}
+
+test "scrape hook refreshes gauges before rendering" {
+    const allocator = std.testing.allocator;
+    var m = PrometheusMetrics.init(allocator);
+    defer m.deinit();
+
+    const gauge = try m.createGauge("db_pool_active", "Active pooled connections");
+    const Hook = struct {
+        fn run(ud: ?*anyopaque) void {
+            const g: *PrometheusMetrics.Gauge = @ptrCast(@alignCast(ud.?));
+            g.set(7);
+        }
+    };
+    m.setScrapeHook(Hook.run, gauge);
+
+    const text = try m.toPrometheusFormat(allocator);
+    defer allocator.free(text);
+    // The value was sampled at scrape time, not registered up front.
+    try std.testing.expect(std.mem.indexOf(u8, text, "db_pool_active 7.000000") != null);
 }

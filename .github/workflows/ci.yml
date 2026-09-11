@@ -11,6 +11,11 @@ on:
   # Manual trigger for debugging workflow-level failures (0s runs with no
   # jobs) without needing a code push.
   workflow_dispatch:
+  # Nightly concurrency soak (`zig build soak`): heavy N-clients x M-tenants
+  # traffic with cross-tenant-leak assertions. Too slow for every push, which
+  # is exactly why it runs on a schedule.
+  schedule:
+    - cron: '17 3 * * *'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -360,6 +365,14 @@ jobs:
         env:
           DB: postgres
           PGconninfo: host=localhost port=5432 dbname=postgres user=postgres password=postgres
+          # Opt-in real-database coverage for the postgres dialect (the
+          # DistributedLock table lock; SQLite-only runs skip it).
+          ZIGMODU_TEST_PG: "1"
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          PGDATABASE: postgres
         run: zig build test
 
   test-mysql:
@@ -490,10 +503,40 @@ jobs:
           retention-days: 7
 
   # ── Benchmark ──────────────────────────────────
+  soak:
+    name: Nightly soak (N clients x M tenants)
+    runs-on: ubuntu-latest
+    # Scheduled + manual only: this is the slow, high-fan-out run.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux) ART="zig-x86_64-linux" ;;
+            macOS) ART="zig-aarch64-macos" ;;
+            *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
+          esac
+          curl -fsSL "https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
+          echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
+
+      - name: Install deps
+        run: sudo apt-get install -y libpq-dev libmariadb-dev libmariadb-dev-compat libsqlite3-dev
+
+      - name: Soak (cross-tenant leak assertions + frozen-registry concurrency)
+        # Larger than the local defaults: the point of running this nightly is
+        # to widen the window, not to re-run the fast suite.
+        run: zig build soak -Dsoak-clients=64 -Dsoak-iterations=200
+
   benchmark:
     name: Benchmark
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     steps:
       - uses: actions/checkout@v4
 

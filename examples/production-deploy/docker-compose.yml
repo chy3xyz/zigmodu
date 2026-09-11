@@ -1,0 +1,78 @@
+# Minimal TLS-termination topology: nginx + two backend replicas.
+#
+#   docker compose up --build
+#   curl -sfk https://localhost:8443/health/live
+#   curl -sk  https://localhost:8443/metrics | head
+#
+# The backends run examples/basic via ../../Dockerfile (context = repo root,
+# because the example depends on zigmodu through a relative path). Point
+# APP at another example or your own project as needed.
+
+services:
+  app1:
+    build:
+      # Context must be the repo root: the example apps depend on zigmodu via
+      # `.path = "../.."`.
+      context: ../..
+      dockerfile: examples/production-deploy/Dockerfile
+      args:
+        APP: examples/basic
+    environment:
+      HTTP_PORT: "8080"
+      HTTP_MAX_CONNECTIONS: "4096"      # connection backpressure (Server.fromEnv)
+      HTTP_HEADER_TIMEOUT_MS: "10000"   # slowloris guard
+      WS_WRITE_TIMEOUT_MS: "10000"      # slow WS peers cannot stall writers
+      JWT_SECRET: "${JWT_SECRET:?set JWT_SECRET}"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health/live || exit 1"]
+      interval: 10s
+      timeout: 2s
+      retries: 3
+      start_period: 5s
+    # panic kills the process — restart is the availability backstop.
+    restart: always
+    ulimits:
+      nofile: { soft: 65535, hard: 65535 }
+
+  app2:
+    build:
+      context: ../..
+      dockerfile: examples/production-deploy/Dockerfile
+      args:
+        APP: examples/basic
+    environment:
+      HTTP_PORT: "8080"
+      HTTP_MAX_CONNECTIONS: "4096"
+      HTTP_HEADER_TIMEOUT_MS: "10000"
+      WS_WRITE_TIMEOUT_MS: "10000"
+      JWT_SECRET: "${JWT_SECRET:?set JWT_SECRET}"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health/live || exit 1"]
+      interval: 10s
+      timeout: 2s
+      retries: 3
+      start_period: 5s
+    restart: always
+    ulimits:
+      nofile: { soft: 65535, hard: 65535 }
+
+  edge:
+    image: nginx:1.27-alpine
+    depends_on:
+      app1: { condition: service_healthy }
+      app2: { condition: service_healthy }
+    ports:
+      - "8443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/zigmodu.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    restart: always
+
+  # Optional: Prometheus scraping both replicas (see docs/OBSERVABILITY.md).
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    profiles: ["observability"]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"

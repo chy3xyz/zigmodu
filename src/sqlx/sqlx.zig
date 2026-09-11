@@ -4395,6 +4395,15 @@ pub const Client = struct {
         return defaultAcceptable(err);
     }
 
+    /// Pool saturation snapshot — `null` when pooling is disabled (e.g. the
+    /// `:memory:` single-connection path). Expose these as gauges (see
+    /// `PrometheusMetrics.setScrapeHook`) so pool exhaustion is visible before
+    /// requests start timing out.
+    pub fn poolMetrics(self: *Client) ?ConnPool.PoolMetrics {
+        if (self.pool) |*p| return p.metrics();
+        return null;
+    }
+
     pub fn deinit(self: *Client) void {
         if (self.pool) |*p| {
             p.deinit();

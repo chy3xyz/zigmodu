@@ -16,7 +16,11 @@
 | 多租户列名 | `docs/ARCHITECTURE.md` § Multi-Tenancy |
 | zent ORM（电商/社交主推组合） | `docs/ZENT.md`（勿与 sqlx 混事务；§4.8 场景能力矩阵） |
 | SQLx 驱动链接 | `docs/SQLX_DRIVERS.md`（`-Ddb=` / `.db=`） |
+| 生产接线 / 背压 / 编排 | `docs/ROUTE_TABLE.md` §7.4 + `docs/BEST_PRACTICES.md`「韧性」 |
+| 观测 / 告警 / Grafana | `docs/OBSERVABILITY.md`（黄金信号 + 阈值 + dashboard JSON；夜间 `zig build soak` 见 CI `soak` job） |
+| 部署拓扑（TLS 边车/探针/守护） | `examples/production-deploy/`（nginx · Envoy · k8s · systemd） |
 | Extract / SSE / Testkit / Outbox | `docs/FRAMEWORK_BACKLOG.md` |
+| 故障注入 / 契约门禁模板 | `src/test/FaultInjection.zig` · `src/test/ContractGate.zig` |
 | CLI 生成 | `docs/ZMODU_CLI_INTEGRATION.md` · `zig build zmodu -- scaffold …` |
 | LLM 对话模块（产品功能） | `docs/AI.md`（**不是** agent 指南） |
 | AI 业务接入（KeyManager/Agent/Workflow/Skill/接入） | `docs/AI_DEV_GUIDE.md` + `docs/AI_SKILLS.md` + `docs/LLM_POLICIES.md` |
@@ -63,6 +67,19 @@ defer app.stop();
 | WS：`on_message(session, msg, kind)` — **text+binary**（`WsFrameKind`）；`writeBinary`/`writeData` | 假定只收 0x1；丢弃 0x2（会破坏 OpenIM protobuf） |
 | sqlx：`Client.open` 后注意 pool/client 指针；CB 传 `io` | 在 ConnPool 上缓存失效的 `*Client` |
 | sqlx 驱动链接：`-Ddb=sqlite\|postgres\|mysql\|all`（默认 `all`） | 小系统用 `.db = "sqlite"`，勿默认三库全链 |
+| 共享注册表：`zmodu.FrozenMap/FrozenStringMap`，启动期填充后 `freeze()` | 文件作用域裸 HashMap 在 worker 池上并发写（撕裂元数据 → 进程崩溃） |
+| 应用 root 接 `pub const panic = zmodu.panicHook`（panic 时输出当前请求 METHOD/path） | 请求路径 `catch unreachable` / `@panic`（audit b19–b21 拦截） |
+| 生产配置 `max_connections` + `header_timeout_ms`（连接洪泛/slowloris）；发布前 `zig build soak` | 只设 `request_timeout_ms` 就当防住了慢连接（它只管 handler 阶段） |
+| 租户来源：JWT `aud` → attr（`.tenant_source = .attr`） | 从 query 取租户（`.query` 可被客户端篡改，audit b22 拦截） |
+| 生产一行接入：`http.productionProfile(&server, .{...}, &state)`（背压+安全+`/metrics`+`/health/*`+`/metrics` 黄金信号） | 在 `router.mountAll`/`addRoute` 之后再挂全局中间件（`addRoute` 注册时快照中间件链） |
+| WS 出站：`Server.Config.ws_write_timeout_ms` + `WsFramer.isWritable()` 丢帧 | 对不读的慢客户端无限阻塞写（会卡住写线程与 `ConnectionRegistry` shard 锁） |
+| 沙箱 CI：`zig build test -Dnet-tests=false` 跳过 socket 测试 | 在无 loopback 权限环境里跑默认套件（网络用例会失败/抖动） |
+| 多副本后台任务：`cron.setLock(...)` / `runner.setLock(...)`（`zigmodu.DistributedLock`，表锁按 DB 自动分方言） | 多副本直接跑 cron / 迁移（每个副本都会执行 = 重复副作用、并发 DDL） |
+| 指标标签用 `ctx.route_template`（模式）；用 `createCounterFamily` 限基数 | 把原始 path / id / 用户输入塞进 label（基数爆炸） |
+| 启动跑 `zigmodu.Preflight.run(...)`（env/secret/DB/迁移/时钟） | 用占位 JWT secret 或默认配置上线（预检会拦，别绕过） |
+| 生产接线的参考实现看 `examples/tenant-mgmt`（`productionProfile`）与 `examples/zmsaas`（Preflight + 池/积压指标） | 让示例停在上古手工接线（文档承诺、旗舰不用） |
+| 换 JWT 密钥走 `JwksKeyRing` + `setKeyring`（带 kid，新旧双验） | 直接改 secret 重启（全员强制重登；或留下无法验证的旧 token） |
+| outbox 用 `consumer.setMetrics` + `startPolling`；池/积压用 `metrics.setScrapeHook` | 只盯 HTTP 指标（outbox 停投、池打满在 HTTP 层完全看不见） |
 
 ### Selective SQL linking（消费者）
 
@@ -294,8 +311,12 @@ bash scripts/ci-integration.sh   # tenant-mgmt + stress + shopdemo（-Ddb=sqlite
 ## Version
 - Framework: **v0.15.35** (`build.zig.zon`)
 - Zig: **0.17.0-dev.1970+67f39b551**（CI 同款锁定版本，见 `.github/workflows/ci.yml` → `ZIG_VERSION`；避免 fmt 行为漂移。注意 ziglang 镜像会回收旧 dev 构建——dev.1567 已 404，升级时本地先验证再改 CI）
-- Tests: **1000/1019 passed**, 19 skipped（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`）
-- Score: ~98/100（`docs/EVALUATION_REPORT.md` v5.6）
+- Tests: **961/981 passed**, 20 skipped（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`；
+  其中 1 个跳过是门控的真实 PostgreSQL 锁用例 `ZIGMODU_TEST_PG=1`，CI 的 `test-postgres` job 会启用）
+- 其它测试入口：`zig build soak`（N 并发 × M 租户，默认 16×50；CI 夜间 64×200）·
+  `zig build test -Dnet-tests=false`（沙箱里跳过全部 socket 用例）
+- Score: ~98/100（`docs/EVALUATION_REPORT.md` v5.6；该报告早于 2026-09 加固批次，
+  当前状态以本文件与 `CHANGELOG.md` 为准）
 - Roadmap: `docs/PRODUCTION_ROADMAP.md`（phases 1–9 ✅）
 
 ### Release 流程（强制）
@@ -324,7 +345,7 @@ bash scripts/ci-integration.sh   # tenant-mgmt + stress + shopdemo（-Ddb=sqlite
 - Sandbox cache：`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`.
 - Auth Path A + `CatalogPermLoadInput` 已落地；legacy JWT 只写 `auth_info`。
 - x402 fail-closed；OTLP/Vault 已支持 HTTPS（系统 CA）。
-- zent v0.33.0 与 `data.sqlx` 正交，勿混驱动/共享事务（`docs/ZENT.md`）；`examples/zent-modulith` 按 v0.33.0 能力演示（v0.13 起向后兼容）。v0.32.3 起 sqlite 单连接访问串行化（`Rows` 持锁至 `deinit()`）；v0.33.0 起 `UseInterceptor` 覆盖 Create/BulkInsert（create 上 `whereEq` = 缺省才填）——升级后先审计存量拦截器（`docs/ZENT.md` §14）。
+- zent v0.37.0 与 `data.sqlx` 正交，勿混驱动/共享事务（`docs/ZENT.md`）；`examples/zent-modulith` 按 v0.37.0 能力演示（v0.13 起向后兼容）。v0.32.3 起 sqlite 单连接访问串行化（`Rows` 持锁至 `deinit()`）；v0.33.0 起 `UseInterceptor` 覆盖 Create/BulkInsert（create 上 `whereEq` = 缺省才填）；v0.35.0 起 outbox 认领式派发（崩溃遗留用 `requeueStale` 回收）；v0.36.0 起迁移默认加锁、outbox 新增 `claimed_at` 列、`createAllTables` 增加 allocator 参数；v0.37.0 起 `max_wait_ms` 真正阻塞等待、嵌套预加载每层一次查询。升级依赖后**先删 `.zig-cache` 重建**（增量缓存可能沿用旧 fetch 模块，本次适配实测踩中）。
 - SQLx 选择性链接：`-Ddb=` / `.db=`，默认 `all`；框架测试勿收窄；见 `docs/SQLX_DRIVERS.md`。
 - WS：`WsMessageFn` 含 `WsFrameKind`；fiber/io_uring 分发 text+binary（OpenIM protobuf OK）。
 - CI：`bash scripts/ci-integration.sh`（tenant-mgmt + stress + shopdemo，`-Ddb=sqlite`）。

@@ -1,0 +1,99 @@
+# Envoy — TLS/ALPN termination in front of a ZigModu h2c backend.
+# Note: proxy_http_version 2 / h2c upgrade requires Envoy's http2_protocol_options
+# on the upstream cluster when the backend enables HTTP/2 (Server.enable_http2).
+
+static_resources:
+  listeners:
+    - name: https
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8443 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                codec_type: AUTO
+                stream_idle_timeout: 30s
+                request_timeout: 30s
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: zigmodu
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/metrics" }
+                          route: { cluster: zigmodu_internal, timeout: 5s }
+                        - match: { prefix: "/" }
+                          route:
+                            cluster: zigmodu
+                            timeout: 30s
+                            retry_policy:
+                              retry_on: "5xx,reset,connect-failure"
+                              num_retries: 1
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                alpn_protocols: ["h2", "http/1.1"]
+                tls_certificates:
+                  - certificate_chain: { filename: /etc/envoy/certs/fullchain.pem }
+                    private_key: { filename: /etc/envoy/certs/privkey.pem }
+
+    - name: health
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8080 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: health
+                route_config:
+                  name: health_route
+                  virtual_hosts:
+                    - name: health
+                      domains: ["*"]
+                      routes:
+                        - match: { path: "/health/live" }
+                          route: { cluster: zigmodu, timeout: 2s }
+                        - match: { path: "/health/ready" }
+                          route: { cluster: zigmodu, timeout: 2s }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: zigmodu
+      connect_timeout: 3s
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: zigmodu
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: app1, port_value: 8080 } } }
+              - endpoint: { address: { socket_address: { address: app2, port_value: 8080 } } }
+      health_checks:
+        - timeout: 2s
+          interval: 5s
+          unhealthy_threshold: 3
+          healthy_threshold: 2
+          http_health_check: { path: /health/ready }
+
+    # Same endpoints, but never retried (metrics scrapes must not fan out).
+    - name: zigmodu_internal
+      connect_timeout: 3s
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: zigmodu_internal
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: app1, port_value: 8080 } } }

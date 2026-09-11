@@ -57,6 +57,20 @@ pub const ContractVerificationResult = struct {
         actual: []const u8,
         message: []const u8,
     };
+
+    /// Releases everything `verifyContract` allocated. Call it even on pass —
+    /// the result always owns its `contract_name`.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.contract_name);
+        for (self.failures) |f| {
+            allocator.free(f.field);
+            allocator.free(f.expected);
+            allocator.free(f.actual);
+            allocator.free(f.message);
+        }
+        allocator.free(self.failures);
+        self.* = undefined;
+    }
 };
 
 /// [...]Tests[...]

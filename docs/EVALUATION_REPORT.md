@@ -6,6 +6,10 @@
 **Zig 版本**: 0.17.0  
 **测试结果**: **990/1009 passed, 19 skipped, 0 failed**（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`，2026-08-27 复测）  
 
+> ⚠️ **本报告为时点快照**：数字对应 2026-08-27，早于 2026-09 的加固批次
+> （韧性三件套 / 背压 / 生产 profile / Preflight / 分布式锁 / 可观测标签等）。
+> 当前能力与测试计数以 [`AGENTS.md`](../AGENTS.md) 与 [`CHANGELOG.md`](../CHANGELOG.md) 为准。
+
 **生产门禁**: `zig build check`（热路径禁止裸 `catch {}`）  
 **旗舰示例**: [`examples/tenant-mgmt/`](../examples/tenant-mgmt/) — SQLite 持久层 + 真 JWT + CI 业务断言  
 **内置 CodeGen CLI**: [`tools/zmodu/`](../tools/zmodu/) — 支持 SQL DDL 解析、`@initialized` 开发模型与内置 MCP Server（`zig build zmodu`）

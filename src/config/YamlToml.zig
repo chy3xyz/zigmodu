@@ -14,10 +14,9 @@ pub const YamlParser = struct {
     /// Parse YAML file into a flat key-value map
     /// Nested keys are flattened with dots (e.g., server.port -> "server.port")
     pub fn parseFile(self: *Self, path: []const u8) !std.StringHashMap([]const u8) {
-        const file = try std.Io.Dir.cwd().openFile(path, .{});
-        defer file.close(std.testing.io);
-
-        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
+        // Zig 0.17: reading a whole file goes through Io-aware `Dir.readFileAlloc`.
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const content = try std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, std.Io.Limit.limited(1024 * 1024));
         defer self.allocator.free(content);
 
         return try self.parse(content);
@@ -142,10 +141,9 @@ pub const TomlParser = struct {
     }
 
     pub fn parseFile(self: *Self, path: []const u8) !std.StringHashMap([]const u8) {
-        const file = try std.Io.Dir.cwd().openFile(path, .{});
-        defer file.close(std.testing.io);
-
-        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
+        // Zig 0.17: reading a whole file goes through Io-aware `Dir.readFileAlloc`.
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const content = try std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, std.Io.Limit.limited(1024 * 1024));
         defer self.allocator.free(content);
 
         return try self.parse(content);
@@ -360,4 +358,30 @@ test "TomlParser sections and arrays" {
     try std.testing.expectEqualStrings("0.0.0.0", map.get("server.host").?);
     try std.testing.expectEqualStrings("3000", map.get("server.port").?);
     try std.testing.expectEqualStrings("\"hot_reload\", \"websockets\"", map.get("server.features").?);
+}
+
+test "YamlParser.parseFile reads a YAML file end to end" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "zigmodu_yaml_parsefile_test.yaml";
+
+    {
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, "server.port: 8080\nserver.host: 127.0.0.1\n");
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var parser = YamlParser.init(allocator);
+    var map = try parser.parseFile(path);
+    defer {
+        var it = map.iterator();
+        while (it.next()) |e| {
+            allocator.free(e.key_ptr.*);
+            allocator.free(e.value_ptr.*);
+        }
+        map.deinit();
+    }
+    try std.testing.expectEqualStrings("8080", map.get("server.port").?);
+    try std.testing.expectEqualStrings("127.0.0.1", map.get("server.host").?);
 }

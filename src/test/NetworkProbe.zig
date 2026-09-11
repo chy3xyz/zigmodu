@@ -8,9 +8,12 @@
 //! `return error.SkipZigTest` in such environments instead of crashing.
 
 const std = @import("std");
+const build_options = @import("build_options");
 
 /// Returns true when loopback TCP connections are permitted.
+/// `-Dnet-tests=false` forces false so a sandboxed run skips them all.
 pub fn available() bool {
+    if (!build_options.net_tests) return false;
     const rc = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
     const fd: std.posix.socket_t = switch (std.posix.errno(rc)) {
         .SUCCESS => @intCast(rc),

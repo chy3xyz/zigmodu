@@ -33,8 +33,20 @@ pub const Dispatcher = struct {
 
     /// Poll pending rows and publish them; failures are requeued with an
     /// incremented attempt counter (permanently failed after max_attempts).
+    ///
+    /// Since zent v0.35 claiming reserves rows before publishing (so two
+    /// dispatchers never publish the same row), a dispatcher that dies after
+    /// claiming leaves the row in `processing` forever. v0.36 added
+    /// `requeueStale` for exactly that: before dispatching, put back anything
+    /// claimed longer ago than a few publish timeouts.
     pub fn dispatchOnce(self: *Dispatcher) !usize {
         const Outbox = zent.outbox.Outbox(persist.infos, persist.OutboxInfo);
+        const stale_secs: i64 = 300;
+        if (Outbox.requeueStale(self.allocator, self.client.*, stale_secs)) |n| {
+            if (n > 0) std.log.warn("[outbox] requeued {d} stale claim(s) (dispatcher died mid-publish)", .{n});
+        } else |err| {
+            std.log.err("[outbox] requeueStale failed: {s}", .{@errorName(err)});
+        }
         return Outbox.dispatch(self.allocator, self.client.*, self.nowMs(), .{
             .ctx = null,
             .call = publish,

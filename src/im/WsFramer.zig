@@ -155,7 +155,32 @@ pub const WsFramer = struct {
         }
 
         // Header + payload in one syscall (writev).
-        try sockread.writevAll(self.stream, &.{ header[0..header_len], payload });
+        // On a send-timeout we also shut the socket down: a peer that stopped
+        // reading will not send anything either, so the read loop would
+        // otherwise sit on this connection forever.
+        sockread.writevAll(self.stream, &.{ header[0..header_len], payload }) catch |err| {
+            if (err == error.WriteTimeout) {
+                _ = std.c.shutdown(self.stream.socket.handle, std.c.SHUT.RDWR);
+            }
+            return err;
+        };
+    }
+
+    /// Bound blocking writes on this socket (0 = unbounded, the default).
+    pub fn setSendTimeout(self: *WsFramer, timeout_ms: u32) void {
+        sockread.setSendTimeout(self.stream, timeout_ms);
+    }
+
+    /// O(1) probe of the kernel send buffer. `true` does not guarantee a large
+    /// payload won't block — it is a cheap "is this peer keeping up?" signal so
+    /// fan-out code can drop frames instead of stalling.
+    pub fn isWritable(self: *WsFramer) bool {
+        var pfds = [1]std.posix.pollfd{.{
+            .fd = self.stream.socket.handle,
+            .events = std.posix.POLL.OUT,
+            .revents = 0,
+        }};
+        return (std.posix.poll(&pfds, 0) catch 0) > 0;
     }
 
     /// Write a pong frame.

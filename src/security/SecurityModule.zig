@@ -2,6 +2,7 @@ const std = @import("std");
 const crypto = std.crypto;
 const Time = @import("../core/Time.zig");
 const api = @import("../api/Server.zig");
+const JwksKeyRing = @import("JwksKeyRing.zig").JwksKeyRing;
 
 /// Security module - [...]Encrypt[...]
 pub const SecurityModule = struct {
@@ -11,6 +12,11 @@ pub const SecurityModule = struct {
     jwt_secret: []const u8,
     token_expiry_seconds: i64,
     io: ?std.Io = null,
+    /// Optional multi-key ring for zero-downtime secret rotation. When set,
+    /// tokens are signed with the primary key (`kid` in the header) and
+    /// verified against whichever key the token names — so an old key can stay
+    /// valid during the rollout window. Must outlive the module.
+    keyring: ?*JwksKeyRing = null,
 
     pub fn init(allocator: std.mem.Allocator, jwt_secret: []const u8, token_expiry_seconds: i64) Self {
         return .{
@@ -124,7 +130,7 @@ pub const SecurityModule = struct {
         const now = self.nowSeconds();
         const exp = now + self.token_expiry_seconds;
 
-        const header = JwtToken.JwtHeader{};
+        const header = JwtToken.JwtHeader{ .kid = self.signingKid() };
         const payload = JwtToken.JwtPayload{
             .sub = user_id,
             .iss = "zigmodu",
@@ -149,8 +155,8 @@ pub const SecurityModule = struct {
         const signature_base = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ header_b64, payload_b64 });
         defer self.allocator.free(signature_base);
 
-        // Generate signature using HMAC-SHA256
-        const signature = try self.sign(signature_base);
+        // Generate signature using HMAC-SHA256 (primary key when a keyring is set)
+        const signature = try self.signWith(signature_base, self.signingSecret());
         defer self.allocator.free(signature);
 
         // [...]token[...]
@@ -158,6 +164,34 @@ pub const SecurityModule = struct {
     }
 
     /// Validation JWT Token
+    /// Enable key rotation. Keys live in `ring` (primary signs, all verify).
+    pub fn setKeyring(self: *Self, ring: *JwksKeyRing) void {
+        self.keyring = ring;
+    }
+
+    /// kid that new tokens carry (null without a keyring).
+    pub fn signingKid(self: *const Self) ?[]const u8 {
+        const ring = self.keyring orelse return null;
+        const primary = ring.getPrimaryKey() orelse return null;
+        return primary.kid;
+    }
+
+    fn signingSecret(self: *const Self) []const u8 {
+        const ring = self.keyring orelse return self.jwt_secret;
+        const primary = ring.getPrimaryKey() orelse return self.jwt_secret;
+        return primary.secret;
+    }
+
+    /// Verification secret for a token: the key its `kid` names, falling back
+    /// to the module secret for tokens issued before rotation. An unknown
+    /// `kid` is rejected rather than silently checked against the default key.
+    fn verificationSecret(self: *const Self, header_json: []const u8) ![]const u8 {
+        const kid = parseKid(header_json) orelse return self.jwt_secret;
+        const ring = self.keyring orelse return self.jwt_secret;
+        const key = ring.getKey(kid) orelse return error.UnknownKeyId;
+        return key.secret;
+    }
+
     pub fn verifyToken(self: *Self, token_string: []const u8) !JwtToken.JwtPayload {
         // Split token (must be exactly 3 parts: header.payload.signature)
         var parts = std.mem.splitSequence(u8, token_string, ".");
@@ -177,7 +211,8 @@ pub const SecurityModule = struct {
         const signature_base = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ header_b64, payload_b64 });
         defer self.allocator.free(signature_base);
 
-        const expected_signature = try self.sign(signature_base);
+        const verify_secret = try self.verificationSecret(header_json);
+        const expected_signature = try self.signWith(signature_base, verify_secret);
         defer self.allocator.free(expected_signature);
 
         // Constant-time comparison to prevent timing side-channel
@@ -235,7 +270,11 @@ pub const SecurityModule = struct {
 
     /// HMAC-SHA256 [...]
     fn sign(self: *Self, data: []const u8) ![]const u8 {
-        var hmac = crypto.auth.hmac.sha2.HmacSha256.init(self.jwt_secret);
+        return self.signWith(data, self.jwt_secret);
+    }
+
+    fn signWith(self: *Self, data: []const u8, secret: []const u8) ![]const u8 {
+        var hmac = crypto.auth.hmac.sha2.HmacSha256.init(secret);
         hmac.update(data);
         // SAFETY: Buffer is immediately filled by hmac.final() before use
         var result: [32]u8 = undefined;
@@ -369,6 +408,19 @@ pub fn authRateLimitMiddleware(
 }
 
 /// [...] (Zig 0.16 timing_safe.eql [...]/[...])
+/// Extract the `"kid":"…"` value from a JWT header without a full JSON parse.
+/// Returns null when absent or `null`.
+fn parseKid(header_json: []const u8) ?[]const u8 {
+    const key = "\"kid\":";
+    const idx = std.mem.indexOf(u8, header_json, key) orelse return null;
+    var rest = std.mem.trimStart(u8, header_json[idx + key.len ..], " \t");
+    if (rest.len == 0 or rest[0] != '"') return null;
+    rest = rest[1..];
+    const end = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
+    if (end == 0) return null;
+    return rest[0..end];
+}
+
 fn timingSafeSliceEql(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     var acc: u8 = 0;
@@ -546,4 +598,59 @@ test "SecurityModule token credential version roundtrip" {
     defer sec.freePayload(p);
     try std.testing.expectEqual(@as(i64, 7), p.ver);
     try std.testing.expectEqualStrings("user-1", p.sub);
+}
+
+test "keyring rotation: old tokens stay valid, unknown kid is rejected" {
+    const allocator = std.testing.allocator;
+    var ring = JwksKeyRing.init(allocator);
+    defer ring.deinit();
+
+    var sec = SecurityModule.init(allocator, "legacy-default-secret", 3600);
+    sec.setKeyring(&ring);
+
+    // v1 signs.
+    try ring.addKey("v1", "secret-2025-aaaaaaaaaaaaaaaaaaaaaa", true);
+    const t1 = try sec.generateTokenWithTenant("user-1", &.{"user"}, "tenant-1");
+    defer allocator.free(t1);
+    try std.testing.expectEqualStrings("v1", sec.signingKid().?);
+    const p1 = try sec.verifyToken(t1);
+    defer sec.freePayload(p1);
+    try std.testing.expectEqualStrings("user-1", p1.sub);
+
+    // Rotate: v2 becomes primary, v1 stays in the ring for the rollout window.
+    try ring.addKey("v2", "secret-2026-bbbbbbbbbbbbbbbbbbbbbb", true);
+    const t2 = try sec.generateTokenWithTenant("user-2", &.{"user"}, "tenant-1");
+    defer allocator.free(t2);
+    try std.testing.expectEqualStrings("v2", sec.signingKid().?);
+
+    // Both verify: no forced logout during the rotation.
+    const p2 = try sec.verifyToken(t2);
+    defer sec.freePayload(p2);
+    try std.testing.expectEqualStrings("user-2", p2.sub);
+    const p1_again = try sec.verifyToken(t1);
+    defer sec.freePayload(p1_again);
+    try std.testing.expectEqualStrings("user-1", p1_again.sub);
+
+    // A token naming a key we no longer hold is rejected, not silently checked
+    // against the primary secret.
+    const forged_header = "{\"alg\":\"HS256\",\"typ\":\"JWT\",\"kid\":\"v9\"}";
+    const header_b64 = try base64UrlEncode(allocator, forged_header);
+    defer allocator.free(header_b64);
+    var parts = std.mem.splitScalar(u8, t2, '.');
+    _ = parts.next();
+    const payload_b64 = parts.next().?;
+    const forged = try std.fmt.allocPrint(allocator, "{s}.{s}.{s}", .{ header_b64, payload_b64, parts.next().? });
+    defer allocator.free(forged);
+    try std.testing.expectError(error.UnknownKeyId, sec.verifyToken(forged));
+}
+
+test "without a keyring the header has no kid (previous behavior)" {
+    const allocator = std.testing.allocator;
+    var sec = SecurityModule.init(allocator, "plain-secret", 3600);
+    try std.testing.expect(sec.signingKid() == null);
+    const token = try sec.generateTokenWithTenant("u", &.{"user"}, "t");
+    defer allocator.free(token);
+    const payload = try sec.verifyToken(token);
+    defer sec.freePayload(payload);
+    try std.testing.expectEqualStrings("u", payload.sub);
 }

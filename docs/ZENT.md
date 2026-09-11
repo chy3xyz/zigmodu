@@ -1,7 +1,7 @@
 # ZigModu × zent 最佳实践
 
 **zent**: [chy3xyz/zent](https://github.com/chy3xyz/zent) — Zig 版 [ent](https://entgo.io/)（schema-as-code ORM）  
-**版本口径**: zent **v0.33.0**（拦截器覆盖 Create/BulkInsert + sqlite 串行化，见 §14；示例与本文按最新发布演示；最低兼容 v0.13 起）· ZigModu **v0.15.22+** · Zig **≥ 0.17**  
+**版本口径**: zent **v0.37.0**（池阻塞等待 + 嵌套预加载批量化；0.36 起迁移默认加锁、outbox 认领新增 `claimed_at`，见 §14；示例与本文按最新发布演示；最低兼容 v0.13 起）· ZigModu **v0.15.22+** · Zig **≥ 0.17**  
 **主推组合**: **电商 / 社交类项目默认选 ZigModu + zent**（见 §2 决策表与 §4.8 场景能力矩阵）；只有存量 SQL 繁重、报表主导或 DBA 强管控的项目才默认 sqlx。
 
 **参考实现**: [`examples/zent-modulith/`](../examples/zent-modulith/)  
@@ -30,7 +30,8 @@
 11. [依赖接入](#11-依赖接入)
 12. [反模式](#12-反模式)
 13. [检查清单](#13-检查清单)
-14. [升级注意（0.6 → 0.12）](#14-升级注意zent-06--012)
+14. [升级注意（0.6 → 0.37）](#14-升级注意zent-06--012--013--027--031--037)
+15. [v0.34–v0.37 实战用法与边界](#15-v034v037-实战用法与边界)
 
 ---
 
@@ -153,6 +154,18 @@ Application / http
 
 配置了 policy 必须 `withContext`，否则易得 `PrivacyDenied`。
 
+**租户来源铁律（zent-modulith `CrudApi`）**：`CrudApiOpts.tenant_source` 有两个取值：
+
+| 取值 | 含义 | 何时可用 |
+|------|------|----------|
+| `.attr`（推荐） | 从请求上下文 attr 取租户，由 JWT 中间件从 token `aud` claim 注入 | **生产唯一选择** |
+| `.query` | 从 URL query 取租户 | 仅公开 demo |
+
+`.query` 让客户端自己声明租户——改一个 `?tenant_id=` 就能跨租户读，
+不是"配置不严"而是**可直接利用的越权**。`zmodu audit` 规则 b22 会拦截。
+参考实现：`examples/zent-modulith/src/main.zig`（`.attr` +
+`jwtAuthFromCatalog`，dev 取 token 走 `ZENT_DEV_TOKEN=1` 才挂载的路由）。
+
 ### 4.4 Hooks（before / after）
 
 **价值**：create/update/delete/query 进出库前统一校验、审计、软删、默认值；`before` 可取消写。
@@ -203,7 +216,7 @@ zent 是 ent-style：**关系走 Edges 预加载，不做跨表 JOIN 查询**（
 2. **复杂报表**：用 zent driver 裸 SQL（`client.driver.query(...)`）或 zigmodu `data.sqlx` 写 JOIN —— **不要在 zent 与 sqlx 之间共享事务**（见 §1 定位；报表只读连接可独立）。
 3. 报表查询建议独立 `report/` 模块持有自己的 `sqlx.Client`，与写路径（zent）解耦，避免把复杂 SQL 混进 domain 模块。
 
-### 4.8 电商 / 社交主推能力矩阵（zent v0.30–v0.32）
+### 4.8 电商 / 社交主推能力矩阵（zent v0.30–v0.37）
 
 这两版把电商/社交最常见的「钱、幂等、列表、可见性」四类痛点补成了一等能力，是主推组合的直接理由：
 
@@ -501,7 +514,7 @@ pub const CatalogStore = struct {
 
 ## 11. 依赖接入
 
-zent **v0.32.0** 提供 `build.zig.zon`（模块名 `zent`，path 依赖本地 checkout 开发）。
+zent **v0.37.0** 提供 `build.zig.zon`（模块名 `zent`；生产 pin git tag，本地开发可换 path 依赖）。
 
 **本地 sibling（开发）：**
 
@@ -520,7 +533,7 @@ exe_mod.addImport("zent", zent_dep.module("zent"));
 
 ```zon
 .zent = .{
-    .url = "https://github.com/chy3xyz/zent/archive/refs/tags/v0.33.0.tar.gz",
+    .url = "https://github.com/chy3xyz/zent/archive/refs/tags/v0.37.0.tar.gz",
     .hash = "<zig fetch 后填入>",
 },
 ```
@@ -566,10 +579,14 @@ zig_ws/
 
 ---
 
-## 14. 升级注意（zent 0.6 → 0.12 → 0.13 → 0.27 → 0.31 → 0.32.3）
+## 14. 升级注意（zent 0.6 → 0.12 → 0.13 → 0.27 → 0.31 → 0.37）
 
 | 主题 | 动作 / 新特性 |
 |------|--------------|
+| **v0.37.0 池阻塞等待 + 嵌套预加载** | `Options.max_wait_ms` 不再形同虚设：非 0 时 `borrow` 会在池条件变量上等待（由 `release` 唤醒），预算耗尽才 `error.PoolExhausted`，之后仍回落到原有 `max_retries` 路径；`max_wait_ms = 0`（默认）语义与旧版完全一致（非阻塞）。**升级自查**：此前"传了但无效"的 `max_wait_ms` 现在真的会排队。`ConnPool.deinit` 的调用约定明确要求静默期——不能靠 deinit 打断正在等待（parked）的借用者。`WithEdge("posts.comments")` 这类嵌套预加载从"每父实体一次查询"改为**每层一次查询**（实测 3 所有者两级 = 3 条语句），行为不变但 N+1 消失。 |
+| **v0.36.0 迁移默认加锁 / outbox 认领可恢复 / 建表要求 allocator** | ① `MigrateOptions.lock_timeout_ms` 默认 10s，PG 用 `pg_advisory_lock`、MySQL 用 `GET_LOCK`，并发实例串行化，超时 `error.MigrationLockTimeout`（不支持/被拒时降级为告警继续）；已应用文件迁移的 checksum 会与磁盘比对，改动过的迁移报 `error.MigrationChecksumMismatch`。② outbox 认领新增可空 `claimed_at` 列（**存量库需迁移**；`migrateSchema` 会自动补列），崩溃在 publish 中途的行不再永久卡在 `processing`——用 `Outbox.requeueStale(allocator, client, older_than_secs)` 定期回收（示例已接：`examples/zent-modulith` 的 dispatcher 每次派发前先回收）。③ `createAllTables` / `createTables` 现在第一个参数是 allocator（不再内部用 page_allocator）。 |
+| **v0.35.0 认领式 outbox 派发 + 边写入** | `Outbox.claim` 原子地把一批行从 `pending` 置为 `processing`（PG/SQLite 单条 `UPDATE … RETURNING`，PG 加 `FOR UPDATE SKIP LOCKED`；MySQL 走事务内的 `SELECT … FOR UPDATE SKIP LOCKED` + `UPDATE`），并发 dispatcher 不会再重复发布同一行；`pending` 保留为只读路径。`UpdateBuilder` 新增 `AddEdgeIDs` / `RemoveEdgeIDs` / `SetEdgeIDs` / `ClearEdge`，M2M 写关联表、o2m/o2o 走目标表 FK，非空 FK 拒绝 detach（错误在编译期）。 |
+| **v0.34.0 参数化原生谓词 + 聚合/upsert 表达式** | `sql.RawArgs(sql_text, args)` 让裸 SQL 片段按方言重绑占位符（PG `$N`），与类型化谓词 `sql.And/Or` 组合，标记与参数数量不匹配直接报 `error.RawArgCountMismatch`。聚合：`SumOrZero` / `AggregateOne` / `AggregateText`（金额用精确十进制文本）/ `AggregateBy`（分组聚合，带谓词与软删过滤）。upsert：`SaveOrUpdateOnWith` 支持 `{t:col}` / `{x:col}` 表达式（计数器自增等），SQLite 上带表达式时改用 `ON CONFLICT DO UPDATE`（不再是 delete+insert）。 |
 | **v0.33.0 拦截器覆盖写路径** | `UseInterceptor` 现在也拦截 `Create`/`BulkInsert`：`whereEq` 在 create 上语义为"缺省才填"（显式值保留），无该字段的表仍报 `UnknownField`。**自查存量拦截器**：v0.32 里只影响查询/更新/删除的拦截器，升级后会开始影响写入——这正是把租户注入收敛到拦截器的正确时机（见 `examples/zent-modulith` 的 `tenant-injection` 演示路由）。⚠️ 升级依赖后若行为未变，删 `.zig-cache` 重建——Zig 0.17-dev 增量缓存可能用过期的 path/fetch 依赖模块（本次适配实测踩中）。 |
 | **v0.32.3 sqlite 连接串行化** | `SQLiteDriver` 内置 RecursiveMutex，所有连接访问串行——修复并发请求下 `sqlite3_prepare_v2` SEGV。**消费侧注意**：① `query()` 返回的 `Rows` 持有锁直到 `Rows.deinit()`，遍历完立即释放，不要持锁做慢操作（如同步 HTTP 调用）；② 单连接 sqlite 的并发吞吐本质是串行的，写重场景考虑 `beginTxFromDriver` + 池或换 PG/MySQL；③ 公共 API 无签名变化，纯升级即可。 |
 | **v0.31 精确金额 / 边 inner-join / 池上事务** | `field.Decimal`（PG NUMERIC / MySQL DECIMAL(38,10)，扫描为 owned `[]const u8`）；`WithEdgeOptions(.{ .join = .inner })` 消除 eager-load limit skew；`beginTxFromDriver` 从共享 Driver/池直开 `TxClient`；`ManagedEntity`/`dupeEntityTo` allocator 安全 teardown；`SelectExpr`/`OrderExprSql`/`Row.columnIndex` 别名 DTO 映射。 |
@@ -591,6 +608,32 @@ zig_ws/
 | **v0.26 投影 / 批量软删** | `Select(cols)` 列投影跳过 text/blob；soft-delete 实体 `BulkDelete` 一条 UPDATE 置位；`or_in` 值语义谓词修悬垂。 |
 | **v0.27 根导出补全** | `codegen.toMaskedJson` 根导出；optional 字段 create/get/update/bulk 全路径修复。 |
 
+
+---
+
+## 15. v0.34–v0.37 实战用法与边界
+
+新能力不是"知道有"就够，关键是**什么时候用、什么时候不要用**。
+
+| 能力（版本） | 用它的场合 | 不要用的场合 / 坑 |
+|---|---|---|
+| `sql.RawArgs(sql_text, args)`（0.34） | `BETWEEN`、函数调用、复杂 `IN`——类型化谓词表达不了的片段，且需要参数化 | 能用类型化谓词就别写裸 SQL；拼接字符串仍在 `zmodu audit`/评审红线。标记与参数数量不匹配会报 `error.RawArgCountMismatch`（比"悄悄拼错"好，但仍是运行期） |
+| `SumOrZero` / `AggregateOne` / `AggregateText` / `AggregateBy`（0.34） | 统计口径：空集要 0 而不是 NULL、单值聚合、**金额用 `AggregateText` 拿精确十进制文本** | 金额别用 `AggregateBy`（f64 舍入）；`AggregateBy` 返回 `Managed(GroupMetric)`，记得 `freeGroupMetrics` |
+| `SaveOrUpdateOnWith`（0.34） | upsert 里需要表达式，如 `{t:receive_num} + 1` 计数 | SQLite 上带表达式会从 `INSERT OR REPLACE`（delete+insert，破坏 FK/ROWID）切到 `ON CONFLICT DO UPDATE`——**行为差异要考虑**；占位列名只允许 `[A-Za-z0-9_]` |
+| 边写入 `AddEdgeIDs` / `RemoveEdgeIDs` / `SetEdgeIDs` / `ClearEdge`（0.35） | 关联维护（M2M 关联表、o2m/o2o 移 FK），不想手写 junction SQL | 非原子：语句按父更新谓词作用域，**要原子就包 `beginTx`**；非空 FK 拒绝 detach（编译期报错，别绕过） |
+| 类型化谓词 `In`/`NotIn`/`IsNull`/`NotNil`/`HasPrefix`/`HasSuffix`/`ContainsFold`/`EQFold`（0.35） | 用户输入做 LIKE/前缀匹配 | LIKE 变体会转义通配符（用户输入按字面匹配）——如果业务真的需要 `%` 通配，那就不是"用户输入"了，务必显式说明 |
+| `Outbox.claim` 认领式派发（0.35） | **多 dispatcher 并发**（多副本 / 多 worker）：认领先于发布，同一行不会被重复发布 | `pending` 变成只读路径，别再拿它驱动派发；认领后进程崩溃会留下 `processing` 行 → 必须配 `requeueStale`（下条） |
+| `Outbox.requeueStale(allocator, client, older_than_secs)`（0.36） | 周期性 sweeper，回收"认领后派发进程死掉"的行（NULL `claimed_at` 一律视为陈旧） | 阈值要**大于最长发布时间**（示例用 300s），否则会把还在发布中的行抢回；UPDATE 幂等，多个 sweeper 同时跑无害 |
+| 迁移默认加锁 + checksum 校验（0.36） | 多实例滚动发布同时启动 | 角色没有 advisory lock 权限时：PG 会降级为告警继续（**要确认是"继续"还是"锁失败"**）；已应用迁移文件一旦被改动即 `error.MigrationChecksumMismatch`——**不要改历史迁移** |
+| `StorageKey`（0.36） | 采用 zent 但既有库表列名不合字段命名规范（`user_name` vs `userName`） | 一旦使用，字段名与列名分叉：`whereEq`、谓词、DDL 都用**字段名**，只有物理列名不同——排障时以 `codegen.graph.columnName` 为准 |
+| `queryTargetsByValue`（0.36） | 主键是 UUID / 文本的实体也要遍历边 | `queryTargets` 仍是 i64 专用包装；两者语义一致（空列表短路、目标软删过滤、调用方拥有结果） |
+| `BulkInsert` 分片 + `chunkRows(n)`（0.36） | 批量插入行数大（SQLite <3.32 的参数上限 999；MySQL `max_allowed_packet`） | 分片后仍是多次语句：**要么整批在事务里**，要么接受部分成功；`chunkRows` 只在你明确要控制语句大小时才用 |
+| 池阻塞等待 `max_wait_ms`（0.37） | 可以接受排队而不是立刻失败（推荐配 3–5s 的预算 + 指标） | 默认 `0` = 非阻塞（旧语义）。**`ConnPool.deinit` 要求静默期**：不能拿 deinit 去打断正在 parked 的借用者，必须确保没有线程在 `borrow`/`release`/`asDriver` 中 |
+| 嵌套预加载每层一次查询（0.37） | `WithEdge("posts.comments")` 这类两级加载，之前是 N+1 | 语义没变但**要记住预加载目标的读契约**：只过滤软删，**不带租户/行级隐私作用域**——跨租户数据不能靠预加载来"顺带"过滤，需要在父查询或目标查询上显式加谓词 |
+
+**升级自查（踩过的坑）**：改完 `build.zig.zon` 的 pin 后若行为/编译结果没变，**先删
+`.zig-cache` 再构建**——Zig 0.17-dev 的增量缓存会沿用旧的 fetch 模块（本次 v0.33→v0.37
+适配实测：`zig build --verbose` 显示仍在用 `zig-pkg/zent-0.33.0-…`）。
 
 ---
 

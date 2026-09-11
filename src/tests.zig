@@ -37,6 +37,8 @@ test "compile all source files" {
     _ = @import("core/Error.zig");
     _ = @import("core/Event.zig");
     _ = @import("core/EventBus.zig");
+    _ = @import("core/FrozenMap.zig");
+    _ = @import("api/PanicHook.zig");
     _ = @import("core/EventRegistry.zig");
     _ = @import("core/ModuleContext.zig");
     _ = @import("core/EventLogger.zig");
@@ -110,6 +112,8 @@ test "compile all source files" {
 
     // Scheduler
     _ = @import("scheduler/Cron.zig");
+    _ = @import("core/DistributedLock.zig");
+    _ = @import("core/Preflight.zig");
 
     // Security
     _ = @import("security/SecurityModule.zig");
@@ -124,6 +128,8 @@ test "compile all source files" {
     _ = @import("test/ModulithTest.zig");
     _ = @import("test/ModuleTest.zig");
     _ = @import("test/NetworkProbe.zig");
+    _ = @import("test/FaultInjection.zig");
+    _ = @import("test/ContractGate.zig");
 
     // Tracing
     _ = @import("tracing/DistributedTracer.zig");
@@ -347,4 +353,26 @@ test "ai barrel exposes the public AI API surface" {
     _ = ai.run_audit.RunAuditStore;
     _ = ai.freeValue;
     _ = ai.TokenQuota;
+}
+
+test "domain modules stay independent of the optional src/ai domain" {
+    const allocator = std.testing.allocator;
+    // src/ai is an optional domain (~12k lines, used by the ai-ops /
+    // llm-policies / mcp-server / tenant-ai examples). Because Zig analyses
+    // lazily, a consumer that never touches `zmodu.ai` never compiles it —
+    // but only as long as the canonical domain files keep their distance.
+    const domains = [_][]const u8{
+        "src/http.zig",
+        "src/data.zig",
+        "src/security.zig",
+        "src/observability.zig",
+    };
+    for (domains) |path| {
+        const content = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, std.Io.Limit.limited(4 * 1024 * 1024));
+        defer allocator.free(content);
+        if (std.mem.indexOf(u8, content, "ai/") != null) {
+            std.debug.print("domain file {s} must not import src/ai/*\n", .{path});
+            return error.AiDomainLeakedIntoCore;
+        }
+    }
 }

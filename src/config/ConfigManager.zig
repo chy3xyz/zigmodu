@@ -58,10 +58,9 @@ pub const ConfigManager = struct {
 
     /// Load configuration from JSON file
     pub fn loadJson(self: *Self, path: []const u8) !void {
-        const file = try std.Io.Dir.cwd().openFile(path, .{});
-        defer file.close(std.testing.io);
-
-        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
+        // Zig 0.17: reading a whole file goes through Io-aware `Dir.readFileAlloc`.
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const content = try std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, std.Io.Limit.limited(1024 * 1024));
         defer self.allocator.free(content);
 
         var parser = std.json.Parser.init(self.allocator, .alloc_if_needed);

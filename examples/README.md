@@ -6,7 +6,10 @@ This directory contains comprehensive examples demonstrating various features of
 
 ## ★ Start here: Tenant Management (`examples/tenant-mgmt`)
 
-**Flagship runnable demo** — multi-tenant SaaS, middleware chain (tenant → JWT → data permission), `/health/live`, dashboard, and `zigmodu.http` canonical imports. Used by CI integration probes (`scripts/ci-integration.sh`).
+**Flagship runnable demo** — multi-tenant SaaS, `http.productionProfile` (connection
+backpressure + security/observability middleware + `/metrics` golden signals +
+`/health/live` + `/health/ready`), middleware chain (tenant → JWT → data permission),
+dashboard, and `zigmodu.http` canonical imports. Used by CI integration probes (`scripts/ci-integration.sh`).
 
 ```bash
 cd examples/tenant-mgmt && HTTP_PORT=18080 zig build run
@@ -114,6 +117,20 @@ zig build test                          # asserts 402→200 and 401→200 flows
 ```
 
 Covered in [docs/WEB4.md](../docs/WEB4.md).
+
+## Production deployment (`examples/production-deploy`)
+
+**Not a runnable app — a topology reference.** TLS terminates at a sidecar/gateway
+(nginx or Envoy config included), the backend speaks h2c/plain HTTP, and a
+supervisor (`Restart=always` / k8s `restartPolicy`) is the availability backstop
+because a Zig panic aborts the process. Also covers probe semantics
+(liveness = process, readiness = dependencies), `docker-compose.yml`,
+`k8s.yaml` (probes + HPA + Prometheus annotations), `zigmodu.service`, and a
+multi-stage Dockerfile.
+
+Backend flags wired throughout: `HTTP_MAX_CONNECTIONS`, `HTTP_HEADER_TIMEOUT_MS`,
+`WS_WRITE_TIMEOUT_MS`. See [`production-deploy/README.md`](production-deploy/README.md)
+and [`docs/OBSERVABILITY.md`](../docs/OBSERVABILITY.md).
 
 ## ShopDemo boundary (`examples/shopdemo`)
 
@@ -439,8 +456,9 @@ pub fn main(init: std.process.Init) !void {
 ## 📚 Additional Resources
 
 - [API Documentation](../docs/API.md)
-- [Quick Start Guide](../QUICK-START.md)
-- [Spring Modulith Comparison](../docs/SPRING_MODULITH_COMPARISON.md)
+- [Quick Start Guide](../docs/QUICK-START.md)
+- [Production Roadmap](../docs/PRODUCTION_ROADMAP.md)
+- [Observability & alerting](../docs/OBSERVABILITY.md)
 - [Contributing Guide](../CONTRIBUTING.md)
 
 ---
@@ -453,6 +471,9 @@ pub fn main(init: std.process.Init) !void {
 | Event-Driven | 200 | Intermediate | ✅ Ready |
 | Testing | 120 | Intermediate | ✅ Ready |
 | HTTP Stress Test | 300 | Advanced | ✅ Ready |
+| zent-modulith | ~1.4k | Advanced | ✅ Ready (JWT + `.attr` tenant) |
+| tenant-mgmt | — | Advanced | ✅ Flagship (CI) |
+| production-deploy | — | Advanced | ✅ Reference topology |
 
 ---
 

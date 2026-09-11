@@ -9,17 +9,30 @@
 
 ## 📋 目录 (Table of Contents)
 
-- [渐进式架构演进路线图](#渐进式架构演进路线图)
-- [模块设计原则](#模块设计原则)
-- [领域分层（摘要）](#领域分层摘要)
-- [代码质量规范](#代码质量规范)
-- [错误处理](#错误处理)
-- [内存管理](#内存管理)
-- [测试策略](#测试策略)
-- [性能优化](#性能优化)
-- [安全实践](#安全实践)
-- [部署与CI/CD](#部署与cicd)
-- [文档规范](#文档规范)
+- [渐进式架构演进路线图](#-渐进式架构演进路线图)
+- [模块设计原则](#-模块设计原则)
+- [代码质量规范](#-代码质量规范)
+- [错误处理](#-错误处理)
+  - [韧性：一个 bug 不拖垮整个后端](#韧性一个-bug-不拖垮整个后端v01536)
+  - [连接级背压与慢连接防护](#连接级背压与慢连接防护v01536)
+  - [上线前预检](#上线前预检v01536)
+  - [JWT 密钥轮换（kid）](#jwt-密钥轮换kidv01536)
+  - [迁移失败后怎么恢复](#迁移失败后怎么恢复运维向)
+  - [多副本后台任务：跨实例互斥](#多副本后台任务跨实例互斥v01536)
+- [数据访问选型（zent / sqlx）](#-数据访问选型zent--sqlx)
+- [内存管理](#-内存管理)
+- [测试策略](#-测试策略)
+- [性能优化](#-性能优化)
+- [事务范式（伪事务警示）](#-事务范式伪事务警示)
+- [安全实践](#-安全实践)
+- [部署与 CI/CD](#-部署与cicd)
+- [**生产就绪检查清单**](#-生产就绪检查清单)
+- [文档规范](#-文档规范)
+- [开发工具](#-开发工具)
+- [常见陷阱与避免方法](#-常见陷阱与避免方法)
+- [质量指标](#-质量指标)
+- [版本升级指南](#-版本升级指南)
+- [团队协作](#-团队协作)
 
 ## 🚀 渐进式架构演进路线图
 
@@ -566,15 +579,22 @@ Month 4: 可观测性
 
 ---
 
-## 🏗️ 模块设计原则
-- [代码质量规范](#代码质量规范)
-- [错误处理](#错误处理)
-- [内存管理](#内存管理)
-- [测试策略](#测试策略)
-- [性能优化](#性能优化)
-- [安全实践](#安全实践)
-- [部署与CI/CD](#部署与cicd)
-- [文档规范](#文档规范)
+## 🗄 数据访问选型（zent / sqlx）
+
+ZigModu 不绑定 ORM：**同一个应用里按模块选型**，但两者正交——**不要混驱动、不要跨两者共享事务**。
+
+| 场景 | 选 | 理由 |
+|------|-----|------|
+| 电商 / 社交的实体 CRUD、边关系、行级数据权限 | **zent**（`docs/ZENT.md`） | schema-as-code + 引擎强制租户/数据范围过滤，安全靠结构而非纪律 |
+| 复杂报表、多表 join、批量分析 | `data.sqlx` 裸 SQL | zent 不做 join 编排；报表只读连接可独立 |
+| 需要与既有 SQL schema 对齐 | zent + `StorageKey`（v0.36+） | 字段名与列名解耦，不必改库表命名 |
+| 既有 sqlx 代码迁移 | 逐模块替换 | 分层契约不变（model / persistence / service），改动局限在 persistence |
+
+铁律与细节：[`docs/ZENT.md`](ZENT.md) §1 定位、§2 何时用哪个、§12 反模式、§14 升级注意。
+租户来源必须是 JWT 注入的 attr（`.tenant_source = .attr`），从 query 取租户会被
+`zmodu audit` b22 拦下。
+
+---
 
 ## 🏗️ 模块设计原则
 
@@ -779,6 +799,222 @@ pub fn processRequest(req: Request) AppError!Response {
 - **重试机制**：对临时性错误实现指数退避重试
 - **降级策略**：在关键服务不可用时提供降级方案
 - **断路器模式**：使用 CircuitBreaker 防止雪崩
+
+### 韧性：一个 bug 不拖垮整个后端（v0.15.36+）
+
+Zig 的 panic 不可捕获——请求路径上任何一次 panic 都会终止**整个进程**，
+拖垮全部在途请求。框架提供四层防线（预防 → 收口 → 诊断 → 恢复）。
+
+**生产一行接入**（细节与顺序约束见
+[`ROUTE_TABLE.md`](ROUTE_TABLE.md) §7.4）：
+
+```zig
+var profile = zigmodu.http.ProductionProfileState.init(allocator);
+defer profile.deinit(allocator);
+try zigmodu.http.productionProfile(&server, .{
+    .max_connections = 4096,      // 连接洪泛背压
+    .header_timeout_ms = 10_000,  // slowloris（请求行+header 阶段）
+}, &profile);                     // ⚠️ 必须在 addRoute / mountAll 之前
+```
+
+它同时挂出 `/metrics`（黄金信号）、`/health/live`、`/health/ready` 与
+tracing/access-log/security-headers；告警与看板见
+[`OBSERVABILITY.md`](OBSERVABILITY.md)。
+
+**1. 预防 · 共享注册表用 FrozenMap（消除最高发的崩溃源）**
+
+app 级共享 HashMap（适配器表、路由缓存、开关表）在 worker 池上并发
+`put`/resize 会撕裂元数据，读者随后 `panic: incorrect alignment`——这类
+崩溃无 stack 可用、极难定位。正确姿势：启动期填充 → `freeze()` → 运行期
+只读（无锁、任意并发读安全）；冻结后写返回 `error.Frozen`（可测试、可在
+启动期暴露）：
+
+```zig
+var adapters = zmodu.FrozenStringMap(Adapter).init(allocator);
+try adapters.put("alipay", .{ .endpoint = "..." });  // 启动期：可写
+adapters.freeze();                                   // 服务期：只读
+const a = adapters.get("alipay");                    // 无锁、线程安全
+```
+
+**2. 收口 · 请求路径禁止裸 panic**
+
+handler/service/persistence 里用错误返回，不用 `catch unreachable` /
+`@panic`。`zmodu audit` 规则默认开启并拦截这三类：
+
+| 规则 | 拦截 | 豁免 |
+|------|------|------|
+| b19 | 请求路径 `@panic(...)` / 语句级 `unreachable;` | switch 分支穷举 `=> unreachable,` 不报；确实不可能的分支用 `// audit: ignore b19` |
+| b20 | 文件作用域共享可变 HashMap | `zmodu.FrozenMap/FrozenStringMap` 不报 |
+| b21 | 请求路径裸 `@alignCast`（指针来源必须稳定） | `ctx.user_data` 与 `@alignCast(self)`（单例注册）不报 |
+
+**3. 诊断 · panic 钩子（一行接入）**
+
+进程还是要死，但要死得可查：panic 时先把**当前请求的 `METHOD /path`**
+打到 stderr（无分配、固定缓冲），再走标准 panic 输出 stack trace。应用
+root（含 `main` 的文件）加一行：
+
+```zig
+const zmodu = @import("zigmodu");
+pub const panic = zmodu.panicHook;
+```
+
+Server 在 dispatch 前写入 threadlocal 请求上下文、结束后清除，无需业务
+侧任何配合；不接这一行则一切照旧。
+
+**4. 恢复 · 进程级兜底**
+
+panic 钩子管诊断，不管存活。进程存活靠 supervisor：`systemd`
+`Restart=always`、k8s `restartPolicy: Always` 或容器编排的重启策略。
+多进程隔离（prefork）的边界与前置条件见
+[`PRODUCTION_ROADMAP.md`](PRODUCTION_ROADMAP.md)「单进程单点与原位隔离」。
+
+### 连接级背压与慢连接防护（v0.15.36+）
+
+`request_timeout_ms` 只管 **handler 阶段**：连接洪泛与 header 慢速滴入
+（slowloris）在它生效之前就把 fd/内存耗尽——这类故障**不需要任何 bug 就能
+打挂进程**，所以是独立的两个开关：
+
+```zig
+var server = zigmodu.http.Server.initWithConfig(io, allocator, .{
+    .port = 8080,
+    .max_connections = 4096,          // 0 = 不限（默认）；超限立即处理
+    .over_limit_response = .close,    // .close（最省）或 .unavailable（先回 503）
+    .header_timeout_ms = 10_000,      // 请求行 + header 阶段的总 deadline
+});
+```
+
+| 场景 | 行为 |
+|------|------|
+| 正常请求 | 不受影响；header 读完后 deadline 立即解除，慢速上传（body）不会被误杀 |
+| 慢速滴 header | 到点回 `408 Request Timeout` 并关连接 |
+| 连接数超限 `.close` | 直接关（不发响应，最省） |
+| 连接数超限 `.unavailable` | 先用裸 socket 回 `503` 再关（写在 accept 线程上，不走 io，避免阻塞 accept 循环） |
+
+也可用环境变量：`HTTP_MAX_CONNECTIONS`、`HTTP_HEADER_TIMEOUT_MS`
+（`Server.fromEnv`）。上线前按"预期并发 × 2"设 `max_connections`，
+`header_timeout_ms` 取 p99 建连时间的两倍左右（默认 10s 已相当宽松）。
+
+**WebSocket 出站**（同属"慢客户端"问题，但发生在写方向）：
+
+```zig
+var server = zigmodu.http.Server.initWithConfig(io, allocator, .{
+    .port = 8080,
+    .ws_write_timeout_ms = 10_000,   // 0 = 旧行为（可无限阻塞）
+});
+```
+
+不读数据的客户端会让发送缓冲填满，写线程（以及 `im.ConnectionRegistry` 的
+shard 锁）被无限期占住。设了超时后写返回 `error.WriteTimeout` 并 shutdown
+连接；广播/Fan-out 还可先用 `framer.isWritable()` 做 O(1) 水位探测，主动丢帧
+而不是排队堆积。
+
+**并发验收**：`zig build soak`（`-Dsoak-clients=N -Dsoak-iterations=M`）跑真实
+socket 的 N 并发 × M 租户压测，断言跨租户读取为 **0**、冻结注册表在并发读 +
+拒写下不撕裂、连接计数回落为 0。它刻意不挂在 `zig build test` 里，以便日常
+快跑、发布前慢跑。
+
+**沙箱/受限 CI**：`zig build test -Dnet-tests=false` 让所有依赖 loopback 的用例
+走 `NetworkProbe.available()` 跳过（默认开启网络用例）。
+
+### 上线前预检（v0.15.36+）
+
+生产事故大多在启动前就已注定：少了一个环境变量、JWT secret 还是示例里的占位值、
+数据库连不上、时钟差了几年（签出的 token 直接过期）。这些**在启动时检查几乎零成本**，
+上线后排查却极贵：
+
+```zig
+var env_ctx = zigmodu.Preflight.EnvCheck.fromMap(init.environ_map, &.{ "JWT_SECRET", "DATABASE_URL" });
+var secret_ctx = zigmodu.Preflight.SecretCheck{ .secret = jwt_secret };  // 拒绝占位/过短
+var clock_ctx = zigmodu.Preflight.ClockCheck{ .io = io };
+var report = zigmodu.Preflight.run(allocator, &.{
+    zigmodu.Preflight.envCheck(&env_ctx),
+    zigmodu.Preflight.secretCheck(&secret_ctx),
+    zigmodu.Preflight.dbCheck(&db_client),      // SELECT 1
+    zigmodu.Preflight.migrationCheck(&mig_ctx), // 有待应用迁移就拒绝启动
+    zigmodu.Preflight.clockCheck(&clock_ctx),
+});
+defer report.deinit();
+report.log();
+if (!report.ok()) return error.PreflightFailed;   // 不启动，胜过带病运行
+```
+
+- `Severity.warn` 只告警不阻塞（如"迁移未应用"在自动迁移的应用里只提示）。
+- 检查之间互不影响：单个探针失败不会掩盖其它结果。
+- 参考接线：`examples/zmsaas/backend/src/main.zig`（env + secret + DB + clock）。
+
+### JWT 密钥轮换（kid，v0.15.36+）
+
+不带 keyring 时签发的 token 头部 `kid` 为空，换密钥只能"全部重启 + 所有人重登"。
+接上 `JwksKeyRing` 后，token 头部带 `kid`，验签按 `kid` 取密钥：
+
+```zig
+var ring = zigmodu.security.JwksKeyRing.init(allocator);
+defer ring.deinit();
+try ring.addKey("v1", old_secret, true);      // 上线时的主密钥
+app_sec.module.setKeyring(&ring);
+
+// 轮换：新密钥设为主密钥，旧密钥留在环里继续可验
+try ring.addKey("v2", new_secret, true);      // 新签发的 token 用 v2
+// → 旧 token 在有效期内仍可用；等它们自然过期后再 ring 里移除 v1
+```
+
+`kid` 指向环中不存在的密钥时直接拒绝（`error.UnknownKeyId`），不会退化成"用主密钥
+试一下"——否则伪造一个未知 kid 就等于绕过。
+
+### 迁移失败后怎么恢复（运维向）
+
+`MigrationRunner.run()` 的失败语义是**明确的**，恢复动作因此也是确定的：
+
+| 事实 | 含义 |
+|------|------|
+| 失败时写入 `success = false` 的历史行，随后返回 `error.MigrationFailed` | 下一条迁移不会执行（顺序保证） |
+| 只有 `success = true` 的行会被跳过 | 修复后**重启即自动重试**那条迁移，无需手工改状态 |
+| 部分语句可能已生效（断在第 N 条） | 迁移脚本必须**可重复执行**：`CREATE TABLE IF NOT EXISTS` / `ADD COLUMN IF NOT EXISTS` / 先判断再建索引 |
+| `validateChecksums()` 校验已应用迁移的 checksum | 已上线的迁移文件**不许改**；要改就加新版本 |
+| `ALTER TABLE` 语句失败会被 log + 跳过并记 success | 这是为了兼容"列已存在"，代价是**真的写错也会被吞**——ALTER 请用 `IF NOT EXISTS` 形式，测试环境先跑一遍 |
+
+恢复步骤：修脚本（保持同一版本号与幂等）→ 重启（或再跑一次 `run()`）→ 用
+`getMigrationStatus()` / 查询 `_zigmodu_migrations` 确认 `success = true`。
+
+```sql
+-- 事故现场查询：哪条迁移没成功
+SELECT version, description, success, execution_time_ms, applied_at
+FROM _zigmodu_migrations ORDER BY version;
+```
+
+生成迁移文件：`zmodu migration "add orders.notes" --dir src/migrations`（只生成，
+不代跑）；应用由应用启动时调 `runner.run(client)`，多副本务必配
+`runner.setLock(...)`（见上一节）。
+
+### 多副本后台任务：跨实例互斥（v0.15.36+）
+
+单机跑得对，不代表多副本跑得对：**cron 和迁移在 N 个副本上会各跑一遍**——发券、
+对账、outbox 投递会重复执行，迁移则可能并发执行 DDL。
+
+```zig
+// 一张表即可，三个驱动通用（表名会做标识符校验）
+var lock = try zigmodu.DistributedLock.SqlLock(@TypeOf(db)).init(
+    allocator, io, &db, "zigmodu_lock", .sqlite,   // .sqlite | .postgres | .mysql
+);
+defer lock.deinit();
+
+// 每个 job 每分钟只在一个副本上执行
+cron.setLock(lock.lock(), 60_000);
+
+// 滚动发布时只有一个实例应用迁移；抢不到返回 error.MigrationLocked
+runner.setLock(lock.lock(), 300_000);
+```
+
+要点：
+
+- **TTL 必须大于最慢任务**：持有者崩溃未释放时，锁在 `ttl_ms` 之后被回收；
+  若任务运行时间超过 TTL，下个窗口可能被另一副本并行执行。
+- **争用不是错误**：抢占是一条原子语句（`INSERT … ON CONFLICT DO NOTHING` /
+  `INSERT IGNORE`），`rows_affected == 0` 即"别人持有"，返回 false；连接失败
+  等真实错误会向上抛，不会被静默当成"跳过"。
+- **默认无锁**（`NoopLock`）：不配置就保持单进程行为，不会有隐藏契约变化。
+- Postgres 想用原生 `pg_try_advisory_lock`：实现同一个 `Lock` vtable 即可
+  （`tryAcquire(name, ttl_ms)` / `release(name)`），调用点无需改动。
 
 ## 🧠 内存管理
 
@@ -1166,6 +1402,41 @@ jobs:
           cd examples/basic && zig build
           cd ../event-driven && zig build
 ```
+
+## ✅ 生产就绪检查清单
+
+上线前逐条过一遍；每条都对应一个真实故障模式，括号内是承接它的能力。
+
+**进程与启动**
+- [ ] 应用 root 接上 `pub const panic = zmodu.panicHook;`（panic 时输出正在处理的请求）
+- [ ] 启动跑 `zigmodu.Preflight.run(...)`：必填 env、JWT secret 非占位、DB 连通、无待应用迁移、时钟正常（`!report.ok()` 直接拒绝启动）
+- [ ] supervisor 就位：systemd `Restart=always` 或 k8s `restartPolicy: Always`（panic 不可捕获，重启是最后一道可用性防线）
+
+**HTTP 层**
+- [ ] `http.productionProfile(&server, cfg, &state)` 在**所有 `addRoute` / `mountAll` 之前**调用
+- [ ] `max_connections` 已设（≈ 预期并发 × 2）；`header_timeout_ms` 打开；`.unavailable` 或 `.close` 按需
+- [ ] WS 服务设了 `ws_write_timeout_ms`；广播前用 `framer.isWritable()` 丢帧
+- [ ] CORS 不再是 `"*"`（profile 会告警）
+
+**数据与并发**
+- [ ] 请求路径无裸 `panic`/`catch unreachable`（`zmodu audit` b19 拦截）
+- [ ] 共享注册表用 `FrozenMap`/`FrozenStringMap`，启动期填充后 `freeze()`（b20 拦截）
+- [ ] 多副本的 cron / 迁移配 `DistributedLock`（`cron.setLock` / `runner.setLock`）
+- [ ] 换密钥走 `JwksKeyRing` + `setKeyring`（带 `kid`，新旧双验）
+- [ ] zent 数据访问：`.tenant_source = .attr`（b22 拦截）
+
+**可观测**
+- [ ] `/metrics` 已挂且**不对公网暴露**；`/health/live` 与 `/health/ready` 语义分离（存活查进程、就绪查依赖）
+- [ ] 至少 5 条告警在跑：`up`、5xx 率、P95 延迟、`outbox_pending`、`db_pool_waiters`（`docs/OBSERVABILITY.md`）
+- [ ] outbox 有后台轮询 + 指标；池饱和度用 `setScrapeHook` 采样
+
+**验证与发布**
+- [ ] `zig build test` 全绿；`bash scripts/ci-integration.sh` 通过
+- [ ] 发布前跑 `zig build soak`（跨租户泄漏断言）；CI 夜间已挂 64×200
+- [ ] TLS 在边车终结（`examples/production-deploy/`），证书轮换有流程
+- [ ] 迁移幂等（`IF NOT EXISTS`），且有失败恢复步骤（本文「迁移失败后怎么恢复」）
+
+---
 
 ## 📚 文档规范
 

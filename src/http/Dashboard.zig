@@ -65,7 +65,7 @@ fn handleModules(ctx: *Context) !void {
         \\  {{"name":"cache","desc":"Cache aside + LRU","status":"UP","deps":0}},
         \\  {{"name":"sqlx","desc":"PG/MySQL/SQLite","status":"UP","deps":0}}
         \\],"count":13}}
-    );
+    , .{});
     defer ctx.allocator.free(json);
     try ctx.json(200, json);
 }

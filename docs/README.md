@@ -35,6 +35,9 @@ Comprehensive documentation for the ZigModu modular framework.
 | [API Reference](API.md) | Detailed API documentation | Advanced |
 | [Architecture](ARCHITECTURE.md) | System design and patterns | Intermediate |
 | [Framework Backlog](FRAMEWORK_BACKLOG.md) | Extractors / SSE / Testkit recipes | Intermediate |
+| [**Observability**](OBSERVABILITY.md) | 黄金信号、PromQL、告警阈值、Grafana dashboard、上线自检 | Advanced |
+| [Production Roadmap](PRODUCTION_ROADMAP.md) | 维护边界、prefork 边界、`src/ai` 可剔离域 | Advanced |
+| [部署参考](../examples/production-deploy/README.md) | TLS 边车、探针语义、`Restart=always`、Dockerfile | Advanced |
 
 ## 🔧 Features
 
@@ -55,6 +58,28 @@ Comprehensive documentation for the ZigModu modular framework.
 ### Observability
 - DistributedTracer - OpenTelemetry compatible tracing
 - PrometheusMetrics - Counter, Gauge, Histogram
+- `productionProfile` - `/metrics` golden signals (traffic / status classes /
+  latency histogram) + `/health/live` + `/health/ready` in one call
+- Grafana dashboard + alert thresholds: [`OBSERVABILITY.md`](OBSERVABILITY.md)
+
+### Production hardening
+- Connection backpressure (`max_connections`, `over_limit_response`) and header
+  deadline (`header_timeout_ms`, slowloris)
+- WebSocket outbound backpressure (`ws_write_timeout_ms`, `WsFramer.isWritable`)
+- `FrozenMap` / `FrozenStringMap` - freeze shared registries before serving
+- `panicHook` - panic output carries the in-flight `METHOD /path`
+- Deployment topology reference: [`../examples/production-deploy/`](../examples/production-deploy/)
+- `DistributedLock` - one replica runs each cron job / applies migrations
+  (`cron.setLock` / `MigrationRunner.setLock`). Table lock tested on SQLite and
+  on a real PostgreSQL 17 (`ZIGMODU_TEST_PG=1`, CI `test-postgres`); the MySQL
+  dialect (`INSERT IGNORE`) is implemented but not yet covered by a real server
+  test
+- `Preflight` - refuse to boot on missing env / placeholder secrets / unreachable
+  DB / pending migrations / skewed clock
+- JWT key rotation (`JwksKeyRing`) - tokens carry `kid`, old keys keep verifying
+- Outbox + DB pool metrics (`setMetrics` / `poolMetrics` / `setScrapeHook`)
+- Test templates: fault injection (`src/test/FaultInjection.zig`) and contract
+  gate (`src/test/ContractGate.zig`)
 
 ## 📁 Examples
 

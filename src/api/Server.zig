@@ -19,6 +19,7 @@
 //!   - One PR per § block when possible; Context/connFiber changes need Middleware tests too.
 
 const std = @import("std");
+const PanicHook = @import("PanicHook.zig");
 const WsFramer = @import("../im/WsFramer.zig").WsFramer;
 const BufferPool = @import("../im/BufferPool.zig").BufferPool;
 const WsUring = @import("../im/ws_uring.zig").WsUring;
@@ -241,6 +242,10 @@ pub const Context = struct {
     allocator: std.mem.Allocator,
     method: Method,
     path: []const u8,
+    /// Matched route pattern (e.g. `/api/v1/orders/{id}`), set at dispatch.
+    /// Use this — not `path` — as a metrics label: paths carry ids and would
+    /// blow up cardinality.
+    route_template: ?[]const u8 = null,
     raw_path: []const u8,
     query: std.StringHashMap([]const u8),
     params: std.StringHashMap([]const u8),
@@ -906,12 +911,89 @@ fn parseFormBody(allocator: std.mem.Allocator, body: []const u8) !std.StringHash
 /// its final memory location, which is why construction is a two-step process:
 /// allocate uninitialized storage, then call `setup`.
 const StreamReader = struct {
-    reader: std.Io.net.Stream.Reader,
+    interface: std.Io.Reader = undefined,
     buffer: [8192]u8 = undefined,
+    stream: std.Io.net.Stream = undefined,
+    io: std.Io = undefined,
+    /// Absolute deadline (`.awake` clock, ns) for the request line + header
+    /// phase; null = unbounded. Enforced inside `streamImpl`, so every read
+    /// the delimiter scanner performs is covered, not just the first.
+    deadline_ns: ?i96 = null,
+    /// Set when `deadline_ns` fired, so callers can answer 408 instead of
+    /// silently closing.
+    timed_out: bool = false,
 
     fn setup(self: *StreamReader, stream: std.Io.net.Stream, io: std.Io) void {
         self.buffer = undefined;
-        self.reader = std.Io.net.Stream.Reader.init(stream, io, &self.buffer);
+        self.stream = stream;
+        self.io = io;
+        self.deadline_ns = null;
+        self.timed_out = false;
+        // Only `.stream` is implemented; the default `readVec` keeps the
+        // buffer bookkeeping (seek/end) in sync.
+        self.interface = .{
+            .vtable = &.{ .stream = streamImpl },
+            .buffer = &self.buffer,
+            .seek = 0,
+            .end = 0,
+        };
+    }
+
+    /// Bound the header phase: a peer that trickles bytes (slowloris) is cut
+    /// off after `timeout_ms`. 0 disables the bound.
+    fn setHeaderDeadline(self: *StreamReader, timeout_ms: u32) void {
+        self.timed_out = false;
+        if (timeout_ms == 0) {
+            self.deadline_ns = null;
+            return;
+        }
+        const now = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
+        self.deadline_ns = now + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    }
+
+    /// Headers are in — stop bounding. Bodies/uploads get the looser
+    /// `request_timeout_ms` (handler stage) instead.
+    fn clearHeaderDeadline(self: *StreamReader) void {
+        self.deadline_ns = null;
+    }
+
+    fn streamImpl(io_r: *std.Io.Reader, io_w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *StreamReader = @alignCast(@fieldParentPtr("interface", io_r));
+        const dest = limit.slice(try io_w.writableSliceGreedy(1));
+        const n = try self.readInto(dest);
+        io_w.advance(n);
+        return n;
+    }
+
+    fn readInto(self: *StreamReader, out: []u8) std.Io.Reader.Error!usize {
+        if (self.deadline_ns) |deadline| {
+            const now = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
+            const remaining_ns = deadline - now;
+            if (remaining_ns <= 0) {
+                self.timed_out = true;
+                return error.ReadFailed;
+            }
+            const remaining_ms = @divTrunc(remaining_ns, std.time.ns_per_ms) + 1;
+            var pfds = [1]std.posix.pollfd{.{
+                .fd = self.stream.socket.handle,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            const ready = std.posix.poll(&pfds, @intCast(@min(remaining_ms, @as(i96, std.math.maxInt(i32))))) catch return error.ReadFailed;
+            if (ready == 0) {
+                self.timed_out = true;
+                return error.ReadFailed;
+            }
+            // Raw read: the io `net_read` path can hang on macOS (see
+            // core/sockread.zig) and would defeat the deadline.
+            const n = std.posix.read(self.stream.socket.handle, out) catch return error.ReadFailed;
+            if (n == 0) return error.EndOfStream;
+            return n;
+        }
+        var iovecs = [1][]u8{out};
+        const n = self.stream.read(self.io, &iovecs) catch return error.ReadFailed;
+        if (n == 0) return error.EndOfStream;
+        return n;
     }
 
     /// Reads a single line terminated by `delimiter`. Returns a slice into the
@@ -922,14 +1004,14 @@ const StreamReader = struct {
     /// (EOF on a fresh read), and propagates `error.ReadFailed` for actual
     /// I/O errors so the caller can distinguish benign close from failure.
     fn readUntilDelimiterOrEof(self: *StreamReader, _: []u8, delimiter: u8) !?[]u8 {
-        return self.reader.interface.takeDelimiter(delimiter) catch |err| switch (err) {
+        return self.interface.takeDelimiter(delimiter) catch |err| switch (err) {
             error.ReadFailed => error.ReadFailed,
             error.StreamTooLong => error.InvalidRequest,
         };
     }
 
     fn readAll(self: *StreamReader, out: []u8) !usize {
-        self.reader.interface.readSliceAll(out) catch |err| switch (err) {
+        self.interface.readSliceAll(out) catch |err| switch (err) {
             error.EndOfStream, error.ReadFailed => return 0,
         };
         return out.len;
@@ -1010,7 +1092,12 @@ const RequestParser = struct {
         while (true) {
             const line_raw = try reader.readUntilDelimiterOrEof(&buffer, '\n') orelse return error.InvalidRequest;
             const header_line = trimCrlf(line_raw);
-            if (header_line.len == 0) break;
+            if (header_line.len == 0) {
+                // Request line + headers are in; the body is not bounded by
+                // the header deadline.
+                reader.clearHeaderDeadline();
+                break;
+            }
 
             header_count += 1;
             header_bytes += header_line.len;
@@ -1557,6 +1644,17 @@ pub const Server = struct {
     request_timeout_ms: u32,
     max_requests_per_conn: usize,
     header_limits: HeaderLimits,
+    /// 0 = unlimited. See `Config.max_connections`.
+    max_connections: usize = 0,
+    /// See `Config.over_limit_response`.
+    over_limit_response: OverLimitResponse = .close,
+    /// See `Config.header_timeout_ms`.
+    header_timeout_ms: u32 = 10_000,
+    /// See `Config.ws_write_timeout_ms`.
+    ws_write_timeout_ms: u32 = 0,
+    /// Accepted connections currently being served (reserved before the fiber
+    /// starts, released when it returns).
+    active_connections: std.atomic.Value(u64) = .init(0),
     in_flight: ?*std.atomic.Value(u64) = null,
     /// Allocated route-group / scoped middleware slices (RouteGroup.use, ComptimeRouter Scoped.use).
     owned_route_mw: std.ArrayList([]const Middleware),
@@ -1581,7 +1679,27 @@ pub const Server = struct {
         /// Per-connection thread stack size. Default 128KB suffices for HTTP handlers.
         /// Lower = more concurrent connections. Raise if handlers need deep recursion.
         connection_stack_size: usize = 128 * 1024,
+        /// Max accepted connections served concurrently. 0 = unlimited.
+        /// Over the limit the connection is closed immediately (or answered
+        /// with 503 when `over_limit_response == .unavailable`), which keeps
+        /// an accept flood from exhausting file descriptors and memory.
+        max_connections: usize = 0,
+        /// What an over-limit connection gets: `.close` (cheapest) or
+        /// `.unavailable` (write 503 first).
+        over_limit_response: OverLimitResponse = .close,
+        /// Deadline for receiving the request line + headers, independent of
+        /// `request_timeout_ms` (which only covers handler execution). Bounds
+        /// slowloris-style trickle. 0 disables the deadline.
+        header_timeout_ms: u32 = 10_000,
+        /// Bound on blocking WebSocket writes (`SO_SNDTIMEO`). A peer that
+        /// stops reading would otherwise stall the writing thread forever
+        /// (and, for `im.ConnectionRegistry`, while holding a shard lock).
+        /// On timeout the frame write fails with `error.WriteTimeout` and the
+        /// socket is shut down. 0 keeps the unbounded behavior.
+        ws_write_timeout_ms: u32 = 0,
     };
+
+    pub const OverLimitResponse = enum { close, unavailable };
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, port: u16) Server {
         return Server.initWithConfig(io, allocator, .{ .port = port });
@@ -1604,6 +1722,10 @@ pub const Server = struct {
             .request_timeout_ms = config.request_timeout_ms,
             .max_requests_per_conn = config.max_requests_per_conn,
             .header_limits = config.header_limits,
+            .max_connections = config.max_connections,
+            .over_limit_response = config.over_limit_response,
+            .header_timeout_ms = config.header_timeout_ms,
+            .ws_write_timeout_ms = config.ws_write_timeout_ms,
             .owned_route_mw = std.ArrayList([]const Middleware).empty,
         };
     }
@@ -1749,6 +1871,8 @@ pub const Server = struct {
 
     fn executeWithMiddleware(self: *Server, ctx: *Context, final_handler: HandlerFn, combined_middleware: []const Middleware) !void {
         _ = self;
+        PanicHook.setRequestContext(ctx.method.toString(), ctx.path);
+        defer PanicHook.clearRequestContext();
         ctx.chain_middlewares = combined_middleware;
         ctx.chain_handler = final_handler;
         ctx.chain_index = 0;
@@ -1770,6 +1894,7 @@ pub const Server = struct {
             }
 
             ctx.user_data = m.route.user_data;
+            ctx.route_template = m.route.path;
 
             self.executeWithMiddleware(ctx, m.route.handler, m.route.combined_middleware) catch |err| {
                 if (!ctx.responded) {
@@ -1815,6 +1940,22 @@ pub const Server = struct {
                 continue;
             };
 
+            // Connection-level backpressure: reserve a slot before dispatching
+            // and release it when the fiber returns. Without this an accept
+            // flood (or thousands of slow connections) exhausts fds/memory.
+            const active = self.active_connections.fetchAdd(1, .monotonic) + 1;
+            if (self.max_connections != 0 and active > self.max_connections) {
+                _ = self.active_connections.fetchSub(1, .monotonic);
+                if (self.over_limit_response == .unavailable) {
+                    // Raw socket write, deliberately: this runs on the accept
+                    // thread, and the io write path can block it (which would
+                    // stop all accepts — worse than the flood we're shedding).
+                    writeOverLimit503(stream);
+                }
+                stream.close(self.io);
+                continue;
+            }
+
             // Use `concurrent`, NOT `async`, to dispatch the connection fiber.
             //
             // `Group.async` has backpressure semantics: when `busy_count`
@@ -1830,6 +1971,7 @@ pub const Server = struct {
             // with, instead of hijacking the accept loop.
             self.conn_group.concurrent(self.io, connFiber, .{ self, stream, self.allocator }) catch |err| {
                 std.log.warn("[Server] connection rejected (concurrent limit): {}", .{err});
+                _ = self.active_connections.fetchSub(1, .monotonic);
                 stream.close(self.io);
                 continue;
             };
@@ -1889,15 +2031,30 @@ pub const Server = struct {
     pub fn fromEnv(io: std.Io, allocator: std.mem.Allocator, env: std.process.Environ) !Server {
         var port: u16 = 8080;
         var max_body: usize = 8 * 1024 * 1024;
+        var max_conns: usize = 0;
+        var header_timeout_ms: u32 = 10_000;
+        var ws_write_timeout_ms: u32 = 0;
         var iter = env.iterator();
         while (iter.next()) |entry| {
             if (std.mem.eql(u8, entry.key_ptr.*, "HTTP_PORT")) {
                 port = std.fmt.parseInt(u16, entry.value_ptr.*, 10) catch 8080;
             } else if (std.mem.eql(u8, entry.key_ptr.*, "HTTP_MAX_BODY")) {
                 max_body = std.fmt.parseInt(usize, entry.value_ptr.*, 10) catch (8 * 1024 * 1024);
+            } else if (std.mem.eql(u8, entry.key_ptr.*, "HTTP_MAX_CONNECTIONS")) {
+                max_conns = std.fmt.parseInt(usize, entry.value_ptr.*, 10) catch 0;
+            } else if (std.mem.eql(u8, entry.key_ptr.*, "HTTP_HEADER_TIMEOUT_MS")) {
+                header_timeout_ms = std.fmt.parseInt(u32, entry.value_ptr.*, 10) catch 10_000;
+            } else if (std.mem.eql(u8, entry.key_ptr.*, "WS_WRITE_TIMEOUT_MS")) {
+                ws_write_timeout_ms = std.fmt.parseInt(u32, entry.value_ptr.*, 10) catch 0;
             }
         }
-        return initWithConfig(io, allocator, .{ .port = port, .max_body_size = max_body });
+        return initWithConfig(io, allocator, .{
+            .port = port,
+            .max_body_size = max_body,
+            .max_connections = max_conns,
+            .header_timeout_ms = header_timeout_ms,
+            .ws_write_timeout_ms = ws_write_timeout_ms,
+        });
     }
 
     /// Close the listener exactly once, whichever caller wins the race.
@@ -1919,6 +2076,7 @@ pub const Server = struct {
 
 /// Connection fiber — handles one HTTP connection
 fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allocator) void {
+    defer _ = server.active_connections.fetchSub(1, .monotonic);
     defer stream.close(server.io);
     Server.tuneSocket(stream);
 
@@ -1936,10 +2094,17 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
 
         const start_time = std.Io.Timestamp.now(server.io, .real);
 
+        // Bound the request line + header phase (slowloris guard). Cleared by
+        // the parser once the blank line is seen; re-armed per request here.
+        reader.setHeaderDeadline(server.header_timeout_ms);
+
         // Prefetch first line — HTTP/2 prior-knowledge preface starts with PRI.
         const first_line_raw = reader.readUntilDelimiterOrEof(&.{}, '\n') catch |err| {
             switch (err) {
-                error.ReadFailed => return,
+                error.ReadFailed => {
+                    if (reader.timed_out) writeErrorResponse(server.io, stream, arena_alloc, 408, "Request Timeout");
+                    return;
+                },
                 else => {
                     writeErrorResponse(server.io, stream, arena_alloc, 400, "Bad Request");
                     return;
@@ -1956,6 +2121,8 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
             if (RequestParser.trimCrlf(l2).len != 0) return;
             if (!std.mem.eql(u8, RequestParser.trimCrlf(l3), "SM")) return;
             if (RequestParser.trimCrlf(l4).len != 0) return;
+            // The preface is consumed; H2 frames are not header-phase reads.
+            reader.clearHeaderDeadline();
 
             // Reuse the same StreamReader for the H2 session (do not create a second
             // reader on this stream). Any bytes already buffered after the preface
@@ -1971,7 +2138,7 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                 .site_user_ctx = server,
                 // One inbound frame per stream request is typical; leave headroom for SETTINGS/WINDOW_UPDATE/CONTINUATION.
                 .max_frames = @max(server.max_requests_per_conn * 16, 4096),
-            }, &.{}, &reader.reader.interface) catch |err| {
+            }, &.{}, &reader.interface) catch |err| {
                 std.log.warn("[Server] HTTP/2 session ended: {s}", .{@errorName(err)});
             };
             return;
@@ -1979,7 +2146,11 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
 
         var request = parser.parseAfterRequestLine(&reader, first_line_raw, server.max_body_size, server.header_limits) catch |err| {
             switch (err) {
-                error.ReadFailed, error.IncompleteBody => return,
+                error.ReadFailed => {
+                    if (reader.timed_out) writeErrorResponse(server.io, stream, arena_alloc, 408, "Request Timeout");
+                    return;
+                },
+                error.IncompleteBody => return,
                 else => {},
             }
             std.log.err("Parse error: {any}", .{err});
@@ -2078,6 +2249,7 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                             return;
                         };
                         ctx.upgraded = true;
+                        framer.setSendTimeout(server.ws_write_timeout_ms);
 
                         // Call on_connect — gateway returns session pointer (null = reject)
                         const session = ws_route.on_connect(&ctx, @ptrCast(&framer));
@@ -2149,6 +2321,7 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
             m.params = std.StringHashMap([]const u8).init(arena_alloc);
 
             ctx.user_data = m.route.user_data;
+            ctx.route_template = m.route.path;
 
             server.executeWithMiddleware(&ctx, m.route.handler, m.route.combined_middleware) catch |err| {
                 std.log.err("[HC] Handler error: {any}", .{err});
@@ -2193,6 +2366,30 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
 }
 
 /// Write an error response directly to the connection stream
+/// Minimal 503 for over-limit connections. Raw `write` syscalls only — it runs
+/// on the accept thread, where an io-path write could stall the accept loop.
+fn writeOverLimit503(stream: std.Io.net.Stream) void {
+    const body = "{\"error\":\"Service Unavailable\"}";
+    var head_buf: [160]u8 = undefined;
+    const head = std.fmt.bufPrint(&head_buf, "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n", .{body.len}) catch return;
+    writeRaw(stream, head);
+    writeRaw(stream, body);
+}
+
+fn writeRaw(stream: std.Io.net.Stream, bytes: []const u8) void {
+    var sent: usize = 0;
+    while (sent < bytes.len) {
+        const rc = std.posix.system.write(stream.socket.handle, bytes[sent..].ptr, bytes[sent..].len);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => {},
+            else => return,
+        }
+        const n: usize = @intCast(rc);
+        if (n == 0) return;
+        sent += n;
+    }
+}
+
 fn writeErrorResponse(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, status: u16, message: []const u8) void {
     var headers = std.StringHashMap([]const u8).init(allocator);
     defer {
@@ -3362,4 +3559,303 @@ test "envelope dialects render expected shapes" {
     ctx.setEnvelope(.default);
     try ctx.failCode(42, "say \"hi\"");
     try std.testing.expectEqualStrings("{\"code\":42,\"msg\":\"say \\\"hi\\\"\",\"data\":null}", ctx.response_body.items);
+}
+
+// ── connection backpressure / header deadline ──────────────────────────────
+
+/// socketpair helper shared by the StreamReader deadline tests.
+fn testSocketPair() ?[2]std.posix.socket_t {
+    var fds: [2]std.posix.socket_t = undefined;
+    const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => return fds,
+        else => return null,
+    }
+}
+
+test "StreamReader header deadline fires on a silent peer" {
+    const fds = testSocketPair() orelse return error.SkipZigTest;
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } };
+    defer stream.close(std.testing.io);
+    defer _ = std.posix.system.close(fds[1]);
+
+    var reader: StreamReader = undefined;
+    reader.setup(stream, std.testing.io);
+    reader.setHeaderDeadline(80);
+
+    // Peer sends nothing: the deadline must cut the read instead of blocking.
+    try std.testing.expectError(error.ReadFailed, reader.readUntilDelimiterOrEof(&.{}, '\n'));
+    try std.testing.expect(reader.timed_out);
+}
+
+test "StreamReader header deadline leaves a prompt peer alone" {
+    const fds = testSocketPair() orelse return error.SkipZigTest;
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } };
+    defer stream.close(std.testing.io);
+    defer _ = std.posix.system.close(fds[1]);
+
+    var reader: StreamReader = undefined;
+    reader.setup(stream, std.testing.io);
+    reader.setHeaderDeadline(2000);
+    _ = std.posix.system.write(fds[1], "GET / HTTP/1.1\r\n", 16);
+
+    const line = try reader.readUntilDelimiterOrEof(&.{}, '\n');
+    try std.testing.expect(line != null);
+    try std.testing.expect(std.mem.startsWith(u8, line.?, "GET / HTTP/1.1"));
+    try std.testing.expect(!reader.timed_out);
+
+    // Headers complete → deadline cleared → the body follows the normal read
+    // path (unbounded), so a slow upload is not killed by the header deadline.
+    reader.clearHeaderDeadline();
+    _ = std.posix.system.write(fds[1], "BODY", 4);
+    var body: [4]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 4), try reader.readAll(&body));
+    try std.testing.expectEqualStrings("BODY", &body);
+    try std.testing.expect(!reader.timed_out);
+}
+
+test "header deadline answers 408 and max_connections sheds the flood" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{
+        .port = 0,
+        .max_connections = 1,
+        .over_limit_response = .close,
+        .header_timeout_ms = 300,
+    });
+    defer server.deinit();
+    var group = server.group("");
+    try group.get("ping", struct {
+        fn h(ctx: *Context) anyerror!void {
+            try ctx.jsonStruct(200, .{ .ok = true });
+        }
+    }.h, null);
+
+    const th = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, struct {
+        fn run(s: *Server) void {
+            s.start() catch {};
+        }
+    }.run, .{&server});
+    defer th.join();
+
+    var port: u16 = 0;
+    var tries: usize = 0;
+    while (tries < 200) : (tries += 1) {
+        if (server.listener) |*l| {
+            port = l.socket.address.getPort();
+            break;
+        }
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    try std.testing.expect(port != 0);
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+
+    // 1) Occupy the single slot with a silent connection.
+    var holder = try addr.connect(std.testing.io, .{ .mode = .stream });
+    defer holder.close(std.testing.io);
+    std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(100), .real) catch {};
+    try std.testing.expectEqual(@as(u64, 1), server.active_connections.load(.monotonic));
+
+    // 2) A second connection is over the limit → closed without a response.
+    var rejected = try addr.connect(std.testing.io, .{ .mode = .stream });
+    defer rejected.close(std.testing.io);
+    var rbuf: [64]u8 = undefined;
+    var pfds = [_]std.posix.pollfd{.{ .fd = rejected.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    const ready = try std.posix.poll(&pfds, 2000);
+    try std.testing.expect(ready > 0);
+    const rn = try std.posix.read(rejected.socket.handle, &rbuf);
+    try std.testing.expectEqual(@as(usize, 0), rn); // immediate EOF, no 503 body
+
+    // 3) The silent holder trips the header deadline: 408 then close.
+    var hbuf: [256]u8 = undefined;
+    var hpds = [_]std.posix.pollfd{.{ .fd = holder.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    const hready = try std.posix.poll(&hpds, 3000);
+    try std.testing.expect(hready > 0);
+    const hn = try std.posix.read(holder.socket.handle, &hbuf);
+    try std.testing.expect(hn > 0);
+    try std.testing.expect(std.mem.indexOf(u8, hbuf[0..hn], "408") != null);
+
+    // 4) Slot released → a normal request is served again.
+    std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(100), .real) catch {};
+    try std.testing.expectEqual(@as(u64, 0), server.active_connections.load(.monotonic));
+    var ok_stream = try addr.connect(std.testing.io, .{ .mode = .stream });
+    defer ok_stream.close(std.testing.io);
+    const req = "GET /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    _ = std.posix.system.write(ok_stream.socket.handle, req.ptr, req.len);
+    var obuf: [512]u8 = undefined;
+    var opds = [_]std.posix.pollfd{.{ .fd = ok_stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    const oready = try std.posix.poll(&opds, 3000);
+    try std.testing.expect(oready > 0);
+    const on = try std.posix.read(ok_stream.socket.handle, &obuf);
+    try std.testing.expect(on > 0);
+    try std.testing.expect(std.mem.startsWith(u8, obuf[0..on], "HTTP/1.1 200"));
+
+    // Required: the deferred th.join() runs before server.deinit(), so the
+    // accept loop must be told to exit or join blocks forever.
+    server.stop();
+}
+
+test "over-limit connections get 503 when configured" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{
+        .port = 0,
+        .max_connections = 1,
+        .over_limit_response = .unavailable,
+        .header_timeout_ms = 3000,
+    });
+    defer server.deinit();
+    var group = server.group("");
+    try group.get("ping", struct {
+        fn h(ctx: *Context) anyerror!void {
+            try ctx.jsonStruct(200, .{ .ok = true });
+        }
+    }.h, null);
+
+    const th = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, struct {
+        fn run(s: *Server) void {
+            s.start() catch {};
+        }
+    }.run, .{&server});
+    defer th.join();
+
+    var port: u16 = 0;
+    var tries: usize = 0;
+    while (tries < 200) : (tries += 1) {
+        if (server.listener) |*l| {
+            port = l.socket.address.getPort();
+            break;
+        }
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    try std.testing.expect(port != 0);
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+
+    var holder = try addr.connect(std.testing.io, .{ .mode = .stream });
+    defer holder.close(std.testing.io);
+    std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(100), .real) catch {};
+
+    var rejected = try addr.connect(std.testing.io, .{ .mode = .stream });
+    defer rejected.close(std.testing.io);
+    var buf: [256]u8 = undefined;
+    var pfds = [_]std.posix.pollfd{.{ .fd = rejected.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    const ready = try std.posix.poll(&pfds, 2000);
+    try std.testing.expect(ready > 0);
+    const n = try std.posix.read(rejected.socket.handle, &buf);
+    try std.testing.expect(n > 0);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "503") != null);
+
+    server.stop();
+}
+
+const SlowWsState = struct {
+    framer: WsFramer = undefined,
+    write_error: ?anyerror = null,
+    closed: bool = false,
+};
+var slow_ws_state = SlowWsState{};
+
+test "WS write timeout disconnects a peer that stops reading" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    slow_ws_state = .{};
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{
+        .port = 0,
+        .ws_write_timeout_ms = 200,
+    });
+    defer server.deinit();
+
+    var group = server.group("");
+    try group.ws("ws", (struct {
+        fn connect(_: *Context, framer: *anyopaque) ?*anyopaque {
+            // Copy by value: the pointer targets a connFiber stack local.
+            slow_ws_state.framer = @as(*WsFramer, @ptrCast(@alignCast(framer))).*;
+            return @ptrCast(&slow_ws_state);
+        }
+    }).connect, (struct {
+        fn message(session: ?*anyopaque, _: []const u8, _: WsFrameKind) void {
+            const st: *SlowWsState = @ptrCast(@alignCast(session.?));
+            var payload: [64 * 1024]u8 = @splat('x');
+            var i: usize = 0;
+            while (i < 200) : (i += 1) {
+                st.framer.writeBinary(&payload) catch |err| {
+                    st.write_error = err;
+                    return;
+                };
+            }
+        }
+    }).message, (struct {
+        fn close(session: ?*anyopaque) void {
+            const st: *SlowWsState = @ptrCast(@alignCast(session.?));
+            st.closed = true;
+        }
+    }).close, null);
+
+    const th = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, struct {
+        fn run(s: *Server) void {
+            s.start() catch {};
+        }
+    }.run, .{&server});
+    defer th.join();
+
+    var port: u16 = 0;
+    var tries: usize = 0;
+    while (tries < 200) : (tries += 1) {
+        if (server.listener) |*l| {
+            port = l.socket.address.getPort();
+            break;
+        }
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    try std.testing.expect(port != 0);
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+    var stream = try addr.connect(std.testing.io, .{ .mode = .stream });
+    var closed_early = false;
+    defer if (!closed_early) stream.close(std.testing.io);
+
+    var wbuf: [512]u8 = undefined;
+    var w = stream.writer(std.testing.io, &wbuf);
+    const handshake = "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+    try w.interface.writeAll(handshake);
+    try w.interface.flush();
+
+    // Read the 101, then deliberately stop reading anything.
+    var rbuf: [512]u8 = undefined;
+    var pfds = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    _ = try std.posix.poll(&pfds, 3000);
+    _ = try std.posix.read(stream.socket.handle, &rbuf);
+
+    // Trigger the server-side push loop with one masked binary frame.
+    var frame_buf: [16]u8 = undefined;
+    frame_buf[0] = 0x82; // FIN + binary
+    frame_buf[1] = 0x80 | 2; // masked, 2-byte payload
+    frame_buf[2..6].* = .{ 9, 9, 9, 9 };
+    frame_buf[6] = 'g' ^ 9;
+    frame_buf[7] = 'o' ^ 9;
+    _ = std.posix.system.write(stream.socket.handle, &frame_buf, 8);
+
+    // The send buffer is tiny (SO_SNDBUF=2048 via tuneSocket), so the push
+    // loop must hit the 200ms send timeout quickly instead of hanging.
+    tries = 0;
+    while (slow_ws_state.write_error == null and tries < 500) : (tries += 1) {
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    try std.testing.expect(slow_ws_state.write_error != null);
+    try std.testing.expectEqual(error.WriteTimeout, slow_ws_state.write_error.?);
+
+    // Closing the client lets the read loop end and on_close fire.
+    stream.close(std.testing.io);
+    closed_early = true;
+    tries = 0;
+    while (!slow_ws_state.closed and tries < 300) : (tries += 1) {
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    try std.testing.expect(slow_ws_state.closed);
+
+    server.stop();
 }

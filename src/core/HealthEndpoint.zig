@@ -214,7 +214,7 @@ pub fn handleReadiness(endpoint: *HealthEndpoint) api.HandlerFn {
     S.ep = endpoint;
     return struct {
         fn h(ctx: *api.Context) anyerror!void {
-            const details = S.ep.checkHealth();
+            var details = S.ep.checkHealth();
             defer details.components.deinit();
             const json = try S.ep.toJson(ctx.allocator);
             defer ctx.allocator.free(json);

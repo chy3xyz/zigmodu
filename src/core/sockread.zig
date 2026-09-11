@@ -28,6 +28,22 @@ pub fn readFull(stream: std.Io.net.Stream, buf: []u8) !void {
     }
 }
 
+/// Bound how long a blocking write may stall on a full send buffer.
+///
+/// Without this a slow (or maliciously non-reading) WS peer can block the
+/// writing thread indefinitely — and, for `im.ConnectionRegistry`, while it
+/// holds a shard lock. After the timeout the syscall returns `EAGAIN`, which
+/// the write helpers surface as `error.WriteTimeout` so callers can disconnect
+/// the peer. 0 disables the bound (previous behavior).
+pub fn setSendTimeout(stream: std.Io.net.Stream, timeout_ms: u32) void {
+    if (timeout_ms == 0) return;
+    const tv = std.posix.timeval{
+        .sec = @intCast(timeout_ms / 1000),
+        .usec = @intCast((timeout_ms % 1000) * 1000),
+    };
+    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
+}
+
 /// Write all of `bytes` (loops on partial writes so frames are never split).
 pub fn writeFull(stream: std.Io.net.Stream, bytes: []const u8) !void {
     var sent: usize = 0;
@@ -35,6 +51,7 @@ pub fn writeFull(stream: std.Io.net.Stream, bytes: []const u8) !void {
         const rc = std.posix.system.write(stream.socket.handle, bytes[sent..].ptr, bytes[sent..].len);
         switch (std.posix.errno(rc)) {
             .SUCCESS => {},
+            .AGAIN => return error.WriteTimeout,
             else => return error.ConnectionError,
         }
         const n: usize = @intCast(rc);
@@ -60,6 +77,7 @@ pub fn writevAll(stream: std.Io.net.Stream, parts: []const []const u8) !void {
         const rc = std.posix.system.writev(stream.socket.handle, &iovecs, @intCast(count));
         const got = switch (std.posix.errno(rc)) {
             .SUCCESS => @as(usize, @intCast(rc)),
+            .AGAIN => return error.WriteTimeout,
             else => return error.ConnectionError,
         };
         if (got == 0) return error.ConnectionClosed;
@@ -166,4 +184,51 @@ test "writevAll sends multiple segments as one stream" {
     try std.testing.expectEqual(@as(usize, 6), n);
     try std.testing.expectEqualStrings("ABCDEF", &out);
     _ = std.posix.system.close(fds[1]);
+}
+
+test "writeFull reports WriteTimeout on a non-reading peer" {
+    var fds: [2]std.posix.socket_t = undefined;
+    const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } };
+    defer stream.close(std.testing.io);
+    defer _ = std.posix.system.close(fds[1]);
+
+    // Nobody reads fds[1]: with a send timeout the write must give up instead
+    // of blocking forever.
+    setSendTimeout(stream, 50);
+    var chunk: [16 * 1024]u8 = @splat('x');
+    var i: usize = 0;
+    var timed_out = false;
+    while (i < 512) : (i += 1) {
+        writeFull(stream, &chunk) catch |err| switch (err) {
+            error.WriteTimeout => {
+                timed_out = true;
+                break;
+            },
+            else => return err,
+        };
+    }
+    try std.testing.expect(timed_out);
+}
+
+test "setSendTimeout(0) keeps the blocking default" {
+    var fds: [2]std.posix.socket_t = undefined;
+    const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } };
+    defer stream.close(std.testing.io);
+    defer _ = std.posix.system.close(fds[1]);
+
+    setSendTimeout(stream, 0); // no-op
+    try writeFull(stream, "hello");
+    var buf: [5]u8 = undefined;
+    const n = try std.posix.read(fds[1], &buf);
+    try std.testing.expectEqualStrings("hello", buf[0..n]);
 }

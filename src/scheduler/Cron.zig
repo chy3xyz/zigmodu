@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const Time = @import("../core/Time.zig");
+const DistributedLock = @import("../core/DistributedLock.zig");
 
 /// Cron expression (5-field: minute hour day month dow).
 /// Supports: * (any), */n (step), n (specific), n-m (range), n,m (list)
@@ -125,6 +126,11 @@ pub const Scheduler = struct {
     running: std.atomic.Value(bool),
     thread: ?std.Thread = null,
     tick_interval_ms: u64,
+    /// Cross-instance guard. When set, a job whose lock is held by another
+    /// replica is skipped for this tick. Default null = every instance runs
+    /// every job (single-process behavior).
+    lock: ?DistributedLock.Lock = null,
+    lock_ttl_ms: u64 = 60_000,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Scheduler {
         return .{
@@ -171,6 +177,15 @@ pub const Scheduler = struct {
             .context = context,
             .last_run = 0,
         });
+    }
+
+    /// Guard every job with a cross-instance lock (cron on N replicas).
+    /// `ttl_ms` must exceed the worst-case job runtime: a holder that dies
+    /// without releasing is reaped once the TTL passes. The backing lock
+    /// object must outlive the scheduler.
+    pub fn setLock(self: *Scheduler, lock: DistributedLock.Lock, ttl_ms: u64) void {
+        self.lock = lock;
+        self.lock_ttl_ms = ttl_ms;
     }
 
     /// Start the scheduler in a background thread
@@ -229,10 +244,26 @@ pub const Scheduler = struct {
         defer self.mutex.unlock(self.io);
         const minute_start = @divFloor(now, 60) * 60;
         for (self.jobs.items) |*job| {
-            if (job.schedule.matches(now) and job.last_run < minute_start) {
+            if (!job.schedule.matches(now) or job.last_run >= minute_start) continue;
+            // Marked as due either way: if another replica owns this minute we
+            // must not hammer the lock on every tick.
+            job.last_run = now;
+            const lock = self.lock orelse {
                 job.task(job.context);
-                job.last_run = now;
-            }
+                continue;
+            };
+            const key = std.fmt.allocPrint(self.allocator, "cron:{s}", .{job.name}) catch {
+                std.log.err("[cron] {s}: cannot build lock name; skipping this tick", .{job.name});
+                continue;
+            };
+            defer self.allocator.free(key);
+            const acquired = lock.tryAcquire(key, self.lock_ttl_ms) catch |err| {
+                std.log.err("[cron] {s}: lock acquire failed ({s}); skipping this tick", .{ job.name, @errorName(err) });
+                continue;
+            };
+            if (!acquired) continue; // another replica is running it
+            defer lock.release(key);
+            job.task(job.context);
         }
     }
 
@@ -328,4 +359,63 @@ test "every runs the task after the delay" {
     };
     every(std.testing.io, 0, T.run, &count);
     try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+fn countTask(ctx: *anyopaque) void {
+    const counter: *usize = @ptrCast(@alignCast(ctx));
+    counter.* += 1;
+}
+
+test "cron: a job held by another replica is skipped, then runs once freed" {
+    const allocator = std.testing.allocator;
+    const SqlClient = @import("../sqlx/sqlx.zig").Client;
+    var db = SqlClient.init(allocator, std.testing.io, .{
+        .driver = .sqlite,
+        .sqlite_path = ":memory:",
+        .max_open_conns = 1,
+        .max_idle_conns = 1,
+    });
+    defer db.deinit();
+
+    var sched = Scheduler.init(allocator, std.testing.io);
+    defer sched.deinit();
+    var sched_lock = try DistributedLock.SqlLock(@TypeOf(db)).init(allocator, std.testing.io, &db, "zmodu_cron_lock", .sqlite);
+    defer sched_lock.deinit();
+    sched.setLock(sched_lock.lock(), 60_000);
+
+    // A second owner stands in for the replica that is currently running the
+    // job (or that crashed and whose TTL has not elapsed yet).
+    var other_replica = try DistributedLock.SqlLock(@TypeOf(db)).init(allocator, std.testing.io, &db, "zmodu_cron_lock", .sqlite);
+    defer other_replica.deinit();
+    try std.testing.expect(try other_replica.lock().tryAcquire("cron:nightly", 60_000));
+
+    var runs: usize = 0;
+    try sched.addJob("nightly", try Expression.parse("* * * * *"), countTask, &runs);
+
+    const now: i64 = 1_700_000_040;
+    sched.tick(now);
+    // Locked elsewhere → this replica stays out of the way (the duplicate
+    // side-effect this guard exists to prevent).
+    try std.testing.expectEqual(@as(usize, 0), runs);
+
+    other_replica.lock().release("cron:nightly");
+    sched.tick(now + 60);
+    try std.testing.expectEqual(@as(usize, 1), runs);
+
+    // The winner released when its tick ended, so the slot is free again.
+    try std.testing.expect(try other_replica.lock().tryAcquire("cron:nightly", 60_000));
+}
+
+test "cron: no lock configured keeps single-process behavior" {
+    const allocator = std.testing.allocator;
+    var sched = Scheduler.init(allocator, std.testing.io);
+    defer sched.deinit();
+
+    var runs: usize = 0;
+    try sched.addJob("plain", try Expression.parse("* * * * *"), countTask, &runs);
+    sched.tick(1_700_000_040);
+    try std.testing.expectEqual(@as(usize, 1), runs);
+    // Same minute: not due again.
+    sched.tick(1_700_000_045);
+    try std.testing.expectEqual(@as(usize, 1), runs);
 }

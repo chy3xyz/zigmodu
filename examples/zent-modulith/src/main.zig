@@ -3,6 +3,7 @@ const zigmodu = @import("zigmodu");
 const zent = @import("zent");
 const zent_helpers = @import("zent_helpers");
 const zent_crud = @import("zent_crud.zig");
+const dev_auth = @import("dev_auth.zig");
 const outbox_demo = @import("outbox_demo.zig");
 const data_scope_demo = @import("data_scope_demo.zig");
 const features_demo = @import("features_demo.zig");
@@ -37,16 +38,17 @@ pub fn main(init: std.process.Init) !void {
     var catalog_api = CatalogApiT.init(&catalog_svc);
 
     // Generic CRUD: one declaration = the five standard routes over the zent
-    // CrudService. Tenant comes from the query string in this public demo
-    // (real deployments switch to .attr with the JWT middleware). The client
-    // carries a privacy context so AuditMixin auto-fills created_by/updated_by.
+    // CrudService. Tenant comes from the JWT `aud` claim → `tenant_id` attr
+    // (jwtAuthFromCatalog below); `.query` would let any client pick a tenant.
+    // The client carries a privacy context so AuditMixin auto-fills
+    // created_by/updated_by.
     const ProductCrud = zent.crud.CrudService(catalog.persistence.infos, catalog.persistence.ProductInfo, "tenant_id");
     var product_crud = ProductCrud.init(allocator, store.client.product.withContext(.{ .user_id = 1 }));
     const ProductApiT = zent_crud.CrudApi(catalog.persistence.infos, catalog.persistence.ProductInfo, .{
         .module_name = "catalog",
         .nest = &.{"products"},
         .tenant_col = "tenant_id",
-        .tenant_source = .query,
+        .tenant_source = .attr,
     });
     var product_api = ProductApiT.init(&product_crud);
 
@@ -261,9 +263,23 @@ pub fn main(init: std.process.Init) !void {
 
     var catalog_slot: zigmodu.http.CatalogSlot = .{};
     defer catalog_slot.deinit();
+
+    // JWT stack: verifies Bearer tokens on non-public routes and writes the
+    // `tenant_id` attr from the token `aud` claim — the only tenant source the
+    // products CRUD trusts.
+    const jwt_secret = init.environ_map.get("JWT_SECRET") orelse "dev-secret-change-me";
+    var app_sec = zigmodu.security.AppSecurity.init(allocator, io, .{ .jwt_secret = jwt_secret });
+    try server.addMiddleware(zigmodu.http.jwtAuthFromCatalog(&app_sec.module, &catalog_slot, .{}));
+
     try server.addMiddleware(zigmodu.http.moduleGate(&catalog_slot, .{ .unknown = .allow }));
 
-    comptime zigmodu.http.assertNoDupes(.{ CatalogApiT, ProductApiT, OutboxApiT, DocApiT, InventoryApiT, FeedApiT, SummaryApiT, BatchApiT, UpsertApiT, FeedModernApiT, OrderApiT, AccountApiT });
+    // Dev token mint — a backdoor by construction, so it only exists when
+    // ZENT_DEV_TOKEN=1. See dev_auth.zig.
+    const dev_token_enabled = std.mem.eql(u8, init.environ_map.get("ZENT_DEV_TOKEN") orelse "", "1");
+    const DevAuthApiT = dev_auth.DevAuthApi(@TypeOf(app_sec.module));
+    var dev_auth_api = DevAuthApiT.init(&app_sec.module);
+
+    comptime zigmodu.http.assertNoDupes(.{ CatalogApiT, ProductApiT, OutboxApiT, DocApiT, InventoryApiT, FeedApiT, SummaryApiT, BatchApiT, UpsertApiT, FeedModernApiT, OrderApiT, AccountApiT, DevAuthApiT });
 
     const AppState = struct {};
     var app_state: AppState = .{};
@@ -288,6 +304,7 @@ pub fn main(init: std.process.Init) !void {
     });
     var docs_scope = try api_v1.use(.{ .func = data_scope_demo.scopeMiddleware });
     try docs_scope.mount(DocApiT, &doc_api);
+    if (dev_token_enabled) try api_v1.mount(DevAuthApiT, &dev_auth_api);
     catalog_slot.set(try router.finish());
 
     try server.addRoute(.{
@@ -313,8 +330,13 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("[main] route catalog: {d} entries", .{catalog_slot.get().?.entries.len});
     std.log.info("[main] listening http://127.0.0.1:{d}", .{port});
     std.log.info("[main] POST /api/v1/tenants?name=&domain=", .{});
-    std.log.info("[main] CrudApi: GET/POST /api/v1/products?tenant_id= (paged list / create)", .{});
-    std.log.info("[main] CrudApi: GET/PUT/DELETE /api/v1/products/<id>?tenant_id=", .{});
+    std.log.info("[main] CrudApi: GET/POST /api/v1/products (Bearer token; tenant from JWT aud)", .{});
+    std.log.info("[main] CrudApi: GET/PUT/DELETE /api/v1/products/<id> (Bearer token)", .{});
+    if (dev_token_enabled) {
+        std.log.warn("[main] dev token mint ENABLED: POST /api/v1/dev/token?tenant_id=1&sub=1 (never enable in production)", .{});
+    } else {
+        std.log.info("[main] products routes need a Bearer token; set ZENT_DEV_TOKEN=1 to expose POST /api/v1/dev/token", .{});
+    }
     std.log.info("[main] POST /api/v1/outbox/enqueue?aggregate_type=&aggregate_id=&event_type=&payload=", .{});
     std.log.info("[main] POST /api/v1/outbox/dispatch (manual; cron every minute when file-backed)", .{});
     std.log.info("[main] GET  /api/v1/docs?user_id=&tenant_id=&scope=self_|dept_only|dept_custom&dept_ids=", .{});

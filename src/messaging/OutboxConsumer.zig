@@ -9,6 +9,8 @@
 const std = @import("std");
 const SqlxBackend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend;
 const Outbox = @import("OutboxPublisher.zig");
+const PrometheusMetrics = @import("../metrics/PrometheusMetrics.zig").PrometheusMetrics;
+const Time = @import("../core/Time.zig");
 
 pub const OutboxEntry = Outbox.OutboxEntry;
 
@@ -31,6 +33,17 @@ pub const PollStats = struct {
     failed: usize,
 };
 
+/// Optional metric handles. Wire with `setMetrics` so a stalled outbox shows up
+/// as a flat `outbox_delivered_total` plus a rising `outbox_pending` gauge,
+/// instead of the "business says it never arrived, logs say nothing" failure
+/// mode this pattern is famous for.
+pub const Metrics = struct {
+    selected: *PrometheusMetrics.Counter,
+    delivered: *PrometheusMetrics.Counter,
+    failed: *PrometheusMetrics.Counter,
+    pending: ?*PrometheusMetrics.Gauge = null,
+};
+
 pub const OutboxConsumer = struct {
     const Self = @This();
 
@@ -39,6 +52,13 @@ pub const OutboxConsumer = struct {
     config: OutboxConsumerConfig,
     userdata: *anyopaque,
     handler: OutboxHandlerFn,
+    metrics: ?Metrics = null,
+    io: ?std.Io = null,
+    poll_thread: ?std.Thread = null,
+    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    poll_interval_ms: u64 = 1000,
+    /// Consecutive poll failures, for operators to alert on.
+    consecutive_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -48,6 +68,69 @@ pub const OutboxConsumer = struct {
         handler: OutboxHandlerFn,
     ) Self {
         return .{ .allocator = allocator, .backend = backend, .config = config, .userdata = userdata, .handler = handler };
+    }
+
+    /// Attach Prometheus handles. Creates the counters against `metrics`;
+    /// `pending` is refreshed on every poll and on demand via `refreshPending`.
+    pub fn setMetrics(self: *Self, metrics: *PrometheusMetrics) !void {
+        self.metrics = .{
+            .selected = try metrics.createCounter("outbox_selected_total", "Outbox entries picked up for delivery"),
+            .delivered = try metrics.createCounter("outbox_delivered_total", "Outbox entries delivered successfully"),
+            .failed = try metrics.createCounter("outbox_failed_total", "Outbox entries that exhausted their retries"),
+            .pending = metrics.createGauge("outbox_pending", "Outbox entries waiting to be delivered") catch null,
+        };
+    }
+
+    /// Refresh the `outbox_pending` gauge (also called after each poll).
+    pub fn refreshPending(self: *Self) void {
+        const m = self.metrics orelse return;
+        const gauge = m.pending orelse return;
+        gauge.set(@floatFromInt(self.pendingCount() catch return));
+    }
+
+    /// Pending entries (`status IN (0,1)` and retries left). This is the number
+    /// that must not keep growing.
+    pub fn pendingCount(self: *Self) !u64 {
+        const Sql = struct { n: i64 };
+        var rows = try self.backend.client.queryRows(Sql, "SELECT COUNT(*) AS n FROM event_outbox WHERE status IN (0, 1)", &.{});
+        defer rows.deinit(self.allocator);
+        if (rows.items.len == 0) return 0;
+        return @intCast(@max(0, rows.items[0].n));
+    }
+
+    /// Dispatch in the background every `interval_ms` (replaces the
+    /// hand-rolled cron job; a multi-replica deployment still wants
+    /// `DistributedLock` around it). Idempotent.
+    pub fn startPolling(self: *Self, io: std.Io, interval_ms: u64) !void {
+        if (self.running.load(.monotonic)) return;
+        self.io = io;
+        self.poll_interval_ms = interval_ms;
+        self.running.store(true, .monotonic);
+        self.poll_thread = try std.Thread.spawn(.{}, pollLoop, .{self});
+    }
+
+    /// Stop the background poller and join it.
+    pub fn stopPolling(self: *Self) void {
+        self.running.store(false, .monotonic);
+        if (self.poll_thread) |t| {
+            t.join();
+            self.poll_thread = null;
+        }
+    }
+
+    fn pollLoop(self: *Self) void {
+        const io = self.io orelse return;
+        while (self.running.load(.monotonic)) {
+            _ = self.pollOnce() catch |err| {
+                _ = self.consecutive_failures.fetchAdd(1, .monotonic);
+                std.log.err("[outbox] poll failed ({s}); pending delivery stalled", .{@errorName(err)});
+                std.Io.sleep(io, std.Io.Duration.fromMilliseconds(@intCast(self.poll_interval_ms)), .real) catch {};
+                continue;
+            };
+            self.consecutive_failures.store(0, .monotonic);
+            self.refreshPending();
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(@intCast(self.poll_interval_ms)), .real) catch {};
+        }
     }
 
     /// Poll one batch of pending entries and dispatch them. Returns how many
@@ -108,6 +191,11 @@ pub const OutboxConsumer = struct {
                     );
                 }
             }
+        }
+        if (self.metrics) |m| {
+            m.selected.add(@intCast(stats.selected));
+            m.delivered.add(@intCast(stats.delivered));
+            m.failed.add(@intCast(stats.failed));
         }
         return stats;
     }
@@ -246,4 +334,48 @@ test "OutboxConsumer marks retry then fails on persistent handler errors" {
     try std.testing.expectEqual(@as(i64, 3), row.get("status").?.int);
     try std.testing.expectEqual(@as(i64, 2), row.get("retry_count").?.int);
     try std.testing.expectEqualStrings("DeliveryFailed", row.get("error_message").?.string);
+}
+
+test "outbox metrics expose backlog and delivery counters" {
+    const allocator = std.testing.allocator;
+    var client = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    _ = try client.exec(
+        "CREATE TABLE event_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, payload TEXT, status INTEGER DEFAULT 0, tenant_id INTEGER, retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 5, created_at INTEGER, updated_at INTEGER, error_message TEXT)",
+        &.{},
+    );
+    _ = try client.exec(
+        "INSERT INTO event_outbox (topic, payload, status, retry_count, max_retries, created_at, updated_at) VALUES ('t.a', '{}', 0, 0, 3, 1, 1), ('t.b', '{}', 0, 0, 3, 2, 2)",
+        &.{},
+    );
+
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    const Handler = struct {
+        fn handle(_: *anyopaque, _: std.mem.Allocator, _: OutboxEntry) anyerror!void {}
+    };
+    var consumer = OutboxConsumer.init(allocator, &backend, .{}, undefined, Handler.handle);
+
+    var metrics = PrometheusMetrics.init(allocator);
+    defer metrics.deinit();
+    try consumer.setMetrics(&metrics);
+
+    // Backlog is visible before anything is delivered — the whole point.
+    try std.testing.expectEqual(@as(u64, 2), try consumer.pendingCount());
+    consumer.refreshPending();
+
+    const first = try consumer.pollOnce();
+    try std.testing.expectEqual(@as(usize, 2), first.delivered);
+
+    const after = try consumer.pollOnce();
+    try std.testing.expectEqual(@as(usize, 0), after.selected);
+    try std.testing.expectEqual(@as(u64, 0), try consumer.pendingCount());
+
+    const text = try metrics.toPrometheusFormat(allocator);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "outbox_selected_total 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "outbox_delivered_total 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "outbox_failed_total 0") != null);
+    // Gauge was refreshed when the backlog was still 2.
+    try std.testing.expect(std.mem.indexOf(u8, text, "outbox_pending 2.000000") != null);
 }

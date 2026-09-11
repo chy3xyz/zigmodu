@@ -17,6 +17,9 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "log_level", b.option([]const u8, "log-level", "Compile-time log level (debug/info/warn/err)") orelse "debug");
     build_options.addOption(std.SemanticVersion, "version", std.SemanticVersion.parse(package_zon.version) catch unreachable);
+    // `-Dnet-tests=false` makes every socket-dependent test skip (sandboxed CI
+    // without loopback permission). They run by default.
+    build_options.addOption(bool, "net_tests", b.option(bool, "net-tests", "Run tests that need real loopback sockets") orelse true);
     db_link.addToOptions(build_options, features);
     const build_options_mod = build_options.createModule();
 
@@ -194,4 +197,27 @@ pub fn build(b: *std.Build) void {
     });
     const dc_scanner_tests = b.addTest(.{ .root_module = dc_scanner_mod });
     test_step.dependOn(&b.addRunArtifact(dc_scanner_tests).step);
+
+    // Concurrency soak (`zig build soak`) — real sockets, N clients x M
+    // tenants, cross-tenant leak assertions. Kept out of `zig build test` so
+    // the default suite stays fast; sized via options.
+    const soak_options = b.addOptions();
+    soak_options.addOption(usize, "soak_clients", b.option(usize, "soak-clients", "soak: concurrent client threads") orelse 16);
+    soak_options.addOption(usize, "soak_iterations", b.option(usize, "soak-iterations", "soak: requests per client") orelse 50);
+    const soak_options_mod = soak_options.createModule();
+
+    const soak_mod = b.createModule(.{
+        .root_source_file = b.path("src/soak.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    soak_mod.addImport("zigmodu", zigmodu_mod);
+    soak_mod.addImport("build_options", soak_options_mod);
+    db_link.link(soak_mod, b, features);
+
+    const soak_tests = b.addTest(.{ .root_module = soak_mod });
+    const run_soak = b.addRunArtifact(soak_tests);
+    const soak_step = b.step("soak", "Run concurrency soak tests (N clients x M tenants)");
+    soak_step.dependOn(&run_soak.step);
 }

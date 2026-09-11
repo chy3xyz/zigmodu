@@ -13,7 +13,7 @@ typed identity). Sibling ORM backlog: `zig_ws/zent/docs/ISSUES_FROM_ZAPI.md`.
 | 2 | Unified error → ProblemDetails | **Landed** | `respondProblem` / `respondErr` + `setErrorMap` |
 | 3 | Scope-local middleware | **Landed** | `RouteGroup.use`, `Scoped.use` |
 | 4 | Router oneshot / Testkit | **Landed** | `Testkit.dispatch` / `dispatchOpts` |
-| 5 | Security / Obs / Resilience profiles | **Landed** | `applyHttpDefaults` + `applyResilienceDefaults` / `ResilienceProfileState` |
+| 5 | Security / Obs / Resilience profiles | **Landed** | `productionProfile`（生产一键：背压+中间件+`/metrics`+`/health/*`）；散件 `applyHttpDefaults` + `applyResilienceDefaults` |
 | 6 | Testkit JWT / SQLite / tenant / SSE | **Landed** | `signBearerToken`, `openMemorySqlite`, `tenantMiddleware`, `SseRecorder` |
 | 7 | Outbox / Idempotency | **Landed** | `zigmodu.outbox.*`, `idempotencyMiddleware` (+ sample tests) |
 | 8 | Config / health / shutdown | **Landed** | `requireEnv`, `ShutdownChecklist` |
@@ -23,6 +23,28 @@ typed identity). Sibling ORM backlog: `zig_ws/zent/docs/ISSUES_FROM_ZAPI.md`.
 | + | Example migration | **Landed** | `examples/zent-modulith` + `tools/zmodu/.../api_standalone.zig.tpl` |
 | + | **WS binary frames** | **Landed** | `WsFrameKind` + `on_message(..., kind)` text/binary; `WsFramer.writeBinary` |
 | + | **OpenAPI UI Suite** | **Landed** | `http.swaggerUiHandler`, `http.scalarUiHandler`, `http.openApiRoutes` zero-config HTML embed & one-line route tuple |
+
+---
+
+## 2026-09 加固批次（production hardening）
+
+| # | 能力 | 入口 | 解决什么 |
+|---|------|------|----------|
+| 1 | 生产一键接线 | `http.productionProfile(&server, cfg, &state)` | 背压 + 安全/观测中间件 + `/metrics` 黄金信号 + `/health/*`；**必须在 `addRoute` 之前** |
+| 2 | 连接背压 / 慢连接 | `Server.Config.max_connections` · `over_limit_response` · `header_timeout_ms` · `ws_write_timeout_ms` | accept 洪泛、slowloris、慢 WS 客户端阻塞写线程 |
+| 3 | 共享注册表 | `zmodu.FrozenMap` / `FrozenStringMap` | 启动期填充后 `freeze()`，消除并发 put/resize 撕裂（`panic: incorrect alignment`） |
+| 4 | panic 归因 | `pub const panic = zmodu.panicHook;` | panic 输出带上正在处理的 `METHOD /path` |
+| 5 | 启动预检 | `zmodu.Preflight.run(...)` | 缺 env、占位 JWT secret、DB 不通、待应用迁移、时钟偏移 → 拒绝启动 |
+| 6 | 密钥轮换 | `SecurityModule.setKeyring(&JwksKeyRing)` | token 带 `kid`，新旧双验，无需全员重登 |
+| 7 | 后台任务互斥 | `cron.setLock(...)` · `runner.setLock(...)`（`zmodu.DistributedLock`） | 多副本重复执行 job / 并发 DDL |
+| 8 | 业务面指标 | `OutboxConsumer.setMetrics/startPolling` · `Client.poolMetrics` · `metrics.setScrapeHook` | outbox 停投、池打满这类 HTTP 层看不见的静默失败 |
+| 9 | 指标下钻 | `createCounterFamily` / `createHistogramFamily` + `ctx.route_template` | 受限基数地按路由看延迟与错误 |
+| 10 | 审计规则 | `zmodu audit` b19–b22 | 请求路径裸 panic / 共享可变 HashMap / 裸 `@alignCast` / query 取租户 |
+| 11 | 验证手段 | `zig build soak` · `src/test/FaultInjection.zig` · `src/test/ContractGate.zig` | 跨租户泄漏、熔断恢复行为、接口契约漂移 |
+
+权威细节：[`BEST_PRACTICES.md`](BEST_PRACTICES.md)「韧性 / 上线前预检 / 多副本」
+· [`OBSERVABILITY.md`](OBSERVABILITY.md) · [`ROUTE_TABLE.md`](ROUTE_TABLE.md) §7.4
+· `examples/production-deploy/`。
 
 ---
 
@@ -63,6 +85,21 @@ var res = try http.applyResilienceDefaults(allocator, &.{
 });
 defer res.deinit();
 ```
+
+生产环境用一键入口（**必须在路由注册之前**调用，否则全局中间件不会进已注册路由）：
+
+```zig
+var profile = http.ProductionProfileState.init(allocator);
+defer profile.deinit(allocator);
+try http.productionProfile(&server, .{
+    .max_connections = 4096,
+    .header_timeout_ms = 10_000,
+}, &profile);
+// → 背压 + CORS/request-id/recover/tracing/access-log + GET /metrics
+//   + GET /health/live + /health/ready（+ 可选 dashboard）
+```
+
+细节与告警阈值：[`OBSERVABILITY.md`](OBSERVABILITY.md) · 接线顺序：[`ROUTE_TABLE.md`](ROUTE_TABLE.md) §7.4。
 
 ### Testkit
 

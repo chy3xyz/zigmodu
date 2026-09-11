@@ -124,11 +124,38 @@ Expected output:
 info: Application started successfully!
 ```
 
+## Going to production
+
+Before the first deploy, do these four things:
+
+```zig
+// 1) one call: backpressure + security middleware + /metrics + /health/*
+var profile = zigmodu.http.ProductionProfileState.init(allocator);
+defer profile.deinit(allocator);
+try zigmodu.http.productionProfile(&server, .{
+    .max_connections = 4096,
+    .header_timeout_ms = 10_000,
+}, &profile);            // ⚠️ before router.mountAll / server.addRoute
+
+// 2) panic attribution (root file)
+pub const panic = zigmodu.panicHook;
+```
+
+3. Refuse to boot when misconfigured — `zigmodu.Preflight.run(...)`
+   checks required env, placeholder JWT secrets, DB reachability, pending
+   migrations and clock skew (see `docs/BEST_PRACTICES.md`「上线前预检」).
+4. TLS terminates at a sidecar/gateway — reference topology in
+   [`../examples/production-deploy/`](../examples/production-deploy/).
+5. Run under a supervisor (`Restart=always` / k8s `restartPolicy: Always`).
+
+Read next: [`OBSERVABILITY.md`](OBSERVABILITY.md) (alerts + dashboard),
+[`BEST_PRACTICES.md`](BEST_PRACTICES.md)「韧性」, [`ROUTE_TABLE.md`](ROUTE_TABLE.md) §7.4.
+
 ## What's Next?
 
 | Tutorial | Description |
 |----------|-------------|
-| [Examples](examples/) | More complete examples |
+| [Examples](../examples/) | More complete examples |
 | [Best Practices](BEST_PRACTICES.md) | Architecture + JWT / auth checklist |
 | [Declarative Routes](ROUTE_TABLE.md) | ComptimeRouter + catalog RBAC |
 | [AGENTS.md](../AGENTS.md) | AI agent handbook |
@@ -162,4 +189,4 @@ zig build docs        # Generate docs
 **"missing init/deinit"**
 - Every module must implement both functions
 
-For more help, see [CONTRIBUTING.md](CONTRIBUTING.md) or open an issue.
+For more help, see [CONTRIBUTING.md](../CONTRIBUTING.md) or open an issue.

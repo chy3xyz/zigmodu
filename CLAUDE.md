@@ -18,7 +18,7 @@ zig build zmodu -- scaffold --sql schema.sql --name my_app --with-auth
 
 ## Architecture (5 domain files)
 ```
-src/http.zig          → Server, Context, Router, Middleware, sse, extract*, Testkit, applyHttpDefaults
+src/http.zig          → Server, Context, Router, Middleware, sse, extract*, Testkit, applyHttpDefaults, productionProfile
 src/data.zig          → Client, sqlx, orm, Repository, redis
 src/security.zig      → AppSecurity, CatalogPermDb, PasswordEncoder, SecretsManager
 src/observability.zig → PrometheusMetrics, DistributedTracer, OtlpExporter

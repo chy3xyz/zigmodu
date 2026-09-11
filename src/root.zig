@@ -57,6 +57,11 @@ pub const ThreadSafeEventBus = @import("core/EventBus.zig").ThreadSafeEventBus;
 pub const EventRegistry = @import("core/EventRegistry.zig").EventRegistry;
 pub const ModuleContext = @import("core/ModuleContext.zig").ModuleContext;
 pub const Container = @import("di/Container.zig").Container;
+pub const FrozenMap = @import("core/FrozenMap.zig").FrozenMap;
+pub const FrozenStringMap = @import("core/FrozenMap.zig").FrozenStringMap;
+pub const PanicHook = @import("api/PanicHook.zig");
+/// Drop-in panic namespace for app roots: `pub const panic = zmodu.panicHook;`
+pub const panicHook = @import("api/PanicHook.zig").hook;
 
 // ============================================================
 // 2. DOMAIN RE-EXPORTS (canonical — prefer these)
@@ -163,6 +168,10 @@ pub const Http2 = @import("http/Http2.zig");
 // 7. SCHEDULER
 // ============================================================
 pub const cron = @import("scheduler/Cron.zig");
+/// Cross-instance mutual exclusion for background work (cron, migrations).
+pub const DistributedLock = @import("core/DistributedLock.zig");
+/// Startup preflight checks (env / secret / DB / migrations / clock).
+pub const Preflight = @import("core/Preflight.zig");
 
 // ============================================================
 // 8. UTILITIES
@@ -197,6 +206,8 @@ pub const Contract = @import("test/ContractTest.zig").Contract;
 pub const ContractVerificationResult = @import("test/ContractTest.zig").ContractVerificationResult;
 pub const ModuleTestContext = @import("test/ModuleTest.zig").ModuleTestContext;
 pub const createMockModule = @import("test/ModuleTest.zig").createMockModule;
+/// Loopback TCP probe for socket tests in restricted sandboxes.
+pub const NetworkProbe = @import("test/NetworkProbe.zig");
 
 // ============================================================
 // ============================================================

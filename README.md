@@ -17,11 +17,14 @@ A modular application framework for Zig 0.17, inspired by Spring Modulith. Build
 | [Events & DI](docs/EVENTS_DI.md) | `initWith(ctx)` + `app.eventBus` + container freeze |
 | [Declarative Routes](docs/ROUTE_TABLE.md) | ComptimeRouter + catalog JWT/RBAC |
 | [ZigModu × zent](docs/ZENT.md) | **电商/社交主推组合**：zent ORM 集成最佳实践 |
-| [Best Practices](docs/BEST_PRACTICES.md) | Architecture evolution + JWT checklist |
+| [Best Practices](docs/BEST_PRACTICES.md) | Architecture evolution + JWT checklist + 韧性（panic/背压/FrozenMap） |
+| [Observability](docs/OBSERVABILITY.md) | Golden signals, PromQL, alert thresholds, Grafana dashboard |
+| [Production Roadmap](docs/PRODUCTION_ROADMAP.md) | Maintenance boundaries, prefork limits, `src/ai` boundary |
 | [API Reference](docs/API.md) | Detailed API documentation |
 | [Architecture](docs/ARCHITECTURE.md) | System design and patterns |
 | [Evaluation Report](docs/EVALUATION_REPORT.md) | Production readiness assessment (~98/100) |
 | [Examples](examples/) | Runnable example projects |
+| [Production deploy](examples/production-deploy/) | TLS sidecar (nginx/Envoy), k8s, systemd, Dockerfile |
 | [ZModu CLI](docs/ZMODU_CLI_INTEGRATION.md) | Built-in codegen (`zig build zmodu`) |
 
 ## ✨ Features
@@ -145,7 +148,26 @@ const zigmodu_dep = b.dependency("zigmodu", .{
 ```bash
 zig build -Ddb=sqlite          # apps / examples
 zig build test                 # framework tests: keep default all
+zig build soak                 # concurrency soak: N clients x M tenants (real sockets)
 ```
+
+Production: one call wires backpressure, security, `/metrics` (golden signals)
+and `/health/*`. It must run **before** routes are registered:
+
+```zig
+var server = zigmodu.http.Server.init(io, allocator, 8080);
+var profile = zigmodu.http.ProductionProfileState.init(allocator);
+defer profile.deinit(allocator);
+try zigmodu.http.productionProfile(&server, .{
+    .max_connections = 4096,
+    .over_limit_response = .close,  // or .unavailable to answer 503 first
+    .header_timeout_ms = 10_000,    // request line + headers (slowloris guard)
+}, &profile);
+```
+
+Deployment topology (TLS at a sidecar/gateway, graceful restarts, probes):
+[`examples/production-deploy/`](examples/production-deploy/) ·
+dashboards & alerting: [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md).
 
 Disabled drivers → C stubs; runtime `error.DriverNotEnabled` (HTTP 400). Full guide: **[docs/SQLX_DRIVERS.md](docs/SQLX_DRIVERS.md)**.
 
