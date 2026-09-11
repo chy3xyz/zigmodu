@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.37] - 2026-09-12
+
+### Fixed
+- **CI `Test (DB=postgres)` 失败**：新增的真实 PG 锁用例连不上 CI 的 service 容器。
+  根因是 sqlx 的 PG 驱动默认 `sslmode=require`（安全默认，保持不改），而测试用
+  service 不支持 TLS —— 仅在该 job 里设 `PGSSLMODE: disable`（一次性测试库）。
+  已用同一条件在本地复现并验证。
+- **CI `Benchmark` job 首次真正执行即失败**：`benchmark-action` 需要 `gh-pages`
+  分支，仓库还没有 → 加 `skip-fetch-gh-pages: true` 让其自举（该 job 此前因
+  分支条件写错从未运行，v0.15.36 修好条件后才暴露）。
+
 ## [0.15.36] - 2026-09-12
 
 ### Changed
