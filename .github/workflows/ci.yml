@@ -567,7 +567,16 @@ jobs:
       - name: Run benchmarks
         run: zig build benchmark -Doptimize=ReleaseFast
 
+      # The benchmark RUN above is the gate (it must compile and complete).
+      # Storing history needs a `gh-pages` branch, which this repo does not have
+      # yet — until one exists the threshold comparison cannot work, so this
+      # step must not fail the build. To enable it:
+      #   git checkout --orphan gh-pages && git commit --allow-empty -m init \
+      #     && git push -u origin gh-pages
+      # then make the action authoritative (drop continue-on-error, set
+      # fail-on-alert: true).
       - name: Store benchmark results
+        continue-on-error: true
         uses: benchmark-action/github-action-benchmark@v1
         with:
           tool: 'customSmallerIsBetter'
