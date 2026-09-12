@@ -129,6 +129,7 @@ test "compile all source files" {
     _ = @import("test/ModuleTest.zig");
     _ = @import("test/NetworkProbe.zig");
     _ = @import("test/FaultInjection.zig");
+    _ = @import("http/StaticFiles.zig");
     _ = @import("test/ContractGate.zig");
 
     // Tracing

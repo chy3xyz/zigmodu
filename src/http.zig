@@ -153,6 +153,9 @@ pub const Testkit = @import("http/Testkit.zig");
 /// Meta ↔ runtime auth audit (M2): `auditAuthCoverage(alloc, &server, &slot)`.
 pub const auditAuthCoverage = Testkit.auditAuthCoverage;
 pub const AuthAuditMismatch = Testkit.AuthAuditMismatch;
+pub const StaticFiles = @import("http/StaticFiles.zig");
+/// Static file serving (traversal guard + ETag/304 + Range).
+pub const staticFiles = @import("http/StaticFiles.zig").staticFiles;
 pub const Profiles = @import("http/Profiles.zig");
 pub const ProfileConfig = Profiles.ProfileConfig;
 pub const HttpProfileState = Profiles.HttpProfileState;

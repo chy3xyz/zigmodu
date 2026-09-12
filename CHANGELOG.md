@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Added
+- **静态文件服务**（`zigmodu.http.staticFiles` / `StaticFiles.staticMiddleware`，zapi 反馈 P1-6）：
+
+  ```zig
+  try zigmodu.http.staticFiles(io, &server, allocator, "/assets", "public", .{
+      .cache_control = "public, max-age=3600",
+  });
+  ```
+
+  实现为**中间件**而非路由：路由器现阶段的 `/prefix/*` 只匹配前缀本身，路由式挂载无法服务其下文件。
+  行为约定：只服务 `GET`/`HEAD`（其余 405）；**不做目录索引/列表**（`/assets/` → 404）；
+  路径先归一化再碰文件系统（`..`、绝对路径、反斜杠、`:`、NUL 一律拒绝）；
+  `ETag`（size+mtime）支持 `If-None-Match` → 304；`Range` 支持 206 / 416（多段范围回落为整实体）；
+  超过 `max_bytes`（默认 16 MiB）返回 413 而不是整文件读进内存；
+  正文按 `chunk_bytes` 分块读取。挂载对象按进程生命周期分配（所有权契约写在文件头注释里）。
+
 ### Fixed
 - **表单体的解码口径与 query 不一致**（`parseFormBody`，zapi 反馈 P0-1）：query 的
   key/value 都会 percent-decode，而 form body 原样 `dupe`。后果有两层：`formValue("name")`
