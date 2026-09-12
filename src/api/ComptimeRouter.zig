@@ -23,7 +23,17 @@ pub const WsFrameKind = server_mod.WsFrameKind;
 /// Auth for a single route. `.inherit` resolves to nest/scoped default (`.jwt`).
 pub const Auth = enum {
     inherit,
+    /// No authentication. Identity is **not** attached: `ctx.userId()` stays
+    /// null. Use `.optional` when a public handler may still want to know who
+    /// is calling.
     public,
+    /// Optional authentication: verify a presented token and attach the
+    /// identity when it is valid; a missing/invalid/expired token changes
+    /// nothing and the request still succeeds. Never 401 — the route is public,
+    /// it just gets personalization for free. This is the explicit form of the
+    /// "public but personalized" endpoint (C-end user center, feature flags per
+    /// user, …) that otherwise needs a hand-rolled token check in the handler.
+    optional,
     jwt,
 };
 
@@ -142,6 +152,13 @@ pub const RouteCatalog = struct {
     pub fn isPublic(self: *const RouteCatalog, method: Method, path: []const u8) bool {
         const e = self.findEntry(method, path) orelse return false;
         return e.auth == .public;
+    }
+
+    /// Route wants best-effort identity (`.optional`): verify if a token is
+    /// presented, never reject.
+    pub fn isOptionalAuth(self: *const RouteCatalog, method: Method, path: []const u8) bool {
+        const e = self.findEntry(method, path) orelse return false;
+        return e.auth == .optional;
     }
 
     pub fn authFor(self: *const RouteCatalog, method: Method, path: []const u8) ?Auth {

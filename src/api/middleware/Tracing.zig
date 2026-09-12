@@ -115,7 +115,7 @@ pub fn rateLimitPerClient(
         stored_registry: *RateLimiterRegistry,
         stored_extractor: *const fn (*api.Context) []const u8,
     };
-    const stored = std.heap.page_allocator.create(S) catch unreachable;
+    const stored = std.heap.page_allocator.create(S) catch @panic("tracing middleware setup: out of memory");
     stored.* = .{ .stored_registry = registry, .stored_extractor = key_extractor };
 
     return .{

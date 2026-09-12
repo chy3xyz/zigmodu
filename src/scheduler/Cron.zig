@@ -270,7 +270,7 @@ pub const Scheduler = struct {
     fn runLoop(self: *Scheduler) void {
         while (self.running.load(.monotonic)) {
             self.tick(Time.monotonicNowSeconds());
-            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(@intCast(self.tick_interval_ms)), .real) catch {};
+            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(@intCast(self.tick_interval_ms)), .real) catch |sleep_err| std.log.debug("[cron] tick sleep interrupted ({s})", .{@errorName(sleep_err)});
         }
     }
 };
@@ -278,7 +278,7 @@ pub const Scheduler = struct {
 /// Block for `seconds`, then run `task` once (blocking helper).
 /// Use `Scheduler` for recurring jobs.
 pub fn every(io: std.Io, seconds: u64, task: *const fn (*anyopaque) void, context: *anyopaque) void {
-    std.Io.sleep(io, std.Io.Duration.fromSeconds(@intCast(seconds)), .real) catch {};
+    std.Io.sleep(io, std.Io.Duration.fromSeconds(@intCast(seconds)), .real) catch |err| std.log.debug("[cron] every(): sleep interrupted ({s})", .{@errorName(err)});
     task(context);
 }
 

@@ -1,5 +1,45 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **`Auth.optional`：公开但可个性化的路由（一等能力）**。`Auth` 此前只有
+  `inherit | public | jwt`：`public` 完全跳过验签、`ctx.userId()` 恒为空，而需要身份就等于
+  `.jwt`（游客直接 401）。C 端用户中心这类"公开但想看是谁"的接口只能靠 handler 里手写
+  token 检查。现在：
+
+  ```zig
+  pub const routes = [_]cr.RouteSpec(State){
+      .{ .method = .GET, .path = "me", .handler = me, .meta = .{ .auth = .optional } },
+  };
+  ```
+  语义：**有 token 就验并注入身份，token 缺失/非法/过期一律不影响请求**，永不 401。
+  与 `.public` 的差别被显式化并可测试（矩阵用例覆盖 optional×{无/有效/坏 token}、
+  public×有效 token、jwt×{无/有效 token}）。同时把此前只在 `authFromCatalog(AuthBackend)`
+  一支存在的"尽力而为验签"抽成 `attachIdentityBestEffort`，三处中间件行为一致；
+  `permissionGate` 的 public 短路不覆盖 `.optional`（这类路由仍可带 permission/roles 元数据）。
+
+### Changed
+- **CI 门禁 `check-production.sh` 覆盖全仓**：原来只扫 9 个硬编码热文件 + `src/security/*`，
+  其余文件（含 auth/tracing 中间件）长期是盲区。现在按前缀分层：
+  `src/api|core|http|metrics|messaging|scheduler|security` **强制**，其余
+  （`ai/`、`extensions/`、`im/`、`log/`）先**告警**（28 处，作为待收紧清单）。
+  扫描同时忽略注释行（文档里提到该模式不再误报）。
+
+### Fixed
+- **`catch unreachable` 的可达性收敛**（第 2 类"把环境失败当成不可能"）：8 处
+  `page_allocator.create(...) catch unreachable`（中间件构造：CORS / jwtAuth /
+  jwtAuthFromCatalog / …WithPermissions / authFromCatalog / tenantResolver / moduleGate /
+  tracing）在 `ReleaseFast` 下是 UB，现改为 `catch @panic("<可读原因>: out of memory")`；
+  2 处测试内的 `catch unreachable` 改为 `try` / `error.TestUnexpectedResult`；
+  `SO_SNDTIMEO` 设置失败从静默改为 **warn**（那意味着慢客户端能无限阻塞写线程）。
+- **`PrometheusMetrics` 直方图可能半初始化**：`createHistogramFamily` 里
+  `counts.append(0) catch {}` 失败时会留下"有桶无计数"的直方图（`le` 行永久错误），
+  现改为清理并降级到 overflow 序列，保证桶与计数始终同步。
+- 重点路径上 15 处 `catch {}` 改为带上下文的 debug/warn（分布式锁回收与释放、
+  HTTP/2 窗口与 RST、连接池回收与退避、outbox/cron 睡眠、access-log、
+  auto-instrumentation），符合仓库既有的"不吞错误"规则。
+
 ## [0.15.40] - 2026-09-12
 
 ### Changed

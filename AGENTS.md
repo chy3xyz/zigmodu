@@ -76,6 +76,7 @@ defer app.stop();
 | 沙箱 CI：`zig build test -Dnet-tests=false` 跳过 socket 测试 | 在无 loopback 权限环境里跑默认套件（网络用例会失败/抖动） |
 | 多副本后台任务：`cron.setLock(...)` / `runner.setLock(...)`（`zigmodu.DistributedLock`，表锁按 DB 自动分方言） | 多副本直接跑 cron / 迁移（每个副本都会执行 = 重复副作用、并发 DDL） |
 | 指标标签用 `ctx.route_template`（模式）；用 `createCounterFamily` 限基数 | 把原始 path / id / 用户输入塞进 label（基数爆炸） |
+| 公开但可能带身份的接口用 `auth = .optional`（有 token 就注入身份、永不 401） | 用 `.public` 后又在 handler 里手写 token 解析（或再加一条 `.jwt` 路由） |
 | 启动跑 `zigmodu.Preflight.run(...)`（env/secret/DB/迁移/时钟） | 用占位 JWT secret 或默认配置上线（预检会拦，别绕过） |
 | 生产接线的参考实现看 `examples/tenant-mgmt`（`productionProfile`）与 `examples/zmsaas`（Preflight + 池/积压指标） | 让示例停在上古手工接线（文档承诺、旗舰不用） |
 | 换 JWT 密钥走 `JwksKeyRing` + `setKeyring`（带 kid，新旧双验） | 直接改 secret 重启（全员强制重登；或留下无法验证的旧 token） |

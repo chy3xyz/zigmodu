@@ -762,7 +762,7 @@ test "redis concurrent incr" {
     const final_val = try redis.get(key);
     if (final_val) |v| {
         defer std.testing.allocator.free(v);
-        const parsed = std.fmt.parseInt(i64, v, 10) catch unreachable;
+        const parsed = std.fmt.parseInt(i64, v, 10) catch return error.TestUnexpectedResult;
         try std.testing.expectEqual(@as(i64, threads_n), parsed);
     } else {
         try std.testing.expect(false); // key should exist with value == threads_n

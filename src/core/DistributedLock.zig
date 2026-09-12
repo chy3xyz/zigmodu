@@ -139,7 +139,7 @@ pub fn SqlLock(comptime Client: type) type {
             // replica's cleanup is equally fine).
             const reap_sql = try std.fmt.allocPrint(self.allocator, "DELETE FROM {s} WHERE name = ? AND expires_at <= ?", .{self.table});
             defer self.allocator.free(reap_sql);
-            _ = self.client.exec(reap_sql, &.{ .{ .string = name }, .{ .int = now_ms } }) catch {};
+            _ = self.client.exec(reap_sql, &.{ .{ .string = name }, .{ .int = now_ms } }) catch |err| std.log.debug("[lock] reap of '{s}' failed ({s}); a stale row may linger until the next attempt", .{ name, @errorName(err) });
 
             // Atomic claim: exactly one racer gets rows_affected == 1.
             const insert_sql = switch (self.dialect) {
@@ -170,7 +170,7 @@ pub fn SqlLock(comptime Client: type) type {
             const self: *Self = @ptrCast(@alignCast(ptr));
             const sql = std.fmt.allocPrint(self.allocator, "DELETE FROM {s} WHERE name = ? AND owner = ?", .{self.table}) catch return;
             defer self.allocator.free(sql);
-            _ = self.client.exec(sql, &.{ .{ .string = name }, .{ .string = &self.owner } }) catch {};
+            _ = self.client.exec(sql, &.{ .{ .string = name }, .{ .string = &self.owner } }) catch |err| std.log.debug("[lock] release of '{s}' failed ({s}); ttl will expire it", .{ name, @errorName(err) });
         }
 
         fn ensureTable(self: *Self) !void {

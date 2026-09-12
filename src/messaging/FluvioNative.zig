@@ -290,7 +290,7 @@ test "NativeTransport produce/consume/list over loopback" {
 
     var transport = try NativeTransport.connect(allocator, std.testing.io, "127.0.0.1", port);
     defer transport.deinit();
-    var connector = Connector.FluvioConnector.init(allocator, std.testing.io, .{}) catch unreachable;
+    var connector = try Connector.FluvioConnector.init(allocator, std.testing.io, .{});
     connector.transport = transport.asTransport();
     // createTopic is exercised separately below; produce auto-creates.
     try connector.produce("orders", "k1", "v1");

@@ -319,7 +319,17 @@ pub const PrometheusMetrics = struct {
                     self.overflow_used = true;
                     return &self.overflow;
                 };
-                hist.counts.append(0) catch {};
+                // Keep buckets and counts in lockstep: a half-built histogram
+                // (bucket present, count missing) would render wrong `le`
+                // lines forever. Degrade to the overflow series instead.
+                hist.counts.append(0) catch {
+                    hist.buckets.deinit();
+                    hist.counts.deinit();
+                    self.allocator.free(key);
+                    self.allocator.destroy(hist);
+                    self.overflow_used = true;
+                    return &self.overflow;
+                };
             }
             self.series.put(key, hist) catch {
                 hist.buckets.deinit();

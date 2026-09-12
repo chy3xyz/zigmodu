@@ -123,12 +123,12 @@ pub const OutboxConsumer = struct {
             _ = self.pollOnce() catch |err| {
                 _ = self.consecutive_failures.fetchAdd(1, .monotonic);
                 std.log.err("[outbox] poll failed ({s}); pending delivery stalled", .{@errorName(err)});
-                std.Io.sleep(io, std.Io.Duration.fromMilliseconds(@intCast(self.poll_interval_ms)), .real) catch {};
+                std.Io.sleep(io, std.Io.Duration.fromMilliseconds(@intCast(self.poll_interval_ms)), .real) catch |sleep_err| std.log.debug("[outbox] poll sleep interrupted ({s})", .{@errorName(sleep_err)});
                 continue;
             };
             self.consecutive_failures.store(0, .monotonic);
             self.refreshPending();
-            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(@intCast(self.poll_interval_ms)), .real) catch {};
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(@intCast(self.poll_interval_ms)), .real) catch |err| std.log.debug("[outbox] poll sleep interrupted ({s})", .{@errorName(err)});
         }
     }
 

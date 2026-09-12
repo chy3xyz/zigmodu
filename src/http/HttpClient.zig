@@ -127,7 +127,7 @@ pub const HttpClient = struct {
                 released_conn.last_used = Time.monotonicNowSeconds();
                 // Best-effort: OOM while pooling just drops the connection
                 // (same outcome as the dead-connection branch below).
-                self.idle_connections.append(self.allocator, released_conn) catch {};
+                self.idle_connections.append(self.allocator, released_conn) catch |err| std.log.debug("[http-client] idle connection dropped ({s})", .{@errorName(err)});
             } else {
                 if (conn.stream) |stream| {
                     stream.close(self.io);
@@ -264,7 +264,7 @@ pub const HttpClient = struct {
                 if (attempt < self.retry_policy.max_retries) {
                     const delay = self.retry_policy.calculateDelay(attempt);
                     std.log.warn("Request failed, retrying in {d}ms (attempt {d}/{d})", .{ delay, attempt + 1, self.retry_policy.max_retries });
-                    std.Io.sleep(self.connection_pool.io, .{ .nanoseconds = delay * std.time.ns_per_ms }, .real) catch {};
+                    std.Io.sleep(self.connection_pool.io, .{ .nanoseconds = delay * std.time.ns_per_ms }, .real) catch |sleep_err| std.log.debug("[http-client] retry backoff sleep interrupted ({s})", .{@errorName(sleep_err)});
                 }
                 continue;
             };

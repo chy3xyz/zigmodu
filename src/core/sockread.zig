@@ -41,7 +41,7 @@ pub fn setSendTimeout(stream: std.Io.net.Stream, timeout_ms: u32) void {
         .sec = @intCast(timeout_ms / 1000),
         .usec = @intCast((timeout_ms % 1000) * 1000),
     };
-    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
+    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch |err| std.log.warn("[sockread] SO_SNDTIMEO not applied ({s}): a slow peer can block the writer indefinitely", .{@errorName(err)});
 }
 
 /// Write all of `bytes` (loops on partial writes so frames are never split).

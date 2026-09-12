@@ -63,7 +63,7 @@ pub fn cors(config: CorsConfig) api.Middleware {
     // Per-instance configuration on `user_data` (allocated once, process
     // lifetime): multiple Servers / registrations with different configs no
     // longer overwrite each other via module-level statics.
-    const cfg = std.heap.page_allocator.create(CorsConfig) catch unreachable;
+    const cfg = std.heap.page_allocator.create(CorsConfig) catch @panic("cors middleware setup: out of memory");
     cfg.* = config;
     return .{
         .func = struct {
@@ -214,7 +214,7 @@ pub fn recover() api.Middleware {
 /// token's own `exp` claim is checked) — it only matters for token GENERATION,
 /// so use `jwtAuthWithSecurity` / `AppSecurity` when you also issue tokens.
 pub fn jwtAuth(secret: []const u8) api.Middleware {
-    const secret_copy = std.heap.page_allocator.create([]const u8) catch unreachable;
+    const secret_copy = std.heap.page_allocator.create([]const u8) catch @panic("jwtAuth setup: out of memory");
     secret_copy.* = secret;
     return .{
         .func = struct {
@@ -286,6 +286,44 @@ pub const CatalogPermissionLoader = *const fn (
     input: CatalogPermLoadInput,
 ) anyerror![]u8;
 
+/// Best-effort identity for `.optional` routes: attach `user_id`/`tenant_id`/
+/// `roles` when a valid Bearer token is present, and do nothing at all when it
+/// is missing, malformed, expired or unknown. Never writes a response, never
+/// 401s — that is the whole difference from `verifyJwtLoadPermsAndNext`.
+///
+/// Failures are logged at debug level rather than swallowed silently (a bare
+/// `catch {}` is banned on this path by the project's own gate).
+pub fn attachIdentityBestEffort(sec: *SecurityModule, ctx: *api.Context) void {
+    const auth = ctx.headers.get("authorization") orelse return;
+    const token = SecurityModule.extractBearerToken(auth) orelse {
+        std.log.debug("[auth] optional route {s} {s}: malformed Authorization header", .{ ctx.method.toString(), ctx.path });
+        return;
+    };
+    const payload = sec.verifyToken(token) catch |err| {
+        std.log.debug("[auth] optional route {s} {s}: token ignored ({s})", .{ ctx.method.toString(), ctx.path, @errorName(err) });
+        return;
+    };
+    defer sec.freePayload(payload);
+
+    ctx.setAttr("user_id", payload.sub) catch |err| {
+        std.log.debug("[auth] optional route {s} {s}: user_id attr failed ({s})", .{ ctx.method.toString(), ctx.path, @errorName(err) });
+        return;
+    };
+    if (payload.aud.len > 0) {
+        ctx.setAttr("tenant_id", payload.aud) catch |err| {
+            std.log.debug("[auth] optional route {s} {s}: tenant_id attr failed ({s})", .{ ctx.method.toString(), ctx.path, @errorName(err) });
+            return;
+        };
+    }
+    if (payload.roles.len > 0) {
+        const roles_csv = joinCsv(ctx.allocator, payload.roles) catch return;
+        defer ctx.allocator.free(roles_csv);
+        ctx.setAttr("roles", roles_csv) catch |err| std.log.debug("[auth] optional route: roles attr failed ({s})", .{@errorName(err)});
+    } else {
+        ctx.setAttr("roles", "") catch |err| std.log.debug("[auth] optional route: empty roles attr failed ({s})", .{@errorName(err)});
+    }
+}
+
 fn verifyJwtLoadPermsAndNext(
     sec: *SecurityModule,
     ctx: *api.Context,
@@ -356,7 +394,7 @@ pub fn jwtAuthFromCatalog(security: *SecurityModule, slot: *comptime_router.Cata
         catalog_slot: *comptime_router.CatalogSlot,
         cfg: JwtFromCatalogConfig,
     };
-    const stored = std.heap.page_allocator.create(Store) catch unreachable;
+    const stored = std.heap.page_allocator.create(Store) catch @panic("middleware setup: out of memory");
     stored.* = .{ .sec = security, .catalog_slot = slot, .cfg = config };
     return .{
         .func = struct {
@@ -368,6 +406,11 @@ pub fn jwtAuthFromCatalog(security: *SecurityModule, slot: *comptime_router.Cata
                 }
                 if (st.catalog_slot.get()) |cat| {
                     if (cat.isPublic(ctx.method, ctx.path)) {
+                        try next(ctx);
+                        return;
+                    }
+                    if (cat.isOptionalAuth(ctx.method, ctx.path)) {
+                        attachIdentityBestEffort(st.sec, ctx);
                         try next(ctx);
                         return;
                     }
@@ -394,7 +437,7 @@ pub fn jwtAuthFromCatalogWithPermissions(
         cfg: JwtFromCatalogConfig,
         load: CatalogPermissionLoader,
     };
-    const stored = std.heap.page_allocator.create(Store) catch unreachable;
+    const stored = std.heap.page_allocator.create(Store) catch @panic("middleware setup: out of memory");
     stored.* = .{ .sec = security, .catalog_slot = slot, .cfg = config, .load = loader };
     return .{
         .func = struct {
@@ -406,6 +449,11 @@ pub fn jwtAuthFromCatalogWithPermissions(
                 }
                 if (st.catalog_slot.get()) |cat| {
                     if (cat.isPublic(ctx.method, ctx.path)) {
+                        try next(ctx);
+                        return;
+                    }
+                    if (cat.isOptionalAuth(ctx.method, ctx.path)) {
+                        attachIdentityBestEffort(st.sec, ctx);
                         try next(ctx);
                         return;
                     }
@@ -472,7 +520,7 @@ pub fn authFromCatalog(slot: *comptime_router.CatalogSlot, backend: AuthBackend,
         backend: AuthBackend,
         cfg: AuthFromCatalogConfig,
     };
-    const stored = std.heap.page_allocator.create(Store) catch unreachable;
+    const stored = std.heap.page_allocator.create(Store) catch @panic("middleware setup: out of memory");
     stored.* = .{ .catalog_slot = slot, .backend = backend, .cfg = config };
     return .{
         .func = struct {
@@ -483,6 +531,17 @@ pub fn authFromCatalog(slot: *comptime_router.CatalogSlot, backend: AuthBackend,
                     return;
                 }
                 if (st.catalog_slot.get()) |cat| {
+                    if (cat.isOptionalAuth(ctx.method, ctx.path)) {
+                        // `.optional`: verify when a token is present, attach the
+                        // identity, never reject (see Auth.optional).
+                        if (st.backend.verify(ctx)) |_| {} else |err| {
+                            std.log.debug("[auth] optional route {s} {s}: token ignored ({s})", .{
+                                ctx.method.toString(), ctx.path, @errorName(err),
+                            });
+                        }
+                        try next(ctx);
+                        return;
+                    }
                     if (cat.isPublic(ctx.method, ctx.path)) {
                         // Best-effort identity on public routes: when a token is
                         // presented, verify it so handlers may *optionally*
@@ -653,7 +712,7 @@ pub const TenantResolverConfig = struct {
 /// call `ctx.tenantId()`; with JWT auth, register after it so `aud` wins
 /// unless `override_existing` is set.
 pub fn tenantResolver(config: TenantResolverConfig) api.Middleware {
-    const stored = std.heap.page_allocator.create(TenantResolverConfig) catch unreachable;
+    const stored = std.heap.page_allocator.create(TenantResolverConfig) catch @panic("tenantResolver setup: out of memory");
     stored.* = config;
     return .{
         .func = struct {
@@ -710,7 +769,7 @@ pub fn moduleGate(slot: *comptime_router.CatalogSlot, config: ModuleGateConfig) 
         catalog_slot: *comptime_router.CatalogSlot,
         cfg: ModuleGateConfig,
     };
-    const stored = std.heap.page_allocator.create(Store) catch unreachable;
+    const stored = std.heap.page_allocator.create(Store) catch @panic("middleware setup: out of memory");
     stored.* = .{ .catalog_slot = slot, .cfg = config };
     return .{
         .func = struct {
@@ -823,6 +882,9 @@ pub fn permissionGateWith(slot: *comptime_router.CatalogSlot, config: Permission
                     try next(ctx);
                     return;
                 }
+                // `.optional` routes are public for *auth* purposes but may still
+                // carry permission/role metadata, so they fall through to the
+                // checks below exactly like `.jwt`.
                 // Route-level portal roles (RouteMeta.roles, `|` = OR): matched
                 // against the identity roles attr before fine-grained permission.
                 if (cat.rolesFor(ctx.method, ctx.path)) |route_roles| {
@@ -1717,4 +1779,106 @@ test "permissionGate enforces RouteMeta.roles before permission" {
     try allow.setAttr("roles", "ops");
     try mw.func(&allow, next, mw.user_data);
     try std.testing.expect(!allow.responded);
+}
+
+test "Auth.optional: identity when a token is valid, no 401 otherwise" {
+    const allocator = std.testing.allocator;
+    const Testkit = @import("../http/Testkit.zig");
+    const cr = @import("ComptimeRouter.zig");
+
+    const AppState = struct {};
+
+    const Api = struct {
+        pub const module_name = "profile";
+        pub const nest = .{};
+        pub const State = @This();
+
+        pub const routes = [_]cr.RouteSpec(State){
+            // Public: never sees identity in this middleware stack.
+            .{ .method = .GET, .path = "public", .handler = whoami, .meta = .{ .auth = .public } },
+            // Optional: same route code, personalized when a token is present.
+            .{ .method = .GET, .path = "optional", .handler = whoami, .meta = .{ .auth = .optional } },
+            // Required: still 401s without a token.
+            .{ .method = .GET, .path = "private", .handler = whoami, .meta = .{ .auth = .jwt } },
+        };
+
+        fn whoami(ctx: *@import("Server.zig").Context, _: *State) !void {
+            try ctx.jsonStruct(200, .{ .user = ctx.userId() });
+        }
+    };
+
+    var sec = SecurityModule.init(allocator, "optional-auth-test-secret", 3600);
+    defer sec.deinit();
+    var slot: cr.CatalogSlot = .{};
+    defer slot.deinit();
+    var app_state: AppState = .{};
+    var api_state: Api = .{};
+
+    var server = @import("Server.zig").Server.init(std.testing.io, allocator, 0);
+    defer server.deinit();
+
+    // Ordering matters (and the framework says so): middleware added *after*
+    // routes are registered is not part of those routes' chain snapshot.
+    try server.addMiddleware(jwtAuthFromCatalog(&sec, &slot, .{}));
+
+    var router = cr.Router(AppState).init(std.testing.io, allocator, &server, &app_state);
+    defer router.deinit();
+    var root = router.scope("");
+    try root.mountAll(.{.{ .Mod = Api, .state = &api_state }});
+    slot.set(try router.finish());
+
+    const token = try sec.generateTokenWithTenant("user-42", &.{"user"}, "tenant-9");
+    defer allocator.free(token);
+    const bearer = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
+    defer allocator.free(bearer);
+
+    // optional, no token → 200 with no identity
+    {
+        var resp = try Testkit.dispatch(&server, .GET, "/optional", null);
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"user\":null") != null);
+    }
+    // optional, valid token → 200 **with** identity (the whole point)
+    {
+        var opts = Testkit.DispatchOptions{};
+        opts.headers = &.{.{ "authorization", bearer }};
+        var resp = try Testkit.dispatchOpts(&server, .GET, "/optional", opts);
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"user\":\"user-42\"") != null);
+    }
+    // optional, garbage token → still 200, still anonymous (never 401)
+    {
+        var opts = Testkit.DispatchOptions{};
+        opts.headers = &.{.{ "authorization", "Bearer not-a-jwt" }};
+        var resp = try Testkit.dispatchOpts(&server, .GET, "/optional", opts);
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"user\":null") != null);
+    }
+    // public stays anonymous even with a valid token (documented difference)
+    {
+        var opts = Testkit.DispatchOptions{};
+        opts.headers = &.{.{ "authorization", bearer }};
+        var resp = try Testkit.dispatchOpts(&server, .GET, "/public", opts);
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"user\":null") != null);
+    }
+    // jwt still enforces: no token → 401
+    {
+        var resp = try Testkit.dispatch(&server, .GET, "/private", null);
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 401), resp.status_code);
+    }
+    // jwt with a valid token → 200 with identity
+    {
+        var opts = Testkit.DispatchOptions{};
+        opts.headers = &.{.{ "authorization", bearer }};
+        var resp = try Testkit.dispatchOpts(&server, .GET, "/private", opts);
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"user\":\"user-42\"") != null);
+    }
 }

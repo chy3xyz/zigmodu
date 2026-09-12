@@ -959,6 +959,40 @@ if (!report.ok()) return error.PreflightFailed;   // 不启动，胜过带病运
 - 检查之间互不影响：单个探针失败不会掩盖其它结果。
 - 参考接线：`examples/zmsaas/backend/src/main.zig`（env + secret + DB + clock）。
 
+### 公开但可个性化：`Auth.optional`（v0.15.41+）
+
+`Auth` 的三个值语义要分清，选错会得到"游客拿不到身份"或"游客被 401"：
+
+| 值 | 验签 | 身份注入 | 适用 |
+|----|------|----------|------|
+| `.public` | 跳过 | **无**（`ctx.userId()` 恒空） | 纯公开数据（健康检查、公开列表） |
+| `.optional` | 有 token 就验，失败忽略 | 有效 token → 注入 `user_id`/`tenant_id`/`roles` | **公开但可个性化**：C 端用户中心、按用户灰度的公开接口、公开详情的"是否已收藏" |
+| `.jwt` | 必须 | 必须 | 私有接口；无 token 401 |
+
+```zig
+.{ .method = .GET, .path = "products/{id}", .handler = detail, .meta = .{ .auth = .optional } }
+// handler 里照常 ctx.userId()：有 token 有值，没 token 就是 null，绝不会 401
+```
+
+不要再用"handler 里手写 token 解析"或"给公开接口再挂一条 jwt 路由"来绕过。
+`.optional` 仍可带 `permission` / `roles` 元数据（`permissionGate` 不会把它当 public 短路）。
+
+### `unreachable` / `assert` 的分类原则（v0.15.41+）
+
+这两个构造的选择标准是**"这个失败是不是来自外部输入或环境"**：
+
+| 情形 | 用什么 | 例子 |
+|------|--------|------|
+| 内部状态机的不变式（构造上不可能） | `=> unreachable`（switch 穷举） | 熔断器 `CLOSED => unreachable`（`canAccept` 已保证） |
+| **环境失败**（OOM、socket 选项、syscall） | 显式 error，或 `@panic("可读原因")` | 中间件构造期的 `page_allocator.create` → `catch @panic("…: out of memory")` |
+| 请求路径上的任何"不可能" | 返回错误（`respondErr`），不许 `unreachable` | `zmodu audit` **b19** 会拦 |
+| 测试里的前提 | `try` / `error.TestUnexpectedResult` | 解析刚写入的值 |
+
+`ReleaseFast` 下 `unreachable` 是 UB、`ReleaseSafe` 是 abort 且没有上下文——所以
+"能说出原因"的 panic 也比裸 `unreachable` 好。CI 门禁 `scripts/check-production.sh`
+按前缀分层强制这一规则（`src/api|core|http|metrics|messaging|scheduler|security`），
+其余目录先告警、逐步收紧。
+
 ### JWT 密钥轮换（kid，v0.15.36+）
 
 不带 keyring 时签发的 token 头部 `kid` 为空，换密钥只能"全部重启 + 所有人重登"。

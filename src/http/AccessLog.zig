@@ -210,7 +210,7 @@ pub fn accessLogMiddleware(logger: *AccessLogger) api.MiddlewareFn {
                     .response_size = 0,
                     .user_agent = ctx.header("User-Agent"),
                     .client_ip = null,
-                }) catch {};
+                }) catch |log_err| std.log.debug("[access-log] entry dropped ({s})", .{@errorName(log_err)});
                 return err;
             };
 
@@ -225,7 +225,7 @@ pub fn accessLogMiddleware(logger: *AccessLogger) api.MiddlewareFn {
                 .response_size = 0,
                 .user_agent = ctx.header("User-Agent"),
                 .client_ip = null,
-            }) catch {};
+            }) catch |err| std.log.debug("[access-log] entry dropped ({s})", .{@errorName(err)});
         }
     };
 

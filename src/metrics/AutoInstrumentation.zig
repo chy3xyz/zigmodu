@@ -177,7 +177,7 @@ pub const AutoInstrumentation = struct {
             span.status = .OK;
         }
 
-        span.addEvent(self.allocator, "api_request_complete") catch {};
+        span.addEvent(self.allocator, "api_request_complete") catch |err| std.log.debug("[metrics] span event dropped ({s})", .{@errorName(err)});
         self.tracer.endSpan(span);
 
         std.log.info("[AutoInstrumentation] API call done, duration: {d:.3}s, status: {s}", .{

@@ -255,11 +255,11 @@ pub fn serveAfterPrefacePrefetchReader(
                                 };
                                 var it = streams.valueIterator();
                                 while (it.next()) |st| {
-                                    st.flow.applyPeerInitialWindowSize(new_initial) catch {};
+                                    st.flow.applyPeerInitialWindowSize(new_initial) catch |err| std.log.debug("[h2] window-size update ignored ({s})", .{@errorName(err)});
                                 }
                                 var pit = outbound.pending.valueIterator();
                                 while (pit.next()) |p| {
-                                    p.flow.applyPeerInitialWindowSize(new_initial) catch {};
+                                    p.flow.applyPeerInitialWindowSize(new_initial) catch |err| std.log.debug("[h2] window-size update ignored ({s})", .{@errorName(err)});
                                 }
                             },
                             Http2.SettingsId.max_frame_size => {
@@ -311,7 +311,7 @@ pub fn serveAfterPrefacePrefetchReader(
             .rst_stream => {
                 const sid = frame.header.stream_id;
                 if (sid != 0) {
-                    _ = Http2.decodeRstStream(frame.payload) catch {};
+                    _ = Http2.decodeRstStream(frame.payload) catch |err| std.log.debug("[h2] malformed RST_STREAM ignored ({s})", .{@errorName(err)});
                     abortStream(&outbound, &priority_tree, &streams, allocator, sid);
                 }
             },
