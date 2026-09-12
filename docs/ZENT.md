@@ -1,7 +1,7 @@
 # ZigModu × zent 最佳实践
 
 **zent**: [chy3xyz/zent](https://github.com/chy3xyz/zent) — Zig 版 [ent](https://entgo.io/)（schema-as-code ORM）  
-**版本口径**: zent **v0.37.0**（池阻塞等待 + 嵌套预加载批量化；0.36 起迁移默认加锁、outbox 认领新增 `claimed_at`，见 §14；示例与本文按最新发布演示；最低兼容 v0.13 起）· ZigModu **v0.15.22+** · Zig **≥ 0.17**  
+**版本口径**: zent **v0.39.2**（0.38 起 `queryTargets*` fail-closed、新增宽松扫描器；0.39 起 `zent.scope` 让裸 SQL 也走同一套读契约，见 §14/§15；示例与本文按最新发布演示；最低兼容 v0.13 起）· ZigModu **v0.15.22+** · Zig **≥ 0.17**  
 **主推组合**: **电商 / 社交类项目默认选 ZigModu + zent**（见 §2 决策表与 §4.8 场景能力矩阵）；只有存量 SQL 繁重、报表主导或 DBA 强管控的项目才默认 sqlx。
 
 **参考实现**: [`examples/zent-modulith/`](../examples/zent-modulith/)  
@@ -214,9 +214,24 @@ zent 是 ent-style：**关系走 Edges 预加载，不做跨表 JOIN 查询**（
 
 1. **优先**：`client.product.Query()` 拿本表数据 + `WithEdge` 组装，或 `CountBy` / `Sum` / `GroupBy` 做单表聚合。
 2. **复杂报表**：用 zent driver 裸 SQL（`client.driver.query(...)`）或 zigmodu `data.sqlx` 写 JOIN —— **不要在 zent 与 sqlx 之间共享事务**（见 §1 定位；报表只读连接可独立）。
+
+   ⚠️ **裸 SQL 的安全前提（v0.39 起）**：手写语句**不会**自动带上软删 / 隐私策略 /
+   拦截器谓词——`client.driver.query()` 绕过了整条读契约，租户过滤会被静默跳过。
+   必须在手写语句里用 `zent.scope` 拼上同一份契约：
+
+   ```zig
+   const scope = zent.scope.forClient(persist.infos, "product", &client.product, .{});
+   const frag = try scope.withClause(allocator);   // 软删 → 隐私 → 拦截器
+   defer allocator.free(frag);
+   const sql = try std.fmt.allocPrint(allocator, "SELECT id, name FROM product WHERE 1=1 {s} ORDER BY id", .{frag});
+   ```
+
+   带策略的表若没有 `privacy_ctx`，`withClause` 直接返回 `error.PrivacyDenied`
+   （fail-closed），而不是给你一段"没有过滤"的 SQL。`:alias` 会对每个注入谓词做限定，
+   JOIN 时不会歧义；`table` 是 comptime 参数，写错表名是**编译错误**。
 3. 报表查询建议独立 `report/` 模块持有自己的 `sqlx.Client`，与写路径（zent）解耦，避免把复杂 SQL 混进 domain 模块。
 
-### 4.8 电商 / 社交主推能力矩阵（zent v0.30–v0.37）
+### 4.8 电商 / 社交主推能力矩阵（zent v0.30–v0.39）
 
 这两版把电商/社交最常见的「钱、幂等、列表、可见性」四类痛点补成了一等能力，是主推组合的直接理由：
 
@@ -514,7 +529,7 @@ pub const CatalogStore = struct {
 
 ## 11. 依赖接入
 
-zent **v0.37.0** 提供 `build.zig.zon`（模块名 `zent`；生产 pin git tag，本地开发可换 path 依赖）。
+zent **v0.39.2** 提供 `build.zig.zon`（模块名 `zent`；生产 pin git tag，本地开发可换 path 依赖）。
 
 **本地 sibling（开发）：**
 
@@ -533,7 +548,7 @@ exe_mod.addImport("zent", zent_dep.module("zent"));
 
 ```zon
 .zent = .{
-    .url = "https://github.com/chy3xyz/zent/archive/refs/tags/v0.37.0.tar.gz",
+    .url = "https://github.com/chy3xyz/zent/archive/refs/tags/v0.39.2.tar.gz",
     .hash = "<zig fetch 后填入>",
 },
 ```
@@ -583,6 +598,8 @@ zig_ws/
 
 | 主题 | 动作 / 新特性 |
 |------|--------------|
+| **v0.39.0 `zent.scope` + 宽松扫描器 + `zent.version`** | ① `zent.scope.forClient(infos, table, &client.entity, opts)` 把与 fluent 路径**同一份**读契约（软删 → 隐私 → 拦截器）渲染成 SQL 片段，供手写语句 splice —— 此前裸 SQL 会静默跳过租户/隐私过滤（本文件 §4.7 已补警告）。带策略的表缺 `privacy_ctx` → `error.PrivacyDenied`。② `queryAllLenient` / `queryOneLenient` 把 v0.38 的宽松扫描带到查询层（NULL/缺列 → 保留字段默认值，而非 `error.TypeMismatch`），适合 LEFT JOIN/DTO。③ `<col>Contains` 的诚实名字 `<col>Like`（`Contains` 保留为别名，不破坏）。④ `zent.version` 让消费侧校验版本而不必比对 git 提交。 |
+| **v0.38.0 `queryTargets*` 改为 fail-closed（BREAKING）** | 旧行为（目标只过滤软删、**不带**租户/隐私/拦截器）与 `WithEdge` 的读契约不一致，是真实的跨租户泄漏面。现在两个批量邻居读取器都走同一份 `appendTargetScopePreds`，目标带策略而无上下文时返回 `error.PrivacyDenied`；旧的"仅软删"语义保留在显式命名的 `queryTargetsUnscoped` / `queryTargetsByValueUnscoped`（**用它们就等于声明放弃隔离**，评审要写明理由）。同时新增 NULL 容忍扫描器 `scanRowLenient*` / `scanRowNamedLenient*`（LEFT JOIN、聚合输出、可空 DTO 的第二契约），严格扫描器不变。迁移步骤：zent `UPGRADING.md` §11。 |
 | **v0.37.0 池阻塞等待 + 嵌套预加载** | `Options.max_wait_ms` 不再形同虚设：非 0 时 `borrow` 会在池条件变量上等待（由 `release` 唤醒），预算耗尽才 `error.PoolExhausted`，之后仍回落到原有 `max_retries` 路径；`max_wait_ms = 0`（默认）语义与旧版完全一致（非阻塞）。**升级自查**：此前"传了但无效"的 `max_wait_ms` 现在真的会排队。`ConnPool.deinit` 的调用约定明确要求静默期——不能靠 deinit 打断正在等待（parked）的借用者。`WithEdge("posts.comments")` 这类嵌套预加载从"每父实体一次查询"改为**每层一次查询**（实测 3 所有者两级 = 3 条语句），行为不变但 N+1 消失。 |
 | **v0.36.0 迁移默认加锁 / outbox 认领可恢复 / 建表要求 allocator** | ① `MigrateOptions.lock_timeout_ms` 默认 10s，PG 用 `pg_advisory_lock`、MySQL 用 `GET_LOCK`，并发实例串行化，超时 `error.MigrationLockTimeout`（不支持/被拒时降级为告警继续）；已应用文件迁移的 checksum 会与磁盘比对，改动过的迁移报 `error.MigrationChecksumMismatch`。② outbox 认领新增可空 `claimed_at` 列（**存量库需迁移**；`migrateSchema` 会自动补列），崩溃在 publish 中途的行不再永久卡在 `processing`——用 `Outbox.requeueStale(allocator, client, older_than_secs)` 定期回收（示例已接：`examples/zent-modulith` 的 dispatcher 每次派发前先回收）。③ `createAllTables` / `createTables` 现在第一个参数是 allocator（不再内部用 page_allocator）。 |
 | **v0.35.0 认领式 outbox 派发 + 边写入** | `Outbox.claim` 原子地把一批行从 `pending` 置为 `processing`（PG/SQLite 单条 `UPDATE … RETURNING`，PG 加 `FOR UPDATE SKIP LOCKED`；MySQL 走事务内的 `SELECT … FOR UPDATE SKIP LOCKED` + `UPDATE`），并发 dispatcher 不会再重复发布同一行；`pending` 保留为只读路径。`UpdateBuilder` 新增 `AddEdgeIDs` / `RemoveEdgeIDs` / `SetEdgeIDs` / `ClearEdge`，M2M 写关联表、o2m/o2o 走目标表 FK，非空 FK 拒绝 detach（错误在编译期）。 |
@@ -627,6 +644,9 @@ zig_ws/
 | 迁移默认加锁 + checksum 校验（0.36） | 多实例滚动发布同时启动 | 角色没有 advisory lock 权限时：PG 会降级为告警继续（**要确认是"继续"还是"锁失败"**）；已应用迁移文件一旦被改动即 `error.MigrationChecksumMismatch`——**不要改历史迁移** |
 | `StorageKey`（0.36） | 采用 zent 但既有库表列名不合字段命名规范（`user_name` vs `userName`） | 一旦使用，字段名与列名分叉：`whereEq`、谓词、DDL 都用**字段名**，只有物理列名不同——排障时以 `codegen.graph.columnName` 为准 |
 | `queryTargetsByValue`（0.36） | 主键是 UUID / 文本的实体也要遍历边 | `queryTargets` 仍是 i64 专用包装；两者语义一致（空列表短路、目标软删过滤、调用方拥有结果） |
+| `zent.scope.forClient` + `withClause`（0.39） | 手写 SQL（报表/JOIN）要保住租户与隐私过滤 | 别把它当"可选装饰"：带策略的表没上下文会 `PrivacyDenied`，这正是 fail-closed 的意义；`table` 是 comptime，别名/表名写错当场报错 |
+| `queryTargets` / `queryTargetsByValue`（0.38 起 fail-closed） | 一次性批量读邻居实体，且希望与 `WithEdge` 同样的租户/隐私作用域 | 真需要"不加隔离"时必须显式改叫 `*Unscoped`，并在评审里说明理由——别为了绕过 `PrivacyDenied` 无脑替换 |
+| `scanRowNamedLenient*` / `queryAllLenient`（0.38/0.39） | LEFT JOIN、聚合输出、字段可空的 DTO | 实体读仍用严格扫描器：非空列出现 NULL 说明行不符合 schema，宽松化会把"数据坏了"变成静默默认值 |
 | `BulkInsert` 分片 + `chunkRows(n)`（0.36） | 批量插入行数大（SQLite <3.32 的参数上限 999；MySQL `max_allowed_packet`） | 分片后仍是多次语句：**要么整批在事务里**，要么接受部分成功；`chunkRows` 只在你明确要控制语句大小时才用 |
 | 池阻塞等待 `max_wait_ms`（0.37） | 可以接受排队而不是立刻失败（推荐配 3–5s 的预算 + 指标） | 默认 `0` = 非阻塞（旧语义）。**`ConnPool.deinit` 要求静默期**：不能拿 deinit 去打断正在 parked 的借用者，必须确保没有线程在 `borrow`/`release`/`asDriver` 中 |
 | 嵌套预加载每层一次查询（0.37） | `WithEdge("posts.comments")` 这类两级加载，之前是 N+1 | 语义没变但**要记住预加载目标的读契约**：只过滤软删，**不带租户/行级隐私作用域**——跨租户数据不能靠预加载来"顺带"过滤，需要在父查询或目标查询上显式加谓词 |

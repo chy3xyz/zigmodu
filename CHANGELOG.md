@@ -1,5 +1,21 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- **zent 适配 v0.37.0 → v0.39.2**：`examples/zent-modulith` 的 pin 升到发布 tag
+  （`?ref=v0.39.2#1fbf86c`）。两个 minor 带来：
+  - **BREAKING（0.38）**：`queryTargets` / `queryTargetsByValue` 改为 **fail-closed**
+    （软删 → 隐私 → 拦截器，与 `WithEdge` 同契约）；旧的"仅软删"语义改名为
+    `queryTargetsUnscoped` / `queryTargetsByValueUnscoped`。目标表带策略而无
+    `privacy_ctx` 时返回 `error.PrivacyDenied` 而不是静默跳过过滤。
+  - **安全（0.39）**：新增 `zent.scope`，让**手写 SQL** 也能拼上同一份读契约；
+    此前裸 SQL 会静默绕过租户/隐私过滤。`<col>Like`（`Contains` 的诚实名字）、
+    NULL 容忍扫描器（`scanRow*Lenient` / `queryAllLenient`）、`zent.version`。
+- **文档同步**：`docs/ZENT.md` §4.7 补"裸 SQL 的安全前提（必须接 `zent.scope`）"，
+  §14 兼容表新增 0.38/0.39 两条升级注意，§15 增加三条使用边界（scope、fail-closed
+  邻居读取、宽松扫描器的适用面），版本口径与依赖示例更新到 v0.39.2。
+
 ## [0.15.39] - 2026-09-12
 
 ### Changed

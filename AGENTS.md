@@ -345,7 +345,7 @@ bash scripts/ci-integration.sh   # tenant-mgmt + stress + shopdemo（-Ddb=sqlite
 - Sandbox cache：`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`.
 - Auth Path A + `CatalogPermLoadInput` 已落地；legacy JWT 只写 `auth_info`。
 - x402 fail-closed；OTLP/Vault 已支持 HTTPS（系统 CA）。
-- zent v0.37.0 与 `data.sqlx` 正交，勿混驱动/共享事务（`docs/ZENT.md`）；`examples/zent-modulith` 按 v0.37.0 能力演示（v0.13 起向后兼容）。v0.32.3 起 sqlite 单连接访问串行化（`Rows` 持锁至 `deinit()`）；v0.33.0 起 `UseInterceptor` 覆盖 Create/BulkInsert（create 上 `whereEq` = 缺省才填）；v0.35.0 起 outbox 认领式派发（崩溃遗留用 `requeueStale` 回收）；v0.36.0 起迁移默认加锁、outbox 新增 `claimed_at` 列、`createAllTables` 增加 allocator 参数；v0.37.0 起 `max_wait_ms` 真正阻塞等待、嵌套预加载每层一次查询。升级依赖后**先删 `.zig-cache` 重建**（增量缓存可能沿用旧 fetch 模块，本次适配实测踩中）。
+- zent v0.39.2 与 `data.sqlx` 正交，勿混驱动/共享事务（`docs/ZENT.md`）；`examples/zent-modulith` 按 v0.39.2 能力演示（v0.13 起向后兼容）。v0.32.3 起 sqlite 单连接访问串行化（`Rows` 持锁至 `deinit()`）；v0.33.0 起 `UseInterceptor` 覆盖 Create/BulkInsert（create 上 `whereEq` = 缺省才填）；v0.35.0 起 outbox 认领式派发（崩溃遗留用 `requeueStale` 回收）；v0.36.0 起迁移默认加锁、outbox 新增 `claimed_at` 列、`createAllTables` 增加 allocator 参数；v0.37.0 起 `max_wait_ms` 真正阻塞等待、嵌套预加载每层一次查询；v0.38.0 起 `queryTargets*` fail-closed（旧语义改名 `*Unscoped`），新增 NULL 容忍扫描器；v0.39.0 起 `zent.scope` 让手写 SQL 也能带上软删/隐私/拦截器契约（**裸 SQL 不再自动隔离，必须接 scope**），并有 `<col>Like` 与 `zent.version`。升级依赖后**先删 `.zig-cache` 重建**（增量缓存可能沿用旧 fetch 模块，本次适配实测踩中）。
 - SQLx 选择性链接：`-Ddb=` / `.db=`，默认 `all`；框架测试勿收窄；见 `docs/SQLX_DRIVERS.md`。
 - WS：`WsMessageFn` 含 `WsFrameKind`；fiber/io_uring 分发 text+binary（OpenIM protobuf OK）。
 - CI：`bash scripts/ci-integration.sh`（tenant-mgmt + stress + shopdemo，`-Ddb=sqlite`）。
