@@ -79,7 +79,7 @@ pub fn InventoryApi(comptime Client: type) type {
         fn get(ctx: *http.Context, self: *State) !void {
             const product_id = try ctx.paramInt(i64, "product_id");
             var inv = (try findByProduct(self.client, product_id)) orelse return http.respondErr(ctx, error.NotFound);
-            defer zent.codegen.deinitEntity(persist.infos, persist.InventoryInfo, &inv, self.client.allocator);
+            defer self.client.inventory.deinitRow(&inv);
             try ctx.jsonStruct(200, .{ .product_id = product_id, .stock = inv.stock, .version = inv.version });
         }
 
@@ -87,7 +87,7 @@ pub fn InventoryApi(comptime Client: type) type {
             const q = http.extractQuery(ctx, DecrementQ) catch |err| return http.respondErr(ctx, err);
             if (q.qty <= 0) return http.respondErr(ctx, error.InvalidQuantity);
             var inv = (try findByProduct(self.client, q.product_id)) orelse return http.respondErr(ctx, error.NotFound);
-            defer zent.codegen.deinitEntity(persist.infos, persist.InventoryInfo, &inv, self.client.allocator);
+            defer self.client.inventory.deinitRow(&inv);
 
             const ec = self.client.inventory;
             var u = ec.Update();
@@ -133,11 +133,8 @@ pub fn FeedApi(comptime Client: type) type {
             var q = self.client.author.Query();
             defer q.deinit();
             _ = try q.WithEdge("posts.comments");
-            const rows = try q.All();
-            defer {
-                for (rows.items) |*a| zent.codegen.deinitEntity(persist.infos, persist.AuthorInfo, a, self.client.allocator);
-                rows.deinit();
-            }
+            var rows = try q.All();
+            defer self.client.author.deinitRows(&rows); // page + list, one call
             const arr = try maskedArrayJson(self.client.allocator, persist.infos, persist.AuthorInfo, rows.items);
             defer self.client.allocator.free(arr);
             const body = try std.fmt.allocPrint(self.client.allocator, "{{\"authors\":{s}}}", .{arr});
@@ -172,11 +169,8 @@ pub fn FeedApi(comptime Client: type) type {
             }
             _ = qb.Limit(page_size);
 
-            const rows = try qb.All();
-            defer {
-                for (rows.items) |*c| zent.codegen.deinitEntity(persist.infos, persist.CommentInfo, c, self.client.allocator);
-                rows.deinit();
-            }
+            var rows = try qb.All();
+            defer self.client.comment.deinitRows(&rows);
             const CommentEntity = zent.codegen.entity(persist.infos, persist.CommentInfo);
             const last: ?CommentEntity = if (rows.items.len > 0) rows.items[rows.items.len - 1] else null;
             const arr = try maskedArrayJson(self.client.allocator, persist.infos, persist.CommentInfo, rows.items);
@@ -229,11 +223,8 @@ pub fn FeedApi(comptime Client: type) type {
             var q = self.client.post.Query();
             defer q.deinit();
             _ = q.WithTrashed();
-            const rows = try q.All();
-            defer {
-                for (rows.items) |*p| zent.codegen.deinitEntity(persist.infos, persist.PostInfo, p, self.client.allocator);
-                rows.deinit();
-            }
+            var rows = try q.All();
+            defer self.client.post.deinitRows(&rows);
             const arr = try maskedArrayJson(self.client.allocator, persist.infos, persist.PostInfo, rows.items);
             defer self.client.allocator.free(arr);
             const body = try std.fmt.allocPrint(self.client.allocator, "{{\"trashed\":{s}}}", .{arr});
@@ -269,7 +260,7 @@ pub fn SummaryApi(comptime Client: type) type {
             _ = q.Select(&.{ "id", "name", "price_cents" });
             const rows = try q.All();
             defer {
-                for (rows.items) |*p| zent.codegen.deinitEntity(persist.infos, persist.ProductInfo, p, self.client.allocator);
+                for (rows.items) |*p| self.client.product.deinitRow(p);
                 rows.deinit();
             }
             const arr = try maskedArrayJson(self.client.allocator, persist.infos, persist.ProductInfo, rows.items);
@@ -371,7 +362,7 @@ pub fn UpsertApi(comptime Client: type) type {
             // Conflict on the `sku` business key → update stock/price in place
             // (PG/SQLite ON CONFLICT (sku) DO UPDATE; MySQL ODKU).
             var row = b.SaveOrUpdateOn(&.{"sku"}) catch |err| return http.respondErr(ctx, err);
-            defer zent.codegen.deinitEntity(persist.infos, persist.SkuStockInfo, &row, self.client.allocator);
+            defer self.client.sku_stock.deinitRow(&row);
             try ctx.jsonStruct(200, .{ .sku = body.sku, .stock = row.stock, .price = row.price });
         }
 
@@ -501,7 +492,7 @@ pub fn InterceptorApi(comptime Client: type) type {
                 std.log.err("[tenant-injection] create failed: {s}", .{@errorName(err)});
                 return http.respondErr(ctx, err);
             };
-            defer zent.codegen.deinitEntity(persist.infos, persist.ProductInfo, &row, self.client.allocator);
+            defer self.client.product.deinitRow(&row);
             try ctx.jsonStruct(201, .{ .id = row.id, .tenant_id = row.tenant_id, .name = row.name });
         }
 
@@ -511,7 +502,7 @@ pub fn InterceptorApi(comptime Client: type) type {
             defer q.deinit();
             const rows = q.All() catch |err| return http.respondErr(ctx, err);
             defer {
-                for (rows.items) |*p| zent.codegen.deinitEntity(persist.infos, persist.ProductInfo, p, self.client.allocator);
+                for (rows.items) |*p| self.client.product.deinitRow(p);
                 rows.deinit();
             }
             const arr = try maskedArrayJson(self.client.allocator, persist.infos, persist.ProductInfo, rows.items);

@@ -1,5 +1,21 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- **zent 适配 v0.39.2 → v0.41.1**（pin 升到发布 tag `?ref=v0.41.1#2611ade`）：
+  - **采用 v0.40 的一行式释放**：示例里 23 处手写 `zent.codegen.deinitEntity(infos, info, &e, alloc)`
+    （含 5 处 `for (...) deinitEntity; list.deinit()` 手写循环）全部改为生成客户端的
+    `client.<entity>.deinitRow(&e)` / `deinitRows(&rows)`；整页释放需要把 `const rows` 改为
+    `var rows`（helper 会重置调用方的列表并使其可复用）。
+  - v0.41.0：`crud_helpers.queryRows` 被明确为**裸路径**（与 `driver.query` 同类，不带你配的
+    软删/隐私/拦截器），必须用 `zent.scope` 组合 —— 已补进 `docs/ZENT.md` §15。
+  - v0.41.1：修复 0.40.0 把 `deinitRows(rows: anytype)` 收窄成只认值、导致传 `&rows` 编译失败的
+    回归；这条与本仓库「anytype 形参的契约写法」的规矩同源，已写进 §14。
+- 文档：`docs/ZENT.md` 版本口径 / §14 兼容表（新增 0.40/0.41 三条）/ §15 使用边界、
+  `AGENTS.md`、示例 README 同步；四个 zent 示例全部重建通过，zent-modulith 运行时
+  实测（嵌套预加载 / 列表释放 / 裸 SQL 搜索 / 事务）零错误。
+
 ## [0.15.43] - 2026-09-12
 
 ### Added

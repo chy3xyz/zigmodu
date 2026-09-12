@@ -159,7 +159,7 @@ pub fn CrudApi(
             // NOTE: defer must be at function scope — a defer inside the
             // `if` body runs before jsonStruct below and would serialize
             // already-freed strings (visible as garbage names in responses).
-            defer if (found) |*e| zent.codegen.deinitEntity(infos, info, e, ctx.allocator);
+            defer if (found) |*e| self.svc.client.deinitRow(e);
             if (found) |e| {
                 try ctx.jsonStruct(200, e);
             } else {

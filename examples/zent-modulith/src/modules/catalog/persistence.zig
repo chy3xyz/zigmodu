@@ -81,12 +81,7 @@ pub const CatalogStore = struct {
         const preds = self.client.product.predicates;
         _ = try q.Where(.{ preds.tenant_idEQ(.{ .int = tenant_id }), preds.nameContainsEscaped(needle) });
         var found = try q.All();
-        defer {
-            for (found.items) |*p| {
-                zent.codegen.deinitEntity(infos, ProductInfo, p, self.allocator);
-            }
-            found.deinit();
-        }
+        defer self.client.product.deinitRows(&found);
         var out = try self.allocator.alloc(ProductRow, found.items.len);
         errdefer self.allocator.free(out);
         for (found.items, 0..) |*p, i| {

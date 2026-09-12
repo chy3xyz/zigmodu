@@ -76,7 +76,7 @@ pub fn OrderApi(comptime Client: type) type {
                 defer qp.deinit();
                 _ = try qp.Where(.{tx.client.product.predicates.idEQ(.{ .int = q.product_id })});
                 var p = (try qp.First()) orelse return http.respondErr(ctx, error.NotFound);
-                defer zent.codegen.deinitEntity(persist.infos, persist.ProductInfo, &p, self.client.allocator);
+                defer self.client.product.deinitRow(&p);
                 break :blk p.price_cents;
             };
             const total_cents = price_cents * q.qty;
@@ -90,7 +90,7 @@ pub fn OrderApi(comptime Client: type) type {
                 _ = try b.setFieldValue("total_cents", total_cents);
                 _ = try b.setFieldValue("status", "pending");
                 var row = try b.Save();
-                defer zent.codegen.deinitEntity(persist.infos, persist.OrderInfo, &row, self.client.allocator);
+                defer self.client.order.deinitRow(&row);
                 break :blk row.id;
             };
 
@@ -141,7 +141,7 @@ pub fn OrderApi(comptime Client: type) type {
             defer q.deinit();
             _ = try q.Where(.{self.client.order.predicates.idEQ(.{ .int = id })});
             var row = (try q.First()) orelse return http.respondErr(ctx, error.NotFound);
-            defer zent.codegen.deinitEntity(persist.infos, persist.OrderInfo, &row, self.client.allocator);
+            defer self.client.order.deinitRow(&row);
             try ctx.jsonStruct(200, row);
         }
     };
@@ -190,7 +190,7 @@ pub fn AccountApi(comptime Client: type) type {
             _ = try b.setFieldValue("name", q.name);
             _ = try b.setFieldValue("api_key", q.api_key);
             var row = try b.Save();
-            defer zent.codegen.deinitEntity(persist.infos, persist.AccountInfo, &row, self.client.allocator);
+            defer self.client.account.deinitRow(&row);
             try ctx.jsonStruct(201, .{ .id = row.id });
         }
 
@@ -200,7 +200,7 @@ pub fn AccountApi(comptime Client: type) type {
             defer q.deinit();
             _ = try q.Where(.{self.client.account.predicates.idEQ(.{ .string = id })});
             var row = (try q.First()) orelse return http.respondErr(ctx, error.NotFound);
-            defer zent.codegen.deinitEntity(persist.infos, persist.AccountInfo, &row, self.client.allocator);
+            defer self.client.account.deinitRow(&row);
             const masked = try zent.codegen.toMaskedJson(ctx.allocator, persist.infos, persist.AccountInfo, row);
             defer ctx.allocator.free(masked);
             try ctx.json(200, masked);

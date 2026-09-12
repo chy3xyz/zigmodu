@@ -65,7 +65,7 @@ pub fn main(init: std.process.Init) !void {
         _ = try b.setFieldValue("dept_id", @as(i64, seed[2]));
         _ = try b.setFieldValue("title", seed[3]);
         var row = try b.Save();
-        zent.codegen.deinitEntity(catalog.persistence.infos, catalog.persistence.DocInfo, &row, allocator);
+        env.client.doc.deinitRow(&row); // zent v0.40+: one-call release
     }
 
     // Commerce + social demos: Inventory (atomic stock decrement) and a
@@ -75,7 +75,7 @@ pub fn main(init: std.process.Init) !void {
         defer b.deinit();
         _ = try b.setFieldValue("name", "alice");
         var row = try b.Save();
-        defer zent.codegen.deinitEntity(catalog.persistence.infos, catalog.persistence.AuthorInfo, &row, allocator);
+        defer env.client.author.deinitRow(&row);
         break :id row.id;
     };
     const post_a = id: {
@@ -84,7 +84,7 @@ pub fn main(init: std.process.Init) !void {
         _ = try b.setFieldValue("author_id", alice_id);
         _ = try b.setFieldValue("title", "hello-zent");
         var row = try b.Save();
-        defer zent.codegen.deinitEntity(catalog.persistence.infos, catalog.persistence.PostInfo, &row, allocator);
+        defer env.client.post.deinitRow(&row);
         break :id row.id;
     };
     const post_b = id: {
@@ -93,7 +93,7 @@ pub fn main(init: std.process.Init) !void {
         _ = try b.setFieldValue("author_id", alice_id);
         _ = try b.setFieldValue("title", "nested-edges");
         var row = try b.Save();
-        defer zent.codegen.deinitEntity(catalog.persistence.infos, catalog.persistence.PostInfo, &row, allocator);
+        defer env.client.post.deinitRow(&row);
         break :id row.id;
     };
     // Comments carry explicit created_at values so the keyset-cursor demo has
@@ -107,7 +107,7 @@ pub fn main(init: std.process.Init) !void {
         _ = try b.setFieldValue("created_at", @as(i64, seed[2]));
         _ = try b.setFieldValue("hidden", @as(bool, seed[3]));
         var row = try b.Save();
-        zent.codegen.deinitEntity(catalog.persistence.infos, catalog.persistence.CommentInfo, &row, allocator);
+        env.client.comment.deinitRow(&row);
     }
     // Third visible comment on post_a so the edge Limit(2) is observable
     // (newest two visible only)…
@@ -119,7 +119,7 @@ pub fn main(init: std.process.Init) !void {
         _ = try b.setFieldValue("created_at", @as(i64, 300));
         _ = try b.setFieldValue("hidden", @as(bool, false));
         var row = try b.Save();
-        zent.codegen.deinitEntity(catalog.persistence.infos, catalog.persistence.CommentInfo, &row, allocator);
+        env.client.comment.deinitRow(&row);
     }
     // …and a hidden "spam" comment that must never be eager-loaded.
     {
@@ -130,7 +130,7 @@ pub fn main(init: std.process.Init) !void {
         _ = try b.setFieldValue("created_at", @as(i64, 400));
         _ = try b.setFieldValue("hidden", @as(bool, true));
         var row = try b.Save();
-        zent.codegen.deinitEntity(catalog.persistence.infos, catalog.persistence.CommentInfo, &row, allocator);
+        env.client.comment.deinitRow(&row);
     }
     {
         var b = try env.client.inventory.Create();
@@ -138,7 +138,7 @@ pub fn main(init: std.process.Init) !void {
         _ = try b.setFieldValue("product_id", @as(i64, 1));
         _ = try b.setFieldValue("stock", @as(i64, 100));
         var row = try b.Save();
-        zent.codegen.deinitEntity(catalog.persistence.infos, catalog.persistence.InventoryInfo, &row, allocator);
+        env.client.inventory.deinitRow(&row);
     }
     // Distributed-id demo: account with a time-ordered uuidv7 primary key and
     // a Sensitive api_key (never serialized raw).
@@ -153,7 +153,7 @@ pub fn main(init: std.process.Init) !void {
         _ = try b.setFieldValue("name", "alice-api");
         _ = try b.setFieldValue("api_key", "sk-live-secret-123");
         var row = try b.Save();
-        zent.codegen.deinitEntity(catalog.persistence.infos, catalog.persistence.AccountInfo, &row, allocator);
+        env.client.account.deinitRow(&row);
         std.log.info("[seed] account id={s} (api_key masked on read)", .{id_str});
     }
 

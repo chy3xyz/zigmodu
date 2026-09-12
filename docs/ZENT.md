@@ -1,7 +1,7 @@
 # ZigModu × zent 最佳实践
 
 **zent**: [chy3xyz/zent](https://github.com/chy3xyz/zent) — Zig 版 [ent](https://entgo.io/)（schema-as-code ORM）  
-**版本口径**: zent **v0.39.2**（0.38 起 `queryTargets*` fail-closed、新增宽松扫描器；0.39 起 `zent.scope` 让裸 SQL 也走同一套读契约，见 §14/§15；示例与本文按最新发布演示；最低兼容 v0.13 起）· ZigModu **v0.15.22+** · Zig **≥ 0.17**  
+**版本口径**: zent **v0.41.1**（0.40 起一行式实体释放 `deinitRows`/`deinitRow`/`deinitEdgeRows`，0.41 补齐指针形态；0.38 起 `queryTargets*` fail-closed；0.39 起 `zent.scope` 让裸 SQL 也走同一套读契约，见 §14/§15；最低兼容 v0.13 起）· ZigModu **v0.15.22+** · Zig **≥ 0.17**  
 **主推组合**: **电商 / 社交类项目默认选 ZigModu + zent**（见 §2 决策表与 §4.8 场景能力矩阵）；只有存量 SQL 繁重、报表主导或 DBA 强管控的项目才默认 sqlx。
 
 **参考实现**: [`examples/zent-modulith/`](../examples/zent-modulith/)  
@@ -231,7 +231,7 @@ zent 是 ent-style：**关系走 Edges 预加载，不做跨表 JOIN 查询**（
    JOIN 时不会歧义；`table` 是 comptime 参数，写错表名是**编译错误**。
 3. 报表查询建议独立 `report/` 模块持有自己的 `sqlx.Client`，与写路径（zent）解耦，避免把复杂 SQL 混进 domain 模块。
 
-### 4.8 电商 / 社交主推能力矩阵（zent v0.30–v0.39）
+### 4.8 电商 / 社交主推能力矩阵（zent v0.30–v0.41）
 
 这两版把电商/社交最常见的「钱、幂等、列表、可见性」四类痛点补成了一等能力，是主推组合的直接理由：
 
@@ -548,7 +548,7 @@ exe_mod.addImport("zent", zent_dep.module("zent"));
 
 ```zon
 .zent = .{
-    .url = "https://github.com/chy3xyz/zent/archive/refs/tags/v0.39.2.tar.gz",
+    .url = "https://github.com/chy3xyz/zent/archive/refs/tags/v0.41.1.tar.gz",
     .hash = "<zig fetch 后填入>",
 },
 ```
@@ -606,6 +606,9 @@ zig_ws/
 
 | 主题 | 动作 / 新特性 |
 |------|--------------|
+| **v0.41.1 `deinitRows` 重新接受指针（0.40.0 回归修复）** | 0.40.0 把 `crud_helpers.deinitRows(rows: anytype)` 的实现收窄成只认值（`var list = rows; deinitEntityList(…, &list)`），于是所有传 `&rows` 的调用方**编译失败**（`expected type 'T', found '*T'`）；注释还声称"保持按值签名"，是错的。0.41.1 在 comptime 归一化：可变指针直通（调用方的列表被清空且可复用）、值与 `*const` 走可变副本。三个形态都有回归测试。**教训**：`anytype` 的"接受形态"一旦收窄就是静默破坏性变更——本仓库的 `docs/BEST_PRACTICES.md`「anytype 形参的契约写法」与 `src/test/ErrorSetSnapshot.zig` 就是为这类问题立的规矩。 |
+| **v0.41.0 裸路径审计（哪些有作用域、哪些没有）** | `crud_helpers.queryRows` 只是 `driver.query` 的映射器，**按你写的语句原样执行**——与 `zent.scope` 要解决的裸路径同类，只是位置更高一层；其文档现在明说并给出组合写法，`BEST_PRACTICES` §5 列出每条裸路径的要求，并有端到端测试（未加作用域 3 租户行 → 加作用域 1 行）。另两条经审计确认安全：`PreparedCache` 以最终 SQL 文本逐字节为键（跨租户语句永不共享）、`explainSql` 只包一层 `EXPLAIN`（`Format` 无 `ANALYZE`，不会真执行）。 |
+| **v0.40.0 一行式实体释放** | `deinitRows` / `deinitRow` / `deinitEdgeRows`（生成客户端与 builder 上都有），取代"N 次 `deinitEntity(infos, info, &e, alloc)` + `list.deinit()`"的长写法（zent 报告侧的统计是 607 处手写 vs 0 处用现成 helper）。**本仓库的 zent-modulith 示例已全部改用**（23 处手写调用 → `client.<entity>.deinitRow(&e)` / `deinitRows(&rows)`；注意列表形态需要 `var rows`，因为 helper 会重置调用方的列表）。 |
 | **v0.39.0 `zent.scope` + 宽松扫描器 + `zent.version`** | ① `zent.scope.forClient(infos, table, &client.entity, opts)` 把与 fluent 路径**同一份**读契约（软删 → 隐私 → 拦截器）渲染成 SQL 片段，供手写语句 splice —— 此前裸 SQL 会静默跳过租户/隐私过滤（本文件 §4.7 已补警告）。带策略的表缺 `privacy_ctx` → `error.PrivacyDenied`。② `queryAllLenient` / `queryOneLenient` 把 v0.38 的宽松扫描带到查询层（NULL/缺列 → 保留字段默认值，而非 `error.TypeMismatch`），适合 LEFT JOIN/DTO。③ `<col>Contains` 的诚实名字 `<col>Like`（`Contains` 保留为别名，不破坏）。④ `zent.version` 让消费侧校验版本而不必比对 git 提交。 |
 | **v0.38.0 `queryTargets*` 改为 fail-closed（BREAKING）** | 旧行为（目标只过滤软删、**不带**租户/隐私/拦截器）与 `WithEdge` 的读契约不一致，是真实的跨租户泄漏面。现在两个批量邻居读取器都走同一份 `appendTargetScopePreds`，目标带策略而无上下文时返回 `error.PrivacyDenied`；旧的"仅软删"语义保留在显式命名的 `queryTargetsUnscoped` / `queryTargetsByValueUnscoped`（**用它们就等于声明放弃隔离**，评审要写明理由）。同时新增 NULL 容忍扫描器 `scanRowLenient*` / `scanRowNamedLenient*`（LEFT JOIN、聚合输出、可空 DTO 的第二契约），严格扫描器不变。迁移步骤：zent `UPGRADING.md` §11。 |
 | **v0.37.0 池阻塞等待 + 嵌套预加载** | `Options.max_wait_ms` 不再形同虚设：非 0 时 `borrow` 会在池条件变量上等待（由 `release` 唤醒），预算耗尽才 `error.PoolExhausted`，之后仍回落到原有 `max_retries` 路径；`max_wait_ms = 0`（默认）语义与旧版完全一致（非阻塞）。**升级自查**：此前"传了但无效"的 `max_wait_ms` 现在真的会排队。`ConnPool.deinit` 的调用约定明确要求静默期——不能靠 deinit 打断正在等待（parked）的借用者。`WithEdge("posts.comments")` 这类嵌套预加载从"每父实体一次查询"改为**每层一次查询**（实测 3 所有者两级 = 3 条语句），行为不变但 N+1 消失。 |
@@ -652,6 +655,8 @@ zig_ws/
 | 迁移默认加锁 + checksum 校验（0.36） | 多实例滚动发布同时启动 | 角色没有 advisory lock 权限时：PG 会降级为告警继续（**要确认是"继续"还是"锁失败"**）；已应用迁移文件一旦被改动即 `error.MigrationChecksumMismatch`——**不要改历史迁移** |
 | `StorageKey`（0.36） | 采用 zent 但既有库表列名不合字段命名规范（`user_name` vs `userName`） | 一旦使用，字段名与列名分叉：`whereEq`、谓词、DDL 都用**字段名**，只有物理列名不同——排障时以 `codegen.graph.columnName` 为准 |
 | `queryTargetsByValue`（0.36） | 主键是 UUID / 文本的实体也要遍历边 | `queryTargets` 仍是 i64 专用包装；两者语义一致（空列表短路、目标软删过滤、调用方拥有结果） |
+| `client.<entity>.deinitRow(&e)` / `deinitRows(&rows)` / `deinitEdgeRows(edge, &rows)`（0.40+） | 释放查询结果：单行、整页+列表、边页 | **整页要 `var rows`**（helper 会把调用方的列表重置为空、可复用）；`&rows` 与 `rows` 都接受，但传值只释放副本、调用方的列表变陈旧（0.40.0 曾把这条收窄导致消费方编译失败，见 §14） |
+| `crud_helpers.queryRows`（0.41 明确） | 需要自己拼 SQL 的读写 | 它是**裸路径**：不带你配的软删/隐私/拦截器，必须用 `zent.scope` 组合（同 `driver.query`） |
 | `zent.scope.forClient` + `withClause`（0.39） | 手写 SQL（报表/JOIN）要保住租户与隐私过滤 | 别把它当"可选装饰"：带策略的表没上下文会 `PrivacyDenied`，这正是 fail-closed 的意义；`table` 是 comptime，别名/表名写错当场报错 |
 | `queryTargets` / `queryTargetsByValue`（0.38 起 fail-closed） | 一次性批量读邻居实体，且希望与 `WithEdge` 同样的租户/隐私作用域 | 真需要"不加隔离"时必须显式改叫 `*Unscoped`，并在评审里说明理由——别为了绕过 `PrivacyDenied` 无脑替换 |
 | `scanRowNamedLenient*` / `queryAllLenient`（0.38/0.39） | LEFT JOIN、聚合输出、字段可空的 DTO | 实体读仍用严格扫描器：非空列出现 NULL 说明行不符合 schema，宽松化会把"数据坏了"变成静默默认值 |

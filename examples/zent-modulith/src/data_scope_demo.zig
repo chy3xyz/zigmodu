@@ -92,11 +92,8 @@ pub fn DocApi(comptime Client: type) type {
             var q = scoped_doc.Query();
             defer q.deinit();
             _ = try q.Where(.{scoped_doc.predicates.tenant_idEQ(.{ .int = tenant_id })});
-            const rows = try q.All();
-            defer {
-                for (rows.items) |*e| zent.codegen.deinitEntity(persist.infos, persist.DocInfo, e, self.client.allocator);
-                rows.deinit();
-            }
+            var rows = try q.All();
+            defer self.client.doc.deinitRows(&rows);
             try ctx.jsonStruct(200, .{ .items = rows.items });
         }
     };
