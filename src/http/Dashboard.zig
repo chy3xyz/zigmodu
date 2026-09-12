@@ -26,7 +26,16 @@ pub const SystemInfo = struct {
 };
 
 /// [...] Dashboard [...] HTTP Server
+/// Register the dashboard routes.
+///
+/// Accepted form: **a pointer** to anything with
+/// `get(path, handler, user_data)` — a `*RouteGroup` (e.g.
+/// `&server.group("")`) or a `*Scoped`. A bare `Server` does not have `get`.
 pub fn registerRoutes(server_or_group: anytype) !void {
+    const T = @TypeOf(server_or_group);
+    if (@typeInfo(T) != .pointer or !@hasDecl(@typeInfo(T).pointer.child, "get")) {
+        @compileError("dashboardRoutes expects a *pointer* to something with `get(path, handler, user_data)` (e.g. `&server.group(\"\")`); got " ++ @typeName(T));
+    }
     // HTML [...]
     try server_or_group.get("/", handleIndex, null);
     try server_or_group.get("/dashboard", handleIndex, null);

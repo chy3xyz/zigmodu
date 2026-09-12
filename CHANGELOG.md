@@ -20,6 +20,14 @@
   `permissionGate` 的 public 短路不覆盖 `.optional`（这类路由仍可带 permission/roles 元数据）。
 
 ### Changed
+- **`anytype` 形参的契约显式化**（建议第 1 条）：`Preflight.dbCheck` /
+  `Preflight.EnvCheck.fromMap` / `PrometheusMetrics.registerMetricsRoute[Path]` /
+  `Dashboard.registerRoutes` 现在
+  ①doc comment 首句写明"必须是**指针**、需要哪些方法"，
+  ②加 `@compileError`（含 `@typeName` 与实际修法）把错误提到**调用点**，
+  ③配一条"鸭子类型替身"回归测试固定契约。
+  最佳实践写法（含分类：对象指针 / 鸭子 client / 任意事件值 / comptime 元组）落在
+  `docs/BEST_PRACTICES.md`「`anytype` 形参的契约写法」。
 - **CI 门禁 `check-production.sh` 覆盖全仓**：原来只扫 9 个硬编码热文件 + `src/security/*`，
   其余文件（含 auth/tracing 中间件）长期是盲区。现在按前缀分层：
   `src/api|core|http|metrics|messaging|scheduler|security` **强制**，其余

@@ -115,9 +115,14 @@ pub const EnvCheck = struct {
     /// Variables that must be set and non-empty.
     required: []const []const u8,
 
-    /// Look variables up in anything with `get(name) ?[]const u8` —
-    /// `std.process.Init.environ_map` or `std.process.Environ`.
+    /// Accepted form: **a pointer** to anything with `get(name) ?[]const u8`.
+    /// `init.environ_map` (a `*Environ.Map`) and `*std.process.Environ` both
+    /// qualify; a plain map value does not (the checker stores the pointer).
     pub fn fromMap(map: anytype, required: []const []const u8) EnvCheck {
+        const T = @TypeOf(map);
+        if (@typeInfo(T) != .pointer) {
+            @compileError("Preflight.EnvCheck.fromMap expects a *pointer* to an environment map (e.g. `init.environ_map`); got " ++ @typeName(T));
+        }
         const Map = @TypeOf(map.*);
         return .{
             .ctx = @constCast(map),
@@ -177,8 +182,21 @@ pub fn secretCheck(ctx: *SecretCheck) Check {
 
 /// One round-trip against the database. `client` is the framework sqlx client
 /// (or anything with `queryRows(T, sql, params)`).
+/// Database reachability probe.
+///
+/// Accepted form: **a pointer** to anything with
+/// `queryRows(T, sql, params) -> QueryResult(T)` — in practice `*zigmodu.data.Client`.
+/// Pass `&client`, not `client`: a value would fail deeper inside this function
+/// with a type error that does not mention the caller.
 pub fn dbCheck(client: anytype) Check {
-    const Client = @TypeOf(client.*);
+    const T = @TypeOf(client);
+    if (@typeInfo(T) != .pointer) {
+        @compileError("Preflight.dbCheck expects a *pointer* to a client (e.g. `&db_client`); got " ++ @typeName(T) ++ ". Pass the address, not the value.");
+    }
+    const Client = @typeInfo(T).pointer.child;
+    if (!@hasDecl(Client, "queryRows")) {
+        @compileError("Preflight.dbCheck expects a type with `queryRows(T, sql, params)` (a sqlx Client or a wrapper); got " ++ @typeName(Client));
+    }
     return .{ .name = "database", .run = struct {
         fn probe(userdata: ?*anyopaque, allocator: std.mem.Allocator) anyerror!void {
             const c: *Client = @ptrCast(@alignCast(userdata.?));
@@ -306,4 +324,36 @@ test "preflight migration and clock checks" {
     try std.testing.expectEqualStrings("migrations", report.findings.items[0].name);
     try std.testing.expectEqualStrings("PendingMigrations", report.findings.items[0].message);
     try std.testing.expectEqual(@as(usize, 1), report.passed); // clock check
+}
+
+test "dbCheck accepts any type with queryRows (kept as a contract test)" {
+    const allocator = std.testing.allocator;
+
+    // A minimal duck-typed stand-in: the contract is the method, not the type.
+    const Fake = struct {
+        called: bool = false,
+        pub fn queryRows(self: *@This(), comptime T: type, sql: []const u8, args: []const @import("../sqlx/sqlx.zig").Value) !@import("../sqlx/sqlx.zig").QueryResult(T) {
+            _ = sql;
+            _ = args;
+            self.called = true;
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            errdefer arena.deinit();
+            const rows = try arena.allocator().alloc(T, 1);
+            rows[0] = .{ .v = 1 };
+            return .{ .items = rows, .arena = arena };
+        }
+    };
+    var fake = Fake{};
+    var report = run(allocator, &.{dbCheck(&fake)});
+    defer report.deinit();
+    try std.testing.expect(report.ok());
+    try std.testing.expect(fake.called);
+
+    // Real client, pointer form (the documented one).
+    var client = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    var report2 = run(allocator, &.{dbCheck(&client)});
+    defer report2.deinit();
+    try std.testing.expect(report2.ok());
 }

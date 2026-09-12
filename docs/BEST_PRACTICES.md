@@ -959,6 +959,40 @@ if (!report.ok()) return error.PreflightFailed;   // 不启动，胜过带病运
 - 检查之间互不影响：单个探针失败不会掩盖其它结果。
 - 参考接线：`examples/zmsaas/backend/src/main.zig`（env + secret + DB + clock）。
 
+### `anytype` 形参的契约写法（v0.15.41+）
+
+`anytype` 是灵活性来源，也是**隐式契约**——消费方传错形态时，报错往往落在被调方深处，
+要翻两层才知道是自己传错了（zent 的 `deinitRows(rows: anytype)` 传 `&rows` 就是这样）。
+本仓库的规则：
+
+1. **doc comment 第一句就写"接受什么形态"**，用"必须是**指针**"这类明确措辞：
+
+   ```zig
+   /// Accepted form: **a pointer** to anything with
+   /// `queryRows(T, sql, params)` — in practice `*zigmodu.data.Client`.
+   /// Pass `&client`, not `client`.
+   pub fn dbCheck(client: anytype) Check { ... }
+   ```
+2. **能表达成编译期约束的，绝不留给我们推导**——把报错提到调用点并写清怎么改：
+
+   ```zig
+   const T = @TypeOf(client);
+   if (@typeInfo(T) != .pointer) {
+       @compileError("dbCheck expects a *pointer* to a client (e.g. `&db_client`); got "
+           ++ @typeName(T) ++ ". Pass the address, not the value.");
+   }
+   const Client = @typeInfo(T).pointer.child;
+   if (!@hasDecl(Client, "queryRows")) @compileError("...expects `queryRows`...");
+   ```
+3. **用回归测试固定形态**：至少一条正向用例走"真实类型"，另一条走"鸭子类型替身"
+   （见 `src/core/Preflight.zig` 的 `dbCheck accepts any type with queryRows`）。
+   这样契约变化会在 CI 里失败，而不是在消费方那里失败。
+4. 泛型事件/`comptime` 元组这类**真正"任意"**的形参（`stageEvent(event: anytype)`、
+   `scanModules(modules: anytype)`）不需要约束，但要在注释里写清"任意值/类型元组"。
+
+已加固的公开 API：`Preflight.dbCheck` / `Preflight.EnvCheck.fromMap` /
+`PrometheusMetrics.registerMetricsRoute[Path]` / `Dashboard.registerRoutes`。
+
 ### 公开但可个性化：`Auth.optional`（v0.15.41+）
 
 `Auth` 的三个值语义要分清，选错会得到"游客拿不到身份"或"游客被 401"：

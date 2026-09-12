@@ -759,14 +759,22 @@ pub const PrometheusMetrics = struct {
         return f;
     }
 
-    /// Convenience: register /metrics route on a server with Prometheus text format.
-    /// Usage: try metrics.registerMetricsRoute(&server);
+    /// Convenience: register /metrics route on a server with Prometheus text
+    /// format. Usage: `try metrics.registerMetricsRoute(&server);`
+    /// (pointer to a `Server`; see `registerMetricsRoutePath` for the contract).
     pub fn registerMetricsRoute(self: *Self, server: anytype) !void {
         try self.registerMetricsRoutePath(server, "/metrics");
     }
 
     /// Same as `registerMetricsRoute` with a caller-chosen path.
+    ///
+    /// Accepted form: **a pointer** to anything with `addRoute(Route)` —
+    /// `*api.Server`. A `RouteGroup` does not qualify (it exposes `get`/`post`).
     pub fn registerMetricsRoutePath(self: *Self, server: anytype, path: []const u8) !void {
+        const T = @TypeOf(server);
+        if (@typeInfo(T) != .pointer or !@hasDecl(@typeInfo(T).pointer.child, "addRoute")) {
+            @compileError("registerMetricsRoute[Path] expects a *pointer* to something with `addRoute` (e.g. `&server` of type *Server); got " ++ @typeName(T));
+        }
         const ptr: *anyopaque = @ptrCast(self);
         try server.addRoute(.{
             .method = .GET,
