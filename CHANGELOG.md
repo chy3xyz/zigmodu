@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.15.40] - 2026-09-12
 
 ### Changed
 - **zent 适配 v0.37.0 → v0.39.2**：`examples/zent-modulith` 的 pin 升到发布 tag
