@@ -3,6 +3,27 @@
 ## [Unreleased]
 
 ### Added
+- **`multipart/form-data` 一等支持**（zapi 反馈 P1-5）：`src/http/Multipart.zig` +
+  `ctx.multipart(cfg)` / `ctx.bindMultipart(T, cfg)`。
+
+  ```zig
+  var form = try ctx.multipart(.{});         // defer form.deinit();
+  const title = form.value("title");         // 文本字段
+  if (form.file("avatar")) |f| { ... }       // 文件：f.data / f.filename / f.content_type
+  ___
+  const Meta = struct { full_name: []const u8, age: i64 };
+  const meta = try ctx.bindMultipart(Meta, .{});   // 与 bindForm 同一套 loose 绑定契约
+  ```
+
+  要点：文本查找**永不返回文件块**（`value()` 跳过带 filename 的 part）；「首次命中优先」
+  与 `bindForm` 一致；整个 body 在内存中解析（框架本身已缓冲请求），因此防护是 `Config`
+  限额 —— `max_parts` / `max_part_bytes` / `max_total_bytes`，超限分别返回
+  `TooManyParts` / `PartTooLarge` / `PayloadTooLarge`，而非盲目分配。
+  **不做流式落盘**（请求体已被缓冲，流式 API 只会假装省内存），落盘是应用决策。
+  新增 5 个测试（boundary/Disposition 解析矩阵、混合表单含文件、四类拒绝路径、
+  文本字段桥接、Context 端到端）。
+
+### Added
 - **静态文件服务**（`zigmodu.http.staticFiles` / `StaticFiles.staticMiddleware`，zapi 反馈 P1-6）：
 
   ```zig

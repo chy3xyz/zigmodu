@@ -820,6 +820,25 @@ pub const Context = struct {
         return result;
     }
 
+    /// Parse a `multipart/form-data` body (file uploads + mixed forms).
+    /// The returned `Form` owns its parts — `defer form.deinit()`.
+    pub fn multipart(self: *const Context, config: Multipart.Config) Multipart.Error!Multipart.Form {
+        const body = self.body orelse return Multipart.Error.NotMultipart;
+        const ctype = self.headers.get("content-type") orelse return Multipart.Error.NotMultipart;
+        return Multipart.parse(self.allocator, body, ctype, config);
+    }
+
+    /// Bind the **text** parts of a multipart form into a struct, with the same
+    /// contract as `bindForm` (loose field names, defaults preserved, owned
+    /// strings). File parts are reached via `Form.file(name)`.
+    pub fn bindMultipart(self: *const Context, comptime T: type, config: Multipart.Config) !T {
+        var form = try self.multipart(config);
+        defer form.deinit();
+        var map = try form.textFields(self.allocator);
+        defer map.deinit();
+        return bindStringMap(T, map, self.allocator);
+    }
+
     /// Bind `application/x-www-form-urlencoded` into a struct. Field lookup is
     /// loose like `bindJsonLoose` (exact name, or camelCase/snake_case
     /// equivalent), absent optionals stay null, and a field with a declared
@@ -1234,6 +1253,8 @@ test "percentDecode decodes query values" {
     defer allocator.free(plain);
     try std.testing.expectEqualStrings("hello", plain);
 }
+
+const Multipart = @import("../http/Multipart.zig");
 
 const ParsedRequest = struct {
     method: Method,
@@ -4053,4 +4074,39 @@ test "bindForm / bindQuery bind a struct without hand-rolled getPara" {
     // Missing required field is an error, not a silent empty value.
     const Required = struct { absent_required: i64 };
     try std.testing.expectError(error.MissingField, ctx.bindQuery(Required));
+}
+
+test "ctx.multipart and bindMultipart read a real request body" {
+    const allocator = std.testing.allocator;
+    var ctx = try Context.init(allocator, .POST, "/upload");
+    defer ctx.deinit();
+
+    const body =
+        "--X\r\nContent-Disposition: form-data; name=\"full_name\"\r\n\r\nZhang San\r\n" ++
+        "--X\r\nContent-Disposition: form-data; name=\"age\"\r\n\r\n42\r\n" ++
+        "--X\r\nContent-Disposition: form-data; name=\"doc\"; filename=\"r.pdf\"\r\n" ++
+        "Content-Type: application/pdf\r\n\r\n%PDF-1.4\r\n" ++
+        "--X--\r\n";
+    ctx.body = body;
+    // NB: `headers` are the *request* headers (setHeader writes responses).
+    try ctx.headers.put(try allocator.dupe(u8, "content-type"), try allocator.dupe(u8, "multipart/form-data; boundary=X"));
+
+    // Text fields bind through the same contract as bindForm.
+    const Meta = struct { full_name: []const u8, age: i64 };
+    const meta = try ctx.bindMultipart(Meta, .{});
+    defer allocator.free(meta.full_name);
+    try std.testing.expectEqualStrings("Zhang San", meta.full_name);
+    try std.testing.expectEqual(@as(i64, 42), meta.age);
+
+    // Files stay reachable, and text lookups never hand back a blob.
+    var form = try ctx.multipart(.{});
+    defer form.deinit();
+    const doc = form.file("doc").?;
+    try std.testing.expectEqualStrings("r.pdf", doc.filename.?);
+    try std.testing.expectEqualStrings("%PDF-1.4", doc.data);
+    try std.testing.expect(form.value("doc") == null);
+
+    // (Non-multipart rejection lives in Multipart.zig's own tests — replacing a
+    // request header here would leak the previous value, which `ctx.deinit`
+    // cannot know about.)
 }
