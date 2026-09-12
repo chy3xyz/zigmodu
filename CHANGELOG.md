@@ -1,23 +1,6 @@
 # Changelog
 
-## [0.15.41] - 2026-09-12
-
-### Added
-- **`Auth.optional`：公开但可个性化的路由（一等能力）**。`Auth` 此前只有
-  `inherit | public | jwt`：`public` 完全跳过验签、`ctx.userId()` 恒为空，而需要身份就等于
-  `.jwt`（游客直接 401）。C 端用户中心这类"公开但想看是谁"的接口只能靠 handler 里手写
-  token 检查。现在：
-
-  ```zig
-  pub const routes = [_]cr.RouteSpec(State){
-      .{ .method = .GET, .path = "me", .handler = me, .meta = .{ .auth = .optional } },
-  };
-  ```
-  语义：**有 token 就验并注入身份，token 缺失/非法/过期一律不影响请求**，永不 401。
-  与 `.public` 的差别被显式化并可测试（矩阵用例覆盖 optional×{无/有效/坏 token}、
-  public×有效 token、jwt×{无/有效 token}）。同时把此前只在 `authFromCatalog(AuthBackend)`
-  一支存在的"尽力而为验签"抽成 `attachIdentityBestEffort`，三处中间件行为一致；
-  `permissionGate` 的 public 短路不覆盖 `.optional`（这类路由仍可带 permission/roles 元数据）。
+## [0.15.42] - 2026-09-12
 
 ### Added
 - **文档 ↔ 代码一致性门禁**（建议第 6 条）：新增 `src/test/DocsConsistency.zig`，
@@ -41,6 +24,29 @@
   ③配一条"鸭子类型替身"回归测试固定契约。
   最佳实践写法（含分类：对象指针 / 鸭子 client / 任意事件值 / comptime 元组）落在
   `docs/BEST_PRACTICES.md`「`anytype` 形参的契约写法」。
+
+## [0.15.41] - 2026-09-12
+
+### Added
+- **`Auth.optional`：公开但可个性化的路由（一等能力）**。`Auth` 此前只有
+  `inherit | public | jwt`：`public` 完全跳过验签、`ctx.userId()` 恒为空，而需要身份就等于
+  `.jwt`（游客直接 401）。C 端用户中心这类"公开但想看是谁"的接口只能靠 handler 里手写
+  token 检查。现在：
+
+  ```zig
+  pub const routes = [_]cr.RouteSpec(State){
+      .{ .method = .GET, .path = "me", .handler = me, .meta = .{ .auth = .optional } },
+  };
+  ```
+  语义：**有 token 就验并注入身份，token 缺失/非法/过期一律不影响请求**，永不 401。
+  与 `.public` 的差别被显式化并可测试（矩阵用例覆盖 optional×{无/有效/坏 token}、
+  public×有效 token、jwt×{无/有效 token}）。同时把此前只在 `authFromCatalog(AuthBackend)`
+  一支存在的"尽力而为验签"抽成 `attachIdentityBestEffort`，三处中间件行为一致；
+  `permissionGate` 的 public 短路不覆盖 `.optional`（这类路由仍可带 permission/roles 元数据）。
+
+### Added
+
+### Changed
 - **CI 门禁 `check-production.sh` 覆盖全仓**：原来只扫 9 个硬编码热文件 + `src/security/*`，
   其余文件（含 auth/tracing 中间件）长期是盲区。现在按前缀分层：
   `src/api|core|http|metrics|messaging|scheduler|security` **强制**，其余
