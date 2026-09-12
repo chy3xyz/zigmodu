@@ -836,6 +836,20 @@ adapters.freeze();                                   // 服务期：只读
 const a = adapters.get("alipay");                    // 无锁、线程安全
 ```
 
+**参数层（表单 / 上传）**
+
+| 输入 | 用它 | 说明 |
+|------|------|------|
+| `application/x-www-form-urlencoded` | `ctx.bindForm(T)` | 与 query 同口径解码；loose 字段名；缺必填 → `error.MissingField` |
+| query string | `ctx.bindQuery(T)` | 同上契约 |
+| `multipart/form-data` | `ctx.bindMultipart(T, cfg)` + `Form.file(name)` | 文本与文件分开取；限额 `max_parts` / `max_part_bytes` / `max_total_bytes` |
+| JSON | `ctx.bindJsonLoose(T)` | camelCase 兼容、null 视为缺省、所有权统一 |
+| 路径参数 | `ctx.pathParam(name)`（旧名 `param`） | 它**不是**"任意参数" |
+| 静态资源 | `http.staticFiles(io, &server, allocator, "/assets", "public", .{})` | 中间件实现；只 GET/HEAD；无目录索引；ETag/Range |
+
+手写 `getPara`、自建解码器、自建 JSON 发射器、自写静态服务都不再必要——
+整批绑定用上面的 `bind*`，单值才用 `formValue` / `queryParam`。
+
 **2. 收口 · 请求路径禁止裸 panic**
 
 handler/service/persistence 里用错误返回，不用 `catch unreachable` /

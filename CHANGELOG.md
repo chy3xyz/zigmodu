@@ -10,7 +10,7 @@
   var form = try ctx.multipart(.{});         // defer form.deinit();
   const title = form.value("title");         // 文本字段
   if (form.file("avatar")) |f| { ... }       // 文件：f.data / f.filename / f.content_type
-  ___
+  // 文本字段也可整批绑定：
   const Meta = struct { full_name: []const u8, age: i64 };
   const meta = try ctx.bindMultipart(Meta, .{});   // 与 bindForm 同一套 loose 绑定契约
   ```

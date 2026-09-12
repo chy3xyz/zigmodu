@@ -653,6 +653,35 @@ comes from a supervisor (`Restart=always`, k8s `restartPolicy: Always`); see
 [`BEST_PRACTICES.md`](BEST_PRACTICES.md)「韧性」and
 [`PRODUCTION_ROADMAP.md`](PRODUCTION_ROADMAP.md) for the prefork boundary.
 
+### `zigmodu.http.Multipart`
+
+```zig
+pub const Config = struct { max_parts: usize = 64, max_part_bytes: usize = 8 MiB, max_total_bytes: usize = 32 MiB };
+pub fn parse(allocator, body, content_type, config) Error!Form
+pub const Form = struct {
+    pub fn value(self, name) ?[]const u8      // text fields only
+    pub fn file(self, name) ?*const Part      // filename/data/content_type
+    pub fn textFields(self, allocator) !std.StringHashMap([]const u8)
+    pub fn deinit(self) void
+};
+
+// Context:
+pub fn multipart(self: *const Context, config: Multipart.Config) Multipart.Error!Multipart.Form
+pub fn bindMultipart(self: *const Context, comptime T: type, config: Multipart.Config) !T
+```
+
+### `zigmodu.http.staticFiles` (static file serving)
+
+```zig
+pub fn staticFiles(io, server: *Server, allocator, prefix: []const u8, root_dir: []const u8, config: Config) !void
+pub fn staticMiddleware(io, allocator, prefix, root_dir, config) Middleware
+```
+
+Implemented as middleware (the router's `/prefix/*` matches only the prefix
+itself). Serves `GET`/`HEAD` only; no directory index; normalizes paths before
+touching the filesystem; `ETag` + `If-None-Match` → 304; `Range` → 206/416;
+bodies above `max_bytes` (16 MiB default) → 413.
+
 ### Metrics with bounded labels
 
 ```zig
