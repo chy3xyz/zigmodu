@@ -117,4 +117,22 @@ if [ "$PUSH" = "1" ]; then
     git push origin master
     git push origin "v$VERSION"
     echo "pushed master + v$VERSION"
+
+    # The tag push only runs release-verify (tag == package version). The real
+    # suite runs on the *master* push, and `ci.yml` cancels in-progress runs for
+    # the same ref — so a rapid commit→release→push sequence can leave the tip's
+    # main run cancelled, i.e. the release never actually tested. Report the run
+    # for the tip commit instead of assuming.
+    if command -v gh >/dev/null 2>&1; then
+        sha="$(git rev-parse HEAD)"
+        echo "-- main CI for ${sha:0:8} (verify it is not 'cancelled') --"
+        gh run list --workflow=ci.yml --limit 6 \
+            --json headSha,status,conclusion,url \
+            -q ".[] | select(.headSha==\"$sha\") | \"\(.conclusion // .status)\t\(.url)\"" \
+            | head -1 || true
+        gh run list --workflow=release-verify.yml --limit 3 \
+            --json headBranch,conclusion \
+            -q ".[] | \"release-verify: \(.conclusion // \"-\")\t\(.headBranch)\"" || true
+        echo "release-verify only checks tag↔version; the suite result above is the one that matters."
+    fi
 fi
