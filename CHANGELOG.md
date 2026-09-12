@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.15.44] - 2026-09-12
 
 ### Changed
 - **zent 适配 v0.39.2 → v0.41.1**（pin 升到发布 tag `?ref=v0.41.1#2611ade`）：
