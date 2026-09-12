@@ -1676,7 +1676,7 @@ test "token extractors cover bearer, x-token, query" {
     defer ctx.deinit();
 
     try std.testing.expect(extractTokenAny(&ctx, &.{ .bearer, .x_token, .query }) == null);
-    try ctx.query.put(try alloc.dupe(u8, "token"), try alloc.dupe(u8, "q-tok"));
+    try ctx.query.put("token", "q-tok"); // Params duplicates internally
     try std.testing.expectEqualStrings("q-tok", extractTokenAny(&ctx, &.{ .bearer, .query }).?);
     try ctx.headers.put(try alloc.dupe(u8, "x-token"), try alloc.dupe(u8, "x-tok"));
     try std.testing.expectEqualStrings("x-tok", extractTokenAny(&ctx, &.{ .x_token, .query }).?);

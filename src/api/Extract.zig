@@ -414,9 +414,7 @@ test "extractQuery with defaults via optional" {
     var ctx = try Context.init(allocator, .GET, "/search");
     defer ctx.deinit();
 
-    const pk = try allocator.dupe(u8, "page");
-    const pv = try allocator.dupe(u8, "3");
-    try ctx.query.put(pk, pv);
+    try ctx.query.put("page", "3");
 
     const Dto = struct { page: u32, q: ?[]const u8 };
     const dto = try extractQuery(&ctx, Dto);

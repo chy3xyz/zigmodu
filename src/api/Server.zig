@@ -247,10 +247,11 @@ pub const Context = struct {
     /// blow up cardinality.
     route_template: ?[]const u8 = null,
     raw_path: []const u8,
-    query: std.StringHashMap([]const u8),
+    /// Query string / form body: multi-value (repeated keys + `a[b]` brackets).
+    query: Params,
     params: std.StringHashMap([]const u8),
     headers: std.StringHashMap([]const u8),
-    form: ?std.StringHashMap([]const u8) = null,
+    form: ?Params = null,
     body: ?[]const u8 = null,
     response_body: std.ArrayList(u8),
     status_code: u16 = 200,
@@ -288,12 +289,12 @@ pub const Context = struct {
 
     /// Reset per-request state between keep-alive requests.
     pub fn resetArena(self: *Context) void {
-        self.freeStringMap(&self.query);
+        self.query.deinit();
         self.freeStringMap(&self.params);
         self.freeStringMap(&self.headers);
         self.freeStringMap(&self.attributes);
         self.freeStringMap(&self.response_headers);
-        if (self.form) |*f| self.freeStringMap(f);
+        if (self.form) |*f| f.deinit();
     }
 
     fn freeStringMap(self: *Context, map: *std.StringHashMap([]const u8)) void {
@@ -313,7 +314,7 @@ pub const Context = struct {
             .method = method,
             .path = path,
             .raw_path = path,
-            .query = std.StringHashMap([]const u8).init(allocator),
+            .query = Params.init(allocator),
             .params = std.StringHashMap([]const u8).init(allocator),
             .headers = std.StringHashMap([]const u8).init(allocator),
             .response_body = std.ArrayList(u8).empty,
@@ -323,16 +324,12 @@ pub const Context = struct {
     }
 
     pub fn deinit(self: *Context) void {
-        self.freeStringMap(&self.query);
         self.query.deinit();
         self.freeStringMap(&self.params);
         self.params.deinit();
         self.freeStringMap(&self.headers);
         self.headers.deinit();
-        if (self.form) |*f| {
-            self.freeStringMap(f);
-            f.deinit();
-        }
+        if (self.form) |*f| f.deinit();
         self.response_body.deinit(self.allocator);
         self.freeStringMap(&self.response_headers);
         self.response_headers.deinit();
@@ -834,9 +831,43 @@ pub const Context = struct {
     pub fn bindMultipart(self: *const Context, comptime T: type, config: Multipart.Config) !T {
         var form = try self.multipart(config);
         defer form.deinit();
-        var map = try form.textFields(self.allocator);
-        defer map.deinit();
-        return bindStringMap(T, map, self.allocator);
+        var params = Params.init(self.allocator);
+        defer params.deinit();
+        for (form.parts.items) |part| {
+            if (part.filename != null) continue; // files are reached via Form.file
+            try params.put(part.name, part.data);
+        }
+        return bindStringMap(T, params, self.allocator);
+    }
+
+    /// Every value for `name` in the query string (repeated keys), arrival order.
+    pub fn queryValues(self: *const Context, name: []const u8) []const []const u8 {
+        return self.query.getAll(name);
+    }
+
+    /// Every value for `name` in the form body.
+    pub fn formValues(self: *const Context, name: []const u8) []const []const u8 {
+        const f = self.form orelse return &.{};
+        return f.getAll(name);
+    }
+
+    /// Bracket/repeated-key array read (`role_id[0]`, `role_id[]`, `a=1&a=2`).
+    /// Caller frees the returned slice.
+    pub fn formArray(self: *const Context, allocator: std.mem.Allocator, name: []const u8) ![][]const u8 {
+        const f = self.form orelse return allocator.alloc([]const u8, 0);
+        return f.getArray(allocator, name);
+    }
+
+    pub fn queryArray(self: *const Context, allocator: std.mem.Allocator, name: []const u8) ![][]const u8 {
+        return self.query.getArray(allocator, name);
+    }
+
+    /// Dotted path lookup (`filter.tags` → `filter[tags]`), query first then form.
+    pub fn paramPath(self: *const Context, path: []const u8) ?[]const u8 {
+        if (self.form) |f| {
+            if (f.getPath(path)) |v| return v;
+        }
+        return self.query.getPath(path);
     }
 
     /// Bind `application/x-www-form-urlencoded` into a struct. Field lookup is
@@ -929,16 +960,29 @@ fn parseValue(comptime T: type, value: []const u8) !T {
     };
 }
 
-fn parseFormBody(allocator: std.mem.Allocator, body: []const u8) !std.StringHashMap([]const u8) {
-    var form = std.StringHashMap([]const u8).init(allocator);
-    errdefer {
-        var iter = form.iterator();
-        while (iter.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            allocator.free(entry.value_ptr.*);
-        }
-        form.deinit();
+/// Parse `a=1&b=%20&role_id%5B0%5D=7` into `params`: keys and values are
+/// percent-decoded, repeated names accumulate, bracket keys are kept verbatim
+/// so `getArray`/`getPath` can interpret them. Enforces `max_params`
+/// occurrences.
+fn parseQueryInto(params: *Params, raw_query: []const u8, allocator: std.mem.Allocator, max_params: usize) !void {
+    var it = std.mem.splitScalar(u8, raw_query, '&');
+    while (it.next()) |param| {
+        if (param.len == 0) continue;
+        const eq_pos = std.mem.indexOfScalar(u8, param, '=') orelse continue;
+        if (params.totalValues() >= max_params) return error.TooManyParams;
+        const key = try percentDecode(allocator, param[0..eq_pos]);
+        const value = try percentDecode(allocator, param[eq_pos + 1 ..]);
+        params.putOwned(key, value) catch |err| {
+            allocator.free(key);
+            allocator.free(value);
+            return err;
+        };
     }
+}
+
+fn parseFormBody(allocator: std.mem.Allocator, body: []const u8, max_params: usize) !Params {
+    var form = Params.init(allocator);
+    errdefer form.deinit();
 
     var iter = std.mem.splitScalar(u8, body, '&');
     while (iter.next()) |param| {
@@ -950,10 +994,14 @@ fn parseFormBody(allocator: std.mem.Allocator, body: []const u8) !std.StringHash
             // could never be found via `formValue("role_id[0]")`, and a raw
             // value meant `formValue("name")` returned `%E5%BC%A0%E4%B8%89`
             // instead of `张三`.
+            if (form.totalValues() >= max_params) return error.TooManyParams;
             const key = try percentDecode(allocator, param[0..eq_pos]);
-            errdefer allocator.free(key);
             const value = try percentDecode(allocator, param[eq_pos + 1 ..]);
-            try form.put(key, value);
+            form.putOwned(key, value) catch |err| {
+                allocator.free(key);
+                allocator.free(value);
+                return err;
+            };
         }
     }
 
@@ -1108,7 +1156,7 @@ const RequestParser = struct {
     }
 
     /// Continue HTTP/1.1 parse after the request line was already read (H2 preface probe).
-    pub fn parseAfterRequestLine(self: *RequestParser, reader: *StreamReader, request_line_raw_view: []const u8, max_body_size: usize, header_limits: HeaderLimits) !ParsedRequest {
+    pub fn parseAfterRequestLine(self: *RequestParser, reader: *StreamReader, request_line_raw_view: []const u8, max_body_size: usize, header_limits: HeaderLimits, max_params: usize) !ParsedRequest {
         var buffer: [8192]u8 = undefined;
 
         const request_line_owned = try self.allocator.dupe(u8, trimCrlf(request_line_raw_view));
@@ -1127,21 +1175,14 @@ const RequestParser = struct {
 
         // Parse query string
         var path = raw_path;
-        var query_map = std.StringHashMap([]const u8).init(self.allocator);
+        var query_map = Params.init(self.allocator);
+        errdefer query_map.deinit();
 
         if (std.mem.indexOf(u8, raw_path, "?")) |query_start| {
             path = raw_path[0..query_start];
             const query_str = raw_path[query_start + 1 ..];
 
-            var qiter = std.mem.splitScalar(u8, query_str, '&');
-            while (qiter.next()) |param| {
-                if (param.len == 0) continue;
-                if (std.mem.indexOf(u8, param, "=")) |eq_pos| {
-                    const key = try percentDecode(self.allocator, param[0..eq_pos]);
-                    const value = try percentDecode(self.allocator, param[eq_pos + 1 ..]);
-                    try query_map.put(key, value);
-                }
-            }
+            try parseQueryInto(&query_map, query_str, self.allocator, max_params);
         }
 
         // Parse headers
@@ -1255,12 +1296,13 @@ test "percentDecode decodes query values" {
 }
 
 const Multipart = @import("../http/Multipart.zig");
+const Params = @import("../http/Params.zig").Params;
 
 const ParsedRequest = struct {
     method: Method,
     path: []const u8,
     raw_path: []const u8,
-    query: std.StringHashMap([]const u8),
+    query: Params,
     headers: std.StringHashMap([]const u8),
     body: ?[]const u8,
     /// Owned buffer that path and raw_path slice into.
@@ -1270,11 +1312,6 @@ const ParsedRequest = struct {
     pub fn deinit(self: *ParsedRequest, allocator: std.mem.Allocator) void {
         allocator.free(self._request_line_buf);
 
-        var query_iter = self.query.iterator();
-        while (query_iter.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            allocator.free(entry.value_ptr.*);
-        }
         self.query.deinit();
 
         var headers_iter = self.headers.iterator();
@@ -1713,6 +1750,8 @@ pub const Server = struct {
     header_timeout_ms: u32 = 10_000,
     /// See `Config.ws_write_timeout_ms`.
     ws_write_timeout_ms: u32 = 0,
+    /// See `Config.max_params`.
+    max_params: usize = 1000,
     /// Accepted connections currently being served (reserved before the fiber
     /// starts, released when it returns).
     active_connections: std.atomic.Value(u64) = .init(0),
@@ -1752,6 +1791,12 @@ pub const Server = struct {
         /// `request_timeout_ms` (which only covers handler execution). Bounds
         /// slowloris-style trickle. 0 disables the deadline.
         header_timeout_ms: u32 = 10_000,
+        /// Upper bound on parameters parsed from one request's query string or
+        /// form body (occurrences, not distinct names). Mirrors PHP's
+        /// `max_input_vars`: a parser that accepts unbounded input is a DoS
+        /// surface. Exceeding it fails the request (`error.TooManyParams`)
+        /// instead of silently truncating it.
+        max_params: usize = 1000,
         /// Bound on blocking WebSocket writes (`SO_SNDTIMEO`). A peer that
         /// stops reading would otherwise stall the writing thread forever
         /// (and, for `im.ConnectionRegistry`, while holding a shard lock).
@@ -1787,6 +1832,7 @@ pub const Server = struct {
             .over_limit_response = config.over_limit_response,
             .header_timeout_ms = config.header_timeout_ms,
             .ws_write_timeout_ms = config.ws_write_timeout_ms,
+            .max_params = config.max_params,
             .owned_route_mw = std.ArrayList([]const Middleware).empty,
         };
     }
@@ -2205,7 +2251,7 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
             return;
         }
 
-        var request = parser.parseAfterRequestLine(&reader, first_line_raw, server.max_body_size, server.header_limits) catch |err| {
+        var request = parser.parseAfterRequestLine(&reader, first_line_raw, server.max_body_size, server.header_limits, server.max_params) catch |err| {
             switch (err) {
                 error.ReadFailed => {
                     if (reader.timed_out) writeErrorResponse(server.io, stream, arena_alloc, 408, "Request Timeout");
@@ -2239,12 +2285,12 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
         ctx.io = server.io;
         ctx.stream = stream;
 
-        // Transfer ownership: steal query/headers HashMaps from request
+        // Transfer ownership: steal the query/headers containers from request
         // to avoid re-duplicating every key-value pair (saves ~10 allocs/req).
         // Both use arena_alloc so lifetimes are consistent.
         ctx.query.deinit();
         ctx.query = request.query;
-        request.query = std.StringHashMap([]const u8).init(arena_alloc);
+        request.query = Params.init(arena_alloc);
 
         ctx.headers.deinit();
         ctx.headers = request.headers;
@@ -2263,7 +2309,7 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
         if (request.body) |body| {
             const ctype = ctx.headers.get("content-type") orelse "";
             if (std.mem.startsWith(u8, ctype, "application/x-www-form-urlencoded")) {
-                ctx.form = parseFormBody(arena_alloc, body) catch null;
+                ctx.form = parseFormBody(arena_alloc, body, server.max_params) catch null;
             }
         }
 
@@ -2540,13 +2586,13 @@ fn namesEquivalent(a: []const u8, b: []const u8) bool {
 /// Shared loose binder for string→value sources (form body, query string).
 /// Values are owned by the caller exactly like `bindJsonLoose` (deep-copied
 /// strings), so the same free/ownership discipline applies.
-fn bindStringMap(comptime T: type, map: std.StringHashMap([]const u8), allocator: std.mem.Allocator) !T {
+fn bindStringMap(comptime T: type, params: Params, allocator: std.mem.Allocator) !T {
     const info = @typeInfo(T);
     if (info != .@"struct") @compileError("bindForm/bindQuery expect a struct type, got " ++ @typeName(T));
 
     var result: T = undefined;
     inline for (info.@"struct".field_names, info.@"struct".field_types, info.@"struct".field_attrs) |fname, F, attrs| {
-        const raw = lookupLoose(map, fname);
+        const raw = lookupLoose(params, fname);
         const finfo = @typeInfo(F);
         const is_opt = finfo == .optional;
         const Base = if (is_opt) finfo.optional.child else F;
@@ -2582,18 +2628,18 @@ fn parseFieldString(comptime Base: type, comptime fname: []const u8, text: []con
     };
 }
 
-fn lookupLoose(map: std.StringHashMap([]const u8), fname: []const u8) ?[]const u8 {
-    if (map.get(fname)) |v| return v;
-    var it = map.iterator();
+fn lookupLoose(params: Params, fname: []const u8) ?[]const u8 {
+    if (params.get(fname)) |v| return v;
+    var it = params.map.iterator();
     while (it.next()) |e| {
-        if (namesEquivalent(e.key_ptr.*, fname)) return e.value_ptr.*;
+        if (namesEquivalent(e.key_ptr.*, fname)) return e.value_ptr.items[e.value_ptr.items.len - 1];
     }
     // Nested key (`role_id[0]`, `params[balance][money]`): bind the first
     // element to the scalar field. Browsers/`qs` send exactly this shape, and
     // the parse layer already decoded it (`role_id%5B0%5D` → `role_id[0]`).
     // Other indices / repeated keys are read explicitly from the map.
     var nested: ?[]const u8 = null;
-    var it2 = map.iterator();
+    var it2 = params.map.iterator();
     while (it2.next()) |e| {
         const key = e.key_ptr.*;
         if (key.len > fname.len and key[fname.len] == '[' and
@@ -2602,7 +2648,7 @@ fn lookupLoose(map: std.StringHashMap([]const u8), fname: []const u8) ?[]const u
             if (nested == null or std.mem.order(u8, key, nested.?) == .lt) nested = key;
         }
     }
-    if (nested) |k| return map.get(k);
+    if (nested) |k| return params.get(k);
     return null;
 }
 
@@ -2730,7 +2776,7 @@ test "parse req binding" {
     defer ctx.deinit();
 
     try ctx.params.put(try allocator.dupe(u8, "id"), try allocator.dupe(u8, "42"));
-    try ctx.query.put(try allocator.dupe(u8, "page"), try allocator.dupe(u8, "3"));
+    try ctx.query.put("page", "3");
 
     const Req = struct {
         id: u32,
@@ -2964,9 +3010,7 @@ test "integration: router + handler + response" {
         }
 
         // Set a query param
-        const qk = try allocator.dupe(u8, "page");
-        const qv = try allocator.dupe(u8, "5");
-        try ctx.query.put(qk, qv);
+        try ctx.query.put("page", "5");
 
         // Execute handler
         try m.route.handler(&ctx);
@@ -3313,12 +3357,8 @@ test "queryInt parses valid integer" {
     var ctx = try Context.init(allocator, .GET, "/test?page=5&size=20");
     defer ctx.deinit();
 
-    const qk = try allocator.dupe(u8, "page");
-    const qv = try allocator.dupe(u8, "5");
-    try ctx.query.put(qk, qv);
-    const sk = try allocator.dupe(u8, "size");
-    const sv = try allocator.dupe(u8, "20");
-    try ctx.query.put(sk, sv);
+    try ctx.query.put("page", "5");
+    try ctx.query.put("size", "20");
 
     try std.testing.expectEqual(@as(i64, 5), ctx.queryInt(i64, "page", 0));
     try std.testing.expectEqual(@as(i64, 20), ctx.queryInt(i64, "size", 10));
@@ -3999,15 +4039,8 @@ test "WS write timeout disconnects a peer that stops reading" {
 
 test "parseFormBody decodes keys and values like the query string" {
     const allocator = std.testing.allocator;
-    var form = try parseFormBody(allocator, "name=%E5%BC%A0%E4%B8%89&role_id%5B0%5D=7&note=a+b&plain=v");
-    defer {
-        var it = form.iterator();
-        while (it.next()) |e| {
-            allocator.free(e.key_ptr.*);
-            allocator.free(e.value_ptr.*);
-        }
-        form.deinit();
-    }
+    var form = try parseFormBody(allocator, "name=%E5%BC%A0%E4%B8%89&role_id%5B0%5D=7&note=a+b&plain=v", 1000);
+    defer form.deinit(); // Params owns names and values
 
     // UTF-8 value arrives decoded (`张三`), not as percent escapes.
     try std.testing.expectEqualStrings("张三", form.get("name").?);
@@ -4037,7 +4070,7 @@ test "pathParam and jsonValue aliases keep the documented semantics" {
 
 test "bindForm / bindQuery bind a struct without hand-rolled getPara" {
     const allocator = std.testing.allocator;
-    const Params = struct {
+    const Fields = struct {
         name: []const u8,
         role_id: i64,
         active: bool = false,
@@ -4050,10 +4083,10 @@ test "bindForm / bindQuery bind a struct without hand-rolled getPara" {
     ctx.body = "name=%E5%BC%A0%E4%B8%89&role_id%5B0%5D=7&active=1&score=9.25";
     // Ownership stays with `ctx` — `Context.deinit` frees the form map (keys
     // and values included), so the test must not free it a second time.
-    ctx.form = try parseFormBody(allocator, ctx.body.?);
-    try ctx.query.put(try allocator.dupe(u8, "name"), try allocator.dupe(u8, "fallback"));
+    ctx.form = try parseFormBody(allocator, ctx.body.?, 1000);
+    try ctx.query.put("name", "fallback");
 
-    const p = try ctx.bindForm(Params);
+    const p = try ctx.bindForm(Fields);
     defer allocator.free(p.name);
     try std.testing.expectEqualStrings("张三", p.name);
     // Nested key binds its first element to the scalar field: the browser sent
@@ -4109,4 +4142,38 @@ test "ctx.multipart and bindMultipart read a real request body" {
     // (Non-multipart rejection lives in Multipart.zig's own tests — replacing a
     // request header here would leak the previous value, which `ctx.deinit`
     // cannot know about.)
+}
+
+test "query parsing: repeated keys, brackets and the parameter guard" {
+    const allocator = std.testing.allocator;
+    var q = Params.init(allocator);
+    defer q.deinit();
+
+    try parseQueryInto(&q, "ids=1&ids=2&role_id%5B0%5D=7&role_id%5B1%5D=8&tag%5B%5D=a&name=%E5%BC%A0%E4%B8%89&empty=&novalue", allocator, 100);
+
+    // Repeated keys: every value is kept, `get` stays "last wins" for compat.
+    try std.testing.expectEqual(@as(usize, 2), q.getAll("ids").len);
+    try std.testing.expectEqualStrings("2", q.get("ids").?);
+
+    // Brackets survive parsing (decoded to `role_id[0]`) and read back sorted.
+    const roles = try q.getArray(allocator, "role_id");
+    defer allocator.free(roles);
+    try std.testing.expectEqual(@as(usize, 2), roles.len);
+    try std.testing.expectEqualStrings("7", roles[0]);
+    try std.testing.expectEqualStrings("8", roles[1]);
+
+    const tags = try q.getArray(allocator, "tag");
+    defer allocator.free(tags);
+    try std.testing.expectEqual(@as(usize, 1), tags.len);
+    try std.testing.expectEqualStrings("a", tags[0]);
+
+    // Values are decoded; `=`-less params are skipped; empty values are kept.
+    try std.testing.expectEqualStrings("张三", q.get("name").?);
+    try std.testing.expectEqualStrings("", q.get("empty").?);
+    try std.testing.expect(!q.contains("novalue"));
+
+    // The guard counts occurrences and refuses rather than truncating.
+    var small = Params.init(allocator);
+    defer small.deinit();
+    try std.testing.expectError(error.TooManyParams, parseQueryInto(&small, "a=1&b=2&c=3", allocator, 2));
 }

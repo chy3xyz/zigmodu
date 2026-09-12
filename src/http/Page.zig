@@ -79,16 +79,16 @@ test "PageParams clamps page_size and page" {
     defer ctx.deinit();
     // Context.init does not parse the URL query — populate like the request
     // parser does for a real request.
-    try ctx.query.put(try allocator.dupe(u8, "page"), try allocator.dupe(u8, "0"));
-    try ctx.query.put(try allocator.dupe(u8, "page_size"), try allocator.dupe(u8, "0"));
+    try ctx.query.put("page", "0");
+    try ctx.query.put("page_size", "0");
     const p = PageParams.parse(&ctx, .{ .max_page_size = 50 });
     try std.testing.expectEqual(@as(usize, 1), p.page);
     try std.testing.expectEqual(@as(usize, 1), p.page_size);
 
     var ctx2 = try Context.init(allocator, .GET, "/");
     defer ctx2.deinit();
-    try ctx2.query.put(try allocator.dupe(u8, "page"), try allocator.dupe(u8, "999"));
-    try ctx2.query.put(try allocator.dupe(u8, "page_size"), try allocator.dupe(u8, "10000"));
+    try ctx2.query.put("page", "999");
+    try ctx2.query.put("page_size", "10000");
     const p2 = PageParams.parse(&ctx2, .{ .max_page_size = 50 });
     try std.testing.expectEqual(@as(usize, 999), p2.page);
     try std.testing.expectEqual(@as(usize, 50), p2.page_size);
