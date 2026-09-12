@@ -133,6 +133,8 @@ test "compile all source files" {
     _ = @import("http/Multipart.zig");
     _ = @import("test/ContractGate.zig");
     _ = @import("test/DocsConsistency.zig");
+    _ = @import("test/ErrorSetSnapshot.zig");
+    _ = @import("test/CombinationMatrix.zig");
 
     // Tracing
     _ = @import("tracing/DistributedTracer.zig");

@@ -596,6 +596,14 @@ zig_ws/
 
 ## 14. 升级注意（zent 0.6 → 0.12 → 0.13 → 0.27 → 0.31 → 0.37）
 
+> **升级自查（先跑命令，再读条目）**：
+> ```bash
+> zmodu audit .                 # 租户来源 / 裸 panic / 共享 map / 裸 alignCast（b19–b22）
+> zig build check-production    # 裸 catch / catch unreachable
+> zig build test                # 形态与错误集快照（含文档↔代码一致性）
+> ```
+> 依赖版本升级后**先删 `.zig-cache` 再构建**（Zig 0.17-dev 增量缓存会沿用旧 fetch 模块）。
+
 | 主题 | 动作 / 新特性 |
 |------|--------------|
 | **v0.39.0 `zent.scope` + 宽松扫描器 + `zent.version`** | ① `zent.scope.forClient(infos, table, &client.entity, opts)` 把与 fluent 路径**同一份**读契约（软删 → 隐私 → 拦截器）渲染成 SQL 片段，供手写语句 splice —— 此前裸 SQL 会静默跳过租户/隐私过滤（本文件 §4.7 已补警告）。带策略的表缺 `privacy_ctx` → `error.PrivacyDenied`。② `queryAllLenient` / `queryOneLenient` 把 v0.38 的宽松扫描带到查询层（NULL/缺列 → 保留字段默认值，而非 `error.TypeMismatch`），适合 LEFT JOIN/DTO。③ `<col>Contains` 的诚实名字 `<col>Like`（`Contains` 保留为别名，不破坏）。④ `zent.version` 让消费侧校验版本而不必比对 git 提交。 |

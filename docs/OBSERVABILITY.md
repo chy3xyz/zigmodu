@@ -58,6 +58,19 @@ histogram_quantile(0.95, sum(rate(http_request_duration_milliseconds_bucket[5m])
 topk(5, sum(rate(http_responses_5xx_total[5m])) by (route))
 ```
 
+**基数纪律（多租户场景必须守）**：`route` 之外的维度**一律不要**直接打标签——
+`tenant_id`/`user_id`/`order_id` 这类高基数值会把 Prometheus 打死（每个租户一条序列，
+几千租户 = 几十万条）。需要分租户看时：
+
+- 用**已受限基数**的 `createCounterFamily` / `createHistogramFamily`（超出 `max_series`
+  统一进 `__other__`，见上文），并且只用于**小集合**（如"大客户"白名单）；
+- 或把租户维度留给日志/追踪（trace id 已由 `tracingMiddleware` 注入），指标只留聚合。
+- **禁止**：`metrics.createCounter("http_requests_total_v2", ...)` 里塞租户名、
+  或在 label 值里拼 `user-123` —— 这类写法在评审里应当直接打回。
+
+真要按租户分流，正确做法是**每租户一个实例/分片**（把基数变成部署维度），
+而不是把它压进标签。
+
 ### 业务面黄金信号（静默失败的高发区）
 
 HTTP 指标正常 ≠ 系统正常。outbox 停止投递、连接池打满这类故障在 HTTP 层面

@@ -1,5 +1,25 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **公开 API 错误集快照**（建议第 3 条）：`src/test/ErrorSetSnapshot.zig` 用
+  `@typeInfo` 反射钉住 `verifyToken` / `Multipart.parse` / `Server.start` 的错误集——
+  ①消费方 `switch` 依赖的错误必须仍在，②总数不得超过记录的上限（**放宽即破坏性变更**，
+  必须在本文件里显式确认），③退化成 `anyerror` 直接失败。基线：三者当前都是窄集
+  （22 / 7 / 19），**没有 anyerror**。
+- **组合矩阵测试**（建议第 7 条）：`src/test/CombinationMatrix.zig` 覆盖
+  `moduleGate(.unknown = .deny) × skip_prefixes`（目录内放行 / 目录外拒绝 /
+  `health/*` 等跳过前缀放行）与 `tenantResolver × JWT aud × override_existing`
+  （默认 aud 优先、显式覆盖时 header 优先、`require` 时无租户即拒绝、query 回退）。
+- **基数纪律写成明文禁令**（建议第 8 条）：`OBSERVABILITY.md` 明确禁止把
+  `tenant_id`/`user_id`/`order_id` 直接做标签（几千租户 = 几十万序列），给出两条正解
+  （受限基数 family 仅用于小集合 / 租户维度留给日志与 trace），并指出"按租户分流 =
+  把基数变成部署维度"。
+- **升级自查从"读文档"变成"跑命令"**（建议第 4 条的一部分）：`docs/ZENT.md` §14 顶部
+  给出三条命令（`zmodu audit` / `zig build check-production` / `zig build test`，
+  含形态与错误集快照、文档一致性）与"升级后先删 `.zig-cache`"的硬提醒。
+
 ## [0.15.42] - 2026-09-12
 
 ### Added
