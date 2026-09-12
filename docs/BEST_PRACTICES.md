@@ -842,6 +842,9 @@ const a = adapters.get("alipay");                    // 无锁、线程安全
 |------|------|------|
 | `application/x-www-form-urlencoded` | `ctx.bindForm(T)` | 与 query 同口径解码；loose 字段名；缺必填 → `error.MissingField` |
 | query string | `ctx.bindQuery(T)` | 同上契约 |
+| **重复键 / 数组**（`ids=1&ids=2`、`role_id[0]`、`tags[]`） | `ctx.queryValues` / `ctx.formValues` / `ctx.formArray` / `ctx.queryArray` | `get()` 仍是"最后出现者"（兼容旧语义）；`getFirst`/`getAll` 取全部；`getArray` 把 `name[0..n]` 与 `name[]` 合并为按索引排序的数组 |
+| **深层键** | `ctx.paramPath("filter.tags")` | 点路径 → `filter[tags]`；form 优先、回退 query |
+| 参数数量防护 | `Server.Config.max_params`（默认 1000） | query/form 按出现次数计数，超限 `error.TooManyParams`，不静默截断（对标 PHP `max_input_vars`） |
 | `multipart/form-data` | `ctx.bindMultipart(T, cfg)` + `Form.file(name)` | 文本与文件分开取；限额 `max_parts` / `max_part_bytes` / `max_total_bytes` |
 | JSON | `ctx.bindJsonLoose(T)` | camelCase 兼容、null 视为缺省、所有权统一 |
 | 路径参数 | `ctx.pathParam(name)`（旧名 `param`） | 它**不是**"任意参数" |

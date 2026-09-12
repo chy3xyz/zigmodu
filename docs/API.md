@@ -653,6 +653,25 @@ comes from a supervisor (`Restart=always`, k8s `restartPolicy: Always`); see
 [`BEST_PRACTICES.md`](BEST_PRACTICES.md)「韧性」and
 [`PRODUCTION_ROADMAP.md`](PRODUCTION_ROADMAP.md) for the prefork boundary.
 
+### `zigmodu.http.Params` (multi-value query/form)
+
+`ctx.query` and `ctx.form` are `Params`, not `StringHashMap`: HTML's two native
+"several values for one name" shapes are kept.
+
+```zig
+pub fn put(self, name, value) !void            // duplicates; repeated names accumulate
+pub fn putOwned(self, name, value) !void       // takes ownership (parsers use this)
+pub fn get(self, name) ?[]const u8             // LAST occurrence (compat with the old map)
+pub fn getFirst(self, name) ?[]const u8
+pub fn getAll(self, name) []const []const u8
+pub fn getArray(self, allocator, name) ![][]const u8   // name[0..n] sorted, then name[]
+pub fn getPath(self, path) ?[]const u8         // "filter.tags" → filter[tags]
+pub fn totalValues(self) usize                 // occurrences — what the guard counts
+```
+
+Context helpers: `queryValues` / `formValues` / `queryArray` / `formArray` /
+`paramPath`. Guard: `Server.Config.max_params` (default 1000 → `error.TooManyParams`).
+
 ### `zigmodu.http.Multipart`
 
 ```zig

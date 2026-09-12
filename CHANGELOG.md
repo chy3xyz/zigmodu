@@ -1,5 +1,30 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- **`ctx.query` / `ctx.form` 升级为多值容器 `Params`**（zapi 反馈 P1-4）：重复键
+  （`ids=1&ids=2`，即 `<select multiple>` / 复选框组的原生形态）不再被覆盖，括号键
+  （`role_id[0]`、`tags[]`）按原样保留供上层解释。**兼容性**：`get()` 仍返回**最后**一次
+  出现的值（与旧的单值 map 语义一致），消费侧 `ctx.query.get("page")` 无需改动。
+
+  ```zig
+  ctx.query.get("ids")            // 最后一次（历史语义）
+  ctx.query.getFirst("ids")       // 第一次
+  ctx.query.getAll("ids")         // 全部（到达顺序）
+  ctx.queryArray(alloc, "ids")    // 重复键或 ids[0]/ids[]（索引排序）
+  ctx.formArray(alloc, "role_id") // 表单同上
+  ctx.paramPath("filter.tags")    // 点路径 → filter[tags]（form 优先、回退 query）
+  ctx.bindForm(T) / bindQuery(T)  // 绑定契约不变；现也吃重复键与 role_id[0] 首元素
+  ```
+- **参数数量上限**：`Server.Config.max_params`（默认 1000，对标 PHP `max_input_vars`）。
+  query 与 form 都按"出现次数"计数，超限返回 `error.TooManyParams`，**不静默截断**。
+
+### Added
+- `zigmodu.http.Params` 导出（`put`/`putOwned`/`get`/`getFirst`/`getAll`/`getArray`/
+  `getPath`/`getSegments`/`count`/`totalValues`），6 个新测试覆盖重复键、括号数组
+  （索引排序 + `[]` 追加 + 无括号回退）、点路径、参数上限与所有权转移。
+
 ## [0.15.38] - 2026-09-12
 
 ### Added
