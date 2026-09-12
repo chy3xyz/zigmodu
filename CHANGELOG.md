@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.15.38] - 2026-09-12
 
 ### Added
 - **`multipart/form-data` 一等支持**（zapi 反馈 P1-5）：`src/http/Multipart.zig` +
