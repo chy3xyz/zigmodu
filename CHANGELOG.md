@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.15.43] - 2026-09-12
 
 ### Added
 - **公开 API 错误集快照**（建议第 3 条）：`src/test/ErrorSetSnapshot.zig` 用
