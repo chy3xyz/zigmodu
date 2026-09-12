@@ -53,6 +53,13 @@ pub const CorsConfig = struct {
 
 /// CORS middleware — config stored at module scope to avoid heap allocation.
 pub fn cors(config: CorsConfig) api.Middleware {
+    // An empty allowlist rejects every cross-origin request — including the
+    // preflight — with no other signal, which reads as "CORS is broken" during
+    // integration. Default is `&.{"*"}` (allow all), so this only fires when a
+    // caller deliberately passed an empty list.
+    if (config.allow_origins.len == 0) {
+        std.log.warn("[cors] allow_origins is empty: every cross-origin request (and preflight) will be rejected with 403", .{});
+    }
     // Per-instance configuration on `user_data` (allocated once, process
     // lifetime): multiple Servers / registrations with different configs no
     // longer overwrite each other via module-level statics.
@@ -477,6 +484,13 @@ pub fn authFromCatalog(slot: *comptime_router.CatalogSlot, backend: AuthBackend,
                 }
                 if (st.catalog_slot.get()) |cat| {
                     if (cat.isPublic(ctx.method, ctx.path)) {
+                        // Best-effort identity on public routes: when a token is
+                        // presented, verify it so handlers may *optionally*
+                        // personalize (ctx.userId() / optionalPortalUser) without a
+                        // second route or an "optional auth" mode. Failures are
+                        // ignored — the route stays public, and `verifyFn` never
+                        // writes a response.
+                        _ = st.backend.verify(ctx) catch {};
                         try next(ctx);
                         return;
                     }

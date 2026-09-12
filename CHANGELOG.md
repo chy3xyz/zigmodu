@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **Best-effort identity on `.public` routes.** `authFromCatalog` now verifies a
+  presented token even when the catalog marks the route `.public` and attaches
+  the resulting identity, instead of skipping verification outright. A missing,
+  malformed, or expired token changes nothing — the route stays public and
+  `verifyFn` never writes a response — but a *valid* one lets a public handler
+  optionally personalize (`ctx.userId()` / `optionalPortalUser`). This closes
+  the gap where a public-but-personalized endpoint (e.g. a C-end user center)
+  always saw an anonymous caller, since the framework had no "optional auth"
+  mode (`Auth` is `inherit | public | jwt`). Cost on public routes: one header
+  lookup without a token, one JWT verification with one.
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
