@@ -19,6 +19,19 @@
   一支存在的"尽力而为验签"抽成 `attachIdentityBestEffort`，三处中间件行为一致；
   `permissionGate` 的 public 短路不覆盖 `.optional`（这类路由仍可带 permission/roles 元数据）。
 
+### Added
+- **文档 ↔ 代码一致性门禁**（建议第 6 条）：新增 `src/test/DocsConsistency.zig`，
+  扫描 `docs/API.md` 里所有 `pub fn` / `pub const` 声明，逐个核对 `src/` 中是否存在
+  该声明（大写名字按"类型构造器"写法放宽、忽略仅注释里出现的词），缺失即 CI 失败。
+  首次运行抓出 **4 个纯虚构 API**：`TransportProtocol`、`MqttTransport`、
+  `TaskScheduler`、`PasRaftAdapter`——它们从未存在于本仓库，却被当作可用能力写在
+  API 参考里。已修正文档（Transport 段改为真实情况：HTTP/1.1 + h2c + gRPC，
+  MQTT 明确"未提供"；Scheduler 改为真实的 `zigmodu.cron.Scheduler` 签名；
+  Raft 指向 `core/cluster/RaftElection.zig` 并标注 experimental），另修掉把
+  `Context.body` 字段写成方法的条目。
+  范围只含 API.md：BEST_PRACTICES 有意展示**应用侧**示例代码（`OrdersApi` 等），
+  扫它全是误报。
+
 ### Changed
 - **`anytype` 形参的契约显式化**（建议第 1 条）：`Preflight.dbCheck` /
   `Preflight.EnvCheck.fromMap` / `PrometheusMetrics.registerMetricsRoute[Path]` /

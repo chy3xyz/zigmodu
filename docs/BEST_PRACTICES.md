@@ -959,6 +959,17 @@ if (!report.ok()) return error.PreflightFailed;   // 不启动，胜过带病运
 - 检查之间互不影响：单个探针失败不会掩盖其它结果。
 - 参考接线：`examples/zmsaas/backend/src/main.zig`（env + secret + DB + clock）。
 
+### 文档 ↔ 代码一致性（v0.15.42+）
+
+`src/test/DocsConsistency.zig` 把"API 参考里写的符号必须真实存在"变成 CI 门禁：
+扫描 `docs/API.md` 的 `pub fn` / `pub const` 声明，逐个在 `src/` 里核对（大写名字按
+"类型构造器"的文档写法放宽，只出现在注释里的词不算）。首次运行就抓到 4 个**从未存在过**
+的 API 被写在参考文档里——消费方照着写只会得到"找不到符号"。
+
+写文档时的三条规矩：① 示例签名从源码复制，别凭记忆；② 字段就是字段，别写成
+`pub fn`；③ 计划中/未提供的能力明确标注（`Not provided` / `experimental`），不要以
+可用 API 的形式出现。应用侧示例代码放在 BEST_PRACTICES（有意不参与该检查）。
+
 ### `anytype` 形参的契约写法（v0.15.41+）
 
 `anytype` 是灵活性来源，也是**隐式契约**——消费方传错形态时，报错往往落在被调方深处，

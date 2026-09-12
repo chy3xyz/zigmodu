@@ -802,17 +802,10 @@ pub fn isWritable(self: *WsFramer) bool                       // O(1) send-buffe
 
 ### Transport Protocols
 
-#### `zigmodu.core.TransportProtocol`
-
-Supported transport protocols.
-
-```zig
-pub const TransportProtocol = enum {
-    http,
-    grpc,
-    mqtt,
-};
-```
+ZigModu ships HTTP/1.1 and h2c in `http.Server` (`enable_http2`), and gRPC over
+HTTP/2 via `extensions/GrpcTransport.zig` + `GrpcServiceRegistry`. There is no
+`TransportProtocol` enum and no built-in MQTT transport — bring your own client
+for those (an MQTT client is not part of the framework).
 
 ### gRPC Transport (unary)
 
@@ -864,13 +857,8 @@ const host = sm.get("DB_HOST"); // priority: env > file > vault > default
 
 ### MQTT Transport
 
-```zig
-pub const MqttTransport = struct {
-    pub fn init(allocator: Allocator, broker: []const u8, port: u16) !Self
-    pub fn deinit(self: *Self) void
-    pub fn publish(self: *Self, topic: []const u8, payload: []const u8) !void
-};
-```
+Not provided. Use an external MQTT client library; the framework's HTTP stack
+(`http.HttpClient`) is unrelated to MQTT.
 
 ### HTTP Client
 
@@ -1096,7 +1084,7 @@ pub fn header(self: *const Context, key: []const u8) ?[]const u8
 
 pub fn formValue(self: *const Context, key: []const u8) ?[]const u8
 
-pub fn body: ?[]const u8
+body: ?[]const u8            // field, not a method
 
 ```
 
@@ -1416,14 +1404,20 @@ pub const CacheManager = struct {
 
 ### Scheduler
 
+#### `zigmodu.cron.Scheduler` (`src/scheduler/Cron.zig`)
+
+Cron expression jobs (`* * * * *`), driven by a background thread. For
+multi-replica deployments guard it with `DistributedLock` (see
+[`BEST_PRACTICES.md`](BEST_PRACTICES.md)「多副本后台任务」).
+
 ```zig
-pub const TaskScheduler = struct {
-    pub fn init(allocator: std.mem.Allocator) Self
-    pub fn addCronTask(self: *Self, name: []const u8, cron: []const u8, task: fn () void) !void
-    pub fn addIntervalTask(self: *Self, name: []const u8, interval_ms: u64, task: fn () void) !void
-    pub fn start(self: *Self) !void
-    pub fn stop(self: *Self) void
-};
+pub fn init(allocator: std.mem.Allocator, io: std.Io) Scheduler
+pub fn deinit(self: *Scheduler) void
+pub fn addJob(self: *Scheduler, name: []const u8, schedule: Expression, task: *const fn (*anyopaque) void, context: *anyopaque) !void
+pub fn setLock(self: *Scheduler, lock: DistributedLock.Lock, ttl_ms: u64) void
+pub fn start(self: *Scheduler) !void
+pub fn stop(self: *Scheduler) void
+pub fn tick(self: *Scheduler, now: i64) void   // deterministic driving, used by tests
 ```
 
 ### Database / Repository
@@ -1476,16 +1470,13 @@ pub const ClusterMembership = struct {
 };
 ```
 
-### PasRaft Consensus
+### Raft (experimental)
 
-```zig
-pub const PasRaftAdapter = struct {
-    pub fn init(allocator: std.mem.Allocator, config: Config) !Self
-    pub fn deinit(self: *Self) void
-    pub fn proposeModuleOperation(self: *Self, operation: Operation) ![]const u8
-    pub fn getClusterStatus(self: *Self) ![]const u8
-};
-```
+Leader election lives in `src/core/cluster/RaftElection.zig` (plus
+`ClusterMembership` / `ClusterHealth`). It is marked **experimental** — see
+[`PRODUCTION_ROADMAP.md`](PRODUCTION_ROADMAP.md) for the position on using it
+in production. The older `PasRaftAdapter` documented here never existed in this
+repository.
 
 ### Hot Reloader
 
