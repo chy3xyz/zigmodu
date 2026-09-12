@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+### Fixed
+- **表单体的解码口径与 query 不一致**（`parseFormBody`，zapi 反馈 P0-1）：query 的
+  key/value 都会 percent-decode，而 form body 原样 `dupe`。后果有两层：`formValue("name")`
+  拿到的是 `%E5%BC%A0%E4%B8%89` 而不是 `张三`；更隐蔽的是 **key 也未解码**，浏览器把嵌套键
+  编成 `role_id%5B0%5D`，于是 `formValue("role_id[0]")` 永远查不到。现在两条路径同一口径
+  （`%XX` 与 `+`→空格 都在解析期处理）。
+  ⚠️ **迁移提示**：消费侧若自己补了解码器（zapi 的 `contract/params.zig` 即此类），
+  需要删掉，否则会对已经解过的值再解一次；这类解码器同时可删的还有"逐字符比较原始 key"
+  的查找函数。
+- **CORS 空 allowlist 的失败模式不可诊断**（`Middleware.cors`）：显式传空
+  `allow_origins` 时所有跨域请求（含预检）一律 403 且无任何提示；现在启动时会 warn 一行。
+  （默认值仍是 `&.{"*"}`，只有主动传空数组才会触发。）
+
+### Added
+- **`ctx.bindForm(T)` / `ctx.bindQuery(T)`**（zapi 反馈 P0-2）：表单与查询的声明式绑定，
+  语义与所有权对齐 `bindJsonLoose` —— 字段名 loose 匹配（`role_id` ↔ `roleId`）、
+  缺省值保留、字符串字段深拷贝（调用方统一 free）、缺必填字段返回 `error.MissingField`
+  而不是静默零值。支持 `[]const u8` / 整数 / 浮点 / `bool`（`1/0/true/false/on/off`）
+  及其 `?T`；其它类型是编译期错误（不静默跳过字段）。
+  同时支持嵌套键的**首元素**绑定：字段 `role_id` 可直接吃下 `role_id[0]`。
+- **`ctx.pathParam(name)`**：`param` 的显式别名，消除"路径参数 vs 任意参数"的误读。
+- **`ctx.jsonValue(status, value)`**：`jsonStruct` 的别名。**注**：zapi 反馈称"框架只有
+  `ctx.json(bytes)`"，实际 `jsonStruct(status, anytype)` 早已存在且正是"任意 Zig 值 →
+  JSON"（P0-3 的真实缺口是命名可发现性，不是能力）。
+
 ### Added
 - **Best-effort identity on `.public` routes.** `authFromCatalog` now verifies a
   presented token even when the catalog marks the route `.public` and attaches

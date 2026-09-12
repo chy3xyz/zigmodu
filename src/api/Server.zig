@@ -360,6 +360,13 @@ pub const Context = struct {
     }
 
     /// Get query parameter
+    /// Path parameter (route placeholder, e.g. `{id}`). `param` is the
+    /// historical name for this — prefer `pathParam` for readability; form and
+    /// query inputs come from `formValue` / `queryParam` / `queryStr`.
+    pub fn pathParam(self: *const Context, key: []const u8) ?[]const u8 {
+        return self.param(key);
+    }
+
     pub fn queryParam(self: *const Context, key: []const u8) ?[]const u8 {
         return self.query.get(key);
     }
@@ -813,6 +820,32 @@ pub const Context = struct {
         return result;
     }
 
+    /// Bind `application/x-www-form-urlencoded` into a struct. Field lookup is
+    /// loose like `bindJsonLoose` (exact name, or camelCase/snake_case
+    /// equivalent), absent optionals stay null, and a field with a declared
+    /// default keeps it — so a form handler stops hand-rolling `getPara`.
+    ///
+    /// Supported field types: `[]const u8`/`[]u8`, integers, floats, `bool`
+    /// (`1/0/true/false/on/off`), and their `?T` forms. Anything else is a
+    /// compile error — add the type deliberately rather than silently ignoring
+    /// the field.
+    pub fn bindForm(self: *const Context, comptime T: type) !T {
+        const form = self.form orelse return error.NoFormBody;
+        return bindStringMap(T, form, self.allocator);
+    }
+
+    /// Bind the query string into a struct. Same contract as `bindForm`.
+    pub fn bindQuery(self: *const Context, comptime T: type) !T {
+        return bindStringMap(T, self.query, self.allocator);
+    }
+
+    /// Alias of `jsonStruct` for discoverability: any Zig value
+    /// (struct / optional / slice / array / int / float / bool / json.Value)
+    /// → JSON response. Prefer this name when asking "how do I send a value?"
+    pub fn jsonValue(self: *Context, status: u16, value: anytype) !void {
+        return self.jsonStruct(status, value);
+    }
+
     /// Send JSON from struct.
     pub fn jsonStruct(self: *Context, status: u16, value: anytype) !void {
         self.status_code = status;
@@ -892,8 +925,15 @@ fn parseFormBody(allocator: std.mem.Allocator, body: []const u8) !std.StringHash
     while (iter.next()) |param| {
         if (param.len == 0) continue;
         if (std.mem.indexOf(u8, param, "=")) |eq_pos| {
-            const key = try allocator.dupe(u8, param[0..eq_pos]);
-            const value = try allocator.dupe(u8, param[eq_pos + 1 ..]);
+            // Same decoding contract as the query string: keys AND values are
+            // percent-decoded (with `+` → space) at parse time. Browsers/`qs`
+            // encode nested keys (`role_id[0]` → `role_id%5B0%5D`), so a raw key
+            // could never be found via `formValue("role_id[0]")`, and a raw
+            // value meant `formValue("name")` returned `%E5%BC%A0%E4%B8%89`
+            // instead of `张三`.
+            const key = try percentDecode(allocator, param[0..eq_pos]);
+            errdefer allocator.free(key);
+            const value = try percentDecode(allocator, param[eq_pos + 1 ..]);
             try form.put(key, value);
         }
     }
@@ -2476,6 +2516,82 @@ fn namesEquivalent(a: []const u8, b: []const u8) bool {
 }
 
 /// Find a JSON object entry whose key is name-equivalent to `fname`.
+/// Shared loose binder for string→value sources (form body, query string).
+/// Values are owned by the caller exactly like `bindJsonLoose` (deep-copied
+/// strings), so the same free/ownership discipline applies.
+fn bindStringMap(comptime T: type, map: std.StringHashMap([]const u8), allocator: std.mem.Allocator) !T {
+    const info = @typeInfo(T);
+    if (info != .@"struct") @compileError("bindForm/bindQuery expect a struct type, got " ++ @typeName(T));
+
+    var result: T = undefined;
+    inline for (info.@"struct".field_names, info.@"struct".field_types, info.@"struct".field_attrs) |fname, F, attrs| {
+        const raw = lookupLoose(map, fname);
+        const finfo = @typeInfo(F);
+        const is_opt = finfo == .optional;
+        const Base = if (is_opt) finfo.optional.child else F;
+
+        if (raw) |text| {
+            @field(result, fname) = try parseFieldString(Base, fname, text, allocator);
+        } else if (comptime is_opt) {
+            @field(result, fname) = null;
+        } else if (attrs.defaultValue(F)) |d| {
+            @field(result, fname) = d;
+        } else {
+            return error.MissingField;
+        }
+    }
+    return result;
+}
+
+/// Parse one textual parameter value into a field type. Unsupported types are a
+/// compile error on purpose: a field the binder cannot fill must not silently
+/// stay zero.
+fn parseFieldString(comptime Base: type, comptime fname: []const u8, text: []const u8, allocator: std.mem.Allocator) !Base {
+    return switch (@typeInfo(Base)) {
+        .pointer => |ptr| blk: {
+            if (ptr.size != .slice or ptr.child != u8) {
+                @compileError("bindForm/bindQuery: unsupported field type for '" ++ fname ++ "': " ++ @typeName(Base));
+            }
+            break :blk try allocator.dupe(u8, text);
+        },
+        .int => std.fmt.parseInt(Base, text, 10) catch error.InvalidField,
+        .float => std.fmt.parseFloat(Base, text) catch error.InvalidField,
+        .bool => parseBoolLoose(text) orelse error.InvalidField,
+        else => @compileError("bindForm/bindQuery: unsupported field type for '" ++ fname ++ "': " ++ @typeName(Base)),
+    };
+}
+
+fn lookupLoose(map: std.StringHashMap([]const u8), fname: []const u8) ?[]const u8 {
+    if (map.get(fname)) |v| return v;
+    var it = map.iterator();
+    while (it.next()) |e| {
+        if (namesEquivalent(e.key_ptr.*, fname)) return e.value_ptr.*;
+    }
+    // Nested key (`role_id[0]`, `params[balance][money]`): bind the first
+    // element to the scalar field. Browsers/`qs` send exactly this shape, and
+    // the parse layer already decoded it (`role_id%5B0%5D` → `role_id[0]`).
+    // Other indices / repeated keys are read explicitly from the map.
+    var nested: ?[]const u8 = null;
+    var it2 = map.iterator();
+    while (it2.next()) |e| {
+        const key = e.key_ptr.*;
+        if (key.len > fname.len and key[fname.len] == '[' and
+            std.mem.startsWith(u8, key, fname))
+        {
+            if (nested == null or std.mem.order(u8, key, nested.?) == .lt) nested = key;
+        }
+    }
+    if (nested) |k| return map.get(k);
+    return null;
+}
+
+fn parseBoolLoose(text: []const u8) ?bool {
+    if (text.len == 0) return false;
+    if (std.mem.eql(u8, text, "1") or std.ascii.eqlIgnoreCase(text, "true") or std.ascii.eqlIgnoreCase(text, "on") or std.ascii.eqlIgnoreCase(text, "yes")) return true;
+    if (std.mem.eql(u8, text, "0") or std.ascii.eqlIgnoreCase(text, "false") or std.ascii.eqlIgnoreCase(text, "off") or std.ascii.eqlIgnoreCase(text, "no")) return false;
+    return null;
+}
+
 fn findLooseField(obj: std.json.ObjectMap, fname: []const u8) ?std.json.Value {
     var it = obj.iterator();
     while (it.next()) |e| {
@@ -3858,4 +3974,83 @@ test "WS write timeout disconnects a peer that stops reading" {
     try std.testing.expect(slow_ws_state.closed);
 
     server.stop();
+}
+
+test "parseFormBody decodes keys and values like the query string" {
+    const allocator = std.testing.allocator;
+    var form = try parseFormBody(allocator, "name=%E5%BC%A0%E4%B8%89&role_id%5B0%5D=7&note=a+b&plain=v");
+    defer {
+        var it = form.iterator();
+        while (it.next()) |e| {
+            allocator.free(e.key_ptr.*);
+            allocator.free(e.value_ptr.*);
+        }
+        form.deinit();
+    }
+
+    // UTF-8 value arrives decoded (`张三`), not as percent escapes.
+    try std.testing.expectEqualStrings("张三", form.get("name").?);
+    // Nested key is reachable by its decoded form — this is what the browser
+    // actually sent as `role_id%5B0%5D`.
+    try std.testing.expectEqualStrings("7", form.get("role_id[0]").?);
+    // `+` is a space, same as in query strings.
+    try std.testing.expectEqualStrings("a b", form.get("note").?);
+    try std.testing.expectEqualStrings("v", form.get("plain").?);
+    // No raw-key duplicate is left behind.
+    try std.testing.expect(form.get("role_id%5B0%5D") == null);
+}
+
+test "pathParam and jsonValue aliases keep the documented semantics" {
+    const allocator = std.testing.allocator;
+    var ctx = try Context.init(allocator, .GET, "/orders/42");
+    defer ctx.deinit();
+    try ctx.params.put(try allocator.dupe(u8, "id"), try allocator.dupe(u8, "42"));
+
+    try std.testing.expectEqualStrings("42", ctx.pathParam("id").?);
+    try std.testing.expectEqualStrings("42", ctx.param("id").?);
+
+    try ctx.jsonValue(201, .{ .id = 42, .ok = true });
+    try std.testing.expectEqual(@as(u16, 201), ctx.status_code);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.response_body.items, "\"id\":42") != null);
+}
+
+test "bindForm / bindQuery bind a struct without hand-rolled getPara" {
+    const allocator = std.testing.allocator;
+    const Params = struct {
+        name: []const u8,
+        role_id: i64,
+        active: bool = false,
+        note: ?[]const u8 = null,
+        score: f64 = 1.5,
+    };
+
+    var ctx = try Context.init(allocator, .POST, "/users");
+    defer ctx.deinit();
+    ctx.body = "name=%E5%BC%A0%E4%B8%89&role_id%5B0%5D=7&active=1&score=9.25";
+    // Ownership stays with `ctx` — `Context.deinit` frees the form map (keys
+    // and values included), so the test must not free it a second time.
+    ctx.form = try parseFormBody(allocator, ctx.body.?);
+    try ctx.query.put(try allocator.dupe(u8, "name"), try allocator.dupe(u8, "fallback"));
+
+    const p = try ctx.bindForm(Params);
+    defer allocator.free(p.name);
+    try std.testing.expectEqualStrings("张三", p.name);
+    // Nested key binds its first element to the scalar field: the browser sent
+    // `role_id%5B0%5D=7`, which the parse layer decoded to `role_id[0]`.
+    try std.testing.expectEqual(@as(i64, 7), p.role_id);
+    try std.testing.expect(p.active);
+    try std.testing.expectEqual(@as(f64, 9.25), p.score);
+    // Declared default preserved for an absent optional.
+    try std.testing.expect(p.note == null);
+
+    // bindQuery reads the query map with the same contract (form does not leak in).
+    const Q = struct { name: []const u8, page: i64 = 1 };
+    const q = try ctx.bindQuery(Q);
+    defer allocator.free(q.name);
+    try std.testing.expectEqualStrings("fallback", q.name);
+    try std.testing.expectEqual(@as(i64, 1), q.page);
+
+    // Missing required field is an error, not a silent empty value.
+    const Required = struct { absent_required: i64 };
+    try std.testing.expectError(error.MissingField, ctx.bindQuery(Required));
 }
