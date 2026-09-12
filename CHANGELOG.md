@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.15.39] - 2026-09-12
 
 ### Changed
 - **`ctx.query` / `ctx.form` 升级为多值容器 `Params`**（zapi 反馈 P1-4）：重复键
