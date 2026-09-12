@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.15.41] - 2026-09-12
 
 ### Added
 - **`Auth.optional`：公开但可个性化的路由（一等能力）**。`Auth` 此前只有
