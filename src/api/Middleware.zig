@@ -490,7 +490,17 @@ pub fn authFromCatalog(slot: *comptime_router.CatalogSlot, backend: AuthBackend,
                         // second route or an "optional auth" mode. Failures are
                         // ignored — the route stays public, and `verifyFn` never
                         // writes a response.
-                        _ = st.backend.verify(ctx) catch {};
+                        if (st.backend.verify(ctx)) |_| {} else |err| {
+                            // A missing/expired/malformed token must not fail a
+                            // public route — but it must not vanish either:
+                            // debug keeps it out of production logs while
+                            // remaining diagnosable, and this stays a real
+                            // `catch` instead of a bare `catch {}` (banned by
+                            // the project's own gate for I/O paths).
+                            std.log.debug("[auth] public route {s} {s}: token ignored ({s})", .{
+                                ctx.method.toString(), ctx.path, @errorName(err),
+                            });
+                        }
                         try next(ctx);
                         return;
                     }
