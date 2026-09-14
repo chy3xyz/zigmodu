@@ -69,6 +69,18 @@ pub const jwtBackendWithPermissions = http_middleware.jwtBackendWithPermissions;
 pub const AuthRejectFn = http_middleware.AuthRejectFn;
 pub const defaultReject = http_middleware.defaultReject;
 pub const envelopeReject = http_middleware.envelopeReject;
+// Process-wide error renderers: in-chain (sendError) + pre-routing transport.
+pub const problemReject = http_middleware.problemReject;
+pub const problemTransportBody = http_middleware.problemTransportBody;
+pub const setDefaultReject = http_middleware.setDefaultReject;
+pub const clearDefaultReject = http_middleware.clearDefaultReject;
+pub const useRfc7807Errors = http_middleware.useRfc7807Errors;
+pub const ErrorRendererFn = server_mod.ErrorRendererFn;
+pub const TransportErrorFn = server_mod.TransportErrorFn;
+pub const TransportErrorBody = server_mod.TransportErrorBody;
+pub const setErrorRenderer = server_mod.setErrorRenderer;
+pub const setTransportErrorRenderer = server_mod.setTransportErrorRenderer;
+pub const renderTransportError = server_mod.renderTransportError;
 // Token extractors (M12) + tenant resolver (M7).
 pub const TokenSource = http_middleware.TokenSource;
 pub const extractBearer = http_middleware.extractBearer;
@@ -85,6 +97,8 @@ pub const PermissionGateConfig = http_middleware.PermissionGateConfig;
 pub const PermissionMode = http_middleware.PermissionMode;
 pub const permissionMatchesRoles = http_middleware.permissionMatchesRoles;
 pub const permissionMatchesAuthInfo = http_middleware.permissionMatchesAuthInfo;
+pub const permissionMatchesContext = http_middleware.permissionMatchesContext;
+pub const permissionMatchesWith = http_middleware.permissionMatchesWith;
 pub const JwtFromCatalogConfig = http_middleware.JwtFromCatalogConfig;
 pub const ModuleGateConfig = http_middleware.ModuleGateConfig;
 pub const tracing_middleware = @import("api/middleware/Tracing.zig");

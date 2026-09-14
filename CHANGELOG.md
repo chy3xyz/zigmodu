@@ -1,5 +1,75 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **进程级错误渲染器**：框架自产错误体有三条出口（链内 `ctx.sendError`、路由前裸 socket、
+  handler 自写），此前只有第三条能被应用改。新增
+  `http.useRfc7807Errors()`（一次把前两条统一成 RFC 7807，media type
+  `application/problem+json`）、`http.setDefaultReject(?AuthRejectFn)`、
+  `http.clearDefaultReject()`、`http.problemReject`、
+  `http.setTransportErrorRenderer(?TransportErrorFn)` / `http.problemTransportBody`
+  （路由前 408/413/431/503 的体）、`Context.sendErrorEnvelope()`（绕过渲染器）。
+  `ModuleGateConfig` 补 `reject: AuthRejectFn`，**可保留 `.unknown = .deny` 同时改 404 体**。
+  装渲染器后"链尾中间件改 404 体 + 放弃 `.deny`"的 workaround 可删。
+- **handler 侧权限匹配**：`Context.permissionsCsv()`（与 `rolesCsv()` 同形）、
+  `Context.permissionMatches(expr)`、`http.permissionMatchesContext(ctx, expr)`、
+  `http.permissionMatchesWith(ctx, expr, config)`（与某个 gate 完全同语义）。
+  与 gate 的 OR 语义（`portal:user|portal:shop`）共用同一实现 —— 匹配原语下沉到
+  `ZigModu.security.Rbac.exprMatchesCsv` / `exprMatchesAuthInfo`，
+  `permissionGateWith` 改为委托，杜绝 handler 与 gate 两套语义漂移。
+- 测试：`src/test/ErrorShape.zig`（链内/路由前/未捕获 500 的形状矩阵，含"装 `defaultReject`
+  为默认渲染器不得自递归"）、`src/test/PermissionMatch.zig`（OR 表达式、AuthInfo 权威性、
+  `.roles`/`.rbac` 同语义）、`resilience/RateLimiter.zig` 两个并发用例
+  （去守卫会放行 117/100 —— 有牙）、`redis.zig` 三个 RESP 分帧用例。
+- 文档：`docs/UPGRADING.md`（逐版本 breaking / 影响面 / 一行改法）、
+  `docs/ISSUES_FROM_ZIGSHOP.md`（第 1–13 条核实矩阵：属实/部分/已存在/不属实 + 依据）。
+
+### Fixed
+- **Redis 客户端四件套**：① `pool_size <= 1` 的共享单流分支**不加锁** → 命令交叠、
+  流错位后端点永久挂起；② 每条命令只 `readSome` 一次 → 大回包截断且余字节留在流里污染
+  后续命令；③ `read_timeout_ms` / `write_timeout_ms` 声明了但全仓无读取点 → 读可以永久阻塞；
+  ④ 解析失败后连接原样放回池。现在：按 RESP 分帧读（`$`/`*` 先读长度再读体，**尾部 CRLF
+  从流里消费并校验**）、无池分支由 `stream_mu` 串行化、读路径每次阻塞前 poll 到 deadline
+  （超时 `RedisTimeout`）、写路径 `SO_SNDTIMEO`、任一失败即 `evictStream()` 摘除该连接。
+- **`ProblemDetails.toJson` 不做 JSON 转义**：`detail`/`instance`/`type` 含引号即产出非法
+  JSON（校验消息会带用户输入）。现全部经 `std.json.Stringify` 转义，
+  `ValidationProblem` 同步；`statusTitle` 补全 402/411/413/414/415/416/418/428/431/451/501/505/507。
+- **`RateLimiter` / `RateLimiterRegistry` / `SlidingWindowRateLimiter` 无任何同步**：
+  `current_tokens` 的读-改-写竞争会**同一枚令牌被两个线程花掉**（实测去掉守卫后 100 枚令牌
+  放行 117 次）；registry 的 `StringHashMap.put` 会撕裂元数据。三类各加内部短守卫
+  （先 `spinLoopHint`，32 次后 `std.Thread.yield()`；临界区只有一次 map 查找或两次浮点运算，
+  故不自旋到死也不引入 `io` 参数）。
+- **`RateLimiterRegistry` 按值存 `RateLimiter`**：`getOrCreate` 返回的 `*RateLimiter` 指向
+  map 内部存储，**下一次插入触发 rehash 即悬垂**（与 zent 连接池 UAF 同族）。改为存
+  `*RateLimiter`（堆分配），指针在 registry 生命周期内稳定 —— 有"插入 257 个 key 后旧指针
+  仍可用"的测试。
+
+### Changed
+- `RateLimiterRegistry.limiters` 字段类型 `std.StringHashMap(RateLimiter)` →
+  `std.StringHashMap(*RateLimiter)`（**破坏性**，仅影响直读该字段的代码；用
+  `get`/`getOrCreate`/`count` 的调用方不受影响）。详见 `docs/UPGRADING.md`。
+- `ctx.sendError` / `ctx.sendErrorResponse` 现在优先交给进程级渲染器；未装渲染器时行为
+  与之前一致，仅 `msg` 改为 JSON 转义（含引号的消息此前会产出非法 JSON）。
+  装渲染器后 `sendErrorResponse` 的业务 `code` 不被表达（RFC 7807 无业务码位）。
+- `ModuleGateConfig.reject` 默认仍为 `defaultReject`（信封），但 `defaultReject` 经
+  `ctx.sendError` 转发，故跟随进程级渲染器；`setDefaultReject(defaultReject)` 解析为
+  "不装渲染器"，避免自递归。
+- `RateLimiter.acquire` 标注 DEPRECATED（与 `tryAcquire` 同义）。
+- `AGENTS.md` 测试计数不再抄写具体数字，改为"以 `zig build test` 输出为准"
+  （`-Ddb` 收窄、平台、门控用例都会改变计数，抄下来必然漂移）。
+
+### Docs
+- `BEST_PRACTICES.md`：新增「错误响应形状：一条开关统一全框架」（三种形状 × 触发路径 ×
+  三条守则）、「共享限流器 / 统计结构的线程安全」（三个自查问题）、
+  「跨函数边界返回：必须具名类型」；「数据访问选型」补 sqlx `Client`/`Transaction`
+  两套签名与 `Rows`/`ManagedRows`/`BorrowedRow`/`QueryResult` 所有权表（签名已与源码核对）。
+- `API.md`：新增「Error response rendering」「Permission matching」两节，校正
+  `RateLimiter`（`acquire` 返回 `bool`、补 `release`）、`RateLimiterRegistry`（补 `get`/`count`
+  与指针稳定性）、补 `SlidingWindowRateLimiter`。
+- `AGENTS.md`：文件地图加 `UPGRADING.md` / `ISSUES_FROM_*`；DO/DON'T 加错误体统一、
+  单 gate 换形状、handler 问门户三行。
+
 ## [0.15.44] - 2026-09-12
 
 ### Changed

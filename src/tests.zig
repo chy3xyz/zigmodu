@@ -135,6 +135,8 @@ test "compile all source files" {
     _ = @import("test/DocsConsistency.zig");
     _ = @import("test/ErrorSetSnapshot.zig");
     _ = @import("test/CombinationMatrix.zig");
+    _ = @import("test/ErrorShape.zig");
+    _ = @import("test/PermissionMatch.zig");
 
     // Tracing
     _ = @import("tracing/DistributedTracer.zig");

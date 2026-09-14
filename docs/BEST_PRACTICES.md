@@ -13,7 +13,9 @@
 - [模块设计原则](#-模块设计原则)
 - [代码质量规范](#-代码质量规范)
 - [错误处理](#-错误处理)
+  - [错误响应形状：一条开关统一全框架](#错误响应形状一条开关统一全框架v01545)
   - [韧性：一个 bug 不拖垮整个后端](#韧性一个-bug-不拖垮整个后端v01536)
+  - [共享限流器 / 统计结构的线程安全](#共享限流器--统计结构的线程安全v01545)
   - [连接级背压与慢连接防护](#连接级背压与慢连接防护v01536)
   - [上线前预检](#上线前预检v01536)
   - [JWT 密钥轮换（kid）](#jwt-密钥轮换kidv01536)
@@ -594,6 +596,33 @@ ZigModu 不绑定 ORM：**同一个应用里按模块选型**，但两者正交�
 租户来源必须是 JWT 注入的 attr（`.tenant_source = .attr`），从 query 取租户会被
 `zmodu audit` b22 拦下。
 
+### sqlx：`Client` 与 `Transaction` 两套签名
+
+同一件事在两个对象上签名不同，**不是笔误**——`Transaction` 不持有 allocator（它借连接），
+所以凡是要分配字符串/行的查询都多一个 `allocator` 参数：
+
+| 操作 | `Client` | `Transaction` |
+|------|----------|---------------|
+| 取一行（全字段） | `queryRow(T, sql, args)` | `queryRow(allocator, T, sql, args)` |
+| 取一行（部分字段） | `queryRowPartial(T, sql, args)` | `queryRowPartial(allocator, T, sql, args)` |
+| 取多行 | `queryRows(T, sql, args)` | `queryRows(allocator, T, sql, args)` |
+| 执行 | `exec(sql, args)` | `tx.exec(sql, args)` |
+
+行集的释放责任也随之不同（**以下签名已与源码核对**）：
+
+| 类型 | 所有权 | 释放 |
+|------|--------|------|
+| `Rows`（`queryRows`/`query` 返回） | 自带 arena | `rows.deinit()` —— **不传 allocator** |
+| `ManagedRows` | 包一层 `Rows` | `.deinit()` —— 同样不传 allocator |
+| `BorrowedRow(T)`（`queryRowPartialBorrowed`） | 借用，字符串绑定其 arena | `.deinit()`；`get()` 的浅拷贝在 `deinit` 前有效 |
+| `QueryResult(T)`（`queryRowsOwned` / `scanRowsToOwned`） | `arena != null` 时拥有全部字符串与 items 切片 | **二选一**：`deinitArena()`（arena 路径，推荐）**或** 逐行 `freeScanned(allocator, T, row)` + `allocator.free(items)` —— **都做 = double-free** |
+
+`deinit(allocator)` 在 arena 路径上会忽略传入的 allocator（用 arena 自己的 backing allocator），
+所以**误传不同 allocator 不会立刻报错、却会让 SafeAllocator 拒收**——arena 路径请用 `deinitArena()`。
+
+`Transaction` 内的读写**必须**走 `tx` 句柄（`tx.exec` / `backend.execTx`），否则自动提交且
+`rollback` 无效——伪事务，`zmodu audit` b18 会拦。
+
 ---
 
 ## 🏗️ 模块设计原则
@@ -800,6 +829,41 @@ pub fn processRequest(req: Request) AppError!Response {
 - **降级策略**：在关键服务不可用时提供降级方案
 - **断路器模式**：使用 CircuitBreaker 防止雪崩
 
+### 错误响应形状：一条开关统一全框架（v0.15.45+）
+
+对外契约最常见的写法是"失败体必须是 `ProblemDetails`"。这个承诺**只有在你够得到每一条出口时才成立** ——
+框架自产的错误体有三条出口，修复前只有一条能被应用改：
+
+| 形状 | 触发路径 | 谁来写 |
+|------|---------|--------|
+| `{"status":…,"title":…,"detail":…,"instance":…}` | `http.respondErr` / `respondProblem` / 显式 `.reject` | **handler / 应用**（你能控制） |
+| `{"code":status,"msg":…,"data":null}` | `ctx.sendError`/`sendErrorResponse`：moduleGate 403/404、CSRF 403、413、请求超时 408、**未捕获 handler 500**、静态文件错误 | 框架内部 |
+| `{"error":"…"}` | 路由**之前**写裸 socket：400/408/413 `BodyTooLarge`/431 `TooManyHeaders`、accept 线程超额 503 | 框架传输层（中间件链之外） |
+
+后两条是"客户端把路径写错 / UI 未迁移"这种最常见场景的出口。装上渲染器即可全部收口：
+
+```zig
+// 启动期一次：链内 + 路由前全部 RFC 7807（application/problem+json）
+zigmodu.http.useRfc7807Errors();
+```
+
+| 需求 | 调用 |
+|------|------|
+| 只收口链内 | `http.setDefaultReject(http.problemReject)` |
+| 只收口路由前 | `http.setTransportErrorRenderer(http.problemTransportBody)` |
+| 完全复位（测试用） | `http.clearDefaultReject()` |
+| 单个 gate 例外 | `.reject = http.envelopeReject(.thinkphp)`（`ModuleGateConfig` 也接受 `reject`） |
+| 单条响应例外 | `ctx.sendErrorEnvelope(status, code, msg)` |
+
+三条守则：
+
+- **不要用链尾中间件去改 404 体。** 那需要把 `moduleGate` 降级成 `.unknown = .allow`，等于放弃 gate 的拒绝语义；`.reject` 钩子（v0.15.45）既保留 `.deny` 又能改body。
+- **未捕获的 500 抓不到就别去抓。** 它发生在中间件链之外，只能由进程级渲染器统一 —— 这也是钩子设计成进程级而非路由级的原因。
+- **渲染器签名不含业务 code。** `sendErrorResponse(status, code, msg)` 在装了渲染器后 `code` 会被丢弃（RFC 7807 没有业务码位）；需要两者兼得就用 `ctx.sendErrorEnvelope`。
+
+> 自查：`grep -rn 'application/json' src/api/middleware/` 不该出现自造信封；
+> `scripts/check-production.sh` 会拦"信封泄漏"（`sendSuccess`/`sendFail`/裸 `{"code":`）。
+
 ### 韧性：一个 bug 不拖垮整个后端（v0.15.36+）
 
 Zig 的 panic 不可捕获——请求路径上任何一次 panic 都会终止**整个进程**，
@@ -884,6 +948,23 @@ panic 钩子管诊断，不管存活。进程存活靠 supervisor：`systemd`
 `Restart=always`、k8s `restartPolicy: Always` 或容器编排的重启策略。
 多进程隔离（prefork）的边界与前置条件见
 [`PRODUCTION_ROADMAP.md`](PRODUCTION_ROADMAP.md)「单进程单点与原位隔离」。
+
+### 共享限流器 / 统计结构的线程安全（v0.15.45+）
+
+`RateLimiter`、`RateLimiterRegistry`、`SlidingWindowRateLimiter` 三者**现在都是线程安全的**
+（内部短自旋守卫）。在此之前的后果不是抽象的：`current_tokens` 的读-改-写竞争会让
+**同一枚令牌被两个线程花掉**——把守卫临时去掉，100 枚令牌的并发用例被放行 117 次。
+
+自己写"跨请求共享的可变结构"时，按同一个标准问三个问题：
+
+| 问题 | 危险信号 | 处置 |
+|------|---------|------|
+| 热路径上有共享可变哈希表吗？ | `put`/`resize` 撕裂元数据，读者 `@alignCast` → `incorrect alignment` panic（进程级） | 启动期填充 + `FrozenMap`（只读），或加锁 |
+| 返回过容器内部元素的指针吗？ | 下一次插入触发 rehash → 调用方拿到**悬垂指针**（zent 连接池 UAF 同族） | 容器存**指针**，不存值 |
+| 计数器是"读-改-写"吗？ | 丢更新（限流值只是"大致"）、令牌重复消费 | 原子 CAS，或加锁 |
+
+`zmodu audit` 的 b20/b21 规则正是扫前两类（文件作用域共享可变 HashMap / 请求路径裸 `@alignCast`）——
+两者都属于"一次就打死整个进程"，见 [`MODULITH.md`](MODULITH.md) 与「韧性」一节。
 
 ### 连接级背压与慢连接防护（v0.15.36+）
 
@@ -1003,6 +1084,24 @@ if (!report.ok()) return error.PreflightFailed;   // 不启动，胜过带病运
 
 已加固的公开 API：`Preflight.dbCheck` / `Preflight.EnvCheck.fromMap` /
 `PrometheusMetrics.registerMetricsRoute[Path]` / `Dashboard.registerRoutes`。
+
+### 跨函数边界返回：必须具名类型（v0.15.45+）
+
+Zig 里**同名但各自内联的 struct 是不同类型**。persistence 返回 `!struct { list: []T, total: i64 }`，
+service 再声明一个字面相同的内联返回类型，编译器报的是 `expected A, found B` —— 名字一样，
+类型不同，人会反复踩（反馈方在日志查询、结算列表、统计趋势、任务统计上各踩一次）。
+
+```zig
+// ✗ 两层各自内联：类型不相等，报错在 service 层，光看名字找不到原因
+pub fn listLogs(...) !struct { list: []Log, total: i64 } { ... }
+pub fn logs(...) !struct { list: []Log, total: i64 } { ... }
+
+// ✓ 具名一次，全链路复用（框架已有泛型容器 data.PageResult(T)）
+pub const LogPage = struct { list: []Log, total: i64 };
+```
+
+规则：**跨函数/跨层边界返回的结构一律具名**；分页场景直接用 `data.PageResult(T)`。
+局部变量里的内联 struct 无所谓。
 
 ### 公开但可个性化：`Auth.optional`（v0.15.41+）
 

@@ -18,6 +18,7 @@ Complete API reference for the ZigModu modular framework.
 10. [Security](#security)
 11. [Testing](#testing)
 12. [Hardening primitives](#hardening-primitives)
+13. [Error response rendering](#error-response-rendering)
 
 ---
 
@@ -395,14 +396,15 @@ pub fn resetAll(self: *Self) void
 
 #### `zigmodu.resilience.RateLimiter`
 
-Token bucket rate limiting.
+Token bucket rate limiting. **线程安全**（内部短自旋守卫），可跨线程共享。
 
 ```zig
 pub fn init(allocator: std.mem.Allocator, name: []const u8, max_tokens: u32, refill_rate: u32) !Self
 pub fn deinit(self: *Self) void
 pub fn tryAcquire(self: *Self) bool
-pub fn acquire(self: *Self) void
+pub fn acquire(self: *Self) bool          // DEPRECATED: 同 tryAcquire（同步上下文无法阻塞等待）
 pub fn tryAcquireMany(self: *Self, count: u32) bool
+pub fn release(self: *Self) void          // 归还一枚令牌（预留后未用上的场景）
 pub fn availableTokens(self: *Self) u32
 pub fn reset(self: *Self) void
 pub fn getStats(self: *Self) Stats
@@ -414,6 +416,23 @@ pub fn getStats(self: *Self) Stats
 pub fn RateLimiterRegistry.init(allocator: std.mem.Allocator, default_max_tokens: u32, default_refill_rate: u32) Self
 pub fn getOrCreate(self: *Self, name: []const u8) !*RateLimiter
 pub fn getOrCreateForClient(self: *Self, client_id: []const u8, max_tokens: u32, refill_rate: u32) !*RateLimiter
+pub fn get(self: *Self, name: []const u8) ?*RateLimiter
+pub fn count(self: *Self) usize
+```
+
+`getOrCreate*` 返回的 `*RateLimiter` 在 registry 生命周期内**稳定**（内部堆分配，后续插入不会使其失效）。
+
+### SlidingWindowRateLimiter
+
+#### `zigmodu.resilience.SlidingWindowRateLimiter`
+
+窗口内计数限流；**线程安全**。
+
+```zig
+pub fn init(allocator: std.mem.Allocator, name: []const u8, window_size_seconds: u64, max_requests: u32) !Self
+pub fn deinit(self: *Self) void
+pub fn tryAcquire(self: *Self) bool
+pub fn currentCount(self: *Self) usize
 ```
 
 ### Retry Policy
@@ -1309,6 +1328,37 @@ pub fn main(init: std.process.Init) !void {
 ```
 ---
 
+## Error response rendering
+
+### `zigmodu.http.useRfc7807Errors`
+
+框架自产的错误体有三条出口（链内 `ctx.sendError`、路由前裸 socket、handler 自写）。
+这两条钩子把前两条统一成 RFC 7807 ProblemDetails（media type `application/problem+json`）：
+
+```zig
+pub fn useRfc7807Errors() void                       // 链内 + 路由前，一次到位
+pub fn setDefaultReject(renderer: ?AuthRejectFn) void // 仅链内；null = 复原信封
+pub fn clearDefaultReject() void                      // 复位（测试用）
+
+pub fn problemReject(ctx: *Context, status: u16, message: []const u8) anyerror!void
+pub fn problemTransportBody(status: u16, message: []const u8, buf: []u8) TransportErrorBody
+
+pub fn setTransportErrorRenderer(renderer: ?TransportErrorFn) void  // 仅路由前
+pub fn renderTransportError(status: u16, message: []const u8, buf: []u8) TransportErrorBody
+
+// Context
+pub fn sendError(self: *Context, status: u16, message: []const u8) !void
+pub fn sendErrorResponse(self: *Context, status: u16, code: i32, message: []const u8) !void
+pub fn sendErrorEnvelope(self: *Context, status: u16, code: i32, message: []const u8) !void  // 绕过渲染器
+
+// Middleware 配置：ModuleGateConfig 新增 reject（保留 .unknown = .deny 同时改 404 体）
+pub const ModuleGateConfig = struct { reject: AuthRejectFn = defaultReject, ... };
+```
+
+细节与三条守则见 [`BEST_PRACTICES.md`](BEST_PRACTICES.md)「错误响应形状」。
+
+---
+
 ## Security
 
 ### JWT Authentication
@@ -1324,6 +1374,27 @@ pub fn verifyToken(self: *Self, token_string: []const u8) !JwtPayload
 pub fn hashPassword(self: *Self, password: []const u8) ![]const u8
 pub fn verifyPassword(self: *Self, password: []const u8, hash: []const u8) bool
 ```
+
+### Permission matching
+
+handler 侧使用**与路由 meta 完全相同的表达式**判断身份，避免"路由允许 OR、handler 只认一侧"把一整类用户 403 掉：
+
+```zig
+// Context
+pub fn rolesCsv(self: *const Context) ?[]const u8           // 逗号分隔门户角色
+pub fn permissionsCsv(self: *const Context) ?[]const u8     // 逗号分隔权限码（同形）
+pub fn permissionMatches(self: *const Context, expr: []const u8) bool
+
+// http（Middleware）
+pub fn permissionMatchesContext(ctx: *const Context, expr: []const u8) bool
+pub fn permissionMatchesWith(ctx: *const Context, expr: []const u8, config: PermissionGateConfig) bool
+pub fn permissionMatchesRoles(roles_csv: []const u8, permission: []const u8) bool
+pub fn permissionMatchesAuthInfo(auth: *const Rbac.AuthInfo, permission: []const u8) bool
+```
+
+`expr` 支持 `a|b` 备选语法。`permissionMatches` 命中任一身份来源（AuthInfo / `permissions` / `roles`）；
+`permissionMatchesWith` 则**锁定某个 gate 的语义**（`.roles` 只读 roles；`.rbac` 有 AuthInfo 时以它为准）。
+两者共用 `zigmodu.security.Rbac.exprMatchesCsv` / `exprMatchesAuthInfo`，与 gate 同一份实现。
 
 ### Security Scanner
 
@@ -1505,5 +1576,5 @@ pub const PluginManager = struct {
 
 ---
 
-*Last updated: 2025-04-15*
+*Last updated: 2026-09-15*
 *For more examples, see [examples](../examples/)*

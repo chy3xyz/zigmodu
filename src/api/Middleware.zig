@@ -16,14 +16,77 @@ const std = @import("std");
 const api = @import("Server.zig");
 const Time = @import("../core/Time.zig");
 const SecurityModule = @import("../security/SecurityModule.zig").SecurityModule;
+const ProblemDetails = @import("../http/ProblemDetails.zig").ProblemDetails;
 
 /// Consumer hook for auth rejections: renders the 401/403/500 body in any
 /// envelope dialect without forking middleware. Default = `ctx.sendError`.
 pub const AuthRejectFn = *const fn (ctx: *api.Context, status: u16, message: []const u8) anyerror!void;
 
-/// Default rejection renderer (current behavior): `{"code":status,"msg":…,"data":null}`.
+/// Default rejection renderer: the legacy envelope
+/// `{"code":status,"msg":…,"data":null}` via `ctx.sendError`.
+///
+/// `ctx.sendError` honours the process-wide error renderer, so a gate that
+/// leaves `.reject` at this default follows `http.useRfc7807Errors()`. Use
+/// `ctx.sendErrorEnvelope` from a custom renderer if you need the envelope
+/// unconditionally.
 pub fn defaultReject(ctx: *api.Context, status: u16, message: []const u8) anyerror!void {
     try ctx.sendError(status, message);
+}
+
+/// Rejection renderer emitting RFC 7807 ProblemDetails with `instance` set to
+/// the request path, and media type `application/problem+json`.
+///
+/// Install process-wide with `setDefaultReject(problemReject)` /
+/// `useRfc7807Errors()`, or per gate with `.reject = problemReject`.
+pub fn problemReject(ctx: *api.Context, status: u16, message: []const u8) anyerror!void {
+    const problem = ProblemDetails.init(status, message, ctx.path);
+    const json = try problem.toJson(ctx.allocator);
+    defer ctx.allocator.free(json);
+    try ctx.json(status, json);
+    try ctx.setHeader("Content-Type", "application/problem+json");
+}
+
+/// `api.TransportErrorFn` implementation: RFC 7807 body for errors raised
+/// before routing, allocated into the caller's scratch buffer.
+pub fn problemTransportBody(status: u16, message: []const u8, buf: []u8) api.TransportErrorBody {
+    const problem = ProblemDetails.init(status, message, null);
+    return .{
+        .content_type = "application/problem+json",
+        .body = problem.writeToBuf(buf),
+    };
+}
+
+/// Install the process-wide renderer for in-chain errors — every internal
+/// `ctx.sendError` / `ctx.sendErrorResponse` (moduleGate 403/404, CSRF 413/403,
+/// request-timeout 408, the uncaught-handler 500, static-file errors) plus any
+/// gate left at the `.reject = defaultReject` default.
+///
+/// Pass `null` to restore the legacy envelope. Call once at startup: the global
+/// is read per request and is not synchronised with in-flight traffic.
+pub fn setDefaultReject(renderer: ?AuthRejectFn) void {
+    // `defaultReject` writes through `ctx.sendError`, which is the call the
+    // renderer hook intercepts — installing it as the renderer would recurse.
+    // `null` is how "keep the legacy envelope" is expressed.
+    const resolved: ?AuthRejectFn = if (renderer) |f| (if (f == defaultReject) null else f) else null;
+    api.setErrorRenderer(resolved);
+}
+
+/// Make every framework-generated error body RFC 7807 ProblemDetails, in one
+/// call — both the middleware-chain sites and the pre-routing transport errors
+/// (408/413/431/503). Call once during startup, before `app.start()`.
+///
+/// Handlers that already use `ctx.json` / `http.respondErr`, and gates given an
+/// explicit `.reject` (e.g. `envelopeReject(.thinkphp)`), are unaffected.
+pub fn useRfc7807Errors() void {
+    setDefaultReject(problemReject);
+    api.setTransportErrorRenderer(problemTransportBody);
+}
+
+/// Remove the process-wide renderers installed by `useRfc7807Errors`, restoring
+/// the legacy envelope and `{"error":…}` bodies. Intended for tests.
+pub fn clearDefaultReject() void {
+    api.setErrorRenderer(null);
+    api.setTransportErrorRenderer(null);
 }
 
 /// Rejection renderer for an envelope dialect: 401 → `ctx.unauth` (ThinkPHP
@@ -761,6 +824,12 @@ pub const ModuleGateConfig = struct {
     /// Path prefixes exempt from `unknown = .deny` (infra routes living outside
     /// the ComptimeRouter catalog, e.g. health/metrics probes).
     skip_prefixes: []const []const u8 = &.{ "health", "dashboard", "openapi.json" },
+    /// Renderer for the 403 (module not in `allowed`) and 404 (unknown module
+    /// under `.deny`). Defaults to the legacy envelope, which itself follows the
+    /// process-wide renderer — pass `.reject = problemReject` to force RFC 7807
+    /// on this gate, or `.allow` plus a chain-tail middleware to style 404s
+    /// yourself.
+    reject: AuthRejectFn = defaultReject,
 };
 
 /// Resolves catalog module → ctx attr; optional allow-list / deny-unknown.
@@ -790,13 +859,13 @@ pub fn moduleGate(slot: *comptime_router.CatalogSlot, config: ModuleGateConfig) 
                             }
                         }
                         if (!ok) {
-                            try ctx.sendError(403, "Module not allowed");
+                            try st.cfg.reject(ctx, 403, "Module not allowed");
                             return;
                         }
                     }
                 } else if (st.cfg.unknown == .deny) {
                     if (!comptime_router.pathHasSkipPrefix(ctx.path, st.cfg.skip_prefixes)) {
-                        try ctx.sendError(404, "Unknown route module");
+                        try st.cfg.reject(ctx, 404, "Unknown route module");
                         return;
                     }
                 }
@@ -807,32 +876,48 @@ pub fn moduleGate(slot: *comptime_router.CatalogSlot, config: ModuleGateConfig) 
     };
 }
 
-fn rolesCsvHas(roles_csv: []const u8, want: []const u8) bool {
-    var it = std.mem.splitScalar(u8, roles_csv, ',');
-    while (it.next()) |r| {
-        const trimmed = std.mem.trim(u8, r, " \t");
-        if (trimmed.len > 0 and std.mem.eql(u8, trimmed, want)) return true;
-    }
-    return false;
-}
-
 /// `permission` may be a single code or OR-alternatives separated by `|`.
+/// Delegates to `Rbac.exprMatchesCsv` so the gate and the handler-side
+/// `Context.permissionMatches` cannot diverge.
 pub fn permissionMatchesRoles(roles_csv: []const u8, permission: []const u8) bool {
-    var alts = std.mem.splitScalar(u8, permission, '|');
-    while (alts.next()) |alt| {
-        const want = std.mem.trim(u8, alt, " \t");
-        if (want.len > 0 and rolesCsvHas(roles_csv, want)) return true;
-    }
-    return false;
+    return Rbac.exprMatchesCsv(roles_csv, permission);
 }
 
+/// See `permissionMatchesRoles`. Delegates to `Rbac.exprMatchesAuthInfo`.
 pub fn permissionMatchesAuthInfo(auth: *const Rbac.AuthInfo, permission: []const u8) bool {
-    var alts = std.mem.splitScalar(u8, permission, '|');
-    while (alts.next()) |alt| {
-        const want = std.mem.trim(u8, alt, " \t");
-        if (want.len > 0 and auth.hasPermission(want)) return true;
-    }
-    return false;
+    return Rbac.exprMatchesAuthInfo(auth, permission);
+}
+
+/// Handler-side counterpart of `permissionGateWith`.
+///
+/// A gate may accept `portal:user|portal:shop` (OR), after which the handler
+/// often still needs to know *which* branch this request satisfied — to pick a
+/// response shape, or to run a portal-specific check. Re-implementing the match
+/// in the handler is how a route that accepts both portals ends up 403-ing one
+/// of them.
+///
+/// `expr` is the route's expression verbatim. Any attached identity source may
+/// satisfy it (AuthInfo, `permissions` attr, `roles` attr).
+pub fn permissionMatchesContext(ctx: *const api.Context, expr: []const u8) bool {
+    return ctx.permissionMatches(expr);
+}
+
+/// `permissionMatchesContext` pinned to one gate's exact semantics — same mode
+/// and attr names, so the handler's answer cannot differ from the gate's:
+///
+///   `http.permissionMatchesWith(ctx, expr, .{ .mode = .rbac })`
+///
+/// In `.rbac` mode an attached `AuthInfo` is authoritative (the gate does not
+/// fall back to the attr), and in `.roles` mode only the roles attr is read.
+pub fn permissionMatchesWith(ctx: *const api.Context, expr: []const u8, config: PermissionGateConfig) bool {
+    return switch (config.mode) {
+        .roles => Rbac.exprMatchesCsv(ctx.getAttr(config.role_attr) orelse "", expr),
+        .rbac => blk: {
+            if (ctx.authInfo(Rbac.AuthInfo)) |ai| break :blk Rbac.exprMatchesAuthInfo(ai, expr);
+            const perms = ctx.getAttr(config.permission_attr) orelse break :blk false;
+            break :blk Rbac.exprMatchesCsv(perms, expr);
+        },
+    };
 }
 
 pub const PermissionMode = enum {

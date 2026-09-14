@@ -7,6 +7,7 @@
 //!
 //!   - `moduleGate(.unknown = .deny) × skip_prefixes`
 //!   - `tenantResolver × JWT aud × override_existing`
+//!   - `error shape × {gate default, gate override, sendError, transport}`
 //!   - `auth = .optional × valid/invalid/absent token` (Middleware.zig) —
 //!     covered next to the middleware itself.
 

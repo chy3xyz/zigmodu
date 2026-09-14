@@ -10,6 +10,114 @@ const sockread = @import("../core/sockread.zig");
 /// Write command bytes to Redis stream (Zig 0.17 compat: stream.write removed).
 /// Must flush: `Writer.writeAll` only fills the buffer; without flush the
 /// RESP command never reaches Redis and the subsequent read hangs forever.
+/// Reads one complete RESP reply into a caller-owned buffer.
+///
+/// The old code did a single `readSome` per command, which is wrong on two
+/// counts: a reply larger than the buffer was truncated (and the remainder
+/// stayed in the socket, desynchronising every later command), and a reply
+/// split across TCP segments was parsed half-formed. This reader frames by
+/// RESP instead: `+`/`-`/`:` run to CRLF, `$`/`*` read the declared byte count.
+///
+/// `timeout_ms` is a real read deadline (poll before each blocking read) —
+/// `RedisConfig.read_timeout_ms` used to be declared and never read.
+const ReplyReader = struct {
+    stream: std.Io.net.Stream,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    timeout_ms: u32,
+
+    fn deadlineExpired(self: *ReplyReader) !void {
+        if (self.timeout_ms == 0) return;
+        var fds = [1]std.posix.pollfd{.{
+            .fd = self.stream.socket.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = std.posix.poll(&fds, @intCast(self.timeout_ms)) catch return error.RedisTimeout;
+        if (ready == 0) return error.RedisTimeout;
+    }
+
+    fn readByte(self: *ReplyReader) !u8 {
+        try self.deadlineExpired();
+        var one: [1]u8 = undefined;
+        const n = sockread.readSome(self.stream, &one) catch return error.RedisError;
+        if (n == 0) return error.RedisError;
+        return one[0];
+    }
+
+    /// Append one CRLF-terminated line, CRLF included, so `out` holds the exact
+    /// wire bytes the pre-framing code used to hand to the parsers.
+    fn readLine(self: *ReplyReader, out: *std.ArrayList(u8)) !void {
+        while (true) {
+            const c = try self.readByte();
+            try out.append(self.allocator, c);
+            if (c == '\r') {
+                const nl = try self.readByte();
+                if (nl != '\n') return error.RedisError;
+                try out.append(self.allocator, nl);
+                return;
+            }
+        }
+    }
+
+    fn readExact(self: *ReplyReader, out: *std.ArrayList(u8), count: usize) !void {
+        var i: usize = 0;
+        var chunk: [512]u8 = undefined;
+        while (i < count) {
+            const want = @min(chunk.len, count - i);
+            try self.deadlineExpired();
+            const n = sockread.readSome(self.stream, chunk[0..want]) catch return error.RedisError;
+            if (n == 0) return error.RedisError;
+            try out.appendSlice(self.allocator, chunk[0..n]);
+            i += n;
+        }
+    }
+
+    /// Consume the CRLF that terminates a bulk body. It has to come off the
+    /// socket, not be synthesised: a phantom CRLF left in the stream shifts the
+    /// next reply by two bytes and every later command misparses.
+    fn readCrlf(self: *ReplyReader, out: *std.ArrayList(u8)) !void {
+        const start = out.items.len;
+        try self.readExact(out, 2);
+        if (!std.mem.eql(u8, out.items[start..], "\r\n")) return error.RedisError;
+    }
+
+    /// Read a `$`/`*` length line: the digits are returned, the whole line
+    /// (CRLF included) is appended to `out`.
+    fn readCount(self: *ReplyReader, out: *std.ArrayList(u8)) !i64 {
+        var line = std.ArrayList(u8).empty;
+        defer line.deinit(self.allocator);
+        try self.readLine(&line);
+        try out.appendSlice(self.allocator, line.items);
+        return std.fmt.parseInt(i64, std.mem.trimEnd(u8, line.items, "\r\n"), 10) catch error.RedisError;
+    }
+};
+
+/// Frame one complete RESP reply into `out`, keeping the wire shape
+/// (`+OK\r\n`, `:12\r\n`, `$5\r\nhello\r\n`, `*-1\r\n`) so a command's
+/// existing parsing keeps working on a now-complete buffer.
+fn readWholeReply(reader: *ReplyReader, out: *std.ArrayList(u8)) !void {
+    const type_byte = try reader.readByte();
+    try out.append(reader.allocator, type_byte);
+    switch (type_byte) {
+        // Simple string / error / integer: one line.
+        '+', '-', ':' => try reader.readLine(out),
+        '$' => {
+            const len = try reader.readCount(out);
+            if (len >= 0) {
+                try reader.readExact(out, @intCast(len));
+                try reader.readCrlf(out);
+            }
+        },
+        '*' => {
+            const count = try reader.readCount(out);
+            var i: i64 = 0;
+            while (i < count) : (i += 1) try readWholeReply(reader, out);
+        },
+        else => return error.RedisError,
+    }
+}
+
 fn writeCmd(stream: *const std.Io.net.Stream, io: std.Io, cmd: []const u8) errors.Result {
     var wbuf: [8192]u8 = undefined;
     var wstream = stream.writer(io, &wbuf);
@@ -30,6 +138,8 @@ pub const RedisConfig = struct {
 
 /// Redis client for zigzero
 pub const Redis = struct {
+    /// Serialises commands when there is no pool (`pool_size <= 1`).
+    stream_mu: std.Io.Mutex = .init,
     allocator: std.mem.Allocator,
     config: RedisConfig,
     stream: ?std.Io.net.Stream = null,
@@ -91,10 +201,23 @@ pub const Redis = struct {
     pub fn connect(self: *Redis) !void {
         const address = std.Io.net.IpAddress.parseIp4(self.config.host, self.config.port) catch return error.RedisError;
         self.stream = address.connect(self.io, .{ .mode = .stream }) catch return error.RedisError;
+        // `write_timeout_ms` used to be declared and never applied: a stalled
+        // Redis made writes block forever (and held `stream_mu` while doing it).
+        if (self.stream) |s| sockread.setSendTimeout(s, self.config.write_timeout_ms);
     }
 
+    /// Borrowed connection handle. Named on purpose: an inline struct type
+    /// would not be assignable between `acquireStream` / `releaseStream` /
+    /// `evictStream` even with identical fields.
+    pub const Borrowed = struct { stream: std.Io.net.Stream, pool_idx: ?usize };
+
     /// Borrow a pooled connection (or the primary stream when pool_size <= 1).
-    fn acquireStream(self: *Redis) errors.ResultT(struct { stream: std.Io.net.Stream, pool_idx: ?usize }) {
+    ///
+    /// The single-stream case takes `stream_mu` for the whole command: without
+    /// it two request fibers interleave their writes and each reads the other's
+    /// reply (the desync that produced 500s and then hung endpoints forever
+    /// under concurrency with `pool_size = 1`).
+    fn acquireStream(self: *Redis) errors.ResultT(Borrowed) {
         if (self.pool) |*p| {
             self.pool_mu.lock(self.io) catch return error.RedisError;
             defer self.pool_mu.unlock(self.io);
@@ -112,16 +235,46 @@ pub const Redis = struct {
             }
             return error.RedisError; // pool exhausted
         }
-        const s = self.stream orelse return error.RedisError;
+        self.stream_mu.lock(self.io) catch return error.RedisError;
+        const s = self.stream orelse {
+            self.stream_mu.unlock(self.io);
+            return error.RedisError;
+        };
         return .{ .stream = s, .pool_idx = null };
     }
 
     fn releaseStream(self: *Redis, pool_idx: ?usize) void {
-        const idx = pool_idx orelse return;
+        const idx = pool_idx orelse {
+            self.stream_mu.unlock(self.io);
+            return;
+        };
         if (self.pool) |*p| {
             self.pool_mu.lock(self.io) catch return;
             defer self.pool_mu.unlock(self.io);
             if (idx < p.in_use.len) p.in_use[idx] = false;
+        }
+    }
+
+    /// Drop the stream we just failed on instead of returning it to the pool:
+    /// a desynchronised connection must never be handed to the next borrower.
+    fn evictStream(self: *Redis, borrowed: Borrowed) void {
+        if (self.pool) |*p| {
+            const idx = borrowed.pool_idx orelse {
+                borrowed.stream.close(self.io);
+                return;
+            };
+            self.pool_mu.lock(self.io) catch return;
+            defer self.pool_mu.unlock(self.io);
+            if (idx < p.streams.len) {
+                if (p.streams[idx]) |s| s.close(self.io);
+                p.streams[idx] = null;
+                p.in_use[idx] = false;
+            }
+            return;
+        }
+        borrowed.stream.close(self.io);
+        if (self.stream) |s| {
+            if (s.socket.handle == borrowed.stream.socket.handle) self.stream = null;
         }
     }
 
@@ -144,9 +297,14 @@ pub const Redis = struct {
 
             try writeCmd(&stream, self.io, cmd);
 
-            var buf: [4096]u8 = undefined;
-            const n = sockread.readSome(stream, &buf) catch return error.RedisError;
-            const response = buf[0..n];
+            var response_list = std.ArrayList(u8).empty;
+            defer response_list.deinit(self.allocator);
+            var reply_reader = ReplyReader{ .stream = stream, .io = self.io, .allocator = self.allocator, .timeout_ms = self.config.read_timeout_ms };
+            readWholeReply(&reply_reader, &response_list) catch {
+                self.evictStream(borrowed);
+                return error.RedisError;
+            };
+            const response = response_list.items;
 
             // Parse bulk string response
             if (response.len > 1) {
@@ -181,8 +339,13 @@ pub const Redis = struct {
 
         try writeCmd(&stream, self.io, cmd);
 
-        var buf: [256]u8 = undefined;
-        _ = sockread.readSome(stream, &buf) catch return error.RedisError;
+        var response_list = std.ArrayList(u8).empty;
+        defer response_list.deinit(self.allocator);
+        var reply_reader = ReplyReader{ .stream = stream, .io = self.io, .allocator = self.allocator, .timeout_ms = self.config.read_timeout_ms };
+        readWholeReply(&reply_reader, &response_list) catch {
+            self.evictStream(borrowed);
+            return error.RedisError;
+        };
     }
 
     /// Set a value only if key doesn't exist
@@ -195,9 +358,16 @@ pub const Redis = struct {
 
         try writeCmd(&stream, self.io, cmd);
 
-        var buf: [256]u8 = undefined;
-        const n = sockread.readSome(stream, &buf) catch return error.RedisError;
-        const response = buf[0..n];
+        var response_list = std.ArrayList(u8).empty;
+        defer response_list.deinit(self.allocator);
+        var reply_reader = ReplyReader{ .stream = stream, .io = self.io, .allocator = self.allocator, .timeout_ms = self.config.read_timeout_ms };
+        readWholeReply(&reply_reader, &response_list) catch {
+            // Framing failed or the deadline passed: this connection's byte
+            // stream can no longer be trusted, so it must not go back to the pool.
+            self.evictStream(borrowed);
+            return error.RedisError;
+        };
+        const response = response_list.items;
 
         if (response.len > 1 and response[0] == ':') {
             const val = std.fmt.parseInt(i32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return false;
@@ -221,9 +391,16 @@ pub const Redis = struct {
 
         try writeCmd(&stream, self.io, cmd_builder.items);
 
-        var buf: [256]u8 = undefined;
-        const n = sockread.readSome(stream, &buf) catch return error.RedisError;
-        const response = buf[0..n];
+        var response_list = std.ArrayList(u8).empty;
+        defer response_list.deinit(self.allocator);
+        var reply_reader = ReplyReader{ .stream = stream, .io = self.io, .allocator = self.allocator, .timeout_ms = self.config.read_timeout_ms };
+        readWholeReply(&reply_reader, &response_list) catch {
+            // Framing failed or the deadline passed: this connection's byte
+            // stream can no longer be trusted, so it must not go back to the pool.
+            self.evictStream(borrowed);
+            return error.RedisError;
+        };
+        const response = response_list.items;
 
         if (response.len > 1 and response[0] == ':') {
             const val = std.fmt.parseInt(u32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
@@ -242,9 +419,16 @@ pub const Redis = struct {
 
         try writeCmd(&stream, self.io, cmd);
 
-        var buf: [256]u8 = undefined;
-        const n = sockread.readSome(stream, &buf) catch return error.RedisError;
-        const response = buf[0..n];
+        var response_list = std.ArrayList(u8).empty;
+        defer response_list.deinit(self.allocator);
+        var reply_reader = ReplyReader{ .stream = stream, .io = self.io, .allocator = self.allocator, .timeout_ms = self.config.read_timeout_ms };
+        readWholeReply(&reply_reader, &response_list) catch {
+            // Framing failed or the deadline passed: this connection's byte
+            // stream can no longer be trusted, so it must not go back to the pool.
+            self.evictStream(borrowed);
+            return error.RedisError;
+        };
+        const response = response_list.items;
 
         if (response.len > 1 and response[0] == ':') {
             const val = std.fmt.parseInt(i32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return false;
@@ -263,9 +447,16 @@ pub const Redis = struct {
 
         try writeCmd(&stream, self.io, cmd);
 
-        var buf: [256]u8 = undefined;
-        const n = sockread.readSome(stream, &buf) catch return error.RedisError;
-        const response = buf[0..n];
+        var response_list = std.ArrayList(u8).empty;
+        defer response_list.deinit(self.allocator);
+        var reply_reader = ReplyReader{ .stream = stream, .io = self.io, .allocator = self.allocator, .timeout_ms = self.config.read_timeout_ms };
+        readWholeReply(&reply_reader, &response_list) catch {
+            // Framing failed or the deadline passed: this connection's byte
+            // stream can no longer be trusted, so it must not go back to the pool.
+            self.evictStream(borrowed);
+            return error.RedisError;
+        };
+        const response = response_list.items;
 
         if (response.len > 1 and response[0] == ':') {
             const val = std.fmt.parseInt(i64, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
@@ -284,9 +475,16 @@ pub const Redis = struct {
 
         try writeCmd(&stream, self.io, cmd);
 
-        var buf: [256]u8 = undefined;
-        const n = sockread.readSome(stream, &buf) catch return error.RedisError;
-        const response = buf[0..n];
+        var response_list = std.ArrayList(u8).empty;
+        defer response_list.deinit(self.allocator);
+        var reply_reader = ReplyReader{ .stream = stream, .io = self.io, .allocator = self.allocator, .timeout_ms = self.config.read_timeout_ms };
+        readWholeReply(&reply_reader, &response_list) catch {
+            // Framing failed or the deadline passed: this connection's byte
+            // stream can no longer be trusted, so it must not go back to the pool.
+            self.evictStream(borrowed);
+            return error.RedisError;
+        };
+        const response = response_list.items;
 
         if (response.len > 1 and response[0] == ':') {
             const val = std.fmt.parseInt(i64, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
@@ -305,8 +503,13 @@ pub const Redis = struct {
 
         try writeCmd(&stream, self.io, cmd);
 
-        var buf: [256]u8 = undefined;
-        _ = sockread.readSome(stream, &buf) catch return error.RedisError;
+        var response_list = std.ArrayList(u8).empty;
+        defer response_list.deinit(self.allocator);
+        var reply_reader = ReplyReader{ .stream = stream, .io = self.io, .allocator = self.allocator, .timeout_ms = self.config.read_timeout_ms };
+        readWholeReply(&reply_reader, &response_list) catch {
+            self.evictStream(borrowed);
+            return error.RedisError;
+        };
         return;
     }
 
@@ -320,9 +523,16 @@ pub const Redis = struct {
 
         try writeCmd(&stream, self.io, cmd);
 
-        var buf: [256]u8 = undefined;
-        const n = sockread.readSome(stream, &buf) catch return error.RedisError;
-        const response = buf[0..n];
+        var response_list = std.ArrayList(u8).empty;
+        defer response_list.deinit(self.allocator);
+        var reply_reader = ReplyReader{ .stream = stream, .io = self.io, .allocator = self.allocator, .timeout_ms = self.config.read_timeout_ms };
+        readWholeReply(&reply_reader, &response_list) catch {
+            // Framing failed or the deadline passed: this connection's byte
+            // stream can no longer be trusted, so it must not go back to the pool.
+            self.evictStream(borrowed);
+            return error.RedisError;
+        };
+        const response = response_list.items;
 
         if (response.len > 1 and response[0] == ':') {
             const val = std.fmt.parseInt(i64, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
@@ -349,9 +559,16 @@ pub const Redis = struct {
 
         try writeCmd(&stream, self.io, cmd_builder.items);
 
-        var buf: [256]u8 = undefined;
-        const n = sockread.readSome(stream, &buf) catch return error.RedisError;
-        const response = buf[0..n];
+        var response_list = std.ArrayList(u8).empty;
+        defer response_list.deinit(self.allocator);
+        var reply_reader = ReplyReader{ .stream = stream, .io = self.io, .allocator = self.allocator, .timeout_ms = self.config.read_timeout_ms };
+        readWholeReply(&reply_reader, &response_list) catch {
+            // Framing failed or the deadline passed: this connection's byte
+            // stream can no longer be trusted, so it must not go back to the pool.
+            self.evictStream(borrowed);
+            return error.RedisError;
+        };
+        const response = response_list.items;
 
         if (response.len >= 3 and std.mem.eql(u8, response[0..3], "+OK")) {
             return true;
@@ -369,8 +586,13 @@ pub const Redis = struct {
 
         try writeCmd(&stream, self.io, cmd);
 
-        var buf: [256]u8 = undefined;
-        _ = sockread.readSome(stream, &buf) catch return error.RedisError;
+        var response_list = std.ArrayList(u8).empty;
+        defer response_list.deinit(self.allocator);
+        var reply_reader = ReplyReader{ .stream = stream, .io = self.io, .allocator = self.allocator, .timeout_ms = self.config.read_timeout_ms };
+        readWholeReply(&reply_reader, &response_list) catch {
+            self.evictStream(borrowed);
+            return error.RedisError;
+        };
         return;
     }
 
@@ -384,9 +606,16 @@ pub const Redis = struct {
 
         try writeCmd(&stream, self.io, cmd);
 
-        var buf: [256]u8 = undefined;
-        const n = sockread.readSome(stream, &buf) catch return error.RedisError;
-        const response = buf[0..n];
+        var response_list = std.ArrayList(u8).empty;
+        defer response_list.deinit(self.allocator);
+        var reply_reader = ReplyReader{ .stream = stream, .io = self.io, .allocator = self.allocator, .timeout_ms = self.config.read_timeout_ms };
+        readWholeReply(&reply_reader, &response_list) catch {
+            // Framing failed or the deadline passed: this connection's byte
+            // stream can no longer be trusted, so it must not go back to the pool.
+            self.evictStream(borrowed);
+            return error.RedisError;
+        };
+        const response = response_list.items;
 
         if (response.len > 1 and response[0] == ':') {
             const val = std.fmt.parseInt(u32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
@@ -404,9 +633,16 @@ pub const Redis = struct {
 
         try writeCmd(&stream, self.io, cmd);
 
-        var buf: [4096]u8 = undefined;
-        const n = sockread.readSome(stream, &buf) catch return error.RedisError;
-        const response = buf[0..n];
+        var response_list = std.ArrayList(u8).empty;
+        defer response_list.deinit(self.allocator);
+        var reply_reader = ReplyReader{ .stream = stream, .io = self.io, .allocator = self.allocator, .timeout_ms = self.config.read_timeout_ms };
+        readWholeReply(&reply_reader, &response_list) catch {
+            // Framing failed or the deadline passed: this connection's byte
+            // stream can no longer be trusted, so it must not go back to the pool.
+            self.evictStream(borrowed);
+            return error.RedisError;
+        };
+        const response = response_list.items;
 
         if (response.len > 1) {
             if (response[0] == '$') {
@@ -438,9 +674,16 @@ pub const Redis = struct {
 
         try writeCmd(&stream, self.io, cmd);
 
-        var buf: [256]u8 = undefined;
-        const n = sockread.readSome(stream, &buf) catch return error.RedisError;
-        const response = buf[0..n];
+        var response_list = std.ArrayList(u8).empty;
+        defer response_list.deinit(self.allocator);
+        var reply_reader = ReplyReader{ .stream = stream, .io = self.io, .allocator = self.allocator, .timeout_ms = self.config.read_timeout_ms };
+        readWholeReply(&reply_reader, &response_list) catch {
+            // Framing failed or the deadline passed: this connection's byte
+            // stream can no longer be trusted, so it must not go back to the pool.
+            self.evictStream(borrowed);
+            return error.RedisError;
+        };
+        const response = response_list.items;
 
         if (response.len > 1 and response[0] == ':') {
             const val = std.fmt.parseInt(i32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return 0;
@@ -460,9 +703,16 @@ pub const Redis = struct {
 
         try writeCmd(&stream, self.io, cmd);
 
-        var buf: [4096]u8 = undefined;
-        const n = sockread.readSome(stream, &buf) catch return error.RedisError;
-        const response = buf[0..n];
+        var response_list = std.ArrayList(u8).empty;
+        defer response_list.deinit(self.allocator);
+        var reply_reader = ReplyReader{ .stream = stream, .io = self.io, .allocator = self.allocator, .timeout_ms = self.config.read_timeout_ms };
+        readWholeReply(&reply_reader, &response_list) catch {
+            // Framing failed or the deadline passed: this connection's byte
+            // stream can no longer be trusted, so it must not go back to the pool.
+            self.evictStream(borrowed);
+            return error.RedisError;
+        };
+        const response = response_list.items;
 
         if (response.len > 1) {
             if (response[0] == '$') {
@@ -494,9 +744,16 @@ pub const Redis = struct {
 
         try writeCmd(&stream, self.io, cmd);
 
-        var buf: [256]u8 = undefined;
-        const n = sockread.readSome(stream, &buf) catch return error.RedisError;
-        const response = buf[0..n];
+        var response_list = std.ArrayList(u8).empty;
+        defer response_list.deinit(self.allocator);
+        var reply_reader = ReplyReader{ .stream = stream, .io = self.io, .allocator = self.allocator, .timeout_ms = self.config.read_timeout_ms };
+        readWholeReply(&reply_reader, &response_list) catch {
+            // Framing failed or the deadline passed: this connection's byte
+            // stream can no longer be trusted, so it must not go back to the pool.
+            self.evictStream(borrowed);
+            return error.RedisError;
+        };
+        const response = response_list.items;
 
         if (response.len > 1 and response[0] == ':') {
             const val = std.fmt.parseInt(u32, std.mem.trimEnd(u8, response[1..], "\r\n"), 10) catch return error.RedisError;
@@ -796,4 +1053,151 @@ test "redis cluster init" {
     const node1 = cluster.selectNode("mykey");
     const node2 = cluster.selectNode("mykey");
     try std.testing.expectEqual(node1, node2);
+}
+
+// ── RESP framing & single-stream locking (regression tests for the desync bug) ──
+
+/// socketpair-based fake peer: no network permission needed, fully deterministic.
+fn testPair() ?[2]std.posix.socket_t {
+    var fds: [2]std.posix.socket_t = undefined;
+    const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    return switch (std.posix.errno(rc)) {
+        .SUCCESS => fds,
+        else => null,
+    };
+}
+
+fn testReader(stream: std.Io.net.Stream, allocator: std.mem.Allocator, timeout_ms: u32) ReplyReader {
+    return .{ .stream = stream, .io = std.testing.io, .allocator = allocator, .timeout_ms = timeout_ms };
+}
+
+/// Write a whole slice to the fake peer. Hand-counting the length for
+/// `system.write` is a trap: `"$5\r\nhe"` is 6 bytes, so asking for 7 ships the
+/// literal's NUL sentinel down the socket and the reader then sees a reply that
+/// never came from Redis.
+fn peerWriteAll(fd: std.posix.socket_t, bytes: []const u8) void {
+    var sent: usize = 0;
+    while (sent < bytes.len) {
+        const rc = std.posix.system.write(fd, bytes[sent..].ptr, bytes[sent..].len);
+        if (std.posix.errno(rc) != .SUCCESS) return;
+        const n: usize = @intCast(rc);
+        if (n == 0) return;
+        sent += n;
+    }
+}
+
+test "readWholeReply frames a bulk value split across writes" {
+    const allocator = std.testing.allocator;
+    const fds = testPair() orelse return error.SkipZigTest;
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } };
+    defer stream.close(std.testing.io);
+    defer _ = std.posix.system.close(fds[1]);
+
+    // "$5\r\nhello\r\n" delivered in three TCP-sized bites, the body straddling
+    // two of them — the old single `readSome` parse produced a truncated value
+    // and left "llo\r\n" in the socket to poison the next command.
+    peerWriteAll(fds[1], "$5\r\nhe");
+    peerWriteAll(fds[1], "llo");
+    peerWriteAll(fds[1], "\r\n");
+
+    var reader = testReader(stream, allocator, 2000);
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    try readWholeReply(&reader, &out);
+    try std.testing.expectEqualStrings("$5\r\nhello\r\n", out.items);
+}
+
+test "readWholeReply frames values larger than one read and nested arrays" {
+    const allocator = std.testing.allocator;
+    const fds = testPair() orelse return error.SkipZigTest;
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } };
+    defer stream.close(std.testing.io);
+    defer _ = std.posix.system.close(fds[1]);
+
+    // The peer writes from its own thread: a socketpair's buffer is far smaller
+    // than the 8 KiB payload, so writing inline before anyone reads deadlocks.
+    const Peer = struct {
+        fn run(fd: std.posix.socket_t) void {
+            const big_len = 8192;
+            var header_buf: [32]u8 = undefined;
+            const header = std.fmt.bufPrint(&header_buf, "${d}\r\n", .{big_len}) catch return;
+            peerWriteAll(fd, header);
+            var payload: [1024]u8 = @splat('x');
+            var sent: usize = 0;
+            while (sent < big_len) : (sent += payload.len) {
+                peerWriteAll(fd, payload[0..@min(payload.len, big_len - sent)]);
+            }
+            peerWriteAll(fd, "\r\n");
+            // Nested array (`*2` of `$-1` and `:7`) right after: the int-only
+            // commands rely on arrays being framed too.
+            peerWriteAll(fd, "*2\r\n$-1\r\n:7\r\n");
+        }
+    };
+    const peer = try std.Thread.spawn(.{}, Peer.run, .{fds[1]});
+    defer peer.join();
+
+    var reader = testReader(stream, allocator, 5000);
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    try readWholeReply(&reader, &out);
+    const header_len = "$8192\r\n".len;
+    try std.testing.expectEqual(@as(usize, header_len + 8192 + 2), out.items.len);
+    try std.testing.expect(std.mem.startsWith(u8, out.items, "$8192\r\n"));
+    try std.testing.expectEqual(@as(usize, 8192), std.mem.count(u8, out.items, "x"));
+
+    var out2 = std.ArrayList(u8).empty;
+    defer out2.deinit(allocator);
+    try readWholeReply(&reader, &out2);
+    try std.testing.expectEqualStrings("*2\r\n$-1\r\n:7\r\n", out2.items);
+}
+
+test "readWholeReply honors the read deadline instead of blocking forever" {
+    const allocator = std.testing.allocator;
+    const fds = testPair() orelse return error.SkipZigTest;
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } };
+    defer stream.close(std.testing.io);
+    defer _ = std.posix.system.close(fds[1]);
+
+    // Server accepts the command but never replies: before this, the read
+    // blocked forever and the endpoint could not recover without a restart.
+    var reader = testReader(stream, allocator, 120);
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    try std.testing.expectError(error.RedisTimeout, readWholeReply(&reader, &out));
+}
+
+test "redis concurrent incr on a single shared stream (pool_size = 1)" {
+    // The production shape that failed: `pool_size = 1` means every request
+    // fiber shares one socket. Before the fix that path took no lock (commands
+    // interleaved: 11/60 requests got `RedisError`, then endpoints hung once the
+    // byte stream desynchronised) and there was no read deadline to recover.
+    // Requires a running Redis server; set REDIS_URL to enable.
+    const redis_url = if (builtin.os.tag == .windows) @as(?[]const u8, null) else if (std.c.getenv("REDIS_URL")) |ptr| std.mem.span(ptr) else null;
+    if (redis_url == null or redis_url.?.len == 0) return error.SkipZigTest;
+
+    const raw = redis_url.?;
+    const after_scheme = if (std.mem.startsWith(u8, raw, "redis://")) raw["redis://".len..] else raw;
+    const host = if (std.mem.indexOfScalar(u8, after_scheme, ':')) |i| after_scheme[0..i] else after_scheme;
+
+    const threads_n: usize = 32;
+    const cfg = RedisConfig{ .host = host, .pool_size = 1, .read_timeout_ms = 2000 };
+    var r = try Redis.new(std.testing.allocator, std.testing.io, cfg);
+    defer r.deinit();
+    try r.connect();
+
+    const key = "zigmodu:test:redis:single-stream";
+    _ = r.del(&.{key}) catch {};
+
+    const threads = try std.testing.allocator.alloc(std.Thread, threads_n);
+    defer std.testing.allocator.free(threads);
+    for (threads) |*t| t.* = try std.Thread.spawn(.{}, concurrentIncrWorker, .{ &r, key });
+    for (threads) |t| t.join();
+
+    const final = try r.get(key);
+    defer if (final) |v| std.testing.allocator.free(v);
+    try std.testing.expect(final != null);
+    // Every INCR must have landed: a lost update means two commands interleaved
+    // on the shared socket (the bug this test exists for).
+    try std.testing.expectEqualStrings("32", final.?);
+    _ = r.del(&.{key}) catch {};
 }

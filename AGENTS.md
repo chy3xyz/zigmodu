@@ -21,6 +21,8 @@
 | 部署拓扑（TLS 边车/探针/守护） | `examples/production-deploy/`（nginx · Envoy · k8s · systemd） |
 | Extract / SSE / Testkit / Outbox | `docs/FRAMEWORK_BACKLOG.md` |
 | 故障注入 / 契约门禁模板 | `src/test/FaultInjection.zig` · `src/test/ContractGate.zig` |
+| 升级注意事项（breaking / 影响面 / 改法） | `docs/UPGRADING.md` |
+| 外部反馈核实与处置 | `docs/ISSUES_FROM_ZAPI.md` · `docs/ISSUES_FROM_ZIGSHOP.md` |
 | CLI 生成 | `docs/ZMODU_CLI_INTEGRATION.md` · `zig build zmodu -- scaffold …` |
 | LLM 对话模块（产品功能） | `docs/AI.md`（**不是** agent 指南） |
 | AI 业务接入（KeyManager/Agent/Workflow/Skill/接入） | `docs/AI_DEV_GUIDE.md` + `docs/AI_SKILLS.md` + `docs/LLM_POLICIES.md` |
@@ -68,6 +70,9 @@ defer app.stop();
 | sqlx：`Client.open` 后注意 pool/client 指针；CB 传 `io` | 在 ConnPool 上缓存失效的 `*Client` |
 | sqlx 驱动链接：`-Ddb=sqlite\|postgres\|mysql\|all`（默认 `all`） | 小系统用 `.db = "sqlite"`，勿默认三库全链 |
 | 共享注册表：`zmodu.FrozenMap/FrozenStringMap`，启动期填充后 `freeze()` | 文件作用域裸 HashMap 在 worker 池上并发写（撕裂元数据 → 进程崩溃） |
+| 错误体统一：启动期 `http.useRfc7807Errors()`（链内 + 路由前一次到位） | 写链尾中间件改 404 体（需把 `moduleGate` 降成 `.unknown = .allow`）；靠 `curl` 才发现形状不一致 |
+| 单 gate 换形状：`.reject = http.problemReject`（`ModuleGateConfig` 也支持 `reject`） | 为改 404 体而放弃 `.unknown = .deny` |
+| handler 问门户：`ctx.permissionMatches("portal:user\|portal:shop")`（与路由声明同表达式） | handler 重写门户检查只认一侧（OR meta 会被窄化成 403） |
 | 应用 root 接 `pub const panic = zmodu.panicHook`（panic 时输出当前请求 METHOD/path） | 请求路径 `catch unreachable` / `@panic`（audit b19–b21 拦截） |
 | 生产配置 `max_connections` + `header_timeout_ms`（连接洪泛/slowloris）；发布前 `zig build soak` | 只设 `request_timeout_ms` 就当防住了慢连接（它只管 handler 阶段） |
 | 租户来源：JWT `aud` → attr（`.tenant_source = .attr`） | 从 query 取租户（`.query` 可被客户端篡改，audit b22 拦截） |
@@ -312,8 +317,11 @@ bash scripts/ci-integration.sh   # tenant-mgmt + stress + shopdemo（-Ddb=sqlite
 ## Version
 - Framework: **v0.15.44** (`build.zig.zon`)
 - Zig: **0.17.0-dev.1970+67f39b551**（CI 同款锁定版本，见 `.github/workflows/ci.yml` → `ZIG_VERSION`；避免 fmt 行为漂移。注意 ziglang 镜像会回收旧 dev 构建——dev.1567 已 404，升级时本地先验证再改 CI）
-- Tests: **961/981 passed**, 20 skipped（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`；
-  其中 1 个跳过是门控的真实 PostgreSQL 锁用例 `ZIGMODU_TEST_PG=1`，CI 的 `test-postgres` job 会启用）
+- Tests: **以 `zig build test` 输出为准**（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`）。
+  本文件不再抄写具体数字：`-Ddb` 收窄、平台（Linux/macOS）、门控用例都会改变计数，
+  抄下来的数字必然漂移。要在文档里写数字，先跑一次并与输出核对。
+  门控用例：真实 PostgreSQL 锁（`ZIGMODU_TEST_PG=1`，CI `test-postgres` job 启用）、
+  `REDIS_URL` 门控的 Redis 用例。
 - 其它测试入口：`zig build soak`（N 并发 × M 租户，默认 16×50；CI 夜间 64×200）·
   `zig build test -Dnet-tests=false`（沙箱里跳过全部 socket 用例）
 - Score: ~98/100（`docs/EVALUATION_REPORT.md` v5.6；该报告早于 2026-09 加固批次，

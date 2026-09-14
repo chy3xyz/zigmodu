@@ -169,6 +169,39 @@ pub const AuthInfo = struct {
     }
 };
 
+/// `expr` is one permission code or `|`-separated alternatives — the syntax a
+/// `RouteMeta.permission` / `RouteMeta.roles` declares. CSV entries are trimmed
+/// and empties ignored.
+///
+/// Shared by the permission gate and `Context.permissionMatches` so a handler
+/// asking "which side of `portal:user|portal:shop` am I on?" gets the gate's
+/// answer rather than a second, drifting implementation.
+pub fn exprMatchesAuthInfo(auth: *const AuthInfo, expr: []const u8) bool {
+    var alts = std.mem.splitScalar(u8, expr, '|');
+    while (alts.next()) |alt| {
+        const want = std.mem.trim(u8, alt, " \t");
+        if (want.len == 0) continue;
+        if (auth.hasPermission(want)) return true;
+    }
+    return false;
+}
+
+/// See `exprMatchesAuthInfo`. Matches against a comma-separated role/permission
+/// list such as the `roles` / `permissions` context attrs.
+pub fn exprMatchesCsv(csv: []const u8, expr: []const u8) bool {
+    var alts = std.mem.splitScalar(u8, expr, '|');
+    while (alts.next()) |alt| {
+        const want = std.mem.trim(u8, alt, " \t");
+        if (want.len == 0) continue;
+        var it = std.mem.splitScalar(u8, csv, ',');
+        while (it.next()) |entry| {
+            const trimmed = std.mem.trim(u8, entry, " \t");
+            if (trimmed.len > 0 and std.mem.eql(u8, trimmed, want)) return true;
+        }
+    }
+    return false;
+}
+
 // ── RBAC Engine ──────────────────────────────────────────────────
 
 pub const RbacEngine = struct {

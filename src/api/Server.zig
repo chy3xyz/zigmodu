@@ -28,6 +28,7 @@ const Http2 = @import("../http/Http2.zig");
 const Http2Tls = @import("../http/Http2Tls.zig");
 const Hpack = @import("../http/Hpack.zig");
 const GrpcServiceRegistry = @import("../extensions/GrpcTransport.zig").GrpcServiceRegistry;
+const Rbac = @import("../security/Rbac.zig");
 
 /// HTTP method
 pub const Method = enum {
@@ -230,6 +231,64 @@ pub const EnvelopeDialect = enum {
     ruoyi,
 };
 
+// ── Process-wide error renderers ────────────────────────────────────────
+//
+// Errors reach the client through three paths, and before these hooks only one
+// of them was styleable by an application:
+//
+//   1. in-chain rejections — `ctx.sendError` / `ctx.sendErrorResponse` from
+//      moduleGate, CSRF, auth, the uncaught-handler 500 … (`error_renderer`)
+//   2. response bodies written *before* routing — malformed request line,
+//      oversized body, header flood, over-limit connections
+//      (`transport_error_renderer`)
+//   3. handler-owned bodies — `ctx.json` / `http.respondErr`
+//
+// Set both hooks once at startup (`http.useRfc7807Errors()`) to make every
+// framework-generated error body one shape. They are process-wide on purpose:
+// the uncaught-handler 500 is raised outside the middleware chain, so no
+// per-request or per-route config can reach it.
+
+/// Renders an in-chain error response. Install with `setErrorRenderer`.
+pub const ErrorRendererFn = *const fn (ctx: *Context, status: u16, message: []const u8) anyerror!void;
+
+/// Renders a pre-routing error body. `buf` is caller-owned scratch; return a
+/// slice of it (or a static string). Called on the accept thread and possibly
+/// concurrently, so the returned slice must never alias shared mutable state.
+pub const TransportErrorFn = *const fn (status: u16, message: []const u8, buf: []u8) TransportErrorBody;
+
+pub const TransportErrorBody = struct {
+    content_type: []const u8 = "application/json",
+    body: []const u8,
+};
+
+/// See `ErrorRendererFn`. `null` (default) = the legacy
+/// `{"code":status,"msg":…,"data":null}` envelope.
+pub var error_renderer: ?ErrorRendererFn = null;
+
+/// See `TransportErrorFn`. `null` (default) = the legacy `{"error":"…"}` body.
+pub var transport_error_renderer: ?TransportErrorFn = null;
+
+/// Install the renderer for in-chain errors (`sendError` / `sendErrorResponse`,
+/// and therefore every gate that defaults to `http.defaultReject`).
+/// Call once at startup; `null` restores the legacy envelope.
+pub fn setErrorRenderer(renderer: ?ErrorRendererFn) void {
+    error_renderer = renderer;
+}
+
+/// Install the renderer for errors written before routing (408/413/431/503).
+/// Call once at startup; `null` restores the legacy body.
+pub fn setTransportErrorRenderer(renderer: ?TransportErrorFn) void {
+    transport_error_renderer = renderer;
+}
+
+/// Body for a pre-routing error. Falls back to the legacy `{"error":"…"}` when
+/// no renderer is installed.
+pub fn renderTransportError(status: u16, message: []const u8, buf: []u8) TransportErrorBody {
+    if (transport_error_renderer) |f| return f(status, message, buf);
+    const body = std.fmt.bufPrint(buf, "{{\"error\":\"{s}\"}}", .{message}) catch return .{ .body = "{\"error\":\"Request Failed\"}" };
+    return .{ .body = body };
+}
+
 pub const FieldSource = enum {
     path,
     query,
@@ -430,7 +489,7 @@ pub const Context = struct {
     }
 
     /// Type-safe accessor for auth_info (RBAC AuthInfo, etc.).
-    pub fn authInfo(self: *Context, comptime T: type) ?*T {
+    pub fn authInfo(self: *const Context, comptime T: type) ?*T {
         return @ptrCast(@alignCast(self.auth_info));
     }
 
@@ -487,6 +546,41 @@ pub const Context = struct {
     /// Comma-separated portal roles, or null.
     pub fn rolesCsv(self: *const Context) ?[]const u8 {
         return self.getAttr("roles");
+    }
+
+    /// Comma-separated permission codes (JWT/catalog loader), or null.
+    ///
+    /// Mirror of `rolesCsv()`, reading the same attr `permissionGateWith` writes
+    /// (`PermissionGateConfig.permission_attr`, default `"permissions"`). The
+    /// kind of check a route's `permission` performs, use `permissionMatches`.
+    pub fn permissionsCsv(self: *const Context) ?[]const u8 {
+        return self.getAttr("permissions");
+    }
+
+    /// Does this identity satisfy a route's `permission` / `roles` expression?
+    ///
+    /// `expr` is a single code or `|`-separated alternatives — the same syntax
+    /// `RouteMeta` declares — so a handler can ask "which side of
+    /// `portal:user|portal:shop` is this request on?" instead of re-deriving the
+    /// match (and drifting from the gate it sits behind).
+    ///
+    /// Checked in order: the RBAC `AuthInfo` when one is attached, the
+    /// `permissions` attr, then the `roles` attr. Any match counts.
+    ///
+    /// This is the *handler's* view, not an authorization gate: the gate already
+    /// ran. To reproduce one gate's exact semantics (`.roles` vs `.rbac`, custom
+    /// attr names) use `http.permissionMatchesWith(ctx, expr, config)`.
+    pub fn permissionMatches(self: *const Context, expr: []const u8) bool {
+        if (self.authInfo(Rbac.AuthInfo)) |ai| {
+            if (Rbac.exprMatchesAuthInfo(ai, expr)) return true;
+        }
+        if (self.permissionsCsv()) |perms| {
+            if (Rbac.exprMatchesCsv(perms, expr)) return true;
+        }
+        if (self.rolesCsv()) |roles| {
+            if (Rbac.exprMatchesCsv(roles, expr)) return true;
+        }
+        return false;
     }
 
     // ── Typed attr getters ──────────────────────────────────────────────
@@ -683,21 +777,37 @@ pub const Context = struct {
         self.responded = true;
     }
 
-    /// Send error response
+    /// Send an error response.
+    ///
+    /// Honours the process-wide `error_renderer` when one is installed
+    /// (`setErrorRenderer` / `http.useRfc7807Errors`), so framework-internal
+    /// rejections — moduleGate, CSRF, the uncaught-handler 500, static-file
+    /// errors — take the application's error shape. With no renderer the legacy
+    /// `{"code":status,"msg":…,"data":null}` envelope is emitted.
     pub fn sendError(self: *Context, status: u16, message: []const u8) !void {
-        self.status_code = status;
-        try self.setHeader("Content-Type", "application/json");
-        const err_json = try std.fmt.allocPrint(self.allocator, "{{\"code\":{d},\"msg\":\"{s}\",\"data\":null}}", .{ status, message });
-        defer self.allocator.free(err_json);
-        try self.response_body.appendSlice(self.allocator, err_json);
-        self.responded = true;
+        if (error_renderer) |render| return render(self, status, message);
+        return self.sendErrorEnvelope(status, status, message);
     }
 
-    /// Send structured error response
+    /// Send a structured error response. Under a custom `error_renderer` the
+    /// `code` argument is not representable (RFC 7807 has no business code) and
+    /// is dropped; the HTTP `status` is always preserved.
     pub fn sendErrorResponse(self: *Context, status: u16, code: i32, message: []const u8) !void {
+        if (error_renderer) |render| return render(self, status, message);
+        return self.sendErrorEnvelope(status, code, message);
+    }
+
+    /// Write the legacy envelope directly, bypassing any installed renderer.
+    /// This is the fallback body and the escape hatch for a caller that wants
+    /// the envelope on one response while the process default is ProblemDetails.
+    /// It never consults `error_renderer`, so a renderer may delegate here
+    /// without recursing.
+    pub fn sendErrorEnvelope(self: *Context, status: u16, code: i32, message: []const u8) !void {
         self.status_code = status;
         try self.setHeader("Content-Type", "application/json");
-        const err_json = try std.fmt.allocPrint(self.allocator, "{{\"code\":{d},\"msg\":\"{s}\",\"data\":null}}", .{ code, message });
+        const msg_json = try std.json.Stringify.valueAlloc(self.allocator, message, .{});
+        defer self.allocator.free(msg_json);
+        const err_json = try std.fmt.allocPrint(self.allocator, "{{\"code\":{d},\"msg\":{s},\"data\":null}}", .{ code, msg_json });
         defer self.allocator.free(err_json);
         try self.response_body.appendSlice(self.allocator, err_json);
         self.responded = true;
@@ -2475,12 +2585,14 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
 /// Write an error response directly to the connection stream
 /// Minimal 503 for over-limit connections. Raw `write` syscalls only — it runs
 /// on the accept thread, where an io-path write could stall the accept loop.
+/// The body follows `transport_error_renderer` when one is installed.
 fn writeOverLimit503(stream: std.Io.net.Stream) void {
-    const body = "{\"error\":\"Service Unavailable\"}";
-    var head_buf: [160]u8 = undefined;
-    const head = std.fmt.bufPrint(&head_buf, "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n", .{body.len}) catch return;
+    var body_buf: [1024]u8 = undefined;
+    const rendered = renderTransportError(503, "Service Unavailable", &body_buf);
+    var head_buf: [256]u8 = undefined;
+    const head = std.fmt.bufPrint(&head_buf, "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Type: {s}\r\nContent-Length: {d}\r\n\r\n", .{ rendered.content_type, rendered.body.len }) catch return;
     writeRaw(stream, head);
-    writeRaw(stream, body);
+    writeRaw(stream, rendered.body);
 }
 
 fn writeRaw(stream: std.Io.net.Stream, bytes: []const u8) void {
@@ -2497,7 +2609,13 @@ fn writeRaw(stream: std.Io.net.Stream, bytes: []const u8) void {
     }
 }
 
+/// Error response for requests that failed *before* routing (bad request line,
+/// oversized body, header flood). This runs outside the middleware chain, so a
+/// middleware cannot restyle it — `transport_error_renderer` is the hook.
 fn writeErrorResponse(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, status: u16, message: []const u8) void {
+    var body_buf: [1024]u8 = undefined;
+    const rendered = renderTransportError(status, message, &body_buf);
+
     var headers = std.StringHashMap([]const u8).init(allocator);
     defer {
         var it = headers.iterator();
@@ -2509,7 +2627,7 @@ fn writeErrorResponse(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.
     }
 
     const key = allocator.dupe(u8, "Content-Type") catch return;
-    const val = allocator.dupe(u8, "application/json") catch {
+    const val = allocator.dupe(u8, rendered.content_type) catch {
         allocator.free(key);
         return;
     };
@@ -2519,10 +2637,7 @@ fn writeErrorResponse(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.
         return;
     };
 
-    const body = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{message}) catch return;
-    defer allocator.free(body);
-
-    writeResponse(io, stream, status, headers, body) catch |err| std.log.err("[Server] writeErrorResponse failed: {}", .{err});
+    writeResponse(io, stream, status, headers, rendered.body) catch |err| std.log.err("[Server] writeErrorResponse failed: {}", .{err});
 }
 
 fn runMiddlewareChain(ctx: *Context) anyerror!void {
