@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.15.45] - 2026-09-15
 
 ### Added
 - **进程级错误渲染器**：框架自产错误体有三条出口（链内 `ctx.sendError`、路由前裸 socket、
