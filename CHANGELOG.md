@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.15.46] - 2026-09-15
 
 ### Added
 - **`http.UploadGuard` — 上传内容策略**（唯一被外部反馈认定为"真缺口"的一处）：框架此前只解析
