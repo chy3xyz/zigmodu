@@ -1,5 +1,49 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- **zent 适配 v0.41.1 → v0.67.0**（26 个 minor，`examples/zent-modulith` 的 pin 升到
+  `?ref=v0.67.0#e60d81e`）。编译级破坏只有一处：**`CrudService.create(entity, tenant_id)`
+  双参**（zent v0.54.0）——旧签名从实体读租户列，而写循环会复制每个字段、拦截器又只填"缺失"的，
+  于是调用方新建实体的租户字段为 0 时会写 `0`。本仓库 `zent_crud.CrudApi.create` 已改为
+  `create(buildEntity(tenant, body), tenant)`。
+- 语义级变更（编译通过但行为不同）已在 §14 记录并验证：**空 `dept_ids` 由"放行全表"改为拒绝**
+  （zent v0.66.0 的安全修复，本仓库 smoke 已把"空 `dept_ids` → 空结果"钉成断言）、无谓词
+  `BulkDelete` 报 `error.NoPredicate`、无 `last_insert_id` 报 `error.MissingLastInsertId`、
+  MySQL 批量改逐行、MySQL 的 `String`/`Enum` 落 `VARCHAR(255)`、`driver.Error` 新增
+  `ParamCountMismatch`/`PoolWaitTimeout`。
+
+### Fixed
+- **示例崩溃：`deinitRow` 与 `CrudService.get` 的分配器不匹配**（`GET /api/v1/products/{id}`
+  命中一行即 `panic: free of invalid memory` 打死整个服务器）。根因不在 zent：
+  `CrudService.get(allocator, …)` 返回的是 **`ownedCopy(allocator, …)`**（字符串归调用方传入的
+  allocator，即请求 arena），而 `client.<entity>.deinitRow(&e)` 用 **client 的 allocator** 释放 →
+  不匹配释放。这是上一轮（commit `23bd2e1`）把 `deinitEntity(…, ctx.allocator)` 机械替换成
+  `deinitRow` 时引入的：旧写法传的是拥有者 arena，而 Zig 0.17 里 `ArenaAllocator.free` 是 no-op，
+  所以无害；换成 client allocator 后同一个调用变成非法释放。修法：arena 拥有的 owned copy
+  **不交给 `deinitRow`**（代码里留了 7 行注释说明契约，防止被"修回去"）。已核对全仓 30 处
+  `deinitRow(s)`：其余都作用于驱动扫描出的行（builder `Save()` / `Query().All()`），契约正确。
+- **升级验证被增量缓存欺骗**：pin 已改成 v0.67.0 后 `zig build` 仍"编译通过"，但崩溃栈里的源码
+  路径是 `zent-0.41.1`——Zig 0.17-dev 的缓存沿用了旧 fetch 依赖。现在 §14/AGENTS.md 明确
+  "改 pin 后先 `rm -rf .zig-cache`（并删 `zig-pkg/<旧版本>`）"，本轮即按此复现出真实的编译错误。
+
+### Added
+- **`examples/zent-modulith/smoke.sh`**：43 项运行时断言（真实服务器 + 真 sqlite 文件库），覆盖
+  泛型 CRUD、原子扣减、事务下单、嵌套预加载、keyset 游标、批量软删、outbox、SSE、data-scope
+  四种 scope 与"缺上下文 401"，并在结束时断言**服务器仍存活且日志无 panic**。
+  **接入 CI**（Build Examples job）：编译示例证明不了集成正确——上一轮就是"编译通过"而一个请求
+  就能打死进程。
+
+### Docs
+- `docs/ZENT.md`：版本口径 → v0.67.0；§14 新增 0.42–0.67 六条（含两条升级陷阱：`deinitRow` 与
+  owned copy 的分配器匹配、增量缓存沿用旧依赖）；pin 片段改 `v0.67.0.tar.gz`；能力矩阵范围
+  改 v0.30–v0.67。
+- `AGENTS.md`：zent workspace 事实重写（v0.67.0 + 两条陷阱 + 0.54/0.57/0.58/0.66/0.67 的要点）。
+- `examples/zent-modulith/README.md`：版本口径 + smoke 段指向脚本。
+- `examples/shopdemo-zent`、`examples/metaverse-creative`（本地 path 依赖）对 **v0.67.0**
+  编译通过；`examples/_shared` 同步确认。
+
 ## [0.15.46] - 2026-09-15
 
 ### Added

@@ -141,6 +141,12 @@ jobs:
           echo "== building examples/zmsaas/backend =="
           (cd examples/zmsaas/backend && zig build)
 
+      - name: Smoke zent-modulith (real server, 43 assertions)
+        # Compiling the zent example proves nothing about the integration: the
+        # v0.41.1 adaptation shipped a mismatched free that only a request
+        # triggered. This walks every demo route and fails on a panic.
+        run: bash examples/zent-modulith/smoke.sh
+
       - name: zmodu ai CLI smoke (export-skills + openapi)
         run: |
           set -euo pipefail

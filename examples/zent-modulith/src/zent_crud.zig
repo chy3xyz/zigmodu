@@ -148,18 +148,26 @@ pub fn CrudApi(
         fn create(ctx: *http.Context, self: *State) !void {
             const tenant = try tenantId(ctx);
             const body = ctx.bindJson(Body) catch |err| return http.respondErr(ctx, err);
-            const id = self.svc.create(buildEntity(tenant, body)) catch |err| return http.respondErr(ctx, err);
+            // zent v0.54.0: `CrudService.create(entity, tenant_id)` — the tenant is
+            // an argument now, not a field the interceptor fills. The old shape
+            // let a zero-valued tenant field overwrite the bound tenant.
+            const id = self.svc.create(buildEntity(tenant, body), tenant) catch |err| return http.respondErr(ctx, err);
             try ctx.jsonStruct(201, .{ .id = id });
         }
 
         fn get(ctx: *http.Context, self: *State) !void {
             const tenant = try tenantId(ctx);
             const id = try ctx.paramInt(i64, "id");
-            var found = self.svc.get(ctx.allocator, tenant, id) catch |err| return http.respondErr(ctx, err);
-            // NOTE: defer must be at function scope — a defer inside the
-            // `if` body runs before jsonStruct below and would serialize
-            // already-freed strings (visible as garbage names in responses).
-            defer if (found) |*e| self.svc.client.deinitRow(e);
+            const found = self.svc.get(ctx.allocator, tenant, id) catch |err| return http.respondErr(ctx, err);
+            // No deinitRow here, deliberately. `CrudService.get` returns
+            // `ownedCopy(allocator, …)` — its strings belong to the allocator we
+            // passed (the request arena), not to the client's. `deinitRow` frees
+            // with the *client* allocator, which is a mismatched free of arena
+            // memory: SafeAllocator reports "free of invalid memory" and the
+            // server dies. (The arena reclaims it when the request ends; in Zig
+            // 0.17 `ArenaAllocator.free` is a no-op, which is why the older
+            // `deinitEntity(…, ctx.allocator)` form was harmless and why this
+            // only started crashing once it was migrated to `deinitRow`.)
             if (found) |e| {
                 try ctx.jsonStruct(200, e);
             } else {

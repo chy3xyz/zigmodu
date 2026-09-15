@@ -1,6 +1,6 @@
 # zent-modulith — ZigModu + zent
 
-Demonstrates **ZigModu** (Application / HTTP / **ComptimeRouter**) with **[zent](https://github.com/chy3xyz/zent)** v0.41.1 as the schema-as-code data layer (demos span v0.21–v0.41 capabilities).
+Demonstrates **ZigModu** (Application / HTTP / **ComptimeRouter**) with **[zent](https://github.com/chy3xyz/zent)** v0.67.0 as the schema-as-code data layer (demos span v0.21–v0.67 capabilities).
 
 See framework guides: [`docs/ZENT.md`](../../docs/ZENT.md) · [`docs/ROUTE_TABLE.md`](../../docs/ROUTE_TABLE.md).
 
@@ -17,7 +17,7 @@ zig_ws/
   zent/          # git clone https://github.com/chy3xyz/zent.git
 ```
 
-`build.zig.zon` pins the released tag `v0.41.1`; for local development against a
+`build.zig.zon` pins the released tag `v0.67.0`; for local development against a
 sibling checkout, replace it with `.zent = .{ .path = "../../../zent" }`.
 
 ## Run
@@ -30,6 +30,14 @@ ZENT_DEV_TOKEN=1 HTTP_PORT=18100 zig build run
 ```
 
 ## Smoke
+
+`smoke.sh` 把下面这串 curl 变成 43 项断言（含"空 `dept_ids` 必须拒绝"与
+"服务器跑完仍存活、日志无 panic"），CI 的 Build Examples job 会跑它：
+
+```bash
+bash examples/zent-modulith/smoke.sh          # 默认 :18111，可传端口
+```
+
 
 ```bash
 # 1) mint a tenant-1 token (dev mint; see above)
