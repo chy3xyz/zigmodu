@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.15.47] - 2026-09-15
 
 ### Changed
 - **zent 适配 v0.41.1 → v0.67.0**（26 个 minor，`examples/zent-modulith` 的 pin 升到
