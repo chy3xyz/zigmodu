@@ -22,6 +22,7 @@
   - [迁移失败后怎么恢复](#迁移失败后怎么恢复运维向)
   - [多副本后台任务：跨实例互斥](#多副本后台任务跨实例互斥v01536)
 - [数据访问选型（zent / sqlx）](#-数据访问选型zent--sqlx)
+- [上传与 multipart](#-上传与-multipartv01546)
 - [内存管理](#-内存管理)
 - [测试策略](#-测试策略)
 - [性能优化](#-性能优化)
@@ -1359,6 +1360,81 @@ pub fn processBatch(allocator: Allocator, items: []Item) !void {
 `tx.queryRowPartial`（缺失列置零，与 `Client.queryRowPartial` 同契约）。多写方法
 的遗漏由 `zmodu audit` 的 b16 规则兜底（默认开启）。
 
+
+## 📤 上传与 multipart（v0.15.46+）
+
+### 三件事一起做，缺一个就有洞
+
+上传端点要同时回答三个问题：**能不能收**（大小）、**收进来是什么**（内容）、**收下来安全吗**（存放）。
+
+```zig
+// 1) 能收多大：先抬服务端上限，再让 multipart 的限额在它之内
+var server = zigmodu.http.Server.initWithConfig(io, allocator, .{
+    .max_body_size = 64 << 20,
+});
+const mp = zigmodu.http.Multipart.Config.forBodyLimit(64 << 20);
+
+// 2) 收进来是什么：解析失败按 ProblemDetails 出 415/413/400
+var form = try zigmodu.http.extractMultipart(ctx, mp);
+defer form.deinit();
+
+// 3) 安全吗：按字节判定格式，并要求与扩展名一致
+try zigmodu.http.UploadGuard.checkForm(&form, .{
+    .extensions = &.{ "jpg", "jpeg", "png", "webp" },
+    .formats = &.{ .jpeg, .png, .webp },
+    .max_bytes = 5 << 20,
+});
+const avatar = form.file("avatar").?;   // 到这里才可信
+```
+
+### 限额的先后顺序（最容易搞错的一处）
+
+| 配置 | 默认 | 在哪一层生效 |
+|------|------|------------|
+| `Server.Config.max_body_size` | 8 MB | **最先**：请求体还在读的时候就 413，`Multipart.parse` 根本不会被调用 |
+| `Multipart.Config.max_total_bytes` | 32 MB | 解析期，仅在服务端已放行该体积之后才有意义 |
+| `Multipart.Config.max_part_bytes` | 8 MB | 同上，单个 part |
+
+所以默认配置下 `max_total_bytes = 32 MB` **永远不可能触发**——服务端 8 MB 先拒了。
+要收 64 MB 的附件，必须同时抬 `max_body_size` 与 multipart 限额；`Config.forBodyLimit(n)`
+用同一个数字帮你把两者对齐（单 part ≤ 总量 ≤ body）。
+
+### 内容校验：三种"看起来对"的写法都是错的
+
+```zig
+// ✗ 只看扩展名：shell.php 改名 avatar.jpg 就过了
+if (!std.mem.endsWith(u8, filename, ".jpg")) return error.Rejected;
+
+// ✗ 只看 Content-Type：这个头是客户端自己填的，只是建议
+if (!std.mem.eql(u8, part.content_type, "image/jpeg")) return error.Rejected;
+
+// ✗ 放行 SVG：SVG 是脚本容器，从你自己的源站发出去就是 stored-XSS
+```
+
+**可用的规则：嗅探字节，再要求"嗅探结果"与"扩展名"一致。** `UploadGuard.check` 的判定顺序是
+刻意的（大小 → 主动内容 → 扩展名白名单 → 格式白名单 → 两者一致），因此错误信息可以直接告诉调用方
+问题在哪：
+
+| 错误 | 含义 |
+|------|------|
+| `FileTooLarge` | 超过 `max_bytes`（单文件上限，独立于请求总量） |
+| `ActiveContentNotAllowed` | 嗅探到 SVG/HTML。**默认拒绝**，即使白名单里写了 `svg`——`allow_active_content = true` 才是显式选择 |
+| `ExtensionNotAllowed` | 扩展名不在 `extensions`（没扩展名也算） |
+| `ContentNotAllowed` | 嗅探出的格式不在 `formats` |
+| `ExtensionContentMismatch` | 两边各自都合法，但互相对不上（PNG 字节挂了 `.jpg` 名） |
+
+支持嗅探：JPEG/PNG/GIF/WebP/BMP/TIFF/PDF/ZIP/GZIP/**MP4(ISO-BMFF，校验 box size + `ftyp`)**/WebM/OGG/MP3/WAV，
+以及"文本容器"——`<svg`/`<!doctype html`/`<script` 归为主动内容，其它文本归为 `plain`。
+
+**这不是病毒扫描器**，也不解析图像：它只保证"文件是它声称的那类"，把上传端点从"任人投递"变成"只收这几类"。
+要求更高的场景（图片重编码、病毒扫描）应放在存储侧的后处理里。
+
+### 其它两条上传相关的约定
+
+- `http.extractMultipart(ctx, config)` 是 `ctx.multipart` 的抽取器版本：失败直接产出
+  ProblemDetails（415/413/400），不需要每个 handler 自己映射 `Multipart.Error`。
+- 目录/文件名只在**扩展名比对**时使用，且只看最后一段路径（`a.b/c.jpg` → `jpg`）；真正的落盘路径
+  仍要自己生成（不要用客户端文件名拼路径）。
 
 ## 🔒 安全实践
 

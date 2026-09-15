@@ -685,14 +685,14 @@ pub const HttpClient = struct {
         return try out.toOwnedSlice(allocator);
     }
 
-    /// GET [...]
+    /// GET request without a body.
     pub fn get(self: *Self, url: []const u8) !HttpResponse {
         var req = HttpRequest.init(self.allocator, "GET", url);
         defer req.deinit();
         return self.request(req);
     }
 
-    /// POST [...]
+    /// POST request with a JSON body.
     pub fn post(self: *Self, url: []const u8, body: []const u8) !HttpResponse {
         var req = HttpRequest.init(self.allocator, "POST", url);
         defer req.deinit();
@@ -701,7 +701,7 @@ pub const HttpClient = struct {
         return self.request(req);
     }
 
-    /// PUT [...]
+    /// PUT request with a JSON body.
     pub fn put(self: *Self, url: []const u8, body: []const u8) !HttpResponse {
         var req = HttpRequest.init(self.allocator, "PUT", url);
         defer req.deinit();
@@ -710,7 +710,7 @@ pub const HttpClient = struct {
         return self.request(req);
     }
 
-    /// DELETE [...]
+    /// DELETE request without a body.
     pub fn delete(self: *Self, url: []const u8) !HttpResponse {
         var req = HttpRequest.init(self.allocator, "DELETE", url);
         defer req.deinit();

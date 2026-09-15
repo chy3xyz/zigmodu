@@ -5,7 +5,9 @@
 //!
 //! Physical partitioning (e.g., tenant_1.table, tenant_2.table) is handled
 //! by the database layer (MySQL partition, Citus, Vitess). This module provides
-//! the application-level routing primitives.
+//! the application-level routing primitives only: it maps a tenant to a pool,
+//! and offers no table-name rewriting. (A `ShardedQuery.tableForTenant` stub
+//! that could only return `error.NotImplemented` was removed in v0.15.46.)
 
 const std = @import("std");
 const tc = @import("TenantContext.zig");
@@ -154,25 +156,6 @@ pub const SqlxConfig = struct {
     password: []const u8,
     max_open_conns: u16,
     max_idle_conns: u16,
-};
-
-/// Shard-aware SQL helper — prepends shard prefix to table names.
-pub const ShardedQuery = struct {
-    allocator: std.mem.Allocator,
-
-    pub fn init(allocator: std.mem.Allocator) ShardedQuery {
-        return .{ .allocator = allocator };
-    }
-
-    /// Build a table name with shard prefix for a tenant.
-    /// e.g. tableForTenant(5, "orders") → "tenant_05.orders" or "orders" depending on strategy.
-    pub fn tableForTenant(_: *ShardedQuery, tenant_id: i64, table_name: []const u8) ![]const u8 {
-        // Logical isolation: use row-level tenant_id column (handled by TenantInterceptor).
-        // Physical isolation: would return "tenant_{d}.{s}" for dedicated tables.
-        _ = tenant_id;
-        _ = table_name;
-        return error.NotImplemented; // Physical sharding requires DB-level setup
-    }
 };
 
 // ==================== Tests ====================

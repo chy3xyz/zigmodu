@@ -11,9 +11,46 @@ const Server = @import("Server.zig");
 const ProblemDetails = @import("../http/ProblemDetails.zig").ProblemDetails;
 const Validator = @import("../validation/Validator.zig");
 const OpenApi = @import("../http/OpenApi.zig");
+const Multipart = @import("../http/Multipart.zig");
 
 pub const Context = Server.Context;
 pub const FieldRules = Validator.FieldRules;
+
+/// Parse a `multipart/form-data` body, rendering failures as ProblemDetails.
+///
+/// `ctx.multipart` is the raw parser: the caller gets a `Multipart.Error` and
+/// has to turn it into a status itself, which is how upload endpoints end up
+/// returning a different error shape from the rest of the API. This is the
+/// counterpart of `extractJson*` for uploads:
+///
+///   415 wrong content type · 413 too large · 400 malformed/too many parts
+///
+/// `OutOfMemory` is propagated without rendering — that is a 500 owned by the
+/// server's error path, not a client mistake.
+///
+/// Size limits live in `Multipart.Config` and are gated by
+/// `Server.Config.max_body_size` first — see `Multipart.Config.forBodyLimit`.
+pub fn extractMultipart(ctx: *Context, config: Multipart.Config) !Multipart.Form {
+    return ctx.multipart(config) catch |err| switch (err) {
+        error.NotMultipart => {
+            try respondProblem(ctx, 415, "Expected multipart/form-data");
+            return error.UnsupportedMediaType;
+        },
+        error.MissingBoundary, error.MalformedPart => {
+            try respondProblem(ctx, 400, "Malformed multipart body");
+            return error.InvalidMultipart;
+        },
+        error.TooManyParts => {
+            try respondProblem(ctx, 400, "Too many multipart parts");
+            return error.InvalidMultipart;
+        },
+        error.PartTooLarge, error.PayloadTooLarge => {
+            try respondProblem(ctx, 413, "Upload too large");
+            return error.PayloadTooLarge;
+        },
+        error.OutOfMemory => |e| return e,
+    };
+}
 
 /// Parse query parameters into struct `T`. Field names map to query keys.
 /// Supports `[]const u8`, integers, `bool`, `?T`, and Zig field defaults (`page: u32 = 0`).
@@ -498,4 +535,53 @@ test "openApiParamsFromStruct marks optionals and defaults" {
     try std.testing.expect(!params[0].required); // default
     try std.testing.expect(!params[1].required); // optional
     try std.testing.expect(params[2].required);
+}
+
+test "extractMultipart renders ProblemDetails for 415 / 413 / 400" {
+    const allocator = std.testing.allocator;
+
+    // Wrong content type → 415, not a bare error the caller has to map.
+    {
+        var ctx = try Context.init(allocator, .POST, "/upload");
+        defer ctx.deinit();
+        ctx.body = "{}";
+        try ctx.headers.put(try allocator.dupe(u8, "content-type"), try allocator.dupe(u8, "application/json"));
+        try std.testing.expectError(error.UnsupportedMediaType, extractMultipart(&ctx, .{}));
+        try std.testing.expectEqual(@as(u16, 415), ctx.status_code);
+        try std.testing.expect(std.mem.indexOf(u8, ctx.response_body.items, "\"status\":415") != null);
+        try std.testing.expect(std.mem.indexOf(u8, ctx.response_body.items, "multipart/form-data") != null);
+    }
+
+    // multipart without a boundary → 400 (the client's body is unusable).
+    {
+        var ctx = try Context.init(allocator, .POST, "/upload");
+        defer ctx.deinit();
+        ctx.body = "x";
+        try ctx.headers.put(try allocator.dupe(u8, "content-type"), try allocator.dupe(u8, "multipart/form-data"));
+        try std.testing.expectError(error.InvalidMultipart, extractMultipart(&ctx, .{}));
+        try std.testing.expectEqual(@as(u16, 400), ctx.status_code);
+    }
+
+    // A well-formed body that busts the configured total → 413.
+    {
+        var ctx = try Context.init(allocator, .POST, "/upload");
+        defer ctx.deinit();
+        ctx.body = "--X\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n12345\r\n--X--\r\n";
+        try ctx.headers.put(try allocator.dupe(u8, "content-type"), try allocator.dupe(u8, "multipart/form-data; boundary=X"));
+        try std.testing.expectError(error.PayloadTooLarge, extractMultipart(&ctx, .{ .max_total_bytes = 4 }));
+        try std.testing.expectEqual(@as(u16, 413), ctx.status_code);
+        try std.testing.expect(std.mem.indexOf(u8, ctx.response_body.items, "\"status\":413") != null);
+    }
+
+    // Happy path: the form comes back owned by the caller.
+    {
+        var ctx = try Context.init(allocator, .POST, "/upload");
+        defer ctx.deinit();
+        ctx.body = "--X\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nok\r\n--X--\r\n";
+        try ctx.headers.put(try allocator.dupe(u8, "content-type"), try allocator.dupe(u8, "multipart/form-data; boundary=X"));
+        var form = try extractMultipart(&ctx, .{});
+        defer form.deinit();
+        try std.testing.expectEqualStrings("ok", form.value("a").?);
+        try std.testing.expect(!ctx.responded);
+    }
 }

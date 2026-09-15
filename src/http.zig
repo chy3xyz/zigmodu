@@ -150,6 +150,7 @@ pub const extractPath = Extract.extractPath;
 pub const extractJson = Extract.extractJson;
 pub const extractJsonValidated = Extract.extractJsonValidated;
 pub const extractJsonLoose = Extract.extractJsonLoose;
+pub const extractMultipart = Extract.extractMultipart;
 pub const openApiParamsFromStruct = Extract.openApiParamsFromStruct;
 pub const respondProblem = Extract.respondProblem;
 pub const respondErr = Extract.respondErr;
@@ -168,6 +169,8 @@ pub const Testkit = @import("http/Testkit.zig");
 pub const auditAuthCoverage = Testkit.auditAuthCoverage;
 pub const AuthAuditMismatch = Testkit.AuthAuditMismatch;
 pub const Multipart = @import("http/Multipart.zig");
+/// Upload content policy: sniffed format vs extension allowlist (see doc header).
+pub const UploadGuard = @import("http/UploadGuard.zig");
 pub const StaticFiles = @import("http/StaticFiles.zig");
 /// Static file serving (traversal guard + ETag/304 + Range).
 pub const staticFiles = @import("http/StaticFiles.zig").staticFiles;

@@ -1,8 +1,11 @@
 //! Consistent Hashing Partitioner
 //!
 //!
-//! ⚠️ WORK IN PROGRESS — not yet wired into DistributedEventBus.
-//! Tests are implemented but disabled pending integration.
+//! ⚠️ Not yet wired into DistributedEventBus: nothing calls this module, so
+//! partition routing is not in effect. Its own tests do run (they were
+//! previously described as "disabled" — that was stale: see the `test` blocks
+//! at the bottom of this file). Wire it in, or delete it; either is better than
+//! a routing strategy that silently does nothing.
 //!
 //! Routes messages to nodes using consistent hashing with virtual nodes.
 //! This provides:

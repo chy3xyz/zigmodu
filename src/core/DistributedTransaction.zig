@@ -1,9 +1,9 @@
 const std = @import("std");
 const Time = @import("Time.zig");
 
-/// Distributed transaction[...]
-/// Distributed transaction[...]
-/// [...] Saga [...]forDistributed transaction
+/// Distributed transaction manager based on the Saga pattern.
+/// Runs a transaction's steps in order; the first step that fails triggers
+/// reverse-order compensation of the steps already executed.
 pub const DistributedTransactionManager = struct {
     const Self = @This();
 
@@ -60,7 +60,7 @@ pub const DistributedTransactionManager = struct {
         self.* = undefined;
     }
 
-    /// [...]Transaction
+    /// Begin a transaction and return its id; the id lives in the manager's arena.
     pub fn beginTransaction(self: *Self) ![]const u8 {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
@@ -82,7 +82,7 @@ pub const DistributedTransactionManager = struct {
         return id;
     }
 
-    /// [...] Saga step
+    /// Append a Saga step together with the compensation callback that undoes it.
     pub fn addStep(
         self: *Self,
         tx_id: []const u8,
@@ -105,7 +105,8 @@ pub const DistributedTransactionManager = struct {
         });
     }
 
-    /// [...]Transaction
+    /// Run the steps in order. A failure marks the step, compensates the
+    /// executed steps in reverse and returns error.TransactionFailed.
     pub fn execute(self: *Self, tx_id: []const u8) !void {
         const tx = self.transactions.getPtr(tx_id) orelse return error.TransactionNotFound;
 
@@ -163,13 +164,13 @@ pub const DistributedTransactionManager = struct {
         std.log.info("Compensation completed for transaction: {s}", .{tx_id});
     }
 
-    /// [...]Transaction[...]
+    /// Current status of a transaction, or null when the id is unknown.
     pub fn getStatus(self: *Self, tx_id: []const u8) ?SagaTransaction.TransactionStatus {
         const tx = self.transactions.get(tx_id) orelse return null;
         return tx.status;
     }
 
-    /// [...]Transaction[...]
+    /// Counts of transactions per status across the whole manager.
     pub fn getStatistics(self: *Self) TransactionStatistics {
         var stats = TransactionStatistics{};
 
@@ -197,7 +198,7 @@ pub const TransactionStatistics = struct {
     running: usize = 0,
 };
 
-/// [...] (2PC) [...]
+/// Two-phase commit (2PC): participants vote in Prepare, then all commit or roll back.
 pub const TwoPhaseCommit = struct {
     const Self = @This();
 
@@ -278,7 +279,8 @@ pub const TwoPhaseCommit = struct {
         });
     }
 
-    /// [...]
+    /// Run both phases: prepare everyone, then commit if all voted yes,
+    /// otherwise roll back every participant and return error.TransactionAborted.
     pub fn execute(self: *Self, tx_id: []const u8) !void {
         const coord = self.coordinators.getPtr(tx_id) orelse return error.CoordinatorNotFound;
 

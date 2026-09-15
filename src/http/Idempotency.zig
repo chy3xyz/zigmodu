@@ -1,7 +1,7 @@
 const std = @import("std");
 const Time = @import("../core/Time.zig");
 
-/// Idempotency[...]
+/// One stored idempotency key entry
 pub const IdempotencyEntry = struct {
     key: []const u8,
     response: []const u8,
@@ -10,18 +10,18 @@ pub const IdempotencyEntry = struct {
     expires_at: i64,
 };
 
-/// Idempotency middleware[...]
+/// Idempotency middleware configuration
 pub const IdempotencyConfig = struct {
-    /// Idempotency[...] ([...])
+    /// Default lifetime of an idempotency key (seconds)
     ttl_seconds: u64 = 24 * 60 * 60, // 24 hours
-    /// [...]
+    /// Maximum number of entries kept in the store
     max_entries: usize = 100_000,
-    /// Idempotency[...] HTTP header [...]
+    /// Name of the HTTP header carrying the idempotency key
     header_name: []const u8 = "Idempotency-Key",
 };
 
-/// Idempotency store[...]
-/// [...] Redis / SQLite / Memory [...]
+/// Idempotency store
+/// Can be swapped for a Redis / SQLite / Memory implementation
 pub const IdempotencyStore = struct {
     const Self = @This();
 
@@ -47,11 +47,11 @@ pub const IdempotencyStore = struct {
         self.* = undefined;
     }
 
-    /// [...]Idempotency[...]
+    /// Stores the response produced for an idempotency key
     pub fn store(self: *Self, key: []const u8, response: []const u8, status_code: u16, ttl_seconds: u64) !void {
         const now = Time.monotonicNowSeconds();
 
-        // [...]
+        // Evict the oldest entry once the store is full
         if (self.entries.count() >= self.max_entries) {
             self.evictOldest();
         }
@@ -71,13 +71,13 @@ pub const IdempotencyStore = struct {
         });
     }
 
-    /// [...]Idempotency[...]
+    /// Looks up an existing idempotency response
     pub fn get(self: *Self, key: []const u8) ?IdempotencyEntry {
         const entry_ptr = self.entries.getPtr(key) orelse return null;
 
         const now = Time.monotonicNowSeconds();
         if (now >= entry_ptr.expires_at) {
-            // [...] — [...]
+            // Expired — hold on to the owned pointers before removing the entry
             const owned_key = entry_ptr.key;
             const owned_resp = entry_ptr.response;
             _ = self.entries.remove(key);
@@ -95,12 +95,12 @@ pub const IdempotencyStore = struct {
         };
     }
 
-    /// [...]IdempotencyWhether key exists and is not expired
+    /// Checks whether the key exists and is not expired
     pub fn has(self: *Self, key: []const u8) bool {
         return self.get(key) != null;
     }
 
-    /// [...]
+    /// Purges expired entries, returning how many were removed
     pub fn purgeExpired(self: *Self) !usize {
         const now = Time.monotonicNowSeconds();
         var purged: usize = 0;
@@ -186,22 +186,22 @@ pub fn idempotencyMiddleware(store: *IdempotencyStore) api.Middleware {
     return .{ .func = S.handler, .user_data = @ptrCast(store) };
 }
 
-/// [...]Idempotency middleware[...] Context[...]
+/// Extends the Context for the idempotency middleware so it can capture the response body
 pub fn wrapContextWithIdempotency(ctx: *api.Context, store: *IdempotencyStore, ttl_seconds: u64) !void {
     const key = ctx.header("idempotency-key") orelse return;
 
-    // [...]
+    // Check the store first to avoid a race
     if (store.has(key)) return;
 
-    // [...]Indicates request is being processed
+    // Store a placeholder marking the request as being processed
     _ = try store.store(key, "", 202, ttl_seconds);
 }
 
-/// [...]Idempotency[...] ([...] handler done[...]call)
+/// Records the idempotency response (call once the handler is done)
 pub fn recordIdempotencyResponse(store: *IdempotencyStore, key: []const u8, response_body: []const u8, status_code: u16, ttl_seconds: u64) !void {
-    // [...]
+    // Drop the placeholder first
     _ = store.get(key);
-    // [...]
+    // Then store the real response
     try store.store(key, response_body, status_code, ttl_seconds);
 }
 

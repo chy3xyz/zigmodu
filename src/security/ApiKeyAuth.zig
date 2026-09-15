@@ -1,31 +1,31 @@
 const std = @import("std");
 const Time = @import("../core/Time.zig");
 
-/// API Key [...]
+/// API key authentication configuration
 pub const ApiKeyConfig = struct {
-    /// API Key [...]
+    /// Name of the request header carrying the API key
     header_name: []const u8 = "X-API-Key",
-    /// API Key [...] Query [...]
+    /// Name of the query parameter carrying the API key
     query_param_name: []const u8 = "api_key",
-    /// [...] Query [...] ([...])
+    /// Whether the API key may also be passed as a query parameter (less safe)
     allow_query_param: bool = false,
-    /// [...]failure[...] HTTP status code
+    /// HTTP status code returned when authentication fails
     unauthorized_status: u16 = 401,
-    /// [...]failure[...]
+    /// Message returned when authentication fails
     unauthorized_message: []const u8 = "Invalid or missing API key",
 };
 
 /// API Key Auth middleware
 ///
-/// [...] X-API-Key ([...] Query [...] ?api_key=) [...] API Key
-/// [...]ValidationWhether it is in the allowed key list
+/// Extracts the API key from the X-API-Key header (or the Query parameter ?api_key=)
+/// and verifies that it is in the allowed key list
 ///
 /// Usage:
 ///   server.addMiddleware(.{
 ///       .func = apiKeyAuth(.{ .keys = &.{"sk-123", "sk-456"} })
 ///   });
 ///
-/// Support loading keys from external storage ([...]Redis):
+/// Supports loading keys from external storage (e.g. Redis):
 ///   server.addMiddleware(.{
 ///       .func = apiKeyAuthWithLoader(.{ .loader = loadKeysFromDb })
 ///   });
@@ -53,13 +53,13 @@ pub fn apiKeyAuth(config: ApiKeyAuthConfig) api.MiddlewareFn {
     return S.handler;
 }
 
-/// API Key [...] ([...])
+/// API key authentication configuration (with a static key list)
 pub const ApiKeyAuthConfig = struct {
     config: ApiKeyConfig = .{},
     keys: []const []const u8 = &.{},
 };
 
-/// API Key Auth middleware ([...])
+/// API key auth middleware (with an external loader)
 pub fn apiKeyAuthWithLoader(config: ApiKeyLoaderConfig) api.MiddlewareFn {
     const S = struct {
         var cfg: ApiKeyLoaderConfig = undefined;
@@ -84,20 +84,20 @@ pub fn apiKeyAuthWithLoader(config: ApiKeyLoaderConfig) api.MiddlewareFn {
     return S.handler;
 }
 
-/// API Key [...]
+/// API key loader configuration
 pub const ApiKeyLoaderConfig = struct {
     config: ApiKeyConfig = .{},
     loader: *const fn ([]const u8) bool,
 };
 
-/// [...] Context [...] API Key (Header [...] Query)
+/// Extracts the API key from the Context (header first, then query parameter)
 fn extractApiKey(ctx: *api.Context, config: ApiKeyConfig) ?[]const u8 {
-    // 1. [...] Header [...]
+    // 1. Read from the request header
     if (ctx.header(config.header_name)) |val| {
         return if (val.len > 0) val else null;
     }
 
-    // 2. [...] Query [...] ([...])
+    // 2. Fall back to the query parameter (only when explicitly allowed)
     if (config.allow_query_param) {
         if (ctx.queryParam(config.query_param_name)) |val| {
             return if (val.len > 0) val else null;
@@ -107,7 +107,7 @@ fn extractApiKey(ctx: *api.Context, config: ApiKeyConfig) ?[]const u8 {
     return null;
 }
 
-/// Validation API Key [...]
+/// Checks whether the API key is in the allowed list
 fn validateKey(key: []const u8, allowed_keys: []const []const u8) bool {
     for (allowed_keys) |ak| {
         if (std.mem.eql(u8, key, ak)) return true;
@@ -115,9 +115,9 @@ fn validateKey(key: []const u8, allowed_keys: []const []const u8) bool {
     return false;
 }
 
-/// API Key [...] — [...] API Key
+/// API key generator — creates random API keys
 pub const ApiKeyGenerator = struct {
-    /// [...] API Key ([...]: sk-{32 hex chars})
+    /// Generates one API key (format: sk-{32 hex chars})
     pub fn generate(allocator: std.mem.Allocator) ![]const u8 {
         var buf: [16]u8 = undefined;
         var seed: [32]u8 = undefined;
@@ -136,7 +136,7 @@ pub const ApiKeyGenerator = struct {
         return std.fmt.allocPrint(allocator, "sk-{s}", .{hex[0..32]});
     }
 
-    /// Validation API Key [...] (sk-{32 hex})
+    /// Validates the API key format (sk-{32 hex})
     pub fn validateFormat(key: []const u8) bool {
         if (!std.mem.startsWith(u8, key, "sk-")) return false;
         if (key.len != 35) return false; // "sk-" + 32 hex chars

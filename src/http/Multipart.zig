@@ -15,6 +15,19 @@
 //! real protection — set `max_total_bytes` to what your upload endpoint should
 //! ever accept, and let `413`/`400` surface rather than allocating blindly.
 //!
+//! **Order of limits (the trap):** the request body is rejected with `413` by
+//! `Server.Config.max_body_size` (default 8 MB) while it is still being read —
+//! *before* `parse` is ever called, so before any `Config` limit here is
+//! consulted. The defaults (part 8 MB, total 32 MB) therefore cannot fire on a
+//! default server: the body never gets that far. Raising these numbers without
+//! raising `max_body_size` changes nothing. Use `Config.forBodyLimit` to set the
+//! pair from one number, and see `BEST_PRACTICES.md`「上传与 multipart」.
+//!
+//! ```zig
+//! var server = zigmodu.http.Server.initWithConfig(io, alloc, .{ .max_body_size = 64 << 20 });
+//! const cfg = zigmodu.http.Multipart.Config.forBodyLimit(64 << 20);
+//! ```
+//!
 //! Streaming large uploads straight to disk is deliberately out of scope: the
 //! request body is already buffered by the parser, so a streaming API would
 //! pretend to save memory it cannot save.
@@ -26,9 +39,30 @@ pub const Config = struct {
     max_parts: usize = 64,
     /// Maximum size of a single part's data.
     max_part_bytes: usize = 8 * 1024 * 1024,
-    /// Maximum size across all parts.
+    /// Maximum size across all parts. Only reachable once the server accepts a
+    /// body this large — `Server.Config.max_body_size` (default 8 MB) rejects
+    /// first, see the module doc.
     max_total_bytes: usize = 32 * 1024 * 1024,
+
+    /// Limits subdivided from a server body limit, so the two numbers cannot
+    /// disagree: one part may use the whole body, parts together may not exceed
+    /// it. Pass the same value you gave `Server.Config.max_body_size`.
+    pub fn forBodyLimit(body_limit: usize) Config {
+        return .{
+            .max_part_bytes = body_limit,
+            .max_total_bytes = body_limit,
+        };
+    }
 };
+
+test "Config.forBodyLimit keeps the multipart limits inside the body limit" {
+    const cfg = Config.forBodyLimit(64 << 20);
+    try std.testing.expectEqual(@as(usize, 64 << 20), cfg.max_total_bytes);
+    try std.testing.expectEqual(@as(usize, 64 << 20), cfg.max_part_bytes);
+    // A part cannot claim more than the total, which is what keeps the pair
+    // consistent when the body limit is raised.
+    try std.testing.expect(cfg.max_part_bytes <= cfg.max_total_bytes);
+}
 
 pub const Error = error{
     NotMultipart,

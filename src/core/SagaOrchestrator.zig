@@ -4,20 +4,20 @@ const std = @import("std");
 const Time = @import("../core/Time.zig");
 const WAL = @import("eventbus/WAL.zig").WAL;
 
-/// Saga step[...]
+/// One saga step
 pub const SagaStep = struct {
     name: []const u8,
-    /// [...]
+    /// Forward action to run
     action: *const fn () anyerror!void,
-    /// [...] ([...])
+    /// Compensation that undoes the already-performed action
     compensation: *const fn () void,
-    /// [...]
+    /// Whether the step may be retried
     retryable: bool = true,
-    /// [...] ([...])
+    /// Timeout in seconds
     timeout_seconds: u64 = 30,
 };
 
-/// Saga Transaction[...]
+/// Saga transaction status
 pub const SagaStatus = enum {
     pending,
     running,
@@ -28,7 +28,7 @@ pub const SagaStatus = enum {
     timed_out,
 };
 
-/// Saga [...]
+/// Saga execution log
 pub const SagaLog = struct {
     transaction_id: []const u8,
     saga_name: []const u8,
@@ -55,7 +55,8 @@ pub const SagaLog = struct {
 };
 
 /// Saga orchestrator
-/// [...]: [...]failure[...]success[...]
+/// Automatic compensation: when a step fails, the steps that already succeeded are
+/// compensated in reverse order
 pub const SagaOrchestrator = struct {
     const Self = @This();
 
@@ -117,7 +118,7 @@ pub const SagaOrchestrator = struct {
         self.* = undefined;
     }
 
-    /// [...] Saga [...]
+    /// Registers a saga definition
     pub fn registerSaga(self: *Self, name: []const u8, steps: []const SagaStep) !void {
         const name_copy = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(name_copy);
@@ -139,7 +140,7 @@ pub const SagaOrchestrator = struct {
         });
     }
 
-    /// [...]Execute saga
+    /// Starts executing a saga
     pub fn execute(self: *Self, saga_name: []const u8) ![]const u8 {
         const saga = self.sagas.get(saga_name) orelse return error.SagaNotFound;
 
@@ -158,7 +159,7 @@ pub const SagaOrchestrator = struct {
 
         try self.running_instances.put(instance_id, instance);
 
-        // [...]
+        // Run the steps in order
         for (saga.steps, 0..) |step, i| {
             const inst = self.running_instances.getPtr(instance_id) orelse return error.InternalError;
             inst.current_step = i;
@@ -184,7 +185,7 @@ pub const SagaOrchestrator = struct {
                 // Persist state before compensation
                 self.saveSagaState(instance_id);
 
-                // [...]
+                // Undo the steps that already succeeded
                 try self.compensate(instance_id, i);
                 return error.SagaStepFailed;
             };
@@ -213,7 +214,7 @@ pub const SagaOrchestrator = struct {
         return instance_id;
     }
 
-    /// Execute compensation ([...])
+    /// Executes compensation (reverse-order rollback)
     fn compensate(self: *Self, instance_id: []const u8, failed_step_index: usize) !void {
         const inst = self.running_instances.getPtr(instance_id) orelse return;
         const saga = self.sagas.get(inst.saga_name) orelse return;
@@ -222,7 +223,7 @@ pub const SagaOrchestrator = struct {
 
         std.log.info("[Saga] Compensating '{s}' (failed at step {d})", .{ instance_id, failed_step_index });
 
-        // [...]success[...]
+        // Compensate the steps before the failing one, in reverse order
         var i: usize = failed_step_index;
         while (i > 0) {
             i -= 1;
@@ -231,7 +232,7 @@ pub const SagaOrchestrator = struct {
             std.log.info("[Saga] Executing compensation for step '{s}'", .{step.name});
             step.compensation();
 
-            // [...]
+            // Mark the matching step log as compensated
             for (inst.step_logs.items) |*log| {
                 if (std.mem.eql(u8, log.step_name, step.name) and log.status == .completed) {
                     log.status = .compensated;
@@ -246,13 +247,13 @@ pub const SagaOrchestrator = struct {
         std.log.info("[Saga] Compensation completed for '{s}'", .{instance_id});
     }
 
-    /// [...] Saga [...]
+    /// Gets the status of a saga instance
     pub fn getStatus(self: *Self, instance_id: []const u8) ?SagaStatus {
         const inst = self.running_instances.get(instance_id) orelse return null;
         return inst.status;
     }
 
-    /// [...] Saga [...]
+    /// Gets the execution log of a saga instance
     pub fn getLog(self: *Self, instance_id: []const u8) !?SagaLog {
         const inst = self.running_instances.get(instance_id) orelse return null;
 
@@ -277,7 +278,7 @@ pub const SagaOrchestrator = struct {
         };
     }
 
-    /// [...] Saga [...]
+    /// Lists the ids of all currently active saga instances
     pub fn listActiveInstances(self: *Self) ![]const []const u8 {
         var result = std.ArrayList([]const u8).empty;
 
@@ -291,7 +292,7 @@ pub const SagaOrchestrator = struct {
         return result.toOwnedSlice(self.allocator);
     }
 
-    /// [...] Saga [...]
+    /// Gets the number of registered sagas
     pub fn getSagaCount(self: *Self) usize {
         return self.sagas.count();
     }

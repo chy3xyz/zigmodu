@@ -1,10 +1,11 @@
 const std = @import("std");
 const Validator = @import("../../validation/Validator.zig");
 
-/// [...]Request bodyValidation middleware
+/// Request body validation entry point for handlers.
 ///
-/// [...] Validator.FieldRules [...]Validation[...]
-/// [...] HTTP [...]Request body[...]failure[...] RFC 7807 [...]Error
+/// Rules are `Validator.FieldRules` values keyed by field name; the first
+/// failing field yields a Validation message.
+/// On HTTP failure it responds 422 (RFC 7807 when a problem renderer is set).
 ///
 /// Usage:
 ///   const UserReq = struct { name: []const u8, email: []const u8, age: u32 };
@@ -39,24 +40,25 @@ pub fn validateRequest(
     }
 }
 
-/// [...]Request bodyValidation middleware ([...]Validation[...])
+/// Request body validation middleware (pass-through scaffold).
 ///
-/// [...] Middleware chain [...] `X-Validate` header [...]Validation[...]
-/// Or always for matching paths+[...]Validation[...]
+/// Mount it on the Middleware chain; a request carrying the `X-Validate`
+/// header is one that expects Validation, but the schema is not resolved here.
 ///
 /// Usage:
 ///   server.addMiddleware(.{ .func = validationMiddleware() });
 ///
-/// [...] X-Validate-Schema: UserReq [...]Validation[...]
+/// A client may send `X-Validate-Schema: UserReq` to name the schema; the
+/// middleware does not read that header.
 pub fn validationMiddleware() api.MiddlewareFn {
     const S = struct {
         fn handler(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
             _ = user_data;
 
-            // Check ifRequest validation
+            // Check whether the caller asked for request validation
             if (ctx.header("X-Validate")) |_| {
-                // [...]: [...]Validation ([...])
-                // [...] handler [...]call validateRequest
+                // The schema is not resolved here, so no Validation runs:
+                // handlers are expected to call validateRequest themselves.
             }
 
             try next(ctx, next, null);

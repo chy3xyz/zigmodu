@@ -169,3 +169,100 @@ Zig 里同名内联 struct 是**不同类型**，`expected A, found B` 是正确
 - 升级注意事项（含本版 breaking 项与影响面）→ [`UPGRADING.md`](UPGRADING.md)
 - 错误形状表 / anytype 契约 / 线程安全级别 → [`BEST_PRACTICES.md`](BEST_PRACTICES.md)
 - 代码 ↔ 文档一致性门禁 → `src/test/DocsConsistency.zig`
+
+---
+
+# 第二轮反馈（v0.15.46 处置）
+
+4 条，来自"三门户全量真实化"之后的再次实战。**3 条属实、1 条机制说反了**。
+
+## 汇总
+
+| # | 反馈 | 核实结论 | 处置 |
+|---|------|---------|------|
+| 1 | 上传内容策略是唯一真缺口 | **属实** | 新增 `http.UploadGuard`（嗅探 + 一致性 + SVG 拒绝） |
+| 2 | 没有 `extractMultipart` | **属实** | 新增 `http.extractMultipart`（415/413/400 → ProblemDetails） |
+| 3 | `route_template` 在 legacy `addRoute` 路径为 null | **不属实**（机制）；但**存在真问题**：同一概念两种标签形状 | 注册期统一前导斜杠 + 4 条测试 |
+| 4 | `Multipart.max_total_bytes` 默认值永不生效 | **属实** | 文档写明判定顺序 + 新增 `Config.forBodyLimit` |
+
+## #1 上传内容策略 ✅ v0.15.46
+
+属实。`grep -n "magic\|sniff\|extension\|whitelist\|MIME" src/http/Multipart.zig` → **零命中**：
+框架只解析 + 限体积（`max_parts` / `max_part_bytes` / `max_total_bytes`），没有任何内容校验。
+反馈方列的三种错法全部成立，其中 SVG 那条最危险——它是脚本容器，从自己的源站发出去就是 stored-XSS。
+
+新增 `src/http/UploadGuard.zig`：
+
+- `sniff(bytes)`：JPEG/PNG/GIF/WebP/BMP/TIFF/PDF/ZIP/GZIP/**MP4（ISO-BMFF：校验 box size 与 `ftyp`，
+  而不是只在固定偏移看到 `ftyp` 就放行）**/WebM/OGG/MP3/WAV + 文本容器分类（`<svg`/`<!doctype html`/
+  `<script` → 主动内容，其它文本 → `plain`）。
+- `check(filename, data, policy)`：判定顺序**故意固定**为 大小 → 主动内容 → 扩展名白名单 → 格式白名单 →
+  扩展名与内容一致。于是"`avatar.jpg` 里是 PHP"报 `ContentNotAllowed`（内容不是接受的格式），
+  而"PNG 字节挂 `.jpg` 名"报 `ExtensionContentMismatch`（两边各自合法但互不相符）。
+- **SVG/HTML 默认拒绝**，即使 `extensions`/`formats` 里写了它 —— 必须显式 `allow_active_content = true`。
+  默认 fail-closed，与 x402 同一取向。
+- `checkForm(form, policy)`：遍历 file part（无 filename 的文本字段跳过），第一个不合规即拒绝。
+
+## #2 `extractMultipart` ✅ v0.15.46
+
+属实：抽取器有 `extractPath/Query/Json/JsonValidated/JsonLoose`，唯独 multipart 没有，
+`http.Multipart` 只是裸解析器，错误得由每个 handler 自己映射成状态码。
+
+新增 `http.extractMultipart(ctx, config)`，与 `extractJson*` 同款：415（不是 multipart）、
+413（太大）、400（缺 boundary / 畸形 / part 过多）都直接产出 ProblemDetails；
+`OutOfMemory` 不渲染（那是服务端的 500，不是客户端的错）。
+
+## #3 `route_template` —— 机制说反了，但问题存在 ✅ v0.15.46
+
+反馈称"该字段只在 ComptimeRouter 的两条派发路径被赋值，`addRoute` 注册的路由拿到 null"。
+**核实不成立**：全仓只有两个派发点（`Server.zig` 的 `handleForTest` 与 `handleRequest`），
+**都**执行 `ctx.route_template = m.route.path`，而 `/metrics` 正是经 `addRoute` → `self.router.match`
+进来的（`PrometheusMetrics.registerMetricsRoutePath` 走同一条路）。
+
+用测试钉住真相后发现**另一个真问题**（`src/test/RouteTemplate.zig` 4 条用例）：
+
+| 注册方式 | 修复前的 `route_template` |
+|---------|------------------------|
+| `group.get("/health", …)` | `/health` |
+| `group.get("health", …)` | `health` |
+| ComptimeRouter `mountAll`（`nest` + `spec.path`） | `orders/{id}` |
+| `addRoute(.{ .path = "/metrics" })` | `/metrics` |
+
+即形状取决于**调用方怎么写**，而 `ctx.path` 永远是带斜杠的形式 —— 同一套指标里既有 `/metrics`
+又有 `orders/{id}`，写死的 dashboard 查询会漏掉一半。
+
+修复：`Router.addRoute` 里新增 `normalizeRoutePath`（那里本来就在 dupe 路径，**零额外开销**），
+统一为"恰好一个前导斜杠"。匹配逻辑不受影响（trie 按 `/` 切分并跳过空段，不用这个字符串）。
+
+## #4 `Multipart.max_total_bytes` 默认值不可达 ✅ v0.15.46
+
+属实。`Server.zig:1331` 在读体阶段就 `content_len > max_body_size` → 413，
+`Multipart.parse` 根本不会被调用；默认 8 MB（body）< 32 MB（multipart 总量），所以后者永不触发。
+
+处置（按反馈给的两个选项**都做**）：
+
+1. 文档：`Multipart.zig` 模块头 + `Multipart.Config.max_total_bytes` + `Context.multipart`
+   三处写明判定顺序与"必须先抬 `max_body_size`"；新增 `BEST_PRACTICES.md`「上传与 multipart」
+   一节（含限额优先级表）。
+2. 代码：新增 `Multipart.Config.forBodyLimit(body_limit)`，用同一个数字对齐
+   "单 part ≤ 总量 ≤ body"，避免手算。
+
+**未改默认值**：把 32 MB 降成 8 MB 会改变"已抬 body 上限但依赖 32 MB 总量的调用方"的行为——
+那是静默破坏，不是修复。宁可把顺序写清楚，并提供对齐工具。
+
+## 顺带发现（同族缺陷，一并修）
+
+- **`CircuitBreakerRegistry` 有与 `RateLimiterRegistry` 同族的两处缺陷**（反馈未提）：
+  按值存 `CircuitBreaker` → `getOrCreate` 返回的内部指针**下一次插入 rehash 后失效**；全程零同步。
+  已改为堆分配指针 + 内部锁，`generateReport` 从占位串改为真实 JSON。
+- **两个热路径锁是"纯自旋不让出"**（`http/AccessLog.zig:35`、`http/HttpMetrics.zig:51`）：
+  `while (!mutex.tryLock()) spinLoopHint();` 在争用下烧 CPU。改为共享 `core/SpinLock.zig`
+  （自旋 32 次后 `std.Thread.yield()`），并把 14 处 `self.mutex.state.store(...)` 的裸解锁
+  换成 `self.mutex.unlock()`。
+- **`ShardRouter.ShardedQuery.tableForTenant`**：只能 `return error.NotImplemented` 且无任何调用点 ——
+  删除（物理分表本来就交由 DB 层），模块头写明。
+- **`PluginManager.loadPlugin`** 注册名字但不加载代码（静默 no-op）：改为每次都 warn，
+  并新增 `dynamicLoadingSupported()` 让调用方可以分支。
+- **`Partitioner.zig` 文件头自称"tests are disabled"**：实际 3 条测试都在跑且通过 —— 注释改为实情
+  （该模块确实未被 `DistributedEventBus` 使用，这点保留）。
+- **`FluvioConnector`**：log 降级模式**已经**是显式且可检测的（`isCliAvailable()`），无需改动。

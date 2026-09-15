@@ -131,12 +131,14 @@ test "compile all source files" {
     _ = @import("test/FaultInjection.zig");
     _ = @import("http/StaticFiles.zig");
     _ = @import("http/Multipart.zig");
+    _ = @import("http/UploadGuard.zig");
     _ = @import("test/ContractGate.zig");
     _ = @import("test/DocsConsistency.zig");
     _ = @import("test/ErrorSetSnapshot.zig");
     _ = @import("test/CombinationMatrix.zig");
     _ = @import("test/ErrorShape.zig");
     _ = @import("test/PermissionMatch.zig");
+    _ = @import("test/RouteTemplate.zig");
 
     // Tracing
     _ = @import("tracing/DistributedTracer.zig");

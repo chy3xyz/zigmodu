@@ -2,7 +2,7 @@ const std = @import("std");
 
 // ── Enums ────────────────────────────────────────────────────────
 
-/// [...]
+/// Kind of menu node: directory, page, or button-level permission.
 pub const MenuType = enum(u8) {
     dir = 1,
     menu = 2,
@@ -18,7 +18,7 @@ pub const MenuType = enum(u8) {
     }
 };
 
-/// [...]
+/// Data visibility scope of a role (all / department / self).
 pub const DataScope = enum(u8) {
     all = 1,
     dept_custom = 2,
@@ -40,7 +40,7 @@ pub const DataScope = enum(u8) {
 
 // ── Core Types ───────────────────────────────────────────────────
 
-/// Role — [...] system_role [...]
+/// A role row (`system_role` table): code, status, data scope and tenant.
 pub const Role = struct {
     id: i64,
     name: []const u8,
@@ -54,7 +54,7 @@ pub const Role = struct {
     tenant_id: i64,
 };
 
-/// [...] — [...] system_menu [...]
+/// A menu row (`system_menu` table): permission code, route and flags.
 pub const Menu = struct {
     id: i64,
     name: []const u8,
@@ -82,21 +82,21 @@ pub const Menu = struct {
     }
 };
 
-/// Role-[...]
+/// Role ↔ menu link row.
 pub const RoleMenu = struct {
     id: i64,
     role_id: i64,
     menu_id: i64,
 };
 
-/// [...]-Role[...]
+/// User ↔ role link row.
 pub const UserRole = struct {
     id: i64,
     user_id: i64,
     role_id: i64,
 };
 
-/// [...]
+/// Menu node with a child list; built by `RbacEngine.buildMenuTree`.
 pub const MenuTreeNode = struct {
     id: i64,
     name: []const u8,
@@ -122,7 +122,7 @@ pub const MenuTreeNode = struct {
     }
 };
 
-/// [...]Info — [...] JWT [...]Context
+/// AuthInfo — identity and permission set carried on the request context.
 /// Authentication info populated from JWT claims.
 ///
 /// IMPORTANT: `permissions` starts empty. The caller MUST load permissions
@@ -211,7 +211,7 @@ pub const RbacEngine = struct {
         return .{ .allocator = allocator };
     }
 
-    /// Build from flat menu listPermission[...]
+    /// Collects non-empty `menu.permission` values from a flat list into a set.
     pub fn buildPermissionSet(allocator: std.mem.Allocator, menus: []const Menu) !std.StringHashMap(bool) {
         var set = std.StringHashMap(bool).init(allocator);
         for (menus) |menu| {
@@ -222,7 +222,8 @@ pub const RbacEngine = struct {
         return set;
     }
 
-    /// [...] → [...]
+    /// Builds a parent/child menu tree from a flat menu list.
+    /// Nodes whose `parent_id` is `root_id` (or unknown) become top-level.
     pub fn buildMenuTree(self: *const RbacEngine, menus: []const Menu, root_id: i64) !std.ArrayList(MenuTreeNode) {
         var nodes = std.ArrayList(MenuTreeNode){};
         var node_map = std.AutoHashMap(i64, *MenuTreeNode).init(self.allocator);
@@ -249,7 +250,7 @@ pub const RbacEngine = struct {
             try node_map.put(menu.id, node);
         }
 
-        // [...]
+        // Attach each node under its parent, or keep it as a root
         var it = node_map.iterator();
         while (it.next()) |entry| {
             const node = entry.value_ptr.*;
@@ -268,7 +269,7 @@ pub const RbacEngine = struct {
         return nodes;
     }
 
-    /// [...]Keep only nodes user has access to
+    /// Prunes nodes without permission grants; childless directories go too.
     pub fn filterTreeByPermission(self: *const RbacEngine, tree: *std.ArrayList(MenuTreeNode), auth: *const AuthInfo) void {
         var i: usize = 0;
         while (i < tree.items.len) {

@@ -11,15 +11,15 @@ const WorkerPool = @import("WorkerPool.zig").WorkerPool;
 
 const log = std.log.scoped(.event_bus);
 
-/// ListenerSet for O(1) [...]/[...]
-/// ListenerSet [...] ArrayList [...] HashMap [...]
+/// ListenerSet for O(1) append and linear scan over the listeners.
+/// Listeners are kept in an ArrayList instead of a HashMap.
 ///
 /// NOTE: This type is NOT thread-safe. For concurrent access, use ThreadSafeEventBus.
 fn ListenerSet(comptime CallbackType: type) type {
     return struct {
         const Self = @This();
 
-        // [...] ArrayList [...]Achieve better cache locality
+        // Listeners live in a flat ArrayList instead of a HashMap — better cache locality.
         list: std.ArrayList(CallbackType),
         allocator: std.mem.Allocator,
 

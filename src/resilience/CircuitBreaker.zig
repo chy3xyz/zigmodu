@@ -1,9 +1,10 @@
 //! Circuit breaker — CLOSED/OPEN/HALF_OPEN state machine with per-service breakers.
 
 const std = @import("std");
+const SpinLock = @import("../core/SpinLock.zig").SpinLock;
 const Time = @import("../core/Time.zig");
 
-/// [...] - [...]
+/// Circuit breaker — CLOSED/OPEN/HALF_OPEN failure detector for one dependency.
 pub const CircuitBreaker = struct {
     const Self = @This();
 
@@ -116,13 +117,13 @@ pub const CircuitBreaker = struct {
     pub fn onSuccess(self: *Self) void {
         switch (self.state) {
             .CLOSED => {
-                // [...]Failure count
+                // A success clears the accumulated failure count.
                 self.failure_count = 0;
             },
             .HALF_OPEN => {
                 self.success_count += 1;
                 if (self.success_count >= self.config.success_threshold) {
-                    // [...]CLOSED[...]
+                    // Enough probe successes — close the circuit again.
                     std.log.info("Circuit breaker '{s}' closing after {d} successes", .{ self.name, self.success_count });
                     self.state = .CLOSED;
                     self.failure_count = 0;
@@ -142,13 +143,13 @@ pub const CircuitBreaker = struct {
         switch (self.state) {
             .CLOSED => {
                 if (self.failure_count >= self.config.failure_threshold) {
-                    // [...]
+                    // Threshold reached — open the circuit.
                     std.log.warn("Circuit breaker '{s}' opening after {d} failures", .{ self.name, self.failure_count });
                     self.state = .OPEN;
                 }
             },
             .HALF_OPEN => {
-                // HALF_OPEN[...]failure[...]OPEN
+                // A failure while probing sends the breaker straight back to OPEN.
                 std.log.warn("Circuit breaker '{s}' re-opening after failure in HALF_OPEN", .{self.name});
                 self.state = .OPEN;
                 self.success_count = 0;
@@ -157,14 +158,14 @@ pub const CircuitBreaker = struct {
         }
     }
 
-    /// [...]
+    /// Timeout-driven OPEN → HALF_OPEN transition; a no-op in other states.
     fn updateState(self: *Self) void {
         if (self.state == .OPEN) {
             const now = Time.monotonicNowSeconds();
             const elapsed = @as(u64, @intCast(now - self.last_failure_time));
 
             if (elapsed >= self.config.timeout_seconds) {
-                // [...]HALF_OPEN[...]
+                // Timeout elapsed — let probe calls through via HALF_OPEN.
                 std.log.info("Circuit breaker '{s}' entering HALF_OPEN after timeout", .{self.name});
                 self.state = .HALF_OPEN;
                 self.success_count = 0;
@@ -181,20 +182,20 @@ pub const CircuitBreaker = struct {
         self.last_failure_time = 0;
     }
 
-    /// [...]OPEN[...]
+    /// Force the breaker OPEN without recording a failure (manual/ops use).
     pub fn forceOpen(self: *Self) void {
         std.log.warn("Circuit breaker '{s}' manually forced OPEN", .{self.name});
         self.state = .OPEN;
         self.last_failure_time = 0;
     }
 
-    /// Get current[...]
+    /// Current state, first applying any pending timeout transition.
     pub fn getState(self: *Self) State {
         self.updateState();
         return self.state;
     }
 
-    /// [...]Info
+    /// Snapshot of state and counters for reporting (no transition applied).
     pub fn getStats(self: *Self) Stats {
         return .{
             .state = self.state,
@@ -212,73 +213,161 @@ pub const CircuitBreaker = struct {
     };
 };
 
-/// [...] - [...]
+/// Registry of named circuit breakers — one per downstream dependency.
+/// Per-dependency circuit breakers, keyed by name.
+///
+/// Breakers are heap-allocated and the map holds pointers, so a pointer from
+/// `getOrCreate`/`get` stays valid across later inserts. Storing them by value
+/// (the previous shape) moved them on rehash and handed callers dangling
+/// pointers — the same use-after-free class the zent connection pool hit.
+/// All access is guarded; safe to share across threads.
+///
+/// Keys are expected to be a fixed set of downstream dependencies, so unlike
+/// `RateLimiterRegistry` there is no size cap: if you key breakers by something
+/// request-derived, keep that set bounded yourself (`remove` is available).
 pub const CircuitBreakerRegistry = struct {
     const Self = @This();
 
+    guard: SpinLock = .{},
     allocator: std.mem.Allocator,
-    breakers: std.StringHashMap(CircuitBreaker),
+    breakers: std.StringHashMap(*CircuitBreaker),
     default_config: CircuitBreaker.Config,
 
     pub fn init(allocator: std.mem.Allocator, default_config: CircuitBreaker.Config) Self {
         return .{
             .allocator = allocator,
-            .breakers = std.StringHashMap(CircuitBreaker).init(allocator),
+            .breakers = std.StringHashMap(*CircuitBreaker).init(allocator),
             .default_config = default_config,
         };
     }
 
     pub fn deinit(self: *Self) void {
         var iter = self.breakers.iterator();
-        while (iter.next()) |*entry| {
+        while (iter.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit();
+            entry.value_ptr.*.deinit();
+            self.allocator.destroy(entry.value_ptr.*);
         }
         self.breakers.deinit();
         self.* = undefined;
     }
 
-    /// [...]
+    /// Breaker for `name`, created with `default_config` on first use.
     pub fn getOrCreate(self: *Self, name: []const u8) !*CircuitBreaker {
-        if (self.breakers.getPtr(name)) |breaker| {
-            return breaker;
-        }
+        self.guard.lock();
+        defer self.guard.unlock();
+
+        if (self.breakers.get(name)) |existing| return existing;
 
         const name_copy = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(name_copy);
-        const breaker = try CircuitBreaker.init(self.allocator, name_copy, self.default_config);
+
+        const breaker = try self.allocator.create(CircuitBreaker);
+        errdefer self.allocator.destroy(breaker);
+        breaker.* = try CircuitBreaker.init(self.allocator, name_copy, self.default_config);
+        errdefer breaker.deinit();
+
         try self.breakers.put(name_copy, breaker);
-
-        return self.breakers.getPtr(name).?;
+        return breaker;
     }
 
-    /// [...]
+    /// Existing breaker, or null. The pointer outlives later inserts.
     pub fn get(self: *Self, name: []const u8) ?*CircuitBreaker {
-        return self.breakers.getPtr(name);
+        self.guard.lock();
+        defer self.guard.unlock();
+        return self.breakers.get(name);
     }
 
-    /// [...]
+    /// Drop `name`'s breaker. No-op when absent.
     pub fn remove(self: *Self, name: []const u8) bool {
-        var entry = self.breakers.fetchRemove(name) orelse return false;
+        self.guard.lock();
+        defer self.guard.unlock();
+
+        const entry = self.breakers.fetchRemove(name) orelse return false;
         self.allocator.free(entry.key);
         entry.value.deinit();
+        self.allocator.destroy(entry.value);
         return true;
     }
 
-    /// [...]
-    pub fn resetAll(self: *Self) void {
-        var iter = self.breakers.iterator();
-        while (iter.next()) |entry| {
-            entry.value_ptr.reset();
-        }
+    /// Number of tracked breakers.
+    pub fn count(self: *Self) usize {
+        self.guard.lock();
+        defer self.guard.unlock();
+        return self.breakers.count();
     }
 
-    /// Get all circuit breaker status reports
+    pub fn resetAll(self: *Self) void {
+        self.guard.lock();
+        defer self.guard.unlock();
+
+        var iter = self.breakers.iterator();
+        while (iter.next()) |entry| entry.value_ptr.*.reset();
+    }
+
+    /// JSON snapshot of every breaker's state — for an admin/debug endpoint.
+    /// Caller frees.
     pub fn generateReport(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
-        _ = self;
-        return allocator.dupe(u8, "generateReport (pending Zig 0.16 allocPrint migration)");
+        const Entry = struct {
+            name: []const u8,
+            state: []const u8,
+            failure_count: u32,
+            success_count: u32,
+            failure_threshold: u32,
+        };
+
+        self.guard.lock();
+        defer self.guard.unlock();
+
+        var entries = std.ArrayList(Entry).empty;
+        defer entries.deinit(allocator);
+
+        var iter = self.breakers.iterator();
+        while (iter.next()) |entry| {
+            const breaker = entry.value_ptr.*;
+            try entries.append(allocator, .{
+                .name = breaker.name,
+                .state = @tagName(breaker.state),
+                .failure_count = breaker.failure_count,
+                .success_count = breaker.success_count,
+                .failure_threshold = breaker.config.failure_threshold,
+            });
+        }
+        return std.json.Stringify.valueAlloc(allocator, entries.items, .{});
     }
 };
+
+test "CircuitBreakerRegistry keeps pointers valid and reports state" {
+    const allocator = std.testing.allocator;
+    var registry = CircuitBreakerRegistry.init(allocator, .{
+        .failure_threshold = 2,
+        .success_threshold = 1,
+        .timeout_seconds = 60,
+        .half_open_max_calls = 1,
+    });
+    defer registry.deinit();
+
+    const first = try registry.getOrCreate("payment");
+    // Force rehash: a by-value map would have moved `first` by now.
+    for (0..128) |i| {
+        var buf: [24]u8 = undefined;
+        _ = try registry.getOrCreate(try std.fmt.bufPrint(&buf, "dep-{d}", .{i}));
+    }
+    try std.testing.expect(first == try registry.getOrCreate("payment"));
+    try std.testing.expectEqual(@as(usize, 129), registry.count());
+
+    const report = try registry.generateReport(allocator);
+    defer allocator.free(report);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, report, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 129), parsed.value.array.items.len);
+
+    // Removal frees the entry and the name can come back.
+    try std.testing.expect(registry.remove("payment"));
+    try std.testing.expect(!registry.remove("payment"));
+    try std.testing.expectEqual(@as(usize, 128), registry.count());
+    try std.testing.expect(registry.get("payment") == null);
+}
 
 test "CircuitBreaker state transitions" {
     const allocator = std.testing.allocator;

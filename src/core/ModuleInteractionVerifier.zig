@@ -56,7 +56,7 @@ pub const ModuleInteractionVerifier = struct {
         max_dependency_depth: usize = 5,
         /// Max dependency count per module
         max_dependencies_per_module: usize = 10,
-        /// Whether to strictly require Event[...]
+        /// Whether to strictly require event-driven interaction (not enforced yet)
         enforce_event_driven: bool = false,
     };
 
@@ -92,7 +92,7 @@ pub const ModuleInteractionVerifier = struct {
         self.* = undefined;
     }
 
-    /// [...]
+    /// Add a rule allowing `allowed_types` for every module pair.
     pub fn addRule(self: *Self, allowed_types: []const InteractionType, description: []const u8) !void {
         const types_copy = try self.allocator.dupe(InteractionType, allowed_types);
         errdefer self.allocator.free(types_copy);
@@ -128,8 +128,8 @@ pub const ModuleInteractionVerifier = struct {
         });
     }
 
-    /// ValidationWhether single module deps are compliant
-    /// [...]
+    /// Validate whether a single module's dependencies are compliant.
+    /// Reports dependency-count, circular-dependency and self-dependency issues.
     pub fn verifyModuleDependencies(
         self: *Self,
         comptime module_info: ModuleInfo,
@@ -180,7 +180,7 @@ pub const ModuleInteractionVerifier = struct {
             }
         }
 
-        // 3. Check if[...]
+        // 3. Check for self-dependency
         for (module_info.dependencies) |dep_name| {
             if (std.mem.eql(u8, dep_name, module_info.name)) {
                 const msg = try std.fmt.allocPrint(
@@ -200,7 +200,7 @@ pub const ModuleInteractionVerifier = struct {
         return result.toOwnedSlice(self.allocator);
     }
 
-    /// Validation[...]
+    /// Validate every module in the list, aggregating their violations.
     pub fn verifyAllModules(
         self: *Self,
         comptime modules: anytype,
@@ -239,7 +239,7 @@ pub const ModuleInteractionVerifier = struct {
         });
     }
 
-    /// [...]
+    /// Violations collected by verification and `addViolation` (owned by self).
     pub fn getViolations(self: *Self) []const Violation {
         return self.violations.items;
     }

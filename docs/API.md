@@ -19,6 +19,7 @@ Complete API reference for the ZigModu modular framework.
 11. [Testing](#testing)
 12. [Hardening primitives](#hardening-primitives)
 13. [Error response rendering](#error-response-rendering)
+14. [Uploads](#uploads)
 
 ---
 
@@ -414,13 +415,21 @@ pub fn getStats(self: *Self) Stats
 
 ```zig
 pub fn RateLimiterRegistry.init(allocator: std.mem.Allocator, default_max_tokens: u32, default_refill_rate: u32) Self
+pub fn initWithCapacity(allocator, default_max_tokens, default_refill_rate, max_keys: usize) Self
 pub fn getOrCreate(self: *Self, name: []const u8) !*RateLimiter
 pub fn getOrCreateForClient(self: *Self, client_id: []const u8, max_tokens: u32, refill_rate: u32) !*RateLimiter
 pub fn get(self: *Self, name: []const u8) ?*RateLimiter
+pub fn remove(self: *Self, name: []const u8) bool
+pub fn retain(self: *Self, max_idle_seconds: i64) usize
 pub fn count(self: *Self) usize
+pub fn generateReport(self: *Self, allocator: std.mem.Allocator) ![]const u8
 ```
 
-`getOrCreate*` 返回的 `*RateLimiter` 在 registry 生命周期内**稳定**（内部堆分配，后续插入不会使其失效）。
+`max_keys` (default 0 = unbounded) caps tracked limiters and evicts the
+least-recently-used on insert. Per-client keys come from the request, so an
+unbounded registry grows for as long as someone invents new keys — set a cap when
+you key by IP. `getOrCreate*` returns a pointer that stays valid for the life of
+the registry.
 
 ### SlidingWindowRateLimiter
 
@@ -689,12 +698,25 @@ pub fn totalValues(self) usize                 // occurrences — what the guard
 ```
 
 Context helpers: `queryValues` / `formValues` / `queryArray` / `formArray` /
-`paramPath`. Guard: `Server.Config.max_params` (default 1000 → `error.TooManyParams`).
+`nestedParam` (dotted path, was `paramPath`) / `requestParam` (form first, then
+query). Guard: `Server.Config.max_params` (default 1000 → `error.TooManyParams`).
+
+Path placeholders are `pathParam` (alias `param`) only — they do not fall back to
+query/form. `route_template` is the metric label to use; it is normalised to a
+leading `/` at registration, so `group.get("health")` and a ComptimeRouter mount
+both report the same shape as `group.get("/health")`.
 
 ### `zigmodu.http.Multipart`
 
 ```zig
-pub const Config = struct { max_parts: usize = 64, max_part_bytes: usize = 8 MiB, max_total_bytes: usize = 32 MiB };
+pub const Config = struct {
+    max_parts: usize = 64,
+    max_part_bytes: usize = 8 MiB,
+    max_total_bytes: usize = 32 MiB,
+    // Limits subdivided from a server body limit — use this so the two cannot
+    // disagree: parts may not together exceed the body the server accepted.
+    pub fn forBodyLimit(body_limit: usize) Config
+};
 pub fn parse(allocator, body, content_type, config) Error!Form
 pub const Form = struct {
     pub fn value(self, name) ?[]const u8      // text fields only
@@ -707,6 +729,39 @@ pub const Form = struct {
 pub fn multipart(self: *const Context, config: Multipart.Config) Multipart.Error!Multipart.Form
 pub fn bindMultipart(self: *const Context, comptime T: type, config: Multipart.Config) !T
 ```
+
+`Server.Config.max_body_size` (default 8 MiB) rejects a body **before** any
+`Config` limit here is consulted, so the 32 MiB default total is unreachable
+until that is raised — see `docs/BEST_PRACTICES.md`「上传与 multipart」.
+
+### Uploads
+
+```zig
+// http.Extract: multipart failures rendered as ProblemDetails
+pub fn extractMultipart(ctx: *Context, config: Multipart.Config) !Multipart.Form
+//   415 not multipart · 413 too large · 400 missing boundary / malformed / too many parts
+
+// http.UploadGuard — decide what a file *is* from its bytes
+pub const Format = enum { jpeg, png, gif, webp, bmp, tiff, pdf, zip, gzip, mp4, webm, ogg, mp3, wav, plain, svg, html, unknown };
+pub const Policy = struct {
+    extensions: []const []const u8 = &.{},   // allowlist, lowercase, no dot
+    formats: []const Format = &.{},
+    max_bytes: usize = 0,                    // per file
+    require_extension_match: bool = true,
+    allow_active_content: bool = false,      // SVG/HTML: refused by default
+};
+pub fn check(filename: []const u8, data: []const u8, policy: Policy) Error!Accepted
+pub fn checkForm(form: *const Multipart.Form, policy: Policy) Error!void
+pub fn sniff(data: []const u8) Format
+pub fn extensionOf(filename: []const u8) ?[]const u8
+pub fn extensionMatchesFormat(ext: []const u8, format: Format) bool
+```
+
+`check` decides in a fixed order: size → active content (SVG/HTML refused unless
+`allow_active_content`) → extension allowlist → format allowlist → extension vs
+content agreement. The rule it enforces: **sniff the bytes and require the
+sniffed format to agree with the extension** — a renamed script fails on content,
+a renamed image cross-family fails on the mismatch.
 
 ### `zigmodu.http.staticFiles` (static file serving)
 

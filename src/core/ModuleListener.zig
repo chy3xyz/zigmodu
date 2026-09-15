@@ -1,13 +1,13 @@
 const std = @import("std");
 const EventBus = @import("./EventBus.zig").EventBus;
 
-/// @ApplicationModuleListener [...]
-/// for[...]Module event[...]Transaction[...]Feature
+/// Ties one event type to one handler on an `EventBus`.
+/// Config is stored as-is; only `async_mode` is read back (and ignored).
 pub fn ApplicationModuleListener(comptime EventType: type) type {
     return struct {
         const Self = @This();
 
-        /// [...]
+        /// Listener options; `async_mode` is informational, the rest are unused.
         pub const Config = struct {
             async_mode: bool = true,
             transactional: bool = false,
@@ -51,16 +51,16 @@ pub fn ApplicationModuleListener(comptime EventType: type) type {
             self.event_bus.subscribe(self.event_type, S.wrapper);
         }
 
-        /// [...]
+        /// No-op: this listener implementation never removes its subscription.
         pub fn unsubscribe(self: *Self) void {
             _ = self;
-            // [...]
+            // Nothing to do: subscribe() has no counterpart here
         }
     };
 }
 
-/// Module event[...]
-/// [...]Event[...]
+/// Tracks which modules listen to which events, keyed by `module:event`.
+/// `getModuleListeners` filters the registry by module name.
 pub const ModuleListenerRegistry = struct {
     const Self = @This();
 
@@ -86,7 +86,7 @@ pub const ModuleListenerRegistry = struct {
         self.* = undefined;
     }
 
-    /// [...]
+    /// Records a listener under `module_name:event_type`; a repeat overwrites it.
     pub fn registerListener(
         self: *Self,
         module_name: []const u8,
@@ -154,8 +154,8 @@ test "ApplicationModuleListener subscribes and receives published events" {
     try std.testing.expectEqual(@as(?EventType, null), State.handled);
 }
 
-/// Event[...]
-/// [...]Eventpublish[...]Message queue[...]
+/// Fan-out of published events to named externalizers (e.g. a message queue).
+/// The first externalizer whose `can_handle` returns true receives the event.
 pub const EventExternalization = struct {
     const Self = @This();
 
@@ -180,12 +180,12 @@ pub const EventExternalization = struct {
         self.* = undefined;
     }
 
-    /// [...]
+    /// Appends an externalizer to the dispatch list.
     pub fn registerExternalizer(self: *Self, externalizer: Externalizer) !void {
         try self.externalizers.append(self.allocator, externalizer);
     }
 
-    /// [...]Event
+    /// Sends the event to the first externalizer that can handle it, else warns.
     pub fn externalize(self: *Self, event_type: []const u8, event_data: []const u8) !void {
         for (self.externalizers.items) |externalizer| {
             if (externalizer.can_handle(event_type)) {

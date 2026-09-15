@@ -1,9 +1,9 @@
 const std = @import("std");
 const ZigModuError = @import("../core/Error.zig").ZigModuError;
 
-/// Externalized configuration[...]
-/// [...]
-/// [...]
+/// Externalized configuration manager.
+/// Multiple sources are supported: environment variables, config files, or any custom loader.
+/// Config hot reload is supported through file watching.
 pub const ExternalizedConfig = struct {
     const Self = @This();
 
@@ -40,7 +40,7 @@ pub const ExternalizedConfig = struct {
         loader: *const fn (allocator: std.mem.Allocator) anyerror!std.StringHashMap([]const u8),
     };
 
-    /// [...] - [...]
+    /// File watcher - watches a config file for changes.
     pub const FileWatcher = struct {
         filepath: []const u8,
         last_modified: i128,
@@ -52,10 +52,10 @@ pub const ExternalizedConfig = struct {
     };
 
     pub fn deinit(self: *Self) void {
-        // [...]
+        // Stop the watch thread
         self.stopWatching();
 
-        // [...]
+        // Free all config values
         var prop_iter = self.properties.iterator();
         while (prop_iter.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -65,7 +65,7 @@ pub const ExternalizedConfig = struct {
         self.sources.deinit(self.allocator);
         self.listeners.deinit(self.allocator);
 
-        // [...]
+        // Free the file watchers
         for (self.file_watchers.items) |*watcher| {
             self.allocator.free(watcher.filepath);
         }
@@ -73,7 +73,7 @@ pub const ExternalizedConfig = struct {
         self.* = undefined;
     }
 
-    /// [...]
+    /// Add a config source.
     pub fn addSource(self: *Self, name: []const u8, priority: u8, loader: LoaderFn) !void {
         try self.sources.append(self.allocator, .{
             .name = name,
@@ -81,7 +81,7 @@ pub const ExternalizedConfig = struct {
             .loader = loader,
         });
 
-        // [...]
+        // Sort by priority
         std.sort.insertion(ConfigSource, self.sources.items, {}, compareSourcePriority);
     }
 
@@ -113,7 +113,7 @@ pub const ExternalizedConfig = struct {
         return a.priority < b.priority;
     }
 
-    /// [...]
+    /// Load config from all sources, in priority order.
     pub fn load(self: *Self) !void {
         std.log.info("Loading configuration from {d} sources", .{self.sources.items.len});
 
@@ -135,7 +135,7 @@ pub const ExternalizedConfig = struct {
                 const key = try self.allocator.dupe(u8, entry.key_ptr.*);
                 const value = try self.allocator.dupe(u8, entry.value_ptr.*);
 
-                // [...]Decide overwrite based on priority
+                // Key already exists: free the old value, the later source wins
                 if (self.properties.get(key)) |old_value| {
                     self.allocator.free(old_value);
                 }
@@ -147,17 +147,17 @@ pub const ExternalizedConfig = struct {
         std.log.info("Loaded {d} configuration properties", .{self.properties.count()});
     }
 
-    /// [...]
+    /// Get a config value.
     pub fn get(self: *Self, key: []const u8) ?[]const u8 {
         return self.properties.get(key);
     }
 
-    /// [...]
+    /// Get a config value, falling back to a default when the key is missing.
     pub fn getOrDefault(self: *Self, key: []const u8, default_value: []const u8) []const u8 {
         return self.properties.get(key) orelse default_value;
     }
 
-    /// [...]
+    /// Get an integer config value; null when the key is missing or fails to parse.
     pub fn getInt(self: *Self, key: []const u8) ?i64 {
         const value = self.properties.get(key) orelse return null;
         return std.fmt.parseInt(i64, value, 10) catch |err| {
@@ -166,13 +166,13 @@ pub const ExternalizedConfig = struct {
         };
     }
 
-    /// [...]Error[...]
+    /// Get an integer config value; null when missing, parse errors are returned to the caller.
     pub fn getIntOrError(self: *Self, key: []const u8) !?i64 {
         const value = self.properties.get(key) orelse return null;
         return try std.fmt.parseInt(i64, value, 10);
     }
 
-    /// [...]
+    /// Get a boolean config value: true/1/yes and false/0/no; other values give null.
     pub fn getBool(self: *Self, key: []const u8) ?bool {
         const value = self.properties.get(key) orelse return null;
         if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "yes")) {
@@ -184,8 +184,8 @@ pub const ExternalizedConfig = struct {
         return null;
     }
 
-    /// Validation[...] = [...]
-    /// [...] Application.start() [...]call[...]ErrorInfo[...]
+    /// Validate the required config keys. Returns the list of missing keys (empty = all present).
+    /// The caller owns the returned slice and decides how to report the error.
     pub fn validateRequired(self: *Self, required_keys: []const []const u8, allocator: std.mem.Allocator) ![]const []const u8 {
         var missing = std.ArrayList([]const u8).empty;
         for (required_keys) |key| {
@@ -196,7 +196,7 @@ pub const ExternalizedConfig = struct {
         return missing.toOwnedSlice(allocator);
     }
 
-    /// [...]
+    /// Set a config value, then notify the listeners.
     pub fn set(self: *Self, key: []const u8, value: []const u8) !void {
         const key_copy = try self.allocator.dupe(u8, key);
         const value_copy = try self.allocator.dupe(u8, value);
@@ -208,18 +208,18 @@ pub const ExternalizedConfig = struct {
 
         try self.properties.put(key_copy, value_copy);
 
-        // [...]
+        // Notify the listeners
         for (self.listeners.items) |listener| {
             listener(key, value);
         }
     }
 
-    /// [...]
+    /// Add a config change listener.
     pub fn addListener(self: *Self, listener: *const fn ([]const u8, []const u8) void) !void {
         try self.listeners.append(self.allocator, listener);
     }
 
-    /// [...]for[...]
+    /// Add a config file watcher (used for hot reload).
     pub fn watchFile(self: *Self, filepath: []const u8, loader: *const fn (std.mem.Allocator) anyerror!std.StringHashMap([]const u8)) !void {
         const path_copy = try self.allocator.dupe(u8, filepath);
         errdefer self.allocator.free(path_copy);
@@ -227,7 +227,7 @@ pub const ExternalizedConfig = struct {
         // Get file initial modification time
         const stat = std.Io.Dir.cwd().statFile(self.io, filepath, .{}) catch |err| {
             std.log.warn("Cannot get file status {s}: {}", .{ filepath, err });
-            // [...]
+            // File may not exist yet; use 0 so a later successful stat triggers a reload
             const watcher = FileWatcher{
                 .filepath = path_copy,
                 .last_modified = 0,
@@ -247,7 +247,7 @@ pub const ExternalizedConfig = struct {
         std.log.info("Start watching config file: {s}", .{filepath});
     }
 
-    /// [...]
+    /// Start config watching (hot reload).
     pub fn watch(self: *Self, config: WatchConfig) !void {
         if (self.watch_thread != null) {
             std.log.warn("Config watcher already running", .{});
@@ -257,13 +257,13 @@ pub const ExternalizedConfig = struct {
         self.watch_interval_ms = config.interval_ms;
         self.should_stop.store(false, .release);
 
-        // [...]
+        // Create the watch thread
         self.watch_thread = try std.Thread.spawn(.{}, watchThreadFn, .{self});
 
         std.log.info("Config hot-reload started (interval: {d}ms)", .{config.interval_ms});
     }
 
-    /// [...]
+    /// Stop config watching.
     pub fn stopWatching(self: *Self) void {
         if (self.watch_thread) |thread| {
             self.should_stop.store(true, .release);
@@ -273,7 +273,7 @@ pub const ExternalizedConfig = struct {
         }
     }
 
-    /// [...]
+    /// Watch thread entry point.
     fn watchThreadFn(self: *Self) void {
         while (!self.should_stop.load(.acquire)) {
             self.checkFileChanges() catch |err| {
@@ -294,7 +294,7 @@ pub const ExternalizedConfig = struct {
     fn checkFileChanges(self: *Self) !void {
         for (self.file_watchers.items) |*watcher| {
             const stat = std.Io.Dir.cwd().statFile(self.io, watcher.filepath, .{}) catch |err| {
-                // File may not exist or be inaccessible[...]
+                // File may not exist or be inaccessible; only FileNotFound is skipped
                 if (err == error.FileNotFound) {
                     std.log.warn("Config file not found: {s}", .{watcher.filepath});
                     continue;
@@ -306,7 +306,7 @@ pub const ExternalizedConfig = struct {
                 std.log.info("Config file change detected: {s}", .{watcher.filepath});
                 watcher.last_modified = @as(i128, @intCast(stat.mtime.nanoseconds));
 
-                // [...]
+                // Reload the config
                 try self.reloadFromWatcher(watcher.*);
             }
         }
@@ -333,7 +333,7 @@ pub const ExternalizedConfig = struct {
             changed_keys.deinit(self.allocator);
         }
 
-        // [...]
+        // Apply the new config
         var iter = new_props.iterator();
         while (iter.next()) |entry| {
             const key = entry.key_ptr.*;
@@ -341,11 +341,11 @@ pub const ExternalizedConfig = struct {
 
             if (self.properties.get(key)) |old_value| {
                 if (!std.mem.eql(u8, old_value, new_value)) {
-                    // [...]
+                    // Value changed
                     const key_copy = try self.allocator.dupe(u8, key);
                     try changed_keys.append(self.allocator, key_copy);
 
-                    // [...]
+                    // Update the config
                     self.allocator.free(old_value);
                     const new_value_copy = try self.allocator.dupe(u8, new_value);
                     try self.properties.put(key, new_value_copy);
@@ -353,7 +353,7 @@ pub const ExternalizedConfig = struct {
                     std.log.info("Config updated: {s} = {s}", .{ key, new_value });
                 }
             } else {
-                // [...]
+                // New key
                 const key_copy = try self.allocator.dupe(u8, key);
                 try changed_keys.append(self.allocator, key_copy);
 
@@ -365,7 +365,7 @@ pub const ExternalizedConfig = struct {
             }
         }
 
-        // [...]
+        // Notify the listeners
         for (changed_keys.items) |key| {
             if (self.properties.get(key)) |value| {
                 for (self.listeners.items) |listener| {
@@ -377,21 +377,21 @@ pub const ExternalizedConfig = struct {
         std.log.info("Config file reload done, {d} changes", .{changed_keys.items.len});
     }
 
-    /// Check if[...]
+    /// Check whether watching is currently active.
     pub fn isWatching(self: *Self) bool {
         return self.watch_thread != null;
     }
 
-    /// [...]
+    /// Number of registered file watchers.
     pub fn getWatcherCount(self: *Self) usize {
         return self.file_watchers.items.len;
     }
 
-    /// [...]
+    /// Refresh the config (reload every source from scratch).
     pub fn refresh(self: *Self) !void {
         std.log.info("Manual config refresh...", .{});
 
-        // [...]
+        // Clear the existing config
         var iter = self.properties.iterator();
         while (iter.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -399,12 +399,12 @@ pub const ExternalizedConfig = struct {
         }
         self.properties.clearRetainingCapacity();
 
-        // [...]
+        // Reload
         try self.load();
         std.log.info("Config refresh done", .{});
     }
 
-    /// [...]
+    /// Print all config properties.
     pub fn printAll(self: *Self) void {
         std.log.info("=== Configuration Properties ===", .{});
         var iter = self.properties.iterator();
@@ -414,7 +414,7 @@ pub const ExternalizedConfig = struct {
     }
 };
 
-/// [...]
+/// Environment variable config source; reads the ZIGMODU_ prefixed variables.
 pub fn envVarLoader(allocator: std.mem.Allocator) !std.StringHashMap([]const u8) {
     var props = std.StringHashMap([]const u8).init(allocator);
 
@@ -450,9 +450,9 @@ pub fn jsonFileLoader(filepath: []const u8, io: std.Io) *const fn (std.mem.Alloc
             defer allocator.free(content);
             _ = try std.Io.File.readPositionalAll(file, io, content, 0);
 
-            // [...]JSON[...]key-value[...]
-            // [...]std.json[...]
-            // content[...]
+            // Simplified implementation: parse JSON and flatten it into key-value pairs
+            // A real implementation should parse it with std.json
+            // content holds the file contents, which currently stay unparsed
             const dummy_key = try allocator.dupe(u8, "config.loaded");
             const dummy_value = try allocator.dupe(u8, "true");
             try props.put(dummy_key, dummy_value);

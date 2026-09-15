@@ -67,7 +67,7 @@ pub const HealthEndpoint = struct {
         try self.checks.put(name_copy, .{ .name = name_copy, .check_fn = check_fn, .context = context, .description = desc_copy });
     }
 
-    /// [...]Health check
+    /// Run every registered check and aggregate the results into HealthDetails.
     pub fn checkHealth(self: *Self) HealthDetails {
         var components = std.StringHashMap(ComponentHealth).init(self.allocator);
         var overall_status = HealthStatus.UP;
@@ -83,7 +83,7 @@ pub const HealthEndpoint = struct {
 
             components.put(check.name, health) catch |err| std.log.warn("[HealthEndpoint] component put failed: {}", .{err});
 
-            // If any component is unhealthy[...]DOWN
+            // If any component is unhealthy, the overall status becomes DOWN
             if (status != .UP) {
                 overall_status = .DOWN;
             }
@@ -98,12 +98,12 @@ pub const HealthEndpoint = struct {
         };
     }
 
-    /// [...]
+    /// Return the last aggregated status (UNKNOWN until checkHealth has run).
     pub fn getStatus(self: *Self) HealthStatus {
         return self.status;
     }
 
-    /// [...]JSON[...]
+    /// Serialize the current health report as a JSON string; caller owns the result.
     pub fn toJson(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
         var buf = std.ArrayList(u8).empty;
         var health = self.checkHealth();

@@ -1,15 +1,15 @@
 const std = @import("std");
 const CacheManager = @import("CacheManager.zig").CacheManager;
 
-/// Cache-Aside [...] — [...] read-through / write-through [...]
+/// Cache-Aside pattern — automatic read-through / write-through caching
 ///
-/// [...]:
-/// 1. [...] → [...]
-/// 2. [...] → [...] → [...] → [...]
+/// Read flow:
+/// 1. Look up the cache → return on a hit
+/// 2. On a miss → query the database → write to cache → return
 ///
-/// [...]:
-/// 1. [...]
-/// 2. [...] ([...])
+/// Write flow:
+/// 1. Write to the database
+/// 2. Invalidate the cache entry (or refresh it)
 ///
 /// Usage:
 ///   var aside = CacheAside.init(allocator, &cache);
@@ -21,7 +21,7 @@ pub const CacheAside = struct {
 
     allocator: std.mem.Allocator,
     cache: *CacheManager,
-    /// [...] TTL [...] (0 = [...] CacheManager [...] TTL)
+    /// Cache TTL override (0 = use the CacheManager default TTL)
     ttl_seconds: u64,
 
     pub fn init(allocator: std.mem.Allocator, cache: *CacheManager) Self {
@@ -32,41 +32,41 @@ pub const CacheAside = struct {
         };
     }
 
-    /// Read-Through: [...] DB [...]
+    /// Read-Through: read the cache first, load from the DB on a miss and cache the value
     pub fn get(self: *Self, key: []const u8, db_loader: *const fn ([]const u8) anyerror![]const u8) anyerror![]const u8 {
-        // Step 1: [...]
+        // Step 1: look up the cache
         if (self.cache.get(key)) |cached| {
             return cached;
         }
 
-        // Step 2: [...] → [...]
+        // Step 2: cache miss → query the database
         const value = try db_loader(key);
 
-        // Step 3: [...]
+        // Step 3: write the value to the cache
         try self.cache.set(key, value);
 
         return value;
     }
 
-    /// Write-Through: [...] DB[...]
+    /// Write-Through: write to the DB, then update the cache
     pub fn set(self: *Self, key: []const u8, value: []const u8, db_writer: *const fn ([]const u8, []const u8) anyerror!void) !void {
         try db_writer(key, value);
         try self.cache.set(key, value);
     }
 
-    /// Write-Invalidate: [...] DB[...] ([...])
+    /// Write-Invalidate: write to the DB, then invalidate the cache (the common pattern)
     pub fn invalidate(self: *Self, key: []const u8, db_writer: *const fn ([]const u8) anyerror!void) !void {
         try db_writer(key);
         _ = self.cache.remove(key);
     }
 
-    /// [...] (DB + Cache)
+    /// Delete from both the database and the cache
     pub fn delete(self: *Self, key: []const u8, db_deleter: *const fn ([]const u8) anyerror!void) !void {
         try db_deleter(key);
         _ = self.cache.remove(key);
     }
 
-    /// [...]: [...] DB [...]
+    /// Warm up the cache: load the given keys from the DB in bulk
     pub fn warmup(self: *Self, keys: []const []const u8, db_loader: *const fn ([]const u8) anyerror![]const u8) !void {
         for (keys) |key| {
             _ = self.get(key, db_loader) catch |err| {
@@ -75,7 +75,7 @@ pub const CacheAside = struct {
         }
     }
 
-    /// [...]
+    /// Get cache statistics
     pub fn getStats(self: *Self) CacheManager.CacheStats {
         return self.cache.getStats();
     }

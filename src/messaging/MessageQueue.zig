@@ -1,7 +1,7 @@
 const std = @import("std");
 const Nats = @import("Nats.zig");
 
-/// Message queue[...]
+/// Message queue abstraction over pluggable in-memory, NATS, Redis and Kafka backends.
 pub const MessageQueue = struct {
     const Self = @This();
 
@@ -25,7 +25,7 @@ pub const MessageQueue = struct {
         kafka: KafkaBackend,
     };
 
-    /// [...]
+    /// Producer handle: publishes messages to the queue backend.
     pub const Producer = struct {
         backend: *QueueBackend,
 
@@ -39,7 +39,7 @@ pub const MessageQueue = struct {
         }
     };
 
-    /// consume[...]
+    /// Consumer handle: tracks the topics subscribed on the queue backend.
     pub const Consumer = struct {
         allocator: std.mem.Allocator,
         backend: *QueueBackend,
@@ -67,7 +67,7 @@ pub const MessageQueue = struct {
         }
     };
 
-    /// [...]
+    /// In-memory backend: one FIFO queue (ArrayList) per topic.
     pub const InMemoryBackend = struct {
         allocator: std.mem.Allocator,
         queues: std.StringHashMap(std.ArrayList(Message)),

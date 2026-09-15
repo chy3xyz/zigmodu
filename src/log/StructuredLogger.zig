@@ -1,7 +1,7 @@
 const std = @import("std");
 const Time = @import("../core/Time.zig");
 
-/// Log level[...]
+/// Log level
 pub const LogLevel = enum(u8) {
     DEBUG = 0,
     INFO = 1,
@@ -21,7 +21,7 @@ pub const LogLevel = enum(u8) {
 };
 
 /// Structured logger
-/// [...] JSON [...]Context[...]
+/// Supports JSON output, context fields and multiple output targets
 pub const StructuredLogger = struct {
     const Self = @This();
 
@@ -57,14 +57,14 @@ pub const StructuredLogger = struct {
         self.* = undefined;
     }
 
-    /// [...]Context[...]
+    /// Adds a context field applied to every later log entry
     pub fn withField(self: *Self, key: []const u8, value: []const u8) !void {
         const key_copy = try self.allocator.dupe(u8, key);
         const value_copy = try self.allocator.dupe(u8, value);
         try self.context.put(key_copy, value_copy);
     }
 
-    /// [...]
+    /// Writes one log entry; entries below the configured level are dropped
     pub fn log(self: *Self, level: LogLevel, message: []const u8, fields: anytype) !void {
         if (@backingInt(level) < @backingInt(self.level)) {
             return;
@@ -85,7 +85,7 @@ pub const StructuredLogger = struct {
             entry.fields.deinit();
         }
 
-        // [...]Context[...]
+        // Merge the context fields into the entry
         var ctx_iter = self.context.iterator();
         while (ctx_iter.next()) |entry_ctx| {
             const key = try self.allocator.dupe(u8, entry_ctx.key_ptr.*);
@@ -93,7 +93,7 @@ pub const StructuredLogger = struct {
             try entry.fields.put(key, value);
         }
 
-        // [...]
+        // Merge the caller-supplied fields
         const fields_info = @typeInfo(@TypeOf(fields));
         if (fields_info == .@"struct" and fields_info.@"struct".is_tuple == false) {
             inline for (fields_info.@"struct".field_names) |key| {
@@ -110,10 +110,10 @@ pub const StructuredLogger = struct {
         const json = try entry.toJson(self.allocator);
         defer self.allocator.free(json);
 
-        // [...]
-        // [...]failure[...]
-        // 1. Log system must not fail due to outputfailure[...]
-        // 2. Cannot log through log systemfailure
+        // Emit the entry
+        // Output failures are swallowed on purpose:
+        // 1. The logger must not crash because the output failed
+        // 2. A failed write cannot be reported through the logger itself
         switch (self.output) {
             .stdout => std.Io.File.stdout().writeStreamingAll(self.io, json) catch {},
             .stderr => std.Io.File.stderr().writeStreamingAll(self.io, json) catch {},
@@ -142,7 +142,7 @@ pub const StructuredLogger = struct {
     }
 };
 
-/// [...]
+/// Log file rotator
 pub const LogRotator = struct {
     const Self = @This();
 
@@ -186,15 +186,15 @@ pub const LogRotator = struct {
     }
 
     fn rotate(self: *Self) !void {
-        // CLOSED[...]
+        // Close the current file first
         if (self.current_file) |file| {
             file.close(self.io);
         }
 
-        // [...]
-        // [...]failure[...]
+        // Rotate the old files
+        // Rename failures are swallowed on purpose:
         // 1. Some files may not exist during rotation
-        // 2. [...]failure[...]
+        // 2. A rotation failure must not block writes to the new log
         var i: u32 = self.max_files - 1;
         while (i > 0) : (i -= 1) {
             const old_name = try std.fmt.allocPrint(self.allocator, "{s}.{d}", .{ self.base_path, i - 1 });
@@ -205,18 +205,18 @@ pub const LogRotator = struct {
             std.Io.Dir.cwd().rename(self.io, old_name, new_name) catch {};
         }
 
-        // [...]
+        // Move the current file to .0
         const backup_name = try std.fmt.allocPrint(self.allocator, "{s}.0", .{self.base_path});
         defer self.allocator.free(backup_name);
         std.Io.Dir.cwd().rename(self.io, self.base_path, backup_name) catch {};
 
-        // [...]
+        // Open a fresh current file
         self.current_file = try std.Io.Dir.cwd().createFile(self.io, self.base_path, .{});
         self.current_size = 0;
     }
 };
 
-/// [...]
+/// One log entry
 const LogEntry = struct {
     timestamp: i64,
     level: LogLevel,

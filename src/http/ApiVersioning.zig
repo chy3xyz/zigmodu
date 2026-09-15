@@ -1,10 +1,10 @@
 const std = @import("std");
 
-/// API version[...]
+/// API versioning — a `major.minor` pair.
 pub const ApiVersion = struct {
-    /// [...]
+    /// Major version. `isCompatible` compares only this, so a bump here is breaking.
     major: u16,
-    /// [...]
+    /// Minor version. Additive changes only.
     minor: u16 = 0,
 
     pub fn parse(version_str: []const u8) ?ApiVersion {
@@ -33,16 +33,16 @@ pub const ApiVersion = struct {
         return self.major == other.major and self.minor == other.minor;
     }
 
-    /// [...]: [...]
+    /// Compatibility check: same major version (minor differences are compatible).
     pub fn isCompatible(self: ApiVersion, other: ApiVersion) bool {
         return self.major == other.major;
     }
 };
 
-/// API version[...] — [...]
-/// [...] URL [...] Header [...]
+/// API version extractor — pulls the version out of a request.
+/// Supports the URL path and header styles.
 pub const ApiVersionExtractor = struct {
-    /// [...] URL [...]: /api/v1/users → v1
+    /// Extract from the URL path: /api/v1/users → v1
     pub fn fromPath(path: []const u8) ?ApiVersion {
         var it = std.mem.splitScalar(u8, path, '/');
         while (it.next()) |segment| {
@@ -53,7 +53,7 @@ pub const ApiVersionExtractor = struct {
         return null;
     }
 
-    /// [...]: Accept-Version: v2
+    /// Extract from a request header: Accept-Version: v2
     pub fn fromHeader(headers: anytype, header_name: []const u8) ?ApiVersion {
         if (headers.get(header_name)) |value| {
             return ApiVersion.parse(value);
@@ -61,14 +61,14 @@ pub const ApiVersionExtractor = struct {
         return null;
     }
 
-    /// [...] ([...] header[...] path)
+    /// Extract from the request (header first, then path).
     pub fn extract(path: []const u8, headers: anytype, header_name: []const u8) ?ApiVersion {
         if (fromHeader(headers, header_name)) |v| return v;
         return fromPath(path);
     }
 };
 
-/// API versionRoute group — Register independent routes per version
+/// API version route group — registers independent routes per version.
 ///
 /// Usage:
 ///   var v1 = server.group("/api/v1");
@@ -98,7 +98,7 @@ pub const ApiVersionRouter = struct {
         self.* = undefined;
     }
 
-    /// [...]
+    /// Register a version and the route prefix it owns.
     pub fn registerVersion(self: *Self, version: ApiVersion, prefix: []const u8) !void {
         try self.versions.append(self.allocator, .{
             .version = version,
@@ -106,7 +106,7 @@ pub const ApiVersionRouter = struct {
         });
     }
 
-    /// [...] ([...] ≤ [...])
+    /// Find the matching version: the newest registered version ≤ the requested one.
     pub fn resolve(self: *Self, requested: ApiVersion) ?ApiVersion {
         var best: ?ApiVersion = null;
         for (self.versions.items) |vg| {
@@ -122,8 +122,12 @@ pub const ApiVersionRouter = struct {
     }
 };
 
-/// API version[...]Middleware
-/// Auto-extract version from request and set ctx [...]
+/// API version negotiation middleware.
+///
+/// Extracts the requested version (header first, then path). It does **not**
+/// publish it to handlers yet: the extracted value and `default_version_str`
+/// are both discarded below, so this middleware currently only proves the
+/// negotiation path. Wire the result into a ctx attr before relying on it.
 ///
 /// Usage:
 ///   server.addMiddleware(.{ .func = apiVersionMiddleware("1.0") });
@@ -134,14 +138,15 @@ pub fn apiVersionMiddleware(default_version_str: []const u8) api.MiddlewareFn {
         fn handler(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
             _ = user_data;
 
-            // [...] URL [...] Header [...]
+            // Version from the request URL or Accept-Version header.
             const version = ApiVersionExtractor.extract(
                 ctx.path,
                 ctx.headers,
                 "Accept-Version",
             ) orelse ApiVersion{ .major = 1, .minor = 0 };
 
-            // [...] Context user_data [...]
+            // Extracted, but nothing consumes it yet (`_ = version` keeps the
+            // public shape stable until handlers get an attr to read).
             _ = version;
 
             try next(ctx, next, null);

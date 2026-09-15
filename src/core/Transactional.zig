@@ -1,78 +1,78 @@
 const std = @import("std");
 
-/// [...]Transaction[...]
-/// [...] Spring @Transactional [...]Transaction[...]
+/// Declarative transaction support
+/// Provides Spring @Transactional-style transaction management
 /// High-priority architecture improvement item
 pub const Transactional = struct {
     const Self = @This();
 
-    /// Transaction[...]
+    /// Transaction propagation behavior
     pub const Propagation = enum {
-        /// REQUIRED: [...]Transaction[...]Transaction[...]Transaction[...]
+        /// REQUIRED: join the current transaction if one exists, otherwise create a new one (default)
         REQUIRED,
 
-        /// SUPPORTS: [...]Transaction[...]Transaction[...]Transaction[...]
+        /// SUPPORTS: join the current transaction if one exists, otherwise run without a transaction
         SUPPORTS,
 
-        /// MANDATORY: [...]Transaction[...]Transaction[...]
+        /// MANDATORY: join the current transaction if one exists, otherwise raise an error
         MANDATORY,
 
-        /// REQUIRES_NEW: [...]Transaction[...]Transaction[...]Transaction
+        /// REQUIRES_NEW: create a new transaction, suspending the current one if it exists
         REQUIRES_NEW,
 
-        /// NOT_SUPPORTED: [...]Transaction[...]Transaction[...]Transaction
+        /// NOT_SUPPORTED: run without a transaction, suspending the current one if it exists
         NOT_SUPPORTED,
 
-        /// NEVER: [...]Transaction[...]Transaction[...]
+        /// NEVER: run without a transaction, raising an error if one exists
         NEVER,
 
-        /// NESTED: [...]Transaction[...]Transaction[...]Transaction
+        /// NESTED: run inside a nested transaction if one exists, otherwise create a new one
         NESTED,
     };
 
-    /// Transaction[...]
+    /// Transaction isolation level
     pub const Isolation = enum {
         /// DEFAULT: Use database default isolation level
         DEFAULT,
 
-        /// READ_UNCOMMITTED: [...]
+        /// READ_UNCOMMITTED: reads changes made by other uncommitted transactions
         READ_UNCOMMITTED,
 
-        /// READ_COMMITTED: [...]
+        /// READ_COMMITTED: only sees changes committed by other transactions
         READ_COMMITTED,
 
-        /// REPEATABLE_READ: [...]
+        /// REPEATABLE_READ: repeated reads of the same row return the same value
         REPEATABLE_READ,
 
-        /// SERIALIZABLE: [...]
+        /// SERIALIZABLE: transactions behave as if executed one after another
         SERIALIZABLE,
     };
 
-    /// Transaction[...]
+    /// Transaction definition
     pub const Definition = struct {
-        /// Transaction[...]for[...]
+        /// Transaction name (optional, used for monitoring and logs)
         name: []const u8 = "",
 
-        /// [...]
+        /// Propagation behavior
         propagation: Propagation = .REQUIRED,
 
-        /// [...]
+        /// Isolation level
         isolation: Isolation = .DEFAULT,
 
-        /// [...]-1 [...]
+        /// Timeout in seconds, -1 means use the default
         timeout: i32 = -1,
 
-        /// [...]Transaction
+        /// Whether the transaction is read-only
         read_only: bool = false,
 
-        /// [...]RuntimeException[...]
+        /// Exceptions that trigger a rollback (empty means all RuntimeException)
         rollback_for: []const []const u8 = &.{},
 
         /// Which exceptions to not rollback on
         no_rollback_for: []const []const u8 = &.{},
     };
 
-    /// Transaction[...]
+    /// Transaction status
     pub const Status = struct {
         definition: Definition,
         is_new_transaction: bool,
@@ -81,13 +81,13 @@ pub const Transactional = struct {
         start_time: i64,
     };
 
-    /// Transaction[...]
+    /// Transaction callback interface
     pub const TransactionCallback = struct {
         ctx: *anyopaque,
         execute_fn: *const fn (ctx: *anyopaque) anyerror!void,
     };
 
-    /// Transaction[...]
+    /// Transaction manager interface
     pub const TransactionManager = struct {
         ctx: *anyopaque,
         vtable: *const VTable,
@@ -111,24 +111,24 @@ pub const Transactional = struct {
         }
     };
 
-    /// Transaction[...] - [...]Transaction[...]
+    /// Transaction template - simplifies transaction execution
     pub const TransactionTemplate = struct {
         transaction_manager: TransactionManager,
         definition: Definition,
 
-        /// [...]Transaction[...]
+        /// Execute a callback inside a transaction
         pub fn execute(self: TransactionTemplate, callback: TransactionCallback) !void {
             const status = try self.transaction_manager.begin(self.definition);
             errdefer {
                 if (!status.is_completed) {
                     self.transaction_manager.rollback(status) catch |e| {
-                        std.log.err("Rollback transactionfailure: {}", .{e});
+                        std.log.err("Rollback transaction failed: {}", .{e});
                     };
                 }
             }
 
             callback.execute_fn(callback.ctx) catch |err| {
-                // Check if[...]
+                // Check whether a rollback is needed
                 if (shouldRollback(self.definition, err)) {
                     try self.transaction_manager.rollback(status);
                 } else {
@@ -141,21 +141,21 @@ pub const Transactional = struct {
         }
 
         fn shouldRollback(definition: Definition, err: anyerror) bool {
-            // [...]Error[...]
+            // By default all errors trigger a rollback
             _ = definition;
             _ = @errorName(err);
             return true;
         }
     };
 
-    /// [...]Transaction[...]for[...]
+    /// Declarative transaction attribute (for code generation or metadata)
     pub const Attribute = struct {
         definition: Definition,
         target_method: []const u8,
         target_type: []const u8,
     };
 
-    /// Transaction[...]
+    /// Transaction interceptor
     pub const Interceptor = struct {
         allocator: std.mem.Allocator,
         transaction_manager: TransactionManager,
@@ -174,15 +174,15 @@ pub const Transactional = struct {
             self.* = undefined;
         }
 
-        /// [...]Transaction[...]
+        /// Register a transaction attribute for a method
         pub fn register(self: *Interceptor, method_signature: []const u8, definition: Definition) !void {
             try self.attributes.put(method_signature, definition);
         }
 
-        /// [...]call
+        /// Intercept a method call
         pub fn invoke(self: *Interceptor, method_signature: []const u8, comptime ResultType: type, action: fn () anyerror!ResultType) !ResultType {
             const definition = self.attributes.get(method_signature) orelse {
-                // [...]Transaction[...]
+                // No transaction configured, execute directly
                 return action();
             };
 
@@ -191,7 +191,7 @@ pub const Transactional = struct {
                 .definition = definition,
             };
 
-            // [...]
+            // Use a struct to carry the result
             const Context = struct {
                 result: ?ResultType,
                 action_error: ?anyerror,
@@ -226,7 +226,7 @@ pub const Transactional = struct {
         }
     };
 
-    /// [...]Transaction[...]forTests[...]
+    /// In-memory transaction manager (for tests)
     pub const InMemoryTransactionManager = struct {
         const TMContext = struct {
             transactions: std.array_list.Managed(Status),
@@ -302,7 +302,7 @@ pub const Transactional = struct {
 
             std.log.info("[Transaction] commit: {s}", .{status.definition.name});
 
-            // [...]Transaction
+            // Remove the transaction from the tracked list
             if (tm_ctx.transactions.items.len > 0) {
                 _ = tm_ctx.transactions.pop();
             }
@@ -313,19 +313,19 @@ pub const Transactional = struct {
 
             std.log.info("[Transaction] rollback: {s}", .{status.definition.name});
 
-            // [...]Transaction
+            // Remove the transaction from the tracked list
             if (tm_ctx.transactions.items.len > 0) {
                 _ = tm_ctx.transactions.pop();
             }
         }
     };
 
-    /// [...]Transaction[...]
-    /// [...]:
+    /// Convenience helper: run an operation inside a transaction
+    /// Usage example:
     /// ```zig
     /// try Transactional.run(tm, .{ .name = "createOrder" }, struct {
     ///     fn exec() !void {
-    /// // [...]
+    ///         // business logic
     ///     }
     /// }.exec);
     /// ```
@@ -362,7 +362,7 @@ test "Transactional basic" {
         .propagation = .REQUIRED,
     };
 
-    // Testssuccess[...]
+    // Test a successful commit
     try Transactional.run(tm.getManager(), definition, struct {
         fn exec() !void {
             std.log.info("execute business logic", .{});
@@ -382,7 +382,7 @@ test "Transactional rollback" {
         .propagation = .REQUIRED,
     };
 
-    // Tests[...]
+    // Test rollback
     const result = Transactional.run(tm.getManager(), definition, struct {
         fn exec() !void {
             return error.TestError;

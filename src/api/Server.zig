@@ -416,9 +416,10 @@ pub const Context = struct {
     }
 
     /// Get query parameter
-    /// Path parameter (route placeholder, e.g. `{id}`). `param` is the
-    /// historical name for this — prefer `pathParam` for readability; form and
-    /// query inputs come from `formValue` / `queryParam` / `queryStr`.
+    /// Path parameter (route placeholder, e.g. `{id}` in `/orders/{id}`).
+    /// `param` is the historical name for exactly this — prefer `pathParam`
+    /// when the distinction matters: nothing here reads query or form input.
+    /// See the table below.
     pub fn pathParam(self: *const Context, key: []const u8) ?[]const u8 {
         return self.param(key);
     }
@@ -427,9 +428,32 @@ pub const Context = struct {
         return self.query.get(key);
     }
 
-    /// Get path parameter
+    /// Get path parameter.
+    ///
+    /// The four accessors, so no reader has to guess:
+    ///
+    /// | call | reads |
+    /// |------|-------|
+    /// | `param` / `pathParam` | **route placeholder only** (`/orders/{id}`) |
+    /// | `queryParam` / `queryStr` / `queryInt` | query string only |
+    /// | `formValue` | form body only |
+    /// | `requestParam` | **form first, then query** — "wherever the client put it" |
+    /// | `nestedParam` | dotted path into form/query (`filter.tags`) |
     pub fn param(self: *const Context, key: []const u8) ?[]const u8 {
         return self.params.get(key);
+    }
+
+    /// Form value, else query value (form wins). The "give me this parameter
+    /// wherever the client sent it" accessor — `param` is *not* that, despite
+    /// the name: it is the route placeholder.
+    ///
+    /// Form-first matches Rails / Laravel / ThinkPHP `input()` semantics, so a
+    /// POST body overrides a stray query parameter of the same name.
+    pub fn requestParam(self: *const Context, key: []const u8) ?[]const u8 {
+        if (self.form) |f| {
+            if (f.get(key)) |v| return v;
+        }
+        return self.query.get(key);
     }
 
     /// Path parameter as integer (generic). Returns error.BadRequest if missing/invalid.
@@ -929,6 +953,11 @@ pub const Context = struct {
 
     /// Parse a `multipart/form-data` body (file uploads + mixed forms).
     /// The returned `Form` owns its parts — `defer form.deinit()`.
+    /// Parse a `multipart/form-data` body. Size limits live in
+    /// `Multipart.Config`, but the **first** gate is the server's body limit:
+    /// `Server.Config.max_body_size` (default 8 MB) already rejected the request
+    /// while reading it, so a `Config` larger than that can never fire. Keep the
+    /// pair consistent with `Multipart.Config.forBodyLimit`.
     pub fn multipart(self: *const Context, config: Multipart.Config) Multipart.Error!Multipart.Form {
         const body = self.body orelse return Multipart.Error.NotMultipart;
         const ctype = self.headers.get("content-type") orelse return Multipart.Error.NotMultipart;
@@ -972,12 +1001,23 @@ pub const Context = struct {
         return self.query.getArray(allocator, name);
     }
 
-    /// Dotted path lookup (`filter.tags` → `filter[tags]`), query first then form.
-    pub fn paramPath(self: *const Context, path: []const u8) ?[]const u8 {
+    /// Nested/dotted lookup into form then query (`filter.tags` →
+    /// `filter[tags]`, literal key tried first).
+    ///
+    /// Renamed from `paramPath`, which read like a *path parameter* but has
+    /// nothing to do with route placeholders — that confusion is the reason
+    /// `paramPath` is now a deprecated alias.
+    pub fn nestedParam(self: *const Context, path: []const u8) ?[]const u8 {
         if (self.form) |f| {
             if (f.getPath(path)) |v| return v;
         }
         return self.query.getPath(path);
+    }
+
+    /// DEPRECATED: use `nestedParam`. Same behaviour; the name suggested a route
+    /// path parameter, which it is not.
+    pub fn paramPath(self: *const Context, path: []const u8) ?[]const u8 {
+        return self.nestedParam(path);
     }
 
     /// Bind `application/x-www-form-urlencoded` into a struct. Field lookup is
@@ -1535,6 +1575,23 @@ const TrieNode = struct {
     }
 };
 
+/// Canonical form of a stored route path: exactly one leading `/`.
+///
+/// Callers are inconsistent — `group.get("/health")` carries the slash,
+/// `group.get("health")` and every ComptimeRouter mount (`nest` + `spec.path`)
+/// do not — but the stored path is what `ctx.route_template` reports and what
+/// metrics label on. Two spellings of one route (`health` vs `/health`, and
+/// `orders/{id}` vs `/metrics`) mean a dashboard query silently misses half the
+/// traffic. Normalise at registration, where the path is already being duped.
+///
+/// Matching is unaffected: the trie splits on `/` and skips empty segments, so
+/// only the node structure routes requests, never this string.
+fn normalizeRoutePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const trimmed = std.mem.trimStart(u8, path, "/");
+    if (trimmed.len == 0) return allocator.dupe(u8, "/");
+    return std.fmt.allocPrint(allocator, "/{s}", .{trimmed});
+}
+
 /// Router for matching routes using a trie
 const Router = struct {
     allocator: std.mem.Allocator,
@@ -1594,7 +1651,7 @@ const Router = struct {
         }
 
         // Store route at the endpoint node
-        const path_copy = try self.allocator.dupe(u8, route.path);
+        const path_copy = try normalizeRoutePath(self.allocator, route.path);
         var r = route;
         r.path = path_copy;
         current.route = r;
@@ -1607,7 +1664,7 @@ const Router = struct {
         return root;
     }
 
-    /// [...] trie [...]Register route[...] (method, path) Info
+    /// Walk the route trie and collect all registered routes as RouteInfo entries (method, path).
     pub fn listRoutes(self: *const Router, alloc: std.mem.Allocator) ![]const RouteInfo {
         var result = std.ArrayList(RouteInfo).empty;
 
@@ -4291,4 +4348,45 @@ test "query parsing: repeated keys, brackets and the parameter guard" {
     var small = Params.init(allocator);
     defer small.deinit();
     try std.testing.expectError(error.TooManyParams, parseQueryInto(&small, "a=1&b=2&c=3", allocator, 2));
+}
+
+test "requestParam prefers the form and falls back to the query string" {
+    const allocator = std.testing.allocator;
+    var ctx = try Context.init(allocator, .POST, "/orders/7");
+    defer ctx.deinit();
+
+    // Route placeholder: only `param`/`pathParam` see it.
+    try ctx.params.put(try allocator.dupe(u8, "id"), try allocator.dupe(u8, "7"));
+    try std.testing.expectEqualStrings("7", ctx.param("id").?);
+    try std.testing.expect(ctx.queryParam("id") == null);
+    try std.testing.expect(ctx.formValue("id") == null);
+    try std.testing.expect(ctx.requestParam("id") == null);
+
+    // Same name in query and form: the body wins (POST semantics).
+    try ctx.query.put("name", "from-query");
+    try std.testing.expectEqualStrings("from-query", ctx.requestParam("name").?);
+    // Ownership note: `ctx.form` holds the Params **by value** and deinits it,
+    // so the local must not be deinit'd too (that frees the map ctx still points
+    // at — found the hard way, as a segfault).
+    var form = Params.init(allocator);
+    try form.put("name", "from-form");
+    try form.put("only_form", "x");
+    ctx.form = form;
+    try std.testing.expectEqualStrings("from-form", ctx.requestParam("name").?);
+    try std.testing.expectEqualStrings("from-query", ctx.queryParam("name").?);
+    try std.testing.expectEqualStrings("x", ctx.requestParam("only_form").?);
+    try std.testing.expect(ctx.requestParam("absent") == null);
+}
+
+test "nestedParam is the dotted-path lookup; paramPath stays as its alias" {
+    const allocator = std.testing.allocator;
+    var ctx = try Context.init(allocator, .GET, "/x");
+    defer ctx.deinit();
+
+    try ctx.query.put("filter[tags]", "a,b");
+    try std.testing.expectEqualStrings("a,b", ctx.nestedParam("filter.tags").?);
+    // Deprecated alias keeps working (source compatibility).
+    try std.testing.expectEqualStrings("a,b", ctx.paramPath("filter.tags").?);
+    // …and it is not a route parameter, which is the whole point of the rename.
+    try std.testing.expect(ctx.nestedParam("id") == null);
 }

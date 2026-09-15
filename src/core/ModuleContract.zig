@@ -1,82 +1,82 @@
 const std = @import("std");
 
 /// ModuleContract - Runtime contract verification for modules
-/// Module contract[...]
-/// [...]publish/consume[...]Event[...]API[...]
-/// High-priority architecture improvement item，forImprove inter-module contract clarity
+/// Module contract definition
+/// Explicitly declares the module's published/consumed events, provided APIs, and dependencies
+/// High-priority architecture improvement item for inter-module contract clarity
 pub const ModuleContract = struct {
     const Self = @This();
 
     /// Module name
     name: []const u8,
 
-    /// [...]
+    /// Module description
     description: []const u8 = "",
 
-    /// publish[...]Event[...]Event[...]
+    /// Published event types (events this module emits)
     published_events: []const EventDefinition = &.{},
 
-    /// consume[...]Event[...]Event[...]
+    /// Consumed event types (events this module listens to)
     consumed_events: []const EventDefinition = &.{},
 
-    /// [...]API[...]
+    /// Provided API endpoints
     provided_apis: []const ApiDefinition = &.{},
 
-    /// [...]
+    /// Dependent service interfaces
     required_services: []const ServiceDependency = &.{},
 
-    /// [...]
+    /// Configuration properties
     configuration: []const ConfigProperty = &.{},
 
-    /// Event[...]
+    /// Event definition
     pub const EventDefinition = struct {
-        /// Event[...] "OrderCreated", "PaymentCompleted"[...]
+        /// Event type name (e.g. "OrderCreated", "PaymentCompleted")
         name: []const u8,
 
-        /// Event[...]
+        /// Event description
         description: []const u8 = "",
 
-        /// Event[...]Represent as type name string[...] "OrderPayload"[...]
+        /// Event payload type, given as a type name string (e.g. "OrderPayload")
         payload_type: []const u8,
 
-        /// [...]Event[...]Domain Event[...]
+        /// Whether this is a domain event (Domain Event)
         is_domain_event: bool = true,
 
-        /// Event[...]forEvent[...]
+        /// Event version (used for event evolution)
         version: u32 = 1,
 
-        /// [...]Event[...]
+        /// Whether the event is persisted to the event store
         persistent: bool = true,
     };
 
-    /// API[...]
+    /// API endpoint definition
     pub const ApiDefinition = struct {
-        /// API[...]
+        /// API name
         name: []const u8,
 
-        /// API[...]
+        /// API description
         description: []const u8 = "",
 
-        /// HTTP[...]REST API[...]
+        /// HTTP method (for REST APIs)
         http_method: HttpMethod = .GET,
 
-        /// API[...]
+        /// API path
         path: []const u8 = "",
 
-        /// [...]
+        /// Request type name
         request_type: []const u8 = "void",
 
-        /// [...]
+        /// Response type name
         response_type: []const u8 = "void",
 
-        /// [...]
+        /// Whether the endpoint is public (no authentication required)
         is_public: bool = false,
 
-        /// [...]Permission
+        /// Required permissions
         required_permissions: []const []const u8 = &.{},
     };
 
-    /// HTTP[...]
+    /// HTTP method enum
     pub const HttpMethod = enum {
         GET,
         POST,
@@ -85,40 +85,40 @@ pub const ModuleContract = struct {
         PATCH,
     };
 
-    /// [...]
+    /// Service dependency definition
     pub const ServiceDependency = struct {
-        /// [...]
+        /// Service name
         name: []const u8,
 
-        /// [...]
+        /// Service description
         description: []const u8 = "",
 
-        /// [...]
+        /// Whether the dependency is required
         required: bool = true,
 
-        /// [...]
+        /// Service interface name
         interface_type: []const u8,
     };
 
-    /// [...]
+    /// Configuration property definition
     pub const ConfigProperty = struct {
-        /// [...]
+        /// Configuration key
         key: []const u8,
 
-        /// [...]
+        /// Configuration description
         description: []const u8 = "",
 
-        /// [...]
+        /// Configuration type
         property_type: ConfigType = .String,
 
-        /// [...]
+        /// Default value (string representation)
         default_value: ?[]const u8 = null,
 
-        /// [...]
+        /// Whether the property is required
         required: bool = false,
     };
 
-    /// [...]
+    /// Configuration type enum
     pub const ConfigType = enum {
         String,
         Integer,
@@ -126,7 +126,7 @@ pub const ModuleContract = struct {
         Float,
     };
 
-    /// [...]Validation[...]
+    /// Contract validation result
     pub const ValidationResult = struct {
         valid: bool,
         errors: std.array_list.Managed([]const u8),
@@ -155,17 +155,17 @@ pub const ModuleContract = struct {
         }
     };
 
-    /// Validation[...]
+    /// Validates the contract definition
     pub fn validate(self: *const Self, allocator: std.mem.Allocator) !ValidationResult {
         var result = ValidationResult.init(allocator);
         errdefer result.deinit();
 
-        // ValidationModule name
+        // Validate module name
         if (self.name.len == 0) {
             try result.addError("Module name cannot be empty");
         }
 
-        // Validationpublish[...]Event
+        // Validate published events
         for (self.published_events) |event| {
             if (event.name.len == 0) {
                 try result.addError("Publish event name cannot be empty");
@@ -175,21 +175,21 @@ pub const ModuleContract = struct {
             }
         }
 
-        // Validationconsume[...] Event
+        // Validate consumed events
         for (self.consumed_events) |event| {
             if (event.name.len == 0) {
                 try result.addError("Consume event name cannot be empty");
             }
         }
 
-        // ValidationAPI[...]
+        // Validate API definitions
         for (self.provided_apis) |api| {
             if (api.name.len == 0) {
                 try result.addError("API name cannot be empty");
             }
         }
 
-        // Validation[...]
+        // Validate service dependencies
         for (self.required_services) |service| {
             if (service.name.len == 0) {
                 try result.addError("Dependent service name cannot be empty");
@@ -202,7 +202,7 @@ pub const ModuleContract = struct {
         return result;
     }
 
-    /// [...]PlantUML[...]
+    /// Generates the PlantUML component diagram description
     pub fn generatePlantUml(self: *const Self, allocator: std.mem.Allocator) ![]u8 {
         var buf = std.array_list.Managed(u8).init(allocator);
         defer buf.deinit();
@@ -210,29 +210,29 @@ pub const ModuleContract = struct {
 
         try writer.print("component \"{s}\" as {s} {{\n", .{ self.name, self.name });
 
-        // [...]
+        // Add the description
         if (self.description.len > 0) {
             try writer.print("  note right: {s}\n", .{self.description});
         }
 
-        // [...]publish[...]Event
+        // Add the published events
         if (self.published_events.len > 0) {
             try writer.interface.writeAll("  portout PUBLISHED_EVENTS\n");
         }
 
-        // [...]consume[...]Event
+        // Add the consumed events
         if (self.consumed_events.len > 0) {
             try writer.interface.writeAll("  portin CONSUMED_EVENTS\n");
         }
 
-        // [...]API[...]
+        // Add the API endpoints
         if (self.provided_apis.len > 0) {
             try writer.interface.writeAll("  portout APIS\n");
         }
 
         try writer.interface.writeAll("}\n");
 
-        // [...]Event[...]
+        // Add notes with the event details
         for (self.published_events) |event| {
             try writer.print("note right of {s}::PUBLISHED_EVENTS : publishes {s}({s})\n", .{ self.name, event.name, event.payload_type });
         }
@@ -245,7 +245,7 @@ pub const ModuleContract = struct {
     }
 };
 
-/// Contract registry - [...]
+/// Contract registry - manages the contracts of all modules
 pub const ContractRegistry = struct {
     const Self = @This();
 
@@ -264,19 +264,19 @@ pub const ContractRegistry = struct {
         self.* = undefined;
     }
 
-    /// [...]Module contract
+    /// Registers a module contract
     pub fn register(self: *Self, contract: ModuleContract) !void {
         try self.contracts.put(contract.name, contract);
         std.log.info("Registered module contract: {s}", .{contract.name});
     }
 
-    /// [...]Module contract
+    /// Gets a module contract
     pub fn get(self: *Self, module_name: []const u8) ?ModuleContract {
         return self.contracts.get(module_name);
     }
 
-    /// Validation[...]
-    /// [...]Eventpublish[...]consume[...]
+    /// Validates the compatibility of all contracts
+    /// Checks whether event publishers and consumers match
     pub fn validateContracts(self: *Self, allocator: std.mem.Allocator) !ModuleContract.ValidationResult {
         var result = ModuleContract.ValidationResult.init(allocator);
         errdefer result.deinit();
@@ -285,7 +285,7 @@ pub const ContractRegistry = struct {
         while (iter.next()) |entry| {
             const contract = entry.value_ptr.*;
 
-            // Validation[...]
+            // Validate each contract
             var validation = try contract.validate(allocator);
             defer validation.deinit();
 
@@ -307,13 +307,13 @@ pub const ContractRegistry = struct {
             }
         }
 
-        // [...]Event[...]
+        // Check event compatibility
         try self.validateEventCompatibility(&result);
 
         return result;
     }
 
-    /// ValidationEventpublish/consume[...]
+    /// Validates event publish/consume compatibility
     fn validateEventCompatibility(self: *Self, result: *ModuleContract.ValidationResult) !void {
         var consumer_iter = self.contracts.iterator();
         while (consumer_iter.next()) |consumer_entry| {
@@ -352,7 +352,7 @@ pub const ContractRegistry = struct {
         }
     }
 
-    /// [...]PlantUML[...]
+    /// Generates the PlantUML diagram of all contracts
     pub fn generatePlantUmlDiagram(self: *Self, allocator: std.mem.Allocator) ![]u8 {
         var buf = std.array_list.Managed(u8).init(allocator);
         defer buf.deinit();
@@ -363,7 +363,7 @@ pub const ContractRegistry = struct {
         try writer.interface.writeAll("skinparam componentStyle rectangle\n\n");
         try writer.interface.writeAll("title Module Contracts\n\n");
 
-        // [...]
+        // Generate each component
         var iter = self.contracts.iterator();
         while (iter.next()) |entry| {
             const contract = entry.value_ptr.*;
@@ -373,7 +373,7 @@ pub const ContractRegistry = struct {
             try writer.interface.writeAll("\n");
         }
 
-        // [...]Event[...]
+        // Generate the event dependency relations
         try self.generateEventRelations(writer);
 
         try writer.interface.writeAll("\n@enduml\n");
@@ -381,7 +381,7 @@ pub const ContractRegistry = struct {
         return buf.toOwnedSlice();
     }
 
-    /// [...]Event[...]
+    /// Generates the event relations
     fn generateEventRelations(self: *Self, writer: anytype) !void {
         var consumer_iter = self.contracts.iterator();
         while (consumer_iter.next()) |consumer_entry| {
@@ -403,7 +403,7 @@ pub const ContractRegistry = struct {
     }
 };
 
-/// [...]Module contract
+/// Example: creates a contract for the order module
 pub fn createOrderModuleContract() ModuleContract {
     return .{
         .name = "order",

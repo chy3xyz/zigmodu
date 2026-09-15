@@ -3,43 +3,43 @@
 const std = @import("std");
 const Time = @import("Time.zig");
 
-/// ZigModu [...]Error type
+/// ZigModu unified error type
 pub const ZigModuError = error{
-    // [...]Error
+    // Module errors
     ModuleNotFound,
     ModuleAlreadyExists,
     ModuleInitializationFailed,
     ModuleDeinitializationFailed,
 
-    // [...]Error
+    // Dependency errors
     DependencyNotFound,
     DependencyViolation,
     CircularDependency,
     SelfDependency,
 
-    // [...]Error
+    // Lifecycle errors
     InvalidLifecycleState,
     StartupFailed,
     ShutdownFailed,
 
-    // [...]Error
+    // Configuration errors
     ConfigurationError,
     ConfigFileNotFound,
     ConfigParseError,
     ConfigValidationFailed,
 
-    // DI [...]Error
+    // DI container errors
     ServiceNotFound,
     ServiceAlreadyExists,
     TypeMismatch,
     ContainerClosed,
 
-    // Event[...]Error
+    // Event system errors
     EventBusError,
     EventHandlerNotFound,
     EventSerializationFailed,
 
-    // TransactionError
+    // Transaction errors
     TransactionFailed,
     TransactionRollbackFailed,
     TransactionAlreadyActive,
@@ -59,33 +59,33 @@ pub const ZigModuError = error{
     /// SQL driver disabled at compile time (`-Ddb=` / `build_options.enable_*`).
     DriverNotEnabled,
 
-    // [...]Error
+    // General business errors
     NotFound,
     RateLimitExceeded,
     CircuitBreakerOpen,
     ServiceUnavailable,
     ServiceOverloaded,
 
-    // [...]Error
+    // Security errors
     AuthenticationFailed,
     AuthorizationFailed,
     TokenExpired,
     InvalidToken,
     InvalidCredentials,
 
-    // ValidationError
+    // Validation errors
     ValidationFailed,
     InvalidInput,
     InvalidModuleName,
     MissingRequiredField,
     InvalidFormat,
 
-    // [...]Error
+    // Cache errors
     CacheError,
     CacheKeyNotFound,
     CacheFull,
 
-    // [...]Error
+    // Network errors
     NetworkError,
     ConnectionTimeout,
     Timeout,
@@ -93,16 +93,16 @@ pub const ZigModuError = error{
     HttpError,
     ServerError,
 
-    // [...]Error
+    // Resource errors
     OutOfMemory,
     ResourceExhausted,
     ResourceLeak,
 
-    // [...]Error
+    // Unknown errors
     UnknownError,
 };
 
-/// Error contextInfo
+/// Error context
 pub const ErrorContext = struct {
     error_code: ZigModuError,
     message: []const u8,
@@ -160,12 +160,12 @@ pub const ErrorHandler = struct {
             }
         }
 
-        // [...]
+        // Default handling: log the error
         std.log.err("[{s}] {s}", .{ @errorName(ctx.error_code), ctx.message });
     }
 };
 
-/// [...]
+/// Result type alias
 pub fn Result(T: type) type {
     return union(enum) {
         ok: T,
@@ -194,7 +194,7 @@ pub fn Result(T: type) type {
     };
 }
 
-/// Error[...]
+/// Error conversion helper
 pub fn toErrorContext(err: anyerror, message: []const u8) ErrorContext {
     const code = switch (err) {
         error.OutOfMemory => ZigModuError.OutOfMemory,

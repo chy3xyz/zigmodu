@@ -1,12 +1,12 @@
 const std = @import("std");
 
-/// OpenAPI [...]
+/// OpenAPI specification version the generator writes out.
 pub const OpenApiVersion = enum {
     v3_0,
     v3_1,
 };
 
-/// HTTP [...]
+/// HTTP method an endpoint is registered under.
 pub const HttpMethod = enum {
     GET,
     POST,
@@ -17,7 +17,7 @@ pub const HttpMethod = enum {
     OPTIONS,
 };
 
-/// [...]
+/// Where a parameter is carried: query string, path, header, or cookie.
 pub const ParamLocation = enum {
     query,
     path,
@@ -25,7 +25,7 @@ pub const ParamLocation = enum {
     cookie,
 };
 
-/// API endpoint[...]
+/// One parameter of an endpoint: name, location, type and required flag.
 pub const ApiParam = struct {
     name: []const u8,
     location: ParamLocation,
@@ -34,7 +34,7 @@ pub const ApiParam = struct {
     description: []const u8 = "",
 };
 
-/// API endpoint[...]
+/// One API endpoint (operation) as it appears in the generated document.
 pub const ApiEndpoint = struct {
     method: HttpMethod,
     path: []const u8,
@@ -50,7 +50,7 @@ pub const ApiEndpoint = struct {
     requires_auth: bool = false,
 };
 
-/// Request body[...]
+/// Request body of an endpoint: content type and optional schema reference.
 pub const RequestBody = struct {
     content_type: []const u8 = "application/json",
     description: []const u8 = "",
@@ -58,14 +58,14 @@ pub const RequestBody = struct {
     schema_ref: ?[]const u8 = null,
 };
 
-/// API response[...]
+/// One response of an endpoint: status code, description, optional schema.
 pub const ApiResponse = struct {
     status_code: u16,
     description: []const u8,
     schema_ref: ?[]const u8 = null,
 };
 
-/// [...]/ Schema [...]
+/// Named schema (component) shared by endpoints: type, properties, required.
 pub const ApiSchema = struct {
     name: []const u8,
     schema_type: []const u8 = "object",
@@ -74,7 +74,7 @@ pub const ApiSchema = struct {
     description: []const u8 = "",
 };
 
-/// Schema [...]
+/// One property of a schema: type, format, example, nullability.
 pub const SchemaProperty = struct {
     name: []const u8,
     prop_type: []const u8,
@@ -85,8 +85,8 @@ pub const SchemaProperty = struct {
     enum_values: ?[]const []const u8 = null,
 };
 
-/// OpenAPI [...]
-/// [...] OpenAPI 3.0/3.1 JSON
+/// Collects endpoints, schemas and tags, then emits an OpenAPI document.
+/// generate() writes version 3.0.3 or 3.1.0 JSON.
 pub const OpenApiGenerator = struct {
     const Self = @This();
 
@@ -163,12 +163,12 @@ pub const OpenApiGenerator = struct {
         self.* = undefined;
     }
 
-    /// [...] API endpoint
+    /// Registers an endpoint (deep-copied) and records any new tag names.
     pub fn addEndpoint(self: *Self, endpoint: ApiEndpoint) !void {
         const owned = try self.cloneEndpoint(endpoint);
         try self.endpoints.append(self.allocator, owned);
 
-        // [...] tags
+        // Register tag names that are not in the list yet
         for (owned.tags) |tag| {
             var found = false;
             for (self.tags.items) |existing| {
@@ -183,13 +183,13 @@ pub const OpenApiGenerator = struct {
         }
     }
 
-    /// [...] Schema
+    /// Registers a schema (deep-copied).
     pub fn addSchema(self: *Self, schema: ApiSchema) !void {
         const owned = try self.cloneSchema(schema);
         try self.schemas.append(self.allocator, owned);
     }
 
-    /// [...] OpenAPI JSON [...]
+    /// Renders everything as an OpenAPI JSON string; caller owns the memory.
     pub fn generate(self: *Self) ![]const u8 {
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);

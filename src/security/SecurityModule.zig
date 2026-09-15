@@ -4,7 +4,7 @@ const Time = @import("../core/Time.zig");
 const api = @import("../api/Server.zig");
 const JwksKeyRing = @import("JwksKeyRing.zig").JwksKeyRing;
 
-/// Security module - [...]Encrypt[...]
+/// Security module - provides authentication, authorization and encryption
 pub const SecurityModule = struct {
     const Self = @This();
 
@@ -53,7 +53,7 @@ pub const SecurityModule = struct {
         self.* = undefined;
     }
 
-    /// JWT Token [...]
+    /// JWT Token structure
     pub const JwtToken = struct {
         header: JwtHeader,
         payload: JwtPayload,
@@ -76,7 +76,7 @@ pub const SecurityModule = struct {
             ver: i64 = 0,
         };
 
-        /// [...] JWT Token [...]
+        /// Build the JWT token string (header.payload.signature)
         pub fn toString(self: JwtToken, allocator: std.mem.Allocator) ![]const u8 {
             // Base64 encode header
             const header_json = try std.json.Stringify.valueAlloc(allocator, self.header, .{});
@@ -99,7 +99,7 @@ pub const SecurityModule = struct {
         }
     };
 
-    /// [...] JWT Token
+    /// Generate a JWT token
     pub fn generateToken(
         self: *Self,
         user_id: []const u8,
@@ -108,7 +108,7 @@ pub const SecurityModule = struct {
         return self.generateTokenWithTenant(user_id, roles, "zigmodu-app");
     }
 
-    /// [...] JWT Token with tenant_id as aud claim
+    /// Generate a JWT token with tenant_id as the aud claim
     pub fn generateTokenWithTenant(
         self: *Self,
         user_id: []const u8,
@@ -159,11 +159,10 @@ pub const SecurityModule = struct {
         const signature = try self.signWith(signature_base, self.signingSecret());
         defer self.allocator.free(signature);
 
-        // [...]token[...]
+        // Build the token string directly, avoiding an intermediate struct
         return std.fmt.allocPrint(self.allocator, "{s}.{s}.{s}", .{ header_b64, payload_b64, signature });
     }
 
-    /// Validation JWT Token
     /// Enable key rotation. Keys live in `ring` (primary signs, all verify).
     pub fn setKeyring(self: *Self, ring: *JwksKeyRing) void {
         self.keyring = ring;
@@ -268,7 +267,7 @@ pub const SecurityModule = struct {
         self.allocator.free(payload.roles);
     }
 
-    /// HMAC-SHA256 [...]
+    /// HMAC-SHA256 signature
     fn sign(self: *Self, data: []const u8) ![]const u8 {
         return self.signWith(data, self.jwt_secret);
     }
@@ -343,7 +342,7 @@ pub const SecurityModule = struct {
         return timingSafeSliceEql(hash_b64, expected_hash_b64);
     }
 
-    /// [...]RolePermission
+    /// Check whether the payload carries the given role
     pub fn hasRole(payload: JwtToken.JwtPayload, role: []const u8) bool {
         for (payload.roles) |r| {
             if (std.mem.eql(u8, r, role)) {
@@ -353,7 +352,7 @@ pub const SecurityModule = struct {
         return false;
     }
 
-    /// [...]Role
+    /// Check whether the payload carries any of the given roles
     pub fn hasAnyRole(payload: JwtToken.JwtPayload, roles: []const []const u8) bool {
         for (roles) |role| {
             if (hasRole(payload, role)) {
@@ -363,7 +362,7 @@ pub const SecurityModule = struct {
         return false;
     }
 
-    /// [...]Role
+    /// Check whether the payload carries all of the given roles
     pub fn hasAllRoles(payload: JwtToken.JwtPayload, roles: []const []const u8) bool {
         for (roles) |role| {
             if (!hasRole(payload, role)) {
@@ -407,7 +406,6 @@ pub fn authRateLimitMiddleware(
     return .{ .func = S.handler, .user_data = @ptrCast(@constCast(limiter)) };
 }
 
-/// [...] (Zig 0.16 timing_safe.eql [...]/[...])
 /// Extract the `"kid":"…"` value from a JWT header without a full JSON parse.
 /// Returns null when absent or `null`.
 fn parseKid(header_json: []const u8) ?[]const u8 {
@@ -421,6 +419,7 @@ fn parseKid(header_json: []const u8) ?[]const u8 {
     return rest[0..end];
 }
 
+/// Constant-time slice comparison (Zig 0.16 `timing_safe.eql` only accepts arrays/vectors)
 fn timingSafeSliceEql(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     var acc: u8 = 0;
@@ -432,7 +431,7 @@ fn timingSafeSliceEql(a: []const u8, b: []const u8) bool {
     return @as(bool, @bitCast(@as(u1, @truncate((extended -% 1) >> s))));
 }
 
-/// Base64 URL [...] (JWT [...])
+/// Base64 URL encoding (JWT alphabet: `-`/`_` instead of `+`/`/`, padding stripped)
 fn base64UrlEncode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     const encoder = std.base64.Base64Encoder.init(std.base64.standard_alphabet_chars, '=');
     const encoded = try allocator.alloc(u8, encoder.calcSize(data.len));
@@ -453,7 +452,7 @@ fn base64UrlEncode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     return try allocator.realloc(encoded, len);
 }
 
-/// Base64 URL [...]
+/// Base64 URL decoding (restores padding and maps `-`/`_` back to `+`/`/`)
 fn base64UrlDecode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     // Restore padding
     const padding_needed = (4 - (data.len % 4)) % 4;
@@ -478,7 +477,7 @@ fn base64UrlDecode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     return decoded;
 }
 
-/// [...] Base64 [...]
+/// Standard Base64 encoding
 fn base64Encode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     const encoder = std.base64.Base64Encoder.init(std.base64.standard_alphabet_chars, '=');
     const encoded = try allocator.alloc(u8, encoder.calcSize(data.len));
@@ -486,7 +485,7 @@ fn base64Encode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     return encoded;
 }
 
-/// [...] Base64 [...]
+/// Standard Base64 decoding
 fn base64Decode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     const decoder = std.base64.Base64Decoder.init(std.base64.standard_alphabet_chars, '=');
     const decoded = try allocator.alloc(u8, decoder.calcSizeForSlice(data) catch return error.InvalidEncoding);

@@ -1,5 +1,6 @@
 const std = @import("std");
 const Time = @import("../core/Time.zig");
+const SpinLock = @import("../core/SpinLock.zig").SpinLock;
 
 /// Structured access log middleware.
 ///
@@ -8,16 +9,17 @@ const Time = @import("../core/Time.zig");
 /// redacted to prevent credential leakage in log output.
 ///
 /// Sensitive headers redacted: Authorization, X-API-Key, Cookie, Set-Cookie
-/// - Request body[...]
-/// - [...]
+/// Not captured:
+/// - Request body contents (only the byte length is recorded)
+/// - Headers other than:
 ///   - User-Agent
-/// - [...] IP
+/// - Client IP (left null by the middleware below)
 ///
 /// Usage:
 ///   var logger = AccessLogger.init(allocator);
 ///   server.addMiddleware(.{ .func = accessLogMiddleware(&logger) });
 ///
-/// [...]:
+/// Reading entries back:
 ///   const entries = logger.getEntries();
 ///   const json = try logger.toJson(allocator);
 pub const AccessLogger = struct {
@@ -26,13 +28,11 @@ pub const AccessLogger = struct {
     allocator: std.mem.Allocator,
     entries: std.ArrayList(LogEntry),
     max_entries: usize,
-    /// 共享于连接线程之间 → 增删必须持锁（否则并发 append 竞争损坏 ArrayList）。
-    /// 临界区仅内存操作（不 yield），用 tryLock + 自旋即可（无需 io 上下文）。
-    mutex: std.Io.Mutex = .init,
-
-    fn lock(self: *Self) void {
-        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
-    }
+    /// Shared across connection threads, so add/remove must hold the lock
+    /// (concurrent `append` otherwise corrupts the backing ArrayList). The
+    /// critical section is memory-only, which is why a spinlock fits — but it
+    /// must *yield* after spinning, or sustained contention burns a core.
+    mutex: SpinLock = .{},
 
     pub const LogEntry = struct {
         timestamp: i64,
@@ -55,8 +55,8 @@ pub const AccessLogger = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.lock();
-        defer self.mutex.state.store(.unlocked, .release);
+        self.mutex.lock();
+        defer self.mutex.unlock();
         for (self.entries.items) |entry| {
             self.allocator.free(entry.method);
             self.allocator.free(entry.path);
@@ -67,10 +67,10 @@ pub const AccessLogger = struct {
         self.* = undefined;
     }
 
-    /// [...]
+    /// Appends an entry, deep-copying its strings; drops the oldest past capacity.
     pub fn log(self: *Self, entry: LogEntry) !void {
-        self.lock();
-        defer self.mutex.state.store(.unlocked, .release);
+        self.mutex.lock();
+        defer self.mutex.unlock();
         const method_copy = try self.allocator.dupe(u8, entry.method);
         errdefer self.allocator.free(method_copy);
         const path_copy = try self.allocator.dupe(u8, entry.path);
@@ -98,24 +98,24 @@ pub const AccessLogger = struct {
         }
     }
 
-    /// [...]
+    /// Returns the live entry slice (valid until the next log or deinit).
     pub fn getEntries(self: *Self) []const LogEntry {
-        self.lock();
-        defer self.mutex.state.store(.unlocked, .release);
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.entries.items;
     }
 
-    /// [...]
+    /// Number of buffered entries.
     pub fn count(self: *Self) usize {
-        self.lock();
-        defer self.mutex.state.store(.unlocked, .release);
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.entries.items.len;
     }
 
-    /// [...]
+    /// Copies entries with the given status into `buf`, returns the filled part.
     pub fn filterByStatus(self: *Self, buf: []LogEntry, status: u16) []LogEntry {
-        self.lock();
-        defer self.mutex.state.store(.unlocked, .release);
+        self.mutex.lock();
+        defer self.mutex.unlock();
         var n: usize = 0;
         for (self.entries.items) |entry| {
             if (entry.status == status and n < buf.len) {
@@ -126,10 +126,10 @@ pub const AccessLogger = struct {
         return buf[0..n];
     }
 
-    /// [...]
+    /// Copies entries whose path starts with `prefix` into `buf`.
     pub fn filterByPath(self: *Self, buf: []LogEntry, prefix: []const u8) []LogEntry {
-        self.lock();
-        defer self.mutex.state.store(.unlocked, .release);
+        self.mutex.lock();
+        defer self.mutex.unlock();
         var n: usize = 0;
         for (self.entries.items) |entry| {
             if (std.mem.startsWith(u8, entry.path, prefix) and n < buf.len) {
@@ -140,10 +140,10 @@ pub const AccessLogger = struct {
         return buf[0..n];
     }
 
-    /// [...] JSON [...]
+    /// Serializes all entries as a JSON array; caller frees the result.
     pub fn toJson(self: *Self) ![]const u8 {
-        self.lock();
-        defer self.mutex.state.store(.unlocked, .release);
+        self.mutex.lock();
+        defer self.mutex.unlock();
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
 
@@ -183,7 +183,7 @@ pub const AccessLogger = struct {
     }
 };
 
-/// Access logMiddleware — [...]
+/// Access-log middleware: records method/path/status and elapsed time per request.
 pub fn accessLogMiddleware(logger: *AccessLogger) api.MiddlewareFn {
     _ = logger;
     const S = struct {
@@ -192,13 +192,13 @@ pub fn accessLogMiddleware(logger: *AccessLogger) api.MiddlewareFn {
 
             const start = Time.monotonicNowSeconds();
 
-            // [...]Info
+            // Capture request info before handing off to the next handler
             const method = ctx.method.toString();
             const path = ctx.path;
             const body_len = if (ctx.body) |b| b.len else 0;
 
             next(ctx) catch |err| {
-                // [...]Error
+                // Handler failed: record it as a 500 and re-throw to the caller
                 const elapsed = Time.monotonicNowSeconds() - start;
                 log.log(.{
                     .timestamp = start,

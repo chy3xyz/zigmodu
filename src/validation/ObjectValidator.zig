@@ -1,6 +1,6 @@
 const std = @import("std");
 
-/// [...]Validation[...] - DTO [...]Validation
+/// Validates DTO fields, accumulating one error per failed rule.
 pub const Validator = struct {
     const Self = @This();
 
@@ -39,14 +39,14 @@ pub const Validator = struct {
         self.* = undefined;
     }
 
-    /// ValidationRequired field
+    /// Field is present and non-empty.
     pub fn required(self: *Self, field_name: []const u8, value: ?[]const u8) !void {
         if (value == null or value.?.len == 0) {
             try self.addError(field_name, "Field is required", "REQUIRED");
         }
     }
 
-    /// Validation[...]Min length
+    /// Fails when `value` is shorter than `min` characters.
     pub fn minLength(self: *Self, field_name: []const u8, value: []const u8, min: usize) !void {
         if (value.len < min) {
             const msg = try std.fmt.allocPrint(self.allocator, "Minimum length is {d}, got {d}", .{ min, value.len });
@@ -55,7 +55,7 @@ pub const Validator = struct {
         }
     }
 
-    /// Validation[...]Max length
+    /// Fails when `value` is longer than `max` characters.
     pub fn maxLength(self: *Self, field_name: []const u8, value: []const u8, max: usize) !void {
         if (value.len > max) {
             const msg = try std.fmt.allocPrint(self.allocator, "Maximum length is {d}, got {d}", .{ max, value.len });
@@ -64,7 +64,7 @@ pub const Validator = struct {
         }
     }
 
-    /// Validation[...]
+    /// Fails when the integer `value` falls outside [`min`, `max`].
     pub fn range(self: *Self, field_name: []const u8, value: i64, min: i64, max: i64) !void {
         if (value < min or value > max) {
             const msg = try std.fmt.allocPrint(self.allocator, "Value must be between {d} and {d}", .{ min, max });
@@ -73,11 +73,11 @@ pub const Validator = struct {
         }
     }
 
-    /// ValidationEmail format
+    /// Field looks like an email address (empty values pass; pair with `required`).
     pub fn email(self: *Self, field_name: []const u8, value: []const u8) !void {
         if (value.len == 0) return;
 
-        // [...]Validation
+        // Minimal structural check: an '@' plus a '.' after it
         var has_at = false;
         var has_dot = false;
         for (value) |c| {
@@ -90,9 +90,9 @@ pub const Validator = struct {
         }
     }
 
-    /// ValidationRegex pattern
+    /// Field matches `regex_pattern`.
     pub fn pattern(self: *Self, field_name: []const u8, value: []const u8, regex_pattern: []const u8) !void {
-        // [...]Check if[...]
+        // Only the `.*\d.*` pattern is interpreted: require one digit
         const requires_digit = std.mem.eql(u8, regex_pattern, ".*\\d.*");
         if (requires_digit) {
             var has_digit = false;
@@ -110,7 +110,7 @@ pub const Validator = struct {
         }
     }
 
-    /// Validation[...]
+    /// Fails unless `value` matches one of `allowed_values`.
     pub fn enumValue(self: *Self, field_name: []const u8, value: []const u8, allowed_values: []const []const u8) !void {
         for (allowed_values) |allowed| {
             if (std.mem.eql(u8, value, allowed)) return;
@@ -118,14 +118,14 @@ pub const Validator = struct {
         try self.addError(field_name, "Invalid enum value", "ENUM");
     }
 
-    /// Validation[...]
+    /// Fails when `value` is empty.
     pub fn notEmpty(self: *Self, field_name: []const u8, value: []const u8) !void {
         if (value.len == 0) {
             try self.addError(field_name, "Array must not be empty", "NOT_EMPTY");
         }
     }
 
-    /// [...]Error
+    /// Appends one error, duplicating all three strings into the allocator.
     fn addError(self: *Self, field: []const u8, message: []const u8, code: []const u8) !void {
         const field_copy = try self.allocator.dupe(u8, field);
         const msg_copy = try self.allocator.dupe(u8, message);
@@ -138,7 +138,7 @@ pub const Validator = struct {
         });
     }
 
-    /// [...]Validation[...]
+    /// Returns the collected result; valid when no error was recorded.
     pub fn validate(self: *Self) ValidationResult {
         return .{
             .valid = self.errors.items.len == 0,
@@ -146,13 +146,13 @@ pub const Validator = struct {
         };
     }
 
-    /// [...]Validation[...]
+    /// Runs the built-in rules over the fields of a reflected struct.
     pub fn validateObject(self: *Self, comptime T: type, obj: T) !ValidationResult {
         inline for (@typeInfo(T).@"struct".fields) |field| {
             const field_name = field.name;
             const field_value = @field(obj, field_name);
 
-            // [...]Validation
+            // Apply the rules that match the field type
             switch (@typeInfo(field.type)) {
                 .Optional => {
                     if (field_value == null) {
@@ -161,7 +161,7 @@ pub const Validator = struct {
                 },
                 .Pointer => |ptr| {
                     if (ptr.size == .Slice and ptr.child == u8) {
-                        // [...]
+                        // Plain string slice: require 1..255 bytes
                         try self.required(field_name, field_value);
                         try self.minLength(field_name, field_value, 1);
                         try self.maxLength(field_name, field_value, 255);
@@ -178,7 +178,7 @@ pub const Validator = struct {
     }
 };
 
-// [...] DTO
+// Tests: DTO validation
 test "Validator - basic validation" {
     const allocator = std.testing.allocator;
     var validator = Validator.init(allocator);

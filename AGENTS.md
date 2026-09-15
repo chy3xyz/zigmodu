@@ -17,6 +17,7 @@
 | zent ORM（电商/社交主推组合） | `docs/ZENT.md`（勿与 sqlx 混事务；§4.8 场景能力矩阵） |
 | SQLx 驱动链接 | `docs/SQLX_DRIVERS.md`（`-Ddb=` / `.db=`） |
 | 生产接线 / 背压 / 编排 | `docs/ROUTE_TABLE.md` §7.4 + `docs/BEST_PRACTICES.md`「韧性」 |
+| 文件上传 / 内容校验 / 限额顺序 | `docs/BEST_PRACTICES.md`「上传与 multipart」 |
 | 观测 / 告警 / Grafana | `docs/OBSERVABILITY.md`（黄金信号 + 阈值 + dashboard JSON；夜间 `zig build soak` 见 CI `soak` job） |
 | 部署拓扑（TLS 边车/探针/守护） | `examples/production-deploy/`（nginx · Envoy · k8s · systemd） |
 | Extract / SSE / Testkit / Outbox | `docs/FRAMEWORK_BACKLOG.md` |
@@ -73,6 +74,9 @@ defer app.stop();
 | 错误体统一：启动期 `http.useRfc7807Errors()`（链内 + 路由前一次到位） | 写链尾中间件改 404 体（需把 `moduleGate` 降成 `.unknown = .allow`）；靠 `curl` 才发现形状不一致 |
 | 单 gate 换形状：`.reject = http.problemReject`（`ModuleGateConfig` 也支持 `reject`） | 为改 404 体而放弃 `.unknown = .deny` |
 | handler 问门户：`ctx.permissionMatches("portal:user\|portal:shop")`（与路由声明同表达式） | handler 重写门户检查只认一侧（OR meta 会被窄化成 403） |
+| 上传：`http.extractMultipart(ctx, mp)` + `http.UploadGuard.checkForm(&form, …)` | 只查扩展名 / 只信 `Content-Type` / 放行 SVG（脚本容器 → stored-XSS） |
+| 上传限额：`Multipart.Config.forBodyLimit(n)` 与 `Server.Config.max_body_size` 用同一个数 | 只设 `Multipart.Config.max_total_bytes`（服务端 8MB 先 413，它永不触发） |
+| 取参数：路由占位 `pathParam`；form/query 用 `requestParam`（form 优先）或 `nestedParam`（点号路径） | 以为 `ctx.param` 会回退到 query/form（它只读路由占位符） |
 | 应用 root 接 `pub const panic = zmodu.panicHook`（panic 时输出当前请求 METHOD/path） | 请求路径 `catch unreachable` / `@panic`（audit b19–b21 拦截） |
 | 生产配置 `max_connections` + `header_timeout_ms`（连接洪泛/slowloris）；发布前 `zig build soak` | 只设 `request_timeout_ms` 就当防住了慢连接（它只管 handler 阶段） |
 | 租户来源：JWT `aud` → attr（`.tenant_source = .attr`） | 从 query 取租户（`.query` 可被客户端篡改，audit b22 拦截） |

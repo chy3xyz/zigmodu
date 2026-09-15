@@ -1,5 +1,84 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **`http.UploadGuard` — 上传内容策略**（唯一被外部反馈认定为"真缺口"的一处）：框架此前只解析
+  multipart 并限制体积，**没有任何内容校验**，于是每个收上传的应用各写一遍，而三种常见写法都有洞
+  （只查扩展名 → 改名即绕过；只查 `Content-Type` → 客户端自填；放行 SVG → 脚本容器，从自己源站
+  发出去就是 stored-XSS）。新增：
+  - `sniff(bytes)`：JPEG/PNG/GIF/WebP/BMP/TIFF/PDF/ZIP/GZIP/**MP4（ISO-BMFF，校验 box size + `ftyp`）**
+    /WebM/OGG/MP3/WAV，以及文本容器分类（`<svg`/`<!doctype html`/`<script` → 主动内容）。
+  - `check(filename, data, policy)` / `checkForm(form, policy)`：判定顺序固定为
+    **大小 → 主动内容 → 扩展名白名单 → 格式白名单 → 扩展名与内容一致**，因此错误可诊断：
+    "`avatar.jpg` 里是 PHP" → `ContentNotAllowed`，"PNG 字节挂 `.jpg` 名" → `ExtensionContentMismatch`。
+  - **SVG/HTML 默认拒绝**（`allow_active_content = true` 才放行），fail-closed。
+- **`http.extractMultipart(ctx, config)`**：与 `extractJson*` 对齐的抽取器，失败直接产出 ProblemDetails
+  —— 415（不是 multipart）/ 413（太大）/ 400（缺 boundary、畸形、part 过多）；`OutOfMemory` 不渲染。
+- **`Multipart.Config.forBodyLimit(body_limit)`**：用同一个数字对齐"单 part ≤ 总量 ≤ 请求体上限"。
+- `RateLimiterRegistry`：`max_keys`（`initWithCapacity`）+ LRU 淘汰、`remove(name)`、
+  `retain(max_idle_seconds)`、`generateReport()`。
+- `CircuitBreakerRegistry`：`count()`、`generateReport()`（真实 JSON）。
+- `Context.requestParam(name)`：**form 优先、回退 query** 的取值器（Rails/Laravel/ThinkPHP `input()` 语义）。
+- `Context.nestedParam(path)`：点号路径查找（原 `paramPath`，新名不再读起来像"路径参数"）。
+- `CircuitBreaker`：`lastUsedAt()`；`PluginManager.dynamicLoadingSupported()`。
+- `src/core/SpinLock.zig`：共享的短自适应自旋锁（自旋后 `yield`），供 io-free 热路径临界区复用。
+- 测试：`http/UploadGuard.zig`（8 条：嗅探、ISO-BMFF 尺寸校验、主动内容、改名绕过、跨族改名、
+  限额/扩展名、表单级）、`test/RouteTemplate.zig`（4 条：三条注册路径 + 未匹配）、
+  `RateLimiterRegistry` 淘汰/LRU/retain 4 条、`CircuitBreakerRegistry` 指针稳定性 + 报告、
+  `CapabilityRegistry.generateApiBoundaryReport`、`SpinLock` 2 条、`Multipart.Config.forBodyLimit`。
+
+### Fixed
+- **`ctx.route_template` 形状随注册方式而变**：`group.get("/health")` 得 `/health`、
+  `group.get("health")` 得 `health`、ComptimeRouter `mountAll` 得 `orders/{id}`、
+  `addRoute` 得 `/metrics` —— 同一套指标里两种拼法，写死的 dashboard 查询会漏一半流量。
+  现在 `Router.addRoute` 里统一为"恰好一个前导斜杠"（该处本来就在 dupe 路径，零额外开销）；
+  匹配逻辑不受影响（trie 按 `/` 切分，不用这个字符串）。
+- **`CircuitBreakerRegistry` 与 `RateLimiterRegistry` 同族的两处缺陷**：按值存 breaker →
+  `getOrCreate` 返回的内部指针**下一次插入 rehash 后失效**（悬垂指针，与 zent 连接池 UAF 同族）；
+  且全程零同步。现改为堆分配指针 + 内部锁，指针在 registry 生命周期内稳定。
+- **两个热路径锁是"纯自旋不让出"**：`http/AccessLog.zig`、`http/HttpMetrics.zig` 的
+  `while (!mutex.tryLock()) spinLoopHint();` 在争用下烧 CPU。改用共享 `SpinLock`（自旋 32 次后
+  `std.Thread.yield()`），并把 14 处 `self.mutex.state.store(...)` 的裸解锁换成 `mutex.unlock()`。
+- **`Multipart.Config.max_total_bytes` 默认值永不生效**：`Server.Config.max_body_size`（默认 8 MB）
+  在读体阶段先 413，`Multipart.parse` 不会被调用，所以默认 32 MB 的总量上限不可达。
+  模块头/字段/`Context.multipart` 三处写明判定顺序，并新增 `forBodyLimit` 对齐工具。
+  **默认值未改**（降成 8 MB 会静默改变"已抬 body 上限"的调用方行为）。
+- **`generateReport` 占位串**（`RateLimiterRegistry`、`CircuitBreakerRegistry`、
+  `CapabilityRegistry.generateApiBoundaryReport`）返回 `"pending … migration"`：改为真实 JSON 快照。
+- **`PluginManager.loadPlugin` 是静默 no-op**（登记名字但不加载代码）：现在每次 warn 一行，
+  并提供 `dynamicLoadingSupported() == false` 供调用方分支。
+- `Transactional` 的日志串 `"Rollback transactionfailure: {}"` 缺空格；`core/Error.zig` /
+  `ObjectValidator` / `SecurityScanner` / `ModuleBoundary` / `ApiVersioning` 中同一批"半翻译"注释
+  （`ValidationRequired field`、`ValidationModule boundary`、`API versionRoute group` …）一并写清。
+- `SecurityModule` 里错位的 `/// Validation JWT Token`（挂在 `setKeyring` 上方，与下一行冲突）删除。
+
+### Changed
+- **`RateLimiter` / `RateLimiterRegistry` / `SlidingWindowRateLimiter` / `CircuitBreakerRegistry` /
+  `AccessLog` / `HttpMetrics` 的锁统一为 `core/SpinLock.zig`**（同一份实现，避免多份自旋逻辑漂移）。
+- `CircuitBreakerRegistry.breakers` 类型 `std.StringHashMap(CircuitBreaker)` →
+  `std.StringHashMap(*CircuitBreaker)`（破坏性，仅影响直读该字段的代码）。
+- `Context.paramPath` → **DEPRECATED**，改用 `nestedParam`（行为不变）。
+- `ShardRouter.ShardedQuery` **移除**：只能 `return error.NotImplemented`，且全仓无调用点
+  （物理分表由 DB 层负责，模块头已写明）。
+- `Partitioner.zig` 文件头"tests are disabled pending integration"是过期描述——测试实际在跑且通过，
+  注释改为实情（仍未接入 `DistributedEventBus`，这点保留）。
+
+### Docs
+- `BEST_PRACTICES.md`：新增「上传与 multipart」整节（三个问题、限额优先级表、三种错误写法、
+  `UploadGuard` 判定顺序与错误表、支持嗅探的格式清单、落盘路径提醒）。
+- `UPGRADING.md`：补 v0.15.46 段（含 `route_template` 标签值变化的升级动作、
+  `CircuitBreakerRegistry` 字段类型变化、`paramPath` 弃用）。
+- `ISSUES_FROM_ZIGSHOP.md`：追加第二轮 4 条核实矩阵（含 #3 的机制更正与真问题定位）与顺带发现清单。
+- `API.md`：Multipart 限额顺序、Uploads（`extractMultipart` + `UploadGuard`）、
+  `nestedParam`/`requestParam`、`route_template` 规整、registry 淘汰与报告。
+- `AGENTS.md`：DO/DON'T 加"上传内容校验""上传限额对齐""取参数用对名字"三行；文件地图加上传一节。
+- **全仓 628 行被 `[...]` 污染的注释修复**（35 个文件；这批注释是 `6316708`「翻译所有中文注释」
+  那次自动化替换留下的残骸——中文被吞、英文技术名词残留，出现 `/// Module contract[...]`、
+  `/// [...]publish/consume[...]Event[...]API[...]` 这类半句）。按 `6316708^` 的原文核对语义后用
+  英文重写（与各文件现存语言一致）；`Page.zig` 里 JSON 示例的 `[...]` 是合法省略号，保留。
+  校验：逐文件比对"非注释行"与 HEAD，**34/35 文件零代码改动**（另一个是我本批的改动），全量测试通过。
+
 ## [0.15.45] - 2026-09-15
 
 ### Added

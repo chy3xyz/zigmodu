@@ -1,7 +1,7 @@
 const std = @import("std");
 
-/// [...]Security scanner
-/// [...]VulnerabilityCheck and security best practicesValidation
+/// Module security scanner
+/// Static security analysis, vulnerability checking and best-practice validation
 /// Medium-priority architecture improvement
 pub const SecurityScanner = struct {
     const Self = @This();
@@ -12,21 +12,21 @@ pub const SecurityScanner = struct {
     config: Config,
     io: std.Io,
 
-    /// [...]
+    /// Scanner configuration
     pub const Config = struct {
-        /// [...]
+        /// Minimum severity a finding must have to be reported
         min_severity: Severity = .LOW,
-        /// [...]
+        /// Whether to scan dependencies
         scan_dependencies: bool = true,
-        /// [...]Info[...]
+        /// Whether to check for leaked Info such as hardcoded secrets
         check_secrets: bool = true,
-        /// [...]API[...]
+        /// Whether to check for unsafe API usage
         check_unsafe_apis: bool = true,
-        /// [...]Permission[...]
+        /// Whether to check for missing Permission checks
         check_permissions: bool = true,
     };
 
-    /// [...]
+    /// A single security rule and the check function backing it
     pub const SecurityRule = struct {
         id: []const u8,
         name: []const u8,
@@ -45,7 +45,7 @@ pub const SecurityScanner = struct {
         };
     };
 
-    /// [...]
+    /// One issue reported by a rule for a specific file
     pub const SecurityFinding = struct {
         rule_id: []const u8,
         severity: Severity,
@@ -64,7 +64,7 @@ pub const SecurityScanner = struct {
         }
     };
 
-    /// [...]
+    /// Severity level, ordered from CRITICAL (most severe) down to INFO
     pub const Severity = enum {
         CRITICAL,
         HIGH,
@@ -107,7 +107,7 @@ pub const SecurityScanner = struct {
         }
     };
 
-    /// [...]
+    /// Initializes the scanner and registers the built-in rules
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Config) Self {
         var scanner = Self{
             .allocator = allocator,
@@ -117,13 +117,13 @@ pub const SecurityScanner = struct {
             .io = io,
         };
 
-        // [...]
+        // Register the default rules up front
         scanner.registerDefaultRules();
 
         return scanner;
     }
 
-    /// [...]
+    /// Frees the rule list plus every allocation owned by the findings
     pub fn deinit(self: *Self) void {
         self.rules.deinit();
 
@@ -138,14 +138,14 @@ pub const SecurityScanner = struct {
         self.* = undefined;
     }
 
-    /// [...]
+    /// Appends a rule so it takes part in the next scan
     pub fn registerRule(self: *Self, rule: SecurityRule) !void {
         try self.rules.append(rule);
     }
 
-    /// [...]
+    /// Registers the five built-in security rules
     fn registerDefaultRules(self: *Self) void {
-        // [...]
+        // Hardcoded secret detection
         self.registerRule(.{
             .id = "SEC001",
             .name = "Hardcoded Secret",
@@ -155,7 +155,7 @@ pub const SecurityScanner = struct {
             .check_fn = checkHardcodedSecret,
         }) catch |err| std.log.err("[SecurityScanner] registerRule SEC001 failed: {}", .{err});
 
-        // SQL[...]
+        // SQL injection detection
         self.registerRule(.{
             .id = "SEC002",
             .name = "SQL Injection Risk",
@@ -165,7 +165,7 @@ pub const SecurityScanner = struct {
             .check_fn = checkSqlInjection,
         }) catch |err| std.log.err("[SecurityScanner] registerRule SEC002 failed: {}", .{err});
 
-        // [...]HTTP[...]
+        // Insecure HTTP configuration
         self.registerRule(.{
             .id = "SEC003",
             .name = "Insecure HTTP Configuration",
@@ -175,7 +175,7 @@ pub const SecurityScanner = struct {
             .check_fn = checkInsecureHttp,
         }) catch |err| std.log.err("[SecurityScanner] registerRule SEC003 failed: {}", .{err});
 
-        // [...]Encrypt[...]
+        // Weak encryption algorithm detection
         self.registerRule(.{
             .id = "SEC004",
             .name = "Weak Cryptography",
@@ -185,7 +185,7 @@ pub const SecurityScanner = struct {
             .check_fn = checkWeakCrypto,
         }) catch |err| std.log.err("[SecurityScanner] registerRule SEC004 failed: {}", .{err});
 
-        // Permission[...]
+        // Permission bypass detection
         self.registerRule(.{
             .id = "SEC005",
             .name = "Missing Authorization",
@@ -196,7 +196,7 @@ pub const SecurityScanner = struct {
         }) catch |err| std.log.err("[SecurityScanner] registerRule SEC005 failed: {}", .{err});
     }
 
-    /// [...]
+    /// Runs every rule at or above the configured min_severity against one source file
     pub fn scanSourceCode(self: *Self, file_path: []const u8, source_code: []const u8) !void {
         for (self.rules.items) |rule| {
             if (@backingInt(rule.severity) > @backingInt(self.config.min_severity)) {
@@ -218,7 +218,7 @@ pub const SecurityScanner = struct {
         }
     }
 
-    /// [...]
+    /// Scans a module directory and returns the aggregated result
     pub fn scanModule(self: *Self, module_path: []const u8) !ScanResult {
         var result = ScanResult{
             .total_files = 0,
@@ -226,7 +226,7 @@ pub const SecurityScanner = struct {
         };
         errdefer result.findings.deinit(self.allocator);
 
-        // [...].zig[...]
+        // Scan every .zig file in the module directory
         var dir = std.Io.Dir.cwd().openDir(std.testing.io, module_path, .{ .iterate = true }) catch |err| {
             std.log.err("Cannot open module directory {s}: {}", .{ module_path, err });
             return result;
@@ -251,7 +251,7 @@ pub const SecurityScanner = struct {
             }
         }
 
-        // [...]
+        // Copy the collected findings into the result and tally them by severity
         for (self.findings.items) |finding| {
             try result.findings.append(self.allocator, finding);
             switch (finding.severity) {
@@ -266,7 +266,7 @@ pub const SecurityScanner = struct {
         return result;
     }
 
-    /// [...]
+    /// Renders a Markdown report for a scan result
     pub fn generateReport(self: *Self, result: *const ScanResult) ![]const u8 {
         var buf = std.ArrayList(u8).empty;
 
@@ -293,13 +293,13 @@ pub const SecurityScanner = struct {
         return buf.toOwnedSlice(self.allocator);
     }
 
-    /// Check if[...]Security scan
+    /// Check if a Security scan passed, i.e. no CRITICAL or HIGH findings
     pub fn isSecure(self: *Self, result: *const ScanResult) bool {
         _ = self;
         return !result.hasCriticalOrHigh();
     }
 
-    // [...]
+    // Rule check functions
     fn checkHardcodedSecret(source: []const u8) ?[]const u8 {
         const patterns = [_][]const u8{
             "password = \"",
@@ -355,7 +355,7 @@ pub const SecurityScanner = struct {
     }
 
     fn checkMissingAuth(source: []const u8) ?[]const u8 {
-        // [...]API[...]auth[...]
+        // Simplified check: API definitions that declare neither authorize nor authenticate
         if (std.mem.indexOf(u8, source, "pub fn") != null and
             std.mem.indexOf(u8, source, "authorize") == null and
             std.mem.indexOf(u8, source, "authenticate") == null)
@@ -366,14 +366,14 @@ pub const SecurityScanner = struct {
     }
 };
 
-/// [...]Vulnerability[...]
+/// Dependency vulnerability checker
 pub const DependencyScanner = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
     vulnerability_db: std.StringHashMap(Vulnerability),
 
-    /// VulnerabilityInfo
+    /// A known-vulnerability record.
     pub const Vulnerability = struct {
         id: []const u8,
         package_name: []const u8,
@@ -406,7 +406,7 @@ pub const DependencyScanner = struct {
         self.* = undefined;
     }
 
-    /// [...]VulnerabilityInfo[...]
+    /// Adds one VulnerabilityInfo entry, keyed by package name and affected versions
     pub fn addVulnerability(self: *Self, vuln: Vulnerability) !void {
         const key = try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{
             vuln.package_name,
@@ -426,7 +426,7 @@ pub const DependencyScanner = struct {
         try self.vulnerability_db.put(key, owned_vuln);
     }
 
-    /// Check if dependency has knownVulnerability
+    /// Known vulnerability for `package_name`, or null. `version` is not consulted yet.
     pub fn checkDependency(self: *Self, package_name: []const u8, version: []const u8) ?Vulnerability {
         _ = version;
         var iter = self.vulnerability_db.iterator();
@@ -439,11 +439,11 @@ pub const DependencyScanner = struct {
     }
 };
 
-/// [...]Validation[...]
+/// Security configuration Validation
 pub const SecurityConfigValidator = struct {
     const Self = @This();
 
-    /// [...]
+    /// A single security configuration check
     pub const SecurityCheck = struct {
         name: []const u8,
         description: []const u8,
@@ -463,12 +463,12 @@ pub const SecurityConfigValidator = struct {
         self.* = undefined;
     }
 
-    /// [...]
+    /// Adds a security check to be run by validateAll
     pub fn addCheck(self: *Self, check: SecurityCheck) !void {
         try self.checks.append(check);
     }
 
-    /// [...]
+    /// Runs every registered check; passed stays true only if all of them succeed
     pub fn validateAll(self: *Self) ValidationResult {
         var result = ValidationResult{
             .passed = true,
@@ -496,7 +496,7 @@ pub const SecurityConfigValidator = struct {
     };
 };
 
-// Tests[...]
+// Tests
 test "SecurityScanner basic" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -506,7 +506,7 @@ test "SecurityScanner basic" {
     });
     defer scanner.deinit();
 
-    // Tests[...]
+    // Test code that is expected to be flagged
     const test_code =
         \\\const password = "secret123";
         \\\var api_key = "sk-1234567890";

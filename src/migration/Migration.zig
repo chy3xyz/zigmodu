@@ -86,21 +86,21 @@ fn dollarQuoteTagLen(sql: []const u8, pos: usize) ?usize {
     return null;
 }
 
-/// Database migration[...]
+/// Database migration entry
 pub const MigrationEntry = struct {
-    /// [...] ([...]: YYYYMMDDHHMMSS)
+    /// Version number (timestamp format: YYYYMMDDHHMMSS)
     version: i64,
-    /// [...]
+    /// Migration description
     description: []const u8,
-    /// SQL [...]
+    /// SQL body
     sql: []const u8,
-    /// [...] SQL ([...])
+    /// Rollback SQL (optional)
     rollback_sql: ?[]const u8 = null,
-    /// [...] (SHA256)
+    /// Checksum (SHA256)
     checksum: ?[]const u8 = null,
 };
 
-/// [...]
+/// Applied migration record
 pub const AppliedMigration = struct {
     version: i64,
     description: []const u8,
@@ -110,7 +110,7 @@ pub const AppliedMigration = struct {
     success: bool,
 };
 
-/// [...]
+/// Migration status
 pub const MigrationStatus = enum {
     pending,
     applied,
@@ -118,22 +118,22 @@ pub const MigrationStatus = enum {
     skipped,
 };
 
-/// [...] (for getMigrationStatus)
+/// Migration status entry (for getMigrationStatus)
 pub const MigrationStatusEntry = struct {
     version: i64,
     description: []const u8,
     status: MigrationStatus,
 };
 
-/// [...]
-/// [...] Flyway / Liquibase [...]Database migration[...]
+/// Migration runner
+/// Database migration management similar to Flyway / Liquibase
 pub const MigrationRunner = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
     migrations: std.ArrayList(MigrationEntry),
     history: std.ArrayList(AppliedMigration),
-    /// Migration history[...]
+    /// Migration history table name
     history_table: []const u8,
     /// Cross-instance guard so a rolling deploy cannot apply the same DDL
     /// twice. Default null = no guard (single instance / local dev).
@@ -176,7 +176,7 @@ pub const MigrationRunner = struct {
         self.lock_ttl_ms = ttl_ms;
     }
 
-    /// [...]
+    /// Register a migration
     pub fn addMigration(self: *Self, version: i64, description: []const u8, sql: []const u8) !void {
         const desc_copy = try self.allocator.dupe(u8, description);
         errdefer self.allocator.free(desc_copy);
@@ -184,7 +184,7 @@ pub const MigrationRunner = struct {
         const sql_copy = try self.allocator.dupe(u8, sql);
         errdefer self.allocator.free(sql_copy);
 
-        // [...]
+        // Compute the checksum
         const checksum = try computeChecksum(self.allocator, sql);
 
         try self.migrations.append(self.allocator, .{
@@ -195,7 +195,7 @@ pub const MigrationRunner = struct {
         });
     }
 
-    /// [...]
+    /// Register a migration together with its rollback SQL
     pub fn addMigrationWithRollback(
         self: *Self,
         version: i64,
@@ -265,7 +265,7 @@ pub const MigrationRunner = struct {
         return buf[0..count];
     }
 
-    /// [...]
+    /// Get the status of every registered migration
     pub fn getMigrationStatus(self: *Self, buf: []MigrationStatusEntry) []MigrationStatusEntry {
         var count: usize = 0;
         for (self.migrations.items) |migration| {
@@ -284,7 +284,7 @@ pub const MigrationRunner = struct {
         return buf[0..count];
     }
 
-    /// [...]
+    /// Record the result of a migration run
     pub fn recordMigration(
         self: *Self,
         version: i64,
@@ -318,7 +318,7 @@ pub const MigrationRunner = struct {
         return count;
     }
 
-    /// [...]
+    /// Get the total number of registered migrations
     pub fn getTotalCount(self: *Self) usize {
         return self.migrations.items.len;
     }
@@ -446,7 +446,7 @@ pub const MigrationRunner = struct {
         });
     }
 
-    /// [...]Migration history[...] SQL
+    /// Generate the migration history table creation SQL
     pub fn generateHistoryTableDDL(self: *Self) ![]const u8 {
         return std.fmt.allocPrint(self.allocator,
             \\CREATE TABLE IF NOT EXISTS {s} (
@@ -460,7 +460,7 @@ pub const MigrationRunner = struct {
         , .{self.history_table});
     }
 
-    /// Validation[...]
+    /// Validate the checksums of applied migrations
     pub fn validateChecksums(self: *Self) !bool {
         for (self.history.items) |applied| {
             if (!applied.success) continue;
@@ -484,12 +484,12 @@ pub const MigrationRunner = struct {
     }
 };
 
-/// SQL [...]
+/// SQL migration file loader
 pub const MigrationLoader = struct {
-    /// [...] SQL [...]
-    /// [...]: -- version: YYYYMMDDHHMMSS
+    /// Load a migration from a SQL file string
+    /// Expected format: -- version: YYYYMMDDHHMMSS
     ///           -- description: xxx
-    /// -- rollback: ... ([...])
+    /// -- rollback: ... (optional)
     ///           SQL statements...
     pub fn parseMigrationFile(allocator: std.mem.Allocator, content: []const u8) !struct {
         version: i64,
@@ -531,7 +531,7 @@ pub const MigrationLoader = struct {
             return error.InvalidMigrationFormat;
         }
 
-        // [...] SQL [...]
+        // Extract the SQL content
         var sql_buf = std.ArrayList(u8).empty;
         defer sql_buf.deinit(allocator);
         var lines2 = std.mem.splitScalar(u8, content, '\n');
@@ -551,9 +551,9 @@ pub const MigrationLoader = struct {
         };
     }
 
-    /// [...] V{version}__{description}.sql Parse version and description from filename
+    /// Parse version and description from a V{version}__{description}.sql filename
     pub fn parseMigrationFilename(filename: []const u8) ?struct { version: i64, description: []const u8 } {
-        // [...]: V{YYYYMMDDHHMMSS}__{description}.sql
+        // Format: V{YYYYMMDDHHMMSS}__{description}.sql
         if (!std.mem.startsWith(u8, filename, "V")) return null;
         if (!std.mem.endsWith(u8, filename, ".sql")) return null;
 
@@ -568,7 +568,7 @@ pub const MigrationLoader = struct {
     }
 };
 
-/// [...] SHA256 [...]
+/// Compute the SHA256 checksum of a string
 fn computeChecksum(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(data);

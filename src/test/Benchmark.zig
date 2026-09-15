@@ -1,7 +1,7 @@
 const std = @import("std");
 
-/// [...]Tests[...]
-/// [...]Tests[...]Statistical analysis and report generation
+/// Performance benchmark framework
+/// Provides performance measurement, statistical analysis and report generation
 /// Medium-priority architecture improvement
 pub const Benchmark = struct {
     const Self = @This();
@@ -11,23 +11,23 @@ pub const Benchmark = struct {
     results: std.array_list.Managed(BenchmarkResult),
     config: Config,
 
-    /// [...]Tests[...]
+    /// Benchmark configuration
     pub const Config = struct {
-        /// [...]
+        /// Minimum number of runs
         min_iterations: usize = 10,
-        /// [...]
+        /// Maximum number of runs
         max_iterations: usize = 10000,
-        /// [...]
+        /// Minimum run time in nanoseconds
         min_time_ns: u64 = 1_000_000_000, // 1 second
-        /// [...]
+        /// Whether to warm up before measuring
         warmup: bool = true,
-        /// [...]
+        /// Number of warmup runs
         warmup_iterations: usize = 3,
-        /// [...]
+        /// Whether to print verbose output
         verbose: bool = false,
     };
 
-    /// [...]
+    /// Result of a single run
     pub const RunResult = struct {
         duration_ns: u64,
         iterations: usize,
@@ -35,26 +35,26 @@ pub const Benchmark = struct {
         items_processed: usize = 0,
     };
 
-    /// [...]Tests[...]
+    /// Benchmark result
     pub const BenchmarkResult = struct {
         name: []const u8,
         runs: std.array_list.Managed(RunResult),
 
-        // [...]
+        // Statistics
         mean_ns: f64 = 0,
         median_ns: f64 = 0,
         min_ns: u64 = 0,
         max_ns: u64 = 0,
         std_dev_ns: f64 = 0,
 
-        // [...]
+        // Throughput
         throughput_bytes_per_sec: f64 = 0,
         throughput_items_per_sec: f64 = 0,
 
         pub fn calculateStats(self: *BenchmarkResult) void {
             if (self.runs.items.len == 0) return;
 
-            // [...]
+            // Compute the mean
             var sum: u128 = 0;
             var min: u64 = std.math.maxInt(u64);
             var max: u64 = 0;
@@ -73,7 +73,7 @@ pub const Benchmark = struct {
             self.min_ns = min;
             self.max_ns = max;
 
-            // [...]
+            // Compute the median
             var sorted = self.runs.clone() catch return;
             defer sorted.deinit();
 
@@ -91,7 +91,7 @@ pub const Benchmark = struct {
                 self.median_ns = @as(f64, @floatFromInt(sorted.items[mid].duration_ns));
             }
 
-            // [...]
+            // Compute the standard deviation
             var variance_sum: f64 = 0;
             for (self.runs.items) |r| {
                 const diff = @as(f64, @floatFromInt(r.duration_ns)) - self.mean_ns;
@@ -99,7 +99,7 @@ pub const Benchmark = struct {
             }
             self.std_dev_ns = @sqrt(variance_sum / @as(f64, @floatFromInt(self.runs.items.len)));
 
-            // [...]
+            // Compute throughput
             const total_duration_secs = @as(f64, @floatFromInt(sum)) / 1_000_000_000.0;
             if (total_duration_secs > 0) {
                 self.throughput_bytes_per_sec = @as(f64, @floatFromInt(total_bytes)) / total_duration_secs;
@@ -121,7 +121,7 @@ pub const Benchmark = struct {
         }
     };
 
-    /// [...]Tests
+    /// Create a new benchmark
     pub fn init(allocator: std.mem.Allocator, name: []const u8, config: Config) !Self {
         return .{
             .allocator = allocator,
@@ -131,7 +131,7 @@ pub const Benchmark = struct {
         };
     }
 
-    /// [...]
+    /// Release resources
     pub fn deinit(self: *Self) void {
         self.allocator.free(self.name);
 
@@ -143,7 +143,7 @@ pub const Benchmark = struct {
         self.* = undefined;
     }
 
-    /// [...]Tests[...]
+    /// Run a single benchmark function
     pub fn run(self: *Self, bench_name: []const u8, comptime BenchFn: type, bench_ctx: anytype) !void {
         _ = BenchFn;
         var result = BenchmarkResult{
@@ -155,7 +155,7 @@ pub const Benchmark = struct {
             self.allocator.free(result.name);
         }
 
-        // [...]
+        // Warmup
         if (self.config.warmup) {
             var i: usize = 0;
             while (i < self.config.warmup_iterations) : (i += 1) {
@@ -163,7 +163,7 @@ pub const Benchmark = struct {
             }
         }
 
-        // [...]Tests
+        // Actual measurement
         var total_time: u64 = 0;
         var iteration: usize = 0;
 
@@ -182,13 +182,13 @@ pub const Benchmark = struct {
                 .items_processed = bench_result.items_processed,
             });
 
-            // Check if[...]
+            // Check whether the minimum run count and time have been reached
             if (iteration >= self.config.min_iterations and total_time >= self.config.min_time_ns) {
                 break;
             }
         }
 
-        // [...]
+        // Compute statistics
         result.calculateStats();
 
         try self.results.append(result);
@@ -198,7 +198,7 @@ pub const Benchmark = struct {
         }
     }
 
-    /// [...]
+    /// Print a single result
     fn printResult(self: *Self, result: *const BenchmarkResult) void {
         _ = self;
 
@@ -232,7 +232,7 @@ pub const Benchmark = struct {
         }
     }
 
-    /// [...]
+    /// Generate the full report
     pub fn generateReport(self: *Self) ![]const u8 {
         var buf = std.array_list.Managed(u8).init(self.allocator);
         defer buf.deinit();
@@ -265,7 +265,7 @@ pub const Benchmark = struct {
         return buf.toOwnedSlice();
     }
 
-    /// [...]Tests[...]
+    /// Compare with the results of another benchmark
     pub fn compareWithBaseline(self: *Self, baseline: *const Benchmark, result_name: []const u8) !?ComparisonResult {
         const current = self.findResult(result_name) orelse return null;
         const base = baseline.findResult(result_name) orelse return null;
@@ -291,7 +291,7 @@ pub const Benchmark = struct {
         return null;
     }
 
-    /// [...]
+    /// Comparison result
     pub const ComparisonResult = struct {
         benchmark_name: []const u8,
         baseline_mean_ns: f64,
@@ -302,7 +302,7 @@ pub const Benchmark = struct {
     };
 };
 
-/// [...]TestsContext[...]
+/// Benchmark context interface
 pub fn BenchmarkContext(comptime ReturnType: type) type {
     return struct {
         const Self = @This();
@@ -316,9 +316,9 @@ pub fn BenchmarkContext(comptime ReturnType: type) type {
     };
 }
 
-/// [...]Tests[...]
+/// Common benchmark scenarios
 pub const BenchmarkScenarios = struct {
-    /// [...]Tests
+    /// Module startup performance benchmark
     pub const ModuleStartupBenchmark = struct {
         pub const Result = struct {
             iterations: usize = 1,
@@ -345,7 +345,7 @@ pub const BenchmarkScenarios = struct {
         }
     };
 
-    /// Event bus[...]Tests
+    /// Event bus performance benchmark
     pub const EventBusBenchmark = struct {
         pub const Result = struct {
             iterations: usize,
@@ -369,7 +369,7 @@ pub const BenchmarkScenarios = struct {
         }
     };
 
-    /// HTTP API[...]Tests
+    /// HTTP API performance benchmark
     pub const HttpApiBenchmark = struct {
         pub const Result = struct {
             iterations: usize,
@@ -400,7 +400,7 @@ pub const BenchmarkScenarios = struct {
     };
 };
 
-/// [...]Tests[...] - [...]Tests
+/// Benchmark suite - runs multiple related benchmarks
 pub const BenchmarkSuite = struct {
     const Self = @This();
 
@@ -427,7 +427,7 @@ pub const BenchmarkSuite = struct {
         self.* = undefined;
     }
 
-    /// [...]Tests
+    /// Add a benchmark
     pub fn addBenchmark(self: *Self, name: []const u8, config: Benchmark.Config) !*Benchmark {
         const bench = try self.allocator.create(Benchmark);
         bench.* = try Benchmark.init(self.allocator, name, config);
@@ -435,18 +435,18 @@ pub const BenchmarkSuite = struct {
         return bench;
     }
 
-    /// [...]Tests
+    /// Run all benchmarks
     pub fn runAll(self: *Self) !void {
         std.log.info("\n=== Running Benchmark Suite: {s} ===", .{self.name});
 
         for (self.benchmarks.items) |bench| {
             std.log.info("\nRunning: {s}", .{bench.name});
-            // [...]Tests[...] addBenchmark [...]
-            // Actual run should be after addingTests[...]done
+            // The benchmark was already created by addBenchmark, it does not need to run here
+            // The actual run happens when the test case is added
         }
     }
 
-    /// [...]
+    /// Generate the summary report
     pub fn generateSummaryReport(self: *Self) ![]const u8 {
         var buf = std.array_list.Managed(u8).init(self.allocator);
         defer buf.deinit();
@@ -466,7 +466,7 @@ pub const BenchmarkSuite = struct {
     }
 };
 
-// Tests[...]
+// Test cases
 test "Benchmark basic" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -478,7 +478,7 @@ test "Benchmark basic" {
     });
     defer bench.deinit();
 
-    // Create a simple benchmarkTestsContext
+    // Create a simple benchmark test context
     const TestContext = struct {
         counter: usize = 0,
 
@@ -489,7 +489,7 @@ test "Benchmark basic" {
         };
 
         pub fn run(self: *@This()) !Result {
-            // [...]
+            // Simulate some work
             var sum: usize = 0;
             for (0..1000) |i| {
                 sum += i;
@@ -506,7 +506,7 @@ test "Benchmark basic" {
 test "BenchmarkScenarios" {
     const testing = std.testing;
 
-    // Tests[...]
+    // Test the module startup benchmark
     var startup_bench = BenchmarkScenarios.ModuleStartupBenchmark{
         .module_name = "test_module",
         .init_fn = struct {

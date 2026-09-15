@@ -3,69 +3,50 @@
 //! ## Thread safety
 //!
 //! All three types are safe to share across threads; each guards its mutable
-//! state with an internal `Guard`. `tryAcquire` is called from request handlers,
-//! and with a shared limiter (one global budget for the whole process) that is
-//! genuinely concurrent — without the guard two threads racing on the last token
-//! both see it and both admit, and `RateLimiterRegistry`'s map insert can tear
-//! the backing storage.
-//!
-//! `Guard` is a short adaptive spinlock rather than a `std.Io.Mutex`: the
-//! critical sections here are a map lookup or two float operations, and
-//! `std.Io.Mutex.lock`/`unlock` need an `Io`, which would have to be threaded
-//! through `init`, `tryAcquire`, `authRateLimitMiddleware` and
-//! `RedisRateLimiter.allowWithFallback`. If profiling ever shows contention on
-//! one shared limiter, the fix is to shard the limiter, not to re-lock it.
+//! state with an internal `SpinLock` (`core/SpinLock.zig`, with the reasoning for
+//! a spinlock over `std.Io.Mutex`). That matters because `tryAcquire` runs on
+//! request handlers: with a shared limiter (one global budget for the process)
+//! two threads racing on the last token both see it and both admit, and
+//! `RateLimiterRegistry`'s map insert can tear the backing storage.
 
 const std = @import("std");
 const Time = @import("../core/Time.zig");
-
-/// Minimal io-free mutual exclusion for the tiny critical sections in this file.
-/// Spins briefly, then yields the time slice, so it degrades to polite waiting
-/// instead of burning a core under sustained contention.
-const Guard = struct {
-    state: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-    fn lock(self: *Guard) void {
-        var spins: u32 = 0;
-        while (self.state.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
-            spins += 1;
-            if (spins < 32) {
-                std.atomic.spinLoopHint();
-            } else {
-                // A failed yield is benign (we just retry the acquire), but it is
-                // still an error — surface it at debug rather than swallowing it.
-                std.Thread.yield() catch |err| std.log.debug("[RateLimiter] lock wait: yield failed ({s}), retrying", .{@errorName(err)});
-            }
-        }
-    }
-
-    fn unlock(self: *Guard) void {
-        self.state.store(false, .release);
-    }
-};
+const SpinLock = @import("../core/SpinLock.zig").SpinLock;
 
 /// Token bucket. `max_tokens` is the burst size, `refill_rate` the sustained
 /// rate in tokens per second. Safe to share across threads.
 pub const RateLimiter = struct {
     const Self = @This();
 
-    guard: Guard = .{},
+    guard: SpinLock = .{},
     allocator: std.mem.Allocator,
     name: []const u8,
     max_tokens: u32,
     refill_rate: u32, // tokens per second
     current_tokens: f64,
     last_refill_time: i64,
+    /// Monotonic seconds of the last successful acquire, for
+    /// `RateLimiterRegistry`'s idle sweep. Atomic so a sweep can read it without
+    /// taking this limiter's guard.
+    last_used_at: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
 
     pub fn init(allocator: std.mem.Allocator, name: []const u8, max_tokens: u32, refill_rate: u32) !Self {
+        const now = Time.monotonicNowSeconds();
         return .{
             .allocator = allocator,
             .name = try allocator.dupe(u8, name),
             .max_tokens = max_tokens,
             .refill_rate = refill_rate,
             .current_tokens = @as(f64, @floatFromInt(max_tokens)),
-            .last_refill_time = Time.monotonicNowSeconds(),
+            .last_refill_time = now,
+            .last_used_at = std.atomic.Value(i64).init(now),
         };
+    }
+
+    /// Monotonic seconds of the last successful acquire (creation time until
+    /// then). 0 only for a value that was never `init`ed.
+    pub fn lastUsedAt(self: *const Self) i64 {
+        return self.last_used_at.load(.monotonic);
     }
 
     pub fn deinit(self: *Self) void {
@@ -76,9 +57,13 @@ pub const RateLimiter = struct {
     /// Take one token if available. Denies rather than waiting.
     pub fn tryAcquire(self: *Self) bool {
         @branchHint(.likely);
-        self.guard.lock();
-        defer self.guard.unlock();
-        return self.acquireLocked(1.0);
+        const allowed = blk: {
+            self.guard.lock();
+            defer self.guard.unlock();
+            break :blk self.acquireLocked(1.0);
+        };
+        if (allowed) self.last_used_at.store(Time.monotonicNowSeconds(), .monotonic);
+        return allowed;
     }
 
     /// Acquire a token, waiting if unavailable.
@@ -173,11 +158,19 @@ pub const RateLimiter = struct {
 pub const RateLimiterRegistry = struct {
     const Self = @This();
 
-    guard: Guard = .{},
+    guard: SpinLock = .{},
     allocator: std.mem.Allocator,
     limiters: std.StringHashMap(*RateLimiter),
     default_max_tokens: u32,
     default_refill_rate: u32,
+    /// Upper bound on tracked limiters. 0 = unbounded (previous behaviour).
+    ///
+    /// Per-client limiters are keyed by attacker-controlled input (IP, user id),
+    /// so an unbounded registry grows for as long as someone keeps sending new
+    /// keys — a memory-growth vector, not a style question. At `max_keys` the
+    /// least-recently-used limiter is evicted on insert (its budget resets if it
+    /// comes back, which under eviction pressure is the intended trade).
+    max_keys: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, default_max_tokens: u32, default_refill_rate: u32) Self {
         return .{
@@ -186,6 +179,18 @@ pub const RateLimiterRegistry = struct {
             .default_max_tokens = default_max_tokens,
             .default_refill_rate = default_refill_rate,
         };
+    }
+
+    /// `init` plus a hard cap on tracked keys. See `max_keys`.
+    pub fn initWithCapacity(
+        allocator: std.mem.Allocator,
+        default_max_tokens: u32,
+        default_refill_rate: u32,
+        max_keys: usize,
+    ) Self {
+        var self = Self.init(allocator, default_max_tokens, default_refill_rate);
+        self.max_keys = max_keys;
+        return self;
     }
 
     pub fn deinit(self: *Self) void {
@@ -216,6 +221,37 @@ pub const RateLimiterRegistry = struct {
         return self.limiters.get(name);
     }
 
+    /// Drop `name`'s limiter (e.g. on logout, so the next session starts with a
+    /// full budget). No-op when absent. Returns whether an entry was removed.
+    pub fn remove(self: *Self, name: []const u8) bool {
+        self.guard.lock();
+        defer self.guard.unlock();
+        return self.removeLocked(name);
+    }
+
+    /// Drop every limiter idle for more than `max_idle_seconds`. Call from a
+    /// periodic tick. The clock is coarse (1s), so `0` reclaims what has been
+    /// untouched for a full second — never an entry used in the current second.
+    pub fn retain(self: *Self, max_idle_seconds: i64) usize {
+        self.guard.lock();
+        defer self.guard.unlock();
+
+        const now = Time.monotonicNowSeconds();
+        var evicted: usize = 0;
+        var it = self.limiters.iterator();
+        while (it.next()) |entry| {
+            if (now - entry.value_ptr.*.lastUsedAt() > max_idle_seconds) {
+                const doomed = entry.key_ptr.*;
+                entry.value_ptr.*.deinit();
+                self.allocator.destroy(entry.value_ptr.*);
+                _ = self.limiters.remove(doomed);
+                self.allocator.free(doomed);
+                evicted += 1;
+            }
+        }
+        return evicted;
+    }
+
     /// Number of tracked limiters.
     pub fn count(self: *Self) usize {
         self.guard.lock();
@@ -229,6 +265,10 @@ pub const RateLimiterRegistry = struct {
 
         if (self.limiters.get(name)) |existing| return existing;
 
+        if (self.max_keys > 0 and self.limiters.count() >= self.max_keys) {
+            try self.evictLeastRecentlyUsedLocked();
+        }
+
         const key = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(key);
 
@@ -241,10 +281,62 @@ pub const RateLimiterRegistry = struct {
         return limiter;
     }
 
-    /// Pending: needs an allocPrint migration for Zig 0.17.
+    /// Caller holds the guard.
+    fn removeLocked(self: *Self, name: []const u8) bool {
+        const entry = self.limiters.fetchRemove(name) orelse return false;
+        self.allocator.free(entry.key);
+        entry.value.deinit();
+        self.allocator.destroy(entry.value);
+        return true;
+    }
+
+    /// Caller holds the guard. Drops the entry whose `last_used_at` is oldest —
+    /// the client least likely to notice its budget resetting.
+    fn evictLeastRecentlyUsedLocked(self: *Self) !void {
+        var oldest_name: ?[]const u8 = null;
+        var oldest_at: i64 = std.math.maxInt(i64);
+        var it = self.limiters.iterator();
+        while (it.next()) |entry| {
+            const used = entry.value_ptr.*.lastUsedAt();
+            if (used < oldest_at) {
+                oldest_at = used;
+                oldest_name = entry.key_ptr.*;
+            }
+        }
+        const victim = oldest_name orelse return;
+        _ = self.removeLocked(victim);
+    }
+
+    /// JSON snapshot of every tracked limiter — for an admin/debug endpoint.
+    /// Caller frees.
     pub fn generateReport(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
-        _ = self;
-        return allocator.dupe(u8, "generateReport (pending Zig 0.16 allocPrint migration)");
+        const Entry = struct {
+            name: []const u8,
+            max_tokens: u32,
+            refill_rate: u32,
+            available_tokens: u32,
+            last_used_at: i64,
+        };
+
+        self.guard.lock();
+        defer self.guard.unlock();
+
+        var entries = std.ArrayList(Entry).empty;
+        defer entries.deinit(allocator);
+
+        var it = self.limiters.iterator();
+        while (it.next()) |kv| {
+            const limiter = kv.value_ptr.*;
+            try entries.append(allocator, .{
+                .name = limiter.name,
+                .max_tokens = limiter.max_tokens,
+                .refill_rate = limiter.refill_rate,
+                // Reading a peer's counters needs its own guard.
+                .available_tokens = limiter.availableTokens(),
+                .last_used_at = limiter.lastUsedAt(),
+            });
+        }
+        return std.json.Stringify.valueAlloc(allocator, entries.items, .{});
     }
 };
 
@@ -253,7 +345,7 @@ pub const RateLimiterRegistry = struct {
 pub const SlidingWindowRateLimiter = struct {
     const Self = @This();
 
-    guard: Guard = .{},
+    guard: SpinLock = .{},
     allocator: std.mem.Allocator,
     name: []const u8,
     window_size_seconds: u64,
@@ -447,4 +539,95 @@ test "concurrent getOrCreate yields one limiter per key" {
     try std.testing.expectEqual(@as(usize, keys_n), registry.count());
     // 32 threads × 16 keys, 10 tokens each: admissions are capped per key.
     try std.testing.expectEqual(@as(u64, @as(u64, keys_n) * 10), Worker.seen.load(.monotonic));
+}
+
+test "registry max_keys bounds growth for per-client limiters" {
+    // Per-client keys come from the request (IP, user id). Without a bound the
+    // registry only grows, so a client that keeps inventing keys is a
+    // memory-growth vector — this pins that `max_keys` actually holds.
+    const allocator = std.testing.allocator;
+    var registry = RateLimiterRegistry.initWithCapacity(allocator, 5, 0, 3);
+    defer registry.deinit();
+
+    for (0..50) |i| {
+        var buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&buf, "client-{d}", .{i});
+        _ = try registry.getOrCreateForClient(key, 5, 0);
+    }
+    try std.testing.expectEqual(@as(usize, 3), registry.count());
+
+    // Re-reading a survivor must not create a second entry.
+    const again = try registry.getOrCreateForClient("client-49", 5, 0);
+    try std.testing.expect(again == (registry.get("client-49")).?);
+    try std.testing.expectEqual(@as(usize, 3), registry.count());
+}
+
+test "registry evicts the least recently used limiter" {
+    const allocator = std.testing.allocator;
+    var registry = RateLimiterRegistry.initWithCapacity(allocator, 10, 0, 2);
+    defer registry.deinit();
+
+    const old = try registry.getOrCreate("old");
+    const fresh = try registry.getOrCreate("fresh");
+    // Make `old` strictly older than `fresh` before the third insert.
+    _ = old.tryAcquire();
+    _ = fresh.tryAcquire();
+    _ = fresh.tryAcquire();
+
+    _ = try registry.getOrCreate("newcomer");
+
+    try std.testing.expectEqual(@as(usize, 2), registry.count());
+    try std.testing.expect(registry.get("newcomer") != null);
+    // The two most recently used survive; `old` is the victim.
+    try std.testing.expect(registry.get("fresh") != null);
+    try std.testing.expect(registry.get("old") == null);
+}
+
+test "registry remove and retain reclaim entries" {
+    const allocator = std.testing.allocator;
+    var registry = RateLimiterRegistry.init(allocator, 5, 0);
+    defer registry.deinit();
+
+    _ = try registry.getOrCreate("a");
+    _ = try registry.getOrCreate("b");
+    try std.testing.expectEqual(@as(usize, 2), registry.count());
+
+    // Explicit removal (e.g. on logout) frees the key and the limiter.
+    try std.testing.expect(registry.remove("a"));
+    try std.testing.expect(!registry.remove("a")); // idempotent
+    try std.testing.expectEqual(@as(usize, 1), registry.count());
+    // …and the key can come back with a fresh budget.
+    const readded = try registry.getOrCreate("a");
+    try std.testing.expectEqualStrings("a", readded.name);
+
+    // Both entries were created in the current second, so a 0-second window
+    // keeps them: `retain(0)` drops only what has been idle for a full second.
+    try std.testing.expectEqual(@as(usize, 0), registry.retain(0));
+    try std.testing.expectEqual(@as(usize, 2), registry.count());
+
+    // Backdate one entry instead of waiting on the wall clock: the sweep reads
+    // `last_used_at`, so this is the same code path a real idle limiter takes,
+    // minus a second of test time.
+    registry.get("a").?.last_used_at.store(Time.monotonicNowSeconds() - 100, .monotonic);
+    try std.testing.expectEqual(@as(usize, 1), registry.retain(0));
+    try std.testing.expectEqual(@as(usize, 1), registry.count());
+    try std.testing.expect(registry.get("a") == null);
+    try std.testing.expect(registry.get("b") != null);
+
+    // A generous window keeps freshly-used limiters.
+    _ = try registry.getOrCreate("c");
+    try std.testing.expectEqual(@as(usize, 0), registry.retain(3600));
+    try std.testing.expectEqual(@as(usize, 2), registry.count());
+}
+
+test "registry.max_keys = 0 keeps the unbounded behaviour" {
+    const allocator = std.testing.allocator;
+    var registry = RateLimiterRegistry.init(allocator, 5, 0);
+    defer registry.deinit();
+
+    for (0..20) |i| {
+        var buf: [16]u8 = undefined;
+        _ = try registry.getOrCreate(try std.fmt.bufPrint(&buf, "k{d}", .{i}));
+    }
+    try std.testing.expectEqual(@as(usize, 20), registry.count());
 }

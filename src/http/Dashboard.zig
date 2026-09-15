@@ -4,7 +4,7 @@ const Server = @import("../api/Server.zig");
 const Context = Server.Context;
 const HandlerFn = Server.HandlerFn;
 
-/// System information ([...])
+/// System information rendered by the dashboard (version, uptime, counters).
 pub var system_info = SystemInfo{
     .version = "0.8.0",
     .zig_version = "0.16.0",
@@ -25,7 +25,7 @@ pub const SystemInfo = struct {
     test_skipped: usize,
 };
 
-/// [...] Dashboard [...] HTTP Server
+/// Dashboard routes: the HTML pages and the JSON endpoints.
 /// Register the dashboard routes.
 ///
 /// Accepted form: **a pointer** to anything with
@@ -36,7 +36,7 @@ pub fn registerRoutes(server_or_group: anytype) !void {
     if (@typeInfo(T) != .pointer or !@hasDecl(@typeInfo(T).pointer.child, "get")) {
         @compileError("dashboardRoutes expects a *pointer* to something with `get(path, handler, user_data)` (e.g. `&server.group(\"\")`); got " ++ @typeName(T));
     }
-    // HTML [...]
+    // HTML page, served at both "/" and "/dashboard"
     try server_or_group.get("/", handleIndex, null);
     try server_or_group.get("/dashboard", handleIndex, null);
 
@@ -46,7 +46,7 @@ pub fn registerRoutes(server_or_group: anytype) !void {
     try server_or_group.get("/api/dashboard/system", handleSystem, null);
 }
 
-/// Dashboard HTML [...]
+/// Handle GET / and GET /dashboard — serve the dashboard HTML page.
 fn handleIndex(ctx: *Context) !void {
     try ctx.text(200, DASHBOARD_HTML);
 }
@@ -79,7 +79,7 @@ fn handleModules(ctx: *Context) !void {
     try ctx.json(200, json);
 }
 
-/// API: [...]
+/// API: aggregate stats — modules, routes, middleware, uptime and test counters.
 fn handleStats(ctx: *Context) !void {
     const now = Time.monotonicNowSeconds();
     const uptime = now - system_info.started_at;
@@ -118,7 +118,7 @@ fn handleSystem(ctx: *Context) !void {
     try ctx.json(200, json);
 }
 
-/// [...] Dashboard HTML (HTMX + Alpine.js + TailwindCSS CDN)
+/// Inline dashboard HTML page (HTMX + Alpine.js + TailwindCSS CDN).
 const DASHBOARD_HTML =
     \\<!DOCTYPE html>
     \\<html lang="en" class="dark">

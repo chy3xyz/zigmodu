@@ -1,16 +1,16 @@
 const std = @import("std");
 const ModuleInfo = @import("Module.zig").ModuleInfo;
 
-/// [...]Module boundary verifier
+/// Compile-time module boundary verifier
 /// Ensure modules follow architecture rules：
-/// 1. [...] API
+/// 1. Export only the public API
 /// 2. Do not directly access other module internals
-/// 3. [...]
+/// 3. Follow the naming conventions
 pub const ModuleBoundary = struct {
-    /// ValidationModule boundary
+    /// Validation module boundary.
     /// Check module definitions at compile time
     pub fn validate(comptime T: type) void {
-        // [...] info [...]
+        // Module must declare 'info'
         if (!@hasDecl(T, "info")) {
             @compileError("Module must declare 'pub const info' with module metadata");
         }
@@ -23,7 +23,7 @@ pub const ModuleBoundary = struct {
             @compileError("Module name cannot be empty");
         }
 
-        // [...] + [...]
+        // Check naming conventions (lowercase + underscore)
         for (info.name) |c| {
             if (std.ascii.isUpper(c)) {
                 @compileError("Module name must be lowercase: '" ++ info.name ++ "'");
@@ -33,7 +33,7 @@ pub const ModuleBoundary = struct {
             }
         }
 
-        // [...] init [...] deinit [...]
+        // Check the init and deinit function signatures
         if (@hasDecl(T, "init")) {
             const init_fn = @field(T, "init");
             const init_info = @typeInfo(@TypeOf(init_fn));
@@ -42,7 +42,7 @@ pub const ModuleBoundary = struct {
                 @compileError("Module 'init' must be a function");
             }
 
-            // init [...] !void
+            // init should return '!void'
             const return_type = init_info.@"fn".return_type.?;
             if (return_type != anyerror!void) {
                 compileWarn("Module 'init' should return '!void' for consistency");
@@ -63,7 +63,7 @@ pub const ModuleBoundary = struct {
             }
         }
 
-        // [...]Zig [...] pub [...]
+        // Check exports (optional: controlled by pub in Zig)
         // More checks can be added here
     }
 
@@ -87,36 +87,36 @@ pub const ModuleBoundary = struct {
                 @compileError("Module '" ++ info.name ++ "' depends on unknown module: '" ++ dep_name ++ "'");
             }
 
-            // Check circular dependencies[...]
-            // [...] Application [...]
+            // Check circular dependencies (simplified)
+            // A full implementation would check at the Application level
         }
     }
 
-    /// [...]Warn[...]
+    /// Compile-time warning (if supported)
     fn compileWarn(comptime msg: []const u8) void {
-        // Zig [...]Warn[...]
-        // [...]Error[...]
-        // [...]
+        // Zig has no standard compile-warning mechanism yet
+        // It could be simulated via compile errors or logging
+        // Not handled here for now
         _ = msg;
     }
 };
 
-/// [...]
-/// [...] Spring Modulith [...] OPEN/CLOSED
+/// Module type definition
+/// Similar to Spring Modulith's OPEN/CLOSED
 pub const ModuleType = enum {
-    /// [...]Allow other modules direct access
+    /// Open module: allow other modules direct access
     open,
 
-    /// [...] API [...]
-    /// [...]Validation[...]
+    /// Closed module: accessible only through its public API
+    /// Requires strict boundary validation
     closed,
 
-    /// [...]Internal use only for this module
-    /// [...]Module dependencies
+    /// Internal module: for use inside this module only
+    /// Must not be depended on by other modules
     internal,
 };
 
-/// [...]
+/// Extended module definition (optional)
 pub const ModuleDef = struct {
     name: []const u8,
     description: []const u8 = "",
@@ -126,8 +126,8 @@ pub const ModuleDef = struct {
     exposed_packages: ?[]const []const u8 = null,
 };
 
-/// [...]
-/// [...]
+/// Compile-time boundary check macro
+/// Usage:
 /// ```zig
 /// comptime {
 ///     checkModuleBoundary(@This(), .{
@@ -138,7 +138,7 @@ pub const ModuleDef = struct {
 pub fn checkModuleBoundary(comptime T: type, comptime opts: anytype) void {
     ModuleBoundary.validate(T);
 
-    // [...]
+    // Check the allowed dependencies
     if (@hasField(@TypeOf(opts), "allowed_deps")) {
         const info = @field(T, "info");
         inline for (info.dependencies) |dep| {
@@ -165,17 +165,17 @@ test "ModuleBoundary validation" {
         pub fn deinit() void {}
     };
 
-    // [...]Validation
+    // Compile-time validation
     comptime {
         ModuleBoundary.validate(ValidModule);
     }
 }
 
 test "ModuleBoundary catches invalid name" {
-    // [...]Tests[...]failure
+    // This test would fail to compile
     // const InvalidModule = struct {
     //     pub const info = ModuleInfo{
-    // .name = "InvalidModule",  // [...]Error
+    // .name = "InvalidModule",  // uppercase is an error
     //         .desc = "Invalid",
     //         .deps = &.{},
     //     };

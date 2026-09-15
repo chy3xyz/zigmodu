@@ -1,20 +1,20 @@
 const std = @import("std");
 
-/// [...] (Consumer-Driven Contract)
+/// Contract definition (Consumer-Driven Contract)
 pub const Contract = struct {
-    /// [...]
+    /// Contract name
     name: []const u8,
-    /// consume[...]
+    /// Consumer name
     consumer: []const u8,
-    /// [...]
+    /// Provider name
     provider: []const u8,
-    /// [...]
+    /// Contract version
     version: []const u8,
     /// Interaction type
     interaction_type: InteractionType,
-    /// [...]
+    /// Request matching rules
     request: RequestMatcher,
-    /// [...]
+    /// Expected response
     response: ResponseExpectation,
 
     pub const InteractionType = enum {
@@ -44,7 +44,7 @@ pub const Contract = struct {
     };
 };
 
-/// [...]Validation[...]
+/// Contract verification result
 pub const ContractVerificationResult = struct {
     contract_name: []const u8,
     passed: bool,
@@ -73,8 +73,8 @@ pub const ContractVerificationResult = struct {
     }
 };
 
-/// [...]Tests[...]
-/// consume[...]Tests (Pact-style)
+/// Contract test runner
+/// Consumer-driven contract testing (Pact-style)
 pub const ContractTestRunner = struct {
     const Self = @This();
 
@@ -128,13 +128,13 @@ pub const ContractTestRunner = struct {
         self.* = undefined;
     }
 
-    /// [...]
+    /// Register a contract
     pub fn registerContract(self: *Self, contract: Contract) !void {
         const owned = try self.cloneContract(contract);
         try self.contracts.append(self.allocator, owned);
     }
 
-    /// Validation[...]: [...]
+    /// Verify a contract: simulate the request and validate the response
     pub fn verifyContract(
         self: *Self,
         contract_name: []const u8,
@@ -147,7 +147,7 @@ pub const ContractTestRunner = struct {
         var failures = std.ArrayList(ContractVerificationResult.ContractFailure).empty;
         const start = @import("../core/Time.zig").monotonicNowSeconds();
 
-        // Validation[...]
+        // Validate the status code
         if (actual_status != contract.response.status) {
             try failures.append(self.allocator, .{
                 .field = try self.allocator.dupe(u8, "status"),
@@ -157,7 +157,7 @@ pub const ContractTestRunner = struct {
             });
         }
 
-        // Validation[...]
+        // Validate that the response body contains the expected string
         if (contract.response.body_contains) |expected| {
             if (!std.mem.containsAtLeast(u8, actual_body, 1, expected)) {
                 try failures.append(self.allocator, .{
@@ -169,7 +169,7 @@ pub const ContractTestRunner = struct {
             }
         }
 
-        // Validation[...]
+        // Validate the response headers
         for (contract.response.headers) |expected_header| {
             var found = false;
             for (actual_headers) |actual_header| {
@@ -208,7 +208,7 @@ pub const ContractTestRunner = struct {
         };
     }
 
-    /// [...]
+    /// Generate a contract report
     pub fn generateReport(self: *Self) ![]const u8 {
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);

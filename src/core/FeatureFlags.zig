@@ -3,26 +3,26 @@
 const std = @import("std");
 const Time = @import("../core/Time.zig");
 
-/// [...]
+/// One feature flag entry
 pub const FeatureFlag = struct {
-    /// [...]
+    /// Unique flag name
     key: []const u8,
-    /// [...]
+    /// Whether the flag is enabled
     enabled: bool,
-    /// [...]
+    /// Human-readable flag description
     description: []const u8,
-    /// [...]
+    /// Creation time
     created_at: i64,
-    /// [...]
+    /// Last modification time
     updated_at: i64,
-    /// [...] (0-100, 0=[...]CLOSED, 100=[...])
+    /// Rollout percentage (0-100, 0=fully CLOSED, 100=fully enabled)
     rollout_percent: u8 = 100,
-    /// [...]/[...] ID [...]
+    /// Whitelisted user/tenant ID values that always get the flag
     whitelist: []const []const u8 = &.{},
 };
 
-/// [...]
-/// [...]Feature flags[...]Support percentage rollout and allowlist
+/// Feature flag manager
+/// Runtime toggles that support percentage rollout and allowlist
 ///
 /// Usage:
 ///   var flags = FeatureFlagManager.init(allocator);
@@ -33,7 +33,7 @@ pub const FeatureFlagManager = struct {
 
     allocator: std.mem.Allocator,
     flags: std.StringHashMap(FeatureFlag),
-    /// [...]
+    /// Callbacks invoked after every successful set()
     change_listeners: std.ArrayList(*const fn ([]const u8, FeatureFlag) void),
 
     pub fn init(allocator: std.mem.Allocator) Self {
@@ -57,7 +57,7 @@ pub const FeatureFlagManager = struct {
         self.* = undefined;
     }
 
-    /// [...]
+    /// Creates or replaces a flag, then notifies the change listeners
     pub fn set(self: *Self, key: []const u8, enabled: bool, description: []const u8, rollout_percent: u8) !void {
         const now = Time.monotonicNowSeconds();
 
@@ -79,21 +79,21 @@ pub const FeatureFlagManager = struct {
 
         try self.flags.put(key_copy, flag);
 
-        // [...]
+        // Notify the change listeners
         for (self.change_listeners.items) |listener| {
             listener(key_copy, flag);
         }
     }
 
-    /// [...]publish[...]
+    /// Sets the whitelist used for gradual rollout publish
     pub fn setWhitelist(self: *Self, key: []const u8, whitelist: []const []const u8) !void {
         const flag = self.flags.getPtr(key) orelse return error.FlagNotFound;
 
-        // [...]
+        // Free the previously stored whitelist
         for (flag.whitelist) |w| self.allocator.free(w);
         self.allocator.free(flag.whitelist);
 
-        // [...]
+        // Copy the new whitelist into owned memory
         var new_whitelist = try self.allocator.alloc([]const u8, whitelist.len);
         for (whitelist, 0..) |entry, i| {
             new_whitelist[i] = try self.allocator.dupe(u8, entry);
@@ -102,27 +102,27 @@ pub const FeatureFlagManager = struct {
     }
 
     /// Check if flag is enabled for specific user
-    /// [...] enabled + rollout_percent + whitelist
+    /// Considers global enabled + rollout_percent + whitelist
     pub fn isEnabled(self: *Self, key: []const u8, user_id: ?[]const u8) bool {
         const flag = self.flags.get(key) orelse return false;
 
-        // [...]CLOSED
+        // Globally CLOSED
         if (!flag.enabled) return false;
 
-        // [...] ([...] rollout [...])
+        // Whitelist check (always wins, whatever the rollout percentage)
         if (user_id) |uid| {
             for (flag.whitelist) |w| {
                 if (std.mem.eql(u8, w, uid)) return true;
             }
         }
 
-        // 100% [...]
+        // 100% rollout
         if (flag.rollout_percent == 100) return true;
 
-        // 0% [...]
+        // 0% rollout
         if (flag.rollout_percent == 0) return false;
 
-        // [...]: [...] ID [...] hash [...]
+        // Percentage rollout: decided by the hash of the user ID
         if (user_id) |uid| {
             const hash = hashString(uid);
             const bucket = @mod(hash, @as(u32, 100));
@@ -132,18 +132,18 @@ pub const FeatureFlagManager = struct {
         return false;
     }
 
-    /// Get flag pure enabled state ([...]/[...])
+    /// Get flag pure enabled state (no rollout/whitelist check)
     pub fn isGloballyEnabled(self: *Self, key: []const u8) bool {
         const flag = self.flags.get(key) orelse return false;
         return flag.enabled;
     }
 
-    /// [...]
+    /// Gets a flag by key
     pub fn get(self: *Self, key: []const u8) ?FeatureFlag {
         return self.flags.get(key);
     }
 
-    /// [...]
+    /// Removes a flag and frees its owned memory; false if the key was absent
     pub fn remove(self: *Self, key: []const u8) bool {
         if (self.flags.fetchRemove(key)) |removed| {
             self.allocator.free(removed.key);
@@ -155,7 +155,7 @@ pub const FeatureFlagManager = struct {
         return false;
     }
 
-    /// [...]
+    /// Lists the keys of all flags
     pub fn list(self: *Self) ![]const []const u8 {
         var keys = std.ArrayList([]const u8).empty;
         var iter = self.flags.keyIterator();
@@ -177,19 +177,19 @@ pub const FeatureFlagManager = struct {
         return keys.toOwnedSlice(self.allocator);
     }
 
-    /// [...]
+    /// Registers a listener called on every flag change
     pub fn onChange(self: *Self, listener: *const fn ([]const u8, FeatureFlag) void) !void {
         try self.change_listeners.append(self.allocator, listener);
     }
 
-    /// [...]
+    /// Total number of flags
     pub fn count(self: *Self) usize {
         return self.flags.count();
     }
 
-    /// [...] JSON Content batch load feature flag
+    /// Batch loads feature flags from JSON Content
     pub fn loadFromJsonContent(self: *Self, content: []const u8) !void {
-        // [...]: {"flag_name": true, "flag2": false}
+        // Format: {"flag_name": true, "flag2": false}
         var i: usize = 0;
         while (i < content.len) : (i += 1) {
             while (i < content.len and (content[i] == ' ' or content[i] == '\n' or content[i] == '{' or content[i] == '}' or content[i] == ',')) : (i += 1) {}
@@ -216,7 +216,7 @@ pub const FeatureFlagManager = struct {
     }
 };
 
-/// [...] (for[...])
+/// Simple string hash (for rollout bucketing)
 fn hashString(s: []const u8) u32 {
     var hash: u32 = 5381;
     for (s) |c| {
@@ -248,7 +248,7 @@ test "FeatureFlagManager rollout percentage" {
 
     try ffs.set("canary", true, "Canary deployment", 50);
 
-    // [...] 100 [...]
+    // Count how many of 100 users get the flag
     var enabled_count: usize = 0;
     for (0..100) |i| {
         const user_id = try std.fmt.allocPrint(allocator, "user-{d}", .{i});
@@ -256,7 +256,7 @@ test "FeatureFlagManager rollout percentage" {
         if (ffs.isEnabled("canary", user_id)) enabled_count += 1;
     }
 
-    // [...] 50% [...]
+    // Expect roughly 50% of users to be enabled
     try std.testing.expect(enabled_count > 20 and enabled_count < 80);
 }
 

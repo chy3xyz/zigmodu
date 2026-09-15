@@ -90,7 +90,7 @@ pub const PasswordEncoder = struct {
     }
 };
 
-/// [...] (Zig 0.16 timing_safe.eql [...]/[...])
+/// Constant-time slice comparison, used in place of Zig 0.16 timing_safe.eql.
 fn timingSafeSliceEql(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     var acc: u8 = 0;

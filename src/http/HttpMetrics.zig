@@ -1,4 +1,5 @@
 const std = @import("std");
+const SpinLock = @import("../core/SpinLock.zig").SpinLock;
 
 /// HTTP Metrics Middleware — auto-collect request count and latency
 ///
@@ -44,12 +45,10 @@ pub const HttpMetricsCollector = struct {
     max_duration_seconds: f64 = 0,
     /// In-flight request count
     in_flight: u64 = 0,
-    /// 共享于连接线程之间 → 计数必须持锁。临界区仅算术，无 yield，自旋即可。
-    mutex: std.Io.Mutex = .init,
-
-    fn lock(self: *Self) void {
-        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
-    }
+    /// Shared across connection threads, so counters must be guarded. The
+    /// critical section is arithmetic only; `SpinLock` spins briefly then
+    /// yields, so a burst of requests cannot pin a core here.
+    mutex: SpinLock = .{},
 
     const StatusBucket = enum(usize) {
         info = 0, // 1xx
@@ -66,15 +65,15 @@ pub const HttpMetricsCollector = struct {
 
     /// Mark a request started (thread-safe).
     pub fn beginRequest(self: *Self) void {
-        self.lock();
-        defer self.mutex.state.store(.unlocked, .release);
+        self.mutex.lock();
+        defer self.mutex.unlock();
         self.in_flight += 1;
     }
 
     /// Mark a request finished and record its status/duration (thread-safe).
     pub fn endRequest(self: *Self, status: u16, duration_seconds: f64) void {
-        self.lock();
-        defer self.mutex.state.store(.unlocked, .release);
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.in_flight > 0) self.in_flight -= 1;
         self.request_count += 1;
         self.total_duration_seconds += duration_seconds;
@@ -94,8 +93,8 @@ pub const HttpMetricsCollector = struct {
 
     /// Record one request (backward-compatible: counters only, no in_flight).
     pub fn recordRequest(self: *Self, status: u16, duration_seconds: f64) void {
-        self.lock();
-        defer self.mutex.state.store(.unlocked, .release);
+        self.mutex.lock();
+        defer self.mutex.unlock();
         self.request_count += 1;
         self.total_duration_seconds += duration_seconds;
         self.min_duration_seconds = @min(self.min_duration_seconds, duration_seconds);
@@ -114,24 +113,24 @@ pub const HttpMetricsCollector = struct {
 
     /// Average latency
     pub fn avgDuration(self: *Self) f64 {
-        self.lock();
-        defer self.mutex.state.store(.unlocked, .release);
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.request_count == 0) return 0;
         return self.total_duration_seconds / @as(f64, @floatFromInt(self.request_count));
     }
 
     /// Request rate (req/s — caller provides elapsed_seconds)
     pub fn requestRate(self: *Self, elapsed_seconds: f64) f64 {
-        self.lock();
-        defer self.mutex.state.store(.unlocked, .release);
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (elapsed_seconds == 0) return 0;
         return @as(f64, @floatFromInt(self.request_count)) / elapsed_seconds;
     }
 
     /// Snapshot current counts (thread-safe).
     pub fn snapshot(self: *Self) struct { request_count: u64, status_counts: [6]u64, in_flight: u64, min_duration_seconds: f64, max_duration_seconds: f64 } {
-        self.lock();
-        defer self.mutex.state.store(.unlocked, .release);
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return .{
             .request_count = self.request_count,
             .status_counts = self.status_counts,
@@ -143,8 +142,8 @@ pub const HttpMetricsCollector = struct {
 
     /// Generate human-readable report
     pub fn generateReport(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
-        self.lock();
-        defer self.mutex.state.store(.unlocked, .release);
+        self.mutex.lock();
+        defer self.mutex.unlock();
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(allocator);
 

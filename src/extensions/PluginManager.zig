@@ -52,16 +52,26 @@ pub const PluginManager = struct {
         self.* = undefined;
     }
 
-    /// Load a plugin from file
+    /// Whether `loadPlugin` can actually load executable code. Always `false`:
+    /// Zig has no stable dynamic-loading support, so `loadPlugin` only records
+    /// the name. Branch on this instead of assuming a plugin became active.
+    pub fn dynamicLoadingSupported() bool {
+        return false;
+    }
+
+    /// Register a plugin for bookkeeping. **No code is loaded** — see
+    /// `dynamicLoadingSupported()`. A warning is logged on every call.
     pub fn loadPlugin(self: *Self, name: []const u8, path: []const u8) !void {
         if (self.plugins.contains(name)) {
             return error.PluginAlreadyLoaded;
         }
 
-        // File existence check (stub — dynamic loading deferred)
-
-        // Note: In Zig, dynamic library loading at runtime is limited
-        // This is a framework for future implementation when better DLL support is available
+        // Registration only — no shared library is loaded, so the plugin's
+        // code never runs. Zig has no stable dynamic-loading story, so this is
+        // not a temporary gap. Say so out loud instead of registering a name
+        // that looks active: callers that need real extension points should use
+        // a module + `Application` wiring instead.
+        std.log.warn("[PluginManager] loadPlugin('{s}') registers '{s}' for bookkeeping only — no code was loaded (dynamic loading is not supported; see dynamicLoadingSupported())", .{ name, path });
 
         const name_copy = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(name_copy);
