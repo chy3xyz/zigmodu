@@ -20,6 +20,7 @@
 | 文件上传 / 内容校验 / 限额顺序 | `docs/BEST_PRACTICES.md`「上传与 multipart」 |
 | Worker / 邮箱 / 定时器 / RingBuffer（v0.16 运行时） | `docs/RUNTIME.md`（定位、契约、背压语义、兼容 10 条） |
 | 架构检查 / 依赖图 / `zmodu doctor` | `docs/ARCHITECTURE.md`「Architecture engine」+ `src/core/ModuleGraph.zig` |
+| 集群成员读侧（请求路径选节点/健康度） | `docs/DISTRIBUTED.md`「集群读侧」+ `zigmodu.ClusterView`（`acquire`/`release`，别读写入侧的哈希表） |
 | 观测 / 告警 / Grafana | `docs/OBSERVABILITY.md`（黄金信号 + 阈值 + dashboard JSON；夜间 `zig build soak` 见 CI `soak` job） |
 | 部署拓扑（TLS 边车/探针/守护） | `examples/production-deploy/`（nginx · Envoy · k8s · systemd） |
 | Extract / SSE / Testkit / Outbox | `docs/FRAMEWORK_BACKLOG.md` |
@@ -86,6 +87,8 @@ defer app.stop();
 | 一个事件多个消费者且发布方不能等：`runtime.HotBus(E,N)` + 启动期 `subscribe(...)` + `freeze()` | 把 L0 扇出接到 `app.eventBus`（L1 会分配、可慢），或在热路径上自己遍历订阅者加锁 |
 | 模块依赖靠 `build(.{...})` 的编译期图检查拦住（环/缺失/自依赖/重名，报错带环路径） | 用 `@import` 跨模块直接引用对方内部文件（`zmodu doctor` 会报纠缠 + 文件:行） |
 | 交付前跑 `zmodu doctor`（阻断项 exit 1，可直接进 CI） | 声明无法执行的架构规则（如"domain 不许 import db"却只在文档里写 —— 编译期看不到 import，交 `doctor`） |
+| 集群读侧：`view.acquire()` → 用 → `release()`；选节点 `view.pick(key)`（rendezvous） | 在 handler 里直接读 `ClusterMembership` 的可变表（那是维护循环的状态），或为读它加锁 |
+| 发布是单写者整份替换；`error.ReadersBusy` 当作"下个 tick 再发" | 把 `ReadersBusy` 当致命错误重试到死（读者卡住时该跳过这次发布） |
 | 取参数：路由占位 `pathParam`；form/query 用 `requestParam`（form 优先）或 `nestedParam`（点号路径） | 以为 `ctx.param` 会回退到 query/form（它只读路由占位符） |
 | 应用 root 接 `pub const panic = zmodu.panicHook`（panic 时输出当前请求 METHOD/path） | 请求路径 `catch unreachable` / `@panic`（audit b19–b21 拦截） |
 | 生产配置 `max_connections` + `header_timeout_ms`（连接洪泛/slowloris）；发布前 `zig build soak` | 只设 `request_timeout_ms` 就当防住了慢连接（它只管 handler 阶段） |

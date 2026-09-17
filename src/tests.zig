@@ -63,6 +63,7 @@ test "compile all source files" {
 
     // Cluster & Distributed (integration tests - these compile successfully)
     _ = @import("core/ClusterMembership.zig");
+    _ = @import("cluster/ClusterView.zig");
     _ = @import("core/cluster/FailureDetector.zig");
     _ = @import("core/cluster/NetworkTransport.zig");
     _ = @import("core/cluster/PeerDiscovery.zig");

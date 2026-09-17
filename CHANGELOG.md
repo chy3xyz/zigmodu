@@ -1,5 +1,31 @@
 # Changelog
 
+## [Unreleased]
+
+> **0 breaking**（v0.19 = 集群读侧）。纯新增：`ClusterView` 与既有 DistributedEventBus /
+> ClusterMembership 并存，后者一行未动。
+
+### Added
+- **`zigmodu.ClusterView(N, G)`（`src/cluster/ClusterView.zig`）** —— 集群状态在**请求路径**上的安全读法：
+  - **引用计数的成员快照**：写者（维护循环，单写者）`publish()` 整份替换；读者 `acquire()` → 用 →
+    `release()`，全程无锁、无分配、无 GC。写者在复用槽位前等该槽读者清零，等不到返回
+    `error.ReadersBusy` 而不是覆盖活数据（发布是秒级活动、读是微秒级活动，等是便宜的方向）。
+  - **`pick(key)` / `pickRanked(key, rank)`**：rendezvous（最高随机权重）哈希选节点，主 + 至多 3 个备份。
+    选它而不是 `core/eventbus/Partitioner.zig` 的一致性哈希环：环要重建、读要加锁，而 rendezvous
+    无状态无锁，"成员变化只迁移它拥有的 key"这条性质同样成立；环仍留在批量写的事件总线路径。
+  - `error.TooManyMembers`（超容量拒绝，计数）、`stats()`（publishes / generation / members /
+    healthy / over_capacity / readers_busy）、`peek()`（诊断用，明确标注"可能被回收"）。
+  - 6 项测试：发布即拥有字符串（调用方之后改原 buffer 不影响快照）、rendezvous 稳定性（同集合换序不换主、
+    新增节点只迁移一部分 key）、不健康节点永不入选（全不健康 → null，而不是错的答案）、
+    **并发**（20k 次发布 × 3 读者 → 0 次不一致读；写者按设计报 Busy 且 publishes+busy 计数守恒）、
+    分代环复用后当前视图不丢、超容量拒绝且旧视图完好。
+
+### Docs
+- `docs/DISTRIBUTED.md`：新增「集群读侧：`ClusterView`」——为什么请求路径不该读写入侧的哈希表、
+  回收没有 GC 靠引用计数、为什么用 rendezvous 而不是环、以及**本版刻意不做**的四件事
+  （不发明协议 / 不做跨节点一致性 / Raft 与分布式事务仍 experimental / `weight` 留位未使用）。
+- `AGENTS.md`：文件地图 + 两行 DO/DON'T（读侧 acquire/release；`ReadersBusy` 当作"下个 tick 再发"）。
+
 ## [0.18.0] - 2026-09-17
 
 > **0 breaking**（v0.18 = 架构引擎）。唯一可能让工程"突然编译不过"的是新增的编译期图检查 ——

@@ -120,6 +120,10 @@ pub const WALConfig = @import("core/eventbus/WAL.zig").WALConfig;
 // 5. DISTRIBUTED
 // ============================================================
 pub const ClusterBootstrap = @import("core/cluster/ClusterBootstrap.zig").ClusterBootstrap;
+/// Read side of a cluster: refcounted membership snapshots + rendezvous routing.
+pub const ClusterView = @import("cluster/ClusterView.zig").ClusterView;
+pub const ClusterMember = @import("cluster/ClusterView.zig").Member;
+pub const ClusterSnapshot = @import("cluster/ClusterView.zig").Snapshot;
 pub const ClusterMembership = @import("core/ClusterMembership.zig").ClusterMembership;
 pub const SagaOrchestrator = @import("core/SagaOrchestrator.zig").SagaOrchestrator;
 pub const SagaLog = @import("core/SagaOrchestrator.zig").SagaLog;

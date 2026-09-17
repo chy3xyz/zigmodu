@@ -67,3 +67,40 @@ var cluster_b = try ClusterMembership.init(allocator, io, "node-b", addr_b, &bus
 try debus_b.subscribe("order.created", handleOrderCreated);
 try debus_a.publish("order.created", order_data);
 ```
+
+## 集群读侧：`ClusterView`（v0.19+）
+
+写入侧（`ClusterMembership` / `FailureDetector` / `PeerDiscovery`）是**维护循环**的状态：gossip 到达、
+心跳丢失、状态翻转。**请求路径不该读它** —— 那是一个由维护循环拥有的可变哈希表，为它加锁又是错误
+的取舍（数据每几秒才变一次，而请求是微秒级的）。
+
+```zig
+var view = zigmodu.ClusterView(64, 4).init(allocator);
+defer view.deinit();
+
+// 维护循环（单写者）：整份发布，读者要么看到旧的、要么看到新的，绝不看到半份
+try view.publish(&.{ .{ .id = "node-a", .address = "10.0.0.1:8080" }, ... });
+
+// 请求路径：引用计数的快照，无锁
+const snap = view.acquire();
+defer view.release(snap);
+const owner = view.pick(key) orelse return error.NoHealthyNode;   // rendezvous 哈希
+const backup = view.pickRanked(key, 1);                           // 故障转移用
+```
+
+**回收没有 GC 也要说清楚**：只有"分代环"是不够的 —— 慢读者仍可能读到写者已经绕回的槽位
+（实测：20 万次读里 1888 次不一致）。所以读侧是**引用计数**：`acquire()` 拿一份带计数的快照，
+`release()` 归还；写者在复用槽位前**等该槽读者清零**，等不到就返回 `error.ReadersBusy` 而不是覆盖活数据。
+发布是秒级的维护活动、读是微秒级的请求活动 —— 等，是便宜的那个方向。
+
+**选节点用 rendezvous 哈希**（`hash(key ‖ id)` 取最大），而不是 `core/eventbus/Partitioner.zig` 的
+一致性哈希环：环需要在每次成员变化时重建、且读它要加锁；rendezvous 无状态、无存储、无锁，
+而"成员变化时只有它拥有的 key 迁移"这条要紧的性质同样成立。环仍留在事件总线那种**批量写**的场景。
+
+**本版刻意不做**（避免把未验证的东西当能力卖）：
+
+- 不发明新协议：成员传播/心跳仍走既有 `NetworkTransport` / 既有 gossip 消息格式。
+- 不做跨节点一致性：需要强一致的编排继续用 Postgres（见 `docs/BEST_PRACTICES.md`「分布式建议」）。
+- `RaftElection` / `DistributedTransaction` 仍是 **experimental**：前者未接入服务发现，后者缺持久化日志。
+- 快照的 `weight` 字段已带但 `pick` 未使用（留位，避免以后改快照格式）。
+
