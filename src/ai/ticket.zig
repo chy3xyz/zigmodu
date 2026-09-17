@@ -5,7 +5,7 @@
 //! the send gate is where a human-in-the-loop approval lives.
 
 const std = @import("std");
-const SqlxBackend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend;
+const SqlxBackend = @import("../data.zig").SqlxBackend;
 const SkillContext = @import("skill.zig").SkillContext;
 const OutboxPublisher = @import("../messaging/OutboxPublisher.zig").OutboxPublisher;
 const reporter = @import("reporter.zig");
@@ -108,7 +108,7 @@ pub const TicketFlow = struct {
 
 test "TicketFlow triages with context and writes to outbox" {
     const allocator = std.testing.allocator;
-    var client = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     _ = try client.exec(

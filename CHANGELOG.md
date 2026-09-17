@@ -1,5 +1,20 @@
 # Changelog
 
+## [Unreleased]
+
+> **0 breaking**（v0.20.2 = AI 与驱动层解耦完成）。纯 import 替换，无行为变化。
+
+### Changed
+- **`src/ai/**` 不再直接 import 驱动层**：56 处（`sqlx/sqlx.zig` 30 + `persistence/backends/**` 26，
+  分布在 21 个文件）全部改为 `@import("../data.zig")`。`data.sqlx` 与 `data.SqlxBackend` 本来就是同一批
+  模块的 re-export，所以这是**类型同一性不变、行为不变**的机械替换 —— 整个迁移用一个替换规则完成，
+  全量测试 1085 全绿（含 AI 的持久化/审批/预算等用例）。
+- 诚实记录：这 56 处里绝大多数是**测试脚手架**（`:memory:` 客户端与 backend 的构造），
+  真实生产耦合小于这个数字；但一条替换就能清零，没有理由留着。
+- `src/test/AiBoundary.zig` 的两个冻结上限从 30 / 26 调到 **0 / 0**，等于对驱动层 import 的绝对禁止：
+  再新增一处就编译失败。`docs/AI_BOUNDARY.md` 的表格同步为迁移前/后对照，抽包条件由
+  "两个计数到 0" 变成"保持为 0"。
+
 ## [0.20.1] - 2026-09-17
 
 > **0 breaking**（v0.20.1 = 把 AI 抽包的边界变成机器检查）。纯新增测试 + 文档。

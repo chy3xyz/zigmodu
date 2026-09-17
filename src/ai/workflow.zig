@@ -742,14 +742,14 @@ test "workflow toMermaid renders linear and DAG graphs" {
 
 test "workflow approval step gates on human decision" {
     const allocator = std.testing.allocator;
-    var client = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     _ = try client.exec(
         "CREATE TABLE event_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, payload TEXT, status INTEGER DEFAULT 0, tenant_id INTEGER, retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 5, created_at INTEGER, updated_at INTEGER, error_message TEXT)",
         &.{},
     );
-    var backend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend{ .allocator = allocator, .client = &client };
+    var backend = @import("../data.zig").SqlxBackend{ .allocator = allocator, .client = &client };
     const Policy = struct {
         fn decide(_: std.mem.Allocator, _: *SkillContext, _: []const u8, amount: i64, _: usize, _: []const u8, _: []const u8, _: *[]const u8) anyerror!@import("approval.zig").ApprovalDecision {
             return if (amount <= 1000) .approved else .escalated;
@@ -788,14 +788,14 @@ test "workflow approval gate resumes after the human approves" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var client = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     _ = try client.exec(
         "CREATE TABLE event_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, payload TEXT, status INTEGER DEFAULT 0, tenant_id INTEGER, retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 5, created_at INTEGER, updated_at INTEGER, error_message TEXT)",
         &.{},
     );
-    var backend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend{ .allocator = allocator, .client = &client };
+    var backend = @import("../data.zig").SqlxBackend{ .allocator = allocator, .client = &client };
 
     const EscalateAlways = struct {
         fn decide(_: std.mem.Allocator, _: *SkillContext, _: []const u8, _: i64, _: usize, _: []const u8, _: []const u8, _: *[]const u8) anyerror!@import("approval.zig").ApprovalDecision {
@@ -839,14 +839,14 @@ test "workflow approval gate resumes after the human approves" {
 
 test "workflow approval gate stops a DAG run at pending_human" {
     const allocator = std.testing.allocator;
-    var client = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     _ = try client.exec(
         "CREATE TABLE event_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, payload TEXT, status INTEGER DEFAULT 0, tenant_id INTEGER, retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 5, created_at INTEGER, updated_at INTEGER, error_message TEXT)",
         &.{},
     );
-    var backend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend{ .allocator = allocator, .client = &client };
+    var backend = @import("../data.zig").SqlxBackend{ .allocator = allocator, .client = &client };
     const Escalate = struct {
         fn decide(_: std.mem.Allocator, _: *SkillContext, _: []const u8, _: i64, _: usize, _: []const u8, _: []const u8, _: *[]const u8) anyerror!@import("approval.zig").ApprovalDecision {
             return .escalated;
@@ -879,10 +879,10 @@ test "workflow approval gate stops a DAG run at pending_human" {
 
 test "workflow records run audit automatically" {
     const allocator = std.testing.allocator;
-    var client = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
-    var backend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend{ .allocator = allocator, .client = &client };
+    var backend = @import("../data.zig").SqlxBackend{ .allocator = allocator, .client = &client };
     var store = @import("run_audit.zig").RunAuditStore.init(allocator, &backend);
     try store.migrate();
 

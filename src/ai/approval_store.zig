@@ -5,7 +5,7 @@
 //! memory version.
 
 const std = @import("std");
-const SqlxBackend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend;
+const SqlxBackend = @import("../data.zig").SqlxBackend;
 const SkillContext = @import("skill.zig").SkillContext;
 const approval_api = @import("approval_api.zig");
 
@@ -153,7 +153,7 @@ pub fn queuedEscalationPersistent(
 
 test "PersistentApprovalQueue push, list and resolve across queries" {
     const allocator = std.testing.allocator;
-    var client = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     var backend = SqlxBackend{ .allocator = allocator, .client = &client };

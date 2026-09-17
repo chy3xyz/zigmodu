@@ -3,10 +3,10 @@
 //! is written to the outbox for audit and downstream automation.
 
 const std = @import("std");
-const SqlxBackend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend;
+const SqlxBackend = @import("../data.zig").SqlxBackend;
 const SkillContext = @import("skill.zig").SkillContext;
 const OutboxPublisher = @import("../messaging/OutboxPublisher.zig").OutboxPublisher;
-const sqlx = @import("../sqlx/sqlx.zig");
+const sqlx = @import("../data.zig").sqlx;
 
 /// A rule whose SQL returns a row when the risk factor applies; each match
 /// adds `score` to the subject's risk score.
@@ -97,7 +97,7 @@ pub const RiskReview = struct {
 
 test "RiskReview scores rules and applies threshold decisions" {
     const allocator = std.testing.allocator;
-    var client = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     _ = try client.exec(

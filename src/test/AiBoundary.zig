@@ -1,20 +1,17 @@
 //! AI boundary — the machine-checked half of `docs/AI_BOUNDARY.md`.
 //!
 //! `src/ai/` is the largest optional surface in the tree (~12k lines) and the one
-//! most likely to become its own package. Extraction is blocked by exactly one
-//! thing: AI code that imports the **driver layer** directly
-//! (`sqlx/sqlx.zig`, `persistence/backends/**`) instead of going through the
-//! `data` domain seam. Measured when this test was written: **30** direct
-//! `sqlx/sqlx.zig` imports and **26** direct `persistence/backends` imports across
-//! 21 files.
-//!
-//! Fixing all of them is a refactor; *stopping the rot* is a test. So:
+//! most likely to become its own package. It used to reach into the **driver
+//! layer** directly (`sqlx/sqlx.zig` 30×, `persistence/backends/**` 26× across 21
+//! files) instead of the `data` domain seam — measured when this test was written,
+//! then migrated in v0.20.2. Both counts are now **0** and the ratchet keeps them
+//! there:
 //!
 //! * the reverse direction (core → ai) is enforced **absolutely**: `src/` outside
 //!   `ai/` may not import `ai/` at all, except the single root export;
-//! * the forward coupling is **ratcheted**: the counts below are a frozen ceiling
-//!   and may only go down. Adding one more direct driver import fails the build,
-//!   which is what makes "we'll clean it up later" true instead of aspirational.
+//! * the forward direction allows only domain seams (`data.zig`, `http.zig`,
+//!   `core/Time`, `http/Sse`, `messaging/`, …) — the driver layer is off limits,
+//!   and the frozen ceilings below are zero.
 //!
 //! The allowlist is deliberately generous where the seam is legitimate (SSE for
 //! streaming, `core/Time`, the `data`/`http` domain barrels, messaging for the
@@ -23,9 +20,12 @@
 
 const std = @import("std");
 
-/// Frozen ceilings. Lower them as the refactor lands; never raise them.
-const baseline_direct_sqlx = 30;
-const baseline_direct_backends = 26;
+/// Frozen ceilings, now **zero**: the migration in v0.20.2 replaced every direct
+/// driver import with the `data` seam in one mechanical pass (all 56 of them were
+/// the same two import expressions, and `data.sqlx` is literally the same module,
+/// so type identity — and behaviour — was preserved). Any new one fails the build.
+const baseline_direct_sqlx = 0;
+const baseline_direct_backends = 0;
 
 /// Import targets `src/ai/**` may use without any further justification: they are
 /// domain seams, not driver internals.

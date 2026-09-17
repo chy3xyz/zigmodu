@@ -265,6 +265,10 @@ fn CyclePath(comptime max_nodes: usize) type {
 /// DFS with colours (0 = unvisited, 1 = on stack, 2 = done). Returns the cycle
 /// path (`a -> b -> a`) when one exists, `len == 0` otherwise.
 fn findCycle(nodes: []const Node) CyclePath(nodes.len) {
+    // The DFS + name lookups are O(modules² · name_len) comptime branches;
+    // large catalogs (17+ modules with multi-dep graphs) exceed the default
+    // 1000 backwards-branch budget.
+    @setEvalBranchQuota(100_000);
     if (nodes.len == 0) return .{};
 
     var colour: [nodes.len]u8 = @splat(0);

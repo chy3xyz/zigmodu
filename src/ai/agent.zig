@@ -460,10 +460,10 @@ test "AgentResult deinit frees owned answer" {
 
 test "Agent recordRunAudit persists agent runs" {
     const allocator = std.testing.allocator;
-    var client = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
-    var backend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend{ .allocator = allocator, .client = &client };
+    var backend = @import("../data.zig").SqlxBackend{ .allocator = allocator, .client = &client };
     var store = run_audit_mod.RunAuditStore.init(allocator, &backend);
     try store.migrate();
 

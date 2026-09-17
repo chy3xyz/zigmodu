@@ -3,10 +3,10 @@
 //! writeback). Pair with `zigmodu.ai.trigger` for scheduled checks.
 
 const std = @import("std");
-const SqlxBackend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend;
+const SqlxBackend = @import("../data.zig").SqlxBackend;
 const SkillContext = @import("skill.zig").SkillContext;
 const OutboxPublisher = @import("../messaging/OutboxPublisher.zig").OutboxPublisher;
-const sqlx = @import("../sqlx/sqlx.zig");
+const sqlx = @import("../data.zig").sqlx;
 
 /// A rule whose SQL returns violation rows (e.g. failed orders, low stock).
 pub const AlertRule = struct {

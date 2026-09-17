@@ -8,11 +8,11 @@
 //! subject/amount/request description, never policy logic.
 
 const std = @import("std");
-const SqlxBackend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend;
+const SqlxBackend = @import("../data.zig").SqlxBackend;
 const SkillContext = @import("skill.zig").SkillContext;
 const SkillRegistry = @import("skill.zig").SkillRegistry;
 const OutboxPublisher = @import("../messaging/OutboxPublisher.zig").OutboxPublisher;
-const sqlx = @import("../sqlx/sqlx.zig");
+const sqlx = @import("../data.zig").sqlx;
 
 /// What happened at one approval step.
 pub const ApprovalDecision = enum { approved, escalated, rejected };

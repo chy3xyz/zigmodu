@@ -5,7 +5,7 @@
 //! complementing the in-memory `AgentAuditLog` with durable history.
 
 const std = @import("std");
-const SqlxBackend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend;
+const SqlxBackend = @import("../data.zig").SqlxBackend;
 const Time = @import("../core/Time.zig");
 const SkillContext = @import("skill.zig").SkillContext;
 
@@ -87,7 +87,7 @@ pub const RunAuditStore = struct {
     ) !void {
         var where = std.ArrayList(u8).empty;
         defer where.deinit(allocator);
-        var args = std.ArrayList(@import("../sqlx/sqlx.zig").Value).empty;
+        var args = std.ArrayList(@import("../data.zig").sqlx.Value).empty;
         defer args.deinit(allocator);
         var first = true;
         if (kind) |k| {
@@ -138,7 +138,7 @@ pub const RunAuditStore = struct {
 
 test "RunAuditStore records, filters and lists run history" {
     const allocator = std.testing.allocator;
-    var client = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     var backend = SqlxBackend{ .allocator = allocator, .client = &client };

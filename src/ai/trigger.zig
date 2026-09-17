@@ -9,11 +9,11 @@
 
 const std = @import("std");
 const SkillContext = @import("skill.zig").SkillContext;
-const SqlxBackend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend;
+const SqlxBackend = @import("../data.zig").SqlxBackend;
 const OutboxPublisher = @import("../messaging/OutboxPublisher.zig").OutboxPublisher;
 const Scheduler = @import("../scheduler/Cron.zig").Scheduler;
 const Expression = @import("../scheduler/Cron.zig").Expression;
-const sqlx = @import("../sqlx/sqlx.zig");
+const sqlx = @import("../data.zig").sqlx;
 const Time = @import("../core/Time.zig");
 
 pub const TriggerResult = struct {

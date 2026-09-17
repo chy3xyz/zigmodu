@@ -11,8 +11,8 @@
 //!     JSON (row-capped, read-only).
 
 const std = @import("std");
-const SqlxBackend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend;
-const sqlx = @import("../sqlx/sqlx.zig");
+const SqlxBackend = @import("../data.zig").SqlxBackend;
+const sqlx = @import("../data.zig").sqlx;
 const SkillRegistry = @import("skill.zig").SkillRegistry;
 const SkillContext = @import("skill.zig").SkillContext;
 const OutboxPublisher = @import("../messaging/OutboxPublisher.zig").OutboxPublisher;

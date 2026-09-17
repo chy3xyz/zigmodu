@@ -3,8 +3,8 @@
 //! outbox writeback) or call `generate` directly from an API route.
 
 const std = @import("std");
-const SqlxBackend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend;
-const sqlx = @import("../sqlx/sqlx.zig");
+const SqlxBackend = @import("../data.zig").SqlxBackend;
+const sqlx = @import("../data.zig").sqlx;
 
 pub const ReportQuery = struct {
     name: []const u8,

@@ -267,14 +267,14 @@ test "ApprovalQueue push/resolve lifecycle" {
 
 test "queuedEscalation pushes escalated runs into the queue" {
     const allocator = std.testing.allocator;
-    var client = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     _ = try client.exec(
         "CREATE TABLE event_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, payload TEXT, status INTEGER DEFAULT 0, tenant_id INTEGER, retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 5, created_at INTEGER, updated_at INTEGER, error_message TEXT)",
         &.{},
     );
-    var backend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend{ .allocator = allocator, .client = &client };
+    var backend = @import("../data.zig").SqlxBackend{ .allocator = allocator, .client = &client };
 
     var queue = ApprovalQueue.init(allocator, std.testing.io);
     defer queue.deinit();
@@ -308,10 +308,10 @@ test "ApprovalApi mounts with both in-memory and persistent queues" {
     var mem_api = MemApi{ .queue = &mem_queue };
 
     // Persistent queue + API module.
-    var client = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
-    var backend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend{ .allocator = allocator, .client = &client };
+    var backend = @import("../data.zig").SqlxBackend{ .allocator = allocator, .client = &client };
     var persistent = @import("approval_store.zig").PersistentApprovalQueue.init(allocator, &backend);
     try persistent.migrate();
     const PersApi = ApprovalApi(@import("approval_store.zig").PersistentApprovalQueue);
@@ -338,14 +338,14 @@ test "ApprovalApi mounts with both in-memory and persistent queues" {
 
 test "approval.request skill submits and reports the chain status" {
     const allocator = std.testing.allocator;
-    var client = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
     defer client.deinit();
     try client.connect();
     _ = try client.exec(
         "CREATE TABLE event_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, payload TEXT, status INTEGER DEFAULT 0, tenant_id INTEGER, retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 5, created_at INTEGER, updated_at INTEGER, error_message TEXT)",
         &.{},
     );
-    var backend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend{ .allocator = allocator, .client = &client };
+    var backend = @import("../data.zig").SqlxBackend{ .allocator = allocator, .client = &client };
     var queue = ApprovalQueue.init(allocator, std.testing.io);
     defer queue.deinit();
 
