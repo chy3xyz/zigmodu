@@ -1,0 +1,1 @@
+.{ .name = .runtime_workers, .version = "0.1.0", .fingerprint = 0x74af79d5bbb7e184, .minimum_zig_version = "0.17.0", .dependencies = .{ .zigmodu = .{ .path = "../.." } }, .paths = .{ "build.zig", "build.zig.zon", "src" } }

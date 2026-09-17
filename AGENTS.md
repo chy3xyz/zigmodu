@@ -18,6 +18,7 @@
 | SQLx 驱动链接 | `docs/SQLX_DRIVERS.md`（`-Ddb=` / `.db=`） |
 | 生产接线 / 背压 / 编排 | `docs/ROUTE_TABLE.md` §7.4 + `docs/BEST_PRACTICES.md`「韧性」 |
 | 文件上传 / 内容校验 / 限额顺序 | `docs/BEST_PRACTICES.md`「上传与 multipart」 |
+| Worker / 邮箱 / 定时器 / RingBuffer（v0.16 运行时） | `docs/RUNTIME.md`（定位、契约、背压语义、兼容 10 条） |
 | 观测 / 告警 / Grafana | `docs/OBSERVABILITY.md`（黄金信号 + 阈值 + dashboard JSON；夜间 `zig build soak` 见 CI `soak` job） |
 | 部署拓扑（TLS 边车/探针/守护） | `examples/production-deploy/`（nginx · Envoy · k8s · systemd） |
 | Extract / SSE / Testkit / Outbox | `docs/FRAMEWORK_BACKLOG.md` |
@@ -76,6 +77,10 @@ defer app.stop();
 | handler 问门户：`ctx.permissionMatches("portal:user\|portal:shop")`（与路由声明同表达式） | handler 重写门户检查只认一侧（OR meta 会被窄化成 403） |
 | 上传：`http.extractMultipart(ctx, mp)` + `http.UploadGuard.checkForm(&form, …)` | 只查扩展名 / 只信 `Content-Type` / 放行 SVG（脚本容器 → stored-XSS） |
 | 上传限额：`Multipart.Config.forBodyLimit(n)` 与 `Server.Config.max_body_size` 用同一个数 | 只设 `Multipart.Config.max_total_bytes`（服务端 8MB 先 413，它永不触发） |
+| 高并发/热路径：`rt.spawn(W, init, cap)` + 邮箱（状态单线程独占，无锁）· 完整见 `docs/RUNTIME.md` | 多个线程共享可变状态再加锁；把 L0 热事件塞进 `app.eventBus`（那是 L1 业务事件通道） |
+| 队列满时必须显式处理：`catch error.Full` → 丢弃/合并/退避，并读 `stats().dropped_full` | 让队列"自己长大"（邮箱容量是 comptime 有界的，`error.Full` 是唯一出口） |
+| 定时器只投消息：`handle.after(ms, msg)`（在 worker 线程上处理） | 在 ticker 线程上跑业务回调（会破坏 worker 的单线程状态所有权） |
+| 运行时是 opt-in：不调用 `app.runtime()` 就零线程、零定时器（v0.16 起） | 为普通 CRUD API 引入 worker（多一层，没有收益） |
 | 取参数：路由占位 `pathParam`；form/query 用 `requestParam`（form 优先）或 `nestedParam`（点号路径） | 以为 `ctx.param` 会回退到 query/form（它只读路由占位符） |
 | 应用 root 接 `pub const panic = zmodu.panicHook`（panic 时输出当前请求 METHOD/path） | 请求路径 `catch unreachable` / `@panic`（audit b19–b21 拦截） |
 | 生产配置 `max_connections` + `header_timeout_ms`（连接洪泛/slowloris）；发布前 `zig build soak` | 只设 `request_timeout_ms` 就当防住了慢连接（它只管 handler 阶段） |

@@ -1,5 +1,62 @@
 # Changelog
 
+## [Unreleased]
+
+> **0 breaking**：本版只新增（v0.16 = 运行时底座，见 `docs/dev/todo3.1.md` 的兼容策略）。
+> 不调用 `app.runtime()` 的应用，线程数、生命周期、行为与 v0.15.x 完全一致。
+
+### Added
+- **ZigModu Runtime（`zigmodu.runtime` + `app.runtime()`）** —— `Application`（架构单元：Module/DI/
+  Lifecycle/EventBus/HTTP）旁边新增一条**可选**执行通道（执行单元：Worker/Mailbox/RingBuffer/
+  TimerWheel），共享同一个 io / config / 可观测性。定位与契约见 `docs/RUNTIME.md`。
+  - `RingBuffer(T, N)`：单生产者/单消费者**无锁**环（各自只读对方指针，无 CAS），N 必须 2 的幂。
+  - `MpscRing(T, N)`：Vyukov 有界多生产者队列；**N ≥ 2 由编译期强制**（N=1 时序列号无法区分
+    "空"与"未消费"，会覆盖未消费消息 —— 实测 `len` 涨到 2）。
+  - `Mailbox(T, N)`：有界 + spin-then-block 交接。`send` 满即 `error.Full`（背压对生产者可见），
+    `sendBlocking(msg, timeout)` 用延迟换不丢，`close()` 唤醒所有等待者并允许排空。
+    无丢唤醒的保证写在实现里：消费者在**持锁**下复查空、生产者在**持锁**下 signal。
+  - `Wheel(Payload)`：分层时间轮（5 层 × 64 槽 × 10ms，最长 ~124 天），O(1) 插入/取消；
+    长停摆（ticker 被饿死）走 **O(pending) 扫描**而不是逐槽空转；`cancelWith` 带 drop 钩子，
+    取消与触发都必须能释放 payload（否则取消即泄漏）。
+  - `ObjectPool(T)`：定容对象池，`acquire` **不分配**、耗尽返回 null；`release` 校验归属并拒绝重复归还。
+    自旋锁而非无锁栈：索引上的 Treiber 栈有 ABA 窗口会把同一对象发两次，而"发两次"没有测试能稳定复现。
+  - `Clock`：`.monotonic`（生产）/ `.manual`（测试：推进一小时定时器不需要睡觉）。
+  - `Runtime` + Worker 契约（comptime 探测，热路径无 vtable）：`pub const Message = T` + `handle(self, msg, ctx)`
+    走消息驱动；`run(self, ctx)` 自带循环；`init`/`deinit` 为可选生命周期钩子。
+    `rt.spawn(W, init, cap)` → `Handle`：`send` / `sendBlocking` / `stop` / `join` / `after(ms, msg)` / `stats`。
+    `rt.start()` 起 ticker（或 `rt.tick()` 自驱）、`rt.shutdown()` 请求停止 → 唤醒 → join。
+  - `RuntimeStats`：`workers / running / messages_sent / messages_received / messages_dropped /
+    handler_errors / timer_fires / timer_lag_max_ms`；每 worker 明细在 `handle.stats()`。
+- `Application.runtime()`：**首次调用才创建**（不调用 = 零线程、零定时器）；`stop()` 先
+  `runtime.shutdown()`（join 所有 worker）**再**停模块 —— worker 可能正在调模块服务；
+  `deinit()` 释放。`Application` 的既有 API 一字未动。
+- `examples/runtime-workers/`：行情源 → 订单簿 worker → 风控 worker + 快照定时器的流水线。演示
+  ①状态单线程独占（**全文件无锁**）②有界背压（5000 条里 4645 条在生产者侧被削掉、队列零增长）
+  ③定时器只投消息（在 worker 线程上处理，不在 ticker 上跑业务）④优雅停机（屏障消息排水 + join）。
+  CI 会构建**并运行**它。
+- 31 项运行时测试，含真并发：4 生产者 × 5000 条零丢失、20 万条 SPSC 序贯、对象池 8 线程
+  acquire/release 收支平衡、以及唯一一条真正启动 ticker 线程的端到端定时器用例。
+
+### Fixed
+写这套原语时被测试抓出的四个真 bug（都记在代码注释里，防止回退）：
+- `Wheel.cancel` 不更新**槽头指针** → 取消槽内首个定时器后，下一次 `advance` 会遍历已释放节点
+  （SafeAllocator 报 `write after free`）。现在 `unlink` 会修头指针，另有"取消中间节点"的回归用例。
+- `MpscRing` 在 **capacity = 1** 时**静默覆盖未消费消息**（生产者写 `pos+1`、消费者写 `pos+capacity`，
+  同一个数值无法区分状态）→ 编译期拒绝，并在文档写明替代方案。
+- `Runtime.running` 把"ticker 已启动"与"运行时存活"混为一谈 → 不调用 `start()`（文档承认的受支持用法）
+  时，`ctx.stopped()` 立刻为真，run-owned worker 一行没跑就退出（实测 `ticks = 0`）。
+  拆成 `alive` 与 `ticker_running`。
+- `timer_fires` 在**投递之后**才自增（计数器落后于自身效果 = 竞态）→ 先计数再投递；
+  `timer_lag_max_ms` 此前从未被写入（假字段）→ 由每个 timer 的 deadline 真实计算。
+- 另：`Mailbox.dropped_full` 不再被 `sendBlocking` 的内部重试污染（只统计非阻塞 `send` 的拒绝）。
+
+### Docs
+- **`docs/RUNTIME.md`**（新）：定位（Modulith + Runtime）、兼容 10 条、worker 三种声明方式、
+  原语取舍表（含"为什么池用锁而不是 Treiber"）、背压三规则、事件分层 L0/L1/L2（**不替换现有
+  EventBus**）、何时不要用运行时、可观测性、v0.16 → 1.0 路线图。
+- `AGENTS.md`：文件地图加 `docs/RUNTIME.md`；DO/DON'T 加四行（worker 与邮箱、`error.Full` 必须显式处理、
+  定时器只投消息、运行时是 opt-in 别给 CRUD 加 worker）。
+
 ## [0.15.47] - 2026-09-15
 
 ### Changed

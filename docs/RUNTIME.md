@@ -1,0 +1,171 @@
+# ZigModu Runtime —— 第二条高速通道
+
+> 定位：**Modulith（架构单元）+ Runtime（执行单元）**。
+> 目标句式：*a compile-time modular, worker-oriented, event-driven runtime for Zig*。
+> 版本口径：运行时代码自 **v0.16.0** 起（`zigmodu.runtime`）。参考 `docs/dev/todo3.md`（方向）与
+> `docs/dev/todo3.1.md`（兼容策略）。
+
+## 1. 为什么是"第二条通道"而不是重写
+
+`Application` / `Module` / `DI` / `EventBus` / HTTP 已经跑在很多项目上，它们是**架构资产**。
+运行时要做的是补上另一件正交的事：**一个线程拥有的状态、一个邮箱拥有交接、一个时间轮拥有延迟**。
+
+```
+                     ZigModu
+                        │
+        ┌───────────────┴───────────────┐
+        │                               │
+   Application（不变）             Runtime（新增·可选）
+   Module / DI / Lifecycle          Worker / Mailbox
+   EventBus / Outbox                RingBuffer / TimerWheel
+   HTTP / ORM / Redis               ObjectPool / Clock
+        │                               │
+        └───────────────┬───────────────┘
+                        │
+              共享 io / config / observability
+```
+
+**没有 Actor 就不需要 Actor。** 普通 Web SaaS 继续写 `Application → Module → Service`；
+只有在"减少共享状态、减少锁、明确状态所有权"能带来真实收益的负载上（WebSocket 扇出、
+行情/订单簿、游戏房间、IoT 汇聚、AI Agent 循环）才引入 worker。
+
+## 2. 兼容原则（写进契约，逐条可验证）
+
+```
+ZigModu Compatibility Principles
+
+ 1. Existing Module API remains stable.
+ 2. Existing Application API remains stable.
+ 3. Existing DI API remains stable.
+ 4. Existing Application EventBus remains stable.
+ 5. New Runtime APIs are additive.
+ 6. Hot-path runtime is opt-in.
+ 7. Distributed runtime is opt-in.
+ 8. Actor runtime is opt-in.
+ 9. Existing applications require no migration.
+10. Breaking changes are reserved for 1.0.
+```
+
+落到实现上：
+
+- `app.runtime()` 返回 `!*Runtime`，**首次调用才创建**；不调用 = 零线程、零定时器、行为与 v0.15 完全一致。
+- `Application.stop()` 先 `runtime.shutdown()`（join 所有 worker）**再**停模块 —— worker 可能在调模块服务，顺序不能反。
+- `Application.deinit()` 释放 runtime。
+- 运行时**不碰** `Application.events`：`app.eventBus(T)` 仍是业务事件通道。事件分层（L0 hot / L1 app / L2 distributed）
+  见 §6，L0 是 `MpscRing`，L1 是现有 EventBus，两者互不替换。
+
+## 3. Worker：一个结构体，三种声明方式
+
+```zig
+const OrderBook = struct {
+    pub const Message = Delta;            // 声明消息类型 → 运行时拥有接收循环
+    bids: std.ArrayList(Level) = .empty,
+    asks: std.ArrayList(Level) = .empty,
+
+    pub fn init(self: *@This(), ctx: anytype) !void { ... }     // 可选，先跑一次
+    pub fn handle(self: *@This(), msg: Delta, ctx: anytype) !void {
+        // 只有这个线程碰 self.bids/self.asks —— 没有锁是因为没有共享
+    }
+    pub fn deinit(self: *@This()) void { ... }                  // 可选，最后跑一次
+};
+```
+
+| 声明 | 运行时如何驱动 | 何时用 |
+|------|--------------|--------|
+| `pub const Message = T` + `pub fn handle(self, msg, ctx)` | **消息驱动**：运行时循环 `recv → handle`，`stop()`/`close()` 结束 | 绝大多数：worker 的输入就是消息 |
+| `pub fn run(self, ctx)` | **自带循环**：跑一次，自行 `while (!ctx.stopped())` | 拉取型（轮询外部源）、需要精确控制节拍的循环 |
+| `pub fn init` / `pub fn deinit` | 生命周期钩子，前后各一次 | 打开/关闭资源 |
+
+```zig
+const rt = try app.runtime();
+const book = try rt.spawn(OrderBook, .{}, 256);   // 256 = 邮箱容量（comptime）
+try book.send(.{ .bid = 101, .qty = 2 });          // 满 → error.Full（背压可见）
+try book.after(50, .{ .tick = true });             // 50ms 后投一条消息给同一个 worker
+book.stop();                                       // 请求结束（join 由 shutdown/join 负责）
+```
+
+**契约要点**
+
+- `ctx` 是 `WorkerContext(W, capacity)`，用 `anytype` 接 —— worker 作者不必写出容量参数。
+- `ctx.stopped()`：`stop()` 或运行时关闭。**"没启动 ticker" 不算停止**（自己驱动 `tick()` 是受支持用法）。
+- 定时器**只投消息**，不在 ticker 线程上跑你的代码：`ctx.handle.after(...)` 是唯一的延迟入口，
+  这样 worker 的状态依然单线程独占。
+- `handle`/`run` 返回的错误被记录并计数（`stats().handler_errors`），**不会**停掉 worker；
+  panic 不可捕获，会带走进程 —— 热路径上的 panic 见 `docs/BEST_PRACTICES.md`「韧性」。
+
+## 4. 原语与取舍
+
+| 类型 | 并发形态 | 关键性质 |
+|------|---------|---------|
+| `RingBuffer(T, N)` | 1 生产者 / 1 消费者 | 无 CAS（各自只读对方指针）；N 必须 2 的幂 |
+| `MpscRing(T, N)` | N 生产者 / 1 消费者 | Vyukov 有界队列；**N ≥ 2**（N=1 时序号无法区分"空"与"未消费"，编译期拒绝） |
+| `Mailbox(T, N)` | N 生产者 / 1 消费者 | 有界 + 阻塞；`send` 满即 `error.Full`，`sendBlocking` 换延迟；`close()` 唤醒等待者 |
+| `Wheel(Payload)` | 单线程驱动 | 分层时间轮，O(1) 插入/取消；10ms 粒度、5 层、最长 ~124 天；长停摆走 O(pending) 扫描 |
+| `ObjectPool(T)` | 多线程 | 定容 + 自旋锁；`acquire` **不分配**，耗尽返回 null（把流量高峰变成"削峰"而不是 OOM） |
+| `Clock` | 值类型 | `.monotonic`（生产）/ `.manual`（测试：不睡觉就能推动一小时定时器） |
+
+**为什么池用自旋锁而不是无锁栈**：Treiber 栈在索引上有一个 ABA 窗口，会把同一个对象发给两个调用者 ——
+那是任何测试都不稳定复现的数据竞争。临界区只有一次指针交换，锁的代价远小于"正确性靠运气"。
+真出现争用，正确做法是**按线程分片**，不是把锁去掉。
+
+## 5. 背压语义（这是运行时的核心承诺）
+
+```
+生产者 ──send──▶ 邮箱（有界 N）──recv──▶ worker
+   │                  │
+   │ 满               │ 空
+   ▼                  ▼
+error.Full        阻塞等待（recv(0)）或超时（recv(ms)）
+（由调用方决定丢弃/合并/退避）
+```
+
+三条规则：
+
+1. **队列永不增长**。容量是 comptime 的，`error.Full` 是唯一出口 —— 内存曲线可预测。
+2. **丢弃必须可见**。`stats().dropped_full` 计数，`RuntimeStats` 汇总，接 Prometheus 只是时间问题。
+3. **消息是值**。`T` 按值拷贝进队列；要传堆对象就传指针并显式约定所有权，别让 `T` 偷偷拥有内存。
+
+## 6. 事件分层（L0 / L1 / L2）
+
+| 层 | 载体 | 语义 | 用于 |
+|----|------|------|------|
+| **L0** | `MpscRing` / `Mailbox` + worker | 有界、零分配、单线程消费 | 行情、订单簿、Tick、房间广播、内部命令 |
+| **L1** | `app.eventBus(T)`（现有，不动） | 进程内、类型化、可订阅 | `UserCreated` / `OrderCreated` / 领域事件 |
+| **L2** | Kafka / NATS / Outbox | 跨进程、至少一次 | 跨服务、跨机房 |
+
+L0 与 L1 是**两个通道，不是一个**：不要把热路径塞进 L1（它是为可读性与可靠性设计的），
+也不要把业务事件塞进 L0（它没有订阅模型、不落盘）。
+
+## 7. 何时不要用运行时
+
+- CRUD、后台管理、普通 API：模块 + service 已经够了，worker 只是多一层。
+- 需要"同一份状态被多个线程读"：那是共享内存问题，先考虑冻结快照（`FrozenMap`）或把状态搬进 worker 再问。
+- 需要跨进程顺序：用 Kafka/NATS（L2），别自己写 RPC。
+
+## 8. 可观测性
+
+```zig
+const s = rt.stats();
+// workers / running / messages_sent / messages_received
+// messages_dropped / handler_errors / timer_fires / timer_lag_max_ms
+```
+
+`timer_lag_max_ms` 是"定时器迟到的最大值"：ticker 被饿死、或某个 `post` 太慢时会变大 ——
+它比"定时器数量"更能说明运行时是否健康。每个 worker 的明细在 `handle.stats()`。
+
+## 9. 路线图（本文件随之更新）
+
+| 版本 | 内容 | 状态 |
+|------|------|------|
+| **v0.16.0** | `RingBuffer` / `MpscRing` / `Mailbox` / `ObjectPool` / `Clock` / `Wheel` / `Runtime` + `Worker` + `app.runtime()` | ✅ 本文档 |
+| v0.17 | Actor（`Actor(State)` = worker + 监督 + 生命周期）、HotEventBus（L0 的发布/订阅视图）、Sequencer | 计划 |
+| v0.18 | 编译期架构引擎：依赖图、架构规则、`zmodu graph`、`zmodu doctor` | 计划 |
+| v0.19 | Cluster / Shard / Service Discovery（**适配** QUIC/gRPC/NATS，不发明协议） | 计划 |
+| v0.20 | Workflow（状态机 + Saga + 补偿 + 检查点 + 恢复） | 计划 |
+| v0.21 | Agent Runtime（Identity / Memory / Skills / Permissions / Budget 一等化） | 计划 |
+| 1.0 | API 收敛、命名统一、deprecated 清理 | 计划 |
+
+## 10. 最小示例
+
+见 `examples/runtime-workers/`：一条"行情源 → 订单簿 worker → 风控 worker → 快照定时器"的流水线，
+既演示 worker/邮箱/定时器，也演示背压（`error.Full` 时的合并策略）与优雅停机。

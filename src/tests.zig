@@ -140,6 +140,9 @@ test "compile all source files" {
     _ = @import("test/PermissionMatch.zig");
     _ = @import("test/RouteTemplate.zig");
 
+    // Runtime (v0.16): ring/mailbox/timer/pool/worker primitives
+    _ = @import("runtime.zig");
+
     // Tracing
     _ = @import("tracing/DistributedTracer.zig");
     _ = @import("tracing/OtlpExporter.zig");

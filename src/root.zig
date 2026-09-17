@@ -70,6 +70,7 @@ pub const http = @import("http.zig");
 pub const data = @import("data.zig");
 pub const security = @import("security.zig");
 pub const observability = @import("observability.zig");
+pub const runtime = @import("runtime.zig");
 pub const migration = @import("migration/Migration.zig");
 
 /// Legacy flat aliases for backwards compatibility — prefer the domain

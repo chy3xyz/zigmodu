@@ -12,6 +12,7 @@ const Documentation = @import("core/Documentation.zig");
 const ModuleRegistry = @import("core/ModuleRegistry.zig").ModuleRegistry;
 const ModuleRuntime = @import("core/ModuleRuntime.zig").ModuleRuntime;
 const EventRegistry = @import("core/EventRegistry.zig").EventRegistry;
+const rt_mod = @import("runtime.zig");
 const ModuleContext = @import("core/ModuleContext.zig").ModuleContext;
 const Container = @import("di/Container.zig").Container;
 
@@ -64,6 +65,10 @@ pub const Application = struct {
     /// frozen once startup completes — afterwards `get` is a lock-free read
     /// safe for concurrent handlers.
     services: Container,
+    /// Opt-in execution runtime (workers / mailboxes / timers), created on first
+    /// `runtime()` call and shut down by `stop()`. Null means "this app never
+    /// used it" — the module lifecycle is unchanged either way.
+    runtime_state: ?*rt_mod.Runtime = null,
 
     pub const State = enum {
         initialized,
@@ -116,6 +121,11 @@ pub const Application = struct {
     pub fn deinit(self: *Self) void {
         if (self.state == .started) {
             self.stop();
+        }
+        if (self.runtime_state) |rt| {
+            rt.deinit();
+            self.allocator.destroy(rt);
+            self.runtime_state = null;
         }
         if (self.registry) |*r| r.deinit();
         self.events.deinit();
@@ -179,6 +189,11 @@ pub const Application = struct {
             return; // Not started, nothing to stop
         }
 
+        // Workers before modules: a worker may still be calling module services,
+        // and `shutdown` joins them, so this also means "no runtime thread is
+        // running while teardown happens".
+        if (self.runtime_state) |rt| rt.shutdown();
+
         // Call shutdown hooks in reverse registration order
         var i: usize = self.shutdown_hooks.items.len;
         while (i > 0) {
@@ -225,6 +240,23 @@ pub const Application = struct {
     }
 
     /// Get or create the shared thread-safe bus for event type `T`.
+    /// The execution runtime, created on first use. Additive: an app that never
+    /// asks for it behaves exactly as before (no threads, no timers).
+    ///
+    /// ```zig
+    /// const rt = try app.runtime();
+    /// const worker = try rt.spawn(OrderBook, .{ .symbol = "BTC/USDT" });
+    /// try worker.send(.{ .price = 101 });
+    /// ```
+    pub fn runtime(self: *Self) !*rt_mod.Runtime {
+        if (self.runtime_state) |rt| return rt;
+        const rt = try self.allocator.create(rt_mod.Runtime);
+        errdefer self.allocator.destroy(rt);
+        rt.* = rt_mod.Runtime.init(self.allocator, self.io, .monotonic);
+        self.runtime_state = rt;
+        return rt;
+    }
+
     pub fn eventBus(self: *Self, comptime T: type) !*@import("core/EventBus.zig").ThreadSafeEventBus(T) {
         return self.events.bus(T);
     }
