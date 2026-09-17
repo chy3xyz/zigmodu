@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.24.0] - 2026-09-17
 
 > **⚠️ 破坏性变更**：删除 7 个示例文件/目录（`examples/testing/`、`examples/deprecated/`、`examples/cluster-demo/`、
 > `examples/example_tests.zig`）—— 内容已分别并入 `examples/basic/src/tests.zig`、`examples/distributed/README.md`，
