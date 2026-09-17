@@ -1,5 +1,47 @@
 # Changelog
 
+## [Unreleased]
+
+> **0 breaking**（v0.17 = 运行时的监督与扇出，仍是纯新增）。v0.16 的 worker 语义一字未改：
+> `rt.spawn(...)` 依旧"记录错误并继续"，新语义只在 `spawnActor` 上生效。
+
+### Added
+- **Actor 监督（`rt.spawnActor(W, init, cap, Supervision)`）** —— Actor 是"加了失败策略的 Worker"，
+  不引入第二套生命周期：
+  - `Supervision.strategy = .restart | .stop`：`.restart`（worker 语义，默认）只记录继续；
+    `.stop` 首个错误即停（fail-fast，邮箱关闭、线程退出）。
+  - `max_errors` / `window_ms`：**窗口错误预算**。窗口内超过 N 次即停，`0` = 不限。
+    一个"每条消息都出错"的 actor 在"只记录"语义下会永远烧掉一个核而外部看起来健康 —— 预算把
+    它变成"停止 + 一条 warn + 计数"。
+  - `pub fn onError(self, err, ctx) Supervision.Strategy`（可选声明）：**现场决策并覆盖配置策略**
+    （例如只有 `error.Fatal` 才停）。
+  - 停止后 `stats().stopped_by_supervisor == true`、邮箱关闭（生产者拿到 `error.Closed`），**不会**
+    退化成静默丢弃；`WorkerStats` 新增 `errors_in_window` / `stopped_by_supervisor`。
+  - 诚实边界（写在 `docs/RUNTIME.md` §3b）：本版**不**实现"用干净状态重启 actor"（需要初始状态副本或
+    `reset` 钩子，语义未定就不给）；父子关系目前只体现为**停止顺序**——`shutdown` 按 spawn 逆序 join，
+    所以"先父后子"即"子先停"，真正的监督树留给后续版本。
+- **`runtime.HotBus(E, N)`（L0 扇出）** —— 一个事件、多个消费者，而发布方不能等：
+  - `subscribe(*Handle(W, cap))` 接 worker（消息类型不符是**编译期**错误）、`subscribeSink(Sink)`
+    接非 worker 消费者（指标、广播器、测试记录器）。
+  - `freeze()` 之后 `publish` 是一次**无锁、无分配**的切片遍历；未 freeze 就发布返回
+    `error.NotFrozen`（接线 bug 应大声失败而不是竞争）。
+  - 满的订阅者**丢该条并计数**（`stats().dropped`），慢消费者既不能拖慢发布方也不能吃光内存。
+- **`runtime.Sequencer`** —— 无锁单调序列：`next()` / `nextBatch(n)`（原子预留一段连续值）/
+  `peek()` / `advanceTo()`（只前进，不回退，供快照回放）。**不是时钟**：只在进程生命期内可比较。
+- 12 项新测试：Actor 四条（worker 语义保持 / fail-fast / 预算耗尽 / `onError` 覆盖两个方向）、
+  HotBus 五条（扇出顺序、慢订阅者丢弃并计数、未 freeze 与 freeze 后订阅、容量、真 worker 邮箱打满）、
+  Sequencer 三条（唯一性、并发下区间不相交、`advanceTo` 不回退）。
+- `examples/runtime-workers` 扩成 v0.17 形态：订单簿把每条 delta 发到 `HotBus`，扇出给
+  **故意慢的审计 worker** + **O(1) 的指标 sink**，并跑一个必然失败、被预算停掉的 actor。实测
+  `subscribers=2 published=261 delivered=330 dropped=192`（审计丢、指标一条不漏、订单簿从未阻塞）、
+  `attempts=4 stopped_by_supervisor=true mailbox_closed=true`。CI 仍会构建并运行它。
+
+### Docs
+- `docs/RUNTIME.md`：新增 §3b（Actor 与监督，含"为什么不实现带状态重启"）、§3c（HotBus 两条规则
+  与实测数据）、worker 契约表加 `onError`、原语表加 `Sequencer`/`HotBus`、路线图把 v0.17 标为已落地
+  并把"真监督树/跨节点监督"明确列为**未承诺**。
+- `AGENTS.md`：DO/DON'T 再加两行（持续失败用预算而不是永远记录；L0 扇出用 `HotBus` 而不是 L1 EventBus）。
+
 ## [0.16.0] - 2026-09-17
 
 > **0 breaking**：本版只新增（v0.16 = 运行时底座，见 `docs/dev/todo3.1.md` 的兼容策略）。

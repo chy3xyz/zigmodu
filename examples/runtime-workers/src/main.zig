@@ -11,6 +11,12 @@
 //! 1. **State ownership** — `OrderBook.bids/asks` and `Risk.exposure` are touched by
 //!    exactly one thread. There is no mutex anywhere in this file, and that is the
 //!    point: the mailbox is the only hand-off.
+//! 1b. **Fan-out (v0.17 `HotBus`)** — the same delta also goes to an audit worker,
+//!    wired at startup then `freeze()`d, so publishing is a lock-free slice walk and
+//!    a slow audit trail drops instead of stalling the book.
+//! 1c. **Supervision (v0.17 Actor)** — `FaultyReporter` errors on every message with a
+//!    3-error budget: the runtime stops it and closes its mailbox, instead of logging
+//!    forever. That is the difference between `spawn` and `spawnActor`.
 //! 2. **Bounded backpressure** — the feed pushes faster than the book drains and
 //!    gets `error.Full`; it *coalesces* (drops the delta, keeps the last price)
 //!    rather than growing a queue. `stats().dropped_full` records the choice.
@@ -42,6 +48,7 @@ const OrderBook = struct {
     /// a sleep, or waiting for a count that dropped messages can never reach).
     done: bool = false,
     risk: *runtime.Handle(Risk, 256),
+    bus: *runtime.HotBus(Delta, 4),
     io: std.Io = undefined,
     allocator: std.mem.Allocator = undefined,
 
@@ -56,11 +63,15 @@ const OrderBook = struct {
         if (d.bid) self.bids += 1 else self.asks += 1;
 
         // Hand off to risk *by value*: no shared state, no lock.
-        self.risk.send(.{ .price = d.price, .qty = d.qty, .bid = d.bid }) catch |err| switch (err) {
+        self.risk.send(d) catch |err| switch (err) {
             // Bounded queue: "risk is behind" is a decision, not an accident.
             error.Full, error.Timeout => self.coalesced += 1,
             error.Closed => {},
         };
+
+        // Fan out to audit + metrics. `publish` never blocks and never allocates:
+        // subscribers that cannot keep up drop this delta and count it.
+        _ = self.bus.publish(d) catch {};
 
         // Every 50 deltas, ask the runtime to wake us for a snapshot.
         if ((self.bids + self.asks) % 50 == 0) {
@@ -101,6 +112,59 @@ const Risk = struct {
     }
 };
 
+/// Fan-out target: keeps the last N prices as an "audit trail". Slow by design
+/// (it appends), which is what makes the drop counter move.
+const Audit = struct {
+    pub const Message = Delta;
+    kept: usize = 0,
+    last_price: i64 = 0,
+
+    pub fn handle(self: *@This(), d: Delta, ctx: anytype) anyerror!void {
+        _ = ctx;
+        if (d.price == -1) return;
+        self.kept += 1;
+        self.last_price = d.price;
+        var spins: usize = 0;
+        while (spins < 200_000) : (spins += 1) std.atomic.spinLoopHint(); // pretend work
+    }
+};
+
+/// A non-worker subscriber: anything with a `deliver` thunk can ride the bus
+/// (metrics today, a websocket broadcaster tomorrow).
+const MetricsSink = struct {
+    deltas: u64 = 0,
+    last_price: i64 = 0,
+
+    fn sink(self: *@This()) runtime.HotBus(Delta, 4).Sink {
+        return .{
+            .ctx = @ptrCast(self),
+            .deliver = struct {
+                fn deliver(ctx: *anyopaque, d: Delta) bool {
+                    const m: *MetricsSink = @ptrCast(@alignCast(ctx));
+                    if (d.price != -1) {
+                        m.deltas += 1;
+                        m.last_price = d.price;
+                    }
+                    return true; // always accepts: it does O(1) work
+                }
+            }.deliver,
+        };
+    }
+};
+
+/// An actor that always fails, to show the supervisor's budget in action.
+const FaultyReporter = struct {
+    pub const Message = Delta;
+    attempts: u32 = 0,
+
+    pub fn handle(self: *@This(), d: Delta, ctx: anytype) anyerror!void {
+        _ = d;
+        _ = ctx;
+        self.attempts += 1;
+        return error.UpstreamUnavailable;
+    }
+};
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
@@ -118,10 +182,25 @@ pub fn main(init: std.process.Init) !void {
 
     const risk = try rt.spawn(Risk, .{}, 256);
 
+    // L0 fan-out (v0.17): wired during startup, frozen before traffic. The book
+    // publishes every accepted delta; a slow subscriber is *dropped and counted*
+    // rather than allowed to slow the book down.
+    var bus = runtime.HotBus(Delta, 4).init();
+    const audit = try rt.spawn(Audit, .{}, 64);
+    try bus.subscribe(audit); // a real worker (slow, deliberately)
+    var metrics = MetricsSink{};
+    try bus.subscribeSink(metrics.sink()); // a plain sink, no worker needed
+    bus.freeze();
+
+    // Supervised actor (v0.17): 3 errors inside the window means "stop", not
+    // "log forever" — the difference between spawnActor and spawn.
+    const faulty = try rt.spawnActor(FaultyReporter, .{}, 32, .{ .max_errors = 3, .window_ms = 60_000 });
+    for (0..10) |_| faulty.send(.{ .price = 1, .qty = 1, .bid = true }) catch break;
+
     // The book needs the risk handle, so it is spawned with a placeholder and
     // wired in `init` — hence the two-step here (a real app would pass a
     // service locator or spawn risk from inside the book's init).
-    const book_init = OrderBook{ .risk = risk };
+    const book_init = OrderBook{ .risk = risk, .bus = &bus };
     const book = try rt.spawn(OrderBook, book_init, 256);
 
     // Feed: a plain thread, deliberately faster than the pipeline drains, to make
@@ -152,6 +231,14 @@ pub fn main(init: std.process.Init) !void {
     const snap = Snapshot{ .bids = book.state.bids, .asks = book.state.asks, .exposure = risk.state.exposure };
     std.log.info("[snapshot] bids={d} asks={d} risk_exposure={d} checks={d} rejected={d}", .{
         snap.bids, snap.asks, snap.exposure, risk.state.checks, risk.state.rejected,
+    });
+
+    std.log.info("[v0.17] bus: subscribers={d} published={d} delivered={d} dropped={d} | metrics deltas={d} | audit kept={d}", .{
+        bus.stats().subscribers, bus.stats().published, bus.stats().delivered, bus.stats().dropped,
+        metrics.deltas,          audit.state.kept,
+    });
+    std.log.info("[v0.17] supervised actor: attempts={d} stopped_by_supervisor={} mailbox_closed={}", .{
+        faulty.state.attempts, faulty.stats().stopped_by_supervisor, faulty.mailbox.isClosed(),
     });
 
     const s = rt.stats();

@@ -75,6 +75,7 @@ const OrderBook = struct {
 | `pub const Message = T` + `pub fn handle(self, msg, ctx)` | **消息驱动**：运行时循环 `recv → handle`，`stop()`/`close()` 结束 | 绝大多数：worker 的输入就是消息 |
 | `pub fn run(self, ctx)` | **自带循环**：跑一次，自行 `while (!ctx.stopped())` | 拉取型（轮询外部源）、需要精确控制节拍的循环 |
 | `pub fn init` / `pub fn deinit` | 生命周期钩子，前后各一次 | 打开/关闭资源 |
+| `pub fn onError(self, err, ctx) Supervision.Strategy` | **Actor 才有**：每条错误现场决定 `.restart` / `.stop`，覆盖配置的策略 | 只有某些错误值得停（如 `error.Fatal`） |
 
 ```zig
 const rt = try app.runtime();
@@ -93,6 +94,57 @@ book.stop();                                       // 请求结束（join 由 sh
 - `handle`/`run` 返回的错误被记录并计数（`stats().handler_errors`），**不会**停掉 worker；
   panic 不可捕获，会带走进程 —— 热路径上的 panic 见 `docs/BEST_PRACTICES.md`「韧性」。
 
+## 3b. Actor —— Worker + 监督（v0.17）
+
+**Actor 不是新的运行单元，是加了失败策略的 Worker。** 这样"Module → Runtime → Worker → Actor"是一条直路，
+不存在两套生命周期。
+
+```zig
+const h = try rt.spawnActor(Reporter, .{}, 32, .{ .max_errors = 3, .window_ms = 60_000 });
+```
+
+| 配置 | 含义 |
+|------|------|
+| `strategy = .restart`（默认） | 出错只记录，继续服务 —— 与 v0.16 的 worker 契约一致 |
+| `strategy = .stop` | 首个错误即停（fail-fast，邮箱关闭、线程退出） |
+| `max_errors` / `window_ms` | **错误预算**：窗口内超过 N 次即停。`0` = 不限 |
+| `onError(self, err, ctx)`（可选声明） | 现场决策，**覆盖** `strategy` |
+
+**为什么需要预算**：一个"每条消息都出错"的 actor，在"只记录不停止"的语义下会永远烧掉一个核，
+从外部看却是健康的（线程在跑、邮箱在收）。预算把这种情况变成"停止 + 一条 warn + 计数"，
+而不是一个安静的 CPU 黑洞。停止后 `stats().stopped_by_supervisor` 为真、邮箱关闭（生产者拿到
+`error.Closed`），**不会**悄悄改成静默丢弃。
+
+**停不下来的那些**：本版不实现"用干净状态重启 actor"（Erlang 的 process restart）——状态是 spawn 时
+移进去的，重启意味着要么保留一份初始副本（要求 State 可拷贝），要么声明 `reset` 钩子并接受
+"上一次失败留下的痕迹"。在语义确定之前宁可不给。**父子关系**目前只体现在**停止顺序**：`shutdown`
+按 spawn 逆序 join，因此"先 spawn 父、再 spawn 子"就得到"子先停"。真正的监督树（父决定子的重启策略）
+留给后续版本。
+
+## 3c. HotBus —— L0 的扇出（v0.17）
+
+一个事件、多个消费者（订单簿 + 风控 + 审计 + 指标），而发布方**不能等**。
+
+```zig
+var bus = runtime.HotBus(Trade, 4).init();   // 最多 4 个订阅者
+try bus.subscribe(book);                     // 真 worker（任意 *Handle(W, cap)）
+try bus.subscribeSink(metrics.sink());       // 普通 sink（不是 worker 也行）
+bus.freeze();                                // 启动期接线结束
+if (!try bus.publish(trade)) { /* 所有订阅者都满了 */ }
+```
+
+两条规则让它成为 L0 而不是"另一个 EventBus"：
+
+1. **先 freeze 再跑流量**：订阅者在启动期接好、`freeze()` 之后 `publish` 就是一次**无锁、无分配**的切片遍历。
+   未 freeze 就 publish 返回 `error.NotFrozen` —— 这是接线 bug，应该大声失败而不是竞争。
+2. **丢，但不长**：每个订阅者是**有界邮箱**，满即丢该条并计数（`stats().dropped`）。慢消费者既不能拖慢发布方，
+   也不能把内存吃光。
+
+实测（`examples/runtime-workers`）：审计 worker 故意慢，指标 sink 是 O(1) ——
+同一批 261 条事件里 `delivered=330 / dropped=192`，指标一条不漏、审计丢掉慢的那些、**订单簿从未阻塞**。
+
+与 `app.eventBus(T)` 的分工见 §6：L1 要"最终大家都看到"（可以分配、可以慢），L0 要"发布方绝不停"（有界、可丢）。
+
 ## 4. 原语与取舍
 
 | 类型 | 并发形态 | 关键性质 |
@@ -103,6 +155,8 @@ book.stop();                                       // 请求结束（join 由 sh
 | `Wheel(Payload)` | 单线程驱动 | 分层时间轮，O(1) 插入/取消；10ms 粒度、5 层、最长 ~124 天；长停摆走 O(pending) 扫描 |
 | `ObjectPool(T)` | 多线程 | 定容 + 自旋锁；`acquire` **不分配**，耗尽返回 null（把流量高峰变成"削峰"而不是 OOM） |
 | `Clock` | 值类型 | `.monotonic`（生产）/ `.manual`（测试：不睡觉就能推动一小时定时器） |
+| `Sequencer` | 多线程 | 无锁单调序列：`next()` / `nextBatch(n)` / `advanceTo()`；**不是时钟**（只在进程生命期内有意义） |
+| `HotBus(E, N)` | 1 发布者 / 多订阅者 | freeze 后无锁发布、drop-on-full、计数齐全（见 §3c） |
 
 **为什么池用自旋锁而不是无锁栈**：Treiber 栈在索引上有一个 ABA 窗口，会把同一个对象发给两个调用者 ——
 那是任何测试都不稳定复现的数据竞争。临界区只有一次指针交换，锁的代价远小于"正确性靠运气"。
@@ -158,8 +212,9 @@ const s = rt.stats();
 | 版本 | 内容 | 状态 |
 |------|------|------|
 | **v0.16.0** | `RingBuffer` / `MpscRing` / `Mailbox` / `ObjectPool` / `Clock` / `Wheel` / `Runtime` + `Worker` + `app.runtime()` | ✅ 本文档 |
-| v0.17 | Actor（`Actor(State)` = worker + 监督 + 生命周期）、HotEventBus（L0 的发布/订阅视图）、Sequencer | 计划 |
-| v0.18 | 编译期架构引擎：依赖图、架构规则、`zmodu graph`、`zmodu doctor` | 计划 |
+| **v0.17.0** | Actor 监督（`spawnActor` + 错误预算 + `onError` 现场决策）、`HotBus`（L0 扇出，freeze 后无锁、drop-on-full）、`Sequencer` | ✅ 本文档 §3b/§3c |
+| v0.18 | 编译期架构引擎：依赖图、架构规则、`zmodu graph`、`zmodu doctor` | 计划（下一步） |
+| 之后 | 真监督树（父决定子的重启策略）、带干净状态的重启、跨进程/跨节点监督 | 未承诺 |
 | v0.19 | Cluster / Shard / Service Discovery（**适配** QUIC/gRPC/NATS，不发明协议） | 计划 |
 | v0.20 | Workflow（状态机 + Saga + 补偿 + 检查点 + 恢复） | 计划 |
 | v0.21 | Agent Runtime（Identity / Memory / Skills / Permissions / Budget 一等化） | 计划 |

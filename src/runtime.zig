@@ -18,6 +18,8 @@ pub const clock = @import("runtime/clock.zig");
 pub const timer_wheel = @import("runtime/timer_wheel.zig");
 pub const object_pool = @import("runtime/object_pool.zig");
 pub const mailbox = @import("runtime/mailbox.zig");
+pub const sequencer = @import("runtime/sequencer.zig");
+pub const hot_bus = @import("runtime/hot_bus.zig");
 pub const runtime_impl = @import("runtime/runtime.zig");
 
 /// Single-producer / single-consumer lock-free ring.
@@ -32,6 +34,13 @@ pub const Wheel = timer_wheel.Wheel;
 pub const ObjectPool = object_pool.ObjectPool;
 /// Bounded blocking mailbox (the worker hand-off).
 pub const Mailbox = mailbox.Mailbox;
+
+/// Monotonic sequence (order without a clock, unique without a lock).
+pub const Sequencer = sequencer.Sequencer;
+/// L0 publish/subscribe fan-out over worker mailboxes (frozen, drop-on-full).
+pub const HotBus = hot_bus.HotBus;
+/// Worker failure policy (`restart` / `stop` + windowed error budget).
+pub const Supervision = runtime_impl.Supervision;
 
 /// The runtime itself, plus the worker contract.
 pub const Runtime = runtime_impl.Runtime;

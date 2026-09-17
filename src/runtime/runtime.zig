@@ -72,6 +72,28 @@ const TimerAction = struct {
     deadline_ms: i64 = 0,
 };
 
+/// How the runtime reacts to an error a worker's `handle`/`run` returned.
+///
+/// A plain worker (v0.16 behaviour) logs and carries on. An **actor** declares
+/// intent instead: fail-fast, or tolerate a bounded number of errors inside a
+/// window and then stop for good — the classic supervision "intensity", which
+/// exists because an actor that errors on *every* message otherwise burns a core
+/// forever while looking alive.
+pub const Supervision = struct {
+    pub const Strategy = enum {
+        /// Log the error, keep serving. The v0.16 worker contract.
+        restart,
+        /// Stop the actor on this error (fail fast, mailboxes close, thread exits).
+        stop,
+    };
+
+    strategy: Strategy = .restart,
+    /// Errors tolerated inside `window_ms` before the actor is stopped anyway.
+    /// 0 = unlimited (plain-worker behaviour: never stop on errors).
+    max_errors: u32 = 0,
+    window_ms: i64 = 10_000,
+};
+
 pub const WorkerStats = struct {
     name: []const u8,
     running: bool,
@@ -83,6 +105,10 @@ pub const WorkerStats = struct {
     /// Panics inside `handle`/`run` do not reach here (they abort the process);
     /// this counts returned errors.
     handler_errors: u64,
+    /// Errors inside the current supervision window.
+    errors_in_window: u32,
+    /// True when the supervisor stopped this actor (fail-fast or over budget).
+    stopped_by_supervisor: bool,
 };
 
 pub const RuntimeStats = struct {
@@ -113,6 +139,12 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         thread: ?std.Thread = null,
         stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         handler_errors: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        supervision: Supervision = .{},
+        /// Supervisor bookkeeping. Owned by the worker's own thread (only it
+        /// handles messages), so plain fields — no atomics.
+        errors_in_window: u32 = 0,
+        window_start_ms: i64 = 0,
+        stopped_by_supervisor: bool = false,
         joined: bool = false,
 
         pub fn send(self: *Self, message: Message) mbox.SendError!void {
@@ -174,6 +206,8 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
                 .received = ms.received,
                 .dropped_full = ms.dropped_full,
                 .handler_errors = self.handler_errors.load(.monotonic),
+                .errors_in_window = self.errors_in_window,
+                .stopped_by_supervisor = self.stopped_by_supervisor,
             };
         }
 
@@ -309,6 +343,30 @@ pub const Runtime = struct {
         initial_state: W,
         comptime capacity: usize,
     ) !*Handle(W, capacity) {
+        return self.spawnSupervised(W, initial_state, capacity, .{});
+    }
+
+    /// Spawn an **actor**: same contract as a worker, but the runtime supervises
+    /// it — a bounded error budget inside a window, and a stop when the budget is
+    /// spent. Defaults differ from `spawn` on purpose: an actor that keeps
+    /// failing is stopped rather than left burning a core.
+    pub fn spawnActor(
+        self: *Self,
+        comptime W: type,
+        initial_state: W,
+        comptime capacity: usize,
+        supervision: Supervision,
+    ) !*Handle(W, capacity) {
+        return self.spawnSupervised(W, initial_state, capacity, supervision);
+    }
+
+    pub fn spawnSupervised(
+        self: *Self,
+        comptime W: type,
+        initial_state: W,
+        comptime capacity: usize,
+        supervision: Supervision,
+    ) !*Handle(W, capacity) {
         const H = Handle(W, capacity);
         const handle = try self.allocator.create(H);
         errdefer self.allocator.destroy(handle);
@@ -318,6 +376,8 @@ pub const Runtime = struct {
             .mailbox = mbox.Mailbox(H.Message, capacity).init(self.io),
             .runtime = self,
             .context = undefined,
+            .supervision = supervision,
+            .window_start_ms = self.clock.nowMs(),
         };
         handle.context = .{
             .runtime = self,
@@ -466,10 +526,14 @@ pub const Runtime = struct {
 fn workerMain(comptime W: type, comptime capacity: usize) fn (*Handle(W, capacity)) void {
     return struct {
         fn main(handle: *Handle(W, capacity)) void {
-            // Optional init.
+            const H = Handle(W, capacity);
+
+            // Optional init. A failure here is fatal for the worker (there is no
+            // half-started state to supervise), but it still counts and stops.
             if (@hasDecl(W, "init")) {
                 W.init(&handle.state, &handle.context) catch |err| {
                     std.log.err("[runtime] {s}.init failed: {s}", .{ @typeName(W), @errorName(err) });
+                    _ = handle.handler_errors.fetchAdd(1, .monotonic);
                     handle.stop();
                 };
             }
@@ -483,15 +547,13 @@ fn workerMain(comptime W: type, comptime capacity: usize) fn (*Handle(W, capacit
                         continue;
                     };
                     W.handle(&handle.state, message, &handle.context) catch |err| {
-                        _ = handle.handler_errors.fetchAdd(1, .monotonic);
-                        std.log.err("[runtime] {s} handler error: {s}", .{ @typeName(W), @errorName(err) });
+                        if (supervise(H, handle, err)) break;
                     };
                 }
             } else if (@hasDecl(W, "run")) {
                 // Loop-owned: the worker decides when to finish.
                 W.run(&handle.state, &handle.context) catch |err| {
-                    _ = handle.handler_errors.fetchAdd(1, .monotonic);
-                    std.log.err("[runtime] {s}.run error: {s}", .{ @typeName(W), @errorName(err) });
+                    _ = supervise(H, handle, err);
                 };
             } else {
                 @compileError("worker " ++ @typeName(W) ++ " declares neither " ++
@@ -499,6 +561,48 @@ fn workerMain(comptime W: type, comptime capacity: usize) fn (*Handle(W, capacit
             }
 
             if (@hasDecl(W, "deinit")) W.deinit(&handle.state);
+        }
+
+        /// Record an error and decide whether the worker survives it.
+        /// Returns true when the caller must stop its loop.
+        fn supervise(comptime HH: type, handle: *HH, err: anyerror) bool {
+            _ = handle.handler_errors.fetchAdd(1, .monotonic);
+
+            // Windowed budget: reset the window when it has elapsed.
+            const now = handle.runtime.clock.nowMs();
+            if (handle.supervision.window_ms > 0 and now - handle.window_start_ms > handle.supervision.window_ms) {
+                handle.window_start_ms = now;
+                handle.errors_in_window = 0;
+            }
+            handle.errors_in_window += 1;
+
+            // The actor's own opinion wins when declared; otherwise the strategy.
+            const decision: Supervision.Strategy = if (@hasDecl(W, "onError"))
+                W.onError(&handle.state, err, &handle.context)
+            else
+                handle.supervision.strategy;
+
+            const over_budget = handle.supervision.max_errors != 0 and
+                handle.errors_in_window > handle.supervision.max_errors;
+            const must_stop = decision == .stop or over_budget;
+
+            if (must_stop) {
+                handle.stopped_by_supervisor = true;
+                std.log.warn("[runtime] {s} stopped by supervisor after {d} error(s) in window ({s}{s}); last: {s}", .{
+                    @typeName(W),
+                    handle.errors_in_window,
+                    @tagName(decision),
+                    if (over_budget) ", over budget" else "",
+                    @errorName(err),
+                });
+                handle.stop();
+                return true;
+            }
+
+            std.log.warn("[runtime] {s} handler error ({d} in window): {s}", .{
+                @typeName(W), handle.errors_in_window, @errorName(err),
+            });
+            return false;
         }
     }.main;
 }
@@ -716,4 +820,125 @@ test "Runtime: the ticker fires timers without help from the caller" {
 
     rt.shutdown();
     try std.testing.expectEqual(@as(usize, 0), rt.stats().workers);
+}
+
+const FlakyActor = struct {
+    pub const Message = u32;
+    handled: u32 = 0,
+    /// Errors on every odd message; the supervisor decides what that means.
+    pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
+        _ = ctx;
+        if (msg % 2 == 1) return error.Boom;
+        self.handled += 1;
+    }
+};
+
+test "Actor: a plain worker survives handler errors (v0.16 contract)" {
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .{ .manual = &clk });
+    defer rt.deinit();
+
+    const h = try rt.spawn(FlakyActor, .{}, 8); // spawn, not spawnActor: no budget
+    for (0..4) |i| try h.send(@intCast(i)); // 1 and 3 fail
+    var spins: usize = 0;
+    while (h.state.handled < 2 and spins < 4_000_000) : (spins += 1) std.atomic.spinLoopHint();
+
+    try std.testing.expectEqual(@as(u32, 2), h.state.handled); // the good messages got through
+    try std.testing.expectEqual(@as(u64, 2), h.stats().handler_errors);
+    try std.testing.expect(!h.stats().stopped_by_supervisor);
+    try std.testing.expect(!h.mailbox.isClosed()); // still serving
+    h.stop();
+}
+
+test "Actor: fail-fast strategy stops on the first error" {
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .{ .manual = &clk });
+    defer rt.deinit();
+
+    const h = try rt.spawnActor(FlakyActor, .{}, 8, .{ .strategy = .stop });
+    try h.send(1); // fails → stop
+    var spins: usize = 0;
+    while (!h.mailbox.isClosed() and spins < 4_000_000) : (spins += 1) std.atomic.spinLoopHint();
+
+    try std.testing.expect(h.mailbox.isClosed());
+    try std.testing.expect(h.stats().stopped_by_supervisor);
+    // A stopped actor takes no new work, and says so rather than buffering.
+    try std.testing.expectError(error.Closed, h.send(2));
+    h.join();
+}
+
+test "Actor: an error budget stops a permanently broken actor" {
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .{ .manual = &clk });
+    defer rt.deinit();
+
+    // Tolerate 2 errors in the window, then stop — rather than logging forever.
+    const h = try rt.spawnActor(FlakyActor, .{}, 32, .{ .max_errors = 2, .window_ms = 60_000 });
+    for (0..20) |i| h.send(@intCast(i)) catch break;
+    var spins: usize = 0;
+    while (!h.mailbox.isClosed() and spins < 8_000_000) : (spins += 1) std.atomic.spinLoopHint();
+
+    try std.testing.expect(h.mailbox.isClosed());
+    const s = h.stats();
+    try std.testing.expect(s.stopped_by_supervisor);
+    try std.testing.expectEqual(@as(u32, 3), s.errors_in_window); // stopped on the 3rd
+    h.join();
+}
+
+test "Actor: an onError hook overrides the configured strategy" {
+    const Decides = struct {
+        pub const Message = u32;
+        handled: u32 = 0,
+        pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
+            _ = ctx;
+            if (msg == 9) return error.Fatal;
+            self.handled += 1;
+        }
+        pub fn onError(self: *@This(), err: anyerror, ctx: anytype) Supervision.Strategy {
+            _ = self;
+            _ = ctx;
+            // Only the fatal one is worth stopping for; everything else is noise.
+            return if (err == error.Fatal) .stop else .restart;
+        }
+    };
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .{ .manual = &clk });
+    defer rt.deinit();
+
+    // Strategy says "stop on any error"; the hook says "except the fatal one".
+    const h = try rt.spawnActor(Decides, .{}, 32, .{ .strategy = .stop, .max_errors = 0 });
+    try h.send(9);
+
+    var spins: usize = 0;
+    while (!h.mailbox.isClosed() and spins < 8_000_000) : (spins += 1) std.atomic.spinLoopHint();
+    try std.testing.expect(h.mailbox.isClosed());
+    try std.testing.expect(h.stats().stopped_by_supervisor);
+
+    // And the hook can also do the opposite: tolerate everything while the
+    // configured strategy says fail-fast.
+    const Tolerant = struct {
+        pub const Message = u32;
+        handled: u32 = 0,
+        pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
+            _ = ctx;
+            if (msg == 9) return error.Noise;
+            self.handled += 1;
+        }
+        pub fn onError(self: *@This(), err: anyerror, ctx: anytype) Supervision.Strategy {
+            _ = self;
+            _ = ctx;
+            std.log.debug("tolerating {s}", .{@errorName(err)});
+            return .restart;
+        }
+    };
+    const h2 = try rt.spawnActor(Tolerant, .{}, 32, .{ .strategy = .stop, .max_errors = 0 });
+    try h2.send(9); // errors, but the hook says keep going
+    try h2.send(2); // processed normally
+    spins = 0;
+    while (h2.state.handled == 0 and spins < 8_000_000) : (spins += 1) std.atomic.spinLoopHint();
+    try std.testing.expectEqual(@as(u32, 1), h2.state.handled);
+    try std.testing.expect(!h2.mailbox.isClosed());
+    try std.testing.expect(!h2.stats().stopped_by_supervisor);
+    h2.stop();
 }
