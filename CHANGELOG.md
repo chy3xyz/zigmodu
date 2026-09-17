@@ -1,5 +1,33 @@
 # Changelog
 
+## [Unreleased]
+
+> **0 breaking**（v0.20 = 长流程可恢复执行）。新增 `resumeInstance`，既有 `execute` / WAL 格式不变。
+
+### Added
+- **`SagaOrchestrator.resumeInstance(id)`** —— 继续一个被上一个进程留在半途的 saga（由
+  `restoreFromWal` 装回来）。语义写进 `docs/WORKFLOW.md`：已 `completed` 的步**不重跑**、
+  崩溃时**在飞**的那一步**重跑**（所以有副作用的步骤必须幂等）、终态实例（completed/compensated/
+  failed/timed_out）与补偿中途（compensating）一律拒绝（`error.NothingToResume` / `UnknownInstance`）。
+- 步进循环抽成 `runFrom(instance_id, start_index)`：`execute` 与 `resumeInstance` 共用一条路径，
+  续跑的语义不可能与首次执行漂移。
+- 2 项测试：崩溃续跑（手写一条"step index 1 在飞"的 `saga-state` WAL 记录当崩溃现场 → 恢复 →
+  续跑只重跑在飞那步 + 之后各步，且不触发补偿）、恢复取**最新**状态（回归测试直接钉住下面第 1 条）。
+
+### Fixed
+- **恢复会复活已结束的实例**：`restoreFromWal` 原先逐条看记录，只要任意一条是 `running` 就恢复 ——
+  而"失败并补偿完"的 saga 在 WAL 里正是 `running → running → compensated` 的链条，于是它会以
+  `running` 回来，续跑即**重复补偿**。现在按实例取最后一条状态再决定。
+- **`restoreFromWal` 每次启动泄漏**：`readFrom` 交出的条目（topic/payload/source_node）归调用方释放，
+  它从不释放。之前没有测试调用过这条路径，所以没人发现。
+- `pub fn resume` 无法编译：`resume` 是 Zig 关键字（`suspend`/`resume`）→ 改名 `resumeInstance`。
+
+### Docs
+- `docs/WORKFLOW.md`（新）：一步之内的语义表（什么重跑、什么拒绝、为什么）、WAL 接线样例、
+  本版修掉的三个真问题、**刻意不做**的四件事（不加 DSL / 不做调度器 / 不做跨节点编排 /
+  `ai/workflow.zig` 保留并说明分工）。
+- `AGENTS.md`：文件地图加一行（长流程用 `resumeInstance`，副作用步骤必须幂等）。
+
 ## [0.19.0] - 2026-09-17
 
 > **0 breaking**（v0.19 = 集群读侧）。纯新增：`ClusterView` 与既有 DistributedEventBus /

@@ -142,7 +142,9 @@ pub const SagaOrchestrator = struct {
 
     /// Starts executing a saga
     pub fn execute(self: *Self, saga_name: []const u8) ![]const u8 {
-        const saga = self.sagas.get(saga_name) orelse return error.SagaNotFound;
+        // Look the definition up before creating anything: an unknown saga must not
+        // leave a half-created instance behind.
+        if (!self.sagas.contains(saga_name)) return error.SagaNotFound;
 
         self.instance_counter += 1;
         const instance_id = try std.fmt.allocPrint(self.allocator, "saga-{s}-{d}", .{ saga_name, self.instance_counter });
@@ -159,10 +161,29 @@ pub const SagaOrchestrator = struct {
 
         try self.running_instances.put(instance_id, instance);
 
-        // Run the steps in order
-        for (saga.steps, 0..) |step, i| {
-            const inst = self.running_instances.getPtr(instance_id) orelse return error.InternalError;
-            inst.current_step = i;
+        try self.runFrom(instance_id, 0);
+
+        const inst = self.running_instances.getPtr(instance_id) orelse return error.InternalError;
+        inst.status = .completed;
+
+        // Persist final state
+        self.saveSagaState(instance_id);
+
+        std.log.info("[Saga] '{s}' completed successfully", .{instance_id});
+        return instance_id;
+    }
+
+    /// Run `saga.steps[start_index..]`, logging every outcome and compensating on
+    /// failure. Shared by `execute` (start 0) and `resume` (start = recorded
+    /// progress) so a resumed saga cannot drift from a fresh one.
+    fn runFrom(self: *Self, instance_id: []const u8, start_index: usize) !void {
+        const inst = self.running_instances.getPtr(instance_id) orelse return error.InternalError;
+        const saga = self.sagas.get(inst.saga_name) orelse return error.SagaNotFound;
+        if (start_index >= saga.steps.len) return;
+
+        for (saga.steps[start_index..], start_index..) |step, i| {
+            const running = self.running_instances.getPtr(instance_id) orelse return error.InternalError;
+            running.current_step = i;
 
             const step_start = Time.monotonicNowSeconds();
 
@@ -170,7 +191,7 @@ pub const SagaOrchestrator = struct {
                 const step_end = Time.monotonicNowSeconds();
                 const err_msg = try std.fmt.allocPrint(self.allocator, "{s}", .{@errorName(err)});
 
-                try inst.step_logs.append(self.allocator, .{
+                try running.step_logs.append(self.allocator, .{
                     .step_name = try self.allocator.dupe(u8, step.name),
                     .status = .failed,
                     .started_at = step_start,
@@ -178,7 +199,7 @@ pub const SagaOrchestrator = struct {
                     .error_message = err_msg,
                 });
 
-                inst.last_error = try self.allocator.dupe(u8, err_msg);
+                running.last_error = try self.allocator.dupe(u8, err_msg);
 
                 std.log.warn("[Saga] Step '{s}' failed in '{s}': {s}", .{ step.name, instance_id, err_msg });
 
@@ -192,7 +213,7 @@ pub const SagaOrchestrator = struct {
 
             const step_end = Time.monotonicNowSeconds();
 
-            try inst.step_logs.append(self.allocator, .{
+            try running.step_logs.append(self.allocator, .{
                 .step_name = try self.allocator.dupe(u8, step.name),
                 .status = .completed,
                 .started_at = step_start,
@@ -204,14 +225,45 @@ pub const SagaOrchestrator = struct {
             self.saveSagaState(instance_id);
         }
 
-        const inst = self.running_instances.getPtr(instance_id) orelse return error.InternalError;
-        inst.status = .completed;
-
-        // Persist final state
+        const done = self.running_instances.getPtr(instance_id) orelse return error.InternalError;
+        done.status = .completed;
         self.saveSagaState(instance_id);
-
         std.log.info("[Saga] '{s}' completed successfully", .{instance_id});
-        return instance_id;
+    }
+
+    /// Continue a saga that a previous process left in flight (the instance comes
+    ///
+    /// Named `resumeInstance` because `resume` is a Zig keyword.
+    /// back via `restoreFromWal`).
+    ///
+    /// Semantics, stated because they are the whole point of a checkpoint:
+    ///
+    /// * Steps logged **completed** are never re-run.
+    /// * The step that was *in flight* when the process died **is** re-run, because
+    ///   nothing recorded whether it took effect — so a step with side effects must
+    ///   be idempotent (the same requirement every at-least-once system has).
+    /// * A terminal instance (`.completed`, `.compensated`, `.failed`) is refused:
+    ///   re-running a compensated saga would compensate side effects twice.
+    pub fn resumeInstance(self: *Self, instance_id: []const u8) !void {
+        const inst = self.running_instances.getPtr(instance_id) orelse return error.UnknownInstance;
+        switch (inst.status) {
+            .completed, .compensated, .failed, .timed_out => return error.NothingToResume,
+            .compensating => return error.NothingToResume, // compensation was mid-flight: a human decides
+            .pending, .running => {},
+        }
+
+        // Where to continue from: the step after the last one *logged completed*.
+        // (Not `current_step + 1`: the step in flight when we died has no completed
+        // log, and `current_step` is only updated as the loop enters each step.)
+        var completed_steps: usize = 0;
+        for (inst.step_logs.items) |log| {
+            if (log.status == .completed) completed_steps += 1;
+        }
+        if (completed_steps < inst.current_step) completed_steps = inst.current_step;
+
+        std.log.info("[Saga] Resuming '{s}' from step {d}", .{ instance_id, completed_steps });
+        inst.status = .running;
+        try self.runFrom(instance_id, completed_steps);
     }
 
     /// Executes compensation (reverse-order rollback)
@@ -339,6 +391,34 @@ pub const SagaOrchestrator = struct {
         const w = self.wal orelse return;
         const from_seq = w.lastCommittedIndex() + 1;
         const entries = try w.readFrom(from_seq);
+        defer {
+            // `readFrom` hands over owned strings; without this the restore leaks
+            // one topic+payload+source_node per record on every boot.
+            for (entries) |entry| {
+                self.allocator.free(entry.topic);
+                self.allocator.free(entry.payload);
+                self.allocator.free(entry.source_node);
+            }
+            self.allocator.free(entries);
+        }
+
+        // A crash leaves a *chain* of records per instance (running → running →
+        // completed). Restoring on "any record says running" resurrects instances
+        // that already finished or compensated — so decide from each instance's
+        // LAST record, which means looking at all of them before creating any.
+        var latest = std.StringHashMap(SagaStatus).init(self.allocator);
+        defer latest.deinit();
+        for (entries) |entry| {
+            if (!std.mem.eql(u8, entry.topic, "saga-state")) continue;
+            var it = std.mem.splitScalar(u8, entry.payload, '|');
+            const id = it.next() orelse continue;
+            _ = it.next() orelse continue; // saga_name
+            const status_str = it.next() orelse continue;
+            const status_int = std.fmt.parseInt(u8, status_str, 10) catch continue;
+            const status: SagaStatus = @fromBackingInt(@intCast(status_int));
+            // Later entries overwrite earlier ones: `put` keeps the newest.
+            latest.put(id, status) catch continue;
+        }
 
         for (entries) |entry| {
             if (!std.mem.eql(u8, entry.topic, "saga-state")) continue;
@@ -356,8 +436,9 @@ pub const SagaOrchestrator = struct {
             const current_step = std.fmt.parseInt(usize, current_step_str, 10) catch continue;
             const started_at = std.fmt.parseInt(i64, started_at_str, 10) catch continue;
 
-            // Only restore sagas that are still in-progress
-            if (status != .running and status != .compensating and status != .pending) continue;
+            // Only restore sagas whose *latest* state is still in-progress.
+            const final_status = latest.get(saga_id) orelse status;
+            if (final_status != .running and final_status != .compensating and final_status != .pending) continue;
 
             // Check if already restored
             if (self.running_instances.contains(saga_id)) continue;
@@ -633,4 +714,94 @@ test "Saga persists step results to WAL" {
 
     // Verify that WAL entries were written (at least 1 for completion, plus step success)
     try std.testing.expect(wal.lastIndex() >= 2);
+}
+
+test "resume: a crash-restored saga continues without re-running completed steps" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const wal_config = @import("eventbus/WAL.zig").WALConfig{ .dir_path = "wal_test_resume", .max_segment_size = 1024 * 1024 };
+    var wal = try WAL.init(allocator, std.testing.io, wal_config);
+    defer wal.deinit();
+
+    const Ctx = struct {
+        var ran: u32 = 0;
+        var compensated: u32 = 0;
+        fn a1() !void {
+            ran += 1;
+        }
+        fn a2() !void {
+            ran += 1;
+        }
+        fn a3() !void {
+            ran += 1;
+        }
+        fn c() void {
+            compensated += 1;
+        }
+    };
+    Ctx.ran = 0;
+    Ctx.compensated = 0;
+
+    const steps = &[_]SagaStep{
+        .{ .name = "one", .action = Ctx.a1, .compensation = Ctx.c },
+        .{ .name = "two", .action = Ctx.a2, .compensation = Ctx.c },
+        .{ .name = "three", .action = Ctx.a3, .compensation = Ctx.c },
+    };
+
+    // The crash artifact: a `saga-state` record saying "instance X is running,
+    // step index 1 is in flight". That is exactly what `saveSagaState` wrote before
+    // the process died mid-step-2 — the test writes it by hand instead of dying.
+    // (`current_step` is the step being *entered*, so index 1 = the second step.)
+    _ = try wal.append(.{ .topic = "saga-state", .payload = "saga-resume-1|resume-saga|1|1|1700000000", .source_node = "test" });
+
+    var orch = SagaOrchestrator.init(allocator);
+    defer orch.deinit();
+    orch.setWal(&wal);
+    try orch.registerSaga("resume-saga", steps);
+    try orch.restoreFromWal();
+
+    try std.testing.expectEqual(SagaStatus.running, orch.getStatus("saga-resume-1").?);
+    try std.testing.expectEqual(@as(u32, 0), Ctx.ran);
+
+    try orch.resumeInstance("saga-resume-1");
+
+    // Step index 1 ("two") is re-run — it was in flight, nothing recorded whether it
+    // took effect — and step 2 ("three") runs. Step 0 ("one") is not re-run: the
+    // record says the process had already entered step 1, which is only written
+    // after step 0 returned. Nothing is compensated.
+    try std.testing.expectEqual(@as(u32, 2), Ctx.ran);
+    try std.testing.expectEqual(@as(u32, 0), Ctx.compensated);
+    try std.testing.expectEqual(SagaStatus.completed, orch.getStatus("saga-resume-1").?);
+
+    // Terminal instances refuse to resume: a compensated saga must not be replayed.
+    try std.testing.expectError(error.NothingToResume, orch.resumeInstance("saga-resume-1"));
+    try std.testing.expectError(error.UnknownInstance, orch.resumeInstance("no-such-instance"));
+}
+
+test "restoreFromWal keeps the *latest* state per instance (no stale resurrection)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const wal_config = @import("eventbus/WAL.zig").WALConfig{ .dir_path = "wal_test_latest", .max_segment_size = 1024 * 1024 };
+    var wal = try WAL.init(allocator, std.testing.io, wal_config);
+    defer wal.deinit();
+
+    // The chain a saga that failed and compensated leaves behind. Before the fix,
+    // the `running` records made it come back to life on restart.
+    _ = try wal.append(.{ .topic = "saga-state", .payload = "saga-old-1|s|1|0|1700000000", .source_node = "test" });
+    _ = try wal.append(.{ .topic = "saga-state", .payload = "saga-old-1|s|1|1|1700000001", .source_node = "test" });
+    _ = try wal.append(.{ .topic = "saga-state", .payload = "saga-old-1|s|5|1|1700000002", .source_node = "test" }); // 5 = compensated
+    // A second instance that really is still in flight must be restored.
+    _ = try wal.append(.{ .topic = "saga-state", .payload = "saga-live-1|s|1|0|1700000003", .source_node = "test" });
+
+    var orch = SagaOrchestrator.init(allocator);
+    defer orch.deinit();
+    orch.setWal(&wal);
+    try orch.restoreFromWal();
+
+    try std.testing.expect(orch.getStatus("saga-old-1") == null); // terminal: not resurrected
+    try std.testing.expectEqual(SagaStatus.running, orch.getStatus("saga-live-1").?);
 }
