@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.17.0] - 2026-09-17
 
 > **0 breaking**（v0.17 = 运行时的监督与扇出，仍是纯新增）。v0.16 的 worker 语义一字未改：
 > `rt.spawn(...)` 依旧"记录错误并继续"，新语义只在 `spawnActor` 上生效。
