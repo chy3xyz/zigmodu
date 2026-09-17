@@ -26,6 +26,17 @@ pub fn build(b: *std.Build) void {
     });
     zmodu_mod.addImport("build_options", build_options_mod);
 
+    // The architecture analyser lives in the framework, and the CLI must run it on
+    // *scanned source* (the CLI cannot import framework types). Sharing the module
+    // keeps one implementation of the cycle/finding logic instead of a CLI copy
+    // that drifts — `zmodu doctor` and `ApplicationBuilder.build` then agree.
+    const graph_mod = b.createModule(.{
+        .root_source_file = b.path("../../src/core/ModuleGraph.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zmodu_mod.addImport("module_graph", graph_mod);
+
     const exe = b.addExecutable(.{
         .name = "zmodu",
         .root_module = zmodu_mod,

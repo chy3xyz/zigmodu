@@ -444,6 +444,39 @@ src/
         └── internal.zig
 ```
 
+## Architecture engine（v0.18+）
+
+模块依赖不是"文档里的约定"，而是**可检查的数据**。两半，各有各的输入：
+
+| 哪一半 | 输入 | 何时运行 | 检查什么 |
+|--------|------|---------|---------|
+| `src/core/ModuleGraph.zig` + `ApplicationBuilder.build(.{...})` | 模块**类型** | **编译期** | 缺失依赖、自依赖、重名、**环**（含路径）→ `@compileError` |
+| `zmodu doctor` | **源码扫描** | 任意时刻（不编译工程） | 同一套图检查 + **跨模块直接 import** 的纠缠 |
+
+```bash
+zmodu doctor                 # 人类可读，阻塞性问题 exit 1
+zmodu doctor --json          # CI / 看板
+zmodu doctor --max-deps 6    # 收紧告警阈值
+zmodu doctor --allow a->b    # 承认一处纠缠（可重复）
+zmodu graph [dir] --out g.mmd  # Mermaid（已有）
+```
+
+三层强度，别混淆：
+
+```
+编译期（挡住）      缺失/自依赖/重名/环          → 构建失败，信息里带环的路径
+启动期（告警）      依赖数超阈值                 → Application.validate() 记 warning
+CLI（报告+可选失败）跨模块直接 import 的纠缠     → doctor 的 [warn] + 文件:行
+```
+
+为什么"domain 不许 import 数据库"这类规则只在 CLI 层：**模块声明里没有任何字段记录某个文件 import 了什么**。
+声明一条无法执行的规则比不声明更糟，所以编译期只做"声明图"能证明的事，
+源码级纠缠交给 `doctor` 扫描（它同时给出文件:行，评审能看到具体那行 import）。
+
+优先级约定（与 `ModuleGraph.Report.ok()` 一致）：
+**环 / 缺失 / 自依赖 / 重名 = 阻断；依赖数超阈值 / 孤儿叶子 = 告警**。
+孤儿叶子（没人依赖、也不依赖别人）在 `shared`/`util` 这类模块上是正常形状，因此永不阻断。
+
 ## Multi-Tenancy (Optional)
 
 **多租户不是框架强制能力。** ZigModu 核心（`Application`、HTTP Server、SQLx、EventBus）可在完全不启用租户逻辑的情况下运行，例如 [`examples/basic/`](../examples/basic/) 就没有任何租户中间件或 `tenant_id` 过滤。

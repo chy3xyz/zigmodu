@@ -18,6 +18,7 @@ const incremental = @import("incremental.zig");
 const ai_cli = @import("ai_cli.zig");
 const deadcode = @import("deadcode.zig");
 const audit_mod = @import("audit.zig");
+const doctor_mod = @import("doctor.zig");
 const ci_mod = @import("ci.zig");
 const saas_mod = @import("saas.zig");
 const market_mod = @import("market.zig");
@@ -44,6 +45,7 @@ const Command = enum {
     ai,
     audit,
     graph,
+    doctor,
     ci,
     saas,
     market,
@@ -273,6 +275,7 @@ fn runCommand(io: std.Io, allocator: std.mem.Allocator, command: Command, cmd_ar
         .ai => try cmdAi(io, allocator, cmd_args),
         .audit => cmdAudit(io, allocator, cmd_args),
         .graph => try cmdGraph(io, allocator, cmd_args),
+        .doctor => cmdDoctor(io, allocator, cmd_args),
         .ci => cmdCi(io, allocator, cmd_args),
         .saas => try cmdSaas(io, allocator, cmd_args),
         .market => cmdMarket(io, allocator, cmd_args),
@@ -389,6 +392,7 @@ fn parseCommand(cmd: []const u8) ?Command {
     if (std.mem.eql(u8, cmd, "diff")) return .diff;
     if (std.mem.eql(u8, cmd, "audit")) return .audit;
     if (std.mem.eql(u8, cmd, "graph")) return .graph;
+    if (std.mem.eql(u8, cmd, "doctor")) return .doctor;
     if (std.mem.eql(u8, cmd, "ci")) return .ci;
     if (std.mem.eql(u8, cmd, "saas")) return .saas;
     if (std.mem.eql(u8, cmd, "market")) return .market;
@@ -430,6 +434,7 @@ fn printUsage() void {
         \\  ai                AI skill registry: export-skills | openapi
         \\  audit [dir]       Best-practice audit: architecture rules + business lint
         \\  graph [dir]       Render module dependency graph (Mermaid)
+        \\  doctor [dir]      Architecture health: graph + cross-module imports (exit 1 on errors)
         \\  ci [dir]          One-shot gate: build + fmt + verify + audit + deadcode
         \\  saas <model.json>  SaaS backend module from a business model (org-scoped)
         \\  market             Curated module catalog: list | search <q> | info <id>
@@ -644,6 +649,11 @@ fn cmdGraph(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) 
         try stdout.writeAll(mermaid);
         try stdout.flush();
     }
+}
+
+fn cmdDoctor(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) void {
+    const code = doctor_mod.run(io, allocator, args);
+    if (code != 0) std.process.exit(code);
 }
 
 fn cmdCi(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) void {

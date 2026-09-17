@@ -164,6 +164,12 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     zmodu_cli_mod.addImport("build_options", build_options_mod);
+    const cli_graph_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/ModuleGraph.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zmodu_cli_mod.addImport("module_graph", cli_graph_mod);
     const zmodu_cli_exe = b.addExecutable(.{
         .name = "zmodu",
         .root_module = zmodu_cli_mod,

@@ -13,6 +13,7 @@ const ModuleRegistry = @import("core/ModuleRegistry.zig").ModuleRegistry;
 const ModuleRuntime = @import("core/ModuleRuntime.zig").ModuleRuntime;
 const EventRegistry = @import("core/EventRegistry.zig").EventRegistry;
 const rt_mod = @import("runtime.zig");
+const ModuleGraph = @import("core/ModuleGraph.zig");
 const ModuleContext = @import("core/ModuleContext.zig").ModuleContext;
 const Container = @import("di/Container.zig").Container;
 
@@ -331,6 +332,10 @@ pub const ApplicationBuilder = struct {
     /// Services pre-registered into `Application.services` by `build()`
     /// (borrowed — the caller keeps ownership and must outlive the app).
     pending_services: std.ArrayList(PendingService),
+    /// Compile-time module-graph check (see `ModuleGraph`), on by default.
+    comptime_graph_check: bool = true,
+    /// Advisory threshold for "this module depends on too much".
+    max_dependencies: usize = 8,
 
     const PendingService = struct {
         name: []const u8,
@@ -354,6 +359,22 @@ pub const ApplicationBuilder = struct {
 
     pub fn withName(self: *ApplicationBuilder, name: []const u8) *ApplicationBuilder {
         self.app_name = name;
+        return self;
+    }
+
+    /// Turn off the compile-time module-graph check. Only for setups where the
+    /// module set is assembled dynamically (a plugin registry): the runtime
+    /// `validateModules` check still runs at startup.
+    pub fn withCompileTimeGraphCheck(self: *ApplicationBuilder, enabled: bool) *ApplicationBuilder {
+        self.comptime_graph_check = enabled;
+        return self;
+    }
+
+    /// Advisory threshold checked at **startup** (not comptime — the number is
+    /// runtime configuration): a module with more dependencies than this is
+    /// logged as a warning. Default 8.
+    pub fn withMaxDependencies(self: *ApplicationBuilder, max_deps: usize) *ApplicationBuilder {
+        self.max_dependencies = max_deps;
         return self;
     }
 
@@ -401,6 +422,16 @@ pub const ApplicationBuilder = struct {
     }
 
     pub fn build(self: *ApplicationBuilder, comptime modules: anytype) !Application {
+        // Compile-time architecture check: a cyclic or misspelled dependency is a
+        // build error with the cycle spelled out, not a startup abort. `Application`
+        // still re-checks at startup for the dynamic path.
+        if (self.comptime_graph_check) {
+            const module_list: []const type = comptime blk: {
+                const arr: [modules.len]type = modules;
+                break :blk &arr;
+            };
+            ModuleGraph.validateOrFail(module_list);
+        }
         var app = try Application.init(
             self.io,
             self.allocator,

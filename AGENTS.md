@@ -19,6 +19,7 @@
 | 生产接线 / 背压 / 编排 | `docs/ROUTE_TABLE.md` §7.4 + `docs/BEST_PRACTICES.md`「韧性」 |
 | 文件上传 / 内容校验 / 限额顺序 | `docs/BEST_PRACTICES.md`「上传与 multipart」 |
 | Worker / 邮箱 / 定时器 / RingBuffer（v0.16 运行时） | `docs/RUNTIME.md`（定位、契约、背压语义、兼容 10 条） |
+| 架构检查 / 依赖图 / `zmodu doctor` | `docs/ARCHITECTURE.md`「Architecture engine」+ `src/core/ModuleGraph.zig` |
 | 观测 / 告警 / Grafana | `docs/OBSERVABILITY.md`（黄金信号 + 阈值 + dashboard JSON；夜间 `zig build soak` 见 CI `soak` job） |
 | 部署拓扑（TLS 边车/探针/守护） | `examples/production-deploy/`（nginx · Envoy · k8s · systemd） |
 | Extract / SSE / Testkit / Outbox | `docs/FRAMEWORK_BACKLOG.md` |
@@ -83,6 +84,8 @@ defer app.stop();
 | 运行时是 opt-in：不调用 `app.runtime()` 就零线程、零定时器（v0.16 起） | 为普通 CRUD API 引入 worker（多一层，没有收益） |
 | 会持续失败的 worker 用 `spawnActor` + `max_errors`/`window_ms` 预算（停 + 计数），需要现场判断就声明 `onError` | 让"每条消息都出错"的 actor 永远只记录不停止（线程活着、邮箱在收，但是个 CPU 黑洞） |
 | 一个事件多个消费者且发布方不能等：`runtime.HotBus(E,N)` + 启动期 `subscribe(...)` + `freeze()` | 把 L0 扇出接到 `app.eventBus`（L1 会分配、可慢），或在热路径上自己遍历订阅者加锁 |
+| 模块依赖靠 `build(.{...})` 的编译期图检查拦住（环/缺失/自依赖/重名，报错带环路径） | 用 `@import` 跨模块直接引用对方内部文件（`zmodu doctor` 会报纠缠 + 文件:行） |
+| 交付前跑 `zmodu doctor`（阻断项 exit 1，可直接进 CI） | 声明无法执行的架构规则（如"domain 不许 import db"却只在文档里写 —— 编译期看不到 import，交 `doctor`） |
 | 取参数：路由占位 `pathParam`；form/query 用 `requestParam`（form 优先）或 `nestedParam`（点号路径） | 以为 `ctx.param` 会回退到 query/form（它只读路由占位符） |
 | 应用 root 接 `pub const panic = zmodu.panicHook`（panic 时输出当前请求 METHOD/path） | 请求路径 `catch unreachable` / `@panic`（audit b19–b21 拦截） |
 | 生产配置 `max_connections` + `header_timeout_ms`（连接洪泛/slowloris）；发布前 `zig build soak` | 只设 `request_timeout_ms` 就当防住了慢连接（它只管 handler 阶段） |

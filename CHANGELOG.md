@@ -1,5 +1,53 @@
 # Changelog
 
+## [Unreleased]
+
+> **0 breaking**（v0.18 = 架构引擎）。唯一可能让工程"突然编译不过"的是新增的编译期图检查 ——
+> 而它拦的正是**以前会在启动期 abort** 的那些图（环 / 缺失 / 自依赖 / 重名），
+> 需要动态装配模块的场景可以 `.withCompileTimeGraphCheck(false)` 关掉。
+
+### Added
+- **编译期架构检查（`src/core/ModuleGraph.zig` + `ApplicationBuilder.build`）** —— 模块依赖图从
+  "启动期校验"前移成"编译期数据"：
+  - 检查：缺失依赖 / 自依赖 / 重名 / **环（DFS，报错信息里带完整路径 `a -> b -> a`）**。
+  - 阻断性问题直接 `@compileError`，不再等到二进制跑起来第一件事就是 exit。
+  - 关闭：`.withCompileTimeGraphCheck(false)`（仅用于动态装配的模块集，启动期 `validateModules` 仍在）。
+  - 同一份分析在运行时也可用：`analyzeRuntime(allocator, nodes, limits)`（动态注册表可自检），
+    与编译期版本共享 `Report`/`Finding`/渲染器。
+  - 诚实边界：**"domain 不许 import 数据库"这类规则编译期无法检查** —— 模块声明里没有"某文件
+    import 了什么"这个信息。声明无法执行的规则比不声明更糟，所以源码级纠缠交给 `zmodu doctor`。
+- **`zmodu doctor`（CLI）** —— 不编译工程就能拿到架构健康报告：
+  - 复用 `audit.collectModules` 的源码扫描，跑同一套图检查（环/缺失/自依赖/重名/依赖数阈值/孤儿）。
+  - **新增跨模块直接 import 检测**：`src/modules/alpha/**` 里出现 `@import("../beta/service.zig")`
+    即报纠缠并给出 `文件:行`（"declare the dependency, import the module barrel, or `--allow`"）。
+  - `--json`（CI/看板）、`--max-deps N`、`--allow from->to`（承认一处纠缠，可重复）、`--skip-imports`。
+  - 退出码：阻断性问题 → 1（可直接进 CI），纠缠 → warn 不影响退出码（设计味道，不是坏图）。
+- 7 项 `ModuleGraph` 测试：健康图（含深度度量）、环（路径闭合）、自依赖+未知依赖、重名、
+  阈值与孤儿是**告警不阻断**、两个渲染器（Mermaid/DOT/文本，含错误文本里点到点的通配）、
+  以及运行时孪生（与编译期同结论）。CLI 侧另有 `moduleOfImport` 与 JSON 渲染的单元测试。
+
+### Fixed
+- **`mapOfImport` 的路径深度算术**（本版新写的第一版）：按"importing 文件的目录深度"扣 `..` 个数
+  会**拒掉模块根文件写的 `../../other/x.zig`** —— 而这正是最常见写法。改成"剥掉前导 `..` 后取首段，
+  再与已知模块名比对"，更简单也更难写错。
+- **`analyzeRuntime` 返回的是 DFS 栈而不是环**（首版）：环体被建好后没交给调用者，返回值少一个元素
+  且泄漏一份分配。现在通过出参回传，并有"环路径首尾同名"的断言兜住。
+- **`@compileError` 的无条件分析**：`if (!report.ok()) @compileError(...)` 在条件未被 comptime 折叠时，
+  分支体会被分析 —— 于是**所有**调用点（含健康图）都编译失败。用 `comptime {}` 块 + `inline ok()` 修正，
+  并留注释说明原因（这类 bug 的症状是"检查器把好代码也判死"，很容易被误当成"太严"而关掉）。
+
+### Changed
+- `tools/zmodu` 与根 `build.zig` 都把框架的 `ModuleGraph` 暴露为命名模块 `module_graph`：
+  CLI 与框架**共用一份**环/结论算法，而不是在工具里复制一份会漂移的实现。
+  为此 `ModuleGraph.zig` 保持**零框架依赖**（只用 std），其测试夹具用本地 `Info` 结构而非 `api.Module`。
+
+### Docs
+- `docs/ARCHITECTURE.md`：新增「Architecture engine」——两半的输入/时机/检查项、三层强度
+  （编译期挡住 / 启动期告警 / CLI 报告）、优先级约定（阻断 vs 告警），以及"为什么 import 级规则
+  只能在 CLI 层"。
+- `AGENTS.md`：文件地图加一行；DO/DON'T 加两行（依赖靠编译期检查拦住；交付前跑 `zmodu doctor`，
+  别声明无法执行的架构规则）。
+
 ## [0.17.0] - 2026-09-17
 
 > **0 breaking**（v0.17 = 运行时的监督与扇出，仍是纯新增）。v0.16 的 worker 语义一字未改：

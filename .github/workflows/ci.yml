@@ -141,6 +141,17 @@ jobs:
           echo "== building examples/zmsaas/backend =="
           (cd examples/zmsaas/backend && zig build)
 
+      - name: Architecture health on the example apps (zmodu doctor)
+        # Blocks on cycles / missing / self / duplicate dependencies and reports
+        # cross-module file imports with file:line. Runs on the example projects
+        # because the framework's own tree is not laid out as src/modules/<name>.
+        run: |
+          set -euo pipefail
+          for app in tenant-mgmt tenant-shop shopdemo zent-modulith; do
+            echo "== doctor examples/$app =="
+            ./zig-out/bin/zmodu doctor "examples/$app"
+          done
+
       - name: Run the runtime pipeline example (workers + mailboxes + timers)
         run: (cd examples/runtime-workers && zig build run)
 
