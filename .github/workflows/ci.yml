@@ -18,7 +18,11 @@ on:
     - cron: '17 3 * * *'
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # `event_name` is part of the key so the nightly `schedule` run — which fires on
+  # refs/heads/master and therefore used to share this group — cannot cancel a
+  # release's in-flight push run (and vice versa). Superseded runs of the *same*
+  # event still cancel each other, which is the part that matters for pushes.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 env:
