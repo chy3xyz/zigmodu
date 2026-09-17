@@ -144,6 +144,9 @@ test "compile all source files" {
     // Runtime (v0.16): ring/mailbox/timer/pool/worker primitives
     _ = @import("runtime.zig");
 
+    // AI boundary: ratcheted coupling + one-way seam (docs/AI_BOUNDARY.md)
+    _ = @import("test/AiBoundary.zig");
+
     // Tracing
     _ = @import("tracing/DistributedTracer.zig");
     _ = @import("tracing/OtlpExporter.zig");

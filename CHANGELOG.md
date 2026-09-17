@@ -1,5 +1,25 @@
 # Changelog
 
+## [Unreleased]
+
+> **0 breaking**（v0.20.1 = 把 AI 抽包的边界变成机器检查）。纯新增测试 + 文档。
+
+### Added
+- **`src/test/AiBoundary.zig`** —— AI 边界的机器检查，两半：
+  - **反向绝对禁止**：`src/{core,api,data,sqlx,http,security,messaging,runtime}` 下任何文件 import
+    `ai/` 即失败（现在 `src/` 里只有 `root.zig` 一行 re-export，是唯一的缝）。
+  - **正向 ratchet**：`src/ai/**` 只许 import 领域缝；直接 import 驱动层
+    （`sqlx/sqlx.zig`、`persistence/backends/**`）被冻结在实测上限 **30 / 26**，**只能减不能增**；
+    计数下降时会打印一行提醒把上限调低。
+- **`docs/AI_BOUNDARY.md`** —— 实测数据（21 个文件里 56 处绕过 `data.zig` 的驱动层 import）、
+  允许/禁止清单、每个文件的清理路径（`@import("../sqlx/sqlx.zig")` → `@import("../data.zig")`）、
+  抽包条件（两个计数到 0 且测试持续为绿），以及**为什么要 ratchet 而不是一次性清理**
+  （把 56 处 import 的迁移和边界定义混在一次提交里难以验证）。
+
+### Why
+v0.21 的 Agent Runtime 要求 AI 层能被别的包依赖 —— 而"能被依赖"的前提是它只依赖**稳定接口**
+（领域缝），不是"当前那个驱动文件恰好长这样"。顺序必须是先收边界再加能力，否则耦合只会更多。
+
 ## [0.20.0] - 2026-09-17
 
 > **0 breaking**（v0.20 = 长流程可恢复执行）。新增 `resumeInstance`，既有 `execute` / WAL 格式不变。
