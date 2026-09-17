@@ -67,6 +67,10 @@ test "ClusterHealth JSON output" {
     var cluster = try ClusterBootstrap.init(allocator, io, .{
         .node_id = "health-test",
         .port = 19001,
+        // This test exercises the health report, not elections: a single node has
+        // nothing to elect, so the stub Raft transport is fine (multi-node boots
+        // are refused — see the ClusterBootstrap tests).
+        .raft_cluster_size = 1,
     });
     defer cluster.deinit();
 

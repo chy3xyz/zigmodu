@@ -69,8 +69,9 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
-    var app = try zmodu.builder(allocator, std.testing.io)
-        .withName("my-app")
+    var b = zmodu.builder(allocator, std.testing.io);   // 先绑定：builder 方法收 *Self
+    defer b.deinit();
+    var app = try b.withName("my-app")
         .build(.{UserModule});
     defer app.deinit();
 
@@ -126,7 +127,9 @@ const zmodu = @import("zigmodu");
 const sec = zmodu.security;
 
 // Recommended: builder helper (uses initWithIo internally)
-var b = zmodu.builder(allocator, io).withName("my-app");
+var b = zmodu.builder(allocator, io);   // 先绑定：builder 方法收 *Self，临时值是 *const
+defer b.deinit();
+_ = b.withName("my-app");
 var app_sec = b.security("your-secret", 3600);
 try server.addMiddleware(app_sec.jwtMiddleware());
 

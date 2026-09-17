@@ -134,7 +134,9 @@ pub fn initWith(ctx: *zmodu.ModuleContext) !void {
 }
 
 // main 组装共享服务；start() 完成后容器冻结：
-var app = try zmodu.builder(allocator, io)
+var b = zmodu.builder(allocator, io);                    // 先绑定：builder 方法收 *Self
+defer b.deinit();
+var app = try b
     .withService(AppConfig, "config", &config)           // 借用注册：容器不销毁
     .build(.{OrderModule});
 try app.start();                                          // initWith 运行 → 容器 freeze

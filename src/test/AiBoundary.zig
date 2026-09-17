@@ -34,6 +34,7 @@ const allowed_prefixes = [_][]const u8{
     "http/", // Sse.zig — streaming is AI's own transport concern
     "http.zig", // the http domain barrel
     "data.zig", // the data domain barrel (the seam AI *should* use)
+    "runtime.zig", // the runtime domain barrel — Agent as a worker (docs/AGENT_RUNTIME.md)
     "messaging/",
     "scheduler/",
     "resilience/",

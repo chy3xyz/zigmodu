@@ -10,7 +10,9 @@
 //! changes:
 //!
 //! ```zig
-//! var app = try zmodu.builder(allocator, io).build(.{OrderModule});
+//! var b = zmodu.builder(allocator, io);          // bind first: a temporary is `*const`
+//! defer b.deinit();
+//! var app = try b.build(.{OrderModule});
 //! try app.start();
 //! const rt = app.runtime();                   // created on first use
 //! const worker = try rt.spawn(OrderBook, .{ .symbol = "BTC/USDT" });

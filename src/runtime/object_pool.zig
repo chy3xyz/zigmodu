@@ -18,6 +18,12 @@
 //! object twice is a data race that no test reliably catches. The critical
 //! section here is a pointer swap, so the lock costs little and is provably
 //! correct; if a profile ever shows it, shard the pool per thread instead.
+//!
+//! Adoption note (2026-09-17): **no in-tree consumer yet** — `src/im/`
+//! ConnectionRegistry keeps its own specialised free list, because it pools
+//! connection entries (a lock-free table, different constraints). Treat this as a
+//! public primitive: reach for it where a *bounded* pool of ordinary objects is
+//! wanted, and expect `acquire` to say "no" instead of growing.
 
 const std = @import("std");
 const SpinLock = @import("../core/SpinLock.zig").SpinLock;

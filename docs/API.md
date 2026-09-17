@@ -174,7 +174,7 @@ pub fn builder(allocator: std.mem.Allocator) ApplicationBuilder
 
 **Example:**
 ```zig
-var builder = zigmodu.builder(allocator);
+var builder = zigmodu.builder(allocator, io);   // io 来自 std.process.Init / 应用的 Io
 defer builder.deinit();
 
 var app = try builder

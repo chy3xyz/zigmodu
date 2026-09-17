@@ -71,6 +71,11 @@ pub const PeerDiscovery = struct {
     }
 
     /// Free a resolved peer slice returned by resolve().
+    ///
+    /// **Call it before `deinit()`**: it dereferences `self.allocator`, and
+    /// `deinit` poisons the struct (`self.* = undefined`). Getting that order
+    /// wrong segfaults only when the peer list is non-empty — which is why it
+    /// survived until a multi-node bootstrap test existed.
     pub fn deinitResolved(self: *Self, peers: []Peer) void {
         for (peers) |p| self.allocator.free(p.host);
         self.allocator.free(peers);

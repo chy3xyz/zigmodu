@@ -123,8 +123,11 @@ For large projects, import only the domains you need:
 ```zig
 const zmodu = @import("zigmodu");
 
-// Full import (everything):
-var app = try zmodu.builder(allocator, io).build(.{MyModule});
+// Full import (everything) — bind the builder first: a builder method takes
+// `*Self`, and a temporary is `*const`:
+var b = zmodu.builder(allocator, io);
+defer b.deinit();
+var app = try b.build(.{MyModule});
 
 // Fast import: only HTTP + Core (skips SQLx, Redis, Kafka, etc.):
 const http = zmodu.http;       // Server, middleware, client, OpenAPI
@@ -240,7 +243,9 @@ pub fn initWith(ctx: *zmodu.ModuleContext) !void {
 }
 
 // main wires shared services; container freezes after start():
-var app = try zmodu.builder(allocator, io)
+var b = zmodu.builder(allocator, io);                    // bind first: a builder method takes *Self
+defer b.deinit();
+var app = try b
     .withService(AppConfig, "config", &config)           // borrowed: not destroyed by container
     .build(.{OrderModule});
 try app.start();                                          // initWith runs → services frozen

@@ -11,10 +11,15 @@ const run_audit_mod = @import("run_audit.zig");
 const retriever_mod = @import("retriever.zig");
 const quota_mod = @import("quota.zig");
 const tokenizer = @import("tokenizer.zig");
+const guard_mod = @import("guard.zig");
+const memory_mod = @import("memory.zig");
+const Sequencer = @import("../runtime.zig").Sequencer;
 
 /// Monotonic sequence so `agent-<ms>-<seq>` run ids never collide, even for
-/// concurrent runs in the same millisecond.
-var run_id_seq = std.atomic.Value(u32).init(0);
+/// concurrent runs in the same millisecond. `runtime.Sequencer` *is* this
+/// (one atomic increment, documented, batch-capable) — using it keeps one
+/// primitive in the tree instead of a private copy of it.
+var run_id_seq = Sequencer.init(0);
 const Budget = @import("budget.zig").Budget;
 const ContextManager = @import("context.zig").ContextManager;
 const AgentHandle = @import("handle.zig").AgentHandle;
@@ -153,10 +158,96 @@ pub const AgentMetrics = struct {
     }
 };
 
+/// Default identity for a hand-built `Agent{}` and for `Spec.build`.
+pub const default_system_prompt = "You are a helpful agent. Prefer tools for factual lookups. When finished, reply with the final answer only.";
+
+/// One declarative place to answer "what is this agent, and what may it do".
+///
+/// A hand-built `Agent{}` can silently forget `guard` (and then nothing is
+/// enforced), `memory`, or its identity. A `Spec` makes those one reviewable
+/// literal and `build()` wires them, so `docs/AGENT_RUNTIME.md` §八 ("an agent
+/// is not allowed to act by default") is the *default* rather than something a
+/// caller has to remember.
+pub const Spec = struct {
+    /// Identity: the name reported in logs and Prometheus labels.
+    name: []const u8,
+    provider: *AiProvider,
+    skills: *SkillRegistry,
+    /// Identity: the system message (role / persona / instructions).
+    system_prompt: []const u8 = default_system_prompt,
+    /// Authority. `null` means **unbounded** — the agent runs every registered
+    /// tool that passes the allowlist. Prefer setting it; check `isGuarded`.
+    guard: ?*guard_mod.Guard = null,
+    /// Long-term memory recalled into the system message (tenant+user scoped).
+    memory: ?*memory_mod.MemoryStore = null,
+    memory_prefix: []const u8 = "",
+    memory_limit: usize = 8,
+    budget: ?*Budget = null,
+    /// Tool-name allowlist (`null` = every registered tool).
+    allowlist: ?[]const []const u8 = null,
+    tool_timeout_ms: ?u64 = null,
+    retriever: ?Retriever = null,
+    context: ?*ContextManager = null,
+    audit: ?*AgentAuditLog = null,
+    hooks: AgentHooks = .{},
+
+    pub fn build(self: Spec) Agent {
+        return .{
+            .provider = self.provider,
+            .registry = self.skills,
+            .name = self.name,
+            .system_prompt = self.system_prompt,
+            .guard = self.guard,
+            .memory = self.memory,
+            .memory_prefix = self.memory_prefix,
+            .memory_limit = self.memory_limit,
+            .budget = self.budget,
+            .allowlist = self.allowlist,
+            .tool_timeout_ms = self.tool_timeout_ms,
+            .retriever = self.retriever,
+            .context = self.context,
+            .audit = self.audit,
+            .hooks = self.hooks,
+        };
+    }
+
+    /// True when a guard is set but grants nothing: every tool call would come
+    /// back `ToolDenied`. Call it at startup and fail loudly rather than watch
+    /// the agent refuse its way through a run.
+    pub fn isInert(self: Spec) bool {
+        const g = self.guard orelse return false;
+        return g.isInert();
+    }
+
+    /// False for a spec with no guard at all — that agent is unbounded, which
+    /// is a different (and usually worse) problem than an inert one.
+    pub fn isGuarded(self: Spec) bool {
+        return self.guard != null;
+    }
+};
+
 pub const Agent = struct {
     provider: *AiProvider,
     registry: *SkillRegistry,
-    system_prompt: []const u8 = "You are a helpful agent. Prefer tools for factual lookups. When finished, reply with the final answer only.",
+    /// Identity: label for logs — a process running several agents is hard to
+    /// read without one.
+    name: []const u8 = "agent",
+    /// Authority. When set, **every** tool call is checked against the policy
+    /// (the tool's declared `action` × its name) before dispatch; a denied call
+    /// is fed back to the model as `{"error":"ToolDenied","reason":…}` instead
+    /// of running, so it can pivot to proposing. `null` keeps the legacy path
+    /// (allowlist + `hooks.on_tool_request` only) — see `docs/AGENT_RUNTIME.md`.
+    guard: ?*guard_mod.Guard = null,
+    /// Memory: facts for this run's tenant **and** user are recalled into the
+    /// system message. The run must carry a non-zero tenant *and* user id or
+    /// nothing is injected at all (`memory.recallBlockAlloc` — 0 means "any" to
+    /// `recall`, which would cross tenants).
+    memory: ?*memory_mod.MemoryStore = null,
+    /// Only recall logical keys with this prefix (e.g. `"user:"`). Empty = all.
+    memory_prefix: []const u8 = "",
+    /// Cap on facts injected per run.
+    memory_limit: usize = 8,
+    system_prompt: []const u8 = default_system_prompt,
     allowlist: ?[]const []const u8 = null,
     tool_timeout_ms: ?u64 = null,
     hooks: AgentHooks = .{},
@@ -220,6 +311,29 @@ pub const Agent = struct {
                     system_content = merged;
                 }
             } else |_| {}
+        }
+        // Memory is recalled *after* the retriever and merged the same way, so
+        // long-term facts about this identity ride along with the retrieved
+        // documents. It never widens the scope: without a non-zero tenant and
+        // user on the run, nothing is injected (see `memory.recallBlockAlloc`).
+        if (self.memory) |mem| {
+            const block: ?[]u8 = memory_mod.MemoryStore.recallBlockAlloc(
+                mem,
+                allocator,
+                skill_ctx.tenant_id,
+                skill_ctx.user_id,
+                self.memory_prefix,
+                self.memory_limit,
+            ) catch |err| blk: {
+                std.log.warn("[Agent:{s}] memory recall failed: {}", .{ self.name, err });
+                break :blk null;
+            };
+            if (block) |b| {
+                try owned_strs.append(allocator, b);
+                const merged = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ system_content, b });
+                try owned_strs.append(allocator, merged);
+                system_content = merged;
+            }
         }
 
         try messages.append(allocator, .{ .role = "system", .content = system_content });
@@ -343,6 +457,43 @@ pub const Agent = struct {
             for (tc_copy) |tc| {
                 _ = self.metrics.tool_calls.fetchAdd(1, .monotonic);
 
+                // Authority first: the guard decides what this agent may do at
+                // all, before a per-run approval hook is even asked. Unknown
+                // tools are left to dispatch (they cannot have an effect);
+                // everything else is judged by its *declared* class, and a tool
+                // that declared nothing is `execute` (`skill.Tool.action`).
+                if (self.guard) |g| {
+                    if (self.registry.get(tc.name)) |tool| {
+                        // 0 tokens: the run's LLM spend is `Agent.budget`'s job —
+                        // this gate is about authority, and double-charging the
+                        // same tokens twice would only make both limits lie.
+                        const decision = g.check(tool.action, tc.name, 0);
+                        if (decision != .allowed) {
+                            _ = self.metrics.tool_denied.fetchAdd(1, .monotonic);
+                            if (self.hooks.on_tool) |tcb| tcb(self.hooks.ctx, tc.name, false);
+                            if (self.audit) |log| {
+                                log.record(.tool_denied, tc.name, @tagName(decision), skill_ctx.tenant_id orelse 0, skill_ctx.user_id orelse 0);
+                            }
+                            // Machine-readable reason so the model can pivot
+                            // (a denied `execute` is a cue to propose).
+                            const err_s = try std.fmt.allocPrint(
+                                allocator,
+                                "{{\"error\":\"ToolDenied\",\"reason\":\"{s}\"}}",
+                                .{@tagName(decision)},
+                            );
+                            try owned_strs.append(allocator, err_s);
+                            const tid = try allocator.dupe(u8, tc.id);
+                            try owned_strs.append(allocator, tid);
+                            try messages.append(allocator, .{
+                                .role = "tool",
+                                .tool_call_id = tid,
+                                .content = err_s,
+                            });
+                            continue;
+                        }
+                    }
+                }
+
                 if (self.hooks.on_tool_request) |cb| {
                     if (cb(self.hooks.ctx, tc.name, tc.arguments) == .deny) {
                         _ = self.metrics.tool_denied.fetchAdd(1, .monotonic);
@@ -371,7 +522,7 @@ pub const Agent = struct {
                         break :blk .{ .object = .{} };
                     }
                     const parsed = std.json.parseFromSlice(std.json.Value, allocator, tc.arguments, .{}) catch |err| {
-                        std.log.warn("[Agent] tool arguments JSON parse failed (name={s}): {}", .{ tc.name, err });
+                        std.log.warn("[Agent:{s}] tool arguments JSON parse failed (name={s}): {}", .{ self.name, tc.name, err });
                         break :blk .{ .object = .{} };
                     };
                     parsed_opt = parsed;
@@ -437,7 +588,7 @@ pub const Agent = struct {
     ) !void {
         const store = self.audit_store orelse return;
         const now_ms = @import("../core/Time.zig").monotonicNowMilliseconds();
-        const seq = run_id_seq.fetchAdd(1, .monotonic);
+        const seq = run_id_seq.next();
         const run_id = try std.fmt.allocPrint(allocator, "agent-{d}-{d}", .{ now_ms, seq });
         defer allocator.free(run_id);
         try store.record(.{
@@ -451,6 +602,47 @@ pub const Agent = struct {
         });
     }
 };
+
+test "Spec.build carries identity, authority and memory into the agent" {
+    const allocator = std.testing.allocator;
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    var guard = guard_mod.Guard.init(.{ .allow = &.{"ping"} });
+    var store = memory_mod.MemoryStore.init(allocator, std.testing.io);
+    defer store.deinit();
+    var budget = @import("budget.zig").Budget.init(100);
+
+    const spec = Spec{
+        .name = "trader",
+        .provider = undefined, // never called: this test only checks the wiring
+        .skills = &registry,
+        .guard = &guard,
+        .memory = &store,
+        .memory_prefix = "user:",
+        .budget = &budget,
+        .allowlist = &.{"ping"},
+    };
+    try std.testing.expect(spec.isGuarded());
+    try std.testing.expect(!spec.isInert());
+
+    const agent = spec.build();
+    try std.testing.expectEqualStrings("trader", agent.name);
+    try std.testing.expectEqual(@as(?*guard_mod.Guard, &guard), agent.guard);
+    try std.testing.expectEqual(@as(?*memory_mod.MemoryStore, &store), agent.memory);
+    try std.testing.expectEqualStrings("user:", agent.memory_prefix);
+    try std.testing.expectEqual(@as(?*Budget, &budget), agent.budget);
+
+    // An inert guard and no guard at all are different problems, and the spec
+    // says which one you have.
+    var inert_guard = guard_mod.Guard.init(.{});
+    const inert = Spec{ .name = "x", .provider = undefined, .skills = &registry, .guard = &inert_guard };
+    try std.testing.expect(inert.isGuarded());
+    try std.testing.expect(inert.isInert());
+
+    const unbounded = Spec{ .name = "y", .provider = undefined, .skills = &registry };
+    try std.testing.expect(!unbounded.isGuarded());
+    try std.testing.expect(!unbounded.isInert());
+}
 
 test "AgentResult deinit frees owned answer" {
     const a = std.testing.allocator;
@@ -796,6 +988,69 @@ test "Agent.run stops when a cancel is requested mid-run" {
     defer result.deinit(allocator);
     try std.testing.expect(result.canceled);
     try std.testing.expectEqual(@as(usize, 1), agent.metrics.canceled.load(.monotonic));
+}
+
+test "Agent.run asks the guard before dispatching a tool" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    const State = struct {
+        var calls: usize = 0;
+    };
+
+    // The tool declares `.execute`, so the policy's second switch is the only
+    // thing that decides between the two phases.
+    for ([_]bool{ false, true }) |allow_execute| {
+        State.calls = 0;
+        var server = try MockAgentServer.start(allocator, std.testing.io, struct {
+            fn f(call: u32) []const u8 {
+                return if (call == 0) mock_tool_call_body else mock_final_body;
+            }
+        }.f);
+        defer server.deinit();
+
+        var url_buf: [128]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/v1/chat/completions", .{server.port()});
+        var http = @import("../http/HttpClient.zig").HttpClient.init(allocator, std.testing.io, 1, 5000);
+        defer http.deinit();
+        var provider = provider_mod.AiProvider.init(allocator, &http, url, "Bearer sk", "mock");
+
+        var registry = SkillRegistry.init(allocator, std.testing.io);
+        defer registry.deinit();
+        try registry.register(.{
+            .name = "ping",
+            .description = "pong",
+            .parameters = &.{},
+            .action = .execute,
+            .handler = struct {
+                fn h(c: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+                    State.calls += 1;
+                    var obj = std.json.ObjectMap{};
+                    try obj.put(c.allocator, try c.allocator.dupe(u8, "ok"), .{ .bool = true });
+                    return .{ .object = obj };
+                }
+            }.h,
+        });
+
+        var guard = guard_mod.Guard.init(.{ .allow = &.{"ping"}, .allow_execute = allow_execute });
+        var agent = Agent{ .provider = &provider, .registry = &registry, .guard = &guard };
+        var sctx = SkillContext{ .allocator = allocator };
+        var result = try agent.run(allocator, "q", &sctx, 5);
+        defer result.deinit(allocator);
+
+        // Either way the model gets an answer: a refusal is information it can
+        // act on (e.g. propose instead), not a failed run.
+        try std.testing.expectEqualStrings("done", result.answer);
+        if (allow_execute) {
+            try std.testing.expectEqual(@as(usize, 1), State.calls);
+            try std.testing.expectEqual(@as(usize, 0), agent.metrics.tool_denied.load(.monotonic));
+            try std.testing.expectEqual(@as(u64, 1), guard.stats().allowed);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), State.calls);
+            try std.testing.expectEqual(@as(usize, 1), agent.metrics.tool_denied.load(.monotonic));
+            try std.testing.expectEqual(@as(u64, 1), guard.stats().denied_execute_class);
+        }
+    }
 }
 
 test "SkillRegistry tools json for agent" {

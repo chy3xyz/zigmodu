@@ -277,11 +277,13 @@ zmodu market list --catalog <path>     # 用外部目录文件替代内嵌目录
 一条命令跑完全部门禁（面向 CI 或本地提交流程）：
 
 ```bash
-zmodu ci [dir]      # zig build → fmt --check → verify → audit → deadcode
+zmodu ci [dir]      # zig build → fmt --check → verify → audit → deadcode → doctor
 ```
 
 任何一步失败退出码 1，全部通过退出码 0。业务项目可在 GitHub Actions 里
-直接 `zmodu ci`，无需再拼多段脚本。
+直接 `zmodu ci`，无需再拼多段脚本。最后一步 `doctor` 是**架构健康**（环依赖 + 源码级纠缠，
+即"某个模块的文件绕过声明边界直接 import 另一个模块的文件"）—— 它与 CI 里针对每个 example 单独跑的那条
+口径一致，所以本地 `zmodu ci` 绿 ≈ CI 那条也绿。
 
 ## `zmodu graph` — 模块依赖图（Mermaid）
 
@@ -348,3 +350,18 @@ zig build zmodu -- scaffold --from-db postgresql://user@localhost/db --name myap
 ```
 
 运行时 DSN 与链接驱动必须一致；未链接的驱动会在 `Client.connect` 返回 `error.DriverNotEnabled`。
+
+## `zmodu module <name> [--full]` — 模块骨架
+
+默认只写 `src/modules/<name>/module.zig`（一个声明）。`--full` 追加其余层文件，一次得到
+`docs/MODULE_LAYERS.md` 说的模块形状：
+
+```bash
+zmodu module order --full
+# → src/modules/order/{module,model,persistence,service,api,root,module_test}.zig
+```
+
+- 生成的代码**能解析**（CI 用 `zig fmt --check` 校验），但表还不存在——`persistence.zig` 里是
+  参数化 SQL 骨架，`service.zig` 是占位实现，替换成真实命令即可。
+- `api.zig` 的 `ping` 路由默认 `.jwt`：把它改成 `.public` 应当是一行**刻意**的改动，而不是生成器的默认。
+- 已有文件不会被覆盖，除非加 `--force`（`--dry-run` 可先看要写什么）。

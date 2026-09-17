@@ -1,5 +1,85 @@
 # Changelog
 
+## [Unreleased]
+
+> **0 breaking**（Agent 闸门接线 + 三段骨架）。既有字段与函数签名全部保留，新增字段都有默认值。
+
+### Added
+- **`Guard` 接进 `Agent.run`**：设了 `Agent.guard` 之后，**每次工具调用先过闸门再分派** —— 被拒时把
+  `{"error":"ToolDenied","reason":…}` 当工具结果喂回模型（它可以改走"提议"分支），同时计
+  `AgentMetrics.tool_denied` 并按具体原因写 audit。闸门排在 `hooks.on_tool_request` 之前：结构上不该
+  发生的事不必先问人。走闸门时不扣 guard 预算（LLM 花费归 `Agent.budget`，同一个 token 不记两次账）。
+- **`skill.Tool.action`（默认 `execute`）**：工具自己声明类别（`read` / `propose` / `execute`）。
+  忘了声明的工具永远拿不到宽策略 —— fail-closed 的默认值。
+- **`ai.AgentSpec`**（`agent.Spec` + `build()`）：身份 / 技能 / 记忆 / 权限收在一处声明；
+  `isGuarded()` 与 `isInert()` 把"没有闸门（无界）"和"有闸门但什么都没授予（惰性）"分开，便于启动期断言。
+- **`Agent.memory` / `memory_prefix` / `memory_limit`** + **`memory.recallBlockAlloc`**：记忆按本次运行的
+  tenant + user 注入 system message。`recall` 把 `0` 当"任意"，所以身份缺失或为 0 时**一个字都不注入**
+  （跨租户注入是沉默的、最坏的那种失败）。
+- **`ai.ProposalPipeline`**（`src/ai/proposal.zig`）：把 `todo3.md` §八 的三段做成不能跳序的骨架 ——
+  `guard(.propose)` → `risk.RiskReview` →（escalate 时）`approval.ApprovalFlow` → `guard(.execute)` → executor。
+  `executeStage` 私有；没有审批链时 escalate 是硬停（agent 不自我批准）；风险结论在"能不能执行"之前产生，
+  于是常态结局是 `execute_not_permitted` **带着风险结果**交给人工，而不是一句无权限的沉默失败。
+- 测试 +8（**1096 passed / 21 skipped / 0 failed**）：记忆作用域拒绝、Pipeline 三条拒绝路径（含 sqlite
+  风险规则）、审批链放行、`Agent.run` 走闸门的两个相位、`AgentSpec` 接线。
+
+### Changed
+- `Agent` 新增 `name` 字段（默认 `"agent"`），日志改为 `[Agent:<name>] …`，同进程多 agent 可分辨。
+- `docs/AGENT_RUNTIME.md` 增补：闸门接线、`AgentSpec`、Pipeline 图与三个刻意决定、记忆的 `0` 语义。
+- **Runtime 被框架真正采用**（v0.21 之后第一件"装配线"工作）：
+  - `ModuleContext.runtime()`（`src/core/ModuleContext.zig`）—— 模块在 `initWith` 里 spawn worker/timer；
+    `Application.stop()` **先**请求停止并 join 它们、**再** `Lifecycle.stopAll`（worker 可能正在调模块服务）。
+    裸 harness（直接 `Lifecycle.startAllWith`）里返回 `error.RuntimeUnavailable`，明确失败而不是偷偷新建一个。
+  - `Application.runtime()` 现在**首次调用即启动 ticker**：此前返回未启动的 runtime，`handle.after(...)` 会静默不触发；
+    启动失败时清理已分配的内存（`errdefer rt.deinit()`）。
+  - e2e 测试锁定两条不变量：`ctx.runtime() == app.runtime()`（同一个对象）、worker 随 `app.stop()` 被 join
+    （`src/Application.zig`「a module spawns workers through ctx.runtime()」）。
+  - **`examples/runtime-workers` 改走 app + module 路径**：管线在 `Pipeline.initWith` 里通过 `ctx.runtime()` 建好，
+    `main` 只驱动与观察 —— 参考示例教的形态与文档一致，且 CI 每次都会跑这条路径。
+  - `docs/RUNTIME.md` 新增 §3d「模块里怎么用」：四条规则（只借不还 / 停止顺序 / 别自己 shutdown / 测试用 Manual 时钟就别走 app）。
+- **`ai.AgentWorker`（`src/ai/agent_worker.zig`）—— `Agent → Worker → Event` 接通**（`todo3.md` §八）：
+  `Agent.run` 会阻塞调用线程整轮 LLM 往返（`ai.trigger.Trigger.fire` 就是这么调的，一个慢模型占住一个请求线程），
+  现在可以把 agent 跑成运行时 worker —— 有界邮箱（满 → 生产方 `error.Full`）、生命周期（`stop()` join）、
+  监督（`spawnActor` + 错误预算）、指标（`handle.stats()`）全部白拿。
+  - 所有权明确：`agent_worker.post()` dupe 目标文本、worker 跑完释放；`on_result` 拿到的 `AgentResult` 是借用。
+  - 失败不算 worker 错误：provider 挂掉走 `on_result(err)` 由 app 决定重试/DLQ/告警，监督器错误预算留给真 bug
+    （`stats().handler_errors` 保持 0，有测试断言）。
+  - `executor` 可注入：默认 `Agent.run`，测试用罐头执行器（两个新测试不碰网络）。
+  - 边界：`runtime.zig` 作为领域缝加入 `src/test/AiBoundary.zig` 白名单，理由写进 `docs/AI_BOUNDARY.md`
+    （单向：ai → runtime 允许，runtime → ai 由反向检查绝对禁止）。
+- **Cluster 读侧接通**（`todo3.md` §七 的第一条装配线）：`src/cluster/MembershipView.zig` 把 membership（写侧
+  hash map）喂给 `ClusterView`（读侧引用计数快照 + rendezvous），请求路径不再读写侧；`ClusterBootstrap` 自带
+  一个 view 并新增 `tick()`（一次做 gossip/health + 刷新读侧；`error.ReadersBusy` 不是失败）与 `getView()`；
+  `root.zig` 导出此前只能按文件路径拿的 `RaftElection` / `PeerDiscovery` / `LoadBalancer` / `ClusterHealth` /
+  `AccrualFailureDetector`；`ClusterMembership` 新增只读的 `nodesSnapshot()`（读侧的取数缝）。
+  - 顺带修掉 gossip 负载里的地址格式：`{any}` 打印的是结构体 dump（`.{ .ip4 = .{ .bytes = … } }`）→ 改 `{f}`
+    （`host:port`），并把"被发现的节点按 `127.0.0.1` 记账"这条**跨主机限制**写进代码注释与 `docs/DISTRIBUTED.md`。
+- **`zmodu module <name> --full`**：默认只写 `module.zig`（一个声明），`--full` 追加六件套
+  （`model` / `persistence` / `service` / `api` / `root` / `module_test`），一次得到 `docs/MODULE_LAYERS.md`
+  说的模块形状。生成物经 `zig fmt --check` 解析校验、无残留占位符；`api.zig` 的 `ping` 路由默认 `.jwt`
+  （改 `.public` 应当是刻意的一行）。实测：`zmodu module order --full` → 7 个文件、全部解析通过。
+- **`zmodu ci` 纳入 `doctor`**：`zmodu ci` 现在跑 6 步（compile → fmt → verify → audit → deadcode → **doctor**），
+  架构健康检查（环依赖 + 源码级纠缠）与应用发布门禁合成一条命令，与 CI 里针对每个 example 跑的那条
+  （`ci.yml` "Architecture health on the example apps"）口径一致。已按 CI 的调用方式在 `examples/basic` 上
+  端到端验证：`[doctor] PASS` + `summary: PASS`（exit 0）。
+- **孤儿原语收编**（复核里"存在但没人用"那一条）：
+  - `runtime.Sequencer` 接上真实消费者：`ai/agent.zig` 的 run-id 序列原本是私有 `std.atomic.Value(u32)`，
+    现在用 `Sequencer`（同一语义、有文档、还带 `nextBatch`；经 `runtime.zig` 领域桶导入，落在 AI 边界白名单内）。
+  - `runtime.ObjectPool` 如实标注「暂无仓内消费者」：`src/im/ConnectionRegistry.zig` 有连接表专用的 free list
+    （约束不同），所以这条是**文档而非接线** —— 它的头注释解释了为何用 SpinLock 而非 Treiber 栈（ABA），
+    属于刻意写的公共原语，面向"有界池、满了就拒绝"的场景。
+- **文档片段抽查 `src/test/DocSnippets.zig`**：扫 `AGENTS.md` / `README.md` / `README.zh.md` / `docs/**.md` 里的
+  **围栏代码块**（`zig` 或无标签；散文与表格按速记处理），禁止把 builder 方法直接链在 `zmodu.builder(…)`
+  临时值后面 —— 那个形状编译不过（`error: expected type '*T', found '*const T'`，此前 12 处都这么写）。
+  带"检测器自身的单测"：坏形状必须被抓、`var b = …` 正确形状必须放行。
+- **集群：多节点启动 fail-closed + 修掉一个段错误**：
+  - `ClusterBootstrap` 的 Raft 传输是桩（投票发不出去、append 恒 false），`raft_cluster_size > 1` 时 `start()`
+    现在返回 `error.RaftTransportUnavailable`（并说明怎么承认：`.allow_stub_raft_transport = true`，或单节点
+    `raft_cluster_size = 1`）—— 不再静默选出一个没有 quorum 的 leader。
+  - **修段错误**：`start()` 里 `disco.deinit()` 与 `deinitResolved(peers)` 的 defer 顺序反了（前者把结构体置
+    `undefined`，后者仍要读 `self.allocator`）→ 只要带**一个 peer** 启动就崩在 `0xaaaa…`。空 peer 列表时循环体
+    不执行，所以这条多节点路径此前从未被跑过；新测试现在覆盖它（`PeerDiscovery.deinitResolved` 的文档也写明了这个调用顺序要求）。
+
 ## [0.21.0] - 2026-09-17
 
 > **0 breaking**（v0.21 = Agent 的运行时闸门）。纯新增，`Agent` / `SkillRegistry` / `Budget` 一字未动。

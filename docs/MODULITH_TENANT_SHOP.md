@@ -227,8 +227,9 @@ tenant-shop/
 ## 4. `main` 组装顺序（示意）
 
 ```zig
-var app = try zmodu.builder(allocator, io)
-    .withName("tenant-shop")
+var b = zmodu.builder(allocator, io);   // 先绑定：builder 方法收 *Self，临时值是 *const
+defer b.deinit();
+var app = try b.withName("tenant-shop")
     .build(.{
         tenant.Module,
         user.Module,

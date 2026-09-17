@@ -19,10 +19,17 @@ AI 代码直接 import **驱动层**（`sqlx/sqlx.zig`、`persistence/backends/*
 
 - **反向（core → ai）绝对禁止**：`src/{core,api,data,sqlx,http,security,messaging,runtime}` 下任何文件
   import `ai/` 都会让测试失败。只有 `root.zig` 的 re-export 是缝。
-- **正向（ai → 框架）ratchet**：只允许 import 领域缝（`data.zig` / `http.zig` / `core/Time` /
+- **正向（ai → 框架）ratchet**：只允许 import 领域缝（`data.zig` / `http.zig` / `runtime.zig` / `core/Time` /
   `http/Sse` / `messaging/` / `scheduler/` / `resilience/` / `tracing/` / `redis/` / `security/` /
   `test/`）。直接 import 驱动层被**冻结在两个上限**（30 / 26），**只能减不能增** —— 新增一处就编译失败。
   计数下降时测试会打印一行，提醒把上限调低锁住成果。
+
+### `runtime.zig`（2026-09-17 加入白名单）
+
+`src/ai/agent_worker.zig` 把 Agent 跑成运行时 worker（`todo3.md` §八 的 `Agent → Worker → Event`），
+所以 ai 要拿 `runtime.zig` 这个**领域桶**（`Runtime` / `Handle` / `WorkerContext`），不是 `runtime/` 下的内部文件。
+方向是单向的：**ai → runtime 允许，runtime → ai 由反向检查绝对禁止**（`src/runtime` 只依赖 `core/Time`、`core/SpinLock`）。
+把它当成和 `data.zig` 同级的缝：要么用桶，要么不用。
 
 为什么要 ratchet 而不是一次性清理：一次性改 56 处跨 21 个文件的 import 是把"边界"和"行为"两件事
 混在一次提交里，风险高且难验证；ratchet 保证**债务不再增长**，然后可以按模块逐个搬。

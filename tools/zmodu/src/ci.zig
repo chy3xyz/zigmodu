@@ -1,7 +1,8 @@
 //! `zmodu ci` — one-shot quality gate for ZigModu projects.
 //!
 //! Runs, in order: `zig build` (compile), `zig fmt --check`, `verify`
-//! (structure/imports), `audit` (best-practice rules) and `deadcode`.
+//! (structure/imports), `audit` (best-practice rules), `deadcode` and `doctor`
+//! (architecture health: cycles + source-level entanglement).
 //! Exit: 0 all pass, 1 any step fails, 2 usage error.
 
 const std = @import("std");
@@ -10,11 +11,12 @@ const Dir = Io.Dir;
 const verify_mod = @import("verify.zig");
 const audit_mod = @import("audit.zig");
 const deadcode_mod = @import("deadcode.zig");
+const doctor_mod = @import("doctor.zig");
 
 pub const usage =
     \\Usage: zmodu ci [dir]
     \\
-    \\One-shot quality gate: zig build + zig fmt --check + verify + audit + deadcode.
+    \\One-shot quality gate: zig build + zig fmt --check + verify + audit + deadcode + doctor.
     \\
     \\Options:
     \\  -h, --help   show this help
@@ -177,6 +179,22 @@ pub fn run(io: Io, allocator: std.mem.Allocator, args: []const []const u8) u8 {
         }
     } else {
         stdout.print("[deadcode] SKIP (no src/tools dirs)\n", .{}) catch return 1;
+    }
+
+    // 6. doctor — architecture health (cycles + source-level entanglement). CI
+    // already runs exactly this per example app, so folding it in means an app
+    // author gets the same gate from one command. In-process: doctor prints its own
+    // report, and exits 1 on blocking findings.
+    {
+        const doc_code = doctor_mod.run(io, allocator, &.{dir});
+        if (doc_code == 0) {
+            stdout.print("[doctor] PASS (no cycles, no unacknowledged entanglement)\n", .{}) catch return 1;
+        } else if (doc_code == 1) {
+            failed = true;
+            stdout.print("[doctor] FAIL (architecture health)\n", .{}) catch return 1;
+        } else {
+            stdout.print("[doctor] SKIP ({d})\n", .{doc_code}) catch return 1;
+        }
     }
 
     if (failed) {

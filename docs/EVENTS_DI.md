@@ -56,8 +56,9 @@ pub fn initWith(ctx: *zmodu.ModuleContext) !void {       // 新增：需要总�
 ### 2.2 main：组装者接线
 
 ```zig
-var app = try zmodu.builder(allocator, io)
-    .withName("shop")
+var b = zmodu.builder(allocator, io);   // 先绑定：builder 方法收 *Self，临时值是 *const
+defer b.deinit();
+var app = try b.withName("shop")
     .withService(AppConfig, "config", &config)   // 借用注册：容器不销毁 &config
     .build(.{ UserModule, OrderModule });
 defer app.deinit();

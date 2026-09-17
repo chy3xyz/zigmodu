@@ -6,7 +6,9 @@ const std = @import("std");
 //
 // Quick start:
 //   const zmodu = @import("zigmodu");
-//   var app = try zmodu.builder(allocator, io).build(.{MyModule});
+//   var b = zmodu.builder(allocator, io);          // bind first: a temporary is `*const`
+//   defer b.deinit();
+//   var app = try b.build(.{MyModule});
 //
 // For faster compilation, import only the domain you need:
 //   const http = zmodu.http;       // Server, middleware, client
@@ -124,7 +126,20 @@ pub const ClusterBootstrap = @import("core/cluster/ClusterBootstrap.zig").Cluste
 pub const ClusterView = @import("cluster/ClusterView.zig").ClusterView;
 pub const ClusterMember = @import("cluster/ClusterView.zig").Member;
 pub const ClusterSnapshot = @import("cluster/ClusterView.zig").Snapshot;
+/// The bridge that feeds `ClusterView` from `ClusterMembership` — use this, not
+/// the membership map, on request paths (`docs/DISTRIBUTED.md`).
+pub const MembershipView = @import("cluster/MembershipView.zig").MembershipView;
+pub const ClusterNodeView = @import("cluster/MembershipView.zig").Node;
 pub const ClusterMembership = @import("core/ClusterMembership.zig").ClusterMembership;
+/// Cluster building blocks. Exported so an app can assemble its own topology
+/// instead of taking the whole `ClusterBootstrap`; each is independently tested
+/// and **not** wired into a request path by the framework (see the readiness
+/// notes in `docs/DISTRIBUTED.md`).
+pub const RaftElection = @import("core/cluster/RaftElection.zig").RaftElection;
+pub const PeerDiscovery = @import("core/cluster/PeerDiscovery.zig").PeerDiscovery;
+pub const LoadBalancer = @import("core/cluster/LoadBalancer.zig").LoadBalancer;
+pub const ClusterHealth = @import("core/cluster/ClusterHealth.zig").ClusterHealth;
+pub const AccrualFailureDetector = @import("core/cluster/FailureDetector.zig").AccrualFailureDetector;
 pub const SagaOrchestrator = @import("core/SagaOrchestrator.zig").SagaOrchestrator;
 pub const SagaLog = @import("core/SagaOrchestrator.zig").SagaLog;
 pub const SagaStatus = @import("core/SagaOrchestrator.zig").SagaStatus;

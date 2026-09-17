@@ -151,6 +151,11 @@ pub const MemoryStore = struct {
 
     /// Format recalled memories as context strings for system prompt injection.
     /// Returns allocated string — caller owns.
+    ///
+    /// **Pass real ids.** `recall` treats `0` as "any", so `tenant_id = 0` pulls
+    /// every tenant's memories into the string. An agent run carries `?i64`
+    /// identity and often has none — use `recallBlockAlloc` there, which refuses
+    /// to widen instead.
     pub fn formatContext(
         self: *MemoryStore,
         allocator: std.mem.Allocator,
@@ -177,6 +182,46 @@ pub const MemoryStore = struct {
             try buf.appendSlice(allocator, "\n");
         }
         return buf.toOwnedSlice(allocator);
+    }
+
+    /// Recall block for an agent run, or `null` when there is nothing safe to
+    /// inject.
+    ///
+    /// The refusal *is* the feature: `recall` treats `0` as "any"
+    /// (`if (e.tenant_id != tenant_id and tenant_id != 0)`), so passing `0` for
+    /// a missing id returns **every tenant's** memories. A run with no tenant
+    /// (or no user) therefore gets no memory block at all, and ids are used
+    /// exactly as given — never widened. Returns `null` rather than an empty
+    /// header so the prompt is not padded with noise. Caller frees.
+    pub fn recallBlockAlloc(
+        self: *MemoryStore,
+        allocator: std.mem.Allocator,
+        tenant_id: ?i64,
+        user_id: ?i64,
+        key_prefix: []const u8,
+        limit: usize,
+    ) !?[]u8 {
+        const tenant = tenant_id orelse return null;
+        const user = user_id orelse return null;
+        if (tenant == 0 or user == 0 or limit == 0) return null;
+
+        var recalled = try self.recall(allocator, key_prefix, tenant, user);
+        defer {
+            for (recalled.items) |e| {
+                allocator.free(e.key);
+                allocator.free(e.value);
+            }
+            recalled.deinit(allocator);
+        }
+        if (recalled.items.len == 0) return null;
+
+        var buf = std.ArrayList(u8).empty;
+        errdefer buf.deinit(allocator);
+        try buf.appendSlice(allocator, "Facts you remember about this user:\n");
+        for (recalled.items[0..@min(limit, recalled.items.len)]) |e| {
+            try buf.print(allocator, "- {s} = {s}\n", .{ e.key, e.value });
+        }
+        return try buf.toOwnedSlice(allocator);
     }
 
     pub fn count(self: *MemoryStore) usize {
@@ -342,6 +387,40 @@ test "MemoryStore formatContext" {
 
     try std.testing.expect(std.mem.indexOf(u8, ctx, "Alice") != null);
     try std.testing.expect(std.mem.indexOf(u8, ctx, "admin") != null);
+}
+
+test "MemoryStore recallBlockAlloc refuses to widen scope" {
+    const a = std.testing.allocator;
+    var store = MemoryStore.init(a, std.testing.io);
+    defer store.deinit();
+
+    try store.remember("user:fact:lang", "zh-hans", 1, 42);
+    try store.remember("user:fact:theme", "dark", 1, 42);
+    try store.remember("user:fact:lang", "en-US", 2, 42); // same user, other tenant
+    try store.remember("user:fact:lang", "fr-FR", 1, 7); // same tenant, other user
+
+    const block = (try store.recallBlockAlloc(a, 1, 42, "user:", 8)).?;
+    defer a.free(block);
+    try std.testing.expect(std.mem.indexOf(u8, block, "zh-hans") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, block, "\n- "));
+    try std.testing.expect(std.mem.indexOf(u8, block, "en-US") == null);
+    try std.testing.expect(std.mem.indexOf(u8, block, "fr-FR") == null);
+
+    // Missing or zero identity: no block at all. `recall` reads 0 as "any", so
+    // rendering anything here would put other tenants' facts in the prompt.
+    try std.testing.expectEqual(@as(?[]u8, null), try store.recallBlockAlloc(a, null, 42, "user:", 8));
+    try std.testing.expectEqual(@as(?[]u8, null), try store.recallBlockAlloc(a, 1, null, "user:", 8));
+    try std.testing.expectEqual(@as(?[]u8, null), try store.recallBlockAlloc(a, 0, 42, "user:", 8));
+    try std.testing.expectEqual(@as(?[]u8, null), try store.recallBlockAlloc(a, 1, 0, "user:", 8));
+
+    // No match, and limit 0, are both "nothing to say".
+    try std.testing.expectEqual(@as(?[]u8, null), try store.recallBlockAlloc(a, 1, 42, "order:", 8));
+    try std.testing.expectEqual(@as(?[]u8, null), try store.recallBlockAlloc(a, 1, 42, "user:", 0));
+
+    // `limit` bounds the block.
+    const one = (try store.recallBlockAlloc(a, 1, 42, "user:", 1)).?;
+    defer a.free(one);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, one, "\n- "));
 }
 
 test "MemoryStore capacity eviction" {

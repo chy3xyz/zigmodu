@@ -139,8 +139,9 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     // io 来自 Zig 0.17 Init / 应用约定
 
-    var app = try zmodu.builder(allocator, io)
-        .withName("shop")
+    var b = zmodu.builder(allocator, io);   // 先绑定：builder 方法收 *Self，临时值是 *const
+    defer b.deinit();
+    var app = try b.withName("shop")
         .build(.{ UserModule, ProductModule, OrderModule, PaymentModule });
     defer app.deinit();
 

@@ -22,7 +22,7 @@
 //!    rather than growing a queue. `stats().dropped_full` records the choice.
 //! 3. **Timers deliver messages** — the snapshot timer is `book.after(...)`, so it
 //!    runs on the book's thread with the book's state, not on the ticker's.
-//! 4. **Graceful stop** — `rt.shutdown()` requests stop, wakes every blocked
+//! 4. **Graceful stop** — `app.stop()` requests stop, wakes every blocked
 //!    `recv`, then joins. Nothing is abandoned.
 //!
 //! Run: `zig build run` (add `--summary all` to see the runtime stats table).
@@ -165,43 +165,77 @@ const FaultyReporter = struct {
     }
 };
 
+/// The pipeline as a module: the app hands it the runtime in `initWith`, so the
+/// workers belong to the module lifecycle — `app.stop()` joins them, and
+/// nothing in `main` has to remember to.
+pub const Pipeline = struct {
+    pub const info = zmodu.api.Module{
+        .name = "pipeline",
+        .description = "order book + risk + audit workers",
+        .dependencies = &.{},
+    };
+
+    /// Handles are send portals, not shared state: `send` *is* the hand-off, so
+    /// `main` may drive the feed through `book` while the book keeps its state.
+    var risk: ?*runtime.Handle(Risk, 256) = null;
+    var book: ?*runtime.Handle(OrderBook, 256) = null;
+    var audit: ?*runtime.Handle(Audit, 64) = null;
+    var faulty: ?*runtime.Handle(FaultyReporter, 32) = null;
+    var bus: runtime.HotBus(Delta, 4) = undefined;
+    var metrics: MetricsSink = .{};
+
+    pub fn initWith(ctx: *zmodu.ModuleContext) !void {
+        const rt = try ctx.runtime(); // the app's runtime, not a private one
+
+        risk = try rt.spawn(Risk, .{}, 256);
+
+        // L0 fan-out (v0.17): wired during startup, frozen before traffic. The
+        // book publishes every accepted delta; a slow subscriber is *dropped and
+        // counted* rather than allowed to slow the book down.
+        bus = runtime.HotBus(Delta, 4).init();
+        audit = try rt.spawn(Audit, .{}, 64);
+        try bus.subscribe(audit.?); // a real worker (slow, deliberately)
+        try bus.subscribeSink(metrics.sink()); // a plain sink, no worker needed
+        bus.freeze();
+
+        // Supervised actor (v0.17): 3 errors inside the window means "stop", not
+        // "log forever" — the difference between spawnActor and spawn.
+        faulty = try rt.spawnActor(FaultyReporter, .{}, 32, .{ .max_errors = 3, .window_ms = 60_000 });
+        for (0..10) |_| faulty.?.send(.{ .price = 1, .qty = 1, .bid = true }) catch break;
+
+        // The book needs the risk handle, so it is spawned with a placeholder
+        // and wired in `init` — hence the two-step (a real app would pass a
+        // service locator, or spawn risk from inside the book's init).
+        book = try rt.spawn(OrderBook, .{ .risk = risk.?, .bus = &bus }, 256);
+    }
+
+    pub fn deinit() void {}
+};
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
 
     std.log.info("runtime-workers: no locks, no shared mutable state below this line", .{});
 
-    // A runtime can stand alone; `app.runtime()` gives you one wired to an app
-    // (created on first call, shut down by `app.stop()`).
-    var rt = runtime.Runtime.init(allocator, io, .monotonic);
-    defer rt.deinit();
-    // Timers need the ticker. Skip `start()` and `handle.after(...)` stays
-    // pending until you call `rt.tick()` yourself (which is what a test with a
-    // Manual clock does).
-    try rt.start();
+    // The app owns the runtime: created on first use, ticker started for you,
+    // and joined by `app.stop()` — one lifecycle for the process, no stray
+    // threads. (A runtime can also stand alone in a test: then you drive
+    // `rt.tick()` with a Manual clock and own `rt.deinit()`.)
+    var b = zmodu.builder(allocator, io);
+    defer b.deinit();
+    var app = try b.withName("runtime-workers").build(.{Pipeline});
+    defer app.deinit();
+    try app.start(); // Pipeline.initWith spawned the whole pipeline
+    const rt = try app.runtime();
 
-    const risk = try rt.spawn(Risk, .{}, 256);
-
-    // L0 fan-out (v0.17): wired during startup, frozen before traffic. The book
-    // publishes every accepted delta; a slow subscriber is *dropped and counted*
-    // rather than allowed to slow the book down.
-    var bus = runtime.HotBus(Delta, 4).init();
-    const audit = try rt.spawn(Audit, .{}, 64);
-    try bus.subscribe(audit); // a real worker (slow, deliberately)
-    var metrics = MetricsSink{};
-    try bus.subscribeSink(metrics.sink()); // a plain sink, no worker needed
-    bus.freeze();
-
-    // Supervised actor (v0.17): 3 errors inside the window means "stop", not
-    // "log forever" — the difference between spawnActor and spawn.
-    const faulty = try rt.spawnActor(FaultyReporter, .{}, 32, .{ .max_errors = 3, .window_ms = 60_000 });
-    for (0..10) |_| faulty.send(.{ .price = 1, .qty = 1, .bid = true }) catch break;
-
-    // The book needs the risk handle, so it is spawned with a placeholder and
-    // wired in `init` — hence the two-step here (a real app would pass a
-    // service locator or spawn risk from inside the book's init).
-    const book_init = OrderBook{ .risk = risk, .bus = &bus };
-    const book = try rt.spawn(OrderBook, book_init, 256);
+    // Local aliases so the run below reads like the single-process pipeline it is.
+    const risk = Pipeline.risk.?;
+    const book = Pipeline.book.?;
+    const audit = Pipeline.audit.?;
+    const faulty = Pipeline.faulty.?;
+    const bus = &Pipeline.bus;
+    const metrics = &Pipeline.metrics;
 
     // Feed: a plain thread, deliberately faster than the pipeline drains, to make
     // the backpressure path visible in the counters.
@@ -251,6 +285,6 @@ pub fn main(init: std.process.Init) !void {
         bs.mailbox_capacity, bs.mailbox_len, bs.dropped_full, book.state.coalesced,
     });
 
-    rt.shutdown(); // requests stop, wakes blocked recvs, joins
+    app.stop(); // requests stop, wakes blocked recvs, joins
     std.log.info("[done] every worker joined", .{});
 }

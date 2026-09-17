@@ -23,7 +23,7 @@
 | 集群成员读侧（请求路径选节点/健康度） | `docs/DISTRIBUTED.md`「集群读侧」+ `zigmodu.ClusterView`（`acquire`/`release`，别读写入侧的哈希表） |
 | 长流程 / 崩溃续跑（Saga、补偿、检查点） | `docs/WORKFLOW.md` + `SagaOrchestrator.resumeInstance`（有副作用的一步必须幂等） |
 | 改 `src/ai/**` 前（它只能依赖领域缝） | `docs/AI_BOUNDARY.md` + `src/test/AiBoundary.zig`（驱动层 import 数只减不增） |
-| Agent 能做什么（默认不能执行） | `docs/AGENT_RUNTIME.md` + `ai.Guard`（`execute` 需 `allow_execute` 第二开关；`deny` 压过 `allow`） |
+| Agent 能做什么（默认不能执行） | `docs/AGENT_RUNTIME.md` + `ai.Guard` / `ai.AgentSpec` / `ai.ProposalPipeline` / `ai.AgentWorker`（闸门已接进 `Agent.run`；Agent 可跑成运行时 worker） |
 | 观测 / 告警 / Grafana | `docs/OBSERVABILITY.md`（黄金信号 + 阈值 + dashboard JSON；夜间 `zig build soak` 见 CI `soak` job） |
 | 部署拓扑（TLS 边车/探针/守护） | `examples/production-deploy/`（nginx · Envoy · k8s · systemd） |
 | Extract / SSE / Testkit / Outbox | `docs/FRAMEWORK_BACKLOG.md` |
@@ -50,8 +50,11 @@ pub const info = zmodu.api.Module{ .name = "my-module", .description = "...", .d
 pub fn init() !void { ... }
 pub fn deinit() void { ... }
 
-// App builder
-var app = try zmodu.builder(allocator, io).withName("app").build(.{ModuleA, ModuleB});
+// App builder — bind it first: a builder method takes `*Self`, and a temporary
+// is `*const` (`error: expected type '*T', found '*const T'`).
+var b = zmodu.builder(allocator, io);
+defer b.deinit();
+var app = try b.withName("app").build(.{ModuleA, ModuleB});
 defer app.deinit();
 try app.start();
 defer app.stop();
@@ -76,7 +79,10 @@ defer app.stop();
 | WS：`on_message(session, msg, kind)` — **text+binary**（`WsFrameKind`）；`writeBinary`/`writeData` | 假定只收 0x1；丢弃 0x2（会破坏 OpenIM protobuf） |
 | sqlx：`Client.open` 后注意 pool/client 指针；CB 传 `io` | 在 ConnPool 上缓存失效的 `*Client` |
 | sqlx 驱动链接：`-Ddb=sqlite\|postgres\|mysql\|all`（默认 `all`） | 小系统用 `.db = "sqlite"`，勿默认三库全链 |
+| Agent：`AgentSpec{.guard=…}` + 技能声明 `.action`（默认 `execute`）；`ai.ProposalPipeline` 走提议→风险→执行 | 裸 `Agent{}` 不设 `guard`（= **无界**）；用 `MemoryStore.formatContext` 给 agent 喂记忆（`0` = 任意 = 跨租户） |
 | 共享注册表：`zmodu.FrozenMap/FrozenStringMap`，启动期填充后 `freeze()` | 文件作用域裸 HashMap 在 worker 池上并发写（撕裂元数据 → 进程崩溃） |
+| Runtime：模块里 `ctx.runtime()`（app 拥有：首次创建即启动 ticker；`stop()` 先 join worker 再停模块） | 模块里自己 `Runtime.init`（线程没人 join）；在模块里 `rt.shutdown()`（提前打断别的模块的 worker） |
+| 文档/注释里的 builder 片段：先 `var b = zmodu.builder(allocator, io); defer b.deinit();` 再链式 | 写 `builder(…).withName(…)`（临时值是 `*const`，编译不过；`src/test/DocSnippets.zig` 会抽查文档代码块） |
 | 错误体统一：启动期 `http.useRfc7807Errors()`（链内 + 路由前一次到位） | 写链尾中间件改 404 体（需把 `moduleGate` 降成 `.unknown = .allow`）；靠 `curl` 才发现形状不一致 |
 | 单 gate 换形状：`.reject = http.problemReject`（`ModuleGateConfig` 也支持 `reject`） | 为改 404 体而放弃 `.unknown = .deny` |
 | handler 问门户：`ctx.permissionMatches("portal:user\|portal:shop")`（与路由声明同表达式） | handler 重写门户检查只认一侧（OR meta 会被窄化成 403） |

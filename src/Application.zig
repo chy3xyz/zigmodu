@@ -168,12 +168,14 @@ pub const Application = struct {
         }
 
         // Start modules — each may declare initWith(ctx) to receive the
-        // shared EventRegistry + DI container (classic init() still works).
+        // shared EventRegistry + DI container (classic init() still works), and
+        // `ctx.runtime()` to spawn workers that `stop()` will join.
         var module_ctx = ModuleContext{
             .allocator = self.allocator,
             .io = self.io,
             .events = &self.events,
             .services = &self.services,
+            .runtime_provider = .{ .ctx = self, .get = provideRuntime },
         };
         try Lifecycle.startAllWith(&self.modules, &module_ctx);
         // Startup wiring complete: further registration is rejected, and
@@ -240,24 +242,37 @@ pub const Application = struct {
         try self.shutdown_hooks.append(self.allocator, hook);
     }
 
-    /// Get or create the shared thread-safe bus for event type `T`.
-    /// The execution runtime, created on first use. Additive: an app that never
-    /// asks for it behaves exactly as before (no threads, no timers).
+    /// The execution runtime, created on first use **and started** (the ticker
+    /// runs, so `handle.after(...)` fires without help). Additive: an app that
+    /// never asks for it behaves exactly as before (no threads, no timers).
     ///
     /// ```zig
     /// const rt = try app.runtime();
     /// const worker = try rt.spawn(OrderBook, .{ .symbol = "BTC/USDT" });
     /// try worker.send(.{ .price = 101 });
     /// ```
+    ///
+    /// Modules reach the same runtime through `ModuleContext.runtime()`, so a
+    /// worker spawned in `initWith` is joined by `stop()` like any other.
     pub fn runtime(self: *Self) !*rt_mod.Runtime {
         if (self.runtime_state) |rt| return rt;
         const rt = try self.allocator.create(rt_mod.Runtime);
         errdefer self.allocator.destroy(rt);
         rt.* = rt_mod.Runtime.init(self.allocator, self.io, .monotonic);
+        errdefer rt.deinit();
+        try rt.start();
         self.runtime_state = rt;
         return rt;
     }
 
+    /// Adapter handed to `ModuleContext.RuntimeProvider`: one owner, so
+    /// `ctx.runtime()` and `app.runtime()` are the same object.
+    fn provideRuntime(ud: ?*anyopaque) anyerror!*rt_mod.Runtime {
+        const app: *Application = @ptrCast(@alignCast(ud orelse return error.RuntimeUnavailable));
+        return app.runtime();
+    }
+
+    /// Get or create the shared thread-safe bus for event type `T`.
     pub fn eventBus(self: *Self, comptime T: type) !*@import("core/EventBus.zig").ThreadSafeEventBus(T) {
         return self.events.bus(T);
     }
@@ -783,6 +798,75 @@ test "e2e: Application events + services wiring through ModuleContext" {
     try std.testing.expectEqual(@as(i64, 10), Ctx.received);
 
     app.stop();
+}
+
+test "e2e: a module spawns workers through ctx.runtime() and stop() joins them" {
+    const allocator = std.testing.allocator;
+
+    const Ctx = struct {
+        var got_runtime = false;
+        var same_runtime = false;
+        var total = std.atomic.Value(u32).init(0);
+        var seen = std.atomic.Value(u32).init(0);
+    };
+    Ctx.got_runtime = false;
+    Ctx.same_runtime = false;
+    Ctx.total.store(0, .monotonic);
+    Ctx.seen.store(0, .monotonic);
+
+    const Counter = struct {
+        pub const Message = u32;
+        pub fn handle(_: *@This(), msg: u32, ctx: anytype) anyerror!void {
+            _ = ctx;
+            _ = Ctx.total.fetchAdd(msg, .monotonic);
+            _ = Ctx.seen.fetchAdd(1, .monotonic);
+        }
+    };
+
+    const BookModule = struct {
+        pub const info = api.Module{
+            .name = "book",
+            .description = "Owns a worker, spawned from the module lifecycle",
+            .dependencies = &.{},
+        };
+        pub fn initWith(ctx: *ModuleContext) !void {
+            // The app owns the runtime: created on first use, ticker running,
+            // joined by `app.stop()`. Modules never build their own.
+            const rt = try ctx.runtime();
+            Ctx.got_runtime = true;
+            Ctx.same_runtime = rt == try ctx.runtime();
+            const worker = try rt.spawn(Counter, .{}, 32);
+            for (1..4) |i| try worker.send(@intCast(i));
+        }
+        pub fn deinit() void {}
+    };
+
+    var app = try Application.init(std.testing.io, allocator, "worker-app", .{BookModule}, .{});
+    defer app.deinit();
+
+    try app.start();
+    try std.testing.expect(Ctx.got_runtime);
+    try std.testing.expect(Ctx.same_runtime);
+
+    // The worker runs on its own thread: wait for the three sends to land.
+    var spins: usize = 0;
+    while (Ctx.seen.load(.monotonic) != 3 and spins < 400_000_000) : (spins += 1) std.atomic.spinLoopHint();
+    try std.testing.expectEqual(@as(u32, 3), Ctx.seen.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 6), Ctx.total.load(.monotonic));
+
+    // `stop()` requests stop and joins, so no runtime thread outlives the app —
+    // which is what makes the deferred `deinit()` race-free.
+    app.stop();
+    try std.testing.expectEqual(Application.State.stopped, app.getState());
+
+    // A harness that never wired a provider says so instead of inventing one.
+    var bare = ModuleContext{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .events = &app.events,
+        .services = &app.services,
+    };
+    try std.testing.expectError(error.RuntimeUnavailable, bare.runtime());
 }
 
 test "e2e: in-flight counter tracks request lifecycle" {

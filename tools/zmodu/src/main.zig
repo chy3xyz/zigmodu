@@ -1078,15 +1078,18 @@ pub fn cmdModule(io: std.Io, allocator: std.mem.Allocator, args: []const []const
     }
 
     var opts: GenOptions = .{};
+    var full = false;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--dry-run")) {
             opts.dry_run = true;
         } else if (std.mem.eql(u8, args[i], "--force")) {
             opts.force = true;
+        } else if (std.mem.eql(u8, args[i], "--full")) {
+            full = true;
         } else {
             std.log.err("Unknown option for module: {s}", .{args[i]});
-            std.log.err("Usage: zmodu module <name> [--dry-run] [--force]", .{});
+            std.log.err("Usage: zmodu module <name> [--full] [--dry-run] [--force]", .{});
             return error.CliUsage;
         }
     }
@@ -1104,6 +1107,8 @@ pub fn cmdModule(io: std.Io, allocator: std.mem.Allocator, args: []const []const
     defer allocator.free(module_path);
 
     try safeWrite(io, allocator, module_path, module_code, opts);
+
+    if (full) try writeModuleSkeleton(io, allocator, module_name, module_dir, opts);
 
     std.log.info("Module {s} created: {s}", .{ module_name, module_path });
 }
@@ -1684,7 +1689,10 @@ fn generateMainZig(allocator: std.mem.Allocator, project_name: []const u8) ![]co
         \\    std.log.info("Application '{{PROJECT_NAME}}' started!", .{});
         \\
         \\    // TODO: Add your modules via `zmodu module <name>`
-        \\    // Then wire them in: var app = try zigmodu.builder(allocator, init.io).build(.{...});
+        \\    // Then wire them in (bind the builder first — a temporary is `*const`):
+        \\    //   var b = zigmodu.builder(allocator, init.io);
+        \\    //   defer b.deinit();
+        \\    //   var app = try b.build(.{ ... });
         \\}
         \\
     ;
@@ -1695,6 +1703,147 @@ fn generateModule(allocator: std.mem.Allocator, module_name: []const u8) ![]cons
     // Same shape as ORM-generated modules (AGENTS.md: init/deinit, api.Module fields).
     return generateModuleZig(allocator, module_name, "&.{}");
 }
+
+/// `zmodu module <name> --full`: the rest of the module skeleton. `module.zig`
+/// alone is a declaration — a module that earns the name owns its layer files
+/// (model / persistence / service / api / root, see `docs/MODULE_LAYERS.md`).
+fn writeModuleSkeleton(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    module_name: []const u8,
+    module_dir: []const u8,
+    opts: GenOptions,
+) !void {
+    const pascal = try toPascalCase(allocator, module_name);
+    defer allocator.free(pascal);
+
+    const files = [_]struct { name: []const u8, body: []const u8 }{
+        .{ .name = "model.zig", .body = module_model_tpl },
+        .{ .name = "persistence.zig", .body = module_persistence_tpl },
+        .{ .name = "service.zig", .body = module_service_tpl },
+        .{ .name = "api.zig", .body = module_api_tpl },
+        .{ .name = "root.zig", .body = module_root_tpl },
+        .{ .name = "module_test.zig", .body = module_test_tpl },
+    };
+    for (files) |f| {
+        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ module_dir, f.name });
+        defer allocator.free(path);
+        const body = try orm_tpl.expandTemplate(
+            allocator,
+            f.body,
+            &.{ "{{NAME}}", "{{PASCAL_NAME}}" },
+            &.{ module_name, pascal },
+        );
+        defer allocator.free(body);
+        try safeWrite(io, allocator, path, body, opts);
+    }
+    std.log.info("Module skeleton written: {d} files under {s}", .{ files.len, module_dir });
+}
+
+const module_model_tpl =
+    \\//! Row shape for the `{{NAME}}` module: fields mirror columns 1:1.
+    \\//! No SQL here — persistence owns the statements (docs/MODULE_LAYERS.md).
+    \\
+    \\pub const {{PASCAL_NAME}} = struct {
+    \\    id: i64 = 0,
+    \\    created_at: i64 = 0,
+    \\    updated_at: i64 = 0,
+    \\};
+    \\
+;
+
+const module_persistence_tpl =
+    \\//! Parameterized SQL for `{{NAME}}`. Every statement takes `?` arguments —
+    \\//! never interpolate values into SQL (docs/BEST_PRACTICES.md).
+    \\
+    \\pub const find_by_id =
+    \\    "SELECT id, created_at, updated_at FROM {{NAME}} WHERE id = ?";
+    \\pub const insert_row =
+    \\    "INSERT INTO {{NAME}} (created_at, updated_at) VALUES (?, ?)";
+    \\
+;
+
+const module_service_tpl =
+    \\//! `{{PASCAL_NAME}}` service: commands in, results out; the transaction
+    \\//! boundary lives here (docs/MODULE_LAYERS.md). SQL stays in persistence.zig.
+    \\
+    \\const std = @import("std");
+    \\const model = @import("model.zig");
+    \\
+    \\pub const Service = struct {
+    \\    allocator: std.mem.Allocator,
+    \\
+    \\    pub fn init(allocator: std.mem.Allocator) Service {
+    \\        return .{ .allocator = allocator };
+    \\    }
+    \\
+    \\    pub fn deinit(self: *Service) void {
+    \\        _ = self;
+    \\    }
+    \\
+    \\    /// Replace with a real command once the table exists.
+    \\    pub fn save(self: *Service, row: model.{{PASCAL_NAME}}) !model.{{PASCAL_NAME}} {
+    \\        _ = self;
+    \\        return row;
+    \\    }
+    \\};
+    \\
+;
+
+const module_api_tpl =
+    \\//! `{{PASCAL_NAME}}` HTTP surface (ComptimeRouter). `.jwt` is the secure
+    \\//! default — switching a route to `.public` should be a deliberate line.
+    \\
+    \\const http = @import("zigmodu").http;
+    \\
+    \\pub fn Api(comptime Service: type) type {
+    \\    return struct {
+    \\        const Self = @This();
+    \\        service: *Service,
+    \\
+    \\        pub const module_name = "{{NAME}}";
+    \\        pub const nest = .{"{{NAME}}"};
+    \\        pub const State = Self;
+    \\
+    \\        pub const routes = [_]http.RouteSpec(State){
+    \\            .{ .method = .GET, .path = "ping", .handler = ping, .meta = .{ .auth = .jwt } },
+    \\        };
+    \\
+    \\        fn ping(ctx: *http.Context, self: *State) !void {
+    \\            _ = self;
+    \\            try ctx.json(200, .{ .ok = true });
+    \\        }
+    \\    };
+    \\}
+    \\
+;
+
+const module_root_tpl =
+    \\//! Barrel for `{{NAME}}` — import this from outside the module, never the
+    \\//! layer files directly (docs/MODULITH.md).
+    \\
+    \\pub const model = @import("model.zig");
+    \\pub const persistence = @import("persistence.zig");
+    \\pub const service = @import("service.zig");
+    \\pub const api = @import("api.zig");
+    \\
+;
+
+const module_test_tpl =
+    \\//! Smoke test for `{{NAME}}`. Wire it into the module's arch/test root so it
+    \\//! runs with `zig build test`.
+    \\
+    \\const std = @import("std");
+    \\const service_mod = @import("service.zig");
+    \\
+    \\test "{{NAME}}: the service returns the row it was given" {
+    \\    var service = service_mod.Service.init(std.testing.allocator);
+    \\    defer service.deinit();
+    \\    const out = try service.save(.{ .id = 1 });
+    \\    try std.testing.expectEqual(@as(i64, 1), out.id);
+    \\}
+    \\
+;
 
 fn generateEvent(allocator: std.mem.Allocator, event_name: []const u8) ![]const u8 {
     const pascal_name = try toPascalCase(allocator, event_name);

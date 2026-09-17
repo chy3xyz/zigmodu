@@ -145,6 +145,53 @@ if (!try bus.publish(trade)) { /* 所有订阅者都满了 */ }
 
 与 `app.eventBus(T)` 的分工见 §6：L1 要"最终大家都看到"（可以分配、可以慢），L0 要"发布方绝不停"（有界、可丢）。
 
+## 3d. 模块里怎么用（Application 拥有 Runtime）
+
+`Runtime` 不必自己 new：**`Application` 就是它的所有者** —— 首次用到时创建、ticker 自动跑、
+`stop()` 时请求停止并 join。模块通过 `ModuleContext.runtime()` 拿到**同一个** runtime：
+
+```zig
+const zmodu = @import("zigmodu");
+const rt = zmodu.runtime;
+
+/// 拥有一个 worker 的模块：从 `initWith` 里 spawn，生命周期交给 app。
+pub const BookModule = struct {
+    pub const info = zmodu.api.Module{
+        .name = "book",
+        .description = "order book worker",
+        .dependencies = &.{},
+    };
+
+    pub fn initWith(ctx: *zmodu.ModuleContext) !void {
+        const runtime = try ctx.runtime();               // 不是新建，是 app 的那个
+        _ = try runtime.spawn(OrderBook, .{ .symbol = "BTC/USDT" }, 256);
+    }
+    pub fn deinit() void {}
+};
+
+// main：
+var b = zmodu.builder(allocator, io);   // 先绑定：builder 方法收 `*Self`，临时值是 `*const`
+defer b.deinit();
+var app = try b.withName("trader").build(.{BookModule});
+defer app.deinit();
+try app.start();    // initWith 里 spawn 的 worker 已经在跑
+defer app.stop();   // 先请求停止 + join worker，再停模块
+```
+
+规则：
+
+- **模块只借不还**：不要在模块里 `Runtime.init` —— 那样线程没人 join；`ctx.runtime()` 拿到的那个由 app 收尾。
+- **停止顺序是刻意的**：`app.stop()` **先** join 所有 worker，**再** `Lifecycle.stopAll`。worker 可能正在调模块服务，
+  反过来就会 use-after-free。
+- **不要在模块里 `rt.shutdown()` / `rt.deinit()`**：虽然幂等，但会提前打断别的模块的 worker。
+- **测试想用 `Manual` 时钟自己 `tick()`？** 那就别走 app：`Runtime.init(alloc, io, .{ .manual = &clk })`
+  并自己 `defer rt.deinit()`（`src/runtime/runtime.zig` 的单测就是这么做的）。
+- 没有 provider 的裸 harness（直接调 `Lifecycle.startAllWith`）里 `ctx.runtime()` 返回 `error.RuntimeUnavailable` ——
+  明确失败，而不是偷偷给你一个没人管的 runtime。
+
+接线在 `Application.start()`（注入 `ModuleContext.runtime_provider`）与 `Application.runtime()`；
+`ctx.runtime() == app.runtime()` 这条不变量有 e2e 测试兜底（`src/Application.zig` 「a module spawns workers through ctx.runtime()」）。
+
 ## 4. 原语与取舍
 
 | 类型 | 并发形态 | 关键性质 |
@@ -213,11 +260,11 @@ const s = rt.stats();
 |------|------|------|
 | **v0.16.0** | `RingBuffer` / `MpscRing` / `Mailbox` / `ObjectPool` / `Clock` / `Wheel` / `Runtime` + `Worker` + `app.runtime()` | ✅ 本文档 |
 | **v0.17.0** | Actor 监督（`spawnActor` + 错误预算 + `onError` 现场决策）、`HotBus`（L0 扇出，freeze 后无锁、drop-on-full）、`Sequencer` | ✅ 本文档 §3b/§3c |
-| v0.18 | 编译期架构引擎：依赖图、架构规则、`zmodu graph`、`zmodu doctor` | 计划（下一步） |
+| **v0.18** | 编译期架构引擎：依赖图（`ModuleGraph` 编译期报环）、`zmodu graph`（Mermaid）、`zmodu doctor` | ✅ 已发布（doctor 清单仍未覆盖"未解析服务/事件拓扑/消费者计数"，见 `docs/dev/todo3.md` 评估） |
 | 之后 | 真监督树（父决定子的重启策略）、带干净状态的重启、跨进程/跨节点监督 | 未承诺 |
-| v0.19 | Cluster / Shard / Service Discovery（**适配** QUIC/gRPC/NATS，不发明协议） | 计划 |
-| v0.20 | Workflow（状态机 + Saga + 补偿 + 检查点 + 恢复） | 计划 |
-| v0.21 | Agent Runtime（Identity / Memory / Skills / Permissions / Budget 一等化） | 计划 |
+| **v0.19** | Cluster / Shard / Service Discovery | ⚠ 部分：`ClusterView`（读侧快照/rendezvous）、`ShardRouter` 落地；选主（`RaftElection`）/LB/`PeerDiscovery` 存在但**未导出、未接线**，集群传输仍是自造 TCP（未按本节原意"适配 QUIC"） |
+| **v0.20** | Workflow（状态机 + Saga + 补偿 + 检查点 + 恢复） | ⚠ 部分：Saga 补偿 + WAL 检查点 + 崩溃续跑 ✅（`SagaOrchestrator.resumeInstance` / `restoreFromWal`）；**状态机与 timeout 未做**（`SagaStep.timed_out` 从不赋值），`.step().compensate()` DSL 明确不做（`docs/WORKFLOW.md`） |
+| **v0.21** | Agent Runtime（Identity / Memory / Skills / Permissions / Budget 一等化） | ✅ 已发布：`ai.AgentSpec` + `ai.Guard`（已接进 `Agent.run`）+ `ai.ProposalPipeline` —— 见 `docs/AGENT_RUNTIME.md`；**Agent 的 State / Event subscriptions / Lifecycle 与 Worker 接线仍未做** |
 | 1.0 | API 收敛、命名统一、deprecated 清理 | 计划 |
 
 ## 10. 最小示例

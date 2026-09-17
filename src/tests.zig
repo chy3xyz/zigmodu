@@ -135,6 +135,7 @@ test "compile all source files" {
     _ = @import("http/UploadGuard.zig");
     _ = @import("test/ContractGate.zig");
     _ = @import("test/DocsConsistency.zig");
+    _ = @import("test/DocSnippets.zig");
     _ = @import("test/ErrorSetSnapshot.zig");
     _ = @import("test/CombinationMatrix.zig");
     _ = @import("test/ErrorShape.zig");
@@ -147,6 +148,9 @@ test "compile all source files" {
     // AI boundary: ratcheted coupling + one-way seam (docs/AI_BOUNDARY.md)
     _ = @import("test/AiBoundary.zig");
     _ = @import("ai/guard.zig");
+    _ = @import("ai/proposal.zig");
+    _ = @import("ai/agent_worker.zig");
+    _ = @import("cluster/MembershipView.zig");
 
     // Tracing
     _ = @import("tracing/DistributedTracer.zig");

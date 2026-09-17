@@ -223,7 +223,14 @@ pub const ClusterMembership = struct {
         var buf: [1024]u8 = undefined;
 
         var addr_buf: [64]u8 = undefined;
-        const addr_str = try std.fmt.bufPrint(&addr_buf, "{any}", .{self.address});
+        // `{f}`, not `{any}`: the latter renders the structural dump
+        // (`.{ .ip4 = .{ .bytes = … } }`), which used to travel inside the
+        // gossip payload as `"h"`. `{f}` calls `IpAddress.format` → `host:port`.
+        var w = std.Io.Writer.fixed(&addr_buf);
+        w.print("{f}", .{self.address}) catch |err| {
+            std.log.debug("[ClusterMembership] address format failed: {}", .{err});
+        };
+        const addr_str = w.buffered();
         const host = if (std.mem.indexOf(u8, addr_str, ":")) |colon| addr_str[0..colon] else addr_str;
 
         const payload = try std.fmt.bufPrint(&buf, "{{\"t\":{d},\"id\":\"{s}\",\"h\":\"{s}\",\"p\":{d},\"ts\":{d}}}", .{ @backingInt(event_type), self.node_id, host, self.address.ip4.port, Time.monotonicNowSeconds() });
@@ -287,6 +294,11 @@ pub const ClusterMembership = struct {
         if (std.mem.eql(u8, event.node_id, self.node_id)) return;
 
         const now = Time.monotonicNowSeconds();
+        // The gossip payload carries the peer's host, but nothing here resolves
+        // it: a discovered node is addressed as loopback + its advertised port.
+        // So *discovery* works when the peer is reachable at 127.0.0.1 (same host,
+        // or a container network that routes it); across hosts use explicit seeds
+        // (`connectToSeed`) — those carry their real address and are unaffected.
         const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = event.port } };
 
         // Record heartbeat in failure detector if available
@@ -366,6 +378,25 @@ pub const ClusterMembership = struct {
             }
         }
         return count;
+    }
+
+    /// Copy the node list into `out` (mutex-protected) and return how many were
+    /// written. This is the seam the **read side** needs: `ClusterView` is fed
+    /// from here (`cluster/MembershipView.zig`), so request paths never touch
+    /// this hash map. `ClusterNode` values borrow `id` — valid while the
+    /// membership lives, which is exactly what a view publish expects.
+    pub fn nodesSnapshot(self: *Self, out: []ClusterNode) usize {
+        self.mutex.lock(self.io) catch return 0;
+        defer self.mutex.unlock(self.io);
+
+        var n: usize = 0;
+        var iter = self.nodes.iterator();
+        while (iter.next()) |entry| {
+            if (n >= out.len) break;
+            out[n] = entry.value_ptr.*;
+            n += 1;
+        }
+        return n;
     }
 
     pub fn getLeader(self: *Self) ?[]const u8 {

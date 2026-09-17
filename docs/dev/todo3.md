@@ -1,5 +1,51 @@
 # Modular Runtime for High-Performance Systems
 
+> **复核（v0.21.0，2026-09-17）**：8 个方向已按 v0.16→v0.21 推进六个版本，**零件基本齐备**，但
+> 「升级为 Modular Runtime Platform」这个目标**未完全达成** —— 差距在**采用/接线**与**参考实现**，
+> 不在能力有无。逐条见下表；判定口径 = 代码里能跑、且有人用（证据为 文件:行号）。
+
+| # | 方向 | 判定 | 关键证据 / 差距 |
+|---|------|------|----------------|
+| 1 | Hot Runtime | ⚠ 部分（**采用已接通**） | `src/runtime/` 8 文件 2783 行：SPSC(`ring.zig:45`) + MPSC(`:125`)、`mailbox.zig:42`、`timer_wheel.zig:28`、`hot_bus.zig:44`、`clock.zig:21`。✅ **已被框架采用**：模块 `ctx.runtime()`(`core/ModuleContext.zig`) + `app.runtime()` 首次创建即启动 ticker + `stop()` 先 join worker 再停模块（e2e 测试锁定 `ctx.runtime() == app.runtime()`；`examples/runtime-workers` 走 app+module 路径）。**仍缺** MPMC/SPMC、scheduler/reactor/arena/metrics；`sequencer.zig`/`object_pool.zig` 零使用者 |
+| 2 | Actor / Worker | ⚠ 部分 | 契约式 worker + `Runtime.spawn`(`runtime.zig:340`)、监督(`:82,353,565`)、背压(`mailbox.zig:28`)；模块已能在 `initWith` 里 spawn（见第 1 行）。**仍缺** `Worker(State)` 泛型类型、`ActorSystem`、真监督树（`docs/RUNTIME.md` 已标"未承诺"） |
+| 3 | Compile-time Architecture | ✅ 机制达成 | 编译期模块图 + 环路径报错(`ModuleGraph.zig:186-216` ← `Application.zig:428`)；`zmodu graph`/`doctor` 已发布。**未做** `module(.{.imports,.exports})` DSL 与 `cannot_import` 声明（原因见 `ModuleGraph.zig:24-30`） |
+| 4 | Event 三层 | ✅ 基本达成 | L0 `HotBus`(`hot_bus.zig:44`)、L1 `app.eventBus`(`Application.zig:261`)、L2 Kafka/NATS/Outbox + 自研 TCP Bus。**缺** Redis Stream、L2 统一接口；L0 框架内部仍无消费者（只有 `examples/runtime-workers`） |
+| 5 | Distributed Runtime | ⚠ 部分（**读侧已接通**） | 零件齐：`ClusterView.zig` + **`MembershipView.zig`（本轮接线：membership → view，`ClusterBootstrap.tick()` 驱动）**、`RaftElection.zig`(1311 行)、`LoadBalancer.zig`、`PeerDiscovery.zig`、`ShardRouter.zig`。**缺** 统一门面（仍无 `Cluster` 类型）、选主传输仍是桩（**已 fail-closed**：多节点启动直接拒绝，不再假装选主）、LB 无接入点；2PC 无持久化日志(`DistributedTransaction.zig:331`)；跨主机 gossip 发现按 `127.0.0.1` 记账（要解析器，或用 seed） |
+| 6 | AI-native Runtime | ✅ 达成度最高 | `ai.AgentSpec`(`agent.zig:168`)、`ai.Guard`(`guard.zig:63`，已接进 `Agent.run`)、`ai.ProposalPipeline`(`proposal.zig`)、`ai.AgentWorker`(`agent_worker.zig`，§八 的 `Agent→Worker→Event` 已通)、`MemoryStore`(`memory.zig:23`，agent 路径 fail-closed)。**缺** Agent 的 State / Event subscriptions / Lifecycle |
+| 7 | DX / CLI | ⚠ 部分 | 28 个子命令(`tools/zmodu/src/main.zig:373-408`：new/module/scaffold/audit/graph/doctor/ci/mcp/…)。**缺** `create app`(app.zig / domain / infrastructure / config / Dockerfile / compose) 与 `create module` 六件套一键生成（`module` 只写 module.zig，`main.zig:1096`） |
+| 8 | Workflow Runtime | ⚠ 部分 | Saga 补偿逆序回滚(`SagaOrchestrator.zig:262`)、WAL 检查点 + 崩溃续跑(`:247`、`:390`，测试 `:719`、`:783`)。**缺** 状态机、生效的 timeout（`timed_out` 从不赋值）、`.step().compensate()` DSL（`docs/WORKFLOW.md` 明确不做） |
+| §十一 | Visualization | ⚠ 部分 | `zmodu doctor`(`tools/zmodu/src/doctor.zig:49`) 清单 8 项中 3 ✅ / 2 ⚠ / 3 ❌（缺"未解析服务/事件拓扑/消费者计数"）；`graph` 仅 Mermaid(`main.zig:624`)，`ModuleGraph.renderDot` 未接 CLI；**`doctor` 已进 `zmodu ci`**（第 6 步，与 CI 对 examples 的门禁同口径） |
+| §十六 | alpha-engine 参考实现 | ❌ 未做 | `examples/alpha-engine` 不存在；最接近是 `examples/runtime-workers`（行情→订单簿→风控，`examples/runtime-workers/src/main.zig:1-31`），缺 Execution / Exchange Adapter / Replay / Backtest / Paper / Live |
+
+**完成度（2026-09-17 复核）** —— 计分口径：每条 todo3 子诉求 **1.0** = 有实体代码 + 测试 + **被采用**（框架内或参考示例真的走这条路）；**0.5** = 有代码有测试但**没人用**（孤岛）；**0** = 没有。
+
+| # | 方向 | 完成度 | 主要失分点 |
+|---|------|:-----:|-----------|
+| 1 | Hot Runtime | **~78%** | `sequencer` / `object_pool` / `HotBus` 在 `src/runtime/` 之外零引用（看得到但没人用）；scheduler / reactor / arena / metrics 文件族不存在 |
+| 2 | Actor / Worker | **~68%** | 无 `Worker(State)` 泛型类型（comptime 契约等价）、无 `ActorSystem`、无真监督树 |
+| 3 | Compile-time Architecture | **~55%** | 机制强（编译期报环，超出原文设想）、**声明面弱**：`module(.{.imports,.exports})` 与 `cannot_import` 无法表达 |
+| 4 | Event 三层 | **~75%** | L0 `HotBus` 框架内无消费者；无 Redis Stream；L2 无统一接口 |
+| 5 | Distributed Runtime | **~50%** | 读侧接线完成（`MembershipView` 有发布者、`tick()` 驱动、组件已导出）；仍无统一门面、选主传输是桩、LB 无接入点；2PC 无持久化协调日志；跨主机发现受限 |
+| 6 | AI-native Runtime | **~90%** | Agent 的 State / Event subscriptions / Lifecycle 不存在 |
+| 7 | DX / CLI | **~60%** | 无 `create app`（app.zig / domain / infrastructure / config / Dockerfile / compose）；六件套非一键 |
+| 8 | Workflow Runtime | **~55%** | 无状态机；`SagaStep.timed_out` 从不赋值（timeout 是假承诺）；DSL 主动不做 |
+| §十一 | Visualization | **~50%** | doctor 缺 3 项检查；graph 仅 Mermaid；未进 `zmodu ci` |
+| §十六 | alpha-engine | **~10%** | 未做；`runtime-workers` 只覆盖链路前三段 |
+
+- **版本路线图：v0.16 → v0.21 六版按序交付 = 100%**（这是最硬的一项成绩）。
+- **加权总体 ≈ 62%**：前四个"护城河"方向按 ×2 权重 →
+  `(78+68+55+75)×2 + (50+90+60+55+50+10)` = `867 / 14` ≈ **61.9%**。
+- 同一批事实换三个口径看：**能力存在性 ≈ 85%**（几乎都有代码）／**采用度 ≈ 70%**（Runtime / Agent / Cluster 读侧三条线已通）／
+  **todo3 的产品定位目标 ≈ 62%**（"Modular Runtime Platform + killer reference impl"）。
+- 本轮（2026-09-17）变化：① Runtime **采用已接通**（模块 `ctx.runtime()` + app 生命周期 + e2e 测试 +
+  示例改走 app+module 路径）② §八 的 `Agent→Worker→Event` 接通（`ai.AgentWorker`：有界邮箱/背压/监督/生命周期，
+  失败不占监督器错误预算）③ **Cluster 读侧接通**（`cluster/MembershipView.zig` + `ClusterBootstrap.tick()/getView()`；
+  顺带修掉 gossip 负载里 `{any}` 打印结构体 dump 的地址格式问题，并把跨主机发现限制写进注释与文档）
+  ④ `zmodu.builder(..).withName(..)` 链式误用 12 处已修（此前 README / docs / 注释里的片段**全部编译不过**）。
+
+**结论：零件齐了，装配线建成三条（Runtime 采用、Agent→Worker、Cluster 读侧），集群的门面/选主/LB 仍空着。** 接下来的 ROI 顺序：① 集群门面（选主接真传输、LB 给接入点，或明确降级为"单机 modulith + 外部 LB"）② 给 `HotBus`/`sequencer`/`object_pool` 找真实消费者或删除（孤儿原语是最贵的债）③ CLI 六件套 / alpha-engine ④ 给文档片段加编译抽查。
+
+
 **现在的 ZigModu 已经不是“功能不够”的问题，而是产品定位还可以再往上提一层。**
 
 目前它已经覆盖了 Modulith、DI、Event、HTTP、WebSocket、gRPC、ORM、Redis、Kafka、Resilience、Observability、Security、AI、CLI 等相当完整的能力；仓库目前是 `v0.15.47`，并且明确定位为 Zig 0.17 的 Modulith Framework。([GitHub][1])

@@ -1,5 +1,6 @@
 const std = @import("std");
 const Time = @import("../core/Time.zig");
+const guard_mod = @import("guard.zig");
 
 /// Parameter definition for a Tool — maps to JSON Schema for LLM function calling.
 pub const Param = struct {
@@ -23,6 +24,10 @@ pub const Tool = struct {
     /// refuses with `error.PermissionDenied` unless `SkillContext.permissions`
     /// contains it.
     required_permission: ?[]const u8 = null,
+    /// What kind of effect this tool has — the class `guard.Guard` checks
+    /// before dispatch. **Default `execute`** (the most restricted): a tool that
+    /// forgot to declare itself can never be granted by a read-only policy.
+    action: guard_mod.Action = .execute,
     /// Handler: receives context + JSON value of arguments, returns JSON result.
     handler: *const fn (ctx: *SkillContext, args: std.json.Value) anyerror!std.json.Value,
 };
@@ -142,6 +147,7 @@ pub const SkillRegistry = struct {
             .parameters = params,
             .timeout_ms = tool.timeout_ms,
             .required_permission = tool.required_permission,
+            .action = tool.action,
             .handler = tool.handler,
         };
         self.tools.putAssumeCapacity(key, owned);
