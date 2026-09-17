@@ -324,7 +324,7 @@ bash scripts/ci-integration.sh   # tenant-mgmt + stress + shopdemo（-Ddb=sqlite
 ```
 
 ## Version
-- Framework: **v0.15.47** (`build.zig.zon`)
+- Framework: **v0.16.0** (`build.zig.zon`)
 - Zig: **0.17.0-dev.1970+67f39b551**（CI 同款锁定版本，见 `.github/workflows/ci.yml` → `ZIG_VERSION`；避免 fmt 行为漂移。注意 ziglang 镜像会回收旧 dev 构建——dev.1567 已 404，升级时本地先验证再改 CI）
 - Tests: **以 `zig build test` 输出为准**（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`）。
   本文件不再抄写具体数字：`-Ddb` 收窄、平台（Linux/macOS）、门控用例都会改变计数，
@@ -359,7 +359,7 @@ bash scripts/ci-integration.sh   # tenant-mgmt + stress + shopdemo（-Ddb=sqlite
 
 ## Learned Workspace Facts
 
-- Package **v0.15.47** · Zig **0.17.0** · GitHub `chy3xyz/zigmodu` · branch `master`.
+- Package **v0.16.0** · Zig **0.17.0** · GitHub `chy3xyz/zigmodu` · branch `master`.
 - Sandbox cache：`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`.
 - Auth Path A + `CatalogPermLoadInput` 已落地；legacy JWT 只写 `auth_info`。
 - x402 fail-closed；OTLP/Vault 已支持 HTTPS（系统 CA）。

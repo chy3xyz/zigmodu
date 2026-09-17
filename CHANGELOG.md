@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.16.0] - 2026-09-17
 
 > **0 breaking**：本版只新增（v0.16 = 运行时底座，见 `docs/dev/todo3.1.md` 的兼容策略）。
 > 不调用 `app.runtime()` 的应用，线程数、生命周期、行为与 v0.15.x 完全一致。

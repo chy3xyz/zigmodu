@@ -156,8 +156,8 @@ pub fn main(init: std.process.Init) !void {
 
     const s = rt.stats();
     std.log.info("[stats] workers={d} sent={d} received={d} dropped={d} handler_errors={d} timer_fires={d} timer_lag_max_ms={d}", .{
-        s.workers,          s.messages_sent, s.messages_received, s.messages_dropped,
-        s.handler_errors,   s.timer_fires,   s.timer_lag_max_ms,
+        s.workers,        s.messages_sent, s.messages_received, s.messages_dropped,
+        s.handler_errors, s.timer_fires,   s.timer_lag_max_ms,
     });
     const bs = book.stats();
     std.log.info("[book] mailbox cap={d} len={d} dropped_full={d} coalesced={d}", .{
