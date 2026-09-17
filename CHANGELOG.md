@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.19.0] - 2026-09-17
 
 > **0 breaking**（v0.19 = 集群读侧）。纯新增：`ClusterView` 与既有 DistributedEventBus /
 > ClusterMembership 并存，后者一行未动。
