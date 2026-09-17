@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.21.0] - 2026-09-17
 
 > **0 breaking**（v0.21 = Agent 的运行时闸门）。纯新增，`Agent` / `SkillRegistry` / `Budget` 一字未动。
 
