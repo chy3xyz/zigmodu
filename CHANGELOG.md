@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.23.0] - 2026-09-17
 
 - **`ClusterBootstrap` 可选自带 Raft 传输**：`BootstrapConfig.transport` 接受应用提供的
   `RaftElection.ElectionTransport`；给了它就**不再**要求 `.allow_stub_raft_transport`（默认 `raft_cluster_size = 3`
