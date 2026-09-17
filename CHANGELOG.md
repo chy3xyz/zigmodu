@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.20.2] - 2026-09-17
 
 > **0 breaking**（v0.20.2 = AI 与驱动层解耦完成）。纯 import 替换，无行为变化。
 
