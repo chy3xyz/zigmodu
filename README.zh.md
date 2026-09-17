@@ -20,6 +20,7 @@
 | [ZigModu × zent](docs/ZENT.md) | **电商/社交主推组合**：zent ORM 正交接入与最佳实践 |
 | [SQLx 驱动链接](docs/SQLX_DRIVERS.md) | `-Ddb=` / `.db=` 选择性链接 |
 | [最佳实践](docs/BEST_PRACTICES.md) | DAU 演进 + JWT / 多端身份清单 |
+| [Agent 运行时](docs/AGENT_RUNTIME.md) | **Agent 默认不能直接交易**：`Guard` 两条轴 fail-closed（`execute` 二次开关 + `allow` 默认空） |
 | [API参考](docs/API.md) | 完整API文档 |
 | [架构设计](docs/ARCHITECTURE.md) | 系统设计与模式 |
 | [示例项目](examples/) | 可运行的示例 |

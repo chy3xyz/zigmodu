@@ -23,6 +23,7 @@
 | 集群成员读侧（请求路径选节点/健康度） | `docs/DISTRIBUTED.md`「集群读侧」+ `zigmodu.ClusterView`（`acquire`/`release`，别读写入侧的哈希表） |
 | 长流程 / 崩溃续跑（Saga、补偿、检查点） | `docs/WORKFLOW.md` + `SagaOrchestrator.resumeInstance`（有副作用的一步必须幂等） |
 | 改 `src/ai/**` 前（它只能依赖领域缝） | `docs/AI_BOUNDARY.md` + `src/test/AiBoundary.zig`（驱动层 import 数只减不增） |
+| Agent 能做什么（默认不能执行） | `docs/AGENT_RUNTIME.md` + `ai.Guard`（`execute` 需 `allow_execute` 第二开关；`deny` 压过 `allow`） |
 | 观测 / 告警 / Grafana | `docs/OBSERVABILITY.md`（黄金信号 + 阈值 + dashboard JSON；夜间 `zig build soak` 见 CI `soak` job） |
 | 部署拓扑（TLS 边车/探针/守护） | `examples/production-deploy/`（nginx · Envoy · k8s · systemd） |
 | Extract / SSE / Testkit / Outbox | `docs/FRAMEWORK_BACKLOG.md` |

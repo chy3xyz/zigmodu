@@ -18,6 +18,7 @@ A modular application framework for Zig 0.17, inspired by Spring Modulith. Build
 | [Declarative Routes](docs/ROUTE_TABLE.md) | ComptimeRouter + catalog JWT/RBAC |
 | [ZigModu × zent](docs/ZENT.md) | **电商/社交主推组合**：zent ORM 集成最佳实践 |
 | [Best Practices](docs/BEST_PRACTICES.md) | Architecture evolution + JWT checklist + 韧性（panic/背压/FrozenMap） |
+| [Agent Runtime](docs/AGENT_RUNTIME.md) | **Agents can't act by default**: `Guard` (two fail-closed axes — an `execute` second switch + empty-by-default allow list) |
 | [Observability](docs/OBSERVABILITY.md) | Golden signals, PromQL, alert thresholds, Grafana dashboard |
 | [Production Roadmap](docs/PRODUCTION_ROADMAP.md) | Maintenance boundaries, prefork limits, `src/ai` boundary |
 | [API Reference](docs/API.md) | Detailed API documentation |
@@ -95,6 +96,7 @@ A modular application framework for Zig 0.17, inspired by Spring Modulith. Build
 - **MemoryStore** — Cross-session memory with `remember`/`recall`/`forget`, LRU eviction
 - **SSE Writer** — Server-Sent Events with retry, heartbeat, multi-line data
 - **ReAct Loop** — Autonomous agent (think→act→observe→repeat)
+- **Agent Guard** — Fail-closed authority gate: `read`/`propose`/`execute` classes, `execute` needs an explicit second switch, empty allow list = inert agent
 
 ### Performance
 - **ArenaAllocator** — Per-connection arena (0 heap allocs/request, resets on keep-alive)

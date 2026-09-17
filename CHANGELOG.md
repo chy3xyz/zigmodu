@@ -1,5 +1,26 @@
 # Changelog
 
+## [Unreleased]
+
+> **0 breaking**（v0.21 = Agent 的运行时闸门）。纯新增，`Agent` / `SkillRegistry` / `Budget` 一字未动。
+
+### Added
+- **`src/ai/guard.zig`（`ai.Guard` / `ai.Permissions`）** —— 把 `todo3.md` §八 的硬规则
+  （**AI Agent 默认不能直接交易**）变成可测试的代码，两条轴都是 fail-closed：
+  - **类别轴**（`read` / `propose` / `execute`）：`execute` 需要 `allow_execute` **另外**再开一次开关 ——
+    把 `order.submit` 写进 allow 不等于"这个 agent 可以下单"，配置写错不会静默交出交易接口。
+  - **名字轴**：`allow` 默认**为空**（无策略的 agent 什么都不能做，`isInert()` 让调用方启动期就能大声失败）；
+    `deny` 永远压过 `allow`，宽列表可被局部收回而不必重写。
+  - 预算在**同一个 `check()`** 里扣：被拒绝的动作**不消耗预算**（否则配置错的 agent 会靠"试"把自己饿死），
+    拒绝原因**分门别类计数**（not_listed / explicitly / execute_class / budget）——
+    "看起来健康"的被拒 agent 正是这道闸门要防的东西。
+  - 3 项测试：空策略三类别全拒且计数正确、列名之后 `execute` 仍需第二开关（且 `deny` 压过它）、
+    拒绝免费 / 允许计费 / 超预算单独计数。
+- **`docs/AGENT_RUNTIME.md`** —— 两条轴的表、接线示例（拒绝 `execute` 后落到 `propose` 分支，正是规则要的形状）、
+  与 `security/` 的分工（这道闸门管 **agent 自身**的权限，不是终端用户鉴权），
+  以及**还没做**的三件事（身份/记忆/技能尚无声明式包装、`Guard` 未接进 `Agent.run` 调用链、
+  Proposal→Risk→Execution 只有 Proposal 侧入口）。
+
 ## [0.20.2] - 2026-09-17
 
 > **0 breaking**（v0.20.2 = AI 与驱动层解耦完成）。纯 import 替换，无行为变化。

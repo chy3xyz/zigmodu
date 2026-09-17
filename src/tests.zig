@@ -146,6 +146,7 @@ test "compile all source files" {
 
     // AI boundary: ratcheted coupling + one-way seam (docs/AI_BOUNDARY.md)
     _ = @import("test/AiBoundary.zig");
+    _ = @import("ai/guard.zig");
 
     // Tracing
     _ = @import("tracing/DistributedTracer.zig");

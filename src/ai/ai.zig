@@ -7,6 +7,11 @@ pub const freeValue = @import("skill.zig").freeValue;
 
 pub const AiProvider = @import("provider.zig").AiProvider;
 pub const key_pool = @import("key_pool.zig");
+pub const guard = @import("guard.zig");
+pub const Guard = guard.Guard;
+pub const Permissions = guard.Permissions;
+pub const GuardAction = guard.Action;
+
 pub const KeyPool = key_pool.KeyPool;
 pub const KeyLease = key_pool.KeyLease;
 pub const KeyErrorKind = key_pool.KeyErrorKind;
