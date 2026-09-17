@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.20.0] - 2026-09-17
 
 > **0 breaking**（v0.20 = 长流程可恢复执行）。新增 `resumeInstance`，既有 `execute` / WAL 格式不变。
 
