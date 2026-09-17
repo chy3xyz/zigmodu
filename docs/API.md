@@ -133,6 +133,7 @@ High-level application abstraction.
 
 ```zig
 pub fn init(
+    io: std.Io,
     allocator: std.mem.Allocator,
     name: []const u8,
     modules: anytype,
@@ -152,6 +153,7 @@ pub const Config = struct {
 **Example:**
 ```zig
 var app = try zigmodu.Application.init(
+    io,
     allocator,
     "myapp",
     .{UserModule, OrderModule},

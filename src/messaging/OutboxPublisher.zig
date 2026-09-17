@@ -131,37 +131,58 @@ pub const OutboxPublisher = struct {
         };
     }
 
+    /// Column list shared by both INSERT shapes; they differ only in the
+    /// `tenant_id` slot (bound parameter vs. NULL literal), never in column
+    /// order or placeholder count.
+    const insert_columns =
+        "INSERT INTO event_outbox (topic, payload, tenant_id, status, retry_count, max_retries, created_at, updated_at)\n";
+
+    /// Unscoped insert: five placeholders — `tenant_id` is a NULL literal, so
+    /// it consumes no slot. Bind order: topic, payload, max_retries,
+    /// created_at, updated_at.
+    const insert_sql_unscoped = insert_columns ++ "VALUES (?, ?, NULL, 0, 0, ?, ?, ?)";
+
+    /// Tenant-scoped insert: six placeholders — `tenant_id` is bound in slot 3.
+    /// Bind order: topic, payload, tenant_id, max_retries, created_at, updated_at.
+    const insert_sql_tenant = insert_columns ++ "VALUES (?, ?, ?, 0, 0, ?, ?, ?)";
+
     /// Generate the INSERT SQL for an outbox entry (tenant-scoped variant).
-    /// Caller should execute this within a transaction alongside business data.
+    /// Caller should execute this within a transaction alongside business data,
+    /// binding `params` in declaration order (see `insert_sql_tenant`).
     pub fn buildInsertForTenant(
         self: *Self,
         topic: []const u8,
         payload: []const u8,
         tenant_id: i64,
     ) !OutboxInsert {
-        var insert = try self.buildInsert(topic, payload);
-        insert.params.tenant_id = tenant_id;
-        return insert;
+        return self.buildInsertWithTenant(topic, payload, tenant_id);
     }
 
     /// Generate the INSERT SQL for an outbox entry (no tenant).
-    /// Caller should execute this within a transaction alongside business data.
+    /// Caller should execute this within a transaction alongside business data,
+    /// binding `params` in declaration order (see `insert_sql_unscoped`).
     pub fn buildInsert(
         self: *Self,
         topic: []const u8,
         payload: []const u8,
     ) !OutboxInsert {
+        return self.buildInsertWithTenant(topic, payload, null);
+    }
+
+    fn buildInsertWithTenant(
+        self: *Self,
+        topic: []const u8,
+        payload: []const u8,
+        tenant_id: ?i64,
+    ) OutboxInsert {
         const now = Time.monotonicNowSeconds();
 
         return OutboxInsert{
-            .sql =
-            \\INSERT INTO event_outbox (topic, payload, tenant_id, status, retry_count, max_retries, created_at, updated_at)
-            \\VALUES (?, ?, ?, 0, 0, ?, ?, ?)
-            ,
+            .sql = if (tenant_id == null) insert_sql_unscoped else insert_sql_tenant,
             .params = .{
                 .topic = topic,
                 .payload = payload,
-                .tenant_id = null,
+                .tenant_id = tenant_id,
                 .max_retries = self.config.max_retries,
                 .created_at = now,
                 .updated_at = now,
@@ -169,7 +190,9 @@ pub const OutboxPublisher = struct {
         };
     }
 
-    /// Prepared INSERT statement for binding into a SQL transaction.
+    /// Prepared INSERT statement for binding into a SQL transaction. `sql`'s
+    /// placeholders follow `params` in declaration order — the tenant-scoped
+    /// shape carries one extra placeholder in slot 3 (`tenant_id`).
     pub const OutboxInsert = struct {
         sql: []const u8,
         params: struct {
@@ -405,6 +428,11 @@ pub const OutboxStats = struct {
 
 // ==================== Tests ====================
 
+/// Number of `?` placeholders in `sql`.
+fn countPlaceholders(sql: []const u8) usize {
+    return std.mem.count(u8, sql, "?");
+}
+
 test "OutboxPublisher buildInsert" {
     const allocator = std.testing.allocator;
     var publisher = OutboxPublisher.init(allocator, .{});
@@ -413,6 +441,11 @@ test "OutboxPublisher buildInsert" {
     try std.testing.expectEqualStrings("order.created", insert.params.topic);
     try std.testing.expectEqualStrings("{\"id\":1}", insert.params.payload);
     try std.testing.expect(insert.params.tenant_id == null);
+    // One placeholder per bound param: a `tenant_id` *placeholder* here would
+    // take `max_retries` as the tenant and leave `updated_at` (NOT NULL in every
+    // migration dialect) unbound — the ai-ops failure, 2026-09-17.
+    try std.testing.expectEqual(@as(usize, 5), countPlaceholders(insert.sql));
+    try std.testing.expect(std.mem.indexOf(u8, insert.sql, "VALUES (?, ?, NULL, 0, 0, ?, ?, ?)") != null);
 }
 
 test "OutboxPublisher buildInsertForTenant" {
@@ -421,6 +454,47 @@ test "OutboxPublisher buildInsertForTenant" {
     const insert = try publisher.buildInsertForTenant("order.created", "{\"id\":1}", 42);
     try std.testing.expectEqual(@as(?i64, 42), insert.params.tenant_id);
     try std.testing.expect(std.mem.indexOf(u8, insert.sql, "tenant_id") != null);
+    // The scoped shape binds the tenant, so it has one placeholder more.
+    try std.testing.expectEqual(@as(usize, 6), countPlaceholders(insert.sql));
+}
+
+test "OutboxPublisher unscoped insert fills every NOT NULL column" {
+    const allocator = std.testing.allocator;
+    var client = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    // The shipped DDL (table first; the index that follows is not part of the
+    // insert contract).
+    _ = try client.exec(OutboxPublisher.migrationSqlWithDialect(.sqlite), &.{});
+
+    var publisher = OutboxPublisher.init(allocator, .{ .max_retries = 3 });
+    const insert = try publisher.buildInsert("order.created", "{\"id\":1}");
+    _ = try client.exec(insert.sql, &.{
+        .{ .string = insert.params.topic },
+        .{ .string = insert.params.payload },
+        .{ .int = @intCast(insert.params.max_retries) },
+        .{ .int = insert.params.created_at },
+        .{ .int = insert.params.updated_at },
+    });
+
+    var cursor = try client.queryCursorEx(
+        "SELECT topic, payload, tenant_id, status, max_retries, created_at, updated_at FROM event_outbox",
+        &.{},
+        .{},
+    );
+    defer cursor.deinit();
+    const row = cursor.next().?;
+    try std.testing.expectEqualStrings("order.created", row.get("topic").?.string);
+    try std.testing.expectEqualStrings("{\"id\":1}", row.get("payload").?.string);
+    // The driver reports SQL NULL as a missing `?Value`, so the tenant column is
+    // `== null` (the SELECT above is what makes that unambiguous).
+    try std.testing.expectEqual(@as(usize, 7), row.columns.len);
+    try std.testing.expect(row.get("tenant_id") == null);
+    try std.testing.expectEqual(@as(i64, 0), row.get("status").?.int);
+    try std.testing.expectEqual(@as(i64, 3), row.get("max_retries").?.int);
+    const created_at = row.get("created_at").?.int;
+    try std.testing.expect(created_at > 0);
+    try std.testing.expectEqual(created_at, row.get("updated_at").?.int);
 }
 
 test "OutboxPublisher migrationSql" {

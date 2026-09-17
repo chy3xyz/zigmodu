@@ -13,13 +13,35 @@ pub const default_initial_window_size: u31 = 65535;
 /// Max DATA payload per frame for outbound chunking.
 pub const max_data_chunk_size: usize = 16 * 1024;
 
+/// Frame-codec and flow-control failures of the HTTP/2 layer (RFC 7540 §6).
+///
+/// These are *connection-fatal* framing violations, not request errors: a peer
+/// that sends one is speaking a different protocol. The usual handling is to
+/// answer `GOAWAY` and close the connection (see `Http2Server.abortStream` /
+/// `sendGoAway`) rather than try to serve the stream — a caller that ignores one
+/// risks a desynchronised frame stream.
 pub const FlowControlError = error{
+    /// A WINDOW_UPDATE payload was not exactly 4 bytes. Peer is malformed: GOAWAY
+    /// with FRAME_SIZE_ERROR.
     InvalidWindowUpdatePayload,
+    /// A WINDOW_UPDATE asked for a 0-byte increment, which RFC 7540 forbids. Same
+    /// treatment as the malformed case.
     ZeroWindowUpdateIncrement,
+    /// Applying a window change would push a send/recv window past 2^31-1. The
+    /// sender has over-credited us; GOAWAY with FLOW_CONTROL_ERROR.
     FlowControlOverflow,
+    /// The peer granted no window at all, so nothing can be written right now.
+    /// This one is recoverable: stop writing this stream and resume when a
+    /// WINDOW_UPDATE arrives.
     FlowControlBlocked,
+    /// A SETTINGS payload length was not a multiple of 6 (id+value pairs).
+    /// GOAWAY with FRAME_SIZE_ERROR.
     InvalidSettingsPayload,
+    /// A SETTINGS entry set INITIAL_WINDOW_SIZE to 0, which RFC 7540 §6.5.2
+    /// forbids. GOAWAY with PROTOCOL_ERROR.
     InvalidInitialWindowSize,
+    /// A frame payload was shorter than its type's fixed part (e.g. GOAWAY < 8
+    /// bytes, RST_STREAM < 4). GOAWAY with FRAME_SIZE_ERROR.
     InvalidFramePayload,
 };
 
@@ -333,7 +355,12 @@ pub const PriorityInfo = struct {
     }
 };
 
+/// Failures of the RFC 7540 §5.3 priority surface (`decodePriority`,
+/// `PriorityTree.apply`).
 pub const PriorityError = error{
+    /// A PRIORITY payload was shorter than the fixed 5 bytes (dependency word +
+    /// weight). The frame is malformed: drop the priority hint and keep serving
+    /// the stream — priority is advisory, so a bad frame is not connection-fatal.
     InvalidPriorityPayload,
 };
 

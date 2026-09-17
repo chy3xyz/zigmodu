@@ -4,6 +4,17 @@
 //! output) and enforcing a shared `Budget` across LLM-consuming steps. WAL
 //! persistence / crash recovery / resume is planned (P1); v1 is an in-process
 //! runner that returns a full audit trail for the caller to persist.
+//!
+//! STRUCTURE:
+//!   §1  Step model —— StepKind, Step, StepStatus, RunStatus, EscalateReason
+//!   §2  Hooks & records —— VerifyFn, EscalateFn, StepRecord, WorkflowResult, WorkflowMetrics
+//!   §3  Configuration & graph —— Workflow fields, init, toMermaid
+//!   §4  Run & resume —— run (linear/DAG dispatch) and resumeRun (WAL replay)
+//!   §5  Execution engines —— runSteps, runLinear, runDag wave scheduling
+//!   §6  Step execution & persistence —— executeStep, attempt, append*, persistStep, maybeEscalate
+//!   §7  Tests
+//!
+//! Every section carries a matching `// ==== §N ... ====` anchor — `grep "§4"` jumps there.
 
 const std = @import("std");
 const provider_mod = @import("provider.zig");
@@ -18,6 +29,8 @@ pub const AiProvider = provider_mod.AiProvider;
 pub const SkillRegistry = skill_mod.SkillRegistry;
 pub const SkillContext = skill_mod.SkillContext;
 pub const Agent = agent_mod.Agent;
+
+// ==== §1  Step model ====
 
 /// What a workflow step does.
 pub const StepKind = union(enum) {
@@ -46,6 +59,8 @@ pub const StepStatus = enum { pending, running, completed, failed };
 pub const RunStatus = enum { completed, failed, budget_exhausted, pending_human };
 
 pub const EscalateReason = enum { step_failed, budget_exhausted, verification_failed };
+
+// ==== §2  Hooks & records ====
 
 /// Verify the final output; return false to trigger a review re-run.
 pub const VerifyFn = *const fn (
@@ -120,6 +135,8 @@ const StepOutcome = struct {
     pending_human: bool = false,
 };
 
+// ==== §3  Configuration & graph ====
+
 pub const Workflow = struct {
     /// Only required when a step uses `.llm` or `.agent`.
     provider: ?*AiProvider = null,
@@ -184,6 +201,8 @@ pub const Workflow = struct {
         }
         return buf.toOwnedSlice(allocator);
     }
+
+    // ==== §4  Run & resume ====
 
     /// Execute all steps sequentially. Returns a partial result on step
     /// failure (status `.failed`) instead of erroring, so callers can inspect
@@ -271,6 +290,8 @@ pub const Workflow = struct {
         }
         return result;
     }
+
+    // ==== §5  Execution engines ====
 
     fn hasDeps(self: Workflow) bool {
         for (self.steps) |s| {
@@ -444,6 +465,8 @@ pub const Workflow = struct {
         }
     }
 
+    // ==== §6  Step execution & persistence ====
+
     /// Run a step with its retry budget; appends the record to `result`.
     /// Returns null when all attempts failed (record is marked failed).
     fn executeStep(
@@ -615,6 +638,8 @@ pub const Workflow = struct {
         };
     }
 };
+
+// ==== §7  Tests ====
 
 test "workflow runs skill steps and records results" {
     const allocator = std.testing.allocator;

@@ -49,8 +49,10 @@ cd ../.. && python3 scripts/mcp-client-test.py examples/mcp-server/zig-out/bin/m
 ## 安全
 
 - 技能保留 `required_permission` 门控：MCP 会话的 `SkillContext.permissions`
-  决定可调用的管理/审批技能；
-- `admin.*` 技能默认不在任何 allowlist，需要显式加入才会出现在 `tools/list`；
+  决定可调用的管理/审批技能 —— 拒绝发生在 `tools/call`（`SkillRegistry.dispatch`），**不在** `tools/list`；
+- **`tools/list` 不过滤**：`ai.mcp.toMcpTools` 列出注册表里的**全部**技能（含 `admin.*`）。
+  按 allowlist / 权限裁剪 `tools/list` 目前**是缺口，不是既有能力** —— 要藏管理类技能，
+  只能先别把它们注册进暴露给 MCP 的那个 registry；
 - 租户隔离：`ctx_template.tenant_id` 贯穿所有分发。
 
 ## 编程接口

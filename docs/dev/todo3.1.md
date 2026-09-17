@@ -43,7 +43,8 @@ const app = Application.init(...);
 
 app.start();
 
-const worker = try app.runtime().spawn(...);
+const rt = try app.runtime();                      // 首次调用才创建（v0.16+）
+const worker = try rt.spawn(MyWorker, .{}, 256);   // 256 = comptime 邮箱容量
 ```
 
 这样老项目完全可以：
@@ -160,7 +161,8 @@ const PaymentWorker = struct {
 然后：
 
 ```zig
-try app.runtime().spawn(PaymentWorker, .{});
+const rt = try app.runtime();
+const worker = try rt.spawn(PaymentWorker, .{}, 256);
 ```
 
 这意味着：

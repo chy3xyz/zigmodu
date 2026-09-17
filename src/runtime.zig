@@ -1,8 +1,9 @@
 //! Runtime domain: workers, mailboxes, timers, ring buffers, pools, clocks.
 //!
 //! ```zig
-//! const rt = zigmodu.runtime;                 // or `@import("zigmodu").runtime`
-//! const worker = try app.runtime().spawn(MyWorker, .{}, 256);
+//! const runtime = @import("zigmodu").runtime;   // the namespace: RingBuffer, Clock, HotBus, Runtime…
+//! const rt = try app.runtime();                 // first call creates and starts it
+//! const worker = try rt.spawn(MyWorker, .{}, 256); // 256 = mailbox capacity (comptime)
 //! ```
 //!
 //! Everything here is **additive**: the module API, DI, `Application.eventBus`,
@@ -13,13 +14,21 @@
 
 const std = @import("std");
 
+/// Ring module: `RingBuffer` (SPSC) and `MpscRing` (Vyukov).
 pub const ring = @import("runtime/ring.zig");
+/// Clock module: injectable time source (`Clock.monotonic` / `Clock.manual`).
 pub const clock = @import("runtime/clock.zig");
+/// Timer wheel module: `Wheel` plus its geometry constants (`slot_ms`).
 pub const timer_wheel = @import("runtime/timer_wheel.zig");
+/// Object pool module: `ObjectPool` for bounded reuse over allocator churn.
 pub const object_pool = @import("runtime/object_pool.zig");
+/// Mailbox module: the bounded hand-off queue between threads.
 pub const mailbox = @import("runtime/mailbox.zig");
+/// Sequencer module: monotonic sequence numbers without a clock or a lock.
 pub const sequencer = @import("runtime/sequencer.zig");
+/// HotBus module: L0 fan-out to worker mailboxes (frozen, drops when full).
 pub const hot_bus = @import("runtime/hot_bus.zig");
+/// Runtime implementation: `Runtime`, the worker contract, stats, supervision.
 pub const runtime_impl = @import("runtime/runtime.zig");
 
 /// Single-producer / single-consumer lock-free ring.
@@ -44,8 +53,11 @@ pub const Supervision = runtime_impl.Supervision;
 
 /// The runtime itself, plus the worker contract.
 pub const Runtime = runtime_impl.Runtime;
+/// What a worker sees inside `handle`: sender handle, timers, stats.
 pub const WorkerContext = runtime_impl.WorkerContext;
+/// Per-worker counters: queue depth, sent/received, `dropped_full`, errors.
 pub const WorkerStats = runtime_impl.WorkerStats;
+/// Runtime-wide counters: workers alive, messages sent/dropped, timer lag.
 pub const RuntimeStats = runtime_impl.RuntimeStats;
 
 /// Handle to a spawned worker: `send` / `stop` / `after` / `stats`.

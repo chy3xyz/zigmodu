@@ -58,7 +58,10 @@ pub fn EventPublisherMixin(comptime EventTypes: anytype) type {
             }
 
             if (!comptime found) {
-                @compileError("Event type not registered. Add to EventTypes tuple.");
+                @compileError("EventPublisherMixin: the event type " ++ @typeName(EventType) ++
+                    " is not listed in this mixin's `EventTypes` tuple, so publishEvent cannot type the bus. " ++
+                    "Add it to the mixin argument, e.g. `EventPublisherMixin(.{ " ++ @typeName(EventType) ++
+                    ", ... })`, or publish a registered event type instead.");
             }
 
             // Validate bus type matches event type (TypedEventBus publishes a

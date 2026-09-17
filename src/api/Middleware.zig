@@ -11,12 +11,27 @@
 //!   // Production (wall-clock exp): share a SecurityModule initialized with initWithIo
 //!   server.addMiddleware(zigmodu.http_middleware.jwtAuthWithSecurity(&sec));
 //!   server.addMiddleware(zigmodu.http_middleware.csrf());
+//!
+//! STRUCTURE:
+//!   §1  Reject hooks & envelopes —— AuthRejectFn, defaultReject, problemReject, envelopeReject
+//!   §2  CORS —— CorsConfig and the cors middleware
+//!   §3  Core middleware —— requestId, logging, maxBodySize, requestTimeout, recover, legacy jwtAuth
+//!   §4  Catalog JWT & permission loading —— jwtAuthFromCatalog*, CatalogPermissionLoader, attachIdentity
+//!   §5  Pluggable auth backends —— AuthBackend and authFromCatalog (catalog = sole bypass truth)
+//!   §6  Token extraction, JWT backend & tenant resolver —— extract*, jwtBackend*, tenantResolver
+//!   §7  Module gate & permission gate —— moduleGate, permissionMatches*, permissionGate*
+//!   §8  CSRF & security headers —— csrf, defaultSecurityHeaders, securityHeaders
+//!   §9  Tests —— auth / CORS / CSRF / gate unit tests
+//!
+//! Every section carries a matching `// ==== §N ... ====` anchor — `grep "§4"` jumps there.
 
 const std = @import("std");
 const api = @import("Server.zig");
 const Time = @import("../core/Time.zig");
 const SecurityModule = @import("../security/SecurityModule.zig").SecurityModule;
 const ProblemDetails = @import("../http/ProblemDetails.zig").ProblemDetails;
+
+// ==== §1  Reject hooks & envelopes ====
 
 /// Consumer hook for auth rejections: renders the 401/403/500 body in any
 /// envelope dialect without forking middleware. Default = `ctx.sendError`.
@@ -106,6 +121,8 @@ pub fn envelopeReject(dialect: api.EnvelopeDialect) AuthRejectFn {
     return S.reject;
 }
 
+// ==== §2  CORS ====
+
 /// CORS middleware configuration
 pub const CorsConfig = struct {
     allow_origins: []const []const u8 = &.{"*"},
@@ -180,6 +197,8 @@ pub fn cors(config: CorsConfig) api.Middleware {
         .user_data = cfg,
     };
 }
+
+// ==== §3  Core middleware ====
 
 var request_id_counter = std.atomic.Value(u64).init(0);
 
@@ -306,6 +325,8 @@ pub fn jwtAuthWithSecurity(security: *SecurityModule) api.Middleware {
         .user_data = security,
     };
 }
+
+// ==== §4  Catalog JWT & permission loading ====
 
 fn verifyJwtAndNext(sec: *SecurityModule, ctx: *api.Context, next: api.HandlerFn) !void {
     try verifyJwtLoadPermsAndNext(sec, ctx, next, null, defaultReject);
@@ -545,6 +566,8 @@ pub fn catalogLoaderFromTable(table: *const Rbac.RolePermissionTable) CatalogPer
     return Holder.load;
 }
 
+// ==== §5  Pluggable auth backends ====
+
 // ── Pluggable auth backends (catalog = sole bypass truth) ────────────────
 
 /// Pluggable auth backend: verify a request and, on success, write identity
@@ -664,6 +687,8 @@ pub fn authFromCatalog(slot: *comptime_router.CatalogSlot, backend: AuthBackend,
         .user_data = stored,
     };
 }
+
+// ==== §6  Token extraction, JWT backend & tenant resolver ====
 
 // ── Token extractors ──────────────────────────────────────────────────────
 
@@ -816,6 +841,8 @@ pub fn tenantResolver(config: TenantResolverConfig) api.Middleware {
         .user_data = stored,
     };
 }
+
+// ==== §7  Module gate & permission gate ====
 
 pub const ModuleGateConfig = struct {
     allowed: ?[]const []const u8 = null,
@@ -1014,6 +1041,8 @@ pub fn permissionGateWith(slot: *comptime_router.CatalogSlot, config: Permission
     };
 }
 
+// ==== §8  CSRF & security headers ====
+
 /// CSRF protection using double-submit cookie pattern.
 /// GET/HEAD/OPTIONS pass through. State-changing methods require
 /// X-CSRF-Token header to match the csrf_token cookie value.
@@ -1085,6 +1114,8 @@ pub fn securityHeaders(headers: ?[]const SecurityHeader) api.Middleware {
     S.stored = if (headers) |h| h else &.{};
     return .{ .func = S.mw };
 }
+
+// ==== §9  Tests ====
 
 test "csrf rejects state-changing requests without a matching token" {
     const allocator = std.testing.allocator;

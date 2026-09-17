@@ -12,7 +12,9 @@ pub const ModuleBoundary = struct {
     pub fn validate(comptime T: type) void {
         // Module must declare 'info'
         if (!@hasDecl(T, "info")) {
-            @compileError("Module must declare 'pub const info' with module metadata");
+            @compileError("ModuleBoundary.validate expects `pub const info` on the module type; " ++
+                @typeName(T) ++ " declares none. Add `pub const info = zmodu.api.Module{ .name = \"my-module\", " ++
+                ".description = \"...\", .dependencies = &.{} };` to the module root and validate again.");
         }
 
         // Get module info

@@ -12,21 +12,22 @@
 //!   client.query(sql, &.{}); // ← name may contain '; DROP TABLE users; --
 //!
 //! STRUCTURE (monolith — intentionally NOT split; see docs/PRODUCTION_ROADMAP.md):
-//!   §1  Types        — Value, Row, Rows, ExecResult, Driver, Conn, Stmt
-//!   §2  SQLiteConn   — SQLite connection + VTable
-//!   §3  PostgresConn — PostgreSQL connection + VTable
-//!   §4  MySqlConn    — MySQL connection + VTable
-//!   §5  PreparedStmt — SQLiteStmt, PostgresStmt, MySqlStmt
-//!   §6  ConnPool     — Connection pool with circuit breaker
-//!   §7  Client       — Main client (init, query, exec, tx)
-//!   §8  Transaction  — Transaction with rollback/savepoint
-//!   §9  ORM Helpers  — Row scanning utilities
-//!   §10 Tests
+//!   §1  Types & helpers     —— Value, Row, Rows, ExecResult, Driver, Conn, Stmt + SQL-fragment guards
+//!   §2  Struct scanning      —— buildColumnIndices, scanStruct, valueToType, freeScanned, QueryResult
+//!   §3  SQLite driver        —— SQLiteConn + VTable, bind/read helpers, LRU statement cache
+//!   §4  PostgreSQL driver    —— PostgresConn + VTable, binary/date/numeric/inet decoders
+//!   §5  MySQL driver         —— MySqlConn + VTable, query formatting, row materialisation
+//!   §6  Prepared statements  —— Stmt vtable + SQLiteStmt / PostgresStmt / MySqlStmt
+//!   §7  Connection pool      —— ConnPool with circuit breaker, health checks, waiters
+//!   §8  Unified client       —— Config, Client (init/query/exec/tx), Transaction, misc helpers
+//!   §9  Tests                —— offline tests + `DB=`-gated per-driver tests
+//!
+//! Every section below carries a matching `// ==== §N ... ====` anchor — `grep "§8"` jumps there.
 //!
 //! MAINTENANCE (do NOT grow this file without reading the roadmap):
 //!   - One PR should touch at most ONE § section.
 //!   - New DB driver → new file under sqlx/ (e.g. sqlx/foo_conn.zig), register here only.
-//!   - New ORM features → sqlx/orm.zig (or data layer), not ad-hoc helpers in §7.
+//!   - New ORM features → sqlx/orm.zig (or data layer), not ad-hoc helpers in §8.
 //!   - ConnPool / Row arena / stmt cache changes → full `zig build test` required.
 
 const std = @import("std");
@@ -51,6 +52,8 @@ const enable_mysql = blk: {
 const sqlite3_c = if (enable_sqlite) @import("sqlite3_c.zig") else @import("sqlite3_c_stub.zig");
 const libpq_c = if (enable_postgres) @import("libpq_c.zig") else @import("libpq_c_stub.zig");
 const libmysql_c = if (enable_mysql) @import("libmysql_c.zig") else @import("libmysql_c_stub.zig");
+
+// ==== §1  Types & helpers ====
 
 /// Compile-time driver feature flags (from `-Ddb=` / `build_options`).
 pub const DriverFeatures = struct {
@@ -675,7 +678,7 @@ pub const Conn = struct {
     }
 };
 
-// ==================== Struct Scanning ====================
+// ==== §2  Struct scanning ====
 
 /// Precompute struct-field → column-index mapping once per query.
 /// Eliminates O(F*C) string comparisons per row — each row scan
@@ -744,7 +747,8 @@ pub fn scanRowsToOwned(comptime T: type, rows: *Rows, partial: bool) !QueryResul
 /// When `borrow_strings` is true, []const u8 fields point into the row arena (no dupe).
 fn scanStruct(allocator: std.mem.Allocator, comptime T: type, row: Row, partial: bool, indices: ?[]?usize, borrow_strings: bool) !T {
     const info = @typeInfo(T);
-    if (info != .@"struct") @compileError("scanStruct only supports structs, got " ++ @typeName(T));
+    if (info != .@"struct") @compileError("scanStruct / queryRow* expect a struct row type whose fields mirror the SELECT list; got " ++
+        @typeName(T) ++ ". Pass a struct (optionals for nullable columns, `[]const u8` for text) or scan a single column with queryScalar.");
 
     var result: T = undefined;
     const fn_names = info.@"struct".field_names;
@@ -1018,7 +1022,7 @@ pub fn QueryResult(comptime T: type) type {
     };
 }
 
-// ==================== SQLite Implementation ====================
+// ==== §3  SQLite driver ====
 
 /// Bounded prepared-statement cache (per connection, LRU eviction).
 const MAX_CACHED_STMTS = 64;
@@ -1333,7 +1337,7 @@ fn readSQLiteValue(allocator: std.mem.Allocator, stmt: ?*sqlite3_c.sqlite3_stmt,
     };
 }
 
-// ==================== PostgreSQL Implementation ====================
+// ==== §4  PostgreSQL driver ====
 
 /// Maximum cached prepared statements per PG connection.
 const PG_MAX_CACHED_STMTS = 64;
@@ -2586,7 +2590,7 @@ pub const PostgresConn = struct {
     }
 };
 
-// ==================== MySQL Implementation ====================
+// ==== §5  MySQL driver ====
 
 fn formatQuery(allocator: std.mem.Allocator, sql: []const u8, args: []const Value) ![]u8 {
     var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
@@ -3475,7 +3479,7 @@ pub const MySqlConn = struct {
     }
 };
 
-// ==================== Prepared Statements ====================
+// ==== §6  Prepared statements ====
 
 pub const Stmt = struct {
     ptr: *anyopaque,
@@ -3787,7 +3791,7 @@ pub const MySqlStmt = struct {
     }
 };
 
-// ==================== Connection Pool ====================
+// ==== §7  Connection pool ====
 
 const ConnPool = struct {
     pub const PooledEntry = struct {
@@ -4164,7 +4168,7 @@ const ConnPool = struct {
     }
 };
 
-// ==================== Unified Client ====================
+// ==== §8  Unified client ====
 
 /// SQL configuration
 pub const Config = struct {
@@ -5690,7 +5694,7 @@ pub const Builder = struct {
     }
 };
 
-// ==================== Tests ====================
+// ==== §9  Tests ====
 
 /// Skip this test unless the DB env var matches.
 /// Postgres tests (named "postgres"): skip if DB=mysql or DB=sqlite

@@ -43,17 +43,41 @@ pub const SqlError = struct {
     message: []const u8,
 };
 
-/// Database-specific error types aligned with SQLState codes
+/// Database-specific error types aligned with SQLState codes.
+///
+/// Produced by `sqlStateToError` (SQLSTATE → kind) and by `diagnose*` in
+/// `sqlx/sqlx.zig`. `isAcceptableDbError` decides which of them are "expected"
+/// and must not trip the pool circuit breaker.
 pub const DatabaseError = error{
+    /// The connection is gone or was never established (SQLSTATE 08xxx, incl. 08004
+    /// too-many-connections). Reconnect or fail the request; the statement did not run.
     ConnectionFailed,
+    /// The server rejected the statement itself (SQLSTATE 42xxx — unknown table,
+    /// column, or syntax). A code bug, not a transient failure: do not retry.
     QueryFailed,
+    /// The statement failed during execution. Present in the taxonomy but not
+    /// returned by `sqlStateToError` today — the drivers map to `Other` instead.
     ExecFailed,
+    /// The statement was cancelled by a timeout (SQLSTATE 57014). Retryable; treat
+    /// as backpressure rather than an outage.
     Timeout,
+    /// No row matched (SQLSTATE 02000) or the row was already deleted. Surfacing it
+    /// as 404 is normal; `isAcceptableDbError` marks it as breaker-safe.
     NotFound,
+    /// A constraint was violated (SQLSTATE 23xxx — unique, FK, check). Retrying the
+    /// same statement will fail again; report a conflict (409) to the client.
     ConstraintViolation,
+    /// A serializable transaction lost a race (SQLSTATE 40001 / 40P01). Retry the
+    /// whole transaction; `isAcceptableDbError` marks it as breaker-safe.
     SerializationFailure,
+    /// The connection is read-only (SQLSTATE 25000/25001/25002). Route the write to a
+    /// primary; `isAcceptableDbError` marks it as breaker-safe.
     ReadOnlyViolation,
+    /// The server is out of connection slots (SQLSTATE 53300). Back off and retry
+    /// later instead of opening another connection.
     TooManyConnections,
+    /// No more specific mapping exists for this SQLSTATE. Log the raw state/message
+    /// (they stay available in `SqlError`) before deciding to retry.
     Other,
 };
 

@@ -1,6 +1,6 @@
 # Multi-Tenant Management System — ZigModu Best Practice Demo
 
-A complete multi-tenant SaaS management system built with **ZigModu v0.13.15** / **Zig 0.17**, demonstrating framework best practices. This is the **flagship runnable example** (see `scripts/ci-integration.sh`).
+A complete multi-tenant SaaS management system built with **ZigModu v0.23.0** / **Zig 0.17**, demonstrating framework best practices. This is the **flagship runnable example** (see `scripts/ci-integration.sh`).
 
 > **多租户是可选项。** 本示例演示 Tenant → JWT → DataPermission 中间链 + 表级 `tenant_id` 隔离。单租户应用可省略租户中间件，见 [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) § Multi-Tenancy (Optional) 与 [`examples/basic/`](../basic/)。
 

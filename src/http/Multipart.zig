@@ -64,12 +64,31 @@ test "Config.forBodyLimit keeps the multipart limits inside the body limit" {
     try std.testing.expect(cfg.max_part_bytes <= cfg.max_total_bytes);
 }
 
+/// Failures `parse` reports for a request body.
+///
+/// `src/api/Extract.zig` (`extractMultipart`) is the reference consumer and turns
+/// them into statuses: 415 for `NotMultipart`, 413 for the size errors, 400 for
+/// everything else. `Allocator.Error` is deliberately not rendered there — it is a
+/// 500 owned by the server's error path, not a client mistake.
 pub const Error = error{
+    /// `Content-Type` is not `multipart/form-data` at all. Answer 415 and tell the
+    /// client the expected media type.
     NotMultipart,
+    /// `Content-Type` says multipart/form-data but carries no `boundary=`
+    /// parameter, so parts cannot be framed. Answer 400.
     MissingBoundary,
+    /// The body does not match its own framing: no opening `--boundary`, no
+    /// blank line between part headers and payload, or no closing delimiter.
+    /// Answer 400.
     MalformedPart,
+    /// More parts than `Config.max_parts`. Answer 400, or raise the cap if the
+    /// endpoint legitimately accepts more.
     TooManyParts,
+    /// A single part's payload exceeds `Config.max_part_bytes`. Answer 413.
     PartTooLarge,
+    /// The whole body exceeds `Config.max_total_bytes`. Answer 413 — and remember
+    /// `Server.Config.max_body_size` is checked first, so this one may never fire
+    /// unless the two limits are kept in sync via `Config.forBodyLimit`.
     PayloadTooLarge,
 } || std.mem.Allocator.Error;
 

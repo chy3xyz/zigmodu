@@ -59,7 +59,12 @@ const now = Time.monotonicNowSeconds();
 ### 3. Application Initialization
 
 #### Old API (v0.4)
-```zig
+
+The allocator was the first parameter back then (`io` arrived in v0.16): this is
+history, not a snippet to copy — the `text` fence keeps it out of the
+doc-snippet gate, which only judges `zig` fences.
+
+```text
 var app = try Application.init(allocator, "app", modules);
 try app.start();
 ```

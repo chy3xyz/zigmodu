@@ -14,8 +14,8 @@
 //! defer b.deinit();
 //! var app = try b.build(.{OrderModule});
 //! try app.start();
-//! const rt = app.runtime();                   // created on first use
-//! const worker = try rt.spawn(OrderBook, .{ .symbol = "BTC/USDT" });
+//! const rt = try app.runtime();               // created (and started) on first use
+//! const worker = try rt.spawn(OrderBook, .{ .symbol = "BTC/USDT" }, 256); // 256 = mailbox capacity (comptime)
 //! try worker.send(.{ .price = 101 });
 //! ```
 //!

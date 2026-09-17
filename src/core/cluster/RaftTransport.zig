@@ -54,7 +54,21 @@ pub const MessageTag = enum(u8) {
     install_snapshot_response = 6,
 };
 
-pub const DecodeError = error{ TruncatedMessage, UnknownMessageTag, UnexpectedMessageTag };
+/// Reasons `decode` rejects a payload. Every failure means "drop this frame and
+/// keep reading": the cursor never advances past the bad bytes, so callers must
+/// not try to re-parse the same buffer after one of these.
+pub const DecodeError = error{
+    /// The cursor ran past the declared length — the payload is shorter than its
+    /// length prefixes claim. Callers should resync from the next frame instead of
+    /// retrying with the same bytes.
+    TruncatedMessage,
+    /// The version/tag byte is not one of the known `MessageTag` values. Treat it as
+    /// a protocol mismatch (peer speaks a newer wire version) and log the byte.
+    UnknownMessageTag,
+    /// The message is internally inconsistent for its tag — e.g. a response type
+    /// arrived where a request was expected. Drop it and surface the bug.
+    UnexpectedMessageTag,
+};
 
 /// Cursor over one payload (the bytes after the tag).
 const Cursor = struct {

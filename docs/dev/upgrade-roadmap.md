@@ -16,6 +16,11 @@ examples/cluster-demo/
 └── README.md
 ```
 
+> **现状（2026-09-17）**：这条计划**没有按此实现**，`examples/cluster-demo/` 已删除（它只有 compose + README，
+> 且 compose 构建的是仓根 Dockerfile 跑 basic 示例；`node1/2/3.zig` 从未存在）。今天要看去处：
+> 多节点拓扑与 fail-closed 说明 → `examples/distributed/README.md`；集群栈现状（membership + 读侧可用，
+> 选主缺状态机、多节点启动默认拒绝）→ `docs/DISTRIBUTED.md`；docker 拓扑参考 → `examples/production-deploy/`。
+
 ### 1.2 WAL/DLQ/Partitioner test enablement
 Fix Zig 0.16 `std.fs` API calls in WAL/DLQ/Partitioner. Use `std.testing.tmpDir`
 to enable 8 existing-but-disabled tests.

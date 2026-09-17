@@ -140,8 +140,9 @@ if (!try bus.publish(trade)) { /* 所有订阅者都满了 */ }
 2. **丢，但不长**：每个订阅者是**有界邮箱**，满即丢该条并计数（`stats().dropped`）。慢消费者既不能拖慢发布方，
    也不能把内存吃光。
 
-实测（`examples/runtime-workers`）：审计 worker 故意慢，指标 sink 是 O(1) ——
-同一批 261 条事件里 `delivered=330 / dropped=192`，指标一条不漏、审计丢掉慢的那些、**订单簿从未阻塞**。
+实测（`examples/runtime-workers`）：审计 worker 故意慢，指标 sink 是 O(1) —— 指标一条不漏、审计丢掉慢的那些、
+**订单簿从未阻塞**。具体条数随示例版本变化（投递/丢弃由 feed 速率与邮箱容量决定），跑一次看当次输出即可，
+别照抄历史数字。
 
 与 `app.eventBus(T)` 的分工见 §6：L1 要"最终大家都看到"（可以分配、可以慢），L0 要"发布方绝不停"（有界、可丢）。
 
@@ -262,9 +263,10 @@ const s = rt.stats();
 | **v0.17.0** | Actor 监督（`spawnActor` + 错误预算 + `onError` 现场决策）、`HotBus`（L0 扇出，freeze 后无锁、drop-on-full）、`Sequencer` | ✅ 本文档 §3b/§3c |
 | **v0.18** | 编译期架构引擎：依赖图（`ModuleGraph` 编译期报环）、`zmodu graph`（Mermaid）、`zmodu doctor` | ✅ 已发布（doctor 清单仍未覆盖"未解析服务/事件拓扑/消费者计数"，见 `docs/dev/todo3.md` 评估） |
 | 之后 | 真监督树（父决定子的重启策略）、带干净状态的重启、跨进程/跨节点监督 | 未承诺 |
-| **v0.19** | Cluster / Shard / Service Discovery | ⚠ 部分：`ClusterView`（读侧快照/rendezvous）、`ShardRouter` 落地；选主（`RaftElection`）/LB/`PeerDiscovery` 存在但**未导出、未接线**，集群传输仍是自造 TCP（未按本节原意"适配 QUIC"） |
+| **v0.19** | Cluster / Shard / Service Discovery | ⚠ 部分：`ClusterView`（读侧快照/rendezvous）、`ShardRouter` 落地；选主（`RaftElection`）/LB/`PeerDiscovery` 已从 `root.zig` 导出（v0.23.0 起含 `RaftTransport`）但**框架未接进请求路径**，集群传输仍是自造 TCP（未按本节原意"适配 QUIC"）；真选主要什么见 `docs/DISTRIBUTED.md` |
 | **v0.20** | Workflow（状态机 + Saga + 补偿 + 检查点 + 恢复） | ⚠ 部分：Saga 补偿 + WAL 检查点 + 崩溃续跑 ✅（`SagaOrchestrator.resumeInstance` / `restoreFromWal`）；**状态机与 timeout 未做**（`SagaStep.timed_out` 从不赋值），`.step().compensate()` DSL 明确不做（`docs/WORKFLOW.md`） |
-| **v0.21** | Agent Runtime（Identity / Memory / Skills / Permissions / Budget 一等化） | ✅ 已发布：`ai.AgentSpec` + `ai.Guard`（已接进 `Agent.run`）+ `ai.ProposalPipeline` —— 见 `docs/AGENT_RUNTIME.md`；**Agent 的 State / Event subscriptions / Lifecycle 与 Worker 接线仍未做** |
+| **v0.21** | Agent Runtime（Identity / Memory / Skills / Permissions / Budget 一等化） | ✅ 已发布：`ai.AgentSpec` + `ai.Guard`（已接进 `Agent.run`）+ `ai.ProposalPipeline` —— 见 `docs/AGENT_RUNTIME.md`；**Agent 的 State / Event subscriptions / Lifecycle 仍未做** |
+| **v0.22.0** | Agent 跑成 worker（`Agent → Worker → Event`） | ✅ `ai.AgentWorker`：`rt.spawn(ai.AgentWorker, …)` + `ai.agent_worker.post(...)`，有界邮箱 / 生命周期 / 监督 / 指标跟着来 —— 见 `docs/AGENT_RUNTIME.md` §六 |
 | 1.0 | API 收敛、命名统一、deprecated 清理 | 计划 |
 
 ## 10. 最小示例

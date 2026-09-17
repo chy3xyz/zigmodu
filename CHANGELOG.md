@@ -1,5 +1,51 @@
 # Changelog
 
+## [Unreleased]
+
+> **⚠️ 破坏性变更**：删除 7 个示例文件/目录（`examples/testing/`、`examples/deprecated/`、`examples/cluster-demo/`、
+> `examples/example_tests.zig`）—— 内容已分别并入 `examples/basic/src/tests.zig`、`examples/distributed/README.md`，
+> 或属零引用占位。其余为纯新增/修复。
+
+### 文档与示例品质（2026-09 复核批次）
+
+- **导出面文档**：`src/root.zig` + 六个领域 barrel（http/data/security/ai/observability/runtime）新增
+  **463 行 `///`**，覆盖率从 root 14% / barrel 4% 提到 **100%**（每条一句话：是什么 + 什么时候用）。
+- **两个"死旋钮"接线**（文档承诺行为、代码零读取）：`Application.Config.max_dependencies` 现在真的在启动期
+  做超限告警（`warnOverDependencyLimit`）；`Server.Config.connection_stack_size` 真的用于 accept 线程
+  （低于平台下限才抬升）。两者各有测试。
+- **可执行文档修正**：`Application.init(io, allocator, name, modules, Config)` 的真签名示例、`app.runtime()` 的
+  `try` / comptime capacity、`ClusterView` 的 refcount 表述、`tuneSocket` 的 keepalive 说明。
+- **`DocSnippets` 门禁扩容**：新增两类模式（`try app.runtime().spawn(...)` 整链、`Application.init(allocator` 首参错），
+  并把 markdown 扫描**递归到 `docs/**`**（跳过插件目录）；两处旧片段顺带修正。
+- **大文件可导航**：Server(4392) / KafkaConnector / Middleware / GrpcTransport / Http2Server / ai-workflow /
+  redis / sqlx 加 `//! §N` 目录 + 正文 `// ==== §N ====` 锚点（`grep "§3"` 可跳）。
+- **公开 error set 全成员文档**：12/12（新补 8 个 set / 94 条成员注释）；5 处 `@compileError` / `@panic` 文案
+  统一成"期望形态 + 怎么改"。
+
+### 修复
+
+- **outbox 占位符错配**（真 bug）：`8977184` 给 INSERT 加了 `tenant_id` 列与第 6 个 `?`，而全仓 13 处调用方
+  一律按 5 参绑定 → 参数错位、`updated_at` 无人绑定 → `NOT NULL constraint failed: event_outbox.updated_at`。
+  非租户 SQL 改为 `VALUES (?, ?, NULL, 0, 0, ?, ?, ?)`（占位符回到 5 个，与调用方逐一对齐），租户变体保留 6 个；
+  两条复现测试（含"临时改回旧 SQL 必失败"的反证）。`examples/ai-ops` 的 test 因此恢复并接回 CI。
+- **英文 README 中文污染清零** + 门禁：`README.md` 出现汉字即失败，反向断言 `README.zh.md` 必须是中文（防对调）。
+- `examples/distributed` 的"多节点部署"改成事实（跨节点事件总线，**无选主**）；`http-stress-test` / `tenant-mgmt`
+  README 与代码对齐；根 README 的 Distributed 行同样改准；`docs/dev/upgrade-roadmap.md` 的 `cluster-demo` 引用
+  加现状说明（历史原文保留）。
+
+### 示例与 CI
+
+- **CI 两份示例构建清单统一**（此前漂移：`zent-modulith` 只在一侧，`shopdemo-zent` / `metaverse-creative` 两侧都没有）：
+  现在两份**逐字一致（17 项 + `zmsaas/backend`）**，19 个示例逐个实测离线 `zig build` exit=0；不可构建的目录
+  （docker / node / sibling 依赖）在两处都写明原因。
+- 已有 test step 的示例接进 CI（ai-ops / basic / llm-policies / tenant-ai / web4 / zmsaas-backend）。
+- **收敛重复示例**：`testing` 并入 `basic`（3 个 test 逐条保留 + 2 条从未跑过的 demo 改为真测试，
+  顺带发现其中一条原断言为假）；`cluster-demo` 并进 `distributed`；删 `deprecated/` 与 `example_tests.zig`。
+  `examples/README.md` 索引与目录一一对应（20/20，脚本校验）。
+- `alpha-engine`（v0.23 的 P0 示例）进 CI 构建列表 + doctor 循环，并补 README；`runtime-workers` 补 README。
+- `shopdemo-zent` / `metaverse-creative` 的 zent 依赖由 `.path` 改 **git tag pin（v0.67.0）**；9 个 `build.zig.zon`
+  的 `minimum_zig_version` → `0.17.0`。
+
 ## [0.23.0] - 2026-09-17
 
 - **`ClusterBootstrap` 可选自带 Raft 传输**：`BootstrapConfig.transport` 接受应用提供的

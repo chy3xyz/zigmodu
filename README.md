@@ -13,11 +13,11 @@ A modular application framework for Zig 0.17, inspired by Spring Modulith. Build
 |-------|-------------|
 | [**AGENTS.md**](AGENTS.md) | **AI agent handbook** (DO/DON'T, Path A auth, ComptimeRouter) |
 | [Quick Start](docs/QUICK-START.md) | Get started in 5 minutes |
-| [Modulith 高并发](docs/MODULITH.md) | Day-one modulith + high-concurrency practices |
+| [Modulith & Concurrency](docs/MODULITH.md) | Day-one modulith + high-concurrency practices |
 | [Events & DI](docs/EVENTS_DI.md) | `initWith(ctx)` + `app.eventBus` + container freeze |
 | [Declarative Routes](docs/ROUTE_TABLE.md) | ComptimeRouter + catalog JWT/RBAC |
-| [ZigModu × zent](docs/ZENT.md) | **电商/社交主推组合**：zent ORM 集成最佳实践 |
-| [Best Practices](docs/BEST_PRACTICES.md) | Architecture evolution + JWT checklist + 韧性（panic/背压/FrozenMap） |
+| [ZigModu × zent](docs/ZENT.md) | **Recommended pairing for commerce/social**: zent ORM integration best practices |
+| [Best Practices](docs/BEST_PRACTICES.md) | Architecture evolution + JWT checklist + resilience (panic / backpressure / FrozenMap) |
 | [Agent Runtime](docs/AGENT_RUNTIME.md) | **Agents can't act by default**: `Guard` (two fail-closed axes — an `execute` second switch + empty-by-default allow list) |
 | [Observability](docs/OBSERVABILITY.md) | Golden signals, PromQL, alert thresholds, Grafana dashboard |
 | [Production Roadmap](docs/PRODUCTION_ROADMAP.md) | Maintenance boundaries, prefork limits, `src/ai` boundary |
@@ -428,14 +428,13 @@ docker compose --profile tracing up -d  # With Jaeger
 
 | Example | Description |
 |---------|-------------|
-| **[Tenant Mgmt](examples/tenant-mgmt/)** | **旗舰示例**：多租户 SaaS、中间件链、健康探针、`zigmodu.http` |
-| [Basic](examples/basic/) | Module fundamentals |
+| **[Tenant Mgmt](examples/tenant-mgmt/)** | **Flagship example**: multi-tenant SaaS, middleware chain, health probes, `zigmodu.http` |
+| [Basic](examples/basic/) | Module fundamentals + test utilities (`src/tests.zig`) |
 | [Event-Driven](examples/event-driven/) | Publish-subscribe patterns |
-| [Testing](examples/testing/) | Test utilities |
 | [HTTP Stress Test](examples/http-stress-test/) | Concurrent load (CI integration) |
 | [Metaverse Creative](examples/metaverse-creative/) | Creative demo |
-| [Distributed](examples/distributed/) | Multi-node deployment |
-| [ShopDemo](examples/shopdemo/) | **Codegen 参考**：152 表 schema + `generated-sample/`（需 zmodu CLI 生成完整应用） |
+| [Distributed](examples/distributed/) | Cross-node event bus (`DistributedEventBus`); **no leader election** — see `docs/DISTRIBUTED.md` for the cluster stack and its fail-closed multi-node startup |
+| [ShopDemo](examples/shopdemo/) | **Codegen reference**: a 152-table schema + `generated-sample/` (use the zmodu CLI to generate the full app) |
 
 ## 🤝 Contributing
 

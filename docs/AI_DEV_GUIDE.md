@@ -87,25 +87,40 @@ try registry.register(.{
         .{ .name = "order_id", .type = .number, .description = "订单 ID", .required = true },
     },
     .required_permission = "order:read",   // 未授权直接 error.PermissionDenied
+    .action = .read,                       // 工具类别：.read / .propose / .execute（默认 .execute，最严）
     .handler = orderSummaryHandler,
 });
 ```
 
 ### 3.3 执行：Agent
 
+用 `ai.AgentSpec` 装配（**不要**手搓裸 `Agent{}`：漏掉 `.guard` 就是无界 —— 任何已注册工具都能跑）。
+闸门 / 工具类别 / 权限默认 deny 的完整说明见 [`AGENT_RUNTIME.md`](AGENT_RUNTIME.md)。
+
 ```zig
 var budget = zigmodu.ai.Budget.init(2000);          // 硬 token 预算（预留制）
 var audit_log = try zigmodu.ai.AgentAuditLog.init(allocator, io, 256);
-var agent = zigmodu.ai.Agent{
+var memory = zigmodu.ai.MemoryStore.init(allocator, io);   // 可选：按 tenant + user 注入
+var guard = zigmodu.ai.Guard.init(.{
+    .allow = &.{"order.summary"},                   // 列名 ≠ 可执行；空 = 什么都不放行
+    .allow_execute = false,                         // 执行类是第二道开关
+});
+
+var spec = zigmodu.ai.AgentSpec{
+    .name = "order-assistant",                      // 身份：进日志与 Prometheus 标签
     .provider = &provider,
-    .registry = &registry,
-    .allowlist = &.{"order.summary"},               // 安全：只允许列出的工具
-    .tool_timeout_ms = 5_000,
+    .skills = &registry,
+    .system_prompt = "你是订单助手，只调用已授权的工具。",
+    .guard = &guard,                                // 不设 = 无界（启动期用 spec.isGuarded() 断言）
+    .memory = &memory,                              // 身份缺失或为 0 时一个字都不注入
     .budget = &budget,
+    .allowlist = &.{"order.summary"},               // 工具名白名单（第二道口子，可与 guard 并存）
+    .tool_timeout_ms = 5_000,
     .audit = &audit_log,
     // .context = &ctx_mgr,                         // 可选：长对话自动压缩
-    // .tracer = &tracer,                           // 可选：run 级 trace span
 };
+var agent = spec.build();
+// agent.tracer = &tracer;                          // 可选：run 级 trace span（Spec 未收，build 后赋值）
 
 var skill_ctx = zigmodu.ai.SkillContext{
     .allocator = allocator,
@@ -180,13 +195,14 @@ _ = trigger.fire(allocator, "webhook-event");   // 事件源即时触发
 `outbox.OutboxConsumer` 消费，形成「业务事件 → outbox → AI → 审计/人工」闭环。
 
 **MCP**：`ai.mcp.serveStdio(io, allocator, &registry, ctx_template)` 起 stdio
-server，`tools/list` 自动从注册表推导参数 schema，`admin.*` 默认不进
-`tools/list`（需显式 allowlist）。
+server，`tools/list` 自动从注册表推导参数 schema，并列出注册表里的**全部**技能
+（`admin.*` 也在内）。按 allowlist / 权限裁剪 `tools/list` **尚未实现** —— 管理类技能
+不要注册进暴露给 MCP 的 registry（见 `MCP.md`「安全」）。
 
 ## 7. 安全与受控执行清单
 
 - [ ] key 从 `init.environ_map` 读，端点/模型白名单由应用配置
-- [ ] `Agent.allowlist` 只列业务需要的技能；管理类技能（`admin.*`）默认关闭
+- [ ] `guard.allow`（空 = 什么都不放行）+ `Agent.allowlist`（null = 全部注册工具）两处都只列业务需要的技能；`admin.*` 不要注册进暴露面
 - [ ] 写操作技能设 `required_permission` + 事务性 outbox + 幂等键（`run_id`）
 - [ ] handler 返回值全部 `ctx.allocator` 持有，调用方 `freeValue`
 - [ ] `SkillContext.tenant_id` 从请求/JWT 注入，实体技能自动租户隔离
@@ -208,5 +224,5 @@ server，`tools/list` 自动从注册表推导参数 schema，`admin.*` 默认�
 ## 边界（刻意不做）
 
 无界自主循环（每轮有限步骤 + 预算 + 可中止）；不内置 shell / 任意 URL 抓取 /
-裸 SQL 写 / 跨租户访问 / 向量库（`Retriever` 自接）；管理类技能必须显式
-加入 allowlist。
+裸 SQL 写 / 跨租户访问 / 向量库（`Retriever` 自接）；管理类技能不进暴露给
+MCP / 外部调用方的 registry（`tools/list` 不做过滤）。

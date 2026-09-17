@@ -36,6 +36,7 @@ const outbox_table_sql =
     \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
     \\  topic TEXT NOT NULL,
     \\  payload TEXT NOT NULL,
+    \\  tenant_id INTEGER,
     \\  status INTEGER NOT NULL DEFAULT 0,
     \\  retry_count INTEGER NOT NULL DEFAULT 0,
     \\  max_retries INTEGER NOT NULL DEFAULT 5,

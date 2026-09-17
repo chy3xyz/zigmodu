@@ -136,9 +136,21 @@ jobs:
         run: zig build check
 
       - name: Build framework examples
+        # Keep this list identical to the `Build all examples` step of the
+        # `examples` job below — the two drifted once (zent-modulith was built
+        # only there, so a regression in it could not fail this job) and it is
+        # the coverage contract: an example missing from a list is an example
+        # nobody compiles until a user does. Everything listed must build
+        # offline — no sibling checkout, no live service; that is why the zent
+        # demos pin zent by git tag in their build.zig.zon instead of a path.
         run: |
           set -euo pipefail
-          for ex in ai-ops tenant-ai llm-policies mcp-server web4 basic distributed event-driven runtime-workers http-stress-test shopdemo tenant-mgmt tenant-shop testing; do
+          # Absent on purpose, here and in the `examples` job:
+          #   production-deploy nginx/envoy/k8s/systemd references only
+          #   _shared           helper lib imported by path; its only step
+          #                     (`test`) needs a sibling ../zent checkout
+          #   zmsaas/frontend   SolidStart app — needs the node toolchain
+          for ex in ai-ops tenant-ai llm-policies mcp-server web4 basic distributed event-driven runtime-workers alpha-engine http-stress-test shopdemo shopdemo-zent tenant-mgmt tenant-shop zent-modulith metaverse-creative; do
             echo "== building examples/$ex =="
             (cd "examples/$ex" && zig build)
           done
@@ -151,7 +163,7 @@ jobs:
         # because the framework's own tree is not laid out as src/modules/<name>.
         run: |
           set -euo pipefail
-          for app in tenant-mgmt tenant-shop shopdemo zent-modulith; do
+          for app in tenant-mgmt tenant-shop shopdemo zent-modulith alpha-engine; do
             echo "== doctor examples/$app =="
             ./zig-out/bin/zmodu doctor "examples/$app"
           done
@@ -294,14 +306,36 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libpq-dev libmariadb-dev libmariadb-dev-compat libsqlite3-dev
 
       - name: Build all examples
+        # Keep this list identical to the `Build framework examples` step of
+        # the `build-and-test` job above (same exclusions, same order) — see
+        # the comment there for why the lists exist and what may not join.
         run: |
           set -euo pipefail
-          for ex in ai-ops tenant-ai llm-policies mcp-server web4 basic distributed event-driven runtime-workers http-stress-test shopdemo tenant-mgmt tenant-shop testing zent-modulith; do
+          # Absent on purpose, here and in the `build-and-test` job:
+          #   production-deploy nginx/envoy/k8s/systemd references only
+          #   _shared           helper lib imported by path; its only step
+          #                     (`test`) needs a sibling ../zent checkout
+          #   zmsaas/frontend   SolidStart app — needs the node toolchain
+          for ex in ai-ops tenant-ai llm-policies mcp-server web4 basic distributed event-driven runtime-workers alpha-engine http-stress-test shopdemo shopdemo-zent tenant-mgmt tenant-shop zent-modulith metaverse-creative; do
             echo "== building examples/$ex =="
             (cd "examples/$ex" && zig build)
           done
           echo "== building examples/zmsaas/backend =="
           (cd examples/zmsaas/backend && zig build)
+
+      - name: Run the example test steps
+        # Only the examples that ship a `test` step: this runs the same command
+        # their READMEs advertise, so a broken assertion is caught here instead
+        # of in a reader's clone. Not covered yet: examples with tests but no
+        # step (shopdemo, zent-modulith).
+        run: |
+          set -euo pipefail
+          for ex in ai-ops basic llm-policies tenant-ai web4; do
+            echo "== testing examples/$ex =="
+            (cd "examples/$ex" && zig build test)
+          done
+          echo "== testing examples/zmsaas/backend =="
+          (cd examples/zmsaas/backend && zig build test)
 
   # ── Integration (full) ─────────────────────────
   integration-full:

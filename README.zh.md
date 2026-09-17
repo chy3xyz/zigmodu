@@ -244,7 +244,7 @@ XN|| 示例 | 描述 | 运行 |
 PN||------|------|------|
 SW|| [基础](examples/basic/) | 模块基础 | `cd examples/basic && zig build run` |
 PJ|| [事件驱动](examples/event-driven/) | 发布订阅 | `cd examples/event-driven && zig build run` |
-WT|| [测试](examples/testing/) | 测试工具 | `cd examples/testing && zig build test` |
+WT|| [测试（并入 basic）](examples/basic/) | 测试工具 | `cd examples/basic && zig build test` |
 JP|| [HTTP压力测试](examples/http-stress-test/) | 并发连接 | `cd examples/http-stress-test && zig build run` |
 NW|| [元宇宙创意](examples/metaverse-creative/) | 创意演示 | `cd examples/metaverse-creative && zig build run` |
 

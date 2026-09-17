@@ -19,7 +19,7 @@ demonstrates the zent choice for a small order domain.
 ```
 shopdemo-zent/
 ├── build.zig            # ZigModu + zent (sqlite3 + optional pq/mysql)
-├── build.zig.zon        # .name = .shopdemo_zent, zent = ../../../zent
+├── build.zig.zon        # .name = .shopdemo_zent, zent pinned by git tag (v0.67.0)
 └── src/
     ├── main.zig         # driver open → migrate → store → service → api → http
     └── modules/order/
@@ -65,13 +65,9 @@ pub const OrderItem = Schema("OrderItem", .{
 
 ## Run
 
-Requires a sibling checkout of `zent`:
-
-```
-zig_ws/
-├── zigmodu/
-└── zent/
-```
+`zent` is pinned by git tag in `build.zig.zon` (v0.67.0), so no sibling checkout
+is needed — Zig fetches it on first build. For developing `zent` itself, swap
+the dependency for `.zent = .{ .path = "../../../zent" }`.
 
 ```bash
 cd examples/shopdemo-zent

@@ -10,6 +10,7 @@ basic/
 ├── build.zig.zon
 └── src/
     ├── main.zig
+    ├── tests.zig
     └── modules/
         ├── user.zig
         ├── order.zig
@@ -21,6 +22,17 @@ basic/
 ```bash
 cd examples/basic
 zig build run
+```
+
+## Running the Tests
+
+`src/tests.zig` carries the testing demo:
+`ModuleTestContext`, `zigmodu.createMockModule`, application lifecycle, and
+dependency validation.
+
+```bash
+cd examples/basic
+zig build test
 ```
 
 ## Module Dependencies
@@ -35,3 +47,4 @@ Payment → Order → User
 - Module dependencies
 - Lifecycle hooks (init/deinit)
 - Application bootstrap
+- Module testing: `ModuleTestContext`, `createMockModule`, dependency validation

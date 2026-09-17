@@ -2,7 +2,11 @@
 
 const std = @import("std");
 
+/// Failure modes of the startup configuration checks in this file.
 pub const EnvError = error{
+    /// At least one key passed to `requireEnv` is absent from the map. The error
+    /// names no key (the map/keys remain owned by the caller), so log the caller's
+    /// key list and fail startup before listening.
     MissingConfig,
 };
 

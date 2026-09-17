@@ -7,7 +7,135 @@
 > **HTTP 路由 + catalog JWT / RBAC**：见专文 [ROUTE_TABLE.md](ROUTE_TABLE.md) §7；可执行清单见下文「JWT / 多端身份」。  
 > **AI / Agent 写代码**：先读仓库根目录 [AGENTS.md](../AGENTS.md)（文档地图 + DO/DON'T）；方法论见 [AI_METHODOLOGY.md](AI_METHODOLOGY.md)。
 
+## 🔄 现状复核（2026-09-17，v0.23.0）—— 近期演进对示例/文档的影响
+
+**结论：对 `examples/` 的代码影响很小，问题集中在文档与 CLI 模板。** 三份只读审计（Runtime/builder、
+AI 侧、集群侧）的实测结果：builder 绑定、worker 归 app、不手动 `rt.start()` 这三条在 examples 里**零违规**
+（全仓只有 3 处 `zmodu.builder`，全部先绑定）；`examples/` 里**没有任何**代码用 `ai.Agent`（只用
+SkillRegistry / Workflow / 审批流），也**没有任何**示例接集群栈。真正"照抄即失败"的都在文档里，清单见本节末尾。
+
+### 当前最佳实践速查
+
+1. **App 组装**：builder 必须先绑定 —— `var b = zmodu.builder(allocator, io); defer b.deinit();`
+   然后 `var app = try b.withName("x").build(.{Mod});`。链在**临时值**上（`builder(…).withName(…)`）
+   编译不过：临时值物化成 `*const`，而 builder 方法收 `*Self`。
+2. **worker 属于 app**：模块在 `pub fn initWith(ctx: *ModuleContext)` 里 `const rt = try ctx.runtime();`
+   再 spawn；`Application.stop()` 先 join worker 再停模块。不要在模块里 `Runtime.init`（线程没人 join）
+   或 `rt.shutdown()`（会打断别的模块）。`Application.runtime()` **首次调用即启动 ticker**，别再多写 `rt.start()`。
+3. **Agent 装配**：用 `ai.AgentSpec{ .name, .provider, .skills, .system_prompt, .guard, .memory, .budget }`
+   + `spec.build()`；启动期用 `isGuarded()`（有没有闸门）/ `isInert()`（有闸门但什么都没授予）断言。
+   裸 `Agent{}` 不设 `.guard` = **无界**（任何注册工具都能跑）。
+4. **工具必须声明类别**：`skill.Tool.action = .read / .propose / .execute`（**默认 `.execute`**，最严）。
+   注意：内置技能目前全部落在默认值上 —— 照 `AGENT_RUNTIME.md` §二 配
+   `allow = 读工具 + allow_execute = false`，会把它们**全部拒掉**且 `isInert()` 不报警（见待修清单 B）。
+5. **记忆**：`agent.memory = &store`（按本次运行的 tenant + user 注入；身份缺失或为 0 时**一个字都不注入**）。
+   别用 `MemoryStore.formatContext(…, 0, 0, …)` 手工拼 prompt —— `0` 是"任意"，那会跨租户。
+6. **Agent 跑成 worker**：webhook / cron 路径用 `ai.AgentWorker` + `ai.agent_worker.post(...)`，
+   别在请求线程里同步 `Agent.run`（`ai.trigger.Trigger.fire` 是同步的）。被拒/失败走 `on_result`，不占监督预算。
+7. **有副作用的 agent**：`ai.ProposalPipeline`（`guard(.propose)` → `RiskReview` →（escalate）`ApprovalFlow`
+   → `guard(.execute)` → executor）；常态结局是 `execute_not_permitted` **带着风险结论**交给人工。
+8. **集群读侧**：请求路径用 `MembershipView.acquire()/release()/pick(key)`（或 `ClusterBootstrap.getView()`），
+   **不要**读 `ClusterMembership` 的哈希表；循环里调 `ClusterBootstrap.tick()`（一次做 gossip/health + 刷新读侧）。
+9. **多节点选主默认 fail-closed**：桩传输下 `raft_cluster_size > 1` 会拒绝启动。出路三条：单机
+   `raft_cluster_size = 1`；只跑 membership + 读侧 `.allow_stub_raft_transport = true`；自带
+   `.transport = <ElectionTransport>`（契约见 `DISTRIBUTED.md`「真选主要什么」，v0.23.0 的
+   `src/core/cluster/RaftTransport.zig` 可作起点 —— 但选主状态机仍有缺口，见该文）。
+10. **事件分层**：热路径 L0 `runtime.HotBus`（有界、可丢、发布方不停）；业务事件 L1 `app.eventBus(T)` /
+    `ModuleContext.eventBus(T)`；跨进程 L2（Kafka/NATS/Outbox）。用错层的代价是"可靠投递"和"零阻塞"两头不靠。
+11. **门禁**：应用侧 `zmodu ci`（compile → fmt → verify → audit → deadcode → **doctor**，6 步）；
+    文档里的 Zig 片段会被 `src/test/DocSnippets.zig` 抽查（只扫围栏代码块）——写 `builder` 片段时照第 1 条的形态写。
+
+### ⚠️ 待修清单（审计产出，按严重度；**尚未修**）
+
+**A. 会编译 / 启动失败**
+- `examples/README.md:161,446`：`Application.init(allocator,"app",.{M},.{})` 缺 `io`（真实签名是
+  `init(io, allocator, name, modules, opts)`）
+- `docs/DISTRIBUTED.md:41-43`：它自己的组装片段用默认 `raft_cluster_size = 3` → 现在 `start()` 返回
+  `error.RaftTransportUnavailable`（与该文 60 行后的 fail-closed 自相矛盾）
+- `docs/CLUSTER-QUICKSTART.md` 整篇：fail-closed 之前的写法（3 节点、无 transport）+ 用了 0.17 已移除的
+  `std.Thread.sleep` + 挂了一条框架从未实现的路由
+- 本文件下方「集群」段（约 :217、:224-230）：`ClusterMembership.init` 少 `io`、`.seed_nodes` 不在 `Config`、
+  `zigmodu.core.*` 路径不存在、"实现 PasRaft 共识"的说法
+- `tools/zmodu/src/main.zig:6011`（`--with-agent` 模板）：生成**无 guard 的裸 `Agent{}`**；`:6082-6086`
+  的 handler 同步跑 agent 且不设 tenant/user
+- `src/ai/workflow.zig:590`：`.agent` 步骤内部现搓裸 `Agent{}`，Workflow 无处传 guard ⇒ 文档推荐的
+  `.agent` 步骤就是**无界 agent**
+- `src/core/cluster/ClusterHealth.zig:20,37`：丢掉真实 `node_id`，输出固定串 `"node-id"`（多节点无法区分）
+
+**B. 会误导（口径与实现不符）**
+- AI 文档四件套（`AI_DEV_GUIDE.md` / `AI.md` / `AI_SKILLS.md` / `AI_ORCHESTRATION.md`）停在 2026-08：
+  裸 `Agent{}`、不提 `Tool.action` / `guard` / `AgentSpec` / `AgentWorker`；`MCP.md:53` 的
+  "需显式加入 allowlist"与实现（列出全部注册工具）**不符**
+- **最容易踩的一条**：内置技能全部落在 `.action` 默认值 `.execute` 上（全 `src/` 只有 1 处显式
+  `.action =`，还是测试）—— 按 `AGENT_RUNTIME.md` 的推荐配法会拒掉所有内置技能，且启动期不报警
+- `docs/RUNTIME.md:267` 仍写"Worker 接线未做"（v0.22.0 已落地 `ai.AgentWorker`）；`:144-145` 的实测数字
+  （261 条 / delivered=330 / dropped=192）与现在的示例（5000 条 feed）不符
+- `examples/distributed/README.md`：声称 leader election ✅ / 3 节点 / heartbeat，但 `src/main.zig` 只用
+  `DistributedEventBus`（README 里自曝 "Connected nodes: 0"）；`docker-compose.yml` 的 command 被
+  `ENTRYPOINT` 吞掉，`Dockerfile` COPY 一个不存在的文件
+- ~~`examples/cluster-demo/`~~（**已删除**，2026-09-17）：compose 构建的是**仓根 Dockerfile**（跑 basic 示例，
+  无 cluster 二进制）；README 教人 `curl :8081/cluster/health` 而该路由从未挂载。拓扑与 fail-closed
+  说明现并入 `examples/distributed/README.md`（docker 拓扑参考见 `examples/production-deploy/`）
+- `docs/UPGRADING.md` 止于 v0.15.46 —— v0.22 / v0.23 的集群破坏性变更（fail-closed + `.transport`）没有条目
+
+**C. 只是过时数字 / 措辞**（可批量改）
+- `examples/README.md`：行数表、`"Zig 0.16.0 or later"`、把 shopdemo 说成 "Not a complete runnable app"、
+  "每个示例跑 `zig build test`"（只有 6/24 有 test step）
+- 9 个 `build.zig.zon` 的 `.minimum_zig_version = "0.16.0"`；`tenant-mgmt` README 的 v0.13.15；
+  `metaverse-creative/DEMO_SUMMARY.md` 的 v0.4.0；`shopdemo-zent` 注释里的 zent v0.39.2
+- `examples/alpha-engine`（v0.23 新示例）**未进 `ci.yml` 的 examples 构建列表**，也没有 doctor / audit 覆盖
+
+
+### 源码文档质量（2026-09-17 抽样）
+
+口径：`src/**.zig` 264 文件 / 1842 pub 声明；模块级 `//!` 覆盖 **171/264（64.8%）**，公开 API `///` 覆盖
+**772/1842（41.9%）**，`root.zig` 再导出 **21/147（14.3%）**。关键结论：主要问题不是"缺文档"，而是
+**文档没跟代码走** —— 两处死旋钮（`Application.withMaxDependencies`、`Server.Config.connection_stack_size`
+零读取）、若干**编不过的片段**（`Application.zig:43` 的 init 例子、`runtime.zig:17` 与 `src/runtime.zig:5`
+的 `app.runtime()`）、自相矛盾处（`ClusterView.zig:10` 的 "no refcount" 与 `acquire/release` 的 fetchAdd/Sub）、
+未兑现的注释（`Server.zig:2257` 的 keepalive 只设了 `SO_KEEPALIVE`）。
+
+1. **守住导出面**（半天）：给 `root.zig` 与 http/data/security/ai/observability 六个 barrel 的每个导出补一行
+   "用哪个入口、何时用"；验收：root ≥90%、barrel ≥80%。
+2. **死旋钮：接线或删除**（半天）：每个 pub 配置字段至少一处读取，否则字段与文档一并删。
+3. **给超长文件加可跳转目录**（1 天）：Server 4392 / KafkaConnector 3221 / Middleware / GrpcTransport /
+   Http2Server / ai-workflow / redis 加 `//! §N` 目录 + 正文锚点；sqlx.zig 补锚点。
+4. **修可执行文档 + 加护栏**（半天）：改上面点到的片段与注释；`src/test/DocSnippets.zig` 增补
+   `try app.runtime()` 与 `Application.init(` 两类模式（现只拦 builder 链式）。
+5. **错误与契约文案**（1 天）：12 个 pub error set 补成员级 `///`；`@compileError` 统一"期望形态 + 怎么改"
+   （样板：`runtime.zig:561`、`Preflight.zig:194`）。
+
+### 示例品质（2026-09-17 抽样）
+
+统计：24 个目录（`find -name '*.zig'` 求和，排除缓存/构建产物）。**可运行样板与门禁最不匹配的地方**：
+`runtime-workers`（324 行，builder+`ctx.runtime()`+HotBus+`spawnActor` 全对）**没有 README、不在索引里**；
+`alpha-engine`（486 行，v0.23 的 P0）**不在 CI、无 README**；`shopdemo` 有 12 个 test 声明但
+`build.zig` **没有 test step**（悬空）；`shopdemo-zent`/`metaverse-creative` 用 `.path = "../../../zent"`
+（无 sibling 检出时不可构建）而 `zent-modulith` 用 tag pin；三份 README 有假声明
+（`distributed` 的选主/env、`http-stress-test` 的 wrk、`tenant-mgmt` 的 v0.13.15）。重复候选：
+shopdemo↔shopdemo-zent、basic↔testing、distributed↔cluster-demo、`deprecated/` 与 `examples/example_tests.zig`
+—— 后三组已于 2026-09-17 收敛（见本节第 5 条）；`shopdemo`↔`shopdemo-zent` 保留（sqlx / zent 两种持久化的对照）。
+
+1. **把已存在的 test step 接进 CI**：对 ai-ops / tenant-ai / llm-policies / web4 / testing / zmsaas-backend 加
+   `zig build test`；给 shopdemo（12 个 test 无 step）与 zent-modulith 补 step。验收：改坏一条能被拦住。
+2. **修三处假 README**：`distributed`（删选主/env 声明，或把 `NODE_ID/PORT` 真读进代码）、`http-stress-test`
+   （改成"自带 32×50 压测 + 可选 wrk"）、`tenant-mgmt`（版本号）。验收：README 每条命令本地可复现。
+3. **给 runtime-workers / alpha-engine 补 README + 索引条目**，把 alpha-engine 加进 CI 与 `zmodu doctor` 列表。
+   验收：`zmodu doctor examples/alpha-engine` 通过。
+4. **统一 zent 依赖为 git tag pin**（照 `zent-modulith` 的 `?ref=v0.67.0`）。验收：无 sibling 检出也能构建。
+5. **收敛重复示例** —— ✅ **已完成（2026-09-17）**：删 `deprecated/`（只有一份裸 snippet）与 `examples/example_tests.zig`
+   （占位）；testing 并入 basic（`examples/basic/src/tests.zig` + `build.zig` 的 `test` step，5 个测试：原 testing 的 3 个
+   全保留 + lifecycle / mock 两例；CI 的 test-step 列表随之由 `testing` 换成 `basic`）；distributed 与 cluster-demo
+   合成一份"集群现状 / fail-closed"说明（`examples/distributed/README.md`，含 3 节点拓扑与 docker 拓扑指向
+   `examples/production-deploy/`）。验收：`examples/README.md` 的索引表与目录**一一对应**（20 个目录 20 行，
+   含 runtime-workers / alpha-engine / mcp-server / shopdemo-zent / metaverse-creative / zmsaas / distributed；
+   行数表已删，避免第二份会漂移的清单）。
+6. **加元数据门禁**：grep 9 处 `minimum_zig_version = "0.16.0"`（basic/distributed/event-driven/
+   http-stress-test/shopdemo/tenant-mgmt/tenant-shop/testing/zmsaas）+ `DEMO_SUMMARY.md` 的 v0.4.0 与失效路径。
+   验收：`grep -rn '"0.16.0"' examples/*/build.zig.zon` 为空。
+
 ## 📋 目录 (Table of Contents)
+
 
 - [渐进式架构演进路线图](#-渐进式架构演进路线图)
 - [模块设计原则](#-模块设计原则)
@@ -102,13 +230,13 @@ Week 4: 上线准备
 **推荐配置**：
 ```zig
 // 单机最小配置
-var app = try zigmodu.Application.init(allocator, "shop", .{
+var app = try zigmodu.Application.init(io, allocator, "shop", .{
     UserModule,
     OrderModule,
     ProductModule,
 }, .{
-    .validate = true,
-    .auto_docs = true,
+    .validate_on_start = true,
+    .auto_generate_docs = true,
 });
 try app.start();
 ```
@@ -214,19 +342,30 @@ const async_bus = zigmodu.extensions.AsyncEventBus.init(allocator);
 
 | 能力 | 作用 | 引入方式 |
 |------|------|----------|
-| DistributedEventBus | 跨实例事件通信 | `zigmodu.core.DistributedEventBus` || ClusterMembership | 节点发现与健康检查 | `zigmodu.core.ClusterMembership` |
+| DistributedEventBus | 跨实例事件通信 | `zigmodu.DistributedEventBus` |
+| ClusterMembership | 节点发现与健康检查 | `zigmodu.ClusterMembership` |
+| 集群读侧 | 请求路径选节点（引用计数快照 + rendezvous） | `zigmodu.MembershipView` / `ClusterBootstrap.getView()` |
 | Session 共享 | 分布式会话 | Redis Session Store |
 | 负载均衡 | 请求分发 | Nginx/Envoy |
 
 **配置示例**：
 ```zig
-// 多实例部署配置
-var cluster = try ClusterMembership.init(allocator, "node-1", address, &bus);
-try cluster.start(.{
-    .seed_nodes = &.{"node-1", "node-2"},
-    .gossip_interval_ms = 1000,
+// 多实例部署配置（组装 + 读侧首选 ClusterBootstrap；单节点 raft_cluster_size = 1）
+var boot = try zigmodu.ClusterBootstrap.init(allocator, io, .{
+    .node_id = "node-1",
+    .port = 9001,
+    .peers = &.{ "127.0.0.1:9002" },
+    .raft_cluster_size = 1,   // >1 需要自带 `.transport`，否则 start() 拒绝启动
 });
-// 分布式事件发布
+defer boot.deinit();
+try boot.start();             // 循环里再调 boot.tick()（外部驱动：gossip/health + 刷新读侧）
+
+// 裸用 membership 也可以，但 `start` 的 Config 只有三项（没有 `seed_nodes`，seed 节点走 `connectToSeed`）：
+//   var member = try zigmodu.ClusterMembership.init(allocator, io, "node-1", address, &bus);
+//   try member.start(.{ .gossip_interval_ms = 1000, .health_check_interval_ms = 3000, .node_timeout_ms = 10000 });
+
+// 跨实例事件走它内部的 DistributedEventBus：
+const bus = boot.getEventBus() orelse return error.ClusterNotStarted;
 try bus.publish("order.created", event_data);
 ```
 
@@ -292,8 +431,8 @@ try bus.publish("order.created", event_data);
 | 分布式限流 | `zigmodu.data.redis_rate_limit.RateLimiter` | Redis INCR+EXPIRE 固定窗口（跨实例，fail-closed）|
 | 分布式追踪 | `zigmodu.tracing.DistributedTracer` | Jaeger 导出 |
 | 指标收集 | `zigmodu.metrics.PrometheusMetrics` | /metrics 端点 |
-| gRPC | `zigmodu.core.TransportProtocols.GrpcTransport` | HTTP/2 |
-| MQTT | `zigmodu.core.TransportProtocols.MqttTransport` | 消息队列 |
+| gRPC | `zigmodu.GrpcServiceRegistry` / `zigmodu.GrpcClient` | HTTP/2（unary + stream） |
+| 消息队列 | `zigmodu.NatsClient` / `zigmodu.MessageQueue` | 没有 MQTT 实现，别照抄旧名 |
 
 **配置示例**：
 ```zig
@@ -369,8 +508,8 @@ defer tracer.endSpan(span);
     └──────────────────────┼───────────────────────┘
                            │
 ┌──────────────────────────┼──────────────────────────┐
-│              PasRaft Consensus Layer                   │
-│   (Leader Election + Log Replication + Failover)      │
+│        Raft 选主 / 复制（框架给缝，不给实现）             │
+│   ElectionTransport + RaftTransport（状态机仍有缺口）   │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -378,27 +517,26 @@ defer tracer.endSpan(span);
 
 | 能力 | 作用 | 框架支持 |
 |------|------|----------|
-| PasRaft 共识 | 跨区域协调，选主 | `zigmodu.core.PasRaftAdapter` |
+| 选主 / 日志复制 | 跨区域协调 | `zigmodu.RaftElection` + `zigmodu.RaftTransport`（自带传输；见 `docs/DISTRIBUTED.md`） |
 | 多租户 | 租户隔离 | Namespace + 资源配额 |
-| 热更新 | 运行时模块替换 | `zigmodu.core.HotReloader` |
-| 插件系统 | 动态扩展 | `zigmodu.core.PluginManager` |
+| 热更新 | 运行时模块替换 | `zigmodu.HotReloader` |
+| 插件系统 | 动态扩展 | `zigmodu.PluginManager` |
 
 **配置示例**：
 ```zig
-// PasRaft 共识集群
-var raft = try PasRaftAdapter.init(allocator, .{
+// 单节点：显式 raft_cluster_size = 1（默认 3 会因内置传输是桩而拒绝启动）
+var boot = try zigmodu.ClusterBootstrap.init(allocator, io, .{
     .node_id = "node-asia-1",
-    .peers = &.{"node-asia-1", "node-asia-2", "node-eu-1"},
-    .election_timeout_ms = 5000,
-    .heartbeat_interval_ms = 1000,
+    .port = 9001,
+    .peers = &.{},
+    .raft_cluster_size = 1,
 });
+defer boot.deinit();
+try boot.start();
 
-// 共识日志复制
-try raft.proposeModuleOperation(.{
-    .operation = .config_change,
-    .module = "order",
-    .config = new_config,
-});
+// 跨区域选主要自带传输（契约见 docs/DISTRIBUTED.md「真选主要什么」）：
+//   .transport = <RaftElection.ElectionTransport>
+// 或只跑 membership + 读侧：.allow_stub_raft_transport = true
 ```
 
 **关键指标**：
@@ -431,7 +569,7 @@ try raft.proposeModuleOperation(.{
 │   └─ 需要可观测？→ 追踪 + 指标
 │
 └─ > 1,000,000 → 阶段5：大规模分布式
-    └─ 跨区域？→ PasRaft 共识
+    └─ 跨区域？→ 集群读侧 + 自带 Raft 传输（框架不提供跨区编排）
     └─ 需要弹性？→ 热更新 + 插件
 ```
 
@@ -478,8 +616,8 @@ try raft.proposeModuleOperation(.{
 ```
 Month 1-2: 分布式基础
 ├── 部署 DistributedEventBus
-├── 引入 ClusterMembership
-└── 实现 PasRaft 共识
+├── 接入 ClusterBootstrap（单节点起步；多节点需自带 Raft 传输）
+└── 读侧用 ClusterView / MembershipView，别读 membership 哈希表
 
 Month 3: 服务治理
 ├── 集成 ServiceMesh
@@ -494,7 +632,7 @@ Month 4: 可观测性
 ```
 
 **技术要点**：
-- 使用 `TransportProtocols` 支持多协议（gRPC/MQTT）
+- 多协议：gRPC 用 `zigmodu.GrpcServiceRegistry` / `zigmodu.GrpcClient`；消息总线用 `zigmodu.NatsClient` / `zigmodu.MessageQueue`（**没有** MQTT 实现）
 - 断路器配置建议：
   ```zig
   const cb = CircuitBreaker.init(5, 30000); // 5次失败，30秒半开
@@ -558,7 +696,7 @@ Month 4: 可观测性
 │   └─ 多团队？→ ModuleCapabilities 边界
 │
 ├─ 30-100 模块 → 阶段3：分布式系统
-│   └─ 高可用？→ PasRaft + ServiceMesh
+│   └─ 高可用？→ ClusterView 读侧 + 自带 Raft 传输（选主状态机仍有缺口）+ ServiceMesh
 │   └─ 性能敏感？→ gRPC + 断路器 + 速率限制
 │
 └─ > 100 模块 → 阶段4：平台化

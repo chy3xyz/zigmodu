@@ -228,3 +228,65 @@ test "DiagnosisFlow gathers evidence, diagnoses and writes outbox" {
     try std.testing.expectEqualStrings("ai.diagnose", row.get("topic").?.string);
     try std.testing.expect(std.mem.indexOf(u8, row.get("payload").?.string, "payment provider rejected") != null);
 }
+
+test "DiagnosisFlow writeOutbox fills every NOT NULL column of the shipped DDL" {
+    const allocator = std.testing.allocator;
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    // The shipped DDL — `created_at` / `updated_at` are NOT NULL. Reproduces the
+    // ai-ops failure (2026-09-17): the INSERT carried a sixth placeholder that
+    // the call site below never bound, so `updated_at` arrived NULL and the
+    // whole pipeline aborted with a constraint violation.
+    _ = try client.exec(OutboxPublisher.migrationSqlWithDialect(.sqlite), &.{});
+
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    var outbox = OutboxPublisher.init(allocator, .{ .max_retries = 3 });
+
+    const Diagnoser = struct {
+        fn run(
+            a: std.mem.Allocator,
+            _: *SkillContext,
+            _: AnomalyCase,
+            _: []const EvidenceBlock,
+            out_causes: *std.ArrayList([]const u8),
+            out_actions: *std.ArrayList([]const u8),
+            out_summary: *[]const u8,
+        ) anyerror!void {
+            try out_causes.append(a, try a.dupe(u8, "gateway timeout"));
+            try out_actions.append(a, try a.dupe(u8, "retry after backoff"));
+            out_summary.* = try a.dupe(u8, "two failed orders");
+        }
+    };
+
+    var flow = DiagnosisFlow.init(allocator, &backend, Diagnoser.run);
+    flow.outbox = &outbox;
+
+    var ctx = SkillContext{ .allocator = allocator };
+    var res = try flow.run(allocator, &ctx, .{
+        .source = "alert",
+        .subject = "orders",
+        .severity = .warning,
+        .description = "failed orders",
+    });
+    defer res.deinit(allocator);
+
+    var cursor = try client.queryCursorEx(
+        "SELECT topic, payload, tenant_id, status, max_retries, created_at, updated_at FROM event_outbox",
+        &.{},
+        .{},
+    );
+    defer cursor.deinit();
+    const row = cursor.next().?;
+    try std.testing.expectEqualStrings("ai.diagnose", row.get("topic").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, row.get("payload").?.string, "gateway timeout") != null);
+    // The driver reports SQL NULL as a missing `?Value`, so the tenant column is
+    // `== null` (the SELECT above is what makes that unambiguous).
+    try std.testing.expectEqual(@as(usize, 7), row.columns.len);
+    try std.testing.expect(row.get("tenant_id") == null);
+    try std.testing.expectEqual(@as(i64, 0), row.get("status").?.int);
+    try std.testing.expectEqual(@as(i64, 3), row.get("max_retries").?.int);
+    const created_at = row.get("created_at").?.int;
+    try std.testing.expect(created_at > 0);
+    try std.testing.expectEqual(created_at, row.get("updated_at").?.int);
+}

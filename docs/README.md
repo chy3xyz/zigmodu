@@ -87,7 +87,7 @@ Comprehensive documentation for the ZigModu modular framework.
 |---------|-------------|
 | [Basic](../examples/basic/) | Module fundamentals |
 | [Event-Driven](../examples/event-driven/) | Publish-subscribe |
-| [Testing](../examples/testing/) | Test utilities |
+| [Testing](../examples/basic/) | Test utilities (`src/tests.zig` in basic) |
 | [HTTP Stress Test](../examples/http-stress-test/) | Concurrent connections |
 | [zent-modulith](../examples/zent-modulith/) | ZigModu HTTP + zent schema-as-code ORM |
 | [Metaverse Creative](../examples/metaverse-creative/) | Creative demo |

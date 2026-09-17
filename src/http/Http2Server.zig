@@ -8,11 +8,26 @@
 //! 5. Schedules outbound DATA via RFC 7540 PRIORITY weights (`PriorityTree` deficit WRR)
 //!
 //! HPACK via `Hpack.zig` (static + dynamic table; Huffman supported).
+//!
+//! STRUCTURE:
+//!   §1  Wire types —— SiteResponse, SiteHandler, ServeOptions, ConnWriter
+//!   §2  Entry points —— serve, serveAfterPreface and the prefetch variants
+//!   §3  Connection loop —— serveAfterPrefacePrefetchReader: frame demux and stream lifecycle
+//!   §4  Stream teardown —— abortStream, resetStream, sendGoAway
+//!   §5  Outbound scheduler —— PendingOutbound, OutboundScheduler, window-aware DATA chunking
+//!   §6  Stream state & live bidi —— StreamState, LiveFlushCtx, gRPC bidi pumping
+//!   §7  Response encoding —— buildStreamResponseWire, encodeSiteResponseWire
+//!   §8  Frame readers —— readFrame / readExact and their prefetch variants
+//!   §9  Tests
+//!
+//! Every section carries a matching `// ==== §N ... ====` anchor — `grep "§6"` jumps there.
 
 const std = @import("std");
 const Http2 = @import("Http2.zig");
 const Hpack = @import("Hpack.zig");
 const Grpc = @import("../extensions/GrpcTransport.zig");
+
+// ==== §1  Wire types ====
 
 /// Owned site response from `SiteHandler`.
 pub const SiteResponse = struct {
@@ -114,6 +129,8 @@ const ConnWriter = struct {
     }
 };
 
+// ==== §2  Entry points ====
+
 /// Serve one HTTP/2 connection: read client connection preface, then process frames.
 pub fn serve(
     io: std.Io,
@@ -151,6 +168,8 @@ pub fn serveAfterPrefacePrefetch(
     // No shared inbound reader — create one here for the whole H2 session.
     try serveAfterPrefacePrefetchReader(io, stream, allocator, opts, prefetch, null);
 }
+
+// ==== §3  Connection loop ====
 
 /// Like `serveAfterPrefacePrefetch`, but reuses an existing `std.Io.Reader` (e.g. the
 /// connection's StreamReader) so buffered preface leftovers and further reads share
@@ -496,6 +515,8 @@ pub fn serveAfterPrefacePrefetchReader(
     try writer.flush();
 }
 
+// ==== §4  Stream teardown ====
+
 fn abortStream(
     outbound: *OutboundScheduler,
     tree: *Http2.PriorityTree,
@@ -545,6 +566,8 @@ fn sendGoAway(
     try writer.write(frame);
     try writer.flush();
 }
+
+// ==== §5  Outbound scheduler ====
 
 /// Per-stream pending HTTP/2 wire (HEADERS/DATA/trailers) drained by PriorityTree WRR.
 const PendingOutbound = struct {
@@ -778,6 +801,8 @@ fn shrinkDataFrameInPlace(pending: *PendingOutbound, sent: usize) void {
     }).encode(pending.wire[base..][0..9]);
     pending.end = base + new_frame_len + after_len;
 }
+
+// ==== §6  Stream state & live bidi ====
 
 const StreamState = struct {
     header_block: std.ArrayList(u8) = .empty,
@@ -1019,6 +1044,8 @@ fn streamErrorFromAny(err: anyerror) u32 {
     };
 }
 
+// ==== §7  Response encoding ====
+
 /// Build owned HTTP/2 response wire for a completed stream (HEADERS + DATA + optional trailers).
 fn buildStreamResponseWire(
     allocator: std.mem.Allocator,
@@ -1107,6 +1134,8 @@ fn encodeSiteResponseWire(
     return try std.mem.concat(allocator, u8, &.{ h, d });
 }
 
+// ==== §8  Frame readers ====
+
 fn readFrame(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator) ![]u8 {
     var rbuf: [8192]u8 = undefined;
     var r = stream.reader(io, &rbuf);
@@ -1160,6 +1189,8 @@ fn readExactPrefetch(
         error.ReadFailed => return error.ReadFailed,
     };
 }
+
+// ==== §9  Tests ====
 
 test "Hpack decode path via Decoder for site headers" {
     const allocator = std.testing.allocator;

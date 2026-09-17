@@ -16,10 +16,24 @@
 //! - True interleaved duplex still needs a live H2 session pump
 //!
 //! Protobuf encode/decode stays in application code; this layer carries bytes.
+//!
+//! STRUCTURE:
+//!   §1  Message types —— GrpcMethod, GrpcRequest, GrpcResponse, OwnedGrpcResponse
+//!   §2  Status codes —— GrpcStatusCode and its HTTP mapping
+//!   §3  Framing & handler signatures —— GrpcFrame plus the unary/stream/client-stream/bidi fn types
+//!   §4  Streaming primitives —— GrpcStreamReader, GrpcStreamBuffer, GrpcStreamWriter
+//!   §5  Service registry —— method registration, invoke, HTTP/1.1 and HTTP/2 dispatch
+//!   §6  Proto parser —— minimal `.proto` service/method/stream extraction
+//!   §7  Client —— GrpcClient calls plus HTTP response decoding
+//!   §8  Tests
+//!
+//! Every section carries a matching `// ==== §N ... ====` anchor — `grep "§5"` jumps there.
 
 const std = @import("std");
 const HttpClient = @import("../http/HttpClient.zig").HttpClient;
 const Http2 = @import("../http/Http2.zig");
+
+// ==== §1  Message types ====
 
 /// gRPC method descriptor.
 pub const GrpcMethod = struct {
@@ -66,6 +80,8 @@ pub const OwnedGrpcResponse = struct {
         return .{ .payload = self.payload, .status = self.status, .message = self.message };
     }
 };
+
+// ==== §2  Status codes ====
 
 pub const GrpcStatusCode = enum(u8) {
     OK = 0,
@@ -149,6 +165,8 @@ pub const GrpcStatusCode = enum(u8) {
     }
 };
 
+// ==== §3  Framing & handler signatures ====
+
 /// Length-prefixed gRPC message: 1 byte compressed-flag + 4 byte BE length + payload.
 pub const GrpcFrame = struct {
     pub fn encode(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
@@ -186,6 +204,8 @@ pub const BidiHandler = *const fn (request: GrpcRequest, reader: *GrpcStreamRead
 
 /// Per-message bidi pump — called once per complete inbound frame (enables interleaved flush).
 pub const BidiPumpHandler = *const fn (request: GrpcRequest, msg: []const u8, writer: *GrpcStreamWriter) anyerror!void;
+
+// ==== §4  Streaming primitives ====
 
 /// Iterates length-prefixed gRPC frames in a concatenated body.
 pub const GrpcStreamReader = struct {
@@ -308,6 +328,8 @@ pub const GrpcStreamWriter = struct {
         return self.body.items;
     }
 };
+
+// ==== §5  Service registry ====
 
 pub const GrpcServiceRegistry = struct {
     const Self = @This();
@@ -870,6 +892,8 @@ pub const GrpcServiceRegistry = struct {
     }
 };
 
+// ==== §6  Proto parser ====
+
 pub const ProtoParser = struct {
     pub const ProtoService = struct {
         name: []const u8,
@@ -933,6 +957,8 @@ pub const ProtoParser = struct {
         return services.toOwnedSlice(allocator);
     }
 };
+
+// ==== §7  Client ====
 
 /// Unary gRPC client: local registry and/or HTTP/1.1 `application/grpc`.
 pub const GrpcClient = struct {
@@ -1050,9 +1076,7 @@ fn parseHttpGrpcResponse(allocator: std.mem.Allocator, http_resp: *HttpClient.Ht
     };
 }
 
-// ─────────────────────────────────────────────────
-// Tests
-// ─────────────────────────────────────────────────
+// ==== §8  Tests ====
 
 test "GrpcStatusCode toString" {
     try std.testing.expectEqualStrings("OK", GrpcStatusCode.OK.toString());

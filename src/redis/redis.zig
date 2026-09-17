@@ -1,11 +1,22 @@
 //! Redis client for zigzero
 //!
 //! Provides Redis operations aligned with go-zero's redis functionality.
+//!
+//! STRUCTURE:
+//!   §1  RESP framing —— ReplyReader, readWholeReply, writeCmd
+//!   §2  Config & connection —— RedisConfig, Redis lifecycle, pooled stream borrow/release
+//!   §3  Command surface —— get/set/del/incr/expire, list and hash ops, pub-sub, lock/unlock
+//!   §4  Cluster & locks —— crc16/keySlot, ClusterNode, RedisCluster, Lock
+//!   §5  Tests —— unit tests plus RESP framing regression tests
+//!
+//! Every section carries a matching `// ==== §N ... ====` anchor — `grep "§3"` jumps there.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const errors = @import("../sqlx/errors.zig");
 const sockread = @import("../core/sockread.zig");
+
+// ==== §1  RESP framing ====
 
 /// Write command bytes to Redis stream (Zig 0.17 compat: stream.write removed).
 /// Must flush: `Writer.writeAll` only fills the buffer; without flush the
@@ -124,6 +135,8 @@ fn writeCmd(stream: *const std.Io.net.Stream, io: std.Io, cmd: []const u8) error
     wstream.interface.writeAll(cmd) catch return error.RedisError;
     wstream.interface.flush() catch return error.RedisError;
 }
+
+// ==== §2  Config & connection ====
 
 /// Redis configuration
 pub const RedisConfig = struct {
@@ -285,6 +298,8 @@ pub const Redis = struct {
             self.stream = null;
         }
     }
+
+    // ==== §3  Command surface ====
 
     /// Get a value by key
     pub fn get(self: *Redis, key: []const u8) errors.ResultT(?[]const u8) {
@@ -763,6 +778,8 @@ pub const Redis = struct {
     }
 };
 
+// ==== §4  Cluster & locks ====
+
 /// CRC16 for Redis cluster slot calculation
 fn crc16(data: []const u8) u16 {
     const table = [_]u16{
@@ -949,6 +966,8 @@ pub const Lock = struct {
         }
     }
 };
+
+// ==== §5  Tests ====
 
 test "redis client" {
     // Requires a running Redis server; set REDIS_URL to enable (e.g. redis://127.0.0.1:6379).

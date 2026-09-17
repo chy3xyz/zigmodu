@@ -21,7 +21,7 @@ See [tenant-mgmt/README.md](tenant-mgmt/README.md) for full API reference.
 
 ## Multi-Tenant Shop scaffold (`examples/tenant-shop`)
 
-**Modulith blueprint demo** — storefront domain graph from [`docs/MODULITH_TENANT_SHOP.md`](../docs/MODULITH_TENANT_SHOP.md). Week 1–2 runnable (`tenant` / `user` / `product` / `inventory`); cart/order/payment/BFF are status stubs.
+**Modulith blueprint demo** — storefront domain graph from [`docs/MODULITH_TENANT_SHOP.md`](../docs/MODULITH_TENANT_SHOP.md). Week 1–4 scaffold: `tenant` / `user` / `product` / `inventory` plus `cart` → `order` → `payment` with the `shop_bff` / `admin_bff` edge modules (outbox retry + DLQ included).
 
 ```bash
 cd examples/tenant-shop && HTTP_PORT=18090 zig build run
@@ -30,7 +30,7 @@ curl http://127.0.0.1:18090/health/live
 
 ## ZigModu × zent (`examples/zent-modulith`)
 
-**Orthogonal ORM demo** — ZigModu `http.Server` + [zent](https://github.com/chy3xyz/zent) schema-as-code Client/migrate. Requires sibling checkout `../zent` (or adjust `build.zig.zon`). Practices: [`docs/ZENT.md`](../docs/ZENT.md).
+**Orthogonal ORM demo** — ZigModu `http.Server` + [zent](https://github.com/chy3xyz/zent) schema-as-code Client/migrate. zent is pinned by git tag in `build.zig.zon` (`v0.67.0`); a sibling `../zent` checkout is only for developing zent itself. Practices: [`docs/ZENT.md`](../docs/ZENT.md).
 
 ```bash
 cd examples/zent-modulith && HTTP_PORT=18100 zig build run
@@ -54,7 +54,7 @@ curl http://127.0.0.1:18100/health/live
 cd examples/ai-ops && zig build run     # prints the trace, then serves :18087
 curl http://127.0.0.1:18087/api/approvals/pending
 curl -X POST http://127.0.0.1:18087/api/approvals/order-2/approve
-zig build test                          # asserts every stage
+zig build test                          # runs the single end-to-end pipeline test
 ```
 
 Covered in [docs/AI_ORCHESTRATION.md](../docs/AI_ORCHESTRATION.md).
@@ -134,14 +134,48 @@ and [`docs/OBSERVABILITY.md`](../docs/OBSERVABILITY.md).
 
 ## ShopDemo boundary (`examples/shopdemo`)
 
-**Codegen reference only** — `schema.sql` + `generated-sample/` module output. Not a complete runnable app. Use [zmodu CLI](https://github.com/chy3xyz/zmodu) to scaffold a full 42-module project.
+**Minimal runnable app** — the single `order` module extracted from `generated-sample/`, served over HTTP (`zig build run`) and smoke-tested in CI (`scripts/ci-integration.sh`). `schema.sql` keeps the full 152-table e-commerce schema; generating all 30+ modules requires the [zmodu CLI](https://github.com/chy3xyz/zmodu).
 
 ---
 
 ## 📚 Example Index
 
+Every directory under `examples/` appears in this table exactly once, so the
+index and the folder cannot drift apart. Run each row from the repository root,
+e.g. `cd examples/ai-ops && zig build run`. Whether a directory ships a `test`
+step is stated per row — that is the command CI runs for it.
+
+| Directory | Demonstrates | Commands |
+|-----------|--------------|----------|
+| [`_shared`](_shared/) | `db_link.zig` helper imported by path — library, no app entry point | no build step of its own (`test` needs a sibling `../zent` checkout) |
+| [`ai-ops`](ai-ops/) | AI ops pipeline: detect → diagnose → approve → notify → audit, plus the human approval queue over HTTP | `zig build run` · `zig build test` |
+| [`alpha-engine`](alpha-engine/) | Replay pipeline (v0.23 P0 example) | `zig build run` |
+| [`basic`](basic/) | Module fundamentals — **and the testing example**: `src/tests.zig` with `ModuleTestContext`, mock modules, lifecycle, dependency validation | `zig build run` · `zig build test` |
+| [`distributed`](distributed/) | `DistributedEventBus` demo + the multi-node topology and why start is fail-closed | `zig build run` |
+| [`event-driven`](event-driven/) | Publish/subscribe with the EventBus | `zig build run` |
+| [`http-stress-test`](http-stress-test/) | Concurrent connections against the fiber-based `Server` | `zig build run` |
+| [`llm-policies`](llm-policies/) | `AiProvider` wired to the built-in LLM policies (fake `json_fn`, no network) | `zig build test` · `zig build run` |
+| [`mcp-server`](mcp-server/) | AI skills exposed over MCP stdio | `zig build run` |
+| [`metaverse-creative`](metaverse-creative/) | Creative domain demo (zent + DID) | `zig build run` |
+| [`production-deploy`](production-deploy/) | Deploy topology reference: nginx/Envoy TLS sidecar, k8s, systemd — no app | `docker compose up --build` |
+| [`runtime-workers`](runtime-workers/) | Runtime workers: mailbox, backpressure, supervisor, HotBus | `zig build run` |
+| [`shopdemo`](shopdemo/) | Generated `order` module + full 152-table e-commerce schema on sqlx | `zig build run` |
+| [`shopdemo-zent`](shopdemo-zent/) | Same domain persisted through zent | `zig build run` |
+| [`tenant-ai`](tenant-ai/) | Tenant-isolated AI skills, reports and approval queue | `zig build run` · `zig build test` |
+| [`tenant-mgmt`](tenant-mgmt/) | Flagship: multi-tenant SaaS on `http.productionProfile` (CI integration demo) | `zig build run` |
+| [`tenant-shop`](tenant-shop/) | Modulith blueprint: tenant/user/product/inventory + `shop_bff` / `admin_bff` | `zig build run` |
+| [`web4`](web4/) | did:key identity + x402 payment gating | `zig build run` · `zig build test` |
+| [`zent-modulith`](zent-modulith/) | ZigModu HTTP + zent schema-as-code ORM (zent pinned by git tag) | `zig build run` |
+| [`zmsaas`](zmsaas/) | Backend (ZigModu) + SolidStart frontend | `cd examples/zmsaas/backend && zig build` · `zig build test` |
+
+The three walkthroughs below go one level deeper on a few of those rows.
+
 ### 1. Basic Example (`examples/basic`)
 **Demonstrates**: Core module system features
+
+This row also carries the testing example: `src/tests.zig` covers
+`ModuleTestContext`, `zigmodu.createMockModule`, application lifecycle and
+dependency validation, and runs via `zig build test`.
 
 - Module definition with dependencies
 - Application initialization
@@ -154,15 +188,19 @@ and [`docs/OBSERVABILITY.md`](../docs/OBSERVABILITY.md).
 const MyModule = struct {
     pub const info = zigmodu.api.Module{
         .name = "my-module",
-        .dependencies = &."other-module"},
+        .dependencies = &.{"other-module"},
     };
 };
 
-var app = try zigmodu.Application.init(allocator, "app", .{MyModule}, .{});
+// Bind the builder first: its methods take `*Self`, a temporary is `*const`.
+var b = zigmodu.builder(allocator, io);
+defer b.deinit();
+var app = try b.withName("app").build(.{MyModule});
+defer app.deinit();
 try app.start();
 ```
 
-**Run**: `cd examples/basic && zig build run`
+**Run**: `cd examples/basic && zig build run` · tests: `cd examples/basic && zig build test`
 
 ---
 
@@ -190,27 +228,7 @@ bus.publish(.{ .order_id = 123, .total = 99.99 });
 
 ---
 
-### 3. Testing Example (`examples/testing`)
-**Demonstrates**: Module testing and mocking
-
-- ModuleTestContext
-- Mock modules
-- Test lifecycle
-- Assertion patterns
-
-**Key Concepts**:
-```zig
-var ctx = try ModuleTestContext.init(allocator, "test-module");
-try ctx.start();
-// Test logic
-ctx.stop();
-```
-
-**Run**: `cd examples/testing && zig build test`
-
----
-
-### 4. HTTP Server Stress Test (`examples/http-stress-test`)
+### 3. HTTP Server Stress Test (`examples/http-stress-test`)
 **Demonstrates**: Async HTTP server capabilities
 
 - Concurrent connection handling
@@ -248,8 +266,7 @@ try server.start();
 
 ### Prerequisites
 
-### Prerequisites
-- Zig 0.16.0 or later
+- Zig 0.17.0 or later
 - Git
 
 ### Running Examples
@@ -263,12 +280,13 @@ cd zigmodu
 cd examples/basic
 zig build run
 
-# Run all tests
+# Run all framework tests
 cd ../..
 zig build test
 
-# Run specific example test
-cd examples/testing
+# Run one example's tests — the examples with a `test` step are
+# ai-ops, basic, llm-policies, tenant-ai, web4 and zmsaas/backend
+cd examples/basic
 zig build test
 ```
 
@@ -283,7 +301,7 @@ zig build test
 
 ### Intermediate
 4. Explore **Event-Driven Example** for decoupled architecture
-5. Review **Testing Example** for quality assurance
+5. Read `examples/basic/src/tests.zig` for the testing patterns (`ModuleTestContext`, mocks)
 6. Study **tenant-mgmt** for JWT + RBAC + tenant isolation
 
 ### Advanced
@@ -382,7 +400,7 @@ pub fn build(b: *std.Build) void {
 
 When updating ZigModu API:
 1. Update all examples
-2. Run `zig build test` in each
+2. Run each example the way it ships: `zig build test` for the ones with a `test` step (`ai-ops`, `basic`, `llm-policies`, `tenant-ai`, `web4`, `zmsaas/backend`); the rest are `zig build` / `zig build run`
 3. Update documentation
 4. Test manually
 
@@ -442,10 +460,13 @@ const Module1 = struct {
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
-    
-    var app = try zigmodu.Application.init(allocator, "example", .{Module1}, .{});
+    const io = init.io;
+
+    var b = zigmodu.builder(allocator, io);
+    defer b.deinit();
+    var app = try b.withName("example").build(.{Module1});
     defer app.deinit();
-    
+
     try app.start();
     std.log.info("Example completed!", .{});
 }
@@ -465,16 +486,11 @@ pub fn main(init: std.process.Init) !void {
 
 ## 📊 Example Statistics
 
-| Example | Lines | Complexity | Status |
-|---------|-------|------------|--------|
-| Basic | 150 | Beginner | ✅ Ready |
-| Event-Driven | 200 | Intermediate | ✅ Ready |
-| Testing | 120 | Intermediate | ✅ Ready |
-| HTTP Stress Test | 300 | Advanced | ✅ Ready |
-| zent-modulith | ~1.4k | Advanced | ✅ Ready (JWT + `.attr` tenant) |
-| tenant-mgmt | — | Advanced | ✅ Flagship (CI) |
-| production-deploy | — | Advanced | ✅ Reference topology |
+The index table above is the authority for which examples exist and how each one
+runs. The per-example line counts and "Ready" badges that used to live here were
+a snapshot that went stale (and duplicated the index), so they are no longer
+maintained.
 
 ---
 
-*Last updated: 2025-04-14*
+*Last updated: 2026-09-17*

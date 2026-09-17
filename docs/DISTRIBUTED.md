@@ -23,8 +23,11 @@ For multi-node production, see the caveats below.
 | **Partitioner** | 3 | Consistent hash ring. Node add/remove + routing. |
 
 > 计数口径：各文件内 `grep -c '^test '`。本表会随版本漂移，**以代码为准**（`docs/AGENTS.md` 同款原则）。
-> `src/core/cluster/` 下另有 PeerDiscovery(4) / LoadBalancer(5) / ClusterHealth(1) / ClusterBootstrap(1)，
-> 但**均未从 `root.zig` 导出、无请求路径接入**；`DistributedIntegrationTest.zig` 无人 import（不编译、测试不运行）。
+> `src/core/cluster/` 下的构建块现已从 `root.zig` 平铺导出：`RaftElection` / `RaftTransport` /
+> `PeerDiscovery` / `LoadBalancer` / `AccrualFailureDetector`（供应用自行拼拓扑，**框架不替你接进请求路径**）。
+> `ClusterHealth` **不是类型**：导出的是 `cluster_health` 模块 + 两个函数 `clusterHealthJson(alloc, cluster)` /
+> `clusterHealthHandler(cluster)`，路由要应用自己挂。`DistributedIntegrationTest.zig` 仍无人 import
+> （不编译、测试不运行）。
 
 ## 读侧怎么被喂（membership → view → 请求路径）
 
@@ -37,8 +40,14 @@ For multi-node production, see the caveats below.
 ```
 
 ```zig
-// 组装：ClusterBootstrap 自带一个 view
-var cluster = try ClusterBootstrap.init(allocator, io, .{ .node_id = "n1", .port = 9000, .peers = &.{} });
+// 组装：ClusterBootstrap 自带一个 view。单节点必须显式 raft_cluster_size = 1 ——
+// Config 默认是 3，而内置 Raft 传输是桩，start() 会拒绝启动（见下文 fail-closed）。
+var cluster = try ClusterBootstrap.init(allocator, io, .{
+    .node_id = "n1",
+    .port = 9000,
+    .peers = &.{},
+    .raft_cluster_size = 1,
+});
 defer cluster.deinit();
 try cluster.start();
 
@@ -51,6 +60,9 @@ const snap = view.acquire();
 defer view.release(snap);
 const node = view.pick(order_id) orelse return error.NoHealthyNode;
 ```
+
+> 多节点（`raft_cluster_size > 1`）需要 `.transport = <ElectionTransport>`，或显式
+> `.allow_stub_raft_transport = true` 只跑 membership + 读侧（见下文「多节点启动 fail-closed」）。
 
 - `tick()` 里的 `error.ReadersBusy` **不算失败**：请求路径正在读，view 保留上一代，下一个 tick 再发布
   （视图刻意不覆盖有人持有的槽位）。
@@ -71,7 +83,9 @@ const node = view.pick(order_id) orelse return error.NoHealthyNode;
 
 ### 真选主要什么（transport 契约）
 
-框架里已有全部零件，缺的是把它们接起来的那层（本仓未提供）：
+框架里已有全部零件，接线的这层在 v0.23.0 起由 `src/core/cluster/RaftTransport.zig` 提供
+（`TransportImpl(N)` 出站同步/异步 · `handleConnection` + `InboundServer` 入站分发与同连接回包 · `AddressBook`；
+投票应答另走「应答走入站」回推，loopback 用例见该文件）。下表既是它替你完成的契约，也是你自带传输时要实现的部分：
 
 | 方向 | 用什么 | 要做的事 |
 |------|--------|---------|
@@ -81,10 +95,12 @@ const node = view.pick(order_id) orelse return error.NoHealthyNode;
 | 地址簿 | 你自己 | peer id → `host:port` 的映射（今天 `BootstrapConfig.peers` 是唯一来源；`ClusterMembership` 的 `nodes` 只有 loopback + 端口） |
 | 失败语义 | 你自己 | Raft 能容忍丢包与重发：`AppendEntriesResponse{ .success = false }` 是**正常应答**而不是错误；连接失败按"这条消息丢了"处理即可，别把节点判死（那是 `AccrualFailureDetector` 的活） |
 
-`RaftElection.tick()` 现在**没有任何人调用**（和 `ClusterMembership.runOnce` 一样是外部驱动）——
-自带传输的同时要把它挂进你的循环（例如 `ClusterBootstrap.tick()` 里加一行）。
+**传输有了，状态机仍有缺口** —— 这两条是多节点上生产前必须补的：
 
-上面「本仓未提供」已不成立：实现于 `RaftTransport.zig`（`TransportImpl(N)` 出站同步/异步 · `handleConnection` + `InboundServer` 入站分发与同连接回包 · `AddressBook`；投票应答另走「应答走入站」回推，loopback 用例见该文件）。
+- `RaftElection.handleVoteResponse` 收到**第一张**赞成票就 `becomeLeader()`，**不按 peer 计票**
+  （代码注释自认 "In production, this would track per-peer votes and call becomeLeader() on quorum"）。
+- `RaftElection.tick()` **没有任何人调用**（和 `ClusterMembership.runOnce` 一样是外部驱动）——
+  自带传输的同时要把它挂进你的循环（例如 `ClusterBootstrap.tick()` 里加一行）。
 
 ## Production Deployment Checklist
 
@@ -93,7 +109,9 @@ const node = view.pick(order_id) orelse return error.NoHealthyNode;
 ### Multi-node (3-7 nodes):
 1. ✅ `ClusterMembership` — gossip converges via `DistributedEventBus.subscribeWithContext`
 2. ✅ `DistributedEventBus` — cross-node pub/sub with soft backpressure
-3. ✅ `RaftElection` — leader election (test with 3+ real nodes)
+3. ⚠️ `RaftElection` + `RaftTransport` — **transport exists, the election state machine still has gaps**
+   (no per-peer vote counting; `tick()` is externally driven), and `raft_cluster_size > 1` refuses to start
+   without a real `.transport` (`error.RaftTransportUnavailable`) — see 「多节点启动 fail-closed」与「真选主要什么」
 4. ✅ `SagaOrchestrator` — compensation workflows
 5. ✅ `DistributedTransaction` — 2PC (add persistence for production durability)
 6. ✅ `KafkaConnector` — Kafka wire client for **RobustMQ** (`initWithIo`, default `127.0.0.1:9092`)

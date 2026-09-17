@@ -4,13 +4,17 @@
 //! Aligned with go-zero's rest package.
 //!
 //! STRUCTURE (monolith — intentionally NOT split; see docs/PRODUCTION_ROADMAP.md):
-//!   §A  Method, Route, RouteGroup, Ws callbacks
-//!   §B  Context — request/response, arena, bindJson, streaming
-//!   §C  StreamReader, ParsedRequest — HTTP/1.1 parsing
-//!   §D  TrieNode, Router — route matching, wildcards, params
-//!   §E  Server — listen, graceful drain, global middleware
-//!   §F  connFiber — per-connection lifecycle, WS upgrade
-//!   §G  deepCopy, unit/integration tests
+//!   §1  Method / Route / RouteGroup / WS callbacks —— routing declarations, middleware and listener types
+//!   §2  Process-wide error renderers —— setErrorRenderer / setTransportErrorRenderer and the transport body
+//!   §3  Context —— request/response, arena, bindJson, streaming and parameter helpers
+//!   §4  HTTP/1.1 parsing —— StreamReader, RequestParser, ParsedRequest and header deadlines
+//!   §5  TrieNode / Router / RouteInfo —— route matching, wildcards, params, listRoutes
+//!   §6  Server & response writers —— status text, raw writes, listen, graceful drain
+//!   §7  connFiber —— per-connection lifecycle, WS upgrade, backpressure, write timeout
+//!   §8  Middleware runner & struct binding —— runMiddlewareChain, Request/Response/Json, deepCopy
+//!   §9  Tests —— routing / middleware / WS / binding / backpressure unit and integration tests
+//!
+//! Every section carries a matching `// ==== §N ... ====` anchor — `grep "§5"` jumps there.
 //!
 //! MAINTENANCE:
 //!   - New middleware kinds → src/api/Middleware.zig (not here).
@@ -29,6 +33,8 @@ const Http2Tls = @import("../http/Http2Tls.zig");
 const Hpack = @import("../http/Hpack.zig");
 const GrpcServiceRegistry = @import("../extensions/GrpcTransport.zig").GrpcServiceRegistry;
 const Rbac = @import("../security/Rbac.zig");
+
+// ==== §1  Method / Route / RouteGroup / WS callbacks ====
 
 /// HTTP method
 pub const Method = enum {
@@ -231,6 +237,8 @@ pub const EnvelopeDialect = enum {
     ruoyi,
 };
 
+// ==== §2  Process-wide error renderers ====
+
 // ── Process-wide error renderers ────────────────────────────────────────
 //
 // Errors reach the client through three paths, and before these hooks only one
@@ -288,6 +296,8 @@ pub fn renderTransportError(status: u16, message: []const u8, buf: []u8) Transpo
     const body = std.fmt.bufPrint(buf, "{{\"error\":\"{s}\"}}", .{message}) catch return .{ .body = "{\"error\":\"Request Failed\"}" };
     return .{ .body = body };
 }
+
+// ==== §3  Context ====
 
 pub const FieldSource = enum {
     path,
@@ -1158,6 +1168,8 @@ fn parseFormBody(allocator: std.mem.Allocator, body: []const u8, max_params: usi
     return form;
 }
 
+// ==== §4  HTTP/1.1 parsing ====
+
 /// Simple stream reader wrapper for HTTP parsing
 /// Persistent buffered reader over a `std.Io.net.Stream`.
 ///
@@ -1475,6 +1487,8 @@ const ParsedRequest = struct {
         self.* = undefined;
     }
 };
+
+// ==== §5  Router ====
 
 /// Trie node for the router
 const TrieNode = struct {
@@ -1825,6 +1839,8 @@ const MatchedRoute = struct {
     }
 };
 
+// ==== §6  Server & response writers ====
+
 fn getStatusText(status: u16) []const u8 {
     return switch (status) {
         200 => "OK",
@@ -1911,6 +1927,9 @@ pub const Server = struct {
     header_limits: HeaderLimits,
     /// 0 = unlimited. See `Config.max_connections`.
     max_connections: usize = 0,
+    /// See `Config.connection_stack_size` (used by `runInBackground`, raised to
+    /// `min_thread_stack_size` there).
+    connection_stack_size: usize = 128 * 1024,
     /// See `Config.over_limit_response`.
     over_limit_response: OverLimitResponse = .close,
     /// See `Config.header_timeout_ms`.
@@ -1943,8 +1962,12 @@ pub const Server = struct {
         request_timeout_ms: u32 = 30000,
         max_requests_per_conn: usize = 100,
         header_limits: HeaderLimits = .{},
-        /// Per-connection thread stack size. Default 128KB suffices for HTTP handlers.
-        /// Lower = more concurrent connections. Raise if handlers need deep recursion.
+        /// Thread stack size for the accept-loop thread `runInBackground`
+        /// spawns. Connection fibers do **not** run on it (they execute on the
+        /// io executor's own worker threads), so this sizes one thread, not
+        /// one-per-connection. Values below `min_thread_stack_size` are raised
+        /// to that floor at spawn time — raising it is the useful direction
+        /// (deep recursion inside the loop); lowering it is not.
         connection_stack_size: usize = 128 * 1024,
         /// Max accepted connections served concurrently. 0 = unlimited.
         /// Over the limit the connection is closed immediately (or answered
@@ -1974,6 +1997,18 @@ pub const Server = struct {
 
     pub const OverLimitResponse = enum { close, unavailable };
 
+    /// Smallest `stack_size` `pthread_create` accepts here: on aarch64 glibc
+    /// (ubuntu 22.04) 128 KiB *is* `PTHREAD_STACK_MIN` and the guard page eats
+    /// into it, so smaller requests come back as EINVAL (measured). The tests
+    /// below spawn their accept loops with this size for the same reason.
+    pub const min_thread_stack_size: usize = 2 * 1024 * 1024;
+
+    /// What `runInBackground` hands to `std.Thread.spawn`: the configured size,
+    /// never below the platform floor.
+    pub fn effectiveStackSize(configured: usize) usize {
+        return @max(configured, min_thread_stack_size);
+    }
+
     pub fn init(io: std.Io, allocator: std.mem.Allocator, port: u16) Server {
         return Server.initWithConfig(io, allocator, .{ .port = port });
     }
@@ -1996,6 +2031,7 @@ pub const Server = struct {
             .max_requests_per_conn = config.max_requests_per_conn,
             .header_limits = config.header_limits,
             .max_connections = config.max_connections,
+            .connection_stack_size = config.connection_stack_size,
             .over_limit_response = config.over_limit_response,
             .header_timeout_ms = config.header_timeout_ms,
             .ws_write_timeout_ms = config.ws_write_timeout_ms,
@@ -2264,7 +2300,9 @@ pub const Server = struct {
         std.posix.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.RCVBUF, std.mem.asBytes(&rcvbuf)) catch |err| std.log.debug("[Server] setsockopt RCVBUF: {}", .{err});
         std.posix.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.SNDBUF, std.mem.asBytes(&sndbuf)) catch |err| std.log.debug("[Server] setsockopt SNDBUF: {}", .{err});
         std.posix.setsockopt(fd, std.c.IPPROTO.TCP, std.c.TCP.NODELAY, std.mem.asBytes(&one)) catch |err| std.log.debug("[Server] setsockopt TCP_NODELAY: {}", .{err});
-        // Keepalive after 60s idle, probe every 15s
+        // SO_KEEPALIVE only: idle/probe timings are the OS defaults (Linux and
+        // macOS both idle 7200 s, probe every 75 s) — TCP_KEEPIDLE/TCP_KEEPINTVL
+        // are not set, and the per-platform constant names differ.
         std.posix.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.KEEPALIVE, std.mem.asBytes(&one)) catch |err| std.log.debug("[Server] setsockopt KEEPALIVE: {}", .{err});
     }
 
@@ -2282,8 +2320,13 @@ pub const Server = struct {
         // NB: on aarch64 glibc (ubuntu 22.04 arm64) `pthread_create` rejects a
         // custom `stack_size` ≤ 256 KiB with EINVAL (PTHREAD_STACK_MIN is 128 KiB
         // there, and the guard page eats into it). 2 MiB is the smallest size we
-        // measured to succeed; use that instead of the original 128 KiB.
-        const handle = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, runLoop, .{self});
+        // measured to succeed, which is why `effectiveStackSize` raises anything
+        // smaller — including the 128 KiB default — to `min_thread_stack_size`.
+        const handle = try std.Thread.spawn(
+            .{ .stack_size = effectiveStackSize(self.connection_stack_size) },
+            runLoop,
+            .{self},
+        );
         return handle;
     }
 
@@ -2347,6 +2390,8 @@ pub const Server = struct {
         }
     }
 };
+
+// ==== §7  connFiber ====
 
 /// Connection fiber — handles one HTTP connection
 fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allocator) void {
@@ -2697,6 +2742,8 @@ fn writeErrorResponse(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.
     writeResponse(io, stream, status, headers, rendered.body) catch |err| std.log.err("[Server] writeErrorResponse failed: {}", .{err});
 }
 
+// ==== §8  Middleware runner & struct binding ====
+
 fn runMiddlewareChain(ctx: *Context) anyerror!void {
     if (ctx.chain_index < ctx.chain_middlewares.len) {
         const mw = ctx.chain_middlewares[ctx.chain_index];
@@ -2882,6 +2929,8 @@ fn deepCopy(value: anytype, allocator: std.mem.Allocator) !@TypeOf(value) {
         else => return value,
     }
 }
+
+// ==== §9  Tests ====
 
 test "api server" {
     const allocator = std.testing.allocator;
@@ -3566,18 +3615,26 @@ test "deep path matching with RouteGroup" {
 
     // Test: deep path (4 segments) should match
     var m1 = server.router.match(allocator, .GET, "/test/overview/home/dashboard");
-    if (m1 == null) @panic("FAIL: /test/overview/home/dashboard returned 404");
+    if (m1 == null) @panic("route match failed: expected GET /test/overview/home/dashboard to resolve " ++
+        "(registered as group(\"/test/overview/home\").get(\"/dashboard\")). Fix the prefix join in " ++
+        "RouteGroup.get / normalizeRoutePath, or correct the path asserted here.");
 
     // Test: 2-segment path should match
     var m2 = server.router.match(allocator, .GET, "/customer/summary");
-    if (m2 == null) @panic("FAIL: /customer/summary returned 404");
+    if (m2 == null) @panic("route match failed: expected GET /customer/summary to resolve " ++
+        "(registered as group(\"/customer\").get(\"/summary\")). Fix RouteGroup prefix joining, " ++
+        "or correct the path asserted here.");
 
     // Test: 3-segment paths should match
     var m3 = server.router.match(allocator, .GET, "/crm/statistics");
-    if (m3 == null) @panic("FAIL: /crm/statistics returned 404");
+    if (m3 == null) @panic("route match failed: expected GET /crm/statistics to resolve " ++
+        "(registered as group(\"/crm\").get(\"/statistics\")). Fix RouteGroup prefix joining, " ++
+        "or correct the path asserted here.");
 
     var m4 = server.router.match(allocator, .GET, "/insurance/compensation-plan");
-    if (m4 == null) @panic("FAIL: /insurance/compensation-plan returned 404");
+    if (m4 == null) @panic("route match failed: expected GET /insurance/compensation-plan to resolve " ++
+        "(registered as group(\"/insurance\").get(\"/compensation-plan\")). Fix RouteGroup prefix " ++
+        "joining, or correct the path asserted here.");
 
     // Clean up params
     if (m1) |*m| m.params.deinit();
@@ -3732,6 +3789,25 @@ test "HeaderLimits defaults are sane" {
     const h = HeaderLimits{};
     try std.testing.expect(h.max_count > 0 and h.max_count <= 1024);
     try std.testing.expect(h.max_total_bytes > 0 and h.max_total_bytes <= 1024 * 1024);
+}
+
+test "connection_stack_size flows from Config to the accept-loop spawn" {
+    const allocator = std.testing.allocator;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .connection_stack_size = 4 * 1024 * 1024 });
+    defer server.deinit();
+    try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), server.connection_stack_size);
+    try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), Server.effectiveStackSize(server.connection_stack_size));
+
+    // Below the platform floor the request is raised, not honoured: smaller
+    // sizes fail `pthread_create` with EINVAL (see `min_thread_stack_size`).
+    try std.testing.expectEqual(Server.min_thread_stack_size, Server.effectiveStackSize(128 * 1024));
+    try std.testing.expectEqual(Server.min_thread_stack_size, Server.effectiveStackSize(0));
+
+    var defaults = Server.init(std.testing.io, allocator, 8080);
+    defer defaults.deinit();
+    try std.testing.expectEqual(@as(usize, 128 * 1024), defaults.connection_stack_size);
+    try std.testing.expectEqual(Server.min_thread_stack_size, Server.effectiveStackSize(defaults.connection_stack_size));
 }
 
 const WsE2eState = struct {

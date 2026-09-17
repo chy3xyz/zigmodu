@@ -8,7 +8,10 @@
 //! node owns this key" is the wrong trade for data that changes every few seconds.
 //!
 //! So: one writer publishes whole snapshots, readers load a generation index and
-//! read a slice. No lock, no allocation, no refcount on the read path.
+//! read a slice. No lock, no allocation, and readers never wait for one another —
+//! the only shared write on the read path is a per-slot reader counter, bumped in
+//! `acquire` and dropped in `release` so the writer can tell when a slot is free
+//! again (that mechanism is the next section).
 //!
 //! ## Reclamation without a garbage collector
 //!
@@ -105,8 +108,10 @@ pub const Stats = struct {
 };
 
 pub fn ClusterView(comptime max_members: usize, comptime generations: usize) type {
-    if (max_members == 0) @compileError("ClusterView needs room for at least one member");
-    if (generations < 2) @compileError("ClusterView needs at least two generations: a reader holds one while the writer fills the next");
+    if (max_members == 0) @compileError("ClusterView(max_members, generations) needs max_members >= 1, got 0. " ++
+        "Size the view for the largest membership you will publish, e.g. ClusterView(64, 4).");
+    if (generations < 2) @compileError("ClusterView(max_members, generations) needs generations >= 2, got fewer: " ++
+        "a reader holds one generation while the writer fills the next. Pass at least 2 (4 is the common choice).");
     return struct {
         const Self = @This();
 

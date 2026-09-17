@@ -21,18 +21,32 @@
 ```zig
 var registry = zigmodu.ai.SkillRegistry.init(allocator, io);
 defer registry.deinit();
-try registry.register(.{ .name = "ping", .description = "pong", .parameters = &.{}, .handler = ping });
+try registry.register(.{
+    .name = "ping",
+    .description = "pong",
+    .parameters = &.{},
+    .action = .read,           // 工具类别 .read / .propose / .execute（默认 .execute，最严）
+    .handler = ping,
+});
 
-var agent = zigmodu.ai.Agent{
+// 用 AgentSpec 装配：裸 `Agent{}` 漏掉 `.guard` 就是无界（任何注册工具都能跑）。
+var guard = zigmodu.ai.Guard.init(.{ .allow = &.{"ping"}, .allow_execute = false });
+var spec = zigmodu.ai.AgentSpec{
+    .name = "ping-agent",      // 身份：进日志与指标标签
     .provider = &provider,
-    .registry = &registry,
-    .allowlist = &.{"ping"}, // 安全：只允许列出的工具
-    .tool_timeout_ms = 5_000, // 协作式超时（handler 应 checkDeadline）
+    .skills = &registry,
+    .system_prompt = "You are a ping agent.",
+    .guard = &guard,
+    .allowlist = &.{"ping"},   // 工具名白名单：第二道口子
+    .tool_timeout_ms = 5_000,  // 协作式超时（handler 应 checkDeadline）
 };
+var agent = spec.build();
 var skill_ctx = zigmodu.ai.SkillContext{ .allocator = allocator };
 var result = try agent.run(allocator, "ping the system", &skill_ctx, 5);
 defer result.deinit(allocator);
 ```
+
+闸门 / 工具类别 / 权限默认 deny 的完整规则见 [`AGENT_RUNTIME.md`](AGENT_RUNTIME.md)。
 
 **刻意不做**：默认任意 shell / 外部 MCP client。需要时自行 `register` 受控 handler。
 
@@ -227,9 +241,12 @@ memory.max_entries = 50000;
 ## Agent 观测
 
 ```zig
-var agent = zigmodu.ai.Agent{
+var guard = zigmodu.ai.Guard.init(.{ .allow = &.{"ping"}, .allow_execute = false });
+var spec = zigmodu.ai.AgentSpec{
+    .name = "ping-agent",
     .provider = &provider,
-    .registry = &registry,
+    .skills = &registry,
+    .guard = &guard,
     .allowlist = &.{"ping"},
     .hooks = .{
         .on_tool = struct {
@@ -239,6 +256,7 @@ var agent = zigmodu.ai.Agent{
         }.f,
     },
 };
+var agent = spec.build();
 // agent.metrics.runs / steps / tool_calls / tool_errors / max_steps_hits
 const prom = try agent.metrics.toPrometheusFormat(allocator, "ops");
 defer allocator.free(prom);

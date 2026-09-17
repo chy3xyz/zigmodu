@@ -19,7 +19,16 @@
 
 const std = @import("std");
 
-pub const FrozenError = error{Frozen};
+/// Raised by `put`/`putNoClobber`/`remove` once `freeze()` has been called.
+///
+/// It is the signal that a write arrived after the registry became read-only —
+/// usually a registration happening outside startup. The map is unchanged when
+/// this is returned (no partial write), so callers can either drop the write and
+/// log it, or move the registration earlier, before `freeze()`.
+pub const FrozenError = error{
+    /// The map is frozen and immutable; the write did not happen.
+    Frozen,
+};
 
 pub fn FrozenMap(comptime K: type, comptime V: type) type {
     return FrozenMapImpl(std.AutoHashMap(K, V), K, V);

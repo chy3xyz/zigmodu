@@ -38,12 +38,20 @@ pub fn getInFlightCounter() *std.atomic.Value(u64) {
 /// Application Builder Pattern
 /// Simplified API for creating and managing modular applications
 ///
-/// Example:
+/// Preferred — build through the builder (bind it first: a temporary is `*const`):
 /// ```zig
-/// var app = try zigmodu.Application.init(allocator, .{
-///     .name = "shop",
-///     .modules = .{ order_module, payment_module },
-/// });
+/// var b = zigmodu.builder(allocator, io);
+/// defer b.deinit();
+/// var app = try b.withName("shop").build(.{ order_module, payment_module });
+/// defer app.deinit();
+///
+/// try app.start();
+/// defer app.stop();
+/// ```
+///
+/// Or construct directly — the argument order is `(io, allocator, name, modules, Config)`:
+/// ```zig
+/// var app = try zigmodu.Application.init(io, allocator, "shop", .{ order_module, payment_module }, .{});
 /// defer app.deinit();
 ///
 /// try app.start();
@@ -83,6 +91,11 @@ pub const Application = struct {
         validate_on_start: bool = true,
         auto_generate_docs: bool = false,
         docs_path: ?[]const u8 = null,
+        /// Advisory startup check, the runtime counterpart of `ModuleGraph`'s
+        /// comptime one: a module declaring more than this many dependencies is
+        /// logged as a warning by `validate()` (sizing is a smell, never a
+        /// reason to refuse to start). `0` disables the check.
+        max_dependencies: usize = 8,
     };
 
     /// Initialize application with modules
@@ -109,6 +122,7 @@ pub const Application = struct {
                 .validate_on_start = options.validate_on_start,
                 .auto_generate_docs = options.auto_generate_docs,
                 .docs_path = options.docs_path,
+                .max_dependencies = options.max_dependencies,
             },
             .state = .initialized,
             .shutdown_hooks = std.ArrayList(*const fn () void).empty,
@@ -144,6 +158,9 @@ pub const Application = struct {
             return; // Already validated
         }
         try validateModules(&self.modules);
+        if (self.config.max_dependencies > 0) {
+            _ = warnOverDependencyLimit(&self.modules, self.config.max_dependencies);
+        }
         self.state = .validated;
     }
 
@@ -328,7 +345,7 @@ pub const Application = struct {
 ///
 /// Example:
 /// ```zig
-/// var builder = zigmodu.ApplicationBuilder.init(allocator);
+/// var builder = zigmodu.ApplicationBuilder.init(allocator, io);
 /// defer builder.deinit();
 ///
 /// var app = try builder
@@ -387,7 +404,7 @@ pub const ApplicationBuilder = struct {
 
     /// Advisory threshold checked at **startup** (not comptime — the number is
     /// runtime configuration): a module with more dependencies than this is
-    /// logged as a warning. Default 8.
+    /// logged as a warning by `validate()`. Default 8; `0` disables the check.
     pub fn withMaxDependencies(self: *ApplicationBuilder, max_deps: usize) *ApplicationBuilder {
         self.max_dependencies = max_deps;
         return self;
@@ -456,6 +473,7 @@ pub const ApplicationBuilder = struct {
                 .validate_on_start = self.validate_on_start,
                 .auto_generate_docs = self.auto_generate_docs,
                 .docs_path = self.docs_path,
+                .max_dependencies = self.max_dependencies,
             },
         );
         errdefer app.deinit();
@@ -469,6 +487,27 @@ pub const ApplicationBuilder = struct {
 /// Convenience function to create ApplicationBuilder
 pub fn builder(allocator: std.mem.Allocator, io: std.Io) ApplicationBuilder {
     return ApplicationBuilder.init(allocator, io);
+}
+
+/// Log-and-count modules whose declared dependency count exceeds `limit` — the
+/// advisory half of startup validation (`ModuleGraph.analyze` cannot run here:
+/// the module set is a runtime value by the time `Application` exists). Returns
+/// how many modules were over, which is what the tests assert on.
+fn warnOverDependencyLimit(modules: *const ApplicationModules, limit: usize) usize {
+    var over: usize = 0;
+    var iter = modules.modules.iterator();
+    while (iter.next()) |entry| {
+        const module = entry.value_ptr.*;
+        if (module.deps.len > limit) {
+            std.log.warn("Module '{s}' declares {d} dependencies (advisory max {d})", .{
+                module.name,
+                module.deps.len,
+                limit,
+            });
+            over += 1;
+        }
+    }
+    return over;
 }
 
 test "Application lifecycle" {
@@ -527,6 +566,45 @@ test "ApplicationBuilder" {
     try std.testing.expectEqualStrings("built-app", app.config.name);
     try std.testing.expectEqual(false, app.config.validate_on_start);
     try std.testing.expect(app.hasModule("builder-mock"));
+}
+
+test "advisory max-dependency limit is wired from the builder into startup validation" {
+    const allocator = std.testing.allocator;
+
+    const Leaf = struct {
+        pub const info = api.Module{ .name = "leaf", .description = "Leaf", .dependencies = &.{} };
+        pub fn init() !void {}
+        pub fn deinit() void {}
+    };
+    const Other = struct {
+        pub const info = api.Module{ .name = "other-leaf", .description = "Leaf", .dependencies = &.{} };
+        pub fn init() !void {}
+        pub fn deinit() void {}
+    };
+    const Wide = struct {
+        pub const info = api.Module{
+            .name = "wide",
+            .description = "Depends on both leaves",
+            .dependencies = &.{ "leaf", "other-leaf" },
+        };
+        pub fn init() !void {}
+        pub fn deinit() void {}
+    };
+
+    var b = ApplicationBuilder.init(allocator, std.testing.io);
+    defer b.deinit();
+
+    var app = try b.withMaxDependencies(1).build(.{ Leaf, Other, Wide });
+    defer app.deinit();
+
+    // The builder's number reaches the config `validate()` reads.
+    try std.testing.expectEqual(@as(usize, 1), app.config.max_dependencies);
+    try std.testing.expectEqual(@as(usize, 1), warnOverDependencyLimit(&app.modules, app.config.max_dependencies));
+    try std.testing.expectEqual(@as(usize, 0), warnOverDependencyLimit(&app.modules, 2));
+
+    // ... and `validate()` runs it as part of startup (advisory: no error).
+    try app.validate();
+    try std.testing.expectEqual(Application.State.validated, app.getState());
 }
 
 test "Application shutdown hooks" {

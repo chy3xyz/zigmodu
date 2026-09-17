@@ -6,11 +6,26 @@
 //!
 //! Unit tests use offline mode (no network). Live I/O tests require
 //! `ROBUSTMQ_URL` or `KAFKA_BOOTSTRAP` (e.g. `127.0.0.1:9092`).
+//!
+//! STRUCTURE:
+//!   §1  Message & config types —— KafkaMessage, producer/consumer config, PartitionAssignorKind
+//!   §2  Transport & wire helpers —— RobustMQTransport plus bootstrap parsing and big-endian helpers
+//!   §3  Producer —— KafkaProducer send path and stats
+//!   §4  Partition assignors —— range, round-robin, sticky, cooperative-sticky
+//!   §5  Consumer group session —— join/heartbeat/leave, assignment apply, cooperative revocation
+//!   §6  Consumer —— KafkaConsumer subscribe/poll/commit
+//!   §7  Event bridge —— KafkaEventBridge between the event bus and Kafka
+//!   §8  Wire format —— KafkaWireFormat request encoding and response parsing
+//!   §9  Tests —— offline tests plus `ROBUSTMQ_URL` / `KAFKA_BOOTSTRAP`-gated live tests
+//!
+//! Every section carries a matching `// ==== §N ... ====` anchor — `grep "§5"` jumps there.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const Time = @import("../core/Time.zig");
 const sockread = @import("sockread.zig");
+
+// ==== §1  Message & config types ====
 
 pub const KafkaMessage = struct {
     topic: []const u8,
@@ -90,6 +105,8 @@ pub const KafkaConsumerConfig = struct {
     partition_assignor: PartitionAssignorKind = .range,
     offline: bool = false,
 };
+
+// ==== §2  Transport & wire helpers ====
 
 /// Low-level Kafka wire client used by producer/consumer against RobustMQ.
 pub const RobustMQTransport = struct {
@@ -352,6 +369,8 @@ fn readI16(buf: []const u8) i16 {
     return @bitCast(u);
 }
 
+// ==== §3  Producer ====
+
 pub const KafkaProducer = struct {
     const Self = @This();
 
@@ -447,6 +466,8 @@ pub const KafkaProducer = struct {
         entry.value_ptr.failed += 1;
     }
 };
+
+// ==== §4  Partition assignors ====
 
 /// Shared partition-assignment result for all assignors.
 pub const PartitionAssignor = struct {
@@ -837,6 +858,8 @@ pub const CooperativeStickyAssignor = struct {
         PartitionAssignor.freeAssignment(allocator, assignment);
     }
 };
+
+// ==== §5  Consumer group session ====
 
 pub const ConsumerGroupSession = struct {
     const Self = @This();
@@ -1240,6 +1263,8 @@ pub const ConsumerGroupSession = struct {
         );
     }
 };
+
+// ==== §6  Consumer ====
 
 pub const KafkaConsumer = struct {
     const Self = @This();
@@ -1728,6 +1753,8 @@ pub const KafkaConsumer = struct {
     }
 };
 
+// ==== §7  Event bridge ====
+
 pub const KafkaEventBridge = struct {
     const Self = @This();
 
@@ -1760,6 +1787,8 @@ pub const KafkaEventBridge = struct {
         try self.consumer.subscribe(topic, Store.handler);
     }
 };
+
+// ==== §8  Wire format ====
 
 /// Kafka wire protocol builders (non-flexible headers; Produce/Fetch v7 + Consumer Group).
 pub const KafkaWireFormat = struct {
@@ -2578,9 +2607,7 @@ pub const KafkaWireFormat = struct {
     }
 };
 
-// ─────────────────────────────────────────────────
-// Tests
-// ─────────────────────────────────────────────────
+// ==== §9  Tests ====
 
 test "KafkaProducer send and stats" {
     const allocator = std.testing.allocator;
