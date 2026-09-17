@@ -136,6 +136,9 @@ pub const ClusterMembership = @import("core/ClusterMembership.zig").ClusterMembe
 /// and **not** wired into a request path by the framework (see the readiness
 /// notes in `docs/DISTRIBUTED.md`).
 pub const RaftElection = @import("core/cluster/RaftElection.zig").RaftElection;
+/// The real transport behind `RaftElection` (`docs/DISTRIBUTED.md`「真选主要什么」):
+/// outbound vote/replication RPCs over TCP, inbound dispatch, address book.
+pub const RaftTransport = @import("core/cluster/RaftTransport.zig");
 pub const PeerDiscovery = @import("core/cluster/PeerDiscovery.zig").PeerDiscovery;
 pub const LoadBalancer = @import("core/cluster/LoadBalancer.zig").LoadBalancer;
 pub const ClusterHealth = @import("core/cluster/ClusterHealth.zig").ClusterHealth;

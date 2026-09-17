@@ -1,5 +1,33 @@
 # Changelog
 
+## [Unreleased]
+
+- **`ClusterBootstrap` 可选自带 Raft 传输**：`BootstrapConfig.transport` 接受应用提供的
+  `RaftElection.ElectionTransport`；给了它就**不再**要求 `.allow_stub_raft_transport`（默认 `raft_cluster_size = 3`
+  也能启动）。框架仍然不内置真传输，但 seam 可用、契约写清了：出站用 `NetworkTransport.connect/send`、
+  入站用 `ClusterServer.start(handler)` 分发到 `handleVoteRequest`/`handleAppendEntries`/`handleVoteResponse`/
+  `handleInstallSnapshot` 并在同一连接回包；`sendVoteRequest` 是 fire-and-forget（应答走入站），
+  `sendAppendEntries` 是同步的；丢包按"消息丢了"处理，别把节点判死。详见 `docs/DISTRIBUTED.md`
+  「真选主要什么」。测试用一个自带 transport 的 3 节点配置锁定"给了传输就能启动"。
+- **真选主传输落地**（`src/core/cluster/RaftTransport.zig`）：wire 格式（4 字节长度前缀 + 1 字节 tag）、
+  peer→地址簿、出站投票（fire-and-forget）与日志复制（同步读回）、入站分发（`handleConnection` 把
+  `handleVoteRequest`/`handleAppendEntries`/`handleVoteResponse`/`handleInstallSnapshot` 的返回值在同一连接回包）。
+  4 个测试，其中两个是**真 TCP loopback**：3 个 listener → `tick()` → 真投票 → 2/3 quorum → `isLeader()`。
+  **诚实边界（未做，属 `RaftElection` 内部状态机）**：`handleVoteResponse` 收到第一张票就 `becomeLeader()`（不数票，
+  quorum 由调用方 `hasQuorum` 判）；`tick()` 发的是空条目心跳且 `prev_log_index = last_idx`，空日志 follower 会拒 →
+  落后 follower 追不上；`ClusterBootstrap` 不自动起入站 server 与 `raft.tick()`；`InstallSnapshot` 只有入站。
+  另：`NetworkTransport.connect` 是死代码且引用即编译不过（`ConnectOptions` 需 `.mode`），本次在 `RaftTransport`
+  内自建拨号，未改该文件。
+- **`examples/alpha-engine/`（P0）**：`feed → OrderBook → Alpha → Risk → Execution → PaperExchange` 的确定性离线
+  流水线（内嵌 200 点价格序列，无随机数），`Pipeline` 模块在 `initWith` 里 `ctx.runtime()` spawn 全部 worker，
+  快照定时器 + drain barrier + `rt.stats()`。`zig build run` 退出码 0，连跑数字一致。P1–P3 见
+  `docs/dev/alpha-engine-spec.md`。
+- **doctor 补三项检查 + `graph --dot`**：doctor 新增「未解析服务 / 消费者计数 / 事件拓扑」三项 **advisory** 检查
+  （查不到就输出 `n/a (静态分析不可得)`，不编数字；阈值 `--max-consumers N`）；`zmodu graph --dot` 把
+  `ModuleGraph.renderDot` 接进 CLI（DOT 与 Mermaid 共用 `--out`）。顺带修：**doctor 的测试此前从未被编译**
+  （`main.zig` 未在测试上下文引用它）→ 已并入 CLI 覆盖率门禁；`moduleOfImport` 把 `std`/`zigmodu` 误判成模块名 →
+  改为只认相对 import。
+
 ## [0.22.0] - 2026-09-17
 
 > **0 breaking**（Agent 闸门接线 + 三段骨架）。既有字段与函数签名全部保留，新增字段都有默认值。

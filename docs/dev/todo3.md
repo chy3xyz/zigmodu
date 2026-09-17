@@ -15,7 +15,7 @@
 | 7 | DX / CLI | ⚠ 部分 | 28 个子命令(`tools/zmodu/src/main.zig:373-408`：new/module/scaffold/audit/graph/doctor/ci/mcp/…)。**缺** `create app`(app.zig / domain / infrastructure / config / Dockerfile / compose) 与 `create module` 六件套一键生成（`module` 只写 module.zig，`main.zig:1096`） |
 | 8 | Workflow Runtime | ⚠ 部分 | Saga 补偿逆序回滚(`SagaOrchestrator.zig:262`)、WAL 检查点 + 崩溃续跑(`:247`、`:390`，测试 `:719`、`:783`)。**缺** 状态机、生效的 timeout（`timed_out` 从不赋值）、`.step().compensate()` DSL（`docs/WORKFLOW.md` 明确不做） |
 | §十一 | Visualization | ⚠ 部分 | `zmodu doctor`(`tools/zmodu/src/doctor.zig:49`) 清单 8 项中 3 ✅ / 2 ⚠ / 3 ❌（缺"未解析服务/事件拓扑/消费者计数"）；`graph` 仅 Mermaid(`main.zig:624`)，`ModuleGraph.renderDot` 未接 CLI；**`doctor` 已进 `zmodu ci`**（第 6 步，与 CI 对 examples 的门禁同口径） |
-| §十六 | alpha-engine 参考实现 | ❌ 未做 | `examples/alpha-engine` 不存在；最接近是 `examples/runtime-workers`（行情→订单簿→风控，`examples/runtime-workers/src/main.zig:1-31`），缺 Execution / Exchange Adapter / Replay / Backtest / Paper / Live |
+| §十六 | alpha-engine 参考实现 | ❌ 未做（**已有规格**） | `examples/alpha-engine` 不存在；最接近是 `examples/runtime-workers`（行情→订单簿→风控，`examples/runtime-workers/src/main.zig:1-31`），缺 Alpha / Execution / Exchange Adapter / Replay / Backtest / Paper。**规格：`docs/dev/alpha-engine-spec.md`**（P0 骨架 → P1 观测容错 → P2 模块化+门禁 → P3 AI 提议侧；每阶段独立可验证） |
 
 **完成度（2026-09-17 复核）** —— 计分口径：每条 todo3 子诉求 **1.0** = 有实体代码 + 测试 + **被采用**（框架内或参考示例真的走这条路）；**0.5** = 有代码有测试但**没人用**（孤岛）；**0** = 没有。
 

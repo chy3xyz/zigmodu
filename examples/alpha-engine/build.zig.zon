@@ -1,0 +1,1 @@
+.{ .name = .alpha_engine, .version = "0.1.0", .fingerprint = 0x13a8c686f104b482, .minimum_zig_version = "0.17.0", .dependencies = .{ .zigmodu = .{ .path = "../.." } }, .paths = .{ "build.zig", "build.zig.zon", "src" } }

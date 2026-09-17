@@ -18,6 +18,7 @@ const incremental = @import("incremental.zig");
 const ai_cli = @import("ai_cli.zig");
 const deadcode = @import("deadcode.zig");
 const audit_mod = @import("audit.zig");
+const graph_mod = @import("module_graph");
 const doctor_mod = @import("doctor.zig");
 const ci_mod = @import("ci.zig");
 const saas_mod = @import("saas.zig");
@@ -433,8 +434,8 @@ fn printUsage() void {
         \\  diff <old> <new>  Compare two SQL files, show table-level changes
         \\  ai                AI skill registry: export-skills | openapi
         \\  audit [dir]       Best-practice audit: architecture rules + business lint
-        \\  graph [dir]       Render module dependency graph (Mermaid)
-        \\  doctor [dir]      Architecture health: graph + cross-module imports (exit 1 on errors)
+        \\  graph [dir]       Render module dependency graph (Mermaid; --dot, --out <file>)
+        \\  doctor [dir]      Architecture health: graph + imports + wiring (exit 1 on errors)
         \\  ci [dir]          One-shot gate: build + fmt + verify + audit + deadcode
         \\  saas <model.json>  SaaS backend module from a business model (org-scoped)
         \\  market             Curated module catalog: list | search <q> | info <id>
@@ -618,15 +619,21 @@ fn cmdAudit(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) 
     if (code != 0) std.process.exit(code);
 }
 
+/// `zmodu graph [dir] [--out <file>] [--dot]` — the module dependency graph as
+/// Mermaid (default, renders in Markdown) or Graphviz DOT (`--dot`, `dot -Tsvg`).
+/// Both formats go through the same `--out`.
 fn cmdGraph(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
     var dir: []const u8 = ".";
     var out_path: ?[]const u8 = null;
+    var dot = false;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--out")) {
             if (i + 1 >= args.len) return error.CliUsage;
             i += 1;
             out_path = args[i];
+        } else if (std.mem.eql(u8, args[i], "--dot")) {
+            dot = true;
         } else if (args[i].len > 0 and args[i][0] == '-') {
             return error.CliUsage;
         } else {
@@ -634,21 +641,77 @@ fn cmdGraph(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) 
         }
     }
 
-    const mermaid = try audit_mod.renderMermaid(io, allocator, dir);
-    defer allocator.free(mermaid);
+    const rendered = if (dot)
+        try renderDotGraph(io, allocator, dir)
+    else
+        try audit_mod.renderMermaid(io, allocator, dir);
+    defer allocator.free(rendered);
     if (out_path) |p| {
         const file = try std.Io.Dir.cwd().createFile(io, p, .{});
         defer file.close(io);
-        try file.writeStreamingAll(io, mermaid);
+        try file.writeStreamingAll(io, rendered);
         std.log.info("module graph written to {s}", .{p});
     } else {
         var out_buf: [4096]u8 = undefined;
         var out_file = std.Io.File.stdout();
         var out_writer = out_file.writer(io, &out_buf);
         const stdout = &out_writer.interface;
-        try stdout.writeAll(mermaid);
+        try stdout.writeAll(rendered);
         try stdout.flush();
     }
+}
+
+/// DOT for a scanned project: collect the module declarations, then hand the
+/// nodes to `core/ModuleGraph.renderDot` — the same renderer `zmodu doctor`
+/// uses, so CLI and framework cannot drift.
+fn renderDotGraph(io: std.Io, allocator: std.mem.Allocator, project_dir: []const u8) ![]const u8 {
+    var modules = std.ArrayList(audit_mod.ModuleRec).empty;
+    defer {
+        for (modules.items) |*m| m.deinit(allocator);
+        modules.deinit(allocator);
+    }
+    try audit_mod.collectModules(io, allocator, project_dir, &modules);
+    return dotFromModules(allocator, modules.items);
+}
+
+/// Pure half of `renderDotGraph`: node/edge set from the module records, no
+/// filesystem. Edges are filtered to known modules so DOT and Mermaid (`audit`'s
+/// `renderMermaid`) describe the same graph; a dependency on a module that does
+/// not exist is `doctor`'s finding, not a phantom node here.
+fn dotFromModules(allocator: std.mem.Allocator, modules: []const audit_mod.ModuleRec) ![]const u8 {
+    const nodes = try allocator.alloc(graph_mod.Node, modules.len);
+    defer allocator.free(nodes);
+    var filled: usize = 0;
+    errdefer for (nodes[0..filled]) |n| allocator.free(n.dependencies);
+    defer for (nodes[0..filled]) |n| allocator.free(n.dependencies);
+
+    var edges = std.ArrayList([]const u8).empty;
+    defer edges.deinit(allocator);
+    for (modules, 0..) |m, i| {
+        edges.clearRetainingCapacity();
+        for (m.deps) |d| {
+            for (modules) |other| {
+                if (std.mem.eql(u8, other.name, d)) {
+                    try edges.append(allocator, d);
+                    break;
+                }
+            }
+        }
+        nodes[i] = .{
+            .name = m.name,
+            .description = m.description,
+            .dependencies = try allocator.dupe([]const u8, edges.items),
+            .is_internal = false,
+        };
+        filled += 1;
+    }
+
+    var buf = std.ArrayList(u8).empty;
+    var writer = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
+    errdefer writer.deinit();
+    try graph_mod.renderDot(.{ .nodes = nodes }, &writer.writer);
+    var list = writer.toArrayList();
+    return list.toOwnedSlice(allocator);
 }
 
 fn cmdDoctor(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) void {
@@ -727,10 +790,11 @@ fn cmdMarket(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8)
     if (code != 0) std.process.exit(code);
 }
 
-test "cli submodule coverage gates (saas + market + audit)" {
+test "cli submodule coverage gates (saas + market + audit + doctor)" {
     _ = @import("saas.zig");
     _ = @import("market.zig");
     _ = @import("audit.zig");
+    _ = @import("doctor.zig");
 }
 
 fn cmdVerify(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -8985,4 +9049,54 @@ test "inferModuleName from table list" {
     const name = try inferModuleName(allocator, "ad_category", 0);
     defer allocator.free(name);
     try std.testing.expectEqualStrings("ad_category", name);
+}
+
+test "graph --dot renders a Graphviz digraph (CLI scanner + framework renderer)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "src/modules/order");
+    try tmp.dir.createDirPath(io, "src/modules/user");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "src/modules/order/module.zig",
+        .data =
+        \\pub const info = zigmodu.api.Module{
+        \\    .name = "order",
+        \\    .description = "Order management",
+        \\    .dependencies = &.{"user"},
+        \\};
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "src/modules/user/module.zig",
+        .data =
+        \\pub const info = zigmodu.api.Module{
+        \\    .name = "user",
+        \\    .description = "User management",
+        \\    .dependencies = &.{},
+        \\};
+        ,
+    });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    const dot = try renderDotGraph(io, allocator, path_buf[0..path_len]);
+    defer allocator.free(dot);
+
+    try std.testing.expect(std.mem.indexOf(u8, dot, "digraph") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dot, "->") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dot, "\"order\" -> \"user\";") != null);
+
+    // A dependency on a module that does not exist is `doctor`'s finding, not a
+    // phantom node in the graph — DOT and Mermaid describe the same edges.
+    const modules = &[_]audit_mod.ModuleRec{
+        .{ .name = "order", .description = "", .deps = &.{ "user", "biling" }, .file = "src/modules/order/module.zig", .info_line = 1 },
+        .{ .name = "user", .description = "", .deps = &.{}, .file = "src/modules/user/module.zig", .info_line = 1 },
+    };
+    const filtered = try dotFromModules(allocator, modules);
+    defer allocator.free(filtered);
+    try std.testing.expect(std.mem.indexOf(u8, filtered, "biling") == null);
+    try std.testing.expect(std.mem.indexOf(u8, filtered, "\"order\" -> \"user\";") != null);
 }

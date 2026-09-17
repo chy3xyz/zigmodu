@@ -66,6 +66,7 @@ test "compile all source files" {
     _ = @import("cluster/ClusterView.zig");
     _ = @import("core/cluster/FailureDetector.zig");
     _ = @import("core/cluster/NetworkTransport.zig");
+    _ = @import("core/cluster/RaftTransport.zig");
     _ = @import("core/cluster/PeerDiscovery.zig");
     _ = @import("core/cluster/ClusterMessage.zig");
     _ = @import("core/cluster/TlsTransport.zig");

@@ -36,6 +36,13 @@ pub const BootstrapConfig = struct {
     port: u16 = 9000,
     peers: []const []const u8 = &.{},
     raft_cluster_size: usize = 3,
+    /// Bring your own Raft transport. The built-in one is a stub, so a multi-node
+    /// cluster is **refused** unless this is set or the caller acknowledges with
+    /// `allow_stub_raft_transport`. What a real transport must do is written out in
+    /// `docs/DISTRIBUTED.md`「真选主要什么」（出站发送 + 入站分发到
+    /// `RaftElection.handleVoteRequest` / `handleVoteResponse` / `handleAppendEntries`
+    /// 并在同一连接上回包）—— 框架给缝，不给实现。
+    transport: ?RaftElection.ElectionTransport = null,
     /// Leader election needs votes to actually travel, and the built-in Raft
     /// transport is a **stub** (see `start()`). So a cluster with
     /// `raft_cluster_size > 1` refuses to start unless this is set — which is the
@@ -107,20 +114,20 @@ pub const ClusterBootstrap = struct {
 
         // 4. Create RaftElection (leader election)
         //
-        // The transport below is a **stub**: `sendVoteRequest` is a no-op and
-        // `sendAppendEntries` always fails. A real one has to carry Raft's
-        // request/response over `NetworkTransport` (vote request → vote response,
-        // append entries → match index); until that exists, a multi-node election
-        // cannot make progress. Refuse loudly rather than elect a "leader" no peer
-        // ever voted for — a single-node cluster has nothing to elect, and a
-        // process that only wants membership + the read side acknowledges with
+        // `config.transport` may be supplied by the app (a real network transport).
+        // Without one we fall back to a **stub**: `sendVoteRequest` is a no-op and
+        // `sendAppendEntries` always fails, so a multi-node election cannot make
+        // progress. Refuse loudly rather than elect a "leader" no peer ever voted
+        // for — a single-node cluster has nothing to elect, and a process that only
+        // wants membership + the read side acknowledges with
         // `.allow_stub_raft_transport = true`.
-        if (self.config.raft_cluster_size > 1 and !self.config.allow_stub_raft_transport) {
+        if (self.config.transport == null and self.config.raft_cluster_size > 1 and !self.config.allow_stub_raft_transport) {
             // `warn`, not `err`: the returned error is the loud part, and the test
             // harness treats an `err`-level log as a failure by itself.
             std.log.warn(
-                "[ClusterBootstrap] refusing to start node {s}: raft_cluster_size={d} but the built-in Raft transport is a stub (votes go nowhere). " ++
-                    "Set `.allow_stub_raft_transport = true` to run membership + read side only, or raft_cluster_size = 1 for a single node.",
+                "[ClusterBootstrap] refusing to start node {s}: raft_cluster_size={d} but no Raft transport was supplied " ++
+                    "and the built-in one is a stub (votes go nowhere). Pass `.transport`, or acknowledge with " ++
+                    "`.allow_stub_raft_transport = true` to run membership + read side only.",
                 .{ self.config.node_id, self.config.raft_cluster_size },
             );
             return error.RaftTransportUnavailable;
@@ -144,7 +151,8 @@ pub const ClusterBootstrap = struct {
                 }.f,
             };
         }
-        const election_transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&S.transport_impl.?)));
+        const stub_transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&S.transport_impl.?)));
+        const election_transport = self.config.transport orelse stub_transport;
         const raft = try self.allocator.create(RaftElection);
         raft.* = try RaftElection.init(self.allocator, self.config.node_id, &.{}, election_cfg, &election_transport);
         self.raft = raft;
@@ -253,6 +261,37 @@ test "ClusterBootstrap initialization" {
     try std.testing.expectEqual(@as(usize, 1), snap.count());
     try std.testing.expectEqualStrings("test-node", snap.find("test-node").?.id);
     try std.testing.expect(snap.find("test-node").?.healthy);
+}
+
+test "ClusterBootstrap accepts an app-supplied Raft transport" {
+    const allocator = std.testing.allocator;
+
+    // A "real" transport for this test: it records nothing, but it is *not* the
+    // stub — which is the point (the guard only fires without one).
+    const Impl = struct {
+        fn sendVote(_: ?[]const u8, _: []const u8, _: VoteRequest) void {}
+        fn sendAppend(_: ?[]const u8, _: []const u8, _: AppendEntriesRequest) AppendEntriesResponse {
+            return .{ .term = 7, .success = true, .match_index = 1 };
+        }
+    };
+    var vtable = struct {
+        sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void = Impl.sendVote,
+        sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse = Impl.sendAppend,
+    }{};
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(&vtable));
+
+    // `raft_cluster_size` stays at its default 3: with a transport supplied this
+    // must start (no acknowledgement needed).
+    var cluster = try ClusterBootstrap.init(allocator, std.testing.io, .{
+        .node_id = "byo-transport-node",
+        .port = 19004,
+        .peers = &.{"127.0.0.1:19005"},
+        .transport = transport,
+    });
+    defer cluster.deinit();
+    try cluster.start();
+    try std.testing.expect(cluster.getRaft() != null);
+    try cluster.tick();
 }
 
 test "ClusterBootstrap refuses a multi-node cluster without a real Raft transport" {

@@ -61,11 +61,30 @@ const node = view.pick(order_id) orelse return error.NoHealthyNode;
 `127.0.0.1 + 它自报的端口` 记账（`ClusterMembership.handleGossipEvent`，代码注释里写明了）。所以
 **同主机 / 共享容器网络**的发现可用，**跨主机**要用显式 seed（`connectToSeed` 带真实地址，不受影响）。
 
-**多节点启动 fail-closed**：`ClusterBootstrap` 的 Raft 传输是桩（`sendVoteRequest` 空函数、`sendAppendEntries`
-恒 false），所以 `raft_cluster_size > 1` 时 `start()` 返回 `error.RaftTransportUnavailable` —— 宁可不启动，
-也不选出一个"没人投过票"的 leader。只要 membership + 读侧的进程显式承认：`.allow_stub_raft_transport = true`；
-单节点用 `raft_cluster_size = 1`。真选主需要把 Raft 的请求/应答架到 `NetworkTransport` 上（要什么写在
-`ClusterBootstrap.start()` 第 4 步的注释里）。
+**多节点启动 fail-closed，但可自带传输**：`ClusterBootstrap` 内置的 Raft 传输是桩（`sendVoteRequest` 空函数、
+`sendAppendEntries` 恒 false），所以 `raft_cluster_size > 1` 时 `start()` 返回 `error.RaftTransportUnavailable` ——
+宁可不启动，也不选出一个"没人投过票"的 leader。两条出路：
+
+1. **自带传输**：`BootstrapConfig.transport = <RaftElection.ElectionTransport>`。这是框架给缝、不给实现的地方 ——
+   契约在下一节。
+2. **只要 membership + 读侧**：`.allow_stub_raft_transport = true` 显式承认；单节点用 `raft_cluster_size = 1`。
+
+### 真选主要什么（transport 契约）
+
+框架里已有全部零件，缺的是把它们接起来的那层（本仓未提供）：
+
+| 方向 | 用什么 | 要做的事 |
+|------|--------|---------|
+| 出站 · 投票 | `NetworkTransport.connect(host, port)` → `ClusterConnection.send(payload)` | `sendVoteRequest` 返回 `void`（fire-and-forget）：把 `VoteRequest` 编码后发给每个 peer 即可，**应答走入站** |
+| 出站 · 日志复制 | 同上 | `sendAppendEntries` 是**同步**的：发出去、读回 `AppendEntriesResponse`（同一条连接 `recv`） |
+| 入站 · 分发 | `ClusterServer.start(handler)`（handler 拿到 `ClusterConnection`） | 解码后分别调 `RaftElection.handleVoteRequest` / `handleAppendEntries` / `handleVoteResponse` / `handleInstallSnapshot`，把返回值编码后**在同一连接上回包** |
+| 地址簿 | 你自己 | peer id → `host:port` 的映射（今天 `BootstrapConfig.peers` 是唯一来源；`ClusterMembership` 的 `nodes` 只有 loopback + 端口） |
+| 失败语义 | 你自己 | Raft 能容忍丢包与重发：`AppendEntriesResponse{ .success = false }` 是**正常应答**而不是错误；连接失败按"这条消息丢了"处理即可，别把节点判死（那是 `AccrualFailureDetector` 的活） |
+
+`RaftElection.tick()` 现在**没有任何人调用**（和 `ClusterMembership.runOnce` 一样是外部驱动）——
+自带传输的同时要把它挂进你的循环（例如 `ClusterBootstrap.tick()` 里加一行）。
+
+上面「本仓未提供」已不成立：实现于 `RaftTransport.zig`（`TransportImpl(N)` 出站同步/异步 · `handleConnection` + `InboundServer` 入站分发与同连接回包 · `AddressBook`；投票应答另走「应答走入站」回推，loopback 用例见该文件）。
 
 ## Production Deployment Checklist
 
