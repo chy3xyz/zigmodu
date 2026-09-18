@@ -348,3 +348,85 @@ fn traceFromHeader(id: []const u8) zigmodu.runtime.TraceId {
 
 见 `examples/runtime-workers/`：一条"行情源 → 订单簿 worker → 风控 worker → 快照定时器"的流水线，
 既演示 worker/邮箱/定时器，也演示背压（`error.Full` 时的合并策略）与优雅停机。
+
+## 11. EventRecorder —— 设计草案（未实现）
+
+> 状态：**只有设计，没有代码**。这一节存在的理由是先把契约定下来 —— 录什么、按什么顺序、
+> 存哪里、怎么和 `Clock.manual` 对齐。四问答错任何一个，写出来的东西要么不可重放，
+> 要么在热路径上不可接受。
+
+### 11.1 先说已经有什么（别重造）
+
+| 已有 | 是什么 | 为什么不能直接当 EventRecorder |
+|------|--------|------------------------------|
+| `core/EventStore.zig`（`append` / `readStream` / `replay` / `getVersion`）+ `SnapshotStore` + `EventReplay.replayFromSnapshot` | **领域事件溯源**：按 `stream_id` 记业务事件、版本、快照，可持久 | 它记的是**应用主动 append 的领域事件**，不是运行时的投递流；流/版本/快照那套机制也不适合 1M/s 的 tick |
+| `core/eventbus/WAL.zig`（`WALConfig` / `SyncMode{fsync,segment_sync,none}` / 64MB 分段 / `append`·`readFrom`·`markCommitted`·`cleanup`） | 通用 WAL，**尚未接进 runtime** | 可以做落地层，但 `append` 会分配并返回 `!u64`，不能直接放热路径 |
+| `examples/alpha-engine`（`market/service.zig` 的 `Replay(BookInbox)` + drain marker） | **重放驱动跑通了**：非 worker 的驱动线程按确定序列喂邮箱 | 它读的是内嵌序列，不是录下来的运行流 |
+| `SagaOrchestrator.resumeInstance` / `restoreFromWal` | 记录 + 崩溃续跑在 **Saga 这一层**已成立 | 只覆盖 saga 步骤，不是通用投递流 |
+| `runtime.Sequencer` / `runtime.Clock`（`.monotonic` / `.manual`） | 全局序号 + 可注入时间 | 正是本设计要复用的两块地基 |
+
+**所以缺的不是"记录事件"或"重放"本身，而是**：把运行时**实际投递了什么、按什么顺序、在哪个运行时时刻**录成一份可重放的日志。
+
+### 11.2 缺口的确切形状
+
+`HotBus` 是**有意有损**的 —— `publish` 逐个 sink 调 `deliver`，返回 false（满/关闭）就计一次
+`dropped` 然后**继续**，事件不保留（`hot_bus.zig:118`）。因此：
+
+- 从 `HotBus` **读不回**一次运行；
+- `Handle.send` 的直达投递、`after` 的定时器投递、以及 `MpscRing` 的跨生产者顺序，`HotBus` 都不覆盖。
+
+而 `HotBus` 一旦 `freeze()` 订阅者表就固定，所以"记录"必须在 freeze 前接上。
+
+### 11.3 四个契约问题
+
+**Q1 在哪里取？**
+
+| 取点 | 拿到什么 | 代价 |
+|------|---------|------|
+| `HotBus.publish` 挂一个 sink | 只有 L0 扇出的那一份 | ❌ **不能选**：sink 是竞争者，`max_subscribers` 是 comptime，满时 `deliver` 返回 false → **记录会被丢掉**。而"丢过的记录"比没有记录更危险：你会以为重放是完整的 |
+| `Handle.send` / `sendBlocking` / `sendTraced` + 定时器投递 | **实际进邮箱的每一条**，含直达发送与 `after` | 热路径：每条 send 多一次判断，必须零分配 |
+| `Runtime` 内部、扇出之前 | 同上，且能同时看见 bus 与直达两条来路 | 改动落在 `Runtime`，比改 `Handle` 集中 |
+
+→ 倾向**第三个**，退一步是第二个。
+
+**Q2 顺序怎么定义？** 运行时**没有全局顺序**（每邮箱 FIFO；`MpscRing` 明确不保证跨生产者顺序）。
+所以顺序必须被**定义**：在取点用 `Sequencer.next()` 打一个单调序号，**日志的顺序就是重放的顺序**。
+诚实边界：这是取点处的**某一个**合法交错，不等于某次运行被观察到的那个交错 ——
+重放是确定性的，但不是"时间倒流"。
+
+**Q3 时间。** 每条记录带 `Clock.nowMs()`；重放用 `Clock.manual` 按这些时刻推进，于是定时器按相对次序触发、不 sleep。
+**限制**：这只对**读注入 `Clock` 的代码**成立。runtime 内部全部走 `Clock`，但应用代码若直接调
+`core/Time.zig` 就读到了真实时间 —— 那条路径不参与重放，必须在文档里写明。
+
+**Q4 存哪里？** 三档：
+
+1. **v1：内存有界环**（复用 `RingBuffer`/`MpscRing`）。**溢出是错误而不是静默丢弃** ——
+   与 `HotBus` 相反，这是刻意的：记录器丢一条，重放就不再是那次运行。
+2. 落盘：接 `core/eventbus/WAL.zig`（分段 + `SyncMode`），后台线程刷。
+3. **不**用 `EventStore`：它的流/版本/快照是给领域事件用的，套在 tick 上属于误用。
+
+### 11.4 v1 建议范围
+
+```
+src/runtime/Recorder.zig          // 新文件，opt-in
+  Runtime.enableRecording(cfg)    // 开着才有开销；关着只是一次 ?*Recorder 判断
+  Recorder.record(...)            // 取点调用：零分配，写预分配环
+  Recorder.replay(runtime, clk)   // 按 seq 重放，驱动 Clock.manual
+```
+
+复用：`Sequencer`（顺序）、`Clock`（时间）、`RingBuffer`（存储）、`WAL`（可选落地）。
+
+**明确不做**（否则它会长成一个平行框架）：
+
+- 不做领域事件溯源 —— 那是 `EventStore` 的活；
+- 不做 `HotBus` 的订阅者 —— 见 Q1，会丢；
+- 不承诺"进程级完全确定性"：`spawn`/`init` 的副作用、网络、墙钟、以及**丢弃模式**都不重放。
+  丢不丢是时序的函数；重放的是"投递成功的那部分"。
+
+### 11.5 待定（定完再动手）
+
+1. **取点选哪个**（`Runtime` 内部 / `Handle`）—— 决定改动面，以及能否覆盖定时器投递。
+2. **v1 要不要落盘**：只做内存环（小，够测试与短事故窗口）还是同时接 WAL。
+3. **记录粒度**：存 `(seq, clock_ms, target, kind, len)` + 载荷字节，还是只存载荷哈希
+   （省内存，但重放时得重建载荷 —— 对一个"重放"特性来说通常是错的选择）。
+
