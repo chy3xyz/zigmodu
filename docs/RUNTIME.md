@@ -89,6 +89,8 @@ book.stop();                                       // 请求结束（join 由 sh
 
 - `ctx` 是 `WorkerContext(W, capacity)`，用 `anytype` 接 —— worker 作者不必写出容量参数。
 - `ctx.stopped()`：`stop()` 或运行时关闭。**"没启动 ticker" 不算停止**（自己驱动 `tick()` 是受支持用法）。
+- `ctx.traceId()`：**当前正在处理的这条消息**带的 trace id（`sendTraced` 附上的），没有则 `null`；
+  `init`/`run` 阶段也是 `null`。见 §8.1。
 - 定时器**只投消息**，不在 ticker 线程上跑你的代码：`ctx.handle.after(...)` 是唯一的延迟入口，
   这样 worker 的状态依然单线程独占。
 - `handle`/`run` 返回的错误被记录并计数（`stats().handler_errors`），**不会**停掉 worker；
@@ -276,6 +278,57 @@ metrics.setScrapeHook(@TypeOf(bridge).sample, &bridge);
 
 `MetricsBridge` 对 `MetricsT` 是鸭子类型（只要求 `createGauge` + `Gauge.set`），所以 runtime 层
 不依赖 observability 层。`bridge` 的生命周期要覆盖进程（别放在会返回的栈帧里）。
+
+### 8.1 Worker trace context —— 消息可归属到发起它的那次请求
+
+`messages_dropped` 告诉你"丢了多少"，说不清"**谁的**被丢了"。`sendTraced` 补上这一半：一条消息可以
+带上它来源的 trace id，worker 处理它时能看见，于是 worker 的日志/错误能归到发起请求的那条链上。
+
+```zig
+// 生产侧（HTTP handler、别的 worker、任何线程）—— trace 是 16 字节值类型
+try worker.sendTraced(.{ .user_id = id }, trace);            // 不阻塞，满则 error.Full
+try worker.sendBlockingTraced(msg, trace, 500);              // 等 500ms 腾出槽位
+
+// worker 侧
+pub fn handle(self: *Self, msg: Msg, ctx: anytype) anyerror!void {
+    if (ctx.traceId()) |t| std.log.info("processing user {d} trace={x:016}{x:016}", .{ msg.user_id, t.high, t.low });
+    ...
+}
+```
+
+契约（`src/runtime/runtime.zig` 的测试逐条钉住）：
+
+- **每条消息**，不是每个 worker：trace 跟着邮箱槽位走（信封化），两个生产者并发 `sendTraced` 互不覆盖。
+  这也是它**零分配**的原因 —— 16 字节值类型，热路径上一个字段的拷贝。
+- 普通 `send` / `sendBlocking` 投递的消息 `ctx.traceId()` 为 `null`；`init` / `run` 阶段也是 `null`
+  （那时没有"正在处理的消息"可言）。
+- `Handle.after(delay, msg)` 在 **handler 内**（也就是 worker 自己的线程上）调用时，会把**当前这条消息**的
+  trace 一并投给定时器投递的消息 —— "延迟处理"仍然属于发起它的那次请求。在别的线程上调 `after` 则投递
+  无 trace 的消息（那里没有正在处理的请求，硬编一个反而是假的）。
+- **错误日志带 `trace=`**：`handler error` 与 `stopped by supervisor` 两行都会带上出错那条消息的 trace id
+  （`[runtime] OrderBook trace=<hex> handler error (2 in window): Boom`），可直接 grep 回请求。
+- `Handle.send` / `sendBlocking` 签名没变，`HotBus` / `Mailbox` / `Runtime.spawn` 的契约也没变；
+  trace 是增量的，老代码一行不用改。
+
+**和 HTTP `ctx.traceId()` 接上**：HTTP 侧是字符串（`"{x:016}-{x:016}"`，见 `http.Tracing`），runtime 侧是
+16 字节值 —— 边界上转一次即可：
+
+```zig
+// 路由 handler 里：把 HTTP trace 交给 worker
+const http_trace = ctx.traceId() orelse "";
+try worker.sendTraced(cmd, traceFromHeader(http_trace));
+
+/// `x-trace-id`（两段 16 进制，或上游任意字符串）→ runtime 的 `TraceId`。
+fn traceFromHeader(id: []const u8) zigmodu.runtime.TraceId {
+    var parts = std.mem.splitScalar(u8, id, '-');
+    const high = std.fmt.parseInt(u64, parts.next() orelse "", 16) catch return zigmodu.runtime.TraceId.generate();
+    const low = std.fmt.parseInt(u64, parts.next() orelse "", 16) catch 0;
+    return .{ .high = high, .low = low };
+}
+```
+
+解析失败（上游给的是非 16 进制串）就退回 `TraceId.generate()`：**宁可换一个新 id，也不要让 worker 的日志
+挂上一条张冠李戴的 trace**。OTLP 侧同理 —— span 上的 `trace_id` 就是同一种 `TraceId`（`docs/OBSERVABILITY.md`）。
 
 ## 9. 路线图（本文件随之更新）
 

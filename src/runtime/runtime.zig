@@ -35,7 +35,28 @@
 //! `ctx` is a `WorkerContext(W, capacity)` value — passed as `anytype` so a
 //! worker never has to name the mailbox capacity. It exposes `runtime`, `io`,
 //! `allocator`, `name`, `handle` (the typed handle, for self-sends and timers),
-//! `clock()`, `stopped()` and `schedule()`.
+//! `clock()`, `stopped()` and `traceId()`.
+//!
+//! ## Trace context
+//!
+//! A message can carry the trace id of the work that produced it — the HTTP
+//! request, the upstream service — so a worker's logs and errors are
+//! attributable to that work instead of being orphans in the trace:
+//!
+//! ```zig
+//! try worker.sendTraced(.{ .id = 42 }, trace);   // producer side
+//! // ...
+//! pub fn handle(self: *T, msg: Msg, ctx: anytype) anyerror!void {
+//!     if (ctx.traceId()) |t| { _ = t; }           // the trace of *this* message
+//! }
+//! ```
+//!
+//! The id rides in the mailbox slot — 16 bytes, a value type, no allocation — not
+//! on the handle, so concurrent producers cannot overwrite each other's. It is
+//! null for a plain `send`, and null during `init`/`run` (no message is being
+//! handled then). `handle.after(...)` called from inside a handler carries the
+//! current message's trace along to the timer, so deferred work stays
+//! attributable to whoever scheduled it.
 //!
 //! ## Bounded by construction
 //!
@@ -59,6 +80,15 @@ const clock_mod = @import("clock.zig");
 pub const Clock = clock_mod.Clock;
 pub const Wheel = wheel_mod.Wheel;
 pub const Mailbox = mbox.Mailbox;
+
+/// The id a traced message carries: `{ high: u64, low: u64 }` — a 16-byte value
+/// type with no allocation, which is what lets it ride in a mailbox slot.
+///
+/// Re-exported (it lives in `tracing/DistributedTracer.zig`) so a producer tags a
+/// message as `zigmodu.runtime.TraceId` without reaching into the tracing module,
+/// and so the framework keeps exactly one such shape rather than a parallel
+/// runtime-local one.
+pub const TraceId = @import("../tracing/DistributedTracer.zig").DistributedTracer.TraceId;
 
 /// Deferred work handed to the timer wheel. Type-erased so one wheel serves
 /// workers with different message types; the runtime owns `ctx` (it drops it on
@@ -131,7 +161,18 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
     return struct {
         const Self = @This();
         pub const Message = if (@hasDecl(W, "Message")) W.Message else void;
-        const MailboxType = mbox.Mailbox(Message, capacity);
+
+        /// What actually travels through the mailbox: the message plus the trace
+        /// of the work that produced it. Private on purpose — the runtime is the
+        /// only reader and writer, so wrapping the message costs callers nothing
+        /// and keeps `send`'s signature intact. Nullable, so a producer with no
+        /// trace to offer (a cron tick, a plain `send`) is not forced to invent
+        /// one.
+        const Envelope = struct {
+            trace: ?TraceId = null,
+            message: Message,
+        };
+        const MailboxType = mbox.Mailbox(Envelope, capacity);
 
         /// The worker's own values, moved in at `spawn`.
         state: W,
@@ -150,11 +191,27 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         joined: bool = false,
 
         pub fn send(self: *Self, message: Message) mbox.SendError!void {
-            return self.mailbox.send(message);
+            return self.mailbox.send(.{ .message = message });
         }
 
         pub fn sendBlocking(self: *Self, message: Message, timeout_ms: u32) mbox.SendError!void {
-            return self.mailbox.sendBlocking(message, timeout_ms);
+            return self.mailbox.sendBlocking(.{ .message = message }, timeout_ms);
+        }
+
+        /// `send`, with the trace id of the work that produced the message
+        /// attached. The worker reads it back with `ctx.traceId()` while it
+        /// handles *this* message: the value travels in the mailbox slot, so two
+        /// producers sending different traces cannot overwrite each other's.
+        pub fn sendTraced(self: *Self, message: Message, trace: TraceId) mbox.SendError!void {
+            return self.mailbox.send(.{ .trace = trace, .message = message });
+        }
+
+        /// `sendBlocking`, with a trace attached — for the producer that would
+        /// rather wait for room than drop. Backpressure is exactly when losing
+        /// the trace hurts most: the messages that arrive late are the ones you
+        /// want to attribute.
+        pub fn sendBlockingTraced(self: *Self, message: Message, trace: TraceId, timeout_ms: u32) mbox.SendError!void {
+            return self.mailbox.sendBlocking(.{ .trace = trace, .message = message }, timeout_ms);
         }
 
         /// Ask the worker to finish: its mailbox stops accepting and a blocked
@@ -168,17 +225,25 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
 
         /// Deliver `message` to this worker after `delay_ms`, via the runtime's
         /// timer wheel (one wheel for the whole runtime, O(1) insert).
+        ///
+        /// The delivered message keeps the trace of whatever this worker is
+        /// handling *right now*, so work deferred to the timer stays attributable
+        /// to the request that deferred it. That only has an answer on the
+        /// worker's own thread (see `WorkerContext.inheritTrace`): scheduling from
+        /// anywhere else delivers an untraced message, which is the honest
+        /// reading — no message is being handled there.
         pub fn after(self: *Self, delay_ms: i64, message: Message) !wheel_mod.Wheel(TimerAction).Id {
             const Delivery = struct {
                 handle: *Self,
                 message: Message,
+                trace: ?TraceId,
                 fn post(ctx: *anyopaque) void {
                     const d: *@This() = @ptrCast(@alignCast(ctx));
                     // A timer must not be able to stall the ticker, so a full or
                     // closed mailbox drops the message. Surfaced at debug: under
                     // sustained backpressure this is the line that tells you the
                     // timer fired but its worker never saw it.
-                    d.handle.send(d.message) catch |err| std.log.debug(
+                    d.handle.mailbox.send(.{ .trace = d.trace, .message = d.message }) catch |err| std.log.debug(
                         "[runtime] timer delivery to {s} dropped: {s}",
                         .{ d.handle.context.name, @errorName(err) },
                     );
@@ -189,7 +254,11 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
                 }
             };
             const delivery = try self.runtime.allocator.create(Delivery);
-            delivery.* = .{ .handle = self, .message = message };
+            delivery.* = .{
+                .handle = self,
+                .message = message,
+                .trace = self.context.inheritTrace(),
+            };
             return self.runtime.scheduleAction(delay_ms, .{
                 .ctx = @ptrCast(delivery),
                 .post = Delivery.post,
@@ -239,6 +308,16 @@ pub fn WorkerContext(comptime W: type, comptime capacity: usize) type {
         allocator: std.mem.Allocator,
         name: []const u8,
         handle: *Handle(W, capacity),
+        /// The worker's own thread id, published by that thread before it runs
+        /// anything. Atomic because a caller on another thread may ask "is this
+        /// the worker?" while the worker is still starting; 0 = not started.
+        owner: std.atomic.Value(std.Thread.Id) = std.atomic.Value(std.Thread.Id).init(0),
+        /// Trace of the message being handled *right now*. A plain field on
+        /// purpose: only the worker's own thread writes it, and `inheritTrace`
+        /// is the check that keeps that claim true for readers. `workerMain` sets
+        /// it around each `handle` call; it stays null in `init`/`run`, when
+        /// nothing is being handled.
+        current_trace: ?TraceId = null,
 
         pub fn clock(self: *Self) Clock {
             return self.runtime.clock;
@@ -247,6 +326,28 @@ pub fn WorkerContext(comptime W: type, comptime capacity: usize) type {
         /// True once `stop()` was called or the runtime is shutting down.
         pub fn stopped(self: *Self) bool {
             return self.handle.stop_requested.load(.acquire) or !self.runtime.alive.load(.acquire);
+        }
+
+        /// Trace id of the message this worker is handling — the value its
+        /// producer attached with `sendTraced`/`sendBlockingTraced`. Null for an
+        /// untraced message, and everywhere outside `handle` (`init`, `run`,
+        /// between messages).
+        ///
+        /// This is **per message, not per worker**: two messages carrying two
+        /// different traces are each seen with their own, whatever order the
+        /// producers posted them in.
+        pub fn traceId(self: *const Self) ?TraceId {
+            return self.current_trace;
+        }
+
+        /// What `Handle.after` hands the timer: the current message's trace, but
+        /// only when the scheduling call happens on the worker's own thread.
+        /// Anywhere else it is null — no message is being handled there, and
+        /// letting that caller read `current_trace` would be a cross-thread read
+        /// of a plain field.
+        fn inheritTrace(self: *const Self) ?TraceId {
+            if (self.owner.load(.acquire) != std.Thread.getCurrentId()) return null;
+            return self.current_trace;
         }
 
         // Deferring work is `ctx.handle.after(delay_ms, message)` — the timer
@@ -375,7 +476,7 @@ pub const Runtime = struct {
 
         handle.* = .{
             .state = initial_state,
-            .mailbox = mbox.Mailbox(H.Message, capacity).init(self.io),
+            .mailbox = mbox.Mailbox(H.Envelope, capacity).init(self.io),
             .runtime = self,
             .context = undefined,
             .supervision = supervision,
@@ -601,11 +702,23 @@ fn workerMain(comptime W: type, comptime capacity: usize) fn (*Handle(W, capacit
         fn main(handle: *Handle(W, capacity)) void {
             const H = Handle(W, capacity);
 
+            // Publish this thread's id before anything else runs: `Handle.after`
+            // asks "am I on the worker's own thread?" to decide whether the
+            // current message's trace may be inherited, and that question needs an
+            // answer (0 = not this worker) even while `init` runs.
+            handle.context.owner.store(std.Thread.getCurrentId(), .release);
+
             // Optional init. A failure here is fatal for the worker (there is no
             // half-started state to supervise), but it still counts and stops.
             if (@hasDecl(W, "init")) {
                 W.init(&handle.state, &handle.context) catch |err| {
-                    std.log.err("[runtime] {s}.init failed: {s}", .{ @typeName(W), @errorName(err) });
+                    var tag_buf: [trace_tag_len]u8 = undefined;
+                    // No message is being handled yet, so the tag is always empty
+                    // here — carried anyway so every runtime error line has the
+                    // same shape and the same grep.
+                    std.log.err("[runtime] {s}.init failed{s}: {s}", .{
+                        @typeName(W), traceTag(handle.context.traceId(), &tag_buf), @errorName(err),
+                    });
                     _ = handle.handler_errors.fetchAdd(1, .monotonic);
                     handle.stop();
                 };
@@ -615,11 +728,17 @@ fn workerMain(comptime W: type, comptime capacity: usize) fn (*Handle(W, capacit
                 // Message-driven: the runtime owns the receive loop.
                 while (true) {
                     if (handle.stop_requested.load(.acquire) and handle.mailbox.len() == 0) break;
-                    const message = handle.mailbox.recv(0) orelse {
+                    const envelope = handle.mailbox.recv(0) orelse {
                         if (handle.mailbox.isClosed()) break;
                         continue;
                     };
-                    W.handle(&handle.state, message, &handle.context) catch |err| {
+                    // Per *message*, not per worker: the trace is published for
+                    // exactly as long as this message's `handle` runs, so a handler
+                    // can neither see a previous message's trace nor leak this one
+                    // into whatever it schedules afterwards.
+                    handle.context.current_trace = envelope.trace;
+                    defer handle.context.current_trace = null;
+                    W.handle(&handle.state, envelope.message, &handle.context) catch |err| {
                         if (supervise(H, handle, err)) break;
                     };
                 }
@@ -659,10 +778,17 @@ fn workerMain(comptime W: type, comptime capacity: usize) fn (*Handle(W, capacit
                 handle.errors_in_window > handle.supervision.max_errors;
             const must_stop = decision == .stop or over_budget;
 
+            // The trace of the message whose handler just failed — this is what
+            // turns "worker X errored" into "the work that request Y caused
+            // errored". Read here, before the loop clears `current_trace`.
+            var tag_buf: [trace_tag_len]u8 = undefined;
+            const tag = traceTag(handle.context.traceId(), &tag_buf);
+
             if (must_stop) {
                 handle.stopped_by_supervisor = true;
-                std.log.warn("[runtime] {s} stopped by supervisor after {d} error(s) in window ({s}{s}); last: {s}", .{
+                std.log.warn("[runtime] {s}{s} stopped by supervisor after {d} error(s) in window ({s}{s}); last: {s}", .{
                     @typeName(W),
+                    tag,
                     handle.errors_in_window,
                     @tagName(decision),
                     if (over_budget) ", over budget" else "",
@@ -672,12 +798,25 @@ fn workerMain(comptime W: type, comptime capacity: usize) fn (*Handle(W, capacit
                 return true;
             }
 
-            std.log.warn("[runtime] {s} handler error ({d} in window): {s}", .{
-                @typeName(W), handle.errors_in_window, @errorName(err),
+            std.log.warn("[runtime] {s}{s} handler error ({d} in window): {s}", .{
+                @typeName(W), tag, handle.errors_in_window, @errorName(err),
             });
             return false;
         }
     }.main;
+}
+
+/// Longest `traceTag` output: `" trace="` + two 16-digit hex halves.
+const trace_tag_len = " trace=".len + 32;
+
+/// `" trace=<hex>"` when the worker is handling a traced message, `""` otherwise.
+/// Stack-formatted and allocator-free — this runs on an error path, where an
+/// allocation failure would swallow the very line that says what went wrong.
+/// The hex shape matches `TraceId.toString` (and therefore the OTLP span), just
+/// without the dash the HTTP middleware puts between the two halves.
+fn traceTag(trace: ?TraceId, buf: []u8) []const u8 {
+    const t = trace orelse return "";
+    return std.fmt.bufPrint(buf, " trace={x:016}{x:016}", .{ t.high, t.low }) catch "";
 }
 
 // ─────────────────────────────────────────────────
@@ -848,6 +987,233 @@ test "Runtime: cancelling a timer drops it and its payload" {
     try std.testing.expectEqual(@as(u32, 0), handle.state.seen);
     try std.testing.expectEqual(@as(u64, 0), rt.stats().timer_fires);
     handle.stop();
+}
+
+// ── trace context ────────────────────────────────────────────────────────
+
+/// What a producer tags a message with: derived from the producer's tag, so a
+/// test can tell "the trace my message carried" from "some other producer's".
+fn taggedTrace(tag: u64) TraceId {
+    return .{ .high = tag +% 1, .low = ~tag };
+}
+
+fn traceEquals(a: ?TraceId, b: ?TraceId) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return a.?.high == b.?.high and a.?.low == b.?.low;
+}
+
+/// Records the message it got and the trace its handler saw, so assertions can
+/// run after `join()` instead of racing the worker.
+const TraceProbe = struct {
+    pub const Message = u32;
+    const max_seen = 16;
+
+    traces: [max_seen]?TraceId = @splat(null),
+    messages: [max_seen]u32 = @splat(0),
+    count: usize = 0,
+    /// Set before sending: the next message's handler defers through the timer.
+    defer_next: bool = false,
+    deferred_message: u32 = 0xF00D,
+
+    pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
+        // Read the trace first: it describes *this* message, and `after` below
+        // deliberately inherits it.
+        const trace = ctx.traceId();
+        if (self.defer_next) {
+            self.defer_next = false;
+            _ = try ctx.handle.after(10, self.deferred_message);
+        }
+        // Record last, so a test that sees the message also knows the handler ran
+        // to completion (and, with `defer_next`, that the timer is really armed —
+        // the wheel is not thread-safe, so the observer must not walk it while
+        // this thread might still be scheduling).
+        if (self.count < max_seen) {
+            self.traces[self.count] = trace;
+            self.messages[self.count] = msg;
+            self.count += 1;
+        }
+    }
+};
+
+/// One producer thread of the cross-thread test: every message it posts carries
+/// *its* trace.
+const TraceProducer = struct {
+    fn run(handle: anytype, tag: u64, count: u32) void {
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            const msg = (tag << 32) | @as(u64, i);
+            // Blocking, not dropping: the point of the test is which trace each
+            // *delivered* message carries, so a retry loop would only add noise.
+            handle.sendBlockingTraced(msg, taggedTrace(tag), 0) catch return;
+            std.atomic.spinLoopHint();
+        }
+    }
+};
+
+/// Two producers, one worker. A trace kept on the handle instead of in the
+/// mailbox slot would be clobbered by the other producer's next send — this is
+/// the test that fails if someone "simplifies" the envelope away.
+const CrossThreadProbe = struct {
+    pub const Message = u64;
+
+    seen: u32 = 0,
+    mismatches: u32 = 0,
+
+    pub fn handle(self: *@This(), msg: u64, ctx: anytype) anyerror!void {
+        const tag = msg >> 32;
+        const want = taggedTrace(tag);
+        if (ctx.traceId()) |got| {
+            if (got.high != want.high or got.low != want.low) self.mismatches += 1;
+        } else {
+            self.mismatches += 1;
+        }
+        self.seen += 1;
+    }
+};
+
+test "Runtime: sendTraced tags the message, send leaves it untraced" {
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .{ .manual = &clk });
+    defer rt.deinit();
+
+    const handle = try rt.spawn(TraceProbe, .{}, 16);
+    const tag = taggedTrace(7);
+    try handle.sendTraced(1, tag);
+    try handle.send(2);
+    try handle.sendBlockingTraced(3, tag, 1_000);
+    handle.stop();
+    handle.join(); // the mailbox drains before it reports closed
+
+    try std.testing.expectEqual(@as(usize, 3), handle.state.count);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, handle.state.messages[0..3]);
+    try std.testing.expect(traceEquals(tag, handle.state.traces[0]));
+    try std.testing.expect(handle.state.traces[1] == null);
+    try std.testing.expect(traceEquals(tag, handle.state.traces[2]));
+}
+
+test "Runtime: interleaved traced and untraced messages each keep their own trace" {
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .{ .manual = &clk });
+    defer rt.deinit();
+
+    const first = taggedTrace(1);
+    const second = taggedTrace(2);
+    const handle = try rt.spawn(TraceProbe, .{}, 16);
+    try handle.send(10);
+    try handle.sendTraced(11, first);
+    try handle.send(12);
+    try handle.sendTraced(13, second);
+    try handle.send(14);
+    handle.stop();
+    handle.join();
+
+    try std.testing.expectEqual(@as(usize, 5), handle.state.count);
+    try std.testing.expectEqualSlices(u32, &.{ 10, 11, 12, 13, 14 }, handle.state.messages[0..5]);
+    try std.testing.expect(handle.state.traces[0] == null);
+    try std.testing.expect(traceEquals(first, handle.state.traces[1]));
+    try std.testing.expect(handle.state.traces[2] == null);
+    try std.testing.expect(traceEquals(second, handle.state.traces[3]));
+    try std.testing.expect(handle.state.traces[4] == null);
+}
+
+test "Runtime: a producer's trace stays on its own messages across threads" {
+    const per_producer: u32 = 1_000;
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .{ .manual = &clk });
+    defer rt.deinit();
+
+    // Room for both producers to be in flight at once, so the two traces really
+    // do overlap in time. 256 (not more): `MpscRing.init` seeds every slot at
+    // comptime, and a bigger capacity trips the comptime branch quota.
+    const handle = try rt.spawn(CrossThreadProbe, .{}, 256);
+    const a = try std.Thread.spawn(.{}, TraceProducer.run, .{ handle, @as(u64, 0), per_producer });
+    const b = try std.Thread.spawn(.{}, TraceProducer.run, .{ handle, @as(u64, 1), per_producer });
+    a.join();
+    b.join();
+    handle.stop();
+    handle.join();
+
+    try std.testing.expectEqual(@as(u32, 2 * per_producer), handle.state.seen);
+    try std.testing.expectEqual(@as(u32, 0), handle.state.mismatches);
+}
+
+test "Runtime: a timer scheduled inside a handler keeps that message's trace" {
+    var clk = Clock.Manual{ .now_ms = 1_000 };
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .{ .manual = &clk });
+    defer rt.deinit();
+
+    const tag = taggedTrace(9);
+    const handle = try rt.spawn(TraceProbe, .{ .defer_next = true }, 8);
+    try handle.sendTraced(7, tag);
+
+    var spins: usize = 0;
+    while (handle.state.count == 0 and spins < 8_000_000) : (spins += 1) std.atomic.spinLoopHint();
+    try std.testing.expectEqual(@as(usize, 1), handle.state.count); // handled, timer armed
+    try std.testing.expectEqual(@as(usize, 1), rt.wheel.pendingCount());
+
+    clk.advance(10);
+    _ = rt.tick(); // the timer posts into the same mailbox
+    spins = 0;
+    while (handle.state.count < 2 and spins < 8_000_000) : (spins += 1) std.atomic.spinLoopHint();
+    handle.stop();
+    handle.join();
+
+    try std.testing.expectEqual(@as(usize, 2), handle.state.count);
+    try std.testing.expectEqual(@as(u32, 7), handle.state.messages[0]);
+    try std.testing.expect(traceEquals(tag, handle.state.traces[0]));
+    try std.testing.expectEqual(handle.state.deferred_message, handle.state.messages[1]);
+    // The deferred message was not sent by anyone — it inherited the trace of the
+    // message whose handler armed the timer.
+    try std.testing.expect(traceEquals(tag, handle.state.traces[1]));
+}
+
+test "Runtime: trace context exists only inside a message's handler" {
+    const PhaseProbe = struct {
+        pub const Message = u32;
+        init_had_trace: bool = false,
+        untraced_had_trace: bool = false,
+        traced_had_trace: bool = false,
+
+        pub fn init(self: *@This(), ctx: anytype) anyerror!void {
+            self.init_had_trace = ctx.traceId() != null;
+        }
+
+        pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
+            if (msg == 1) {
+                self.untraced_had_trace = ctx.traceId() != null;
+            } else {
+                self.traced_had_trace = ctx.traceId() != null;
+            }
+        }
+    };
+
+    const LoopProbe = struct {
+        saw_trace: bool = false,
+
+        pub fn run(self: *@This(), ctx: anytype) anyerror!void {
+            self.saw_trace = ctx.traceId() != null;
+        }
+    };
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .{ .manual = &clk });
+    defer rt.deinit();
+
+    const handle = try rt.spawn(PhaseProbe, .{}, 8);
+    try handle.send(1); // untraced
+    try handle.sendTraced(2, taggedTrace(3));
+    handle.stop();
+    handle.join();
+
+    try std.testing.expect(!handle.state.init_had_trace); // `init`: no message yet
+    try std.testing.expect(!handle.state.untraced_had_trace);
+    try std.testing.expect(handle.state.traced_had_trace);
+
+    // A run-owned worker has no message at all, so there is nothing to attribute.
+    const loop = try rt.spawn(LoopProbe, .{}, 4);
+    loop.join(); // `run` returns immediately
+    try std.testing.expect(!loop.state.saw_trace);
+    loop.stop();
 }
 
 test "Runtime: shutdown joins every worker and reports stats" {

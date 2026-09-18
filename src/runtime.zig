@@ -50,6 +50,8 @@ pub const Sequencer = sequencer.Sequencer;
 pub const HotBus = hot_bus.HotBus;
 /// Worker failure policy (`restart` / `stop` + windowed error budget).
 pub const Supervision = runtime_impl.Supervision;
+/// Trace id a worker message can carry (`sendTraced` → `ctx.traceId()`).
+pub const TraceId = runtime_impl.TraceId;
 
 /// The runtime itself, plus the worker contract.
 pub const Runtime = runtime_impl.Runtime;

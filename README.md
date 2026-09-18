@@ -134,6 +134,10 @@ Opt-in via `app.runtime()` — see [docs/RUNTIME.md](docs/RUNTIME.md) and the
   inside a window, plus an `onError` hook to decide on the spot
 - **Runtime metrics** — `RuntimeStats` + `MetricsBridge`, which publishes
   `zigmodu_runtime_*` gauges; drops and timer lag are invisible from the HTTP side
+- **Worker trace context** — `sendTraced` / `sendBlockingTraced` carry a 16-byte
+  `TraceId` **in the mailbox slot** (no allocation, no shared producer state); the
+  handler reads it back with `ctx.traceId()`, `after` hands it to the timer, and
+  runtime error logs tag the offending message's trace
 
 ### Developer Experience
 - **Architecture Tester** — Compile-time dependency rule validation

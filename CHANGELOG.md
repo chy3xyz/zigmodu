@@ -2,6 +2,52 @@
 
 ## [Unreleased]
 
+### 新增：Runtime worker trace context —— 消息可归属到发起它的请求（**破坏性：否**）
+
+外部 review 的 v0.28 提案里，「Tracing — Worker trace context」是核对后仅剩的 3 个真实缺口之一。
+在此之前运行时代码里没有任何追踪概念 —— 对 `HEAD` 逐文件核对，每个文件都是 0：
+
+```text
+$ for f in src/runtime/*.zig; do git show HEAD:$f | grep -cE "TraceId|trace_id|traceId|tracing"; done
+0
+0
+0
+0
+0
+0
+0
+0
+```
+
+（`timer_wheel.zig` 里出现过 `span`，那是时间轮的几何宽度，不是 trace span。）
+
+HTTP 层有 `trace_id`（`http.Tracing`）、有 OTLP 导出，但请求触发的 worker 消息在追踪里是**孤儿**：
+worker 报错只说得出"谁出错了"，说不出"哪一次请求造成的"。
+
+**改动（集中在 `src/runtime/runtime.zig`）**
+
+- 邮箱元素从裸 `Message` 换成文件内私有信封 `struct { trace: ?TraceId = null, message: Message }`。
+  `TraceId` 从 `tracing/DistributedTracer.zig` **原样** re-export（`zigmodu.runtime.TraceId`，16 字节
+  值类型），不另造平行结构。**零分配**：trace 跟着邮箱槽位走，不给 `Mailbox` / `RingBuffer` /
+  `HotBus` / `send` 加 allocator 形参 —— 热路径上只是一个字段的拷贝。
+- `Handle.send` / `sendBlocking` **签名不变**（内部发 `trace = null`）；新增
+  `sendTraced(msg, trace)` 与 `sendBlockingTraced(msg, trace, timeout_ms)`。
+- `WorkerContext.traceId()` 返回**当前正在处理的那条消息**的 trace —— 每条消息一份，不是每个 worker
+  一份，生产者线程设的值不会串到别的消息上；`init` / `run` 阶段为 `null`。
+- `Handle.after(...)` 在 handler 内（worker 自己的线程）调用时带上当前消息的 trace，定时器投递的消息
+  保留归属；在别的线程上调则投无 trace 的消息（那里没有正在处理的请求，硬编一个反而是假的）。
+- `supervise` 的两行错误日志与 `init` 失败那行带上 `trace=<hex>`，可直接 grep 回请求。
+- `HotBus` / `Mailbox` / `Runtime.spawn` 的公开契约未动（`HotBus` 只做 `@hasField(H, "mailbox")`
+  探测 + `h.send`，`send` 签名不变即无需改动）。
+
+**测试 5 条**（`runtime.zig`）：`sendTraced` 与 `send` 的区别、traced/untraced 交替时各自的归属与顺序、
+跨线程双生产者 2000 条零错配、`after` 保留调度时的 trace、`init`/`run` 阶段为 `null`。
+跨线程那条是**反证**：把 trace 临时改存到 handle 上（而不是信封里）再跑同一份测试，
+2000 条里 **802 条**归属错乱 —— 信封化不是形式主义，它买的就是这个。
+
+**文档**：`docs/RUNTIME.md` §8.1（用法、逐条契约、错误日志、与 HTTP `ctx.traceId()` 的接法）、
+§3 契约要点、README「High-Performance Runtime」清单（英文）。
+
 ### 修复：v0.27.0 的提交过不了自己的 `check-version.sh`
 
 **背景**：`tools/zmodu/src/incremental.zig` 的两个测试把 `saveManifest(…, zmodu_version)`
