@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.27.0] - 2026-09-18
 
 ### 修复：`zmodu scaffold` 生成的工程过不了自己的 `zmodu ci`
 
