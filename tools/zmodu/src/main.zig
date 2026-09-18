@@ -238,12 +238,23 @@ const zigmodu_zon_url = "https://github.com/chy3xyz/zigmodu/archive/refs/tags/v"
 const zigmodu_zon_hash = "zigmodu-0.25.0-U40vs7slTgD9e8TBtXse157iLNYVdE5aGU_Rl8AZbUBP";
 
 comptime {
-    // A version bump that forgot the hash would otherwise ship a scaffold that
-    // cannot fetch the framework (Zig would reject the stale hash).
-    const prefix = "zigmodu-" ++ ZMODU_VERSION ++ "-";
-    if (!std.mem.startsWith(u8, zigmodu_zon_hash, prefix)) {
-        @compileError("zigmodu_zon_hash must be for " ++ prefix ++
-            " — regenerate it with `zig build --fetch` (see comment above)");
+    // The pinned hash can only be computed **after** the tag for its version
+    // exists (Zig hashes the tarball, the tarball comes from the tag). So right
+    // after a version bump this constant still points at the previous release —
+    // that is expected, not an error: a hard version check here blocks the
+    // release itself (it blocked the release cut that introduced it). What is never acceptable is a
+    // placeholder; the version lag is reported by `scripts/check-version.sh` as a
+    // WARN, with the exact refresh command.
+    const dash = std.mem.lastIndexOfScalar(u8, zigmodu_zon_hash, '-') orelse
+        @compileError("zigmodu_zon_hash must look like `zigmodu-<version>-<payload>`");
+    const payload = zigmodu_zon_hash[dash + 1 ..];
+    var distinct = false;
+    for (payload) |c| {
+        if (c != payload[0]) distinct = true;
+    }
+    if (payload.len < 16 or !distinct) {
+        @compileError("zigmodu_zon_hash is a placeholder — run `zig build --fetch` in a project using " ++
+            "`zigmodu_zon_url` and paste the `expected .hash = ...` value it prints");
     }
 }
 

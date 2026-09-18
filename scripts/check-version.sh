@@ -50,7 +50,7 @@ while IFS= read -r hit; do
       fail=1
     fi
   done
-done <<<"$(tools_grep "$pin_re")"
+done <<<"$(tools_grep "$pin_re" | grep -v 'zigmodu_zon_hash')"
 
 # 2. Any other 0.x.y literal must be deliberate (see allowed_version).
 allowed_version() {
@@ -94,6 +94,13 @@ else
   if [[ -z "$(printf '%s' "$payload_body" | tr -d "${payload_body%"${payload_body#?}"}")" ]]; then
     echo "check-version: $TOOLS/zmodu/src/main.zig: zigmodu_zon_hash is a placeholder" >&2
     fail=1
+  fi
+  # The hash can only be regenerated once the tag exists, so a lagging version is
+  # a WARN, not a failure (see the comment above the comptime check in main.zig).
+  hash_ver="$(sed -n 's/^const zigmodu_zon_hash = "zigmodu-\([0-9][0-9.]*\)-.*";$/\1/p' "$TOOLS/zmodu/src/main.zig" | head -1)"
+  if [[ -n "$hash_ver" && "$hash_ver" != "$VERSION" ]]; then
+    echo "check-version: WARN: scaffold pins zigmodu-$hash_ver; after tag v$VERSION is pushed, regenerate it:" >&2
+    echo "check-version: WARN:   cd tools/zmodu && zig build --fetch   (paste the 'expected .hash' value)" >&2
   fi
 fi
 
