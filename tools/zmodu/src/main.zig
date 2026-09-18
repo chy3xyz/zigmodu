@@ -235,7 +235,7 @@ const zigmodu_zon_url = "https://github.com/chy3xyz/zigmodu/archive/refs/tags/v"
 /// release-specific and must be refreshed together with `build.zig.zon`.
 /// Get it from `zig build --fetch` in a project using `zigmodu_zon_url`: the
 /// "expected .hash = ..." hint is printed verbatim.
-const zigmodu_zon_hash = "zigmodu-0.25.0-U40vs7slTgD9e8TBtXse157iLNYVdE5aGU_Rl8AZbUBP";
+const zigmodu_zon_hash = "zigmodu-0.26.0-U40vs6AhTwAVWt-e_i_FWi2M0zEa4AuEC3fVPonQt1-Q";
 
 comptime {
     // The pinned hash can only be computed **after** the tag for its version
@@ -245,9 +245,15 @@ comptime {
     // release itself (it blocked the release cut that introduced it). What is never acceptable is a
     // placeholder; the version lag is reported by `scripts/check-version.sh` as a
     // WARN, with the exact refresh command.
-    const dash = std.mem.lastIndexOfScalar(u8, zigmodu_zon_hash, '-') orelse
+    // Shape: `zigmodu-<version>-<payload>`. Split after the **second** dash —
+    // the payload itself may contain dashes (Zig's hash alphabet uses them, e.g.
+    // `…U40vs6AhTwAVWt-e_i_FWi2M0zEa4AuEC3fVPonQt1-Q`), so `lastIndexOfScalar`
+    // would cut it down to its tail and misreport a real hash as a placeholder.
+    const first = std.mem.indexOfScalar(u8, zigmodu_zon_hash, '-') orelse
         @compileError("zigmodu_zon_hash must look like `zigmodu-<version>-<payload>`");
-    const payload = zigmodu_zon_hash[dash + 1 ..];
+    const second = std.mem.indexOfScalarPos(u8, zigmodu_zon_hash, first + 1, '-') orelse
+        @compileError("zigmodu_zon_hash must look like `zigmodu-<version>-<payload>`");
+    const payload = zigmodu_zon_hash[second + 1 ..];
     var distinct = false;
     for (payload) |c| {
         if (c != payload[0]) distinct = true;
