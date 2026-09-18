@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.26.0] - 2026-09-18
 
 > **⚠️ 行为变更**：`Tool.action` 默认值收紧的后果（内置技能已声明类别）、`Server.fromEnv` 签名变更、
 > `MessageQueue` 的部分后端 `publish` 由"静默丢弃"改为返回错误、`zmodu verify` 对无表模块放宽、
