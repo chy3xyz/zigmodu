@@ -160,9 +160,18 @@ ZIG
 
 compile() {
   # Prints combined stdout+stderr; returns the compiler's exit code.
+  #
+  # `-lc` is required on Linux, not on macOS: the `std` code reachable behind
+  # the plain fixture's `Repository.insert/update/delete/findPage/…` pulls a
+  # `std.c` extern declaration, and Zig refuses that without an explicit libc
+  # dependency — ubuntu-latest failed the plain fixture with
+  #   error: dependency on libc must be explicitly specified in the build command
+  # while the same fixture passed on macOS. Nothing is linked here
+  # (`-fno-emit-bin` emits no binary, so undefined driver symbols never matter);
+  # the flag only satisfies that analysis.
   local out code
   set +e
-  out="$("$ZIG" build-obj -fno-emit-bin "$1" 2>&1)"
+  out="$("$ZIG" build-obj -fno-emit-bin -lc "$1" 2>&1)"
   code=$?
   set -e
   printf '%s\n' "$out"

@@ -23,6 +23,23 @@
   （设计如此）。验证不看 hash 像不像，而是**真编译**一个钉住该 URL+hash 的生成工程，
   `zig build` exit 0 才算数。
 
+### 修复：`check-tenant-scope.sh` 在 Linux 上必红（本次把它接进 CI 时暴露）
+
+`ci.yml` 新增的 "Tenant-scope compile gate" 在 ubuntu-latest 上失败，`plain` fixture 报：
+
+```
+error: dependency on libc must be explicitly specified in the build command
+    extern "c" fn clock_gettime(...)
+referenced by: clock_gettime -> monotonicNow: src/core/Time.zig:46
+```
+
+`plain` fixture 可达的代码在 Linux 上经 **`src/core/Time.zig` 的 `monotonicNow`** 走到
+`std.c.clock_gettime`，Zig 要求显式声明 libc 依赖；macOS 不走这条路径，所以本地一直是绿的。
+`compile()` 加 `-lc` —— `-fno-emit-bin` 不产生二进制，该标志只满足这次分析。
+
+**验证方式**：不靠"推上去看 CI"，而是本地用 `-target x86_64-linux-gnu` 跑同一份分析：
+去掉 `-lc` 精确复现了 CI 的报错与调用链，加上 `-lc` 后 3/3 通过。
+
 ## [0.27.0] - 2026-09-18
 
 ### 修复：`zmodu scaffold` 生成的工程过不了自己的 `zmodu ci`
