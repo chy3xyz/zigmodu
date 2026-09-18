@@ -103,7 +103,6 @@ test "compile all source files" {
     _ = @import("metrics/PrometheusMetrics.zig");
 
     // Persistence
-    _ = @import("persistence/Database.zig");
     _ = @import("persistence/Orm.zig");
     _ = @import("persistence/backends/SqlxBackend.zig");
 
@@ -382,7 +381,7 @@ test "ai barrel exposes the public AI API surface" {
 test "domain modules stay independent of the optional src/ai domain" {
     const allocator = std.testing.allocator;
     // src/ai is an optional domain (~12k lines, used by the ai-ops /
-    // llm-policies / mcp-server / tenant-ai examples). Because Zig analyses
+    // llm-policies / mcp-server examples). Because Zig analyses
     // lazily, a consumer that never touches `zmodu.ai` never compiles it —
     // but only as long as the canonical domain files keep their distance.
     const domains = [_][]const u8{

@@ -230,7 +230,9 @@ pub const RedisCooldownStore = struct {
         if (self.mirror_cooling.getPtr(key)) |until| {
             until.* = self.now_fn() + ttl_ms;
         } else {
-            _ = self.mirror_cooling.put(self.allocator, self.allocator.dupe(u8, key) catch return, self.now_fn() + ttl_ms) catch {};
+            _ = self.mirror_cooling.put(self.allocator, self.allocator.dupe(u8, key) catch return, self.now_fn() + ttl_ms) catch |err| {
+                std.log.debug("[RedisCooldownStore] mirror cool insert failed ({s})", .{@errorName(err)});
+            };
         }
         self.mutex.unlock(self.io);
 
@@ -249,14 +251,18 @@ pub const RedisCooldownStore = struct {
         if (self.mirror_failures.getPtr(key)) |c| {
             c.* = count;
         } else {
-            _ = self.mirror_failures.put(self.allocator, self.allocator.dupe(u8, key) catch return count, count) catch {};
+            _ = self.mirror_failures.put(self.allocator, self.allocator.dupe(u8, key) catch return count, count) catch |err| {
+                std.log.debug("[RedisCooldownStore] mirror failure insert failed ({s})", .{@errorName(err)});
+            };
         }
         self.mutex.unlock(self.io);
 
         var kbuf: [128]u8 = undefined;
         const fkey = failKey(&kbuf, key);
         if (self.redis.incr(fkey)) |n| {
-            self.redis.expire(fkey, 3600) catch {};
+            self.redis.expire(fkey, 3600) catch |err| {
+                std.log.debug("[RedisCooldownStore] expire of failure key failed ({s})", .{@errorName(err)});
+            };
             return @intCast(@max(n, 0));
         } else |err| {
             std.log.warn("[RedisCooldownStore] incr failed ({}), using local count {d} for '{s}'", .{ err, count, key });

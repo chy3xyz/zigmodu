@@ -473,6 +473,77 @@ pub const Runtime = struct {
         };
     }
 
+    /// Publishes `RuntimeStats` into a metrics registry, sampled once per scrape.
+    /// Wire it once at startup:
+    ///
+    /// ```zig
+    /// var bridge = try Runtime.MetricsBridge(PrometheusMetrics).init(rt, metrics);
+    /// metrics.setScrapeHook(@TypeOf(bridge).sample, &bridge);
+    /// ```
+    ///
+    /// The runtime is the one place where "is it healthy" cannot be read off an
+    /// HTTP histogram: a flooded mailbox, dropped messages, worker handler
+    /// errors and a starved ticker are all invisible from the request side —
+    /// `timer_lag_ms` in particular is the signal `docs/RUNTIME.md` §8 calls out
+    /// as more telling than any timer count. Everything here is **sampled**
+    /// rather than accumulated, so the values are gauges and carry no `_total`
+    /// suffix (`PrometheusMetrics.Counter` has no `set`, only `inc`/`add`).
+    ///
+    /// `MetricsT` is duck-typed (`createGauge` + `Gauge.set`) so this layer keeps
+    /// no dependency on the observability layer; the bridge outlives the
+    /// process, so keep it in a stable location (not a stack frame you return
+    /// from).
+    pub fn MetricsBridge(comptime MetricsT: type) type {
+        return struct {
+            const Bridge = @This();
+
+            rt: *Runtime,
+            workers: *MetricsT.Gauge,
+            running: *MetricsT.Gauge,
+            messages_sent: *MetricsT.Gauge,
+            messages_received: *MetricsT.Gauge,
+            messages_dropped: *MetricsT.Gauge,
+            handler_errors: *MetricsT.Gauge,
+            timer_fires: *MetricsT.Gauge,
+            timer_lag_ms: *MetricsT.Gauge,
+
+            /// Registers the gauges. Startup-time call: if a later `createGauge`
+            /// fails, the earlier ones stay registered in `metrics`.
+            pub fn init(rt: *Runtime, metrics: *MetricsT) !Bridge {
+                return .{
+                    .rt = rt,
+                    .workers = try metrics.createGauge("zigmodu_runtime_workers", "Worker slots registered in this runtime"),
+                    .running = try metrics.createGauge("zigmodu_runtime_running", "Workers currently running"),
+                    .messages_sent = try metrics.createGauge("zigmodu_runtime_messages_sent", "Messages posted into worker mailboxes"),
+                    .messages_received = try metrics.createGauge("zigmodu_runtime_messages_received", "Messages a worker pulled out of its mailbox"),
+                    .messages_dropped = try metrics.createGauge("zigmodu_runtime_messages_dropped", "Messages rejected by a full mailbox (backpressure, not silent loss)"),
+                    .handler_errors = try metrics.createGauge("zigmodu_runtime_handler_errors", "Worker handler errors observed"),
+                    .timer_fires = try metrics.createGauge("zigmodu_runtime_timer_fires", "Timers fired"),
+                    .timer_lag_ms = try metrics.createGauge("zigmodu_runtime_timer_lag_ms", "Worst lateness between a timer deadline and its firing, in milliseconds"),
+                };
+            }
+
+            /// Matches `PrometheusMetrics.ScrapeHook`; `ud` must point at a live
+            /// `Bridge`.
+            pub fn sample(ud: ?*anyopaque) void {
+                const self: *Bridge = @ptrCast(@alignCast(ud orelse return));
+                self.publish();
+            }
+
+            pub fn publish(self: *Bridge) void {
+                const s = self.rt.stats();
+                self.workers.set(@floatFromInt(s.workers));
+                self.running.set(@floatFromInt(s.running));
+                self.messages_sent.set(@floatFromInt(s.messages_sent));
+                self.messages_received.set(@floatFromInt(s.messages_received));
+                self.messages_dropped.set(@floatFromInt(s.messages_dropped));
+                self.handler_errors.set(@floatFromInt(s.handler_errors));
+                self.timer_fires.set(@floatFromInt(s.timer_fires));
+                self.timer_lag_ms.set(@floatFromInt(s.timer_lag_max_ms));
+            }
+        };
+    }
+
     // ── internals ────────────────────────────────────────────────────────
 
     fn onTimerCancel(self: *Runtime, id: u64, action: TimerAction) void {
@@ -943,4 +1014,73 @@ test "Actor: an onError hook overrides the configured strategy" {
     try std.testing.expect(!h2.mailbox.isClosed());
     try std.testing.expect(!h2.stats().stopped_by_supervisor);
     h2.stop();
+}
+
+test "Runtime.MetricsBridge publishes RuntimeStats into a Prometheus scrape" {
+    const PrometheusMetrics = @import("../metrics/PrometheusMetrics.zig").PrometheusMetrics;
+    const allocator = std.testing.allocator;
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(allocator, std.testing.io, .{ .manual = &clk });
+    defer rt.deinit();
+
+    const counter_handle = try rt.spawn(CounterWorker, .{}, 64);
+    try counter_handle.send(1);
+    try counter_handle.send(2);
+    counter_handle.stop();
+    counter_handle.join();
+
+    var metrics = PrometheusMetrics.init(allocator);
+    defer metrics.deinit();
+
+    // Startup wiring: register the gauges once, then let the scrape hook sample
+    // them. Nothing else in the framework watches the runtime's own health.
+    var bridge = try Runtime.MetricsBridge(PrometheusMetrics).init(&rt, &metrics);
+    metrics.setScrapeHook(@TypeOf(bridge).sample, &bridge);
+
+    const text = try metrics.toPrometheusFormat(allocator);
+    defer allocator.free(text);
+
+    // Values are compared against `rt.stats()` rather than hardcoded: the point
+    // is that the scrape reports what the runtime reports, not a fixed number.
+    const s = rt.stats();
+    const check = struct {
+        fn gauge(body: []const u8, name: []const u8, value: f64) !void {
+            var buf: [128]u8 = undefined;
+            const line = try std.fmt.bufPrint(&buf, "{s} {d:.6}", .{ name, value });
+            try std.testing.expect(std.mem.indexOf(u8, body, line) != null);
+        }
+    }.gauge;
+
+    try std.testing.expect(s.workers == 1);
+    try check(text, "zigmodu_runtime_workers", @floatFromInt(s.workers));
+    try check(text, "zigmodu_runtime_running", @floatFromInt(s.running));
+    try check(text, "zigmodu_runtime_messages_sent", @floatFromInt(s.messages_sent));
+    try check(text, "zigmodu_runtime_messages_received", @floatFromInt(s.messages_received));
+    try check(text, "zigmodu_runtime_messages_dropped", @floatFromInt(s.messages_dropped));
+    try check(text, "zigmodu_runtime_handler_errors", @floatFromInt(s.handler_errors));
+    try check(text, "zigmodu_runtime_timer_fires", @floatFromInt(s.timer_fires));
+    try check(text, "zigmodu_runtime_timer_lag_ms", @floatFromInt(s.timer_lag_max_ms));
+
+    // The dropped/backpressure signal is the reason this bridge exists — make
+    // sure a full mailbox actually moves it rather than staying at zero.
+    const SlowWorker = struct {
+        pub const Message = u32;
+        pub fn handle(_: *@This(), _: u32, _: anytype) anyerror!void {
+            var spins: usize = 0;
+            while (spins < 500_000) : (spins += 1) std.atomic.spinLoopHint();
+        }
+    };
+    const full = try rt.spawn(SlowWorker, .{}, 2);
+    defer full.stop();
+    for (0..1000) |i| {
+        full.send(@intCast(i)) catch break; // capacity 2 → the producer sees error.Full
+    }
+    const after = rt.stats();
+    try std.testing.expect(after.messages_dropped > 0);
+
+    bridge.publish(); // sampling is callable directly, not only from a scrape
+    const retext = try metrics.toPrometheusFormat(allocator);
+    defer allocator.free(retext);
+    try check(retext, "zigmodu_runtime_messages_dropped", @floatFromInt(after.messages_dropped));
 }

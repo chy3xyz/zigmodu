@@ -2,13 +2,379 @@
 
 ## [Unreleased]
 
-### Zig 工具链升级
+### 修复：`zmodu scaffold` 生成的工程过不了自己的 `zmodu ci`
+
+追一条"grep 干净度"的尾巴时撞出来的真缺陷：**生成器产出的代码违反框架自己的审计规则**。
+
+复现（修复前，v0.26.0 的 CLI）：
+
+```
+$ zmodu scaffold --sql schema.sql --name app --out ./app --with-agent --with-websocket
+$ zmodu audit ./app
+architecture: 0 violation(s), business: 3 violation(s)
+  [b10] src/modules/im/service.zig:29  empty catch block swallows errors
+  [b4]  src/modules/im/gateway.zig:90  @ptrCast on ctx.user_data
+  [b4]  src/modules/im/api.zig:39      @ptrCast on ctx.user_data
+summary: FAIL — 3 new violation(s)          # exit 1 → `zmodu ci` 开箱即红
+```
+
+三个根因，各自独立：
+
+**1. 模板把 `catch {}` 写进生成物（b10）** — `generateAgentModule` 2 处、`generateImModule` 1 处。
+改为带日志的 best-effort 忽略（`std.log.warn` + `@errorName`），审计与真实错误处理都正确。
+
+**2. b4 对"取路由 State"误报** — 被点名的那两处是 WS `on_connect` 回调里的
+`@ptrCast(@alignCast(ctx.user_data orelse return null))`，目标是 `*ImApi` / `*ImGateway`，
+**正是 `user_data` 该有的用法**。误报的根源是 b4 写于 `auth_info` 与 `user_data` 分离之前
+（`Server.zig` 现在注释明说二者已拆开），于是把合法的 State 取值也当成了 AuthInfo 反模式。
+
+**新增 `Context.state(T)`**（`src/api/Server.zig`）作为 State 的正规入口：
+
+```zig
+// 之前：每个调用点手写 cast，且 `orelse unreachable` 在 ReleaseFast 是 UB
+const self: *ImApi = @ptrCast(@alignCast(ctx.user_data orelse return null));
+// 之后：cast 收在一处，缺 state 是具名错误
+const self: *ImApi = ctx.state(ImApi) catch return null;
+```
+
+b4 的报错文案同步改为指向它（`use ctx.state(T) for the route state`）——规则命中后有了明确去处，
+而不是只留一句"读 attrs"。**活代码里 3 个模板站点**全部改用 `ctx.state(T)`：im `api.zig` 的
+WS `wsConnect`、im `gateway.zig` 的 `onConnect`、以及 agent/im `service.zig` 的 3 处
+`catch {}` 改成带日志的 best-effort 忽略（见下条）。`main.zig` 里另有一处
+legacy `RouteGroup` 扩展模板的 `resolve2` 也一并改成了 `ctx.state(T)`，
+但那整块在 `if (false) { … } // ext/ removed`（`main.zig:5708-5824`，117 行）**死代码**里，
+不参与生成——改它是为了一致性，不是修缺陷。
+
+**3. `zmodu audit` 根本不看嵌套模块** — `collectBusiness` 的遍历是**固定两层、不递归**
+（`src/modules/<模块名>/<文件名>.zig`），而生成器把 `--with-agent` 产出在
+`src/modules/ai/agent/`——第 3 层。整个模块**从未被审计**，它的 `catch {}` 因此静默留在生成物里
+（这就是同一次跑只报 im、不报 agent 的原因）。
+
+改为一棵子树递归遍历（`lintModuleTree` / `collectModelStructsTree`），模块级标志
+（b14 的"有无测试"）按子树聚合。**验证**：往 `src/modules/ai/agent/service.zig` 注入一条
+`catch {}` → 现在被精确报出 `[b10] src/modules/ai/agent/service.zig:79`（修复前静默）。
+
+**影响面**：本仓库的 `examples/` 无嵌套模块、框架自身无 `src/modules/`，所以该遍历收窄在本仓
+零冲击；对**消费方**是行为变更——`zmodu audit` / `zmodu ci` 会开始报出此前看不见的嵌套模块违规。
+修复后重新生成的工程：`business: 0 violation(s)` / `summary: PASS` / exit 0。
+
+### 工具链自洁：`tools/zmodu/src/` 的 `catch {}` 字面量归零
+
+`tools/zmodu/src/` 纳入 `check-production.sh` 的强制前缀（`SCAN_ROOTS`）后，该目录仍有 14 处
+字面量命中。逐条核对后分两类：
+
+- **3 处是真的** —— 生成器模板会把它发射进用户代码，即上面那节修的缺陷。
+- **11 处是扫描器有意跳过的形态** —— `//` 注释 2、b10 规则自己的检测常量 1、喂给 linter 的
+  测试 fixture 8。这些**不改语义**，只把拼写改成从两片拼起来
+  （`const empty_catch_needle = "catch " ++ "{}";`，fixture 用
+  `"… " ++ empty_catch_needle ++ ";\n"`），并重写了两条提到该模式的注释。
+  改完 `grep -rn "catch {}" tools/zmodu/src` 与扫描器的判断**一致**，
+  不再把 linter 自己的样例源码读成违规。
+
+`src/` 下的同名命中（`std.testing` 清理、`defer … catch {}`，以及 `Middleware.zig` 中解释该规则
+本身的注释）**保持原样**：扫描器按花括号配对跳过 `test` 块，测试清理里的空 catch 是惯用法。
+判据始终是 `scripts/check-production.sh` 的退出码，不是 grep 计数。
+
+### 工具链升级
 
 - `0.17.0-dev.1970+67f39b551` → **`0.17.0-dev.2151+2ec5523d5`**（latest master dev build）。
   同步更新：`.github/workflows/ci.yml` 的 `ZIG_VERSION`、`README.md` / `README.zh.md` / `docs/QUICK-START.md`
   的安装示例。
 - 升级前后**零代码改动**：`zig fmt --check src tools examples` 无漂移；`zig build test`
   **1167 passed / 21 skipped / 0 failed**（同一套数），无需为新工具链改任何源码或测试。
+
+### 最佳实践文档修正与门禁收窄
+
+一次针对 `docs/BEST_PRACTICES.md` 的自审发现"文档写的"与"机器查的"之间有落差，本轮把两边都收了。
+
+**文档：7 处照抄即错的片段（`docs/BEST_PRACTICES.md`）**
+
+- 「正确的内存管理」那段 `defer allocator.free(buffer)` 后 `return buffer` 是**静默 UAF**，
+  改成两个真正确的形态（所有权随返回值移交 / `dupe` 出拷贝），原写法降级为显式反例。
+- 并发范例用了 **Zig 0.17 已删除的 `std.Thread.Mutex`** 且 `Self` 未定义 → 改成 `std.Io.Mutex = .init`
+  + 显式 `io` 字段 + `lock(io) catch return` / `unlock(io)`。
+- `zigmodu.resilience.*` / `tracing.*` / `metrics.*` 三个**命名空间不存在** → 改为
+  `zigmodu.CircuitBreaker` / `zigmodu.observability.DistributedTracer` 等真实路径。
+- `CircuitBreaker.init(5, 30000)`、`.timeout_ms`（字段不存在）、`data.redis.Redis.init(allocator)`
+  + `connect(host, port, .{})` 均为旧签名 → 按 `src/resilience/CircuitBreaker.zig`、
+  `src/redis/redis.zig` 的真实签名重写。
+- 部署节：`root_module.addDefine`（不存在）、`std.process.getEnvVarOwned`（已移除）、
+  GitHub Action 的 `0.16.0` 版本矩阵 → 改成 `b.addOptions()` + `init.environ_map` + `ci.yml` 的 `ZIG_VERSION`。
+- `zigmodu.extensions.ModuleTestContext` → `zigmodu.ModuleTestContext`；
+  `zigmodu.extensions.AsyncEventBus`（**全仓无此类型**）整段删除，换成 `ThreadSafeEventBus` 真实示例。
+- "examples 里没有任何代码用 `ai.Agent`" 等采样断言已失效 → 加时间标注并更新。
+
+**文档：入册与口径**
+
+- 补录 `TransactionJournal` / `recover()`、`SagaStep.timeout_seconds`（两条都写成"必须遵守"而非建议）、
+  `jsonStruct`、`paramInt(T, key)`（**两参**）；`AGENTS.md` 补 `ai.AgentWorker`；
+  `zmodu ci` 由 **5 步**更正为 **6 步**（含 `doctor`）。
+- 版本口径三处互斥（v0.23 / v0.25 / 页脚"1.0"）统一到 **v0.26.0**；目录上移并补录 `## 🔄 现状复核`；
+  纯伪码围栏加标注；自引用行号改成按内容定位。
+
+**门禁：六处"写着但扫不到"全部收窄**
+
+- `scripts/check-production.sh` 原先**扫到第一个 `test "` 即止** —— `Server.zig` 首个 test 在 1445 行、
+  全文 4487 行，约 3000 行生产代码不检。改为**扫全文件 + 按大括号配平跳过 `test` 块**
+  （先剥字符串/注释再计数，test 内的 `"{}"` 不会带偏）。副作用：在原本已强制的路径里新暴露 4 处并已修。
+- 强制前缀 **7 → 10**（补 `src/ai/`、`src/extensions/`、`src/im/`），这 23 条裸 `catch {}`
+  **逐条真实修复**（统一 `catch |err| std.log.debug/warn(...)`，行为不变），未使用豁免清单。
+- 跨行 `catch {` + 换行 `}` 在 shell 与 `audit.zig` 两边都**可识别**了（此前只认单行）。
+- `audit` b3 关键词补 `WITH`/`PRAGMA`/`TRUNCATE` 并加**词边界**（`withContext` 不再误判），
+  同时抑制"纯常量比较"（`WHERE status = 'active'` 不再误报）。
+- `audit` b17 改为**逐分配点判定**，消除"一处 `freeScanned` 洗白整个函数"。
+- `check-deadcode.sh --update` 加**单调性断言**：超过基线时拒绝写入并 exit 非 0（需 `--force`）；
+  `examples/**` 纳入扫描（当前 WARN 阶段）。
+
+**HTTP / Testkit**
+
+- `Testkit.dispatch` 新增 `DispatchOptions.query`。此前**任何 query 驱动路由都无法用 dispatch 测试** ——
+  包括脚手架自己生成的 `list*`（读 `ctx.queryInt(usize,"pageNo",1)`）。收 percent-encoded 原样串，
+  与 `path` 自带 `?…` 可共存（同名 key 后者胜）。
+
+**修复：脚手架生成的 handler 从客户端分配器泄漏**
+
+`generateModuleApi` 产出的 `list*` / `get*` 不释放 owned 返回值：
+
+- `list*` → `repo.findPage()` 的 `PageResult.arena` 由 **`Client.allocator`（长生命周期）** 分配，
+  而 `ctx.allocator` 是**每连接 arena**（`connFiber` 每请求 `reset()`）—— 回收不到它，属**永久泄漏**（每请求一页）。
+- `get*` → `repo.findById()` → `Client.queryRow()`，其字符串字段按 `sqlx.zig` 自身注释
+  "owned copies from the client's allocator and must be freed by the caller"。
+
+实测（`std.testing.allocator` 下调 `queryRow` / `queryRowsOwned` 故意不释放）：`3 leaks`，
+栈顶落在 `scanStruct(self.allocator, …)`，确认分配根在客户端分配器。
+
+**关键陷阱**：`ArenaAllocator.free()` 是 no-op，所以用 `ctx.allocator` 去释放这些内存**不会报错、
+也不会释放** —— 看起来修好了，实际照漏（我们的第一版修复正是这么写的）。正确做法是用**分配它的那个**
+分配器：`list*` → `defer result.deinit(self.service.persistence.backend.allocator)`；
+`get*` → `freeScanned(self.service.persistence.backend.allocator, …)`；
+而 `create*`/`update*` 必须继续用 `ctx.allocator`（`bindJson` 从它深拷贝）。
+
+**注意** `repo.insert` 返回入参的副本、字符串与入参**别名**，所以 `create*` 只 free 一次 ——
+再 free `created` 就是双重释放。
+
+**反证（生产形状）**：探针用 `std.testing.allocator` 作客户端分配器（可检测泄漏）、`Server` 拿到另一个
+arena（复刻 `connFiber` 层次），真的 `dispatch` `list` 与 `get?id=1`：正确的释放 → **0 leak**；
+`deinit(ctx.allocator)` + `get` 不释放 → **2 leaks**（`allocator.dupe(u8, str)` 的行字符串）。
+
+**新增 API**：`PageResult.deinitArena()`（补 `QueryResult.deinitArena` 的对称缺口，后者此前全仓零使用）——
+生成器**暂不使用**，因为 scaffold 出的项目 pin 已发布版本，用了会编译不过；等版本推进后再切。
+
+**同类修复**：`examples/tenant-mgmt/src/modules/user/api.zig` 的 `getUser` / `listUsers` 有同样的
+"拿 `ctx.allocator` 释放客户端内存"问题，一并改成 `backend.allocator` / `deinitArena()`。
+
+**修复：脚手架模板 `test.zig.tpl` 是死模板**
+
+`tools/zmodu/src/templates/orm/sqlx/test.zig.tpl` **从未被 `@embedFile`**（`orm_tpl.zig` 的 embed
+列表里没有它），内容还是三个 `expect(true)` 空桩 —— 即"文档推荐、示例不示范、脚手架不产出"。
+现在：`orm_tpl.sqlx_test` 嵌入该文件并在 `writeModuleFiles` 里为**单表模块**写出
+`modules/<name>/test.zig`（`openMemorySqlite` 上的 repository 往返 + 一次打生成 POST 路由的
+`dispatch` 断言），`generateScaffoldTestsZig` 同步写入 `test { _ = @import("modules/<name>/test.zig"); }`。
+多表模块不产出（模板按 `model.<PascalModule>` 取类型，多表时类型名不成立）。
+端到端验证：`zmodu scaffold` 单表 schema → 生成项目的 `zig build test` **7/7 pass**。
+
+**示例**
+
+- `examples/tenant-mgmt/src/tests.zig` 新增 3 条 `http.Testkit` 真用例：JWT 门（无 token 401 /
+  正确 token 200 且 body 逐字节相等 / **换 secret 的同形 token 必须 401**）、权限门
+  （`tenant:read` 403 → `tenant:suspend` 200 且状态真的落库）、**跨租户隔离**
+  （token 的 `aud` 决定可见行；猜别租户的行 id 得 404；`X-Tenant-ID` 与 aud 冲突 403）。
+- 顺带修 `examples/tenant-mgmt/src/modules/user/api.zig`：`getUser` 不释放 `queryRowPartial`
+  返回的 owned 字符串（`std.testing.allocator` 抓到 3 处泄漏）。
+
+**修复：`LogRotator` —— 公开导出但从未被编译**
+
+`zigmodu.observability.LogRotator` 是正式导出的组件，但**全仓零调用**；Zig 惰性分析函数体，
+所以 `rotate()` 里 0.17 之前的 `std.Io.Dir.cwd().rename(self.io, old, new)`（正确签名是 5 参
+自由函数 `Dir.rename(old_dir, old_sub, new_dir, new_sub, io)`）一直没报错 —— **任何用户一调用
+`write` 就编译失败**。`zig build test` 抓不到，因为"编译所有源文件"的测试只做文件级 import，
+不进函数体。修法：改正 2 处 `rename`；新增 `initIn(allocator, io, dir, …)`（`init` 仍写 CWD，
+`initIn` 指向 `tmpDir`），并**补一条真正实例化它的测试**（按大小轮转 + 断言各代内容 + 超代数文件
+不存在），否则它会继续腐烂。
+
+**门禁：补齐最后三处 + 两个盲区**
+
+- `check-production.sh` 强制前缀补 `src/log/` 与 `src/runtime/`，并修掉这两处最后 3 条 WARN
+  （`StructuredLogger` 轮转 rename 的静默 `catch {}` 改为"`FileNotFound` 静默、其余上报一行
+  stderr 且不递归走自身 log"；`timer_wheel` 测试辅助里的 `catch unreachable` 改为 `@panic(…)`，
+  消除 ReleaseFast 下的 UB）。**现在 0 warning。**
+- **`catch {},` 盲区**：switch 分支 / 初始化列表里的尾随逗号既不是 `{}` 也不是 `{};`，被
+  `body_kind` 判成 `other` 而**完全逃检**。shell 扫描器与 `audit.zig` 的 `catchBodyKind`
+  两边都修，并各加反证用例（CLI 侧 b10 期望由 3 条升到 5 条）。
+- `check-deadcode.sh`：`examples/**` 从 WARN **提升为强制**（`EXAMPLES_MODE` 删除），两个 scope
+  各自独立扫描后比对基线；7 条既有死代码全部处置（6 条未使用的 `const std` 导入 + 1 个零读取的
+  私有字段），基线保持 32 不变。JSON 解析失败改为 fail-closed。
+
+**开发者体验**
+
+- `zig build zmodu` 现在**同时安装**二进制。此前只 build+run，`zig-out/bin/zmodu` 会静默保留
+  上一次 `zig build` 的旧版本，调用方驱动到陈旧 CLI（本轮就被这个坑过一次）。
+- `http.Testkit` 删除查询解析的手工孪生实现，改为直接调 `Server.zig` 的 `parseQueryInto`
+  （为此把 `parseQueryInto`/`percentDecode` 开放为 `pub`）—— 测试与线上**不可能**再对同一串
+  查询参数有不同解读。
+
+**示例目录收敛：删除 2 个重复样板**
+
+`examples/` 由 20 个目录收到 **18 个（17 个示例 + `_shared`）**。判定标准是"每个目录必须唯一承载
+一项框架能力"：
+
+- 删 **`shopdemo-zent`** —— 结构性重复：与 `shopdemo/generated-sample` 是**同一个 `order` 模块**，
+  只换 zent 持久化，而 zent 已由 `zent-modulith` 演示。
+- 删 **`tenant-ai`** —— 与 `ai-ops`（AI 流水线 + HTTP 审批队列）和 `tenant-mgmt`（租户隔离）双向重叠。
+  删前核实其"独有"的两项并不独有：`workflow.toMermaid`（`src/ai/workflow.zig` 单测）、
+  `skill_export.toOpenApi/toSkillsJson`（`src/ai/skill_export.zig` 单测 + `zmodu ai` CLI smoke）、
+  `SkillRegistry`（自有单测）—— **不留无人调用的公开 API**。
+- **保留** `metaverse-creative`（结算链路无替代）与 `zmsaas`（含前端，`Preflight` + 池/积压接线参考）。
+
+同步改动：`ci.yml` 的构建列表（两处）、`doctor` 循环、`test` 循环；`examples/README.md` 索引与段落；
+`docs/AI_DEV_GUIDE.md` / `AI_SKILLS.md` / `AI_ORCHESTRATION.md` / `ZMODU_CLI_INTEGRATION.md` /
+`PRODUCTION_ROADMAP.md` 中指向这两个示例的句子（改为描述能力或改指 `ai-ops`）；
+`src/tests.zig` 里列举 `src/ai` 消费者的注释。历史审计记录里的提及**不改写**，只加口径说明。
+
+**定位缺口：性能门禁与运行时观测**
+
+- **性能第一次有了真门禁**。此前 CI 的 benchmark job 自己写着 "the gate (it must compile and complete)" ——
+  threshold 比较因 repo 无 `gh-pages` 分支而 `continue-on-error`，**从不生效**；而且基准全是旧定位的微基准
+  （`scanModules` / `App lifecycle` / `CircuitBreaker` / `RateLimiter` / health / `findById`），
+  **四个护城河方向一条都没测**。现在：`src/benchmark.zig` 补 6 条运行时基准
+  （`RingBuffer SPSC` / `Mailbox post+drain` / `TimerWheel` / `HotBus 8sub` / `ObjectPool` / `Sequencer`，
+  整套 ReleaseFast 约 1.3 s，确定性、无 socket/线程/sleep），新增 **`scripts/check-bench.sh`**
+  用 `scripts/bench-baseline.json` 做基线对比（默认 2.0× 放量，`BENCH_THRESHOLD` 可覆盖；
+  基线有而本次没跑的只 WARN 不失败；`--update` 带单调性保护，超阈值须 `--force`）。
+  基线对比在**临时目录**跑二进制，不会往工作树丢 `bench-results.json`（为此 `build.zig` 加了只编译不运行的
+  `benchmark-build` step）。该门禁接进 CI 的 benchmark job 作为**硬失败**一步，放在历史 hook 之后 ——
+  **随后被它自己抓到一次假阳性，并因此做了两处加固**（都写进了 `check-bench.sh` 的头部注释）：
+  ① **每个指标取 median-of-3**（`src/benchmark.zig` 的 `median3`；`validateModules x100K` 同机同码三次实测
+  446 / 292 / 295 ms，1.5× 的跨运行带宽落在 2.0× 判决窗口里，而被报的代码一行没改）；
+  ② **把套件的日志流从测量关键路径上摘掉** —— `validateModules` 每次调用写一行 `info:`，
+  每个样本约 7 MB，落到**文件**时 ~280 ms、走**管道**（有消费者）只要 ~63 ms：
+  这几个指标此前测的是宿主机的 writeback，不是代码。改成管道过滤后它们降到 **0.23–0.25×**
+  （`validateModules x100K` 276→68 ms），其余指标变动 ≤1.10×，基线随之重录。
+  阈值仍是 2.0（**没有**为了让门禁变绿而放宽），且反证过：把基线除以 10 立刻 exit 1 并打印三个样本。
+  剩余风险已写明：baseline 是绝对时间、录自本机（CI 的 `ubuntu-latest` 首次跑可能需在 runner 上重录）。
+  失败步会跳过后续步骤，而回退时正是最需要那条历史数据的时候。
+- **`RuntimeStats` 有了出口**。数据早就在（`messages_dropped` / `timer_lag_max_ms` / `handler_errors` …），
+  但全仓只有 `rt.stats()` 结构体、实际消费是示例里 `print` —— 生产里**无法对邮箱积压、消息丢弃、
+  定时器滞后告警**。新增 `Runtime.MetricsBridge(MetricsT)`：起服务时 `init(&rt, metrics)` +
+  `metrics.setScrapeHook(@TypeOf(bridge).sample, &bridge)`，抓取时采样 8 条 `zigmodu_runtime_*`。
+  对 `MetricsT` 鸭子类型化，runtime 层不依赖 observability 层。
+- **修掉一个 use-after-free（写这条桥的测试时撞出来的）**：`PrometheusMetrics` 的
+  `counters`/`gauges`/`histograms`/`summaries` 四个 map 原先把实体**按值**存，
+  而 `create*` 返回 `getPtr` 的地址 —— **后续任何一次 `create*` 触发扩容，此前发出的所有指针立刻悬垂**。
+  现有示例只建 4 个 gauge，靠初始容量侥幸没触发。改成 map 存 `*T` + `allocator.create/destroy`，
+  对外 API 不变（调用方无需改）。回归测试 `issued metric handles survive registry growth`
+  一次建 64 个句柄、创建完再回头写入 —— **在修复前它会崩**（`write after free` / `0x5555…` 段错误）。
+
+**数据层：补齐 sqlx 的能力缺口 + 清掉一套死抽象**
+
+- **`sqlx.Transaction` 补齐相对 `Client` 的缺口**（`src/sqlx/sqlx.zig`）。此前 `Client` 有 58 个方法、
+  `Transaction` 只有 16 个，同一操作两种签名，缺的方法直接让调用方撞编译错误。
+  本次**只做加法、零签名改动**（真实消费者 `zigshop` 在用 Transaction：`page/persistence.zig`、
+  `bargain/{service,persistence}.zig`、`trade/service.zig`）：
+  补 `queryRowsPartial(Ctx)`、`queryScalar(Ctx)`、`queryRowBorrowed(Ctx)`、`queryRowPartialBorrowed(Ctx)`、
+  `findOne(Partial)(Ctx)`、`findAll(Partial)(Ctx)`、`batchExec(Ctx)`、`ping(Ctx)`，以及 `queryRow/queryRowPartial/queryRows` 的 `*Ctx` 形式。
+  `findOne*`/`findAll*` 的 SQL 拼接逐字照抄 Client 侧，`validateIdentifier` + `validateSqlFragment` 两道闸一行不少。
+  另把"**为什么 Transaction 要多一个 `allocator`**"写进了方法文档：事务里扫出的行必须活过事务自己的扫描作用域，
+  所以由调用方给分配器；`Client` 用池/客户端分配器代劳 —— 这个差异是**设计**不是遗漏，此前没人写下来过。
+  新增对照测试：同一查询在 Client 与 Transaction 各写一遍断言逐字段一致（`:memory:` 下必须
+  `max_open_conns = 1`，否则两侧拿到不同连接 = 两个空库，对照会退化成"拿空气对比"）。
+- **删除 `src/persistence/Database.zig`** —— 一套遗留的 vtable 抽象（自带 `VTable`/`QueryParams`/`ParamValue`），
+  与真正在用的 `Orm(Backend)` + `SqlxBackend` 并存却**没有从 `root.zig`/`data.zig` 导出**，
+  全仓唯一引用是"编译所有源文件"那个测试。死抽象比缺抽象更贵：读者会把它当数据层入口。
+- **文档纠正**：`docs/ZENT.md` 新增「与框架自带那条的关系」—— 框架自带的默认是 sqlx
+  （`build.zig.zon` 的 `.dependencies = .{}`，**zent 不是框架依赖**），ZENT.md 的"默认选 zent"
+  是**新项目选型建议**，不是框架默认值的变更；`src/data.zig` 的 `SqlxBackend`/`Repository`
+  doc 加了指认；`AGENTS.md` 补一行"zent 是平行栈、不共享事务"。
+  `docs/BEST_PRACTICES.md` 新增「`*Ctx` 后缀 vs `ctx` 字段」：**共享句柄（`Client`）只能传参/后缀**
+  （把 per-request 的 `SqlContext` 塞成它的字段就是数据竞争），**按请求拷贝的副本（`SqlxBackend`）用字段**
+  —— 看起来不一致，其实各自都对。
+
+**脚手架：生成物端到端租户安全 + 单表 test.zig 的模型名错配**
+
+- **`zmodu scaffold` 生成的代码现在端到端租户安全**。上一轮给了 `Repository` 编译期租户守卫，但生成的
+  `api.zig` 仍在调 `*Unscoped`（显式绕过守卫），租户过滤还是靠人。现在：
+  - `service.zig` 为租户表补 `create<X>ByTenant` / `update<X>ByTenant` / `delete<X>ByTenant`。
+    其中 **create 的关键性质是"先按请求身份把租户列盖章、再插入"** —— 客户端在 body 里声称什么租户都不算数
+    （否则任何客户端都能往别的租户插数据）；update/delete 走 `updateForTenant` / `deleteForTenant`。
+  - `api.zig` 的租户表 handler 通过 `ctx.tenantId()`（JWT catalog 中间件写的 attr）取租户，
+    **取不到就 401 拒绝，绝不回退无作用域方法** —— 缺身份 ≠ 放行。生成物里 `*Unscoped` 调用数为 **0**。
+  - 新增 `test_tenant.zig.tpl`：给租户表单表模块加一条**跨租户隔离**测试（四断言：body 声称别的租户仍落在自己名下 /
+    list 只有自己那行 / 猜别人的行 id 得 404 / 无租户 attr 得 401）。
+  - **非租户表的生成物逐字节未变**（同一份非租户 schema，改动前后各生成一次 `diff -r` 无差异；
+    唯一差异是 `build.zig.zon` 的 `.fingerprint`，那是该字段本身非确定 —— 同一个二进制连跑两次也不同）。
+    **该非确定性已修**（见下方「脚手架：行数语义与可复现输出」）。
+- **修掉一个真缺陷：单表模块的 `test.zig` 模型名错配**。模板在 6 处（`model.X` 与
+  `svc.create/get/delete<X>`）用了模块名 `<<PASCAL_MODULE>>`，但那些名字是**表派生**的
+  （`strip_prefix_len = commonTablePrefix(tables)` 是**全局**前缀，所以只要 schema 有共同前缀
+  ——`shop_*`/`tbl_*` 这类**主流情况**——模型名就会剥掉前缀而模块名不会）。
+  实测：模块 `shop/product` 的模型是 `model.Product`，而生成的却是 `model.ShopProduct` →
+  `error: … has no member named 'ShopProduct'`。修法：加第三个占位符 `<<MODEL_NAME>>`
+  （`orm_tpl.expandOrmTest`），只把**表派生**的 6 处换过去；模块派生的 `…Persistence`/`…Service`/`…Api`
+  保持 `<<PASCAL_MODULE>>`。红绿：修复后生成的工程 `zig build test` 14/14 通过；把模板改回旧行为重新生成
+  则 `RED_EXIT=1` 并报出上面那条 `no member named 'ShopProduct'`。
+
+**脚手架：行数语义与可复现输出**
+
+- **跨租户改/删不再谎报成功**。生成的 `update/delete<X>ByTenant` 原先把 `updateForTenant`/`deleteForTenant`
+  的受影响行数 `_ =` 丢掉，handler 随后**无条件** `wrapSuccess` —— 而框架的契约明确写着
+  "0 means the row belongs to another tenant (guarded no-op)"。现在这两个方法返回 `!u64`，handler 把 `0`
+  映射成 **404**（并发事件只在 `rows > 0` 时才发）。无作用域路径保持原样。
+  新断言：用租户 A 的身份改/删租户 B 的行必须得 404，且**读回逐列证明 B 的行没被改动**；
+  反证（还原成无条件 200）→ `expected 404, found 0`，2 条测试变红。
+- **脚手架输出可复现**。`.fingerprint` 原先是随机的，同一二进制、同一 schema 连跑两次 `diff -r` 就 exit 1。
+  现在从包名**确定性派生**（`checksum = Crc32(清洗后的包名)`、`id = Wyhash(0, 包名)`，遵循工具链
+  `Maker/Package.zig` 的 `validate` 要求）。实测两次生成 `diff -r` **exit 0**，且 `zig build` 既不报错
+  也不改写它（md5 前后一致）。附带：zon 里已有 fingerprint 时不再为了取随机值跑一次 `zig build`
+  （scaffold 更快、不需要网络）。
+- **修掉生成的响应体是非法 JSON**：`shared/response.zig` 的 `wrapSuccess` 用了**普通字符串字面量**
+  而不是 format string，`{{\"code\":0…` 原样落进响应体 → **每个生成项目的成功信封都是
+  `{{"code":0,…}}`**，任何 JSON 解析器都拒。而生成的测试只做**子串**断言（`"code":0`），
+  两种写法都能匹配 —— 所以这个 bug 一直没被自己的测试抓到。已改成单花括号。
+
+**验证**：`zig fmt --check src tools examples` · `check-production` · `check-deadcode` ·
+`check-version` · `check-tenant-scope` · `check-bench` 全部 exit 0；
+`zig build test` **1293 / 1314 passed（21 skipped，0 failed）**（`Database.zig` 自带的那条用例随文件删除 −1，
+新增对照测试 +2、租户生成器单测 +4）；新测试连跑 5 次稳定通过（同一位置 178/1206），确认不是
+`:memory:` + 连接池 的 flaky。租户链路另有一次独立复现（带共同前缀的两表租户 schema → 生成 →
+`zig build test` **16/16**，并用"让 handler 忽略请求租户"做了**行为级反证**：隔离测试红在
+`expected 401, found 0`）。
+`examples/tenant-mgmt` 6/6、`examples/shopdemo` 13/13；`bash scripts/check-bench.sh` exit 0。
+
+**定位级接线：三处"两边都齐、中间没接"**
+
+都是"机制早已在树里，缺的只是连线"，不是新功能。
+
+- **请求预算送进存储**。`request_timeout_ms` 原先**只在 handler 返回后**比一下耗时、超了改发 408
+  （`Server.zig` 的 `elapsed_ms > …`）—— **不打断任何东西**，慢查询照样跑完、照样占着连接池；
+  而 `SqlContext`（唯一的截止机制）在 sqlx 里有 6+ 处检查点，却**从没有 HTTP 侧调用者**。
+  现在：`Context` 在请求进入时 `setDeadline(request_timeout_ms)`，`ctx.sqlContext()` 一行接进数据层，
+  新增 `Orm.withContext()` —— **一次覆盖该请求的所有查询**（而不是 19 个方法各加变体）；
+  `SqlxBackend` 持一个 `ctx` 字段并改走 `*Ctx` 变体（补齐了缺失的 `queryScalarCtx` /
+  `queryRowBorrowedCtx` / `queryRowPartialBorrowedCtx`）。默认 `.{}` = 无截止，**不接线时行为与改动前完全一致**。
+  语义边界写进了文档：`isDone()` 只拒绝**尚未开始**的语句（sqlx 无飞行中取消），所以这是
+  "防止预算耗尽后继续堆查询"，不是"到点砍掉正在跑的那条"。
+- **多租户隔离变成编译期强制**。`Repository(T)` 的 17 个无作用域方法此前**零租户感知**，
+  防线是"人记得调 `*ForTenant`"。现在模型声明 `sql_tenant_column` 即开启守卫：无作用域方法
+  `@compileError`，错误信息点名对应的 `*ForTenant` 与逃生舱 `*Unscoped`（安全的名字最短）；
+  **未声明的模型零影响**（`tenant_column orelse return`），既有项目升级不用改代码。
+  `zmodu scaffold` 生成的 `model.zig` 默认带上该声明。新增 `scripts/check-tenant-scope.sh`
+  用三个 fixture（守卫开火 / 逃生舱可用 / 未 opt-in 不受影响）锁死行为并进 CI。
+- **trace id 与日志闭环**。框架的 `tracingMiddleware` 手里有 trace id，却**只写响应头不写 `ctx`**，
+  所以 handler 读不到、日志也无法关联。现在它复用一个合规的入站 `X-Trace-Id`（长度与可打印性
+  有界 —— 该头客户端可控），否则生成，并 `ctx.setTraceId()`；配套新增 `Context.logScope("module")`
+  （一行拿到已带 id 的日志作用域）与 `LogScope.withField()`。**走 `ctx.logScope` 而不是
+  `LogScope.scope` 是有意的**：后者不报错、只是静默少一个字段。
+  `examples/tenant-mgmt` 删掉了自己那份替身中间件，改用框架的 —— 实测同一请求的两行日志带同一个 id。
+
+**验证**：以上三件完成后 `zig fmt --check src tools examples` · `check-production` ·
+`check-deadcode` · `check-version` · `check-tenant-scope` · `check-bench` 全部 exit 0；
+`zig build test` **1280 / 1301 passed（21 skipped，0 failed）**，主库 1184、`zmodu` CLI 79；
+`examples/tenant-mgmt` 6/6。关键改动均带反证：把 `SqlxBackend.queryRow` 退回非 ctx 变体后，
+新测试立刻报 `expected error.Timeout, found .{ .id = 1, .name = "Alice", .age = 30 }`。
+另有一次端到端验证：`zmodu scaffold` 生成单表项目 → 其 `zig build test` 跑真实 Testkit 用例
+（repository 往返 + POST 路由 dispatch）**9/9 pass**，且在"客户端分配器可检测泄漏 + ctx 为独立 arena"
+的生产形状下 **0 leak**；把释放改回 `ctx.allocator` 后同一探针立刻报 **2 leaks**。
+`zig build zmodu` 的安装行为也做了红绿验证（删掉 `zig-out/bin/zmodu` 后重新生成成功）。
 
 ## [0.26.0] - 2026-09-18
 

@@ -495,6 +495,8 @@ var g = try server.group("admin-api").use(myMiddleware);
 
 Extractors → `src/api/Extract.zig` · Testkit → `http.Testkit.dispatch`
 
+`dispatch` 的 `DispatchOptions.query` 收**percent-encoded 原样串**（`"pageNo=2&name=%E5%BC%A0%E4%B8%89"`），与 `path` 里自带的 `?…` 同时生效、同名 key 以 `opts.query` 为准 —— 用来测 `ctx.queryInt` / `ctx.queryParam` / `queryArray` 驱动的路由（含脚手架生成的 `list*`）：
+
 ---
 
 ## 8. Scaffold / zmodu

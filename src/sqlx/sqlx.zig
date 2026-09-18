@@ -4918,6 +4918,25 @@ pub const Client = struct {
         return row; // freeScanned is a no-op for string-free T
     }
 
+    /// Deadline-aware `queryScalar`: refuses to start once the request budget is
+    /// spent. Same string-free `T` requirement.
+    pub fn queryScalarCtx(self: *Client, ctx: SqlContext, comptime T: type, sql_str: []const u8, args: []const Value) !?T {
+        if (ctx.isDone()) return error.Timeout;
+        return self.queryScalar(T, sql_str, args);
+    }
+
+    /// Deadline-aware `queryRowBorrowed`.
+    pub fn queryRowBorrowedCtx(self: *Client, ctx: SqlContext, comptime T: type, sql_str: []const u8, args: []const Value) !BorrowedRow(T) {
+        if (ctx.isDone()) return error.Timeout;
+        return self.queryRowBorrowed(T, sql_str, args);
+    }
+
+    /// Deadline-aware `queryRowPartialBorrowed`.
+    pub fn queryRowPartialBorrowedCtx(self: *Client, ctx: SqlContext, comptime T: type, sql_str: []const u8, args: []const Value) !BorrowedRow(T) {
+        if (ctx.isDone()) return error.Timeout;
+        return self.queryRowPartialBorrowed(T, sql_str, args);
+    }
+
     pub fn queryRowPartialCtx(self: *Client, ctx: SqlContext, comptime T: type, sql_str: []const u8, args: []const Value) !T {
         if (ctx.isDone()) return error.Timeout;
         return self.queryRowPartial(T, sql_str, args);
@@ -5113,7 +5132,18 @@ pub const Transaction = struct {
         _ = try self.exec(sql, &.{});
     }
 
-    /// queryRow scans a single row into struct T (like Client.queryRow but on tx)
+    /// Scan a single row into struct T (like `Client.queryRow`, but on a tx)
+    /// and return owned copies of its `[]const u8` fields — the caller frees
+    /// them with `defer freeScanned(allocator, T, row)`.
+    ///
+    /// **Why does a `Transaction` take an explicit `allocator` here when
+    /// `Client.queryRow` does not?** A row scanned inside a transaction must
+    /// outlive the transaction's own scan scope: `Transaction.query` hands back
+    /// `Rows` that this helper frees right away (`defer rows.deinit()`), so every
+    /// string field has to be copied into an allocator whose lifetime the caller
+    /// controls. The caller therefore names that allocator (and frees with it);
+    /// `Client` has no such parameter because it does exactly this on your
+    /// behalf with the pool/client allocator.
     pub fn queryRow(self: *Transaction, allocator: std.mem.Allocator, comptime T: type, sql_str: []const u8, args: []const Value) !T {
         var rows = try self.query(allocator, sql_str, args);
         defer rows.deinit();
@@ -5121,8 +5151,16 @@ pub const Transaction = struct {
         return try rows.rows[0].scan(allocator, T);
     }
 
+    /// Deadline-aware `queryRow`. Same explicit-`allocator` contract as
+    /// `queryRow` above (owned strings outlive the tx scan scope).
+    pub fn queryRowCtx(self: *Transaction, ctx: SqlContext, allocator: std.mem.Allocator, comptime T: type, sql_str: []const u8, args: []const Value) !T {
+        if (ctx.isDone()) return error.Timeout;
+        return self.queryRow(allocator, T, sql_str, args);
+    }
+
     /// Partial-scan variant of `queryRow` on a transaction: missing columns
-    /// are zeroed instead of failing (like `Client.queryRowPartial`).
+    /// are zeroed instead of failing (like `Client.queryRowPartial`). Same
+    /// explicit-`allocator` contract as `queryRow` above.
     pub fn queryRowPartial(self: *Transaction, allocator: std.mem.Allocator, comptime T: type, sql_str: []const u8, args: []const Value) !T {
         var rows = try self.query(allocator, sql_str, args);
         defer rows.deinit();
@@ -5130,14 +5168,222 @@ pub const Transaction = struct {
         return try rows.rows[0].scanPartial(allocator, T);
     }
 
+    /// Deadline-aware `queryRowPartial`.
+    pub fn queryRowPartialCtx(self: *Transaction, ctx: SqlContext, allocator: std.mem.Allocator, comptime T: type, sql_str: []const u8, args: []const Value) !T {
+        if (ctx.isDone()) return error.Timeout;
+        return self.queryRowPartial(allocator, T, sql_str, args);
+    }
+
+    /// Arena-borrowed RAII variant of `queryRow` on a tx (mirrors
+    /// `Client.queryRowBorrowed`): returns a `BorrowedRow(T)` that owns the scan
+    /// arena, so `[]const u8` fields point **into** that arena instead of being
+    /// duplicated — nothing to `freeScanned`; release with `defer row.deinit()`.
+    /// `allocator` backs the returned arena and the transient column-index map.
+    pub fn queryRowBorrowed(self: *Transaction, allocator: std.mem.Allocator, comptime T: type, sql_str: []const u8, args: []const Value) !BorrowedRow(T) {
+        var rows = try self.query(allocator, sql_str, args);
+        errdefer rows.deinit();
+        for (rows.rows) |*row| row.arena = &rows.arena;
+        if (rows.rows.len == 0) return error.NotFound;
+        const indices = try buildColumnIndices(allocator, T, rows.rows[0].columns);
+        defer allocator.free(indices);
+        const arena_alloc = rows.arena.allocator();
+        const value = try scanStruct(arena_alloc, T, rows.rows[0], false, indices, true);
+        const stolen = rows.arena;
+        return .{ .value = value, .arena = stolen };
+    }
+
+    /// Deadline-aware `queryRowBorrowed`.
+    pub fn queryRowBorrowedCtx(self: *Transaction, ctx: SqlContext, allocator: std.mem.Allocator, comptime T: type, sql_str: []const u8, args: []const Value) !BorrowedRow(T) {
+        if (ctx.isDone()) return error.Timeout;
+        return self.queryRowBorrowed(allocator, T, sql_str, args);
+    }
+
+    /// Arena-borrowed RAII variant of `queryRowPartial` on a tx (mirrors
+    /// `Client.queryRowPartialBorrowed`): missing columns are zeroed like
+    /// `queryRowPartial`, strings borrow the arena owned by the returned
+    /// `BorrowedRow`. Release with `defer row.deinit()`.
+    pub fn queryRowPartialBorrowed(self: *Transaction, allocator: std.mem.Allocator, comptime T: type, sql_str: []const u8, args: []const Value) !BorrowedRow(T) {
+        var rows = try self.query(allocator, sql_str, args);
+        errdefer rows.deinit();
+        for (rows.rows) |*row| row.arena = &rows.arena;
+        if (rows.rows.len == 0) return error.NotFound;
+        const indices = try buildColumnIndices(allocator, T, rows.rows[0].columns);
+        defer allocator.free(indices);
+        const arena_alloc = rows.arena.allocator();
+        const value = try scanStruct(arena_alloc, T, rows.rows[0], true, indices, true);
+        const stolen = rows.arena;
+        return .{ .value = value, .arena = stolen };
+    }
+
+    /// Deadline-aware `queryRowPartialBorrowed`.
+    pub fn queryRowPartialBorrowedCtx(self: *Transaction, ctx: SqlContext, allocator: std.mem.Allocator, comptime T: type, sql_str: []const u8, args: []const Value) !BorrowedRow(T) {
+        if (ctx.isDone()) return error.Timeout;
+        return self.queryRowPartialBorrowed(allocator, T, sql_str, args);
+    }
+
+    /// One-shot scalar query on a tx (mirrors `Client.queryScalar`): scans the
+    /// first row, returns a plain value copy, and never hands the caller owned
+    /// strings — so nothing needs freeing. `NotFound` → `null`. Requires a
+    /// **string-free** `T` (compile error otherwise; use `queryRow` /
+    /// `queryRowBorrowed` for models with `[]const u8` fields). `allocator`
+    /// covers the transient scan state (no strings means nothing is retained).
+    pub fn queryScalar(self: *Transaction, allocator: std.mem.Allocator, comptime T: type, sql_str: []const u8, args: []const Value) !?T {
+        comptime if (typeHasStrings(T)) {
+            @compileError("queryScalar requires a string-free type — use queryRow / queryRowOwned / queryRowBorrowed for models with []const u8 fields");
+        };
+        const row = self.queryRow(allocator, T, sql_str, args) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        return row; // freeScanned is a no-op for string-free T
+    }
+
+    /// Deadline-aware `queryScalar`.
+    pub fn queryScalarCtx(self: *Transaction, ctx: SqlContext, allocator: std.mem.Allocator, comptime T: type, sql_str: []const u8, args: []const Value) !?T {
+        if (ctx.isDone()) return error.Timeout;
+        return self.queryScalar(allocator, T, sql_str, args);
+    }
+
     /// queryRows scans all rows into an owned QueryResult(T) (like Client.queryRows but on tx).
-    /// Caller MUST `defer result.deinit(allocator)`.
+    /// Caller MUST `defer result.deinit(allocator)`. Same explicit-`allocator`
+    /// contract as `queryRow` above: the result's strings outlive the tx scan
+    /// scope, so the caller names the allocator that ultimately frees them.
     pub fn queryRows(self: *Transaction, allocator: std.mem.Allocator, comptime T: type, sql_str: []const u8, args: []const Value) !QueryResult(T) {
         var rows = try self.query(allocator, sql_str, args);
         return scanRowsToOwned(T, &rows, false) catch |err| {
             rows.deinit();
             return err;
         };
+    }
+
+    /// Deadline-aware `queryRows`.
+    pub fn queryRowsCtx(self: *Transaction, ctx: SqlContext, allocator: std.mem.Allocator, comptime T: type, sql_str: []const u8, args: []const Value) !QueryResult(T) {
+        if (ctx.isDone()) return error.Timeout;
+        return self.queryRows(allocator, T, sql_str, args);
+    }
+
+    /// Partial-scan variant of `queryRows` on a tx (mirrors
+    /// `Client.queryRowsPartial`): columns missing from the result set are
+    /// zeroed instead of failing. Caller MUST `defer result.deinit(allocator)`
+    /// (or `deinitArena()` when the result is arena-backed).
+    pub fn queryRowsPartial(self: *Transaction, allocator: std.mem.Allocator, comptime T: type, sql_str: []const u8, args: []const Value) !QueryResult(T) {
+        var rows = try self.query(allocator, sql_str, args);
+        return scanRowsToOwned(T, &rows, true) catch |err| {
+            rows.deinit();
+            return err;
+        };
+    }
+
+    /// Deadline-aware `queryRowsPartial`.
+    pub fn queryRowsPartialCtx(self: *Transaction, ctx: SqlContext, allocator: std.mem.Allocator, comptime T: type, sql_str: []const u8, args: []const Value) !QueryResult(T) {
+        if (ctx.isDone()) return error.Timeout;
+        return self.queryRowsPartial(allocator, T, sql_str, args);
+    }
+
+    /// `Client.findOne` on a tx: builds `SELECT * FROM {table} WHERE
+    /// {where_clause} LIMIT 1`. The identifier / fragment gates
+    /// (`validateIdentifier` + `validateSqlFragment`) are the injection
+    /// barriers and are applied exactly as on `Client` — values still belong in
+    /// `args` via `?` placeholders. Generated SQL comes from `allocator`.
+    pub fn findOne(self: *Transaction, allocator: std.mem.Allocator, comptime T: type, table: []const u8, where_clause: []const u8, args: []const Value) !T {
+        try validateIdentifier(table);
+        try validateSqlFragment(where_clause);
+        const sql = try std.fmt.allocPrint(allocator, "SELECT * FROM {s} WHERE {s} LIMIT 1", .{ table, where_clause });
+        defer allocator.free(sql);
+        return self.queryRow(allocator, T, sql, args);
+    }
+
+    /// Deadline-aware `findOne`.
+    pub fn findOneCtx(self: *Transaction, ctx: SqlContext, allocator: std.mem.Allocator, comptime T: type, table: []const u8, where_clause: []const u8, args: []const Value) !T {
+        if (ctx.isDone()) return error.Timeout;
+        return self.findOne(allocator, T, table, where_clause, args);
+    }
+
+    /// Partial-scan `findOne` (mirrors `Client.findOnePartial`): missing columns
+    /// are zeroed. Same identifier / fragment validation as `findOne`.
+    pub fn findOnePartial(self: *Transaction, allocator: std.mem.Allocator, comptime T: type, table: []const u8, where_clause: []const u8, args: []const Value) !T {
+        try validateIdentifier(table);
+        try validateSqlFragment(where_clause);
+        const sql = try std.fmt.allocPrint(allocator, "SELECT * FROM {s} WHERE {s} LIMIT 1", .{ table, where_clause });
+        defer allocator.free(sql);
+        return self.queryRowPartial(allocator, T, sql, args);
+    }
+
+    /// Deadline-aware `findOnePartial`.
+    pub fn findOnePartialCtx(self: *Transaction, ctx: SqlContext, allocator: std.mem.Allocator, comptime T: type, table: []const u8, where_clause: []const u8, args: []const Value) !T {
+        if (ctx.isDone()) return error.Timeout;
+        return self.findOnePartial(allocator, T, table, where_clause, args);
+    }
+
+    /// `Client.findAll` on a tx: `SELECT * FROM {table}` with an optional
+    /// validated `WHERE` fragment. Same identifier / fragment gates as
+    /// `Client.findAll` (no literals, separators, comments, backticks or
+    /// statement keywords — bind values through `args`).
+    pub fn findAll(self: *Transaction, allocator: std.mem.Allocator, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) !QueryResult(T) {
+        try validateIdentifier(table);
+        if (where_clause) |w| try validateSqlFragment(w);
+        const sql = if (where_clause) |w|
+            try std.fmt.allocPrint(allocator, "SELECT * FROM {s} WHERE {s}", .{ table, w })
+        else
+            try std.fmt.allocPrint(allocator, "SELECT * FROM {s}", .{table});
+        defer allocator.free(sql);
+        return self.queryRows(allocator, T, sql, args);
+    }
+
+    /// Deadline-aware `findAll`.
+    pub fn findAllCtx(self: *Transaction, ctx: SqlContext, allocator: std.mem.Allocator, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) !QueryResult(T) {
+        if (ctx.isDone()) return error.Timeout;
+        return self.findAll(allocator, T, table, where_clause, args);
+    }
+
+    /// Partial-scan `findAll` (mirrors `Client.findAllPartial`): missing columns
+    /// are zeroed. Same identifier / fragment validation as `findAll`.
+    pub fn findAllPartial(self: *Transaction, allocator: std.mem.Allocator, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) !QueryResult(T) {
+        try validateIdentifier(table);
+        if (where_clause) |w| try validateSqlFragment(w);
+        const sql = if (where_clause) |w|
+            try std.fmt.allocPrint(allocator, "SELECT * FROM {s} WHERE {s}", .{ table, w })
+        else
+            try std.fmt.allocPrint(allocator, "SELECT * FROM {s}", .{table});
+        defer allocator.free(sql);
+        return self.queryRowsPartial(allocator, T, sql, args);
+    }
+
+    /// Deadline-aware `findAllPartial`.
+    pub fn findAllPartialCtx(self: *Transaction, ctx: SqlContext, allocator: std.mem.Allocator, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) !QueryResult(T) {
+        if (ctx.isDone()) return error.Timeout;
+        return self.findAllPartial(allocator, T, table, where_clause, args);
+    }
+
+    /// Execute the same statement multiple times with different argument sets
+    /// inside the transaction (mirrors `Client.batchExec`). Caller owns the
+    /// returned slice and must free it with `allocator.free(results)`.
+    pub fn batchExec(self: *Transaction, allocator: std.mem.Allocator, sql_str: []const u8, rows: []const []const Value) ![]ExecResult {
+        const results = try allocator.alloc(ExecResult, rows.len);
+        errdefer allocator.free(results);
+        for (rows, 0..) |args, i| {
+            results[i] = try self.exec(sql_str, args);
+        }
+        return results;
+    }
+
+    /// Deadline-aware `batchExec`.
+    pub fn batchExecCtx(self: *Transaction, ctx: SqlContext, allocator: std.mem.Allocator, sql_str: []const u8, rows: []const []const Value) ![]ExecResult {
+        if (ctx.isDone()) return error.Timeout;
+        return self.batchExec(allocator, sql_str, rows);
+    }
+
+    /// Liveness probe on the transaction's own connection (mirrors
+    /// `Client.ping`, minus the client-level circuit breaker that a tx does not
+    /// own).
+    pub fn ping(self: *Transaction) !void {
+        return self.conn.ping();
+    }
+
+    /// Deadline-aware `ping`.
+    pub fn pingCtx(self: *Transaction, ctx: SqlContext) !void {
+        if (ctx.isDone()) return error.Timeout;
+        return self.ping();
     }
 
     pub fn prepare(self: *Transaction, allocator: std.mem.Allocator, sql_str: []const u8) !Stmt {
@@ -7362,4 +7608,262 @@ test "sqlite transaction queryRowPartial zeroes missing columns" {
     try std.testing.expectEqual(@as(i64, 1), user.id);
     try std.testing.expectEqualStrings("Alice", user.name);
     try std.testing.expectEqual(@as(usize, 0), user.bio.len);
+}
+
+// Compile-time checklist for Client ⇄ Transaction parity. `Client` had a
+// large scan/find surface while `Transaction` had a handful of methods, so
+// users only found out at the call site (`no field or member function named
+// 'queryRowsPartial'`). This pins the names: removing or renaming one on the
+// tx breaks the build here instead of in a consumer project.
+test "Transaction exposes the Client scan/find surface" {
+    const required = [_][]const u8{
+        // tier 1 — scan helpers (with Ctx forms)
+        "queryRowsPartial",        "queryRowsPartialCtx",
+        "queryScalar",             "queryScalarCtx",
+        "queryRowBorrowed",        "queryRowBorrowedCtx",
+        "queryRowPartialBorrowed", "queryRowPartialBorrowedCtx",
+        // tier 2 — table helpers, same validateIdentifier/validateSqlFragment gates
+        "findOne",                 "findOneCtx",
+        "findOnePartial",          "findOnePartialCtx",
+        "findAll",                 "findAllCtx",
+        "findAllPartial",          "findAllPartialCtx",
+        // tier 3 — batch + liveness
+        "batchExec",               "batchExecCtx",
+        "ping",                    "pingCtx",
+        // Ctx forms of the pre-existing trio (Client has them, tx did not)
+        "queryRowCtx",             "queryRowPartialCtx",
+        "queryRowsCtx",
+    };
+    inline for (required) |name| {
+        if (!@hasDecl(Transaction, name)) {
+            @compileError("Transaction is missing Client-parity method: " ++ name);
+        }
+    }
+}
+
+// Client/Transaction parity test: the same query written once against each
+// API must yield identical results — field values, row counts and error
+// semantics. The write-path helpers are compared on their affected-row counts.
+test "transaction scan helpers match client for the same query" {
+    const allocator = std.testing.allocator;
+    // Single connection on purpose: under the default pool (max_open_conns = 8)
+    // the tx would hold one `:memory:` connection while the client-side reads
+    // acquire a second one — and every pooled `:memory:` connection is its own
+    // empty database, so the "client side" of the comparison would be querying
+    // nothing. `max_open_conns = 1` disables the pool and keeps both surfaces on
+    // the same connection (see Client.ensurePool).
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:", .max_open_conns = 1 });
+    defer client.deinit();
+    try client.connect();
+
+    _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)", &.{});
+    _ = try client.exec("INSERT INTO users (name, email) VALUES (?1, ?2)", &.{ .{ .string = "Alice" }, .{ .string = "alice@example.com" } });
+    _ = try client.exec("INSERT INTO users (name, email) VALUES (?1, ?2)", &.{ .{ .string = "Bob" }, .{ .string = "bob@example.com" } });
+
+    const User = struct { id: i64, name: []const u8 };
+    const PartialUser = struct {
+        id: i64,
+        name: []const u8,
+        bio: []const u8, // never selected → zeroed by the partial variants
+    };
+    const Count = struct { n: i64 };
+
+    var tx = try client.beginTx();
+    defer tx.rollback() catch {};
+
+    // --- queryRowsPartial ------------------------------------------------
+    const c_partial = try client.queryRowsPartial(PartialUser, "SELECT id, name FROM users ORDER BY id", &.{});
+    defer c_partial.deinit(allocator);
+    const t_partial = try tx.queryRowsPartial(allocator, PartialUser, "SELECT id, name FROM users ORDER BY id", &.{});
+    defer t_partial.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), c_partial.items.len);
+    try std.testing.expectEqual(c_partial.items.len, t_partial.items.len);
+    for (c_partial.items, t_partial.items) |c, t| {
+        try std.testing.expectEqual(c.id, t.id);
+        try std.testing.expectEqualStrings(c.name, t.name);
+        try std.testing.expectEqual(c.bio.len, t.bio.len);
+    }
+
+    // --- queryRow / queryRowPartial (owned copies, tx names the allocator) --
+    const c_user = try client.queryRow(User, "SELECT id, name FROM users WHERE id = ?1", &.{.{ .int = 1 }});
+    defer freeScanned(allocator, User, c_user);
+    const t_user = try tx.queryRow(allocator, User, "SELECT id, name FROM users WHERE id = ?1", &.{.{ .int = 1 }});
+    defer freeScanned(allocator, User, t_user);
+    try std.testing.expectEqual(c_user.id, t_user.id);
+    try std.testing.expectEqualStrings(c_user.name, t_user.name);
+    try std.testing.expectEqualStrings("Alice", t_user.name);
+
+    const c_partial_row = try client.queryRowPartial(PartialUser, "SELECT id, name FROM users WHERE id = ?1", &.{.{ .int = 2 }});
+    defer freeScanned(allocator, PartialUser, c_partial_row);
+    const t_partial_row = try tx.queryRowPartial(allocator, PartialUser, "SELECT id, name FROM users WHERE id = ?1", &.{.{ .int = 2 }});
+    defer freeScanned(allocator, PartialUser, t_partial_row);
+    try std.testing.expectEqual(c_partial_row.id, t_partial_row.id);
+    try std.testing.expectEqualStrings(c_partial_row.name, t_partial_row.name);
+    try std.testing.expectEqual(c_partial_row.bio.len, t_partial_row.bio.len);
+
+    // NotFound semantics are identical on both surfaces.
+    try std.testing.expectError(error.NotFound, client.queryRow(User, "SELECT id, name FROM users WHERE id = ?1", &.{.{ .int = 777 }}));
+    try std.testing.expectError(error.NotFound, tx.queryRow(allocator, User, "SELECT id, name FROM users WHERE id = ?1", &.{.{ .int = 777 }}));
+
+    // --- queryRows --------------------------------------------------------
+    const c_rows = try client.queryRows(User, "SELECT id, name FROM users ORDER BY id", &.{});
+    defer c_rows.deinit(allocator);
+    const t_rows = try tx.queryRows(allocator, User, "SELECT id, name FROM users ORDER BY id", &.{});
+    defer t_rows.deinit(allocator);
+    try std.testing.expectEqual(c_rows.items.len, t_rows.items.len);
+    for (c_rows.items, t_rows.items) |c, t| try std.testing.expectEqualStrings(c.name, t.name);
+
+    // --- queryRowBorrowed / queryRowPartialBorrowed ------------------------
+    {
+        var c_row = try client.queryRowBorrowed(User, "SELECT id, name FROM users WHERE id = ?1", &.{.{ .int = 1 }});
+        defer c_row.deinit();
+        var t_row = try tx.queryRowBorrowed(allocator, User, "SELECT id, name FROM users WHERE id = ?1", &.{.{ .int = 1 }});
+        defer t_row.deinit();
+        try std.testing.expectEqual(c_row.get().id, t_row.get().id);
+        try std.testing.expectEqualStrings(c_row.get().name, t_row.get().name);
+    }
+    {
+        var c_row = try client.queryRowPartialBorrowed(PartialUser, "SELECT id, name FROM users WHERE id = ?1", &.{.{ .int = 2 }});
+        defer c_row.deinit();
+        var t_row = try tx.queryRowPartialBorrowed(allocator, PartialUser, "SELECT id, name FROM users WHERE id = ?1", &.{.{ .int = 2 }});
+        defer t_row.deinit();
+        try std.testing.expectEqual(c_row.get().id, t_row.get().id);
+        try std.testing.expectEqualStrings(c_row.get().name, t_row.get().name);
+        try std.testing.expectEqual(c_row.get().bio.len, t_row.get().bio.len);
+        try std.testing.expectEqual(@as(usize, 0), t_row.get().bio.len);
+    }
+
+    // --- queryScalar (value copy; no freeScanned; NotFound → null) ---------
+    const c_count = try client.queryScalar(Count, "SELECT COUNT(*) AS n FROM users", &.{});
+    const t_count = try tx.queryScalar(allocator, Count, "SELECT COUNT(*) AS n FROM users", &.{});
+    try std.testing.expectEqual(c_count.?.n, t_count.?.n);
+    try std.testing.expectEqual(@as(i64, 2), t_count.?.n);
+    const c_missing = try client.queryScalar(Count, "SELECT id AS n FROM users WHERE id = ?1", &.{.{ .int = 999 }});
+    const t_missing = try tx.queryScalar(allocator, Count, "SELECT id AS n FROM users WHERE id = ?1", &.{.{ .int = 999 }});
+    try std.testing.expect(c_missing == null);
+    try std.testing.expect(t_missing == null);
+
+    // --- findOne / findOnePartial / findAll / findAllPartial ---------------
+    const c_found = try client.findOne(User, "users", "id = ?1", &.{.{ .int = 2 }});
+    defer freeScanned(allocator, User, c_found);
+    const t_found = try tx.findOne(allocator, User, "users", "id = ?1", &.{.{ .int = 2 }});
+    defer freeScanned(allocator, User, t_found);
+    try std.testing.expectEqual(c_found.id, t_found.id);
+    try std.testing.expectEqualStrings(c_found.name, t_found.name);
+
+    const c_found_partial = try client.findOnePartial(PartialUser, "users", "name = ?1", &.{.{ .string = "Alice" }});
+    defer freeScanned(allocator, PartialUser, c_found_partial);
+    const t_found_partial = try tx.findOnePartial(allocator, PartialUser, "users", "name = ?1", &.{.{ .string = "Alice" }});
+    defer freeScanned(allocator, PartialUser, t_found_partial);
+    try std.testing.expectEqual(c_found_partial.id, t_found_partial.id);
+    try std.testing.expectEqual(c_found_partial.bio.len, t_found_partial.bio.len);
+
+    const c_all = try client.findAll(User, "users", null, &.{});
+    defer c_all.deinit(allocator);
+    const t_all = try tx.findAll(allocator, User, "users", null, &.{});
+    defer t_all.deinit(allocator);
+    try std.testing.expectEqual(c_all.items.len, t_all.items.len);
+
+    const c_all_partial = try client.findAllPartial(PartialUser, "users", "name = ?1", &.{.{ .string = "Bob" }});
+    defer c_all_partial.deinit(allocator);
+    const t_all_partial = try tx.findAllPartial(allocator, PartialUser, "users", "name = ?1", &.{.{ .string = "Bob" }});
+    defer t_all_partial.deinit(allocator);
+    try std.testing.expectEqual(c_all_partial.items.len, t_all_partial.items.len);
+    try std.testing.expectEqualStrings(c_all_partial.items[0].name, t_all_partial.items[0].name);
+    try std.testing.expectEqual(c_all_partial.items[0].bio.len, t_all_partial.items[0].bio.len);
+
+    // The injection gates fire identically on both surfaces.
+    try std.testing.expectError(error.InvalidSqlIdentifier, client.findOne(User, "users; DROP TABLE users", "id = 1", &.{}));
+    try std.testing.expectError(error.InvalidSqlIdentifier, tx.findOne(allocator, User, "users; DROP TABLE users", "id = 1", &.{}));
+    try std.testing.expectError(error.UnsafeSqlFragment, client.findOne(User, "users", "id = 1; DROP TABLE users", &.{}));
+    try std.testing.expectError(error.UnsafeSqlFragment, tx.findOne(allocator, User, "users", "id = 1; DROP TABLE users", &.{}));
+    try std.testing.expectError(error.UnsafeSqlFragment, tx.findAll(allocator, User, "users", "name = 'Alice'", &.{}));
+
+    // --- Ctx variants: every new method is instantiated, not just declared --
+    const ctx = SqlContext.withTimeout(5_000);
+    try client.ping();
+    try tx.ping();
+    try tx.pingCtx(ctx);
+    {
+        const rows = try tx.queryRowsCtx(ctx, allocator, User, "SELECT id, name FROM users ORDER BY id", &.{});
+        defer rows.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 2), rows.items.len);
+    }
+    {
+        const rows = try tx.queryRowsPartialCtx(ctx, allocator, PartialUser, "SELECT id, name FROM users ORDER BY id", &.{});
+        defer rows.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 2), rows.items.len);
+        try std.testing.expectEqual(@as(usize, 0), rows.items[0].bio.len);
+    }
+    {
+        const row = try tx.queryRowCtx(ctx, allocator, User, "SELECT id, name FROM users WHERE id = ?1", &.{.{ .int = 1 }});
+        defer freeScanned(allocator, User, row);
+        try std.testing.expectEqualStrings("Alice", row.name);
+    }
+    {
+        const row = try tx.queryRowPartialCtx(ctx, allocator, PartialUser, "SELECT id, name FROM users WHERE id = ?1", &.{.{ .int = 1 }});
+        defer freeScanned(allocator, PartialUser, row);
+        try std.testing.expectEqual(@as(usize, 0), row.bio.len);
+    }
+    {
+        var row = try tx.queryRowBorrowedCtx(ctx, allocator, User, "SELECT id, name FROM users WHERE id = ?1", &.{.{ .int = 1 }});
+        defer row.deinit();
+        try std.testing.expectEqualStrings("Alice", row.get().name);
+    }
+    {
+        var row = try tx.queryRowPartialBorrowedCtx(ctx, allocator, PartialUser, "SELECT id, name FROM users WHERE id = ?1", &.{.{ .int = 1 }});
+        defer row.deinit();
+        try std.testing.expectEqual(@as(usize, 0), row.get().bio.len);
+    }
+    {
+        const n = try tx.queryScalarCtx(ctx, allocator, Count, "SELECT COUNT(*) AS n FROM users", &.{});
+        try std.testing.expectEqual(@as(i64, 2), n.?.n);
+    }
+    {
+        const row = try tx.findOneCtx(ctx, allocator, User, "users", "id = ?1", &.{.{ .int = 1 }});
+        defer freeScanned(allocator, User, row);
+        try std.testing.expectEqualStrings("Alice", row.name);
+    }
+    {
+        const row = try tx.findOnePartialCtx(ctx, allocator, PartialUser, "users", "id = ?1", &.{.{ .int = 1 }});
+        defer freeScanned(allocator, PartialUser, row);
+        try std.testing.expectEqual(@as(usize, 0), row.bio.len);
+    }
+    {
+        const rows = try tx.findAllCtx(ctx, allocator, User, "users", null, &.{});
+        defer rows.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 2), rows.items.len);
+    }
+    {
+        const rows = try tx.findAllPartialCtx(ctx, allocator, PartialUser, "users", "name = ?1", &.{.{ .string = "Alice" }});
+        defer rows.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 1), rows.items.len);
+    }
+    // A spent budget is refused before any work happens, on every Ctx variant.
+    {
+        const expired = SqlContext.withDeadline(Time.monotonicNowMilliseconds() - 1);
+        try std.testing.expectError(error.Timeout, tx.pingCtx(expired));
+        try std.testing.expectError(error.Timeout, tx.queryScalarCtx(expired, allocator, Count, "SELECT COUNT(*) AS n FROM users", &.{}));
+        try std.testing.expectError(error.Timeout, tx.queryRowsPartialCtx(expired, allocator, PartialUser, "SELECT id FROM users", &.{}));
+        try std.testing.expectError(error.Timeout, tx.findOneCtx(expired, allocator, User, "users", "id = ?1", &.{.{ .int = 1 }}));
+    }
+
+    // --- batchExec (write path; compared on affected rows) -----------------
+    const client_batch = [_][]const Value{
+        &.{ .{ .string = "ClientBatch1" }, .{ .string = "cb1@example.com" } },
+        &.{ .{ .string = "ClientBatch2" }, .{ .string = "cb2@example.com" } },
+    };
+    const c_batch = try client.batchExec("INSERT INTO users (name, email) VALUES (?1, ?2)", &client_batch);
+    defer allocator.free(c_batch);
+
+    const ctx_batch = [_][]const Value{
+        &.{ .{ .string = "TxBatch1" }, .{ .string = "tb1@example.com" } },
+        &.{ .{ .string = "TxBatch2" }, .{ .string = "tb2@example.com" } },
+    };
+    const t_batch = try tx.batchExecCtx(ctx, allocator, "INSERT INTO users (name, email) VALUES (?1, ?2)", &ctx_batch);
+    defer allocator.free(t_batch);
+
+    try std.testing.expectEqual(c_batch.len, t_batch.len);
+    for (c_batch, t_batch) |c, t| try std.testing.expectEqual(c.rows_affected, t.rows_affected);
+    try std.testing.expectEqual(@as(u64, 1), t_batch[0].rows_affected);
 }

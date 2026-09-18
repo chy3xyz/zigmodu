@@ -24,13 +24,33 @@ pub fn tracing() api.Middleware {
     return .{
         .func = struct {
             fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
-                // Generate unique trace-id for this request
-                const now_ns: u64 = @intCast(Time.monotonicNow());
-                const counter = trace_id_counter.fetchAdd(1, .monotonic);
-                const trace_id = try std.fmt.allocPrint(ctx.allocator, "{x:016}-{x:016}", .{ now_ns, counter });
+                // Propagate an inbound id when the caller supplied one (an
+                // upstream service, or a client correlating its own traces),
+                // otherwise mint one. Bounded on purpose: the value ends up in
+                // an attribute, so an unbounded header is a memory lever.
+                const inbound: ?[]const u8 = blk: {
+                    const raw = ctx.header("x-trace-id") orelse break :blk null;
+                    if (raw.len == 0 or raw.len > 128) break :blk null;
+                    for (raw) |ch| {
+                        if (ch < 0x21 or ch > 0x7e) break :blk null;
+                    }
+                    break :blk raw;
+                };
+
+                const trace_id = if (inbound) |id|
+                    try ctx.allocator.dupe(u8, id)
+                else blk: {
+                    const now_ns: u64 = @intCast(Time.monotonicNow());
+                    const counter = trace_id_counter.fetchAdd(1, .monotonic);
+                    break :blk try std.fmt.allocPrint(ctx.allocator, "{x:016}-{x:016}", .{ now_ns, counter });
+                };
                 defer ctx.allocator.free(trace_id);
 
-                // Inject trace-id into request context for downstream use
+                // Hand it to the request, not just to the response header: this
+                // is what lets a handler do `ctx.logScope("m")` and get every
+                // line tagged, and what makes the timing line below correlate
+                // with the handler's own lines.
+                try ctx.setTraceId(trace_id);
                 try ctx.setHeader("x-trace-id", trace_id);
 
                 // Record start time
@@ -261,4 +281,57 @@ test "circuitBreak middleware passes on success" {
 
     try mw.func(&ctx, next, mw.user_data);
     try std.testing.expect(!ctx.responded);
+}
+
+test "tracing() hands the trace id to the request and reuses a sane inbound one" {
+    const allocator = std.testing.allocator;
+
+    const Next = struct {
+        var seen: ?[]const u8 = null;
+        fn n(c: *api.Context) anyerror!void {
+            seen = c.traceId();
+        }
+    };
+    const next = Next.n;
+
+    // No inbound id: one is minted, the handler can read it, and the response
+    // echoes it.
+    {
+        Next.seen = null;
+        var ctx = try api.Context.init(allocator, .GET, "/orders");
+        defer ctx.deinit();
+        const mw = tracing();
+        try mw.func(&ctx, next, mw.user_data);
+        try std.testing.expect(ctx.traceId() != null);
+        try std.testing.expectEqualStrings(ctx.traceId().?, Next.seen.?);
+        try std.testing.expectEqualStrings(ctx.traceId().?, ctx.response_headers.get("x-trace-id").?);
+    }
+
+    // A sane inbound id is propagated instead of replaced — that is what makes
+    // the id useful across two services.
+    {
+        Next.seen = null;
+        var ctx = try api.Context.init(allocator, .GET, "/orders");
+        defer ctx.deinit();
+        try ctx.headers.put(try allocator.dupe(u8, "x-trace-id"), try allocator.dupe(u8, "abc-123"));
+        const mw = tracing();
+        try mw.func(&ctx, next, mw.user_data);
+        try std.testing.expectEqualStrings("abc-123", ctx.traceId().?);
+    }
+
+    // An oversized id is ignored rather than copied into an attribute — the
+    // header is attacker-controlled.
+    {
+        Next.seen = null;
+        var ctx = try api.Context.init(allocator, .GET, "/orders");
+        defer ctx.deinit();
+        var junk_buf: [200]u8 = undefined;
+        @memset(&junk_buf, 'x');
+        const junk: []const u8 = &junk_buf;
+        try ctx.headers.put(try allocator.dupe(u8, "x-trace-id"), try allocator.dupe(u8, junk));
+        const mw = tracing();
+        try mw.func(&ctx, next, mw.user_data);
+        try std.testing.expect(ctx.traceId() != null);
+        try std.testing.expect(!std.mem.eql(u8, junk, ctx.traceId().?));
+    }
 }

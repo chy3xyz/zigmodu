@@ -88,7 +88,9 @@ pub const WebSocketServer = struct {
         }
         // Drain any in-flight accept/connection fibers so their futures do
         // not leak. Safe to call repeatedly because `Group.await` is idempotent.
-        self.fiber_group.await(self.io) catch {};
+        self.fiber_group.await(self.io) catch |err| {
+            std.log.debug("[ws] draining fiber group failed: {s}", .{@errorName(err)});
+        };
     }
 
     fn acceptLoop(self: *Self) void {
@@ -133,7 +135,9 @@ pub const WebSocketServer = struct {
             var write_buf: [256]u8 = undefined;
             var w = conn.writer(self.io, &write_buf);
             // Best-effort: a failed write means the peer is already gone.
-            _ = w.interface.writeAll(response) catch {};
+            _ = w.interface.writeAll(response) catch |err| {
+                std.log.debug("[ws] handshake write failed (peer gone?): {s}", .{@errorName(err)});
+            };
             return;
         };
         // Validate Origin header if allowed_origins is configured
@@ -153,7 +157,9 @@ pub const WebSocketServer = struct {
                     var w = conn.writer(self.io, &write_buf);
                     // Best-effort: the peer is being rejected anyway; a failed
                     // write only means the socket is already gone.
-                    _ = w.interface.writeAll(response) catch {};
+                    _ = w.interface.writeAll(response) catch |err| {
+                        std.log.debug("[ws] handshake write failed (peer gone?): {s}", .{@errorName(err)});
+                    };
                     return;
                 }
             }
@@ -461,7 +467,9 @@ pub const WebSocketMonitor = struct {
         self.is_running = false;
         self.ws_server.stop();
         self.update_thread = null;
-        self.update_group.await(self.ws_server.io) catch {};
+        self.update_group.await(self.ws_server.io) catch |err| {
+            std.log.debug("[ws] draining update group failed: {s}", .{@errorName(err)});
+        };
     }
 
     fn updateLoop(self: *Self) void {

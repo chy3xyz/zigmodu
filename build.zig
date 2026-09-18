@@ -103,6 +103,15 @@ pub fn build(b: *std.Build) void {
     const benchmark_step = b.step("benchmark", "Run benchmarks");
     benchmark_step.dependOn(&benchmark_run.step);
 
+    // Build the benchmark binary without running it: the run step writes
+    // `bench-results.json` into the *cwd*, which for `zig build benchmark` is the
+    // repository root. `scripts/check-bench.sh` installs the binary into a
+    // temporary prefix (`--prefix`) and executes it there instead, so the gate
+    // never drops a file into the working tree.
+    const benchmark_install = b.addInstallArtifact(benchmark_exe, .{});
+    const benchmark_build_step = b.step("benchmark-build", "Build the benchmark binary without running it");
+    benchmark_build_step.dependOn(&benchmark_install.step);
+
     // Docs step
     const docs_mod = b.createModule(.{
         .root_source_file = b.path("src/docs.zig"),
@@ -174,11 +183,16 @@ pub fn build(b: *std.Build) void {
         .name = "zmodu",
         .root_module = zmodu_cli_mod,
     });
-    b.installArtifact(zmodu_cli_exe);
+    // Keep the handle: `zig build zmodu` must *install* the binary it just ran,
+    // otherwise `zig-out/bin/zmodu` silently stays at whatever an earlier
+    // `zig build` left there and callers drive a stale CLI.
+    const zmodu_install = b.addInstallArtifact(zmodu_cli_exe, .{});
+    b.getInstallStep().dependOn(&zmodu_install.step);
 
     const run_zmodu_cmd = b.addRunArtifact(zmodu_cli_exe);
-    const zmodu_step = b.step("zmodu", "Build unified zmodu CLI code generator");
+    const zmodu_step = b.step("zmodu", "Build and install the unified zmodu CLI code generator");
     zmodu_step.dependOn(&run_zmodu_cmd.step);
+    zmodu_step.dependOn(&zmodu_install.step);
 
     // Include zmodu CLI test suite in `zig build test`
     const zmodu_tests = b.addTest(.{

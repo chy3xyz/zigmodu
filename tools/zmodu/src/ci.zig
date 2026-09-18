@@ -49,8 +49,8 @@ pub fn run(io: Io, allocator: std.mem.Allocator, args: []const []const u8) u8 {
         .stdout_limit = .limited(8 * 1024 * 1024),
         .stderr_limit = .limited(8 * 1024 * 1024),
     }) catch |err| {
-        stdout.print("[compile] ERROR: cannot run `zig build`: {s}\n", .{@errorName(err)}) catch {};
-        stdout.flush() catch {};
+        stdout.print("[compile] ERROR: cannot run `zig build`: {s}\n", .{@errorName(err)}) catch return 1;
+        stdout.flush() catch return 1;
         return 1;
     };
     defer {
@@ -63,8 +63,10 @@ pub fn run(io: Io, allocator: std.mem.Allocator, args: []const []const u8) u8 {
     } else {
         failed = true;
         stdout.print("[compile] FAIL (zig build)\n", .{}) catch return 1;
-        stdout.writeAll(build_res.stderr) catch {};
-        stdout.writeAll(build_res.stdout) catch {};
+        // A dead stdout means the report never reaches the caller — fail the
+        // run instead of pretending the step reported.
+        stdout.writeAll(build_res.stderr) catch return 1;
+        stdout.writeAll(build_res.stdout) catch return 1;
     }
 
     // 2. zig fmt --check on existing top-level dirs (src/tools/examples).
@@ -85,8 +87,8 @@ pub fn run(io: Io, allocator: std.mem.Allocator, args: []const []const u8) u8 {
             .stdout_limit = .limited(8 * 1024 * 1024),
             .stderr_limit = .limited(8 * 1024 * 1024),
         }) catch |err| {
-            stdout.print("[fmt] ERROR: cannot run `zig fmt --check`: {s}\n", .{@errorName(err)}) catch {};
-            stdout.flush() catch {};
+            stdout.print("[fmt] ERROR: cannot run `zig fmt --check`: {s}\n", .{@errorName(err)}) catch return 1;
+            stdout.flush() catch return 1;
             return 1;
         };
         defer {
@@ -99,8 +101,8 @@ pub fn run(io: Io, allocator: std.mem.Allocator, args: []const []const u8) u8 {
         } else {
             failed = true;
             stdout.print("[fmt] FAIL (zig fmt --check)\n", .{}) catch return 1;
-            stdout.writeAll(fmt_res.stderr) catch {};
-            stdout.writeAll(fmt_res.stdout) catch {};
+            stdout.writeAll(fmt_res.stderr) catch return 1;
+            stdout.writeAll(fmt_res.stdout) catch return 1;
         }
     } else {
         stdout.print("[fmt] SKIP (no src/tools/examples dirs)\n", .{}) catch return 1;
@@ -108,8 +110,8 @@ pub fn run(io: Io, allocator: std.mem.Allocator, args: []const []const u8) u8 {
 
     // 3. verify (structure/imports, in-process).
     const report = verify_mod.verifyProject(allocator, io, dir) catch |err| {
-        stdout.print("[verify] ERROR: {s}\n", .{@errorName(err)}) catch {};
-        stdout.flush() catch {};
+        stdout.print("[verify] ERROR: {s}\n", .{@errorName(err)}) catch return 1;
+        stdout.flush() catch return 1;
         return 1;
     };
     defer {
@@ -130,13 +132,13 @@ pub fn run(io: Io, allocator: std.mem.Allocator, args: []const []const u8) u8 {
     } else {
         failed = true;
         stdout.print("[verify] FAIL ({s})\n", .{report.summary}) catch return 1;
-        for (report.errors) |e| stdout.print("  {s}\n", .{e}) catch {};
+        for (report.errors) |e| stdout.print("  {s}\n", .{e}) catch return 1;
     }
 
     // 4. audit (best-practice rules, in-process).
     const audit_json = audit_mod.auditJsonFor(io, allocator, dir) catch |err| {
-        stdout.print("[audit] ERROR: {s}\n", .{@errorName(err)}) catch {};
-        stdout.flush() catch {};
+        stdout.print("[audit] ERROR: {s}\n", .{@errorName(err)}) catch return 1;
+        stdout.flush() catch return 1;
         return 1;
     };
     defer allocator.free(audit_json);
@@ -146,7 +148,7 @@ pub fn run(io: Io, allocator: std.mem.Allocator, args: []const []const u8) u8 {
     } else {
         failed = true;
         stdout.print("[audit] FAIL\n", .{}) catch return 1;
-        stdout.writeAll(audit_json) catch {};
+        stdout.writeAll(audit_json) catch return 1;
     }
 
     // 5. deadcode (in-process; prints its own report).

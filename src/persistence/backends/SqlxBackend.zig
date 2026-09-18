@@ -10,6 +10,14 @@ const orm = @import("../Orm.zig");
 pub const SqlxBackend = struct {
     allocator: std.mem.Allocator,
     client: *sqlx.Client,
+    /// Request budget shared by every statement this backend issues. Defaults
+    /// to "no deadline" (`.{}`), so an untouched backend behaves exactly as
+    /// before; `Orm.withContext` stamps it per request.
+    ///
+    /// `SqlContext.isDone()` only refuses a statement that has **not started**
+    /// yet — sqlx has no mid-flight cancellation — so this bounds the pile-up
+    /// of queries behind an exhausted budget, it does not abort one in flight.
+    ctx: sqlx.SqlContext = .{},
 
     pub const Value = sqlx.Value;
     pub const ExecResult = sqlx.ExecResult;
@@ -26,7 +34,7 @@ pub const SqlxBackend = struct {
     }
 
     pub fn queryRow(self: @This(), comptime T: type, sql_str: []const u8, args: []const Value) !?T {
-        return self.client.queryRow(T, sql_str, args) catch |err| switch (err) {
+        return self.client.queryRowCtx(self.ctx, T, sql_str, args) catch |err| switch (err) {
             error.NotFound => return null,
             else => return err,
         };
@@ -38,28 +46,28 @@ pub const SqlxBackend = struct {
     }
 
     pub fn queryRows(self: @This(), comptime T: type, sql_str: []const u8, args: []const Value) !sqlx.QueryResult(T) {
-        return self.client.queryRowsOwned(T, sql_str, args);
+        return self.client.queryRowsCtx(self.ctx, T, sql_str, args);
     }
 
     /// Arena-borrowed single row: strings point into the returned
     /// `BorrowedRow`'s arena; `deinit()` frees everything (no freeScanned).
     pub fn queryRowBorrowed(self: @This(), comptime T: type, sql_str: []const u8, args: []const Value) !sqlx.BorrowedRow(T) {
-        return self.client.queryRowBorrowed(T, sql_str, args);
+        return self.client.queryRowBorrowedCtx(self.ctx, T, sql_str, args);
     }
 
     /// Partial-scan arena-borrowed single row (missing columns zeroed).
     pub fn queryRowPartialBorrowed(self: @This(), comptime T: type, sql_str: []const u8, args: []const Value) !sqlx.BorrowedRow(T) {
-        return self.client.queryRowPartialBorrowed(T, sql_str, args);
+        return self.client.queryRowPartialBorrowedCtx(self.ctx, T, sql_str, args);
     }
 
     /// One-shot scalar query (string-free `T` only; owned strings freed
     /// internally). See `sqlx.Client.queryScalar`.
     pub fn queryScalar(self: @This(), comptime T: type, sql_str: []const u8, args: []const Value) !?T {
-        return self.client.queryScalar(T, sql_str, args);
+        return self.client.queryScalarCtx(self.ctx, T, sql_str, args);
     }
 
     pub fn exec(self: @This(), sql_str: []const u8, args: []const Value) !ExecResult {
-        return self.client.exec(sql_str, args);
+        return self.client.execCtx(self.ctx, sql_str, args);
     }
 
     /// Driver dialect for dialect-aware SQL generation (bulk upsert).
@@ -168,3 +176,48 @@ const User = struct {
     name: []const u8,
     age: i64,
 };
+
+test "Orm.withContext arms the request budget for every repository call" {
+    const allocator = std.testing.allocator;
+
+    var client = sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    _ = try client.exec("CREATE TABLE User (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)", &.{});
+    _ = try client.exec("INSERT INTO User (id, name, age) VALUES (1, 'Alice', 30)", &.{});
+
+    var orm_instance = orm.Orm(SqlxBackend){ .backend = .{ .allocator = allocator, .client = &client } };
+    const UserRepo = orm.Orm(SqlxBackend).Repository(User);
+
+    // Unarmed: `.{}` means no deadline, so nothing changes for code that never
+    // calls `withContext`.
+    const plain = UserRepo{ .orm = &orm_instance };
+    const found = (try plain.findById(@as(i64, 1))).?;
+    defer allocator.free(found.name);
+    try std.testing.expectEqualStrings("Alice", found.name);
+
+    // Armed with a budget that is already spent: every statement is refused
+    // before it is sent, on every read/write path this backend serves.
+    const expired = sqlx.SqlContext.withDeadline(Time.monotonicNowMilliseconds() - 1);
+    var scoped_orm = orm_instance.withContext(expired);
+    const scoped = UserRepo{ .orm = &scoped_orm };
+
+    try std.testing.expectError(error.Timeout, scoped.findById(@as(i64, 1)));
+    try std.testing.expectError(error.Timeout, scoped.findAll());
+    try std.testing.expectError(error.Timeout, scoped.count());
+    try std.testing.expectError(error.Timeout, scoped.update(.{ .id = 1, .name = "x", .age = 1 }));
+    try std.testing.expectError(error.Timeout, scoped.delete(@as(i64, 1)));
+    // `insert` goes through `exec` — the write path is covered too.
+    try std.testing.expectError(error.Timeout, scoped.insert(.{ .id = 9, .name = "z", .age = 9 }));
+
+    // The deadline is a *budget*, not a kill switch: a live one still runs.
+    var fresh_orm = orm_instance.withContext(sqlx.SqlContext.withTimeout(60_000));
+    const fresh = UserRepo{ .orm = &fresh_orm };
+    const still_there = (try fresh.findById(@as(i64, 1))).?;
+    defer allocator.free(still_there.name);
+    try std.testing.expectEqualStrings("Alice", still_there.name);
+
+    // And `withContext` copies — the original keeps its own (empty) budget.
+    try std.testing.expect(orm_instance.backend.ctx.deadline_ms == null);
+}
+
+const Time = @import("../../core/Time.zig");

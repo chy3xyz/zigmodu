@@ -79,8 +79,8 @@ pub fn saveManifest(allocator: std.mem.Allocator, io: Io, project_dir: []const u
     try file.writeStreamingAll(io, buf.items);
 }
 
-/// Load hash manifest from disk. Returns empty map if file doesn't exist.
-/// Caller owns the returned map and must deinit it.
+/// Load hash manifest from disk. Returns an empty map if the file doesn't exist.
+/// The map's keys are allocated: release them with `freeManifest`, not `deinit`.
 pub fn loadManifest(allocator: std.mem.Allocator, io: Io, project_dir: []const u8) std.StringHashMap([64]u8) {
     var map = std.StringHashMap([64]u8).init(allocator);
 
@@ -90,36 +90,68 @@ pub fn loadManifest(allocator: std.mem.Allocator, io: Io, project_dir: []const u
     const content = Io.Dir.cwd().readFileAlloc(io, path, allocator, Io.Limit.limited(10 * 1024 * 1024)) catch return map;
     defer allocator.free(content);
 
-    // Parse the JSON manually to extract file hashes
-    // Look for pattern: "path": "hash"
-    var pos: usize = 0;
-    while (pos < content.len) {
-        // Find opening quote of a key
-        if (std.mem.indexOfPos(u8, content, pos, "\"")) |q1| {
-            // Find closing quote of key
-            if (std.mem.indexOfPos(u8, content, q1 + 1, "\"")) |q2| {
-                const key = content[q1 + 1 .. q2];
-                // Find value after ": "
-                if (std.mem.indexOfPos(u8, content, q2 + 1, "\"")) |v1| {
-                    if (std.mem.indexOfPos(u8, content, v1 + 1, "\"")) |v2| {
-                        const val = content[v1 + 1 .. v2];
-                        if (val.len == 64 and key.len > 0 and !std.mem.eql(u8, key, "generated_at") and
-                            !std.mem.eql(u8, key, "zmodu_version"))
-                        {
-                            var hash: [64]u8 = undefined;
-                            @memcpy(&hash, val[0..64]);
-                            map.put(allocator.dupe(u8, key) catch break, hash) catch break;
-                        }
-                        pos = v2 + 1;
-                        continue;
-                    }
-                }
-                pos = q2 + 1;
-            } else break;
-        } else break;
-    }
+    parseManifest(allocator, content, &map) catch {
+        map.clearRetainingCapacity();
+    };
 
     return map;
+}
+
+/// Free a map from `loadManifest`: its keys are separate allocations that
+/// `std.StringHashMap.deinit` does not know about.
+pub fn freeManifest(allocator: std.mem.Allocator, map: *std.StringHashMap([64]u8)) void {
+    var keys = map.keyIterator();
+    while (keys.next()) |key| allocator.free(key.*);
+    map.deinit();
+}
+
+/// Read `"path": "<64 hex>"` pairs out of a manifest body. `saveManifest` writes
+/// a flat object, so a pair-at-a-time scan suffices; members whose value is not
+/// a 64-char string (`generated_at`, `zmodu_version`, or the `files` object
+/// itself) are skipped.
+fn parseManifest(allocator: std.mem.Allocator, content: []const u8, map: *std.StringHashMap([64]u8)) !void {
+    var pos: usize = 0;
+    while (nextJsonString(content, &pos)) |key| {
+        var probe = pos;
+        skipWhitespace(content, &probe);
+        if (probe >= content.len or content[probe] != ':') continue;
+        probe += 1;
+        skipWhitespace(content, &probe);
+        // `"files": {` opens the object holding the pairs — not a pair itself.
+        if (probe >= content.len or content[probe] != '"') continue;
+        pos = probe;
+
+        const value = nextJsonString(content, &pos) orelse break;
+        if (value.len != 64) continue;
+
+        var hash: [64]u8 = undefined;
+        @memcpy(&hash, value);
+        try map.put(try allocator.dupe(u8, key), hash);
+    }
+}
+
+/// Read the JSON string starting at `pos` (skipping anything before its opening
+/// quote) and advance `pos` past its closing quote. Backslash escapes are kept
+/// verbatim — hashes never contain one, and a path that does will simply not
+/// match a manifest key.
+fn nextJsonString(content: []const u8, pos: *usize) ?[]const u8 {
+    const open = std.mem.indexOfScalarPos(u8, content, pos.*, '"') orelse return null;
+    var i = open + 1;
+    while (i < content.len) : (i += 1) {
+        if (content[i] == '\\') {
+            i += 1;
+            continue;
+        }
+        if (content[i] == '"') {
+            pos.* = i + 1;
+            return content[open + 1 .. i];
+        }
+    }
+    return null;
+}
+
+fn skipWhitespace(content: []const u8, pos: *usize) void {
+    while (pos.* < content.len and std.ascii.isWhitespace(content[pos.*])) pos.* += 1;
 }
 
 // ── Tests ──
@@ -137,4 +169,76 @@ test "sha256Hex different inputs produce different hashes" {
     const a = sha256Hex("aaa");
     const b = sha256Hex("bbb");
     try std.testing.expect(!std.mem.eql(u8, &a, &b));
+}
+
+test "manifest round-trips through saveManifest/loadManifest" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(dir);
+
+    const body = "pub const x = 1;\n";
+    const entries = [_]HashEntry{
+        .{ .path = "src/main.zig", .hash = sha256Hex(body) },
+        .{ .path = "build.zig.zon", .hash = sha256Hex("zon") },
+        .{ .path = ".claude/skills/a/SKILL.md", .hash = sha256Hex("skill") },
+    };
+    try saveManifest(allocator, io, dir, &entries, "0.26.0");
+
+    var manifest = loadManifest(allocator, io, dir);
+    defer freeManifest(allocator, &manifest);
+
+    try std.testing.expectEqual(entries.len, manifest.count());
+    for (entries) |entry| {
+        try std.testing.expectEqualDeep(entry.hash, manifest.get(entry.path).?);
+    }
+    try std.testing.expect(manifest.get("generated_at") == null);
+    try std.testing.expect(manifest.get("files") == null);
+}
+
+test "loadManifest reports nothing for an absent manifest" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(dir);
+
+    var manifest = loadManifest(allocator, io, dir);
+    defer freeManifest(allocator, &manifest);
+    try std.testing.expectEqual(@as(usize, 0), manifest.count());
+}
+
+test "isUnchanged tells our file from an edited one" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(dir);
+
+    const original = "pub const untouched = true;\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.zig", .data = original });
+
+    const entries = [_]HashEntry{
+        .{ .path = "model.zig", .hash = sha256Hex(original) },
+        .{ .path = "missing.zig", .hash = sha256Hex("gone") },
+    };
+    try saveManifest(allocator, io, dir, &entries, "0.26.0");
+
+    var manifest = loadManifest(allocator, io, dir);
+    defer freeManifest(allocator, &manifest);
+
+    try std.testing.expect(isUnchanged(allocator, io, dir, "model.zig", &manifest));
+    try std.testing.expect(!isUnchanged(allocator, io, dir, "missing.zig", &manifest));
+    try std.testing.expect(!isUnchanged(allocator, io, dir, "never-seen.zig", &manifest));
+
+    // Hand edit → no longer ours.
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.zig", .data = "// mine\n" ++ original });
+    try std.testing.expect(!isUnchanged(allocator, io, dir, "model.zig", &manifest));
 }

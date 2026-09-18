@@ -152,7 +152,9 @@ pub const WebMonitor = struct {
 
         var write_buf: [2048]u8 = undefined;
         var w = stream.writer(self.io, &write_buf);
-        _ = w.interface.writeAll(response) catch {};
+        _ = w.interface.writeAll(response) catch |err| {
+            std.log.debug("[web-monitor] response write failed (peer gone?): {s}", .{@errorName(err)});
+        };
     }
 
     fn handleModules(self: *Self, stream: std.Io.net.Stream) void {
@@ -183,7 +185,9 @@ pub const WebMonitor = struct {
 
         var write_buf: [8192]u8 = undefined;
         var w = stream.writer(self.io, &write_buf);
-        _ = w.interface.writeAll(response) catch {};
+        _ = w.interface.writeAll(response) catch |err| {
+            std.log.debug("[web-monitor] response write failed (peer gone?): {s}", .{@errorName(err)});
+        };
     }
 
     fn handleHealth(self: *Self, stream: std.Io.net.Stream) void {
@@ -194,7 +198,9 @@ pub const WebMonitor = struct {
 
         var write_buf: [256]u8 = undefined;
         var w = stream.writer(self.io, &write_buf);
-        _ = w.interface.writeAll(response) catch {};
+        _ = w.interface.writeAll(response) catch |err| {
+            std.log.debug("[web-monitor] response write failed (peer gone?): {s}", .{@errorName(err)});
+        };
     }
 
     fn handleMetrics(self: *Self, stream: std.Io.net.Stream) void {
@@ -208,7 +214,9 @@ pub const WebMonitor = struct {
 
         var write_buf: [1024]u8 = undefined;
         var w = stream.writer(self.io, &write_buf);
-        _ = w.interface.writeAll(response) catch {};
+        _ = w.interface.writeAll(response) catch |err| {
+            std.log.debug("[web-monitor] response write failed (peer gone?): {s}", .{@errorName(err)});
+        };
     }
 
     fn handle404(self: *Self, stream: std.Io.net.Stream) void {
@@ -219,7 +227,9 @@ pub const WebMonitor = struct {
 
         var write_buf: [256]u8 = undefined;
         var w = stream.writer(self.io, &write_buf);
-        _ = w.interface.writeAll(response) catch {};
+        _ = w.interface.writeAll(response) catch |err| {
+            std.log.debug("[web-monitor] response write failed (peer gone?): {s}", .{@errorName(err)});
+        };
     }
 };
 

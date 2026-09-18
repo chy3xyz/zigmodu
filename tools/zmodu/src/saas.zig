@@ -593,7 +593,11 @@ pub fn generateModule(
         defer allocator.free(P);
         const mod_dir = try std.fs.path.join(allocator, &.{ out_dir, e.name });
         defer allocator.free(mod_dir);
-        std.Io.Dir.cwd().createDirPath(io, mod_dir) catch {};
+        // Best-effort: the createFile per member below fails with the same
+        // underlying error and the full path in hand.
+        std.Io.Dir.cwd().createDirPath(io, mod_dir) catch |err| {
+            std.log.debug("zmodu saas: createDirPath({s}) failed ({s})", .{ mod_dir, @errorName(err) });
+        };
 
         const pairs = [_]struct { name: []const u8, content: []const u8 }{
             .{ .name = "model.zig", .content = try emitModel(allocator, e, P) },

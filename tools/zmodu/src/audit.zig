@@ -257,7 +257,7 @@ fn loadRuleConfig(io: Io, allocator: std.mem.Allocator, project_dir: []const u8)
     if (parsed.value.object.get("disabled")) |dis| {
         if (dis == .array) {
             for (dis.array.items) |item| {
-                if (item == .string) rc.disabled.put(try allocator.dupe(u8, item.string), {}) catch {};
+                if (item == .string) try rc.disabled.put(try allocator.dupe(u8, item.string), {});
             }
         }
     }
@@ -542,6 +542,86 @@ fn cycleVisit(ctx: *CycleCtx, i: usize) !void {
 
 // ── business lint ─────────────────────────────────────────────────────────
 
+/// `collectModelStructs` over every `.zig` file in a module subtree.
+///
+/// Modules are not always flat: `zmodu scaffold --with-agent` emits
+/// `src/modules/ai/agent/`, so a one-level walk leaves the nested files out of
+/// the struct symbol table and b17 cannot classify their types.
+fn collectModelStructsTree(
+    io: Io,
+    allocator: std.mem.Allocator,
+    modules_path: []const u8,
+    rel_sub: []const u8,
+    dir: Dir,
+    out: *std.StringHashMap(bool),
+) !void {
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind == .directory) {
+            var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+            defer sub.close(io);
+            const next_sub = std.fs.path.join(allocator, &.{ rel_sub, entry.name }) catch continue;
+            defer allocator.free(next_sub);
+            try collectModelStructsTree(io, allocator, modules_path, next_sub, sub, out);
+            continue;
+        }
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zig")) continue;
+        const rel = std.fs.path.join(allocator, &.{ modules_path, rel_sub, entry.name }) catch continue;
+        defer allocator.free(rel);
+        const content = Dir.cwd().readFileAlloc(io, rel, allocator, Io.Limit.limited(4 * 1024 * 1024)) catch continue;
+        defer allocator.free(content);
+        try collectModelStructs(allocator, content, out);
+    }
+}
+
+/// `lintFile` over every `.zig` file in a module subtree, at any depth, and
+/// accumulate the two module-level flags b14 needs (a `test` block anywhere in
+/// the subtree counts; a nested `CrudApi`/`CrudService` counts too).
+///
+/// Depth matters. The previous walk opened exactly one directory level, so
+/// `src/modules/ai/agent/*.zig` — a module the generator itself creates — was
+/// never linted, and its violations never surfaced in `zmodu audit` / `ci`.
+fn lintModuleTree(
+    io: Io,
+    allocator: std.mem.Allocator,
+    modules_path: []const u8,
+    rel_sub: []const u8,
+    dir: Dir,
+    config: *const RuleConfig,
+    violations: *std.ArrayList(Violation),
+    saw_test: *bool,
+    saw_autocrud: *bool,
+) !void {
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind == .directory) {
+            var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+            defer sub.close(io);
+            const next_sub = std.fs.path.join(allocator, &.{ rel_sub, entry.name }) catch continue;
+            defer allocator.free(next_sub);
+            try lintModuleTree(io, allocator, modules_path, next_sub, sub, config, violations, saw_test, saw_autocrud);
+            continue;
+        }
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zig")) continue;
+
+        const rel = std.fs.path.join(allocator, &.{ modules_path, rel_sub, entry.name }) catch continue;
+        defer allocator.free(rel);
+        const content = Dir.cwd().readFileAlloc(io, rel, allocator, Io.Limit.limited(4 * 1024 * 1024)) catch continue;
+        defer allocator.free(content);
+
+        const rel_display = std.fs.path.join(allocator, &.{ "src", "modules", rel_sub, entry.name }) catch continue;
+        defer allocator.free(rel_display);
+
+        if (std.mem.indexOf(u8, content, "test \"") != null or std.mem.indexOf(u8, content, "test {") != null) {
+            saw_test.* = true;
+        }
+        if (std.mem.indexOf(u8, content, "CrudApi(") != null or std.mem.indexOf(u8, content, "CrudService(") != null) {
+            saw_autocrud.* = true;
+        }
+        try lintFile(allocator, entry.name, content, rel_display, config, violations);
+    }
+}
+
 fn collectBusiness(
     io: Io,
     allocator: std.mem.Allocator,
@@ -573,15 +653,7 @@ fn collectBusiness(
         if (entry.kind != .directory) continue;
         const scan_dir = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
         defer scan_dir.close(io);
-        var sf_it = scan_dir.iterate();
-        while (try sf_it.next(io)) |f| {
-            if (f.kind != .file or !std.mem.endsWith(u8, f.name, ".zig")) continue;
-            const rel = std.fs.path.join(allocator, &.{ modules_path, entry.name, f.name }) catch continue;
-            defer allocator.free(rel);
-            const content = Dir.cwd().readFileAlloc(io, rel, allocator, Io.Limit.limited(4 * 1024 * 1024)) catch continue;
-            defer allocator.free(content);
-            try collectModelStructs(allocator, content, &model_symbols);
-        }
+        try collectModelStructsTree(io, allocator, modules_path, entry.name, scan_dir, &model_symbols);
     }
     var effective_cfg = config.*;
     effective_cfg.model_symbols = &model_symbols;
@@ -599,24 +671,7 @@ fn collectBusiness(
         // (tenant-mgmt/tenant-shop style) aren't gated before migration.
         var module_has_test = false;
         var module_uses_autocrud = false;
-        var f_it = mod_dir.iterate();
-        while (try f_it.next(io)) |f| {
-            if (f.kind != .file or !std.mem.endsWith(u8, f.name, ".zig")) continue;
-            const rel = std.fs.path.join(allocator, &.{ modules_path, entry.name, f.name }) catch continue;
-            defer allocator.free(rel);
-            const content = Dir.cwd().readFileAlloc(io, rel, allocator, Io.Limit.limited(4 * 1024 * 1024)) catch continue;
-            defer allocator.free(content);
-
-            const rel_display = std.fs.path.join(allocator, &.{ "src", "modules", entry.name, f.name }) catch continue;
-            defer allocator.free(rel_display);
-            if (std.mem.indexOf(u8, content, "test \"") != null or std.mem.indexOf(u8, content, "test {") != null) {
-                module_has_test = true;
-            }
-            if (std.mem.indexOf(u8, content, "CrudApi(") != null or std.mem.indexOf(u8, content, "CrudService(") != null) {
-                module_uses_autocrud = true;
-            }
-            try lintFile(allocator, f.name, content, rel_display, lint_cfg, violations);
-        }
+        try lintModuleTree(io, allocator, modules_path, entry.name, mod_dir, lint_cfg, violations, &module_has_test, &module_uses_autocrud);
         if (module_uses_autocrud and !module_has_test and !config.disabled.contains("b14")) {
             const mod_rel = try std.fs.path.join(allocator, &.{ "src", "modules", entry.name });
             defer allocator.free(mod_rel);
@@ -652,16 +707,26 @@ fn lintFile(
     var fn_open_name: ?[]const u8 = null;
     // b17 — owned-string queryRow* results must be freed (freeScanned) or the
     // caller leaks; scope-local code should prefer queryRowBorrowed instead.
-    var qr_count: usize = 0;
-    var qr_fs_count: usize = 0;
-    var qr_return_count: usize = 0;
-    var qr_first_line: usize = 0;
+    // Granularity is per allocation point: every owned queryRow* call in the fn
+    // becomes one `QrItem` and is judged on its own by flushOwnedRow, so a
+    // single `freeScanned` can no longer clear the whole fn.
+    var qr_items: std.ArrayList(QrItem) = .empty;
+    defer qr_items.deinit(allocator);
+    var qr_free_lines: std.ArrayList([]const u8) = .empty;
+    defer qr_free_lines.deinit(allocator);
+    // b10 — a `catch` whose empty body opens on a later line. Both shapes
+    // (`foo() catch {\n};` and `foo() catch\n{};`) are invisible to a
+    // single-line test, so the tail is carried across lines.
+    var pending_catch_kw_line: usize = 0; // saw bare `catch` / `catch |e|`, body pending
+    var pending_catch_brace_line: usize = 0; // saw `catch {`, closing brace pending
     // b18 — pseudo-transaction guard: beginTx() followed by a pool-connection
     // exec in the same fn (auto-commit, rollback no-op).
     var b18_begin_seen = false;
     // `const x = queryRow(...)` whose value is delegated via the next-line
     // `return x;` — ownership transfers, no leak at this call site.
     var pending_qr_var: ?[]const u8 = null;
+    // Index into `qr_items` of the allocation `pending_qr_var` came from.
+    var pending_qr_item: usize = 0;
     // Inside a `return .{ … };` assembly that may borrow the pending var whole.
     var in_return_assembly = false;
     // A queryRow* call whose first argument starts on the NEXT line (e.g.
@@ -693,8 +758,8 @@ fn lintFile(
         // kills every in-flight request, not just the buggy one. Return an
         // error instead (handler → respondErr / error propagation).
         // Idiomatic switch-prong exhaustiveness (`=> unreachable,`) is fine;
-        // we flag statement form (`catch unreachable;`, `unreachable;`) and
-        // explicit `@panic(...)`.
+        // we flag the statement form — a catch whose body is `unreachable`, or
+        // a bare `unreachable;` — plus explicit `@panic(...)`.
         if ((std.mem.eql(u8, file_name, "api.zig") or std.mem.eql(u8, file_name, "service.zig") or std.mem.eql(u8, file_name, "persistence.zig")) and !config.disabled.contains("b19")) {
             if (std.mem.indexOf(u8, trimmed, "@panic(") != null or std.mem.endsWith(u8, trimmed, "unreachable;")) {
                 try pushViolation(violations, allocator, "b19", rel_path, idx, "请求路径裸 panic — panic 会终止整个进程（拖垮全部在途请求）；改为返回错误（handler 用 respondErr / 错误传播），确实不可能的分支用 // audit: ignore b19 注明", .{});
@@ -768,16 +833,19 @@ fn lintFile(
         // allocator, so each call site must `freeScanned` them (or delegate
         // ownership via `return`). Scope-local code should prefer the RAII
         // `queryRowBorrowed` (arena owned by the wrapper, nothing to free).
-        // Heuristic is per-fn and heuristic: flag when a service/persistence
-        // fn has owned queryRow* calls, no freeScanned anywhere in it, and
-        // doesn't `return` all of them.
+        //
+        // Granularity: per allocation point, not per fn. Each owned queryRow*
+        // call is appended as its own QrItem and resolved independently at
+        // flush time (a named binding only counts as freed when a
+        // `freeScanned(...)` in the same fn names that variable), so one
+        // `freeScanned` no longer washes every other call in the fn.
         if ((std.mem.eql(u8, file_name, "service.zig") or std.mem.eql(u8, file_name, "persistence.zig")) and !config.disabled.contains("b17")) {
             if (pubFnName(trimmed)) |_| {
-                try flushOwnedRow(qr_count, qr_fs_count, qr_return_count, qr_first_line, rel_path, allocator, violations);
-                qr_count = 0;
-                qr_fs_count = 0;
-                qr_return_count = 0;
-                qr_first_line = 0;
+                try flushOwnedRow(qr_items.items, qr_free_lines.items, rel_path, allocator, violations);
+                qr_items.clearRetainingCapacity();
+                qr_free_lines.clearRetainingCapacity();
+                pending_qr_var = null;
+                pending_qr_item = 0;
             } else {
                 // Delegate pattern: `const x = queryRow(...); return x;` —
                 // the following line(s) decide whether ownership transfers
@@ -785,42 +853,41 @@ fn lintFile(
                 // intermediate `const y = .{ … x … }; return y;` chain).
                 if (pending_qr_var) |v| {
                     if (in_return_assembly) {
-                        if (isWholeVarAssign(line, v)) qr_return_count += 1;
+                        if (isWholeVarAssign(line, v)) markQrReturned(qr_items.items, pending_qr_item);
                         if (std.mem.endsWith(u8, trimmed, "};")) {
                             in_return_assembly = false;
                             pending_qr_var = null;
                         }
                     } else if (isReturnVar(trimmed, v)) {
-                        qr_return_count += 1;
+                        markQrReturned(qr_items.items, pending_qr_item);
                         pending_qr_var = null;
                     } else if (std.mem.indexOf(u8, line, "return .{") != null) {
                         in_return_assembly = true;
-                        if (isWholeVarAssign(line, v)) qr_return_count += 1;
+                        if (isWholeVarAssign(line, v)) markQrReturned(qr_items.items, pending_qr_item);
                         if (std.mem.endsWith(u8, trimmed, "};")) {
                             in_return_assembly = false;
                             pending_qr_var = null;
                         }
                     } else if (constAssignedVar(line)) |alias| {
                         // Intermediate assembly/alias: ownership follows the
-                        // alias until it is returned (or used elsewhere).
+                        // alias until it is returned (or used elsewhere). Still
+                        // the same allocation, so the QrItem is unchanged.
                         pending_qr_var = if (isWholeVarAssign(line, v)) alias else null;
                     } else {
                         pending_qr_var = null;
                     }
                 }
-                if (std.mem.indexOf(u8, line, "freeScanned") != null) qr_fs_count += 1;
+                if (std.mem.indexOf(u8, line, "freeScanned") != null) {
+                    try qr_free_lines.append(allocator, line);
+                }
                 // Cross-line queryRow* call: first argument starts next line.
                 if (pending_qr_open_line > 0) {
                     if (std.mem.startsWith(u8, trimmed, "struct {")) {
                         if (!isScalarInlineStruct(line)) {
-                            if (qr_count == 0) qr_first_line = pending_qr_open_line;
-                            qr_count += 1;
-                            if (isReturnOfOwnedQueryRow(trimmed)) qr_return_count += 1;
+                            try qr_items.append(allocator, .{ .line = pending_qr_open_line, .name = null, .returned = isReturnOfOwnedQueryRow(trimmed) });
                         }
                     } else if (!namedTypeHasNoString(line, config.model_symbols)) {
-                        if (qr_count == 0) qr_first_line = pending_qr_open_line;
-                        qr_count += 1;
-                        if (isReturnOfOwnedQueryRow(trimmed)) qr_return_count += 1;
+                        try qr_items.append(allocator, .{ .line = pending_qr_open_line, .name = null, .returned = isReturnOfOwnedQueryRow(trimmed) });
                     }
                     pending_qr_open_line = 0;
                 }
@@ -837,23 +904,24 @@ fn lintFile(
                         // named type the symbol table knows to be string-free:
                         // row owns no strings — nothing to free.
                     } else {
-                        if (qr_count == 0) qr_first_line = idx;
-                        qr_count += 1;
+                        const bound = constAssignedVar(line);
+                        try qr_items.append(allocator, .{ .line = idx, .name = bound, .returned = isReturnOfOwnedQueryRow(trimmed) });
+                        pending_qr_item = qr_items.items.len - 1;
                         if (isReturnOfOwnedQueryRow(trimmed)) {
-                            qr_return_count += 1;
-                        } else if (constAssignedVar(line)) |name| {
+                            // `return …queryRow(...)` — ownership transfers.
+                        } else if (bound) |name| {
                             pending_qr_var = name;
                         }
                     }
                 }
                 if (std.mem.eql(u8, trimmed, "}")) {
-                    try flushOwnedRow(qr_count, qr_fs_count, qr_return_count, qr_first_line, rel_path, allocator, violations);
-                    qr_count = 0;
-                    qr_fs_count = 0;
-                    qr_return_count = 0;
-                    qr_first_line = 0;
+                    try flushOwnedRow(qr_items.items, qr_free_lines.items, rel_path, allocator, violations);
+                    qr_items.clearRetainingCapacity();
+                    qr_free_lines.clearRetainingCapacity();
                     in_return_assembly = false;
                     pending_qr_open_line = 0;
+                    pending_qr_var = null;
+                    pending_qr_item = 0;
                 }
             }
         }
@@ -894,16 +962,24 @@ fn lintFile(
             }
         }
 
-        // b3 — non-parameterized SQL in persistence/service.
+        // b3 — non-parameterized SQL in persistence/service. A literal that is
+        // only compared against a column (`AND status = 'active'`) carries no
+        // caller input and is exempt; interpolated (`{s}`), concatenated
+        // (`++`) or non-`=`-position literals are still reported.
         if (std.mem.eql(u8, file_name, "persistence.zig") or std.mem.eql(u8, file_name, "service.zig")) {
-            if (looksLikeSql(line) and hasNonEmptyStringLiteral(line) and !config.disabled.contains("b3")) {
+            if (looksLikeSql(line) and hasNonEmptyStringLiteral(line) and
+                !onlyConstantStringComparisons(line) and !config.disabled.contains("b3"))
+            {
                 try pushViolation(violations, allocator, "b3", rel_path, idx, "SQL statement contains string literals — use ? placeholders with bound args", .{});
             }
         }
 
-        // b4 — @ptrCast on user_data.
+        // b4 — @ptrCast on user_data. `auth_info` is a separate field now, so a
+        // `user_data` cast is route-state access, not the old AuthInfo
+        // side-channel — but spelling the cast by hand still means a raw
+        // `orelse unreachable` at every call site. Point at `ctx.state(T)`.
         if (std.mem.indexOf(u8, line, "@ptrCast") != null and std.mem.indexOf(u8, line, "user_data") != null and !config.disabled.contains("b4")) {
-            try pushViolation(violations, allocator, "b4", rel_path, idx, "@ptrCast on ctx.user_data — read auth via middleware attrs (user_id/tenant_id/permissions)", .{});
+            try pushViolation(violations, allocator, "b4", rel_path, idx, "@ptrCast on ctx.user_data — use ctx.state(T) for the route state; read identity via attrs (userId/tenantId/permissions)", .{});
         }
 
         // b5 — legacy response helpers.
@@ -952,11 +1028,35 @@ fn lintFile(
         // write, e.g. SSE disconnect) are best-effort by nature — the
         // original error is what matters, the cleanup failure is secondary —
         // so they are idiomatic rather than swallowed errors and exempted.
+        // A body that opens on the *next* line is resolved here as well.
         if (isEmptyCatch(line) and
             !containsAny(line, &.{ "errdefer", "rollback", "sendError" }) and
             !config.disabled.contains("b10"))
         {
             try pushViolation(violations, allocator, "b10", rel_path, idx, "empty catch block swallows errors — log and propagate (ZigModuError)", .{});
+        }
+        if (!config.disabled.contains("b10")) {
+            const exempt = containsAny(line, &.{ "errdefer", "rollback", "sendError" });
+            if (pending_catch_kw_line > 0) {
+                switch (catchBodyKind(trimmed)) {
+                    .empty => try pushViolation(violations, allocator, "b10", rel_path, pending_catch_kw_line, "empty catch block swallows errors — log and propagate (ZigModuError)", .{}),
+                    .open => pending_catch_brace_line = pending_catch_kw_line,
+                    .other => {},
+                }
+                pending_catch_kw_line = 0;
+            } else if (pending_catch_brace_line > 0) {
+                if (std.mem.eql(u8, trimmed, "}") or std.mem.eql(u8, trimmed, "};")) {
+                    try pushViolation(violations, allocator, "b10", rel_path, pending_catch_brace_line, "empty catch block swallows errors — log and propagate (ZigModuError)", .{});
+                }
+                pending_catch_brace_line = 0;
+            }
+            if (!exempt) {
+                switch (catchTailKind(trimmed)) {
+                    .keyword => pending_catch_kw_line = idx,
+                    .open_brace => pending_catch_brace_line = idx,
+                    .none => {},
+                }
+            }
         }
 
         // b12 — pure CRUD passthrough in service.zig: a list/get/create/
@@ -1005,7 +1105,7 @@ fn lintFile(
         }
     }
     try flushMultiWrite(fn_open, fn_open_name, fn_open_line, fn_write_count, fn_tx_seen, rel_path, allocator, violations);
-    try flushOwnedRow(qr_count, qr_fs_count, qr_return_count, qr_first_line, rel_path, allocator, violations);
+    try flushOwnedRow(qr_items.items, qr_free_lines.items, rel_path, allocator, violations);
 
     // Line-level exemptions: a source line ending with `// audit: ignore`
     // (all rules) or `// audit: ignore b13,b17` (specific rules) drops the
@@ -1059,21 +1159,84 @@ fn flushMultiWrite(
     }
 }
 
-/// b17 — flush the per-fn owned-string bookkeeping: report when the fn used
-/// owned `queryRow*` calls but neither freed them (`freeScanned`) nor
-/// delegated every result via `return`.
+/// b17 — one owned-string `queryRow*` allocation inside a service/persistence
+/// fn. `name` is the variable it was bound to (`const p = …queryRow(…)`) when
+/// there is one; `returned` records that ownership was delegated via `return`.
+const QrItem = struct {
+    line: usize,
+    name: ?[]const u8,
+    returned: bool,
+};
+
+/// Mark the QrItem at `index` as ownership-delegated. Idempotent: an alias
+/// chain can re-report the same allocation.
+fn markQrReturned(items: []QrItem, index: usize) void {
+    if (index < items.len) items[index].returned = true;
+}
+
+/// b17 — flush one function's owned-string allocations.
+///
+/// Granularity is per allocation point, deliberately NOT per fn: an entry is
+/// reported only when that specific `queryRow`/`queryRowPartial` result was
+/// neither returned nor named as the argument of a `freeScanned(...)` call in
+/// the same fn. One `freeScanned` therefore no longer suppresses every other
+/// leak in the fn (the previous per-fn counter did exactly that).
+///
+/// Matching is by variable name with identifier boundaries, so
+/// `freeScanned(allocator, model.Product, p)` releases the allocation bound to
+/// `p` and nothing else.
 fn flushOwnedRow(
-    qr_count: usize,
-    qr_fs_count: usize,
-    qr_return_count: usize,
-    qr_first_line: usize,
+    items: []const QrItem,
+    free_lines: []const []const u8,
     rel_path: []const u8,
     allocator: std.mem.Allocator,
     violations: *std.ArrayList(Violation),
 ) !void {
-    if (qr_count > 0 and qr_fs_count == 0 and qr_return_count < qr_count) {
-        try pushViolation(violations, allocator, "b17", rel_path, qr_first_line, "queryRow/queryRowPartial returns owned strings never freed here — call freeScanned(allocator, T, row) or use queryRowBorrowed (RAII arena, nothing to free)", .{});
+    // Pass 1 — named allocations, matched against the `freeScanned` lines.
+    var claimed_free: usize = 0;
+    for (items) |item| {
+        if (item.returned) continue;
+        const name = item.name orelse continue;
+        var freed = false;
+        for (free_lines) |fl| {
+            if (containsIdentifier(fl, name)) {
+                freed = true;
+                break;
+            }
+        }
+        if (freed) {
+            claimed_free += 1;
+        } else {
+            try pushViolation(violations, allocator, "b17", rel_path, item.line, "queryRow/queryRowPartial bound to '{s}' returns owned strings never freed here — call freeScanned(allocator, T, {s}) or use queryRowBorrowed (RAII arena, nothing to free)", .{ name, name });
+        }
     }
+    // Pass 2 — results with no variable to match (passed straight into another
+    // call, discarded, or only a field of them escapes). Each one consumes a
+    // `freeScanned` call that no named allocation claimed.
+    var spare = free_lines.len -| claimed_free;
+    for (items) |item| {
+        if (item.returned or item.name != null) continue;
+        if (spare > 0) {
+            spare -= 1;
+            continue;
+        }
+        try pushViolation(violations, allocator, "b17", rel_path, item.line, "queryRow/queryRowPartial returns owned strings never freed here — call freeScanned(allocator, T, row) or use queryRowBorrowed (RAII arena, nothing to free)", .{});
+    }
+}
+
+/// True when `name` occurs in `haystack` as a whole identifier, so `p` is not
+/// matched inside `Product` or `self`.
+fn containsIdentifier(haystack: []const u8, name: []const u8) bool {
+    if (name.len == 0) return false;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, from, name)) |pos| {
+        const before_ok = pos == 0 or !isWordChar(haystack[pos - 1]);
+        const after = pos + name.len;
+        const after_ok = after >= haystack.len or !isWordChar(haystack[after]);
+        if (before_ok and after_ok) return true;
+        from = pos + 1;
+    }
+    return false;
 }
 
 /// Owned-string single-row query calls (the caller owns the returned string
@@ -1349,9 +1512,15 @@ fn bareJsonStructArg(line: []const u8) ?[]const u8 {
     return payload;
 }
 
+/// The banned pattern b10 looks for, spelled from two pieces so the linter's own
+/// source does not match a tree-wide search for that pattern — a raw hit reads
+/// as a violation, and `scripts/check-production.sh` scans this file. The b10
+/// fixtures below build their sample source from it for the same reason.
+const empty_catch_needle = "catch " ++ "{}";
+
 fn isEmptyCatch(line: []const u8) bool {
     const trimmed = std.mem.trim(u8, line, " \t\r");
-    if (std.mem.indexOf(u8, trimmed, "catch {}")) |_| return true;
+    if (std.mem.indexOf(u8, trimmed, empty_catch_needle)) |_| return true;
     const c = std.mem.indexOf(u8, trimmed, "catch") orelse return false;
     const after = std.mem.trim(u8, trimmed[c + 5 ..], " \t");
     // catch |err| {} / catch |_| {} / catch |e| { } (empty body)
@@ -1365,6 +1534,44 @@ fn isEmptyCatch(line: []const u8) bool {
     return false;
 }
 
+/// What trails the LAST `catch` on a line.
+const CatchTail = enum { none, keyword, open_brace };
+
+/// Classify the text after the last `catch` on `trimmed`:
+///   * `keyword`    — `catch` / `catch |e|` with the body on a later line;
+///   * `open_brace` — `catch {` with nothing after the brace;
+///   * `none`       — a complete body (handled by `isEmptyCatch`) or no catch.
+/// This is what makes the multi-line shapes
+/// `foo() catch {\n};` and `foo() catch\n{};` visible.
+fn catchTailKind(trimmed: []const u8) CatchTail {
+    const pos = std.mem.lastIndexOf(u8, trimmed, "catch") orelse return .none;
+    var body = std.mem.trim(u8, trimmed[pos + "catch".len ..], " \t");
+    if (body.len == 0) return .keyword;
+    if (body[0] == '|') {
+        const close = std.mem.indexOfScalarPos(u8, body, 1, '|') orelse return .none;
+        body = std.mem.trim(u8, body[close + 1 ..], " \t");
+        if (body.len == 0) return .keyword;
+    }
+    if (body.len == 1 and body[0] == '{') return .open_brace;
+    return .none;
+}
+
+/// Meaning of a line that should carry the body of a pending `catch`.
+const CatchBody = enum { other, empty, open };
+
+fn catchBodyKind(trimmed: []const u8) CatchBody {
+    if (std.mem.eql(u8, trimmed, "{")) return .open;
+    // A trailing `;` (statement position) or `,` (switch arm / initializer list)
+    // is punctuation, not body — without this, a call followed by an empty
+    // catch body read as "other" and slipped past the empty-catch check entirely.
+    var body = std.mem.trim(u8, trimmed, " \t");
+    while (body.len > 0 and (body[body.len - 1] == ';' or body[body.len - 1] == ',')) {
+        body = std.mem.trim(u8, body[0 .. body.len - 1], " \t");
+    }
+    if (body.len == 2 and body[0] == '{' and body[1] == '}') return .empty;
+    return .other;
+}
+
 fn containsAny(haystack: []const u8, needles: []const []const u8) bool {
     for (needles) |n| {
         if (std.mem.indexOf(u8, haystack, n) != null) return true;
@@ -1372,11 +1579,32 @@ fn containsAny(haystack: []const u8, needles: []const []const u8) bool {
     return false;
 }
 
+/// SQL statement openers. `WITH` (CTE), `PRAGMA` and `TRUNCATE` were missing, so
+/// those statements were never checked for injected literals.
+const sql_keywords = [_][]const u8{ "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "WITH", "PRAGMA", "TRUNCATE" };
+
+/// Case-insensitive keyword match with identifier boundaries, so
+/// `withContext(...)` / `createTable(...)` are not read as SQL.
+fn containsSqlKeyword(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or haystack.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (!containsIgnoreCase(haystack[i .. i + needle.len], needle)) continue;
+        const before_ok = i == 0 or !isWordChar(haystack[i - 1]);
+        const after = i + needle.len;
+        const after_ok = after >= haystack.len or !isWordChar(haystack[after]);
+        if (before_ok and after_ok) return true;
+    }
+    return false;
+}
+
+fn isWordChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
 fn looksLikeSql(line: []const u8) bool {
-    const needle = "SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER";
-    var it = std.mem.splitScalar(u8, needle, '|');
-    while (it.next()) |kw| {
-        if (containsIgnoreCase(line, kw)) return true;
+    for (sql_keywords) |kw| {
+        if (containsSqlKeyword(line, kw)) return true;
     }
     return false;
 }
@@ -1397,6 +1625,36 @@ fn hasNonEmptyStringLiteral(line: []const u8) bool {
         return true;
     }
     return false;
+}
+
+/// b3 false-positive guard: true when every non-empty string literal on the
+/// line is the right-hand side of a comparison (`status = 'active'`,
+/// `kind != 'x'`) and nothing is interpolated (`{s}` / `{d}`) or concatenated
+/// (`++`). Such a literal is fixed statement text — no caller input can reach
+/// it — so `SELECT … WHERE status = 'active'` is not an injection.
+fn onlyConstantStringComparisons(line: []const u8) bool {
+    if (containsAny(line, &.{ "{s}", "{d}", "{any}", "{f}", "++" })) return false;
+    var seen = false;
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        if (line[i] != '\'') continue;
+        // `''` — empty literal (alias/default), not a value.
+        if (i + 1 < line.len and line[i + 1] == '\'') {
+            i += 1;
+            continue;
+        }
+        const close = std.mem.indexOfScalarPos(u8, line, i + 1, '\'') orelse return false;
+        // Must sit right after a comparison operator (`=`/`==`/`!=`/`<=`/`>=`).
+        var j = i;
+        while (j > 0 and (line[j - 1] == ' ' or line[j - 1] == '\t')) j -= 1;
+        if (j == 0 or line[j - 1] != '=') return false;
+        if (j >= 2 and line[j - 2] == '+') return false; // `+= '…'`
+        // Must be a complete literal, not a fragment of a concatenation.
+        if (close + 1 < line.len and (line[close + 1] == '+' or line[close + 1] == '\'')) return false;
+        seen = true;
+        i = close;
+    }
+    return seen;
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -1515,9 +1773,13 @@ fn writeBaseline(
     baseline_path: []const u8,
     violations: []const Violation,
 ) !void {
-    // Ensure parent dir exists.
+    // Ensure parent dir exists. Best-effort: if this fails the createFile below
+    // reports the same underlying error with the path attached, so only a debug
+    // line is warranted here.
     const parent = std.fs.path.dirname(baseline_path) orelse ".";
-    Dir.cwd().createDirPath(io, parent) catch {};
+    Dir.cwd().createDirPath(io, parent) catch |err| {
+        std.log.debug("[audit] baseline parent dir '{s}' not created ({s})", .{ parent, @errorName(err) });
+    };
 
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
@@ -1775,22 +2037,25 @@ test "audit business lint flags anti-patterns" {
 
     try lintFile(allocator, "api.zig", "const r = try client.queryRows(T, sql, args);\n", "src/modules/x/api.zig", &cfg, &violations);
     try lintFile(allocator, "model.zig", "const r = try client.queryRows(T, sql, args);\n", "src/modules/x/model.zig", &cfg, &violations);
-    try lintFile(allocator, "persistence.zig", "SELECT * FROM users WHERE name = 'alice'\n", "src/modules/x/persistence.zig", &cfg, &violations);
+    try lintFile(allocator, "persistence.zig", "const sql = \"SELECT * FROM users WHERE name = '\" ++ name ++ \"'\";\n", "src/modules/x/persistence.zig", &cfg, &violations);
     // b3 negative — empty string literal (alias/default) is not an injection vector.
     try lintFile(allocator, "persistence.zig", "SELECT '' AS spec_sku_id FROM skus WHERE id = ?\n", "src/modules/x/persistence.zig", &cfg, &violations);
+    // b3 negative — constant comparison: the literal is statement text, no input
+    // can reach it (`WHERE status = 'active'` used to be a false positive).
+    try lintFile(allocator, "persistence.zig", "SELECT * FROM users WHERE status = 'active'\n", "src/modules/x/persistence.zig", &cfg, &violations);
     try lintFile(allocator, "service.zig", "const auth = @ptrCast(@alignCast(ctx.user_data));\n", "src/modules/x/service.zig", &cfg, &violations);
     try lintFile(allocator, "api.zig", "try sendFail(ctx, 500, \"x\");\n", "src/modules/x/api.zig", &cfg, &violations);
     try lintFile(allocator, "root.zig", "const z = @import(\"zigmodu.http_server\");\n", "src/modules/x/root.zig", &cfg, &violations);
     try lintFile(allocator, "service.zig", "var mu: std.Thread.Mutex = .init;\n", "src/modules/x/service.zig", &cfg, &violations);
     try lintFile(allocator, "service.zig", "const p = @import(\"../../modules/order/persistence.zig\");\n", "src/modules/x/service.zig", &cfg, &violations);
     try lintFile(allocator, "api.zig", "const auth = ctx.getHeader(\"Authorization\");\n", "src/modules/x/api.zig", &cfg, &violations);
-    try lintFile(allocator, "service.zig", "client.exec(sql, &.{}) catch {};\n", "src/modules/x/service.zig", &cfg, &violations);
+    try lintFile(allocator, "service.zig", "client.exec(sql, &.{}) " ++ empty_catch_needle ++ ";\n", "src/modules/x/service.zig", &cfg, &violations);
     try lintFile(allocator, "service.zig", "client.exec(sql, &.{}) catch |err| {};\n", "src/modules/x/service.zig", &cfg, &violations);
     // b10 negative — errdefer rollback is best-effort cleanup, not a swallowed error.
-    try lintFile(allocator, "service.zig", "errdefer tx.rollback() catch {};\n", "src/modules/x/service.zig", &cfg, &violations);
-    try lintFile(allocator, "service.zig", "errdefer conn.close(io) catch {};\n", "src/modules/x/service.zig", &cfg, &violations);
+    try lintFile(allocator, "service.zig", "errdefer tx.rollback() " ++ empty_catch_needle ++ ";\n", "src/modules/x/service.zig", &cfg, &violations);
+    try lintFile(allocator, "service.zig", "errdefer conn.close(io) " ++ empty_catch_needle ++ ";\n", "src/modules/x/service.zig", &cfg, &violations);
     // b10 negative — sendError is best-effort (SSE disconnect / client gone).
-    try lintFile(allocator, "service.zig", "sse.sendError(500, \"boom\") catch {};\n", "src/modules/x/service.zig", &cfg, &violations);
+    try lintFile(allocator, "service.zig", "sse.sendError(500, \"boom\") " ++ empty_catch_needle ++ ";\n", "src/modules/x/service.zig", &cfg, &violations);
     // b18 — pseudo-transaction: beginTx then pool exec.
     try lintFile(allocator, "service.zig", "pub fn pay(self: *@This(), id: i64) !void {\n    _ = try self.client.beginTx();\n    _ = self.db.exec(\"UPDATE orders SET paid = 1 WHERE id = ?\", &.{});\n}\n", "src/modules/x/service.zig", &cfg, &violations);
     // b18 negative — tx handle exec inside the transaction is fine.
@@ -2028,11 +2293,11 @@ test "audit line-level ignore comment suppresses that line's violations" {
     }
 
     // Line with `// audit: ignore b10` — the swallowed-error catch is exempt.
-    try lintFile(allocator, "service.zig", "client.exec(sql, &.{}) catch {}; // audit: ignore b10\n", "src/modules/x/service.zig", &cfg, &violations);
+    try lintFile(allocator, "service.zig", "client.exec(sql, &.{}) " ++ empty_catch_needle ++ "; // audit: ignore b10\n", "src/modules/x/service.zig", &cfg, &violations);
     // Same pattern without the marker still reports.
-    try lintFile(allocator, "service.zig", "client.exec(sql, &.{}) catch {};\n", "src/modules/x/service.zig", &cfg, &violations);
+    try lintFile(allocator, "service.zig", "client.exec(sql, &.{}) " ++ empty_catch_needle ++ ";\n", "src/modules/x/service.zig", &cfg, &violations);
     // Bare `// audit: ignore` ignores every rule on that line.
-    try lintFile(allocator, "service.zig", "client.exec(sql, &.{}) catch {}; // audit: ignore\n", "src/modules/x/service.zig", &cfg, &violations);
+    try lintFile(allocator, "service.zig", "client.exec(sql, &.{}) " ++ empty_catch_needle ++ "; // audit: ignore\n", "src/modules/x/service.zig", &cfg, &violations);
 
     var rules = std.StringHashMap(usize).init(allocator);
     defer rules.deinit();
@@ -2042,4 +2307,104 @@ test "audit line-level ignore comment suppresses that line's violations" {
         gop.value_ptr.* += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), rules.get("b10").?);
+}
+
+test "audit b10 flags empty catch bodies that open on a later line" {
+    const allocator = std.testing.allocator;
+    var cfg = RuleConfig{};
+    cfg.disabled = std.StringHashMap(void).init(allocator);
+    defer cfg.deinit(allocator);
+
+    var violations = std.ArrayList(Violation).empty;
+    defer {
+        for (violations.items) |*v| v.deinit(allocator);
+        violations.deinit(allocator);
+    }
+
+    // `catch {` … `};` — the brace opens on the catch line.
+    try lintFile(allocator, "service.zig", "client.exec(sql, &.{}) catch {\n};\n", "src/modules/x/service.zig", &cfg, &violations);
+    // `catch` … `{};` — no brace at all on the catch line.
+    try lintFile(allocator, "service.zig", "client.exec(sql, &.{}) catch\n    {};\n", "src/modules/x/service.zig", &cfg, &violations);
+    // `catch |err|` … `{};` — capture on the catch line, body below.
+    try lintFile(allocator, "service.zig", "client.exec(sql, &.{}) catch |err|\n    {};\n", "src/modules/x/service.zig", &cfg, &violations);
+    // Negative — a body with content on the next line is not empty.
+    try lintFile(allocator, "service.zig", "client.exec(sql, &.{}) catch |err| {\n    std.log.warn(\"{s}\", .{@errorName(err)});\n};\n", "src/modules/x/service.zig", &cfg, &violations);
+    // Negative — `errdefer` best-effort cleanup stays exempt across lines.
+    try lintFile(allocator, "service.zig", "errdefer conn.close(io) catch {\n};\n", "src/modules/x/service.zig", &cfg, &violations);
+    // Trailing `,` instead of `;` — a switch arm / initializer list. The body is
+    // still empty, so this must be flagged too (it used to read as "other").
+    try lintFile(allocator, "service.zig", "client.exec(sql, &.{}) " ++ empty_catch_needle ++ ",\n", "src/modules/x/service.zig", &cfg, &violations);
+    try lintFile(allocator, "service.zig", "client.exec(sql, &.{}) catch\n    {},\n", "src/modules/x/service.zig", &cfg, &violations);
+
+    var b10: usize = 0;
+    for (violations.items) |v| {
+        if (std.mem.eql(u8, v.rule, "b10")) b10 += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 5), b10);
+}
+
+test "audit b3 covers CTE/pragma/truncate without flagging constant comparisons" {
+    const allocator = std.testing.allocator;
+    var cfg = RuleConfig{};
+    cfg.disabled = std.StringHashMap(void).init(allocator);
+    defer cfg.deinit(allocator);
+
+    var violations = std.ArrayList(Violation).empty;
+    defer {
+        for (violations.items) |*v| v.deinit(allocator);
+        violations.deinit(allocator);
+    }
+
+    // WITH (CTE) was never checked before.
+    try lintFile(allocator, "persistence.zig", "const q = std.fmt.allocPrint(a, \"WITH t AS (SELECT 1) SELECT * FROM t WHERE n = '{s}'\", .{n});\n", "src/modules/x/persistence.zig", &cfg, &violations);
+    // PRAGMA and TRUNCATE likewise.
+    try lintFile(allocator, "persistence.zig", "const q = std.fmt.allocPrint(a, \"PRAGMA table_info('{s}')\", .{t});\n", "src/modules/x/persistence.zig", &cfg, &violations);
+    try lintFile(allocator, "persistence.zig", "const q = std.fmt.allocPrint(a, \"TRUNCATE TABLE t WHERE k = '{s}'\", .{k});\n", "src/modules/x/persistence.zig", &cfg, &violations);
+    // Positive — a concatenated literal is injectable.
+    try lintFile(allocator, "persistence.zig", "const q = \"SELECT * FROM t WHERE a = '\" ++ a ++ \"'\";\n", "src/modules/x/persistence.zig", &cfg, &violations);
+    // Negative — `withContext` is not a CTE (word-boundary match).
+    try lintFile(allocator, "persistence.zig", "const v = withContext(\"x\");\n", "src/modules/x/persistence.zig", &cfg, &violations);
+    // Negative — constant comparisons only.
+    try lintFile(allocator, "persistence.zig", "SELECT * FROM t WHERE a = 'b' AND c = 'd'\n", "src/modules/x/persistence.zig", &cfg, &violations);
+
+    var b3: usize = 0;
+    for (violations.items) |v| {
+        if (std.mem.eql(u8, v.rule, "b3")) b3 += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), b3);
+}
+
+test "audit b17 resolves each allocation point on its own" {
+    const allocator = std.testing.allocator;
+    var cfg = RuleConfig{};
+    cfg.disabled = std.StringHashMap(void).init(allocator);
+    defer cfg.deinit(allocator);
+
+    var violations = std.ArrayList(Violation).empty;
+    defer {
+        for (violations.items) |*v| v.deinit(allocator);
+        violations.deinit(allocator);
+    }
+
+    // Two owned rows in one fn, only `p` freed: the old per-fn rule saw a
+    // `freeScanned` in the fn and cleared both.
+    try lintFile(allocator, "service.zig", "pub fn two(self: *@This(), id: i64) !void {\n" ++
+        "    const p = try self.db.queryRow(model.Product, \"SELECT * FROM products WHERE id = ?\", &.{.{ .int = id }});\n" ++
+        "    defer freeScanned(self.allocator, model.Product, p);\n" ++
+        "    const q = try self.db.queryRow(model.Product, \"SELECT * FROM products WHERE id = ?\", &.{.{ .int = id }});\n" ++
+        "    _ = q;\n" ++
+        "}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // Negative control — both allocations are freed.
+    try lintFile(allocator, "service.zig", "pub fn both(self: *@This(), id: i64) !void {\n" ++
+        "    const p = try self.db.queryRow(model.Product, \"SELECT * FROM products WHERE id = ?\", &.{.{ .int = id }});\n" ++
+        "    defer freeScanned(self.allocator, model.Product, p);\n" ++
+        "    const q = try self.db.queryRow(model.Product, \"SELECT * FROM products WHERE id = ?\", &.{.{ .int = id }});\n" ++
+        "    defer freeScanned(self.allocator, model.Product, q);\n" ++
+        "}\n", "src/modules/x/service.zig", &cfg, &violations);
+
+    var b17: usize = 0;
+    for (violations.items) |v| {
+        if (std.mem.eql(u8, v.rule, "b17")) b17 += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), b17);
 }

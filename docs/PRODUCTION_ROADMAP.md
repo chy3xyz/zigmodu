@@ -253,7 +253,7 @@ Agent / Workflow / Skill / MCP / LLM 策略等**业务产品能力**，不是后
 - 由于 Zig 惰性分析，**不 import `zmodu.ai` 的消费者不会编译这 13k 行**——
   边界是结构性的，不靠纪律。回归守卫见 `src/tests.zig`
   「domain modules stay independent of the optional src/ai domain」。
-- 使用者：`examples/ai-ops`、`llm-policies`、`mcp-server`、`tenant-ai` 四个示例。
+- 使用者：`examples/ai-ops`、`llm-policies`、`mcp-server` 三个示例。
 
 **为什么仍建议最终抽成独立包**：
 - 版本节奏不同：LLM/Agent 侧 API 变动快，框架侧求稳，同仓同版本号会互相拖累。

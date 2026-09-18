@@ -33,7 +33,9 @@ pub const MemoryStore = struct {
 
     pub fn initCapacity(allocator: std.mem.Allocator, io: std.Io, capacity: usize) MemoryStore {
         var entries = std.StringHashMap(MemoryEntry).init(allocator);
-        entries.ensureTotalCapacity(@intCast(capacity)) catch {};
+        entries.ensureTotalCapacity(@intCast(capacity)) catch |err| {
+            std.log.warn("[ai.memory] pre-allocating {d} entries failed ({s}); later puts may fail", .{ capacity, @errorName(err) });
+        };
         return .{
             .allocator = allocator,
             .io = io,

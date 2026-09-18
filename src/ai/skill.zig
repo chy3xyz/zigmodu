@@ -153,7 +153,9 @@ pub const SkillRegistry = struct {
     /// HashMap storage so runtime register() is infallible.
     pub fn initCapacity(allocator: std.mem.Allocator, io: std.Io, capacity: usize) Self {
         var tools = std.StringHashMap(Tool).init(allocator);
-        tools.ensureTotalCapacity(@intCast(capacity)) catch {};
+        tools.ensureTotalCapacity(@intCast(capacity)) catch |err| {
+            std.log.warn("[ai.skill] pre-allocating {d} tools failed ({s}); register() may fail later", .{ capacity, @errorName(err) });
+        };
         return .{
             .allocator = allocator,
             .io = io,

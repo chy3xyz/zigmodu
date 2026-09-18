@@ -259,6 +259,24 @@ const s = rt.stats();
 `timer_lag_max_ms` 是"定时器迟到的最大值"：ticker 被饿死、或某个 `post` 太慢时会变大 ——
 它比"定时器数量"更能说明运行时是否健康。每个 worker 的明细在 `handle.stats()`。
 
+**接进 `/metrics`**：`RuntimeStats` 有现成的桥，起服务时接一次即可，抓取时采样（无后台线程）：
+
+```zig
+var bridge = try zigmodu.Runtime.MetricsBridge(PrometheusMetrics).init(&rt, metrics);
+metrics.setScrapeHook(@TypeOf(bridge).sample, &bridge);
+```
+
+它注册 8 条 `zigmodu_runtime_*` 指标（`workers` / `running` / `messages_sent` /
+`messages_received` / **`messages_dropped`** / `handler_errors` / `timer_fires` /
+**`timer_lag_ms`**）。名字里没有 `_total` 后缀是刻意的：这些是**抓取时采样**的快照，所以走 gauge
+而不是 counter（`PrometheusMetrics.Counter` 没有 `set`）。
+
+**为什么必须有这一步**：`messages_dropped` 与 `timer_lag_ms` 只在这里出现 —— 邮箱打满、定时器被饿死
+在 HTTP 侧**完全看不见**，只看请求直方图会得出"一切正常"的结论。
+
+`MetricsBridge` 对 `MetricsT` 是鸭子类型（只要求 `createGauge` + `Gauge.set`），所以 runtime 层
+不依赖 observability 层。`bridge` 的生命周期要覆盖进程（别放在会返回的栈帧里）。
+
 ## 9. 路线图（本文件随之更新）
 
 | 版本 | 内容 | 状态 |
@@ -267,8 +285,8 @@ const s = rt.stats();
 | **v0.17.0** | Actor 监督（`spawnActor` + 错误预算 + `onError` 现场决策）、`HotBus`（L0 扇出，freeze 后无锁、drop-on-full）、`Sequencer` | ✅ 本文档 §3b/§3c |
 | **v0.18** | 编译期架构引擎：依赖图（`ModuleGraph` 编译期报环）、`zmodu graph`（Mermaid）、`zmodu doctor` | ✅ 已发布（doctor 清单仍未覆盖"未解析服务/事件拓扑/消费者计数"，见 `docs/dev/todo3.md` 评估） |
 | 之后 | 真监督树（父决定子的重启策略）、带干净状态的重启、跨进程/跨节点监督 | 未承诺 |
-| **v0.19** | Cluster / Shard / Service Discovery | ⚠ 部分：`ClusterView`（读侧快照/rendezvous）、`ShardRouter` 落地；选主（`RaftElection`）/LB/`PeerDiscovery` 已从 `root.zig` 导出（v0.23.0 起含 `RaftTransport`）但**框架未接进请求路径**，集群传输仍是自造 TCP（未按本节原意"适配 QUIC"）；真选主要什么见 `docs/DISTRIBUTED.md` |
-| **v0.20** | Workflow（状态机 + Saga + 补偿 + 检查点 + 恢复） | ⚠ 部分：Saga 补偿 + WAL 检查点 + 崩溃续跑 ✅（`SagaOrchestrator.resumeInstance` / `restoreFromWal`）；**状态机与 timeout 未做**（`SagaStep.timed_out` 从不赋值），`.step().compensate()` DSL 明确不做（`docs/WORKFLOW.md`） |
+| **v0.19** | Cluster / Shard / Service Discovery | ⚠ 部分：`ClusterView`（读侧快照/rendezvous）、`ShardRouter` 落地；**v0.25.0 起 `ClusterBootstrap` 已是门面** —— `tick()` 一次做完 `membership.runOnce()` → `view.sync()` → `raft.tick()`（此前从没人驱动选举）、配 `.transport` 时 `start()` 自动起入站监听、`pick(key)` 与 `healthJson()` 都在它上面；集群组件从 `root.zig` 正面导出。集群传输仍是自造 TCP（未按本节原意"适配 QUIC"）；`LoadBalancer` 是**有意不接**（数据源与读侧是两份事实，见 `docs/DISTRIBUTED.md`）。剩余缺口见 `docs/DISTRIBUTED.md` |
+| **v0.20** | Workflow（状态机 + Saga + 补偿 + 检查点 + 恢复） | ⚠ 部分：Saga 补偿 + WAL 检查点 + 崩溃续跑 ✅（`SagaOrchestrator.resumeInstance` / `restoreFromWal`）；**`SagaStep.timeout_seconds` 已于 v0.25.0 真正生效**（超预算即补偿含该步、终态 `.timed_out`、返回 `error.SagaStepTimeout`）；**状态机仍未做**，`.step().compensate()` DSL 明确不做（`docs/WORKFLOW.md`） |
 | **v0.21** | Agent Runtime（Identity / Memory / Skills / Permissions / Budget 一等化） | ✅ 已发布：`ai.AgentSpec` + `ai.Guard`（已接进 `Agent.run`）+ `ai.ProposalPipeline` —— 见 `docs/AGENT_RUNTIME.md`；**Agent 的 State / Event subscriptions / Lifecycle 仍未做** |
 | **v0.22.0** | Agent 跑成 worker（`Agent → Worker → Event`） | ✅ `ai.AgentWorker`：`rt.spawn(ai.AgentWorker, …)` + `ai.agent_worker.post(...)`，有界邮箱 / 生命周期 / 监督 / 指标跟着来 —— 见 `docs/AGENT_RUNTIME.md` §六 |
 | 1.0 | API 收敛、命名统一、deprecated 清理 | 计划 |

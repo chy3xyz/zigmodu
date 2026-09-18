@@ -137,7 +137,10 @@ pub fn main(init: std.process.Init) !void {
     var app_sec = zigmodu.security.AppSecurity.init(allocator, io, .{ .jwt_secret = jwt_secret });
     var catalog_slot: zigmodu.http.CatalogSlot = .{};
     defer catalog_slot.deinit();
-    // Order: JWT(from catalog) → tenant resolution → ModuleGate → RBAC → data permission
+    // Order: trace id → JWT(from catalog) → tenant resolution → ModuleGate → RBAC → data permission
+    // The framework's own middleware: it now stamps the request (not just the
+    // response header), so the handler's log scope picks the id up for free.
+    try server.addMiddleware(zigmodu.http.tracingMiddleware());
     try server.addMiddleware(middleware.jwtAuthMiddleware(&app_sec.module, &catalog_slot, &db_client));
     try server.addMiddleware(middleware.tenantMiddleware());
     try server.addMiddleware(middleware.moduleGateMiddleware(&catalog_slot));

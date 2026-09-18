@@ -4,8 +4,9 @@
 //! ComptimeRouter: `pub const routes` + `http.Router.scope(...).mount` (docs/ROUTE_TABLE.md)
 
 const http = @import("zigmodu").http;
-const service = @import("service.zig");
+<<STD_IMPORT>>const service = @import("service.zig");
 const model = @import("model.zig");
+const sqlx = @import("zigmodu").data.sqlx;
 const R = @import("<<SHARED_IMPORT>>response.zig");
 
 pub const <<PASCAL_MODULE>>Api = struct {

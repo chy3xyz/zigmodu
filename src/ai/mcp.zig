@@ -122,7 +122,9 @@ pub fn serveStdio(
             if (err == error.EndOfStream) break;
             return err;
         };
-        _ = stdin_reader.interface.takeByte() catch {};
+        _ = stdin_reader.interface.takeByte() catch |err| {
+            std.log.debug("[mcp] consuming frame delimiter failed: {s}", .{@errorName(err)});
+        };
         if (n == 0) continue;
         const line = line_buf[0..n];
 

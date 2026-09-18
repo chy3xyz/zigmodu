@@ -26,8 +26,7 @@
 
 | 示例 | 示范什么 |
 |------|----------|
-| [`examples/tenant-ai`](../examples/tenant-ai) | 多租户 AI：技能、审批队列、workflow、`AiMetrics`、`RunAuditStore` |
-| [`examples/ai-ops`](../examples/ai-ops) | 业务工具全链路：告警 → 诊断 → 审批 → 通知 → 审计 |
+| [`examples/ai-ops`](../examples/ai-ops) | 业务工具全链路：告警 → 诊断 → 审批 → 通知 → 审计；审批队列经 HTTP 暴露 |
 | [`examples/llm-policies`](../examples/llm-policies) | LLM 策略真实接线（`json_fn` 注入可无模型测试） |
 | [`examples/mcp-server`](../examples/mcp-server) | SkillRegistry → MCP stdio server（`tools/list` / `tools/call`） |
 
@@ -180,7 +179,8 @@ defer wf_result.deinit();
 
 **HTTP（ComptimeRouter）**：handler 里组装 `SkillContext` 后调
 `agent.run` / `wf.run`，把 `result.answer` 用 `ctx.json` 返回；权限来自 JWT
-中间件写的 attrs（`user_id` / `tenant_id` / `permissions`），参考 `tenant-ai`。
+中间件写的 attrs（`user_id` / `tenant_id` / `permissions`）——`SkillContext`
+的 `tenant_id` 就是从它取的，参考 `examples/ai-ops` 的接线。
 
 **cron**：
 
@@ -213,7 +213,8 @@ server，`tools/list` 自动从注册表推导参数 schema，并列出注册表
 ## 8. 观测与调试
 
 - `zigmodu.ai.observability.AiMetrics`：合并 `WorkflowMetrics` + `AgentMetrics`
-  + `TokenQuota` 为一份 Prometheus 文档（`tenant-ai` 的 `GET /api/ai/metrics`）。
+  + `TokenQuota` 为一份 Prometheus 文档（挂指针 + 名字，一个 `/metrics` 端点
+  即可覆盖整个 AI 栈）。
 - `zigmodu.ai.run_audit.RunAuditStore`：workflow / agent / approval 运行历史
   （`GET /api/ai/runs`，租户隔离）。
 - `mgr.listProviders(io, allocator)`：每个 provider/key 的 status / failures /

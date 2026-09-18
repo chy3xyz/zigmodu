@@ -114,7 +114,9 @@ pub const Trigger = struct {
 
 fn cronTask(ctx: *anyopaque) void {
     const c: *Trigger.CronCtx = @ptrCast(@alignCast(ctx));
-    _ = c.trigger.fire(c.trigger.allocator, c.input) catch {};
+    _ = c.trigger.fire(c.trigger.allocator, c.input) catch |err| {
+        std.log.warn("[ai.trigger] cron fire failed: {s}", .{@errorName(err)});
+    };
 }
 
 test "trigger fire runs the workflow and returns the outcome" {

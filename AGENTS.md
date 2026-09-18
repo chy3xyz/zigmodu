@@ -30,7 +30,7 @@
 | 故障注入 / 契约门禁模板 | `src/test/FaultInjection.zig` · `src/test/ContractGate.zig` |
 | 升级注意事项（breaking / 影响面 / 改法） | `docs/UPGRADING.md` |
 | 外部反馈核实与处置 | `docs/ISSUES_FROM_ZAPI.md` · `docs/ISSUES_FROM_ZIGSHOP.md` |
-| CLI 生成 | `docs/ZMODU_CLI_INTEGRATION.md` · `zig build zmodu -- scaffold …` |
+| CLI 生成 | `docs/ZMODU_CLI_INTEGRATION.md` · `zig build zmodu -- scaffold …`（**必须从仓库根跑**，见下方"两个 zmodu 入口"） |
 | LLM 对话模块（产品功能） | `docs/AI.md`（**不是** agent 指南） |
 | AI 业务接入（KeyManager/Agent/Workflow/Skill/接入） | `docs/AI_DEV_GUIDE.md` + `docs/AI_SKILLS.md` + `docs/LLM_POLICIES.md` |
 
@@ -62,6 +62,18 @@ defer app.stop();
 // Codegen: zig build zmodu -- scaffold --sql schema.sql --name my_app [--with-auth]
 ```
 
+**两个 zmodu 入口（踩过两次的坑）**：`zig build zmodu` **从仓库根**跑才装到 `zig-out/bin/zmodu` ——
+CI、`scripts/ci-*.sh`、本文件都用那个。`cd tools/zmodu && zig build` 会装到
+`tools/zmodu/zig-out/bin/zmodu`（那是它作为独立包时的入口，`release.sh` 会 bump 它的 `build.zig.zon`）。
+**两个二进制同名但不同位置**，调错就会用陈旧生成器跑出旧产物 —— 改完生成器请用**根**入口重建，并用
+`ls -la zig-out/bin/zmodu` 确认时间戳是刚生成的。
+
+**别在框架仓库根冒烟测试写文件的子命令（踩过一次）**：`module` / `api` / `event` / `health` / `config`
+默认按 **CWD 相对**路径写 `src/modules/<name>/…` 与 `src/config.zig`，**没有任何"这里是不是一个应用"的检测**
+（框架仓库自己有 `build.zig.zon`，所以它也拦不住）。本会话就有一次冒烟测试把
+`src/config.zig` / `src/modules/health.zig` 直接写进了框架树，而且事后被误报成"并行工作的产物"。
+所以：跑这些命令要用 `--dry-run` 或**临时目录**，跑完 `git status --porcelain` 自查有没有多出未跟踪文件。
+
 ## 近期栈 DO / DON'T（v0.14.x 升级后 · AI 必守）
 
 | DO | DON'T |
@@ -72,6 +84,7 @@ defer app.stop();
 | 自定义 `CatalogPermissionLoader(allocator, CatalogPermLoadInput)` 接业务表 | 三套门户 RBAC 硬塞进 `CatalogPermDb` |
 | Handler 读 attrs：`user_id` / `tenant_id` / `permissions` | `@ptrCast(ctx.user_data)` 当 AuthInfo；handler 重复 Bearer 验签 |
 | `user_data` = ComptimeRouter `*State` only | 把 AuthInfo / JWT 对象写入 `user_data` |
+| 取路由 State：`ctx.state(T)`（WS `on_connect` / legacy `RouteGroup` 回调同用） | 手写 `@ptrCast(@alignCast(ctx.user_data orelse unreachable))`（`unreachable` 在 ReleaseFast 是 UB） |
 | Legacy `rbacJwtMiddleware` / `jwtAuth` → 只读 `auth_info` | 新应用默认走 legacy 中间件 |
 | `ctx.json` / `http.respondErr` / extractors | `sendSuccess`/`sendFail`；拼用户输入进 SQL |
 | OTLP / Vault：`http(s)://`（TLS 走 `std.http.Client` 系统信任库）；x402 **fail-closed** | 默认放行支付 |
@@ -80,6 +93,7 @@ defer app.stop();
 | sqlx：`Client.open` 后注意 pool/client 指针；CB 传 `io` | 在 ConnPool 上缓存失效的 `*Client` |
 | sqlx 驱动链接：`-Ddb=sqlite\|postgres\|mysql\|all`（默认 `all`） | 小系统用 `.db = "sqlite"`，勿默认三库全链 |
 | Agent：`AgentSpec{.guard=…}` + 技能声明 `.action`（默认 `execute`）；`ai.ProposalPipeline` 走提议→风险→执行 | 裸 `Agent{}` 不设 `guard`（= **无界**）；用 `MemoryStore.formatContext` 给 agent 喂记忆（`0` = 任意 = 跨租户） |
+| Agent 跑成 worker：webhook / cron 路径用 `ai.AgentWorker`（`rt.spawn(ai.AgentWorker, …)` 拿 `*runtime.Handle(AgentWorker, cap)`，再 `ai.agent_worker.post(handle, goal)`）；被拒/失败经 `on_result` 回报，不占监督预算 | 在请求线程里同步 `Agent.run`（`ai.trigger.Trigger.fire` 是同步的，会占住 handler）；把失败当 supervisor 错误反复重试 |
 | 共享注册表：`zmodu.FrozenMap/FrozenStringMap`，启动期填充后 `freeze()` | 文件作用域裸 HashMap 在 worker 池上并发写（撕裂元数据 → 进程崩溃） |
 | Runtime：模块里 `ctx.runtime()`（app 拥有：首次创建即启动 ticker；`stop()` 先 join worker 再停模块） | 模块里自己 `Runtime.init`（线程没人 join）；在模块里 `rt.shutdown()`（提前打断别的模块的 worker） |
 | 文档/注释里的 builder 片段：先 `var b = zmodu.builder(allocator, io); defer b.deinit();` 再链式 | 写 `builder(…).withName(…)`（临时值是 `*const`，编译不过）；注意 `src/test/DocSnippets.zig` 只抽查围栏代码块/文档注释里的 5 种形状（builder 临时值直链、`try app.runtime().…`、`Application.init(allocator…)`、`ctx.json(<数字>, .{…})`、`ctx.paramInt("…")`），并非全量编译文档 |
@@ -106,12 +120,18 @@ defer app.stop();
 | WS 出站：`Server.Config.ws_write_timeout_ms` + `WsFramer.isWritable()` 丢帧 | 对不读的慢客户端无限阻塞写（会卡住写线程与 `ConnectionRegistry` shard 锁） |
 | 沙箱 CI：`zig build test -Dnet-tests=false` 跳过 socket 测试 | 在无 loopback 权限环境里跑默认套件（网络用例会失败/抖动） |
 | 多副本后台任务：`cron.setLock(...)` / `runner.setLock(...)`（`zigmodu.DistributedLock`，表锁按 DB 自动分方言） | 多副本直接跑 cron / 迁移（每个副本都会执行 = 重复副作用、并发 DDL） |
+| 长流程收尾：`SagaStep.timeout_seconds` **必须设**（`0` = 关掉预算）；进程重启后接 `zigmodu.TransactionJournal.initWithBackend(...)` + `recover()`，把悬挂（in-doubt）事务交人工处置 | 让某步卡死把 saga 永久挂在 `running`（`timeout_seconds = 0` 就是关掉预算）；重启后对 in-doubt 事务装作没发生 —— `recover()` 只**报告**，不会自动重试/回滚 |
 | 指标标签用 `ctx.route_template`（模式）；用 `createCounterFamily` 限基数 | 把原始 path / id / 用户输入塞进 label（基数爆炸） |
 | 公开但可能带身份的接口用 `auth = .optional`（有 token 就注入身份、永不 401） | 用 `.public` 后又在 handler 里手写 token 解析（或再加一条 `.jwt` 路由） |
 | 启动跑 `zigmodu.Preflight.run(...)`（env/secret/DB/迁移/时钟） | 用占位 JWT secret 或默认配置上线（预检会拦，别绕过） |
 | 生产接线的参考实现看 `examples/tenant-mgmt`（`productionProfile`）与 `examples/zmsaas`（Preflight + 池/积压指标） | 让示例停在上古手工接线（文档承诺、旗舰不用） |
 | 换 JWT 密钥走 `JwksKeyRing` + `setKeyring`（带 kid，新旧双验） | 直接改 secret 重启（全员强制重登；或留下无法验证的旧 token） |
-| outbox 用 `consumer.setMetrics` + `startPolling`；池/积压用 `metrics.setScrapeHook` | 只盯 HTTP 指标（outbox 停投、池打满在 HTTP 层完全看不见） |
+| outbox 用 `consumer.setMetrics` + `startPolling`；池/积压用 `metrics.setScrapeHook`；**运行时用 `Runtime.MetricsBridge` + `setScrapeHook`**（`messages_dropped` / `timer_lag_ms` 只在这里看得见，HTTP 侧完全无感） | 只盯 HTTP 指标（outbox 停投、池打满、邮箱打满、ticker 饿死在 HTTP 层完全看不见） |
+| 新增 `pub` 导出的组件时，**同时**写一条真正实例化它的测试（调用链要打通，不只是 `@import`） | 只导出、没调用者 —— Zig 惰性分析函数体，签名过期/编译不过要等用户真正调用才炸（`LogRotator` 就这么烂了很久） |
+| 租户模型上声明 `pub const sql_tenant_column: ?[]const u8 = "tenant_id"`（`zmodu scaffold` 已默认生成）——隔离变成编译期强制 | 靠"记得调 `*ForTenant`"：无作用域变体在租户模型上照样跨租户返回 |
+| 跨租户是合法需求时写 `*Unscoped`（`findByIdUnscoped` …），让危险操作在代码里一眼可见 | 为了绕过守卫而删掉 `sql_tenant_column` 声明 |
+| 需要请求预算落到存储时 `orm.withContext(ctx.sqlContext())`（一次覆盖该请求所有查询）；裸 sqlx 用 `*Ctx` 变体 | 以为 `request_timeout_ms` 会中止慢查询 —— 它只在 handler 返回后补一个 408 |
+| handler 日志用 `ctx.logScope("module")`（已带 trace_id） | 用 `LogScope.scope("module")` 而不带 id —— 漏了不报错，只是静默丢关联 |
 
 ### Selective SQL linking（消费者）
 
@@ -185,10 +205,11 @@ const now_ms = Time.monotonicNowMilliseconds();
 - Multi-portal: JWT `roles` = 门户；业务 RBAC → `permissions` CSV + `portal:*` — §7.1（**无**框架 `type` claim）
 - Attrs: middleware 写 `user_id`/`tenant_id`/`permissions`；handler **只读 attrs**
 - Legacy JWT 中间件只写 **`auth_info`**；禁止 `@ptrCast(user_data)` 当 AuthInfo
+- **Route state**: `ctx.state(T)` 取 ComptimeRouter `*State`（WS `on_connect`/`on_close`、legacy `RouteGroup` 回调同用）；缺 state 返 `error.NoRouteState`，别写 `@ptrCast(@alignCast(ctx.user_data orelse unreachable))`
 - **Extractors**: `extractPath` / `extractQuery` / `extractJson` / `extractJsonValidated`
 - **Errors**: `respondErr` + optional `setErrorMap`（RFC 7807）
 - **Scope MW**: `RouteGroup.use` / `Scoped.use` before mount
-- **Testkit**: `dispatch` / `signBearerToken` / `openMemorySqlite` / `SseRecorder`
+- **Testkit**: `dispatch`（`DispatchOptions.query` 传 percent-encoded 原样串，与 path 自带 `?…` 可共存）/ `signBearerToken` / `openMemorySqlite` / `SseRecorder`
 - **SSE**: `http.sse(ctx)`（设 `streaming`）+ `SseSpec`/`sse_routes` + `lastEventId`
 - **Profiles**: `applyHttpDefaults` + `applyResilienceDefaults`
 - **OpenAPI**: `openApiParamsFromStruct` + `RouteMeta.openapi_params`；`openApiRoutes` / `swaggerUiHandler` / `scalarUiHandler` HTML 零配置一键挂载 UI
@@ -200,6 +221,7 @@ const now_ms = Time.monotonicNowMilliseconds();
 - NEVER use `zigmodu.orm.Orm(...)` — use `zigmodu.data.Repository(T)`
 - NEVER use `zigmodu.PasswordEncoder` — use `zigmodu.security.PasswordEncoder`
 - Domain files are CANONICAL: `http.zig`, `data.zig`, `security.zig`, `observability.zig`
+- 数据层默认 = 框架自带 `data.sqlx` / `data.Repository`（`SqlxBackend` 是自带 backend）；**zent 是平行栈**（`docs/ZENT.md`），按 git tag 在应用/示例里单独引入，**不是框架依赖**，两者不共享驱动与事务
 
 ### Module lifecycle
 ```zig
@@ -363,7 +385,7 @@ bash scripts/ci-integration.sh   # tenant-mgmt + stress + shopdemo（-Ddb=sqlite
 - 推 tag 前本地先过 `bash scripts/check-release-tag.sh`；CI 的 `release-verify`
   job 会在任何 `v*` tag push 时复核（tag == `build.zig.zon` version，且
   CHANGELOG 有条目）。两者任一失败 = 发布无效。
-- 业务项目发布前置门禁：`zmodu ci`（build + fmt + verify + audit + deadcode）。
+- 业务项目发布前置门禁：`zmodu ci`（build + fmt + verify + audit + deadcode + **doctor**，共 **6 步**）。
 
 ## Learned User Preferences
 

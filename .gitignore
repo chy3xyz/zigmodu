@@ -5,6 +5,9 @@
 
 # Zig build artifacts
 .zig-cache/
+# Per-label caches from `zig build --cache-dir .zig-cache-<label>` — without
+# this, a parallel-build experiment leaves an untracked directory behind.
+.zig-cache-*/
 zig-out/
 .zig-global-cache/
 .cache/zig/

@@ -13,6 +13,7 @@
    - `service.zig` — 业务逻辑校验与 EventBus 消息事件发布。
    - `api.zig` — ComptimeRouter `pub const routes`（`http.RouteSpec`）+ typed handler；scaffold 经 `mountAll` 接线（见 [`ROUTE_TABLE.md`](ROUTE_TABLE.md)）。
    - `module.zig` — Module 生命期（`init` / `deinit`）与导出链。
+   - `test.zig` — **仅单表模块**产出（`orm_tpl.sqlx_test` + `writeModuleFiles`）：基于 `http.Testkit` 的两条真断言 —— `openMemorySqlite` 上的 repository 往返（insert → findById → delete），以及一次 `dispatch` 打生成的 POST 路由（断言信封与"行真的落库"）。`generateScaffoldTestsZig` 会同步写入 `test { _ = @import("modules/<name>/test.zig"); }`，所以 `zig build test` 直接跑它。多表模块不产出：模板按 `model.<PascalModule>` 取类型，多表时该类型名不成立。
 3. **内置 MCP Server 交互能力**：内置 Model Context Protocol (MCP) Server，AI 智能体可直接通过 MCP Tool (如 `scaffold`, `module`, `verify`, `sql_diff`) 与代码库联动。
 
 ---
@@ -33,7 +34,8 @@ zig build zmodu -- scaffold --sql ./schema.sql --name myapp --tenant-column app_
 
 ```bash
 zig build zmodu
-# 二进制生成于 zig-out/bin/zmodu
+# 二进制生成于 zig-out/bin/zmodu（该 step 现在同时 build + run + install，
+# 所以 zig-out/bin/zmodu 一定是当前源码编译出来的）
 ```
 
 ### 2. 从 SQL DDL 一键生成 Modulith 项目
@@ -174,8 +176,8 @@ zmodu ai openapi --in skills.json --out openapi.json
 
 每个技能对应一个 `POST /skills/{name}` 操作，参数从注册表推导
 （`properties` + `required`）。应用侧可直接用
-`zigmodu.ai.skill_export.toSkillsJson / toOpenApi` 在运行时导出（tenant-ai
-示例暴露于 `GET /api/ai/skills` 与 `GET /api/ai/skills/openapi`）。
+`zigmodu.ai.skill_export.toSkillsJson / toOpenApi` 在运行时导出并挂成
+`GET /api/ai/skills` 与 `GET /api/ai/skills/openapi` 之类的端点。
 
 ---
 

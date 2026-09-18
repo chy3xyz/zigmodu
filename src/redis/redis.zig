@@ -1003,7 +1003,9 @@ test "redis client" {
 /// Worker used by the concurrent-incr test: INCR one key, ignoring errors
 /// (caller asserts the final count so any lost increment fails the test).
 fn concurrentIncrWorker(r: *Redis, k: []const u8) void {
-    _ = r.incr(k) catch {};
+    _ = r.incr(k) catch |err| {
+        std.log.debug("[redis] concurrent incr worker failed: {s}", .{@errorName(err)});
+    };
 }
 
 test "redis concurrent incr" {

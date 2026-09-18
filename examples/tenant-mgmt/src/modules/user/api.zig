@@ -37,7 +37,9 @@ pub fn UserApi(comptime Service: type) type {
                 try ctx.sendErrorResponse(500, 0, "Failed to list users");
                 return;
             };
-            defer users_qr.deinit(ctx.allocator);
+            // `queryRowsPartial` is arena-backed: the arena came from the
+            // client allocator, so free it without naming one.
+            defer users_qr.deinitArena();
             const users = users_qr.items;
 
             var buf = std.ArrayList(u8).empty;
@@ -95,6 +97,10 @@ pub fn UserApi(comptime Service: type) type {
                 try ctx.sendErrorResponse(404, 0, "User not found");
                 return;
             };
+            // `queryRowPartial` scans from the **client** allocator, so the row
+            // must be freed with that one — `ctx.allocator` is the per-request
+            // arena, where `free` is a no-op and the row would leak for good.
+            defer zigmodu.data.sqlx.freeScanned(self.service.persistence.db.allocator, @TypeOf(user), user);
             const resp = try std.fmt.allocPrint(ctx.allocator,
                 \\{{"id":{d},"tenant_id":{d},"username":"{s}","email":"{s}","role":"{s}","status":{d}}}
             , .{ user.id, user.tenant_id, user.username, user.email, user.role, user.status });

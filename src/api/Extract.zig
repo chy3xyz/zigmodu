@@ -12,6 +12,7 @@ const ProblemDetails = @import("../http/ProblemDetails.zig").ProblemDetails;
 const Validator = @import("../validation/Validator.zig");
 const OpenApi = @import("../http/OpenApi.zig");
 const Multipart = @import("../http/Multipart.zig");
+const UploadGuard = @import("../http/UploadGuard.zig");
 
 pub const Context = Server.Context;
 pub const FieldRules = Validator.FieldRules;
@@ -49,6 +50,54 @@ pub fn extractMultipart(ctx: *Context, config: Multipart.Config) !Multipart.Form
             return error.PayloadTooLarge;
         },
         error.OutOfMemory => |e| return e,
+    };
+}
+
+/// `extractMultipartGuarded` inputs: the parser limits plus the content policy.
+pub const GuardedUpload = struct {
+    multipart: Multipart.Config = .{},
+    policy: UploadGuard.Policy,
+    /// Status rendered when the guard refuses a file. 415 by default; use 422
+    /// where the media type is understood but the payload is not acceptable.
+    reject_status: u16 = 415,
+};
+
+/// Parse **and** content-check in one call — `extractMultipart` followed by
+/// `UploadGuard.checkForm`, with the guard's rejection rendered as
+/// ProblemDetails.
+///
+/// Two calls is where upload endpoints go wrong: the policy exists, the
+/// handler calls `extractMultipart`, and the `checkForm` line never gets
+/// written. Pairing them makes the check the default rather than a step someone
+/// has to remember.
+///
+/// Parse failures keep `extractMultipart`'s statuses (415/413/400). Guard
+/// refusals answer `config.reject_status` and the guard's own error is returned
+/// unchanged, so a handler may still branch on `error.ExtensionNotAllowed` vs
+/// `error.ContentNotAllowed` — it just must not render a second response
+/// (the server keeps the first one, see the `ctx.responded` check in
+/// `Server.handleForTest`). The form is freed on the rejection path.
+pub fn extractMultipartGuarded(ctx: *Context, config: GuardedUpload) !Multipart.Form {
+    var form = try extractMultipart(ctx, config.multipart);
+    errdefer form.deinit();
+
+    UploadGuard.checkForm(&form, config.policy) catch |err| {
+        try respondProblem(ctx, config.reject_status, uploadRejectionDetail(err));
+        return err;
+    };
+    return form;
+}
+
+/// Client-facing wording for a policy refusal. Deliberately describes the rule,
+/// not the sniffed format: echoing what the bytes were helps an attacker map
+/// the guard, and the uploader already knows what they sent.
+fn uploadRejectionDetail(err: UploadGuard.Error) []const u8 {
+    return switch (err) {
+        error.ExtensionNotAllowed => "File extension is not accepted",
+        error.ContentNotAllowed => "File content is not an accepted format",
+        error.ExtensionContentMismatch => "File content does not match its extension",
+        error.ActiveContentNotAllowed => "Active content (SVG/HTML) is not accepted",
+        error.FileTooLarge => "Uploaded file is too large",
     };
 }
 
@@ -583,5 +632,133 @@ test "extractMultipart renders ProblemDetails for 415 / 413 / 400" {
         defer form.deinit();
         try std.testing.expectEqualStrings("ok", form.value("a").?);
         try std.testing.expect(!ctx.responded);
+    }
+}
+
+/// Multipart body with one file part, as it arrives on the wire. Allocated so
+/// a fixture's real bytes can be passed in — not just comptime literals.
+fn uploadBody(allocator: std.mem.Allocator, filename: []const u8, declared_type: []const u8, data: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "--B\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"{s}\"\r\n" ++
+            "Content-Type: {s}\r\n\r\n{s}\r\n--B--\r\n",
+        .{ filename, declared_type, data },
+    );
+}
+
+/// A real 1×1 PNG — the same 68 bytes the guard's own tests are built on.
+fn realPng(allocator: std.mem.Allocator) ![]u8 {
+    const buf = try allocator.alloc(u8, 68);
+    return std.fmt.hexToBytes(buf, "89504e470d0a1a0a" ++
+        "0000000d49484452000000010000000108060000001f15c489" ++
+        "0000000b4944415478da636000020000050001e9fadcd8" ++
+        "0000000049454e44ae426082");
+}
+
+test "extractMultipartGuarded renders the policy refusal as ProblemDetails" {
+    const allocator = std.testing.allocator;
+    const policy = UploadGuard.Policy{ .extensions = &.{ "jpg", "jpeg", "png" }, .formats = &.{ .jpeg, .png } };
+
+    // PHP source behind an allowed name and a plausible Content-Type.
+    {
+        var ctx = try Context.init(allocator, .POST, "/upload");
+        defer ctx.deinit();
+        const body = try uploadBody(allocator, "avatar.jpg", "image/jpeg", "<?php system($_GET['c']); ?>");
+        defer allocator.free(body);
+        ctx.body = body;
+        try ctx.headers.put(try allocator.dupe(u8, "content-type"), try allocator.dupe(u8, "multipart/form-data; boundary=B"));
+
+        try std.testing.expectError(error.ContentNotAllowed, extractMultipartGuarded(&ctx, .{ .policy = policy }));
+        try std.testing.expectEqual(@as(u16, 415), ctx.status_code);
+        try std.testing.expect(std.mem.indexOf(u8, ctx.response_body.items, "\"status\":415") != null);
+        // The wording describes the rule, not what the bytes were.
+        try std.testing.expect(std.mem.indexOf(u8, ctx.response_body.items, "not an accepted format") != null);
+    }
+
+    // An extension off the allowlist answers the caller's chosen status.
+    {
+        var ctx = try Context.init(allocator, .POST, "/upload");
+        defer ctx.deinit();
+        const body = try uploadBody(allocator, "tool.exe", "application/octet-stream", "MZ\x90\x00");
+        defer allocator.free(body);
+        ctx.body = body;
+        try ctx.headers.put(try allocator.dupe(u8, "content-type"), try allocator.dupe(u8, "multipart/form-data; boundary=B"));
+
+        try std.testing.expectError(error.ExtensionNotAllowed, extractMultipartGuarded(&ctx, .{
+            .policy = policy,
+            .reject_status = 422,
+        }));
+        try std.testing.expectEqual(@as(u16, 422), ctx.status_code);
+    }
+
+    // Accepted upload: the form is returned and nothing was written.
+    {
+        var ctx = try Context.init(allocator, .POST, "/upload");
+        defer ctx.deinit();
+        const body = try uploadBody(allocator, "note.txt", "text/plain", "quarterly numbers");
+        defer allocator.free(body);
+        ctx.body = body;
+        try ctx.headers.put(try allocator.dupe(u8, "content-type"), try allocator.dupe(u8, "multipart/form-data; boundary=B"));
+
+        var form = try extractMultipartGuarded(&ctx, .{
+            .policy = .{ .extensions = &.{"txt"}, .formats = &.{.plain} },
+        });
+        defer form.deinit();
+        try std.testing.expectEqualStrings("quarterly numbers", form.file("avatar").?.data);
+        try std.testing.expect(!ctx.responded);
+    }
+}
+
+test "an upload endpoint refuses a renamed script with 415 (Testkit dispatch)" {
+    const Testkit = @import("../http/Testkit.zig");
+    const allocator = std.testing.allocator;
+
+    const Upload = struct {
+        fn post(ctx: *Context) anyerror!void {
+            var form = try extractMultipartGuarded(ctx, .{
+                .multipart = .{ .max_total_bytes = 1 << 20 },
+                .policy = .{
+                    .extensions = &.{ "jpg", "jpeg", "png" },
+                    .formats = &.{ .jpeg, .png },
+                },
+            });
+            defer form.deinit();
+            try ctx.json(200, "{\"ok\":true}");
+        }
+    };
+
+    var server = Server.Server.init(std.testing.io, allocator, 0);
+    defer server.deinit();
+    var group = server.group("");
+    try group.post("upload", Upload.post, null);
+
+    // The rename bypass, end to end: served as a real request, the response the
+    // client sees is the guard's 415 — the handler never writes one itself.
+    {
+        const body = try uploadBody(allocator, "avatar.jpg", "image/jpeg", "<?php system($_GET['c']); ?>");
+        defer allocator.free(body);
+        var resp = try Testkit.dispatchOpts(&server, .POST, "/upload", .{
+            .body = body,
+            .headers = &.{.{ "content-type", "multipart/form-data; boundary=B" }},
+        });
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 415), resp.status_code);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":415") != null);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"instance\":\"/upload\"") != null);
+    }
+
+    // A genuinely real PNG through the same route → the handler's 200.
+    {
+        const png = try realPng(allocator);
+        defer allocator.free(png);
+        const body = try uploadBody(allocator, "avatar.png", "image/png", png);
+        defer allocator.free(body);
+        var resp = try Testkit.dispatchOpts(&server, .POST, "/upload", .{
+            .body = body,
+            .headers = &.{.{ "content-type", "multipart/form-data; boundary=B" }},
+        });
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+        try std.testing.expectEqualStrings("{\"ok\":true}", resp.body);
     }
 }

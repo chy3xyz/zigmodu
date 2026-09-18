@@ -759,6 +759,17 @@ pub fn checkForm(form: *const Multipart.Form, policy: Policy) Error!void
 pub fn sniff(data: []const u8) Format
 pub fn extensionOf(filename: []const u8) ?[]const u8
 pub fn extensionMatchesFormat(ext: []const u8, format: Format) bool
+
+// Extraction: parse + content-check in one call (recommended entry point)
+pub const GuardedUpload = struct {
+    multipart: Multipart.Config = .{},
+    policy: UploadGuard.Policy,
+    reject_status: u16 = 415,                // 422 for "type ok, payload not"
+};
+pub fn extractMultipartGuarded(ctx: *Context, config: GuardedUpload) !Multipart.Form
+//   parse failures keep extractMultipart's 415/413/400; a policy refusal renders
+//   ProblemDetails at `reject_status` and returns the guard error unchanged.
+//   The form is freed on the rejection path — the caller owns it only on success.
 ```
 
 `check` decides in a fixed order: size → active content (SVG/HTML refused unless
@@ -766,6 +777,11 @@ pub fn extensionMatchesFormat(ext: []const u8, format: Format) bool
 content agreement. The rule it enforces: **sniff the bytes and require the
 sniffed format to agree with the extension** — a renamed script fails on content,
 a renamed image cross-family fails on the mismatch.
+
+`extractMultipartGuarded` is `extractMultipart` + `checkForm` in one call, so an
+endpoint cannot ship with the policy defined but never applied; it renders the
+refusal (415 by default) and still returns the guard error for handlers that
+branch on it.
 
 ### `zigmodu.http.staticFiles` (static file serving)
 

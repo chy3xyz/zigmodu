@@ -443,7 +443,9 @@ fn Recorder(comptime Payload: type) type {
         fired: std.ArrayList(Payload) = .empty,
 
         fn on_fire(self: *Self, _: u64, payload: Payload) void {
-            self.fired.append(std.testing.allocator, payload) catch unreachable;
+            // OOM is the only failure here; abort with a message instead of UB
+            // (`catch unreachable` is undefined behaviour in ReleaseFast builds).
+            self.fired.append(std.testing.allocator, payload) catch @panic("timer_wheel test Recorder: out of memory");
         }
 
         fn deinit(self: *Self) void {

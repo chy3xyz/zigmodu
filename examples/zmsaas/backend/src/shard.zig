@@ -12,8 +12,6 @@ const ShardOrder = struct {
     region: []const u8 = "",
     customer: []const u8 = "",
     amount: i64 = 0,
-    /// 迁移时记录源分片行 id（行级幂等：唯一索引 (org_id, source_id)）。
-    source_id: ?i64 = null,
 };
 
 const RebalanceEvent = struct {

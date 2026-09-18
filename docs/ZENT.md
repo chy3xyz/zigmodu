@@ -2,7 +2,7 @@
 
 **zent**: [chy3xyz/zent](https://github.com/chy3xyz/zent) — Zig 版 [ent](https://entgo.io/)（schema-as-code ORM）  
 **版本口径**: zent **v0.67.0**（0.54 起 `CrudService.create(entity, tenant_id)` 双参；0.66 起空 `dept_ids` 拒绝而非放行、无谓词 `BulkDelete` 报 `NoPredicate`；0.67 起无 `last_insert_id` 报 `MissingLastInsertId`、MySQL 批量改逐行；0.57 起 MySQL 的 `String`/`Enum` 落 `VARCHAR(255)`；0.40 起一行式实体释放 `deinitRows`/`deinitRow`/`deinitEdgeRows`；0.38 起 `queryTargets*` fail-closed；0.39 起 `zent.scope` 让裸 SQL 也走同一套读契约，见 §14/§15）· 本仓库示例按 **v0.67.0** 验证；`create` 双参签名要求 **≥ v0.54.0**，其余条目见 §14 · ZigModu **v0.15.22+**（本文件随 v0.15.47 适配 v0.67.0）· Zig **≥ 0.17**  
-**主推组合**: **电商 / 社交类项目默认选 ZigModu + zent**（见 §2 决策表与 §4.8 场景能力矩阵）；只有存量 SQL 繁重、报表主导或 DBA 强管控的项目才默认 sqlx。
+**主推组合**: **电商 / 社交类项目默认选 ZigModu + zent**（见 §2 决策表与 §4.8 场景能力矩阵）；只有存量 SQL 繁重、报表主导或 DBA 强管控的项目才默认 sqlx。这是**新项目选型建议**，与框架自带的默认实现不是一件事——口径见 §1「与框架自带那条的关系」。
 
 **参考实现**: [`examples/zent-modulith/`](../examples/zent-modulith/)  
 **zent 自带示例**: `zig build run-start` / `run-complex` / `run-pool`（在 zent 仓库内）
@@ -36,6 +36,18 @@
 ---
 
 ## 1. 定位：正交，不要混栈
+
+### 与框架自带那条的关系（先读这一段）
+
+框架**自带的默认数据层是 sqlx，不是 zent**，两者层次不同，别把本文的"默认"读成"框架默认值变了"：
+
+- `data.SqlxBackend` 是框架默认的 ORM backend，`data.Repository(T)` 就是
+  `orm.Orm(SqlxBackend).Repository`（见 [`src/data.zig`](../src/data.zig)）；
+- `build.zig.zon` 的 `.dependencies = .{}` —— **zent 不是框架依赖**，只在示例/应用里
+  按 git tag 单独 pin（见 §11 依赖接入）。
+
+所以本文说"电商 / 社交新项目**默认选** zent"，指的是**新项目选型建议**（§2、§4.8），
+不是"框架默认改成 zent 了"。框架默认值决定"你不选也能跑什么"，本文决定"你该选什么"。
 
 > **Shared helper**：示例级生命周期和测试工具位于
 > [`examples/_shared/zent_helpers.zig`](../examples/_shared/zent_helpers.zig)。它只封装

@@ -11,6 +11,14 @@ pub const sqlx_api_header = @embedFile("templates/orm/sqlx/api_header.zig.tpl");
 pub const sqlx_api_footer = @embedFile("templates/orm/sqlx/api_footer.zig.tpl");
 pub const sqlx_module_zig = @embedFile("templates/orm/sqlx/module.zig.tpl");
 pub const sqlx_root_zig = @embedFile("templates/orm/sqlx/root.zig.tpl");
+/// `test.zig` emitted next to `api.zig` for single-table modules. Assumes the
+/// module's one table is named after the module (`model.<<PASCAL_MODULE>>`).
+pub const sqlx_test = @embedFile("templates/orm/sqlx/test.zig.tpl");
+/// Appended to `test.zig` when that single table carries the tenant column: the
+/// cross-tenant isolation test, which drives the generated routes instead of
+/// the service so it also covers the handlers' tenant lookup. Needs
+/// `expandOrmTest`'s three names plus `<<TENANT_COLUMN>>`.
+pub const sqlx_test_tenant = @embedFile("templates/orm/sqlx/test_tenant.zig.tpl");
 
 /// `zmodu module <name>` — minimal `root.zig` next to `module.zig`.
 pub const module_minimal_root_zig = @embedFile("templates/module/root.zig.tpl");
@@ -50,6 +58,27 @@ pub fn expandOrm(allocator: std.mem.Allocator, template: []const u8, module_name
     const s1 = try replaceAll(allocator, template, "<<MODULE_NAME>>", module_name);
     defer allocator.free(s1);
     return replaceAll(allocator, s1, "<<PASCAL_MODULE>>", pascal_module);
+}
+
+/// `expandOrm` plus a third name, for the one template that reaches past the
+/// module into its model.
+///
+/// The module's own types are named after the module (`…Persistence`,
+/// `…Service`, `…Api`), but its **model** is named after the table, and so are
+/// the service methods that take one (`createProduct`). For a module whose
+/// table name differs from the module name — `shop_product` in module
+/// `ShopProduct` — those are two different identifiers, and a template that
+/// assumes one name silently emits code that does not compile.
+pub fn expandOrmTest(
+    allocator: std.mem.Allocator,
+    template: []const u8,
+    module_name: []const u8,
+    pascal_module: []const u8,
+    model_name: []const u8,
+) ![]const u8 {
+    const s1 = try expandOrm(allocator, template, module_name, pascal_module);
+    defer allocator.free(s1);
+    return replaceAll(allocator, s1, "<<MODEL_NAME>>", model_name);
 }
 
 /// Replace `{{KEY}}` placeholders with values. Keys and values are paired in order.
@@ -143,6 +172,8 @@ test "embedded templates are non-empty" {
     try std.testing.expect(sqlx_api_header.len > 0);
     try std.testing.expect(sqlx_module_zig.len > 0);
     try std.testing.expect(sqlx_root_zig.len > 0);
+    try std.testing.expect(sqlx_test.len > 0);
+    try std.testing.expect(sqlx_test_tenant.len > 0);
     try std.testing.expect(module_minimal_root_zig.len > 0);
     try std.testing.expect(api_standalone_tpl.len > 0);
     try std.testing.expect(event_tpl.len > 0);

@@ -302,6 +302,10 @@ pub const AuthAuditMismatch = Testkit.AuthAuditMismatch;
 pub const Multipart = @import("http/Multipart.zig");
 /// Upload content policy: sniffed format vs extension allowlist (see doc header).
 pub const UploadGuard = @import("http/UploadGuard.zig");
+/// `extractMultipart` + `UploadGuard.checkForm` in one call (rejection → ProblemDetails).
+pub const extractMultipartGuarded = Extract.extractMultipartGuarded;
+/// Config for `extractMultipartGuarded` (parser limits + content policy).
+pub const GuardedUpload = Extract.GuardedUpload;
 /// Static file serving module (wraps the `staticFiles` handler).
 pub const StaticFiles = @import("http/StaticFiles.zig");
 /// Static file serving (traversal guard + ETag/304 + Range).

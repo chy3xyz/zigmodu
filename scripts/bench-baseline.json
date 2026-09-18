@@ -1,0 +1,117 @@
+[
+  {
+    "name": "scanModules x100K",
+    "unit": "ms",
+    "value": 9.178
+  },
+  {
+    "name": "scanModules x1M",
+    "unit": "ms",
+    "value": 91.851
+  },
+  {
+    "name": "validateModules x10K",
+    "unit": "ms",
+    "value": 8.586
+  },
+  {
+    "name": "validateModules x100K",
+    "unit": "ms",
+    "value": 84.194
+  },
+  {
+    "name": "App lifecycle x3K",
+    "unit": "ms",
+    "value": 9.961
+  },
+  {
+    "name": "workflow 20-step x5K",
+    "unit": "ms",
+    "value": 18.781
+  },
+  {
+    "name": "1L x10M events",
+    "unit": "ms",
+    "value": 21.313
+  },
+  {
+    "name": "10L x1M events",
+    "unit": "ms",
+    "value": 12.517
+  },
+  {
+    "name": "100L x100K events",
+    "unit": "ms",
+    "value": 12.315
+  },
+  {
+    "name": "CircuitBreaker x10M",
+    "unit": "ms",
+    "value": 6.571
+  },
+  {
+    "name": "CircuitBreaker x100M",
+    "unit": "ms",
+    "value": 64.488
+  },
+  {
+    "name": "RateLimiter x1M",
+    "unit": "ms",
+    "value": 53.43
+  },
+  {
+    "name": "RateLimiter x10M",
+    "unit": "ms",
+    "value": 346.481
+  },
+  {
+    "name": "10 checks x100K",
+    "unit": "ms",
+    "value": 13.001
+  },
+  {
+    "name": "100 checks x10K",
+    "unit": "ms",
+    "value": 15.537
+  },
+  {
+    "name": "findById x20K",
+    "unit": "ms",
+    "value": 13.795
+  },
+  {
+    "name": "findById x10K",
+    "unit": "ms",
+    "value": 6.894
+  },
+  {
+    "name": "RingBuffer SPSC x1M",
+    "unit": "ms",
+    "value": 10.55
+  },
+  {
+    "name": "Mailbox post+drain x1M",
+    "unit": "ms",
+    "value": 16.781
+  },
+  {
+    "name": "TimerWheel x100K",
+    "unit": "ms",
+    "value": 6.75
+  },
+  {
+    "name": "HotBus 8sub x1M",
+    "unit": "ms",
+    "value": 16.952
+  },
+  {
+    "name": "ObjectPool x1M",
+    "unit": "ms",
+    "value": 15.246
+  },
+  {
+    "name": "Sequencer x10M",
+    "unit": "ms",
+    "value": 21.961
+  }
+]

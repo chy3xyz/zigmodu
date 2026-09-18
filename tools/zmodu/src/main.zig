@@ -69,6 +69,34 @@ const GenOptions = struct {
     with_websocket: bool = false,
     /// SQL/model tenant column (`tenant_id` default, e.g. `app_id`).
     tenant_column: []const u8 = "tenant_id",
+    /// Project root the manifest keys are relative to. Left `null` (the default)
+    /// an existing file always goes to `<path>.gen.new`.
+    manifest_root: ?[]const u8 = null,
+    /// `.zmodu/generated_hashes.json` under `manifest_root`, loaded once per
+    /// command by the entry point and carried here by pointer.
+    manifest_files: ?*const std.StringHashMap([64]u8) = null,
+    /// What this command generated, for the next manifest write.
+    written: ?*WrittenFiles = null,
+};
+
+/// The files one command wrote to their real target (never the `.gen.new`
+/// copies). This — not a tree walk — decides what the next manifest claims as
+/// generated, so a pre-existing file of the user's is never adopted as ours.
+const WrittenFiles = struct {
+    paths: std.ArrayList([]const u8) = .empty,
+
+    fn deinit(self: *WrittenFiles, allocator: std.mem.Allocator) void {
+        for (self.paths.items) |p| allocator.free(p);
+        self.paths.deinit(allocator);
+    }
+
+    fn record(self: *WrittenFiles, allocator: std.mem.Allocator, path: []const u8) !void {
+        const owned = try allocator.dupe(u8, path);
+        self.paths.append(allocator, owned) catch |err| {
+            allocator.free(owned);
+            return err;
+        };
+    }
 };
 
 const OrmCli = struct {
@@ -264,6 +292,23 @@ comptime {
     }
 }
 
+/// Set by `cliLog` whenever an error-level line is emitted, so `main` can tell
+/// whether the failing command already explained itself instead of printing the
+/// bare error name (see the catch-all in `main`).
+var error_reported: bool = false;
+
+fn cliLog(
+    comptime message_level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    if (message_level == .err) error_reported = true;
+    std.log.defaultLog(message_level, scope, format, args);
+}
+
+pub const std_options: std.Options = .{ .logFn = cliLog };
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
@@ -294,7 +339,13 @@ pub fn main(init: std.process.Init) !void {
     runCommand(init.io, allocator, command, args.items[2..], home) catch |err| switch (err) {
         error.CliUsage => std.process.exit(2),
         error.RefuseOverwrite => std.process.exit(3),
-        else => |e| return e,
+        else => |e| {
+            // User-level failure (missing file, unwritable output dir, …).
+            // Returning it from `main` would print an error return trace whose
+            // frames are std internals; report one line instead.
+            if (!error_reported) std.log.err("{s}", .{@errorName(e)});
+            std.process.exit(1);
+        },
     };
 }
 
@@ -618,10 +669,14 @@ fn cmdAi(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !vo
         var i: usize = 1;
         while (i < args.len) : (i += 1) {
             if (std.mem.eql(u8, args[i], "--out")) {
-                if (i + 1 >= args.len) return error.CliUsage;
+                if (i + 1 >= args.len) {
+                    std.log.err("Missing value after --out. Usage: zmodu ai export-skills [--out <file>]", .{});
+                    return error.CliUsage;
+                }
                 out_path = args[i + 1];
                 i += 1;
             } else {
+                std.log.err("Unknown option for `zmodu ai export-skills`: {s}. Usage: zmodu ai export-skills [--out <file>]", .{args[i]});
                 return error.CliUsage;
             }
         }
@@ -632,14 +687,21 @@ fn cmdAi(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !vo
         var i: usize = 1;
         while (i < args.len) : (i += 1) {
             if (std.mem.eql(u8, args[i], "--in")) {
-                if (i + 1 >= args.len) return error.CliUsage;
+                if (i + 1 >= args.len) {
+                    std.log.err("Missing value after --in. Usage: zmodu ai openapi --in <skills.json> [--out <file>]", .{});
+                    return error.CliUsage;
+                }
                 in_path = args[i + 1];
                 i += 1;
             } else if (std.mem.eql(u8, args[i], "--out")) {
-                if (i + 1 >= args.len) return error.CliUsage;
+                if (i + 1 >= args.len) {
+                    std.log.err("Missing value after --out. Usage: zmodu ai openapi --in <skills.json> [--out <file>]", .{});
+                    return error.CliUsage;
+                }
                 out_path = args[i + 1];
                 i += 1;
             } else {
+                std.log.err("Unknown option for `zmodu ai openapi`: {s}. Usage: zmodu ai openapi --in <skills.json> [--out <file>]", .{args[i]});
                 return error.CliUsage;
             }
         }
@@ -674,12 +736,16 @@ fn cmdGraph(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--out")) {
-            if (i + 1 >= args.len) return error.CliUsage;
+            if (i + 1 >= args.len) {
+                std.log.err("Missing value after --out. Usage: zmodu graph [dir] [--out <file>] [--dot]", .{});
+                return error.CliUsage;
+            }
             i += 1;
             out_path = args[i];
         } else if (std.mem.eql(u8, args[i], "--dot")) {
             dot = true;
         } else if (args[i].len > 0 and args[i][0] == '-') {
+            std.log.err("Unknown option for `zmodu graph`: {s}. Usage: zmodu graph [dir] [--out <file>] [--dot]", .{args[i]});
             return error.CliUsage;
         } else {
             dir = args[i];
@@ -785,11 +851,17 @@ fn cmdSaas(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--out")) {
-            if (i + 1 >= args.len) return error.CliUsage;
+            if (i + 1 >= args.len) {
+                std.log.err("Missing value after --out. Usage: zmodu saas <model.json> [--out <dir>] [--tenant-column <col>] [--dry-run] [--force]", .{});
+                return error.CliUsage;
+            }
             i += 1;
             out_dir = args[i];
         } else if (std.mem.eql(u8, args[i], "--tenant-column")) {
-            if (i + 1 >= args.len) return error.CliUsage;
+            if (i + 1 >= args.len) {
+                std.log.err("Missing value after --tenant-column. Usage: zmodu saas <model.json> [--out <dir>] [--tenant-column <col>]", .{});
+                return error.CliUsage;
+            }
             i += 1;
             tenant_col = args[i];
         } else if (std.mem.eql(u8, args[i], "--dry-run")) {
@@ -797,6 +869,7 @@ fn cmdSaas(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !
         } else if (std.mem.eql(u8, args[i], "--force")) {
             force = true;
         } else {
+            std.log.err("Unknown option for `zmodu saas`: {s}. Usage: zmodu saas <model.json> [--out <dir>] [--tenant-column <col>] [--dry-run] [--force]", .{args[i]});
             return error.CliUsage;
         }
     }
@@ -815,7 +888,11 @@ fn cmdSaas(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !
     const schema_path = try std.fs.path.join(allocator, &.{ out_dir, "saas-schema.sql" });
     defer allocator.free(schema_path);
     if (!dry_run) {
-        Io.Dir.cwd().createDirPath(io, out_dir) catch {};
+        // Best-effort: the createFile below fails with the same underlying error
+        // and the path in hand, so only a debug line is warranted here.
+        Io.Dir.cwd().createDirPath(io, out_dir) catch |err| {
+            std.log.debug("zmodu saas: createDirPath({s}) failed ({s})", .{ out_dir, @errorName(err) });
+        };
         const file = try Io.Dir.cwd().createFile(io, schema_path, .{});
         defer file.close(io);
         try file.writeStreamingAll(io, schema_sql);
@@ -942,14 +1019,21 @@ fn cmdDiff(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--migration")) {
-            if (i + 1 >= args.len) return error.CliUsage;
+            if (i + 1 >= args.len) {
+                std.log.err("Missing value after --migration. Usage: zmodu diff <old.sql> <new.sql> [--migration <name>] [--dir <migrations-dir>]", .{});
+                return error.CliUsage;
+            }
             i += 1;
             migration_name = args[i];
         } else if (std.mem.eql(u8, args[i], "--dir")) {
-            if (i + 1 >= args.len) return error.CliUsage;
+            if (i + 1 >= args.len) {
+                std.log.err("Missing value after --dir. Usage: zmodu diff <old.sql> <new.sql> [--migration <name>] [--dir <migrations-dir>]", .{});
+                return error.CliUsage;
+            }
             i += 1;
             migrations_dir = args[i];
         } else {
+            std.log.err("Unknown argument for `zmodu diff`: {s}. Usage: zmodu diff <old.sql> <new.sql> [--migration <name>] [--dir <migrations-dir>]", .{args[i]});
             return error.CliUsage;
         }
     }
@@ -1432,35 +1516,38 @@ fn scaffoldDbLinkOption(db_dsn: ?[]const u8) []const u8 {
     return "sqlite";
 }
 
+/// The `build.zig.zon` fingerprint to emit when the caller has none.
+///
+/// Zig splits a package fingerprint into a `checksum` half and an `id` half
+/// (`Package.Fingerprint` in the toolchain's `lib/compiler`): `checksum` must be
+/// `std.hash.Crc32.hash(name)` and `id` may be any `u32` other than `0` and
+/// `0xffffffff`. `zig init` draws `id` from an RNG, which is why generating the
+/// same project twice used to produce two different `build.zig.zon` files.
+///
+/// A generator's output has to be reproducible, so both halves are derived from
+/// the package name here: the checksum half because Zig demands it, the id half
+/// from the name itself. Same name → same fingerprint, byte for byte.
+fn derivedFingerprintForPackage(pkg: []const u8) u64 {
+    const checksum: u32 = std.hash.Crc32.hash(pkg);
+    var id: u32 = @truncate(std.hash.Wyhash.hash(0, pkg));
+    if (id == 0 or id == 0xffffffff) id = 1;
+    return (@as(u64, checksum) << 32) | @as(u64, id);
+}
+
+/// `fingerprint == null` means "derive a stable one from the package name";
+/// pass a value only to replace one the toolchain rejected (see
+/// `finalizeBuildZigZonFingerprint`).
 fn generateBuildZonImpl(allocator: std.mem.Allocator, project_name: []const u8, fingerprint: ?u64) ![]const u8 {
     const pkg = try packageNameForZon(allocator, project_name);
     defer allocator.free(pkg);
-    if (fingerprint) |fp| {
-        return try std.fmt.allocPrint(allocator,
-            \\.{{
-            \\    .name = .{s},
-            \\    .version = "0.1.0",
-            \\    .fingerprint = 0x{x},
-            \\    .minimum_zig_version = "0.17.0",
-            \\    .dependencies = .{{
-            \\        .zigmodu = .{{
-            \\            .url = "{s}",
-            \\            .hash = "{s}",
-            \\        }},
-            \\    }},
-            \\    .paths = .{{
-            \\        "build.zig",
-            \\        "build.zig.zon",
-            \\        "src",
-            \\    }},
-            \\}}
-            \\
-        , .{ pkg, fp, zigmodu_zon_url, zigmodu_zon_hash });
-    }
+    // The fingerprint is over the *sanitized* `.name` this file actually
+    // carries, not the raw `--name`: Zig validates it against the parsed name.
+    const fp = fingerprint orelse derivedFingerprintForPackage(pkg);
     return try std.fmt.allocPrint(allocator,
         \\.{{
         \\    .name = .{s},
         \\    .version = "0.1.0",
+        \\    .fingerprint = 0x{x},
         \\    .minimum_zig_version = "0.17.0",
         \\    .dependencies = .{{
         \\        .zigmodu = .{{
@@ -1475,7 +1562,7 @@ fn generateBuildZonImpl(allocator: std.mem.Allocator, project_name: []const u8, 
         \\    }},
         \\}}
         \\
-    , .{ pkg, zigmodu_zon_url, zigmodu_zon_hash });
+    , .{ pkg, fp, zigmodu_zon_url, zigmodu_zon_hash });
 }
 
 fn parseZigSuggestedFingerprint(diag: []const u8) ?u64 {
@@ -1502,8 +1589,7 @@ fn parseZigSuggestedFingerprint(diag: []const u8) ?u64 {
 /// every template having to be fmt-exact by hand.
 ///
 /// Runs before `saveGeneratedHashes`, so the recorded hashes describe the
-/// formatted files. Best-effort: a missing `zig` only warns — the same binary
-/// is required a moment later by `finalizeBuildZigZonFingerprint` anyway.
+/// formatted files. Best-effort: a missing `zig` only warns.
 fn formatGeneratedTree(io: std.Io, allocator: std.mem.Allocator, project_dir: []const u8) void {
     const run = std.process.run(allocator, io, .{
         .argv = &.{ "zig", "fmt", "src" },
@@ -1519,7 +1605,19 @@ fn formatGeneratedTree(io: std.Io, allocator: std.mem.Allocator, project_dir: []
     }
 }
 
+/// Repair path for a `build.zig.zon` that carries no `.fingerprint`.
+///
+/// Zig refuses to build such a manifest, prints the value it wants, and this
+/// asks for that value and rewrites the file. `generateBuildZonImpl` now always
+/// emits a derived fingerprint, so the generated manifests arrive complete and
+/// this normally returns before spawning anything — which also keeps scaffold
+/// offline (a plain `zig build` in the new project would now fetch and compile
+/// the dependencies instead of failing fast on the missing field).
 fn finalizeBuildZigZonFingerprint(io: std.Io, allocator: std.mem.Allocator, project_name: []const u8, zon_path: []const u8) !void {
+    const current = std.Io.Dir.cwd().readFileAlloc(io, zon_path, allocator, std.Io.Limit.limited(1024 * 1024)) catch return;
+    defer allocator.free(current);
+    if (std.mem.indexOf(u8, current, ".fingerprint = 0x") != null) return;
+
     const run = try std.process.run(allocator, io, .{
         .argv = &.{ "zig", "build" },
         .cwd = .{ .path = std.fs.path.dirname(zon_path) orelse return error.BadPath },
@@ -2083,15 +2181,22 @@ fn hasUncommittedChanges(io: std.Io, allocator: std.mem.Allocator, path: []const
     return result.term.exited != 0;
 }
 
-/// Write file safely: skip if user has modified it (git diff), unless --force.
+/// Write file safely: rewrite in place only when the manifest proves the file
+/// is still the one we generated; anything else the user may have touched is
+/// preserved next to a `<path>.gen.new` copy, unless `--force`.
 fn safeWrite(io: std.Io, allocator: std.mem.Allocator, path: []const u8, content: []const u8, opts: GenOptions) !void {
     if (opts.dry_run) {
         std.log.info("[dry-run] write {s} ({d} bytes)", .{ path, content.len });
         return;
     }
 
+    const exists = fileExists(io, path);
+    // `--force` always takes the file over; otherwise only a file the manifest
+    // still vouches for is ours to rewrite in place.
+    const in_place = opts.force or (exists and isGeneratedUnchanged(io, allocator, path, opts));
+
     var new_path_buf: ?[]const u8 = null;
-    const target = if (!opts.force and fileExists(io, path)) blk: {
+    const target = if (exists and !in_place) blk: {
         new_path_buf = try std.fmt.allocPrint(allocator, "{s}.gen.new", .{path});
         std.log.info("File exists: generated update at {s}", .{new_path_buf.?});
         break :blk new_path_buf.?;
@@ -2104,6 +2209,44 @@ fn safeWrite(io: std.Io, allocator: std.mem.Allocator, path: []const u8, content
     };
     defer file.close(io);
     try file.writeStreamingAll(io, content);
+
+    // Only the real target becomes ours; a `.gen.new` copy means the file on
+    // disk is still the user's, so the next manifest must not claim it.
+    if (opts.written) |written| {
+        if (new_path_buf == null) try written.record(allocator, path);
+    }
+}
+
+/// True when `path` still holds exactly the bytes we recorded in the manifest —
+/// our file, nobody touched it, so regenerating over it is idempotent.
+fn isGeneratedUnchanged(io: std.Io, allocator: std.mem.Allocator, path: []const u8, opts: GenOptions) bool {
+    const root = opts.manifest_root orelse return false;
+    const manifest = opts.manifest_files orelse return false;
+    const key = manifestKey(path, root) orelse return false;
+    return incremental.isUnchanged(allocator, io, root, key, manifest);
+}
+
+/// Manifest keys are paths relative to the project root. Every caller builds
+/// `path` from the same root it hands us, so stripping `root/` yields the key;
+/// a path that does not sit under the root is reported as "not ours" rather
+/// than guessed at.
+fn manifestKey(path: []const u8, root: []const u8) ?[]const u8 {
+    const p = stripLeadingDots(path);
+    const r = std.mem.trimEnd(u8, stripLeadingDots(root), "/");
+    // `.` (and `./`, and an empty prefix) means the caller is already inside the
+    // project root and `path` is the key.
+    if (r.len == 0 or std.mem.eql(u8, r, ".")) {
+        return if (p.len > 0 and p[0] != '/' and !std.mem.startsWith(u8, p, "..")) p else null;
+    }
+    if (std.mem.startsWith(u8, p, r) and p.len > r.len and p[r.len] == '/') return p[r.len + 1 ..];
+    return null;
+}
+
+/// Drop leading `./` so `./foo/bar` and `foo/bar` name the same file.
+fn stripLeadingDots(s: []const u8) []const u8 {
+    var out = s;
+    while (out.len >= 2 and out[0] == '.' and out[1] == '/') out = out[2..];
+    return out;
 }
 
 /// Legacy wrapper — delegates to safeWrite. Remove after migration complete.
@@ -2617,7 +2760,11 @@ fn importSqlToDatabase(io: std.Io, allocator: std.mem.Allocator, dsn: []const u8
 
     const tmp_file = try writeTempSql(io, allocator, sql);
     defer {
-        std.Io.Dir.cwd().deleteFile(io, tmp_file) catch {};
+        // Best-effort temp cleanup: the import has already run, and failing to
+        // unlink a temp file is not a reason to fail the command.
+        std.Io.Dir.cwd().deleteFile(io, tmp_file) catch |err| {
+            std.log.debug("zmodu import-sql: removing temp file {s} failed ({s})", .{ tmp_file, @errorName(err) });
+        };
         allocator.free(tmp_file);
     }
 
@@ -2848,8 +2995,14 @@ fn introspectDatabasePostgres(io: std.Io, allocator: std.mem.Allocator, host: []
         const nullable = std.mem.eql(u8, std.mem.trim(u8, is_nullable_str, " \t"), "YES");
         const has_default = default_val != null and default_val.?.len > 0 and !std.mem.eql(u8, default_val.?, "NULL");
 
-        const gop = try col_map.getOrPut(try allocator.dupe(u8, table_name));
-        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        const table_key = try allocator.dupe(u8, table_name);
+        const gop = try col_map.getOrPut(table_key);
+        if (gop.found_existing) {
+            // getOrPut keeps the key already in the map.
+            allocator.free(table_key);
+        } else {
+            gop.value_ptr.* = .empty;
+        }
         try gop.value_ptr.append(allocator, .{
             .name = try allocator.dupe(u8, col_name),
             .col_type = col_type,
@@ -3151,8 +3304,10 @@ fn extractForeignKeys(allocator: std.mem.Allocator, sql: []const u8, body_start:
 
         var ref_seen = std.StringHashMap(void).init(allocator);
         defer ref_seen.deinit();
+        // Only OOM can fail this; losing an entry would emit a duplicate FK, so
+        // propagate instead of silently producing a wrong schema model.
         for (fks.items) |fk| {
-            ref_seen.put(fk.column_name, {}) catch {};
+            try ref_seen.put(fk.column_name, {});
         }
 
         var pos: usize = 0;
@@ -3211,7 +3366,7 @@ fn extractForeignKeys(allocator: std.mem.Allocator, sql: []const u8, body_start:
             }
             // Skip if already covered by FOREIGN KEY
             if (ref_seen.contains(col_name)) continue;
-            ref_seen.put(col_name, {}) catch {};
+            try ref_seen.put(col_name, {});
 
             // Read ref column if present
             var ref_column: []const u8 = "id";
@@ -3274,6 +3429,29 @@ fn inferModuleDependencies(allocator: std.mem.Allocator, tables: []const TableDe
     try buf.appendSlice(allocator, " }");
     deps.deinit(allocator);
     return buf.toOwnedSlice(allocator);
+}
+
+/// Release a module→tables map returned by `groupTablesByModule`. The map owns
+/// its keys; the `TableDef`s themselves stay owned by the caller.
+fn freeModuleMap(allocator: std.mem.Allocator, map: *std.StringHashMap(std.ArrayList(TableDef))) void {
+    var iter = map.iterator();
+    while (iter.next()) |entry| {
+        entry.value_ptr.deinit(allocator);
+        allocator.free(entry.key_ptr.*);
+    }
+    map.deinit();
+}
+
+/// Release a subsystem map returned by `detectSubsystems` (keys, the copied
+/// module names held by each value, and the value lists).
+fn freeSubsystemMap(allocator: std.mem.Allocator, map: *std.StringHashMap(std.ArrayList([]const u8))) void {
+    var iter = map.iterator();
+    while (iter.next()) |entry| {
+        for (entry.value_ptr.items) |name| allocator.free(name);
+        entry.value_ptr.deinit(allocator);
+        allocator.free(entry.key_ptr.*);
+    }
+    map.deinit();
 }
 
 /// Build a module→tables map, auto-detecting the common table prefix for smart grouping.
@@ -3357,8 +3535,12 @@ fn detectSubsystems(allocator: std.mem.Allocator, module_map: *std.StringHashMap
             name;
         // Only consider as subsystem prefix if the module has an underscore (multi-word)
         if (first_seg.len < name.len and first_seg.len > 1) {
-            const gop = try prefix_groups.getOrPut(try allocator.dupe(u8, first_seg));
-            if (!gop.found_existing) {
+            const prefix_key = try allocator.dupe(u8, first_seg);
+            const gop = try prefix_groups.getOrPut(prefix_key);
+            if (gop.found_existing) {
+                // getOrPut keeps the key already in the map.
+                allocator.free(prefix_key);
+            } else {
                 gop.value_ptr.* = .empty;
             }
             try gop.value_ptr.append(allocator, try allocator.dupe(u8, name));
@@ -3379,14 +3561,12 @@ fn detectSubsystems(allocator: std.mem.Allocator, module_map: *std.StringHashMap
                     remainder = full_name[prefix.len + 1 ..]; // strip "prefix_"
                 }
                 try modules.append(allocator, try allocator.dupe(u8, remainder));
-                // Move module map entry: old key → "<prefix>/<remainder>"
-                if (module_map.getPtr(full_name)) |src_data| {
-                    var new_list = std.ArrayList(TableDef).empty;
-                    for (src_data.items) |t| try new_list.append(allocator, t);
+                // Re-key the module map entry: "<module>" → "<prefix>/<module>".
+                // fetchRemove hands back the old key so it can be freed here.
+                if (module_map.fetchRemove(full_name)) |removed| {
+                    allocator.free(removed.key);
                     const new_key = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, remainder });
-                    try module_map.put(new_key, new_list);
-                    src_data.deinit(allocator);
-                    _ = module_map.remove(full_name);
+                    try module_map.put(new_key, removed.value);
                 }
             }
             try subsystem_map.put(try allocator.dupe(u8, entry.key_ptr.*), modules);
@@ -3421,7 +3601,12 @@ fn detectSubsystems(allocator: std.mem.Allocator, module_map: *std.StringHashMap
                     const sub = key[0..slash];
                     const merge_key = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ sub, parent });
                     const gop = try merge_candidates.getOrPut(merge_key);
-                    if (!gop.found_existing) gop.value_ptr.* = .empty;
+                    if (gop.found_existing) {
+                        // getOrPut keeps the key already in the map.
+                        allocator.free(merge_key);
+                    } else {
+                        gop.value_ptr.* = .empty;
+                    }
                     try gop.value_ptr.append(allocator, try allocator.dupe(u8, key));
                 }
             }
@@ -3434,10 +3619,11 @@ fn detectSubsystems(allocator: std.mem.Allocator, module_map: *std.StringHashMap
                     // Move first module's tables to the parent key
                     var merged = std.ArrayList(TableDef).empty;
                     for (entry.value_ptr.items) |child_key| {
-                        if (module_map.getPtr(child_key)) |child_data| {
+                        if (module_map.fetchRemove(child_key)) |removed| {
+                            allocator.free(removed.key);
+                            var child_data = removed.value;
+                            defer child_data.deinit(allocator);
                             for (child_data.items) |t| try merged.append(allocator, t);
-                            child_data.deinit(allocator);
-                            _ = module_map.remove(child_key);
                         }
                     }
                     try module_map.put(try allocator.dupe(u8, entry.key_ptr.*), merged);
@@ -3453,7 +3639,19 @@ fn detectSubsystems(allocator: std.mem.Allocator, module_map: *std.StringHashMap
     return subsystem_map;
 }
 
-fn generateModuleModel(allocator: std.mem.Allocator, module_name: []const u8, tables: []const TableDef, strip_prefix_len: usize, json_style: JsonStyle) ![]const u8 {
+/// True when the table carries `name` as one of its SQL columns.
+fn tableHasColumn(table: TableDef, name: []const u8) bool {
+    for (table.columns) |col| {
+        if (std.mem.eql(u8, col.name, name)) return true;
+    }
+    return false;
+}
+
+/// Generate `model.zig`. Tables that carry the configured tenant column also
+/// get `pub const sql_tenant_column`, which makes the repository's unscoped
+/// methods compile errors for that model (see `Repository(T)` in
+/// src/persistence/Orm.zig) — new projects are tenant-isolated by default.
+fn generateModuleModel(allocator: std.mem.Allocator, module_name: []const u8, tables: []const TableDef, strip_prefix_len: usize, json_style: JsonStyle, tenant_column: []const u8) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
@@ -3473,6 +3671,11 @@ fn generateModuleModel(allocator: std.mem.Allocator, module_name: []const u8, ta
 
         try buf.print(allocator, "pub const {s} = struct {{\n", .{model_name});
         try buf.print(allocator, "    pub const sql_table_name: []const u8 = \"{s}\";\n", .{table.name});
+        if (tenant_column.len > 0 and tableHasColumn(table, tenant_column)) {
+            try buf.print(allocator, "    /// Opt-in tenant isolation: the unscoped Repository methods are\n", .{});
+            try buf.print(allocator, "    /// compile errors on this model; use the *ForTenant / *Unscoped names.\n", .{});
+            try buf.print(allocator, "    pub const sql_tenant_column: ?[]const u8 = \"{s}\";\n", .{tenant_column});
+        }
         for (table.columns) |col| {
             if (col.col_type == .unknown and col.name.len == 0) continue;
             const base = zigScalarColumnType(col.col_type);
@@ -3602,70 +3805,136 @@ fn generateModuleService(allocator: std.mem.Allocator, module_name: []const u8, 
         const list_method = try std.fmt.allocPrint(allocator, "list{s}{s}", .{ model_name, list_sfx });
         defer allocator.free(list_method);
 
+        // Tables carrying the tenant column produce models that declare
+        // `sql_tenant_column`, so their repository has no unscoped names at all:
+        // the generic CRUD methods below must call the explicitly named
+        // `*Unscoped` variants, and the `*ByTenant` ones the `*ForTenant` ones.
+        const has_tenant = tenant_column.len > 0 and tableHasColumn(table, tenant_column);
+        const unscoped = if (has_tenant) "Unscoped" else "";
+
         try buf.print(allocator, "    pub fn {s}(self: *{s}Service, page: usize, size: usize) !data.orm.PageResult(model.{s}) {{\n", .{ list_method, pascal_module, model_name });
         try buf.print(allocator, "        var repo = self.persistence.{s}Repo();\n", .{method_name});
-        try buf.appendSlice(allocator, "        return try repo.findPage(page, size);\n");
+        try buf.print(allocator, "        return try repo.findPage{s}(page, size);\n", .{unscoped});
         try buf.appendSlice(allocator, "    }\n\n");
 
         const pk_type = pkColumnZigType(table);
         try buf.print(allocator, "    pub fn get{s}(self: *{s}Service, id: {s}) !?model.{s} {{\n", .{ model_name, pascal_module, pk_type, model_name });
         try buf.print(allocator, "        var repo = self.persistence.{s}Repo();\n", .{method_name});
-        try buf.appendSlice(allocator, "        return try repo.findById(id);\n");
+        try buf.print(allocator, "        return try repo.findById{s}(id);\n", .{unscoped});
         try buf.appendSlice(allocator, "    }\n\n");
 
         // Tenant-aware variants if table has the configured tenant column
-        const has_tenant = for (table.columns) |col| {
-            if (std.mem.eql(u8, col.name, tenant_column)) break true;
-        } else false;
         if (has_tenant) {
-            // The model may render the tenant column as `?i64` (nullable /
-            // DEFAULT / PK) or plain `i64` (NOT NULL, no DEFAULT) — the compare
-            // has to match, or the generated method does not compile.
-            const tenant_optional = for (table.columns) |col| {
-                if (std.mem.eql(u8, col.name, tenant_column))
-                    break (col.nullable or col.has_default or col.is_primary_key);
-            } else false;
             // Distinct name: Zig structs cannot overload by arity, and AGENTS.md
             // documents this as `listXByTenant()` alongside `getXByTenant()`.
+            // `findPageFilteredForTenant` keeps the pk-DESC ordering the
+            // unscoped `findPageFiltered` form had.
             try buf.print(allocator, "    pub fn {s}ByTenant(self: *{s}Service, page: usize, size: usize, tenant_id: i64) !data.orm.PageResult(model.{s}) {{\n", .{ list_method, pascal_module, model_name });
             try buf.print(allocator, "        var repo = self.persistence.{s}Repo();\n", .{method_name});
-            try buf.print(allocator, "        return try repo.findPageFiltered(self.persistence.backend.allocator, \"WHERE {s} = ?\", &.{{zigmodu.data.sqlx.Value{{ .int = tenant_id }}}}, page, size);\n", .{tenant_column});
+            try buf.print(allocator, "        return try repo.findPageFilteredForTenant(\"{s}\", self.persistence.backend.allocator, tenant_id, \"\", &.{{}}, page, size);\n", .{tenant_column});
             try buf.appendSlice(allocator, "    }\n\n");
+            // The tenant predicate lives in the SQL (`AND {col} = ?`), so the
+            // generated method no longer needs the post-fetch field compare —
+            // that compare could only run *after* the row had already been read.
             try buf.print(allocator, "    pub fn get{s}ByTenant(self: *{s}Service, id: {s}, tenant_id: i64) !?model.{s} {{\n", .{ model_name, pascal_module, pk_type, model_name });
             try buf.print(allocator, "        var repo = self.persistence.{s}Repo();\n", .{method_name});
-            try buf.appendSlice(allocator, "        const entity = try repo.findById(id);\n");
-            if (tenant_optional) {
-                try buf.print(allocator, "        return if (entity != null and entity.?.{s} != null and entity.?.{s}.? == tenant_id) entity else null;\n", .{ tenant_column, tenant_column });
-            } else {
-                try buf.print(allocator, "        return if (entity != null and entity.?.{s} == tenant_id) entity else null;\n", .{tenant_column});
-            }
+            try buf.print(allocator, "        return try repo.findByIdForTenant(\"{s}\", tenant_id, id);\n", .{tenant_column});
             try buf.appendSlice(allocator, "    }\n\n");
         }
 
+        // An INSERT carries its own tenant column: no SQL predicate can check
+        // it, so the generated create path states the (unchecked) choice in the
+        // method name rather than hiding it.
         try buf.print(allocator, "    pub fn create{s}(self: *{s}Service, entity: model.{s}) !model.{s} {{\n", .{ model_name, pascal_module, model_name, model_name });
         try buf.print(allocator, "        var repo = self.persistence.{s}Repo();\n", .{method_name});
-        try buf.appendSlice(allocator, "        const created = try repo.insert(entity);\n");
+        try buf.print(allocator, "        const created = try repo.insert{s}(entity);\n", .{unscoped});
         if (enable_events) {
             try buf.print(allocator, "        self.publish(.{{ .{s}Created = .{{ .id = created.id.? }} }});\n", .{model_name});
         }
         try buf.appendSlice(allocator, "        return created;\n");
         try buf.appendSlice(allocator, "    }\n\n");
 
+        if (has_tenant) {
+            // An INSERT carries its own tenant column, so no SQL predicate can
+            // check it: the *only* correct scoping is to overwrite the field
+            // from the caller's identity before writing. Anything the request
+            // body claimed for that column is dropped, which is the whole point
+            // — without this, any client could plant a row inside a tenant it
+            // does not own.
+            try buf.print(allocator, "    /// Tenant-scoped insert: `{s}` is overwritten from the argument\n", .{tenant_column});
+            try buf.appendSlice(allocator, "    /// before the row is written, so a tenant id supplied in the request\n");
+            try buf.appendSlice(allocator, "    /// body cannot place the row inside another tenant.\n");
+            try buf.print(allocator, "    pub fn create{s}ByTenant(self: *{s}Service, tenant_id: i64, entity: model.{s}) !model.{s} {{\n", .{ model_name, pascal_module, model_name, model_name });
+            try buf.print(allocator, "        var repo = self.persistence.{s}Repo();\n", .{method_name});
+            try buf.appendSlice(allocator, "        var scoped = entity;\n");
+            try buf.print(allocator, "        scoped.{s} = tenant_id;\n", .{tenant_column});
+            try buf.appendSlice(allocator, "        const created = try repo.insertUnscoped(scoped);\n");
+            if (enable_events) {
+                try buf.print(allocator, "        self.publish(.{{ .{s}Created = .{{ .id = created.id.? }} }});\n", .{model_name});
+            }
+            try buf.appendSlice(allocator, "        return created;\n");
+            try buf.appendSlice(allocator, "    }\n\n");
+        }
+
         try buf.print(allocator, "    pub fn update{s}(self: *{s}Service, entity: model.{s}) !void {{\n", .{ model_name, pascal_module, model_name });
         try buf.print(allocator, "        var repo = self.persistence.{s}Repo();\n", .{method_name});
-        try buf.appendSlice(allocator, "        try repo.update(entity);\n");
+        try buf.print(allocator, "        try repo.update{s}(entity);\n", .{unscoped});
         if (enable_events) {
             try buf.print(allocator, "        self.publish(.{{ .{s}Updated = .{{ .id = entity.id.? }} }});\n", .{model_name});
         }
         try buf.appendSlice(allocator, "    }\n\n");
 
+        if (has_tenant) {
+            // `updateForTenant` appends `AND {col} = ?` to the UPDATE, so the
+            // row of another tenant matches nothing and the write is a no-op
+            // rather than a cross-tenant rewrite. The rows-affected count is
+            // that no-op's only signal, and it is the one signal on the tenant
+            // path that carries security meaning: `0` is "this row is not
+            // yours". Discarding it (the old `_ = try …`) left the handler no
+            // way to tell a rewrite from a miss, so it always answered 200.
+            try buf.appendSlice(allocator, "    /// Tenant-scoped update: the row is only rewritten when its tenant\n");
+            try buf.appendSlice(allocator, "    /// column matches `tenant_id` — another tenant's row is a no-op.\n");
+            try buf.appendSlice(allocator, "    ///\n");
+            try buf.appendSlice(allocator, "    /// Returns the rows affected. `0` means nothing was rewritten: the\n");
+            try buf.appendSlice(allocator, "    /// row either belongs to another tenant or this id does not exist.\n");
+            try buf.print(allocator, "    pub fn update{s}ByTenant(self: *{s}Service, tenant_id: i64, entity: model.{s}) !u64 {{\n", .{ model_name, pascal_module, model_name });
+            try buf.print(allocator, "        var repo = self.persistence.{s}Repo();\n", .{method_name});
+            try buf.print(allocator, "        const rows = try repo.updateForTenant(\"{s}\", tenant_id, entity);\n", .{tenant_column});
+            if (enable_events) {
+                // A no-op is not an update: announcing one would tell every
+                // subscriber about a row that still holds its old values.
+                try buf.appendSlice(allocator, "        if (rows == 0) return 0;\n");
+                try buf.print(allocator, "        self.publish(.{{ .{s}Updated = .{{ .id = entity.id.? }} }});\n", .{model_name});
+            }
+            try buf.appendSlice(allocator, "        return rows;\n");
+            try buf.appendSlice(allocator, "    }\n\n");
+        }
+
         try buf.print(allocator, "    pub fn delete{s}(self: *{s}Service, id: {s}) !void {{\n", .{ model_name, pascal_module, pk_type });
         try buf.print(allocator, "        var repo = self.persistence.{s}Repo();\n", .{method_name});
-        try buf.appendSlice(allocator, "        try repo.delete(id);\n");
+        try buf.print(allocator, "        try repo.delete{s}(id);\n", .{unscoped});
         if (enable_events) {
             try buf.print(allocator, "        self.publish(.{{ .{s}Deleted = .{{ .id = id }} }});\n", .{model_name});
         }
         try buf.appendSlice(allocator, "    }\n\n");
+
+        if (has_tenant) {
+            // Same contract as the update: `deleteForTenant` reports rows
+            // affected, and `0` is "that id is not a row of yours".
+            try buf.appendSlice(allocator, "    /// Tenant-scoped delete: the row is only dropped when its tenant\n");
+            try buf.appendSlice(allocator, "    /// column matches `tenant_id` — guessing another tenant's id is a no-op.\n");
+            try buf.appendSlice(allocator, "    ///\n");
+            try buf.appendSlice(allocator, "    /// Returns the rows affected. `0` means nothing was dropped.\n");
+            try buf.print(allocator, "    pub fn delete{s}ByTenant(self: *{s}Service, tenant_id: i64, id: {s}) !u64 {{\n", .{ model_name, pascal_module, pk_type });
+            try buf.print(allocator, "        var repo = self.persistence.{s}Repo();\n", .{method_name});
+            try buf.print(allocator, "        const rows = try repo.deleteForTenant(\"{s}\", tenant_id, id);\n", .{tenant_column});
+            if (enable_events) {
+                try buf.appendSlice(allocator, "        if (rows == 0) return 0;\n");
+                try buf.print(allocator, "        self.publish(.{{ .{s}Deleted = .{{ .id = id }} }});\n", .{model_name});
+            }
+            try buf.appendSlice(allocator, "        return rows;\n");
+            try buf.appendSlice(allocator, "    }\n\n");
+        }
 
         if (with_transactions) {
             try buf.print(allocator, "    pub fn transact{s}(self: *{s}Service, comptime R: type, fn_tx: *const fn (*data.orm.Tx(data.SqlxBackend)) anyerror!R) !R {{\n", .{ model_name, pascal_module });
@@ -3779,13 +4048,33 @@ fn gateNameFromModule(allocator: std.mem.Allocator, module_name: []const u8) ![]
     return try replaceChar(allocator, module_name, '/', '_');
 }
 
-fn generateModuleApi(allocator: std.mem.Allocator, module_name: []const u8, tables: []const TableDef, strip_prefix_len: usize) ![]const u8 {
+/// `tenant_column` decides whether the emitted handlers read the caller's
+/// tenant from the request and answer with the `*ByTenant` service methods
+/// (tenant tables) or keep the plain unscoped calls (everything else). A
+/// module whose tables do not carry the column emits exactly the bytes it did
+/// before the tenant guard existed.
+fn generateModuleApi(allocator: std.mem.Allocator, module_name: []const u8, tables: []const TableDef, strip_prefix_len: usize, tenant_column: []const u8) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
+    var any_tenant = false;
+    for (tables) |table| {
+        if (tenant_column.len > 0 and tableHasColumn(table, tenant_column)) any_tenant = true;
+    }
+
     const pascal_module = try toPascalCase(allocator, module_name);
     defer allocator.free(pascal_module);
-    const header = try orm_tpl.expandOrm(allocator, orm_tpl.sqlx_api_header, module_name, pascal_module);
+    const header_raw = try orm_tpl.expandOrm(allocator, orm_tpl.sqlx_api_header, module_name, pascal_module);
+    defer allocator.free(header_raw);
+    // `<<STD_IMPORT>>` sits as a line prefix, so the empty replacement leaves
+    // the surrounding bytes untouched — `requireTenant` is the only user of
+    // `std`, and only a tenant module gets one.
+    const header = try replaceAllStr(
+        allocator,
+        header_raw,
+        "<<STD_IMPORT>>",
+        if (any_tenant) "const std = @import(\"std\");\n" else "",
+    );
     defer allocator.free(header);
     // Compute shared/ import path: flat → ../../shared, nested → ../../../shared, etc.
     var sp_depth: usize = 2;
@@ -3843,23 +4132,47 @@ fn generateModuleApi(allocator: std.mem.Allocator, module_name: []const u8, tabl
         defer allocator.free(model_name);
         const pl_sfx2 = if (std.mem.endsWith(u8, model_name, "s") or std.mem.endsWith(u8, model_name, "S")) "" else "s";
         const pk_is_str2 = pkIsString(table);
+        const has_tenant2 = tenant_column.len > 0 and tableHasColumn(table, tenant_column);
 
         // list — GET .../list
         try buf.print(allocator, "    fn list{s}{s}(ctx: *http.Context, self: *State) !void {{\n", .{ model_name, pl_sfx2 });
+        if (has_tenant2) try buf.appendSlice(allocator, "        const tenant_id = (try requireTenant(ctx)) orelse return;\n");
         try buf.appendSlice(allocator, "        const page = ctx.queryInt(usize, \"pageNo\", 1);\n");
         try buf.appendSlice(allocator, "        const size = ctx.queryInt(usize, \"pageSize\", 10);\n");
-        try buf.print(allocator, "        const result = try self.service.list{s}{s}(page, size);\n", .{ model_name, pl_sfx2 });
+        // `list` returns an owned `PageResult` whose arena rides on the
+        // *client* allocator, not the per-request arena — free it after the
+        // response is written, or every request leaks the whole page for the
+        // process lifetime. The backend allocator is the arena's own backing
+        // allocator, so this is the one correct argument; `ctx.allocator` would
+        // be silently ignored and the page would leak.
+        //
+        // (`PageResult.deinitArena()` is the allocator-free form, but it is
+        // newer than the version scaffolded projects pin, so emit `deinit`.)
+        if (has_tenant2) {
+            try buf.print(allocator, "        var result = try self.service.list{s}{s}ByTenant(page, size, tenant_id);\n", .{ model_name, pl_sfx2 });
+        } else {
+            try buf.print(allocator, "        var result = try self.service.list{s}{s}(page, size);\n", .{ model_name, pl_sfx2 });
+        }
+        try buf.appendSlice(allocator, "        defer result.deinit(self.service.persistence.backend.allocator);\n");
         try buf.appendSlice(allocator, "        try R.wrapList(ctx, result);\n");
         try buf.appendSlice(allocator, "    }\n\n");
 
         // get — GET .../get?id=
         try buf.print(allocator, "    fn get{s}(ctx: *http.Context, self: *State) !void {{\n", .{model_name});
+        if (has_tenant2) try buf.appendSlice(allocator, "        const tenant_id = (try requireTenant(ctx)) orelse return;\n");
         if (pk_is_str2) {
             try buf.appendSlice(allocator, "        const id = try ctx.paramStr(\"id\");\n");
         } else {
             try buf.appendSlice(allocator, "        const id = ctx.queryInt(i64, \"id\", 0);\n");
         }
-        try buf.print(allocator, "        if (try self.service.get{s}(id)) |entity| {{\n", .{model_name});
+        if (has_tenant2) {
+            try buf.print(allocator, "        if (try self.service.get{s}ByTenant(id, tenant_id)) |entity| {{\n", .{model_name});
+        } else {
+            try buf.print(allocator, "        if (try self.service.get{s}(id)) |entity| {{\n", .{model_name});
+        }
+        // `findById` scans from the client allocator; freeing with
+        // `ctx.allocator` would be a no-op under the request arena.
+        try buf.print(allocator, "            defer sqlx.freeScanned(self.service.persistence.backend.allocator, model.{s}, entity);\n", .{model_name});
         try buf.appendSlice(allocator, "            try R.wrapOk(ctx, entity);\n");
         try buf.appendSlice(allocator, "        } else {\n");
         try buf.appendSlice(allocator, "            try R.wrapErr(ctx, .not_found, \"not found\");\n");
@@ -3868,34 +4181,91 @@ fn generateModuleApi(allocator: std.mem.Allocator, module_name: []const u8, tabl
 
         // create
         try buf.print(allocator, "    fn create{s}(ctx: *http.Context, self: *State) !void {{\n", .{model_name});
+        if (has_tenant2) try buf.appendSlice(allocator, "        const tenant_id = (try requireTenant(ctx)) orelse return;\n");
         try buf.print(allocator, "        const entity = ctx.bindJson(model.{s}) catch {{\n", .{model_name});
         try buf.appendSlice(allocator, "            try R.wrapErr(ctx, .validation_failed, \"invalid body\");\n            return;\n        };\n");
+        // `bindJson` deep-copies every string field out of `ctx.allocator`, so
+        // that is the allocator to free with (unlike `get`/`list`, whose rows
+        // come from the client). `insert` hands back a copy of `entity` that
+        // aliases those same slices, so `entity` is freed once here — freeing
+        // `created` too would be a double free.
+        try buf.print(allocator, "        defer sqlx.freeScanned(ctx.allocator, model.{s}, entity);\n", .{model_name});
         try buf.print(allocator, "        self.service.validate{s}(entity) catch {{\n", .{model_name});
         try buf.appendSlice(allocator, "            try R.wrapErr(ctx, .validation_failed, \"validation failed\");\n            return;\n        };\n");
-        try buf.print(allocator, "        const created = try self.service.create{s}(entity);\n", .{model_name});
+        // The body's tenant column is deliberately replaced by the caller's
+        // tenant inside `create…ByTenant`; the handler must not try to police it.
+        if (has_tenant2) {
+            try buf.print(allocator, "        const created = try self.service.create{s}ByTenant(tenant_id, entity);\n", .{model_name});
+        } else {
+            try buf.print(allocator, "        const created = try self.service.create{s}(entity);\n", .{model_name});
+        }
         try buf.appendSlice(allocator, "        try R.wrapOk(ctx, created);\n");
         try buf.appendSlice(allocator, "    }\n\n");
 
         // update
         try buf.print(allocator, "    fn update{s}(ctx: *http.Context, self: *State) !void {{\n", .{model_name});
+        if (has_tenant2) try buf.appendSlice(allocator, "        const tenant_id = (try requireTenant(ctx)) orelse return;\n");
         try buf.print(allocator, "        const entity = ctx.bindJson(model.{s}) catch {{\n", .{model_name});
         try buf.appendSlice(allocator, "            try R.wrapErr(ctx, .validation_failed, \"invalid body\");\n            return;\n        };\n");
+        try buf.print(allocator, "        defer sqlx.freeScanned(ctx.allocator, model.{s}, entity);\n", .{model_name});
         try buf.print(allocator, "        self.service.validate{s}(entity) catch {{\n", .{model_name});
         try buf.appendSlice(allocator, "            try R.wrapErr(ctx, .validation_failed, \"validation failed\");\n            return;\n        };\n");
-        try buf.print(allocator, "        try self.service.update{s}(entity);\n", .{model_name});
+        if (has_tenant2) {
+            // `update…ByTenant` reports the rows it rewrote, and `0` is the
+            // whole point of the tenant predicate: the row exists but is not
+            // this caller's. Reporting success there would hand the client a
+            // 200 for a write that never happened, so 0 becomes not-found —
+            // the same answer `get` gives for another tenant's row.
+            try buf.print(allocator, "        const rows = try self.service.update{s}ByTenant(tenant_id, entity);\n", .{model_name});
+            try buf.appendSlice(allocator, "        if (rows == 0) {\n            try R.wrapErr(ctx, .not_found, \"not found\");\n            return;\n        }\n");
+        } else {
+            try buf.print(allocator, "        try self.service.update{s}(entity);\n", .{model_name});
+        }
         try buf.appendSlice(allocator, "        try R.wrapSuccess(ctx);\n");
         try buf.appendSlice(allocator, "    }\n\n");
 
         // delete
         try buf.print(allocator, "    fn delete{s}(ctx: *http.Context, self: *State) !void {{\n", .{model_name});
+        if (has_tenant2) try buf.appendSlice(allocator, "        const tenant_id = (try requireTenant(ctx)) orelse return;\n");
         if (pk_is_str2) {
             try buf.appendSlice(allocator, "        const id = try ctx.paramStr(\"id\");\n");
         } else {
             try buf.appendSlice(allocator, "        const id = ctx.queryInt(i64, \"id\", 0);\n");
         }
-        try buf.print(allocator, "        try self.service.delete{s}(id);\n", .{model_name});
+        if (has_tenant2) {
+            // Same as update: 0 rows deleted means the id did not name a row of
+            // this caller's tenant (or no row at all) — that is a 404, never a
+            // success.
+            try buf.print(allocator, "        const rows = try self.service.delete{s}ByTenant(tenant_id, id);\n", .{model_name});
+            try buf.appendSlice(allocator, "        if (rows == 0) {\n            try R.wrapErr(ctx, .not_found, \"not found\");\n            return;\n        }\n");
+        } else {
+            try buf.print(allocator, "        try self.service.delete{s}(id);\n", .{model_name});
+        }
         try buf.appendSlice(allocator, "        try R.wrapSuccess(ctx);\n");
         try buf.appendSlice(allocator, "    }\n\n");
+    }
+
+    if (any_tenant) {
+        try buf.appendSlice(allocator,
+            \\    /// The caller's tenant: the `tenant_id` attr the JWT catalog
+            \\    /// middleware writes from the token's `aud` claim (`ctx.tenantId()`),
+            \\    /// never a query parameter or a body field — a client controls both.
+            \\    ///
+            \\    /// A missing or non-numeric tenant is a rejection, not a fallback:
+            \\    /// none of the handlers above has an unscoped call to fall back to.
+            \\    fn requireTenant(ctx: *http.Context) !?i64 {
+            \\        const raw = ctx.tenantId() orelse {
+            \\            try R.wrapErr(ctx, .unauthorized, "tenant required");
+            \\            return null;
+            \\        };
+            \\        return std.fmt.parseInt(i64, raw, 10) catch {
+            \\            try R.wrapErr(ctx, .unauthorized, "tenant required");
+            \\            return null;
+            \\        };
+            \\    }
+            \\
+            \\
+        );
     }
 
     try appendFooter(&buf, allocator, orm_tpl.sqlx_api_footer);
@@ -3945,7 +4315,7 @@ fn writeModuleFiles(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u
     defer allocator.free(module_dir);
     try ensureDirGen(io, module_dir, opts);
 
-    const model_code = try generateModuleModel(allocator, module_name, tables, strip_prefix_len, opts.json_style);
+    const model_code = try generateModuleModel(allocator, module_name, tables, strip_prefix_len, opts.json_style, opts.tenant_column);
     defer allocator.free(model_code);
     const model_path = try std.fmt.allocPrint(allocator, "{s}/model.zig", .{module_dir});
     defer allocator.free(model_path);
@@ -3964,11 +4334,57 @@ fn writeModuleFiles(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u
         defer allocator.free(service_path);
         try safeWrite(io, allocator, service_path, service_code, opts);
 
-        const api_code = try generateModuleApi(allocator, module_name, tables, strip_prefix_len);
+        const api_code = try generateModuleApi(allocator, module_name, tables, strip_prefix_len, opts.tenant_column);
         defer allocator.free(api_code);
         const api_path = try std.fmt.allocPrint(allocator, "{s}/api.zig", .{module_dir});
         defer allocator.free(api_path);
         try safeWrite(io, allocator, api_path, api_code, opts);
+
+        // Runnable module test next to api.zig. It reaches the generated surface
+        // through two different names — the module's (`…Persistence`, `…Api`)
+        // and its model's (`model.Product`, `createProduct`) — so it fits a
+        // module with exactly one table, and the emitter passes the model name
+        // separately (see `orm_tpl.expandOrmTest`).
+        if (tables.len == 1) {
+            const pascal_module = try toPascalCase(allocator, module_name);
+            defer allocator.free(pascal_module);
+            const single = tables[0];
+            const effective_table = if (strip_prefix_len > 0 and strip_prefix_len < single.name.len)
+                single.name[strip_prefix_len..]
+            else
+                single.name;
+            const model_name = try toPascalCase(allocator, effective_table);
+            defer allocator.free(model_name);
+            // A tenant table gets one more test: the only executable proof that
+            // the handlers do not reach the unscoped repository names (which the
+            // model's `sql_tenant_column` turns into compile errors, so the
+            // template cannot silently regress into them).
+            const tenant_column = if (opts.tenant_column.len > 0 and tableHasColumn(single, opts.tenant_column)) opts.tenant_column else "";
+            const tpl = if (tenant_column.len > 0)
+                try std.mem.concat(allocator, u8, &.{ orm_tpl.sqlx_test, orm_tpl.sqlx_test_tenant })
+            else
+                try allocator.dupe(u8, orm_tpl.sqlx_test);
+            defer allocator.free(tpl);
+            const named = try orm_tpl.expandOrmTest(allocator, tpl, module_name, pascal_module, model_name);
+            defer allocator.free(named);
+            // `<<POST_DISPATCH>>` is the tail of the one dispatch call in the
+            // base test: the unscoped form expands to the original bytes, and a
+            // tenant-scoped module names its identity attrs there instead,
+            // because every tenant handler rejects a request without one.
+            const keys = [_][]const u8{ "<<POST_DISPATCH>>", "<<TENANT_COLUMN>>" };
+            const vals = [_][]const u8{
+                if (tenant_column.len > 0)
+                    "Opts(&server, .POST, create_path, .{ .body = body, .attrs = &.{.{ \"tenant_id\", \"1\" }} })"
+                else
+                    "(&server, .POST, create_path, body)",
+                tenant_column,
+            };
+            const test_code = try orm_tpl.expandTemplate(allocator, named, &keys, &vals);
+            defer allocator.free(test_code);
+            const test_path = try std.fmt.allocPrint(allocator, "{s}/test.zig", .{module_dir});
+            defer allocator.free(test_path);
+            try safeWrite(io, allocator, test_path, test_code, opts);
+        }
 
         const dependencies_str = try inferModuleDependencies(allocator, tables, module_name, strip_prefix_len);
         defer allocator.free(dependencies_str);
@@ -4207,7 +4623,17 @@ fn cmdOrm(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
     const out_dir = cli.out_dir;
     const forced_module = cli.forced_module;
     const backend = cli.backend;
-    const opts = cli.opts;
+
+    // `orm` writes paths relative to the current directory, which is the
+    // project root — the same root `scaffold` records its keys against.
+    var manifest = incremental.loadManifest(allocator, io, ".");
+    defer incremental.freeManifest(allocator, &manifest);
+    var written = WrittenFiles{};
+    defer written.deinit(allocator);
+    var opts = cli.opts;
+    opts.manifest_root = ".";
+    opts.manifest_files = &manifest;
+    opts.written = &written;
 
     if (pathContainsDotDot(out_dir)) {
         std.log.err("--out must not contain '..': {s}", .{out_dir});
@@ -4277,19 +4703,15 @@ fn cmdOrm(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
             try writeModuleFiles(io, allocator, out_dir, mod_name, tables, opts, 0);
         }
         std.log.info("All {d} table(s) placed in module '{s}'", .{ tables.len, mod_name });
+        if (!opts.dry_run) saveGeneratedHashes(io, allocator, ".", &manifest, &written) catch |err| {
+            std.log.warn("Could not save generated hashes: {}", .{err});
+        };
         return;
     }
 
     // Auto-group: smart prefix detection + multi-module generation
     var module_map = try groupTablesByModule(allocator, tables);
-    defer {
-        var iter = module_map.iterator();
-        while (iter.next()) |entry| {
-            entry.value_ptr.deinit(allocator);
-            allocator.free(entry.key_ptr.*);
-        }
-        module_map.deinit();
-    }
+    defer freeModuleMap(allocator, &module_map);
 
     try ensureDirGen(io, out_dir, opts);
 
@@ -4306,6 +4728,9 @@ fn cmdOrm(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
         module_count += 1;
     }
     std.log.info("Auto-grouped {d} table(s) into {d} module(s)", .{ tables.len, module_count });
+    if (!opts.dry_run) saveGeneratedHashes(io, allocator, ".", &manifest, &written) catch |err| {
+        std.log.warn("Could not save generated hashes: {}", .{err});
+    };
 }
 
 // ── migration: generate Flyway-style migration file ─────────────────
@@ -4394,7 +4819,10 @@ fn cmdMigration(io: std.Io, allocator: std.mem.Allocator, args: []const []const 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--dir")) {
-            if (i + 1 >= args.len) return error.CliUsage;
+            if (i + 1 >= args.len) {
+                std.log.err("Missing value after --dir. Usage: zmodu migration <description> [--dir <dir>]", .{});
+                return error.CliUsage;
+            }
             dir = args[i + 1];
             i += 1;
         } else if (description.len == 0) {
@@ -4631,11 +5059,17 @@ fn cmdHealth(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8)
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--out")) {
-            if (i + 1 >= args.len) return error.CliUsage;
+            if (i + 1 >= args.len) {
+                std.log.err("Missing value after --out. Usage: zmodu health [--out <dir>] [--module <name>]", .{});
+                return error.CliUsage;
+            }
             out_dir = args[i + 1];
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--module")) {
-            if (i + 1 >= args.len) return error.CliUsage;
+            if (i + 1 >= args.len) {
+                std.log.err("Missing value after --module. Usage: zmodu health [--out <dir>] [--module <name>]", .{});
+                return error.CliUsage;
+            }
             module_name = args[i + 1];
             i += 1;
         }
@@ -4714,11 +5148,17 @@ fn cmdConfig(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8)
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--out")) {
-            if (i + 1 >= args.len) return error.CliUsage;
+            if (i + 1 >= args.len) {
+                std.log.err("Missing value after --out. Usage: zmodu config [--out <dir>] [--keys k1,k2,...]", .{});
+                return error.CliUsage;
+            }
             out_dir = args[i + 1];
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--keys")) {
-            if (i + 1 >= args.len) return error.CliUsage;
+            if (i + 1 >= args.len) {
+                std.log.err("Missing value after --keys. Usage: zmodu config [--out <dir>] [--keys k1,k2,...]", .{});
+                return error.CliUsage;
+            }
             keys_str = args[i + 1];
             i += 1;
         }
@@ -4793,26 +5233,103 @@ fn cmdConfig(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8)
 
 // ── test: generate integration test scaffolding ──────────────────
 
-fn cmdTest(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
-    if (args.len == 0) {
-        std.log.err("Usage: zmodu test <module-name> [--out <dir>]", .{});
-        return error.CliUsage;
-    }
-    const module_name = args[0];
-    var out_dir: []const u8 = "src/modules";
+/// Parsed `zmodu test` arguments. Split out from `cmdTest` so the validation is
+/// testable without touching the filesystem.
+const TestArgs = union(enum) {
+    ok: struct {
+        module_name: []const u8,
+        out_dir: []const u8,
+    },
+    /// Ready-to-print rejection reason. Returned rather than logged so the
+    /// parser stays pure: Zig's test runner fails a test that logs at `.err`,
+    /// and a parser that cannot be tested is how the bug below survived.
+    usage: []const u8,
+};
 
+/// `zmodu test <module-name> [--out <dir>]`, with the module name required to
+/// not look like a flag.
+///
+/// Before this, `args[0]` was taken as the module name verbatim and unknown
+/// flags were skipped in silence — so `zmodu test --out` created
+/// `src/modules/--out/test.zig` and exited 0, turning a typo into a directory.
+fn parseTestArgs(args: []const []const u8, buf: []u8) TestArgs {
+    const usage_default = "Usage: zmodu test <module-name> [--out <dir>]";
+    if (args.len == 0) return .{ .usage = usage_default };
+    if (args[0].len == 0 or args[0][0] == '-') {
+        const msg = std.fmt.bufPrint(
+            buf,
+            "Missing module name: got the flag '{s}' where a module name belongs. {s}",
+            .{ args[0], usage_default },
+        ) catch usage_default;
+        return .{ .usage = msg };
+    }
+
+    var out_dir: []const u8 = "src/modules";
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--out")) {
-            if (i + 1 >= args.len) return error.CliUsage;
+            if (i + 1 >= args.len) {
+                return .{ .usage = "Missing value after --out. " ++ usage_default };
+            }
             out_dir = args[i + 1];
             i += 1;
+        } else {
+            const msg = std.fmt.bufPrint(
+                buf,
+                "Unknown flag '{s}'. {s}",
+                .{ args[i], usage_default },
+            ) catch usage_default;
+            return .{ .usage = msg };
         }
     }
+    return .{ .ok = .{ .module_name = args[0], .out_dir = out_dir } };
+}
+
+test "parseTestArgs: rejects anything that would turn a typo into a directory" {
+    var buf: [256]u8 = undefined;
+
+    // Happy paths.
+    {
+        const a = parseTestArgs(&.{"orders"}, &buf).ok;
+        try std.testing.expectEqualStrings("orders", a.module_name);
+        try std.testing.expectEqualStrings("src/modules", a.out_dir);
+    }
+    {
+        const a = parseTestArgs(&.{ "orders", "--out", "/tmp/x" }, &buf).ok;
+        try std.testing.expectEqualStrings("orders", a.module_name);
+        try std.testing.expectEqualStrings("/tmp/x", a.out_dir);
+    }
+
+    // The cases that used to write `src/modules/--out/test.zig` and exit 0.
+    try std.testing.expect(std.mem.indexOf(u8, parseTestArgs(&[_][]const u8{}, &buf).usage, "Usage:") != null);
+    // The message has to name the offending token, or the user cannot tell what
+    // was misread as a module name.
+    try std.testing.expect(std.mem.indexOf(u8, parseTestArgs(&.{"--out"}, &buf).usage, "'--out'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parseTestArgs(&.{"--bogus"}, &buf).usage, "'--bogus'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parseTestArgs(&.{ "orders", "--oops" }, &buf).usage, "'--oops'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parseTestArgs(&.{ "orders", "--out" }, &buf).usage, "Missing value after --out") != null);
+}
+
+fn cmdTest(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
+    var msg_buf: [256]u8 = undefined;
+    const parsed = switch (parseTestArgs(args, &msg_buf)) {
+        .ok => |a| a,
+        .usage => |msg| {
+            std.log.err("{s}", .{msg});
+            return error.CliUsage;
+        },
+    };
+    const module_name = parsed.module_name;
+    const out_dir = parsed.out_dir;
 
     const mod_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ out_dir, module_name });
     defer allocator.free(mod_dir);
-    std.Io.Dir.cwd().createDirPath(io, mod_dir) catch {};
+    // A failed mkdir is the writer's problem, not a warning to swallow: without
+    // the directory the write below fails anyway, just with a worse message.
+    std.Io.Dir.cwd().createDirPath(io, mod_dir) catch |err| {
+        std.log.err("Cannot create {s}: {s}", .{ mod_dir, @errorName(err) });
+        return err;
+    };
     const fp = try std.fmt.allocPrint(allocator, "{s}/test.zig", .{mod_dir});
     defer allocator.free(fp);
 
@@ -4910,19 +5427,31 @@ fn parseScaffoldArgs(allocator: std.mem.Allocator, args: []const []const u8) !Sc
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--sql")) {
-            if (i + 1 >= args.len) return error.CliUsage;
+            if (i + 1 >= args.len) {
+                std.log.err("Missing value after --sql. Usage: zmodu scaffold --sql <file> --name <project> [--out <dir>]", .{});
+                return error.CliUsage;
+            }
             sql_path = args[i + 1];
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--from-db")) {
-            if (i + 1 >= args.len) return error.CliUsage;
+            if (i + 1 >= args.len) {
+                std.log.err("Missing value after --from-db. Usage: zmodu scaffold --from-db <dsn> --name <project> [--out <dir>]", .{});
+                return error.CliUsage;
+            }
             db_dsn = args[i + 1];
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--name")) {
-            if (i + 1 >= args.len) return error.CliUsage;
+            if (i + 1 >= args.len) {
+                std.log.err("Missing value after --name. Usage: zmodu scaffold --sql <file> --name <project> [--out <dir>]", .{});
+                return error.CliUsage;
+            }
             project_name = args[i + 1];
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--out")) {
-            if (i + 1 >= args.len) return error.CliUsage;
+            if (i + 1 >= args.len) {
+                std.log.err("Missing value after --out. Usage: zmodu scaffold --sql <file> --name <project> [--out <dir>]", .{});
+                return error.CliUsage;
+            }
             out_dir = args[i + 1];
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--force")) {
@@ -4930,7 +5459,10 @@ fn parseScaffoldArgs(allocator: std.mem.Allocator, args: []const []const u8) !Sc
         } else if (std.mem.eql(u8, args[i], "--dry-run")) {
             dry_run = true;
         } else if (std.mem.eql(u8, args[i], "--diff")) {
-            if (i + 1 >= args.len) return error.CliUsage;
+            if (i + 1 >= args.len) {
+                std.log.err("Missing value after --diff. Usage: zmodu scaffold --sql <new.sql> --diff <old.sql> --name <project>", .{});
+                return error.CliUsage;
+            }
             diff_old_sql = args[i + 1];
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--with-events")) {
@@ -4958,7 +5490,10 @@ fn parseScaffoldArgs(allocator: std.mem.Allocator, args: []const []const u8) !Sc
         } else if (std.mem.eql(u8, args[i], "--with-web4")) {
             with_web4 = true;
         } else if (std.mem.eql(u8, args[i], "--tenant-column")) {
-            if (i + 1 >= args.len) return error.CliUsage;
+            if (i + 1 >= args.len) {
+                std.log.err("Missing value after --tenant-column. Usage: zmodu scaffold … --tenant-column <col>", .{});
+                return error.CliUsage;
+            }
             const val = args[i + 1];
             if (!isSafeTenantColumnIdent(val)) {
                 std.log.err("--tenant-column must be a SQL identifier, got '{s}'", .{val});
@@ -4967,7 +5502,10 @@ fn parseScaffoldArgs(allocator: std.mem.Allocator, args: []const []const u8) !Sc
             tenant_column = val;
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--json-style")) {
-            if (i + 1 >= args.len) return error.CliUsage;
+            if (i + 1 >= args.len) {
+                std.log.err("Missing value after --json-style. Usage: zmodu scaffold … --json-style snake|camel", .{});
+                return error.CliUsage;
+            }
             if (std.mem.eql(u8, args[i + 1], "camel")) json_style = .camel;
             i += 1;
         } else {
@@ -5034,7 +5572,10 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
         defer allocator.free(sql_content);
 
         const sql_for_parse = stripUtf8BomAndTrimSql(sql_content);
-        if (sql_for_parse.len == 0) return error.CliUsage;
+        if (sql_for_parse.len == 0) {
+            std.log.err("--sql '{s}' is empty (no CREATE TABLE found) — nothing to scaffold.", .{sql_path});
+            return error.CliUsage;
+        }
 
         tables = parseSqlSchema(allocator, sql_for_parse) catch |err| {
             std.log.err("Failed to parse SQL: {s}", .{@errorName(err)});
@@ -5042,6 +5583,7 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
         };
         std.log.info("Scaffolding '{s}' from {d} tables in {s}", .{ sopts.project_name, tables.len, sql_path });
     } else {
+        std.log.err("No schema source: pass --sql <file> or --from-db <dsn>.", .{});
         return error.CliUsage;
     }
 
@@ -5102,18 +5644,14 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
         allocator.free(tables);
     }
 
-    if (tables.len == 0) return error.CliUsage;
+    if (tables.len == 0) {
+        std.log.err("No usable table found (no CREATE TABLE with columns) — nothing to scaffold. Check --sql <file> / --from-db <dsn>.", .{});
+        return error.CliUsage;
+    }
 
     // 2. Auto-group tables into modules
     var module_map = try groupTablesByModule(allocator, tables);
-    defer {
-        var iter = module_map.iterator();
-        while (iter.next()) |entry| {
-            entry.value_ptr.deinit(allocator);
-            allocator.free(entry.key_ptr.*);
-        }
-        module_map.deinit();
-    }
+    defer freeModuleMap(allocator, &module_map);
 
     // 2.5 Detect subsystems from module name prefixes
     // Tables like shop_order, shop_product → subsystem "shop" with modules "order", "product"
@@ -5121,15 +5659,7 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
     // Tables like users (no shared prefix) → no subsystem
     var subsystem_map: ?std.StringHashMap(std.ArrayList([]const u8)) = try detectSubsystems(allocator, &module_map);
     defer {
-        if (subsystem_map) |*sm| {
-            var siter = sm.iterator();
-            while (siter.next()) |entry| {
-                for (entry.value_ptr.items) |m| allocator.free(m);
-                entry.value_ptr.deinit(allocator);
-                allocator.free(entry.key_ptr.*);
-            }
-            sm.deinit();
-        }
+        if (subsystem_map) |*sm| freeSubsystemMap(allocator, sm);
     }
 
     // Collect sorted module names for deterministic codegen
@@ -5160,7 +5690,13 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
     // 4. Generate modules under src/modules/
     const modules_dir = try std.fmt.allocPrint(allocator, "{s}/src/modules", .{project_dir});
     defer allocator.free(modules_dir);
-    const gen_opts: GenOptions = .{ .dry_run = sopts.dry_run, .force = sopts.force, .json_style = sopts.json_style, .enable_events = sopts.with_events, .with_transactions = sopts.with_transactions, .tenant_column = sopts.tenant_column };
+    // The manifest is loaded once here; `safeWrite` consults it per file to tell
+    // a file we generated (and nobody touched) from one the user edited.
+    var manifest = incremental.loadManifest(allocator, io, project_dir);
+    defer incremental.freeManifest(allocator, &manifest);
+    var written = WrittenFiles{};
+    defer written.deinit(allocator);
+    const gen_opts: GenOptions = .{ .dry_run = sopts.dry_run, .force = sopts.force, .json_style = sopts.json_style, .enable_events = sopts.with_events, .with_transactions = sopts.with_transactions, .tenant_column = sopts.tenant_column, .manifest_root = project_dir, .manifest_files = &manifest, .written = &written };
 
     const scaffold_prefix_len = commonTablePrefix(tables);
 
@@ -5242,7 +5778,7 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
                 \\    }}
                 \\
                 \\    fn resolve2(ctx: *http.Context) *{s}ApiExt {{
-                \\        return @ptrCast(@alignCast(ctx.user_data orelse unreachable));
+                \\        return ctx.state({s}ApiExt) catch @panic("route registered without state");
                 \\    }}
                 \\
                 \\    fn hPage(ctx: *http.Context) !void {{
@@ -5531,7 +6067,10 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
     try shared_buf.appendSlice(allocator, "//! RuoYi-style API response helpers\nconst std = @import(\"std\");\nconst http = @import(\"zigmodu\").http;\nconst BizCode = @import(\"errors.zig\").BizCode;\n\n");
     try shared_buf.appendSlice(allocator, "pub fn wrapOk(ctx: *http.Context, value: anytype) !void {\n    const inner = try std.json.Stringify.valueAlloc(ctx.allocator, value, .{});\n    defer ctx.allocator.free(inner);\n    const json = try std.fmt.allocPrint(ctx.allocator, \"{{\\\"code\\\":0,\\\"msg\\\":\\\"\\\",\\\"data\\\":{s}}}\", .{inner});\n    defer ctx.allocator.free(json);\n    try ctx.json(200, json);\n}\n\n");
     try shared_buf.appendSlice(allocator, "pub fn wrapList(ctx: *http.Context, result: anytype) !void {\n    const inner = try std.json.Stringify.valueAlloc(ctx.allocator, result.items, .{});\n    defer ctx.allocator.free(inner);\n    const json = try std.fmt.allocPrint(ctx.allocator, \"{{\\\"code\\\":0,\\\"msg\\\":\\\"\\\",\\\"data\\\":{{\\\"list\\\":{s},\\\"total\\\":{d}}}}}\", .{ inner, result.total });\n    defer ctx.allocator.free(json);\n    try ctx.json(200, json);\n}\n\n");
-    try shared_buf.appendSlice(allocator, "pub fn wrapSuccess(ctx: *http.Context) !void {\n    try ctx.json(200, \"{{\\\"code\\\":0,\\\"msg\\\":\\\"\\\",\\\"data\\\":null}}\");\n}\n\n");
+    // A plain string literal, not a format string: `{{`/`}}` would reach the
+    // response body verbatim and produce JSON no parser accepts (the three
+    // helpers above escape them because they *are* format strings).
+    try shared_buf.appendSlice(allocator, "pub fn wrapSuccess(ctx: *http.Context) !void {\n    try ctx.json(200, \"{\\\"code\\\":0,\\\"msg\\\":\\\"\\\",\\\"data\\\":null}\");\n}\n\n");
     try shared_buf.appendSlice(allocator, "pub fn wrapErr(ctx: *http.Context, code: BizCode, errmsg: []const u8) !void {\n    const json = try std.fmt.allocPrint(ctx.allocator, \"{{\\\"code\\\":{d},\\\"msg\\\":\\\"{s}\\\",\\\"data\\\":null}}\", .{ @backingInt(code), errmsg });\n    defer ctx.allocator.free(json);\n    try ctx.json(200, json);\n}\n");
     const shared_response = try shared_buf.toOwnedSlice(allocator);
     defer allocator.free(shared_response);
@@ -5699,7 +6238,7 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
         try finalizeBuildZigZonFingerprint(io, allocator, sopts.project_name, zon_path);
 
         // Save SHA256 hashes of all generated files for incremental support
-        saveGeneratedHashes(io, allocator, project_dir) catch |err| {
+        saveGeneratedHashes(io, allocator, project_dir, &manifest, &written) catch |err| {
             std.log.warn("Could not save generated hashes: {}", .{err});
         };
     }
@@ -5708,66 +6247,60 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
     std.log.info("  cd {s} && zig build run", .{project_dir});
 }
 
-/// Walk project directory and save SHA256 hashes of all .zig files.
-fn saveGeneratedHashes(io: std.Io, allocator: std.mem.Allocator, project_dir: []const u8) !void {
+/// Record in `.zmodu/generated_hashes.json` the files this command generated.
+/// Hashes are read back from disk (not taken from the content handed to
+/// `safeWrite`) because `formatGeneratedTree` rewrites files after the write.
+/// Entries from the previous manifest carry over so a later run still
+/// recognises the files this one did not touch; entries are sorted by path to
+/// keep the file byte-stable across runs.
+fn saveGeneratedHashes(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    project_dir: []const u8,
+    previous: *const std.StringHashMap([64]u8),
+    written: *const WrittenFiles,
+) !void {
+    if (written.paths.items.len == 0) return;
+
     var entries = std.ArrayList(incremental.HashEntry).empty;
     defer entries.deinit(allocator);
 
-    // Walk src/ directory for .zig files
-    var src_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const src_path = std.fmt.bufPrint(&src_buf, "{s}/src", .{project_dir}) catch return;
-    try walkAndHash(io, allocator, src_path, project_dir, &entries);
+    // Path slices are borrowed from `previous` and `written` — both outlive this
+    // call — so only the hash values are copied here.
+    var seen = std.StringHashMap(usize).init(allocator);
+    defer seen.deinit();
 
-    // Walk build.zig, build.zig.zon, main.zig at root
-    const root_files = [_][]const u8{ "build.zig", "build.zig.zon" };
-    for (root_files) |f| {
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ project_dir, f }) catch continue;
-        const content = Io.Dir.cwd().readFileAlloc(io, path, allocator, Io.Limit.limited(10 * 1024 * 1024)) catch continue;
-        defer allocator.free(content);
-        const hash = incremental.sha256Hex(content);
-        try entries.append(allocator, .{ .path = try allocator.dupe(u8, f), .hash = hash });
+    var iter = previous.iterator();
+    while (iter.next()) |kv| {
+        seen.put(kv.key_ptr.*, entries.items.len) catch continue;
+        try entries.append(allocator, .{ .path = kv.key_ptr.*, .hash = kv.value_ptr.* });
     }
 
-    if (entries.items.len > 0) {
-        incremental.saveManifest(allocator, io, project_dir, entries.items, ZMODU_VERSION) catch |err| {
-            std.log.warn("Failed to save hash manifest: {}", .{err});
-        };
-    }
-
-    // Free path strings
-    for (entries.items) |e| allocator.free(e.path);
-}
-
-fn walkAndHash(io: std.Io, allocator: std.mem.Allocator, current_path: []const u8, project_dir: []const u8, entries: *std.ArrayList(incremental.HashEntry)) !void {
-    var dir = Io.Dir.cwd().openDir(io, current_path, .{ .iterate = true }) catch return;
-    defer dir.close(io);
-
-    var iter = dir.iterate();
-    while (try iter.next(io)) |entry| {
+    for (written.paths.items) |path| {
+        const key = manifestKey(path, project_dir) orelse continue;
         var full_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ current_path, entry.name }) catch continue;
-
-        if (entry.kind == .directory) {
-            if (entry.name[0] == '.') continue;
-            try walkAndHash(io, allocator, full, project_dir, entries);
-            continue;
-        }
-
-        if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
-
+        const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ project_dir, key }) catch continue;
         const content = Io.Dir.cwd().readFileAlloc(io, full, allocator, Io.Limit.limited(10 * 1024 * 1024)) catch continue;
         defer allocator.free(content);
         const hash = incremental.sha256Hex(content);
 
-        // Compute relative path from project_dir
-        const rel_path = if (std.mem.startsWith(u8, full, project_dir))
-            full[project_dir.len + 1 ..]
-        else
-            full;
-
-        try entries.append(allocator, .{ .path = try allocator.dupe(u8, rel_path), .hash = hash });
+        if (seen.get(key)) |idx| {
+            entries.items[idx].hash = hash;
+        } else {
+            seen.put(key, entries.items.len) catch continue;
+            try entries.append(allocator, .{ .path = key, .hash = hash });
+        }
     }
+
+    std.mem.sort(incremental.HashEntry, entries.items, {}, struct {
+        fn lt(_: void, a: incremental.HashEntry, b: incremental.HashEntry) bool {
+            return std.mem.lessThan(u8, a.path, b.path);
+        }
+    }.lt);
+
+    incremental.saveManifest(allocator, io, project_dir, entries.items, ZMODU_VERSION) catch |err| {
+        std.log.warn("Failed to save hash manifest: {}", .{err});
+    };
 }
 
 fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []const u8, gen_opts: GenOptions) !void {
@@ -6262,7 +6795,9 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
         \\                .error_msg = @errorName(err),
         \\                .created_at = 0,
         \\                .updated_at = 0,
-        \\            }) catch {};
+        \\            }) catch |audit_err| {
+        \\                std.log.warn("[ai.agent] could not record failed run: {s}", .{@errorName(audit_err)});
+        \\            };
         \\            return err;
         \\        };
         \\        _ = run_repo.insert(.{
@@ -6275,7 +6810,9 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
         \\            .result = result.answer,
         \\            .created_at = 0,
         \\            .updated_at = 0,
-        \\        }) catch {};
+        \\        }) catch |audit_err| {
+        \\            std.log.warn("[ai.agent] could not record run: {s}", .{@errorName(audit_err)});
+        \\        };
         \\        return result;
         \\    }
         \\    pub fn getRuns(self: *AiAgentService, tenant_id: i64, page: usize, size: usize) !zigmodu.data.orm.PageResult(model.AgentRun) {
@@ -7091,7 +7628,9 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
         \\        var repo = self.persistence.messageRepo();
         \\        const saved = try repo.insert(msg);
         \\        if (self.send_fn) |f| {
-        \\            if (self.relay) |r| f(r, &saved) catch {};
+        \\            if (self.relay) |r| f(r, &saved) catch |send_err| {
+        \\                std.log.warn("[im] relay send failed: {s}", .{@errorName(send_err)});
+        \\            };
         \\        }
         \\        return saved;
         \\    }
@@ -7157,7 +7696,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
         \\    };
         \\
         \\    fn wsConnect(ctx: *http.Context, framer: *anyopaque) ?*anyopaque {
-        \\        const self: *ImApi = @ptrCast(@alignCast(ctx.user_data orelse return null));
+        \\        const self: *ImApi = ctx.state(ImApi) catch return null;
         \\        return self.gateway.accept(ctx, framer);
         \\    }
         \\
@@ -7307,7 +7846,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
         \\    }
         \\
         \\    fn onConnect(ctx: *http.Context, raw_framer: *anyopaque) ?*anyopaque {
-        \\        const gw: *ImGateway = @ptrCast(@alignCast(ctx.user_data orelse return null));
+        \\        const gw: *ImGateway = ctx.state(ImGateway) catch return null;
         \\        return gw.accept(ctx, raw_framer);
         \\    }
         \\
@@ -8169,7 +8708,10 @@ fn cmdAdd(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--sql")) {
-            if (i + 1 >= args.len) return error.CliUsage;
+            if (i + 1 >= args.len) {
+                std.log.err("Missing value after --sql. Usage: zmodu add --sql <file> [--tenant-column <col>]", .{});
+                return error.CliUsage;
+            }
             sql_path = args[i + 1];
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--force")) {
@@ -8177,7 +8719,10 @@ fn cmdAdd(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
         } else if (std.mem.eql(u8, args[i], "--dry-run")) {
             dry_run = true;
         } else if (std.mem.eql(u8, args[i], "--tenant-column")) {
-            if (i + 1 >= args.len) return error.CliUsage;
+            if (i + 1 >= args.len) {
+                std.log.err("Missing value after --tenant-column. Usage: zmodu add --sql <file> [--tenant-column <col>]", .{});
+                return error.CliUsage;
+            }
             const val = args[i + 1];
             if (!isSafeTenantColumnIdent(val)) {
                 std.log.err("--tenant-column must be a SQL identifier, got '{s}'", .{val});
@@ -8186,11 +8731,14 @@ fn cmdAdd(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
             tenant_column = val;
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--json-style")) {
-            if (i + 1 >= args.len) return error.CliUsage;
+            if (i + 1 >= args.len) {
+                std.log.err("Missing value after --json-style. Usage: zmodu add --sql <file> [--json-style snake|camel]", .{});
+                return error.CliUsage;
+            }
             if (std.mem.eql(u8, args[i + 1], "camel")) json_style = .camel;
             i += 1;
         } else {
-            std.log.err("Unknown option: {s}", .{args[i]});
+            std.log.err("Unknown option: {s}. Usage: zmodu add --sql <file> [--tenant-column <col>] [--json-style snake|camel] [--force] [--dry-run]", .{args[i]});
             return error.CliUsage;
         }
     }
@@ -8198,7 +8746,12 @@ fn cmdAdd(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
         std.log.err("zmodu add requires --sql <file>", .{});
         return error.CliUsage;
     }
-    const gen_opts: GenOptions = .{ .dry_run = dry_run, .force = force, .json_style = json_style, .tenant_column = tenant_column };
+    // `add` also writes project-relative paths, so the project root is the cwd.
+    var manifest = incremental.loadManifest(allocator, io, ".");
+    defer incremental.freeManifest(allocator, &manifest);
+    var written = WrittenFiles{};
+    defer written.deinit(allocator);
+    const gen_opts: GenOptions = .{ .dry_run = dry_run, .force = force, .json_style = json_style, .tenant_column = tenant_column, .manifest_root = ".", .manifest_files = &manifest, .written = &written };
 
     // 1. Read and parse SQL
     const sql_content = std.Io.Dir.cwd().readFileAlloc(io, sql_path.?, allocator, std.Io.Limit.limited(100 * 1024 * 1024)) catch |err| {
@@ -8208,7 +8761,10 @@ fn cmdAdd(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
     defer allocator.free(sql_content);
 
     const sql_for_parse = stripUtf8BomAndTrimSql(sql_content);
-    if (sql_for_parse.len == 0) return error.CliUsage;
+    if (sql_for_parse.len == 0) {
+        std.log.err("--sql '{s}' is empty (no CREATE TABLE found) — nothing to add.", .{sql_path.?});
+        return error.CliUsage;
+    }
 
     const tables = parseSqlSchema(allocator, sql_for_parse) catch |err| {
         std.log.err("Failed to parse SQL: {s}", .{@errorName(err)});
@@ -8231,20 +8787,17 @@ fn cmdAdd(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
         }
         allocator.free(tables);
     }
-    if (tables.len == 0) return error.CliUsage;
+    if (tables.len == 0) {
+        std.log.err("No usable table found in '{s}' (no CREATE TABLE with columns) — nothing to add.", .{sql_path.?});
+        return error.CliUsage;
+    }
     std.log.info("Adding {d} table(s) from {s}", .{ tables.len, sql_path.? });
 
     // 2. Group tables into modules + detect subsystems
     var module_map = try groupTablesByModule(allocator, tables);
-    defer {
-        var iter = module_map.iterator();
-        while (iter.next()) |entry| {
-            entry.value_ptr.deinit(allocator);
-            allocator.free(entry.key_ptr.*);
-        }
-        module_map.deinit();
-    }
-    _ = try detectSubsystems(allocator, &module_map);
+    defer freeModuleMap(allocator, &module_map);
+    var subsystem_map = try detectSubsystems(allocator, &module_map);
+    if (subsystem_map) |*sm| freeSubsystemMap(allocator, sm);
 
     // Collect module names
     var module_names = std.ArrayList([]const u8).empty;
@@ -8312,14 +8865,25 @@ fn cmdAdd(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
 
     // 4. Wire into main.zig
     if (!dry_run) {
-        try wireModulesIntoMainZig(io, allocator, module_names.items);
+        try wireModulesIntoMainZig(io, allocator, module_names.items, &written);
+        saveGeneratedHashes(io, allocator, ".", &manifest, &written) catch |err| {
+            std.log.warn("Could not save generated hashes: {}", .{err});
+        };
     }
 
     std.log.info("add complete: {d} table(s) → {d} module(s)", .{ tables.len, module_names.items.len });
 }
 
 /// Append module imports + wiring to an existing main.zig using anchor comments.
-fn wireModulesIntoMainZig(io: std.Io, allocator: std.mem.Allocator, new_modules: []const []const u8) !void {
+///
+/// The wiring has to land in the real `src/main.zig` (that is the file the
+/// project builds), so this edit cannot go through `safeWrite`'s "our file or
+/// `<path>.gen.new`" fork. `written` is what keeps it accounted for instead:
+/// the path is registered after the write, and `saveGeneratedHashes` re-reads
+/// the file from disk, so the manifest records the *post-wiring* hash. Without
+/// that, the next `scaffold` would see a file the manifest cannot vouch for and
+/// park its copy at `src/main.zig.gen.new`.
+fn wireModulesIntoMainZig(io: std.Io, allocator: std.mem.Allocator, new_modules: []const []const u8, written: ?*WrittenFiles) !void {
     const main_path = "src/main.zig";
     const main_content = std.Io.Dir.cwd().readFileAlloc(io, main_path, allocator, std.Io.Limit.limited(10 * 1024 * 1024)) catch {
         std.log.err("Cannot read {s} — wiring skipped. Update manually.", .{main_path});
@@ -8484,6 +9048,10 @@ fn wireModulesIntoMainZig(io: std.Io, allocator: std.mem.Allocator, new_modules:
     const file = try std.Io.Dir.cwd().createFile(io, main_path, .{});
     defer file.close(io);
     try file.writeStreamingAll(io, out.items);
+
+    // Registered only now, on purpose: the manifest re-reads the file, so the
+    // hash it stores has to be the one this write just produced.
+    if (written) |w| try w.record(allocator, main_path);
 
     std.log.info("Wired {d} module(s) into {s}", .{ to_wire.items.len, main_path });
 }
@@ -8936,6 +9504,14 @@ fn generateScaffoldTestsZig(
         try buf.print(allocator, "    {s}.deinit();\n", .{bind});
         try buf.appendSlice(allocator, "}\n\n");
 
+        // The scaffold also drops a runnable `test.zig` into single-table
+        // modules (repository round-trip + a `http.Testkit.dispatch` against
+        // the generated POST route). Referencing it here pulls it into
+        // `zig build test`; multi-table modules get no such file.
+        if (tables.items.len == 1) {
+            try buf.print(allocator, "test {{ _ = @import(\"modules/{s}/test.zig\"); }}\n\n", .{mod_name});
+        }
+
         for (tables.items) |table| {
             const effective_name = if (strip_prefix_len > 0 and strip_prefix_len < table.name.len)
                 table.name[strip_prefix_len..]
@@ -9117,13 +9693,189 @@ test "generateModuleApi emits RouteSpec table and typed handlers" {
         .comment = null,
     }};
     const table = TableDef{ .name = try a.dupe(u8, "orders"), .columns = cols[0..], .foreign_keys = &.{} };
-    const code = try generateModuleApi(a, "order", &.{table}, 0);
+    const code = try generateModuleApi(a, "order", &.{table}, 0, "tenant_id");
     try std.testing.expect(std.mem.indexOf(u8, code, "pub const routes = [_]http.RouteSpec(State)") != null);
     try std.testing.expect(std.mem.indexOf(u8, code, "pub const nest = .{\"order\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, code, ".path = \"list\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, code, "fn listOrders(ctx: *http.Context, self: *State)") != null);
     try std.testing.expect(std.mem.indexOf(u8, code, "registerRoutes") == null);
     try std.testing.expect(std.mem.indexOf(u8, code, "resolve(ctx)") == null);
+}
+
+test "generateModuleApi frees the owned rows it is handed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cols = [_]ColumnDef{.{
+        .name = "id",
+        .col_type = .int,
+        .nullable = false,
+        .is_primary_key = true,
+        .is_unique = false,
+        .has_default = false,
+        .comment = null,
+    }};
+    const table = TableDef{ .name = "orders", .columns = cols[0..], .foreign_keys = &.{} };
+    const code = try generateModuleApi(a, "order", &.{table}, 0, "tenant_id");
+
+    // `list` hands back a PageResult whose arena rides on the *client*
+    // allocator, so the per-request ctx arena never reclaims it.
+    try std.testing.expect(std.mem.indexOf(u8, code, "var result = try self.service.listOrders(page, size);") != null);
+    // `list` frees with the backend allocator — the PageResult arena's own
+    // backing allocator. Naming the request arena here is the footgun this
+    // guards against (it would be silently ignored and leak the page).
+    try std.testing.expect(std.mem.indexOf(u8, code, "var result = try self.service.listOrders(page, size);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "defer result.deinit(self.service.persistence.backend.allocator);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "result.deinit(ctx.allocator)") == null);
+
+    // get scans from the client allocator, so it frees through the backend;
+    // create / update bind from ctx.allocator, so they free through ctx.
+    // A single row has no arena — there is no allocator-free way to free it.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, code, "defer sqlx.freeScanned(self.service.persistence.backend.allocator, model.Orders, entity);"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, code, "defer sqlx.freeScanned(ctx.allocator, model.Orders, entity);"));
+    // `create` must not also free `created`: `repo.insert` returns a copy of
+    // the input whose slices alias it, so a second free is a double free.
+    try std.testing.expect(std.mem.indexOf(u8, code, "freeScanned(self.service.persistence.backend.allocator, model.Orders, created)") == null);
+}
+
+// The tenant column is the only thing that decides whether a generated module
+// is tenant-scoped: it has to reach the model (the `sql_tenant_column`
+// declaration), the service (the `*ByTenant` writes) and the api (the tenant
+// lookup plus the `*Unscoped`-free handler bodies).
+test "generateModuleService adds the tenant write variants" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cols = [_]ColumnDef{
+        .{ .name = "id", .col_type = .int, .nullable = false, .is_primary_key = true, .is_unique = false, .has_default = false, .comment = null },
+        .{ .name = "tenant_id", .col_type = .int, .nullable = false, .is_primary_key = false, .is_unique = false, .has_default = false, .comment = null },
+        .{ .name = "title", .col_type = .string, .nullable = false, .is_primary_key = false, .is_unique = false, .has_default = false, .comment = null },
+    };
+    const scoped = TableDef{ .name = "shop_product", .columns = cols[0..], .foreign_keys = &.{} };
+    const code = try generateModuleService(a, "shop/product", &.{scoped}, 5, false, false, "tenant_id");
+
+    try std.testing.expect(std.mem.indexOf(u8, code, "pub fn createProductByTenant(self: *ShopProductService, tenant_id: i64, entity: model.Product) !model.Product {") != null);
+    // The tenant column is rewritten *before* the INSERT: a body-supplied
+    // tenant id must not decide where the row lands.
+    try std.testing.expect(std.mem.indexOf(u8, code, "        var scoped = entity;\n        scoped.tenant_id = tenant_id;\n        const created = try repo.insertUnscoped(scoped);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "pub fn updateProductByTenant(self: *ShopProductService, tenant_id: i64, entity: model.Product) !u64 {") != null);
+    // The rows-affected count is passed on, not dropped: `0` is the only signal
+    // that the UPDATE matched nothing because the row is another tenant's.
+    try std.testing.expect(std.mem.indexOf(u8, code, "const rows = try repo.updateForTenant(\"tenant_id\", tenant_id, entity);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "return rows;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "_ = try repo.updateForTenant") == null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "pub fn deleteProductByTenant(self: *ShopProductService, tenant_id: i64, id: i64) !u64 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "const rows = try repo.deleteForTenant(\"tenant_id\", tenant_id, id);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "_ = try repo.deleteForTenant") == null);
+}
+
+test "generateModuleService leaves a table without the tenant column alone" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cols = [_]ColumnDef{
+        .{ .name = "id", .col_type = .int, .nullable = false, .is_primary_key = true, .is_unique = false, .has_default = false, .comment = null },
+        .{ .name = "title", .col_type = .string, .nullable = false, .is_primary_key = false, .is_unique = false, .has_default = false, .comment = null },
+    };
+    const plain = TableDef{ .name = "note", .columns = cols[0..], .foreign_keys = &.{} };
+    const code = try generateModuleService(a, "note", &.{plain}, 0, false, false, "tenant_id");
+
+    try std.testing.expect(std.mem.indexOf(u8, code, "ByTenant") == null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "ForTenant") == null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "pub fn createNote(self: *NoteService, entity: model.Note) !model.Note {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "const created = try repo.insert(entity);") != null);
+}
+
+test "generateModuleApi reads the tenant from the request for tenant tables" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cols = [_]ColumnDef{
+        .{ .name = "id", .col_type = .int, .nullable = false, .is_primary_key = true, .is_unique = false, .has_default = false, .comment = null },
+        .{ .name = "tenant_id", .col_type = .int, .nullable = false, .is_primary_key = false, .is_unique = false, .has_default = false, .comment = null },
+    };
+    const scoped = TableDef{ .name = "shop_product", .columns = cols[0..], .foreign_keys = &.{} };
+    const code = try generateModuleApi(a, "shop/product", &.{scoped}, 5, "tenant_id");
+
+    try std.testing.expect(std.mem.indexOf(u8, code, "const std = @import(\"std\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "fn requireTenant(ctx: *http.Context) !?i64 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "        const raw = ctx.tenantId() orelse {") != null);
+    // Every handler takes the tenant from the request and every one of them
+    // rejects a request without it — there is no unscoped branch to fall into.
+    try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, code, "const tenant_id = (try requireTenant(ctx)) orelse return;"));
+    try std.testing.expect(std.mem.indexOf(u8, code, "self.service.listProductsByTenant(page, size, tenant_id)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "self.service.getProductByTenant(id, tenant_id)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "self.service.createProductByTenant(tenant_id, entity)") != null);
+    // The write handlers must consult the row count: a cross-tenant UPDATE that
+    // rewrote nothing has to answer 404, not a success envelope.
+    try std.testing.expect(std.mem.indexOf(u8, code, "const rows = try self.service.updateProductByTenant(tenant_id, entity);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "const rows = try self.service.deleteProductByTenant(tenant_id, id);") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, code, "if (rows == 0) {\n            try R.wrapErr(ctx, .not_found, \"not found\");\n            return;\n        }"));
+    try std.testing.expect(std.mem.indexOf(u8, code, "Unscoped") == null);
+}
+
+test "generateModuleApi keeps a table without the tenant column unscoped" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cols = [_]ColumnDef{
+        .{ .name = "id", .col_type = .int, .nullable = false, .is_primary_key = true, .is_unique = false, .has_default = false, .comment = null },
+        .{ .name = "title", .col_type = .string, .nullable = false, .is_primary_key = false, .is_unique = false, .has_default = false, .comment = null },
+    };
+    const plain = TableDef{ .name = "note", .columns = cols[0..], .foreign_keys = &.{} };
+
+    // Opt-out (`tenant_column = ""`) and a table that simply lacks the column
+    // must both render the unscoped handlers, with no tenant machinery at all —
+    // a scaffolded project without tenant tables must not need a JWT.
+    for ([_][]const u8{ "", "tenant_id" }) |tenant_column| {
+        const code = try generateModuleApi(a, "note", &.{plain}, 0, tenant_column);
+        try std.testing.expect(std.mem.indexOf(u8, code, "requireTenant") == null);
+        try std.testing.expect(std.mem.indexOf(u8, code, "ByTenant") == null);
+        try std.testing.expect(std.mem.indexOf(u8, code, "const std = @import(\"std\");") == null);
+        try std.testing.expect(std.mem.indexOf(u8, code, "var result = try self.service.listNotes(page, size);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, code, "if (try self.service.getNote(id)) |entity| {") != null);
+        try std.testing.expect(std.mem.indexOf(u8, code, "const created = try self.service.createNote(entity);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, code, "try self.service.updateNote(entity);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, code, "try self.service.deleteNote(id);") != null);
+    }
+}
+
+test "generateScaffoldTestsZig wires the per-module test.zig" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cols = [_]ColumnDef{.{
+        .name = "id",
+        .col_type = .int,
+        .nullable = false,
+        .is_primary_key = true,
+        .is_unique = false,
+        .has_default = false,
+        .comment = null,
+    }};
+    const notes_table = TableDef{ .name = "notes", .columns = cols[0..], .foreign_keys = &.{} };
+    const names = [_][]const u8{"notes"};
+
+    var single = std.StringHashMap(std.ArrayList(TableDef)).init(a);
+    defer single.deinit();
+    var notes: std.ArrayList(TableDef) = .empty;
+    try notes.append(a, notes_table);
+    try single.put("notes", notes);
+
+    const code = try generateScaffoldTestsZig(a, names[0..], &single, 0);
+    try std.testing.expect(std.mem.indexOf(u8, code, "test { _ = @import(\"modules/notes/test.zig\"); }") != null);
+
+    // A multi-table module gets no test.zig from writeModuleFiles, so the
+    // project test root must not reference one.
+    var pair = std.StringHashMap(std.ArrayList(TableDef)).init(a);
+    defer pair.deinit();
+    var both: std.ArrayList(TableDef) = .empty;
+    try both.append(a, notes_table);
+    try both.append(a, .{ .name = "labels", .columns = cols[0..], .foreign_keys = &.{} });
+    try pair.put("notes", both);
+
+    const wide = try generateScaffoldTestsZig(a, names[0..], &pair, 0);
+    try std.testing.expect(std.mem.indexOf(u8, wide, "modules/notes/test.zig") == null);
 }
 
 test "generated ORM files only import std where a method uses it" {
@@ -9156,7 +9908,7 @@ test "generated ORM files only import std where a method uses it" {
 
     const persistence = try generateModulePersistence(a, "app", &.{plain}, 0);
     try std.testing.expect(std.mem.indexOf(u8, persistence, std_import) == null);
-    const api = try generateModuleApi(a, "app", &.{plain}, 0);
+    const api = try generateModuleApi(a, "app", &.{plain}, 0, "tenant_id");
     try std.testing.expect(std.mem.indexOf(u8, api, std_import) == null);
 
     // The email shape check is the only `std.*` call a generated service body
@@ -9203,6 +9955,58 @@ test "generateScaffoldMainZig mounts plugins via ComptimeRouter" {
     try std.testing.expect(std.mem.indexOf(u8, code, "permissionGateWith(&catalog_slot, .{ .mode = .rbac })") != null);
     try std.testing.expect(std.mem.indexOf(u8, code, "RolePermissionTable") != null);
     try std.testing.expect(std.mem.indexOf(u8, code, "permissionGate(&catalog_slot)") == null);
+}
+
+// A generator has to emit the same bytes for the same input. The fingerprint is
+// the half of `build.zig.zon` that used to be drawn from an RNG (Zig's
+// `Package.Fingerprint.generate`), which made two scaffolds of one schema
+// differ. It is now derived from the package name — and it still has to satisfy
+// Zig's own validation rule, or the generated project will not build at all.
+test "generateBuildZonImpl: fingerprint is derived from the name, not random" {
+    const a = std.testing.allocator;
+
+    const first = try generateBuildZonImpl(a, "shop_demo", null);
+    defer a.free(first);
+    const second = try generateBuildZonImpl(a, "shop-demo", null);
+    defer a.free(second);
+    try std.testing.expectEqualStrings(first, second);
+    try std.testing.expect(std.mem.indexOf(u8, first, ".fingerprint = 0x") != null);
+
+    // `shop-demo` and `shop_demo` sanitize to the same `.name`, so they share a
+    // fingerprint; another name must not collide with it.
+    const other = try generateBuildZonImpl(a, "shop_orders", null);
+    defer a.free(other);
+    try std.testing.expect(!std.mem.eql(u8, first, other));
+
+    // Byte 0 of the value is the id half of `Package.Fingerprint` (low bits of
+    // the packed struct), the checksum half lives in the high 32 bits. Only the
+    // latter is checked by the compiler: `validate` compares it against
+    // `std.hash.Crc32.hash(name)` and rejects 0 / 0xffffffff as the id.
+    for ([_][]const u8{ "shop_demo", "shop_orders" }) |name| {
+        const zon = try generateBuildZonImpl(a, name, null);
+        defer a.free(zon);
+        const fp = try zonFingerprintForTest(zon);
+        const pkg = try packageNameForZon(a, name);
+        defer a.free(pkg);
+        try std.testing.expectEqual(std.hash.Crc32.hash(pkg), @as(u32, @truncate(fp >> 32)));
+        const id: u32 = @truncate(fp);
+        try std.testing.expect(id != 0 and id != 0xffffffff);
+    }
+
+    // An explicit value still wins — that is the repair path for a manifest
+    // whose derived fingerprint a toolchain rejected.
+    const pinned = try generateBuildZonImpl(a, "shop_demo", 0x11223344aabbccdd);
+    defer a.free(pinned);
+    try std.testing.expect(std.mem.indexOf(u8, pinned, ".fingerprint = 0x11223344aabbccdd") != null);
+}
+
+/// Parse the `.fingerprint = 0x…` line back out of a generated `build.zig.zon`.
+fn zonFingerprintForTest(zon: []const u8) !u64 {
+    const marker = ".fingerprint = 0x";
+    const start = std.mem.indexOf(u8, zon, marker) orelse return error.MissingFingerprint;
+    const digits = zon[start + marker.len ..];
+    const end = std.mem.indexOfScalar(u8, digits, ',') orelse return error.MissingFingerprint;
+    return try std.fmt.parseInt(u64, digits[0..end], 16);
 }
 
 test "generateZentClient: buildGraph types on one line" {
@@ -9365,6 +10169,26 @@ test "isSafeModuleDirName" {
     try std.testing.expect(!isSafeModuleDirName("a/b"));
     try std.testing.expect(!isSafeModuleDirName(".."));
     try std.testing.expect(!isSafeModuleDirName(""));
+}
+
+test "manifestKey: keys are relative to the project root" {
+    // scaffold: paths are built from project_dir, so the prefix comes off.
+    try std.testing.expectEqualStrings("src/main.zig", manifestKey("proj/src/main.zig", "proj").?);
+    try std.testing.expectEqualStrings("src/main.zig", manifestKey("./proj/src/main.zig", "./proj").?);
+    try std.testing.expectEqualStrings("src/main.zig", manifestKey("/abs/proj/src/main.zig", "/abs/proj").?);
+    // orm/add run at the project root, where the path already is the key.
+    try std.testing.expectEqualStrings("src/modules/product/model.zig", manifestKey("src/modules/product/model.zig", ".").?);
+    try std.testing.expectEqualStrings("src/modules/product/model.zig", manifestKey("./src/modules/product/model.zig", "./").?);
+    // Nothing outside the root may be claimed as ours.
+    try std.testing.expect(manifestKey("/elsewhere/x.zig", ".") == null);
+    try std.testing.expect(manifestKey("other/x.zig", "proj") == null);
+    try std.testing.expect(manifestKey("proj", "proj") == null);
+}
+
+test "stripLeadingDots drops a leading ./ chain" {
+    try std.testing.expectEqualStrings("a/b", stripLeadingDots("./a/b"));
+    try std.testing.expectEqualStrings("a/b", stripLeadingDots("././a/b"));
+    try std.testing.expectEqualStrings("a/b", stripLeadingDots("a/b"));
 }
 
 test "toPascalCase snake_case to PascalCase" {

@@ -51,7 +51,9 @@ pub const RunAuditStore = struct {
         } else |_| {
             const alter = try std.fmt.allocPrint(self.allocator, "ALTER TABLE {s} ADD COLUMN model TEXT", .{self.table});
             defer self.allocator.free(alter);
-            _ = self.backend.exec(alter, &.{}) catch {};
+            _ = self.backend.exec(alter, &.{}) catch |err| {
+                std.log.debug("[ai.run_audit] best-effort legacy column add failed ({s})", .{@errorName(err)});
+            };
         }
     }
 

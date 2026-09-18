@@ -15,6 +15,87 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 
 ---
 
+## v0.26.0+（未发布批次）
+
+### `zmodu audit` / `zmodu ci` 现在会审计嵌套模块
+
+**Breaking?** 是 —— 对消费方是**新增报错**，可能让原本绿的 `ci` 变红。
+
+**背景**：`collectBusiness` 的目录遍历是固定两层（`src/modules/<模块>/<文件>.zig`），
+而 `zmodu scaffold --with-agent` 把模块产出在 `src/modules/ai/agent/` —— 第 3 层。
+那个模块**从未被审计过**，里面的违规一直不可见。
+
+**影响面**：模块平铺在 `src/modules/<name>/` 的手写项目不受影响；受影响的是**嵌套模块**
+（`src/modules/a/b/…`）以及 `--with-agent` 的生成物。
+
+**一行改法**：升级后重跑 `zmodu audit .`，修掉新出现的违规；确属误报的用行级豁免
+`// audit: ignore <rule>`。
+
+### 取路由 State 用 `ctx.state(T)`
+
+**Breaking?** 否 —— 新增 API。旧写法仍能编译，但会被 `zmodu audit` 的 b4 点名。
+
+```zig
+// 旧（b4 会报）
+const self: *MyApi = @ptrCast(@alignCast(ctx.user_data orelse unreachable));
+// 新
+const self: *MyApi = ctx.state(MyApi) catch return null;
+```
+
+`user_data` 放的一直是 ComptimeRouter 的 `*State`（身份在另一个字段 `auth_info` 上）。
+`ctx.state(T)` 在缺 state 时返回具名错误 `error.NoRouteState`，而不是让
+`orelse unreachable` 在 ReleaseFast 下变成 UB。WS 的 `on_connect` / `on_close`
+与 legacy `RouteGroup` 回调同样适用。
+
+### 生成的 `catch {}` 改为带日志的忽略
+
+**Breaking?** 否 —— `zmodu scaffold --with-agent` / `--with-websocket` 生成物的行为微变：
+原本静默吞掉的审计写入 / 中继发送失败，现在会打一条 `std.log.warn`。
+重新生成即可拿到。
+
+### 生成的脚手架代码：跨租户 update/delete 从 `200 OK` 改为 `404`
+
+**Breaking?** 是（只影响**用 `zmodu scaffold` 生成过、且表带租户列**的项目，重新生成后行为变化）。
+
+**背景**：`updateForTenant` / `deleteForTenant` 的契约一直写着"0 行 = 这行属于别的租户（guarded no-op）"，
+但生成的 `update/delete<X>ByTenant` 把行数 `_ =` 丢掉了，handler 随后无条件 `wrapSuccess` ——
+于是"改别人的行"会被回答 **200 OK**（没有数据泄漏，但应用无法区分"改到了"与"不是你的行"）。
+
+**一行改法**：重新生成（`zmodu scaffold …`），或手工把 handler 改成
+
+```zig
+const rows = try self.service.updateXByTenant(tenant_id, entity);
+if (rows == 0) { try R.wrapErr(ctx, .not_found, "not found"); return; }
+try R.wrapSuccess(ctx);
+```
+（delete 同形。）**附带**：租户 update/delete 现在**只有 `rows > 0` 时才发事件**。
+
+### 生成的 `shared/response.zig` 的成功信封曾是**非法 JSON**
+
+**Breaking?** 是（生成的响应体变了）。`wrapSuccess` 用了普通字符串字面量而不是 format string，
+`{{\"code\":0…` 原样落进响应体 → 每个生成项目的成功信封都是 `{{"code":0,…}}`，任何 JSON 解析器都拒。
+**一行改法**：重新生成即可（现在产出 `{"code":0,"msg":"","data":null}`）。
+自查：`curl … | python3 -m json.tool` —— 以前这里会报解析错误。
+
+### 脚手架输出现在**可复现**（`.fingerprint` 从包名确定性派生）
+
+**Breaking?** 否，但**重新生成会改写 `build.zig.zon` 的 `.fingerprint` 一次**（从随机值换成本地派生值）。
+此后同一 `--name` + 同一 schema 的两次生成**逐字节相同**（`diff -r` exit 0），重新生成不再制造 diff。
+Zig 接受该值且**不会**在 `zig build` 时改写它（实测 md5 前后一致）。
+
+### `sqlx.Transaction` 补齐了相对 `Client` 的方法
+
+**Breaking?** 否，纯新增：`queryRowsPartial(Ctx)` / `queryScalar(Ctx)` / `queryRowBorrowed(Ctx)` /
+`queryRowPartialBorrowed(Ctx)` / `findOne(Partial)(Ctx)` / `findAll(Partial)(Ctx)` / `batchExec(Ctx)` /
+`ping(Ctx)`，以及 `queryRow/queryRowPartial/queryRows` 的 `*Ctx` 形式。既有签名**一字未改**。
+
+### 删除 `src/persistence/Database.zig`
+
+**Breaking?** 否（它没有从 `root.zig`/`data.zig` 导出，全仓唯一引用是"编译所有源文件"那个测试）。
+数据层的入口是 `data.sqlx` / `data.Repository`（`Orm(Backend)`），见 [`ZENT.md`](ZENT.md) §1。
+
+---
+
 ## v0.25.0
 
 ### `ClusterBootstrap.tick()` 也驱动 `raft.tick()`；配 `.transport` 时 `start()` 起入站监听
@@ -92,8 +173,9 @@ zig build test -Dexample=basic          # 合并后的测试根
 
 ### CI 两份示例构建清单统一
 
-**Breaking?** 否。此前两份清单漂移（`zent-modulith` 只在一侧，`shopdemo-zent` / `metaverse-creative` 两侧都没有），
+**Breaking?** 否。此前两份清单漂移（`zent-modulith` 只在一侧，`metaverse-creative` 两侧都没有），
 现在两份**逐字一致（17 项 + `zmsaas/backend`）**；不可构建的目录（docker / node / sibling 依赖）在两处都写明原因。
+（2026-09-18：`shopdemo-zent` 与 `tenant-ai` 两个示例删除后，两份清单为 **15 项 + `zmsaas/backend`**。）
 
 ---
 

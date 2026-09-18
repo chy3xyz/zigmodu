@@ -123,7 +123,9 @@ pub const WsUring = struct {
         var cqes: [64]linux.io_uring_cqe = undefined;
 
         while (self.running.load(.monotonic)) {
-            _ = self.ring.submit() catch {};
+            _ = self.ring.submit() catch |err| {
+                std.log.debug("[ws_uring] submit failed: {s}", .{@errorName(err)});
+            };
 
             const count = self.ring.copy_cqes(&cqes, 0) catch {
                 std.time.sleep(std.time.ns_per_ms);
@@ -243,7 +245,9 @@ pub const WsUring = struct {
                     return;
                 },
                 0x9 => { // Ping → Pong
-                    self.sendPong(fd, payload) catch {};
+                    self.sendPong(fd, payload) catch |err| {
+                        std.log.debug("[ws_uring] pong send failed: {s}", .{@errorName(err)});
+                    };
                 },
                 else => {},
             }

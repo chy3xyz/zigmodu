@@ -5,14 +5,63 @@
 > **ZigModu × zent（schema / Client / privacy / 模块级选型）**：见专文 [ZENT.md](ZENT.md)（参考实现 `examples/zent-modulith`）。  
 > **SQLx 选择性驱动链接（`-Ddb=` / `.db=`）**：见专文 [SQLX_DRIVERS.md](SQLX_DRIVERS.md)。  
 > **HTTP 路由 + catalog JWT / RBAC**：见专文 [ROUTE_TABLE.md](ROUTE_TABLE.md) §7；可执行清单见下文「JWT / 多端身份」。  
-> **AI / Agent 写代码**：先读仓库根目录 [AGENTS.md](../AGENTS.md)（文档地图 + DO/DON'T）；方法论见 [AI_METHODOLOGY.md](AI_METHODOLOGY.md)。
+> **AI / Agent 写代码**：先读仓库根目录 [AGENTS.md](../AGENTS.md)（文档地图 + DO/DON'T）；方法论见 [AI_METHODOLOGY.md](AI_METHODOLOGY.md)。  
+> **代码片段基线**：**ZigModu v0.26.0 · Zig 0.17.0**（CI 钉 `0.17.0-dev.2151+2ec5523d5`，见 `.github/workflows/ci.yml` 的 `ZIG_VERSION`）。跨版本升级看 [UPGRADING.md](UPGRADING.md)。  
+> **片段口径**：本文的代码围栏分两类 —— **可照抄的完整示例**，和**示意用的片段/伪码**（含 `...`、`// ...`、
+> 或引用了上下文里没给的标识符）。伪码**不保证可直接编译**，只表达结构与契约；可编译的完整示例看
+> `examples/**`。逐段标注见各围栏前的说明。
 
-## 🔄 现状复核（2026-09-17，v0.23.0）—— 近期演进对示例/文档的影响
+## 📋 目录 (Table of Contents)
+
+- [现状复核（2026-09-18 复核，v0.26.0）—— 近期演进对示例/文档的影响](#-现状复核2026-09-18-复核v0260-近期演进对示例文档的影响)
+  - [当前最佳实践速查](#当前最佳实践速查)
+  - [待修清单（审计产出，按严重度）](#-待修清单审计产出按严重度-命中的条目是-2026-09-17--2026-09-18-两批复核后已修的其余仍未修)
+  - [源码文档质量（2026-09-17 抽样）](#源码文档质量2026-09-17-抽样)
+  - [示例品质（2026-09-17 抽样）](#示例品质2026-09-17-抽样)
+  - [仍待完善（2026-09-18 复核，v0.26.0）](#仍待完善2026-09-18-复核v0260)
+  - [CLI 与门禁现状（2026-09-18 复检）](#cli-与门禁现状2026-09-18-复检)
+  - [新用户路径卡点（2026-09-18，按严重度）](#新用户路径卡点2026-09-18按严重度)
+  - [BEST_PRACTICES 自审（2026-09-18）](#best_practices-自审2026-09-18)
+  - [实践 ↔ 门禁一致性（2026-09-18）](#实践--门禁一致性2026-09-18)
+- [渐进式架构演进路线图](#-渐进式架构演进路线图)
+- [模块设计原则](#-模块设计原则)
+- [代码质量规范](#-代码质量规范)
+- [错误处理](#-错误处理)
+  - [错误响应形状：一条开关统一全框架（v0.15.45+）](#错误响应形状一条开关统一全框架v01545)
+  - [韧性：一个 bug 不拖垮整个后端（v0.15.36+）](#韧性一个-bug-不拖垮整个后端v01536)
+  - [共享限流器 / 统计结构的线程安全（v0.15.45+）](#共享限流器--统计结构的线程安全v01545)
+  - [连接级背压与慢连接防护（v0.15.36+）](#连接级背压与慢连接防护v01536)
+  - [上线前预检（v0.15.36+）](#上线前预检v01536)
+  - [JWT 密钥轮换（kid，v0.15.36+）](#jwt-密钥轮换kidv01536)
+  - [迁移失败后怎么恢复（运维向）](#迁移失败后怎么恢复运维向)
+  - [多副本后台任务：跨实例互斥（v0.15.36+）](#多副本后台任务跨实例互斥v01536)
+- [数据访问选型（zent / sqlx）](#-数据访问选型zent--sqlx)
+- [上传与 multipart（v0.15.46+）](#-上传与-multipartv01546)
+- [内存管理](#-内存管理)
+- [测试策略](#-测试策略)
+- [性能优化](#-性能优化)
+- [事务范式（伪事务警示）](#-事务范式伪事务警示)
+  - [跨进程事务日志：TransactionJournal + recover()（必须接）](#跨进程事务日志transactionjournal--recover必须接)
+  - [Saga 步骤超时：SagaStep.timeout_seconds（必须设）](#saga-步骤超时sagasteptimeout_seconds必须设)
+- [安全实践](#-安全实践)
+- [部署与 CI/CD](#-部署与cicd)
+- [生产就绪检查清单](#-生产就绪检查清单)
+- [文档规范](#-文档规范)
+- [开发工具](#-开发工具)
+- [常见陷阱与避免方法](#-常见陷阱与避免方法)
+- [质量指标](#-质量指标)
+- [版本升级指南](#-版本升级指南)
+- [团队协作](#-团队协作)
+
+## 🔄 现状复核（2026-09-18 复核，v0.26.0）—— 近期演进对示例/文档的影响
 
 **结论：对 `examples/` 的代码影响很小，问题集中在文档与 CLI 模板。** 三份只读审计（Runtime/builder、
 AI 侧、集群侧）的实测结果：builder 绑定、worker 归 app、不手动 `rt.start()` 这三条在 examples 里**零违规**
-（全仓只有 3 处 `zmodu.builder`，全部先绑定）；`examples/` 里**没有任何**代码用 `ai.Agent`（只用
-SkillRegistry / Workflow / 审批流），也**没有任何**示例接集群栈。真正"照抄即失败"的都在文档里，清单见本节末尾。
+（2026-09-17 采样：全仓 2 处真实 `zmodu.builder` 调用 —— `examples/runtime-workers/src/main.zig`、
+`examples/alpha-engine/src/main.zig` —— 全部先绑定）。**"examples 里没有任何代码用 `ai.Agent`"这条断言
+（2026-09-17 采样）已被推翻**：`examples/alpha-engine/src/modules/propose/module.zig` 用了**裸 `Agent{}`**
+—— 恰好违反下文规则 3；截至 2026-09-18 仍是唯一一处。也**没有任何**示例接集群栈。真正"照抄即失败"的
+都在文档里，清单见本节末尾。**本节所有"全仓有几处 / 没有任何"式数字都是采样值，会过时——以 `grep` 为准。**
 
 ### 当前最佳实践速查
 
@@ -55,7 +104,7 @@ SkillRegistry / Workflow / 审批流），也**没有任何**示例接集群栈�
 - ✅ `docs/CLUSTER-QUICKSTART.md`：整篇重写 —— 开头就是 fail-closed 声明、`raft_cluster_size = 1`、
   无 `std.Thread.sleep`；`/cluster/health` 明确写成"由你的 handler 挂载"，并**如实列出** `node_id`
   仍是固定串 `"node-id"`（见下方 ClusterHealth 一条 —— 2026-09-18 已修）
-- ✅ 本文件「集群」段（现 :376-377）：已写 `ClusterMembership.init(allocator, io, …)`，并注明
+- ✅ 本文件「集群」段（即「阶段 3：多实例部署」的组装示例）：已写 `ClusterMembership.init(allocator, io, …)`，并注明
   "`start` 的 Config 只有三项（没有 `seed_nodes`，seed 节点走 `connectToSeed`）"；
   `zigmodu.core.*` / "实现 PasRaft 共识" 的说法已删
 - ✅ `tools/zmodu/src/main.zig:6011`（`--with-agent` 模板）：生成**无 guard 的裸 `Agent{}`**；`:6082-6086`
@@ -148,7 +197,8 @@ SkillRegistry / Workflow / 审批流），也**没有任何**示例接集群栈�
 （无 sibling 检出时不可构建）而 `zent-modulith` 用 tag pin；三份 README 有假声明
 （`distributed` 的选主/env、`http-stress-test` 的 wrk、`tenant-mgmt` 的 v0.13.15）。重复候选：
 shopdemo↔shopdemo-zent、basic↔testing、distributed↔cluster-demo、`deprecated/` 与 `examples/example_tests.zig`
-—— 后三组已于 2026-09-17 收敛（见本节第 5 条）；`shopdemo`↔`shopdemo-zent` 保留（sqlx / zent 两种持久化的对照）。
+—— 后三组已于 2026-09-17 收敛（见本节第 5 条）；`shopdemo`↔`shopdemo-zent` 一组当时判为"保留"，
+**2026-09-18 改判并删除**（见下方「示例目录收敛」）。
 **各条已在 v0.24.0 / 2026-09-17 全部收敛**（`shopdemo` 的 test 根与 `zent-modulith` 的 step 也已补上），逐条现状：
 
 1. **把已存在的 test step 接进 CI** —— ✅ **已完成（2026-09-17）**：ai-ops / basic / llm-policies /
@@ -178,7 +228,38 @@ shopdemo↔shopdemo-zent、basic↔testing、distributed↔cluster-demo、`depre
    （`DEMO_SUMMARY.md:202` 原 v0.23.0、`ARCHITECTURE_DIAGRAM.txt:153` 原 **v0.4.0** —— 上一版把 v0.4.0 记到了
    `DEMO_SUMMARY.md`，实际在 `ARCHITECTURE_DIAGRAM.txt`，两处都已改）。
 
-### 仍待完善（2026-09-18 复核，v0.25.0）
+### 示例目录收敛（2026-09-18）
+
+上面第 5 条收敛到 20 个目录后仍偏重，这轮按"**每个目录必须唯一承载一项框架能力**"再筛一遍，删掉 2 个：
+
+- **`shopdemo-zent`** —— 结构性重复：它就是 `shopdemo/generated-sample` 的**同一个 `order` 模块**
+  （model / persistence / service / api / module / root 一一对应），只把持久化换成 zent；而 zent
+  已由 `zent-modulith` 演示（还带 `smoke.sh` 的真实请求遍历）。此前判"保留作两种持久化的对照"，
+  实测这个"对照"没有任何断言在守，属纯维护面。
+- **`tenant-ai`** —— 与 `ai-ops`（AI 流水线 + HTTP 审批队列）和 `tenant-mgmt`（租户隔离）双向重叠。
+  删前核实过它"独有"的两项**并不独有**：`workflow.toMermaid` 在 `src/ai/workflow.zig` 有单测、
+  `skill_export.toOpenApi/toSkillsJson` 在 `src/ai/skill_export.zig` 有单测且被 `zmodu ai
+  export-skills / openapi` 的 CLI smoke 端到端覆盖，`SkillRegistry` 也有自己的单测 —— 所以删掉
+  不会留下"无人调用因而无人编译"的公开 API（`LogRotator` 那类问题）。
+
+保留判定：`metaverse-creative`（结算链路 PaymentIntent 幂等 → 双分录 Ledger → OwnershipTransfer →
+Outbox 无替代）与 `zmsaas` 后端（`Preflight` + 池/积压指标的接线参考）**保留**；
+`zmsaas/frontend`（SolidStart，CI 从不构建）本轮不动。
+
+影响面同步（**注意：`examples/README.md` 那句"每个目录在索引表里恰好出现一次"没有任何门禁在查**，
+漏改不会红）：`.github/workflows/ci.yml` 的构建列表（两处，`build-and-test` 与 `examples` job）、
+`doctor` 循环、`test` 循环；`examples/README.md` 索引表 + 段落；`docs/AI_DEV_GUIDE.md` /
+`AI_SKILLS.md` / `AI_ORCHESTRATION.md` / `ZMODU_CLI_INTEGRATION.md` / `PRODUCTION_ROADMAP.md` 的
+指向示例的句子（改成描述能力或改指 `ai-ops`，不留悬空路径）。收敛后：**18 个目录（17 个示例 + `_shared`）**，
+CI 构建 15 项 + `zmsaas/backend`。
+
+### 仍待完善（2026-09-18 复核，v0.26.0）
+
+> 口径：本节标题与页脚的版本号都指**仓库当前版本**（`build.zig.zon` 的 `.version` = **v0.26.0**）。
+> 正文里出现的「（v0.25.0 本轮）」「v0.24.0」是**该修复落地时**的版本，属历史事实，不改。
+> 同理，凡提到 `examples/shopdemo-zent` 或 `examples/tenant-ai` 的句子，都是**2026-09-18 删除之前**
+> 的审计记录（删除理由见上方「示例目录收敛」）—— 那是当时的真实状态，不改写；当前目录清单以
+> `examples/README.md` 的索引表为准。
 
 **按 ROI 排序（每条都带证据；前三条是"功能级"而非文案级）**
 
@@ -319,36 +400,103 @@ shopdemo↔shopdemo-zent、basic↔testing、distributed↔cluster-demo、`depre
    （2026-09-18 修：`docs/README.md:48-50` 新增「Other documents」表逐条收录前三份，`:51` 收录 `docs/dev/` 目录；
    `ls docs/dev/ | wc -l` = 14）
 
-## 📋 目录 (Table of Contents)
+### BEST_PRACTICES 自审（2026-09-18）
 
+规模：2197 行 / 21 个 `##` / 79 个 `###` / 48 个围栏。链接与锚点**无断链** ✓；问题集中在"过时片段"与"结构"。
 
-- [渐进式架构演进路线图](#-渐进式架构演进路线图)
-- [模块设计原则](#-模块设计原则)
-- [代码质量规范](#-代码质量规范)
-- [错误处理](#-错误处理)
-  - [错误响应形状：一条开关统一全框架](#错误响应形状一条开关统一全框架v01545)
-  - [韧性：一个 bug 不拖垮整个后端](#韧性一个-bug-不拖垮整个后端v01536)
-  - [共享限流器 / 统计结构的线程安全](#共享限流器--统计结构的线程安全v01545)
-  - [连接级背压与慢连接防护](#连接级背压与慢连接防护v01536)
-  - [上线前预检](#上线前预检v01536)
-  - [JWT 密钥轮换（kid）](#jwt-密钥轮换kidv01536)
-  - [迁移失败后怎么恢复](#迁移失败后怎么恢复运维向)
-  - [多副本后台任务：跨实例互斥](#多副本后台任务跨实例互斥v01536)
-- [数据访问选型（zent / sqlx）](#-数据访问选型zent--sqlx)
-- [上传与 multipart](#-上传与-multipartv01546)
-- [内存管理](#-内存管理)
-- [测试策略](#-测试策略)
-- [性能优化](#-性能优化)
-- [事务范式（伪事务警示）](#-事务范式伪事务警示)
-- [安全实践](#-安全实践)
-- [部署与 CI/CD](#-部署与cicd)
-- [**生产就绪检查清单**](#-生产就绪检查清单)
-- [文档规范](#-文档规范)
-- [开发工具](#-开发工具)
-- [常见陷阱与避免方法](#-常见陷阱与避免方法)
-- [质量指标](#-质量指标)
-- [版本升级指南](#-版本升级指南)
-- [团队协作](#-团队协作)
+> ⚠️ 本节原始审计里写的 `:1547` 式**行号是 2026-09-18 快照**，其后文档有增删，行号必然漂移。
+> **定位一律用 `grep` 按内容找**；下文已把行号引用换成内容描述，不再给出可漂移的数字。
+
+**会误导读者（按严重度）—— ✅ 2026-09-18 已逐条修掉**
+1. ✅ 「正确 vs 错误的内存管理」对照（现「内存管理 → 分配器使用」节）—— 标着「✅ 正确的内存管理」，却在 `defer allocator.free(buffer)` 之后 `return buffer`：**照抄即悬垂指针（静默 UAF）**。现改为两个真正确形态：「返回拷贝，所有权交给调用方」与「写入调用方提供的缓冲，不移交所有权」。
+2. ✅ 「并发安全」节的 `ThreadSafeCounter`（现「安全实践 → 并发安全」节）—— 用了 **Zig 0.17 已删除的 `std.Thread.Mutex`**（现为 `std.Io.Mutex`，`lock`/`unlock` 需 `io` 参数），且 `Self` 未定义；而这是"并发安全"的正面示例。现按 `src/core/EventBus.zig` 的 `ThreadSafeEventBus` 真实写法重写。
+3. ✅ 「阶段 4：服务网格」的能力表与「配置示例」—— `zigmodu.resilience.*` / `zigmodu.tracing.*` / `zigmodu.metrics.*` 三个命名空间**都不存在**。真身：`zigmodu.CircuitBreaker` / `zigmodu.RateLimiter`（`src/root.zig` §3），`zigmodu.observability.DistributedTracer` / `zigmodu.observability.PrometheusMetrics`（`src/observability.zig`）。已改。
+4. ✅ 同两处的 `CircuitBreaker.init(5, 30000)` 与 `data.redis.Redis.init(allocator)` + `connect(host, port, .{})` —— 真签名分别是 `CircuitBreaker.init(allocator, name, cfg)`（`cfg` 字段是 `timeout_seconds` / `half_open_max_calls`）与 `data.redis.Redis.new(allocator, io, cfg)` + `connect()`。已改。
+5. ✅ 「部署与 CI/CD」节的三处旧 API —— `std.process.getEnvVarOwned`（0.17 已移除，改走 `init.environ_map`）、`root_module.addDefine(...)`（不存在，改 `b.addOptions()` + `addImport("build_options", …)`）、CI 矩阵 `zig-version: ["0.16.0"]`（本仓走 `ci.yml` 的 `ZIG_VERSION`）。已改。
+6. ✅ 测试节与阶段 2 示例里的 `zigmodu.extensions.ModuleTestContext`（真身 `zigmodu.ModuleTestContext`，`src/root.zig`）与 `zigmodu.extensions.AsyncEventBus`（**全仓无此类型** —— 整段已删除，换成 `ThreadSafeEventBus` 示例）。已改。
+7. ✅ 本节开头的采样断言（"examples 里没有任何代码用 `ai.Agent`／全仓只有 3 处 `zmodu.builder`"）—— 已标 `（2026-09-17 采样）`、更新数字，并注明"以 `grep` 为准"。
+
+**结构与口径（2026-09-18 部分处理）**
+- ✅ 目录已**上移到正文之前**，并补录 `## 🔄 现状复核` 与本次新增的小节。
+- ✅ 版本口径三处互斥已统一为**仓库当前 v0.26.0**（`build.zig.zon` 的 `.version`），页脚一并改。
+- ✅ 自引用行号（如指向本文件/tools 某行的 `:231`）已换成按章节名/片段引用。
+- ⏳ 仍未处理（属重构，本次范围外）：错误处理节 412 行塞了 15 个主题，建议拆；认证内容散在「JWT 密钥轮换」「Auth.optional」「JWT / 多端身份」三处；路线图节尾有第二套"阶段 3/4（模块数）"与上文同名；「演进决策树」「技术债务」「ClusterBootstrap」「Server.initWithConfig」各重复 2–3 次。
+
+### 实践 ↔ 门禁一致性（2026-09-18）
+
+「会炸/会漏」的规则**基本都有门禁**（`audit` b1–b22 + `check-production` + `DocSnippets` + `AiBoundary`）。缺口分三类：
+
+**A. 只有约定、没有机制**（文档说得硬，机器不查）
+`worker 归 app`（禁模块内 `Runtime.init`/`rt.shutdown`）· **裸 `Agent{}` 必带 guard**（只有 opt-in 的 `isGuarded()`）· `请求路径勿读 ClusterMembership 哈希表`（b20 只管文件作用域 `var …HashMap`）· 多副本 cron/迁移 `setLock` · `TransactionJournal.recover()` · `SagaStep.timeout_seconds`。
+
+**B. 门禁比文档松**（原六处 → 复检出第七处 —— **2026-09-18 全部收窄**）
+1. ✅ `scripts/check-production.sh` 原先**扫到第一个 `test "` 即止** —— `src/api/Server.zig` 首个 test 在 1445 行、全文 4487 行，约 3000 行生产代码完全不检。
+   **新行为**：改为**扫全文件**，只在遇到 `test` **块**时跳过该块（内嵌 awk 扫描器按大括号配平，且先剥掉字符串/字符字面量与 `//` 注释再计数，所以 test 内的 `"{}"` 不会带偏配平）。副作用：在原本已强制的路径里新暴露 4 处（`src/redis/redis.zig` 1 处、`src/core/cluster/RaftTransport.zig` 3 处）并已修。
+   **更正**：此前记的 `RaftElection.zig:991` 经核实落在 `test "log replication commit"` 块**之内**，是测试代码，被正确跳过 —— 不是 B1 的战果。
+2. ✅ 强制前缀 **7 → 10**：新增 `src/ai/`、`src/extensions/`、`src/im/`。这三处 23 条裸 `catch {}` 已**逐条真实修复**（统一改成 `catch |err| std.log.debug/warn("[tag] … ({s})", .{@errorName(err)})`，行为不变、只多一条日志），**未使用豁免清单**。仍未修 3 条 WARN 区：`src/log/StructuredLogger.zig`(×2)、`src/runtime/timer_wheel.zig`(×1)。
+3. ✅ 跨行 `catch {` + 换行 `}`：`check-production.sh`（awk 状态机，识别 `catch` / `catch |e|` / `catch {` 三种尾巴）与 `audit.zig`（`pending_catch_kw_line` / `pending_catch_brace_line`）两边都已支持。
+4. ✅ `audit` b3 关键词补 `WITH`（CTE）/`PRAGMA`/`TRUNCATE`，并改为**大小写不敏感 + 标识符词边界**（`withContext` / `createTable` 不再被当 SQL）；同时新增"纯常量比较"抑制 —— `WHERE status = 'active'` 这类不再误报，含 `{s}`/`++` 的拼接仍报。
+5. ✅ `audit` b17 改为**逐分配点判定**：命名分配只有在 `freeScanned(...)` 实参里以标识符边界出现该变量名时才算释放，匿名分配消耗一条未被认领的 `freeScanned` —— "一处 free 洗白全函数"已消除。
+6. ✅ `check-deadcode.sh --update` 加了**单调性断言**：新增条数超过基线时**拒绝写入并 exit 非 0**（需显式 `--force`），写入时打印 `old -> new (+n / -m)` 摘要。`examples/**` **同日也从 WARN 提升为强制**（`EXAMPLES_MODE` 已删除）：`src`+`tools` 与 `examples/**` 现在**各自独立**扫描后比对基线 —— 不合并扫描是因为合并会改变 import 图、让 `src/api/Server.zig` 的某条判定凭空出现/消失。
+7. ✅ `body_kind` 的**尾随标点盲区**已封：`x() catch {},`（switch 分支 / 初始化列表里的逗号）此前既不是 `{}` 也不是 `{};`，被判为 `other` 而**完全逃检** —— shell 扫描器与 `audit.zig` 的 `catchBodyKind` 两边都有这个洞，现已同时修掉并各加反证用例。
+
+**C. 新能力未入册 / 推荐了但没人示范**
+前三项 **2026-09-18 已入册**：`TransactionJournal` / `recover()`（「事务日志与 Saga 超时」节 + `AGENTS.md` DO/DON'T「长流程」行）、`SagaStep.timeout_seconds`（同节）、`jsonStruct` / `paramInt(T, key)`（「韧性」节参数层表与「错误响应形状」表的成功体一行）；`ai.AgentWorker` 已补进 `AGENTS.md` DO/DON'T；`AGENTS.md` 的 `zmodu ci` 已改成 **6 步**（含 doctor）。
+**测试实践（2026-09-18 已修）**：`http.Testkit` 此前在 `examples/**` 只有 1 处真实用例（`examples/tenant-mgmt/src/tests.zig` 的 `openMemorySqlite`），`dispatch`/`signBearerToken` 零示例。更关键的是 `tools/zmodu/src/templates/orm/sqlx/test.zig.tpl` **从未被 `@embedFile`**（`orm_tpl.zig` 的 embed 列表里没有它），内容还是三个 `expect(true)` 空桩 —— 即"文档推荐、示例不示范、脚手架不产出"。现状：
+
+- `examples/tenant-mgmt` 已用 `dispatch` + `signBearerToken` 写出 3 条真用例，含**跨租户隔离**（token 的 `aud` 决定可见行；猜别租户的 id 得 404）与"换一个 secret 签的同形 token 必须 401"。
+- `test.zig.tpl` 已重写为可跑测试并**真正接线**：`orm_tpl.sqlx_test` + `writeModuleFiles` 对**单表模块**写出 `modules/<name>/test.zig`，`generateScaffoldTestsZig` 同步产出 `test { _ = @import("modules/<name>/test.zig"); }` 把它拉进 `zig build test`。多表模块不产出（模板按 `model.<<PASCAL_MODULE>>` 取类型，多表时类型名不对）。
+- `Testkit.dispatch` 补了 `DispatchOptions.query`（percent-encoded 原样串，与 `path` 自带的 `?…` 可共存，同名 key 后者胜）——此前**任何 query 驱动路由都无法用 dispatch 测试**，包括脚手架自己生成的 `list*`（读 `ctx.queryInt(usize,"pageNo",1)`）。
+
+**D. 顺带修掉的真缺陷：脚手架生成的 handler 从客户端分配器泄漏**
+
+给脚手架补测试时发现 `generateModuleApi` 产出的 `list*` / `get*` handler **不释放 owned 返回值**：
+
+- `list*`：`service.list*()` → `repo.findPage()`，其 `PageResult.arena` 由 **`Client.allocator`（长生命周期）** 分配，而 `ctx.allocator` 是**每请求 arena** ——请求结束的 arena 重置**回收不到**它，属**永久泄漏**（每请求一页）。
+- `get*`：`service.get*()` → `repo.findById()` → `Client.queryRow()`，其字符串字段按 `sqlx.zig` 自己的注释就是"owned copies from the client's allocator and must be freed by the caller"。
+
+**实测证据**（在生成的探针项目里，用 `std.testing.allocator` 调 `db.queryRow` / `db.queryRowsOwned` 且故意不释放）：
+```
++- run test 9 pass (9 total); 3 leaks
+  … queryRow … sqlx.zig:4834: return try scanStruct(self.allocator, T, rows.rows[0], …)
+```
+栈顶落在 `scanStruct(self.allocator, …)`，确认分配根在客户端分配器。
+
+**关键陷阱：`ctx.allocator` 释放不了这些内存。** 生产里 `ctx.allocator` 是**每连接的 arena**（`Server.connFiber` 的 `arena_alloc`，每请求 `arena.reset()`）。`ArenaAllocator.free()` 是 **no-op**，所以"用 `ctx.allocator` 释放客户端分配器的内存"既不会报错、也不会释放——**看起来修好了，实际照漏**。这是本轮最容易写错的一点（我们的第一版修复就是这么写的，靠下面的反证才发现）。
+
+**修法**（用分配它的那个分配器）：
+- `list*` → `var result = try …; defer result.deinit(self.service.persistence.backend.allocator);` —— `SqlxBackend.allocator` 就是 arena 的 backing allocator，是唯一正确的实参（`PageResult.deinit` 新增的 doc 已写明：给别的分配器是 misuse，arena 路径上会被静默忽略）。
+- `get*` → `defer sqlx.freeScanned(self.service.persistence.backend.allocator, model.X, entity);`
+- `create*` / `update*` → `defer sqlx.freeScanned(ctx.allocator, …)` —— 这里**必须**是 `ctx.allocator`，因为 `bindJson` 是从它深拷贝出来的（`bindJson` 的文档契约就是"深拷贝、调用方可统一 free"）。两个方向的分配器不能互换。
+
+**注意**：`repo.insert` 返回的是入参 `entity` 的**副本**，其字符串字段与 `entity` **别名同一片内存** —— 因此 `create*` 只 free `entity` 一次，**再 free `created` 就是双重释放**。这一点写进了生成器的注释。
+
+**反证（生产形状）**：探针用 `std.testing.allocator` 作**客户端**分配器（可检测泄漏），`Server` 拿到的是**另一个 arena**（复刻 `connFiber` 的层次），然后真的 `dispatch` `list` 与 `get?id=1`：
+
+| 生成代码里的释放 | 结果 |
+|---|---|
+| `defer result.deinit(self.service.persistence.backend.allocator)` + `get` 用 backend 分配器 free | **0 leak**（9/9 pass） |
+| `defer result.deinit(ctx.allocator)` + `get` 不释放 | **2 leaks** —— `allocator.dupe(u8, str)` 分配的行字符串 |
+
+**顺带**：`PageResult` 原来只有 `deinit(allocator)`，没有 `QueryResult` 那样的无参 `deinitArena()`（而 `QueryResult.deinitArena` 全仓**零使用**）。本轮补上了 `PageResult.deinitArena()` 及其测试，但**生成器暂时不用它** —— scaffold 出的项目 pin 的是已发布版本，用了会编译不过；等版本推进后再把生成器和文档切到 `deinitArena`（`repo.insert` 那类单行没有 arena，仍需 `freeScanned` + 客户端分配器）。
+
+**E. "公开 API + 零调用者 = 从未被编译"：`LogRotator` 的教训**
+
+`zigmodu.observability.LogRotator` 是正式导出的公开组件，但**全仓零调用**（`grep -rn LogRotator src/ tools/ examples/` 只有那一行导出）。Zig 惰性分析函数体，所以 `rotate()` 里的
+
+```zig
+std.Io.Dir.cwd().rename(self.io, old_name, new_name)   // 0.17 之前的签名
+```
+
+一直没报错 —— 0.17 里 `rename` 是 5 参自由函数 `rename(old_dir, old_sub_path, new_dir, new_sub_path, io)`。**任何用户一调用 `LogRotator.write` 就编译失败。** 光靠 `zig build test` 抓不到这类问题，因为"引用所有源文件"的编译测试只做文件级 import，不进函数体。
+
+**修法与防复发**：
+
+- 补 `initIn(allocator, io, dir, …)`（`init` 仍写 CWD，`initIn` 指向 `tmpDir`），修 2 处 `rename`；
+- **加一条真正实例化它的测试**（`tmpDir` + 按大小轮转 + 断言 `.0`/`.1` 内容 + 超代数的文件不存在）。写这个测试时顺带纠正了我对语义的错误猜测：`max_size=10` + 4 字节写并不是"每次写都轮转"，而是两笔一滚 —— 断言得按真实语义写。
+- **推广**：任何 `pub` 导出但无人调用的组件，都应当有一条把它**真正用起来**的测试。`deinitArena`（`QueryResult`/`PageResult`）同样属于这一类。
+
+**同批收尾**：`check-production.sh` 的强制前缀补 `src/log/`、`src/runtime/`（此前只剩 3 条 WARN）；`zig build zmodu` 现在**同时安装**二进制（此前只 build+run，`zig-out/bin/zmodu` 会静默留着旧的，调用方驱动到陈旧 CLI）；`http.Testkit` 删掉查询解析的手工孪生实现，改为直接调 `Server.zig` 的 `parseQueryInto`（现在两边**不可能**再漂移）。
 
 ## 🚀 渐进式架构演进路线图
 
@@ -464,8 +612,9 @@ try app.start();
 ```
 
 **新增能力**：
+
 ```zig
-// 引入缓存模块
+// 引入缓存模块（伪码：示意结构，非可直接编译）
 const CacheModule = struct {
     pub const info = api.Module{
         .name = "cache",
@@ -474,8 +623,12 @@ const CacheModule = struct {
     // 本地缓存 + Redis 分布式缓存
 };
 
-// 异步事件处理
-const async_bus = zigmodu.extensions.AsyncEventBus.init(allocator);
+// 异步事件处理：业务事件走线程安全的 ThreadSafeEventBus（L1 层）
+// —— 没有 `zigmodu.extensions.AsyncEventBus` 这个类型。
+var bus = try zigmodu.ThreadSafeEventBus(OrderCreated).init(allocator, io);
+defer bus.deinit();
+try bus.subscribe(onOrderCreated);   // 回调在 publish 的线程上同步跑，保持短小
+bus.publish(.{ .order_id = 42 });
 ```
 
 **关键指标**：
@@ -609,30 +762,47 @@ try bus.publish("order.created", event_data);
 
 **新增能力**：
 
-| 能力 | 框架支持 | 配置 |
-|------|----------|------|
-| 断路器 | `zigmodu.resilience.CircuitBreaker` | 5次失败，30秒半开 |
-| 限流 | `zigmodu.resilience.RateLimiter` | 令牌桶 1000/s |
+| 能力 | 框架支持（真实导入路径） | 配置 |
+|------|--------------------------|------|
+| 断路器 | `zigmodu.CircuitBreaker` | 5 次失败，30 秒半开 |
+| 限流 | `zigmodu.RateLimiter` | 令牌桶 1000/s |
+| 隔离舱 | `zigmodu.Bulkhead` | 每组并发上限，一个失败不拖垮全部 |
+| 自适应卸压 | `zigmodu.load_shedder` | 超载时拒绝，而不是无限排队 |
 | 分布式限流 | `zigmodu.data.redis_rate_limit.RateLimiter` | Redis INCR+EXPIRE 固定窗口（跨实例，fail-closed）|
-| 分布式追踪 | `zigmodu.tracing.DistributedTracer` | Jaeger 导出 |
-| 指标收集 | `zigmodu.metrics.PrometheusMetrics` | /metrics 端点 |
+| 分布式追踪 | `zigmodu.observability.DistributedTracer` | 采样 + `OtlpExporter` 导出 |
+| 指标收集 | `zigmodu.observability.PrometheusMetrics` | /metrics 端点 |
 | gRPC | `zigmodu.GrpcServiceRegistry` / `zigmodu.GrpcClient` | HTTP/2（unary + stream） |
 | 消息队列 | `zigmodu.NatsClient` / `zigmodu.MessageQueue` | 没有 MQTT 实现，别照抄旧名 |
 
+> 韧性/观测**没有** `zigmodu.resilience.*` / `zigmodu.tracing.*` / `zigmodu.metrics.*` 这三层命名空间：
+> 韧性原语直接挂在 `zigmodu.*`（`src/root.zig` §3 RESILIENCE），追踪与指标在 `zigmodu.observability.*`
+> （`src/observability.zig`）。见到旧写法请一并改。
+
 **配置示例**：
+
 ```zig
-// 服务治理配置
+const CircuitBreaker = zigmodu.CircuitBreaker;
+const RateLimiter = zigmodu.RateLimiter;
+
+// 断路器：init(allocator, name, Config) —— Config 四个字段都要给全
 var cb = try CircuitBreaker.init(allocator, "order-service", .{
-    .failure_threshold = 5,
-    .timeout_ms = 30000,
+    .failure_threshold = 5,   // 连续 5 次失败 → OPEN
+    .success_threshold = 2,   // HALF_OPEN 期间 2 次成功 → CLOSED
+    .timeout_seconds = 30,    // OPEN 保持 30 秒后转 HALF_OPEN
+    .half_open_max_calls = 3, // HALF_OPEN 最多放 3 个探测请求
 });
+defer cb.deinit();
 
 var limiter = try RateLimiter.init(allocator, "api", 1000, 100);
+defer limiter.deinit();
 
 // 分布式限流（跨实例共享固定窗口；Redis 不可用 → error，fail-closed）
-var redis = try data.redis.Redis.init(allocator);
+var redis = try data.redis.Redis.new(allocator, io, .{
+    .host = "127.0.0.1",
+    .port = 6379,
+});
 defer redis.deinit();
-try redis.connect("127.0.0.1", 6379, .{});
+try redis.connect();
 var dist_limiter = data.redis_rate_limit.RateLimiter.init(&redis);
 const allowed = dist_limiter.allow("login:user-1", 5, 60) catch |err| {
     // fail-closed：限流后端不可用时不放行，按拒绝处理
@@ -641,19 +811,25 @@ const allowed = dist_limiter.allow("login:user-1", 5, 60) catch |err| {
 };
 if (!allowed) return error.RateLimited;
 
-// 跨实例 WebSocket fanout：任意实例 publish → 全集群所有实例本地 broadcast
+// 分布式追踪：init(allocator, tracer_name, service_name)
+var tracer = try zigmodu.observability.DistributedTracer.init(allocator, "order-tracer", "order-service");
+var span = try tracer.startTrace("createOrder");
+defer tracer.endSpan(span);
+```
+
+跨实例 WebSocket fanout（任意实例 publish → 全集群所有实例本地 broadcast）走
+`zigmodu.DistributedEventBus`（`init(allocator, io, node_id)` + `publish` / `subscribeWithContext`，
+见 `src/core/DistributedEventBus.zig`）。下面这段**省略了 `bus` 的创建与 `ws_server` 的定义**：
+
+```zig
+// （伪码：假设已有 var bus = try zigmodu.DistributedEventBus.init(allocator, io, node_id);）
 try bus.subscribeWithContext("ws.fanout", &ws_server, struct {
-    fn onEvent(ctx: ?*anyopaque, ev: NetworkEvent) void {
+    fn onEvent(ctx: ?*anyopaque, ev: zigmodu.DistributedEventBus.NetworkEvent) void {
         const s: *WebSocketServer = @ptrCast(@alignCast(ctx.?));
         s.broadcast(ev.payload);
     }
 }.onEvent);
 try bus.publish("ws.fanout", "{\"type\":\"notice\"}");
-
-// 分布式追踪
-var tracer = try DistributedTracer.init(allocator, "order-service", "prod");
-var span = try tracer.startTrace("createOrder");
-defer tracer.endSpan(span);
 ```
 
 **关键指标**：
@@ -818,9 +994,15 @@ Month 4: 可观测性
 
 **技术要点**：
 - 多协议：gRPC 用 `zigmodu.GrpcServiceRegistry` / `zigmodu.GrpcClient`；消息总线用 `zigmodu.NatsClient` / `zigmodu.MessageQueue`（**没有** MQTT 实现）
-- 断路器配置建议：
+- 断路器配置：`CircuitBreaker.init(allocator, name, Config)`（完整字段见上文阶段 4「配置示例」）
   ```zig
-  const cb = CircuitBreaker.init(5, 30000); // 5次失败，30秒半开
+  var cb = try zigmodu.CircuitBreaker.init(allocator, "order-service", .{
+      .failure_threshold = 5,   // 5 次失败 → OPEN
+      .success_threshold = 2,
+      .timeout_seconds = 30,    // 30 秒后转 HALF_OPEN
+      .half_open_max_calls = 3,
+  });
+  defer cb.deinit();
   ```
 - 速率限制根据业务峰值配置
 
@@ -947,12 +1129,39 @@ ZigModu 不绑定 ORM：**同一个应用里按模块选型**，但两者正交�
 `Transaction` 内的读写**必须**走 `tx` 句柄（`tx.exec` / `backend.execTx`），否则自动提交且
 `rollback` 无效——伪事务，`zmodu audit` b18 会拦。
 
+### `*Ctx` 后缀 vs `ctx` 字段：看起来不一致，其实各自都对
+
+给查询带上"截止时间（请求预算）"有两副面孔，读代码时容易当成历史遗留：
+
+| 对象 | 形式 | 例子 |
+|------|------|------|
+| `sqlx.Client`（跨请求共享 / 池化） | 方法名 **`*Ctx` 后缀** | `client.queryRowsCtx(sql_ctx, T, sql, args)`（`Client` 的 58 个方法里 19 个是 `*Ctx` 变体） |
+| `data.SqlxBackend`（`Orm.withContext()` 里的**按请求副本**） | 一个 **`ctx` 字段** | `backend.ctx`；backend 的查询/执行都把它转交给对应的 `*Ctx` |
+
+规则一句话：**共享句柄只能用传参，请求局部副本才能用字段。**
+
+- `*Client` 是被池 / `ConnectionRegistry` 跨请求复用的对象。把 per-request 的
+  `SqlContext` 存成它的字段就是**数据竞争**（A 请求的 deadline 会看见 B 请求的），
+  所以它只能"改调用形式"——多一个参数，或方法名带 `Ctx`。
+- `SqlxBackend` 不同：`Orm.withContext(ctx)` 返回的是**按请求拷贝**的一份值，
+  字段天然请求局部，一次赋值就覆盖它全部的查询/执行方法——这里是字段更省事，也正确。
+  （事务路径是例外：`beginTx` / `execTx` / `queryRowTx` 不带预算，要预算得用
+  `Client.transactCtx`。）
+
+用法对应：
+
+- 裸 sqlx：预算**每次**传 —— `client.queryRowsCtx(ctx.sqlContext(), T, sql, args)`；
+- 仓储层：一行覆盖该请求**所有**查询 —— `var scoped = self.persistence.orm.withContext(ctx.sqlContext())`，
+  此后由它建的 `data.Repository(T)` 都继承预算（展开见下面「请求预算要传给存储」一节）。
+
+**不要**把这条读成"将来要统一成字段"：对共享的 `Client` 那样做是错的。
+
 ---
 
 ## 🏗️ 模块设计原则
 
 ### 单一职责原则
-每个模块应只负责一个功能领域：
+每个模块应只负责一个功能领域（**片段**：`api.Module` 与两个回调是示意结构，非完整可编译模块）：
 ```zig
 // ✅ 正确示例
 const UserModule = struct {
@@ -980,7 +1189,7 @@ const BadModule = struct {
 - **最小依赖原则**：只依赖必要的模块
 
 ### 模块生命周期
-每个模块必须实现完整的生命周期：
+每个模块必须实现完整的生命周期（**片段**：只示 `init` / `deinit` 的形状与注释约定）：
 ```zig
 pub fn init() !void {
     // 初始化：连接数据库、启动协程、注册事件等
@@ -1102,7 +1311,8 @@ model/persistence/service/api/module/root 五个文件，自定义逻辑可放�
 - **注释规范**：关键算法和决策点必须有注释
 
 ```zig
-// ✅ 良好的代码结构
+// ✅ 良好的代码结构（片段：`validateRequest` / `checkInventory` / `createOrderEntity` /
+//    `publishOrderCreated` 是示意调用，未在上下文给出定义）
 const OrderService = struct {
     /// 创建订单并验证库存
     pub fn createOrder(allocator: Allocator, req: OrderRequest) !Order {
@@ -1131,6 +1341,7 @@ const OrderService = struct {
 - **上下文信息**：错误应包含足够的上下文信息
 
 ```zig
+// （片段：`Request` / `connectToDatabase` 是假设的上下文，`// ...` 处省略）
 pub const AppError = error{
     DatabaseConnectionFailed,
     InvalidConfiguration,
@@ -1173,6 +1384,7 @@ zigmodu.http.useRfc7807Errors();
 
 | 需求 | 调用 |
 |------|------|
+| **成功体（值形态）** | `ctx.jsonStruct(200, .{ .ok = true })` —— `ctx.json` 的第二参是 `[]const u8`（预序列化 body），**不能**直接传结构体；别名 `ctx.jsonValue` |
 | 只收口链内 | `http.setDefaultReject(http.problemReject)` |
 | 只收口路由前 | `http.setTransportErrorRenderer(http.problemTransportBody)` |
 | 完全复位（测试用） | `http.clearDefaultReject()` |
@@ -1218,6 +1430,7 @@ app 级共享 HashMap（适配器表、路由缓存、开关表）在 worker 池
 启动期暴露）：
 
 ```zig
+// （片段：`Adapter` 是示意类型；`"..."` 是占位值）
 var adapters = zmodu.FrozenStringMap(Adapter).init(allocator);
 try adapters.put("alipay", .{ .endpoint = "..." });  // 启动期：可写
 adapters.freeze();                                   // 服务期：只读
@@ -1236,6 +1449,7 @@ const a = adapters.get("alipay");                    // 无锁、线程安全
 | `multipart/form-data` | `ctx.bindMultipart(T, cfg)` + `Form.file(name)` | 文本与文件分开取；限额 `max_parts` / `max_part_bytes` / `max_total_bytes` |
 | JSON | `ctx.bindJsonLoose(T)` | camelCase 兼容、null 视为缺省、所有权统一 |
 | 路径参数 | `ctx.pathParam(name)`（旧名 `param`） | 它**不是**"任意参数" |
+| **路径参数转整数** | `ctx.paramInt(T, key)` —— **两参，第一个是类型** | 例：`ctx.paramInt(i64, "id")`；解析失败返回 `error.BadRequest`。写成 `ctx.paramInt("id")` 编译不过（门禁 `DocSnippets.paramIntMissingType` 会拦） |
 | 静态资源 | `http.staticFiles(io, &server, allocator, "/assets", "public", .{})` | 中间件实现；只 GET/HEAD；无目录索引；ETag/Range |
 
 手写 `getPara`、自建解码器、自建 JSON 发射器、自写静态服务都不再必要——
@@ -1289,6 +1503,67 @@ panic 钩子管诊断，不管存活。进程存活靠 supervisor：`systemd`
 
 `zmodu audit` 的 b20/b21 规则正是扫前两类（文件作用域共享可变 HashMap / 请求路径裸 `@alignCast`）——
 两者都属于"一次就打死整个进程"，见 [`MODULITH.md`](MODULITH.md) 与「韧性」一节。
+
+### 请求预算要传给存储，否则超时只是"事后 408"
+
+`request_timeout_ms` 原先**只做一件事**：handler 返回后比一下耗时，超了就改发 408
+（`Server.zig` 的 `elapsed_ms > server.request_timeout_ms`）。**它不打断任何东西** ——
+慢查询照样跑完、照样占着连接池，而客户端已经走人。
+
+现在 `Context` 带着这个预算，一行即可把它送进存储（`Context.setDeadline` 在请求进入时自动
+armed，`0` 表示不限）：
+
+```zig
+fn listOrders(ctx: *http.Context, self: *State) !void {
+    // 这一行之后，本请求**所有**仓储查询都继承预算（不是每查询一行）
+    var scoped = self.persistence.orm.withContext(ctx.sqlContext());
+    const repo = data.Repository(model.Order){ .orm = &scoped };
+    ...
+    // 裸 sqlx 同理：client.queryRowsCtx(ctx.sqlContext(), T, sql, args)
+}
+```
+
+语义边界（**必须知道**，否则会误判为"取消"）：
+
+- `SqlContext.isDone()` 只拒绝**尚未开始**的语句 —— sqlx 没有飞行中取消。
+  所以这个预算是**防止请求在预算耗尽后继续堆查询**，不是"到点砍掉正在跑的那条"。
+- 不调 `withContext` / `sqlContext()` 时行为与改动前**完全一致**（默认 `.{}` = 无截止），
+  所以这是**按 handler opt-in**，不是全局行为变更。
+- `Orm.withContext` 返回的是**副本**：`repo.orm` 指向它，副本要活到仓储用完（同一作用域即可）。
+- 第三方 backend 若没有 `ctx` 字段，编译期会直接报错并告诉你该加什么。
+
+### 多租户：把隔离从"记得调"变成"编译不过"
+
+`Repository(T)` 同时提供 `findById` 和 `findByIdForTenant`，而编译期守卫只保证"调用 `*ForTenant`
+时模型必须有租户列" —— **它不阻止你对租户模型调用无作用域变体**。模型带 `tenant_id` 时
+`repo.findById(id)` 照样跨租户返回，防线是"人记得"。
+
+**模型 opt-in 一行，就变成编译期强制**：
+
+```zig
+pub const Order = struct {
+    pub const sql_table_name: []const u8 = "orders";
+    /// 开启后，下列无作用域方法在本模型上**编译错误**。
+    pub const sql_tenant_column: ?[]const u8 = "tenant_id";
+    id: i64,
+    tenant_id: i64,
+    ...
+};
+```
+
+- 17 个无作用域方法（`findById` / `findAll` / `count` / `findPage*` / `insert*` / `update*` /
+  `delete*` / `findByIds` / `upsertMany` …）全部被守卫；错误信息点名对应的
+  `*ForTenant` 或逃生舱名字，并指出调用点。
+- **逃生舱**：跨租户是合法需求的场景（平台管理员 / 对账 / 导出）写更长的
+  `findByIdUnscoped` / `findPageUnscoped` / …。命名原则是**"安全的名字最短"** ——
+  危险的那条必须多打几个字，且代码里一眼可见。
+- **未声明 `sql_tenant_column` 的模型完全不受影响**（守卫第一句就是
+  `tenant_column orelse return`），所以既有项目升级不需要改任何东西。
+- `zmodu scaffold` 生成的 `model.zig` **默认就带这一行**（表里真有租户列时才写），
+  新项目默认安全。
+
+口径与验证：`scripts/check-tenant-scope.sh` 用三个 fixture 锁死"守卫开火 / 逃生舱可用 /
+未 opt-in 的模型不受影响"，进 CI。
 
 ### 连接级背压与慢连接防护（v0.15.36+）
 
@@ -1416,6 +1691,7 @@ service 再声明一个字面相同的内联返回类型，编译器报的是 `e
 类型不同，人会反复踩（反馈方在日志查询、结算列表、统计趋势、任务统计上各踩一次）。
 
 ```zig
+// （伪码：`...` 处省略了参数与函数体，只示"内联 struct 是不同类型"这一点）
 // ✗ 两层各自内联：类型不相等，报错在 service 层，光看名字找不到原因
 pub fn listLogs(...) !struct { list: []Log, total: i64 } { ... }
 pub fn logs(...) !struct { list: []Log, total: i64 } { ... }
@@ -1543,19 +1819,43 @@ runner.setLock(lock.lock(), 300_000);
 - **使用 defer**：关键资源使用 `defer` 确保释放
 
 ```zig
-// ✅ 正确的内存管理
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+// ✅ 正确（一）：把所有权交给调用方 —— 就不要再 defer free
+//    契约：返回的切片归调用方所有，调用方负责 free。
 pub fn processData(allocator: Allocator, input: []const u8) ![]u8 {
     const buffer = try allocator.alloc(u8, input.len);
-    defer allocator.free(buffer); // 确保释放
-    
+    errdefer allocator.free(buffer); // 只兜住"本函数失败"这一条路径
+
+    @memcpy(buffer, input);
     // 处理数据...
-    
-    return buffer;
+
+    return buffer; // 所有权随返回值移交；此处绝不 free
 }
 
-// ❌ 错误的内存管理
+// ✅ 正确（二）：本函数保留所有权 —— 返回拷贝给调用方
+pub fn processDataCopy(allocator: Allocator, input: []const u8) ![]u8 {
+    const buffer = try allocator.alloc(u8, input.len);
+    defer allocator.free(buffer); // 本函数拥有 buffer，退出时归还
+
+    @memcpy(buffer, input);
+    // 处理数据...
+
+    return allocator.dupe(u8, buffer); // 交出的是拷贝，与 buffer 无关
+}
+
+// ❌ 错误：标着"确保释放"，释放后却把同一块内存返回 —— 悬垂指针（静默 UAF）
+pub fn danglingAlloc(allocator: Allocator, input: []const u8) ![]u8 {
+    const buffer = try allocator.alloc(u8, input.len);
+    defer allocator.free(buffer); // 返回前就把内存还了
+    @memcpy(buffer, input);
+    return buffer; // ✗ 调用方拿到的是已释放内存
+}
+
+// ❌ 错误：分配到堆、没人释放，调用方也不知道要 free
 pub fn badPractice() ![]u8 {
-    const buffer = try allocator.alloc(u8, 1024);
+    const buffer = try std.heap.page_allocator.alloc(u8, 1024);
     // 忘记 defer 释放
     return buffer; // 内存泄漏
 }
@@ -1575,39 +1875,58 @@ pub fn badPractice() ![]u8 {
 
 ### 测试编写规范
 ```zig
-// ✅ 良好的测试实践
-const ModuleTestContext = @import("zigmodu").extensions.ModuleTestContext;
+const std = @import("std");
+const zigmodu = @import("zigmodu");
 
-test "用户模块 - 创建用户" {
-    const allocator = std.testing.allocator;
-    var ctx = try ModuleTestContext.init(allocator, "user");
+// 被测模块
+const UserModule = struct {
+    pub const info = zigmodu.api.Module{
+        .name = "user",
+        .description = "User module",
+        .dependencies = &.{},
+    };
+    pub fn init() !void {}
+    pub fn deinit() void {}
+};
+
+// ✅ 良好实践（一）：模块级测试用 ModuleTestContext
+//    真身是 `zigmodu.ModuleTestContext`（src/root.zig）——
+//    **没有** `zigmodu.extensions.ModuleTestContext` 这一层。
+test "用户模块 - 装 mock 并查表" {
+    var ctx = try zigmodu.ModuleTestContext.init(std.testing.allocator, "user");
     defer ctx.deinit();
-    
-    try ctx.start();
-    defer ctx.stop();
-    
-    // 执行操作
-    const result = try createUser(ctx, "test_user");
-    
-    // 验证结果
-    try std.testing.expectEqualStrings("test_user", result.name);
-    try std.testing.expect(ctx.hasEvent("user.created"));
+
+    try ctx.registerMockModule(zigmodu.createMockModule("user", "User module", &.{}));
+
+    const module = ctx.modules.get("user");
+    try std.testing.expect(module != null);
+    try std.testing.expectEqualStrings("user", module.?.name);
 }
 
-test "订单模块 - 异常处理" {
-    const allocator = std.testing.allocator;
-    var ctx = try ModuleTestContext.init(allocator, "order");
-    defer ctx.deinit();
-    
-    // 测试错误场景
-    const result = createOrder(ctx, .{
-        .product_id = "invalid",
-        .quantity = 0, // 无效数量
-    });
-    
-    try std.testing.expectError(error.InvalidQuantity, result);
+// ✅ 良好实践（二）：走真实 Application 生命周期 + 依赖校验（validate_on_start）
+fn createOrder(quantity: usize) !void {
+    if (quantity == 0) return error.InvalidQuantity;
+}
+
+test "订单模块 - 异常路径" {
+    var app = try zigmodu.Application.init(
+        std.testing.io,                 // 第一个参数是 io，不是 allocator
+        std.testing.allocator,
+        "order-failure",
+        .{UserModule},
+        .{ .validate_on_start = true },
+    );
+    defer app.deinit();
+    try app.start();
+    defer app.stop();
+
+    try std.testing.expectError(error.InvalidQuantity, createOrder(0));
 }
 ```
+
+> 参考实现：`examples/basic/src/tests.zig`（ModuleTestContext + mock + 生命周期 + 依赖校验）
+> 与 `examples/tenant-mgmt/src/tests.zig`。请求级断言用 `http.Testkit`（`dispatch` /
+> `signBearerToken` / `openMemorySqlite` / `SseRecorder`）。
 
 ### 覆盖率要求
 - **核心模块**：覆盖率 ≥ 80%
@@ -1683,6 +2002,90 @@ pub fn processBatch(allocator: Allocator, items: []Item) !void {
 `tx.queryRowPartial`（缺失列置零，与 `Client.queryRowPartial` 同契约）。多写方法
 的遗漏由 `zmodu audit` 的 b16 规则兜底（默认开启）。
 
+### 跨进程事务日志：`TransactionJournal` + `recover()`（必须接）
+
+单机 `beginTx` 管不了"协调者进程崩在 prepare 与 commit 之间"：参与者锁着资源，
+协调者自己什么都记不住 —— 重启后没人知道这笔事务该提交还是回滚。这就是 **in-doubt**。
+
+`zigmodu.TransactionJournal`（`src/core/TransactionJournal.zig`）是**追加写**的协调者日志：
+每次状态迁移插一条记录，崩溃最多丢最后一条，不会损坏已写的。接进 `TwoPhaseCommit` 后，
+`prepared` 记录在任何参与者收到 commit 指令**之前**落盘。带 journal 的协调者一旦
+写不进日志就拒绝推进（fail-closed）。
+
+```zig
+const zigmodu = @import("zigmodu");
+const data = zigmodu.data;
+
+// 启动期一次：建表 + 挂到协调者上
+var journal = zigmodu.TransactionJournal.initWithBackend(
+    allocator,
+    data.SqlxBackend{ .allocator = allocator, .client = &db },
+);
+defer journal.deinit();
+try journal.migrate();               // CREATE TABLE IF NOT EXISTS（三驱动通用，表名可配）
+
+var tpc = zigmodu.TwoPhaseCommit.init(allocator);
+defer tpc.deinit();
+tpc.setJournal(&journal);            // ← 不接这一步，协调者就是纯内存的
+
+// 进程重启后（或在 supervisor 的启动序列里）：把悬挂事务捞出来交人工/补偿
+const in_doubt = try tpc.recover(allocator);
+defer zigmodu.TransactionJournal.freeInDoubt(allocator, in_doubt);
+for (in_doubt) |tx| {
+    // tx.tx_id / tx.participants / tx.updated_at —— 只报告
+    std.log.warn("in-doubt tx {s} prepared at {d}, participants={any}", .{ tx.tx_id, tx.updated_at, tx.participants });
+}
+```
+
+三条规则（**必须遵守**，不是建议）：
+
+1. **`recover()` 必须接。** 不接就没有任何机制会发现 in-doubt 事务 —— 参与者可能永久锁着。
+2. **`recover()` 只报告，不自动处置。** 没有重试、没有回滚、没有超时策略，也不知道参与者
+   实际做没做。它给的是"该人工看一眼"的清单；决定权在你（`preparePhase` / `commitPhase` /
+   `abortPhase`）。
+3. **`freeInDoubt` 必须配对**（`defer`），每项里还有独立分配的 id 与参与者列表。
+
+一个进程内的 saga 另有一套崩溃续跑机制（`SagaOrchestrator.resumeInstance` + WAL，
+见 [WORKFLOW.md](WORKFLOW.md)）；本节管的是**跨进程 2PC** 那一条。
+
+### Saga 步骤超时：`SagaStep.timeout_seconds`（必须设）
+
+`SagaStep.timeout_seconds`（默认 `30`，`0` = **关掉**这个检查）是**每个步骤的预算**。
+它防的是最难受的一种挂起：某一步的 `action` 卡死（等一个永远不回的 RPC、死循环），
+saga 就永远停在 `running` —— 补偿不跑、实例不释放、没人知道它死了。
+
+```zig
+// `SagaStep` 是 `core/SagaOrchestrator.zig` 的顶层声明（`zigmodu` 目前只再导出
+// `SagaOrchestrator` / `SagaLog` / `SagaStatus`）。所以别写 `zigmodu.SagaStep`——
+// 直接把字面量交给 `registerSaga`，元素类型由此推断：
+var orch = zigmodu.SagaOrchestrator.init(allocator);
+defer orch.deinit();
+
+try orch.registerSaga("order", &.{
+    .{
+        .name = "charge",
+        .action = charge,
+        .compensation = refund,
+        .timeout_seconds = 15, // 必须给一个正数；`0` 等于关掉预算
+    },
+    .{
+        .name = "ship",
+        .action = ship,
+        .compensation = unship,
+        .timeout_seconds = 30, // 默认值就是 30，写出来是为了显式
+    },
+});
+```
+
+语义要说清（**判在事后，不是打断**）：
+
+- 判断发生在 `action` **返回之后** —— 进程内执行器无法抢占正在跑的步骤。
+- 超预算时实例落到 `.timed_out`，**已经产生效果的所有步骤（含这一步，因为它确实返回了）
+  按逆序补偿**；`execute` / `resumeInstance` 随后返回 `error.SagaStepTimeout`。
+- `.timed_out` 是终态：`resumeInstance` 拒绝续跑（`error.NothingToResume`），
+  `restoreFromWal` 也跳过它。
+- 所以 `timeout_seconds = 0` 不是"更快"，是"关掉唯一的悬挂检测"——**别设 0**。
+
 
 ## 📤 上传与 multipart（v0.15.46+）
 
@@ -1751,6 +2154,30 @@ if (!std.mem.eql(u8, part.content_type, "image/jpeg")) return error.Rejected;
 
 **这不是病毒扫描器**，也不解析图像：它只保证"文件是它声称的那类"，把上传端点从"任人投递"变成"只收这几类"。
 要求更高的场景（图片重编码、病毒扫描）应放在存储侧的后处理里。
+
+### 一步到位：解析 + 校验绑在一起
+
+两步写法里最容易被漏掉的是 `checkForm` 那一行——策略写了，handler 只调了 `extractMultipart`，
+中间那道门就没装上（而且这种漏掉不会报错，只会静默放行）。`extractMultipartGuarded` 把两者绑成一次调用：
+
+- 解析失败沿用 `extractMultipart` 的状态码（415 / 413 / 400）；
+- 策略拒绝默认出 **415** ProblemDetails，`reject_status = 422` 可以换成"类型能收、内容不收"的语义；
+- guard 的错误**原样返回**，所以想区分"扩展名不对"和"内容不对"的 handler 照样能
+  `catch |err| switch (err)`——只是**不要再写第二个响应**（服务器保留第一个，见 `Server.handleForTest` 的 `ctx.responded` 判断）；
+- 被拒时 form 由内部释放，调用方不用管。
+
+```zig
+var form = try zigmodu.http.extractMultipartGuarded(ctx, .{
+    .multipart = zigmodu.http.Multipart.Config.forBodyLimit(64 << 20),
+    .policy = .{
+        .extensions = &.{ "jpg", "jpeg", "png", "webp" },
+        .formats = &.{ .jpeg, .png, .webp },
+        .max_bytes = 5 << 20,
+    },
+});
+defer form.deinit();
+const avatar = form.file("avatar").?;   // 到这里才可信
+```
 
 ### 其它两条上传相关的约定
 
@@ -1862,7 +2289,7 @@ fn load(allocator: Allocator, input: http.CatalogPermLoadInput) ![]u8 {
 - **错误处理**：绝不忽略错误
 
 ```zig
-// ✅ 安全的输入验证
+// ✅ 安全的输入验证（片段：`// 进一步验证...` 处省略，未给出完整校验）
 pub fn validateInput(input: []const u8) !void {
     if (input.len == 0 or input.len > 1024) {
         return error.InvalidInput;
@@ -1881,26 +2308,43 @@ pub fn validateInput(input: []const u8) !void {
 - **原子操作**：简单计数器使用原子操作
 - **线程隔离**：避免跨线程共享可变状态
 
+Zig 0.17 删掉了 `std.Thread.Mutex`：现在是 **`std.Io.Mutex`**，且 `lock` / `unlock`
+都要**带 `io` 参数**（`lock(io)` / `unlock(io)`，都返回 error union）。锁本身仍是非阻塞自旋语义，
+也要自己声明 `io` 字段。写法对齐 `src/core/EventBus.zig` 的 `ThreadSafeEventBus`：
+
 ```zig
 const std = @import("std");
 
 pub const ThreadSafeCounter = struct {
-    mutex: std.Thread.Mutex = .{},
+    const Self = @This();          // 少了这行，`*Self` 编译不过
+
+    mutex: std.Io.Mutex = .init,   // 不是 `.{}`
+    io: std.Io,                    // lock/unlock 都要它
     value: u64 = 0,
-    
+
+    pub fn init(io: std.Io) Self {
+        return .{ .io = io };
+    }
+
     pub fn increment(self: *Self) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lock(self.io) catch return;   // 拿不到锁就当本次没加
+        defer self.mutex.unlock(self.io);
         self.value += 1;
     }
-    
+
     pub fn get(self: *Self) u64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lock(self.io) catch return 0;
+        defer self.mutex.unlock(self.io);
         return self.value;
     }
 };
 ```
+
+> 反例（Zig 0.17 编译不过、也别照抄）：`mutex: std.Thread.Mutex = .{}` +
+> `self.mutex.lock()` / `self.mutex.unlock()`。旧文档里出现过，已删。
+>
+> 只是计数的话，优先考虑 `std.atomic.Value(u64)` 的 `fetchAdd`（无锁），
+> 锁留给"一次要改多处状态"的场景。
 
 ### 安全扫描
 - **静态分析**：使用安全扫描工具定期检查
@@ -1915,49 +2359,80 @@ pub const ThreadSafeCounter = struct {
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{
-        .preferred_optimize_mode = .ReleaseSafe, // 生产环境使用 ReleaseSafe
+        .preferred_optimize_mode = .ReleaseSafe, // 带 `-Drelease` 时用 ReleaseSafe
     });
-    
+
+    // 编译期开关走 build options —— Zig 0.17 **没有** `root_module.addDefine`。
+    // 与仓库根 build.zig 的 `log_level` 同款写法。
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "log_level", b.option(
+        []const u8,
+        "log-level",
+        "Compile-time log level (debug/info/warn/err)",
+    ) orelse "debug");
+    const build_options_mod = build_options.createModule();
+
+    const exe_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    exe_mod.addImport("build_options", build_options_mod); // ← 开关这样进代码
+
     const exe = b.addExecutable(.{
         .name = "app",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+        .root_module = exe_mod,
     });
-    
-    // 生产环境特定配置
-    if (optimize == .ReleaseSafe or optimize == .ReleaseFast) {
-        exe.root_module.addDefine("NDEBUG");
-        exe.root_module.addDefine("LOG_LEVEL=2"); // 减少日志
-    }
+    b.installArtifact(exe);
 }
 ```
+
+```zig
+// src/main.zig —— 读编译期开关
+const build_options = @import("build_options");
+const log_level = build_options.log_level; // "debug" | "info" | "warn" | "err"
+```
+
+> 生产环境别靠 `addDefine` 关日志：日志级别用 `-Dlog-level=warn`（上面的 option），
+> 或者运行时用 `StructuredLogger` 的级别字段。
 
 ### 环境配置
 - **环境分离**：开发、测试、生产环境分离
 - **配置管理**：使用环境变量配置
 - **密钥管理**：敏感信息使用密钥管理服务
 
+Zig 0.17 移除了 `std.process.getEnvVarOwned`：环境变量从 `main` 的
+**`init.environ_map`**（`*std.process.Environ.Map`）拿，`get` 返回 `?[]const u8`，
+不分配、不需要释放。仓库示例统一这么写（`examples/*/src/main.zig`）。
+
 ```zig
-// config/Loader.zig - 环境感知配置
-pub fn loadConfig(allocator: Allocator) !Config {
-    const env = std.process.getEnvVarOwned(allocator, "APP_ENV") catch "development";
-    
-    return switch (env) {
+// src/config/Loader.zig - 环境感知配置
+const std = @import("std");
+
+pub const Config = struct {
+    db_url: []const u8,
+    log_level: LogLevel,
+    enable_cache: bool,
+};
+
+/// 环境表由调用方（main）传进来；本函数不分配、不持有环境内存。
+pub fn loadConfig(env: *const std.process.Environ.Map) !Config {
+    const app_env = env.get("APP_ENV") orelse "development"; // 缺省即默认值
+    const db_url = env.get("DB_URL");
+
+    return switch (app_env) {
         "production" => .{
-            .db_url = std.process.getEnvVarOwned(allocator, "DB_URL").?,
+            .db_url = db_url orelse return error.MissingDbUrl,
             .log_level = .error,
             .enable_cache = true,
         },
         "staging" => .{
-            .db_url = std.process.getEnvVarOwned(allocator, "DB_URL").?,
+            .db_url = db_url orelse return error.MissingDbUrl,
             .log_level = .info,
             .enable_cache = true,
         },
         else => .{
-            .db_url = "sqlite:///dev.db",
+            .db_url = db_url orelse "sqlite:///dev.db",
             .log_level = .debug,
             .enable_cache = false,
         },
@@ -1965,37 +2440,65 @@ pub fn loadConfig(allocator: Allocator) !Config {
 }
 ```
 
+```zig
+// src/main.zig —— main 拿到的 `init` 里就有环境表
+pub fn main(init: std.process.Init) !void {
+    const cfg = try loadConfig(init.environ_map);
+    _ = cfg;
+}
+```
+
+> 生产接线还有一条更省事的路径：`Server.fromEnv(io, allocator, init.environ_map)`
+> （`src/api/Server.zig`）读 `HTTP_PORT` / `HTTP_MAX_BODY` / `HTTP_MAX_CONNECTIONS` /
+> `HTTP_HEADER_TIMEOUT_MS`；启动期必填项检查交给 `zigmodu.Preflight.run(...)`。
+
 ### CI/CD 流水线
 ```yaml
-# .github/workflows/ci.yml
+# .github/workflows/ci.yml（节选）
 name: CI
 
 on:
   push:
-    branches: [master, develop]
+    branches: [master]
   pull_request:
     branches: [master]
+
+env:
+  # 真源就是这里。dev 构建会被 ziglang 镜像回收（dev.1567 已 404），
+  # 升级时先本地验证，再改这个值。
+  ZIG_VERSION: "0.17.0-dev.2151+2ec5523d5"
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        zig-version: ["0.16.0"]
-    
     steps:
       - uses: actions/checkout@v4
       - name: Setup Zig
-        uses: goto-bus-stop/setup-zig@v2
-        with:
-          version: ${{ matrix.zig-version }}
+        # 别用版本矩阵：`goto-bus-stop/setup-zig` 之类的 action 按旧 URL 形状
+        # (zig-<os>-<arch>) 拼链接，对当前 dev 构建一律 404。直接下 tarball。
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux) ART="zig-x86_64-linux" ;;
+            macOS) ART="zig-aarch64-macos" ;;
+            *) echo "unsupported runner OS: $RUNNER_OS"; exit 1 ;;
+          esac
+          curl -fsSL "https://ziglang.org/builds/$ART-$ZIG_VERSION.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig"
+          echo "$RUNNER_TEMP/zig/$ART-$ZIG_VERSION" >> "$GITHUB_PATH"
       - name: Run tests
         run: zig build test
       - name: Build examples
+        shell: bash
         run: |
-          cd examples/basic && zig build
-          cd ../event-driven && zig build
+          for d in examples/basic examples/event-driven; do
+            (cd "$d" && zig build)
+          done
 ```
+
+> 业务项目的发布门禁是 `zmodu ci`（build → fmt → verify → audit → deadcode → doctor，6 步）；
+> 框架自身是 `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`。
 
 ## ✅ 生产就绪检查清单
 
@@ -2065,7 +2568,7 @@ pub const UserModule = struct {
         name: []const u8,
         email: []const u8,
     ) !User {
-        // 实现...
+        // 片段：`// 实现...` 处省略；`UserModule.init(allocator)` 只是文档注释里的示意调用
     }
 };
 ```
@@ -2192,6 +2695,5 @@ zig build docs
 
 --
 
-**最后更新**：2025年4月  
-**版本**：1.0  
+**最后更新**：2026-09-18 · ZigModu v0.26.0（Zig 0.17.0）  
 **维护者**：ZigModu 团队

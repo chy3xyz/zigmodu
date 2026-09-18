@@ -61,7 +61,7 @@
 | `notification.send` | 向具名渠道投递通知（webhook / sink / outbox），渠道白名单 | `ai.notify.registerNotifySkills` |
 
 技能目录可导出：`zigmodu.ai.skill_export.toSkillsJson / toOpenApi`
-（运行时，tenant-ai 暴露于 `GET /api/ai/skills`），或 `zmodu ai
+（应用侧可在运行时导出并挂成 HTTP 端点），或 `zmodu ai
 export-skills / openapi`（CLI，内置目录）。
 
 ## P1 · 业务动作（✅ 已落地，默认人机门 + 幂等）

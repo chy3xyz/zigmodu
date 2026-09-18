@@ -171,8 +171,23 @@ annotations:
 
 - 访问日志与 trace id 由 `productionProfile` 默认接好（`tracingMiddleware` 注入
   `x-trace-id` 并记录耗时），响应头带 trace id 以便与日志关联。
+- **trace id 与业务日志的闭环**：中间件**不只写响应头** —— 它同时 `ctx.setTraceId()`，
+  所以 handler 一行就能让该请求的每条日志都带上 id：
+
+  ```zig
+  const log = ctx.logScope("orders");           // 已绑好 trace_id
+  log.info("order {d} placed", .{id});
+  // → [orders] order 7 placed trace_id=4bf92f35…
+  ```
+
+  入站已有 `X-Trace-Id` 时**复用它**（跨服务串成一条链），否则生成一个；
+  长度 >128 或含非可打印字符的入站值会被忽略（这个头是客户端可控的）。
+  走 `ctx.logScope(...)` 而不是 `LogScope.scope(...)` 是有意的：后者不会带 id，
+  漏了只会静默少一个字段，没人会注意到。
 - OTLP 导出（可选）：`zmodu.observability.OtlpExporter`，`http(s)://` 均支持
   （HTTPS 走系统信任库）。接 collector 后 trace 与指标可在同一后端关联。
+  **注意**：`DistributedTracer` 是手动 API（没有"当前 span"这类隐式状态），
+  所以 span → 日志的关联要显式做：谁手里有 id，谁负责 `setTraceId`。
 - **panic 归因**：应用 root 加 `pub const panic = zmodu.panicHook;`，panic 时
   stderr 会先打印"正在处理哪个请求"，再输出标准堆栈。详见
   [`BEST_PRACTICES.md`](BEST_PRACTICES.md)「韧性」。

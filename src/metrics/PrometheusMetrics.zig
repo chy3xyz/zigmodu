@@ -11,10 +11,13 @@ pub const PrometheusMetrics = struct {
     /// Bounded-cardinality labeled series (see `createCounterFamily`).
     counter_families: std.ArrayList(*CounterFamily),
     histogram_families: std.ArrayList(*HistogramFamily),
-    counters: std.StringHashMap(Counter),
-    gauges: std.StringHashMap(Gauge),
-    histograms: std.StringHashMap(Histogram),
-    summaries: std.StringHashMap(Summary),
+    /// Values are heap-allocated and held by pointer: `create*` hands the
+    /// pointer to callers and keeps the same object in the map, so a rehash
+    /// never invalidates a handle that has already been issued.
+    counters: std.StringHashMap(*Counter),
+    gauges: std.StringHashMap(*Gauge),
+    histograms: std.StringHashMap(*Histogram),
+    summaries: std.StringHashMap(*Summary),
 
     pub const Counter = struct {
         name: []const u8,
@@ -395,10 +398,10 @@ pub const PrometheusMetrics = struct {
             .scrape_userdata = null,
             .counter_families = std.ArrayList(*CounterFamily).empty,
             .histogram_families = std.ArrayList(*HistogramFamily).empty,
-            .counters = std.StringHashMap(Counter).init(allocator),
-            .gauges = std.StringHashMap(Gauge).init(allocator),
-            .histograms = std.StringHashMap(Histogram).init(allocator),
-            .summaries = std.StringHashMap(Summary).init(allocator),
+            .counters = std.StringHashMap(*Counter).init(allocator),
+            .gauges = std.StringHashMap(*Gauge).init(allocator),
+            .histograms = std.StringHashMap(*Histogram).init(allocator),
+            .summaries = std.StringHashMap(*Summary).init(allocator),
         };
     }
 
@@ -416,35 +419,43 @@ pub const PrometheusMetrics = struct {
         // Free all metrics
         var counter_iter = self.counters.iterator();
         while (counter_iter.next()) |entry| {
-            self.allocator.free(entry.value_ptr.name);
-            self.allocator.free(entry.value_ptr.help);
-            entry.value_ptr.labels.deinit();
+            const counter = entry.value_ptr.*;
+            self.allocator.free(counter.name);
+            self.allocator.free(counter.help);
+            counter.labels.deinit();
+            self.allocator.destroy(counter);
         }
         self.counters.deinit();
 
         var gauge_iter = self.gauges.iterator();
         while (gauge_iter.next()) |entry| {
-            self.allocator.free(entry.value_ptr.name);
-            self.allocator.free(entry.value_ptr.help);
-            entry.value_ptr.labels.deinit();
+            const gauge = entry.value_ptr.*;
+            self.allocator.free(gauge.name);
+            self.allocator.free(gauge.help);
+            gauge.labels.deinit();
+            self.allocator.destroy(gauge);
         }
         self.gauges.deinit();
 
         var hist_iter = self.histograms.iterator();
         while (hist_iter.next()) |entry| {
-            self.allocator.free(entry.value_ptr.name);
-            self.allocator.free(entry.value_ptr.help);
-            entry.value_ptr.buckets.deinit();
-            entry.value_ptr.counts.deinit();
+            const hist = entry.value_ptr.*;
+            self.allocator.free(hist.name);
+            self.allocator.free(hist.help);
+            hist.buckets.deinit();
+            hist.counts.deinit();
+            self.allocator.destroy(hist);
         }
         self.histograms.deinit();
 
         var summary_iter = self.summaries.iterator();
         while (summary_iter.next()) |entry| {
-            self.allocator.free(entry.value_ptr.name);
-            self.allocator.free(entry.value_ptr.help);
-            entry.value_ptr.quantiles.deinit();
-            entry.value_ptr.values.deinit();
+            const summary = entry.value_ptr.*;
+            self.allocator.free(summary.name);
+            self.allocator.free(summary.help);
+            summary.quantiles.deinit();
+            summary.values.deinit();
+            self.allocator.destroy(summary);
         }
         self.summaries.deinit();
         self.* = undefined;
@@ -452,10 +463,14 @@ pub const PrometheusMetrics = struct {
 
     /// Create Counter
     pub fn createCounter(self: *Self, name: []const u8, help: []const u8) !*Counter {
+        const counter = try self.allocator.create(Counter);
+        errdefer self.allocator.destroy(counter);
         const name_copy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_copy);
         const help_copy = try self.allocator.dupe(u8, help);
+        errdefer self.allocator.free(help_copy);
 
-        const counter = Counter{
+        counter.* = .{
             .name = name_copy,
             .help = help_copy,
             .value = std.atomic.Value(u64).init(0),
@@ -463,38 +478,49 @@ pub const PrometheusMetrics = struct {
         };
 
         try self.counters.put(name_copy, counter);
-        return self.counters.getPtr(name_copy).?;
+        return counter;
     }
 
     /// Create Gauge
     pub fn createGauge(self: *Self, name: []const u8, help: []const u8) !*Gauge {
+        const gauge = try self.allocator.create(Gauge);
+        errdefer self.allocator.destroy(gauge);
         const name_copy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_copy);
         const help_copy = try self.allocator.dupe(u8, help);
+        errdefer self.allocator.free(help_copy);
 
-        const gauge = Gauge{
+        gauge.* = .{
             .name = name_copy,
             .help = help_copy,
             .labels = std.StringHashMap([]const u8).init(self.allocator),
         };
 
         try self.gauges.put(name_copy, gauge);
-        return self.gauges.getPtr(name_copy).?;
+        return gauge;
     }
 
     /// Create Histogram
     pub fn createHistogram(self: *Self, name: []const u8, help: []const u8, buckets: []const f64) !*Histogram {
-        const name_copy = try self.allocator.dupe(u8, name);
-        const help_copy = try self.allocator.dupe(u8, help);
+        const histogram = try self.allocator.create(Histogram);
+        errdefer self.allocator.destroy(histogram);
 
         var bucket_list = std.array_list.Managed(f64).init(self.allocator);
+        errdefer bucket_list.deinit();
         var count_list = std.array_list.Managed(u64).init(self.allocator);
+        errdefer count_list.deinit();
 
         for (buckets) |bucket| {
             try bucket_list.append(bucket);
             try count_list.append(0);
         }
 
-        const histogram = Histogram{
+        const name_copy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_copy);
+        const help_copy = try self.allocator.dupe(u8, help);
+        errdefer self.allocator.free(help_copy);
+
+        histogram.* = .{
             .name = name_copy,
             .help = help_copy,
             .buckets = bucket_list,
@@ -502,36 +528,38 @@ pub const PrometheusMetrics = struct {
         };
 
         try self.histograms.put(name_copy, histogram);
-        return self.histograms.getPtr(name_copy).?;
+        return histogram;
     }
 
     /// Create Summary
     pub fn createSummary(self: *Self, name: []const u8, help: []const u8) !*Summary {
+        const summary = try self.allocator.create(Summary);
+        errdefer self.allocator.destroy(summary);
+
         const name_copy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_copy);
         const help_copy = try self.allocator.dupe(u8, help);
+        errdefer self.allocator.free(help_copy);
 
-        const quantile_list = std.array_list.Managed(f64).init(self.allocator);
-        const value_list = std.array_list.Managed(f64).init(self.allocator);
-
-        const summary = Summary{
+        summary.* = .{
             .name = name_copy,
             .help = help_copy,
-            .quantiles = quantile_list,
-            .values = value_list,
+            .quantiles = std.array_list.Managed(f64).init(self.allocator),
+            .values = std.array_list.Managed(f64).init(self.allocator),
         };
 
         try self.summaries.put(name_copy, summary);
-        return self.summaries.getPtr(name_copy).?;
+        return summary;
     }
 
     /// Get Counter
     pub fn getCounter(self: *Self, name: []const u8) ?*Counter {
-        return self.counters.getPtr(name);
+        return self.counters.get(name);
     }
 
     /// Get Gauge
     pub fn getGauge(self: *Self, name: []const u8) ?*Gauge {
-        return self.gauges.getPtr(name);
+        return self.gauges.get(name);
     }
 
     /// Generate Prometheus-format metrics output
@@ -558,7 +586,7 @@ pub const PrometheusMetrics = struct {
         // Gauges
         var gauge_iter = self.gauges.iterator();
         while (gauge_iter.next()) |entry| {
-            const gauge = entry.value_ptr;
+            const gauge = entry.value_ptr.*;
             try buf.print("# HELP {s} {s}\n", .{ gauge.name, gauge.help });
             try buf.print("# TYPE {s} gauge\n", .{gauge.name});
             try buf.print("{s} {d:.6}\n\n", .{ gauge.name, gauge.get() });
@@ -958,6 +986,67 @@ test "histogram family renders per-label buckets" {
     try std.testing.expect(std.mem.indexOf(u8, text, "http_request_duration_milliseconds_bucket{route=\"/orders/{id}\",le=\"100.000\"} 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "http_request_duration_milliseconds_bucket{route=\"/orders/{id}\",le=\"+Inf\"} 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "http_request_duration_milliseconds_count{route=\"/orders/{id}\"} 3") != null);
+}
+
+test "issued metric handles survive registry growth" {
+    const allocator = std.testing.allocator;
+    var metrics = PrometheusMetrics.init(allocator);
+    defer metrics.deinit();
+
+    // Far past the initial capacity of every registry map, so each `create*`
+    // rehashes several times. A handle issued before a rehash is the only way
+    // callers (and the MetricsBackend vtable) ever touch a metric, so it must
+    // keep pointing at a live object.
+    const count = 64;
+
+    var names: [count][40]u8 = undefined;
+    var name_slices: [count][]const u8 = undefined;
+    var gauge_handles: [count]*PrometheusMetrics.Gauge = undefined;
+    var counter_handles: [count]*PrometheusMetrics.Counter = undefined;
+    var histogram_handles: [count]*PrometheusMetrics.Histogram = undefined;
+    var summary_handles: [count]*PrometheusMetrics.Summary = undefined;
+
+    for (0..count) |i| {
+        name_slices[i] = try std.fmt.bufPrint(&names[i], "growth_probe_{d}", .{i});
+        gauge_handles[i] = try metrics.createGauge(name_slices[i], "growth probe");
+        counter_handles[i] = try metrics.createCounter(name_slices[i], "growth probe");
+        histogram_handles[i] = try metrics.createHistogram(name_slices[i], "growth probe", &.{ 1, 10 });
+        summary_handles[i] = try metrics.createSummary(name_slices[i], "growth probe");
+    }
+
+    // Only now write through the handles issued before the final rehash.
+    for (gauge_handles, 0..) |g, i| g.set(@floatFromInt(i));
+    for (counter_handles, 0..) |c, i| c.add(@intCast(i));
+    for (histogram_handles, 0..) |h, i| h.observe(@floatFromInt(i));
+    for (summary_handles, 0..) |s, i| try s.observe(@floatFromInt(i));
+
+    var scratch: [128]u8 = undefined;
+    const text = try metrics.toPrometheusFormat(allocator);
+    defer allocator.free(text);
+
+    for (0..count) |i| {
+        try std.testing.expectEqual(
+            @as(f64, @floatFromInt(i)),
+            metrics.getGauge(name_slices[i]).?.get(),
+        );
+        try std.testing.expectEqual(
+            @as(u64, @intCast(i)),
+            metrics.getCounter(name_slices[i]).?.get(),
+        );
+        try std.testing.expectEqual(@as(u64, 1), summary_handles[i].totalCount());
+        try std.testing.expectEqual(@as(f64, @floatFromInt(i)), summary_handles[i].totalSum());
+
+        // The handles above must be the same objects the registry looks up by
+        // name, and the scrape must render every one of them.
+        const gauge_line = try std.fmt.bufPrint(&scratch, "{s} {d:.6}\n", .{ name_slices[i], @as(f64, @floatFromInt(i)) });
+        try std.testing.expect(std.mem.indexOf(u8, text, gauge_line) != null);
+
+        const counter_line = try std.fmt.bufPrint(&scratch, "{s} {d}\n", .{ name_slices[i], i });
+        try std.testing.expect(std.mem.indexOf(u8, text, counter_line) != null);
+
+        const histogram_line = try std.fmt.bufPrint(&scratch, "{s}_count {d}\n", .{ name_slices[i], 1 });
+        try std.testing.expect(std.mem.indexOf(u8, text, histogram_line) != null);
+    }
 }
 
 test "scrape hook refreshes gauges before rendering" {

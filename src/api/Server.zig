@@ -33,6 +33,9 @@ const Http2Tls = @import("../http/Http2Tls.zig");
 const Hpack = @import("../http/Hpack.zig");
 const GrpcServiceRegistry = @import("../extensions/GrpcTransport.zig").GrpcServiceRegistry;
 const Rbac = @import("../security/Rbac.zig");
+const Time = @import("../core/Time.zig");
+const sqlx = @import("../sqlx/sqlx.zig");
+const ModuleLogger = @import("../log/ModuleLogger.zig").ModuleLogger;
 
 // ==== §1  Method / Route / RouteGroup / WS callbacks ====
 
@@ -338,6 +341,13 @@ pub const Context = struct {
     upgraded: bool = false,
     /// Envelope dialect used by `ok` / `fail` / `unauth` / `paginated`.
     envelope: EnvelopeDialect = .default,
+    /// Absolute deadline (monotonic ms) for this request, from
+    /// `Server.Config.request_timeout_ms`. `null` = unbounded.
+    ///
+    /// This is a **budget**, not a kill switch: wiring it into storage is what
+    /// stops a slow request from holding a pool connection after the client has
+    /// already given up. `ctx.sqlContext()` is the one-line bridge.
+    deadline_ms: ?i64 = null,
 
     /// Per-request arena — eliminates ~20 heap allocs per request.
     /// Removed nested arena in Zig 0.17: ArenaAllocator.free() is no-op,
@@ -407,6 +417,36 @@ pub const Context = struct {
         self.* = undefined;
     }
 
+    /// Arms the request budget. `timeout_ms == 0` disables it (`.null`).
+    pub fn setDeadline(self: *Context, timeout_ms: u32) void {
+        self.deadline_ms = if (timeout_ms == 0)
+            null
+        else
+            Time.monotonicNowMilliseconds() + @as(i64, @intCast(timeout_ms));
+    }
+
+    /// Milliseconds left in the budget, `null` when unbounded. Negative once
+    /// the budget is spent.
+    pub fn remainingMs(self: *const Context) ?i64 {
+        const d = self.deadline_ms orelse return null;
+        return d - Time.monotonicNowMilliseconds();
+    }
+
+    /// The request budget in the shape storage understands. Hand it to
+    /// `Orm.withContext` (or any `sqlx` `*Ctx` call) and every query on that
+    /// path refuses to *start* once the budget is spent:
+    ///
+    /// ```zig
+    /// var scoped = self.persistence.orm.withContext(ctx.sqlContext());
+    /// const repo = data.Repository(Row){ .orm = &scoped };
+    /// ```
+    ///
+    /// Without this call the request runs unbounded — which is the pre-existing
+    /// behaviour, so wiring it is opt-in per handler.
+    pub fn sqlContext(self: *const Context) sqlx.SqlContext {
+        return .{ .deadline_ms = self.deadline_ms };
+    }
+
     /// Store an attribute on the context (for middleware data passing).
     pub fn setAttr(self: *Context, key: []const u8, value: []const u8) !void {
         const k = try self.allocator.dupe(u8, key);
@@ -423,6 +463,24 @@ pub const Context = struct {
     /// Retrieve an attribute from the context.
     pub fn getAttr(self: *const Context, key: []const u8) ?[]const u8 {
         return self.attributes.get(key);
+    }
+
+    /// Typed route state: `user_data` carries the `*State` the route was
+    /// registered with (ComptimeRouter mounts, `RouteGroup` handlers, and the
+    /// WebSocket `on_connect` / `on_close` callbacks all reach it this way).
+    ///
+    /// Prefer this over spelling `@ptrCast(@alignCast(ctx.user_data orelse …))`
+    /// at each call site: the reinterpret happens once here, and the
+    /// "no state on this route" case is the named `error.NoRouteState` instead
+    /// of an inline `orelse unreachable`.
+    ///
+    /// `T` must be the state type the route was registered with. This is a
+    /// reinterpreting cast, not a runtime type check. Reading identity is a
+    /// different concern — use `userId()` / `tenantId()` / `rolesCsv()`, which
+    /// read middleware attributes.
+    pub fn state(self: *const Context, comptime T: type) error{NoRouteState}!*T {
+        const raw = self.user_data orelse return error.NoRouteState;
+        return @ptrCast(@alignCast(raw));
     }
 
     /// Get query parameter
@@ -589,6 +647,50 @@ pub const Context = struct {
     /// kind of check a route's `permission` performs, use `permissionMatches`.
     pub fn permissionsCsv(self: *const Context) ?[]const u8 {
         return self.getAttr("permissions");
+    }
+
+    /// Trace id for this request, or null when nothing bound one.
+    ///
+    /// Nothing here generates or propagates a trace id: the framework has no
+    /// ambient "current span", so the producer is whoever knows the id — a
+    /// middleware that minted or forwarded one (`tracingMiddleware`,
+    /// `tracingWithTrace`), or a handler holding a `DistributedTracer` span.
+    /// It calls `setTraceId`; the handler reads the attr back and hands it to
+    /// the log scope, which is the whole correlation recipe:
+    ///
+    /// ```zig
+    /// const log = LogScope.scope("payments")
+    ///     .withField("trace_id", ctx.traceId() orelse "");
+    /// log.info("charged {d}", .{amount});
+    /// ```
+    pub fn traceId(self: *const Context) ?[]const u8 {
+        return self.getAttr("trace_id");
+    }
+
+    /// Bind the trace id for this request (attr `trace_id`, owned by the
+    /// context). Middleware calls this after minting or parsing an id; the
+    /// handler then reads it with `traceId()` — see that doc for the recipe.
+    pub fn setTraceId(self: *Context, id: []const u8) !void {
+        try self.setAttr("trace_id", id);
+    }
+
+    /// A log scope already carrying this request's trace id — the one-liner that
+    /// keeps the trace/log loop closed:
+    ///
+    /// ```zig
+    /// const log = ctx.logScope("orders");
+    /// log.info("order {d} placed", .{id});   // …→ [orders] order 7 placed trace_id=…
+    /// ```
+    ///
+    /// Built this way on purpose: `LogScope.scope("orders")` alone still works
+    /// and emits an untagged line, so a handler that forgets the trace id
+    /// *silently* loses correlation. Going through `ctx` removes that failure
+    /// mode — either the request has an id and every line carries it, or the
+    /// request has none and neither does the line (which is honest).
+    pub fn logScope(self: *const Context, comptime module: []const u8) ModuleLogger.LogScope.scope(module).Bound {
+        const Scope = ModuleLogger.LogScope.scope(module);
+        if (self.traceId()) |id| return Scope.withField("trace_id", id);
+        return .{};
     }
 
     /// Does this identity satisfy a route's `permission` / `roles` expression?
@@ -1124,7 +1226,10 @@ fn parseValue(comptime T: type, value: []const u8) !T {
 /// percent-decoded, repeated names accumulate, bracket keys are kept verbatim
 /// so `getArray`/`getPath` can interpret them. Enforces `max_params`
 /// occurrences.
-fn parseQueryInto(params: *Params, raw_query: []const u8, allocator: std.mem.Allocator, max_params: usize) !void {
+///
+/// Public so `http.Testkit` drives the *same* parser instead of keeping a twin
+/// copy in sync by hand.
+pub fn parseQueryInto(params: *Params, raw_query: []const u8, allocator: std.mem.Allocator, max_params: usize) !void {
     var it = std.mem.splitScalar(u8, raw_query, '&');
     while (it.next()) |param| {
         if (param.len == 0) continue;
@@ -1415,7 +1520,7 @@ fn hexVal(c: u8) u8 {
 }
 
 /// RFC 3986 percent-decode (query form): `%XX` → byte, `+` → space.
-fn percentDecode(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+pub fn percentDecode(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
     var out_len: usize = 0;
     var i: usize = 0;
     while (i < input.len) : (i += 1) {
@@ -2482,6 +2587,13 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
         };
         defer ctx.deinit();
 
+        // Arm the request budget once, here: `request_timeout_ms` used to be a
+        // post-hoc check (compare elapsed, send 408 if the handler overshot)
+        // with no way for storage to hear about it. Context now carries the
+        // deadline, and `ctx.sqlContext()` hands it to the query layer — so a
+        // handler that wires it stops piling queries behind a spent budget.
+        ctx.setDeadline(server.request_timeout_ms);
+
         ctx.io = server.io;
         ctx.stream = stream;
 
@@ -3077,9 +3189,64 @@ test "wildcard route matching" {
     try std.testing.expect(router.match(allocator, .GET, "/other/path") == null);
 }
 
-test "context response helpers" {
+test "context carries the request budget into storage" {
     const allocator = std.testing.allocator;
 
+    // Unarmed by default: an unconfigured Context must not impose a deadline.
+    {
+        var ctx = try Context.init(allocator, .GET, "/test");
+        defer ctx.deinit();
+        try std.testing.expect(ctx.deadline_ms == null);
+        try std.testing.expect(ctx.remainingMs() == null);
+        try std.testing.expect(ctx.sqlContext().deadline_ms == null);
+    }
+
+    // `request_timeout_ms` (30s default) arms it.
+    {
+        var ctx = try Context.init(allocator, .GET, "/test");
+        defer ctx.deinit();
+        ctx.setDeadline(30_000);
+        const remaining = ctx.remainingMs().?;
+        try std.testing.expect(remaining > 29_000 and remaining <= 30_000);
+        // The same budget reaches storage, which is the whole point.
+        try std.testing.expect(ctx.sqlContext().deadline_ms == ctx.deadline_ms);
+        try std.testing.expect(!ctx.sqlContext().isDone());
+    }
+
+    // 0 disables the budget rather than arming an already-expired one.
+    {
+        var ctx = try Context.init(allocator, .GET, "/test");
+        defer ctx.deinit();
+        ctx.setDeadline(0);
+        try std.testing.expect(ctx.deadline_ms == null);
+    }
+
+    // A spent budget is visible to storage and refuses queries.
+    {
+        var ctx = try Context.init(allocator, .GET, "/test");
+        defer ctx.deinit();
+        ctx.deadline_ms = Time.monotonicNowMilliseconds() - 1;
+        try std.testing.expect(ctx.sqlContext().isDone());
+        try std.testing.expect(ctx.remainingMs().? <= 0);
+    }
+}
+
+test "context logScope carries the request's trace id, and nothing when absent" {
+    const allocator = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+
+    var ctx = try Context.init(allocator, .GET, "/test");
+    defer ctx.deinit();
+
+    // No id yet: the scope must be empty, not a phantom `trace_id=`.
+    try std.testing.expectEqualStrings("", ctx.logScope("orders").fieldSuffix(&buf));
+
+    try ctx.setTraceId("abc-123");
+    try std.testing.expectEqualStrings(" trace_id=abc-123", ctx.logScope("orders").fieldSuffix(&buf));
+}
+
+test "context response helpers" {
+    const allocator = std.testing.allocator;
     // JSON response
     {
         var ctx = try Context.init(allocator, .GET, "/test");
@@ -3924,6 +4091,47 @@ test "typed identity getters read canonical attrs" {
     const snap = ctx.identity();
     try std.testing.expectEqualStrings("42", snap.user_id.?);
     try std.testing.expectEqualStrings("shop1", snap.tenant_id.?);
+}
+
+test "state(T) returns the route state and names the missing-state case" {
+    const allocator = std.testing.allocator;
+    var ctx = try Context.init(allocator, .GET, "/");
+    defer ctx.deinit();
+
+    const RouteState = struct { hits: u32 = 0 };
+    var st = RouteState{};
+
+    // A route registered without state (legacy RouteGroup default) is an error,
+    // not an inline unreachable.
+    try std.testing.expectError(error.NoRouteState, ctx.state(RouteState));
+
+    ctx.user_data = &st;
+    const got = try ctx.state(RouteState);
+    try std.testing.expect(got == &st);
+    got.hits += 1;
+    try std.testing.expectEqual(@as(u32, 1), st.hits);
+}
+
+test "trace id is an attr the log side can read" {
+    const allocator = std.testing.allocator;
+    var ctx = try Context.init(allocator, .GET, "/");
+    defer ctx.deinit();
+
+    // Nothing binds one unless the app does — no ambient trace state.
+    try std.testing.expect(ctx.traceId() == null);
+
+    try ctx.setTraceId("4bf92f3577b34da6a3ce929d0e0e4736");
+    try std.testing.expectEqualStrings("4bf92f3577b34da6a3ce929d0e0e4736", ctx.traceId().?);
+    // Same attr, so the generic accessor sees it too.
+    try std.testing.expectEqualStrings("4bf92f3577b34da6a3ce929d0e0e4736", ctx.getAttr("trace_id").?);
+
+    // Rebinding replaces the value (and the context frees the old copy).
+    try ctx.setTraceId("00000000000000000000000000000000");
+    try std.testing.expectEqualStrings("00000000000000000000000000000000", ctx.traceId().?);
+
+    // Sanity: it is not the tenant/user attrs.
+    try std.testing.expect(ctx.userId() == null);
+    try std.testing.expect(ctx.tenantId() == null);
 }
 
 test "typed attr getters parse int and enum" {

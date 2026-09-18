@@ -59,32 +59,14 @@ zig build test                          # runs the single end-to-end pipeline te
 
 Covered in [docs/AI_ORCHESTRATION.md](../docs/AI_ORCHESTRATION.md).
 
-## Multi-tenant AI (`examples/tenant-ai`)
-
-**Tenant-scoped AI operations** — two tenants share one app; every AI
-capability is isolated per tenant (via `X-Tenant-ID` middleware →
-`SkillContext.tenant_id`):
-
-- `GET  /api/ai/kpi?metric=paid_revenue` — per-tenant KPI (`kpi.query`);
-- `GET  /api/ai/report` — tenant-filtered Markdown business report;
-- `GET  /api/ai/alerts` — tenant-filtered alert rules;
-- `POST /api/ai/approval/submit?amount=N` — approval chain (auto-approve ≤
-  1000, escalate above, persisted per tenant);
-- `GET  /api/ai/approvals` + `POST /api/ai/approvals/{run_id}/approve` —
-  per-tenant human approval queue (tenants cannot see/resolve each other's);
-- `POST /api/ai/workflow/run` — orchestration running the registered skills
-  (with `WorkflowMetrics`);
-- `GET  /api/ai/workflow/graph` — Mermaid graph of the step pipeline
-  (including the approval gate).
-- `GET  /api/ai/skills` + `GET /api/ai/skills/openapi` — live skill catalog
-  and OpenAPI export of the registered AI skills.
-
-```bash
-cd examples/tenant-ai && zig build run
-curl -H "X-Tenant-ID: 1" "http://127.0.0.1:18088/api/ai/kpi?metric=paid_revenue"   # 150
-curl -H "X-Tenant-ID: 2" "http://127.0.0.1:18088/api/ai/kpi?metric=paid_revenue"   # 9000
-zig build test                          # asserts isolation end-to-end
-```
+> **Removed 2026-09-18.** Two AI examples were dropped to keep this directory
+> lean: `tenant-ai` (tenant-scoped AI — its tenant isolation is covered by
+> `tenant-mgmt`, its approval queue and AI pipeline by `ai-ops`, and the
+> `workflow.toMermaid` / `skill_export.toOpenApi` it served over HTTP have
+> unit tests in `src/ai/workflow.zig` / `src/ai/skill_export.zig` plus the
+> `zmodu ai export-skills` / `zmodu ai openapi` CLI smoke in CI), and
+> `shopdemo-zent` (the same `order` module as `shopdemo/generated-sample`,
+> only persisted through zent — which `zent-modulith` already demonstrates).
 
 ## LLM-Powered Policies (`examples/llm-policies`)
 
@@ -160,8 +142,6 @@ step is stated per row — that is the command CI runs for it.
 | [`production-deploy`](production-deploy/) | Deploy topology reference: nginx/Envoy TLS sidecar, k8s, systemd — no app | `docker compose up --build` |
 | [`runtime-workers`](runtime-workers/) | Runtime workers: mailbox, backpressure, supervisor, HotBus | `zig build run` |
 | [`shopdemo`](shopdemo/) | Generated `order` module + full 152-table e-commerce schema on sqlx | `zig build run` · `zig build test` |
-| [`shopdemo-zent`](shopdemo-zent/) | Same domain persisted through zent | `zig build run` |
-| [`tenant-ai`](tenant-ai/) | Tenant-isolated AI skills, reports and approval queue | `zig build run` · `zig build test` |
 | [`tenant-mgmt`](tenant-mgmt/) | Flagship: multi-tenant SaaS on `http.productionProfile` (CI integration demo) | `zig build run` · `zig build test` |
 | [`tenant-shop`](tenant-shop/) | Modulith blueprint: tenant/user/product/inventory + `shop_bff` / `admin_bff` | `zig build run` |
 | [`web4`](web4/) | did:key identity + x402 payment gating | `zig build run` · `zig build test` |
@@ -285,7 +265,7 @@ cd ../..
 zig build test
 
 # Run one example's tests — the examples with a `test` step are
-# ai-ops, basic, llm-policies, shopdemo, tenant-mgmt, tenant-ai, web4 and
+# ai-ops, basic, llm-policies, shopdemo, tenant-mgmt, web4 and
 # zmsaas/backend (the same list CI runs in `Run the example test steps`)
 cd examples/basic
 zig build test
@@ -401,7 +381,7 @@ pub fn build(b: *std.Build) void {
 
 When updating ZigModu API:
 1. Update all examples
-2. Run each example the way it ships: `zig build test` for the ones with a `test` step (`ai-ops`, `basic`, `llm-policies`, `shopdemo`, `tenant-mgmt`, `tenant-ai`, `web4`, `zmsaas/backend` — the list `ci.yml`'s `Run the example test steps` loops over); the rest are `zig build` / `zig build run`
+2. Run each example the way it ships: `zig build test` for the ones with a `test` step (`ai-ops`, `basic`, `llm-policies`, `shopdemo`, `tenant-mgmt`, `web4`, `zmsaas/backend` — the list `ci.yml`'s `Run the example test steps` loops over); the rest are `zig build` / `zig build run`
 3. Update documentation
 4. Test manually
 

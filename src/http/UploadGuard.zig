@@ -412,3 +412,142 @@ test "checkForm refuses a form whose file part is not what it claims" {
         .formats = &.{.jpeg},
     }));
 }
+
+// ─────────────────────────────────────────────────
+// Failure-path coverage: a real file, a rename, and the truncated input the
+// client controls. These are written against bytes rather than a helper that
+// fabricates a "valid" header, because the whole point of the guard is that
+// only the bytes get a vote.
+// ─────────────────────────────────────────────────
+
+/// A real 1×1 RGBA PNG: 68 bytes, four chunks (IHDR, IDAT, IEND) with correct
+/// CRCs, produced by zlib. Not a signature with padding glued on — the point of
+/// embedding a real file is that the guard accepts what an image decoder would.
+const png_1x1_hex = "89504e470d0a1a0a" ++
+    "0000000d49484452000000010000000108060000001f15c489" ++
+    "0000000b4944415478da636000020000050001e9fadcd8" ++
+    "0000000049454e44ae426082";
+
+fn realPng1x1(buf: *[68]u8) ![]const u8 {
+    return std.fmt.hexToBytes(buf, png_1x1_hex);
+}
+
+/// Walk the PNG chunk layout, verifying each chunk's CRC-32, and return the
+/// chunk count. Any framing or checksum error fails, which is what makes the
+/// fixture above checkable: padding after the signature cannot pass this.
+fn pngChunkCount(data: []const u8) !usize {
+    if (data.len < 8 or !std.mem.eql(u8, data[0..8], "\x89PNG\r\n\x1a\n")) return error.NotPng;
+    var i: usize = 8;
+    var count: usize = 0;
+    while (i < data.len) {
+        if (i + 12 > data.len) return error.TruncatedChunk;
+        const len = std.mem.readInt(u32, data[i..][0..4], .big);
+        const next = i + 12 + len;
+        if (next > data.len) return error.TruncatedChunk;
+        var crc = std.hash.crc.@"CRC-32/ISO-HDLC".init();
+        crc.update(data[i + 4 .. i + 8 + len]);
+        if (crc.final() != std.mem.readInt(u32, data[i + 8 + len ..][0..4], .big)) return error.BadChunkCrc;
+        count += 1;
+        i = next;
+    }
+    return count;
+}
+
+const image_policy = Policy{
+    .extensions = &.{ "jpg", "jpeg", "png" },
+    .formats = &.{ .jpeg, .png },
+};
+
+test "a real PNG passes, and its chunk CRCs prove the fixture is real" {
+    var buf: [68]u8 = undefined;
+    const png = try realPng1x1(&buf);
+
+    // The fixture must be a genuine file, or the rest of these tests would be
+    // asserting against "signature + padding" and prove nothing.
+    try std.testing.expectEqual(@as(usize, 68), png.len);
+    try std.testing.expectEqual(@as(usize, 3), try pngChunkCount(png));
+    try std.testing.expectEqual(Format.png, sniff(png));
+
+    const accepted = try check("avatar.png", png, image_policy);
+    try std.testing.expectEqual(Format.png, accepted.format);
+    try std.testing.expectEqualStrings("png", accepted.extension);
+}
+
+test "a rename cannot smuggle bytes past the guard" {
+    var buf: [68]u8 = undefined;
+    const png = try realPng1x1(&buf);
+
+    // (1) Real PNG bytes behind a `.php` name: the extension is what is wrong,
+    //     and nothing about the content can excuse it.
+    try std.testing.expectError(Error.ExtensionNotAllowed, check("shell.php", png, image_policy));
+
+    // (2) The direction an extension-only check cannot see at all: PHP source
+    //     behind an allowed `.jpg` name. The bytes decide, so this is refused.
+    try std.testing.expectError(Error.ContentNotAllowed, check("avatar.jpg", php_bytes, image_policy));
+
+    // (3) Both sides allowed, but they disagree about which format this is —
+    //     PNG bytes wearing a `.jpg` name. The more specific error.
+    try std.testing.expectError(Error.ExtensionContentMismatch, check("avatar.jpg", png, image_policy));
+
+    // (4) A name with no extension gets no free pass once an allowlist is set.
+    try std.testing.expectError(Error.ExtensionNotAllowed, check("avatar", png, image_policy));
+}
+
+test "the client's Content-Type cannot vouch for the bytes" {
+    const allocator = std.testing.allocator;
+    // Every claim the client can make is present and wrong-but-plausible: a
+    // `.jpg` name and `image/jpeg` declared. The body is a PHP script.
+    const body =
+        "--B\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"avatar.jpg\"\r\n" ++
+        "Content-Type: image/jpeg\r\n\r\n" ++ php_bytes ++ "\r\n--B--\r\n";
+    var form = try Multipart.parse(allocator, body, "multipart/form-data; boundary=B", .{});
+    defer form.deinit();
+
+    const part = form.file("avatar").?;
+    try std.testing.expectEqualStrings("avatar.jpg", part.filename.?);
+    try std.testing.expectEqualStrings("image/jpeg", part.content_type.?);
+
+    // Nothing in the check reads `content_type`, so the header buys nothing.
+    try std.testing.expectError(Error.ContentNotAllowed, checkForm(&form, image_policy));
+    try std.testing.expectError(Error.ContentNotAllowed, check(part.filename.?, part.data, image_policy));
+}
+
+test "SVG is refused by its bytes, whatever the name says" {
+    const svg = "<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>";
+
+    // Renaming it to an allowed image extension changes nothing.
+    try std.testing.expectError(Error.ActiveContentNotAllowed, check("logo.png", svg, image_policy));
+    // Active content is refused before the extension allowlist is consulted…
+    try std.testing.expectError(Error.ActiveContentNotAllowed, check("logo.txt", svg, image_policy));
+    // …and before the format allowlist too, so an endpoint with no allowlist
+    // at all is still not a file host for script containers.
+    try std.testing.expectError(Error.ActiveContentNotAllowed, check("logo", svg, .{}));
+    // HTML travels the same path (`<script>`, `<!doctype html`, `<html`…).
+    try std.testing.expectError(Error.ActiveContentNotAllowed, check("page.png", "<script>alert(1)</script>", image_policy));
+}
+
+test "truncated, empty and unlisted uploads are all refused" {
+    // Nothing at all: no extension to vouch for it, no bytes to sniff.
+    try std.testing.expectEqual(Format.unknown, sniff(""));
+    try std.testing.expectError(Error.ExtensionNotAllowed, check("", "", image_policy));
+    // A named file with no bytes is still not a PNG.
+    try std.testing.expectError(Error.ContentNotAllowed, check("a.png", "", image_policy));
+    try std.testing.expectError(Error.ContentNotAllowed, check("a.png", "\x00", image_policy));
+    try std.testing.expectError(Error.ContentNotAllowed, check("a.png", "\xFF", image_policy));
+
+    // Every truncated prefix of a real PNG signature: never accepted, never a
+    // crash. The guard reads bytes, so a 7-byte file is simply not a PNG.
+    const signature = "\x89PNG\r\n\x1a\n";
+    var i: usize = 0;
+    while (i < signature.len) : (i += 1) {
+        try std.testing.expectError(Error.ContentNotAllowed, check("a.png", signature[0..i], image_policy));
+    }
+
+    // Extensions outside the allowlist, including ones the bytes cannot save.
+    var buf: [68]u8 = undefined;
+    const png = try realPng1x1(&buf);
+    try std.testing.expectError(Error.ExtensionNotAllowed, check("tool.exe", "\x4d\x5a\x90\x00\x03", image_policy));
+    try std.testing.expectError(Error.ExtensionNotAllowed, check("tool.exe", png, image_policy));
+    try std.testing.expectError(Error.ExtensionNotAllowed, check("run.sh", "#!/bin/sh\n", image_policy));
+    try std.testing.expectError(Error.ExtensionNotAllowed, check("README", "hello", image_policy));
+}

@@ -60,7 +60,9 @@ const TaskState = struct {
 };
 
 fn taskFn(st: *TaskState) void {
-    st.executor(st.allocator, &st.ctx, st.task, &st.result) catch {};
+    st.executor(st.allocator, &st.ctx, st.task, &st.result) catch |err| {
+        std.log.warn("[ai.hierarchy] subtask executor failed: {s}", .{@errorName(err)});
+    };
 }
 
 pub const Hierarchy = struct {

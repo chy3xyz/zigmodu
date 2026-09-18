@@ -27,7 +27,12 @@ pub fn start(io: Io, allocator: std.mem.Allocator) !void {
             if (err == error.EndOfStream) break;
             return err;
         };
-        _ = stdin_reader.interface.takeByte() catch {};
+        // Best-effort: swallow the delimiter itself. A final line without a
+        // trailing '\n' still ends in EndOfStream here, and the loop above
+        // already breaks on that, so nothing is lost by ignoring the failure.
+        _ = stdin_reader.interface.takeByte() catch |err| {
+            std.log.debug("[mcp] consuming newline after line failed: {s}", .{@errorName(err)});
+        };
 
         if (n == 0) continue;
         const line = line_buf[0..n];
@@ -431,30 +436,30 @@ fn callDiff(io: Io, allocator: std.mem.Allocator, arguments: ?std.json.Value) ![
 
 // ── Helpers ──
 
-fn buildResponseValue(allocator: std.mem.Allocator, id: ?i64, result: std.json.Value) std.json.Value {
+fn buildResponseValue(allocator: std.mem.Allocator, id: ?i64, result: std.json.Value) !std.json.Value {
     var resp: std.json.ObjectMap = .{};
-    resp.put(allocator, "jsonrpc", .{ .string = "2.0" }) catch unreachable;
+    try resp.put(allocator, "jsonrpc", .{ .string = "2.0" });
     if (id) |i| {
-        resp.put(allocator, "id", .{ .integer = i }) catch unreachable;
+        try resp.put(allocator, "id", .{ .integer = i });
     } else {
-        resp.put(allocator, "id", .null) catch unreachable;
+        try resp.put(allocator, "id", .null);
     }
-    resp.put(allocator, "result", result) catch unreachable;
+    try resp.put(allocator, "result", result);
     return .{ .object = resp };
 }
 
-fn buildErrorResponseValue(allocator: std.mem.Allocator, id: ?i64, code: i64, message: []const u8) std.json.Value {
+fn buildErrorResponseValue(allocator: std.mem.Allocator, id: ?i64, code: i64, message: []const u8) !std.json.Value {
     var resp: std.json.ObjectMap = .{};
-    resp.put(allocator, "jsonrpc", .{ .string = "2.0" }) catch unreachable;
+    try resp.put(allocator, "jsonrpc", .{ .string = "2.0" });
     if (id) |i| {
-        resp.put(allocator, "id", .{ .integer = i }) catch unreachable;
+        try resp.put(allocator, "id", .{ .integer = i });
     } else {
-        resp.put(allocator, "id", .null) catch unreachable;
+        try resp.put(allocator, "id", .null);
     }
     var err_obj: std.json.ObjectMap = .{};
-    err_obj.put(allocator, "code", .{ .integer = code }) catch unreachable;
-    err_obj.put(allocator, "message", .{ .string = message }) catch unreachable;
-    resp.put(allocator, "error", .{ .object = err_obj }) catch unreachable;
+    try err_obj.put(allocator, "code", .{ .integer = code });
+    try err_obj.put(allocator, "message", .{ .string = message });
+    try resp.put(allocator, "error", .{ .object = err_obj });
     return .{ .object = resp };
 }
 

@@ -57,7 +57,9 @@ pub const RefundFlow = struct {
 
         _ = try self.writeCommand(allocator, self.command_topic, order_id, amount);
         self.writeCommand(allocator, self.notify_topic, order_id, amount) catch {
-            _ = self.writeCommand(allocator, self.compensation_topic, order_id, amount) catch {};
+            _ = self.writeCommand(allocator, self.compensation_topic, order_id, amount) catch |err| {
+                std.log.warn("[ai.refund] compensation write failed: {s}", .{@errorName(err)});
+            };
             return .{ .status = .compensated, .order_id = order_id, .amount = amount };
         };
         return .{ .status = .executed, .order_id = order_id, .amount = amount };

@@ -4,6 +4,11 @@
 //!   const resp = try http.Testkit.dispatch(&server, .GET, "/health", null);
 //!   defer resp.deinit(allocator);
 //!
+//! Query-driven routes (percent-encoded, exactly as sent on the wire):
+//!   const resp = try http.Testkit.dispatchOpts(&server, .GET, "/users", .{
+//!       .query = "pageNo=2&pageSize=5",
+//!   });
+//!
 //! JWT + tenant:
 //!   var sec = try http.Testkit.testSecurity(allocator, io);
 //!   defer sec.deinit(); // no-op today; frees via allocator on tokens
@@ -42,6 +47,22 @@ pub const DispatchOptions = struct {
     headers: []const HeaderPair = &.{},
     /// Context attributes (e.g. `tenant_id`) injected before the middleware chain.
     attrs: []const AttrPair = &.{},
+    /// Query string, **percent-encoded** exactly as a client would send it on
+    /// the request line (`GET /list?<query> HTTP/1.1`) — e.g.
+    /// `"pageNo=2&pageSize=5"`, `"name=%E5%BC%A0%E4%B8%89"`, `"q=100%25off"`,
+    /// `"tag=a+b"`.
+    ///
+    /// Do **not** pre-decode: the same decoder the production request parser
+    /// uses runs on it (`%XX` → byte, `+` → space), so
+    /// `ctx.queryParam("name")` yields `张三` and
+    /// `ctx.queryInt(usize, "pageNo", 1)` yields `2` rather than the default.
+    ///
+    /// Precedence with a `?` already in `path`: the path's own query is parsed
+    /// first, this field is appended after it, and both stay live. For a key
+    /// present in both, this field wins — `Params.get` returns the last
+    /// occurrence. (A `...&name=value` segment without `=` is dropped, as it is
+    /// in production.)
+    query: ?[]const u8 = null,
 };
 
 /// Match `path`, run middleware chain + handler, return response snapshot.
@@ -49,12 +70,21 @@ pub fn dispatch(server: *Server, method: Method, path: []const u8, body: ?[]cons
     return dispatchOpts(server, method, path, .{ .body = body });
 }
 
-/// Same as `dispatch` with optional headers and attributes.
+/// Same as `dispatch` with optional headers, attributes and query string.
 pub fn dispatchOpts(server: *Server, method: Method, path: []const u8, opts: DispatchOptions) !TestResponse {
     const allocator = server.allocator;
 
-    var ctx = try Context.init(allocator, method, path);
+    // Split the query off the path like the HTTP/1.1 request parser does:
+    // routing matches the bare path, the pairs land decoded in `ctx.query`.
+    const qmark = std.mem.indexOfScalar(u8, path, '?');
+    const route_path = if (qmark) |i| path[0..i] else path;
+
+    var ctx = try Context.init(allocator, method, route_path);
     errdefer ctx.deinit();
+    if (qmark != null) ctx.raw_path = path; // full request target, as in production
+
+    if (qmark) |i| try server_mod.parseQueryInto(&ctx.query, path[i + 1 ..], allocator, server.max_params);
+    if (opts.query) |raw_query| try server_mod.parseQueryInto(&ctx.query, raw_query, allocator, server.max_params);
 
     var body_owned: ?[]u8 = null;
     defer if (body_owned) |b| allocator.free(b);
@@ -89,6 +119,12 @@ pub fn dispatchOpts(server: *Server, method: Method, path: []const u8, opts: Dis
         .body_owned = true,
     };
 }
+
+// ── Query string decoding ────────────────────────────────────────────────
+//
+// The decoding itself lives in `Server.zig` — Testkit calls the request
+// parser's own `parseQueryInto`, so a query string cannot mean one thing on
+// the wire and another under test. (This used to be a hand-kept twin.)
 
 // ── JWT / SQLite / tenant helpers ──
 
@@ -266,6 +302,66 @@ test "dispatchOpts injects headers and attrs" {
 
     try std.testing.expectEqual(@as(u16, 200), resp.status_code);
     try std.testing.expectEqualStrings("acme", resp.body);
+}
+
+/// Handler shaped like scaffold-generated list endpoints: window read from the
+/// query string, defaults when a parameter is absent.
+fn listQueryHandler(ctx: *Context) !void {
+    const page = ctx.queryInt(usize, "pageNo", 1);
+    const size = ctx.queryInt(usize, "pageSize", 10);
+    const name = ctx.queryStr("name", "nobody");
+    var buf: [64]u8 = undefined;
+    try ctx.text(200, try std.fmt.bufPrint(&buf, "{d}/{d}/{s}", .{ page, size, name }));
+}
+
+fn addListQueryRoute(server: *Server) !void {
+    try server.addRoute(.{ .method = .GET, .path = "list", .handler = listQueryHandler });
+}
+
+test "dispatchOpts query string reaches the query accessors" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(std.testing.io, allocator, 0);
+    defer server.deinit();
+    try addListQueryRoute(&server);
+
+    // Percent-encoded, as it would appear on the request line.
+    var resp = try dispatchOpts(&server, .GET, "/list", .{
+        .query = "pageNo=2&pageSize=5&name=%E5%BC%A0%E4%B8%89",
+    });
+    defer resp.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+    try std.testing.expectEqualStrings("2/5/张三", resp.body);
+}
+
+test "dispatchOpts without query keeps handler defaults" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(std.testing.io, allocator, 0);
+    defer server.deinit();
+    try addListQueryRoute(&server);
+
+    var resp = try dispatchOpts(&server, .GET, "/list", .{});
+    defer resp.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+    try std.testing.expectEqualStrings("1/10/nobody", resp.body);
+}
+
+test "dispatchOpts path query and opts.query are both parsed" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(std.testing.io, allocator, 0);
+    defer server.deinit();
+    try addListQueryRoute(&server);
+
+    // Path keeps its own query (routing still sees `/list`).
+    var resp = try dispatchOpts(&server, .GET, "/list?pageNo=3", .{ .query = "pageSize=7" });
+    defer resp.deinit(allocator);
+    try std.testing.expectEqualStrings("3/7/nobody", resp.body);
+
+    // Both carry the same key: `opts.query` is appended last, so it wins.
+    var resp2 = try dispatchOpts(&server, .GET, "/list?pageNo=3", .{ .query = "pageNo=9" });
+    defer resp2.deinit(allocator);
+    try std.testing.expectEqualStrings("9/10/nobody", resp2.body);
 }
 
 test "signBearerToken verifies with AppSecurity" {

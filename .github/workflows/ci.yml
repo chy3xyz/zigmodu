@@ -135,6 +135,9 @@ jobs:
       - name: Production hot-path gate
         run: zig build check
 
+      - name: Tenant-scope compile gate
+        run: bash scripts/check-tenant-scope.sh
+
       - name: Build framework examples
         # Keep this list identical to the `Build all examples` step of the
         # `examples` job below — the two drifted once (zent-modulith was built
@@ -150,7 +153,7 @@ jobs:
           #   _shared           helper lib imported by path; its only step
           #                     (`test`) needs a sibling ../zent checkout
           #   zmsaas/frontend   SolidStart app — needs the node toolchain
-          for ex in ai-ops tenant-ai llm-policies mcp-server web4 basic distributed event-driven runtime-workers alpha-engine http-stress-test shopdemo shopdemo-zent tenant-mgmt tenant-shop zent-modulith metaverse-creative; do
+          for ex in ai-ops llm-policies mcp-server web4 basic distributed event-driven runtime-workers alpha-engine http-stress-test shopdemo tenant-mgmt tenant-shop zent-modulith metaverse-creative; do
             echo "== building examples/$ex =="
             (cd "examples/$ex" && zig build)
           done
@@ -164,7 +167,7 @@ jobs:
         run: |
           set -euo pipefail
           # Subset by construction: doctor needs a module graph, so only module-layout examples are listed.
-          for app in tenant-mgmt tenant-shop shopdemo shopdemo-zent zent-modulith alpha-engine metaverse-creative; do
+          for app in tenant-mgmt tenant-shop shopdemo zent-modulith alpha-engine metaverse-creative; do
             echo "== doctor examples/$app =="
             ./zig-out/bin/zmodu doctor "examples/$app"
           done
@@ -318,7 +321,7 @@ jobs:
           #   _shared           helper lib imported by path; its only step
           #                     (`test`) needs a sibling ../zent checkout
           #   zmsaas/frontend   SolidStart app — needs the node toolchain
-          for ex in ai-ops tenant-ai llm-policies mcp-server web4 basic distributed event-driven runtime-workers alpha-engine http-stress-test shopdemo shopdemo-zent tenant-mgmt tenant-shop zent-modulith metaverse-creative; do
+          for ex in ai-ops llm-policies mcp-server web4 basic distributed event-driven runtime-workers alpha-engine http-stress-test shopdemo tenant-mgmt tenant-shop zent-modulith metaverse-creative; do
             echo "== building examples/$ex =="
             (cd "examples/$ex" && zig build)
           done
@@ -334,7 +337,7 @@ jobs:
         run: |
           set -euo pipefail
           # Subset by construction: the examples whose build.zig ships a `test` step — examples/README.md marks the same rows.
-          for ex in ai-ops basic llm-policies shopdemo tenant-mgmt tenant-ai web4; do
+          for ex in ai-ops basic llm-policies shopdemo tenant-mgmt web4; do
             echo "== testing examples/$ex =="
             (cd "examples/$ex" && zig build test)
           done
@@ -629,14 +632,17 @@ jobs:
       - name: Run benchmarks
         run: zig build benchmark -Doptimize=ReleaseFast
 
-      # The benchmark RUN above is the gate (it must compile and complete).
-      # Storing history needs a `gh-pages` branch, which this repo does not have
-      # yet — until one exists the threshold comparison cannot work, so this
-      # step must not fail the build. To enable it:
-      #   git checkout --orphan gh-pages && git commit --allow-empty -m init \
-      #     && git push -u origin gh-pages
-      # then make the action authoritative (drop continue-on-error, set
-      # fail-on-alert: true).
+      # History only — this action needs a `gh-pages` branch, which this repo
+      # does not have, so it can neither store nor compare. It stays
+      # `continue-on-error` and is NOT the gate; `scripts/check-bench.sh` below
+      # is. Run after the history step on purpose: a failed step skips the rest
+      # of the job, and a regression is exactly when the history data point is
+      # worth having.
+      #
+      # To make the action authoritative instead: create the branch
+      # (`git checkout --orphan gh-pages && git commit --allow-empty -m init
+      # && git push -u origin gh-pages`), drop `skip-fetch-gh-pages`, then drop
+      # `continue-on-error` and set `fail-on-alert: true`.
       - name: Store benchmark results
         continue-on-error: true
         uses: benchmark-action/github-action-benchmark@v1
@@ -650,6 +656,25 @@ jobs:
           # on `git fetch … gh-pages` (job never ran until the branch guard was
           # fixed, so this surfaced only now).
           skip-fetch-gh-pages: true
+
+      - name: Performance gate (baseline comparison)
+        # The authoritative gate: compares every metric against
+        # scripts/bench-baseline.json and fails when one is more than 2.0x
+        # slower (lower is better). Runs the suite in a temporary directory, so
+        # it neither overwrites the `bench-results.json` the step above stored
+        # nor leaves files in the working tree.
+        #
+        # This job stays push-to-main/master only. A benchmark run needs a full
+        # ReleaseFast build plus the suite itself, and the numbers move with
+        # runner load — which is a bad trade for a per-PR check, especially for
+        # fork PRs, where the comparison would be between the committed baseline
+        # and a different machine class. Landing on master still gets the
+        # verdict, and `workflow_dispatch` runs it on demand for a PR.
+        #
+        # If the runner is *systematically* slower than wherever the baseline was
+        # recorded, re-record it (`bash scripts/check-bench.sh --update`, then
+        # review the diff) — do not raise BENCH_THRESHOLD to make it pass.
+        run: bash scripts/check-bench.sh
 
   # ── Docker Build ──────────────────────────────
   docker:

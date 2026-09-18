@@ -761,7 +761,9 @@ fn startInbound(
         // `ClusterServer.start` flips `running` right after a successful listen.
         var spins: usize = 0;
         while (!out.server.running.load(.monotonic) and spins < 2000) : (spins += 1) {
-            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake) catch |err| {
+                std.log.debug("[raft] poll sleep interrupted ({s})", .{@errorName(err)});
+            };
         }
         if (out.server.running.load(.monotonic)) return port;
         thread.join(); // port taken: `run` already returned
@@ -784,9 +786,13 @@ fn stopInbound(io: std.Io, inbound: *InboundServer, thread: *std.Thread) void {
 fn waitForTerm(io: std.Io, raft: *RaftElection, expected: u64, spins_max: usize) bool {
     var spins: usize = 0;
     while (raft.getTerm() != expected and spins < spins_max) : (spins += 1) {
-        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake) catch |err| {
+            std.log.debug("[raft] poll sleep interrupted ({s})", .{@errorName(err)});
+        };
     }
-    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(5), .awake) catch {};
+    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(5), .awake) catch |err| {
+        std.log.debug("[raft] term settle sleep interrupted ({s})", .{@errorName(err)});
+    };
     return raft.getTerm() == expected;
 }
 

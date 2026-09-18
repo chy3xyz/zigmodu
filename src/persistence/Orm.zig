@@ -129,6 +129,26 @@ pub fn Model(comptime T: type) type {
         /// Whether this model uses camelCase fields (mapped to snake_case columns)
         pub const camel_case = camel;
 
+        /// Tenant column this model opted into, or `null` when the model did
+        /// not declare `sql_tenant_column` (the default — an absent decl keeps
+        /// every pre-existing model byte-for-byte unaffected).
+        ///
+        /// When set, every unscoped `Repository(T)` method is a compile error
+        /// and only the `*ForTenant` / `*Unscoped` names are callable.
+        pub const tenant_column: ?[]const u8 = blk: {
+            if (!@hasDecl(T, "sql_tenant_column")) break :blk null;
+            const declared: ?[]const u8 = T.sql_tenant_column;
+            if (declared) |col| {
+                // `col` is a SQL column; on camelCase models the struct field
+                // is the camelCase spelling of it.
+                const field = if (camel) snakeToCamel(col) else col;
+                if (!@hasField(T, field)) {
+                    @compileError("model '" ++ @typeName(T) ++ "' declares `sql_tenant_column = \"" ++ col ++ "\"` but has no field '" ++ field ++ "' — add the field or drop the decl");
+                }
+            }
+            break :blk declared;
+        };
+
         pub const primary_key = blk: {
             if (@hasDecl(T, "sql_primary_key")) break :blk T.sql_primary_key;
             for (info.@"struct".field_names) |fname| {
@@ -268,6 +288,35 @@ fn comptimeRequireTenantField(comptime T: type, comptime col: []const u8, compti
     if (!@hasField(T, field)) {
         @compileError("tenant-scoped repository method called for model without field '" ++ field ++ "' (column '" ++ col ++ "') — add the tenant column to the model or use the non-tenant variant");
     }
+}
+
+/// Human-readable reason a name is unavailable, plus the two ways out.
+/// Split out so the wording is testable and so every guard says the same thing.
+fn tenantScopeMessage(
+    comptime model_name: []const u8,
+    comptime col: []const u8,
+    comptime method: []const u8,
+    comptime scoped_alt: []const u8,
+) []const u8 {
+    const why = "model '" ++ model_name ++ "' declares `sql_tenant_column = \"" ++ col ++
+        "\"`, so an unscoped `" ++ method ++ "` would read/write rows belonging to every tenant. ";
+    if (scoped_alt.len == 0) {
+        return why ++ "There is no tenant-scoped counterpart for this write (the tenant column rides on the row itself, so no SQL predicate can check it): validate it against the caller's tenant, then call `" ++ method ++ "Unscoped` to make that choice explicit.";
+    }
+    return why ++ "Use `" ++ scoped_alt ++ "` for the tenant-scoped call, or `" ++ method ++
+        "Unscoped` when cross-tenant access is intentional (admin / audit / export).";
+}
+
+/// Fail the build when an unscoped repository method is called on a model that
+/// opted into tenant isolation via `sql_tenant_column`. The error trace's next
+/// frame is the call site, so the message names the method and its two exits
+/// rather than the guard.
+///
+/// Models without the decl short-circuit on `orelse return`, so this costs
+/// nothing and changes nothing for every pre-existing consumer.
+fn comptimeGuardTenantScope(comptime T: type, comptime method: []const u8, comptime scoped_alt: []const u8) void {
+    const col = Model(T).tenant_column orelse return;
+    @compileError(tenantScopeMessage(@typeName(T), col, method, scoped_alt));
 }
 
 /// Build `WHERE {col} = ?` (empty `where_sql`) or `{where_sql} AND {col} = ?`.
@@ -535,6 +584,13 @@ pub fn PageResult(comptime T: type) type {
         }
 
         /// Free owned memory (arena preferred; else per-string freeScanned).
+        ///
+        /// Prefer `deinitArena()` when the result came from `findPage` /
+        /// `findAll` / any `queryRowsOwned` path: those return an arena captured
+        /// from the **client** allocator, so there is no allocator for the caller
+        /// to get wrong. Passing a different one here is a misuse — the arena
+        /// still frees through its own backing allocator, so the argument is
+        /// silently ignored on the arena path and only bites on the slice path.
         pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
             if (self.arena) |*a| {
                 a.deinit();
@@ -545,6 +601,23 @@ pub fn PageResult(comptime T: type) type {
             for (self.items) |item| sqlx.freeScanned(allocator, T, item);
             allocator.free(self.items);
             self.items = &.{};
+        }
+
+        /// Free an arena-backed PageResult without taking an allocator.
+        /// The arena's backing allocator — captured at scan time — releases its
+        /// buffer, so the caller cannot confuse the free path.
+        ///
+        /// Calling this on a slice-backed result (arena == null) is a bug:
+        /// per-row strings would leak. Debug-panic to surface it loudly rather
+        /// than silently leak.
+        pub fn deinitArena(self: *@This()) void {
+            if (self.arena) |*a| {
+                a.deinit();
+                self.arena = null;
+                self.items = &.{};
+                return;
+            }
+            @panic("deinitArena called on a slice-backed PageResult (arena == null); " ++ "use deinit(allocator) for the slice path");
         }
     };
 }
@@ -621,13 +694,52 @@ pub fn Orm(comptime B: type) type {
         const Self = @This();
         backend: B,
 
+        /// Returns a copy of this ORM whose backend carries `ctx` — the request
+        /// budget. Every repository built from the copy inherits it, so wiring
+        /// the deadline is **one line per request**, not one per query:
+        ///
+        /// ```zig
+        /// var scoped = self.persistence.orm.withContext(ctx.sqlContext());
+        /// const repo = data.Repository(Row){ .orm = &scoped };
+        /// ```
+        ///
+        /// Keep the copy alive for as long as repositories built from it are
+        /// used (`repo.orm` points at it). `SqlContext{}` (the default) means
+        /// "no deadline", so an ORM that never sees this call behaves exactly
+        /// as before.
+        ///
+        /// The capability lives on the backend, not here: a backend without a
+        /// `ctx` field is told so at compile time rather than silently ignoring
+        /// the deadline.
+        pub fn withContext(self: Self, ctx: sqlx.SqlContext) Self {
+            comptime if (!@hasField(B, "ctx")) {
+                @compileError("Orm.withContext: backend '" ++ @typeName(B) ++ "' has no `ctx` field — add `ctx: sqlx.SqlContext = .{}` to it (see SqlxBackend) and route its client calls through the *Ctx variants, or pass the deadline per call");
+            };
+            var out = self;
+            out.backend.ctx = ctx;
+            return out;
+        }
+
         pub fn Repository(comptime T: type) type {
             const meta = Model(T);
 
             return struct {
                 orm: *Self,
 
+                /// Tenant-safe lookup. On a model that declares
+                /// `sql_tenant_column` this is a **compile error** — a row id
+                /// alone does not identify a tenant. Call
+                /// `findByIdForTenant(col, tenant_id, id)`, or the deliberate
+                /// escape hatch `findByIdUnscoped`.
                 pub fn findById(self: @This(), id: anytype) !?T {
+                    comptime comptimeGuardTenantScope(T, "findById", "findByIdForTenant");
+                    return self.findByIdUnscoped(id);
+                }
+
+                /// Unscoped escape hatch: the lookup **without** any tenant
+                /// filter — it happily returns another tenant's row. For admin
+                /// / audit / reconciliation paths only.
+                pub fn findByIdUnscoped(self: @This(), id: anytype) !?T {
                     const sql = comptime comptimeSelectById(meta.table_name, meta.sql_columns, meta.fields, meta.primary_key, meta.camel_case, @hasField(T, "deleted"));
                     var args = [_]B.Value{B.fromOrmValue(toOrmValue(id))};
                     return self.orm.backend.queryRow(T, sql, &args);
@@ -636,8 +748,17 @@ pub fn Orm(comptime B: type) type {
                 /// Soft-delete escape hatch: like `findById` but WITHOUT the
                 /// `AND deleted = 0` filter — returns soft-deleted rows too.
                 /// Use for restore / audit queries; the normal read paths keep
-                /// filtering automatically.
+                /// filtering automatically. Tenant-isolated models must call
+                /// `findByIdIgnoringSoftDeleteUnscoped` (there is no scoped
+                /// variant: filtering is up to the caller's WHERE clause).
                 pub fn findByIdIgnoringSoftDelete(self: @This(), id: anytype) !?T {
+                    comptime comptimeGuardTenantScope(T, "findByIdIgnoringSoftDelete", "");
+                    return self.findByIdIgnoringSoftDeleteUnscoped(id);
+                }
+
+                /// Unscoped escape hatch: soft-deleted rows too, and **without**
+                /// any tenant filter. Admin / audit / restore paths only.
+                pub fn findByIdIgnoringSoftDeleteUnscoped(self: @This(), id: anytype) !?T {
                     const sql = comptime comptimeSelectById(meta.table_name, meta.sql_columns, meta.fields, meta.primary_key, meta.camel_case, false);
                     var args = [_]B.Value{B.fromOrmValue(toOrmValue(id))};
                     return self.orm.backend.queryRow(T, sql, &args);
@@ -655,7 +776,16 @@ pub fn Orm(comptime B: type) type {
 
                 /// Batch lookup: `WHERE pk IN (?,?,…)` in one round-trip.
                 /// Result order follows the DB, not the input order.
+                /// Tenant-isolated models must use `findByIdsForTenant` or the
+                /// deliberate `findByIdsUnscoped`.
                 pub fn findByIds(self: @This(), allocator: std.mem.Allocator, ids: []const i64) !sqlx.QueryResult(T) {
+                    comptime comptimeGuardTenantScope(T, "findByIds", "findByIdsForTenant");
+                    return self.findByIdsUnscoped(allocator, ids);
+                }
+
+                /// Unscoped escape hatch: batch lookup **without** a tenant
+                /// filter — another tenant's rows come back too.
+                pub fn findByIdsUnscoped(self: @This(), allocator: std.mem.Allocator, ids: []const i64) !sqlx.QueryResult(T) {
                     if (ids.len == 0) return error.EmptyIds;
                     const cols = comptime comptimeColumnList(meta.sql_columns, meta.fields, meta.camel_case);
                     var buf = std.ArrayList(u8).empty;
@@ -710,15 +840,34 @@ pub fn Orm(comptime B: type) type {
                     return self.orm.backend.queryRows(T, buf.items, args);
                 }
 
+                /// Full-table scan. On a tenant-isolated model this is a
+                /// compile error: it reads every tenant's rows. Use
+                /// `findAllForTenant(col, tenant_id)`, or the deliberate
+                /// `findAllUnscoped`.
                 pub fn findAll(self: @This()) !sqlx.QueryResult(T) {
+                    comptime comptimeGuardTenantScope(T, "findAll", "findAllForTenant");
+                    return self.findAllUnscoped();
+                }
+
+                /// Unscoped escape hatch: the full-table scan **without** a
+                /// tenant filter. Admin / export paths only.
+                pub fn findAllUnscoped(self: @This()) !sqlx.QueryResult(T) {
                     const sql = comptime comptimeSelectAll(meta.table_name, meta.sql_columns, meta.fields, meta.camel_case, @hasField(T, "deleted"));
                     return self.orm.backend.queryRows(T, sql, &.{});
                 }
 
                 /// Soft-delete escape hatch: like `findAll` but WITHOUT the
                 /// `WHERE deleted = 0` filter — includes soft-deleted rows.
-                /// Use for restore / audit queries.
+                /// Use for restore / audit queries. Tenant-isolated models must
+                /// use `findAllIncludingSoftDeleteUnscoped` (no scoped variant).
                 pub fn findAllIncludingSoftDelete(self: @This()) !sqlx.QueryResult(T) {
+                    comptime comptimeGuardTenantScope(T, "findAllIncludingSoftDelete", "");
+                    return self.findAllIncludingSoftDeleteUnscoped();
+                }
+
+                /// Unscoped escape hatch: soft-deleted rows too, and **no**
+                /// tenant filter. Restore / audit paths only.
+                pub fn findAllIncludingSoftDeleteUnscoped(self: @This()) !sqlx.QueryResult(T) {
                     const sql = comptime comptimeSelectAll(meta.table_name, meta.sql_columns, meta.fields, meta.camel_case, false);
                     return self.orm.backend.queryRows(T, sql, &.{});
                 }
@@ -730,13 +879,34 @@ pub fn Orm(comptime B: type) type {
                     return self.orm.backend.queryRows(T, sql, &.{.{ .int = tenant_id }});
                 }
 
+                /// Row count. On a tenant-isolated model this is a compile
+                /// error: it counts every tenant's rows. Use
+                /// `countForTenant(col, tenant_id)` or `countUnscoped`.
                 pub fn count(self: @This()) !usize {
+                    comptime comptimeGuardTenantScope(T, "count", "countForTenant");
+                    return self.countUnscoped();
+                }
+
+                /// Unscoped escape hatch: counts rows of **every** tenant.
+                /// Platform metrics / reconciliation only.
+                pub fn countUnscoped(self: @This()) !usize {
                     const sql = comptime comptimeCount(meta.table_name, @hasField(T, "deleted"));
                     const result = try self.orm.backend.queryRow(struct { count: i64 }, sql, &.{});
                     return @intCast(result.?.count);
                 }
 
+                /// Paginated scan. On a tenant-isolated model this is a compile
+                /// error — a page of every tenant's rows. Use
+                /// `findPageForTenant(col, tenant_id, page, size)` or
+                /// `findPageUnscoped`.
                 pub fn findPage(self: @This(), page: usize, size: usize) !PageResult(T) {
+                    comptime comptimeGuardTenantScope(T, "findPage", "findPageForTenant");
+                    return self.findPageUnscoped(page, size);
+                }
+
+                /// Unscoped escape hatch: pages over **every** tenant's rows,
+                /// with an unscoped COUNT for `total`.
+                pub fn findPageUnscoped(self: @This(), page: usize, size: usize) !PageResult(T) {
                     const sql = comptime comptimeSelectPage(meta.table_name, meta.sql_columns, meta.fields, meta.camel_case, @hasField(T, "deleted"));
                     const offset: i64 = if (page > 0) @intCast((page - 1) * size) else 0;
                     var args = [_]B.Value{
@@ -745,7 +915,7 @@ pub fn Orm(comptime B: type) type {
                     };
                     var result = try self.orm.backend.queryRows(T, sql, &args);
                     const owned = result.take();
-                    const total = try self.count();
+                    const total = try self.countUnscoped();
                     const total_page = if (size > 0) (total + size - 1) / size else 0;
                     return .{
                         .items = owned.items,
@@ -796,7 +966,21 @@ pub fn Orm(comptime B: type) type {
                 /// `where_sql` must not contain string literals/comments/`;` —
                 /// pass values via `?` placeholders + `args` (see sqlx.validateSqlFragment).
                 /// LIMIT/OFFSET are appended as bound parameters (portable across SQLite/PG/MySQL).
+                ///
+                /// It cannot check the caller's `where_sql`, so on a
+                /// tenant-isolated model it is a compile error: use
+                /// `findPageFilteredForTenant(col, alloc, tenant_id, …)` (which
+                /// prepends `col = ?`), or `findPageFilteredUnscoped` when the
+                /// WHERE clause already pins the tenant.
                 pub fn findPageFiltered(self: @This(), alloc: std.mem.Allocator, where_sql: []const u8, args: []const B.Value, page: usize, size: usize) !PageResult(T) {
+                    comptime comptimeGuardTenantScope(T, "findPageFiltered", "findPageFilteredForTenant");
+                    return self.findPageFilteredUnscoped(alloc, where_sql, args, page, size);
+                }
+
+                /// Unscoped escape hatch: the caller's WHERE clause is used
+                /// as-is — **no** tenant filter is added. Only safe when the
+                /// clause itself pins the tenant (`WHERE tenant_id = ?`).
+                pub fn findPageFilteredUnscoped(self: @This(), alloc: std.mem.Allocator, where_sql: []const u8, args: []const B.Value, page: usize, size: usize) !PageResult(T) {
                     try sqlx.validateSqlFragment(where_sql);
                     const col_list = comptime comptimeColumnList(meta.sql_columns, meta.fields, meta.camel_case);
 
@@ -906,7 +1090,19 @@ pub fn Orm(comptime B: type) type {
                     }
                 }
 
+                /// INSERT one row. On a tenant-isolated model this is a compile
+                /// error: the row carries its own tenant column, so no SQL
+                /// predicate can check it — validate the column against the
+                /// caller's tenant here, then call `insertUnscoped`.
                 pub fn insert(self: @This(), entity: T) !T {
+                    comptime comptimeGuardTenantScope(T, "insert", "");
+                    return self.insertUnscoped(entity);
+                }
+
+                /// Unscoped escape hatch: inserts `entity` **without** checking
+                /// its tenant column — the row lands under whatever tenant the
+                /// caller put in it.
+                pub fn insertUnscoped(self: @This(), entity: T) !T {
                     const auto_ts = comptime @hasDecl(T, "sql_auto_timestamps") and T.sql_auto_timestamps;
                     var e = entity;
                     const sql = comptime comptimeInsert(meta.table_name, meta.sql_columns, meta.fields, auto_ts);
@@ -936,7 +1132,16 @@ pub fn Orm(comptime B: type) type {
                 /// DB `DEFAULT` (if any) take over. Non-nullable fields are
                 /// always written. This is opt-in: the default `insert` keeps
                 /// writing explicit NULLs (full-coverage semantics).
+                /// Tenant-isolated models must call `insertOmitNullsUnscoped`
+                /// after checking the tenant column themselves.
                 pub fn insertOmitNulls(self: @This(), allocator: std.mem.Allocator, entity: T) !T {
+                    comptime comptimeGuardTenantScope(T, "insertOmitNulls", "");
+                    return self.insertOmitNullsUnscoped(allocator, entity);
+                }
+
+                /// Unscoped escape hatch: the null-omitting INSERT, with **no**
+                /// check of the row's tenant column.
+                pub fn insertOmitNullsUnscoped(self: @This(), allocator: std.mem.Allocator, entity: T) !T {
                     const auto_ts = comptime @hasDecl(T, "sql_auto_timestamps") and T.sql_auto_timestamps;
                     var e = entity;
                     var cols = std.ArrayList(u8).empty;
@@ -976,7 +1181,16 @@ pub fn Orm(comptime B: type) type {
                 }
 
                 /// Multi-row INSERT in one round-trip (VALUES (?,?),(?,?)…).
+                /// Tenant-isolated models must call `insertManyUnscoped` after
+                /// checking every row's tenant column themselves.
                 pub fn insertMany(self: @This(), allocator: std.mem.Allocator, entities: []const T) !void {
+                    comptime comptimeGuardTenantScope(T, "insertMany", "");
+                    return self.insertManyUnscoped(allocator, entities);
+                }
+
+                /// Unscoped escape hatch: bulk INSERT with **no** tenant check
+                /// on any row.
+                pub fn insertManyUnscoped(self: @This(), allocator: std.mem.Allocator, entities: []const T) !void {
                     if (entities.len == 0) return;
                     const columns = comptime comptimeInsertColumns(meta.sql_columns, meta.fields, false);
                     const rows = try self.rowsFromEntities(allocator, entities);
@@ -990,7 +1204,22 @@ pub fn Orm(comptime B: type) type {
                 /// Multi-row upsert (INSERT … ON CONFLICT DO UPDATE /
                 /// ON DUPLICATE KEY UPDATE) in one round-trip. Requires a
                 /// backend exposing `dialect()` (e.g. data.SqlxBackend).
+                /// Tenant-isolated models must call `upsertManyUnscoped` after
+                /// checking every row's tenant column themselves.
                 pub fn upsertMany(
+                    self: @This(),
+                    allocator: std.mem.Allocator,
+                    entities: []const T,
+                    conflict_columns: []const []const u8,
+                ) !void {
+                    comptime comptimeGuardTenantScope(T, "upsertMany", "");
+                    return self.upsertManyUnscoped(allocator, entities, conflict_columns);
+                }
+
+                /// Unscoped escape hatch: bulk upsert with **no** tenant check
+                /// — an entity carrying another tenant's key can overwrite that
+                /// tenant's row.
+                pub fn upsertManyUnscoped(
                     self: @This(),
                     allocator: std.mem.Allocator,
                     entities: []const T,
@@ -1067,7 +1296,19 @@ pub fn Orm(comptime B: type) type {
                     return rows;
                 }
 
+                /// Full-row UPDATE by primary key. On a tenant-isolated model
+                /// this is a compile error: the id alone does not prove the row
+                /// belongs to the caller's tenant. Use
+                /// `updateForTenant(col, tenant_id, entity)`, or
+                /// `updateUnscoped` when the tenant column is verified upstream.
                 pub fn update(self: @This(), entity: T) !void {
+                    comptime comptimeGuardTenantScope(T, "update", "updateForTenant");
+                    return self.updateUnscoped(entity);
+                }
+
+                /// Unscoped escape hatch: full-row UPDATE with **no** tenant
+                /// predicate — it can rewrite another tenant's row.
+                pub fn updateUnscoped(self: @This(), entity: T) !void {
                     const auto_ts = comptime @hasDecl(T, "sql_auto_timestamps") and T.sql_auto_timestamps;
                     const sql = comptime comptimeUpdate(meta.table_name, meta.sql_columns, meta.primary_key);
                     const n = @typeInfo(T).@"struct".field_names.len;
@@ -1093,7 +1334,17 @@ pub fn Orm(comptime B: type) type {
                 /// UPDATE returning rows affected — 0 means the primary key did
                 /// not match any row (enables optimistic-lock / NotFound checks
                 /// without a separate read). Mirrors `updateForTenant`.
+                /// Tenant-isolated models must use
+                /// `updateForTenant(col, tenant_id, entity)` or
+                /// `updateReturningUnscoped`.
                 pub fn updateReturning(self: @This(), entity: T) !u64 {
+                    comptime comptimeGuardTenantScope(T, "updateReturning", "updateForTenant");
+                    return self.updateReturningUnscoped(entity);
+                }
+
+                /// Unscoped escape hatch: the affected-rows UPDATE, with **no**
+                /// tenant predicate.
+                pub fn updateReturningUnscoped(self: @This(), entity: T) !u64 {
                     const auto_ts = comptime @hasDecl(T, "sql_auto_timestamps") and T.sql_auto_timestamps;
                     const sql = comptime comptimeUpdate(meta.table_name, meta.sql_columns, meta.primary_key);
                     const n = @typeInfo(T).@"struct".field_names.len;
@@ -1121,7 +1372,17 @@ pub fn Orm(comptime B: type) type {
                 /// nullable fields left null keep their current DB value. The
                 /// primary key is always used for the WHERE clause. Opt-in; the
                 /// default `update` keeps full-coverage (null clears) semantics.
+                /// Tenant-isolated models must use
+                /// `updateForTenant(col, tenant_id, entity)` or
+                /// `updatePartialUnscoped`.
                 pub fn updatePartial(self: @This(), allocator: std.mem.Allocator, entity: T) !void {
+                    comptime comptimeGuardTenantScope(T, "updatePartial", "updateForTenant");
+                    return self.updatePartialUnscoped(allocator, entity);
+                }
+
+                /// Unscoped escape hatch: partial UPDATE keyed on the primary
+                /// key alone — **no** tenant predicate.
+                pub fn updatePartialUnscoped(self: @This(), allocator: std.mem.Allocator, entity: T) !void {
                     const auto_ts = comptime @hasDecl(T, "sql_auto_timestamps") and T.sql_auto_timestamps;
                     var set_clause = std.ArrayList(u8).empty;
                     defer set_clause.deinit(allocator);
@@ -1182,7 +1443,18 @@ pub fn Orm(comptime B: type) type {
                     return res.rows_affected;
                 }
 
+                /// DELETE by primary key. On a tenant-isolated model this is a
+                /// compile error — the id alone does not prove ownership. Use
+                /// `deleteForTenant(col, tenant_id, id)`, or `deleteUnscoped`
+                /// when the caller already checked the row's tenant.
                 pub fn delete(self: @This(), id: anytype) !void {
+                    comptime comptimeGuardTenantScope(T, "delete", "deleteForTenant");
+                    return self.deleteUnscoped(id);
+                }
+
+                /// Unscoped escape hatch: DELETE by primary key with **no**
+                /// tenant predicate — it can drop another tenant's row.
+                pub fn deleteUnscoped(self: @This(), id: anytype) !void {
                     const sql = comptime comptimeDelete(meta.table_name, meta.primary_key);
                     var args = [_]B.Value{B.fromOrmValue(toOrmValue(id))};
                     _ = try self.orm.backend.exec(sql, &args);
@@ -1190,7 +1462,17 @@ pub fn Orm(comptime B: type) type {
 
                 /// DELETE returning rows affected — 0 means the primary key did
                 /// not match any row. Mirrors `deleteForTenant`.
+                /// Tenant-isolated models must use
+                /// `deleteForTenant(col, tenant_id, id)` or
+                /// `deleteByIdReturningUnscoped`.
                 pub fn deleteByIdReturning(self: @This(), id: anytype) !u64 {
+                    comptime comptimeGuardTenantScope(T, "deleteByIdReturning", "deleteForTenant");
+                    return self.deleteByIdReturningUnscoped(id);
+                }
+
+                /// Unscoped escape hatch: the affected-rows DELETE, with **no**
+                /// tenant predicate.
+                pub fn deleteByIdReturningUnscoped(self: @This(), id: anytype) !u64 {
                     const sql = comptime comptimeDelete(meta.table_name, meta.primary_key);
                     var args = [_]B.Value{B.fromOrmValue(toOrmValue(id))};
                     const res = try self.orm.backend.exec(sql, &args);
@@ -1243,6 +1525,49 @@ test "Model table name defaults to type name without sql_table_name" {
     };
     const meta = Model(Account);
     try std.testing.expectEqualStrings("Account", meta.table_name);
+}
+
+test "Model.tenant_column derives from the sql_tenant_column opt-in" {
+    const OptedIn = struct {
+        pub const sql_table_name: []const u8 = "opted_in";
+        pub const sql_tenant_column: ?[]const u8 = "tenant_id";
+        id: i64,
+        tenant_id: i64,
+    };
+    const OptedOutExplicitly = struct {
+        pub const sql_tenant_column: ?[]const u8 = null;
+        id: i64,
+    };
+    const NeverDeclared = struct {
+        id: i64,
+        tenant_id: i64, // a tenant column alone does not opt in
+    };
+    const CamelOptedIn = struct {
+        pub const sql_column_style: enum { snake, camelCase } = .camelCase;
+        pub const sql_tenant_column: ?[]const u8 = "tenant_id";
+        id: i64,
+        tenantId: i64,
+    };
+
+    try std.testing.expectEqualStrings("tenant_id", Model(OptedIn).tenant_column.?);
+    try std.testing.expectEqual(@as(?[]const u8, null), Model(OptedOutExplicitly).tenant_column);
+    try std.testing.expectEqual(@as(?[]const u8, null), Model(NeverDeclared).tenant_column);
+    // camelCase models spell the field `tenantId` but keep the SQL column name.
+    try std.testing.expectEqualStrings("tenant_id", Model(CamelOptedIn).tenant_column.?);
+}
+
+test "tenantScopeMessage names the model, the replacement and the escape hatch" {
+    const msg = comptime tenantScopeMessage("Row", "tenant_id", "findById", "findByIdForTenant");
+    try std.testing.expect(std.mem.indexOf(u8, msg, "sql_tenant_column = \"tenant_id\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "belonging to every tenant") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "findByIdForTenant") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "findByIdUnscoped") != null);
+
+    // Writes with no scoped counterpart get the "validate it yourself" wording
+    // instead of a dead `*ForTenant` pointer.
+    const write_msg = comptime tenantScopeMessage("Row", "tenant_id", "insert", "");
+    try std.testing.expect(std.mem.indexOf(u8, write_msg, "insertUnscoped") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_msg, "no tenant-scoped counterpart") != null);
 }
 
 test "SQL builders" {
@@ -1722,4 +2047,41 @@ test "Repository auto timestamps fill create_time/update_time (opt-in)" {
     try std.testing.expect(after_update.update_time >= after_update.create_time);
     try std.testing.expectEqual(orig_create, after_update.create_time);
     allocator.free(after_update.title);
+}
+
+test "PageResult deinitArena frees the arena captured from the client allocator" {
+    const allocator = std.testing.allocator;
+    const data = @import("../data.zig");
+
+    const ArenaRow = struct {
+        pub const sql_table_name: []const u8 = "arena_row";
+        id: i64,
+        title: []const u8,
+    };
+
+    var client = try data.Client.open(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    _ = try client.exec("CREATE TABLE arena_row (id INTEGER PRIMARY KEY, title TEXT NOT NULL)", &.{});
+    _ = try client.exec("INSERT INTO arena_row (id, title) VALUES (1, 'a'), (2, 'b')", &.{});
+
+    const backend = data.SqlxBackend{ .allocator = allocator, .client = &client };
+    var orm_instance: data.orm.Orm(data.SqlxBackend) = undefined;
+    orm_instance.backend = backend;
+    const Repo = data.Repository(ArenaRow);
+    const repo = Repo{ .orm = &orm_instance };
+
+    // findPage hands back an arena rooted in the client allocator — the request
+    // arena cannot reclaim it, which is why `deinitArena` exists.
+    var page = try repo.findPage(1, 10);
+    try std.testing.expect(page.arena != null);
+    try std.testing.expectEqual(@as(usize, 2), page.items.len);
+    try std.testing.expectEqual(@as(usize, 2), page.total);
+
+    page.deinitArena();
+    try std.testing.expect(page.arena == null);
+    try std.testing.expectEqual(@as(usize, 0), page.items.len);
+
+    // Like `QueryResult.deinitArena`, this is NOT idempotent: a freed result has
+    // `arena == null`, which is indistinguishable from slice-backed, so a second
+    // call panics. Call it exactly once.
 }

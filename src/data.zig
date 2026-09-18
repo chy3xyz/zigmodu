@@ -14,8 +14,12 @@ pub const orm = @import("persistence/Orm.zig");
 /// Batch insert/update helpers: one round trip instead of N statements.
 pub const bulk = @import("sqlx/Bulk.zig");
 /// Default ORM backend — runs repository SQL through `sqlx`.
+/// This is the framework's built-in default; for the new-project choice between
+/// this stack and zent (a separate, non-bundled stack) see `docs/ZENT.md` §2.
 pub const SqlxBackend = @import("persistence/backends/SqlxBackend.zig").SqlxBackend;
 /// Typed repository (`Repository(T)`): list/get/create/update/delete per entity.
+/// Built on the framework's default backend; new-project ORM choice (zent is a
+/// parallel stack, not a framework dependency) → `docs/ZENT.md` §2.
 pub const Repository = orm.Orm(SqlxBackend).Repository;
 /// Generic CRUD service — entity persistence without passthrough boilerplate.
 pub const CrudService = @import("data/CrudService.zig").CrudService;

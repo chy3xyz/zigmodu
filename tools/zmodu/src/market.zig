@@ -106,7 +106,11 @@ pub fn loadMergedCatalog(io: Io, allocator: std.mem.Allocator, external_path: ?[
 
 /// Fetch a remote catalog JSON into `.zmodu/market-index.json`.
 pub fn fetchIndex(io: Io, allocator: std.mem.Allocator, url: []const u8) !void {
-    Dir.cwd().createDirPath(io, ".zmodu") catch {};
+    // Best-effort: the createFile below fails with the same underlying error and
+    // the path in hand, so only a debug line is warranted here.
+    Dir.cwd().createDirPath(io, ".zmodu") catch |err| {
+        std.log.debug("market: createDirPath(.zmodu) failed ({s})", .{@errorName(err)});
+    };
     var client = std.http.Client{ .allocator = allocator, .io = io };
     defer client.deinit();
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{cache_path_const});
@@ -151,7 +155,11 @@ pub fn copyTree(io: Io, allocator: std.mem.Allocator, src: []const u8, dst: []co
         return err;
     };
     defer src_dir.close(io);
-    if (!dry_run) Dir.cwd().createDirPath(io, dst) catch {};
+    // Best-effort: every file write below reports its own failure with the path
+    // attached, so a missing `dst` surfaces there rather than here.
+    if (!dry_run) Dir.cwd().createDirPath(io, dst) catch |err| {
+        std.log.debug("market: createDirPath({s}) failed ({s})", .{ dst, @errorName(err) });
+    };
     var it = src_dir.iterate();
     while (try it.next(io)) |entry| {
         if (shouldSkip(entry.name)) continue;
