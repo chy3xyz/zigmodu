@@ -66,6 +66,10 @@ allowed_version() {
 }
 while IFS= read -r hit; do
   [[ -n "$hit" ]] || continue
+  # The scaffold's dependency hash is version-tagged by construction
+  # ('zigmodu-<version>-<payload>'); its lag behind a fresh bump is reported as a
+  # WARN in section 4, not a "hard-coded version" to derive from ZMODU_VERSION.
+  [[ "$hit" == *zigmodu_zon_hash* ]] && continue
   for lv in $(printf '%s\n' "$hit" | grep -oE 'v?0\.[0-9]+\.[0-9]+' | sed 's/^v//'); do
     if ! allowed_version "$lv"; then
       echo "check-version: tools/ hard-codes version $lv -> $hit" >&2
