@@ -226,13 +226,21 @@ const BenchResult = struct {
 // ─────────────────────────────────────────────────
 // Runtime primitives (`src/runtime/**`) — the framework's worker plumbing
 //
-// Deliberately deterministic: no sockets, no threads, no wall-clock deadlines.
-// Every harness heap-allocates the structure it drives and feeds each result
-// through `std.mem.doNotOptimizeAway`, so LLVM cannot conclude the address never
-// escapes and delete the loop it is supposed to be timing. The `CircuitBreaker x*`
-// metrics above used to be the counter-example — no heap, no barrier, and a
-// printed 0.00 ms that was a folded-away loop rather than a fast one; see
-// `benchCircuitBreaker` for what changed.
+// Deliberately deterministic: no sockets, no wall-clock deadlines, and a
+// `Manual` clock wherever anything schedules. Every harness heap-allocates the
+// structure it drives and feeds each result through `std.mem.doNotOptimizeAway`,
+// so LLVM cannot conclude the address never escapes and delete the loop it is
+// supposed to be timing. The `CircuitBreaker x*` metrics above used to be the
+// counter-example — no heap, no barrier, and a printed 0.00 ms that was a
+// folded-away loop rather than a fast one; see `benchCircuitBreaker` for what
+// changed.
+//
+// The one exception to "no threads" is `Worker spawn+join`, and it is the point
+// of that metric: a worker's lifecycle *is* thread creation, so that harness
+// creates real threads on a real started runtime and is orders of magnitude
+// slower than the lock-free primitives around it. Everything else in this group
+// runs on the calling thread only, which is what keeps it in the
+// nanoseconds-per-operation band and repeatable on a loaded host.
 // ─────────────────────────────────────────────────
 
 const rt = zigmodu.runtime;
@@ -270,6 +278,64 @@ fn benchMailbox(io: std.Io, allocator: std.mem.Allocator, count: usize) !f64 {
         while (mailbox.tryRecv() != null) {}
     }
     return elapsedMs(t0);
+}
+
+/// Backpressure reject path: `count` posts into a mailbox that is already full,
+/// every one of which must come back `error.Full`.
+///
+/// Filling the mailbox is fixture, not measurement. The timed loop takes the
+/// branch a production producer takes once its consumer stops keeping up:
+/// `tryPush` fails, the ring's and the mailbox's drop counters bump, the error
+/// returns. Nothing on that path can allocate — `send` does not even take an
+/// allocator, the queue storage is inside the mailbox — and nothing blocks, so
+/// this is the per-message price of refusing work. It is measured at 10x the
+/// scale of the accepted path above for that reason: a reject is an order of
+/// magnitude cheaper than a hand-off, so 1M of them is a 2 ms sample — above the
+/// 2 ms floor but under the 5 ms this suite sizes a new metric at (see
+/// `scripts/check-bench.sh`), where the 2.0x window is narrower than the wobble
+/// it is meant to see past. 10M puts it at ~21 ms.
+///
+/// The mailbox is the only thing here that needs memory, and it is built through
+/// a `FailingAllocator` that is armed to refuse the next request before the timed
+/// loop starts: the "no allocation on the reject path" guarantee is structural
+/// (`send` has no allocator to allocate with), and this is what makes it an
+/// executed tripwire too — a reject path that grew a retry queue, a heap-backed
+/// error log or a metrics buffer would fail this harness rather than merely
+/// measure slower. The counter delta is checked afterwards for the same reason,
+/// so a loop the optimizer folded away fails the run instead of recording a fast
+/// number.
+fn benchMailboxFull(io: std.Io, count: usize) !f64 {
+    const M = rt.Mailbox(u64, 256);
+    var probe = WorkerAllocProbe.init(harness_allocator, .{});
+    const mailbox = try probe.allocator().create(M);
+    defer probe.allocator().destroy(mailbox);
+    mailbox.* = M.init(io);
+
+    var posted: usize = 0;
+    while (mailbox.send(posted)) |_| {
+        posted += 1;
+    } else |err| switch (err) {
+        error.Full => {}, // the queue is full: the loop below measures this path
+        else => return err,
+    }
+    if (posted != mailbox.maxMessages()) return error.BenchMailboxNotFull;
+    const dropped_before = mailbox.stats().dropped_full;
+
+    // Armed from here on: the next allocation through this allocator fails.
+    probe.fail_index = probe.alloc_index;
+    const t0 = now();
+    for (0..count) |_| {
+        mailbox.send(0) catch |err| switch (err) {
+            error.Full => continue,
+            else => return err, // Closed/Timeout is a different path, not this metric
+        };
+        return error.BenchMailboxAcceptedWhenFull;
+    }
+    const ms = elapsedMs(t0);
+    probe.fail_index = std.math.maxInt(usize);
+
+    if (mailbox.stats().dropped_full - dropped_before != count) return error.BenchMailboxRejectsNotCounted;
+    return ms;
 }
 
 const TimerFireCounter = struct {
@@ -372,6 +438,93 @@ fn benchSequencer(allocator: std.mem.Allocator, count: usize) !f64 {
     const t0 = now();
     for (0..count) |_| std.mem.doNotOptimizeAway(seq.next());
     return elapsedMs(t0);
+}
+
+/// Mailbox capacity for the lifecycle harness. Small on purpose: `MpscRing.init`
+/// seeds every slot at comptime and this harness pays for one mailbox per turn.
+const bench_worker_mailbox_capacity = 8;
+
+/// The allocator both allocation-sensitive runtime harnesses run through, with a
+/// tripwire on it: every allocation and resize routed through it is counted, and
+/// `fail_index` can be moved to the current count so the next allocation fails
+/// outright.
+///
+/// `spawn` is the one timed loop in this file that *must* allocate — a heap
+/// handle, an entry in the runtime's worker list, a thread — so "no allocation
+/// on the hot path" cannot mean "no allocation in the loop" here. What it does
+/// mean is that the *graceful stop* half allocates nothing, and this probe is how
+/// that is asserted instead of assumed: a `stop`/`join` that allocated anything
+/// (a fresh handle, a re-registration, a logged error built on the heap) fails the
+/// run rather than quietly inflating the number. `std.testing.FailingAllocator`
+/// rather than a local vtable — it already counts allocations, exposes the
+/// counters, and can be armed mid-run; the framework uses it the same way
+/// elsewhere (`src/core/ModuleRegistry.zig`).
+const WorkerAllocProbe = std.testing.FailingAllocator;
+
+/// A worker with nothing to do: it declares a message type and an `init` hook so
+/// a lifecycle turn covers the whole contract (thread, mailbox, hook, receive
+/// loop), and so the cost it reports is the plumbing rather than a handler.
+const BenchNoopWorker = struct {
+    pub const Message = u64;
+    seen: u64 = 0,
+
+    pub fn init(self: *@This(), ctx: anytype) anyerror!void {
+        _ = ctx;
+        self.seen = 0;
+    }
+
+    pub fn handle(self: *@This(), msg: u64, ctx: anytype) anyerror!void {
+        _ = ctx;
+        self.seen +%= msg;
+    }
+};
+
+/// Worker lifecycle: `count` spawn → `stop` → `join` turns on one started
+/// runtime, then a runtime shutdown that must report nothing left alive.
+///
+/// A turn is the whole graceful cycle, not just the start: the thread is created,
+/// the handle and its mailbox come off the heap, the optional `init` hook runs,
+/// `stop()` closes the mailbox and sets the stop flag, the worker leaves its
+/// receive loop and runs its optional `deinit`, and `join()` reaps the thread.
+/// The probe is armed across the stop half (see `WorkerAllocProbe`); the start
+/// half is expected to allocate and does.
+///
+/// The runtime is started on a `Manual` clock, so the ticker thread runs as it
+/// would in production without anything actually reading the wall clock, and the
+/// handles are deliberately left registered as the loop goes: by the end the
+/// worker list holds all `count` of them, which is what makes the closing
+/// `shutdown()` a real check that the runtime reclaims every one of them
+/// (`workers` and `running` back to 0, the acceptance line this metric exists
+/// for) rather than a formality over an empty list.
+fn benchWorkerSpawnJoin(io: std.Io, count: usize) !f64 {
+    var clk = rt.Clock.Manual{ .now_ms = 0 };
+    var probe = WorkerAllocProbe.init(harness_allocator, .{});
+    var rtx = rt.Runtime.init(probe.allocator(), io, .{ .manual = &clk });
+    defer rtx.deinit();
+    try rtx.start();
+
+    const t0 = now();
+    for (0..count) |_| {
+        const handle = try rtx.spawn(BenchNoopWorker, .{}, bench_worker_mailbox_capacity);
+        // The start half just allocated, as it must. From here to the end of the
+        // turn: any allocation through the runtime's allocator fails, and the
+        // counters are compared as well, so an allocation added to the stop path
+        // — including a `resize`/`remap` growth that `fail_index` does not cover —
+        // fails the run instead of hiding as a slightly slower sample.
+        probe.fail_index = probe.alloc_index;
+        const allocations_before = probe.alloc_index + probe.resize_index;
+        handle.stop();
+        handle.join();
+        probe.fail_index = std.math.maxInt(usize);
+        if (probe.alloc_index + probe.resize_index != allocations_before) return error.BenchStopPathAllocated;
+        std.mem.doNotOptimizeAway(handle.state.seen);
+    }
+    const ms = elapsedMs(t0);
+
+    rtx.shutdown();
+    const s = rtx.stats();
+    if (s.workers != 0 or s.running != 0) return error.BenchRuntimeLeakedWorkers;
+    return ms;
 }
 
 fn benchWorkflow(allocator: std.mem.Allocator, io: std.Io, steps_count: usize, iterations: usize) !f64 {
@@ -516,9 +669,13 @@ pub fn main(init: std.process.Init) !void {
     }
 
     std.debug.print("\n-- Runtime (worker plumbing) --\n", .{});
-    // One scale per primitive: in a ReleaseFast build these land at 6-22 ms, which
+    // One scale per primitive: in a ReleaseFast build these land at 6-29 ms, which
     // is stable enough to threshold, and a second scale would double both CI time
-    // and the number of thresholds the gate has to hold.
+    // and the number of thresholds the gate has to hold. The two metrics that are
+    // not a lock-free primitive — `Worker spawn+join` (thread creation) and
+    // `Mailbox full-path` (a refusal, an order of magnitude cheaper per turn than
+    // the hand-off above and so given 10x the turns) — are each still one
+    // primitive, not a second scale of something already in the group.
     {
         const name = "RingBuffer SPSC x1M";
         const ms = try median3(name, benchRingBuffer, .{ a, 1_000_000 });
@@ -530,6 +687,12 @@ pub fn main(init: std.process.Init) !void {
         const ms = try median3(name, benchMailbox, .{ io, a, 1_000_000 });
         try results.append(a, .{ .name = name, .value = ms });
         std.debug.print("  {s}  {d:.2} ms  ({d:.0} messages/s)\n", .{ name, ms, 1_000_000.0 / ms * 1000.0 });
+    }
+    {
+        const name = "Mailbox full-path x10M";
+        const ms = try median3(name, benchMailboxFull, .{ io, 10_000_000 });
+        try results.append(a, .{ .name = name, .value = ms });
+        std.debug.print("  {s}  {d:.2} ms  ({d:.0} rejects/s)\n", .{ name, ms, 10_000_000.0 / ms * 1000.0 });
     }
     {
         const name = "TimerWheel x100K";
@@ -555,6 +718,12 @@ pub fn main(init: std.process.Init) !void {
         const ms = try median3(name, benchSequencer, .{ a, 10_000_000 });
         try results.append(a, .{ .name = name, .value = ms });
         std.debug.print("  {s}  {d:.2} ms  ({d:.0} stamps/s)\n", .{ name, ms, 10_000_000.0 / ms * 1000.0 });
+    }
+    {
+        const name = "Worker spawn+join x1K";
+        const ms = try median3(name, benchWorkerSpawnJoin, .{ io, 1000 });
+        try results.append(a, .{ .name = name, .value = ms });
+        std.debug.print("  {s}  {d:.2} ms  ({d:.0} cycles/s)\n", .{ name, ms, 1000.0 / ms * 1000.0 });
     }
 
     // Emit bench-results.json for CI baseline tracking

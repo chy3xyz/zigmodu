@@ -122,6 +122,16 @@
 # recording, inside 1.01-1.13x per run — so read a ratio near 1.4x on it as that
 # band, not as a regression in the code it covers.
 #
+# Re-recorded again after v0.27.0, without `--force`, to add the two rows the
+# runtime acceptance list was still missing: `Worker spawn+join x1K` (worker
+# start plus graceful stop, asserting no leaked worker) and
+# `Mailbox full-path x10M` (the rejection path as a number — a full mailbox
+# costs `error.Full`, and this is what that costs). `--update` rewrites every
+# entry, so the untouched 23 moved as well: 21 tightened (max -18.0%,
+# `validateModules x10K`) and two drifted up by noise (+0.9%
+# `TimerWheel x100K`, +0.5% `ObjectPool x1M`). Nothing was add+dropped, so the
+# ratchet only moved where the machine did.
+#
 # Re-record it
 # with the same command whenever a metric is added, a slowdown is accepted on
 # purpose, or the machine class changes. It is an absolute-time baseline, so it
@@ -139,7 +149,7 @@
 #                                    BENCH_BASELINE at it.
 #
 # The gap is not small: on the same code the runner measures ~1.3x the laptop
-# (CircuitBreaker x10M 6.57 ms vs ~10.9 ms; all 23 metrics scale together).
+# (CircuitBreaker x10M 6.57 ms vs ~10.9 ms; every metric scales together).
 # Gating CI against the laptop baseline left only ~18% of headroom under the
 # 2.0x threshold and produced a false red on a commit that touched nothing but a
 # shell script. Each class now ratchets against its own reference and keeps the

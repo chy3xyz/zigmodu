@@ -2,116 +2,126 @@
   {
     "name": "scanModules x100K",
     "unit": "ms",
-    "value": 9.178
+    "value": 7.941
   },
   {
     "name": "scanModules x1M",
     "unit": "ms",
-    "value": 91.851
+    "value": 77.915
   },
   {
     "name": "validateModules x10K",
     "unit": "ms",
-    "value": 8.586
+    "value": 7.042
   },
   {
     "name": "validateModules x100K",
     "unit": "ms",
-    "value": 84.194
+    "value": 72.498
   },
   {
     "name": "App lifecycle x3K",
     "unit": "ms",
-    "value": 9.961
+    "value": 9.177
   },
   {
     "name": "workflow 20-step x5K",
     "unit": "ms",
-    "value": 18.781
+    "value": 18.298
   },
   {
     "name": "1L x10M events",
     "unit": "ms",
-    "value": 21.313
+    "value": 20.874
   },
   {
     "name": "10L x1M events",
     "unit": "ms",
-    "value": 12.517
+    "value": 12.36
   },
   {
     "name": "100L x100K events",
     "unit": "ms",
-    "value": 12.315
+    "value": 12.222
   },
   {
     "name": "CircuitBreaker x10M",
     "unit": "ms",
-    "value": 6.571
+    "value": 6.385
   },
   {
     "name": "CircuitBreaker x100M",
     "unit": "ms",
-    "value": 64.488
+    "value": 63.047
   },
   {
     "name": "RateLimiter x1M",
     "unit": "ms",
-    "value": 53.43
+    "value": 51.549
   },
   {
     "name": "RateLimiter x10M",
     "unit": "ms",
-    "value": 346.481
+    "value": 335.643
   },
   {
     "name": "10 checks x100K",
     "unit": "ms",
-    "value": 13.001
+    "value": 12.617
   },
   {
     "name": "100 checks x10K",
     "unit": "ms",
-    "value": 15.537
+    "value": 15.458
   },
   {
     "name": "findById x20K",
     "unit": "ms",
-    "value": 13.795
+    "value": 12.709
   },
   {
     "name": "findById x10K",
     "unit": "ms",
-    "value": 6.894
+    "value": 6.211
   },
   {
     "name": "RingBuffer SPSC x1M",
     "unit": "ms",
-    "value": 10.55
+    "value": 10.471
   },
   {
     "name": "Mailbox post+drain x1M",
     "unit": "ms",
-    "value": 16.781
+    "value": 16.694
+  },
+  {
+    "name": "Mailbox full-path x10M",
+    "unit": "ms",
+    "value": 21.913
   },
   {
     "name": "TimerWheel x100K",
     "unit": "ms",
-    "value": 6.75
+    "value": 6.808
   },
   {
     "name": "HotBus 8sub x1M",
     "unit": "ms",
-    "value": 16.952
+    "value": 16.877
   },
   {
     "name": "ObjectPool x1M",
     "unit": "ms",
-    "value": 15.246
+    "value": 15.327
   },
   {
     "name": "Sequencer x10M",
     "unit": "ms",
-    "value": 21.961
+    "value": 21.389
+  },
+  {
+    "name": "Worker spawn+join x1K",
+    "unit": "ms",
+    "value": 29.37
   }
 ]

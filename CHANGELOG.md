@@ -72,6 +72,42 @@ referenced by: clock_gettime -> monotonicNow: src/core/Time.zig:46
 **残留**：CI 基线录自某一个 runner 实例，换到明显更慢的实例仍可能逼近 2.0×；
 这比修前（仅 18% 余量）稳健得多，真出现时按脚本提示重录，不要调阈值。
 
+### 补齐 Runtime 验收表仅剩的两行：worker 启停 + 背压路径
+
+外部 review 给了一份 "v0.28 Runtime Foundation" 提案，要求新建 `src/runtime/` 下的
+Worker / Mailbox / RingBuffer / HotEventBus / Clock / Supervisor 等。**核对后确认这些在
+v0.16/v0.17 就已交付**：`docs/RUNTIME.md` §9 的 roadmap 逐条对得上，`src/runtime/` 下已有
+`runtime.zig` / `ring.zig` / `mailbox.zig` / `hot_bus.zig` / `timer_wheel.zig` / `clock.zig` /
+`object_pool.zig` / `sequencer.zig`，`app.runtime()` 在 `Application.zig:274`。按提案字面
+实施等于造第二套平行 runtime（正是该提案自己原则 2 所禁止），所以只做真正缺的部分。
+
+**两条 benchmark** —— 提案 §19 验收表里仅剩未覆盖的行：
+
+| 指标 | 实测（本机） | 覆盖的验收行 |
+|---|---|---|
+| `Worker spawn+join x1K` | 29.51 ms | worker startup / shutdown / 无泄漏 worker |
+| `Mailbox full-path x10M` | 21.80 ms | Queue full → bounded（背压拒绝路径的成本）|
+
+`Worker spawn+join x1K` 把运行时的分配器换成 `FailingAllocator` 并武装在 stop/join 半段，
+比对 `alloc_index + resize_index`（`fail_index` 盖不住 `resize`/`remap` 增长），任何被加进停机
+路径的分配都会直接失败，而不是变成一个稍慢的样本；循环结束后再断言
+`stats().workers == 0 and running == 0`。`spawn` 本身必然分配，这一点没有假装。
+
+提案 §19 其余各行本已满足：RingBuffer / Mailbox / HotBus 的收发路径**不接受 allocator 形参**
+（固定容量，结构上不可能分配）；队列满、运行时停机、多线程竞态都有现成单测
+（`RingBuffer moves values between two threads without loss`、
+`Mailbox: many producers, one consumer, nothing lost`、`MpscRing accepts many producers`、
+`Runtime: shutdown joins every worker and reports stats`）。
+
+**文档**：README 的 Features 此前**完全没有 runtime 这一层**（`grep -i runtime` 只命中
+"Agent Runtime" 与 "runtime error"）。补了「两种执行模型」的定位句、`### High-Performance
+Runtime` 能力清单（Worker / Mailbox / RingBuffer / MpscRing / HotBus / TimerWheel / Clock /
+Supervision / 指标桥），以及 Project Structure 里的 `src/runtime/`。英文 README 仍无中文。
+
+**基线**：本机基线重录（23 → 25；无改名，21 条收紧、2 条 +0.9% / +0.5% 噪声漂移）。
+**CI 基线 `scripts/bench-baseline.ci.json` 尚未包含这两条** —— 该文件只能在真实 runner 上录，
+补录前 CI 对这种"基线不认识的指标"只报 WARN（不失败）。
+
 ## [0.27.0] - 2026-09-18
 
 ### 修复：`zmodu scaffold` 生成的工程过不了自己的 `zmodu ci`

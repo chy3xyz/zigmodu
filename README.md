@@ -30,6 +30,14 @@ A modular application framework for Zig 0.17, inspired by Spring Modulith. Build
 
 ## ✨ Features
 
+ZigModu provides two complementary execution models. Adopt either one, or both:
+
+1. **Application Runtime** — modules, DI, HTTP, events, data, security. The default;
+   nothing here changes if you never touch the second one.
+2. **High-Performance Runtime** — workers, mailboxes, lock-free queues, hot events,
+   timers. Opt-in via `app.runtime()`; an app that never calls it spawns no extra
+   threads. See [Runtime](docs/RUNTIME.md).
+
 ### Core Framework
 - **Module System** — Declarative module definition with compile-time dependency validation
 - **Lifecycle Management** — Automatic init/deinit orchestration in dependency order; modules opt into framework facilities via `initWith(ctx)`
@@ -104,6 +112,28 @@ A modular application framework for Zig 0.17, inspired by Spring Modulith. Build
 - **`ensureTotalCapacity`** — Pre-allocate HashMap/ArrayList in 4 hot-path containers
 - **`@branchHint`** — Hot-path hints on CircuitBreaker + RateLimiter
 - **Path Rewriter** — Pre-routing URL transformation (ThinkPHP compat, prefix stripping)
+
+### High-Performance Runtime
+
+Opt-in via `app.runtime()` — see [docs/RUNTIME.md](docs/RUNTIME.md) and the
+[runtime-workers example](examples/runtime-workers).
+
+- **Worker** — One struct with `handle` (per-message) or `run` (long-lived loop); the
+  runtime owns its thread, its mailbox and its lifecycle (`init`/`deinit` run once,
+  shutdown joins every worker)
+- **Mailbox** — Bounded blocking hand-off between threads; a full mailbox is
+  `error.Full` at the producer, never an unbounded grow (**backpressure below HTTP**)
+- **RingBuffer (SPSC)** — Lock-free, cache-line-separated indices, fixed capacity
+- **MpscRing** — Vyukov many-producer/single-consumer queue (per-producer order kept)
+- **HotBus** — L0 fan-out into worker mailboxes; frozen after construction, so `publish`
+  takes no lock and allocates nothing; drops on full and counts it
+- **TimerWheel** — Hierarchical O(1) schedule/cancel; lateness surfaces as
+  `timer_lag_max_ms`
+- **Clock** — Injectable time source (`monotonic` in production, `manual` in tests/replay)
+- **Supervision** — Per-worker failure policy: fail-fast, or a bounded error budget
+  inside a window, plus an `onError` hook to decide on the spot
+- **Runtime metrics** — `RuntimeStats` + `MetricsBridge`, which publishes
+  `zigmodu_runtime_*` gauges; drops and timer lag are invisible from the HTTP side
 
 ### Developer Experience
 - **Architecture Tester** — Compile-time dependency rule validation
@@ -373,6 +403,15 @@ zigmodu/
 │   │   ├── HotReloader.zig            # File-watch hot reload
 │   │   ├── PluginManager.zig          # Dynamic plugin system
 │   │   └── ...
+│   ├── runtime/                       # High-performance runtime (opt-in)
+│   │   ├── runtime.zig                # Runtime, Worker, supervision, stats
+│   │   ├── ring.zig                   # RingBuffer (SPSC) + MpscRing (Vyukov)
+│   │   ├── mailbox.zig                # Bounded blocking mailbox (backpressure)
+│   │   ├── hot_bus.zig                # L0 fan-out, frozen after construction
+│   │   ├── timer_wheel.zig            # Hierarchical timer wheel
+│   │   ├── clock.zig                  # Injectable time source
+│   │   ├── object_pool.zig            # Fixed-capacity reuse pool
+│   │   └── sequencer.zig              # Lock-free sequence numbers
 │   ├── http/                          # HTTP & API
 │   │   ├── HttpClient.zig             # HTTP client with pooling
 │   │   ├── Idempotency.zig            # Request deduplication middleware
