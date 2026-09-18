@@ -1,5 +1,28 @@
 # Changelog
 
+## [Unreleased]
+
+### 修复：v0.27.0 的提交过不了自己的 `check-version.sh`
+
+**背景**：`tools/zmodu/src/incremental.zig` 的两个测试把 `saveManifest(…, zmodu_version)`
+的 fixture 值写成了当时的版本字面量 `"0.26.0"`。`scripts/check-version.sh` 会扫 `tools/`
+下的 `0.x.y` 字面量并判为硬编码版本 —— 版本一 bump 到 0.27.0，这个闸门就红了。
+它**只在 CI 里跑**（`ci.yml` 的 "Version consistency"），不在 `release.sh` 的闸门清单里，
+于是本地发布全绿、推上去才红。
+
+**修法**
+
+- 两处 fixture 改成无版本含义的 `"test"`（测试只做 manifest 往返，不断言该字段的值）。
+  生产侧本来就是对的：`main.zig:6301` 传的是 `ZMODU_VERSION`（源自 `build.zig.zon`）。
+- `release.sh` 的闸门清单补齐为 **CI 阻断项的并集**：新增 `check-version.sh`、
+  `check-tenant-scope.sh`、`zig build check-api`、`zig build check`（后者内部跑
+  `check-production.sh`）。"本地绿、CI 红"的发布事故因此不会复发。
+- scaffold 的 `zigmodu_zon_hash` 刷新到 **v0.27.0**
+  （`zigmodu-0.27.0-U40vs9t8UgBlmRaJ7WNawmUCr_LZFk9H1XrKU44bvHk1`）。该 hash 必须在 tag
+  存在之后才能算出，所以每次发布后都要补这一手；滞后期间 `check-version.sh` 只报 WARN
+  （设计如此）。验证不看 hash 像不像，而是**真编译**一个钉住该 URL+hash 的生成工程，
+  `zig build` exit 0 才算数。
+
 ## [0.27.0] - 2026-09-18
 
 ### 修复：`zmodu scaffold` 生成的工程过不了自己的 `zmodu ci`

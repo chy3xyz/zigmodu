@@ -90,11 +90,18 @@ if ! grep -q "v$VERSION" docs/EVALUATION_REPORT.md || ! grep -q "v$VERSION" docs
     exit 1
 fi
 
-# 3. Quality gates.
+# 3. Quality gates. Keep this list a superset of what ci.yml blocks on: a gate
+#    that only CI runs can reject the very tag this script is about to cut.
+#    v0.27.0 shipped that way — `check-version.sh` was missing here and failed
+#    the "Version consistency" step minutes after the tag was pushed.
 echo "-- gates --"
 zig fmt --check src tools examples
 ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test --summary all
 bash scripts/check-deadcode.sh
+bash scripts/check-version.sh
+bash scripts/check-tenant-scope.sh
+zig build check-api
+zig build check
 
 # 4. Commit + tag.
 git add -A

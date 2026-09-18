@@ -187,7 +187,11 @@ test "manifest round-trips through saveManifest/loadManifest" {
         .{ .path = "build.zig.zon", .hash = sha256Hex("zon") },
         .{ .path = ".claude/skills/a/SKILL.md", .hash = sha256Hex("skill") },
     };
-    try saveManifest(allocator, io, dir, &entries, "0.26.0");
+    // Any string works here — the manifest only stores it. Deliberately not
+    // version-shaped: a `0.x.y` literal in this package reads as a hard-coded
+    // release version to `scripts/check-version.sh` and fails the gate on the
+    // next bump.
+    try saveManifest(allocator, io, dir, &entries, "test");
 
     var manifest = loadManifest(allocator, io, dir);
     defer freeManifest(allocator, &manifest);
@@ -229,7 +233,7 @@ test "isUnchanged tells our file from an edited one" {
         .{ .path = "model.zig", .hash = sha256Hex(original) },
         .{ .path = "missing.zig", .hash = sha256Hex("gone") },
     };
-    try saveManifest(allocator, io, dir, &entries, "0.26.0");
+    try saveManifest(allocator, io, dir, &entries, "test");
 
     var manifest = loadManifest(allocator, io, dir);
     defer freeManifest(allocator, &manifest);
