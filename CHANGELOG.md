@@ -105,8 +105,11 @@ Runtime` 能力清单（Worker / Mailbox / RingBuffer / MpscRing / HotBus / Time
 Supervision / 指标桥），以及 Project Structure 里的 `src/runtime/`。英文 README 仍无中文。
 
 **基线**：本机基线重录（23 → 25；无改名，21 条收紧、2 条 +0.9% / +0.5% 噪声漂移）。
-**CI 基线 `scripts/bench-baseline.ci.json` 尚未包含这两条** —— 该文件只能在真实 runner 上录，
-补录前 CI 对这种"基线不认识的指标"只报 WARN（不失败）。
+CI 基线随后从真实 runner 补录了这 2 条（`Mailbox full-path x10M` 49.44 ms、
+`Worker spawn+join x1K` 44.88 ms），**其余 23 条原样未动** —— 该轮 runner 比上一轮慢约 1.19×
+（23 条的中位比值 1.19×，范围 0.97–1.50×），整份重录会把当天 runner 的速度烙进棘轮。
+另记一条实测观察：`RingBuffer SPSC x1M` 是唯一**不随机器缩放**的指标（runner 1.09 ms vs
+本机 10.6 ms，慢机器上反而更快），所以跨这两份基线比较它没有意义。
 
 ## [0.27.0] - 2026-09-18
 

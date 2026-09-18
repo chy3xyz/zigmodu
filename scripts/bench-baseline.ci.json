@@ -95,6 +95,11 @@
     "value": 15.35
   },
   {
+    "name": "Mailbox full-path x10M",
+    "unit": "ms",
+    "value": 49.44
+  },
+  {
     "name": "TimerWheel x100K",
     "unit": "ms",
     "value": 6.87
@@ -113,5 +118,10 @@
     "name": "Sequencer x10M",
     "unit": "ms",
     "value": 20.61
+  },
+  {
+    "name": "Worker spawn+join x1K",
+    "unit": "ms",
+    "value": 44.88
   }
 ]

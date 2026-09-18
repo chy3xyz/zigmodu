@@ -156,6 +156,20 @@
 # full 2.0x sensitivity. `--update` writes whichever file BENCH_BASELINE
 # selects, so refreshing the CI baseline means: run the gate on the runner,
 # `--update`, then review the diff.
+#
+# Two caveats when reading or refreshing the CI file:
+#
+#   * Do not blanket `--update` it. Every runner is its own machine class: the
+#     numbers in it came from a runner that measured ~1.19x the one before
+#     (median over 23 metrics, range 0.97-1.50x on unchanged code), so a full
+#     re-record bakes that day's runner speed into the ratchet. Add the metrics
+#     you are introducing and leave the rest alone.
+#   * `RingBuffer SPSC x1M` is the one metric that does not scale with the
+#     machine: 1.09 ms on the runner vs ~10.6 ms on the laptop — *faster* on the
+#     slower box. Each baseline holds its own side's value, and comparing this
+#     metric across the two is meaningless: a laptop run against the CI file
+#     fails on it and on nothing else (9.96x). Read that as a platform
+#     difference, not a regression.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
