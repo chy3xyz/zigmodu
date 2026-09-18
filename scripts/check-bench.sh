@@ -128,10 +128,28 @@
 # only transfers to a machine of comparable speed — re-record it on the runner
 # that will check it (`--update`, then review the diff) rather than widening
 # BENCH_THRESHOLD.
+#
+# Two baselines exist because there are two machine classes, and one absolute
+# baseline cannot serve both:
+#
+#   scripts/bench-baseline.json      recorded on the maintainer's laptop
+#                                    (M1 Pro, load 9-13) — the default, local.
+#   scripts/bench-baseline.ci.json   recorded *from* a green CI run on
+#                                    ubuntu-latest; ci.yml points
+#                                    BENCH_BASELINE at it.
+#
+# The gap is not small: on the same code the runner measures ~1.3x the laptop
+# (CircuitBreaker x10M 6.57 ms vs ~10.9 ms; all 23 metrics scale together).
+# Gating CI against the laptop baseline left only ~18% of headroom under the
+# 2.0x threshold and produced a false red on a commit that touched nothing but a
+# shell script. Each class now ratchets against its own reference and keeps the
+# full 2.0x sensitivity. `--update` writes whichever file BENCH_BASELINE
+# selects, so refreshing the CI baseline means: run the gate on the runner,
+# `--update`, then review the diff.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-BASELINE=scripts/bench-baseline.json
+BASELINE="${BENCH_BASELINE:-scripts/bench-baseline.json}"
 THRESHOLD="${BENCH_THRESHOLD:-2.0}"
 
 MODE=check

@@ -674,6 +674,15 @@ jobs:
         # If the runner is *systematically* slower than wherever the baseline was
         # recorded, re-record it (`bash scripts/check-bench.sh --update`, then
         # review the diff) — do not raise BENCH_THRESHOLD to make it pass.
+        #
+        # BENCH_BASELINE: gate the runner against numbers recorded *on this
+        # runner class*, not the maintainer's laptop. One absolute-time baseline
+        # cannot serve both — on identical code ubuntu-latest measures ~1.3x the
+        # M1 Pro it was recorded on (6.57 ms vs ~10.9 ms for CircuitBreaker x10M,
+        # all 23 metrics scaling together), which left ~18% of headroom under the
+        # 2.0x threshold and reddened a commit that changed only a shell script.
+        env:
+          BENCH_BASELINE: scripts/bench-baseline.ci.json
         run: bash scripts/check-bench.sh
 
   # ── Docker Build ──────────────────────────────

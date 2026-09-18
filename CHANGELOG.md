@@ -40,6 +40,38 @@ referenced by: clock_gettime -> monotonicNow: src/core/Time.zig:46
 **验证方式**：不靠"推上去看 CI"，而是本地用 `-target x86_64-linux-gnu` 跑同一份分析：
 去掉 `-lc` 精确复现了 CI 的报错与调用链，加上 `-lc` 后 3/3 通过。
 
+### 修复：Benchmark 闸门拿本机基线卡 CI —— 拆成两份基线
+
+`ci.yml` 的 "Performance gate" 在 `88f082b` 上失败，报 CircuitBreaker 两个指标慢
+2.14× / 2.18× —— 而该提交只改了一个 shell 脚本和 CHANGELOG。真因是**基线录制机器与
+闸门运行机器不是同一台**：`scripts/bench-baseline.json` 录在维护者的 M1 Pro 上，
+闸门却跑在 ubuntu-latest 上。
+
+同一份代码，三次测量：
+
+| 指标 | 本机基线 | 上一轮 CI（绿） | 本轮 CI（红） |
+|---|---|---|---|
+| CircuitBreaker x10M | 6.571 ms | 10.91 ms（1.66×） | 14.055 ms（2.14×） |
+| CircuitBreaker x100M | 64.488 ms | 109.08 ms（1.69×） | 140.551 ms（2.18×） |
+
+绿的那轮已经只剩约 18% 余量；而本轮 **23 个指标在同一次 CI 内部一致地慢约 1.3×** ——
+这是整台机器档位的速度差，不是任何单个指标的回归。
+
+**修法**：绝对时间基线不可能同时服务两个硬件档位，所以一档一份：
+
+- `scripts/bench-baseline.json` —— 本机（默认）
+- `scripts/bench-baseline.ci.json` —— **从一次绿的 CI run 的数字录成**，`ci.yml` 用
+  `BENCH_BASELINE` 指过去
+
+`check-bench.sh` 的 `BASELINE` 改为 `${BENCH_BASELINE:-scripts/bench-baseline.json}`，
+`--update` 写哪一份由它决定。**阈值不动**（仍是 2.0×），两档各自保持满灵敏度。
+
+**验证**：拿失败那轮的 23 个指标去比 CI 基线，比值全部落在 **1.21–1.36×**（最大 1.36×），
+即修好后那一轮会通过；本机默认路径仍 exit 0。
+
+**残留**：CI 基线录自某一个 runner 实例，换到明显更慢的实例仍可能逼近 2.0×；
+这比修前（仅 18% 余量）稳健得多，真出现时按脚本提示重录，不要调阈值。
+
 ## [0.27.0] - 2026-09-18
 
 ### 修复：`zmodu scaffold` 生成的工程过不了自己的 `zmodu ci`
