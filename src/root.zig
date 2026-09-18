@@ -231,12 +231,14 @@ pub const AccrualFailureDetector = @import("core/cluster/FailureDetector.zig").A
 pub const SagaOrchestrator = @import("core/SagaOrchestrator.zig").SagaOrchestrator;
 /// Persisted saga log — the recovery point for crash resume.
 pub const SagaLog = @import("core/SagaOrchestrator.zig").SagaLog;
-/// Saga state: running / completed / compensating / failed.
+/// Saga state: running / completed / compensating / failed / timed_out.
 pub const SagaStatus = @import("core/SagaOrchestrator.zig").SagaStatus;
 /// Saga-pattern transactions: forward steps, reverse-order compensation.
 pub const DistributedTransactionManager = @import("core/DistributedTransaction.zig").DistributedTransactionManager;
 /// 2PC coordinator: tracks each transaction's prepare/commit decision.
 pub const TwoPhaseCommit = @import("core/DistributedTransaction.zig").TwoPhaseCommit;
+/// Durable 2PC coordinator journal (`record` / `recover`, `data.SqlxBackend`).
+pub const TransactionJournal = @import("core/TransactionJournal.zig").TransactionJournal;
 /// Declarative transaction wrapper (Spring `@Transactional` style).
 pub const Transactional = @import("core/Transactional.zig").Transactional;
 /// Routes a tenant id to the correct database connection pool.

@@ -38,6 +38,13 @@ ZENT_DEV_TOKEN=1 HTTP_PORT=18100 zig build run
 bash examples/zent-modulith/smoke.sh          # 默认 :18111，可传端口
 ```
 
+示例没有 zig test 块，`zig build test` 就是跑这个脚本（先装好二进制，
+脚本自己再 build 一次的行为用 `ZENT_SMOKE_SKIP_BUILD=1` 跳过）：
+
+```bash
+cd examples/zent-modulith && zig build test
+```
+
 
 ```bash
 # 1) mint a tenant-1 token (dev mint; see above)

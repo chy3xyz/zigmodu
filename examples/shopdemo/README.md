@@ -12,6 +12,13 @@ zig build run
 
 The server listens on `0.0.0.0:8080` by default (override with `HTTP_PORT=...`).
 
+### Tests
+
+```bash
+cd examples/shopdemo
+zig build test    # order module + architecture tests (tests.zig is the test root)
+```
+
 ### Smoke test
 
 ```bash
@@ -31,6 +38,7 @@ curl -s http://127.0.0.1:8080/health/live
 | `src/db/backend.zig` | Shared `*data.Client` backend alias |
 | `src/db/schema.zig` | SQLite DDL for the single `zmodu_order` table |
 | `src/modules/order/` | The `order` module migrated from `generated-sample/` |
+| `tests.zig` | Test root for `zig build test` — pulls in the generated `test.zig` / `_arch_test.zig` |
 
 ## Generating the full project
 

@@ -1003,3 +1003,92 @@ test "real loopback replication: sync AppendEntries and same-connection replies"
     });
     try testing.expectEqual(@as(u64, 3), b_raft.getTerm());
 }
+
+test "real loopback catch-up: empty-log follower converges via per-peer nextIndex" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    if (!@import("../../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var a_impl: ElectionTransportImpl = undefined;
+    var b_impl: TransportImpl(1) = undefined;
+    var a_raft: RaftElection = undefined;
+    var b_raft: RaftElection = undefined;
+    var b_inbound: InboundServer = undefined;
+    var b_thread: std.Thread = undefined;
+
+    var impls_up: u8 = 0;
+    var rafts_up: u8 = 0;
+    var servers_up: u8 = 0;
+    defer {
+        if (impls_up >= 2) a_impl.deinit();
+        if (impls_up >= 1) b_impl.deinit();
+    }
+    defer {
+        if (rafts_up >= 2) a_raft.deinit();
+        if (rafts_up >= 1) b_raft.deinit();
+    }
+    defer if (servers_up >= 1) stopInbound(io, &b_inbound, &b_thread);
+
+    b_impl.init(allocator, io, &b_raft);
+    impls_up = 1;
+    const b_port = try startInbound(allocator, io, &b_raft, &b_impl.addresses, 19640, &b_inbound, &b_thread);
+    servers_up = 1;
+    const b_endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{b_port});
+    defer allocator.free(b_endpoint);
+
+    a_impl.init(allocator, io, &a_raft);
+    impls_up = 2;
+    try a_impl.addresses.addEndpoint("node-b", b_endpoint);
+
+    b_raft = try RaftElection.init(allocator, "node-b", &.{}, .{}, &b_impl.transport());
+    rafts_up = 1;
+    var peers = [_]Peer{.{ .id = "node-b", .address = "" }};
+    a_raft = try RaftElection.init(allocator, "node-a", &peers, .{}, &a_impl.transport());
+    rafts_up = 2;
+
+    // node-a leads term 1 with two entries; node-b's log is empty. A heartbeat
+    // built from the leader's own tail (prev_log_index = 2) would be rejected
+    // forever — the per-peer next_index is what lets the follower catch up.
+    a_raft.state = .leader;
+    a_raft.current_term = 1;
+    _ = try a_raft.appendEntry("cmd-1");
+    _ = try a_raft.appendEntry("cmd-2");
+    try testing.expectEqual(@as(usize, 2), a_raft.logLen());
+    try testing.expectEqual(@as(usize, 0), b_raft.logLen());
+
+    // Every tick runs one heartbeat round; each rejection backs the peer's
+    // next_index off one step until prev_log_index matches the follower's log
+    // (3 → reject → 2 → reject → 1 → both entries flow). The rounds are
+    // synchronous, so a bounded tick loop converges deterministically.
+    a_raft.config.heartbeat_interval_ms = 0;
+    var ticks: usize = 0;
+    while (ticks < 8 and (b_raft.logLen() < 2 or b_raft.getCommitIndex() < 2)) : (ticks += 1) {
+        try a_raft.tick();
+    }
+
+    // The follower caught up: same entries, same terms, same order.
+    try testing.expectEqual(@as(usize, 2), b_raft.logLen());
+    var i: u64 = 1;
+    while (i <= 2) : (i += 1) {
+        const ldr = a_raft.getLogEntry(i).?;
+        const fwr = b_raft.getLogEntry(i).?;
+        try testing.expectEqual(ldr.term, fwr.term);
+        try testing.expectEqual(ldr.index, fwr.index);
+        try testing.expectEqualStrings(ldr.command, fwr.command);
+    }
+
+    // Majority replication advanced the leader's commit index, and the next
+    // heartbeat carried it to the follower.
+    try testing.expectEqual(@as(u64, 2), a_raft.getCommitIndex());
+    try testing.expectEqual(@as(u64, 2), b_raft.getCommitIndex());
+
+    // Leader bookkeeping reflects the caught-up follower.
+    try testing.expectEqual(@as(?u64, 3), a_raft.next_index.get("node-b"));
+    try testing.expectEqual(@as(?u64, 2), a_raft.match_index.get("node-b"));
+
+    // A heartbeat on the converged follower is accepted (prev_log_index = the
+    // follower's own tail), so the steady state is stable, not flapping.
+    const before = a_raft.next_index.get("node-b").?;
+    try a_raft.tick();
+    try testing.expectEqual(before, a_raft.next_index.get("node-b").?);
+}

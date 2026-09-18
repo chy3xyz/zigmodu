@@ -45,17 +45,19 @@ SkillRegistry / Workflow / 审批流），也**没有任何**示例接集群栈�
 11. **门禁**：应用侧 `zmodu ci`（compile → fmt → verify → audit → deadcode → **doctor**，6 步）；
     文档里的 Zig 片段会被 `src/test/DocSnippets.zig` 抽查（只扫围栏代码块）——写 `builder` 片段时照第 1 条的形态写。
 
-### ⚠️ 待修清单（审计产出，按严重度；**尚未修**）
+### ⚠️ 待修清单（审计产出，按严重度；✅ 命中的条目是 2026-09-17 复核后**已修**的，其余仍未修）
 
 **A. 会编译 / 启动失败**
-- `examples/README.md:161,446`：`Application.init(allocator,"app",.{M},.{})` 缺 `io`（真实签名是
-  `init(io, allocator, name, modules, opts)`）
-- `docs/DISTRIBUTED.md:41-43`：它自己的组装片段用默认 `raft_cluster_size = 3` → 现在 `start()` 返回
-  `error.RaftTransportUnavailable`（与该文 60 行后的 fail-closed 自相矛盾）
-- `docs/CLUSTER-QUICKSTART.md` 整篇：fail-closed 之前的写法（3 节点、无 transport）+ 用了 0.17 已移除的
-  `std.Thread.sleep` + 挂了一条框架从未实现的路由
-- 本文件下方「集群」段（约 :217、:224-230）：`ClusterMembership.init` 少 `io`、`.seed_nodes` 不在 `Config`、
-  `zigmodu.core.*` 路径不存在、"实现 PasRaft 共识"的说法
+- ✅ `examples/README.md`：`Application.init(allocator,"app",.{M},.{})` 的缺 `io` 片段已删
+  （`grep -n "Application.init(allocator" examples/README.md` 为空）
+- ✅ `docs/DISTRIBUTED.md`：组装片段已显式写 `raft_cluster_size = 1` + fail-closed 注释，
+  与后文不再自相矛盾
+- ✅ `docs/CLUSTER-QUICKSTART.md`：整篇重写 —— 开头就是 fail-closed 声明、`raft_cluster_size = 1`、
+  无 `std.Thread.sleep`；`/cluster/health` 明确写成"由你的 handler 挂载"，并**如实列出** `node_id`
+  仍是固定串 `"node-id"`（见下方 ClusterHealth 一条，仍未修）
+- ✅ 本文件「集群」段（现 :376-377）：已写 `ClusterMembership.init(allocator, io, …)`，并注明
+  "`start` 的 Config 只有三项（没有 `seed_nodes`，seed 节点走 `connectToSeed`）"；
+  `zigmodu.core.*` / "实现 PasRaft 共识" 的说法已删
 - `tools/zmodu/src/main.zig:6011`（`--with-agent` 模板）：生成**无 guard 的裸 `Agent{}`**；`:6082-6086`
   的 handler 同步跑 agent 且不设 tenant/user
 - `src/ai/workflow.zig:590`：`.agent` 步骤内部现搓裸 `Agent{}`，Workflow 无处传 guard ⇒ 文档推荐的
@@ -64,65 +66,87 @@ SkillRegistry / Workflow / 审批流），也**没有任何**示例接集群栈�
 
 **B. 会误导（口径与实现不符）**
 - AI 文档四件套（`AI_DEV_GUIDE.md` / `AI.md` / `AI_SKILLS.md` / `AI_ORCHESTRATION.md`）停在 2026-08：
-  裸 `Agent{}`、不提 `Tool.action` / `guard` / `AgentSpec` / `AgentWorker`；`MCP.md:53` 的
-  "需显式加入 allowlist"与实现（列出全部注册工具）**不符**
+  裸 `Agent{}`、不提 `Tool.action` / `guard` / `AgentSpec` / `AgentWorker` —— **仍未修**：`AI_SKILLS.md` /
+  `AI_ORCHESTRATION.md` 至今 0 处提及 `guard` / `AgentSpec`（`AI_DEV_GUIDE.md` / `AI.md` 已开始提到）
+- ✅ `MCP.md:53` 的"需显式加入 allowlist"已改成事实：「**`tools/list` 不过滤**…按 allowlist / 权限裁剪
+  `tools/list` 目前**是缺口，不是既有能力**」
 - **最容易踩的一条**：内置技能全部落在 `.action` 默认值 `.execute` 上（全 `src/` 只有 1 处显式
   `.action =`，还是测试）—— 按 `AGENT_RUNTIME.md` 的推荐配法会拒掉所有内置技能，且启动期不报警
-- `docs/RUNTIME.md:267` 仍写"Worker 接线未做"（v0.22.0 已落地 `ai.AgentWorker`）；`:144-145` 的实测数字
-  （261 条 / delivered=330 / dropped=192）与现在的示例（5000 条 feed）不符
-- `examples/distributed/README.md`：声称 leader election ✅ / 3 节点 / heartbeat，但 `src/main.zig` 只用
-  `DistributedEventBus`（README 里自曝 "Connected nodes: 0"）；`docker-compose.yml` 的 command 被
-  `ENTRYPOINT` 吞掉，`Dockerfile` COPY 一个不存在的文件
+- ✅ `docs/RUNTIME.md`：`"Worker 接线未做"` 已删（路线图 v0.21 行改为 ✅ `ai.AgentSpec` + `ai.Guard`）；
+  `:144-145` 的历史实测数字已换成"具体条数随示例版本变化…别照抄历史数字"
+- ✅ `examples/distributed/README.md`：已改成事实 —— 选主 "Not used — `RaftElection` is a framework module,
+  not wired here"、"no discovery, no heartbeats, no gossip"、`NODE_ID` / `PORT` 不被代码读取（三个容器都打
+  `node1` / `9000`）、Docker 三件套标注为 scaffold
 - ~~`examples/cluster-demo/`~~（**已删除**，2026-09-17）：compose 构建的是**仓根 Dockerfile**（跑 basic 示例，
   无 cluster 二进制）；README 教人 `curl :8081/cluster/health` 而该路由从未挂载。拓扑与 fail-closed
   说明现并入 `examples/distributed/README.md`（docker 拓扑参考见 `examples/production-deploy/`）
 - `docs/UPGRADING.md` 止于 v0.15.46 —— v0.22 / v0.23 的集群破坏性变更（fail-closed + `.transport`）没有条目
 
-**C. 只是过时数字 / 措辞**（可批量改）
-- `examples/README.md`：行数表、`"Zig 0.16.0 or later"`、把 shopdemo 说成 "Not a complete runnable app"、
-  "每个示例跑 `zig build test`"（只有 6/24 有 test step）
-- 9 个 `build.zig.zon` 的 `.minimum_zig_version = "0.16.0"`；`tenant-mgmt` README 的 v0.13.15；
-  `metaverse-creative/DEMO_SUMMARY.md` 的 v0.4.0；`shopdemo-zent` 注释里的 zent v0.39.2
-- `examples/alpha-engine`（v0.23 新示例）**未进 `ci.yml` 的 examples 构建列表**，也没有 doctor / audit 覆盖
+**C. 只是过时数字 / 措辞** —— ✅ **已全部收敛（2026-09-17 复核）**
+- ✅ `examples/README.md`：行数表已删（末尾「Example Statistics」写明索引表才是唯一权威）；
+  `"Zig 0.17.0 or later"`；shopdemo 改成 "Minimal runnable app"；test step 改为**逐行标注**，
+  且三处清单与 `ci.yml` 的 `Run the example test steps` 一致
+- ✅ `build.zig.zon` 的 `.minimum_zig_version` 已全部是 `"0.17.0"`
+  （`grep -rn '"0.16.0"' examples/ --include='*.zon'` 为空）；`tenant-mgmt` README → v0.23.0；
+  `metaverse-creative` 两处 → v0.24.0（v0.4.0 实际在 `ARCHITECTURE_DIAGRAM.txt:153`，不在 `DEMO_SUMMARY.md`）；
+  `shopdemo-zent` 注释 → zent v0.67.0 的 git tag pin
+- ✅ `examples/alpha-engine` 已进 `ci.yml` 两个 examples 构建循环（`:153` / `:319`）与 `zmodu doctor`
+  循环（`:166`）。**仍未进 `zmodu audit` 循环**（`:214`，仍是 tenant-mgmt / tenant-shop / basic /
+  ai-ops / zmsaas-backend）—— 实测 `audit examples/alpha-engine` pass、0 violations，可随时加入
 
 
 ### 源码文档质量（2026-09-17 抽样）
 
-口径：`src/**.zig` 264 文件 / 1842 pub 声明；模块级 `//!` 覆盖 **171/264（64.8%）**，公开 API `///` 覆盖
-**772/1842（41.9%）**，`root.zig` 再导出 **21/147（14.3%）**。关键结论：主要问题不是"缺文档"，而是
+口径（2026-09-17 抽样）：`src/**.zig` 264 文件 / 1842 pub 声明；模块级 `//!` 覆盖 **171/264（64.8%）**，公开 API `///` 覆盖
+**772/1842（41.9%）**，`root.zig` 再导出 **21/147（14.3%）**。当时的关键结论：主要问题不是"缺文档"，而是
 **文档没跟代码走** —— 两处死旋钮（`Application.withMaxDependencies`、`Server.Config.connection_stack_size`
 零读取）、若干**编不过的片段**（`Application.zig:43` 的 init 例子、`runtime.zig:17` 与 `src/runtime.zig:5`
 的 `app.runtime()`）、自相矛盾处（`ClusterView.zig:10` 的 "no refcount" 与 `acquire/release` 的 fetchAdd/Sub）、
-未兑现的注释（`Server.zig:2257` 的 keepalive 只设了 `SO_KEEPALIVE`）。
+未兑现的注释（`Server.zig:2257` 的 keepalive 只设了 `SO_KEEPALIVE`）。**以上 5 条已在 v0.24.0 全部完成**，逐条现状：
 
-1. **守住导出面**（半天）：给 `root.zig` 与 http/data/security/ai/observability 六个 barrel 的每个导出补一行
-   "用哪个入口、何时用"；验收：root ≥90%、barrel ≥80%。
-2. **死旋钮：接线或删除**（半天）：每个 pub 配置字段至少一处读取，否则字段与文档一并删。
-3. **给超长文件加可跳转目录**（1 天）：Server 4392 / KafkaConnector 3221 / Middleware / GrpcTransport /
-   Http2Server / ai-workflow / redis 加 `//! §N` 目录 + 正文锚点；sqlx.zig 补锚点。
-4. **修可执行文档 + 加护栏**（半天）：改上面点到的片段与注释；`src/test/DocSnippets.zig` 增补
-   `try app.runtime()` 与 `Application.init(` 两类模式（现只拦 builder 链式）。
-5. **错误与契约文案**（1 天）：12 个 pub error set 补成员级 `///`；`@compileError` 统一"期望形态 + 怎么改"
-   （样板：`runtime.zig:561`、`Preflight.zig:194`）。
+1. **守住导出面** —— ✅ **已完成（v0.24.0）**：`root.zig` 与六个 barrel（http / data / security / ai / observability / runtime）
+   新增 **463 行 `///`**，导出面覆盖 **100%**（`root.zig` 157 pub / 163 doc；http 176/178、data 24/24、security 21/21、
+   observability 13/13、runtime 22/22），每条一句话写"是什么 + 什么时候用"。
+2. **死旋钮：接线或删除** —— ✅ **已完成（v0.24.0）**：两个字段都真接线了 —— `Application.Config.max_dependencies`
+   在启动期做超限告警（`src/Application.zig:161-162` 调 `warnOverDependencyLimit`），`Server.Config.connection_stack_size`
+   真用于 accept 线程栈（`src/api/Server.zig:2034,2326`，低于平台下限才抬升）；两者各有测试（`Server.zig:3794`）。
+3. **给超长文件加可跳转目录** —— ✅ **已完成（v0.24.0）**：Server / KafkaConnector / Middleware / GrpcTransport /
+   Http2Server / ai-workflow / redis / sqlx 均加了 `//! §N` 目录 + 正文 `// ==== §N ====` 锚点
+   （如 `src/core/KafkaConnector.zig` 有 10 处锚点），`grep "§3"` 可跳。
+4. **修可执行文档 + 加护栏** —— ✅ **已完成（v0.24.0）**：`Application.init` 真签名示例、`app.runtime()` 的
+   `try` / comptime capacity、`ClusterView` 的 refcount 表述、`tuneSocket` 的 keepalive 说明全部改正；
+   `src/test/DocSnippets.zig` 增补 `try app.runtime()` 与 `Application.init(allocator…` 两类模式
+   （`DocSnippets.zig:31,33`），并把 markdown 扫描**递归到 `docs/**`**（跳过 `docs/superpowers/**`）。
+5. **错误与契约文案** —— ✅ **已完成（v0.24.0）**：12/12 pub error set 补齐成员级 `///`（新补 8 个 set / 94 条成员注释）；
+   5 处 `@compileError` / `@panic` 文案统一成"期望形态 + 怎么改"。
 
 ### 示例品质（2026-09-17 抽样）
 
-统计：24 个目录（`find -name '*.zig'` 求和，排除缓存/构建产物）。**可运行样板与门禁最不匹配的地方**：
-`runtime-workers`（324 行，builder+`ctx.runtime()`+HotBus+`spawnActor` 全对）**没有 README、不在索引里**；
-`alpha-engine`（486 行，v0.23 的 P0）**不在 CI、无 README**；`shopdemo` 有 12 个 test 声明但
+统计（2026-09-17 抽样）：当时 24 个目录（`find -name '*.zig'` 求和，排除缓存/构建产物）。**当时"可运行样板与门禁最不匹配的地方"**：
+`runtime-workers`（builder+`ctx.runtime()`+HotBus+`spawnActor` 全对）**没有 README、不在索引里**；
+`alpha-engine`（v0.23 的 P0）**不在 CI、无 README**；`shopdemo` 有 12 个 test 声明但
 `build.zig` **没有 test step**（悬空）；`shopdemo-zent`/`metaverse-creative` 用 `.path = "../../../zent"`
 （无 sibling 检出时不可构建）而 `zent-modulith` 用 tag pin；三份 README 有假声明
 （`distributed` 的选主/env、`http-stress-test` 的 wrk、`tenant-mgmt` 的 v0.13.15）。重复候选：
 shopdemo↔shopdemo-zent、basic↔testing、distributed↔cluster-demo、`deprecated/` 与 `examples/example_tests.zig`
 —— 后三组已于 2026-09-17 收敛（见本节第 5 条）；`shopdemo`↔`shopdemo-zent` 保留（sqlx / zent 两种持久化的对照）。
+**各条已在 v0.24.0 / 2026-09-17 全部收敛**（`shopdemo` 的 test 根与 `zent-modulith` 的 step 也已补上），逐条现状：
 
-1. **把已存在的 test step 接进 CI**：对 ai-ops / tenant-ai / llm-policies / web4 / testing / zmsaas-backend 加
-   `zig build test`；给 shopdemo（12 个 test 无 step）与 zent-modulith 补 step。验收：改坏一条能被拦住。
-2. **修三处假 README**：`distributed`（删选主/env 声明，或把 `NODE_ID/PORT` 真读进代码）、`http-stress-test`
-   （改成"自带 32×50 压测 + 可选 wrk"）、`tenant-mgmt`（版本号）。验收：README 每条命令本地可复现。
-3. **给 runtime-workers / alpha-engine 补 README + 索引条目**，把 alpha-engine 加进 CI 与 `zmodu doctor` 列表。
-   验收：`zmodu doctor examples/alpha-engine` 通过。
-4. **统一 zent 依赖为 git tag pin**（照 `zent-modulith` 的 `?ref=v0.67.0`）。验收：无 sibling 检出也能构建。
+1. **把已存在的 test step 接进 CI** —— ✅ **已完成（2026-09-17）**：ai-ops / basic / llm-policies /
+   tenant-ai / web4 / zmsaas-backend 的 test step 已进 CI（`testing` 并入 `basic`）；`shopdemo` 已补 test 根
+   （`tests.zig` 聚合 `src/modules/order/` 与 `generated-sample/` 的 4 个生成测试文件 = **13 个 test**，
+   `build.zig` 的 `test` step）并进入同一循环（`ci.yml:334`）。`zent-modulith` 的 step 是 `bash smoke.sh`，
+   由 `Smoke zent-modulith` 步骤单独跑，因此**刻意**不在这个循环里（`ci.yml:327-331` 已写明原因）。
+2. **修三处假 README** —— ✅ **已完成（2026-09-17）**：`examples/distributed/README.md` 改成事实
+   （「Leader election | Not used — `RaftElection` 是框架模块，未在此接线」+ fail-closed 三条出路）；
+   `http-stress-test` 改为"自带压测（1600 请求 / Errors: 0 即断言）+ 可选 wrk"；`tenant-mgmt` 版本号 → v0.23.0。
+   顺带把根 README 的 Distributed 行与 `docs/dev/upgrade-roadmap.md` 的 `cluster-demo` 引用改准。
+3. **给 runtime-workers / alpha-engine 补 README + 索引条目** —— ✅ **已完成（2026-09-17）**：两者都补了 README；
+   `examples/README.md` 索引与目录一一对应（20 行，含 runtime-workers / alpha-engine）；`alpha-engine` 已进
+   CI 构建列表（`ci.yml:153`）与 `zmodu doctor` 循环（`ci.yml:166`）。
+4. **统一 zent 依赖为 git tag pin** —— ✅ **已完成（2026-09-17）**：`shopdemo-zent` / `metaverse-creative` /
+   `zent-modulith` 三处都改成 `git+https://github.com/chy3xyz/zent?ref=v0.67.0` 的 tag pin（无 sibling 检出也能构建）；
+   例外只剩 `examples/_shared`（helper 库，仍按 path 引 sibling `../zent`，CI 的注释已写明此处不可离线构建）。
 5. **收敛重复示例** —— ✅ **已完成（2026-09-17）**：删 `deprecated/`（只有一份裸 snippet）与 `examples/example_tests.zig`
    （占位）；testing 并入 basic（`examples/basic/src/tests.zig` + `build.zig` 的 `test` step，5 个测试：原 testing 的 3 个
    全保留 + lifecycle / mock 两例；CI 的 test-step 列表随之由 `testing` 换成 `basic`）；distributed 与 cluster-demo
@@ -130,9 +154,10 @@ shopdemo↔shopdemo-zent、basic↔testing、distributed↔cluster-demo、`depre
    `examples/production-deploy/`）。验收：`examples/README.md` 的索引表与目录**一一对应**（20 个目录 20 行，
    含 runtime-workers / alpha-engine / mcp-server / shopdemo-zent / metaverse-creative / zmsaas / distributed；
    行数表已删，避免第二份会漂移的清单）。
-6. **加元数据门禁**：grep 9 处 `minimum_zig_version = "0.16.0"`（basic/distributed/event-driven/
-   http-stress-test/shopdemo/tenant-mgmt/tenant-shop/testing/zmsaas）+ `DEMO_SUMMARY.md` 的 v0.4.0 与失效路径。
-   验收：`grep -rn '"0.16.0"' examples/*/build.zig.zon` 为空。
+6. **加元数据门禁** —— ✅ **已完成（2026-09-17）**：`build.zig.zon` 的 `minimum_zig_version` 全部 → `"0.17.0"`
+   （`grep -rn '"0.16.0"' examples/ --include='*.zon'` 为空）；`metaverse-creative` 两处 → ZigModu **v0.24.0**
+   （`DEMO_SUMMARY.md:202` 原 v0.23.0、`ARCHITECTURE_DIAGRAM.txt:153` 原 **v0.4.0** —— 上一版把 v0.4.0 记到了
+   `DEMO_SUMMARY.md`，实际在 `ARCHITECTURE_DIAGRAM.txt`，两处都已改）。
 
 ## 📋 目录 (Table of Contents)
 

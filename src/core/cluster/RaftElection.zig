@@ -23,7 +23,8 @@ pub const ElectionConfig = struct {
     /// Heartbeat interval (ms) - leader sends heartbeats at this rate
     heartbeat_interval_ms: u64 = 50,
 
-    /// Maximum entries to send in one AppendEntries RPC
+    /// Maximum entries to send in one AppendEntries RPC. A lagging follower is
+    /// fed its backlog in chunks of this size; values below 1 are read as 1.
     max_append_entries: usize = 100,
 };
 
@@ -121,6 +122,10 @@ pub const RaftElection = struct {
     next_index: std.StringHashMap(u64),
     match_index: std.StringHashMap(u64),
 
+    // Candidate state: ids of the peers that granted a vote in the current
+    // term (keys borrowed from `peers`, so a repeated vote tallies once).
+    votes_received: std.StringHashMap(void),
+
     // Membership
     local_id: []const u8,
     peers: std.ArrayList(Peer),
@@ -164,6 +169,7 @@ pub const RaftElection = struct {
             .log = std.ArrayList(LogEntry).empty,
             .next_index = std.StringHashMap(u64).init(allocator),
             .match_index = std.StringHashMap(u64).init(allocator),
+            .votes_received = std.StringHashMap(void).init(allocator),
             .local_id = local_id_copy,
             .peers = peers_copy,
             .transport = transport,
@@ -180,9 +186,10 @@ pub const RaftElection = struct {
         }
         self.log.deinit(self.allocator);
 
-        // Free leader state hashmaps (keys are borrowed from peers, values are u64)
+        // Free leader state hashmaps (keys are borrowed from peers)
         self.next_index.deinit();
         self.match_index.deinit();
+        self.votes_received.deinit();
 
         self.allocator.free(self.local_id);
         for (self.peers.items) |peer| {
@@ -235,6 +242,11 @@ pub const RaftElection = struct {
             .index = index,
             .command = cmd_copy,
         });
+
+        // A quorum may already hold this entry (in a one-node cluster the leader
+        // *is* the quorum), and waiting for the next heartbeat tick would leave
+        // the write uncommitted until then.
+        self.advanceCommitIndex();
         return index;
     }
 
@@ -363,12 +375,22 @@ pub const RaftElection = struct {
                 break :blk idx;
             };
 
-            // Build entries slice: from (next_idx - 1) to end of log
+            // Build entries slice: from (next_idx - 1) to end of log, capped so
+            // a lagging follower is fed the log in `max_append_entries` chunks
+            // instead of one RPC carrying everything. The following round picks
+            // up where this one stopped (`next_index` = last entry sent + 1).
             const start: usize = if (next_idx > 0) @intCast(next_idx - 1) else 0;
-            const entries: []const LogEntry = if (start < self.log.items.len)
+            const pending: []const LogEntry = if (start < self.log.items.len)
                 self.log.items[start..]
             else
                 &.{};
+            // A cap of 0 would ship empty rounds forever and never advance
+            // `next_index`, so it is read as "one entry per round".
+            const batch_max = @max(@as(usize, 1), self.config.max_append_entries);
+            const entries: []const LogEntry = if (pending.len > batch_max)
+                pending[0..batch_max]
+            else
+                pending;
 
             var prev_log_idx: u64 = 0;
             var prev_log_term: u64 = 0;
@@ -413,6 +435,10 @@ pub const RaftElection = struct {
                 }
             }
         }
+
+        // Entries held by a quorum are committed (§5.3/§5.4); the next round
+        // carries the new leader_commit to the followers.
+        self.advanceCommitIndex();
     }
 
     /// Advance commit_index if a majority of peers have replicated an entry
@@ -448,7 +474,14 @@ pub const RaftElection = struct {
         }
     }
 
-    /// Start a new election
+    /// Start a new election.
+    ///
+    /// Tallying convention: `votes_received` counts **peer grants**, so a
+    /// candidate needs `quorumSize()` distinct peers to answer (the convention
+    /// `handleVoteResponse` and `hasQuorum` document). A cluster of one has no
+    /// peer to ask — its own vote is the entire majority (`quorumSize() == 1`),
+    /// so that election is won immediately instead of waiting for a ballot that
+    /// can never arrive.
     fn startElection(self: *Self) !void {
         self.state = .candidate;
         self.current_term +|= 1;
@@ -457,11 +490,19 @@ pub const RaftElection = struct {
         if (self.voted_for) |v| self.allocator.free(v);
         self.voted_for = try self.allocator.dupe(u8, self.local_id);
 
+        // New term, new tally: votes granted in earlier terms must not count.
+        self.votes_received.clearRetainingCapacity();
+
         // Reset election deadline
         const now_ms = Time.monotonicNowMilliseconds();
         self.election_deadline_ms = now_ms + @as(i64, @intCast(self.randomElectionTimeout()));
 
         std.log.info("[RaftElection] Starting election for term {d}", .{self.current_term});
+
+        if (self.clusterSize() == 1) {
+            self.becomeLeader();
+            return;
+        }
 
         const last_idx: u64 = @intCast(self.log.items.len);
         const last_term = if (last_idx > 0) self.log.items[last_idx - 1].term else 0;
@@ -506,47 +547,60 @@ pub const RaftElection = struct {
         self.sendHeartbeats() catch |err| std.log.err("[RaftElection] initial heartbeat failed: {}", .{err});
     }
 
-    /// Send heartbeats to all peers (AppendEntries with empty entries).
+    /// Send heartbeats to all peers. A heartbeat is the same per-peer
+    /// AppendEntries round as replication: a caught-up follower receives empty
+    /// entries with a `prev_log_*` it actually has, while a lagging follower
+    /// rejects the probe and gets its `next_index` backed off one step per
+    /// round until the logs line up and the missing entries flow —
+    /// `config.max_append_entries` of them per round.
     fn sendHeartbeats(self: *Self) !void {
-        const last_idx: u64 = @intCast(self.log.items.len);
-        const prev_log_term = if (last_idx > 0) self.log.items[last_idx - 1].term else 0;
-
-        for (self.peers.items) |peer| {
-            const req = AppendEntriesRequest{
-                .term = self.current_term,
-                .leader_id = self.local_id,
-                .prev_log_index = last_idx,
-                .prev_log_term = prev_log_term,
-                .entries = &.{},
-                .leader_commit = self.commit_index,
-            };
-            const resp = self.transport.*.sendAppendEntries(peer.id, peer.address, req);
-            if (resp.term > self.current_term) {
-                self.current_term = resp.term;
-                self.state = .follower;
-            }
-        }
+        try self.sendAppendEntries();
     }
 
-    /// Handle vote response from peer.
-    /// In production, this would track per-peer votes and call becomeLeader() on quorum.
+    /// Handle a vote response from a peer. Granted votes are tallied per term
+    /// and deduplicated by peer id; the candidate becomes leader only once the
+    /// tally reaches `quorumSize()` (the same peer-vote convention
+    /// `hasQuorum(votes_received)` documents). A cluster of one never gets here
+    /// — `startElection` elects it on the self-vote alone.
     pub fn handleVoteResponse(self: *Self, resp: VoteResponse, from_peer: []const u8) !void {
-        _ = from_peer;
         if (resp.term > self.current_term) {
             self.current_term = resp.term;
             self.state = .follower;
+            self.votes_received.clearRetainingCapacity();
             return;
         }
 
         if (self.state != .candidate) return;
+        if (resp.term < self.current_term) return; // ballot from a past election
+        if (!resp.vote_granted) return;
 
-        if (resp.vote_granted) {
+        // Only configured cluster members count. The map key borrows the
+        // peer's stored id, which outlives the (often arena-owned) `from_peer`.
+        const peer_id = self.peerId(from_peer) orelse return;
+        try self.votes_received.put(peer_id, {});
+
+        if (@as(usize, self.votes_received.count()) >= self.quorumSize()) {
             self.becomeLeader();
         }
     }
 
+    /// The stored id of the peer named `id`, or null when it is not a member.
+    fn peerId(self: *const Self, id: []const u8) ?[]const u8 {
+        for (self.peers.items) |peer| {
+            if (std.mem.eql(u8, peer.id, id)) return peer.id;
+        }
+        return null;
+    }
+
     /// Generate random election timeout
     fn randomElectionTimeout(self: *Self) u64 {
+        // A degenerate window (min == max, or a max below min) must still yield a
+        // timeout: `% 0` is a division-by-zero panic, and a timeout of 0 would
+        // spin the election loop.
+        if (self.config.election_timeout_max_ms <= self.config.election_timeout_min_ms) {
+            return @max(@as(u64, 1), self.config.election_timeout_min_ms);
+        }
+
         const range = self.config.election_timeout_max_ms - self.config.election_timeout_min_ms;
         const now = Time.monotonicNowMilliseconds();
         var rng = std.Random.DefaultPrng.init(@bitCast(now));
@@ -671,6 +725,12 @@ pub const RaftElection = struct {
     }
 
     /// Check if votes received meet quorum.
+    ///
+    /// `votes_received` is a count of **peer grants** — the candidate's own
+    /// vote is not part of the tally, so a multi-node candidate needs
+    /// `quorumSize()` peers behind it. A cluster of one never wins through this
+    /// path: `startElection` elects it outright, since there is no peer whose
+    /// ballot could ever arrive.
     pub fn hasQuorum(self: *const Self, votes_received: usize) bool {
         return votes_received >= self.quorumSize();
     }
@@ -692,6 +752,9 @@ const TestCluster = struct {
     nodes: std.ArrayList(Node),
     local_ids: std.ArrayList([]const u8),
     transports: std.ArrayList(TestTransport),
+    /// Stable storage for the `*const ElectionTransport` each raft holds —
+    /// taking the address of a loop-local here would dangle after init.
+    transport_refs: std.ArrayList(RaftElection.ElectionTransport),
 
     const TestTransport = struct {
         sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
@@ -702,9 +765,11 @@ const TestCluster = struct {
         var nodes = std.ArrayList(Node).empty;
         var local_ids = std.ArrayList([]const u8).empty;
         var transports = std.ArrayList(TestTransport).empty;
+        var transport_refs = std.ArrayList(RaftElection.ElectionTransport).empty;
 
         // Pre-allocate to prevent reallocation (transports are referenced by pointer)
         try transports.ensureTotalCapacity(allocator, count);
+        try transport_refs.ensureTotalCapacity(allocator, count);
         try nodes.ensureTotalCapacity(allocator, count);
         try local_ids.ensureTotalCapacity(allocator, count);
 
@@ -735,9 +800,9 @@ const TestCluster = struct {
                 .sendVoteRequest = sendVoteRequestFn,
                 .sendAppendEntries = sendAppendEntriesFn,
             });
+            transport_refs.appendAssumeCapacity(@ptrCast(@alignCast(@constCast(&transports.items[i]))));
 
-            const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transports.items[i])));
-            const election = try RaftElection.init(allocator, my_id, peer_list.items, .{}, &transport);
+            const election = try RaftElection.init(allocator, my_id, peer_list.items, .{}, &transport_refs.items[i]);
             nodes.appendAssumeCapacity(Node{ .election = election });
 
             // Free temp peer list (RaftElection.init copies the data)
@@ -749,6 +814,7 @@ const TestCluster = struct {
             .nodes = nodes,
             .local_ids = local_ids,
             .transports = transports,
+            .transport_refs = transport_refs,
         };
     }
 
@@ -762,6 +828,7 @@ const TestCluster = struct {
         }
         self.local_ids.deinit(self.allocator);
         self.transports.deinit(self.allocator);
+        self.transport_refs.deinit(self.allocator);
     }
 
     /// Simulate: leader appends command and replicates to followers
@@ -1253,6 +1320,58 @@ test "RaftElection quorum calculation" {
     try testing.expectEqual(@as(usize, 1), e2.quorumSize());
 }
 
+test "RaftElection vote counting: leader only at quorum, duplicate and stale votes ignored" {
+    const allocator = testing.allocator;
+
+    var cluster = try TestCluster.init(allocator, 3);
+    defer cluster.deinit();
+
+    var cand = &cluster.nodes.items[0].election;
+
+    // Become a candidate for term 1 (vote requests go to the stub transport).
+    try cand.startElection();
+    try testing.expectEqual(RaftState.candidate, cand.getState());
+    try testing.expectEqual(@as(u64, 1), cand.getTerm());
+
+    // A ballot from an older term must not count.
+    try cand.handleVoteResponse(.{ .term = 0, .vote_granted = true }, "n1");
+    try testing.expect(!cand.isLeader());
+
+    // First granted vote: 1 peer vote < quorum(2) — must NOT become leader.
+    try cand.handleVoteResponse(.{ .term = 1, .vote_granted = true }, "n1");
+    try testing.expect(!cand.isLeader());
+    try testing.expectEqual(RaftState.candidate, cand.getState());
+
+    // A duplicate vote from the same peer is tallied once.
+    try cand.handleVoteResponse(.{ .term = 1, .vote_granted = true }, "n1");
+    try testing.expect(!cand.isLeader());
+
+    // Votes from non-members do not count.
+    try cand.handleVoteResponse(.{ .term = 1, .vote_granted = true }, "n9");
+    try testing.expect(!cand.isLeader());
+
+    // A rejection changes nothing.
+    try cand.handleVoteResponse(.{ .term = 1, .vote_granted = false }, "n2");
+    try testing.expect(!cand.isLeader());
+
+    // Second distinct peer vote reaches quorum → leader.
+    try cand.handleVoteResponse(.{ .term = 1, .vote_granted = true }, "n2");
+    try testing.expect(cand.isLeader());
+    try testing.expectEqual(@as(u64, 1), cand.getTerm());
+
+    // A higher-term response steps the node back down to follower.
+    try cand.handleVoteResponse(.{ .term = 2, .vote_granted = false }, "n1");
+    try testing.expectEqual(RaftState.follower, cand.getState());
+    try testing.expectEqual(@as(u64, 2), cand.getTerm());
+
+    // The next election starts from a clean tally: one peer vote is, again,
+    // not enough on its own.
+    try cand.startElection();
+    try testing.expectEqual(@as(u64, 3), cand.getTerm());
+    try cand.handleVoteResponse(.{ .term = 3, .vote_granted = true }, "n1");
+    try testing.expect(!cand.isLeader());
+}
+
 test "RaftElection log compaction and InstallSnapshot" {
     const allocator = testing.allocator;
 
@@ -1308,4 +1427,257 @@ test "RaftElection log compaction and InstallSnapshot" {
     try testing.expectEqual(@as(u64, 1), snap_resp.term);
     try testing.expectEqual(@as(u64, 10), follower.last_included_index);
     try testing.expectEqualStrings("follower-snapshot-data", follower.snapshot_data.?);
+}
+
+/// Shape of `RaftElection.ElectionTransport`, restated at file scope so the
+/// tests below can build transports out of named helper functions.
+const TestTransportVTable = struct {
+    sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
+    sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse,
+};
+
+fn noopVoteRequest(_: ?[]const u8, _: []const u8, _: VoteRequest) void {}
+
+/// Records what a peer was handed, and accepts it.
+const AppendEntriesCapture = struct {
+    var calls: usize = 0;
+    var entries_len: usize = 0;
+    var first_index: u64 = 0;
+    var last_index: u64 = 0;
+
+    fn reset() void {
+        calls = 0;
+        entries_len = 0;
+        first_index = 0;
+        last_index = 0;
+    }
+
+    fn accept(_: ?[]const u8, _: []const u8, req: AppendEntriesRequest) AppendEntriesResponse {
+        calls += 1;
+        entries_len = req.entries.len;
+        first_index = if (req.entries.len > 0) req.entries[0].index else 0;
+        last_index = if (req.entries.len > 0) req.entries[req.entries.len - 1].index else req.prev_log_index;
+        return .{ .term = req.term, .success = true, .match_index = last_index };
+    }
+};
+
+/// Answers with a higher term, which makes the leader step down inside
+/// `sendAppendEntries` before it can touch `next_index` / `match_index` — so
+/// whatever `becomeLeader` wrote into those maps stays observable.
+fn higherTermAppendEntries(_: ?[]const u8, _: []const u8, req: AppendEntriesRequest) AppendEntriesResponse {
+    return .{ .term = req.term +| 1, .success = false, .match_index = 0 };
+}
+
+test "RaftElection single-node cluster elects itself on the first tick" {
+    const allocator = testing.allocator;
+    AppendEntriesCapture.reset();
+
+    var impl = TestTransportVTable{
+        .sendVoteRequest = noopVoteRequest,
+        .sendAppendEntries = AppendEntriesCapture.accept,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
+
+    var raft = try RaftElection.init(allocator, "solo", &.{}, .{}, &transport);
+    defer raft.deinit();
+
+    try testing.expectEqual(@as(usize, 1), raft.clusterSize());
+    try testing.expectEqual(@as(usize, 1), raft.quorumSize());
+    try testing.expectEqual(RaftState.follower, raft.getState());
+
+    // No peer will ever answer a vote request, so the self-vote has to be the
+    // whole majority: the first elapsed election deadline must elect this node.
+    raft.election_deadline_ms = Time.monotonicNowMilliseconds() - 1;
+    try raft.tick();
+
+    try testing.expect(raft.isLeader());
+    try testing.expectEqual(RaftState.leader, raft.getState());
+    try testing.expectEqual(@as(u64, 1), raft.getTerm());
+    try testing.expectEqualStrings("solo", raft.getLeader().?);
+    try testing.expectEqualStrings("solo", raft.voted_for.?);
+
+    // The leader is the entire quorum, so the append is committed on the spot
+    // rather than waiting for a heartbeat round with nobody to send it to.
+    try testing.expectEqual(@as(u64, 1), try raft.appendEntry("only-writer"));
+    try testing.expectEqual(@as(u64, 1), raft.getCommitIndex());
+
+    // A leader tick with no peers is still a heartbeat round: it must neither
+    // reach the transport nor cost the node its leadership.
+    raft.last_heartbeat_ms = Time.monotonicNowMilliseconds() - 1000;
+    try raft.tick();
+    try testing.expect(raft.isLeader());
+    try testing.expectEqual(@as(u64, 1), raft.getCommitIndex());
+    try testing.expectEqual(@as(usize, 0), AppendEntriesCapture.calls);
+}
+
+test "RaftElection three-node candidate needs two peer grants, not its self-vote" {
+    const allocator = testing.allocator;
+
+    var cluster = try TestCluster.init(allocator, 3);
+    defer cluster.deinit();
+
+    const cand = &cluster.nodes.items[0].election;
+
+    // `startElection` votes for itself and polls n1/n2 through the stub
+    // transport. The self-vote is not a peer grant, so the node stays a
+    // candidate: a 3-node cluster is only won with 2 of 3 votes.
+    try cand.startElection();
+    try testing.expectEqual(RaftState.candidate, cand.getState());
+    try testing.expect(!cand.isLeader());
+    try testing.expectEqual(@as(usize, 3), cand.clusterSize());
+    try testing.expectEqual(@as(usize, 2), cand.quorumSize());
+
+    try cand.handleVoteResponse(.{ .term = 1, .vote_granted = true }, "n1");
+    try testing.expect(!cand.isLeader());
+
+    try cand.handleVoteResponse(.{ .term = 1, .vote_granted = true }, "n2");
+    try testing.expect(cand.isLeader());
+    try testing.expectEqual(RaftState.leader, cand.getState());
+}
+
+test "RaftElection caps each replication round at max_append_entries" {
+    const allocator = testing.allocator;
+    AppendEntriesCapture.reset();
+
+    var impl = TestTransportVTable{
+        .sendVoteRequest = noopVoteRequest,
+        .sendAppendEntries = AppendEntriesCapture.accept,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
+
+    var peers = [_]Peer{.{ .id = "n2", .address = "" }};
+    var raft = try RaftElection.init(allocator, "n1", &peers, .{ .max_append_entries = 4 }, &transport);
+    defer raft.deinit();
+
+    raft.state = .leader;
+    raft.current_term = 1;
+    for (0..10) |i| {
+        var buf: [16]u8 = undefined;
+        _ = try raft.appendEntry(try std.fmt.bufPrint(&buf, "cmd-{d}", .{i}));
+    }
+    try testing.expectEqual(@as(usize, 10), raft.logLen());
+
+    const peer_key = raft.peers.items[0].id;
+    try raft.next_index.put(peer_key, 1);
+    try raft.match_index.put(peer_key, 0);
+
+    // Round 1: the first four entries, not the whole 10-entry log.
+    try raft.sendAppendEntries();
+    try testing.expectEqual(@as(usize, 1), AppendEntriesCapture.calls);
+    try testing.expectEqual(@as(usize, 4), AppendEntriesCapture.entries_len);
+    try testing.expectEqual(@as(u64, 1), AppendEntriesCapture.first_index);
+    try testing.expectEqual(@as(u64, 4), AppendEntriesCapture.last_index);
+    try testing.expectEqual(@as(u64, 5), raft.next_index.get(peer_key).?);
+    try testing.expectEqual(@as(u64, 4), raft.getCommitIndex());
+
+    // Round 2: continues where round 1 stopped.
+    try raft.sendAppendEntries();
+    try testing.expectEqual(@as(usize, 4), AppendEntriesCapture.entries_len);
+    try testing.expectEqual(@as(u64, 5), AppendEntriesCapture.first_index);
+    try testing.expectEqual(@as(u64, 8), AppendEntriesCapture.last_index);
+    try testing.expectEqual(@as(u64, 9), raft.next_index.get(peer_key).?);
+    try testing.expectEqual(@as(u64, 8), raft.getCommitIndex());
+
+    // Round 3: the short tail, still within the cap.
+    try raft.sendAppendEntries();
+    try testing.expectEqual(@as(usize, 2), AppendEntriesCapture.entries_len);
+    try testing.expectEqual(@as(u64, 9), AppendEntriesCapture.first_index);
+    try testing.expectEqual(@as(u64, 10), AppendEntriesCapture.last_index);
+    try testing.expectEqual(@as(u64, 11), raft.next_index.get(peer_key).?);
+    try testing.expectEqual(@as(u64, 10), raft.getCommitIndex());
+
+    // Round 4: nothing left → an empty probe that leaves the log untouched.
+    try raft.sendAppendEntries();
+    try testing.expectEqual(@as(usize, 0), AppendEntriesCapture.entries_len);
+    try testing.expectEqual(@as(u64, 10), AppendEntriesCapture.last_index);
+    try testing.expectEqual(@as(usize, 10), raft.logLen());
+    try testing.expectEqual(@as(u64, 11), raft.next_index.get(peer_key).?);
+}
+
+test "RaftElection becomeLeader reinitializes per-peer next_index and match_index" {
+    const allocator = testing.allocator;
+
+    var impl = TestTransportVTable{
+        .sendVoteRequest = noopVoteRequest,
+        .sendAppendEntries = higherTermAppendEntries,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
+
+    var peers = [_]Peer{
+        .{ .id = "n1", .address = "" },
+        .{ .id = "n2", .address = "" },
+    };
+    var raft = try RaftElection.init(allocator, "n0", &peers, .{}, &transport);
+    defer raft.deinit();
+
+    // Stale bookkeeping from an earlier term must not survive the promotion.
+    try raft.next_index.put(raft.peers.items[0].id, 1);
+    try raft.match_index.put(raft.peers.items[0].id, 7);
+
+    raft.state = .leader;
+    raft.current_term = 1;
+    _ = try raft.appendEntry("a");
+    _ = try raft.appendEntry("b");
+    _ = try raft.appendEntry("c");
+
+    raft.becomeLeader();
+
+    // The probe answered with a higher term, so the new leader stepped back down
+    // before its heartbeat could rewrite the maps — which is what makes
+    // `becomeLeader`'s own initialization observable: next_index = last log
+    // index + 1, match_index = 0 for every peer.
+    try testing.expectEqual(RaftState.follower, raft.getState());
+    try testing.expectEqual(@as(u64, 2), raft.getTerm());
+    for (raft.peers.items) |peer| {
+        try testing.expectEqual(@as(u64, 4), raft.next_index.get(peer.id).?);
+        try testing.expectEqual(@as(u64, 0), raft.match_index.get(peer.id).?);
+    }
+}
+
+test "RaftElection leader commits an append only once a quorum replicates it" {
+    const allocator = testing.allocator;
+
+    var cluster = try TestCluster.init(allocator, 3);
+    defer cluster.deinit();
+
+    cluster.electLeader(0);
+    const leader = &cluster.nodes.items[0].election;
+
+    // `appendEntry` tries to commit immediately, and in a 3-node cluster the
+    // leader alone is not a quorum: the entry stays uncommitted until the
+    // followers hold it too.
+    _ = try leader.appendEntry("unreplicated");
+    try testing.expectEqual(@as(u64, 0), leader.getCommitIndex());
+
+    try cluster.replicate(0, "replicated");
+    try testing.expectEqual(@as(u64, 2), leader.getCommitIndex());
+}
+
+test "RaftElection degenerate election timeout window still schedules an election" {
+    const allocator = testing.allocator;
+    AppendEntriesCapture.reset();
+
+    var impl = TestTransportVTable{
+        .sendVoteRequest = noopVoteRequest,
+        .sendAppendEntries = AppendEntriesCapture.accept,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
+
+    // min == max used to reach `x % 0` inside `randomElectionTimeout`: a
+    // division-by-zero panic on the first elapsed election deadline.
+    var peers = [_]Peer{.{ .id = "n1", .address = "" }};
+    var raft = try RaftElection.init(allocator, "n0", &peers, .{
+        .election_timeout_min_ms = 120,
+        .election_timeout_max_ms = 120,
+    }, &transport);
+    defer raft.deinit();
+
+    const before = Time.monotonicNowMilliseconds();
+    raft.election_deadline_ms = before - 1;
+    try raft.tick();
+
+    try testing.expectEqual(RaftState.candidate, raft.getState());
+    try testing.expectEqual(@as(u64, 1), raft.getTerm());
+    // The window is one value wide, so the new deadline is exactly that far out.
+    try testing.expect(raft.election_deadline_ms >= before + 120);
 }

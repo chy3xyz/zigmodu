@@ -3,8 +3,15 @@
 
 const std = @import("std");
 const zigmodu = @import("zigmodu");
+const data = zigmodu.data;
 const model = @import("model.zig");
 const persistence = @import("persistence.zig");
+
+pub const OrderEvent = union(enum) {
+    created: struct { id: i64 },
+    updated: struct { id: i64 },
+    deleted: struct { id: i64 },
+};
 
 pub const OrderService = struct {
     persistence: *persistence.OrderPersistence,

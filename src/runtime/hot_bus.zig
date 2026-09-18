@@ -27,6 +27,16 @@
 //! *business* events where "everyone eventually sees it" matters, so it is
 //! allowed to allocate and to be slower. Use L0 where a missed event is
 //! acceptable and a stalled publisher is not. See `docs/RUNTIME.md` §6.
+//!
+//! Positioning: `HotBus` is a **user-facing** L0 primitive. The framework
+//! itself has no internal consumer — deliberately. The in-framework hot paths
+//! that exist today are all single-consumer or pull-based (runtime stats are
+//! aggregated on demand by `Runtime.stats()`, `im.ConnectionRegistry` is a
+//! point-to-point routing table, `AgentWorker.on_result` is one callback whose
+//! `Done` borrows memory that is freed right after it returns). Wiring a
+//! fan-out into any of them would manufacture a subscriber nobody needs and
+//! change that path's semantics, so L0 fan-out stays an opt-in application
+//! tool; `examples/runtime-workers` shows the intended use.
 
 const std = @import("std");
 

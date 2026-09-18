@@ -147,6 +147,8 @@ pub const Config = struct {
     validate_on_start: bool = true,
     auto_generate_docs: bool = false,
     docs_path: ?[]const u8 = null,
+    // 启动期超限告警（warnOverDependencyLimit）；0 关闭
+    max_dependencies: usize = 8,
 };
 ```
 

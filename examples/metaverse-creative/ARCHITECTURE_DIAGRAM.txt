@@ -150,6 +150,6 @@ Legend:
                                                                                 
                                                                                 
 Generated: 2025-01-09
-Framework: ZigModu v0.4.0
+Framework: ZigModu v0.24.0
 Project: MetaVerse Creative Economy Demo
                                                                                 

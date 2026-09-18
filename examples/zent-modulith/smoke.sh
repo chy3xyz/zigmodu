@@ -10,6 +10,10 @@
 #
 # Usage:  bash examples/zent-modulith/smoke.sh [PORT]
 # Requires: sqlite3 headers (the CI "Build Examples" job installs them).
+#
+# ZENT_SMOKE_SKIP_BUILD=1 skips the `zig build` below — set by the example's
+# `zig build test` step, which already installed the binary it runs here (a
+# nested build would otherwise contend for the same cache).
 set -uo pipefail
 
 PORT="${1:-${PORT:-18111}}"
@@ -23,8 +27,12 @@ export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$ROOT/.zig-global-cache}"
 cleanup() { [[ -n "${PID:-}" ]] && kill "$PID" 2>/dev/null; rm -f "$DB"* "$LOG"; }
 trap cleanup EXIT
 
-echo "smoke: building zent-modulith"
-(cd "$EX" && zig build) || { echo "smoke: build failed"; exit 1; }
+if [[ "${ZENT_SMOKE_SKIP_BUILD:-0}" == "1" ]]; then
+  echo "smoke: using the binary built by the caller ($EX/zig-out/bin/zent-modulith)"
+else
+  echo "smoke: building zent-modulith"
+  (cd "$EX" && zig build) || { echo "smoke: build failed"; exit 1; }
+fi
 
 echo "smoke: starting server on :$PORT (db=$DB)"
 ZENT_SQLITE="$DB" ZENT_DEV_TOKEN=1 HTTP_PORT="$PORT" "$EX/zig-out/bin/zent-modulith" > "$LOG" 2>&1 &

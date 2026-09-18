@@ -3,7 +3,7 @@ const zigmodu = @import("zigmodu");
 
 // ═══════════════════════════════════════════════════
 // Multi-Tenant Management System
-// ZigModu v0.13.15 Best Practice Demo
+// ZigModu v0.24.0 Best Practice Demo
 //
 // Architecture:
 //   HTTP → Middleware (JWT/Tenant/DataPermission) → API (Tenant/User/Subscription) → Service → Persistence → DB

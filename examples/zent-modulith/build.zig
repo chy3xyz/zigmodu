@@ -52,4 +52,13 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     const run_step = b.step("run", "Run zent + ZigModu demo server");
     run_step.dependOn(&run_cmd.step);
+
+    // Runtime smoke suite. This example ships no Zig test blocks: `smoke.sh`
+    // boots the built server and asserts every demo route (43 checks), which is
+    // the only layer that catches a zent contract change.
+    const smoke = b.addSystemCommand(&.{ "bash", "smoke.sh" });
+    smoke.step.dependOn(b.getInstallStep());
+    smoke.setEnvironmentVariable("ZENT_SMOKE_SKIP_BUILD", "1");
+    const test_step = b.step("test", "Run the runtime smoke suite (bash smoke.sh)");
+    test_step.dependOn(&smoke.step);
 }

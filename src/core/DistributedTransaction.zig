@@ -1,5 +1,6 @@
 const std = @import("std");
 const Time = @import("Time.zig");
+const TransactionJournal = @import("TransactionJournal.zig").TransactionJournal;
 
 /// Distributed transaction manager based on the Saga pattern.
 /// Runs a transaction's steps in order; the first step that fails triggers
@@ -199,11 +200,20 @@ pub const TransactionStatistics = struct {
 };
 
 /// Two-phase commit (2PC): participants vote in Prepare, then all commit or roll back.
+///
+/// Attach a `TransactionJournal` with `setJournal` to make the coordinator's
+/// decisions durable: the `prepared` record is written before any participant
+/// is told to commit, so a coordinator that dies between the phases leaves an
+/// in-doubt transaction that `recover` reports instead of a participant that is
+/// locked forever. Without a journal the coordinator is memory-only — the
+/// behaviour every existing caller already has.
 pub const TwoPhaseCommit = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
     coordinators: std.StringHashMap(TransactionCoordinator),
+    /// Optional durable coordinator log. Unset = in-memory coordinator.
+    journal: ?*TransactionJournal = null,
 
     pub const TransactionCoordinator = struct {
         tx_id: []const u8,
@@ -253,11 +263,19 @@ pub const TwoPhaseCommit = struct {
     /// Create coordinator
     pub fn createCoordinator(self: *Self, tx_id: []const u8) !void {
         const id_copy = try self.allocator.dupe(u8, tx_id);
-        try self.coordinators.put(id_copy, .{
+        self.coordinators.put(id_copy, .{
             .tx_id = id_copy,
             .status = .PREPARING,
             .participants = std.ArrayList(TransactionCoordinator.Participant).empty,
-        });
+        }) catch |err| {
+            self.allocator.free(id_copy);
+            return err;
+        };
+        // The map owns `id_copy` from here: undo the registration if the
+        // journal cannot record it, rather than leaving a coordinator the log
+        // has never heard of.
+        errdefer self.dropCoordinator(tx_id);
+        try self.journalRecord(tx_id, .begun, &.{});
     }
 
     /// Add participant
@@ -271,6 +289,17 @@ pub const TwoPhaseCommit = struct {
     ) !void {
         const coord = self.coordinators.getPtr(tx_id) orelse return error.CoordinatorNotFound;
 
+        // Journal the grown participant list before it exists in memory: a
+        // crash in between leaves a `begun` record that names the participant,
+        // never the reverse.
+        {
+            var ids = std.ArrayList([]const u8).empty;
+            defer ids.deinit(self.allocator);
+            for (coord.participants.items) |participant| try ids.append(self.allocator, participant.id);
+            try ids.append(self.allocator, participant_id);
+            try self.journalRecord(tx_id, .begun, ids.items);
+        }
+
         try coord.participants.append(self.allocator, .{
             .id = try self.allocator.dupe(u8, participant_id),
             .prepare = prepare,
@@ -279,12 +308,58 @@ pub const TwoPhaseCommit = struct {
         });
     }
 
-    /// Run both phases: prepare everyone, then commit if all voted yes,
-    /// otherwise roll back every participant and return error.TransactionAborted.
-    pub fn execute(self: *Self, tx_id: []const u8) !void {
+    /// Attach the durable coordinator log (`docs/DISTRIBUTED.md`).
+    pub fn setJournal(self: *Self, journal: *TransactionJournal) void {
+        self.journal = journal;
+    }
+
+    fn dropCoordinator(self: *Self, tx_id: []const u8) void {
+        const coord = self.coordinators.getPtr(tx_id) orelse return;
+        for (coord.participants.items) |participant| self.allocator.free(participant.id);
+        coord.participants.deinit(self.allocator);
+        if (self.coordinators.fetchRemove(tx_id)) |entry| {
+            self.allocator.free(entry.key);
+        }
+    }
+
+    /// Append one coordinator lifecycle record. Fail-closed: a coordinator with
+    /// a journal refuses to advance when the record cannot be written (an
+    /// unjournaled decision is exactly the in-doubt hole this closes).
+    fn journalRecord(self: *Self, tx_id: []const u8, state: TransactionJournal.TxState, participant_ids: []const []const u8) !void {
+        const journal = self.journal orelse return;
+        const participants = try TransactionJournal.joinParticipants(self.allocator, participant_ids);
+        defer self.allocator.free(participants);
+        try journal.record(.{ .tx_id = tx_id, .state = state, .participants = participants });
+    }
+
+    /// Journal the state of a coordinator whose participants are already registered.
+    fn journalCoordinator(self: *Self, coord: *const TransactionCoordinator, state: TransactionJournal.TxState) !void {
+        if (self.journal == null) return;
+        var ids = std.ArrayList([]const u8).empty;
+        defer ids.deinit(self.allocator);
+        for (coord.participants.items) |participant| try ids.append(self.allocator, participant.id);
+        try self.journalRecord(coord.tx_id, state, ids.items);
+    }
+
+    /// In-doubt transactions from the journal: prepared with no commit/abort
+    /// decision on record. **Reports only** — no retry, no rollback, no timeout
+    /// policy; the caller decides what the participants should be told. Returns
+    /// an empty list when no journal is attached. Free with
+    /// `zigmodu.TransactionJournal.freeInDoubt`.
+    pub fn recover(self: *Self, allocator: std.mem.Allocator) ![]TransactionJournal.InDoubt {
+        const journal = self.journal orelse return allocator.alloc(TransactionJournal.InDoubt, 0);
+        return journal.recover(allocator);
+    }
+
+    /// Phase 1: collect every vote. When they are all YES the commit decision is
+    /// journaled (`prepared`) before this returns — the in-doubt record — and
+    /// the coordinator stays `.PREPARED` until phase 2.
+    ///
+    /// Returns false when a participant voted NO; the caller then decides with
+    /// `abortPhase` (which journals the abort decision before rolling back).
+    pub fn preparePhase(self: *Self, tx_id: []const u8) !bool {
         const coord = self.coordinators.getPtr(tx_id) orelse return error.CoordinatorNotFound;
 
-        // Phase 1: Prepare
         std.log.info("2PC Phase 1: Prepare for transaction {s}", .{tx_id});
         coord.status = .PREPARING;
 
@@ -302,34 +377,66 @@ pub const TwoPhaseCommit = struct {
             }
         }
 
-        // Phase 2: Commit or Abort
         if (all_prepared) {
-            std.log.info("2PC Phase 2: Commit for transaction {s}", .{tx_id});
-            coord.status = .COMMITTING;
-
-            for (coord.participants.items) |participant| {
-                participant.commit();
-            }
-
-            coord.status = .COMMITTED;
-            std.log.info("Transaction {s} committed successfully", .{tx_id});
-        } else {
-            std.log.info("2PC Phase 2: Abort for transaction {s}", .{tx_id});
-            coord.status = .ABORTING;
-
-            for (coord.participants.items) |participant| {
-                participant.rollback();
-            }
-
-            coord.status = .ABORTED;
-            std.log.info("Transaction {s} aborted", .{tx_id});
-            return error.TransactionAborted;
+            try self.journalCoordinator(coord, .prepared);
+            coord.status = .PREPARED;
         }
+        return all_prepared;
+    }
+
+    /// Phase 2, commit branch: tell every participant to commit, then journal
+    /// `committed`. A failure to journal here leaves a false in-doubt record
+    /// (the transaction *is* committed) — reported to a human rather than
+    /// silently forgotten, which is the safe direction.
+    pub fn commitPhase(self: *Self, tx_id: []const u8) !void {
+        const coord = self.coordinators.getPtr(tx_id) orelse return error.CoordinatorNotFound;
+
+        std.log.info("2PC Phase 2: Commit for transaction {s}", .{tx_id});
+        coord.status = .COMMITTING;
+
+        for (coord.participants.items) |participant| {
+            participant.commit();
+        }
+
+        coord.status = .COMMITTED;
+        try self.journalCoordinator(coord, .committed);
+        std.log.info("Transaction {s} committed successfully", .{tx_id});
+    }
+
+    /// Phase 2, abort branch: journal the `aborted` decision, then roll every
+    /// participant back.
+    pub fn abortPhase(self: *Self, tx_id: []const u8) !void {
+        const coord = self.coordinators.getPtr(tx_id) orelse return error.CoordinatorNotFound;
+
+        std.log.info("2PC Phase 2: Abort for transaction {s}", .{tx_id});
+        // Decision before action: a crash mid-rollback then replays an abort
+        // nobody must re-decide.
+        try self.journalCoordinator(coord, .aborted);
+        coord.status = .ABORTING;
+
+        for (coord.participants.items) |participant| {
+            participant.rollback();
+        }
+
+        coord.status = .ABORTED;
+        std.log.info("Transaction {s} aborted", .{tx_id});
+    }
+
+    /// Run both phases: prepare everyone, then commit if all voted yes,
+    /// otherwise roll back every participant and return error.TransactionAborted.
+    pub fn execute(self: *Self, tx_id: []const u8) !void {
+        if (try self.preparePhase(tx_id)) {
+            try self.commitPhase(tx_id);
+            return;
+        }
+        try self.abortPhase(tx_id);
+        return error.TransactionAborted;
     }
 };
 
-/// In-memory append-only transaction log for crash recovery.
-/// Records all transaction lifecycle events so state can be replayed.
+/// In-memory append-only transaction log (saga-style lifecycle events).
+/// Process-local: `replay` can only recover state the process still holds — the
+/// durable 2PC coordinator log is `TransactionJournal`.
 pub const TransactionLog = struct {
     allocator: std.mem.Allocator,
     entries: std.ArrayList(LogEntry),
@@ -563,4 +670,173 @@ test "TransactionLog abort and compensate" {
     const active = try log.replay(allocator);
     defer allocator.free(active);
     try std.testing.expectEqual(@as(usize, 0), active.len);
+}
+
+fn voteYes() bool {
+    return true;
+}
+
+fn voteNo() bool {
+    return false;
+}
+
+fn commitNoop() void {}
+
+fn rollbackNoop() void {}
+
+test "TwoPhaseCommit without a journal reports no in-doubt transactions" {
+    const allocator = std.testing.allocator;
+
+    var tpc = TwoPhaseCommit.init(allocator);
+    defer tpc.deinit();
+
+    try tpc.createCoordinator("tx-1");
+    try tpc.addParticipant("tx-1", "orders", voteYes, commitNoop, rollbackNoop);
+
+    try tpc.execute("tx-1");
+    try std.testing.expectEqual(TwoPhaseCommit.TransactionCoordinator.TwoPhaseStatus.COMMITTED, tpc.coordinators.get("tx-1").?.status);
+
+    const in_doubt = try tpc.recover(allocator);
+    defer TransactionJournal.freeInDoubt(allocator, in_doubt);
+    try std.testing.expectEqual(@as(usize, 0), in_doubt.len);
+}
+
+test "TwoPhaseCommit journals the decision so commit and abort leave nothing in doubt" {
+    const allocator = std.testing.allocator;
+    const data = @import("../data.zig");
+
+    var client = data.sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    const backend = data.SqlxBackend{ .allocator = allocator, .client = &client };
+
+    var journal = TransactionJournal.initWithBackend(allocator, backend);
+    defer journal.deinit();
+    try journal.migrate();
+
+    var tpc = TwoPhaseCommit.init(allocator);
+    defer tpc.deinit();
+    tpc.setJournal(&journal);
+
+    // Committed transaction: no longer in doubt once phase 2 journals it.
+    try tpc.createCoordinator("tx-commit");
+    try tpc.addParticipant("tx-commit", "orders", voteYes, commitNoop, rollbackNoop);
+    try tpc.addParticipant("tx-commit", "inventory", voteYes, commitNoop, rollbackNoop);
+    try tpc.execute("tx-commit");
+    try std.testing.expectEqual(TwoPhaseCommit.TransactionCoordinator.TwoPhaseStatus.COMMITTED, tpc.coordinators.get("tx-commit").?.status);
+
+    // Aborted transaction: the NO vote journals `aborted`, never `prepared`.
+    try tpc.createCoordinator("tx-abort");
+    try tpc.addParticipant("tx-abort", "orders", voteNo, commitNoop, rollbackNoop);
+    try std.testing.expectError(error.TransactionAborted, tpc.execute("tx-abort"));
+    try std.testing.expectEqual(TwoPhaseCommit.TransactionCoordinator.TwoPhaseStatus.ABORTED, tpc.coordinators.get("tx-abort").?.status);
+
+    const in_doubt = try tpc.recover(allocator);
+    defer TransactionJournal.freeInDoubt(allocator, in_doubt);
+    try std.testing.expectEqual(@as(usize, 0), in_doubt.len);
+}
+
+test "TwoPhaseCommit: in-doubt transaction survives a coordinator crash" {
+    const allocator = std.testing.allocator;
+    const data = @import("../data.zig");
+    const db_path = "/tmp/zigmodu_2pc_in_doubt.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, db_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, db_path) catch {};
+
+    // Coordinator #1 reaches `prepared` for both participants and then dies —
+    // neither `commitPhase` nor `abortPhase` ever runs.
+    {
+        var client = data.sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = db_path });
+        defer client.deinit();
+        try client.connect();
+        const backend = data.SqlxBackend{ .allocator = allocator, .client = &client };
+        var journal = TransactionJournal.initWithBackend(allocator, backend);
+        defer journal.deinit();
+        try journal.migrate();
+
+        var tpc = TwoPhaseCommit.init(allocator);
+        defer tpc.deinit();
+        tpc.setJournal(&journal);
+
+        try tpc.createCoordinator("tx-in-doubt");
+        try tpc.addParticipant("tx-in-doubt", "orders", voteYes, commitNoop, rollbackNoop);
+        try tpc.addParticipant("tx-in-doubt", "inventory", voteYes, commitNoop, rollbackNoop);
+
+        try std.testing.expect(try tpc.preparePhase("tx-in-doubt"));
+        try std.testing.expectEqual(TwoPhaseCommit.TransactionCoordinator.TwoPhaseStatus.PREPARED, tpc.coordinators.get("tx-in-doubt").?.status);
+    }
+
+    // Coordinator #2: new process, same database. The in-doubt transaction is
+    // reported so someone can decide what the participants should be told.
+    var client = data.sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = db_path });
+    defer client.deinit();
+    try client.connect();
+    const backend = data.SqlxBackend{ .allocator = allocator, .client = &client };
+    var journal = TransactionJournal.initWithBackend(allocator, backend);
+    defer journal.deinit();
+    try journal.migrate();
+
+    var tpc = TwoPhaseCommit.init(allocator);
+    defer tpc.deinit();
+    tpc.setJournal(&journal);
+
+    const in_doubt = try tpc.recover(allocator);
+    defer TransactionJournal.freeInDoubt(allocator, in_doubt);
+    try std.testing.expectEqual(@as(usize, 1), in_doubt.len);
+    try std.testing.expectEqualStrings("tx-in-doubt", in_doubt[0].tx_id);
+    try std.testing.expectEqual(@as(usize, 2), in_doubt[0].participants.len);
+    try std.testing.expectEqualStrings("orders", in_doubt[0].participants[0]);
+    try std.testing.expectEqualStrings("inventory", in_doubt[0].participants[1]);
+}
+
+test "TwoPhaseCommit: a reported in-doubt transaction can be decided after recovery" {
+    const allocator = std.testing.allocator;
+    const data = @import("../data.zig");
+    const db_path = "/tmp/zigmodu_2pc_resume.db";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, db_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, db_path) catch {};
+
+    {
+        var client = data.sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = db_path });
+        defer client.deinit();
+        try client.connect();
+        const backend = data.SqlxBackend{ .allocator = allocator, .client = &client };
+        var journal = TransactionJournal.initWithBackend(allocator, backend);
+        defer journal.deinit();
+        try journal.migrate();
+
+        var tpc = TwoPhaseCommit.init(allocator);
+        defer tpc.deinit();
+        tpc.setJournal(&journal);
+
+        try tpc.createCoordinator("tx-resume");
+        try tpc.addParticipant("tx-resume", "orders", voteYes, commitNoop, rollbackNoop);
+        try std.testing.expect(try tpc.preparePhase("tx-resume"));
+    }
+
+    // New coordinator: report, then re-drive the commit (the caller's policy —
+    // the coordinator supplies no retry/rollback decision of its own).
+    var client = data.sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = db_path });
+    defer client.deinit();
+    try client.connect();
+    const backend = data.SqlxBackend{ .allocator = allocator, .client = &client };
+    var journal = TransactionJournal.initWithBackend(allocator, backend);
+    defer journal.deinit();
+
+    var tpc = TwoPhaseCommit.init(allocator);
+    defer tpc.deinit();
+    tpc.setJournal(&journal);
+
+    const in_doubt = try tpc.recover(allocator);
+    defer TransactionJournal.freeInDoubt(allocator, in_doubt);
+    try std.testing.expectEqual(@as(usize, 1), in_doubt.len);
+    try std.testing.expectEqualStrings("tx-resume", in_doubt[0].tx_id);
+
+    try tpc.createCoordinator("tx-resume");
+    try tpc.addParticipant("tx-resume", "orders", voteYes, commitNoop, rollbackNoop);
+    try tpc.commitPhase("tx-resume");
+
+    const after = try tpc.recover(allocator);
+    defer TransactionJournal.freeInDoubt(allocator, after);
+    try std.testing.expectEqual(@as(usize, 0), after.len);
 }

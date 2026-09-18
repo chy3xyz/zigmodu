@@ -25,6 +25,21 @@ try orch.restoreFromWal();              // 崩溃遗留的实例回到 .running
 for (orch.listActiveInstances()) |id| try orch.resumeInstance(id);
 ```
 
+## 步骤超时：`timeout_seconds` 是事后判定，不是中断
+
+进程内执行器**无法抢占**一个正在运行的 step，所以 `SagaStep.timeout_seconds`
+（秒，`0` = 不做预算检查，默认 30）的语义是**诚实的事后判定**：
+
+- step 的 action 正常返回后，若实际耗时 > 预算，实例判为 `.timed_out` —— 终态，
+  与 `failed` 同级但可区分；`execute` / `resumeInstance` 返回 `error.SagaStepTimeout`。
+- 超时的那一步**已经执行完、副作用已生效**，所以它会和之前已完成的步一起被逆序补偿
+  （对照：action 报错的步没有生效，只补偿它之前的步）。
+- `.timed_out` 与 `completed` / `compensated` / `failed` 同为终态：
+  `restoreFromWal` 不恢复，`resumeInstance` 拒绝（`error.NothingToResume`）。
+
+要"到点立即掐死 step"需要可抢占的执行环境（独立进程 / 远程调用 + 取消令牌），
+不在进程内编排器的范围内。
+
 ## 本版修掉的三个真问题（都由新测试暴露）
 
 1. **恢复会"复活"已结束的实例**：`restoreFromWal` 原先逐条看记录，只要**任意**一条是

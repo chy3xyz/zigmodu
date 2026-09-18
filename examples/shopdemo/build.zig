@@ -41,4 +41,18 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     const run_step = b.step("run", "Run shopdemo API server");
     run_step.dependOn(&run_cmd.step);
+
+    // Module test suite. `tests.zig` is the root because the generated
+    // `test.zig` / `_arch_test.zig` files are not imported by `src/main.zig`;
+    // without it Zig compiles no test in this example.
+    const tests_mod = b.createModule(.{
+        .root_source_file = b.path("tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tests_mod.addImport("zigmodu", zigmodu_mod);
+
+    const tests = b.addTest(.{ .root_module = tests_mod });
+    const test_step = b.step("test", "Run the shopdemo example tests");
+    test_step.dependOn(&b.addRunArtifact(tests).step);
 }

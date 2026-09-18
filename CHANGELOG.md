@@ -1,5 +1,54 @@
 # Changelog
 
+## [Unreleased]
+
+### 集群：门面 + 选主状态机补完
+
+- **`ClusterBootstrap` 补成完整门面**：`tick()` 现在一次做完 `membership.runOnce()` → `view.sync()` →
+  **`raft.tick()`**（此前从没人驱动选举）；配了 `.transport` 时 `start()` **启动入站监听**并把连接交给
+  `RaftTransport.handleConnection` 分发（端口起不来就 `error.RaftInboundListenFailed`，不静默降级），`stop()` 对应停掉；
+  新增 `pick(key)`（rendezvous 选点）与 `healthJson(allocator)`，请求路径不必再自己拼 view/health。
+- **修一个真 bug**：`start()` 把 `ElectionTransport` 存在**栈局部**再取地址给 `RaftElection` → `start()` 一返回即悬垂，
+  第一次选举会跳到死函数指针（新测试实测 `Bus error`）；改为存字段。
+- **选主状态机**：单节点（`cluster_size == 1`）**首次 election 即当选**（此前永远选不出）；`max_append_entries` 真接上
+  （落后量大时分批，`@max(1, config)` 防 0 卡死）；`appendEntry` 末尾补 `advanceCommitIndex()`（单节点写入不再等心跳）。
+  口径保持"只数 peer 票"，写进了 `startElection`/`handleVoteResponse`/`hasQuorum` 注释。
+- **修一个真 bug**：`randomElectionTimeout` 在 `min == max` 时 `% 0` → **panic: division by zero**（退化为 `max(1, min)`）。
+- **LB 有意不接**：`LoadBalancer` 的数据源是 PeerDiscovery 的「服务名→Peer」+ canary/计数，与读侧的「成员 id→地址+健康」
+  是两份事实；每 tick 镜像会破坏 `sync()` 稳态零分配。已在 `docs/DISTRIBUTED.md` 写明接入点与分工。
+
+### 2PC 持久化协调日志（in-doubt 有解）
+
+- 新增 `src/core/TransactionJournal.zig`（`zigmodu.TransactionJournal`）：append-only、**只 INSERT 不 UPDATE**、
+  DDL 方言中立、走 `data.SqlxBackend` 领域缝；不配 backend 时退回内存。
+- 写点：`begun`（带参与者名单）→ **`prepared` 先落盘再返回**（崩溃窗口）→ `committed`；`abortPhase` 先写 `aborted` 再回滚。
+  配了日志即 **fail-closed**（写不进去就报错、不前进）。
+- `recover()` **只报告不决策**：返回"prepared 且无终态"的事务 + 参与者，供调用方自行重试/回滚。
+  8 个新测试，含"preparePhase 后丢掉协调者 → 新实例 recover 读出 in-doubt"的崩溃恢复用例。
+
+### Workflow / Saga
+
+- `SagaStep.timeout_seconds` **真正生效**：事后判定（步骤耗时超预算 → 持久化 → 逆序补偿**含该步** → 终态 `.timed_out`
+  → 返回 `error.SagaStepTimeout`）；`0` 表示不做预算。字段注释、`SagaStatus` 注释与 `docs/WORKFLOW.md` 同步。
+
+### alpha-engine 参考实现推进到 P1–P3
+
+- **P1 观测与容错**：HotBus 扇出（慢 audit worker 被丢弃计数、O(1) metrics sink 一条不漏）+ 被监督停掉的
+  `FaultyFillReporter` + 可见背压；**四条断言**（`bus.dropped > 0`、`dropped_full > 0`、`stopped_by_supervisor`、`timer_fires > 0`）。
+- **P2 模块化**：拆成 `market → book → alpha → risk → exec` + `audit`（跨模块零 import，消息统一放 `contracts.zig`）；
+  `zmodu doctor`（7 modules / architecture OK）与 `zmodu ci` 六步全 PASS。
+- **P3 AI 提议侧**：日终快照 → `ai.AgentWorker`（**注入 executor**，离线确定性）→ `ai.ProposalPipeline`
+  （`guard(.propose)` 允许 → `ai.RiskReview` → `guard(.execute)` 被拒 → `execute_not_permitted`）→ **非 agent 路径**的
+  desk 授权后由 `PaperExchange` 成交。两条 P3 断言（`denied_execute_class > 0` 且 **`effect_reached = 0`**、提议→授权→成交闭环）。
+
+### 示例与文档
+
+- **`shopdemo` 的 12 个测试真正跑起来**（此前不在导入图里，Zig 从不编译）：新增测试根 + test step，
+  顺带暴露并修掉一处腐坏（`generated-sample/service.zig` 引用不存在的 `OrderEvent`）；`zent-modulith` 加 test step（`smoke.sh` 43 checks）。
+- CI 的 test-step 循环补 `shopdemo`；`doctor`/`audit`/`test` 三个子集循环各加一行"Subset by construction"说明。
+- 元数据/文档一致性清扫：`metaverse-creative`、`tenant-mgmt` 的旧版本号；`docs/BEST_PRACTICES.md` 两份审计清单标 ✅ 并加图例；
+  `docs/DISTRIBUTED.md` 的门面/2PC/选主播述全部改成事实。
+
 ## [0.24.0] - 2026-09-17
 
 > **⚠️ 破坏性变更**：删除 7 个示例文件/目录（`examples/testing/`、`examples/deprecated/`、`examples/cluster-demo/`、

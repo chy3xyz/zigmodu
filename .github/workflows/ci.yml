@@ -163,6 +163,7 @@ jobs:
         # because the framework's own tree is not laid out as src/modules/<name>.
         run: |
           set -euo pipefail
+          # Subset by construction: doctor needs a module graph, so only module-layout examples are listed.
           for app in tenant-mgmt tenant-shop shopdemo zent-modulith alpha-engine; do
             echo "== doctor examples/$app =="
             ./zig-out/bin/zmodu doctor "examples/$app"
@@ -211,6 +212,7 @@ jobs:
       - name: zmodu audit CLI smoke (best-practice checker)
         run: |
           set -euo pipefail
+          # Subset by construction: only examples that pass the checker cleanly; the legacy one (shopdemo) is exercised through the baseline path below.
           for ex in tenant-mgmt tenant-shop basic ai-ops zmsaas/backend; do
             ./zig-out/bin/zmodu audit "examples/$ex" -j | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['pass'], d"
           done
@@ -326,11 +328,13 @@ jobs:
       - name: Run the example test steps
         # Only the examples that ship a `test` step: this runs the same command
         # their READMEs advertise, so a broken assertion is caught here instead
-        # of in a reader's clone. Not covered yet: examples with tests but no
-        # step (shopdemo, zent-modulith).
+        # of in a reader's clone. zent-modulith is absent on purpose — its
+        # `test` step runs `smoke.sh`, which the `Smoke zent-modulith` step of
+        # the `build-and-test` job above already runs once per workflow.
         run: |
           set -euo pipefail
-          for ex in ai-ops basic llm-policies tenant-ai web4; do
+          # Subset by construction: the examples whose build.zig ships a `test` step — examples/README.md marks the same rows.
+          for ex in ai-ops basic llm-policies shopdemo tenant-ai web4; do
             echo "== testing examples/$ex =="
             (cd "examples/$ex" && zig build test)
           done

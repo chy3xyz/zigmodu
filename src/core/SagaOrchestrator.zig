@@ -13,11 +13,20 @@ pub const SagaStep = struct {
     compensation: *const fn () void,
     /// Whether the step may be retried
     retryable: bool = true,
-    /// Timeout in seconds
+    /// Per-step budget in seconds; `0` disables the check.
+    ///
+    /// Judged *after* the step returns — an in-process executor cannot preempt
+    /// a running step. When the action took longer than the budget the instance
+    /// ends `.timed_out` and every step whose effects took place (this one
+    /// included, because it DID return successfully) is compensated in reverse
+    /// order; `execute` / `resumeInstance` then return `error.SagaStepTimeout`.
     timeout_seconds: u64 = 30,
 };
 
-/// Saga transaction status
+/// Saga transaction status. Terminal states — `completed`, `compensated`,
+/// `failed`, `timed_out` — are refused by `resumeInstance` and skipped by
+/// `restoreFromWal`. `timed_out` is a post-hoc verdict (see
+/// `SagaStep.timeout_seconds`), never a mid-step interruption.
 pub const SagaStatus = enum {
     pending,
     running,
@@ -185,7 +194,10 @@ pub const SagaOrchestrator = struct {
             const running = self.running_instances.getPtr(instance_id) orelse return error.InternalError;
             running.current_step = i;
 
-            const step_start = Time.monotonicNowSeconds();
+            // Milliseconds are what the budget is checked against; the step log
+            // keeps seconds. divFloor(ms) == monotonicNowSeconds().
+            const step_start_ms = Time.monotonicNowMilliseconds();
+            const step_start = @divFloor(step_start_ms, std.time.ms_per_s);
 
             step.action() catch |err| {
                 const step_end = Time.monotonicNowSeconds();
@@ -211,7 +223,8 @@ pub const SagaOrchestrator = struct {
                 return error.SagaStepFailed;
             };
 
-            const step_end = Time.monotonicNowSeconds();
+            const step_end_ms = Time.monotonicNowMilliseconds();
+            const step_end = @divFloor(step_end_ms, std.time.ms_per_s);
 
             try running.step_logs.append(self.allocator, .{
                 .step_name = try self.allocator.dupe(u8, step.name),
@@ -220,6 +233,24 @@ pub const SagaOrchestrator = struct {
                 .ended_at = step_end,
                 .error_message = null,
             });
+
+            // Post-hoc timeout judgement: a step cannot be preempted mid-flight,
+            // so the budget is only checked when it returns. The step DID
+            // complete — its side effects are real — so it is compensated along
+            // with the steps before it (`compensate` covers indices `< i + 1`).
+            const elapsed_ms = step_end_ms - step_start_ms;
+            if (step.timeout_seconds > 0 and
+                @as(u128, @intCast(elapsed_ms)) > @as(u128, step.timeout_seconds) * std.time.ms_per_s)
+            {
+                running.last_error = try std.fmt.allocPrint(self.allocator, "step '{s}' exceeded its {d}s budget (took {d}ms)", .{ step.name, step.timeout_seconds, elapsed_ms });
+                std.log.warn("[Saga] Step '{s}' in '{s}' timed out: {d}ms over a {d}s budget", .{ step.name, instance_id, elapsed_ms, step.timeout_seconds });
+                self.saveSagaState(instance_id);
+                try self.compensate(instance_id, i + 1);
+                const done = self.running_instances.getPtr(instance_id) orelse return error.InternalError;
+                done.status = .timed_out;
+                self.saveSagaState(instance_id);
+                return error.SagaStepTimeout;
+            }
 
             std.log.info("[Saga] Step '{s}' completed in '{s}'", .{ step.name, instance_id });
             self.saveSagaState(instance_id);
@@ -242,7 +273,8 @@ pub const SagaOrchestrator = struct {
     /// * The step that was *in flight* when the process died **is** re-run, because
     ///   nothing recorded whether it took effect — so a step with side effects must
     ///   be idempotent (the same requirement every at-least-once system has).
-    /// * A terminal instance (`.completed`, `.compensated`, `.failed`) is refused:
+    /// * A terminal instance (`.completed`, `.compensated`, `.failed`,
+    ///   `.timed_out`) is refused:
     ///   re-running a compensated saga would compensate side effects twice.
     pub fn resumeInstance(self: *Self, instance_id: []const u8) !void {
         const inst = self.running_instances.getPtr(instance_id) orelse return error.UnknownInstance;
@@ -560,6 +592,120 @@ test "SagaOrchestrator auto-compensation on failure" {
 
     const result = orchestrator.execute("fail-saga");
     try std.testing.expectError(error.SagaStepFailed, result);
+}
+
+test "SagaOrchestrator timeout_seconds = 0 disables the budget" {
+    const allocator = std.testing.allocator;
+    var orchestrator = SagaOrchestrator.init(allocator);
+    defer orchestrator.deinit();
+
+    const steps = &[_]SagaStep{
+        .{
+            .name = "no-budget",
+            .action = struct {
+                fn act() !void {}
+            }.act,
+            .compensation = struct {
+                fn comp() void {}
+            }.comp,
+            .timeout_seconds = 0,
+        },
+    };
+
+    try orchestrator.registerSaga("no-budget-saga", steps);
+    const instance_id = try orchestrator.execute("no-budget-saga");
+    try std.testing.expectEqual(SagaStatus.completed, orchestrator.getStatus(instance_id).?);
+}
+
+test "SagaOrchestrator step over budget ends timed_out and compensates what ran" {
+    const allocator = std.testing.allocator;
+    var orchestrator = SagaOrchestrator.init(allocator);
+    defer orchestrator.deinit();
+
+    const Ctx = struct {
+        var order: [4][]const u8 = undefined;
+        var n: usize = 0;
+        var never_ran: bool = false;
+        fn compSlow() void {
+            order[n] = "slow";
+            n += 1;
+        }
+        fn compFast() void {
+            order[n] = "fast";
+            n += 1;
+        }
+        fn slow() !void {
+            std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(1200), .awake) catch {};
+        }
+        fn fast() !void {}
+        fn never() !void {
+            never_ran = true;
+        }
+    };
+    Ctx.n = 0;
+    Ctx.never_ran = false;
+
+    const steps = &[_]SagaStep{
+        .{ .name = "fast", .action = Ctx.fast, .compensation = Ctx.compFast, .timeout_seconds = 60 },
+        .{ .name = "slow", .action = Ctx.slow, .compensation = Ctx.compSlow, .timeout_seconds = 1 },
+        .{ .name = "never", .action = Ctx.never, .compensation = Ctx.compFast },
+    };
+
+    try orchestrator.registerSaga("timeout-saga", steps);
+    // execute returns the error, not the id — the instance stays in the map.
+    try std.testing.expectError(error.SagaStepTimeout, orchestrator.execute("timeout-saga"));
+
+    var it = orchestrator.running_instances.iterator();
+    const entry = it.next().?;
+    try std.testing.expect(it.next() == null);
+    try std.testing.expectEqual(SagaStatus.timed_out, entry.value_ptr.status);
+
+    // Reverse order, the over-budget step included: its action returned, so its
+    // effects are real and get undone too. The step after it never ran.
+    try std.testing.expectEqual(@as(usize, 2), Ctx.n);
+    try std.testing.expectEqualStrings("slow", Ctx.order[0]);
+    try std.testing.expectEqualStrings("fast", Ctx.order[1]);
+    try std.testing.expect(!Ctx.never_ran);
+
+    // The step logs tell the same story: both ran, both were compensated.
+    try std.testing.expectEqual(@as(usize, 2), entry.value_ptr.step_logs.items.len);
+    try std.testing.expectEqual(SagaLog.StepLog.StepStatus.compensated, entry.value_ptr.step_logs.items[0].status);
+    try std.testing.expectEqual(SagaLog.StepLog.StepStatus.compensated, entry.value_ptr.step_logs.items[1].status);
+    try std.testing.expect(entry.value_ptr.last_error != null);
+
+    // Terminal: nothing to resume.
+    try std.testing.expectError(error.NothingToResume, orchestrator.resumeInstance(entry.key_ptr.*));
+}
+
+test "SagaOrchestrator step within budget completes normally" {
+    const allocator = std.testing.allocator;
+    var orchestrator = SagaOrchestrator.init(allocator);
+    defer orchestrator.deinit();
+
+    var compensated = false;
+    const Comp = struct {
+        var flag: *bool = undefined;
+        fn comp() void {
+            flag.* = true;
+        }
+    };
+    Comp.flag = &compensated;
+
+    const steps = &[_]SagaStep{
+        .{
+            .name = "quick",
+            .action = struct {
+                fn act() !void {}
+            }.act,
+            .compensation = Comp.comp,
+            .timeout_seconds = 5,
+        },
+    };
+
+    try orchestrator.registerSaga("within-budget-saga", steps);
+    const instance_id = try orchestrator.execute("within-budget-saga");
+    try std.testing.expectEqual(SagaStatus.completed, orchestrator.getStatus(instance_id).?);
+    try std.testing.expect(!compensated);
 }
 
 test "SagaOrchestrator saga not found" {

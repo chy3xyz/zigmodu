@@ -146,6 +146,10 @@ if (!try bus.publish(trade)) { /* 所有订阅者都满了 */ }
 
 与 `app.eventBus(T)` 的分工见 §6：L1 要"最终大家都看到"（可以分配、可以慢），L0 要"发布方绝不停"（有界、可丢）。
 
+定位：HotBus 是**用户面向**的 L0 原语，框架内部没有消费者是**刻意的** —— 现有内部热路径要么单消费者
+（`AgentWorker.on_result`）、要么点对点路由（`im.ConnectionRegistry`）、要么统计走拉取（`Runtime.stats()`），
+接进去只会硬造订阅者并改动那条路径的语义。参考用法见 `examples/runtime-workers`。
+
 ## 3d. 模块里怎么用（Application 拥有 Runtime）
 
 `Runtime` 不必自己 new：**`Application` 就是它的所有者** —— 首次用到时创建、ticker 自动跑、
