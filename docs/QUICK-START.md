@@ -10,7 +10,7 @@ CI pins:
 
 ```bash
 # https://ziglang.org/download/ · zigup: https://github.com/marler8997/zigup
-zigup 0.17.0-dev.1970+67f39b551
+zigup 0.17.0-dev.2151+2ec5523d5
 
 # ziglang's mirrors garbage-collect old dev builds (they start returning 404),
 # so the version above goes stale by design: `.github/workflows/ci.yml` →
@@ -22,7 +22,7 @@ Verify installation:
 ```bash
 zig version
 # Should show the value pinned in .github/workflows/ci.yml → ZIG_VERSION,
-# e.g. 0.17.0-dev.1970+67f39b551
+# e.g. 0.17.0-dev.2151+2ec5523d5
 ```
 
 ## Step 1: Create a Module

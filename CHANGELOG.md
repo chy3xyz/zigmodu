@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Zig 工具链升级
+
+- `0.17.0-dev.1970+67f39b551` → **`0.17.0-dev.2151+2ec5523d5`**（latest master dev build）。
+  同步更新：`.github/workflows/ci.yml` 的 `ZIG_VERSION`、`README.md` / `README.zh.md` / `docs/QUICK-START.md`
+  的安装示例。
+- 升级前后**零代码改动**：`zig fmt --check src tools examples` 无漂移；`zig build test`
+  **1167 passed / 21 skipped / 0 failed**（同一套数），无需为新工具链改任何源码或测试。
+
 ## [0.26.0] - 2026-09-18
 
 > **⚠️ 行为变更**：`Tool.action` 默认值收紧的后果（内置技能已声明类别）、`Server.fromEnv` 签名变更、

@@ -100,7 +100,7 @@ const db_opt = b.option([]const u8, "db", "SQL drivers to link: all|sqlite|postg
 
 ```bash
 # 安装 CI 锁定的 Zig dev 版本：
-zigup 0.17.0-dev.1970+67f39b551
+zigup 0.17.0-dev.2151+2ec5523d5
 # (https://ziglang.org/download/ · https://github.com/marler8997/zigup)
 
 # dev 版本会被 ziglang 镜像回收（旧版开始 404），所以上面这行天然会过时：

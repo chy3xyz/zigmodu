@@ -30,7 +30,7 @@ env:
   # is reproducible in CI. NOTE: ziglang mirrors garbage-collect old dev
   # builds — dev.1567 404'd and broke Setup Zig; when that recurs, bump to
   # the current master dev build and verify locally first.
-  ZIG_VERSION: "0.17.0-dev.1970+67f39b551"
+  ZIG_VERSION: "0.17.0-dev.2151+2ec5523d5"
 
 jobs:
   # ── Windows cross-compile (no DB drivers) ──────
