@@ -58,21 +58,55 @@
 
 ## 🚀 快速开始
 
-应用依赖 zigmodu 时建议显式收窄 SQL 驱动（默认 `all` 会链三库）：
+先在 `build.zig.zon` 里声明依赖（首次 `zig build` 会拒绝占位的 `.fingerprint`，
+并打印出该填的值）：
+
+```zig
+.{
+    .name = .myapp,                 // 必须是合法的 Zig 标识符
+    .version = "0.1.0",
+    .fingerprint = 0x0,             // ← 把 `zig build` 提示的值填在这里
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        // 本地检出（examples/basic 就是这么写的，不需要 `.hash`）：
+        .zigmodu = .{ .path = "../zigmodu" },
+        // ……或用 tag 发布版；`.hash` 交给 `zig fetch --save <url>` 生成：
+        // .zigmodu = .{ .url = "git+https://github.com/chy3xyz/zigmodu?ref=v0.25.0" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
+```
+
+再按实际用到的驱动收窄链接（依赖侧默认 `all`，会链三库）：
 
 ```zig
 const zigmodu_dep = b.dependency("zigmodu", .{
     .target = target,
     .optimize = optimize,
-    .db = "sqlite", // 详见 docs/SQLX_DRIVERS.md
+    .db = db_opt, // 或 postgres | mysql | "sqlite,postgres" | all
 });
 ```
+
+命令行上的 `-Ddb=` 需要**你自己的** `build.zig` 声明该 option：
+
+```zig
+const db_opt = b.option([]const u8, "db", "SQL drivers to link: all|sqlite|postgres|mysql (comma-list)") orelse "sqlite";
+```
+
+详见 [docs/SQLX_DRIVERS.md](docs/SQLX_DRIVERS.md)；完整的 `build.zig`（含 `run` / `test` step）见
+[docs/QUICK-START.md](docs/QUICK-START.md) 第 3 步。
 
 ### 前置要求
 
 ```bash
-# 安装 Zig 0.17.0 — https://ziglang.org/download/
-brew install zig   # 或以官网包为准，确保 zig version → 0.17.0
+# 安装 CI 锁定的 Zig dev 版本：
+zigup 0.17.0-dev.1970+67f39b551
+# (https://ziglang.org/download/ · https://github.com/marler8997/zigup)
+
+# dev 版本会被 ziglang 镜像回收（旧版开始 404），所以上面这行天然会过时：
+# 以 `.github/workflows/ci.yml` → `ZIG_VERSION` 为准。
+# `brew install zig` 装的是 stable 版，**编不过本仓库**（框架用的是 dev API：
+# `std.process.Init`、`std.Io.Mutex` 等）。
 ```
 
 ### 创建第一个模块
@@ -82,7 +116,8 @@ brew install zig   # 或以官网包为准，确保 zig version → 0.17.0
 const std = @import("std");
 const zigmodu = @import("zigmodu");
 
-const UserModule = struct {
+// `pub` 是必须的：main.zig 里通过 `user.UserModule` 引用它。
+pub const UserModule = struct {
     pub const info = zigmodu.api.Module{
         .name = "user",
         .description = "用户管理模块",
@@ -111,7 +146,7 @@ const user = @import("modules/user.zig");
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
-    var modules = try zigmodu.scanModules(allocator, .{user});
+    var modules = try zigmodu.scanModules(allocator, .{user.UserModule});
     defer modules.deinit();
 
     try zigmodu.validateModules(&modules);
@@ -123,6 +158,9 @@ pub fn main(init: std.process.Init) !void {
 ```
 
 ### 事件与 DI（Application 内置）
+
+片段（示意）——`OrderModule` / `OrderEvent` / `AppConfig` / `auditListener`
+是你自己的类型，`allocator` / `io` 来自 `std.process.Init`：
 
 ```zig
 // 模块通过 initWith(ctx) 接收框架设施：
@@ -139,6 +177,7 @@ defer b.deinit();
 var app = try b
     .withService(AppConfig, "config", &config)           // 借用注册：容器不销毁
     .build(.{OrderModule});
+defer app.deinit();
 try app.start();                                          // initWith 运行 → 容器 freeze
 
 const bus = try app.eventBus(OrderEvent);                // 仅 ThreadSafeEventBus
@@ -238,15 +277,15 @@ zig build run
 zig fmt
 ```
 
-KM|## 📦 示例
-JR|
-XN|| 示例 | 描述 | 运行 |
-PN||------|------|------|
-SW|| [基础](examples/basic/) | 模块基础 | `cd examples/basic && zig build run` |
-PJ|| [事件驱动](examples/event-driven/) | 发布订阅 | `cd examples/event-driven && zig build run` |
-WT|| [测试（并入 basic）](examples/basic/) | 测试工具 | `cd examples/basic && zig build test` |
-JP|| [HTTP压力测试](examples/http-stress-test/) | 并发连接 | `cd examples/http-stress-test && zig build run` |
-NW|| [元宇宙创意](examples/metaverse-creative/) | 创意演示 | `cd examples/metaverse-creative && zig build run` |
+## 📦 示例
+
+| 示例 | 描述 | 运行 |
+|------|------|------|
+| [基础](examples/basic/) | 模块基础 | `cd examples/basic && zig build run` |
+| [事件驱动](examples/event-driven/) | 发布订阅 | `cd examples/event-driven && zig build run` |
+| [测试（并入 basic）](examples/basic/) | 测试工具 | `cd examples/basic && zig build test` |
+| [HTTP压力测试](examples/http-stress-test/) | 并发连接 | `cd examples/http-stress-test && zig build run` |
+| [元宇宙创意](examples/metaverse-creative/) | 创意演示 | `cd examples/metaverse-creative && zig build run` |
 
 ## 🤝 贡献
 

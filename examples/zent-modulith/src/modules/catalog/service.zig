@@ -1,4 +1,3 @@
-const std = @import("std");
 const persist = @import("persistence.zig");
 
 pub const CatalogService = struct {

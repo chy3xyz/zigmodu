@@ -191,6 +191,16 @@ fn trimTrailingNewlines(s: []const u8) []const u8 {
     return s[0..end];
 }
 
+/// Append a module-level footer (`};`) with exactly one newline of separation.
+/// The per-table emitters all end in `\n\n`, which would leave a blank line
+/// before the closing brace — `zig fmt` strips it, so emitting it makes the
+/// generated project fail `zig fmt --check`.
+fn appendFooter(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, footer: []const u8) !void {
+    buf.items.len = trimTrailingNewlines(buf.items).len;
+    try buf.appendSlice(allocator, "\n");
+    try buf.appendSlice(allocator, footer);
+}
+
 /// Strip UTF-8 BOM (common from editors) and leading/trailing ASCII whitespace for SQL parsing.
 fn stripUtf8BomAndTrimSql(s: []const u8) []const u8 {
     const bom = "\xEF\xBB\xBF";
@@ -215,9 +225,27 @@ fn isSafeModuleDirName(name: []const u8) bool {
     return true;
 }
 
-/// Released tarball for `zmodu new` projects (hash from `zig build` / missing-hash hint, Zig 0.16).
-const zigmodu_zon_url = "https://github.com/chy3xyz/zigmodu/archive/refs/tags/v0.13.9.tar.gz";
-const zigmodu_zon_hash = "zigmodu-0.13.7-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+/// Released tarball for `zmodu new` / `zmodu scaffold` projects. The tag is
+/// derived from `ZMODU_VERSION` (itself from `build.zig.zon`) so it can never
+/// drift from the framework release.
+const zigmodu_zon_url = "https://github.com/chy3xyz/zigmodu/archive/refs/tags/v" ++ ZMODU_VERSION ++ ".tar.gz";
+
+/// Content-addressed package hash — Zig 0.17 requires an explicit `.hash` for
+/// URL dependencies, and the hash embeds the release version, so it is
+/// release-specific and must be refreshed together with `build.zig.zon`.
+/// Get it from `zig build --fetch` in a project using `zigmodu_zon_url`: the
+/// "expected .hash = ..." hint is printed verbatim.
+const zigmodu_zon_hash = "zigmodu-0.25.0-U40vs7slTgD9e8TBtXse157iLNYVdE5aGU_Rl8AZbUBP";
+
+comptime {
+    // A version bump that forgot the hash would otherwise ship a scaffold that
+    // cannot fetch the framework (Zig would reject the stale hash).
+    const prefix = "zigmodu-" ++ ZMODU_VERSION ++ "-";
+    if (!std.mem.startsWith(u8, zigmodu_zon_hash, prefix)) {
+        @compileError("zigmodu_zon_hash must be for " ++ prefix ++
+            " — regenerate it with `zig build --fetch` (see comment above)");
+    }
+}
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -430,7 +458,7 @@ fn printUsage() void {
         \\  life           Project evolutionary memory (tree, fingerprint, evolve)
         \\  upgrade        Upgrade zmodu to latest (git pull + zig build)
         \\  mcp            Start MCP server (for AI agent integration)
-        \\  verify [dir]   Verify project compiles and has correct structure
+        \\  verify [dir]   Verify project compiles and has correct structure (--json; -h for the module layout rule)
         \\  diff <old> <new>  Compare two SQL files, show table-level changes
         \\  ai                AI skill registry: export-skills | openapi
         \\  audit [dir]       Best-practice audit: architecture rules + business lint
@@ -790,15 +818,38 @@ fn cmdMarket(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8)
     if (code != 0) std.process.exit(code);
 }
 
-test "cli submodule coverage gates (saas + market + audit + doctor)" {
+test "cli submodule coverage gates (saas + market + audit + doctor + verify)" {
     _ = @import("saas.zig");
     _ = @import("market.zig");
     _ = @import("audit.zig");
     _ = @import("doctor.zig");
+    // Without this, verify.zig's tests are not part of the test graph at all
+    // (nothing else in it is referenced from a test) and silently never run.
+    _ = @import("verify.zig");
 }
 
 fn cmdVerify(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
-    const project_dir = if (args.len > 0) args[0] else ".";
+    var project_dir: []const u8 = ".";
+    var json_mode = false;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "-j") or std.mem.eql(u8, arg, "--json")) {
+            json_mode = true;
+        } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            var help_buf: [4096]u8 = undefined;
+            var help_file = std.Io.File.stdout();
+            var help_writer = help_file.writer(io, &help_buf);
+            const help_out = &help_writer.interface;
+            try help_out.writeAll(verify_mod.usage);
+            try help_out.flush();
+            return;
+        } else if (arg.len > 0 and arg[0] == '-') {
+            std.log.err("unknown flag for `zmodu verify`: {s}", .{arg});
+            return error.CliUsage;
+        } else {
+            project_dir = arg;
+        }
+    }
+
     const report = try verify_mod.verifyProject(allocator, io, project_dir);
     defer {
         // Free details for passing checks (failing check details are shared with errors)
@@ -815,17 +866,51 @@ fn cmdVerify(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8)
         allocator.free(report.summary);
     }
 
-    // Simple JSON output via io
     var out_buf: [4096]u8 = undefined;
     var out_file = std.Io.File.stdout();
     var out_writer = out_file.writer(io, &out_buf);
     const stdout = &out_writer.interface;
-    if (report.pass) {
-        try stdout.print("{{\"pass\":true,\"summary\":\"{s}\"}}\n", .{report.summary});
-    } else {
-        try stdout.print("{{\"pass\":false,\"summary\":\"{s}\"}}\n", .{report.summary});
+
+    // --json: summary object only (unchanged machine-readable contract).
+    if (json_mode) {
+        if (report.pass) {
+            try stdout.print("{{\"pass\":true,\"summary\":\"{s}\"}}\n", .{report.summary});
+        } else {
+            try stdout.print("{{\"pass\":false,\"summary\":\"{s}\"}}\n", .{report.summary});
+        }
+        try stdout.flush();
+        return;
     }
+
+    // Human mode: per-check line, then the concrete warnings/errors. Passing
+    // checks print their details too (that is where the module-integrity loose
+    // rule announces itself).
+    try stdout.print("== zmodu verify (dir: {s}) ==\n", .{project_dir});
+    for (report.checks) |c| {
+        try stdout.print("[{s}] {s}", .{ c.name, @tagName(c.status) });
+        if (c.status == .pass) {
+            if (c.details) |d| try stdout.print(" — {s}", .{d});
+        }
+        try stdout.writeAll("\n");
+    }
+    if (report.warnings.len > 0) {
+        try stdout.writeAll("warnings:\n");
+        for (report.warnings) |w| try writeIndentedLines(stdout, w);
+    }
+    if (report.errors.len > 0) {
+        try stdout.writeAll("errors:\n");
+        for (report.errors) |e| try writeIndentedLines(stdout, e);
+    }
+    try stdout.print("summary: {s}\n", .{if (report.pass) "PASS" else "FAIL"});
     try stdout.flush();
+}
+
+fn writeIndentedLines(stdout: anytype, text: []const u8) !void {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        try stdout.print("  {s}\n", .{line});
+    }
 }
 
 fn cmdDiff(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -1088,24 +1173,24 @@ fn cmdNew(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
         \\```
         \\
         },
-        .{ .file = "context.md", .content =
-        \\# Project AI Context
-        \\
-        \\## Stack
-        \\- Framework: zmodu v0.14.4 (Zig 0.17)
-        \\- Database: MySQL/PostgreSQL/SQLite via sqlx
-        \\- HTTP: zigmodu.http.Server (async fiber-based)
-        \\
-        \\## Conventions
-        \\- Domain imports: const http = zigmodu.http; const data = zigmodu.data;
-        \\- Module lifecycle: init() at startup → deinit() at shutdown (reverse order)
-        \\- Dependencies: declared in module.zig info.dependencies
-        \\- Health: registerHealthChecks() per module + HealthEndpoint in main.zig
-        \\- API: RESTful via http.RouteGroup, handlers use resolve(ctx) helper
-        \\- ORM: data.Repository(T) returned by persistence Repo accessors
-        \\- Events: typed EventBus(T) in service, publish() method
-        \\
-        },
+        .{ .file = "context.md", .content = std.fmt.comptimePrint(
+            \\# Project AI Context
+            \\
+            \\## Stack
+            \\- Framework: zmodu v{s} (Zig 0.17)
+            \\- Database: MySQL/PostgreSQL/SQLite via sqlx
+            \\- HTTP: zigmodu.http.Server (async fiber-based)
+            \\
+            \\## Conventions
+            \\- Domain imports: const http = zigmodu.http; const data = zigmodu.data;
+            \\- Module lifecycle: init() at startup → deinit() at shutdown (reverse order)
+            \\- Dependencies: declared in module.zig info.dependencies
+            \\- Health: registerHealthChecks() per module + HealthEndpoint in main.zig
+            \\- API: RESTful via http.RouteGroup, handlers use resolve(ctx) helper
+            \\- ORM: data.Repository(T) returned by persistence Repo accessors
+            \\- Events: typed EventBus(T) in service, publish() method
+            \\
+        , .{ZMODU_VERSION}) },
     };
 
     for (prompts) |p| {
@@ -1390,6 +1475,33 @@ fn parseZigSuggestedFingerprint(diag: []const u8) ?u64 {
     return null;
 }
 
+/// Format the freshly generated sources with the toolchain's own `zig fmt`.
+///
+/// Several emitters (the compact one-liner templates behind `--with-agent`,
+/// `--with-aichat`, `--with-web4`, …) write valid Zig that is not fmt-exact,
+/// and `zig fmt`'s spacing rules (`.{".x"}` vs `.{ ".x" }`, when a one-line
+/// struct literal is expanded) are easy to get wrong in a template. Formatting
+/// the tree once makes `zig fmt --check src` hold for every variant instead of
+/// every template having to be fmt-exact by hand.
+///
+/// Runs before `saveGeneratedHashes`, so the recorded hashes describe the
+/// formatted files. Best-effort: a missing `zig` only warns — the same binary
+/// is required a moment later by `finalizeBuildZigZonFingerprint` anyway.
+fn formatGeneratedTree(io: std.Io, allocator: std.mem.Allocator, project_dir: []const u8) void {
+    const run = std.process.run(allocator, io, .{
+        .argv = &.{ "zig", "fmt", "src" },
+        .cwd = .{ .path = project_dir },
+    }) catch |err| {
+        std.log.warn("Skipping `zig fmt` on generated sources: {s}", .{@errorName(err)});
+        return;
+    };
+    defer allocator.free(run.stdout);
+    defer allocator.free(run.stderr);
+    if (run.term != .exited or run.term.exited != 0) {
+        std.log.warn("`zig fmt src` reported a problem in {s}: {s}", .{ project_dir, std.mem.trim(u8, run.stderr, " \n\r") });
+    }
+}
+
 fn finalizeBuildZigZonFingerprint(io: std.Io, allocator: std.mem.Allocator, project_name: []const u8, zon_path: []const u8) !void {
     const run = try std.process.run(allocator, io, .{
         .argv = &.{ "zig", "build" },
@@ -1413,7 +1525,7 @@ fn finalizeBuildZigZonFingerprint(io: std.Io, allocator: std.mem.Allocator, proj
 
 fn generateAgentsMd(allocator: std.mem.Allocator, project_name: []const u8) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
-    try buf.print(allocator, "# AGENTS.md — AI Development Guide\n\n## Project: {s}\n## Framework: zigmodu v0.13.9 (Zig 0.17)\n\n", .{project_name});
+    try buf.print(allocator, "# AGENTS.md — AI Development Guide\n\n## Project: {s}\n## Framework: zigmodu v{s} (Zig 0.17)\n\n", .{ project_name, ZMODU_VERSION });
     try buf.appendSlice(allocator,
         \\## Quick Commands
         \\```
@@ -3366,8 +3478,33 @@ fn generateModuleModel(allocator: std.mem.Allocator, module_name: []const u8, ta
         try buf.appendSlice(allocator, "};\n\n");
     }
 
+    buf.items.len = trimTrailingNewlines(buf.items).len;
+    try buf.appendSlice(allocator, "\n");
     return buf.toOwnedSlice(allocator);
 }
+/// The service header ships an empty event union (`--with-events`); fill it with
+/// a Created/Updated/Deleted triple per model so the `publish(...)` calls the
+/// same generator emits actually name variants that exist.
+fn fillServiceEventUnion(allocator: std.mem.Allocator, header: []const u8, tables: []const TableDef, strip_prefix_len: usize) !?[]const u8 {
+    const placeholder = "    // populated by zmodu orm from table discovery\n";
+    if (std.mem.indexOf(u8, header, placeholder) == null) return null;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    for (tables) |table| {
+        const effective_name = if (strip_prefix_len > 0 and strip_prefix_len < table.name.len)
+            table.name[strip_prefix_len..]
+        else
+            table.name;
+        const model_name = try toPascalCase(allocator, effective_name);
+        defer allocator.free(model_name);
+        try buf.print(allocator, "    {s}Created: struct {{ id: i64 }},\n", .{model_name});
+        try buf.print(allocator, "    {s}Updated: struct {{ id: i64 }},\n", .{model_name});
+        try buf.print(allocator, "    {s}Deleted: struct {{ id: i64 }},\n", .{model_name});
+    }
+    if (buf.items.len == 0) return null;
+    return try replaceAllStr(allocator, header, placeholder, buf.items);
+}
+
 fn generateModulePersistence(allocator: std.mem.Allocator, module_name: []const u8, tables: []const TableDef, strip_prefix_len: usize) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
@@ -3393,8 +3530,26 @@ fn generateModulePersistence(allocator: std.mem.Allocator, module_name: []const 
         try buf.appendSlice(allocator, "    }\n\n");
     }
 
-    try buf.appendSlice(allocator, orm_tpl.sqlx_persistence_footer);
+    try appendFooter(&buf, allocator, orm_tpl.sqlx_persistence_footer);
     return buf.toOwnedSlice(allocator);
+}
+
+/// The only `std.*` call any generated service method makes is the email shape
+/// check below, so the service templates keep `const std` behind `<<STD_IMPORT>>`
+/// and it is dropped unless some column actually triggers that rule.
+fn columnNeedsStd(col: ColumnDef) bool {
+    return col.col_type == .string and
+        (std.mem.containsAtLeast(u8, col.name, 1, "email") or std.mem.containsAtLeast(u8, col.name, 1, "mail"));
+}
+
+fn tablesNeedStdImport(tables: []const TableDef) bool {
+    for (tables) |table| {
+        for (table.columns) |col| {
+            if (col.col_type == .unknown and col.name.len == 0) continue;
+            if (columnNeedsStd(col)) return true;
+        }
+    }
+    return false;
 }
 
 fn generateModuleService(allocator: std.mem.Allocator, module_name: []const u8, tables: []const TableDef, strip_prefix_len: usize, enable_events: bool, with_transactions: bool, tenant_column: []const u8) ![]const u8 {
@@ -3404,9 +3559,18 @@ fn generateModuleService(allocator: std.mem.Allocator, module_name: []const u8, 
     const pascal_module = try toPascalCase(allocator, module_name);
     defer allocator.free(pascal_module);
     const header_tpl = if (enable_events) orm_tpl.sqlx_service_header else orm_tpl.sqlx_service_header_noev;
-    const header = try orm_tpl.expandOrm(allocator, header_tpl, module_name, pascal_module);
-    defer allocator.free(header);
-    try buf.appendSlice(allocator, header);
+    const header_raw = try orm_tpl.expandOrm(allocator, header_tpl, module_name, pascal_module);
+    defer allocator.free(header_raw);
+    const header_std = try replaceAllStr(
+        allocator,
+        header_raw,
+        "<<STD_IMPORT>>",
+        if (tablesNeedStdImport(tables)) "const std = @import(\"std\");\n" else "",
+    );
+    defer allocator.free(header_std);
+    const header_events = if (enable_events) try fillServiceEventUnion(allocator, header_std, tables, strip_prefix_len) else null;
+    defer if (header_events) |filled| allocator.free(filled);
+    try buf.appendSlice(allocator, header_events orelse header_std);
 
     for (tables) |table| {
         const effective_name = if (strip_prefix_len > 0 and strip_prefix_len < table.name.len)
@@ -3437,14 +3601,27 @@ fn generateModuleService(allocator: std.mem.Allocator, module_name: []const u8, 
             if (std.mem.eql(u8, col.name, tenant_column)) break true;
         } else false;
         if (has_tenant) {
-            try buf.print(allocator, "    pub fn {s}(self: *{s}Service, page: usize, size: usize, tenant_id: i64) !data.orm.PageResult(model.{s}) {{\n", .{ list_method, pascal_module, model_name });
+            // The model may render the tenant column as `?i64` (nullable /
+            // DEFAULT / PK) or plain `i64` (NOT NULL, no DEFAULT) — the compare
+            // has to match, or the generated method does not compile.
+            const tenant_optional = for (table.columns) |col| {
+                if (std.mem.eql(u8, col.name, tenant_column))
+                    break (col.nullable or col.has_default or col.is_primary_key);
+            } else false;
+            // Distinct name: Zig structs cannot overload by arity, and AGENTS.md
+            // documents this as `listXByTenant()` alongside `getXByTenant()`.
+            try buf.print(allocator, "    pub fn {s}ByTenant(self: *{s}Service, page: usize, size: usize, tenant_id: i64) !data.orm.PageResult(model.{s}) {{\n", .{ list_method, pascal_module, model_name });
             try buf.print(allocator, "        var repo = self.persistence.{s}Repo();\n", .{method_name});
-            try buf.print(allocator, "        return try repo.findPageFiltered(self.persistence.backend.allocator, \"WHERE {s} = ?\", &.{{zigmodu.data.sqlx.Value.int(tenant_id)}}, page, size);\n", .{tenant_column});
+            try buf.print(allocator, "        return try repo.findPageFiltered(self.persistence.backend.allocator, \"WHERE {s} = ?\", &.{{zigmodu.data.sqlx.Value{{ .int = tenant_id }}}}, page, size);\n", .{tenant_column});
             try buf.appendSlice(allocator, "    }\n\n");
             try buf.print(allocator, "    pub fn get{s}ByTenant(self: *{s}Service, id: {s}, tenant_id: i64) !?model.{s} {{\n", .{ model_name, pascal_module, pk_type, model_name });
             try buf.print(allocator, "        var repo = self.persistence.{s}Repo();\n", .{method_name});
             try buf.appendSlice(allocator, "        const entity = try repo.findById(id);\n");
-            try buf.print(allocator, "        return if (entity != null and entity.?.{s} != null and entity.?.{s}.? == tenant_id) entity else null;\n", .{ tenant_column, tenant_column });
+            if (tenant_optional) {
+                try buf.print(allocator, "        return if (entity != null and entity.?.{s} != null and entity.?.{s}.? == tenant_id) entity else null;\n", .{ tenant_column, tenant_column });
+            } else {
+                try buf.print(allocator, "        return if (entity != null and entity.?.{s} == tenant_id) entity else null;\n", .{tenant_column});
+            }
             try buf.appendSlice(allocator, "    }\n\n");
         }
 
@@ -3480,19 +3657,29 @@ fn generateModuleService(allocator: std.mem.Allocator, module_name: []const u8, 
             try buf.appendSlice(allocator, "    }\n\n");
         }
 
-        // Generate validate method from SQL constraints
+        // Generate validate method from SQL constraints.
+        // The model renders a column as `?T = null` when it is nullable, has a
+        // SQL DEFAULT, or is the primary key (see `generateModuleModel`), so
+        // every rule below has to unwrap optional fields before comparing.
         try buf.print(allocator, "    pub fn validate{s}(_: *{s}Service, entity: model.{s}) !void {{\n", .{ model_name, pascal_module, model_name });
         var has_rules = false;
         for (table.columns) |col| {
             if (col.col_type == .unknown and col.name.len == 0) continue;
+            const optional_field = col.nullable or col.has_default or col.is_primary_key;
             // Required non-nullable string fields with no default
-            if (!col.nullable and !col.has_default and !col.is_primary_key and col.col_type == .string) {
+            if (!optional_field and col.col_type == .string) {
                 try buf.print(allocator, "        if (entity.{s}.len == 0) return error.ValidationFailed;\n", .{col.name});
                 has_rules = true;
             }
             // Email format check
-            if (std.mem.containsAtLeast(u8, col.name, 1, "email") or std.mem.containsAtLeast(u8, col.name, 1, "mail")) {
-                try buf.print(allocator, "        if (entity.{s}.len > 0 and std.mem.indexOfScalar(u8, entity.{s}, '@') == null) return error.ValidationFailed;\n", .{ col.name, col.name });
+            if (columnNeedsStd(col)) {
+                if (optional_field) {
+                    try buf.print(allocator, "        if (entity.{s}) |{s}| {{\n", .{ col.name, col.name });
+                    try buf.print(allocator, "            if ({s}.len > 0 and std.mem.indexOfScalar(u8, {s}, '@') == null) return error.ValidationFailed;\n", .{ col.name, col.name });
+                    try buf.appendSlice(allocator, "        }\n");
+                } else {
+                    try buf.print(allocator, "        if (entity.{s}.len > 0 and std.mem.indexOfScalar(u8, entity.{s}, '@') == null) return error.ValidationFailed;\n", .{ col.name, col.name });
+                }
                 has_rules = true;
             }
             // Numeric range check (positive values for amount/price/stock fields)
@@ -3503,7 +3690,13 @@ fn generateModuleService(allocator: std.mem.Allocator, module_name: []const u8, 
                     std.mem.containsAtLeast(u8, col.name, 1, "quantity") or
                     std.mem.containsAtLeast(u8, col.name, 1, "count"))
                 {
-                    try buf.print(allocator, "        if (entity.{s} < 0) return error.ValidationFailed;\n", .{col.name});
+                    if (optional_field) {
+                        try buf.print(allocator, "        if (entity.{s}) |{s}| {{\n", .{ col.name, col.name });
+                        try buf.print(allocator, "            if ({s} < 0) return error.ValidationFailed;\n", .{col.name});
+                        try buf.appendSlice(allocator, "        }\n");
+                    } else {
+                        try buf.print(allocator, "        if (entity.{s} < 0) return error.ValidationFailed;\n", .{col.name});
+                    }
                     has_rules = true;
                 }
             }
@@ -3520,7 +3713,7 @@ fn generateModuleService(allocator: std.mem.Allocator, module_name: []const u8, 
         try buf.appendSlice(allocator, "    }\n\n");
     }
 
-    try buf.appendSlice(allocator, orm_tpl.sqlx_service_footer);
+    try appendFooter(&buf, allocator, orm_tpl.sqlx_service_footer);
     return buf.toOwnedSlice(allocator);
 }
 
@@ -3543,16 +3736,25 @@ fn pluralizeRoute(allocator: std.mem.Allocator, singular: []const u8) ![]const u
 fn formatNestTuple(allocator: std.mem.Allocator, module_name: []const u8) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
-    try buf.appendSlice(allocator, ".{");
-    var first = true;
+    // `zig fmt` spacing: one segment renders as `.{"./x"}`, several as `.{ "a", "b" }`.
+    var count: usize = 0;
+    var segs: [16][]const u8 = undefined;
     var it = std.mem.splitScalar(u8, module_name, '/');
     while (it.next()) |seg| {
         if (seg.len == 0) continue;
-        if (!first) try buf.appendSlice(allocator, ",");
-        try buf.print(allocator, " \"{s}\"", .{seg});
-        first = false;
+        if (count == segs.len) break;
+        segs[count] = seg;
+        count += 1;
     }
-    try buf.appendSlice(allocator, " }");
+    if (count == 0) return buf.toOwnedSlice(allocator);
+    try buf.appendSlice(allocator, ".{");
+    if (count > 1) try buf.appendSlice(allocator, " ");
+    for (segs[0..count], 0..) |seg, i| {
+        if (i > 0) try buf.appendSlice(allocator, ", ");
+        try buf.print(allocator, "\"{s}\"", .{seg});
+    }
+    if (count > 1) try buf.appendSlice(allocator, " ");
+    try buf.appendSlice(allocator, "}");
     return buf.toOwnedSlice(allocator);
 }
 
@@ -3642,15 +3844,17 @@ fn generateModuleApi(allocator: std.mem.Allocator, module_name: []const u8, tabl
         }
         try buf.print(allocator, "        if (try self.service.get{s}(id)) |entity| {{\n", .{model_name});
         try buf.appendSlice(allocator, "            try R.wrapOk(ctx, entity);\n");
-        try buf.appendSlice(allocator, "        } else { try R.wrapErr(ctx, 1, \"not found\"); }\n");
+        try buf.appendSlice(allocator, "        } else {\n");
+        try buf.appendSlice(allocator, "            try R.wrapErr(ctx, .not_found, \"not found\");\n");
+        try buf.appendSlice(allocator, "        }\n");
         try buf.appendSlice(allocator, "    }\n\n");
 
         // create
         try buf.print(allocator, "    fn create{s}(ctx: *http.Context, self: *State) !void {{\n", .{model_name});
         try buf.print(allocator, "        const entity = ctx.bindJson(model.{s}) catch {{\n", .{model_name});
-        try buf.appendSlice(allocator, "            try R.wrapErr(ctx, 1, \"invalid body\");\n            return;\n        };\n");
+        try buf.appendSlice(allocator, "            try R.wrapErr(ctx, .validation_failed, \"invalid body\");\n            return;\n        };\n");
         try buf.print(allocator, "        self.service.validate{s}(entity) catch {{\n", .{model_name});
-        try buf.appendSlice(allocator, "            try R.wrapErr(ctx, 1, \"validation failed\");\n            return;\n        };\n");
+        try buf.appendSlice(allocator, "            try R.wrapErr(ctx, .validation_failed, \"validation failed\");\n            return;\n        };\n");
         try buf.print(allocator, "        const created = try self.service.create{s}(entity);\n", .{model_name});
         try buf.appendSlice(allocator, "        try R.wrapOk(ctx, created);\n");
         try buf.appendSlice(allocator, "    }\n\n");
@@ -3658,9 +3862,9 @@ fn generateModuleApi(allocator: std.mem.Allocator, module_name: []const u8, tabl
         // update
         try buf.print(allocator, "    fn update{s}(ctx: *http.Context, self: *State) !void {{\n", .{model_name});
         try buf.print(allocator, "        const entity = ctx.bindJson(model.{s}) catch {{\n", .{model_name});
-        try buf.appendSlice(allocator, "            try R.wrapErr(ctx, 1, \"invalid body\");\n            return;\n        };\n");
+        try buf.appendSlice(allocator, "            try R.wrapErr(ctx, .validation_failed, \"invalid body\");\n            return;\n        };\n");
         try buf.print(allocator, "        self.service.validate{s}(entity) catch {{\n", .{model_name});
-        try buf.appendSlice(allocator, "            try R.wrapErr(ctx, 1, \"validation failed\");\n            return;\n        };\n");
+        try buf.appendSlice(allocator, "            try R.wrapErr(ctx, .validation_failed, \"validation failed\");\n            return;\n        };\n");
         try buf.print(allocator, "        try self.service.update{s}(entity);\n", .{model_name});
         try buf.appendSlice(allocator, "        try R.wrapSuccess(ctx);\n");
         try buf.appendSlice(allocator, "    }\n\n");
@@ -3677,7 +3881,7 @@ fn generateModuleApi(allocator: std.mem.Allocator, module_name: []const u8, tabl
         try buf.appendSlice(allocator, "    }\n\n");
     }
 
-    try buf.appendSlice(allocator, orm_tpl.sqlx_api_footer);
+    try appendFooter(&buf, allocator, orm_tpl.sqlx_api_footer);
     return buf.toOwnedSlice(allocator);
 }
 fn generateModuleZig(allocator: std.mem.Allocator, module_name: []const u8, dependencies: []const u8) ![]const u8 {
@@ -5034,7 +5238,7 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
                 \\    fn hDeleteList(ctx: *http.Context) !void {{
                 \\        const s = resolve2(ctx);
                 \\        const ids = ctx.queryStr(\"ids\", \"\");
-                \\        if (ids.len == 0) {{ try R.wrapErr(ctx, 400, \"Missing ids\"); return; }}
+                \\        if (ids.len == 0) {{ try R.wrapErr(ctx, .validation_failed, \"Missing ids\"); return; }}
                 \\        var it = std.mem.splitScalar(u8, ids, ',');
                 \\        while (it.next()) |id_str| {{
                 \\            const id = std.fmt.parseInt(i64, id_str, 10) catch continue;
@@ -5208,7 +5412,7 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
     try safeWrite(io, allocator, main_path, main_zig, gen_opts);
 
     // 8. Generate src/tests.zig
-    const tests_zig = try generateScaffoldTestsZig(allocator, module_names.items);
+    const tests_zig = try generateScaffoldTestsZig(allocator, module_names.items, &module_map, scaffold_prefix_len);
     defer allocator.free(tests_zig);
     const tests_path = try std.fmt.allocPrint(allocator, "{s}/src/tests.zig", .{project_dir});
     defer allocator.free(tests_path);
@@ -5256,7 +5460,6 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
     // shared/types.zig — cross-module shared types
     const shared_types = try std.fmt.allocPrint(allocator,
         \\//! Shared types — used across modules.
-        \\const std = @import("std");
         \\
         \\pub const SortDir = enum {{ asc, desc }};
         \\
@@ -5310,9 +5513,9 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
     defer shared_buf.deinit(allocator);
     try shared_buf.appendSlice(allocator, "//! RuoYi-style API response helpers\nconst std = @import(\"std\");\nconst http = @import(\"zigmodu\").http;\nconst BizCode = @import(\"errors.zig\").BizCode;\n\n");
     try shared_buf.appendSlice(allocator, "pub fn wrapOk(ctx: *http.Context, value: anytype) !void {\n    const inner = try std.json.Stringify.valueAlloc(ctx.allocator, value, .{});\n    defer ctx.allocator.free(inner);\n    const json = try std.fmt.allocPrint(ctx.allocator, \"{{\\\"code\\\":0,\\\"msg\\\":\\\"\\\",\\\"data\\\":{s}}}\", .{inner});\n    defer ctx.allocator.free(json);\n    try ctx.json(200, json);\n}\n\n");
-    try shared_buf.appendSlice(allocator, "pub fn wrapList(ctx: *http.Context, result: anytype) !void {\n    const inner = try std.json.Stringify.valueAlloc(ctx.allocator, result.items, .{});\n    defer ctx.allocator.free(inner);\n    const json = try std.fmt.allocPrint(ctx.allocator, \"{{\\\"code\\\":0,\\\"msg\\\":\\\"\\\",\\\"data\\\":{{\\\"list\\\":{s},\\\"total\\\":{d}}}}}\", .{inner, result.total});\n    defer ctx.allocator.free(json);\n    try ctx.json(200, json);\n}\n\n");
+    try shared_buf.appendSlice(allocator, "pub fn wrapList(ctx: *http.Context, result: anytype) !void {\n    const inner = try std.json.Stringify.valueAlloc(ctx.allocator, result.items, .{});\n    defer ctx.allocator.free(inner);\n    const json = try std.fmt.allocPrint(ctx.allocator, \"{{\\\"code\\\":0,\\\"msg\\\":\\\"\\\",\\\"data\\\":{{\\\"list\\\":{s},\\\"total\\\":{d}}}}}\", .{ inner, result.total });\n    defer ctx.allocator.free(json);\n    try ctx.json(200, json);\n}\n\n");
     try shared_buf.appendSlice(allocator, "pub fn wrapSuccess(ctx: *http.Context) !void {\n    try ctx.json(200, \"{{\\\"code\\\":0,\\\"msg\\\":\\\"\\\",\\\"data\\\":null}}\");\n}\n\n");
-    try shared_buf.appendSlice(allocator, "pub fn wrapErr(ctx: *http.Context, code: BizCode, errmsg: []const u8) !void {\n    const json = try std.fmt.allocPrint(ctx.allocator, \"{{\\\"code\\\":{d},\\\"msg\\\":\\\"{s}\\\",\\\"data\\\":null}}\", .{@intFromEnum(code), errmsg});\n    defer ctx.allocator.free(json);\n    try ctx.json(200, json);\n}\n");
+    try shared_buf.appendSlice(allocator, "pub fn wrapErr(ctx: *http.Context, code: BizCode, errmsg: []const u8) !void {\n    const json = try std.fmt.allocPrint(ctx.allocator, \"{{\\\"code\\\":{d},\\\"msg\\\":\\\"{s}\\\",\\\"data\\\":null}}\", .{ @backingInt(code), errmsg });\n    defer ctx.allocator.free(json);\n    try ctx.json(200, json);\n}\n");
     const shared_response = try shared_buf.toOwnedSlice(allocator);
     defer allocator.free(shared_response);
     const shared_response_path = try std.fmt.allocPrint(allocator, "{s}/response.zig", .{shared_dir});
@@ -5410,11 +5613,11 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
     defer allocator.free(amp_path);
     try safeWrite(io, allocator, amp_path, add_mod_prompt, gen_opts);
 
-    const ctx_prompt =
+    const ctx_prompt = std.fmt.comptimePrint(
         \\# Project AI Context
         \\
         \\## Stack
-        \\- Framework: zmodu v0.14.4 (Zig 0.17)
+        \\- Framework: zmodu v{s} (Zig 0.17)
         \\- Database: MySQL/PostgreSQL/SQLite via sqlx
         \\- HTTP: zigmodu.http.Server (async fiber-based)
         \\
@@ -5425,7 +5628,7 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
         \\- ORM: data.Repository(T) returned by persistence Repo accessors
         \\- Health: registerHealthChecks() + HealthEndpoint in main.zig
         \\
-    ;
+    , .{ZMODU_VERSION});
     const ctx_path = try std.fmt.allocPrint(allocator, "{s}/context.md", .{ai_dir});
     defer allocator.free(ctx_path);
     try safeWrite(io, allocator, ctx_path, ctx_prompt, gen_opts);
@@ -5475,6 +5678,7 @@ pub fn cmdScaffold(io: std.Io, allocator: std.mem.Allocator, args: []const []con
     try generateClaudeSkills(io, allocator, project_dir, gen_opts);
 
     if (!sopts.dry_run) {
+        formatGeneratedTree(io, allocator, project_dir);
         try finalizeBuildZigZonFingerprint(io, allocator, sopts.project_name, zon_path);
 
         // Save SHA256 hashes of all generated files for incremental support
@@ -5509,7 +5713,7 @@ fn saveGeneratedHashes(io: std.Io, allocator: std.mem.Allocator, project_dir: []
     }
 
     if (entries.items.len > 0) {
-        incremental.saveManifest(allocator, io, project_dir, entries.items, "0.14.9") catch |err| {
+        incremental.saveManifest(allocator, io, project_dir, entries.items, ZMODU_VERSION) catch |err| {
             std.log.warn("Failed to save hash manifest: {}", .{err});
         };
     }
@@ -5802,9 +6006,9 @@ fn generateAiChatModule(io: std.Io, allocator: std.mem.Allocator, project_dir: [
         \\    };
         \\
         \\    fn sendMessage(ctx: *http.Context, self: *State) !void {
-        \\        const content = ctx.body orelse { try R.wrapErr(ctx, 1, "empty body"); return; };
+        \\        const content = ctx.body orelse { try R.wrapErr(ctx, .validation_failed, "empty body"); return; };
         \\        const conv_id = ctx.queryInt(i64, "conversationId", 0);
-        \\        if (conv_id == 0) { try R.wrapErr(ctx, 1, "missing conversationId"); return; }
+        \\        if (conv_id == 0) { try R.wrapErr(ctx, .validation_failed, "missing conversationId"); return; }
         \\        const result = self.service.send(conv_id, content, null) catch { try R.wrapErr(ctx, .server_error, "AI error"); return; };
         \\        try R.wrapOk(ctx, result);
         \\    }
@@ -5995,6 +6199,13 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
         \\    audit: ?*zigmodu.ai.AgentAuditLog = null,
         \\    retriever: ?zigmodu.ai.Retriever = null,
         \\    quota: ?*zigmodu.ai.TokenQuota = null,
+        \\    /// Authority. `Guard.init(.{})` is **fail-closed**: with an empty allow
+        \\    /// list the agent runs no tool at all and every call comes back
+        \\    /// `ToolDenied` (counted in `guard.stats()`). Replace the policy at
+        \\    /// startup — `svc.guard = zigmodu.ai.Guard.init(.{ .allow = &.{"order.draft"} })`
+        \\    /// — and turn on `.allow_execute = true` only for tools that take effect.
+        \\    /// The guard is addressable on purpose: it keeps counters and a budget.
+        \\    guard: zigmodu.ai.Guard = zigmodu.ai.Guard.init(.{}),
         \\
         \\    pub fn init(p: *persistence.AiAgentPersistence, r: *zigmodu.ai.SkillRegistry) AiAgentService {
         \\        return .{ .persistence = p, .registry = r };
@@ -6005,19 +6216,26 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
         \\    pub fn setQuota(self: *AiAgentService, q: *zigmodu.ai.TokenQuota) void {
         \\        self.quota = q;
         \\    }
+        \\    /// Replace the authority policy. Keep the default (empty) policy until
+        \\    /// you know which skills the agent should be allowed to call.
+        \\    pub fn setGuard(self: *AiAgentService, g: zigmodu.ai.Guard) void {
+        \\        self.guard = g;
+        \\    }
         \\    pub fn run(self: *AiAgentService, allocator: std.mem.Allocator, goal: []const u8, ctx: *zigmodu.ai.SkillContext) !zigmodu.ai.AgentResult {
         \\        const provider = self.provider orelse return error.NoProvider;
         \\        var run_repo = self.persistence.runRepo();
         \\        var agent = zigmodu.ai.Agent{
         \\            .provider = provider,
         \\            .registry = self.registry,
+        \\            .name = "ai/agent",
+        \\            .guard = &self.guard,
         \\            .allowlist = self.allowlist,
         \\            .tool_timeout_ms = self.tool_timeout_ms,
         \\            .audit = self.audit,
         \\            .retriever = self.retriever,
         \\            .quota = self.quota,
         \\        };
-        \\        var result = agent.run(allocator, goal, ctx, 10) catch |err| {
+        \\        const result = agent.run(allocator, goal, ctx, 10) catch |err| {
         \\            _ = run_repo.insert(.{
         \\                .id = null,
         \\                .tenant_id = ctx.tenant_id orelse 0,
@@ -6044,9 +6262,8 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
         \\        return result;
         \\    }
         \\    pub fn getRuns(self: *AiAgentService, tenant_id: i64, page: usize, size: usize) !zigmodu.data.orm.PageResult(model.AgentRun) {
-        \\        _ = tenant_id;
         \\        var repo = self.persistence.runRepo();
-        \\        return try repo.findPage(page, size);
+        \\        return try repo.findPageFiltered(self.persistence.backend.allocator, "WHERE tenant_id = ?", &.{zigmodu.data.sqlx.Value{ .int = tenant_id }}, page, size);
         \\    }
         \\    pub fn getRun(self: *AiAgentService, id: i64) !?model.AgentRun {
         \\        var repo = self.persistence.runRepo();
@@ -6073,6 +6290,13 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
         \\
         \\    pub fn init(s: *service.AiAgentService) AiAgentApi { return .{ .service = s }; }
         \\
+        \\    /// Tenant from the JWT/tenant middleware attr — never from a query
+        \\    /// parameter, which the client can set to another tenant's id.
+        \\    fn tenantId(ctx: *http.Context) i64 {
+        \\        const raw = ctx.tenantId() orelse return 0;
+        \\        return std.fmt.parseInt(i64, raw, 10) catch 0;
+        \\    }
+        \\
         \\    pub const routes = [_]http.RouteSpec(State){
         \\        .{ .method = .POST, .path = "run", .handler = runAgent, .meta = .{ .permission = "admin|agent" } },
         \\        .{ .method = .GET, .path = "runs", .handler = listRuns },
@@ -6081,8 +6305,14 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
         \\
         \\    fn runAgent(ctx: *http.Context, self: *State) !void {
         \\        const goal = ctx.queryStr("goal", "");
-        \\        if (goal.len == 0) { try R.wrapErr(ctx, 1, "missing goal"); return; }
-        \\        var skill_ctx = zigmodu.ai.SkillContext{ .allocator = ctx.allocator };
+        \\        if (goal.len == 0) { try R.wrapErr(ctx, .validation_failed, "missing goal"); return; }
+        \\        // Identity rides on the run: memory recall and the audit trail are
+        \\        // tenant+user scoped, and 0 means "any" to both.
+        \\        var skill_ctx = zigmodu.ai.SkillContext{
+        \\            .allocator = ctx.allocator,
+        \\            .tenant_id = tenantId(ctx),
+        \\            .user_id = ctx.userIdInt(i64),
+        \\        };
         \\        var result = self.service.run(ctx.allocator, goal, &skill_ctx) catch { try R.wrapErr(ctx, .server_error, "agent error"); return; };
         \\        defer result.deinit(ctx.allocator);
         \\        try R.wrapOk(ctx, .{ .answer = result.answer, .steps = result.steps });
@@ -6090,8 +6320,7 @@ fn generateAgentModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []
         \\    fn listRuns(ctx: *http.Context, self: *State) !void {
         \\        const page = ctx.queryInt(usize, "pageNo", 1);
         \\        const size = ctx.queryInt(usize, "pageSize", 10);
-        \\        const tid = ctx.queryInt(i64, "tenantId", 0);
-        \\        const r = try self.service.getRuns(tid, page, size);
+        \\        const r = try self.service.getRuns(tenantId(ctx), page, size);
         \\        try R.wrapList(ctx, r);
         \\    }
         \\    fn getRun(ctx: *http.Context, self: *State) !void {
@@ -7418,7 +7647,7 @@ fn generateLifeDir(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u8
     defer allocator.free(dp);
     var dna: std.ArrayList(u8) = .empty;
     defer dna.deinit(allocator);
-    try dna.print(allocator, "# {s}\ngenesis: zmodu scaffold\ntables: {d}\nmodules: {d}\nframework: zigmodu v0.13.9\nzig: 0.17.0\n", .{ project_name, table_count, module_count });
+    try dna.print(allocator, "# {s}\ngenesis: zmodu scaffold\ntables: {d}\nmodules: {d}\nframework: zigmodu v{s}\nzig: 0.17.0\n", .{ project_name, table_count, module_count, ZMODU_VERSION });
     try safeWrite(io, allocator, dp, dna.items, gen_opts);
 
     // manifest.json — compact
@@ -8200,20 +8429,31 @@ fn wireModulesIntoMainZig(io: std.Io, allocator: std.mem.Allocator, new_modules:
             try out.append(allocator, '\n');
         }
 
-        // Insert lifecycle module names into Application.init tuple
-        if (!inserted_lifecycle and std.mem.indexOf(u8, trimmed, "Application.init") != null and std.mem.indexOf(u8, trimmed, ".{ ") != null) {
+        // Insert lifecycle module names into Application.init tuple.
+        // Two shapes exist: the one-line tuple older scaffolds emitted
+        // (`..., .{ order, }, .{});`) and the multi-line tuple current ones use
+        // (`var app = ...init(..., .{\n order,\n}, .{});`).
+        if (!inserted_lifecycle and std.mem.indexOf(u8, main_content, "Application.init") != null) {
             if (std.mem.indexOf(u8, line, "}, .{});")) |idx| {
-                const mod_before = line[0..idx];
-                const mod_after = line[idx..];
                 inserted_lifecycle = true;
-                try out.appendSlice(allocator, mod_before);
-                // Trim trailing whitespace from existing modules, add new ones
-                for (to_wire.items) |mod_name| {
-                    const var_name = try replaceChar(allocator, mod_name, '/', '_');
-                    defer allocator.free(var_name);
-                    try out.print(allocator, " {s},", .{var_name});
+                if (std.mem.indexOf(u8, line, ".{ ") != null) {
+                    try out.appendSlice(allocator, line[0..idx]);
+                    for (to_wire.items) |mod_name| {
+                        const var_name = try replaceChar(allocator, mod_name, '/', '_');
+                        defer allocator.free(var_name);
+                        try out.print(allocator, " {s},", .{var_name});
+                    }
+                    try out.appendSlice(allocator, line[idx..]);
+                } else {
+                    // Multi-line tuple: each module is its own line before the
+                    // closing `}, .{});`.
+                    for (to_wire.items) |mod_name| {
+                        const var_name = try replaceChar(allocator, mod_name, '/', '_');
+                        defer allocator.free(var_name);
+                        try out.print(allocator, "        {s},\n", .{var_name});
+                    }
+                    try out.appendSlice(allocator, line);
                 }
-                try out.appendSlice(allocator, mod_after);
                 try out.append(allocator, '\n');
                 continue;
             }
@@ -8283,9 +8523,14 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
         \\
         \\    const db_driver: zigmodu.data.sqlx.Driver = if (std.mem.eql(u8, db_driver_str, "postgres") or std.mem.eql(u8, db_driver_str, "postgresql")) .postgres else if (std.mem.eql(u8, db_driver_str, "sqlite")) .sqlite else .mysql;
         \\    const db_cfg = zigmodu.data.sqlx.Config{
-        \\        .driver = db_driver, .host = db_host, .port = std.fmt.parseInt(u16, db_port, 10) catch 3306,
-        \\        .database = db_name, .username = db_user, .password = db_pass,
-        \\        .max_open_conns = 10, .max_idle_conns = 5,
+        \\        .driver = db_driver,
+        \\        .host = db_host,
+        \\        .port = std.fmt.parseInt(u16, db_port, 10) catch 3306,
+        \\        .database = db_name,
+        \\        .username = db_user,
+        \\        .password = db_pass,
+        \\        .max_open_conns = 10,
+        \\        .max_idle_conns = 5,
         \\        .sqlite_path = db_name,
         \\    };
         \\    var db_client = try zigmodu.data.sqlx.Client.open(allocator, init.io, db_cfg);
@@ -8399,6 +8644,10 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
             \\    var ai_agent_svc = ai_agent.service.AiAgentService.init(&ai_agent_p, &skill_registry);
             \\    ai_agent_svc.setProvider(&agent_provider);
             \\    ai_agent_svc.setQuota(&ai_token_quota);
+            \\    // Authority: fail-closed. The empty allow list means this agent may call
+            \\    // no tool at all — register the skills you want it to use and name them
+            \\    // here (`.allow_execute = true` only for tools that change state).
+            \\    ai_agent_svc.setGuard(zigmodu.ai.Guard.init(.{ .allow = &.{} }));
             \\    var ai_agent_api = ai_agent.api.AiAgentApi.init(&ai_agent_svc);
             \\
         );
@@ -8601,108 +8850,149 @@ fn generateScaffoldMainZig(allocator: std.mem.Allocator, project_name: []const u
     // Application lifecycle
     try buf.appendSlice(allocator, "\n    // -- Lifecycle --\n    var app = try zigmodu.Application.init(init.io, allocator, \"");
     try buf.appendSlice(allocator, project_name);
-    try buf.appendSlice(allocator, "\", .{ ");
+    try buf.appendSlice(allocator, "\", .{\n");
 
     for (module_names) |name| {
         const var_name = try replaceChar(allocator, name, '/', '_');
         defer allocator.free(var_name);
         if (isZigReserved(var_name)) {
-            try buf.print(allocator, "{s}_mod, ", .{var_name});
+            try buf.print(allocator, "        {s}_mod,\n", .{var_name});
         } else {
-            try buf.print(allocator, "{s}, ", .{var_name});
+            try buf.print(allocator, "        {s},\n", .{var_name});
         }
     }
-    if (sopts.with_websocket) try buf.appendSlice(allocator, "im, ");
-    if (sopts.with_aichat) try buf.appendSlice(allocator, "ai_chat, ");
-    if (sopts.with_agent) try buf.appendSlice(allocator, "ai_agent, ");
-    if (sopts.with_web4) try buf.appendSlice(allocator, "web4, ");
-    try buf.appendSlice(allocator, "}, .{});\n    defer app.deinit();\n\n    try app.start();\n    try server.start();\n}\n\nfn healthLive(ctx: *zigmodu.http.Context) !void {\n    try ctx.json(200, \"{\\\"status\\\":\\\"UP\\\"}\");\n}\n\nfn healthReady(ctx: *zigmodu.http.Context) !void {\n    try ctx.json(200, \"{\\\"status\\\":\\\"UP\\\"}\");\n}\n");
+    if (sopts.with_websocket) try buf.appendSlice(allocator, "        im,\n");
+    if (sopts.with_aichat) try buf.appendSlice(allocator, "        ai_chat,\n");
+    if (sopts.with_agent) try buf.appendSlice(allocator, "        ai_agent,\n");
+    if (sopts.with_web4) try buf.appendSlice(allocator, "        web4,\n");
+    try buf.appendSlice(allocator, "    }, .{});\n    defer app.deinit();\n\n    try app.start();\n    try server.start();\n}\n\nfn healthLive(ctx: *zigmodu.http.Context) !void {\n    try ctx.json(200, \"{\\\"status\\\":\\\"UP\\\"}\");\n}\n\nfn healthReady(ctx: *zigmodu.http.Context) !void {\n    try ctx.json(200, \"{\\\"status\\\":\\\"UP\\\"}\");\n}\n");
 
     return buf.toOwnedSlice(allocator);
 }
 
-fn generateScaffoldTestsZig(allocator: std.mem.Allocator, module_names: []const []const u8) ![]const u8 {
+fn generateScaffoldTestsZig(
+    allocator: std.mem.Allocator,
+    module_names: []const []const u8,
+    module_map: *std.StringHashMap(std.ArrayList(TableDef)),
+    strip_prefix_len: usize,
+) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
-    try buf.appendSlice(allocator, "const std = @import(\"std\");\nconst zigmodu = @import(\"zigmodu\");\nconst testing = std.testing;\n\n");
+    try buf.appendSlice(allocator,
+        \\//! Smoke tests for the generated modules — no database required.
+        \\//!
+        \\//! They check the module contract (lifecycle, route table) and the model
+        \\//! shape, which is what a scaffold can honestly assert before you write
+        \\//! migrations. Add DB-backed tests once your tables exist:
+        \\//! `zigmodu.data.sqlx.Client.open(alloc, testing.io, cfg)` gives you a
+        \\//! `*Client` (keep it in a variable — `SqlxBackend` stores the pointer).
+        \\const std = @import("std");
+        \\const testing = std.testing;
+        \\
+    );
 
     // Import all modules
     for (module_names) |mod_name| {
         const var_name = try replaceChar(allocator, mod_name, '/', '_');
         defer allocator.free(var_name);
-        try buf.print(allocator, "const {s} = @import(\"modules/{s}/module.zig\");\n", .{ var_name, mod_name });
+        const bind = try testVarName(allocator, var_name);
+        defer allocator.free(bind);
+        try buf.print(allocator, "const {s} = @import(\"modules/{s}/module.zig\");\n", .{ bind, mod_name });
     }
     try buf.appendSlice(allocator, "\n");
 
-    // DB setup helper
-    try buf.appendSlice(allocator,
-        \\fn testBackend(alloc: std.mem.Allocator) !zigmodu.data.SqlxBackend {
-        \\    const cfg = zigmodu.data.sqlx.Config{ .driver = .sqlite, .sqlite_path = "/tmp/zmodu_test.db", .max_open_conns = 1 };
-        \\    var client = try zigmodu.data.sqlx.Client.open(alloc, std.testing.io, cfg);
-        \\    return zigmodu.data.SqlxBackend{ .allocator = alloc, .client = &client };
-        \\}
-        \\
-    );
-
-    // Generate CRUD test per module
     for (module_names) |mod_name| {
         const var_name = try replaceChar(allocator, mod_name, '/', '_');
         defer allocator.free(var_name);
+        const bind = try testVarName(allocator, var_name);
+        defer allocator.free(bind);
+        const tables = module_map.get(mod_name) orelse continue;
+        if (tables.items.len == 0) continue;
         const pascal = try toPascalCase(allocator, var_name);
         defer allocator.free(pascal);
 
-        const pl_sfx = if (std.mem.endsWith(u8, pascal, "s") or std.mem.endsWith(u8, pascal, "S")) "" else "s";
-        // Use "name" field if module likely has one; otherwise just test init
-        const has_name = std.mem.indexOf(u8, var_name, "user") != null or
-            std.mem.indexOf(u8, var_name, "product") != null or
-            std.mem.indexOf(u8, var_name, "customer") != null or
-            std.mem.indexOf(u8, var_name, "dept") != null or
-            std.mem.indexOf(u8, var_name, "role") != null;
-        if (has_name) {
-            try buf.print(allocator,
-                \\test "integration: {s} CRUD" {{
-                \\    const backend = try testBackend(testing.allocator);
-                \\    defer backend.client.deinit();
-                \\    var p = {s}.persistence.{s}Persistence.init(backend);
-                \\    var svc = {s}.service.{s}Service.init(&p);
-                \\    _ = try svc.create{s}(.{{ .name = "test" }});
-                \\    const list = try svc.list{s}{s}(0, 10);
-                \\    try testing.expect(list.total >= 1);
-                \\    if (list.items[0].id) |id| {{
-                \\        const got = try svc.get{s}(id);
-                \\        try testing.expect(got != null);
-                \\        try svc.delete{s}(id);
-                \\        try testing.expect((try svc.get{s}(id)) == null);
-                \\    }}
-                \\}}
-                \\
-            , .{ mod_name, var_name, pascal, var_name, pascal, pascal, pascal, pl_sfx, pascal, pascal, pascal });
-        } else {
-            try buf.print(allocator,
-                \\test "integration: {s} module init" {{
-                \\    const backend = try testBackend(testing.allocator);
-                \\    defer backend.client.deinit();
-                \\    var p = {s}.persistence.{s}Persistence.init(backend);
-                \\    var svc = {s}.service.{s}Service.init(&p);
-                \\    const list = try svc.list{s}{s}(0, 10);
-                \\    try testing.expect(list.total >= 0);
-                \\}}
-                \\
-            , .{ mod_name, var_name, pascal, var_name, pascal, pascal, pl_sfx });
+        // Module contract: identity + lifecycle (what every module must expose).
+        try buf.print(allocator, "test \"{s}: module contract\" {{\n", .{mod_name});
+        try buf.print(allocator, "    try testing.expectEqualStrings(\"{s}\", {s}.info.name);\n", .{ mod_name, bind });
+        try buf.print(allocator, "    try {s}.init();\n", .{bind});
+        try buf.print(allocator, "    {s}.deinit();\n", .{bind});
+        try buf.appendSlice(allocator, "}\n\n");
+
+        for (tables.items) |table| {
+            const effective_name = if (strip_prefix_len > 0 and strip_prefix_len < table.name.len)
+                table.name[strip_prefix_len..]
+            else
+                table.name;
+            const model_name = try toPascalCase(allocator, effective_name);
+            defer allocator.free(model_name);
+
+            // Model shape: required (NOT NULL, no DEFAULT, not the PK) columns are
+            // non-optional, everything else defaults to null — so building the
+            // literal is the compile-time check against the SQL schema.
+            try buf.print(allocator, "test \"{s}: {s} model shape\" {{\n", .{ mod_name, model_name });
+            try buf.print(allocator, "    const entity = {s}.model.{s}{{\n", .{ bind, model_name });
+            for (table.columns) |col| {
+                if (col.col_type == .unknown and col.name.len == 0) continue;
+                if (col.nullable or col.has_default or col.is_primary_key) continue;
+                try buf.print(allocator, "        .{s} = {s},\n", .{ col.name, zeroLiteral(col.col_type) });
+            }
+            try buf.appendSlice(allocator, "    };\n");
+            try buf.print(allocator, "    try testing.expectEqualStrings(\"{s}\", {s}.model.{s}.sql_table_name);\n", .{ table.name, bind, model_name });
+            for (table.columns) |col| {
+                if (col.col_type == .unknown and col.name.len == 0) continue;
+                if (col.nullable or col.has_default or col.is_primary_key) {
+                    try buf.print(allocator, "    try testing.expect(entity.{s} == null);\n", .{col.name});
+                } else if (col.col_type == .string or col.col_type == .datetime) {
+                    try buf.print(allocator, "    try testing.expectEqualStrings(\"\", entity.{s});\n", .{col.name});
+                } else if (col.col_type == .bool) {
+                    try buf.print(allocator, "    try testing.expect(!entity.{s});\n", .{col.name});
+                } else if (col.col_type == .float) {
+                    try buf.print(allocator, "    try testing.expectEqual(@as(f64, 0), entity.{s});\n", .{col.name});
+                } else {
+                    try buf.print(allocator, "    try testing.expectEqual(@as(i64, 0), entity.{s});\n", .{col.name});
+                }
+            }
+            try buf.appendSlice(allocator, "}\n\n");
         }
+
+        // Route table: compiles every handler in api.zig against the service.
+        // 5 routes per table — list / get / create / update / delete.
+        const route_count = tables.items.len * 5;
+        try buf.print(allocator, "test \"{s}: route table\" {{\n", .{mod_name});
+        try buf.print(allocator, "    try testing.expect({s}.api.{s}Api.routes.len == {d});\n", .{ bind, pascal, route_count });
+        try buf.appendSlice(allocator, "}\n\n");
+
+        // Zig only analyses what is referenced, so a handler-free method (the
+        // tenant variants, for one) can be broken and still build. Referencing
+        // every declaration forces each generated method through the compiler.
+        try buf.print(allocator, "test \"{s}: generated service surface compiles\" {{\n", .{mod_name});
+        try buf.print(allocator, "    inline for (comptime std.meta.declarations({s}.service.{s}Service)) |decl| {{\n", .{ bind, pascal });
+        try buf.print(allocator, "        if (@TypeOf(@field({s}.service.{s}Service, decl)) == type) continue;\n", .{ bind, pascal });
+        try buf.print(allocator, "        _ = &@field({s}.service.{s}Service, decl);\n", .{ bind, pascal });
+        try buf.appendSlice(allocator, "    }\n");
+        try buf.appendSlice(allocator, "}\n\n");
     }
 
-    // Module lifecycle test
-    try buf.appendSlice(allocator, "\ntest \"integration: module lifecycle\" {\n");
-    for (module_names) |mod_name| {
-        const var_name = try replaceChar(allocator, mod_name, '/', '_');
-        defer allocator.free(var_name);
-        try buf.print(allocator, "    try {s}.init();\n    {s}.deinit();\n", .{ var_name, var_name });
-    }
-    try buf.appendSlice(allocator, "}\n");
-
+    buf.items.len = trimTrailingNewlines(buf.items).len;
+    try buf.appendSlice(allocator, "\n");
     return buf.toOwnedSlice(allocator);
+}
+
+/// Import binding for a module inside the generated tests: a Zig keyword can
+/// not be a `const` name, so it gets the same `_mod` suffix main.zig uses.
+fn testVarName(allocator: std.mem.Allocator, module_var: []const u8) ![]const u8 {
+    if (isZigReserved(module_var)) return std.fmt.allocPrint(allocator, "{s}_mod", .{module_var});
+    return allocator.dupe(u8, module_var);
+}
+
+fn zeroLiteral(col_type: ColumnType) []const u8 {
+    return switch (col_type) {
+        .int => "0",
+        .float => "0",
+        .bool => "false",
+        .string, .datetime, .unknown => "\"\"",
+    };
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -8746,7 +9036,7 @@ test "formatNestTuple splits module path" {
     const a = std.testing.allocator;
     const flat = try formatNestTuple(a, "order");
     defer a.free(flat);
-    try std.testing.expectEqualStrings(".{ \"order\" }", flat);
+    try std.testing.expectEqualStrings(".{\"order\"}", flat);
     const nested = try formatNestTuple(a, "shop/order");
     defer a.free(nested);
     try std.testing.expectEqualStrings(".{ \"shop\", \"order\" }", nested);
@@ -8812,11 +9102,58 @@ test "generateModuleApi emits RouteSpec table and typed handlers" {
     const table = TableDef{ .name = try a.dupe(u8, "orders"), .columns = cols[0..], .foreign_keys = &.{} };
     const code = try generateModuleApi(a, "order", &.{table}, 0);
     try std.testing.expect(std.mem.indexOf(u8, code, "pub const routes = [_]http.RouteSpec(State)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, code, "pub const nest = .{ \"order\" }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "pub const nest = .{\"order\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, code, ".path = \"list\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, code, "fn listOrders(ctx: *http.Context, self: *State)") != null);
     try std.testing.expect(std.mem.indexOf(u8, code, "registerRoutes") == null);
     try std.testing.expect(std.mem.indexOf(u8, code, "resolve(ctx)") == null);
+}
+
+test "generated ORM files only import std where a method uses it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var plain_cols = [_]ColumnDef{.{
+        .name = "title",
+        .col_type = .string,
+        .nullable = false,
+        .is_primary_key = false,
+        .is_unique = false,
+        .has_default = false,
+        .comment = null,
+    }};
+    const plain = TableDef{ .name = "tag", .columns = plain_cols[0..], .foreign_keys = &.{} };
+    var mail_cols = [_]ColumnDef{.{
+        .name = "email",
+        .col_type = .string,
+        .nullable = false,
+        .is_primary_key = false,
+        .is_unique = false,
+        .has_default = false,
+        .comment = null,
+    }};
+    const with_email = TableDef{ .name = "account", .columns = mail_cols[0..], .foreign_keys = &.{} };
+
+    const std_import = "const std = @import(\"std\");";
+
+    const persistence = try generateModulePersistence(a, "app", &.{plain}, 0);
+    try std.testing.expect(std.mem.indexOf(u8, persistence, std_import) == null);
+    const api = try generateModuleApi(a, "app", &.{plain}, 0);
+    try std.testing.expect(std.mem.indexOf(u8, api, std_import) == null);
+
+    // The email shape check is the only `std.*` call a generated service body
+    // makes, so both service templates keep the import for such a column and
+    // drop it — an unused `const std` fails `zmodu ci` deadcode — otherwise.
+    for ([_]bool{ false, true }) |enable_events| {
+        const plain_service = try generateModuleService(a, "app", &.{plain}, 0, enable_events, false, "tenant_id");
+        try std.testing.expect(std.mem.indexOf(u8, plain_service, std_import) == null);
+        try std.testing.expect(std.mem.indexOf(u8, plain_service, "std.mem.indexOfScalar") == null);
+
+        const email_service = try generateModuleService(a, "app", &.{with_email}, 0, enable_events, false, "tenant_id");
+        try std.testing.expect(std.mem.indexOf(u8, email_service, std_import) != null);
+        try std.testing.expect(std.mem.indexOf(u8, email_service, "std.mem.indexOfScalar") != null);
+    }
 }
 
 test "generateScaffoldMainZig mounts plugins via ComptimeRouter" {

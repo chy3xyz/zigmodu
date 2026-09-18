@@ -58,6 +58,7 @@ pub fn query(
 pub fn registerKpiSkills(registry: *SkillRegistry) !void {
     try registry.register(.{
         .name = "kpi.query",
+        .action = .read,
         .description = "Query an app-registered business metric (e.g. daily_revenue, refund_rate); returns its value",
         .parameters = &.{
             .{ .name = "metric", .type = .string, .description = "Metric name", .required = true },

@@ -146,6 +146,11 @@ pub const Workflow = struct {
     /// Max steps run concurrently in a DAG wave.
     max_parallel: usize = 4,
     budget: ?*Budget = null,
+    /// Authority for `.agent` steps: handed to the `Agent` each one builds, so a
+    /// workflow that is policed as a whole does not silently run unbounded agent
+    /// steps. `null` (the default) keeps the legacy behavior; see
+    /// `docs/AGENT_RUNTIME.md` §二 and `SkillRegistry.auditPolicy`.
+    guard: ?*@import("guard.zig").Guard = null,
     steps: []const Step,
     /// Reflection quality gate on the final step's output.
     reflection: ?VerifyFn = null,
@@ -591,6 +596,18 @@ pub const Workflow = struct {
         if (self.on_escalate) |cb| try cb(ctx, reason, step, allocator);
     }
 
+    /// The `Agent` an `.agent` step runs with: the workflow's provider, registry
+    /// and budget, **plus `guard` when one is set** — an `.agent` step must not
+    /// be unbounded while the workflow that owns it is policed.
+    fn agentForStep(self: Workflow, provider: *AiProvider) Agent {
+        return .{
+            .provider = provider,
+            .registry = self.registry,
+            .guard = self.guard,
+            .budget = self.budget,
+        };
+    }
+
     fn runStep(self: Workflow, allocator: std.mem.Allocator, ctx: *SkillContext, step: Step) !StepOutcome {
         return switch (step.kind) {
             .llm => |s| blk: {
@@ -612,11 +629,7 @@ pub const Workflow = struct {
             },
             .agent => |s| blk: {
                 const provider = self.provider orelse return error.ProviderRequired;
-                var agent = Agent{
-                    .provider = provider,
-                    .registry = self.registry,
-                    .budget = self.budget,
-                };
+                var agent = self.agentForStep(provider);
                 var ar = try agent.run(allocator, s.goal, ctx, s.max_steps);
                 defer ar.deinit(allocator);
                 break :blk .{
@@ -1279,4 +1292,28 @@ test "workflow detects cyclic dependencies" {
 
     const err = wf.run(allocator, &ctx) catch |e| e;
     try std.testing.expectEqual(error.CyclicDependency, err);
+}
+
+test "workflow .agent steps inherit the workflow guard" {
+    const allocator = std.testing.allocator;
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+
+    var http_client = @import("../http/HttpClient.zig").HttpClient.init(allocator, std.testing.io, 1, 5000);
+    defer http_client.deinit();
+    var provider = AiProvider.init(allocator, &http_client, "http://127.0.0.1:1/v1/chat/completions", "Bearer test", "mock");
+
+    var guard = @import("guard.zig").Guard.init(.{ .allow = &.{"ping"} });
+
+    const steps = [_]Step{.{ .name = "act", .kind = .{ .agent = .{ .goal = "g", .max_steps = 1 } } }};
+    var wf = Workflow.init(&registry, &steps);
+    wf.guard = &guard;
+
+    // Wiring only: `agentForStep` builds the Agent, it does not run it.
+    const agent = wf.agentForStep(&provider);
+    try std.testing.expectEqual(@as(?*@import("guard.zig").Guard, &guard), agent.guard);
+
+    // No guard on the workflow keeps the legacy unbounded agent step.
+    var legacy = Workflow.init(&registry, &steps);
+    try std.testing.expectEqual(@as(?*@import("guard.zig").Guard, null), legacy.agentForStep(&provider).guard);
 }

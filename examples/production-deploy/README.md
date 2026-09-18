@@ -16,7 +16,7 @@ client ─┤  网关/边车  ├──────────────►�
 | 决策 | 原因 |
 |------|------|
 | TLS 在边车终结，后端 h2c/明文 | 框架不实现 TLS server；把证书轮换、ALPN、HTTP/2 版本协商交给成熟组件 |
-| 网关 → 后端用 **h2c**（HTTP/2 cleartext） | 复用 `Server.enable_http2` 的多路复用与 gRPC 路径；`docs/BEST_PRACTICES.md` |
+| 网关 → 后端用 **h2c**（HTTP/2 cleartext） | 复用 `Server.setHttp2Enabled(true)` 的多路复用与 gRPC 路径；`docs/BEST_PRACTICES.md` |
 | 进程守护 `Restart=always` / `restartPolicy: Always` | panic 不可捕获：任何请求路径 panic 都会结束进程。**重启是最后一道可用性防线** |
 | 应用 root 接 `pub const panic = zmodu.panicHook;` | 让 stderr 带上"panic 时正在处理哪个请求"，重启后能定位 |
 | 后端设 `max_connections` + `header_timeout_ms` | 边车只是转发；连接洪泛/slowloris 会穿透到后端 |

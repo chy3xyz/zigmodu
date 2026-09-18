@@ -58,11 +58,19 @@ pub const Product = struct {
 ### 3.1 CRUD：`Persistence(Backend)`
 
 ```zig
+// `Backend` 是装配处选定的**具体类型**（comptime 形参），它只决定下面用哪套方法：
+//   *data.Client     → queryRowPartial / queryRowsPartial（返回自有字符串，调用方 free）
+//   data.SqlxBackend → queryRowPartialBorrowed（借用单行：字符串在 BorrowedRow(T).deinit()
+//                      前有效）/ queryRows（整页自有）——见 src/persistence/backends/SqlxBackend.zig
 pub fn ProductPersistence(comptime Backend: type) type {
     return struct {
         db: Backend,
         pub fn init(db: Backend) @This() { return .{ .db = db }; }
 
+        // products 表自带 tenant_id → 业务键是 (tenant_id, id)。
+        // 表本身就是租户主表、没有 tenant_id 列时（tenant-shop 的 tenants），
+        // 签名退化为 findById(self, id) —— 见
+        // examples/tenant-shop/src/modules/tenant/persistence.zig。
         pub fn findById(self: *@This(), tenant_id: i64, id: i64) !?model.Product {
             return self.db.queryRowPartial(model.Product, "... WHERE tenant_id = ? AND id = ?", &.{
                 .{ .int = tenant_id }, .{ .int = id },
@@ -81,7 +89,9 @@ pub fn ProductPersistence(comptime Backend: type) type {
 |----------|------|
 | `find*` | `!?T`（NotFound → null） |
 | `get*` / `list*` | `!T` / `![]T`（找不到就错或空切片） |
-| 所有查询 | 第一个业务键是 **`tenant_id`** |
+| `Backend` | 装配处传入的具体类型：`*data.Client`（自有扫描）或 `data.SqlxBackend`（借用扫描，`BorrowedRow` 作用域内有效） |
+| 带 `tenant_id` 列的表 | 所有查询的第一个业务键是 **`tenant_id`** |
+| 租户主表（无 `tenant_id` 列） | 按主键查即可（`findById(self, id)`）；隔离由鉴权层（JWT `aud` → 租户中间件/作用域）负责，这一层没有可加的谓词 |
 
 ### 3.2 跨表同一事务：`pub const Tx`
 

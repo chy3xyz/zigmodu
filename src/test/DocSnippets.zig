@@ -40,6 +40,27 @@
 //! `docs/superpowers/**` (a plugin's own plans/specs tree, not this project's
 //! docs). Fences are what is judged; prose and table cells are shorthand.
 //!
+//! The 2026-09-18 pass added the two `Context`-accessor shapes that had been
+//! shipping in `AGENTS.md`'s core code patterns — the most-copied snippet in
+//! the repo — and were the ones the gate never looked at:
+//!
+//! * `ctx.json(200, .{ .ok = true })` — `json`'s second parameter is
+//!   `[]const u8`, so the value form has to go through `ctx.jsonStruct`
+//!   (alias `jsonValue`);
+//! * `ctx.paramInt("id")` — `paramInt` is a generic taking the integer type
+//!   first (`paramInt(comptime T, key)`); the string-only form cannot compile.
+//!
+//! Both are matched on the decidable half only: a numeric status literal plus a
+//! second argument that opens a struct literal for the first rule, a string
+//! literal as the first argument for the second. `ctx.json(200, body)` is the
+//! legitimate string form, `jsonStruct` is a different call, and a line that
+//! breaks after `(` is a fragment — none of them are flagged.
+//!
+//! One exemption applies to every rule: a full-line `//` comment inside a fence
+//! is prose *about* code. The line that warns "the chained
+//! `builder(…).build(…)` one-liner does not compile" names the broken shape
+//! without offering it, and judging it would punish the warning itself.
+//!
 //! A block that shows an older signature on purpose — the v0.4
 //! `Application.init` in `docs/MIGRATION_v04_to_v07.md` — is tagged `text`, not
 //! `zig`: only `zig` and untagged fences are judged, so history stays readable
@@ -71,6 +92,14 @@ const runtime_fix_hint =
 const init_fix_hint =
     "  real signature: Application.init(io, allocator, name, modules, Config)\n" ++
     "  or bind the builder: var b = zmodu.builder(allocator, io); defer b.deinit();\n";
+
+const json_fix_hint =
+    "  `json` takes a pre-serialised `[]const u8` body;\n" ++
+    "  for a value use: ctx.jsonStruct(status, value) (alias jsonValue)\n";
+
+const param_int_fix_hint =
+    "  real signature: ctx.paramInt(T, key)\n" ++
+    "  e.g. ctx.paramInt(i64, \"id\")\n";
 
 /// Optional per-corpus rules. Every corpus runs the whole set today; the struct
 /// stays so a corpus can exempt a rule it has not been cleaned for yet.
@@ -164,6 +193,54 @@ fn initStartsWithAllocator(line: []const u8) bool {
         std.mem.startsWith(u8, arg, "arena");
 }
 
+/// Byte offset of a `ctx.<method>(` call that is not glued to a longer
+/// identifier: `self.ctx.json(` is still this `ctx`, `mini_ctx.json(` is
+/// somebody else's object.
+fn indexOfCtxCall(line: []const u8, comptime call: []const u8) ?usize {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, line, from, call)) |at| {
+        if (at == 0 or !isIdentChar(line[at - 1])) return at;
+        from = at + 1;
+    }
+    return null;
+}
+
+fn digitsPrefix(text: []const u8) usize {
+    var i: usize = 0;
+    while (i < text.len and (std.ascii.isDigit(text[i]) or text[i] == '_')) i += 1;
+    return i;
+}
+
+/// `ctx.json(200, .{ … })` — the second parameter is `[]const u8`, so a struct
+/// literal there cannot compile; the value form is `ctx.jsonStruct(status, value)`
+/// (alias `jsonValue`). Both halves have to hold, so the decidable cases stay
+/// clear: a numeric status literal (a variable status is unknowable from one
+/// line) *and* a second argument that starts a struct literal —
+/// `ctx.json(200, body)` is the legitimate string form and is left alone.
+fn jsonGetsStructLiteral(line: []const u8) ?[]const u8 {
+    const call = "ctx.json(";
+    const at = indexOfCtxCall(line, call) orelse return null;
+    var rest = std.mem.trimStart(u8, line[at + call.len ..], " \t");
+    const digits = digitsPrefix(rest);
+    if (digits == 0) return null;
+    rest = std.mem.trimStart(u8, rest[digits..], " \t");
+    if (rest.len == 0 or rest[0] != ',') return null;
+    rest = std.mem.trimStart(u8, rest[1..], " \t");
+    if (!std.mem.startsWith(u8, rest, ".{")) return null;
+    return line[at .. line.len - rest.len + 2];
+}
+
+/// `ctx.paramInt("id")` — the generic takes the integer type first
+/// (`paramInt(comptime T, key)`), so a string literal as the first argument
+/// cannot compile. `paramInt(i64, "id")`, `paramInt(T, "id")` and the
+/// line-broken fragment `ctx.paramInt(` are not judged.
+fn paramIntMissingType(line: []const u8) bool {
+    const call = "ctx.paramInt(";
+    const at = indexOfCtxCall(line, call) orelse return false;
+    const arg = std.mem.trimStart(u8, line[at + call.len ..], " \t");
+    return arg.len > 0 and (arg[0] == '"' or arg[0] == '\'');
+}
+
 /// `doc_line` turns a raw file line into the text to judge, or `null` when the
 /// line is not part of the document (code outside doc comments — which also ends
 /// any pending chain).
@@ -203,6 +280,13 @@ fn scanText(
         }
         if (!fence_is_zig) continue;
 
+        // A full-line `//` comment is prose *about* code — the line that warns
+        // "the chained `builder(…).build(…)` one-liner does not compile" names
+        // the broken shape without offering it, and judging it would punish the
+        // very warning the gate exists to spread. Nothing in a comment is meant
+        // to be copied, so no detector runs on it; a pending chain survives it.
+        if (std.mem.startsWith(u8, std.mem.trimStart(u8, line, " \t"), "//")) continue;
+
         if (chainedOnSameLine(line)) |method| {
             std.debug.print("[doc-snippets] {s}:{d}: `builder(…){s}…` cannot compile\n{s}", .{ path, line_no, method, fix_hint });
             violations.* += 1;
@@ -219,6 +303,20 @@ fn scanText(
         }
         if (rules.init_first_arg and initStartsWithAllocator(line)) {
             std.debug.print("[doc-snippets] {s}:{d}: `Application.init(allocator…` cannot compile\n{s}", .{ path, line_no, init_fix_hint });
+            violations.* += 1;
+            pending_builder = false;
+            pending_runtime = false;
+            continue;
+        }
+        if (jsonGetsStructLiteral(line)) |snippet| {
+            std.debug.print("[doc-snippets] {s}:{d}: `{s}…` cannot compile — the second parameter is `[]const u8`\n{s}", .{ path, line_no, snippet, json_fix_hint });
+            violations.* += 1;
+            pending_builder = false;
+            pending_runtime = false;
+            continue;
+        }
+        if (paramIntMissingType(line)) {
+            std.debug.print("[doc-snippets] {s}:{d}: `ctx.paramInt(\"…\")` lacks the type parameter\n{s}", .{ path, line_no, param_int_fix_hint });
             violations.* += 1;
             pending_builder = false;
             pending_runtime = false;
@@ -421,7 +519,7 @@ test "docs: the English README contains no Chinese (README.zh.md is the Chinese 
     if (!hasHan(zh)) return error.EnglishInChineseReadme;
 }
 
-test "doc snippets: no builder method is chained straight off the temporary" {
+test "doc snippets: the markdown corpus carries none of the known-uncompilable shapes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -520,4 +618,58 @@ test "doc snippets: source doc comments carry no stale snippets" {
         std.debug.print("[doc-snippets] {d} source doc snippet(s) that cannot compile\n", .{violations});
         return error.DocSnippetViolation;
     }
+}
+
+test "doc snippets: the json detector flags the value form and clears the string form" {
+    // The broken shape: a struct literal where `[]const u8` is expected.
+    try std.testing.expectEqualStrings("ctx.json(200, .{", jsonGetsStructLiteral(
+        "try ctx.json(200, .{ .ok = true });",
+    ).?);
+    try std.testing.expectEqualStrings("ctx.json(201, .{", jsonGetsStructLiteral(
+        "try ctx.json(201, .{ .code = 0, .msg = \"\", .data = data });",
+    ).?);
+    // Inside a longer receiver is still this `ctx`.
+    try std.testing.expect(jsonGetsStructLiteral("try self.ctx.json(200, .{ .ok = true });") != null);
+
+    // The working forms: a `[]const u8` body, a value through `jsonStruct`.
+    try std.testing.expect(jsonGetsStructLiteral("try ctx.json(200, \"{\\\"ok\\\":true}\");") == null);
+    try std.testing.expect(jsonGetsStructLiteral("try ctx.json(200, body);") == null);
+    try std.testing.expect(jsonGetsStructLiteral("const r = try std.fmt.allocPrint(ctx.allocator, \"{{\\\"id\\\":{d}}}\", .{id});") == null);
+    try std.testing.expect(jsonGetsStructLiteral("try ctx.json(200, try std.fmt.allocPrint(ctx.allocator, \"{{}}\", .{}));") == null);
+    try std.testing.expect(jsonGetsStructLiteral("try ctx.jsonStruct(200, .{ .ok = true });") == null);
+    try std.testing.expect(jsonGetsStructLiteral("try ctx.jsonValue(200, .{ .ok = true });") == null);
+    // A status the fragment does not pin down is not judged.
+    try std.testing.expect(jsonGetsStructLiteral("try ctx.json(status, .{ .ok = true });") == null);
+    // A different object's `json(…)` is not this rule's business.
+    try std.testing.expect(jsonGetsStructLiteral("try mini_ctx.json(200, .{ .ok = true });") == null);
+}
+
+test "doc snippets: the paramInt detector flags the type-less form and clears the generic one" {
+    // The broken shape: the key in the type position.
+    try std.testing.expect(paramIntMissingType("const id = try ctx.paramInt(\"id\");"));
+    try std.testing.expect(paramIntMissingType("const id = try ctx.paramInt( 'id' );"));
+
+    // The working forms: the integer type first, however it is spelled.
+    try std.testing.expect(!paramIntMissingType("const id = try ctx.paramInt(i64, \"id\");"));
+    try std.testing.expect(!paramIntMissingType("const n = try ctx.paramInt(u32, \"page\");"));
+    try std.testing.expect(!paramIntMissingType("const id = try ctx.paramInt(UserId, \"id\");"));
+    // A different object, a different method.
+    try std.testing.expect(!paramIntMissingType("const id = try mini_ctx.paramInt(\"id\");"));
+    try std.testing.expect(!paramIntMissingType("const n = ctx.queryInt(i64, \"page\", 1);"));
+    // A fragment that breaks the line after `(` is not judged.
+    try std.testing.expect(!paramIntMissingType("const id = try ctx.paramInt("));
+}
+
+test "doc snippets: a full-line comment inside a fence is prose, not a snippet" {
+    const block =
+        "```zig\n" ++
+        "// the chained builder(allocator, io).build(.{M}) one-liner does not compile\n" ++
+        "// ctx.json(200, .{ .ok = true }) is the wrong shape too\n" ++
+        "var app = try zmodu.builder(allocator, io).build(.{M});\n" ++
+        "```\n";
+
+    var violations: usize = 0;
+    scanText("inline", block, &everythingIsDoc, .{ .init_first_arg = true }, &violations);
+    // Only the line that actually offers the shape counts.
+    try std.testing.expectEqual(@as(usize, 1), violations);
 }

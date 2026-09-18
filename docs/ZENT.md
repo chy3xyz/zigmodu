@@ -473,13 +473,10 @@ pub const CatalogStore = struct {
         defer q.deinit();
         const preds = self.client.product.predicates;
         _ = try q.Where(.{preds.tenant_idEQ(.{ .int = tenant_id })});
+        // 整页释放走生成客户端的一行式 helper（zent ≥ 0.40）：需要 `var found`，
+        // 它会把调用方的列表重置为空并释放每行持有的字符串。
         var found = try q.All();
-        defer {
-            for (found.items) |*p| {
-                zent.codegen.deinitEntity(infos, ProductInfo, p, self.allocator);
-            }
-            found.deinit();
-        }
+        defer self.client.product.deinitRows(&found);
         // dupe 成 ProductRow DTO …
     }
 };
@@ -491,6 +488,7 @@ pub const CatalogStore = struct {
 |----------|------|
 | `find*` | `!?T`（无则 null） |
 | `get*` / `list*` | `!T` / `![]T` |
+| 结果释放 | `client.<entity>.deinitRow(&e)` / `deinitRows(&rows)`（生成客户端上的一行式 helper，zent ≥ 0.40）；手写 `deinitEntity` 循环是旧写法，本仓库示例已全部改掉 |
 | 租户过滤 | predicate 或 Privacy，**默认带上** |
 | 对外返回 | DTO；调用方 `free*` 写清 |
 
@@ -516,7 +514,7 @@ pub const CatalogStore = struct {
 
 | 对象 | 规则 |
 |------|------|
-| `Query().All()` | `Managed(Entity)`；每项 `deinitEntity(infos, info, &e, alloc)`，再 `list.deinit()` |
+| `Query().All()` | `Managed(Entity)`；首选生成客户端的一行式 `client.<entity>.deinitRows(&rows)`（列表要 `var`）；底层手写形态 `deinitEntity(infos, info, &e, alloc)` + `list.deinit()` 仍然可用 |
 | `Create()` builder | `defer builder.deinit()` |
 | `driver.Tx` / `TxClient` | commit/rollback 后**恰好一次** `deinit` |
 | `deinitEntity` | 传 **可变指针** `&entity`（非 `*const`） |
@@ -529,7 +527,7 @@ pub const CatalogStore = struct {
 
 ## 11. 依赖接入
 
-zent **v0.39.2** 提供 `build.zig.zon`（模块名 `zent`；生产 pin git tag，本地开发可换 path 依赖）。
+zent **v0.67.0** 提供 `build.zig.zon`（模块名 `zent`；生产 pin git tag，本地开发可换 path 依赖）。
 
 **本地 sibling（开发）：**
 

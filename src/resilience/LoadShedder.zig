@@ -2,6 +2,13 @@
 //!
 //! Provides an adaptive shedder that drops requests when the system
 //! is under load, based on response time and throughput.
+//!
+//! Positioning: user-facing resilience primitive; no in-tree consumer. Its
+//! `resilience/` siblings (`Bulkhead`, `RateLimiter`, `CircuitBreaker`) are wired
+//! into `ModuleRuntime`, but an RT/throughput-driven shedder is not: the L0 actor
+//! model already refuses on a full mailbox (`error.Full`), and the HTTP server's
+//! connection-level backpressure is `productionProfile`'s `max_connections`. Call
+//! `AdaptiveShedder.allow()` from your own request path.
 
 const std = @import("std");
 const Time = @import("../core/Time.zig");

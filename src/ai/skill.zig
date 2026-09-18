@@ -87,6 +87,54 @@ pub fn freeValue(allocator: std.mem.Allocator, v: std.json.Value) void {
     }
 }
 
+/// What a `guard.Permissions` policy does to the tools that are actually
+/// registered — judged by each tool's **declared class**, which is exactly what
+/// `Guard`/`Permissions` cannot see.
+///
+/// `Permissions.isInert()` only asks "is `allow` empty?", so a policy that names
+/// exclusively `execute` tools looks configured while `allow_execute = false`
+/// makes every one of those calls `denied_execute_class`. This struct is the
+/// registry-side answer to that blind spot: `class_denied` (and the names behind
+/// it) is the count that must be zero for a policy to be worth deploying.
+pub const PolicyHealth = struct {
+    /// Registered tools examined. Zero means the audit had nothing to judge.
+    total: usize = 0,
+    /// Listed by the policy **and** admitted by its class gate.
+    allowed: usize = 0,
+    /// Listed by the policy, but refused by its own class gate
+    /// (`denied_execute_class`) — the blind spot described above.
+    class_denied: usize = 0,
+    /// Not on the allow list.
+    not_listed: usize = 0,
+    /// On the deny list (`deny` beats `allow`).
+    explicitly_denied: usize = 0,
+    /// The names behind `class_denied`. **Borrowed from the registry** (name keys
+    /// live as long as the registry does); only the outer slice is allocated.
+    class_denied_tools: []const []const u8 = &.{},
+
+    /// The policy cannot admit a single registered tool — whether because `allow`
+    /// is empty (`Permissions.isInert()`) **or** because everything it lists is
+    /// blocked by its class gate. Fail startup on this, not on the narrower
+    /// `Guard.isInert()` alone.
+    pub fn isInert(self: PolicyHealth) bool {
+        if (self.total == 0) return false; // nothing registered: nothing to report
+        return self.allowed == 0;
+    }
+
+    /// The policy names tools but the class gate refuses at least one of them.
+    /// Log `class_denied_tools` at startup: the settings are not wrong, they are
+    /// just not enough (`allow_execute`, or swap an `execute` tool for a
+    /// `propose` one).
+    pub fn hasClassBlindSpot(self: PolicyHealth) bool {
+        return self.class_denied > 0;
+    }
+
+    pub fn deinit(self: *PolicyHealth, allocator: std.mem.Allocator) void {
+        allocator.free(self.class_denied_tools);
+        self.class_denied_tools = &.{};
+    }
+};
+
 /// Registry that aggregates Tool definitions from all modules.
 /// Thread-safe via std.Io.Mutex (same fiber model as ConnectionRegistry).
 pub const SkillRegistry = struct {
@@ -179,6 +227,47 @@ pub const SkillRegistry = struct {
             n += 1;
         }
         return n;
+    }
+
+    /// Audit a policy against the **declared classes** of the registered tools.
+    ///
+    /// `Guard` decides by name; this is the layer that can also see each tool's
+    /// `action`, so it answers the question a name-only check cannot: *which
+    /// registered tools does the class gate refuse even though the policy lists
+    /// them?* Call it once at startup next to `Guard.isInert()` and fail loudly
+    /// when `PolicyHealth.isInert()` or `hasClassBlindSpot()` is true.
+    ///
+    /// Free the result with `PolicyHealth.deinit` (`class_denied_tools` borrows
+    /// the registry's own name keys, so nothing else is owned).
+    pub fn auditPolicy(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        permissions: guard_mod.Permissions,
+    ) !PolicyHealth {
+        self.mutex.lock(self.io) catch return error.RegistryLockFailed;
+        defer self.mutex.unlock(self.io);
+
+        var health = PolicyHealth{};
+        var denied = std.ArrayList([]const u8).empty;
+        errdefer denied.deinit(allocator);
+
+        var it = self.tools.iterator();
+        while (it.next()) |entry| {
+            const tool = entry.value_ptr.*;
+            health.total += 1;
+            switch (permissions.permits(tool.action, tool.name)) {
+                .allowed => health.allowed += 1,
+                .denied_execute_class => {
+                    health.class_denied += 1;
+                    try denied.append(allocator, tool.name);
+                },
+                .denied_not_listed => health.not_listed += 1,
+                .denied_explicitly => health.explicitly_denied += 1,
+                .denied_budget => unreachable, // produced by `Guard.check`, not `permits`
+            }
+        }
+        health.class_denied_tools = try denied.toOwnedSlice(allocator);
+        return health;
     }
 
     /// Generate OpenAI-compatible tools JSON (owned slice).
@@ -404,6 +493,162 @@ test "SkillRegistry cooperative deadline" {
 
     var ctx = SkillContext{ .allocator = allocator };
     try std.testing.expectError(error.ToolTimeout, reg.dispatch("slow", &ctx, .null));
+}
+
+// ─────────────────────────────────────────────────
+// Policy audit — declared classes vs. a policy (guard.zig)
+// ─────────────────────────────────────────────────
+
+/// Every builtin skill catalog, and the class each skill declares. Kept as a
+/// table on purpose: a builtin that forgets `.action` falls back to `execute`
+/// (fail-closed) and shows up here as a mismatch, instead of silently becoming
+/// unreachable under `allow_execute = false`.
+const builtin_classes = [_]struct { []const u8, guard_mod.Action }{
+    .{ "db.query", .read },
+    .{ "entity.lookup", .read },
+    .{ "entity.list", .read },
+    .{ "entity.create", .execute },
+    .{ "entity.update", .execute },
+    .{ "command.execute", .execute },
+    .{ "report.generate", .read },
+    .{ "list_schedulable_tasks", .read },
+    .{ "schedule_job", .execute },
+    .{ "list_jobs", .read },
+    .{ "cancel_job", .execute },
+    .{ "notification.send", .propose },
+    .{ "kpi.query", .read },
+    .{ "approval.submit", .propose },
+    .{ "approval.request", .propose },
+    .{ "admin.cache.invalidate", .execute },
+    .{ "admin.cache.clear", .execute },
+    .{ "admin.config.get", .read },
+    .{ "admin.config.set", .execute },
+    .{ "admin.audit.export", .read },
+    .{ "admin.user.manage", .execute },
+    .{ "admin.tenant.provision", .execute },
+};
+
+fn registerBuiltinCatalog(registry: *SkillRegistry) !void {
+    const business = @import("business.zig");
+    try business.registerBusinessSkills(registry, &[_]business.EntitySpec{});
+    try @import("actions.zig").registerWriteSkills(registry);
+    try @import("actions.zig").registerCommandSkills(registry);
+    try @import("actions.zig").registerReportSkills(registry);
+    try @import("schedule.zig").registerScheduleSkills(registry);
+    try @import("notify.zig").registerNotifySkills(registry);
+    try @import("kpi.zig").registerKpiSkills(registry);
+    try @import("approval.zig").registerApprovalSkills(registry);
+    try @import("approval_api.zig").registerApprovalRequestSkills(registry);
+    try @import("admin.zig").registerAdminSkills(registry);
+}
+
+test "builtin skills declare their action class" {
+    const allocator = std.testing.allocator;
+    var reg = SkillRegistry.init(allocator, std.testing.io);
+    defer reg.deinit();
+    try registerBuiltinCatalog(&reg);
+
+    // 1:1 — an unclassified builtin (defaulting to `.execute`) fails here.
+    try std.testing.expectEqual(builtin_classes.len, reg.count());
+    for (builtin_classes) |entry| {
+        const tool = reg.get(entry[0]) orelse {
+            std.debug.print("missing builtin skill: {s}\n", .{entry[0]});
+            return error.TestUnexpectedResult;
+        };
+        if (tool.action != entry[1]) {
+            std.debug.print("builtin {s} declares {s}, expected {s}\n", .{
+                entry[0], @tagName(tool.action), @tagName(entry[1]),
+            });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "auditPolicy: a read-only policy admits read tools and kills nothing by class" {
+    const allocator = std.testing.allocator;
+    var reg = SkillRegistry.init(allocator, std.testing.io);
+    defer reg.deinit();
+    try registerBuiltinCatalog(&reg);
+
+    // Exactly the policy docs/AGENT_RUNTIME.md §二 recommends: name the read
+    // tools, leave execution off.
+    var allow: [builtin_classes.len][]const u8 = undefined;
+    var n: usize = 0;
+    for (builtin_classes) |entry| {
+        if (entry[1] == .read) {
+            allow[n] = entry[0];
+            n += 1;
+        }
+    }
+    const perms = guard_mod.Permissions{ .allow = allow[0..n] }; // allow_execute = false
+
+    // (i) a read tool really is permitted by the guard, and it is read *because*
+    //     the builtin declared so.
+    try std.testing.expectEqual(guard_mod.Action.read, reg.get("db.query").?.action);
+    var guard = guard_mod.Guard.init(perms);
+    try std.testing.expectEqual(guard_mod.Decision.allowed, guard.check(.read, "db.query", 0));
+    // The class axis only narrows: a propose tool needs its own name, and an
+    // unlisted `execute` reports `denied_not_listed` (its class is not yet the
+    // binding reason) — see `guard.Permissions.permits`.
+    try std.testing.expectEqual(guard_mod.Decision.denied_not_listed, guard.check(.propose, "notification.send", 0));
+    try std.testing.expectEqual(guard_mod.Decision.denied_not_listed, guard.check(.execute, "schedule_job", 0));
+
+    // (ii) the audit reports the policy as usable: read tools live, nothing
+    //      refused by its own class gate.
+    var health = try reg.auditPolicy(allocator, perms);
+    defer health.deinit(allocator);
+    try std.testing.expectEqual(builtin_classes.len, health.total);
+    try std.testing.expectEqual(n, health.allowed);
+    try std.testing.expectEqual(@as(usize, 0), health.class_denied);
+    try std.testing.expect(!health.hasClassBlindSpot());
+    try std.testing.expect(!health.isInert());
+    try std.testing.expectEqual(@as(usize, 0), health.class_denied_tools.len);
+}
+
+test "auditPolicy: an execute-only allow list is a class blind spot isInert() misses" {
+    const allocator = std.testing.allocator;
+    var reg = SkillRegistry.init(allocator, std.testing.io);
+    defer reg.deinit();
+    try registerBuiltinCatalog(&reg);
+
+    // The trap: a policy that *looks* configured but lists only `execute` tools
+    // while `allow_execute` is off.
+    const perms = guard_mod.Permissions{
+        .allow = &.{ "schedule_job", "admin.config.set" },
+    };
+    try std.testing.expectEqual(guard_mod.Action.execute, reg.get("schedule_job").?.action);
+
+    // `Permissions.isInert()` cannot see it (allow is not empty) …
+    try std.testing.expect(!perms.isInert());
+
+    // … the registry-side audit can, and names the tools it refuses.
+    var health = try reg.auditPolicy(allocator, perms);
+    defer health.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), health.allowed);
+    try std.testing.expectEqual(@as(usize, 2), health.class_denied);
+    try std.testing.expect(health.hasClassBlindSpot());
+    try std.testing.expect(health.isInert());
+    try std.testing.expectEqual(@as(usize, 2), health.class_denied_tools.len);
+    var saw_job = false;
+    for (health.class_denied_tools) |name| {
+        if (std.mem.eql(u8, name, "schedule_job")) saw_job = true;
+    }
+    try std.testing.expect(saw_job);
+
+    // Flipping the switch is the fix, and `deny` still wins over the class gate.
+    var switched = try reg.auditPolicy(allocator, .{ .allow = perms.allow, .deny = &.{"schedule_job"}, .allow_execute = true });
+    defer switched.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), switched.allowed);
+    try std.testing.expectEqual(@as(usize, 1), switched.explicitly_denied);
+    try std.testing.expectEqual(@as(usize, 0), switched.class_denied);
+
+    // An empty registry has nothing to judge (`total == 0`) — it must not be
+    // reported as an inert policy.
+    var empty = SkillRegistry.init(allocator, std.testing.io);
+    defer empty.deinit();
+    var empty_health = try empty.auditPolicy(allocator, perms);
+    defer empty_health.deinit(allocator);
+    try std.testing.expect(!empty_health.isInert());
 }
 
 fn pingHandler(ctx: *SkillContext, _: std.json.Value) anyerror!std.json.Value {

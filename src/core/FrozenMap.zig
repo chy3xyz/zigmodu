@@ -16,6 +16,12 @@
 //! const a = adapters.get("alipay");        // lock-free, thread-safe
 //! try adapters.put("wechat", .{ ... });    // error.Frozen — no race
 //! ```
+//!
+//! Positioning: user-facing primitive. **`FrozenStringMap` already has an in-tree
+//! consumer** — `src/soak.zig` builds its shared tenant registry from it — while
+//! the generic `FrozenMap` has none: no file under `src/` owns a file-scope
+//! mutable registry map (the `zmodu audit` b20 rule exists to catch apps that do).
+//! Recommended in `AGENTS.md`, `docs/BEST_PRACTICES.md` and `docs/RUNTIME.md` §6.
 
 const std = @import("std");
 

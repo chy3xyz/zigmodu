@@ -29,7 +29,9 @@ For multi-node production, see the caveats below.
 > `healthJson(alloc)` / `tick()`，**不要再自己拼一套**（详见下一节）。
 > `ClusterHealth` **不是类型**：导出的是 `cluster_health` 模块 + 两个函数 `clusterHealthJson(alloc, cluster)` /
 > `clusterHealthHandler(cluster)`，路由要应用自己挂。`DistributedIntegrationTest.zig` 仍无人 import
-> （不编译、测试不运行）。
+> （不编译、测试不运行）。读侧的两个根导出名 `ClusterSnapshot`（= `ClusterView.Snapshot`）与
+> `ClusterNodeView`（= `MembershipView.Node`）是给应用的别名；框架内部只用后两个名字，这正是
+> 这两个别名在树内"零使用"的原因 —— 没有失效的类型，只有没被内部代码用到的名字。
 
 ## 读侧怎么被喂（membership → view → 请求路径）
 

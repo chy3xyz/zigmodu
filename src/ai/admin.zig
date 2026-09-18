@@ -104,6 +104,7 @@ fn findCache(caches: []const CacheHandle, name: []const u8) ?CacheHandle {
 pub fn registerAdminSkills(registry: *SkillRegistry) !void {
     try registry.register(.{
         .name = "admin.cache.invalidate",
+        .action = .execute,
         .description = "Delete one key from a whitelisted cache; wildcards are rejected (use admin.cache.clear with all=true for a full clear)",
         .required_permission = "admin:cache",
         .parameters = &.{
@@ -130,6 +131,7 @@ pub fn registerAdminSkills(registry: *SkillRegistry) !void {
     });
     try registry.register(.{
         .name = "admin.cache.clear",
+        .action = .execute,
         .description = "Fully clear a whitelisted cache (requires explicit all=true)",
         .required_permission = "admin:cache",
         .parameters = &.{
@@ -155,6 +157,7 @@ pub fn registerAdminSkills(registry: *SkillRegistry) !void {
     });
     try registry.register(.{
         .name = "admin.config.get",
+        .action = .read,
         .description = "Read a whitelisted configuration value",
         .required_permission = "admin:config",
         .parameters = &.{
@@ -178,6 +181,7 @@ pub fn registerAdminSkills(registry: *SkillRegistry) !void {
     });
     try registry.register(.{
         .name = "admin.config.set",
+        .action = .execute,
         .description = "Set a mutable configuration value (mutable-keys whitelist)",
         .required_permission = "admin:config",
         .parameters = &.{
@@ -202,6 +206,7 @@ pub fn registerAdminSkills(registry: *SkillRegistry) !void {
     });
     try registry.register(.{
         .name = "admin.audit.export",
+        .action = .read,
         .description = "Query the durable AI run-audit store (optional kind/tenant filters)",
         .required_permission = "admin:audit",
         .parameters = &.{
@@ -245,6 +250,7 @@ pub fn registerAdminSkills(registry: *SkillRegistry) !void {
     });
     try registry.register(.{
         .name = "admin.user.manage",
+        .action = .execute,
         .description = "Delegate a user-management action to the application handler",
         .required_permission = "admin:user",
         .parameters = &.{
@@ -265,6 +271,7 @@ pub fn registerAdminSkills(registry: *SkillRegistry) !void {
     });
     try registry.register(.{
         .name = "admin.tenant.provision",
+        .action = .execute,
         .description = "Delegate a tenant-provisioning action to the application handler",
         .required_permission = "admin:tenant",
         .parameters = &.{

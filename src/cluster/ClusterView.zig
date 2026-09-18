@@ -63,6 +63,8 @@ pub const Member = struct {
 /// stalled (a blocked syscall, a debugger), and failing loudly beats corrupting it.
 const reader_wait_spins = 200_000;
 
+/// Exported from the package root as `zmodu.ClusterSnapshot`. The *alias* has no
+/// in-tree user — `ClusterBootstrap` and `MembershipView` hold the type directly.
 pub const Snapshot = struct {
     generation: u64,
     members: []const Member,

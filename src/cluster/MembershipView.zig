@@ -31,6 +31,10 @@ const ClusterMembership = membership_mod.ClusterMembership;
 
 /// One member as the bridge sees it. `address` is `host:port` and informational
 /// (`pick` scores on `id`).
+///
+/// Exported from the package root as `zmodu.ClusterNodeView`. The *alias* has no
+/// in-tree user — this file and `ClusterBootstrap` pass the type around as
+/// `MembershipView.Node`.
 pub const Node = struct {
     id: []const u8,
     address: []const u8 = "",

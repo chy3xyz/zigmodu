@@ -2343,34 +2343,22 @@ pub const Server = struct {
         };
     }
 
+    /// Read an integer environment variable, falling back to `default` when the
+    /// variable is unset or malformed (a typo must not take the server down).
+    fn envInt(comptime T: type, env: *const std.process.Environ.Map, key: []const u8, default: T) T {
+        const raw = env.get(key) orelse return default;
+        return std.fmt.parseInt(T, raw, 10) catch default;
+    }
+
     /// Factory: create a Server from environment variables.
-    /// Pass std.process.Environ from main's init: Server.fromEnv(io, alloc, init.environ).
-    pub fn fromEnv(io: std.Io, allocator: std.mem.Allocator, env: std.process.Environ) !Server {
-        var port: u16 = 8080;
-        var max_body: usize = 8 * 1024 * 1024;
-        var max_conns: usize = 0;
-        var header_timeout_ms: u32 = 10_000;
-        var ws_write_timeout_ms: u32 = 0;
-        var iter = env.iterator();
-        while (iter.next()) |entry| {
-            if (std.mem.eql(u8, entry.key_ptr.*, "HTTP_PORT")) {
-                port = std.fmt.parseInt(u16, entry.value_ptr.*, 10) catch 8080;
-            } else if (std.mem.eql(u8, entry.key_ptr.*, "HTTP_MAX_BODY")) {
-                max_body = std.fmt.parseInt(usize, entry.value_ptr.*, 10) catch (8 * 1024 * 1024);
-            } else if (std.mem.eql(u8, entry.key_ptr.*, "HTTP_MAX_CONNECTIONS")) {
-                max_conns = std.fmt.parseInt(usize, entry.value_ptr.*, 10) catch 0;
-            } else if (std.mem.eql(u8, entry.key_ptr.*, "HTTP_HEADER_TIMEOUT_MS")) {
-                header_timeout_ms = std.fmt.parseInt(u32, entry.value_ptr.*, 10) catch 10_000;
-            } else if (std.mem.eql(u8, entry.key_ptr.*, "WS_WRITE_TIMEOUT_MS")) {
-                ws_write_timeout_ms = std.fmt.parseInt(u32, entry.value_ptr.*, 10) catch 0;
-            }
-        }
+    /// Pass main's environment map: `Server.fromEnv(io, alloc, init.environ_map)`.
+    pub fn fromEnv(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !Server {
         return initWithConfig(io, allocator, .{
-            .port = port,
-            .max_body_size = max_body,
-            .max_connections = max_conns,
-            .header_timeout_ms = header_timeout_ms,
-            .ws_write_timeout_ms = ws_write_timeout_ms,
+            .port = envInt(u16, env, "HTTP_PORT", 8080),
+            .max_body_size = envInt(usize, env, "HTTP_MAX_BODY", 8 * 1024 * 1024),
+            .max_connections = envInt(usize, env, "HTTP_MAX_CONNECTIONS", 0),
+            .header_timeout_ms = envInt(u32, env, "HTTP_HEADER_TIMEOUT_MS", 10_000),
+            .ws_write_timeout_ms = envInt(u32, env, "WS_WRITE_TIMEOUT_MS", 0),
         });
     }
 
@@ -4465,4 +4453,35 @@ test "nestedParam is the dotted-path lookup; paramPath stays as its alias" {
     try std.testing.expectEqualStrings("a,b", ctx.paramPath("filter.tags").?);
     // …and it is not a route parameter, which is the whole point of the rename.
     try std.testing.expect(ctx.nestedParam("id") == null);
+}
+
+test "fromEnv reads the documented variables off init.environ_map" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put("HTTP_PORT", "18080");
+    try env.put("HTTP_MAX_CONNECTIONS", "4096");
+    try env.put("HTTP_HEADER_TIMEOUT_MS", "2500");
+    try env.put("HTTP_MAX_BODY", "1024");
+
+    var server = try Server.fromEnv(std.testing.io, allocator, &env);
+    defer server.deinit();
+
+    try std.testing.expectEqual(@as(u16, 18080), server.port);
+    try std.testing.expectEqual(@as(usize, 4096), server.max_connections);
+    try std.testing.expectEqual(@as(u32, 2500), server.header_timeout_ms);
+    try std.testing.expectEqual(@as(usize, 1024), server.max_body_size);
+    // Unset or malformed variables fall back to the documented defaults.
+    try std.testing.expectEqual(@as(u32, 0), server.ws_write_timeout_ms);
+}
+
+test "fromEnv falls back to defaults when a variable is malformed" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put("HTTP_PORT", "not-a-port");
+
+    var server = try Server.fromEnv(std.testing.io, allocator, &env);
+    defer server.deinit();
+    try std.testing.expectEqual(@as(u16, 8080), server.port);
 }

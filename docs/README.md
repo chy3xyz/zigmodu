@@ -39,6 +39,17 @@ Comprehensive documentation for the ZigModu modular framework.
 | [Production Roadmap](PRODUCTION_ROADMAP.md) | 维护边界、prefork 边界、`src/ai` 可剔离域 | Advanced |
 | [部署参考](../examples/production-deploy/README.md) | TLS 边车、探针语义、`Restart=always`、Dockerfile | Advanced |
 
+## 📎 Other documents
+
+These are referenced by task but were not indexed before — kept as-is.
+
+| Doc | What it covers |
+|-----|----------------|
+| [LOGGING.md](LOGGING.md) | Structured logging: levels, fields, sinks |
+| [MIGRATION_v04_to_v07.md](MIGRATION_v04_to_v07.md) | Historical upgrade guide v0.4 → v0.7 (older than [UPGRADING.md](UPGRADING.md)) |
+| [ZIGMODU_NOTES.md](ZIGMODU_NOTES.md) | Field notes from a real project integration (v0.14.x) |
+| [docs/dev/](dev/) | Internal review / assessment / roadmap scratch notes (not user-facing contracts) |
+
 ## 🔧 Features
 
 ### Core

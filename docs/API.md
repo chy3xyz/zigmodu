@@ -578,7 +578,7 @@ pub fn withGracefulDrain(self: *Server, counter: *std.atomic.Value(u64)) void
 | `request_timeout_ms` | `30000` | **handler stage** budget |
 | `max_requests_per_conn` | `100` | keep-alive reuse cap |
 | `header_limits` | `.{ .max_count = 100, .max_total_bytes = 16 KiB }` | header-bomb guard |
-| `connection_stack_size` | `128 KiB` | per-connection stack |
+| `connection_stack_size` | `128 KiB` | accept-loop thread stack (`runInBackground`; raised to `min_thread_stack_size`) — not per-connection |
 | `max_connections` | `0` (unlimited) | concurrent accepted connections; over the limit the socket is closed |
 | `over_limit_response` | `.close` | `.close` = cheapest, `.unavailable` = raw-socket `503` first |
 | `header_timeout_ms` | `10_000` | request line + headers deadline (slowloris); `0` disables; cleared once headers are read |
@@ -1610,6 +1610,10 @@ repository.
 
 ### Hot Reloader
 
+**File watching only** (⚠️ 有条件). Zig links statically, so `reloadModule` logs the
+request and returns without replacing code; drive your own response (rebuild, restart,
+hot-swap via `ModuleSnapshot`) from the `onChange` callback.
+
 ```zig
 pub const HotReloader = struct {
     pub fn init(allocator: std.mem.Allocator) Self
@@ -1619,6 +1623,12 @@ pub const HotReloader = struct {
     pub fn reloadModule(self: *Self, module_path: []const u8) !void
 };
 ```
+
+### Plugin System
+
+**Registration only.** `loadPlugin` records the name and logs a warning;
+`dynamicLoadingSupported()` returns `false` and no shared library is ever loaded
+(see `docs/UPGRADING.md`). For a real extension point use modules + `Application`.
 
 ### Plugin System
 

@@ -58,6 +58,7 @@ test "compile all source files" {
     _ = @import("core/ModuleRegistry.zig");
     _ = @import("core/Transactional.zig");
     _ = @import("core/TransactionalEvent.zig");
+    _ = @import("extensions/PluginManager.zig");
     _ = @import("extensions/WebMonitor.zig");
     _ = @import("extensions/WebSocket.zig");
 
@@ -74,6 +75,7 @@ test "compile all source files" {
     _ = @import("core/cluster/ClusterBootstrap.zig");
     _ = @import("core/cluster/ClusterHealth.zig");
     _ = @import("core/cluster/LoadBalancer.zig");
+    _ = @import("core/cluster/DistributedIntegrationTest.zig");
     _ = @import("messaging/OutboxPublisher.zig");
     _ = @import("tenant/ShardRouter.zig");
 

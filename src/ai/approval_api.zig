@@ -130,6 +130,7 @@ pub const ApprovalCtx = struct {
 pub fn registerApprovalRequestSkills(registry: *SkillRegistry) !void {
     try registry.register(.{
         .name = "approval.request",
+        .action = .propose,
         .description = "Submit a business request through the app-registered approval chain; returns the approval run id and status (approved / pending_human / rejected)",
         .required_permission = "approval:decide",
         .parameters = &.{

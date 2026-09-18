@@ -82,7 +82,7 @@ defer app.stop();
 | Agent：`AgentSpec{.guard=…}` + 技能声明 `.action`（默认 `execute`）；`ai.ProposalPipeline` 走提议→风险→执行 | 裸 `Agent{}` 不设 `guard`（= **无界**）；用 `MemoryStore.formatContext` 给 agent 喂记忆（`0` = 任意 = 跨租户） |
 | 共享注册表：`zmodu.FrozenMap/FrozenStringMap`，启动期填充后 `freeze()` | 文件作用域裸 HashMap 在 worker 池上并发写（撕裂元数据 → 进程崩溃） |
 | Runtime：模块里 `ctx.runtime()`（app 拥有：首次创建即启动 ticker；`stop()` 先 join worker 再停模块） | 模块里自己 `Runtime.init`（线程没人 join）；在模块里 `rt.shutdown()`（提前打断别的模块的 worker） |
-| 文档/注释里的 builder 片段：先 `var b = zmodu.builder(allocator, io); defer b.deinit();` 再链式 | 写 `builder(…).withName(…)`（临时值是 `*const`，编译不过；`src/test/DocSnippets.zig` 会抽查文档代码块） |
+| 文档/注释里的 builder 片段：先 `var b = zmodu.builder(allocator, io); defer b.deinit();` 再链式 | 写 `builder(…).withName(…)`（临时值是 `*const`，编译不过）；注意 `src/test/DocSnippets.zig` 只抽查围栏代码块/文档注释里的 5 种形状（builder 临时值直链、`try app.runtime().…`、`Application.init(allocator…)`、`ctx.json(<数字>, .{…})`、`ctx.paramInt("…")`），并非全量编译文档 |
 | 错误体统一：启动期 `http.useRfc7807Errors()`（链内 + 路由前一次到位） | 写链尾中间件改 404 体（需把 `moduleGate` 降成 `.unknown = .allow`）；靠 `curl` 才发现形状不一致 |
 | 单 gate 换形状：`.reject = http.problemReject`（`ModuleGateConfig` 也支持 `reject`） | 为改 404 体而放弃 `.unknown = .deny` |
 | handler 问门户：`ctx.permissionMatches("portal:user\|portal:shop")`（与路由声明同表达式） | handler 重写门户检查只认一侧（OR meta 会被窄化成 403） |
@@ -263,14 +263,14 @@ pub fn OrderApi(comptime Service: type) type {
         };
 
         fn getOrder(ctx: *http.Context, self: *State) !void {
-            const id = try ctx.paramInt("id");
+            const id = try ctx.paramInt(i64, "id");
             // tenant: ctx.getAttr("tenant_id") — 勿再验 Bearer
             _ = self;
             _ = id;
-            try ctx.json(200, .{ .ok = true });
+            try ctx.jsonStruct(200, .{ .ok = true });
         }
-        fn cancel(ctx: *http.Context, _: *State) !void { try ctx.json(200, .{ .ok = true }); }
-        fn login(ctx: *http.Context, _: *State) !void { try ctx.json(200, .{ .token = "..." }); }
+        fn cancel(ctx: *http.Context, _: *State) !void { try ctx.jsonStruct(200, .{ .ok = true }); }
+        fn login(ctx: *http.Context, _: *State) !void { try ctx.jsonStruct(200, .{ .token = "..." }); }
     };
 }
 
@@ -283,8 +283,8 @@ pub fn OrderApi(comptime Service: type) type {
 ```zig
 try group.get("users/{id}", getUser, null); // 路径无前导 /
 fn getUser(ctx: *http.Context) !void {
-    const id = try ctx.paramInt("id");
-    try ctx.json(200, .{ .id = id }); // NOT sendSuccess/sendFail
+    const id = try ctx.paramInt(i64, "id");
+    try ctx.jsonStruct(200, .{ .id = id }); // NOT sendSuccess/sendFail
 }
 ```
 

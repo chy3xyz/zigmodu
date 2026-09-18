@@ -46,10 +46,6 @@ fn fakeJson(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const u8) a
     return .{ .object = obj };
 }
 
-fn putOwned(obj: *std.json.ObjectMap, allocator: std.mem.Allocator, key: []const u8, value: std.json.Value) !void {
-    try obj.put(allocator, try allocator.dupe(u8, key), value);
-}
-
 pub fn main(init: std.process.Init) !void {
     try run(init);
 }

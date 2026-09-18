@@ -14,19 +14,6 @@ const OrderCreated = struct {
     timestamp: i64,
 };
 
-const PaymentProcessed = struct {
-    order_id: u64,
-    payment_id: u64,
-    status: enum { success, failed },
-    amount: f64,
-};
-
-const InventoryReserved = struct {
-    order_id: u64,
-    product_id: u64,
-    quantity: i32,
-};
-
 // 订单模块 - 发布事件
 const OrderModule = struct {
     pub const info = zigmodu.api.Module{

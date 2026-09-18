@@ -123,6 +123,7 @@ pub const NotificationCtx = struct {
 pub fn registerNotifySkills(registry: *SkillRegistry) !void {
     try registry.register(.{
         .name = "notification.send",
+        .action = .propose,
         .description = "Send a notification (title + body) to a named channel; returns delivered/sent counts",
         .parameters = &.{
             .{ .name = "channel", .type = .string, .description = "Channel name", .required = true },

@@ -1,7 +1,6 @@
 const std = @import("std");
 const zigmodu = @import("zigmodu");
 const http = zigmodu.http;
-const service = @import("service.zig");
 const model = @import("model.zig");
 
 pub fn CreativeApi(comptime Service: type) type {

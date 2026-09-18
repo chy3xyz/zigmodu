@@ -5,6 +5,11 @@
 //! - Peer health from ClusterMembership
 //! - Message rates from ClusterMetrics
 //! - RaftElection term and state
+//!
+//! Positioning: user-facing; no in-tree consumer, deliberately. `healthJson` /
+//! `clusterHealthHandler` are handed to the application to mount on whatever path
+//! it likes (the framework adds no route for them), and
+//! `ClusterBootstrap.healthJson` forwards to the former.
 
 const std = @import("std");
 const ClusterBootstrap = @import("ClusterBootstrap.zig").ClusterBootstrap;
@@ -34,7 +39,7 @@ pub fn healthJson(alloc: std.mem.Allocator, cluster: *ClusterBootstrap) ![]const
         \\  }}
         \\}}
     , .{
-        "node-id",
+        cluster.getConfig().node_id,
         m.node_count.load(.monotonic),
         raft.getTerm(),
         @tagName(raft.getState()),
@@ -82,4 +87,25 @@ test "ClusterHealth JSON output" {
     try std.testing.expect(std.mem.indexOf(u8, json, "UP") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "nodes_active") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "raft_term") != null);
+}
+
+test "ClusterHealth reports the configured node_id" {
+    const allocator = std.testing.allocator;
+
+    var cluster = try ClusterBootstrap.init(allocator, std.testing.io, .{
+        .node_id = "health-node-id",
+        .port = 19006,
+        .raft_cluster_size = 1,
+    });
+    defer cluster.deinit();
+
+    try cluster.start();
+
+    const json = try healthJson(allocator, &cluster);
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("health-node-id", parsed.value.object.get("node_id").?.string);
+    try std.testing.expectEqualStrings(cluster.getConfig().node_id, parsed.value.object.get("node_id").?.string);
 }

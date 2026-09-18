@@ -8,7 +8,6 @@ const std = @import("std");
 const zigmodu = @import("zigmodu");
 const http = zigmodu.http;
 const zent = @import("zent");
-const persist = @import("modules/catalog/persistence.zig");
 
 /// Public-demo middleware: reads scope params from the query string and
 /// normalizes them into context attrs (real deployments source them from JWT

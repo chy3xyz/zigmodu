@@ -6,7 +6,6 @@
 //! only mounts it when `ZENT_DEV_TOKEN=1` is set. Real deployments must not
 //! enable it; issue tokens from a real login flow instead.
 
-const std = @import("std");
 const zigmodu = @import("zigmodu");
 const http = zigmodu.http;
 

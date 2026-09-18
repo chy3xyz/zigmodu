@@ -1,6 +1,5 @@
 // order custom API endpoints — add business routes here.
 // Survives zmodu regeneration.
-const std = @import("std");
 const zigmodu = @import("zigmodu");
 const order_ext = @import("service_ext.zig");
 

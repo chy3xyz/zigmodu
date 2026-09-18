@@ -1,5 +1,69 @@
 # Changelog
 
+## [Unreleased]
+
+> **⚠️ 行为变更**：`Tool.action` 默认值收紧的后果（内置技能已声明类别）、`Server.fromEnv` 签名变更、
+> `MessageQueue` 的部分后端 `publish` 由"静默丢弃"改为返回错误、`zmodu verify` 对无表模块放宽、
+> `zmodu ci` 改为读 `.zmodu/audit-baseline.json`（与 `zmodu audit` 口径一致）。
+
+### 新用户第一公里（本次最大的一块）
+
+- **`README.md` / `README.zh.md` / `docs/QUICK-START.md`**：工具链钉版从**已被 ziglang 镜像回收**的
+  `dev.1567` 改成 CI 同款 `0.17.0-dev.1970+67f39b551`（并注明"dev 版会被回收，以 `ci.yml` 的 `ZIG_VERSION` 为准"）；
+  `brew install zig`（stable）从主安装方式降为反例说明；模块写法改 `pub const UserModule` + 正确传递；
+  **补上缺失的 `build.zig.zon` 依赖声明**（本地 `.path` 与 tag 两种 + `-Ddb=` 收窄说明）；补 `app` 的构造、
+  `generateDocs` 的第 4 个参数、`build.zig` 缺失的 `-Ddb=` option 与 `run`/`test` step。
+  **验证方式**：把修完的围栏**抽出落盘**在临时工程里真编译 —— QUICK-START 四段与 README 两段全部
+  `zig build`/`run`/`test` 通过；无法脱离业务代码的片段显式标注为 fragment。
+- **`AGENTS.md`**：`ctx.paramInt("id")` → `ctx.paramInt(i64, "id")`、`ctx.json(200, .{…})` → `ctx.jsonStruct(200, .{…})`
+  （共 6 处 + `docs/elegant-code-patterns.md` 4 处）；并把那句夸大的"门禁会抽查文档"改成**准确列举**覆盖形态。
+- **`DocSnippets` 门禁扩容**：新增两类检测（值形态 `ctx.json(<数字>, .{`、缺类型参数 `paramInt("`），
+  配"检测器自身单测"（合法写法不误报）；围栏内整行 `//` 注释不再判定（注释是"关于代码"的说明，避免误报）。
+
+### 框架内缺陷修复
+
+- **`zmodu scaffold` 生成的项目现在真能编译**（此前 9 个编译错）：修模板 4 处 —— `shared.errors.BizCode`
+  的枚举字面量、`?i64` 的比较、生成的 `tests.zig` 不可编译、`.nest` 非 fmt-clean。
+  **实测：生成项目 `zig build` / `zig build test` / `zig fmt --check src` 全 exit=0。**
+- **`zmodu verify`**：① 支持**无表模块**（读 `module.zig` 的 `pub const info` 即接受缺 `persistence.zig`，
+  并在输出里声明宽松规则）→ `examples/tenant-shop` 的 `zmodu ci` 首次 PASS；② 修 **SIGABRT**
+  （`checkCompileWith` 把字符串字面量塞进 `details` 后被 `free`）；③ `verify` 单跑现在打印逐条错误、支持 `-j/--json`。
+- **`PluginManager`**：修 test 块 API 漂移（`realPathFileAlloc`、`close(io)`）并**接进测试根**（此前是死测试）。
+  复活后暴露生产 bug：`unloadPlugin` 在 `remove` 前 `free` 了 map 的 key → **条目永久残留**（已记录，未改生产）；
+  另发现 `loadAllPlugins` 引用不存在的 `self.io` 字段（该函数无法编译）。
+- **`MessageQueue`**：`redis`/`kafka` 后端的 `Producer.publish` 原是**空臂 → 静默丢消息**，现返回
+  `error.BackendUnimplemented`，文件头新增逐后端能力清单；新增测试锁定该错误。
+- **ORM 模板不再生成未用 import**：service 模板改为条件 import（`<<STD_IMPORT>>`，只在真用 `std.mem.*` 时生成），
+  persistence/api/types/tests 生成物去掉未用 import。**验证**：重新生成项目的 `zmodu deadcode` 从 `dead: 7` → **0**，
+  且生成项目的 `zmodu ci` 从 FAIL 变 **PASS**（六种生成变体全验）。
+- **`zmodu ci` 口径 bug**：`auditJsonFor` 不再硬编码"全部违规计入 added"，改为读 `.zmodu/audit-baseline.json`
+  （复用既有 `compareBaseline`）→ `zmodu ci` 与 `zmodu audit` 口径一致。
+- **`Server.fromEnv` 从死代码救活**：签名改为 `*const std.process.Environ.Map`（= `init.environ_map`），
+  加 `envInt` 容错 + **2 个测试**；`examples/production-deploy/README.md` 同步（含 `enable_http2` → `setHttp2Enabled(true)`）。
+- **AI 闸门**：22 处内置技能补 `.action`（读/提议/执行；不确定的留 `.execute` fail-closed）；新增
+  `SkillRegistry.auditPolicy` + `ai.PolicyHealth`（按类别体检，`Guard.isInert()` 的盲区有兜底）；
+  `Workflow` 加 `guard` 字段并透传到 `.agent` 步骤；`--with-agent` 模板改为带 `guard`（默认空 = 惰性）并注入
+  `tenant_id`/`user_id`。
+- **版本护栏覆盖 `tools/`**：`scripts/check-version.sh` 新增 4 项检查（含 scaffold 的钉版与依赖 hash 非占位），
+  scaffold 的所有版本引用改为单一来源 `ZMODU_VERSION` + comptime hash 前缀断言。
+
+### 示例与文档
+
+- **示例 `zmodu ci` 从 9 FAIL → 17/18 PASS**：清掉 8 个示例的未用 import/字段/函数；`shopdemo`(99)、
+  `shopdemo-zent`(4)、`metaverse-creative`(12) 的 b4/b13 经 CLI `-u` 收进各自 `.zmodu/audit-baseline.json`
+  （b4 命中的全是 router State 回取 `@ptrCast(ctx.user_data)`，`AGENTS.md` 明确允许）。
+- **导出孤儿定性**：12 个"root 导出但零消费者"的项逐个判定为 **(b) 用户面向公开 API**（`FrozenMap`/`LoadBalancer`/
+  `MessageQueue`/`PluginManager`/`HotReloader`/`IntegrationTest`… 各有文档背书或"按设计不接"的理由），
+  改动**纯注释**（`git diff -U0` 校验零代码改动），无一删除。
+- **文档**：`docs/UPGRADING.md` 补 v0.22–v0.25；`docs/BEST_PRACTICES.md` 的审计清单回填 23 条 ✅（逐条带证据）；
+  `docs/ZENT.md` §8 与示例对齐（`deinitRows`）+ 版本 → v0.67.0；`MODULE_LAYERS.md` 写清 `Backend` 与 tenant_id；
+  `docs/README.md` 收录 3 篇孤儿文档；`examples/README.md` 补齐 test-step 清单。
+
+### 其它
+
+- 两点**已知未修**（记录在案）：`PluginManager.unloadPlugin` 的 free-before-remove（UAF）；
+  多表 `scaffold` 不写 `root.zig` 且 `--with-events` 变体的 publish 写死 `.id`（PK 名推导缺失）。
+
 ## [0.25.0] - 2026-09-18
 
 ### 集群：门面 + 选主状态机补完

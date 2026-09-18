@@ -9,7 +9,6 @@ const zigmodu = @import("zigmodu");
 const http = zigmodu.http;
 
 const Server = http.Server;
-const Route = http.Route;
 const Context = http.Context;
 
 const NUM_CLIENTS: u32 = 32;

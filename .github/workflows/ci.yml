@@ -164,7 +164,7 @@ jobs:
         run: |
           set -euo pipefail
           # Subset by construction: doctor needs a module graph, so only module-layout examples are listed.
-          for app in tenant-mgmt tenant-shop shopdemo zent-modulith alpha-engine; do
+          for app in tenant-mgmt tenant-shop shopdemo shopdemo-zent zent-modulith alpha-engine metaverse-creative; do
             echo "== doctor examples/$app =="
             ./zig-out/bin/zmodu doctor "examples/$app"
           done
@@ -213,7 +213,7 @@ jobs:
         run: |
           set -euo pipefail
           # Subset by construction: only examples that pass the checker cleanly; the legacy one (shopdemo) is exercised through the baseline path below.
-          for ex in tenant-mgmt tenant-shop basic ai-ops zmsaas/backend; do
+          for ex in tenant-mgmt tenant-shop basic ai-ops alpha-engine zmsaas/backend; do
             ./zig-out/bin/zmodu audit "examples/$ex" -j | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['pass'], d"
           done
           # graph renders module nodes + edges
@@ -334,7 +334,7 @@ jobs:
         run: |
           set -euo pipefail
           # Subset by construction: the examples whose build.zig ships a `test` step — examples/README.md marks the same rows.
-          for ex in ai-ops basic llm-policies shopdemo tenant-ai web4; do
+          for ex in ai-ops basic llm-policies shopdemo tenant-mgmt tenant-ai web4; do
             echo "== testing examples/$ex =="
             (cd "examples/$ex" && zig build test)
           done

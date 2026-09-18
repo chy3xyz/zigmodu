@@ -2,8 +2,7 @@
 //!
 //! Service layer for module: <<MODULE_NAME>>
 
-const std = @import("std");
-const zigmodu = @import("zigmodu");
+<<STD_IMPORT>>const zigmodu = @import("zigmodu");
 const data = zigmodu.data;
 const model = @import("model.zig");
 const persistence = @import("persistence.zig");

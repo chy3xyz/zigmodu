@@ -3,6 +3,10 @@
 > 从「AI 驱动业务框架」角度规划的内置 skill 目录。所有 skill 遵守受控执行
 > 姿态：LLM 不写代码、白名单 + 人机门 + 配额 + 审计 + 租户隔离。
 
+> **运行时姿态见 [`AGENT_RUNTIME.md`](AGENT_RUNTIME.md)**：`ai.Guard`（闸门已经接进 `Agent.run`）、
+> `skill.Tool.action`（默认 `.execute`，fail-closed）、`ai.AgentWorker`、`ai.ProposalPipeline`。
+> 本文只列"有什么工具"，那篇写"工具被允许怎么跑"。
+
 ## 设计原则（每个内置 skill 都套这层壳）
 
 | 机制 | 组件 | 默认行为 |
@@ -12,6 +16,26 @@
 | 白名单 | 实体注册表 / allowlist | `entity.*` 只能访问注册实体；管理类 skill 默认不在 allowlist |
 | 所有权 | `ai.freeValue` | 结果 JSON 由 ctx.allocator 持有，调用方可深释放 |
 | 审计/配额 | AgentAuditLog / TokenQuota | 工具调用自动落审计、计配额 |
+
+## 技能类别（`Tool.action`）× 权限闸门（`ai.Guard`）
+
+每个 skill 注册时声明 `action`（`guard.Action`）—— 这是 `ai.Guard` 的**类别轴**：没声明就是
+`execute`（最严），永远拿不到 `allow_execute = false` 的宽策略。
+
+| 声明类别 | 内置 skill | 为什么 |
+|----------|-----------|--------|
+| `read` | `db.query` · `entity.lookup` · `entity.list` · `kpi.query` · `report.generate` · `admin.config.get` · `admin.audit.export` · `list_schedulable_tasks` · `list_jobs` | 只读数据，不改状态 |
+| `propose` | `notification.send` · `approval.submit` · `approval.request` | 产出一件事交出去（通知/审批），由别人或审批链决定 |
+| `execute` | `entity.create` · `entity.update` · `command.execute` · `schedule_job` · `cancel_job` · `admin.cache.invalidate` · `admin.cache.clear` · `admin.config.set` · `admin.user.manage` · `admin.tenant.provision` | 真正改状态：需要 `allow_execute = true` **且**列名 |
+
+所以 `allow = &.{ "db.query", "kpi.query" }` + `allow_execute = false` 的 agent 能查数、什么也改不了
+（读类工具**不会**被那道开关误伤）。后两项管理 skill 是委托给应用回调的，效果未知 —— 按 fail-closed
+留在 `execute`。自定义技能同样要自己声明；忘了就是 `execute`。
+
+`Guard` 只看名字、看不到类别：`allow` 里全是 `execute` 工具时 `isInert()` 仍返回 false，但实际一件
+事也做不了。启动期体检用 `registry.auditPolicy(allocator, guard.permissions)`（或规格侧
+`AgentSpec.auditPolicy`），`class_denied_tools` 会列出被**类别**（而非名字）拒掉的工具 ——
+详见 [`AGENT_RUNTIME.md`](AGENT_RUNTIME.md) §一。
 
 ## P0 · 只读高价值（✅ 已落地）
 

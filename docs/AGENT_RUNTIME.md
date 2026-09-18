@@ -28,6 +28,29 @@
 `execute` 报 `denied_not_listed`，哪怕 `allow_execute` 也关着 —— 打开那个开关不会有任何变化，
 报"执行类被拒"只会把运维指到错的旋钮上。
 
+### 工具必须声明类别：内置技能已声明，体检入口是 `SkillRegistry.auditPolicy`
+
+内置技能（`db.query` / `entity.lookup` / `entity.list` / `report.generate` / `kpi.query` /
+`notification.send` / `approval.submit` / `schedule_job` … 全表见 `docs/AI_SKILLS.md`）注册时
+**各自声明了 `action`**，所以照 §二 的推荐配 `allow = &.{ "db.query", … }`（读类）+ `allow_execute = false`
+不会把它们一起拒掉。自己注册的技能仍需自己声明：忘了写就是默认 `execute`（fail-closed）。
+
+`Guard` 只看名字、看不到类别，所以 `isInert()` 发现不了一类配置错误 —— `allow` 里**全是** `execute`
+工具、`allow_execute = false`：名字列了，实际一件事也做不了，而 `isInert()` 返回 false、启动期不报警。
+体检入口在能看到 registry 的那一层：
+
+```zig
+var health = try registry.auditPolicy(allocator, guard.permissions);
+defer health.deinit(allocator);
+if (health.isInert()) std.log.err("guard grants nothing", .{});
+if (health.hasClassBlindSpot()) {
+    std.log.err("guard lists tools its own class gate refuses: {any}", .{health.class_denied_tools});
+}
+```
+
+`AgentSpec.auditPolicy(allocator)` 是同一件事的规格侧入口（没设 guard 时返回 `null` —— 那是**无界**，
+不是惰性，见 §三）。
+
 ## 二、接进 `Agent.run`（默认路径）
 
 `Agent.guard` 一旦设置，**每次工具调用先过闸门再分派**：

@@ -5,6 +5,8 @@ const Dir = Io.Dir;
 
 pub const VerifyStatus = enum { pass, fail, warn, skip };
 
+/// OWNERSHIP: `details` is always an allocation made with the allocator passed to
+/// `verifyProject` (never a string literal), so callers may free it unconditionally.
 pub const CheckResult = struct {
     name: []const u8,
     status: VerifyStatus,
@@ -12,6 +14,10 @@ pub const CheckResult = struct {
     duration_ms: ?u64 = null,
 };
 
+/// OWNERSHIP: `checks[i].details` is owned; `errors` / `warnings` entries *alias*
+/// the details of the corresponding `.fail` / `.warn` check. Callers therefore free
+/// pass/skip details plus every error/warning entry — and must not free a failing
+/// check's details twice.
 pub const VerifyReport = struct {
     pass: bool,
     checks: []CheckResult,
@@ -19,6 +25,31 @@ pub const VerifyReport = struct {
     warnings: [][]const u8,
     summary: []const u8,
 };
+
+pub const usage =
+    \\Usage: zmodu verify [dir] [--json]
+    \\
+    \\Verify an existing ZigModu project: module layout, import resolution, compile.
+    \\
+    \\Arguments:
+    \\  dir          project root (default: .)
+    \\
+    \\Options:
+    \\  -j, --json   print the summary as JSON only (no per-check detail)
+    \\  -h, --help   show this help
+    \\
+    \\Module layout rule (src/modules/<module>/):
+    \\  Strict: model.zig, persistence.zig, service.zig, api.zig, module.zig, root.zig.
+    \\  Loose rule: a module WITHOUT persistence.zig — the table-less / BFF convention
+    \\  in docs/MODULITH_TENANT_SHOP.md (no persistence, no own tables) — is accepted
+    \\  when its module.zig declares `pub const info`; then only api.zig, module.zig and
+    \\  root.zig are required, and model.zig / service.zig may be omitted. Without
+    \\  `pub const info` the strict list applies and persistence.zig is reported missing.
+    \\  The check output always says when the loose rule was applied, and to which modules.
+    \\
+    \\Exit codes: 0 checks completed (read the summary), 2 invalid arguments
+    \\
+;
 
 /// Run all verification checks against a generated project directory.
 pub fn verifyProject(allocator: std.mem.Allocator, io: Io, project_dir: []const u8) !VerifyReport {
@@ -90,10 +121,23 @@ pub fn verifyProject(allocator: std.mem.Allocator, io: Io, project_dir: []const 
     };
 }
 
-/// Check that every subdirectory in `src/modules/` contains the 6 required files:
-/// model.zig, persistence.zig, service.zig, api.zig, module.zig, root.zig.
+fn moduleDeclaresInfo(allocator: std.mem.Allocator, io: Io, mod_dir: Dir) bool {
+    const src = mod_dir.readFileAlloc(io, "module.zig", allocator, Io.Limit.limited(256 * 1024)) catch return false;
+    defer allocator.free(src);
+    return std.mem.indexOf(u8, src, "pub const info") != null;
+}
+
+/// Check every subdirectory in `src/modules/`:
+///   * strict — the 6 files model.zig, persistence.zig, service.zig, api.zig,
+///     module.zig, root.zig;
+///   * loose rule — a module without `persistence.zig` whose `module.zig` declares
+///     `pub const info` is a table-less module (BFF; docs/MODULITH_TENANT_SHOP.md
+///     §「BFF 约定」), so only api.zig, module.zig and root.zig are required.
+///     Without `pub const info` the strict list applies, so a stray directory still
+///     reports persistence.zig as missing.
 fn checkModuleIntegrity(allocator: std.mem.Allocator, io: Io, project_dir: []const u8) !CheckResult {
     const required_files = [_][]const u8{ "model.zig", "persistence.zig", "service.zig", "api.zig", "module.zig", "root.zig" };
+    const tableless_required_files = [_][]const u8{ "api.zig", "module.zig", "root.zig" };
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const modules_path = std.fmt.bufPrint(&path_buf, "{s}/src/modules", .{project_dir}) catch
@@ -108,6 +152,9 @@ fn checkModuleIntegrity(allocator: std.mem.Allocator, io: Io, project_dir: []con
     defer dir.close(io);
 
     var module_count: usize = 0;
+    var tableless_count: usize = 0;
+    var tableless_names = std.ArrayList(u8).empty;
+    defer tableless_names.deinit(allocator);
     var missing_list = std.ArrayList(u8).empty;
     defer missing_list.deinit(allocator);
 
@@ -119,7 +166,19 @@ fn checkModuleIntegrity(allocator: std.mem.Allocator, io: Io, project_dir: []con
         const mod_dir = dir.openDir(io, entry.name, .{}) catch continue;
         defer mod_dir.close(io);
 
-        for (required_files) |req| {
+        const owns_tables = blk: {
+            mod_dir.access(io, "persistence.zig", .{}) catch break :blk false;
+            break :blk true;
+        };
+        const tableless = !owns_tables and moduleDeclaresInfo(allocator, io, mod_dir);
+        if (tableless) {
+            tableless_count += 1;
+            if (tableless_names.items.len > 0) try tableless_names.appendSlice(allocator, ", ");
+            try tableless_names.appendSlice(allocator, entry.name);
+        }
+
+        const req_files: []const []const u8 = if (tableless) &tableless_required_files else &required_files;
+        for (req_files) |req| {
             mod_dir.access(io, req, .{}) catch {
                 try missing_list.appendSlice(allocator, entry.name);
                 try missing_list.appendSlice(allocator, "/");
@@ -137,7 +196,14 @@ fn checkModuleIntegrity(allocator: std.mem.Allocator, io: Io, project_dir: []con
         };
     }
 
-    const details = try std.fmt.allocPrint(allocator, "{d} modules found, all complete", .{module_count});
+    const details = if (tableless_count == 0)
+        try std.fmt.allocPrint(allocator, "{d} modules found, all complete", .{module_count})
+    else
+        try std.fmt.allocPrint(
+            allocator,
+            "{d} modules found, all complete (loose rule: {d} table-less module(s) accepted without persistence.zig: {s})",
+            .{ module_count, tableless_count, tableless_names.items },
+        );
     return CheckResult{
         .name = "module_integrity",
         .status = .pass,
@@ -261,14 +327,26 @@ fn checkFileImports(
 
 /// Spawn `zig build` in the project directory and check if it succeeds.
 fn checkCompile(allocator: std.mem.Allocator, io: Io, project_dir: []const u8) !CheckResult {
+    return checkCompileWith(allocator, io, project_dir, "zig");
+}
+
+/// `zig_exe` is a parameter so tests can exercise the "binary not found" path
+/// without mutating PATH. Every `details` string returned here is an allocation
+/// (never a literal) — callers free it.
+fn checkCompileWith(
+    allocator: std.mem.Allocator,
+    io: Io,
+    project_dir: []const u8,
+    zig_exe: []const u8,
+) !CheckResult {
     const result = std.process.run(allocator, io, .{
-        .argv = &.{ "zig", "build" },
+        .argv = &.{ zig_exe, "build" },
         .cwd = .{ .path = project_dir },
     }) catch |err| {
         const msg = if (err == error.FileNotFound)
-            "zig compiler not found in PATH"
+            try std.fmt.allocPrint(allocator, "zig compiler not found in PATH (or project dir {s} missing): {s}", .{ project_dir, @errorName(err) })
         else
-            try std.fmt.allocPrint(allocator, "failed to run zig build: {}", .{err});
+            try std.fmt.allocPrint(allocator, "failed to run zig build in {s}: {}", .{ project_dir, err });
         return CheckResult{
             .name = "compile",
             .status = .fail,
@@ -382,4 +460,105 @@ test "checkImportConsistency finds missing import" {
     try std.testing.expect(result.status == .warn);
     try std.testing.expect(result.details != null);
     try std.testing.expect(std.mem.indexOf(u8, result.details.?, "nonexistent.zig") != null);
+}
+
+fn writeModuleFile(tmp: anytype, sub_path: []const u8, data: []const u8) !void {
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = sub_path, .data = data });
+}
+
+test "checkModuleIntegrity accepts table-less (BFF) module without persistence.zig" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "src/modules/shop_bff");
+    try writeModuleFile(&tmp, "src/modules/shop_bff/module.zig", "pub const info = zigmodu.api.Module{ .name = \"shop_bff\" };\n");
+    try writeModuleFile(&tmp, "src/modules/shop_bff/api.zig", "// placeholder");
+    try writeModuleFile(&tmp, "src/modules/shop_bff/root.zig", "// placeholder");
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+
+    const result = try checkModuleIntegrity(allocator, io, path_buf[0..path_len]);
+    defer if (result.details) |d| allocator.free(d);
+    try std.testing.expect(result.status == .pass);
+    try std.testing.expect(std.mem.indexOf(u8, result.details.?, "loose rule") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.details.?, "shop_bff") != null);
+}
+
+test "checkModuleIntegrity rejects table-less-looking dir without pub const info" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "src/modules/orphan");
+    try writeModuleFile(&tmp, "src/modules/orphan/module.zig", "// no info here");
+    try writeModuleFile(&tmp, "src/modules/orphan/api.zig", "// placeholder");
+    try writeModuleFile(&tmp, "src/modules/orphan/root.zig", "// placeholder");
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+
+    const result = try checkModuleIntegrity(allocator, io, path_buf[0..path_len]);
+    defer if (result.details) |d| allocator.free(d);
+    try std.testing.expect(result.status == .fail);
+    try std.testing.expect(std.mem.indexOf(u8, result.details.?, "orphan/persistence.zig") != null);
+}
+
+/// Mirrors the free sequence used by `main.zig cmdVerify` / `ci.zig` so the
+/// ownership contract of VerifyReport is exercised, not just assumed.
+fn freeReportForTest(allocator: std.mem.Allocator, report: VerifyReport) void {
+    for (report.checks) |c| {
+        if (c.status == .pass or c.status == .skip) {
+            if (c.details) |d| allocator.free(d);
+        }
+    }
+    allocator.free(report.checks);
+    for (report.errors) |e| allocator.free(e);
+    allocator.free(report.errors);
+    for (report.warnings) |w| allocator.free(w);
+    allocator.free(report.warnings);
+    allocator.free(report.summary);
+}
+
+test "verifyProject on a missing directory returns an owned report (no literal details)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const missing_dir = "/nonexistent-zmodu-verify-test";
+    const report = try verifyProject(allocator, io, missing_dir);
+    defer freeReportForTest(allocator, report);
+
+    try std.testing.expect(!report.pass);
+    try std.testing.expect(report.errors.len > 0);
+    // Freeing above only stays honest if the compile failure is an allocation:
+    // it used to be the literal "zig compiler not found in PATH", which aborted
+    // the CLI at exit-134. The message must carry the directory, which a literal
+    // cannot.
+    try std.testing.expect(std.mem.indexOf(u8, report.errors[0], missing_dir) != null);
+}
+
+test "checkCompile reports a missing zig binary as an owned string" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "proj");
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    const project_dir = path_buf[0..path_len];
+
+    const result = try checkCompileWith(allocator, io, project_dir, "zmodu-no-such-zig-binary");
+    // Freeing proves the allocation is owned; the interpolated path proves the
+    // failure is not a bare string literal.
+    defer if (result.details) |d| allocator.free(d);
+    try std.testing.expect(result.status == .fail);
+    const details = result.details.?;
+    try std.testing.expect(std.mem.indexOf(u8, details, "not found in PATH") != null);
+    try std.testing.expect(std.mem.indexOf(u8, details, project_dir) != null);
 }

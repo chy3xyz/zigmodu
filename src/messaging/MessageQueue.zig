@@ -1,3 +1,20 @@
+//! Message queue abstraction over pluggable backends.
+//!
+//! Positioning: user-facing primitive; no in-tree consumer. The framework's own
+//! messaging paths are the transactional `outbox` and the typed event buses, so
+//! nothing under `src/` constructs a `MessageQueue`.
+//!
+//! Backend status:
+//! - `in_memory` — publish and consume implemented (per-topic FIFO in process).
+//! - `nats` — publish implemented; requires a live NATS server.
+//! - `redis` — **publish not implemented**: `Producer.publish` returns
+//!   `error.BackendUnimplemented` (the backend carries no client). Nothing is
+//!   sent, and the failure is explicit rather than a silently dropped message.
+//! - `kafka` — **publish not implemented**, same contract as `redis`.
+//!
+//! `Consumer.subscribe` only records topic names on every backend; there is no
+//! delivery loop here.
+
 const std = @import("std");
 const Nats = @import("Nats.zig");
 
@@ -29,12 +46,18 @@ pub const MessageQueue = struct {
     pub const Producer = struct {
         backend: *QueueBackend,
 
+        /// Publishes `msg` through the configured backend.
+        ///
+        /// The `redis` and `kafka` backends are not implemented: they return
+        /// `error.BackendUnimplemented` and the message is *not* delivered. The
+        /// error is propagated, never swallowed, so a caller cannot mistake a
+        /// dropped message for a delivered one.
         pub fn publish(self: *Producer, msg: Message) !void {
             switch (self.backend.*) {
                 .in_memory => |backend| try backend.publish(msg),
                 .nats => |backend| try backend.publish(msg),
-                .redis => {},
-                .kafka => {},
+                .redis => |*backend| try backend.publish(msg),
+                .kafka => |*backend| try backend.publish(msg),
             }
         }
     };
@@ -104,13 +127,33 @@ pub const MessageQueue = struct {
         }
     };
 
+    /// Redis queue backend — declared but has no client.
+    ///
+    /// `publish` always fails with `error.BackendUnimplemented`; sending is not
+    /// supported yet, and this backend never silently drops a message.
     pub const RedisBackend = struct {
         host: []const u8,
         port: u16,
+
+        pub fn publish(self: *RedisBackend, msg: Message) !void {
+            _ = self;
+            _ = msg;
+            return error.BackendUnimplemented;
+        }
     };
 
+    /// Kafka queue backend — declared but has no client.
+    ///
+    /// `publish` always fails with `error.BackendUnimplemented`; sending is not
+    /// supported yet, and this backend never silently drops a message.
     pub const KafkaBackend = struct {
         brokers: []const []const u8,
+
+        pub fn publish(self: *KafkaBackend, msg: Message) !void {
+            _ = self;
+            _ = msg;
+            return error.BackendUnimplemented;
+        }
     };
 
     /// NATS message queue backend (default: localhost:4222).
@@ -200,4 +243,30 @@ test "MessageQueue Producer and Consumer" {
     const consumed = try backend.consume("events");
     try std.testing.expect(consumed != null);
     try std.testing.expectEqualStrings("hello", consumed.?.payload);
+}
+
+test "MessageQueue unimplemented backends fail publish explicitly" {
+    const allocator = std.testing.allocator;
+
+    const msg = MessageQueue.Message{
+        .id = "msg-unimpl",
+        .topic = "events",
+        .payload = "must-not-be-dropped-silently",
+        .headers = std.StringHashMap([]const u8).init(allocator),
+        .timestamp = 0,
+    };
+
+    var redis_backend = MessageQueue.RedisBackend{ .host = "127.0.0.1", .port = 6379 };
+    try std.testing.expectError(error.BackendUnimplemented, redis_backend.publish(msg));
+
+    var redis_mq = MessageQueue.init(allocator, .{ .redis = redis_backend });
+    var redis_producer = redis_mq.createProducer();
+    try std.testing.expectError(error.BackendUnimplemented, redis_producer.publish(msg));
+
+    var kafka_backend = MessageQueue.KafkaBackend{ .brokers = &.{"127.0.0.1:9092"} };
+    try std.testing.expectError(error.BackendUnimplemented, kafka_backend.publish(msg));
+
+    var kafka_mq = MessageQueue.init(allocator, .{ .kafka = kafka_backend });
+    var kafka_producer = kafka_mq.createProducer();
+    try std.testing.expectError(error.BackendUnimplemented, kafka_producer.publish(msg));
 }

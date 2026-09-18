@@ -554,7 +554,9 @@ test "handleMessage dispatches tools/call for version" {
     const allocator = std.testing.allocator;
     const resp = try handleMessage(std.testing.io, allocator, "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"zmodu_version\",\"arguments\":{}}}");
     defer allocator.free(resp);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "0.14.9") != null);
+    // Assert against the single source of truth (build.zig.zon via build_options)
+    // rather than a literal that drifts on every release.
+    try std.testing.expect(std.mem.indexOf(u8, resp, main_mod.ZMODU_VERSION) != null);
 }
 
 test "handleMessage handles notification (no id)" {

@@ -233,22 +233,22 @@ Every API response must use the `{code, msg, data}` envelope:
 ```zig
 /// Success with data
 fn wrapOk(ctx: *Context, data: anytype) !void {
-    try ctx.json(200, .{ .code = 0, .msg = "", .data = data });
+    try ctx.jsonStruct(200, .{ .code = 0, .msg = "", .data = data });
 }
 
 /// Success, no data
 fn wrapSuccess(ctx: *Context) !void {
-    try ctx.json(200, .{ .code = 0, .msg = "", .data = null });
+    try ctx.jsonStruct(200, .{ .code = 0, .msg = "", .data = null });
 }
 
 /// Error
 fn wrapErr(ctx: *Context, code: i32, msg: []const u8) !void {
-    try ctx.json(200, .{ .code = code, .msg = msg, .data = null });
+    try ctx.jsonStruct(200, .{ .code = code, .msg = msg, .data = null });
 }
 
 /// Paginated list — always returns {list, total}
 fn wrapList(ctx: *Context, result: anytype) !void {
-    try ctx.json(200, .{ .code = 0, .msg = "", .data = .{ .list = result.items, .total = result.total } });
+    try ctx.jsonStruct(200, .{ .code = 0, .msg = "", .data = .{ .list = result.items, .total = result.total } });
 }
 ```
 

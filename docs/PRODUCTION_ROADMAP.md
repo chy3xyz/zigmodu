@@ -240,15 +240,17 @@ worker（在途连接断开并重试），其余 worker 继续服务，panic 钩
 （Postgres/Redis）+ 跨域副作用走 Outbox；把 prefork 当作"单机密度与故障
 隔离"的增强项，而非可用性的必要前提。
 
-### `src/ai` 边界：11% 行数的可剔离域
+### `src/ai` 边界：约 14% 行数的可剔离域
 
-**事实（2026-09）**：`src/ai/` = 42 个文件 / 12,216 行（约占框架 11%），提供
+**事实（2026-09-18 快照）**：`src/ai/` = 45 个文件 / 13,919 行（约占框架 14.0% = 13,919 / 99,287 行），提供
 Agent / Workflow / Skill / MCP / LLM 策略等**业务产品能力**，不是后端框架内核。
+（复算：`find src/ai -name '*.zig' | wc -l`、`find src/ai -name '*.zig' -exec cat {} + | wc -l`、
+`find src -name '*.zig' -exec cat {} + | wc -l`。）
 
 **当前边界状态（已核实并由测试守护）**：
 - 四个规范域文件（`http.zig` / `data.zig` / `security.zig` / `observability.zig`）
   **零** `ai/` 引用；只有 `root.zig` 有一个惰性 `pub const ai = @import("ai/ai.zig")`。
-- 由于 Zig 惰性分析，**不 import `zmodu.ai` 的消费者不会编译这 12k 行**——
+- 由于 Zig 惰性分析，**不 import `zmodu.ai` 的消费者不会编译这 13k 行**——
   边界是结构性的，不靠纪律。回归守卫见 `src/tests.zig`
   「domain modules stay independent of the optional src/ai domain」。
 - 使用者：`examples/ai-ops`、`llm-policies`、`mcp-server`、`tenant-ai` 四个示例。

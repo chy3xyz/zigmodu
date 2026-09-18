@@ -3,7 +3,6 @@
 //! HTTP API for module: <<MODULE_NAME>>
 //! ComptimeRouter: `pub const routes` + `http.Router.scope(...).mount` (docs/ROUTE_TABLE.md)
 
-const std = @import("std");
 const http = @import("zigmodu").http;
 const service = @import("service.zig");
 const model = @import("model.zig");

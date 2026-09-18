@@ -4,15 +4,25 @@ Get up and running with ZigModu in 5 minutes.
 
 ## Prerequisites
 
+ZigModu tracks Zig's **development** API (`std.process.Init`, `std.Io.Mutex`,
+…), so a stable Zig release will not compile it. Install the exact dev build
+CI pins:
+
 ```bash
-# Install Zig 0.17.0
-# https://ziglang.org/download/
+# https://ziglang.org/download/ · zigup: https://github.com/marler8997/zigup
+zigup 0.17.0-dev.1970+67f39b551
+
+# ziglang's mirrors garbage-collect old dev builds (they start returning 404),
+# so the version above goes stale by design: `.github/workflows/ci.yml` →
+# `ZIG_VERSION` is the source of truth.
+# `brew install zig` installs a *stable* Zig → not usable for this repo.
 ```
 
 Verify installation:
 ```bash
 zig version
-# Should show: 0.17.0
+# Should show the value pinned in .github/workflows/ci.yml → ZIG_VERSION,
+# e.g. 0.17.0-dev.1970+67f39b551
 ```
 
 ## Step 1: Create a Module
@@ -23,7 +33,8 @@ Create a new file `src/modules/user.zig`:
 const std = @import("std");
 const zigmodu = @import("zigmodu");
 
-const UserModule = struct {
+// `pub` matters: `main.zig` refers to it as `user.UserModule`.
+pub const UserModule = struct {
     pub const info = zigmodu.api.Module{
         .name = "user",
         .description = "User management module",
@@ -53,6 +64,7 @@ const user = @import("modules/user.zig");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
+    const io = init.io;
 
     // Scan and register modules
     var modules = try zigmodu.scanModules(allocator, .{user.UserModule});
@@ -62,9 +74,17 @@ pub fn main(init: std.process.Init) !void {
     try zigmodu.validateModules(&modules);
 
     // Generate documentation (optional)
-    try zigmodu.generateDocs(&modules, "modules.puml", allocator);
+    try zigmodu.generateDocs(&modules, "modules.puml", allocator, io);
 
-    // Start the application (wraps Lifecycle.startAll in dependency order)
+    // Build the application. Bind the builder first: its methods take `*Self`,
+    // and a function-call temporary materialises as `*const` — so the chained
+    // one-liner `zigmodu.builder(…).build(…)` does not compile.
+    var b = zigmodu.builder(allocator, io);
+    defer b.deinit();
+    var app = try b.build(.{user.UserModule});
+    defer app.deinit();
+
+    // start() runs each module's init() in dependency order; stop() reverses it.
     try app.start();
     defer app.stop();
 
@@ -72,9 +92,33 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-## Step 3: Configure Build
+## Step 3: Configure the Build
 
-Edit `build.zig`:
+`build.zig.zon` — declare the dependency. The very first `zig build` rejects the
+placeholder `.fingerprint` and prints the exact value to paste in:
+
+```zig
+.{
+    .name = .myapp,                 // must be a valid Zig identifier
+    .version = "0.1.0",
+    .fingerprint = 0x0,             // ← paste the value `zig build` suggests
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        // Local checkout (what examples/basic uses — no `.hash` needed):
+        .zigmodu = .{ .path = "../zigmodu" },
+        // …or a tagged release; `zig fetch --save <url>` fills in `.hash`:
+        // .zigmodu = .{ .url = "git+https://github.com/chy3xyz/zigmodu?ref=v0.25.0" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
+```
+
+`build.zig` — the `.db` argument selects which SQL drivers get linked (the
+default `all` links all three; full contract: `docs/SQLX_DRIVERS.md`):
 
 ```zig
 const std = @import("std");
@@ -83,11 +127,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Which SQL drivers to link (default: sqlite only). `-Ddb=` overrides.
+    const db_opt = b.option([]const u8, "db", "SQL drivers to link: all|sqlite|postgres|mysql (comma-list)") orelse "sqlite";
+
     const zigmodu_dep = b.dependency("zigmodu", .{
         .target = target,
         .optimize = optimize,
-        .db = "sqlite", // link only what you need: sqlite|postgres|mysql|all
-        // 完整约定 → docs/SQLX_DRIVERS.md
+        .db = db_opt,
     });
 
     const exe_mod = b.createModule(.{
@@ -101,8 +147,17 @@ pub fn build(b: *std.Build) void {
         .name = "myapp",
         .root_module = exe_mod,
     });
-
     b.installArtifact(exe);
+
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    const run_step = b.step("run", "Build and run the app");
+    run_step.dependOn(&run_cmd.step);
+
+    const tests = b.addTest(.{ .root_module = exe_mod });
+    const run_tests = b.addRunArtifact(tests);
+    const test_step = b.step("test", "Run the app's tests");
+    test_step.dependOn(&run_tests.step);
 }
 ```
 
@@ -119,14 +174,20 @@ zig build
 zig build test
 ```
 
-Expected output:
+Expected output (trimmed):
 ```
+info: All module dependencies validated successfully (1 modules)
+info: User module initialized
+info: Application 'app' started successfully
 info: Application started successfully!
 ```
 
 ## Going to production
 
 Before the first deploy, do these four things:
+
+Fragment — `server` / `allocator` come from your own `main` (runnable wiring:
+[`examples/tenant-mgmt`](../examples/tenant-mgmt/)):
 
 ```zig
 // 1) one call: backpressure + security middleware + /metrics + /health/*

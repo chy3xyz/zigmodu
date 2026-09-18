@@ -245,10 +245,11 @@ pub const ApprovalCtx = struct {
 pub fn registerApprovalSkills(registry: *SkillRegistry) !void {
     try registry.register(.{
         .name = "approval.submit",
+        .action = .propose,
         .description = "Submit a business request through the configured multi-level approval chain; returns the approval run id and status (approved / pending_human / rejected)",
         .parameters = &.{
             .{ .name = "subject", .type = .string, .description = "What is being approved, e.g. order number or refund id", .required = true },
-            .{ .name = "amount", .type = .integer, .description = "Monetary amount involved (cents or minor units)", .required = true },
+            .{ .name = "amount", .type = .number, .description = "Monetary amount involved (cents or minor units)", .required = true },
             .{ .name = "request", .type = .string, .description = "Human-readable request description", .required = true },
         },
         .handler = struct {
@@ -261,7 +262,7 @@ pub fn registerApprovalSkills(registry: *SkillRegistry) !void {
                 _ = obj.get("request") orelse return error.InvalidArguments;
                 if (subj_v != .string or amt_v != .integer) return error.InvalidArguments;
 
-                const result = try ac.flow.submit(sctx.allocator, sctx, subj_v.string, amt_v.integer, ac.steps);
+                var result = try ac.flow.submit(sctx.allocator, sctx, subj_v.string, amt_v.integer, ac.steps);
                 defer result.deinit(sctx.allocator);
                 var out = std.json.ObjectMap{};
                 try putOwned(&out, sctx.allocator, "run_id", .{ .string = try sctx.allocator.dupe(u8, result.run_id) });

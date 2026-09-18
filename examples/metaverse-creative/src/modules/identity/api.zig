@@ -1,7 +1,6 @@
 const std = @import("std");
 const zigmodu = @import("zigmodu");
 const http = zigmodu.http;
-const service = @import("service.zig");
 
 pub fn IdentityApi(comptime Service: type) type {
     return struct {

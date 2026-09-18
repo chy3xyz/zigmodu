@@ -6,6 +6,8 @@ pub const Param = @import("skill.zig").Param;
 pub const SkillContext = @import("skill.zig").SkillContext;
 /// Registry of skills an agent may call — dispatch by name, list as tools.
 pub const SkillRegistry = @import("skill.zig").SkillRegistry;
+/// Registry-side policy audit: what a policy does to the tools' declared classes.
+pub const PolicyHealth = @import("skill.zig").PolicyHealth;
 /// Per-dispatch options: timeout, tenant/actor scope, approval hook.
 pub const DispatchOpts = @import("skill.zig").DispatchOpts;
 /// Frees a `Value` returned by a skill dispatch.

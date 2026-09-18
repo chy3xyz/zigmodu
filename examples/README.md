@@ -162,7 +162,7 @@ step is stated per row — that is the command CI runs for it.
 | [`shopdemo`](shopdemo/) | Generated `order` module + full 152-table e-commerce schema on sqlx | `zig build run` · `zig build test` |
 | [`shopdemo-zent`](shopdemo-zent/) | Same domain persisted through zent | `zig build run` |
 | [`tenant-ai`](tenant-ai/) | Tenant-isolated AI skills, reports and approval queue | `zig build run` · `zig build test` |
-| [`tenant-mgmt`](tenant-mgmt/) | Flagship: multi-tenant SaaS on `http.productionProfile` (CI integration demo) | `zig build run` |
+| [`tenant-mgmt`](tenant-mgmt/) | Flagship: multi-tenant SaaS on `http.productionProfile` (CI integration demo) | `zig build run` · `zig build test` |
 | [`tenant-shop`](tenant-shop/) | Modulith blueprint: tenant/user/product/inventory + `shop_bff` / `admin_bff` | `zig build run` |
 | [`web4`](web4/) | did:key identity + x402 payment gating | `zig build run` · `zig build test` |
 | [`zent-modulith`](zent-modulith/) | ZigModu HTTP + zent schema-as-code ORM (zent pinned by git tag) | `zig build run` |
@@ -285,8 +285,8 @@ cd ../..
 zig build test
 
 # Run one example's tests — the examples with a `test` step are
-# ai-ops, basic, llm-policies, shopdemo, tenant-ai, web4 and zmsaas/backend
-# (the same list CI runs in `Run the example test steps`)
+# ai-ops, basic, llm-policies, shopdemo, tenant-mgmt, tenant-ai, web4 and
+# zmsaas/backend (the same list CI runs in `Run the example test steps`)
 cd examples/basic
 zig build test
 ```
@@ -401,7 +401,7 @@ pub fn build(b: *std.Build) void {
 
 When updating ZigModu API:
 1. Update all examples
-2. Run each example the way it ships: `zig build test` for the ones with a `test` step (`ai-ops`, `basic`, `llm-policies`, `shopdemo`, `tenant-ai`, `web4`, `zmsaas/backend` — the list `ci.yml`'s `Run the example test steps` loops over); the rest are `zig build` / `zig build run`
+2. Run each example the way it ships: `zig build test` for the ones with a `test` step (`ai-ops`, `basic`, `llm-policies`, `shopdemo`, `tenant-mgmt`, `tenant-ai`, `web4`, `zmsaas/backend` — the list `ci.yml`'s `Run the example test steps` loops over); the rest are `zig build` / `zig build run`
 3. Update documentation
 4. Test manually
 

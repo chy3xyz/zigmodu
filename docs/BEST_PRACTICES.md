@@ -45,7 +45,7 @@ SkillRegistry / Workflow / 审批流），也**没有任何**示例接集群栈�
 11. **门禁**：应用侧 `zmodu ci`（compile → fmt → verify → audit → deadcode → **doctor**，6 步）；
     文档里的 Zig 片段会被 `src/test/DocSnippets.zig` 抽查（只扫围栏代码块）——写 `builder` 片段时照第 1 条的形态写。
 
-### ⚠️ 待修清单（审计产出，按严重度；✅ 命中的条目是 2026-09-17 复核后**已修**的，其余仍未修）
+### ⚠️ 待修清单（审计产出，按严重度；✅ 命中的条目是 **2026-09-17 / 2026-09-18 两批复核后已修**的，其余仍未修）
 
 **A. 会编译 / 启动失败**
 - ✅ `examples/README.md`：`Application.init(allocator,"app",.{M},.{})` 的缺 `io` 片段已删
@@ -54,24 +54,41 @@ SkillRegistry / Workflow / 审批流），也**没有任何**示例接集群栈�
   与后文不再自相矛盾
 - ✅ `docs/CLUSTER-QUICKSTART.md`：整篇重写 —— 开头就是 fail-closed 声明、`raft_cluster_size = 1`、
   无 `std.Thread.sleep`；`/cluster/health` 明确写成"由你的 handler 挂载"，并**如实列出** `node_id`
-  仍是固定串 `"node-id"`（见下方 ClusterHealth 一条，仍未修）
+  仍是固定串 `"node-id"`（见下方 ClusterHealth 一条 —— 2026-09-18 已修）
 - ✅ 本文件「集群」段（现 :376-377）：已写 `ClusterMembership.init(allocator, io, …)`，并注明
   "`start` 的 Config 只有三项（没有 `seed_nodes`，seed 节点走 `connectToSeed`）"；
   `zigmodu.core.*` / "实现 PasRaft 共识" 的说法已删
-- `tools/zmodu/src/main.zig:6011`（`--with-agent` 模板）：生成**无 guard 的裸 `Agent{}`**；`:6082-6086`
+- ✅ `tools/zmodu/src/main.zig:6011`（`--with-agent` 模板）：生成**无 guard 的裸 `Agent{}`**；`:6082-6086`
   的 handler 同步跑 agent 且不设 tenant/user
-- `src/ai/workflow.zig:590`：`.agent` 步骤内部现搓裸 `Agent{}`，Workflow 无处传 guard ⇒ 文档推荐的
+  （2026-09-18 修：模板现生成 `guard: zigmodu.ai.Guard = …`（`tools/zmodu/src/main.zig:6127`）并交给
+  `Agent{ .guard = &self.guard }`（`:6150`），handler 用 `tenantId(ctx)` / `ctx.userIdInt(i64)` 填
+  `SkillContext{ .tenant_id = …, .user_id = … }`（`:6214` / `:6232-6233`））
+- ✅ `src/ai/workflow.zig:590`：`.agent` 步骤内部现搓裸 `Agent{}`，Workflow 无处传 guard ⇒ 文档推荐的
   `.agent` 步骤就是**无界 agent**
-- `src/core/cluster/ClusterHealth.zig:20,37`：丢掉真实 `node_id`，输出固定串 `"node-id"`（多节点无法区分）
+  （2026-09-18 修：`Workflow` 增 `guard` 字段（`src/ai/workflow.zig:153`），`agentForStep()` 透传
+  `.guard = self.guard`（`:606`）；测试 `workflow .agent steps inherit the workflow guard`（`:1297`））
+- ✅ `src/core/cluster/ClusterHealth.zig:20,37`：丢掉真实 `node_id`，输出固定串 `"node-id"`（多节点无法区分）
+  （2026-09-18 修：`healthJson` 改读 `cluster.getConfig().node_id`（`src/core/cluster/ClusterHealth.zig:37`，
+  `getConfig` 见 `src/core/cluster/ClusterBootstrap.zig:300`）；测试断言 health JSON 的 `node_id` == 配置值（`:87`））
 
 **B. 会误导（口径与实现不符）**
-- AI 文档四件套（`AI_DEV_GUIDE.md` / `AI.md` / `AI_SKILLS.md` / `AI_ORCHESTRATION.md`）停在 2026-08：
-  裸 `Agent{}`、不提 `Tool.action` / `guard` / `AgentSpec` / `AgentWorker` —— **仍未修**：`AI_SKILLS.md` /
-  `AI_ORCHESTRATION.md` 至今 0 处提及 `guard` / `AgentSpec`（`AI_DEV_GUIDE.md` / `AI.md` 已开始提到）
+- ✅ AI 文档四件套（`AI_DEV_GUIDE.md` / `AI.md` / `AI_SKILLS.md` / `AI_ORCHESTRATION.md`）停在 2026-08：
+  裸 `Agent{}`、不提 `Tool.action` / `guard` / `AgentSpec` / `AgentWorker`（`AI_DEV_GUIDE.md` / `AI.md` 先开始提到）
+  （2026-09-18 修：`AI_SKILLS.md:6-7` / `AI_ORCHESTRATION.md:8-9` 补了指向 `AGENT_RUNTIME.md` 的
+  「运行时姿态」指针并点名 `ai.Guard` / `ai.AgentSpec` / `Tool.action` / `ai.AgentWorker`；四件套现均提及
+  `guard`/`AgentSpec`（`rg -c 'guard|AgentSpec' docs/AI_*.md` → `AI_SKILLS.md:3`、`AI_ORCHESTRATION.md:2`、
+  `AI_DEV_GUIDE.md:7`、`AI.md:8`）；`AI_DEV_GUIDE.md:97` / `AI.md:32` 明写"不要手搓裸 `Agent{}`"）
 - ✅ `MCP.md:53` 的"需显式加入 allowlist"已改成事实：「**`tools/list` 不过滤**…按 allowlist / 权限裁剪
   `tools/list` 目前**是缺口，不是既有能力**」
-- **最容易踩的一条**：内置技能全部落在 `.action` 默认值 `.execute` 上（全 `src/` 只有 1 处显式
+- ✅ **最容易踩的一条**：内置技能全部落在 `.action` 默认值 `.execute` 上（全 `src/` 只有 1 处显式
   `.action =`，还是测试）—— 按 `AGENT_RUNTIME.md` 的推荐配法会拒掉所有内置技能，且启动期不报警
+  （2026-09-18 修：内置技能逐个显式声明类别（`src/ai/business.zig:106/154/202`、`src/ai/kpi.zig:61`、
+  `src/ai/notify.zig:126`、`src/ai/schedule.zig:47/71/109/130`、`src/ai/admin.zig:107/134/160/184/209/253/274`、
+  `src/ai/actions.zig:66/83/221/304`、`src/ai/approval_api.zig:133`、`src/ai/approval.zig:248`），
+  并有测试 `builtin skills declare their action class`（`src/ai/skill.zig:545`）；盲区本身由
+  `SkillRegistry.auditPolicy` + `PolicyHealth.isInert()/hasClassBlindSpot()` 补齐（`src/ai/skill.zig:99,242`，
+  测试 `:567/:608`）——`Guard.isInert()` 仍只看 `allow.len`（`src/ai/guard.zig:87`），但注册表侧现在能报出
+  "列了名单却被类别闸门全拒"）
 - ✅ `docs/RUNTIME.md`：`"Worker 接线未做"` 已删（路线图 v0.21 行改为 ✅ `ai.AgentSpec` + `ai.Guard`）；
   `:144-145` 的历史实测数字已换成"具体条数随示例版本变化…别照抄历史数字"
 - ✅ `examples/distributed/README.md`：已改成事实 —— 选主 "Not used — `RaftElection` is a framework module,
@@ -80,7 +97,9 @@ SkillRegistry / Workflow / 审批流），也**没有任何**示例接集群栈�
 - ~~`examples/cluster-demo/`~~（**已删除**，2026-09-17）：compose 构建的是**仓根 Dockerfile**（跑 basic 示例，
   无 cluster 二进制）；README 教人 `curl :8081/cluster/health` 而该路由从未挂载。拓扑与 fail-closed
   说明现并入 `examples/distributed/README.md`（docker 拓扑参考见 `examples/production-deploy/`）
-- `docs/UPGRADING.md` 止于 v0.15.46 —— v0.22 / v0.23 的集群破坏性变更（fail-closed + `.transport`）没有条目
+- ✅ `docs/UPGRADING.md` 止于 v0.15.46 —— v0.22 / v0.23 的集群破坏性变更（fail-closed + `.transport`）没有条目
+  （2026-09-18 修：补上 v0.22.0（`docs/UPGRADING.md:132`）/ v0.23.0（`:100`）/ v0.24.0（`:70`）/
+  v0.25.0（`:18`）四节，含 `ClusterBootstrap` 多节点 fail-closed 与 `.transport` 那条）
 
 **C. 只是过时数字 / 措辞** —— ✅ **已全部收敛（2026-09-17 复核）**
 - ✅ `examples/README.md`：行数表已删（末尾「Example Statistics」写明索引表才是唯一权威）；
@@ -105,7 +124,7 @@ SkillRegistry / Workflow / 审批流），也**没有任何**示例接集群栈�
 未兑现的注释（`Server.zig:2257` 的 keepalive 只设了 `SO_KEEPALIVE`）。**以上 5 条已在 v0.24.0 全部完成**，逐条现状：
 
 1. **守住导出面** —— ✅ **已完成（v0.24.0）**：`root.zig` 与六个 barrel（http / data / security / ai / observability / runtime）
-   新增 **463 行 `///`**，导出面覆盖 **100%**（`root.zig` 157 pub / 163 doc；http 176/178、data 24/24、security 21/21、
+   新增 **463 行 `///`**，导出面覆盖 **100%**（`root.zig` 158 pub / 164 doc〔2026-09-18 实测〕；http 176/178、data 24/24、security 21/21、
    observability 13/13、runtime 22/22），每条一句话写"是什么 + 什么时候用"。
 2. **死旋钮：接线或删除** —— ✅ **已完成（v0.24.0）**：两个字段都真接线了 —— `Application.Config.max_dependencies`
    在启动期做超限告警（`src/Application.zig:161-162` 调 `warnOverDependencyLimit`），`Server.Config.connection_stack_size`
@@ -158,6 +177,147 @@ shopdemo↔shopdemo-zent、basic↔testing、distributed↔cluster-demo、`depre
    （`grep -rn '"0.16.0"' examples/ --include='*.zon'` 为空）；`metaverse-creative` 两处 → ZigModu **v0.24.0**
    （`DEMO_SUMMARY.md:202` 原 v0.23.0、`ARCHITECTURE_DIAGRAM.txt:153` 原 **v0.4.0** —— 上一版把 v0.4.0 记到了
    `DEMO_SUMMARY.md`，实际在 `ARCHITECTURE_DIAGRAM.txt`，两处都已改）。
+
+### 仍待完善（2026-09-18 复核，v0.25.0）
+
+**按 ROI 排序（每条都带证据；前三条是"功能级"而非文案级）**
+
+1. ✅ **`zmodu scaffold` 生成的项目拉不到框架**：`tools/zmodu/src/main.zig:219-220` 仍钉 `v0.13.9` 且 hash 是占位符
+   `0.13.7-AAAA…A`；生成文本 `:1095/:1416/:5417/:7421` 停在 v0.13.9/v0.14.4，`saveManifest`(`:5512`) 写 `0.14.9`。
+   `scripts/check-version.sh` 只校验 5 个顶层文档，**`tools/` 不在护栏内** —— 这是版本漂移的根，先补护栏再改值。
+   （2026-09-18 修：`scripts/check-version.sh:31-104` 新增 4 项 `tools/` 护栏（框架形状 pin 必须 == 当前版本、
+   非白名单 `0.x.y` 字面量报错、`tools/zmodu/build.zig.zon` 版本必须相等、scaffold 依赖 hash 不得是占位符）；
+   `tools/zmodu/src/main.zig:231` 的 tarball URL 改为 `ZMODU_VERSION` 拼接、`:238` 换真 hash；
+   `rg -n '0\.13\.9|0\.14\.9|0\.13\.7-AAAA' tools/zmodu/src/` 为空）
+2. ✅ **内置技能全落默认 `.action = .execute` + `isInert()` 盲区**：`grep -rn "\.action = " src/` 非测试仅 `skill.zig:150`
+   的转发；`business/admin/schedule/notify/mcp` 的技能全落 `.execute`（`skill.zig:30`）。按 `AGENT_RUNTIME.md` §二 推荐配
+   `allow = 读工具 + allow_execute = false` 会**全拒**，而 `guard.zig:87` 的 `isInert()` 只看 `allow.len` → 不报警。
+   改：读类工具补 `.action = .read|.propose`；`isInert()` 纳入类别维度。
+   （2026-09-18 修：内置技能逐个显式声明类别 —— `src/ai/business.zig:106/154/202`、`src/ai/kpi.zig:61`、
+   `src/ai/notify.zig:126`、`src/ai/schedule.zig:47/71/109/130`、`src/ai/admin.zig:107/134/160/184/209/253/274`、
+   `src/ai/actions.zig:66/83/221/304`、`src/ai/approval_api.zig:133`、`src/ai/approval.zig:248`；
+   类别维度的盲区改由注册表侧补：`SkillRegistry.auditPolicy` + `PolicyHealth.isInert()/hasClassBlindSpot()`
+   （`src/ai/skill.zig:99,242`）会列名"被类别闸门拒掉"的工具，测试见 `:545` / `:608`。
+   `Guard.isInert()` 本身仍只看 `allow.len`（`src/ai/guard.zig:87`），故这一条的"改"按 `PolicyHealth` 落地）
+3. ✅ **`Workflow` 的 `.agent` 步骤无 guard 途径**：`src/ai/workflow.zig:615-619` 现搓裸 `Agent{provider,registry,budget}`，
+   且 `Workflow`(`:140-167`) 没有 guard 字段 → workflow 里的 agent 天然无界。改：加字段并透传。
+   （2026-09-18 修：`Workflow` 新增 `guard: ?*guard.Guard` 字段（`src/ai/workflow.zig:153`），`.agent` 步骤经
+   `agentForStep()` 透传 `.guard = self.guard`（`:606`）；测试 `workflow .agent steps inherit the workflow guard`（`:1297`））
+4. ✅ **scaffold `--with-agent` 生成无 guard 的裸 `Agent{}`**：`tools/zmodu/src/main.zig:6011-6019`；`:6085` 的 handler 也不设
+   tenant/user（落库恒 0）。改：生成 `AgentSpec{ .guard = … }` + `SkillContext{ .tenant_id = ctx.tenantId(), … }`。
+   （2026-09-18 修：模板生成 `guard: zigmodu.ai.Guard = zigmodu.ai.Guard.init(.{})`（`tools/zmodu/src/main.zig:6127`）
+   + `setGuard()`（`:6140`），装配 `Agent{ .guard = &self.guard }`（`:6150`）；handler 侧 `fn tenantId(ctx)`（`:6214`）
+   与 `ctx.userIdInt(i64)`（`:6233`）填 `SkillContext`。实测 `scaffold --with-agent` 的生成项目 `zig build` exit 0，
+   `rg '\.guard|tenantId\(ctx\)' src/modules/ai/agent/` 命中模板产物）
+5. **`/cluster/health` 的 `node_id` 是硬编码 `"node-id"`** —— ✅ **已完成（v0.25.0 本轮）**：`ClusterHealth.healthJson` 改读
+   `ClusterBootstrap.getConfig().node_id`（新增最小只读 getter），并加测试断言 health JSON 的 `node_id` == 配置值。
+6. ✅ **`tools/zmodu/src/mcp_server.zig:557` 断言版本 `"0.14.9"`**，实际来自 `build.zig.zon`（0.25.0）→ 该断言与当前版本不可能
+   同时成立（若是活路径，需要改成读 `ZMODU_VERSION`；若是死路径，顺手删）。
+   （2026-09-18 修：断言改为读单一真源 `main_mod.ZMODU_VERSION`（`tools/zmodu/src/mcp_server.zig:559`，
+   `tools/call` 的 `version` 响应也用它，`:95,:179`）；`rg -n '0\.14\.9' tools/zmodu/src/` 为空）
+7. ✅ **死测试文件**：`src/core/cluster/DistributedIntegrationTest.zig` 的 **11 个 test 从 `src/tests.zig` 不可达**，自 2026-07-06
+   起零编译（与 doctor 那次同类）。改：接进测试根或删除（它已登记在 deadcode baseline）。
+   （2026-09-18 修：已接进测试根 —— `src/tests.zig:77` `_ = @import("core/cluster/DistributedIntegrationTest.zig");`）
+8. ✅ **CI 的 doctor 循环漏两个 module-layout 示例**：`ci.yml:246` 只跑 tenant-mgmt/tenant-shop/shopdemo/zent-modulith/alpha-engine，
+   而 `metaverse-creative`（4 个 `module.zig`）与 `shopdemo-zent`（1 个）从不 doctored；`examples/tenant-mgmt` 至今**零测试**。
+   （2026-09-18 修：doctor 循环补上 `shopdemo-zent` 与 `metaverse-creative`（`.github/workflows/ci.yml:167`）；
+   `examples/tenant-mgmt` 补 `src/tests.zig`（2 个 test：模块图 + 路由表）与 `build.zig:54` 的 `test` step，
+   并进 CI test-step 循环（`ci.yml:337`））
+9. **`docs/UPGRADING.md` 止于 v0.15.46** —— ✅ **已完成（v0.25.0 本轮）**：补上 v0.22–v0.25 的破坏性/行为变更（`ModuleContext.runtime()`、
+   `Tool.action` 默认、`Agent.memory` 注入规则、`DocSnippets` 门禁、示例目录删除、`minimum_zig_version`、多节点 fail-closed + `.transport`、
+   `RaftTransport`、门面 `tick()`/入站监听、Raft 计票口径、Saga timeout 生效、`TransactionJournal`）。
+10. **文档数字/版本漂移** —— ✅ **已完成（v0.25.0 本轮）**：`docs/PRODUCTION_ROADMAP.md:245`（42 文件/12,216 行 → 实测 45/13,919
+    行，≈14.0%，并把复算命令写进文档）、
+    `docs/BEST_PRACTICES.md:108`（root.zig 157/163 → 158/164）、`README.md:65`（改为已有 `TransactionJournal` 持久化协调日志）、
+    `docs/API.md:581`（"per-connection stack" → 只 sizing accept-loop 线程栈）、`docs/CLUSTER-QUICKSTART.md:35`（补 `tick()` 也驱动
+    `raft.tick()` + `.transport` 时 `start()` 起入站监听）、`examples/{tenant-mgmt,metaverse-creative}` 版本号 → v0.25.0；
+    `docs/AI_SKILLS.md` 与 `AI_ORCHESTRATION.md` 各加指针指向 `AGENT_RUNTIME.md`。
+
+**导出孤儿**（`root.zig` 导出、src + examples 零引用；建议逐个"找消费者或删"）：
+`ClusterNodeView` · `ClusterSnapshot` · `cluster_health`/`clusterHealthJson` · `MessageQueue` · `LoadBalancer` ·
+`ModuleInteractionVerifier` · `PluginManager` · `HotReloader` · `IntegrationTest` · `load_shedder` · **`FrozenMap`**
+（`AGENTS.md` 明确推荐它，但框架内零消费者 —— 属于"文档承诺的入口没人用"）。
+
+**测试跳过面**：`SkipZigTest` 共 82 处，主因是 loopback 权限（29×）、Windows（10×）、`REDIS_URL`(5×)、`NATS_URL`(3×)
+与各中间件 URL —— 都属环境门控，不是缺口；真缺口只有上面第 7 条。
+
+### CLI 与门禁现状（2026-09-18 复检）
+
+- ✅ **`zmodu scaffold` 生成的项目仍不能 `zig build`**（实测 9 错，exit 1）。模板缺陷 4 处：
+  `tools/zmodu/src/main.zig:3665/3671/3673/3681/3683` 把字面量 `1` 传给 `shared.errors.BizCode`（枚举）；
+  `:3526`+`:3368` 对 `?i64` 做 `<` 比较；`:8677` 生成的 `tests.zig` 不可编译（硬编码 `.name = "test"` 不补必填字段）；
+  `:3563` 生成的 `.nest` 非 fmt-clean。**实测：只补前两处 `zig build` 即通过（产出二进制）；补全 4 处才是完整可用产物。**
+  （2026-09-18 修：四处都改了 —— `BizCode` 一律用枚举成员（`main.zig:1752-1754` 等 `R.wrapErr(ctx, .not_found, …)`，
+  `rg 'wrapErr\(ctx, [0-9]' tools/zmodu/src/main.zig` 为空）；租户列可空时改按 `entity.?.tenant_id != null`
+  判断（`main.zig:3522-3536`）；生成器输出统一过 `appendFooter()` 消掉多余空行（`:194-201`）。
+  复现：`zig build -p <tmp>` 出新 CLI → `zmodu scaffold --sql <2 表 schema> --name myapp` → 生成项目
+  `zig build` exit 0、`zig build test` exit 0、`zig fmt --check src` exit 0。
+  残留：生成的顶层 `build.zig` 模板仍带 3 处行尾空格（`zig fmt --check build.zig` exit 1，但 `zmodu ci` 的 fmt
+  步只扫 `src/tools/examples`，故不影响门禁）；`zmodu ci` 在新生成项目上仍 FAIL verify + deadcode。）
+- ✅ **`zmodu ci` 在 18 个有 build.zig 的示例里 9 个 FAIL**（compile 全 PASS）：deadcode 8 个（未用 `std`/字段/函数）、
+  verify 1 个（`tenant-shop` 的 `shop_bff/{model,persistence,service}.zig`）、audit 4 个（`shopdemo` 99 条 b4/b13、
+  `metaverse-creative` 12 条、`shopdemo-zent` 4 条、`tenant-mgmt` 2 条）。
+  （2026-09-18 复测：`for d in $(find examples -maxdepth 2 -name build.zig | xargs -n1 dirname | sort); do zmodu ci "$d"; done`
+  → **只剩 1 个 FAIL**：`examples/tenant-shop` 的 `[verify]`（现在报 `shop_bff/*` 与 `admin_bff/{model,persistence,service}.zig`
+  共 6 个文件）；**deadcode 与 audit 已全部 PASS** —— 上面点名的 `shopdemo`（99 条 b4/b13）、`metaverse-creative`（12 条）、
+  `shopdemo-zent`（4 条）、`tenant-mgmt`（2 条）现在都是 `[audit] PASS`，`tenant-shop` 的 verify 一条仍成立）
+- ✅ **口径不一致**：`zmodu ci` 的 audit 步骤**忽略 `.zmodu/audit-baseline.json`**（`tools/zmodu/src/audit.zig:1626`
+  的 `auditJsonFor` 硬编码 `added = violations.len`）→ 有 baseline 的 `tenant-mgmt` 单独跑 `zmodu audit` 是
+  `pass:true`，在 `zmodu ci` 里却 FAIL；而 CI 的 audit job 只跑 `zmodu audit` → **CI 绿、`zmodu ci` 红**。
+  （2026-09-18 修：`auditJsonFor` 现在读 `<dir>/.zmodu/audit-baseline.json` 并走 `compareBaseline`
+  （`tools/zmodu/src/audit.zig:1650-1657`），`cmdAudit` 同样以 `baseline.added == 0` 判 pass（`:159-180`）；
+  `zmodu ci` 的 audit 步因此与 `zmodu audit` 口径一致）
+- ✅ 遗留项：本轮已修 1/2/3/5/6/7；~~**4 仍成立**~~（`main.zig:6040-6047` 的 `--with-agent` 仍生成无 `.guard` 的裸 `Agent{}`，
+  `:6104` 的 `SkillContext` 仍无 tenant/user）；~~**8 只剩 README 侧**~~（`examples/README.md:165/288-289/404` 未补 `tenant-mgmt`）。
+  （2026-09-18 修：第 4 条已修 —— `--with-agent` 模板生成 `.guard`（`tools/zmodu/src/main.zig:6127/6150`）
+  并用 `tenantId(ctx)` / `ctx.userIdInt(i64)` 填 `SkillContext`（`:6214,:6233`）；第 8 条已修 ——
+  `examples/README.md:165`（索引行）、`:288-289`、`:404` 都已列入 `tenant-mgmt`）
+
+### 新用户路径卡点（2026-09-18，按严重度）
+
+1. ✅ **第一步就 404**：`README.md:183` 把工具链钉在 `zigup 0.17.0-dev.1567+f0354179a`，而该 dev 版本已被 ziglang 镜像
+   回收（`AGENTS.md:345` 自己都写了"dev.1567 已 404"；`ci.yml:33` 用的是 `1970+67f39b551`）；`:184` 又只给
+   `brew install zig`（stable），与本仓的 `std.process.Init` 等 dev API 不兼容。
+   （2026-09-18 修：`README.md:218` 与 `docs/QUICK-START.md:13` 都改成 CI 同款 `zigup 0.17.0-dev.1970+67f39b551`；
+   `README.md:224` / `QUICK-START.md:8` 明确写"`brew install zig` 装的是 *stable*，编译不了本仓"，并注明
+   `.github/workflows/ci.yml` → `ZIG_VERSION`（`:33`）才是真源。`rg -n 'dev\.1567' README.md docs/QUICK-START.md` 为空）
+2. ✅ **"5 分钟教程"本身编不过**：`docs/QUICK-START.md:68` 的 `app` 通篇未定义、`:65` 的 `generateDocs` 少 `io` 参
+   （真签名 4 参）；`:16` 说 `zig version` 显示 `0.17.0` 与 README 的 dev 钉版、AGENTS 互相矛盾；`:86` 调
+   `b.dependency("zigmodu")` 而全篇没给 `build.zig.zon` 依赖声明。README 里 `const UserModule`（非 `pub`）+ 传
+   `.{user}`（文件结构体无 `info`）同样编不过。
+   （2026-09-18 修：`docs/QUICK-START.md:37` 是 `pub const UserModule`（注释点明 `pub` 的原因），`:84` 有
+   `var app = try b.build(.{user.UserModule});`，`:77` 的 `generateDocs` 带满 4 个实参，`:25` 的 `zig version`
+   期望值改为 `ci.yml` 的 `ZIG_VERSION`，`:97` 起补了 `build.zig.zon` 依赖声明（`:133` 的 `b.dependency("zigmodu")`
+   因此有出处）；`README.md:236` 的 `UserModule` 也是 `pub`，`main` 走 `scanModules` / `startAll`）
+3. ✅ **`AGENTS.md` 的核心代码模式是错的**：`:266/:286` 的 `ctx.paramInt("id")` 少类型参（真签名 `paramInt(T, key)`）；
+   `:270/:272/:273/:287` 的 `ctx.json(200, .{ .ok = true })`——`ctx.json` 第二参是 `[]const u8`，值形态要用
+   `jsonStruct`/`jsonValue`。**加重误导**：`:85` 声称 `DocSnippets.zig` 会抽查文档代码块，但该门禁只认
+   builder/runtime/init 三种形态（`src/test/DocSnippets.zig:51-73`），这两类永远漏检。
+   （2026-09-18 修：`AGENTS.md:266/286` 改成 `ctx.paramInt(i64, "id")`、`:270/272/273/287` 改成
+   `ctx.jsonStruct(200, .{ … })`（`:287` 还带 `// NOT sendSuccess/sendFail`）；门禁同步扩容 —— `AGENTS.md:85`
+   改口为"5 种形状"并点名这两类，检测器是 `jsonGetsStructLiteral`（`src/test/DocSnippets.zig:220`）与
+   `paramIntMissingType`（`:237`）。`rg -n 'paramInt\("|ctx\.json\([0-9]' AGENTS.md` 为空）
+4. ✅ **有文档背书的死代码**：`examples/production-deploy/README.md:49` 教 `Server.fromEnv(io, allocator, init.environ_map)`
+   —— `fromEnv` 形参是 `std.process.Environ`（`Server.zig:2348`）而传的是 `*Environ.Map`，且函数体 `env.iterator()`
+   只存在于 `Environ.Map`（toolchain `std/process/Environ.zig:337`）→ **一旦被实例化就编不过**，却全仓无人调用、
+   无测试。"部署时唯一的 env 接线入口"是死的。另 `:19` 的 `Server.enable_http2` 真名是 `setHttp2Enabled()`。
+   （2026-09-18 修：`Server.fromEnv` 形参改为 `*const std.process.Environ.Map`（`src/api/Server.zig:2355`）并补两个测试
+   （`src/api/Server.zig:4458` / `:4478`）；`examples/production-deploy/README.md:19` 改用真名 `Server.setHttp2Enabled(true)`，
+   `:49` 的调用与真签名一致）
+5. ✅ **数据层文档自相矛盾**：`docs/ZENT.md:450-483` 标着"摘自示例"的推荐形态用的是手写 `zent.codegen.deinitEntity` 循环，
+   而示例真码是 `deinitRows(&found)`（`examples/zent-modulith/.../catalog/persistence.zig:84`），同一文档 `:519/:618/:665`
+   又要求用 `deinitRows`；`docs/MODULE_LAYERS.md:67` 的 `findById(self, tenant_id, id)` 与其"参考实现"
+   `examples/tenant-shop/.../tenant/persistence.zig:26` 的 `findById(self, id)` 不符；`Backend` 口径不清
+   （文档主推 `data.SqlxBackend`，但 `queryRowPartial` 只在 `*data.Client` 上存在）。`ZENT.md:532` 还写着 zent v0.39.2（实际 pin v0.67.0）。
+   （2026-09-18 修：`docs/ZENT.md` 的"摘自示例"块已改成 `defer self.client.product.deinitRows(&found)`（`:479`），
+   `:491` 注明"手写 `deinitEntity` 循环是旧写法，本仓库示例已全部改掉"；全文 `v0.39.2` 清零、口径为 zent v0.67.0
+   （`:4` / `:530` / `:549`）；`docs/MODULE_LAYERS.md:62-64` 写清 `Backend` 两套方法（`*data.Client` → `queryRowPartial`，
+   `data.SqlxBackend` → `queryRowPartialBorrowed`），`:72-74` + `:94` 说明租户键表用 `findById(self, tenant_id, id)`、
+   租户主表退化为 `findById(self, id)`。`rg -n 'v0\.39\.2' docs/ZENT.md` 为空）
+6. ✅ **孤儿文档**（无任何索引收录）：`docs/LOGGING.md`、`docs/MIGRATION_v04_to_v07.md`、`docs/ZIGMODU_NOTES.md`，
+   以及 `docs/dev/**` 全部 14 个文件。
+   （2026-09-18 修：`docs/README.md:48-50` 新增「Other documents」表逐条收录前三份，`:51` 收录 `docs/dev/` 目录；
+   `ls docs/dev/ | wc -l` = 14）
 
 ## 📋 目录 (Table of Contents)
 

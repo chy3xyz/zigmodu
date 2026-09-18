@@ -2,7 +2,6 @@
 //!
 //! ORM persistence for module: <<MODULE_NAME>>
 
-const std = @import("std");
 const data = @import("zigmodu").data;
 const model = @import("model.zig");
 

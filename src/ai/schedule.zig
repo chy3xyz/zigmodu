@@ -44,6 +44,7 @@ pub fn registerScheduleSkills(
 ) !void {
     try registry.register(.{
         .name = "list_schedulable_tasks",
+        .action = .read,
         .description = "List tasks that can be scheduled and their descriptions",
         .parameters = &.{},
         .handler = struct {
@@ -67,6 +68,7 @@ pub fn registerScheduleSkills(
 
     try registry.register(.{
         .name = "schedule_job",
+        .action = .execute,
         .description = "Schedule a named task on a 5-field cron expression (minute hour day-of-month month day-of-week; e.g. '0 9 * * *' for 09:00 daily)",
         .parameters = &.{
             .{ .name = "task", .type = .string, .description = "Task name from list_schedulable_tasks", .required = true },
@@ -104,6 +106,7 @@ pub fn registerScheduleSkills(
 
     try registry.register(.{
         .name = "list_jobs",
+        .action = .read,
         .description = "List jobs currently scheduled on the cron scheduler",
         .parameters = &.{},
         .handler = struct {
@@ -124,6 +127,7 @@ pub fn registerScheduleSkills(
 
     try registry.register(.{
         .name = "cancel_job",
+        .action = .execute,
         .description = "Cancel a scheduled job by name",
         .parameters = &.{
             .{ .name = "job", .type = .string, .description = "Job name from list_jobs", .required = true },

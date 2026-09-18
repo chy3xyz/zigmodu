@@ -28,6 +28,8 @@ const DistributedTracer = @import("../tracing/DistributedTracer.zig").Distribute
 pub const AiProvider = provider_mod.AiProvider;
 pub const SkillRegistry = skill_mod.SkillRegistry;
 pub const SkillContext = skill_mod.SkillContext;
+/// Registry-side policy audit: which tools a policy refuses by **class**.
+pub const PolicyHealth = skill_mod.PolicyHealth;
 pub const AgentAuditLog = audit_mod.AgentAuditLog;
 pub const Retriever = retriever_mod.Retriever;
 pub const TokenQuota = quota_mod.TokenQuota;
@@ -223,6 +225,19 @@ pub const Spec = struct {
     /// is a different (and usually worse) problem than an inert one.
     pub fn isGuarded(self: Spec) bool {
         return self.guard != null;
+    }
+
+    /// Class-aware policy health (`SkillRegistry.auditPolicy`).
+    ///
+    /// `isInert()` only sees whether `allow` is empty, so a policy that lists
+    /// exclusively `execute` tools looks configured while `allow_execute = false`
+    /// refuses every one of them. This asks the registry what each tool
+    /// declared, so `class_denied_tools` can name the tools the *class* gate is
+    /// blocking. `null` means no guard at all: unbounded, not inert (see
+    /// `isGuarded`). Free the result with `PolicyHealth.deinit`.
+    pub fn auditPolicy(self: Spec, allocator: std.mem.Allocator) !?PolicyHealth {
+        const g = self.guard orelse return null;
+        return try self.skills.auditPolicy(allocator, g.permissions);
     }
 };
 
@@ -642,6 +657,36 @@ test "Spec.build carries identity, authority and memory into the agent" {
     const unbounded = Spec{ .name = "y", .provider = undefined, .skills = &registry };
     try std.testing.expect(!unbounded.isGuarded());
     try std.testing.expect(!unbounded.isInert());
+}
+
+test "Spec.auditPolicy names the tools the class gate blocks" {
+    const allocator = std.testing.allocator;
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    const noop = struct {
+        fn h(_: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+            return .{ .bool = true };
+        }
+    }.h;
+    try registry.register(.{ .name = "market.quote", .description = "", .parameters = &.{}, .action = .read, .handler = noop });
+    try registry.register(.{ .name = "order.submit", .description = "", .parameters = &.{}, .action = .execute, .handler = noop });
+
+    // The trap again, this time through the spec: `allow` is not empty, so the
+    // name-only check calls this agent healthy while it can do nothing.
+    var guard = guard_mod.Guard.init(.{ .allow = &.{"order.submit"} });
+    const spec = Spec{ .name = "trader", .provider = undefined, .skills = &registry, .guard = &guard };
+    try std.testing.expect(!spec.isInert());
+
+    var health = (try spec.auditPolicy(allocator)).?;
+    defer health.deinit(allocator);
+    try std.testing.expect(health.isInert());
+    try std.testing.expect(health.hasClassBlindSpot());
+    try std.testing.expectEqual(@as(usize, 1), health.class_denied_tools.len);
+    try std.testing.expectEqualStrings("order.submit", health.class_denied_tools[0]);
+
+    // No guard at all is unbounded, not inert — there is no policy to audit.
+    const unbounded = Spec{ .name = "y", .provider = undefined, .skills = &registry };
+    try std.testing.expect((try unbounded.auditPolicy(allocator)) == null);
 }
 
 test "AgentResult deinit frees owned answer" {

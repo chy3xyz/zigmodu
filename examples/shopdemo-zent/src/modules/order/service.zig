@@ -1,6 +1,5 @@
 //! Service layer for the order module — validates inputs, delegates to
 //! the zent-backed `OrderStore`. No HTTP / SQL strings leak in here.
-const std = @import("std");
 const persist = @import("persistence.zig");
 
 pub const OrderService = struct {

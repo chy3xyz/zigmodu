@@ -41,4 +41,17 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     const run_step = b.step("run", "Run tenant-mgmt API server");
     run_step.dependOn(&run_cmd.step);
+
+    // Example tests (module graph + routed catalog) live in src/tests.zig and
+    // ship their own step, the same way the other examples expose one.
+    const tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tests_mod.addImport("zigmodu", zigmodu_mod);
+
+    const test_step = b.step("test", "Run the tenant-mgmt example tests");
+    const tests = b.addTest(.{ .root_module = tests_mod });
+    test_step.dependOn(&b.addRunArtifact(tests).step);
 }

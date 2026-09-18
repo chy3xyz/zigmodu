@@ -295,6 +295,12 @@ pub const ClusterBootstrap = struct {
         RaftTransport.handleConnection(raft, &self.addresses, &owned);
     }
 
+    /// The config this node was booted with — read-only entry point for the
+    /// facades that report on it (e.g. `ClusterHealth.healthJson`).
+    pub fn getConfig(self: *const Self) *const BootstrapConfig {
+        return &self.config;
+    }
+
     pub fn getMetrics(self: *Self) *ClusterMetrics {
         return &self.metrics;
     }

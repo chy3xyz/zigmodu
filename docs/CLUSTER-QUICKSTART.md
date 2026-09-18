@@ -33,7 +33,10 @@ pub fn main(init: std.process.Init) !void {
     cluster = &boot;
 
     // Nothing drives the membership loop for you: tick() is one gossip/health pass
-    // plus a read-side republish. `error.ReadersBusy` is not a failure (a request path
+    // plus a read-side republish, plus raft.tick() — that is what starts elections
+    // and sends heartbeats. With a `.transport` configured, `start()` also brings up
+    // the inbound Raft listener on `port`.
+    // `error.ReadersBusy` is not a failure (a request path
     // was mid-read; the previous view stays published and the next tick retries).
     while (true) {
         try boot.tick();

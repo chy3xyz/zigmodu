@@ -5,6 +5,10 @@
 > 所有能力复用业务层基建（Saga/outbox/WAL、Scheduler、EventBus、quota/audit），
 > 遵守受控执行姿态。
 
+> **运行时姿态见 [`AGENT_RUNTIME.md`](AGENT_RUNTIME.md)**：`ai.Guard` / `ai.AgentSpec`（含 `isGuarded()` / `isInert()`）、
+> `skill.Tool.action`（默认 `.execute`）、`ai.AgentWorker`（agent 跑成运行时 worker）、
+> `ai.ProposalPipeline`（提议 → 风险 → 执行）。本文只讲编排形状，那篇讲闸门与执行许可。
+
 ## P0 · 已落地
 
 ### `zigmodu.ai.workflow` — 线性多步任务编排

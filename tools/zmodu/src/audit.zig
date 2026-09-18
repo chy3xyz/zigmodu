@@ -1622,7 +1622,9 @@ fn appendPrint(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime f
     try buf.appendSlice(allocator, s);
 }
 
-/// Run both groups without baseline and return the JSON report (MCP/ci entry).
+/// Run both groups and return the JSON report (MCP/ci entry). Honors the same
+/// `<dir>/.zmodu/audit-baseline.json` as the `audit` command so `zmodu ci`
+/// agrees with a standalone `zmodu audit`.
 pub fn auditJsonFor(io: Io, allocator: std.mem.Allocator, project_dir: []const u8) ![]const u8 {
     var cfg = loadRuleConfig(io, allocator, project_dir) catch blk: {
         var rc = RuleConfig{};
@@ -1644,7 +1646,15 @@ pub fn auditJsonFor(io: Io, allocator: std.mem.Allocator, project_dir: []const u
     for (violations.items) |v| {
         if (v.rule[0] == 'a') arch_count += 1 else biz_count += 1;
     }
-    return buildJsonString(allocator, project_dir, arch_count, biz_count, violations.items, .{ .added = violations.items.len, .suppressed = 0, .removed = 0 });
+
+    const baseline_path = try std.fs.path.join(allocator, &.{ project_dir, ".zmodu", "audit-baseline.json" });
+    defer allocator.free(baseline_path);
+    const baseline = compareBaseline(io, allocator, baseline_path, violations.items) catch |err| blk: {
+        std.log.err("audit: baseline compare failed: {s}", .{@errorName(err)});
+        break :blk BaselineResult{ .added = violations.items.len, .suppressed = 0, .removed = 0 };
+    };
+
+    return buildJsonString(allocator, project_dir, arch_count, biz_count, violations.items, baseline);
 }
 
 /// Render the module dependency graph as Mermaid (nodes + edges between known

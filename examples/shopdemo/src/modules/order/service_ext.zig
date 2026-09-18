@@ -1,6 +1,5 @@
 // order service extension — add custom business logic here.
 // Survives zmodu regeneration.
-const std = @import("std");
 const zigmodu = @import("zigmodu");
 const order_svc = @import("service.zig");
 

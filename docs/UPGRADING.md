@@ -15,6 +15,173 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 
 ---
 
+## v0.25.0
+
+### `ClusterBootstrap.tick()` 也驱动 `raft.tick()`；配 `.transport` 时 `start()` 起入站监听
+
+**Breaking?** 否（此前 `raft.tick()` **没人驱动**，选举根本不发生 —— 接上之后行为才符合文档）。
+
+**影响面**：所有用 `ClusterBootstrap` 的进程。`tick()` 一次做完 `membership.runOnce()` → `view.sync()` →
+`raft.tick()`；配了 `.transport` 时 `start()` 还会在 `config.port` 上开入站监听（端口起不来返回
+`error.RaftInboundListenFailed`，不静默降级），`stop()` 对应停掉。**别把同一个 `port` 再给
+`DistributedEventBus.start(port)`**。
+
+**改法**：让 `tick()` 真的在循环里跑起来（此前只驱动 gossip 也算"能用"，现在选举/心跳依赖它）：
+
+```zig
+// before: 只在别处手工调 membership，raft 从未被 tick
+// after
+_ = try worker.after(1000, .tick);   // runtime 定时器 → Worker.handle → cluster.tick()
+```
+
+### Raft 计票口径：只数 peer 票，单节点首次选举即当选
+
+**Breaking?** 否，是修 bug。`hasQuorum`/`startElection` 的口径明确为"只数 peer 票"（自己的票不重复计入）；
+`cluster_size == 1` 时首次 election 立即当选（此前永远选不出 leader）。
+
+**影响面**：依赖"单节点集群会自己成为 leader"的启动逻辑现在能成立；断言过旧行为（永远 follower）的测试会变红。
+
+### `SagaStep.timeout_seconds` 真正生效
+
+**Breaking?** 是（行为变化）：预算超时的步骤现在会被判定并补偿。
+
+**影响面**：所有写了 `timeout_seconds` 的 saga。步骤耗时超预算 → 持久化 → **逆序补偿（含该步）** →
+终态 `.timed_out` → 返回 `error.SagaStepTimeout`；`0` 表示不做预算（与旧行为一致）。
+
+**改法**：`run` 的调用点要能接住新错误：
+
+```zig
+wf.run(allocator, &ctx) catch |err| switch (err) {
+    error.SagaStepTimeout => { /* 已补偿，读 instance 的终态 */ },
+    else => return err,
+};
+```
+
+### 2PC 新增 `TransactionJournal`（in-doubt 有解）
+
+**Breaking?** 否，纯新增（`zigmodu.TransactionJournal`）。append-only、只 INSERT、DDL 方言中立；
+不配 backend 时退回内存。配了日志即 **fail-closed**（写不进去就报错、不前进）。`recover()` **只报告不决策**，
+返回"prepared 且无终态"的事务供调用方自行重试/回滚。
+
+**影响面**：用 `DistributedTransaction` 的应用不再需要自己造协调日志。
+
+---
+
+## v0.24.0
+
+### 删除 7 个示例文件/目录（示例收敛）
+
+**Breaking?** 是，只对**引用这些路径**的脚本/文档/CI 成立。
+
+**影响面**：`examples/testing/`、`examples/deprecated/`、`examples/cluster-demo/`、`examples/example_tests.zig`
+已不存在 —— 内容分别并入 `examples/basic/src/tests.zig` 与 `examples/distributed/README.md`。
+
+**改法**：
+
+```bash
+# before: zig build test -Dexample=testing
+# after
+zig build test -Dexample=basic          # 合并后的测试根
+```
+
+### `build.zig.zon` 的 `minimum_zig_version` → `0.17.0`
+
+**Breaking?** 否，但旧工具链会被 Zig 直接拦下（这正是不再支持 0.16 的表述）。
+
+**影响面**：框架与 9 个示例的 `build.zig.zon`（含 `examples/*` 里 pin zent 的示例）。
+
+### CI 两份示例构建清单统一
+
+**Breaking?** 否。此前两份清单漂移（`zent-modulith` 只在一侧，`shopdemo-zent` / `metaverse-creative` 两侧都没有），
+现在两份**逐字一致（17 项 + `zmsaas/backend`）**；不可构建的目录（docker / node / sibling 依赖）在两处都写明原因。
+
+---
+
+## v0.23.0
+
+### `ClusterBootstrap` 多节点 fail-closed（`raft_cluster_size > 1` 需 `.transport` 或显式承认）
+
+**Breaking?** 是：**多节点**配置的 `start()` 现在会返回 `error.RaftTransportUnavailable`（v0.22 引入检查，v0.23 给出
+`.transport` 这条出路）。此前静默选出一个没有 quorum 的"leader"。
+
+**影响面**：所有 `raft_cluster_size > 1` 的启动路径（默认值就是 3）。
+
+**改法**：三选一 —— 自带传输 / 显式承认只跑 membership + 读侧 / 单节点：
+
+```zig
+var cluster = try zmodu.ClusterBootstrap.init(allocator, io, .{
+    .node_id = "node-1",
+    .port = 9000,
+    .transport = my_raft_transport,          // 真传输（v0.23 起的推荐路径）
+    // .allow_stub_raft_transport = true,    // 或：承认「选举在别处，或干脆不选」
+    // .raft_cluster_size = 1,               // 或：单节点
+});
+```
+
+### `RaftTransport` 落地（真选主传输）
+
+**Breaking?** 否，纯新增（`src/core/cluster/RaftTransport.zig`）：4 字节长度前缀 + 1 字节 tag 的 wire 格式、
+peer→地址簿、出站投票（fire-and-forget）与日志复制（同步读回）、入站分发（`handleConnection` 在同一连接回包）。
+`NetworkTransport.connect` 仍是死代码（引用即编译不过），拨号在 `RaftTransport` 内自建。
+
+**影响面**：想接真选主的应用 —— 自带传输只需管**发**，入站由 `ClusterBootstrap.start()` 监听 `port` 并分发
+（契约见 `docs/DISTRIBUTED.md`「真选主要什么」）。
+
+---
+
+## v0.22.0
+
+### `ModuleContext.runtime()` 接线（模块内建 worker/timer 的唯一入口）
+
+**Breaking?** 否，但**裸 harness** 下行为是显式失败。
+
+**影响面**：模块在 `initWith` 里 `ctx.runtime()` spawn worker；`Application.stop()` **先** join worker、**再**
+`Lifecycle.stopAll`（worker 可能正在调模块服务）。直接 `Lifecycle.startAllWith` 的裸 harness 返回
+`error.RuntimeUnavailable`，不会偷偷新建一个 runtime。`Application.runtime()` 现在**首次调用即启动 ticker**
+（此前 `handle.after(...)` 会静默不触发）。
+
+**改法**：别在模块里自己 `Runtime.init` / `rt.shutdown()`：
+
+```zig
+pub fn initWith(ctx: *zmodu.ModuleContext) !void {
+    const rt = ctx.runtime() catch |err| return err;   // 同一个 app.runtime()
+    _ = rt;                                            // rt.spawn(...) / handle.after(...)
+}
+```
+
+### `skill.Tool.action`（默认 `.execute`）
+
+**Breaking?** 否，但**默认值是 fail-closed 的**：忘了声明的工具永远是 `execute`，拿不到宽策略。
+
+**影响面**：所有内置技能此前全落 `.execute`（`skill.zig:150` 的转发）；按 `AGENT_RUNTIME.md` §二 配
+`allow = 读工具 + allow_execute = false` 会**全拒**。读类工具要显式标 `.action = .read` / `.propose`。
+
+### `Agent.memory` 注入规则（身份缺失即一个字都不注入）
+
+**Breaking?** 否，纯新增（`Agent.memory` / `memory_prefix` / `memory_limit` + `memory.recallBlockAlloc`）。
+记忆按本次运行的 **tenant + user** 注入 system message；`recall` 把 `0` 当"任意"，所以身份缺失或为 0 时
+**一条记忆都不注入**（跨租户注入是沉默且最坏的失败）。**别**用 `MemoryStore.formatContext` 直接给 agent 喂记忆。
+
+### `DocSnippets` 门禁（文档代码块会被编译/形状校验）
+
+**Breaking?** 否，但**文档里的 `zig` 围栏代码块现在会被门禁扫**（`src/test/DocSnippets.zig`，递归到 `docs/**`，
+跳过插件目录）。最常被抓的是把 builder 方法直接链在 `zmodu.builder(…)` 临时值后面 —— 那个形状编译不过。
+
+**改法**（坏形状与好形状分开看 —— 历史形状用 `text` 围栏，避免门禁把它当成推荐的写法）：
+
+```text
+// 编译不过：临时值是 *const
+var app = try zmodu.builder(allocator, io).withName("app").build(.{});
+```
+
+```zig
+var b = zmodu.builder(allocator, io);
+defer b.deinit();
+var app = try b.withName("app").build(.{});
+```
+
+---
+
 ## v0.15.46
 
 ### 上传内容策略（**新增，可选**）

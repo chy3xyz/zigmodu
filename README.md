@@ -62,7 +62,7 @@ A modular application framework for Zig 0.17, inspired by Spring Modulith. Build
 ### Distributed Systems
 - **DistributedEventBus** ⚠️ — Cross-node event pub/sub with heartbeat (experimental)
 - **ClusterMembership** ⚠️ — Gossip-based node discovery + health check (experimental)
-- **DistributedTransaction** ⚠️ — 2PC + Saga patterns (experimental, needs persistence)
+- **DistributedTransaction** ⚠️ — 2PC + Saga patterns (experimental; 2PC coordinator state persists via `TransactionJournal`)
 - **Kafka Connector** — Producer/Consumer with topic stats + EventBridge
 - **Sharding** — Tenant-aware ShardRouter with configurable pools
 
@@ -123,11 +123,14 @@ For large projects, import only the domains you need:
 ```zig
 const zmodu = @import("zigmodu");
 
-// Full import (everything) — bind the builder first: a builder method takes
-// `*Self`, and a temporary is `*const`:
+// Builder wiring. This is a fragment, not a whole `main`: `allocator` / `io`
+// come from `std.process.Init` (see "Bootstrap Application") and `UserModule`
+// is defined in "Create Your First Module". Bind the builder first — a builder
+// method takes `*Self`, and a temporary materialises as `*const`:
 var b = zmodu.builder(allocator, io);
 defer b.deinit();
-var app = try b.build(.{MyModule});
+var app = try b.build(.{UserModule});
+_ = app;
 
 // Fast import: only HTTP + Core (skips SQLx, Redis, Kafka, etc.):
 const http = zmodu.http;       // Server, middleware, client, OpenAPI
@@ -138,26 +141,58 @@ const obs  = zmodu.observability; // Prometheus, Tracing, Logging
 
 Each domain file is self-contained — importing `zmodu.http` does not compile `sqlx` or `redis`.
 
-### Selective SQL driver linking
+### Project setup: `build.zig.zon` + `build.zig`
 
-Link only the database drivers you need (default remains `all` for compatibility):
+Declare the dependency in `build.zig.zon`. The first `zig build` rejects the
+placeholder `.fingerprint` and prints the exact value to paste in:
+
+```zig
+.{
+    .name = .myapp,                 // must be a valid Zig identifier
+    .version = "0.1.0",
+    .fingerprint = 0x0,             // ← paste the value `zig build` suggests
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        // Local checkout (what examples/basic uses — no `.hash` needed):
+        .zigmodu = .{ .path = "../zigmodu" },
+        // …or a tagged release; `zig fetch --save <url>` fills in `.hash`:
+        // .zigmodu = .{ .url = "git+https://github.com/chy3xyz/zigmodu?ref=v0.25.0" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
+```
+
+Then link only the database drivers you need (the dependency's default is `all`,
+which pulls in all three):
 
 ```zig
 const zigmodu_dep = b.dependency("zigmodu", .{
     .target = target,
     .optimize = optimize,
-    .db = "sqlite", // or postgres | mysql | "sqlite,postgres" | all
+    .db = db_opt, // or postgres | mysql | "sqlite,postgres" | all
 });
 ```
 
+`-Ddb=` on the command line only exists if *your* `build.zig` declares the
+option (the framework examples that support it do the same):
+
+```zig
+const db_opt = b.option([]const u8, "db", "SQL drivers to link: all|sqlite|postgres|mysql (comma-list)") orelse "sqlite";
+```
+
 ```bash
-zig build -Ddb=sqlite          # apps / examples
+zig build -Ddb=sqlite          # apps / examples (needs the option above)
 zig build test                 # framework tests: keep default all
 zig build soak                 # concurrency soak: N clients x M tenants (real sockets)
 ```
 
+A complete `build.zig` (install + `run` + `test` steps) is in
+[docs/QUICK-START.md](docs/QUICK-START.md) Step 3.
+
 Production: one call wires backpressure, security, `/metrics` (golden signals)
-and `/health/*`. It must run **before** routes are registered:
+and `/health/*`. It must run **before** routes are registered. Fragment —
+`server` / `allocator` come from your own `main` (runnable wiring:
+[`examples/tenant-mgmt/`](examples/tenant-mgmt/)):
 
 ```zig
 var server = zigmodu.http.Server.init(io, allocator, 8080);
@@ -179,9 +214,15 @@ Disabled drivers → C stubs; runtime `error.DriverNotEnabled` (HTTP 400). Full 
 ### Prerequisites
 
 ```bash
-# Install the pinned Zig toolchain (CI uses the exact same dev build)
-# zigup 0.17.0-dev.1567+f0354179a   (see .github/workflows/ci.yml → ZIG_VERSION)
-brew install zig          # macOS (or zigup / mlugg/setup-zig in CI)
+# Install the pinned Zig toolchain — CI uses this exact dev build:
+zigup 0.17.0-dev.1970+67f39b551
+# (https://ziglang.org/download/ · https://github.com/marler8997/zigup)
+
+# dev builds are garbage-collected from ziglang's mirrors (old ones start
+# returning 404), so the version above goes stale by design — treat
+# `.github/workflows/ci.yml` → `ZIG_VERSION` as the source of truth.
+# `brew install zig` installs a *stable* Zig, which does NOT compile this repo
+# (the framework needs the dev API: `std.process.Init`, `std.Io.Mutex`, …).
 ```
 
 ### Create Your First Module
@@ -191,7 +232,8 @@ brew install zig          # macOS (or zigup / mlugg/setup-zig in CI)
 const std = @import("std");
 const zigmodu = @import("zigmodu");
 
-const UserModule = struct {
+// `pub` matters: `main.zig` refers to it as `user.UserModule`.
+pub const UserModule = struct {
     pub const info = zigmodu.api.Module{
         .name = "user",
         .description = "User management module",
@@ -220,7 +262,7 @@ const user = @import("modules/user.zig");
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
-    var modules = try zigmodu.scanModules(allocator, .{user});
+    var modules = try zigmodu.scanModules(allocator, .{user.UserModule});
     defer modules.deinit();
 
     try zigmodu.validateModules(&modules);
@@ -232,6 +274,9 @@ pub fn main(init: std.process.Init) !void {
 ```
 
 ### Events & DI (Application built-in)
+
+Fragment — `OrderModule` / `OrderEvent` / `AppConfig` / `auditListener` are
+yours, and `allocator` / `io` come from `std.process.Init`:
 
 ```zig
 // Module opts into framework facilities via initWith(ctx):
@@ -248,6 +293,7 @@ defer b.deinit();
 var app = try b
     .withService(AppConfig, "config", &config)           // borrowed: not destroyed by container
     .build(.{OrderModule});
+defer app.deinit();
 try app.start();                                          // initWith runs → services frozen
 
 const bus = try app.eventBus(OrderEvent);                // ThreadSafeEventBus only
@@ -258,7 +304,12 @@ Full rules and anti-patterns: [docs/EVENTS_DI.md](docs/EVENTS_DI.md) · runnable
 
 ### Quick HTTP Server
 
+Self-contained — it needs only `build.zig` + `build.zig.zon` and this file:
+
 ```zig
+const std = @import("std");
+const zigmodu = @import("zigmodu");
+
 const http = zigmodu.http;
 
 const Server = http.Server;

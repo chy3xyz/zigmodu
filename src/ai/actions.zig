@@ -63,6 +63,7 @@ pub const WriteCtx = struct {
 pub fn registerWriteSkills(registry: *SkillRegistry) !void {
     try registry.register(.{
         .name = "entity.create",
+        .action = .execute,
         .description = "Create a row in a whitelisted entity; only whitelisted columns are writable and the tenant column is forced from context",
         .required_permission = "entity:write",
         .parameters = &.{
@@ -79,6 +80,7 @@ pub fn registerWriteSkills(registry: *SkillRegistry) !void {
     });
     try registry.register(.{
         .name = "entity.update",
+        .action = .execute,
         .description = "Update a row by primary key in a whitelisted entity; only whitelisted columns are writable and the tenant column is forced from context",
         .required_permission = "entity:write",
         .parameters = &.{
@@ -216,6 +218,7 @@ pub const CommandCtx = struct {
 pub fn registerCommandSkills(registry: *SkillRegistry) !void {
     try registry.register(.{
         .name = "command.execute",
+        .action = .execute,
         .description = "Submit an app-registered business command through the transactional outbox; idempotency key comes from the run context",
         .required_permission = "command:execute",
         .parameters = &.{
@@ -298,6 +301,7 @@ pub const ReportCtx = struct {
 pub fn registerReportSkills(registry: *SkillRegistry) !void {
     try registry.register(.{
         .name = "report.generate",
+        .action = .read,
         .description = "Run an app-registered aggregation report and return it as CSV or JSON (row-capped, read-only)",
         .parameters = &.{
             .{ .name = "report", .type = .string, .description = "Registered report name", .required = true },

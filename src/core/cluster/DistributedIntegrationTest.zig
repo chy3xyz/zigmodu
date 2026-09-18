@@ -11,7 +11,6 @@
 
 const std = @import("std");
 const Testing = std.testing;
-const Time = @import("../Time.zig");
 const ClusterMembership = @import("../ClusterMembership.zig").ClusterMembership;
 const DistributedEventBus = @import("../DistributedEventBus.zig").DistributedEventBus;
 const AccrualFailureDetector = @import("./FailureDetector.zig").AccrualFailureDetector;
@@ -174,7 +173,7 @@ test "ClusterMembership with FailureDetector - getNodePhi" {
 test "AccrualFailureDetector - statistics" {
     const allocator = Testing.allocator;
 
-    var fd = AccrualFailureDetector.init(allocator, .{
+    var fd = AccrualFailureDetector.init(allocator, AccrualFailureDetectorConfig{
         .phi_threshold = 8.0,
         .max_samples = 100,
     });
@@ -344,6 +343,7 @@ test "AccrualFailureDetector - normal CDF approximation" {
 test "3-node cluster with RaftElection quorum and event routing" {
     const allocator = Testing.allocator;
     const io = Testing.io;
+    const raft = @import("RaftElection.zig");
 
     // Create 3 event buses (simulating 3 nodes)
     var bus1 = try DistributedEventBus.init(allocator, io, "node-1");
@@ -353,44 +353,64 @@ test "3-node cluster with RaftElection quorum and event routing" {
     var bus3 = try DistributedEventBus.init(allocator, io, "node-3");
     defer bus3.deinit();
 
-    // Verify each bus initialized with correct node ID
+    // Verify each bus initialized with correct node ID, and that a bus that has
+    // no connected peers still counts itself as the whole cluster.
     try Testing.expectEqualStrings("node-1", bus1.nodeId());
     try Testing.expectEqualStrings("node-2", bus2.nodeId());
+    try Testing.expectEqual(@as(usize, 1), bus1.clusterSize());
 
-    // Create RaftElection instances with 3-node cluster
-    var e1 = try @import("RaftElection.zig").RaftElection.init(allocator, "node-1", 3);
+    // Create RaftElection instances with 3-node cluster. The transports are
+    // in-process no-ops: this test asserts topology/quorum arithmetic, not RPC.
+    const RaftFixture = struct {
+        fn sendVote(_: ?[]const u8, _: []const u8, _: raft.VoteRequest) void {}
+        fn sendAppend(_: ?[]const u8, _: []const u8, _: raft.AppendEntriesRequest) raft.AppendEntriesResponse {
+            return .{ .term = 0, .success = false, .match_index = 0 };
+        }
+        const transport: raft.RaftElection.ElectionTransport = &.{
+            .sendVoteRequest = sendVote,
+            .sendAppendEntries = sendAppend,
+        };
+    };
+
+    const peers = [_]raft.Peer{
+        .{ .id = "node-2", .address = "127.0.0.1:19302" },
+        .{ .id = "node-3", .address = "127.0.0.1:19303" },
+    };
+
+    var e1 = try raft.RaftElection.init(allocator, "node-1", @constCast(&peers), .{}, &RaftFixture.transport);
     defer e1.deinit();
-    var e2 = try @import("RaftElection.zig").RaftElection.init(allocator, "node-2", 3);
+    var e2 = try raft.RaftElection.init(allocator, "node-2", &.{}, .{}, &RaftFixture.transport);
     defer e2.deinit();
-    var e3 = try @import("RaftElection.zig").RaftElection.init(allocator, "node-3", 3);
-    defer e3.deinit();
 
-    // Add peers
-    try e1.addPeer("node-2");
-    try e1.addPeer("node-3");
-    try e2.addPeer("node-1");
-    try e2.addPeer("node-3");
-
-    // Verify cluster sizes
+    // The peer list handed to `init` is the cluster topology.
     try Testing.expectEqual(@as(usize, 3), e1.clusterSize());
     try Testing.expectEqual(@as(usize, 2), e1.quorumSize());
+    try Testing.expectEqual(@as(usize, 1), e2.clusterSize());
+    try Testing.expectEqual(@as(usize, 1), e2.quorumSize());
 
     // Verify quorum: need 2 of 3 votes
     try Testing.expect(e1.hasQuorum(2));
     try Testing.expect(!e1.hasQuorum(1));
 
-    // Publish events across buses
-    var received: u32 = 0;
-    try bus2.subscribe("test.topic", struct {
+    // Publishing fans out to the local topic subscribers of the publishing bus.
+    const Counter = struct {
         var count: u32 = 0;
-        fn handler(_: []const u8) void {
+        fn handler(_: DistributedEventBus.NetworkEvent) void {
             count += 1;
         }
-    }.handler);
+    };
+    Counter.count = 0;
+    try bus1.subscribe("test.topic", Counter.handler);
+    defer bus1.unsubscribe("test.topic", Counter.handler);
 
     try bus1.publish("test.topic", "hello from node-1");
-    try bus3.publish("test.topic", "hello from node-3");
-    _ = received;
+    try bus1.publish("test.topic", "hello again from node-1");
+    try Testing.expectEqual(@as(u32, 2), Counter.count);
 
-    try Testing.expectEqual(@as(u64, 3), bus1.clusterSize());
+    // A bus with no connected peers reaches no other node's subscribers.
+    Counter.count = 0;
+    try bus3.subscribe("test.topic", Counter.handler);
+    defer bus3.unsubscribe("test.topic", Counter.handler);
+    try bus2.publish("test.topic", "hello from node-2");
+    try Testing.expectEqual(@as(u32, 0), Counter.count);
 }

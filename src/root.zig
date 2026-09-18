@@ -75,6 +75,10 @@ pub const ContractRegistry = @import("core/ModuleContract.zig").ContractRegistry
 /// Runs architecture assertions over modules, reported by severity.
 pub const ArchitectureTester = @import("core/ArchitectureTester.zig").ArchitectureTester;
 /// Checks modules talk only over allowed channels (prevents erosion).
+///
+/// Positioning: user-facing; the app declares its own interaction rules, so the
+/// framework has nothing to feed it and no in-tree consumer. The framework's own
+/// architecture gate is `zmodu doctor` (a static scan in `tools/`).
 pub const ModuleInteractionVerifier = @import("core/ModuleInteractionVerifier.zig").ModuleInteractionVerifier;
 /// How modules may reach each other: direct dep, event, shared data, API.
 pub const InteractionType = @import("core/ModuleInteractionVerifier.zig").ModuleInteractionVerifier.InteractionType;
@@ -134,6 +138,13 @@ pub const BulkheadRegistry = @import("resilience/Bulkhead.zig").BulkheadRegistry
 /// Retry helpers with backoff for transient failures.
 pub const retry = @import("resilience/Retry.zig");
 /// Adaptive load shedding: refuse work instead of queueing it forever.
+///
+/// Positioning: user-facing resilience primitive; no in-tree consumer. Its
+/// siblings under `resilience/` (`Bulkhead`, `RateLimiter`, `CircuitBreaker`) are
+/// wired into `ModuleRuntime`, but an RT/throughput-driven shedder has no place
+/// there: the L0 actor model already refuses on a full mailbox (`error.Full`), and
+/// the HTTP server's connection-level backpressure is `productionProfile`'s
+/// `max_connections`.
 pub const load_shedder = @import("resilience/LoadShedder.zig");
 
 // ============================================================
@@ -170,6 +181,11 @@ pub const NatsClient = @import("messaging/Nats.zig").NatsClient;
 /// NATS connection settings (URL, credentials, timeouts).
 pub const NatsConfig = @import("messaging/Nats.zig").NatsConfig;
 /// Queue abstraction over in-memory, NATS, Redis and Kafka backends.
+///
+/// Positioning: user-facing; no in-tree consumer — the framework's own messaging
+/// paths are the transactional `outbox` and the typed event buses. Note only the
+/// in-memory and NATS backends are implemented: `Producer.publish` into `redis` /
+/// `kafka` is a no-op arm, so those messages are dropped.
 pub const MessageQueue = @import("messaging/MessageQueue.zig").MessageQueue;
 /// Gossip event bus across nodes; also carries cluster membership.
 pub const DistributedEventBus = @import("core/DistributedEventBus.zig").DistributedEventBus;
@@ -198,11 +214,17 @@ pub const ClusterView = @import("cluster/ClusterView.zig").ClusterView;
 /// One node inside a `ClusterSnapshot`.
 pub const ClusterMember = @import("cluster/ClusterView.zig").Member;
 /// Immutable, refcounted membership snapshot handed out by `ClusterView`.
+///
+/// Positioning: user-facing alias for `ClusterView.Snapshot`; no in-tree consumer
+/// of this *name* — the framework holds the type directly.
 pub const ClusterSnapshot = @import("cluster/ClusterView.zig").Snapshot;
 /// The bridge that feeds `ClusterView` from `ClusterMembership` — use this, not
 /// the membership map, on request paths (`docs/DISTRIBUTED.md`).
 pub const MembershipView = @import("cluster/MembershipView.zig").MembershipView;
 /// One member as the read-side bridge sees it (id, address, healthy).
+///
+/// Positioning: user-facing alias for `MembershipView.Node`; no in-tree consumer
+/// of this *name*.
 pub const ClusterNodeView = @import("cluster/MembershipView.zig").Node;
 /// The membership *write* side — the gossip maintenance loop's own state.
 pub const ClusterMembership = @import("core/ClusterMembership.zig").ClusterMembership;
@@ -271,11 +293,17 @@ pub const datapermission = @import("datapermission/DataPermission.zig");
 // ============================================================
 // 6. EXTENSIONS
 // ============================================================
-/// Loads shared libraries as plugins (.so / .dll / .dylib).
+/// Records plugin names in a registry — **no shared library is loaded**
+/// (`dynamicLoadingSupported()` is `false`; see `docs/UPGRADING.md`).
+///
+/// Positioning: user-facing; no in-tree consumer, kept exported deliberately.
 pub const PluginManager = @import("extensions/PluginManager.zig").PluginManager;
 /// Plugin metadata: name, version, author, exports, dependencies.
 pub const PluginManifest = @import("extensions/PluginManager.zig").PluginManifest;
-/// Watches module files and reloads them without a full restart.
+/// Watches module files and fires a callback — **it does not replace code**.
+///
+/// Positioning: user-facing; no in-tree consumer. Zig links statically, so
+/// `reloadModule` only logs; the app drives its own response (`docs/API.md`).
 pub const HotReloader = @import("extensions/HotReloader.zig").HotReloader;
 /// How a reload treats state: restart, preserve state, gradual migration.
 pub const ReloadStrategy = @import("extensions/HotReloader.zig").ReloadStrategy;
@@ -360,6 +388,9 @@ pub const TomlParser = @import("config/YamlToml.zig").TomlParser;
 // 10. TESTING
 // ============================================================
 /// End-to-end test harness: run an app in-process for one case.
+///
+/// Positioning: user-facing testing helper; no in-tree consumer — the framework's
+/// own tests drive `Application` / `Container` / `EventBus` directly.
 pub const IntegrationTest = @import("test/IntegrationTest.zig").IntegrationTest;
 /// Seeded generator for deterministic test fixtures.
 pub const TestDataGenerator = @import("test/IntegrationTest.zig").TestDataGenerator;

@@ -1,3 +1,13 @@
+//! File-watch hook for module sources.
+//!
+//! **`reloadModule` does not replace code.** Zig links statically, so it logs the
+//! request and returns; the load-bearing part is the `onChange` callback, which
+//! tells the app that a watched file changed and leaves the response (rebuild,
+//! restart, hot-swap via `ModuleSnapshot`) to it.
+//!
+//! Positioning: user-facing primitive; no in-tree consumer. `docs/dev/todo.md`
+//! rates it ⚠️ 有条件 — "仅文件变更检测".
+
 const std = @import("std");
 const Time = @import("../core/Time.zig");
 const Application = @import("../Application.zig").Application;

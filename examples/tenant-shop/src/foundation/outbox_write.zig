@@ -1,5 +1,4 @@
 //! Shared outbox INSERT for use inside a DB transaction.
-const std = @import("std");
 const zigmodu = @import("zigmodu");
 const data = zigmodu.data;
 

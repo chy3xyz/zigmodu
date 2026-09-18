@@ -1,3 +1,12 @@
+//! Module interaction verifier — assert that modules reach each other only over
+//! the channels their interaction model allows (Spring Modulith `verify()` +
+//! ArchUnit shape).
+//!
+//! Positioning: user-facing primitive; no in-tree consumer. The rules come from
+//! the application (`addRule` / `addModuleRule`), so there is nothing for the
+//! framework to wire up; the framework's own architecture gate is `zmodu doctor`
+//! (`tools/zmodu`), a static source scan that needs no runtime verifier.
+
 const std = @import("std");
 const ModuleInfo = @import("Module.zig").ModuleInfo;
 

@@ -103,6 +103,7 @@ pub fn registerBusinessSkills(
 ) !void {
     try registry.register(.{
         .name = "db.query",
+        .action = .read,
         .description = "Run a read-only parameterized SQL SELECT against the business database. Use ? placeholders and pass values in args. Row count is capped.",
         .parameters = &.{
             .{ .name = "sql", .type = .string, .description = "SELECT statement with ? placeholders (no literals, no ;)", .required = true },
@@ -150,6 +151,7 @@ pub fn registerBusinessSkills(
 
     try registry.register(.{
         .name = "entity.lookup",
+        .action = .read,
         .description = "Look up one registered business entity by primary key. Returns null when not found.",
         .parameters = &.{
             .{ .name = "entity", .type = .string, .description = "Entity name from the registered whitelist", .required = true },
@@ -197,6 +199,7 @@ pub fn registerBusinessSkills(
 
     try registry.register(.{
         .name = "entity.list",
+        .action = .read,
         .description = "List registered business entities with optional equality filters. Row count is capped.",
         .parameters = &.{
             .{ .name = "entity", .type = .string, .description = "Entity name from the registered whitelist", .required = true },
