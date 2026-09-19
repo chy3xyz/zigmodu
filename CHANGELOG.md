@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.28.0] - 2026-09-19
 
 > **本版说明**：给 v0.28 定的硬规定是「所有已有 public API 必须保持 source-compatible」，
 > **本版有意偏离一次**，且只此一次 —— `Runtime.cancelTimer(id) bool` 被删除，拆成
