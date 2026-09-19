@@ -309,6 +309,12 @@ metrics.setScrapeHook(@TypeOf(bridge).sample, &bridge);
 `MetricsBridge` 对 `MetricsT` 是鸭子类型（只要求 `createGauge` + `Gauge.set`），所以 runtime 层
 不依赖 observability 层。`bridge` 的生命周期要覆盖进程（别放在会返回的栈帧里）。
 
+**静态的那一半**：上面这些数字都是**运行中**进程的属性，静态 CLI 读不到（也不该假装读到）。
+项目**声明了什么**接线 —— worker 类型与邮箱容量、`Mailbox`/`HotBus` 等原语、定时器调用点、
+recorder/trace 引用、时钟选择 —— 可以用 `zmodu runtime [dir]` 盘出来（只读源码，每条带
+`file:line`；没用 runtime 的项目也退 0）。两者互补：一个答"接线长什么样"，一个答"跑起来怎么样"。
+见 [`ZMODU_CLI_INTEGRATION.md`](ZMODU_CLI_INTEGRATION.md) 的 `zmodu runtime` 一节。
+
 ### 8.1 Worker trace context —— 消息可归属到发起它的那次请求
 
 `messages_dropped` 告诉你"丢了多少"，说不清"**谁的**被丢了"。`sendTraced` 补上这一半：一条消息可以

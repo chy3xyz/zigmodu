@@ -244,6 +244,27 @@ CI 基线随后从真实 runner 补录了这 2 条（`Mailbox full-path x10M` 49
 另记一条实测观察：`RingBuffer SPSC x1M` 是唯一**不随机器缩放**的指标（runner 1.09 ms vs
 本机 10.6 ms，慢机器上反而更快），所以跨这两份基线比较它没有意义。
 
+### 新增：`zmodu runtime` —— 运行时接线的静态盘点（**破坏性：否**）
+
+v0.28 review 的 §二 提过"runtime diagnose/bench"。能做且诚实的只有一半：**读活的运行时状态**
+静态 CLI 做不到（队列深度 / `dropped_full` / `timer_lag_ms` 是运行中进程的属性，已由
+`Runtime.MetricsBridge` 导出成 8 条 Prometheus 指标，抓取配方在 `docs/RUNTIME.md` §8）；
+能做的是把某个项目**已经声明**的 runtime 接线盘出来 —— 新增
+`tools/zmodu/src/runtime.zig`，`zmodu runtime [dir] [--json]`。
+
+报告六块（每条带 `file:line`）：是否用了 runtime、worker（`spawn`/`spawnActor`/`spawnSupervised`
+的**类型名 + 邮箱容量**）、邮箱/队列原语（`Mailbox(`/`RingBuffer(`/`MpscRing(`/`ObjectPool(`/`HotBus(`）、
+定时器调用点、录制/追踪引用、时钟选择，末尾一行汇总（如
+`9 worker(s), 1 bus(es), 1 timer call site(s), recording: no, tracing: no`）。
+
+容量**只在读得出来时**给数字：字面量直接用；`api.order_capacity` 这种顺着该文件自己的
+`@import("api.zig")` 找到 `pub const` 再用；读不出来报 `?` 并附原表达式 —— 不猜。
+遍历是**递归**的（`src/**/*.zig` + 根目录 `*.zig`），不像 `audit` 那样固定两层。
+刻意**不做任何判据**：只报看得见的事实（`attachRecorder(` 在 `src/x.zig:42`），
+不做静态不可靠的推断（"recorder 是否在 `freeze()` 之前挂上"），所以 `--json` 可以进 CI 而不产生假警报。
+退出码 `0`/`1`（目录读不了）/`2`（用法错误）；**项目没用 runtime 也是 0**（报告说 `uses runtime: no`）。
+文档：`docs/ZMODU_CLI_INTEGRATION.md` 新增一节（含"它不做什么"），README Commands 加一行。
+
 ## [0.27.0] - 2026-09-18
 
 ### 修复：`zmodu scaffold` 生成的工程过不了自己的 `zmodu ci`

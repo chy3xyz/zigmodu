@@ -504,6 +504,10 @@ zig build check
 # Formatting gate (src + tools + examples)
 zig fmt --check src tools examples
 
+# Static runtime wiring of a project (workers + mailbox capacities, timer sites;
+# reads source only — live queue depth / dropped_full come from /metrics)
+zig build zmodu && ./zig-out/bin/zmodu runtime examples/alpha-engine
+
 # Integration probes (tenant-mgmt + stress test; needs curl)
 HTTP_PORT=18080 bash scripts/ci-integration.sh
 

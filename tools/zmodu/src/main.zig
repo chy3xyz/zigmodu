@@ -20,6 +20,7 @@ const deadcode = @import("deadcode.zig");
 const audit_mod = @import("audit.zig");
 const graph_mod = @import("module_graph");
 const doctor_mod = @import("doctor.zig");
+const runtime_mod = @import("runtime.zig");
 const ci_mod = @import("ci.zig");
 const saas_mod = @import("saas.zig");
 const market_mod = @import("market.zig");
@@ -51,6 +52,7 @@ const Command = enum {
     saas,
     market,
     deadcode,
+    runtime,
     help,
     version,
 };
@@ -377,6 +379,7 @@ fn runCommand(io: std.Io, allocator: std.mem.Allocator, command: Command, cmd_ar
         .saas => try cmdSaas(io, allocator, cmd_args),
         .market => cmdMarket(io, allocator, cmd_args),
         .deadcode => cmdDeadcode(io, allocator, cmd_args),
+        .runtime => cmdRuntime(io, allocator, cmd_args),
         .help => {
             if (cmd_args.len != 0) {
                 std.log.err("`zmodu help` does not accept arguments (got {d}).", .{cmd_args.len});
@@ -495,6 +498,7 @@ fn parseCommand(cmd: []const u8) ?Command {
     if (std.mem.eql(u8, cmd, "market")) return .market;
     if (std.mem.eql(u8, cmd, "ai")) return .ai;
     if (std.mem.eql(u8, cmd, "deadcode")) return .deadcode;
+    if (std.mem.eql(u8, cmd, "runtime")) return .runtime;
     if (std.mem.eql(u8, cmd, "help")) return .help;
     if (std.mem.eql(u8, cmd, "version")) return .version;
     if (std.mem.eql(u8, cmd, "--help")) return .help;
@@ -536,6 +540,8 @@ fn printUsage() void {
         \\  saas <model.json>  SaaS backend module from a business model (org-scoped)
         \\  market             Curated module catalog: list | search <q> | info <id>
         \\  deadcode          Scan for unused declarations (dead code)
+        \\  runtime [dir]     Static runtime wiring: workers + capacities, primitives,
+        \\                    timer sites, recorder/trace, clock (--json)
         \\  generate <t>   Alias: generate module|event|api|orm [...]
         \\  help            Show help
         \\  version         Show version
@@ -835,6 +841,16 @@ fn cmdCi(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) voi
     if (code != 0) std.process.exit(code);
 }
 
+/// `zmodu runtime [dir] [--json]` — the runtime wiring a project declares, read
+/// statically (worker spawns + mailbox capacities, mailbox/queue primitives,
+/// timer call sites, recorder/trace references, clock selection). It reads
+/// source only: live queue depth / dropped_full / timer_lag_ms live in
+/// `Runtime.MetricsBridge` — scrape `/metrics` (docs/RUNTIME.md §8).
+fn cmdRuntime(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) void {
+    const code = runtime_mod.run(io, allocator, args);
+    if (code != 0) std.process.exit(code);
+}
+
 /// `zmodu saas <model.json> [--out <dir>] [--tenant-column <col>] [--dry-run] [--force]`
 /// — emit an org-scoped schema from a business model and feed it to the
 /// canonical `zmodu orm` pipeline (model/persistence/service/api + routes).
@@ -917,6 +933,7 @@ test "cli submodule coverage gates (saas + market + audit + doctor + verify)" {
     _ = @import("market.zig");
     _ = @import("audit.zig");
     _ = @import("doctor.zig");
+    _ = @import("runtime.zig");
     // Without this, verify.zig's tests are not part of the test graph at all
     // (nothing else in it is referenced from a test) and silently never run.
     _ = @import("verify.zig");

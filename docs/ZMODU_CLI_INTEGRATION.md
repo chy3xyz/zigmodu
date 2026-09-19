@@ -296,6 +296,41 @@ zmodu graph [dir]            # stdout
 zmodu graph --out docs/modules.md   # 写入文件（可进 CI 自动更新架构图）
 ```
 
+## `zmodu runtime` — 运行时接线的静态盘点
+
+Runtime 是 opt-in 的（`docs/RUNTIME.md`）：直到某个模块 `ctx.runtime()` 之前什么都不跑。
+此后"哪个 worker 存在、邮箱多大、谁在 `HotBus` 上扇出、定时器在哪 arm、有没有 recorder"
+散落在各模块自己的文件里。这个子命令把这些**已经声明过**的接线读出来，每条都带 `file:line`：
+
+```bash
+zmodu runtime [dir]        # 人读报告（默认目录 "."）
+zmodu runtime --json       # 机器可读（CI / dashboard）
+```
+
+报告六块：是否用了 runtime、worker（`spawn`/`spawnActor`/`spawnSupervised` 的**类型名 + 邮箱容量**）、
+邮箱/队列原语（`Mailbox(` / `RingBuffer(` / `MpscRing(` / `ObjectPool(` / `HotBus(`）、
+定时器调用点（`after(` / `scheduleAction(` / `requestCancelTimer(` / `cancelTimerSync(`）、
+录制/追踪引用（`attachRecorder(` / `Recorder(` / `sendTraced(` / `sendBlockingTraced(` / `ctx.traceId(`）、
+时钟选择（`Clock.manual` / `.manual =` / `.monotonic`），末尾一行汇总：
+
+```
+summary: 9 worker(s), 1 bus(es), 1 timer call site(s), recording: no, tracing: no
+```
+
+容量只在**读得出来**时才给数字：字面量（`256`、`1_024`）直接用；写成 `api.order_capacity`
+这种常量时，顺着该文件自己的 `@import("api.zig")` 找到 `pub const order_capacity: usize = 256;`
+再用那个数；读不出来就报 `?`（并把原表达式附在后面）——不猜。所以 `alpha-engine` 报的是
+`mailbox 256 (api.mailbox_capacity)`。
+
+**它不做什么**（很重要）：它**不读活进程**。队列深度、`dropped_full`、`timer_lag_ms` 是运行中进程的
+属性，已由 `Runtime.MetricsBridge` 导出成 Prometheus 指标 —— 抓取配方见
+[`RUNTIME.md`](RUNTIME.md) §8。它也**不做任何判据**：只报看得见的事实（"`attachRecorder(` 在
+`src/x.zig:42`"），不做静态不可靠的推断（"recorder 是不是在 `freeze()` 之后挂的"），
+所以 `--json` 可以直接进 CI 而不产生假警报。
+
+退出码：`0` 正常（**项目没用 runtime 也是 0**，那是默认状态，报告会说 `uses runtime: no`）；
+`1` 目标目录读不了；`2` 用法错误（未知 flag / 多个目录参数）。
+
 ## `zmodu diff --migration` — schema 演进闭环
 
 `diff` 现在可以直接产出 Flyway 迁移文件：
