@@ -572,4 +572,118 @@ rec.replay(&manual, &harness, Harness.sink);         // 按 seq 推进 clock，�
 - 不承诺进程级完全确定性：`spawn`/`init` 副作用、网络、墙钟、以及丢弃模式都不重放。
 - 只有**读注入 `Clock`** 的代码参与重放；直接调 `core/Time.zig` 的路径读到真实时间。
 
+## 12. WorkerPool / Scheduler —— 设计草案（未实现）
+
+> 状态：**只有设计，没有代码**。这是 v0.29 的 P0，也是当前最大的架构缺口。先定契约，因为
+> 这一刀切下去要动的是 Runtime 的命根子（state ownership），不是加一个原语。
+
+### 12.1 问题：一 worker = 一线程
+
+`spawn` 现在是 `allocator.create(Handle)` + `std.Thread.spawn(workerMain(W, capacity), handle)`
+（`runtime.zig`）。所以：
+
+```
+100 个 symbol → 100 个 orderbook worker → 100 个 OS 线程
+```
+
+线程不是免费的：每个约 8MB 栈的虚拟地址空间、调度器里的实体、上下文切换成本。**"worker 数"
+一旦从"模块数"变成"数据维数"，这个模型就到顶了。** 量化、游戏房间、WebSocket 连接、
+IoT 设备、AI 会话都是这种形态。
+
+但**不能简单换成 ThreadPool**：`state: W` 现在住在 `*Handle` 里、由它自己的线程独占；
+随便丢给任意池线程执行，`handle` 里的裸字段访问立刻变成数据竞争（这正是 §1 那条
+"一个线程拥有的状态"要挡的东西）。
+
+### 12.2 两种执行模式，而不是替换
+
+```
+Runtime
+ ├── Dedicated   Worker → 自己的 OS 线程        （现状，默认，低延迟链用它）
+ └── Scheduled   Worker → 池线程执行 + 就绪队列   （新增，长尾用它）
+```
+
+`spawn` 保持现状语义（= Dedicated），新增 `spawnPooled`（或 `spawn(..., .mode = .pooled)`，
+API 形状见 §12.8）。**默认不变**，所以既有应用零影响。
+
+### 12.3 必须守住的不变量
+
+池化**不能**松掉任何一条，否则这个改动就白做：
+
+1. **状态独占**：任一时刻只有一个线程在执行某个 worker 的 `handle`/状态。**从"按线程身份独占"
+   变成"按排他声明独占"**（见 §12.4 的 `claimed`）——这是本设计的核心，也是唯一一处
+   需要重新论证的语义。
+2. **每 worker FIFO**：同一 worker 的消息顺序不变（`Mailbox` 不变，仍是有界的）。
+3. **池线程绝不阻塞**：调度线程上跑的代码不允许 `recv(0)` 阻塞、不允许 sleep、不允许等锁。
+4. **热路径零分配**：就绪队列是定容 `MpscRing`；派发与认领零分配。由 §13 那份分配契约守。
+5. **Wheel 仍是 ticker-only**：§4 的 owner 契约不受影响；定时器投递照旧走 `handle.send`。
+
+### 12.4 机制
+
+```
+发消息方                     调度线程（N 条）
+  send(msg)                    loop:
+    ├─ mailbox.send(msg)          ├─ ready.pop()  → handle
+    └─ ready.push(handle)          ├─ claimed.testAndSet(handle) → 抢不到就跳过
+        （同一 worker 只推一次）     ├─ drain 该 mailbox（tryRecv，一轮若干条）
+                                    │    └─ W.handle(state, msg, ctx)
+                                    └─ 清 claimed；mailbox 还非空就再 push
+```
+
+三点关键：
+
+- **就绪信号从"有没有线程停在 `recv`"改成"`ready` 环里有没有它"**。这是 `Mailbox` 的语义
+  分叉点：Dedicated 模式下 `send` 靠条件变量唤醒自己那个线程；Scheduled 模式下 `send`
+  只负责把 handle 推上 ready 环。**`Handle.send*` 的签名与背压语义（满 = `error.Full`）不变。**
+- **`claimed` 是排他声明**（`std.atomic.Value(bool)`）：保证同一 worker 不会被两条池线程
+  同时执行。它替代了"只有我的线程能碰我"，是 §12.3 第 1 条的落地形式。
+- **一轮 drain 多条**（而不是一条一派发）是为了摊掉 ready 环的往返；具体批量是待调参数（§12.8）。
+
+### 12.5 边界：有的 worker **不能**池化
+
+这是本设计最需要写清的一条，否则会有隐蔽的错用：
+
+| worker 形态 | 能否池化 | 原因 |
+|---|---|---|
+| `pub const Message` + `handle`（消息驱动） | ✅ | 循环是运行时的，改为"被派发时 drain 一轮"即可 |
+| `run(self, ctx)`（自带循环） | ❌ **只能 Dedicated** | 它自己 `while (!ctx.stopped())` 占着线程；池化等于让一条池线程被它独占，池就废了 |
+
+所以池化不是"给所有 worker 换个执行器"，而是**先声明哪些 worker 是消息驱动的**。
+`spawnPooled` 对 `run` 型 worker **应当编译期报错**（`@compileError`），而不是运行期悄悄退化成独占。
+
+**延迟代价要如实说**：Dedicated 是"发送方直接写进对方邮箱、对方线程立刻醒"；Scheduled 多一跳
+（发送方 → ready 环 → 调度线程 → `handle`）。对 `行情 → 订单簿 → 风控 → 执行` 这种链，
+**每一跳都会进关键路径**，所以那条链该继续用 Dedicated；池化是给长尾（metrics / audit /
+通知 / AI 会话）省线程。这也是 §12.2 保留两种模式、而不是只留池化的原因。
+
+### 12.6 与现有件的关系
+
+- **`Mailbox` 不改语义**（仍是有界、`error.Full`、`sendBlocking`），只多一个"被谁唤醒"的分叉。
+- **`Wheel` 不变**：`after` 的投递末端是 `handle.send`，它照 §12.4 决定推不推 ready。
+- **`Recorder`**：`Record` 覆盖的是 `HotBus.publish`，与池化正交；若将来扩到 `send`，
+  记录点仍在 `Handle.send*`，不受调度模式影响。
+- **`RuntimeStats`**：`workers` / `running` 语义不变（"已 spawn" 与 "正在执行"），
+  池化后 `running` 的上界从"worker 数"变成"池线程数"——这本身是个有用的观测信号。
+- **`shutdown()`**：§3 的顺序（先停 ticker → 停 worker → join → destroy → drain）要扩展一步：
+  先停调度线程（它们可能正握着某个 worker 的 `claimed`），确认所有权都归还后再 destroy。
+
+### 12.7 明确不做（本设计范围内）
+
+- **不做 MPMC / 新的队列原语** —— `MpscRing` 够用（多生产者推 ready、多调度线程消费）。
+- **不做 CPU affinity / NUMA / 优先级**（评估 §14 也建议往后放）：它们属于**执行策略层**，
+  应在 Dedicated/Pooled 稳定之后再谈，否则会同时改两个变量。
+- **不做 μs 级 timer**：那是独立的 `LowLatencyClock/Timer`（评估 §7 的建议），与调度器正交。
+- **不做 remote worker**（评估 §15）：本地 Runtime 稳定之前不谈。
+
+### 12.8 待定（定完再动手）
+
+1. **API 形状**：`spawnPooled(W, state, cap)` 独立入口，还是 `spawn(..., .{ .mode = .pooled })`？
+   （倾向后者：一处入口、`mode` 是显式声明，但会让 `spawn` 的第三参从 comptime 容量变成配置结构。）
+2. **池的规模与归属**：`Runtime` 起一条池还是多条？池线程数默认取什么（`cpu_count`？可配？）。
+   倾向：`Runtime.init` 时声明，默认 **不创建**（不碰 runtime 的应用仍然零线程）。
+3. **一轮 drain 的批量**：1 条 = 最低延迟、最贵；整箱 = 最高吞吐、最坏公平性。需要实测再定，
+   并且**应做成可配**，因为量化链和通知 worker 的诉求正相反。
+4. **公平性**：ready 环上同一 worker 反复被推时，如何避免饿死别的 worker（要不要 per-worker 计数）？
+5. **`claimed` 的归还时机**：`handle` 返回后立刻归还（公平），还是 drain 完整箱再归还（省往返）？
+
+
 
