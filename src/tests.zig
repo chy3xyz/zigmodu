@@ -146,6 +146,8 @@ test "compile all source files" {
 
     // Runtime (v0.16): ring/mailbox/timer/pool/worker primitives
     _ = @import("runtime.zig");
+    // Scheduler: the pooled execution mode of `Runtime.spawn` (docs/RUNTIME.md §12)
+    _ = @import("runtime/scheduler.zig");
     // Allocation contract for the L0 hot paths (docs/RUNTIME.md §4–§6)
     _ = @import("runtime/alloc_contract_test.zig");
 

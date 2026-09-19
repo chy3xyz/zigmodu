@@ -4,6 +4,8 @@
 //! const runtime = @import("zigmodu").runtime;   // the namespace: RingBuffer, Clock, HotBus, Runtime…
 //! const rt = try app.runtime();                 // first call creates and starts it
 //! const worker = try rt.spawn(MyWorker, .{}, 256); // 256 = mailbox capacity (comptime)
+//! // The long tail can share one pool thread instead (§12):
+//! const audit = try rt.spawn(AuditWorker, .{}, .{ .capacity = 64, .mode = .pooled });
 //! ```
 //!
 //! Everything here is **additive**: the module API, DI, `Application.eventBus`,
@@ -30,6 +32,8 @@ pub const sequencer = @import("runtime/sequencer.zig");
 pub const hot_bus = @import("runtime/hot_bus.zig");
 /// Recorder module: bounded delivery log + replay against a manual clock.
 pub const recorder = @import("runtime/recorder.zig");
+/// Scheduler module: the pool behind `.mode = .pooled` (docs/RUNTIME.md §12).
+pub const scheduler = @import("runtime/scheduler.zig");
 /// Runtime implementation: `Runtime`, the worker contract, stats, supervision.
 pub const runtime_impl = @import("runtime/runtime.zig");
 
@@ -54,6 +58,12 @@ pub const HotBus = hot_bus.HotBus;
 pub const Recorder = recorder.Recorder;
 /// Worker failure policy (`restart` / `stop` + windowed error budget).
 pub const Supervision = runtime_impl.Supervision;
+/// Who runs a worker's `handle`: its own thread (`.dedicated`) or the pool.
+pub const SpawnMode = runtime_impl.SpawnMode;
+/// `spawn`'s last argument, in either shape: `256` or `.{ .capacity = 256, .mode = .pooled }`.
+pub const SpawnConfig = runtime_impl.SpawnConfig;
+/// How a pool is declared: `Runtime.initWithOptions(.{ .scheduler = ... })`.
+pub const SchedulerConfig = runtime_impl.SchedulerConfig;
 /// Trace id a worker message can carry (`sendTraced` → `ctx.traceId()`).
 pub const TraceId = runtime_impl.TraceId;
 

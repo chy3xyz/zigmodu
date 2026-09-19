@@ -138,6 +138,12 @@ jobs:
       - name: Tenant-scope compile gate
         run: bash scripts/check-tenant-scope.sh
 
+      - name: Worker-pool compile gate
+        # `.mode = .pooled` on a `run`-owned worker must not build (its loop would
+        # occupy a pool thread for as long as it runs). Same shape as the gate
+        # above: fixtures that must fail/succeed, asserted by compiling them.
+        run: bash scripts/check-pool-guard.sh
+
       - name: Build framework examples
         # Keep this list identical to the `Build all examples` step of the
         # `examples` job below — the two drifted once (zent-modulith was built

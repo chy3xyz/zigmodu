@@ -81,10 +81,74 @@ const wheel_mod = @import("timer_wheel.zig");
 const clock_mod = @import("clock.zig");
 const ring_mod = @import("ring.zig");
 const sequencer_mod = @import("sequencer.zig");
+const scheduler_mod = @import("scheduler.zig");
 
 pub const Clock = clock_mod.Clock;
 pub const Wheel = wheel_mod.Wheel;
 pub const Mailbox = mbox.Mailbox;
+/// The pool behind `.mode = .pooled` (docs/RUNTIME.md §12).
+pub const Scheduler = scheduler_mod.Scheduler;
+/// How the pool is declared: `Runtime.InitOptions.scheduler`.
+pub const SchedulerConfig = scheduler_mod.SchedulerConfig;
+
+/// Who runs a worker's `handle`.
+pub const SpawnMode = enum {
+    /// Its own OS thread. The default, and the v0.16 behaviour: a message wakes
+    /// the worker's thread directly. Latency chains stay here.
+    dedicated,
+    /// A thread from the runtime's pool (docs/RUNTIME.md §12). The worker keeps
+    /// its own mailbox and contract; what changes is who guarantees §12.3's state
+    /// exclusivity — an explicit claim instead of thread identity.
+    pooled,
+};
+
+/// `spawn`'s last argument, in either of the two shapes `spawnConfig` accepts.
+pub const SpawnConfig = struct {
+    /// Mailbox capacity in messages. Comptime, because the mailbox is a
+    /// fixed-capacity ring.
+    capacity: usize,
+    mode: SpawnMode = .dedicated,
+};
+
+/// Normalise `spawn`'s last parameter, so the two call shapes are one entry
+/// point (§12.8 D1) and one implementation:
+///
+/// ```zig
+/// const a = try rt.spawn(Book, .{}, 256);                                  // v0.16 form
+/// const b = try rt.spawn(Audit, .{}, .{ .capacity = 64, .mode = .pooled }); // + pool
+/// ```
+///
+/// The positional capacity is kept for the ~30 call sites that already have it —
+/// the mode is additive, so upgrading is a choice rather than a migration.
+pub fn spawnConfig(comptime arg: anytype) SpawnConfig {
+    const T = @TypeOf(arg);
+    switch (@typeInfo(T)) {
+        .int, .comptime_int => return .{ .capacity = arg },
+        .@"struct" => {
+            if (!@hasField(T, "capacity")) @compileError(
+                "spawn's last parameter is a mailbox capacity (`256`) or a `SpawnConfig` " ++
+                    "(`.{ .capacity = 256, .mode = .pooled }`); " ++ @typeName(T) ++ " has no `capacity` field",
+            );
+            var config: SpawnConfig = .{ .capacity = @field(arg, "capacity") };
+            if (@hasField(T, "mode")) config.mode = @field(arg, "mode");
+            return config;
+        },
+        else => @compileError(
+            "spawn's last parameter is a mailbox capacity (`256`) or a `SpawnConfig`, not " ++ @typeName(T),
+        ),
+    }
+}
+
+/// Whether `W` may be pooled (§12.5).
+///
+/// A message-driven worker is driven by the runtime one message at a time, so a
+/// pool thread can run a bounded batch and hand it back. A `run`-owned worker
+/// has a loop of its own: pooling it would occupy a pool thread for as long as
+/// it runs, which is the one thing the pool cannot survive — `spawn` turns this
+/// into a `@compileError` rather than a worker that quietly monopolises the pool.
+pub fn poolable(comptime W: type) bool {
+    return @hasDecl(W, "Message") and @hasDecl(W, "handle");
+}
 
 /// The id a traced message carries: `{ high: u64, low: u64 }` — a 16-byte value
 /// type with no allocation, which is what lets it ride in a mailbox slot.
@@ -238,13 +302,34 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         window_start_ms: i64 = 0,
         stopped_by_supervisor: bool = false,
         joined: bool = false,
+        /// Set for `.pooled` workers only: the scheduler that runs this worker,
+        /// plus the bits it shares with it (`claimed`/`queued`). Null for a
+        /// dedicated worker, whose readiness the mailbox's own condition
+        /// variable carries — `announceReady` is then one predictable branch and
+        /// the ready ring sees nothing at all (docs/RUNTIME.md §12.4).
+        pool: ?scheduler_mod.Ready = null,
+        /// `.pooled` only: true while a pool thread is executing this worker.
+        /// This is §12.3's state exclusivity — an exclusive declaration instead
+        /// of thread identity (D4). Never set on a dedicated worker.
+        claimed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        /// `.pooled` only: true while a token for this worker is in the ready
+        /// ring. "At most one token per worker" is what bounds the ring's
+        /// occupancy, and therefore what makes a push infallible (D4).
+        queued: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        /// `.pooled` only: set when the worker's lifecycle started on the pool
+        /// thread (`init` ran, or was attempted). A pooled worker has no thread
+        /// that starts at `spawn`, so this is what the destroy path reads to
+        /// decide whether a `deinit` is owed.
+        started: bool = false,
 
         pub fn send(self: *Self, message: Message) mbox.SendError!void {
-            return self.mailbox.send(.{ .message = message });
+            try self.mailbox.send(.{ .message = message });
+            self.announceReady();
         }
 
         pub fn sendBlocking(self: *Self, message: Message, timeout_ms: u32) mbox.SendError!void {
-            return self.mailbox.sendBlocking(.{ .message = message }, timeout_ms);
+            try self.mailbox.sendBlocking(.{ .message = message }, timeout_ms);
+            self.announceReady();
         }
 
         /// `send`, with the trace id of the work that produced the message
@@ -252,7 +337,8 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         /// handles *this* message: the value travels in the mailbox slot, so two
         /// producers sending different traces cannot overwrite each other's.
         pub fn sendTraced(self: *Self, message: Message, trace: TraceId) mbox.SendError!void {
-            return self.mailbox.send(.{ .trace = trace, .message = message });
+            try self.mailbox.send(.{ .trace = trace, .message = message });
+            self.announceReady();
         }
 
         /// `sendBlocking`, with a trace attached — for the producer that would
@@ -260,7 +346,19 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         /// the trace hurts most: the messages that arrive late are the ones you
         /// want to attribute.
         pub fn sendBlockingTraced(self: *Self, message: Message, trace: TraceId, timeout_ms: u32) mbox.SendError!void {
-            return self.mailbox.sendBlocking(.{ .trace = trace, .message = message }, timeout_ms);
+            try self.mailbox.sendBlocking(.{ .trace = trace, .message = message }, timeout_ms);
+            self.announceReady();
+        }
+
+        /// Producer side of the pooled hand-off, and the *only* difference
+        /// between a dedicated `send` and a pooled one: a dedicated worker's
+        /// readiness is its thread parked in `recv`, a pooled worker's is a token
+        /// in the ready ring. Signature and backpressure are unchanged — a full
+        /// mailbox still comes back as `error.Full` from `send`, before this
+        /// line, and nothing here allocates (§4's zero-allocation contract).
+        fn announceReady(self: *Self) void {
+            const item = self.pool orelse return; // `.dedicated`: the mailbox signal is the whole story
+            scheduler_mod.announce(item);
         }
 
         /// Ask the worker to finish: its mailbox stops accepting and a blocked
@@ -333,7 +431,15 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
             const ms = self.mailbox.stats();
             return .{
                 .name = self.context.name,
-                .running = self.thread != null and !self.joined,
+                // `running` means "this worker is being executed right now":
+                // for a dedicated worker that is its thread having started (and
+                // not yet joined), for a pooled one it is the claim — which is
+                // also why the pooled total can never exceed the number of pool
+                // threads (docs/RUNTIME.md §12.9).
+                .running = if (self.pool != null)
+                    self.claimed.load(.acquire)
+                else
+                    self.thread != null and !self.joined,
                 .mailbox_capacity = capacity,
                 .mailbox_len = ms.len,
                 .sent = ms.sent,
@@ -350,12 +456,44 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
             if (self.thread) |t| {
                 t.join();
                 self.thread = null;
+            } else if (self.pool) |link| {
+                // A pooled worker has no thread of its own, so "joined" has to
+                // mean both halves of "there is nothing left to run for it": no
+                // pool thread is executing it, and no message is still waiting in
+                // its mailbox. The second half is what a dedicated `join` gets for
+                // free (the loop only returns once its mailbox is drained), and
+                // without it `join` would report a worker finished while a whole
+                // batch of its messages is still queued — the claim is released
+                // between batches (D5).
+                //
+                // The `stopping` escape hatch is not an optimisation: `Runtime
+                // .shutdown` stops the pool *first* (§12.6), so a worker can
+                // legitimately still hold messages at that point, and there is
+                // nobody left to drain them. Waiting for the mailbox there would
+                // hang the shutdown.
+                while (self.claimed.load(.acquire) or
+                    (self.mailbox.len() != 0 and !link.scheduler.stopping.load(.acquire)))
+                {
+                    // Spins rather than parking: this is a startup/shutdown-path
+                    // call, and a condition variable here would put a signal on
+                    // the hand-back's hot path for nobody.
+                    std.atomic.spinLoopHint();
+                }
             }
             self.joined = true;
         }
 
         fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             self.join();
+            // A pooled worker has no thread that ends its lifecycle, so its
+            // `deinit` hook runs here: after the pool has been stopped and after
+            // the claim was handed back (`Runtime.shutdown` fixes that order),
+            // i.e. at the only moment `state` is provably unowned. `started`
+            // keeps "deinit only what was initialised" true — a pooled worker
+            // that never received a message never ran `init`, and gets no
+            // `deinit`. A failed `init` still gets one, exactly as in
+            // `workerMain`.
+            if (self.pool != null and self.started and @hasDecl(W, "deinit")) W.deinit(&self.state);
             allocator.destroy(self);
         }
     };
@@ -463,6 +601,11 @@ pub const Runtime = struct {
     /// configuration), read by `stats()` — hence an atomic.
     timers_discarded: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     timer_lag_max_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    /// The pool behind `.mode = .pooled`, present only when it was declared at
+    /// construction (`Runtime.initWithOptions`). Null — the default — means this
+    /// runtime runs no pool thread at all and `.pooled` is a configuration error
+    /// (docs/RUNTIME.md §12.8 D2).
+    scheduler: ?*Scheduler = null,
 
     const Entry = struct {
         ptr: *anyopaque,
@@ -471,6 +614,10 @@ pub const Runtime = struct {
         join: *const fn (*anyopaque) void,
         destroy: *const fn (*anyopaque, std.mem.Allocator) void,
         stats: *const fn (*anyopaque) WorkerStats,
+        /// Whether a pool thread still holds this worker's claim. Read once, at
+        /// shutdown, between joining the pool and destroying the worker — the
+        /// check §12.6 asks for ("confirm every ownership was handed back").
+        claimed: *const fn (*anyopaque) bool,
     };
 
     /// How often the ticker wakes to fire timers. One level-0 spoke is 10 ms;
@@ -480,6 +627,16 @@ pub const Runtime = struct {
     /// `[delay_ms, delay_ms + enqueue latency + tick_interval_ms]` — see
     /// `docs/RUNTIME.md` §3.
     pub const tick_interval_ms: u32 = 5;
+
+    /// How a runtime is constructed when it needs more than "a clock".
+    pub const InitOptions = struct {
+        clock: Clock = .monotonic,
+        /// Declare the pool (docs/RUNTIME.md §12.8 D2). Left at its default the
+        /// runtime owns no pool at all: no ring, no thread, and `.mode = .pooled`
+        /// is a configuration error at `spawn` rather than a thread appearing
+        /// behind the caller's back.
+        scheduler: SchedulerConfig = .{},
+    };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, clock: Clock) Self {
         return .{
@@ -494,10 +651,31 @@ pub const Runtime = struct {
         };
     }
 
+    /// `init` plus the pool declaration. Fallible because a declared pool
+    /// allocates its ready ring here, sized from the declared bound — see the
+    /// capacity invariant in `scheduler.zig` (that sizing is what makes a token
+    /// push infallible, so it cannot be deferred to a constant).
+    pub fn initWithOptions(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        options: InitOptions,
+    ) !Self {
+        var self = init(allocator, io, options.clock);
+        if (options.scheduler.max_pooled_workers != 0) {
+            self.scheduler = try Scheduler.init(allocator, io, options.scheduler);
+        }
+        return self;
+    }
+
     pub fn deinit(self: *Self) void {
         self.shutdown();
         self.wheel.deinit();
         self.workers.deinit(self.allocator);
+        // Last: `shutdown` stops the pool thread, but tokens that arrived while
+        // it was winding down are still in the ring, and nothing reads them
+        // again — the pool is the ring's only consumer.
+        if (self.scheduler) |sched| sched.deinit();
+        self.scheduler = null;
         self.* = undefined;
     }
 
@@ -508,12 +686,17 @@ pub const Runtime = struct {
     /// The wheel's clock is *not* touched here: `start()` runs on the caller's
     /// thread, which is not the wheel's owner. The ticker aligns it when it
     /// takes the wheel (see `tickerMain`).
+    ///
+    /// The pool thread is *not* started here either: it appears with the first
+    /// pooled `spawn`, so a runtime that declares a pool and never uses it still
+    /// starts no thread (D2).
     pub fn start(self: *Self) !void {
         if (self.ticker_running.swap(true, .acquire)) return; // already started
         self.ticker = try std.Thread.spawn(.{}, tickerMain, .{self});
     }
 
-    /// Stop the ticker, then every worker (request + join + destroy). Idempotent.
+    /// Stop the ticker, then the pool, then every worker (request + join +
+    /// destroy). Idempotent.
     ///
     /// **The ticker goes first, and the order is load-bearing.** A timer's
     /// payload delivers into the `*Handle` that armed it (`Handle.after`'s
@@ -528,6 +711,12 @@ pub const Runtime = struct {
     /// posted to a handle the next lines are about to free. After `alive = false`
     /// a timer's message has no live owner anyway, so dropping is the honest
     /// answer — and it is counted (`RuntimeStats.timers_discarded`).
+    ///
+    /// **The pool goes second** (§12.6, §12.9): a pool thread can be inside a
+    /// worker's `handle` right now, holding that worker's `claimed`. Destroying
+    /// workers first would free a `*Handle` a pool thread is still running. The
+    /// join is what makes "every claim is handed back" true, and the assertion
+    /// after it is what keeps the claim from becoming a comment nobody checks.
     pub fn shutdown(self: *Self) void {
         self.alive.store(false, .release);
 
@@ -541,6 +730,24 @@ pub const Runtime = struct {
             if (self.ticker) |t| {
                 t.join();
                 self.ticker = null;
+            }
+        }
+
+        // Then the pool: it can be running a worker whose handle the lines below
+        // are about to free. `Scheduler.shutdown` waits for the batch in flight
+        // to finish (a worker that never returns still blocks shutdown — §4's
+        // rule, kept).
+        if (self.scheduler) |sched| {
+            sched.shutdown();
+            for (self.workers.items) |entry| {
+                // A pooled worker has no thread, so `join` cannot have waited for
+                // anything; the claim is the only thing that says "a pool thread
+                // still owns this state". It must be false here, and if it ever
+                // is not, the next lines would free memory a live thread is
+                // running. Debug/ReleaseSafe turn it into a call-site panic;
+                // ReleaseFast keeps the destruction as-is (the same trade the
+                // wheel's owner assertions make).
+                std.debug.assert(!entry.claimed(entry.ptr));
             }
         }
 
@@ -563,15 +770,22 @@ pub const Runtime = struct {
         self.wakeTimerWaiters();
     }
 
-    /// Spawn `W` with `capacity` mailbox slots. `init` is the worker's initial
-    /// state, moved onto the heap (the thread must not see a stack copy).
+    /// Spawn `W` with a mailbox capacity of `capacity` slots and `.mode =
+    /// .dedicated`. `initial_state` is moved onto the heap (a worker's thread
+    /// must never see a stack copy).
+    ///
+    /// The last parameter also accepts a `SpawnConfig`, which is the pooled form:
+    ///
+    /// ```zig
+    /// const handle = try rt.spawn(AuditWorker, .{}, .{ .capacity = 64, .mode = .pooled });
+    /// ```
     pub fn spawn(
         self: *Self,
         comptime W: type,
         initial_state: W,
-        comptime capacity: usize,
-    ) !*Handle(W, capacity) {
-        return self.spawnSupervised(W, initial_state, capacity, .{});
+        comptime config: anytype,
+    ) !*Handle(W, spawnConfig(config).capacity) {
+        return self.spawnSupervised(W, initial_state, config, .{});
     }
 
     /// Spawn an **actor**: same contract as a worker, but the runtime supervises
@@ -582,19 +796,43 @@ pub const Runtime = struct {
         self: *Self,
         comptime W: type,
         initial_state: W,
-        comptime capacity: usize,
+        comptime config: anytype,
         supervision: Supervision,
-    ) !*Handle(W, capacity) {
-        return self.spawnSupervised(W, initial_state, capacity, supervision);
+    ) !*Handle(W, spawnConfig(config).capacity) {
+        return self.spawnSupervised(W, initial_state, config, supervision);
     }
 
     pub fn spawnSupervised(
         self: *Self,
         comptime W: type,
         initial_state: W,
-        comptime capacity: usize,
+        comptime config: anytype,
         supervision: Supervision,
-    ) !*Handle(W, capacity) {
+    ) !*Handle(W, spawnConfig(config).capacity) {
+        const spawn_config = comptime spawnConfig(config);
+        const capacity = comptime spawn_config.capacity;
+        const pooled = comptime spawn_config.mode == .pooled;
+        // `comptime (...)`, not `pooled and …`: a `@compileError` branch is
+        // analysed unless the *condition* is a comptime expression — a plain
+        // `if` over a comptime-known bool still reports the error (measured).
+        if (comptime (pooled and !poolable(W))) @compileError(
+            @typeName(W) ++ " cannot be pooled: it declares `run`, which owns a loop of its own — " ++
+                "a pool thread running it would be occupied for as long as it runs (docs/RUNTIME.md §12.5). " ++
+                "Declare `pub const Message` + `pub fn handle` to pool a worker, or leave it `.dedicated`.",
+        );
+
+        // A pool has to have been declared; `.pooled` without one is a
+        // configuration mistake, not something to paper over by starting a
+        // thread (D2).
+        var sched: ?*Scheduler = null;
+        if (pooled) sched = self.scheduler orelse return error.PoolNotConfigured;
+        // ...and the declaration is a hard bound, not a hint: the ready ring's
+        // capacity is derived from it, so admitting one worker more than it says
+        // would make a token push fail — which strands a worker (see the
+        // capacity invariant in `scheduler.zig`).
+        if (sched) |s| try s.reserve();
+        errdefer if (sched) |s| s.release();
+
         const H = Handle(W, capacity);
         const handle = try self.allocator.create(H);
         errdefer self.allocator.destroy(handle);
@@ -614,6 +852,19 @@ pub const Runtime = struct {
             .name = @typeName(W),
             .handle = handle,
         };
+        if (comptime pooled) {
+            // Comptime-gated: a dedicated instantiation does not even analyse
+            // this, which is what lets `pooledDispatch` assume `W.handle` exists
+            // while `spawnSupervised` still serves `run`-owned workers.
+            if (sched) |s| handle.pool = .{
+                .scheduler = s,
+                .ctx = @ptrCast(handle),
+                .claimed = &handle.claimed,
+                .queued = &handle.queued,
+                .dispatch = pooledDispatch(W, H),
+                .pending = pooledPending(H),
+            };
+        }
 
         try self.workers.append(self.allocator, .{
             .ptr = @ptrCast(handle),
@@ -642,13 +893,27 @@ pub const Runtime = struct {
                     return h.stats();
                 }
             }.f,
+            .claimed = struct {
+                fn f(p: *anyopaque) bool {
+                    const h: *H = @ptrCast(@alignCast(p));
+                    return h.claimed.load(.acquire);
+                }
+            }.f,
         });
+        // From here the spawn owns a slot, an entry and a handle; every failure
+        // path below gives all three back. (Keeping the cleanup in `errdefer`
+        // rather than in each `catch` is what makes them run exactly once: a
+        // `catch` that frees the handle *and* returns an error would free it
+        // again here.)
+        errdefer _ = self.workers.pop();
 
-        handle.thread = std.Thread.spawn(.{}, workerMain(W, capacity), .{handle}) catch |err| {
-            _ = self.workers.pop();
-            self.allocator.destroy(handle);
-            return err;
-        };
+        if (sched) |s| {
+            // Materialise the pool thread on first use (D2: declaring a pool you
+            // never use costs no thread).
+            try s.start();
+        } else {
+            handle.thread = try std.Thread.spawn(.{}, workerMain(W, capacity), .{handle});
+        }
         return handle;
     }
 
@@ -773,6 +1038,20 @@ pub const Runtime = struct {
             .timers_discarded = self.timers_discarded.load(.monotonic),
             .timer_lag_max_ms = self.timer_lag_max_ms.load(.monotonic),
         };
+    }
+
+    /// The pool's own counters: ring depth and high-water, claim misses, refused
+    /// pushes, idle polls. Null when this runtime has no pool.
+    ///
+    /// `RuntimeStats` answers "how are the workers doing"; this answers "is the
+    /// scheduler keeping up" — and one number in it is a contract rather than a
+    /// metric: `ready_push_failures` must stay `0`. A refused token push does not
+    /// lose a message, it loses a *worker* (see the capacity invariant in
+    /// `scheduler.zig`), so a non-zero value here is a bug to fix, not a
+    /// backpressure reading to tune.
+    pub fn poolStats(self: *Self) ?Scheduler.Stats {
+        const sched = self.scheduler orelse return null;
+        return sched.stats();
     }
 
     /// Publishes `RuntimeStats` into a metrics registry, sampled once per scrape.
@@ -1054,21 +1333,7 @@ fn workerMain(comptime W: type, comptime capacity: usize) fn (*Handle(W, capacit
             // answer (0 = not this worker) even while `init` runs.
             handle.context.owner.store(std.Thread.getCurrentId(), .release);
 
-            // Optional init. A failure here is fatal for the worker (there is no
-            // half-started state to supervise), but it still counts and stops.
-            if (@hasDecl(W, "init")) {
-                W.init(&handle.state, &handle.context) catch |err| {
-                    var tag_buf: [trace_tag_len]u8 = undefined;
-                    // No message is being handled yet, so the tag is always empty
-                    // here — carried anyway so every runtime error line has the
-                    // same shape and the same grep.
-                    std.log.err("[runtime] {s}.init failed{s}: {s}", .{
-                        @typeName(W), traceTag(handle.context.traceId(), &tag_buf), @errorName(err),
-                    });
-                    _ = handle.handler_errors.fetchAdd(1, .monotonic);
-                    handle.stop();
-                };
-            }
+            startWorker(W, H, handle);
 
             if (@hasDecl(W, "Message") and @hasDecl(W, "handle")) {
                 // Message-driven: the runtime owns the receive loop.
@@ -1078,20 +1343,12 @@ fn workerMain(comptime W: type, comptime capacity: usize) fn (*Handle(W, capacit
                         if (handle.mailbox.isClosed()) break;
                         continue;
                     };
-                    // Per *message*, not per worker: the trace is published for
-                    // exactly as long as this message's `handle` runs, so a handler
-                    // can neither see a previous message's trace nor leak this one
-                    // into whatever it schedules afterwards.
-                    handle.context.current_trace = envelope.trace;
-                    defer handle.context.current_trace = null;
-                    W.handle(&handle.state, envelope.message, &handle.context) catch |err| {
-                        if (supervise(H, handle, err)) break;
-                    };
+                    if (!deliver(W, H, handle, envelope)) break;
                 }
             } else if (@hasDecl(W, "run")) {
                 // Loop-owned: the worker decides when to finish.
                 W.run(&handle.state, &handle.context) catch |err| {
-                    _ = supervise(H, handle, err);
+                    _ = supervise(W, H, handle, err);
                 };
             } else {
                 @compileError("worker " ++ @typeName(W) ++ " declares neither " ++
@@ -1100,56 +1357,150 @@ fn workerMain(comptime W: type, comptime capacity: usize) fn (*Handle(W, capacit
 
             if (@hasDecl(W, "deinit")) W.deinit(&handle.state);
         }
+    }.main;
+}
 
-        /// Record an error and decide whether the worker survives it.
-        /// Returns true when the caller must stop its loop.
-        fn supervise(comptime HH: type, handle: *HH, err: anyerror) bool {
-            _ = handle.handler_errors.fetchAdd(1, .monotonic);
+/// The optional `init` hook, plus the bookkeeping around a failure. Called once
+/// per worker lifecycle: by `workerMain` on the worker's own thread, and by
+/// `pooledDispatch` on the pool thread that first runs a pooled worker — which is
+/// the earliest moment a pooled worker owns a thread, and the only one at which
+/// running `init` cannot race its own `handle`.
+///
+/// A failure here is fatal for the worker (there is no half-started state to
+/// supervise), but it still counts and stops.
+fn startWorker(comptime W: type, comptime H: type, handle: *H) void {
+    if (!@hasDecl(W, "init")) return;
+    W.init(&handle.state, &handle.context) catch |err| {
+        var tag_buf: [trace_tag_len]u8 = undefined;
+        // No message is being handled yet, so the tag is always empty here —
+        // carried anyway so every runtime error line has the same shape and the
+        // same grep.
+        std.log.err("[runtime] {s}.init failed{s}: {s}", .{
+            @typeName(W), traceTag(handle.context.traceId(), &tag_buf), @errorName(err),
+        });
+        _ = handle.handler_errors.fetchAdd(1, .monotonic);
+        handle.stop();
+    };
+}
 
-            // Windowed budget: reset the window when it has elapsed.
-            const now = handle.runtime.clock.nowMs();
-            if (handle.supervision.window_ms > 0 and now - handle.window_start_ms > handle.supervision.window_ms) {
-                handle.window_start_ms = now;
-                handle.errors_in_window = 0;
+/// One message through `W.handle`: the trace is published for exactly as long as
+/// *this* message runs (so a handler can neither see a previous message's trace
+/// nor leak this one into whatever it schedules afterwards), and a returned error
+/// goes through supervision. Returns false when the worker must stop serving.
+///
+/// Shared by the dedicated loop (`workerMain`) and the pooled batch
+/// (`pooledDispatch`) on purpose: the two modes differ in *who* runs a worker,
+/// never in what running it means.
+fn deliver(comptime W: type, comptime H: type, handle: *H, envelope: H.Envelope) bool {
+    var keep_serving = true;
+    {
+        defer handle.context.current_trace = null;
+        handle.context.current_trace = envelope.trace;
+        W.handle(&handle.state, envelope.message, &handle.context) catch |err| {
+            if (supervise(W, H, handle, err)) keep_serving = false;
+        };
+    }
+    return keep_serving;
+}
+
+/// `Ready.dispatch` for `H` — one bounded batch of a pooled worker's loop.
+///
+/// Returns true when the mailbox gave nothing (empty, or closed and drained) and
+/// false when the batch bound ended the call, which is what tells the scheduler
+/// whether there may still be work when it hands the worker back.
+fn pooledDispatch(comptime W: type, comptime H: type) *const fn (*anyopaque, usize) bool {
+    return struct {
+        fn run(ctx: *anyopaque, max: usize) bool {
+            const handle: *H = @ptrCast(@alignCast(ctx));
+
+            // §4's owner contract, pooled flavour: *this* thread owns the worker
+            // while it runs it. That is the answer `Handle.after`'s trace
+            // inheritance needs ("am I the worker's thread?"), and 0 afterwards
+            // says "no message is being handled here" — the same reading a
+            // dedicated worker has between messages.
+            handle.context.owner.store(std.Thread.getCurrentId(), .release);
+            defer handle.context.owner.store(0, .release);
+
+            // The lifecycle starts with the first batch, inside the claim: from
+            // here on this worker is exclusively owned, exactly as a dedicated
+            // worker's thread owns it when `workerMain` runs `init`.
+            if (!handle.started) {
+                // Set before the hook, so a failed `init` still gets its
+                // `deinit` — the pairing `workerMain` has.
+                handle.started = true;
+                startWorker(W, H, handle);
             }
-            handle.errors_in_window += 1;
 
-            // The actor's own opinion wins when declared; otherwise the strategy.
-            const decision: Supervision.Strategy = if (@hasDecl(W, "onError"))
-                W.onError(&handle.state, err, &handle.context)
-            else
-                handle.supervision.strategy;
-
-            const over_budget = handle.supervision.max_errors != 0 and
-                handle.errors_in_window > handle.supervision.max_errors;
-            const must_stop = decision == .stop or over_budget;
-
-            // The trace of the message whose handler just failed — this is what
-            // turns "worker X errored" into "the work that request Y caused
-            // errored". Read here, before the loop clears `current_trace`.
-            var tag_buf: [trace_tag_len]u8 = undefined;
-            const tag = traceTag(handle.context.traceId(), &tag_buf);
-
-            if (must_stop) {
-                handle.stopped_by_supervisor = true;
-                std.log.warn("[runtime] {s}{s} stopped by supervisor after {d} error(s) in window ({s}{s}); last: {s}", .{
-                    @typeName(W),
-                    tag,
-                    handle.errors_in_window,
-                    @tagName(decision),
-                    if (over_budget) ", over budget" else "",
-                    @errorName(err),
-                });
-                handle.stop();
-                return true;
+            var ran: usize = 0;
+            while (ran < max) {
+                const envelope = handle.mailbox.tryRecv() orelse return true;
+                ran += 1;
+                if (!deliver(W, H, handle, envelope)) break;
             }
-
-            std.log.warn("[runtime] {s}{s} handler error ({d} in window): {s}", .{
-                @typeName(W), tag, handle.errors_in_window, @errorName(err),
-            });
             return false;
         }
-    }.main;
+    }.run;
+}
+
+/// `Ready.pending` for `H`: the hand-back's re-check, and nothing else. A length
+/// read rather than a receive, so the runner never consumes what it is deciding
+/// about.
+fn pooledPending(comptime H: type) *const fn (*anyopaque) usize {
+    return struct {
+        fn count(ctx: *anyopaque) usize {
+            const handle: *H = @ptrCast(@alignCast(ctx));
+            return handle.mailbox.len();
+        }
+    }.count;
+}
+
+/// Record an error and decide whether the worker survives it.
+/// Returns true when the caller must stop its loop.
+fn supervise(comptime W: type, comptime H: type, handle: *H, err: anyerror) bool {
+    _ = handle.handler_errors.fetchAdd(1, .monotonic);
+
+    // Windowed budget: reset the window when it has elapsed.
+    const now = handle.runtime.clock.nowMs();
+    if (handle.supervision.window_ms > 0 and now - handle.window_start_ms > handle.supervision.window_ms) {
+        handle.window_start_ms = now;
+        handle.errors_in_window = 0;
+    }
+    handle.errors_in_window += 1;
+
+    // The actor's own opinion wins when declared; otherwise the strategy.
+    const decision: Supervision.Strategy = if (@hasDecl(W, "onError"))
+        W.onError(&handle.state, err, &handle.context)
+    else
+        handle.supervision.strategy;
+
+    const over_budget = handle.supervision.max_errors != 0 and
+        handle.errors_in_window > handle.supervision.max_errors;
+    const must_stop = decision == .stop or over_budget;
+
+    // The trace of the message whose handler just failed — this is what
+    // turns "worker X errored" into "the work that request Y caused
+    // errored". Read here, before the loop clears `current_trace`.
+    var tag_buf: [trace_tag_len]u8 = undefined;
+    const tag = traceTag(handle.context.traceId(), &tag_buf);
+
+    if (must_stop) {
+        handle.stopped_by_supervisor = true;
+        std.log.warn("[runtime] {s}{s} stopped by supervisor after {d} error(s) in window ({s}{s}); last: {s}", .{
+            @typeName(W),
+            tag,
+            handle.errors_in_window,
+            @tagName(decision),
+            if (over_budget) ", over budget" else "",
+            @errorName(err),
+        });
+        handle.stop();
+        return true;
+    }
+
+    std.log.warn("[runtime] {s}{s} handler error ({d} in window): {s}", .{
+        @typeName(W), tag, handle.errors_in_window, @errorName(err),
+    });
+    return false;
 }
 
 /// Longest `traceTag` output: `" trace="` + two 16-digit hex halves.
@@ -2442,4 +2793,368 @@ test "Runtime.MetricsBridge publishes RuntimeStats into a Prometheus scrape" {
     const retext = try metrics.toPrometheusFormat(allocator);
     defer allocator.free(retext);
     try check(retext, "zigmodu_runtime_messages_dropped", @floatFromInt(after.messages_dropped));
+}
+
+// ─────────────────────────────────────────────────
+// Pooled workers (docs/RUNTIME.md §12, Phase 1)
+// ─────────────────────────────────────────────────
+//
+// These tests use the *real* pool thread, which is what makes them end-to-end:
+// a message goes through mailbox → ready token → pool thread → `handle`. The
+// protocol itself is pinned down without a thread in `scheduler.zig`'s tests, so
+// a failure here is about the wiring, not about a lucky interleaving.
+
+/// Spin until `probe.ready()` holds, bounded by `timeout_ms`. Time-bounded
+/// rather than "sleep long enough": a scheduler that never delivers has to
+/// *fail* these tests, and a test that sleeps for a fixed while instead of
+/// observing the condition can only pass or hang.
+fn waitUntil(probe: anytype, timeout_ms: i64) !void {
+    const Time = @import("../core/Time.zig");
+    const deadline = Time.monotonicNowMilliseconds() + timeout_ms;
+    while (!probe.ready()) {
+        if (Time.monotonicNowMilliseconds() > deadline) return error.WaitTimeout;
+        std.atomic.spinLoopHint();
+    }
+}
+
+/// Probe: this pooled worker has nothing left to run — no pool thread is
+/// executing it and its mailbox is empty. This is the condition `Handle.join`
+/// waits for, bounded here so a scheduler that never delivers fails a test
+/// instead of hanging the suite.
+fn Drained(comptime H: type) type {
+    return struct {
+        handle: *H,
+
+        pub fn ready(self: @This()) bool {
+            return !self.handle.claimed.load(.acquire) and self.handle.mailbox.len() == 0;
+        }
+    };
+}
+
+/// Probe: an atomic *counter* another thread publishes, waiting for `>= want`.
+fn Published(comptime V: type, comptime T: type) type {
+    return struct {
+        value: *V,
+        want: T,
+
+        pub fn ready(self: @This()) bool {
+            return self.value.load(.acquire) >= self.want;
+        }
+    };
+}
+
+/// Probe: a boolean flag another thread publishes.
+///
+/// Both probes wait on something the worker (or the shutdown path) made visible,
+/// never on elapsed time — a timeout only ever turns "not yet" into a failure.
+fn Flag(comptime V: type) type {
+    return struct {
+        value: *V,
+
+        pub fn ready(self: @This()) bool {
+            return self.value.load(.acquire);
+        }
+    };
+}
+
+test "Runtime: a pooled worker receives every message, in order" {
+    const OrderWorker = struct {
+        pub const Message = u32;
+        seen: [64]u32 = undefined,
+        len: usize = 0,
+
+        pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
+            _ = ctx;
+            self.seen[self.len] = msg;
+            self.len += 1;
+        }
+    };
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        .clock = .{ .manual = &clk },
+        .scheduler = .{ .max_pooled_workers = 1 },
+    });
+    defer rt.deinit();
+
+    const handle = try rt.spawn(OrderWorker, .{}, .{ .capacity = 16, .mode = .pooled });
+    try std.testing.expect(handle.pool != null); // this one is the pool's
+    for (1..6) |i| try handle.send(@intCast(i));
+    // Wait (bounded) for the drain, then stop and join: `join` is what makes
+    // reading `state` from this thread sound — it waits for "nothing left to run",
+    // which includes the mailbox being empty, not just the claim being free.
+    try waitUntil(Drained(@TypeOf(handle.*)){ .handle = handle }, 5_000);
+    handle.stop();
+    handle.join();
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5 }, handle.state.seen[0..5]);
+
+    const s = rt.poolStats().?;
+    try std.testing.expectEqual(@as(usize, 1), s.spawned);
+    try std.testing.expectEqual(@as(u64, 0), s.ready_push_failures);
+    try std.testing.expect(s.dispatches >= 1);
+    // Everything is handed back once the worker is stopped and drained.
+    try std.testing.expectEqual(@as(usize, 0), s.ready_len);
+    try std.testing.expect(!handle.claimed.load(.acquire));
+    try std.testing.expect(!handle.queued.load(.acquire));
+}
+
+test "Runtime: a pooled worker loses nothing under concurrent producers" {
+    // The D5 window, hit for real: `batch = 1` means the hand-back (and its
+    // mailbox re-check) runs after *every* message, and three producers are
+    // sending into that window continuously. `sendBlocking` means nothing is
+    // dropped for backpressure either, so the expected count is exact.
+    const SumWorker = struct {
+        pub const Message = u64;
+        sum: u64 = 0,
+        count: u64 = 0,
+
+        pub fn handle(self: *@This(), msg: u64, ctx: anytype) anyerror!void {
+            _ = ctx;
+            self.sum +%= msg;
+            self.count += 1;
+        }
+    };
+    const producers = 3;
+    const per_producer = 200;
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        .clock = .{ .manual = &clk },
+        .scheduler = .{ .max_pooled_workers = 1, .batch = 1 },
+    });
+    defer rt.deinit();
+
+    const handle = try rt.spawn(SumWorker, .{}, .{ .capacity = 8, .mode = .pooled });
+
+    const Feed = struct {
+        fn run(h: @TypeOf(handle), base: u64) void {
+            for (0..per_producer) |i| {
+                h.sendBlocking(base + i, 5_000) catch return;
+            }
+        }
+    };
+    var threads: [producers]std.Thread = undefined;
+    for (&threads, 0..) |*t, i| {
+        t.* = try std.Thread.spawn(.{}, Feed.run, .{ handle, @as(u64, i * per_producer + 1) });
+    }
+    for (threads) |t| t.join();
+
+    try waitUntil(Drained(@TypeOf(handle.*)){ .handle = handle }, 10_000);
+    handle.stop();
+    handle.join();
+
+    const expected_count: u64 = producers * per_producer;
+    // Sum of 1..=600 in the order the three producers posted: their ranges are
+    // contiguous, so the total is the same whatever the interleaving.
+    try std.testing.expectEqual(expected_count, handle.state.count);
+    try std.testing.expectEqual(expected_count * (expected_count + 1) / 2, handle.state.sum);
+    const s = rt.poolStats().?;
+    try std.testing.expectEqual(@as(u64, 0), s.ready_push_failures);
+}
+
+test "Runtime: `.pooled` without a declared pool is refused, and the bound is hard" {
+    var clk = Clock.Manual{ .now_ms = 0 };
+
+    // (a) No pool declared: a configuration error, reported at the spawn rather
+    // than quietly starting a thread (D2).
+    var rt0 = Runtime.init(std.testing.allocator, std.testing.io, .{ .manual = &clk });
+    defer rt0.deinit();
+    try std.testing.expectError(error.PoolNotConfigured, rt0.spawn(
+        CounterWorker,
+        .{},
+        .{ .capacity = 8, .mode = .pooled },
+    ));
+    try std.testing.expect(rt0.poolStats() == null);
+
+    // (b) A declared bound is a bound: the (N+1)-th pooled spawn is refused,
+    // because the ready ring was sized for N — accepting it would make a token
+    // push fail, which strands a worker (the capacity invariant).
+    var rt = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        .clock = .{ .manual = &clk },
+        .scheduler = .{ .max_pooled_workers = 2 },
+    });
+    defer rt.deinit();
+    _ = try rt.spawn(CounterWorker, .{}, .{ .capacity = 8, .mode = .pooled });
+    _ = try rt.spawn(CounterWorker, .{}, .{ .capacity = 8, .mode = .pooled });
+    try std.testing.expectError(error.PoolCapacityExceeded, rt.spawn(
+        CounterWorker,
+        .{},
+        .{ .capacity = 8, .mode = .pooled },
+    ));
+
+    const s = rt.poolStats().?;
+    try std.testing.expect(s.ready_capacity >= s.max_pooled_workers);
+    try std.testing.expect(s.ready_len <= s.max_pooled_workers);
+    try std.testing.expectEqual(@as(usize, 2), s.spawned);
+    try std.testing.expectEqual(@as(u64, 0), s.ready_push_failures);
+}
+
+test "Runtime: a dedicated worker puts nothing in the ready ring" {
+    // A declared pool must not change anything for `.dedicated` workers — the
+    // default, and every existing call site: no token, no thread, no counter.
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        .clock = .{ .manual = &clk },
+        .scheduler = .{ .max_pooled_workers = 2 },
+    });
+    defer rt.deinit();
+
+    const handle = try rt.spawn(CounterWorker, .{}, 16); // positional capacity: dedicated
+    try std.testing.expect(handle.pool == null);
+    try std.testing.expect(handle.thread != null); // its own thread, as before
+    for (1..8) |i| try handle.send(@intCast(i));
+    handle.stop();
+    handle.join();
+
+    try std.testing.expectEqual(@as(u32, 28), handle.state.total);
+    try std.testing.expect(handle.thread == null); // reaped by `join`, as before
+    try std.testing.expect(!handle.queued.load(.acquire));
+    try std.testing.expect(!handle.claimed.load(.acquire));
+
+    const s = rt.poolStats().?;
+    try std.testing.expectEqual(@as(usize, 0), s.spawned);
+    try std.testing.expectEqual(@as(usize, 0), s.ready_len);
+    try std.testing.expectEqual(@as(u64, 0), s.dispatches);
+    try std.testing.expectEqual(@as(u64, 0), s.ready_push_failures);
+    try std.testing.expect(!s.running); // declaring a pool that is never used starts no thread
+}
+
+test "Runtime: a pooled worker's init and deinit run around its life" {
+    const Lifecycle = struct {
+        /// Every field another thread writes is an atomic: the test waits on
+        /// what the worker *published*, not on the mailbox having been emptied.
+        const Shared = struct {
+            inits: std.atomic.Value(u32) = .init(0),
+            deinits: std.atomic.Value(u32) = .init(0),
+            seen: std.atomic.Value(u32) = .init(0),
+            init_thread: std.atomic.Value(std.Thread.Id) = .init(0),
+            handle_thread: std.atomic.Value(std.Thread.Id) = .init(0),
+        };
+        pub const Message = u32;
+        shared: *Shared = undefined,
+
+        pub fn init(self: *@This(), ctx: anytype) anyerror!void {
+            _ = ctx;
+            self.shared.init_thread.store(std.Thread.getCurrentId(), .release);
+            _ = self.shared.inits.fetchAdd(1, .monotonic);
+        }
+
+        pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
+            _ = ctx;
+            self.shared.handle_thread.store(std.Thread.getCurrentId(), .release);
+            _ = self.shared.seen.fetchAdd(msg, .monotonic);
+        }
+
+        pub fn deinit(self: *@This()) void {
+            _ = self.shared.deinits.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        .clock = .{ .manual = &clk },
+        .scheduler = .{ .max_pooled_workers = 2 },
+    });
+    defer rt.deinit(); // `shutdown` below is what the assertions are about; this is the cleanup
+
+    var busy = Lifecycle.Shared{};
+    var idle = Lifecycle.Shared{};
+    const used = try rt.spawn(Lifecycle, .{ .shared = &busy }, .{ .capacity = 8, .mode = .pooled });
+    _ = try rt.spawn(Lifecycle, .{ .shared = &idle }, .{ .capacity = 8, .mode = .pooled });
+
+    // Lazy: a pooled worker owns no thread at spawn, so its `init` hook runs
+    // with its first batch — the earliest moment it can own one.
+    try std.testing.expectEqual(@as(u32, 0), busy.inits.load(.acquire));
+    try used.send(41);
+    try waitUntil(Published(@TypeOf(busy.seen), u32){ .value = &busy.seen, .want = 41 }, 5_000);
+
+    // `shutdown` (idempotent) rather than `deinit`, so the assertions below can
+    // still read the test's own `Shared` values.
+    rt.shutdown();
+
+    try std.testing.expectEqual(@as(u32, 1), busy.inits.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 41), busy.seen.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), busy.deinits.load(.acquire));
+    // `init` and the first batch ran on the same thread, inside the claim: that
+    // is the pooled form of "a worker's state belongs to one thread at a time".
+    try std.testing.expectEqual(busy.init_thread.load(.acquire), busy.handle_thread.load(.acquire));
+    try std.testing.expect(busy.init_thread.load(.acquire) != std.Thread.getCurrentId());
+    // The worker that never received a message never started, so it owes no
+    // `deinit` either — the pairing is "started", not "spawned".
+    try std.testing.expectEqual(@as(u32, 0), idle.inits.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), idle.deinits.load(.acquire));
+}
+
+test "Runtime: shutdown with the pool mid-batch hands the claim back first" {
+    const Blocker = struct {
+        const Shared = struct {
+            started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+            release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+            handled: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        };
+        pub const Message = u32;
+        shared: *Shared = undefined,
+
+        pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
+            _ = ctx;
+            self.shared.started.store(true, .release);
+            while (!self.shared.release.load(.acquire)) std.atomic.spinLoopHint();
+            _ = self.shared.handled.fetchAdd(msg, .monotonic);
+        }
+    };
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        .clock = .{ .manual = &clk },
+        .scheduler = .{ .max_pooled_workers = 2 },
+    });
+    defer rt.deinit(); // a second `shutdown` on an already-stopped runtime is a no-op
+
+    var shared = Blocker.Shared{};
+    const handle = try rt.spawn(Blocker, .{ .shared = &shared }, .{ .capacity = 8, .mode = .pooled });
+    try handle.send(41);
+    try waitUntil(Flag(@TypeOf(shared.started)){ .value = &shared.started }, 5_000);
+
+    // Tear the runtime down *while the pool thread is inside `handle`: the pool
+    // join has to wait for the batch, the claim has to be handed back before the
+    // handle is freed (that is the assertion inside `shutdown`), and the message
+    // in flight has to be finished rather than dropped. Under
+    // `std.testing.allocator` a use-after-free or a double free fails the test.
+    const Teardown = struct {
+        fn run(r: *Runtime) void {
+            r.shutdown();
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Teardown.run, .{&rt});
+    // Wait for the teardown to have actually begun (shutdown clears `alive`
+    // first), then let the handler finish.
+    try waitUntil(Flag(@TypeOf(rt.alive)){ .value = &rt.alive }, 5_000);
+    shared.release.store(true, .release);
+    thread.join();
+
+    try std.testing.expectEqual(@as(u32, 41), shared.handled.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), rt.stats().workers);
+    try std.testing.expectEqual(@as(usize, 0), rt.stats().running);
+}
+
+test "Runtime: a `run`-owned worker cannot be pooled" {
+    const LoopWorker = struct {
+        pub fn run(self: *@This(), ctx: anytype) anyerror!void {
+            _ = self;
+            _ = ctx;
+        }
+    };
+
+    // The guard itself is a `@compileError` inside `spawnSupervised`, gated by
+    // exactly this predicate — and a test that *provoked* it could not live in a
+    // green suite: the failure would be this file's compilation. So the
+    // predicate is asserted here, and the compile error is exercised out of
+    // band by `scripts/check-pool-guard.sh` (a fixture that must fail to build,
+    // the same shape `check-tenant-scope.sh` uses for its own guard).
+    try std.testing.expect(!poolable(LoopWorker));
+    try std.testing.expect(poolable(CounterWorker));
+
+    // And the reason: a pooled worker is driven one message at a time, so a
+    // `run`-owned loop would occupy a pool thread for as long as it runs.
+    try std.testing.expect(@hasDecl(LoopWorker, "run") and !@hasDecl(LoopWorker, "Message"));
 }

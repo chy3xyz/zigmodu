@@ -258,6 +258,7 @@ defer app.stop();   // 先请求停止 + join worker，再停模块
 | `Sequencer` | 多线程 | 无锁单调序列：`next()` / `nextBatch(n)` / `advanceTo()`；**不是时钟**（只在进程生命期内有意义） |
 | `HotBus(E, N)` | 1 发布者 / 多订阅者 | freeze 后无锁发布、drop-on-full、计数齐全（见 §3c） |
 | `Recorder(E, C)` | N 生产者 / 单线程重放 | 定容追加日志，**满即 `error.Full`（不覆盖、不静默丢弃）**；序号即槽位，`entries()` 无锁给出 seq 升序前缀；`replay` 驱动 `Clock.Manual`、不 sleep（见 §11.6） |
+| `Scheduler`（池化执行，§12） | N 生产者 / **1 池线程**（Phase 1） | 就绪环（Vyukov，堆上切片）：容量 = `ceilPowerOfTwo(max_pooled_workers)`，**按声明的上界算出来，不是常数**；D4 ⇒ 每 worker 至多一个 token ⇒ `push` 永不失败（失败 = 调度器失联，不是背压：断言 + `ready_push_failures`）。`claimed`（正被跑）/ `queued`（在环里等）是**两个位**；worker 数超过声明上界时 `spawn` 直接 `error.PoolCapacityExceeded`。见 §12.10 |
 
 **为什么池用自旋锁而不是无锁栈**：Treiber 栈在索引上有一个 ABA 窗口，会把同一个对象发给两个调用者 ——
 那是任何测试都不稳定复现的数据竞争。临界区只有一次指针交换，锁的代价远小于"正确性靠运气"。
@@ -291,6 +292,11 @@ error.Full        阻塞等待（recv(0)）或超时（recv(ms)）
 2. **丢弃必须可见**。`stats().dropped_full` 计数，`RuntimeStats` 汇总，接 Prometheus 只是时间问题。
    定时器命令队列（`timer_command_capacity` = 512）用同一条规则：满了就 `error.Full`，不静默丢。
 3. **消息是值**。`T` 按值拷贝进队列；要传堆对象就传指针并显式约定所有权，别让 `T` 偷偷拥有内存。
+4. **"环满"不是背压**。就绪环（§12）里的 token 不是消息，是**一个 worker 的调度权**：丢一条消息是丢工作，
+   丢一个 token 是丢 worker —— 邮箱继续收、`send` 继续成功、而它永远不再运行。所以那个环的容量是按
+   **声明的池化上界**算出来的（因此 `push` 不可能失败），`SchedulerConfig.max_pooled_workers` 是硬上限
+   （第 N+1 个 `.pooled` spawn 在启动期被拒），真失败时 `std.debug.assert` + `ready_push_failures` 计数。
+   把它当背压"丢掉就好"是错的。
 
 ## 6. 事件分层（L0 / L1 / L2）
 
@@ -423,6 +429,7 @@ fn traceFromHeader(id: []const u8) zigmodu.runtime.TraceId {
 | **v0.28.0** | 定时器时间轮改为 **ticker-owned**：`Runtime` 命令队列（`arm`/`cancel` 同一条 FIFO）+ 生产者侧 id/deadline；`cancelTimer` 拆成 `requestCancelTimer`（请求）/ `cancelTimerSync`（要结果） | ✅ 本文档 §3/§4（**Breaking**：旧的 `cancelTimer(id) bool` 已删 —— 第 2 节第 10 条那条分层契约的先例） |
 | **v0.28.0** | `shutdown()` 释放**已进轮**的待触发 payload（`Wheel.drainAll`，在 owner 线程上 drain）+ `RuntimeStats.timers_discarded` / `zigmodu_runtime_timers_discarded` | ✅ 本文档 §3/§4/§8（**非 Breaking**：补上 ticker-owned 那批的"未附带"项） |
 | **v0.28.0** | `shutdown()` 顺序改为**先停 ticker 再拆 worker**（关掉 "ticker 向已 destroy 的 handle 投递" 的 use-after-free 窗口）+ `onTimerFire` 在 `alive = false` 时只 drop 不 post | ✅ 本文档 §3（**非 Breaking**：签名不变，只多一次 `alive` 读） |
+| **未发版** | WorkerPool **Phase 1**：`spawn(..., .{ .mode = .pooled })` + `queued`/`claimed` 两位 + 就绪环 + **一条**池线程（`src/runtime/scheduler.zig`）；池在 `Runtime.initWithOptions` 声明的上界内 | ✅ 本文档 §12.10（**Breaking：否** —— 第三参同时接受 `256` 与 `.{ .capacity = 256, .mode = .pooled }`；`run` 型 worker 用 `.pooled` 是编译期报错，见 `scripts/check-pool-guard.sh`） |
 | 1.0 | API 收敛、命名统一、deprecated 清理 | 计划 |
 
 ## 10. 最小示例
@@ -572,10 +579,12 @@ rec.replay(&manual, &harness, Harness.sink);         // 按 seq 推进 clock，�
 - 不承诺进程级完全确定性：`spawn`/`init` 副作用、网络、墙钟、以及丢弃模式都不重放。
 - 只有**读注入 `Clock`** 的代码参与重放；直接调 `core/Time.zig` 的路径读到真实时间。
 
-## 12. WorkerPool / Scheduler —— 设计草案（未实现）
+## 12. WorkerPool / Scheduler —— Phase 1 已落地（一条池线程）
 
-> 状态：**只有设计，没有代码**。这是 v0.29 的 P0，也是当前最大的架构缺口。先定契约，因为
-> 这一刀切下去要动的是 Runtime 的命根子（state ownership），不是加一个原语。
+> 状态：**Phase 1 已落地**（`src/runtime/scheduler.zig`，`spawn(..., .{ .mode = .pooled })`）。
+> 12.1–12.9 是设计原文，原样保留作为决策记录；**12.10 记落地结果** —— 实际做到哪、没做哪，
+> 以及实测后对 D4/D5 的两处收紧（老写法会丢 worker，不是丢消息）。
+> **多池线程、drain 批量调优、公平性加权、affinity 仍未做**（也正是 12.7 明确不做的那些）。
 
 ### 12.1 问题：一 worker = 一线程
 
@@ -726,6 +735,60 @@ API 形状见 §12.8）。**默认不变**，所以既有应用零影响。
 4. **`RuntimeStats.running` 的上界变化**：池化后从"worker 数"变成"池线程数"。这本身是有用的观测
    信号，但别让它被误读成"worker 变少了"。
 
+### 12.10 Phase 1 落地记要（做到哪，没做哪）
 
+**落地范围**：`queued` / `claimed` 两个位 + ready 环 + **一条**池线程 + `spawn` 的 `mode`
+（`.dedicated` 默认 / `.pooled`）。既有调用点一行未改：`spawn` 的第三参**同时**接受位置容量与配置结构。
 
+```zig
+var rt = try Runtime.initWithOptions(allocator, io, .{      // 池在构造时声明（D2）
+    .scheduler = .{ .max_pooled_workers = 64 },             // 不写 = 没有池，零线程
+});
+const audit = try rt.spawn(AuditWorker, .{}, .{ .capacity = 64, .mode = .pooled });
+```
 
+**那条派生不变量的落地形式**（安全支点，见本文件 §5 第 4 条）：
+
+* 环容量 = `ceilPowerOfTwo(max_pooled_workers)`（最小 2），在 `Scheduler.init` 里**按声明的上界**算，
+  不是常数 —— 它必须 ≥ 池化 worker 数，否则"环满丢 token"会等于**永久停掉一个 worker**；
+* 上界也是硬上限：第 `max+1` 个 `.pooled` spawn 被 `error.PoolCapacityExceeded` 拒（启动期），
+  而不是先收下再让某个 token 无处可放；
+* `push` 失败 = 不变量被破坏：Debug/ReleaseSafe 断言 + `ready_push_failures` 计数，
+  **绝不当背压丢**。`Runtime.poolStats()` 读得到。
+
+**实测后收紧的两处（不改就会丢 worker）**：
+
+1. **认领失败要重推 token，不能丢**（§12.4 写的是"抢不到就跳过"）。丢掉的 token 不会自己回来，
+   而 `queued` 还是 true —— 生产者再也不会为它推第二个 token。重推把它变成"稍后重试"。
+2. **批量结束只有一条回执出口，顺序固定**：清 `queued` → 清 `claimed` → 重查邮箱 → **赢了 `queued` 位才 push**。
+   §12.4/D5 的"保持 claimed 并重新入环"分支有一个"token 在环里、claim 还握着"的窗口：
+   那个 token 被别的池线程 pop 到只会被跳过，而持有者又已交还 —— worker 从此不再被调度。
+   单出口版本同时把 D3 的公平性（每批之后重新排队，排在别人后面）白拿到手。
+   重查之后**赢位才 push** 也很关键：无条件 push 会在"生产者刚赢得位并推了 token"时留下两个 token，
+   而环的容量正是按"每 worker 一个"算的（这条是被并发压力测试抓出来的）。
+
+**`.pooled` 的生命周期与状态语义**（与 `.dedicated` 有意不同，写清以免误读）：
+
+| 事项 | `.dedicated` | `.pooled` |
+|------|--------------|-----------|
+| 谁跑 `handle` | 自己的线程 | 池线程（一条，Phase 1） |
+| `init` 钩子 | `spawn` 后立刻，在 worker 线程上 | **第一条消息的批次里**（池线程、claim 内）；从未收到消息就从未 `init` |
+| `deinit` 钩子 | 循环结束后，在 worker 线程上 | `shutdown()` destroy 之前（`init` 失败过也会跑；没 `init` 过就不跑） |
+| `ctx.owner` | 固定 = worker 自己的线程 | 批次期间 = 当前池线程，批次之外 0（trace 继承的答案来源） |
+| `Thread.getCurrentId()` 用于自查 | 稳定 | 只在一次 `handle` 内稳定，别跨消息保存 |
+| `stats().running` | 线程活着 | 正被 claim（所以总量上界 = 池线程数，§12.9 第 4 条） |
+| `join()` | `Thread.join` | 等 claim 交还（自旋；它只在停机路径被调用） |
+| `stop()` | 关邮箱 + 唤醒 `recv` | 同上；池把邮箱抽干后不再为它排 token |
+
+**停机顺序**（在 §3 的老顺序上多一步，§12.6/§12.9 第 3 条）：`alive=false` → 停 ticker →
+**停池线程（join）** → 断言没有 worker 还握着 claim → request/join/destroy worker → 收尾定时器。
+池线程在批次之间才退出，所以"停机时它正跑着某个 worker"这个窗口里，worker 的 `handle` 会先跑完
+（和 dedicated 一样：worker 不返回就拖着停机，这是刻意的）。
+
+**明确没做**（Phase 2 起再谈，别拿 Phase 1 当结论）：
+
+* 多池线程（Phase 1 只有一条；协议里的 two-bit 与环都是按"读者只在 pop 时认领"写的，加线程前要
+  把 §12.3/§12.10 的推理重新做一遍）；
+* `batch` 的实测调优（默认 16，D3 的起点；per-worker 覆盖也没做）；
+* 公平性加权、优先级、CPU affinity/NUMA（§12.7 本来就排除）；
+* `zmodu_runtime_*` 里**没有**池的指标（`RuntimeStats.running` 是间接信号；`poolStats()` 是进程内读数）。

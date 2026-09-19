@@ -18,7 +18,7 @@
 | SQLx 驱动链接 | `docs/SQLX_DRIVERS.md`（`-Ddb=` / `.db=`） |
 | 生产接线 / 背压 / 编排 | `docs/ROUTE_TABLE.md` §7.4 + `docs/BEST_PRACTICES.md`「韧性」 |
 | 文件上传 / 内容校验 / 限额顺序 | `docs/BEST_PRACTICES.md`「上传与 multipart」 |
-| Worker / 邮箱 / 定时器 / RingBuffer（v0.16 运行时） | `docs/RUNTIME.md`（定位、契约、背压语义、兼容 10 条） |
+| Worker / 邮箱 / 定时器 / RingBuffer / **池化（§12）** | `docs/RUNTIME.md`（定位、契约、背压语义、兼容 10 条；§12.10 = WorkerPool Phase 1 落地边界） |
 | 架构检查 / 依赖图 / `zmodu doctor` | `docs/ARCHITECTURE.md`「Architecture engine」+ `src/core/ModuleGraph.zig` |
 | 集群成员读侧（请求路径选节点/健康度） | `docs/DISTRIBUTED.md`「集群读侧」+ `zigmodu.ClusterView`（`acquire`/`release`，别读写入侧的哈希表） |
 | 长流程 / 崩溃续跑（Saga、补偿、检查点） | `docs/WORKFLOW.md` + `SagaOrchestrator.resumeInstance`（有副作用的一步必须幂等） |
@@ -108,6 +108,9 @@ CI、`scripts/ci-*.sh`、本文件都用那个。`cd tools/zmodu && zig build` �
 | 运行时是 opt-in：不调用 `app.runtime()` 就零线程、零定时器（v0.16 起） | 为普通 CRUD API 引入 worker（多一层，没有收益） |
 | 会持续失败的 worker 用 `spawnActor` + `max_errors`/`window_ms` 预算（停 + 计数），需要现场判断就声明 `onError` | 让"每条消息都出错"的 actor 永远只记录不停止（线程活着、邮箱在收，但是个 CPU 黑洞） |
 | 一个事件多个消费者且发布方不能等：`runtime.HotBus(E,N)` + 启动期 `subscribe(...)` + `freeze()` | 把 L0 扇出接到 `app.eventBus`（L1 会分配、可慢），或在热路径上自己遍历订阅者加锁 |
+| 长尾 worker 用池化：`Runtime.initWithOptions(.{ .scheduler = .{ .max_pooled_workers = N } })` + `spawn(W, .{}, .{ .capacity = c, .mode = .pooled })`（`Application.Config.max_pooled_workers` 同理） | 不声明就用 `.pooled`（`error.PoolNotConfigured`）或超过声明上界（`error.PoolCapacityExceeded`）—— 上界是硬上限，环容量按它算 |
+| `.pooled` 只给消息驱动 worker（`Message` + `handle`）；`run` 型必须 `.dedicated` | 把 `.pooled` 给 `run` 型（编译期报错，`scripts/check-pool-guard.sh` 兜底）；把 `poolStats().ready_push_failures` 当背压读数 |
+| 就绪环的 token 是"一个 worker 的调度权"，不是消息：环满 = 调度器失联（断言 + 计数，不是丢） | 把环满当普通满队列丢掉（丢一个 token = 那个 worker 永久不再被调度，邮箱却继续收） |
 | 模块依赖靠 `build(.{...})` 的编译期图检查拦住（环/缺失/自依赖/重名，报错带环路径） | 用 `@import` 跨模块直接引用对方内部文件（`zmodu doctor` 会报纠缠 + 文件:行） |
 | 交付前跑 `zmodu doctor`（阻断项 exit 1，可直接进 CI） | 声明无法执行的架构规则（如"domain 不许 import db"却只在文档里写 —— 编译期看不到 import，交 `doctor`） |
 | 集群读侧：`view.acquire()` → 用 → `release()`；选节点 `view.pick(key)`（rendezvous） | 在 handler 里直接读 `ClusterMembership` 的可变表（那是维护循环的状态），或为读它加锁 |

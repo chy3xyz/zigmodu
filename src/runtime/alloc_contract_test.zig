@@ -205,6 +205,57 @@ test "alloc contract: scheduleAction / requestCancelTimer allocate nothing on th
     try std.testing.expectEqual(@as(usize, 4), sink.drops);
 }
 
+/// Bounded wait on the mailbox's delivered count — an atomic the pool thread
+/// writes. Waiting for the effect (rather than sleeping) is what keeps a green
+/// allocation count from meaning "nothing had run yet".
+fn waitForReceived(handle: anytype, want: u64, timeout_ms: i64) !void {
+    const Time = @import("../core/Time.zig");
+    const deadline = Time.monotonicNowMilliseconds() + timeout_ms;
+    while (handle.stats().received < want) {
+        if (Time.monotonicNowMilliseconds() > deadline) return error.WaitTimeout;
+        std.atomic.spinLoopHint();
+    }
+}
+
+test "alloc contract: a pooled Handle.send allocates nothing, ready token included" {
+    // `.mode = .pooled` puts a token in the scheduler's ready ring on the send
+    // path, so this is the test that says the extra hop is still allocation-free:
+    // the ring is sized at construction (see `scheduler.zig`), and pushing into
+    // it is a plain store into one of its slots.
+    var probe = Probe.init(std.testing.allocator, .{});
+    var clk = rt.Clock.Manual{ .now_ms = 0 };
+    var runtime = try rt.Runtime.initWithOptions(probe.allocator(), std.testing.io, .{
+        .clock = .{ .manual = &clk },
+        .scheduler = .{ .max_pooled_workers = 2 },
+    });
+    defer runtime.deinit();
+
+    const handle = try runtime.spawn(Quiet, .{}, .{ .capacity = 64, .mode = .pooled });
+
+    const before = measure(&probe);
+    for (0..16) |i| try handle.send(i);
+    try expectExact(&probe, before, 0, "pooled Handle.send x16");
+
+    for (0..8) |i| try handle.sendBlocking(i, 5);
+    try expectExact(&probe, before, 0, "pooled Handle.sendBlocking x8");
+
+    for (0..8) |i| try handle.sendTraced(i, .{ .high = 3, .low = @intCast(i) });
+    try expectExact(&probe, before, 0, "pooled Handle.sendTraced x8");
+
+    for (0..8) |i| try handle.sendBlockingTraced(i, .{ .high = 4, .low = @intCast(i) }, 5);
+    try expectExact(&probe, before, 0, "pooled Handle.sendBlockingTraced x8");
+
+    // 40 messages went in, and the pool ran all of them: a green count above
+    // cannot come from having sent nothing (blocking sends are never dropped).
+    try waitForReceived(handle, 40, 5_000);
+    handle.stop();
+    handle.join();
+    try std.testing.expectEqual(@as(u64, 40), handle.stats().received);
+    // The scheduler refused nothing: `ready_push_failures` is the "a worker got
+    // lost" counter, and it must stay 0 (see scheduler.zig's capacity invariant).
+    try std.testing.expectEqual(@as(u64, 0), runtime.poolStats().?.ready_push_failures);
+}
+
 // ─────────────────────────────────────────────────
 // Non-zero: the two places the runtime allocates on purpose
 // ─────────────────────────────────────────────────

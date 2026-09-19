@@ -2,6 +2,59 @@
 
 ## [Unreleased]
 
+### WorkerPool Phase 1 —— `spawn(..., .{ .mode = .pooled })`：长尾 worker 共用一条池线程（**破坏性：否**）
+
+`spawn` 一直是「一 worker 一线程」：`allocator.create(Handle)` + `std.Thread.spawn`。对
+`行情 → 订单簿 → 风控 → 执行` 这种链是对的，对长尾（symbol / 房间 / 会话 / 指标扇入）到了顶 ——
+"worker 数"变成"数据维数"，每个都吃一个栈、一个调度实体、一次上下文切换。Phase 1 落地
+`docs/RUNTIME.md` §12 的设计：worker 还是那个 `W`（同一份 `handle`、同一个有界邮箱、同一套契约），
+只是可以由**池线程**运行，状态独占从"按线程身份"换成"按排他声明"（`claimed`）。
+
+```zig
+var rt = try Runtime.initWithOptions(allocator, io, .{ .scheduler = .{ .max_pooled_workers = 64 } });
+const audit = try rt.spawn(AuditWorker, .{}, .{ .capacity = 64, .mode = .pooled });
+// 既有调用点一行不用改：第三参同时接受 `256` 与 `.{ .capacity = 256, .mode = .pooled }`
+const book = try rt.spawn(OrderBook, .{}, 256);   // 仍是 .dedicated
+```
+
+- **API/兼容**：`spawn` / `spawnActor` / `spawnSupervised` 的最后一个参数改为 comptime 归一化
+  （`spawnConfig`）：**位置容量（`256`）原样可用**，新增配置结构形态。`.dedicated` 是默认，
+  行为逐位不变（`Handle.thread`、`join()`、`running` 语义在 dedicated 下与 v0.28 相同）。因此
+  **不是源码级 Breaking** —— §12.9 第 2 条预期的迁移没有发生。
+- **不能池化的形态是编译期错误**：`run` 型 worker 自带循环，池化等于让一条池线程被它独占；
+  `spawn(..., .pooled)` 对它 `@compileError`（报错文本点名 `.dedicated` 与 `handle`）。
+  这条守卫在测试套件里断言不了（触发它就是本文件编译失败），所以和 `check-tenant-scope.sh` 同形
+  加了 `scripts/check-pool-guard.sh`：一个必须失败的 fixture + 两个必须通过的。
+- **配置错误不留后门**：没在 `initWithOptions` / `Application.Config.max_pooled_workers` 里声明池就
+  用 `.pooled` → `error.PoolNotConfigured`（不"顺手起一条线程"）；声明的上界是硬上限，
+  第 `max+1` 个 `.pooled` spawn → `error.PoolCapacityExceeded`。
+- **那条派生不变量**（§12 原文没点透，落地时必须成立）：**就绪环的容量 ≥ 可池化 worker 数**。
+  D4（每 worker 在环上至多一项）⇒ 占用上界 = worker 数 ⇒ 容量取 `ceilPowerOfTwo(max_pooled_workers)`：
+  **按声明的上界算出来，不是常数**。因为环里的 token 是"一个 worker 的调度权"，不是消息：
+  丢 token = 那个 worker 永远不再运行（邮箱继续收、`send` 继续成功）。所以环满**不是背压**：
+  `push` 失败要 `std.debug.assert` + `ready_push_failures` 计数（`Runtime.poolStats()`），
+  绝不当普通满队列丢掉。
+- **两处对设计草案的收紧（实测出来的，不改会丢 worker）**：① 认领失败要**重推** token（§12.4 写的
+  "抢不到就跳过"）；② 批量结束只留**一条回执出口**，顺序固定 `清 queued → 清 claimed → 重查邮箱 →
+  赢位才 push`（§12.4 的"保持 claimed 并重新入环"有一个 token 在环里而 claim 仍被持有的窗口，
+  跳过的 token 会永久停掉一个 worker）。②里"赢位才 push"是被并发压力测试抓出来的：无条件 push
+  会留下两个 token，而容量正是按"每 worker 一个"算的。
+- **零分配契约不松**：`Handle.send*` 在池化下仍 **0 次分配**（新的 `alloc contract: a pooled Handle.send…`
+  用例，`src/runtime/alloc_contract_test.zig`）；就绪环在构造时定容，推 token 是往槽里写一个值。
+- **停机顺序多一步**（§12.6/§12.9-3）：`alive=false` → 停 ticker → **停池线程（join）** →
+  断言没有 worker 还握着 `claimed` → request/join/destroy worker。池线程只在批次之间退出，
+  所以"停机时它正在跑某个 worker"的窗口里 `handle` 会先跑完（worker 不返回就拖着停机，与 dedicated 一致）。
+- **生命周期差异（写清以免误读）**：`.pooled` 的 `init` 钩子在**第一条消息的批次里**跑（池线程、
+  claim 内），`deinit` 在 `shutdown()` destroy 前跑；从未收到消息的 pooled worker 两个钩子都不跑。
+  `RuntimeStats.running` 对 pooled 表示"正被 claim"（上界 = 池线程数）。
+- **测试**：协议在 `src/runtime/scheduler.zig` **不用线程**直接驱动（`step`/`runOne`），所以
+  "同一 worker 不会被两条执行路径同时跑"和"handler 执行期间到达的消息不被丢"是单元级断言而不是
+  "只有一条线程所以侥幸过"；端到端覆盖在同文件与 `src/runtime/runtime.zig`（含 3 生产者 × 200 条、
+  `batch = 1` 把回执窗口打满、断言一条不丢；以及"停机时池线程正在跑"的 UAF 窗口）。
+  `zig build test` 全绿。
+- **没做（Phase 2 起）**：多池线程、`batch` 实测调优（16 是 D3 的设计起点，不是结论）、公平性加权、
+  affinity/NUMA、池的 Prometheus 指标、per-worker batch 覆盖。见 `docs/RUNTIME.md` §12.10。
+
 ### `check-version.sh` 跳过 `test { … }` 块内的版本形字面量 —— 消除的是一类误报（**破坏性：否**）
 
 tag `v0.27.0`（`1c705e5`）的 `bash scripts/check-version.sh` 红了**两条**，都在同一个文件里：

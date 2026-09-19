@@ -96,6 +96,12 @@ pub const Application = struct {
         /// logged as a warning by `validate()` (sizing is a smell, never a
         /// reason to refuse to start). `0` disables the check.
         max_dependencies: usize = 8,
+        /// Declared upper bound on `.mode = .pooled` workers (docs/RUNTIME.md
+        /// §12): the runtime `app.runtime()` creates is sized for it, and its
+        /// pool thread appears the first time a pooled worker is spawned. `0` —
+        /// the default — means this app has no pool, and `.pooled` is refused at
+        /// `spawn` rather than starting a thread nobody declared.
+        max_pooled_workers: usize = 0,
     };
 
     /// Initialize application with modules
@@ -275,7 +281,10 @@ pub const Application = struct {
         if (self.runtime_state) |rt| return rt;
         const rt = try self.allocator.create(rt_mod.Runtime);
         errdefer self.allocator.destroy(rt);
-        rt.* = rt_mod.Runtime.init(self.allocator, self.io, .monotonic);
+        rt.* = try rt_mod.Runtime.initWithOptions(self.allocator, self.io, .{
+            .clock = .monotonic,
+            .scheduler = .{ .max_pooled_workers = self.config.max_pooled_workers },
+        });
         errdefer rt.deinit();
         try rt.start();
         self.runtime_state = rt;
