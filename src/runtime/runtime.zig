@@ -242,6 +242,17 @@ pub const WorkerStats = struct {
     sent: u64,
     received: u64,
     dropped_full: u64,
+    /// Messages this worker accepted and then abandoned at its stop: it was
+    /// stopped by the supervisor (or the pool went down) with a queue still
+    /// behind it, and whatever was left will never be handled.
+    ///
+    /// A different reason from `dropped_full`, and a separate counter on
+    /// purpose: `dropped_full` is a producer being refused (`error.Full`, the
+    /// message was never accepted, the caller knows), while this is work that
+    /// was accepted and then thrown away by the *worker's* stop. Merging them
+    /// would read "the producers are under backpressure" and "this actor's
+    /// queue was abandoned" as the same event. See docs/RUNTIME.md §5.
+    discarded_on_stop: u64,
     /// Panics inside `handle`/`run` do not reach here (they abort the process);
     /// this counts returned errors.
     handler_errors: u64,
@@ -257,6 +268,15 @@ pub const RuntimeStats = struct {
     messages_sent: u64,
     messages_received: u64,
     messages_dropped: u64,
+    /// Messages accepted and then abandoned by a worker's stop, runtime-wide —
+    /// what every worker's `WorkerStats.discarded_on_stop` counts, added up by
+    /// the runtime as it happens. Read off that accumulator rather than summed
+    /// over the live workers (the way `messages_dropped` is), because `shutdown`
+    /// joins and destroys a worker in the same pass: a sum would be back to 0 by
+    /// the time anyone could read the loss. `timers_discarded` is accumulated
+    /// for the same reason. NOT a second reading of `messages_dropped` — see
+    /// that field's sibling in `WorkerStats` and docs/RUNTIME.md §5.
+    messages_discarded_on_stop: u64,
     handler_errors: u64,
     timer_fires: u64,
     /// Timers that were accepted but never fired, released when the runtime shut
@@ -295,6 +315,13 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         thread: ?std.Thread = null,
         stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         handler_errors: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        /// Messages counted instead of run when this worker stopped — see
+        /// `countAbandoned`. Atomic because `stats()` reads it from another
+        /// thread (a scrape, most of the time).
+        discarded_on_stop: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        /// Mailbox length `countAbandoned` has already reported. Bookkeeping for
+        /// its delta (see there), not a second reading of the counter above.
+        counted_at_stop: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
         supervision: Supervision = .{},
         /// Supervisor bookkeeping. Owned by the worker's own thread (only it
         /// handles messages), so plain fields — no atomics.
@@ -427,6 +454,38 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
             });
         }
 
+        /// Count — and deliberately *not* run — whatever is still in the mailbox
+        /// at a point where this worker can never `recv` again: its own loop has
+        /// returned (dedicated), or the pool that would have dispatched it has
+        /// (`Runtime.shutdown`'s teardown). Nobody is going to handle those
+        /// messages, so the least this can do is leave a number (§5's rule), on
+        /// the worker *and* on the runtime — the handle is destroyed by the very
+        /// `shutdown` that abandoned them, so a per-worker counter alone would be
+        /// unreadable exactly when it matters.
+        ///
+        /// **Idempotent, by taking the increase since the last call.** The ring
+        /// only ever loses messages to `recv`, which is over by the time anyone
+        /// calls this, so "len went up" can only mean messages that arrived
+        /// after a previous call — which is the `close()`-vs-`send` window (a
+        /// producer that read `closed == false` just before the stop can still
+        /// push). Counting the total every time would report the same loss twice;
+        /// counting only the delta reports every loss once, including that one.
+        ///
+        /// The messages themselves stay parked rather than being drained out:
+        /// they are plain values (the ring dies with the handle), and leaving
+        /// them keeps `mailbox_len` honest about where the work went. Draining
+        /// would also mean counting them as `received`, which they are not —
+        /// `received` means "a worker pulled this out to handle it".
+        fn countAbandoned(self: *Self) void {
+            const left = self.mailbox.len();
+            const counted = self.counted_at_stop.load(.monotonic);
+            if (left <= counted) return;
+            self.counted_at_stop.store(left, .monotonic);
+            const increase = left - counted;
+            _ = self.discarded_on_stop.fetchAdd(increase, .monotonic);
+            _ = self.runtime.messages_discarded_on_stop.fetchAdd(increase, .monotonic);
+        }
+
         pub fn stats(self: *Self) WorkerStats {
             const ms = self.mailbox.stats();
             return .{
@@ -445,6 +504,7 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
                 .sent = ms.sent,
                 .received = ms.received,
                 .dropped_full = ms.dropped_full,
+                .discarded_on_stop = self.discarded_on_stop.load(.monotonic),
                 .handler_errors = self.handler_errors.load(.monotonic),
                 .errors_in_window = self.errors_in_window,
                 .stopped_by_supervisor = self.stopped_by_supervisor,
@@ -470,7 +530,9 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
                 // .shutdown` stops the pool *first* (§12.6), so a worker can
                 // legitimately still hold messages at that point, and there is
                 // nobody left to drain them. Waiting for the mailbox there would
-                // hang the shutdown.
+                // hang the shutdown. What those messages are is counted by
+                // `Runtime.shutdown`, which owns the fact that the pool is gone
+                // (`countAbandoned`, through the entry's `abandon` thunk).
                 while (self.claimed.load(.acquire) or
                     (self.mailbox.len() != 0 and !link.scheduler.stopping.load(.acquire)))
                 {
@@ -600,6 +662,13 @@ pub const Runtime = struct {
     /// path (the ticker's last act, or `shutdown` itself on the caller-driven
     /// configuration), read by `stats()` — hence an atomic.
     timers_discarded: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Messages accepted into a worker's mailbox and then abandoned when that
+    /// worker stopped (see `Handle.countAbandoned`). Accumulated on the runtime
+    /// rather than summed over the live workers — the shape `messages_dropped`
+    /// has — because destroying the worker is part of what produced the loss:
+    /// `shutdown` joins and destroys in one pass, so a per-worker sum would read
+    /// 0 for exactly the loss this counter exists to make visible.
+    messages_discarded_on_stop: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     timer_lag_max_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     /// The pool behind `.mode = .pooled`, present only when it was declared at
     /// construction (`Runtime.initWithOptions`). Null — the default — means this
@@ -612,6 +681,11 @@ pub const Runtime = struct {
         name: []const u8,
         request_stop: *const fn (*anyopaque) void,
         join: *const fn (*anyopaque) void,
+        /// Count whatever a worker still had queued once nothing can serve it
+        /// any more — after every `join`, before every `destroy`. Idempotent
+        /// with the dedicated loop's own call, so this is both the pooled
+        /// counting point and the backstop for a message that raced the stop.
+        abandon: *const fn (*anyopaque) void,
         destroy: *const fn (*anyopaque, std.mem.Allocator) void,
         stats: *const fn (*anyopaque) WorkerStats,
         /// Whether a pool thread still holds this worker's claim. Read once, at
@@ -755,6 +829,15 @@ pub const Runtime = struct {
         // message gets its stop signal before anyone blocks on a join.
         for (self.workers.items) |entry| entry.request_stop(entry.ptr);
         for (self.workers.items) |entry| entry.join(entry.ptr);
+        // The joins above are what make this the last word: no thread is left to
+        // `recv` (dedicated) and no pool is left to dispatch (pooled). Anything
+        // still queued is therefore unreachable, and counted here rather than
+        // walked past — this is the pooled half of the loss, which has no other
+        // moment that could report it (a pooled worker's supervisor stop drains
+        // the mailbox; the pool going down first is the case it cannot).
+        // `countAbandoned` takes only the increase, so running it for a
+        // dedicated worker that already counted at its loop exit changes nothing.
+        for (self.workers.items) |entry| entry.abandon(entry.ptr);
         for (self.workers.items) |entry| entry.destroy(entry.ptr, self.allocator);
         self.workers.clearRetainingCapacity();
 
@@ -899,6 +982,12 @@ pub const Runtime = struct {
                     return h.claimed.load(.acquire);
                 }
             }.f,
+            .abandon = struct {
+                fn f(p: *anyopaque) void {
+                    const h: *H = @ptrCast(@alignCast(p));
+                    h.countAbandoned();
+                }
+            }.f,
         });
         // From here the spawn owns a slot, an entry and a handle; every failure
         // path below gives all three back. (Keeping the cleanup in `errdefer`
@@ -1033,6 +1122,10 @@ pub const Runtime = struct {
             .messages_sent = sent,
             .messages_received = received,
             .messages_dropped = dropped,
+            // From the runtime's accumulator, not from the loop above: that
+            // counter is written where the abandonment happens precisely so it
+            // does not need the worker to still exist (see the field).
+            .messages_discarded_on_stop = self.messages_discarded_on_stop.load(.monotonic),
             .handler_errors = errors,
             .timer_fires = self.timer_fires.load(.monotonic),
             .timers_discarded = self.timers_discarded.load(.monotonic),
@@ -1092,6 +1185,7 @@ pub const Runtime = struct {
             messages_sent: *MetricsT.Gauge,
             messages_received: *MetricsT.Gauge,
             messages_dropped: *MetricsT.Gauge,
+            messages_discarded_on_stop: *MetricsT.Gauge,
             handler_errors: *MetricsT.Gauge,
             timer_fires: *MetricsT.Gauge,
             timers_discarded: *MetricsT.Gauge,
@@ -1113,6 +1207,7 @@ pub const Runtime = struct {
                     .messages_sent = try metrics.createGauge("zigmodu_runtime_messages_sent", "Messages posted into worker mailboxes"),
                     .messages_received = try metrics.createGauge("zigmodu_runtime_messages_received", "Messages a worker pulled out of its mailbox"),
                     .messages_dropped = try metrics.createGauge("zigmodu_runtime_messages_dropped", "Messages rejected by a full mailbox (backpressure, not silent loss)"),
+                    .messages_discarded_on_stop = try metrics.createGauge("zigmodu_runtime_messages_discarded_on_stop", "Messages accepted and then abandoned when their worker stopped (not the same event as messages_dropped)"),
                     .handler_errors = try metrics.createGauge("zigmodu_runtime_handler_errors", "Worker handler errors observed"),
                     .timer_fires = try metrics.createGauge("zigmodu_runtime_timer_fires", "Timers fired"),
                     .timers_discarded = try metrics.createGauge("zigmodu_runtime_timers_discarded", "Timers released unfired at shutdown"),
@@ -1140,6 +1235,7 @@ pub const Runtime = struct {
                 self.messages_sent.set(@floatFromInt(s.messages_sent));
                 self.messages_received.set(@floatFromInt(s.messages_received));
                 self.messages_dropped.set(@floatFromInt(s.messages_dropped));
+                self.messages_discarded_on_stop.set(@floatFromInt(s.messages_discarded_on_stop));
                 self.handler_errors.set(@floatFromInt(s.handler_errors));
                 self.timer_fires.set(@floatFromInt(s.timer_fires));
                 self.timers_discarded.set(@floatFromInt(s.timers_discarded));
@@ -1385,6 +1481,16 @@ fn workerMain(comptime W: type, comptime capacity: usize) fn (*Handle(W, capacit
                 @compileError("worker " ++ @typeName(W) ++ " declares neither " ++
                     "`pub const Message` + `pub fn handle(self, msg, ctx)` nor `pub fn run(self, ctx)`");
             }
+
+            // Anything still in the mailbox at this point is work that was
+            // accepted and will never be handled. Both ways of getting here are
+            // real: a supervisor stop breaks the receive loop with a queue still
+            // behind it (a plain `stop()` drains first — the check at the top of
+            // the loop — so it arrives here empty), and a `run`-owned worker
+            // never recv's at all. Counted, not run: an actor on its way down is
+            // not supposed to keep working, but it is not allowed to lose the
+            // number either (docs/RUNTIME.md §5, §12.10).
+            handle.countAbandoned();
 
             if (@hasDecl(W, "deinit")) W.deinit(&handle.state);
         }
@@ -2646,6 +2752,34 @@ const FlakyActor = struct {
     }
 };
 
+/// The probe `docs/RUNTIME.md` §12.10's lifecycle table is measured with.
+/// `handled` counts *invocations*, so a message whose handler returns an error is
+/// in it too — that is what makes the table's "2/8 vs 8/8" the number it carries.
+///
+/// `released` holds the *first* message until the test has published every
+/// `send`. Without it the worker can close the mailbox mid-loop and "8 sent"
+/// becomes whatever the scheduler happened to do — the numbers below would be a
+/// race instead of the table.
+const StopProbeActor = struct {
+    pub const Message = u32;
+    released: *const std.atomic.Value(bool),
+    /// Published when `handle` is entered, so a test that has to act *while the
+    /// worker is busy* has something to wait for instead of a sleep.
+    entered: ?*std.atomic.Value(bool) = null,
+    handled: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
+        _ = ctx;
+        if (msg == 0) {
+            if (self.entered) |e| e.store(true, .release);
+            var spins: usize = 0;
+            while (!self.released.load(.acquire) and spins < 800_000_000) : (spins += 1) std.atomic.spinLoopHint();
+        }
+        _ = self.handled.fetchAdd(1, .monotonic);
+        if (msg % 2 == 1) return error.Boom;
+    }
+};
+
 test "Actor: a plain worker survives handler errors (v0.16 contract)" {
     var clk = Clock.Manual{ .now_ms = 0 };
     var rt = Runtime.init(std.testing.allocator, std.testing.io, .{ .manual = &clk });
@@ -2696,6 +2830,121 @@ test "Actor: an error budget stops a permanently broken actor" {
     try std.testing.expect(s.stopped_by_supervisor);
     try std.testing.expectEqual(@as(u32, 3), s.errors_in_window); // stopped on the 3rd
     h.join();
+}
+
+test "Actor: a supervised stop abandons the mailbox's tail (dedicated)" {
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .{ .manual = &clk });
+    defer rt.deinit();
+
+    var released = std.atomic.Value(bool).init(false);
+    const h = try rt.spawnActor(StopProbeActor, .{ .released = &released }, 8, .{ .strategy = .stop });
+    for (0..8) |i| try h.send(@intCast(i)); // all 8 are in the mailbox before msg 0 runs
+    released.store(true, .release);
+    h.join(); // the loop is gone: whatever is still queued will never be handled
+
+    const s = h.stats();
+    // §12.10's dedicated column, as assertions: 2 of the 8 ran (msg 0, then the
+    // failing msg 1) ...
+    try std.testing.expectEqual(@as(u32, 2), h.state.handled.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 2), s.received);
+    try std.testing.expectEqual(@as(usize, 6), s.mailbox_len);
+    try std.testing.expectEqual(@as(u64, 8), s.sent);
+    // ... and *nothing* was refused at the producer's boundary: every `send`
+    // returned successfully, so the 6 that did not run are not `error.Full`s.
+    try std.testing.expectEqual(@as(u64, 0), s.dropped_full);
+    // The 6 are therefore abandoned-by-stop, which has its own counter — a
+    // *different* reason from `dropped_full`, and a different number.
+    try std.testing.expectEqual(@as(u64, 6), s.discarded_on_stop);
+    try std.testing.expectEqual(@as(u64, 6), rt.stats().messages_discarded_on_stop);
+    // Which closes the accounting identity every accepted message has to
+    // satisfy: it was received, or a counter explains where it went.
+    try std.testing.expectEqual(s.sent, s.received + s.dropped_full + s.discarded_on_stop);
+
+    // Shutting the runtime down walks every worker's mailbox once more on the
+    // way out (that is where the pooled half is counted). The number the same
+    // loss already produced must not move: a report of "12" here would be the
+    // count running twice over one queue.
+    rt.shutdown();
+    try std.testing.expectEqual(@as(u64, 6), rt.stats().messages_discarded_on_stop);
+}
+
+test "Actor: the pooled stop path drains the mailbox, so nothing is abandoned (pooled)" {
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        .clock = .{ .manual = &clk },
+        .scheduler = .{ .max_pooled_workers = 1 },
+    });
+    defer rt.deinit();
+
+    var released = std.atomic.Value(bool).init(false);
+    const h = try rt.spawnActor(StopProbeActor, .{ .released = &released }, .{
+        .capacity = 8,
+        .mode = .pooled,
+    }, .{ .strategy = .stop });
+    for (0..8) |i| try h.send(@intCast(i));
+    released.store(true, .release);
+
+    // The pool keeps handing the worker back while its mailbox has anything in
+    // it (§12.5's stop semantics), so the failing msg 1 stops the *batch*, not
+    // the drain: all 8 end up invoked.
+    var spins: usize = 0;
+    while (h.state.handled.load(.monotonic) < 8 and spins < 800_000_000) : (spins += 1) std.atomic.spinLoopHint();
+    h.join();
+
+    const s = h.stats();
+    try std.testing.expectEqual(@as(u32, 8), h.state.handled.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 8), s.received);
+    try std.testing.expectEqual(@as(usize, 0), s.mailbox_len);
+    try std.testing.expectEqual(@as(u64, 0), s.dropped_full);
+    // The other half of §12.10's row: the same stop, in pooled mode, abandons
+    // nothing — so the counter that reads 6 for a dedicated worker reads 0 here.
+    try std.testing.expectEqual(@as(u64, 0), s.discarded_on_stop);
+    try std.testing.expectEqual(@as(u64, 0), rt.stats().messages_discarded_on_stop);
+    try std.testing.expectEqual(s.sent, s.received + s.dropped_full + s.discarded_on_stop);
+}
+
+test "Actor: the pool going down first counts what it leaves behind (pooled)" {
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        .clock = .{ .manual = &clk },
+        // `batch = 1`: one message per claim, so the hand-back happens with the
+        // rest of the queue still in the mailbox — the window §12.6 opens by
+        // shutting the pool down *before* the workers.
+        .scheduler = .{ .max_pooled_workers = 1, .batch = 1 },
+    });
+    defer rt.deinit();
+
+    var entered = std.atomic.Value(bool).init(false);
+    var released = std.atomic.Value(bool).init(false);
+    const h = try rt.spawnActor(StopProbeActor, .{
+        .released = &released,
+        .entered = &entered,
+    }, .{ .capacity = 8, .mode = .pooled }, .{});
+
+    for (0..4) |i| try h.send(@intCast(i));
+    var spins: usize = 0;
+    while (!entered.load(.acquire) and spins < 800_000_000) : (spins += 1) std.atomic.spinLoopHint();
+
+    // The pool thread is inside msg 0 with 3 messages queued. `shutdown` blocks
+    // on that thread (§12.6), so it runs on its own thread and this one only
+    // releases msg 0 once the pool is stopping — which is when the queued 3
+    // become unreachable rather than merely late.
+    const Down = struct {
+        fn go(r: *Runtime) void {
+            r.shutdown();
+        }
+    };
+    const down = try std.Thread.spawn(.{}, Down.go, .{&rt});
+    spins = 0;
+    while (!rt.scheduler.?.stopping.load(.acquire) and spins < 800_000_000) : (spins += 1) std.atomic.spinLoopHint();
+    released.store(true, .release);
+    down.join();
+
+    // `h` is gone (`shutdown` destroyed it), so the reading has to come from the
+    // runtime — the count must not die with the worker that produced it, which
+    // is why it is accumulated here rather than summed over live workers.
+    try std.testing.expectEqual(@as(u64, 3), rt.stats().messages_discarded_on_stop);
 }
 
 test "Actor: an onError hook overrides the configured strategy" {
@@ -2756,6 +3005,53 @@ test "Actor: an onError hook overrides the configured strategy" {
     h2.stop();
 }
 
+test "Runtime.MetricsBridge publishes the messages a stop abandoned" {
+    const PrometheusMetrics = @import("../metrics/PrometheusMetrics.zig").PrometheusMetrics;
+    const allocator = std.testing.allocator;
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(allocator, std.testing.io, .{ .manual = &clk });
+    defer rt.deinit();
+
+    var metrics = PrometheusMetrics.init(allocator);
+    defer metrics.deinit();
+    var bridge = try Runtime.MetricsBridge(PrometheusMetrics).init(&rt, &metrics);
+    metrics.setScrapeHook(@TypeOf(bridge).sample, &bridge);
+
+    const check = struct {
+        fn gauge(body: []const u8, name: []const u8, value: f64) !void {
+            var buf: [160]u8 = undefined;
+            const line = try std.fmt.bufPrint(&buf, "{s} {d:.6}", .{ name, value });
+            try std.testing.expect(std.mem.indexOf(u8, body, line) != null);
+        }
+    }.gauge;
+
+    // Registered from the start: a scrape of an idle runtime carries the series
+    // at 0 rather than leaving a dashboard to special-case a missing line.
+    try std.testing.expectEqual(@as(u64, 0), rt.stats().messages_discarded_on_stop);
+    const cold_text = try metrics.toPrometheusFormat(allocator);
+    defer allocator.free(cold_text);
+    try check(cold_text, "zigmodu_runtime_messages_discarded_on_stop", 0);
+
+    // Then it moves for the one reason it exists.
+    var released = std.atomic.Value(bool).init(false);
+    const h = try rt.spawnActor(StopProbeActor, .{ .released = &released }, 8, .{ .strategy = .stop });
+    for (0..8) |i| try h.send(@intCast(i));
+    released.store(true, .release);
+    h.join();
+
+    const after = rt.stats();
+    try std.testing.expectEqual(@as(u64, 6), after.messages_discarded_on_stop);
+    // And it is not a second reading of the backpressure counter: nothing was
+    // refused here, 6 were abandoned.
+    try std.testing.expectEqual(@as(u64, 0), after.messages_dropped);
+
+    const text = try metrics.toPrometheusFormat(allocator);
+    defer allocator.free(text);
+    try check(text, "zigmodu_runtime_messages_discarded_on_stop", @floatFromInt(after.messages_discarded_on_stop));
+    try check(text, "zigmodu_runtime_messages_dropped", @floatFromInt(after.messages_dropped));
+}
+
 test "Runtime.MetricsBridge publishes RuntimeStats into a Prometheus scrape" {
     const PrometheusMetrics = @import("../metrics/PrometheusMetrics.zig").PrometheusMetrics;
     const allocator = std.testing.allocator;
@@ -2798,6 +3094,7 @@ test "Runtime.MetricsBridge publishes RuntimeStats into a Prometheus scrape" {
     try check(text, "zigmodu_runtime_messages_sent", @floatFromInt(s.messages_sent));
     try check(text, "zigmodu_runtime_messages_received", @floatFromInt(s.messages_received));
     try check(text, "zigmodu_runtime_messages_dropped", @floatFromInt(s.messages_dropped));
+    try check(text, "zigmodu_runtime_messages_discarded_on_stop", @floatFromInt(s.messages_discarded_on_stop));
     try check(text, "zigmodu_runtime_handler_errors", @floatFromInt(s.handler_errors));
     try check(text, "zigmodu_runtime_timer_fires", @floatFromInt(s.timer_fires));
     try check(text, "zigmodu_runtime_timers_discarded", @floatFromInt(s.timers_discarded));

@@ -286,11 +286,18 @@ error.Full        阻塞等待（recv(0)）或超时（recv(ms)）
 （由调用方决定丢弃/合并/退避）
 ```
 
-三条规则：
+四条规则（第 4 条是 §12 池化之后补的，前面的编号没动，因为文里按"§5 第 4 条"引用它）：
 
 1. **队列永不增长**。容量是 comptime 的，`error.Full` 是唯一出口 —— 内存曲线可预测。
-2. **丢弃必须可见**。`stats().dropped_full` 计数，`RuntimeStats` 汇总，接 Prometheus 只是时间问题。
-   定时器命令队列（`timer_command_capacity` = 512）用同一条规则：满了就 `error.Full`，不静默丢。
+2. **丢弃必须可见，而且"丢"的两种原因要有两个数**。
+   - `stats().dropped_full` / `RuntimeStats.messages_dropped`：**生产者**被满邮箱拒收（`error.Full`，
+     消息**从未被接受**，调用方当场就知道该退避还是该合流）。
+   - `stats().discarded_on_stop` / `RuntimeStats.messages_discarded_on_stop`：消息**已经**被收下
+     （`send` 返回过成功），然后**因为 worker 停机而被放弃** —— 剩下的那条队列不会再有人跑。
+   - 两者**故意不合并**：合成一个数会把"调用方正在挨背压"和"这个 actor 停机时把队列扔了"读成同一件事，
+     而这两种情况该做的处置完全相反（前者退避，后者查停机原因）。合并只省一个字段，代价是读数失去意义。
+   定时器命令队列（`timer_command_capacity` = 512）用同一条规则：满了就 `error.Full`，不静默丢；
+   定时器那一侧的对应读数是 `timers_discarded`（§3、§8）。
 3. **消息是值**。`T` 按值拷贝进队列；要传堆对象就传指针并显式约定所有权，别让 `T` 偷偷拥有内存。
 4. **"环满"不是背压**。就绪环（§12）里的 token 不是消息，是**一个 worker 的调度权**：丢一条消息是丢工作，
    丢一个 token 是丢 worker —— 邮箱继续收、`send` 继续成功、而它永远不再运行。所以那个环的容量是按
@@ -326,7 +333,8 @@ L0 与 L1 是**两个通道，不是一个**：不要把热路径塞进 L1（它
 ```zig
 const s = rt.stats();
 // workers / running / messages_sent / messages_received
-// messages_dropped / handler_errors / timer_fires / timers_discarded / timer_lag_max_ms
+// messages_dropped / messages_discarded_on_stop
+// handler_errors / timer_fires / timers_discarded / timer_lag_max_ms
 ```
 
 `timer_lag_max_ms` 是"定时器迟到的最大值"：ticker 被饿死、或某个 `post` 太慢时会变大 ——
@@ -336,6 +344,28 @@ const s = rt.stats();
 的节点（见 §3「停机不丢已 arm 的定时器」）。它和 `messages_dropped` 是同一条原则 —— 承诺过的活儿没发生，
 就必须留下一个数字；否则"少了一次投递"只能靠人去猜。
 
+`messages_discarded_on_stop` 是**同一原则在消息侧的另一半**，但**不是** `messages_dropped` 的别名
+（§5 第 2 条）：`messages_dropped` 是生产者被满邮箱拒收，这条是**收下了又因 worker 停机被放弃**。
+只有两处会产生它，两处都实测过：
+
+* **dedicated 的监督停机**：`spawnActor` 一旦判停，`handle` 循环直接 `break` —— 在停机中的 actor
+  不该继续干活，但邮箱里剩下的那批**会**被记进 `WorkerStats.discarded_on_stop`（§12.10 有那张实测表）；
+* **池先停、worker 手上还有消息**：`.pooled` 在 `Runtime.shutdown` 里先停池（§12.6），
+  `join()` 那一步遇到"池已停 + 邮箱非空"就放过 —— 于是收尾时（**全部 join 之后、destroy 之前**）
+  把还压在邮箱里的条数记下来。放在这里而不是 `join()` 里，是因为这一句才是
+  "没有线程、也没有池能再跑它们"成立的地方（`join()` 可以被早调，那时池还活着）。
+
+计数只取**增量**（`Handle.countAbandoned` 记着上次报到哪一条），所以这件事**重复执行不会重复报**：
+收尾那一趟对每个 worker 都跑，dedicated 在循环出口已经报过的那 6 条不会变成 12。它顺带兜住
+`close()` 与 `send` 的竞态窗口（生产者刚读到 `closed == false`、停机就发生，消息落进了一个没人再取的邮箱）——
+这种消息在循环出口那次读不到，收尾那次读到了。
+
+它按**运行时累加**（像 `timers_discarded`），而不是像 `messages_dropped` 那样把还活着的 worker 加起来：
+`shutdown` 是"join 完就 destroy"的同一趟，被放弃的消息**正是**伴随着销毁发生的 —— 求和写法会在
+能读到它之前就归零。`RuntimeStats.messages_discarded_on_stop` 因此在 `shutdown()` 之后**仍然可读**
+（进程退出前的最后一次抓取、或崩溃前打的一行日志，拿到的不是 0）。每个 worker 的明细在
+`handle.stats().discarded_on_stop`，只在那个 worker 还活着时可读。
+
 **接进 `/metrics`**：`RuntimeStats` 有现成的桥，起服务时接一次即可，抓取时采样（无后台线程）：
 
 ```zig
@@ -343,12 +373,15 @@ var bridge = try zigmodu.Runtime.MetricsBridge(PrometheusMetrics).init(&rt, metr
 metrics.setScrapeHook(@TypeOf(bridge).sample, &bridge);
 ```
 
-它注册 15 条 `zigmodu_runtime_*` 指标（`workers` / `running` / `messages_sent` /
-`messages_received` / **`messages_dropped`** / `handler_errors` / `timer_fires` /
-**`timers_discarded`** / **`timer_lag_ms`**，加上池化执行（§12）的 6 条：`pool_declared` /
-`pool_threads` / `pool_ready_len` / `pool_claimed` / `pool_dispatches` /
+它注册 16 条 `zigmodu_runtime_*` 指标（`workers` / `running` / `messages_sent` /
+`messages_received` / **`messages_dropped`** / **`messages_discarded_on_stop`** / `handler_errors` /
+`timer_fires` / **`timers_discarded`** / **`timer_lag_ms`**，加上池化执行（§12）的 6 条：
+`pool_declared` / `pool_threads` / `pool_ready_len` / `pool_claimed` / `pool_dispatches` /
 `pool_ready_push_failures`）。名字里没有 `_total` 后缀是刻意的：这些是**抓取时采样**的快照，
 所以走 gauge 而不是 counter（`PrometheusMetrics.Counter` 没有 `set`）。
+
+`messages_dropped` 与 `messages_discarded_on_stop` 是**两条曲线，不是一个**：前者随生产者压力动，
+后者只在停机时跳一次。告警要分开写 —— "背压"和"actor 停机扔了队列"是两种事故。
 
 **池的 6 条读什么**（§12.10 那句"`zmodu_runtime_*` 里没有池的指标"已经作废）：
 
@@ -449,6 +482,7 @@ fn traceFromHeader(id: []const u8) zigmodu.runtime.TraceId {
 | **v0.28.0** | `shutdown()` 顺序改为**先停 ticker 再拆 worker**（关掉 "ticker 向已 destroy 的 handle 投递" 的 use-after-free 窗口）+ `onTimerFire` 在 `alive = false` 时只 drop 不 post | ✅ 本文档 §3（**非 Breaking**：签名不变，只多一次 `alive` 读） |
 | **未发版** | WorkerPool **Phase 1**：`spawn(..., .{ .mode = .pooled })` + `queued`/`claimed` 两位 + 就绪环 + **一条**池线程（`src/runtime/scheduler.zig`）；池在 `Runtime.initWithOptions` / `builder.withMaxPooledWorkers` 声明的上界内 | ✅ 本文档 §12.10（**Breaking：否** —— 第三参同时接受 `256` 与 `.{ .capacity = 256, .mode = .pooled }`；`run` 型 worker 用 `.pooled` 是编译期报错，见 `scripts/check-pool-guard.sh`） |
 | **未发版** | 池的**可观测性与示例**：6 条 `zigmodu_runtime_pool_*`（§8）+ `examples/runtime-workers` 的 audit 环真的以 `.pooled` 跑（`[pool] dispatched>0` 才算过）+ `zmodu runtime` 报池声明 | ✅ 本文档 §12.10 末节（**Breaking：否**；顺带修掉 `Application.Config.max_pooled_workers` 没被 `Application.init` 拷贝的接线缺口） |
+| **未发版** | **监督停机丢弃可见**：`WorkerStats.discarded_on_stop` / `RuntimeStats.messages_discarded_on_stop` + 第 16 条 gauge `zigmodu_runtime_messages_discarded_on_stop` —— dedicated 的 `break` 与"池先停、邮箱非空"两档都计数 | ✅ 本文档 §5 第 2 条 / §8 / §12.10（**Breaking：否**；`RuntimeStats` 只加字段，停机行为一字未改） |
 | 1.0 | API 收敛、命名统一、deprecated 清理 | 计划 |
 
 ## 10. 最小示例
@@ -806,14 +840,29 @@ var app = try b.withName("app").withMaxPooledWorkers(64).build(.{MyModule});
 | `stats().running` | 线程活着 | 正被 claim（所以总量上界 = 池线程数，§12.9 第 4 条） |
 | `join()` | `Thread.join` | 等 claim 交还（自旋；它只在停机路径被调用） |
 | `stop()` | 关邮箱 + 唤醒 `recv` | 同上；池把邮箱抽干后不再为它排 token |
-| **`spawnActor` 监督停机**（实测探针，非推理） | 循环 `break`，邮箱里剩下的消息**被丢弃且不计数** | **继续把邮箱抽干**：`handle` 对每条剩余消息再跑一次（同一个 failing actor、8 条投递：dedicated `handled=2/8`、pooled `handled=8/8`），抽干后才不再排 token |
+| **`spawnActor` 监督停机**（实测探针，非推理） | 循环 `break`：邮箱里剩下的消息**不再 `handle`**，但**都被计数** —— `stats().discarded_on_stop` | **继续把邮箱抽干**：`handle` 对每条剩余消息再跑一次，抽干后才不再排 token |
 
-**监督停机那一行是本表唯一"两种模式下语义真的不同"的地方**，写下来是因为它容易被读成 bug：
+两种模式在监督停机下的实测数字（同一个 failing actor、8 条投递、`Clock.Manual`；`handled` 数的是
+**`handle` 被调用次数**，失败的那条也在内）：
+
+| 模式 | `handled` | 停机时 `mailbox_len` | `discarded_on_stop` | `dropped_full` | 断言位置 |
+|------|-----------|----------------------|---------------------|----------------|----------|
+| dedicated | 2/8 | 6 | **6** | 0 | `src/runtime/runtime.zig` 的 `Actor: a supervised stop abandons the mailbox's tail (dedicated)` |
+| pooled | 8/8 | 0 | **0** | 0 | 同文件的 `Actor: the pooled stop path drains the mailbox, so nothing is abandoned (pooled)` |
+
+两条测试把这张表钉成断言，含一条**守恒式**：`sent == received + dropped_full + discarded_on_stop` ——
+将来谁改了停机语义（无论是让 dedicated 也抽干，还是让 pooled 也 `break`），红的是这条式子而不是某人的记忆。
+
+**监督停机那一行是本表里"两种模式下语义真的不同"的地方**，写下来是因为它容易被读成 bug：
 `.pooled` 的 `stop()` 语义是"把邮箱抽干后不再调度"（本节上一段就写了这一句），而 dedicated 的
 `handle` 循环是 `break` 走人 —— 于是同一个 `spawnActor(..., .max_errors = N)` 在两种模式下
-"停机之后还跑不跑 handler"答案不同。**Phase 1 不改**（改它要么让 pooled 也丢弃队列、要么给
-dedicated 加"抽干后再停"，两者都是语义决定而不是 bugfix，且都会动到 D5 那条回执出口），
-先把事实记在这里；真要统一时，请连同"被丢弃的剩余消息该不该有个计数"一起定。
+"停机之后还跑不跑 handler"答案不同。**语义仍然不统一**（改它要么让 pooled 也丢弃队列、要么给
+dedicated 加"抽干后再停"，两者都是会动到 D5 那条回执出口的语义决定）；但"被放弃的剩余消息要不要有个计数"
+这个问题**已经定了：要**——不统一的只能是"还跑不跑 handler"，不能是"丢了多少要不要说"。dedicated 侧
+计数落在循环出口（`Handle.countAbandoned`），pooled 侧落在 `Runtime.shutdown` 的收尾
+（全部 join 之后、destroy 之前；`join()` 可以被早调，那时池还活着，所以不是它）——
+同一个计数函数只取增量，所以收尾对 dedicated 再跑一次也不会翻倍（§8 有那条测试）。
+两边都进 `RuntimeStats.messages_discarded_on_stop` + `zigmodu_runtime_messages_discarded_on_stop`（§8）。
 
 **停机顺序**（在 §3 的老顺序上多一步，§12.6/§12.9 第 3 条）：`alive=false` → 停 ticker →
 **停池线程（join）** → 断言没有 worker 还握着 claim → request/join/destroy worker → 收尾定时器。

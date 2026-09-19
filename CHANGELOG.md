@@ -2,6 +2,40 @@
 
 ## [Unreleased]
 
+### 监督停机丢掉的剩余消息，现在有计数（**破坏性：否**）
+
+`spawnActor` 判停时 dedicated worker 直接跳出接收循环，邮箱里剩下的消息**被丢弃且没有任何计数** ——
+唯一一处不可见的静默丢弃（`HotBus.dropped` / `Mailbox.dropped_full` / `timers_discarded` 都计数）。
+实测（同一 failing actor、8 条投递、`Clock.Manual`）：dedicated `handled=2/8`、停机时 `mailbox_len=6`、
+`dropped_full=0`；pooled `handled=8/8`、`mailbox_len=0`。**停机行为不改**（正在停的 actor 不该继续干活），
+补的是那个数字。
+
+- **两个原因，两个数**：新增 `WorkerStats.discarded_on_stop` / `RuntimeStats.messages_discarded_on_stop`
+  —— "收下了、然后被停机放弃"，与 `messages_dropped`（生产者被满邮箱拒收即 `error.Full`，消息从未被接受）
+  **故意分开**。合并计数会把"调用方在挨背压"读成"某个 actor 停机扔了队列"，两者的处置相反。
+  语义写进 `docs/RUNTIME.md` §5 第 2 条与 §8。
+- **计数点两处，都是实测可复现的**：① dedicated 的循环出口（`Handle.countAbandoned`，
+  监督停机时 `break` 走人那一条）；② `Runtime.shutdown` 的收尾 —— 先停池（§12.6），全部 join 完、
+  destroy 之前把还压在邮箱里的条数记下（`Entry.abandon`；不放在 `join()` 里，因为 `join()` 可以被早调，
+  那时池还活着，那个时刻还不是"没人能跑它们了"）。计数**只取增量**，所以收尾那趟对每个 worker 都跑、
+  而 dedicated 已报过的 6 条不会变成 12；顺带兜住 `close()` 与 `send` 的竞态窗口（晚到的那一条在
+  循环出口读不到，在收尾那次读得到）。两处都只 `+=` 计数，**不抽干**：那批消息是值，
+  环随 handle 一起销毁，留着它们反而让 `mailbox_len` 诚实；抽干会顺带把它们记成 `received`，而
+  `received` 的含义是"worker 取走准备处理的"。
+- **计数按运行时累加，不按存活 worker 求和**（`messages_dropped` 是后者）：被放弃的消息**正是**
+  在 `shutdown` join + destroy 的同一趟里发生的，求和写法会在能读到它之前归零。
+  `RuntimeStats.messages_discarded_on_stop` 因此在 `shutdown()` 之后仍可读；`timers_discarded` 同形。
+- **第 16 条 gauge**：`zigmodu_runtime_messages_discarded_on_stop`（`Runtime.MetricsBridge`），
+  只在停机时跳一次，和随生产者压力动的 `messages_dropped` 是两条曲线。
+- **测试（先红后绿）**：两条断言表本身的测试（dedicated 6 / pooled 0，含守恒式
+  `sent == received + dropped_full + discarded_on_stop`，dedicated 那条再断言 `shutdown()` 不会把 6 报成 12）、
+  一条"池先停、worker 手上还有 3 条"的测试（断言计数不随 worker 销毁消失）、
+  一条 bridge gauge 注册 + 随运行变化的测试。
+  未改生产代码时红：`expected 8, found 2`（守恒式右边少了那个计数）；补字段前红：
+  `no field named 'discarded_on_stop' in struct 'WorkerStats'`。
+- **零分配契约与停机路径不变**：热路径（`Handle.send*` / `scheduleAction`）一行未动，
+  `src/runtime/alloc_contract_test.zig` 的断言一个字没放宽；停机顺序、`stop()` 语义、`join()` 契约照旧。
+
 ### WorkerPool Phase 1 —— `spawn(..., .{ .mode = .pooled })`：长尾 worker 共用一条池线程（**破坏性：否**）
 
 `spawn` 一直是「一 worker 一线程」：`allocator.create(Handle)` + `std.Thread.spawn`。对
