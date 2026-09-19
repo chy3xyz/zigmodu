@@ -227,6 +227,11 @@ pub const Scheduler = struct {
     batch: usize,
     /// Slots taken by `spawn`, never more than `max_pooled_workers`.
     spawned: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// Workers a pool thread is executing *right now* — one per claim held.
+    /// §12.3's exclusivity is what makes this readable: a claimed worker is
+    /// owned by exactly one thread, so the count cannot be double-taken, and its
+    /// ceiling is the number of pool threads (Phase 1: 1).
+    claimed: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     thread: ?std.Thread = null,
     stopping: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     mu: std.Io.Mutex = .init,
@@ -269,6 +274,15 @@ pub const Scheduler = struct {
         ready_len: usize,
         spawned: usize,
         running: bool,
+        /// How many pool threads this scheduler runs. Phase 1 spawns exactly one
+        /// (`0` before the first pooled worker, never more), so it reads as
+        /// "is the pool deployed" today and as a count once Phase 2 adds
+        /// threads — which is also the ceiling `claimed` cannot exceed (§12.9).
+        pool_threads: usize,
+        /// Workers a pool thread is executing right now: §12.3's exclusive
+        /// declaration, counted. Zero between batches, never above
+        /// `pool_threads`.
+        claimed: usize,
         /// Scheduling turns that entered a worker (`claim_misses` counts the ones
         /// that popped a token and found the claim taken).
         dispatches: u64,
@@ -326,12 +340,17 @@ pub const Scheduler = struct {
     }
 
     pub fn stats(self: *Self) Stats {
+        // Read once: `running` and `pool_threads` are two readings of the same
+        // fact, and a scrape should not be able to see them disagree.
+        const thread_live = self.thread != null;
         return .{
             .max_pooled_workers = self.max_pooled_workers,
             .ready_capacity = self.ready.capacity(),
             .ready_len = self.ready.len(),
             .spawned = self.spawned.load(.monotonic),
-            .running = self.thread != null,
+            .running = thread_live,
+            .pool_threads = @intFromBool(thread_live),
+            .claimed = self.claimed.load(.monotonic),
             .dispatches = self.dispatches.load(.monotonic),
             .claim_misses = self.claim_misses.load(.monotonic),
             .ready_push_failures = self.ready_push_failures.load(.monotonic),
@@ -374,6 +393,7 @@ pub const Scheduler = struct {
             return true;
         }
         _ = self.dispatches.fetchAdd(1, .monotonic);
+        _ = self.claimed.fetchAdd(1, .monotonic);
         self.runOne(item);
         return true;
     }
@@ -396,6 +416,10 @@ pub const Scheduler = struct {
         item.queued.store(false, .release);
         item.claimed.store(false, .release);
         if (item.pending(item.ctx) != 0 and !item.queued.swap(true, .acq_rel)) self.push(item);
+        // Counted last, and only after the claim is really back: the reading
+        // "N workers are being executed" must never be taken while a worker's
+        // ownership is still in this frame.
+        _ = self.claimed.fetchSub(1, .monotonic);
     }
 
     fn poolMain(self: *Self) void {

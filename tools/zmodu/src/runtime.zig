@@ -1,17 +1,18 @@
 //! `zmodu runtime` — the runtime wiring a project *declares*, read out of source.
 //!
 //! `docs/RUNTIME.md` makes the runtime opt-in: nothing runs until a module asks
-//! `ctx.runtime()` for the app's runtime. What follows — which workers exist and
-//! how big their mailboxes are, who fans out on a `HotBus`, where timers get
-//! armed, whether a recorder is attached — is spread over whichever files own
+//! `ctx.runtime()` for the app's runtime. What follows — which workers exist
+//! (and in which execution mode), how big their mailboxes are, whether a pool
+//! was declared for the `.pooled` ones, who fans out on a `HotBus`, where timers
+//! get armed, whether a recorder is attached — is spread over whichever files own
 //! those modules, so a reviewer has to reassemble it by hand. This command reads
 //! it back out and reports it as a list of facts, each with a `file:line`.
 //!
-//! **What it does not do**: read a *live* process. Queue depth, `dropped_full`
-//! and `timer_lag_ms` are properties of a running runtime, not of source — the
-//! runtime exports them as Prometheus metrics (`Runtime.MetricsBridge`, scrape
-//! recipe in `docs/RUNTIME.md` §8) and this command neither reads them nor
-//! guesses at them.
+//! **What it does not do**: read a *live* process. Queue depth, `dropped_full`,
+//! `timer_lag_ms` and the pool's own counters are properties of a running
+//! runtime, not of source — the runtime exports them as Prometheus metrics
+//! (`Runtime.MetricsBridge`, scrape recipe in `docs/RUNTIME.md` §8) and this
+//! command neither reads them nor guesses at them.
 //!
 //! It also **makes no judgement**. Every line is something the text says — a
 //! `spawn` call site, the capacity argument as written, a `Recorder(` reference.
@@ -33,9 +34,10 @@ const usage =
     \\Usage: zmodu runtime [dir] [--json]
     \\
     \\Read the runtime wiring a project declares, statically: worker spawns and
-    \\their mailbox capacities, mailbox/queue primitives, timer call sites,
-    \\recorder/trace references, and clock selection. Every line carries a
-    \\file:line; anything the text does not say is reported as `?`.
+    \\their mailbox capacities and modes, pool declarations (max_pooled_workers),
+    \\mailbox/queue primitives, timer call sites, recorder/trace references, and
+    \\clock selection. Every line carries a file:line; anything the text does not
+    \\say is reported as `?`.
     \\
     \\Options:
     \\  --json      machine-readable JSON on stdout
@@ -46,8 +48,8 @@ const usage =
     \\            2 usage error.
     \\
     \\This command reads source only. It cannot see a live process: queue depth,
-    \\dropped_full and timer_lag_ms are runtime properties — scrape /metrics
-    \\(docs/RUNTIME.md §8) for those.
+    \\dropped_full, timer_lag_ms and the pool's own counters are runtime
+    \\(properties — scrape /metrics (docs/RUNTIME.md §8) for those.
     \\
 ;
 
@@ -250,9 +252,51 @@ const Worker = struct {
     /// The worker type as written (`Worker`, `ai.AgentWorker`).
     type_name: []const u8,
     /// The capacity argument as written, or null when the call did not carry one.
+    /// For the config form (`{ .capacity = 64, .mode = .pooled }`) this is the
+    /// `.capacity` value inside the struct — the argument that *is* the mailbox
+    /// size.
     capacity_expr: ?[]const u8,
     /// The capacity, when the text resolves it to a number.
     capacity: ?usize,
+    /// The `.mode` the call writes — `"pooled"` or `"dedicated"` — or null when
+    /// it does not write one: a positional capacity (`rt.spawn(W, .{}, 256)`), a
+    /// config struct without `.mode`, or a mode this scan does not follow.
+    ///
+    /// The API default is `.dedicated` (docs/RUNTIME.md §12.8 D1: the mode is
+    /// additive). That default is *not* reported here, because a default is not
+    /// something the text says.
+    mode: ?[]const u8,
+    file: []const u8,
+    line: usize,
+};
+
+/// How a project sized its pool (docs/RUNTIME.md §12.8 D2 — both spellings end
+/// up as `SchedulerConfig.max_pooled_workers`).
+const PoolForm = enum {
+    /// `builder.withMaxPooledWorkers(2)` — the application-side spelling.
+    builder,
+    /// `.max_pooled_workers = 2` — `Runtime.InitOptions.scheduler` or
+    /// `Application.Config`, written out.
+    config,
+
+    fn label(self: PoolForm) []const u8 {
+        return switch (self) {
+            .builder => "withMaxPooledWorkers(",
+            .config => ".max_pooled_workers =",
+        };
+    }
+};
+
+/// One `max_pooled_workers` declaration, as written. A declaration is a fact
+/// about *configuration*: whether the spawn sites that want a pool are in the
+/// same build, let alone reachable, is not something a text scan decides — so
+/// the two halves are reported side by side and not compared.
+const PoolDecl = struct {
+    form: PoolForm,
+    /// The value expression as written (`2`, `api.pool_size`).
+    expr: []const u8,
+    /// The declared bound, when the text resolves it to a number.
+    count: ?usize,
     file: []const u8,
     line: usize,
 };
@@ -301,6 +345,10 @@ fn workerLess(_: void, a: Worker, b: Worker) bool {
     return siteLess(a.file, a.line, b.file, b.line);
 }
 
+fn poolLess(_: void, a: PoolDecl, b: PoolDecl) bool {
+    return siteLess(a.file, a.line, b.file, b.line);
+}
+
 fn primitiveLess(_: void, a: Primitive, b: Primitive) bool {
     return siteLess(a.file, a.line, b.file, b.line);
 }
@@ -326,6 +374,8 @@ const Report = struct {
     uses_runtime: bool = false,
     files_scanned: usize = 0,
     workers: std.ArrayList(Worker) = .empty,
+    /// `max_pooled_workers` declarations (§12.8 D2): "a pool was sized here".
+    pools: std.ArrayList(PoolDecl) = .empty,
     primitives: std.ArrayList(Primitive) = .empty,
     timers: std.ArrayList(Timer) = .empty,
     recording: std.ArrayList(Recording) = .empty,
@@ -339,6 +389,11 @@ const Report = struct {
             allocator.free(x.file);
         }
         self.workers.deinit(allocator);
+        for (self.pools.items) |x| {
+            allocator.free(x.expr);
+            allocator.free(x.file);
+        }
+        self.pools.deinit(allocator);
         for (self.primitives.items) |x| {
             allocator.free(x.type_name);
             if (x.capacity_expr) |e| allocator.free(e);
@@ -364,10 +419,24 @@ const Report = struct {
         return n;
     }
 
+    /// Spawn sites that *write* `.mode = .pooled`. A site that stays silent is
+    /// not counted: the report lists what the text says, and the API default is
+    /// not something it says.
+    fn pooledSpawnCount(self: Report) usize {
+        var n: usize = 0;
+        for (self.workers.items) |x| {
+            if (x.mode) |m| {
+                if (std.mem.eql(u8, m, "pooled")) n += 1;
+            }
+        }
+        return n;
+    }
+
     /// Order every list by `file:line` so the report (and `--json`) reads the
     /// way the project does — scan order is an implementation detail.
     fn sortBySite(self: *Report) void {
         std.mem.sort(Worker, self.workers.items, {}, workerLess);
+        std.mem.sort(PoolDecl, self.pools.items, {}, poolLess);
         std.mem.sort(Primitive, self.primitives.items, {}, primitiveLess);
         std.mem.sort(Timer, self.timers.items, {}, timerLess);
         std.mem.sort(Recording, self.recording.items, {}, recordingLess);
@@ -377,9 +446,11 @@ const Report = struct {
 
     /// The one-line summary the report ends on. Kept a method so the human and
     /// JSON renderings cannot disagree about what the numbers are.
-    fn summary(self: Report) struct { workers: usize, buses: usize, timers: usize, recording: bool, tracing: bool } {
+    fn summary(self: Report) struct { workers: usize, pooled: usize, pool_decls: usize, buses: usize, timers: usize, recording: bool, tracing: bool } {
         return .{
             .workers = self.workers.items.len,
+            .pooled = self.pooledSpawnCount(),
+            .pool_decls = self.pools.items.len,
             .buses = self.busCount(),
             .timers = self.timers.items.len,
             .recording = self.recording.items.len > 0,
@@ -490,12 +561,53 @@ fn analyzeSource(
             if (argc < 3) continue;
             const type_name = std.mem.trim(u8, args[0], " \t\r\n");
             if (!isTypePath(type_name)) continue; // `.{}` = Thread.spawn, expressions = not a type
-            const cap_expr = std.mem.trim(u8, args[2], " \t\r\n");
+            const arg2 = std.mem.trim(u8, args[2], " \t\r\n");
+            // The config form carries both facts this report knows how to read:
+            // the capacity and the mode. A positional capacity says nothing about
+            // the mode, and this scan does not fill that in.
+            const config = parseSpawnConfig(arg2);
+            const cap_expr: ?[]const u8 = if (config) |c| c.capacity_expr else arg2;
             try out.workers.append(allocator, .{
                 .kind = n.kind,
                 .type_name = try allocator.dupe(u8, type_name),
-                .capacity_expr = try allocator.dupe(u8, cap_expr),
-                .capacity = resolveCapacity(allocator, sources, index, cap_expr),
+                .capacity_expr = if (cap_expr) |e| try allocator.dupe(u8, e) else null,
+                .capacity = if (cap_expr) |e| resolveCapacity(allocator, sources, index, e) else null,
+                .mode = if (config) |c| c.mode else null,
+                .file = try allocator.dupe(u8, rel),
+                .line = lineOf(content, at),
+            });
+        }
+    }
+
+    // Pool declarations (docs/RUNTIME.md §12.8 D2). Reported as their own facts,
+    // not as "this project has a working pool": whether the `.pooled` spawn sites
+    // are in the same build as the declaration is a question about reachability,
+    // and this command only reads text.
+    const pool_needles = [_]struct { needle: []const u8, form: PoolForm }{
+        .{ .needle = "withMaxPooledWorkers(", .form = .builder },
+        .{ .needle = ".max_pooled_workers", .form = .config },
+    };
+    for (pool_needles) |n| {
+        var i: usize = 0;
+        while (indexOfCode(content, n.needle, i)) |at| {
+            i = at + n.needle.len;
+            // Both spellings end in the declaration's *value*: the builder takes
+            // it as an argument, the config assigns it. Reading it the same way
+            // keeps one "what does the text say the bound is" rule.
+            const value_at = switch (n.form) {
+                .builder => at + n.needle.len,
+                .config => blk: {
+                    var j = at + n.needle.len;
+                    while (j < content.len and (content[j] == ' ' or content[j] == '\t')) j += 1;
+                    if (j >= content.len or content[j] != '=') continue; // `if (x.max_pooled_workers)` reads it
+                    break :blk j + 1;
+                },
+            };
+            const value = codeToken(content, value_at) orelse continue;
+            try out.pools.append(allocator, .{
+                .form = n.form,
+                .expr = try allocator.dupe(u8, value),
+                .count = resolveCapacity(allocator, sources, index, value),
                 .file = try allocator.dupe(u8, rel),
                 .line = lineOf(content, at),
             });
@@ -617,6 +729,73 @@ fn usesRuntime(content: []const u8) bool {
 // ─────────────────────────────────────────────────
 // Reading expressions
 // ─────────────────────────────────────────────────
+
+/// What a `spawn` config argument (`{ .capacity = 64, .mode = .pooled }`) says,
+/// as far as the text goes. Null-able fields mean "the struct does not write
+/// this" — never "the default applies", which is an inference this command
+/// does not make.
+const SpawnFacts = struct {
+    capacity_expr: ?[]const u8 = null,
+    /// `"pooled"` / `"dedicated"`: the tag `.mode = …` writes, with the leading
+    /// dot stripped. Null when `.mode` is absent, or when it is written as
+    /// something this scan does not follow (`api.mode`). Points at a literal
+    /// (nothing to free).
+    mode: ?[]const u8 = null,
+};
+
+/// Read the config form of `spawn`'s third argument. Returns null when the
+/// argument is not a struct literal at all — a positional capacity
+/// (`rt.spawn(W, .{}, 256)`) or an expression, both of which the caller reports
+/// as written without inventing fields.
+///
+/// Field values are split on the top-level commas of the literal; a value that
+/// itself contains a comma (a function call, a nested tuple) is not something
+/// these call sites write, and a mis-split would show up as an unresolved `?`
+/// rather than as a wrong number.
+fn parseSpawnConfig(arg: []const u8) ?SpawnFacts {
+    if (!std.mem.startsWith(u8, arg, ".{")) return null;
+    const close = std.mem.lastIndexOfScalar(u8, arg, '}') orelse return null;
+    if (close < 2) return null;
+    const inner = arg[2..close];
+
+    var facts = SpawnFacts{};
+    var it = std.mem.splitScalar(u8, inner, ',');
+    while (it.next()) |raw_field| {
+        const field = std.mem.trim(u8, raw_field, " \t\r\n");
+        if (field.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, field, '=') orelse continue;
+        const key = std.mem.trim(u8, field[0..eq], " \t\r\n");
+        const value = std.mem.trim(u8, field[eq + 1 ..], " \t\r\n");
+        if (value.len == 0) continue;
+        if (std.mem.eql(u8, key, ".capacity")) {
+            facts.capacity_expr = value;
+        } else if (std.mem.eql(u8, key, ".mode")) {
+            if (std.mem.eql(u8, value, ".pooled")) {
+                facts.mode = "pooled";
+            } else if (std.mem.eql(u8, value, ".dedicated")) {
+                facts.mode = "dedicated";
+            }
+        }
+    }
+    return facts;
+}
+
+/// The identifier-ish token starting at `index`, skipping leading whitespace:
+/// `2`, `1_024`, `api.pool_size`. Stops at the first character that cannot be
+/// part of one (`)`, `,`, `}`, newline). Null when there is nothing to read,
+/// which is what a declaration with no value looks like.
+fn codeToken(content: []const u8, index: usize) ?[]const u8 {
+    var i = index;
+    while (i < content.len and (content[i] == ' ' or content[i] == '\t')) i += 1;
+    const start = i;
+    while (i < content.len) : (i += 1) {
+        const c = content[i];
+        if (std.ascii.isAlphanumeric(c) or c == '_' or c == '.') continue;
+        break;
+    }
+    if (i == start) return null;
+    return content[start..i];
+}
 
 /// Resolve a comptime capacity expression to a number — and only to a number.
 /// A literal (`256`, `1_000`) is returned directly; `api.order_capacity` is
@@ -923,7 +1102,27 @@ fn renderText(project_dir: []const u8, report: Report, w: anytype) !void {
     for (report.workers.items) |x| {
         try w.print("  {s} {s} mailbox ", .{ x.kind.label(), x.type_name });
         try writeCapacity(x.capacity, x.capacity_expr, w);
+        // Printed only when the call writes it: `rt.spawn(W, .{}, 256)` says
+        // nothing about the mode, and filling in the API default here would be
+        // the report guessing.
+        if (x.mode) |m| try w.print(" mode={s}", .{m});
         try w.print("  ({s}:{d})\n", .{ x.file, x.line });
+    }
+
+    // The pool (§12): one half is "who asked to be pooled", the other is "what
+    // was the pool sized to". Both are facts; that they match is not asserted,
+    // because reachability is not something a text scan sees.
+    try w.writeAll("\npool (.mode = .pooled; docs/RUNTIME.md §12):\n");
+    const s0 = report.summary();
+    try w.print("  spawn site(s) writing .mode = .pooled: {d} of {d}\n", .{ s0.pooled, s0.workers });
+    if (report.pools.items.len == 0) {
+        try w.writeAll("  declared max_pooled_workers: none  (without a declaration `.pooled` is refused at `spawn`)\n");
+    } else {
+        for (report.pools.items) |p| {
+            try w.writeAll("  declared max_pooled_workers=");
+            try writeCapacity(p.count, p.expr, w);
+            try w.print("  [{s}]  ({s}:{d})\n", .{ p.form.label(), p.file, p.line });
+        }
     }
 
     try w.print("\nmailbox / queue primitives ({d} site(s); `bus(es)` in the summary counts HotBus):\n", .{report.primitives.items.len});
@@ -965,9 +1164,14 @@ fn renderText(project_dir: []const u8, report: Report, w: anytype) !void {
     }
     if (saw_manual) try w.writeAll("  (a manual clock only moves when a driver advances it — tests.)\n");
 
-    try w.print("\nsummary: {d} worker(s), {d} bus(es), {d} timer call site(s), recording: {s}, tracing: {s}\n", .{
-        s.workers,                        s.buses,                        s.timers,
-        if (s.recording) "yes" else "no", if (s.tracing) "yes" else "no",
+    try w.print("\nsummary: {d} worker(s) ({d} .pooled), {d} bus(es), {d} timer call site(s), pool: {s}, recording: {s}, tracing: {s}\n", .{
+        s.workers,
+        s.pooled,
+        s.buses,
+        s.timers,
+        if (s.pool_decls > 0) "declared" else "none declared",
+        if (s.recording) "yes" else "no",
+        if (s.tracing) "yes" else "no",
     });
     try renderFootnote(w);
 }
@@ -975,7 +1179,8 @@ fn renderText(project_dir: []const u8, report: Report, w: anytype) !void {
 fn renderFootnote(w: anytype) !void {
     try w.writeAll(
         \\note: static wiring only — this reads source, not a live process. Queue depth /
-        \\      dropped_full / timer_lag_ms are properties of a running runtime: scrape
+        \\      dropped_full / timer_lag_ms and the pool's own counters (claims, ready
+        \\      depth, refused pushes) are properties of a running runtime: scrape
         \\      /metrics (docs/RUNTIME.md §8) for those.
         \\
     );
@@ -1010,12 +1215,29 @@ fn renderJson(project_dir: []const u8, report: Report, w: anytype) !void {
         try writeJsonCapacity(x.capacity, w);
         try w.writeAll(",\"capacity_expr\":");
         try writeJsonOptionalString(x.capacity_expr, w);
+        // `null` = the call does not write a `.mode` (the API default is
+        // `.dedicated`, but a default is not something the text says).
+        try w.writeAll(",\"mode\":");
+        try writeJsonOptionalString(x.mode, w);
         try w.writeAll(",\"file\":");
         try writeJsonString(x.file, w);
         try w.print(",\"line\":{d}}}", .{x.line});
     }
 
-    try w.writeAll("],\"primitives\":[");
+    try w.writeAll("],\"pool\":{\"declared\":[");
+    for (report.pools.items, 0..) |x, i| {
+        if (i > 0) try w.writeAll(",");
+        try w.print("{{\"form\":\"{s}\",\"max_pooled_workers\":", .{@tagName(x.form)});
+        try writeJsonCapacity(x.count, w);
+        try w.writeAll(",\"expr\":");
+        try writeJsonString(x.expr, w);
+        try w.writeAll(",\"file\":");
+        try writeJsonString(x.file, w);
+        try w.print(",\"line\":{d}}}", .{x.line});
+    }
+    try w.print("],\"pooled_spawns\":{d}}}", .{s.pooled});
+
+    try w.writeAll(",\"primitives\":[");
     for (report.primitives.items, 0..) |x, i| {
         if (i > 0) try w.writeAll(",");
         try w.print("{{\"kind\":\"{s}\",\"type\":", .{@tagName(x.kind)});
@@ -1061,8 +1283,8 @@ fn renderJson(project_dir: []const u8, report: Report, w: anytype) !void {
         try w.print(",\"line\":{d}}}", .{x.line});
     }
 
-    try w.print("],\"summary\":{{\"workers\":{d},\"buses\":{d},\"timer_sites\":{d},\"recording\":{},\"tracing\":{}}}}}\n", .{
-        s.workers, s.buses, s.timers, s.recording, s.tracing,
+    try w.print("],\"summary\":{{\"workers\":{d},\"pooled_spawns\":{d},\"pool_declarations\":{d},\"buses\":{d},\"timer_sites\":{d},\"recording\":{},\"tracing\":{}}}}}\n", .{
+        s.workers, s.pooled, s.pool_decls, s.buses, s.timers, s.recording, s.tracing,
     });
 }
 
@@ -1259,7 +1481,7 @@ test "runtime reports zero for a project that never touches the runtime" {
     try renderText("examples/basic", report, &stream);
     const text = stream.buffered();
     try std.testing.expect(std.mem.indexOf(u8, text, "uses runtime: no") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "summary: 0 worker(s), 0 bus(es), 0 timer call site(s), recording: no, tracing: no") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "summary: 0 worker(s) (0 .pooled), 0 bus(es), 0 timer call site(s), pool: none declared, recording: no, tracing: no") != null);
 }
 
 test "runtime reads no wiring out of comments, string literals or \\\\ lines" {
@@ -1295,10 +1517,15 @@ test "runtime --json parses back into the documented shape" {
         \\pub fn initWith(ctx: *zmodu.ModuleContext) !void {
         \\    const rt = try ctx.runtime();
         \\    risk = try rt.spawn(Risk, .{}, 256);
+        \\    audit = try rt.spawn(Audit, .{}, .{ .capacity = 64, .mode = .pooled });
         \\    bus = runtime.HotBus(Delta, 4).init();
         \\    _ = try ctx.handle.after(200, .{});
         \\    try bus.attachRecorder(&rec);
         \\    _ = ctx.traceId();
+        \\}
+        \\pub fn main() !void {
+        \\    var app = try b.withMaxPooledWorkers(2).build(.{Pipeline});
+        \\    _ = app;
         \\}
         \\
     ;
@@ -1321,10 +1548,27 @@ test "runtime --json parses back into the documented shape" {
     try std.testing.expect(root.get("uses_runtime").?.bool);
 
     const workers = root.get("workers").?.array;
-    try std.testing.expectEqual(@as(usize, 1), workers.items.len);
+    try std.testing.expectEqual(@as(usize, 2), workers.items.len);
     try std.testing.expectEqualStrings("spawn", workers.items[0].object.get("kind").?.string);
     try std.testing.expectEqualStrings("Risk", workers.items[0].object.get("type").?.string);
     try std.testing.expectEqual(@as(i64, 256), workers.items[0].object.get("capacity").?.integer);
+    // A positional capacity writes no mode: `null`, not the API default.
+    switch (workers.items[0].object.get("mode").?) {
+        .null => {},
+        else => return error.PositionalCapacityShouldNotNameAMode,
+    }
+
+    try std.testing.expectEqualStrings("Audit", workers.items[1].object.get("type").?.string);
+    try std.testing.expectEqual(@as(i64, 64), workers.items[1].object.get("capacity").?.integer);
+    try std.testing.expectEqualStrings("pooled", workers.items[1].object.get("mode").?.string);
+    try std.testing.expectEqualStrings("64", workers.items[1].object.get("capacity_expr").?.string);
+
+    const pool = root.get("pool").?.object;
+    try std.testing.expectEqual(@as(i64, 1), pool.get("pooled_spawns").?.integer);
+    const decls = pool.get("declared").?.array;
+    try std.testing.expectEqual(@as(usize, 1), decls.items.len);
+    try std.testing.expectEqualStrings("builder", decls.items[0].object.get("form").?.string);
+    try std.testing.expectEqual(@as(i64, 2), decls.items[0].object.get("max_pooled_workers").?.integer);
 
     const primitives = root.get("primitives").?.array;
     try std.testing.expectEqual(@as(usize, 1), primitives.items.len);
@@ -1336,11 +1580,68 @@ test "runtime --json parses back into the documented shape" {
     try std.testing.expectEqual(@as(usize, 1), root.get("tracing").?.array.items.len);
 
     const summary = root.get("summary").?.object;
-    try std.testing.expectEqual(@as(i64, 1), summary.get("workers").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), summary.get("workers").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), summary.get("pooled_spawns").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), summary.get("pool_declarations").?.integer);
     try std.testing.expectEqual(@as(i64, 1), summary.get("buses").?.integer);
     try std.testing.expectEqual(@as(i64, 1), summary.get("timer_sites").?.integer);
     try std.testing.expect(summary.get("recording").?.bool);
     try std.testing.expect(summary.get("tracing").?.bool);
+}
+
+test "runtime reports the pool both ways round: who is pooled, and what was declared" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\const rt = try zigmodu.Runtime.initWithOptions(allocator, io, .{
+        \\    .scheduler = .{ .max_pooled_workers = 8 },
+        \\});
+        \\pub fn initWith(ctx: *zmodu.ModuleContext) !void {
+        \\    audit = try rt.spawn(Audit, .{}, .{ .capacity = 64, .mode = .pooled });
+        \\    book = try rt.spawn(Book, .{}, 256);
+        \\    chatty = try rt.spawn(Chatty, .{}, .{ .capacity = 8, .mode = .dedicated });
+        \\}
+        \\pub fn main() !void {
+        \\    var app = try b.withMaxPooledWorkers(pool_size).build(.{Pipeline});
+        \\    if (app.config.max_pooled_workers > 0) {}
+        \\}
+        \\
+    ;
+    const sources = [_]Source{.{ .path = "src/main.zig", .content = src }};
+    var report = Report{};
+    defer report.deinit(allocator);
+    try analyzeSource(allocator, &sources, 0, &report);
+    report.sortBySite();
+
+    try std.testing.expectEqual(@as(usize, 3), report.workers.items.len);
+    try std.testing.expectEqualStrings("pooled", report.workers.items[0].mode.?);
+    try std.testing.expectEqual(@as(?usize, 64), report.workers.items[0].capacity);
+    try std.testing.expectEqual(@as(?[]const u8, null), report.workers.items[1].mode);
+    try std.testing.expectEqual(@as(?usize, 256), report.workers.items[1].capacity);
+    try std.testing.expectEqualStrings("dedicated", report.workers.items[2].mode.?);
+
+    // Two declarations, two spellings, each with its value resolved or not:
+    // `max_pooled_workers = 8` is a literal, `withMaxPooledWorkers(pool_size)`
+    // names a const this fixture does not define (reported `?`, not guessed).
+    try std.testing.expectEqual(@as(usize, 2), report.pools.items.len);
+    try std.testing.expectEqual(PoolForm.config, report.pools.items[0].form);
+    try std.testing.expectEqual(@as(?usize, 8), report.pools.items[0].count);
+    try std.testing.expectEqual(PoolForm.builder, report.pools.items[1].form);
+    try std.testing.expectEqual(@as(?usize, null), report.pools.items[1].count);
+    try std.testing.expectEqualStrings("pool_size", report.pools.items[1].expr);
+
+    // The reading of a member (`if (app.config.max_pooled_workers > 0)`) is not a
+    // declaration: there is no `=` after the name, so nothing is reported.
+    var buf: [8192]u8 = undefined;
+    var stream = std.Io.Writer.fixed(&buf);
+    try renderText("examples/runtime-workers", report, &stream);
+    const text = stream.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, text, "spawn Audit mailbox 64 mode=pooled") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "spawn Book mailbox 256") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "spawn Chatty mailbox 8 mode=dedicated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "spawn site(s) writing .mode = .pooled: 1 of 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "declared max_pooled_workers=8  [.max_pooled_workers =]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "declared max_pooled_workers=? (pool_size)  [withMaxPooledWorkers(]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "pool: declared") != null);
 }
 
 test "runtime parseArgs: unknown flag is a usage error, the pure function never logs" {

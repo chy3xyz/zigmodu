@@ -343,13 +343,31 @@ var bridge = try zigmodu.Runtime.MetricsBridge(PrometheusMetrics).init(&rt, metr
 metrics.setScrapeHook(@TypeOf(bridge).sample, &bridge);
 ```
 
-它注册 9 条 `zigmodu_runtime_*` 指标（`workers` / `running` / `messages_sent` /
+它注册 15 条 `zigmodu_runtime_*` 指标（`workers` / `running` / `messages_sent` /
 `messages_received` / **`messages_dropped`** / `handler_errors` / `timer_fires` /
-**`timers_discarded`** / **`timer_lag_ms`**）。名字里没有 `_total` 后缀是刻意的：这些是**抓取时采样**的快照，
+**`timers_discarded`** / **`timer_lag_ms`**，加上池化执行（§12）的 6 条：`pool_declared` /
+`pool_threads` / `pool_ready_len` / `pool_claimed` / `pool_dispatches` /
+`pool_ready_push_failures`）。名字里没有 `_total` 后缀是刻意的：这些是**抓取时采样**的快照，
 所以走 gauge 而不是 counter（`PrometheusMetrics.Counter` 没有 `set`）。
 
+**池的 6 条读什么**（§12.10 那句"`zmodu_runtime_*` 里没有池的指标"已经作废）：
+
+| 指标 | 含义 | 怎么读 |
+|------|------|--------|
+| `pool_declared` | 声明的 `max_pooled_workers`（上界，不是 worker 数） | `0` = 这个 runtime 没有池（环/线程都不存在） |
+| `pool_threads` | 池线程数（Phase 1 只有 0 或 1） | `pool_claimed` 的天花板；Phase 2 起变多 |
+| `pool_ready_len` | 就绪环里现有 token 数 = 排队等池线程的 worker 数 | 每个 worker 至多一个 token（D4），所以它 ≤ `pool_declared` |
+| `pool_claimed` | **此刻**正被池线程执行的 worker 数 | 池化后 `running` 不再回答"有多少活儿在跑"，这条回答 |
+| `pool_dispatches` | 池线程跑过的批次总数 | **有 `.pooled` spawn 却是 0 = 那些 worker 从没到过池线程** |
+| `pool_ready_push_failures` | 被环拒收的 token 数 | **必须恒为 0**。见 §5 第 4 条：这不是背压，是调度器失联 |
+
+没有池的 runtime 这 6 条**报 0 而不是缺行**：`pool_declared=0` 本身就是"这里没人声明过池"的答案，
+仪表盘不必为它写特例。
+
 **为什么必须有这一步**：`messages_dropped` 与 `timer_lag_ms` 只在这里出现 —— 邮箱打满、定时器被饿死
-在 HTTP 侧**完全看不见**，只看请求直方图会得出"一切正常"的结论。
+在 HTTP 侧**完全看不见**，只看请求直方图会得出"一切正常"的结论。池化之后同理：`pool_claimed` /
+`pool_ready_len` / `pool_ready_push_failures` 在 `RuntimeStats` 里根本不存在（那是**进程内**读数，
+由 `rt.poolStats()` 给），HTTP 侧更是完全无感。
 
 `MetricsBridge` 对 `MetricsT` 是鸭子类型（只要求 `createGauge` + `Gauge.set`），所以 runtime 层
 不依赖 observability 层。`bridge` 的生命周期要覆盖进程（别放在会返回的栈帧里）。
@@ -429,7 +447,8 @@ fn traceFromHeader(id: []const u8) zigmodu.runtime.TraceId {
 | **v0.28.0** | 定时器时间轮改为 **ticker-owned**：`Runtime` 命令队列（`arm`/`cancel` 同一条 FIFO）+ 生产者侧 id/deadline；`cancelTimer` 拆成 `requestCancelTimer`（请求）/ `cancelTimerSync`（要结果） | ✅ 本文档 §3/§4（**Breaking**：旧的 `cancelTimer(id) bool` 已删 —— 第 2 节第 10 条那条分层契约的先例） |
 | **v0.28.0** | `shutdown()` 释放**已进轮**的待触发 payload（`Wheel.drainAll`，在 owner 线程上 drain）+ `RuntimeStats.timers_discarded` / `zigmodu_runtime_timers_discarded` | ✅ 本文档 §3/§4/§8（**非 Breaking**：补上 ticker-owned 那批的"未附带"项） |
 | **v0.28.0** | `shutdown()` 顺序改为**先停 ticker 再拆 worker**（关掉 "ticker 向已 destroy 的 handle 投递" 的 use-after-free 窗口）+ `onTimerFire` 在 `alive = false` 时只 drop 不 post | ✅ 本文档 §3（**非 Breaking**：签名不变，只多一次 `alive` 读） |
-| **未发版** | WorkerPool **Phase 1**：`spawn(..., .{ .mode = .pooled })` + `queued`/`claimed` 两位 + 就绪环 + **一条**池线程（`src/runtime/scheduler.zig`）；池在 `Runtime.initWithOptions` 声明的上界内 | ✅ 本文档 §12.10（**Breaking：否** —— 第三参同时接受 `256` 与 `.{ .capacity = 256, .mode = .pooled }`；`run` 型 worker 用 `.pooled` 是编译期报错，见 `scripts/check-pool-guard.sh`） |
+| **未发版** | WorkerPool **Phase 1**：`spawn(..., .{ .mode = .pooled })` + `queued`/`claimed` 两位 + 就绪环 + **一条**池线程（`src/runtime/scheduler.zig`）；池在 `Runtime.initWithOptions` / `builder.withMaxPooledWorkers` 声明的上界内 | ✅ 本文档 §12.10（**Breaking：否** —— 第三参同时接受 `256` 与 `.{ .capacity = 256, .mode = .pooled }`；`run` 型 worker 用 `.pooled` 是编译期报错，见 `scripts/check-pool-guard.sh`） |
+| **未发版** | 池的**可观测性与示例**：6 条 `zigmodu_runtime_pool_*`（§8）+ `examples/runtime-workers` 的 audit 环真的以 `.pooled` 跑（`[pool] dispatched>0` 才算过）+ `zmodu runtime` 报池声明 | ✅ 本文档 §12.10 末节（**Breaking：否**；顺带修掉 `Application.Config.max_pooled_workers` 没被 `Application.init` 拷贝的接线缺口） |
 | 1.0 | API 收敛、命名统一、deprecated 清理 | 计划 |
 
 ## 10. 最小示例
@@ -747,6 +766,14 @@ var rt = try Runtime.initWithOptions(allocator, io, .{      // 池在构造时�
 const audit = try rt.spawn(AuditWorker, .{}, .{ .capacity = 64, .mode = .pooled });
 ```
 
+应用里走 builder 的同一条声明（`app.runtime()` / `ctx.runtime()` 创建的就是它）：
+
+```zig
+var b = zmodu.builder(allocator, io);
+defer b.deinit();
+var app = try b.withName("app").withMaxPooledWorkers(64).build(.{MyModule});
+```
+
 **那条派生不变量的落地形式**（安全支点，见本文件 §5 第 4 条）：
 
 * 环容量 = `ceilPowerOfTwo(max_pooled_workers)`（最小 2），在 `Scheduler.init` 里**按声明的上界**算，
@@ -779,6 +806,14 @@ const audit = try rt.spawn(AuditWorker, .{}, .{ .capacity = 64, .mode = .pooled 
 | `stats().running` | 线程活着 | 正被 claim（所以总量上界 = 池线程数，§12.9 第 4 条） |
 | `join()` | `Thread.join` | 等 claim 交还（自旋；它只在停机路径被调用） |
 | `stop()` | 关邮箱 + 唤醒 `recv` | 同上；池把邮箱抽干后不再为它排 token |
+| **`spawnActor` 监督停机**（实测探针，非推理） | 循环 `break`，邮箱里剩下的消息**被丢弃且不计数** | **继续把邮箱抽干**：`handle` 对每条剩余消息再跑一次（同一个 failing actor、8 条投递：dedicated `handled=2/8`、pooled `handled=8/8`），抽干后才不再排 token |
+
+**监督停机那一行是本表唯一"两种模式下语义真的不同"的地方**，写下来是因为它容易被读成 bug：
+`.pooled` 的 `stop()` 语义是"把邮箱抽干后不再调度"（本节上一段就写了这一句），而 dedicated 的
+`handle` 循环是 `break` 走人 —— 于是同一个 `spawnActor(..., .max_errors = N)` 在两种模式下
+"停机之后还跑不跑 handler"答案不同。**Phase 1 不改**（改它要么让 pooled 也丢弃队列、要么给
+dedicated 加"抽干后再停"，两者都是语义决定而不是 bugfix，且都会动到 D5 那条回执出口），
+先把事实记在这里；真要统一时，请连同"被丢弃的剩余消息该不该有个计数"一起定。
 
 **停机顺序**（在 §3 的老顺序上多一步，§12.6/§12.9 第 3 条）：`alive=false` → 停 ticker →
 **停池线程（join）** → 断言没有 worker 还握着 claim → request/join/destroy worker → 收尾定时器。
@@ -790,5 +825,21 @@ const audit = try rt.spawn(AuditWorker, .{}, .{ .capacity = 64, .mode = .pooled 
 * 多池线程（Phase 1 只有一条；协议里的 two-bit 与环都是按"读者只在 pop 时认领"写的，加线程前要
   把 §12.3/§12.10 的推理重新做一遍）；
 * `batch` 的实测调优（默认 16，D3 的起点；per-worker 覆盖也没做）；
-* 公平性加权、优先级、CPU affinity/NUMA（§12.7 本来就排除）；
-* `zmodu_runtime_*` 里**没有**池的指标（`RuntimeStats.running` 是间接信号；`poolStats()` 是进程内读数）。
+* 公平性加权、优先级、CPU affinity/NUMA（§12.7 本来就排除）。
+
+**Phase 1 落地后补的三件（原"没做"清单里已划掉）**：
+
+1. **示例真的跑池了**：`examples/runtime-workers` 的 audit worker（长尾那一环：消息驱动、
+   故意慢、且不在 `feed → book → risk` 的延迟链上，见 §12.5）现在以
+   `.{ .capacity = 64, .mode = .pooled }` spawn，池的上界由
+   `builder.withMaxPooledWorkers(1)` 声明。运行时打印一行
+   `[pool] declared=1 threads=1 spawned=1 dispatched=N claimed=0 ready_len=0 push_failures=0`，
+   并在 `dispatched == 0` / `push_failures != 0` 时**以非零退出码失败** —— 也就是说这一环不再是
+   "编译过就算数"，而是每次 `zig build run` 都验证一遍：单测过 ≠ 真跑过。
+   （`audit.state.kept` 在池化后仍是**运行中**的瞬时读数，不要当全量。）
+2. **池进了 Prometheus**：§8 的那 6 条 `zigmodu_runtime_pool_*`。`pool_dispatches` 是"池真的被用了"
+   的远程可读证据，`pool_ready_push_failures` 是"必须恒 0"的契约读数。
+3. **`zmodu runtime` 认识了池的两种写法**：`.max_pooled_workers = N` 与 `withMaxPooledWorkers(N)`
+   各报一条带 `file:line` 的事实，外加"有几条 spawn 写了 `.mode = .pooled`"。仍然只报看得见的事实：
+   它**不**去判断"声明的池和 `.pooled` 的 spawn 是不是同一个 build"、也不去判断 pooled worker 是否
+   可达 —— 那是文本判不了的。

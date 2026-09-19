@@ -307,26 +307,41 @@ zmodu runtime [dir]        # 人读报告（默认目录 "."）
 zmodu runtime --json       # 机器可读（CI / dashboard）
 ```
 
-报告六块：是否用了 runtime、worker（`spawn`/`spawnActor`/`spawnSupervised` 的**类型名 + 邮箱容量**）、
+报告七块：是否用了 runtime、worker（`spawn`/`spawnActor`/`spawnSupervised` 的**类型名 + 邮箱容量 +
+写入的 `.mode`**）、**池（`max_pooled_workers` 声明 + 有几条 spawn 写了 `.mode = .pooled`）**、
 邮箱/队列原语（`Mailbox(` / `RingBuffer(` / `MpscRing(` / `ObjectPool(` / `HotBus(`）、
 定时器调用点（`after(` / `scheduleAction(` / `requestCancelTimer(` / `cancelTimerSync(`）、
 录制/追踪引用（`attachRecorder(` / `Recorder(` / `sendTraced(` / `sendBlockingTraced(` / `ctx.traceId(`）、
 时钟选择（`Clock.manual` / `.manual =` / `.monotonic`），末尾一行汇总：
 
 ```
-summary: 9 worker(s), 1 bus(es), 1 timer call site(s), recording: no, tracing: no
+workers (4 spawn site(s)):
+  spawn Risk mailbox 256  (src/main.zig:200)
+  spawn Audit mailbox 64 mode=pooled  (src/main.zig:214)
+  ...
+pool (.mode = .pooled; docs/RUNTIME.md §12):
+  spawn site(s) writing .mode = .pooled: 1 of 4
+  declared max_pooled_workers=1  [withMaxPooledWorkers(]  (src/main.zig:251)
+...
+summary: 4 worker(s) (1 .pooled), 4 bus(es), 1 timer call site(s), pool: declared, recording: no, tracing: no
 ```
 
-容量只在**读得出来**时才给数字：字面量（`256`、`1_024`）直接用；写成 `api.order_capacity`
+容量与池的上界只在**读得出来**时才给数字：字面量（`256`、`1_024`）直接用；写成 `api.order_capacity`
 这种常量时，顺着该文件自己的 `@import("api.zig")` 找到 `pub const order_capacity: usize = 256;`
 再用那个数；读不出来就报 `?`（并把原表达式附在后面）——不猜。所以 `alpha-engine` 报的是
 `mailbox 256 (api.mailbox_capacity)`。
 
-**它不做什么**（很重要）：它**不读活进程**。队列深度、`dropped_full`、`timer_lag_ms` 是运行中进程的
-属性，已由 `Runtime.MetricsBridge` 导出成 Prometheus 指标 —— 抓取配方见
+池的两种声明形态都认：`.max_pooled_workers = N`（`Runtime.InitOptions.scheduler` 或
+`Application.Config`）与 `withMaxPooledWorkers(N)`（app builder），各报一条带 `file:line` 的事实。
+`mode=…` 只在调用**写了** `.mode` 时才打印：`rt.spawn(W, .{}, 256)` 就是 `.dedicated`
+（那是 API 默认），但**默认值不是文本说的事**，所以 `--json` 里是 `null` 而不是替它填一个。
+
+**它不做什么**（很重要）：它**不读活进程**。队列深度、`dropped_full`、`timer_lag_ms`，以及池自己的
+读数（`pool_claimed` / `pool_ready_len` / `pool_ready_push_failures`）都是运行中进程的属性，
+已由 `Runtime.MetricsBridge` 导出成 Prometheus 指标 —— 抓取配方见
 [`RUNTIME.md`](RUNTIME.md) §8。它也**不做任何判据**：只报看得见的事实（"`attachRecorder(` 在
-`src/x.zig:42`"），不做静态不可靠的推断（"recorder 是不是在 `freeze()` 之后挂的"），
-所以 `--json` 可以直接进 CI 而不产生假警报。
+`src/x.zig:42`"），不做静态不可靠的推断（"recorder 是不是在 `freeze()` 之后挂的"，
+"声明了池的那个 build 和 `.pooled` 的 spawn 是不是同一个"），所以 `--json` 可以直接进 CI 而不产生假警报。
 
 退出码：`0` 正常（**项目没用 runtime 也是 0**，那是默认状态，报告会说 `uses runtime: no`）；
 `1` 目标目录读不了；`2` 用法错误（未知 flag / 多个目录参数）。

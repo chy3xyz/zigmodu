@@ -129,6 +129,7 @@ pub const Application = struct {
                 .auto_generate_docs = options.auto_generate_docs,
                 .docs_path = options.docs_path,
                 .max_dependencies = options.max_dependencies,
+                .max_pooled_workers = options.max_pooled_workers,
             },
             .state = .initialized,
             .shutdown_hooks = std.ArrayList(*const fn () void).empty,
@@ -377,6 +378,11 @@ pub const ApplicationBuilder = struct {
     comptime_graph_check: bool = true,
     /// Advisory threshold for "this module depends on too much".
     max_dependencies: usize = 8,
+    /// Declared upper bound on `.pooled` workers, handed to the runtime
+    /// `app.runtime()` creates (`Config.max_pooled_workers`). `0` — the default —
+    /// means the app has no pool, so a `.mode = .pooled` spawn is refused
+    /// (docs/RUNTIME.md §12.8 D2).
+    max_pooled_workers: usize = 0,
 
     const PendingService = struct {
         name: []const u8,
@@ -421,6 +427,16 @@ pub const ApplicationBuilder = struct {
 
     pub fn withValidation(self: *ApplicationBuilder, enabled: bool) *ApplicationBuilder {
         self.validate_on_start = enabled;
+        return self;
+    }
+
+    /// Declare the runtime pool this app may use (docs/RUNTIME.md §12.8 D2): the
+    /// runtime behind `app.runtime()` / `ctx.runtime()` is sized for it, and its
+    /// pool thread appears with the first `.pooled` spawn. Left alone, the app
+    /// has no pool and `.mode = .pooled` is refused at `spawn` — a declaration is
+    /// what makes the ready ring's capacity follow the bound.
+    pub fn withMaxPooledWorkers(self: *ApplicationBuilder, max_pooled_workers: usize) *ApplicationBuilder {
+        self.max_pooled_workers = max_pooled_workers;
         return self;
     }
 
@@ -483,6 +499,7 @@ pub const ApplicationBuilder = struct {
                 .auto_generate_docs = self.auto_generate_docs,
                 .docs_path = self.docs_path,
                 .max_dependencies = self.max_dependencies,
+                .max_pooled_workers = self.max_pooled_workers,
             },
         );
         errdefer app.deinit();
@@ -954,6 +971,58 @@ test "e2e: a module spawns workers through ctx.runtime() and stop() joins them" 
         .services = &app.services,
     };
     try std.testing.expectError(error.RuntimeUnavailable, bare.runtime());
+}
+
+test "e2e: the builder's pool declaration reaches the runtime a module spawns .pooled on" {
+    const allocator = std.testing.allocator;
+
+    const Shared = struct {
+        var handled = std.atomic.Value(u32).init(0);
+    };
+    Shared.handled.store(0, .monotonic);
+
+    const Audit = struct {
+        pub const Message = u32;
+        pub fn handle(_: *@This(), msg: u32, ctx: anytype) anyerror!void {
+            _ = msg;
+            _ = ctx;
+            _ = Shared.handled.fetchAdd(1, .monotonic);
+        }
+    };
+
+    const TailModule = struct {
+        pub const info = api.Module{
+            .name = "tail",
+            .description = "Long-tail worker, pooled",
+            .dependencies = &.{},
+        };
+        pub fn initWith(ctx: *ModuleContext) !void {
+            const rt = try ctx.runtime();
+            // `.pooled` is a configuration error without a declared pool, so this
+            // line passing is what says the builder's declaration arrived here.
+            const audit = try rt.spawn(Audit, .{}, .{ .capacity = 8, .mode = .pooled });
+            for (0..4) |i| try audit.send(@intCast(i));
+        }
+        pub fn deinit() void {}
+    };
+
+    var b = builder(allocator, std.testing.io);
+    defer b.deinit();
+    var app = try b.withName("pooled-app").withMaxPooledWorkers(1).build(.{TailModule});
+    defer app.deinit();
+    try app.start();
+
+    const rt = try app.runtime();
+    try std.testing.expectEqual(@as(usize, 1), rt.poolStats().?.max_pooled_workers);
+    var spins: usize = 0;
+    while (Shared.handled.load(.monotonic) != 4 and spins < 400_000_000) : (spins += 1) std.atomic.spinLoopHint();
+    try std.testing.expectEqual(@as(u32, 4), Shared.handled.load(.monotonic));
+    // The batches really ran on the pool: the token path was taken, not a thread
+    // of the worker's own.
+    try std.testing.expect(rt.poolStats().?.dispatches >= 1);
+    try std.testing.expectEqual(@as(u64, 0), rt.poolStats().?.ready_push_failures);
+
+    app.stop();
 }
 
 test "e2e: in-flight counter tracks request lifecycle" {

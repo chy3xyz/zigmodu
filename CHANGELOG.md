@@ -53,7 +53,45 @@ const book = try rt.spawn(OrderBook, .{}, 256);   // 仍是 .dedicated
   `batch = 1` 把回执窗口打满、断言一条不丢；以及"停机时池线程正在跑"的 UAF 窗口）。
   `zig build test` 全绿。
 - **没做（Phase 2 起）**：多池线程、`batch` 实测调优（16 是 D3 的设计起点，不是结论）、公平性加权、
-  affinity/NUMA、池的 Prometheus 指标、per-worker batch 覆盖。见 `docs/RUNTIME.md` §12.10。
+  affinity/NUMA、per-worker batch 覆盖。见 `docs/RUNTIME.md` §12.10。
+  （池的 Prometheus 指标原文也在这个清单里 —— 已被下面那条补上。）
+
+### 补上 Phase 1 的三处 `TODO`：示例真跑池 · 池的 Prometheus 指标 · CLI 认识池（**破坏性：否**）
+
+Phase 1（上一条）留下了三处"设计/单测都对，但没真跑过 / 没接出去"的缺口。这轮逐个补掉，
+原则是**从运行中读出来的数**而不是常量：
+
+- **示例真的跑池了**（`examples/runtime-workers`）：`audit` worker 改为
+  `.{ .capacity = 64, .mode = .pooled }`，池的上界在 app builder 上声明
+  （`b.withMaxPooledWorkers(1)`）。选它的理由对着 §12.5 的边界：消息驱动、故意慢、
+  且不在 `feed → book → risk` 的延迟链上 —— 那条链每一跳都进关键路径，继续 `.dedicated`。
+  运行时打印 `[pool] declared=1 threads=1 spawned=1 dispatched=N claimed=0 ready_len=0 push_failures=0`
+  并**在 `dispatched == 0` 或 `push_failures != 0` 时以非零退出码结束**：编译过不算数，
+  每次 `zig build run` 都验证"token 真的到了池线程"（`spawned` + `dispatches` 只能由池化路径抬高，
+  dedicated worker 从不往就绪环里放 token）。示例的业务逻辑一行未改，只改执行模式与接线。
+- **池进了 Prometheus**：`Runtime.MetricsBridge` 新增 6 条 gauge —— `zigmodu_runtime_pool_declared` /
+  `pool_threads` / `pool_ready_len` / `pool_claimed` / `pool_dispatches` / `pool_ready_push_failures`
+  （共 15 条）。`pool_dispatches` 是"池真的被用了"的远程可读证据，`pool_ready_push_failures`
+  照旧是**必须恒 0** 的契约读数（§5 第 4 条：那不是背压，是调度器失联）。没声明池的 runtime
+  这 6 条**报 0 而不是缺行**。鸭子类型契约没变（仍只要求 `createGauge` + `Gauge.set`）。
+  读数来自 `Scheduler.Stats` 新增的 `pool_threads` / `claimed`（后者由 `step`/`runOne` 的
+  claim 生命周期计数：批次的 claim 真的交还之后才减）。
+- **`zmodu runtime` 认识池的两种写法**：`.max_pooled_workers = N` 与 `withMaxPooledWorkers(N)` 各报一条
+  带 `file:line` 的事实，另加"有几条 spawn 写了 `.mode = .pooled`"（`spawn Audit mailbox 64 mode=pooled`）；
+  `--json` 每个 worker 多一个 `mode` 字段（`null` = 该调用没写 mode —— API 默认是 `.dedicated`，
+  但**默认值不是文本说的事**，所以不填）与顶层 `pool` 对象。仍然只报看得见的事实：不判断声明的池与
+  `.pooled` 的 spawn 是否同一个 build，也不判断可达性。
+- **顺手修掉一处真接线缺口**：`Application.Config.max_pooled_workers` 文档里承诺"`app.runtime()`
+  创建的 runtime 按它 sizing"，但 `Application.init` 的结构体字面量**没有拷贝这个字段**、
+  `ApplicationBuilder` 也没有对应方法 —— 即通过 builder/`Application` 路径**根本声明不了池**
+  （恒为 0，`.pooled` 必然 `error.PoolNotConfigured`）。现在 `init` 会拷贝，
+  builder 多了 `withMaxPooledWorkers(n)`，并补了端到端用例（模块在 `ctx.runtime()` 上 `.pooled` spawn、
+  断言 `poolStats().max_pooled_workers` 与 `dispatches ≥ 1`）。这也是示例能声明池的前提。
+- **顺带实测到一处两种模式不一致（只记进文档，未改行为）**：`spawnActor` 监督停机后，dedicated 的
+  worker 直接 `break`（邮箱里剩下的消息被丢弃、且不计数），pooled 的 worker 会把邮箱**抽干**
+  （每条剩余消息都再跑一次 `handle`）。同一个 8 条的探针：dedicated `handled=2/8`、pooled `handled=8/8`。
+  §12.10 的生命周期表原本只写了"池把邮箱抽干后不再排 token"，没有点出**它与 dedicated 的差别**，
+  现补一行实测记录与"Phase 1 不改"的理由（要统一得先决定丢弃的剩余消息是否该有计数）。
 
 ### `check-version.sh` 跳过 `test { … }` 块内的版本形字面量 —— 消除的是一类误报（**破坏性：否**）
 

@@ -1074,6 +1074,14 @@ pub const Runtime = struct {
     /// no dependency on the observability layer; the bridge outlives the
     /// process, so keep it in a stable location (not a stack frame you return
     /// from).
+    ///
+    /// The pool's counters (`docs/RUNTIME.md` §12) come from `poolStats()` and
+    /// are the half `RuntimeStats` cannot show: it counts *workers*, and after
+    /// poolization "how many workers exist" no longer answers "how much work is
+    /// in flight" — `pool_claimed` does, and `pool_ready_push_failures` is the
+    /// one number here that is a contract rather than a reading. A runtime with
+    /// no pool reports zeros for all of them rather than dropping the series:
+    /// "0 = no pool declared" is the first question a dashboard asks.
     pub fn MetricsBridge(comptime MetricsT: type) type {
         return struct {
             const Bridge = @This();
@@ -1088,6 +1096,12 @@ pub const Runtime = struct {
             timer_fires: *MetricsT.Gauge,
             timers_discarded: *MetricsT.Gauge,
             timer_lag_ms: *MetricsT.Gauge,
+            pool_declared: *MetricsT.Gauge,
+            pool_threads: *MetricsT.Gauge,
+            pool_ready_len: *MetricsT.Gauge,
+            pool_claimed: *MetricsT.Gauge,
+            pool_dispatches: *MetricsT.Gauge,
+            pool_ready_push_failures: *MetricsT.Gauge,
 
             /// Registers the gauges. Startup-time call: if a later `createGauge`
             /// fails, the earlier ones stay registered in `metrics`.
@@ -1103,6 +1117,12 @@ pub const Runtime = struct {
                     .timer_fires = try metrics.createGauge("zigmodu_runtime_timer_fires", "Timers fired"),
                     .timers_discarded = try metrics.createGauge("zigmodu_runtime_timers_discarded", "Timers released unfired at shutdown"),
                     .timer_lag_ms = try metrics.createGauge("zigmodu_runtime_timer_lag_ms", "Worst lateness between a timer deadline and its firing, in milliseconds"),
+                    .pool_declared = try metrics.createGauge("zigmodu_runtime_pool_declared", "Declared upper bound on .pooled workers (0 = no pool: no ring, no pool thread)"),
+                    .pool_threads = try metrics.createGauge("zigmodu_runtime_pool_threads", "Pool threads running (Phase 1: 0 or 1); the ceiling on pool_claimed"),
+                    .pool_ready_len = try metrics.createGauge("zigmodu_runtime_pool_ready_len", "Ready-ring occupancy: workers waiting for a pool thread, at most one token per worker"),
+                    .pool_claimed = try metrics.createGauge("zigmodu_runtime_pool_claimed", "Pooled workers a pool thread is executing right now (never above pool_threads)"),
+                    .pool_dispatches = try metrics.createGauge("zigmodu_runtime_pool_dispatches", "Batches the pool thread ran (0 with pooled spawns means they never reached the pool)"),
+                    .pool_ready_push_failures = try metrics.createGauge("zigmodu_runtime_pool_ready_push_failures", "MUST stay 0: a refused token push strands a worker (scheduler desync, not backpressure)"),
                 };
             }
 
@@ -1124,6 +1144,17 @@ pub const Runtime = struct {
                 self.timer_fires.set(@floatFromInt(s.timer_fires));
                 self.timers_discarded.set(@floatFromInt(s.timers_discarded));
                 self.timer_lag_ms.set(@floatFromInt(s.timer_lag_max_ms));
+
+                // `null` pool = zeros, not absent: the series answering "did
+                // anyone declare a pool here" is the same series that carries
+                // the reading when they did.
+                const p = self.rt.poolStats();
+                self.pool_declared.set(@floatFromInt(if (p) |x| x.max_pooled_workers else 0));
+                self.pool_threads.set(@floatFromInt(if (p) |x| x.pool_threads else 0));
+                self.pool_ready_len.set(@floatFromInt(if (p) |x| x.ready_len else 0));
+                self.pool_claimed.set(@floatFromInt(if (p) |x| x.claimed else 0));
+                self.pool_dispatches.set(@floatFromInt(if (p) |x| x.dispatches else 0));
+                self.pool_ready_push_failures.set(@floatFromInt(if (p) |x| x.ready_push_failures else 0));
             }
         };
     }
@@ -2793,6 +2824,119 @@ test "Runtime.MetricsBridge publishes RuntimeStats into a Prometheus scrape" {
     const retext = try metrics.toPrometheusFormat(allocator);
     defer allocator.free(retext);
     try check(retext, "zigmodu_runtime_messages_dropped", @floatFromInt(after.messages_dropped));
+}
+
+test "Runtime.MetricsBridge publishes the pool's counters, and they move with the pool" {
+    const PrometheusMetrics = @import("../metrics/PrometheusMetrics.zig").PrometheusMetrics;
+    const allocator = std.testing.allocator;
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = try Runtime.initWithOptions(allocator, std.testing.io, .{
+        .clock = .{ .manual = &clk },
+        .scheduler = .{ .max_pooled_workers = 2 },
+    });
+    defer rt.deinit();
+
+    const Pooled = struct {
+        const Shared = struct { handled: std.atomic.Value(u32) = .init(0) };
+        pub const Message = u32;
+        shared: *Shared = undefined,
+
+        pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
+            _ = msg;
+            _ = ctx;
+            _ = self.shared.handled.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var shared = Pooled.Shared{};
+    const pooled = try rt.spawn(Pooled, .{ .shared = &shared }, .{ .capacity = 8, .mode = .pooled });
+
+    var metrics = PrometheusMetrics.init(allocator);
+    defer metrics.deinit();
+    var bridge = try Runtime.MetricsBridge(PrometheusMetrics).init(&rt, &metrics);
+    metrics.setScrapeHook(@TypeOf(bridge).sample, &bridge);
+
+    const check = struct {
+        fn gauge(body: []const u8, name: []const u8, value: f64) !void {
+            var buf: [128]u8 = undefined;
+            const line = try std.fmt.bufPrint(&buf, "{s} {d:.6}", .{ name, value });
+            try std.testing.expect(std.mem.indexOf(u8, body, line) != null);
+        }
+    }.gauge;
+
+    // Cold: spawning a pooled worker deploys the pool (a ring and a thread), so
+    // the three structural gauges are already non-zero — while nothing has run
+    // yet, which is what `dispatches` at 0 says.
+    const cold = rt.poolStats().?;
+    try std.testing.expectEqual(@as(usize, 2), cold.max_pooled_workers);
+    try std.testing.expectEqual(@as(usize, 1), cold.pool_threads);
+    try std.testing.expectEqual(@as(u64, 0), cold.dispatches);
+    try std.testing.expectEqual(@as(usize, 0), cold.claimed);
+    bridge.publish();
+    const cold_text = try metrics.toPrometheusFormat(allocator);
+    defer allocator.free(cold_text);
+    try check(cold_text, "zigmodu_runtime_pool_declared", @floatFromInt(cold.max_pooled_workers));
+    try check(cold_text, "zigmodu_runtime_pool_threads", @floatFromInt(cold.pool_threads));
+    try check(cold_text, "zigmodu_runtime_pool_ready_len", @floatFromInt(cold.ready_len));
+    try check(cold_text, "zigmodu_runtime_pool_claimed", @floatFromInt(cold.claimed));
+    try check(cold_text, "zigmodu_runtime_pool_dispatches", @floatFromInt(cold.dispatches));
+    try check(cold_text, "zigmodu_runtime_pool_ready_push_failures", @floatFromInt(cold.ready_push_failures));
+
+    // Warm: messages reach the pool thread, so `pool_dispatches` moves — the
+    // reading that says "the pooled path was actually taken" rather than merely
+    // declared. The scrape is compared against `poolStats()` taken *after*
+    // `join()`, when nothing else can be running, so the two cannot disagree.
+    for (0..5) |i| try pooled.send(@intCast(i));
+    try waitUntil(Published(@TypeOf(shared.handled), u32){ .value = &shared.handled, .want = 5 }, 5_000);
+    pooled.stop();
+    pooled.join(); // pooled join: waits for the claim to come back and the mailbox to drain
+
+    const warm = rt.poolStats().?;
+    try std.testing.expect(warm.dispatches >= 1);
+    try std.testing.expectEqual(@as(usize, 0), warm.claimed);
+    try std.testing.expectEqual(@as(usize, 0), warm.ready_len);
+    try std.testing.expectEqual(@as(u64, 0), warm.ready_push_failures);
+
+    bridge.publish();
+    const warm_text = try metrics.toPrometheusFormat(allocator);
+    defer allocator.free(warm_text);
+    try check(warm_text, "zigmodu_runtime_pool_dispatches", @floatFromInt(warm.dispatches));
+    try check(warm_text, "zigmodu_runtime_pool_claimed", @floatFromInt(warm.claimed));
+    try check(warm_text, "zigmodu_runtime_pool_ready_len", @floatFromInt(warm.ready_len));
+    try check(warm_text, "zigmodu_runtime_pool_ready_push_failures", @floatFromInt(warm.ready_push_failures));
+}
+
+test "Runtime.MetricsBridge reports no pool as zeros" {
+    const PrometheusMetrics = @import("../metrics/PrometheusMetrics.zig").PrometheusMetrics;
+    const allocator = std.testing.allocator;
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(allocator, std.testing.io, .{ .manual = &clk }); // no pool declared
+    defer rt.deinit();
+
+    var metrics = PrometheusMetrics.init(allocator);
+    defer metrics.deinit();
+    var bridge = try Runtime.MetricsBridge(PrometheusMetrics).init(&rt, &metrics);
+    metrics.setScrapeHook(@TypeOf(bridge).sample, &bridge);
+
+    try std.testing.expect(rt.poolStats() == null);
+    const text = try metrics.toPrometheusFormat(allocator);
+    defer allocator.free(text);
+    // The series exist and read 0: "this runtime has no pool" is an answer a
+    // dashboard can graph, not a missing line it has to special-case.
+    for ([_][]const u8{
+        "zigmodu_runtime_pool_declared",
+        "zigmodu_runtime_pool_threads",
+        "zigmodu_runtime_pool_ready_len",
+        "zigmodu_runtime_pool_claimed",
+        "zigmodu_runtime_pool_dispatches",
+        "zigmodu_runtime_pool_ready_push_failures",
+    }) |name| {
+        var buf: [128]u8 = undefined;
+        const line = try std.fmt.bufPrint(&buf, "{s} {d:.6}", .{ name, @as(f64, 0) });
+        try std.testing.expect(std.mem.indexOf(u8, text, line) != null);
+    }
 }
 
 // ─────────────────────────────────────────────────

@@ -108,7 +108,7 @@ CI、`scripts/ci-*.sh`、本文件都用那个。`cd tools/zmodu && zig build` �
 | 运行时是 opt-in：不调用 `app.runtime()` 就零线程、零定时器（v0.16 起） | 为普通 CRUD API 引入 worker（多一层，没有收益） |
 | 会持续失败的 worker 用 `spawnActor` + `max_errors`/`window_ms` 预算（停 + 计数），需要现场判断就声明 `onError` | 让"每条消息都出错"的 actor 永远只记录不停止（线程活着、邮箱在收，但是个 CPU 黑洞） |
 | 一个事件多个消费者且发布方不能等：`runtime.HotBus(E,N)` + 启动期 `subscribe(...)` + `freeze()` | 把 L0 扇出接到 `app.eventBus`（L1 会分配、可慢），或在热路径上自己遍历订阅者加锁 |
-| 长尾 worker 用池化：`Runtime.initWithOptions(.{ .scheduler = .{ .max_pooled_workers = N } })` + `spawn(W, .{}, .{ .capacity = c, .mode = .pooled })`（`Application.Config.max_pooled_workers` 同理） | 不声明就用 `.pooled`（`error.PoolNotConfigured`）或超过声明上界（`error.PoolCapacityExceeded`）—— 上界是硬上限，环容量按它算 |
+| 长尾 worker 用池化：`Runtime.initWithOptions(.{ .scheduler = .{ .max_pooled_workers = N } })` + `spawn(W, .{}, .{ .capacity = c, .mode = .pooled })`；应用里用 `builder.withMaxPooledWorkers(N)`（`Application.Config.max_pooled_workers` 同理）；跑起来的参照是 `examples/runtime-workers` 的 audit 那一环（`[pool] … dispatched>0`） | 不声明就用 `.pooled`（`error.PoolNotConfigured`）或超过声明上界（`error.PoolCapacityExceeded`）—— 上界是硬上限，环容量按它算 |
 | `.pooled` 只给消息驱动 worker（`Message` + `handle`）；`run` 型必须 `.dedicated` | 把 `.pooled` 给 `run` 型（编译期报错，`scripts/check-pool-guard.sh` 兜底）；把 `poolStats().ready_push_failures` 当背压读数 |
 | 就绪环的 token 是"一个 worker 的调度权"，不是消息：环满 = 调度器失联（断言 + 计数，不是丢） | 把环满当普通满队列丢掉（丢一个 token = 那个 worker 永久不再被调度，邮箱却继续收） |
 | 模块依赖靠 `build(.{...})` 的编译期图检查拦住（环/缺失/自依赖/重名，报错带环路径） | 用 `@import` 跨模块直接引用对方内部文件（`zmodu doctor` 会报纠缠 + 文件:行） |
@@ -129,7 +129,7 @@ CI、`scripts/ci-*.sh`、本文件都用那个。`cd tools/zmodu && zig build` �
 | 启动跑 `zigmodu.Preflight.run(...)`（env/secret/DB/迁移/时钟） | 用占位 JWT secret 或默认配置上线（预检会拦，别绕过） |
 | 生产接线的参考实现看 `examples/tenant-mgmt`（`productionProfile`）与 `examples/zmsaas`（Preflight + 池/积压指标） | 让示例停在上古手工接线（文档承诺、旗舰不用） |
 | 换 JWT 密钥走 `JwksKeyRing` + `setKeyring`（带 kid，新旧双验） | 直接改 secret 重启（全员强制重登；或留下无法验证的旧 token） |
-| outbox 用 `consumer.setMetrics` + `startPolling`；池/积压用 `metrics.setScrapeHook`；**运行时用 `Runtime.MetricsBridge` + `setScrapeHook`**（`messages_dropped` / `timer_lag_ms` 只在这里看得见，HTTP 侧完全无感） | 只盯 HTTP 指标（outbox 停投、池打满、邮箱打满、ticker 饿死在 HTTP 层完全看不见） |
+| outbox 用 `consumer.setMetrics` + `startPolling`；池/积压用 `metrics.setScrapeHook`；**运行时用 `Runtime.MetricsBridge` + `setScrapeHook`**（`messages_dropped` / `timer_lag_ms` 只在这里看得见，HTTP 侧完全无感；池化后还有 6 条 `zigmodu_runtime_pool_*`，其中 `pool_claimed` / `pool_ready_push_failures` 是 `RuntimeStats` 里根本没有的读数） | 只盯 HTTP 指标（outbox 停投、池打满、邮箱打满、ticker 饿死在 HTTP 层完全看不见） |
 | 新增 `pub` 导出的组件时，**同时**写一条真正实例化它的测试（调用链要打通，不只是 `@import`） | 只导出、没调用者 —— Zig 惰性分析函数体，签名过期/编译不过要等用户真正调用才炸（`LogRotator` 就这么烂了很久） |
 | 租户模型上声明 `pub const sql_tenant_column: ?[]const u8 = "tenant_id"`（`zmodu scaffold` 已默认生成）——隔离变成编译期强制 | 靠"记得调 `*ForTenant`"：无作用域变体在租户模型上照样跨租户返回 |
 | 跨租户是合法需求时写 `*Unscoped`（`findByIdUnscoped` …），让危险操作在代码里一眼可见 | 为了绕过守卫而删掉 `sql_tenant_column` 声明 |

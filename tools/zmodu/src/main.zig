@@ -842,10 +842,11 @@ fn cmdCi(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) voi
 }
 
 /// `zmodu runtime [dir] [--json]` — the runtime wiring a project declares, read
-/// statically (worker spawns + mailbox capacities, mailbox/queue primitives,
-/// timer call sites, recorder/trace references, clock selection). It reads
-/// source only: live queue depth / dropped_full / timer_lag_ms live in
-/// `Runtime.MetricsBridge` — scrape `/metrics` (docs/RUNTIME.md §8).
+/// statically (worker spawns + mailbox capacities and modes, pool declarations,
+/// mailbox/queue primitives, timer call sites, recorder/trace references, clock
+/// selection). It reads source only: live queue depth / dropped_full /
+/// timer_lag_ms and the pool's own counters live in `Runtime.MetricsBridge` —
+/// scrape `/metrics` (docs/RUNTIME.md §8).
 fn cmdRuntime(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) void {
     const code = runtime_mod.run(io, allocator, args);
     if (code != 0) std.process.exit(code);

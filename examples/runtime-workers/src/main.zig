@@ -4,6 +4,8 @@
 //!   feed (thread)        book (worker)        risk (worker)      timer
 //!   random deltas   →    order book      →    position check →   snapshot every 200 ms
 //!                        (mailbox 256)        (mailbox 256)
+//!                             │
+//!                             └── HotBus fan-out → audit (worker, .pooled → pool thread) + metrics sink
 //! ```
 //!
 //! What it demonstrates, in the order the runtime docs introduce it:
@@ -22,6 +24,12 @@
 //!    rather than growing a queue. `stats().dropped_full` records the choice.
 //! 3. **Timers deliver messages** — the snapshot timer is `book.after(...)`, so it
 //!    runs on the book's thread with the book's state, not on the ticker's.
+//! 3b. **Pooled workers (`Scheduler`, docs/RUNTIME.md §12)** — the audit worker is the long tail
+//!    of this pipeline (message-driven, slow on purpose, and off the critical
+//!    path: the bus drops for it rather than slowing the book down), so it is
+//!    spawned `.mode = .pooled` and its batches run on the pool thread instead of
+//!    a thread of its own. `[pool] … dispatched=N` is the runtime saying that
+//!    path really was taken — see `docs/RUNTIME.md` §12.5 for the boundary.
 //! 4. **Graceful stop** — `app.stop()` requests stop, wakes every blocked
 //!    `recv`, then joins. Nothing is abandoned.
 //!
@@ -113,7 +121,9 @@ const Risk = struct {
 };
 
 /// Fan-out target: keeps the last N prices as an "audit trail". Slow by design
-/// (it appends), which is what makes the drop counter move.
+/// (it appends), which is what makes the drop counter move — and why it is the
+/// one worker here that is **pooled** rather than given a thread of its own
+/// (docs/RUNTIME.md §12.5: message-driven, long tail, not the latency chain).
 const Audit = struct {
     pub const Message = Delta;
     kept: usize = 0,
@@ -192,8 +202,16 @@ pub const Pipeline = struct {
         // L0 fan-out (v0.17): wired during startup, frozen before traffic. The
         // book publishes every accepted delta; a slow subscriber is *dropped and
         // counted* rather than allowed to slow the book down.
+        //
+        // The audit worker is spawned **pooled** (docs/RUNTIME.md §12): it is the long tail of
+        // this pipeline — slow by design, and the bus already drops for it
+        // instead of letting it hold up the book — so it runs its batches on the
+        // shared pool thread. The declaration it needs (`max_pooled_workers`) is
+        // on the app builder in `main`. The book and risk stay `.dedicated`:
+        // every hop of `feed → book → risk` is on the critical path, and the
+        // scheduled path costs one ready-ring round trip per message (§12.5).
         bus = runtime.HotBus(Delta, 4).init();
-        audit = try rt.spawn(Audit, .{}, 64);
+        audit = try rt.spawn(Audit, .{}, .{ .capacity = 64, .mode = .pooled });
         try bus.subscribe(audit.?); // a real worker (slow, deliberately)
         try bus.subscribeSink(metrics.sink()); // a plain sink, no worker needed
         bus.freeze();
@@ -222,9 +240,15 @@ pub fn main(init: std.process.Init) !void {
     // and joined by `app.stop()` — one lifecycle for the process, no stray
     // threads. (A runtime can also stand alone in a test: then you drive
     // `rt.tick()` with a Manual clock and own `rt.deinit()`.)
+    //
+    // `withMaxPooledWorkers` is the pool declaration docs/RUNTIME.md §12.8 D2
+    // asks for: the runtime behind `app.runtime()` is sized for it, and the
+    // pool thread appears with the first `.pooled` spawn (here: the audit
+    // worker, in `Pipeline.initWith`). Without the declaration `.pooled` is a
+    // configuration error at `spawn` — not a thread appearing behind your back.
     var b = zmodu.builder(allocator, io);
     defer b.deinit();
-    var app = try b.withName("runtime-workers").build(.{Pipeline});
+    var app = try b.withName("runtime-workers").withMaxPooledWorkers(1).build(.{Pipeline});
     defer app.deinit();
     try app.start(); // Pipeline.initWith spawned the whole pipeline
     const rt = try app.runtime();
@@ -284,6 +308,27 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("[book] mailbox cap={d} len={d} dropped_full={d} coalesced={d}", .{
         bs.mailbox_capacity, bs.mailbox_len, bs.dropped_full, book.state.coalesced,
     });
+
+    // Pooled path, read off the *running* runtime (docs/RUNTIME.md §12.10). The
+    // audit worker is the only `.pooled` spawn here, and the pool puts a token in
+    // the ready ring on every send it accepts — so `spawned=1` plus
+    // `dispatched>0` says the audit worker's batches ran on the pool thread,
+    // not on a thread of its own. A dedicated worker would leave all of these at
+    // zero. (The first publish cannot be dropped: the audit mailbox is empty and
+    // 64 slots wide, so a token exists as soon as the book has handled a delta.)
+    spins = 0;
+    while (rt.poolStats().?.dispatches == 0 and spins < 200_000_000) : (spins += 1) std.atomic.spinLoopHint();
+    const pool = rt.poolStats().?;
+    std.log.info("[pool] declared={d} threads={d} spawned={d} dispatched={d} claimed={d} ready_len={d} push_failures={d}", .{
+        pool.max_pooled_workers, pool.pool_threads, pool.spawned,             pool.dispatches,
+        pool.claimed,            pool.ready_len,    pool.ready_push_failures,
+    });
+    // Exit code is the conclusion, as with `[done]` below: a `.pooled` worker
+    // that never reached the pool thread, or a token the ring refused to take,
+    // is a failure of the one thing this example now demonstrates.
+    if (pool.dispatches == 0) return error.PooledWorkerNeverDispatched;
+    if (pool.spawned == 0 or pool.pool_threads == 0) return error.PoolNeverDeployed;
+    if (pool.ready_push_failures != 0) return error.PoolTokenRefused;
 
     app.stop(); // requests stop, wakes blocked recvs, joins
     std.log.info("[done] every worker joined", .{});
