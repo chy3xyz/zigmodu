@@ -3,7 +3,7 @@
 #   - bare `catch {}`        — swallows errors silently
 #   - `catch unreachable`    — turns runtime errors into panics
 #
-# Scope (see SCANNER below):
+# Scope (see scripts/lib/zig-scan.awk, shared with check-version.sh):
 #   * whole file, not "up to the first `test \"` line" — that truncation used to
 #     hide ~3000 lines of src/api/Server.zig and everything after the first test
 #     in every other hot-path file.
@@ -23,117 +23,14 @@ cd "$ROOT"
 
 fail=0
 
-# awk scanner. Portable BSD/gawk: no `-P`, no `\s`, no interval regexes.
-# Emits one line per hit: "<lineno>\t<shaped line>".
-SCANNER="$(cat <<'AWK'
-function strip_code(s,   out, i, n, c, nx, in_str, in_char) {
-  out = ""; n = length(s); in_str = 0; in_char = 0
-  for (i = 1; i <= n; i++) {
-    c = substr(s, i, 1)
-    if (in_str) {
-      if (c == "\\") { i++; continue }
-      if (c == "\"") in_str = 0
-      continue
-    }
-    if (in_char) {
-      if (c == "\\") { i++; continue }
-      if (c == "'") in_char = 0
-      continue
-    }
-    if (c == "\"") { in_str = 1; continue }
-    if (c == "'") { in_char = 1; continue }
-    if (c == "/" && substr(s, i + 1, 1) == "/") break
-    out = out c
-  }
-  return out
-}
-function net_braces(s,   i, n, c, d) {
-  d = 0; n = length(s)
-  for (i = 1; i <= n; i++) {
-    c = substr(s, i, 1)
-    if (c == "{") d++
-    else if (c == "}") d--
-  }
-  return d
-}
-function rtrim(s) { sub(/[ \t\r]+$/, "", s); return s }
-function ltrim(s) { sub(/^[ \t\r]+/, "", s); return s }
-function last_index(s, needle,   p, q, last) {
-  last = 0; q = 1
-  while ((p = index(substr(s, q), needle)) > 0) { last = q + p - 1; q = last + 1 }
-  return last
-}
-# Classify a `catch` body fragment: "empty" (nothing between the braces),
-# "open" (`{` opens here, `}` still pending) or "other".
-function body_kind(b,   t) {
-  t = rtrim(ltrim(b))
-  if (t == "") return "kw"
-  if (t == "{") return "open"
-  # A trailing `;` (statement position) or `,` (switch arm / initializer list)
-  # is punctuation, not body — without stripping it, `x() catch {},` slipped
-  # through the check entirely.
-  while (t != "" && (substr(t, length(t)) == ";" || substr(t, length(t)) == ",")) {
-    t = rtrim(substr(t, 1, length(t) - 1))
-  }
-  if (t == "{}" || t == "{ }" || t == "{\t}") return "empty"
-  return "other"
-}
-# What does the last `catch` on this (stripped) line look like?
-function catch_kind(code,   p, tail, rest, c2) {
-  if (index(code, "catch") == 0) return "none"
-  p = last_index(code, "catch")
-  tail = rtrim(substr(code, p + 5))
-  if (tail == "") return "kw"
-  if (substr(tail, 1, 1) == "|") {
-    c2 = index(substr(tail, 2), "|")
-    if (c2 == 0) return "none"
-    rest = substr(tail, c2 + 2)
-    if (rtrim(ltrim(rest)) == "") return "kw"
-    return body_kind(rest)
-  }
-  return body_kind(tail)
-}
-BEGIN { in_test = 0; depth = 0; kw = 0; open = 0 }
-{
-  raw = $0
-  # Zig multiline string literal (`\\…`) — braces there are prose, not code.
-  if (raw ~ /^[ \t]*\\\\/) next
-  code = strip_code(raw)
-  if (rtrim(code) == "") next
-  if (in_test) {
-    depth += net_braces(code)
-    if (depth <= 0) { in_test = 0; depth = 0 }
-    next
-  }
-  if (ltrim(code) ~ /^test[ \t]*\{/) {
-    in_test = 1
-    depth = net_braces(code)
-    if (depth <= 0) { in_test = 0; depth = 0 }
-    next
-  }
-  # Resolve a `catch` whose body starts on an earlier line.
-  if (kw > 0) {
-    k = body_kind(code)
-    if (k == "empty") print kw "\t" rtrim(ltrim(code)) "   [line " kw " is a bare `catch`, body here]"
-    else if (k == "open") open = kw
-    kw = 0
-  } else if (open > 0) {
-    t = rtrim(ltrim(code))
-    if (t == "}" || t == "};") print open "\t" t "   [empty body of the `catch {` opened on line " open "]"
-    open = 0
-  }
-  if (code ~ /catch[ \t]+unreachable/) print NR "\t" rtrim(ltrim(code))
-  k = catch_kind(code)
-  if (k == "empty") print NR "\t" rtrim(ltrim(code))
-  else if (k == "open") open = NR
-  else if (k == "kw") kw = NR
-}
-AWK
-)"
+# The scanner itself — lexer, test-block skip, catch shapes — is shared with
+# check-version.sh through scripts/lib/zig-scan.awk: one copy of "is this line
+# production code?" keeps both gates agreeing on what a `test` block is.
+LEX="$ROOT/scripts/lib/zig-scan.awk"
 
 scan_file() {
   local file="$1" hits
-  hits="$(awk "$SCANNER" "$file" || true)"
+  hits="$(awk -v mode=catch -f "$LEX" "$file" || true)"
   [[ -n "$hits" ]] || return 1
   printf '%s\n' "$hits"
 }

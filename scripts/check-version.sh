@@ -1,6 +1,23 @@
 #!/usr/bin/env bash
 # Fail when the version in build.zig.zon has drifted from derived docs/badges.
 # Run in CI so a manual version bump can never leave the repo inconsistent.
+#
+# What this gate looks for is a version *reference*: a package manifest, a
+# generated project's metadata, docs, or a user-facing string. An arbitrary
+# `0.x.y` string inside a `test { … }` block is none of those — it is a fixture
+# value, and comparing it against the release version is a false positive.
+# Section 2 skips those (so it removes a *class* of false positives, not just the
+# instance that prompted the fix: tag `v0.27.0` / `1c705e5` went red on two such
+# fixtures in tools/zmodu/src/incremental.zig). The skip asks the shared scanner
+# for exactly one fact — "is this line inside a test block?" — via
+# scripts/lib/zig-scan.awk, mode=at-test, which is the same state machine
+# scripts/check-production.sh uses. It deliberately does NOT reuse that gate's
+# wider "skip comments/prose" filter: a `0.x.y` in a comment or in a `\\…`
+# template line outside a test block is still a version literal and still gets
+# checked (the allow-list, not a blanket skip, is what clears the known ones).
+# Nothing else moves: the pins in section 1, the manifest/version checks in
+# section 3, and the WARN in section 4 are unchanged, and a `0.x.y` literal in
+# real code is still a failure.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -52,7 +69,20 @@ while IFS= read -r hit; do
   done
 done <<<"$(tools_grep "$pin_re" | grep -v 'zigmodu_zon_hash')"
 
-# 2. Any other 0.x.y literal must be deliberate (see allowed_version).
+# 2. Any other 0.x.y literal must be deliberate (see allowed_version) — and must
+#    be a real version reference. A fixture inside a `test { … }` block is not;
+#    everything else (comments and `\\…` template lines included) still is.
+LEX="$ROOT/scripts/lib/zig-scan.awk"
+[[ -f "$LEX" ]] || { echo "check-version: scanner not found: $LEX" >&2; exit 1; }
+in_test_block() {
+  local hit="$1" file lineno
+  file="${hit%%:*}"; lineno="${hit#*:}"; lineno="${lineno%%:*}"
+  [[ "$file" == *.zig ]] || return 1     # test blocks exist only in Zig sources
+  [[ -f "$file" ]] || return 1
+  # Only an exact "test" suppresses a hit; a `missing` answer (shortened file)
+  # keeps it, so the filter can never lose a real reference by accident.
+  [[ "$(awk -v mode=at-test -v want="$lineno" -f "$LEX" "$file" || true)" == "test" ]]
+}
 allowed_version() {
   case "$1" in
     "$VERSION") return 0 ;;
@@ -70,6 +100,7 @@ while IFS= read -r hit; do
   # ('zigmodu-<version>-<payload>'); its lag behind a fresh bump is reported as a
   # WARN in section 4, not a "hard-coded version" to derive from ZMODU_VERSION.
   [[ "$hit" == *zigmodu_zon_hash* ]] && continue
+  in_test_block "$hit" && continue
   for lv in $(printf '%s\n' "$hit" | grep -oE 'v?0\.[0-9]+\.[0-9]+' | sed 's/^v//'); do
     if ! allowed_version "$lv"; then
       echo "check-version: tools/ hard-codes version $lv -> $hit" >&2

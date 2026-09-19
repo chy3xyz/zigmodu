@@ -2,6 +2,48 @@
 
 ## [Unreleased]
 
+### `check-version.sh` 跳过 `test { … }` 块内的版本形字面量 —— 消除的是一类误报（**破坏性：否**）
+
+tag `v0.27.0`（`1c705e5`）的 `bash scripts/check-version.sh` 红了**两条**，都在同一个文件里：
+
+```
+check-version: tools/ hard-codes version 0.26.0 -> tools/zmodu/src/incremental.zig:190:    try saveManifest(allocator, io, dir, &entries, "0.26.0");
+check-version: tools/ hard-codes version 0.26.0 -> tools/zmodu/src/incremental.zig:232:    ...（同上）
+```
+
+两处都是 `test` 块里的 **fixture 值**（`saveManifest` 的 `version` 形参），不是版本**引用**。门禁的意图
+是抓"包清单 / 文档 / 面向用户的字符串里写死的框架版本"—— 而 `test` 块里一个任意字符串既不发布也不生成
+任何东西：值改成什么都能过，所以它是**误报**。修法落在门禁一侧：**tag 未移动、未新增 tag、未改发布内容**，
+消除的是这一**类**误报（不是把那两个字面量改成别的字符串 —— 那只是修实例）。
+
+- **只放宽这一处**：`scripts/check-version.sh` 第 2 节（"其它 0.x.y 字面量必须有意为之"）跳过 `test { … }`
+  块内的命中 —— 只有这一个豁免。其余规则一字未动：第 1 节的 pin、第 3 节的 CLI 包版本、第 4 节的 WARN
+  照旧。请求只发往 `.zig`（test 块只存在于 Zig 源码），其它文件照旧走 `grep`；且**只有确切回答
+  "在 test 块里"才抑制命中**（文件被删/变短等异常一律保留命中），过滤器不会吃掉真引用。
+- **不继承 `check-production.sh` 的宽豁免**：那个门禁的 `zig_skip()` 还跳"注释行"和 `\\…` 模板行（注释里的
+  `// catch {}` 不是违规）。版本字面量没有这个理由 —— 模板行正是要写进生成项目的版本。所以共用的状态机
+  `zig_in_test()`（花括号配对，顶层或缩进均可）只回答"这行在不在 test 块里"，`zig_skip()` 在它之上加那两个
+  豁免：`check-production.sh` 用 `mode=catch`（= `zig_skip`），`check-version.sh` 用 `mode=at-test`
+  （= `zig_in_test`），两处不可能漂移。实测本仓 `tools/` 的 33 处命中：**只有 2 处被丢**，都在 test 块里
+  （`market.zig:516-517` 那段 `remote_json` fixture 的 `min_version`）；另有 7 处**注释/模板行在 test 块外**
+  的命中**照旧被检查**（若继续用宽豁免，它们会被静默放过 —— 那才是削弱）。
+- **`test {` 与 `test "name" {` 同一条规则**：`strip_code` 先把测试名（字符串字面量）抹掉，两种写法都变成
+  `test  {`；先剥离字面量也让 test 里的 `"{}"` 不会打乱花括号配对。重构后对 `src/` + `tools/zmodu/src/`
+  的 **284 个 .zig 文件逐一比对**新旧扫描器输出：**0 处差异**；`check-production.sh` 输出与改动前基线
+  **逐字节相同**（`check-production: OK`，exit 0）。
+- **反证（实跑，同一棵树，三种"非 test"形状都要照旧报红）**：在 `tools/zmodu/src/main.zig` 非 test 处插入
+  一个注释行 `// probe-comment: legacy 0.31.7`、一个多行字符串行 `\\probe-prose 0.31.7`、一个普通代码行
+  `pub const legacy_probe_pin = "0.31.7";` → `exit 1`，三行全部点名（`main.zig:27` / `:29` / `:31`）；
+  把**同一个字面量**挪进 `test "cli submodule coverage gates …"` 内 → `exit 0` 且不再点名该文件。
+  还原后 `shasum tools/zmodu/src/main.zig` = `87e3430a2f27b57eff76071677ff1c5e2f9b07cd`（与改动前一致）。
+- **`v0.27.0` 现在绿**：重新 checkout `v0.27.0`（`1c705e5`）的 worktree，把改好的 `check-version.sh` 与
+  `scripts/lib/zig-scan.awk` 复制进去（两边 `shasum` 一致：`27f525e9…` / `2da3b4a0…`），
+  `bash scripts/check-version.sh` → `exit 0`（`check-version: OK (0.27.0 consistent across docs and tools/)`）；
+  scaffold 依赖哈希那条 WARN 仍在 —— 它按设计如此（哈希只能在 tag 推出去之后重算）。**tag 未移动、未新增
+  tag。**
+- **不改发布记录**：另一条路是移动 `v0.27.0` 的 tag，但修复提交在该 tag 之后 12 个提交，移过去等于声称
+  v0.27.0 包含整批后续加固；补一个 `v0.27.1` 也修不了 `v0.27.0`（那个 tag 仍旧红）。两条都歪曲发布内容。
+
 ### Benchmark 门禁：`RingBuffer SPSC x1M` 改用比值判据 —— 它是宿主的内存序实现，不是代码（**破坏性：否**）
 
 `624b423` 的 CI Benchmark 闸门只红一条：
