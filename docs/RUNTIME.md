@@ -434,7 +434,7 @@ worker 先停（邮箱关闭）、定时器随后到点，于是它跳一次 —
 | 指标 | 含义 | 怎么读 |
 |------|------|--------|
 | `pool_declared` | 声明的 `max_pooled_workers`（上界，不是 worker 数） | `0` = 这个 runtime 没有池（环/线程都不存在） |
-| `pool_threads` | 池线程数（Phase 1 只有 0 或 1） | `pool_claimed` 的天花板；Phase 2 起变多 |
+| `pool_threads` | 池线程数：`0` = 池还没起（或已停），起来后 = **声明的宽度**（`pool_threads`，默认 1） | `pool_claimed` 的天花板；只有 0/1 两个值说明宽度没被声明（§12.12） |
 | `pool_ready_len` | 就绪环里现有 token 数 = 排队等池线程的 worker 数 | 每个 worker 至多一个 token（D4），所以它 ≤ `pool_declared` |
 | `pool_claimed` | **此刻**正被池线程执行的 worker 数 | 池化后 `running` 不再回答"有多少活儿在跑"，这条回答 |
 | `pool_dispatches` | 池线程跑过的批次总数 | **有 `.pooled` spawn 却是 0 = 那些 worker 从没到过池线程** |
@@ -680,12 +680,15 @@ rec.replay(&manual, &harness, Harness.sink);         // 按 seq 推进 clock，�
 - 不承诺进程级完全确定性：`spawn`/`init` 副作用、网络、墙钟、以及丢弃模式都不重放。
 - 只有**读注入 `Clock`** 的代码参与重放；直接调 `core/Time.zig` 的路径读到真实时间。
 
-## 12. WorkerPool / Scheduler —— Phase 1 已落地（一条池线程）
+## 12. WorkerPool / Scheduler —— Phase 2 已落地（N 条池线程，默认 1）
 
-> 状态：**Phase 1 已落地**（`src/runtime/scheduler.zig`，`spawn(..., .{ .mode = .pooled })`）。
-> 12.1–12.9 是设计原文，原样保留作为决策记录；**12.10 记落地结果** —— 实际做到哪、没做哪，
-> 以及实测后对 D4/D5 的两处收紧（老写法会丢 worker，不是丢消息）。
-> **多池线程、drain 批量调优、公平性加权、affinity 仍未做**（也正是 12.7 明确不做的那些）。
+> 状态：**Phase 1 已落地**（一条池线程），**Phase 2 已落地**（N 条，声明入口 `pool_threads`，
+> 默认 1 = Phase 1 的形状；环改成多消费者安全）。代码全在 `src/runtime/scheduler.zig`，
+> 入口 `spawn(..., .{ .mode = .pooled })`。
+> 12.1–12.9 是设计原文，原样保留作为决策记录；**12.10 记 Phase 1 的落地结果**，
+> **12.11 记 Phase 1 发出去之后修掉的四处缺陷**，**12.12 记 Phase 2**（多消费者环、线程集合、
+> 宽度声明、以及实测数字）。
+> **仍未做**：drain 批量调优、公平性加权、affinity（正是 12.7 明确不做的那些）。
 
 ### 12.1 问题：一 worker = 一线程
 
@@ -722,9 +725,17 @@ API 形状见 §12.8）。**默认不变**，所以既有应用零影响。
 1. **状态独占**：任一时刻只有一个线程在执行某个 worker 的 `handle`/状态。**从"按线程身份独占"
    变成"按排他声明独占"**（见 §12.4 的 `claimed`）——这是本设计的核心，也是唯一一处
    需要重新论证的语义。
+   **N 条池线程下原样成立**（§12.12 实测：4 条线程、4 个 worker 的压力跑，overlap 读数 0）；
+   但"N 条"把**协议外围**重新摆上台面：就绪环必须是多消费者安全的（Phase 1 的出队是
+   单消费者写法，§12.12 有红证据），环容量必须是"每个 worker 一个 token + 每个消费者一个窗口槽位"，
+   池的宽度必须显式声明。
 2. **每 worker FIFO**：同一 worker 的消息顺序不变（`Mailbox` 不变，仍是有界的）。
+   这条与池的宽度无关：顺序来自邮箱，池只决定"什么时候被谁跑"。
 3. **池线程绝不阻塞**：调度线程上跑的代码不允许 `recv(0)` 阻塞、不允许 sleep、不允许等锁。
+   N 条线程下多一条含义：**空转也要有界** —— 一条拿不到的 token 不能让 N−1 条线程全速自旋
+   （§12.12 的退避；Phase 1 靠"只有一条线程"掩盖了它）。
 4. **热路径零分配**：就绪队列是定容 `MpscRing`；派发与认领零分配。由 §13 那份分配契约守。
+   **线程数组也在 `Scheduler.init` 一次分配**（宽度是声明值，不在调度路径上分配）。
 5. **Wheel 仍是 ticker-only**：§4 的 owner 契约不受影响；定时器投递照旧走 `handle.send`。
 
 ### 12.4 机制
@@ -772,13 +783,21 @@ API 形状见 §12.8）。**默认不变**，所以既有应用零影响。
 - **`Recorder`**：`Record` 覆盖的是 `HotBus.publish`，与池化正交；若将来扩到 `send`，
   记录点仍在 `Handle.send*`，不受调度模式影响。
 - **`RuntimeStats`**：`workers` / `running` 语义不变（"已 spawn" 与 "正在执行"），
-  池化后 `running` 的上界从"worker 数"变成"池线程数"——这本身是个有用的观测信号。
+  池化后 `running` 的上界从"worker 数"变成"**池线程数**"——这本身是个有用的观测信号。
+  宽度可声明之后（§12.12）这句话的读数也变了：`running ≤ pool_threads`，而 `pool_threads`
+  是**声明的宽度**（不是 `0/1` 两个值）。
 - **`shutdown()`**：§3 的顺序（先停 ticker → 停 worker → join → destroy → drain）要扩展一步：
   先停调度线程（它们可能正握着某个 worker 的 `claimed`），确认所有权都归还后再 destroy。
+  **N 条时是"停一整组、join 一整组"**：`Scheduler.shutdown` 先让每条线程看到 `stopping`，
+  再取走 `started` 计数并 join 那么多条 —— 计数是**取走**（swap 成 0）而不是读，否则两个
+  并发调用方会 join 同一个句柄两次（第二次是 `EINVAL` → 中止，§12.11 第 4 条）。
 
 ### 12.7 明确不做（本设计范围内）
 
-- **不做 MPMC / 新的队列原语** —— `MpscRing` 够用（多生产者推 ready、多调度线程消费）。
+- **不做新的队列原语** —— `MpscRing` 够用（多生产者推 ready、多调度线程消费）。
+  **Phase 2 的修正**：ready 环本身必须是 MPMC 的（多调度线程消费），而它一直是"按单消费者写的"
+  （§12.11 第 1 条只修了**生产者**侧的窗口）。修法不是引入新原语：还是 Vyukov 那套
+  `enqueue_pos`/`dequeue_pos` + 槽位序号，只是**出队那一半也要 CAS 下标**（§12.12）。
 - **不做 CPU affinity / NUMA / 优先级**（评估 §14 也建议往后放）：它们属于**执行策略层**，
   应在 Dedicated/Pooled 稳定之后再谈，否则会同时改两个变量。
 - **不做 μs 级 timer**：那是独立的 `LowLatencyClock/Timer`（评估 §7 的建议），与调度器正交。
@@ -793,6 +812,11 @@ API 形状见 §12.8）。**默认不变**，所以既有应用零影响。
 **D2 池的归属与默认**：`Runtime` 持有池；池线程数在 `Runtime.init` 时声明，
 **默认不创建任何池线程** —— 不碰 `runtime` 的应用仍然是零线程，与 §2 的 opt-in 契约一致。
 未显式配池却调用 `.mode = .pooled` 是**配置错误**（启动时报错），不是"顺手给你起一条"。
+
+**Phase 2 把"池线程数"拆成两个声明**（§12.12）：`max_pooled_workers` 是**上界**（环容量按它算、
+第 N+1 个 `.pooled` spawn 被拒），`pool_threads` 是**宽度**（几条线程消费这个环，默认 1）。
+两个都是声明值，两个都在启动期定：一条线程都没有的池只能把 token 堆在环里，宽度为 0 是配置错误、
+被夹到 1；宽度也要进环容量的公式（每个消费者在出队窗口里占一个槽位）。
 
 **D3 一轮 drain 有界小批，默认 16，且 per-worker 可配。**
 理由是把两个极端都排除掉：
@@ -834,7 +858,9 @@ API 形状见 §12.8）。**默认不变**，所以既有应用零影响。
 3. **`shutdown()` 多一步**：先停调度线程（它们可能正握着 `claimed`），确认所有权归还后再 destroy
    worker —— §12.6 已记，落地时要和 §3 的既有顺序合并成一条。
 4. **`RuntimeStats.running` 的上界变化**：池化后从"worker 数"变成"池线程数"。这本身是有用的观测
-   信号，但别让它被误读成"worker 变少了"。
+   信号，但别让它被误读成"worker 变少了"。**Phase 2 落地读数**（§12.12）：`running` 仍逐 worker
+   语义（= 被 claim 的 worker 数），上界就是 `pool.threads`（声明的宽度），`pool.claimed`
+   读的是同一个量；`pool.threads` 是**真实条数**（`0` = 池还没起或已停），不再是 `0/1`。
 
 ### 12.10 Phase 1 落地记要（做到哪，没做哪）
 
@@ -913,14 +939,14 @@ dedicated 加"抽干后再停"，两者都是会动到 D5 那条回执出口的�
 两边都进 `RuntimeStats.messages_discarded_on_stop` + `zigmodu_runtime_messages_discarded_on_stop`（§8）。
 
 **停机顺序**（在 §3 的老顺序上多一步，§12.6/§12.9 第 3 条）：`alive=false` → 停 ticker →
-**停池线程（join）** → 断言没有 worker 还握着 claim → request/join/destroy worker → 收尾定时器。
-池线程在批次之间才退出，所以"停机时它正跑着某个 worker"这个窗口里，worker 的 `handle` 会先跑完
-（和 dedicated 一样：worker 不返回就拖着停机，这是刻意的）。
+**停池线程（join，N 条就是 N 条）** → 断言没有 worker 还握着 claim → request/join/destroy worker →
+收尾定时器。池线程在批次之间才退出，所以"停机时它正跑着某个 worker"这个窗口里，worker 的 `handle`
+会先跑完（和 dedicated 一样：worker 不返回就拖着停机，这是刻意的）。
 
 **明确没做**（Phase 2 起再谈，别拿 Phase 1 当结论）：
 
-* 多池线程（Phase 1 只有一条；协议里的 two-bit 与环都是按"读者只在 pop 时认领"写的，加线程前要
-  把 §12.3/§12.10 的推理重新做一遍）；
+* ~~多池线程~~ —— **Phase 2 已做，见 §12.12**（协议里的 two-bit 与回执出口在任意 N 下都成立，
+  §12.10 这两条不用改；改的是协议外围：环的多消费者出队、宽度声明、以及拿不到 token 时的退避）；
 * `batch` 的实测调优（默认 16，D3 的起点；per-worker 覆盖也没做）；
 * 公平性加权、优先级、CPU affinity/NUMA（§12.7 本来就排除）。
 
@@ -990,6 +1016,122 @@ dedicated 加"抽干后再停"，两者都是会动到 D5 那条回执出口的�
 **对照实验**：同一份测试源码（只用公开 API）在**未改动的基线**（worktree @ `dd6df20`）连跑 8 次
 **8 次全挂**（同一个 `INVAL` 断言），在修后的树上 **8 次全过**。
 测试：`Runtime: two threads calling shutdown at once are safe`。
+
+### 12.12 Phase 2 落地记要（N 条池线程）
+
+> **结论先说**：协议本体不用改。`queued`/`claimed` 两个位、单出口回执（§12.10 第 2 条）、
+> D4「每 worker 至多一项」、D5「回执前重查邮箱」在任意 N 下都成立 —— Phase 1 侥幸掩盖的是
+> **协议外围**的三件事：就绪环的**多消费者出队**、环容量的**消费者窗口**（d2a1cd6 已改成
+> `max_pooled_workers + pool_threads`）、以及**一条拿不到的 token 会让 N−1 条线程全速空转**。
+> 本节的四处改动都在外围。
+
+**1. `ReadyRing.tryPop` 改成多消费者安全**（本次最硬的一处）。Phase 1 的出队是
+"读 `dequeue_pos` → 读槽位 → 写 `dequeue_pos = pos+1` → 释放槽位序号"：
+
+* 两条线程读到同一个 `pos` 就**都会拿走同一个 token** —— §12.3 的状态独占在进门之前就没了
+  （两条线程会跑同一个 worker）；
+* 两次 `dequeue_pos.store` 与两次序号写会让某个 token **永远 pop 不出来** —— 那个 worker 从此
+  不再被调度，而邮箱继续收条。
+
+修法是 Vyukov 出队那一半的标准写法：**下标用 `cmpxchgWeak` 认领**，赢了才拷值、才释放槽位序号；
+落后的一方重读下标，读到"还没轮到我"就返回 null。**没有新原语**（§12.7 的"不做新队列"仍然成立）。
+
+**红证据**（把 `tryPop` 换回 Phase 1 的写法，其余代码不动，只跑新测试）：
+
+| 测试 | 旧实现 | 新实现 |
+|------|--------|--------|
+| `scheduler: two consumers race one token and exactly one of them gets it` | 第 2 轮就红：`expected 2, found 3`（两条消费者各拿到一次同一个 token） | 50 000 轮全绿 |
+| `scheduler: a hammered ring hands every token to exactly one consumer` | 红：`ring: token 0 came out 4 times`，环随即卡死（4 个生产者全部超预算放弃） | 4 生产者 × 5 000 token 全绿 |
+
+两条测试的分工是刻意的：第一条是**同步到同一起跑线**的最小形状（确定性最强），第二条是
+**频率形状**（暴露"丢失"那一半）。旧实现下环不会"偶尔慢一点"，它会**碎掉**：token 重复到手
+之后，某个槽位的序号再也回不到可读状态。
+
+**2. 线程从"一条"变成"一组"**。`thread: ?std.Thread` → `threads: []std.Thread`（在
+`Scheduler.init` 里**一次性分配**，调度路径上零分配）+ `started: usize`（已起的条数）。
+
+* `start()`：整组在**同一个 `start_claim`** 下起完，再发布 `started` —— 懒启动的语义仍是
+  "起或不起"，不是"起几条"（否则两个并发 `spawn` 会各起一部分，§12.11 第 2 条那个 UAF 只是
+  从"多一条"变成"多几条"）；起失败时把已经起来的几条回滚 join 掉，`start` 保持 all-or-nothing。
+* `shutdown()`：先 `stopping` + 唤醒全部，再**取走** `started`（`swap(0)`）并 join 那么多条。
+  计数是取走而不是读 —— 否则两个并发调用方会 join 同一句柄两次（§12.11 第 4 条的 `EINVAL`）。
+  取走同时让"停机后再问池有几条"读作 0。
+* `stats().pool_threads`：**真实条数**（`0` = 池没起或已停，起来后 = 声明的宽度）。
+  把"池部署了吗"和"池有多宽"合成一个读数，会让 `pool_claimed ≤ pool_threads` 这条契约读数
+  在 N>1 时永远停在 0/1 上 —— 那正是这条读数被写下来的原因（§12.9 第 4 条）。
+
+**3. 宽度要有声明入口**：`SchedulerConfig.pool_threads`（**默认 1**）、
+`Application.Config.pool_threads` + `ApplicationBuilder.withPoolThreads(N)`、
+`Runtime.InitOptions.scheduler.pool_threads`。三项都是默认值即"Phase 1 行为"：
+
+* 不碰 runtime 的应用仍是零线程（D2 不变）；
+* 声明了池但没声明宽度的应用，跑的还是**一条**池线程，既有测试与读数逐位不变；
+* 宽度为 0 会被夹到 1：一个没有消费者的池只能把 token 堆在环里；
+* 宽度**进环容量公式**：`capacity = ceilPowerOfTwo(max_pooled_workers + pool_threads)`。
+  这不只是"多留一格"——消费者在出队窗口里持有的是**槽位**，槽位不够时 `push` 只能靠重试等它
+  回来（d2a1cd6 的修法）。容量按消费者数算，等于把"等窗口"从每次推送的常态变成不该发生的例外。
+
+**4. claim-miss 之后要有退避**（性能，不是正确性）。`claimed` 抢不到的 token 会被重推回环里，
+但那条 token 在**当前持有者交还之前**谁也跑不了：Phase 1 的循环在"跳过"时把自旋预算清零，
+于是 N−1 条线程会对着一个谁都拿不走的 token 全速空转（一条线程时这件事根本不存在，因为跳过的
+前提是"有别人在跑它"）。改法两处：
+
+* `turn()` 区分 `ran` / `skipped` / `empty`，**只有 `ran` 清零自旋预算**（"跳过"和"环空"共用一个
+  预算），所以跳过也会走到 park；
+* park 的判据从"环里没有 token"（`ready.len() == 0`）换成"**环和我上次看到的一模一样**"
+  （`pushes` 计数器没变）—— 被 claim 住的 token 会一直在环里，用它当"有活儿"的证据就是
+  永远不 park；
+* 代价如实说：持有者交还 claim 那一刻**不会**唤醒 parked 的线程（生产者路径上没有 mutex/信号，
+  这是刻意的），所以"偷"到那条 token 最多晚一个 `idle_wait_ms`（1 ms）。换来的是空闲时不烧核。
+
+**实测（本机，N 条线程真跑，`batch = 1`；`claim_misses` 是 §12.9 里那个上界读数的落地值）**：
+
+| 形状 | 读数 |
+|------|------|
+| 4 worker × 4 生产者 × 2 000 条，宽度 4 | `attempts = 8000`，`received = 8000`，`dropped_full = 0`，`dispatches = 8000`，`overlaps = **0**`，`claim_misses = **0**`，`ready_push_failures = 0` |
+| 同上，宽度 1（Phase 1 读数） | `claim_misses = 0`（**可证**，见下），`overlaps = 0`，守恒式成立 |
+| 宽度 3 + `shutdown` | 用 OS 线程数（macOS `task_threads`）量：起 3 条、再 `start()` 不增、`shutdown()` 回到基线 |
+| 容量对照（手撑开两个消费者窗口） | 按 Phase 1 口径（`ceilPowerOfTwo(bound)`）的环 `tryPush` **被拒**；把窗口还回去同一个推送就成功（证明拒的是窗口不是"满了"）；按消费者口径的环从未需要等 |
+
+**`claim_misses` 的监控口径要跟着改**（这是 Phase 2 唯一一条"读数含义变了"的东西）：
+
+* **宽度 1**：恒 0，而且是可证的 —— 能交还 claim 的线程就是唯一能再 pop 的线程，等它再 pop 时
+  自己的回执已经把 `claimed` 清了。"非 0 = 协议被破坏"这个读法在宽度 1 上仍然成立。
+* **宽度 > 1**：**允许非 0**。能造出它的只有一条窗口：回执先清 `queued`、两条指令后再清
+  `claimed`，生产者落在这中间就会推一个"worker 还在被跑"的 token；此时另一条线程 pop 到它、
+  抢 claim 失败 —— 这就是一次 skip（token 被重推，不是丢）。这条窗口只有**持有者被抢占**时才会
+  宽，所以本机实测 11 次跑全为 0；**不能把 0 当契约**，也要把"非 0"从告警里摘掉
+  （要盯的恒 0 读数是 `ready_push_failures`）。
+* 结构上界：skip 消耗一个 token，token 只能来自生产者的 `send` 或批次回执的重推，所以
+  `claim_misses ≤ attempted + dispatches`（测试断言的就是这条）。
+
+**新增测试**（都在 `src/runtime/scheduler.zig`，除最后两条）：
+
+* `two consumers race one token and exactly one of them gets it` —— 50 000 轮，两条线程同一起跑线
+  抢 1-token 环，每轮**恰好一个**赢家；
+* `a hammered ring hands every token to exactly one consumer` —— 4 生产者 × 4 消费者、每个 token
+  带自己的编号，断言**每个 token 恰好出来一次**（出来两次 = 两条线程拿到同一个 token；一次都没
+  出来 = token 被环吞了）；
+* `the ring is sized for its consumers' windows (the Phase 1 size would refuse)` —— 两条口径的容量
+  对照，窗口用手撑开做成确定性的；
+* `N pool threads conserve messages and never run one worker twice` —— 真线程跑池：
+  `sent == received + dropped_full`、`ready_push_failures == 0`、**overlap 读数 0**；
+* `with one pool thread a claim is never missed (the Phase 1 reading)` —— N=1 恒 0；
+* `the declared width is the number of threads started — and all of them are joined` —— 用 OS
+  线程数当见证（多出来的线程没有任何计数器看得见，§12.11 第 2 条同理）；
+* `Runtime: N pool threads conserve messages and never overlap on one worker`（`runtime.zig`）——
+  真 `Runtime` + 真 `Handle.send`：3 个 pooled worker、宽度 2，守恒式 + overlap 0 +
+  `ready_len == 0`、`claimed == 0` 收尾；
+* `e2e: the builder's pool *width* reaches the runtime a module spawns .pooled on`（`Application.zig`）
+  —— `withPoolThreads(3)` 一路走到 `poolStats().pool_threads == 3`，`app.stop()` 后回到 0。
+
+**默认行为不变**（硬要求，回归口径）：`pool_threads` 不写 = 1，既有池化测试（Phase 1 的全部
+`Runtime: ...pooled...` 用例、`Actor:` 的两条停机语义用例、`zigmodu_runtime_pool_*` 的取值断言）
+一行未改、读数未变；宽度是新增的声明，不是既有声明的语义变化。
+
+**Phase 2 仍未做**：`batch` 的实测调优（仍是 D3 的起点 16，per-worker 覆盖没有）、
+公平性加权、优先级、affinity/NUMA（§12.7 本来就排除）、以及"池线程数随负载自适应"。
+另外一条已知的**取舍**（不是缺陷）：上面第 4 点的 1 ms 偷取延迟。
 
 ## 13. Runtime Replay —— v1 已实现（见 §13.7）
 

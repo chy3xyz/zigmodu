@@ -98,10 +98,15 @@ pub const Application = struct {
         max_dependencies: usize = 8,
         /// Declared upper bound on `.mode = .pooled` workers (docs/RUNTIME.md
         /// §12): the runtime `app.runtime()` creates is sized for it, and its
-        /// pool thread appears the first time a pooled worker is spawned. `0` —
+        /// pool threads appear the first time a pooled worker is spawned. `0` —
         /// the default — means this app has no pool, and `.pooled` is refused at
         /// `spawn` rather than starting a thread nobody declared.
         max_pooled_workers: usize = 0,
+        /// How many pool threads that pool runs (docs/RUNTIME.md §12.12). `1` —
+        /// the default — is the single-consumer shape, so an app that declares a
+        /// pool and no width keeps exactly the scheduling behaviour it had
+        /// before. Ignored when `max_pooled_workers` is 0: no pool is created.
+        pool_threads: usize = 1,
     };
 
     /// Initialize application with modules
@@ -130,6 +135,7 @@ pub const Application = struct {
                 .docs_path = options.docs_path,
                 .max_dependencies = options.max_dependencies,
                 .max_pooled_workers = options.max_pooled_workers,
+                .pool_threads = options.pool_threads,
             },
             .state = .initialized,
             .shutdown_hooks = std.ArrayList(*const fn () void).empty,
@@ -284,7 +290,10 @@ pub const Application = struct {
         errdefer self.allocator.destroy(rt);
         rt.* = try rt_mod.Runtime.initWithOptions(self.allocator, self.io, .{
             .clock = .monotonic,
-            .scheduler = .{ .max_pooled_workers = self.config.max_pooled_workers },
+            .scheduler = .{
+                .max_pooled_workers = self.config.max_pooled_workers,
+                .pool_threads = self.config.pool_threads,
+            },
         });
         errdefer rt.deinit();
         try rt.start();
@@ -383,6 +392,10 @@ pub const ApplicationBuilder = struct {
     /// means the app has no pool, so a `.mode = .pooled` spawn is refused
     /// (docs/RUNTIME.md §12.8 D2).
     max_pooled_workers: usize = 0,
+    /// How many threads that pool runs (`Config.pool_threads`), handed to the same
+    /// runtime. `1` — the default — keeps the single-consumer scheduling shape
+    /// (docs/RUNTIME.md §12.12).
+    pool_threads: usize = 1,
 
     const PendingService = struct {
         name: []const u8,
@@ -432,11 +445,23 @@ pub const ApplicationBuilder = struct {
 
     /// Declare the runtime pool this app may use (docs/RUNTIME.md §12.8 D2): the
     /// runtime behind `app.runtime()` / `ctx.runtime()` is sized for it, and its
-    /// pool thread appears with the first `.pooled` spawn. Left alone, the app
+    /// pool threads appear with the first `.pooled` spawn. Left alone, the app
     /// has no pool and `.mode = .pooled` is refused at `spawn` — a declaration is
     /// what makes the ready ring's capacity follow the bound.
     pub fn withMaxPooledWorkers(self: *ApplicationBuilder, max_pooled_workers: usize) *ApplicationBuilder {
         self.max_pooled_workers = max_pooled_workers;
+        return self;
+    }
+
+    /// How many threads the pool declared by `withMaxPooledWorkers` runs
+    /// (docs/RUNTIME.md §12.12). The default of 1 is the single-consumer shape,
+    /// and it is what an app that does not call this keeps. Widening the pool is
+    /// for the long tail (§12.5): a pooled worker's state exclusivity is the
+    /// claim, not thread identity, so more threads do not weaken §12.3 — but each
+    /// one adds a consumer to the ring, and the ring's capacity follows the
+    /// declared width.
+    pub fn withPoolThreads(self: *ApplicationBuilder, pool_threads: usize) *ApplicationBuilder {
+        self.pool_threads = pool_threads;
         return self;
     }
 
@@ -500,6 +525,7 @@ pub const ApplicationBuilder = struct {
                 .docs_path = self.docs_path,
                 .max_dependencies = self.max_dependencies,
                 .max_pooled_workers = self.max_pooled_workers,
+                .pool_threads = self.pool_threads,
             },
         );
         errdefer app.deinit();
@@ -1023,6 +1049,68 @@ test "e2e: the builder's pool declaration reaches the runtime a module spawns .p
     try std.testing.expectEqual(@as(u64, 0), rt.poolStats().?.ready_push_failures);
 
     app.stop();
+}
+
+test "e2e: the builder's pool *width* reaches the runtime a module spawns .pooled on" {
+    const allocator = std.testing.allocator;
+
+    const Shared = struct {
+        var handled = std.atomic.Value(u32).init(0);
+    };
+    Shared.handled.store(0, .monotonic);
+
+    const Audit = struct {
+        pub const Message = u32;
+        pub fn handle(_: *@This(), msg: u32, ctx: anytype) anyerror!void {
+            _ = msg;
+            _ = ctx;
+            _ = Shared.handled.fetchAdd(1, .monotonic);
+        }
+    };
+
+    const TailModule = struct {
+        pub const info = api.Module{
+            .name = "tail",
+            .description = "Long-tail workers, pooled on more than one thread",
+            .dependencies = &.{},
+        };
+        pub fn initWith(ctx: *ModuleContext) !void {
+            const rt = try ctx.runtime();
+            for (0..2) |_| {
+                const audit = try rt.spawn(Audit, .{}, .{ .capacity = 8, .mode = .pooled });
+                for (0..4) |i| try audit.send(@intCast(i));
+            }
+        }
+        pub fn deinit() void {}
+    };
+
+    var b = builder(allocator, std.testing.io);
+    defer b.deinit();
+    var app = try b.withName("wide-pooled-app")
+        .withMaxPooledWorkers(2)
+        .withPoolThreads(3)
+        .build(.{TailModule});
+    defer app.deinit();
+    try app.start();
+
+    const rt = try app.runtime();
+    // The width is what the pool reports running — the declaration reached the
+    // scheduler, not just the builder's own struct.
+    try std.testing.expectEqual(@as(usize, 3), rt.poolStats().?.pool_threads);
+    try std.testing.expectEqual(@as(usize, 2), rt.poolStats().?.max_pooled_workers);
+    // The ring was sized for both: one token per worker plus one slot per
+    // consumer (§12.12).
+    try std.testing.expect(rt.poolStats().?.ready_capacity >= 2 + 3);
+    var spins: usize = 0;
+    while (Shared.handled.load(.monotonic) != 8 and spins < 400_000_000) : (spins += 1) std.atomic.spinLoopHint();
+    try std.testing.expectEqual(@as(u32, 8), Shared.handled.load(.monotonic));
+    try std.testing.expect(rt.poolStats().?.dispatches >= 1);
+    try std.testing.expectEqual(@as(u64, 0), rt.poolStats().?.ready_push_failures);
+
+    app.stop();
+    // Every pool thread is joined by the stop: the count goes back to zero with
+    // the pool, not only with the process.
+    try std.testing.expectEqual(@as(usize, 0), rt.poolStats().?.pool_threads);
 }
 
 test "e2e: in-flight counter tracks request lifecycle" {

@@ -884,8 +884,8 @@ pub const Runtime = struct {
         self.shutdown();
         self.wheel.deinit();
         self.workers.deinit(self.allocator);
-        // Last: `shutdown` stops the pool thread, but tokens that arrived while
-        // it was winding down are still in the ring, and nothing reads them
+        // Last: `shutdown` stops the pool's threads, but tokens that arrived while
+        // they were winding down are still in the ring, and nothing reads them
         // again — the pool is the ring's only consumer.
         if (self.scheduler) |sched| sched.deinit();
         self.scheduler = null;
@@ -937,9 +937,11 @@ pub const Runtime = struct {
     /// thread, which is not the wheel's owner. The ticker aligns it when it
     /// takes the wheel (see `tickerMain`).
     ///
-    /// The pool thread is *not* started here either: it appears with the first
-    /// pooled `spawn`, so a runtime that declares a pool and never uses it still
-    /// starts no thread (D2).
+    /// The pool's threads are *not* started here either: they appear with the
+    /// first pooled `spawn`, so a runtime that declares a pool and never uses it
+    /// still starts no thread (D2). The whole declared set starts at once
+    /// (`Scheduler.start`), which is what keeps "is the pool deployed" one fact
+    /// rather than a count that N spawns race each other to widen.
     pub fn start(self: *Self) !void {
         if (self.ticker_running.swap(true, .acquire)) return; // already started
         self.ticker = try std.Thread.spawn(.{}, tickerMain, .{self});
@@ -1214,8 +1216,8 @@ pub const Runtime = struct {
         errdefer _ = self.workers.pop();
 
         if (sched) |s| {
-            // Materialise the pool thread on first use (D2: declaring a pool you
-            // never use costs no thread).
+            // Materialise the pool's threads on first use (D2: declaring a pool
+            // you never use costs no thread).
             try s.start();
         } else {
             handle.thread = try std.Thread.spawn(.{}, workerMain(W, capacity), .{handle});
@@ -1433,10 +1435,10 @@ pub const Runtime = struct {
                     .timer_deliveries_dropped = try metrics.createGauge("zigmodu_runtime_timer_deliveries_dropped", "Timers that fired but whose message the target mailbox refused (closed or full): a fire, not a delivery"),
                     .timer_lag_ms = try metrics.createGauge("zigmodu_runtime_timer_lag_ms", "Worst lateness between a timer deadline and its firing, in milliseconds"),
                     .pool_declared = try metrics.createGauge("zigmodu_runtime_pool_declared", "Declared upper bound on .pooled workers (0 = no pool: no ring, no pool thread)"),
-                    .pool_threads = try metrics.createGauge("zigmodu_runtime_pool_threads", "Pool threads running (Phase 1: 0 or 1); the ceiling on pool_claimed"),
+                    .pool_threads = try metrics.createGauge("zigmodu_runtime_pool_threads", "Pool threads running (0 before the first pooled spawn; the declared width after); the ceiling on pool_claimed"),
                     .pool_ready_len = try metrics.createGauge("zigmodu_runtime_pool_ready_len", "Ready-ring occupancy: workers waiting for a pool thread, at most one token per worker"),
                     .pool_claimed = try metrics.createGauge("zigmodu_runtime_pool_claimed", "Pooled workers a pool thread is executing right now (never above pool_threads)"),
-                    .pool_dispatches = try metrics.createGauge("zigmodu_runtime_pool_dispatches", "Batches the pool thread ran (0 with pooled spawns means they never reached the pool)"),
+                    .pool_dispatches = try metrics.createGauge("zigmodu_runtime_pool_dispatches", "Batches the pool's threads ran (0 with pooled spawns means they never reached the pool)"),
                     .pool_ready_push_failures = try metrics.createGauge("zigmodu_runtime_pool_ready_push_failures", "MUST stay 0: a refused token push strands a worker (scheduler desync, not backpressure)"),
                 };
             }
@@ -3789,6 +3791,146 @@ test "Runtime: a pooled worker loses nothing under concurrent producers" {
     try std.testing.expectEqual(expected_count * (expected_count + 1) / 2, handle.state.sum);
     const s = rt.poolStats().?;
     try std.testing.expectEqual(@as(u64, 0), s.ready_push_failures);
+}
+
+test "Runtime: N pool threads conserve messages and never overlap on one worker" {
+    // The same shape as the test above, with **more than one pool thread**
+    // (docs/RUNTIME.md §12.12). Two things change and both are what this asserts:
+    // §12.3's state exclusivity can no longer be explained away by "there is only
+    // one thread", so the claim is the only thing holding it up (the overlap
+    // witness below is the measurement), and the counters have to add up across
+    // every producer, every worker and the pool's own ring.
+    const workers = 3;
+    const width = 2;
+    const producers = 3;
+    const per_producer = 300;
+    const retry_budget: usize = 1 << 22;
+
+    const Shared = struct {
+        /// Bit `n` is set while a thread is inside worker `n`'s `handle`. Two
+        /// threads inside one worker is the violation; it is counted, not
+        /// assumed, because nothing else in the run would notice.
+        busy: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        overlaps: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        received: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    };
+    const OverlapWorker = struct {
+        pub const Message = u64;
+        shared: *Shared,
+        slot: u5,
+        /// Plain (non-atomic) state on purpose: §12.3's exclusivity is what makes
+        /// touching it sound, and a torn count would show the violation a second
+        /// way.
+        count: u64 = 0,
+
+        pub fn handle(self: *@This(), msg: u64, ctx: anytype) anyerror!void {
+            _ = ctx;
+            _ = msg;
+            const bit = @as(u32, 1) << self.slot;
+            if (self.shared.busy.fetchOr(bit, .acq_rel) & bit != 0) {
+                _ = self.shared.overlaps.fetchAdd(1, .monotonic);
+            }
+            defer _ = self.shared.busy.fetchAnd(~bit, .acq_rel);
+            self.count += 1;
+            _ = self.shared.received.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        .clock = .{ .manual = &clk },
+        .scheduler = .{ .max_pooled_workers = workers, .pool_threads = width, .batch = 1 },
+    });
+    defer rt.deinit();
+
+    var shared = Shared{};
+    const cap = 8;
+    var handles: [workers]*Handle(OverlapWorker, cap) = undefined;
+    for (&handles, 0..) |*h, i| {
+        h.* = try rt.spawn(OverlapWorker, .{
+            .shared = &shared,
+            .slot = @intCast(i),
+        }, .{ .capacity = cap, .mode = .pooled });
+    }
+    // The declared width is what the pool started.
+    try std.testing.expectEqual(@as(usize, width), rt.poolStats().?.pool_threads);
+
+    var calls = std.atomic.Value(u64).init(0);
+    const Feed = struct {
+        fn run(
+            hs: []const *Handle(OverlapWorker, cap),
+            base: u64,
+            n: usize,
+            calls_: *std.atomic.Value(u64),
+        ) void {
+            var c: u64 = 0;
+            // Counted however this producer leaves: every `send` call below is one
+            // mailbox attempt, and the identity the test asserts is over all of
+            // them.
+            defer _ = calls_.fetchAdd(c, .monotonic);
+            for (0..n) |k| {
+                const h = hs[k % hs.len];
+                const msg = base + k;
+                var spins: usize = 0;
+                while (true) {
+                    c += 1; // one `send` call = one mailbox attempt
+                    h.send(msg) catch |err| {
+                        if (err != error.Full) return;
+                        spins += 1;
+                        if (spins > retry_budget) return;
+                        std.atomic.spinLoopHint();
+                        continue;
+                    };
+                    break;
+                }
+            }
+        }
+    };
+    var threads: [producers]std.Thread = undefined;
+    for (&threads, 0..) |*t, i| {
+        t.* = try std.Thread.spawn(.{}, Feed.run, .{
+            &handles, @as(u64, i * per_producer + 1), per_producer, &calls,
+        });
+    }
+    for (threads) |t| t.join();
+
+    // Everything the mailboxes accepted has to be handled before the workers are
+    // stopped and joined — `join` is what makes reading `count` sound.
+    const calls_made = calls.load(.acquire);
+    const dropped = rt.stats().messages_dropped;
+    try waitUntil(Published(std.atomic.Value(u64), u64){
+        .value = &shared.received,
+        .want = calls_made - dropped,
+    }, 20_000);
+    for (handles) |h| {
+        h.stop();
+        h.join();
+    }
+
+    const stats = rt.stats();
+    var counted: u64 = 0;
+    for (handles) |h| counted += h.state.count;
+
+    // Every accepted message was handled exactly once, and no worker was entered
+    // by two pool threads at the same time.
+    try std.testing.expectEqual(counted, shared.received.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), shared.overlaps.load(.acquire));
+    // The conservation identity: every `send` call either landed in a mailbox
+    // (`messages_sent`) or was refused as backpressure (`messages_dropped`), and
+    // what landed was received.
+    try std.testing.expectEqual(calls_made, stats.messages_sent + stats.messages_dropped);
+    try std.testing.expectEqual(stats.messages_sent, stats.messages_received);
+    try std.testing.expectEqual(calls_made, stats.messages_received + stats.messages_dropped);
+    try std.testing.expect(stats.messages_received > 0);
+
+    const pool = rt.poolStats().?;
+    try std.testing.expectEqual(@as(usize, workers), pool.spawned);
+    try std.testing.expectEqual(@as(usize, width), pool.pool_threads);
+    try std.testing.expect(pool.ready_capacity >= workers + width);
+    // The pool never lost a token, and everything it took in came back out.
+    try std.testing.expectEqual(@as(u64, 0), pool.ready_push_failures);
+    try std.testing.expectEqual(@as(usize, 0), pool.ready_len);
+    try std.testing.expectEqual(@as(usize, 0), pool.claimed);
 }
 
 test "Runtime: `.pooled` without a declared pool is refused, and the bound is hard" {

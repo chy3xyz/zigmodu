@@ -1,5 +1,62 @@
 # Changelog
 
+## [Unreleased]
+
+### Scheduler Phase 2：N 条池线程（**破坏性：否**；默认宽度 1 = Phase 1 行为）
+
+Phase 1 的池只有**一条**线程，`docs/RUNTIME.md` §12.10 把"多池线程"列在"明确没做"里。这一批把它做掉，
+而且**协议本体一行未改** —— `queued`/`claimed` 两个位、单出口回执、D4「每 worker 至多一项」、
+D5「回执前重查邮箱」在任意 N 下都成立。改的全是协议**外围**，四处：
+
+1. **`ReadyRing.tryPop` 改成多消费者安全**（本次最硬的一处）。Phase 1 的出队是"读 `dequeue_pos` → 读槽位 →
+   写 `dequeue_pos = pos+1` → 释放槽位序号"：两条线程读到同一个 `pos` 就**都会拿走同一个 token**
+   （§12.3 的状态独占在进门之前就没了），而两次序号写会让某个 token **永远 pop 不出来**（那个 worker 从此
+   不再被调度，邮箱却继续收条）。修法是 Vyukov 出队那一半的标准写法：**下标用 `cmpxchgWeak` 认领**，
+   赢了才拷值、才释放槽位序号，**没有引入任何新原语**（§12.7 的"不做新队列"仍成立）。
+   **红证据**（只把 `tryPop` 换回 Phase 1 的写法，其余不动）：`scheduler: two consumers race one token and
+   exactly one of them gets it` 第 2 轮就红 —— `expected 2, found 3`；`scheduler: a hammered ring hands every
+   token to exactly one consumer` 红 —— `ring: token 0 came out 4 times`，环随即卡死（4 个生产者全部超预算
+   放弃）。换 CAS 后：50 000 轮 + 4×5 000 token 全绿（连跑 5 次）。
+2. **线程从"一条"变成"一组"**：`thread: ?std.Thread` → `threads: []std.Thread`（在 `Scheduler.init` 一次性
+   分配，调度路径仍零分配）+ `started` 计数。`start()` 在**同一个 `start_claim`** 下起完整组再发布计数
+   （懒启动的语义仍是"起或不起"），起失败则回滚 join，保持 all-or-nothing；`shutdown()` 先 `stopping` +
+   唤醒，再**取走**计数（`swap(0)`）并 join 那么多条 —— 取走而不是读，否则两个并发调用方会 join 同一句柄
+   两次（就是 §12.11 第 4 条的 `INVAL` → 中止）。
+   `stats().pool_threads` 从此报**真实条数**（`0` = 池没起或已停，起来后 = 声明的宽度）。Phase 1 用
+   `@intFromBool` 报 0/1，N>1 时会让 `pool_claimed ≤ pool_threads` 这条契约读数永远停在 0/1 上。
+3. **宽度有声明入口**：`SchedulerConfig.pool_threads`、`Application.Config.pool_threads`、
+   `ApplicationBuilder.withPoolThreads(N)`、`Runtime.InitOptions.scheduler.pool_threads`，**默认 1**。
+   不碰 runtime 的应用仍是零线程（D2 不变）；声明了池却没声明宽度的应用跑的还是**一条**线程，既有测试与
+   读数逐位不变。宽度为 0 夹到 1（没有消费者的池只能把 token 堆在环里），并且**进环容量公式**：
+   `capacity = ceilPowerOfTwo(max_pooled_workers + pool_threads)` —— 消费者在出队窗口里持有的是槽位。
+4. **claim-miss 之后退避**（性能，不是正确性）：`turn()` 区分 `ran`/`skipped`/`empty`，**只有 `ran` 清零
+   自旋预算**（"跳过"与"环空"共用预算），park 判据从"环里没有 token"换成"**环与我上次看到的一样**"
+   （`pushes` 计数未变）。否则一条被 claim 住的 token 会让 N−1 条线程全速空转（Phase 1 时这个形状根本
+   不存在）。代价如实说：持有者交还 claim 时**不**唤醒 parked 线程（生产者路径上没有 mutex/信号，这是刻意
+   的），所以"偷"到那条 token 最多晚一个 `idle_wait_ms`（1 ms）。
+
+- 实测（本机，真线程，`batch = 1`）：4 worker × 4 生产者 × 2 000 条、宽度 4 →
+  `attempts = 8000`、`received = 8000`、`dropped_full = 0`、`dispatches = 8000`、**`overlaps = 0`**、
+  `claim_misses = 0`、`ready_push_failures = 0`；宽度 1 同上且 `claim_misses = 0`（**可证**：能交还 claim 的
+  线程就是唯一能再 pop 的线程）；宽度 3 用 OS 线程数量到"起 3 条 → 再 `start()` 不增 → `shutdown()` 回基线"。
+- **`claim_misses` 的监控口径变了**（唯一一条读数含义变化）：宽度 1 恒 0（非 0 = 协议被破坏，读法不变）；
+  宽度 > 1 **允许非 0** —— 回执先清 `queued`、两条指令后再清 `claimed`，生产者落在这中间就会推一个
+  "worker 还在被跑"的 token，此时另一条线程 pop 到它、抢 claim 失败即一次 skip（token 被重推，不是丢）。
+  这条窗口只有持有者被抢占时才会宽，本机 11 次跑全为 0：**不要把 0 当契约，也不要把非 0 当告警**；
+  要盯的恒 0 读数是 `ready_push_failures`。结构上界 `claim_misses ≤ attempted + dispatches`。
+- 新增测试（`src/runtime/scheduler.zig`）：`two consumers race one token and exactly one of them gets it` ·
+  `a hammered ring hands every token to exactly one consumer` ·
+  `the ring is sized for its consumers' windows (the Phase 1 size would refuse)` ·
+  `N pool threads conserve messages and never run one worker twice` ·
+  `with one pool thread a claim is never missed (the Phase 1 reading)` ·
+  `the declared width is the number of threads started — and all of them are joined`；
+  `src/runtime/runtime.zig`：`Runtime: N pool threads conserve messages and never overlap on one worker`；
+  `src/Application.zig`：`e2e: the builder's pool *width* reaches the runtime a module spawns .pooled on`。
+- **零分配契约未放宽**：`src/runtime/alloc_contract_test.zig` 未改（线程数组在 `Scheduler.init` 一次分配，
+  环仍在同一处一次分配）。
+- 文档：`docs/RUNTIME.md` 新增 **§12.12**（机制、红/绿证据、实测数字、`claim_misses` 口径改法与测试名），
+  并按 N 更新 §12.3 / §12.6 / §12.7 / §12.8 D2 / §12.9 第 4 条、§8 的 `pool_threads` 读法。
+
 ## [0.29.1] - 2026-09-20
 
 ### 修复：`.pooled` 路径上的四个缺陷（**破坏性：否**）
