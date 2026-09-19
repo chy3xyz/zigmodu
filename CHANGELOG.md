@@ -2,6 +2,46 @@
 
 ## [Unreleased]
 
+### 修复：`.pooled` 路径上的四个缺陷（**破坏性：否**）
+
+四处都是 v0.29.0 里已经发出去的缺陷，**都在 `.pooled` 这条可选路径上**（`.dedicated` 默认不受影响），
+而且共用一个形状：池把"某件事一定会发生"当成前提，却没有把它变成断言。每处都是**先写能红的测试**再改。
+
+1. **`push` 把"出队窗口"读成"环满" → 丢 token → 那个 worker 永久停摆**（危害最大）。
+   `ReadyRing.tryPop` 先推进 `dequeue_pos`、再释放槽位（`slot.sequence = pos + capacity`）；生产者在这两条
+   指令之间读到的是**上一轮的序号**，被 Vyukov 的检查判成"满"。普通有界队列里这是保守答案（调用方重试），
+   在这里却是丢一个 **token**：worker 的 `queued` 还是 true，别的生产者也不会替它推 ⇒ 这个 worker 再不被
+   调度，而邮箱继续收条。本机实测（cap=4、4 生产者、1 个 CAS 消费者、各 20 万次 `tryPush`）：
+   ReleaseFast `800 000` 次尝试中 `324 416` 次被拒、其中 **`187 053`** 次读到的 `len < capacity`（环并没有满）；
+   Debug 为 `133 070` / **`60 986`**。修法两处都做：① 环容量按 `max_pooled_workers + pool_threads` 取
+   （消费者在窗口里也占一个槽位）；② `push` 被拒后**自旋重试**（预算 `push_retry_rounds`），只有整个预算都
+   没等到才计数 + Debug/ReleaseSafe 断言 —— 从此"环满"只表示真的满。守卫不变：`ready_push_failures` 仍必须为 0。
+2. **`Scheduler.start()` 的懒启动不是原子的 → 起两条池线程、只记住一条 → use-after-free**。
+   池是第一次 `.pooled` spawn 才启动的，于是两个并发 spawn 会一起走到 `if (self.thread != null) return;`
+   与 `self.thread = try std.Thread.spawn(...)` 之间：两条线程都起，只有后写的句柄被记住，`shutdown` 只 join
+   一条，另一条活进 `Scheduler.deinit` 的释放里。修法：`start_claim` 上的 CAS，输的一方等这次尝试有结论。
+   改前实测 `expected 4, found 5`（多出来的那条线程**没有任何计数器看得见**，判据只能是 OS 线程数）+
+   未释放的环/scheduler；改后 30 次连跑全过。
+3. **`Delivery.post` 投递后不 `announceReady` → 定时器投递静默滞留**。`send*` 四条路径都通知就绪，定时器
+   那条（`after` → `Tick` → `Delivery.post` → `enqueue`）没有：池化 worker 的就绪是**环里的 token**，不是停在
+   `recv` 的线程，于是这条消息一直躺到"碰巧有别的 `send`"为止 —— 只被定时器喂的 worker 就是永远。
+   修法：投递成功后按与 `send*` 相同的规则通知就绪（投递失败的那条直接返回，不推 token）。
+4. **并发 `shutdown()` 崩溃**。`Runtime.shutdown` 的文档写"幂等"，但它不是**线程安全**的：两个调用方都进
+   函数体、都读到 `Scheduler.thread`、都 `t.join()` —— 第二次 join 同一个句柄是 `INVAL` → `unreachable` →
+   **ABRT**（调用栈：`std.Thread.join` ← `Scheduler.shutdown` ← `Runtime.shutdown`），`workers` 列表也会被走
+   两遍。修法：`Runtime.shutdown` 整体进 `shutdown_mu` + `shutdown_done`（后到者等做完就返回），
+   `Scheduler.shutdown` 的 join 也串行化。**对照实验**：同一份测试源码（只用公开 API）在未改动的基线
+   （worktree @ `dd6df20`）连跑 8 次 **8 次全挂**（同一个 `INVAL` 断言），在修后的树上 **8 次全过**。
+
+- 新增测试：`scheduler: a producer waits out the slot its consumer is mid-release on` ·
+  `scheduler: a hammered ring never eats a token` · `scheduler: two concurrent first starts spawn exactly one
+  pool thread` · `Runtime: a timer's delivery to a pooled worker arms its ready token` ·
+  `Runtime: two threads calling shutdown at once are safe`。
+- **零分配契约未动**：`src/runtime/alloc_contract_test.zig` 的精确分配计数一个数字没改（环仍在
+  `Scheduler.init` 处一次分配，`push` 的重试路径不分配）。`poolStats().ready_capacity` 的口径随容量一起变
+  （声明上界非 2 的幂时比旧口径大一倍），既有判据 `ready_capacity >= max_pooled_workers` 仍成立。
+- 文档：`docs/RUNTIME.md` 新增 **§12.11**（四处的机制、实测数字、修法与测试名）。
+
 ### Runtime Replay v1：每个 worker 的**投递轨** + 按全局 seq 重放（**破坏性：否**）
 
 §11 的 `Recorder` 记的是 **L0 扇出**（`HotBus.publish` 之前）；它回答"生产者发布了什么"，

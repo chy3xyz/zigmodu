@@ -540,7 +540,14 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
                             "[runtime] timer delivery to {s} dropped: {s}",
                             .{ d.handle.context.name, @errorName(err) },
                         );
+                        return;
                     };
+                    // ...and then the *same* hand-off `send` does. A pooled
+                    // worker's readiness is a token in the scheduler's ring, not a
+                    // thread parked in `recv`: without this line the message sits
+                    // in the mailbox until some unrelated `send` happens to push a
+                    // token, which for a worker fed only by timers is never.
+                    d.handle.announceReady();
                 }
                 fn drop(ctx: *anyopaque, allocator: std.mem.Allocator) void {
                     const d: *@This() = @ptrCast(@alignCast(ctx));
@@ -767,6 +774,16 @@ pub const Runtime = struct {
     mu: std.Io.Mutex = .init,
     idle: std.Io.Condition = .init,
     ticker: ?std.Thread = null,
+    /// Serialises `shutdown`. Every caller is allowed to reach it (an admin
+    /// endpoint, a signal handler, `Application.stop`, a worker winding itself
+    /// down), and two of them at once used to tear the same threads down twice —
+    /// a double `std.Thread.join` (`EINVAL` → `unreachable` → abort) and a double
+    /// pass over `workers`. Idempotent has to mean "any number of callers, any
+    /// interleaving", not just "calling it again afterwards".
+    shutdown_mu: std.Io.Mutex = .init,
+    /// Set by the caller that owns the teardown, once it is done. The others wait
+    /// behind `shutdown_mu` and return without repeating any of it.
+    shutdown_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     timer_fires: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Timers released without firing at shutdown. Written from the shutdown
     /// path (the ticker's last act, or `shutdown` itself on the caller-driven
@@ -950,7 +967,19 @@ pub const Runtime = struct {
     /// workers first would free a `*Handle` a pool thread is still running. The
     /// join is what makes "every claim is handed back" true, and the assertion
     /// after it is what keeps the claim from becoming a comment nobody checks.
+    ///
+    /// **One caller at a time.** "Idempotent" here means any number of callers in
+    /// any interleaving, not just a second call after the first returned: two
+    /// concurrent callers each tore everything down (the first `Scheduler.shutdown`
+    /// they both entered joined the pool thread twice — `INVAL` inside
+    /// `std.Thread.join` → `unreachable` → abort — and `workers` was walked and
+    /// freed twice). So the body runs under `shutdown_mu`, and the caller that did
+    /// not get there first returns as soon as the owner is done.
     pub fn shutdown(self: *Self) void {
+        self.shutdown_mu.lockUncancelable(self.io);
+        defer self.shutdown_mu.unlock(self.io);
+        if (self.shutdown_done.load(.acquire)) return;
+
         self.alive.store(false, .release);
 
         // Stop the wheel's driver before touching anything `post` could reach.
@@ -1010,6 +1039,9 @@ pub const Runtime = struct {
         self.abandonTimerCommands();
         self.drainWheel();
         self.wakeTimerWaiters();
+        // Last, so that a caller waiting on `shutdown_mu` sees a fully torn-down
+        // runtime the moment it gets in — and never a half one.
+        self.shutdown_done.store(true, .release);
     }
 
     /// Spawn `W` with a mailbox capacity of `capacity` slots and `.mode =
@@ -3661,6 +3693,50 @@ test "Runtime: a pooled worker receives every message, in order" {
     try std.testing.expect(!handle.queued.load(.acquire));
 }
 
+test "Runtime: a timer's delivery to a pooled worker arms its ready token" {
+    // A pooled worker has no thread parked in `recv`: its readiness is a *token*
+    // in the ready ring, and every delivery has to put one there. The timer path
+    // is the one that did not (`Handle.after`'s `Delivery.post` enqueued straight
+    // into the mailbox), so a message that arrived by timer sat there until some
+    // other producer happened to `send` — the worker was alive, idle, and not
+    // scheduled, which is the one failure mode the pool must not have.
+    const TimerWorker = struct {
+        const Shared = struct {
+            seen: std.atomic.Value(u32) = .init(0),
+            total: std.atomic.Value(u32) = .init(0),
+        };
+        pub const Message = u32;
+        shared: *Shared = undefined,
+
+        pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
+            _ = ctx;
+            _ = self.shared.seen.fetchAdd(1, .monotonic);
+            _ = self.shared.total.fetchAdd(msg, .monotonic);
+        }
+    };
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        .clock = .{ .manual = &clk },
+        .scheduler = .{ .max_pooled_workers = 1 },
+    });
+    defer rt.deinit();
+
+    var shared = TimerWorker.Shared{};
+    const handle = try rt.spawn(TimerWorker, .{ .shared = &shared }, .{ .capacity = 8, .mode = .pooled });
+    _ = try handle.after(5, 41);
+
+    // The caller drives the wheel (no ticker thread), so the fire is exact: after
+    // this `tick` the message is in the mailbox and *nothing else* is going to
+    // touch this worker — no `send` follows to paper over a missing token.
+    clk.now_ms = 5;
+    try std.testing.expectEqual(@as(usize, 1), rt.tick());
+
+    try waitUntil(Published(@TypeOf(shared.seen), u32){ .value = &shared.seen, .want = 1 }, 2_000);
+    try std.testing.expectEqual(@as(u32, 41), shared.total.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), rt.stats().timer_deliveries_dropped);
+}
+
 test "Runtime: a pooled worker loses nothing under concurrent producers" {
     // The D5 window, hit for real: `batch = 1` means the hand-back (and its
     // mailbox re-check) runs after *every* message, and three producers are
@@ -3898,6 +3974,50 @@ test "Runtime: shutdown with the pool mid-batch hands the claim back first" {
     try std.testing.expectEqual(@as(u32, 41), shared.handled.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), rt.stats().workers);
     try std.testing.expectEqual(@as(usize, 0), rt.stats().running);
+}
+
+test "Runtime: two threads calling shutdown at once are safe" {
+    // `shutdown` is documented as idempotent, and every caller is allowed to
+    // reach it: `Application.stop`, an admin endpoint, a signal handler, a worker
+    // winding itself down. "Idempotent" used to mean "calling it *again* after it
+    // returned does nothing" — two callers *at the same time* both ran the body,
+    // both read `Scheduler.thread`, and both joined the same handle. The second
+    // `std.Thread.join` on an already-joined handle is `EINVAL` →
+    // `unreachable` → abort, from a function whose contract says that cannot
+    // happen (and a torn-down `workers` list is a double free).
+    const Trial = struct {
+        fn run(r: *Runtime, gate: *std.atomic.Value(u32)) void {
+            _ = gate.fetchAdd(1, .acq_rel);
+            while (gate.load(.acquire) < 2) std.atomic.spinLoopHint();
+            r.shutdown();
+        }
+    };
+
+    for (0..16) |_| {
+        var clk = Clock.Manual{ .now_ms = 0 };
+        var rt = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+            .clock = .{ .manual = &clk },
+            .scheduler = .{ .max_pooled_workers = 1 },
+        });
+        // Both kinds of worker: the pooled one is the scheduler's thread to join,
+        // the dedicated one owns a thread of its own and a `joined` flag that is
+        // not atomic either.
+        const pooled = try rt.spawn(CounterWorker, .{}, .{ .capacity = 8, .mode = .pooled });
+        const dedicated = try rt.spawn(CounterWorker, .{}, 8);
+        try pooled.send(1);
+        try dedicated.send(1);
+
+        var gate = std.atomic.Value(u32).init(0);
+        const a = try std.Thread.spawn(.{}, Trial.run, .{ &rt, &gate });
+        const b = try std.Thread.spawn(.{}, Trial.run, .{ &rt, &gate });
+        gate.store(2, .release); // both callers enter `shutdown` together
+        a.join();
+        b.join();
+
+        try std.testing.expectEqual(@as(usize, 0), rt.stats().workers);
+        try std.testing.expectEqual(@as(usize, 0), rt.stats().running);
+        rt.deinit(); // ...and a third, sequential call is still a no-op
+    }
 }
 
 test "Runtime: a `run`-owned worker cannot be pooled" {

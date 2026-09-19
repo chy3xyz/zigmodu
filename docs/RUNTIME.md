@@ -941,6 +941,56 @@ dedicated 加"抽干后再停"，两者都是会动到 D5 那条回执出口的�
    它**不**去判断"声明的池和 `.pooled` 的 spawn 是不是同一个 build"、也不去判断 pooled worker 是否
    可达 —— 那是文本判不了的。
 
+### 12.11 Phase 1 修过的四处（v0.29.1；都在 `.pooled` 上）
+
+> 四处都是 v0.29.0 已经发出去的缺陷，**只在 `.pooled` 这条可选路径上**（`.dedicated` 默认不受影响）。
+> 共用一个形状：池把"某件事一定会发生"当成前提，却没有把它变成断言。每处都是**先写能红的测试**再改，
+> 测试名缀在每条末尾。
+
+**1. `push` 把"出队窗口"读成"环满" → 丢 token → 那个 worker 永久停摆**（危害最大）。
+`ReadyRing.tryPop` 先推进 `dequeue_pos`、再释放槽位（`slot.sequence = pos + capacity`）；生产者在这两条
+指令之间读到的还是**上一轮的序号**，被 Vyukov 的检查判成"满"。普通有界队列里这是保守答案（调用方重试），
+在这里却是丢一个 **token**：worker 的 `queued` 还是 true，别的生产者也不会替它推 ⇒ 这个 worker 再不被
+调度，而邮箱继续收条。本机实测（cap=4、4 生产者、1 个 CAS 消费者、各 20 万次 `tryPush`）：
+
+| 构建 | 尝试 | 被拒 | 其中读到的 `len < capacity`（环并未满） |
+|------|------|------|----------------------------------------|
+| ReleaseFast | 800 000 | 324 416 | **187 053** |
+| Debug | 800 000 | 133 070 | **60 986** |
+
+修法两处，都做：① 环容量按 `max_pooled_workers + pool_threads` 取 —— 消费者在窗口里也占着一个槽位
+（Phase 1 `pool_threads = 1`），只按 worker 数取就正好会少这一格；② `push` 首次被拒后**自旋重试**
+（预算 `push_retry_rounds`），只有整个预算都没等到才计数 + Debug/ReleaseSafe 断言 —— 从此"环满"只表示
+真的满。`ready_push_failures` 仍然是"必须恒 0"的读数。
+测试：`scheduler: a producer waits out the slot its consumer is mid-release on`（把窗口手工撑开，
+确定性）· `scheduler: a hammered ring never eats a token`（真打频率）。
+
+**2. `Scheduler.start()` 的懒启动不是原子的 → 起两条池线程、只记住一条 → use-after-free**。
+池是**第一次 `.pooled` spawn 才启动**的（D2），所以两个并发 spawn 会一起走到
+`if (self.thread != null) return;` 与 `self.thread = try std.Thread.spawn(...)` 之间：两条都过检查、
+各起一条线程，只有后写的句柄被记住 —— `shutdown` join 一条，另一条活进 `Scheduler.deinit` 的释放里。
+这不是泄漏，是 UAF。修法：`start_claim` 上的 CAS，输的一方**等这次尝试有结论**（句柄发布，或失败后位被
+放开），不自己再起一条。改前实测 `expected 4, found 5`（多出来的那条线程**没有任何计数器看得见**，
+判据只能是 OS 线程数：macOS `task_threads` / Linux `/proc/self/task`）+ 未释放的环与 scheduler。
+测试：`scheduler: two concurrent first starts spawn exactly one pool thread`。
+
+**3. `Delivery.post` 投递后不 `announceReady` → 定时器投递静默滞留**。
+`send*` 四条路径都在投递后通知就绪，定时器那条（`after` → `Tick` → `Delivery.post` → `enqueue`）没有：
+池化 worker 的就绪是**环里的 token**，不是停在 `recv` 的线程，于是这条消息一直躺到"碰巧有别的 `send`"
+为止 —— 只被定时器喂的 worker 就是永远。修法：投递成功后按与 `send*` 相同的规则通知就绪
+（投递失败的那条直接返回，不推 token）。测试：`Runtime: a timer's delivery to a pooled worker arms its ready token`
+（`Clock.Manual` + `tick()`；改前 `WaitTimeout`，因为没有任何东西会再碰这个 worker）。
+
+**4. 并发 `shutdown()` 崩溃**。`Runtime.shutdown` 的文档写"幂等"，但它不是**线程安全**的：两个调用方都走
+函数体、都读到 `Scheduler.thread`、都 `t.join()` —— 第二次 join 同一个句柄是 `INVAL` →
+`unreachable` → **ABRT**（调用栈：`std.Thread.join` ← `Scheduler.shutdown` ← `Runtime.shutdown`），
+`workers` 列表也会被走两遍。**"幂等"必须覆盖"任意个调用方、任意交错"**，不只是"返回之后再调一次"。
+修法：`Runtime.shutdown` 整体进 `shutdown_mu` + `shutdown_done`（后到的调用方等前者做完就返回），
+`Scheduler.shutdown` 的 join 也串行化（`joins` 互斥量，join 前先把句柄摘下来）。
+**对照实验**：同一份测试源码（只用公开 API）在**未改动的基线**（worktree @ `dd6df20`）连跑 8 次
+**8 次全挂**（同一个 `INVAL` 断言），在修后的树上 **8 次全过**。
+测试：`Runtime: two threads calling shutdown at once are safe`。
+
 ## 13. Runtime Replay —— v1 已实现（见 §13.7）
 
 > 状态：**13.1–13.5 是设计草案（决策记录，原样保留）；13.6 的三个待定项已定；13.7 记 v1 落地形状**。

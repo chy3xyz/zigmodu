@@ -36,7 +36,7 @@
 //! ```
 //! D4: a worker has at most one token in the ring at a time
 //!   ⟹ ring occupancy ≤ number of pooled workers
-//!   ⟹ capacity ≥ max_pooled_workers makes `push` infallible
+//!   ⟹ every token a producer can want to push has a slot
 //! ```
 //!
 //! Two consequences, both deliberate:
@@ -44,7 +44,10 @@
 //! * the capacity is **derived from the declared bound** (`SchedulerConfig`
 //!   `max_pooled_workers`, rounded up to a power of two for mask indexing) — not
 //!   a constant that could be smaller than the number of workers someone
-//!   declares;
+//!   declares. And it is derived from the bound **plus the pool threads**: a
+//!   consumer that is inside `tryPop` still owns its slot (see `push`), so the
+//!   ring has to have room for one token per worker *and* one per consumer
+//!   sitting in that window;
 //! * the (max+1)-th pooled `spawn` is **refused** (`error.PoolCapacityExceeded`),
 //!   at startup, where a configuration mistake belongs. The alternative —
 //!   accepting the spawn and dropping the push — is what the invariant exists to
@@ -53,7 +56,21 @@
 //! A `push` that fails anyway is therefore *not* backpressure. It is counted
 //! (`Stats.ready_push_failures`), asserted in Debug/ReleaseSafe, and never
 //! silently dropped: "the ring was full" is not a reason to stop running a
-//! worker, it is a bug with a number attached.
+//! worker, it is a bug with a number attached. Before it counts anything, `push`
+//! waits the dequeue window out (below) — the one reading that *looks* like
+//! "full" without being it.
+//!
+//! ## The dequeue window (why a push retries)
+//!
+//! Vyukov's producer decides "full" from the slot's sequence number, and
+//! `tryPop` releases that sequence a couple of instructions *after* it has
+//! advanced `dequeue_pos`. A producer whose read lands in between sees the
+//! previous round's sequence and is told the ring is full — while the ring is
+//! one slot short of full and the release is about to land. In a plain bounded
+//! queue that is a conservative answer and the caller waits. Here, returning it
+//! would drop a token, so `push` spins over the window instead: the retry is
+//! what makes "the ring was full" mean *full*, and only that, before the assert
+//! fires.
 //!
 //! ## The hand-back order (the easy thing to get wrong)
 //!
@@ -93,6 +110,20 @@ pub const SchedulerConfig = struct {
 };
 
 pub const default_batch: usize = 16;
+
+/// How many pool threads this phase runs (docs/RUNTIME.md §12.9). It is also the
+/// number of ring slots that can be *held by a consumer inside `tryPop`* at one
+/// instant — the window `push` retries over — which is why the ready ring's
+/// capacity is derived from `max_pooled_workers + pool_threads` and not from the
+/// workers alone.
+pub const pool_threads: usize = 1;
+
+/// How long `push` waits for a slot it was told is full, in spin rounds, before
+/// it concludes the ring really is full (which, per the capacity invariant, is a
+/// bug). The window it exists for is two instructions wide on the consumer side;
+/// the budget is orders of magnitude larger so that a *preempted* consumer is
+/// still waited out rather than blamed.
+const push_retry_rounds: usize = 1 << 20;
 
 /// The pool thread's spin before it parks, and how long it parks. Parking is a
 /// poll rather than a signal on purpose: a `signal` per publish would put a
@@ -171,8 +202,11 @@ const ReadyRing = struct {
         return self.slots.len;
     }
 
-    /// Any thread. False when full — which, per the capacity invariant, is a bug
-    /// rather than a state to handle.
+    /// Any thread. False when full — which means one of two things, and only
+    /// `Scheduler.push` can tell them apart: the ring *is* full (per the capacity
+    /// invariant, a bug rather than a state to handle), or the consumer is
+    /// between the two stores of `tryPop` and the slot is about to come back.
+    /// The second is why `push` retries instead of counting.
     fn tryPush(self: *Self, item: Ready) bool {
         var pos = self.enqueue_pos.load(.monotonic);
         while (true) {
@@ -232,7 +266,21 @@ pub const Scheduler = struct {
     /// owned by exactly one thread, so the count cannot be double-taken, and its
     /// ceiling is the number of pool threads (Phase 1: 1).
     claimed: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// The pool thread, published by whoever wins `start_claim`. Only written by
+    /// `start` and by the one caller `joins` lets into `shutdown`.
     thread: ?std.Thread = null,
+    /// Who is inside `start` right now. `start` is called lazily by the first
+    /// pooled `spawn` (D2), so two concurrent spawns arrive together: without
+    /// this bit both would pass `thread != null` and both spawn a pool thread,
+    /// and only the last handle would be remembered (the other would outlive
+    /// `deinit`, which is a use-after-free rather than a leak).
+    start_claim: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Serialises the join in `shutdown`. `shutdown` is documented as idempotent
+    /// and every caller may reach it — `Application.stop`, an admin endpoint, a
+    /// worker winding itself down — so "two callers at once" is a real shape, not
+    /// a hypothetical. Two joiners are a double `std.Thread.join` on one handle:
+    /// `EINVAL` → `unreachable` → abort.
+    joins: std.Io.Mutex = .init,
     stopping: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     mu: std.Io.Mutex = .init,
     idle: std.Io.Condition = .init,
@@ -248,11 +296,14 @@ pub const Scheduler = struct {
     ) !*Self {
         std.debug.assert(config.max_pooled_workers > 0); // the runtime only creates a pool it was asked for
         std.debug.assert(config.batch > 0);
-        // Round the declared bound *up*: the index arithmetic needs a power of
-        // two, and rounding down would break the capacity invariant. The floor
-        // of two is the ring's own minimum (a 1-slot ring cannot tell "free"
-        // from "not read yet"), and it rounds *up*, never down.
-        const capacity = @max(std.math.ceilPowerOfTwo(usize, config.max_pooled_workers) catch
+        // Round the declared bound *up*, and add the pool threads: the index
+        // arithmetic needs a power of two, rounding down would break the capacity
+        // invariant, and a consumer that is inside `tryPop` still owns its slot —
+        // so the producers need room for one token per worker *plus* one per
+        // consumer in the dequeue window (see `push`). The floor of two is the
+        // ring's own minimum (a 1-slot ring cannot tell "free" from "not read
+        // yet"), and it rounds *up*, never down.
+        const capacity = @max(std.math.ceilPowerOfTwo(usize, config.max_pooled_workers + pool_threads) catch
             return error.PoolTooLarge, 2);
         const self = try allocator.create(Self);
         errdefer allocator.destroy(self);
@@ -268,8 +319,9 @@ pub const Scheduler = struct {
 
     pub const Stats = struct {
         max_pooled_workers: usize,
-        /// Ring slots. `>= max_pooled_workers` by construction (`ceilPowerOfTwo`),
-        /// which is what makes `push` infallible.
+        /// Ring slots. `>= max_pooled_workers + pool_threads` by construction
+        /// (`ceilPowerOfTwo`), which is what makes `push` infallible: room for one
+        /// token per worker, plus one per consumer sitting in the dequeue window.
         ready_capacity: usize,
         ready_len: usize,
         spawned: usize,
@@ -317,22 +369,44 @@ pub const Scheduler = struct {
         _ = self.spawned.fetchSub(1, .acq_rel);
     }
 
-    /// Start the pool thread. Idempotent. Called lazily by the first pooled
-    /// `spawn`, so declaring a pool that is never used still costs no thread
-    /// (§12.8 D2).
+    /// Start the pool thread. Idempotent — including for two callers arriving at
+    /// the **first** start together, which is the shape the lazy start invites:
+    /// the first pooled `spawn` starts it, so two concurrent spawns race here.
+    /// Called lazily, so declaring a pool that is never used still costs no
+    /// thread (§12.8 D2).
     pub fn start(self: *Self) !void {
-        if (self.thread != null) return;
-        self.thread = try std.Thread.spawn(.{}, poolMain, .{self});
+        while (true) {
+            if (self.thread != null) return; // already running
+            if (self.start_claim.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
+                defer self.start_claim.store(false, .release);
+                self.thread = try std.Thread.spawn(.{}, poolMain, .{self});
+                return;
+            }
+            // Another thread is in the middle of starting it: wait for that
+            // attempt to conclude (the handle published, or the claim released
+            // again by its failure). Spawning our own is what leaves a pool
+            // thread nobody's handle points at.
+            while (self.start_claim.load(.acquire)) std.atomic.spinLoopHint();
+            if (self.thread == null) return error.PoolStartFailed;
+        }
     }
 
     /// Ask the pool thread to finish, then wait for it. A batch in flight is
     /// allowed to complete: a worker that never returns still blocks shutdown
     /// (§4's rule for dedicated workers, kept for pooled ones).
+    ///
+    /// Safe for two threads at once: one of them joins the pool thread, the other
+    /// waits behind `joins` and then finds no handle left to join. Without that,
+    /// both read `self.thread` and both call `t.join()` — and a second `join` of
+    /// the same handle is `EINVAL` → `unreachable` → abort (measured; see the
+    /// test below).
     pub fn shutdown(self: *Self) void {
         self.stopping.store(true, .release);
         self.mu.lock(self.io) catch return;
         self.idle.broadcast(self.io);
         self.mu.unlock(self.io);
+        self.joins.lockUncancelable(self.io);
+        defer self.joins.unlock(self.io);
         if (self.thread) |t| {
             t.join();
             self.thread = null;
@@ -365,14 +439,27 @@ pub const Scheduler = struct {
         return self.ready.len();
     }
 
-    /// Push a token. Infallible by construction — see the capacity invariant at
-    /// the top of this file. A failure here is counted (and asserted in
-    /// Debug/ReleaseSafe) rather than swallowed, because a dropped token is a
-    /// worker that stops being scheduled, not a message that gets lost.
+    /// Push a token. Infallible — see the capacity invariant at the top of this
+    /// file. A failure here is counted (and asserted in Debug/ReleaseSafe) rather
+    /// than swallowed, because a dropped token is a worker that stops being
+    /// scheduled, not a message that gets lost.
+    ///
+    /// The retry is not backpressure and not a second chance: it is the only way
+    /// to tell "the ring is full" from "the consumer has advanced `dequeue_pos`
+    /// and has not released the slot yet" (the window `tryPop` leaves open, two
+    /// instructions wide). Both readings come back as `false` from Vyukov's check,
+    /// and the second one clears itself — so waiting is exactly what the first
+    /// one cannot do, and treating them alike is what eats the token.
     fn push(self: *Self, item: Ready) void {
-        const pushed = self.ready.tryPush(item);
-        std.debug.assert(pushed);
-        if (!pushed) _ = self.ready_push_failures.fetchAdd(1, .monotonic);
+        var round: usize = 0;
+        while (true) {
+            if (self.ready.tryPush(item)) return;
+            round += 1;
+            if (round > push_retry_rounds) break;
+            std.atomic.spinLoopHint();
+        }
+        _ = self.ready_push_failures.fetchAdd(1, .monotonic);
+        std.debug.assert(false);
     }
 
     /// One scheduling turn: pop a token, run its worker. False when the ring is
@@ -584,7 +671,8 @@ test "scheduler: a claimed worker is never run by a second scheduling turn" {
 
 test "scheduler: the ready ring's capacity follows the declared bound" {
     // Not a constant: every declared bound gets a ring that can hold one token
-    // per worker, which is what makes `push` infallible (see the file header).
+    // per worker — plus the slot a consumer holds while it is inside `tryPop` —
+    // which is what makes `push` infallible (see the file header).
     for ([_]usize{ 1, 2, 5, 8, 17, 64, 1000 }) |bound| {
         var sched = try testScheduler(.{ .max_pooled_workers = bound });
         defer sched.deinit();
@@ -649,4 +737,213 @@ test "scheduler: a message arriving as the batch ends is never lost" {
     // And the message is not just "maybe later": it runs.
     try std.testing.expect(sched.step());
     try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, fake.handled[0..2]);
+}
+
+// ─────────────────────────────────────────────────
+// The dequeue window, and the token it must not eat
+// ─────────────────────────────────────────────────
+//
+// `ReadyRing.tryPop` advances `dequeue_pos` and *then* releases the slot
+// (`slot.sequence = pos + capacity`). A producer that reads the slot inside
+// those few instructions sees the **previous round's** sequence, which Vyukov's
+// algorithm reads as "the ring is full" — while in fact the consumer has already
+// left and the slot is about to be free. In a plain bounded queue that is a
+// conservative answer the caller retries. Here it is not backpressure: the token
+// is dropped, the worker's `queued` bit stays true, and no producer will ever
+// push for it again — the worker stops being scheduled while its mailbox keeps
+// accepting (see the capacity invariant at the top of this file).
+//
+// So `Scheduler.push` has to wait the window out. These two tests pin that: the
+// first holds the window open on purpose, the second hits it for real.
+
+/// How long a test's stand-in consumer takes between the two halves of
+/// `tryPop`, in spin rounds: long enough that the producer's first read is
+/// certainly in the past, short enough that a retrying push is still inside its
+/// budget.
+const release_delay_rounds: usize = 1 << 14;
+
+test "scheduler: a producer waits out the slot its consumer is mid-release on" {
+    var sched = try testScheduler(.{ .max_pooled_workers = 1 }); // ring capacity 2
+    defer sched.deinit();
+    const ring = &sched.ready;
+
+    var a = FakeWorker{ .scheduler = sched };
+    var b = FakeWorker{ .scheduler = sched };
+    try std.testing.expect(ring.tryPush(a.ready()));
+    try std.testing.expect(ring.tryPush(b.ready()));
+
+    // `tryPop`, split in half by hand: the consumer has copied the value out and
+    // moved `dequeue_pos` on, and has *not* released the slot yet. That is the
+    // state a producer can catch it in — the window is a couple of instructions
+    // wide in production, and holding it open is the only way to make the
+    // interleaving an assertion instead of a hope.
+    const taken = ring.slots[0].value;
+    ring.dequeue_pos.store(1, .monotonic);
+    try std.testing.expectEqual(@as(*anyopaque, @ptrCast(&a)), taken.ctx);
+    // One token left in a two-slot ring: there is room, and the ring says so.
+    try std.testing.expectEqual(@as(usize, 1), ring.len());
+    try std.testing.expect(ring.len() < ring.capacity());
+
+    const HalfPop = struct {
+        fn run(r: *ReadyRing, entered: *std.atomic.Value(bool)) void {
+            while (!entered.load(.acquire)) std.atomic.spinLoopHint();
+            var i: usize = 0;
+            while (i < release_delay_rounds) : (i += 1) std.atomic.spinLoopHint();
+            r.slots[0].sequence.store(0 +% r.slots.len, .release); // the second half
+        }
+    };
+    var entered = std.atomic.Value(bool).init(false);
+    const releaser = try std.Thread.spawn(.{}, HalfPop.run, .{ ring, &entered });
+
+    var c = FakeWorker{ .scheduler = sched };
+    entered.store(true, .release);
+    sched.push(c.ready()); // must wait for the release, not report "full"
+    releaser.join();
+
+    // The push landed: the third token is in the ring, and the counter that says
+    // "a worker stopped being scheduled" reads zero.
+    try std.testing.expectEqual(@as(usize, 2), sched.readyLen());
+    try std.testing.expectEqual(@as(u64, 0), sched.stats().ready_push_failures);
+}
+
+test "scheduler: a hammered ring never eats a token" {
+    // The rate version: producers hammer `push` while a consumer drains, so the
+    // window is met for real. Every refusal in this ring is a token the pool
+    // would never see again — nothing here is backpressure.
+    const producers = 4;
+    const per_producer = 20_000;
+    var sched = try testScheduler(.{ .max_pooled_workers = 3 }); // ring capacity 4
+    defer sched.deinit();
+
+    var fakes: [4]FakeWorker = @splat(FakeWorker{});
+    var items: [4]Ready = undefined;
+    for (&fakes, &items) |*fake, *item| {
+        fake.scheduler = sched;
+        item.* = fake.ready();
+    }
+
+    var stop = std.atomic.Value(bool).init(false);
+    const Drain = struct {
+        fn run(s: *Scheduler, done: *std.atomic.Value(bool)) void {
+            while (!done.load(.acquire)) {
+                if (s.ready.tryPop() == null) std.atomic.spinLoopHint();
+            }
+        }
+    };
+    const drain = try std.Thread.spawn(.{}, Drain.run, .{ sched, &stop });
+
+    const Hammer = struct {
+        fn run(s: *Scheduler, batch: []const Ready, n: usize) void {
+            for (0..n) |i| s.push(batch[i % batch.len]);
+        }
+    };
+    var threads: [producers]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Hammer.run, .{ sched, &items, per_producer });
+    for (threads) |t| t.join();
+    stop.store(true, .release);
+    drain.join();
+
+    try std.testing.expectEqual(@as(u64, 0), sched.stats().ready_push_failures);
+}
+
+/// The live thread count, with a linger guard: a thread that has just returned
+/// can still be listed for a moment, and this measurement is used as a *delta*,
+/// so a body being reaped must not read as a live one. Two readings, the lower.
+fn settledThreadCount() ?usize {
+    const first = liveThreadCount() orelse return null;
+    var spins: usize = 0;
+    while (spins < 200_000) : (spins += 1) std.atomic.spinLoopHint();
+    return @min(first, liveThreadCount() orelse return null);
+}
+
+/// How many OS threads this process runs right now, or null where the platform
+/// cannot be asked. The lazy start's race leaks a pool thread whose handle was
+/// never stored, so no counter inside the scheduler can see it: the OS is the
+/// only witness.
+fn liveThreadCount() ?usize {
+    const builtin = @import("builtin");
+    switch (builtin.os.tag) {
+        .macos => {
+            var ports: std.c.mach_port_array_t = undefined;
+            var count: std.c.mach_msg_type_number_t = 0;
+            if (std.c.task_threads(std.c.mach_task_self(), &ports, &count) != 0) return null;
+            // The port array is handed to us; releasing it is our job.
+            _ = std.c.vm_deallocate(
+                std.c.mach_task_self(),
+                @intFromPtr(ports),
+                @as(std.c.vm_size_t, count) * @sizeOf(std.c.mach_port_t),
+            );
+            return count;
+        },
+        .linux => {
+            const dir = std.c.opendir("/proc/self/task") orelse return null;
+            defer _ = std.c.closedir(dir);
+            var n: usize = 0;
+            while (std.c.readdir(dir)) |entry| {
+                if (std.ascii.isDigit(entry.name[0])) n += 1;
+            }
+            return n;
+        },
+        else => return null,
+    }
+}
+
+test "scheduler: two concurrent first starts spawn exactly one pool thread" {
+    // `start()` is lazy (D2: a declared pool costs no thread until it is used),
+    // so two threads can arrive at the *first* start together — two `.pooled`
+    // spawns racing. `if (self.thread != null) return` is a check and an act with
+    // a thread spawn in between: both pass it and both spawn. Only one handle is
+    // remembered, so `shutdown` joins one, and the other keeps running into
+    // `Scheduler.deinit`'s frees.
+    // Both callers stay alive until the counting is done, so the delta is only
+    // "what the two `start()` calls spawned" — a joined thread's bookkeeping
+    // cannot blur it.
+    const Race = struct {
+        fn run(
+            s: *Scheduler,
+            gate: *std.atomic.Value(u32),
+            done: *std.atomic.Value(u32),
+            release: *std.atomic.Value(bool),
+            ok: *std.atomic.Value(bool),
+        ) void {
+            _ = gate.fetchAdd(1, .acq_rel);
+            while (gate.load(.acquire) < 2) std.atomic.spinLoopHint();
+            s.start() catch ok.store(false, .release);
+            _ = done.fetchAdd(1, .acq_rel);
+            while (!release.load(.acquire)) std.atomic.spinLoopHint();
+        }
+    };
+
+    for (0..4) |_| {
+        var sched = try testScheduler(.{ .max_pooled_workers = 1 });
+        const before = settledThreadCount() orelse {
+            // No way to count on this platform: the race still runs, it just
+            // cannot be asserted on.
+            sched.deinit();
+            return;
+        };
+
+        var gate = std.atomic.Value(u32).init(0);
+        var done = std.atomic.Value(u32).init(0);
+        var release = std.atomic.Value(bool).init(false);
+        var ok = std.atomic.Value(bool).init(true);
+        const a = try std.Thread.spawn(.{}, Race.run, .{ sched, &gate, &done, &release, &ok });
+        const b = try std.Thread.spawn(.{}, Race.run, .{ sched, &gate, &done, &release, &ok });
+        gate.store(2, .release);
+        var spins: usize = 0;
+        while (done.load(.acquire) < 2) : (spins += 1) {
+            if (spins > 1_000_000_000) return error.StartNeverReturned;
+            std.atomic.spinLoopHint();
+        }
+
+        // Two callers, one pool thread: `before + 2 (the callers) + 1`.
+        try std.testing.expectEqual(before + 3, settledThreadCount().?);
+        try std.testing.expect(ok.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), sched.stats().pool_threads);
+
+        release.store(true, .release);
+        a.join();
+        b.join();
+        sched.deinit();
+    }
 }
