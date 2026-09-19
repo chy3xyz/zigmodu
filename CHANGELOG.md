@@ -1,5 +1,36 @@
 # Changelog
 
+## [Unreleased]
+
+### Scheduler Phase 2：红证据与守卫的复现复核（**破坏性：否**；只补验证，生产代码未改）
+
+v0.30.0 把就位环的出队改成 CAS 认领，**理由**是"旧出队下两条线程能拿到同一个 token、陈旧的槽位序号会让
+某个 token 永远 pop 不出来"，但那一轮的执行者撞了步数上限、没交交接报告 —— 红证据与"守卫到底红不红"
+一直是欠账。本次补齐，且**只加测试**（`src/runtime/**` 的非测试部分一行未改）：
+
+1. **确定性红证据**（一次性暂停钩子，只在 `/tmp` 副本里跑）：把 `tryPop` 停在"读到 token 值之后、推进
+   `dequeue_pos` 之前"，主线程再完整跑一次 `tryPop`。旧形状 → token0 被两条线程各拿一次
+   （`T1=1 T2=1`，且陈旧 store 把 `dequeue_pos` 从 2 打回 1）；CAS 认领 → `T1=1 T2=2 T3=0`，恰好一个。
+   第二种形态（陈旧的 `slot.sequence.store`）同样确定性复现：旧形状下 `tryPop()` 返回 null 而
+   `len() != 0`（槽位永久不可读、后续推送还毒化一格）；新形状下被暂停的消费者只让生产者被拒一次
+   （可恢复的窗口，不是丢 token）。
+2. **守卫有牙齿**（验收方式：只把 `tryPop` 换回 Phase 1 写法，其余一行不动）：现有两条多消费者测试
+   在旧实现下**确实是红的** —— `two consumers race one token …` → `expected 2, found 3`；
+   `a hammered ring hands every token to exactly one consumer` → `ring: token 0 came out 4 times`；
+   真池用例 `N pool threads conserve messages …` 更直接 **ABRT**（`push` 的重试预算耗尽 →
+   `scheduler.zig:564: std.debug.assert(false)`，调用栈 `push ← runOne ← turn ← poolMain`）。
+   结论：它们不是"没牙齿的测试"。
+3. **新增守卫**：`four consumers released together still hand one token out once`（同一起跑线的加宽版，
+   旧实现下红：`expected 1, found 2` / `expected 2, found 4`，视撞上的轮次）；
+   `the declared occupancy pushes cleanly, round after round`（`bound + width` 口径连压 500 轮 × 7 次推送
+   **0 拒绝**，同时断言 Phase 1 口径的环第 5 次就被拒；容量公式去掉 `+ pool_threads` 时它红：
+   `expected 8, found 4`）；`with one pool thread a claim is never missed` 从一种形状扩到三种
+   （`batch` 1/8/16、worker 2/4/6）。
+4. **读数**：宽度 4 真线程 → `sent=8000 received=8000 dropped_full=0 overlaps=0 claim_misses=0
+   dispatches=8000 push_failures=0`；宽度 1 三种形状 `claim_misses` 全 0。
+
+零分配契约未放宽，`pool_threads` 默认仍是 1。细节与原文见 `docs/RUNTIME.md` §12.12.1。
+
 ## [0.30.0] - 2026-09-20
 
 ### Scheduler Phase 2：N 条池线程（**破坏性：否**；默认宽度 1 = Phase 1 行为）

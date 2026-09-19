@@ -1217,6 +1217,108 @@ test "scheduler: a hammered ring hands every token to exactly one consumer" {
     try std.testing.expectEqual(@as(u64, 0), push_failures.load(.acquire));
 }
 
+test "scheduler: four consumers released together still hand one token out once" {
+    // The two-consumer test above is the minimal shape of the race; this is the
+    // same race widened. The protocol has no count in it, but the number of
+    // *pairs* that can read one position before either claims it grows with the
+    // consumers, so a dequeue that claims by store (`load -> read -> store`) is
+    // caught in fewer rounds here. It fails the same way: a second winner in a
+    // round is one token handed to two threads (§12.3's state exclusivity is
+    // already gone by the time the worker runs).
+    const consumers = 4;
+    const rounds = 20_000;
+    var sched = try testScheduler(.{ .max_pooled_workers = 1, .pool_threads = consumers });
+    defer sched.deinit();
+    const ring = &sched.ready;
+
+    const stop_marker = std.math.maxInt(u32);
+    var gate = std.atomic.Value(u32).init(0);
+    var done = std.atomic.Value(u32).init(0);
+    var wins = std.atomic.Value(u32).init(0);
+
+    const Consumer = struct {
+        const stop = std.math.maxInt(u32);
+        fn run(r: *ReadyRing, g: *std.atomic.Value(u32), d: *std.atomic.Value(u32), w: *std.atomic.Value(u32), n: usize) void {
+            var round: usize = 0;
+            while (round < n) : (round += 1) {
+                const released: u32 = @intCast(round + 1);
+                while (g.load(.acquire) != released) {
+                    if (g.load(.acquire) == stop) return;
+                    std.atomic.spinLoopHint();
+                }
+                if (r.tryPop() != null) _ = w.fetchAdd(1, .acq_rel);
+                _ = d.fetchAdd(1, .acq_rel);
+            }
+        }
+    };
+    var threads: [consumers]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Consumer.run, .{ ring, &gate, &done, &wins, rounds });
+    defer {
+        for (threads) |t| t.join();
+    }
+    // Registered after the joins, so it runs *before* them (LIFO): a failed
+    // assertion must release every consumer, or the joins would wait on a gate
+    // value that never arrives.
+    errdefer gate.store(stop_marker, .release);
+
+    for (0..rounds) |round| {
+        try std.testing.expect(ring.tryPush(numberedToken(round)));
+        gate.store(@intCast(round + 1), .release);
+        var spins: usize = 0;
+        while (done.load(.acquire) != consumers * (round + 1)) : (spins += 1) {
+            try std.testing.expect(spins < 1 << 32);
+            std.atomic.spinLoopHint();
+        }
+        // One token, `consumers` consumers, one winner — every round.
+        try std.testing.expectEqual(@as(u32, @intCast(round + 1)), wins.load(.acquire));
+    }
+}
+
+test "scheduler: the declared occupancy pushes cleanly, round after round" {
+    // `push` is infallible at the occupancy the capacity was declared for, and
+    // that has to survive repetition: `max_pooled_workers + pool_threads` tokens
+    // fit, every round, with no refusal. The `+ pool_threads` half is what keeps a
+    // consumer inside `tryPop` from costing a producer its slot — the Phase 1
+    // sizing (the bound alone) refuses the same script in its first round, which
+    // is asserted below.
+    const bound = 4;
+    const width = 3; // bound + width = 7 > ceilPowerOfTwo(bound) = 4
+    const rounds = 500;
+    const phase1_capacity = @max(try std.math.ceilPowerOfTwo(usize, bound), 2);
+    const consumer_capacity = @max(try std.math.ceilPowerOfTwo(usize, bound + width), 2);
+    try std.testing.expect(phase1_capacity < bound + width);
+
+    var sched = try testScheduler(.{ .max_pooled_workers = bound, .pool_threads = width });
+    defer sched.deinit();
+    const ring = &sched.ready;
+    // The Scheduler's ring is the one the declared width pays for, not a ring
+    // built by hand in the test.
+    try std.testing.expectEqual(consumer_capacity, ring.capacity());
+
+    for (0..rounds) |_| {
+        for (0..bound + width) |i| {
+            try std.testing.expect(ring.tryPush(numberedToken(i)));
+        }
+        // ...and every one of them comes back, in order, exactly once.
+        for (0..bound + width) |i| {
+            try std.testing.expectEqual(i, tokenId(ring.tryPop().?));
+        }
+        try std.testing.expectEqual(@as(usize, 0), ring.len());
+    }
+    try std.testing.expectEqual(@as(u64, 0), sched.stats().ready_push_failures);
+
+    var legacy = try ReadyRing.init(std.testing.allocator, phase1_capacity);
+    defer legacy.deinit(std.testing.allocator);
+    for (0..bound + width) |i| {
+        // The rings hold the same token count; only the sizing differs.
+        if (i < phase1_capacity) {
+            try std.testing.expect(legacy.tryPush(numberedToken(i)));
+        } else {
+            try std.testing.expect(!legacy.tryPush(numberedToken(i)));
+        }
+    }
+}
+
 /// One consumer stopped halfway through `tryPop`: the value is copied out and
 /// `dequeue_pos` has moved on, and the slot is not released yet. That is the
 /// state the ring's capacity has to leave room for — holding it open by hand is
@@ -1514,15 +1616,34 @@ test "scheduler: with one pool thread a claim is never missed (the Phase 1 readi
     // is only ever held by the thread that popped the token, and that same thread
     // is the only consumer that can pop again — by the time it does, its own
     // hand-back has already released the claim. So `claim_misses` is 0 by
-    // construction here, whatever the load (§12.12).
-    const load = try runPoolLoad(std.testing.allocator, 4, 1, 1, 4, 1_000);
+    // construction here, whatever the load (§12.12). "Whatever the load" is the
+    // part worth asserting: the batch size moves *when* the hand-back happens and
+    // the worker count moves how often a worker is re-armed, so one shape is a
+    // reading and several are the contract.
+    const Shape = struct { workers: usize, batch: usize, producers: usize, per_producer: usize };
+    const shapes = [_]Shape{
+        .{ .workers = 4, .batch = 1, .producers = 4, .per_producer = 1_000 },
+        .{ .workers = 2, .batch = 8, .producers = 2, .per_producer = 1_000 },
+        .{ .workers = 6, .batch = 16, .producers = 3, .per_producer = 500 },
+    };
+    for (shapes) |shape| {
+        const load = try runPoolLoad(
+            std.testing.allocator,
+            shape.workers,
+            1,
+            shape.batch,
+            shape.producers,
+            shape.per_producer,
+        );
 
-    try std.testing.expectEqual(@as(usize, 1), load.pool_threads);
-    try std.testing.expect(load.dispatches > 0);
-    try std.testing.expectEqual(@as(u64, 0), load.claim_misses);
-    try std.testing.expectEqual(@as(u32, 0), load.overlaps);
-    try std.testing.expectEqual(load.sent, load.received + load.dropped_full);
-    try std.testing.expectEqual(@as(u64, 0), load.ready_push_failures);
+        try std.testing.expectEqual(@as(usize, 1), load.pool_threads);
+        try std.testing.expectEqual(@as(usize, shape.workers), load.max_pooled_workers);
+        try std.testing.expect(load.dispatches > 0);
+        try std.testing.expectEqual(@as(u64, 0), load.claim_misses);
+        try std.testing.expectEqual(@as(u32, 0), load.overlaps);
+        try std.testing.expectEqual(load.sent, load.received + load.dropped_full);
+        try std.testing.expectEqual(@as(u64, 0), load.ready_push_failures);
+    }
 }
 
 test "scheduler: the declared width is the number of threads started — and all of them are joined" {

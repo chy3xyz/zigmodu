@@ -1045,7 +1045,9 @@ dedicated 加"抽干后再停"，两者都是会动到 D5 那条回执出口的�
 
 两条测试的分工是刻意的：第一条是**同步到同一起跑线**的最小形状（确定性最强），第二条是
 **频率形状**（暴露"丢失"那一半）。旧实现下环不会"偶尔慢一点"，它会**碎掉**：token 重复到手
-之后，某个槽位的序号再也回不到可读状态。
+之后，某个槽位的序号再也回不到可读状态。真池用例（`N pool threads conserve messages …`）在旧实现下
+还会直接 **ABRT**（生产者重试预算耗尽 → `push` 的 Debug 断言）—— 上表的两条读数已在 2026-09-20
+**补测复核**（确定性暂停钩子 + 纯回退两种口径），复核记录、第二条形态与新增守卫见 **§12.12.1**。
 
 **2. 线程从"一条"变成"一组"**。`thread: ?std.Thread` → `threads: []std.Thread`（在
 `Scheduler.init` 里**一次性分配**，调度路径上零分配）+ `started: usize`（已起的条数）。
@@ -1114,9 +1116,16 @@ dedicated 加"抽干后再停"，两者都是会动到 D5 那条回执出口的�
   出来 = token 被环吞了）；
 * `the ring is sized for its consumers' windows (the Phase 1 size would refuse)` —— 两条口径的容量
   对照，窗口用手撑开做成确定性的；
+* `four consumers released together still hand one token out once` —— 上上条的**加宽版**（4 条消费者
+  抢 1-token 环）：同一份协议，能读同一位置的**线程对**更多，旧实现下 `expected 2, found 4`
+  （红证据见 §12.12.1）；
+* `the declared occupancy pushes cleanly, round after round` —— `bound + width` 口径连压 500 轮 ×
+  7 次推送**零拒绝**，并在同一用例里断言 Phase 1 口径（`ceilPowerOfTwo(bound)`）的环第 5 次就被拒；
+  容量公式回退成 `max_pooled_workers` 时它红（§12.12.1）；
 * `N pool threads conserve messages and never run one worker twice` —— 真线程跑池：
   `sent == received + dropped_full`、`ready_push_failures == 0`、**overlap 读数 0**；
-* `with one pool thread a claim is never missed (the Phase 1 reading)` —— N=1 恒 0；
+* `with one pool thread a claim is never missed (the Phase 1 reading)` —— N=1 恒 0，**三种形状**
+  （`batch` 1/8/16、worker 2/4/6）都要恒 0：一种形状是读数，几种形状才是契约；
 * `the declared width is the number of threads started — and all of them are joined` —— 用 OS
   线程数当见证（多出来的线程没有任何计数器看得见，§12.11 第 2 条同理）；
 * `Runtime: N pool threads conserve messages and never overlap on one worker`（`runtime.zig`）——
@@ -1124,6 +1133,63 @@ dedicated 加"抽干后再停"，两者都是会动到 D5 那条回执出口的�
   `ready_len == 0`、`claimed == 0` 收尾；
 * `e2e: the builder's pool *width* reaches the runtime a module spawns .pooled on`（`Application.zig`）
   —— `withPoolThreads(3)` 一路走到 `poolStats().pool_threads == 3`，`app.stop()` 后回到 0。
+
+**12.12.1 红证据与守卫的复现复核（2026-09-20 补测）**
+
+> §12.12 第一版把"旧出队是坏的"写在**改动理由**里，而支撑它的数字来自设计审查那一步，不是这次实现
+> 自己的测试 —— 执行那一轮的 agent 撞了步数上限、没交报告。本节把它补上，**生产代码一行未改**：
+> 只加验证，加两条守卫，并把"守卫在旧实现下到底红不红"实跑一遍。
+
+**(1) 确定性红证据（一次性暂停钩子，只在 `/tmp` 的副本里跑）**
+
+把 `tryPop` 停在"读到 token 值之后、推进 `dequeue_pos` 之前"（旧形状），主线程在被暂停的消费者
+停住时**完整跑一次 `tryPop`** —— 两条消费者于是同一起跑线抢一个 1-token 环。原文：
+
+| 实现 | 观测（测试打印原文） | 判定 |
+|------|----------------------|------|
+| 旧 `load → 读值 → store` | `PROBE race: T1=1 T2=1 T3=2 (1 = token0, 2 = token1, 0 = null)  len=1 dequeue_pos=1 enqueue_pos=2` | **两条线程拿到同一个 token**（token0 交出两次）；且 `dequeue_pos` 被陈旧 store 从 2 **打回** 1，环当场卡住 |
+| 新 CAS 认领 | `PROBE race: T1=1 T2=2 T3=0 … len=0 dequeue_pos=2 enqueue_pos=2` | token0 恰好一个消费者拿到，token1 顺位交出，三个读数互相一致 |
+
+第二种形态（陈旧的 `slot.sequence.store`）在同一个钩子下也是确定性的：
+
+| 实现 | 观测（测试打印原文） | 判定 |
+|------|----------------------|------|
+| 旧 | `PROBE stale: T1=1 T2=1 pushes={ true, true, true, true } drained={ 2, 3, 4 } stuck_after_drain=1 accepted_more=3 next_pop=0  len=4 dequeue_pos=4 enqueue_pos=8` | 暂停者醒来把**陈旧的 `pos + cap` 写回**，该槽位从此不可读：`tryPop()` 返回 null 而 `len() != 0`；后续推送还**永久毒化一格**（`accepted_more=3`），环整个停摆 |
+| 新 | `PROBE stale: T1=1 T2=0 pushes={ true, true, true, false } drained={ 2, 3, 4 } stuck_after_drain=0 accepted_more=4 next_pop=6  len=3 …` | 认领过的位置只有认领者能释放：被暂停的消费者不还槽位时生产者**被拒一次**（可恢复的窗口，不是丢 token），暂停者一还，推送就进、token 一个不少 |
+
+钩子在两条实现里插在**同一个语义点**（"值已拷出、槽位还没还"），而这正是修法的落点：新的 `tryPop`
+先把位置**认领**下来再读值，"读到值"与"位置还属于我"于是是同一件事 —— 第二个人读到的不再是
+"这个 token 还在"，而是"这个位置已经有人在处理"。
+
+落地件（都在 `/tmp`，仓库里没有钩子，也没有为它留任何分支）：
+`/tmp/zm-red/patch_probe.py`（换成旧形状 + 插钩子 + 两个 PROBE 用例）、`/tmp/zm-red/probe-legacy/`、
+`/tmp/zm-red/probe-fixed/`。
+
+**(2) 守卫有没有牙齿：只把 `tryPop` 换回 Phase 1 写法（`/tmp/zm-red/legacy/`），其余一行不动**
+
+| 检查 | 旧实现下的原文 | 新实现 |
+|------|----------------|--------|
+| `two consumers race one token and exactly one of them gets it` | `expected 2, found 3` → `FAIL (TestExpectedEqual)`（一轮里两个赢家；复现时撞上的轮次不同，读数会不同 —— 另一跑是 `expected 1, found 2`，同一条断言） | 50 000 轮全绿 |
+| `a hammered ring hands every token to exactly one consumer` | `ring: token 0 came out 4 times` → `FAIL (TokenNotDeliveredExactlyOnce)` | 4 生产者 × 5 000 token 全绿 |
+| `N pool threads conserve messages and never run one worker twice` | **不是断言失败，是进程 ABRT**：`push` 的重试预算耗尽 → `scheduler.zig:564: std.debug.assert(false)`（调用栈 `push ← runOne ← turn ← poolMain`，生产者路径同样撞上；token 被吞 = worker 永久停摆） | 全绿 |
+
+即：§12.12 新增的那两条多消费者测试**本身就有牙齿**，红证据不是设计审查的转述。本次另补两条：
+
+* `four consumers released together still hand one token out once` —— 同一起跑线的**加宽版**
+  （4 条消费者抢 1-token 环）：旧实现下红（`expected 1, found 2` / `expected 2, found 4`，视撞上的轮次）；
+* `the declared occupancy pushes cleanly, round after round` —— 按新容量口径连压 500 轮、每轮 7 次推送
+  **零拒绝**，并在同一用例里断言 Phase 1 口径（`ceilPowerOfTwo(bound)`）的环第 5 次推送就被拒；
+  把容量公式回退成 `max_pooled_workers`（去掉 `+ pool_threads`）时它红：`expected 8, found 4`；
+* `with one pool thread a claim is never missed` 从**一种形状**扩成三种（`batch` 1/8/16、worker 2/4/6）——
+  "恒 0"才算有形状覆盖。
+
+**(3) 三项读数（本机实跑；数字取自 `runPoolLoad` 的实测打印）**
+
+| 形状 | 读数 |
+|------|------|
+| N 条线程的消息守恒：4 worker × 宽度 4 × 4 生产者 × 2 000 条，`batch = 1` | `sent=8000 received=8000 dropped_full=0 overlaps=0 claim_misses=0 dispatches=8000 pool_threads=4 ready_capacity=8 push_failures=0` —— 守恒式成立、`overlaps = 0`（没有 worker 被两条线程同时执行） |
+| 容量边界：`bound = 4`、`width = 3`（`bound + width = 7`，容量 8），连压 500 轮 × 7 次推送 | **0 次拒绝**（同一用例断言 `ready_push_failures == 0`）；Phase 1 口径的 4 槽环第 5 次即被拒 |
+| `claim_misses` 在 `pool_threads == 1`、`batch` 1/8/16 三种形状 | 三次全 **0**（各自 `sent == received`、`dropped_full = 0`、`overlaps = 0`、`push_failures = 0`） |
 
 **默认行为不变**（硬要求，回归口径）：`pool_threads` 不写 = 1，既有池化测试（Phase 1 的全部
 `Runtime: ...pooled...` 用例、`Actor:` 的两条停机语义用例、`zigmodu_runtime_pool_*` 的取值断言）
