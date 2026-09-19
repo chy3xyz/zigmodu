@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+### `shutdown()` 先停 ticker 再拆 worker —— 收掉停机窗口的 use-after-free（**破坏性：否**）
+
+`shutdown()` 原来是"先 `request_stop`/join/`destroy` 所有 worker，再停 ticker"。夹在中间的那段窗口里
+ticker **还在跑**：它每 5ms 醒一次，若这期间有一条定时器到期，`onTimerFire` → `post` 就会写到
+**已经被 `destroy` 的 worker handle** 上 —— 定时器 payload 的投递目标恰恰是那个 handle 的邮箱
+（`Handle.after` 的 `Delivery.post`）。窗口长度 = join 掉 N 个 worker 的耗时（毫秒级），不是理论值。
+
+- **顺序**：`alive = false` → **停 ticker（broadcast + join）** → `request_stop` → join → `destroy` →
+  `abandonTimerCommands()` → `drainWheel()`。ticker 退出前的最后一步本来就是 `drainWheel`（上一项），
+  所以"先停 ticker"顺带把语义钉死：停机时还在轮里的定时器是**被 drop 掉**，而不是投给一个即将被
+  释放的 handle（`alive = false` 之后那条消息本来也没有活着的收件人）。worker 之间的 "Ask first,
+  join after" 与 `shutdown()` 的幂等性都没动。
+- **纵深防御**：`onTimerFire` 在 `!alive` 时**只 drop 不 post**，并计入 `timers_discarded`（而非
+  `timer_fires`）。这条覆盖"顺序管不到"的组合 —— 例如另一个线程的 `tick()` 与 `shutdown()` 并发
+  （`docs/RUNTIME.md` §4 的 owner 契约本就禁止这种用法，但"写进已释放内存"对一次误用来说代价太大）。
+- 公开签名不变；热路径只多一次 `alive` 的 acquire load。
+
+**回归测试 2 条**（`src/runtime/runtime.zig`，都是确定性的，不靠"撞窗口"）：一条直接测 guard
+（`alive = false` 后 `post` 不再被调用、`drop` 被调用、计数落在 `timers_discarded`）；一条测顺序不变量
+—— worker 的 `deinit` 在退出时记录"轮是否已经空了"，两个 worker 都必须看到空轮（旧顺序下必红：
+`expected 2, found 0`）。**红证据**：把生产代码临时还原成旧顺序 / 去掉 guard，两条测试分别稳定报红
+（`expected 2, found 0` 与 `expected 1, found 2`）。
+
+**UAF 红证据（一次性探针，不进套件）**：用 `std.heap.page_allocator` 启动 runtime，每次 `destroy`
+直接 `munmap`，于是"post 打到已释放 handle"变成硬故障而不是静默写。250 轮 × 2 worker × 24 条
+待触发定时器、`-OReleaseSafe`：未改生产代码时 **4/4 次** SIGSEGV（栈 `tickerMain → onTimerFire →
+action.post → Mailbox.send → std/atomic.zig`）；修完在 Debug / ReleaseSafe 下均 0 崩溃。
+
 ### 定时器时间轮改为 ticker-owned：跨线程 arm 不再共享写（**破坏性：是**）
 
 `docs/RUNTIME.md` §4 早就把 `Wheel(Payload)` 标成"单线程驱动"，但实现不是：时间轮零锁零原子，

@@ -110,6 +110,13 @@ book.stop();                                       // 请求结束（join 由 sh
   命令队列里的 arm，也包括**已经进轮**的节点；释放条数汇总在 `stats().timers_discarded`（§8）。
   释放只能在时间轮的 owner 线程上做，所以有 ticker 时由 ticker 在退出前完成（`shutdown()` 只负责 join），
   自己 `tick()` 驱动时由那个调用者线程完成。`shutdown()` 仍然**幂等**：两次调用不会重复释放（也不会 double-free）。
+- **停机顺序是有意义的，不是整理**（v0.28 起）：`alive = false` → **停 ticker（broadcast + join）** →
+  worker 的 `request_stop` → join → `destroy` → 清命令队列 → drain。定时器的 `post` 投递目标是**arm 它的
+  那个 worker handle**，而 `destroy` 释放那个 handle —— ticker 若还在跑，join worker 的这几毫秒里到期
+  的定时器就会 `post` 到已释放的内存（这是真故障，不是理论风险）。先 join ticker 把窗口关掉，并且因为
+  ticker 退出前自己会 drain，"停机时还 pending 的定时器"的语义被钉死为 **drop，而不是投给将死的 worker**。
+  另外 `onTimerFire` 在 `alive = false` 时**只 drop 不 post**（计入 `timers_discarded`）：这是纵深防御，
+  覆盖另一个线程的 `tick()` 与 `shutdown()` 并发这种超出 owner 契约的用法。
 - `handle`/`run` 返回的错误被记录并计数（`stats().handler_errors`），**不会**停掉 worker；
   panic 不可捕获，会带走进程 —— 热路径上的 panic 见 `docs/BEST_PRACTICES.md`「韧性」。
 
@@ -210,7 +217,8 @@ defer app.stop();   // 先请求停止 + join worker，再停模块
 
 - **模块只借不还**：不要在模块里 `Runtime.init` —— 那样线程没人 join；`ctx.runtime()` 拿到的那个由 app 收尾。
 - **停止顺序是刻意的**：`app.stop()` **先** join 所有 worker，**再** `Lifecycle.stopAll`。worker 可能正在调模块服务，
-  反过来就会 use-after-free。
+  反过来就会 use-after-free。runtime 内部第一层同样有顺序：**先停 ticker，再拆 worker**（见 §3
+  「停机顺序是有意义的」）—— 理由一模一样的另一面：ticker 会向 worker 的 handle 投递定时器消息。
 - **不要在模块里 `rt.shutdown()` / `rt.deinit()`**：虽然幂等，但会提前打断别的模块的 worker。
 - **测试想用 `Manual` 时钟自己 `tick()`？** 那就别走 app：`Runtime.init(alloc, io, .{ .manual = &clk })`
   并自己 `defer rt.deinit()`（`src/runtime/runtime.zig` 的单测就是这么做的）。
@@ -391,6 +399,7 @@ fn traceFromHeader(id: []const u8) zigmodu.runtime.TraceId {
 | **Unreleased** | EventRecorder v1：`Recorder(E, C)` + `HotBus.attachRecorder`（运行时投递流录制、按 seq 重放并驱动 `Clock.Manual`） | ✅ 本文档 §11.6（**尚未发版**；落盘、多事件类型、`Handle.send`/定时器投递不在 v1） |
 | **Unreleased** | 定时器时间轮改为 **ticker-owned**：`Runtime` 命令队列（`arm`/`cancel` 同一条 FIFO）+ 生产者侧 id/deadline；`cancelTimer` 拆成 `requestCancelTimer`（请求）/ `cancelTimerSync`（要结果） | ✅ 本文档 §3/§4（**Breaking**：旧的 `cancelTimer(id) bool` 已删） |
 | **Unreleased** | `shutdown()` 释放**已进轮**的待触发 payload（`Wheel.drainAll`，在 owner 线程上 drain）+ `RuntimeStats.timers_discarded` / `zigmodu_runtime_timers_discarded` | ✅ 本文档 §3/§4/§8（**非 Breaking**：补上 ticker-owned 那批的"未附带"项） |
+| **Unreleased** | `shutdown()` 顺序改为**先停 ticker 再拆 worker**（关掉 "ticker 向已 destroy 的 handle 投递" 的 use-after-free 窗口）+ `onTimerFire` 在 `alive = false` 时只 drop 不 post | ✅ 本文档 §3（**非 Breaking**：签名不变，只多一次 `alive` 读） |
 | 1.0 | API 收敛、命名统一、deprecated 清理 | 计划 |
 
 ## 10. 最小示例

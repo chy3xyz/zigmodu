@@ -67,10 +67,13 @@
 //!
 //! ## Lifecycle
 //!
-//! `Runtime.shutdown()` (and `Application.stop()`) requests every worker to stop,
-//! closes its mailbox so a blocked `recv` wakes, then joins. Workers that never
-//! return still block shutdown: that is deliberate — a runtime that silently
-//! abandons threads hides the bug.
+//! `Runtime.shutdown()` (and `Application.stop()`) stops the **ticker first**,
+//! then requests every worker to stop, closes its mailbox so a blocked `recv`
+//! wakes, and joins. The order is deliberate: the ticker is the one thread that
+//! can still run a timer's `post`, and that callback writes into the handle
+//! being torn down (see `shutdown`). Workers that never return still block
+//! shutdown: that is deliberate — a runtime that silently abandons threads hides
+//! the bug.
 
 const std = @import("std");
 const mbox = @import("mailbox.zig");
@@ -510,20 +513,27 @@ pub const Runtime = struct {
         self.ticker = try std.Thread.spawn(.{}, tickerMain, .{self});
     }
 
-    /// Stop every worker (request + join), then the ticker. Idempotent.
+    /// Stop the ticker, then every worker (request + join + destroy). Idempotent.
     ///
-    /// Timers that never got to fire are not dropped silently on the way out:
-    /// their payloads are released (see `drainWheel`) and the number is reported
-    /// as `RuntimeStats.timers_discarded`.
+    /// **The ticker goes first, and the order is load-bearing.** A timer's
+    /// payload delivers into the `*Handle` that armed it (`Handle.after`'s
+    /// `Delivery.post`), and the worker's teardown frees that handle. A ticker
+    /// still running while the handles are being freed would therefore post into
+    /// freed memory the moment a timer came due inside that window — and the
+    /// window is not theoretical: it lasts as long as joining every worker takes.
+    ///
+    /// Joining the ticker first also settles what happens to the timers: its last
+    /// act before returning is `drainWheel` (see `tickerMain`), so by the time
+    /// the join returns the wheel is empty and those payloads were *dropped*, not
+    /// posted to a handle the next lines are about to free. After `alive = false`
+    /// a timer's message has no live owner anyway, so dropping is the honest
+    /// answer — and it is counted (`RuntimeStats.timers_discarded`).
     pub fn shutdown(self: *Self) void {
         self.alive.store(false, .release);
-        // Ask first, join after: a worker that is waiting on another worker's
-        // message gets its stop signal before anyone blocks on a join.
-        for (self.workers.items) |entry| entry.request_stop(entry.ptr);
-        for (self.workers.items) |entry| entry.join(entry.ptr);
-        for (self.workers.items) |entry| entry.destroy(entry.ptr, self.allocator);
-        self.workers.clearRetainingCapacity();
 
+        // Stop the wheel's driver before touching anything `post` could reach.
+        // See the doc comment above: the join is what makes "no timer can fire
+        // after this line" true rather than likely.
         if (self.ticker_running.swap(false, .acquire)) {
             self.mu.lock(self.io) catch return;
             self.idle.broadcast(self.io);
@@ -533,6 +543,13 @@ pub const Runtime = struct {
                 self.ticker = null;
             }
         }
+
+        // Ask first, join after: a worker that is waiting on another worker's
+        // message gets its stop signal before anyone blocks on a join.
+        for (self.workers.items) |entry| entry.request_stop(entry.ptr);
+        for (self.workers.items) |entry| entry.join(entry.ptr);
+        for (self.workers.items) |entry| entry.destroy(entry.ptr, self.allocator);
+        self.workers.clearRetainingCapacity();
 
         // Nobody is driving the wheel any more, so commands still in flight will
         // never become timers — and their payloads are owned by this queue until
@@ -946,6 +963,25 @@ pub const Runtime = struct {
 
     fn onTimerFire(self: *Runtime, id: u64, action: TimerAction) void {
         _ = id;
+        // A fire that lands while the runtime is going away must not reach
+        // `post`: that callback delivers into the handle which armed the timer,
+        // and `shutdown` frees those handles. `shutdown` itself stops the ticker
+        // *before* it touches a worker (see its doc comment), so the primary
+        // ordering guard lives there; this is the cheap second one, covering the
+        // arrangements that ordering cannot cover — a `tick()` caller on another
+        // thread racing a `shutdown()` (a misuse the ownership contract in
+        // `docs/RUNTIME.md` §4 already forbids, but `post` into freed memory is
+        // too expensive an answer to a misuse).
+        //
+        // A dropped fire is not a fire: it is released through the same `drop`
+        // the cancel and shutdown paths use, and counted the same way, so a timer
+        // that never ran never disappears without a number.
+        if (!self.alive.load(.acquire)) {
+            action.drop(action.ctx, self.allocator);
+            _ = self.timers_discarded.fetchAdd(1, .monotonic);
+            return;
+        }
+
         // Count first, then deliver: a caller that observes the effect (a worker
         // that saw the message) must never see `timer_fires` still at the old
         // value — a counter that lags its own effect is a race, not a metric.
@@ -1411,6 +1447,169 @@ test "Runtime: timers that already fired are not released again at shutdown" {
     rt.shutdown(); // nothing left: a fired timer must not be released a second time
     try std.testing.expectEqual(@as(u64, 0), rt.stats().timers_discarded);
     try std.testing.expectEqual(@as(usize, 0), rt.wheel.pendingCount());
+}
+
+// ── the shutdown window: no timer may reach a handle that is being freed ──
+//
+// A fire calls `post`, `post` writes into the `*Handle` that armed the timer,
+// and `shutdown` frees that handle. So the promise is: past the point where
+// handles can be freed, no fire reaches `post` any more. Two independent
+// mechanisms carry it — `shutdown` stops the ticker *before* it touches a worker
+// (so the fire cannot happen at all), and `onTimerFire` refuses to post once
+// `alive` is false (so a fire arriving anyway, e.g. from a `tick()` caller on
+// another thread, is dropped).
+//
+// Both are asserted below, and both assertions are **deterministic**. What is
+// deliberately *not* here is a use-after-free reproduction: arranging a fire to
+// land inside the free window means timing the wheel against a join, which
+// either does not reproduce or corrupts the test process instead of failing an
+// assertion. A test that only sometimes proves the point is worse than none.
+
+/// Payload for the fire-path test: records which of the two hooks ran, so "did
+/// it post or drop?" is an assertion rather than a guess.
+const FireProbe = struct {
+    post_calls: usize = 0,
+    drop_calls: usize = 0,
+
+    fn post(ctx: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.post_calls += 1;
+    }
+
+    fn drop(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.drop_calls += 1;
+    }
+
+    fn action(self: *@This()) TimerAction {
+        return .{ .ctx = @ptrCast(self), .post = post, .drop = drop };
+    }
+};
+
+test "Runtime: a fire past alive=false drops its payload instead of posting it" {
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .{ .manual = &clk });
+    defer rt.deinit();
+
+    var probe = FireProbe{};
+    // Alive first: the ordinary contract is unchanged — post, then drop.
+    rt.onTimerFire(1, probe.action());
+    try std.testing.expectEqual(@as(usize, 1), probe.post_calls);
+    try std.testing.expectEqual(@as(usize, 1), probe.drop_calls);
+    try std.testing.expectEqual(@as(u64, 1), rt.stats().timer_fires);
+
+    rt.shutdown(); // alive = false: from here a timer's message has no live owner
+    rt.onTimerFire(2, probe.action());
+    try std.testing.expectEqual(@as(usize, 1), probe.post_calls); // not one more
+    try std.testing.expectEqual(@as(usize, 2), probe.drop_calls);
+    // Released, not fired, and *counted*: a payload that was handed to the
+    // runtime and never ran shows up in `timers_discarded`, never in
+    // `timer_fires`.
+    try std.testing.expectEqual(@as(u64, 1), rt.stats().timer_fires);
+    try std.testing.expectEqual(@as(u64, 1), rt.stats().timers_discarded);
+}
+
+/// Worker for the ordering test: message-driven, so it lives until `shutdown`
+/// stops it, and `deinit` is the last thing the runtime calls on it — the handle
+/// is freed only after that returns. Whatever `deinit` sees about the wheel is
+/// therefore what was true *before* this handle went away.
+const OrderProbe = struct {
+    pub const Message = void;
+
+    shared: *Shared,
+
+    const Shared = struct {
+        /// Set by the pending timer's `drop`, i.e. when the wheel is emptied.
+        wheel_emptied: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        /// Set by the pending timer's `post`. Must stay false: a timer pending at
+        /// shutdown is released, never delivered into a dying worker.
+        posted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        exits: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        exits_seeing_empty_wheel: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    };
+
+    pub fn handle(self: *@This(), msg: void, ctx: anytype) anyerror!void {
+        _ = self;
+        _ = msg;
+        _ = ctx;
+    }
+
+    pub fn deinit(self: *@This()) void {
+        if (self.shared.wheel_emptied.load(.acquire)) {
+            _ = self.shared.exits_seeing_empty_wheel.fetchAdd(1, .monotonic);
+        }
+        _ = self.shared.exits.fetchAdd(1, .monotonic);
+    }
+};
+
+/// The pending timer of the ordering test. Heap-owned, so the testing allocator
+/// doubles as the leak oracle, and its two hooks publish what the runtime did
+/// with it.
+const DrainProbe = struct {
+    shared: *OrderProbe.Shared,
+
+    fn post(ctx: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.shared.posted.store(true, .release);
+    }
+
+    fn drop(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        // Published before the allocation goes away: the worker's `deinit` reads
+        // this, and it must not be reading a dangling pointer to find out.
+        self.shared.wheel_emptied.store(true, .release);
+        allocator.destroy(self);
+    }
+};
+
+test "Runtime: shutdown drains the wheel before it tears a worker down" {
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .monotonic);
+    defer rt.deinit();
+    try rt.start();
+
+    var shared = OrderProbe.Shared{};
+    _ = try rt.spawn(OrderProbe, .{ .shared = &shared }, 4);
+    _ = try rt.spawn(OrderProbe, .{ .shared = &shared }, 4);
+
+    // A timer an hour out: pending, and it can only leave the wheel through the
+    // fire path or through the shutdown drain. The leak oracle would complain if
+    // neither released it.
+    const pending = try std.testing.allocator.create(DrainProbe);
+    pending.* = .{ .shared = &shared };
+    _ = try rt.scheduleAction(3_600_000, .{
+        .ctx = @ptrCast(pending),
+        .post = DrainProbe.post,
+        .drop = DrainProbe.drop,
+    });
+
+    // Fence, so the test does not rest on a sleep: arm and cancel share one
+    // FIFO, and `cancelTimerSync` returns only after the owner applied the
+    // cancel — which means the owner had already drained everything pushed
+    // *before* it, this test's pending timer included. Reading the wheel from
+    // here is not an option: this thread does not own it.
+    const fence = try std.testing.allocator.create(WheelPayload);
+    fence.* = .{};
+    const fence_id = try rt.scheduleAction(3_600_000, .{
+        .ctx = @ptrCast(fence),
+        .post = WheelPayload.post,
+        .drop = WheelPayload.drop,
+    });
+    // `true` = it was still pending when the cancel got applied. The payload is
+    // released by the runtime on that path, so this allocation is accounted for.
+    try std.testing.expect(try rt.cancelTimerSync(fence_id));
+
+    rt.shutdown();
+
+    // Every worker reached the end of its life, and reached it with an empty
+    // wheel: the pending timer was released before the first handle was freed.
+    try std.testing.expectEqual(@as(u32, 2), shared.exits.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 2), shared.exits_seeing_empty_wheel.load(.monotonic));
+    try std.testing.expect(shared.wheel_emptied.load(.acquire));
+    // …and it was *released*, not delivered into a worker that was going away.
+    try std.testing.expect(!shared.posted.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), rt.stats().timer_fires);
+    try std.testing.expectEqual(@as(u64, 1), rt.stats().timers_discarded);
 }
 
 // ── the wheel's concurrency contract ─────────────────────────────────────
