@@ -28,6 +28,8 @@ pub const mailbox = @import("runtime/mailbox.zig");
 pub const sequencer = @import("runtime/sequencer.zig");
 /// HotBus module: L0 fan-out to worker mailboxes (frozen, drops when full).
 pub const hot_bus = @import("runtime/hot_bus.zig");
+/// Recorder module: bounded delivery log + replay against a manual clock.
+pub const recorder = @import("runtime/recorder.zig");
 /// Runtime implementation: `Runtime`, the worker contract, stats, supervision.
 pub const runtime_impl = @import("runtime/runtime.zig");
 
@@ -48,6 +50,8 @@ pub const Mailbox = mailbox.Mailbox;
 pub const Sequencer = sequencer.Sequencer;
 /// L0 publish/subscribe fan-out over worker mailboxes (frozen, drop-on-full).
 pub const HotBus = hot_bus.HotBus;
+/// Opt-in, zero-allocation log of the delivery stream; replay drives `Clock.Manual`.
+pub const Recorder = recorder.Recorder;
 /// Worker failure policy (`restart` / `stop` + windowed error budget).
 pub const Supervision = runtime_impl.Supervision;
 /// Trace id a worker message can carry (`sendTraced` → `ctx.traceId()`).

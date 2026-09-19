@@ -2,6 +2,52 @@
 
 ## [Unreleased]
 
+### 新增：EventRecorder v1 —— 运行时投递流可录、可重放（**破坏性：否**）
+
+`HotBus` 是**有意有损**的（满则丢并计数），运行时也没有全局顺序（每邮箱 FIFO），所以"这次运行
+到底投递了什么、按什么顺序、在什么时刻"事后问不出来。v1 补上这一块：`src/runtime/recorder.zig`
+的 `Recorder(E, capacity)`，opt-in、零分配、可重放。设计依据是 `docs/RUNTIME.md` §11（草案保留，
+新增 §11.6 记录实际落地的形状与差异）。
+
+```zig
+var rec = runtime.Recorder(Trade, 4096).init(clock); // 与 Runtime.init 同一个 clock
+try bus.attachRecorder(&rec);                        // 必须在 freeze() 之前
+bus.freeze();
+// …运行…
+var manual = runtime.Clock.Manual{ .now_ms = 0 };
+rec.replay(&manual, &harness, Harness.sink);         // 按 seq 推进 clock，不 sleep
+```
+
+**取点（对 §11.3 Q1 的更正）**：草案倾向"`Runtime` 内部、扇出之前"，但 `Handle.send` 直接写邮箱、
+不经过 `Runtime`，那里没有取点。实际取点是 **`HotBus.publish` 的 sink 循环之前** —— 它正是扇出
+本身，在它之前记录既不占 comptime 的订阅者槽位，也不会走 `dropped` 分支（`:128`）：那正是 §11
+要避免的"丢记录"。**没 attach recorder 的 bus，`publish` 行为逐位不变**（只多一次 `?*anyopaque`
+空判断，有测试守着 `attach` 前后的同一份断言）。
+
+**溢出不是静默丢弃**：`record` 满环返回 `error.Full`，绝不覆盖；`entries()` 因此永远是 seq 升序
+的完整前缀。`publish` 拿到拒绝后 `stats().record_dropped += 1` **并且返回 `false`**（签名仍是
+`Error!bool`，examples 用的那个不动）—— 日志不完整不该读成成功；`Recorder.hasOverflowed()`
+此后恒为真。
+
+**实现要点**：`Sequencer` 的序号**就是槽位下标**（0,1,2,…），一次 `fetchAdd` 同时拿到顺序与空间，
+多生产者不撞车；per-slot `ready` 标志 + `published` 前缀长度让 `entries()` 无锁、无等待地给出一段
+完整前缀（领先的生产者写完自己那条就返回）。复用 `Clock`/`Clock.Manual` 做时间与重放驱动。
+
+**测试 8 条**（`src/runtime/recorder.zig`）：record/replay 往返逐条相等；满环 = `error.Full` 且
+`len` 未超（**反证**：把满环分支改成静默丢弃，这条立刻红）；seq 严格单调（含被拒的记录仍消耗
+序号）；重放把 `Clock.Manual` 推到每条记录的 `clock_ms`（501 ms 的记录时间在墙钟上半秒内跑完，
+即不 sleep）；attach 前后 `publish` 返回值一致；`freeze()` 之后 attach 返回 `error.Frozen`；
+被拒的记录在 bus 上可见（`record_dropped` + 返回值 + `hasOverflowed`）；4 生产者 × 500 条并发
+record 序号不丢不重。
+
+**明确不做**：不做领域事件溯源（那是 `core/EventStore.zig`）；不做 `HotBus` 订阅者（会丢）；v1 只录
+**单一事件类型 `E`** 的 `HotBus` 发布流，`Handle.send` 直达投递、`after` 定时器投递、多 worker
+**异构**消息都不覆盖；不承诺进程级完全确定性（`spawn`/`init` 副作用、网络、墙钟、丢弃模式不重放）；
+只有读注入 `Clock` 的代码参与重放。
+
+**文档**：`docs/RUNTIME.md` §11.6（形状、与草案的差异表、未做边界）、README
+「High-Performance Runtime」清单（英文）。
+
 ### 新增：Runtime worker trace context —— 消息可归属到发起它的请求（**破坏性：否**）
 
 外部 review 的 v0.28 提案里，「Tracing — Worker trace context」是核对后仅剩的 3 个真实缺口之一。

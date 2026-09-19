@@ -142,6 +142,10 @@ if (!try bus.publish(trade)) { /* 所有订阅者都满了 */ }
 2. **丢，但不长**：每个订阅者是**有界邮箱**，满即丢该条并计数（`stats().dropped`）。慢消费者既不能拖慢发布方，
    也不能把内存吃光。
 
+要事后重放这段投递流，用 **EventRecorder**（§11.6）：`bus.attachRecorder(&rec)` 必须在 `freeze()` 之前，
+记录点在**扇出之前** —— 它不占订阅者槽位，也不会被计成 `dropped`；日志满则 `error.Full`（不静默丢），
+`stats().record_dropped` 与 `publish` 的返回值都会说出来。
+
 实测（`examples/runtime-workers`）：审计 worker 故意慢，指标 sink 是 O(1) —— 指标一条不漏、审计丢掉慢的那些、
 **订单簿从未阻塞**。具体条数随示例版本变化（投递/丢弃由 feed 速率与邮箱容量决定），跑一次看当次输出即可，
 别照抄历史数字。
@@ -211,6 +215,7 @@ defer app.stop();   // 先请求停止 + join worker，再停模块
 | `Clock` | 值类型 | `.monotonic`（生产）/ `.manual`（测试：不睡觉就能推动一小时定时器） |
 | `Sequencer` | 多线程 | 无锁单调序列：`next()` / `nextBatch(n)` / `advanceTo()`；**不是时钟**（只在进程生命期内有意义） |
 | `HotBus(E, N)` | 1 发布者 / 多订阅者 | freeze 后无锁发布、drop-on-full、计数齐全（见 §3c） |
+| `Recorder(E, C)` | N 生产者 / 单线程重放 | 定容追加日志，**满即 `error.Full`（不覆盖、不静默丢弃）**；序号即槽位，`entries()` 无锁给出 seq 升序前缀；`replay` 驱动 `Clock.Manual`、不 sleep（见 §11.6） |
 
 **为什么池用自旋锁而不是无锁栈**：Treiber 栈在索引上有一个 ABA 窗口，会把同一个对象发给两个调用者 ——
 那是任何测试都不稳定复现的数据竞争。临界区只有一次指针交换，锁的代价远小于"正确性靠运气"。
@@ -342,6 +347,7 @@ fn traceFromHeader(id: []const u8) zigmodu.runtime.TraceId {
 | **v0.20** | Workflow（状态机 + Saga + 补偿 + 检查点 + 恢复） | ⚠ 部分：Saga 补偿 + WAL 检查点 + 崩溃续跑 ✅（`SagaOrchestrator.resumeInstance` / `restoreFromWal`）；**`SagaStep.timeout_seconds` 已于 v0.25.0 真正生效**（超预算即补偿含该步、终态 `.timed_out`、返回 `error.SagaStepTimeout`）；**状态机仍未做**，`.step().compensate()` DSL 明确不做（`docs/WORKFLOW.md`） |
 | **v0.21** | Agent Runtime（Identity / Memory / Skills / Permissions / Budget 一等化） | ✅ 已发布：`ai.AgentSpec` + `ai.Guard`（已接进 `Agent.run`）+ `ai.ProposalPipeline` —— 见 `docs/AGENT_RUNTIME.md`；**Agent 的 State / Event subscriptions / Lifecycle 仍未做** |
 | **v0.22.0** | Agent 跑成 worker（`Agent → Worker → Event`） | ✅ `ai.AgentWorker`：`rt.spawn(ai.AgentWorker, …)` + `ai.agent_worker.post(...)`，有界邮箱 / 生命周期 / 监督 / 指标跟着来 —— 见 `docs/AGENT_RUNTIME.md` §六 |
+| **Unreleased** | EventRecorder v1：`Recorder(E, C)` + `HotBus.attachRecorder`（运行时投递流录制、按 seq 重放并驱动 `Clock.Manual`） | ✅ 本文档 §11.6（**尚未发版**；落盘、多事件类型、`Handle.send`/定时器投递不在 v1） |
 | 1.0 | API 收敛、命名统一、deprecated 清理 | 计划 |
 
 ## 10. 最小示例
@@ -349,11 +355,12 @@ fn traceFromHeader(id: []const u8) zigmodu.runtime.TraceId {
 见 `examples/runtime-workers/`：一条"行情源 → 订单簿 worker → 风控 worker → 快照定时器"的流水线，
 既演示 worker/邮箱/定时器，也演示背压（`error.Full` 时的合并策略）与优雅停机。
 
-## 11. EventRecorder —— 设计草案（未实现）
+## 11. EventRecorder —— 设计草案（v1 已实现：见 §11.6）
 
-> 状态：**只有设计，没有代码**。这一节存在的理由是先把契约定下来 —— 录什么、按什么顺序、
-> 存哪里、怎么和 `Clock.manual` 对齐。四问答错任何一个，写出来的东西要么不可重放，
-> 要么在热路径上不可接受。
+> 状态：**本节是决策记录（设计草案），别再当成"未实现"读**。落地形状、与草案的差异、
+> 以及明确未做的边界见 **§11.6**；代码在 `src/runtime/recorder.zig`。
+> 这一节存在的理由是先把契约定下来 —— 录什么、按什么顺序、存哪里、怎么和 `Clock.manual` 对齐。
+> 四问答错任何一个，写出来的东西要么不可重放，要么在热路径上不可接受。
 
 ### 11.1 先说已经有什么（别重造）
 
@@ -429,4 +436,65 @@ src/runtime/Recorder.zig          // 新文件，opt-in
 2. **v1 要不要落盘**：只做内存环（小，够测试与短事故窗口）还是同时接 WAL。
 3. **记录粒度**：存 `(seq, clock_ms, target, kind, len)` + 载荷字节，还是只存载荷哈希
    （省内存，但重放时得重建载荷 —— 对一个"重放"特性来说通常是错的选择）。
+
+### 11.6 v1 已实现（`src/runtime/recorder.zig`）
+
+上面的草案保持原样（它是决策记录）；这里是实际落地的形状，以及和草案的差异。
+
+```zig
+const runtime = @import("zigmodu").runtime;
+
+var rec = runtime.Recorder(Trade, 4096).init(clock); // clock 与 Runtime.init 用同一个
+try bus.attachRecorder(&rec);                        // 必须在 bus.freeze() 之前
+bus.freeze();
+// …运行…
+if (rec.hasOverflowed()) { /* 这份日志不完整：丢掉，别重放 */ }
+try bus.publish(trade);                              // 记录点：扇出之前
+
+var manual = runtime.Clock.Manual{ .now_ms = 0 };
+rec.replay(&manual, &harness, Harness.sink);         // 按 seq 推进 clock，不 sleep
+```
+
+**取点（对 §11.3 Q1 的更正）**：草案写"倾向 `Runtime` 内部、扇出之前"，但 `Handle.send`
+**直接写邮箱、不经过 `Runtime`**，所以 `Runtime` 里没有那个取点。真正的位置是
+**`HotBus.publish` 的 sink 循环之前**（`hot_bus.zig` 的 `publish`）：它正是"扇出"本身，
+在它之前记录既不占订阅者槽位（`max_subscribers` 是 comptime），也不会走 `dropped` 分支
+（`publish` 里 `deliver` 返回 false 的那一支）—— 那正是 §11 要避免的"丢记录"。代价很小：
+没 attach recorder 的 bus，`publish` 只多一次 `?*anyopaque` 空判断，行为逐位不变（有测试守着）。
+
+**溢出怎么处理**（§11.3 Q4 第 1 档）：`Recorder.record` 满环返回 `error.Full`，
+**绝不覆盖、绝不静默丢弃**；`entries()` 因此永远是 `seq` 升序的一段完整前缀。
+`HotBus.publish` 拿到拒绝后做两件可见的事：
+
+1. `stats().record_dropped += 1`（`Stats` 新增字段）；
+2. `publish` 返回 `false` —— 签名仍是 `Error!bool`（examples 在用，不动），但"日志已经不完整"
+   不应该读成成功。`Recorder.hasOverflowed()` 此后恒为真。
+   无 recorder 时 `publish` 的返回值与改动前一致。
+
+**存储与顺序**：`Sequencer` 给出的序号**就是槽位下标**（0,1,2,…），一次 `fetchAdd` 同时拿到
+顺序与空间 —— 多生产者不会撞车（有 4×500 条的并发测试）。槽位有 per-slot `ready` 标志，
+`published` 是"已完整写入的前缀长度"，因此跨线程读 `entries()` 不需要锁、也不需要等待
+（领先的生产者写自己的槽位就返回，由滞后的那条来延伸前缀）。没有 `RingBuffer` 的绕圈覆盖：
+一次溢出之后就不再接受，语义上就是"有界追加日志"。
+
+**与草案的其它差异**
+
+| 草案 | 落地 | 为什么 |
+|------|------|--------|
+| `src/runtime/Recorder.zig`（大写文件名） | `src/runtime/recorder.zig` | 与目录内其它文件（`hot_bus.zig`/`timer_wheel.zig`…）一致 |
+| `Runtime.enableRecording(cfg)` | `HotBus.attachRecorder(rec)` | 取点落在 bus 上，`Runtime` 手上没有那个取点；opt-in 更局部 |
+| 三档存储中的第 2 档（WAL 落地） | **未做** | v1 只要内存环：够测试与短事故窗口，落盘留给后续 |
+| `replay(runtime, clk)` | `replay(&Clock.Manual, ctx, sink)` | 重放不需要 `Runtime`；驱动 `Clock.Manual` + 一个 sink，测试与事故复现都不必起线程 |
+| `(seq, clock_ms, target, kind, len)` + 载荷字节 | `Entry{ seq, clock_ms, event }` | v1 只录单一事件类型 `E`（值拷贝，零分配），`target/kind` 属于多流记录，不在范围内 |
+
+**明确未做（同 §11.4，这里写死边界）**
+
+- **单一事件类型 `E`**：`Recorder(E, capacity)` 只录一种 `E`。同步录多个 worker 的**异构**
+  消息不在 v1 —— `Handle.send` 直达投递、`after` 定时器投递、`MpscRing` 的跨生产者交错
+  都不覆盖。v1 录的是 `HotBus` 的**发布流**。
+- 不做领域事件溯源（那是 `core/EventStore.zig`：按 `stream_id` + 版本 + 快照、可持久，
+  是"业务决定了什么"；`Recorder` 是"运行时投递了什么"，内存、有界、opt-in 的调试工具）。
+- 不承诺进程级完全确定性：`spawn`/`init` 副作用、网络、墙钟、以及丢弃模式都不重放。
+- 只有**读注入 `Clock`** 的代码参与重放；直接调 `core/Time.zig` 的路径读到真实时间。
+
 

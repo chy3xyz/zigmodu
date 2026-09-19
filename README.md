@@ -138,6 +138,12 @@ Opt-in via `app.runtime()` — see [docs/RUNTIME.md](docs/RUNTIME.md) and the
   `TraceId` **in the mailbox slot** (no allocation, no shared producer state); the
   handler reads it back with `ctx.traceId()`, `after` hands it to the timer, and
   runtime error logs tag the offending message's trace
+- **EventRecorder** — Opt-in, zero-allocation log of the delivery stream: attach a
+  `Recorder(E, capacity)` to a `HotBus` before `freeze()` and every publish is
+  recorded with a monotonic seq and the injected clock; `replay` drives a
+  `Clock.Manual` over the log, so a recorded run replays without sleeping. A full
+  log returns `error.Full` (never a silent drop), counts `record_dropped` and
+  makes `publish` return false
 
 ### Developer Experience
 - **Architecture Tester** — Compile-time dependency rule validation

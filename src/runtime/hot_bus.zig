@@ -28,6 +28,12 @@
 //! allowed to allocate and to be slower. Use L0 where a missed event is
 //! acceptable and a stalled publisher is not. See `docs/RUNTIME.md` §6.
 //!
+//! To replay a run later, attach a `Recorder` (default: off, one null check per
+//! publish) with `attachRecorder` before `freeze()`. It is *not* a subscriber —
+//! a sink would occupy a subscriber slot and a full log would be counted as a
+//! dropped delivery while the event flowed on, which is exactly the "lost but
+//! looks complete" log a replay must never have.
+//!
 //! Positioning: `HotBus` is a **user-facing** L0 primitive. The framework
 //! itself has no internal consumer — deliberately. The in-framework hot paths
 //! that exist today are all single-consumer or pull-based (runtime stats are
@@ -66,9 +72,14 @@ pub fn HotBus(comptime E: type, comptime max_subscribers: usize) type {
         subscribers: [max_subscribers]Sink = undefined,
         count: usize = 0,
         frozen: bool = false,
+        /// Opt-in delivery log. `null` (the default) means `publish` behaves
+        /// exactly as it did before recorders existed — one null check.
+        recorder_ctx: ?*anyopaque = null,
+        recorder_record: ?*const fn (ctx: *anyopaque, event: E) bool = null,
         published: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
         delivered: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
         dropped: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        record_dropped: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
         pub fn init() Self {
             return .{};
@@ -112,12 +123,57 @@ pub fn HotBus(comptime E: type, comptime max_subscribers: usize) type {
             return self.frozen;
         }
 
+        /// Attach a `runtime.Recorder(E, capacity)` (see `recorder.zig`): every
+        /// `publish` is then logged *before* the fan-out. Wire it during
+        /// startup — after `freeze()` this is `error.Frozen`, because the
+        /// wiring is fixed at that point exactly like the subscribers are.
+        ///
+        /// Why a record point and not a subscriber: a sink consumes one of the
+        /// comptime subscriber slots, and a recorder too small for the traffic
+        /// would come back as `deliver == false` — counted as a *drop*, with the
+        /// event still flowing on. A log with a hole in it looks complete, which
+        /// is the one failure a replay tool must not have. Recording here also
+        /// logs the published stream itself, whatever the subscribers do with
+        /// it, and costs a bus with no recorder nothing but one null check.
+        pub fn attachRecorder(self: *Self, rec: anytype) Error!void {
+            const R = @TypeOf(rec.*);
+            if (!@hasDecl(R, "Event") or !@hasField(R, "clock"))
+                @compileError("HotBus.attachRecorder expects a *runtime.Recorder(E, capacity) from src/runtime/recorder.zig");
+            if (R.Event != E) @compileError("HotBus(" ++ @typeName(E) ++ ").attachRecorder got a Recorder for " ++ @typeName(R.Event) ++
+                " — the bus event type and the recorder's must match");
+            if (self.frozen) return Error.Frozen;
+            self.recorder_ctx = @ptrCast(rec);
+            self.recorder_record = struct {
+                fn record(ctx: *anyopaque, event: E) bool {
+                    const rec_ptr: *R = @ptrCast(@alignCast(ctx));
+                    rec_ptr.record(event) catch return false;
+                    return true;
+                }
+            }.record;
+        }
+
+        /// Whether a delivery log is attached (recording costs one null check
+        /// and one `record` call per published event).
+        pub fn hasRecorder(self: *const Self) bool {
+            return self.recorder_ctx != null;
+        }
+
         /// Offer `event` to every subscriber. Returns false when *nothing* was
         /// delivered (an idle-but-wired bus stays quiet: with zero subscribers
-        /// this returns true).
+        /// this returns true) — or when an attached recorder refused the event,
+        /// because a log that is no longer complete must not read as success.
+        /// That refusal is counted in `stats().record_dropped`; the recorder's
+        /// own `hasOverflowed()` stays true for the rest of its life.
         pub fn publish(self: *Self, event: E) Error!bool {
             if (!self.frozen) return Error.NotFrozen;
             _ = self.published.fetchAdd(1, .monotonic);
+
+            // Before the fan-out, not as a subscriber: see `attachRecorder`.
+            var recorded = true;
+            if (self.recorder_ctx) |ctx| {
+                recorded = self.recorder_record.?(ctx, event);
+                if (!recorded) _ = self.record_dropped.fetchAdd(1, .monotonic);
+            }
 
             var any_delivered = false;
             for (self.subscribers[0..self.count]) |sink| {
@@ -128,7 +184,7 @@ pub fn HotBus(comptime E: type, comptime max_subscribers: usize) type {
                     _ = self.dropped.fetchAdd(1, .monotonic);
                 }
             }
-            return any_delivered or self.count == 0;
+            return recorded and (any_delivered or self.count == 0);
         }
 
         pub fn subscriberCount(self: *const Self) usize {
@@ -141,6 +197,7 @@ pub fn HotBus(comptime E: type, comptime max_subscribers: usize) type {
                 .published = self.published.load(.monotonic),
                 .delivered = self.delivered.load(.monotonic),
                 .dropped = self.dropped.load(.monotonic),
+                .record_dropped = self.record_dropped.load(.monotonic),
             };
         }
 
@@ -153,6 +210,10 @@ pub fn HotBus(comptime E: type, comptime max_subscribers: usize) type {
             /// Subscriber refusals (full or closed mailbox) — the backpressure
             /// signal this bus exists to make visible.
             dropped: u64,
+            /// Events an attached recorder refused (its log was full). Never
+            /// silent: the corresponding `publish` also returned false, and any
+            /// non-zero value means the recording is incomplete.
+            record_dropped: u64,
         };
     };
 }
