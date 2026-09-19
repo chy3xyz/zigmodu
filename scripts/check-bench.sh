@@ -164,12 +164,35 @@
 #     (median over 23 metrics, range 0.97-1.50x on unchanged code), so a full
 #     re-record bakes that day's runner speed into the ratchet. Add the metrics
 #     you are introducing and leave the rest alone.
-#   * `RingBuffer SPSC x1M` is the one metric that does not scale with the
-#     machine: 1.09 ms on the runner vs ~10.6 ms on the laptop — *faster* on the
-#     slower box. Each baseline holds its own side's value, and comparing this
-#     metric across the two is meaningless: a laptop run against the CI file
-#     fails on it and on nothing else (9.96x). Read that as a platform
+#   * `RingBuffer SPSC x1M` is gated as a ratio for the same reason as the five
+#     atomic-path metrics below, but it is the one metric whose *value* differs
+#     between the two machine classes by an order of magnitude: 1.09-1.57 ms on
+#     the runners (x86_64, where a release store and an acquire load are plain
+#     `mov`s and the loop is a store-forwarding chain) vs ~10.7 ms on the laptop
+#     (aarch64, where they are `stlr`/`ldar`). Measured directly: the same
+#     `benchRingBuffer` loop against a verbatim copy of `src/runtime/ring.zig`
+#     with *only* `.release`/`.acquire` relaxed to `.monotonic` costs 11.70 ms on
+#     this laptop against 0.954 ms for the copy — a 12.3x difference from the
+#     orderings alone, and 0.954 ms is the runner's number. So the inversion was
+#     never "a fast slow box": it is the host's memory-ordering implementation,
+#     which is what the ratio divides out. Each baseline still holds its own
+#     class's ratio (the laptop's is ~0.49, the runner's ~0.052 — they are not
+#     comparable either, for the same reason), and a laptop run against the CI
+#     file fails on this metric and on nothing else. Read that as a platform
 #     difference, not a regression.
+#
+#     This is also why the metric is *not* folded-away code, and why its old
+#     absolute entry was the wrong criterion rather than a pseudo-value: it is
+#     reproducible per host and it *moves with the host class*. The 2026-09-19
+#     Benchmark failure on `624b423` is the case in point — that commit touches only
+#     `src/runtime/timer_wheel.zig` (`RingBuffer` is not reachable from it), and its
+#     run landed on a WestUS3 Xeon 8370C: `RingBuffer SPSC x1M` 2.34 ms against
+#     1.09/1.24/1.27/1.41/1.57 ms on the other 15 recorded runs, and that same run's
+#     `atomic RMW x10M` came back at 60.58 ms against 20.67/23.68/23.69 ms — every
+#     run whose host the job printed is an EPYC except this one. Within a run the
+#     three samples agree to 1.03x (1.24 / 1.24 / 1.24 ms; 1.09 / 1.09 / 1.09 ms)
+#     while the medians step between hosts, which is a latency chain reporting the
+#     host's store-to-load-forwarding latency — not noise, and not a fold.
 #
 # ── Two criteria, because the old one held the host still too (2026-09-19) ──
 #
@@ -194,11 +217,11 @@
 # So the gate now measures the host, in the same run, and divides by it. The suite
 # grew one metric that does nothing else — `atomic RMW x10M`, a bare
 # `fetchAdd(1, .monotonic)` loop (`src/benchmark.zig`, `benchAtomicRmw`) — and the
-# five atomic-path metrics above are compared as `metric / atomic RMW x10M`, both
-# medians from the *same* run, which cancels the host generation. Everything else
-# stays on the absolute criterion it was recorded with: normalizing helps only
-# where the metric tracks the reference, and the metrics whose work is in the
-# allocator, the SQLite driver, a mutex or thread creation do not.
+# metrics listed below are compared as `metric / atomic RMW x10M`, both medians
+# from the *same* run, which cancels the host generation. Everything else stays on
+# the absolute criterion it was recorded with: normalizing helps only where the
+# metric tracks the reference, and the metrics whose work is in the allocator, the
+# SQLite driver, a mutex or thread creation do not.
 #
 #   * A ratio is still a ratio of *code*: an extra allocation, an extra lock or a
 #     second atomic in a normalized metric raises the ratio and fails the gate
@@ -215,10 +238,10 @@
 #     when the host generation changes, which is the failure this section exists to
 #     remove. When it lands more than THRESHOLD away from its recorded value the
 #     gate says so as a host note and keeps it out of the verdict. A benchmark-side
-#     bug in it would show up as a smaller denominator — five ratios drifting down,
-#     not five failures — which is why it stays a three-line loop with nothing but
-#     the atomic in it, and why the ratio baselines live next to it in the file
-#     where a reviewer reads them.
+#     bug in it would show up as a smaller denominator — ratios drifting down, not
+#     failures — which is why it stays a three-line loop with nothing but the atomic
+#     in it, and why the ratio baselines live next to it in the file where a
+#     reviewer reads them.
 #   * Normalizing is not a licence to raise BENCH_THRESHOLD. Nothing here makes a
 #     *regression* pass; it only stops the host's generation from being charged to
 #     the code.
@@ -236,15 +259,20 @@
 # it is instead of being trusted.
 #
 # Rolling this out to `scripts/bench-baseline.ci.json`: it was recorded before the
-# reference existed, so its five atomic-path entries carry `normalized_by` with a
-# `null` value, and so does its `atomic RMW x10M` entry. Until a runner records
-# them (`bash scripts/check-bench.sh --update` on the runner, then review the diff —
-# do not blanket `--update` that file) those six WARN and go unchecked on CI while
-# every other metric keeps exactly the criterion it had. Filling the ratios in from
-# an estimate was considered and rejected: `Sequencer x10M` is the same `fetchAdd`
-# loop and measured within 2% of the reference on the laptop, so a plausible number
-# is one line of arithmetic away — but an unmeasured number baked into a ratchet is
-# a guess, and a guess is what the reviewer of this file has to trust.
+# reference existed, so when the ratio criterion landed its atomic-path entries
+# carried `normalized_by` with a `null` value and WARNed — unchecked, but no longer
+# compared against milliseconds they were never measured in. A runner recorded them
+# afterwards from a real run (`--update` on the runner, then review the diff — do
+# not blanket `--update` that file), and `RingBuffer SPSC x1M` was converted the
+# same way: its ratio in that file is the median of three *measured* pairs from CI
+# logs (1.24/23.68, 1.24/23.56 and 1.09/20.67 -> 0.0523, 0.0524, 0.0527), not a
+# number derived from the laptop. Filling ratios in from an estimate is still
+# rejected: `Sequencer x10M` is the same `fetchAdd` loop and measured within 2% of
+# the reference on the laptop, so a plausible number is one line of arithmetic away
+# — but an unmeasured number baked into a ratchet is a guess, and a guess is what
+# the reviewer of this file has to trust. (A `note` on an entry records where its
+# number came from; `--update` does not preserve notes, so the provenance of
+# anything hand-converted belongs here in the header.)
 #
 # Machine information (region, CPU, cores) is printed with the verdict: a
 # benchmark number means nothing without it, and digging it out of the job's "Set
@@ -260,12 +288,32 @@ THRESHOLD="${BENCH_THRESHOLD:-2.0}"
 
 # The machine reference and the metrics gated as a ratio against it (see the
 # header). This list *is* the criterion: a baseline entry that disagrees with it
-# is a mismatch the gate reports, not something it quietly trusts. A metric
-# belongs here only if its whole per-turn path is atomic read-modify-writes, so
-# that the host's atomic speed is what moves it — `ObjectPool x1M` takes a
-# `SpinLock` per turn and is deliberately absent: it stayed inside 1.1x across the
-# host generations that moved these five, and a ratio that does not track the
-# reference trades a false red for a blind spot.
+# is a mismatch the gate reports, not something it quietly trusts.
+#
+# A metric belongs here when its per-turn critical path is a single memory-ordering
+# primitive, so that what moves the number is the host's implementation of it and
+# not the framework's code:
+#
+#   * the five atomic-path metrics below spend the turn in a read-modify-write,
+#     which is the host's atomic speed;
+#   * `RingBuffer SPSC x1M` spends the turn in one store→load chain per index —
+#     `tryPush` stores `tail` and `tryPop` loads it back, and the same for `head` —
+#     so it is the host's release/acquire lowering plus its store-to-load-forwarding
+#     latency. Both terms are host properties: 1.09/1.24/1.41/1.57 ms across the
+#     EPYC runners against 2.34 ms on the one Xeon 8370C run that reddened `624b423`
+#     (see the header), and 10.7 ms for the identical loop on aarch64, where the
+#     orderings become `stlr`/`ldar` (a verbatim copy of `ring.zig` with only the
+#     orderings relaxed measures 0.954 ms on that same laptop).
+#
+# `ObjectPool x1M` takes a `SpinLock` per turn and is deliberately absent: it stayed
+# inside 1.1x across the host generations that moved these five (0.97x on that Xeon
+# run), and a ratio that does not track the reference trades a false red for a blind
+# spot. The ring's ratio is also only an *approximation* — the Xeon run put it at
+# 0.0386 against 0.0523-0.0527 on the EPYCs, a 26% spread, because a store-forwarding
+# chain is penalized somewhat less than a locked RMW when the host generation changes.
+# That imperfection is still the right trade for a 2.0x window: the ratios stay 26%
+# apart where the absolute values were 2.15x apart, and 2.15x is what failed a commit
+# that could not reach this code.
 REF_METRIC="atomic RMW x10M"
 NORMALIZED_METRICS=(
   "Mailbox post+drain x1M"
@@ -273,6 +321,7 @@ NORMALIZED_METRICS=(
   "HotBus 8sub x1M"
   "Sequencer x10M"
   "1L x10M events"
+  "RingBuffer SPSC x1M"
 )
 export BENCH_REF_METRIC="$REF_METRIC"
 export BENCH_NORMALIZED_METRICS="$(IFS=';'; printf '%s' "${NORMALIZED_METRICS[*]}")"

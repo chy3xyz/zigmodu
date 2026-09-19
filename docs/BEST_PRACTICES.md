@@ -2616,13 +2616,18 @@ zig build docs
 
 ### 性能门禁的两种判据（2026-09-19 起）
 
-`scripts/check-bench.sh` 对**大多数**指标用绝对毫秒（2.0× 阈值，越低越好）；对**每轮路径全是原子
-RMW** 的五条（`Mailbox post+drain`、`Mailbox full-path`、`HotBus 8sub`、`Sequencer`、`1L x10M events`）
-改用**比值**：`指标 ÷ 'atomic RMW x10M'`（同一轮的两个中位数相除）。原因是 Azure runner 按区域滚动
-换代，原子路径整体变慢的那代机器会把绝对判据打红，而这份二进制的计时循环逐条指令相同（见
-`src/benchmark.zig` 的 `benchAtomicRmw` 与 `scripts/check-bench.sh` 头部记录的证据）。比值判据**不削弱**
+`scripts/check-bench.sh` 对**大多数**指标用绝对毫秒（2.0× 阈值，越低越好）；对**每轮关键路径是一个
+内存序原语**的六条改用**比值**：`指标 ÷ 'atomic RMW x10M'`（同一轮的两个中位数相除）。这六条是
+`Mailbox post+drain`、`Mailbox full-path`、`HotBus 8sub`、`Sequencer`、`1L x10M events`
+（每轮卡在一次原子 RMW 上）以及 `RingBuffer SPSC x1M`（每轮卡在 `tail`/`head` 各一条 store→load 链上，
+量的是宿主的 release/acquire 实现 + store-to-load forwarding 延迟 —— 同一份 `ring.zig` 只把
+`.release`/`.acquire` 换成 `.monotonic`，本机就从 11.70 ms 掉到 0.954 ms）。原因是 Azure runner 按区域滚动
+换代，内存序路径整体变慢的那代机器会把绝对判据打红，而这份二进制的计时循环逐条指令相同（见
+`src/benchmark.zig` 的 `benchAtomicRmw` 与 `scripts/check-bench.sh` 头部记录的证据；2026-09-19 那条
+`RingBuffer SPSC x1M` 的误红就是唯一一次落在 Xeon 档的 run）。比值判据**不削弱**
 对真回归的敏感度：热路径多一次分配 / 多一把锁 / 多一个原子都会把比值推上去（反证见 CHANGELOG 对应条目）。
-`atomic RMW x10M` 本身只做“这台机器有多快”的报告，**不参与判定**。
+`atomic RMW x10M` 本身只做“这台机器有多快”的报告，**不参与判定**；两种基线各留一份，比值也**不跨机器档
+比较**（本机 ~0.50、runner ~0.052）。
 
 ## 🚨 常见陷阱与避免方法
 

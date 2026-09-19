@@ -92,8 +92,9 @@
   },
   {
     "name": "RingBuffer SPSC x1M",
-    "unit": "ms",
-    "value": 10.471
+    "unit": "ratio",
+    "value": 0.4976,
+    "normalized_by": "atomic RMW x10M"
   },
   {
     "name": "Mailbox post+drain x1M",

@@ -94,8 +94,10 @@
   },
   {
     "name": "RingBuffer SPSC x1M",
-    "unit": "ms",
-    "value": 1.09
+    "unit": "ratio",
+    "value": 0.0524,
+    "normalized_by": "atomic RMW x10M",
+    "note": "median of three measured metric/reference pairs from CI logs: 1.24/23.68 (run 35426335882), 1.24/23.56 (35423924976), 1.09/20.67 (35424522314) — see scripts/check-bench.sh header; the 1.09 ms absolute entry it replaces was a host-class artifact (2.34 ms on the one Xeon 8370C run, identical loop)"
   },
   {
     "name": "Mailbox post+drain x1M",

@@ -2,6 +2,55 @@
 
 ## [Unreleased]
 
+### Benchmark 门禁：`RingBuffer SPSC x1M` 改用比值判据 —— 它是宿主的内存序实现，不是代码（**破坏性：否**）
+
+`624b423` 的 CI Benchmark 闸门只红一条：
+
+```
+FAIL: 1 metric(s) slower than the baseline by more than 2.0x (lower is better):
+  [absolute] RingBuffer SPSC x1M: baseline 1.090 ms → actual 2.336 ms (+114.3%)
+```
+
+该提交只动 `src/runtime/timer_wheel.zig`（`benchRingBuffer` 直接用 `rt.RingBuffer(u64, 1024)`，与时间轮
+**不可达**）。逐条排除后，结论是：**这条指标的绝对毫秒判据不成立**，而 `1.090` **不是**被优化掉的伪值 ——
+它是一条真实循环在另一种宿主上的真实数字。
+
+- **代码被排除在指令级**：交叉编译 `facef4c` / `624b423` 两份 `x86_64-linux` benchmark 二进制
+  （`zig build benchmark-build -Dtarget=x86_64-linux -Doptimize=ReleaseFast -Ddb=none`）逐指令比对：
+  `benchRingBuffer` 内联进 `benchmark.main` 的三条展开副本（`0x106fd8a` 起）**编码与地址逐字节相同**，
+  唯一差别是 call 重定位位移（链接布局挪了 `0x400`）；整份二进制的差异（374816 → 375046 条，
+  改动 271/501 条）全部落在时间轮被内联的那段路径上。
+- **不是被 LLVM 折掉的循环**（三条独立证据）：① 汇编里 slot 的 store 与 load 都在（`movq %rax,
+  0x100(%rbx,%rsi,8)` / `movq 0x100(%rbx,%rdx,8), %rdx`），计数循环 `cmpq $0xf4240` 也在；
+  ② 该循环**对 count 线性** —— 100K/1M/4M/16M = 1.035 / 10.840 / 42.775 / 173.171 ms（10.35-10.82 ns/iter）；
+  ③ 把 sink 换成**不可能被折叠**的形式也不变：带内存 clobber 的指针形式 10.43 ms、把 pop 值累加进
+  循环携带依赖的 `acc +%= v` 形式 10.98 ms（对生产形式 10.84 ms 在 ±3% 内）。
+- **宿主档才是变量**：16 次 CI run 的记录里，同一份代码在**同一宿主上稳定到 3 位有效数字**
+  （1.24 / 1.24 / 1.24 ms），跨宿主**台阶式**跳变：1.09（EPYC 9V74）、1.24（EPYC 7763）、1.26-1.57、
+  **2.34（WestUS3 Intel Xeon Platinum 8370C）**—— 而红的那次 run 恰好就是唯一落在 Xeon 上的那次，
+  同 run 的机器标尺 `atomic RMW x10M` 是 **60.58 ms**（EPYC 上 20.67 / 23.68 / 23.69）。折掉的循环不会
+  随宿主变，所以这既是"没折"的反证，也是红的成因。
+- **10× 倒挂的机制**：把 `src/runtime/ring.zig` **逐字复制**后只把 `.release`/`.acquire` 换成 `.monotonic`
+  （其余一字不改），同一个 `benchRingBuffer` 循环在本机（M1 Pro）从 **11.70 ms → 0.954 ms**（12.3×），
+  而 0.954 ms 正是 runner 上的那个数 —— x86 上 release store / acquire load 就是普通 `mov`，
+  arm64 上是 `stlr`/`ldar`。所以这条指标量的是**宿主的 release/acquire 实现 + store-to-load forwarding
+  延迟**（每轮的关键路径是 `tail`/`head` 各一条 store→load 链），不是框架代码。
+- **修法（两条基线各一处）**：`RingBuffer SPSC x1M` 加入 `NORMALIZED_METRICS`，与那五条原子路径指标一样
+  按 `指标 ÷ 'atomic RMW x10M'` 判比值（成员的准入规则从"每轮全是原子 RMW"改写为"每轮的关键路径是
+  单个内存序原语"）。`scripts/bench-baseline.json` 只改这一条（`10.471 ms` → 比值
+  `0.4976` = 10.706 ÷ 21.503，本机一次录制），其余 25 条按文件头部约定手工还原（`--update` 会全量重写）；
+  `scripts/bench-baseline.ci.json` 同样只改这一条，比值 `0.0524` 取三次 **runner 实测对**的中位数
+  （1.24/23.68、1.24/23.56、1.09/20.67），不是从本机推算的。**未改 `BENCH_THRESHOLD`（仍 2.0×），
+  未整份重录基线**。
+- **旧值为何不能留**：`1.090 ms` 是"某一档宿主的毫秒数"，被当成"代码的毫秒数"用；同一份二进制在 Xeon
+  档上就是 `2.34 ms`。比值判据把宿主约掉（EPYC 0.0523-0.0527，Xeon 0.0386 —— 这条的比值只**近似**
+  跟踪参考，26% 的离散度 vs 绝对值 2.15× 的离散度，仍远在 2.0× 窗口内），且**不削弱**对真回归的敏感度：
+  循环里多一次分配/多一个原子都会把 `ms` 推上去，而分母同一轮不变，比值随之上升，闸门照旧报红。
+- **更正 v0.28.0 段的一条记录**：那里写的"`RingBuffer SPSC x1M` 是唯一**不随机器缩放**的指标
+  （runner 1.09 ms vs 本机 10.6 ms，慢机器上反而更快）"读法要改 —— 它**随宿主缩放**，只是缩放的是
+  release/acquire 的实现成本，两个机器档在这条上相差约 10×，所以跨档比较依旧无意义（本机对 CI 基线
+  仍然只红这一条，9.37×）。`scripts/check-bench.sh` 头部那段注释按实测机制重写。
+
 ### 时间轮的推进口径修正：非对齐 deadline 不再晚 640ms、也不再提前一格（**破坏性：否**）
 
 `Wheel.advance` 的 level-0 槽 walk 有 off-by-one：它先 `index[0] += 1` 再走槽，却拿 `now_ms + slot_ms`
