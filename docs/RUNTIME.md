@@ -289,15 +289,23 @@ error.Full        阻塞等待（recv(0)）或超时（recv(ms)）
 四条规则（第 4 条是 §12 池化之后补的，前面的编号没动，因为文里按"§5 第 4 条"引用它）：
 
 1. **队列永不增长**。容量是 comptime 的，`error.Full` 是唯一出口 —— 内存曲线可预测。
-2. **丢弃必须可见，而且"丢"的两种原因要有两个数**。
+2. **丢弃必须可见，而且"丢"的不同原因要有不同的数**。
    - `stats().dropped_full` / `RuntimeStats.messages_dropped`：**生产者**被满邮箱拒收（`error.Full`，
      消息**从未被接受**，调用方当场就知道该退避还是该合流）。
    - `stats().discarded_on_stop` / `RuntimeStats.messages_discarded_on_stop`：消息**已经**被收下
      （`send` 返回过成功），然后**因为 worker 停机而被放弃** —— 剩下的那条队列不会再有人跑。
-   - 两者**故意不合并**：合成一个数会把"调用方正在挨背压"和"这个 actor 停机时把队列扔了"读成同一件事，
+   - `RuntimeStats.timer_deliveries_dropped`：**定时器已经触发**（`timer_fires` 已经动过），但那条消息投进
+     目标邮箱时**被拒** —— `error.Closed`（那个 worker 已经停了）或 `error.Full`（队列还满着）。
+     这是第四个原因、第四个数：没有生产者在挨背压、没有消息被"收下又放弃"、定时器也确实跑了。
+     `error.Full` 那一半会和 `messages_dropped` 同时涨（就是同一个 `send` 拒的），**正因为这样才需要它**：
+     只有这个读数能把"生产者在挨背压"和"一个已经触发的定时器的消息没到"分成两件事。
+     投递用的是非阻塞 `send`（不是 `sendBlocking`）：定时器**不允许**把 ticker 顶住，所以这里的答案
+     只能是"丢 + 计数"，不能是"等"。
+   - 这几种**故意不合并**：合成一个数会把"调用方正在挨背压"和"这个 actor 停机时把队列扔了"读成同一件事，
      而这两种情况该做的处置完全相反（前者退避，后者查停机原因）。合并只省一个字段，代价是读数失去意义。
    定时器命令队列（`timer_command_capacity` = 512）用同一条规则：满了就 `error.Full`，不静默丢；
-   定时器那一侧的对应读数是 `timers_discarded`（§3、§8）。
+   定时器那一侧的对应读数是 `timers_discarded`（§3、§8）——它数的是**没触发就释放**，
+   `timer_deliveries_dropped` 数的是**触发了但没投到**，两者互补，别互相替代。
 3. **消息是值**。`T` 按值拷贝进队列；要传堆对象就传指针并显式约定所有权，别让 `T` 偷偷拥有内存。
 4. **"环满"不是背压**。就绪环（§12）里的 token 不是消息，是**一个 worker 的调度权**：丢一条消息是丢工作，
    丢一个 token 是丢 worker —— 邮箱继续收、`send` 继续成功、而它永远不再运行。所以那个环的容量是按
@@ -334,7 +342,7 @@ L0 与 L1 是**两个通道，不是一个**：不要把热路径塞进 L1（它
 const s = rt.stats();
 // workers / running / messages_sent / messages_received
 // messages_dropped / messages_discarded_on_stop
-// handler_errors / timer_fires / timers_discarded / timer_lag_max_ms
+// handler_errors / timer_fires / timers_discarded / timer_deliveries_dropped / timer_lag_max_ms
 ```
 
 `timer_lag_max_ms` 是"定时器迟到的最大值"：ticker 被饿死、或某个 `post` 太慢时会变大 ——
@@ -343,6 +351,18 @@ const s = rt.stats();
 `timers_discarded` 是**停机时未触发就被释放**的定时器数：既包括还在命令队列里的 arm，也包括已经进了时间轮
 的节点（见 §3「停机不丢已 arm 的定时器」）。它和 `messages_dropped` 是同一条原则 —— 承诺过的活儿没发生，
 就必须留下一个数字；否则"少了一次投递"只能靠人去猜。
+
+`timer_deliveries_dropped` 是**定时器已经触发、但那条消息没投到目标邮箱**的数 —— 触发路径上的 `send`
+返回了 `error.Closed`（那个 worker 已经停了）或 `error.Full`（队列还满着）。它和 `timers_discarded`
+数的是互补的两件事（一个"没触发就走"、一个"触发了但没投到"），和 `messages_dropped` **不是**同一个原因：
+后者是某个生产者在调用点被拒（它在自己的线程上，当场就能改主意），前者是运行时替一个已经跑完的定时器
+丢一条消息（没有调用方在场）。`error.Full` 那一半会让两个数同时涨 —— 就是同一个 `send` 拒的 ——
+这正是它存在的理由：告警里"生产者挨背压"和"定时器的消息没到"要能分开。`after()` 的文档说投递失败
+"只打一行 debug 日志"，那是**不够的**（debug 日志在生产里默认关着），现在它有上面的读数 + 那行日志：
+日志给"哪个 worker"，读数给"多少次"。
+
+它按**运行时累加**（像 `timers_discarded`、`messages_discarded_on_stop`），不是把活着的 worker 加起来：
+`error.Closed` 的那一半写的时刻，那个 worker 已经停了 —— 求和写法会在能读到它之前归零。
 
 `messages_discarded_on_stop` 是**同一原则在消息侧的另一半**，但**不是** `messages_dropped` 的别名
 （§5 第 2 条）：`messages_dropped` 是生产者被满邮箱拒收，这条是**收下了又因 worker 停机被放弃**。
@@ -373,15 +393,22 @@ var bridge = try zigmodu.Runtime.MetricsBridge(PrometheusMetrics).init(&rt, metr
 metrics.setScrapeHook(@TypeOf(bridge).sample, &bridge);
 ```
 
-它注册 16 条 `zigmodu_runtime_*` 指标（`workers` / `running` / `messages_sent` /
+它注册 17 条 `zigmodu_runtime_*` 指标（`workers` / `running` / `messages_sent` /
 `messages_received` / **`messages_dropped`** / **`messages_discarded_on_stop`** / `handler_errors` /
-`timer_fires` / **`timers_discarded`** / **`timer_lag_ms`**，加上池化执行（§12）的 6 条：
+`timer_fires` / **`timers_discarded`** / **`timer_deliveries_dropped`** / **`timer_lag_ms`**，
+加上池化执行（§12）的 6 条：
 `pool_declared` / `pool_threads` / `pool_ready_len` / `pool_claimed` / `pool_dispatches` /
 `pool_ready_push_failures`）。名字里没有 `_total` 后缀是刻意的：这些是**抓取时采样**的快照，
 所以走 gauge 而不是 counter（`PrometheusMetrics.Counter` 没有 `set`）。
 
 `messages_dropped` 与 `messages_discarded_on_stop` 是**两条曲线，不是一个**：前者随生产者压力动，
 后者只在停机时跳一次。告警要分开写 —— "背压"和"actor 停机扔了队列"是两种事故。
+
+`timer_deliveries_dropped` 是**第三条**，`timer_fires` 的配对读数：`timer_fires` 涨而
+`messages_received` 不涨时，缺的那部分就在这条里（还有一个出口是 §3 的停机释放，走
+`timers_discarded`；两个出口加起来才等于"承诺过的定时器活儿"的总额）。它的典型形状是**停机窗口**：
+worker 先停（邮箱关闭）、定时器随后到点，于是它跳一次 —— 而 `messages_dropped` 不动，因为没有任何
+生产者在挨背压。持续增长则是另一回事：目标邮箱长期满着，定时器在往一个跟不上的 worker 上投活儿。
 
 **池的 6 条读什么**（§12.10 那句"`zmodu_runtime_*` 里没有池的指标"已经作废）：
 

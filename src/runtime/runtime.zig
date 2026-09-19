@@ -284,6 +284,21 @@ pub const RuntimeStats = struct {
     /// wheel. Counted for the same reason `messages_dropped` is: work that was
     /// promised and then did not happen must not disappear without a number.
     timers_discarded: u64,
+    /// Timers that **fired** and whose message the target mailbox refused
+    /// (`error.Closed` because that worker had stopped, `error.Full` because its
+    /// queue was still full). The timer never runs the ticker's callback chain
+    /// past this point: `send` has no blocking variant on the fire path, by
+    /// design — a timer must not be able to stall the wheel.
+    ///
+    /// A fourth reason, and a fourth number, because it is none of the other
+    /// three: no producer was refused (`messages_dropped`), no message was ever
+    /// accepted and then abandoned (`messages_discarded_on_stop`), and the timer
+    /// did fire (`timers_discarded`). The `error.Full` half overlaps
+    /// `messages_dropped` by construction — the same `send` bumps the mailbox's
+    /// own counter — which is precisely why this one exists: only this reading
+    /// separates "a producer is under backpressure" from "a fired timer's
+    /// message never arrived". See docs/RUNTIME.md §5.
+    timer_deliveries_dropped: u64,
     /// Worst lateness observed between a timer's deadline and its firing.
     timer_lag_max_ms: i64,
 };
@@ -416,6 +431,13 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         /// worker's own thread (see `WorkerContext.inheritTrace`): scheduling from
         /// anywhere else delivers an untraced message, which is the honest
         /// reading — no message is being handled there.
+        ///
+        /// **Delivery can still fail after all of this succeeded**, and `after`
+        /// is long gone by then: the mailbox may be closed (the worker stopped)
+        /// or full when the timer comes due, and the fire path cannot block on it
+        /// without letting a timer stall the ticker. That is a lost *delivery*,
+        /// not a lost timer, and it is counted — `RuntimeStats.timer_deliveries_dropped`,
+        /// plus a debug line naming the worker. See `docs/RUNTIME.md` §5.
         pub fn after(self: *Self, delay_ms: i64, message: Message) !wheel_mod.Wheel(TimerAction).Id {
             const Delivery = struct {
                 handle: *Self,
@@ -424,13 +446,22 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
                 fn post(ctx: *anyopaque) void {
                     const d: *@This() = @ptrCast(@alignCast(ctx));
                     // A timer must not be able to stall the ticker, so a full or
-                    // closed mailbox drops the message. Surfaced at debug: under
-                    // sustained backpressure this is the line that tells you the
-                    // timer fired but its worker never saw it.
-                    d.handle.mailbox.send(.{ .trace = d.trace, .message = d.message }) catch |err| std.log.debug(
-                        "[runtime] timer delivery to {s} dropped: {s}",
-                        .{ d.handle.context.name, @errorName(err) },
-                    );
+                    // closed mailbox drops the message — but a lost *delivery*
+                    // is not a lost *fire*: the timer ran, the message did not
+                    // arrive, and that difference is what this counter keeps
+                    // (see `RuntimeStats.timer_deliveries_dropped`). It goes on
+                    // the runtime rather than on the worker, because the
+                    // `error.Closed` half is "that worker is already gone" —
+                    // the one place a per-worker number would be unreadable
+                    // exactly when it matters. The debug line stays for the
+                    // "which worker" half that a number cannot carry.
+                    d.handle.mailbox.send(.{ .trace = d.trace, .message = d.message }) catch |err| {
+                        _ = d.handle.runtime.timer_deliveries_dropped.fetchAdd(1, .monotonic);
+                        std.log.debug(
+                            "[runtime] timer delivery to {s} dropped: {s}",
+                            .{ d.handle.context.name, @errorName(err) },
+                        );
+                    };
                 }
                 fn drop(ctx: *anyopaque, allocator: std.mem.Allocator) void {
                     const d: *@This() = @ptrCast(@alignCast(ctx));
@@ -662,6 +693,12 @@ pub const Runtime = struct {
     /// path (the ticker's last act, or `shutdown` itself on the caller-driven
     /// configuration), read by `stats()` — hence an atomic.
     timers_discarded: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Timer fires whose message the target mailbox refused (see
+    /// `RuntimeStats.timer_deliveries_dropped`). Accumulated here rather than
+    /// summed over the live workers, for the same reason
+    /// `messages_discarded_on_stop` is: the `error.Closed` half is written while
+    /// the worker is already stopped, so a per-worker sum would lose it.
+    timer_deliveries_dropped: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Messages accepted into a worker's mailbox and then abandoned when that
     /// worker stopped (see `Handle.countAbandoned`). Accumulated on the runtime
     /// rather than summed over the live workers — the shape `messages_dropped`
@@ -1129,6 +1166,7 @@ pub const Runtime = struct {
             .handler_errors = errors,
             .timer_fires = self.timer_fires.load(.monotonic),
             .timers_discarded = self.timers_discarded.load(.monotonic),
+            .timer_deliveries_dropped = self.timer_deliveries_dropped.load(.monotonic),
             .timer_lag_max_ms = self.timer_lag_max_ms.load(.monotonic),
         };
     }
@@ -1189,6 +1227,7 @@ pub const Runtime = struct {
             handler_errors: *MetricsT.Gauge,
             timer_fires: *MetricsT.Gauge,
             timers_discarded: *MetricsT.Gauge,
+            timer_deliveries_dropped: *MetricsT.Gauge,
             timer_lag_ms: *MetricsT.Gauge,
             pool_declared: *MetricsT.Gauge,
             pool_threads: *MetricsT.Gauge,
@@ -1211,6 +1250,7 @@ pub const Runtime = struct {
                     .handler_errors = try metrics.createGauge("zigmodu_runtime_handler_errors", "Worker handler errors observed"),
                     .timer_fires = try metrics.createGauge("zigmodu_runtime_timer_fires", "Timers fired"),
                     .timers_discarded = try metrics.createGauge("zigmodu_runtime_timers_discarded", "Timers released unfired at shutdown"),
+                    .timer_deliveries_dropped = try metrics.createGauge("zigmodu_runtime_timer_deliveries_dropped", "Timers that fired but whose message the target mailbox refused (closed or full): a fire, not a delivery"),
                     .timer_lag_ms = try metrics.createGauge("zigmodu_runtime_timer_lag_ms", "Worst lateness between a timer deadline and its firing, in milliseconds"),
                     .pool_declared = try metrics.createGauge("zigmodu_runtime_pool_declared", "Declared upper bound on .pooled workers (0 = no pool: no ring, no pool thread)"),
                     .pool_threads = try metrics.createGauge("zigmodu_runtime_pool_threads", "Pool threads running (Phase 1: 0 or 1); the ceiling on pool_claimed"),
@@ -1239,6 +1279,7 @@ pub const Runtime = struct {
                 self.handler_errors.set(@floatFromInt(s.handler_errors));
                 self.timer_fires.set(@floatFromInt(s.timer_fires));
                 self.timers_discarded.set(@floatFromInt(s.timers_discarded));
+                self.timer_deliveries_dropped.set(@floatFromInt(s.timer_deliveries_dropped));
                 self.timer_lag_ms.set(@floatFromInt(s.timer_lag_max_ms));
 
                 // `null` pool = zeros, not absent: the series answering "did
@@ -1843,6 +1884,86 @@ test "Runtime: after(delay) never fires early and lands on the first tick at or 
         try std.testing.expectEqual(@as(u32, 1), handle.state.seen);
         handle.stop();
     }
+}
+
+// ── a timer that fired and whose message could not be handed over ─────────
+//
+// The drop counter §5's list was missing: the timer *did* fire (`timer_fires`
+// moved), and the mailbox refused the message anyway. Not a producer being
+// refused (`messages_dropped`): there was no producer. Not a message abandoned
+// by a stop (`messages_discarded_on_stop`): nothing was ever accepted. Not a
+// timer released unfired (`timers_discarded`): the fire happened — that is the
+// *other* timer-side number, and the two are complementary ("never fired" vs
+// "fired, never arrived").
+//
+// `send` has exactly two failure modes here — `error.Closed` and `error.Full` —
+// so both are exercised below.
+
+test "Runtime: a timer that fires into a closed mailbox is accounted for" {
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .{ .manual = &clk });
+    defer rt.deinit();
+
+    const handle = try rt.spawn(CounterWorker, .{}, 8);
+    _ = try handle.after(50, 7);
+    _ = rt.tick(); // into the wheel, not due yet
+
+    handle.stop(); // the mailbox closes; the receive loop drains nothing and returns
+    handle.join();
+
+    clk.advance(60);
+    try std.testing.expectEqual(@as(usize, 1), rt.tick()); // due: fires, and cannot deliver
+
+    const s = rt.stats();
+    try std.testing.expectEqual(@as(u64, 1), s.timer_fires); // the timer fired ...
+    try std.testing.expectEqual(@as(u32, 0), handle.state.seen); // ... and the message never arrived
+    // None of the three existing counters owns it — no producer was refused, no
+    // message was ever accepted, and the timer did fire — so the delivery has a
+    // counter of its own:
+    try std.testing.expectEqual(@as(u64, 0), s.messages_dropped);
+    try std.testing.expectEqual(@as(u64, 0), s.messages_discarded_on_stop);
+    try std.testing.expectEqual(@as(u64, 0), s.timers_discarded);
+    try std.testing.expectEqual(@as(u64, 1), s.timer_deliveries_dropped);
+}
+
+test "Runtime: a timer that fires into a full mailbox is accounted for" {
+    // The other error `send` can come back with. A `run`-owned worker never
+    // recv's, so its mailbox only ever fills — nothing else can be draining it
+    // and make this test a race.
+    const Spinner = struct {
+        pub fn run(self: *@This(), ctx: anytype) anyerror!void {
+            _ = self;
+            while (!ctx.stopped()) std.atomic.spinLoopHint();
+        }
+    };
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .{ .manual = &clk });
+    defer rt.deinit();
+
+    const handle = try rt.spawn(Spinner, .{}, 4);
+    var full_seen = false;
+    for (0..64) |_| handle.send({}) catch |err| switch (err) {
+        error.Full => {
+            full_seen = true;
+            break;
+        },
+        else => return err,
+    };
+    try std.testing.expect(full_seen);
+
+    _ = try handle.after(50, {});
+    _ = rt.tick(); // into the wheel, not due yet
+    clk.advance(60);
+    try std.testing.expectEqual(@as(usize, 1), rt.tick()); // due: fires, mailbox still full
+
+    const s = rt.stats();
+    try std.testing.expectEqual(@as(u64, 1), s.timer_fires);
+    // The mailbox's own counter moves too (it is the same `send` that refused a
+    // producer a moment ago) — which is exactly why the timer side needs its
+    // own: `messages_dropped` cannot tell "a producer was refused" from "a
+    // timer's message was refused", and the two are different incidents.
+    try std.testing.expectEqual(@as(u64, 1), s.timer_deliveries_dropped);
 }
 
 test "Runtime: cancelling a timer drops it and its payload" {
@@ -3050,6 +3171,59 @@ test "Runtime.MetricsBridge publishes the messages a stop abandoned" {
     defer allocator.free(text);
     try check(text, "zigmodu_runtime_messages_discarded_on_stop", @floatFromInt(after.messages_discarded_on_stop));
     try check(text, "zigmodu_runtime_messages_dropped", @floatFromInt(after.messages_dropped));
+}
+
+test "Runtime.MetricsBridge publishes the timer deliveries that did not land" {
+    const PrometheusMetrics = @import("../metrics/PrometheusMetrics.zig").PrometheusMetrics;
+    const allocator = std.testing.allocator;
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(allocator, std.testing.io, .{ .manual = &clk });
+    defer rt.deinit();
+
+    var metrics = PrometheusMetrics.init(allocator);
+    defer metrics.deinit();
+    var bridge = try Runtime.MetricsBridge(PrometheusMetrics).init(&rt, &metrics);
+    metrics.setScrapeHook(@TypeOf(bridge).sample, &bridge);
+
+    const check = struct {
+        fn gauge(body: []const u8, name: []const u8, value: f64) !void {
+            var buf: [160]u8 = undefined;
+            const line = try std.fmt.bufPrint(&buf, "{s} {d:.6}", .{ name, value });
+            try std.testing.expect(std.mem.indexOf(u8, body, line) != null);
+        }
+    }.gauge;
+
+    // Registered from the start: a dashboard gets the series at 0 rather than a
+    // missing line, the same way the other drop counters behave.
+    try std.testing.expectEqual(@as(u64, 0), rt.stats().timer_deliveries_dropped);
+    const cold_text = try metrics.toPrometheusFormat(allocator);
+    defer allocator.free(cold_text);
+    try check(cold_text, "zigmodu_runtime_timer_deliveries_dropped", 0);
+
+    // Then it moves for the one reason it exists: a fire whose message the
+    // mailbox refused because the worker was already stopped.
+    const handle = try rt.spawn(CounterWorker, .{}, 8);
+    _ = try handle.after(50, 7);
+    _ = rt.tick();
+    handle.stop();
+    handle.join();
+    clk.advance(60);
+    _ = rt.tick();
+
+    const after = rt.stats();
+    try std.testing.expectEqual(@as(u64, 1), after.timer_fires);
+    try std.testing.expectEqual(@as(u64, 1), after.timer_deliveries_dropped);
+    // Not a second reading of anything else: nothing was refused at a producer's
+    // boundary and nothing was abandoned out of a queue.
+    try std.testing.expectEqual(@as(u64, 0), after.messages_dropped);
+    try std.testing.expectEqual(@as(u64, 0), after.messages_discarded_on_stop);
+
+    bridge.publish(); // sampling is callable directly, not only from a scrape
+    const text = try metrics.toPrometheusFormat(allocator);
+    defer allocator.free(text);
+    try check(text, "zigmodu_runtime_timer_deliveries_dropped", @floatFromInt(after.timer_deliveries_dropped));
+    try check(text, "zigmodu_runtime_timer_fires", @floatFromInt(after.timer_fires));
 }
 
 test "Runtime.MetricsBridge publishes RuntimeStats into a Prometheus scrape" {

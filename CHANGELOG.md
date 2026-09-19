@@ -2,6 +2,41 @@
 
 ## [Unreleased]
 
+### 定时器"触发了但没投到"现在有计数（**破坏性：否**）
+
+`Handle.after` 的投递回调（`Delivery.post`）在 `mailbox.send` 失败时**只打一行 debug 日志**：
+定时器已经触发（`timer_fires` 动过），那条消息却没进目标邮箱，而**没有任何计数**记下它 ——
+上一轮"丢弃必须可见"清单里剩下的最后一个洞。debug 日志在生产里默认关着，所以实际读数只有 0。
+
+`send` 在这里有且只有两个失败出口，两个都覆盖并各有测试：`error.Closed`（那个 worker 已经停了）
+与 `error.Full`（它的队列还满着）。
+
+- **第四个原因，第四个数**：新增 `RuntimeStats.timer_deliveries_dropped`（运行时累加，
+  `Handle` 侧没有对应字段）。它与既有三个数各不重叠：
+  - `messages_dropped`（= `dropped_full`）：**生产者**在自己的调用点被满邮箱拒收 —— 调用方当场在场，
+    消息从未被接受；`timer_deliveries_dropped` 是运行时替一个**已经跑完的定时器**丢消息，没有调用方在场。
+    （`error.Full` 那一半会让两个数同时涨 —— 就是同一个 `send` 拒的 —— 这正是它存在的理由：
+    只有这个读数能把"生产者在挨背压"和"定时器的消息没到"分成两件事。）
+  - `messages_discarded_on_stop`：消息**被收下过**（`send` 返回过成功）然后被停机放弃；
+    这里 `send` 从来没成功过，什么都不在队列里。
+  - `timers_discarded`：定时器**没触发**就被释放（停机/取消）；这里 `timer_fires` 已经涨了。
+- **停机窗口的典型形状**：worker 先停（邮箱关闭）、定时器随后到点 —— 于是它跳一次而
+  `messages_dropped` 不动。持续增长则是另一回事：定时器在往一个长期跟不上的 worker 上投活儿。
+- **第 17 条 gauge**：`zigmodu_runtime_timer_deliveries_dropped`（`Runtime.MetricsBridge`，
+  16 → 17 条）。桥仍是鸭子类型（`createGauge` + `Gauge.set`），runtime 层不依赖 observability 层。
+- **那行日志保留**（改的是 `catch |err| <计数 + 日志>`，不是退化成裸 `catch {}`）：日志回答"哪个 worker"，
+  计数回答"多少次"。`scripts/check-production.sh` 照旧通过。
+- **测试（先红后绿）**：两条生产路径各一条测试 —— 关闭邮箱（`error.Closed`）与满邮箱（`error.Full`，
+  用一个不 `recv` 的 `run` 型 worker 制造，避免竞态）、外加一条 bridge gauge 注册 + 随运行变化的测试。
+  未改生产代码时红（两种形式都贴过）：① 运行期守恒式
+  `s.timer_fires == s.messages_received + s.timers_discarded` → `expected 1, found 0`；
+  ② 补字段前 → `src/runtime/runtime.zig:1884:48: error: no field named 'timer_deliveries_dropped'
+  in struct 'runtime.runtime.RuntimeStats'`。
+- **零分配契约不变**：热路径（`Handle.send*` / `Runtime.scheduleAction`）与 `Handle.after` 的分配次数
+  一行未动（计数是一次 `fetchAdd`），`src/runtime/alloc_contract_test.zig` 的断言一个字没放宽。
+- **语义写进 `docs/RUNTIME.md`**：§5 第 2 条（四种原因各自的定义与"故意不合并"的理由）、§8（读数含义 +
+  `timer_fires` 的配对读法）。
+
 ### 监督停机丢掉的剩余消息，现在有计数（**破坏性：否**）
 
 `spawnActor` 判停时 dedicated worker 直接跳出接收循环，邮箱里剩下的消息**被丢弃且没有任何计数** ——
