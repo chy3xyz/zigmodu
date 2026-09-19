@@ -14,6 +14,16 @@
 //! 46.6 h, and a maximum timeout of ~124 days. A deadline beyond that is clamped
 //! to the last level (fires late rather than never).
 //!
+//! Delivery timing: `advance(now)` fires exactly what is due at `now`. Slots the
+//! wheel has already passed are expired whole (their end is behind `now`, so
+//! every node in them is due), and the slot `now` sits inside is swept for what
+//! is due while the rest waits there for the next tick. A timer therefore fires
+//! at the first `advance` that reaches its deadline — never early (firing up to
+//! `slot_ms` early was what the old `now + slot_ms` threshold did), never a
+//! rotation late (reinserting into the slot just walked cost 640 ms). Work per
+//! `advance` is the elapsed slots plus the nodes in the current one, so it still
+//! grows with time elapsed rather than with the number of pending timers.
+//!
 //! Long pauses: if `advance` is called after a jump larger than one level-0
 //! rotation, walking slot by slot would be a busy loop. That path instead scans
 //! the live timers once (O(pending)) and fires the due ones — the honest cost of
@@ -81,7 +91,14 @@ pub fn Wheel(comptime Payload: type) type {
         /// wheel held directly by a test/harness, or the window before the
         /// runtime's driver publishes itself. See the module doc comment.
         owner: std.atomic.Value(std.Thread.Id) = std.atomic.Value(std.Thread.Id).init(0),
-        /// Absolute slot index per level, as of `now_ms`.
+        /// Absolute slot index per level, as of `now_ms`: the slot that *contains*
+        /// `now_ms` at that level's resolution. At level 0 every slot strictly
+        /// before `index[0]` has been expired whole, and the slot `index[0]` names
+        /// has been swept for what was due then. The coarser entries are written
+        /// when the walk enters a new rotation of the level below; that is what
+        /// makes "which coarse slot covers the slots about to be walked" a
+        /// derivation (`index[0] / 64^l`) instead of incremental bookkeeping that
+        /// can drift.
         index: [levels]u64 = @splat(0),
         now_ms: i64 = 0,
         slots: [levels][spokes]?*Node = @splat(@splat(null)),
@@ -255,10 +272,11 @@ pub fn Wheel(comptime Payload: type) type {
             return dropped;
         }
 
-        /// Move time forward, firing everything due. `on_fire` is called for each
-        /// due timer with the payload — synchronous, on the caller's thread, so
-        /// keep it short (the runtime's hook posts a message, it does not run
-        /// application work here).
+        /// Move time forward, firing everything due at `now_ms` — every timer with
+        /// `deadline_ms <= now_ms` and not one before its deadline.
+        /// `on_fire` is called for each due timer with the payload — synchronous,
+        /// on the caller's thread, so keep it short (the runtime's hook posts a
+        /// message, it does not run application work here).
         ///
         /// Owner thread only.
         pub fn advance(
@@ -324,12 +342,15 @@ pub fn Wheel(comptime Payload: type) type {
             node.next = null;
         }
 
-        /// Fire or cascade every node in one slot.
+        /// Fire or cascade every node in one slot, and empty it.
         ///
-        /// `fire_before` is the inclusive deadline threshold for firing: level 0
-        /// fires anything due within the tick it just walked (`now + slot_ms`,
-        /// which is the wheel's resolution), while coarser slots only fire what
-        /// is *already* overdue — everything else cascades down to a finer level.
+        /// `fire_before` is the inclusive deadline threshold for firing. What the
+        /// caller passes is what makes a timer's delivery time honest: a slot the
+        /// wheel has left behind passes its own end (every node in it is due), a
+        /// coarse slot passes `now` (fire what is already overdue, cascade the
+        /// rest down), and the slot `now` sits inside is not worked by this
+        /// function at all (`sweepDue` handles it, because that one has to keep
+        /// the nodes it cannot fire yet).
         fn expireSlot(
             self: *Self,
             level: u32,
@@ -357,8 +378,109 @@ pub fn Wheel(comptime Payload: type) type {
             return fired_now;
         }
 
+        /// Fire the nodes of one slot that are due by `deadline_limit`, leaving
+        /// the rest linked in place.
+        ///
+        /// This is how the slot `now_ms` sits inside is handled. Its end is still
+        /// in the future, so a node in it may well not be due yet — firing it
+        /// would break the "at least `delay_ms`" half of the contract, and moving
+        /// it elsewhere has nowhere correct to put it: its deadline belongs to
+        /// *this* slot, which the wheel has just arrived at. So it stays, and the
+        /// next tick looks again. That is what bounds the delivery lag by the
+        /// tick interval instead of a whole rotation, and it is also why the
+        /// nodes left here are at most one slot behind the wheel's position.
+        ///
+        /// Fire order matches `expireSlot` (list order, head first) and nothing is
+        /// allocated: a node that is not due keeps its `next`/`prev`/`level`/`slot`
+        /// exactly as they were, so `cancel` and `drainAll` still find it.
+        fn sweepDue(
+            self: *Self,
+            level: u32,
+            slot: usize,
+            deadline_limit: i64,
+            ctx: anytype,
+            comptime on_fire: fn (@TypeOf(ctx), Id, Payload) void,
+        ) usize {
+            var fired_now: usize = 0;
+            var prev: ?*Node = null;
+            var it = self.slots[level][slot];
+            while (it) |node| {
+                const next = node.next;
+                if (node.deadline_ms <= deadline_limit) {
+                    if (prev) |p| {
+                        p.next = next;
+                    } else {
+                        self.slots[level][slot] = next;
+                    }
+                    if (next) |n| n.prev = prev;
+                    node.prev = null;
+                    node.next = null;
+                    _ = self.nodes.remove(node.id);
+                    on_fire(ctx, node.id, node.payload);
+                    self.allocator.destroy(node);
+                    fired_now += 1;
+                } else {
+                    prev = node;
+                }
+                it = next;
+            }
+            return fired_now;
+        }
+
+        /// Descend the coarse slots that cover the fine rotation starting at
+        /// `first_fine` (a multiple of `spokes` — the fine wheel is entering a new
+        /// rotation).
+        ///
+        /// Level 1's slot `|first_fine| / spokes` covers exactly the 64 fine slots
+        /// about to be walked, so it has to be emptied into them *before* the walk
+        /// starts: anything it hands down lands in a slot the wheel has not
+        /// reached yet. Doing it the other way round was the second half of the
+        /// same bug — a cascaded timer whose deadline lay in the first `slot_ms`
+        /// of the rotation was dropped into a slot already walked and waited a
+        /// rotation. The loop then climbs: a level whose own index is a multiple of
+        /// `spokes` is itself the start of a rotation one level up.
+        fn cascade(
+            self: *Self,
+            first_fine: u64,
+            now_ms: i64,
+            ctx: anytype,
+            comptime on_fire: fn (@TypeOf(ctx), Id, Payload) void,
+        ) usize {
+            var fired_now: usize = 0;
+            var level: u32 = 1;
+            var abs = first_fine / spokes;
+            while (true) {
+                self.index[level] = abs;
+                // `now_ms`, not the slot's start: a coarse slot can be reached by a
+                // jump that lands past part of its window, and everything already
+                // overdue fires now rather than waiting for a finer walk that this
+                // call is about to perform anyway.
+                fired_now += self.expireSlot(level, @intCast(abs & spokes_mask), now_ms, ctx, on_fire);
+                if (level + 1 >= levels or (abs & spokes_mask) != 0) break;
+                abs /= spokes;
+                level += 1;
+            }
+            return fired_now;
+        }
+
         /// Walk the slots between the last position and `now_ms` (≤ one level-0
         /// rotation), firing due timers and cascading coarse slots down.
+        ///
+        /// Two halves, and both matter for "fires at `deadline`, never before":
+        ///
+        /// * Slots the wheel has **left behind** (`index[0] < target0`) are expired
+        ///   whole — their end is already in the past, so every node in them is
+        ///   due. Walking the slot *before* stepping onto it is what stops a node
+        ///   from being reinserted into the slot the wheel just passed (that cost
+        ///   a full rotation: 64 × `slot_ms` = 640 ms).
+        /// * The slot `now_ms` **sits inside** is only swept for what is due at
+        ///   `now_ms`; the rest stays there for the next tick (`sweepDue`).
+        ///
+        /// Together they make `advance(now)` mean exactly "everything due at `now`
+        /// has fired, and nothing before its deadline has": the second half is what
+        /// the old `now + slot_ms` threshold got wrong in the *early* direction
+        /// (it fired a node due up to `slot_ms` later), and the first half is what
+        /// it got wrong in the late direction.
         fn advanceFine(
             self: *Self,
             now_ms: i64,
@@ -366,22 +488,33 @@ pub fn Wheel(comptime Payload: type) type {
             comptime on_fire: fn (@TypeOf(ctx), Id, Payload) void,
         ) usize {
             var fired_now: usize = 0;
+            // The walk reinserts cascaded nodes, and `insert` picks their level
+            // from `deadline_ms - now_ms`: it has to be the real `now_ms`, not the
+            // time of some slot in the middle of the walk, or a node is filed a
+            // level too high and pays an extra cascade before it can fire.
+            self.now_ms = now_ms;
             const target0 = slotIndex(0, now_ms);
             while (self.index[0] < target0) {
-                self.index[0] += 1;
-                // Level 0 fires whatever is due within the tick just walked.
-                fired_now += self.expireSlot(0, @intCast(self.index[0] & spokes_mask), self.now_ms + slot_ms, ctx, on_fire);
-
-                // Each wrap of a level rotates the next one up. Coarse slots hold
-                // timers that are still far away, so they cascade instead of firing.
-                var level: u32 = 0;
-                while (level + 1 < levels and (self.index[level] & spokes_mask) == 0) : (level += 1) {
-                    self.index[level + 1] += 1;
-                    fired_now += self.expireSlot(level + 1, @intCast(self.index[level + 1] & spokes_mask), self.now_ms, ctx, on_fire);
+                // Entering a rotation: cascade the coarse slot covering it first,
+                // so its nodes land in slots this walk has not reached yet.
+                if ((self.index[0] & spokes_mask) == 0) {
+                    // The fine index is the rotation's start; `cascade` derives the
+                    // level-1 slot from it (`first_fine / spokes`).
+                    fired_now += self.cascade(self.index[0], now_ms, ctx, on_fire);
                 }
-                self.now_ms += slot_ms;
+                // Safe to expire whole: `index[0] < target0` means this slot's end
+                // is at or before `now_ms`, so every node in it is due.
+                fired_now += self.expireSlot(
+                    0,
+                    @intCast(self.index[0] & spokes_mask),
+                    @as(i64, @intCast(self.index[0] + 1)) * slot_ms,
+                    ctx,
+                    on_fire,
+                );
+                self.index[0] += 1;
             }
-            self.now_ms = now_ms;
+            // What is left is inside slot `target0`, the one `now_ms` falls in.
+            fired_now += self.sweepDue(0, @intCast(target0 & spokes_mask), now_ms, ctx, on_fire);
             return fired_now;
         }
 
@@ -472,6 +605,242 @@ test "Wheel cascades a long timer down through the levels" {
     }
     try std.testing.expectEqual(@as(usize, 1), rec.fired.items.len);
     try std.testing.expectEqual(@as(u32, 7), rec.fired.items[0]);
+}
+
+/// One ticker step: the runtime reads its clock every `tick_interval_ms` (5 ms)
+/// and hands the value to `advance`, so that — not `slot_ms` — is the grid a
+/// timer's delivery can be observed on.
+const tick_ms: i64 = 5;
+
+/// Drive `wheel` like the ticker does — one `advance` per tick, from `from` to
+/// `until` — and report the first tick at which anything fired.
+fn runTicker(
+    comptime Payload: type,
+    wheel: *Wheel(Payload),
+    rec: *Recorder(Payload),
+    from: i64,
+    until: i64,
+) ?i64 {
+    var t = from;
+    while (t <= until) : (t += tick_ms) {
+        _ = wheel.advance(t, rec, Recorder(Payload).on_fire);
+        if (rec.fired.items.len > 0) return t;
+    }
+    return null;
+}
+
+test "Wheel fires a timer the moment it is due, unaligned deadlines included" {
+    // The regression, stated as a property: whatever the offset inside a slot,
+    // `advance(now)` fires everything due at `now` — never earlier, and never a
+    // rotation later. The old `advanceFine` stepped onto a slot and then used
+    // that slot's *start* as its firing threshold, so a deadline sitting inside
+    // it was reinserted into the slot the wheel had just walked and was not seen
+    // again for 64 slots (640 ms).
+    const deadlines = [_]i64{ 1, 4, 5, 9, 10, 11, 14, 16, 19, 20, 24, 630, 635, 639, 640, 641, 700 };
+    for (deadlines) |delay| {
+        var wheel = Wheel(u32).init(std.testing.allocator, 1_000);
+        defer wheel.deinit();
+        var rec = Recorder(u32){};
+        defer rec.deinit();
+
+        const deadline = 1_000 + delay;
+        _ = try wheel.schedule(deadline, @intCast(delay));
+
+        const fired_at = runTicker(u32, &wheel, &rec, 1_000, deadline + 200);
+        try std.testing.expect(fired_at != null); // it fired at all
+        try std.testing.expectEqual(@as(usize, 1), rec.fired.items.len);
+        try std.testing.expectEqual(@as(u32, @intCast(delay)), rec.fired.items[0]);
+        try std.testing.expect(fired_at.? >= deadline); // never before the deadline
+        try std.testing.expect(fired_at.? <= deadline + tick_ms); // never past the next tick
+        try std.testing.expectEqual(@as(usize, 0), wheel.pendingCount());
+    }
+}
+
+test "Wheel: a single advance fires what is due inside the slot it lands in" {
+    // The bare report: 24 ms out, advanced to 40 ms. The timer lives in the slot
+    // covering [20, 30), which the walk reaches with `now` already past its end.
+    var wheel = Wheel(u32).init(std.testing.allocator, 0);
+    defer wheel.deinit();
+    var rec = Recorder(u32){};
+    defer rec.deinit();
+
+    _ = try wheel.schedule(24, 1);
+    try std.testing.expectEqual(@as(usize, 1), wheel.advance(40, &rec, Recorder(u32).on_fire));
+    try std.testing.expectEqualSlices(u32, &.{1}, rec.fired.items);
+    try std.testing.expectEqual(@as(usize, 0), wheel.pendingCount());
+}
+
+test "Wheel: a deadline is due the moment `now` reaches it (slot edges)" {
+    // On the boundary between slots, on the last millisecond of a slot, one past
+    // the boundary, and inside the slot `now` falls in — `advance(deadline)`
+    // means exactly "everything due at `deadline` has fired".
+    for ([_]i64{ 1_010, 1_014, 1_019, 1_020, 1_030, 1_039, 1_040 }) |deadline| {
+        var wheel = Wheel(u32).init(std.testing.allocator, 1_000);
+        defer wheel.deinit();
+        var rec = Recorder(u32){};
+        defer rec.deinit();
+
+        _ = try wheel.schedule(deadline, 9);
+        // One tick before the deadline: nothing may fire.
+        _ = wheel.advance(deadline - 1, &rec, Recorder(u32).on_fire);
+        try std.testing.expectEqual(@as(usize, 0), rec.fired.items.len);
+        try std.testing.expectEqual(@as(usize, 1), wheel.pendingCount());
+
+        try std.testing.expectEqual(@as(usize, 1), wheel.advance(deadline, &rec, Recorder(u32).on_fire));
+        try std.testing.expectEqual(@as(usize, 0), wheel.pendingCount());
+    }
+}
+
+test "Wheel: coarse deadlines (level promotion) fire at the first tick at or after them" {
+    // 41 s out sits two levels up, so it only reaches level 0 by cascading — the
+    // path where an off-by-one puts the timer into a slot the fine wheel has
+    // already walked.
+    const delays = [_]i64{ 41_000, 41_003, 4_096, 4_103 };
+    for (delays) |delay| {
+        var wheel = Wheel(u32).init(std.testing.allocator, 1_000);
+        defer wheel.deinit();
+        var rec = Recorder(u32){};
+        defer rec.deinit();
+
+        const deadline = 1_000 + delay;
+        _ = try wheel.schedule(deadline, 5);
+        const fired_at = runTicker(u32, &wheel, &rec, 1_000, deadline + 200);
+        try std.testing.expect(fired_at != null); // it fired at all
+        try std.testing.expect(fired_at.? >= deadline);
+        try std.testing.expect(fired_at.? <= deadline + tick_ms);
+        try std.testing.expectEqual(@as(usize, 0), wheel.pendingCount());
+    }
+}
+
+test "Wheel: a timer waiting inside the current slot can still be cancelled or drained" {
+    // Timers that are not due yet stay linked in the slot `now` sits inside
+    // (that is what keeps them from being pushed a rotation out), so `cancel`
+    // and `drainAll` have to keep working on a list that was only partially
+    // consumed.
+    var wheel = Wheel(u32).init(std.testing.allocator, 1_000);
+    defer wheel.deinit();
+    var rec = Recorder(u32){};
+    defer rec.deinit();
+
+    const head = try wheel.schedule(1_014, 1);
+    const middle = try wheel.schedule(1_016, 2);
+    _ = try wheel.schedule(1_019, 3);
+
+    _ = wheel.advance(1_010, &rec, Recorder(u32).on_fire); // inside slot 101: nothing is due
+    try std.testing.expectEqual(@as(usize, 0), rec.fired.items.len);
+    try std.testing.expectEqual(@as(usize, 3), wheel.pendingCount());
+
+    try std.testing.expect(wheel.cancel(head)); // head of the partially walked slot
+    try std.testing.expect(wheel.cancel(middle)); // middle of it
+
+    var dropped: usize = 0;
+    const Dropper = struct {
+        fn onDrop(count: *usize, _: u64, _: u32) void {
+            count.* += 1;
+        }
+    };
+    try std.testing.expectEqual(@as(usize, 1), wheel.drainAll(&dropped, Dropper.onDrop));
+    try std.testing.expectEqual(@as(usize, 1), dropped);
+    try std.testing.expectEqual(@as(usize, 0), wheel.pendingCount());
+
+    // The slot is still usable afterwards (no stale head, no skipped node).
+    _ = try wheel.schedule(1_017, 4);
+    try std.testing.expectEqual(@as(usize, 1), wheel.advance(1_020, &rec, Recorder(u32).on_fire));
+    try std.testing.expectEqualSlices(u32, &.{4}, rec.fired.items);
+}
+
+test "Wheel: a mixed batch of unaligned deadlines each fire inside their own tick" {
+    // The property the two bugs broke, at batch scale: 200 deadlines with every
+    // offset mod 10, spanning plain fine slots and a level promotion, driven one
+    // tick at a time. Each timer must come out exactly once, never before its
+    // deadline, and never more than one tick after it.
+    const count = 200;
+    const Stamped = struct {
+        fire_at: [count]?i64 = @splat(null),
+        now: i64 = 0,
+        fn onFire(self: *@This(), _: u64, payload: u32) void {
+            self.fire_at[payload] = self.now;
+        }
+    };
+
+    var wheel = Wheel(u32).init(std.testing.allocator, 1_000);
+    defer wheel.deinit();
+    var stamped = Stamped{};
+
+    for (0..count) |i| {
+        const delay: i64 = 1 + @as(i64, @intCast(i)) * 7;
+        _ = try wheel.schedule(1_000 + delay, @intCast(i));
+    }
+
+    var t: i64 = 1_000;
+    var fired: usize = 0;
+    while (fired < count and t <= 1_000 + count * 7 + 200) : (t += tick_ms) {
+        stamped.now = t;
+        fired += wheel.advance(t, &stamped, Stamped.onFire);
+    }
+    try std.testing.expectEqual(@as(usize, count), fired);
+    try std.testing.expectEqual(@as(usize, 0), wheel.pendingCount());
+
+    for (0..count) |i| {
+        const delay: i64 = 1 + @as(i64, @intCast(i)) * 7;
+        const at = stamped.fire_at[i] orelse return error.TimerNeverFired;
+        try std.testing.expect(at >= 1_000 + delay); // never early
+        try std.testing.expect(at <= 1_000 + delay + tick_ms); // never past the next tick
+    }
+}
+
+test "Wheel survives a long stall with unaligned deadlines, and stays exact afterwards" {
+    var wheel = Wheel(u32).init(std.testing.allocator, 1_000);
+    defer wheel.deinit();
+    var rec = Recorder(u32){};
+    defer rec.deinit();
+
+    _ = try wheel.schedule(1_006, 1);
+    _ = try wheel.schedule(1_014, 2); // inside a slot, like the fine path's hard case
+    _ = try wheel.schedule(1_640, 3); // needs a level promotion to get here
+
+    // One tick before the earliest deadline: still nothing, even though the two
+    // timers live in different slots.
+    _ = wheel.advance(1_005, &rec, Recorder(u32).on_fire);
+    try std.testing.expectEqual(@as(usize, 0), rec.fired.items.len);
+
+    // The ticker was starved for two minutes: the rescan path fires all three at
+    // once, and none of them before its deadline.
+    try std.testing.expectEqual(@as(usize, 3), wheel.advance(121_000, &rec, Recorder(u32).on_fire));
+    try std.testing.expectEqual(@as(usize, 0), wheel.pendingCount());
+
+    // ...and the fine walk is still exact after the rescan reset the indices.
+    _ = try wheel.schedule(121_014, 4);
+    _ = wheel.advance(121_010, &rec, Recorder(u32).on_fire);
+    try std.testing.expectEqual(@as(usize, 3), rec.fired.items.len); // 121_014 is not due yet
+    try std.testing.expectEqual(@as(usize, 1), wheel.advance(121_015, &rec, Recorder(u32).on_fire));
+    try std.testing.expectEqual(@as(u32, 4), rec.fired.items[rec.fired.items.len - 1]);
+}
+
+test "Wheel: multi-day deadlines cascade down through every level and fire on time" {
+    // Delays whose first home is level 2, 3 or 4: they only reach level 0 by
+    // cascading, and every hop has to hand the node to a window the wheel has not
+    // walked yet. Driven 500 ms per advance, so the fine path does the cascading
+    // rather than the stall rescan.
+    const step_ms: i64 = 500;
+    const delays = [_]i64{ 3_600_000, 3_600_003, 90_000_000, 200_000_000 };
+    for (delays) |delay| {
+        var wheel = Wheel(u32).init(std.testing.allocator, 0);
+        defer wheel.deinit();
+        var rec = Recorder(u32){};
+        defer rec.deinit();
+
+        _ = try wheel.schedule(delay, 1);
+        var fire_at: ?i64 = null;
+        var t: i64 = 0;
+        while (fire_at == null and t <= delay + step_ms) : (t += step_ms) {
+            if (wheel.advance(t, &rec, Recorder(u32).on_fire) > 0) fire_at = t;
+        }
+        try std.testing.expect(fire_at != null); // it fired at all
+        try std.testing.expect(fire_at.? >= delay); // never early
+        try std.testing.expect(fire_at.? <= delay + step_ms); // never past the next advance
+        try std.testing.expectEqual(@as(usize, 0), wheel.pendingCount());
+    }
 }
 
 test "Wheel fires same-slot timers in insertion order" {

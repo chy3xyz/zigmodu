@@ -1315,6 +1315,48 @@ test "Runtime: timers deliver a message after the delay, not before" {
     handle.stop();
 }
 
+test "Runtime: after(delay) never fires early and lands on the first tick at or after it" {
+    // The wheel's fine spokes are 10 ms wide and the ticker wakes every 5 ms, so
+    // a deadline with an arbitrary offset falls inside the spoke the wheel is
+    // already standing in. The regression: such a timer was reinserted into that
+    // same spoke and waited a full rotation (640 ms) — and, on the other side,
+    // the spoke walk fired the previous window's leftovers up to a spoke early.
+    // Both halves of the documented envelope are asserted here: `>= deadline`
+    // (never early) and within one tick (the arm is drained by the first tick,
+    // so no enqueue latency is left to spend).
+    const delays = [_]i64{ 20, 16, 14, 11, 9, 5 };
+    for (delays) |delay| {
+        var manual = Clock.Manual{ .now_ms = 1_000 };
+        var rt = Runtime.init(std.testing.allocator, std.testing.io, .{ .manual = &manual });
+        defer rt.deinit();
+
+        const handle = try rt.spawn(CounterWorker, .{}, 8);
+        _ = try handle.after(delay, 1);
+        const deadline = 1_000 + delay;
+
+        // Drive the wheel through `tick()` on the ticker's grid — the same
+        // arrangement as a running ticker, without the sleep.
+        var fired_at: ?i64 = null;
+        var t: i64 = 1_000;
+        const tick_interval: i64 = Runtime.tick_interval_ms;
+        while (fired_at == null and t <= deadline + 5 * tick_interval) : (t += tick_interval) {
+            manual.set(t);
+            if (rt.tick() > 0) fired_at = t;
+        }
+
+        const at = fired_at orelse return error.TimerNeverFired;
+        try std.testing.expect(at >= deadline); // the contract is "at least delay_ms"
+        try std.testing.expect(at <= deadline + tick_interval); // and no later than the next tick
+        try std.testing.expectEqual(@as(u64, 1), rt.stats().timer_fires);
+
+        // The message — not just the wheel entry — reached the worker.
+        var spins: usize = 0;
+        while (handle.state.seen == 0 and spins < 4_000_000) : (spins += 1) std.atomic.spinLoopHint();
+        try std.testing.expectEqual(@as(u32, 1), handle.state.seen);
+        handle.stop();
+    }
+}
+
 test "Runtime: cancelling a timer drops it and its payload" {
     var manual_clock = Clock.Manual{ .now_ms = 0 };
     var rt = Runtime.init(std.testing.allocator, std.testing.io, .{ .manual = &manual_clock });

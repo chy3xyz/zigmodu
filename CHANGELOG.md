@@ -1,5 +1,38 @@
 # Changelog
 
+## [Unreleased]
+
+### 时间轮的推进口径修正：非对齐 deadline 不再晚 640ms、也不再提前一格（**破坏性：否**）
+
+`Wheel.advance` 的 level-0 槽 walk 有 off-by-one：它先 `index[0] += 1` 再走槽，却拿 `now_ms + slot_ms`
+（该槽的**起点**）当触发阈值 —— 走在**下一个**槽上、阈值只到它的起点，于是槽内 deadline 大于该阈值的节点被
+`expireSlot` 重新 `insert` 回**刚走过的那个槽**，要再等 64 个槽（64 × 10ms = **640ms**）才被看见。同一处偏差的
+另一半是**提前触发**（阈值取的是上一轮的 `now_ms`）：`after(14)` 在第 4ms 就发出。两者都与
+`docs/RUNTIME.md` §3（以及 `docs/UPGRADING.md` 的 v0.28.0 段）承诺的
+`[delay_ms, delay_ms + 入队延迟 + tick_interval_ms]` 冲突 —— 而既有测试的 deadline 全是槽对齐的
+（`after(50)`@1000→1050、`schedule(1050)`、5000/5030…），唯一的 ticker 用例自旋预算 4 亿次，所以一直没红。
+
+- **新的推进口径**（`src/runtime/timer_wheel.zig`）：一次 `advance(now)` 先钉住 `now_ms = now`，然后
+  ①**已经走过的槽**（`index[0] < target0`）**整槽过期**，阈值取**槽终点**（≤ `now`，槽里每个节点都已到期，
+  因此不存在"被塞回刚走过的槽"这回事）；②**`now` 所在的槽**交给新的 `sweepDue`：**只发到期的那部分**，
+  没到期的**留在槽里**（`next`/`prev`/`level`/`slot` 原样不动，`cancel`/`drainAll` 照样找得到），下一个 tick 再看。
+  于是 `advance(now)` 严格等于"到期即发、不到期不发"，10ms 的槽粒度不再写进延迟上界（5ms tick 下偏差 ≤ 5ms）。
+- **顺带修的同类偏差**：粗层（level ≥ 1）的 cascade 原本在"下层索引预增之后"执行，等于提前一格去清**下一个**
+  粗槽，落在窗口头 10ms 的节点会被塞进刚走过的细槽、同样等一个旋转。现在级联发生**在走进新旋转之前**，
+  要清的粗槽由「细索引 ÷ 64^l」直接推出，并只在"本层索引是 64 的倍数"时继续往上（层与层的窗口对齐是构造性的，
+  不是靠增量维护）。
+- **测试**：`src/runtime/timer_wheel.zig` 新增 8 条（裸轮复现 `schedule(24)`+`advance(40)`；5ms tick 网格下的
+  unaligned 表；槽边界/槽终点/槽内各种偏移；level 提升（4096/4103/41000/41003）；多天延迟逐级级联
+  （含 200,000,000ms ≈ 2.3 天）；200 条混合 batch 的逐条窗口断言；长停摆 + unaligned；部分走过的槽上的
+  `cancel`/`drainAll`），`src/runtime/runtime.zig` 新增 1 条经**公开 API** 的用例（`Clock.Manual` + `rt.tick()`，
+  不 sleep）验证 `after(delay)` 不早于 deadline、且落在下一个 tick 内。
+- **兼容面：无 API 变化、无契约变化**（契约本来就是"**至少** `delay_ms`"），但**触发时刻会变**：
+  非对齐 deadline 从"可能早最多 ~9ms、或晚最多 640ms"变成"恰好在 deadline 与下一个 tick 之间"。
+  依赖旧的"提前几毫秒"做错峰的消费方会观察到差异；这正是它单独成条的理由。
+- **未回归**：owner 单写者契约（`claimOwner`/`assertOwner`）、零分配契约
+  （`src/runtime/alloc_contract_test.zig` 里 `Wheel.schedule/cancel/advance/drainAll` 的精确分配次数断言一字未改）、
+  长停摆 `advanceCoarse` 路径、`TimerWheel x100K` benchmark（比值判据 < 2.0×）。
+
 ## [0.28.0] - 2026-09-19
 
 > **本版说明**：给 v0.28 定的硬规定是「所有已有 public API 必须保持 source-compatible」，

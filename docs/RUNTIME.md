@@ -111,6 +111,12 @@ book.stop();                                       // 请求结束（join 由 sh
   不需要锁，也不会出现两个线程同时写 `nodes` 的哈希表撕裂（这正是 v0.27 的缺陷）。
   - **有效延迟** = `∈ [delay_ms, delay_ms + 入队延迟 + tick_interval_ms]`：`deadline` 在**调用侧**
     算好，所以 `after(50)` 始终是"从这次调用起 +50"，与 ticker 忙不忙无关；tick 间隔是 **5ms**。
+    这个上界成立靠的是时间轮的**推进口径**（v0.28.0 修正，之前不成立）：一次 `advance` 里
+    **已经走过的槽整槽过期**（槽终点已在 `now` 之前，槽里每个定时器都已到期），而 `now` 所在的
+    **当前槽每轮只发"到期了的"**、没到期的不动、下一个 tick 再看。于是 10ms 的槽粒度既不把延迟
+    抬到"下一个槽边界"（那会到 ~15ms），也不提前一个槽触发（那是违反"至少 delay_ms"的另一半）。
+    实测偏差看 `timer_lag_ms`（§8）—— 它是 `clock.nowMs() - deadline`，还包含 ticker 的唤醒抖动，
+    所以夜里/满载下偶尔略高于 5ms 属于抖动，不是契约失效。
   - 命令队列满 = `error.Full`（**不静默丢**，和邮箱同一条原则）：调用方自己决定丢弃/合并/重试。
 - **取消有两个入口，语义写在名字里**（v0.28）：
   - `rt.requestCancelTimer(id) !void` —— 热路径，含义是"**请求已交给 Runtime**"，约一个 tick 后生效；
@@ -246,7 +252,7 @@ defer app.stop();   // 先请求停止 + join worker，再停模块
 | `RingBuffer(T, N)` | 1 生产者 / 1 消费者 | 无 CAS（各自只读对方指针）；N 必须 2 的幂 |
 | `MpscRing(T, N)` | N 生产者 / 1 消费者 | Vyukov 有界队列；**N ≥ 2**（N=1 时序号无法区分"空"与"未消费"，编译期拒绝） |
 | `Mailbox(T, N)` | N 生产者 / 1 消费者 | 有界 + 阻塞；`send` 满即 `error.Full`，`sendBlocking` 换延迟；`close()` 唤醒等待者 |
-| `Wheel(Payload)` | **单线程驱动（ticker 独占）** | 分层时间轮，O(1) 插入/取消；10ms 粒度、5 层、最长 ~124 天；长停摆走 O(pending) 扫描。**零锁**：`schedule`/`cancel`/`advance`/`drainAll` 只有驱动它的那一个线程能调（Debug/ReleaseSafe 下 `claimOwner`+`assertOwner` 会拦）；跨线程只通过 `Runtime` 的有界命令队列交接，见 §3「`after` 到底做了什么」。`drainAll` 是 fire/cancel 之外的第三个出口：停机时把还在轮里的 payload 交给同一个 `drop` 钩子 |
+| `Wheel(Payload)` | **单线程驱动（ticker 独占）** | 分层时间轮，O(1) 插入/取消；10ms 粒度、5 层、最长 ~124 天；`advance(now)` 的语义是"到期即发、不到期不发"——走过的槽整槽过期，`now` 所在的槽只发到期的那部分（没到期的留到下一个 tick），所以 10ms 槽粒度不写进延迟上界（§3）。长停摆走 O(pending) 扫描。**零锁**：`schedule`/`cancel`/`advance`/`drainAll` 只有驱动它的那一个线程能调（Debug/ReleaseSafe 下 `claimOwner`+`assertOwner` 会拦）；跨线程只通过 `Runtime` 的有界命令队列交接，见 §3「`after` 到底做了什么」。`drainAll` 是 fire/cancel 之外的第三个出口：停机时把还在轮里的 payload 交给同一个 `drop` 钩子 |
 | `ObjectPool(T)` | 多线程 | 定容 + 自旋锁；`acquire` **不分配**，耗尽返回 null（把流量高峰变成"削峰"而不是 OOM） |
 | `Clock` | 值类型 | `.monotonic`（生产）/ `.manual`（测试：不睡觉就能推动一小时定时器） |
 | `Sequencer` | 多线程 | 无锁单调序列：`next()` / `nextBatch(n)` / `advanceTo()`；**不是时钟**（只在进程生命期内有意义） |
