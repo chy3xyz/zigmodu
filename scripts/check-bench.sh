@@ -165,6 +165,20 @@
 # field's comment, and the `a long-lived wheel's lookups do not get slower as it
 # ages` test in that file.
 #
+# That "unaffected" used to be an assertion from one judged run; it has since been
+# measured directly (2026-09-19, interleaved A/B against a copy of the pre-change
+# wheel, order-balanced within each round, with an A/A control measured in the
+# same rounds because this host has to be treated as shared). What it costs
+# `TimerWheel x100K` is in the low single digits at worst: ~1.04x on the fixed
+# buffer instrument, 1.12-1.17x median on the suite's own allocator where the A/A
+# control already reads 1.08x. The cost is **growth**, not steady state — the
+# array index keeps two structures and rebuilds the second on every growth step
+# (34 growth allocations / 14.75 MB against 15 / 10.06 MB for the hash map on a
+# 100k-timer wheel), while at a presized 100k keys it is 6% *faster* to insert
+# into than the old map was. That is the trade for the 9.4x above, so no entry
+# here moved: 6.808 ms against a 2.0x window still leaves ~1.8x of headroom.
+# Full table: `docs/BEST_PRACTICES.md`, the `[pct]` section's last two bullets.
+#
 # The CI file (`scripts/bench-baseline.ci.json`) does **not** carry that entry
 # yet. Recording it from this laptop would bake a value from the wrong machine
 # class into a file whose whole point is that the two classes are not comparable
