@@ -15,6 +15,35 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 
 ---
 
+## v0.28.0
+
+### `Runtime.cancelTimer(id) bool` 删除，拆成两个入口
+
+**Breaking?** 是 —— **本版唯一一处**。全仓只有 `runtime.zig` 内部 1 处 + 1 个单测引用过它
+（`examples/`、`tools/`、`docs/` 零引用）。
+
+**为什么删而不是保留**：时间轮改为 ticker-owned 后，取消必然变成"投一条命令给 ticker"，
+调用返回时取消还没发生。`bool` 再也无法表示"它确实还挂着"——保留它只有一个后果：
+**静默改义**，调用方一个字节都不用改、行为悄悄变了。那比删掉危险。
+
+**一行改法**：
+
+```zig
+// 旧（已删）
+if (rt.cancelTimer(id)) { ... }          // 语义是"它确实还挂着"
+
+// 新：热路径 —— 含义是"请求已交给 Runtime"，约一个 tick（5ms）后生效
+try rt.requestCancelTimer(id);
+
+// 新：控制面 —— 等 owner 执行完，返回最终结果
+if (try rt.cancelTimerSync(id)) { ... }  // true = 调用那一刻它还在 pending
+```
+
+**顺带的能力**：`after` 的表现语义变成"**至少** delay_ms 后"，上界是
+`delay_ms + 入队延迟 + tick_interval_ms`（tick 是 5ms）。deadline 由**调用方**算
+（`clock.nowMs() + delay`），所以 `after(50)` 仍是相对调用时刻 +50，不是相对 ticker 收到 +50。
+命令队列满时 `after` 返回 `error.Full`，不静默丢。
+
 ## v0.26.0+（未发布批次）
 
 ### `zmodu audit` / `zmodu ci` 现在会审计嵌套模块

@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+> **本版说明**：给 v0.28 定的硬规定是「所有已有 public API 必须保持 source-compatible」，
+> **本版有意偏离一次**，且只此一次 —— `Runtime.cancelTimer(id) bool` 被删除，拆成
+> `requestCancelTimer` / `cancelTimerSync`。理由是它一旦异步化（时间轮改为 ticker-owned 后
+> 必然如此）就无法再回答"是否已取消"，留着它就是**静默改义**，比删掉更危险；删除前已清点
+> 全仓调用方（`examples/`、`tools/`、`docs/` 零引用，只有 `runtime.zig` 内部 1 处 + 1 个单测）。
+> 迁移方式见 `docs/UPGRADING.md`。除这一处外，本版完全向后兼容。
+
 ### Benchmark 门禁：给"原子路径"指标加同轮机器参考（**破坏性：否**）
 
 CI 的 Benchmark 闸门（`bash scripts/check-bench.sh`）在 `2462e70` 上稳定报红（两次 attempt 比值只差
