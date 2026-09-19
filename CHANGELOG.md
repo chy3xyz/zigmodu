@@ -40,8 +40,35 @@
 - `T3`：worker 在自己的 handler 里 `ctx.handle.after(...)`、ticker 在跑，断言那条消息最终到达
   （文档 §3 推荐的用法；修复前就是绿的，保留为回归网）。
 
-**未附带**：`Runtime.shutdown()` 仍不释放**已经进轮**的待触发 payload（只释放命令队列里的）——
-和修复前同形，属既知缺口，另开一项处理。
+**未附带**（现已补上，见下一项）：`Runtime.shutdown()` 当时仍不释放**已经进轮**的待触发 payload
+（只释放命令队列里的）。
+
+### `shutdown()` 释放已进时间轮的待触发 payload（**破坏性：否**）
+
+上一项修完之后留下的缺口：`shutdown()` 只交出了**还在命令队列里**的请求，已经进轮的那些定时器
+（`Wheel.nodes` 里的节点）只被 `wheel.deinit` 销毁节点本身，**payload 不释放** —— 停机时 armed 未触发的
+定时器一律泄漏。修法遵守同一条单写者不变量：**drain 必须发生在 owner 线程上**，而不是让 `shutdown()`
+（应用线程）去碰时间轮、把刚立起来的契约再破坏一次。
+
+- **`Wheel.drainAll(ctx, on_drop) usize`**（`timer_wheel.zig`，owner-only + `assertOwner()`）：遍历全部
+  slot，对每个 node 调 `on_drop(ctx, id, payload)`，销毁 node，清空 `nodes` map，返回释放条数。
+  它是 fire/cancel 之外的**第三个出口**，用的是同一个 `drop` 钩子 —— 这正是"payload 恰好释放一次"
+  在三条路径上都成立的原因。重复调用返回 0（幂等）。
+- **有 ticker**：ticker 是 owner，所以由它在退出前 drain（`defer`，任何退出路径都覆盖），
+  `shutdown()` 只负责 join —— drain 天然落在 owner 线程上。
+- **没有 ticker**（调用方自己 `tick()` 自驱）：那条路径上调用方就是 owner，`shutdown()` 直接 drain。
+  轮被**另一个**线程持有时不越界写它，而是 `std.log.warn` 出条数与 owner（不是静默丢）。
+- **`shutdown()` 仍然幂等**：第二次调用发现轮里没有待触发项就直接返回，不 double-free。
+- **丢弃可见**：`RuntimeStats` 新增 `timers_discarded`（按 `stats()` 既有的聚合写法加，`stats()` 里直接 load），命令队列里被丢弃的 arm
+  与轮里被 drain 的定时器**同计**（对调用方而言都是"我 arm 的那次没跑"）；`Runtime.MetricsBridge` 出
+  第 9 条 gauge `zigmodu_runtime_timers_discarded`。理由和 `messages_dropped` 一样：承诺过的活儿没发生，
+  不能没有数字（`docs/RUNTIME.md` §3 / §8）。
+
+**回归测试 4 条**（`src/runtime/runtime.zig`，`std.testing.allocator` 当泄漏 oracle，无需显式断言泄漏）+
+1 条轮级单测（`timer_wheel.zig`）：ticker 路径 / 自驱路径各一条，断言 `timers_discarded == N` 且
+`pendingCount() == 0`；幂等一条（连调两次 `shutdown()`，同一 `N`、不崩）；"已 fire 的不重复 drop" 一条
+（正常触发一轮后 `timers_discarded == 0`）。**红证据**：未改生产代码时先跑这组测试，3 条失败
+（`expected 0, found 64 / 16 / 8`）并报 88 leaks；实现后全绿。
 
 ### 新增：EventRecorder v1 —— 运行时投递流可录、可重放（**破坏性：否**）
 

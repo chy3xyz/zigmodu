@@ -94,8 +94,9 @@ pub const TraceId = @import("../tracing/DistributedTracer.zig").DistributedTrace
 
 /// Deferred work handed to the timer wheel. Type-erased so one wheel serves
 /// workers with different message types; the runtime owns `ctx` and releases it
-/// exactly once — on fire, on cancel, or (if the request never made it onto the
-/// command queue) before `scheduleAction` returns the error.
+/// exactly once — on fire, on cancel, at shutdown (a timer that never fires is
+/// released by `Runtime.drainWheel`), or, if the request never made it onto the
+/// command queue, before `scheduleAction` returns the error.
 const TimerAction = struct {
     ctx: *anyopaque,
     post: *const fn (ctx: *anyopaque) void,
@@ -191,6 +192,11 @@ pub const RuntimeStats = struct {
     messages_dropped: u64,
     handler_errors: u64,
     timer_fires: u64,
+    /// Timers that were accepted but never fired, released when the runtime shut
+    /// down instead — still in the command queue, or already a node in the
+    /// wheel. Counted for the same reason `messages_dropped` is: work that was
+    /// promised and then did not happen must not disappear without a number.
+    timers_discarded: u64,
     /// Worst lateness observed between a timer's deadline and its firing.
     timer_lag_max_ms: i64,
 };
@@ -449,6 +455,10 @@ pub const Runtime = struct {
     idle: std.Io.Condition = .init,
     ticker: ?std.Thread = null,
     timer_fires: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Timers released without firing at shutdown. Written from the shutdown
+    /// path (the ticker's last act, or `shutdown` itself on the caller-driven
+    /// configuration), read by `stats()` — hence an atomic.
+    timers_discarded: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     timer_lag_max_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
 
     const Entry = struct {
@@ -501,6 +511,10 @@ pub const Runtime = struct {
     }
 
     /// Stop every worker (request + join), then the ticker. Idempotent.
+    ///
+    /// Timers that never got to fire are not dropped silently on the way out:
+    /// their payloads are released (see `drainWheel`) and the number is reported
+    /// as `RuntimeStats.timers_discarded`.
     pub fn shutdown(self: *Self) void {
         self.alive.store(false, .release);
         // Ask first, join after: a worker that is waiting on another worker's
@@ -524,7 +538,11 @@ pub const Runtime = struct {
         // never become timers — and their payloads are owned by this queue until
         // one of the two happens. Release them (the `drop` half of the fire/cancel
         // contract) so a shutdown with a full command queue is not a leak.
+        // Then the same for what already made it onto the wheel: with a ticker
+        // that is the ticker's own doing (see `tickerMain`), so this is a no-op
+        // there and the real work on the caller-driven configuration.
         self.abandonTimerCommands();
+        self.drainWheel();
         self.wakeTimerWaiters();
     }
 
@@ -735,6 +753,7 @@ pub const Runtime = struct {
             .messages_dropped = dropped,
             .handler_errors = errors,
             .timer_fires = self.timer_fires.load(.monotonic),
+            .timers_discarded = self.timers_discarded.load(.monotonic),
             .timer_lag_max_ms = self.timer_lag_max_ms.load(.monotonic),
         };
     }
@@ -771,6 +790,7 @@ pub const Runtime = struct {
             messages_dropped: *MetricsT.Gauge,
             handler_errors: *MetricsT.Gauge,
             timer_fires: *MetricsT.Gauge,
+            timers_discarded: *MetricsT.Gauge,
             timer_lag_ms: *MetricsT.Gauge,
 
             /// Registers the gauges. Startup-time call: if a later `createGauge`
@@ -785,6 +805,7 @@ pub const Runtime = struct {
                     .messages_dropped = try metrics.createGauge("zigmodu_runtime_messages_dropped", "Messages rejected by a full mailbox (backpressure, not silent loss)"),
                     .handler_errors = try metrics.createGauge("zigmodu_runtime_handler_errors", "Worker handler errors observed"),
                     .timer_fires = try metrics.createGauge("zigmodu_runtime_timer_fires", "Timers fired"),
+                    .timers_discarded = try metrics.createGauge("zigmodu_runtime_timers_discarded", "Timers released unfired at shutdown"),
                     .timer_lag_ms = try metrics.createGauge("zigmodu_runtime_timer_lag_ms", "Worst lateness between a timer deadline and its firing, in milliseconds"),
                 };
             }
@@ -805,6 +826,7 @@ pub const Runtime = struct {
                 self.messages_dropped.set(@floatFromInt(s.messages_dropped));
                 self.handler_errors.set(@floatFromInt(s.handler_errors));
                 self.timer_fires.set(@floatFromInt(s.timer_fires));
+                self.timers_discarded.set(@floatFromInt(s.timers_discarded));
                 self.timer_lag_ms.set(@floatFromInt(s.timer_lag_max_ms));
             }
         };
@@ -848,18 +870,64 @@ pub const Runtime = struct {
     /// Release everything still queued, without touching the wheel: shutdown
     /// runs on a thread that is *not* the owner (the owner has already been
     /// joined). A queued arm will never fire, so its payload is dropped exactly
-    /// as a cancel would drop it; a queued cancel is answered "no" so a waiter
-    /// does not hang on a wheel that is going away.
+    /// as a cancel would drop it, and counted exactly as `drainWheel` counts the
+    /// ones that got further — from the caller's side both are "the timer I
+    /// armed never ran". A queued cancel is answered "no" so a waiter does not
+    /// hang on a wheel that is going away.
     fn abandonTimerCommands(self: *Self) void {
         while (self.timer_commands.tryPop()) |cmd| {
             switch (cmd) {
-                .arm => |arm| arm.action.drop(arm.action.ctx, self.allocator),
+                .arm => |arm| {
+                    arm.action.drop(arm.action.ctx, self.allocator);
+                    _ = self.timers_discarded.fetchAdd(1, .monotonic);
+                },
                 .cancel => |cancel| {
                     if (cancel.result) |result| result.store(false, .monotonic);
                     if (cancel.done) |done| done.store(true, .release);
                 },
             }
         }
+    }
+
+    /// Release every timer still pending in the wheel, and count them.
+    ///
+    /// The wheel's owner is the only thread allowed to write it, so which
+    /// thread runs this is not a detail:
+    ///
+    /// * with a ticker, that thread runs it as its last act (`tickerMain`), and
+    ///   the `join` in `shutdown` waits for it — so this call finds an empty
+    ///   wheel;
+    /// * without a ticker, whoever calls `tick()` owns the wheel, and `shutdown`
+    ///   is expected to come from that same thread (the caller-driven
+    ///   configuration of `docs/RUNTIME.md` §4).
+    ///
+    /// A wheel owned by some *other* thread is left alone: writing it from here
+    /// is precisely the cross-thread violation the ownership contract exists to
+    /// prevent. That combination is a misuse of `tick()`, and it is reported
+    /// rather than dropped quietly.
+    ///
+    /// Idempotent: once nothing is pending it returns without touching the owner
+    /// check, which is what keeps a second `shutdown()` free of side effects.
+    fn drainWheel(self: *Self) void {
+        const pending = self.wheel.pendingCount();
+        if (pending == 0) return;
+        const owner = self.wheel.ownerThread();
+        if (owner != 0 and owner != std.Thread.getCurrentId()) {
+            std.log.warn(
+                "[runtime] shutdown: {d} timer payload(s) still pending in a wheel owned by another thread ({d}); only its owner may release them",
+                .{ pending, owner },
+            );
+            return;
+        }
+        const discarded = self.wheel.drainAll(self, onTimerDiscard);
+        _ = self.timers_discarded.fetchAdd(discarded, .monotonic);
+    }
+
+    /// The wheel's drop hook on the shutdown path — the same release the fire
+    /// and cancel paths perform, for a timer that will never run.
+    fn onTimerDiscard(self: *Runtime, id: u64, action: TimerAction) void {
+        _ = id;
+        action.drop(action.ctx, self.allocator);
     }
 
     /// Wake everyone parked in `cancelTimerSync`. Only called when somebody is
@@ -901,6 +969,14 @@ pub const Runtime = struct {
         // wheel has one writer by contract, and `start()` runs on somebody else's.
         self.wheel.claimOwner();
         self.wheel.alignNow(self.clock.nowMs());
+
+        // Whoever ends this loop — `shutdown()` setting `ticker_running`, or an
+        // error on the way to the sleep — this thread is the wheel's owner, so
+        // releasing what is still pending has to happen here: `shutdown` is
+        // waiting in `join()` and could not do it without writing another
+        // thread's wheel. `defer` rather than a trailing call so every exit path
+        // gets it, including the `catch return`s below.
+        defer self.drainWheel();
 
         self.mu.lock(self.io) catch return;
         while (self.ticker_running.load(.acquire)) {
@@ -1225,6 +1301,116 @@ test "Runtime: cancelling a timer drops it and its payload" {
     try std.testing.expectEqual(@as(u32, 0), handle.state.seen);
     try std.testing.expectEqual(@as(u64, 0), rt.stats().timer_fires);
     handle.stop();
+}
+
+// ── what shutdown does with timers still in the wheel ────────────────────
+//
+// The runtime owns a timer's payload from the moment the arm command is applied
+// until it fires or is cancelled. `shutdown()` is the third exit: everything
+// still pending has to be released there, or a process that stops with timers
+// armed leaks them. That release can only happen on the wheel's owner thread
+// (see the ownership contract in `timer_wheel.zig`), which is why the ticker
+// does it on its way out and a caller-driven runtime does it from `shutdown`.
+//
+// `std.testing.allocator` is the oracle: a payload that is not released is a
+// leak the test runner reports on its own, without any assertion in the test.
+
+/// Payload for the shutdown tests. Deliberately non-zero-sized: `create` of a
+/// zero-sized type allocates nothing, so a leak would have nothing to leak and
+/// the allocator oracle above would stay silent.
+const WheelPayload = struct {
+    marker: u64 = 0x5eed,
+
+    fn post(ctx: *anyopaque) void {
+        const payload: *@This() = @ptrCast(@alignCast(ctx));
+        // These tests only observe whether the payload was *released*, never
+        // whether it was delivered — touch the marker so the call is not
+        // compiled away in a release build.
+        std.mem.doNotOptimizeAway(payload.marker);
+    }
+
+    fn drop(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+        const payload: *@This() = @ptrCast(@alignCast(ctx));
+        allocator.destroy(payload);
+    }
+};
+
+/// Arm `count` timers, each with a heap payload the runtime owns from here on,
+/// all far enough out that none of them fires before the test's shutdown.
+fn armStillPending(rt: *Runtime, count: usize, delay_ms: i64) !void {
+    for (0..count) |_| {
+        const payload = try std.testing.allocator.create(WheelPayload);
+        payload.* = .{};
+        _ = try rt.scheduleAction(delay_ms, .{
+            .ctx = @ptrCast(payload),
+            .post = WheelPayload.post,
+            .drop = WheelPayload.drop,
+        });
+    }
+}
+
+test "Runtime: shutdown releases timers still in the wheel when the ticker drives it" {
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .monotonic);
+    defer rt.deinit();
+    try rt.start();
+
+    const n = 64;
+    try armStillPending(&rt, n, 60_000); // a minute out: none of them fires
+
+    rt.shutdown(); // the ticker owns the wheel; it releases them before the join returns
+    try std.testing.expectEqual(@as(u64, n), rt.stats().timers_discarded);
+    try std.testing.expectEqual(@as(usize, 0), rt.wheel.pendingCount());
+    try std.testing.expectEqual(@as(u64, 0), rt.stats().timer_fires);
+}
+
+test "Runtime: shutdown releases timers still in the wheel on the caller-driven path" {
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .{ .manual = &clk });
+    defer rt.deinit();
+
+    const n = 16;
+    try armStillPending(&rt, n, 5_000);
+    _ = rt.tick(); // the arms become wheel nodes; nothing is due yet
+    try std.testing.expectEqual(@as(usize, n), rt.wheel.pendingCount());
+
+    rt.shutdown(); // no ticker: this call runs on the thread that owns the wheel
+    try std.testing.expectEqual(@as(u64, n), rt.stats().timers_discarded);
+    try std.testing.expectEqual(@as(usize, 0), rt.wheel.pendingCount());
+    try std.testing.expectEqual(@as(u64, 0), rt.stats().timer_fires);
+}
+
+test "Runtime: shutdown twice with timers still in the wheel releases them once" {
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .{ .manual = &clk });
+    defer rt.deinit();
+
+    const n = 8;
+    try armStillPending(&rt, n, 5_000);
+    _ = rt.tick();
+
+    rt.shutdown();
+    try std.testing.expectEqual(@as(u64, n), rt.stats().timers_discarded);
+    rt.shutdown(); // idempotent: nothing left to release, and nothing released twice
+    try std.testing.expectEqual(@as(u64, n), rt.stats().timers_discarded);
+    try std.testing.expectEqual(@as(usize, 0), rt.wheel.pendingCount());
+}
+
+test "Runtime: timers that already fired are not released again at shutdown" {
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .{ .manual = &clk });
+    defer rt.deinit();
+
+    const n = 8;
+    try armStillPending(&rt, n, 20);
+    _ = rt.tick(); // into the wheel, not due yet
+    clk.advance(30);
+    try std.testing.expectEqual(n, rt.tick()); // all due: post + drop, exactly once
+    try std.testing.expectEqual(@as(usize, 0), rt.wheel.pendingCount());
+    try std.testing.expectEqual(@as(u64, n), rt.stats().timer_fires);
+
+    rt.shutdown(); // nothing left: a fired timer must not be released a second time
+    try std.testing.expectEqual(@as(u64, 0), rt.stats().timers_discarded);
+    try std.testing.expectEqual(@as(usize, 0), rt.wheel.pendingCount());
 }
 
 // ── the wheel's concurrency contract ─────────────────────────────────────
@@ -1991,6 +2177,7 @@ test "Runtime.MetricsBridge publishes RuntimeStats into a Prometheus scrape" {
     try check(text, "zigmodu_runtime_messages_dropped", @floatFromInt(s.messages_dropped));
     try check(text, "zigmodu_runtime_handler_errors", @floatFromInt(s.handler_errors));
     try check(text, "zigmodu_runtime_timer_fires", @floatFromInt(s.timer_fires));
+    try check(text, "zigmodu_runtime_timers_discarded", @floatFromInt(s.timers_discarded));
     try check(text, "zigmodu_runtime_timer_lag_ms", @floatFromInt(s.timer_lag_max_ms));
 
     // The dropped/backpressure signal is the reason this bridge exists — make

@@ -106,6 +106,10 @@ book.stop();                                       // 请求结束（join 由 sh
   - `rt.cancelTimerSync(id) !bool` —— 控制面，等 owner 执行完并返回**最终结果**（`true` = 当时还在 pending）。
   ARM 与 CANCEL 走**同一条 FIFO 队列**，所以"先 arm 后 cancel"与"先 cancel 后 arm"的结果是确定的
   （前者被取消、后者正常触发），不是掷骰子。
+- **停机不丢已 arm 的定时器**（v0.28）：`shutdown()` 释放**所有还没触发**的定时器 payload —— 既包括还在
+  命令队列里的 arm，也包括**已经进轮**的节点；释放条数汇总在 `stats().timers_discarded`（§8）。
+  释放只能在时间轮的 owner 线程上做，所以有 ticker 时由 ticker 在退出前完成（`shutdown()` 只负责 join），
+  自己 `tick()` 驱动时由那个调用者线程完成。`shutdown()` 仍然**幂等**：两次调用不会重复释放（也不会 double-free）。
 - `handle`/`run` 返回的错误被记录并计数（`stats().handler_errors`），**不会**停掉 worker；
   panic 不可捕获，会带走进程 —— 热路径上的 panic 见 `docs/BEST_PRACTICES.md`「韧性」。
 
@@ -223,7 +227,7 @@ defer app.stop();   // 先请求停止 + join worker，再停模块
 | `RingBuffer(T, N)` | 1 生产者 / 1 消费者 | 无 CAS（各自只读对方指针）；N 必须 2 的幂 |
 | `MpscRing(T, N)` | N 生产者 / 1 消费者 | Vyukov 有界队列；**N ≥ 2**（N=1 时序号无法区分"空"与"未消费"，编译期拒绝） |
 | `Mailbox(T, N)` | N 生产者 / 1 消费者 | 有界 + 阻塞；`send` 满即 `error.Full`，`sendBlocking` 换延迟；`close()` 唤醒等待者 |
-| `Wheel(Payload)` | **单线程驱动（ticker 独占）** | 分层时间轮，O(1) 插入/取消；10ms 粒度、5 层、最长 ~124 天；长停摆走 O(pending) 扫描。**零锁**：`schedule`/`cancel`/`advance` 只有驱动它的那一个线程能调（Debug/ReleaseSafe 下 `claimOwner`+`assertOwner` 会拦）；跨线程只通过 `Runtime` 的有界命令队列交接，见 §3「`after` 到底做了什么」 |
+| `Wheel(Payload)` | **单线程驱动（ticker 独占）** | 分层时间轮，O(1) 插入/取消；10ms 粒度、5 层、最长 ~124 天；长停摆走 O(pending) 扫描。**零锁**：`schedule`/`cancel`/`advance`/`drainAll` 只有驱动它的那一个线程能调（Debug/ReleaseSafe 下 `claimOwner`+`assertOwner` 会拦）；跨线程只通过 `Runtime` 的有界命令队列交接，见 §3「`after` 到底做了什么」。`drainAll` 是 fire/cancel 之外的第三个出口：停机时把还在轮里的 payload 交给同一个 `drop` 钩子 |
 | `ObjectPool(T)` | 多线程 | 定容 + 自旋锁；`acquire` **不分配**，耗尽返回 null（把流量高峰变成"削峰"而不是 OOM） |
 | `Clock` | 值类型 | `.monotonic`（生产）/ `.manual`（测试：不睡觉就能推动一小时定时器） |
 | `Sequencer` | 多线程 | 无锁单调序列：`next()` / `nextBatch(n)` / `advanceTo()`；**不是时钟**（只在进程生命期内有意义） |
@@ -285,11 +289,15 @@ L0 与 L1 是**两个通道，不是一个**：不要把热路径塞进 L1（它
 ```zig
 const s = rt.stats();
 // workers / running / messages_sent / messages_received
-// messages_dropped / handler_errors / timer_fires / timer_lag_max_ms
+// messages_dropped / handler_errors / timer_fires / timers_discarded / timer_lag_max_ms
 ```
 
 `timer_lag_max_ms` 是"定时器迟到的最大值"：ticker 被饿死、或某个 `post` 太慢时会变大 ——
 它比"定时器数量"更能说明运行时是否健康。每个 worker 的明细在 `handle.stats()`。
+
+`timers_discarded` 是**停机时未触发就被释放**的定时器数：既包括还在命令队列里的 arm，也包括已经进了时间轮
+的节点（见 §3「停机不丢已 arm 的定时器」）。它和 `messages_dropped` 是同一条原则 —— 承诺过的活儿没发生，
+就必须留下一个数字；否则"少了一次投递"只能靠人去猜。
 
 **接进 `/metrics`**：`RuntimeStats` 有现成的桥，起服务时接一次即可，抓取时采样（无后台线程）：
 
@@ -298,10 +306,10 @@ var bridge = try zigmodu.Runtime.MetricsBridge(PrometheusMetrics).init(&rt, metr
 metrics.setScrapeHook(@TypeOf(bridge).sample, &bridge);
 ```
 
-它注册 8 条 `zigmodu_runtime_*` 指标（`workers` / `running` / `messages_sent` /
+它注册 9 条 `zigmodu_runtime_*` 指标（`workers` / `running` / `messages_sent` /
 `messages_received` / **`messages_dropped`** / `handler_errors` / `timer_fires` /
-**`timer_lag_ms`**）。名字里没有 `_total` 后缀是刻意的：这些是**抓取时采样**的快照，所以走 gauge
-而不是 counter（`PrometheusMetrics.Counter` 没有 `set`）。
+**`timers_discarded`** / **`timer_lag_ms`**）。名字里没有 `_total` 后缀是刻意的：这些是**抓取时采样**的快照，
+所以走 gauge 而不是 counter（`PrometheusMetrics.Counter` 没有 `set`）。
 
 **为什么必须有这一步**：`messages_dropped` 与 `timer_lag_ms` 只在这里出现 —— 邮箱打满、定时器被饿死
 在 HTTP 侧**完全看不见**，只看请求直方图会得出"一切正常"的结论。
@@ -382,6 +390,7 @@ fn traceFromHeader(id: []const u8) zigmodu.runtime.TraceId {
 | **v0.22.0** | Agent 跑成 worker（`Agent → Worker → Event`） | ✅ `ai.AgentWorker`：`rt.spawn(ai.AgentWorker, …)` + `ai.agent_worker.post(...)`，有界邮箱 / 生命周期 / 监督 / 指标跟着来 —— 见 `docs/AGENT_RUNTIME.md` §六 |
 | **Unreleased** | EventRecorder v1：`Recorder(E, C)` + `HotBus.attachRecorder`（运行时投递流录制、按 seq 重放并驱动 `Clock.Manual`） | ✅ 本文档 §11.6（**尚未发版**；落盘、多事件类型、`Handle.send`/定时器投递不在 v1） |
 | **Unreleased** | 定时器时间轮改为 **ticker-owned**：`Runtime` 命令队列（`arm`/`cancel` 同一条 FIFO）+ 生产者侧 id/deadline；`cancelTimer` 拆成 `requestCancelTimer`（请求）/ `cancelTimerSync`（要结果） | ✅ 本文档 §3/§4（**Breaking**：旧的 `cancelTimer(id) bool` 已删） |
+| **Unreleased** | `shutdown()` 释放**已进轮**的待触发 payload（`Wheel.drainAll`，在 owner 线程上 drain）+ `RuntimeStats.timers_discarded` / `zigmodu_runtime_timers_discarded` | ✅ 本文档 §3/§4/§8（**非 Breaking**：补上 ticker-owned 那批的"未附带"项） |
 | 1.0 | API 收敛、命名统一、deprecated 清理 | 计划 |
 
 ## 10. 最小示例

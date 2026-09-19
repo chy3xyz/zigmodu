@@ -26,8 +26,9 @@
 //! ## Ownership: one thread at a time
 //!
 //! The wheel has no lock, and that is a contract, not an oversight: **only the
-//! thread that drives it may call `schedule` / `cancel` / `advance`.** Every
-//! field (`now_ms`, `slots`, `nodes`, and the id counter) is single-writer state.
+//! thread that drives it may call `schedule` / `cancel` / `advance` /
+//! `drainAll`.** Every field (`now_ms`, `slots`, `nodes`, and the id counter) is
+//! single-writer state.
 //!
 //! The runtime holds up its end by making the driver the only writer: `after()`
 //! from any thread turns into a command on the runtime's bounded queue, and the
@@ -209,6 +210,49 @@ pub fn Wheel(comptime Payload: type) type {
 
         pub fn pendingCount(self: *const Self) usize {
             return self.nodes.count();
+        }
+
+        /// Release every timer still pending, without firing any of them.
+        ///
+        /// The third exit from the wheel next to fire and cancel: a driver that
+        /// is about to stop can hand every remaining payload to `on_drop`, which
+        /// is the same hook the other two exits call (as `cancelWith`'s
+        /// `on_cancel`) — that is what keeps "a payload is released exactly once"
+        /// true on all three paths. Returns how many timers were released.
+        ///
+        /// Owner thread only, like the rest of the mutating surface: the runtime
+        /// reaches it from the ticker (which owns the wheel) or, when the caller
+        /// drives `tick()` itself, from that caller's thread.
+        ///
+        /// Idempotent — a second call finds empty slots and reports 0 — which is
+        /// what lets the runtime's `shutdown()` stay idempotent.
+        pub fn drainAll(
+            self: *Self,
+            ctx: anytype,
+            comptime on_drop: fn (@TypeOf(ctx), Id, Payload) void,
+        ) usize {
+            self.assertOwner();
+            var dropped: usize = 0;
+            for (0..levels) |l| {
+                for (0..spokes) |s| {
+                    var it = self.slots[l][s];
+                    self.slots[l][s] = null;
+                    while (it) |node| {
+                        it = node.next;
+                        node.next = null;
+                        node.prev = null;
+                        on_drop(ctx, node.id, node.payload);
+                        self.allocator.destroy(node);
+                        dropped += 1;
+                    }
+                }
+            }
+            // Every live node was reachable from a slot, so what is left in the
+            // map is dangling keys. Cleared rather than deinit'd: the wheel stays
+            // usable without giving up the bucket allocation, and `deinit` still
+            // releases it.
+            self.nodes.clearRetainingCapacity();
+            return dropped;
         }
 
         /// Move time forward, firing everything due. `on_fire` is called for each
@@ -545,6 +589,49 @@ test "Wheel ownership: claiming is publish-and-idempotent" {
     try std.testing.expectEqual(std.Thread.getCurrentId(), wheel.ownerThread());
     wheel.claimOwner(); // same thread again: fine
     try std.testing.expectEqual(std.Thread.getCurrentId(), wheel.ownerThread());
+}
+
+test "Wheel drainAll releases every pending payload once, and only once" {
+    const W = Wheel(*u32);
+    const Freed = struct {
+        count: usize = 0,
+        fn onDrop(self: *@This(), _: W.Id, payload: *u32) void {
+            std.testing.allocator.destroy(payload);
+            self.count += 1;
+        }
+    };
+
+    var wheel = W.init(std.testing.allocator, 0);
+    defer wheel.deinit();
+    var freed = Freed{};
+
+    // One per level: 5 s and 60 s sit in coarser slots, so the drain has to walk
+    // the whole hierarchy rather than just level 0.
+    for ([_]i64{ 100, 5_000, 60_000 }) |deadline| {
+        const payload = try std.testing.allocator.create(u32);
+        payload.* = @intCast(deadline);
+        _ = try wheel.schedule(deadline, payload);
+    }
+    try std.testing.expectEqual(@as(usize, 3), wheel.pendingCount());
+
+    try std.testing.expectEqual(@as(usize, 3), wheel.drainAll(&freed, Freed.onDrop));
+    try std.testing.expectEqual(@as(usize, 3), freed.count);
+    try std.testing.expectEqual(@as(usize, 0), wheel.pendingCount());
+
+    // Idempotent: nothing is pending, so nothing may be handed to the hook again
+    // (that second call is where a double free would come from).
+    try std.testing.expectEqual(@as(usize, 0), wheel.drainAll(&freed, Freed.onDrop));
+    try std.testing.expectEqual(@as(usize, 3), freed.count);
+
+    // And the wheel is still usable: drained slots must not leave stale heads.
+    const after = try std.testing.allocator.create(u32);
+    after.* = 7;
+    _ = try wheel.schedule(200, after);
+    var rec = Recorder(*u32){};
+    defer rec.deinit();
+    _ = wheel.advance(300, &rec, Recorder(*u32).on_fire);
+    try std.testing.expectEqualSlices(*u32, &.{after}, rec.fired.items);
+    std.testing.allocator.destroy(after);
 }
 
 /// Records fires in order so tests can assert *which* timers fired and when.
