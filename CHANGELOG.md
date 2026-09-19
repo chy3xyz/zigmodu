@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.30.0] - 2026-09-20
 
 ### Scheduler Phase 2：N 条池线程（**破坏性：否**；默认宽度 1 = Phase 1 行为）
 
