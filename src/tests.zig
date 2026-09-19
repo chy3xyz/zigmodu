@@ -146,6 +146,8 @@ test "compile all source files" {
 
     // Runtime (v0.16): ring/mailbox/timer/pool/worker primitives
     _ = @import("runtime.zig");
+    // Allocation contract for the L0 hot paths (docs/RUNTIME.md §4–§6)
+    _ = @import("runtime/alloc_contract_test.zig");
 
     // AI boundary: ratcheted coupling + one-way seam (docs/AI_BOUNDARY.md)
     _ = @import("test/AiBoundary.zig");

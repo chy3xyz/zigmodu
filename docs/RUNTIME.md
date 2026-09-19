@@ -38,16 +38,27 @@ ZigModu Compatibility Principles
  2. Existing Application API remains stable.
  3. Existing DI API remains stable.
  4. Existing Application EventBus remains stable.
- 5. New Runtime APIs are additive.
+ 5. New Runtime APIs are additive — no existing Runtime call silently changes
+    meaning; a replacement is a deletion plus a documented migration (item 10).
  6. Hot-path runtime is opt-in.
  7. Distributed runtime is opt-in.
  8. Actor runtime is opt-in.
- 9. Existing applications require no migration.
-10. Breaking changes are reserved for 1.0.
+ 9. Existing applications that never touch `runtime` require no migration.
+10. Runtime API may break during 0.x — precedent: §9, v0.28.0 removed
+    `Runtime.cancelTimer(id) bool`. Application / Module / DI / EventBus / HTTP
+    keep the backward-compatibility promise above.
 ```
 
 落到实现上：
 
+- **兼容性是分层的，"0.x 不破坏"不成立**（第 5/9/10 条）：`runtime.*` 在 0.x 阶段允许 breaking
+  evolution，已发生的先例就是 **v0.28.0 删掉 `Runtime.cancelTimer(id) bool`** —— §9 路线图里那一行
+  （"定时器时间轮改为 **ticker-owned**"），迁移步骤在 `docs/UPGRADING.md` 的 v0.28.0 段。删它的理由
+  不是"改名字"，而是时间轮改成 ticker-owned 之后它再也回答不了"是否已取消"，留着就是**静默改义**。
+  `Application` / `Module` / `DI` / `EventBus` / HTTP 的公开契约不在这条允许范围内：它们只增不改
+  （第 1–4 条），所以"不碰 runtime 的应用升级不用动代码"仍然是一句可验证的话。运行时的每一次
+  breaking 都必须同时落进 §9 的路线图与 `docs/UPGRADING.md` 的对应版本段 —— 只写在 CHANGELOG 里
+  不算数。
 - `app.runtime()` 返回 `!*Runtime`，**首次调用才创建**；不调用 = 零线程、零定时器、行为与 v0.15 完全一致。
 - `Application.stop()` 先 `runtime.shutdown()`（join 所有 worker）**再**停模块 —— worker 可能在调模块服务，顺序不能反。
 - `Application.deinit()` 释放 runtime。
@@ -286,6 +297,12 @@ error.Full        阻塞等待（recv(0)）或超时（recv(ms)）
 L0 与 L1 是**两个通道，不是一个**：不要把热路径塞进 L1（它是为可读性与可靠性设计的），
 也不要把业务事件塞进 L0（它没有订阅模型、不落盘）。
 
+**"零分配"是可执行断言，不是形容词**：`src/runtime/alloc_contract_test.zig` 用计数分配器把 L0 的生产者
+路径（`Handle.send*` / `HotBus.publish` / `Mailbox.send*` / `RingBuffer` / `MpscRing` / `Sequencer.next`
+/ `Runtime.scheduleAction` / `requestCancelTimer`）钉死在 **0 次**分配，并对"本来就要分配"的入口写死
+**精确次数**（`Handle.after` 每次 1 个 payload、在调用线程上；`Wheel.schedule` 每个定时器 1 个 node）。
+将来谁往热路径塞一次 `allocator.dupe(...)`，`zig build test` 就会红，而不是等某次基准跑出漂移。
+
 ## 7. 何时不要用运行时
 
 - CRUD、后台管理、普通 API：模块 + service 已经够了，worker 只是多一层。
@@ -396,10 +413,10 @@ fn traceFromHeader(id: []const u8) zigmodu.runtime.TraceId {
 | **v0.20** | Workflow（状态机 + Saga + 补偿 + 检查点 + 恢复） | ⚠ 部分：Saga 补偿 + WAL 检查点 + 崩溃续跑 ✅（`SagaOrchestrator.resumeInstance` / `restoreFromWal`）；**`SagaStep.timeout_seconds` 已于 v0.25.0 真正生效**（超预算即补偿含该步、终态 `.timed_out`、返回 `error.SagaStepTimeout`）；**状态机仍未做**，`.step().compensate()` DSL 明确不做（`docs/WORKFLOW.md`） |
 | **v0.21** | Agent Runtime（Identity / Memory / Skills / Permissions / Budget 一等化） | ✅ 已发布：`ai.AgentSpec` + `ai.Guard`（已接进 `Agent.run`）+ `ai.ProposalPipeline` —— 见 `docs/AGENT_RUNTIME.md`；**Agent 的 State / Event subscriptions / Lifecycle 仍未做** |
 | **v0.22.0** | Agent 跑成 worker（`Agent → Worker → Event`） | ✅ `ai.AgentWorker`：`rt.spawn(ai.AgentWorker, …)` + `ai.agent_worker.post(...)`，有界邮箱 / 生命周期 / 监督 / 指标跟着来 —— 见 `docs/AGENT_RUNTIME.md` §六 |
-| **Unreleased** | EventRecorder v1：`Recorder(E, C)` + `HotBus.attachRecorder`（运行时投递流录制、按 seq 重放并驱动 `Clock.Manual`） | ✅ 本文档 §11.6（**尚未发版**；落盘、多事件类型、`Handle.send`/定时器投递不在 v1） |
-| **Unreleased** | 定时器时间轮改为 **ticker-owned**：`Runtime` 命令队列（`arm`/`cancel` 同一条 FIFO）+ 生产者侧 id/deadline；`cancelTimer` 拆成 `requestCancelTimer`（请求）/ `cancelTimerSync`（要结果） | ✅ 本文档 §3/§4（**Breaking**：旧的 `cancelTimer(id) bool` 已删） |
-| **Unreleased** | `shutdown()` 释放**已进轮**的待触发 payload（`Wheel.drainAll`，在 owner 线程上 drain）+ `RuntimeStats.timers_discarded` / `zigmodu_runtime_timers_discarded` | ✅ 本文档 §3/§4/§8（**非 Breaking**：补上 ticker-owned 那批的"未附带"项） |
-| **Unreleased** | `shutdown()` 顺序改为**先停 ticker 再拆 worker**（关掉 "ticker 向已 destroy 的 handle 投递" 的 use-after-free 窗口）+ `onTimerFire` 在 `alive = false` 时只 drop 不 post | ✅ 本文档 §3（**非 Breaking**：签名不变，只多一次 `alive` 读） |
+| **v0.28.0** | EventRecorder v1：`Recorder(E, C)` + `HotBus.attachRecorder`（运行时投递流录制、按 seq 重放并驱动 `Clock.Manual`） | ✅ 本文档 §11.6（落盘、多事件类型、`Handle.send`/定时器投递不在 v1） |
+| **v0.28.0** | 定时器时间轮改为 **ticker-owned**：`Runtime` 命令队列（`arm`/`cancel` 同一条 FIFO）+ 生产者侧 id/deadline；`cancelTimer` 拆成 `requestCancelTimer`（请求）/ `cancelTimerSync`（要结果） | ✅ 本文档 §3/§4（**Breaking**：旧的 `cancelTimer(id) bool` 已删 —— 第 2 节第 10 条那条分层契约的先例） |
+| **v0.28.0** | `shutdown()` 释放**已进轮**的待触发 payload（`Wheel.drainAll`，在 owner 线程上 drain）+ `RuntimeStats.timers_discarded` / `zigmodu_runtime_timers_discarded` | ✅ 本文档 §3/§4/§8（**非 Breaking**：补上 ticker-owned 那批的"未附带"项） |
+| **v0.28.0** | `shutdown()` 顺序改为**先停 ticker 再拆 worker**（关掉 "ticker 向已 destroy 的 handle 投递" 的 use-after-free 窗口）+ `onTimerFire` 在 `alive = false` 时只 drop 不 post | ✅ 本文档 §3（**非 Breaking**：签名不变，只多一次 `alive` 读） |
 | 1.0 | API 收敛、命名统一、deprecated 清理 | 计划 |
 
 ## 10. 最小示例
