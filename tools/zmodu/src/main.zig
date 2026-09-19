@@ -265,7 +265,7 @@ const zigmodu_zon_url = "https://github.com/chy3xyz/zigmodu/archive/refs/tags/v"
 /// release-specific and must be refreshed together with `build.zig.zon`.
 /// Get it from `zig build --fetch` in a project using `zigmodu_zon_url`: the
 /// "expected .hash = ..." hint is printed verbatim.
-const zigmodu_zon_hash = "zigmodu-0.27.0-U40vs9t8UgBlmRaJ7WNawmUCr_LZFk9H1XrKU44bvHk1";
+const zigmodu_zon_hash = "zigmodu-0.28.0-U40vs4cGVQCFwpTScKdQWKjl6jugZgP_vawmDFEk-Jnm";
 
 comptime {
     // The pinned hash can only be computed **after** the tag for its version

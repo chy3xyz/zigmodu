@@ -32,9 +32,9 @@
   {
     "name": "1L x10M events",
     "unit": "ratio",
-    "value": null,
+    "value": 0.8285,
     "normalized_by": "atomic RMW x10M",
-    "note": "pending: this class has no ratio yet (recorded as 17.73 ms absolute before the ratio criterion, 2026-09-19) — run scripts/check-bench.sh --update on the runner; see the header of that script"
+    "note": "recorded from run 35423924976 (region=eastus, AMD EPYC 7763, Linux 6.17.0-1022-azure)"
   },
   {
     "name": "10L x1M events",
@@ -89,8 +89,8 @@
   {
     "name": "atomic RMW x10M",
     "unit": "ms",
-    "value": null,
-    "note": "pending: the runner that recorded this file never measured this metric (added 2026-09-19); it is the machine reference the five entries below are divided by — run scripts/check-bench.sh --update on the runner, the gate WARNs and skips until then"
+    "value": 23.561,
+    "note": "recorded from run 35423924976 (region=eastus, AMD EPYC 7763, Linux 6.17.0-1022-azure)"
   },
   {
     "name": "RingBuffer SPSC x1M",
@@ -100,16 +100,16 @@
   {
     "name": "Mailbox post+drain x1M",
     "unit": "ratio",
-    "value": null,
+    "value": 0.7411,
     "normalized_by": "atomic RMW x10M",
-    "note": "pending: this class has no ratio yet (recorded as 15.35 ms absolute before the ratio criterion, 2026-09-19) — run scripts/check-bench.sh --update on the runner; see the header of that script"
+    "note": "recorded from run 35423924976 (region=eastus, AMD EPYC 7763, Linux 6.17.0-1022-azure)"
   },
   {
     "name": "Mailbox full-path x10M",
     "unit": "ratio",
-    "value": null,
+    "value": 2.0976,
     "normalized_by": "atomic RMW x10M",
-    "note": "pending: this class has no ratio yet (recorded as 49.44 ms absolute before the ratio criterion, 2026-09-19) — run scripts/check-bench.sh --update on the runner; see the header of that script"
+    "note": "recorded from run 35423924976 (region=eastus, AMD EPYC 7763, Linux 6.17.0-1022-azure)"
   },
   {
     "name": "TimerWheel x100K",
@@ -119,9 +119,9 @@
   {
     "name": "HotBus 8sub x1M",
     "unit": "ratio",
-    "value": null,
+    "value": 0.9359,
     "normalized_by": "atomic RMW x10M",
-    "note": "pending: this class has no ratio yet (recorded as 18.88 ms absolute before the ratio criterion, 2026-09-19) — run scripts/check-bench.sh --update on the runner; see the header of that script"
+    "note": "recorded from run 35423924976 (region=eastus, AMD EPYC 7763, Linux 6.17.0-1022-azure)"
   },
   {
     "name": "ObjectPool x1M",
@@ -131,9 +131,9 @@
   {
     "name": "Sequencer x10M",
     "unit": "ratio",
-    "value": null,
+    "value": 1.0085,
     "normalized_by": "atomic RMW x10M",
-    "note": "pending: this class has no ratio yet (recorded as 20.61 ms absolute before the ratio criterion, 2026-09-19) — run scripts/check-bench.sh --update on the runner; see the header of that script"
+    "note": "recorded from run 35423924976 (region=eastus, AMD EPYC 7763, Linux 6.17.0-1022-azure)"
   },
   {
     "name": "Worker spawn+join x1K",
