@@ -252,7 +252,7 @@ defer app.stop();   // 先请求停止 + join worker，再停模块
 | `RingBuffer(T, N)` | 1 生产者 / 1 消费者 | 无 CAS（各自只读对方指针）；N 必须 2 的幂 |
 | `MpscRing(T, N)` | N 生产者 / 1 消费者 | Vyukov 有界队列；**N ≥ 2**（N=1 时序号无法区分"空"与"未消费"，编译期拒绝） |
 | `Mailbox(T, N)` | N 生产者 / 1 消费者 | 有界 + 阻塞；`send` 满即 `error.Full`，`sendBlocking` 换延迟；`close()` 唤醒等待者 |
-| `Wheel(Payload)` | **单线程驱动（ticker 独占）** | 分层时间轮，O(1) 插入/取消；10ms 粒度、5 层、最长 ~124 天；`advance(now)` 的语义是"到期即发、不到期不发"——走过的槽整槽过期，`now` 所在的槽只发到期的那部分（没到期的留到下一个 tick），所以 10ms 槽粒度不写进延迟上界（§3）。长停摆走 O(pending) 扫描。**零锁**：`schedule`/`cancel`/`advance`/`drainAll` 只有驱动它的那一个线程能调（Debug/ReleaseSafe 下 `claimOwner`+`assertOwner` 会拦）；跨线程只通过 `Runtime` 的有界命令队列交接，见 §3「`after` 到底做了什么」。`drainAll` 是 fire/cancel 之外的第三个出口：停机时把还在轮里的 payload 交给同一个 `drop` 钩子 |
+| `Wheel(Payload)` | **单线程驱动（ticker 独占）** | 分层时间轮，O(1) 插入/取消；10ms 粒度、5 层、最长 ~124 天；`advance(now)` 的语义是"到期即发、不到期不发"——走过的槽整槽过期，`now` 所在的槽只发到期的那部分（没到期的留到下一个 tick），所以 10ms 槽粒度不写进延迟上界（§3）。长停摆走 O(pending) 扫描。**零锁**：`schedule`/`cancel`/`advance`/`drainAll` 只有驱动它的那一个线程能调（Debug/ReleaseSafe 下 `claimOwner`+`assertOwner` 会拦）；跨线程只通过 `Runtime` 的有界命令队列交接，见 §3「`after` 到底做了什么」。`drainAll` 是 fire/cancel 之外的第三个出口：停机时把还在轮里的 payload 交给同一个 `drop` 钩子。id 索引是**数组哈希表**（不是 `AutoHashMapUnmanaged`），理由见下 |
 | `ObjectPool(T)` | 多线程 | 定容 + 自旋锁；`acquire` **不分配**，耗尽返回 null（把流量高峰变成"削峰"而不是 OOM） |
 | `Clock` | 值类型 | `.monotonic`（生产）/ `.manual`（测试：不睡觉就能推动一小时定时器） |
 | `Sequencer` | 多线程 | 无锁单调序列：`next()` / `nextBatch(n)` / `advanceTo()`；**不是时钟**（只在进程生命期内有意义） |
@@ -274,6 +274,25 @@ Debug/ReleaseSafe 下把"第二个线程碰它"变成调用点 panic，ReleaseFa
 **`Clock.Manual.advance` 只在测试 driver / ticker owner 线程上调**：`Manual` 是给"自己驱动"的场景用的
 （`tick()` 那条路），谁驱动谁推进；生产里是 `.monotonic`，没人写它。别让一个生产者线程去推时钟 ——
 那又是"生产者写、ticker 读"的老问题换了个字段。
+
+**为什么 id 索引是数组哈希表而不是 `std.AutoHashMapUnmanaged`**：`nodes`（id → node）在运行时里的形状是
+**长生命周期 + 永远新鲜的 id** —— 轮活整个进程，每一次 `after()` 都是一个新 id。`HashMapUnmanaged` 用墓碑
+删除，而它的增长预算（`available`）把墓碑**也算作可用**，于是表能被墓碑填满：本机实测（200 轮 × 100 个定时器，
+每轮全部触发，id 不重复）得到 256 槽里 206 个墓碑、**0 个空槽**，此后每次查找都要走完整个表 ——
+同一份测量在新轮上 15.0 ns、在老化轮上 203.9 ns（**13.6×**，ReleaseFast；Debug 173.3 → 2143.9，12.4×）。
+这个状态**不会自己恢复**：之后每次插入回收一个墓碑而不是消耗空槽（吸收态），而增长要求
+`size == max_load`，100 个活定时器永远到不了。容量大小不是变量 —— 把表预撑到 131072 槽（2MB）照样排干到 0 个空槽，
+而 4194304 槽且**有空槽**的表比 256 槽无空槽的表快 15 倍：变的是"探测到第一个真空槽要走多远"。
+
+`AutoArrayHashMapUnmanaged` 用后移删除，没有墓碑；它的索引重建规则保证占用 ≤ 60%，空槽是结构性保证、
+不是 churn 历史的函数。同样 churn 之后比值是 0.65×–0.99×（三种优化模式、两种分配器），即"老化不改变查找代价"。
+`TimerWheel x100K`（10 万个定时器铺开、一次 `advance` 全触发）没有回退：门禁测量 7.02 ms 对基线 6.808 ms（1.03×）。
+分配契约**没有变化**：首次 `schedule` 仍是 2 次分配（node + 数组；数组哈希表在条目数 ≤ 8 时只有 entries 一个分配，
+索引头要到第 9 个条目才出现）、`cancel`/`advance`/`drainAll` 仍是 0 次 —— `src/runtime/alloc_contract_test.zig`
+的精确断言原样通过，一个数字都没改。这条性质由两处守着：`timer_wheel.zig` 的
+`a long-lived wheel's lookups do not get slower as it ages`（老实现下**红**：13.6×/10.6×/12.4×，分别对应
+ReleaseFast/ReleaseSafe/Debug），以及基准的 `TimerWheel churn x1M`（`[med3]`，已进基线；老实现 265.5 ns/schedule+fire，
+新实现 27.6 ns，9.6×）。
 
 ## 5. 背压语义（这是运行时的核心承诺）
 

@@ -148,6 +148,30 @@
 # that will check it (`--update`, then review the diff) rather than widening
 # BENCH_THRESHOLD.
 #
+# `TimerWheel churn x1M` is the one entry added since the v0.27.0 recording
+# (2026-09-19: `--update`, then every other entry restored by hand from the
+# previous file, so that commit's baseline diff is that one entry and nothing
+# else — the same run measured several untouched metrics 1.2-1.3x high under
+# background load, which is why the restore matters). It exists because the wheel
+# metric the suite already had, `TimerWheel x100K`, builds a wheel and drops it:
+# every insert goes into a map that has never held anything, while the runtime's
+# wheel lives for the whole process (`src/runtime/runtime.zig`). Same loop, same op
+# count, measured on this laptop: **265.46 ms** on a wheel reused for the run
+# against the `AutoHashMapUnmanaged` id index `src/runtime/timer_wheel.zig` used
+# then, **28.19 ms** after that index became an `AutoArrayHashMapUnmanaged` —
+# a 9.4x no fresh-wheel harness can show, and the recorded 28.193 ms is the
+# `--update` run's value. `TimerWheel x100K` is unaffected in the judged run
+# (7.24 ms against 6.808 ms, 1.06x). Mechanism: `docs/RUNTIME.md` §4, the `nodes`
+# field's comment, and the `a long-lived wheel's lookups do not get slower as it
+# ages` test in that file.
+#
+# The CI file (`scripts/bench-baseline.ci.json`) does **not** carry that entry
+# yet. Recording it from this laptop would bake a value from the wrong machine
+# class into a file whose whole point is that the two classes are not comparable
+# (see the two-baselines note below), so until a run on the runner records it the
+# gate reports it as a WARN ("this machine class has not recorded them") and still
+# passes. Do not copy the laptop value over.
+#
 # Two baselines exist because there are two machine classes, and one absolute
 # baseline cannot serve both:
 #

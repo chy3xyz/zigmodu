@@ -628,6 +628,66 @@ fn benchTimerWheel(allocator: std.mem.Allocator, count: usize) !f64 {
     return ms;
 }
 
+/// How many timers the churn metric keeps live, and how many times it arms and
+/// fires them. 100x10000 = 1M schedule+fire cycles, which is what puts it above
+/// the ~5 ms floor at both the fixed and the unfixed cost (measured: ~28 ms fixed,
+/// ~265 ms before the fix — see `benchTimerWheelChurn`).
+const timer_churn_live = 100;
+const timer_churn_rounds = 10_000;
+
+/// The **production shape**: *one* wheel, alive for the whole run, taking the
+/// traffic a long-lived ticker actually sees — a modest live set, fresh ids every
+/// time, fire and re-arm forever.
+///
+/// This is a different question from `benchTimerWheel` above, and the difference
+/// is not academic. That harness builds a wheel, arms it and drops it: every
+/// insert goes into a map that has never held anything, so it measures the
+/// *cheapest* state a `Wheel` is ever in. The runtime's wheel is the other shape
+/// — `src/runtime/runtime.zig` holds one for the process's lifetime and the
+/// ticker drives it forever — and a wheel that has been churning for a while is
+/// in a state a fresh wheel never reaches. Measured on this host, same loop, same
+/// op count: **a wheel reused for the run cost 234-245 ns per `schedule` against
+/// 28.3 ns for one rebuilt every round** (8.3x), a number no other metric in this
+/// suite could have shown. The cause was the `nodes` map's tombstone probe
+/// behaviour, not the wheel's own code; `timer_wheel.zig`'s `nodes` field and the
+/// `a long-lived wheel's lookups do not get slower as it ages` test in that file
+/// carry the mechanism.
+///
+/// So this row is the one that fails if the wheel ever goes back to a structure
+/// whose per-op cost depends on how long it has been alive. It is deliberately
+/// shaped like the runtime's use and not like a worst case: 100 timers live, one
+/// `advance` per round that takes them all out, ids from a counter that never
+/// repeats, deadlined over half a level-0 rotation so `advance` walks slots one
+/// by one (`timer_span_ms`) instead of taking the long-stall rescan. Cost is
+/// ~28 ms per sample after the fix, 3 samples per run.
+fn benchTimerWheelChurn(allocator: std.mem.Allocator, rounds: usize) !f64 {
+    var wheel = rt.Wheel(u64).init(allocator, 0);
+    defer wheel.deinit();
+    var fired = TimerFireCounter{};
+    const slots_used = timer_span_ms / rt.timer_wheel.slot_ms;
+
+    var now_ms: i64 = 0;
+    var id: u64 = 1;
+    const t0 = now();
+    for (0..rounds) |_| {
+        for (0..timer_churn_live) |k| {
+            const tick: i64 = @intCast(k % @as(usize, @intCast(slots_used)));
+            try wheel.scheduleWithId(id, now_ms + (tick + 1) * rt.timer_wheel.slot_ms, @intCast(k));
+            id += 1;
+        }
+        _ = wheel.advance(now_ms + timer_span_ms, &fired, TimerFireCounter.onFire);
+        now_ms += timer_span_ms;
+    }
+    const ms = elapsedMs(t0);
+
+    // Armed and fired as well as timed: every id is distinct and every round's
+    // `advance` has to take its 100 back out, so a harness that stopped inserting
+    // (or one whose ids collided) fails here instead of recording a fast number.
+    if (wheel.pendingCount() != 0) return error.BenchTimerWheelLeaked;
+    if (fired.fired != @as(u64, rounds) * timer_churn_live) return error.BenchTimerWheelLostTimers;
+    return ms;
+}
+
 const bench_bus_subscribers = 8;
 
 const BusCounter = struct {
@@ -1224,6 +1284,17 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("  {s}  {d:.2} ms  ({d:.0} timers/s)\n", .{ name, ms, 100_000.0 / ms * 1000.0 });
     }
     {
+        // The other half of the same question: not "what does arming cost" but
+        // "what does arming cost on a wheel that has been arming for a while".
+        // See `benchTimerWheelChurn` — this is the row that catches a regression
+        // no fresh-wheel harness can see.
+        const name = "TimerWheel churn x1M";
+        const ms = try median3(name, benchTimerWheelChurn, .{ harness_allocator, timer_churn_rounds });
+        try results.append(a, .{ .name = name, .value = ms });
+        const ops = @as(f64, timer_churn_rounds) * timer_churn_live;
+        std.debug.print("  {s}  {d:.2} ms  ({d:.1} ns per schedule+fire, {d} live)\n", .{ name, ms, ms * 1e6 / ops, @as(u32, timer_churn_live) });
+    }
+    {
         const name = "HotBus 8sub x1M";
         const ms = try median3(name, benchHotBus, .{ a, 1_000_000 });
         try results.append(a, .{ .name = name, .value = ms });
@@ -1305,6 +1376,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("\n-- Latency distribution (p50 / p95 / p99 / p99.9, ns per op) --\n", .{});
     std.debug.print("  {d} batches per metric, one clock pair per batch, nearest-rank quantiles over the\n  batch samples. Observation only: the gate judges the `[med3]` values above, not these.\n", .{pct_batches});
     std.debug.print("  Not sampled here: `TimerWheel x100K` — its per-turn cost is the size of the live wheel\n  (100k nodes), which no 100-op batch holds; its `[med3]` number above is unaffected.\n", .{});
+    std.debug.print("  Not sampled here either: `TimerWheel churn x1M` — what it measures is what a wheel costs\n  *after* churning, and a batch that rebuilds the fixture is only a few rounds old (the same\n  fixture-dominates-the-sample rule that keeps `findById x20K` out).\n", .{});
 
     const latency_section_t0 = now();
     var latency = LatencyRun{ .allocator = a, .injector = try LatencyInjector.fromEnv(init.environ_map), .medians = &results };

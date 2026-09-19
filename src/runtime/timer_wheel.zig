@@ -102,7 +102,39 @@ pub fn Wheel(comptime Payload: type) type {
         index: [levels]u64 = @splat(0),
         now_ms: i64 = 0,
         slots: [levels][spokes]?*Node = @splat(@splat(null)),
-        nodes: std.AutoHashMapUnmanaged(Id, *Node) = .empty,
+        /// `id → node`, the only lookup structure the wheel has.
+        ///
+        /// An **array** hash map, not `AutoHashMapUnmanaged`, and that is a
+        /// correctness-of-cost decision rather than a taste one. `HashMapUnmanaged`
+        /// deletes by tombstone, and a miss has to probe until it finds a
+        /// genuinely free slot — but its growth budget counts a tombstone as
+        /// available, so the table can fill up with tombstones while
+        /// `capacity() - count()` still reads as headroom. A long-lived wheel with
+        /// fresh ids every time (every `after()` mints one) reaches exactly that
+        /// state: measured here, 100 live timers in a 128-slot table went to 128
+        /// tombstones and **0 free slots** and stayed there — the state is
+        /// absorbing, because from then on every insert recycles a tombstone
+        /// instead of consuming a free slot, and nothing recovers it (growth
+        /// needs `size == max_load`, which a live set of 100 never reaches).
+        /// Each `schedule` then walks the entire table to prove its id is absent:
+        /// 234-245 ns/op for a wheel reused for 1000 rounds, against 28.3 ns/op
+        /// for a fresh wheel per round in the same interleaved loop (8.3x), and
+        /// 13.3 ns/op once that churn runs on the structure below (17.6x). A wheel
+        /// reused with a **repeated** id set is 25 ns/op — those inserts find
+        /// their own tombstone immediately, which is why this stayed invisible
+        /// for so long.
+        ///
+        /// `AutoArrayHashMapUnmanaged` deletes by backward shift, so no slot is
+        /// ever a tombstone; its index is rebuilt to stay at most 60% full, so
+        /// the empty slots a miss probes for are a structural guarantee rather
+        /// than a function of the churn's history: the same 1000-round churn is
+        /// 13.8 ns/op and flat from round 1 to round 1000. It costs no more per
+        /// removal either (`swapRemove` moves the last entry into the hole, and
+        /// the wheel holds no pointer into the map): 16 ns against 14 ns measured
+        /// on the cancel path. Both halves of that are guarded now — the
+        /// `a long-lived wheel's lookups do not get slower as it ages` test below,
+        /// and `TimerWheel churn x1M` in `src/benchmark.zig`.
+        nodes: std.AutoArrayHashMapUnmanaged(Id, *Node) = .empty,
         next_id: Id = 1,
         fired: u64 = 0,
         cancelled: u64 = 0,
@@ -116,8 +148,7 @@ pub fn Wheel(comptime Payload: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            var it = self.nodes.valueIterator();
-            while (it.next()) |node| self.allocator.destroy(node.*);
+            for (self.nodes.values()) |node| self.allocator.destroy(node);
             self.nodes.deinit(self.allocator);
             self.slots = @splat(@splat(null));
             self.* = undefined;
@@ -199,7 +230,7 @@ pub fn Wheel(comptime Payload: type) type {
         /// The payload is not touched: if it owns memory, use `cancelWith`.
         pub fn cancel(self: *Self, id: Id) bool {
             self.assertOwner();
-            const node = self.nodes.fetchRemove(id) orelse return false;
+            const node = self.nodes.fetchSwapRemove(id) orelse return false;
             self.unlink(node.value);
             self.allocator.destroy(node.value);
             self.cancelled += 1;
@@ -216,7 +247,7 @@ pub fn Wheel(comptime Payload: type) type {
             comptime on_cancel: fn (@TypeOf(ctx), Id, Payload) void,
         ) bool {
             self.assertOwner();
-            const node = self.nodes.fetchRemove(id) orelse return false;
+            const node = self.nodes.fetchSwapRemove(id) orelse return false;
             const payload = node.value.payload;
             self.unlink(node.value);
             self.allocator.destroy(node.value);
@@ -367,7 +398,7 @@ pub fn Wheel(comptime Payload: type) type {
                 node.next = null;
                 node.prev = null;
                 if (node.deadline_ms <= fire_before) {
-                    _ = self.nodes.remove(node.id);
+                    _ = self.nodes.swapRemove(node.id);
                     on_fire(ctx, node.id, node.payload);
                     self.allocator.destroy(node);
                     fired_now += 1;
@@ -415,7 +446,7 @@ pub fn Wheel(comptime Payload: type) type {
                     if (next) |n| n.prev = prev;
                     node.prev = null;
                     node.next = null;
-                    _ = self.nodes.remove(node.id);
+                    _ = self.nodes.swapRemove(node.id);
                     on_fire(ctx, node.id, node.payload);
                     self.allocator.destroy(node);
                     fired_now += 1;
@@ -536,7 +567,7 @@ pub fn Wheel(comptime Payload: type) type {
                         node.prev = null;
                         still_pending.append(self.allocator, node) catch {
                             // Out of memory while deferring: fire instead of losing.
-                            _ = self.nodes.remove(node.id);
+                            _ = self.nodes.swapRemove(node.id);
                             on_fire(ctx, node.id, node.payload);
                             self.allocator.destroy(node);
                             continue;
@@ -550,7 +581,7 @@ pub fn Wheel(comptime Payload: type) type {
             var fired_now: usize = 0;
             for (still_pending.items) |node| {
                 if (node.deadline_ms <= now_ms) {
-                    _ = self.nodes.remove(node.id);
+                    _ = self.nodes.swapRemove(node.id);
                     on_fire(ctx, node.id, node.payload);
                     self.allocator.destroy(node);
                     fired_now += 1;
@@ -947,6 +978,121 @@ test "Wheel scheduleWithId keeps the caller's id (the runtime mints its own)" {
     const minted = try wheel.schedule(100, 6);
     try std.testing.expectEqual(@as(u64, 1), minted);
     try std.testing.expectEqual(@as(usize, 1), wheel.pendingCount());
+}
+
+/// Time `count` lookups that cannot hit anything, and report ns per lookup.
+///
+/// A `cancel` that finds no timer allocates nothing and frees nothing, so what
+/// this measures is the id index's own probe cost with no allocator in the loop.
+/// `schedule` would drag one in, and `std.testing`'s allocator costs more per
+/// call than the difference this test is about. Returns the best of three
+/// batches: the minimum is the least noisy statistic available for a host that
+/// is running anything else.
+fn missProbeNs(wheel: anytype, count: usize) !f64 {
+    var best: f64 = std.math.inf(f64);
+    for (0..3) |_| {
+        var hits: usize = 0;
+        const t0 = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+        for (0..count) |i| {
+            // Fixed id set, drawn from a range the churn never uses, so both
+            // windows probe the same slots and every probe is a miss.
+            if (wheel.cancel(probe_id_base + i)) hits += 1;
+        }
+        const t1 = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+        if (hits != 0) return error.ProbeMatchedALiveTimer;
+        best = @min(best, @as(f64, @floatFromInt(t1 - t0)) / @as(f64, @floatFromInt(count)));
+    }
+    return best;
+}
+
+const probe_id_base: u64 = 9_000_000_000;
+const probe_batch: usize = 4_000;
+
+// The production shape, as a property: **a wheel that has been churning for a
+// while must not look an id up any more slowly than a fresh one.**
+//
+// Every other test in this file drives a short-lived wheel — arm it, fire it,
+// drop it — and a wheel that has only ever inserted is in the cheapest state its
+// index will ever be in. The runtime's wheel is the other shape: one instance
+// lives for the whole process (`src/runtime/runtime.zig`) and the ticker drives
+// it forever, so what an application pays per `after()` is the cost of an *aged*
+// wheel. That difference is neither small nor visible from a fresh wheel.
+//
+// Measured on this host with the map this test was written against (an
+// `AutoHashMapUnmanaged`, which deletes by tombstone and counts a tombstone as
+// available for growth): the churn below left a 256-slot table with 206
+// tombstones and **0 free slots** — every slot either held a live timer or was a
+// tombstone a probe cannot stop at — and a lookup then walked all 256 of them,
+// **10.4x to 15.2x** its fresh-wheel cost in every build mode measured
+// (ReleaseFast 14.1 -> 204.6 ns, ReleaseSafe 19.4 -> 201.1, Debug 179 -> 2031),
+// permanently, because from then on each insert recycles a tombstone instead of
+// consuming a free slot. With the `AutoArrayHashMapUnmanaged` the wheel uses now
+// (backward-shift delete, no tombstones) the same churn leaves the probe cost
+// where it was: 0.65x-0.99x in the same three modes. The `nodes` field's comment
+// carries the full mechanism, and `src/benchmark.zig`'s `TimerWheel churn x1M`
+// carries the end-to-end version of this number on the wheel's own `schedule`.
+//
+// The bound is a *ratio* between two windows of the same wheel, measured with
+// the same instrument on the same id set, so a slow or busy host moves both and
+// the check keeps its meaning. 3.0x is an order of magnitude below what a
+// tombstone-filled index costs and several times above what host noise puts
+// between two windows of a healthy one.
+test "Wheel: a long-lived wheel's lookups do not get slower as it ages" {
+    const churn_rounds = 200;
+    const live = 100;
+    // A small live set held across the whole churn, so the map is *not* empty
+    // when each window is measured. That is the state a lookup runs against in
+    // production (a `cancel` arrives while other timers are pending), and it is
+    // also the only state in which this measurement means anything: on an empty
+    // map a lookup is answered without probing at all.
+    const held = 50;
+    const span_ms = max_cascade_ms / 2;
+    const slots_used = span_ms / slot_ms;
+    // The runtime's `after()` takes its id from a lock-free `Sequencer`, so a
+    // real wheel never sees the same id twice — that, and not the wheel's own
+    // code, is what turns the churn below into the state this test is about.
+    const first_id: u64 = 1_000_000;
+    const held_id_base: u64 = 5_000_000_000;
+
+    var wheel = Wheel(u32).init(std.testing.allocator, 1_000);
+    defer wheel.deinit();
+    var rec = Recorder(u32){};
+    defer rec.deinit();
+
+    // Far enough out that the churn's own clock (200 x 320 ms) never reaches
+    // them, so the live set is the same in both windows.
+    var held_id = held_id_base;
+    for (0..held) |k| {
+        try wheel.scheduleWithId(held_id, 400_000 + @as(i64, @intCast(k)), @intCast(k));
+        held_id += 1;
+    }
+
+    const fresh = try missProbeNs(&wheel, probe_batch);
+
+    var now_ms: i64 = 1_000;
+    var id = first_id;
+    for (0..churn_rounds) |_| {
+        for (0..live) |k| {
+            const tick: i64 = @intCast(k % @as(usize, @intCast(slots_used)));
+            _ = try wheel.scheduleWithId(id, now_ms + 1 + tick * slot_ms, @intCast(k));
+            id += 1;
+        }
+        _ = wheel.advance(now_ms + span_ms, &rec, Recorder(u32).on_fire);
+        now_ms += span_ms;
+    }
+    // Churned, not skipped: every timer armed in the churn was fired, and the
+    // only ones still pending are the held set.
+    try std.testing.expectEqual(@as(usize, churn_rounds * live), rec.fired.items.len);
+    try std.testing.expectEqual(@as(usize, held), wheel.pendingCount());
+
+    const aged = try missProbeNs(&wheel, probe_batch);
+    if (aged > fresh * 3) {
+        std.debug.print(
+            "[timer wheel] a miss cost {d:.1} ns on a fresh wheel and {d:.1} ns after {d} rounds of churn ({d:.1}x)\n",
+            .{ fresh, aged, churn_rounds, aged / fresh },
+        );
+    }
+    try std.testing.expect(aged <= fresh * 3);
 }
 
 test "Wheel ownership: claiming is publish-and-idempotent" {
