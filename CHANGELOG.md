@@ -2,6 +2,45 @@
 
 ## [Unreleased]
 
+### Benchmark 门禁：给"原子路径"指标加同轮机器参考（**破坏性：否**）
+
+CI 的 Benchmark 闸门（`bash scripts/check-bench.sh`）在 `2462e70` 上稳定报红（两次 attempt 比值只差
+1.3%），但红的是**宿主**不是代码。证据：受影响的是"每轮路径全是原子 RMW"的五条（`Mailbox post+drain`、
+`Mailbox full-path`、`HotBus 8sub`、`Sequencer x10M`、`1L x10M events`），而同一次 run 里对照指标是
+有记录以来最快的（前一次红则是反过来的形态：整机慢 1.09-1.45×，这五条只动 1.00-1.18×）；
+`x86_64-linux` 上 base / head 两份二进制的计时循环**逐条指令相同**（`benchEventBus` 2683 条全等，
+`benchmark.main` 只差 2 条且都在冷路径），两种 CPU 模型下都成立；本机 A/B（8 轮）与 Linux 交叉编译 A/B（5 轮）
+全平（±1.5%）；12 套历史带里这五条从未超过自身最小值的 1.3×。
+
+- **新指标 `atomic RMW x10M`**（`src/benchmark.zig` 的 `benchAtomicRmw`，runtime 分组第一条）：
+  一次 `std.atomic.Value(u64).fetchAdd(1, .monotonic)` 的紧循环，10M 次，本机 ~22 ms。
+  它**不是**框架指标，是"这台机器的原子路径有多快"的同轮标尺。
+- **两种判据**：`Mailbox post+drain`、`Mailbox full-path`、`HotBus 8sub`、`Sequencer x10M`、
+  `1L x10M events` 改成 `指标 ÷ 'atomic RMW x10M'`（同一轮的两个中位数相除）对**比值**用 2.0× 阈值；
+  其余 21 条仍是绝对毫秒。比值把宿主换代约掉，绝对判据留下的部分会把它当成代码回归。
+- **`atomic RMW x10M` 本身只报告、不判定**：给它绝对阈值等于"宿主换代就红"，正是这次要修的病因；
+  它偏离记录值超过阈值时打印 host note（并说明这一条就是机器，不进入 verdict）。
+- **基线格式向后兼容**：条目要么照旧 `{name, unit:"ms", value}`，要么
+  `{name, unit:"ratio", value, normalized_by:"atomic RMW x10M"}`（`value` = 指标 ÷ 参考，均为同一轮中位数）。
+  `value: null` 表示"这个机器档还没录比值"——闸门 WARN 并跳过（与"基线不认识的指标"同语义，不失败）；
+  基线条目与判据清单不一致时**报 mismatch 而不是照比**（拿 0.77 去比 16.9 ms 会全过）。
+- **闸门输出**：开头与 verdict 都打印 `region=… cpu=… cores=…`（region 取 `BENCH_REGION` → Azure IMDS →
+  取不到打 `?`，**不因此失败**），并分开打印 `[absolute]` / `[ratio]` 两类判据（绿的时候也把 5 条比值和
+  基线比值列出来）。
+- **反证（真回归仍抓得到）**：给 `benchSequencer` 的每次取号插一对
+  `harness_allocator.create/destroy`（热路径多一次分配）→ 闸门 **exit 1**，点名
+  `[ratio] Sequencer x10M: baseline ratio 1.0310 → actual 6.7544（= 147.407 ms ÷ atomic RMW x10M
+  21.824 ms）(+555.1%)`；还原后 `src/benchmark.zig` 的 sha256 逐字节一致。顺带测到：在
+  `benchMailbox` 里插同样的分配只让比值 0.7902 → 1.09（+38%），**不触发** —— 2.0× 本来就是给量级滑落留的，
+  这次改动没有降低它的灵敏度（比值阈值≈绝对阈值）。
+- **基线**：`scripts/bench-baseline.json` 用 `--update`（未 `--force`）只动了 6 条（新增参考 + 5 条转比值），
+  其余 20 条保持原值（`--update` 会全量重写，故按其头部约定手工还原了与本次无关的漂移）。
+  `scripts/bench-baseline.ci.json` 无法在本地录：那 6 条写成 `value: null` 占位，CI 首次运行 **WARN 并跳过**，
+  待 runner 上 `--update` 补录（**不要**整份重录）。本次实测该路径：本机对 CI 基线 exit 1 只报
+  `RingBuffer SPSC x1M`（文件头部早有记载的跨平台差异），那 6 条按预期只 WARN。
+- 文档：`scripts/check-bench.sh` 头部记下这轮证据与两种判据的取舍，`docs/BEST_PRACTICES.md`
+  新增"性能门禁的两种判据"一节。生产代码公开签名未动。
+
 ### `shutdown()` 先停 ticker 再拆 worker —— 收掉停机窗口的 use-after-free（**破坏性：否**）
 
 `shutdown()` 原来是"先 `request_stop`/join/`destroy` 所有 worker，再停 ticker"。夹在中间的那段窗口里

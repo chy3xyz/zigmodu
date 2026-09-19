@@ -170,11 +170,113 @@
 #     metric across the two is meaningless: a laptop run against the CI file
 #     fails on it and on nothing else (9.96x). Read that as a platform
 #     difference, not a regression.
+#
+# ── Two criteria, because the old one held the host still too (2026-09-19) ──
+#
+# An absolute millisecond value is a statement about two things at once — the code
+# and the host that ran it — and a threshold on it cannot tell them apart. The
+# Benchmark job failed on `2462e70` (reproducibly: two attempts 1.3% apart) on
+# exactly the metrics whose per-turn path is atomic read-modify-writes, while the
+# machine as a whole was *not* slower: that run's control metrics were the fastest
+# on record, while `Mailbox post+drain x1M`, `Mailbox full-path x10M`,
+# `HotBus 8sub x1M`, `Sequencer x10M` and `1L x10M events` came back 2.59-4.63x
+# their baseline values. The previous failure looked the same with the sign
+# flipped: the host was 1.09-1.45x slower overall and those same five moved only
+# 1.00-1.18x. The code was excluded separately, at the instruction level: the
+# `x86_64-linux` base and head binaries contain the timed loops instruction for
+# instruction (`benchEventBus`: 2683 instructions, all identical; `benchmark.main`
+# differs by 2, both on a cold path), under two CPU models, and A/B runs on this
+# laptop (8 rounds) and cross-compiled on Linux (5 rounds) are flat within ±1.5%.
+# Across 12 recorded host generations the five never exceeded 1.3x of their own
+# minimum — until two runs landed on a region whose atomic path is several times
+# slower.
+#
+# So the gate now measures the host, in the same run, and divides by it. The suite
+# grew one metric that does nothing else — `atomic RMW x10M`, a bare
+# `fetchAdd(1, .monotonic)` loop (`src/benchmark.zig`, `benchAtomicRmw`) — and the
+# five atomic-path metrics above are compared as `metric / atomic RMW x10M`, both
+# medians from the *same* run, which cancels the host generation. Everything else
+# stays on the absolute criterion it was recorded with: normalizing helps only
+# where the metric tracks the reference, and the metrics whose work is in the
+# allocator, the SQLite driver, a mutex or thread creation do not.
+#
+#   * A ratio is still a ratio of *code*: an extra allocation, an extra lock or a
+#     second atomic in a normalized metric raises the ratio and fails the gate
+#     exactly as it did on absolute milliseconds. Measured rather than assumed: one
+#     `harness_allocator.create/destroy` pair per turn inside `benchSequencer` (10M
+#     turns of ~2 ns) drove `Sequencer x10M` from ratio 1.0310 to 6.7544 and the gate
+#     exited 1 naming it. The same pair inside `benchMailbox` moved its ratio
+#     0.7902 -> 1.09 (+38%) and did *not* fire — 2.0x is calibrated for the
+#     order-of-magnitude slip, and normalization did not change that (the ratio
+#     threshold is the same 2.0x the absolute one was). The counter-proof is
+#     recorded in the CHANGELOG entry for this change.
+#   * The reference is recorded but deliberately *not* gated on the absolute
+#     criterion: an absolute threshold on the host's own atomic cost fires exactly
+#     when the host generation changes, which is the failure this section exists to
+#     remove. When it lands more than THRESHOLD away from its recorded value the
+#     gate says so as a host note and keeps it out of the verdict. A benchmark-side
+#     bug in it would show up as a smaller denominator — five ratios drifting down,
+#     not five failures — which is why it stays a three-line loop with nothing but
+#     the atomic in it, and why the ratio baselines live next to it in the file
+#     where a reviewer reads them.
+#   * Normalizing is not a licence to raise BENCH_THRESHOLD. Nothing here makes a
+#     *regression* pass; it only stops the host's generation from being charged to
+#     the code.
+#
+# Baseline format, both criteria in one file: an entry is either absolute —
+# `{name, unit: "ms", value}`, exactly as before — or normalized —
+# `{name, unit: "ratio", value, normalized_by: "atomic RMW x10M"}`, where `value`
+# is the metric divided by the reference, both as measured in the recording run.
+# A normalized entry with `value: null` means "this machine class has not recorded
+# a ratio yet": the gate WARNs and skips it, the same way it treats a metric no
+# baseline knows. `--update` writes whichever shape each metric's criterion calls
+# for, from the list below; a baseline entry *without* `normalized_by` is never
+# silently compared as if it were a ratio (0.77 against 16.9 ms passes anything),
+# and a normalized entry whose value is milliseconds is reported as the mismatch
+# it is instead of being trusted.
+#
+# Rolling this out to `scripts/bench-baseline.ci.json`: it was recorded before the
+# reference existed, so its five atomic-path entries carry `normalized_by` with a
+# `null` value, and so does its `atomic RMW x10M` entry. Until a runner records
+# them (`bash scripts/check-bench.sh --update` on the runner, then review the diff —
+# do not blanket `--update` that file) those six WARN and go unchecked on CI while
+# every other metric keeps exactly the criterion it had. Filling the ratios in from
+# an estimate was considered and rejected: `Sequencer x10M` is the same `fetchAdd`
+# loop and measured within 2% of the reference on the laptop, so a plausible number
+# is one line of arithmetic away — but an unmeasured number baked into a ratchet is
+# a guess, and a guess is what the reviewer of this file has to trust.
+#
+# Machine information (region, CPU, cores) is printed with the verdict: a
+# benchmark number means nothing without it, and digging it out of the job's "Set
+# up job" group after a red build is the step nobody does. Region comes from
+# `BENCH_REGION` if set, otherwise from Azure IMDS (the runner's own host
+# metadata, one short request), otherwise it prints `?`. It is diagnostic output
+# and never fails the gate.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 BASELINE="${BENCH_BASELINE:-scripts/bench-baseline.json}"
 THRESHOLD="${BENCH_THRESHOLD:-2.0}"
+
+# The machine reference and the metrics gated as a ratio against it (see the
+# header). This list *is* the criterion: a baseline entry that disagrees with it
+# is a mismatch the gate reports, not something it quietly trusts. A metric
+# belongs here only if its whole per-turn path is atomic read-modify-writes, so
+# that the host's atomic speed is what moves it — `ObjectPool x1M` takes a
+# `SpinLock` per turn and is deliberately absent: it stayed inside 1.1x across the
+# host generations that moved these five, and a ratio that does not track the
+# reference trades a false red for a blind spot.
+REF_METRIC="atomic RMW x10M"
+NORMALIZED_METRICS=(
+  "Mailbox post+drain x1M"
+  "Mailbox full-path x10M"
+  "HotBus 8sub x1M"
+  "Sequencer x10M"
+  "1L x10M events"
+)
+export BENCH_REF_METRIC="$REF_METRIC"
+export BENCH_NORMALIZED_METRICS="$(IFS=';'; printf '%s' "${NORMALIZED_METRICS[*]}")"
+export BENCH_MACHINE=""
 
 MODE=check
 FORCE=0
@@ -191,6 +293,45 @@ done
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/zigmodu-bench.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
+
+# Machine identification for the verdict. Every source is best-effort: a missing
+# region prints `?` and the gate carries on (see the header).
+machine_region() {
+  if [ -n "${BENCH_REGION:-}" ]; then
+    printf '%s' "$BENCH_REGION"
+    return
+  fi
+  local region
+  region="$(curl -fsS --connect-timeout 2 --max-time 3 -H 'Metadata:true' \
+    'http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text' 2>/dev/null || true)"
+  if [ -n "$region" ]; then printf '%s' "$region"; else printf '?'; fi
+}
+
+machine_cpu() {
+  local cpu=""
+  case "$(uname -s)" in
+    Darwin) cpu="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)" ;;
+    Linux) cpu="$(awk -F': ' '/^model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null || true)" ;;
+  esac
+  if [ -n "$cpu" ]; then printf '%s' "$cpu"; else printf '?'; fi
+}
+
+machine_cores() {
+  local cores
+  cores="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+  if [ -n "$cores" ]; then printf '%s' "$cores"; else printf '?'; fi
+}
+
+REGION="$(machine_region)"
+BENCH_MACHINE="region=$REGION cpu=$(machine_cpu) cores=$(machine_cores)"
+export BENCH_MACHINE
+
+echo "machine: $BENCH_MACHINE  |  $(uname -srm)"
+if [ "$REGION" = "?" ]; then
+  echo "         region unavailable (no BENCH_REGION, no Azure IMDS answer) — diagnostic only, not a failure"
+fi
+echo "criterion: absolute ms for every metric except ${#NORMALIZED_METRICS[@]} atomic-path metric(s), which are a ratio to '$REF_METRIC' (same run, both medians of 3)"
+echo
 
 echo "building benchmark (ReleaseFast)..."
 zig build benchmark-build -Doptimize=ReleaseFast --prefix "$WORK/prefix"
@@ -233,38 +374,90 @@ import json, os, sys
 
 force = sys.argv[1] == "1"
 results_path, base_path, threshold = sys.argv[2], sys.argv[3], float(sys.argv[4])
+ref_name = os.environ["BENCH_REF_METRIC"]
+normalized = [n for n in os.environ["BENCH_NORMALIZED_METRICS"].split(";") if n]
 
 cur = json.load(open(results_path))
-old = {m["name"]: m["value"] for m in json.load(open(base_path))} if os.path.exists(base_path) else {}
+old = {m["name"]: m for m in json.load(open(base_path))} if os.path.exists(base_path) else {}
+values = {m["name"]: m["value"] for m in cur}
 
-loosened = [
-    (m["name"], old[m["name"]], m["value"])
-    for m in cur
-    if m["name"] in old and m["value"] > old[m["name"]] * threshold
-]
+# The reference value this recording run divides by. Without it a normalized
+# metric cannot be expressed as a ratio, and writing milliseconds into a ratio
+# entry would compare 0.77 against 16.9 ms and pass everything — so its entry is
+# left alone instead.
+ref = values.get(ref_name)
+if ref is not None and ref <= 0:
+    ref = None
+if normalized and ref is None:
+    print(f"WARN: this run produced no usable '{ref_name}' — the ratio baselines are left as they are", file=sys.stderr)
+
+
+def recorded_ratio(entry):
+    """The ratio a previous recording holds for `entry`, or None if it has none."""
+    if entry is None or entry.get("normalized_by") is None or entry.get("value") is None:
+        return None
+    return entry["value"]
+
+
+loosened = []
+converted = []
+out = []
+for m in cur:
+    name, value = m["name"], m["value"]
+    prev = old.get(name)
+
+    if name not in normalized:
+        out.append({"name": name, "unit": m.get("unit", "ms"), "value": value})
+        was = prev["value"] if prev is not None and prev.get("normalized_by") is None else None
+        if was is not None and was > 0 and value > was * threshold:
+            loosened.append((name, was, value, None))
+        continue
+
+    if ref is None:
+        # Keep the recorded ratio (or record the entry as still pending) rather
+        # than downgrading a ratio entry to milliseconds.
+        out.append(prev if prev is not None else {"name": name, "unit": "ratio", "value": None, "normalized_by": ref_name})
+        continue
+
+    ratio = round(value / ref, 4)
+    out.append({"name": name, "unit": "ratio", "value": ratio, "normalized_by": ref_name})
+    if prev is not None and prev.get("normalized_by") is None:
+        converted.append(name)
+    was = recorded_ratio(prev)
+    if was is not None and ratio > was * threshold:
+        loosened.append((name, was, ratio, ref))
 
 if loosened and not force:
     print(f"FAIL: --update would record {len(loosened)} metric(s) more than {threshold}x slower:", file=sys.stderr)
-    for name, base, actual in loosened:
-        print(f"  {name}: baseline {base:.3f} → actual {actual:.3f} (+{(actual / base - 1) * 100:.1f}%)", file=sys.stderr)
+    for name, was, actual, divisor in loosened:
+        if divisor is None:
+            print(f"  {name}: baseline {was:.3f} ms → actual {actual:.3f} ms (+{(actual / was - 1) * 100:.1f}%)", file=sys.stderr)
+        else:
+            print(f"  {name}: ratio baseline {was:.4f} → actual {actual:.4f} (÷ '{ref_name}' {divisor:.3f} ms = {actual * divisor:.3f} ms) (+{(actual / was - 1) * 100:.1f}%)", file=sys.stderr)
     print("Fix the regression, or pass --force to record a deliberate slowdown.", file=sys.stderr)
     sys.exit(1)
 
 added = [m["name"] for m in cur if m["name"] not in old]
 dropped = [n for n in old if n not in {m["name"] for m in cur}]
+pending = [e["name"] for e in out if e.get("normalized_by") is not None and e.get("value") is None]
 
 with open(base_path, "w") as fh:
-    json.dump(cur, fh, indent=2)
+    json.dump(out, fh, indent=2)
     fh.write("\n")
 
-print(f"baseline updated: {len(old)} -> {len(cur)} metric(s) (+{len(added)} / -{len(dropped)})")
-print("  values are the median of 3 samples per metric (see src/benchmark.zig median3)")
+print(f"baseline updated: {len(old)} -> {len(out)} metric(s) (+{len(added)} / -{len(dropped)})")
+print("  absolute entries are the median of 3 samples per metric (see src/benchmark.zig median3)")
+print(f"  {len(normalized)} entry/entries recorded as a ratio to '{ref_name}' (`normalized_by`), value = metric ÷ reference, both medians of this run")
 if added:
     print(f"  new: {', '.join(added)}")
 if dropped:
     print(f"  pruned: {', '.join(dropped)}")
+if converted:
+    print(f"  converted from absolute ms to a ratio (review these): {', '.join(converted)}")
+if pending:
+    print(f"  still pending — no ratio recorded, the gate WARNs and skips them: {', '.join(pending)}")
 if loosened:
-    print(f"  recorded with --force: {', '.join(name for name, _, _ in loosened)}")
+    print(f"  recorded with --force: {', '.join(name for name, _, _, _ in loosened)}")
 EOF
   exit 0
 fi
@@ -274,14 +467,23 @@ import json, os, sys
 
 threshold = float(sys.argv[1])
 results_path, base_path, log_path = sys.argv[2], sys.argv[3], sys.argv[4]
+ref_name = os.environ["BENCH_REF_METRIC"]
+normalized = [n for n in os.environ["BENCH_NORMALIZED_METRICS"].split(";") if n]
+machine = os.environ.get("BENCH_MACHINE", "")
 
 if not os.path.exists(base_path):
     print(f"FAIL: no baseline at {base_path} — create one with: scripts/check-bench.sh --update", file=sys.stderr)
     sys.exit(2)
 
 cur = json.load(open(results_path))
-base = {m["name"]: m["value"] for m in json.load(open(base_path))}
+base = {m["name"]: m for m in json.load(open(base_path))}
 seen = set()
+
+# The reference for this run: every normalized metric is divided by the medians
+# this same run measured, which is what cancels the host generation.
+ref = {m["name"]: m["value"] for m in cur}.get(ref_name)
+if ref is not None and ref <= 0:
+    ref = None
 
 # The suite's `[med3] <name>: min / median / max` lines, so a breach can show the
 # three samples behind the median it compared. Missing log (deleted temp dir,
@@ -297,32 +499,96 @@ if os.path.exists(log_path):
             if rest:
                 samples[head] = rest
 
-slower, unmeasurable = [], []
+slower, unmeasurable, pending, mismatch, host_notes = [], [], [], [], []
+ratio_detail = []
 new_metrics = [m["name"] for m in cur if m["name"] not in base]
 for m in cur:
     name, actual = m["name"], m["value"]
     seen.add(name)
     if name not in base:
         continue
-    was = base[name]
+    entry = base[name]
+    was = entry.get("value")
+    # Which criterion applies is decided by the gate's list and cross-checked
+    # against what the recording actually stored: comparing a ratio to
+    # milliseconds (0.77 vs 16.9) or milliseconds to a ratio passes everything,
+    # so a disagreement is reported instead of compared.
+    baseline_is_ratio = entry.get("normalized_by") is not None
+    gate_is_ratio = name in normalized
+    if baseline_is_ratio != gate_is_ratio:
+        mismatch.append(f"{name} — baseline holds "
+                         f"{'a ratio (normalized_by=' + str(entry.get('normalized_by')) + ')' if baseline_is_ratio else 'absolute milliseconds'}"
+                         f", the gating list says {'ratio' if gate_is_ratio else 'absolute milliseconds'}")
+        continue
+
+    if name == ref_name:
+        # The reference is the host, not the framework. Gating it on an absolute
+        # value would fire on exactly the host generation change this criterion
+        # exists to cancel, so it is reported and stays out of the verdict (see
+        # the header): a breach here says "this runner is a different generation",
+        # which is the context for everything above it, not a regression.
+        if was is None:
+            pending.append(f"{name} (absolute ms — reported, never gated)")
+        elif was > 0 and (actual > was * threshold or actual < was / threshold):
+            host_notes.append(f"{name}: baseline {was:.3f} ms → actual {actual:.3f} ms ({actual / was:.2f}x) — this is the host's atomic path, not a framework metric; the ratio criterion cancels it, and it is reported rather than gated")
+        continue
+
+    if gate_is_ratio:
+        if ref is None:
+            unmeasurable.append(f"{name} (no '{ref_name}' in this run to divide by)")
+            continue
+        if was is None:
+            pending.append(f"{name} (ratio to '{ref_name}')")
+            continue
+        ratio = actual / ref
+        ratio_detail.append((name, ratio, was, actual))
+        if ratio > was * threshold:
+            slower.append((name, "ratio",
+                           f"baseline ratio {was:.4f} → actual {ratio:.4f} "
+                           f"(= {actual:.3f} ms ÷ '{ref_name}' {ref:.3f} ms)",
+                           ratio / was - 1))
+        continue
+
     # A baseline of exactly 0.000 (a benchmark the optimizer folded away) has no
     # ratio to compare against; say so instead of dividing by zero.
-    if was <= 0:
-        unmeasurable.append(name)
+    if was is None:
+        pending.append(f"{name} (absolute ms)")
+    elif was <= 0:
+        unmeasurable.append(f"{name} (baseline 0.000)")
     elif actual > was * threshold:
-        slower.append((name, was, actual))
+        slower.append((name, "absolute", f"baseline {was:.3f} ms → actual {actual:.3f} ms", actual / was - 1))
 
 gone = [n for n in base if n not in seen]
+gated_ratio = [m["name"] for m in cur if m["name"] in normalized]
+ref_txt = f"{ref:.3f} ms" if ref is not None else "NOT MEASURED this run"
+
+print(f"machine:  {machine}")
+print(f"criterion: {len(cur) - len(gated_ratio)} metric(s) absolute (median ms) + {len(gated_ratio)} normalized (metric ÷ '{ref_name}', this run: {ref_txt}, threshold {threshold}x on both)")
+
+if ratio_detail:
+    print(f"normalized ({ref_name} = {ref_txt} — the two ratios the gate compares):")
+    for name, ratio, was, actual in ratio_detail:
+        compared = f"baseline ratio {was:.4f}, {ratio / was:.2f}x" if was is not None else "no baseline ratio to compare"
+        print(f"  {name:<28s} {actual:>9.3f} ms / {ref:>8.3f} ms = {ratio:.4f}  ({compared})")
 
 if slower:
     print(f"FAIL: {len(slower)} metric(s) slower than the baseline by more than {threshold}x (lower is better):")
-    for name, was, actual in slower:
-        print(f"  {name}: baseline {was:.3f} → actual {actual:.3f} (+{(actual / was - 1) * 100:.1f}%)")
+    for name, kind, detail, pct in slower:
+        print(f"  [{kind:8s}] {name}: {detail} (+{pct * 100:.1f}%)")
         if name in samples:
             print(f"      samples: {samples[name]}")
-    print("Both compared values are medians of 3; three slow samples are a regression,")
-    print("one outlier sample (see `samples:` above) is machine noise — re-run before fixing.")
+    print("  [absolute] compares milliseconds; [ratio] compares the metric divided by")
+    print(f"  this run's '{ref_name}' against the ratio the baseline recorded, so the host")
+    print("  cancels out but extra work in the metric does not (an added allocation, lock")
+    print("  or atomic raises the ratio). Both compared values are medians of 3; three")
+    print("  slow samples are a regression, one outlier sample (see `samples:` above) is")
+    print("  machine noise — re-run before fixing.")
     print("Fix the regression, or accept it explicitly with: scripts/check-bench.sh --update --force")
+
+if host_notes:
+    print(f"NOTE: the machine reference is more than {threshold}x away from its recorded value (host generation, not code):")
+    for line in host_notes:
+        print(f"      {line}")
 
 if gone:
     print(f"WARN: {len(gone)} baseline metric(s) no longer produced: {', '.join(gone)}")
@@ -330,8 +596,17 @@ if gone:
 if new_metrics:
     print(f"WARN: {len(new_metrics)} metric(s) not in the baseline: {', '.join(new_metrics)}")
     print("      (run --update to record them)")
+if pending:
+    print(f"WARN: {len(pending)} baseline entry/entries hold no number yet — skipped, nothing to compare against:")
+    for line in pending:
+        print(f"      {line}")
+    print("      (this machine class has not recorded them — run --update on it, then review the diff)")
+if mismatch:
+    print(f"WARN: {len(mismatch)} metric(s) whose baseline entry and gating list disagree — skipped, not compared:")
+    for line in mismatch:
+        print(f"      {line}")
 if unmeasurable:
-    print(f"WARN: baseline is 0.000 for {', '.join(unmeasurable)} — skipped, nothing to compare against")
+    print(f"WARN: no comparison possible for {', '.join(unmeasurable)} — skipped, nothing to compare against")
 
 if not slower:
     print(f"OK: {len(cur)} metric(s) within {threshold}x of the baseline (each a median of 3 samples).")

@@ -31,8 +31,10 @@
   },
   {
     "name": "1L x10M events",
-    "unit": "ms",
-    "value": 17.73
+    "unit": "ratio",
+    "value": null,
+    "normalized_by": "atomic RMW x10M",
+    "note": "pending: this class has no ratio yet (recorded as 17.73 ms absolute before the ratio criterion, 2026-09-19) — run scripts/check-bench.sh --update on the runner; see the header of that script"
   },
   {
     "name": "10L x1M events",
@@ -85,19 +87,29 @@
     "value": 9.72
   },
   {
+    "name": "atomic RMW x10M",
+    "unit": "ms",
+    "value": null,
+    "note": "pending: the runner that recorded this file never measured this metric (added 2026-09-19); it is the machine reference the five entries below are divided by — run scripts/check-bench.sh --update on the runner, the gate WARNs and skips until then"
+  },
+  {
     "name": "RingBuffer SPSC x1M",
     "unit": "ms",
     "value": 1.09
   },
   {
     "name": "Mailbox post+drain x1M",
-    "unit": "ms",
-    "value": 15.35
+    "unit": "ratio",
+    "value": null,
+    "normalized_by": "atomic RMW x10M",
+    "note": "pending: this class has no ratio yet (recorded as 15.35 ms absolute before the ratio criterion, 2026-09-19) — run scripts/check-bench.sh --update on the runner; see the header of that script"
   },
   {
     "name": "Mailbox full-path x10M",
-    "unit": "ms",
-    "value": 49.44
+    "unit": "ratio",
+    "value": null,
+    "normalized_by": "atomic RMW x10M",
+    "note": "pending: this class has no ratio yet (recorded as 49.44 ms absolute before the ratio criterion, 2026-09-19) — run scripts/check-bench.sh --update on the runner; see the header of that script"
   },
   {
     "name": "TimerWheel x100K",
@@ -106,8 +118,10 @@
   },
   {
     "name": "HotBus 8sub x1M",
-    "unit": "ms",
-    "value": 18.88
+    "unit": "ratio",
+    "value": null,
+    "normalized_by": "atomic RMW x10M",
+    "note": "pending: this class has no ratio yet (recorded as 18.88 ms absolute before the ratio criterion, 2026-09-19) — run scripts/check-bench.sh --update on the runner; see the header of that script"
   },
   {
     "name": "ObjectPool x1M",
@@ -116,8 +130,10 @@
   },
   {
     "name": "Sequencer x10M",
-    "unit": "ms",
-    "value": 20.61
+    "unit": "ratio",
+    "value": null,
+    "normalized_by": "atomic RMW x10M",
+    "note": "pending: this class has no ratio yet (recorded as 20.61 ms absolute before the ratio criterion, 2026-09-19) — run scripts/check-bench.sh --update on the runner; see the header of that script"
   },
   {
     "name": "Worker spawn+join x1K",

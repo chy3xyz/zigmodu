@@ -31,8 +31,9 @@
   },
   {
     "name": "1L x10M events",
-    "unit": "ms",
-    "value": 20.874
+    "unit": "ratio",
+    "value": 1.0083,
+    "normalized_by": "atomic RMW x10M"
   },
   {
     "name": "10L x1M events",
@@ -85,19 +86,26 @@
     "value": 6.211
   },
   {
+    "name": "atomic RMW x10M",
+    "unit": "ms",
+    "value": 22.177
+  },
+  {
     "name": "RingBuffer SPSC x1M",
     "unit": "ms",
     "value": 10.471
   },
   {
     "name": "Mailbox post+drain x1M",
-    "unit": "ms",
-    "value": 16.694
+    "unit": "ratio",
+    "value": 0.7902,
+    "normalized_by": "atomic RMW x10M"
   },
   {
     "name": "Mailbox full-path x10M",
-    "unit": "ms",
-    "value": 21.913
+    "unit": "ratio",
+    "value": 1.0732,
+    "normalized_by": "atomic RMW x10M"
   },
   {
     "name": "TimerWheel x100K",
@@ -106,8 +114,9 @@
   },
   {
     "name": "HotBus 8sub x1M",
-    "unit": "ms",
-    "value": 16.877
+    "unit": "ratio",
+    "value": 0.8221,
+    "normalized_by": "atomic RMW x10M"
   },
   {
     "name": "ObjectPool x1M",
@@ -116,8 +125,9 @@
   },
   {
     "name": "Sequencer x10M",
-    "unit": "ms",
-    "value": 21.389
+    "unit": "ratio",
+    "value": 1.031,
+    "normalized_by": "atomic RMW x10M"
   },
   {
     "name": "Worker spawn+join x1K",

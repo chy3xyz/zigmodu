@@ -245,6 +245,45 @@ const BenchResult = struct {
 
 const rt = zigmodu.runtime;
 
+/// The host's atomic-path speed, measured on the same run as everything else —
+/// the reference `scripts/check-bench.sh` divides the atomic-path metrics by.
+///
+/// Why a reference metric at all: the gate used to hold every metric to an
+/// absolute millisecond value, so it also held the *host* still. CI runners are
+/// provisioned per Azure region from a rolling hardware generation, and a
+/// generation that makes a single-core atomic read-modify-write 2.6-4.6x more
+/// expensive turns `Sequencer x10M`, the two `Mailbox` metrics, `HotBus 8sub`
+/// and `1L x10M events` red on code whose instructions are byte-identical to the
+/// commit that recorded the baseline (verified at the machine-code level: the
+/// timed loop of `benchEventBus` is 2683 instructions, all identical between the
+/// two binaries). What moved is the host, not the framework, and no recorded
+/// millisecond value can tell those apart. A ratio against a metric that runs on
+/// the same host at the same moment can.
+///
+/// The loop is deliberately nothing but the atomic: a monotonic `fetchAdd` on
+/// one counter held on the heap, with each old value fed to
+/// `doNotOptimizeAway`. No branch that could be predicted differently on another
+/// microarchitecture, no memory beyond the one cache line, no second counter —
+/// what this measures is the machine's baseline cost of the operation the
+/// normalized metrics are made of, and nothing else. Counters in the suite
+/// usually sit next to more work; this one is the control.
+///
+/// It is a metric because it has to be measured (and so recorded, printed and
+/// gated like the rest), but it is not a framework metric: a regression in
+/// `src/runtime/**` cannot move it, only the host can. `check-bench.sh` prints it
+/// separately for that reason.
+fn benchAtomicRmw(allocator: std.mem.Allocator, count: usize) !f64 {
+    const counter = try allocator.create(std.atomic.Value(u64));
+    defer allocator.destroy(counter);
+    counter.* = std.atomic.Value(u64).init(0);
+
+    const t0 = now();
+    for (0..count) |_| {
+        std.mem.doNotOptimizeAway(counter.fetchAdd(1, .monotonic));
+    }
+    return elapsedMs(t0);
+}
+
 /// SPSC hand-off: `count` push/pop round trips through a bounded ring.
 fn benchRingBuffer(allocator: std.mem.Allocator, count: usize) !f64 {
     const ring = try allocator.create(rt.RingBuffer(u64, 1024));
@@ -676,6 +715,19 @@ pub fn main(init: std.process.Init) !void {
     // `Mailbox full-path` (a refusal, an order of magnitude cheaper per turn than
     // the hand-off above and so given 10x the turns) — are each still one
     // primitive, not a second scale of something already in the group.
+    //
+    // `atomic RMW x10M` leads the group because it is the group's (and the
+    // suite's) machine reference: the host's bare atomic RMW cost, which
+    // `check-bench.sh` divides the atomic-path metrics by. First, so the
+    // reference and the metrics normalized against it are never far apart in
+    // time; see `benchAtomicRmw`.
+    {
+        const name = "atomic RMW x10M";
+        const ms = try median3(name, benchAtomicRmw, .{ a, 10_000_000 });
+        try results.append(a, .{ .name = name, .value = ms });
+        std.debug.print("  {s}  {d:.2} ms  ({d:.0} RMW/s)\n", .{ name, ms, 10_000_000.0 / ms * 1000.0 });
+        std.debug.print("    ^ machine reference, not a framework metric: check-bench.sh gates the\n      atomic-path metrics (Mailbox post+drain, Mailbox full-path, HotBus 8sub,\n      Sequencer x10M, 1L x10M events) as a ratio against this run's value.\n", .{});
+    }
     {
         const name = "RingBuffer SPSC x1M";
         const ms = try median3(name, benchRingBuffer, .{ a, 1_000_000 });
