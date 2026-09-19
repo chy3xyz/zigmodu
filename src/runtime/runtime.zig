@@ -76,6 +76,8 @@ const std = @import("std");
 const mbox = @import("mailbox.zig");
 const wheel_mod = @import("timer_wheel.zig");
 const clock_mod = @import("clock.zig");
+const ring_mod = @import("ring.zig");
+const sequencer_mod = @import("sequencer.zig");
 
 pub const Clock = clock_mod.Clock;
 pub const Wheel = wheel_mod.Wheel;
@@ -91,8 +93,9 @@ pub const Mailbox = mbox.Mailbox;
 pub const TraceId = @import("../tracing/DistributedTracer.zig").DistributedTracer.TraceId;
 
 /// Deferred work handed to the timer wheel. Type-erased so one wheel serves
-/// workers with different message types; the runtime owns `ctx` (it drops it on
-/// fire *and* on cancel — see `cancelTimer`).
+/// workers with different message types; the runtime owns `ctx` and releases it
+/// exactly once — on fire, on cancel, or (if the request never made it onto the
+/// command queue) before `scheduleAction` returns the error.
 const TimerAction = struct {
     ctx: *anyopaque,
     post: *const fn (ctx: *anyopaque) void,
@@ -102,6 +105,43 @@ const TimerAction = struct {
     /// up, and it has to come from somewhere. `scheduleAction` fills it in; a
     /// caller-built action leaves it 0.
     deadline_ms: i64 = 0,
+};
+
+/// How many timer commands can be in flight between the producers and the one
+/// thread that owns the wheel. Power of two (`MpscRing` indexes with a mask) and
+/// deliberately small: the queue is a hand-off, not a buffer — the driver drains
+/// it every tick, so a producer that finds it full is looking at a saturated
+/// runtime and gets `error.Full`, which is the runtime's usual "backpressure is
+/// visible" answer.
+pub const timer_command_capacity: usize = 512;
+
+/// A change to the timer set, handed from a producer thread to the wheel's
+/// owner.
+///
+/// Arm and cancel travel on **one** queue, in that order, because that is what
+/// makes their relative order well defined: `arm(A); cancel(A)` from one thread
+/// linearises as arm-then-cancel (cancelled, never fires), and a cancel that
+/// arrives before its arm is simply a cancel that finds nothing to remove.
+/// Two queues would leave the pair unordered and the outcome a coin flip.
+const TimerCommand = union(enum) {
+    arm: struct {
+        /// Minted by the producer (`Runtime.timer_ids`), so `after` can return it
+        /// without waiting for the driver.
+        id: u64,
+        /// Absolute deadline, computed on the **producer's** clock reading, so
+        /// `after(50)` means "50 ms from when I called", not "50 ms from
+        /// whenever the ticker got round to it".
+        deadline_ms: i64,
+        action: TimerAction,
+    },
+    cancel: struct {
+        id: u64,
+        /// Filled in by the owner when the cancel has been applied. Letting the
+        /// command carry the answer is what makes `cancelTimerSync` exact without
+        /// any ordering assumptions beyond the queue's FIFO.
+        done: ?*std.atomic.Value(bool) = null,
+        result: ?*std.atomic.Value(bool) = null,
+    },
 };
 
 /// How the runtime reacts to an error a worker's `handle`/`run` returned.
@@ -226,6 +266,16 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         /// Deliver `message` to this worker after `delay_ms`, via the runtime's
         /// timer wheel (one wheel for the whole runtime, O(1) insert).
         ///
+        /// The delay is measured from *this call*: the deadline is computed here
+        /// and handed to the wheel's owner, which is what keeps a worker's
+        /// `after(50)` independent of how busy the ticker is. The timer fires
+        /// somewhere in `[delay_ms, delay_ms + enqueue latency + tick_interval_ms]`
+        /// (see `docs/RUNTIME.md` §3).
+        ///
+        /// Callable from any thread, and it does not touch the wheel: the request
+        /// goes onto a bounded queue that grows nothing. `error.Full` means that
+        /// queue is saturated — the runtime is behind, and the caller decides.
+        ///
         /// The delivered message keeps the trace of whatever this worker is
         /// handling *right now*, so work deferred to the timer stays attributable
         /// to the request that deferred it. That only has an answer on the
@@ -254,6 +304,10 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
                 }
             };
             const delivery = try self.runtime.allocator.create(Delivery);
+            // The runtime owns the payload from here on: it releases it on the
+            // fire path, on the cancel path, and when the request never made it
+            // onto the queue (which is the only failure this line can see).
+            errdefer self.runtime.allocator.destroy(delivery);
             delivery.* = .{
                 .handle = self,
                 .message = message,
@@ -364,6 +418,24 @@ pub const Runtime = struct {
     io: std.Io,
     clock: Clock,
     wheel: Wheel(TimerAction),
+    /// Hand-off from the producers to the wheel's owner. `after()` never touches
+    /// the wheel — it mints an id, computes a deadline and pushes an `arm`
+    /// command here; the owner pops it and does the (allocating, single-writer)
+    /// wheel insert. That is what makes "the wheel is single-threaded" true
+    /// rather than aspirational, and it keeps the producer path allocation-free
+    /// for the queue itself.
+    timer_commands: ring_mod.MpscRing(TimerCommand, timer_command_capacity),
+    /// Ids for timers, minted on the producer side. A plain lock-free counter:
+    /// two `after()` calls cannot get the same id, which is what lets the wheel
+    /// take ids from outside without giving up its `nodes` keying.
+    timer_ids: sequencer_mod.Sequencer = sequencer_mod.Sequencer.init(1),
+    /// Threads blocked in `cancelTimerSync`. Kept as a counter so the ticker only
+    /// pays for the signal when somebody is actually waiting.
+    timer_waiters: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// Dedicated to `cancelTimerSync`'s wait, so the control-plane waiters cannot
+    /// interfere with the ticker's own `mu`/`idle` sleep.
+    cmd_mu: std.Io.Mutex = .init,
+    cmd_idle: std.Io.Condition = .init,
     /// One entry per spawned worker (type-erased), plus its destroy thunk.
     workers: std.ArrayList(Entry) = .empty,
     /// The runtime is *alive* from construction until `shutdown`. Deliberately
@@ -390,6 +462,10 @@ pub const Runtime = struct {
 
     /// How often the ticker wakes to fire timers. One level-0 spoke is 10 ms;
     /// ticking at half that keeps a 10 ms timer within ~5 ms of its deadline.
+    ///
+    /// A timer armed with `after(delay_ms)` therefore fires somewhere in
+    /// `[delay_ms, delay_ms + enqueue latency + tick_interval_ms]` — see
+    /// `docs/RUNTIME.md` §3.
     pub const tick_interval_ms: u32 = 5;
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, clock: Clock) Self {
@@ -397,7 +473,11 @@ pub const Runtime = struct {
             .allocator = allocator,
             .io = io,
             .clock = clock,
+            // `now_ms` here is pre-ownership initialization: no driver exists
+            // yet, so nobody can be reading the wheel concurrently. A driver
+            // that starts later re-aligns it on its own thread (`Wheel.alignNow`).
             .wheel = Wheel(TimerAction).init(allocator, clock.nowMs()),
+            .timer_commands = ring_mod.MpscRing(TimerCommand, timer_command_capacity).init(),
         };
     }
 
@@ -411,9 +491,12 @@ pub const Runtime = struct {
     /// Start the ticker so timers fire without help. Optional: a caller that
     /// drives `tick()` itself (tests, an event loop that already has a clock)
     /// should not start it.
+    ///
+    /// The wheel's clock is *not* touched here: `start()` runs on the caller's
+    /// thread, which is not the wheel's owner. The ticker aligns it when it
+    /// takes the wheel (see `tickerMain`).
     pub fn start(self: *Self) !void {
         if (self.ticker_running.swap(true, .acquire)) return; // already started
-        self.wheel.now_ms = self.clock.nowMs();
         self.ticker = try std.Thread.spawn(.{}, tickerMain, .{self});
     }
 
@@ -436,6 +519,13 @@ pub const Runtime = struct {
                 self.ticker = null;
             }
         }
+
+        // Nobody is driving the wheel any more, so commands still in flight will
+        // never become timers — and their payloads are owned by this queue until
+        // one of the two happens. Release them (the `drop` half of the fire/cancel
+        // contract) so a shutdown with a full command queue is not a leak.
+        self.abandonTimerCommands();
+        self.wakeTimerWaiters();
     }
 
     /// Spawn `W` with `capacity` mailbox slots. `init` is the worker's initial
@@ -530,21 +620,96 @@ pub const Runtime = struct {
     /// Schedule a raw deferred action (used by `Handle.after`). Prefer
     /// `handle.after(...)`: a callback here runs on the **ticker thread**, so
     /// anything non-trivial must be handed off by message.
+    ///
+    /// Safe from any thread, and **allocation-free on the caller's side** (the
+    /// queue is fixed-capacity; the wheel node is created by the owner when it
+    /// drains this command). `error.Full` when the hand-off queue is saturated —
+    /// the caller drops, coalesces or backs off, exactly as with a full mailbox.
     pub fn scheduleAction(self: *Self, delay_ms: i64, action_in: TimerAction) !u64 {
         var action = action_in;
+        // Both of these belong to the *producer*: the deadline so `after(50)`
+        // keeps meaning "50 ms from the call", the id so `after` can return
+        // before the ticker has seen anything.
         action.deadline_ms = self.clock.nowMs() + delay_ms;
-        return self.wheel.schedule(action.deadline_ms, action);
+        const id = self.timer_ids.next();
+        const accepted = self.timer_commands.tryPush(.{ .arm = .{
+            .id = id,
+            .deadline_ms = action.deadline_ms,
+            .action = action,
+        } });
+        if (!accepted) return error.Full;
+        return id;
     }
 
-    /// Cancel a scheduled action and release its payload (the same `drop` the
-    /// fire path calls — cancelling must not leak what firing would free).
-    pub fn cancelTimer(self: *Self, id: u64) bool {
-        return self.wheel.cancelWith(id, self, onTimerCancel);
+    /// Ask the runtime to cancel `id`, and return as soon as the request is in
+    /// the runtime's hands.
+    ///
+    /// **This is a request, not a result**: the id belongs to the wheel's owner,
+    /// so the cancel takes effect when the owner drains the queue (~one tick).
+    /// Use `cancelTimerSync` when the answer matters now.
+    ///
+    /// The payload is released by the owner — with the same `drop` the fire path
+    /// calls, so cancelling cannot leak what firing would have freed.
+    pub fn requestCancelTimer(self: *Self, id: u64) !void {
+        const accepted = self.timer_commands.tryPush(.{ .cancel = .{ .id = id } });
+        if (!accepted) return error.Full;
+    }
+
+    /// Cancel `id` and report whether it was still pending.
+    ///
+    /// Control-plane: it waits for the owner to apply the cancel, so it must not
+    /// be called from the owner's own thread *if that thread is the ticker* —
+    /// and it does not have to be, because a caller that owns the wheel cancels
+    /// inline (after first draining whatever the queue already holds, so the
+    /// arm/cancel order is still the queue's order).
+    ///
+    /// Returns `error.Full` if the request could not be queued, and
+    /// `error.RuntimeStopped` if the runtime is torn down while waiting.
+    pub fn cancelTimerSync(self: *Self, id: u64) !bool {
+        if (self.wheel.ownerThread() == std.Thread.getCurrentId()) {
+            _ = self.drainTimerCommands();
+            return self.wheel.cancelWith(id, self, onTimerCancel);
+        }
+
+        var done = std.atomic.Value(bool).init(false);
+        var result = std.atomic.Value(bool).init(false);
+        const accepted = self.timer_commands.tryPush(.{ .cancel = .{
+            .id = id,
+            .done = &done,
+            .result = &result,
+        } });
+        if (!accepted) return error.Full;
+
+        _ = self.timer_waiters.fetchAdd(1, .monotonic);
+        defer _ = self.timer_waiters.fetchSub(1, .monotonic);
+        while (!done.load(.acquire)) {
+            if (!self.alive.load(.acquire)) return error.RuntimeStopped;
+            // Waiting on the condition (rather than spinning) keeps the caller
+            // off the CPU during the up-to-one-tick wait; the timeout is the
+            // safety net, the owner's signal after a drain is the fast path.
+            self.cmd_mu.lock(self.io) catch return error.RuntimeStopped;
+            self.cmd_idle.waitTimeout(self.io, &self.cmd_mu, .{
+                .duration = clock_mod.duration(tick_interval_ms),
+            }) catch |err| switch (err) {
+                // Expected: the timeout *is* the poll.
+                error.Timeout => {},
+                else => {},
+            };
+            self.cmd_mu.unlock(self.io);
+        }
+        return result.load(.acquire);
     }
 
     /// Fire due timers without waiting for the ticker (tests drive this with a
     /// `Manual` clock; a custom event loop can call it instead of `start()`).
+    ///
+    /// Drains the timer command queue first, then advances — in that order, so a
+    /// timer armed just before the tick is considered by it. This makes the
+    /// calling thread the wheel's owner: the ticker and `tick()` are two ways to
+    /// be the one driver, and mixing them is a bug the wheel reports.
     pub fn tick(self: *Self) usize {
+        self.wheel.claimOwner();
+        _ = self.drainTimerCommands();
         return self.wheel.advance(self.clock.nowMs(), self, onTimerFire);
     }
 
@@ -647,6 +812,65 @@ pub const Runtime = struct {
 
     // ── internals ────────────────────────────────────────────────────────
 
+    // ── the command queue: producer side in, owner side out ──────────────
+
+    /// Pop every queued command and apply it. **Owner thread only** — it is the
+    /// only caller of `Wheel.scheduleWithId` / `Wheel.cancelWith`.
+    ///
+    /// Drains to empty rather than one command per call: a producer that found
+    /// the queue full should not have to wait for as many ticks as it pushed
+    /// commands, and the drain is bounded by the queue's capacity.
+    fn drainTimerCommands(self: *Self) usize {
+        var applied: usize = 0;
+        while (self.timer_commands.tryPop()) |cmd| {
+            switch (cmd) {
+                .arm => |arm| {
+                    self.wheel.scheduleWithId(arm.id, arm.deadline_ms, arm.action) catch |err| {
+                        // The wheel could not allocate its node, so this timer can
+                        // never fire. Losing it silently is not an option: name the
+                        // error and release the payload the caller handed us.
+                        std.log.err("[runtime] timer arm dropped (id={d}): {s}", .{ arm.id, @errorName(err) });
+                        arm.action.drop(arm.action.ctx, self.allocator);
+                    };
+                    applied += 1;
+                },
+                .cancel => |cancel| {
+                    const removed = self.wheel.cancelWith(cancel.id, self, onTimerCancel);
+                    if (cancel.result) |result| result.store(removed, .monotonic);
+                    if (cancel.done) |done| done.store(true, .release);
+                    applied += 1;
+                },
+            }
+        }
+        return applied;
+    }
+
+    /// Release everything still queued, without touching the wheel: shutdown
+    /// runs on a thread that is *not* the owner (the owner has already been
+    /// joined). A queued arm will never fire, so its payload is dropped exactly
+    /// as a cancel would drop it; a queued cancel is answered "no" so a waiter
+    /// does not hang on a wheel that is going away.
+    fn abandonTimerCommands(self: *Self) void {
+        while (self.timer_commands.tryPop()) |cmd| {
+            switch (cmd) {
+                .arm => |arm| arm.action.drop(arm.action.ctx, self.allocator),
+                .cancel => |cancel| {
+                    if (cancel.result) |result| result.store(false, .monotonic);
+                    if (cancel.done) |done| done.store(true, .release);
+                },
+            }
+        }
+    }
+
+    /// Wake everyone parked in `cancelTimerSync`. Only called when somebody is
+    /// actually waiting, so the drain path's cost does not depend on it.
+    fn wakeTimerWaiters(self: *Self) void {
+        if (self.timer_waiters.load(.monotonic) == 0) return;
+        self.cmd_mu.lock(self.io) catch return;
+        self.cmd_idle.broadcast(self.io);
+        self.cmd_mu.unlock(self.io);
+    }
+
     fn onTimerCancel(self: *Runtime, id: u64, action: TimerAction) void {
         _ = id;
         action.drop(action.ctx, self.allocator);
@@ -672,6 +896,12 @@ pub const Runtime = struct {
     }
 
     fn tickerMain(self: *Self) void {
+        // Take the wheel before touching it, and re-align its clock: time has
+        // passed since `Runtime.init`. Both have to happen on *this* thread — the
+        // wheel has one writer by contract, and `start()` runs on somebody else's.
+        self.wheel.claimOwner();
+        self.wheel.alignNow(self.clock.nowMs());
+
         self.mu.lock(self.io) catch return;
         while (self.ticker_running.load(.acquire)) {
             self.idle.waitTimeout(self.io, &self.mu, .{
@@ -686,8 +916,12 @@ pub const Runtime = struct {
             };
             self.mu.unlock(self.io);
 
+            // Commands first, then the clock: a timer armed during the previous
+            // tick is already a wheel node when this tick advances over it.
+            const applied = self.drainTimerCommands();
             const before = self.clock.nowMs();
             _ = self.wheel.advance(before, self, onTimerFire);
+            if (applied > 0) self.wakeTimerWaiters();
 
             self.mu.lock(self.io) catch return;
         }
@@ -976,10 +1210,14 @@ test "Runtime: cancelling a timer drops it and its payload" {
 
     const handle = try rt.spawn(CounterWorker, .{}, 4);
     const id = try handle.after(100, 5);
+    // The arm is a *request* until the owner drains it: this thread owns the
+    // wheel here (it drives `tick()`), so the tick turns it into a wheel node.
+    _ = rt.tick(); // deadline 100: drained, not due
     try std.testing.expectEqual(@as(usize, 1), rt.wheel.pendingCount());
     // Through the runtime: it drops the payload, which `wheel.cancel` alone
-    // cannot do (it does not know the payload's type).
-    try std.testing.expect(rt.cancelTimer(id));
+    // cannot do (it does not know the payload's type). Synchronous, because the
+    // test wants the answer, not the request.
+    try std.testing.expect(try rt.cancelTimerSync(id));
     try std.testing.expectEqual(@as(usize, 0), rt.wheel.pendingCount());
 
     manual_clock.advance(1_000);
@@ -987,6 +1225,332 @@ test "Runtime: cancelling a timer drops it and its payload" {
     try std.testing.expectEqual(@as(u32, 0), handle.state.seen);
     try std.testing.expectEqual(@as(u64, 0), rt.stats().timer_fires);
     handle.stop();
+}
+
+// ── the wheel's concurrency contract ─────────────────────────────────────
+//
+// Three tests, written against the *contract* rather than the internals:
+// `after()` hands out unique ids, the arm/cancel accounting closes under a
+// concurrent driver, and a timer armed from inside a handler arrives. They are
+// the regression suite for "the wheel is owned by one thread at a time" — the
+// property the command queue in front of it exists to preserve.
+
+/// Request a cancel, retrying while the hand-off queue is full.
+///
+/// `error.Full` is the documented answer to a saturated command queue, and the
+/// ticker is draining it — so for a test that needs the cancel *applied*, the
+/// only honest handling is to wait and retry. (Production code gets to choose:
+/// drop, coalesce or retry, see `docs/RUNTIME.md` §5.)
+fn requestCancelRetry(rt: *Runtime, id: u64) !void {
+    while (true) {
+        rt.requestCancelTimer(id) catch |err| switch (err) {
+            error.Full => {
+                std.atomic.spinLoopHint();
+                continue;
+            },
+        };
+        return;
+    }
+}
+
+/// `cancelTimerSync`, retried on a full queue. Used as a FIFO barrier: the queue
+/// is in-order, so once this one is answered, every cancel pushed before it has
+/// been applied.
+fn cancelSyncRetry(rt: *Runtime, id: u64) !bool {
+    while (true) {
+        return rt.cancelTimerSync(id) catch |err| switch (err) {
+            error.Full => {
+                std.atomic.spinLoopHint();
+                continue;
+            },
+            else => return err,
+        };
+    }
+}
+
+/// T1 — `after()` must hand out a distinct id per call, from any thread.
+///
+/// 32 threads × 10_000 calls, released together by a spin barrier. The barrier
+/// is the point: without it the threads stagger and the read-modify-write on the
+/// id counter is only ever observed one call at a time. The scale is a
+/// trade-off, not a preference — 320k calls is what made the race fire on every
+/// run here, while staying small enough (~2 s in a Debug build, ~5 MB of ids)
+/// not to dominate the suite. The timers are armed an hour out so none of them
+/// fires: the assertion is about the ids, and 320k deliveries would only add
+/// mailbox-drop noise.
+const ArmSquad = struct {
+    handle: *Handle(CounterWorker, 4),
+    ids: []u64,
+    barrier: *std.atomic.Value(u32),
+    threads_n: u32,
+    /// Non-zero ids only: a call that failed can never be cancelled, and the
+    /// caller reports the count separately.
+    failed: *std.atomic.Value(usize),
+
+    fn run(self: *@This()) void {
+        _ = self.barrier.fetchAdd(1, .acq_rel);
+        while (self.barrier.load(.acquire) < self.threads_n) std.atomic.spinLoopHint();
+        for (self.ids) |*id| {
+            // The command queue is a bounded hand-off, so a saturated runtime
+            // answers `error.Full` — that is the contract, not a failure. Retry
+            // (the driver is draining); anything else ends the thread.
+            while (true) {
+                id.* = self.handle.after(3_600_000, 1) catch |err| switch (err) {
+                    error.Full => {
+                        std.atomic.spinLoopHint();
+                        continue;
+                    },
+                    else => {
+                        _ = self.failed.fetchAdd(1, .monotonic);
+                        id.* = 0;
+                        return;
+                    },
+                };
+                break;
+            }
+        }
+    }
+};
+
+test "T1 Runtime: concurrent after() hands out unique timer ids" {
+    const threads_n = 32;
+    const per_thread = 10_000;
+    const total = threads_n * per_thread;
+
+    // `std.heap.smp_allocator`, not `std.testing.allocator`: this test makes
+    // 640k allocations (one `Delivery` per arm, one wheel node per drained arm)
+    // from 33 threads at once, and the testing allocator's per-allocation stack
+    // capture plus its per-thread rendezvous turned that into >10 minutes of
+    // lock spinning on this machine. The scalable allocator makes the same work
+    // take well under a second. What is given up is leak *accounting* — so the
+    // release story is asserted structurally instead, at the end of the test
+    // (every cancel applied, `pendingCount() == 0`).
+    const alloc = std.heap.smp_allocator;
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(alloc, std.testing.io, .{ .manual = &clk });
+    defer rt.deinit();
+    // Whichever thread drives the wheel (here: the ticker) is the only one that
+    // may touch it, so the ticker has to be the one that is running.
+    try rt.start();
+    const handle = try rt.spawn(CounterWorker, .{}, 4);
+    defer handle.stop();
+
+    const ids = try alloc.alloc(u64, total);
+    defer alloc.free(ids);
+
+    var barrier = std.atomic.Value(u32).init(0);
+    var failed = std.atomic.Value(usize).init(0);
+    var threads: [threads_n]std.Thread = undefined;
+    var squads: [threads_n]ArmSquad = undefined;
+    for (&squads, &threads, 0..) |*s, *t, i| {
+        s.* = .{
+            .handle = handle,
+            .ids = ids[i * per_thread ..][0..per_thread],
+            .barrier = &barrier,
+            .threads_n = threads_n,
+            .failed = &failed,
+        };
+        t.* = try std.Thread.spawn(.{}, ArmSquad.run, .{s});
+    }
+    for (&threads) |*t| t.join();
+
+    try std.testing.expectEqual(@as(usize, 0), failed.load(.monotonic));
+
+    var seen = std.AutoHashMapUnmanaged(u64, void).empty;
+    defer seen.deinit(alloc);
+    var duplicates: usize = 0;
+    for (ids) |id| {
+        if ((try seen.getOrPut(alloc, id)).found_existing) duplicates += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), duplicates); // two timers sharing an id is the bug
+    try std.testing.expectEqual(@as(usize, total), seen.count());
+
+    // Release the timers. The payloads are heap-allocated `Delivery`s, and the
+    // wheel does not run their `drop` when it is torn down, so leaving them
+    // pending would be reported by the testing allocator rather than by the
+    // assertion above — a failure for the wrong reason.
+    //
+    // The requests are asynchronous (the ticker owns the wheel), so the last
+    // step is a `cancelTimerSync` on an id that cannot exist: the queue is FIFO,
+    // so once that one is answered, every cancel pushed before it has been
+    // applied.
+    for (ids) |id| try requestCancelRetry(&rt, id);
+    try std.testing.expect(!try cancelSyncRetry(&rt, std.math.maxInt(u64)));
+    try std.testing.expectEqual(@as(usize, 0), rt.wheel.pendingCount());
+}
+
+/// T2 — the arm/cancel/fire accounting must close while a driver is advancing
+/// the wheel underneath the producers.
+///
+/// Producers arm and cancel through `Runtime` while the test thread drives
+/// `tick()`; each timer's payload points at its own counter, so "fired" is
+/// observable per timer with no mailbox in the way (nothing to drop, no log
+/// noise, no flakiness of the test's own making).
+///
+/// The invariant is `S = F + C + P`: every successful arm either fired, was
+/// cancelled, or is still pending — and no timer does two of those.
+const T2Slot = struct {
+    fired: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+};
+
+const T2Payload = struct {
+    fn post(ctx: *anyopaque) void {
+        const slot: *T2Slot = @ptrCast(@alignCast(ctx));
+        _ = slot.fired.fetchAdd(1, .monotonic);
+    }
+    fn drop(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+        // The slots live in the test's own array: nothing to release. (The
+        // runtime still calls this on the cancel path, which is what keeps the
+        // payload's ownership contract honest.)
+        _ = ctx;
+        _ = allocator;
+    }
+};
+
+const T2Producer = struct {
+    rt: *Runtime,
+    slots: []T2Slot,
+    ids: []u64,
+    cancelled: []bool,
+    armed: *std.atomic.Value(usize),
+    finished: *std.atomic.Value(usize),
+    errors: *std.atomic.Value(usize),
+
+    fn run(self: *@This()) void {
+        defer _ = self.finished.fetchAdd(1, .release);
+        for (self.ids, 0..) |*id, i| {
+            const slot = &self.slots[i];
+            const delay: i64 = 10 + @as(i64, @intCast(i % 40)) * 10;
+            id.* = self.rt.scheduleAction(delay, .{
+                .ctx = @ptrCast(slot),
+                .post = T2Payload.post,
+                .drop = T2Payload.drop,
+            }) catch {
+                _ = self.errors.fetchAdd(1, .monotonic);
+                return;
+            };
+            _ = self.armed.fetchAdd(1, .monotonic);
+            // Cancel a timer armed three calls ago: by now the driver may
+            // already have fired it, which is exactly the interleaving the
+            // accounting has to survive. Synchronous on purpose — the point of
+            // the test is to count *applied* cancels, not requested ones.
+            if (i >= 3 and i % 3 == 0) {
+                self.cancelled[i - 3] = self.rt.cancelTimerSync(self.ids[i - 3]) catch failed: {
+                    // A failed request must not be silently read as "not
+                    // cancelled": the invariant below would still hold and hide
+                    // it. Count it and assert on the count.
+                    _ = self.errors.fetchAdd(1, .monotonic);
+                    break :failed false;
+                };
+            }
+        }
+    }
+};
+
+test "T2 Runtime: concurrent arm/cancel/advance keeps scheduled = fired + cancelled + pending" {
+    const producers_n = 4;
+    const per_producer = 1_000;
+    const total = producers_n * per_producer;
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .{ .manual = &clk });
+    defer rt.deinit();
+
+    const slots = try std.testing.allocator.alloc(T2Slot, total);
+    defer std.testing.allocator.free(slots);
+    @memset(slots, T2Slot{});
+    const ids = try std.testing.allocator.alloc(u64, total);
+    defer std.testing.allocator.free(ids);
+    @memset(ids, 0);
+    const cancelled = try std.testing.allocator.alloc(bool, total);
+    defer std.testing.allocator.free(cancelled);
+    @memset(cancelled, false);
+
+    var armed = std.atomic.Value(usize).init(0);
+    var finished = std.atomic.Value(usize).init(0);
+    var errors = std.atomic.Value(usize).init(0);
+    var threads: [producers_n]std.Thread = undefined;
+    var workers: [producers_n]T2Producer = undefined;
+    for (&workers, &threads, 0..) |*w, *t, p| {
+        w.* = .{
+            .rt = &rt,
+            .slots = slots[p * per_producer ..][0..per_producer],
+            .ids = ids[p * per_producer ..][0..per_producer],
+            .cancelled = cancelled[p * per_producer ..][0..per_producer],
+            .armed = &armed,
+            .finished = &finished,
+            .errors = &errors,
+        };
+        t.* = try std.Thread.spawn(.{}, T2Producer.run, .{w});
+    }
+
+    // The driver: advance the clock and let the wheel do its work while the
+    // producers are still arming. Bounded so a wedged producer fails the test
+    // instead of hanging the suite.
+    var spins: usize = 0;
+    while (finished.load(.acquire) < producers_n and spins < 200_000_000) : (spins += 1) {
+        clk.advance(5);
+        _ = rt.tick();
+    }
+    try std.testing.expectEqual(@as(usize, producers_n), finished.load(.acquire));
+    for (&threads) |*t| t.join();
+    try std.testing.expectEqual(@as(usize, 0), errors.load(.monotonic));
+
+    // One last tick with the clock past every deadline: drain, then advance.
+    clk.set(10_000_000);
+    _ = rt.tick();
+
+    var fired: usize = 0;
+    for (slots) |*slot| {
+        const n = slot.fired.load(.monotonic);
+        try std.testing.expect(n <= 1); // a timer fires once
+        fired += n;
+    }
+    for (cancelled, slots) |was_cancelled, slot| {
+        if (was_cancelled) try std.testing.expectEqual(@as(u32, 0), slot.fired.load(.monotonic)); // neither both
+    }
+
+    const scheduled = armed.load(.monotonic);
+    const cancelled_n = rt.wheel.cancelled;
+    const pending = rt.wheel.pendingCount();
+    try std.testing.expectEqual(scheduled, fired + cancelled_n + pending);
+    try std.testing.expectEqual(@as(usize, 0), pending); // the clock is past every deadline
+}
+
+/// T3 — the documented worker idiom: a handler arms a timer through its own
+/// handle, and the runtime's ticker delivers the message later. This is the
+/// path §3 of `docs/RUNTIME.md` tells workers to use, so it has to keep
+/// working whatever the wheel's internals become.
+const DeferProbe = struct {
+    pub const Message = u32;
+    deferred_seen: bool = false,
+    armed: bool = false,
+
+    pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
+        switch (msg) {
+            1 => {
+                self.armed = true;
+                _ = try ctx.handle.after(10, 2);
+            },
+            else => self.deferred_seen = true,
+        }
+    }
+};
+
+test "T3 Runtime: a worker's own after() still fires with the ticker running" {
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .monotonic);
+    defer rt.deinit();
+    try rt.start();
+    const handle = try rt.spawn(DeferProbe, .{}, 8);
+    defer handle.stop();
+
+    try handle.send(1);
+
+    var spins: usize = 0;
+    while (!handle.state.deferred_seen and spins < 400_000_000) : (spins += 1) std.atomic.spinLoopHint();
+    try std.testing.expect(handle.state.armed);
+    try std.testing.expect(handle.state.deferred_seen);
 }
 
 // ── trace context ────────────────────────────────────────────────────────
@@ -1149,6 +1713,7 @@ test "Runtime: a timer scheduled inside a handler keeps that message's trace" {
     var spins: usize = 0;
     while (handle.state.count == 0 and spins < 8_000_000) : (spins += 1) std.atomic.spinLoopHint();
     try std.testing.expectEqual(@as(usize, 1), handle.state.count); // handled, timer armed
+    _ = rt.tick(); // the arm is a queued request: this drains it into the wheel (1000 + 10, not due)
     try std.testing.expectEqual(@as(usize, 1), rt.wheel.pendingCount());
 
     clk.advance(10);

@@ -2,6 +2,47 @@
 
 ## [Unreleased]
 
+### 定时器时间轮改为 ticker-owned：跨线程 arm 不再共享写（**破坏性：是**）
+
+`docs/RUNTIME.md` §4 早就把 `Wheel(Payload)` 标成"单线程驱动"，但实现不是：时间轮零锁零原子，
+而 `Handle.after`（任意线程）会一路走到 `wheel.schedule` 写 `nodes` 哈希表与 id 计数器，ticker 线程
+同时 `advance`。两个线程同时进 `schedule` 时 `std.hash_map` 的 pointer-stability 断言
+（`assert(l.state == .unlocked)`）直接 ABRT —— 这不是理论风险，见下面的复现规模。
+
+修法不是"给它加一把锁"，而是把文档那句话变成真的：**时间轮变成 ticker-owned state machine**，
+生产者与 owner 之间只通过一条定容命令队列交接。
+
+**命令队列**：`Runtime` 内一条 `MpscRing(TimerCommand, 512)`。`arm` 与 `cancel` 走**同一条 FIFO**
+—— 这样二者的线性化顺序由队列唯一确定（先 arm 后 cancel = 被取消；先 cancel 后 arm = 正常触发），
+而不是两条队列下的掷骰子。`after`/`scheduleAction` 在调用线程上只做三件事：取 id（`Sequencer.next()`）、
+按自己的时钟读算 `deadline`、入队。**入队不分配**（定容环），满则 `error.Full` —— 不静默丢。
+
+- **`deadline` 在生产者侧算**：`after(50)` 仍是"从调用时刻起 +50"，与 ticker 忙不忙无关。
+- **id 在生产者侧取**：`after` 立刻能返回一个 id（`!Id` 签名不变），不必等 ticker。
+- ticker 与 `Runtime.tick()` 每轮**先 drain 命令、再 advance**；`tick()` 即声明自己是 owner。
+- **`cancelTimer(id) bool` 已删除**（清点结果：只有框架内部 + 一个单测在用，无对外用户），替换为
+  - `requestCancelTimer(id) !void` —— 热路径，语义是"**请求已交给 Runtime**"（约一个 tick 后生效）；
+  - `cancelTimerSync(id) !bool` —— 控制面，等 owner 执行完并返回最终结果。
+  旧名字的坏处正是它读起来像"已取消"，而它从来只是"请取消"。
+- **`Wheel` 加 owner 断言**：`claimOwner()` 发布（第二次被别人抢 = panic），`assertOwner()` 在
+  `schedule`/`scheduleWithId`/`cancel`/`cancelWith`/`advance` 上拦"第二个线程"，**只在 Debug/ReleaseSafe
+  生效**（ReleaseFast 编译掉，基准不掉速）。未声明 owner 的裸时间轮（测试 / 基准 / 自持循环）不受影响。
+- `now_ms` 只由 owner 写：`start()` 里那次赋值挪进 ticker 自己（`Wheel.alignNow`）。
+- `shutdown()` 会把命令队列里没来得及执行的东西交出去（arm 调 `drop` 释放 payload、cancel 回报 false），
+  停机不再漏掉"还在路上"的定时器 payload。
+
+**回归测试 3 条**（`src/runtime/runtime.zig`，都是 §3 契约级、不是一次性脚本）：
+
+- `T1`：32 线程 × 10_000 次 `after()`，**启动栅栏**同时开始，320k 个 id 必须互不相同。
+  修复前：`std.hash_map` pointer-stability 断言失败 → **ABRT**（原始栈见 PR/文档记录）。
+- `T2`：4 生产者并发 arm/cancel、同时驱动 `tick()`，末尾断言 `S = F + C + P`、同一 id 只 fire 一次、
+  不许既 fire 又 cancel。修复前：ABRT（同上，栈落在 `timer_wheel.zig:98` 的 `nodes.put`）。
+- `T3`：worker 在自己的 handler 里 `ctx.handle.after(...)`、ticker 在跑，断言那条消息最终到达
+  （文档 §3 推荐的用法；修复前就是绿的，保留为回归网）。
+
+**未附带**：`Runtime.shutdown()` 仍不释放**已经进轮**的待触发 payload（只释放命令队列里的）——
+和修复前同形，属既知缺口，另开一项处理。
+
 ### 新增：EventRecorder v1 —— 运行时投递流可录、可重放（**破坏性：否**）
 
 `HotBus` 是**有意有损**的（满则丢并计数），运行时也没有全局顺序（每邮箱 FIFO），所以"这次运行

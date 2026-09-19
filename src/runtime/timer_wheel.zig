@@ -22,6 +22,24 @@
 //! Payload is comptime so the wheel allocates nothing per fire and knows nothing
 //! about what a timer means: the runtime passes "deliver this message to that
 //! worker", a test passes a counter.
+//!
+//! ## Ownership: one thread at a time
+//!
+//! The wheel has no lock, and that is a contract, not an oversight: **only the
+//! thread that drives it may call `schedule` / `cancel` / `advance`.** Every
+//! field (`now_ms`, `slots`, `nodes`, and the id counter) is single-writer state.
+//!
+//! The runtime holds up its end by making the driver the only writer: `after()`
+//! from any thread turns into a command on the runtime's bounded queue, and the
+//! ticker (or whoever calls `Runtime.tick()`) is the one thread that drains that
+//! queue into the wheel. Direct users (a test, the benchmark harness, a custom
+//! loop) own the wheel implicitly because they are the only ones holding it.
+//!
+//! `claimOwner` publishes that thread and `assertOwner` — Debug/ReleaseSafe only,
+//! compiled out of ReleaseFast — turns "someone called this from a second
+//! thread" into a panic at the call site instead of a corrupted hash map three
+//! layers down. An unclaimed wheel (owner 0) asserts nothing, which is what
+//! keeps a directly-held wheel usable.
 
 const std = @import("std");
 
@@ -58,6 +76,10 @@ pub fn Wheel(comptime Payload: type) type {
         };
 
         allocator: std.mem.Allocator,
+        /// The one thread allowed to touch this wheel. 0 = not claimed: either a
+        /// wheel held directly by a test/harness, or the window before the
+        /// runtime's driver publishes itself. See the module doc comment.
+        owner: std.atomic.Value(std.Thread.Id) = std.atomic.Value(std.Thread.Id).init(0),
         /// Absolute slot index per level, as of `now_ms`.
         index: [levels]u64 = @splat(0),
         now_ms: i64 = 0,
@@ -83,27 +105,82 @@ pub fn Wheel(comptime Payload: type) type {
             self.* = undefined;
         }
 
+        /// Publish the calling thread as the wheel's owner. Idempotent for that
+        /// thread; a *second* thread claiming a wheel that is already owned is
+        /// the bug the whole ownership story exists to prevent, so it panics.
+        pub fn claimOwner(self: *Self) void {
+            const me = std.Thread.getCurrentId();
+            if (self.owner.cmpxchgStrong(0, me, .acq_rel, .acquire)) |current| {
+                if (current != me) @panic("timer wheel: claimed by a second thread");
+            }
+        }
+
+        /// The wheel's owner (0 = unclaimed).
+        pub fn ownerThread(self: *const Self) std.Thread.Id {
+            return self.owner.load(.acquire);
+        }
+
+        /// Owner-only in Debug/ReleaseSafe. Compiled out of ReleaseFast, where it
+        /// would show up in the benchmark's `advance` loop.
+        inline fn assertOwner(self: *const Self) void {
+            if (!std.debug.runtime_safety) return;
+            const owner = self.owner.load(.acquire);
+            if (owner == 0 or owner == std.Thread.getCurrentId()) return;
+            @panic("timer wheel: touched from a thread that does not own it");
+        }
+
+        /// Move the wheel's clock to `now_ms`. Owner-thread bookkeeping between
+        /// `init` and the first `advance` (a driver that starts late must not
+        /// walk the slots the process spent starting up).
+        pub fn alignNow(self: *Self, now_ms: i64) void {
+            self.assertOwner();
+            self.now_ms = now_ms;
+            for (0..levels) |l| self.index[l] = slotIndex(@intCast(l), now_ms);
+        }
+
         /// Schedule `payload` to fire at `deadline_ms`. Returns a handle for
         /// `cancel`. Allocates one node (bounded by the number of live timers).
         pub fn schedule(self: *Self, deadline_ms: i64, payload: Payload) !Id {
+            const id = self.next_id;
+            try self.scheduleWithId(id, deadline_ms, payload);
+            self.next_id = id + 1;
+            return id;
+        }
+
+        /// `schedule` with an id the caller already minted.
+        ///
+        /// The runtime takes its ids from a lock-free `Sequencer` on the
+        /// *producer* side, because `after()` has to return an id to a caller
+        /// that must not wait for the ticker. That splits id minting from node
+        /// creation, so this is the entry point that takes the pre-minted one —
+        /// uniqueness stays the caller's obligation (it has the sequencer).
+        pub fn scheduleWithId(self: *Self, id: Id, deadline_ms: i64, payload: Payload) !void {
+            self.assertOwner();
             const clamped_deadline = @max(deadline_ms, self.now_ms);
             const node = try self.allocator.create(Node);
             errdefer self.allocator.destroy(node);
             node.* = .{
-                .id = self.next_id,
+                .id = id,
                 .deadline_ms = clamped_deadline,
                 .payload = payload,
             };
-            self.next_id += 1;
+            // A duplicate id would silently orphan the earlier node (the map
+            // keeps one node per id, the slot lists keep both), so with runtime
+            // safety on this is a hard failure rather than a slow leak. The whole
+            // check is gone in ReleaseFast — the benchmark's 100k-insert loop
+            // must not pay for a hash lookup per timer.
+            if (std.debug.runtime_safety) {
+                if (self.nodes.contains(id)) @panic("timer wheel: id handed out twice");
+            }
             try self.nodes.put(self.allocator, node.id, node);
             self.insert(node);
-            return node.id;
         }
 
         /// Drop a pending timer. False when it already fired or was cancelled.
         ///
         /// The payload is not touched: if it owns memory, use `cancelWith`.
         pub fn cancel(self: *Self, id: Id) bool {
+            self.assertOwner();
             const node = self.nodes.fetchRemove(id) orelse return false;
             self.unlink(node.value);
             self.allocator.destroy(node.value);
@@ -120,6 +197,7 @@ pub fn Wheel(comptime Payload: type) type {
             ctx: anytype,
             comptime on_cancel: fn (@TypeOf(ctx), Id, Payload) void,
         ) bool {
+            self.assertOwner();
             const node = self.nodes.fetchRemove(id) orelse return false;
             const payload = node.value.payload;
             self.unlink(node.value);
@@ -137,12 +215,15 @@ pub fn Wheel(comptime Payload: type) type {
         /// due timer with the payload — synchronous, on the caller's thread, so
         /// keep it short (the runtime's hook posts a message, it does not run
         /// application work here).
+        ///
+        /// Owner thread only.
         pub fn advance(
             self: *Self,
             now_ms: i64,
             ctx: anytype,
             comptime on_fire: fn (@TypeOf(ctx), Id, Payload) void,
         ) usize {
+            self.assertOwner();
             if (now_ms < self.now_ms) return 0; // time does not go backwards
             const delta = now_ms - self.now_ms;
             if (delta < max_cascade_ms) {
@@ -434,6 +515,36 @@ test "Wheel cancel removes a middle node, keeping the others" {
     _ = wheel.advance(400, &rec, Recorder(u32).on_fire);
     try std.testing.expectEqual(@as(u32, 4), rec.fired.items[rec.fired.items.len - 1]);
     try std.testing.expectEqual(@as(usize, 0), wheel.pendingCount());
+}
+
+test "Wheel scheduleWithId keeps the caller's id (the runtime mints its own)" {
+    var wheel = Wheel(u32).init(std.testing.allocator, 0);
+    defer wheel.deinit();
+    var rec = Recorder(u32){};
+    defer rec.deinit();
+
+    // Ids that a `Sequencer` on the producer side already handed out — the wheel
+    // must not renumber them, or `after()` could not return an id without
+    // waiting for the driver.
+    try wheel.scheduleWithId(7_000_000_000, 100, 5);
+    try std.testing.expect(wheel.cancel(7_000_000_000));
+    try std.testing.expect(!wheel.cancel(1)); // nothing was minted for id 1
+
+    // Mixing both entry points keeps them distinct: `schedule` still mints.
+    const minted = try wheel.schedule(100, 6);
+    try std.testing.expectEqual(@as(u64, 1), minted);
+    try std.testing.expectEqual(@as(usize, 1), wheel.pendingCount());
+}
+
+test "Wheel ownership: claiming is publish-and-idempotent" {
+    var wheel = Wheel(u32).init(std.testing.allocator, 0);
+    defer wheel.deinit();
+    try std.testing.expectEqual(@as(std.Thread.Id, 0), wheel.ownerThread()); // unclaimed: assertOwner is a no-op
+
+    wheel.claimOwner();
+    try std.testing.expectEqual(std.Thread.getCurrentId(), wheel.ownerThread());
+    wheel.claimOwner(); // same thread again: fine
+    try std.testing.expectEqual(std.Thread.getCurrentId(), wheel.ownerThread());
 }
 
 /// Records fires in order so tests can assert *which* timers fired and when.

@@ -93,6 +93,19 @@ book.stop();                                       // 请求结束（join 由 sh
   `init`/`run` 阶段也是 `null`。见 §8.1。
 - 定时器**只投消息**，不在 ticker 线程上跑你的代码：`ctx.handle.after(...)` 是唯一的延迟入口，
   这样 worker 的状态依然单线程独占。
+- **`after` 到底做了什么**（v0.28 起）：调用方只做三件事 —— 取一个 id（`Sequencer.next()`，无锁）、
+  用自己的时钟读算出 `deadline`、把一条 `arm` 命令推进 `Runtime` 的有界命令队列（定容、**入队不分配**）。
+  真正碰时间轮的只有**拥有它的那一个线程**：命令行上的 ticker（或自己 `tick()` 的那个线程）每轮
+  **先 drain 命令、再 `advance`**，由它做 `wheel.schedule`/`cancel` —— 时间轮因此是单写者状态，
+  不需要锁，也不会出现两个线程同时写 `nodes` 的哈希表撕裂（这正是 v0.27 的缺陷）。
+  - **有效延迟** = `∈ [delay_ms, delay_ms + 入队延迟 + tick_interval_ms]`：`deadline` 在**调用侧**
+    算好，所以 `after(50)` 始终是"从这次调用起 +50"，与 ticker 忙不忙无关；tick 间隔是 **5ms**。
+  - 命令队列满 = `error.Full`（**不静默丢**，和邮箱同一条原则）：调用方自己决定丢弃/合并/重试。
+- **取消有两个入口，语义写在名字里**（v0.28）：
+  - `rt.requestCancelTimer(id) !void` —— 热路径，含义是"**请求已交给 Runtime**"，约一个 tick 后生效；
+  - `rt.cancelTimerSync(id) !bool` —— 控制面，等 owner 执行完并返回**最终结果**（`true` = 当时还在 pending）。
+  ARM 与 CANCEL 走**同一条 FIFO 队列**，所以"先 arm 后 cancel"与"先 cancel 后 arm"的结果是确定的
+  （前者被取消、后者正常触发），不是掷骰子。
 - `handle`/`run` 返回的错误被记录并计数（`stats().handler_errors`），**不会**停掉 worker；
   panic 不可捕获，会带走进程 —— 热路径上的 panic 见 `docs/BEST_PRACTICES.md`「韧性」。
 
@@ -210,7 +223,7 @@ defer app.stop();   // 先请求停止 + join worker，再停模块
 | `RingBuffer(T, N)` | 1 生产者 / 1 消费者 | 无 CAS（各自只读对方指针）；N 必须 2 的幂 |
 | `MpscRing(T, N)` | N 生产者 / 1 消费者 | Vyukov 有界队列；**N ≥ 2**（N=1 时序号无法区分"空"与"未消费"，编译期拒绝） |
 | `Mailbox(T, N)` | N 生产者 / 1 消费者 | 有界 + 阻塞；`send` 满即 `error.Full`，`sendBlocking` 换延迟；`close()` 唤醒等待者 |
-| `Wheel(Payload)` | 单线程驱动 | 分层时间轮，O(1) 插入/取消；10ms 粒度、5 层、最长 ~124 天；长停摆走 O(pending) 扫描 |
+| `Wheel(Payload)` | **单线程驱动（ticker 独占）** | 分层时间轮，O(1) 插入/取消；10ms 粒度、5 层、最长 ~124 天；长停摆走 O(pending) 扫描。**零锁**：`schedule`/`cancel`/`advance` 只有驱动它的那一个线程能调（Debug/ReleaseSafe 下 `claimOwner`+`assertOwner` 会拦）；跨线程只通过 `Runtime` 的有界命令队列交接，见 §3「`after` 到底做了什么」 |
 | `ObjectPool(T)` | 多线程 | 定容 + 自旋锁；`acquire` **不分配**，耗尽返回 null（把流量高峰变成"削峰"而不是 OOM） |
 | `Clock` | 值类型 | `.monotonic`（生产）/ `.manual`（测试：不睡觉就能推动一小时定时器） |
 | `Sequencer` | 多线程 | 无锁单调序列：`next()` / `nextBatch(n)` / `advanceTo()`；**不是时钟**（只在进程生命期内有意义） |
@@ -220,6 +233,17 @@ defer app.stop();   // 先请求停止 + join worker，再停模块
 **为什么池用自旋锁而不是无锁栈**：Treiber 栈在索引上有一个 ABA 窗口，会把同一个对象发给两个调用者 ——
 那是任何测试都不稳定复现的数据竞争。临界区只有一次指针交换，锁的代价远小于"正确性靠运气"。
 真出现争用，正确做法是**按线程分片**，不是把锁去掉。
+
+**为什么时间轮没有锁**：它不需要"多线程安全"，它需要"只有一个写者"。时间轮的字段（`now_ms` / `slots` /
+`nodes` / id 计数器）全是单写者状态，给它加一把锁只是把一个**顺序**问题伪装成互斥问题：两个线程各自
+`arm` 的先后仍然无定义。所以 v0.28 把它改成 **ticker-owned state machine** —— 生产者只推命令，
+owner 独占执行，线性化顺序由队列的 FIFO 唯一确定（和 `Worker` 的 state 归 worker 线程、
+`Mailbox` 归交接边界是同一套哲学）。`Wheel.claimOwner()` 发布 owner，`assertOwner()` 在
+Debug/ReleaseSafe 下把"第二个线程碰它"变成调用点 panic，ReleaseFast 里整段编译掉（基准不掉速）。
+
+**`Clock.Manual.advance` 只在测试 driver / ticker owner 线程上调**：`Manual` 是给"自己驱动"的场景用的
+（`tick()` 那条路），谁驱动谁推进；生产里是 `.monotonic`，没人写它。别让一个生产者线程去推时钟 ——
+那又是"生产者写、ticker 读"的老问题换了个字段。
 
 ## 5. 背压语义（这是运行时的核心承诺）
 
@@ -236,6 +260,7 @@ error.Full        阻塞等待（recv(0)）或超时（recv(ms)）
 
 1. **队列永不增长**。容量是 comptime 的，`error.Full` 是唯一出口 —— 内存曲线可预测。
 2. **丢弃必须可见**。`stats().dropped_full` 计数，`RuntimeStats` 汇总，接 Prometheus 只是时间问题。
+   定时器命令队列（`timer_command_capacity` = 512）用同一条规则：满了就 `error.Full`，不静默丢。
 3. **消息是值**。`T` 按值拷贝进队列；要传堆对象就传指针并显式约定所有权，别让 `T` 偷偷拥有内存。
 
 ## 6. 事件分层（L0 / L1 / L2）
@@ -310,6 +335,8 @@ pub fn handle(self: *Self, msg: Msg, ctx: anytype) anyerror!void {
 - `Handle.after(delay, msg)` 在 **handler 内**（也就是 worker 自己的线程上）调用时，会把**当前这条消息**的
   trace 一并投给定时器投递的消息 —— "延迟处理"仍然属于发起它的那次请求。在别的线程上调 `after` 则投递
   无 trace 的消息（那里没有正在处理的请求，硬编一个反而是假的）。
+- `Handle.after` **不在调用线程上碰时间轮**：它只取 id、算 `deadline`、推一条命令（见 §3「`after` 到底做了什么」）。
+  所以"任何线程都能安全地 arm 定时器"是结构性的，而不是靠一把锁兜住。
 - **错误日志带 `trace=`**：`handler error` 与 `stopped by supervisor` 两行都会带上出错那条消息的 trace id
   （`[runtime] OrderBook trace=<hex> handler error (2 in window): Boom`），可直接 grep 回请求。
 - `Handle.send` / `sendBlocking` 签名没变，`HotBus` / `Mailbox` / `Runtime.spawn` 的契约也没变；
@@ -348,6 +375,7 @@ fn traceFromHeader(id: []const u8) zigmodu.runtime.TraceId {
 | **v0.21** | Agent Runtime（Identity / Memory / Skills / Permissions / Budget 一等化） | ✅ 已发布：`ai.AgentSpec` + `ai.Guard`（已接进 `Agent.run`）+ `ai.ProposalPipeline` —— 见 `docs/AGENT_RUNTIME.md`；**Agent 的 State / Event subscriptions / Lifecycle 仍未做** |
 | **v0.22.0** | Agent 跑成 worker（`Agent → Worker → Event`） | ✅ `ai.AgentWorker`：`rt.spawn(ai.AgentWorker, …)` + `ai.agent_worker.post(...)`，有界邮箱 / 生命周期 / 监督 / 指标跟着来 —— 见 `docs/AGENT_RUNTIME.md` §六 |
 | **Unreleased** | EventRecorder v1：`Recorder(E, C)` + `HotBus.attachRecorder`（运行时投递流录制、按 seq 重放并驱动 `Clock.Manual`） | ✅ 本文档 §11.6（**尚未发版**；落盘、多事件类型、`Handle.send`/定时器投递不在 v1） |
+| **Unreleased** | 定时器时间轮改为 **ticker-owned**：`Runtime` 命令队列（`arm`/`cancel` 同一条 FIFO）+ 生产者侧 id/deadline；`cancelTimer` 拆成 `requestCancelTimer`（请求）/ `cancelTimerSync`（要结果） | ✅ 本文档 §3/§4（**Breaking**：旧的 `cancelTimer(id) bool` 已删） |
 | 1.0 | API 收敛、命名统一、deprecated 清理 | 计划 |
 
 ## 10. 最小示例
