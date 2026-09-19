@@ -97,7 +97,7 @@
     "unit": "ratio",
     "value": 0.0524,
     "normalized_by": "atomic RMW x10M",
-    "note": "median of three measured metric/reference pairs from CI logs: 1.24/23.68 (run 35426335882), 1.24/23.56 (35423924976), 1.09/20.67 (35424522314) — see scripts/check-bench.sh header; the 1.09 ms absolute entry it replaces was a host-class artifact (2.34 ms on the one Xeon 8370C run, identical loop)"
+    "note": "median of three measured metric/reference pairs from CI logs: 1.24/23.68 (run 35426335882), 1.24/23.56 (35423924976), 1.09/20.67 (35424522314) \u2014 see scripts/check-bench.sh header; the 1.09 ms absolute entry it replaces was a host-class artifact (2.34 ms on the one Xeon 8370C run, identical loop)"
   },
   {
     "name": "Mailbox post+drain x1M",
@@ -117,6 +117,12 @@
     "name": "TimerWheel x100K",
     "unit": "ms",
     "value": 6.87
+  },
+  {
+    "name": "TimerWheel churn x1M",
+    "unit": "ms",
+    "value": 43.35,
+    "note": "recorded from run for 2fe8454 (region=westus, AMD EPYC 7763) \u2014 the gate's own run; it WARNed as 'not in the baseline' before this"
   },
   {
     "name": "HotBus 8sub x1M",
