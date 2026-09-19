@@ -529,6 +529,7 @@ fn traceFromHeader(id: []const u8) zigmodu.runtime.TraceId {
 | **未发版** | WorkerPool **Phase 1**：`spawn(..., .{ .mode = .pooled })` + `queued`/`claimed` 两位 + 就绪环 + **一条**池线程（`src/runtime/scheduler.zig`）；池在 `Runtime.initWithOptions` / `builder.withMaxPooledWorkers` 声明的上界内 | ✅ 本文档 §12.10（**Breaking：否** —— 第三参同时接受 `256` 与 `.{ .capacity = 256, .mode = .pooled }`；`run` 型 worker 用 `.pooled` 是编译期报错，见 `scripts/check-pool-guard.sh`） |
 | **未发版** | 池的**可观测性与示例**：6 条 `zigmodu_runtime_pool_*`（§8）+ `examples/runtime-workers` 的 audit 环真的以 `.pooled` 跑（`[pool] dispatched>0` 才算过）+ `zmodu runtime` 报池声明 | ✅ 本文档 §12.10 末节（**Breaking：否**；顺带修掉 `Application.Config.max_pooled_workers` 没被 `Application.init` 拷贝的接线缺口） |
 | **未发版** | **监督停机丢弃可见**：`WorkerStats.discarded_on_stop` / `RuntimeStats.messages_discarded_on_stop` + 第 16 条 gauge `zigmodu_runtime_messages_discarded_on_stop` —— dedicated 的 `break` 与"池先停、邮箱非空"两档都计数 | ✅ 本文档 §5 第 2 条 / §8 / §12.10（**Breaking：否**；`RuntimeStats` 只加字段，停机行为一字未改） |
+| **未发版** | **Runtime Replay v1（投递轨）**：spawn 点 `.record = .{ .id, .capacity }` 声明**每 worker 一条同类型轨**（复用 §11 的环 + log 的一个 `Sequencer` 打**全局** seq），取点在 `Handle` 的投递漏斗（`send*` + `after` 的定时器投递）；`Runtime.deliveryLog()` + `Replayer.step()`（`replayAll()` 附带）按 seq 归并、驱动 `Clock.Manual`、调用方给"标识 → 新 handle"映射回投 | ✅ 本文档 §13.7（**Breaking：否** —— `SpawnConfig` 多一个可选 `.record`，`Handle` 多一个默认 `null` 的 `track`；没声明就是一次空判断 + 零分配不变。**未做**：落盘/codec、跨进程） |
 | 1.0 | API 收敛、命名统一、deprecated 清理 | 计划 |
 
 ## 10. 最小示例
@@ -672,7 +673,8 @@ rec.replay(&manual, &harness, Harness.sink);         // 按 seq 推进 clock，�
 
 - **单一事件类型 `E`**：`Recorder(E, capacity)` 只录一种 `E`。同步录多个 worker 的**异构**
   消息不在 v1 —— `Handle.send` 直达投递、`after` 定时器投递、`MpscRing` 的跨生产者交错
-  都不覆盖。v1 录的是 `HotBus` 的**发布流**。
+  都不覆盖。v1 录的是 `HotBus` 的**发布流**。（**投递流**那一半后来单独做了：**§13** ——
+  取点在 `Handle` 的投递漏斗，每 worker 一条同类型轨 + 共享 `Sequencer`，**不需要 codec**。）
 - 不做领域事件溯源（那是 `core/EventStore.zig`：按 `stream_id` + 版本 + 快照、可持久，
   是"业务决定了什么"；`Recorder` 是"运行时投递了什么"，内存、有界、opt-in 的调试工具）。
 - 不承诺进程级完全确定性：`spawn`/`init` 副作用、网络、墙钟、以及丢弃模式都不重放。
@@ -939,10 +941,14 @@ dedicated 加"抽干后再停"，两者都是会动到 D5 那条回执出口的�
    它**不**去判断"声明的池和 `.pooled` 的 spawn 是不是同一个 build"、也不去判断 pooled worker 是否
    可达 —— 那是文本判不了的。
 
-## 13. Runtime Replay —— 设计草案（未实现）
+## 13. Runtime Replay —— v1 已实现（见 §13.7）
 
-> 状态：**只有设计，没有代码**。§11 的 EventRecorder 已落地（v1），但它记的是 **L0 扇出**；
-> 本节要做的是**投递流**——"每个 worker 实际收到了什么"。**这是两个不同的问题，不是同一个 log 的两个视图。**
+> 状态：**13.1–13.5 是设计草案（决策记录，原样保留）；13.6 的三个待定项已定；13.7 记 v1 落地形状**。
+> 代码在 `src/runtime/recorder.zig`（`Track` / `DeliveryLog` / `Replayer`）+ `src/runtime/runtime.zig`
+> （`.record` 声明、`Handle` 投递漏斗、`Runtime.deliveryLog()`）。
+>
+> §11 的 EventRecorder 记的是 **L0 扇出**（`HotBus.publish` 之前）；本节做的是**投递流**——
+> "每个 worker 实际收到了什么"。**这是两个不同的问题，不是同一个 log 的两个视图。**
 
 ### 13.1 先说清和 §11 的分工（不搞清必然做错）
 
@@ -1018,10 +1024,96 @@ Runtime
   （丢不丢是时序的函数；重放的是**投递成功的那部分**）
 - 不替代 §11 的 L0 log —— 两者并存，回答不同的问题
 
-### 13.6 待定（定完再动手）
+### 13.6 待定 → **已定（v1 按此实现）**
 
-1. **轨的内存上界怎么声明**：per-worker `.record = .{ .capacity = N }`，还是 Runtime 级总量预算？
-2. **worker 稳定标识由谁给**：调用方显式传，还是从 `ModuleContext` 的模块名派生？
-   （倾向显式——派生会做出一个"模块名唯一"的隐含假设。）
-3. **重放的驱动方式**：调用方逐个 `step()` 推进（便于断言与单步调试），还是 `replayAll(ctx, sink)`？
-   （倾向两者都给、以 `step()` 为主，因为 §13.4 的验收需要它。）
+1. **轨的内存上界怎么声明**：**per-worker `.record = .{ .capacity = N }`，在 spawn 点显式声明**。
+   与 §12 的池"默认不创建"同一条纪律：**不做"默认全记"** —— 那会把内存从"声明了多少"变成
+   "有多少 worker"，而生产里 worker 数是数据维数。未声明的 worker 没有轨（它的投递在重放里不存在，
+   见 §13.7 的边界）。
+2. **worker 稳定标识由谁给**：**调用方显式传**（`.record = .{ .id = "book:BTC", … }`），
+   **不从 `ModuleContext` 的模块名派生** —— 派生会做出一个"模块名唯一"的隐含假设，而标识的作用正是
+   把"spawn 顺序/模块命名"排除在重放语义之外（§13.3 Q3）。同一个 log 里 id 重复 = 声明错误（拒绝），
+   不合并：两份轨共用一个人份身份会把一个 worker 的投递拆成两条流。
+3. **重放的驱动方式**：**`step()` 为主 + `replayAll()` 附带**。§13.4 的验收必须能逐步断言
+   （每步给出 `seq` / `clock_ms` / `id`，并把载荷投给绑定好的 handle），`replayAll()` 只是同一个循环。
+
+### 13.7 v1 已实现（`src/runtime/recorder.zig` + `.record` 声明）
+
+```zig
+// 声明（spawn 点）：每个 worker 一条轨，容量是显式的内存上界
+const book = try rt.spawn(Book, .{}, .{
+    .capacity = 256,
+    .record = .{ .id = "book:BTC", .capacity = 4096 },
+});
+
+// …运行…（`send*`、`HotBus` 扇出的落点、`after(...)` 的定时器投递都进这条轨）
+
+// 重放：按全局 seq 归并多条轨、驱动 Clock.Manual、由调用方给"标识 → 新 handle"的映射
+const log = rt.deliveryLog() orelse return;          // 没有任何 worker 声明过轨
+var manual = runtime.Clock.Manual{ .now_ms = 0 };    // 必须非负（轮用时间算槽位）
+var rp = log.replayer(&manual);
+try rp.bind("book:BTC", fresh_book);                 // 目标不能就在这条 log 里（见下）
+while (try rp.step()) |step| {                       // step.id / step.seq / step.clock_ms
+    // step 已经把载荷投给 fresh_book 了；这里只做断言/记录
+}
+// rp.replayAll() 是同一个循环，只返回投出去的条数
+```
+
+**取点：`Handle` 的投递漏斗**（`src/runtime/runtime.zig` 的 `enqueue` / `enqueueBlocking`）。
+`send*` 与 `Handle.after` 的定时器投递**都**走它 —— 只挂 `send*` 会漏掉定时器那一半
+（`Delivery.post` 直接写邮箱），而 §13.1 说的正是那一半。记录发生在**邮箱接受之后**：
+轨记的是"投递成功的那部分"（§13.5），`error.Full` / `error.Closed` 不产生条目。
+
+**零分配按契约保持**：`Handle.track` 是个 `?*TrackRef`，没声明就一次空判断；
+有声明时是"一次间接调用 + 把值拷进预分配环"。`src/runtime/alloc_contract_test.zig` 对
+`Handle.send*` 的**精确**分配次数断言一个数字都没改（仍是 0）。
+
+**顺序**：全局 `seq` 由 log 的**一个** `Sequencer` 发放，entry 的 `seq` 是全局的，
+而槽位由**每条轨自己的**计数器声明（`slot` 本地、`seq` 全局）。轨道之间没有别的排序依据。
+
+**溢出 / 不完整**：`Track.record` 满环返回 `error.Full` —— **不覆盖、不静默丢弃**。
+但 `send*` **不因此失败**（消息确实进了邮箱）：`DeliveryLog.refused` 计数 + 一条 warn 日志；
+`Replayer` 看到 log 有洞时 `step()` / `replayAll()` 直接返回 `error.LogIncomplete`，
+**连部分也不放**（"有洞的 log 看起来完整"是 §11.6 起就写死的禁忌）。
+
+**与草案的差异**
+
+| 草案 | 落地 | 为什么 |
+|------|------|--------|
+| "复用 `Recorder(W.Message, capacity)` 那套机制" | `Recorder` 的存储半边抽成 `Slots`（`capacity` 槽 + per-slot ready + 连续 published 前缀），`Recorder` 与 `Track` 共用；`Recorder` 的 slot == seq 语义一字未动 | 两条轨的差别只在"槽位从哪来"，把它留在环外，环就只剩一份 |
+| 取点写 `Handle.send*` | `Handle` 的漏斗 `enqueue`/`enqueueBlocking`（`send*` + 定时器投递） | 见上：定时器投递不经过 `send*`，只挂 `send*` 就漏掉 §13.1 要的那半 |
+| `Runtime.enableRecording(cfg)` 式全局开关 | spawn 点 `.record = …` + `Runtime.deliveryLog()`（**懒创建**：首个 `.record` spawn 才分配） | §13.6 · 1：按声明计的内存；没声明就没有 log、没有环 |
+| `(seq, clock_ms, target, kind, len)` + 载荷字节 | `Entry{ seq, clock_ms, event }`（值拷贝，零分配）+ 轨自己的 `id`/`message_type` | v1 不引入 codec：轨内部同类型，payload 就是那个值 |
+| 落盘（Q4 第 2 档） | **未做**。`TrackRef.payload_codec` 是预留位，v1 恒为 `null`；`bind` 会拒绝声明了 codec 的轨 | 接口不翻：接 codec 时"载荷是指针"这件事本来就要变，让它在同一个判据上暴露 |
+
+**新增的一条拒绝（草案没有，实现时发现的）**：`bind` 拒绝**目标就在被重放的那条 log 里**
+（`error.TargetIsInSourceLog`）。把轨重放回**它自己那个 worker** 会把每条重放投递再记一遍，
+而新条目落在游标**之后** → 下一步 `step()` 又取到它们 → 自我喂养、`replayAll()` 永不结束
+（这是实现时被测试撞出来的，不是理论）。要重放就绑一份**没有在记这条 log** 的新图；
+把它重放到**另一个 runtime 上记过的 worker** 也可以 —— 那是两份 log，互不干扰。
+
+**明确未做（v1 边界，写死）**
+
+- **未声明的 worker 没有轨**：它收到的消息在重放里不存在。所以"重放是完整的"只对**声明过的那一刻
+  的 worker 图**成立；这条必须由调用方记住（轨自己不知道有谁没被声明）。
+- **取点处的一个合法交错**：`seq` 是记录点的原子序号，不等于"某次被观察到的真实顺序"。
+  同一个 worker 上**并发生产者**之间的相对顺序，重放按 log 的 `seq` 走 —— 重放是确定性的，
+  但不是"时间倒流"（§13.3 Q2）。
+- **不重放调度**：`after(...)` 的消息在轨里（handler 会收到），但**定时器本身不重放** ——
+  重放里没有 ticker，也不 sleep；重放推动的是 `Clock.Manual`，handler 若自己再 `after(...)`
+  就是新的一次排程（那是应用的事）。
+- **只有读注入 clock 的代码参与重放**：`ctx.clock()` 看到的是被驱动的那个 Manual 时钟；
+  直接调 `core/Time.zig` 的路径读到真实时间，在重放里就是不参与（§11.6 的同一条边界）。
+- **不承诺进程级确定性**：`spawn`/`init` 副作用、网络、墙钟、丢弃模式都不重放。
+- **不做跨进程**（§12.7）、**不做 `Message` codec**（§13.5）。
+- **不新增指标**：拒绝计数在 `DeliveryLog.refusedCount()`（+ 一条 warn 日志）和
+  `Replayer` 的 `error.LogIncomplete` 上，**没有**进 `RuntimeStats` / `MetricsBridge` ——
+  记录的 opt-in 边界是"声明了多少条轨"，而指标面的每一次新增都要连带
+  `docs/OBSERVABILITY.md` 的清单，不在本次范围。要看这个数就读 log。
+
+**验收（§13.4 的那条断言，已测）**：`src/runtime/runtime.zig` 的
+`Runtime Replay (§13.4): a delivery track replays into the same handler sequence, without sleeping` ——
+两个不同 `Message` 类型（两轨、一个共享 seq），中间夹一条 `after(...)` 的定时器投递；
+录制与重放两次的 handler 调用序列（顺序 + 载荷指纹 + handler 读到的时钟）逐条一致，
+且 20_000_000 ms（≈5.5 小时）的录制跨度在 **< 1 s 墙钟**内重放完（不 sleep）。
+轨/日志/溢出/并发的单测在 `src/runtime/recorder.zig`，绑定与错误路径在 `runtime.zig`。

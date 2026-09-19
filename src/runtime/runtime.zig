@@ -82,6 +82,7 @@ const clock_mod = @import("clock.zig");
 const ring_mod = @import("ring.zig");
 const sequencer_mod = @import("sequencer.zig");
 const scheduler_mod = @import("scheduler.zig");
+const recorder_mod = @import("recorder.zig");
 
 pub const Clock = clock_mod.Clock;
 pub const Wheel = wheel_mod.Wheel;
@@ -90,6 +91,11 @@ pub const Mailbox = mbox.Mailbox;
 pub const Scheduler = scheduler_mod.Scheduler;
 /// How the pool is declared: `Runtime.InitOptions.scheduler`.
 pub const SchedulerConfig = scheduler_mod.SchedulerConfig;
+/// One worker's delivery track, and the log all of them merge into (§13):
+/// `rt.deliveryLog().?.replayer(&manual)`.
+pub const DeliveryLog = recorder_mod.DeliveryLog;
+/// A `.record = …` declaration: the worker's stable id and the track's capacity.
+pub const TrackSpec = recorder_mod.TrackSpec;
 
 /// Who runs a worker's `handle`.
 pub const SpawnMode = enum {
@@ -108,6 +114,14 @@ pub const SpawnConfig = struct {
     /// fixed-capacity ring.
     capacity: usize,
     mode: SpawnMode = .dedicated,
+    /// Declare a delivery track for this worker (docs/RUNTIME.md §13): every
+    /// message that reaches its mailbox — from `send*`, from a `HotBus` fan-out,
+    /// from `after(...)` — is then logged with a global sequence number, and the
+    /// runtime's `DeliveryLog` can replay the run into a fresh graph.
+    ///
+    /// `null` (the default) is what §13.6 · 1 asks for: the memory bound is what
+    /// was declared, never "however many workers exist".
+    record: ?TrackSpec = null,
 };
 
 /// Normalise `spawn`'s last parameter, so the two call shapes are one entry
@@ -116,6 +130,7 @@ pub const SpawnConfig = struct {
 /// ```zig
 /// const a = try rt.spawn(Book, .{}, 256);                                  // v0.16 form
 /// const b = try rt.spawn(Audit, .{}, .{ .capacity = 64, .mode = .pooled }); // + pool
+/// const c = try rt.spawn(Tape, .{}, .{ .capacity = 8, .record = .{ .id = "tape", .capacity = 1024 } });
 /// ```
 ///
 /// The positional capacity is kept for the ~30 call sites that already have it —
@@ -129,8 +144,29 @@ pub fn spawnConfig(comptime arg: anytype) SpawnConfig {
                 "spawn's last parameter is a mailbox capacity (`256`) or a `SpawnConfig` " ++
                     "(`.{ .capacity = 256, .mode = .pooled }`); " ++ @typeName(T) ++ " has no `capacity` field",
             );
+            // Unknown fields are refused rather than ignored. A misspelled
+            // `.record` (or `.mode`) would otherwise be *silently* dropped — for
+            // a delivery track that is the worst possible failure: the log would
+            // be missing a worker while still claiming to be the run's log.
+            for (@typeInfo(T).@"struct".field_names) |field_name| {
+                if (!@hasField(SpawnConfig, field_name)) @compileError(
+                    "unknown field `." ++ field_name ++ "` in spawn's config for `" ++ @typeName(T) ++
+                        "`: the accepted fields are .capacity, .mode and .record",
+                );
+            }
             var config: SpawnConfig = .{ .capacity = @field(arg, "capacity") };
             if (@hasField(T, "mode")) config.mode = @field(arg, "mode");
+            if (@hasField(T, "record")) {
+                // Field by field: the literal at the call site is an anonymous
+                // struct, so there is no `?TrackSpec` to assign from directly.
+                const spec = @field(arg, "record");
+                const ST = @TypeOf(spec);
+                if (!@hasField(ST, "id") or !@hasField(ST, "capacity")) @compileError(
+                    "`.record` takes the track declaration `.{ .id = \"worker-id\", .capacity = 1024 }` " ++
+                        "(docs/RUNTIME.md §13.2), not `" ++ @typeName(ST) ++ "`",
+                );
+                config.record = .{ .id = @field(spec, "id"), .capacity = @field(spec, "capacity") };
+            }
             return config;
         },
         else => @compileError(
@@ -363,14 +399,53 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         /// that starts at `spawn`, so this is what the destroy path reads to
         /// decide whether a `deinit` is owed.
         started: bool = false,
+        /// Set only when this worker was spawned with `.record = …`: its delivery
+        /// track (docs/RUNTIME.md §13), owned by the runtime's `DeliveryLog`. Null
+        /// — the default — is what keeps `send` costing one null check, and the
+        /// track is what the replay driver reads back.
+        track: ?*recorder_mod.TrackRef = null,
+
+        /// The funnel every delivery goes through — in two flavours, because the
+        /// mailbox has two: `send*` and `Handle.after`'s timer delivery all arrive
+        /// here, which is what makes the track "what this worker received" rather
+        /// than "what some caller posted" (§13.1). A timer's message never passes
+        /// through `HotBus.publish`, so a log taken there would be missing it.
+        ///
+        /// The record point is *after* the mailbox accepted the message on purpose:
+        /// the track holds deliveries, so an `error.Full`/`error.Closed` from the
+        /// mailbox must not produce an entry for a message nobody received.
+        fn enqueue(self: *Self, envelope: Envelope) mbox.SendError!void {
+            try self.mailbox.send(envelope);
+            self.noteDelivery(envelope.message);
+        }
+
+        /// `enqueue` for the producer that would rather wait for room than drop.
+        fn enqueueBlocking(self: *Self, envelope: Envelope, timeout_ms: u32) mbox.SendError!void {
+            try self.mailbox.sendBlocking(envelope, timeout_ms);
+            self.noteDelivery(envelope.message);
+        }
+
+        /// Log one delivered message. Zero allocation: the track copies the value
+        /// into its pre-allocated ring (§13.2). A refusal does not fail the send —
+        /// the message *is* in the mailbox — it marks the log incomplete, which the
+        /// runtime counts and the replay refuses.
+        fn noteDelivery(self: *Self, message: Message) void {
+            const track = self.track orelse return;
+            track.record(track, @ptrCast(&message)) catch |err| {
+                std.log.warn(
+                    "[runtime] delivery to {s} (track {s}) not recorded: {s} — the log is incomplete from here",
+                    .{ self.context.name, track.id, @errorName(err) },
+                );
+            };
+        }
 
         pub fn send(self: *Self, message: Message) mbox.SendError!void {
-            try self.mailbox.send(.{ .message = message });
+            try self.enqueue(.{ .message = message });
             self.announceReady();
         }
 
         pub fn sendBlocking(self: *Self, message: Message, timeout_ms: u32) mbox.SendError!void {
-            try self.mailbox.sendBlocking(.{ .message = message }, timeout_ms);
+            try self.enqueueBlocking(.{ .message = message }, timeout_ms);
             self.announceReady();
         }
 
@@ -379,7 +454,7 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         /// handles *this* message: the value travels in the mailbox slot, so two
         /// producers sending different traces cannot overwrite each other's.
         pub fn sendTraced(self: *Self, message: Message, trace: TraceId) mbox.SendError!void {
-            try self.mailbox.send(.{ .trace = trace, .message = message });
+            try self.enqueue(.{ .trace = trace, .message = message });
             self.announceReady();
         }
 
@@ -388,7 +463,7 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         /// the trace hurts most: the messages that arrive late are the ones you
         /// want to attribute.
         pub fn sendBlockingTraced(self: *Self, message: Message, trace: TraceId, timeout_ms: u32) mbox.SendError!void {
-            try self.mailbox.sendBlocking(.{ .trace = trace, .message = message }, timeout_ms);
+            try self.enqueueBlocking(.{ .trace = trace, .message = message }, timeout_ms);
             self.announceReady();
         }
 
@@ -455,7 +530,11 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
                     // the one place a per-worker number would be unreadable
                     // exactly when it matters. The debug line stays for the
                     // "which worker" half that a number cannot carry.
-                    d.handle.mailbox.send(.{ .trace = d.trace, .message = d.message }) catch |err| {
+                    //
+                    // Through `enqueue`, not `mailbox.send`: a timer's message is
+                    // a delivery like any other, and §13.1's whole point is that
+                    // these are in the track (they never pass `HotBus.publish`).
+                    d.handle.enqueue(.{ .trace = d.trace, .message = d.message }) catch |err| {
                         _ = d.handle.runtime.timer_deliveries_dropped.fetchAdd(1, .monotonic);
                         std.log.debug(
                             "[runtime] timer delivery to {s} dropped: {s}",
@@ -712,6 +791,12 @@ pub const Runtime = struct {
     /// runtime runs no pool thread at all and `.pooled` is a configuration error
     /// (docs/RUNTIME.md §12.8 D2).
     scheduler: ?*Scheduler = null,
+    /// The delivery log (docs/RUNTIME.md §13), present only once a worker
+    /// declared `.record = …` — created on the first such `spawn`, so a runtime
+    /// whose workers declare no track allocates nothing and holds no rings. It
+    /// outlives `shutdown` on purpose: a replay normally happens *after* the run,
+    /// with the handles gone and a fresh graph in their place.
+    delivery_log: ?*DeliveryLog = null,
 
     const Entry = struct {
         ptr: *anyopaque,
@@ -787,7 +872,44 @@ pub const Runtime = struct {
         // again — the pool is the ring's only consumer.
         if (self.scheduler) |sched| sched.deinit();
         self.scheduler = null;
+        // After `shutdown` (the handles that point into it are already destroyed),
+        // and only here: the log has to survive a `shutdown` so the run can be
+        // replayed at all (docs/RUNTIME.md §13.4).
+        if (self.delivery_log) |log| {
+            log.deinit();
+            self.allocator.destroy(log);
+        }
+        self.delivery_log = null;
         self.* = undefined;
+    }
+
+    /// The delivery log — the tracks declared with `.record = …` and the shared
+    /// sequence that orders them — or `null` when no worker declared one
+    /// (docs/RUNTIME.md §13).
+    ///
+    /// Replay reads from here:
+    ///
+    /// ```zig
+    /// const log = rt.deliveryLog() orelse return;      // nothing was recorded
+    /// var replayer = log.replayer(&manual_clock);      // the driver moves the clock
+    /// try replayer.bind("book:0", fresh_book_handle);  // the caller supplies the map
+    /// while (try replayer.step()) |step| { … }         // merged by global seq, never sleeps
+    /// ```
+    pub fn deliveryLog(self: *Self) ?*DeliveryLog {
+        return self.delivery_log;
+    }
+
+    /// The log, created on first use. Only a `.record` spawn calls this, so the
+    /// "discipline of the pool" (§12.8 D2) is kept for recording too: no
+    /// declaration anywhere, no allocation at all.
+    fn ensureDeliveryLog(self: *Self) !*DeliveryLog {
+        if (self.delivery_log) |log| return log;
+        const log = try self.allocator.create(DeliveryLog);
+        // The runtime's own clock: the log's stamps are meant to line up with what
+        // timers on this runtime saw (and a replay drives a `Manual` to them).
+        log.* = DeliveryLog.init(self.allocator, self.clock);
+        self.delivery_log = log;
+        return log;
     }
 
     /// Start the ticker so timers fire without help. Optional: a caller that
@@ -941,6 +1063,19 @@ pub const Runtime = struct {
                 "Declare `pub const Message` + `pub fn handle` to pool a worker, or leave it `.dedicated`.",
         );
 
+        // A delivery track is declared at the spawn site (§13.6 · 1) and its
+        // capacity is comptime by construction: the ring is a fixed array of the
+        // worker's own `Message`.
+        const track_capacity: ?usize = comptime if (spawn_config.record) |spec| spec.capacity else null;
+        // A `run`-owned worker has no `Message` to record (§3's contract: the
+        // runtime hands it nothing), so `.record` on one is a wiring mistake
+        // rather than a track that would sit empty and look like a quiet worker.
+        if (comptime (track_capacity != null and !@hasDecl(W, "Message"))) @compileError(
+            @typeName(W) ++ " declares `run` and has no `Message`: there is nothing for a delivery " ++
+                "track to record (docs/RUNTIME.md §13). Declare `pub const Message` + `pub fn handle`, " ++
+                "or drop `.record`.",
+        );
+
         // A pool has to have been declared; `.pooled` without one is a
         // configuration mistake, not something to paper over by starting a
         // thread (D2).
@@ -954,6 +1089,18 @@ pub const Runtime = struct {
         errdefer if (sched) |s| s.release();
 
         const H = Handle(W, capacity);
+        // The track exists before the handle, so a failure below can hand it back
+        // exactly once (a ghost track would keep the id taken *and* be replayed as
+        // a worker that never existed). The `errdefer` is at function scope on
+        // purpose: the failures it must cover include the thread spawn far below.
+        var track: ?*recorder_mod.TrackRef = null;
+        errdefer if (track) |t| self.delivery_log.?.removeTrack(t);
+        if (comptime track_capacity) |record_capacity| {
+            const log = try self.ensureDeliveryLog();
+            const typed = try log.addTrack(spawn_config.record.?, H.Message, record_capacity);
+            track = &typed.ref;
+        }
+
         const handle = try self.allocator.create(H);
         errdefer self.allocator.destroy(handle);
 
@@ -964,6 +1111,7 @@ pub const Runtime = struct {
             .context = undefined,
             .supervision = supervision,
             .window_start_ms = self.clock.nowMs(),
+            .track = track,
         };
         handle.context = .{
             .runtime = self,
@@ -3772,4 +3920,346 @@ test "Runtime: a `run`-owned worker cannot be pooled" {
     // And the reason: a pooled worker is driven one message at a time, so a
     // `run`-owned loop would occupy a pool thread for as long as it runs.
     try std.testing.expect(@hasDecl(LoopWorker, "run") and !@hasDecl(LoopWorker, "Message"));
+}
+
+// ─────────────────────────────────────────────────
+// Runtime Replay (docs/RUNTIME.md §13)
+// ─────────────────────────────────────────────────
+
+/// One handler invocation as both phases observe it: which worker ran, what it
+/// was handed (compressed to a fingerprint), and the time it read off its
+/// injected clock. §13.4's assertion is that two runs produce the same sequence
+/// of these — order included — so a comparison needs nothing else.
+const Handled = struct {
+    worker: []const u8 = "",
+    fingerprint: u64 = 0,
+    clock_ms: i64 = 0,
+};
+
+/// Where a phase writes its invocations. One atomic sequence hands out the slot,
+/// so two worker threads cannot collide and neither needs a lock.
+const HandlerLog = struct {
+    order: sequencer_mod.Sequencer = sequencer_mod.Sequencer.init(0),
+    slots: [16]Handled = @splat(.{}),
+
+    fn note(self: *@This(), worker: []const u8, fingerprint: u64, clock_ms: i64) void {
+        const slot: usize = @intCast(self.order.next());
+        self.slots[slot] = .{ .worker = worker, .fingerprint = fingerprint, .clock_ms = clock_ms };
+    }
+
+    fn taken(self: *const @This()) []const Handled {
+        return self.slots[0..@intCast(self.order.peek())];
+    }
+};
+
+/// What a handler logs as "the payload": a hash of the value it received. Both
+/// message types below are padding-free, so their bytes are a canonical encoding
+/// — and a fingerprint is what makes the two phases comparable without replaying
+/// the payload object itself (§13.4).
+fn payloadFingerprint(comptime T: type, value: T) u64 {
+    return std.hash.Wyhash.hash(0, std.mem.asBytes(&value));
+}
+
+/// Bounded wait for the *handler* side of a delivery, by spinning. Both phases
+/// wait here for the same reason — so that each observes deliveries in the order
+/// the log holds them — and this is the harness's wait, never the replay
+/// driver's: `Replayer.step` waits for nothing (§13.6 · 3).
+fn awaitHandled(log: *const HandlerLog, want: u64) !void {
+    var spins: usize = 0;
+    while (log.order.peek() < want) : (spins += 1) {
+        if (spins > 100_000_000) return error.HandlerNeverRan;
+        std.atomic.spinLoopHint();
+    }
+}
+
+const AlphaProbe = struct {
+    pub const Message = u32;
+    log: *HandlerLog,
+
+    pub fn handle(self: *@This(), msg: Message, ctx: anytype) anyerror!void {
+        self.log.note("alpha", payloadFingerprint(Message, msg), ctx.clock().nowMs());
+    }
+};
+
+const BetaProbe = struct {
+    pub const Message = struct { x: i32, y: i32 };
+    log: *HandlerLog,
+
+    pub fn handle(self: *@This(), msg: Message, ctx: anytype) anyerror!void {
+        self.log.note("beta", payloadFingerprint(Message, msg), ctx.clock().nowMs());
+    }
+};
+
+test "Runtime Replay (§13.4): a delivery track replays into the same handler sequence, without sleeping" {
+    const Time = @import("../core/Time.zig");
+    var recorded_log = HandlerLog{};
+    var replayed_log = HandlerLog{};
+
+    // ── phase 1: record ─────────────────────────────────────────────────
+    var rec_clock = Clock.Manual{ .now_ms = 1_000_000 };
+    var rt_rec = Runtime.init(std.testing.allocator, std.testing.io, rec_clock.clock());
+    defer rt_rec.deinit();
+    // The ticker is what delivers `after(...)`, and §13.1 is precisely about
+    // those deliveries being part of the track.
+    try rt_rec.start();
+
+    const alpha = try rt_rec.spawn(AlphaProbe, .{ .log = &recorded_log }, .{
+        .capacity = 8,
+        .record = .{ .id = "alpha", .capacity = 4 },
+    });
+    const beta = try rt_rec.spawn(BetaProbe, .{ .log = &recorded_log }, .{
+        .capacity = 8,
+        .record = .{ .id = "beta", .capacity = 4 },
+    });
+
+    // Interleaved on purpose: two message types, one shared sequence, plus a
+    // timer delivery in the middle — the one that never passes through
+    // `HotBus.publish`, so a log taken there would be missing exactly this half.
+    rec_clock.set(1_000_000);
+    try alpha.send(7);
+    try awaitHandled(&recorded_log, 1);
+
+    rec_clock.set(6_000_000);
+    try beta.send(.{ .x = 1, .y = 2 });
+    try awaitHandled(&recorded_log, 2);
+
+    rec_clock.set(11_000_000);
+    _ = try alpha.after(50, 9);
+    rec_clock.set(11_000_060); // past the deadline: the ticker fires on its next tick
+    try awaitHandled(&recorded_log, 3);
+
+    rec_clock.set(16_000_000);
+    try alpha.send(13);
+    try awaitHandled(&recorded_log, 4);
+
+    rec_clock.set(21_000_000);
+    try beta.send(.{ .x = 3, .y = 4 });
+    try awaitHandled(&recorded_log, 5);
+
+    const recorded = recorded_log.taken();
+    try std.testing.expectEqual(@as(usize, 5), recorded.len);
+
+    const log = rt_rec.deliveryLog() orelse return error.NoDeliveryLog;
+    try std.testing.expectEqual(@as(usize, 2), log.trackCount());
+    try std.testing.expect(!log.hasOverflowed());
+
+    // ── phase 2: replay ─────────────────────────────────────────────────
+    // A fresh graph — same worker types, new handles — on a runtime whose clock
+    // *is* the one the driver moves, so a replayed handler reads the recorded
+    // time and the two invocation logs are directly comparable. (`now_ms` starts
+    // at 0, not at -1: the wheel indexes slots by time, so a negative manual
+    // clock is not a thing `Runtime.init` can be handed.)
+    var rep_clock = Clock.Manual{ .now_ms = 0 };
+    var rt_rep = Runtime.init(std.testing.allocator, std.testing.io, rep_clock.clock());
+    defer rt_rep.deinit();
+    const replayed_alpha = try rt_rep.spawn(AlphaProbe, .{ .log = &replayed_log }, 8);
+    const replayed_beta = try rt_rep.spawn(BetaProbe, .{ .log = &replayed_log }, 8);
+
+    var replayer = log.replayer(&rep_clock);
+    try replayer.bind("alpha", replayed_alpha);
+    try replayer.bind("beta", replayed_beta);
+
+    var ids: [8][]const u8 = @splat("");
+    var stamps: [8]i64 = @splat(0);
+    var seen: usize = 0;
+    const started = Time.monotonicNowMilliseconds();
+    while (true) {
+        const step = (try replayer.step()) orelse break;
+        try std.testing.expect(seen < ids.len);
+        ids[seen] = step.id;
+        stamps[seen] = step.clock_ms;
+        seen += 1;
+        try awaitHandled(&replayed_log, seen);
+    }
+    const elapsed = Time.monotonicNowMilliseconds() - started;
+
+    try std.testing.expectEqual(recorded.len, seen);
+    try std.testing.expectEqualSlices([]const u8, &.{ "alpha", "beta", "alpha", "alpha", "beta" }, ids[0..seen]);
+    // The third entry is the timer's delivery, stamped when it *fired*
+    // (11_000_060) rather than when it was armed (11_000_000): that is the
+    // difference between a delivery log and a schedule log.
+    try std.testing.expectEqualSlices(i64, &.{ 1_000_000, 6_000_000, 11_000_060, 16_000_000, 21_000_000 }, stamps[0..seen]);
+
+    // §13.4 itself: same handlers, same order, same payload fingerprints.
+    for (recorded, replayed_log.taken()) |want, got| {
+        try std.testing.expectEqualStrings(want.worker, got.worker);
+        try std.testing.expectEqual(want.fingerprint, got.fingerprint);
+        try std.testing.expectEqual(want.clock_ms, got.clock_ms);
+    }
+
+    // "and it does not sleep": 20_000_000 ms of recorded time (~5.5 h) replayed
+    // in a fraction of a second of wall time. A driver that waited out the
+    // timestamps could not get anywhere near this, and the clock's final value
+    // says the timestamps really were the ones it moved to.
+    try std.testing.expectEqual(@as(i64, 21_000_000), rep_clock.now_ms);
+    try std.testing.expect(elapsed < 1_000);
+}
+
+test "Runtime Replay: a track that ran out of room marks the log incomplete, and the replay refuses it" {
+    const Taped = struct {
+        pub const Message = u32;
+        seen: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+        pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
+            _ = msg;
+            _ = ctx;
+            _ = self.seen.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, clk.clock());
+    defer rt.deinit();
+
+    const handle = try rt.spawn(Taped, .{}, .{ .capacity = 8, .record = .{ .id = "tape", .capacity = 2 } });
+    const log = rt.deliveryLog() orelse return error.NoDeliveryLog;
+    try std.testing.expectEqual(@as(usize, 1), log.trackCount());
+    try std.testing.expect(!log.hasOverflowed());
+
+    // Three deliveries into a two-entry track: the third one *is* delivered — the
+    // mailbox decides that, not the track — and is not recorded. The log has a
+    // hole, and it says so (the send cannot: it succeeded).
+    for (1..4) |i| try handle.send(@intCast(i));
+    try waitUntil(Published(@TypeOf(handle.mailbox.received), u64){ .value = &handle.mailbox.received, .want = 3 }, 5_000);
+
+    try std.testing.expectEqual(@as(u64, 3), handle.stats().received);
+    try std.testing.expectEqual(@as(usize, 2), log.len());
+    try std.testing.expectEqual(@as(u64, 1), log.refusedCount());
+    try std.testing.expect(log.hasOverflowed());
+
+    // A log with a hole is not replayed — not even partially, and not even when
+    // the caller would be happy with a prefix (§11.6's rule, kept).
+    const fresh = try rt.spawn(Taped, .{}, 8);
+    var manual = Clock.Manual{ .now_ms = 0 };
+    var replayer = log.replayer(&manual);
+    try replayer.bind("tape", fresh);
+    try std.testing.expect(replayer.isFullyBound());
+    try std.testing.expectEqual(@as(usize, 2), replayer.remaining());
+    try std.testing.expectError(error.LogIncomplete, replayer.step());
+    try std.testing.expectError(error.LogIncomplete, replayer.replayAll());
+    // Refused before moving anything: the clock is untouched, so a caller that
+    // decides to inspect the log by hand still has the recorded stamps.
+    try std.testing.expectEqual(@as(i64, 0), manual.now_ms);
+    try std.testing.expectEqual(@as(u64, 0), fresh.stats().received);
+
+    fresh.stop();
+    fresh.join();
+    handle.stop();
+    handle.join();
+}
+
+test "Runtime Replay: binding is checked, and an unbound track is not silently skipped" {
+    const Alpha = struct {
+        pub const Message = u32;
+        pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
+            _ = self;
+            _ = msg;
+            _ = ctx;
+        }
+    };
+    const Beta = struct {
+        pub const Message = u64;
+        pub fn handle(self: *@This(), msg: u64, ctx: anytype) anyerror!void {
+            _ = self;
+            _ = msg;
+            _ = ctx;
+        }
+    };
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, clk.clock());
+    defer rt.deinit();
+
+    const alpha = try rt.spawn(Alpha, .{}, .{ .capacity = 4, .record = .{ .id = "alpha", .capacity = 4 } });
+    _ = try rt.spawn(Beta, .{}, .{ .capacity = 4, .record = .{ .id = "beta", .capacity = 4 } });
+    const log = rt.deliveryLog() orelse return error.NoDeliveryLog;
+
+    // A taken id is refused at the declaration: two tracks under one identity
+    // would split a worker's deliveries and replay them as one.
+    try std.testing.expectError(error.DuplicateTrackId, rt.spawn(Alpha, .{}, .{
+        .capacity = 4,
+        .record = .{ .id = "alpha", .capacity = 4 },
+    }));
+    try std.testing.expectEqual(@as(usize, 2), log.trackCount());
+
+    // The replay's own target: same worker type, *not* recorded into this log —
+    // see `BindError.TargetIsInSourceLog`.
+    const fresh = try rt.spawn(Alpha, .{}, 4);
+
+    try alpha.send(1);
+
+    var manual = Clock.Manual{ .now_ms = 0 };
+    var replayer = log.replayer(&manual);
+    try std.testing.expectError(error.UnknownTrack, replayer.bind("gamma", fresh));
+    // A handle whose `Message` is not what the track recorded: handing the
+    // payload over would reinterpret memory.
+    try std.testing.expectError(error.MessageTypeMismatch, replayer.bind("beta", fresh));
+    // The handle that produced the track: replaying into it would re-record
+    // every replayed delivery, and `step` would find those new entries again.
+    try std.testing.expectError(error.TargetIsInSourceLog, replayer.bind("alpha", alpha));
+    try std.testing.expect(!replayer.isFullyBound());
+    // Delivering what *is* bound while dropping the rest would look like a
+    // complete replay of a run that had one more worker in it.
+    try std.testing.expectError(error.UnboundTrack, replayer.step());
+
+    try replayer.bind("alpha", fresh);
+    try std.testing.expectEqual(@as(u64, 0), (try replayer.step()).?.seq);
+    try std.testing.expectEqual(@as(?recorder_mod.Step, null), try replayer.step());
+    // The replay did not grow the log it was reading.
+    try std.testing.expectEqual(@as(usize, 1), log.len());
+
+    fresh.stop();
+    fresh.join();
+    alpha.stop();
+    alpha.join();
+}
+
+test "Runtime Replay: replayAll hands a whole log to a fresh graph, in order" {
+    const Sink = struct {
+        pub const Message = u32;
+        seen: [16]u32 = @splat(0),
+        len: usize = 0,
+
+        pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
+            _ = ctx;
+            self.seen[self.len] = msg;
+            self.len += 1;
+        }
+    };
+
+    // Phase 1: a recorded worker, five deliveries.
+    var rec_clock = Clock.Manual{ .now_ms = 100 };
+    var rt_rec = Runtime.init(std.testing.allocator, std.testing.io, rec_clock.clock());
+    defer rt_rec.deinit();
+    const recorded = try rt_rec.spawn(Sink, .{}, .{ .capacity = 8, .record = .{ .id = "sink", .capacity = 8 } });
+    for (1..6) |i| {
+        rec_clock.set(100 * @as(i64, @intCast(i)));
+        try recorded.send(@intCast(i * 10));
+    }
+    try waitUntil(Published(@TypeOf(recorded.mailbox.received), u64){ .value = &recorded.mailbox.received, .want = 5 }, 5_000);
+
+    // Phase 2: a fresh graph and `replayAll` — the convenience driver, which is
+    // `step` in a loop and therefore has the same "hands over, never waits"
+    // contract.
+    var replay_clock = Clock.Manual{ .now_ms = 0 };
+    var rt_rep = Runtime.init(std.testing.allocator, std.testing.io, replay_clock.clock());
+    defer rt_rep.deinit();
+    const fresh = try rt_rep.spawn(Sink, .{}, 8);
+
+    const log = rt_rec.deliveryLog() orelse return error.NoDeliveryLog;
+    var replayer = log.replayer(&replay_clock);
+    try replayer.bind("sink", fresh);
+    try std.testing.expectEqual(@as(usize, 5), try replayer.replayAll());
+    try std.testing.expectEqual(@as(usize, 0), replayer.remaining());
+    try std.testing.expectEqual(@as(?recorder_mod.Step, null), try replayer.step());
+    // The driver moved its clock to the last recorded stamp and stopped there.
+    try std.testing.expectEqual(@as(i64, 500), replay_clock.now_ms);
+
+    try waitUntil(Published(@TypeOf(fresh.mailbox.received), u64){ .value = &fresh.mailbox.received, .want = 5 }, 5_000);
+    fresh.stop();
+    fresh.join();
+    try std.testing.expectEqualSlices(u32, &.{ 10, 20, 30, 40, 50 }, fresh.state.seen[0..fresh.state.len]);
+
+    recorded.stop();
+    recorded.join();
 }

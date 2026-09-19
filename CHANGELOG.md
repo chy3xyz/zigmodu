@@ -1,5 +1,51 @@
 # Changelog
 
+## [Unreleased]
+
+### Runtime Replay v1：每个 worker 的**投递轨** + 按全局 seq 重放（**破坏性：否**）
+
+§11 的 `Recorder` 记的是 **L0 扇出**（`HotBus.publish` 之前）；它回答"生产者发布了什么"，
+不回答"每个 worker **收到**了什么"—— `Handle.send` 的直达投递、`after(...)` 的定时器投递、
+以及 `MpscRing` 的跨生产者交错，它一条都不覆盖。要重放一次运行，缺的正是后者。
+
+- **取点在 `Handle` 的投递漏斗**（`enqueue` / `enqueueBlocking`）：`send*` 与
+  `Handle.after` 的定时器投递**都**走它。只挂 `send*` 会漏掉定时器那一半 ——
+  `Delivery.post` 直接写邮箱，`after` → `Tick` → `Delivery.post` 这条链**根本不经过 `publish`**，
+  而它在流水线里往往是关键节拍（快照、结算、超时）。记录发生在**邮箱接受之后**：
+  轨记的是"投递成功的那部分"，`error.Full`/`error.Closed` 不产生条目。
+- **不引入任何 codec**：异构 `Message` 的解法不是序列化，而是**每 worker 一条同类型轨**——
+  轨内部仍是 `E` 的有界环、值放进去，所以仍然零分配、仍然值语义。多轨靠 log 的
+  **一个 `Sequencer`** 打**全局** `seq` 归并（轨内的槽位是本地计数器：`slot` 本地、`seq` 全局）。
+  `Recorder` 的存储半边抽成 `Slots`（槽数组 + per-slot ready + 连续 published 前缀），两条轨共用它；
+  `Recorder` 的 slot == seq 语义与 §11 的全部契约（`error.Full` 不覆盖不静默丢、
+  `HotBus.attachRecorder` 行为逐位不变）一字未改。
+- **声明即上界**：`.record = .{ .id = "book:BTC", .capacity = 4096 }` 在 **spawn 点**给，
+  与 §12 的池"默认不创建"同一条纪律：**没有"默认全记"**，内存是 `Σ(capacity × sizeof(Message))`，
+  由调用方声明。**worker 标识也是调用方给的**（不从模块名派生 —— 派生会做出一个"模块名唯一"的
+  隐含假设）。`Runtime.deliveryLog()` 懒创建：没有任何 `.record` 就没有 log、没有环。
+- **重放**：`DeliveryLog.replayer(&Clock.Manual)` → `bind("book:BTC", fresh_handle)` →
+  `step()` 按 `seq` 归并、把时钟推到该条记录的 `clock_ms`、把载荷投给绑定的 handle。
+  **`step()` 不等待任何人**（不 sleep、不自旋、不 join）；`replayAll()` 是同一个循环。
+  目标 worker 的 `ctx.clock()` 就是被驱动的那个时钟，所以重放出来的 handler 读到的是**录制时的时间**。
+- **有洞就不放**：轨满 `record` 返回 `error.Full`（不覆盖、不静默丢），但 `send*` **不因此失败**
+  ——消息确实进了邮箱。`DeliveryLog.refusedCount()` 计数 + 一条 warn，`Replayer` 见
+  `hasOverflowed` 直接 `error.LogIncomplete`，**连部分也不放**（§11.6 起写死的禁忌：
+  有洞的 log 看起来完整）。
+- **新增一条拒绝（实现时发现）**：`bind` 拒绝目标**就在被重放的 log 里**
+  （`error.TargetIsInSourceLog`）。把轨重放回它自己的 worker 会把每条重放投递再记一遍，
+  新条目落在游标之后 → `step()` 再取到 → 自我喂养、`replayAll()` 永不结束（被测试撞出来的）。
+- **验收（§13.4）**：两个不同 `Message` 类型的两条轨 + 中间一条 `after(...)` 定时器投递，
+  录制与重放两次的 **handler 调用序列（顺序 + 载荷指纹 + handler 读到的时钟）逐条一致**，
+  且 20_000_000 ms（≈5.5 小时）的录制跨度在 **< 1 s 墙钟**内重放完（不 sleep）。
+- **零分配契约不放宽**：`src/runtime/alloc_contract_test.zig` 对 `Handle.send*` 的**精确**分配次数
+  断言一个数字都没改（没声明 `.record` 时是一次空判断；声明了也只是"一次间接调用 + 值拷进预分配环"）。
+- **Breaking：否**。`SpawnConfig` 多一个可选 `.record`，`Handle` 多一个默认 `null` 的 `track`；
+  `spawnConfig` 顺带**拒绝未知字段**（`.recrod = …` 这种拼错过去会被静默忽略 ——
+  对一条"重放完整性"依赖的声明，静默忽略是最坏的失败）。
+- 文档：`docs/RUNTIME.md` §13.6 三个待定项定稿（per-worker 容量 / 调用方给标识 / `step()` 为主）、
+  **§13.7 落地形状**（与草案的差异、边界、新增的 `TargetIsInSourceLog`）。**未做**：落盘（Q4 第 2 档，
+  `TrackRef.payload_codec` 是预留位）、跨进程、指标面（拒绝数只在 log 上，见 §13.7）。
+
 ## [0.29.0] - 2026-09-19
 
 ### 定时轮：长生命周期轮的 id 查找不再随年龄退化（**破坏性：否**）
