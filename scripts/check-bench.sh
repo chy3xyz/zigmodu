@@ -24,6 +24,15 @@
 # line above its timing line, and a breach prints them under the offender — so a
 # failure reads as "one stall" or "three slowdowns" without re-running anything.
 #
+# `[pct]` lines are **not** part of the criterion. Since 2026-09-19 the suite also
+# prints a latency distribution (p50/p95/p99/p99.9, ns/op, 1000 batch samples per
+# metric) for the latency-sensitive metrics — see `src/benchmark.zig` and
+# `docs/BEST_PRACTICES.md`. Those numbers never reach `bench-results.json`, so this
+# script neither thresholds them nor knows their names: they pass through the log
+# verbatim to be read, and nothing here grows a `[pct]` criterion until the
+# cross-host spread of a tail is known (the same reason the atomic-path metrics
+# became a ratio instead of tighter absolute thresholds).
+#
 # Where that spread actually comes from, recorded so nobody re-discovers it:
 # `validateModules` logs one `info:` line per call, so the `validateModules x*`
 # and `App lifecycle x1K` harnesses write ~7 MB of logging per sample, into this

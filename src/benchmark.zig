@@ -224,6 +224,210 @@ const BenchResult = struct {
 };
 
 // ─────────────────────────────────────────────────
+// Latency distribution — p50 / p95 / p99 / p99.9 (ns per operation)
+//
+// `median3` answers "what does a normal turn cost", which is the right input for
+// a regression gate and the wrong shape for a claim about a *high-performance
+// runtime*: a tail is where a runtime's latency stories actually live (a
+// scheduler wake-up, a cold mailbox slot, a thread creation that reaches the
+// allocator), and a median cannot see one at all. This section measures the
+// distribution on the same harnesses, in the same run, and prints it next to the
+// median. Three rules define it:
+//
+//   * **Many batches, not three runs.** Each metric is measured as
+//     `pct_batches` consecutive batches of `total_ops / pct_batches` operations
+//     — the same harness function `median3` calls three times, called once per
+//     batch instead. Every harness starts its own clock *after* building its
+//     fixture, so each sample is that harness's own measurement of one batch and
+//     per-call fixture stays out of it. Timing individual operations is not an
+//     option at this resolution: a `Sequencer` turn is ~2 ns and one clock read
+//     is ~25 ns, so per-operation timing would measure the clock. A batch is
+//     therefore the sampling unit, which makes the reported tail the tail of
+//     *batch* latency — a stall shorter than one batch is invisible, and the
+//     printed `ops` per batch is the resolution that says how fine one is.
+//   * **The collection allocates nothing.** The sample buffer is one preallocated
+//     slice, and the allocator behind it is armed to refuse every request for the
+//     rest of the section. The loop body reads the clock and writes one `f64` into
+//     that slice and nothing else, so a sampler that grew an allocation (a growing
+//     list of samples, a formatted log line) fails the run instead of quietly
+//     timing its own bookkeeping. Requirements of the measured path itself are
+//     each harness's business and are asserted there: `harness_allocator` is the
+//     same reclaiming allocator the median runs use, and the two harnesses whose
+//     stop path must not allocate already carry their own `WorkerAllocProbe`.
+//   * **Reported, never gated.** The percentiles are printed; nothing else reads
+//     them. `scripts/check-bench.sh` judges `bench-results.json`, which this
+//     section does not write to, and no baseline file holds a percentile. The
+//     cross-host spread of a tail is not known yet, and this repo has already
+//     paid three times for gating a fresh number against one host's recording
+//     (`RingBuffer SPSC x1M` alone moves 2.15x on the host's memory-ordering
+//     implementation — see `scripts/check-bench.sh`). Collect a few rounds of
+//     observations first; promote one to a criterion only with the spread in hand.
+//
+// Cost: every metric here is measured with the same total work as one `median3`
+// sample of it, so the section adds one extra pass over the metrics it covers —
+// ~0.2 s per pass at today's scales — while the gate's other 15 metrics are not
+// touched at all.
+//
+// `LatencyInjector` exists so that "the samples are real" is demonstrable rather
+// than asserted; it is off unless the environment asks for it.
+// ─────────────────────────────────────────────────
+
+/// Batches per metric. 1000 samples is what makes p99.9 an order statistic
+/// rather than the maximum of a handful — nearest-rank p99.9 over 1000 samples is
+/// the 999th — and it is also the knob that bounds the section's cost (see the
+/// banner): the total op count per metric is fixed, so more batches means shorter
+/// batches, not more work.
+const pct_batches: usize = 1000;
+
+/// The query points, nearest-rank: sample `ceil(p * n)`, 1-based, clamped. For
+/// `n = 1000` that is the 500th, 950th, 990th and 999th of the sorted samples.
+const pct_points = [_]struct { label: []const u8, p: f64 }{
+    .{ .label = "p50", .p = 0.50 },
+    .{ .label = "p95", .p = 0.95 },
+    .{ .label = "p99", .p = 0.99 },
+    .{ .label = "p99.9", .p = 0.999 },
+};
+
+/// Nearest-rank quantile of an ascending slice: `ceil(p * n)`, 1-based, clamped
+/// into `[1, n]`. The convention is stated here rather than left to the reader
+/// because the upper quantiles are the point of this section, and "p99.9 of 1000
+/// samples" is only meaningful next to the rule that produced it.
+fn nearestRank(sorted: []const f64, p: f64) f64 {
+    const n: f64 = @floatFromInt(sorted.len);
+    const rank = std.math.clamp(@ceil(p * n), 1, n);
+    return sorted[@as(usize, @intFromFloat(rank)) - 1];
+}
+
+/// Stall injection: the counter-proof that this section samples real per-batch
+/// times instead of deriving a distribution from the median.
+///
+/// With `ZIGMODU_BENCH_INJECT_NS` set, every `ZIGMODU_BENCH_INJECT_EVERY`-th
+/// batch (40th by default — 25 of the 1000 samples) pays an extra busy-spin of
+/// that many nanoseconds, timed with the same clock and added to that batch's
+/// sample. The cadence is the point: 25 stalled samples are 2.5% of the
+/// distribution and they are its slowest members, so they occupy the top of the
+/// sorted array — above p95 (the 5% boundary) and past p99 (the 1% boundary).
+/// p50 must therefore not move at all, and p99/p99.9 must move by roughly the
+/// injected width (exactly that width plus the stalled batch's own cost, which is
+/// why the moved value lands at a predictable place and not merely "higher"). A
+/// sampler that reprinted the median three times, or whose quantiles came from
+/// anywhere but its own 1000 samples, cannot produce that shape. p95 is the one
+/// boundary that can shift a notch: it sits 2.5 points — 25 samples — away from
+/// the stalled mass, so its rank moves with it, visibly so on a heavy tail like
+/// `App lifecycle`. `every` between 21 and 99 keeps the property (1-5% stalled).
+///
+/// A spin rather than a sleep: a sleep's overshoot is the host's scheduler, so the
+/// injected width would not be reproducible, and the thing being modelled is
+/// elapsed time inside the measured loop. The spin is measured, not assumed — the
+/// value added to the sample is the width the clock actually observed.
+///
+/// Injection is off unless the variable is set, and the section prints the fact
+/// when it is on: a percentile table produced with injection running is
+/// counter-proof output, not a measurement of the framework.
+const LatencyInjector = struct {
+    stall_ns: i128 = 0,
+    every: usize = 40,
+
+    /// Reads the knobs from main's environment map. A value that does not parse is
+    /// an error rather than a silent fallback to "off": a typo in the variable
+    /// would otherwise look exactly like a sampler that cannot see a stall.
+    fn fromEnv(environ: anytype) !LatencyInjector {
+        var injector = LatencyInjector{};
+        if (environ.get("ZIGMODU_BENCH_INJECT_NS")) |raw| {
+            injector.stall_ns = std.fmt.parseInt(i128, raw, 10) catch return error.BenchInvalidInjectNs;
+            if (injector.stall_ns < 0) return error.BenchInvalidInjectNs;
+        }
+        if (environ.get("ZIGMODU_BENCH_INJECT_EVERY")) |raw| {
+            injector.every = std.fmt.parseInt(usize, raw, 10) catch return error.BenchInvalidInjectEvery;
+        }
+        return injector;
+    }
+
+    fn active(self: LatencyInjector) bool {
+        return self.stall_ns > 0 and self.every > 0;
+    }
+
+    /// Elapsed nanoseconds this batch paid for its stall, 0 for an unstalled one.
+    fn paid(self: LatencyInjector, index: usize) i128 {
+        if (!self.active()) return 0;
+        if (index % self.every != self.every - 1) return 0;
+        const t0 = now();
+        while (now() - t0 < self.stall_ns) {}
+        return now() - t0;
+    }
+};
+
+/// Runs one metric in `pct_batches` batches and prints its percentile line: the
+/// four quantiles in ns per operation, the batch shape they came from, and the
+/// cross-check that batching did not move the metric — the metric's own sum over
+/// its batches against the `[med3]` value the gate judges it by, for the same
+/// total work, in the same run.
+const LatencyRun = struct {
+    allocator: std.mem.Allocator,
+    injector: LatencyInjector,
+    medians: *const std.ArrayList(BenchResult),
+
+    fn medianMs(self: LatencyRun, name: []const u8) ?f64 {
+        for (self.medians.items) |result| {
+            if (std.mem.eql(u8, result.name, name)) return result.value;
+        }
+        return null;
+    }
+
+    fn run(self: LatencyRun, comptime name: []const u8, comptime f: anytype, args: anytype, total_ops: usize) !void {
+        if (total_ops < pct_batches) return error.BenchPercentileTooFewOps;
+        const ops = total_ops / pct_batches;
+
+        var probe = WorkerAllocProbe.init(self.allocator, .{});
+        const samples = try probe.allocator().alloc(f64, pct_batches);
+        defer probe.allocator().free(samples);
+        // Armed from here on: nothing in the sampling loop may allocate.
+        probe.fail_index = probe.alloc_index;
+
+        var sum_ms: f64 = 0;
+        var stalled: usize = 0;
+        for (samples, 0..) |*sample, index| {
+            const stall_ns = self.injector.paid(index);
+            if (stall_ns > 0) stalled += 1;
+            const ms = try @call(.auto, f, args ++ .{ops});
+            sum_ms += ms;
+            sample.* = (ms * 1_000_000.0 + @as(f64, @floatFromInt(stall_ns))) / @as(f64, @floatFromInt(ops));
+        }
+        std.mem.sort(f64, samples, {}, std.sort.asc(f64));
+
+        // A percentile line without a median to sit next to would be a number
+        // nobody can place; the names come from the same table, so a missing one
+        // means the two views of the suite have drifted apart.
+        const med3_ms = self.medianMs(name) orelse return error.BenchPercentileUnpaired;
+
+        std.debug.print("  [pct] {s}:", .{name});
+        inline for (pct_points) |point| {
+            std.debug.print(" {s} {d:.2}", .{ point.label, nearestRank(samples, point.p) });
+        }
+        const drift = sum_ms / med3_ms;
+        std.debug.print(" ns/op  [{d} batches x {d} ops; sum {d:.2} ms = {d:.2}x med3 {d:.2} ms", .{ pct_batches, ops, sum_ms, drift, med3_ms });
+        if (stalled > 0) std.debug.print("; stalled {d}", .{stalled});
+        std.debug.print("]", .{});
+        // Outside this band the two numbers are not the same measurement of the
+        // same thing, and the line says so instead of letting a reader compare
+        // them as if they were. Two causes, and this check cannot tell them apart:
+        // a batch changes the workload when a harness's state grows with it
+        // (`TimerWheel x100K` holds one node per scheduled timer, so the batched
+        // wheel walks a 100-node structure where the gated sample walks a
+        // 100k-node one — cache-hot against cache-cold, measured at 0.34-0.49x),
+        // and host load can move between the `[med3]` phase of the run and this
+        // one at the end of it (measured at 1.37-1.57x on `HotBus 8sub x1M` and
+        // `Mailbox full-path x10M` while a compile ran on this machine). Either
+        // way the quantiles describe what the sampler saw; what is in question is
+        // only whether that is the workload `check-bench.sh` thresholds.
+        if (drift < 0.8 or drift > 1.25) {
+            std.debug.print("\n        ^ its batches summed to {d:.2}x the `[med3]` sample it is compared against — the two are\n          not the same measurement (a batched workload with a smaller working set, or host load that\n          moved between the `[med3]` phase and this one). Read ns/op as the sampled shape's own.", .{drift});
+        }
+        std.debug.print("\n", .{});
+    }
+};
+
+// ─────────────────────────────────────────────────
 // Runtime primitives (`src/runtime/**`) — the framework's worker plumbing
 //
 // Deliberately deterministic: no sockets, no wall-clock deadlines, and a
@@ -778,9 +982,49 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("  {s}  {d:.2} ms  ({d:.0} cycles/s)\n", .{ name, ms, 1000.0 / ms * 1000.0 });
     }
 
+    // ── Latency distribution ──────────────────────────────────────────────
+    //
+    // The latency-sensitive half of the runtime group plus the two chains this
+    // suite has: `App lifecycle` (scan → validate → init → start → stop, the
+    // whole application lifecycle in one turn) and `1L x10M events` (publish →
+    // dispatch → deliver). One metric per primitive, not a second scale of one
+    // already here, and each measured with the same total work as its `[med3]`
+    // line above — see the banner at `pct_batches` for what a sample is, why the
+    // collection cannot allocate, and why none of this is gated.
+    //
+    // `atomic RMW x10M` leads the list as it does above: it is the machine
+    // reference, so its own spread is the context for the ones below it. The
+    // harnesses with a per-call fixture comparable to their timed region are
+    // deliberately absent — `findById x20K` rebuilds a table and inserts 100 rows
+    // per call, which is fixture the sampler would be timing alongside the query
+    // it is not (see `LatencyRun.run`).
+    std.debug.print("\n-- Latency distribution (p50 / p95 / p99 / p99.9, ns per op) --\n", .{});
+    std.debug.print("  {d} batches per metric, one clock pair per batch, nearest-rank quantiles over the\n  batch samples. Observation only: the gate judges the `[med3]` values above, not these.\n", .{pct_batches});
+
+    var latency = LatencyRun{ .allocator = a, .injector = try LatencyInjector.fromEnv(init.environ_map), .medians = &results };
+    if (latency.injector.active()) {
+        std.debug.print("  !! latency injection ON (ZIGMODU_BENCH_INJECT_NS={d}, every {d}th batch): counter-proof\n     run, not a measurement of the framework — p50/p95 must stay put and p99 must move.\n", .{ latency.injector.stall_ns, latency.injector.every });
+    }
+    std.debug.print("\n", .{});
+    try latency.run("atomic RMW x10M", benchAtomicRmw, .{a}, 10_000_000);
+    try latency.run("RingBuffer SPSC x1M", benchRingBuffer, .{a}, 1_000_000);
+    try latency.run("Mailbox post+drain x1M", benchMailbox, .{ io, a }, 1_000_000);
+    try latency.run("Mailbox full-path x10M", benchMailboxFull, .{io}, 10_000_000);
+    try latency.run("TimerWheel x100K", benchTimerWheel, .{a}, 100_000);
+    try latency.run("HotBus 8sub x1M", benchHotBus, .{a}, 1_000_000);
+    try latency.run("ObjectPool x1M", benchObjectPool, .{a}, 1_000_000);
+    try latency.run("Sequencer x10M", benchSequencer, .{a}, 10_000_000);
+    try latency.run("Worker spawn+join x1K", benchWorkerSpawnJoin, .{io}, 1_000);
+    try latency.run("App lifecycle x3K", benchApplicationLifecycle, .{io}, 3_000);
+    try latency.run("1L x10M events", benchEventBus, .{ a, 1 }, 10_000_000);
+
     // Emit bench-results.json for CI baseline tracking
     // (github-action-benchmark `customSmallerIsBetter` format); `value` is the
     // median of the three samples each metric was measured with (`median3`).
+    // The percentile section above deliberately writes nothing here: a metric the
+    // baselines do not know is a WARN in `check-bench.sh`, and adding 44 such
+    // entries per run (11 metrics x 4 quantiles) would train its reader to skip
+    // warnings. `check-bench.sh` sees the `[pct]` lines in its own log instead.
     const json = try std.json.Stringify.valueAlloc(a, results.items, .{});
     const file = try std.Io.Dir.cwd().createFile(io, "bench-results.json", .{});
     defer file.close(io);
