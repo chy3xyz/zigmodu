@@ -64,6 +64,12 @@
 | S2 | `security/SecurityModule.zig:190-196` | CSPRNG seeded with `std.time.epoch.unix` (constant 0) | `std.crypto.random.bytes()` |
 | S3 | `security/ApiKeyAuth.zig:121-122` | Non-crypto `DefaultPrng` with timestamp seed for API keys | `std.crypto.random.bytes()` |
 
+> **读这张表要先看年代。** 本文是 **v0.8.3（2026-05-11）的历史快照**，"Fix" 列记的是**当时**改成了什么，
+> 不是今天的做法。上面三处后来已统一改为 **`std.Io.randomSecure(io, buf)`** —— 每次系统调用、失败即
+> `error.EntropyUnavailable`、**没有回落**。原因是 **`std.crypto.random` 在当前锁定的 Zig 工具链上不存在**，
+> 所以 `std.crypto.random.bytes()` 现在**编译不过**（实测 `struct 'crypto' has no member named 'random'`）。
+> 现状见 [`../../CHANGELOG.md`](../../CHANGELOG.md) 的 `[0.32.0]` 段与 [`../../AGENTS.md`](../../AGENTS.md) §Security。
+
 ### HIGH Issues Fixed (this release)
 
 | # | File | Issue | Fix |

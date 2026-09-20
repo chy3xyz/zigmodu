@@ -54,9 +54,18 @@ if (conn_id == 0) { self.allocator.destroy(session); return null; }   // ← 把
   已核对 `v0.29.0..v0.31.0` 区间**零**破坏性变更（`git log` 里 6 个 `!` 提交全在 v0.32.0），
   所以补一段就把这个洞补完了；每条按房内格式给了 **Breaking? / 影响面 / 一行改法**。
 
-**未做**（同一次审计查到、本次未动）：`CLAUDE.md:35` 仍写"OTLP / Vault 仅 `http://`"、
-`docs/PRODUCTION_ROADMAP.md:144` 仍写 `https://` 明确不支持、`docs/API.md:1115` 的
-`fromString` 返回类型、`docs/dev/final-assessment.md:63-65` 建议 `std.crypto.random.bytes()`。
+**同批收掉的另外四个单行漂移**（同一次审计查到，紧随其后一并修）：
+
+- `CLAUDE.md:35` 与 `docs/PRODUCTION_ROADMAP.md:144` 都写 OTLP/Vault **仅 `http://`**，
+  而 `OtlpExporter.zig:88-89` 与 `SecretsManager.zig:198-199` 都接受 **`http(s)://`**
+  （HTTPS 经 `std.http.Client` 系统信任库），ROADMAP 那句引的 `OtlpTlsNotSupported`
+  **在 `src/` 里已不存在**（只剩测试注释与断言提到它）。两处都改成 `http(s)://`。
+- `docs/API.md:1115` 写 `fromString(s: []const u8) Method`，实际是 **`?Method`**（`Server.zig:60`，
+  未知/畸形方法 → `null` → 501）。
+- `docs/dev/final-assessment.md` 的 S1/S2/S3 修复列写着 `std.crypto.random.bytes()`。
+  **该文件是 v0.8.3（2026-05-11）的历史快照，所以没有改写它的历史记录** ——
+  改为在表下加一段年代说明：这三处后来已统一为 `std.Io.randomSecure(io, buf)`，
+  而 `std.crypto.random` 在当前工具链上不存在、`std.crypto.random.bytes()` 现在**编译不过**。
 
 ## [0.32.0] - 2026-09-20
 

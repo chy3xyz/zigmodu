@@ -32,7 +32,7 @@ src/root.zig          → Application, EventBus, outbox
 4. **多门户**：JWT `roles`=门户；业务 RBAC 用自定义 `CatalogPermissionLoader(CatalogPermLoadInput)`；**勿**加 JWT `type`
 5. **HTTP**：`ctx.json` / `respondErr` / extractors；**勿** `sendSuccess`/`sendFail`
 6. **租户列**：默认 `tenant_id`；`app_id` → `setTenantColumn("app_id")` + `--tenant-column app_id`
-7. **OTLP / Vault**：仅 `http://`；x402 **fail-closed**
+7. **OTLP / Vault**：`http(s)://` 均可（HTTPS 经 `std.http.Client` 系统信任库）；x402 **fail-closed**
 
 ## Zig 0.17 Rules（易错）
 1. `ArrayList(T).init(alloc)` → `.empty` + 方法传 allocator

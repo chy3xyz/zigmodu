@@ -1112,7 +1112,7 @@ pub const Method = enum { GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS };
 
 
 
-pub fn fromString(s: []const u8) Method
+pub fn fromString(s: []const u8) ?Method
 
 pub fn toString(self: Method) []const u8
 
