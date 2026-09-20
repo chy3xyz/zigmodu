@@ -2,6 +2,42 @@
 
 ## [Unreleased]
 
+### 三处「默认为放行」改成 fail-closed（安全审计的中危 ③⑤⑦；**破坏性：是**）
+
+审计里三条同形缺陷，全部是"**默认放行**"这一类 —— 也是 zent 侧 v0.66 已经修过、sqlx 侧没同步的那一类。
+
+**③ `.dept_custom` 的空/坏 `dept_ids`**（`src/datapermission/DataPermission.zig`）：`ids.len == 0` 与解析失败
+都 `return null`，而 `null` 按契约是"**不过滤**"。现在照 zent 的先例给出
+**`deny_clause = "1 = 0"`**（`docs/ZENT.md` §14 的同一条），并且**只有 `.all` 才能产生 `null`**。
+
+> **调用方的形态一字未改**：`if (filter) |f| { … }` 仍然成立 —— 变的是**什么时候**产生 `null`。
+> 所以 `examples/zmsaas/backend/src/shard.zig` 那个调用点不需要改，而它现在**不会再从 `.dept_custom`
+> 拿到 `null`**。这条是这次改动里最容易出错的地方（改了"拒绝"的表示却忘了读它的人），已专门确认。
+
+**⑤ `permissionGateWith` 把配置存在函数级全局 + 空 catalog 放行**（`src/api/Middleware.zig`）：
+非泛型函数里的嵌套 `struct { var … }` 是**进程内唯一** —— 一个进程里跑两个 server（公网 API + 内网 admin）
+时，第二次调用会覆盖第一次的 catalog 与配置，**互相读到对方的 catalog**（若目标路径在那份 catalog 里是
+`.public`，权限检查就被跳过）。改成**每调用一份**（与同文件 `jwtAuthFromCatalog*` / `authFromCatalog` /
+`tenantResolver` / `moduleGate` 一致），并把**空 catalog 改成 fail-closed**（此前 `try next(ctx); return;`
+是直接放行，而同族 `jwtAuth*` 在同样状态下是全站强制鉴权 —— 同族默认值不一致）。
+顺带把 legacy `jwtAuth` 的 `stored_security`（`src/security/AuthMiddleware.zig`）一并改掉：它是同一个形状，
+会让第二个 server 用**最后一个** secret 验签。
+
+**⑦ `tenantClause` 的租户谓词没有括号**（`src/persistence/Orm.zig`）：`"{s} AND {s} = ?"` 直接接在调用方的
+`where_sql` 后面，于是 `WHERE owner_id = ? OR is_public = 1` 变成
+`… OR is_public = 1 AND tenant_id = ?` —— 按优先级**租户隔离对 `OR` 的第一个分支失效**，
+而且 `validateSqlFragment` 的黑名单不禁 `OR`/`AND`，所以它一路通过、**没有任何报错**。现在把调用方那段
+谓词**包起来**，使 `AND tenant_id = ?` 作用于整个 `where_sql`。
+
+**验证**：全量 **1454/1475（21 skipped，0 failed）**，5 道门禁 + fmt 全绿。
+其中 ③ 的守卫由**我自己重做变异**验过：把空列表改回 `return null`，两条用例以
+**`RejectedScopeCameBackAsUnrestricted`** 变红（错误名本身即判据：被拒绝的 scope 不许以无限制的形态回来），
+已按字节回退。
+
+**未做 / 未验证**：⑤ 里"一个进程跑两个 server"的**双实例场景没有构造用例**（改动的正确性来自
+"与同文件那四个一致"这一构造性论证）；只在 SQLite 上跑过 ⑦ 的 SQL 形态（本机无 PG/MySQL）。
+
+
 ### **Breaking**：CSPRNG 换成 `std.Io.randomSecure` + `db.query` 的租户边界（安全审计的中危 ⑥ 与 ④）
 
 **⑥ API key / 密码盐 / uuid 的种子熵不够。** 原种子是「毫秒 + 常量 42 + 栈地址 + 毫秒×1000」，

@@ -27,19 +27,24 @@ pub const PermissionLoader = *const fn (allocator: std.mem.Allocator, auth: *Rba
 /// NOTE: `AuthInfo.permissions` stays empty with this variant, so requirePermission()
 /// will always deny. Use `jwtAuthWithPermissions` when permission checks are needed.
 pub fn jwtAuth(security: *SecurityModule, allocator: std.mem.Allocator) !api.Middleware {
-    const S = struct {
-        var stored_security: *SecurityModule = undefined;
-        var stored_allocator: std.mem.Allocator = undefined;
+    const Store = struct {
+        security: *SecurityModule,
+        allocator: std.mem.Allocator,
     };
-    S.stored_security = security;
-    S.stored_allocator = allocator;
+    // One store per call: a function-level `var` is process-wide, so a second
+    // `jwtAuth` (another server, another secret) would silently overwrite the
+    // first one's security module and make both verify with the last secret.
+    const stored = std.heap.page_allocator.create(Store) catch @panic("jwtAuth setup: out of memory");
+    stored.* = .{ .security = security, .allocator = allocator };
 
     return .{
         .func = struct {
-            fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
-                try runJwtAuth(ctx, next, S.stored_security, S.stored_allocator, null);
+            fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
+                const st: *const Store = @ptrCast(@alignCast(user_data.?));
+                try runJwtAuth(ctx, next, st.security, st.allocator, null);
             }
         }.mw,
+        .user_data = stored,
     };
 }
 
@@ -47,21 +52,22 @@ pub fn jwtAuth(security: *SecurityModule, allocator: std.mem.Allocator) !api.Mid
 /// `loader` after token verification to populate `AuthInfo.permissions`, making
 /// requirePermission/requireAnyPermission/requireAllPermissions functional.
 pub fn jwtAuthWithPermissions(security: *SecurityModule, allocator: std.mem.Allocator, loader: PermissionLoader) !api.Middleware {
-    const S = struct {
-        var stored_security: *SecurityModule = undefined;
-        var stored_allocator: std.mem.Allocator = undefined;
-        var stored_loader: PermissionLoader = undefined;
+    const Store = struct {
+        security: *SecurityModule,
+        allocator: std.mem.Allocator,
+        loader: PermissionLoader,
     };
-    S.stored_security = security;
-    S.stored_allocator = allocator;
-    S.stored_loader = loader;
+    const stored = std.heap.page_allocator.create(Store) catch @panic("jwtAuthWithPermissions setup: out of memory");
+    stored.* = .{ .security = security, .allocator = allocator, .loader = loader };
 
     return .{
         .func = struct {
-            fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
-                try runJwtAuth(ctx, next, S.stored_security, S.stored_allocator, S.stored_loader);
+            fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
+                const st: *const Store = @ptrCast(@alignCast(user_data.?));
+                try runJwtAuth(ctx, next, st.security, st.allocator, st.loader);
             }
         }.mw,
+        .user_data = stored,
     };
 }
 
@@ -318,4 +324,41 @@ test "jwtAuth preserves ComptimeRouter user_data State" {
     try std.testing.expect(S.saw_auth);
     try std.testing.expect(ctx.userData(RouteState) != null);
     try std.testing.expectEqual(@as(i32, 99), ctx.userData(RouteState).?.n);
+}
+
+test "each jwtAuth keeps its own security module" {
+    const allocator = std.testing.allocator;
+    var sec_a = SecurityModule.init(allocator, "secret-a", 3600);
+    var sec_b = SecurityModule.init(allocator, "secret-b", 3600);
+    const token_a = try sec_a.generateTokenWithTenant("42", &.{}, "1");
+    defer allocator.free(token_a);
+
+    const mw_a = try jwtAuth(&sec_a, allocator);
+    const mw_b = try jwtAuth(&sec_b, allocator);
+
+    const S = struct {
+        var reached: bool = false;
+        fn handler(_: *api.Context) anyerror!void {
+            reached = true;
+        }
+    };
+
+    // A token signed with A's secret must verify against A's middleware — the
+    // two middlewares may not share one `stored_security`, or the last one built
+    // would decide for both (cross-instance identity confusion).
+    var ctx_a = try api.Context.init(allocator, .GET, "/tenants");
+    defer ctx_a.deinit();
+    try testPutBearerAuth(&ctx_a, token_a);
+    try mw_a.func(&ctx_a, S.handler, mw_a.user_data);
+    try std.testing.expect(!ctx_a.responded);
+    try std.testing.expect(S.reached);
+
+    // …and B's rejects it.
+    S.reached = false;
+    var ctx_b = try api.Context.init(allocator, .GET, "/tenants");
+    defer ctx_b.deinit();
+    try testPutBearerAuth(&ctx_b, token_a);
+    try mw_b.func(&ctx_b, S.handler, mw_b.user_data);
+    try std.testing.expectEqual(@as(u16, 401), ctx_b.status_code);
+    try std.testing.expect(!S.reached);
 }

@@ -319,22 +319,58 @@ fn comptimeGuardTenantScope(comptime T: type, comptime method: []const u8, compt
     @compileError(tenantScopeMessage(@typeName(T), col, method, scoped_alt));
 }
 
-/// Build `WHERE {col} = ?` (empty `where_sql`) or `{where_sql} AND {col} = ?`.
-/// Caller owns the returned slice.
+/// Offset just past a leading `WHERE` keyword (case-insensitive, and only when
+/// a token boundary follows so a column named `where_clause` is not mistaken for
+/// it), or `null` when the clause does not open with one.
+fn skipLeadingWhere(where_sql: []const u8) ?usize {
+    var i: usize = 0;
+    while (i < where_sql.len and std.ascii.isWhitespace(where_sql[i])) i += 1;
+    const kw = "WHERE";
+    if (where_sql.len - i < kw.len) return null;
+    if (!std.ascii.eqlIgnoreCase(where_sql[i .. i + kw.len], kw)) return null;
+    const after = i + kw.len;
+    if (after == where_sql.len) return after; // bare "WHERE"
+    if (!std.ascii.isWhitespace(where_sql[after]) and where_sql[after] != '(') return null;
+    return after;
+}
+
+/// The predicate inside a caller's `where_sql` ("WHERE …", possibly empty),
+/// with the `WHERE` keyword removed. Empty when there is no predicate at all.
+fn wherePredicate(where_sql: []const u8) []const u8 {
+    const start = skipLeadingWhere(where_sql) orelse 0;
+    return std.mem.trim(u8, where_sql[start..], " \t\n\r");
+}
+
+/// Build `WHERE {col} = ?` (no caller predicate) or
+/// `WHERE ({predicate}) AND {col} = ?`.
+///
+/// The caller's predicate is **parenthesised** before `AND {col} = ?` is
+/// appended. `AND` binds tighter than `OR`, so without the parentheses a
+/// caller-side `OR` (e.g. `WHERE owner_id = ? OR is_public = 1`) would leave the
+/// tenant predicate attached to its last branch only —
+/// `owner_id = ? OR (is_public = 1 AND tenant_id = ?)` — and the row would come
+/// back for the other tenant through the first branch. Wrapping makes the
+/// appended `AND` apply to the whole predicate; the parentheses are the caller's
+/// own if it already wrote them, and nesting them again is still valid on every
+/// dialect. Caller owns the returned slice.
 fn tenantClause(allocator: std.mem.Allocator, comptime col: []const u8, where_sql: []const u8) ![]const u8 {
-    if (where_sql.len == 0) {
+    const predicate = wherePredicate(where_sql);
+    if (predicate.len == 0) {
         return std.fmt.allocPrint(allocator, "WHERE {s} = ?", .{col});
     }
-    return std.fmt.allocPrint(allocator, "{s} AND {s} = ?", .{ where_sql, col });
+    return std.fmt.allocPrint(allocator, "WHERE ({s}) AND {s} = ?", .{ predicate, col });
 }
 
 /// Runtime WHERE fragment for filtered reads: caller's `where_sql` plus
 /// soft-delete. Returns an owned slice when the model has a `deleted` field
 /// (caller frees); otherwise returns `where_sql` borrowed (no free).
+/// Parenthesised for the same reason as `tenantClause`: `AND deleted = 0`
+/// must bind to the whole caller predicate, not to its last `OR` branch.
 fn effectiveWhere(allocator: std.mem.Allocator, comptime T: type, where_sql: []const u8) ![]const u8 {
     if (!@hasField(T, "deleted")) return where_sql;
-    if (where_sql.len == 0) return try allocator.dupe(u8, "WHERE deleted = 0");
-    return try std.fmt.allocPrint(allocator, "{s} AND deleted = 0", .{where_sql});
+    const predicate = wherePredicate(where_sql);
+    if (predicate.len == 0) return try allocator.dupe(u8, "WHERE deleted = 0");
+    return try std.fmt.allocPrint(allocator, "WHERE ({s}) AND deleted = 0", .{predicate});
 }
 
 fn comptimeSkipInsertField(comptime fname: []const u8, comptime auto_ts: bool) bool {
@@ -979,7 +1015,9 @@ pub fn Orm(comptime B: type) type {
 
                 /// Unscoped escape hatch: the caller's WHERE clause is used
                 /// as-is — **no** tenant filter is added. Only safe when the
-                /// clause itself pins the tenant (`WHERE tenant_id = ?`).
+                /// clause itself pins the tenant (`WHERE tenant_id = ?`). On a
+                /// soft-delete model the appended `AND deleted = 0` is applied
+                /// to the whole caller predicate, not to its last `OR` branch.
                 pub fn findPageFilteredUnscoped(self: @This(), alloc: std.mem.Allocator, where_sql: []const u8, args: []const B.Value, page: usize, size: usize) !PageResult(T) {
                     try sqlx.validateSqlFragment(where_sql);
                     const col_list = comptime comptimeColumnList(meta.sql_columns, meta.fields, meta.camel_case);
@@ -1020,10 +1058,13 @@ pub fn Orm(comptime B: type) type {
 
                 /// Tenant-scoped filtered pagination: prepends `{col} = ?` to
                 /// the WHERE clause (when `where_sql` is empty, filters only by
-                /// tenant). Same `where_sql` contract as `findPageFiltered`
-                /// (full `WHERE …` clause, may be empty; values via `?`
-                /// placeholders + args). `col` is the tenant column name;
-                /// compile-time error when the model lacks that field.
+                /// tenant). The caller's predicate is parenthesised, so the
+                /// tenant check applies to the whole of it — an `OR` in
+                /// `where_sql` cannot let a row through. Same `where_sql`
+                /// contract as `findPageFiltered` (full `WHERE …` clause, may be
+                /// empty; values via `?` placeholders + args). `col` is the
+                /// tenant column name; compile-time error when the model lacks
+                /// that field.
                 pub fn findPageFilteredForTenant(self: @This(), comptime col: []const u8, alloc: std.mem.Allocator, tenant_id: i64, where_sql: []const u8, args: []const B.Value, page: usize, size: usize) !PageResult(T) {
                     comptime comptimeRequireTenantField(T, col, meta.camel_case);
                     try sqlx.validateSqlFragment(where_sql);
@@ -2084,4 +2125,150 @@ test "PageResult deinitArena frees the arena captured from the client allocator"
     // Like `QueryResult.deinitArena`, this is NOT idempotent: a freed result has
     // `arena == null`, which is indistinguishable from slice-backed, so a second
     // call panics. Call it exactly once.
+}
+
+test "tenantClause parenthesises the caller predicate" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { where_sql: []const u8, expected: []const u8 }{
+        // No caller predicate at all → tenant only.
+        .{ .where_sql = "", .expected = "WHERE tenant_id = ?" },
+        .{ .where_sql = "WHERE", .expected = "WHERE tenant_id = ?" },
+        .{ .where_sql = "WHERE   ", .expected = "WHERE tenant_id = ?" },
+        // Plain predicate.
+        .{ .where_sql = "WHERE price_cents > ?", .expected = "WHERE (price_cents > ?) AND tenant_id = ?" },
+        // The `OR` the fix is about: it must stay inside the parentheses, so
+        // `AND tenant_id = ?` applies to the whole predicate.
+        .{ .where_sql = "WHERE owner_id = ? OR is_public = 1", .expected = "WHERE (owner_id = ? OR is_public = 1) AND tenant_id = ?" },
+        // Keyword casing and a missing space are the caller's business; the
+        // caller's own parentheses stay where they are and simply nest.
+        .{ .where_sql = "where owner_id = ?", .expected = "WHERE (owner_id = ?) AND tenant_id = ?" },
+        .{ .where_sql = "WHERE(owner_id = ?)", .expected = "WHERE ((owner_id = ?)) AND tenant_id = ?" },
+        // Already parenthesised → nested once more, still valid.
+        .{ .where_sql = "WHERE (a = ? OR b = 1)", .expected = "WHERE ((a = ? OR b = 1)) AND tenant_id = ?" },
+        // A column that merely starts with the keyword is not the keyword.
+        .{ .where_sql = "WHERE_clause = ?", .expected = "WHERE (WHERE_clause = ?) AND tenant_id = ?" },
+    };
+    for (cases) |case| {
+        const clause = try tenantClause(allocator, "tenant_id", case.where_sql);
+        defer allocator.free(clause);
+        try std.testing.expectEqualStrings(case.expected, clause);
+    }
+}
+
+test "effectiveWhere parenthesises the caller predicate for soft delete" {
+    const allocator = std.testing.allocator;
+    const WithDeleted = struct {
+        id: i64,
+        deleted: i64,
+    };
+    const Plain = struct { id: i64 };
+
+    // No predicate → soft-delete only.
+    {
+        const eff = try effectiveWhere(allocator, WithDeleted, "");
+        defer allocator.free(eff);
+        try std.testing.expectEqualStrings("WHERE deleted = 0", eff);
+    }
+    // Predicate without the keyword is wrapped the same way.
+    {
+        const eff = try effectiveWhere(allocator, WithDeleted, "WHERE owner_id = ? OR is_public = 1");
+        defer allocator.free(eff);
+        try std.testing.expectEqualStrings("WHERE (owner_id = ? OR is_public = 1) AND deleted = 0", eff);
+    }
+    // Models without the column are untouched (borrowed, no allocation).
+    {
+        const eff = try effectiveWhere(allocator, Plain, "WHERE owner_id = ? OR is_public = 1");
+        try std.testing.expectEqualStrings("WHERE owner_id = ? OR is_public = 1", eff);
+    }
+}
+
+test "findPageFilteredForTenant keeps the tenant predicate on every OR branch (sqlite)" {
+    const allocator = std.testing.allocator;
+    const data = @import("../data.zig");
+
+    const SharedDoc = struct {
+        pub const sql_table_name: []const u8 = "shared_doc";
+        id: i64,
+        owner_id: i64,
+        is_public: i64,
+        title: []const u8,
+        tenant_id: i64,
+    };
+
+    var client = try data.Client.open(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    _ = try client.exec(
+        "CREATE TABLE shared_doc (id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL, is_public INTEGER NOT NULL, title TEXT NOT NULL, tenant_id INTEGER NOT NULL)",
+        &.{},
+    );
+    const rows = [_]struct { id: i64, owner: i64, public: i64, title: []const u8, tenant: i64 }{
+        .{ .id = 1, .owner = 7, .public = 0, .title = "t1-mine", .tenant = 1 },
+        .{ .id = 2, .owner = 8, .public = 1, .title = "t1-public", .tenant = 1 },
+        // Same owner id, other tenant: the `OR owner_id = ?` branch must not
+        // reach it.
+        .{ .id = 3, .owner = 7, .public = 1, .title = "t2-same-owner", .tenant = 2 },
+    };
+    for (rows) |r| {
+        _ = try client.exec(
+            "INSERT INTO shared_doc (id, owner_id, is_public, title, tenant_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+            &.{ .{ .int = r.id }, .{ .int = r.owner }, .{ .int = r.public }, .{ .string = r.title }, .{ .int = r.tenant } },
+        );
+    }
+
+    const backend = data.SqlxBackend{ .allocator = allocator, .client = &client };
+    var orm: data.orm.Orm(data.SqlxBackend) = undefined;
+    orm.backend = backend;
+    const repo = data.Repository(SharedDoc){ .orm = &orm };
+
+    var filtered = try repo.findPageFilteredForTenant(
+        "tenant_id",
+        allocator,
+        1,
+        "WHERE owner_id = ? OR is_public = 1",
+        &.{.{ .int = 7 }},
+        1,
+        10,
+    );
+    defer if (filtered.arena) |*a| a.deinit();
+    // Before the parentheses, `AND tenant_id = ?` bound to `is_public = 1` only,
+    // so row 3 came back through `owner_id = ?`.
+    try std.testing.expectEqual(@as(usize, 2), filtered.items.len);
+    try std.testing.expectEqual(@as(usize, 2), filtered.total);
+    for (filtered.items) |item| try std.testing.expectEqual(@as(i64, 1), item.tenant_id);
+}
+
+test "findPageFilteredUnscoped keeps the soft-delete predicate on every OR branch (sqlite)" {
+    const allocator = std.testing.allocator;
+    const data = @import("../data.zig");
+
+    const SoftDoc = struct {
+        pub const sql_table_name: []const u8 = "soft_doc";
+        id: i64,
+        owner_id: i64,
+        is_public: i64,
+        deleted: i64,
+    };
+
+    var client = try data.Client.open(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    _ = try client.exec(
+        "CREATE TABLE soft_doc (id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL, is_public INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0)",
+        &.{},
+    );
+    _ = try client.exec(
+        "INSERT INTO soft_doc (id, owner_id, is_public, deleted) VALUES (1, 7, 0, 0), (2, 7, 0, 1), (3, 8, 1, 0)",
+        &.{},
+    );
+
+    const backend = data.SqlxBackend{ .allocator = allocator, .client = &client };
+    var orm: data.orm.Orm(data.SqlxBackend) = undefined;
+    orm.backend = backend;
+    const repo = data.Repository(SoftDoc){ .orm = &orm };
+
+    var filtered = try repo.findPageFiltered(allocator, "WHERE owner_id = ? OR is_public = 1", &.{.{ .int = 7 }}, 1, 10);
+    defer if (filtered.arena) |*a| a.deinit();
+    // Before the parentheses, row 2 (soft-deleted, same owner) came back through
+    // the `owner_id = ?` branch.
+    try std.testing.expectEqual(@as(usize, 2), filtered.items.len);
+    for (filtered.items) |item| try std.testing.expectEqual(@as(i64, 0), item.deleted);
 }

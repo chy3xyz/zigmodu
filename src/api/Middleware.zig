@@ -978,16 +978,32 @@ pub fn permissionGate(slot: *comptime_router.CatalogSlot) api.Middleware {
 
 pub fn permissionGateWith(slot: *comptime_router.CatalogSlot, config: PermissionGateConfig) api.Middleware {
     const Store = struct {
-        var catalog_slot: *comptime_router.CatalogSlot = undefined;
-        var cfg: PermissionGateConfig = .{};
+        catalog_slot: *comptime_router.CatalogSlot,
+        cfg: PermissionGateConfig,
     };
-    Store.catalog_slot = slot;
-    Store.cfg = config;
+    // One store per call — a function-level `var` would be process-wide, so a
+    // second gate (another server, another catalog slot, another `.mode`) would
+    // silently overwrite this one's slot and config. Same shape as
+    // `jwtAuthFromCatalog*` / `authFromCatalog` / `tenantResolver` / `moduleGate`.
+    const stored = std.heap.page_allocator.create(Store) catch @panic("middleware setup: out of memory");
+    stored.* = .{ .catalog_slot = slot, .cfg = config };
     return .{
         .func = struct {
-            fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
-                const cat = Store.catalog_slot.get() orelse {
-                    try next(ctx);
+            fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
+                const st: *const Store = @ptrCast(@alignCast(user_data.?));
+                const cat = st.catalog_slot.get() orelse {
+                    // No catalog = the gate cannot know whether this route is
+                    // public, what permission it needs, or whether it is even
+                    // registered. It used to call `next` here, which let a
+                    // request through un-permission-checked whenever the slot
+                    // was not filled (or was filled by a different server).
+                    // Rejecting is the fail-closed twin of `jwtAuthFromCatalog*`,
+                    // which forces authentication in exactly this state; a gate
+                    // has no token to require, so it refuses instead. 503 (and
+                    // not 403) keeps a wiring mistake from being read as a
+                    // genuine permission denial — same status and wording as
+                    // `openApiCatalogHandler` for the same condition.
+                    try st.cfg.reject(ctx, 503, "Route catalog not ready");
                     return;
                 };
                 if (cat.isPublic(ctx.method, ctx.path)) {
@@ -1000,44 +1016,45 @@ pub fn permissionGateWith(slot: *comptime_router.CatalogSlot, config: Permission
                 // Route-level portal roles (RouteMeta.roles, `|` = OR): matched
                 // against the identity roles attr before fine-grained permission.
                 if (cat.rolesFor(ctx.method, ctx.path)) |route_roles| {
-                    const roles = ctx.getAttr(Store.cfg.role_attr) orelse "";
+                    const roles = ctx.getAttr(st.cfg.role_attr) orelse "";
                     if (!permissionMatchesRoles(roles, route_roles)) {
-                        try Store.cfg.reject(ctx, 403, "Forbidden");
+                        try st.cfg.reject(ctx, 403, "Forbidden");
                         return;
                     }
                 }
                 const perm = cat.permissionFor(ctx.method, ctx.path) orelse {
-                    if (Store.cfg.deny_by_default) {
-                        try Store.cfg.reject(ctx, 403, "Forbidden");
+                    if (st.cfg.deny_by_default) {
+                        try st.cfg.reject(ctx, 403, "Forbidden");
                         return;
                     }
                     try next(ctx);
                     return;
                 };
 
-                const allowed = switch (Store.cfg.mode) {
+                const allowed = switch (st.cfg.mode) {
                     .roles => blk: {
-                        const roles = ctx.getAttr(Store.cfg.role_attr) orelse break :blk false;
+                        const roles = ctx.getAttr(st.cfg.role_attr) orelse break :blk false;
                         break :blk permissionMatchesRoles(roles, perm);
                     },
                     .rbac => blk: {
                         if (ctx.authInfo(Rbac.AuthInfo)) |ai| {
                             break :blk permissionMatchesAuthInfo(ai, perm);
                         }
-                        const perms = ctx.getAttr(Store.cfg.permission_attr) orelse break :blk false;
+                        const perms = ctx.getAttr(st.cfg.permission_attr) orelse break :blk false;
                         break :blk permissionMatchesRoles(perms, perm);
                     },
                 };
                 if (!allowed) {
-                    try Store.cfg.reject(ctx, 403, "Forbidden");
+                    try st.cfg.reject(ctx, 403, "Forbidden");
                     return;
                 }
-                if (Store.cfg.set_permission_attr) {
+                if (st.cfg.set_permission_attr) {
                     try ctx.setAttr("permission", perm);
                 }
                 try next(ctx);
             }
         }.mw,
+        .user_data = stored,
     };
 }
 
@@ -1100,19 +1117,29 @@ pub const defaultSecurityHeaders = [_]SecurityHeader{
 
 /// Injects security response headers on every response. `null` uses the
 /// built-in defaults; pass a custom slice for a tailored policy.
+///
+/// One store per call (like `cors` / `moduleGate`): a function-level `var` would
+/// be process-wide, so a second `securityHeaders(custom)` in the same process
+/// would silently retarget the first middleware's headers too.
 pub fn securityHeaders(headers: ?[]const SecurityHeader) api.Middleware {
-    const S = struct {
-        var stored: []const SecurityHeader = &.{};
-        fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
-            const hdrs: []const SecurityHeader = if (stored.len > 0) stored else &defaultSecurityHeaders;
-            for (hdrs) |h| {
-                try ctx.setHeader(h.name, h.value);
-            }
-            try next(ctx);
-        }
+    const Store = struct {
+        headers: []const SecurityHeader,
     };
-    S.stored = if (headers) |h| h else &.{};
-    return .{ .func = S.mw };
+    const stored = std.heap.page_allocator.create(Store) catch @panic("securityHeaders setup: out of memory");
+    stored.* = .{ .headers = headers orelse &.{} };
+    return .{
+        .func = struct {
+            fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
+                const st: *const Store = @ptrCast(@alignCast(user_data.?));
+                const hdrs: []const SecurityHeader = if (st.headers.len > 0) st.headers else &defaultSecurityHeaders;
+                for (hdrs) |h| {
+                    try ctx.setHeader(h.name, h.value);
+                }
+                try next(ctx);
+            }
+        }.mw,
+        .user_data = stored,
+    };
 }
 
 // ==== §9  Tests ====
@@ -1165,6 +1192,28 @@ test "securityHeaders injects defaults and calls through" {
     try std.testing.expect(State.reached);
     try std.testing.expect(ctx.response_headers.get("Strict-Transport-Security") != null);
     try std.testing.expect(ctx.response_headers.get("X-Frame-Options") != null);
+}
+
+test "each securityHeaders instance keeps its own headers" {
+    const allocator = std.testing.allocator;
+    const custom_a = [_]SecurityHeader{.{ .name = "X-Policy-A", .value = "a" }};
+    const custom_b = [_]SecurityHeader{.{ .name = "X-Policy-B", .value = "b" }};
+    const mw_a = securityHeaders(&custom_a);
+    const mw_b = securityHeaders(&custom_b);
+    const next = struct {
+        fn n(_: *api.Context) anyerror!void {}
+    }.n;
+
+    var ctx_a = try api.Context.init(allocator, .GET, "/");
+    defer ctx_a.deinit();
+    try mw_a.func(&ctx_a, next, mw_a.user_data);
+    try std.testing.expectEqualStrings("a", ctx_a.response_headers.get("X-Policy-A").?);
+    try std.testing.expect(ctx_a.response_headers.get("X-Policy-B") == null);
+
+    var ctx_b = try api.Context.init(allocator, .GET, "/");
+    defer ctx_b.deinit();
+    try mw_b.func(&ctx_b, next, mw_b.user_data);
+    try std.testing.expectEqualStrings("b", ctx_b.response_headers.get("X-Policy-B").?);
 }
 
 test "cors middleware sets headers" {
@@ -1609,8 +1658,92 @@ test "permissionGate accepts any OR alternative" {
     try std.testing.expect(!ok_ctx.responded);
 }
 
+test "each permissionGateWith keeps its own catalog slot and config" {
+    const alloc = std.testing.allocator;
+    // Gate A: slot A marks the route `.jwt` + permission "admin".
+    var entries_a = try alloc.alloc(comptime_router.CatalogEntry, 1);
+    entries_a[0] = .{
+        .method = .GET,
+        .path = try alloc.dupe(u8, "api/v1/tenants"),
+        .auth = .jwt,
+        .module = "tenant",
+        .permission = "admin",
+    };
+    var slot_a: comptime_router.CatalogSlot = .{};
+    defer slot_a.deinit();
+    slot_a.set(.{ .allocator = alloc, .entries = entries_a });
+
+    // Gate B: slot B has the same path with no permission, and denies
+    // unannotated routes.
+    var entries_b = try alloc.alloc(comptime_router.CatalogEntry, 1);
+    entries_b[0] = .{
+        .method = .GET,
+        .path = try alloc.dupe(u8, "api/v1/tenants"),
+        .auth = .jwt,
+        .module = "tenant",
+    };
+    var slot_b: comptime_router.CatalogSlot = .{};
+    defer slot_b.deinit();
+    slot_b.set(.{ .allocator = alloc, .entries = entries_b });
+
+    const mw_a = permissionGateWith(&slot_a, .{});
+    const mw_b = permissionGateWith(&slot_b, .{ .deny_by_default = true });
+    const S = struct {
+        var reached = false;
+        fn n(_: *api.Context) anyerror!void {
+            reached = true;
+        }
+    };
+
+    // A gate must read the slot and config it was built with. Sharing one
+    // function-level `var` made the second call overwrite the first, so mw_a
+    // would have run against slot_b / deny_by_default and 403'd here.
+    S.reached = false;
+    var ctx_a = try api.Context.init(alloc, .GET, "/api/v1/tenants");
+    defer ctx_a.deinit();
+    try ctx_a.setAttr("roles", "admin");
+    try mw_a.func(&ctx_a, S.n, mw_a.user_data);
+    try std.testing.expect(!ctx_a.responded);
+    try std.testing.expect(S.reached);
+
+    // mw_b keeps `.deny_by_default`: the route carries no permission → 403.
+    S.reached = false;
+    var ctx_b = try api.Context.init(alloc, .GET, "/api/v1/tenants");
+    defer ctx_b.deinit();
+    try ctx_b.setAttr("roles", "admin");
+    try mw_b.func(&ctx_b, S.n, mw_b.user_data);
+    try std.testing.expectEqual(@as(u16, 403), ctx_b.status_code);
+    try std.testing.expect(!S.reached);
+}
+
+test "permissionGateWith fails closed before the catalog is ready" {
+    const alloc = std.testing.allocator;
+    var slot: comptime_router.CatalogSlot = .{}; // never `.set()` — startup window / unwired server
+    defer slot.deinit();
+
+    const mw = permissionGateWith(&slot, .{});
+    const S = struct {
+        var reached = false;
+        fn n(_: *api.Context) anyerror!void {
+            reached = true;
+        }
+    };
+
+    var ctx = try api.Context.init(alloc, .GET, "/api/v1/tenants");
+    defer ctx.deinit();
+    try mw.func(&ctx, S.n, mw.user_data);
+
+    // Nothing may run un-permission-checked just because the gate cannot see
+    // which routes exist. `jwtAuthFromCatalog*` forces authentication in the
+    // same state; a gate has no token to demand, so it refuses.
+    try std.testing.expect(!S.reached);
+    try std.testing.expectEqual(@as(u16, 503), ctx.status_code);
+    try std.testing.expect(ctx.responded);
+}
+
 test "permissionGate rbac mode uses permissions attr not roles" {
     const alloc = std.testing.allocator;
+
     var entries = try alloc.alloc(comptime_router.CatalogEntry, 1);
     entries[0] = .{
         .method = .DELETE,
