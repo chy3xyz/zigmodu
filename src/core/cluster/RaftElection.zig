@@ -437,6 +437,43 @@ pub const RaftElection = struct {
             }
         }
 
+        // A log index is **1-based**, and the loop below reads
+        // `log.items[entry.index - 1]`. `entry.index == 0` is not a value that can
+        // exist, and nothing on the decode side rejects it (`decodeAppendEntries`
+        // copies the index straight off the wire), so an unauthenticated peer can
+        // name it in a single frame. Measured with the guard removed, both build
+        // shapes are bad and they are bad *differently*:
+        //
+        //   * Debug / ReleaseSafe — `entry.index - 1` is a runtime subtraction on
+        //     a `u64`, so the overflow check fires first and aborts the process:
+        //     `panic: integer overflow` → `signal ABRT`. One frame, no credential,
+        //     and the node is gone.
+        //   * ReleaseFast — no checks, so the subtraction wraps to
+        //     0xFFFF_FFFF_FFFF_FFFF and the address arithmetic folds
+        //     `items[that]` to `items.ptr - 32` — one `LogEntry`, measured, not a
+        //     wild pointer, which is why it does not fault. The loop then compares
+        //     an out-of-bounds `term` and, in a measured run, *accepted* the
+        //     malformed entry: `handleAppendEntries` returned
+        //     `.{ .success = true, .match_index = 2 }` for a log whose two entries
+        //     are index 1 and index 0 — telling the leader that index 2 is
+        //     replicated. That is a Raft state-machine safety violation, not just a
+        //     crash.
+        //
+        // Note the guard `prev_log_index > 0` six lines above, and the same check in
+        // `getLogEntry`: this loop was the one place that arithmetic was reached
+        // without one. A missed check, not a convention.
+        //
+        // Rejected *before any log mutation*: the loop below truncates at
+        // `entry.index - 1` and only then appends, so checking inside it would let
+        // a malformed request delete committed entries on its way to failing.
+        // (The raft-state writes above — term, follower state, deadline,
+        // `leader_id` — have already happened by this point; that is the same
+        // window every AppendEntries request gets, and losing an election round
+        // is the recoverable outcome there.)
+        for (req.entries) |entry| {
+            if (entry.index == 0) return error.InvalidLogIndex;
+        }
+
         // Process incoming entries: skip already-matched, overwrite conflicts
         for (req.entries) |entry| {
             if (entry.index <= self.log.items.len) {
@@ -1325,6 +1362,68 @@ test "RaftElection heartbeat resets leader info" {
     _ = try election.handleAppendEntries(req);
 
     try testing.expectEqualStrings("leader1", election.getLeader().?);
+}
+
+// Verified red: removing the `entry.index == 0` guard makes this abort rather
+// than fail an assertion, because the subtraction `entry.index - 1` is a
+// runtime `u64` operation and its overflow check fires before the index is ever
+// used — `panic: integer overflow`, `signal ABRT`, the whole test binary down.
+// There is no assertion to fail first; the abort *is* the defect, and one frame
+// from an unauthenticated peer reaches it. In ReleaseFast (no overflow check)
+// the same request instead succeeds and reports `match_index = 2` — measured;
+// see the guard's comment in `handleAppendEntries` for both shapes.
+test "an AppendEntries entry with index 0 is refused before the log is touched" {
+    const allocator = testing.allocator;
+
+    const TransportImpl = struct {
+        sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
+        sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse,
+    };
+    var transport_impl = TransportImpl{
+        .sendVoteRequest = (struct {
+            fn f(_: ?[]const u8, _: []const u8, _: VoteRequest) void {}
+        }).f,
+        .sendAppendEntries = (struct {
+            fn f(_: ?[]const u8, _: []const u8, _: AppendEntriesRequest) AppendEntriesResponse {
+                return AppendEntriesResponse{ .term = 0, .success = true, .match_index = 0 };
+            }
+        }).f,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
+
+    var election = try RaftElection.init(allocator, "node1", &.{}, .{}, &transport);
+    defer election.deinit();
+
+    // Seed one entry the normal way, so the malformed request below has an index
+    // it can plausibly claim to be following.
+    const seeded = try election.handleAppendEntries(.{
+        .term = 1,
+        .leader_id = "leader1",
+        .prev_log_index = 0,
+        .prev_log_term = 0,
+        .entries = &.{.{ .term = 1, .index = 1, .command = "keep" }},
+        .leader_commit = 1,
+    });
+    try testing.expect(seeded.success);
+    try testing.expectEqual(@as(usize, 1), election.logLen());
+
+    // `prev_log_index`/`prev_log_term` match entry 1, which is what routes this
+    // past the §5.3 check and into the entry loop — the shape a real peer sends,
+    // not an artificial one.
+    try testing.expectError(error.InvalidLogIndex, election.handleAppendEntries(.{
+        .term = 2,
+        .leader_id = "leader1",
+        .prev_log_index = 1,
+        .prev_log_term = 1,
+        .entries = &.{.{ .term = 2, .index = 0, .command = "boom" }},
+        .leader_commit = 1,
+    }));
+
+    // The reason the guard sits *before* the loop: the loop truncates at
+    // `entry.index - 1` first, so a check inside it would delete the entry above
+    // on the way to failing.
+    try testing.expectEqual(@as(usize, 1), election.logLen());
+    try testing.expectEqualStrings("keep", election.getLogEntry(1).?.command);
 }
 
 test "RaftElection vote request validation" {

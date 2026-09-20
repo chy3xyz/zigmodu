@@ -2,6 +2,59 @@
 
 ## [Unreleased]
 
+### 集群/Raft 两条高危（安全审计 ② 的第 1、2 条；**破坏性：是**）
+
+两条都来自 `docs/dev/security-audit-cluster.md`，都属于"**对端只需 TCP 可达**"这一类 ——
+那条线上**零认证**仍然成立（`TlsTransport.ClusterAuth` 定义在案、有单测，但**全仓库零调用点**，已复核）。
+
+**① `entry.index == 0` 的无符号下溢**（`src/core/cluster/RaftElection.zig`，`handleAppendEntries`）：
+`decodeAppendEntries` 把 `entry.index` 直接照抄线上值、不做任何校验（`RaftTransport.zig:235`），
+而条目循环用 `self.log.items[entry.index - 1]` —— `index == 0` 时这个 `u64` 减法下溢。现在**在任何日志
+改动之前**拒绝 `index == 0`（`error.InvalidLogIndex`）。检查放在**循环之外**是有意的：循环体内先
+`truncateLog` 再 append，把检查放进去会让一个畸形请求在失败的路上**先删掉已提交的条目**。
+
+> **两种构建形态都实测过（去掉守卫之后）**，而且坏的方式**不同**：
+>
+> - **Debug / ReleaseSafe** —— `entry.index - 1` 是运行时 `u64` 运算，**溢出检查先于任何下标使用触发**：
+>   `panic: integer overflow` → `signal ABRT`，整个测试进程没了。一个帧、无需认证。
+> - **ReleaseFast** —— 减法绕成 `0xFFFF_FFFF_FFFF_FFFF`，而**地址运算把 `items[那个值]` 折到
+>   `items.ptr - 32`**（实测：`sizeof(LogEntry) == 32`，`delta = -32`；**正好一个条目，不是野指针**，
+>   这也解释了它为什么不 segfault）。随后循环拿越界的 `term` 参与比较，实测里**接受了这条畸形条目**：
+>   对一个两条条目（index 1、index 0）的日志返回 `.{ .success = true, .match_index = 2 }` ——
+>   等于告诉 leader "index 2 已复制"。这是 **Raft 状态机的 safety 违背**，不只是崩溃。
+>
+> 审计原文写的是"ReleaseFast = 野指针读"，实测比那个**更具体也更糟**，已按实测更正。
+
+**② 入站 `recv` 没有超时**（`src/core/cluster/RaftTransport.zig`，`handleConnection`）：
+`ClusterServer.start` 在**它自己那条 accept 线程上内联**跑 handler（`NetworkTransport.zig:88`），
+而 `conn.recv` 此前没有任何上界 —— 全仓库只有出站侧设了 `setRecvTimeout`。于是一个连接、只发
+**4 字节长度前缀**就挂住，就能停掉整个节点的 Raft 入站（没有投票、没有心跳、没有复制），并且
+`ClusterBootstrap.stop()` 会卡死在 `thread.join()`：唤醒连接只能进 backlog，而 accept 环正卡在 `readFull` 里。
+现在入站也设 `setRecvTimeout` / `setSendTimeout`，用的就是出站那个 `ElectionConfig.rpc_timeout_ms`
+（默认 100ms）—— 它从此同时约束一次 RPC 的**两个方向**；WAN 觉得紧就把两端一起调大。
+
+> **没改的东西**：accept 环仍然是**单线程内联**的，所以一个慢对端**仍然串行占用**它 ——
+> 这条修的是**挂死**，不是**吞吐**。`DistributedEventBus` 早就为自己的环做过并发改造，
+> 那是后续的结构性改动，本次刻意不做。
+
+**验证**：全量 **1456/1477（21 skipped，0 failed）**（比上一版 +2，即下面这两条新用例），
+6 道门禁（production / deadcode / version / tenant-scope / pool-guard / bench）+ `zig fmt --check` 全绿。
+两条各带一条**我自己重做过的变异**：① 去掉守卫 → 上面两种形态（安全构建是 **abort**，不是断言红）；
+② `rpc_timeout_ms = 0` → `expected error.ConnectionClosed, found error.ConnectionError`（断言红，
+即"第二个对端根本没被服务"），已按字节回退。
+
+**未做 / 未验证**：② 的用例验的是"**第二个连接会被服务**"，没有用真的半帧连接去测；① 的
+`error.InvalidLogIndex` 在 `handleConnection` 里落到 `logDrop`（debug 日志 + 断开，**不回包**）——
+对恶意帧这是应有的行为，但没有用例锁住它。**审计第 3 条（零认证）本次未修。**
+
+> **为什么这条标"破坏性"**：① 给 `RaftElection.handleAppendEntries` 的错误集**加了一个成员**
+> （`InvalidLogIndex`，现共 2 个：另一个是 `OutOfMemory`）。按 `src/test/ErrorSetSnapshot.zig`
+> 自己的契约（"加新成员 = 破坏性变更，必须在这个文件里承认"），已把它登记进快照并把**上限钉在 2** ——
+> 下游对它写穷尽 `switch (err)` 的人会在**自己的**调用点断，所以窄化不了也瞒不住；
+> 下次再加错误会在**这个测试**里红，而不是在消费者那里。
+> 顺带确认它**没有**退化成 `anyerror`（那会让穷尽 switch 直接不可能）。
+> 运行时行为的变化就是修复本身：此前这条请求会**通过**，现在返回错误、由 `handleConnection` 丢弃。
+
 ### 三处「默认为放行」改成 fail-closed（安全审计的中危 ③⑤⑦；**破坏性：是**）
 
 审计里三条同形缺陷，全部是"**默认放行**"这一类 —— 也是 zent 侧 v0.66 已经修过、sqlx 侧没同步的那一类。

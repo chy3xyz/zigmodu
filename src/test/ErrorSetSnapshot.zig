@@ -20,6 +20,7 @@ const std = @import("std");
 const SecurityModule = @import("../security/SecurityModule.zig").SecurityModule;
 const Multipart = @import("../http/Multipart.zig");
 const Server = @import("../api/Server.zig").Server;
+const RaftElection = @import("../core/cluster/RaftElection.zig").RaftElection;
 
 test "public API error sets stay narrow and stable" {
     try checkSnapshot(SecurityModule.verifyToken, "SecurityModule.verifyToken", &.{
@@ -29,6 +30,16 @@ test "public API error sets stay narrow and stable" {
         "NotMultipart", "MissingBoundary", "MalformedPart", "TooManyParts", "PartTooLarge", "PayloadTooLarge",
     }, 7);
     try checkSnapshot(Server.start, "Server.start", &.{}, 19);
+
+    // The Raft inbound handler. `InvalidLogIndex` arrived in v0.32.0 — the
+    // `entry.index == 0` guard (`docs/dev/security-audit-cluster.md` §5), a
+    // rejection path that had to exist but still widens a public error set, which
+    // is why it is acknowledged here and in CHANGELOG.md. Not `anyerror`, so the
+    // set stays switchable.
+    try checkSnapshot(RaftElection.handleAppendEntries, "RaftElection.handleAppendEntries", &.{
+        "InvalidLogIndex",
+        "OutOfMemory",
+    }, 2);
 }
 
 fn checkSnapshot(

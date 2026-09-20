@@ -586,6 +586,21 @@ pub const ElectionTransportImpl = TransportImpl(0);
 /// it, with the obligations (self-contained requests, stale-response guard) any
 /// implementation has to meet.
 pub fn handleConnection(raft: *RaftElection, addresses: ?*const AddressBook, conn: *NetworkTransport.ClusterConnection) void {
+    // **Bound the inbound read** — the mirror of what the outbound side already
+    // does (`TransportImpl.sendAppendEntries`). The accept loop serves one
+    // connection at a time *inline* on its own thread (`NetworkTransport`), so a
+    // peer that connects and then sends a length prefix without a body used to
+    // stop the whole node's Raft inbound with four bytes — no votes, no
+    // heartbeats, no replication — and `ClusterBootstrap.stop()` would then hang
+    // on `thread.join()`, because its wake-up connection only reaches the
+    // backlog while the loop sits in `readFull`.
+    //
+    // `rpc_timeout_ms` is the same bound the outbound side uses, and it now
+    // covers both directions of one RPC: a WAN that finds it too tight for a
+    // large frame should raise it for both ends at once.
+    _ = sockread.setRecvTimeout(conn.stream, raft.config.rpc_timeout_ms);
+    _ = sockread.setSendTimeout(conn.stream, raft.config.rpc_timeout_ms);
+
     var in = std.ArrayList(u8).empty;
     defer in.deinit(conn.allocator);
     const frame = conn.recv(&in) catch |err| {
@@ -1278,4 +1293,69 @@ test "a peer that accepts and never replies costs rpc_timeout_ms, not the peer's
     server.stop();
     server_thread.join();
     server_up = false;
+}
+
+/// How long the test is willing to wait for the stalled peer's *second*
+/// connection to be served. Well above the raft's bound, so "released by the
+/// bound" and "still waiting on the peer" are distinguishable by elapsed time.
+const stalled_peer_patience_ms: u32 = 2_000;
+
+// Verified red: `rpc_timeout_ms = 0` (the pre-fix behaviour — `setRecvTimeout`
+// returns early on 0) makes this fail on `expectError(error.ConnectionClosed,
+// ...)` with `error.ConnectionError`: the second peer is never served, because
+// the accept thread is still inside the first one's body read. `ClusterServer`
+// runs the handler *inline*, so that one four-byte frame stops the node's entire
+// Raft inbound — no votes, no heartbeats, no replication — and
+// `ClusterBootstrap.stop()` then blocks in `thread.join()` behind it.
+test "a half-frame on the inbound side costs rpc_timeout_ms, not the whole node" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    if (!@import("../../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    const timeout_ms: u32 = 200;
+
+    var impl: ElectionTransportImpl = undefined;
+    var raft: RaftElection = undefined;
+    impl.init(allocator, io, &raft);
+    defer impl.deinit();
+    raft = try RaftElection.init(allocator, "node-a", &.{}, .{ .rpc_timeout_ms = timeout_ms }, &impl.transport());
+    defer raft.deinit();
+
+    var inbound: InboundServer = undefined;
+    var inbound_thread: std.Thread = undefined;
+    const port = try startInbound(allocator, io, &raft, null, 19661, &inbound, &inbound_thread);
+    defer stopInbound(io, &inbound, &inbound_thread);
+
+    // Peer A: a length prefix promising 64 bytes, then silence. Four bytes.
+    // `accept` hands out completed connections in order and A completed its
+    // handshake before B existed, so A is the one the handler is holding.
+    var peer_a = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = port });
+    defer peer_a.deinit();
+    var prefix: [4]u8 = undefined;
+    std.mem.writeInt(u32, &prefix, 64, .big);
+    try sockread.writeFull(peer_a.stream, &prefix);
+
+    // Peer B: a complete frame whose tag is not a Raft message, i.e. one
+    // `handleConnection` answers by closing without a reply.
+    var peer_b = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = port });
+    defer peer_b.deinit();
+    sockread.setRecvTimeout(peer_b.stream, stalled_peer_patience_ms);
+    var junk: [8]u8 = @splat(0);
+    std.mem.writeInt(u32, junk[0..4], 4, .big); // tag 0: no such MessageTag
+    try sockread.writeFull(peer_b.stream, &junk);
+
+    // Clocked before B's dial so the lower bound below cannot be lost to it.
+    const started = Time.monotonicNowMilliseconds();
+    var reply: [4]u8 = undefined;
+    const served = sockread.readFull(peer_b.stream, &reply);
+    const elapsed = Time.monotonicNowMilliseconds() - started;
+
+    // B was served: the server closed it, rather than leaving it in the backlog
+    // until B's own bound expired.
+    try testing.expectError(error.ConnectionClosed, served);
+
+    // And it was A's bound that released B. An immediate EOF would mean the
+    // listen socket refused the connection — a different, already-safe case.
+    try testing.expect(elapsed >= @as(i64, timeout_ms) - 50);
+    try testing.expect(elapsed < @as(i64, stalled_peer_patience_ms) - 500);
 }
