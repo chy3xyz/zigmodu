@@ -1,11 +1,19 @@
 //! Built-in business skills for AI Agents.
 //!
 //! Follows the framework's controlled-execution posture (docs/AI.md):
-//! - `db.query`  — read-only, parameterized SELECT only, row-capped;
+//! - `db.query`  — read-only, parameterized SELECT only, row-capped, and
+//!   tenant-scoped by the framework whenever a tenant context is present;
 //! - `entity.lookup` / `entity.list` — queries against an app-registered
 //!   entity whitelist (no free-form SQL; tenant-scoped when configured);
 //! - every handler checks the deadline and refuses to cross tenant/user
 //!   boundaries encoded in `SkillContext`.
+//!
+//! `db.query` takes SQL *text* from the model, so the tenant filter cannot be
+//! spliced into a clause the framework builds itself. It is applied by
+//! wrapping the model's statement in an outer query whose tenant predicate is
+//! bound as a `?` argument. The column it filters on is declared by the
+//! application (`BusinessSkillsConfig.db_query_tenant_column`); with a tenant
+//! context and no declaration the query is *refused*, never run unscoped.
 
 const std = @import("std");
 const SqlxBackend = @import("../data.zig").SqlxBackend;
@@ -37,6 +45,16 @@ fn isValidIdentifier(s: []const u8) bool {
     if (s.len == 0) return false;
     for (s) |c| {
         if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '.') return false;
+    }
+    return true;
+}
+
+/// Identifier restricted to a bare column name (no `.`): used where the name is
+/// prefixed with a framework-owned alias, so a qualified name cannot be valid.
+fn isPlainIdentifier(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
     }
     return true;
 }
@@ -94,17 +112,38 @@ fn findEntity(entities: []const EntitySpec, name: []const u8) ?EntitySpec {
     return null;
 }
 
+/// Application-declared configuration for the built-in business skills.
+pub const BusinessSkillsConfig = struct {
+    /// Column carrying the tenant id, as the application's own schema names it.
+    /// Required to run `db.query` while `SkillContext.tenant_id` is set: the
+    /// framework puts `WHERE <column> = ?` around the model's statement and
+    /// binds the tenant id. Without it, a tenant-scoped `db.query` is refused
+    /// (`error.TenantScopeUnavailable`) instead of reading across tenants.
+    db_query_tenant_column: ?[]const u8 = null,
+};
+
 /// Register the built-in business skills (`db.query`, `entity.lookup`,
-/// `entity.list`). `backend` must point at a connected sqlx Client; `entities`
-/// is borrowed (keep it alive for the registry's lifetime).
+/// `entity.list`) with default configuration. `backend` must point at a
+/// connected sqlx Client; `entities` is borrowed (keep it alive for the
+/// registry's lifetime).
 pub fn registerBusinessSkills(
     registry: *SkillRegistry,
     comptime entities: []const EntitySpec,
 ) !void {
+    try registerBusinessSkillsWith(registry, entities, .{});
+}
+
+/// Register the built-in business skills with explicit configuration — see
+/// `BusinessSkillsConfig.db_query_tenant_column`.
+pub fn registerBusinessSkillsWith(
+    registry: *SkillRegistry,
+    comptime entities: []const EntitySpec,
+    comptime config: BusinessSkillsConfig,
+) !void {
     try registry.register(.{
         .name = "db.query",
         .action = .read,
-        .description = "Run a read-only parameterized SQL SELECT against the business database. Use ? placeholders and pass values in args. Row count is capped.",
+        .description = "Run a read-only parameterized SQL SELECT against the business database. Use ? placeholders and pass values in args. Row count is capped. When the caller is tenant-scoped the framework adds the tenant filter itself; the statement must expose the tenant column in its result set.",
         .parameters = &.{
             .{ .name = "sql", .type = .string, .description = "SELECT statement with ? placeholders (no literals, no ;)", .required = true },
             .{ .name = "args", .type = .array, .description = "Values for ? placeholders in order", .required = false },
@@ -129,7 +168,30 @@ pub fn registerBusinessSkills(
                 const sql_args = try readArgs(ctx, obj.get("args"));
                 defer ctx.allocator.free(sql_args);
 
-                var cursor = try b.client.queryCursorEx(sql, sql_args, .{});
+                var sql_buf = std.ArrayList(u8).empty;
+                defer sql_buf.deinit(ctx.allocator);
+                var args_list = std.ArrayList(sqlx.Value).empty;
+                defer args_list.deinit(ctx.allocator);
+                try args_list.appendSlice(ctx.allocator, sql_args);
+
+                // The statement is the model's text, so the tenant predicate is
+                // not spliced into a clause we control — the whole statement is
+                // nested and filtered from the outside, with the tenant id
+                // bound as a parameter rather than formatted into SQL.
+                var effective_sql: []const u8 = sql;
+                if (ctx.tenant_id) |tid| {
+                    const tc = config.db_query_tenant_column orelse return error.TenantScopeUnavailable;
+                    if (!isPlainIdentifier(tc)) return error.UnsafeSqlIdentifier;
+                    try sql_buf.appendSlice(ctx.allocator, "SELECT * FROM (");
+                    try sql_buf.appendSlice(ctx.allocator, sql);
+                    try sql_buf.appendSlice(ctx.allocator, ") AS _zt_tenant_scope WHERE _zt_tenant_scope.");
+                    try sql_buf.appendSlice(ctx.allocator, tc);
+                    try sql_buf.appendSlice(ctx.allocator, " = ?");
+                    try args_list.append(ctx.allocator, .{ .int = tid });
+                    effective_sql = sql_buf.items;
+                }
+
+                var cursor = try b.client.queryCursorEx(effective_sql, args_list.items, .{});
                 defer cursor.deinit();
 
                 var rows = std.json.Array.init(ctx.allocator);
@@ -289,12 +351,13 @@ test "db.query runs a parameterized SELECT and caps rows" {
     var backend = SqlxBackend{ .allocator = allocator, .client = &client };
     var registry = SkillRegistry.init(allocator, std.testing.io);
     defer registry.deinit();
-    try registerBusinessSkills(&registry, &.{});
+    // A tenant-scoped db.query requires the app to name its tenant column.
+    try registerBusinessSkillsWith(&registry, &.{}, .{ .db_query_tenant_column = "tenant_id" });
 
     var ctx = SkillContext{ .allocator = a, .backend_ptr = &backend, .tenant_id = 1 };
 
     var args_map = std.json.ObjectMap{};
-    try args_map.put(a, "sql", .{ .string = "SELECT id, name FROM users WHERE tenant_id = ?" });
+    try args_map.put(a, "sql", .{ .string = "SELECT id, name, tenant_id FROM users WHERE tenant_id = ?" });
     var args_arr = std.json.Array.init(a);
     try args_arr.append(.{ .integer = 1 });
     try args_map.put(a, "args", .{ .array = args_arr });
@@ -304,6 +367,71 @@ test "db.query runs a parameterized SELECT and caps rows" {
     const rows = res.object.get("rows").?.array.items;
     try std.testing.expectEqualStrings("alice", rows[0].object.get("name").?.string);
     try std.testing.expectEqualStrings("carol", rows[1].object.get("name").?.string);
+}
+
+test "db.query filters rows the model did not scope itself" {
+    const allocator = std.testing.allocator;
+    var client = sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, tenant_id INTEGER)", &.{});
+    _ = try client.exec("INSERT INTO users (name, tenant_id) VALUES ('alice', 1), ('bob', 2), ('carol', 1)", &.{});
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    try registerBusinessSkillsWith(&registry, &.{}, .{ .db_query_tenant_column = "tenant_id" });
+
+    // No WHERE at all: the framework must still confine the result to tenant 1.
+    var args_map = std.json.ObjectMap{};
+    try args_map.put(a, "sql", .{ .string = "SELECT id, name, tenant_id FROM users" });
+
+    var ctx = SkillContext{ .allocator = a, .backend_ptr = &backend, .tenant_id = 1 };
+    const res = try registry.dispatch("db.query", &ctx, .{ .object = args_map });
+    try std.testing.expectEqual(@as(i64, 2), res.object.get("count").?.integer);
+    for (res.object.get("rows").?.array.items) |row| {
+        try std.testing.expectEqual(@as(i64, 1), row.object.get("tenant_id").?.integer);
+    }
+
+    // The same statement under tenant 2 sees only bob — the boundary moves with
+    // the context, not with the statement.
+    ctx.tenant_id = 2;
+    const res2 = try registry.dispatch("db.query", &ctx, .{ .object = args_map });
+    try std.testing.expectEqual(@as(i64, 1), res2.object.get("count").?.integer);
+    try std.testing.expectEqualStrings("bob", res2.object.get("rows").?.array.items[0].object.get("name").?.string);
+}
+
+test "db.query refuses a tenant-scoped call with no declared tenant column" {
+    const allocator = std.testing.allocator;
+    var client = sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, tenant_id INTEGER)", &.{});
+    _ = try client.exec("INSERT INTO users (name, tenant_id) VALUES ('alice', 1), ('bob', 2)", &.{});
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    var registry = SkillRegistry.init(allocator, std.testing.io);
+    defer registry.deinit();
+    try registerBusinessSkills(&registry, &.{}); // no db_query_tenant_column
+
+    var args_map = std.json.ObjectMap{};
+    try args_map.put(a, "sql", .{ .string = "SELECT id, name FROM users" });
+
+    var ctx = SkillContext{ .allocator = a, .backend_ptr = &backend, .tenant_id = 1 };
+    const err = registry.dispatch("db.query", &ctx, .{ .object = args_map }) catch |e| e;
+    try std.testing.expectEqual(error.TenantScopeUnavailable, err);
+
+    // Without a tenant context there is no boundary to enforce, so the same
+    // registration still runs the statement as written.
+    ctx.tenant_id = null;
+    const res = try registry.dispatch("db.query", &ctx, .{ .object = args_map });
+    try std.testing.expectEqual(@as(i64, 2), res.object.get("count").?.integer);
 }
 
 test "db.query/entity.list results are freeValue-safe (no literal keys)" {
@@ -318,7 +446,7 @@ test "db.query/entity.list results are freeValue-safe (no literal keys)" {
     const entities = [_]EntitySpec{.{ .name = "user", .table = "users", .pk = "id", .tenant_column = "tenant_id" }};
     var registry = SkillRegistry.init(allocator, std.testing.io);
     defer registry.deinit();
-    try registerBusinessSkills(&registry, &entities);
+    try registerBusinessSkillsWith(&registry, &entities, .{ .db_query_tenant_column = "tenant_id" });
 
     // ctx.allocator must be a real tracking allocator (not an arena) so
     // freeValue on the result exercises every key/value ownership.
@@ -327,7 +455,7 @@ test "db.query/entity.list results are freeValue-safe (no literal keys)" {
     var db_args = try std.json.parseFromSlice(
         std.json.Value,
         allocator,
-        "{\"sql\":\"SELECT name FROM users WHERE tenant_id = ?\",\"args\":[1]}",
+        "{\"sql\":\"SELECT name, tenant_id FROM users WHERE tenant_id = ?\",\"args\":[1]}",
         .{},
     );
     defer db_args.deinit();

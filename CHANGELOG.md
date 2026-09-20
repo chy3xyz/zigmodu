@@ -2,6 +2,50 @@
 
 ## [Unreleased]
 
+### **Breaking**：CSPRNG 换成 `std.Io.randomSecure` + `db.query` 的租户边界（安全审计的中危 ⑥ 与 ④）
+
+**⑥ API key / 密码盐 / uuid 的种子熵不够。** 原种子是「毫秒 + 常量 42 + 栈地址 + 毫秒×1000」，
+文档自称 "multi-source entropy" 字面成立，但**全部来源都是非秘密、低熵、且同一进程内共享的** ——
+熵上限 ≈ ASLR 位数，且同一进程的所有生成共享同一个 slide，观测到一个就能枚举其余。
+四处（`ApiKeyAuth` / `PasswordEncoder` / `SecurityModule` / `kit/random`）统一改为
+**`std.Io.randomSecure(io, buf)`** —— 每次走系统调用、**失败即 `error.EntropyUnavailable`、没有回落**。
+
+> **审计（和照抄它的简报）建议的 `std.crypto.random.bytes()` 在本工具链上编译不过**：
+> `std.crypto.random` 在 Zig `0.17.0-dev.2151` 上**不存在**（实测 `struct 'crypto' has no member named 'random'`）。
+> 本版本的熵入口是 `std.Io`。刻意**不用** `std.Io.random` —— 它的文档明写失败时回落到
+> pid + 墙钟 + ASLR，那正是这条要消灭的缺陷类别。
+
+**迁移**（忘了传 `io` 是**编译错误**，这是有意的：运行期弱盐比编译不过糟得多）：
+`ApiKeyGenerator.generate(allocator, io)`、`PasswordEncoder.init(allocator, io)` /
+`initWithIterations(allocator, io, iterations)`、`kit.random.uuid(allocator, io)` / `bytes(io, len)`。
+
+**④ `db.query` 没有租户边界。** 兄弟技能 `entity.*` 做了，它没做。
+修法是**外层包裹 + 参数绑定**（不是字符串拼接 —— 那会引入新的注入面，而且碰上模型写的 `OR`
+会被优先级打穿，正是同一次审计第 ⑦ 条的形态）：
+
+```sql
+SELECT * FROM ( <模型原样 SQL> ) AS _zt_tenant_scope WHERE _zt_tenant_scope.<col> = ?
+```
+
+- 租户值**只以 `?` 绑定**出现，一个字节都不进 SQL 文本；列名过 `isPlainIdentifier`。
+- **模型的表达式没有任何位置能削弱这条谓词**（外层独立 WHERE，模型写 `OR`/`1=1` 都不影响）。
+- **有租户上下文但没声明列 → `error.TenantScopeUnavailable`**（fail-closed）。
+  新配置 `BusinessSkillsConfig.db_query_tenant_column` + 新入口 `registerBusinessSkillsWith(...)`；
+  旧 `registerBusinessSkills(...)` 签名**保留**（`docs/AI_SKILLS.md` / `docs/MCP.md` 引着它）。
+  **注意**：`registerBuiltinCatalog` 走的是默认入口，所以**用内置 catalog 的多租户应用，
+  其 `db.query` 在租户上下文下会被拒** —— 必须改调 `registerBusinessSkillsWith`。这是刻意的 fail-closed 默认值。
+- 副作用（方向安全但值得知道）：包裹后模型自己的 `LIMIT` 在内层先生效，可能少返回几行；
+  内层必须把租户列暴露在结果集里，否则外层报 "no such column" → **报错、不出数据**。
+
+**验证**：新增 6 条用例，**三条变异全是断言失败、不是编译错** —— 把旧种子放回去：
+`expected 256, found 29`（同一毫秒内 256 个 key 只有 29 个不同）与 `expected 64, found 15`（盐）；
+把租户谓词去掉：`expected 2, found 3`（租户 2 的 `bob` 漏出来了）。全量 **1442/1463（21 skipped，0 failed）**、
+5 道门禁 + fmt 全绿。
+
+**未验证**：只在 `:memory:` SQLite 上跑过（本机无 PG/MySQL）；`Uring`/`Dispatch` 的 `randomSecure`
+只读了 std 源码，没在 Linux/Windows 上跑。
+
+
 ### **Breaking**：HTTP 请求边界加固（fail-closed）—— 安全审计的高危 ②
 
 审计（`docs/dev/security-audit-v0.31.0.md`）的第二条高危：请求解析有三处与规范不符，**合起来**允许与

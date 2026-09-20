@@ -1,5 +1,4 @@
 const std = @import("std");
-const Time = @import("../core/Time.zig");
 
 /// API key authentication configuration
 pub const ApiKeyConfig = struct {
@@ -117,16 +116,17 @@ fn validateKey(key: []const u8, allowed_keys: []const []const u8) bool {
 
 /// API key generator — creates random API keys
 pub const ApiKeyGenerator = struct {
-    /// Generates one API key (format: sk-{32 hex chars})
-    pub fn generate(allocator: std.mem.Allocator) ![]const u8 {
+    /// Generates one API key (format: sk-{32 hex chars}).
+    ///
+    /// The 16 random bytes come from the OS entropy source
+    /// (`std.Io.randomSecure`) — a syscall on every call, never derived from
+    /// process-local state such as the clock, the stack layout or a
+    /// long-lived in-process RNG. Failure to reach an entropy source surfaces
+    /// as `error.EntropyUnavailable` rather than silently falling back to a
+    /// predictable seed.
+    pub fn generate(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
         var buf: [16]u8 = undefined;
-        var seed: [32]u8 = undefined;
-        std.mem.writeInt(u64, seed[0..8], @intCast(Time.monotonicNowMilliseconds()), .little);
-        std.mem.writeInt(u64, seed[8..16], @intCast(42), .little);
-        std.mem.writeInt(u64, seed[16..24], @intFromPtr(&buf), .little);
-        std.mem.writeInt(u64, seed[24..32], @intCast(Time.monotonicNowMilliseconds() * 1000), .little);
-        var csprng = std.Random.DefaultCsprng.init(seed);
-        csprng.fill(&buf);
+        try std.Io.randomSecure(io, &buf);
         const hex_chars = "0123456789abcdef";
         var hex: [32]u8 = undefined;
         for (buf, 0..) |byte, i| {
@@ -155,11 +155,33 @@ const api = @import("../api/Server.zig");
 
 test "ApiKeyGenerator generate" {
     const allocator = std.testing.allocator;
-    const key = try ApiKeyGenerator.generate(allocator);
+    const key = try ApiKeyGenerator.generate(allocator, std.testing.io);
     defer allocator.free(key);
 
     try std.testing.expect(std.mem.startsWith(u8, key, "sk-"));
     try std.testing.expectEqual(@as(usize, 35), key.len);
+}
+
+test "ApiKeyGenerator keys are unique within one process and one millisecond" {
+    const allocator = std.testing.allocator;
+    var seen = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = seen.keyIterator();
+        while (it.next()) |k| allocator.free(k.*);
+        seen.deinit();
+    }
+
+    var i: usize = 0;
+    while (i < 256) : (i += 1) {
+        const key = try ApiKeyGenerator.generate(allocator, std.testing.io);
+        const res = try seen.getOrPut(key);
+        if (res.found_existing) allocator.free(key);
+    }
+    // A seed built from the clock plus the stack address of the output buffer
+    // collapses here: calls made inside one millisecond from the same frame
+    // re-seed identically, so a batch like this yields only a handful of
+    // distinct keys. OS entropy must make every key unique.
+    try std.testing.expectEqual(@as(usize, 256), seen.count());
 }
 
 test "ApiKeyGenerator validate format" {

@@ -1,31 +1,27 @@
 const std = @import("std");
-const Time = @import("../core/Time.zig");
 const crypto = std.crypto;
 
 pub const PasswordEncoder = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     iterations: u32,
 
     pub const default_iterations: u32 = 100_000;
 
-    pub fn init(allocator: std.mem.Allocator) PasswordEncoder {
-        return .{ .allocator = allocator, .iterations = default_iterations };
+    /// `io` is the only source of salt entropy: there is deliberately no
+    /// constructor without it, because a fallback seed would make the salt
+    /// predictable.
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) PasswordEncoder {
+        return .{ .allocator = allocator, .io = io, .iterations = default_iterations };
     }
 
-    pub fn initWithIterations(allocator: std.mem.Allocator, iterations: u32) PasswordEncoder {
-        return .{ .allocator = allocator, .iterations = iterations };
+    pub fn initWithIterations(allocator: std.mem.Allocator, io: std.Io, iterations: u32) PasswordEncoder {
+        return .{ .allocator = allocator, .io = io, .iterations = iterations };
     }
 
     pub fn encode(self: *PasswordEncoder, raw_password: []const u8) ![]const u8 {
         var salt: [16]u8 = undefined;
-        // Seed CSPRNG from timestamp, pid, and stack address for ~128-bit entropy
-        var seed: [32]u8 = undefined;
-        std.mem.writeInt(u64, seed[0..8], @intCast(Time.monotonicNowMilliseconds()), .little);
-        std.mem.writeInt(u64, seed[8..16], @intCast(@intFromPtr(&seed)), .little);
-        std.mem.writeInt(u64, seed[16..24], @intFromPtr(&salt), .little);
-        std.mem.writeInt(u64, seed[24..32], @intCast(Time.monotonicNowMilliseconds() * 1000), .little);
-        var csprng = std.Random.DefaultCsprng.init(seed);
-        csprng.fill(&salt);
+        try std.Io.randomSecure(self.io, &salt);
 
         var derived_key: [32]u8 = undefined;
         try crypto.pwhash.pbkdf2(
@@ -119,7 +115,7 @@ fn base64Decode(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
 
 test "PasswordEncoder encode and matches" {
     const allocator = std.testing.allocator;
-    var encoder = PasswordEncoder.init(allocator);
+    var encoder = PasswordEncoder.init(allocator, std.testing.io);
 
     const hash = try encoder.encode("my_password");
     defer allocator.free(hash);
@@ -128,9 +124,31 @@ test "PasswordEncoder encode and matches" {
     try std.testing.expect(!encoder.matches("wrong_password", hash));
 }
 
+test "PasswordEncoder salts are unique within one process and one millisecond" {
+    const allocator = std.testing.allocator;
+    // One PBKDF2 iteration keeps the batch inside a single millisecond, which
+    // is exactly where a clock/stack-derived seed repeats itself.
+    var encoder = PasswordEncoder.initWithIterations(allocator, std.testing.io, 1);
+
+    var seen = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = seen.keyIterator();
+        while (it.next()) |k| allocator.free(k.*);
+        seen.deinit();
+    }
+
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        const hash = try encoder.encode("same_password");
+        const res = try seen.getOrPut(hash);
+        if (res.found_existing) allocator.free(hash);
+    }
+    try std.testing.expectEqual(@as(usize, 64), seen.count());
+}
+
 test "PasswordEncoder empty password" {
     const allocator = std.testing.allocator;
-    var encoder = PasswordEncoder.init(allocator);
+    var encoder = PasswordEncoder.init(allocator, std.testing.io);
 
     const hash = try encoder.encode("");
     defer allocator.free(hash);
@@ -140,9 +158,9 @@ test "PasswordEncoder empty password" {
 
 test "PasswordEncoder needsUpgrade with low iterations" {
     const allocator = std.testing.allocator;
-    var encoder = PasswordEncoder.init(allocator);
+    var encoder = PasswordEncoder.init(allocator, std.testing.io);
 
-    var low_iter = PasswordEncoder.initWithIterations(allocator, 10_000);
+    var low_iter = PasswordEncoder.initWithIterations(allocator, std.testing.io, 10_000);
     const old_hash = try low_iter.encode("test");
     defer allocator.free(old_hash);
 

@@ -282,15 +282,12 @@ pub const SecurityModule = struct {
     }
 
     pub fn hashPassword(self: *Self, password: []const u8) ![]const u8 {
+        // The salt must come from the OS entropy source. A module built with
+        // `init` (no `io`) has no entropy source at all, so hashing is
+        // refused rather than done with a predictable salt.
+        const io = self.io orelse return error.EntropyUnavailable;
         var salt: [16]u8 = undefined;
-        // Seed CSPRNG from multiple entropy sources for ~128-bit unpredictability
-        var seed: [32]u8 = undefined;
-        std.mem.writeInt(u64, seed[0..8], @intCast(Time.monotonicNowMilliseconds()), .little);
-        std.mem.writeInt(u64, seed[8..16], @intFromPtr(&seed), .little);
-        std.mem.writeInt(u64, seed[16..24], @intFromPtr(&salt), .little);
-        std.mem.writeInt(u64, seed[24..32], @intCast(Time.monotonicNowMilliseconds() * 1000), .little);
-        var csprng = std.Random.DefaultCsprng.init(seed);
-        csprng.fill(&salt);
+        try std.Io.randomSecure(io, &salt);
 
         // SAFETY: Buffer is immediately filled by pbkdf2() before use
         var derived_key: [32]u8 = undefined;
@@ -545,13 +542,19 @@ test "SecurityModule JWT invalid signature" {
 
 test "SecurityModule password hash and verify" {
     const allocator = std.testing.allocator;
-    var sec = SecurityModule.init(allocator, "secret", 3600);
+    var sec = SecurityModule.initWithIo(allocator, "secret", 3600, std.testing.io);
 
     const hash = try sec.hashPassword("my_password");
     defer allocator.free(hash);
 
     try std.testing.expect(sec.verifyPassword("my_password", hash));
     try std.testing.expect(!sec.verifyPassword("wrong_password", hash));
+}
+
+test "SecurityModule hashPassword without an io refuses instead of using a weak salt" {
+    const allocator = std.testing.allocator;
+    var sec = SecurityModule.init(allocator, "secret", 3600);
+    try std.testing.expectError(error.EntropyUnavailable, sec.hashPassword("my_password"));
 }
 
 test "SecurityModule role checking" {
