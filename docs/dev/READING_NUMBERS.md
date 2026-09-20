@@ -224,3 +224,35 @@ bash scripts/check-bench.sh --ratios /tmp/b-*.log scripts/bench-baseline.json   
 ```
 
 `--explain` 的 token **不能**给它定罪；它只能告诉你"这条读数在单次采样里越了 2.0×"。
+
+## `machine:` 行里的 `load=` —— 为什么它必须在**日志里**
+
+`--explain` 是**离线**的（它 "builds nothing, runs nothing"），所以它读不到"跑那一轮时机器忙不忙"。
+而这件事恰恰决定了参考平坦度能不能当证据：
+
+> **这台机器的参考被故意选成宿主最简单的循环**（`atomic RMW`、以及紧挨它的 store→load 链）。
+> 一个 cache-local 循环在机器满了的时候**照样平**，而内存路径受限的指标会翻倍。
+> 所以"**参考平、指标动**"在饱和下是**预期形状**，不是可疑形状。
+
+实测两次（2026-09-20）：`TimerWheel x100K` 读到 **2.14×** 与 **2.52×**，四个参考全部在 1.08× 以内，
+而 `load averages` 是 **10.00 / 10 核**。没有这个字段时，`--explain` 两次都判它
+`REAL-REGRESSION-CANDIDATE`。
+
+所以 `check-bench.sh` 在运行时把 1 分钟负载打进 `machine:` 行：
+
+```
+machine: region=? cpu=Apple M1 Pro cores=10 load=2.93  |  Darwin 25.6.0 arm64
+```
+
+`--explain` 读它，并且 **`load >= cores` 时把 `REAL-REGRESSION-CANDIDATE` 降级为 `RE-RUN-BEFORE-FIX`**
+（只说降级理由，不改门禁：门禁的判据永远是不带参数那条命令的 exit code）。
+
+两侧都验过（合成日志，真实退出码）：
+
+| 日志 | exit | 是否出现 `RUN-WAS-SATURATED` | 判词 |
+|---|---|---|---|
+| `cores=10 load=10.00` | **0** | 有 | `RE-RUN-BEFORE-FIX` |
+| `cores=10 load=0.50` | **1** | 无 | `REAL-REGRESSION-CANDIDATE` |
+
+**所以：`--explain` 给 `REAL-REGRESSION-CANDIDATE` 时，先看日志里那一轮的 `load=`。**
+它到不了 `cores`，才轮到"看代码"；到得了 `cores`，先换台机器重跑。
