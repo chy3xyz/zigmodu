@@ -342,3 +342,77 @@ TLS/边车（`TlsTransport.zig:1-8` 的文件头已经写明 mTLS 目前要边�
 - §3.6 的重放残留**按设计接受**（Raft 的 term 单调 + 幂等已覆盖），未做时间戳/窗口。
 - **混合版本集群未实测**：设计上硬切（不匹配的帧被丢弃 + debug 日志），但没有真的拿新旧两个二进制对跑。
 - 密钥的来源（`SecretsManager`）只有文档约定，**没有代码强制** —— `?[32]u8` 由应用自己填。
+
+---
+
+## 12. 核查中发现的第二条独立缺陷：票数约定差一票（N=2 结构上不可能选出 leader）
+
+§10 是 id 空间的问题。查它的时候顺手验了 `handleVoteResponse` 的计票口径，**是另一条独立的缺陷**，
+不需要 id 空间问题也能单独触发。
+
+### 机制
+
+```zig
+// RaftElection.zig:769-771
+try self.votes_received.put(peer_id, {});
+if (@as(usize, self.votes_received.count()) >= self.quorumSize()) self.becomeLeader();
+
+// :976-978 —— 这个数**包含自己**
+pub fn quorumSize(self: *const Self) usize { return (self.clusterSize() / 2) + 1; }
+// :971-973
+pub fn clusterSize(self: *const Self) usize { return 1 + self.peers.items.len; }
+```
+
+而 `votes_received` **只记 peer 的票**（`:982-986` 的注释把这当成约定明说了：
+"the candidate's own vote is not part of the tally, so a multi-node candidate needs
+`quorumSize()` peers behind it"）—— 于是实际要求是 `1 + quorumSize()` 票，而分母只有 `clusterSize()`。
+**比 Raft 的多数多要一票。**
+
+### 实测（不是推演）
+
+一条临时探针，2 节点集群（自己 + 1 个 id 匹配的 peer），`startElection()` 后让那唯一的 peer 授予投票：
+
+```
+[PROBE] N=2 clusterSize=2 quorumSize=2
+[PROBE] after 1/1 peer grants: leader=false
+```
+
+**N=2 时 `quorumSize()=2`，而 peer 只有 1 个 —— 结构上不可能达成**，那条集群永远选不出 leader。
+
+### 影响面
+
+| N | Raft 多数 | 本代码要求 peer 票 | 实际总票 | 后果 |
+|---|---|---|---|---|
+| 2 | 2 | 2 | 3 | **不可能**（只有 1 个 peer） |
+| 3 | 2 | 2 | 3 | 需要**全体一致** —— 任一 peer 不可达即无法选举，**零容错** |
+| 5 | 3 | 3 | 4 | 需要 4/5，比多数多一票 |
+
+即**整体少一个节点的容错度**，且 N=2 完全不可用。
+
+### 为什么既有的 3 节点用例没抓到
+
+`real loopback election…` 用 3 个节点、两个 peer 都活着 → 2 票拿得到 → 通过。
+它甚至把 `hasQuorum(2)` 写进了断言（`:98`），**把这条偏差固化成"期望值"**了。
+N=2 的路径没有任何用例经过。
+
+### 修法（一行，但会动到既有断言）
+
+按 Raft 的多数，自己的票要在里面：
+
+```zig
+if (@as(usize, self.votes_received.count()) + 1 >= self.quorumSize()) self.becomeLeader();
+// 以及 hasQuorum(votes_received) 同步改成 votes_received + 1 >= quorumSize()
+```
+
+验算：N=2 → `1+1>=2` ✓；N=3 → `1+1>=2` ✓（需要 1 个 peer）；N=5 → `2+1>=3` ✓（需要 2 个 peer）。
+`real loopback election…` 的 `hasQuorum(2)` 要改成 `hasQuorum(1)`；
+`:982-986` 的注释必须一起改，否则它继续描述旧口径。
+
+### 与 §10 的关系：两条独立
+
+- §10（id 空间）让 **`ClusterBootstrap` 配出来的**集群选不出 leader —— 票投出去了但计不进来。
+- §12（差一票）让 **N=2** 集群选不出 leader —— 票计得进来但门槛够不到。
+
+**两条都要修**，且 §12 是**不需要任何配置决策**的那一条（纯 off-by-one）。
+本次**只记录未修**：它会改选举语义与一条既有断言，且 §10 那个配置形状的决定还没定 ——
+两件事叠在一起改，判据会糊。
