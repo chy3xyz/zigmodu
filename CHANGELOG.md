@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.30.1] - 2026-09-20
 
 ### DX：让"只跑匹配的测试"真的可用，且不再静默骗人（**破坏性：否**；新增 `bash scripts/test-fast.sh --filter`）
 
