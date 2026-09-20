@@ -31,6 +31,7 @@
 | 升级注意事项（breaking / 影响面 / 改法） | `docs/UPGRADING.md` |
 | 外部反馈核实与处置 | `docs/ISSUES_FROM_ZAPI.md` · `docs/ISSUES_FROM_ZIGSHOP.md` |
 | CLI 生成 | `docs/ZMODU_CLI_INTEGRATION.md` · `zig build zmodu -- scaffold …`（**必须从仓库根跑**，见下方"两个 zmodu 入口"） |
+| 只跑一个/一组测试、filter 为什么不能瞎用 | 本文 §Testing「只跑匹配的测试」+ `scripts/test-fast.sh --help` |
 | LLM 对话模块（产品功能） | `docs/AI.md`（**不是** agent 指南） |
 | AI 业务接入（KeyManager/Agent/Workflow/Skill/接入） | `docs/AI_DEV_GUIDE.md` + `docs/AI_SKILLS.md` + `docs/LLM_POLICIES.md` |
 
@@ -122,6 +123,8 @@ CI、`scripts/ci-*.sh`、本文件都用那个。`cd tools/zmodu && zig build` �
 | 生产一行接入：`http.productionProfile(&server, .{...}, &state)`（背压+安全+`/metrics`+`/health/*`+`/metrics` 黄金信号） | 在 `router.mountAll`/`addRoute` 之后再挂全局中间件（`addRoute` 注册时快照中间件链） |
 | WS 出站：`Server.Config.ws_write_timeout_ms` + `WsFramer.isWritable()` 丢帧 | 对不读的慢客户端无限阻塞写（会卡住写线程与 `ConnectionRegistry` shard 锁） |
 | 沙箱 CI：`zig build test -Dnet-tests=false` 跳过 socket 测试 | 在无 loopback 权限环境里跑默认套件（网络用例会失败/抖动） |
+| 只跑匹配的测试：`bash scripts/test-fast.sh --filter <测试名子串> [--db all]`（运行期过滤；命中 0 个 → exit 2 并说明未验证任何东西） | `zig build test -- --test-filter X`（0.17 的 build runner 把 `--` 之后的参数全丢掉：跑全套 ~47s 仍 exit 0）；或 `zig test src/root.zig --test-filter X`（缺 `build_options`/驱动链接，且产物二进制运行期拒收该 flag） |
+| 需要"确实重新执行过"的证据：`bash scripts/test-fast.sh --force-run`（或 `-Dtest-force-run=true`） | 以为第二次 `zig build test` 会重跑 —— Zig 连 test **运行**结果一起缓存，直接显示 `run test cached`，测试没执行、也没有任何计数 |
 | 多副本后台任务：`cron.setLock(...)` / `runner.setLock(...)`（`zigmodu.DistributedLock`，表锁按 DB 自动分方言） | 多副本直接跑 cron / 迁移（每个副本都会执行 = 重复副作用、并发 DDL） |
 | 长流程收尾：`SagaStep.timeout_seconds` **必须设**（`0` = 关掉预算）；进程重启后接 `zigmodu.TransactionJournal.initWithBackend(...)` + `recover()`，把悬挂（in-doubt）事务交人工处置 | 让某步卡死把 saga 永久挂在 `running`（`timeout_seconds = 0` 就是关掉预算）；重启后对 in-doubt 事务装作没发生 —— `recover()` 只**报告**，不会自动重试/回滚 |
 | 指标标签用 `ctx.route_template`（模式）；用 `createCounterFamily` 限基数 | 把原始 path / id / 用户输入塞进 label（基数爆炸） |
@@ -365,6 +368,31 @@ ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test
 bash scripts/ci-integration.sh   # tenant-mgmt + stress + shopdemo（-Ddb=sqlite）
 ```
 
+### 只跑匹配的测试（以及哪些形式不可信）
+
+```bash
+bash scripts/test-fast.sh --db all --filter "RaftElection: a tick"   # 只跑名字含该子串的用例
+bash scripts/test-fast.sh --force-run                               # 整跑，且强制真的执行
+bash scripts/test-fast.sh --help
+```
+
+filter 是**测试全限定名的子串**（形如 `core.cluster.RaftElection.test.<测试名>`，见 `zm-test-runner:` 摘要行）。
+实现的机制是**运行期**过滤：`-Dtest-filter=` 给 `test` step 的每个 test artifact 装上
+`scripts/test-runner.zig`（`mode = .simple`），整套先编译、只有命中的才执行。
+
+**哪些形式不可信（都在 0.17.0-dev.2151 实测过）**：
+
+| 形式 | 实际行为 |
+|------|----------|
+| `zig build test -- --test-filter X` | build runner 把 `--` 之后的参数**整体丢弃**：filter 无效，全套照跑（~47s），**exit 0** |
+| `zig test src/root.zig --test-filter X` | 缺 `build_options` 模块与 SQL 驱动链接；就算用 `-Mroot=` 拼出来，产物二进制在**运行期拒绝** `--test-filter`（该 flag 是编译期的） |
+| Zig 自带 `--test-filter`（`Compile.filters`） | **编译期**过滤：被排除的 test 连函数体都不分析，它 body 里的 `@import` 不会发生 → 被导入文件的测试**根本不在编译里**。本仓库整套挂在一个聚合测试下（`src/tests.zig` → `test "compile all source files"`），所以实测 `-Dtest-filter=RaftElection` 编出的二进制只有 1 个测试（`root.test_0`，无名 `test { … }` 块，任何 filter 都匹配不到）且 **exit 0**；只有 `-Dtest-filter=.`（匹配一切）能跑满 1416 |
+| 命中 0 个 | 自带机制打印 `All 0 tests passed.` 且 **exit 0**。`scripts/test-fast.sh` 汇总 5 个 test 二进制的 `zm-test-runner:` 行，总数 0 时 **exit 2** 并明确说"没有验证任何东西" |
+| 第二次 `zig build test`（缓存热） | Zig 连 test **运行**结果一起缓存：输出 `run test cached`，测试**没有执行**、也没有计数。要能引用的证据就加 `--force-run` |
+
+> 一个二进制里若 filter 命中 0 个，runner **不会**单独失败（5 个 test artifact 里通常只有一个含目标用例，
+> 逐个失败会否掉所有正常的聚焦运行）；判定权在脚本的汇总。旧脚本 `bash scripts/test-fast.sh <name>` 的裸参数形式仍可用。
+
 ## Version
 - Framework: **v0.30.0** (`build.zig.zon`)
 - Zig: **0.17.0-dev.1970+67f39b551**（CI 同款锁定版本，见 `.github/workflows/ci.yml` → `ZIG_VERSION`；避免 fmt 行为漂移。注意 ziglang 镜像会回收旧 dev 构建——dev.1567 已 404，升级时本地先验证再改 CI）
@@ -374,7 +402,8 @@ bash scripts/ci-integration.sh   # tenant-mgmt + stress + shopdemo（-Ddb=sqlite
   门控用例：真实 PostgreSQL 锁（`ZIGMODU_TEST_PG=1`，CI `test-postgres` job 启用）、
   `REDIS_URL` 门控的 Redis 用例。
 - 其它测试入口：`zig build soak`（N 并发 × M 租户，默认 16×50；CI 夜间 64×200）·
-  `zig build test -Dnet-tests=false`（沙箱里跳过全部 socket 用例）
+  `zig build test -Dnet-tests=false`（沙箱里跳过全部 socket 用例）·
+  `bash scripts/test-fast.sh [--filter …]`（聚焦单测/强制重跑；见 §Testing）
 - Score: ~98/100（`docs/EVALUATION_REPORT.md` v5.6；该报告早于 2026-09 加固批次，
   当前状态以本文件与 `CHANGELOG.md` 为准）
 - Roadmap: `docs/PRODUCTION_ROADMAP.md`（phases 1–9 ✅）

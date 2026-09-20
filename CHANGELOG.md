@@ -2,6 +2,37 @@
 
 ## [Unreleased]
 
+### DX：让"只跑匹配的测试"真的可用，且不再静默骗人（**破坏性：否**；新增 `bash scripts/test-fast.sh --filter`）
+
+原来唯一可信的验证方式是整跑（~47s），因为所有"加 filter"的写法都在骗人 —— 三条都在
+0.17.0-dev.2151 上实测复现：
+
+- `zig build test -- --test-filter X`：build runner 把 `--` 之后的参数**整体丢弃**。传一个**不存在**的名字，
+  依然跑满整套（**47.1s**）、**exit 0**，输出里的计数与不带 filter 一模一样。开发者以为自己只跑了一个测试。
+- `zig test src/root.zig --test-filter X`：缺 `build_options` 模块与 SQL 驱动链接，得手拼 `-Mroot=`；
+  而且产物二进制在**运行期拒收** `--test-filter`（`unrecognized command line argument` → abort）—— 该 flag 是编译期的。
+- Zig 自带 `--test-filter`（`Compile.filters`）是**编译期**过滤：被排除的 test 连函数体都不分析，它 body 里的
+  `@import` 不会发生，被导入文件的测试**根本不在编译里**。本仓库整套挂在一个聚合测试下
+  （`src/tests.zig` → `test "compile all source files"`），所以实测 `-Dtest-filter=RaftElection` 编出的
+  二进制只含 1 个用例（`root.test_0`，无名 `test { … }` 块，任何 filter 都匹配不到）且 **exit 0**；
+  只有 `-Dtest-filter=.`（匹配一切）能跑满 1416。
+
+**修法**（`build.zig` + `scripts/**`，未动 `src/**`）：
+
+- `-Dtest-filter=SUBSTR` 改成**运行期**过滤：给 `test` step 的 5 个 test artifact 装上
+  `scripts/test-runner.zig`（`TestRunner{ .mode = .simple }`，模型自编译器自带 `test_runner.zig` 的
+  `mainTerminal`，保留 per-test allocator/io 与泄漏检测语义），整套编译、只执行命中的用例。
+  无名 `test { … }` 块在 filter 下不执行（没有名字可匹配，且计数会把"命中 0 个"藏起来），并在摘要里单列。
+- `bash scripts/test-fast.sh --filter <全限定名子串>` 是**被检查的入口**：汇总各二进制的
+  `zm-test-runner: selected N of M tests` 行，总数 0 就 **exit 2** 并写明"没有验证任何东西"；
+  拿不到计数时 exit 3 或给 WARNING，**绝不报告成功**。退出码：`1` 用例失败 · `2` filter 命中 0 · `3` 拿不到结果 · `64` 用法错误。
+- `-Dtest-force-run=true` / `--force-run`：Zig 连 test **运行**结果一起缓存，热 cache 下重跑只打印
+  `run test cached`（测试没执行、也没有计数）。带 filter 的运行本来就强制重跑。
+  **默认行为未改**：不带任何选项的 `zig build test` 仍用 Zig 自带 runner 跑全部用例。
+- 实测：命中 1 个 → `1 of 1416 tests matched`（秒级，且这个用例是嵌套在聚合测试之下的，编译期 filter 永远够不着）；
+  命中 0 个 → exit 2、**0.7s**（对比整跑 47s）；默认整跑不受影响（`1395/1416 passed, 21 skipped, 0 failed`）。
+- 文档：`AGENTS.md` §Testing「只跑匹配的测试（以及哪些形式不可信）」+ `docs/BEST_PRACTICES.md` §测试策略。
+
 ### Cluster：同一个 `RaftElection` 的两个线程现在由 raft 自己的锁串起来（**破坏性：否**；修真竞态 + 补回归测试 + 两处测试同步）
 
 `ClusterBootstrap.start()` 起一个 accept 线程，把对端发来的 Raft RPC 直接分发进 `raft`（

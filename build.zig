@@ -59,6 +59,58 @@ pub fn build(b: *std.Build) void {
     // Test step - test the main library
     const test_step = b.step("test", "Run all tests");
 
+    // Focused runs: `-Dtest-filter=SUBSTR` runs only tests whose fully qualified
+    // name contains SUBSTR.
+    //
+    // This deliberately does *not* use Zig's `--test-filter` (`Compile.filters`).
+    // That one is applied at compile time, and an excluded test is not analyzed
+    // at all — so its `@import`s never run and the imported files' tests are never
+    // even seen. Filtering is transitive only through *matching* test bodies, and
+    // this repo's suite hangs off one aggregate test (`src/tests.zig` →
+    // `test "compile all source files"` → …). Measured on 0.17.0-dev.2151:
+    // `-Dtest-filter=RaftElection` produced a binary containing exactly one test
+    // (`root.test_0`, an unnamed block no filter can match) and exited 0, while
+    // `-Dtest-filter=.` — which matches everything — ran the full 1416. Silent,
+    // and useless for the thing this option is for.
+    //
+    // So the filter is applied at *runtime* by `scripts/test-runner.zig`: the
+    // whole suite is compiled, the runner sees every test name, and only matches
+    // execute. The runner reports `selected N of M tests` per test binary, and
+    // `scripts/test-fast.sh` sums those lines: zero in total is a hard failure
+    // there (exit 2) instead of a green run that verified nothing. The runner
+    // deliberately does *not* fail a single binary that matched nothing — a
+    // filter normally matches in only one of the five test binaries.
+    //
+    // Caching: Zig caches test *runs*, and a cached run neither re-executes nor
+    // re-prints results. A filtered run therefore sets `has_side_effects`;
+    // `-Dtest-force-run=true` does the same for unfiltered runs. The default
+    // (`zig build test`, no options) keeps its cache behaviour untouched.
+    const test_filter = b.option([]const u8, "test-filter", "Only run tests whose fully qualified name contains this substring (runtime filter via scripts/test-runner.zig; see scripts/test-fast.sh)");
+    const test_force_run = b.option(bool, "test-force-run", "Re-execute test binaries even when Zig has a cached run result for them") orelse false;
+
+    // Attach a test artifact to the `test` step. Kept as one helper so the
+    // filter, the runner and the side-effect flag cannot drift apart.
+    const addTest = struct {
+        fn add(
+            b_: *std.Build,
+            step: *std.Build.Step,
+            artifact: *std.Build.Step.Compile,
+            filter: ?[]const u8,
+            force_run: bool,
+        ) void {
+            if (filter != null) {
+                artifact.test_runner = .{
+                    .path = b_.path("scripts/test-runner.zig"),
+                    .mode = .simple,
+                };
+            }
+            const run = b_.addRunArtifact(artifact);
+            if (filter) |f| run.addArg(b_.fmt("--filter={s}", .{f}));
+            if (filter != null or force_run) run.has_side_effects = true;
+            step.dependOn(&run.step);
+        }
+    }.add;
+
     // Proper build-system test (supports build_options and other generated modules)
     const lib_test_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
@@ -71,8 +123,7 @@ pub fn build(b: *std.Build) void {
     const lib_tests = b.addTest(.{
         .root_module = lib_test_mod,
     });
-    const run_lib_tests = b.addRunArtifact(lib_tests);
-    test_step.dependOn(&run_lib_tests.step);
+    addTest(b, test_step, lib_tests, test_filter, test_force_run);
 
     // Test log_level.zig separately (needs build_options module)
     const log_level_test_mod = b.createModule(.{
@@ -84,8 +135,7 @@ pub fn build(b: *std.Build) void {
     const log_level_tests = b.addTest(.{
         .root_module = log_level_test_mod,
     });
-    const run_log_level_tests = b.addRunArtifact(log_level_tests);
-    test_step.dependOn(&run_log_level_tests.step);
+    addTest(b, test_step, log_level_tests, test_filter, test_force_run);
 
     // Benchmark step
     const benchmark_mod = b.createModule(.{
@@ -198,8 +248,7 @@ pub fn build(b: *std.Build) void {
     const zmodu_tests = b.addTest(.{
         .root_module = zmodu_cli_mod,
     });
-    const run_zmodu_tests = b.addRunArtifact(zmodu_tests);
-    test_step.dependOn(&run_zmodu_tests.step);
+    addTest(b, test_step, zmodu_tests, test_filter, test_force_run);
 
     // Dead-code analyzer unit tests live in the deadcode/ submodule; include
     // them explicitly so `zig build test` covers the analyzer itself.
@@ -209,14 +258,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const dc_analyze_tests = b.addTest(.{ .root_module = dc_analyze_mod });
-    test_step.dependOn(&b.addRunArtifact(dc_analyze_tests).step);
+    addTest(b, test_step, dc_analyze_tests, test_filter, test_force_run);
     const dc_scanner_mod = b.createModule(.{
         .root_source_file = b.path("tools/zmodu/src/deadcode/scanner.zig"),
         .target = target,
         .optimize = optimize,
     });
     const dc_scanner_tests = b.addTest(.{ .root_module = dc_scanner_mod });
-    test_step.dependOn(&b.addRunArtifact(dc_scanner_tests).step);
+    addTest(b, test_step, dc_scanner_tests, test_filter, test_force_run);
 
     // Concurrency soak (`zig build soak`) — real sockets, N clients x M
     // tenants, cross-tenant leak assertions. Kept out of `zig build test` so

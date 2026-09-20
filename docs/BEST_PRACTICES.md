@@ -1928,6 +1928,42 @@ test "订单模块 - 异常路径" {
 > 与 `examples/tenant-mgmt/src/tests.zig`。请求级断言用 `http.Testkit`（`dispatch` /
 > `signBearerToken` / `openMemorySqlite` / `SseRecorder`）。
 
+### 只跑匹配的测试（`scripts/test-fast.sh`）
+
+整套 1416 个用例全跑约 **47s**，迭代时不该每轮都付这个成本 —— 但"加个 filter"这条路在 Zig 0.17
+上有三个坑，全部实测过（0.17.0-dev.2151）：
+
+| 写法 | 实测行为 |
+|------|----------|
+| `zig build test -- --test-filter X` | build runner 把 `--` 之后的参数**整体丢弃**。传一个**不存在**的名字照样跑满全套（~47s）并 **exit 0** —— 开发者以为自己只跑了一个测试 |
+| `zig test src/root.zig --test-filter X` | 缺 `build_options` 模块和 SQL 驱动链接，得手拼 `-Mroot=` 才编得出来；而且产物二进制在**运行期拒收** `--test-filter`（`unrecognized command line argument` → abort）。该 flag 是编译期的 |
+| Zig 自带 `--test-filter`（`Compile.filters`） | 编译期过滤，被排除的 test **函数体不分析** → 它 body 里的 `@import` 不发生 → 被导入文件的测试根本不在编译里。本仓库整套挂在一个聚合测试下（`src/tests.zig` → `test "compile all source files"`），实测 `-Dtest-filter=RaftElection` 编出来的二进制只有 1 个用例（`root.test_0` 这个无名 `test { … }` 块，任何 filter 都匹配不到）且 exit 0；只有 `-Dtest-filter=.`（匹配一切）能跑满 1416 |
+| 命中 0 个 | 自带机制打印 `All 0 tests passed.` 并 **exit 0**：和"跑完并通过"长得一模一样 |
+
+所以本仓库的 filter 走**运行期**：`-Dtest-filter=` 会把 `scripts/test-runner.zig`（`mode = .simple`）装到
+`test` step 的 5 个 test artifact 上，整套先编译、只执行命中的；脚本汇总各二进制的
+`zm-test-runner: selected N of M tests` 行，总数 0 就 **exit 2** 并写明"没有验证任何东西"。
+
+```bash
+bash scripts/test-fast.sh --db all --filter "RaftElection: a tick"   # 命中 1 个：1 of 1416，秒级
+bash scripts/test-fast.sh --db all --filter zzz_no_such_test         # 命中 0 个：exit 2，0.7s
+bash scripts/test-fast.sh --force-run                                # 整跑，且**确实执行**（不是缓存回放）
+```
+
+filter 是**全限定名的子串**（形如 `core.cluster.RaftElection.test.<测试名>`）。
+
+**错误退出码**：`1` 用例失败 · `2` filter 没命中任何用例 · `3` 拿不到结果 · `64` 用法错误。
+"命中 0 个也 exit 0" 这种静默失效已从机制上消除 —— 拿不到计数时脚本只会 exit 3 或给出明确的 WARNING，
+绝不报告成功。
+
+**缓存**：Zig 连 test **运行**结果一起缓存。热 cache 下再跑 `zig build test` 只会打印
+`run test cached`，测试**并不执行**、也不打印任何计数 —— 这不是"跑过了"，是"复用了记录"。
+要一份能引用的证据，用 `--force-run`（带 filter 的运行本来就强制重跑，因为缓存回放会吃掉计数）。
+源码一改（哪怕一个字节）编译缓存即失效，运行随之重跑；这条用"插一个必失败断言 → 必红"实测验证过。
+
+> 每个 test artifact 单独命中 0 个时 runner **不**报错：5 个二进制里通常只有一个含目标用例，
+> 逐个失败会否掉所有正常的聚焦运行。判定权在脚本的汇总。
+
 ### 覆盖率要求
 - **核心模块**：覆盖率 ≥ 80%
 - **关键路径**：覆盖率 ≥ 90%
