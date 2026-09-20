@@ -89,6 +89,12 @@ pub const ElectionConfig = struct {
     /// lost instead of being waited for. 0 disables the bound (the pre-fix
     /// behaviour).
     rpc_timeout_ms: u32 = 100,
+
+    /// Pre-shared key for the cluster port (docs/dev/cluster-auth-design.md).
+    /// When set, every inbound Raft frame must carry a valid HMAC-SHA256 tag and
+    /// every outbound one is signed. When null the frames are bare — which is why
+    /// `ClusterBootstrap.start()` refuses a multi-node cluster without one.
+    cluster_secret: ?[32]u8 = null,
 };
 
 /// Raft server state

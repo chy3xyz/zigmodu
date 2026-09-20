@@ -2,6 +2,77 @@
 
 ## [Unreleased]
 
+### 集群入站逐帧 HMAC 认证 + fail-closed 门禁（安全审计 ② 的第 3 条；**破坏性：是**）
+
+审计那条"入站路径零认证"（`ClusterAuth` 全仓库零调用点，TCP 可达即集群成员）的修复。
+设计在 [`docs/dev/cluster-auth-design.md`](docs/dev/cluster-auth-design.md)（§3 + §3.5 已实现，§4 被阻断，
+理由见下）。
+
+**帧形状**：`[4 字节 BE 长度][tag][payload][32 字节 MAC]`，MAC 覆盖 `[tag][payload]`。
+**验签与剥离在任何 decoder 之前完成**，所以 6 个 `decode*` 一字未改。配了密钥时，
+`verifiedRecv` 用**常时比较**（复用 `ClusterAuth.timingSafeEql`）验签，失败即丢弃连接并 debug 日志。
+
+**配置**（两处，`docs/dev/cluster-auth-design.md` §3.4）：
+
+```zig
+try ClusterBootstrap.init(allocator, io, .{
+    .node_id = "node-a",
+    .port = 9000,
+    .peers = &.{"127.0.0.1:9001"},
+    .transport = my_transport,
+    .cluster_secret = secret,     // 32 字节；自己从 security.SecretsManager 取（env > file > vault）
+});
+```
+
+**fail-closed 门禁**照抄既有的 `allow_stub_raft_transport` 惯用法：`transport != null` +
+`raft_cluster_size > 1` + 没有密钥 → `start()` 返回 **`error.ClusterAuthRequired`**，
+除非显式 `.allow_unauthenticated_cluster = true`。单节点不需要密钥（没有对端要对）。
+
+> **破坏性在于门禁，不在于帧**：一个**今天在多节点上跑着**、没配密钥的部署，升级后会**拒绝启动** ——
+> 这是刻意的（它此前确实是零认证的）。补一个 32 字节密钥即可，或显式承认不安全。
+> 帧格式只在**配了密钥**时变化，所以单节点与不配密钥的集群字节不变。
+
+**顺带必须一起签的三处**（否则配了密钥的集群直接不工作）：入站**回复**、投票响应**中继**、
+`sendAppendEntries` 对**同一连接回复**的读取 —— 候选人会验证自己的入站帧，未签名的中继等于一票被丢；
+未验签的回复读取会让 decoder 接受从未认证过的尾部字节。`writeFrameAuth` / `readFrameAuth` 是这条路上
+唯一的决策点，所以三处不会漂移。
+
+**实现期对设计的两处收紧**：
+
+1. **密钥按值传，不建 `ClusterAuth`**。第一版每帧 `ClusterAuth.init`（内部 `dupe` 一次 `node_id`）
+   再 `deinit`，而 MAC 只用 `pre_shared_key` —— 那个 `node_id` 从未被用过。代价有两个：每帧一次分配，
+   以及**分配失败会把一票静默丢掉**（投票/心跳路径上凭空多出的失败模式）。现在 helper 收 `?[32]u8`。
+2. **门禁用 `log.warn` 而不是 `log.err`**：`scripts/test-runner.zig:176-179` 把**任何 err 级日志**
+   本身算作测试失败，所以 `err` 会让门禁测试与既有的 `RaftTransportUnavailable` 测试一起变红。
+
+**验证**：全量 **1489/1510（21 skipped，0 failed）**（比上一版 +11），`zig fmt --check` + **6 道门禁全绿**。
+新增 11 条用例（帧往返 / 换密钥 / 改 payload / 改 tag / 裸帧 / 短帧 / 带密钥的环回 AppendEntries
+端到端 / 门禁四态）。**三条变异逐条验过红、全是断言红**：去掉验签 → 裸帧测试
+`expected error.ClusterAuthFailed, found { …帧字节… }`；把常时比较那行改成不生效 →
+`a frame signed with another key is refused` 同形红；删掉 `start()` 门禁 →
+`expected error.ClusterAuthRequired, found void`。
+
+**两个既有测试被改（有意，非弱化）**：`ClusterBootstrap accepts an app-supplied Raft transport`
+加 `.cluster_secret`、`ClusterBootstrap drives raft.tick and serves inbound Raft RPCs` 加
+`.allow_unauthenticated_cluster = true`（它手工写**裸**投票请求，必须走裸帧路径）。断言都未削弱。
+设计稿点名的 `real loopback election…` 与 `a half-frame on the inbound side…` **未改动**且通过。
+**未做**：§4 的 L2 成员校验（被下面的既有缺陷阻断）、`DistributedEventBus` 自己的 listener、
+§3.6 的重放残留（按设计接受：Raft 的 term 单调 + 幂等已覆盖）、混合版本集群未实测对跑。
+
+### 新发现（本次实现前核查出来的，比认证缺口更严重）：peer id 空间不一致 → 多节点集群选不出 leader
+
+**未修，已记录**。`ClusterBootstrap` 把 **host 字符串**当 peer id（`ClusterBootstrap.zig:201`
+`try raft.addPeer(p.host)`），而节点自己的 `local_id` 是 `config.node_id`。投票回复上线时带的是
+`raft.local_id`（`RaftTransport.zig:634`），候选人却拿它去 `self.peers[].id`（host 串）里找
+（`RaftElection.zig:762` 的 `peerId`）→ **对不上，这一票被丢弃**。`quorumSize()` 要求 peer 票过半，
+所以 `raft_cluster_size > 1` 的集群**永远选不出 leader**。`ClusterBootstrap` 的测试里**没有一处断言过
+leader**，所以它一直没被看见。
+
+**为什么这挡住了 L2**：`handleAppendEntries` 现在**不校验** `leader_id`，这正是 leader→follower
+复制**唯一还能工作**的原因 —— 照设计给三个 handler 加成员校验，合法的 leader（`"node-a"`）同样会被拒，
+**把唯一能走的路也堵死**。所以顺序必须是：① 修 id 空间 → ② L1（本次已落）→ ③ L2。
+证据链在 `docs/dev/cluster-auth-design.md` §10。
+
 ### P1 剩余五项：WS 帧协议、连接池耗尽、Raft 的 5 处 free-then-dupe 与别名守卫（**破坏性：否**，但 WS 一则改变行为）
 
 评估里 P1 剩下的五项，按文件分三组。

@@ -69,6 +69,14 @@ pub const BootstrapConfig = struct {
     /// elections happen elsewhere, or not at all". `raft_cluster_size <= 1`
     /// (single node) needs no acknowledgement.
     allow_stub_raft_transport: bool = false,
+    /// 32-byte pre-shared key authenticating the cluster port. Source it from
+    /// `security.SecretsManager` (env > file > vault); the framework deliberately
+    /// does not read it for you. Required for a multi-node cluster with a real
+    /// `.transport` — see the gate in `start()`.
+    cluster_secret: ?[32]u8 = null,
+    /// Loud acknowledgement that a multi-node cluster runs **unauthenticated**.
+    /// Same idiom as `allow_stub_raft_transport`: refuse unless set.
+    allow_unauthenticated_cluster: bool = false,
 };
 
 pub const ClusterBootstrap = struct {
@@ -167,7 +175,27 @@ pub const ClusterBootstrap = struct {
             );
             return error.RaftTransportUnavailable;
         }
-        const election_cfg = ElectionConfig{};
+        // The other half of the same honesty, one level up: a multi-node cluster
+        // with a real transport but no pre-shared key runs the cluster port
+        // **unauthenticated** — TCP-reachable means cluster member
+        // (`docs/dev/cluster-auth-design.md` §1: anyone who can connect can win a
+        // vote, forge a leader, or clear the log). Refuse unless the app either
+        // supplies a key or says so out loud. `raft_cluster_size <= 1` needs no
+        // key: there is no peer to talk to.
+        if (self.config.transport != null and self.config.raft_cluster_size > 1 and
+            self.config.cluster_secret == null and !self.config.allow_unauthenticated_cluster)
+        {
+            // `warn`, not `err`: the returned error is the loud part, and the test
+            // harness treats an `err`-level log as a failure by itself.
+            std.log.warn(
+                "[ClusterBootstrap] refusing to start node {s}: raft_cluster_size={d} with a real transport but no " ++
+                    "`cluster_secret`, so every frame on the cluster port would be unauthenticated. Set it from " ++
+                    "SecretsManager, or acknowledge with `.allow_unauthenticated_cluster = true`.",
+                .{ self.config.node_id, self.config.raft_cluster_size },
+            );
+            return error.ClusterAuthRequired;
+        }
+        const election_cfg = ElectionConfig{ .cluster_secret = self.config.cluster_secret };
         const S = struct {
             var transport_impl: ?struct {
                 sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
@@ -458,12 +486,15 @@ test "ClusterBootstrap accepts an app-supplied Raft transport" {
     const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(&vtable));
 
     // `raft_cluster_size` stays at its default 3: with a transport supplied this
-    // must start (no acknowledgement needed).
+    // must start — the *stub* guard needs no acknowledgement here. The cluster
+    // secret is the other requirement a multi-node cluster with a real transport
+    // has (see the gate tests below).
     var cluster = try ClusterBootstrap.init(allocator, std.testing.io, .{
         .node_id = "byo-transport-node",
         .port = 19004,
         .peers = &.{"127.0.0.1:19005"},
         .transport = transport,
+        .cluster_secret = @splat(0x11),
     });
     defer cluster.deinit();
     try cluster.start();
@@ -503,6 +534,111 @@ test "ClusterBootstrap refuses a multi-node cluster without a real Raft transpor
     defer view.release(snap);
     try std.testing.expect(snap.count() >= 1);
     try std.testing.expect(snap.find("acked-node") != null);
+}
+
+/// The vtable the cluster-secret gate tests hand in as `.transport`. They are
+/// about the gate, not about the transport, so this only has to be *not* the
+/// built-in stub (`Impl` above); it is never dialled.
+const GateTransport = struct {
+    fn sendVote(_: ?[]const u8, _: []const u8, _: VoteRequest) void {}
+    fn sendAppend(_: ?[]const u8, _: []const u8, _: AppendEntriesRequest) AppendEntriesResponse {
+        return .{ .term = 0, .success = false, .match_index = 0 };
+    }
+};
+
+fn gateTransport() RaftElection.ElectionTransport {
+    const S = struct {
+        var vtable = struct {
+            sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void = GateTransport.sendVote,
+            sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse = GateTransport.sendAppend,
+        }{};
+    };
+    return @ptrCast(@alignCast(&S.vtable));
+}
+
+test "ClusterBootstrap refuses a multi-node cluster without a cluster secret" {
+    const allocator = std.testing.allocator;
+
+    // Same shape as the `RaftTransportUnavailable` case above, one layer up: a
+    // real transport (so votes would actually travel) with no pre-shared key means
+    // the cluster port answers anyone who can reach it. The gate fires before the
+    // inbound listener is spawned, so this needs no socket.
+    var refusing = try ClusterBootstrap.init(allocator, std.testing.io, .{
+        .node_id = "unauthenticated-node",
+        .port = 19010,
+        .peers = &.{"127.0.0.1:19011"},
+        .raft_cluster_size = 3,
+        .transport = gateTransport(),
+    });
+    defer refusing.deinit();
+    try std.testing.expectError(error.ClusterAuthRequired, refusing.start());
+}
+
+test "ClusterBootstrap starts a multi-node cluster that has a cluster secret" {
+    const allocator = std.testing.allocator;
+    if (!@import("../../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    // The gate's positive control: it keys off `cluster_secret`, not off
+    // "multi-node with a transport" — so supplying a key must start the node.
+    const secret: [32]u8 = @splat(0x2b);
+    var authed = try ClusterBootstrap.init(allocator, std.testing.io, .{
+        .node_id = "authenticated-node",
+        .port = 19012,
+        .peers = &.{"127.0.0.1:19013"},
+        .raft_cluster_size = 3,
+        .transport = gateTransport(),
+        .cluster_secret = secret,
+    });
+    defer authed.deinit();
+
+    try authed.start();
+    // The secret reached the raft, which is what `RaftTransport` reads on every
+    // frame — outbound (`TransportImpl`) and inbound (`handleConnection`).
+    try std.testing.expectEqual(secret, authed.getRaft().?.config.cluster_secret.?);
+}
+
+test "ClusterBootstrap starts an acknowledged unauthenticated multi-node cluster" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    if (!@import("../../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    // The loud opt-out, the same idiom as `allow_stub_raft_transport`: the cluster
+    // runs, on bare frames, because the app said so.
+    var acked = try ClusterBootstrap.init(allocator, io, .{
+        .node_id = "acked-unauth-node",
+        .port = 19014,
+        .peers = &.{"127.0.0.1:19015"},
+        .raft_cluster_size = 3,
+        .transport = gateTransport(),
+        .allow_unauthenticated_cluster = true,
+    });
+    defer acked.deinit();
+
+    try acked.start();
+    try std.testing.expect(acked.server.running.load(.monotonic));
+    // "Unauthenticated" is exactly this: the raft has no key, so frames are bare.
+    try std.testing.expect(acked.getRaft().?.config.cluster_secret == null);
+}
+
+test "ClusterBootstrap needs no cluster secret for a single node" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    if (!@import("../../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    // One node has no peer to talk to, so the gate must not fire — and no
+    // acknowledgement is needed to say that.
+    var solo = try ClusterBootstrap.init(allocator, io, .{
+        .node_id = "solo-node",
+        .port = 19016,
+        .peers = &.{},
+        .raft_cluster_size = 1,
+        .transport = gateTransport(),
+    });
+    defer solo.deinit();
+
+    try solo.start();
+    try std.testing.expect(solo.server.running.load(.monotonic));
+    try std.testing.expect(solo.getRaft().?.config.cluster_secret == null);
 }
 
 test "ClusterBootstrap facade: single node routes, reports health, stops twice" {
@@ -574,6 +710,10 @@ test "ClusterBootstrap drives raft.tick and serves inbound Raft RPCs" {
         .peers = &.{"127.0.0.1:19731"},
         .raft_cluster_size = 2,
         .transport = transport,
+        // This test drives the **bare** frame shape on purpose (it writes an
+        // unsigned vote request by hand below), so it runs unauthenticated —
+        // which is what the acknowledgement is for.
+        .allow_unauthenticated_cluster = true,
     });
     defer cluster.deinit();
     try cluster.start();

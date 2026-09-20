@@ -1,6 +1,8 @@
 # 集群入站零认证 —— 设计（未实现）
 
-> 状态：**设计草案，未实现**。来源是 `docs/dev/security-audit-cluster.md` 的第 3 条高危，
+> 状态：**§3（L1 逐帧 HMAC 认证）与 §3.5（fail-closed 门禁）已实现并验证；
+> §4（L2 成员校验）未实现 —— 被 §10 记录的既有缺陷阻断。**
+> 来源是 `docs/dev/security-audit-cluster.md` 的第 3 条高危，
 > 以及本次评估中对 `handleVoteRequest` / `handleAppendEntries` 的复核。
 > 所有事实都带 `文件:行`；推测的地方显式标注"未验证"。
 
@@ -248,3 +250,95 @@ TLS/边车（`TlsTransport.zig:1-8` 的文件头已经写明 mTLS 目前要边�
    还是让配置写 SecretsManager 的 key 名、由框架去取？
 
 另外：**是否单开一个版本**（这是破坏性的 wire 变更，够一个 `!`）。
+
+---
+
+## 10. 实现前的核查结果（2026-09-21）：**L2 被一个更严重的既有缺陷挡住**
+
+§4.3 说"阶段 5 的第一件事是读加入路径并补用例，而不是先改代码"。读了，结论比预想严重：
+**peer id 空间不一致，导致 `ClusterBootstrap` 配出来的多节点集群今天选不出 leader。**
+
+### 证据链（逐条可核对）
+
+1. `ClusterBootstrap.zig:201-203`：`try raft.addPeer(p.host);` —— **peer 的 id 是 host 字符串**
+   （`config.peers = &.{"127.0.0.1:19005"}` 经 `PeerDiscovery.resolve()` 得到 `Peer{.host="127.0.0.1", .port=19005}`），
+   地址簿另存 `host:port`。`docs/DISTRIBUTED.md` 的样例配置就是这个形状。
+2. 但节点自己的 `local_id` 是 **`config.node_id`**（`ClusterBootstrap.zig:195`）。
+3. 投票回复上线时带的是 `raft.local_id`（`RaftTransport.zig:634`：`encodeVoteResponse(&out, allocator, resp, raft.local_id)`）。
+4. 候选人计数时把它交给 `peerId(from_peer)`（`RaftElection.zig:762`），而 `peerId` 只在 **`self.peers[].id`** 里找 ——
+   也就是 **host 字符串**。`"node-b"` 在 `{"127.0.0.1"}` 里找不到 → `orelse return` → **这一票被丢弃**。
+5. `quorumSize() = clusterSize/2 + 1`（`:970-972`）且 `votes_received` **只数 peer 的票**，
+   所以多节点集群**永远到不了多数** → 永远选不出 leader。
+6. `ClusterBootstrap` 的测试里**没有一处断言过 leader**（`isLeader`/`getLeader` 在测试区零命中）——
+   与这个结论一致，所以它一直没被发现。
+
+> **为什么这对 L2 是阻断性的**：`handleAppendEntries` 现在**不校验** `leader_id`，
+> 这正是 leader→follower 的日志复制**唯一还能工作**的原因。若照 §4.1 给三个 handler 加成员校验，
+> 合法的 leader（`"node-a"`）同样会被拒 —— **把唯一能走的路也堵死**。
+
+### 因此的排序修正
+
+```text
+① 修 peer id 空间（peer id = node_id；地址簿单独承载 host:port）
+      ↓  （这是选举能不能工作的前置，也是 L2 的前置）
+② L1 逐帧 HMAC 认证（与 id 空间正交，可以并行/先落）
+      ↓
+③ L2 三个 handler 的成员校验
+```
+
+**L1 不受影响**，所以本次照 §3 实现 L1 + §3.5 的 fail-closed 门禁；**L2 留到 ① 之后**。
+§4.1 的三个校验点、§7 的第 5 条红证据，都要等 ① 落地。
+
+---
+
+## 11. L1 实现记录（2026-09-21）
+
+§3 + §3.5 已落地。落在四个文件：
+
+| 文件 | 改动 |
+|---|---|
+| `TlsTransport.zig` | 新增 `ClusterAuth.mac()` —— 返回**原始 32 字节** HMAC（`sign` 返回的 64 字节 hex 是给人和 JSON 用的，不能直接上线）；`timingSafeEql` 改为 `pub` 以便复用 |
+| `RaftTransport.zig` | 帧形状 `[len][tag][payload][mac32]`；`sendSigned` / `verifiedRecv` / `writeFrameAuth` / `readFrameAuth`；入站验签在**任何 decoder 之前**完成并剥离，所以 6 个 `decode*` 一字未改 |
+| `RaftElection.zig` | `ElectionConfig.cluster_secret: ?[32]u8 = null` |
+| `ClusterBootstrap.zig` | `BootstrapConfig.cluster_secret` + `allow_unauthenticated_cluster`；门禁紧邻 `allow_stub_raft_transport` 那块，返回 `error.ClusterAuthRequired` |
+
+### 实现期对设计的两处收紧
+
+1. **密钥按值传，不建 `ClusterAuth`。** 第一版每帧 `ClusterAuth.init`（内部 `dupe` 一次 `node_id`）再 `deinit` ——
+   而 MAC 只用 `pre_shared_key`，那个 `node_id` 从头到尾没被用过。代价有两个：每帧一次分配，
+   以及**分配失败会把一票静默丢掉**（投票/心跳路径上的一个新失败模式）。现在 helper 收 `?[32]u8`，
+   `authFor` 整个删掉。这条是 brief 的设计不够好，不是实现的问题。
+2. **门禁用 `log.warn` 而不是设计稿里写的 `log.err`。** `scripts/test-runner.zig:176-179` 把
+   **任何 err 级日志**本身算作测试失败（`log_err_count != 0` → 判红），所以 `err` 会让门禁测试
+   和既有的 `RaftTransportUnavailable` 测试一起失败。错误本身就是响的那部分。
+
+### 顺带必须一起签的三处（否则配了密钥的集群不工作）
+
+入站**回复**、投票响应**中继**、以及 `sendAppendEntries` 对**同一连接回复**的读取。
+候选人会验证自己的入站帧，所以未签名的**中继**等于一票被丢；而未验签的回复读取会让 decoder
+接受一段从未被认证过的尾部字节。`writeFrameAuth`/`readFrameAuth` 是这两条路唯一的决策点。
+
+### 两个既有测试被改（有意，非弱化）
+
+`ClusterBootstrap accepts an app-supplied Raft transport` 加 `.cluster_secret`（它的配置正是新门禁要拒的
+"多节点 + 真 transport + 无密钥"）；`ClusterBootstrap drives raft.tick and serves inbound Raft RPCs` 加
+`.allow_unauthenticated_cluster = true`（它**手工写裸投票请求**，必须走裸帧路径）。
+两处断言都未被削弱。设计稿点名的 `real loopback election…` 与 `a half-frame on the inbound side…`
+**未改动**且通过 —— 它们不带密钥，走的正是裸帧路径。
+
+### 验证
+
+全量 **1489/1510（21 skipped，0 failed）**（比上一版 +11），`zig fmt --check` + **6 道门禁全绿**。
+变异逐条验过红：把 `verifiedRecv` 的验签去掉（第一版直接 `return conn.recv`）→ 裸帧测试
+`expected error.ClusterAuthFailed, found { …帧字节… }`；把常时比较那行改成不生效 →
+`a frame signed with another key is refused` 同形红；删掉 `start()` 门禁 →
+`expected error.ClusterAuthRequired, found void`。三条**都是断言红，不是编译错**。
+
+### 未做
+
+- **L2 未实现**，因为 §10 的 id 空间缺陷未修：`handleAppendEntries` 现在**不校验** `leader_id`，
+  这正是 leader→follower 复制唯一还能工作的原因。先加 L2 会把唯一能走的路也堵死。
+- `DistributedEventBus` 自己的 listener（§3.3 第三个调用点）**未做** —— 独立于 Raft 端口，单独一项。
+- §3.6 的重放残留**按设计接受**（Raft 的 term 单调 + 幂等已覆盖），未做时间戳/窗口。
+- **混合版本集群未实测**：设计上硬切（不匹配的帧被丢弃 + debug 日志），但没有真的拿新旧两个二进制对跑。
+- 密钥的来源（`SecretsManager`）只有文档约定，**没有代码强制** —— `?[32]u8` 由应用自己填。

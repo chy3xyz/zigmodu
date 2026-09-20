@@ -26,7 +26,9 @@
 const std = @import("std");
 const NetworkTransport = @import("NetworkTransport.zig");
 const sockread = @import("../sockread.zig");
+const ClusterAuth = @import("TlsTransport.zig").ClusterAuth;
 const RaftElection = @import("RaftElection.zig").RaftElection;
+const ElectionConfig = @import("RaftElection.zig").ElectionConfig;
 const Peer = @import("RaftElection.zig").Peer;
 const VoteRequest = @import("RaftElection.zig").VoteRequest;
 const VoteResponse = @import("RaftElection.zig").VoteResponse;
@@ -44,6 +46,14 @@ const log = std.log.scoped(.raft_transport);
 // Framing is NetworkTransport's: 4-byte big-endian length + payload. The payload
 // is 1 tag byte + big-endian fixed-width fields; strings and byte blobs are a
 // u16 length followed by that many bytes.
+//
+// With `ElectionConfig.cluster_secret` set, every frame on the cluster port is
+// `[4-byte BE len][tag][payload][mac: 32 raw bytes]` and the MAC covers
+// `[tag][payload]` — `len` counts tag + payload + MAC, which is why the length
+// side of `recv` needs no change. Verification happens **before** decoding and
+// the MAC is stripped there, so `tagOf` / `payloadOf` / the six `decode*` read
+// exactly the bytes they read when the feature is off
+// (`docs/dev/cluster-auth-design.md` §3.1).
 
 /// First byte of a payload: which RPC the rest carries.
 pub const MessageTag = enum(u8) {
@@ -300,6 +310,73 @@ fn writeFrame(stream: std.Io.net.Stream, frame: []const u8) !void {
     try sendAll(stream, frame);
 }
 
+// ── Frame authentication (L1) ───────────────────────────────────────────────
+//
+// `docs/dev/cluster-auth-design.md` §3: an HMAC-SHA256 tag over `[tag][payload]`
+// appended to the frame. The three helpers below are the whole mechanism — the
+// call sites are one line each, and the encoders/decoders are untouched.
+
+/// Length of the tag `sendSigned` appends and `verifiedRecv` strips.
+const auth_mac_bytes = 32;
+
+/// The `ClusterAuth` this node signs with, or null when
+/// `ElectionConfig.cluster_secret` is null (bare frames — the state
+/// `ClusterBootstrap.start()` refuses for a multi-node cluster). A non-null
+/// result must be `deinit`ed.
+/// Sign `frame` (already `[tag][payload]`) and write it length-prefixed.
+/// `frame` is NOT modified — the MAC is appended into a temp buffer, making the
+/// wire bytes `[len][tag][payload][mac]`.
+///
+/// The write goes through `writeFrame`, not `ClusterConnection.send`: the latter
+/// is a bare `writev`, and answering a peer that already closed its socket would
+/// then raise SIGPIPE (`writeFrame`'s comment has the full story). The framing
+/// is byte-for-byte the same.
+fn sendSigned(key: [32]u8, conn: *NetworkTransport.ClusterConnection, frame: []const u8) !void {
+    var mac: [auth_mac_bytes]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, frame, &key);
+    var signed = std.ArrayList(u8).empty;
+    defer signed.deinit(conn.allocator);
+    try signed.appendSlice(conn.allocator, frame);
+    try signed.appendSlice(conn.allocator, &mac);
+    try writeFrame(conn.stream, signed.items);
+}
+
+/// `conn.recv`, then split off the trailing MAC, verify it constant-time and
+/// return the frame **without** it — so the existing decoders are untouched.
+///
+/// `error.ClusterAuthFailed` covers a frame too short to carry a MAC (a bare
+/// frame from a peer that has no secret configured) as well as a MAC that does
+/// not match; callers treat both as "drop this peer".
+fn verifiedRecv(key: [32]u8, conn: *NetworkTransport.ClusterConnection, buf: *std.ArrayList(u8)) ![]const u8 {
+    const frame = try conn.recv(buf);
+    if (frame.len < auth_mac_bytes + 1) return error.ClusterAuthFailed;
+    const signed_len = frame.len - auth_mac_bytes;
+
+    // Raw bytes, not `ClusterAuth.verify`: that one re-hexes the tag it computes
+    // before comparing, which cannot match a `[32]u8` MAC on the wire.
+    var expected: [auth_mac_bytes]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&expected, frame[0..signed_len], &key);
+    if (!ClusterAuth.timingSafeEql(&expected, frame[signed_len..])) return error.ClusterAuthFailed;
+    return frame[0..signed_len];
+}
+
+/// Write one frame on an already-open connection: signed when the node has a
+/// secret, bare otherwise. One place decides, so the outbound half (both RPCs),
+/// the reply, and the vote-response relay cannot drift apart.
+fn writeFrameAuth(secret: ?[32]u8, conn: *NetworkTransport.ClusterConnection, frame: []const u8) !void {
+    if (secret) |k| return sendSigned(k, conn, frame);
+    return writeFrame(conn.stream, frame);
+}
+
+/// The read side of `writeFrameAuth`: a peer with a secret signs its replies
+/// too, so the reply read has to verify for the same reason the inbound one
+/// does (and a decoder that ignores trailing bytes would otherwise accept a
+/// frame it never authenticated).
+fn readFrameAuth(secret: ?[32]u8, conn: *NetworkTransport.ClusterConnection, buf: *std.ArrayList(u8)) ![]const u8 {
+    if (secret) |k| return verifiedRecv(k, conn, buf);
+    return conn.recv(buf);
+}
+
 /// Dial a peer. `NetworkTransport.connect` is unreferenced in-tree and does not
 /// compile against this Zig (`IpAddress.ConnectOptions` now requires `.mode`), so
 /// the three lines live here; it can go back to calling that helper once fixed.
@@ -475,7 +552,7 @@ pub fn TransportImpl(comptime slot: usize) type {
             // stops reading would otherwise block the writing thread on a full
             // send buffer, inside the same spin lock.
             sockread.setSendTimeout(conn.stream, self.rpcTimeoutMs());
-            writeFrame(conn.stream, frame) catch |err| {
+            writeFrameAuth(self.raft.config.cluster_secret, &conn, frame) catch |err| {
                 log.debug("[raft] write {s}:{d} failed, message dropped ({})", .{ ep.host, ep.port, err });
             };
         }
@@ -513,7 +590,7 @@ pub fn TransportImpl(comptime slot: usize) type {
             var conn = dialTo(self.allocator, self.io, ep) catch return lost;
             defer conn.deinit();
             sockread.setSendTimeout(conn.stream, self.rpcTimeoutMs());
-            writeFrame(conn.stream, frame.items) catch return lost;
+            writeFrameAuth(self.raft.config.cluster_secret, &conn, frame.items) catch return lost;
 
             // Bound the wait for the reply as well as the dial: a peer that
             // accepts the connection and never answers is the failure this is
@@ -524,7 +601,7 @@ pub fn TransportImpl(comptime slot: usize) type {
 
             var reply = std.ArrayList(u8).empty;
             defer reply.deinit(self.allocator);
-            const bytes = conn.recv(&reply) catch |err| {
+            const bytes = readFrameAuth(self.raft.config.cluster_secret, &conn, &reply) catch |err| {
                 log.debug("[raft] no reply from {s}:{d} within {d}ms, or the peer closed ({}) — message dropped", .{ ep.host, ep.port, self.rpcTimeoutMs(), err });
                 return lost;
             };
@@ -601,11 +678,26 @@ pub fn handleConnection(raft: *RaftElection, addresses: ?*const AddressBook, con
     _ = sockread.setRecvTimeout(conn.stream, raft.config.rpc_timeout_ms);
     _ = sockread.setSendTimeout(conn.stream, raft.config.rpc_timeout_ms);
 
+    // The key travels by value: it is all the MAC needs, and building a
+    // `ClusterAuth` per frame would allocate (and could fail) on every vote and
+    // heartbeat — dropping a vote because a 6-byte `dupe` failed is not a failure
+    // mode this path should have.
+    const secret = raft.config.cluster_secret;
+
     var in = std.ArrayList(u8).empty;
     defer in.deinit(conn.allocator);
-    const frame = conn.recv(&in) catch |err| {
-        log.debug("[raft] inbound frame not readable ({})", .{err});
-        return;
+    // With a secret configured the frame is verified (and the MAC stripped)
+    // *before* any decoder sees it; a bad tag is the same shape of failure as an
+    // unreadable frame — drop the connection and keep serving.
+    const frame = blk: {
+        if (secret) |k| break :blk verifiedRecv(k, conn, &in) catch |err| {
+            log.debug("[raft] inbound frame not authenticated ({})", .{err});
+            return;
+        };
+        break :blk conn.recv(&in) catch |err| {
+            log.debug("[raft] inbound frame not readable ({})", .{err});
+            return;
+        };
     };
 
     var arena_state = std.heap.ArenaAllocator.init(conn.allocator);
@@ -654,7 +746,7 @@ pub fn handleConnection(raft: *RaftElection, addresses: ?*const AddressBook, con
         .append_entries_response, .install_snapshot_response => return,
     }
 
-    writeFrame(conn.stream, out.items) catch |err| {
+    writeFrameAuth(secret, conn, out.items) catch |err| {
         log.debug("[raft] replying on the inbound connection failed ({})", .{err});
     };
 
@@ -666,7 +758,9 @@ pub fn handleConnection(raft: *RaftElection, addresses: ?*const AddressBook, con
                 return;
             };
             defer conn_out.deinit();
-            writeFrame(conn_out.stream, out.items) catch |err| {
+            // The candidate verifies its inbound frames, so the relay has to be
+            // signed too — an unsigned relay is a vote the candidate drops.
+            writeFrameAuth(secret, &conn_out, out.items) catch |err| {
                 log.debug("[raft] relaying the vote response failed ({})", .{err});
             };
         } else {
@@ -811,6 +905,220 @@ test "wire format round-trips every Raft RPC" {
     try encodeVoteResponse(&out, allocator, .{ .term = 1, .vote_granted = false }, "node-b");
     try testing.expectError(error.UnexpectedMessageTag, decodeVoteRequest(allocator, out.items));
     try testing.expectEqual(@as(?MessageTag, null), tagOf(&.{0x7f}));
+}
+
+// ── Frame authentication tests ──────────────────────────────────────────────
+
+/// A connected pair of `ClusterConnection`s over `socketpair(2)`. The frame
+/// helpers are one write and one read around a pure byte transform, so this is
+/// the smallest fixture that exercises both halves for real — no ports, no
+/// threads, no accept loop. Returns false where `AF.UNIX` socketpairs are
+/// unavailable.
+fn socketPair(allocator: std.mem.Allocator, io: std.Io, out: *[2]NetworkTransport.ClusterConnection) bool {
+    var fds: [2]std.posix.socket_t = undefined;
+    const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return false,
+    }
+    out[0] = NetworkTransport.ClusterConnection.init(allocator, .{ .socket = .{ .handle = fds[0], .address = undefined } }, io);
+    out[1] = NetworkTransport.ClusterConnection.init(allocator, .{ .socket = .{ .handle = fds[1], .address = undefined } }, io);
+    return true;
+}
+
+/// Write `wire ++ mac`, where `mac` is the tag of `signed_frame` — the wire shape
+/// of a peer that signs one frame and sends another. The length prefix comes from
+/// `writeFrame`, so only the payload differs from what `sendSigned` would write.
+fn writeSignedAs(
+    allocator: std.mem.Allocator,
+    key: [32]u8,
+    conn: *NetworkTransport.ClusterConnection,
+    signed_frame: []const u8,
+    wire: []const u8,
+) !void {
+    var mac: [auth_mac_bytes]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, signed_frame, &key);
+    var signed = std.ArrayList(u8).empty;
+    defer signed.deinit(allocator);
+    try signed.appendSlice(allocator, wire);
+    try signed.appendSlice(allocator, &mac);
+    try writeFrame(conn.stream, signed.items);
+}
+
+test "ClusterAuth.mac is the raw tag sign hex-encodes" {
+    const allocator = testing.allocator;
+    var auth = try ClusterAuth.init(allocator, "node-a", @splat(9));
+    defer auth.deinit();
+
+    const raw = auth.mac("hello");
+    const hex = try auth.sign("hello");
+    var hex_of_raw: [64]u8 = undefined;
+    const hex_chars = "0123456789abcdef";
+    for (raw, 0..) |byte, i| {
+        hex_of_raw[i * 2] = hex_chars[byte >> 4];
+        hex_of_raw[i * 2 + 1] = hex_chars[byte & 0xf];
+    }
+    // Same tag, two encodings — the frame wants the 32 raw bytes.
+    try testing.expectEqualSlices(u8, &hex, &hex_of_raw);
+}
+
+test "a signed frame round-trips: sendSigned then verifiedRecv strips the MAC" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var pair: [2]NetworkTransport.ClusterConnection = undefined;
+    if (!socketPair(allocator, io, &pair)) return error.SkipZigTest;
+    defer {
+        pair[0].deinit();
+        pair[1].deinit();
+    }
+
+    const key: [32]u8 = @splat(0x5a);
+    var sender = try ClusterAuth.init(allocator, "node-a", key);
+    defer sender.deinit();
+    var receiver = try ClusterAuth.init(allocator, "node-b", key);
+    defer receiver.deinit();
+
+    var frame = std.ArrayList(u8).empty;
+    defer frame.deinit(allocator);
+    try encodeVoteRequest(&frame, allocator, .{ .term = 5, .candidate_id = "node-a", .last_log_index = 3, .last_log_term = 2 });
+
+    try sendSigned(sender.pre_shared_key, &pair[0], frame.items);
+
+    var in = std.ArrayList(u8).empty;
+    defer in.deinit(allocator);
+    const got = try verifiedRecv(receiver.pre_shared_key, &pair[1], &in);
+
+    // The MAC is gone: what the receiver hands the decoders is byte-for-byte the
+    // frame the sender built, so `tagOf` / `payloadOf` / `decode*` are untouched.
+    try testing.expectEqualSlices(u8, frame.items, got);
+    const req = try decodeVoteRequest(allocator, got);
+    defer allocator.free(req.candidate_id);
+    try testing.expectEqual(@as(u64, 5), req.term);
+    try testing.expectEqualStrings("node-a", req.candidate_id);
+    try testing.expectEqual(@as(u64, 3), req.last_log_index);
+    try testing.expectEqual(@as(u64, 2), req.last_log_term);
+}
+
+test "a frame signed with another key is refused" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var pair: [2]NetworkTransport.ClusterConnection = undefined;
+    if (!socketPair(allocator, io, &pair)) return error.SkipZigTest;
+    defer {
+        pair[0].deinit();
+        pair[1].deinit();
+    }
+
+    var sender = try ClusterAuth.init(allocator, "node-a", @splat(0x5a));
+    defer sender.deinit();
+    var receiver = try ClusterAuth.init(allocator, "node-b", @splat(0x5b));
+    defer receiver.deinit();
+
+    var frame = std.ArrayList(u8).empty;
+    defer frame.deinit(allocator);
+    try encodeVoteRequest(&frame, allocator, .{ .term = 5, .candidate_id = "node-a", .last_log_index = 3, .last_log_term = 2 });
+    try sendSigned(sender.pre_shared_key, &pair[0], frame.items);
+
+    var in = std.ArrayList(u8).empty;
+    defer in.deinit(allocator);
+    try testing.expectError(error.ClusterAuthFailed, verifiedRecv(receiver.pre_shared_key, &pair[1], &in));
+}
+
+test "a frame whose payload changed after signing is refused" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var pair: [2]NetworkTransport.ClusterConnection = undefined;
+    if (!socketPair(allocator, io, &pair)) return error.SkipZigTest;
+    defer {
+        pair[0].deinit();
+        pair[1].deinit();
+    }
+
+    var sender = try ClusterAuth.init(allocator, "node-a", @splat(0x5a));
+    defer sender.deinit();
+    var receiver = try ClusterAuth.init(allocator, "node-b", @splat(0x5a));
+    defer receiver.deinit();
+
+    var frame = std.ArrayList(u8).empty;
+    defer frame.deinit(allocator);
+    try encodeVoteRequest(&frame, allocator, .{ .term = 5, .candidate_id = "node-a", .last_log_index = 3, .last_log_term = 2 });
+
+    // Signed as built, sent with one payload byte flipped (index 0 is the tag, so
+    // index 1 is the first byte of `term`). The trailer stays a valid-looking tag
+    // for the *original* bytes.
+    const tampered = try allocator.dupe(u8, frame.items);
+    defer allocator.free(tampered);
+    tampered[1] ^= 0xff;
+    try writeSignedAs(allocator, sender.pre_shared_key, &pair[0], frame.items, tampered);
+
+    var in = std.ArrayList(u8).empty;
+    defer in.deinit(allocator);
+    try testing.expectError(error.ClusterAuthFailed, verifiedRecv(receiver.pre_shared_key, &pair[1], &in));
+}
+
+test "a frame whose tag changed after signing is refused" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var pair: [2]NetworkTransport.ClusterConnection = undefined;
+    if (!socketPair(allocator, io, &pair)) return error.SkipZigTest;
+    defer {
+        pair[0].deinit();
+        pair[1].deinit();
+    }
+
+    var sender = try ClusterAuth.init(allocator, "node-a", @splat(0x5a));
+    defer sender.deinit();
+    var receiver = try ClusterAuth.init(allocator, "node-b", @splat(0x5a));
+    defer receiver.deinit();
+
+    var frame = std.ArrayList(u8).empty;
+    defer frame.deinit(allocator);
+    try encodeVoteRequest(&frame, allocator, .{ .term = 5, .candidate_id = "node-a", .last_log_index = 3, .last_log_term = 2 });
+
+    // Same payload, a *different* tag: if the MAC covered only the payload this
+    // frame would pass (and be dispatched as an AppendEntries).
+    const retagged = try allocator.dupe(u8, frame.items);
+    defer allocator.free(retagged);
+    retagged[0] = @backingInt(MessageTag.append_entries);
+    try writeSignedAs(allocator, sender.pre_shared_key, &pair[0], frame.items, retagged);
+
+    var in = std.ArrayList(u8).empty;
+    defer in.deinit(allocator);
+    try testing.expectError(error.ClusterAuthFailed, verifiedRecv(receiver.pre_shared_key, &pair[1], &in));
+}
+
+test "a bare frame with no MAC is refused once a secret is configured" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var pair: [2]NetworkTransport.ClusterConnection = undefined;
+    if (!socketPair(allocator, io, &pair)) return error.SkipZigTest;
+    defer {
+        pair[0].deinit();
+        pair[1].deinit();
+    }
+
+    var receiver = try ClusterAuth.init(allocator, "node-b", @splat(0x5a));
+    defer receiver.deinit();
+
+    var frame = std.ArrayList(u8).empty;
+    defer frame.deinit(allocator);
+    // Deliberately longer than `auth_mac_bytes`: the rejection below has to be the
+    // MAC comparison, not the "too short to carry a MAC" length check (which the
+    // second half covers).
+    try encodeVoteRequest(&frame, allocator, .{ .term = 5, .candidate_id = "node-b-candidate", .last_log_index = 3, .last_log_term = 2 });
+    try testing.expect(frame.items.len > auth_mac_bytes + 1);
+
+    // The pre-feature shape, and what a peer with no secret sends: an ordinary
+    // `writeFrame`'d frame with nothing appended.
+    try writeFrame(pair[0].stream, frame.items);
+
+    var in = std.ArrayList(u8).empty;
+    defer in.deinit(allocator);
+    try testing.expectError(error.ClusterAuthFailed, verifiedRecv(receiver.pre_shared_key, &pair[1], &in));
+
+    // And a frame with no room for a MAC at all is refused without reading past it.
+    try writeFrame(pair[0].stream, &.{ @backingInt(MessageTag.vote_request), 0, 0, 0, 0, 0 });
+    try testing.expectError(error.ClusterAuthFailed, verifiedRecv(receiver.pre_shared_key, &pair[1], &in));
 }
 
 test "address book parses host:port and resolves by peer id" {
@@ -1358,4 +1666,92 @@ test "a half-frame on the inbound side costs rpc_timeout_ms, not the whole node"
     // listen socket refused the connection — a different, already-safe case.
     try testing.expect(elapsed >= @as(i64, timeout_ms) - 50);
     try testing.expect(elapsed < @as(i64, stalled_peer_patience_ms) - 500);
+}
+
+// The frame helpers above are unit-tested against a socketpair; this is the
+// acceptance test for the wiring, over real loopback: with a secret configured,
+// `sendSigned` → `verifiedRecv` → a *signed* reply → `readFrameAuth` has to work
+// end to end, and a bare frame has to be dropped before it reaches the raft.
+// The tests above this one all run with no secret, i.e. they cover the bare path.
+test "with a cluster_secret, a loopback AppendEntries round-trip is signed end to end" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    if (!@import("../../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    const secret: [32]u8 = @splat(0x33);
+
+    var a_impl: ElectionTransportImpl = undefined;
+    var b_impl: TransportImpl(1) = undefined;
+    var a_raft: RaftElection = undefined;
+    var b_raft: RaftElection = undefined;
+    var b_inbound: InboundServer = undefined;
+    var b_thread: std.Thread = undefined;
+
+    var impls_up: u8 = 0;
+    var rafts_up: u8 = 0;
+    var servers_up: u8 = 0;
+    defer {
+        if (impls_up >= 2) a_impl.deinit();
+        if (impls_up >= 1) b_impl.deinit();
+    }
+    defer {
+        if (rafts_up >= 2) a_raft.deinit();
+        if (rafts_up >= 1) b_raft.deinit();
+    }
+    defer if (servers_up >= 1) stopInbound(io, &b_inbound, &b_thread);
+
+    b_impl.init(allocator, io, &b_raft);
+    impls_up = 1;
+    const b_port = try startInbound(allocator, io, &b_raft, &b_impl.addresses, 19740, &b_inbound, &b_thread);
+    servers_up = 1;
+    const b_endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{b_port});
+    defer allocator.free(b_endpoint);
+
+    a_impl.init(allocator, io, &a_raft);
+    impls_up = 2;
+    try a_impl.addresses.addEndpoint("node-b", b_endpoint);
+
+    const cfg = ElectionConfig{ .cluster_secret = secret };
+    b_raft = try RaftElection.init(allocator, "node-b", &.{}, cfg, &b_impl.transport());
+    rafts_up = 1;
+    var peers = [_]Peer{.{ .id = "node-b", .address = "" }};
+    a_raft = try RaftElection.init(allocator, "node-a", &peers, cfg, &a_impl.transport());
+    rafts_up = 2;
+
+    // 1. The signed round-trip: request out signed, reply back signed (the
+    //    follower signs what it writes on the same connection), both verified.
+    const entries = [_]LogEntry{.{ .term = 1, .index = 1, .command = "signed-cmd" }};
+    const ack = a_impl.sendAppendEntries("node-b", "", .{
+        .term = 1,
+        .leader_id = "node-a",
+        .prev_log_index = 0,
+        .prev_log_term = 0,
+        .entries = &entries,
+        .leader_commit = 1,
+    });
+    try testing.expect(ack.success);
+    try testing.expectEqual(@as(u64, 1), ack.match_index);
+    try testing.expectEqual(@as(usize, 1), b_raft.logLen());
+    try testing.expectEqualStrings("signed-cmd", b_raft.getLogEntry(1).?.command);
+
+    // 2. A peer without the secret is dropped at the verifier: node-b is
+    //    listening, the frame is well-formed, and the raft must not see it.
+    {
+        var conn = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = b_port });
+        defer conn.deinit();
+        sockread.setRecvTimeout(conn.stream, stalled_peer_patience_ms);
+
+        var frame = std.ArrayList(u8).empty;
+        defer frame.deinit(allocator);
+        try encodeVoteRequest(&frame, allocator, .{ .term = 42, .candidate_id = "outsider", .last_log_index = 9, .last_log_term = 9 });
+        try writeFrame(conn.stream, frame.items);
+
+        // No reply: `handleConnection` returns without answering (the same shape
+        // as an unreadable frame), and the server then closes the connection.
+        var reply = std.ArrayList(u8).empty;
+        defer reply.deinit(allocator);
+        try testing.expectError(error.ConnectionClosed, conn.recv(&reply));
+    }
+    try testing.expect(b_raft.getTerm() < 42);
+    try testing.expectEqualStrings("node-a", b_raft.getLeader().?);
 }

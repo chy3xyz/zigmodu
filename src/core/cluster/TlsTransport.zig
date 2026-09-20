@@ -58,8 +58,20 @@ pub const ClusterAuth = struct {
         return hex;
     }
 
+    /// Raw HMAC-SHA256 over `payload` — the form the wire format uses.
+    /// (`sign` hex-encodes the same tag, for JSON and humans.)
+    pub fn mac(self: *ClusterAuth, payload: []const u8) [32]u8 {
+        var tag: [32]u8 = undefined;
+        std.crypto.auth.hmac.sha2.HmacSha256.create(&tag, payload, &self.pre_shared_key);
+        return tag;
+    }
+
     /// Constant-time slice comparison for signature verification.
-    fn timingSafeEql(a: []const u8, b: []const u8) bool {
+    ///
+    /// `pub` because the raw-byte verifier lives in `RaftTransport.zig` (which
+    /// owns the frame shape) and must not re-implement the comparison with a
+    /// non-constant-time `std.mem.eql`.
+    pub fn timingSafeEql(a: []const u8, b: []const u8) bool {
         if (a.len != b.len) return false;
         var acc: u8 = 0;
         for (a, b) |x, y| acc |= x ^ y;
