@@ -38,10 +38,17 @@
 > 那是后续的结构性改动，本次刻意不做。
 
 **验证**：全量 **1456/1477（21 skipped，0 failed）**（比上一版 +2，即下面这两条新用例），
-6 道门禁（production / deadcode / version / tenant-scope / pool-guard / bench）+ `zig fmt --check` 全绿。
+`zig fmt --check` + production / deadcode / version / tenant-scope / pool-guard 五道门禁全绿。
 两条各带一条**我自己重做过的变异**：① 去掉守卫 → 上面两种形态（安全构建是 **abort**，不是断言红）；
 ② `rpc_timeout_ms = 0` → `expected error.ConnectionClosed, found error.ConnectionError`（断言红，
 即"第二个对端根本没被服务"），已按字节回退。
+
+> **第 6 道门禁 `check-bench` 的诚实读数**：本次改动**跑绿了 5/5**
+> （`TimerWheel x100K` 中位数 8.55 / 9.09 / 9.10 / 10.40 / 10.57 ms，基线 6.808 ms，那一轮 `load=7.50–13.73`，10 核），
+> 但它**在同一棵未改动的树上也会红** —— 把本次改动全部 stash 掉后实测 3 次：`9.33 OK / 8.36 OK / 13.63 FAIL`。
+> 这不是本次改动引入的，而是 `docs/dev/READING_NUMBERS.md` §"一条边界" 已经记录过的那条
+> **内存/页路径受限、参考无法为它作证**的双峰指标（参考是 cache-local 小循环，机器忙时照样平）。
+> 按那份文档的口径，这类指标**比分布、不比单点**；本次不是回退，也**没有** `--update` 基线。
 
 **未做 / 未验证**：② 的用例验的是"**第二个连接会被服务**"，没有用真的半帧连接去测；① 的
 `error.InvalidLogIndex` 在 `handleConnection` 里落到 `logDrop`（debug 日志 + 断开，**不回包**）——
