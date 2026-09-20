@@ -1,5 +1,75 @@
 # Changelog
 
+## [Unreleased]
+
+### **Breaking**：WebSocket 路由的 auth 声明改为**编译期强制**（且只能是 `.public`）
+
+WS 升级在 `Server` 里是**在 `router.match` 之前、在任何全局中间件之前**被应答的，所以 `ws_routes` 上的
+`auth` / `permission` / `roles` **没有任何执行点** —— 它们被记进 catalog，然后没人查；`findEntry` 还会主动
+`continue` 跳过 `is_ws`。**这条真的咬过**：脚手架的 IM 网关在 WS 上把身份取自查询串
+（`ctx.queryInt(u64, "userId", 0)`），任何客户端传 `?userId=<任意人>` 就能以那个人连接，而同一份模板里
+那条路由写着 `.auth = .jwt`。
+
+现在这三种写法**编译不过**：没声明 `.meta.auth` / 声明非 `.public` 的 auth / 声明 `permission`·`roles`。
+**迁移**：WS 路由加 `.meta = .{ .auth = .public }`，身份在 `on_connect` 里用 `ctx` 自己验（§12.14）。
+**为什么是编译期**：运行期拒绝会把那条骗人的声明留在源码里给下一个人抄。
+
+- **脚手架模板改成 fail-closed**：`ImGateway.verifier` 默认 `null`，`accept` 在没接验签器时**拒连**
+  （不再回落到信任客户端给的 id）；HTTP 侧身份改成 `ctx.requireUserIdInt(T)`（从 JWT 中间件写的 attr 读）。
+  **生成物已实编译验证**（`scaffold --with-auth --with-websocket` → 生成工程 `zig build` exit 0）。
+- **`Testkit.auditAuthCoverage` 的 `is_ws` 从静默 `continue` 改成断言** `.auth == .public` ——
+  它过去正是唯一能发现这件事、却"看别处"的那道自动检查。
+
+### 修 `ready_high_water` 的无符号下溢（**破坏性：否**；一个被发布的指标会永久撒谎）
+
+`ReadyRing.tryPush`（`scheduler.zig`）与 `MpscRing.tryPush`（`ring.zig`）里
+`depth = (pos +% 1) -% dequeue_pos`：**两个以上生产者**时，另一个生产者占的槽位可以先被消费掉，把
+`dequeue_pos` 推过 `pos + 1`，减法**下溢成 ~2^64**；而 `high_water` 只增不减，所以**一次下溢就永久毒化**。
+它被 `MetricsBridge` 发布成 `zigmodu_runtime_pool_ready_high_water`。修法是把游标**读在发布之前**
+（发布前没有消费者能看见这个槽位，`dequeue_pos <= pos`）。`RingBuffer` 的 SPSC 同形表达式用的是局部量、
+`head <= tail` 恒成立，**不可达**，未动。
+
+- 新增 `MpscRing: high_water stays a ring level with more than one producer`（**2 生产者**是这个测试的全部
+  意义 —— 单生产者不可达）；**变异验过红**（改回原样 → `TestUnexpectedResult`）。
+- **现场证明**：`runtime-stress` 改前每次运行都印 `high_water=18446744073709551615`，改后是
+  `high_water=4 capacity=8`。
+
+### 新增 `zig build runtime-stress`：长时不变式的压测（**破坏性：否**）
+
+`zig build soak` 是 **HTTP / 租户隔离** soak（64×2000 = 128K 请求只要 **6 秒**），**一行都不碰** Runtime。
+而 v0.31.0 新增的那批东西共同特征是**只在稀有交错或长时下出错** —— 单次测试与短基准**结构上抓不到**。
+
+`src/runtime_stress.zig`（+ `build.zig` 的 step）跑持续负载并周期检查 7 条不变式，**每条都要有"它被走到过"
+的证据**（空洞的绿是最坏的）：监督守恒（没有成员静默消失）、强度用尽后**停止**重建、阻塞池隔离在长时下
+成立、`ready_push_failures == 0`（两池）、热路径零分配、RSS/线程数不单调增长（时间序列）、停机可预测且
+claim 全归还。三条变异验过红（含**"把负载调轻到断言走不到也会红"**）。`alloc_contract_test.zig`
+**一个数字都没改**。
+
+### 读数约定：唯一口径 + "候选回退"标记与手续（**破坏性：否**）
+
+- `scripts/test-fast.sh` 现在**明说自己是谁**：`zm-test-count: aggregate …` 是要抄的那一行，
+  `main-binary …` 标签里明写 "locates a failure, NOT the number to quote"；`--count` stdout 恰好一行。
+  **"拿不到计数不能报成功"**：热缓存回放（`run test cached`，测试没执行也没计数）→ **exit 3**
+  （改前 exit 0，与 `docs/BEST_PRACTICES.md` 里那句话自相矛盾）。
+- `check-bench.sh` 每次运行都印一块 `references —`（4 条声明参考带 `RE-RUN-BEFORE-FIX` 标记与角色标签）；
+  新增 `--explain <log>` 与 `--ratios <log…> <baseline.json>` 两个**离线**模式。`--explain` 的判据是
+  "**参考自己有没有动**"，且明说"门禁的判据是不带参数那条命令的 exit code，它不改变它"。
+- **两条局限都写进判词本身**（当天实测）：① **瓶颈不匹配** —— `TimerWheel x100K` 是内存/页路径受限，
+  而控制参考 `atomic RMW` 是 cache-local，**没有参考能为它作证**（实测 2.25× → 重跑 1.26×，中间无代码
+  改动），正确读法是取 N 次比分布；② **饱和对参考平坦度不可见** —— `machine:` 行新增 `load=` 字段，
+  `--explain` 在 `load >= cores` 时把 `REAL-REGRESSION-CANDIDATE` **降级**为 `RE-RUN-BEFORE-FIX`
+  （实测 load 10.0/10 核时参考全平而该指标读到 2.14× 与 2.52×）。两侧都用真实退出码验过（饱和 → 0、
+  不饱和 → 1）。
+- **判据一个都没放松**：`THRESHOLD`、两个基线文件、`REF_METRICS`/`NORMALIZED_METRICS` 的数组体**逐字未变**。
+
+### 文档
+
+- `docs/RUNTIME.md` **§12.14**（WS 声明的强制与其理由）。
+- `docs/dev/v1.0-gap.md`：v0.31.0 → v1.0 差距评估（**功能已经不是主要差距了；"能不能证明"才是**）。
+- `docs/dev/security-audit-v0.31.0.md`：首次安全审计，**两条高危经逐条复核成立**（WS 绕过中间件；请求边界
+  只认 `": "` 的 `Content-Length` 且完全不处理 `Transfer-Encoding` → 与自带 nginx/Envoy 拓扑产生 CL/TE 走私）。
+  **文中的"没读"清单同样重要**：`core/cluster/**` 的帧解码与 `im/**` 的 `WsFramer` 是未审计的高风险段。
+
 ## [0.31.0] - 2026-09-20
 
 ### Runtime：监督树 —— 组、策略、强度、树（**破坏性：否**；`docs/RUNTIME.md` §14）

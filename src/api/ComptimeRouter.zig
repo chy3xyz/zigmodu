@@ -714,6 +714,49 @@ pub fn Scoped(comptime AppState: type) type {
 
             if (@hasDecl(Mod, "ws_routes")) {
                 inline for (Mod.ws_routes) |spec| {
+                    // ── A WebSocket route has no enforcement point. ─────────────
+                    //
+                    // The upgrade is answered in `Server` *before* `router.match`
+                    // and before any global middleware runs, so nothing here reads
+                    // `auth` / `permission` / `roles`: they would be catalog
+                    // metadata that reads as a guarantee and is not one. The
+                    // framework used to record them anyway, which is how the
+                    // scaffolded IM module ended up taking its identity from
+                    // `?userId=` — the declaration said `.auth = .jwt` and nothing
+                    // checked anything.
+                    //
+                    // So the declaration is **enforced by being refused**: state
+                    // your posture explicitly, and it may only be `.public`.
+                    //
+                    // Refused at compile time on purpose. A runtime refusal would
+                    // leave the misleading declaration in the source for the next
+                    // reader to copy.
+                    if (comptime spec.meta.auth == .inherit) @compileError(
+                        "WebSocket route '" ++ spec.path ++ "' in " ++ @typeName(Mod) ++ " does not declare " ++
+                            "`.meta.auth`.\n" ++
+                            "A WS route has no enforcement point — the upgrade is answered before " ++
+                            "`router.match` and before any middleware runs, so an inherited `auth` would be " ++
+                            "recorded and never checked (docs/RUNTIME.md §12.14).\n" ++
+                            "Say who owns the identity, explicitly:\n" ++
+                            "  .meta = .{ .auth = .public }                       // you authenticate inside on_connect\n" ++
+                            "and if that is what you mean, do it there — the `ctx` is the upgrade request.",
+                    );
+                    if (comptime spec.meta.auth != .public) @compileError(
+                        "WebSocket route '" ++ spec.path ++ "' in " ++ @typeName(Mod) ++ " declares `.meta.auth = ." ++
+                            @tagName(spec.meta.auth) ++ "`, which cannot be enforced.\n" ++
+                            "The upgrade is handled before `router.match` and before any global middleware, so " ++
+                            "nothing would check it — the route would be open while reading as protected " ++
+                            "(docs/RUNTIME.md §12.14).\n" ++
+                            "Declare `.auth = .public` and authenticate inside `on_connect`, where `ctx` is the " ++
+                            "upgrade request.",
+                    );
+                    if (comptime (spec.meta.permission != null or spec.meta.roles != null)) @compileError(
+                        "WebSocket route '" ++ spec.path ++ "' in " ++ @typeName(Mod) ++ " declares " ++
+                            "`permission` / `roles`, which cannot be enforced on a WS route (nothing runs before " ++
+                            "the upgrade is answered).\n" ++
+                            "Check them inside `on_connect` instead, or drop them (docs/RUNTIME.md §12.14).",
+                    );
+
                     const auth = resolveAuth(spec.meta, self.router.default_auth);
                     const module = resolveModule(spec.meta, Mod.module_name);
                     const ud = spec.user_data orelse state_ptr;
@@ -957,7 +1000,9 @@ test "mount records ws_routes in catalog" {
             .{ .method = .GET, .path = "ping", .handler = noopHttp, .meta = .{ .auth = .public } },
         };
         pub const ws_routes = [_]WsSpec(State){
-            .{ .path = "ws", .on_connect = onConnect, .on_message = onMessage, .on_close = onClose },
+            // `.auth` is mandatory on a WS route and may only be `.public`: there is
+            // no enforcement point before the upgrade is answered (§12.14).
+            .{ .path = "ws", .on_connect = onConnect, .on_message = onMessage, .on_close = onClose, .meta = .{ .auth = .public } },
         };
     };
     var st = WsMod.State{ .hits = &hits };

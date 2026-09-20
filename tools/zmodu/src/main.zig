@@ -7709,7 +7709,11 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
         \\            .on_connect = wsConnect,
         \\            .on_message = gateway.ImGateway.onMessage,
         \\            .on_close = gateway.ImGateway.onClose,
-        \\            .meta = .{ .auth = .jwt },
+        \\            // A WS route has no enforcement point — the upgrade is answered before
+        \\            // `router.match` and before any middleware — so the framework refuses
+        \\            // any `auth` but `.public` here at compile time (docs/RUNTIME.md §12.14).
+        \\            // The identity is verified in `ImGateway.accept`.
+        \\            .meta = .{ .auth = .public },
         \\        },
         \\    };
         \\
@@ -7721,7 +7725,10 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
         \\    fn listConversations(ctx: *http.Context, self: *State) !void {
         \\        const page = ctx.queryInt(usize, "pageNo", 1);
         \\        const size = ctx.queryInt(usize, "pageSize", 10);
-        \\        const user_id = ctx.queryInt(i64, "userId", 0);
+        \\        // From the identity the JWT middleware resolved, never from the query
+        \\        // string: `?userId=` is attacker-controlled, so reading it would let any
+        \\        // signed-in user list anyone's conversations (docs/RUNTIME.md §12.14).
+        \\        const user_id = try ctx.requireUserIdInt(i64);
         \\        const result = try self.service.getConversations(user_id, page, size);
         \\        try R.wrapList(ctx, result);
         \\    }
@@ -7824,6 +7831,10 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
         \\    registry: ConnectionRegistry,
         \\    msg_handler: ?MsgHandler = null,
         \\    msg_ctx: ?*anyopaque = null,
+        \\    /// Verifies a bearer token into a user id. **Null by default**, deliberately:
+        \\    /// with nothing wired in, `accept` refuses every upgrade rather than
+        \\    /// trusting a client-supplied id (docs/RUNTIME.md §12.14). See `verifyBearer`.
+        \\    verifier: ?*const fn (token: []const u8) ?u64 = null,
         \\
         \\    pub fn init(allocator: std.mem.Allocator, io: std.Io) ImGateway {
         \\        return .{ .allocator = allocator, .io = io, .registry = ConnectionRegistry.init(allocator, io) };
@@ -7837,12 +7848,39 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
         \\    }
         \\    pub fn cleanup(self: *ImGateway) usize { return self.registry.tickAndCleanup(3); }
         \\
+        \\    /// Resolves the connecting user from the bearer token, or null to refuse.
+        \\    ///
+        \\    /// **Null unless a verifier is wired in**, and that default is the point:
+        \\    /// this gateway cannot guess an identity safely, so the unwired state
+        \\    /// refuses instead of trusting what the client sent.
+        \\    ///
+        \\    /// Wire it where the gateway is constructed (`--with-auth` apps already
+        \\    /// have one):
+        \\    ///
+        \\    ///     gateway.verifier = struct {{
+        \\    ///         fn v(token: []const u8) ?u64 {{
+        \\    ///             const claims = app_sec.verifyToken(token) catch return null;
+        \\    ///             return std.fmt.parseInt(u64, claims.sub, 10) catch null;
+        \\    ///         }}
+        \\    ///     }}.v;
+        \\    fn verifyBearer(self: *ImGateway, ctx: *http.Context) ?u64 {{
+        \\        const verifier = self.verifier orelse return null;
+        \\        const header = ctx.header("authorization") orelse return null;
+        \\        if (header.len <= 7 or !std.ascii.eqlIgnoreCase(header[0..7], "Bearer ")) return null;
+        \\        return verifier(header[7..]);
+        \\    }}
+        \\
         \\    /// Shared by legacy `register` and ComptimeRouter `ws_routes`.
         \\    pub fn accept(self: *ImGateway, ctx: *http.Context, raw_framer: *anyopaque) ?*anyopaque {
         \\        const framer: *WsFramer = @ptrCast(@alignCast(raw_framer));
         \\
-        \\        const user_id = ctx.queryInt(u64, "userId", 0);
-        \\        if (user_id == 0) return null;
+        \\        // A **verified** identity or nothing. This used to read `?userId=` from
+        \\        // the query string, which is attacker-controlled: any client could
+        \\        // connect as any user (docs/RUNTIME.md §12.14).
+        \\        const user_id = self.verifyBearer(ctx) orelse {
+        \\            std.log.warn("[im] refusing a WS upgrade with no verified identity", .{});
+        \\            return null;
+        \\        };
         \\
         \\        const session = self.allocator.create(WsSession) catch return null;
         \\        session.* = .{

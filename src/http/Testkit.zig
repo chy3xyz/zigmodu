@@ -215,7 +215,22 @@ pub fn auditAuthCoverage(
     errdefer out.deinit(allocator);
     const cat = slot.get() orelse return try out.toOwnedSlice(allocator);
     for (cat.entries) |e| {
-        if (e.is_ws or e.is_sse) continue;
+        // `.is_sse` is skipped because an SSE route goes through `group.get` and
+        // therefore through the middleware chain — auditing it would mean holding a
+        // stream open, not that a control is missing.
+        //
+        // `.is_ws` is *asserted* rather than skipped, and that difference is the
+        // point: this loop used to be `if (e.is_ws or e.is_sse) continue;`, which
+        // was the one automated check that could have caught a `ws_routes` entry
+        // declaring `.auth = .jwt` with nothing to enforce it — it looked away
+        // instead. `ComptimeRouter` now refuses anything but `.public` on a WS
+        // route at compile time (docs/RUNTIME.md §12.14), so this is an invariant;
+        // an assert keeps it from becoming an assumption again.
+        if (e.is_ws) {
+            std.debug.assert(e.auth == .public);
+            continue;
+        }
+        if (e.is_sse) continue;
         const path = try concreteCatalogPath(allocator, e.path);
         defer allocator.free(path);
         const expect_401 = e.auth != .public;

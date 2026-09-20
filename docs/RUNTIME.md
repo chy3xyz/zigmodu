@@ -887,6 +887,36 @@ B 仍然被服务，只是要等 A 那一批跑干。所以小 batch 换吞吐�
   **声明的宽度**看 `max_pooled_workers`（= `blocking_threads`/`max_blocking_workers` 里那个上界）。
 - **`.blocking` + `.dedicated` 是编译错**：那个声明会被静默忽略，比不声明更糟。
 
+### 12.14 WebSocket 路由的 auth 声明是**被强制的**（而且只能是 `.public`）
+
+**问题**：WS 升级在 `Server` 里是**在 `router.match` 之前、在任何全局中间件之前**被应答的
+（`Server.zig` 的升级块 vs 其后的 `router.match`），所以 `ws_routes` 上的 `auth` / `permission` /
+`roles` **没有任何执行点** —— 它们会被记进 catalog，然后**没有人查**。`findEntry` 还会主动
+`continue` 跳过 `is_ws`，所以"catalog 是唯一的 bypass 真相"这条设计在 WS 上两头都断。
+
+**这条曾经真的咬人**：脚手架的 IM 网关在 WS 上把身份取自**查询串**
+（`ctx.queryInt(u64, "userId", 0)`），也就是说**任何客户端传 `?userId=<任意人>` 就能以那个人连接**，
+而同一份模板里那条路由写着 `.auth = .jwt`。声明读起来是保证，实际上什么都没有。
+
+**现在**：WS 路由的声明被**拒绝**而不是被记录 ——
+
+| 写法 | 结果 |
+|------|------|
+| 没声明 `.meta.auth` | **编译错**（消息里给出该写什么） |
+| 声明了非 `.public` 的 auth | **编译错**（说明没有执行点） |
+| 声明了 `permission` / `roles` | **编译错**（同上） |
+
+**为什么是编译期**：运行期拒绝会把那条**骗人的声明留在源码里**给下一个人抄。编译期拒绝让"这个声明是假的"
+变成**无法表达**。这与 §12.8 D2（`.pooled` 没有声明就拒绝 spawn）是同一条原则。
+
+**WS 的身份该谁负责**：应用自己，在 `on_connect` 里 —— `ctx` 就是那条升级请求。脚手架的 IM 网关
+示范了 fail-closed 的形状：`ImGateway.verifier` **默认为 null**，而 `accept` 在没接验签器时**拒连**
+（不是回落到信任客户端给的 id），并在注释里给出接法。HTTP 侧同理：身份从 JWT 中间件写入的 attr 读
+（`ctx.requireUserIdInt(T)`），**不从查询串读**。
+
+**审计也跟着改了**：`Testkit.auditAuthCoverage` 过去对 `is_ws` 直接 `continue`（唯一一个本可以发现
+这件事的自动检查，恰好"看别处"）。现在是**断言** `.auth == .public` —— 把不变量钉住，而不是跳过它。
+
 ### 12.6 与现有件的关系
 
 - **`Mailbox` 不改语义**（仍是有界、`error.Full`、`sendBlocking`），只多一个"被谁唤醒"的分叉。
