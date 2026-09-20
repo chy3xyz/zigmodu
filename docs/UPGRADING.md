@@ -15,6 +15,126 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 
 ---
 
+## v0.32.0
+
+> **本版有 5 处破坏性变更，其中 3 处是编译错**（WS 路由声明、CSPRNG 的 `io` 参数、`Method.fromString` 返回类型）。
+> v0.29.0–v0.31.0 **没有**破坏性变更，所以本节是 v0.28.0 之后的唯一一段。
+> 逐条背景见 [`../CHANGELOG.md`](../CHANGELOG.md) 的 `[0.32.0]` 段。
+
+### WebSocket 路由必须显式声明 `.meta.auth = .public`（**编译错**）
+
+**Breaking?** 是 —— **编译不过**，不是运行期拒绝。
+
+WS 升级在 `Server` 里是**在 `router.match` 之前、在任何全局中间件之前**被应答的，所以 `ws_routes` 上的
+`auth` / `permission` / `roles` **没有任何执行点**：它们被记进 catalog，然后没人查。声明本身是**骗人的** ——
+脚手架的 IM 网关把身份取自查询串（`?userId=<任意人>`），而同一份模板里那条路由写着 `.auth = .jwt`。
+
+**一行改法**：WS 路由加 `.meta = .{ .auth = .public }`，身份在 `on_connect` 里用 `ctx` 自己验
+（`docs/RUNTIME.md` §12.14）。**没声明** `.meta`（`.auth` 默认 `.inherit`）、**非 `.public`** 的 auth、
+以及挂 `permission`/`roles` —— 三种都编译不过。
+
+```zig
+pub const ws_routes = [_]http.WsSpec(State){
+    .{ .path = "ws", .on_connect = …, .on_message = …, .meta = .{ .auth = .public } },
+};
+```
+
+**脚手架生成物已经改成 fail-closed**：`ImGateway.verifier` 默认 `null`，没接验签器时**拒连**（不再回落
+到信任客户端给的 id）；HTTP 侧身份改成 `ctx.requireUserIdInt(T)`。已实编译验证过。
+
+### CSPRNG 改为 `std.Io.randomSecure`，熵入口要传 `io`（**编译错**）
+
+**Breaking?** 是 —— 签名变了，**忘了传 `io` 编译不过**。这是有意的：运行期用弱盐比编译不过糟得多。
+
+原种子是「毫秒 + 常量 42 + 栈地址 + 毫秒×1000」，全部来源非秘密、低熵、且**同一进程内共享**，
+观测到一个输出就能枚举其余。现在每次走系统调用，失败即 `error.EntropyUnavailable`，**没有回落**。
+
+**一行改法**：
+
+```zig
+// 旧（已改）                                     // 新
+ApiKeyGenerator.generate(allocator)              ApiKeyGenerator.generate(allocator, io)
+PasswordEncoder.init(allocator)                  PasswordEncoder.init(allocator, io)
+PasswordEncoder.initWithIterations(a, n)         PasswordEncoder.initWithIterations(a, io, n)
+kit.random.uuid(allocator)                       kit.random.uuid(allocator, io)
+```
+
+> 审计建议的 `std.crypto.random.bytes()` **在本工具链上不存在**（实测 `struct 'crypto' has no member
+> named 'random'`）。也**不要**改用 `std.Io.random` —— 它的文档明写失败时回落到 pid + 墙钟 + ASLR，
+> 那正是这条修掉的缺陷类别。
+
+### `db.query` 有租户上下文而没声明列时**拒绝**（行为变化）
+
+**Breaking?** 是 —— 对多租户应用是**新的运行期拒绝**。
+
+`db.query` 以前没有租户边界（兄弟技能 `entity.*` 有）。现在有租户上下文时，框架把整条语句**外层包裹**：
+
+```sql
+SELECT * FROM ( <模型原样 SQL> ) AS _zt_tenant_scope WHERE _zt_tenant_scope.<col> = ?
+```
+
+租户值**只以 `?` 绑定**，一个字节都不进 SQL 文本；模型的 `OR`/`1=1` 都削弱不了外层谓词。
+**没声明列 → `error.TenantScopeUnavailable`（拒绝，不是不过滤）。**
+
+**一行改法**：默认入口 `registerBusinessSkills(&registry, &.{})` 把列留成 `null`，所以多租户应用必须改走显式入口：
+
+```zig
+try ai.business.registerBusinessSkillsWith(&registry, &.{}, .{
+    .db_query_tenant_column = "tenant_id",   // 按你自己 schema 的列名
+});
+```
+
+另外**你的 SELECT 必须把租户列放进结果集**，否则外层报 "no such column"（报错、不出数据）。
+副作用（方向安全）：模型自己的 `LIMIT` 在内层先生效，可能少返回几行。
+
+### HTTP 请求边界加固：畸形请求一律 4xx/501，不再静默接受（**行为 + 签名**）
+
+**Breaking?** 是。三处解析与 RFC 不符**合起来**允许与按规范解析的前置代理产生 **CL/TE 请求走私**。
+
+| 形状 | 之前 | 现在 |
+|---|---|---|
+| 无空格的合法头（`Host:x`、`Content-Length:5`） | 静默丢弃（＝该头不存在） | 正确解析 → `ctx.header` 从 `null` 变真值 |
+| `Transfer-Encoding` | 全文零处理（chunked 体不消费，残留在 reader 里被当成下一个请求行） | **400** |
+| `CL` + `TE` 并存 / 重复 / 冲突 / 非十进制 `CL` | 最后一次生效 | **400** |
+| 未知方法（含 `PROPFIND` 这类合法扩展方法） | 折成 `.GET` 处理 | **501** |
+| 请求行非 3 段 / 版本非 `HTTP/1.x` | 不校验 | **400** |
+
+**签名变化**：`http.Method.fromString` 现在返回 **`?Method`**（未知 → `null`）。折成 `.GET` 本身就是
+走私面的一部分，所以这个变化是修复的要点，不是副作用。
+
+**一行改法**：升级后跑一遍真实流量（或 `examples/production-deploy/` 拓扑），确认没有走 `TE` 的客户端 ——
+本服务器**没有 chunked 请求解码器**，所以带 `TE` 的请求以前也是错的，只是错得无声。
+
+### 三处「默认为放行」改成 fail-closed（行为变化）
+
+**Breaking?** 是（对依赖宽松默认值的应用是行为变化；③ 的**调用方形态一字未改**）。
+
+- **`.dept_custom` 的空/坏 `dept_ids`**：`ids.len == 0` 与解析失败以前都 `return null`，而 `null` 按契约是
+  "**不过滤**"。现在给 `deny_clause = "1 = 0"`，**只有 `.all` 才能产生 `null`**。
+- **`permissionGateWith` 的配置存在函数级全局**：一个进程里跑两个 server 时第二次调用会覆盖第一次的
+  **catalog 与配置**（若目标路径在对方 catalog 里是 `.public`，权限检查被跳过）。改成**每调用一份**，
+  并把**空 catalog 改成 fail-closed**。legacy `jwtAuth` 的 `stored_security` 同形，一并改掉。
+- **`tenantClause` 的租户谓词没有括号**：`WHERE owner_id = ? OR is_public = 1` 会按优先级变成
+  `… OR is_public = 1 AND tenant_id = ?` —— **租户隔离对 `OR` 的第一个分支失效**且**没有任何报错**。
+  现在把调用方那段谓词包起来。
+
+### `handleAppendEntries` 的错误集多了一个成员（**编译错，仅下游穷尽 switch**）
+
+**Breaking?** 是。为修 `entry.index == 0` 的无符号下溢（一个无需认证的帧就能打死/越界读节点），
+`RaftElection.handleAppendEntries` 新增 `error.InvalidLogIndex`，现在共 2 个错误。
+
+**影响面**：只影响**直接调用它并对 `err` 写穷尽 `switch`** 的代码；用 `catch |err|` 兜住的不受影响。
+仓内无此类调用点。已按 `src/test/ErrorSetSnapshot.zig` 自己的契约登记进快照并把上限钉在 2。
+
+**一行改法**：给 `switch` 加一个 `error.InvalidLogIndex` 分支（按"对端发了畸形帧、丢弃"处理）。
+
+### 顺带（**破坏性：否**）
+
+- `getStatusText` 增加了 `501`；畸形请求的日志从 `log.err` **降为** `log.warn`
+  （客户端过错不是服务端故障）。
+- 新增 `zig build runtime-stress`（长时不变式压测）与 `docs/dev/READING_NUMBERS.md` 的读数约定。
+- `ready_high_water` 的无符号下溢修掉 —— 一个被发布的指标此前会永久撒谎。
+
 ## v0.28.0
 
 ### `Runtime.cancelTimer(id) bool` 删除，拆成两个入口

@@ -12,7 +12,12 @@ const ai = zigmodu.ai;
 // 1. 注册技能（业务/审批/KPI/管理…）
 var registry = ai.SkillRegistry.init(allocator, io);
 defer registry.deinit();
-try ai.business.registerBusinessSkills(&registry, &.{});
+// 多租户（下面 ctx.tenant_id 有值）必须用 With 入口并声明租户列，否则
+// db.query 会 fail-closed 返回 error.TenantScopeUnavailable。
+// 单租户应用可以用 registerBusinessSkills(&registry, &.{})。
+try ai.business.registerBusinessSkillsWith(&registry, &.{}, .{
+    .db_query_tenant_column = "tenant_id",
+});
 try ai.kpi.registerKpiSkills(&registry);
 try ai.actions.registerWriteSkills(&registry);
 
@@ -53,7 +58,10 @@ cd ../.. && python3 scripts/mcp-client-test.py examples/mcp-server/zig-out/bin/m
 - **`tools/list` 不过滤**：`ai.mcp.toMcpTools` 列出注册表里的**全部**技能（含 `admin.*`）。
   按 allowlist / 权限裁剪 `tools/list` 目前**是缺口，不是既有能力** —— 要藏管理类技能，
   只能先别把它们注册进暴露给 MCP 的那个 registry；
-- 租户隔离：`ctx_template.tenant_id` 贯穿所有分发。
+- 租户隔离：`ctx_template.tenant_id` 贯穿所有分发。**但隔离由各个技能自己落实** ——
+  `entity.*` 看实体声明的 `tenant_column`，`db.query` 看 `BusinessSkillsConfig.db_query_tenant_column`。
+  有 `tenant_id` 而没声明列时 `db.query` 是 **`error.TenantScopeUnavailable`（拒绝，不是不过滤）**：
+  上面快速接入里的 `registerBusinessSkillsWith` 就是这个原因。
 
 ## 编程接口
 

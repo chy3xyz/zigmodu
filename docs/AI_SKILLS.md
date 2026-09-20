@@ -11,7 +11,7 @@
 
 | 机制 | 组件 | 默认行为 |
 |------|------|----------|
-| 租户隔离 | `SkillContext.tenant_id` | 实体查询自动追加租户条件（实体声明 `tenant_column` 时） |
+| 租户隔离 | `SkillContext.tenant_id` | 实体查询在实体声明 `tenant_column` 时自动追加；`db.query` 由框架**外层包裹**追加 `WHERE <col> = ?`（需要 `BusinessSkillsConfig.db_query_tenant_column`，没声明就 `error.TenantScopeUnavailable`） |
 | SQL 安全 | `validateSqlFragment` + 参数绑定 | `db.query` 仅 SELECT、禁止字面量/注释/`;`、行数上限 |
 | 白名单 | 实体注册表 / allowlist | `entity.*` 只能访问注册实体；管理类 skill 默认不在 allowlist |
 | 所有权 | `ai.freeValue` | 结果 JSON 由 ctx.allocator 持有，调用方可深释放 |
@@ -42,9 +42,18 @@
 `zigmodu.ai.business.registerBusinessSkills(registry, comptime entities)`
 （DB 经 `SkillContext.backend_ptr` 指向 `*data.SqlxBackend`）：
 
+> **多租户应用要换入口**：上面这个默认入口把 `db_query_tenant_column` 留成 `null`，
+> 所以只要 `SkillContext.tenant_id` 有值，`db.query` 就返回 **`error.TenantScopeUnavailable`**（fail-closed）。
+> 要让它工作，用显式配置的入口：
+> ```zig
+> try ai.business.registerBusinessSkillsWith(&registry, &.{}, .{
+>     .db_query_tenant_column = "tenant_id", // 按你自己 schema 的列名写
+> });
+> ```
+
 | Skill | 说明 |
 |-------|------|
-| `db.query` | 只读参数化 SELECT；`?` 占位符 + args；行数上限（默认 20 / 上限 100）；拒绝非 SELECT 与自由字面量 |
+| `db.query` | 只读参数化 SELECT；`?` 占位符 + args；行数上限（默认 20 / 上限 100）；拒绝非 SELECT 与自由字面量。**租户**：有 `tenant_id` 时框架把整条语句外层包裹成 `SELECT * FROM (<你的 SQL>) AS _zt_tenant_scope WHERE _zt_tenant_scope.<col> = ?`，租户值**只以 `?` 绑定**（不拼进 SQL 文本）；因此**你的 SELECT 必须把租户列放进结果集**，否则外层报 "no such column" |
 | `entity.lookup` | 按主键查注册实体；白名单表名；配置 `tenant_column` 后自动按 `tenant_id` 过滤 |
 | `entity.list` | 等值过滤 + 行数上限 + 租户隔离 |
 

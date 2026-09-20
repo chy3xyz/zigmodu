@@ -1,5 +1,63 @@
 # Changelog
 
+## [Unreleased]
+
+### `ConnectionRegistry` 的连接 id 0 与失败哨兵撞车 → 释放后使用（**破坏性：否**）
+
+连接 id 是 `(分片 << 26) | 计数器`，所以**分片 0 的 id 窗口从 0 开始** —— 而
+`ConnectionRegistry.register` 用 **0 表示"注册失败"**。于是分片 0 的**第一个**连接返回 0，
+调用方按约定当成失败：
+
+```zig
+// tools/zmodu/src/main.zig:7896（脚手架生成的 IM 网关）
+const conn_id = self.registry.register(user_id, @ptrCast(session), sendViaWsFramer);
+if (conn_id == 0) { self.allocator.destroy(session); return null; }   // ← 把一个活连接 free 了
+```
+
+而 `register` 是**先写进 `by_user` 再返回**的，所以那条记录仍指向刚被 free 的 `WsSession` ——
+下一次 `sendToUser`（`ConnectionRegistry.zig:260`）解引用它就是**释放后使用**。
+触发面：任何 `user_id & 63 == 0` 的第一个连接，也就是**每个用脚手架生成的项目都带着这个 bug**。
+
+修法是**把 0 留出来**：id 起始值改为 `(分片 << 26) | 1`（`firstId`），分片 0 付出一个 id 的代价；
+同时让计数器在**自己那个 2^26 窗口内**回绕 —— 最末分片的窗口止于 `0xFFFF_FFFF`，
+不回绕的话它加一就正好落到 0，也就是这个方案存在的意义所在。
+公开 `register` 的 `0 = 失败 / 成功的注册永不返回 0` 契约现在写在它的文档注释里。
+
+> **为什么它活了这么久**：`src/tests.zig` **从来没有 wire 过 `src/im/`** ——
+> `ConnectionRegistry.zig` 只经 `im/im.zig`（由 `root.zig` 导出，而聚合测试不 import 它）可达，
+> 所以这个文件里的 **8 条用例一条都没跑过**。既有的用例又恰好只用 `user_id ∈ {1, 42, 65, 999}`，
+> 落在分片 1 / 42 / 1 / 39 —— **分片 0 一次都没被碰过**。
+> 本次把 `im/ConnectionRegistry.zig` 接进 `tests.zig`（`WsFramer`/`BufferPool` 早就经 `api/Server.zig`
+> 可达，只有这一个文件是孤儿），新增 3 条用例，**两条变异各验过红**：
+> `firstId` 去掉 `| 1` → 3 条以断言红（`TestUnexpectedResult` / `expected 4227858433, found 4227858432`）；
+> 把回绕目标改成裸 `0` → 恰好 1 条红（回绕那条）。**都不是编译错。**
+> 全量 **1464/1485（21 skipped，0 failed）**，比上一版 **+8**（整个文件的用例首次执行）。
+
+### 文档漂移批次：AGENTS.md 的 CSPRNG 规则、`db.query` 口径、`ws_routes` 示例、UPGRADING 缺段（**破坏性：否**）
+
+四组都是"文档与代码相反"，其中两组会**主动**把读者带错：
+
+- **`AGENTS.md:256` 仍在主张已被替换的规则**（"CSPRNG: multi-source entropy, never single-timestamp
+  seed"）—— 那正是 v0.32.0 删掉的方案。改为 `std.Io.randomSecure(io, buf)`，并写清
+  **不要**用 `std.crypto.random`（本工具链无此声明）与 `std.Io.random`（失败回落 pid+墙钟+ASLR）。
+  顺带修 `AGENTS.md:170` 把 `@intFromPtr(&seed)` 当"for entropy"的推荐（它是 pid 形状的值，不是熵源），
+  并给 DO/DON'T 表补上 **CSPRNG** 与 **`ws_routes` 必须显式 `.meta.auth = .public`** 两行。
+- **`db.query` 的租户口径**（`docs/AI_SKILLS.md` / `docs/MCP.md` / `docs/AI_DEV_GUIDE.md`）：
+  三份文档都只说实体类技能做租户隔离。而 `MCP.md` 的 quick-start 更是**同时**用默认入口注册
+  **和**设置 `ctx.tenant_id = 1` —— 那个会话里 `db.query` 按新契约**必然** `error.TenantScopeUnavailable`。
+  现在三处都写明：有租户上下文就必须走 `registerBusinessSkillsWith(..., .{ .db_query_tenant_column = … })`，
+  并说明外层包裹要求**你的 SELECT 把租户列放进结果集**。
+- **`docs/ROUTE_TABLE.md` 两处 `ws_routes` 示例现在是编译错**（`.meta` 缺 `.auth` / 完全没写 `.meta`，
+  而 `.auth` 默认 `.inherit`）—— 照抄会直接编译不过。两处都补上 `.auth = .public` 并说明原因。
+- **`docs/UPGRADING.md` 补 v0.32.0 段**：该文件止于 v0.28.0，而 v0.32.0 有 **5 处破坏性变更**
+  （3 处是编译错：WS 路由声明、CSPRNG 的 `io` 参数、`Method.fromString` 返回 `?Method`）。
+  已核对 `v0.29.0..v0.31.0` 区间**零**破坏性变更（`git log` 里 6 个 `!` 提交全在 v0.32.0），
+  所以补一段就把这个洞补完了；每条按房内格式给了 **Breaking? / 影响面 / 一行改法**。
+
+**未做**（同一次审计查到、本次未动）：`CLAUDE.md:35` 仍写"OTLP / Vault 仅 `http://`"、
+`docs/PRODUCTION_ROADMAP.md:144` 仍写 `https://` 明确不支持、`docs/API.md:1115` 的
+`fromString` 返回类型、`docs/dev/final-assessment.md:63-65` 建议 `std.crypto.random.bytes()`。
+
 ## [0.32.0] - 2026-09-20
 
 ### 集群/Raft 两条高危（安全审计 ② 的第 1、2 条；**破坏性：是**）

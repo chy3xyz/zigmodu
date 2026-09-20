@@ -41,6 +41,14 @@ pub const ConnectionRegistry = struct {
     }
 
     /// Register a user connection. Replaces old connection.
+    ///
+    /// Returns the new connection id, or **0 for failure** (pool exhausted, or
+    /// the shard lock could not be taken). A *successful* registration never
+    /// returns 0 — `firstId` reserves it — which is what makes the check
+    /// `if (conn_id == 0) { /* failed */ }` safe. It was not always: shard 0's id
+    /// window starts at 0, so its first connection looked exactly like a failure,
+    /// and a caller that freed the session on 0 left `by_user` pointing at freed
+    /// memory (the next `sendToUser` was a use-after-free).
     pub fn register(self: *Self, user_id: u64, ctx: *anyopaque, send_fn: SendFn) u32 {
         return self.shard(user_id).register(self.allocator, user_id, ctx, send_fn);
     }
@@ -120,7 +128,8 @@ const Shard = struct {
     free_list: ?*ConnectionEntry = null,
     mutex: std.Io.Mutex,
     io: std.Io,
-    next_id_base: u32,
+    /// The id `nextId` will hand out. Never 0 — see `firstId`.
+    next_id: u32,
     tick: u64 = 0,
     id: u8,
 
@@ -153,7 +162,7 @@ const Shard = struct {
             .free_list = free_list,
             .mutex = std.Io.Mutex.init,
             .io = io,
-            .next_id_base = @as(u32, id) << 26,
+            .next_id = firstId(id),
             .id = id,
         };
     }
@@ -189,10 +198,30 @@ const Shard = struct {
         self.free_list = entry;
     }
 
+    /// Hand out the next id, wrapping inside this shard's own 2^26 window rather
+    /// than rolling into the neighbouring shard's ids. The last shard's window
+    /// ends at `0xFFFF_FFFF`, so without the wrap its counter would step onto 0 —
+    /// the one value `register` needs kept free (see `firstId`).
     fn nextId(self: *SelfShard) u32 {
-        const id = self.next_id_base;
-        self.next_id_base += 1;
+        const id = self.next_id;
+        const next = id +% 1;
+        // `(next >> 26) == shard_id` is exactly "still inside this window".
+        self.next_id = if ((next >> 26) == @as(u32, self.id)) next else firstId(self.id);
         return id;
+    }
+
+    /// First id this shard hands out: `(shard << 26) | 1`.
+    ///
+    /// The **low bit forced to 1 is the point**: ids are `(shard << 26) | counter`,
+    /// so shard 0's window is `[0, 1 << 26)` and its very first counter value is 0
+    /// — the same value `ConnectionRegistry.register` returns to mean
+    /// "registration failed". The generated gateway reads it that way
+    /// (`if (conn_id == 0) { destroy(session); }`), so the first connection for any
+    /// `user_id & 63 == 0` was freed while `by_user` still referenced it and the
+    /// next `sendToUser` was a use-after-free. Reserving 0 costs shard 0 exactly
+    /// one id out of 2^26.
+    fn firstId(shard_id: u8) u32 {
+        return (@as(u32, shard_id) << 26) | 1;
     }
 
     fn register(self: *SelfShard, allocator: std.mem.Allocator, user_id: u64, ctx: *anyopaque, send_fn: SendFn) u32 {
@@ -438,4 +467,71 @@ test "sharded unregisterByConn" {
 fn testSendFn(ctx: *anyopaque, msg: []const u8) anyerror!void {
     _ = ctx;
     _ = msg;
+}
+
+/// Counts delivered messages through `ctx`, which points at a `usize`.
+fn countingSendFn(ctx: *anyopaque, msg: []const u8) anyerror!void {
+    _ = msg;
+    const counter: *usize = @ptrCast(@alignCast(ctx));
+    counter.* += 1;
+}
+
+// Verified red: dropping the `| 1` from `firstId` makes this fail on the *first*
+// iteration with `expected ..., found 0` — shard 0's first id. That 0 is the
+// value `ConnectionRegistry.register` documents as "registration failed", so any
+// caller that branches on it frees a live session (see the test below). The
+// existing tests all use user_ids 1 / 42 / 65 / 999, which land on shards 1 / 42 /
+// 1 / 39 — shard 0 is never touched, which is how this survived.
+test "the first id of every shard is non-zero, because 0 means registration failed" {
+    const allocator = std.testing.allocator;
+    var reg = ConnectionRegistry.init(allocator, std.testing.io);
+    defer reg.deinit();
+
+    var dummy: u8 = 0;
+    // `user_id == i` lands on shard `i & 63`, so this visits all 64 shards once
+    // each — i.e. every shard's *first* id, which is the value in question.
+    for (0..SHARDS) |i| {
+        const id = reg.register(i, @ptrCast(&dummy), testSendFn);
+        try std.testing.expect(id != 0);
+    }
+}
+
+// Verified red: same mutation (`| 1` removed) — `register(0, …)` returns 0, so
+// the `id != 0` assertion fails. The rest of the test is what the caller does
+// with that 0: it destroys the session, and `by_user` still points at it.
+test "a shard-0 connection reaches its live session rather than looking like a failure" {
+    const allocator = std.testing.allocator;
+    var reg = ConnectionRegistry.init(allocator, std.testing.io);
+    defer reg.deinit();
+
+    var delivered: usize = 0;
+    // user_id 0 is shard 0 — the shard whose id window starts at 0.
+    const id = reg.register(0, @ptrCast(&delivered), countingSendFn);
+    try std.testing.expect(id != 0); // a caller's `if (id == 0)` is-failure branch
+    try std.testing.expect(reg.isOnline(0));
+    try std.testing.expect(reg.sendToUser(0, "hi"));
+    try std.testing.expectEqual(@as(usize, 1), delivered);
+}
+
+// Verified red: changing the wrap target from `firstId(self.id)` to a bare
+// `0` makes the last assertion fail — shard 63's counter has stepped onto the
+// failure sentinel, and every registration after it looks like a failure.
+test "a shard id counter wraps inside its own window, never onto the sentinel" {
+    const allocator = std.testing.allocator;
+    // Shard 63 owns the top window, `[0xFC00_0000, 0xFFFF_FFFF]` — the only one
+    // whose counter can reach 0 by incrementing.
+    var shard = Shard.initCapacity(allocator, std.testing.io, 63, 4);
+    defer shard.deinit();
+
+    const window_base: u32 = @as(u32, 63) << 26;
+
+    // Start from the last id in the window.
+    shard.next_id = 0xFFFF_FFFF;
+    try std.testing.expectEqual(@as(u32, 0xFFFF_FFFF), shard.nextId());
+    try std.testing.expect(shard.next_id != 0);
+    try std.testing.expectEqual(window_base | 1, shard.next_id);
+
+    // And it keeps counting from there rather than sitting on the boundary.
+    try std.testing.expectEqual(window_base | 1, shard.nextId());
+    try std.testing.expectEqual(window_base | 2, shard.next_id);
 }

@@ -151,6 +151,14 @@ test "compile all source files" {
     // Allocation contract for the L0 hot paths (docs/RUNTIME.md §4–§6)
     _ = @import("runtime/alloc_contract_test.zig");
 
+    // IM domain. `im/ConnectionRegistry.zig`'s own tests were never wired here:
+    // the file is reached only through `im/im.zig`, which `root.zig` exports and
+    // this aggregating test does not import. So its 8 tests never ran — which is
+    // how the id-0 / failure-sentinel collision in `register` shipped (see the
+    // tests at the bottom of that file). `WsFramer`/`BufferPool` are reachable
+    // via `api/Server.zig`; only this one was orphaned.
+    _ = @import("im/ConnectionRegistry.zig");
+
     // AI boundary: ratcheted coupling + one-way seam (docs/AI_BOUNDARY.md)
     _ = @import("test/AiBoundary.zig");
     _ = @import("ai/guard.zig");

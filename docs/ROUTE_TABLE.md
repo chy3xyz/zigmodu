@@ -117,9 +117,11 @@ pub const CrmCustomer = struct {
         .{ .method = .POST, .path = "assign", .handler = handlers.assign },
     };
 
-    // WS 同表或并列：
+    // WS 同表或并列 —— `.meta.auth` 必须**显式** `.public`：
+    // WS 升级发生在 router.match 与全局中间件之前，所以别的 auth 值没有执行点，
+    // 声明它们现在是编译错（docs/RUNTIME.md §12.14）。身份在 on_connect 里自己验。
     pub const ws_routes = [_]WsSpec(State){
-        .{ .path = "ws/im", .on_connect = ..., .on_message = ..., .on_close = ..., .meta = .{ .module = "crm" } },
+        .{ .path = "ws/im", .on_connect = ..., .on_message = ..., .on_close = ..., .meta = .{ .auth = .public, .module = "crm" } },
     };
 };
 ```
@@ -262,7 +264,8 @@ try server.addRoute(.{
 .{ .method = .DELETE, .path = "{id}", .handler = suspend, .meta = .{ .permission = "tenant:suspend" } },
 ```
 
-WS：`pub const ws_routes = [_]http.WsSpec(State){ .{ .path = "ws", .on_connect = …, .on_message = … } };`  
+WS：`pub const ws_routes = [_]http.WsSpec(State){ .{ .path = "ws", .on_connect = …, .on_message = …, .meta = .{ .auth = .public } } };`  
+**`.meta.auth = .public` 是必须的**（缺 `.meta`、写非 `.public` 的 auth、或挂 `permission`/`roles` 都编译不过 —— WS 升级在 `router.match` 与全局中间件之前发生，那些声明没有执行点；`docs/RUNTIME.md` §12.14）。
 `on_message` 签名：`fn(session, msg, kind: http.WsFrameKind)` — **text (0x1) 与 binary (0x2) 均分发**（OpenIM protobuf 等）；写出用 `WsFramer.writeBinary` / `writeData`。
 
 ### SSE（Server-Sent Events）

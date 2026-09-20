@@ -162,7 +162,7 @@ defer wf_result.deinit();
 | 权限 | `required_permission` 设置权限码；`SkillContext.permissions` 不含则 `error.PermissionDenied` |
 | 白名单 | `Agent.allowlist` / `dispatchWith(.{ .allowlist })` 二次收口 |
 | 超时 | handler 循环内 `ctx.checkDeadline()`；框架另有返回后超时检查（非抢占） |
-| 租户 | `SkillContext.tenant_id` 贯穿；实体类技能自动追加租户条件 |
+| 租户 | `SkillContext.tenant_id` 贯穿；隔离**由各技能自己落实**：实体类看实体声明的 `tenant_column`，`db.query` 看 `BusinessSkillsConfig.db_query_tenant_column`（没声明 → `error.TenantScopeUnavailable`，拒绝而非不过滤） |
 | 只读优先 | 写动作走 `ai.actions`（事务性 outbox + 幂等键），不要直接 handler 里裸 SQL |
 
 ## 5. 选型：Agent / Workflow / LLM 策略 / Skill 桥
@@ -205,7 +205,7 @@ server，`tools/list` 自动从注册表推导参数 schema，并列出注册表
 - [ ] `guard.allow`（空 = 什么都不放行）+ `Agent.allowlist`（null = 全部注册工具）两处都只列业务需要的技能；`admin.*` 不要注册进暴露面
 - [ ] 写操作技能设 `required_permission` + 事务性 outbox + 幂等键（`run_id`）
 - [ ] handler 返回值全部 `ctx.allocator` 持有，调用方 `freeValue`
-- [ ] `SkillContext.tenant_id` 从请求/JWT 注入，实体技能自动租户隔离
+- [ ] `SkillContext.tenant_id` 从请求/JWT 注入；多租户应用用 `registerBusinessSkillsWith(..., .{ .db_query_tenant_column = "<列名>" })`（默认入口会让 `db.query` fail-closed），实体技能按实体声明的 `tenant_column` 隔离
 - [ ] 长任务设 `deadline_ms` / `tool_timeout_ms` / `Budget`
 - [ ] 生产打开 `audit`（`AgentAuditLog` / `RunAuditStore`）与指标
 - [ ] LLM 决策「拿不准就转人工」，绝不静默批准（`ai.llm` 已内建该姿态）

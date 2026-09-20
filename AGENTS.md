@@ -91,6 +91,8 @@ CI、`scripts/ci-*.sh`、本文件都用那个。`cd tools/zmodu && zig build` �
 | OTLP / Vault：`http(s)://`（TLS 走 `std.http.Client` 系统信任库）；x402 **fail-closed** | 默认放行支付 |
 | `http.HttpClient`：`https://` 经 `std.http.Client`（OTLP/Vault/AI 出站共用；`requestStream` HTTPS 真增量） | 自签证书未入系统信任库即报 TLS 失败 |
 | WS：`on_message(session, msg, kind)` — **text+binary**（`WsFrameKind`）；`writeBinary`/`writeData` | 假定只收 0x1；丢弃 0x2（会破坏 OpenIM protobuf） |
+| WS 路由：`ws_routes` 每项**显式** `.meta.auth = .public`（`ComptimeRouter.zig:734-758` 强制；非 public 或省掉 `.meta` 都是**编译错**，`permission`/`roles` 也被拒） | 省掉 `.meta`（`.auth` 默认 `.inherit` → 编译不过）；给 WS 路由挂 `permission`/`roles` |
+| CSPRNG：`std.Io.randomSecure(io, buf)` —— 每次系统调用，失败即 `error.EntropyUnavailable`、**无回落** | `std.crypto.random`（**本工具链无此声明**）；`std.Io.random`（文档明写失败回落 pid+墙钟+ASLR）；单一时间戳种子 |
 | sqlx：`Client.open` 后注意 pool/client 指针；CB 传 `io` | 在 ConnPool 上缓存失效的 `*Client` |
 | sqlx 驱动链接：`-Ddb=sqlite\|postgres\|mysql\|all`（默认 `all`） | 小系统用 `.db = "sqlite"`，勿默认三库全链 |
 | Runtime 监督树：`rt.spawnGroup(.one_for_one\|.one_for_all\|.rest_for_one\|.stop_group)` + `Supervision.group`；重建是原地 `deinit`+`init`（`docs/RUNTIME.md` §14） | 让 handler 自己 `catch` 装作没事（错误预算就废了）；把声明 `run` 的 worker 放进会重建的组（spawn 报 `NotRestartable`） |
@@ -167,7 +169,7 @@ const zigmodu_dep = b.dependency("zigmodu", .{
 | `std.Thread.WaitGroup` | no replacement; use `std.Io.Group` |
 | `std.time.milliTimestamp()` | `@import("core/Time.zig").monotonicNowMilliseconds()` |
 | `std.time.microTimestamp()` | same |
-| `std.os.getpid()` | `@intFromPtr(&seed)` for entropy |
+| `std.os.getpid()` | `@intFromPtr(&seed)`（pid **形状**的值；**不是**熵源 —— 熵一律走 `std.Io.randomSecure`，见下） |
 | `std.fs.cwd()` | `std.Io.Dir.cwd(io)` |
 | `std.fs.File` | `std.Io.File` — needs `io` param everywhere |
 | `std.posix.empty_sigset` | `std.posix.sigemptyset()` |
@@ -253,7 +255,11 @@ pub fn deinit() void {}  // reverse order
 - JWT (legacy only): `rbacJwtMiddleware*` / `sec.auth.jwtAuth*` → `auth_info` only
 - Secrets: `SecretsManager`（env > file > vault KV v2）；`http(s)://` 均可，HTTPS 用系统 CA
 - CSRF: `http_middleware.csrf()` double-submit cookie
-- CSPRNG: multi-source entropy, never single-timestamp seed
+- CSPRNG: `std.Io.randomSecure(io, buf)` —— 每次系统调用，失败即 `error.EntropyUnavailable`，**没有回落**
+  （`src/security/ApiKeyAuth.zig:129` · `PasswordEncoder.zig:24` · `SecurityModule.zig:290` · `src/kit/random.zig:17,42`）。
+  熵入口要 `io`：忘了传是**编译错误**，这是有意的。
+  **不要**用 `std.crypto.random`（本工具链上不存在，实测编译不过）、也**不要**用 `std.Io.random`
+  （它的文档明写失败时回落到 pid + 墙钟 + ASLR —— 那正是 §"CSPRNG" 这条修掉的缺陷类别）。
 - x402: fail-closed；dev 才注入 `verifyPaymentAllowAll`
 
 ### Multi-tenancy (optional)
