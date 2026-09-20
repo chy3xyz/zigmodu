@@ -358,6 +358,16 @@ pub const RaftElection = struct {
         self.lock.acquire();
         defer self.lock.release();
 
+        // Only configured cluster members get a vote. `handleVoteResponse` has always
+        // checked this; this handler did not, so an arbitrary TCP peer could name any
+        // `candidate_id` and be granted a ballot (docs/dev/cluster-auth-design.md §1).
+        // Deny rather than error: an unknown candidate is a peer's mistake, not ours.
+        // Placed before every state mutation — including the term update below, which
+        // would otherwise let an impostor move our term and reset the election clock.
+        if (self.peerId(req.candidate_id) == null) {
+            return VoteResponse{ .term = self.current_term, .vote_granted = false };
+        }
+
         if (req.term > self.current_term) {
             self.current_term = req.term;
             self.state = .follower;
@@ -406,6 +416,19 @@ pub const RaftElection = struct {
 
         // Reply false if term < current_term (§5.1)
         if (req.term < self.current_term) {
+            return AppendEntriesResponse{
+                .term = self.current_term,
+                .success = false,
+                .match_index = @intCast(self.log.items.len),
+            };
+        }
+
+        // The leader must be someone we know (or us — `becomeLeader` sets `leader_id`
+        // to our own `local_id`). Placed before every mutation including the term
+        // update: an impostor should not be able to move our term, reset our election
+        // deadline, or reach the log. `success = false` tells the sender nothing about
+        // whether we know them (docs/dev/cluster-auth-design.md §1/#2, §4.1).
+        if (!std.mem.eql(u8, req.leader_id, self.local_id) and self.peerId(req.leader_id) == null) {
             return AppendEntriesResponse{
                 .term = self.current_term,
                 .success = false,
@@ -932,6 +955,13 @@ pub const RaftElection = struct {
             return InstallSnapshotResponse{ .term = self.current_term };
         }
 
+        // Same check as `handleAppendEntries`, and this is the path that wipes the
+        // whole log, so an unknown sender must be refused before anything moves —
+        // term, state and (below) `log` are all reachable from here.
+        if (!std.mem.eql(u8, req.leader_id, self.local_id) and self.peerId(req.leader_id) == null) {
+            return InstallSnapshotResponse{ .term = self.current_term };
+        }
+
         if (req.term > self.current_term) {
             self.current_term = req.term;
         }
@@ -1395,10 +1425,14 @@ test "RaftElection heartbeat resets leader info" {
     };
     const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
 
+    // The leader whose heartbeat is replayed below has to be a configured member:
+    // `handleAppendEntries` now refuses a `leader_id` that is neither a peer nor
+    // this node (docs/dev/cluster-auth-design.md §4.1).
+    var peers = [_]Peer{.{ .id = "leader1", .address = "" }};
     var election = try RaftElection.init(
         allocator,
         "node1",
-        &.{},
+        &peers,
         .{},
         &transport,
     );
@@ -1447,7 +1481,11 @@ test "an AppendEntries entry with index 0 is refused before the log is touched" 
     };
     const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
 
-    var election = try RaftElection.init(allocator, "node1", &.{}, .{}, &transport);
+    // `leader1` is a configured member: the seeded request below is a real leader's
+    // AppendEntries, which the membership check must let through before the
+    // malformed entry in it is reached (docs/dev/cluster-auth-design.md §4.1).
+    var peers = [_]Peer{.{ .id = "leader1", .address = "" }};
+    var election = try RaftElection.init(allocator, "node1", &peers, .{}, &transport);
     defer election.deinit();
 
     // Seed one entry the normal way, so the malformed request below has an index
@@ -1510,7 +1548,11 @@ test "a failed voted_for re-allocation leaves the old vote intact" {
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
     const allocator = failing.allocator();
 
-    var election = try RaftElection.init(allocator, "node1", &.{}, .{}, &transport);
+    // The candidate is a configured member, so the grant path below (the re-dupe of
+    // `voted_for`) is reached at all — an unlisted id gets no ballot
+    // (docs/dev/cluster-auth-design.md §4.1).
+    var peers = [_]Peer{.{ .id = "c1", .address = "" }};
+    var election = try RaftElection.init(allocator, "node1", &peers, .{}, &transport);
     defer election.deinit();
 
     // 1. Grant a vote, so `voted_for` owns a buffer.
@@ -1601,10 +1643,13 @@ test "RaftElection vote request validation" {
     };
     const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
 
+    // A vote is granted only to a configured member, so the candidate under test
+    // (a fresh, up-to-date log) has to be one — docs/dev/cluster-auth-design.md §4.1.
+    var peers = [_]Peer{.{ .id = "candidate1", .address = "" }};
     var election = try RaftElection.init(
         allocator,
         "node1",
-        &.{},
+        &peers,
         .{},
         &transport,
     );
@@ -1641,7 +1686,14 @@ test "RaftElection rejects stale term vote" {
     };
     const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
 
-    var election = try RaftElection.init(allocator, "node-a", &.{}, .{}, &transport);
+    // Both candidates are configured members, so the second request below is
+    // refused for its **term** — not merely for being unknown, which would make this
+    // pass for the wrong reason (docs/dev/cluster-auth-design.md §4.1).
+    var peers = [_]Peer{
+        .{ .id = "c1", .address = "" },
+        .{ .id = "c2", .address = "" },
+    };
+    var election = try RaftElection.init(allocator, "node-a", &peers, .{}, &transport);
     defer election.deinit();
 
     _ = try election.handleVoteRequest(.{
@@ -1682,7 +1734,11 @@ test "RaftElection split vote across three candidates" {
 
     var e1 = try RaftElection.init(allocator, "n1", &.{}, .{}, &transport);
     defer e1.deinit();
-    var e2 = try RaftElection.init(allocator, "n2", &.{}, .{}, &transport);
+    // `n1` is one of `n2`'s peers: a vote request from a node that is not a
+    // configured member is denied before the ballot is even considered
+    // (docs/dev/cluster-auth-design.md §4.1).
+    var e2_peers = [_]Peer{.{ .id = "n1", .address = "" }};
+    var e2 = try RaftElection.init(allocator, "n2", &e2_peers, .{}, &transport);
     defer e2.deinit();
     var e3 = try RaftElection.init(allocator, "n3", &.{}, .{}, &transport);
     defer e3.deinit();
@@ -1950,8 +2006,11 @@ test "RaftElection log compaction and InstallSnapshot" {
     try testing.expectEqual(@as(usize, 1), raft.log.items.len);
     try testing.expectEqualStrings("snapshot-payload-at-2", raft.snapshot_data.?);
 
-    // Follower handle InstallSnapshot
-    var follower = try RaftElection.init(allocator, "node-2", &.{}, .{}, &transport);
+    // Follower handle InstallSnapshot. `node-1` is a configured member — the
+    // snapshot fires on the log **both** nodes hold, and an unknown sender is now
+    // refused before that path is entered (docs/dev/cluster-auth-design.md §4.1).
+    var follower_peers = [_]Peer{.{ .id = "node-1", .address = "" }};
+    var follower = try RaftElection.init(allocator, "node-2", &follower_peers, .{}, &transport);
     defer follower.deinit();
 
     const snap_req = InstallSnapshotRequest{
@@ -2400,10 +2459,18 @@ test "RaftElection: a tick and an inbound RPC cannot both free voted_for" {
     const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
 
     var gate = WindowGate{ .backing = allocator };
-    // A cluster of one: `startElection` elects this node on the self-vote, so a
-    // round needs no peer and no wire — what is under test is the two threads,
-    // not the transport.
-    var raft = try RaftElection.init(gate.allocator(), "node-a", &.{}, .{}, &transport);
+    // `peer-a` (the seeded vote below) and `peer-b` (the inbound driver's id) are
+    // the two names the windows free and replace, and both have to be configured
+    // members: a vote from an unlisted candidate is denied, which would leave the
+    // seeded `voted_for` in place and the rendezvous unreachable
+    // (docs/dev/cluster-auth-design.md §4.1). The transport stays a no-op — what is
+    // under test is the two threads writing `voted_for`, not the wire, and
+    // `startElection` still reaches its read-then-free window on every round.
+    var raft_peers = [_]Peer{
+        .{ .id = "peer-a", .address = "" },
+        .{ .id = "peer-b", .address = "" },
+    };
+    var raft = try RaftElection.init(gate.allocator(), "node-a", &raft_peers, .{}, &transport);
     defer raft.deinit();
     // Runs before the `deinit()` above (defers unwind LIFO): its frees are the
     // only ones outside a window, and a rendezvous there would have no partner.
@@ -2523,4 +2590,163 @@ test "RaftElection: the window rendezvous fires iff nothing serializes the entry
         // draws with its own `freed >= 1`.
         try std.testing.expectEqual(@as(usize, 2), gate.freed.load(.acquire));
     }
+}
+
+// ── L2: the inbound membership check (docs/dev/cluster-auth-design.md §4.1) ───
+//
+// The negative fixtures here hand `init` a peer list that does **not** contain the
+// sender — the state a node is in when a TCP-reachable stranger talks to it, since
+// the wire cannot add itself to `peers`. The last test is the positive control: a
+// sender that *is* in the list still replicates.
+
+/// Nothing is ever sent by these tests and an outbound AppendEntries answers "not
+/// replicated" — the checks under test are all inbound.
+const MembershipTestTransport = struct {
+    fn vote(_: ?[]const u8, _: []const u8, _: VoteRequest) void {}
+    fn append(_: ?[]const u8, _: []const u8, _: AppendEntriesRequest) AppendEntriesResponse {
+        return .{ .term = 0, .success = false, .match_index = 0 };
+    }
+    const vtable: RaftElection.ElectionTransport = &.{
+        .sendVoteRequest = vote,
+        .sendAppendEntries = append,
+    };
+};
+
+// The red→green target of this change (§7 evidence #5). Before the membership check
+// this granted a ballot — and, because the check sits above the term update, moved
+// the term — to any peer that named a `candidate_id`, while `handleVoteResponse`
+// had always refused exactly that.
+test "an unlisted candidate is denied a vote and cannot move the term" {
+    const allocator = testing.allocator;
+
+    var peers = [_]Peer{.{ .id = "node-2", .address = "" }};
+    var election = try RaftElection.init(allocator, "node1", &peers, .{}, &MembershipTestTransport.vtable);
+    defer election.deinit();
+
+    const denied = try election.handleVoteRequest(.{
+        .term = 7,
+        .candidate_id = "outsider",
+        .last_log_index = 99,
+        .last_log_term = 99,
+    });
+
+    try testing.expect(!denied.vote_granted);
+    // Denial rather than error, and denial *before* the mutation: a stranger cannot
+    // bump our term (`req.term` is 7) or reset the election deadline.
+    try testing.expectEqual(@as(u64, 0), election.getTerm());
+    try testing.expect(election.voted_for == null);
+}
+
+test "an unlisted leader is refused and mutates nothing" {
+    const allocator = testing.allocator;
+
+    var peers = [_]Peer{.{ .id = "node-2", .address = "" }};
+    var election = try RaftElection.init(allocator, "node1", &peers, .{}, &MembershipTestTransport.vtable);
+    defer election.deinit();
+
+    const refused = try election.handleAppendEntries(.{
+        .term = 9,
+        .leader_id = "impostor",
+        .prev_log_index = 0,
+        .prev_log_term = 0,
+        .entries = &.{.{ .term = 9, .index = 1, .command = "forged" }},
+        .leader_commit = 1,
+    });
+
+    // `success = false` is also the answer to "your entry does not fit my log", so
+    // the answer alone proves nothing — what this asserts is that every write the
+    // handler makes stayed unmade: term, log, commit and the leader slot.
+    try testing.expect(!refused.success);
+    try testing.expectEqual(@as(u64, 0), election.getTerm());
+    try testing.expectEqual(@as(usize, 0), election.logLen());
+    try testing.expectEqual(@as(u64, 0), election.getCommitIndex());
+    try testing.expect(election.getLeader() == null);
+}
+
+// The other side of the same check: `becomeLeader` names this node in `leader_id`,
+// so the self case has to read as "us" rather than as an unknown sender — otherwise
+// a leader cannot replicate to itself (and §4.1's `!eql(local_id)` clause is dead
+// code that no assertion would miss).
+test "AppendEntries from this node itself is still accepted" {
+    const allocator = testing.allocator;
+
+    // No peers at all: nothing but the `local_id` comparison can let this through.
+    var election = try RaftElection.init(allocator, "node1", &.{}, .{}, &MembershipTestTransport.vtable);
+    defer election.deinit();
+
+    const appended = try election.handleAppendEntries(.{
+        .term = 3,
+        .leader_id = "node1",
+        .prev_log_index = 0,
+        .prev_log_term = 0,
+        .entries = &.{.{ .term = 3, .index = 1, .command = "self-run" }},
+        .leader_commit = 1,
+    });
+
+    try testing.expect(appended.success);
+    try testing.expectEqual(@as(u64, 3), appended.term);
+    try testing.expectEqual(@as(usize, 1), election.logLen());
+    try testing.expectEqualStrings("self-run", election.getLogEntry(1).?.command);
+    try testing.expectEqualStrings("node1", election.getLeader().?);
+}
+
+test "an unlisted leader cannot wipe the log with InstallSnapshot" {
+    const allocator = testing.allocator;
+
+    var peers = [_]Peer{.{ .id = "node-2", .address = "" }};
+    var follower = try RaftElection.init(allocator, "node1", &peers, .{}, &MembershipTestTransport.vtable);
+    defer follower.deinit();
+
+    // A log to lose, written the way a leader writes one.
+    follower.state = .leader;
+    follower.current_term = 1;
+    _ = try follower.appendEntry("keep-1");
+    _ = try follower.appendEntry("keep-2");
+    try testing.expectEqual(@as(usize, 2), follower.logLen());
+
+    const out = try follower.handleInstallSnapshot(.{
+        .term = 5,
+        .leader_id = "impostor",
+        .last_included_index = 10,
+        .last_included_term = 5,
+        .offset = 0,
+        .data = "wipe-everything",
+        .done = true,
+    });
+
+    // The reply carries a term and nothing else, so the log is the observable — and
+    // `last_included_index` is what the destructive branch advances.
+    try testing.expectEqual(@as(u64, 1), out.term);
+    try testing.expectEqual(@as(usize, 2), follower.logLen());
+    try testing.expectEqual(@as(u64, 0), follower.last_included_index);
+    try testing.expect(follower.snapshot_data == null);
+    try testing.expectEqualStrings("keep-1", follower.getLogEntry(1).?.command);
+}
+
+// The positive control for the two AppendEntries tests above: a leader that *is* a
+// configured member still replicates. Without it, a check that rejected everyone
+// would read as a fix.
+test "a member leader's AppendEntries is still accepted and appended" {
+    const allocator = testing.allocator;
+
+    var peers = [_]Peer{.{ .id = "node-leader", .address = "" }};
+    var election = try RaftElection.init(allocator, "node1", &peers, .{}, &MembershipTestTransport.vtable);
+    defer election.deinit();
+
+    const appended = try election.handleAppendEntries(.{
+        .term = 4,
+        .leader_id = "node-leader",
+        .prev_log_index = 0,
+        .prev_log_term = 0,
+        .entries = &.{.{ .term = 4, .index = 1, .command = "from-member" }},
+        .leader_commit = 1,
+    });
+
+    try testing.expect(appended.success);
+    try testing.expectEqual(@as(u64, 1), appended.match_index);
+    try testing.expectEqual(@as(u64, 4), election.getTerm());
+    try testing.expectEqual(@as(usize, 1), election.logLen());
+    try testing.expectEqualStrings("from-member", election.getLogEntry(1).?.command);
+    try testing.expectEqualStrings("node-leader", election.getLeader().?);
+    try testing.expectEqual(@as(u64, 1), election.getCommitIndex());
 }

@@ -1265,9 +1265,16 @@ test "real loopback election: tick sends real vote requests and the candidate wi
     try b_impl.addresses.addEndpoint("node-a", a_endpoint);
     try c_impl.addresses.addEndpoint("node-a", a_endpoint);
 
-    b_raft = try RaftElection.init(allocator, "node-b", &.{}, .{}, &b_impl.transport());
+    // Each follower knows the candidate by **id**. A vote request from a node that is
+    // not in `peers` is now denied before the ballot is considered, so the fixture
+    // (not the assertion) has to name node-a — the same id-versus-address fact the
+    // `ClusterBootstrap` id gate enforces at boot
+    // (docs/dev/cluster-auth-design.md §4.1, §10).
+    var b_peers = [_]Peer{.{ .id = "node-a", .address = "" }};
+    var c_peers = [_]Peer{.{ .id = "node-a", .address = "" }};
+    b_raft = try RaftElection.init(allocator, "node-b", &b_peers, .{}, &b_impl.transport());
     rafts_up = 1;
-    c_raft = try RaftElection.init(allocator, "node-c", &.{}, .{}, &c_impl.transport());
+    c_raft = try RaftElection.init(allocator, "node-c", &c_peers, .{}, &c_impl.transport());
     rafts_up = 2;
     var peers = [_]Peer{ .{ .id = "node-b", .address = "" }, .{ .id = "node-c", .address = "" } };
     a_raft = try RaftElection.init(allocator, "node-a", &peers, .{}, &a_impl.transport());
@@ -1338,7 +1345,16 @@ test "real loopback replication: sync AppendEntries and same-connection replies"
     try a_impl.addresses.addEndpoint("node-b", b_endpoint);
     try b_impl.addresses.addEndpoint("node-a", "127.0.0.1:1");
 
-    b_raft = try RaftElection.init(allocator, "node-b", &.{}, .{}, &b_impl.transport());
+    // node-b is driven by two senders here: node-a (the leader in step 1, the voter in
+    // step 2) and node-z (the fire-and-forget vote in step 3). Both are configured
+    // members now, because an unlisted sender gets neither a ballot nor the log — the
+    // fixture names who is on the wire, which is what the assertions about them meant
+    // all along (docs/dev/cluster-auth-design.md §4.1).
+    var b_peers = [_]Peer{
+        .{ .id = "node-a", .address = "" },
+        .{ .id = "node-z", .address = "" },
+    };
+    b_raft = try RaftElection.init(allocator, "node-b", &b_peers, .{}, &b_impl.transport());
     rafts_up = 1;
     var peers = [_]Peer{.{ .id = "node-b", .address = "" }};
     a_raft = try RaftElection.init(allocator, "node-a", &peers, .{}, &a_impl.transport());
@@ -1451,7 +1467,11 @@ test "real loopback catch-up: empty-log follower converges via per-peer nextInde
     impls_up = 2;
     try a_impl.addresses.addEndpoint("node-b", b_endpoint);
 
-    b_raft = try RaftElection.init(allocator, "node-b", &.{}, .{}, &b_impl.transport());
+    // node-b has to recognise the leader whose AppendEntries carries the backlog, or
+    // the catch-up below is refused at the door
+    // (docs/dev/cluster-auth-design.md §4.1).
+    var b_peers = [_]Peer{.{ .id = "node-a", .address = "" }};
+    b_raft = try RaftElection.init(allocator, "node-b", &b_peers, .{}, &b_impl.transport());
     rafts_up = 1;
     var peers = [_]Peer{.{ .id = "node-b", .address = "" }};
     a_raft = try RaftElection.init(allocator, "node-a", &peers, .{}, &a_impl.transport());
@@ -1716,7 +1736,11 @@ test "with a cluster_secret, a loopback AppendEntries round-trip is signed end t
     try a_impl.addresses.addEndpoint("node-b", b_endpoint);
 
     const cfg = ElectionConfig{ .cluster_secret = secret };
-    b_raft = try RaftElection.init(allocator, "node-b", &.{}, cfg, &b_impl.transport());
+    // The follower recognises node-a by id, so the signed AppendEntries below reaches
+    // the log (docs/dev/cluster-auth-design.md §4.1) — an L2 refusal would look like a
+    // `success = false` reply and fail this test for the wrong reason.
+    var b_peers = [_]Peer{.{ .id = "node-a", .address = "" }};
+    b_raft = try RaftElection.init(allocator, "node-b", &b_peers, cfg, &b_impl.transport());
     rafts_up = 1;
     var peers = [_]Peer{.{ .id = "node-b", .address = "" }};
     a_raft = try RaftElection.init(allocator, "node-a", &peers, cfg, &a_impl.transport());

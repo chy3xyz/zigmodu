@@ -2,6 +2,52 @@
 
 ## [Unreleased]
 
+### 集群成员校验（L2）：三个 Raft handler 只认成员 —— 零认证那条审计闭环（**破坏性：否**）
+
+`docs/dev/cluster-auth-design.md` §4 的落地，补上 §3（L1 逐帧 HMAC）之外的另一半。
+此前**只有** `handleVoteResponse` 校验成员，同族另外三个 handler 一个都不查：
+
+| Handler | 之前 | 现在 |
+|---|---|---|
+| `handleVoteRequest` | 任意 TCP 对端报**任意** `candidate_id` 就能拿到一票 | 非成员 → `vote_granted = false`。**位置在任何状态修改之前** —— 冒名者连我们的 term 都推不动 |
+| `handleAppendEntries` | 从不看 `leader_id`，只看 term | 非成员（且不是自己）→ `success = false`，**先于 term 更新**，伪造者到不了日志 |
+| `handleInstallSnapshot` | 同上 | 同上 —— 这条是**清空整个日志**的那条路 |
+
+「也不是自己」是必要的：`becomeLeader` 会把 `leader_id` 设成自己的 `local_id`。
+
+**为什么现在才能落地**：它当初被 §10 挡住 —— 那时 peer id 是 host 串、节点自报 `node_id`，
+合法的 leader 同样不在 `peers[].id` 里，加校验会把**唯一还能工作的**复制路径也堵死。
+`d84a31c` 把 id 空间修好之后，合法 leader 才真的出现在成员表里。**顺序是 §12 → §10 → L2。**
+
+**连带改的是 fixture，不是断言**：L2 之前，空 peer 列表的 follower 也接受任何 `leader_id`，
+所以多个既有用例的 follower（`RaftElection.init(..., &.{}, ...)`）现在会拒掉合法 leader。
+动了 `RaftElection` 8 处与 `RaftTransport` 4 处环回 fixture，**没有一条断言被削弱** ——
+独立核过整个 diff 里没有删除任何 `expect`/`assert` 行。其中一处值得记：
+`real loopback replication` 的第 3 步断言 `voted_for == "node-z"`，所以 `node-z` 必须被
+**命名为成员**，否则那条断言会因为"未知候选人"失败、而不是因为它在测的原因。
+
+> **一处与指令相左、但改的人是对的**：brief 要求把 `ClusterBootstrap` 里
+> `candidate_id = "peer-node"` 那条断言（未列成员却拿到票）翻成 `false`。
+> 但 §10 的修复已经把这个 fixture 改成 `.peers = &.{"peer-node@127.0.0.1:19731"}` ——
+> `peer-node` **现在就是成员**，再断言 `false` 会对着**正确**的代码失败。
+> 已核实并保留那条正向断言，另补了反向方向（`unlisted-node` 带 `term = current + 100`）。
+
+**L2 挡不住什么（写在明处）**：`leader_id == local_id` 按设计放行，所以一个自称**我们自己 id**
+的对端仍然过 L2。这符合分层：**身份层是 L1（HMAC）**，id 在线上始终是自述的。
+L2 挡的是"已不在成员表里的节点"，以及配合 L1 之后"随便报一个成员 id 的陌生人"。
+
+**验证**：全量 **1499/1520（21 skipped，0 failed）**（+5，即新增用例），`zig fmt --check` + **6 道门禁全绿**。
+两条变异逐条验过红、**都是断言红不是编译错**（`handleVoteRequest` 那条我自己重做过，
+md5 与失败断言与报告一致）：删掉投票校验 →
+`an unlisted candidate is denied a vote and cannot move the term` 在
+`try testing.expect(!denied.vote_granted)` 处 `FAIL (TestUnexpectedResult)`；
+删掉 AppendEntries 校验 → `an unlisted leader is refused and mutates nothing` 同形红。
+§12 的 `+ 1` 两处（`:801` / `:1029`）未动。
+
+**未做**：`DistributedEventBus` 自己的 listener（独立端口，单独一项）、§3.6 的重放残留
+（按设计接受：Raft 的 term 单调 + 幂等已覆盖）、混合版本集群未实测对跑、
+密钥来源只有文档约定无代码强制、`scripts/ci-integration.sh` 未跑。
+
 ### 修 peer id 空间：`ClusterBootstrap` 配出来的多节点集群**永远选不出 leader**（**破坏性：是**）
 
 `start()` 用 `raft.addPeer(p.host)` 把 peer 加进去 —— **peer 的 id 是 host 字符串**（`"127.0.0.1"`）。

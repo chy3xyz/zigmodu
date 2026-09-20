@@ -831,10 +831,45 @@ test "ClusterBootstrap drives raft.tick and serves inbound Raft RPCs" {
     const bytes = try conn.recv(&reply);
     const decoded = try RaftTransport.decodeVoteResponse(allocator, bytes);
     defer allocator.free(decoded.responder_id);
+    // `peer-node` is a configured member, so it gets the ballot. The `@id` in the
+    // config above is what makes that true: peers are named by id, and a bare
+    // `host:port` would fall back to the host string, leaving even this candidate
+    // unlisted (docs/dev/cluster-auth-design.md §10).
     try std.testing.expect(decoded.resp.vote_granted);
     try std.testing.expectEqualStrings("raft-node", decoded.responder_id);
     try std.testing.expectEqual(term_before + 5, decoded.resp.term);
     try std.testing.expectEqual(term_before + 5, raft.getTerm());
+
+    // 2b. The other direction: a candidate that is **not** in `self.peers` gets no
+    //     ballot, and is refused before any state moves — its higher term is not
+    //     adopted either (docs/dev/cluster-auth-design.md §4.1). Answering rather
+    //     than dropping is deliberate: the sender learns only that it lost a vote.
+    const term_after_member = raft.getTerm();
+    {
+        const stream2 = try addr.connect(io, .{ .mode = .stream });
+        var conn2 = NetworkTransport.ClusterConnection.init(allocator, stream2, io);
+        defer conn2.deinit();
+
+        var frame2 = std.ArrayList(u8).empty;
+        defer frame2.deinit(allocator);
+        try RaftTransport.encodeVoteRequest(&frame2, allocator, .{
+            .term = term_after_member + 100,
+            .candidate_id = "unlisted-node",
+            .last_log_index = 0,
+            .last_log_term = 0,
+        });
+        try conn2.send(frame2.items);
+
+        var reply2 = std.ArrayList(u8).empty;
+        defer reply2.deinit(allocator);
+        const bytes2 = try conn2.recv(&reply2);
+        const decoded2 = try RaftTransport.decodeVoteResponse(allocator, bytes2);
+        defer allocator.free(decoded2.responder_id);
+        try std.testing.expect(!decoded2.resp.vote_granted);
+        try std.testing.expectEqualStrings("raft-node", decoded2.responder_id);
+        try std.testing.expectEqual(term_after_member, decoded2.resp.term);
+    }
+    try std.testing.expectEqual(term_after_member, raft.getTerm());
 
     // 3. Stopping the node (with its inbound thread) is safe to repeat.
     cluster.stop();

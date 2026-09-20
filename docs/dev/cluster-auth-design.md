@@ -1,7 +1,7 @@
 # 集群入站零认证 —— 设计（未实现）
 
 > 状态：**§3（L1 逐帧 HMAC 认证）与 §3.5（fail-closed 门禁）已实现并验证；
-> §4（L2 成员校验）未实现 —— 被 §10 记录的既有缺陷阻断。**
+> §4（L2 成员校验）已实现 —— 它当初被 §10 的缺陷阻断，§10 修完后随之解锁。**
 > 来源是 `docs/dev/security-audit-cluster.md` 的第 3 条高危，
 > 以及本次评估中对 `handleVoteRequest` / `handleAppendEntries` 的复核。
 > 所有事实都带 `文件:行`；推测的地方显式标注"未验证"。
@@ -364,8 +364,9 @@ TLS/边车（`TlsTransport.zig:1-8` 的文件头已经写明 mTLS 目前要边�
 
 ### 未做
 
-- **L2 未实现**，因为 §10 的 id 空间缺陷未修：`handleAppendEntries` 现在**不校验** `leader_id`，
-  这正是 leader→follower 复制唯一还能工作的原因。先加 L2 会把唯一能走的路也堵死。
+- **L2 当时未实现**，因为 §10 的 id 空间缺陷未修：`handleAppendEntries` 那时**不校验** `leader_id`，
+  而那正是 leader→follower 复制唯一还能工作的原因 —— 先加 L2 会把唯一能走的路也堵死。
+  §10 修完后 L2 已落地，见 §13。
 - `DistributedEventBus` 自己的 listener（§3.3 第三个调用点）**未做** —— 独立于 Raft 端口，单独一项。
 - §3.6 的重放残留**按设计接受**（Raft 的 term 单调 + 幂等已覆盖），未做时间戳/窗口。
 - **混合版本集群未实测**：设计上硬切（不匹配的帧被丢弃 + debug 日志），但没有真的拿新旧两个二进制对跑。
@@ -481,3 +482,57 @@ pub fn hasQuorum(self: *const Self, votes_received: usize) bool { return votes_r
 
 peer id 空间那条选 **(a) 配置带显式 id**，记录在 §10 的「§10 修复记录」。
 §12 与 §10 是两条独立缺陷，**现在两条都关了**。
+
+---
+
+## 13. L2 实现记录（2026-09-21）
+
+§4.1 的三个校验点已落地（`RaftElection.zig`）：
+
+| 位置 | 改动 |
+|---|---|
+| `handleVoteRequest` `:367` | `self.peerId(req.candidate_id) == null` → 返回 `vote_granted = false`。位置是**拿到锁之后、任何状态修改之前** —— 冒名者连我们的 term 都推不动 |
+| `handleAppendEntries` `:431` | `leader_id` 既不是已知 peer **也不是自己** → `success = false`，且**先于 term 更新**，所以伪造者到不了日志 |
+| `handleInstallSnapshot` `:961` | 同上；这条是**清空整个日志**的那条路 |
+
+「也不是自己」是必要的：`becomeLeader` 会把 `leader_id` 设成自己的 `local_id`。
+
+### 一处与 brief 相左、但子代理是对的
+
+brief 说 `ClusterBootstrap drives raft.tick and serves inbound Raft RPCs` 里 `candidate_id = "peer-node"`
+**断言了漏洞**（未列成员却拿到票），要求把它翻成 `false`。**这条已经在 §10 的修复里失效了**：
+`d84a31c` 把那个 fixture 改成了 `.peers = &.{"peer-node@127.0.0.1:19731"}`（`:792`），
+`peer-node` **现在就是成员** —— 再断言 `false` 反而会对着**正确**的代码失败。
+已核实：保留了那条正向断言（并注明"是 `@id` 让它成立"），另外补了**反向**方向
+（`unlisted-node` 带 `term = current + 100`，断言 `!vote_granted` 且 `getTerm()` 不变）。
+
+### 三处 L2 之外的必须连带（否则既有用例会红）
+
+**fixture 必须补上发送方**：L2 之前，空 peer 列表的 follower 也接受任何 `leader_id`。
+多个既有用例的 follower 是 `RaftElection.init(..., &.{}, ...)`，现在会拒掉合法 leader ——
+所以改的是 **fixture 而不是断言**。动了 `RaftElection` 的 8 处与 `RaftTransport` 的 4 处环回 fixture；
+一处特别值得记：`real loopback replication` 的第 3 步断言 `voted_for == "node-z"`，
+所以 `node-z` 必须**被命名为成员**，否则那条断言会因为"未知候选人"而失败、而不是因为它在测的原因。
+
+### 验证
+
+全量 **1499/1520（21 skipped，0 failed）**（+5，即新增用例），fmt + 6 道门禁全绿。
+两条变异逐条验过红（`handleVoteRequest` 那条我亲自重做，md5 与失败断言一致）：
+删掉投票校验 → `an unlisted candidate is denied a vote and cannot move the term` 在
+`try testing.expect(!denied.vote_granted)` 处 `FAIL (TestUnexpectedResult)`；
+删掉 AppendEntries 校验 → `an unlisted leader is refused and mutates nothing` 同形红。
+另外独立核过：整个 diff **没有删除任何 `expect`/`assert` 行**；§12 的 `+ 1` 两处（`:801` / `:1029`）未动。
+
+### L2 挡不住什么（写在明处）
+
+`leader_id == local_id` 是**按设计放行**的，所以一个自称**我们自己 id** 的对端仍然过 L2 ——
+这符合预期：**身份层是 L1（HMAC）**，而 id 在线上依然是自述的。
+挡的是"已不在成员表里的节点"与"随便报一个成员 id 的陌生人"（后者只能靠 L1）。
+
+### 仍未做
+
+- `DistributedEventBus` 自己的 listener（§3.3 第三个调用点）—— 独立于 Raft 端口，单独一项。
+- §3.6 的重放残留**按设计接受**（Raft 的 term 单调 + 幂等已覆盖），未做时间戳/窗口。
+- 混合版本集群未实测对跑（设计上硬切）。
+- 密钥来源（`SecretsManager`）只有文档约定，无代码强制。
+- `scripts/ci-integration.sh` 未跑（不在本次要求的命令里）。
