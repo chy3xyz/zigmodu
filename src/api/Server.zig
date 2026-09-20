@@ -1476,12 +1476,6 @@ const RequestParser = struct {
         return out;
     }
 
-    pub fn parse(self: *RequestParser, reader: *StreamReader, max_body_size: usize, header_limits: HeaderLimits) !ParsedRequest {
-        var buffer: [8192]u8 = undefined;
-        const request_line_raw_view = try reader.readUntilDelimiterOrEof(&buffer, '\n') orelse return error.ClientClosed;
-        return self.parseAfterRequestLine(reader, request_line_raw_view, max_body_size, header_limits);
-    }
-
     /// Continue HTTP/1.1 parse after the request line was already read (H2 preface probe).
     pub fn parseAfterRequestLine(self: *RequestParser, reader: *StreamReader, request_line_raw_view: []const u8, max_body_size: usize, header_limits: HeaderLimits, max_params: usize) !ParsedRequest {
         var buffer: [8192]u8 = undefined;
