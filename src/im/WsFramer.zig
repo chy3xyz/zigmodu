@@ -43,21 +43,35 @@ pub const WsFramer = struct {
         self.write_buf = buf;
     }
 
-    /// RFC 6455 handshake using a small stack buffer (one-shot).
-    pub fn handshake(self: *WsFramer, ws_key: []const u8) !void {
+    /// `Sec-WebSocket-Accept` for `ws_key` (RFC 6455 §4.2.2):
+    /// `base64(SHA-1(key ++ the magic GUID))`.
+    ///
+    /// Pure on purpose: this is the one handshake step whose input is the
+    /// attacker-controlled header, so it has to be testable without a socket.
+    pub fn acceptKey(ws_key: []const u8) [28]u8 {
         const magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-        var hash_input: [128]u8 = undefined;
-        const hash_len = ws_key.len + magic.len;
-        @memcpy(hash_input[0..ws_key.len], ws_key);
-        @memcpy(hash_input[ws_key.len..hash_len], magic);
-
         var sha1 = std.crypto.hash.Sha1.init(.{});
-        sha1.update(hash_input[0..hash_len]);
+        sha1.update(ws_key);
+        sha1.update(magic);
         var digest: [20]u8 = undefined;
         sha1.final(&digest);
+        var out: [28]u8 = undefined;
+        _ = std.base64.standard.Encoder.encode(&out, &digest);
+        return out;
+    }
 
-        var accept_key: [28]u8 = undefined;
-        _ = std.base64.standard.Encoder.encode(&accept_key, &digest);
+    /// RFC 6455 handshake (one-shot).
+    pub fn handshake(self: *WsFramer, ws_key: []const u8) !void {
+        // **No `hash_input` buffer.** It used to be a `[128]u8` on the stack that
+        // `ws_key` was `@memcpy`d into — and `ws_key` is an attacker-controlled
+        // request header (bounded only by the 16 KB header limit), while the
+        // upgrade is answered *before* `router.match` and before every middleware
+        // (docs/RUNTIME.md §12.14). So a 93-byte key wrote past the frame without
+        // any credential: panic/abort in a safe build, a stack overwrite in
+        // ReleaseFast. SHA-1 is incremental, so the buffer is not needed at all —
+        // feeding the two slices removes the class rather than guarding one
+        // instance, and no legitimate key's behaviour changes.
+        const accept_key = acceptKey(ws_key);
 
         var buf: [256]u8 = undefined;
         const response = try std.fmt.bufPrint(&buf, "HTTP/1.1 101 Switching Protocols\r\n" ++
@@ -202,8 +216,19 @@ test "WsFrameKind opcode roundtrip" {
     try std.testing.expect(WsFrameKind.fromOpcode(0x8) == null);
 }
 
-test "handshake" {
-    _ = WsFramer.init(undefined, undefined);
+test "handshake: the accept key is the RFC's vector, and a long key is not an overflow" {
+    // RFC 6455 §1.3's own example vector.
+    try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", &WsFramer.acceptKey("dGhlIHNhbXBsZSBub25jZQ=="));
+
+    // `Sec-WebSocket-Key` is an attacker-controlled request header, bounded only by
+    // the 16 KB header limit, and the upgrade is answered before `router.match` and
+    // before every middleware (docs/RUNTIME.md §12.14) — so this is a pre-auth path.
+    // It used to `@memcpy` the key into a `[128]u8`, and any key longer than 92 bytes
+    // wrote past that frame. Reaching the assertion is the fix.
+    var long: [1024]u8 = @splat('A');
+    const accepted = WsFramer.acceptKey(&long);
+    try std.testing.expectEqual(@as(usize, 28), accepted.len);
+    try std.testing.expectEqual(@as(u8, '='), accepted[27]);
 }
 
 test "write with and without buffer" {

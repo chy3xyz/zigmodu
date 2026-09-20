@@ -168,13 +168,14 @@ pub const WebSocketServer = struct {
         // Generate accept key
         // Generate accept key
         const magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-        var hash_input: [60]u8 = undefined;
-        const hash_len = ws_key.len + magic.len;
-        @memcpy(hash_input[0..ws_key.len], ws_key);
-        @memcpy(hash_input[ws_key.len..hash_len], magic);
-
+        // **No `hash_input` buffer** — see `src/im/WsFramer.zig` for the full note.
+        // This one was only `[60]u8` (24 + 36, the size of the RFC's example key),
+        // so *any* key longer than 24 bytes wrote past it, and `ws_key` here comes
+        // from a raw request header with no length limit. SHA-1 is incremental, so
+        // feeding the two slices removes the buffer and the overflow with it.
         var sha1 = std.crypto.hash.Sha1.init(.{});
-        sha1.update(hash_input[0..hash_len]);
+        sha1.update(ws_key);
+        sha1.update(magic);
         var digest: [20]u8 = undefined;
         sha1.final(&digest);
 
