@@ -2795,6 +2795,8 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                         }
 
                         // WebSocket read loop (fiber path)
+                        var messages = WsFramer.MessageReader.init(&framer, server.allocator);
+                        defer messages.deinit();
                         while (server.running.load(.monotonic)) {
                             const read_buf = if (server.ws_buffer_pool) |pool|
                                 pool.acquire() catch break
@@ -2803,19 +2805,12 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                             defer {
                                 if (server.ws_buffer_pool) |pool| pool.release(read_buf) else server.allocator.free(read_buf);
                             }
-                            const frame = framer.readFrame(read_buf) catch break;
-                            switch (frame.opcode) {
-                                0x1, 0x2 => { // Text / Binary (e.g. OpenIM protobuf)
-                                    if (@intFromPtr(ws_route.on_message) != 0) {
-                                        const kind = WsFrameKind.fromOpcode(frame.opcode).?;
-                                        ws_route.on_message(session, frame.payload, kind);
-                                    }
+                            const event = messages.read(read_buf) catch break;
+                            switch (event) {
+                                .message => |m| {
+                                    if (@intFromPtr(ws_route.on_message) != 0) ws_route.on_message(session, m.payload, m.kind);
                                 },
-                                0x8 => break, // Close
-                                0x9 => { // Ping → Pong
-                                    framer.writePong(frame.payload) catch break;
-                                },
-                                else => {},
+                                .close => break,
                             }
                         }
 

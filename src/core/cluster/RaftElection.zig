@@ -371,8 +371,14 @@ pub const RaftElection = struct {
                     (req.last_log_term == last_term and req.last_log_index >= last_idx))
                 {
                     vote_granted = true;
+                    // Allocate **before** freeing the old value. The previous order
+                    // freed first and then `try`-duped, so a failed allocation left
+                    // `voted_for` pointing at freed memory — which the guard two
+                    // lines up (`voted_for == null or eql(...)`) and `deinit` both
+                    // dereference.
+                    const vote_copy = try self.allocator.dupe(u8, req.candidate_id);
                     if (self.voted_for) |v| self.allocator.free(v);
-                    self.voted_for = try self.allocator.dupe(u8, req.candidate_id);
+                    self.voted_for = vote_copy;
                 }
             }
         }
@@ -412,9 +418,13 @@ pub const RaftElection = struct {
         self.last_heartbeat_ms = now_ms;
         self.election_deadline_ms = now_ms + @as(i64, @intCast(self.randomElectionTimeout()));
 
-        // Update leader info
+        // Update leader info. Allocate before freeing — same reason as
+        // `handleVoteRequest`'s `voted_for`: freeing first leaves a dangling
+        // `leader_id` on allocation failure, and `deinit` frees it again (and
+        // `getLeader()` hands it out).
+        const leader_copy = try self.allocator.dupe(u8, req.leader_id);
         if (self.leader_id) |l| self.allocator.free(l);
-        self.leader_id = try self.allocator.dupe(u8, req.leader_id);
+        self.leader_id = leader_copy;
 
         // Reply false if log doesn't contain entry at prev_log_index with matching term (§5.3)
         if (req.prev_log_index > 0) {
@@ -639,9 +649,12 @@ pub const RaftElection = struct {
         self.state = .candidate;
         self.current_term +|= 1;
 
-        // Vote for self
+        // Vote for self. Allocate before freeing: on failure the old order left
+        // `voted_for` dangling, and `tick` retries elections, so the dangling value
+        // would be read on the next round rather than at the point of failure.
+        const vote_copy = try self.allocator.dupe(u8, self.local_id);
         if (self.voted_for) |v| self.allocator.free(v);
-        self.voted_for = try self.allocator.dupe(u8, self.local_id);
+        self.voted_for = vote_copy;
 
         // New term, new tally: votes granted in earlier terms must not count.
         self.votes_received.clearRetainingCapacity();
@@ -675,8 +688,18 @@ pub const RaftElection = struct {
     /// Become leader (we've won the election)
     fn becomeLeader(self: *Self) void {
         self.state = .leader;
-        if (self.leader_id) |l| self.allocator.free(l);
-        self.leader_id = self.allocator.dupe(u8, self.local_id) catch self.local_id;
+        // Allocate before freeing: the old order freed `leader_id` first, so a
+        // failed dupe left it dangling until the `catch` reassigned it.
+        const leader_copy = self.allocator.dupe(u8, self.local_id) catch self.local_id;
+        // Mirror `deinit`'s alias guard. After the `catch` above, `leader_id` **is**
+        // `local_id`, so freeing it unconditionally frees `local_id` — and the next
+        // election's dupe would then copy from freed memory, with `deinit` freeing
+        // it a second time. `deinit` has had this guard (and this comment) all along;
+        // `becomeLeader` did not, which is the same intent implemented twice.
+        if (self.leader_id) |l| {
+            if (l.ptr != self.local_id.ptr) self.allocator.free(l);
+        }
+        self.leader_id = leader_copy;
 
         // Initialize next_index and match_index for all peers
         const last_log_idx: u64 = @intCast(self.log.items.len);
@@ -850,15 +873,25 @@ pub const RaftElection = struct {
         if (self.log.items.len == 0) return;
 
         var target_idx: ?usize = null;
+        var target_term: u64 = 0;
         for (self.log.items, 0..) |entry, i| {
             if (entry.index == up_to_index) {
                 target_idx = i;
-                self.last_included_term = entry.term;
+                target_term = entry.term;
                 break;
             }
         }
 
         const idx = target_idx orelse return error.IndexNotFound;
+
+        // Allocate the snapshot **before touching anything**: this function frees the
+        // compacted entries and shortens the log below, so a failed allocation after
+        // that point used to leave a dangling `snapshot_data` *and* a half-compacted
+        // log. `last_included_term` is held in a local for the same reason — the old
+        // code assigned it during the search, i.e. before an allocation that could
+        // still fail.
+        const snap_copy = try self.allocator.dupe(u8, snapshot_bytes);
+        self.last_included_term = target_term;
 
         // Free entries up to idx
         for (0..idx + 1) |i| {
@@ -874,7 +907,7 @@ pub const RaftElection = struct {
         self.last_included_index = up_to_index;
 
         if (self.snapshot_data) |s| self.allocator.free(s);
-        self.snapshot_data = try self.allocator.dupe(u8, snapshot_bytes);
+        self.snapshot_data = snap_copy;
     }
 
     /// Follower handles InstallSnapshot RPC from leader (§7 Log Compaction).
@@ -892,6 +925,12 @@ pub const RaftElection = struct {
         self.state = .follower;
 
         if (req.last_included_index > self.last_included_index) {
+            // Allocate the snapshot **first**: everything below this line is
+            // destructive (it frees every log entry and clears the log), so the old
+            // order left a dangling `snapshot_data` *and* a wiped log when the dupe
+            // failed — the node came back with no snapshot and no log.
+            const snap_copy = try self.allocator.dupe(u8, req.data);
+
             // Free current log entries
             for (self.log.items) |entry| {
                 self.allocator.free(entry.command);
@@ -902,7 +941,7 @@ pub const RaftElection = struct {
             self.last_included_term = req.last_included_term;
 
             if (self.snapshot_data) |s| self.allocator.free(s);
-            self.snapshot_data = try self.allocator.dupe(u8, req.data);
+            self.snapshot_data = snap_copy;
 
             self.commit_index = @max(self.commit_index, req.last_included_index);
             self.last_applied = @max(self.last_applied, req.last_included_index);
@@ -1424,6 +1463,106 @@ test "an AppendEntries entry with index 0 is refused before the log is touched" 
     // on the way to failing.
     try testing.expectEqual(@as(usize, 1), election.logLen());
     try testing.expectEqualStrings("keep", election.getLogEntry(1).?.command);
+}
+
+// Verified red: restoring the free-then-`try dupe` order in `handleVoteRequest`
+// makes this fail on `deinit` with the testing allocator reporting a **double
+// free**. That is the only shape this defect can take: the stale pointer is never
+// dereferenced on the failure path, so nothing asserts before `deinit` frees the
+// same buffer a second time. The two assertions below pass either way — they are
+// there to document what "intact" means, not to catch it.
+test "a failed voted_for re-allocation leaves the old vote intact" {
+    const TransportImpl = struct {
+        sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
+        sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse,
+    };
+    var transport_impl = TransportImpl{
+        .sendVoteRequest = (struct {
+            fn f(_: ?[]const u8, _: []const u8, _: VoteRequest) void {}
+        }).f,
+        .sendAppendEntries = (struct {
+            fn f(_: ?[]const u8, _: []const u8, _: AppendEntriesRequest) AppendEntriesResponse {
+                return AppendEntriesResponse{ .term = 0, .success = true, .match_index = 0 };
+            }
+        }).f,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
+
+    // Backed by `testing.allocator`, so a double free is reported rather than
+    // silently reusing the block.
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const allocator = failing.allocator();
+
+    var election = try RaftElection.init(allocator, "node1", &.{}, .{}, &transport);
+    defer election.deinit();
+
+    // 1. Grant a vote, so `voted_for` owns a buffer.
+    const granted = try election.handleVoteRequest(.{
+        .term = 1,
+        .candidate_id = "c1",
+        .last_log_index = 0,
+        .last_log_term = 0,
+    });
+    try testing.expect(granted.vote_granted);
+    try testing.expectEqualStrings("c1", election.voted_for.?);
+
+    // 2. Repeat the *same* candidate: the grant path re-dupes (it replaces the vote
+    //    when the incumbent is the same candidate), so this reaches the dupe.
+    failing.fail_index = failing.alloc_index; // the next allocation fails
+    try testing.expectError(error.OutOfMemory, election.handleVoteRequest(.{
+        .term = 1,
+        .candidate_id = "c1",
+        .last_log_index = 0,
+        .last_log_term = 0,
+    }));
+    try testing.expect(failing.has_induced_failure);
+
+    // 3. The still-owned vote is what `deinit` frees — once.
+    try testing.expectEqualStrings("c1", election.voted_for.?);
+}
+
+// Verified red: removing `becomeLeader`'s alias guard (the `l.ptr !=
+// self.local_id.ptr` test, which `deinit` has had all along) makes this fail with a
+// **double free** at `deinit`. A `panic`, not an assertion — the second
+// `becomeLeader` frees `local_id` through the alias, dupes from the freed buffer,
+// and `deinit` then frees `local_id` again.
+test "a leader_id aliased onto local_id is not freed on the next election win" {
+    const TransportImpl = struct {
+        sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
+        sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse,
+    };
+    var transport_impl = TransportImpl{
+        .sendVoteRequest = (struct {
+            fn f(_: ?[]const u8, _: []const u8, _: VoteRequest) void {}
+        }).f,
+        .sendAppendEntries = (struct {
+            fn f(_: ?[]const u8, _: []const u8, _: AppendEntriesRequest) AppendEntriesResponse {
+                return AppendEntriesResponse{ .term = 0, .success = true, .match_index = 0 };
+            }
+        }).f,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
+
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const allocator = failing.allocator();
+
+    var election = try RaftElection.init(allocator, "node1", &.{}, .{}, &transport);
+    defer election.deinit();
+
+    // 1. First win with the allocation failing: `becomeLeader` falls back to
+    //    `local_id`, so the two now alias.
+    failing.fail_index = failing.alloc_index;
+    election.becomeLeader();
+    try testing.expect(failing.has_induced_failure);
+    try testing.expectEqual(election.local_id.ptr, election.leader_id.?.ptr);
+
+    // 2. Win again with a working allocator. Pre-fix this freed `local_id` through
+    //    the alias and then copied from the freed buffer.
+    failing.fail_index = std.math.maxInt(usize);
+    election.becomeLeader();
+    try testing.expect(election.leader_id.?.ptr != election.local_id.ptr);
+    try testing.expectEqualStrings("node1", election.leader_id.?);
+    try testing.expectEqualStrings("node1", election.getLeader().?);
 }
 
 test "RaftElection vote request validation" {

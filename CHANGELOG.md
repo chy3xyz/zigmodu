@@ -2,6 +2,90 @@
 
 ## [Unreleased]
 
+### P1 剩余五项：WS 帧协议、连接池耗尽、Raft 的 5 处 free-then-dupe 与别名守卫（**破坏性：否**，但 WS 一则改变行为）
+
+评估里 P1 剩下的五项，按文件分三组。
+
+**① WebSocket 帧处理（`src/im/WsFramer.zig` + `src/api/Server.zig`）—— 这条的用户可见度最高。**
+
+`readFrame` 把 `header[0]` 的 FIN(0x80) 与 RSV1-3(0x70) 一起掩掉、从不检查，而 Server 的
+`switch (frame.opcode)` **完全不看 FIN**。后果是：一个**分片**消息的**第一个**分片被当成完整消息交给
+`on_message`，随后每个 continuation 帧（opcode `0x0`）落进 `else => {}` **被静默丢弃**，连接还开着 ——
+**标准客户端的大消息因此静默截断**：没有错误、没有 close，只有短了一截的数据。
+
+现在：
+
+- `readFrame` 按 RFC 校验并**拒绝**：RSV 非 0 → `ReservedBitsSet`；未掩码的客户端帧 →
+  `UnmaskedClientFrame`（§5.1 要求服务端关闭）；opcode 不在 `{0,1,2,8,9,A}` → `UnknownOpcode`；
+  控制帧 > 125 字节 → `ControlFrameTooLarge`、FIN=0 → `FragmentedControlFrame`。
+  掩码位既然成为必需，掩码键改为**无条件**读取、解掩码也无条件。
+- 新增 `WsFramer.MessageReader`：**重组分片**并顺带服务穿插的控制帧（ping 回 pong、close → `.close`），
+  所以调用方**永远拿不到半条消息**。单帧消息零拷贝（仍指向调用方的缓冲），只有真的分片才用
+  堆上的 `frag`；上限 `max_message_bytes = 1 MiB`（与 `NetworkTransport.MAX_MESSAGE_SIZE` 同值）。
+  协议错误先发一个 close 帧再返回错误，而不是留一个裸 TCP 重置。
+- `WsFramer` **没有变大**：它是每个连接在 `Server.zig:2770` 建的**栈上局部量**（本就带 8 KiB 内联
+  `read_buf`），所以重组缓冲放在 `MessageReader` 里而不是内联。
+
+> **行为变化，值得知道**：不按规范发掩码帧的客户端现在会被断开（以前被静默接受）；
+> 超过 4096 字节的**单帧**仍然是 `PayloadTooLarge`（WS 读缓冲是 4 KiB），但连接现在收到 close 帧而不是静默掉线。
+> 不做的事：**`src/im/ws_uring.zig` 有同一套缺陷且未被修**（它只在 `server.ws_uring` 打开时走，Linux-only），
+> 也**没有**做 UTF-8 校验（§8.1 要求 text 帧必须是合法 UTF-8）。
+
+**② `ConnectionRegistry` 的另一半（`src/im/ConnectionRegistry.zig`）**
+
+- **池耗尽**：`unregisterByConn` 与 `tickAndCleanup` 用 `allocator.destroy` 而不是 `releaseEntry`，
+  而池**没有补充路径**（`free_list` 只由 `initCapacity` 与 `releaseEntry` 写）。所以一个分片经历
+  `capacity` 次连接/断开后就再也建不起连接 —— 而且 `register` 返回的那个 0 被所有调用方读成"注册失败"。
+  生成物用的正是 `unregisterByConn` 这条路。现在两处都回收。
+- **`putAssumeCapacity` 越界写**：它建立在一个**不成立的前提**上 —— `initCapacity` 的
+  `ensureTotalCapacity` 失败时**只记一条日志**（池的 `create` 循环还是 `catch break`），
+  所以分片可能带着**没扩容**的 map 回来，而 `putAssumeCapacity` 对这样的 map 会写到分配之外。
+  改为可失败的 `put` 并回滚，于是"0 = 什么都没注册"这条契约真正成立；
+  `by_conn` 放在 `by_user` **之前**插入（它是会触发扩容的那次调用），这样一次失败的注册
+  不会顺手把用户**在线的**连接也弄丢。顺带把替换旧连接的 `getPtr` 改成 `fetchRemove` ——
+  后者会**把键摘掉**，只 `releaseEntry` 不摘键会让 `by_user` 指向一个已经回到空闲链表的结构，
+  而那个结构可能被下一次 `acquireEntry` 交给**另一个用户**，`sendToUser` 就投错人。
+
+**③ Raft（`src/core/cluster/RaftElection.zig`）**
+
+- **free 后 `try dupe` 共 5 处**（不是审计说的 3 处）：`handleVoteRequest` 的 `voted_for`、
+  `handleAppendEntries` 的 `leader_id`、`startElection` 的 `voted_for`、`compactLog` 与
+  `handleInstallSnapshot` 的 `snapshot_data`。原顺序是**先 free 再 try dupe**，分配失败就把字段
+  留在已释放的内存上，而 `deinit` 会**再 free 一次**。现在一律**先分配成功、再释放旧值**。
+  后两处还往前挪了一步：`compactLog` 会先扔掉被压缩的日志条目、`handleInstallSnapshot` 会
+  **清空整个日志**，所以分配必须在任何破坏性改动之前 —— 否则失败留下的是"悬垂的 `snapshot_data`
+  **加上**一个已被清空的日志"。
+  （`handleVoteRequest` 里 `free` 后接 `= null` 的那处是安全的，没动。）
+- **`becomeLeader` 缺别名守卫**：`deinit` 一直有 `l.ptr != self.local_id.ptr` 这道守卫（连注释都在），
+  `becomeLeader` 没有。`dupe` 失败时它让 `leader_id` **别名** `local_id`，于是下一次当选会
+  `free(local_id)`、再从已释放的缓冲 dupe，"同一个意图实现两次、只在一处加了守卫"。
+
+**验证**：全量 **1478/1499（21 skipped，0 failed）**（比上一版 +14：ConnectionRegistry +3、
+RaftElection +2、WsFramer +9），`zig fmt --check` + 6 道门禁全绿。**6 条变异逐条自己重做过、全是断言/panic 红**：
+
+| 改动 | 变异 | 红的样子 |
+|---|---|---|
+| WS 分片 | 忽略 FIN（变回修复前的形状） | `expected: Hello` / `found: Hel`，`FAIL (TestExpectedEqual)` —— **就是那个静默截断** |
+| WS 未掩码 | 去掉掩码检查（并恢复条件式掩码键读取） | `expected error.UnmaskedClientFrame, found .{ .message = … payload = {104,105} }` |
+| 池回收 | `releaseEntry` → `allocator.destroy` | `round 1: shard 0 pool exhausted after 0 users` → `TestUnexpectedResult`（**一轮**就耗尽，比我预计的还糟） |
+| 陈旧清扫 | 同上（`tickAndCleanup`） | 同形，且只让清扫那条红（两条用例各自独立） |
+| Raft `voted_for` | 恢复 free-then-dupe | `panic: double free of [addr: …, len: 2 (0x2)]`（len 2 = `"c1"`） |
+| Raft 别名 | 去掉 `becomeLeader` 的守卫 | `panic: double free of [addr: …, len: 5 (0x5)]`（len 5 = `"node1"`） |
+
+> 写这条时被门禁抓了一次：`check-production` 拒绝了 `writeClose() catch {}`（热路径禁裸 `catch {}`），
+> 已改成带日志的 `closeForProtocolError()` 辅助函数。门禁起作用了。
+
+**未做 / 未验证**：
+- **`putAssumeCapacity` → `put` 这一条没有行为红**。要构造"`ensureTotalCapacity` 失败而池分配成功"
+  需要让**同一次 `initCapacity`** 里 map 扩容失败、`create` 循环成功，而它俩共用一个 allocator，
+  `FailingAllocator` 只能按调用序号失败、无法按调用点区分 —— 所以这条的依据是**代码级论证**
+  （那句"infallible"的注释本身就不成立），不是用例。**不谎称有证据。**
+- 同上：`register` 的 `by_conn` 先于 `by_user` 的顺序改动也没有独立红；替换路径那条用例是
+  **回归钉子**，修复前的代码也能过（原因写在它的注释里）。
+- WS 的 `ws_uring.zig` 路径、UTF-8 校验、>4 KiB 单帧仍不支持（见 ① 的说明）。
+- WS 那 3 条核心用例之外我没逐个复跑（`fragmented` / `unmasked` 由我亲自变异复核，
+  其余 7 条由实现的子代理跑过并报绿）。
+
 ### `ConnectionRegistry` 的连接 id 0 与失败哨兵撞车 → 释放后使用（**破坏性：否**）
 
 连接 id 是 `(分片 << 26) | 计数器`，所以**分片 0 的 id 窗口从 0 开始** —— 而

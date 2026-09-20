@@ -229,12 +229,6 @@ const Shard = struct {
         self.mutex.lock(self.io) catch return 0;
         defer self.mutex.unlock(self.io);
 
-        // Replace old connection, recycle entry to free list
-        if (self.by_user.getPtr(user_id)) |existing| {
-            _ = self.by_conn.remove(existing.*.conn_id);
-            self.releaseEntry(existing.*);
-        }
-
         // Acquire from object pool (infallible at capacity)
         const entry = self.acquireEntry() orelse return 0;
         const conn_id = self.nextId();
@@ -248,9 +242,37 @@ const Shard = struct {
             .next_free = null,
         };
 
-        // Infallible: capacity pre-allocated via ensureTotalCapacity in initCapacity
-        self.by_user.putAssumeCapacity(user_id, entry);
-        self.by_conn.putAssumeCapacity(conn_id, entry);
+        // **Fallible on purpose.** The `putAssumeCapacity` this replaces rested on
+        // "capacity pre-allocated in initCapacity", and that premise does not hold:
+        // `initCapacity` only *logs* a failed `ensureTotalCapacity` (and its pool
+        // loop `catch break`s), so a shard can come back with maps that never grew —
+        // and `putAssumeCapacity` against such a map writes past its allocation.
+        // `by_conn` first, because it is the insert that can grow a map: if it fails,
+        // the incumbent connection is still intact. Doing it after the swap below
+        // meant a failed registration also dropped the user's live connection.
+        self.by_conn.put(conn_id, entry) catch {
+            self.releaseEntry(entry);
+            return 0;
+        };
+
+        // Now retire the incumbent. `fetchRemove` takes the key out of `by_user` as
+        // well as handing back the entry, and that matters: releasing an entry while
+        // leaving its key in place points `by_user` at a struct that is back on the
+        // free list — one the next `acquireEntry` may hand to a **different** user,
+        // after which `sendToUser` delivers to the wrong session.
+        if (self.by_user.fetchRemove(user_id)) |old| {
+            _ = self.by_conn.remove(old.value.conn_id);
+            self.releaseEntry(old.value);
+        }
+
+        // Re-inserting a key that was just removed cannot need to grow (the map fit
+        // it a moment ago), so this failing means the allocator is already gone —
+        // roll back and leave nothing half-registered.
+        self.by_user.put(user_id, entry) catch {
+            _ = self.by_conn.remove(conn_id);
+            self.releaseEntry(entry);
+            return 0;
+        };
         return conn_id;
     }
 
@@ -267,13 +289,21 @@ const Shard = struct {
     }
 
     fn unregisterByConn(self: *SelfShard, allocator: std.mem.Allocator, conn_id: u32) bool {
+        _ = allocator;
         self.mutex.lock(self.io) catch return false;
         defer self.mutex.unlock(self.io);
 
         if (self.by_conn.fetchRemove(conn_id)) |kv| {
             _ = self.by_user.remove(kv.value.user_id);
-            kv.value.is_connected = false;
-            allocator.destroy(kv.value);
+            // Recycle, do **not** destroy. The pool is finite and has no refill
+            // path (`free_list` is written only by `initCapacity` and
+            // `releaseEntry`), so destroying here shrank it for good: after
+            // `capacity` connect/disconnect cycles on one shard, `acquireEntry`
+            // returns null, `register` returns 0, and every caller reads that as
+            // "registration failed" — that shard could never take another
+            // connection for the life of the process. This is the disconnect path
+            // the generated gateway actually uses.
+            self.releaseEntry(kv.value);
             return true;
         }
         return false;
@@ -311,6 +341,7 @@ const Shard = struct {
     }
 
     fn tickAndCleanup(self: *SelfShard, allocator: std.mem.Allocator, max_gap: u64) usize {
+        _ = allocator;
         self.mutex.lock(self.io) catch return 0;
         defer self.mutex.unlock(self.io);
 
@@ -333,7 +364,9 @@ const Shard = struct {
         for (dead[0..dead_len]) |uid| {
             if (self.by_user.fetchRemove(uid)) |kv| {
                 _ = self.by_conn.remove(kv.value.conn_id);
-                allocator.destroy(kv.value);
+                // Recycle, not destroy — same pool as `unregisterByConn`, so the
+                // same exhaustion applies to the stale-connection sweep.
+                self.releaseEntry(kv.value);
                 count += 1;
             }
         }
@@ -462,6 +495,90 @@ test "sharded unregisterByConn" {
     reg.unregisterByConn(cid);
     try std.testing.expect(!reg.isOnline(42));
     try std.testing.expectEqual(@as(usize, 0), reg.onlineCount());
+}
+
+// Verified red: reverting `unregisterByConn`'s `releaseEntry` to
+// `allocator.destroy` makes this fail on the second round with
+// `expected non-zero, found 0` — the shard's pool never refills, so after
+// `capacity` disconnects `register` reports failure forever and every caller
+// reads that as "this user could not connect". The `capacity = 4` here is what
+// makes it observable in four cycles instead of 1024.
+test "disconnects return their slot to the pool instead of shrinking it" {
+    const allocator = std.testing.allocator;
+    var reg = ConnectionRegistry.initCapacity(allocator, std.testing.io, 4);
+    defer reg.deinit();
+
+    var dummy: u8 = 0;
+    // All four hash to shard 0, i.e. the same per-shard pool of 4.
+    const users = [_]u64{ 0, 64, 128, 192 };
+
+    // Three full connect/disconnect rounds. The pre-fix code survives exactly one:
+    // each `unregisterByConn` destroyed a slot, so round 2 had none left.
+    for (0..3) |round| {
+        var ids: [users.len]u32 = undefined;
+        for (users, 0..) |uid, i| {
+            ids[i] = reg.register(uid, @ptrCast(&dummy), testSendFn);
+            if (ids[i] == 0) {
+                std.debug.print("round {d}: shard 0 pool exhausted after {d} users\n", .{ round, i });
+            }
+            try std.testing.expect(ids[i] != 0);
+        }
+        try std.testing.expectEqual(users.len, reg.onlineCount());
+
+        for (ids) |id| reg.unregisterByConn(id);
+        try std.testing.expectEqual(@as(usize, 0), reg.onlineCount());
+    }
+}
+
+// The stale-connection sweep takes the same path, so it has to recycle too.
+// Verified red the same way (restore `allocator.destroy` in `tickAndCleanup`).
+test "the stale sweep also returns slots to the pool" {
+    const allocator = std.testing.allocator;
+    var reg = ConnectionRegistry.initCapacity(allocator, std.testing.io, 4);
+    defer reg.deinit();
+
+    var dummy: u8 = 0;
+    const users = [_]u64{ 0, 64, 128, 192 };
+
+    for (0..3) |round| {
+        for (users) |uid| {
+            const id = reg.register(uid, @ptrCast(&dummy), testSendFn);
+            if (id == 0) std.debug.print("round {d}: shard 0 pool exhausted\n", .{round});
+            try std.testing.expect(id != 0);
+        }
+        // No heartbeat: every entry is past `max_gap`, so the sweep reaps them all.
+        try std.testing.expectEqual(users.len, reg.tickAndCleanup(0));
+        try std.testing.expectEqual(@as(usize, 0), reg.onlineCount());
+    }
+}
+
+// No mutation red for this one: the pre-fix code also passed it (as analysed in the
+// `register` comment, the old `getPtr` + `releaseEntry` pair happened to work only
+// because `acquireEntry` was guaranteed to hand back the entry that had just been
+// released). It is a pin on the replace path, not a reproduction. The `by_conn`
+// ordering, however, does have teeth — see the exhaustion tests above.
+test "re-registering a user replaces the connection and delivers to the new one" {
+    const allocator = std.testing.allocator;
+    var reg = ConnectionRegistry.init(allocator, std.testing.io);
+    defer reg.deinit();
+
+    var first_delivered: usize = 0;
+    var second_delivered: usize = 0;
+
+    const first = reg.register(0, @ptrCast(&first_delivered), countingSendFn);
+    try std.testing.expect(first != 0);
+    const second = reg.register(0, @ptrCast(&second_delivered), countingSendFn);
+    try std.testing.expect(second != 0);
+    try std.testing.expect(first != second);
+
+    // One user, one entry — the replaced one went back to the pool rather than
+    // lingering in `by_user`.
+    try std.testing.expectEqual(@as(usize, 1), reg.onlineCount());
+
+    // And delivery follows the *new* session, not the replaced one.
+    try std.testing.expect(reg.sendToUser(0, "hi"));
+    try std.testing.expectEqual(@as(usize, 0), first_delivered);
+    try std.testing.expectEqual(@as(usize, 1), second_delivered);
 }
 
 fn testSendFn(ctx: *anyopaque, msg: []const u8) anyerror!void {
