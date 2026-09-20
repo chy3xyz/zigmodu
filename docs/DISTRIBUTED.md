@@ -128,16 +128,38 @@ defer allocator.free(json);               // 挂到 /cluster/health 或 metrics 
 - 仍要你自己决定的：**peer id 与地址的对应关系**。`BootstrapConfig.peers` 只有 `host:port`，
   raft 侧 peer id 记的是 host（`addPeer(p.host)`），所以同主机多节点要区分开就得给每个节点不同的
   `port` 并在 `node_id` 上用稳定、可辨识的 id（投票应答的回推按 `candidate_id` 查地址簿）。
-- **两个线程碰的同一个 `RaftElection`，由门面串起来**：`tick()` 在**你的线程**上跑 `raft.tick()`，
-  而入站分发在 `start()` 起的 accept 线程上跑 `raft.handleVoteRequest` / `handleAppendEntries` ——
-  两边都会 free/dupe `voted_for`、推 `log`、改 `next_index`/`match_index`，而 `RaftElection`
-  自己不带锁。所以 `ClusterBootstrap` 持一把 `raft_lock`（`RaftTransport.RaftLock`，原子自旋，
-  与 `scheduler.zig` 协调池线程同口径）：`tick()` 的 raft 步骤、入站分发的
-  decode→dispatch→encode 段各持一次，**socket 读 / 回包 / 回推不在锁内**（对端 connect 超时不该
-  卡住 `tick()`）。不给 `.transport` 的节点没有 accept 线程，锁是零成本的一条取指。
+- **两个线程碰的同一个 `RaftElection`，由 raft 自己串起来**：`tick()` 在**你的线程**上跑
+  `raft.tick()`，而入站分发在 `start()` 起的 accept 线程上跑 `raft.handleVoteRequest` /
+  `handleAppendEntries` —— 两边都会 free/dupe `voted_for`、推 `log`、改 `next_index`/`match_index`。
+  所以这把锁**在 `RaftElection` 自己身上**（`RaftElection.RaftLock`，原子自旋，与 `scheduler.zig`
+  协调池线程同口径）：每个碰共享状态的公开入口（`tick` / `handleVoteRequest` / `handleAppendEntries` /
+  `handleVoteResponse` / `handleInstallSnapshot` / `appendEntry` / `addPeer` / `compactLog` 以及状态
+  访问器）自己取放一次，私有的步骤函数（`startElection` / `sendHeartbeats` / `becomeLeader` / …）
+  假设锁已在手。**门面不再持锁**（`ClusterBootstrap.raft_lock` 已删）：`ClusterBootstrap` 直接驱动、
+  `RaftTransport.InboundServer` 单独用、或应用自己调 `raft.tick()` / 在其它线程读它，都被同一把锁串起来，
+  不再取决于调用方记得住哪两处不能重叠。
+  锁的窗口是入站那一帧的 **decode → dispatch → encode** 里那次 `handle*`（dispatch 本身即窗口）；
+  decode/encode 只碰 arena 缓冲与 init 之后再不改的 `local_id`，而 **socket 读 / 回包 / 回推仍在锁外**
+  （对端 connect 超时不该卡住 `tick()`）。不给 `.transport` 的节点没有 accept 线程，锁是零成本的一条取指。
   不这么做的实际症状是**进程级 ABRT**（`voted_for` 的 read-then-free 交错 →
   `double free of [addr: …]`，两边都是 `RaftElection.zig` 的 `handleVoteRequest` / `startElection`），
   另一种交错顺序只是漏掉那一小段（`SafeAllocator` 报 leaked）—— 两种都在 12 次里各撞到过。
+- **`getRaft()` 的契约**（裸指针，锁保护不了它，所以不装锁、只写清楚）：一个 `RaftElection` 只允许一个
+  **驱动线程**；`tick()` / `handle*` 各自持锁，但调用方若从别的线程去驱动它，就得自己同步（要么仍由同一个
+  线程驱动，要么把整段要原子化的序列包在 `raft.lock` 里）。访问器是**单次读**而不是事务：要多个值一致，
+  得自己安排；`getLogEntry().command`、`getLeader()` 返回的是借来的切片，下一次调用后就可能失效。
+  `stop()` 会销毁它，之后指针不可再用；`deinit()` 不同步。契约写在
+  `ClusterBootstrap.getRaft()` 的 doc 上，同一条也写在 `RaftElection.deinit` / `getLogEntry` /
+  `getLeader` 的 doc 上。
+- **仓库内回归测试**（进 `zig build test`，实测 2000 轮 = **230 ms**）：
+  `RaftElection: a tick and an inbound RPC cannot both free voted_for`
+  （`src/core/cluster/RaftElection.zig` 末尾）。两个线程 + 显式 barrier 复刻文档接线（一个线程 `tick()`，
+  一个线程 `handleVoteRequest` / `handleAppendEntries`），并用一层 allocator 包装（`WindowGate`）把
+  `voted_for` 的 read-then-free 窗口变成**会合点**：第一个 free 会把窗口按住，直到第二个线程也到达同一个
+  free —— 也就是"两个线程真的同时在这个窗口里"，这正是锁要禁止的状态。不带锁的构建 → 第一轮就确定性
+  ABRT（`double free of [addr: …, len: 6]`，`alloc:` 在 `handleVoteRequest`、`first free:` 在
+  `startElection`，3 次独立运行都红）；带锁构建 → 会合点由"窗口的持有者确实握着锁"这一**状态**直接解开
+  （没有 sleep、没有超时、不撞概率，所以不引入新的 flaky）。
 
 ## Production Deployment Checklist
 

@@ -12,6 +12,47 @@
 const std = @import("std");
 const Time = @import("../Time.zig");
 
+/// Spin lock guarding a `RaftElection`'s state.
+///
+/// The algorithm's entry points are driven from two threads in the documented
+/// wiring (`docs/DISTRIBUTED.md`): the app's tick loop calls `tick()`, while the
+/// node's accept thread dispatches peers' RPCs into `handleVoteRequest` /
+/// `handleAppendEntries` / … Both streams free-then-restore `voted_for` and
+/// `leader_id`, push into and truncate `log`, and rewrite `next_index` /
+/// `match_index` — so every public entry point that touches that state takes
+/// this lock for its whole body, instead of leaving it to the caller to
+/// remember which pairs of calls must not overlap. The interleave it exists to
+/// stop is a process ABRT: `double free of [addr: …, len: 9]` out of
+/// `handleVoteRequest` racing `startElection`.
+///
+/// A spin lock rather than `std.Io.Mutex`: what is guarded is a handful of
+/// in-memory field updates on a state machine that ticks at heartbeat rates,
+/// and the inbound accept thread is an OS thread spawned outside the `io`'s own
+/// pool — the same reason `scheduler.zig` coordinates its pool threads with
+/// atomics.
+///
+/// Deliberately **not** covered: `deinit` (terminal, see its doc), and
+/// `clusterSize` / `quorumSize` / `hasQuorum`, which read only the membership
+/// and are called from *inside* the locked bodies.
+pub const RaftLock = struct {
+    flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    pub fn acquire(self: *RaftLock) void {
+        while (self.flag.swap(true, .acquire)) std.atomic.spinLoopHint();
+    }
+
+    pub fn release(self: *RaftLock) void {
+        self.flag.store(false, .release);
+    }
+
+    /// True while some thread is inside a locked entry point. Lock-free, and
+    /// read by this file's own regression test to tell "the lock serialized the
+    /// two windows" from "the two windows really did overlap".
+    pub fn isHeld(self: *const RaftLock) bool {
+        return self.flag.load(.acquire);
+    }
+};
+
 /// Configuration for Raft
 pub const ElectionConfig = struct {
     /// Minimum election timeout (ms)
@@ -104,6 +145,13 @@ pub const RaftElection = struct {
     allocator: std.mem.Allocator,
     config: ElectionConfig,
 
+    /// Serializes every entry point that touches the fields below — see
+    /// `RaftLock` for why this lives here rather than in the caller. Held for
+    /// the body of `tick` / `handle*` / `appendEntry` / `addPeer` /
+    /// `compactLog` and by the state accessors; the private helpers they call
+    /// (`startElection`, `sendHeartbeats`, …) assume it is already held.
+    lock: RaftLock = .{},
+
     // Persistent state (would be persisted to disk in full Raft)
     current_term: u64 = 0,
     voted_for: ?[]const u8 = null,
@@ -178,7 +226,13 @@ pub const RaftElection = struct {
         };
     }
 
-    /// Release all resources
+    /// Release all resources.
+    ///
+    /// Terminal, and therefore not locked: the caller must already have stopped
+    /// every other user of this raft (`ClusterBootstrap.stop()` joins the
+    /// inbound thread before it gets here). Taking the lock would not make that
+    /// true — it would only hide it, because the lock's own memory is what
+    /// `self.* = undefined` poisons.
     pub fn deinit(self: *Self) void {
         // Free log entries (each owns its command string)
         for (self.log.items) |entry| {
@@ -209,8 +263,17 @@ pub const RaftElection = struct {
         self.* = undefined;
     }
 
-    /// Main tick function - called periodically
+    /// Main tick function - called periodically.
+    ///
+    /// Holds `lock` for the whole step: this is one of the two entry points
+    /// into the shared state (the other is the inbound RPC dispatch), and both
+    /// branches reach a read-then-free of an owned string — `voted_for` via
+    /// `startElection`, `leader_id` via `sendHeartbeats` — with no safe point
+    /// in between.
     pub fn tick(self: *Self) !void {
+        self.lock.acquire();
+        defer self.lock.release();
+
         const now_ms = Time.monotonicNowMilliseconds();
 
         switch (self.state) {
@@ -230,7 +293,14 @@ pub const RaftElection = struct {
     }
 
     /// Leader appends a command to the log, returns the log index.
+    ///
+    /// Holds `lock`: the append and the commit-index advance it triggers are one
+    /// state transition, and `log` is what the inbound `handleAppendEntries` /
+    /// `handleInstallSnapshot` truncate and clear.
     pub fn appendEntry(self: *Self, command: []const u8) !u64 {
+        self.lock.acquire();
+        defer self.lock.release();
+
         if (self.state != .leader) return error.NotLeader;
 
         const cmd_copy = try self.allocator.dupe(u8, command);
@@ -251,7 +321,15 @@ pub const RaftElection = struct {
     }
 
     /// Handle incoming vote request from a candidate.
+    ///
+    /// Holds `lock`: the body frees `voted_for` twice over (the higher-term
+    /// reset and the granted vote) and dupe-replaces it between them — this is
+    /// the read-then-free window whose interleave with `startElection` was a
+    /// `double free of [addr: …]`.
     pub fn handleVoteRequest(self: *Self, req: VoteRequest) !VoteResponse {
+        self.lock.acquire();
+        defer self.lock.release();
+
         if (req.term > self.current_term) {
             self.current_term = req.term;
             self.state = .follower;
@@ -284,7 +362,14 @@ pub const RaftElection = struct {
     }
 
     /// Follower handles incoming AppendEntries RPC from leader.
+    ///
+    /// Holds `lock`: the free-then-dupe of `leader_id`, the `truncateLog` /
+    /// `log.append` sequence, and the commit-index advance all mutate state the
+    /// ticker and the other RPC handlers read.
     pub fn handleAppendEntries(self: *Self, req: AppendEntriesRequest) !AppendEntriesResponse {
+        self.lock.acquire();
+        defer self.lock.release();
+
         // Reply false if term < current_term (§5.1)
         if (req.term < self.current_term) {
             return AppendEntriesResponse{
@@ -364,6 +449,15 @@ pub const RaftElection = struct {
             .match_index = @intCast(self.log.items.len),
         };
     }
+
+    // ── Private helpers ─────────────────────────────────────────────────────
+    //
+    // Everything from here down (`sendAppendEntries`, `advanceCommitIndex`,
+    // `truncateLog`, `startElection`, `becomeLeader`, `sendHeartbeats`,
+    // `randomElectionTimeout`) is reachable only from the locked entry points
+    // above and assumes `lock` is already held: they are steps *within* one
+    // state transition, so taking it here would self-deadlock the spin lock
+    // rather than add a safety margin.
 
     /// Leader sends AppendEntries to all peers with new log entries.
     fn sendAppendEntries(self: *Self) !void {
@@ -562,7 +656,14 @@ pub const RaftElection = struct {
     /// tally reaches `quorumSize()` (the same peer-vote convention
     /// `hasQuorum(votes_received)` documents). A cluster of one never gets here
     /// — `startElection` elects it on the self-vote alone.
+    ///
+    /// Holds `lock`: a tally that reaches quorum promotes the node mid-call
+    /// (`becomeLeader` frees `leader_id` and resets the per-peer maps), and the
+    /// term check it starts with is the same field the ticker writes.
     pub fn handleVoteResponse(self: *Self, resp: VoteResponse, from_peer: []const u8) !void {
+        self.lock.acquire();
+        defer self.lock.release();
+
         if (resp.term > self.current_term) {
             self.current_term = resp.term;
             self.state = .follower;
@@ -607,39 +708,71 @@ pub const RaftElection = struct {
         return self.config.election_timeout_min_ms + rng.random().int(u64) % range;
     }
 
+    // ── State accessors ─────────────────────────────────────────────────────
+    //
+    // These take `lock` too, and take `self` by pointer: a reader on the inbound
+    // thread (or a request handler) must see a whole value rather than one a
+    // writer is midway through. Each call is a single read, not a transaction —
+    // a caller that needs several values to agree still has to arrange that
+    // itself (the lock is not re-entrant, so it cannot hold it across two of
+    // these).
+
     /// Check if this node is the leader
-    pub fn isLeader(self: Self) bool {
+    pub fn isLeader(self: *Self) bool {
+        self.lock.acquire();
+        defer self.lock.release();
         return self.state == .leader;
     }
 
-    /// Get current leader ID
-    pub fn getLeader(self: Self) ?[]const u8 {
+    /// Get current leader ID.
+    ///
+    /// The returned slice is owned by this raft and replaced by the next
+    /// election / AppendEntries, so the lock covers the read, not the borrow:
+    /// use it before the next call into this raft, like `getLogEntry`'s command.
+    pub fn getLeader(self: *Self) ?[]const u8 {
+        self.lock.acquire();
+        defer self.lock.release();
         return self.leader_id;
     }
 
     /// Get current term
-    pub fn getTerm(self: Self) u64 {
+    pub fn getTerm(self: *Self) u64 {
+        self.lock.acquire();
+        defer self.lock.release();
         return self.current_term;
     }
 
     /// Get the replicated log length
-    pub fn logLen(self: Self) usize {
+    pub fn logLen(self: *Self) usize {
+        self.lock.acquire();
+        defer self.lock.release();
         return self.log.items.len;
     }
 
     /// Get the commit index
-    pub fn getCommitIndex(self: Self) u64 {
+    pub fn getCommitIndex(self: *Self) u64 {
+        self.lock.acquire();
+        defer self.lock.release();
         return self.commit_index;
     }
 
     /// Get log entry at the given 1-based index, or null if out of range.
-    pub fn getLogEntry(self: Self, index: u64) ?LogEntry {
+    ///
+    /// The lock makes the lookup whole, but the returned entry's `command`
+    /// borrows the log: it is valid only until the next call into this raft.
+    pub fn getLogEntry(self: *Self, index: u64) ?LogEntry {
+        self.lock.acquire();
+        defer self.lock.release();
         if (index == 0 or index > self.log.items.len) return null;
         return self.log.items[index - 1];
     }
 
-    /// Add a peer to the cluster dynamically.
+    /// Add a peer to the cluster dynamically. Holds `lock`: `peers` is what
+    /// `clusterSize` / `quorumSize` count while elections are running.
     pub fn addPeer(self: *Self, id: []const u8) !void {
+        self.lock.acquire();
+        defer self.lock.release();
+
         const id_copy = try self.allocator.dupe(u8, id);
         errdefer self.allocator.free(id_copy);
         try self.peers.append(self.allocator, .{ .id = id_copy, .address = "" });
@@ -647,7 +780,13 @@ pub const RaftElection = struct {
 
     /// Get current state
     /// Log compaction: Discard entries up to `up_to_index` and retain `snapshot_data`.
+    ///
+    /// Holds `lock`: it frees the entries it discards and compacts `log` under
+    /// the readers of both.
     pub fn compactLog(self: *Self, up_to_index: u64, snapshot_bytes: []const u8) !void {
+        self.lock.acquire();
+        defer self.lock.release();
+
         if (up_to_index <= self.last_included_index) return;
         if (self.log.items.len == 0) return;
 
@@ -681,6 +820,9 @@ pub const RaftElection = struct {
 
     /// Follower handles InstallSnapshot RPC from leader (§7 Log Compaction).
     pub fn handleInstallSnapshot(self: *Self, req: InstallSnapshotRequest) !InstallSnapshotResponse {
+        self.lock.acquire();
+        defer self.lock.release();
+
         if (req.term < self.current_term) {
             return InstallSnapshotResponse{ .term = self.current_term };
         }
@@ -710,16 +852,23 @@ pub const RaftElection = struct {
         return InstallSnapshotResponse{ .term = self.current_term };
     }
 
-    pub fn getState(self: Self) RaftState {
+    pub fn getState(self: *Self) RaftState {
+        self.lock.acquire();
+        defer self.lock.release();
         return self.state;
     }
 
     /// Total cluster size (self + peers).
+    ///
+    /// Lock-free on purpose: it reads only the membership, which `addPeer`
+    /// grows before elections start, and the locked bodies call it themselves
+    /// (`startElection`, `handleVoteResponse`) — a lock here would be a
+    /// self-deadlock, not a safety margin.
     pub fn clusterSize(self: *const Self) usize {
         return 1 + self.peers.items.len;
     }
 
-    /// Quorum = floor(N/2) + 1
+    /// Quorum = floor(N/2) + 1 — lock-free, see `clusterSize`.
     pub fn quorumSize(self: *const Self) usize {
         return (self.clusterSize() / 2) + 1;
     }
@@ -730,7 +879,7 @@ pub const RaftElection = struct {
     /// vote is not part of the tally, so a multi-node candidate needs
     /// `quorumSize()` peers behind it. A cluster of one never wins through this
     /// path: `startElection` elects it outright, since there is no peer whose
-    /// ballot could ever arrive.
+    /// ballot could ever arrive. Lock-free, see `clusterSize`.
     pub fn hasQuorum(self: *const Self, votes_received: usize) bool {
         return votes_received >= self.quorumSize();
     }
@@ -992,7 +1141,7 @@ test "log replication commit" {
     }
 
     // Check all have the entry
-    for (cluster.nodes.items) |node| {
+    for (cluster.nodes.items) |*node| {
         try testing.expectEqual(@as(usize, 1), node.election.logLen());
     }
 }
@@ -1025,7 +1174,7 @@ test "log replication conflict" {
     const leader_len = cluster.nodes.items[0].election.logLen();
     try testing.expectEqual(@as(usize, 3), leader_len);
 
-    for (cluster.nodes.items, 0..) |node, node_idx| {
+    for (cluster.nodes.items, 0..) |*node, node_idx| {
         if (node_idx == 0) continue;
         try testing.expectEqual(leader_len, node.election.logLen());
         for (0..leader_len) |i| {
@@ -1056,7 +1205,7 @@ test "log replication persistence" {
     try cluster.replicate(1, "t2_cmd1");
 
     // Verify old entries still present on all nodes
-    for (cluster.nodes.items) |node| {
+    for (cluster.nodes.items) |*node| {
         try testing.expect(node.election.logLen() >= 3);
 
         // t1_cmd1 and t1_cmd2 should still be there
@@ -1680,4 +1829,227 @@ test "RaftElection degenerate election timeout window still schedules an electio
     try testing.expectEqual(@as(u64, 1), raft.getTerm());
     // The window is one value wide, so the new deadline is exactly that far out.
     try testing.expect(raft.election_deadline_ms >= before + 120);
+}
+
+// ── The lock's regression test ──────────────────────────────────────────────
+
+/// The round's start line: both threads arrive before either proceeds.
+///
+/// Beyond aligning the two windows, this is what makes the test's own
+/// pre-barrier work (the ticker's `election_deadline_ms` write, which takes the
+/// same lock) happen-before *both* windows of the round — so the rendezvous
+/// below can never be released by that write, only by the lock's own
+/// serialization.
+const RoundBarrier = struct {
+    arrivals: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    generation: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+    fn wait(self: *RoundBarrier) void {
+        const generation = self.generation.load(.acquire);
+        if (self.arrivals.fetchAdd(1, .acq_rel) + 1 == 2) {
+            self.arrivals.store(0, .release);
+            self.generation.store(generation + 1, .release);
+            return;
+        }
+        while (self.generation.load(.acquire) == generation) std.atomic.spinLoopHint();
+    }
+};
+
+/// `std.testing.allocator` plus a rendezvous on the one buffer both drivers of
+/// a `RaftElection` free: `startElection` reads `voted_for`, frees it and dupes
+/// the self-vote; `handleVoteRequest` does the same with a peer's id. Under the
+/// lock only one of them is between those two steps at a time, so each free of
+/// a given buffer is the only one there is. Without the lock both threads read
+/// the same pointer, and one of the frees is a double free.
+///
+/// This factor turns that interleave into a certainty instead of a probability:
+/// the first free of the watched buffer *holds the window open* until a second
+/// thread arrives at it, which is precisely "two threads were in the window at
+/// once" — and the two frees then follow. Nothing here sleeps or times out: a
+/// window that the lock has serialized is entered by the thread that holds the
+/// lock, so `lock.isHeld()` is the state answer to "there is no second thread
+/// to wait for".
+///
+/// `waiting` rather than a visit counter decides who waits, so the allocator
+/// handing the same address back for a later round's `voted_for` is not
+/// mistaken for an overlap.
+const WindowGate = struct {
+    backing: std.mem.Allocator,
+    /// Address of the `voted_for` buffer the first round's windows free.
+    watched: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// The raft's lock: the release condition for a serialized window.
+    lock: ?*const RaftLock = null,
+    /// Some thread is inside the window, waiting for a second one.
+    waiting: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// A second thread reached the window while the first was still inside it:
+    /// the handshake for that first thread, and the failure this test asserts
+    /// against (the double free it leads to aborts before the assertion).
+    overlapped: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// How many times the watched address was freed — the test asserts the
+    /// rendezvous was walked at all, so it cannot pass on a build that never
+    /// reaches the window.
+    freed: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+    fn allocator(self: *WindowGate) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    /// Stop watching: `deinit`'s frees run outside any window (nothing holds the
+    /// lock then), so they must not enter the rendezvous.
+    fn disarm(self: *WindowGate) void {
+        self.watched.store(0, .release);
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *WindowGate = @ptrCast(@alignCast(ctx));
+        return self.backing.vtable.alloc(self.backing.ptr, len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *WindowGate = @ptrCast(@alignCast(ctx));
+        return self.backing.vtable.resize(self.backing.ptr, memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *WindowGate = @ptrCast(@alignCast(ctx));
+        return self.backing.vtable.remap(self.backing.ptr, memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *WindowGate = @ptrCast(@alignCast(ctx));
+        self.enterWindow(memory.ptr);
+        self.backing.vtable.free(self.backing.ptr, memory, alignment, ret_addr);
+    }
+
+    fn enterWindow(self: *WindowGate, ptr: [*]u8) void {
+        if (@intFromPtr(ptr) != self.watched.load(.acquire)) return;
+        _ = self.freed.fetchAdd(1, .monotonic);
+
+        if (self.waiting.swap(true, .acq_rel)) {
+            self.overlapped.store(true, .release);
+            return;
+        }
+
+        while (!self.overlapped.load(.acquire)) {
+            if (self.lock) |lock| if (lock.isHeld()) break;
+            std.atomic.spinLoopHint();
+        }
+        self.waiting.store(false, .release);
+    }
+};
+
+/// The app's thread: one `tick()` per round, with the election deadline forced
+/// so the tick takes the `startElection` branch (the read-then-free of
+/// `voted_for`) instead of the heartbeat one.
+fn driveTicker(raft: *RaftElection, barrier: *RoundBarrier, rounds: usize) void {
+    var round: usize = 0;
+    while (round < rounds) : (round += 1) {
+        {
+            raft.lock.acquire();
+            defer raft.lock.release();
+            raft.election_deadline_ms = 0;
+        }
+        barrier.wait();
+        raft.tick() catch |err| std.debug.panic("[raft test] tick: {s}", .{@errorName(err)});
+    }
+}
+
+/// The accept thread's half: one dispatched RPC per round, alternating the vote
+/// request (whose grant path frees and replaces `voted_for`) with AppendEntries
+/// (whose path frees and replaces `leader_id`).
+///
+/// Terms step by two while the ticker's advance by one per round, so every
+/// request is above the ticker's term — without that the handler would take its
+/// early-return branch and never reach the window. No accessor is read here on
+/// purpose: nothing but the window may touch the lock, or the rendezvous would
+/// find it held for an unrelated reason.
+fn driveRpc(raft: *RaftElection, barrier: *RoundBarrier, rounds: usize) void {
+    var term: u64 = 3;
+    var round: usize = 0;
+    while (round < rounds) : (round += 1) {
+        barrier.wait();
+        if (round % 2 == 0) {
+            _ = raft.handleVoteRequest(.{
+                .term = term,
+                .candidate_id = "peer-b",
+                .last_log_index = 0,
+                .last_log_term = 0,
+            }) catch |err| std.debug.panic("[raft test] vote request: {s}", .{@errorName(err)});
+        } else {
+            _ = raft.handleAppendEntries(.{
+                .term = term,
+                .leader_id = "peer-b",
+                .prev_log_index = 0,
+                .prev_log_term = 0,
+                .entries = &.{},
+                .leader_commit = 0,
+            }) catch |err| std.debug.panic("[raft test] append entries: {s}", .{@errorName(err)});
+        }
+        term +|= 2;
+    }
+}
+
+test "RaftElection: a tick and an inbound RPC cannot both free voted_for" {
+    const allocator = testing.allocator;
+    const rounds = 2000;
+
+    AppendEntriesCapture.reset();
+    var impl = TestTransportVTable{
+        .sendVoteRequest = noopVoteRequest,
+        .sendAppendEntries = AppendEntriesCapture.accept,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
+
+    var gate = WindowGate{ .backing = allocator };
+    // A cluster of one: `startElection` elects this node on the self-vote, so a
+    // round needs no peer and no wire — what is under test is the two threads,
+    // not the transport.
+    var raft = try RaftElection.init(gate.allocator(), "node-a", &.{}, .{}, &transport);
+    defer raft.deinit();
+    // Runs before the `deinit()` above (defers unwind LIFO): its frees are the
+    // only ones outside a window, and a rendezvous there would have no partner.
+    defer gate.disarm();
+    gate.lock = &raft.lock;
+
+    // Seed `voted_for` with the buffer the first round's two windows free: a
+    // granted vote for a peer, which the ticker's self-vote replaces.
+    _ = try raft.handleVoteRequest(.{
+        .term = 1,
+        .candidate_id = "peer-a",
+        .last_log_index = 0,
+        .last_log_term = 0,
+    });
+    gate.watched.store(@intFromPtr(raft.voted_for.?.ptr), .release);
+
+    var barrier = RoundBarrier{};
+    const ticker = try std.Thread.spawn(.{}, driveTicker, .{ &raft, &barrier, rounds });
+    const responder = try std.Thread.spawn(.{}, driveRpc, .{ &raft, &barrier, rounds });
+    ticker.join();
+    responder.join();
+
+    // The rendezvous was walked: a build that never reached the window (say,
+    // one whose tick stopped electing) cannot pass this test by doing nothing.
+    try testing.expect(gate.freed.load(.acquire) >= 1);
+    // Two threads inside the window at once is what the lock forbids. When it
+    // happens anyway the double free aborts the run first; this is the
+    // assertion-shaped half of the same evidence.
+    try testing.expect(!gate.overlapped.load(.acquire));
+
+    // `voted_for` still points at a live buffer holding one of the two ids a
+    // whole window can have written — not one freed underneath its owner.
+    const voted = raft.voted_for orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.eql(u8, voted, "node-a") or std.mem.eql(u8, voted, "peer-a") or std.mem.eql(u8, voted, "peer-b"));
+    // ...and both drivers advanced their own state, so the rounds were not
+    // vacuous: the ticker kept electing, the responder kept forcing terms.
+    try testing.expect(raft.getTerm() >= 2);
+    // Neither driver appends a command, so any entry here would be a write the
+    // other thread made out of the interleave.
+    try testing.expectEqual(@as(usize, 0), raft.logLen());
 }
