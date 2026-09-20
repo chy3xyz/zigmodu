@@ -47,6 +47,9 @@ For multi-node production, see the caveats below.
 // 组装：ClusterBootstrap —— 门面。它自带 view、membership、raft、metrics。
 // 单节点必须显式 raft_cluster_size = 1：Config 默认是 3，而内置 Raft 传输是桩，
 // start() 会拒绝启动（见下文 fail-closed）。
+// 多节点的 `.peers` 每项是 `"<id>@<host>:<port>"`（例：`"n2@10.0.0.2:9001"`）：
+// `@<id>` 是节点自报的 `node_id`，**多节点必须写** —— 不写则 `id` 回落成 host，
+// start() 直接返回 error.PeerIdRequired（那种集群永远选不出 leader，见下文）。
 var cluster = try ClusterBootstrap.init(allocator, io, .{
     .node_id = "n1",
     .port = 9000,
@@ -103,6 +106,10 @@ defer allocator.free(json);               // 挂到 /cluster/health 或 metrics 
    契约在下一节。
 2. **只要 membership + 读侧**：`.allow_stub_raft_transport = true` 显式承认；单节点用 `raft_cluster_size = 1`。
 
+同一条路上还有两道门：多节点 + 真传输但**没有** `cluster_secret` → `error.ClusterAuthRequired`
+（或显式 `.allow_unauthenticated_cluster = true`）；`.peers` 里有 peer **没写 `@id`** →
+`error.PeerIdRequired`（见下文「peer id 与地址是两份事实」）。
+
 ### 真选主要什么（transport 契约）
 
 框架里已有全部零件，接线的这层在 v0.23.0 起由 `src/core/cluster/RaftTransport.zig` 提供
@@ -114,7 +121,7 @@ defer allocator.free(json);               // 挂到 /cluster/health 或 metrics 
 | 出站 · 投票 | `NetworkTransport.connect(host, port)` → `ClusterConnection.send(payload)` | `sendVoteRequest` 返回 `void`（fire-and-forget）：把 `VoteRequest` 编码后发给每个 peer 即可，**应答走入站** |
 | 出站 · 日志复制 | 同上 | `sendAppendEntries` 是**同步**的：发出去、读回 `AppendEntriesResponse`（同一条连接 `recv`） |
 | 入站 · 分发 | **`ClusterBootstrap.start()` 已经替你挂好**（给了 `.transport` 就在 `port` 上监听，走 `RaftTransport.handleConnection`）；不用 `ClusterBootstrap` 时才需要自己用 `ClusterServer.start(handler)` / `RaftTransport.InboundServer` | 解码后分别调 `RaftElection.handleVoteRequest` / `handleAppendEntries` / `handleVoteResponse` / `handleInstallSnapshot`，把返回值编码后**在同一连接上回包** |
-| 地址簿 | **`ClusterBootstrap` 从 `config.peers` 建**（`RaftTransport.AddressBook`，peer id = `peers` 里的 host，与 `raft.addPeer` 同口径） | peer id → `host:port` 的映射（今天 `BootstrapConfig.peers` 是唯一来源；`ClusterMembership` 的 `nodes` 只有 loopback + 端口） |
+| 地址簿 | **`ClusterBootstrap` 从 `config.peers` 建**（`RaftTransport.AddressBook`，键 = `peers` 里 `@` 前的 id，与 `raft.addPeer(p.id)` 同口径） | peer id → `host:port` 的映射（今天 `BootstrapConfig.peers` 是唯一来源；`ClusterMembership` 的 `nodes` 只有 loopback + 端口） |
 | 失败语义 | 你自己 | Raft 能容忍丢包与重发：`AppendEntriesResponse{ .success = false }` 是**正常应答**而不是错误；连接失败按"这条消息丢了"处理即可，别把节点判死（那是 `AccrualFailureDetector` 的活） |
 
 **门面已闭上的两个洞**（`ClusterBootstrap`）：
@@ -125,9 +132,12 @@ defer allocator.free(json);               // 挂到 /cluster/health 或 metrics 
 - 入站不再"没人接"：给了 `.transport` 的节点在 `start()` 里就开始监听（`port`），
   对端发来的投票/复制消息由 `RaftTransport.handleConnection` 分发并同连接回包，`stop()` 时对应关掉。
   端口起不来 → `error.RaftInboundListenFailed`（不静默降级）；不给 `.transport` 的行为与以前一致（多节点 fail-closed）。
-- 仍要你自己决定的：**peer id 与地址的对应关系**。`BootstrapConfig.peers` 只有 `host:port`，
-  raft 侧 peer id 记的是 host（`addPeer(p.host)`），所以同主机多节点要区分开就得给每个节点不同的
-  `port` 并在 `node_id` 上用稳定、可辨识的 id（投票应答的回推按 `candidate_id` 查地址簿）。
+- **peer id 与地址是两份事实，`.peers` 里都要写**：每项是 `"<id>@<host>:<port>"`（`@<id>` 是那个节点的
+  `node_id`），`start()` 用 id 调 `raft.addPeer(p.id)`、把 `host:port` 放进地址簿 —— 投票应答的回推按
+  `candidate_id`（= 对端的 `node_id`）查地址簿，两边口径因此一致。**没写 `@id` 时 `id` 回落到 host**，
+  多节点集群（`raft_cluster_size > 1`）会被 `start()` 拒掉（`error.PeerIdRequired`）：Raft 只把票记给
+  `raft.peers[].id`，而节点在线上自报的是 `node_id`，用 host 当 id 的 peer 投的票一张也计不进来 ——
+  那种集群**永远选不出 leader**（`docs/dev/cluster-auth-design.md` §10）。单节点不受影响。
 - **两个线程碰的同一个 `RaftElection`，由 raft 自己串起来**：`tick()` 在**你的线程**上跑
   `raft.tick()`，而入站分发在 `start()` 起的 accept 线程上跑 `raft.handleVoteRequest` /
   `handleAppendEntries` —— 两边都会 free/dupe `voted_for`、推 `log`、改 `next_index`/`match_index`。

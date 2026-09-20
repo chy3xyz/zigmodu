@@ -17,7 +17,7 @@
 //!   var disco = PeerDiscovery.init(allocator, .{});
 //!   defer disco.deinit();
 //!   try disco.registerPeer("svc1", "10.0.0.1", 8080);
-//!   try disco.registerService("api", .{ .host = "10.0.0.1", .port = 8080 });
+//!   try disco.registerService("api", .{ .id = "svc1", .host = "10.0.0.1", .port = 8080 });
 //!   var lb = LoadBalancer.init(allocator, .round_robin, &disco);
 //!   defer lb.deinit();
 //!   const peer = lb.next("api");
@@ -77,6 +77,7 @@ pub const LoadBalancer = struct {
         self.connections.deinit();
 
         for (self.canary_peers.items) |p| {
+            self.allocator.free(p.id);
             self.allocator.free(p.host);
         }
         self.canary_peers.deinit(self.allocator);
@@ -98,6 +99,7 @@ pub const LoadBalancer = struct {
             if (roll < self.canary_weight) {
                 const canary_idx = @min(@as(usize, @intFromFloat(@floor(roll / self.canary_weight * @as(f64, @floatFromInt(self.canary_peers.items.len))))), self.canary_peers.items.len - 1);
                 return Peer{
+                    .id = self.canary_peers.items[canary_idx].id,
                     .host = self.canary_peers.items[canary_idx].host,
                     .port = self.canary_peers.items[canary_idx].port,
                 };
@@ -157,11 +159,16 @@ pub const LoadBalancer = struct {
         self.canary_weight = @max(0.0, @min(1.0, weight));
     }
 
-    /// Add a peer to the canary set. The host string is duped.
+    /// Add a peer to the canary set. The host string is duped for the peer's
+    /// `id` too — a canary is picked by address, so it carries no id of its own
+    /// (the same "no id declared → the host doubles as the id" rule
+    /// `PeerDiscovery` applies to a static peer without an `@id`).
     pub fn addCanaryPeer(self: *Self, host: []const u8, port: u16) !void {
+        const id_dup = try self.allocator.dupe(u8, host);
+        errdefer self.allocator.free(id_dup);
         const host_dup = try self.allocator.dupe(u8, host);
         errdefer self.allocator.free(host_dup);
-        try self.canary_peers.append(self.allocator, .{ .host = host_dup, .port = port });
+        try self.canary_peers.append(self.allocator, .{ .id = id_dup, .host = host_dup, .port = port });
     }
 
     /// Internal: get current connection count for a peer.
@@ -186,9 +193,9 @@ test "LoadBalancer round_robin cycles" {
     try disco.registerPeer("s1", "10.0.0.1", 8080);
     try disco.registerPeer("s2", "10.0.0.2", 8080);
     try disco.registerPeer("s3", "10.0.0.3", 8080);
-    try disco.registerService("api", .{ .host = "10.0.0.1", .port = 8080 });
-    try disco.registerService("api", .{ .host = "10.0.0.2", .port = 8080 });
-    try disco.registerService("api", .{ .host = "10.0.0.3", .port = 8080 });
+    try disco.registerService("api", .{ .id = "s1", .host = "10.0.0.1", .port = 8080 });
+    try disco.registerService("api", .{ .id = "s2", .host = "10.0.0.2", .port = 8080 });
+    try disco.registerService("api", .{ .id = "s3", .host = "10.0.0.3", .port = 8080 });
 
     var lb = LoadBalancer.init(allocator, .round_robin, &disco);
     defer lb.deinit();
@@ -215,8 +222,8 @@ test "LoadBalancer random distributes" {
 
     try disco.registerPeer("a", "10.0.0.1", 8080);
     try disco.registerPeer("b", "10.0.0.2", 8080);
-    try disco.registerService("api", .{ .host = "10.0.0.1", .port = 8080 });
-    try disco.registerService("api", .{ .host = "10.0.0.2", .port = 8080 });
+    try disco.registerService("api", .{ .id = "a", .host = "10.0.0.1", .port = 8080 });
+    try disco.registerService("api", .{ .id = "b", .host = "10.0.0.2", .port = 8080 });
 
     // Use fixed seed for deterministic test
     var prng = std.Random.DefaultPrng.init(0xDEADBEEF);
@@ -256,8 +263,8 @@ test "LoadBalancer canary routing" {
 
     try disco.registerPeer("main-1", "10.0.0.1", 8080);
     try disco.registerPeer("main-2", "10.0.0.2", 8080);
-    try disco.registerService("api", .{ .host = "10.0.0.1", .port = 8080 });
-    try disco.registerService("api", .{ .host = "10.0.0.2", .port = 8080 });
+    try disco.registerService("api", .{ .id = "main-1", .host = "10.0.0.1", .port = 8080 });
+    try disco.registerService("api", .{ .id = "main-2", .host = "10.0.0.2", .port = 8080 });
 
     // Use fixed seed for deterministic test
     var prng = std.Random.DefaultPrng.init(0xCAFE1234);
@@ -304,8 +311,8 @@ test "LoadBalancer least_connections" {
 
     try disco.registerPeer("lc1", "10.0.0.1", 8080);
     try disco.registerPeer("lc2", "10.0.0.2", 8080);
-    try disco.registerService("api", .{ .host = "10.0.0.1", .port = 8080 });
-    try disco.registerService("api", .{ .host = "10.0.0.2", .port = 8080 });
+    try disco.registerService("api", .{ .id = "lc1", .host = "10.0.0.1", .port = 8080 });
+    try disco.registerService("api", .{ .id = "lc2", .host = "10.0.0.2", .port = 8080 });
 
     var lb = LoadBalancer.init(allocator, .least_connections, &disco);
     defer lb.deinit();

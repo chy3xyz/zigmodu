@@ -289,6 +289,34 @@ TLS/边车（`TlsTransport.zig:1-8` 的文件头已经写明 mTLS 目前要边�
 **L1 不受影响**，所以本次照 §3 实现 L1 + §3.5 的 fail-closed 门禁；**L2 留到 ① 之后**。
 §4.1 的三个校验点、§7 的第 5 条红证据，都要等 ① 落地。
 
+### §10 修复记录（2026-09-21）—— **① 已落地，本缺陷关闭**
+
+取 **(a) 配置带显式 id**。理由就是 §10 的前提：`BootstrapConfig` 没有 host/advertise 字段（只 `node_id` +
+`port`，且 `ClusterBootstrap` 绑 `0.0.0.0`），所以 (b)"人人以 `host:port` 为身份"既做不到，也把身份与地址
+混成一件事 —— 而这正是缺陷的根。
+
+| 文件 | 改动 |
+|---|---|
+| `PeerDiscovery.zig` | `Peer` 增 `id`（与 `host` 同为自有拷贝）；静态语法 `"<id>@<host>:<port>"`，`@<id>` 可省（`id` 回落成 host，旧配置照常解析）；`id` 的一切 free（`deinitResolved` / `registerPeer` / `listPeers` / `registerService` / `deregisterPeer` / `deregisterService` / `deinit`）与 `host` 同进同出 |
+| `ClusterBootstrap.zig` | `raft.addPeer(p.id)` + `addresses.add(p.id, p.host, p.port)`（**曾是 `p.host`**）；新增第三道门禁：`raft_cluster_size > 1` 且任一 peer 的 `id == host` → `log.warn` + `error.PeerIdRequired` |
+| `LoadBalancer.zig` | 金丝雀 peer 与 `registerService` 调用点补齐 `id`（金丝雀按地址选，`id` 取 host —— 与静态 peer 的回落同一条规则） |
+
+**门禁为什么不是回归**：`id == host` 的 peer 投出的票**一张也计不进来**（§10 的证据链），所以那种集群
+**本来就是死的**；拒绝它只是把"静默地永不选主"变成启动错误。单节点（`raft_cluster_size <= 1`）没有票要计，不受影响。
+
+**验证**（全量 1494/1515，21 skipped，0 failed；`zig fmt --check` + 6 道门禁全绿）：新增 4 条用例 ——
+`PeerDiscovery` 两种语法的解析、`PeerIdRequired` 门禁（带正对照）、
+`a ClusterBootstrap-configured cluster elects a leader (peers credited by id)`、以及 mirror 该接线的
+`RaftElection` 版（走 `addPeer`，即 `start()` 用的那条路）。**两条变异验过红**：
+`addPeer(p.id)` 改回 `addPeer(p.host)` → 选举用例 `FAIL (TestUnexpectedResult)`；
+门禁条件改成永不触发 → `expected error.PeerIdRequired, found void`。都是断言红、非编译错，且已按字节还原。
+
+**为什么此前没被发现**：`ClusterBootstrap` 的测试没有一处断言过 leader（`isLeader`/`getLeader` 在测试区零命中）——
+用例只验"起来了"。新的那条用例连同"candidate → 收到一张票 → leader"一起断言，这个空洞才闭上。
+
+**仍未做**：§4/L2 的三个成员校验点 —— 现在排位正确了（① 已落地），但它会动到 `handleVoteRequest` /
+`handleAppendEntries` / `handleInstallSnapshot` 的拒绝语义，单独一步。
+
 ---
 
 ## 11. L1 实现记录（2026-09-21）
@@ -449,7 +477,7 @@ pub fn hasQuorum(self: *const Self, votes_received: usize) bool { return votes_r
 新的 `a 2-node cluster elects a leader with its single peer's grant` 我亲自做了变异：
 把 `+ 1` 去掉 → `try testing.expect(e.isLeader())` 处 `FAIL (TestUnexpectedResult)`，**断言红不是编译错**。
 
-### §10 仍然未修
+### §10 已修（2026-09-21）
 
-peer id 空间那条需要**(a) 配置带显式 id** 还是 **(b) 用 host 当身份** 的决定（见 §10），
-涉及公开配置形状或身份语义，本次不动。
+peer id 空间那条选 **(a) 配置带显式 id**，记录在 §10 的「§10 修复记录」。
+§12 与 §10 是两条独立缺陷，**现在两条都关了**。

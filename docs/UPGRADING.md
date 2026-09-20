@@ -17,7 +17,7 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 
 ## v0.32.0
 
-> **本版有 5 处破坏性变更，其中 3 处是编译错**（WS 路由声明、CSPRNG 的 `io` 参数、`Method.fromString` 返回类型）。
+> **本版有 6 处破坏性变更，其中 3 处是编译错**（WS 路由声明、CSPRNG 的 `io` 参数、`Method.fromString` 返回类型）。
 > v0.29.0–v0.31.0 **没有**破坏性变更，所以本节是 v0.28.0 之后的唯一一段。
 > 逐条背景见 [`../CHANGELOG.md`](../CHANGELOG.md) 的 `[0.32.0]` 段。
 
@@ -127,6 +127,28 @@ try ai.business.registerBusinessSkillsWith(&registry, &.{}, .{
 仓内无此类调用点。已按 `src/test/ErrorSetSnapshot.zig` 自己的契约登记进快照并把上限钉在 2。
 
 **一行改法**：给 `switch` 加一个 `error.InvalidLogIndex` 分支（按"对端发了畸形帧、丢弃"处理）。
+
+### `.peers` 在多节点集群里必须带 `@id`，否则**拒绝启动**（**运行期拒绝**）
+
+**Breaking?** 是 —— 对**多节点**部署是新的启动错误（`error.PeerIdRequired`）；单节点不受影响。
+
+`BootstrapConfig.peers` 的静态语法现在是 `"<id>@<host>:<port>"`（`@<id>` 可省）。省掉时 `id` 回落成 host，
+而 `ClusterBootstrap` 曾用 `addPeer(p.host)` 把 peer 的 id 记成 host 字符串 —— Raft 只把票记给
+`raft.peers[].id`，节点在线上自报的却是自己的 `node_id`，所以**这类集群的票一张也计不进来，永远选不出 leader**
+（`docs/dev/cluster-auth-design.md` §10）。现在多节点 + 有 peer 没写 id → `start()` 直接拒（`log.warn` + 返回错误）。
+
+**影响面**：`raft_cluster_size > 1` 且 `.peers` 里有不带 `@id` 的项的部署，升级后**启动失败**（拒绝，不是静默降级）。
+`PeerDiscovery.Peer` 也多了一个 `id` 字段，手工构造它的代码（`registerService` 调用方、
+`LoadBalancer.addCanaryPeer` 内部）要补 `.id`。
+
+**一行改法**（每个 peer 一次）：
+
+```zig
+// 旧（多节点集群）                            // 新：`@` 前写对端的 node_id
+.peers = &.{"127.0.0.1:9001"}                 .peers = &.{"node-b@127.0.0.1:9001"}
+```
+
+单节点（`raft_cluster_size = 1`）**不用改** —— 没有票要计。
 
 ### 顺带（**破坏性：否**）
 

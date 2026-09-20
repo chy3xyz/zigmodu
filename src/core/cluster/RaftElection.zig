@@ -1816,6 +1816,43 @@ test "a 2-node cluster elects a leader with its single peer's grant" {
     try testing.expect(e.isLeader());
 }
 
+// The join path, not the `init` peer list: this is what `ClusterBootstrap.start()`
+// does — `addPeer(p.id)` with the name the peer answers votes under. A peer added
+// under its *address* instead (`addPeer("127.0.0.1")`) has every ballot dropped by
+// `peerId()`, so the node below would stay a candidate forever
+// (docs/dev/cluster-auth-design.md §10).
+test "a raft whose peers were added by id elects a leader (the ClusterBootstrap wiring)" {
+    const allocator = testing.allocator;
+
+    const TransportImpl = struct {
+        sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
+        sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse,
+    };
+    var transport_impl = TransportImpl{
+        .sendVoteRequest = (struct {
+            fn f(_: ?[]const u8, _: []const u8, _: VoteRequest) void {}
+        }).f,
+        .sendAppendEntries = (struct {
+            fn f(_: ?[]const u8, _: []const u8, _: AppendEntriesRequest) AppendEntriesResponse {
+                return AppendEntriesResponse{ .term = 0, .success = false, .match_index = 0 };
+            }
+        }).f,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
+
+    var e = try RaftElection.init(allocator, "node-a", &.{}, .{}, &transport);
+    defer e.deinit();
+    try e.addPeer("node-b");
+
+    try testing.expectEqual(@as(usize, 2), e.clusterSize());
+    try e.startElection();
+    try testing.expectEqual(RaftState.candidate, e.getState());
+    try testing.expect(!e.isLeader());
+
+    try e.handleVoteResponse(.{ .term = e.getTerm(), .vote_granted = true }, "node-b");
+    try testing.expect(e.isLeader());
+}
+
 test "RaftElection vote counting: leader only at quorum, duplicate and stale votes ignored" {
     const allocator = testing.allocator;
 

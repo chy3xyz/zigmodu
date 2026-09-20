@@ -2,6 +2,46 @@
 
 ## [Unreleased]
 
+### 修 peer id 空间：`ClusterBootstrap` 配出来的多节点集群**永远选不出 leader**（**破坏性：是**）
+
+`start()` 用 `raft.addPeer(p.host)` 把 peer 加进去 —— **peer 的 id 是 host 字符串**（`"127.0.0.1"`）。
+但节点回答投票时上线的是它自己的 `node_id`（`RaftTransport`：`encodeVoteResponse(..., raft.local_id)`），
+而候选人计票走 `peerId(from_peer)`，只在 **`raft.peers[].id`** 里找 —— `"node-b"` 不在 `{"127.0.0.1"}` 里，
+`orelse return` **把这一票丢掉**。`quorumSize()` 要 peer 的多数，所以这类集群**一张票也计不进来**
+（`docs/dev/cluster-auth-design.md` §10 的六条证据链）。地址簿同样以 host 为键，中转的投票应答也查不到。
+
+`ClusterBootstrap` 的测试里**没有一处断言过 leader**，所以它一直没被发现 —— 用例只验"起来了"。
+
+**修法**：peer 的身份与地址拆成两份事实。
+
+```zig
+.peers = &.{ "node-b@127.0.0.1:9001" },   // 新的静态 peer 语法：`"<id>@<host>:<port>"`，`@<id>` 可省
+
+for (peers) |p| {
+    try raft.addPeer(p.id);                        // 曾是 p.host
+    try self.addresses.add(p.id, p.host, p.port);  // 键 = id，值 = host:port
+}
+```
+
+`PeerDiscovery.Peer` 因此多了 `id`（与 `host` 一样是自有拷贝，`resolve` / `deinitResolved` 两头都管）。
+不带 `@` 的旧写法仍能解析（`id` 回落成 host），**但多节点集群会被 `start()` 拒掉**
+（`error.PeerIdRequired`，与既有两个门禁同形：`log.warn` + 返回错误）：那种集群**本来就是死的**，
+拒绝它不是回归，而是把"静默地永不选主"变成一个启动错误。单节点（`raft_cluster_size <= 1`）不受影响。
+
+**破坏性**：**是** —— 多节点集群的 `.peers` 现在必须带 `@id`，否则**启动失败**。一行改法见 `docs/UPGRADING.md`。
+`PeerDiscovery.Peer` 多一个字段，构造它的代码要补 `.id`（`registerService` / 金丝雀 peer）。
+
+**验证**：全量 **1494/1515（21 skipped，0 failed）**（比上一版 +4），`zig fmt --check` + 6 道门禁全绿。
+新增 4 条用例：`PeerDiscovery` 两种语法的解析（含回落）、`error.PeerIdRequired` 门禁（含"带 id 就能起来"的正对照）、
+`a ClusterBootstrap-configured cluster elects a leader (peers credited by id)`、以及 mirror 该接线的
+`RaftElection` 版（走 `addPeer`）。**两条变异逐条验过红**：把 `addPeer(p.id)` 改回 `addPeer(p.host)` →
+选举用例在 `try std.testing.expect(raft.isLeader())` 处 `FAIL (TestUnexpectedResult)`；
+把门禁条件改成永不触发 → `expected error.PeerIdRequired, found void`。**都是断言红，不是编译错**，
+且都已按字节还原（`md5` 前后一致、`grep -c MUTATION` = 0）。
+
+**未做**：§4/L2（`handleVoteRequest` / `handleAppendEntries` / `handleInstallSnapshot` 的成员校验）——
+它排在这次 id 空间修复**之后**（§10 的排序修正），本次仍不动。
+
 ### 修选举的票数 off-by-one：多要一票，N=2 结构上不可能选出 leader（**破坏性：否**）
 
 `quorumSize()` 是 `clusterSize()/2 + 1` 而 `clusterSize()` **包含自己**，但 `votes_received`
@@ -64,7 +104,7 @@
 try ClusterBootstrap.init(allocator, io, .{
     .node_id = "node-a",
     .port = 9000,
-    .peers = &.{"127.0.0.1:9001"},
+    .peers = &.{"node-b@127.0.0.1:9001"},
     .transport = my_transport,
     .cluster_secret = secret,     // 32 字节；自己从 security.SecretsManager 取（env > file > vault）
 });

@@ -26,7 +26,9 @@ pub fn main(init: std.process.Init) !void {
         .node_id = "node-1",
         .port = 9001,             // membership / transport port
         .peers = &.{},
-        .raft_cluster_size = 1,   // >1 without a real `.transport` → error.RaftTransportUnavailable
+        // >1 without a real `.transport` → error.RaftTransportUnavailable; a peer
+        // without an `@id` → error.PeerIdRequired (see docs/DISTRIBUTED.md).
+        .raft_cluster_size = 1,
     });
     defer boot.deinit();
     try boot.start();

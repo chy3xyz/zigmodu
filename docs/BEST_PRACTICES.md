@@ -692,8 +692,8 @@ bus.publish(.{ .order_id = 42 });
 var boot = try zigmodu.ClusterBootstrap.init(allocator, io, .{
     .node_id = "node-1",
     .port = 9001,
-    .peers = &.{ "127.0.0.1:9002" },
-    .raft_cluster_size = 1,   // >1 需要自带 `.transport`，否则 start() 拒绝启动
+    .peers = &.{ "node-2@127.0.0.1:9002" },   // 每项 `"<id>@<host>:<port>"`；多节点必须写 `@id`
+    .raft_cluster_size = 1,   // >1 需要自带 `.transport` 且 peers 带 id，否则 start() 拒绝启动
 });
 defer boot.deinit();
 try boot.start();             // 循环里再调 boot.tick()（外部驱动：gossip/health + 刷新读侧）

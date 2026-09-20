@@ -17,7 +17,7 @@
 //!   var cluster = try ClusterBootstrap.init(allocator, io, .{
 //!       .node_id = "node-1",
 //!       .port = 9000,
-//!       .peers = &.{"127.0.0.1:9001", "127.0.0.1:9002"},
+//!       .peers = &.{"node-2@127.0.0.1:9001", "node-3@127.0.0.1:9002"},
 //!   });
 //!   defer cluster.deinit();
 //!   try cluster.start();
@@ -31,6 +31,7 @@ const RaftTransport = @import("RaftTransport.zig");
 const ClusterMembership = @import("../ClusterMembership.zig").ClusterMembership;
 const DistributedEventBus = @import("../DistributedEventBus.zig").DistributedEventBus;
 const RaftElection = @import("RaftElection.zig").RaftElection;
+const RaftState = @import("RaftElection.zig").RaftState;
 const ElectionConfig = @import("RaftElection.zig").ElectionConfig;
 const VoteRequest = @import("RaftElection.zig").VoteRequest;
 const AppendEntriesRequest = @import("RaftElection.zig").AppendEntriesRequest;
@@ -52,6 +53,16 @@ pub const BootstrapConfig = struct {
     /// `.transport` the inbound Raft listener binds it (`start()`). Do not also
     /// hand it to `DistributedEventBus.start(port)`.
     port: u16 = 9000,
+    /// Static peers, each `"<id>@<host>:<port>"` with the `@<id>` part
+    /// **optional** at the parser level (`PeerDiscovery`):
+    ///   `"node-b@127.0.0.1:9001"` → raft peer `node-b`, address `127.0.0.1:9001`
+    ///   `"127.0.0.1:9001"`        → raft peer `127.0.0.1` (id falls back to host)
+    ///
+    /// A **multi-node** cluster (`raft_cluster_size > 1`) requires the id: Raft
+    /// credits a ballot against `raft.peers[].id` while a node answers a vote with
+    /// its own `node_id`, so a peer identified by its host can never be credited —
+    /// the vote is dropped and the cluster never elects a leader. `start()` refuses
+    /// that shape with `error.PeerIdRequired` rather than running dead.
     peers: []const []const u8 = &.{},
     raft_cluster_size: usize = 3,
     /// Bring your own Raft transport. The built-in one is a stub, so a multi-node
@@ -195,6 +206,33 @@ pub const ClusterBootstrap = struct {
             );
             return error.ClusterAuthRequired;
         }
+        // The third thing a multi-node cluster cannot infer: **who its peers are**.
+        // Raft counts a granted ballot against `self.peers[].id` (`peerId` in
+        // `RaftElection.zig`), while a node answers a vote with its own `node_id`
+        // (`RaftTransport.zig`: `encodeVoteResponse(..., raft.local_id)`). A peer
+        // added under its host string therefore never matches: `peerId` returns
+        // null, the vote is dropped, `quorumSize()` is never reached and the
+        // cluster runs forever without a leader — the address book keyed by host
+        // drops the relayed vote response for the same reason
+        // (`docs/dev/cluster-auth-design.md` §10). Such a cluster is **already** a
+        // dead one, so refusing it is not a regression: it turns a silent
+        // no-leader-ever into a startup error. `PeerDiscovery.resolve` reports
+        // "no `@id` was given" as `id == host`; a single node
+        // (`raft_cluster_size <= 1`) has no ballot to reject.
+        if (self.config.raft_cluster_size > 1) {
+            for (peers) |p| {
+                if (!std.mem.eql(u8, p.id, p.host)) continue;
+                // `warn`, not `err`: the returned error is the loud part, and the test
+                // harness treats an `err`-level log as a failure by itself.
+                std.log.warn(
+                    "[ClusterBootstrap] refusing to start node {s}: peer {s}:{d} declares no id (`id` fell back to its host " ++
+                        "string), and Raft credits a vote only against `raft.peers[].id` — the peer's ballots would be dropped " ++
+                        "and this cluster would never elect a leader. Write that peer as `\"<node_id>@{s}:{d}\"` in `.peers`.",
+                    .{ self.config.node_id, p.host, p.port, p.host, p.port },
+                );
+                return error.PeerIdRequired;
+            }
+        }
         const election_cfg = ElectionConfig{ .cluster_secret = self.config.cluster_secret };
         const S = struct {
             var transport_impl: ?struct {
@@ -223,12 +261,16 @@ pub const ClusterBootstrap = struct {
         raft.* = try RaftElection.init(self.allocator, self.config.node_id, &.{}, election_cfg, &self.election_transport);
         self.raft = raft;
 
-        // Add peers to Raft. The address book carries the same identity (the host
-        // string) so the inbound relay can turn a vote response's candidate back
-        // into a `host:port` — the only peer→address mapping this config has.
+        // Add peers to Raft **by id** — that is the name their ballots are counted
+        // under (a peer answers a vote with its `node_id`, so `addPeer(p.host)`
+        // here would drop every vote it sends; see the id gate above). The address
+        // book stays keyed by the same id but carries the `host:port` it is
+        // reachable at, which is what the inbound relay needs to turn a vote
+        // response's candidate back into a dialable endpoint — identity and
+        // address are deliberately two facts.
         for (peers) |p| {
-            try raft.addPeer(p.host);
-            try self.addresses.add(p.host, p.host, p.port);
+            try raft.addPeer(p.id);
+            try self.addresses.add(p.id, p.host, p.port);
         }
 
         // 5. Inbound Raft RPCs: with a real transport the peers' votes and
@@ -488,11 +530,12 @@ test "ClusterBootstrap accepts an app-supplied Raft transport" {
     // `raft_cluster_size` stays at its default 3: with a transport supplied this
     // must start — the *stub* guard needs no acknowledgement here. The cluster
     // secret is the other requirement a multi-node cluster with a real transport
-    // has (see the gate tests below).
+    // has (see the gate tests below), and the peer carries the `@id` a multi-node
+    // cluster needs to credit its votes.
     var cluster = try ClusterBootstrap.init(allocator, std.testing.io, .{
         .node_id = "byo-transport-node",
         .port = 19004,
-        .peers = &.{"127.0.0.1:19005"},
+        .peers = &.{"peer-node@127.0.0.1:19005"},
         .transport = transport,
         .cluster_secret = @splat(0x11),
     });
@@ -510,10 +553,12 @@ test "ClusterBootstrap refuses a multi-node cluster without a real Raft transpor
 
     // Default `raft_cluster_size` is 3 and the built-in Raft transport is a stub,
     // so this must fail loudly instead of electing a leader nobody voted for.
+    // (The peer carries an `@id` so this config isolates *that* gate: a missing id
+    // is `PeerIdRequired`, refused one gate later.)
     var refusing = try ClusterBootstrap.init(allocator, std.testing.io, .{
         .node_id = "refusing-node",
         .port = 19002,
-        .peers = &.{"127.0.0.1:19003"},
+        .peers = &.{"peer-node@127.0.0.1:19003"},
     });
     defer refusing.deinit();
     try std.testing.expectError(error.RaftTransportUnavailable, refusing.start());
@@ -522,7 +567,7 @@ test "ClusterBootstrap refuses a multi-node cluster without a real Raft transpor
     var acked = try ClusterBootstrap.init(allocator, std.testing.io, .{
         .node_id = "acked-node",
         .port = 19003,
-        .peers = &.{"127.0.0.1:19002"},
+        .peers = &.{"peer-node@127.0.0.1:19002"},
         .allow_stub_raft_transport = true,
     });
     defer acked.deinit();
@@ -566,7 +611,7 @@ test "ClusterBootstrap refuses a multi-node cluster without a cluster secret" {
     var refusing = try ClusterBootstrap.init(allocator, std.testing.io, .{
         .node_id = "unauthenticated-node",
         .port = 19010,
-        .peers = &.{"127.0.0.1:19011"},
+        .peers = &.{"peer-node@127.0.0.1:19011"},
         .raft_cluster_size = 3,
         .transport = gateTransport(),
     });
@@ -584,7 +629,7 @@ test "ClusterBootstrap starts a multi-node cluster that has a cluster secret" {
     var authed = try ClusterBootstrap.init(allocator, std.testing.io, .{
         .node_id = "authenticated-node",
         .port = 19012,
-        .peers = &.{"127.0.0.1:19013"},
+        .peers = &.{"peer-node@127.0.0.1:19013"},
         .raft_cluster_size = 3,
         .transport = gateTransport(),
         .cluster_secret = secret,
@@ -597,6 +642,43 @@ test "ClusterBootstrap starts a multi-node cluster that has a cluster secret" {
     try std.testing.expectEqual(secret, authed.getRaft().?.config.cluster_secret.?);
 }
 
+test "ClusterBootstrap refuses a multi-node cluster whose peers carry no id" {
+    const allocator = std.testing.allocator;
+
+    // Every other gate is satisfied — real transport, pre-shared key — and the
+    // only thing wrong is the peer grammar: `"127.0.0.1:19031"` parses with the
+    // host as the id (`PeerDiscovery`), which is the shape that could never
+    // credit that peer's vote. Refusing it is not a regression: that cluster
+    // already had no leader and never would (`docs/dev/cluster-auth-design.md` §10).
+    var refusing = try ClusterBootstrap.init(allocator, std.testing.io, .{
+        .node_id = "idless-node",
+        .port = 19030,
+        .peers = &.{"127.0.0.1:19031"},
+        .raft_cluster_size = 3,
+        .transport = gateTransport(),
+        .cluster_secret = @splat(0x3c),
+    });
+    defer refusing.deinit();
+    try std.testing.expectError(error.PeerIdRequired, refusing.start());
+
+    // Positive control: the same config with the ids declared starts.
+    if (!@import("../../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    var named = try ClusterBootstrap.init(allocator, std.testing.io, .{
+        .node_id = "named-node",
+        .port = 19032,
+        .peers = &.{"peer-node@127.0.0.1:19033"},
+        .raft_cluster_size = 3,
+        .transport = gateTransport(),
+        .cluster_secret = @splat(0x3c),
+    });
+    defer named.deinit();
+    try named.start();
+    // The peer entered the raft (self + one), and it entered under the declared id:
+    // that name is what `handleVoteResponse` looks the ballot up by.
+    try std.testing.expectEqual(@as(usize, 2), named.getRaft().?.clusterSize());
+    try std.testing.expect(named.server.running.load(.monotonic));
+}
+
 test "ClusterBootstrap starts an acknowledged unauthenticated multi-node cluster" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -607,7 +689,7 @@ test "ClusterBootstrap starts an acknowledged unauthenticated multi-node cluster
     var acked = try ClusterBootstrap.init(allocator, io, .{
         .node_id = "acked-unauth-node",
         .port = 19014,
-        .peers = &.{"127.0.0.1:19015"},
+        .peers = &.{"peer-node@127.0.0.1:19015"},
         .raft_cluster_size = 3,
         .transport = gateTransport(),
         .allow_unauthenticated_cluster = true,
@@ -707,7 +789,7 @@ test "ClusterBootstrap drives raft.tick and serves inbound Raft RPCs" {
     var cluster = try ClusterBootstrap.init(allocator, io, .{
         .node_id = "raft-node",
         .port = 19730,
-        .peers = &.{"127.0.0.1:19731"},
+        .peers = &.{"peer-node@127.0.0.1:19731"},
         .raft_cluster_size = 2,
         .transport = transport,
         // This test drives the **bare** frame shape on purpose (it writes an
@@ -757,4 +839,46 @@ test "ClusterBootstrap drives raft.tick and serves inbound Raft RPCs" {
     // 3. Stopping the node (with its inbound thread) is safe to repeat.
     cluster.stop();
     cluster.stop();
+}
+
+// A `ClusterBootstrap`-configured cluster elects a leader — the defect this test
+// exists for (`docs/dev/cluster-auth-design.md` §10). The config below is the
+// real shape (`peers` as `"<id>@<host>:<port>"`), and `start()` hands the **id**
+// to `raft.addPeer`. With `addPeer(p.host)` the peer would be named `127.0.0.1`,
+// `handleVoteResponse(…, "node-b")` would find nothing in `raft.peers[].id`, drop
+// the ballot and leave this node a candidate forever — the `isLeader()` assertion
+// below is what goes red, not a compile error.
+//
+// No socket is needed: the stub transport is acknowledged (the vote response is
+// fed in by hand), and `transport == null` means no inbound listener is spawned.
+test "a ClusterBootstrap-configured cluster elects a leader (peers credited by id)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var cluster = try ClusterBootstrap.init(allocator, io, .{
+        .node_id = "node-a",
+        .port = 19750,
+        .peers = &.{"node-b@127.0.0.1:19751"},
+        .raft_cluster_size = 2,
+        .allow_stub_raft_transport = true,
+    });
+    defer cluster.deinit();
+    try cluster.start();
+
+    const raft = cluster.getRaft().?;
+    try std.testing.expectEqual(@as(usize, 2), raft.clusterSize());
+
+    // One tick past the election timeout (wall-clock, 150–300 ms) makes this node
+    // a candidate for a new term.
+    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(400), .awake) catch |err| {
+        std.log.debug("[test] election-timeout wait ({})", .{err});
+    };
+    try cluster.tick();
+    try std.testing.expectEqual(RaftState.candidate, raft.getState());
+
+    // node-b grants, naming itself the way it does on the wire: its `node_id`.
+    // Self + that grant is a majority of two.
+    try raft.handleVoteResponse(.{ .term = raft.getTerm(), .vote_granted = true }, "node-b");
+    try std.testing.expect(raft.isLeader());
+    try std.testing.expectEqualStrings("node-a", raft.getLeader().?);
 }
