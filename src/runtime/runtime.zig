@@ -3090,8 +3090,18 @@ test "Actor: a plain worker survives handler errors (v0.16 contract)" {
 
     const h = try rt.spawn(FlakyActor, .{}, 8); // spawn, not spawnActor: no budget
     for (0..4) |i| try h.send(@intCast(i)); // 1 and 3 fail
+    // Wait for the *pair* the assertions below read, not for `handled` alone.
+    // The two counters are updated at different points of the run: `handled`
+    // reaches 2 on msg 2 (the second good one), while msg 3's error is only
+    // counted once the worker has pulled it out and `supervise` ran — one
+    // delivery later, and after a `std.log.warn`. Leaving the loop on
+    // `handled == 2` therefore reads `handler_errors` before its writer has
+    // caught up, and the assertion becomes a race on the worker's progress.
+    // `handler_errors` is the atomic of the pair, so the loop cannot be hoisted
+    // into a single evaluation of it.
     var spins: usize = 0;
-    while (h.state.handled < 2 and spins < 4_000_000) : (spins += 1) std.atomic.spinLoopHint();
+    while (spins < 4_000_000 and
+        (h.state.handled < 2 or h.handler_errors.load(.monotonic) < 2)) : (spins += 1) std.atomic.spinLoopHint();
 
     try std.testing.expectEqual(@as(u32, 2), h.state.handled); // the good messages got through
     try std.testing.expectEqual(@as(u64, 2), h.stats().handler_errors);
@@ -3544,6 +3554,10 @@ test "Runtime.MetricsBridge publishes the pool's counters, and they move with th
     try waitUntil(Published(@TypeOf(shared.handled), u32){ .value = &shared.handled, .want = 5 }, 5_000);
     pooled.stop();
     pooled.join(); // pooled join: waits for the claim to come back and the mailbox to drain
+    // ...for the *worker's* claim. The pool's counter is decremented one step
+    // later (and a token re-push lands between the two), so wait for the reading
+    // this test compares against the scrape rather than for the join.
+    try waitUntil(PoolUnclaimed(@TypeOf(rt)){ .rt = &rt }, 5_000);
 
     const warm = rt.poolStats().?;
     try std.testing.expect(warm.dispatches >= 1);
@@ -3624,6 +3638,26 @@ fn Drained(comptime H: type) type {
 
         pub fn ready(self: @This()) bool {
             return !self.handle.claimed.load(.acquire) and self.handle.mailbox.len() == 0;
+        }
+    };
+}
+
+/// Probe: the pool's *own* `claimed` counter — the number `poolStats()` and the
+/// metrics bridge publish — is back to zero.
+///
+/// `Handle.join` waits on the worker's `claimed` **flag**, and `scheduler.zig`'s
+/// hand-back clears that flag one step *before* it decrements this counter
+/// (with a token re-push in between when the mailbox still held work). A reader
+/// that goes straight from `join` to `poolStats()` therefore reads a counter its
+/// writer has not reached yet; waiting on the counter the assertion reads is what
+/// puts the reading and the assertion at the same moment.
+fn PoolUnclaimed(comptime RT: type) type {
+    return struct {
+        rt: *RT,
+
+        pub fn ready(self: @This()) bool {
+            const s = self.rt.poolStats() orelse return true;
+            return s.claimed == 0;
         }
     };
 }

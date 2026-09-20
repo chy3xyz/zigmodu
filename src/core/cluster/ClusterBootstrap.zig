@@ -89,6 +89,13 @@ pub const ClusterBootstrap = struct {
     /// supplied (see `start()`); the accept loop runs on `inbound_thread`.
     server: NetworkTransport.ClusterServer,
     inbound_thread: ?std.Thread = null,
+    /// Serializes the only two threads that touch the same `RaftElection`: this
+    /// process's `tick()` (→ `raft.tick()`, on the app's thread) and the inbound
+    /// dispatch on `inbound_thread` (an RPC's `raft.handle*` mutates the same
+    /// `voted_for` / `log` / `next_index`). Both belong to this facade — `start()`
+    /// spawns the second, `tick()` is the documented way to drive the first — so
+    /// the lock lives here. `docs/DISTRIBUTED.md`「真选主要什么」has the wiring.
+    raft_lock: RaftTransport.RaftLock = .{},
     /// peer id → `host:port`, filled from `config.peers` in `start()`: the inbound
     /// dispatch resolves a granted vote's candidate through it.
     addresses: RaftTransport.AddressBook,
@@ -292,7 +299,7 @@ pub const ClusterBootstrap = struct {
             return;
         };
         const raft = self.raft orelse return;
-        RaftTransport.handleConnection(raft, &self.addresses, &owned);
+        RaftTransport.handleConnectionLocked(raft, &self.addresses, &owned, &self.raft_lock);
     }
 
     /// The config this node was booted with — read-only entry point for the
@@ -351,6 +358,10 @@ pub const ClusterBootstrap = struct {
     ///
     /// The Raft step is what starts elections and sends heartbeats; without a
     /// `.transport` the built-in one is a stub, so it changes local state only.
+    ///
+    /// The Raft step runs under `raft_lock`: with a `.transport`, `start()` has an
+    /// accept thread dispatching peers' RPCs into the same `RaftElection`, and
+    /// `RaftElection` carries no lock of its own (see the field).
     pub fn tick(self: *Self) !void {
         const member = self.membership orelse return;
         try member.runOnce();
@@ -358,7 +369,11 @@ pub const ClusterBootstrap = struct {
             error.ReadersBusy => {},
             else => return err,
         };
-        if (self.raft) |raft| try raft.tick();
+        if (self.raft) |raft| {
+            self.raft_lock.acquire();
+            defer self.raft_lock.release();
+            try raft.tick();
+        }
     }
 };
 

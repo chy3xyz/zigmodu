@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+### Cluster：`ClusterBootstrap` 把同一个 `RaftElection` 的两个线程串起来（**破坏性：否**；修真竞态 + 两处测试同步）
+
+`ClusterBootstrap.start()` 起一个 accept 线程，把对端发来的 Raft RPC 直接分发进 `raft`（
+`RaftTransport.handleConnection` → `RaftElection.handleVoteRequest` / `handleAppendEntries`），而
+`tick()` 是**文档要求由应用自己的循环/定时器**去调的 —— 也就是另一个线程。`RaftElection` 本身没有任何
+同步（裸字段 + `ArrayList` + `StringHashMap`），两边都在 free/dupe `voted_for`、推 `log`、改
+`next_index`/`match_index`，所以"同一时刻只有一个线程碰 raft"这个假设**在代码里不成立**。
+
+- **红证据**（`/tmp` 探针：一个线程空转 `cluster.tick()`，另一线程用真 socket 连入站端口连发
+  `vote_request`，12 次运行 / 随机 seed）：**6 次 ABRT + 2 次内存泄漏**（`SafeAllocator` 报
+  `double free of [addr: 108fe5198, len: 9]`，栈 `handleVoteRequest` ← `handleConnection` ←
+  `onInboundConnection` ← `runInbound`；泄漏那次报的是同一处 `dupe` 丢掉指针）。修后同一探针
+  **12/12 干净**（0 ABRT / 0 泄漏）。
+- **修法**：`RaftTransport.RaftLock`（原子自旋，和 `scheduler.zig` 协调池线程的口径一致）+
+  `handleConnectionLocked(…, lock)` —— 锁只包 **decode → dispatch → encode** 这一段；socket 读、回包、
+  回推（可能 connect 到挂掉的对端）都在锁外，避免把 `tick()` 卡在对端的 connect 超时上。
+  `ClusterBootstrap` 持有 `raft_lock`：`tick()` 的 raft 步骤与入站分发各持一次。
+- 两处测试同步（都不是产品行为问题，是"等了一个计数、断言另一个计数"）：
+  `Actor: a plain worker survives handler errors` 现在等 `handled` **和** `handler_errors` 都到 2；
+  `MetricsBridge publishes the pool's counters` 在 `join()` 之后再等 `poolStats().claimed == 0`
+  （`join` 等的是 worker 自己那个 `claimed` 标志，池计数在 `runOne` 里晚一步递减）。
+- 读数：`Actor` 那条用同一段循环压 20000 轮 —— 旧等待条件有 7314 轮（37%）在断言前读到半更新状态，
+  新条件 0 轮；池那条带负载 40 次：修前 7 次失败（`expected 0, found 1`），修后 0 次。
+
 ### Scheduler Phase 2：红证据与守卫的复现复核（**破坏性：否**；只补验证，生产代码未改）
 
 v0.30.0 把就位环的出队改成 CAS 认领，**理由**是"旧出队下两条线程能拿到同一个 token、陈旧的槽位序号会让

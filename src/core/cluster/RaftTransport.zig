@@ -506,6 +506,27 @@ pub const ElectionTransportImpl = TransportImpl(0);
 
 // ── Inbound ─────────────────────────────────────────────────────────────────
 
+/// A spin lock for the one thing two threads here must not do at once: touch a
+/// `RaftElection`. The type has no lock of its own (plain fields, `ArrayList`,
+/// `StringHashMap`), while the wiring puts it on two threads — the app's
+/// `tick()` on one, this file's inbound dispatch on the accept thread another.
+///
+/// A spin lock rather than `std.Io.Mutex`: the guarded window is a handful of
+/// in-memory mutations (no IO, no locks of its own), and the accepting thread is
+/// an OS thread spawned outside the `io`'s own pool — the same reason
+/// `scheduler.zig` coordinates its pool threads with atomics.
+pub const RaftLock = struct {
+    flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    pub fn acquire(self: *RaftLock) void {
+        while (self.flag.swap(true, .acquire)) std.atomic.spinLoopHint();
+    }
+
+    pub fn release(self: *RaftLock) void {
+        self.flag.store(false, .release);
+    }
+};
+
 /// Serve one Raft RPC on `conn`: read a frame, dispatch it into `raft`, write the
 /// reply back on the same connection. The connection lifetime belongs to the
 /// caller (see `InboundServer.run`).
@@ -513,6 +534,20 @@ pub const ElectionTransportImpl = TransportImpl(0);
 /// `addresses` is optional and used only to push a vote response back to the
 /// candidate (whose own socket is closed by then).
 pub fn handleConnection(raft: *RaftElection, addresses: ?*const AddressBook, conn: *NetworkTransport.ClusterConnection) void {
+    handleConnectionLocked(raft, addresses, conn, null);
+}
+
+/// `handleConnection`, with an optional lock held across the **raft-state
+/// window only** — the decode → dispatch → encode stretch between the socket
+/// read and the socket write. Both ends of the function are IO (a `recv`, the
+/// reply, the relay dial), and neither may run under the lock: a `tick()` that
+/// waits on a peer's connect timeout would be a livelock, not a fix.
+pub fn handleConnectionLocked(
+    raft: *RaftElection,
+    addresses: ?*const AddressBook,
+    conn: *NetworkTransport.ClusterConnection,
+    lock: ?*RaftLock,
+) void {
     var in = std.ArrayList(u8).empty;
     defer in.deinit(conn.allocator);
     const frame = conn.recv(&in) catch |err| {
@@ -531,34 +566,41 @@ pub fn handleConnection(raft: *RaftElection, addresses: ?*const AddressBook, con
     // Only a granted vote needs the extra hop to the candidate.
     var relay_candidate: ?[]const u8 = null;
 
-    switch (tagOf(frame) orelse {
-        log.debug("[raft] dropping a {d}-byte frame with an unknown tag", .{frame.len});
-        return;
-    }) {
-        .vote_request => {
-            const req = decodeVoteRequest(allocator, frame) catch |err| return logDrop(err);
-            const resp = raft.handleVoteRequest(req) catch |err| return logDrop(err);
-            encodeVoteResponse(&out, allocator, resp, raft.local_id) catch |err| return logDrop(err);
-            if (resp.vote_granted) relay_candidate = req.candidate_id;
-        },
-        .append_entries => {
-            const req = decodeAppendEntries(allocator, frame) catch |err| return logDrop(err);
-            const resp = raft.handleAppendEntries(req) catch |err| return logDrop(err);
-            encodeAppendEntriesResponse(&out, allocator, resp) catch |err| return logDrop(err);
-        },
-        .install_snapshot => {
-            const req = decodeInstallSnapshot(allocator, frame) catch |err| return logDrop(err);
-            const resp = raft.handleInstallSnapshot(req) catch |err| return logDrop(err);
-            encodeInstallSnapshotResponse(&out, allocator, resp) catch |err| return logDrop(err);
-        },
-        .vote_response => {
-            const decoded = decodeVoteResponse(allocator, frame) catch |err| return logDrop(err);
-            raft.handleVoteResponse(decoded.resp, decoded.responder_id) catch |err| return logDrop(err);
-            return; // no reply: the candidate asked, this is the answer
-        },
-        // Nothing in `RaftElection` consumes these yet (the leader reads its
-        // AppendEntries reply on the synchronous path).
-        .append_entries_response, .install_snapshot_response => return,
+    // The locked window: decode → dispatch → encode. Everything after it
+    // (`writeFrame`, the relay dial) is IO and stays outside.
+    {
+        if (lock) |l| l.acquire();
+        defer if (lock) |l| l.release();
+
+        switch (tagOf(frame) orelse {
+            log.debug("[raft] dropping a {d}-byte frame with an unknown tag", .{frame.len});
+            return;
+        }) {
+            .vote_request => {
+                const req = decodeVoteRequest(allocator, frame) catch |err| return logDrop(err);
+                const resp = raft.handleVoteRequest(req) catch |err| return logDrop(err);
+                encodeVoteResponse(&out, allocator, resp, raft.local_id) catch |err| return logDrop(err);
+                if (resp.vote_granted) relay_candidate = req.candidate_id;
+            },
+            .append_entries => {
+                const req = decodeAppendEntries(allocator, frame) catch |err| return logDrop(err);
+                const resp = raft.handleAppendEntries(req) catch |err| return logDrop(err);
+                encodeAppendEntriesResponse(&out, allocator, resp) catch |err| return logDrop(err);
+            },
+            .install_snapshot => {
+                const req = decodeInstallSnapshot(allocator, frame) catch |err| return logDrop(err);
+                const resp = raft.handleInstallSnapshot(req) catch |err| return logDrop(err);
+                encodeInstallSnapshotResponse(&out, allocator, resp) catch |err| return logDrop(err);
+            },
+            .vote_response => {
+                const decoded = decodeVoteResponse(allocator, frame) catch |err| return logDrop(err);
+                raft.handleVoteResponse(decoded.resp, decoded.responder_id) catch |err| return logDrop(err);
+                return; // no reply: the candidate asked, this is the answer
+            },
+            // Nothing in `RaftElection` consumes these yet (the leader reads its
+            // AppendEntries reply on the synchronous path).
+            .append_entries_response, .install_snapshot_response => return,
+        }
     }
 
     writeFrame(conn.stream, out.items) catch |err| {

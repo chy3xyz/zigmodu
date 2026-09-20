@@ -128,6 +128,16 @@ defer allocator.free(json);               // 挂到 /cluster/health 或 metrics 
 - 仍要你自己决定的：**peer id 与地址的对应关系**。`BootstrapConfig.peers` 只有 `host:port`，
   raft 侧 peer id 记的是 host（`addPeer(p.host)`），所以同主机多节点要区分开就得给每个节点不同的
   `port` 并在 `node_id` 上用稳定、可辨识的 id（投票应答的回推按 `candidate_id` 查地址簿）。
+- **两个线程碰的同一个 `RaftElection`，由门面串起来**：`tick()` 在**你的线程**上跑 `raft.tick()`，
+  而入站分发在 `start()` 起的 accept 线程上跑 `raft.handleVoteRequest` / `handleAppendEntries` ——
+  两边都会 free/dupe `voted_for`、推 `log`、改 `next_index`/`match_index`，而 `RaftElection`
+  自己不带锁。所以 `ClusterBootstrap` 持一把 `raft_lock`（`RaftTransport.RaftLock`，原子自旋，
+  与 `scheduler.zig` 协调池线程同口径）：`tick()` 的 raft 步骤、入站分发的
+  decode→dispatch→encode 段各持一次，**socket 读 / 回包 / 回推不在锁内**（对端 connect 超时不该
+  卡住 `tick()`）。不给 `.transport` 的节点没有 accept 线程，锁是零成本的一条取指。
+  不这么做的实际症状是**进程级 ABRT**（`voted_for` 的 read-then-free 交错 →
+  `double free of [addr: …]`，两边都是 `RaftElection.zig` 的 `handleVoteRequest` / `startElection`），
+  另一种交错顺序只是漏掉那一小段（`SafeAllocator` 报 leaked）—— 两种都在 12 次里各撞到过。
 
 ## Production Deployment Checklist
 
