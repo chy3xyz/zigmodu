@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.31.0] - 2026-09-20
 
 ### Runtime：监督树 —— 组、策略、强度、树（**破坏性：否**；`docs/RUNTIME.md` §14）
 
