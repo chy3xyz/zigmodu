@@ -29,8 +29,8 @@
 //! |---|---|---|
 //! | `pub const Message = T;` + `pub fn handle(self: *W, msg: T, ctx: anytype) anyerror!void` | message loop | once per message, until `stop()`/`close()` |
 //! | `pub fn run(self: *W, ctx: anytype) anyerror!void` | loop-owned | once; the worker loops itself until `ctx.stopped()` |
-//! | `pub fn init(self: *W, ctx: anytype) anyerror!void` (optional) | before either of the above | once |
-//! | `pub fn deinit(self: *W) void` (optional) | after either of the above | once |
+//! | `pub fn init(self: *W, ctx: anytype) anyerror!void` (optional) | before either of the above | once per generation |
+//! | `pub fn deinit(self: *W) void` (optional) | after either of the above | once per generation |
 //!
 //! `ctx` is a `WorkerContext(W, capacity)` value — passed as `anytype` so a
 //! worker never has to name the mailbox capacity. It exposes `runtime`, `io`,
@@ -83,6 +83,7 @@ const ring_mod = @import("ring.zig");
 const sequencer_mod = @import("sequencer.zig");
 const scheduler_mod = @import("scheduler.zig");
 const recorder_mod = @import("recorder.zig");
+const supervisor_mod = @import("supervisor.zig");
 
 pub const Clock = clock_mod.Clock;
 pub const Wheel = wheel_mod.Wheel;
@@ -108,12 +109,98 @@ pub const SpawnMode = enum {
     pooled,
 };
 
+/// What a worker's `handle` does with the thread it is given, i.e. which pool may
+/// run it (docs/RUNTIME.md §6: "a pooled worker must not block for long").
+///
+/// **This is a declaration, not a detection.** Zig cannot answer "will this code
+/// wait on something outside the process?" in general — a `handle` may block on a
+/// syscall, a lock, a channel, an allocator, or on a call three modules down — so
+/// the runtime does not try. What the class buys is narrow and exact: a worker
+/// that *declares* itself blocking runs on a **separate pool**, so its waits
+/// cannot consume the threads the CPU-class pool needs to keep other workers
+/// moving. It does not help a worker that forgot to declare, and it cannot
+/// (nothing observes a block). The honest reading is "declared blocking = kept out
+/// of the CPU pool", never "known not to block".
+///
+/// Declaring `.blocking` requires `.mode = .pooled`: a dedicated worker already
+/// owns a thread of its own, so a class would be a no-op — and a *silently
+/// ignored* declaration is the one failure mode worse than an undeclared one. It
+/// also requires the runtime to have declared a blocking width
+/// (`SchedulerConfig.blocking_threads`); without one, `spawn` returns
+/// `error.BlockingPoolNotConfigured`, like `.pooled` without a pool.
+pub const ExecutionClass = enum {
+    /// The handler runs to completion without waiting on anything outside the
+    /// process — computation, in-memory state, a `tryPush` that fails rather than
+    /// waits. **The default**, because `.pooled` has always meant exactly this and
+    /// an undeclared class must change nothing.
+    ///
+    /// The CPU pool is sized for *cores* (`pool_threads`): a handler here should
+    /// hold a core for the length of one bounded batch, not for the length of a
+    /// query.
+    cpu,
+    /// The handler may wait: a DB round trip, a blocking HTTP client, file IO, a
+    /// third-party lock. Declared, it moves to the blocking pool — its own ring,
+    /// its own threads (`blocking_threads`), its own admission bound
+    /// (`max_blocking_workers`) — so a worker that blocks for a second holds a
+    /// *blocking* thread and nothing else. That pool can be declared wider than
+    /// any CPU pool would sensibly be, because its threads are waiting rather than
+    /// computing.
+    blocking,
+};
+
+/// What a **stop for good** does with the messages already accepted into a
+/// worker's mailbox.
+///
+/// Before this declaration existed the answer was a side effect of `mode`: a
+/// dedicated actor's supervisor stop broke the receive loop with a queue still
+/// behind it (`immediate`), while the pool kept handing a pooled actor back while
+/// its mailbox had anything in it (`drain`). Both answers are still reachable —
+/// they are what `null` resolves to, per mode — but they are now a decision at the
+/// spawn site rather than something to be discovered from `docs/RUNTIME.md`
+/// §12.10. Declaring the other one moves a worker to the other behaviour.
+///
+/// **What this does not cover, said plainly:** `Handle.stop()` — the external
+/// "finish what you have" request — drains the queue under *either* policy, in
+/// both modes, exactly as it did before this field existed (a `close()` leaves
+/// queued messages available, and neither receive loop stops while one is). The
+/// policy governs the *stop for good*, i.e. where a worker ends its own service:
+/// the supervisor's decision inside `handle`/`run`. Shutdown has its own,
+/// structural answer (`docs/RUNTIME.md` §12.6: the pools go before the workers, so
+/// a pooled worker's tail is unreachable rather than drained) and is deliberately
+/// not redirected by this field.
+pub const StopPolicy = enum {
+    /// The worker stops now. Whatever is still in the mailbox is counted as
+    /// abandoned (`WorkerStats.discarded_on_stop`,
+    /// `RuntimeStats.messages_discarded_on_stop`) and never handled — §5's "a
+    /// drop has to be visible" applies to work that was accepted and then
+    /// abandoned by a stop.
+    immediate,
+    /// The messages already accepted are worked off before the worker stops.
+    /// Nothing is abandoned, so `discarded_on_stop` stays 0 for the tail (a
+    /// producer that raced the stop can still add a message after the last
+    /// count; see `countAbandoned`).
+    drain,
+};
+
 /// `spawn`'s last argument, in either of the two shapes `spawnConfig` accepts.
 pub const SpawnConfig = struct {
     /// Mailbox capacity in messages. Comptime, because the mailbox is a
     /// fixed-capacity ring.
     capacity: usize,
     mode: SpawnMode = .dedicated,
+    /// Which pool may run this worker — see `ExecutionClass`. `.cpu` (the
+    /// default) is the pool as it was before the class existed: undeclared, this
+    /// field changes nothing at all, and a runtime that declares no blocking
+    /// width cannot spawn a `.blocking` worker in the first place.
+    execution_class: ExecutionClass = .cpu,
+    /// How a stop for good treats the queue — see `StopPolicy`.
+    ///
+    /// `null` (the default) is **the mode's historical answer**, which is what
+    /// keeps this declaration from changing any existing worker: `.dedicated`
+    /// resolves to `.immediate`, `.pooled` to `.drain` (docs/RUNTIME.md §12.10's
+    /// two rows, unchanged). Declare it to move one worker to the other
+    /// behaviour; `handle.stop_policy` is the resolved value.
+    stop_policy: ?StopPolicy = null,
     /// Declare a delivery track for this worker (docs/RUNTIME.md §13): every
     /// message that reaches its mailbox — from `send*`, from a `HotBus` fan-out,
     /// from `after(...)` — is then logged with a global sequence number, and the
@@ -151,11 +238,13 @@ pub fn spawnConfig(comptime arg: anytype) SpawnConfig {
             for (@typeInfo(T).@"struct".field_names) |field_name| {
                 if (!@hasField(SpawnConfig, field_name)) @compileError(
                     "unknown field `." ++ field_name ++ "` in spawn's config for `" ++ @typeName(T) ++
-                        "`: the accepted fields are .capacity, .mode and .record",
+                        "`: the accepted fields are .capacity, .mode, .execution_class, .stop_policy and .record",
                 );
             }
             var config: SpawnConfig = .{ .capacity = @field(arg, "capacity") };
             if (@hasField(T, "mode")) config.mode = @field(arg, "mode");
+            if (@hasField(T, "execution_class")) config.execution_class = @field(arg, "execution_class");
+            if (@hasField(T, "stop_policy")) config.stop_policy = @field(arg, "stop_policy");
             if (@hasField(T, "record")) {
                 // Field by field: the literal at the call site is an anonymous
                 // struct, so there is no `?TrackSpec` to assign from directly.
@@ -255,6 +344,12 @@ const TimerCommand = union(enum) {
 /// window and then stop for good — the classic supervision "intensity", which
 /// exists because an actor that errors on *every* message otherwise burns a core
 /// forever while looking alive.
+///
+/// A member of a **supervision group** (§14) adds one more step: when its own
+/// answer is "stop", it hands the decision to the group before anything is torn
+/// down. The group may rebuild it instead — in place, `deinit` + `init` on the
+/// member's own thread — which is what turns "this actor died" into "this actor
+/// died and came back".
 pub const Supervision = struct {
     pub const Strategy = enum {
         /// Log the error, keep serving. The v0.16 worker contract.
@@ -268,7 +363,25 @@ pub const Supervision = struct {
     /// 0 = unlimited (plain-worker behaviour: never stop on errors).
     max_errors: u32 = 0,
     window_ms: i64 = 10_000,
+    /// The **supervision group** this worker belongs to, if any (docs/RUNTIME.md
+    /// §14). A group member that is going down hands the decision to the group —
+    /// which may rebuild it, rebuild its group-mates, or take the group down —
+    /// instead of stopping where it stands. A worker with no group keeps the
+    /// v0.16/v0.17 behaviour exactly: stop, log, count.
+    ///
+    /// Membership is declared here rather than inferred from spawn order so a
+    /// group is a choice rather than a side effect, and so `spawn`'s signature
+    /// does not change to carry it.
+    group: ?*supervisor_mod.Group = null,
 };
+
+/// A supervision group's failure policy (docs/RUNTIME.md §14). Re-exported here
+/// so a caller configuring supervision never has to name `runtime.supervisor`.
+pub const GroupPolicy = supervisor_mod.Policy;
+/// A group's restart budget: at most `max_restarts` rebuilds inside `window_ms`.
+pub const Intensity = supervisor_mod.Intensity;
+/// A supervision group: a set of workers that handle each other's failures.
+pub const Group = supervisor_mod.Group;
 
 pub const WorkerStats = struct {
     name: []const u8,
@@ -296,6 +409,10 @@ pub const WorkerStats = struct {
     errors_in_window: u32,
     /// True when the supervisor stopped this actor (fail-fast or over budget).
     stopped_by_supervisor: bool,
+    /// How many times this member has been **rebuilt** by its supervision group
+    /// (§14): each one is a `deinit` + `init` on the member's own thread. 0 for a
+    /// member in no group, and for one that has never failed.
+    group_restarts: u64,
 };
 
 pub const RuntimeStats = struct {
@@ -335,6 +452,22 @@ pub const RuntimeStats = struct {
     /// separates "a producer is under backpressure" from "a fired timer's
     /// message never arrived". See docs/RUNTIME.md §5.
     timer_deliveries_dropped: u64,
+    /// Members stopped by supervision (§14) — the "counter" §3b's error budget
+    /// was always meant to end in, which until now stopped at
+    /// `WorkerStats.stopped_by_supervisor`: a per-worker reading only a poller
+    /// could see, and one `shutdown` takes with it.
+    ///
+    /// Accumulated on the runtime rather than summed over the live workers, for
+    /// the reason spelled out on `messages_discarded_on_stop` — and it matters
+    /// more here: "a member died" is the reading you most want after a process
+    /// has already stopped.
+    supervised_stops: u64,
+    /// Rebuilds supervision actually **executed** (§14): each is a `deinit` +
+    /// `init` on the member's own thread, not merely a request another thread
+    /// posted — a member that stops before it notices a request never becomes one.
+    /// A member that keeps dying shows up here as a number climbing toward its
+    /// group's `max_restarts`.
+    group_restarts: u64,
     /// Worst lateness observed between a timer's deadline and its firing.
     timer_lag_max_ms: i64,
 };
@@ -365,7 +498,30 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         context: WorkerContext(W, capacity),
         thread: ?std.Thread = null,
         stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        /// The group's "rebuild yourself" request (§14) — the sibling of
+        /// `stop_requested`, seen at the same points (the dedicated loop's top,
+        /// a pool claim) and for the same reason: a member is never interrupted
+        /// mid-message. Set by a group-mate's thread (a `mem.atomic` store, so
+        /// any thread may do it); cleared by this member's own thread when it
+        /// rebuilds. When both are set, `stop` wins — a thing on its way down
+        /// must not be built back up.
+        restart_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         handler_errors: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        /// Rebuilds this member has actually executed. Written by its own thread;
+        /// atomic because `stats()` reads it from another one.
+        group_restarts: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        /// Set by a group-mate *before* it calls `stop()` on this member, so the
+        /// release in `stop()` publishes it and this member's own thread can count
+        /// the stop on its way out. A plain `bool` would not do: the writer is
+        /// another thread.
+        stopped_by_group: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        /// Idempotence for the supervised-stop count: the dedicated loop's exit
+        /// and the pooled `abandon` both want to count it, and it must land once.
+        supervised_stop_counted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        /// This member's position in its group's member list, or null when it is
+        /// in no group. `rest_for_one` is the only reader: it is what tells
+        /// "spawned after the failure" from "spawned before it" (§14.3).
+        group_index: ?usize = null,
         /// Messages counted instead of run when this worker stopped — see
         /// `countAbandoned`. Atomic because `stats()` reads it from another
         /// thread (a scrape, most of the time).
@@ -399,6 +555,19 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         /// that starts at `spawn`, so this is what the destroy path reads to
         /// decide whether a `deinit` is owed.
         started: bool = false,
+        /// What a stop for good does with the queue (see `StopPolicy`). Written
+        /// once, at `spawn`, before any thread can run this worker — read by the
+        /// receive loop, the pooled batch and the hand-back re-check, so it is a
+        /// plain field rather than an atomic.
+        stop_policy: StopPolicy = .immediate,
+        /// `.pooled` only: the worker stopped for good under `.immediate`, so
+        /// nothing in the mailbox will ever be run again. It exists because the
+        /// refused work stays *parked* rather than being drained out (see
+        /// `countAbandoned`), and two readers have to know that "still in the
+        /// mailbox" no longer means "still waiting to run": the hand-back's
+        /// re-check (`pooledPending`, which must not re-arm the worker) and
+        /// `join` (which must not wait for a queue nobody will serve).
+        abandoned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         /// Set only when this worker was spawned with `.record = …`: its delivery
         /// track (docs/RUNTIME.md §13), owned by the runtime's `DeliveryLog`. Null
         /// — the default — is what keeps `send` costing one null check, and the
@@ -482,6 +651,12 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         /// `recv` wakes up. The thread is joined by `Runtime.shutdown()` (or
         /// `join()`), never by `stop()` — callers must be able to decide how long
         /// to wait.
+        ///
+        /// **The queue in front of it is still worked off**, under either
+        /// `StopPolicy` and in both modes: `close()` leaves what was accepted
+        /// available, and neither receive loop stops while a message is there. What
+        /// `stop_policy` governs is the *stop for good* — the supervisor's
+        /// decision inside `handle` — see `StopPolicy`.
         pub fn stop(self: *Self) void {
             self.stop_requested.store(true, .release);
             self.mailbox.close();
@@ -573,8 +748,9 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
 
         /// Count — and deliberately *not* run — whatever is still in the mailbox
         /// at a point where this worker can never `recv` again: its own loop has
-        /// returned (dedicated), or the pool that would have dispatched it has
-        /// (`Runtime.shutdown`'s teardown). Nobody is going to handle those
+        /// returned (dedicated, or a `.pooled` worker stopped under
+        /// `.stop_policy = .immediate`), or the pool that would have dispatched it
+        /// has (`Runtime.shutdown`'s teardown). Nobody is going to handle those
         /// messages, so the least this can do is leave a number (§5's rule), on
         /// the worker *and* on the runtime — the handle is destroyed by the very
         /// `shutdown` that abandoned them, so a per-worker counter alone would be
@@ -625,7 +801,34 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
                 .handler_errors = self.handler_errors.load(.monotonic),
                 .errors_in_window = self.errors_in_window,
                 .stopped_by_supervisor = self.stopped_by_supervisor,
+                .group_restarts = self.group_restarts.load(.monotonic),
             };
+        }
+
+        /// Count this member's supervised stop exactly once, whichever path got
+        /// here first (the dedicated loop's exit, or the pooled `abandon`). Both
+        /// reasons count and they are not the same reason: `stopped_by_supervisor`
+        /// is "I decided my own stop" (§3b's budget), `stopped_by_group` is "a
+        /// group-mate took me down with it" (§14) — but both are supervised stops
+        /// on the same counter, because the reading is "this worker was stopped
+        /// by the framework, not by `shutdown`".
+        fn countSupervisedStop(self: *Self) void {
+            if (!self.stopped_by_supervisor and !self.stopped_by_group.load(.acquire)) return;
+            if (self.supervised_stop_counted.swap(true, .acq_rel)) return;
+            // `release`, not `monotonic`: the plain `stopped_by_supervisor` flag
+            // written above is what a reader of this counter wants to conclude
+            // from, so the counter has to publish it. An acquire load of the
+            // counter (which is how `Published` in this file's tests reads it)
+            // then orders the flag behind it.
+            _ = self.runtime.supervised_stops.fetchAdd(1, .release);
+        }
+
+        /// Count one executed rebuild (§14). Called by the member's own thread,
+        /// right before `deinit` + `init` — "executed", not "requested", because a
+        /// request to a member that stops first never becomes one.
+        fn countGroupRestart(self: *Self) void {
+            _ = self.group_restarts.fetchAdd(1, .release);
+            _ = self.runtime.group_restarts.fetchAdd(1, .release);
         }
 
         pub fn join(self: *Self) void {
@@ -650,8 +853,16 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
                 // hang the shutdown. What those messages are is counted by
                 // `Runtime.shutdown`, which owns the fact that the pool is gone
                 // (`countAbandoned`, through the entry's `abandon` thunk).
+                //
+                // `abandoned` is the third way of the same thing, and it is a
+                // *decision* rather than a race: a `.immediate` worker stopped by
+                // its supervisor left a queue nobody will ever run (that is what
+                // the policy declares), so waiting for it empty would wait
+                // forever. The messages are counted by the batch that abandoned
+                // them; `join` returning here is what makes that count readable.
                 while (self.claimed.load(.acquire) or
-                    (self.mailbox.len() != 0 and !link.scheduler.stopping.load(.acquire)))
+                    (self.mailbox.len() != 0 and !self.abandoned.load(.acquire) and
+                        !link.scheduler.stopping.load(.acquire)))
                 {
                     // Spins rather than parking: this is a startup/shutdown-path
                     // call, and a condition variable here would put a signal on
@@ -764,6 +975,11 @@ pub const Runtime = struct {
     cmd_idle: std.Io.Condition = .init,
     /// One entry per spawned worker (type-erased), plus its destroy thunk.
     workers: std.ArrayList(Entry) = .empty,
+    /// Supervision groups (§14), owned by the runtime because they outlive any
+    /// one member: a group's whole point is to act on members that have stopped.
+    /// Freed at `shutdown`, after the workers are gone (`Entry.destroy`), so no
+    /// member can be asked to do anything on the way out.
+    groups: std.ArrayList(*supervisor_mod.Group) = .empty,
     /// The runtime is *alive* from construction until `shutdown`. Deliberately
     /// not the same thing as "the ticker is running": driving timers yourself
     /// (`tick()` + a Manual clock, or an event loop you already own) is a
@@ -802,12 +1018,29 @@ pub const Runtime = struct {
     /// `shutdown` joins and destroys in one pass, so a per-worker sum would read
     /// 0 for exactly the loss this counter exists to make visible.
     messages_discarded_on_stop: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Members stopped by supervision (§14), and rebuilds actually executed.
+    /// Accumulated here for the same reason `messages_discarded_on_stop` is:
+    /// `shutdown` destroys the workers in the same pass it stops them, so a sum
+    /// over them would read 0 for exactly the events these two exist to make
+    /// visible — and a member's death is the thing you most want to see after a
+    /// process has stopped.
+    supervised_stops: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    group_restarts: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     timer_lag_max_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     /// The pool behind `.mode = .pooled`, present only when it was declared at
     /// construction (`Runtime.initWithOptions`). Null — the default — means this
     /// runtime runs no pool thread at all and `.pooled` is a configuration error
-    /// (docs/RUNTIME.md §12.8 D2).
+    /// (docs/RUNTIME.md §12.8 D2). This is the **`.cpu`** pool: the one that has
+    /// always existed.
     scheduler: ?*Scheduler = null,
+    /// The **blocking** pool behind `.execution_class = .blocking` (docs/RUNTIME.md
+    /// §6), present only when a blocking width was declared. A second `Scheduler`,
+    /// not a setting inside the first: the two share no ring, no thread and no
+    /// admission counter, which is what makes "a blocked blocking worker cannot
+    /// hold a CPU-pool thread" structural. Null — the default — means `.blocking`
+    /// is refused at `spawn` rather than quietly falling back to the pool a
+    /// blocking handler would hold down.
+    blocking_scheduler: ?*Scheduler = null,
     /// The delivery log (docs/RUNTIME.md §13), present only once a worker
     /// declared `.record = …` — created on the first such `spawn`, so a runtime
     /// whose workers declare no track allocates nothing and holds no rings. It
@@ -831,6 +1064,10 @@ pub const Runtime = struct {
         /// shutdown, between joining the pool and destroying the worker — the
         /// check §12.6 asks for ("confirm every ownership was handed back").
         claimed: *const fn (*anyopaque) bool,
+        /// Set the member's restart flag (§14). Same shape as `request_stop`
+        /// because it is the same kind of thing: a request another thread posts,
+        /// which only the member's own thread can act on.
+        request_restart: *const fn (*anyopaque) void,
     };
 
     /// How often the ticker wakes to fire timers. One level-0 spoke is 10 ms;
@@ -868,14 +1105,34 @@ pub const Runtime = struct {
     /// allocates its ready ring here, sized from the declared bound — see the
     /// capacity invariant in `scheduler.zig` (that sizing is what makes a token
     /// push infallible, so it cannot be deferred to a constant).
+    ///
+    /// A declared **blocking** width builds a second pool, with the same rules
+    /// applied to its own bound (docs/RUNTIME.md §6): `max_blocking_workers`, or
+    /// `max_pooled_workers` when that is left 0, sizes its ring and admits its
+    /// workers. `blocking_threads` without any bound to size the ring from is a
+    /// configuration mistake — refused here rather than asserted inside
+    /// `Scheduler.init`, so it cannot depend on an optimisation mode.
     pub fn initWithOptions(
         allocator: std.mem.Allocator,
         io: std.Io,
         options: InitOptions,
     ) !Self {
         var self = init(allocator, io, options.clock);
+        errdefer self.deinit();
         if (options.scheduler.max_pooled_workers != 0) {
             self.scheduler = try Scheduler.init(allocator, io, options.scheduler);
+        }
+        if (options.scheduler.blocking_threads != 0) {
+            const bound = if (options.scheduler.max_blocking_workers != 0)
+                options.scheduler.max_blocking_workers
+            else
+                options.scheduler.max_pooled_workers;
+            if (bound == 0) return error.BlockingPoolNotConfigured;
+            self.blocking_scheduler = try Scheduler.init(allocator, io, .{
+                .max_pooled_workers = bound,
+                .pool_threads = options.scheduler.blocking_threads,
+                .batch = options.scheduler.batch,
+            });
         }
         return self;
     }
@@ -884,11 +1141,16 @@ pub const Runtime = struct {
         self.shutdown();
         self.wheel.deinit();
         self.workers.deinit(self.allocator);
-        // Last: `shutdown` stops the pool's threads, but tokens that arrived while
-        // they were winding down are still in the ring, and nothing reads them
-        // again — the pool is the ring's only consumer.
+        // `shutdown` already freed the groups themselves; this frees the list
+        // that held them (a runtime that never spawned one frees an empty list).
+        self.groups.deinit(self.allocator);
+        // Last: `shutdown` stops the pools' threads, but tokens that arrived while
+        // they were winding down are still in the rings, and nothing reads them
+        // again — a pool is its ring's only consumer.
         if (self.scheduler) |sched| sched.deinit();
         self.scheduler = null;
+        if (self.blocking_scheduler) |sched| sched.deinit();
+        self.blocking_scheduler = null;
         // After `shutdown` (the handles that point into it are already destroyed),
         // and only here: the log has to survive a `shutdown` so the run can be
         // replayed at all (docs/RUNTIME.md §13.4).
@@ -997,12 +1259,19 @@ pub const Runtime = struct {
             }
         }
 
-        // Then the pool: it can be running a worker whose handle the lines below
-        // are about to free. `Scheduler.shutdown` waits for the batch in flight
-        // to finish (a worker that never returns still blocks shutdown — §4's
-        // rule, kept).
-        if (self.scheduler) |sched| {
-            sched.shutdown();
+        // Then the pools: either can be running a worker whose handle the lines
+        // below are about to free. `Scheduler.shutdown` waits for the batch in
+        // flight to finish (a worker that never returns still blocks shutdown —
+        // §4's rule, kept).
+        //
+        // Both are stopped before the assertion that follows, because a worker's
+        // class decides *which* pool holds its claim and the check below is about
+        // the claim, not about the pool (docs/RUNTIME.md §6). A `.blocking` worker
+        // whose pool was left running is exactly the shape §12.6's order exists to
+        // rule out.
+        if (self.scheduler) |sched| sched.shutdown();
+        if (self.blocking_scheduler) |sched| sched.shutdown();
+        if (self.scheduler != null or self.blocking_scheduler != null) {
             for (self.workers.items) |entry| {
                 // A pooled worker has no thread, so `join` cannot have waited for
                 // anything; the claim is the only thing that says "a pool thread
@@ -1030,6 +1299,14 @@ pub const Runtime = struct {
         for (self.workers.items) |entry| entry.abandon(entry.ptr);
         for (self.workers.items) |entry| entry.destroy(entry.ptr, self.allocator);
         self.workers.clearRetainingCapacity();
+
+        // Groups last, and only now: a group exists to act on members, so it must
+        // not outlive them through a moment where `stopSubtree` could reach a
+        // freed handle. Nothing above joins a group's member list, so this is
+        // also the only place a member list is freed.
+        for (self.groups.items) |group| group.deinit(self.allocator);
+        for (self.groups.items) |group| self.allocator.destroy(group);
+        self.groups.clearRetainingCapacity();
 
         // Nobody is driving the wheel any more, so commands still in flight will
         // never become timers — and their payloads are owned by this queue until
@@ -1064,10 +1341,51 @@ pub const Runtime = struct {
         return self.spawnSupervised(W, initial_state, config, .{});
     }
 
+    /// Create a **supervision group** (docs/RUNTIME.md §14): a set of workers
+    /// whose failures are handled together, by `policy`, inside a restart budget.
+    ///
+    /// The group is owned by this runtime and freed at `shutdown` — it has to
+    /// outlive the members it acts on, since a member stopping is exactly when it
+    /// is needed. Members join by naming the group in their `Supervision`
+    /// (`spawnActor(..., .{ .group = g })`), which is also what makes the
+    /// membership a choice rather than a side effect of spawn order.
+    ///
+    /// `policy` and the budget are the whole configuration; see `GroupPolicy`
+    /// for what each policy does, and `Intensity` for why `max_restarts = 0`
+    /// means "never" rather than `max_errors`' "unlimited".
+    pub fn spawnGroup(self: *Self, policy: supervisor_mod.Policy) !*supervisor_mod.Group {
+        return self.spawnGroupWith(policy, .{});
+    }
+
+    /// `spawnGroup` with an explicit restart budget.
+    pub fn spawnGroupWith(
+        self: *Self,
+        policy: supervisor_mod.Policy,
+        intensity: supervisor_mod.Intensity,
+    ) !*supervisor_mod.Group {
+        const group = try self.allocator.create(supervisor_mod.Group);
+        errdefer self.allocator.destroy(group);
+        group.* = supervisor_mod.Group.init(policy, intensity);
+        errdefer group.deinit(self.allocator);
+        try self.groups.append(self.allocator, group);
+        return group;
+    }
+
+    /// Make `parent` treat `child` as one of its members: a failure inside
+    /// `child`'s subtree that `child` cannot handle is escalated to `parent`,
+    /// which applies **its** policy (§14.5).
+    ///
+    /// The edge is stored parent-ward (on the child), so an action can walk down
+    /// the member lists while the tree is still walkable upward.
+    pub fn nestGroup(self: *Self, parent: *supervisor_mod.Group, child: *supervisor_mod.Group) !void {
+        _ = try parent.addSubgroup(self.allocator, child);
+    }
+
     /// Spawn an **actor**: same contract as a worker, but the runtime supervises
     /// it — a bounded error budget inside a window, and a stop when the budget is
     /// spent. Defaults differ from `spawn` on purpose: an actor that keeps
-    /// failing is stopped rather than left burning a core.
+    /// failing is stopped rather than left burning a core. Pass
+    /// `.{ .group = g }` to put it in a supervision group (§14).
     pub fn spawnActor(
         self: *Self,
         comptime W: type,
@@ -1078,6 +1396,16 @@ pub const Runtime = struct {
         return self.spawnSupervised(W, initial_state, config, supervision);
     }
 
+    /// The form `spawn` / `spawnActor` both funnel through: `spawn` with a
+    /// supervision policy.
+    ///
+    /// Declaring `run` (`W.run` owns its own loop) makes a worker
+    /// **unrestartable**: the runtime cannot reach into that loop to tear the
+    /// state down, and nothing would ever read the group's request. Putting one
+    /// in a group that rebuilds is `error.NotRestartable` at spawn — a wiring
+    /// mistake said out loud, on the same principle as the
+    /// `.pooled`-a-`run`-worker and `.record`-a-`run`-worker compile errors. A
+    /// `.stop_group` group never rebuilds, so it accepts one.
     pub fn spawnSupervised(
         self: *Self,
         comptime W: type,
@@ -1097,6 +1425,21 @@ pub const Runtime = struct {
                 "Declare `pub const Message` + `pub fn handle` to pool a worker, or leave it `.dedicated`.",
         );
 
+        // `.blocking` is a declaration about *which pool runs the handler*, so it
+        // needs a pool: a dedicated worker already owns a thread of its own, and a
+        // `run`-owned worker is its own loop. Refusing this here (rather than
+        // ignoring the class on a dedicated worker) is the whole reason the class
+        // is a field instead of a comment: a declaration that silently does
+        // nothing is worse than no declaration at all (docs/RUNTIME.md §6).
+        const execution_class = comptime spawn_config.execution_class;
+        if (comptime (execution_class == .blocking and !pooled)) @compileError(
+            @typeName(W) ++ " declares `.execution_class = .blocking` but not `.mode = .pooled`: " ++
+                "the class says *which pool* runs the handler, and a `.dedicated` worker has a " ++
+                "thread of its own (docs/RUNTIME.md §6). Write " ++
+                "`.{ .capacity = …, .mode = .pooled, .execution_class = .blocking }`, or leave the " ++
+                "class at its default (`.cpu`).",
+        );
+
         // A delivery track is declared at the spawn site (§13.6 · 1) and its
         // capacity is comptime by construction: the ring is a fixed array of the
         // worker's own `Message`.
@@ -1112,13 +1455,30 @@ pub const Runtime = struct {
 
         // A pool has to have been declared; `.pooled` without one is a
         // configuration mistake, not something to paper over by starting a
-        // thread (D2).
+        // thread (D2). *Which* pool is the execution class's one job: it decides
+        // here and nowhere else, so the rest of the spawn — the ready link, the
+        // hand-back, the stop policy — never has to know a class exists.
         var sched: ?*Scheduler = null;
-        if (pooled) sched = self.scheduler orelse return error.PoolNotConfigured;
-        // ...and the declaration is a hard bound, not a hint: the ready ring's
-        // capacity is derived from it, so admitting one worker more than it says
-        // would make a token push fail — which strands a worker (see the
-        // capacity invariant in `scheduler.zig`).
+        if (pooled) sched = switch (execution_class) {
+            .cpu => self.scheduler orelse return error.PoolNotConfigured,
+            .blocking => self.blocking_scheduler orelse return error.BlockingPoolNotConfigured,
+        };
+
+        // A `run`-owned worker owns its own loop, so the runtime can neither
+        // reach in to tear its state down nor get it to look at a restart
+        // request. Refused at spawn rather than accepted-and-ignored: a member
+        // that silently never rebuilds is a supervision tree that reads as
+        // configured and behaves as absent (§14.4). `.stop_group` is fine — that
+        // policy never rebuilds anything.
+        if (supervision.group) |group| {
+            if (comptime !@hasDecl(W, "handle")) {
+                if (group.policy != .stop_group) return error.NotRestartable;
+            }
+        }
+        // ...and the declaration is a hard bound, not a hint: each pool's ready
+        // ring capacity is derived from *its* bound, so admitting one worker more
+        // than it says would make a token push fail — which strands a worker (see
+        // the capacity invariant in `scheduler.zig`).
         if (sched) |s| try s.reserve();
         errdefer if (sched) |s| s.release();
 
@@ -1146,6 +1506,13 @@ pub const Runtime = struct {
             .supervision = supervision,
             .window_start_ms = self.clock.nowMs(),
             .track = track,
+            // `null` = "whatever this mode has always done", resolved here so the
+            // policy is one value at one moment: `.dedicated` keeps the loop's
+            // historical `immediate` stop, `.pooled` keeps the pool's `drain`
+            // (docs/RUNTIME.md §12.10). An *undeclared* policy therefore changes
+            // nothing at all, which is the compatibility requirement that made the
+            // default per-mode instead of a single value.
+            .stop_policy = spawn_config.stop_policy orelse if (pooled) .drain else .immediate,
         };
         handle.context = .{
             .runtime = self,
@@ -1171,12 +1538,7 @@ pub const Runtime = struct {
         try self.workers.append(self.allocator, .{
             .ptr = @ptrCast(handle),
             .name = @typeName(W),
-            .request_stop = struct {
-                fn f(p: *anyopaque) void {
-                    const h: *H = @ptrCast(@alignCast(p));
-                    h.stop();
-                }
-            }.f,
+            .request_stop = stopThunk(H),
             .join = struct {
                 fn f(p: *anyopaque) void {
                     const h: *H = @ptrCast(@alignCast(p));
@@ -1205,8 +1567,16 @@ pub const Runtime = struct {
                 fn f(p: *anyopaque) void {
                     const h: *H = @ptrCast(@alignCast(p));
                     h.countAbandoned();
+                    // Also the pooled half of the supervised-stop count: a
+                    // dedicated member counted at its loop exit, a pooled one has
+                    // no exit of its own — the claim is handed back and that is
+                    // all — so its stop is counted here, where every worker is
+                    // already walked once. Idempotent, so the dedicated case is
+                    // a no-op.
+                    h.countSupervisedStop();
                 }
             }.f,
+            .request_restart = restartThunk(H),
         });
         // From here the spawn owns a slot, an entry and a handle; every failure
         // path below gives all three back. (Keeping the cleanup in `errdefer`
@@ -1214,6 +1584,25 @@ pub const Runtime = struct {
         // `catch` that frees the handle *and* returns an error would free it
         // again here.)
         errdefer _ = self.workers.pop();
+
+        // Join the supervision group, if one was named (§14). After the entry
+        // exists (a group acts on members through exactly this shape) and before
+        // the member can run (it has no thread yet), so a failure can never
+        // arrive at a group that does not know about it — and a failed spawn can
+        // always take itself back out.
+        if (supervision.group) |group| {
+            const membership: supervisor_mod.Member = .{ .worker = .{
+                .ptr = @ptrCast(handle),
+                .name = @typeName(W),
+                .request_restart = restartThunk(H),
+                .request_stop = groupStopThunk(H),
+            } };
+            handle.group_index = try group.add(self.allocator, membership);
+            // Only the tail can be removed: the member just appended *is* the
+            // tail, and a hole in the middle would renumber `rest_for_one`'s
+            // ordering. See `Group.removeLast`.
+            errdefer group.removeLast(membership);
+        }
 
         if (sched) |s| {
             // Materialise the pool's threads on first use (D2: declaring a pool
@@ -1349,6 +1738,12 @@ pub const Runtime = struct {
             .timer_fires = self.timer_fires.load(.monotonic),
             .timers_discarded = self.timers_discarded.load(.monotonic),
             .timer_deliveries_dropped = self.timer_deliveries_dropped.load(.monotonic),
+            // From the runtime's accumulators, like `messages_discarded_on_stop`
+            // above and for the same reason: `shutdown` stops and destroys in one
+            // pass, so summing over the live workers would read 0 for exactly the
+            // events these two exist to make visible.
+            .supervised_stops = self.supervised_stops.load(.monotonic),
+            .group_restarts = self.group_restarts.load(.monotonic),
             .timer_lag_max_ms = self.timer_lag_max_ms.load(.monotonic),
         };
     }
@@ -1362,8 +1757,23 @@ pub const Runtime = struct {
     /// lose a message, it loses a *worker* (see the capacity invariant in
     /// `scheduler.zig`), so a non-zero value here is a bug to fix, not a
     /// backpressure reading to tune.
+    ///
+    /// This is the **`.cpu`** pool. A runtime that declared a blocking width has a
+    /// second, independent set of the same readings — `blockingPoolStats` — and
+    /// the two are deliberately not summed: `pool_claimed ≤ pool_threads` is the
+    /// reading that says "is the pool keeping up", and a total would hide which
+    /// class is saturated.
     pub fn poolStats(self: *Self) ?Scheduler.Stats {
         const sched = self.scheduler orelse return null;
+        return sched.stats();
+    }
+
+    /// The blocking pool's own counters (docs/RUNTIME.md §6), same shape as
+    /// `poolStats`. Null when no blocking width was declared — which is also when
+    /// `.execution_class = .blocking` is refused at `spawn`, so a null here and a
+    /// `.blocking` worker cannot both exist.
+    pub fn blockingPoolStats(self: *Self) ?Scheduler.Stats {
+        const sched = self.blocking_scheduler orelse return null;
         return sched.stats();
     }
 
@@ -1410,6 +1820,8 @@ pub const Runtime = struct {
             timer_fires: *MetricsT.Gauge,
             timers_discarded: *MetricsT.Gauge,
             timer_deliveries_dropped: *MetricsT.Gauge,
+            supervised_stops: *MetricsT.Gauge,
+            group_restarts: *MetricsT.Gauge,
             timer_lag_ms: *MetricsT.Gauge,
             pool_declared: *MetricsT.Gauge,
             pool_threads: *MetricsT.Gauge,
@@ -1417,6 +1829,20 @@ pub const Runtime = struct {
             pool_claimed: *MetricsT.Gauge,
             pool_dispatches: *MetricsT.Gauge,
             pool_ready_push_failures: *MetricsT.Gauge,
+            // The blocking pool is a **second, independent** `Scheduler`
+            // (docs/RUNTIME.md §12.13), so it gets its own set of the same six
+            // readings rather than sharing one: a `.blocking` worker parked in a
+            // DB round trip shows up as a full blocking pool, and the CPU pool's
+            // six numbers stay what answers "is the scheduler keeping up". One
+            // series with a label would read better and would also make every
+            // existing dashboard query change shape; the six-plus-six is what an
+            // app can adopt without touching its panels.
+            blocking_pool_declared: *MetricsT.Gauge,
+            blocking_pool_threads: *MetricsT.Gauge,
+            blocking_pool_ready_len: *MetricsT.Gauge,
+            blocking_pool_claimed: *MetricsT.Gauge,
+            blocking_pool_dispatches: *MetricsT.Gauge,
+            blocking_pool_ready_push_failures: *MetricsT.Gauge,
 
             /// Registers the gauges. Startup-time call: if a later `createGauge`
             /// fails, the earlier ones stay registered in `metrics`.
@@ -1433,6 +1859,8 @@ pub const Runtime = struct {
                     .timer_fires = try metrics.createGauge("zigmodu_runtime_timer_fires", "Timers fired"),
                     .timers_discarded = try metrics.createGauge("zigmodu_runtime_timers_discarded", "Timers released unfired at shutdown"),
                     .timer_deliveries_dropped = try metrics.createGauge("zigmodu_runtime_timer_deliveries_dropped", "Timers that fired but whose message the target mailbox refused (closed or full): a fire, not a delivery"),
+                    .supervised_stops = try metrics.createGauge("zigmodu_runtime_supervised_stops", "Workers stopped by supervision: their own error budget, a group taking them down with a mate, or a group out of restart budget"),
+                    .group_restarts = try metrics.createGauge("zigmodu_runtime_group_restarts", "Worker rebuilds supervision executed (deinit + init on the worker's own thread), cumulative"),
                     .timer_lag_ms = try metrics.createGauge("zigmodu_runtime_timer_lag_ms", "Worst lateness between a timer deadline and its firing, in milliseconds"),
                     .pool_declared = try metrics.createGauge("zigmodu_runtime_pool_declared", "Declared upper bound on .pooled workers (0 = no pool: no ring, no pool thread)"),
                     .pool_threads = try metrics.createGauge("zigmodu_runtime_pool_threads", "Pool threads running (0 before the first pooled spawn; the declared width after); the ceiling on pool_claimed"),
@@ -1440,6 +1868,12 @@ pub const Runtime = struct {
                     .pool_claimed = try metrics.createGauge("zigmodu_runtime_pool_claimed", "Pooled workers a pool thread is executing right now (never above pool_threads)"),
                     .pool_dispatches = try metrics.createGauge("zigmodu_runtime_pool_dispatches", "Batches the pool's threads ran (0 with pooled spawns means they never reached the pool)"),
                     .pool_ready_push_failures = try metrics.createGauge("zigmodu_runtime_pool_ready_push_failures", "MUST stay 0: a refused token push strands a worker (scheduler desync, not backpressure)"),
+                    .blocking_pool_declared = try metrics.createGauge("zigmodu_runtime_blocking_pool_declared", "Declared upper bound on .execution_class = .blocking workers (0 = no blocking pool: blocking spawns are refused)"),
+                    .blocking_pool_threads = try metrics.createGauge("zigmodu_runtime_blocking_pool_threads", "Blocking pool threads running (0 before the first .blocking spawn); the ceiling on blocking_pool_claimed"),
+                    .blocking_pool_ready_len = try metrics.createGauge("zigmodu_runtime_blocking_pool_ready_len", "Blocking ready-ring occupancy: workers waiting for a blocking thread, at most one token per worker"),
+                    .blocking_pool_claimed = try metrics.createGauge("zigmodu_runtime_blocking_pool_claimed", "Blocking workers a blocking thread is executing right now (never above blocking_pool_threads)"),
+                    .blocking_pool_dispatches = try metrics.createGauge("zigmodu_runtime_blocking_pool_dispatches", "Batches the blocking pool's threads ran (0 with .blocking spawns means they never reached that pool)"),
+                    .blocking_pool_ready_push_failures = try metrics.createGauge("zigmodu_runtime_blocking_pool_ready_push_failures", "MUST stay 0: a refused token push strands a blocking worker (scheduler desync, not backpressure)"),
                 };
             }
 
@@ -1462,6 +1896,8 @@ pub const Runtime = struct {
                 self.timer_fires.set(@floatFromInt(s.timer_fires));
                 self.timers_discarded.set(@floatFromInt(s.timers_discarded));
                 self.timer_deliveries_dropped.set(@floatFromInt(s.timer_deliveries_dropped));
+                self.supervised_stops.set(@floatFromInt(s.supervised_stops));
+                self.group_restarts.set(@floatFromInt(s.group_restarts));
                 self.timer_lag_ms.set(@floatFromInt(s.timer_lag_max_ms));
 
                 // `null` pool = zeros, not absent: the series answering "did
@@ -1474,6 +1910,18 @@ pub const Runtime = struct {
                 self.pool_claimed.set(@floatFromInt(if (p) |x| x.claimed else 0));
                 self.pool_dispatches.set(@floatFromInt(if (p) |x| x.dispatches else 0));
                 self.pool_ready_push_failures.set(@floatFromInt(if (p) |x| x.ready_push_failures else 0));
+
+                // Same six, same "0 = no pool declared" answer, for the second
+                // pool. `blockingPoolStats()` is null unless the app declared a
+                // blocking width, so an app that never asked for one graphs
+                // zeros rather than losing the series.
+                const bp = self.rt.blockingPoolStats();
+                self.blocking_pool_declared.set(@floatFromInt(if (bp) |x| x.max_pooled_workers else 0));
+                self.blocking_pool_threads.set(@floatFromInt(if (bp) |x| x.pool_threads else 0));
+                self.blocking_pool_ready_len.set(@floatFromInt(if (bp) |x| x.ready_len else 0));
+                self.blocking_pool_claimed.set(@floatFromInt(if (bp) |x| x.claimed else 0));
+                self.blocking_pool_dispatches.set(@floatFromInt(if (bp) |x| x.dispatches else 0));
+                self.blocking_pool_ready_push_failures.set(@floatFromInt(if (bp) |x| x.ready_push_failures else 0));
             }
         };
     }
@@ -1672,6 +2120,54 @@ pub const Runtime = struct {
 
 /// The thread body. Comptime-specialised per worker type, so the `handle`/`run`
 /// call the compiler generates is a direct call — no dispatch, no vtable.
+/// `Handle(W, cap).stop()`, type-erased — what a supervision group calls to take
+/// a member down (§14). The same function the runtime's own `Entry.request_stop`
+/// uses: "stop this worker" has one meaning, whoever is asking.
+fn stopThunk(comptime H: type) *const fn (*anyopaque) void {
+    return struct {
+        fn f(p: *anyopaque) void {
+            const h: *H = @ptrCast(@alignCast(p));
+            h.stop();
+        }
+    }.f;
+}
+
+/// Set a member's restart flag, type-erased. Deliberately *only* sets the flag:
+/// the member's own thread does the teardown and the rebuild (§14.4), because
+/// rebuilding another thread's state is the one thing the ownership contract
+/// forbids.
+fn restartThunk(comptime H: type) *const fn (*anyopaque) void {
+    return struct {
+        fn f(p: *anyopaque) void {
+            const h: *H = @ptrCast(@alignCast(p));
+            h.restart_requested.store(true, .release);
+            // The flag alone is not enough: a member parked in `recv` has no
+            // message to wake it (this request comes from a group-mate's thread,
+            // not from a producer), and `stop()`'s trick — closing the mailbox —
+            // is the opposite of what a rebuild wants. `wake` is the third
+            // reason a receiver may come back (§14.4).
+            h.mailbox.wake();
+        }
+    }.f;
+}
+
+/// `stopThunk`, but it marks the member as **taken down by its group** before
+/// asking (§14). A separate function on purpose: `stopThunk` is what `shutdown`
+/// uses through `Entry.request_stop`, and a shutdown is not a supervised stop —
+/// merging them would make `RuntimeStats.supervised_stops` count every ordinary
+/// teardown, which is precisely the reading it exists to isolate.
+fn groupStopThunk(comptime H: type) *const fn (*anyopaque) void {
+    return struct {
+        fn f(p: *anyopaque) void {
+            const h: *H = @ptrCast(@alignCast(p));
+            // Before `stop()`: its release publishes this to the member's thread,
+            // which reads it on the way out to decide whether to count a stop.
+            h.stopped_by_group.store(true, .release);
+            h.stop();
+        }
+    }.f;
+}
+
 fn workerMain(comptime W: type, comptime capacity: usize) fn (*Handle(W, capacity)) void {
     return struct {
         fn main(handle: *Handle(W, capacity)) void {
@@ -1683,20 +2179,73 @@ fn workerMain(comptime W: type, comptime capacity: usize) fn (*Handle(W, capacit
             // answer (0 = not this worker) even while `init` runs.
             handle.context.owner.store(std.Thread.getCurrentId(), .release);
 
-            startWorker(W, H, handle);
+            // An `init` failure is already fatal here: `startWorker` closes the
+            // mailbox, so the loop below exits without running a message. There
+            // is no half-started state to hand to a group (§14.4), so the answer
+            // is deliberately not read.
+            _ = startWorker(W, H, handle);
 
             if (@hasDecl(W, "Message") and @hasDecl(W, "handle")) {
                 // Message-driven: the runtime owns the receive loop.
+                //
+                // A supervisor's stop (fail-fast, or the error budget) is where
+                // `stop_policy` decides: `.immediate` — what `.dedicated` has
+                // always done — ends the loop here and hands the queue behind it to
+                // `countAbandoned` below; `.drain` keeps pulling until the mailbox
+                // is empty, which is what a pooled worker does on every stop
+                // (docs/RUNTIME.md §12.10). An external `stop()` drains the queue
+                // under either policy: the check at the top of the loop only breaks
+                // when nothing is left.
                 while (true) {
+                    // A rebuild request is read here, between messages — the same
+                    // moment `stop_requested` is read, and for the same reason: a
+                    // member is never interrupted mid-message. `stop` wins when
+                    // both are set (§14.4) — a thing on its way down must not be
+                    // built back up.
+                    //
+                    // A group member reads the epoch *before* the flag, so a
+                    // request that lands in between is still noticed: the wait
+                    // below compares against this value and returns early. A
+                    // worker in no group reads `0` and takes the plain `recv(0)`
+                    // it always did — no epoch load, no extra branch on the
+                    // message path.
+                    const in_group = handle.group_index != null;
+                    const wake_from = if (in_group) handle.mailbox.wakeEpoch() else 0;
+                    if (handle.restart_requested.load(.acquire) and !handle.stop_requested.load(.acquire)) {
+                        rebuildWorker(W, H, handle);
+                        if (handle.stopped_by_supervisor) break;
+                        continue;
+                    }
                     if (handle.stop_requested.load(.acquire) and handle.mailbox.len() == 0) break;
-                    const envelope = handle.mailbox.recv(0) orelse {
+                    const arrived = if (in_group)
+                        handle.mailbox.recvWakeable(0, wake_from)
+                    else
+                        handle.mailbox.recv(0);
+                    const envelope = arrived orelse {
                         if (handle.mailbox.isClosed()) break;
                         continue;
                     };
-                    if (!deliver(W, H, handle, envelope)) break;
+                    switch (deliver(W, H, handle, envelope)) {
+                        .keep => {},
+                        .rebuild => {
+                            rebuildWorker(W, H, handle);
+                            if (handle.stopped_by_supervisor) break;
+                        },
+                        // A supervisor's stop. `.immediate` is what a dedicated
+                        // worker has always done and `.drain` is what a pooled one
+                        // has always done; both are now declarable rather than
+                        // implied by the execution mode. Under `.drain` the loop
+                        // simply keeps going: `stop_requested` is set, so it exits
+                        // on its own once the tail is empty — the loop-top check is
+                        // that drain.
+                        .stop => if (handle.stop_policy == .immediate) break,
+                    }
                 }
             } else if (@hasDecl(W, "run")) {
-                // Loop-owned: the worker decides when to finish.
+                // Loop-owned: the worker decides when to finish. There is no
+                // rebuild path here — the runtime cannot reach into a loop it
+                // does not own, which is why one of these in a rebuilding group
+                // is refused at spawn rather than accepted and ignored (§14.4).
                 W.run(&handle.state, &handle.context) catch |err| {
                     _ = supervise(W, H, handle, err);
                 };
@@ -1707,13 +2256,17 @@ fn workerMain(comptime W: type, comptime capacity: usize) fn (*Handle(W, capacit
 
             // Anything still in the mailbox at this point is work that was
             // accepted and will never be handled. Both ways of getting here are
-            // real: a supervisor stop breaks the receive loop with a queue still
-            // behind it (a plain `stop()` drains first — the check at the top of
-            // the loop — so it arrives here empty), and a `run`-owned worker
-            // never recv's at all. Counted, not run: an actor on its way down is
-            // not supposed to keep working, but it is not allowed to lose the
-            // number either (docs/RUNTIME.md §5, §12.10).
+            // real: a supervisor stop under `.immediate` breaks the receive loop
+            // with a queue still behind it (a plain `stop()` drains first — the
+            // check at the top of the loop — so it arrives here empty, and so does
+            // a `.drain` stop), and a `run`-owned worker never recv's at all.
+            // Counted, not run: an actor on its way down is not supposed to keep
+            // working, but it is not allowed to lose the number either
+            // (docs/RUNTIME.md §5, §12.10).
             handle.countAbandoned();
+            // The dedicated half of the supervised-stop count; the pooled half
+            // rides on `Entry.abandon`, and the swap makes the pair land once.
+            handle.countSupervisedStop();
 
             if (@hasDecl(W, "deinit")) W.deinit(&handle.state);
         }
@@ -1728,8 +2281,8 @@ fn workerMain(comptime W: type, comptime capacity: usize) fn (*Handle(W, capacit
 ///
 /// A failure here is fatal for the worker (there is no half-started state to
 /// supervise), but it still counts and stops.
-fn startWorker(comptime W: type, comptime H: type, handle: *H) void {
-    if (!@hasDecl(W, "init")) return;
+fn startWorker(comptime W: type, comptime H: type, handle: *H) bool {
+    if (!@hasDecl(W, "init")) return true;
     W.init(&handle.state, &handle.context) catch |err| {
         var tag_buf: [trace_tag_len]u8 = undefined;
         // No message is being handled yet, so the tag is always empty here —
@@ -1740,7 +2293,9 @@ fn startWorker(comptime W: type, comptime H: type, handle: *H) void {
         });
         _ = handle.handler_errors.fetchAdd(1, .monotonic);
         handle.stop();
+        return false;
     };
+    return true;
 }
 
 /// One message through `W.handle`: the trace is published for exactly as long as
@@ -1751,16 +2306,16 @@ fn startWorker(comptime W: type, comptime H: type, handle: *H) void {
 /// Shared by the dedicated loop (`workerMain`) and the pooled batch
 /// (`pooledDispatch`) on purpose: the two modes differ in *who* runs a worker,
 /// never in what running it means.
-fn deliver(comptime W: type, comptime H: type, handle: *H, envelope: H.Envelope) bool {
-    var keep_serving = true;
+fn deliver(comptime W: type, comptime H: type, handle: *H, envelope: H.Envelope) Outcome {
+    var outcome: Outcome = .keep;
     {
         defer handle.context.current_trace = null;
         handle.context.current_trace = envelope.trace;
         W.handle(&handle.state, envelope.message, &handle.context) catch |err| {
-            if (supervise(W, H, handle, err)) keep_serving = false;
+            outcome = supervise(W, H, handle, err);
         };
     }
-    return keep_serving;
+    return outcome;
 }
 
 /// `Ready.dispatch` for `H` — one bounded batch of a pooled worker's loop.
@@ -1781,6 +2336,36 @@ fn pooledDispatch(comptime W: type, comptime H: type) *const fn (*anyopaque, usi
             handle.context.owner.store(std.Thread.getCurrentId(), .release);
             defer handle.context.owner.store(0, .release);
 
+            // A rebuild another member's failure asked for (§14). Done *before*
+            // the lifecycle block below, so the claim that would have started
+            // this worker is the same claim that rebuilds it — a pooled member
+            // has no thread of its own to notice the request between batches.
+            // The claim is exclusive by definition, so the teardown is as safe
+            // here as `workerMain`'s rebuild is on a dedicated thread.
+            //
+            // `stop` wins, as it does everywhere else: a member on its way down
+            // is not built back up.
+            if (handle.restart_requested.load(.acquire) and !handle.stop_requested.load(.acquire)) {
+                if (handle.started) {
+                    // `rebuildWorker` clears the flag, which is load-bearing on
+                    // this path: a rebuild that left it set would be *re-read by
+                    // the next claim*, so every failure would rebuild twice. The
+                    // claim is exclusive by definition, which is what makes the
+                    // teardown as safe here as on a dedicated thread.
+                    //
+                    // `started` stays true across the rebuild — the destroy path
+                    // reads it to decide whether a `deinit` is owed, and one is.
+                    rebuildWorker(W, H, handle);
+                    if (handle.stopped_by_supervisor) return false;
+                } else {
+                    // Asked for before the first claim: there is no generation to
+                    // tear down, so this is a no-op rather than a rebuild — but
+                    // the flag still has to go, or the claim below would keep
+                    // re-reading it.
+                    handle.restart_requested.store(false, .release);
+                }
+            }
+
             // The lifecycle starts with the first batch, inside the claim: from
             // here on this worker is exclusively owned, exactly as a dedicated
             // worker's thread owns it when `workerMain` runs `init`.
@@ -1788,14 +2373,41 @@ fn pooledDispatch(comptime W: type, comptime H: type) *const fn (*anyopaque, usi
                 // Set before the hook, so a failed `init` still gets its
                 // `deinit` — the pairing `workerMain` has.
                 handle.started = true;
-                startWorker(W, H, handle);
+                if (startWorker(W, H, handle)) handle.window_start_ms = handle.runtime.clock.nowMs();
             }
 
             var ran: usize = 0;
             while (ran < max) {
                 const envelope = handle.mailbox.tryRecv() orelse return true;
                 ran += 1;
-                if (!deliver(W, H, handle, envelope)) break;
+                switch (deliver(W, H, handle, envelope)) {
+                    .keep => {},
+                    // Rebuild right here rather than handing the worker back
+                    // with the flag set: the claim is already exclusive, so this
+                    // is the same teardown the next claim would do, without a
+                    // round trip through the ready ring that would have to be
+                    // provoked (`pooledPending`) just to come back.
+                    .rebuild => {
+                        rebuildWorker(W, H, handle);
+                        if (handle.stopped_by_supervisor) return false;
+                    },
+                    // A supervisor's stop. `.drain` (the pooled default) is what
+                    // the pool has always done: end the *batch* and let the
+                    // hand-back re-arm the worker while its mailbox still holds
+                    // something — the tail gets run, and `discarded_on_stop` stays
+                    // 0. `.immediate` (the dedicated default, declarable here)
+                    // means the queue is not going to be run at all: hand it to
+                    // `countAbandoned` and return nothing left, so the hand-back
+                    // does not re-arm a worker whose tail was just counted.
+                    .stop => {
+                        if (handle.stop_policy == .immediate) {
+                            handle.abandoned.store(true, .release);
+                            handle.countAbandoned();
+                            return true;
+                        }
+                        break;
+                    },
+                }
             }
             return false;
         }
@@ -1805,18 +2417,39 @@ fn pooledDispatch(comptime W: type, comptime H: type) *const fn (*anyopaque, usi
 /// `Ready.pending` for `H`: the hand-back's re-check, and nothing else. A length
 /// read rather than a receive, so the runner never consumes what it is deciding
 /// about.
+///
+/// Two reasons a pooled worker reports "there is work" that its mailbox length
+/// would not show:
+///
+/// A pending rebuild counts as work (§14.4): a pooled member asked to rebuild
+/// while its mailbox is empty has nothing left to drain, so a length-only answer
+/// would let the pool hand it back and never claim it again — the request would
+/// sit unread for the rest of the run. Reporting 1 is what gets it claimed one
+/// more time, and that claim is what rebuilds it.
+///
+/// A worker stopped for good under `.immediate` reports 0 even with a non-empty
+/// mailbox: its tail was counted by the batch that stopped (`abandoned`), and
+/// re-arming it — which is what a non-zero answer means — would run the work the
+/// policy just declared abandoned. Checked first, because stop wins, the same
+/// rule the receive loop and `rebuildWorker` follow.
 fn pooledPending(comptime H: type) *const fn (*anyopaque) usize {
     return struct {
         fn count(ctx: *anyopaque) usize {
             const handle: *H = @ptrCast(@alignCast(ctx));
+            if (handle.abandoned.load(.acquire)) return 0;
+            if (handle.restart_requested.load(.acquire)) return 1;
             return handle.mailbox.len();
         }
     }.count;
 }
 
 /// Record an error and decide whether the worker survives it.
-/// Returns true when the caller must stop its loop.
-fn supervise(comptime W: type, comptime H: type, handle: *H, err: anyerror) bool {
+///
+/// Returns what the caller's loop must do: keep serving, rebuild the state
+/// (§14), or stop. A worker in a supervision group hands the decision to the
+/// group *before* anything is torn down — that is the whole point of being in
+/// one — so this is also where a group action is executed.
+fn supervise(comptime W: type, comptime H: type, handle: *H, err: anyerror) Outcome {
     _ = handle.handler_errors.fetchAdd(1, .monotonic);
 
     // Windowed budget: reset the window when it has elapsed.
@@ -1844,6 +2477,31 @@ fn supervise(comptime W: type, comptime H: type, handle: *H, err: anyerror) bool
     const tag = traceTag(handle.context.traceId(), &tag_buf);
 
     if (must_stop) {
+        // In a group, the decision is not this member's to make (§14.4). The
+        // group may rebuild it, rebuild its mates, or take the group down — and
+        // only the last of those stops anything here. Not counted as a
+        // `stopped_by_supervisor` unless it really stops: a rebuilt member was
+        // never stopped, and saying otherwise would make the two readings
+        // ("I died" / "I was rebuilt") indistinguishable.
+        if (handle.supervision.group) |group| {
+            if (handle.group_index) |index| {
+                if (group.onMemberDown(index, now) == .rebuild) {
+                    std.log.warn(
+                        "[runtime] {s}{s} rebuilt by its supervision group after {d} error(s) in window ({s}{s}); last: {s}",
+                        .{
+                            @typeName(W),
+                            tag,
+                            handle.errors_in_window,
+                            @tagName(decision),
+                            if (over_budget) ", over budget" else "",
+                            @errorName(err),
+                        },
+                    );
+                    return .rebuild;
+                }
+            }
+        }
+
         handle.stopped_by_supervisor = true;
         std.log.warn("[runtime] {s}{s} stopped by supervisor after {d} error(s) in window ({s}{s}); last: {s}", .{
             @typeName(W),
@@ -1854,13 +2512,46 @@ fn supervise(comptime W: type, comptime H: type, handle: *H, err: anyerror) bool
             @errorName(err),
         });
         handle.stop();
-        return true;
+        return .stop;
     }
 
     std.log.warn("[runtime] {s}{s} handler error ({d} in window): {s}", .{
         @typeName(W), tag, handle.errors_in_window, @errorName(err),
     });
-    return false;
+    return .keep;
+}
+
+/// What a receive loop must do after one message.
+const Outcome = enum {
+    /// Keep serving this generation of the state.
+    keep,
+    /// Tear the state down and `init` it again, then keep serving (§14).
+    rebuild,
+    /// Stop the worker.
+    stop,
+};
+
+/// Rebuild a member in place (§14.4): `deinit` + `init` on the member's **own
+/// thread**, with the error window starting over.
+///
+/// The handle, the mailbox and the thread are untouched — a rebuild is a new
+/// *generation of state*, not a new worker. That is what lets a producer keep
+/// the handle it already has, and what keeps `shutdown`'s join list valid across
+/// any number of rebuilds.
+fn rebuildWorker(comptime W: type, comptime H: type, handle: *H) void {
+    handle.countGroupRestart();
+    if (@hasDecl(W, "deinit")) W.deinit(&handle.state);
+    handle.errors_in_window = 0;
+    handle.restart_requested.store(false, .release);
+    // An `init` failure on the way back up is fatal for this generation and is
+    // *not* handed to the group again: there is no half-started state to
+    // supervise, and asking the group would be exactly the "init loop" the
+    // restart budget exists to prevent. It stops, and it says which stop it was.
+    if (!startWorker(W, H, handle)) {
+        handle.stopped_by_supervisor = true;
+        return;
+    }
+    handle.window_start_ms = handle.runtime.clock.nowMs();
 }
 
 /// Longest `traceTag` output: `" trace="` + two 16-digit hex halves.
@@ -3217,6 +3908,180 @@ test "Actor: the pooled stop path drains the mailbox, so nothing is abandoned (p
     try std.testing.expectEqual(s.sent, s.received + s.dropped_full + s.discarded_on_stop);
 }
 
+/// A worker that only counts what it was given: the probe for "did the queue get
+/// worked off", with no failure to trigger the policy — the *external* stop case,
+/// where the policy is not supposed to change anything.
+const Counting = struct {
+    pub const Message = u32;
+    seen: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
+        _ = msg;
+        _ = ctx;
+        _ = self.seen.fetchAdd(1, .monotonic);
+    }
+};
+
+test "Handle: an undeclared stop policy is the mode's historical answer" {
+    // The compatibility half of `SpawnConfig.stop_policy = null`, as assertions:
+    // both rows of §12.10's table stay reachable *without* writing the field, and
+    // writing it moves a worker to the other row. The behaviour those rows
+    // describe is pinned by the two tests below.
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        .clock = .{ .manual = &clk },
+        .scheduler = .{ .max_pooled_workers = 1 },
+    });
+    defer rt.deinit();
+
+    const dedicated = try rt.spawn(Counting, .{}, .{ .capacity = 8 });
+    try std.testing.expectEqual(StopPolicy.immediate, dedicated.stop_policy);
+
+    const pooled = try rt.spawn(Counting, .{}, .{ .capacity = 8, .mode = .pooled });
+    try std.testing.expectEqual(StopPolicy.drain, pooled.stop_policy);
+
+    // ...and both are declarations, not derived from who runs the worker:
+    const declared = try rt.spawn(Counting, .{}, .{ .capacity = 8, .stop_policy = .drain });
+    try std.testing.expectEqual(StopPolicy.drain, declared.stop_policy);
+
+    dedicated.stop();
+    dedicated.join();
+    pooled.stop();
+    pooled.join();
+    declared.stop();
+    declared.join();
+}
+
+test "Actor: an external stop() drains the queue under either policy, in both modes" {
+    // The boundary `StopPolicy` draws, as an assertion rather than a footnote:
+    // the policy governs the *stop for good* (the supervisor's decision inside
+    // `handle`), while `stop()` is the caller's "finish what you have" request —
+    // `close()` leaves what was accepted available and both receive loops keep
+    // pulling while anything is there. So an undeclared/explicit policy cannot
+    // lose a message that `stop()` was asked to drain.
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        .clock = .{ .manual = &clk },
+        // Two of the three shapes below are pooled, and the declared bound is
+        // admission, not a hint (see the capacity invariant in `scheduler.zig`).
+        .scheduler = .{ .max_pooled_workers = 2 },
+    });
+    defer rt.deinit();
+
+    // Three shapes, written out: `spawn`'s config is comptime and an anonymous
+    // struct literal is the only shape `spawnConfig` normalises today.
+    {
+        const h = try rt.spawn(Counting, .{}, .{ .capacity = 8, .stop_policy = .immediate });
+        for (0..4) |i| try h.send(@intCast(i));
+        h.stop();
+        // `join` is the deterministic wait for exactly this: dedicated waits for
+        // the loop to end, pooled for the claim plus an empty mailbox.
+        h.join();
+        try expectDrainedByStop(h, 4);
+    }
+    {
+        const h = try rt.spawn(Counting, .{}, .{ .capacity = 8, .mode = .pooled, .stop_policy = .immediate });
+        for (0..4) |i| try h.send(@intCast(i));
+        h.stop();
+        h.join();
+        try expectDrainedByStop(h, 4);
+    }
+    {
+        const h = try rt.spawn(Counting, .{}, .{ .capacity = 8, .mode = .pooled, .stop_policy = .drain });
+        for (0..4) |i| try h.send(@intCast(i));
+        h.stop();
+        h.join();
+        try expectDrainedByStop(h, 4);
+    }
+    try std.testing.expectEqual(@as(u64, 0), rt.stats().messages_discarded_on_stop);
+}
+
+/// One shape of the test above: every message was handled, nothing was refused
+/// and nothing was abandoned.
+fn expectDrainedByStop(handle: anytype, want: u32) !void {
+    const s = handle.stats();
+    try std.testing.expectEqual(want, handle.state.seen.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, want), s.received);
+    try std.testing.expectEqual(@as(usize, 0), s.mailbox_len);
+    try std.testing.expectEqual(@as(u64, 0), s.discarded_on_stop);
+}
+
+test "Actor: `.stop_policy = .drain` gives a dedicated actor the pooled stop" {
+    // The mirror of the test above it: the same `StopProbeActor`, the same
+    // fail-fast supervision, the same 8 queued messages — declared `.drain`, so
+    // the actor works the tail off instead of abandoning it. This is the
+    // declaration that used to be unreachable without changing `mode`.
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .{ .manual = &clk });
+    defer rt.deinit();
+
+    var released = std.atomic.Value(bool).init(false);
+    const h = try rt.spawnActor(StopProbeActor, .{ .released = &released }, .{
+        .capacity = 8,
+        .stop_policy = .drain,
+    }, .{ .strategy = .stop });
+    for (0..8) |i| try h.send(@intCast(i));
+    released.store(true, .release);
+    h.join();
+
+    const s = h.stats();
+    try std.testing.expectEqual(StopPolicy.drain, h.stop_policy);
+    // Where the dedicated default abandons 6 of 8, `.drain` invokes all 8.
+    try std.testing.expectEqual(@as(u32, 8), h.state.handled.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 8), s.received);
+    try std.testing.expectEqual(@as(usize, 0), s.mailbox_len);
+    try std.testing.expectEqual(@as(u64, 0), s.dropped_full);
+    try std.testing.expectEqual(@as(u64, 0), s.discarded_on_stop);
+    try std.testing.expectEqual(@as(u64, 0), rt.stats().messages_discarded_on_stop);
+    try std.testing.expectEqual(s.sent, s.received + s.dropped_full + s.discarded_on_stop);
+}
+
+test "Actor: `.stop_policy = .immediate` gives a pooled actor the dedicated stop" {
+    // ...and the mirror of *that*: the pooled default drains, and `.immediate`
+    // is what says "stop now, count the rest". The count is visible through the
+    // same counters, and — because the tail stays parked — `join` has to be told
+    // by `abandoned` that nothing will ever come along to drain it.
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        .clock = .{ .manual = &clk },
+        .scheduler = .{ .max_pooled_workers = 1 },
+    });
+    defer rt.deinit();
+
+    var released = std.atomic.Value(bool).init(false);
+    const h = try rt.spawnActor(StopProbeActor, .{ .released = &released }, .{
+        .capacity = 8,
+        .mode = .pooled,
+        .stop_policy = .immediate,
+    }, .{ .strategy = .stop });
+    for (0..8) |i| try h.send(@intCast(i));
+    released.store(true, .release);
+
+    // msg 0 runs, msg 1 fails: the batch stops for good. Waiting on the counter
+    // the assertions read (rather than on `handled`) keeps the reading and the
+    // assertion at the same moment — the count is written before the claim is
+    // handed back.
+    var spins: usize = 0;
+    while (rt.stats().messages_discarded_on_stop < 6 and spins < 800_000_000) : (spins += 1) std.atomic.spinLoopHint();
+
+    // `join` returns although the mailbox still holds 6 messages: that is the
+    // whole point of counting them instead of draining them.
+    h.join();
+    const s = h.stats();
+    try std.testing.expectEqual(StopPolicy.immediate, h.stop_policy);
+    try std.testing.expectEqual(@as(u32, 2), h.state.handled.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 2), s.received);
+    try std.testing.expectEqual(@as(usize, 6), s.mailbox_len);
+    try std.testing.expectEqual(@as(u64, 8), s.sent);
+    try std.testing.expectEqual(@as(u64, 0), s.dropped_full);
+    try std.testing.expectEqual(@as(u64, 6), s.discarded_on_stop);
+    try std.testing.expectEqual(@as(u64, 6), rt.stats().messages_discarded_on_stop);
+    try std.testing.expectEqual(s.sent, s.received + s.dropped_full + s.discarded_on_stop);
+    // The worker was not stranded by the early stop: the pool pushed no token it
+    // had to give up on (`ready_push_failures` stays the must-be-0 reading).
+    try std.testing.expectEqual(@as(u64, 0), rt.poolStats().?.ready_push_failures);
+}
+
 test "Actor: the pool going down first counts what it leaves behind (pooled)" {
     var clk = Clock.Manual{ .now_ms = 0 };
     var rt = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
@@ -3599,6 +4464,14 @@ test "Runtime.MetricsBridge reports no pool as zeros" {
         "zigmodu_runtime_pool_claimed",
         "zigmodu_runtime_pool_dispatches",
         "zigmodu_runtime_pool_ready_push_failures",
+        // The blocking pool's six, for the same reason: with no blocking pool
+        // declared they are zeros a dashboard can graph, not absent lines.
+        "zigmodu_runtime_blocking_pool_declared",
+        "zigmodu_runtime_blocking_pool_threads",
+        "zigmodu_runtime_blocking_pool_ready_len",
+        "zigmodu_runtime_blocking_pool_claimed",
+        "zigmodu_runtime_blocking_pool_dispatches",
+        "zigmodu_runtime_blocking_pool_ready_push_failures",
     }) |name| {
         var buf: [128]u8 = undefined;
         const line = try std.fmt.bufPrint(&buf, "{s} {d:.6}", .{ name, @as(f64, 0) });
@@ -4002,6 +4875,177 @@ test "Runtime: `.pooled` without a declared pool is refused, and the bound is ha
     try std.testing.expect(s.ready_len <= s.max_pooled_workers);
     try std.testing.expectEqual(@as(usize, 2), s.spawned);
     try std.testing.expectEqual(@as(u64, 0), s.ready_push_failures);
+}
+
+test "Runtime: a blocked `.blocking` worker does not hold the cpu pool" {
+    // What the class buys, measured instead of argued (docs/RUNTIME.md §6): while
+    // a worker that *declared* itself `.blocking` sits inside its handler — the
+    // shape of a DB round trip or a blocking HTTP call — a `.cpu` worker must
+    // still be run. Both pools run exactly one thread here, which is the sharpest
+    // form of the question: without the class, the blocked handler would be
+    // occupying the only thread the CPU worker has.
+    const Waiter = struct {
+        pub const Message = u32;
+        entered: *std.atomic.Value(bool),
+        release: *std.atomic.Value(bool),
+        handled: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+        pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
+            _ = msg;
+            _ = ctx;
+            self.entered.store(true, .release);
+            // A bounded spin stands in for the wait: this test releases it, and
+            // the budget only exists so a broken run cannot hang the suite.
+            var spins: usize = 0;
+            while (!self.release.load(.acquire) and spins < 4_000_000_000) : (spins += 1) std.atomic.spinLoopHint();
+            _ = self.handled.fetchAdd(1, .monotonic);
+        }
+    };
+    const Cpu = struct {
+        pub const Message = u32;
+        handled: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+        pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
+            _ = msg;
+            _ = ctx;
+            _ = self.handled.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        .clock = .{ .manual = &clk },
+        .scheduler = .{ .max_pooled_workers = 2, .pool_threads = 1, .blocking_threads = 1 },
+    });
+    defer rt.deinit();
+
+    var entered = std.atomic.Value(bool).init(false);
+    var release = std.atomic.Value(bool).init(false);
+    // Registered after `rt.deinit()`, so it runs *before* it (LIFO): the blocked
+    // handler is always released, including on the path where an assertion below
+    // fails.
+    defer release.store(true, .release);
+
+    const waiter = try rt.spawn(Waiter, .{ .entered = &entered, .release = &release }, .{
+        .capacity = 4,
+        .mode = .pooled,
+        .execution_class = .blocking,
+    });
+    const cpu = try rt.spawn(Cpu, .{}, .{ .capacity = 4, .mode = .pooled });
+
+    try waiter.send(1);
+    try waitUntil(Flag(std.atomic.Value(bool)){ .value = &entered }, 5_000);
+
+    // The blocking pool's only thread is inside `handle` right now, and stays
+    // there until this test says otherwise. The CPU pool's only thread is a
+    // different thread; the assertion is that it runs its worker anyway.
+    for (0..4) |i| try cpu.send(@intCast(i));
+    try waitUntil(Published(std.atomic.Value(u32), u32){
+        .value = &cpu.state.handled,
+        .want = 4,
+    }, 5_000);
+    try std.testing.expectEqual(@as(u32, 4), cpu.state.handled.load(.acquire));
+    // ...and the blocked worker is *still* inside that one message: the line above
+    // is a statement about isolation, not about a pause that happened to end.
+    try std.testing.expectEqual(@as(u32, 0), waiter.state.handled.load(.acquire));
+
+    release.store(true, .release);
+    cpu.stop();
+    cpu.join();
+    waiter.stop();
+    waiter.join();
+    try std.testing.expectEqual(@as(u32, 1), waiter.state.handled.load(.acquire));
+
+    // Two pools, two widths, two admissions — and neither lost a token (the one
+    // reading that must stay 0 in both).
+    const cpu_pool = rt.poolStats().?;
+    const blocking = rt.blockingPoolStats().?;
+    try std.testing.expectEqual(@as(usize, 1), cpu_pool.pool_threads);
+    try std.testing.expectEqual(@as(usize, 1), blocking.pool_threads);
+    try std.testing.expectEqual(@as(usize, 1), cpu_pool.spawned);
+    try std.testing.expectEqual(@as(usize, 1), blocking.spawned);
+    try std.testing.expect(blocking.dispatches >= 1);
+    try std.testing.expectEqual(@as(u64, 0), cpu_pool.ready_push_failures);
+    try std.testing.expectEqual(@as(u64, 0), blocking.ready_push_failures);
+}
+
+test "Runtime: `.blocking` needs a declared blocking width, and its bound is its own" {
+    var clk = Clock.Manual{ .now_ms = 0 };
+
+    // (a) `.blocking` with no blocking width declared: refused at the spawn, the
+    // way `.pooled` without a pool is — not quietly put on the CPU pool, which is
+    // the pool a handler that blocks would then hold down.
+    var rt0 = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        .clock = .{ .manual = &clk },
+        .scheduler = .{ .max_pooled_workers = 2 },
+    });
+    defer rt0.deinit();
+    try std.testing.expectError(error.BlockingPoolNotConfigured, rt0.spawn(
+        CounterWorker,
+        .{},
+        .{ .capacity = 8, .mode = .pooled, .execution_class = .blocking },
+    ));
+    try std.testing.expect(rt0.blockingPoolStats() == null);
+    // The refusal cost the CPU pool nothing: its reservation came back.
+    try std.testing.expectEqual(@as(usize, 0), rt0.poolStats().?.spawned);
+    const plain = try rt0.spawn(CounterWorker, .{}, .{ .capacity = 8, .mode = .pooled });
+    try std.testing.expect(plain.pool != null);
+    plain.stop();
+    plain.join();
+
+    // (b) The two bounds are two admissions: `max_pooled_workers` decides the
+    // `.cpu` class only, `max_blocking_workers` the blocking one, and each pool
+    // starts its own declared width.
+    var rt = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        .clock = .{ .manual = &clk },
+        .scheduler = .{
+            .max_pooled_workers = 1,
+            .pool_threads = 2,
+            .blocking_threads = 1,
+            .max_blocking_workers = 2,
+        },
+    });
+    defer rt.deinit();
+
+    _ = try rt.spawn(CounterWorker, .{}, .{ .capacity = 8, .mode = .pooled });
+    try std.testing.expectError(error.PoolCapacityExceeded, rt.spawn(
+        CounterWorker,
+        .{},
+        .{ .capacity = 8, .mode = .pooled },
+    ));
+    // ...while the blocking class still has its own two slots.
+    const b1 = try rt.spawn(CounterWorker, .{}, .{
+        .capacity = 8,
+        .mode = .pooled,
+        .execution_class = .blocking,
+    });
+    const b2 = try rt.spawn(CounterWorker, .{}, .{
+        .capacity = 8,
+        .mode = .pooled,
+        .execution_class = .blocking,
+    });
+    try std.testing.expectError(error.PoolCapacityExceeded, rt.spawn(
+        CounterWorker,
+        .{},
+        .{ .capacity = 8, .mode = .pooled, .execution_class = .blocking },
+    ));
+
+    const cpu_pool = rt.poolStats().?;
+    const blocking = rt.blockingPoolStats().?;
+    try std.testing.expectEqual(@as(usize, 1), cpu_pool.max_pooled_workers);
+    try std.testing.expectEqual(@as(usize, 2), blocking.max_pooled_workers);
+    try std.testing.expectEqual(@as(usize, 2), cpu_pool.pool_threads);
+    try std.testing.expectEqual(@as(usize, 1), blocking.pool_threads);
+    try std.testing.expectEqual(@as(usize, 1), cpu_pool.spawned);
+    try std.testing.expectEqual(@as(usize, 2), blocking.spawned);
+    // Each ring is sized from its own bound plus its own consumers.
+    try std.testing.expect(cpu_pool.ready_capacity >= 1 + 2);
+    try std.testing.expect(blocking.ready_capacity >= 2 + 1);
+
+    b1.stop();
+    b1.join();
+    b2.stop();
+    b2.join();
 }
 
 test "Runtime: a dedicated worker puts nothing in the ready ring" {
@@ -4558,4 +5602,454 @@ test "Runtime Replay: replayAll hands a whole log to a fresh graph, in order" {
 
     recorded.stop();
     recorded.join();
+}
+
+// ---------------------------------------------------------------------------
+// Supervision groups (docs/RUNTIME.md §14)
+//
+// The group machinery — policy, budget, escalation — is unit-tested in
+// `supervisor.zig`, where a member is a probe and no thread is involved. What is
+// tested here is the part that file cannot reach: that a member's own thread
+// actually performs the teardown and the rebuild, that a group-mate is reached
+// through its handle, and that the two counters land where they are readable.
+//
+// A rebuild that stopped short of `init` would leave `inits == 1` below — which
+// is what makes these tests the guard for the mechanism rather than a description
+// of it.
+// ---------------------------------------------------------------------------
+
+/// An actor that fails on every message and counts its own generations, so a
+/// rebuild is observable as `inits` going up and `handled` continuing past it.
+const AlwaysBoom = struct {
+    pub const Message = u32;
+
+    inits: *std.atomic.Value(u32),
+    handled: *std.atomic.Value(u32),
+
+    pub fn init(self: *@This(), _: anytype) !void {
+        _ = self.inits.fetchAdd(1, .release);
+    }
+
+    pub fn deinit(_: *@This()) void {}
+
+    pub fn handle(self: *@This(), _: u32, _: anytype) !void {
+        _ = self.handled.fetchAdd(1, .monotonic);
+        return error.Boom;
+    }
+};
+
+/// A `run`-owned worker: it owns its loop, so nothing outside it can tear its
+/// state down. Refused in a rebuilding group (§14.4).
+const LoopOwned = struct {
+    pub fn run(_: *@This(), ctx: anytype) anyerror!void {
+        while (!ctx.stopped()) std.atomic.spinLoopHint();
+    }
+};
+
+/// The same shape as `AlwaysBoom` but failing only every other message, so a
+/// group-mate can be healthy while its sibling dies.
+const EveryOtherBoom = struct {
+    pub const Message = u32;
+
+    inits: *std.atomic.Value(u32),
+    handled: *std.atomic.Value(u32),
+    n: u32 = 0,
+
+    pub fn init(self: *@This(), _: anytype) !void {
+        _ = self.inits.fetchAdd(1, .release);
+    }
+
+    pub fn deinit(_: *@This()) void {}
+
+    pub fn handle(self: *@This(), _: u32, _: anytype) !void {
+        _ = self.handled.fetchAdd(1, .monotonic);
+        self.n +%= 1;
+        if (self.n % 2 == 0) return error.Boom;
+    }
+};
+
+test "Supervision (§14): one_for_one rebuilds a dying actor in place and it keeps serving" {
+    var inits = std.atomic.Value(u32).init(0);
+    var handled = std.atomic.Value(u32).init(0);
+
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .monotonic);
+    defer rt.deinit();
+
+    const group = try rt.spawnGroup(.one_for_one);
+    // Budget of 1 error per window: two messages in, the actor's own supervision
+    // says stop, and the group says rebuild.
+    const h = try rt.spawnActor(AlwaysBoom, .{ .inits = &inits, .handled = &handled }, 8, .{
+        .max_errors = 1,
+        .window_ms = 60_000,
+        .group = group,
+    });
+
+    // Two messages per rebuild: the first error is inside budget, the second
+    // takes the window over. So four messages are two rebuilds.
+    for (0..4) |i| try h.send(@intCast(i));
+    try waitUntil(Published(@TypeOf(handled), u32){ .value = &handled, .want = 4 }, 5_000);
+    try waitUntil(Published(@TypeOf(h.group_restarts), u64){ .value = &h.group_restarts, .want = 2 }, 5_000);
+    // Wait on the counter this test *asserts*, not on `group_restarts`: a
+    // rebuild bumps the latter *before* it runs `init` (`rebuildWorker`),
+    // so waiting on it and then reading `inits` is a check-then-assert race.
+    // It flaked once in a full-suite run before this.
+    try waitUntil(Published(@TypeOf(inits), u32){ .value = &inits, .want = 3 }, 5_000);
+
+    // The actor really came back: three generations ran (the original plus two
+    // rebuilds) and every message was handled by one of them.
+    try std.testing.expectEqual(@as(u32, 3), inits.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 4), handled.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 2), h.stats().group_restarts);
+    // Rebuilt is not stopped: the two readings must stay distinguishable.
+    try std.testing.expect(!h.stats().stopped_by_supervisor);
+    try std.testing.expectEqual(@as(u64, 0), rt.stats().supervised_stops);
+    try std.testing.expectEqual(@as(u64, 2), rt.stats().group_restarts);
+
+    // ...and it is still taking work, on the same handle a producer already has.
+    try h.send(99);
+    try waitUntil(Published(@TypeOf(handled), u32){ .value = &handled, .want = 5 }, 5_000);
+}
+
+test "Supervision (§14): without a group an actor stops where it stands, unchanged" {
+    var inits = std.atomic.Value(u32).init(0);
+    var handled = std.atomic.Value(u32).init(0);
+
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .monotonic);
+    defer rt.deinit();
+
+    const h = try rt.spawnActor(AlwaysBoom, .{ .inits = &inits, .handled = &handled }, 8, .{
+        .max_errors = 1,
+        .window_ms = 60_000,
+    });
+
+    for (0..2) |i| try h.send(@intCast(i));
+    try waitUntil(Published(@TypeOf(handled), u32){ .value = &handled, .want = 2 }, 5_000);
+    try waitUntil(Published(@TypeOf(rt.supervised_stops), u64){ .value = &rt.supervised_stops, .want = 1 }, 5_000);
+
+    // The v0.16/v0.17 contract, untouched: one generation, a stop, and a closed
+    // mailbox rather than a rebuild.
+    try std.testing.expectEqual(@as(u32, 1), inits.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), h.stats().group_restarts);
+    try std.testing.expect(h.stats().stopped_by_supervisor);
+    try std.testing.expectError(error.Closed, h.send(7));
+}
+
+test "Supervision (§14): one_for_all reaches a healthy group-mate through its handle" {
+    var a_inits = std.atomic.Value(u32).init(0);
+    var a_handled = std.atomic.Value(u32).init(0);
+    var b_inits = std.atomic.Value(u32).init(0);
+    var b_handled = std.atomic.Value(u32).init(0);
+
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .monotonic);
+    defer rt.deinit();
+
+    const group = try rt.spawnGroup(.one_for_all);
+    const a = try rt.spawnActor(AlwaysBoom, .{ .inits = &a_inits, .handled = &a_handled }, 8, .{
+        .max_errors = 1,
+        .window_ms = 60_000,
+        .group = group,
+    });
+    const b = try rt.spawnActor(EveryOtherBoom, .{ .inits = &b_inits, .handled = &b_handled }, 8, .{
+        // Never fails on its own: any rebuild it has was asked for by `a`.
+        .max_errors = 0,
+        .group = group,
+    });
+
+    for (0..2) |i| try a.send(@intCast(i));
+    try waitUntil(Published(@TypeOf(a.group_restarts), u64){ .value = &a.group_restarts, .want = 1 }, 5_000);
+    // Wait on the counter this test *asserts*, not on `group_restarts`: a
+    // rebuild bumps the latter *before* it runs `init` (`rebuildWorker`),
+    // so waiting on it and then reading `a_inits` is a check-then-assert race.
+    // It flaked once in a full-suite run before this.
+    try waitUntil(Published(@TypeOf(a_inits), u32){ .value = &a_inits, .want = 2 }, 5_000);
+    // `b` never errored, and was still rebuilt — that is `one_for_all`, and it
+    // is the half that cannot be tested without a real handle behind the member.
+    try waitUntil(Published(@TypeOf(b.group_restarts), u64){ .value = &b.group_restarts, .want = 1 }, 5_000);
+    // Wait on the counter this test *asserts*, not on `group_restarts`: a
+    // rebuild bumps the latter *before* it runs `init` (`rebuildWorker`),
+    // so waiting on it and then reading `b_inits` is a check-then-assert race.
+    // It flaked once in a full-suite run before this.
+    try waitUntil(Published(@TypeOf(b_inits), u32){ .value = &b_inits, .want = 2 }, 5_000);
+
+    try std.testing.expectEqual(@as(u32, 2), a_inits.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 2), b_inits.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), b.stats().handler_errors);
+    try std.testing.expect(!b.stats().stopped_by_supervisor);
+    try std.testing.expect(!a.stats().stopped_by_supervisor);
+
+    // `b` is still live and still serving, on the handle its producers hold.
+    try b.send(1);
+    try waitUntil(Published(@TypeOf(b_handled), u32){ .value = &b_handled, .want = 1 }, 5_000);
+}
+
+test "Supervision (§14): spending the restart budget takes the group down, and it is counted" {
+    var a_inits = std.atomic.Value(u32).init(0);
+    var a_handled = std.atomic.Value(u32).init(0);
+    var b_inits = std.atomic.Value(u32).init(0);
+    var b_handled = std.atomic.Value(u32).init(0);
+
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .monotonic);
+    defer rt.deinit();
+
+    // One rebuild, then the group gives up: with no parent to escalate to, the
+    // whole subtree stops rather than looping on `init` forever (§14.3).
+    const group = try rt.spawnGroupWith(.one_for_all, .{ .max_restarts = 1, .window_ms = 60_000 });
+    const a = try rt.spawnActor(AlwaysBoom, .{ .inits = &a_inits, .handled = &a_handled }, 8, .{
+        .max_errors = 1,
+        .window_ms = 60_000,
+        .group = group,
+    });
+    const b = try rt.spawnActor(EveryOtherBoom, .{ .inits = &b_inits, .handled = &b_handled }, 8, .{
+        .max_errors = 0,
+        .group = group,
+    });
+
+    // One failing member, one affordable action: `one_for_all` rebuilds both.
+    for (0..2) |i| try a.send(@intCast(i));
+    // Wait for *both* before going on: the second round stops the group, and a
+    // member that is stopped first never gets to read the rebuild it was asked
+    // for ("stop wins"), which would make the count below a race rather than a
+    // reading.
+    try waitUntil(Published(@TypeOf(a.group_restarts), u64){ .value = &a.group_restarts, .want = 1 }, 5_000);
+    try waitUntil(Published(@TypeOf(b.group_restarts), u64){ .value = &b.group_restarts, .want = 1 }, 5_000);
+    // The counter is per **member rebuilt**, not per action taken: one
+    // `one_for_all` decision lands here as two.
+    try std.testing.expectEqual(@as(u64, 2), rt.stats().group_restarts);
+
+    // Two more: the group is out of budget now, so there is no second action.
+    for (0..2) |i| try a.send(@intCast(i));
+    try waitUntil(Published(@TypeOf(rt.supervised_stops), u64){ .value = &rt.supervised_stops, .want = 2 }, 5_000);
+
+    // Both members stopped — the failing one and the healthy one — and both are
+    // on the counter. Before §14 this number had nowhere to live: a member's
+    // death was a per-worker bool and nothing else.
+    try std.testing.expectEqual(@as(u64, 2), rt.stats().supervised_stops);
+    // Still two: an action the budget refused is not a rebuild.
+    try std.testing.expectEqual(@as(u64, 2), rt.stats().group_restarts);
+    try std.testing.expect(a.stopped_by_supervisor);
+    // `b` was taken down *by the group*, which is the other reason a member can
+    // stop — and it is why the two flags exist separately.
+    try std.testing.expect(b.stopped_by_group.load(.acquire));
+    try std.testing.expect(!b.stats().stopped_by_supervisor);
+
+    // A dead member refuses work loudly rather than buffering it.
+    try std.testing.expectError(error.Closed, a.send(9));
+    try std.testing.expectError(error.Closed, b.send(9));
+}
+
+test "Supervision (§14): a run-owned worker is refused in a rebuilding group, accepted in stop_group" {
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .monotonic);
+    defer rt.deinit();
+
+    const restarting = try rt.spawnGroup(.one_for_one);
+    // Nothing outside `LoopOwned.run` can tear its state down, so a group that
+    // promises to rebuild it would be lying. Refused at spawn, said out loud.
+    try std.testing.expectError(
+        error.NotRestartable,
+        rt.spawnActor(LoopOwned, .{}, 8, .{ .group = restarting }),
+    );
+    // The failed spawn left nothing behind: the group is still empty.
+    try std.testing.expectEqual(@as(usize, 0), restarting.len());
+
+    // `.stop_group` never rebuilds, so it has nothing to promise.
+    const stopping = try rt.spawnGroup(.stop_group);
+    const h = try rt.spawnActor(LoopOwned, .{}, 8, .{ .group = stopping });
+    try std.testing.expectEqual(@as(usize, 1), stopping.len());
+    // ...and being in a group still means being stoppable, which for a
+    // `run`-owned worker is `ctx.stopped()`.
+    h.stop();
+    h.join();
+}
+
+test "Supervision (§14): a pooled member is rebuilt by its next claim" {
+    var inits = std.atomic.Value(u32).init(0);
+    var handled = std.atomic.Value(u32).init(0);
+
+    var rt = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        .scheduler = .{ .max_pooled_workers = 4 },
+    });
+    defer rt.deinit();
+
+    const group = try rt.spawnGroup(.one_for_one);
+    const h = try rt.spawnActor(AlwaysBoom, .{ .inits = &inits, .handled = &handled }, .{
+        .capacity = 8,
+        .mode = .pooled,
+    }, .{ .max_errors = 1, .window_ms = 60_000, .group = group });
+
+    for (0..4) |i| try h.send(@intCast(i));
+    try waitUntil(Published(@TypeOf(handled), u32){ .value = &handled, .want = 4 }, 5_000);
+    try waitUntil(Published(@TypeOf(h.group_restarts), u64){ .value = &h.group_restarts, .want = 2 }, 5_000);
+    // Wait on the counter this test *asserts*, not on `group_restarts`: a
+    // rebuild bumps the latter *before* it runs `init` (`rebuildWorker`),
+    // so waiting on it and then reading `inits` is a check-then-assert race.
+    // It flaked once in a full-suite run before this.
+    try waitUntil(Published(@TypeOf(inits), u32){ .value = &inits, .want = 3 }, 5_000);
+
+    // Same accounting as the dedicated case: a pooled rebuild is the same
+    // `deinit` + `init` on whichever thread holds the claim.
+    try std.testing.expectEqual(@as(u32, 3), inits.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 2), h.stats().group_restarts);
+    try std.testing.expectEqual(@as(u64, 2), rt.stats().group_restarts);
+    try std.testing.expect(!h.stats().stopped_by_supervisor);
+}
+
+// §14.5's tree edge, end to end. `supervisor.zig` pins the policy arithmetic with
+// probes; what only this test can say is that the *wiring* carries a failure up a
+// real escalation and back down through real handles — a child group's exhausted
+// budget reaching its parent, and the parent's `one_for_all` landing on a worker
+// that is not even in the failing subtree.
+//
+// Verified red: dropping the `rt.nestGroup(parent, child)` call leaves the child
+// with no parent, so its exhaustion stops the subtree instead of escalating —
+// `waitUntil(inner.group_restarts >= 1)` times out and the run logs
+// `stopped by supervisor` rather than `rebuilt by its supervision group`. The red
+// is that timeout, not a compile error, which is the difference between a
+// mutation that says something and one that only looks red.
+test "Supervision (§14.5): a nested group escalates to its parent, and the parent's policy decides" {
+    var inner_inits = std.atomic.Value(u32).init(0);
+    var inner_handled = std.atomic.Value(u32).init(0);
+    var outer_inits = std.atomic.Value(u32).init(0);
+    var outer_handled = std.atomic.Value(u32).init(0);
+
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .monotonic);
+    defer rt.deinit();
+
+    // The child cannot rebuild anything on its own (`max_restarts = 0`), so its
+    // first exhausted failure escalates — that is the tree edge, and the only
+    // thing this test is about.
+    const child = try rt.spawnGroupWith(.one_for_one, .{ .max_restarts = 0 });
+    const parent = try rt.spawnGroupWith(.one_for_all, .{ .max_restarts = 3 });
+
+    const inner = try rt.spawnActor(AlwaysBoom, .{ .inits = &inner_inits, .handled = &inner_handled }, 8, .{
+        .max_errors = 1,
+        .window_ms = 60_000,
+        .group = child,
+    });
+    // A healthy member of the *parent*: it never fails, so any rebuild it gets
+    // came from the parent's policy reaching down to it.
+    const outer = try rt.spawnActor(EveryOtherBoom, .{ .inits = &outer_inits, .handled = &outer_handled }, 8, .{
+        .max_errors = 0,
+        .group = parent,
+    });
+    try rt.nestGroup(parent, child);
+
+    // Two errors take the child's own budget over; it has none, so it escalates.
+    for (0..2) |i| try inner.send(@intCast(i));
+
+    // `inner` is rebuilt by the child — with a budget the *parent* reset on the
+    // way down, so the next escalation is not immediate.
+    try waitUntil(Published(@TypeOf(inner.group_restarts), u64){ .value = &inner.group_restarts, .want = 1 }, 5_000);
+    // ...and `outer`, which never failed and is not even in the same group, is
+    // rebuilt too: the parent's `one_for_all` applies to its whole member list,
+    // which contains the child subtree as one entry.
+    try waitUntil(Published(@TypeOf(outer.group_restarts), u64){ .value = &outer.group_restarts, .want = 1 }, 5_000);
+
+    try std.testing.expectEqual(@as(u32, 2), inner_inits.load(.monotonic));
+
+    // Wait on the counter this test *asserts*, not on `group_restarts`: a
+    // rebuild bumps the latter *before* it runs `init` (`rebuildWorker`),
+    // so waiting on it and then reading `outer_inits` is a check-then-assert race.
+    // It flaked once in a full-suite run before this.
+    try waitUntil(Published(@TypeOf(outer_inits), u32){ .value = &outer_inits, .want = 2 }, 5_000);
+    try std.testing.expectEqual(@as(u32, 2), outer_inits.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), outer.stats().handler_errors);
+    try std.testing.expect(!inner.stats().stopped_by_supervisor);
+    try std.testing.expect(!outer.stats().stopped_by_supervisor);
+
+    // The parent's budget was spent on the escalation the child handed it, and
+    // the child's was cleared by the rebuild — one decision, two counters, and
+    // the difference is what keeps a doubly-exhausted tree from escalating on
+    // every message.
+    try std.testing.expectEqual(@as(u32, 1), parent.restartsInWindow());
+    try std.testing.expectEqual(@as(u32, 0), child.restartsInWindow());
+    try std.testing.expectEqual(@as(u64, 2), rt.stats().group_restarts);
+
+    // Still serving on the handles their producers hold, and the child is still
+    // reachable through the parent.
+    try inner.send(9);
+    try waitUntil(Published(@TypeOf(inner_handled), u32){ .value = &inner_handled, .want = 3 }, 5_000);
+}
+
+/// A pooled worker that **tops its own mailbox back up**, so its backlog can be
+/// unbounded: every 32 messages it re-arms 32 more. That is the shape a starved
+/// scheduler needs — a busy worker with finite work cannot starve anyone for
+/// long, so `docs/RUNTIME.md` §12.3's "one token per worker in a FIFO ring" only
+/// means something against a worker that never runs out.
+///
+/// It checks `ctx.stopped()` before re-arming, which is also what lets shutdown
+/// finish: a self-feeding worker that ignored the stop would keep a pool thread
+/// claimed forever and `shutdown` waits for the batch in flight.
+const SelfFeedingWorker = struct {
+    pub const Message = u32;
+    seen: *std.atomic.Value(u64),
+
+    pub fn handle(self: *@This(), _: u32, ctx: anytype) !void {
+        const n = self.seen.fetchAdd(1, .monotonic);
+        if (n % 32 == 0 and !ctx.stopped()) {
+            var i: u32 = 0;
+            while (i < 32) : (i += 1) ctx.handle.send(i) catch break;
+        }
+    }
+};
+
+/// One message ever, and it records how much work the *other* worker had done
+/// when it finally arrived.
+const ArrivalProbeWorker = struct {
+    pub const Message = u32;
+    seen: *std.atomic.Value(u64),
+    a_at_arrival: *std.atomic.Value(u64),
+    a_seen: *const std.atomic.Value(u64),
+
+    pub fn handle(self: *@This(), _: u32, _: anytype) !void {
+        if (self.seen.load(.acquire) == 0) self.a_at_arrival.store(self.a_seen.load(.acquire), .release);
+        _ = self.seen.fetchAdd(1, .release);
+    }
+};
+
+test "Pooled (§12.3): an endlessly busy worker cannot starve a ready one" {
+    var a_seen = std.atomic.Value(u64).init(0);
+    var b_seen = std.atomic.Value(u64).init(0);
+    var a_when_b = std.atomic.Value(u64).init(0);
+
+    var rt = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        // **One** pool thread, so the two workers genuinely compete for the
+        // execution resource rather than each getting their own.
+        .scheduler = .{ .max_pooled_workers = 4, .pool_threads = 1 },
+    });
+    defer rt.deinit();
+
+    const a = try rt.spawn(SelfFeedingWorker, .{ .seen = &a_seen }, .{ .capacity = 64, .mode = .pooled });
+    const b = try rt.spawn(ArrivalProbeWorker, .{
+        .seen = &b_seen,
+        .a_at_arrival = &a_when_b,
+        .a_seen = &a_seen,
+    }, .{ .capacity = 8, .mode = .pooled });
+
+    // Give A a backlog, wait until it is demonstrably mining it, and only then
+    // ask for B — so B arrives behind a worker that is already busy and never
+    // about to stop.
+    for (0..64) |i| a.send(@intCast(i)) catch break;
+    try waitUntil(Published(@TypeOf(a_seen), u64){ .value = &a_seen, .want = 64 }, 5_000);
+    try b.send(1);
+
+    // Reaching the next line **at all** is the property: A had unbounded work and
+    // B was still served. `no starvation` is stated in §12.3 and, until now, was
+    // assumed rather than asserted — every other counter in the runtime looks the
+    // same whether or not it holds.
+    try waitUntil(Published(@TypeOf(b_seen), u64){ .value = &b_seen, .want = 1 }, 5_000);
+
+    // The tight half, with slack: the ring is FIFO and a worker holds at most one
+    // token, so the design predicts one `batch` of A ahead of B (A drained 16,
+    // handed back, B already queued behind it). 256 is 16 batches — far more than
+    // the design allows.
+    //
+    // This bound is also what `SchedulerConfig.batch` *is*, which is the finding
+    // the mutation produced: at `batch = 16` B is served before A has run 256,
+    // and at `batch = 1_000_000` this line is the one that fails — B is still
+    // served, but only after A's batch finally runs dry. So `batch` is not a
+    // throughput knob with a fairness side effect; **it is the fairness bound**,
+    // and a worker's worst-case wait behind a busy peer is one batch. Smaller
+    // batches cost throughput, larger ones cost latency for everyone else — the
+    // trade `docs/RUNTIME.md` §12.5 records.
+    try std.testing.expect(a_when_b.load(.acquire) < 256);
 }

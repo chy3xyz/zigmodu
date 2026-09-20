@@ -34,6 +34,9 @@ pub const hot_bus = @import("runtime/hot_bus.zig");
 pub const recorder = @import("runtime/recorder.zig");
 /// Scheduler module: the pool behind `.mode = .pooled` (docs/RUNTIME.md §12).
 pub const scheduler = @import("runtime/scheduler.zig");
+/// Supervisor module: supervision groups — policies, restart budget, the tree
+/// (docs/RUNTIME.md §14).
+pub const supervisor = @import("runtime/supervisor.zig");
 /// Runtime implementation: `Runtime`, the worker contract, stats, supervision.
 pub const runtime_impl = @import("runtime/runtime.zig");
 
@@ -58,8 +61,21 @@ pub const HotBus = hot_bus.HotBus;
 pub const Recorder = recorder.Recorder;
 /// Worker failure policy (`restart` / `stop` + windowed error budget).
 pub const Supervision = runtime_impl.Supervision;
+/// Supervision group: what a set of workers does about each other's failures
+/// (`one_for_one` / `one_for_all` / `rest_for_one` / `stop_group`, §14).
+pub const Group = runtime_impl.Group;
+/// A group's failure policy (§14).
+pub const GroupPolicy = runtime_impl.GroupPolicy;
+/// A group's restart budget: `max_restarts` inside `window_ms` (§14).
+pub const Intensity = runtime_impl.Intensity;
 /// Who runs a worker's `handle`: its own thread (`.dedicated`) or the pool.
 pub const SpawnMode = runtime_impl.SpawnMode;
+/// What a worker's handler does with its thread — `.cpu` or `.blocking` — i.e.
+/// which pool may run it. Declared, never detected (docs/RUNTIME.md §6).
+pub const ExecutionClass = runtime_impl.ExecutionClass;
+/// What a stop for good does with the queue: abandon it (`.immediate`) or work
+/// it off first (`.drain`). Undeclared, a worker keeps its mode's answer.
+pub const StopPolicy = runtime_impl.StopPolicy;
 /// `spawn`'s last argument, in either shape: `256` or `.{ .capacity = 256, .mode = .pooled }`.
 pub const SpawnConfig = runtime_impl.SpawnConfig;
 /// How a pool is declared: `Runtime.initWithOptions(.{ .scheduler = ... })`.

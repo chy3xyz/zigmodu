@@ -1,5 +1,330 @@
 # Changelog
 
+## [Unreleased]
+
+### Runtime：监督树 —— 组、策略、强度、树（**破坏性：否**；`docs/RUNTIME.md` §14）
+
+§3b 的监督是**自我监督**：一个 actor 数自己的错、自己决定停不停。它有两个结构性缺口 ——
+停掉是**终态**（actor 不会回来，`one_for_one` 那种"这个成员重来一次、其余照常"表达不了），
+以及"这个 actor 死了"在**指标面上不存在**（`WorkerStats.stopped_by_supervisor` 只有轮询者看得见，
+没有 `RuntimeStats` 聚合、没有 Prometheus 指标 —— 而 §3b 说预算是为了把"烧核"变成
+"停止 + warn + **计数**"）。本次补上这两件。
+
+**形状**：`rt.spawnGroup(policy)` 建组，成员在 spawn 时用 `Supervision.group` 入组；
+四种策略 `one_for_one` / `one_for_all` / `rest_for_one` / `stop_group`（OTP 的词，
+刻意不叫 `restart` —— 那个词已经被 `Supervision.Strategy` 的"记日志、接着服务"占了）；
+强度 `Intensity{ max_restarts, window_ms }`（默认 `{3, 60_000}`，`0` = 不许重启，
+与 `max_errors` 的"0 = 不限"相反，因为对重启来说"不限"正是这条预算要防的那个黑洞）。
+
+**协调者是 runtime，不是用户 actor** —— 父的邮箱由父自己的 `Message` 类型决定，
+runtime 无法合成任意用户 enum 的变体（§14.2 记了三条绕法为什么都不好）。
+OTP 的 supervisor 本身也不跑用户代码，去掉的只是"为一个不跑用户代码的东西再写一个用户类型"。
+
+**没有新线程、没有跨线程改状态**：执行者是**失败成员自己的线程**。它已经独占了那份状态，
+组动作只是对同组成员的 handle 置位（和 `stop()` 是同一类东西）；被置位的成员在**自己的线程上**
+（循环顶端 / 池认领点）做拆+建。
+
+- **原地重建**：`deinit` + `init` 在同一个线程、同一个循环里发生。线程不退出、handle 不销毁、
+  邮箱不关 —— 生产者手里的 `*Handle(W, cap)` 在重建前后是同一个，`Send` 语义不变。
+  §3b 那句"在语义确定之前宁可不给"（"要么要求 State 可拷贝、要么声明 `reset` 钩子"）
+  因此不再矛盾：重启就是重新 `init`，两条路都不需要。
+- **升级 / 树**：组可以是组的成员（`rt.nestGroup`）。子组**强度用尽**时把决定交给父组
+  （OTP：子 supervisor 放弃，父按自己的策略处理这棵子树），父重建子树时子组的预算一并清零。
+  `.stop_group` **不升级** —— 它是声明，不是预算。
+- **`run` 型成员被拒**：`W.run` 自持循环，runtime 插不进去、也读不到置位，所以往会重建的组里放
+  是 `error.NotRestartable`（spawn 时报，不是静默降级）。`.stop_group` 不重建，因此接受它。
+- **可见性**：`RuntimeStats.supervised_stops` / `group_restarts` +
+  `zigmodu_runtime_supervised_stops` / `zigmodu_runtime_group_restarts` —— 前者是
+  "一个成员被框架停掉了"，后者是"它被重建了几次"（**按成员计**：一次 `one_for_all` 动作
+  重建两个成员就是 2）。`docs/RUNTIME.md` §8 的清单从 17 条变 19 条。
+  两者都是**累计量**，理由同 `messages_discarded_on_stop`：`shutdown` 会在同一趟里 join 并销毁成员。
+
+**邮箱多了第三个"接收者可以回来"的理由**（`Mailbox.wake` / `recvWakeable`）：
+`stop_requested` 靠**关邮箱**叫醒停住的成员，重启请求不能这么做（关邮箱正是它不想要的结果），
+而它又不是一条消息（邮箱是**有类型**的）。成员在**读置位之前**取 epoch，落在这两步之间的
+`wake()` 才不会丢；普通 `recv` 在入口取当前 epoch，因此**行为一字未变**，没有组的成员走的还是老路。
+
+**测试**（净增 20 条：`supervisor.zig` 10 条组级单测 + `runtime.zig` 7 条端到端 + `mailbox.zig` 2 条唤醒；
+另有一条 `RaftElection` 守卫的**阳性对照**，见下）：
+`examples/runtime-workers` 多了一段 §14 演示（`[v0.31] … rebuilds=2 supervised_stops=2`，
+退出码以"真的重建过"为结论）。**过程中的两个真 bug 是测试抓出来的，不是推理出来的**：
+池化路径漏清 `restart_requested` → **每次失败重建两次**；空闲成员没有任何东西唤醒它
+（`one_for_all` 的"健康同伴"永远收不到请求）→ 才有了 `Mailbox.wake`。
+
+### RaftElection：给那条竞态守卫补上阳性对照（**破坏性：否**；只加测试）
+
+`RaftElection: a tick and an inbound RPC cannot both free voted_for` 用 `lock.isHeld()`
+当"这一次窗口被锁串行化了"的释放条件。复核后结论是**这个判据是精确的，不是近似的**：
+能进窗口的只有 `tick`（:274 取锁 + `defer`）与 `handleVoteRequest`（:330 同理）两条路径，
+所以 free `voted_for` 的线程**必然正持着锁**，于是
+`isHeld() == true ⟺ 观察者自己持锁 ⟺ 对方被挡在 acquire ⟺ 不可能重叠`。
+它依赖两个当时没写下来的前提：测试里只有那两个驱动线程，且 mutator 是唯一的取锁者。
+
+真正的缺口是**这条守卫在仓库里没有阳性对照**。而且健康构建里 `overlapped` 根本不可能为真
+（互斥性让两个线程进不了同一窗口），所以那条断言在锁正确时接近同义反复 —— 它的牙齿主要是
+"删掉锁 → 进程 abort"，而那是一次性的手工实验，没进仓库。
+
+- 新增 `RaftElection: the window rendezvous fires iff nothing serializes the entry`：
+  两个线程直接驱动 `WindowGate`，两半**只差一件事**——入口取不取锁。第一半 `lock = null`，
+  第一个线程没有可退出的条件，**必然**等到第二个（`overlapped` 为真是确定性的，不是概率）；
+  第二半两个线程各自持锁进门，于是 `overlapped` 保持 false 且**有理由**。
+  8/8 复跑稳定；把第一半的入口也改成串行化，`expect(overlapped)` 立刻变红（验过的红）。
+- **没有**引入 `isHeldByCurrentThread`（记 owner 的锁）：`tick` / `handleAppendEntries` 是全集群
+  最热的路径，为防一个假想的未来编辑在那里加一次 `getCurrentThreadId()` 不划算 —— 判据本身是精确的，
+  缺的是"它还会不会响"的证据，那条用测试补齐。
+
+### Raft：出站 RPC 的回包等待有界了（**破坏性：否**；`ElectionConfig.rpc_timeout_ms` 默认 100 ms）
+
+上一版把 RaftElection 的竞态守卫补了阳性对照，顺下来的问题是**持锁范围含出站 IO**。查下去发现
+描述它的那句话本身是反的：`docs/DISTRIBUTED.md` 与 `RaftTransport.handleConnection` 都写着
+"socket 读写是 IO，对端 connect 超时不该卡住 `tick()`"，而 `tick()` 的出站轮次
+（`sendHeartbeats` → `transport.sendAppendEntries`、`startElection` 的 `sendVoteRequest`）
+**整段在锁内**跑。而且 `RaftLock` 是**自旋**锁 —— 一个不响应的对端不是"慢一轮"，是让每个想碰
+状态的线程（accept 线程的入站 RPC、`appendEntry`、所有访问器）在 `spinLoopHint` 上**烧核**。
+
+这一版只落了**能落的那一半**，另一半是 std 的限制：
+
+- **已修：回包等待有界。** 新增 `sockread.setRecvTimeout`（`SO_RCVTIMEO`，镜像已有的
+  `setSendTimeout`）+ `ElectionConfig.rpc_timeout_ms`（默认 100 ms，`0` = 不限）。它覆盖的是
+  生产里更常见的黑洞：**握手成功、然后永不回包**（对端 GC 长停顿 / accept 队列打满 / 机器过载）
+  —— 这种对端 connect 侧的界**本来就管不到**。回归测试
+  `a peer that accepts and never replies costs rpc_timeout_ms, not the peer's patience`：
+  一个收下请求、绝不回复、把连接按住 2 秒的监听者；断言在 `rpc_timeout_ms` 内以"消息丢失"返回、
+  **且真的到达过对端**（证明等的是回包而不是握手失败），上界卡在 1500 ms。
+  变异（`rpc_timeout_ms = 0`）验过红：红的正是那条时间断言，不是编译错。
+- **未修：dial。** `IpAddress.ConnectOptions` 声称有 `.timeout`，但 CI 锁定的 Zig 0.17 里
+  `std.Io.Threaded` 的 `netConnectIpPosix` 是
+  `if (options.timeout != .none) @panic("TODO implement netConnectIpPosix with timeout")`
+  —— 第一版传了进去，测试直接 `signal ABRT`。**实测**出来的，不是读来的。所以 `dialTo` 没传；
+  SYN 被丢的对端仍要付 OS 默认的 connect 超时。补这一半得自己写带 deadline 的非阻塞 connect + poll。
+- **未修：锁范围本身。** 上面两条只是把代价**有界化**。收窄的设计（三段式）与三条义务
+  （请求必须自足 —— 否则锁一放、`truncateLog` 就能把 `LogEntry.command` 释放掉，传输层会读到已释放
+  内存；响应必须校验任期/身份，否则会把过期响应写进 `next_index`；`next_index`/`match_index` 在第三段
+  读）写在 `docs/DISTRIBUTED.md` §"出站 IO 与锁"，**并注明落地前必须先补两条红测试**
+  （阻塞的发送 + 并发截断；过期响应），因为现有假传输层全立即返回，撞不出这两类 bug。
+- 顺带修正了一处**自己引入的**顺序 bug：`TransportImpl.init(allocator, io, &raft)` 在现有接线里
+  先于 `raft = RaftElection.init(...)` 调用，所以任何在 `init` 里读 `raft.config` 的写法都在读
+  `undefined`。改成发送路径上按需读（config 只在 `RaftElection.init` 写一次，不会撕裂）。
+
+### Bench：参考判据支持"每条指标各自的参考" + 候选参考就位（**破坏性：否**）
+
+`check-bench.sh` 原来只有一个机器参考名（`BENCH_REF_METRIC`），所有归一化指标都除以它。但
+`RingBuffer SPSC x1M` 每轮的关键路径是**store→load 转发链**（`tryPush` 存 `tail`、`tryPop` 读回来，
+加 release/acquire 降级），跟 `atomic RMW` 的**锁定 RMW** 不是同一个宿主性质 —— 于是 CI 基线的比值
+`0.0524`（EPYC 那批）与本机 aarch64 的 `0.4976` 差 **9.5 倍**，文件头部本来就写着它"只是近似"
+（引 Xeon 那次 0.0386 vs EPYC 0.0523-0.0527 的 26% 离散）。
+
+- **机制**：`BENCH_NORMALIZED_METRICS` 的条目现在可以写成 `"<指标>=<参考>"`，不带 `=` 的回落到
+  `BENCH_REF_METRIC`；两段内嵌 python 同一套解析。新增两条守卫：**跨参考不比较**（基线条目记住
+  `normalized_by`，与门禁列表给的名字不一致就 WARN + 跳过，绝不拿两个不同分母的比值互比）、
+  **参考集合里的指标一律只报告、不用绝对毫秒门禁**（否则候选值记进基线后会变成第二个随宿主世代
+  翻红的绝对门禁，正是参考判据要消除的东西）。
+- **候选**：新增 `StoreForward x10M` —— 裸的 store→load 转发链，每轮 2 个 release store + 2 个
+  acquire load、同一缓存行、单线程、**去掉** ring 的索引算术与分支。
+- **不换**：`RingBuffer SPSC x1M` **仍**除以 `atomic RMW x10M`。换不换是**跨宿主**的数据判断，
+  一台机器上无法证明。本机 12 次并排：`ring/atomic` 0.4698–0.5086（离散 6.6%），
+  `ring/StoreForward` 0.08658–0.09028（**4.3%**）—— 只能读作"本机更稳"，**不是**改进的证明。
+  换参考现在是"改一行 + 每类机器 `--update` 一次"，流程已跑通（变异 M3 验过）。
+- 四条变异都自己验过：参考名不存在 → WARN 且**跳过**（没有静默按默认参考算）；`--update` 遇到拿不到的
+  参考 → 原样保留（不把毫秒写进 ratio 条目）；一行切参考 → 提示跨参考、`--update` 正常重录；
+  候选偏移 12x → 报告而非门禁。
+- **CI 基线未加 `StoreForward`**（本机值不能写进另一类机器），CI 会打一条 "not in the baseline" 的
+  WARN 并照常通过，需要在 runner 上跑一次 `--update` 收编。
+
+### Bench：`TimerWheel x100K` 的"~1.8x 余量"是**算出来的**，不是量出来的；并发掘出它的噪声是结构性的
+
+- **"1.8x"不是门禁读数**：门禁只在**越界时**说话，通过时除了一行 `OK:` 什么都不打印。那个数是头部
+  自己写的 `2.0 ÷ 1.06`（某一次判定运行 7.24 vs 6.808），即**算术余量**。
+- **实测**（同机、两组独立采样、`[med3]` 中位数）：8 次 → 6.94–8.79 ms（基线的 **1.02x–1.29x**）；
+  另一组 12 次 → 6.05–12.91 ms（**0.89x–1.90x**）。同批里 `TimerWheel churn x1M` 只散 1.05x、
+  `atomic RMW x10M` 1.04x —— **这条比邻居噪声大 5 倍**，大样本里有一次距窗口只剩 5%。
+- **噪声是结构性的、不是能修的**：这条 harness 建的是**新轮**、灌 `count` 个**永不重复**的 id，
+  所以计时循环必然含 `nodes` 增长（100k → 34 次增长、14.75 MB）与**新页 first-touch** ——
+  宿主的页路径**按构造在分子里**。稳态那条是 `TimerWheel churn x1M`，这条故意是冷形状。
+- **被实测否掉的"修法"**：把这条 harness 也挪到 `harness_allocator`（文件里 `findById x20K` 的先例是
+  把离散从 1.10–1.37x 降到 1.04x）。那条先例成立是因为**它的循环每轮释放**、块回到 freelist 让页保持热；
+  **这条循环从不释放**（arm 完就丢掉整只轮），换过去只是多加了 `smp_allocator` 自己的 slab 元数据。
+  实测：7.95–12.17 ms、游程离散 1.53x、单次运行内最大 **1.86x** —— 每个方向都更差。**已回退**，
+  并把这条否证写进 harness 与门禁头部的注释，免得下一个人再试一遍。
+- **现在的契约**：这条报慢是**候选回退** —— 先重跑确认，再看 `TimerWheel churn x1M`：churn 平而只有
+  这条动了，那是宿主的页路径，不是轮子。
+
+### Bench：调度器第一次有了基准 —— 并量出池化的那一跳值多少（**破坏性：否**）
+
+第三方评估把"**Scheduler benchmark / pooled vs dedicated 的边界**"列在 P0，而 `src/benchmark.zig` 的
+32 条指标**全是原语**（mailbox / ring / wheel / hotbus / objectpool / sequencer），**一条调度器的都没有**。
+`docs/RUNTIME.md` §12.5 那句"池化多一跳，所以关键路径要 dedicated"因此一直是形容词。
+
+新增 `BenchDrainWorker` 与 `benchWorkerDrain(mode, …)`，让三条基准落在**同一根轴**上 —— 同一个生产循环、
+同一个 worker、同样 256 的邮箱，**只有"谁在 drain"不同**：
+
+| 指标 | ns / 次交接 | 相对无线程 |
+|---|---|---|
+| `Mailbox post+drain x1M`（已存在，无第二线程） | 17 | — |
+| `Worker drain dedicated x1M`（新） | 128 | 7.6× |
+| `Pooled dispatch x1M`（新） | 190 | 11.3× |
+
+即**池化的一次交接约为 dedicated 的 1.5–2.9 倍**（8 次独立运行）。"多一跳"从形容词变成了量级。
+
+- **两条只报告、不门禁**，理由是实测的：8 次运行里 dedicated 散 1.84×、pooled 散 **3.09×**
+  （同批 `Mailbox post+drain` 只散 1.26×），而窗口是 2.0× —— 一次运行内能摆 3 倍的数字当判据就是
+  又一台假红机器（与 `TimerWheel x100K` 同一课）。已进 `check-bench.sh` 的 `REF_METRICS`
+  （"宿主测量，永不门禁"），基线按点插入，**其余 28 条逐字节未动**。
+- **没进 `[pct]` 区**，也是照该区自己的规则：它明确排除"per-call fixture 与计时区可比"的 harness
+  （`findById x20K` 因此出局），而这两条每次调用都要建 Runtime + worker +（池化那条）池线程。
+  第一版把它们放进了 pct，代价是每批 fixture 重建、整套从 6 秒变成**挂死**。
+- **挂死还是另一个 bug**：第一条 harness 忘了 `stop()` 就 `join()`，dedicated 的线程永远停在 `recv` 里。
+  实测症状是进程 9.5 分钟只用 4.88 秒 CPU（0.1%）、**一条输出都没有** —— 是"验证靠跑"而不是"靠读"
+  才看出来的。已修，并把这个形状写进注释（池化侧由空邮箱自行释放，所以这个遗漏**只在 dedicated
+  那条上出现**，而那正是第一条）。
+- `[pct]` 区新增一行显式说明"hand-off 这一对为什么不在这里"。
+
+### 修一条**我自己上一轮引入的** flake（§14 的测试在等错的计数器）
+
+全量套件 3 轮里挂了 2 轮，都是 `Supervision (§14.5): a nested group escalates…` 的
+`expected 2, found 1`（`outer_inits`）。根因不在框架，在测试：`rebuildWorker` 里
+**`countGroupRestart()` 在 `startWorker()`（跑 `init`）之前**调用，所以
+`group_restarts` **先于** `inits` 发布 —— 测试**等的那个计数器**和它**断言的那个**不是一个，
+这是典型的 check-then-assert race。
+
+同一个形状在 §14 的**四条**测试里都有（`one_for_one` / `one_for_all` / pooled / nesting），
+只是碰巧只有一条先炸。修法：**等它断言的那个**（`inits`），并让两份测试 worker 的
+`init` 计数用 `.release` 发布，使 `Published` 的 acquire 读能真正定序它后面的那些读数。
+实测：修前 3 轮挂 2 轮 → 修后 **3 轮全绿（1302 pass / 21 skip / 0 fail）**。
+
+（顺带一个反证：`benchmark.zig` **不在测试图里**（`src/tests.zig` 没引它），所以这条 flake
+与我同一轮加的调度器基准无关 —— 查清这一点才没把两个问题搅在一起。）
+
+### 公平性第一次被**断言**，并量出 `batch` 就是饿死上界（**破坏性：否**）
+
+缺口矩阵 §5 要求 `no starvation` 进验收标准，而它此前**是设计论证、没有断言**：§12.3 写着
+"环是 FIFO、每个 worker 至多一个 token"，可**能造出无界积压的 worker 只有一个自我续食的**，
+而没有任何测试用那种 worker 试过。
+
+新增 `Pooled (§12.3): an endlessly busy worker cannot starve a ready one`：A 每处理 32 条就给自己
+补 32 条（积压无界，且 `ctx.stopped()` 时停手 —— 否则它会一直占住池线程，`shutdown` 永不返回），
+B 只发一条。断言 **B 被服务**（A 有无限活儿也拦不住它）**且** B 到达时 A 还没跑过 256 条。
+
+- **变异验过红，而且红的形状值得记**：把 `SchedulerConfig.batch` 调成 `1_000_000`，红的是**那条
+  边界断言**而不是 `WaitTimeout` —— B **仍然被服务**，只是要等 A 那一批跑干。所以 `batch`
+  **不是性能旋钮**：它就是**公平上界**，一个 worker 在忙邻居后面的最坏等待 = 一个 batch。
+  小 batch 换吞吐、大 batch 换所有人的延迟上界，两边都不能只按吞吐调。写进 §12.5。
+- 3 轮全量全绿（1303 pass / 21 skip / 0 fail）。
+
+（另记一次**假红**，因为它值得当教材：`check-bench` 曾报 `findById x10K/x20K` 慢 2.1×，
+但同一轮里机器参考 `atomic RMW x10M` 自己从 22.2 涨到 **35.8 ms**、所有比值同步掉到 ~0.6×。
+机器静下来重跑即 exit 0、参考回到 21.4 ms。**先看参考有没有动**，比看被门禁的指标快得多。）
+
+### Bench：池的扫描 —— 加池线程从来不更快（**破坏性：否**；只报告不门禁）
+
+缺口矩阵 §3 要 `worker 数 × pool_threads` 的扫描，用它反过来决定每个 Runtime 改动。新增
+`benchPoolSweep(io, workers, pool_threads, total)` 与 5 个网格点（每点 50 万条、64 槽邮箱、
+中位 3 次），**只报告、不门禁，也不进 `bench-results.json`** —— 同一路径上一轮量到的离散是 1.84×/3.09×，
+再多十几个这样的数字放到 2.0× 窗口前就是假红机器。
+
+| workers | pool_threads | ns/条 |
+|---|---|---|
+| 1 | 1 | ~410 |
+| 10 | 4 | ~114 |
+| **100** | **1** | **~41** |
+| 100 | 2 | ~55 |
+| 100 | 4 | ~66 |
+
+- **worker 越多、每条越便宜**（410 → 41）：每 worker 一只邮箱，100×64 = 6400 条的缓冲让生产者几乎
+  不再撞 `error.Full`。代价主要在**生产者的重试**上，不在派发上。
+- **加池线程从未变快**：6 次独立运行里 `pool_threads=1` **5 次最快、1 次持平**，最快的几次比 2/4
+  线程**快 2–3 倍**，且单调（41 → 55 → 66）。所以 `pool_threads` 默认 1 是对的，
+  **不要按吞吐把它调大**。
+- **第二族：给每条消息真活儿**（256 步依赖乘法链，~400 ns），结论**反过来** ——
+  `workers=8` 下 1/2/4/8 线程 = 78-92 / 49-59 / **31-34** / 33-38 ms（4 次运行）：
+  **线程近线性扩展到 4（2.4-3.0×），8 条反而略降**（8 worker + 生产者已占满 10 核）。
+- **两族合起来才是可决策的答案**：`pool_threads` 要**按活儿定** —— handler 琐碎就 1 条
+  （此时生产者才是瓶颈，多线程纯属争抢），每条消息有真活儿就 `min(忙的 worker 数, 核数 − 1)`。
+  单独看任何一族都会得出错结论。这句也印在扫描自己的输出里。
+- 执行器：整个基准套件 7.2 秒（含 6 个网格点 × 3 次采样 × 最多 100 个池化 worker + 4 条池线程）。
+
+### Replay：按 seq 区间与按轨筛选（**破坏性：否**；只加 API，`docs/RUNTIME.md` §13.8）
+
+缺口矩阵 §7 要 `replay --from-seq 100000 --to-seq 120000` 那种能力。v1 只能整份重放，现在
+`Replayer` 上有了定位与筛选（**没有 CLI 包装**，是 API）：
+
+```zig
+var rp = log.replayer(&manual);
+try rp.open(100_000, 120_000);   // [from, to)
+try rp.onlyTracks(&.{"book"});   // 回到全部用 clearTrackFilter()
+try rp.bind("book", book_handle);
+_ = try rp.replayAll();
+_ = rp.skipped();                // 被跳过的总数
+```
+
+**五条语义决策**（`from` 之前＝跳过并计数；`to` 及之后＝根本不走进度、不计任何数；被筛掉的轨＝前进游标 +
+计数；空 `onlyTracks`＝什么都不选且可见；轨 id 拼错＝`error.UnknownTrack`）写在 §13.8 的表里。
+唯一的真合同是**计数恒等式**：一轮走完
+`log.len() == delivered + skipped() + (seq >= to 的条数)` —— 被筛掉的洞**看得见**。
+
+- **签名一个都没变**：`step` / `replayAll` / `remaining` / `isFullyBound` 的签名未动，无 window/filter 时
+  `remaining()` 与 `isFullyBound()` 的**值**与旧行为逐位一致。（代价：`remaining()` 现在是 O(总条目数) 扫描。）
+- **零分配**：`Replayer` 不持有 allocator，`open`/`seekTo` 只是扫描，`onlyTracks` 借调用方的 slice；
+  `alloc_contract_test.zig` 一个数字都没改。
+- **只改了一个文件**：`src/runtime/recorder.zig`（+536/−25）。
+- **独立复核**（我自己跑的，不是采信报告）：4 条新用例全绿；`git diff` 里那四个公开签名**一行都没出现**
+  （= 未改）；**变异自己重做** —— `to` 边界 `>=` 改 `>` → 3 条以 `TestExpectedEqual` 变红
+  （`expected 4, found 5`，行号与报告一致），**不是编译错**，已回退。
+- **未做**：落盘/WAL/codec、CLI 包装、seq 集合/多区间、按类型或时间戳筛选。既有一条边界未动：
+  `Track` 内部不保证 `seq` 升序，而归并假设轨内升序。
+
+### 停机策略与执行类别：把"执行模式的副作用"变成显式声明（**破坏性：否**；`docs/RUNTIME.md` §12.13）
+
+缺口矩阵 §10 与 §6。两件事都改在 `src/runtime/runtime.zig`、`src/runtime/scheduler.zig`、barrel（+655/−31）。
+
+**§10 StopPolicy**：同一个 worker 因为 `.dedicated` / `.pooled` 不同，"停机后邮箱尾巴怎么处理"就不同
+（文档里甚至有测试锁死这个差异）。现在它是显式声明，**"不写"复现两种现状**：不写 = dedicated 得到
+`.immediate`（历史行为）、pooled 得到 `.drain`（历史行为）。新增 4 条用例；**既有的两条停机语义测试
+一行未改、原样通过**（其中"尾巴被计入 `discarded_on_stop`"的丢弃合同保持）。
+
+**§6 执行类别**：`.blocking` 的 worker 走**独立的一只池**（`blocking_threads` / `max_blocking_workers`
+各自声明），所以一个阻塞的 handler 占住池线程**不会**饿死 CPU 池 —— 两池不共享环/线程/计数，
+是**结构性事实**而非时序巧合。`Scheduler` 的机制一行未改（同一套已验证的实例），§12.3 状态独占、
+D4 每 worker 一 token、`push` 不可失败、§12.11 修的四处都不需要重新论证。
+
+- **默认逐位不变、零新线程**：不写 `execution_class`（`.cpu`）且不写 `blocking_threads`（`0`）时，
+  `Scheduler.start` 仍是懒启动，只有 `.blocking` spawn 才起阻塞池。
+- **诚实划边界（写进 §12.13）**：这是**声明式**的，runtime 不能一般地检测阻塞，所以它解决
+  "被声明为阻塞的 worker 不占 CPU 池"，**不**解决"忘了声明"。`blocking_threads` 按**下游资源并发量**
+  定（如 DB 连接池大小），**不要按核数**。两个上界是**两次独立 admission**（总量是两者之和）。
+  `.blocking` + `.dedicated` 是**编译错**（声明会被静默忽略，比不声明更糟）。
+- **独立复核**（我自己跑的）：**合并后** 全量 **1313 pass / 21 skip / 0 fail**、门禁 **7/7 全绿**；
+  **变异自己重做** —— 把策略解析改成"忽略 mode、一律 `.drain`"，**3 条以 `TestExpectedEqual` 变红**
+  （`expected 2, found 8` / `expected .immediate, found .drain` / `expected 6, found 0`，与报告一致），
+  **不是编译错**，回退按字节校验。`alloc contract` 8/8，**精确分配次数一个数字都没改**。
+- **未做**：`MetricsBridge` 只发布 CPU 池的 6 条 `zigmodu_runtime_pool_*`，阻塞池目前只有
+  `blockingPoolStats()` 这个读侧入口（无 live scrape）；`Application` 侧没有 `withBlockingThreads`
+  （builder 接线是后续项）；`soak` / examples / CI 集成脚本未跑。
+
+### 补齐执行类别留下的两处接线缺口（**破坏性：否**）
+
+上一版把 `.blocking` / `SchedulerConfig.blocking_threads` 落进了 **Runtime**，但两条"**给应用用**"的路
+没接：`MetricsBridge` 只发布 CPU 池那六条 `zigmodu_runtime_pool_*`，`Application` 侧也没有
+`withBlockingThreads`（要用阻塞池只能手写 `Runtime.initWithOptions`）。这一版补上：
+
+- **`MetricsBridge` 覆盖阻塞池**：同样六条，`zigmodu_runtime_blocking_pool_*`（declared / threads /
+  ready_len / claimed / dispatches / ready_push_failures），与 CPU 池并列。没声明阻塞池时读 0 ——
+  "这个 app 没有阻塞池"是仪表盘能画出来的答案，不是一条缺失的线。`zigmodu_runtime_*` 从 25 条变 31 条。
+- **`Application.withBlockingThreads(blocking_threads, max_blocking_workers)`**：与
+  `Config.blocking_threads` / `Config.max_blocking_workers` 同名同义，走
+  `ApplicationBuilder → Config → Runtime.initWithOptions` 这条既有的镜像路（六处：两个 `Config` 字段、
+  `init` 的拷贝、`runtime()` 的 scheduler 字面量、两个 builder 字段、builder 方法、`build` 的拷贝）。
+- **新增 2 条接线测试**：`Application: withBlockingThreads declares the blocking pool the runtime then
+  offers`（声明 4/2/7 三个数，断言 CPU 池上界与阻塞池上界**各自**到位，然后**真的 spawn 一个
+  `.blocking` worker 并等它跑完** —— 那才是这条接线缺口的用户可见后果：以前 app 走 builder 声明
+  `.blocking` 只会拿到 `error.BlockingPoolNotConfigured` 而无路可走）与
+  `Application: no withBlockingThreads means no blocking pool at all`（默认仍是零新线程、`.blocking` 被拒）。
+- **变异验过红**：拿掉 builder→Config 的拷贝，红灯是 `BlockingPoolNotDeclared`（**行为红，不是编译错**），
+  已按字节回退。全量 **1315 pass / 21 skip / 0 fail**，门禁 **7/7**。
+- 一处**我自己先写错**的断言值得记：第一版我断言 `blockingPoolStats().pool_threads == 2`，实际读 0 ——
+  `pool_threads` 是"**正在跑的**线程数"，池是懒启动的（声明的池一条线程都不起）。改成断言
+  `max_pooled_workers`（声明的上界）之后再 spawn 一条，才同时验证了"宽度进位"与"线程真起来了"。
+
 ## [0.30.1] - 2026-09-20
 
 ### DX：让"只跑匹配的测试"真的可用，且不再静默骗人（**破坏性：否**；新增 `bash scripts/test-fast.sh --filter`）

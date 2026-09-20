@@ -57,6 +57,18 @@ pub fn Mailbox(comptime T: type, comptime capacity: usize) type {
         received: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
         dropped_full: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
         wait_spins: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        /// Bumped by `wake` to make a parked `recvWakeable` return early.
+        ///
+        /// The mailbox normally has exactly two reasons for a receiver to stop
+        /// waiting: a message, or `close`. That is enough for as long as an
+        /// external "please come back" only ever means "stop for good" — but a
+        /// supervision group asking one of its members to rebuild itself (§14)
+        /// is a third reason, it arrives from another thread, and it is not a
+        /// message the (typed) mailbox could carry. The epoch gives `recvWakeable`
+        /// something to compare against; `recv` passes the current value and
+        /// therefore never returns for it, which is what keeps the ordinary
+        /// receive path exactly as it was.
+        wake_epoch: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
         pub fn init(io: std.Io) Self {
             return .{ .io = io };
@@ -150,11 +162,46 @@ pub fn Mailbox(comptime T: type, comptime capacity: usize) type {
         /// message arrives or the mailbox is closed. Null means "no message"
         /// (timeout, or closed and drained) — check `isClosed()` to tell them
         /// apart when it matters.
+        ///
+        /// Never returns early for a `wake`: it snapshots the epoch on entry, so
+        /// the plain receive path is exactly the path it always was.
         pub fn recv(self: *Self, timeout_ms: u32) ?T {
+            return self.recvWakeable(timeout_ms, self.wakeEpoch());
+        }
+
+        /// The value to pass to `recvWakeable` so that a `wake` arriving *after
+        /// this call* is noticed. A caller checks whatever it needs to check and
+        /// then waits — and it must read this **before** that check, or a wake
+        /// landing in between would be compared against a stale picture and lost.
+        pub fn wakeEpoch(self: *const Self) u32 {
+            return self.wake_epoch.load(.acquire);
+        }
+
+        /// Wake a parked `recvWakeable` without closing the mailbox: the receiver
+        /// returns null at its next opportunity and its caller re-checks whatever
+        /// it woke up for. A "spurious" wake by design — nothing is enqueued and
+        /// nothing is consumed.
+        ///
+        /// Bumps the epoch *before* taking the mutex, so a receiver that is
+        /// between "found the queue empty" and "parked" either sees the new epoch
+        /// on its way in or is woken by the broadcast.
+        pub fn wake(self: *Self) void {
+            _ = self.wake_epoch.fetchAdd(1, .release);
+            self.mu.lock(self.io) catch return;
+            self.not_empty.broadcast(self.io);
+            self.mu.unlock(self.io);
+        }
+
+        /// `recv` that also returns null once the wake epoch has moved past
+        /// `wake_from`. Null is then ambiguous between "timeout", "closed" and
+        /// "woken" — callers of this one are expected to re-check their own
+        /// condition and come back, which is the whole point.
+        pub fn recvWakeable(self: *Self, timeout_ms: u32, wake_from: u32) ?T {
             var spins: u32 = 0;
             while (spins < spin_rounds) : (spins += 1) {
                 if (self.tryRecv()) |message| return message;
                 if (self.closed.load(.acquire) and self.ring.isEmpty()) return null;
+                if (self.wake_epoch.load(.acquire) != wake_from) return null;
                 std.atomic.spinLoopHint();
             }
             _ = self.wait_spins.fetchAdd(1, .monotonic);
@@ -165,6 +212,7 @@ pub fn Mailbox(comptime T: type, comptime capacity: usize) type {
             while (true) {
                 if (self.tryRecvUnlocked()) |message| return message;
                 if (self.closed.load(.acquire)) return null; // drained by the check above
+                if (self.wake_epoch.load(.acquire) != wake_from) return null;
                 if (timeout_ms == 0) {
                     self.not_empty.wait(self.io, &self.mu) catch return null;
                     continue;
@@ -384,4 +432,57 @@ test "Mailbox: many producers, one consumer, nothing lost" {
     for (threads) |t| t.join();
     try std.testing.expectEqual(@as(usize, producers * per_producer), total);
     try std.testing.expectEqual(@as(u64, 0), mb.stats().dropped_full);
+}
+
+test "Mailbox: wake is only visible to a receiver that was watching the old epoch" {
+    var mb = Mailbox(u32, 4).init(std.testing.io);
+    const before = mb.wakeEpoch();
+
+    // A receiver already past the wake comes back empty-handed...
+    mb.wake();
+    const after = mb.wakeEpoch();
+    try std.testing.expect(after != before);
+    try std.testing.expectEqual(@as(?u32, null), mb.recvWakeable(0, before));
+
+    // ...and a wake enqueues nothing, consumes nothing, and leaves no trace that
+    // a later receiver could trip over — which is what lets `recv` snapshot the
+    // epoch on entry and be the same blocking receive it always was.
+    try std.testing.expectEqual(@as(usize, 0), mb.len());
+    try std.testing.expectEqual(@as(u64, 0), mb.received.load(.acquire));
+    try std.testing.expect(!mb.isClosed());
+    try std.testing.expectEqual(before + 1, after);
+}
+
+test "Mailbox: wake unparks a receiver that had already blocked" {
+    var mb = Mailbox(u32, 4).init(std.testing.io);
+    const epoch = mb.wakeEpoch();
+    var woke = std.atomic.Value(bool).init(false);
+
+    const Shared = struct {
+        fn receive(m: *Mailbox(u32, 4), watching: u32, flag: *std.atomic.Value(bool)) void {
+            // There is no message coming: the only way this returns is the wake.
+            _ = m.recvWakeable(0, watching);
+            flag.store(true, .release);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Shared.receive, .{ &mb, epoch, &woke });
+
+    // Wait for the receiver to be *parked*, not merely started. `wait_spins` is
+    // the mailbox's own count of receivers that had to take the condition
+    // variable — the state under test, rather than elapsed time.
+    var spins: u32 = 0;
+    while (mb.wait_spins.load(.acquire) == 0 and spins < 500_000_000) : (spins += 1) std.atomic.spinLoopHint();
+    try std.testing.expect(mb.wait_spins.load(.acquire) > 0);
+
+    mb.wake();
+    // Bounded: a lost wake must *fail*, not hang the suite.
+    var after: u32 = 0;
+    while (!woke.load(.acquire) and after < 500_000_000) : (after += 1) std.atomic.spinLoopHint();
+    try std.testing.expect(woke.load(.acquire));
+    t.join();
+
+    // Woken, not fed: the wake delivered nothing and the mailbox is still open.
+    try std.testing.expectEqual(@as(usize, 0), mb.len());
+    try std.testing.expectEqual(@as(u64, 0), mb.received.load(.acquire));
+    try std.testing.expect(!mb.isClosed());
 }

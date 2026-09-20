@@ -93,6 +93,7 @@ CI、`scripts/ci-*.sh`、本文件都用那个。`cd tools/zmodu && zig build` �
 | WS：`on_message(session, msg, kind)` — **text+binary**（`WsFrameKind`）；`writeBinary`/`writeData` | 假定只收 0x1；丢弃 0x2（会破坏 OpenIM protobuf） |
 | sqlx：`Client.open` 后注意 pool/client 指针；CB 传 `io` | 在 ConnPool 上缓存失效的 `*Client` |
 | sqlx 驱动链接：`-Ddb=sqlite\|postgres\|mysql\|all`（默认 `all`） | 小系统用 `.db = "sqlite"`，勿默认三库全链 |
+| Runtime 监督树：`rt.spawnGroup(.one_for_one\|.one_for_all\|.rest_for_one\|.stop_group)` + `Supervision.group`；重建是原地 `deinit`+`init`（`docs/RUNTIME.md` §14） | 让 handler 自己 `catch` 装作没事（错误预算就废了）；把声明 `run` 的 worker 放进会重建的组（spawn 报 `NotRestartable`） |
 | Agent：`AgentSpec{.guard=…}` + 技能声明 `.action`（默认 `execute`）；`ai.ProposalPipeline` 走提议→风险→执行 | 裸 `Agent{}` 不设 `guard`（= **无界**）；用 `MemoryStore.formatContext` 给 agent 喂记忆（`0` = 任意 = 跨租户） |
 | Agent 跑成 worker：webhook / cron 路径用 `ai.AgentWorker`（`rt.spawn(ai.AgentWorker, …)` 拿 `*runtime.Handle(AgentWorker, cap)`，再 `ai.agent_worker.post(handle, goal)`）；被拒/失败经 `on_result` 回报，不占监督预算 | 在请求线程里同步 `Agent.run`（`ai.trigger.Trigger.fire` 是同步的，会占住 handler）；把失败当 supervisor 错误反复重试 |
 | 共享注册表：`zmodu.FrozenMap/FrozenStringMap`，启动期填充后 `freeze()` | 文件作用域裸 HashMap 在 worker 池上并发写（撕裂元数据 → 进程崩溃） |
@@ -438,4 +439,5 @@ filter 是**测试全限定名的子串**（形如 `core.cluster.RaftElection.te
 - SQLx 选择性链接：`-Ddb=` / `.db=`，默认 `all`；框架测试勿收窄；见 `docs/SQLX_DRIVERS.md`。
 - WS：`WsMessageFn` 含 `WsFrameKind`；fiber/io_uring 分发 text+binary（OpenIM protobuf OK）。
 - CI：`bash scripts/ci-integration.sh`（tenant-mgmt + stress + shopdemo，`-Ddb=sqlite`）。
+- Runtime 监督树（v0.31，`docs/RUNTIME.md` §14）：`rt.spawnGroup(policy)` + `Supervision.group`；重建是**原地** `deinit`+`init`（同线程同循环，handle 不换、邮箱不关）。声明 `run` 的 worker 进会重建的组 = spawn 报 `NotRestartable`。**多了一个"接收者可以回来"的理由**：`Mailbox.wake` / `recvWakeable` —— 成员必须在**读 `restart_requested` 之前**取 epoch，落在这两步之间的 `wake()` 否则会丢（`stop()` 靠关邮箱唤醒，重启不能关邮箱）。
 - 旗舰示例：`examples/tenant-mgmt`（CatalogPermDb）；多主体门户参考应用侧 Alignment 文档（如 ZigShop）。

@@ -1,143 +1,158 @@
 [
-  {
-    "name": "scanModules x100K",
-    "unit": "ms",
-    "value": 7.941
-  },
-  {
-    "name": "scanModules x1M",
-    "unit": "ms",
-    "value": 77.915
-  },
-  {
-    "name": "validateModules x10K",
-    "unit": "ms",
-    "value": 7.042
-  },
-  {
-    "name": "validateModules x100K",
-    "unit": "ms",
-    "value": 72.498
-  },
-  {
-    "name": "App lifecycle x3K",
-    "unit": "ms",
-    "value": 9.177
-  },
-  {
-    "name": "workflow 20-step x5K",
-    "unit": "ms",
-    "value": 18.298
-  },
-  {
-    "name": "1L x10M events",
-    "unit": "ratio",
-    "value": 1.0083,
-    "normalized_by": "atomic RMW x10M"
-  },
-  {
-    "name": "10L x1M events",
-    "unit": "ms",
-    "value": 12.36
-  },
-  {
-    "name": "100L x100K events",
-    "unit": "ms",
-    "value": 12.222
-  },
-  {
-    "name": "CircuitBreaker x10M",
-    "unit": "ms",
-    "value": 6.385
-  },
-  {
-    "name": "CircuitBreaker x100M",
-    "unit": "ms",
-    "value": 63.047
-  },
-  {
-    "name": "RateLimiter x1M",
-    "unit": "ms",
-    "value": 51.549
-  },
-  {
-    "name": "RateLimiter x10M",
-    "unit": "ms",
-    "value": 335.643
-  },
-  {
-    "name": "10 checks x100K",
-    "unit": "ms",
-    "value": 12.617
-  },
-  {
-    "name": "100 checks x10K",
-    "unit": "ms",
-    "value": 15.458
-  },
-  {
-    "name": "findById x20K",
-    "unit": "ms",
-    "value": 12.709
-  },
-  {
-    "name": "findById x10K",
-    "unit": "ms",
-    "value": 6.211
-  },
-  {
-    "name": "atomic RMW x10M",
-    "unit": "ms",
-    "value": 22.177
-  },
-  {
-    "name": "RingBuffer SPSC x1M",
-    "unit": "ratio",
-    "value": 0.4976,
-    "normalized_by": "atomic RMW x10M"
-  },
-  {
-    "name": "Mailbox post+drain x1M",
-    "unit": "ratio",
-    "value": 0.7902,
-    "normalized_by": "atomic RMW x10M"
-  },
-  {
-    "name": "Mailbox full-path x10M",
-    "unit": "ratio",
-    "value": 1.0732,
-    "normalized_by": "atomic RMW x10M"
-  },
-  {
-    "name": "TimerWheel x100K",
-    "unit": "ms",
-    "value": 6.808
-  },
-  {
-    "name": "TimerWheel churn x1M",
-    "unit": "ms",
-    "value": 28.193
-  },
-  {
-    "name": "HotBus 8sub x1M",
-    "unit": "ratio",
-    "value": 0.8221,
-    "normalized_by": "atomic RMW x10M"
-  },
-  {
-    "name": "ObjectPool x1M",
-    "unit": "ms",
-    "value": 15.327
-  },
-  {
-    "name": "Sequencer x10M",
-    "unit": "ratio",
-    "value": 1.031,
-    "normalized_by": "atomic RMW x10M"
-  },
-  {
-    "name": "Worker spawn+join x1K",
-    "unit": "ms",
-    "value": 29.37
-  }
+    {
+        "name": "scanModules x100K",
+        "unit": "ms",
+        "value": 7.941
+    },
+    {
+        "name": "scanModules x1M",
+        "unit": "ms",
+        "value": 77.915
+    },
+    {
+        "name": "validateModules x10K",
+        "unit": "ms",
+        "value": 7.042
+    },
+    {
+        "name": "validateModules x100K",
+        "unit": "ms",
+        "value": 72.498
+    },
+    {
+        "name": "App lifecycle x3K",
+        "unit": "ms",
+        "value": 9.177
+    },
+    {
+        "name": "workflow 20-step x5K",
+        "unit": "ms",
+        "value": 18.298
+    },
+    {
+        "name": "1L x10M events",
+        "unit": "ratio",
+        "value": 1.0083,
+        "normalized_by": "atomic RMW x10M"
+    },
+    {
+        "name": "10L x1M events",
+        "unit": "ms",
+        "value": 12.36
+    },
+    {
+        "name": "100L x100K events",
+        "unit": "ms",
+        "value": 12.222
+    },
+    {
+        "name": "CircuitBreaker x10M",
+        "unit": "ms",
+        "value": 6.385
+    },
+    {
+        "name": "CircuitBreaker x100M",
+        "unit": "ms",
+        "value": 63.047
+    },
+    {
+        "name": "RateLimiter x1M",
+        "unit": "ms",
+        "value": 51.549
+    },
+    {
+        "name": "RateLimiter x10M",
+        "unit": "ms",
+        "value": 335.643
+    },
+    {
+        "name": "10 checks x100K",
+        "unit": "ms",
+        "value": 12.617
+    },
+    {
+        "name": "100 checks x10K",
+        "unit": "ms",
+        "value": 15.458
+    },
+    {
+        "name": "findById x20K",
+        "unit": "ms",
+        "value": 12.709
+    },
+    {
+        "name": "findById x10K",
+        "unit": "ms",
+        "value": 6.211
+    },
+    {
+        "name": "atomic RMW x10M",
+        "unit": "ms",
+        "value": 22.177
+    },
+    {
+        "name": "StoreForward x10M",
+        "unit": "ms",
+        "value": 120.963
+    },
+    {
+        "name": "RingBuffer SPSC x1M",
+        "unit": "ratio",
+        "value": 0.4976,
+        "normalized_by": "atomic RMW x10M"
+    },
+    {
+        "name": "Mailbox post+drain x1M",
+        "unit": "ratio",
+        "value": 0.7902,
+        "normalized_by": "atomic RMW x10M"
+    },
+    {
+        "name": "Mailbox full-path x10M",
+        "unit": "ratio",
+        "value": 1.0732,
+        "normalized_by": "atomic RMW x10M"
+    },
+    {
+        "name": "TimerWheel x100K",
+        "unit": "ms",
+        "value": 6.808
+    },
+    {
+        "name": "TimerWheel churn x1M",
+        "unit": "ms",
+        "value": 28.193
+    },
+    {
+        "name": "HotBus 8sub x1M",
+        "unit": "ratio",
+        "value": 0.8221,
+        "normalized_by": "atomic RMW x10M"
+    },
+    {
+        "name": "ObjectPool x1M",
+        "unit": "ms",
+        "value": 15.327
+    },
+    {
+        "name": "Sequencer x10M",
+        "unit": "ratio",
+        "value": 1.031,
+        "normalized_by": "atomic RMW x10M"
+    },
+    {
+        "name": "Worker spawn+join x1K",
+        "unit": "ms",
+        "value": 29.37
+    },
+    {
+        "name": "Worker drain dedicated x1M",
+        "unit": "ms",
+        "value": 134.0
+    },
+    {
+        "name": "Pooled dispatch x1M",
+        "unit": "ms",
+        "value": 256.2
+    }
 ]

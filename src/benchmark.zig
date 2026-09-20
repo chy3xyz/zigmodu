@@ -502,6 +502,73 @@ fn benchAtomicRmw(allocator: std.mem.Allocator, count: usize) !f64 {
     return elapsedMs(t0);
 }
 
+/// The host's store→load forwarding cost, measured on the same run as everything
+/// else — the *candidate* denominator for `RingBuffer SPSC x1M`, recorded and
+/// printed like the reference above but not wired to anything yet.
+///
+/// `atomic RMW x10M` is the right denominator for the five metrics whose turn is
+/// a read-modify-write, and the ring is not one of them: `tryPush` stores `tail`
+/// and `tryPop` loads that index straight back, and the same for `head`, so its
+/// turn is a store-to-load forwarding chain plus the host's lowering of the
+/// release/acquire pair (plain `mov`s on x86_64, `stlr`/`ldar` on aarch64). The
+/// two host properties correlate, but they are not the same quantity, and the
+/// residual shows up across generations: the Xeon 8370C run that reddened
+/// `624b423` put the ring's ratio at 0.0386 against 0.0523-0.0527 on the EPYC
+/// runners (26% apart) while the same run's `atomic RMW` was 2.6-2.9x its EPYC
+/// value. `scripts/check-bench.sh` records that imperfection next to the metric.
+///
+/// So this harness is the ring's turn with the ring taken out: two release stores
+/// and two acquire loads per round, both counters in the same cache line, each
+/// load reading what the store in front of it just wrote. No index arithmetic, no
+/// mask, no fullness branch, no slot array, no second thread. What is left is the
+/// forwarding chain and the orderings — which is most of what the ring's number is
+/// on a host where the ring's own code is not the cost: the identical loop is
+/// 10.7 ms per 1M round trips on an aarch64 laptop against 1.24 ms on an EPYC
+/// runner, an 8.6x gap in code that did not change (see the header of
+/// `scripts/check-bench.sh`).
+///
+/// A machine reference like `benchAtomicRmw`, not a framework metric: a
+/// regression in `src/runtime/**` cannot move it, only the host can — which is
+/// also why `check-bench.sh` reports it instead of gating it on an absolute
+/// value, exactly as it treats the reference the atomic-path metrics divide by.
+/// It is deliberately **not** in that script's normalized list: whether the ring
+/// should be gated against this instead of against the atomic is a question about
+/// how the two candidates behave across host generations, and one host cannot
+/// answer it. The local run-to-run spreads of both ratios, and what is still
+/// missing to decide, are recorded in that script's header next to the list.
+fn benchStoreForward(allocator: std.mem.Allocator, count: usize) !f64 {
+    // `a` is cache-line aligned and `b` sits 8 bytes behind it, so both counters
+    // share one line. The ring's own two indices are separated on purpose (one
+    // core writing each); this harness measures a single core's chain, where a
+    // second line would add a miss the ring does not pay.
+    const Cells = struct {
+        a: std.atomic.Value(u64) align(std.atomic.cache_line),
+        b: std.atomic.Value(u64),
+    };
+    const cells = try allocator.create(Cells);
+    defer allocator.destroy(cells);
+    cells.* = .{
+        .a = std.atomic.Value(u64).init(0),
+        .b = std.atomic.Value(u64).init(0),
+    };
+
+    var x: u64 = 0;
+    const t0 = now();
+    for (0..count) |_| {
+        cells.a.store(x +% 1, .release); // producer writes `tail`
+        x = cells.a.load(.acquire); // consumer reads it back: the forward
+        cells.b.store(x +% 1, .release); // consumer writes `head`
+        x = cells.b.load(.acquire); // producer reads it back: the forward
+        std.mem.doNotOptimizeAway(x);
+    }
+    const ms = elapsedMs(t0);
+
+    // Two increments per round, so a loop the optimizer folded away fails here
+    // instead of recording a fast number (`benchMailboxFull` makes the same point).
+    if (x != 2 *% @as(u64, @intCast(count))) return error.BenchStoreForwardFolded;
+    return ms;
+}
+
 /// SPSC hand-off: `count` push/pop round trips through a bounded ring.
 fn benchRingBuffer(allocator: std.mem.Allocator, count: usize) !f64 {
     const ring = try allocator.create(rt.RingBuffer(u64, 1024));
@@ -841,6 +908,255 @@ fn benchWorkerSpawnJoin(io: std.Io, count: usize) !f64 {
     rtx.shutdown();
     const s = rtx.stats();
     if (s.workers != 0 or s.running != 0) return error.BenchRuntimeLeakedWorkers;
+    return ms;
+}
+
+/// The worker the two hand-off metrics below drive: it counts what it received
+/// and does nothing else, so the producer's loop and the hand-off are the whole
+/// cost. `acc` is touched only by the worker's own thread (the `[med3]` driver
+/// reads it after `join`), and `seen` is the atomic the producer waits on.
+const BenchDrainWorker = struct {
+    pub const Message = u64;
+    seen: *std.atomic.Value(u64),
+    acc: u64 = 0,
+
+    pub fn handle(self: *@This(), msg: u64, _: anytype) !void {
+        self.acc +%= msg;
+        std.mem.doNotOptimizeAway(self.acc);
+        _ = self.seen.fetchAdd(1, .monotonic);
+    }
+};
+
+/// Mailbox capacity for the hand-off metrics: the same 256 the mailbox group
+/// uses, so `Mailbox post+drain x1M` (no thread), `Worker drain dedicated x1M`
+/// and `Pooled dispatch x1M` sit on one axis and differ only in who drains.
+const bench_drain_capacity = 256;
+
+/// Bound on the wait for the tail, in spin rounds. A lost message must *fail*
+/// the metric, not hang the suite.
+const bench_drain_timeout_spins = 4_000_000_000;
+
+/// `count` messages handed to a worker and drained by it, on whichever execution
+/// resource `mode` names.
+///
+/// This is the pair the scheduler needed and never had. The runtime's execution
+/// modes were documented as a trade — "a dedicated worker costs a thread, a
+/// pooled one costs a ready-ring round trip, so keep the critical path
+/// dedicated" (`docs/RUNTIME.md` §12.5) — with nothing measuring either side.
+/// Same producer loop, same worker, same mailbox capacity; the only difference is
+/// whether the drain happens on the worker's own parked thread or on a pool
+/// thread that had to claim it first.
+fn benchWorkerDrain(comptime mode: rt.SpawnMode, io: std.Io, count: usize) !f64 {
+    var seen = std.atomic.Value(u64).init(0);
+    // The pool is declared either way: it materialises no thread until the first
+    // `.pooled` spawn, so the dedicated run pays nothing for it and the two runs
+    // differ in exactly one thing.
+    var rtx = try rt.Runtime.initWithOptions(harness_allocator, io, .{
+        .scheduler = .{ .max_pooled_workers = 1, .pool_threads = 1 },
+    });
+    defer rtx.deinit();
+    try rtx.start();
+
+    const handle = if (comptime mode == .pooled)
+        try rtx.spawn(BenchDrainWorker, .{ .seen = &seen }, .{ .capacity = bench_drain_capacity, .mode = .pooled })
+    else
+        try rtx.spawn(BenchDrainWorker, .{ .seen = &seen }, bench_drain_capacity);
+
+    const t0 = now();
+    var sent: usize = 0;
+    while (sent < count) {
+        handle.send(sent) catch |err| switch (err) {
+            // The consumer is behind: this is the backpressure path the mailbox
+            // group measures on its own, and here it is just how a producer waits.
+            error.Full => {
+                std.atomic.spinLoopHint();
+                continue;
+            },
+            error.Closed => return error.BenchDrainWorkerClosed,
+            // `send` does not wait, so this cannot come from it; the error set is
+            // the shared `SendError`, so it is named rather than papered over.
+            error.Timeout => return error.BenchDrainUnexpectedTimeout,
+        };
+        sent += 1;
+    }
+    // Everything was accepted, so the wait for the tail is part of the hand-off.
+    var spins: usize = 0;
+    while (seen.load(.acquire) < count and spins < bench_drain_timeout_spins) : (spins += 1) std.atomic.spinLoopHint();
+    const ms = elapsedMs(t0);
+    if (seen.load(.acquire) != count) return error.BenchDrainLostMessages;
+
+    // `stop()` before `join()`, and the first version of this harness hung here
+    // without it: a dedicated worker's loop parks in `recv` until its mailbox is
+    // closed, so `join` waits for a stop nobody asked for. (The pooled side is
+    // released by the empty mailbox alone, which is exactly why the omission only
+    // shows up on the dedicated metric — the first one, so the run produced no
+    // output at all rather than a wrong number.)
+    handle.stop();
+    handle.join();
+    // After `join` the worker's thread is done, so its `acc` is the whole picture:
+    // a handler that saw every message exactly once. Counting receipts alone
+    // would pass on a mailbox that duplicated a message and dropped another.
+    if (handle.state.acc != count * (count - 1) / 2) return error.BenchDrainWrongSum;
+    return ms;
+}
+
+fn benchWorkerDrainDedicated(io: std.Io, count: usize) !f64 {
+    return benchWorkerDrain(.dedicated, io, count);
+}
+
+fn benchWorkerDrainPooled(io: std.Io, count: usize) !f64 {
+    return benchWorkerDrain(.pooled, io, count);
+}
+
+/// Mailbox capacity for the sweep. Smaller than the hand-off pair's 256 on
+/// purpose: with 100 workers a wide mailbox holds the whole working set and the
+/// producer never sees backpressure, which is the state this is about.
+const bench_sweep_capacity = 64;
+
+/// Messages per point for the payload family. Fewer than the no-payload family
+/// because each message costs ~400 ns of work: the same 500k would be 0.2 s of
+/// CPU per sample, times four thread counts times three samples.
+const bench_sweep_worked_messages = 200_000;
+
+/// Dependent multiply steps per message in the payload family. Sized so one
+/// message is a few hundred ns — far above mailbox and dispatch costs, which is
+/// what makes the pool rather than the producer the limiter, and small enough
+/// that 200k messages stay a fraction of a second per sample.
+const sweep_work_iters: u32 = 256;
+
+/// One family of the pool sweep, printed as a block. `work_iters` is comptime so
+/// the two families are different worker types rather than a branch in the
+/// handler — an `if (work == 0)` in the hot loop would measure the branch.
+fn sweepFamily(
+    comptime label: []const u8,
+    comptime work_iters: u32,
+    io: std.Io,
+    grid: []const [2]usize,
+    total: usize,
+) void {
+    std.debug.print("  -- {s} --\n", .{label});
+    for (grid) |point| {
+        const workers = point[0];
+        const threads = point[1];
+        var samples: [3]f64 = undefined;
+        for (&samples) |*sample| {
+            sample.* = benchPoolSweep(work_iters, io, workers, threads, total) catch |err| {
+                std.debug.print("  workers={d:<4} pool_threads={d:<2} ERROR {s}\n", .{ workers, threads, @errorName(err) });
+                return;
+            };
+        }
+        std.mem.sort(f64, &samples, {}, std.sort.asc(f64));
+        const ms = samples[1];
+        std.debug.print("  workers={d:<4} pool_threads={d:<2} {d:>7.1} ms  {d:>6.1} ns/msg  {d:>10.0} msg/s  [{d:.1} / {d:.1} / {d:.1}]\n", .{
+            workers,
+            threads,
+            ms,
+            ms * 1e6 / @as(f64, @floatFromInt(total)),
+            @as(f64, @floatFromInt(total)) / ms * 1000.0,
+            samples[0],
+            samples[1],
+            samples[2],
+        });
+    }
+}
+
+/// Messages per sweep point. 500k over 100 workers is 5k each — far above the
+/// ~5 ms floor this suite judges at, and small enough that the whole grid of
+/// medians-of-3 stays a few seconds on every push to main.
+const bench_sweep_messages = 500_000;
+
+/// A dependent multiply chain — the shape of "real work" in this suite. Each
+/// step feeds the next, so it cannot be vectorized or pipelined and the loop's
+/// cost is its own latency times `iters`. Nothing here is a framework cost; it is
+/// the *payload* the two sweep families differ by.
+fn workChain(comptime iters: u32, seed: u64) u64 {
+    var x = seed;
+    var i: u32 = 0;
+    while (i < iters) : (i += 1) x = x *% 6364136223846793005 +% 1442695040888963407;
+    return x;
+}
+
+/// The sweep's worker: like `BenchDrainWorker`, plus a **shared** total so the
+/// producer can wait on one load instead of summing 100 counters per spin, and a
+/// comptime `work_iters` so one harness covers both questions below.
+fn SweepWorker(comptime work_iters: u32) type {
+    return struct {
+        pub const Message = u64;
+        seen: *std.atomic.Value(u64),
+        total: *std.atomic.Value(u64),
+        acc: u64 = 0,
+
+        pub fn handle(self: *@This(), msg: u64, _: anytype) !void {
+            self.acc +%= msg +% workChain(work_iters, msg);
+            std.mem.doNotOptimizeAway(self.acc);
+            _ = self.seen.fetchAdd(1, .monotonic);
+            _ = self.total.fetchAdd(1, .release);
+        }
+    };
+}
+
+/// `total` messages round-robined over `workers` pooled workers, drained by
+/// `pool_threads` pool threads.
+///
+/// **The `pool_threads` dimension is the point of this harness.** With one
+/// producer and N workers, more pool threads can only help if the *dispatch*
+/// path is the bottleneck rather than the work — and because a batch is bounded,
+/// one pool thread already holds several workers ready without draining any of
+/// them. Whether a second thread buys anything is a question about this
+/// scheduler, and it is not answerable by reading it.
+///
+/// The producer **skips a full mailbox instead of waiting on it**: a cursor
+/// walks the workers and retries whichever refused. Waiting would serialize the
+/// run on the slowest worker and measure backpressure instead of dispatch — the
+/// `Mailbox full-path x10M` metric already answers that question.
+fn benchPoolSweep(comptime work_iters: u32, io: std.Io, workers: usize, pool_threads: usize, total: usize) !f64 {
+    const W = SweepWorker(work_iters);
+    const H = rt.Handle(W, bench_sweep_capacity);
+    const allocator = harness_allocator;
+
+    const counters = try allocator.alloc(std.atomic.Value(u64), workers);
+    defer allocator.free(counters);
+    for (counters) |*c| c.* = std.atomic.Value(u64).init(0);
+    var done = std.atomic.Value(u64).init(0);
+
+    var rtx = try rt.Runtime.initWithOptions(allocator, io, .{
+        .scheduler = .{ .max_pooled_workers = workers, .pool_threads = pool_threads },
+    });
+    defer rtx.deinit();
+    try rtx.start();
+
+    const handles = try allocator.alloc(*H, workers);
+    defer allocator.free(handles);
+    for (handles, 0..) |*h, i| {
+        h.* = try rtx.spawn(W, .{ .seen = &counters[i], .total = &done }, .{
+            .capacity = bench_sweep_capacity,
+            .mode = .pooled,
+        });
+    }
+
+    const t0 = now();
+    var sent: usize = 0;
+    var cursor: usize = 0;
+    while (sent < total) {
+        const h = handles[cursor % workers];
+        cursor +%= 1;
+        h.send(sent) catch |err| switch (err) {
+            // Move on to the next worker rather than waiting on this one.
+            error.Full => continue,
+            error.Closed => return error.BenchSweepWorkerClosed,
+            error.Timeout => return error.BenchSweepUnexpectedTimeout,
+        };
+        sent += 1;
+    }
+
+    // Every message was accepted; wait for the last one to be handled.
+    var spins: usize = 0;
+    while (done.load(.acquire) < total and spins < bench_drain_timeout_spins) : (spins += 1) std.atomic.spinLoopHint();
+    const ms = elapsedMs(t0);
+    if (done.load(.acquire) != total) return error.BenchSweepLostMessages;
+
+    for (handles) |h| h.stop();
+    for (handles) |h| h.join();
     return ms;
 }
 
@@ -1260,6 +1576,18 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("    ^ machine reference, not a framework metric: check-bench.sh gates the\n      atomic-path metrics (Mailbox post+drain, Mailbox full-path, HotBus 8sub,\n      Sequencer x10M, 1L x10M events) as a ratio against this run's value.\n", .{});
     }
     {
+        // The ring's candidate denominator, measured next to the metric it may one
+        // day divide. Ten million rounds because that is ~1M ring round trips'
+        // worth of this loop's work on a host where the orderings are cheap and
+        // ~5x that where they are not — either way comfortably above the ~5 ms
+        // this suite sizes a new metric at. See `benchStoreForward`.
+        const name = "StoreForward x10M";
+        const ms = try median3(name, benchStoreForward, .{ a, 10_000_000 });
+        try results.append(a, .{ .name = name, .value = ms });
+        std.debug.print("  {s}  {d:.2} ms  ({d:.0} chains/s)\n", .{ name, ms, 10_000_000.0 / ms * 1000.0 });
+        std.debug.print("    ^ candidate reference for `RingBuffer SPSC x1M`, not a divisor yet and\n      not gated on an absolute value: check-bench.sh reports it, see its header.\n", .{});
+    }
+    {
         const name = "RingBuffer SPSC x1M";
         const ms = try median3(name, benchRingBuffer, .{ a, 1_000_000 });
         try results.append(a, .{ .name = name, .value = ms });
@@ -1279,6 +1607,27 @@ pub fn main(init: std.process.Init) !void {
     }
     {
         const name = "TimerWheel x100K";
+        // `a` (the suite's arena), and it is *not* the reclaiming
+        // `harness_allocator` the rest of the harnesses use — that was measured
+        // and it is worse here. The argument for `harness_allocator` elsewhere is
+        // that freed blocks come back off the freelist and keep the pages warm,
+        // but this harness **never frees**: it arms `count` never-reused ids into
+        // a fresh wheel and drops it, so nothing is returned to any freelist and
+        // the swap only adds `smp_allocator`'s own slab metadata to the tail.
+        // Eight runs each way, same machine, medians of `[med3]`:
+        //
+        //   arena         6.94 - 8.79 ms   run-to-run 1.27x, worst in-run 1.55x
+        //   harness_all.  7.95 - 12.17 ms  run-to-run 1.53x, worst in-run 1.86x
+        //
+        // Either way this one is far noisier than its neighbours in the same runs
+        // (`TimerWheel churn x1M` 1.05x, `atomic RMW x10M` 1.04x), and the reason
+        // is structural rather than fixable by the allocator: a fresh wheel plus
+        // `count` fresh ids means the timed loop grows `nodes` (34 growth
+        // allocations / 14.75 MB at 100k) and first-touches every page it lands
+        // on — the host's page path, in the numerator, on purpose. That is what
+        // this metric is for (the steady state is `TimerWheel churn x1M`), so it
+        // is left alone and `check-bench.sh`'s header says what a breach here
+        // means: re-run before believing it.
         const ms = try median3(name, benchTimerWheel, .{ a, 100_000 });
         try results.append(a, .{ .name = name, .value = ms });
         std.debug.print("  {s}  {d:.2} ms  ({d:.0} timers/s)\n", .{ name, ms, 100_000.0 / ms * 1000.0 });
@@ -1319,6 +1668,71 @@ pub fn main(init: std.process.Init) !void {
         try results.append(a, .{ .name = name, .value = ms });
         std.debug.print("  {s}  {d:.2} ms  ({d:.0} cycles/s)\n", .{ name, ms, 1000.0 / ms * 1000.0 });
     }
+    // The hand-off pair, and the axis they sit on with `Mailbox post+drain x1M`
+    // above: no thread / a dedicated thread / a pool thread, same producer loop,
+    // same worker, same mailbox capacity. Read as a boundary rather than two
+    // metrics — see the printed line, which states the ratio because the ratio is
+    // the whole point: that is the price of the execution mode, and it is what
+    // decides whether a worker belongs on the critical path or in the long tail.
+    var drain_ms: [2]f64 = undefined;
+    {
+        const name = "Worker drain dedicated x1M";
+        const ms = try median3(name, benchWorkerDrainDedicated, .{ io, 1_000_000 });
+        drain_ms[0] = ms;
+        try results.append(a, .{ .name = name, .value = ms });
+        std.debug.print("  {s}  {d:.2} ms  ({d:.1} ns per hand-off)\n", .{ name, ms, ms * 1e6 / 1_000_000.0 });
+    }
+    {
+        const name = "Pooled dispatch x1M";
+        const ms = try median3(name, benchWorkerDrainPooled, .{ io, 1_000_000 });
+        drain_ms[1] = ms;
+        try results.append(a, .{ .name = name, .value = ms });
+        std.debug.print("  {s}  {d:.2} ms  ({d:.1} ns per hand-off)\n", .{ name, ms, ms * 1e6 / 1_000_000.0 });
+    }
+    std.debug.print("    ^ pooled / dedicated = {d:.2}x. Both are gated on their own absolute value; this\n      ratio is printed, not thresholded, because it is near 1 and a 2.0x window on a\n      ratio of two similar numbers is noise. A >1.3x move here is the boundary\n      shifting and worth a look.\n", .{drain_ms[1] / drain_ms[0]});
+
+    // ── Pool sweep ────────────────────────────────────────────────────────
+    //
+    // Five scales, not a grid: what a reader needs is (a) whether a second pool
+    // thread buys anything at a fixed worker count, and (b) how the cost per
+    // message moves as workers multiply. Sweeping both axes fully would be 25
+    // points for a shape five of them already show, in a suite that runs on
+    // every push.
+    //
+    // **Observation only, never gated, and nothing here enters
+    // `bench-results.json`.** The hand-off pair above measures 1.84x and 3.09x
+    // run-to-run spread on this machine at a single grid point; a dozen more such
+    // numbers in front of a 2.0x window would be a false-red machine. The gate
+    // judges the two hand-off rows (absolute, declared in `REF_METRICS`), and
+    // these lines are for reading.
+    std.debug.print("\n-- Pool sweep (observation only, never gated) --\n", .{});
+    std.debug.print("  {d} messages per point, {d}-slot mailboxes, one producer that skips a full worker\n  instead of waiting on it. Median of 3 per point.\n", .{ bench_sweep_messages, bench_sweep_capacity });
+    std.debug.print("  Two families, and they answer opposite halves of one question. **Read the\n  pool_threads column together with the family label**: with no payload {d} workers x\n  {d} slots is {d} messages of slack, so the *producer* is the limiter and extra pool\n  threads only add ring-CAS and cache-line contention — the 1-thread row is the\n  fastest there, and that is not a defect. With a payload the pool is the limiter\n  and the rows climb with threads until the machine runs out of cores. Neither\n  family is the answer on its own.\n", .{ 100, bench_sweep_capacity, 100 * bench_sweep_capacity });
+    const sweep = [_][2]usize{
+        .{ 1, 1 },
+        .{ 10, 4 },
+        .{ 100, 1 },
+        .{ 100, 2 },
+        .{ 100, 4 },
+    };
+    sweepFamily("payload=none  (the producer is the limiter)", 0, io, &sweep, bench_sweep_messages);
+    // The same axis with **real work per message**, which is the only way to ask
+    // the other half of the question: a pool exists to run work, so "does a
+    // second thread help" is really "can the pool use one". With no payload the
+    // producer is the limiter and extra threads are pure contention (above); here
+    // the work is, and the rows should climb with `pool_threads` until the
+    // machine's cores run out.
+    //
+    // 8 workers, not 100, and that is deliberate: the question is per-thread
+    // scaling, so the worker count should be at or below the core count of a
+    // typical CI box rather than 10x over it.
+    const worked = [_][2]usize{
+        .{ 8, 1 },
+        .{ 8, 2 },
+        .{ 8, 4 },
+        .{ 8, 8 },
+    };
+    sweepFamily("payload=256 (the pool is the limiter)", sweep_work_iters, io, &worked, bench_sweep_worked_messages);
 
     // ── Latency distribution ──────────────────────────────────────────────
     //
@@ -1377,6 +1791,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("  {d} batches per metric, one clock pair per batch, nearest-rank quantiles over the\n  batch samples. Observation only: the gate judges the `[med3]` values above, not these.\n", .{pct_batches});
     std.debug.print("  Not sampled here: `TimerWheel x100K` — its per-turn cost is the size of the live wheel\n  (100k nodes), which no 100-op batch holds; its `[med3]` number above is unaffected.\n", .{});
     std.debug.print("  Not sampled here either: `TimerWheel churn x1M` — what it measures is what a wheel costs\n  *after* churning, and a batch that rebuilds the fixture is only a few rounds old (the same\n  fixture-dominates-the-sample rule that keeps `findById x20K` out).\n", .{});
+    std.debug.print("  And the hand-off pair: `Worker drain dedicated x1M` / `Pooled dispatch x1M` — each call\n  builds a Runtime, a worker and (for the pooled one) a pool thread, which for a 1000-op batch\n  is fixture the size of the measurement. Their `[med3]` values above are the numbers; the tail\n  of a hand-off is left to a harness that can build its fixture once.\n", .{});
 
     const latency_section_t0 = now();
     var latency = LatencyRun{ .allocator = a, .injector = try LatencyInjector.fromEnv(init.environ_map), .medians = &results };

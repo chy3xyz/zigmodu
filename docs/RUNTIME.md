@@ -85,8 +85,9 @@ const OrderBook = struct {
 |------|--------------|--------|
 | `pub const Message = T` + `pub fn handle(self, msg, ctx)` | **消息驱动**：运行时循环 `recv → handle`，`stop()`/`close()` 结束 | 绝大多数：worker 的输入就是消息 |
 | `pub fn run(self, ctx)` | **自带循环**：跑一次，自行 `while (!ctx.stopped())` | 拉取型（轮询外部源）、需要精确控制节拍的循环 |
-| `pub fn init` / `pub fn deinit` | 生命周期钩子，前后各一次 | 打开/关闭资源 |
+| `pub fn init` / `pub fn deinit` | 生命周期钩子；**每一代各一次**——进组之后一次重建就是一轮 `deinit` + `init`（§14） | 打开/关闭资源 |
 | `pub fn onError(self, err, ctx) Supervision.Strategy` | **Actor 才有**：每条错误现场决定 `.restart` / `.stop`，覆盖配置的策略 | 只有某些错误值得停（如 `error.Fatal`） |
+| `Supervision.group = g` | **进监督组**：还没到"停"之前，把决定交给组（重建自己 / 重建同组 / 停整组） | 一组 worker 该一起活、一起死，或一个有难同当 |
 
 ```zig
 const rt = try app.runtime();
@@ -162,7 +163,9 @@ const h = try rt.spawnActor(Reporter, .{}, 32, .{ .max_errors = 3, .window_ms = 
 移进去的，重启意味着要么保留一份初始副本（要求 State 可拷贝），要么声明 `reset` 钩子并接受
 "上一次失败留下的痕迹"。在语义确定之前宁可不给。**父子关系**目前只体现在**停止顺序**：`shutdown`
 按 spawn 逆序 join，因此"先 spawn 父、再 spawn 子"就得到"子先停"。真正的监督树（父决定子的重启策略）
-留给后续版本。
+见 **§14**（组 / 策略 / 强度 / 树）：重启的语义在那里定死了 —— 它是
+**`deinit` + `init` 原地重建**，没有"可拷贝的初始副本"、也没有 `reset` 钩子，
+所以本节"在语义确定之前宁可不给"这条不再矛盾。
 
 ## 3c. HotBus —— L0 的扇出（v0.17）
 
@@ -412,13 +415,22 @@ var bridge = try zigmodu.Runtime.MetricsBridge(PrometheusMetrics).init(&rt, metr
 metrics.setScrapeHook(@TypeOf(bridge).sample, &bridge);
 ```
 
-它注册 17 条 `zigmodu_runtime_*` 指标（`workers` / `running` / `messages_sent` /
+它注册 19 条 `zigmodu_runtime_*` 指标（`workers` / `running` / `messages_sent` /
 `messages_received` / **`messages_dropped`** / **`messages_discarded_on_stop`** / `handler_errors` /
-`timer_fires` / **`timers_discarded`** / **`timer_deliveries_dropped`** / **`timer_lag_ms`**，
+`timer_fires` / **`timers_discarded`** / **`timer_deliveries_dropped`** / **`timer_lag_ms`** /
+**`supervised_stops`** / **`group_restarts`**（后两条是 §14 的监督读数），
 加上池化执行（§12）的 6 条：
 `pool_declared` / `pool_threads` / `pool_ready_len` / `pool_claimed` / `pool_dispatches` /
 `pool_ready_push_failures`）。名字里没有 `_total` 后缀是刻意的：这些是**抓取时采样**的快照，
 所以走 gauge 而不是 counter（`PrometheusMetrics.Counter` 没有 `set`）。
+
+`supervised_stops` 与 `messages_discarded_on_stop` 是**两条曲线**：前者是"一个成员被框架停掉了"
+（它自己的预算、同组成员连坐、或强度用尽整组停），后者是那次停机顺手扔掉的队列长度。
+一个成员死了但队列是空的，只动第一条。
+
+`group_restarts` 是它**唯一**的配对读数，也是"这个成员没有真的死"的证明：重建一次就涨一次，
+所以 `group_restarts` 持续涨而 `supervised_stops` 不涨 = 有一个成员在**反复重启**，
+正在往它组的 `max_restarts` 上撞。两个都不涨而 `handler_errors` 在涨 = 错误都在预算内被吃掉了。
 
 `messages_dropped` 与 `messages_discarded_on_stop` 是**两条曲线，不是一个**：前者随生产者压力动，
 后者只在停机时跳一次。告警要分开写 —— "背压"和"actor 停机扔了队列"是两种事故。
@@ -517,7 +529,6 @@ fn traceFromHeader(id: []const u8) zigmodu.runtime.TraceId {
 | **v0.16.0** | `RingBuffer` / `MpscRing` / `Mailbox` / `ObjectPool` / `Clock` / `Wheel` / `Runtime` + `Worker` + `app.runtime()` | ✅ 本文档 |
 | **v0.17.0** | Actor 监督（`spawnActor` + 错误预算 + `onError` 现场决策）、`HotBus`（L0 扇出，freeze 后无锁、drop-on-full）、`Sequencer` | ✅ 本文档 §3b/§3c |
 | **v0.18** | 编译期架构引擎：依赖图（`ModuleGraph` 编译期报环）、`zmodu graph`（Mermaid）、`zmodu doctor` | ✅ 已发布（doctor 清单仍未覆盖"未解析服务/事件拓扑/消费者计数"，见 `docs/dev/todo3.md` 评估） |
-| 之后 | 真监督树（父决定子的重启策略）、带干净状态的重启、跨进程/跨节点监督 | 未承诺 |
 | **v0.19** | Cluster / Shard / Service Discovery | ⚠ 部分：`ClusterView`（读侧快照/rendezvous）、`ShardRouter` 落地；**v0.25.0 起 `ClusterBootstrap` 已是门面** —— `tick()` 一次做完 `membership.runOnce()` → `view.sync()` → `raft.tick()`（此前从没人驱动选举）、配 `.transport` 时 `start()` 自动起入站监听、`pick(key)` 与 `healthJson()` 都在它上面；集群组件从 `root.zig` 正面导出。集群传输仍是自造 TCP（未按本节原意"适配 QUIC"）；`LoadBalancer` 是**有意不接**（数据源与读侧是两份事实，见 `docs/DISTRIBUTED.md`）。剩余缺口见 `docs/DISTRIBUTED.md` |
 | **v0.20** | Workflow（状态机 + Saga + 补偿 + 检查点 + 恢复） | ⚠ 部分：Saga 补偿 + WAL 检查点 + 崩溃续跑 ✅（`SagaOrchestrator.resumeInstance` / `restoreFromWal`）；**`SagaStep.timeout_seconds` 已于 v0.25.0 真正生效**（超预算即补偿含该步、终态 `.timed_out`、返回 `error.SagaStepTimeout`）；**状态机仍未做**，`.step().compensate()` DSL 明确不做（`docs/WORKFLOW.md`） |
 | **v0.21** | Agent Runtime（Identity / Memory / Skills / Permissions / Budget 一等化） | ✅ 已发布：`ai.AgentSpec` + `ai.Guard`（已接进 `Agent.run`）+ `ai.ProposalPipeline` —— 见 `docs/AGENT_RUNTIME.md`；**Agent 的 State / Event subscriptions / Lifecycle 仍未做** |
@@ -530,6 +541,8 @@ fn traceFromHeader(id: []const u8) zigmodu.runtime.TraceId {
 | **未发版** | 池的**可观测性与示例**：6 条 `zigmodu_runtime_pool_*`（§8）+ `examples/runtime-workers` 的 audit 环真的以 `.pooled` 跑（`[pool] dispatched>0` 才算过）+ `zmodu runtime` 报池声明 | ✅ 本文档 §12.10 末节（**Breaking：否**；顺带修掉 `Application.Config.max_pooled_workers` 没被 `Application.init` 拷贝的接线缺口） |
 | **未发版** | **监督停机丢弃可见**：`WorkerStats.discarded_on_stop` / `RuntimeStats.messages_discarded_on_stop` + 第 16 条 gauge `zigmodu_runtime_messages_discarded_on_stop` —— dedicated 的 `break` 与"池先停、邮箱非空"两档都计数 | ✅ 本文档 §5 第 2 条 / §8 / §12.10（**Breaking：否**；`RuntimeStats` 只加字段，停机行为一字未改） |
 | **未发版** | **Runtime Replay v1（投递轨）**：spawn 点 `.record = .{ .id, .capacity }` 声明**每 worker 一条同类型轨**（复用 §11 的环 + log 的一个 `Sequencer` 打**全局** seq），取点在 `Handle` 的投递漏斗（`send*` + `after` 的定时器投递）；`Runtime.deliveryLog()` + `Replayer.step()`（`replayAll()` 附带）按 seq 归并、驱动 `Clock.Manual`、调用方给"标识 → 新 handle"映射回投 | ✅ 本文档 §13.7（**Breaking：否** —— `SpawnConfig` 多一个可选 `.record`，`Handle` 多一个默认 `null` 的 `track`；没声明就是一次空判断 + 零分配不变。**未做**：落盘/codec、跨进程） |
+| **v0.31.0** | **监督树**：`rt.spawnGroup(policy)` + 四种策略（`one_for_one` / `one_for_all` / `rest_for_one` / `stop_group`）+ 重启强度（`Intensity`）+ 组嵌套（强度用尽即升级到父组）+ **原地重建**（`deinit` + `init` 在同一线程、同一循环里；不换 handle、不关邮箱）+ `supervised_stops` / `group_restarts` 两个累计量与两条指标 | ✅ 本文档 §14（**Breaking：否** —— `Supervision` 多一个默认 `null` 的 `.group`，`spawn*` 签名一字未改；`Mailbox` 多一个 `wake`/`recvWakeable`，`recv` 行为不变） |
+| 之后 | 跨进程 / 跨节点监督 | 未承诺 |
 | 1.0 | API 收敛、命名统一、deprecated 清理 | 计划 |
 
 ## 10. 最小示例
@@ -775,6 +788,104 @@ API 形状见 §12.8）。**默认不变**，所以既有应用零影响。
 （发送方 → ready 环 → 调度线程 → `handle`）。对 `行情 → 订单簿 → 风控 → 执行` 这种链，
 **每一跳都会进关键路径**，所以那条链该继续用 Dedicated；池化是给长尾（metrics / audit /
 通知 / AI 会话）省线程。这也是 §12.2 保留两种模式、而不是只留池化的原因。
+
+**`SchedulerConfig.batch` 不只是性能旋钮 —— 它就是公平上界。** 环是 FIFO、每个 worker 至多
+一个 token，所以"一个永远忙的 worker 把另一个已就绪的 worker 挡在后面"的**最坏等待就是一个
+batch**：一批跑完必须交回，环里的下一个才被认领。这条以前只是设计论证，现在有断言：
+`Pooled (§12.3): an endlessly busy worker cannot starve a ready one`（一个自我续食、积压无界的
+worker A + 只发一条的 worker B，断言 B 被服务时 A 还没跑过 256 条）。
+**变异验证的形状值得记下来**：把 `batch` 调成 `1_000_000`，红的是**那条边界断言**而不是超时 ——
+B 仍然被服务，只是要等 A 那一批跑干。所以小 batch 换吞吐、大 batch 换的是**所有人的延迟上界**，
+两边都不能只按吞吐调。
+
+**这一跳的实测价格**（`src/benchmark.zig` 的三条基准，同一条轴、同一个生产循环、同一个 worker、
+同样 256 的邮箱，只有"谁在 drain"不同）：
+
+| 指标 | ns / 次交接 | 相对无线程 |
+|---|---|---|
+| `Mailbox post+drain x1M`（无第二线程） | 17 | — |
+| `Worker drain dedicated x1M` | 128 | 7.6× |
+| `Pooled dispatch x1M` | 190 | 11.3× |
+
+即**池化的一次交接约为 dedicated 的 1.5–2.9 倍**（8 次独立运行的比值 1.57–2.93）。这条数字把
+"多一跳"从形容词变成了量级：关键路径上每一跳都要付大约一倍，链条越长越亏；而长尾 worker
+用池化省下的是一条线程，付的是它自己那一跳 —— 它不在任何人的关键路径上，所以这笔账划得来。
+
+**池的扫描（`benchPoolSweep`，5 个点、每点 50 万条、中位 3 次，只报告不门禁）**：
+
+| workers | pool_threads | ns / 条 |
+|---|---|---|
+| 1 | 1 | ~410 |
+| 10 | 4 | ~114 |
+| **100** | **1** | **~41** |
+| 100 | 2 | ~55 |
+| 100 | 4 | ~66 |
+
+- **worker 越多、每条越便宜**（410 → 41）：每个 worker 是一只邮箱，100×64 = 6400 条的缓冲让生产者
+  几乎不再撞 `error.Full`；这条曲线的代价主要在**生产者的重试**上，不在派发上。
+- **加池线程从来没有变快**（6 次独立运行：`pool_threads=1` 5 次最快、1 次持平；最快的几次
+  比 2/4 线程**快 2–3 倍**）。所以默认值 1 是对的，**不要按吞吐去调大它**。
+- **但上面那一族量的是"生产者受限"那一半** —— 6400 条的缓冲让池从来不是瓶颈。同一根轴换上**每条消息
+  真有活儿**（一个 256 步的依赖乘法链，约 400 ns）就是下一族，而结论**反过来**：
+
+  | workers | pool_threads | ms（4 次运行） |
+  |---|---|---|
+  | 8 | 1 | 78 / 92 / 83 / 90 |
+  | 8 | 2 | 49 / 59 / 56 / 49 |
+  | 8 | **4** | **34 / 31 / 31 / 31** |
+  | 8 | 8 | 35 / 36 / 38 / 33 |
+
+  **有活儿时线程近线性扩展到 4**（2.4–3.0×），**8 条反而略降**（8 个 worker + 生产者已经把 10 核占满）。
+
+  **两族合起来才是可决策的答案**：`pool_threads` 要**按活儿定**，不能盲调大 ——
+  handler 是琐碎的就 1 条（此时生产者才是瓶颈，多线程纯属争抢），每条消息有真活儿就
+  `min(忙的 worker 数, 核数 − 1)`。单独看任何一族都会得出错结论。
+
+**两条 hand-off 指标只报告、不门禁**，理由是实测出来的：8 次运行里
+`Worker drain dedicated x1M` 散 1.84×、`Pooled dispatch x1M` 散 **3.09×**（同批
+`Mailbox post+drain x1M` 只散 1.26×），而窗口是 2.0× —— 在一次运行内就能摆动 3 倍的数字**不能**
+当判据，否则又多一台假红机器。它们的绝对值是宿主调度/唤醒路径的性质，所以进了
+`check-bench.sh` 的 `REF_METRICS`（"宿主测量，永不门禁"）。要判据就判"比值漂移到 1.3× 以上"，
+那是边界在动，而那条目前也是**打印**而非门禁 —— 先攒跨宿主数据。
+
+### 12.13 停机策略与执行类别（两者都与执行模式解耦）
+
+**§12.5 那两条差异曾经是执行模式的副作用**：同一个 worker 因为 `.dedicated` / `.pooled` 不同，
+"停机后邮箱里的尾巴怎么处理"就不同。现在它是**显式声明**：
+
+| 声明 | `.dedicated` | `.pooled` |
+|------|-------------|-----------|
+| 不写（`null`） | `.immediate` ——**历史行为** | `.drain` ——**历史行为** |
+| `.stop_policy = .immediate` | 监督停机即断，尾巴计入 `discarded_on_stop` | 批次停止 + `countAbandoned`（＝今天 dedicated 的答案） |
+| `.stop_policy = .drain` | 停机后继续抽干（＝今天 pooled 的答案） | 同左 |
+
+**"不写"必须复现两种现状**，这是硬要求（§2 的兼容原则）。实现上解析成默认值时两条路径走的都是
+**原语句**，且新增的 `abandoned` 标志只在 pooled + `.immediate` 上被触碰 —— 所以默认组合零影响。
+
+**一条容易搞错的边界**：`.immediate` 说的是**监督停机**那一侧；`Handle.stop()`（外部停机）
+在两种策略、两种模式下**都抽干**（`close()` 之后队列仍可被读完）。有测试钉住。
+
+**执行类别**：`.blocking` 的 worker 走**独立的一只池**（`blocking_threads` / `max_blocking_workers`
+各自声明），于是"一个阻塞的 handler 占住池线程"不会饿死 CPU 池 —— 这是**结构性事实**（两池不共享
+环、线程、计数），不是时序巧合。
+
+- **这是声明式的，不是检测式的**：runtime **不能**（Zig 里也不能一般地）判断一段代码会不会等外部资源。
+  所以它解决的是"**被声明为阻塞的 worker 不会占 CPU 池**"，**不**解决"忘了声明"。
+  凡是 handler 会等进程外的东西（DB 往返、阻塞 HTTP、文件 IO、第三方锁）就声明 `.blocking`。
+- **`blocking_threads` 按下游资源的并发量定，不要按核数** —— 这些线程在等待，不是在算
+  （例如按 DB 连接池大小）。
+- **两个上界是两次独立 admission**，不是一次声明拆两半：声明了阻塞池之后 `max_pooled_workers`
+  不再描述阻塞类，总量上界是**两者之和**；`max_blocking_workers = 0` 表示"与 CPU 池同数"。
+- **接线两条路都通**：`Runtime.initWithOptions(.{ .scheduler = … })`，或走 builder ——
+  `b.withMaxPooledWorkers(4).withBlockingThreads(2, 7)`（参数是 `blocking_threads` 与
+  `max_blocking_workers`，与 `Config` 上的字段同名）。**不声明就没有阻塞池**：`.blocking` 在 `spawn`
+  时被拒，与 `.pooled` 缺 `max_pooled_workers` 是同一种拒绝（§12.8 D2）。
+- **可观测性**：`MetricsBridge` 为阻塞池发布**同样六条**独立指标
+  （`zigmodu_runtime_blocking_pool_*`），与 CPU 池的六条并列。没声明阻塞池时它们是 0 ——
+  "这个 app 没有阻塞池"是仪表盘能画出来的答案，不是一条缺失的线。读侧对应 `blockingPoolStats()`。
+  注意 `pool_threads` 是**正在跑的**线程数（声明后仍为 0，直到第一条 `.blocking` spawn 把池拉起来），
+  **声明的宽度**看 `max_pooled_workers`（= `blocking_threads`/`max_blocking_workers` 里那个上界）。
+- **`.blocking` + `.dedicated` 是编译错**：那个声明会被静默忽略，比不声明更糟。
 
 ### 12.6 与现有件的关系
 
@@ -1375,3 +1486,243 @@ while (try rp.step()) |step| {                       // step.id / step.seq / ste
 录制与重放两次的 handler 调用序列（顺序 + 载荷指纹 + handler 读到的时钟）逐条一致，
 且 20_000_000 ms（≈5.5 小时）的录制跨度在 **< 1 s 墙钟**内重放完（不 sleep）。
 轨/日志/溢出/并发的单测在 `src/runtime/recorder.zig`，绑定与错误路径在 `runtime.zig`。
+
+## 14. 监督树 —— 组、策略、强度（v0.31 契约）
+
+### 14.1 §3b 的监督是自我监督，缺两件东西
+
+`Supervision{ strategy, max_errors, window_ms }` 是**一个 actor 数自己的错、自己决定停不停**。
+它补上了"安静烧核"这个洞，但它有两个结构性问题：
+
+1. **停掉是终态，没有下文。** actor 不会再回来，`one_for_one` 那种"这个成员重来一次、
+   其余照常"根本表达不了。
+2. **"这个 actor 死了"在指标面上不存在。** `WorkerStats.stopped_by_supervisor` 只有
+   **轮询者**看得见：没有 `RuntimeStats` 聚合，没有 Prometheus 指标。§3b 说预算是为了
+   把"烧核"变成"停止 + 一条 warn + **计数**"——计数在 per-worker 上就到头了，出不了进程。
+
+本节补这两件：**停掉之后有人接手**，以及**停掉这件事可见**。
+
+### 14.2 被否掉的形状：用户 actor 当父
+
+OTP 的 supervisor 是"父进程决定子进程"。照搬会撞上一个具体障碍：
+
+> **父的邮箱由父自己的 `Message` 类型决定，而 runtime 无法合成任意用户 enum 的一个变体。**
+
+三条绕法都不好：强制用户为每种 `Message` 加一个"监督通知"变体（污染业务类型、不组合）；
+让失败的孩子**阻塞**等父裁决（错误路径上一次往返，且孩子此时正持有自己的状态）；
+让 runtime 自己持一条通知通道（父只在自己的线程上跑，那就得轮询）。
+
+**采用的形状**：组的协调者是 **runtime 自己**，不是用户 actor。这不是简化 ——
+OTP 的 supervisor 本身也不跑用户代码。去掉的只是"为一个不跑用户代码的东西
+再写一个用户类型"这份样板。
+
+### 14.3 契约：组、策略、强度
+
+```zig
+// 建组：策略是 comptime，强度是运行期值
+const book_group = try rt.spawnGroup(.one_for_all);
+book_group.setIntensity(.{ .max_restarts = 3, .window_ms = 60_000 });
+
+// 入组：spawn 的签名一字未改，组进 `Supervision`
+const feed = try rt.spawnActor(Feed, .{}, 64, .{ .group = book_group });
+const book = try rt.spawnActor(Book, .{}, 64, .{ .group = book_group });
+```
+
+**策略**（用 OTP 的词，刻意不叫 `restart` —— 那个词在 `Supervision.Strategy` 里已经被
+"记日志、接着服务"占了，同一份配置里两个 `restart` 会读出两种意思）：
+
+| 策略 | 成员的失败（自己那层已经决定要停）之后 |
+|------|--------------------------------------|
+| `.one_for_one` | 只重启**它自己**；同组其余不动 |
+| `.one_for_all` | 重启**组内每一个**成员 |
+| `.rest_for_one` | 重启它**以及 spawn 在它之后**的成员（前面的不动） |
+| `.stop_group` | 不重启：**停掉组内每一个** |
+
+**强度**（`Intensity{ max_restarts, window_ms }`，默认 `{ 3, 60_000 }`）：
+一个组在 `window_ms` 内最多**触发** `max_restarts` 次重启/连坐动作，超了就地降级为
+`.stop_group` —— 组内全体停止、不再重启，并记一条 warn 与计数。理由和 §3b 的
+错误预算完全一样：一个"起来就死"的成员若无限重启，只是把一个 CPU 黑洞换成了
+一个**带日志的** CPU 黑洞，而且这回还多烧了反复 `init` 的代价。
+
+> `max_restarts` 与 `max_errors` 是**两个**预算，因为它们是两件事：
+> 前者数"这个成员被重建了几次"，后者数"这个成员在自己的一生里错了几次"。
+> 合成一个数会让"错很多但每次都恢复到好状态"和"错三次就重建三次"读起来一样。
+
+### 14.4 机制：谁执行 —— 仍然是"一个线程拥有状态"
+
+没有新线程、没有跨线程改状态。执行者是**那个成员自己的线程**：
+
+```
+成员线程：W.handle 返回 error
+      ↓
+supervise()：错误记账（§3b 原样）
+      ↓
+自己那层要不要停？（strategy == .stop 或超出 max_errors）
+      ├─ 不要 → 记日志、接着服务                （§3b 原样，一字未改）
+      └─ 要  → 组动作（新增）
+                 ├─ 无组            → 停自己                    （§3b 原样）
+                 ├─ 有组、强度够    → 按策略（14.3 表）
+                 └─ 有组、强度用尽  → 停组内全体 + warn + 计数
+      ↓
+"重启我"   = deinit(state) → startWorker() → 错误窗口清零 → 接着跑循环
+"重启别人" = 对方 handle 的 restart_requested 置位；它**自己的线程**做拆+建
+"停别人"   = 对方 handle 的 stop()（就是 §3b 已有的那个：置位 + 关邮箱）
+```
+
+三个要点：
+
+- **重启是原地重建**：`deinit` → `init` 在**同一个线程、同一个循环**里发生。
+  线程不退出、handle 不销毁、邮箱不关。因此 `spawn` 之后拿到 `*Handle(W, cap)` 的人
+  在重启前后拿着的是**同一个** handle，`send` 的语义不变。
+- **重启不动邮箱**：重建的是 `state`，不是队列。重启期间排队的消息由**新一代**处理。
+  这是刻意的：邮箱是对外接口，关掉它会让生产者看到 `error.Closed` —— §5 说
+  "丢弃必须可见"，但这里没有丢弃，只是换了一代。
+- **重启只对"能自己重建"的成员成立**：声明 `run`（`W.run` 自持循环）的 worker
+  **无法**被外部重启 —— 它的循环在 `W.run` 里面，runtime 插不进去，也读不到置位。
+  往**会重启的组**里放这种成员是 `error.NotRestartable`（spawn 时报，不是静默降级）。
+  `.stop_group` 的组不重启，因此接受 `run` 型成员。
+
+**池化成员的差别**：`.pooled` 的成员没有自己的线程，`restart_requested` 在**下一次被
+认领时**（`pooledDispatch` 开头，`started`/`startWorker` 本来就在那里）检查，
+效果相同：那一代状态被拆掉、重新 `init`，然后继续接活。如果它当时邮箱是空的，
+`Ready.pending` 会把这个置位**报成"有活儿"**（返回 1）—— 否则池会把它交回去且再也不认领，
+请求就永远没人读（`pooledPending` 的注释里写着这条）。
+
+**"读置位"这件事本身需要一个唤醒。** `stop_requested` 靠**关邮箱**把停在一个 `recv` 里的
+成员叫醒；重启请求不能这么做（关邮箱正是它不想要的那个结果），而它又不是一条消息
+（邮箱是**有类型**的，别的线程造不出这个类型的值）。所以 `Mailbox` 多了第三个
+"接收者可以回来"的理由：`wake()` 把 `wake_epoch` 加一、广播 `not_empty`，接收者下一次
+有机会就返回 null，由自己的循环去重读置位。
+
+两条边界的顺序是**要紧的**：成员必须在**读置位之前**取 epoch，否则落在这两步之间的
+`wake()` 会被一个过期的快照比掉、请求就丢了。普通 `recv` 在入口取当前 epoch，
+因此它**永远不会**因为一次 `wake` 提前返回 —— 没有组的成员走的还是原来那条路。
+
+**`restart_requested` 与 `stop_requested` 的关系**：两者都是"生产者视角的请求"，
+都在**循环顶端 / 认领点**被看到 —— 也就是说，一个正在处理长消息的成员不会被打断
+（和 `stop()` 今天的行为一致）。请求是**幂等**的；同时置位时 `stop` 赢
+（正在死的东西不该再被建起来）。被真的停掉之前，一次"重启"必须把置位**清掉** ——
+池化路径上漏掉这一步的后果不是"没重建"，是**每次失败重建两次**（下一次认领又读到它）；
+这条是测试抓出来的。
+
+### 14.5 树：组可以是组的成员
+
+```zig
+const cluster = try rt.spawnGroup(.one_for_one);
+const backend = try rt.spawnGroup(.one_for_all);
+try rt.nestGroup(cluster, backend);        // backend 整棵子树是 cluster 的一个成员
+```
+
+组的动作在**成员**上递归：worker 成员 → 置位；组成员 → 递归到它自己的成员。
+升级（escalate）就是这条：**子组的强度用尽时，它不自己决定，而是把决定交给父组** ——
+父组按**自己的**策略对这个子组施加动作（父 `one_for_one` = 只重建这棵子树，
+父 `one_for_all` = 重建父组全体，父 `stop_group` = 停父组整棵子树）。
+这就是 OTP 的形状：子 supervisor 放弃，父 supervisor 按自己的策略处理它。
+
+**但 `.stop_group` 不升级。** 这是一条刻意的分界：强度用尽是**计划外**的失败
+（"我们以为能恢复，结果不能"），那正是该问父组的情形；而 `.stop_group` 是**声明**
+（"这些成员要么一起活着，要么一起死"）—— 调用方已经做了决定，把它再递上去
+等于让父组的策略悄悄推翻这个声明。所以：
+
+| 情形 | 子组的动作 | 是否升级 |
+|------|-----------|---------|
+| 强度用尽 | 停自己子树 | **是** —— 父组按自己的策略处理这棵子树；父组重建它时，子组的预算**一并清零**（"父把子树重建了"就是那棵子树 supervisor 的一次新生） |
+| 策略是 `.stop_group` | 停自己子树 | 否 —— 声明即答案 |
+
+没有父组时两者一样：停掉整棵子树，跑完。
+
+**边的方向**：只有 `parent → child` 一条边（子组知道自己属于谁），动作沿成员表向下走。
+
+**锁的次序**：每个组一把自旋锁，只护预算字段与成员表。升级是**先放开子组的锁再进父组**，
+所以嵌套只可能按 `parent → child` 取得，不成环。
+
+### 14.6 可见性：停掉与重启都进指标
+
+`RuntimeStats` 新增两个累计量，`MetricsBridge` 各有一条 gauge：
+
+| 字段 / 指标 | 含义 |
+|-------------|------|
+| `supervised_stops` / `zigmodu_runtime_supervised_stops` | 被监督停掉的成员数（成员自己决定停、连坐停、强度用尽整组停，都算） |
+| `group_restarts` / `zigmodu_runtime_group_restarts` | 实际执行的**重建**次数，**按成员计**：一次 `one_for_all` 动作重建两个成员就是 2 |
+
+两者都是**累计量**而不是"当前存活成员的求和"，理由和 `messages_discarded_on_stop`
+一样（§8）：`shutdown` 会在同一趟里 join 并销毁成员，求和会回到 0 —— 而这两个数
+恰恰是在**停机之后**最需要看的那两个。
+
+### 14.7 明确不做（本节范围外）
+
+- **不做跨进程 / 跨节点监督**：§12.7 的同一条边界；子进程的存活由 `systemd` / k8s 管
+  （`docs/BEST_PRACTICES.md` §"进程可恢复"）。
+- **不做"重启保留上一次的痕迹"以外的状态策略**：重建就是 `deinit` + `init`，
+  没有"从快照恢复状态"这一档。要快照请在自己的 `init`/`deinit` 里做。
+- **不做重启退避（backoff）**：强度用尽即整组停，不做指数退避的无限重试。
+  要退避在 `init` 里睡（并接受它占着那个线程）。
+- **不做成员级策略覆盖**：策略是**组**的属性，不按成员配。需要不同待遇就用不同的组。
+- **不监督 panic**：`handle`/`run` 里的 panic 仍然 abort 进程（§3b 的既有边界）。
+  进程级存活靠 supervisor（`docs/BEST_PRACTICES.md`）。
+
+### 14.8 验收（已测）
+
+策略算术、预算、升级、锁次序在 `src/runtime/supervisor.zig`（10 条，成员是探针，没有线程）——
+那一层能证明"算得对"，证明不了"接得上"。接得上由 `src/runtime/runtime.zig` 的 7 条端到端钉住：
+
+| 用例 | 它唯二能说的话 |
+|------|--------------|
+| `one_for_one rebuilds a dying actor in place and it keeps serving` | 重建真的发生了（`inits` 从 1 变 3）、handle 没换、`stopped_by_supervisor` 仍为 false |
+| `without a group an actor stops where it stands, unchanged` | v0.16/v0.17 的行为一字未改（回归护栏） |
+| `one_for_all reaches a healthy group-mate through its handle` | 一个**从未出错**的成员被重建了 —— 没有真 handle 就测不出来 |
+| `spending the restart budget takes the group down, and it is counted` | 一组成员同时进 `supervised_stops`，而"被组带下去"与"自己决定停"是两个不同的置位 |
+| `a run-owned worker is refused in a rebuilding group, accepted in stop_group` | 编译期接不住的那个接线错误在 spawn 时说出来，且失败不留残骸 |
+| `a pooled member is rebuilt by its next claim` | `.pooled` 走的是同一套计数（拆+建在持认领的线程上） |
+| `a nested group escalates to its parent, and the parent's policy decides`（§14.5） | 树真的接上了：子组预算用尽 → 父组的 `one_for_all` 落到**不在失败子树里**的成员上 |
+
+**两条守卫都验过红**（不是"看着红"）：池化路径的重复重建、`nestGroup` 缺边，
+各由对应用例在变异后变红；`Mailbox.wake` 的"落点丢弃"由 `mailbox.zig` 的
+`wake unparks a receiver that had already blocked` 钉住（读置位之前取 epoch 的那条次序）。
+
+### 13.8 v1 的定位与筛选（`Replayer.open` / `onlyTracks`）
+
+§13.7 的 v1 只能整份重放。缺口矩阵 §7 要的 `--from-seq/--to-seq` 现在在 API 上（没有 CLI 包装）：
+
+```zig
+var rp = log.replayer(&manual);
+try rp.open(100_000, 120_000);      // [from, to)：from 含、to 不含
+try rp.onlyTracks(&.{"book"});      // 只投递这些轨；不再需要时 clearTrackFilter()
+try rp.bind("book", book_handle);
+_ = try rp.replayAll();
+_ = rp.skipped();                   // 被跳过的总数（下面三项之和）
+```
+
+**五条语义，都是决策而非实现细节**：
+
+| 决策 | 选择 | 理由 |
+|------|------|------|
+| 区间端点 | `[from, to)`；`from >= to` = 空窗（不是错误） | 半开是唯一能让"从 100 开始、到 120 结束"不重不漏的说法 |
+| `from` 之前 | **跳过并计入** `skippedBefore` | 它进了游标又被丢弃，必须留痕（§13.5 那条"不得静默丢"） |
+| `to` 及之后 | **根本不走进度、不计任何数** | 那不是"被筛掉"，是调用方压根没要；算成跳过会污染那个计数 |
+| 被筛掉的轨 | **前进游标 + 计入** `skippedUnselected`（不是不计数、也不是报错） | 单线程归并驱动无法"不前进却越过"，而"读了但没投递"必须看得见 |
+| 空 `onlyTracks(&.{})` | **什么都不选**，全部计入 `skippedUnselected`（可见） | "筛得一个不剩"和"筛坏了"必须区分得开；回到全部用 `clearTrackFilter()` |
+
+**未被选中的轨不需要 `bind`**，`isFullyBound()` 相应只看选中轨；但**被选中的**未绑定轨仍然报
+`error.UnboundTrack`（筛选只缩小检查范围，不取消检查）。**轨 id 拼错 = `error.UnknownTrack`**，
+不是"筛掉一切却看着像故意的"。
+
+**计数恒等式**（有测试钉住）：一轮走完后
+`log.len() == delivered + skipped() + (seq >= to 的条数)`；`to == null` 时即 `delivered + skipped()`。
+也就是**被筛掉的洞看得见** —— 这是这一节唯一真正的合同。
+
+**零分配**：`Replayer` 不持有 allocator，`open`/`seekTo`/`position` 只是扫描，`onlyTracks` 借调用方的
+slice。`step` / `replayAll` / `remaining` / `isFullyBound` 的**签名一个都没变**，无 window/filter 时
+`remaining()` 与 `isFullyBound()` 的**值**与旧行为逐位一致（代价：`remaining()` 现在是 O(总条目数) 的扫描）。
+
+**未做**（矩阵 §7 的其余部分）：落盘 / WAL / codec、CLI 包装、seq 集合或多区间、按类型或时间戳筛选。
+另有一条**既有**边界不在本次范围：`Track` 内部条目不保证 `seq` 升序（并发 sender 时 slot 领取序与
+全局 seq 序可不同），而归并本来就假设轨内升序 —— 没动。
+
+**验收**：`src/runtime/recorder.zig` 的 4 条新用例（`Replayer.open: only [from, to) is replayed, and what
+that passed over is counted` / `Replayer.onlyTracks: one track is delivered, the others are skipped and
+counted` / `Replayer: a window inside a filtered log leaves no entry unaccounted for` /
+`Replayer: narrowing and stepping take no allocator, so they cannot allocate`）加 §13.7 既有的 4 条。
+**变异验过红**：把 `to` 边界从 `>=` 改成 `>`，3 条断言以 `TestExpectedEqual` 变红（`expected 4, found 5`），
+不是编译错。
+

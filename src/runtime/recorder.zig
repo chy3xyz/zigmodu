@@ -26,10 +26,12 @@
 //! const log = rt.deliveryLog().?;
 //! var rp = log.replayer(&manual_clock);
 //! try rp.bind("book", fresh_book);                    // the caller supplies the map
+//! try rp.onlyTracks(&.{"book"});                      // …and which tracks are in it
+//! rp.open(from_seq, to_seq);                          // …and which seq range: [from, to)
 //! while (try rp.step()) |step| { … }                  // merged by global seq, never sleeps
 //! ```
 //!
-//! Three properties, each a deliberate choice, and they hold for both logs:
+//! Four properties, each a deliberate choice, and they hold for both logs:
 //!
 //! 1. **Overflow is an error, not a drop.** `record` returns `error.Full` once
 //!    the log has no room. That is the opposite of `HotBus`, on purpose: a log
@@ -45,6 +47,12 @@
 //! 3. **Off costs one null check.** A bus with no recorder attached, and a
 //!    handle spawned without `.record`, behave exactly as they did before this
 //!    file existed.
+//! 4. **A narrowed replay is a counted one.** `Replayer.open`/`seekTo` take a
+//!    seq range and `Replayer.onlyTracks` takes a track filter; whatever either
+//!    of them screens out is skipped *and counted* (`skippedBefore`,
+//!    `skippedUnselected`), never dropped in silence. Looking at a slice of a
+//!    log is the whole point of the feature, so "what did this replay not
+//!    cover" has to be readable rather than implied.
 //!
 //! ## Division of labour with `core/EventStore.zig`
 //!
@@ -556,6 +564,10 @@ pub const DeliveryLog = struct {
     /// Rewinds the tracks' own cursors on the way (the cursors and bindings live
     /// on the `TrackRef`), so a log has **one replay at a time** — the same
     /// discipline `Recorder.replay` has by taking a sink.
+    ///
+    /// The driver starts wide open: every track, the whole `seq` range. Narrow it
+    /// with `Replayer.open`/`seekTo` (a range) and `Replayer.onlyTracks` (a set of
+    /// tracks); both are counted, never silent.
     pub fn replayer(self: *Self, manual: *Clock.Manual) Replayer {
         for (self.tracks.items) |track| {
             track.cursor = 0;
@@ -579,8 +591,10 @@ pub const StepError = mbox.SendError || error{
     /// A track overflowed: the log has a hole, and a replay of it would look
     /// complete without being one. Nothing was replayed (§11.6's rule, kept).
     LogIncomplete,
-    /// Nothing is bound to the track this entry came from. Skipping it would be
-    /// the same lie in smaller letters — the entry would simply never arrive.
+    /// Nothing is bound to the track this entry came from, and the entry is due
+    /// to be delivered (it is inside the window and on a selected track).
+    /// Skipping it would be the same lie in smaller letters — the entry would
+    /// simply never arrive.
     UnboundTrack,
 };
 
@@ -604,6 +618,30 @@ pub const BindError = error{
     CodecRequired,
 };
 
+/// The `seq` range a replay covers: **`[from, to)` — `from` inclusive, `to`
+/// exclusive**. The whole log is `{ .from = 0, .to = null }`, which is what a
+/// driver starts with.
+pub const Window = struct {
+    /// The first `seq` replayed. Everything before it is skipped *and counted*
+    /// (`Replayer.skippedBefore`): a range is a decision the caller made, so the
+    /// size of what it left out is a number, not a shrug.
+    from: u64 = 0,
+    /// One past the last `seq` replayed; `null` means "to the end of the log".
+    /// Entries at or after it are **not walked at all** — the replay stops
+    /// there — so they are counted nowhere. Distinct from `from` on purpose:
+    /// before `from` is discarded, from `to` on is simply not part of this
+    /// replay (and still in the log, untouched).
+    to: ?u64 = null,
+};
+
+/// Why a track filter was refused.
+pub const FilterError = error{
+    /// The filter named a track this log does not have. Validated eagerly so a
+    /// typo fails here rather than screening out every delivery and looking
+    /// like a deliberate filter.
+    UnknownTrack,
+};
+
 /// Replays a `DeliveryLog` (§13.4): merge the tracks by global `seq`, move a
 /// `Clock.Manual` to each entry's recorded stamp, and post each payload back to
 /// the handle the caller bound for that id.
@@ -611,9 +649,37 @@ pub const BindError = error{
 /// The mapping is the caller's (§13.3 Q3). The runtime never guesses it: a
 /// "rebuild the graph and hope the spawn order matches" replay works exactly
 /// until the graph changes, and then misdelivers in silence.
+///
+/// A replay can also be **narrowed** to a `seq` range (`open`/`seekTo`) and to a
+/// set of tracks (`onlyTracks`) — looking at one worker, or at the window around
+/// an incident, instead of replaying a whole run. Narrowing never removes a
+/// binding check silently: whatever is screened out is skipped and counted
+/// (`skippedBefore`, `skippedUnselected`), and an entry the driver *is* supposed
+/// to deliver still needs a target (`error.UnboundTrack`).
 pub const Replayer = struct {
     log: *DeliveryLog,
     manual: *Clock.Manual,
+
+    /// What this driver replays: the seq range, and the tracks it delivers from.
+    /// Set through `open`/`seekTo`/`onlyTracks`, which is what brings the cursors
+    /// and the skip counters in line — assigning these fields directly would
+    /// leave them disagreeing with `remaining()`.
+    ///
+    /// The defaults — every track, the whole seq range — are exactly what this
+    /// driver did before the window and the filter existed.
+    window: Window = .{},
+    /// The tracks to deliver from, by `TrackSpec.id`, or `null` for all of them.
+    /// The slice is the caller's (see `onlyTracks`).
+    only: ?[]const []const u8 = null,
+
+    /// Entries before `window.from`, passed over when the cursors were
+    /// positioned. **Recomputed** by `seekTo`/`open` rather than accumulated, so
+    /// it describes the current position and repeated seeks cannot double count.
+    skipped_before: usize = 0,
+    /// Entries walked past because their track is not in `only` — the cursor
+    /// advances over them, they are never delivered, and they are counted here.
+    /// Grows as the replay runs; reset by positioning.
+    skipped_unselected: usize = 0,
 
     /// Bind the track `id` to the handle its deliveries go to on replay. The
     /// handle may be freshly spawned on another runtime — the driver only needs
@@ -643,25 +709,153 @@ pub const Replayer = struct {
         }.post;
     }
 
-    /// Whether every track has a target. False means `step` would return
-    /// `error.UnboundTrack` as soon as it reached the unbound one.
+    /// Whether every track this driver would deliver from has a target. False
+    /// means `step` would return `error.UnboundTrack` as soon as it reached an
+    /// unbound **selected** track.
+    ///
+    /// Tracks the filter excludes are not part of this replay, so their missing
+    /// bindings are not counted here — filters are as wide as they are only
+    /// because a filtered-out track is skipped *and counted*. With no filter this
+    /// is every track, i.e. the same answer it gave before the filter existed.
     pub fn isFullyBound(self: *const Replayer) bool {
         for (self.log.tracks.items) |track| {
+            if (!self.selects(track)) continue;
             if (track.target == null) return false;
         }
         return true;
     }
 
-    /// Deliveries not yet handed over.
+    /// Deliveries this driver will still hand over: entries on the selected
+    /// tracks, with `seq` in `[from, to)`, whose cursor has not passed them.
+    ///
+    /// Entries the filter screens out and entries before `from` are not counted
+    /// — they are `skipped*` — and neither are entries at or after `to`, since
+    /// the replay stops there. With no window and no filter this is
+    /// `Σ(len − cursor)`, the number it has always been; with either set it can
+    /// no longer be answered by subtraction, so it reads the entries (no
+    /// allocation, no state change).
     pub fn remaining(self: *const Replayer) usize {
         var total: usize = 0;
-        for (self.log.tracks.items) |track| total += track.len(track) - track.cursor;
+        for (self.log.tracks.items) |track| {
+            if (!self.selects(track)) continue;
+            const n = track.len(track);
+            var i = track.cursor;
+            while (i < n) : (i += 1) {
+                const seq = track.entry(track, i).seq;
+                if (seq < self.window.from) continue;
+                if (self.window.to) |to| {
+                    if (seq >= to) continue;
+                }
+                total += 1;
+            }
+        }
         return total;
+    }
+
+    /// Replay from `from` on: put every track's cursor at its first entry whose
+    /// `seq` is >= `from`, and count what that passed over (`skippedBefore`).
+    /// `window.to` is left as it is — `open` sets both ends.
+    ///
+    /// Lets a caller start in the middle of a log (the entry before the one it
+    /// cares about, the delivery that followed a bad state). Zero allocation, and
+    /// idempotent: the cursors and both skip counters are recomputed from `from`,
+    /// so seeking twice — or backwards, to re-replay a range — is just a scan.
+    pub fn seekTo(self: *Replayer, from: u64) void {
+        self.window.from = from;
+        self.position();
+    }
+
+    /// `seekTo(from)` plus the exclusive end: replay exactly **`[from, to)`**,
+    /// with `null` for "to the end of the log". `from >= to` is an empty window —
+    /// the driver hands over nothing and `remaining()` is 0, which is an answer,
+    /// not an error.
+    pub fn open(self: *Replayer, from: u64, to: ?u64) void {
+        self.window = .{ .from = from, .to = to };
+        self.position();
+    }
+
+    /// Deliver only from these tracks (`TrackSpec.id`). A track that is not
+    /// named here is **skipped, its cursor advanced, and counted**
+    /// (`skippedUnselected`) — the driver never passes an entry over without a
+    /// number to point at. An unselected track therefore does not need a
+    /// binding: the filter is the caller saying "this worker is not part of this
+    /// replay". A *selected* track that has no target still fails with
+    /// `error.UnboundTrack` at the first of its entries — the filter narrows the
+    /// check, it does not remove it.
+    ///
+    /// The ids are validated against the log here: a typo is
+    /// `error.UnknownTrack`, not a replay that screens everything out and looks
+    /// deliberate. An empty slice selects nothing (the whole log is skipped);
+    /// `clearTrackFilter` goes back to all tracks.
+    ///
+    /// The slice is the caller's and must outlive the driver. Zero allocation.
+    pub fn onlyTracks(self: *Replayer, ids: []const []const u8) FilterError!void {
+        for (ids) |id| {
+            if (self.log.find(id) == null) return error.UnknownTrack;
+        }
+        self.only = ids;
+    }
+
+    /// Deliver from every track again. The cursors do not move: anything the
+    /// filter skipped is already behind the driver, and `skippedUnselected` keeps
+    /// saying so.
+    pub fn clearTrackFilter(self: *Replayer) void {
+        self.only = null;
+    }
+
+    /// Entries this driver passed over without delivering since it was last
+    /// positioned: `skippedBefore + skippedUnselected`.
+    pub fn skipped(self: *const Replayer) usize {
+        return self.skipped_before + self.skipped_unselected;
+    }
+
+    /// Entries before `window.from` — what `seekTo`/`open` passed over.
+    pub fn skippedBefore(self: *const Replayer) usize {
+        return self.skipped_before;
+    }
+
+    /// Entries walked past because their track is not in the filter.
+    pub fn skippedUnselected(self: *const Replayer) usize {
+        return self.skipped_unselected;
+    }
+
+    /// Is `track` part of this replay? `true` for every track when no filter is
+    /// set.
+    fn selects(self: *const Replayer, track: *const TrackRef) bool {
+        const only = self.only orelse return true;
+        for (only) |id| {
+            if (std.mem.eql(u8, id, track.id)) return true;
+        }
+        return false;
+    }
+
+    /// Bring the cursors and both skip counters in line with `window`: every
+    /// track starts at its first entry whose `seq` is >= `window.from`, and every
+    /// entry before that is counted. The single place the counters are reset —
+    /// and the reason a narrowed `remaining()` can be answered from the cursors.
+    /// Allocates nothing; runs on the caller's thread.
+    fn position(self: *Replayer) void {
+        self.skipped_before = 0;
+        self.skipped_unselected = 0;
+        for (self.log.tracks.items) |track| {
+            const n = track.len(track);
+            var i: usize = 0;
+            while (i < n and track.entry(track, i).seq < self.window.from) : (i += 1) {}
+            self.skipped_before += i;
+            track.cursor = i;
+        }
     }
 
     /// Advance one delivery: take the smallest un-consumed `seq` across the
     /// tracks, move the manual clock to that entry's recorded stamp, and post its
-    /// payload to the bound handle. Null when the log is exhausted.
+    /// payload to the bound handle. Null when the log is exhausted — or when
+    /// nothing inside `[from, to)` is left, which is the same thing as far as the
+    /// caller is concerned.
+    ///
+    /// Entries outside the window or on an unselected track are **not** delivered:
+    /// the driver advances their track's cursor, counts them (`skippedBefore` /
+    /// `skippedUnselected`), and moves on, so `step` never hands the caller an
+    /// entry it was not asked for, and never hides the ones it passed.
     ///
     /// **It never waits for anyone** — no sleep, no spin, no join: the driver
     /// orders *deliveries*, and where the handler then runs is the target
@@ -673,28 +867,47 @@ pub const Replayer = struct {
     /// that entry's delivery was recorded with and the caller may retry it.
     pub fn step(self: *Replayer) StepError!?Step {
         if (self.log.hasOverflowed()) return error.LogIncomplete;
-        var next: ?*TrackRef = null;
-        var next_seq: u64 = std.math.maxInt(u64);
-        for (self.log.tracks.items) |track| {
-            if (track.cursor >= track.len(track)) continue;
-            const seq = track.entry(track, track.cursor).seq;
-            if (seq < next_seq) {
-                next_seq = seq;
-                next = track;
+        while (true) {
+            var next: ?*TrackRef = null;
+            var next_seq: u64 = std.math.maxInt(u64);
+            for (self.log.tracks.items) |track| {
+                if (track.cursor >= track.len(track)) continue;
+                const seq = track.entry(track, track.cursor).seq;
+                if (seq < next_seq) {
+                    next_seq = seq;
+                    next = track;
+                }
             }
+            const track = next orelse return null;
+            // The smallest seq left is past the window: nothing in `[from, to)`
+            // remains, and entries from `to` on are deliberately not walked.
+            if (self.window.to) |to| {
+                if (next_seq >= to) return null;
+            }
+            if (next_seq < self.window.from) {
+                track.cursor += 1;
+                self.skipped_before += 1;
+                continue;
+            }
+            if (!self.selects(track)) {
+                track.cursor += 1;
+                self.skipped_unselected += 1;
+                continue;
+            }
+            const post = track.post orelse return error.UnboundTrack;
+            const entry = track.entry(track, track.cursor);
+            self.manual.set(entry.clock_ms);
+            try post(track.target.?, entry.payload);
+            track.cursor += 1;
+            return .{ .seq = entry.seq, .clock_ms = entry.clock_ms, .id = track.id };
         }
-        const track = next orelse return null;
-        const post = track.post orelse return error.UnboundTrack;
-        const entry = track.entry(track, track.cursor);
-        self.manual.set(entry.clock_ms);
-        try post(track.target.?, entry.payload);
-        track.cursor += 1;
-        return .{ .seq = entry.seq, .clock_ms = entry.clock_ms, .id = track.id };
     }
 
     /// `step` until the log is exhausted; returns the number of deliveries handed
-    /// over. The "just replay it" call, for a caller that does not need to inspect
-    /// each delivery (§13.6 · 3: `step` is the primary driver, this rides along).
+    /// over — entries the window or the filter screened out are not counted, and
+    /// are visible in `skipped()` instead. The "just replay it" call, for a
+    /// caller that does not need to inspect each delivery (§13.6 · 3: `step` is
+    /// the primary driver, this rides along).
     pub fn replayAll(self: *Replayer) StepError!usize {
         var delivered: usize = 0;
         while (try self.step()) |_| delivered += 1;
@@ -1071,4 +1284,302 @@ test "Track: concurrent producers get distinct global sequences across tracks" {
         }
     }
     try std.testing.expectEqual(@as(u64, 2 * per_producer), log.sequencer.peek());
+}
+
+// ─────────────────────────────────────────────────
+// §13 — positioning and filtering a replay
+// ─────────────────────────────────────────────────
+
+/// A stand-in for `*Handle(W, capacity)`. `bind` needs three things from a
+/// target — a `mailbox` field, a `track` field, and a `Message` decl with a
+/// `send` — so a narrowed replay can be asserted here with no runtime, no
+/// threads and nothing to synchronize.
+///
+/// A real handle's `track` is non-null precisely when that worker is recorded,
+/// which is what makes it a `TargetIsInSourceLog`; a fake leaves it null, i.e.
+/// "a fresh graph", the only thing a replay may deliver into.
+fn FakeTarget(comptime M: type) type {
+    return struct {
+        const Self = @This();
+
+        pub const Message = M;
+        mailbox: u8 = 0,
+        track: ?*TrackRef = null,
+        sent: [16]M = @splat(0),
+        n: usize = 0,
+
+        pub fn send(self: *Self, message: M) mbox.SendError!void {
+            self.sent[self.n] = message;
+            self.n += 1;
+        }
+
+        fn taken(self: *const Self) []const M {
+            return self.sent[0..self.n];
+        }
+    };
+}
+
+test "Replayer.open: only [from, to) is replayed, and what that passed over is counted" {
+    // The log stamps entries from the clock it was built with, so a manual one
+    // makes the `clock_ms` assertions below values instead of "whatever the wall
+    // clock said while the test ran".
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var log = DeliveryLog.init(std.testing.allocator, clk.clock());
+    defer log.deinit();
+    const track = try log.addTrack(.{ .id = "a", .capacity = 8 }, u32, 8);
+
+    for (0..8) |i| {
+        clk.set(@intCast(i * 10));
+        try track.record(@intCast(i));
+    }
+    // One track, so its slots are the log's seq values: entry i carries seq i.
+
+    var manual = Clock.Manual{ .now_ms = 0 };
+    var target = FakeTarget(u32){};
+    var rp = log.replayer(&manual);
+    try rp.bind("a", &target);
+
+    // Nothing narrowed: the whole log, i.e. the number `remaining()` has always
+    // returned (Σ len − cursor).
+    try std.testing.expectEqual(@as(usize, 8), rp.remaining());
+    try std.testing.expectEqual(@as(usize, 0), rp.skipped());
+
+    // [2, 6): seq 0 and 1 are skipped and counted, 2..5 are delivered, and 6/7
+    // are never walked — `to` is a stop, not a filter.
+    rp.open(2, 6);
+    try std.testing.expectEqual(@as(usize, 4), rp.remaining());
+    try std.testing.expectEqual(@as(usize, 2), rp.skippedBefore());
+    try std.testing.expectEqual(@as(usize, 0), rp.skippedUnselected());
+
+    try std.testing.expectEqual(@as(usize, 4), try rp.replayAll());
+    try std.testing.expectEqualSlices(u32, &.{ 2, 3, 4, 5 }, target.taken());
+    try std.testing.expectEqual(@as(usize, 0), rp.remaining());
+    try std.testing.expectEqual(@as(?Step, null), try rp.step());
+    try std.testing.expectEqual(@as(usize, 2), rp.skipped());
+    // The entries from `to` on are untouched, not consumed: the log is the same
+    // length it was, and a second driver can still replay all of it.
+    try std.testing.expectEqual(@as(usize, 8), log.len());
+    // The clock stopped at the last entry actually delivered (seq 5, t = 50).
+    try std.testing.expectEqual(@as(i64, 50), manual.now_ms);
+
+    // `from` inclusive, `to` exclusive — one entry at a time.
+    rp.open(7, 8);
+    try std.testing.expectEqual(@as(usize, 1), rp.remaining());
+    try std.testing.expectEqual(@as(usize, 7), rp.skippedBefore());
+    try std.testing.expectEqual(@as(usize, 1), try rp.replayAll());
+    try std.testing.expectEqual(@as(u32, 7), target.taken()[target.n - 1]);
+
+    // `from` past the last entry, to the end: an empty window is an answer, not
+    // an error — nothing to hand over, and the count says so.
+    rp.open(8, null);
+    try std.testing.expectEqual(@as(usize, 0), rp.remaining());
+    try std.testing.expectEqual(@as(usize, 0), try rp.replayAll());
+    try std.testing.expectEqual(@as(usize, 8), rp.skippedBefore());
+
+    // …and an inverted range is empty too, rather than replaying backwards.
+    rp.open(6, 2);
+    try std.testing.expectEqual(@as(usize, 0), rp.remaining());
+    try std.testing.expectEqual(@as(usize, 0), try rp.replayAll());
+    try std.testing.expectEqual(@as(usize, 6), rp.skippedBefore());
+
+    // Positioning repositions rather than accumulates: after all of that, a
+    // driver told to start at 2 says "two entries are before the position", not
+    // "many were skipped at some point".
+    const before = target.n;
+    rp.open(2, null);
+    try std.testing.expectEqual(@as(usize, 2), rp.skippedBefore());
+    try std.testing.expectEqual(@as(usize, 6), rp.remaining());
+    try std.testing.expectEqual(@as(usize, 6), try rp.replayAll());
+    try std.testing.expectEqualSlices(u32, &.{ 2, 3, 4, 5, 6, 7 }, target.taken()[before..]);
+    try std.testing.expectEqual(@as(usize, 0), rp.remaining());
+
+    // `seekTo` is the same positioning with `to` left alone — here it has none,
+    // so the range is open to the end again.
+    rp.seekTo(0);
+    try std.testing.expectEqual(@as(usize, 0), rp.skippedBefore());
+    try std.testing.expectEqual(@as(usize, 8), rp.remaining());
+}
+
+test "Replayer.onlyTracks: one track is delivered, the others are skipped and counted" {
+    // Manual clock on the log itself: the recorded stamps are then the values
+    // below, which is what lets the driver's final clock reading be asserted.
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var log = DeliveryLog.init(std.testing.allocator, clk.clock());
+    defer log.deinit();
+    const book = try log.addTrack(.{ .id = "book", .capacity = 8 }, u32, 8);
+    const risk = try log.addTrack(.{ .id = "risk", .capacity = 8 }, u64, 8);
+
+    // Interleaved, one shared sequence: "risk" holds seq 0 and 2, "book" 1, 3, 4.
+    clk.set(100);
+    try risk.record(20);
+    clk.set(200);
+    try book.record(1);
+    clk.set(300);
+    try risk.record(40);
+    clk.set(400);
+    try book.record(2);
+    clk.set(500);
+    try book.record(3);
+
+    var manual = Clock.Manual{ .now_ms = 0 };
+    var book_target = FakeTarget(u32){};
+    var risk_target = FakeTarget(u64){};
+    var rp = log.replayer(&manual);
+    try rp.bind("book", &book_target);
+    try rp.bind("risk", &risk_target);
+
+    // "Replay the book track": the other track's deliveries are skipped, its
+    // cursor advances over them, and the count says how many.
+    try rp.onlyTracks(&.{"book"});
+    try std.testing.expectEqual(@as(usize, 3), rp.remaining());
+    try std.testing.expectEqual(@as(usize, 3), try rp.replayAll());
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, book_target.taken());
+    try std.testing.expectEqual(@as(usize, 0), risk_target.n);
+    try std.testing.expectEqual(@as(usize, 2), rp.skippedUnselected());
+    try std.testing.expectEqual(@as(usize, 2), rp.skipped());
+    try std.testing.expectEqual(@as(usize, 0), rp.remaining());
+    try std.testing.expectEqual(@as(i64, 500), manual.now_ms);
+
+    // A filter that names a track the log does not have fails here instead of
+    // screening every delivery out, and it leaves the filter in force alone.
+    try std.testing.expectError(error.UnknownTrack, rp.onlyTracks(&.{"bookk"}));
+
+    // An empty filter selects nothing — deliberately, visibly, and with the
+    // whole log counted as skipped rather than silently replayed.
+    var null_manual = Clock.Manual{ .now_ms = 0 };
+    var skipping = log.replayer(&null_manual);
+    try skipping.onlyTracks(&.{});
+    try std.testing.expectEqual(@as(usize, 0), skipping.remaining());
+    try std.testing.expectEqual(@as(usize, 0), try skipping.replayAll());
+    try std.testing.expectEqual(@as(usize, 5), skipping.skippedUnselected());
+
+    // `isFullyBound` follows the filter: a filtered-out track is not part of this
+    // replay, so its missing target is not a missing binding …
+    var manual2 = Clock.Manual{ .now_ms = 0 };
+    var only_book = FakeTarget(u32){};
+    var rp2 = log.replayer(&manual2);
+    try std.testing.expect(!rp2.isFullyBound());
+    try rp2.bind("book", &only_book);
+    try std.testing.expect(!rp2.isFullyBound()); // `risk` is still owed a target
+    try rp2.onlyTracks(&.{"book"});
+    try std.testing.expect(rp2.isFullyBound());
+    try std.testing.expectEqual(@as(usize, 3), try rp2.replayAll());
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, only_book.taken());
+
+    // … but a *selected* track with no target still stops the replay: the filter
+    // narrows the binding check, it does not remove it.
+    var manual3 = Clock.Manual{ .now_ms = 0 };
+    var rp3 = log.replayer(&manual3);
+    try rp3.onlyTracks(&.{"book"});
+    try std.testing.expectError(error.UnboundTrack, rp3.step());
+    // The entry it walked past on the way to that failure is counted (seq 0 is
+    // "risk"): an error is not a licence to lose track of what was skipped.
+    try std.testing.expectEqual(@as(usize, 1), rp3.skippedUnselected());
+
+    // Clearing the filter goes back to every track — the ones already walked past
+    // are behind the driver, and the counter still accounts for them.
+    var manual4 = Clock.Manual{ .now_ms = 0 };
+    var both_book = FakeTarget(u32){};
+    var both_risk = FakeTarget(u64){};
+    var rp4 = log.replayer(&manual4);
+    try rp4.bind("book", &both_book);
+    try rp4.bind("risk", &both_risk);
+    try rp4.onlyTracks(&.{"book"});
+    try std.testing.expectEqual(@as(u64, 1), (try rp4.step()).?.seq);
+    rp4.clearTrackFilter();
+    try std.testing.expectEqual(@as(usize, 3), try rp4.replayAll());
+    try std.testing.expectEqualSlices(u64, &.{40}, both_risk.taken());
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, both_book.taken());
+    try std.testing.expectEqual(@as(usize, 1), rp4.skippedUnselected()); // seq 0, skipped while filtered
+}
+
+test "Replayer: a window inside a filtered log leaves no entry unaccounted for" {
+    var log = DeliveryLog.init(std.testing.allocator, .monotonic);
+    defer log.deinit();
+    const a = try log.addTrack(.{ .id = "a", .capacity = 8 }, u32, 8);
+    const b = try log.addTrack(.{ .id = "b", .capacity = 8 }, u32, 8);
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    for (0..7) |i| {
+        clk.set(@intCast(100 + @as(i64, @intCast(i)) * 10));
+        if (i % 2 == 0) try a.record(@intCast(i)) else try b.record(@intCast(i));
+    }
+    // seq 0, 2, 4, 6 on "a" and seq 1, 3, 5 on "b" — interleaved, so a window or
+    // a filter leaves holes in what actually gets delivered.
+    try std.testing.expectEqual(@as(usize, 4), a.len());
+    try std.testing.expectEqual(@as(usize, 3), b.len());
+
+    var manual = Clock.Manual{ .now_ms = 0 };
+    var target = FakeTarget(u32){};
+    var rp = log.replayer(&manual);
+    try rp.bind("a", &target);
+
+    // [1, 6) on "a": seq 2 and 4 are deliverable, seq 0 is before the window,
+    // seq 1/3/5 are on the unselected track, seq 6 sits at `to`.
+    rp.open(1, 6);
+    try rp.onlyTracks(&.{"a"});
+    try std.testing.expectEqual(@as(usize, 2), rp.remaining());
+    try std.testing.expectEqual(@as(usize, 2), try rp.replayAll());
+    try std.testing.expectEqualSlices(u32, &.{ 2, 4 }, target.taken());
+    try std.testing.expectEqual(@as(usize, 1), rp.skippedBefore()); // seq 0
+    try std.testing.expectEqual(@as(usize, 3), rp.skippedUnselected()); // seq 1, 3, 5
+    try std.testing.expectEqual(@as(usize, 4), rp.skipped());
+    try std.testing.expectEqual(@as(usize, 0), rp.remaining());
+    try std.testing.expectEqual(@as(?Step, null), try rp.step());
+
+    // Every entry is in exactly one bucket: delivered, skipped, or untouched at
+    // and after `to`. The holes are visible, which is the point — a narrowed
+    // replay that looked complete would be worse than no replay.
+    try std.testing.expectEqual(@as(usize, 1), log.len() - target.n - rp.skipped());
+    try std.testing.expectEqual(@as(usize, 7), log.len());
+
+    // A second driver on the same log, wide open, still sees all seven: the
+    // narrowing never wrote anything back into it.
+    var manual2 = Clock.Manual{ .now_ms = 0 };
+    var all_a = FakeTarget(u32){};
+    var all_b = FakeTarget(u32){};
+    var rp2 = log.replayer(&manual2);
+    try rp2.bind("a", &all_a);
+    try rp2.bind("b", &all_b);
+    try std.testing.expectEqual(@as(usize, 7), rp2.remaining());
+    try std.testing.expectEqual(@as(usize, 7), try rp2.replayAll());
+    try std.testing.expectEqual(@as(usize, 0), rp2.skipped());
+    try std.testing.expectEqualSlices(u32, &.{ 0, 2, 4, 6 }, all_a.taken());
+    try std.testing.expectEqualSlices(u32, &.{ 1, 3, 5 }, all_b.taken());
+}
+
+test "Replayer: narrowing and stepping take no allocator, so they cannot allocate" {
+    // The driver holds no allocator at all — the reason `seekTo`/`onlyTracks`/
+    // `step`/`remaining` cannot quietly become an allocation path. Pinning it by
+    // construction: the log's allocator refuses everything from here on, and the
+    // whole narrowed replay still runs.
+    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var log = DeliveryLog.init(probe.allocator(), .monotonic);
+    defer log.deinit();
+    defer probe.fail_index = std.math.maxInt(usize);
+
+    const a = try log.addTrack(.{ .id = "a", .capacity = 16 }, u32, 16);
+    const b = try log.addTrack(.{ .id = "b", .capacity = 16 }, u32, 16);
+    for (0..8) |i| {
+        if (i % 2 == 0) try a.record(@intCast(i)) else try b.record(@intCast(i));
+    }
+
+    var manual = Clock.Manual{ .now_ms = 0 };
+    var target = FakeTarget(u32){};
+    var rp = log.replayer(&manual);
+
+    probe.fail_index = probe.alloc_index;
+    try rp.bind("a", &target);
+    try rp.onlyTracks(&.{"a"});
+    rp.open(1, 6);
+    _ = rp.remaining();
+    _ = rp.skipped();
+    const delivered = try rp.replayAll();
+    rp.clearTrackFilter();
+    rp.seekTo(0);
+    _ = rp.remaining();
+
+    // …and the walk really ran: a green result cannot mean "nothing happened".
+    try std.testing.expectEqual(@as(usize, 2), delivered);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 4 }, target.taken());
 }

@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const NetworkTransport = @import("NetworkTransport.zig");
+const sockread = @import("../sockread.zig");
 const RaftElection = @import("RaftElection.zig").RaftElection;
 const Peer = @import("RaftElection.zig").Peer;
 const VoteRequest = @import("RaftElection.zig").VoteRequest;
@@ -302,6 +303,24 @@ fn writeFrame(stream: std.Io.net.Stream, frame: []const u8) !void {
 /// Dial a peer. `NetworkTransport.connect` is unreferenced in-tree and does not
 /// compile against this Zig (`IpAddress.ConnectOptions` now requires `.mode`), so
 /// the three lines live here; it can go back to calling that helper once fixed.
+///
+/// **The connect cannot be bounded here, and that is a std limitation rather
+/// than a choice.** `IpAddress.ConnectOptions` advertises `.timeout`, but on the
+/// `std.Io.Threaded` backend Zig 0.17 (the version CI pins) has not implemented
+/// it — `netConnectIpPosix` is `if (options.timeout != .none) @panic("TODO
+/// implement netConnectIpPosix with timeout")`, measured, not read. Passing one
+/// would turn every dial into a process abort.
+///
+/// So a peer whose SYN is dropped still costs this dial the OS default. What
+/// *is* bounded is the reply wait (`sockread.setRecvTimeout` in
+/// `TransportImpl.sendAppendEntries`), which covers the other black-hole — a
+/// peer that completes the handshake and then never answers. That one is worth
+/// more than it looks: a wedged peer (long GC pause, saturated accept queue,
+/// overloaded box) is far more common in production than a routing black hole,
+/// and it is the case no connect-side bound could ever have covered.
+///
+/// Closing the remaining gap means a hand-rolled non-blocking `connect` + `poll`
+/// with a deadline; `endpoint/server` plumbing is not the place for it.
 fn dialTo(allocator: std.mem.Allocator, io: std.Io, ep: Endpoint) !NetworkTransport.ClusterConnection {
     const addr = try std.Io.net.IpAddress.parse(ep.host, ep.port);
     const stream = try addr.connect(io, .{ .mode = .stream });
@@ -390,6 +409,18 @@ pub fn TransportImpl(comptime slot: usize) type {
         addresses: AddressBook,
         vtable: VTable = .{ .sendVoteRequest = thunkVoteRequest, .sendAppendEntries = thunkAppendEntries },
 
+        /// `ElectionConfig.rpc_timeout_ms`, read from the raft at send time.
+        ///
+        /// Deliberately **not** cached in a field filled by `init`: the wiring
+        /// everyone uses calls `impl.init(allocator, io, &raft)` *before*
+        /// `raft = try RaftElection.init(...)`, so anything `init` read out of
+        /// `raft` would be reading `undefined`. The config is written once by
+        /// `RaftElection.init` and never again, so reading it here is free and
+        /// cannot see a torn value.
+        fn rpcTimeoutMs(self: *const Self) u32 {
+            return self.raft.config.rpc_timeout_ms;
+        }
+
         /// Shape of `RaftElection.ElectionTransport` — `transport()` hands out a
         /// pointer to this field.
         pub const VTable = struct {
@@ -440,6 +471,10 @@ pub fn TransportImpl(comptime slot: usize) type {
                 return;
             };
             defer conn.deinit();
+            // The write half of the same bound: a peer that accepts and then
+            // stops reading would otherwise block the writing thread on a full
+            // send buffer, inside the same spin lock.
+            sockread.setSendTimeout(conn.stream, self.rpcTimeoutMs());
             writeFrame(conn.stream, frame) catch |err| {
                 log.debug("[raft] write {s}:{d} failed, message dropped ({})", .{ ep.host, ep.port, err });
             };
@@ -477,11 +512,22 @@ pub fn TransportImpl(comptime slot: usize) type {
 
             var conn = dialTo(self.allocator, self.io, ep) catch return lost;
             defer conn.deinit();
+            sockread.setSendTimeout(conn.stream, self.rpcTimeoutMs());
             writeFrame(conn.stream, frame.items) catch return lost;
+
+            // Bound the wait for the reply as well as the dial: a peer that
+            // accepts the connection and never answers is the failure this is
+            // here for. It matters more than the connect bound, because this read
+            // is the one that happens on every heartbeat from every leader — a
+            // half-open peer would otherwise stop the cluster's ticker dead.
+            sockread.setRecvTimeout(conn.stream, self.rpcTimeoutMs());
 
             var reply = std.ArrayList(u8).empty;
             defer reply.deinit(self.allocator);
-            const bytes = conn.recv(&reply) catch return lost;
+            const bytes = conn.recv(&reply) catch |err| {
+                log.debug("[raft] no reply from {s}:{d} within {d}ms, or the peer closed ({}) — message dropped", .{ ep.host, ep.port, self.rpcTimeoutMs(), err });
+                return lost;
+            };
             return decodeAppendEntriesResponse(bytes) catch lost;
         }
 
@@ -530,6 +576,15 @@ pub const ElectionTransportImpl = TransportImpl(0);
 /// would be a livelock, not a fix. The steps the lock used to wrap but no longer
 /// needs to — `decode*` / `encode*` — touch only allocator-local buffers and
 /// `raft.local_id`, which is written once in `init` and freed in `deinit`.
+///
+/// **This paragraph states a principle the outbound half does not yet follow:**
+/// `RaftElection.tick`'s replication round calls `sendAppendEntries` below
+/// *inside* `RaftLock`. The reply wait there is bounded now
+/// (`sockread.setRecvTimeout`, `ElectionConfig.rpc_timeout_ms`), but the dial is
+/// not, and a bounded IO under a spin lock is still IO under a spin lock.
+/// `docs/DISTRIBUTED.md` §"出站 IO 与锁" holds the three-phase design that closes
+/// it, with the obligations (self-contained requests, stale-response guard) any
+/// implementation has to meet.
 pub fn handleConnection(raft: *RaftElection, addresses: ?*const AddressBook, conn: *NetworkTransport.ClusterConnection) void {
     var in = std.ArrayList(u8).empty;
     defer in.deinit(conn.allocator);
@@ -1120,4 +1175,107 @@ test "real loopback catch-up: empty-log follower converges via per-peer nextInde
     const before = a_raft.next_index.get("node-b").?;
     try a_raft.tick();
     try testing.expectEqual(before, a_raft.next_index.get("node-b").?);
+}
+
+/// Frames the black-hole peer below actually read. A `ClusterServer` handler gets
+/// no user context (the signature is `fn (ClusterConnection) void`), so this is
+/// the same file-scope-channel trick `TransportImpl.bound` uses.
+var black_hole_frames = std.atomic.Value(u64).init(0);
+
+/// How long the black hole holds its half of the connection open after reading
+/// the request. It has to outlast the client's timeout by a wide margin, or the
+/// client's `recv` would come back on EOF instead of on the timeout and the test
+/// below would pass for the wrong reason.
+const black_hole_hold_ms = 2_000;
+
+/// Accept, read the frame, and **never answer**.
+///
+/// This is the failure a connect timeout cannot cover, and the one a half-open
+/// peer produces in production: the TCP handshake completes (so `connect`
+/// returns), the request is delivered (so the peer is not "unreachable"), and
+/// then nothing comes back. Without `SO_RCVTIMEO` the leader's synchronous reply
+/// read waits for the peer to close — which, for a peer that is up but wedged,
+/// is never.
+fn blackHoleHandler(conn: NetworkTransport.ClusterConnection) void {
+    var c = conn;
+    defer c.deinit();
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(c.allocator);
+    _ = c.recv(&buf) catch return;
+    _ = black_hole_frames.fetchAdd(1, .monotonic);
+    std.Io.sleep(c.io, std.Io.Duration.fromMilliseconds(black_hole_hold_ms), .awake) catch |err| {
+        std.log.debug("[raft test] black-hole hold interrupted ({s})", .{@errorName(err)});
+    };
+}
+
+// Verified red: setting `rpc_timeout_ms = 0` (the pre-fix behaviour — no bound)
+// makes this fail on exactly the elapsed-time assertion, `elapsed <
+// black_hole_hold_ms - 500`, because the call then waits for the peer's hold
+// instead of the configured timeout. That is the difference between a bound and
+// no bound, not a compile error.
+test "a peer that accepts and never replies costs rpc_timeout_ms, not the peer's patience" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    if (!@import("../../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    black_hole_frames.store(0, .monotonic);
+
+    // The client's bound, well under the peer's hold so "timeout fired" and "the
+    // peer closed" are distinguishable by elapsed time alone.
+    const timeout_ms: u32 = 200;
+
+    var server = NetworkTransport.ClusterServer.init(allocator, io, 19660);
+    var server_up = false;
+    defer if (server_up) server.stop();
+    const server_thread = try std.Thread.spawn(.{}, NetworkTransport.ClusterServer.start, .{ &server, blackHoleHandler });
+    server_up = true;
+    var spins: usize = 0;
+    while (!server.running.load(.monotonic) and spins < 2000) : (spins += 1) {
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    try testing.expect(server.running.load(.monotonic));
+
+    var impl: ElectionTransportImpl = undefined;
+    var raft: RaftElection = undefined;
+    // The order every caller uses, and the reason the transport reads the
+    // timeout out of the raft at send time instead of caching it in `init`:
+    // `raft` is `undefined` right here.
+    impl.init(allocator, io, &raft);
+    defer impl.deinit();
+    raft = try RaftElection.init(allocator, "node-a", &.{}, .{ .rpc_timeout_ms = timeout_ms }, &impl.transport());
+    defer raft.deinit();
+
+    const endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{server.port});
+    defer allocator.free(endpoint);
+
+    const started = Time.monotonicNowMilliseconds();
+    const resp = impl.sendAppendEntries("wedged", endpoint, .{
+        .term = 1,
+        .leader_id = "node-a",
+        .prev_log_index = 0,
+        .prev_log_term = 0,
+        .entries = &.{},
+        .leader_commit = 0,
+    });
+    const elapsed = Time.monotonicNowMilliseconds() - started;
+
+    // The answer is the contract's "lost message" — Raft re-sends, nothing else.
+    try testing.expectEqual(@as(u64, 0), resp.term);
+    try testing.expect(!resp.success);
+
+    // The peer really took delivery: this was a *reply* wait, not a dial that
+    // never completed. Without this the test would also pass against a peer that
+    // was simply not listening — i.e. against the case that was already safe.
+    try testing.expect(black_hole_frames.load(.monotonic) >= 1);
+
+    // Bounded by the configured timeout, and *reached* it: an early return would
+    // mean the peer closed (or the dial failed), neither of which is the state
+    // under test. The upper bound is the real assertion — the pre-fix behaviour
+    // waits for the peer's hold, which is `black_hole_hold_ms`.
+    try testing.expect(elapsed >= @as(i64, timeout_ms) - 50);
+    try testing.expect(elapsed < black_hole_hold_ms - 500);
+
+    server.stop();
+    server_thread.join();
+    server_up = false;
 }

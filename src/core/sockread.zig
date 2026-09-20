@@ -44,6 +44,28 @@ pub fn setSendTimeout(stream: std.Io.net.Stream, timeout_ms: u32) void {
     std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch |err| std.log.warn("[sockread] SO_SNDTIMEO not applied ({s}): a slow peer can block the writer indefinitely", .{@errorName(err)});
 }
 
+/// Bound how long a blocking read may wait for peer data.
+///
+/// The mirror of `setSendTimeout` on the reading side, and the one that matters
+/// for a *synchronous* RPC: a peer that accepts the connection and then never
+/// answers blocks the caller forever, where a peer that refuses to connect only
+/// costs the connect timeout. `SO_RCVTIMEO` bounds **each** blocking `read`, so
+/// a peer trickling one byte per timeout still holds the caller — the same
+/// per-call bound (and the same caveat) `setSendTimeout` documents.
+///
+/// A timed-out read comes back `EAGAIN`, which `readSome` folds into
+/// `error.ConnectionError`: callers already treat "the peer went away" and "the
+/// peer went quiet" as the same lost message, so this deliberately does not
+/// invent a third error for them to switch on. 0 disables the bound.
+pub fn setRecvTimeout(stream: std.Io.net.Stream, timeout_ms: u32) void {
+    if (timeout_ms == 0) return;
+    const tv = std.posix.timeval{
+        .sec = @intCast(timeout_ms / 1000),
+        .usec = @intCast((timeout_ms % 1000) * 1000),
+    };
+    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch |err| std.log.warn("[sockread] SO_RCVTIMEO not applied ({s}): a peer that accepts and never replies can block the reader indefinitely", .{@errorName(err)});
+}
+
 /// Write all of `bytes` (loops on partial writes so frames are never split).
 pub fn writeFull(stream: std.Io.net.Stream, bytes: []const u8) !void {
     var sent: usize = 0;

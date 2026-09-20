@@ -141,6 +141,29 @@ defer allocator.free(json);               // 挂到 /cluster/health 或 metrics 
   锁的窗口是入站那一帧的 **decode → dispatch → encode** 里那次 `handle*`（dispatch 本身即窗口）；
   decode/encode 只碰 arena 缓冲与 init 之后再不改的 `local_id`，而 **socket 读 / 回包 / 回推仍在锁外**
   （对端 connect 超时不该卡住 `tick()`）。不给 `.transport` 的节点没有 accept 线程，锁是零成本的一条取指。
+  **但这条原则在出站方向曾经是反的**，而且这里必须写清是哪一半修了、哪一半没有：
+
+  * `tick()` 的出站轮次（`sendHeartbeats` → `transport.sendAppendEntries`、`startElection` 的
+    `sendVoteRequest`）**整段在锁内**跑，而 `RaftLock` 是**自旋**锁 —— 一个不响应的对端不是"慢一轮"，
+    是让每个想碰状态的线程（accept 线程的入站 RPC、`appendEntry`、所有访问器）在
+    `spinLoopHint` 上**烧核**，时间为这一次 RPC 的等待时间。
+  * **已修的一半是回包等待**：`sockread.setRecvTimeout`（新，`SO_RCVTIMEO`，镜像已有的
+    `setSendTimeout`）由 `ElectionConfig.rpc_timeout_ms`（新，默认 100 ms）驱动，套在发送方的
+    连接上。它覆盖的正是生产里更常见的那种黑洞：**握手成功、然后永不回包**
+    （对端 GC 长停顿 / accept 队列打满 / 机器过载）。这种对端 connect 侧的界**本来就管不到**。
+    回归测试：`RaftTransport.zig` 的
+    `a peer that accepts and never replies costs rpc_timeout_ms, not the peer's patience`
+    —— 一个"收下请求、绝不回复、把连接按住 2 秒"的监听者，断言调用在
+    `rpc_timeout_ms` 内以"消息丢失"返回、**且真的到达过对端**（证明等的是回包而不是握手），
+    并把上界卡在 1500 ms（无界时会等到对方那 2 秒）。变异（`rpc_timeout_ms = 0`）验过红。
+  * **未修的一半是 dial**：`IpAddress.ConnectOptions` 声称有 `.timeout`，但 CI 锁定的 Zig 0.17 里
+    `std.Io.Threaded` 的 `netConnectIpPosix` 是
+    `if (options.timeout != .none) @panic("TODO implement netConnectIpPosix with timeout")`
+    —— **实测**，不是读来的。传进去等于让每次 dial 直接 abort 进程，所以 `dialTo` 没传。
+    SYN 被丢的对端仍然要付 OS 默认的 connect 超时。要补这一半得自己写带 deadline 的
+    非阻塞 connect + poll（平台相关），不是 endpoint 接线该放的东西。
+  * **锁范围本身仍未收窄**（见下面"出站 IO 与锁"一节的设计）：上面两条只是把代价**有界化**，
+    没有把 IO 挪出锁。
   不这么做的实际症状是**进程级 ABRT**（`voted_for` 的 read-then-free 交错 →
   `double free of [addr: …]`，两边都是 `RaftElection.zig` 的 `handleVoteRequest` / `startElection`），
   另一种交错顺序只是漏掉那一小段（`SafeAllocator` 报 leaked）—— 两种都在 12 次里各撞到过。
@@ -160,6 +183,57 @@ defer allocator.free(json);               // 挂到 /cluster/health 或 metrics 
   ABRT（`double free of [addr: …, len: 6]`，`alloc:` 在 `handleVoteRequest`、`first free:` 在
   `startElection`，3 次独立运行都红）；带锁构建 → 会合点由"窗口的持有者确实握着锁"这一**状态**直接解开
   （没有 sleep、没有超时、不撞概率，所以不引入新的 flaky）。
+  这条释放条件（`lock.isHeld()`）是**精确**判据，不是近似：能进这个窗口的只有 `tick`（持锁整段）
+  与 `handleVoteRequest`（同）两条路径，所以 free `voted_for` 的线程**必然正持着锁**，于是
+  `isHeld() == true ⟺ 观察者自己持锁 ⟺ 对方被挡在 acquire ⟺ 不可能重叠`。它依赖两个前提 ——
+  **测试里只有那两个驱动线程**、**mutator 是唯一的取锁者**（全文 15 个取锁入口：8 个 mutator +
+  7 个状态访问器）—— 这两条以前只是隐含的，别在测试里加第三个线程。
+- **阳性对照**：`RaftElection: the window rendezvous fires iff nothing serializes the entry`
+  （同文件末尾，紧随上一条）。上一条只证明"锁让它不响"，而健康构建里 `overlapped` 本来就**不可能**
+  为真（互斥性让两个线程进不了同一窗口），所以那句断言在锁正确时接近同义反复 —— 这条测试的牙齿
+  主要是"删掉锁 → ABRT"，那是手工实验。阳性对照把这件事钉进仓库：两个线程直接驱动 `WindowGate`，
+  两半**只差一件事**（入口取不取锁）。第一半 `lock = null`，第一个线程没有可退出的条件，
+  **必然**等到第二个（`overlapped` 为真是确定性的）；第二半各自持锁进门，`overlapped` 保持 false
+  且**有理由**（第一半改成串行化即变红 —— 验过的红）。
+
+### 出站 IO 与锁 —— 设计已定，**尚未落地**
+
+`tick()` 的出站轮次在锁内跑（见上）。把它收窄到"算法状态转移在锁内、IO 在锁外"是本文件写下这条
+原则时就该有的一半，设计已经定死，但**没有实现** —— 这里写的是契约与三条义务，不是"已完成"。
+
+**形状**：`tick()` 拆三段。
+
+```
+第一段（持锁）：判定 + 把这一轮要发的东西**做成自足的请求**放进本节点的暂存
+第二段（不持锁）：做 IO，收响应
+第三段（持锁）：应用响应，带校验
+```
+
+**三条义务**（缺一条都会引入比它修掉的那个更糟的 bug）：
+
+1. **第二段的请求必须自足。** `AppendEntriesRequest.entries` 借的是 `self.log`，而
+   `LogEntry.command` 是堆内存、**由 `truncateLog` 释放**（`RaftElection.zig` 的 `truncateLog`）。
+   锁一放，入站的 `handleAppendEntries` 就可能截断日志、把那批字节还给分配器 —— 于是传输层
+   在读一段已释放的内存。这正是当初加锁要禁的那类交错。所以第一段必须把 entries（含 command 字节）
+   **拷进本节点自己的暂存**，且该暂存**稳态不分配**（`clearRetainingCapacity` 复用；心跳轮
+   entries 为空，零拷贝 —— 出账只在追日志那条路上，且拷的就是本来要序列化出去的字节）。
+2. **第三段必须校验响应是不是这一轮的。** 两段之间另一个线程可能已经：把 `current_term` 抬上去
+   （入站更高任期）、把我们降成 follower、或者让我们重新当选。所以第一段要记下
+   `(state, current_term)`，第三段要求 `state == .leader and current_term == 等于建轮时的任期`，
+   否则**整批丢弃**，不做"尽力而为地应用"。
+3. **`next_index` / `match_index` 在第三段读，不跨段携带。** 有义务 2 的守卫时它们不可能变
+   （单驱动线程 + 任期未变），但"在第三段读"是把这件事变成**构造上证成**，而不是靠论证。
+
+**顺带必须一起改的**：`becomeLeader` 现在直接 `sendHeartbeats()`（真发），而它从 `startElection`
+（`tick` 第一段内）和 `handleVoteResponse`（入站路径、同样持锁）两处被调到。所以它要改成**只登记
+"欠一次心跳"**，由 `flushOutgoing()` 这个新入口来做"取锁→快照→放锁→发→取锁→应用"，`tick()` 与
+`handleVoteResponse` 各自在放锁之后调它。这样入站路径不必改 `RaftTransport` 的 dispatch。
+
+**护栏**：上面那条阳性对照（`the window rendezvous fires iff nothing serializes the entry`）只管
+"窗口有没有被串行化"，**管不到义务 1 和 2** —— 现有测试用的传输层全是立即返回的假实现，
+撞不出"锁放开期间日志被截断"和"响应过期"。所以落地时必须**另配两条红测试**：一条让
+`sendAppendEntries` 阻塞住、另一个线程同时截断日志，断言发出去的请求仍读到有效字节；
+一条让响应在"任期已变"之后才回，断言它被丢弃而不是写进 `next_index`。没有这两条就不要动这段代码。
 
 ## Production Deployment Checklist
 

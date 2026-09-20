@@ -19,6 +19,12 @@
 //! 1c. **Supervision (v0.17 Actor)** — `FaultyReporter` errors on every message with a
 //!    3-error budget: the runtime stops it and closes its mailbox, instead of logging
 //!    forever. That is the difference between `spawn` and `spawnActor`.
+//! 1d. **Supervision groups (v0.31, `docs/RUNTIME.md` §14)** — the *same* actor, spawned
+//!    into a `one_for_one` group with a two-rebuild budget. Now a failure is not terminal:
+//!    the group rebuilds it in place (`deinit` + `init` on its own thread, same handle,
+//!    same mailbox) until the budget is spent, and only then stops it. `[v0.31] … rebuilds=N`
+//!    is what says the rebuild really happened — `stopped_by_supervisor` reads false for a
+//!    member that came back.
 //! 2. **Bounded backpressure** — the feed pushes faster than the book drains and
 //!    gets `error.Full`; it *coalesces* (drops the delta, keeps the last price)
 //!    rather than growing a queue. `stats().dropped_full` records the choice.
@@ -191,6 +197,9 @@ pub const Pipeline = struct {
     var book: ?*runtime.Handle(OrderBook, 256) = null;
     var audit: ?*runtime.Handle(Audit, 64) = null;
     var faulty: ?*runtime.Handle(FaultyReporter, 32) = null;
+    /// §14: the same actor, but in a **supervision group** — so "3 errors and
+    /// stop" becomes "rebuild, rebuild, and only then stop".
+    var grouped: ?*runtime.Handle(FaultyReporter, 32) = null;
     var bus: runtime.HotBus(Delta, 4) = undefined;
     var metrics: MetricsSink = .{};
 
@@ -220,6 +229,25 @@ pub const Pipeline = struct {
         // "log forever" — the difference between spawnActor and spawn.
         faulty = try rt.spawnActor(FaultyReporter, .{}, 32, .{ .max_errors = 3, .window_ms = 60_000 });
         for (0..10) |_| faulty.?.send(.{ .price = 1, .qty = 1, .bid = true }) catch break;
+
+        // Supervised *group* (v0.31, docs/RUNTIME.md §14): the same actor, but
+        // one that fails is no longer terminal. `max_errors = 1` per window means
+        // two messages take its own budget over, and the group then rebuilds it
+        // in place — `deinit` + `init` on its own thread, same handle, same
+        // mailbox, so the `for` loop below keeps sending into the same portal.
+        // Two rebuilds are affordable; the third failure is not, and with no
+        // parent to escalate to the group takes it down for good.
+        //
+        // The other three policies are one word away: `.one_for_all` rebuilds
+        // every member, `.rest_for_one` the ones spawned after it, and
+        // `.stop_group` declares "these are only useful together".
+        const reporter_group = try rt.spawnGroupWith(.one_for_one, .{ .max_restarts = 2, .window_ms = 60_000 });
+        grouped = try rt.spawnActor(FaultyReporter, .{}, 32, .{
+            .max_errors = 1,
+            .window_ms = 60_000,
+            .group = reporter_group,
+        });
+        for (0..8) |_| grouped.?.send(.{ .price = 1, .qty = 1, .bid = true }) catch break;
 
         // The book needs the risk handle, so it is spawned with a placeholder
         // and wired in `init` — hence the two-step (a real app would pass a
@@ -258,6 +286,7 @@ pub fn main(init: std.process.Init) !void {
     const book = Pipeline.book.?;
     const audit = Pipeline.audit.?;
     const faulty = Pipeline.faulty.?;
+    const grouped = Pipeline.grouped.?;
     const bus = &Pipeline.bus;
     const metrics = &Pipeline.metrics;
 
@@ -298,6 +327,22 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("[v0.17] supervised actor: attempts={d} stopped_by_supervisor={} mailbox_closed={}", .{
         faulty.state.attempts, faulty.stats().stopped_by_supervisor, faulty.mailbox.isClosed(),
     });
+    // The §14 half. `group_restarts` is the number that could not exist before a
+    // group did: a rebuilt member was never stopped, so `stopped_by_supervisor`
+    // reads false while `attempts` jumped past the budget that stopped the
+    // ungrouped one above (same actor, same `max_errors` shape).
+    spins = 0;
+    while (rt.stats().supervised_stops == 0 and spins < 200_000_000) : (spins += 1) std.atomic.spinLoopHint();
+    const grouped_stats = grouped.stats();
+    std.log.info("[v0.31] supervision group: attempts={d} rebuilds={d} supervised_stops={d} stopped={} mailbox_closed={}", .{
+        grouped.state.attempts,              grouped_stats.group_restarts, rt.stats().supervised_stops,
+        grouped_stats.stopped_by_supervisor, grouped.mailbox.isClosed(),
+    });
+    // Exit code is the conclusion, as below: a group that never rebuilt anything
+    // is a supervision tree that reads as configured and behaves as absent.
+    if (grouped_stats.group_restarts != 2) return error.GroupNeverRebuilt;
+    if (!grouped_stats.stopped_by_supervisor) return error.GroupBudgetNeverExhausted;
+    if (rt.stats().supervised_stops == 0) return error.SupervisedStopNotCounted;
 
     const s = rt.stats();
     std.log.info("[stats] workers={d} sent={d} received={d} dropped={d} handler_errors={d} timer_fires={d} timer_lag_max_ms={d}", .{

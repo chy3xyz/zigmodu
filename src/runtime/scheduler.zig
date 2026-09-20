@@ -17,6 +17,17 @@
 //! guarantees §12.3's state exclusivity: with a dedicated thread it is thread
 //! identity; here it is an exclusive declaration (`claimed`).
 //!
+//! ## One protocol, one or two pools (docs/RUNTIME.md §6)
+//!
+//! This type is the whole pool: ring, threads, admission bound, protocol. A
+//! runtime that declares a *blocking* pool (`SchedulerConfig.blocking_threads`)
+//! builds a **second instance** of it rather than widening this one — a
+//! `handle` that blocks on a DB round trip holds the pool thread it was given,
+//! and the only way to guarantee it cannot hold the one a `.cpu` worker needs is
+//! for the two to share nothing. Each instance keeps every invariant below
+//! unchanged (per-worker claim, one token per worker, infallible push), because
+//! each is sized and admitted from its own declared bound.
+//!
 //! ## The two bits, and why there are two
 //!
 //! | bit | means |
@@ -99,10 +110,20 @@ const clock_mod = @import("clock.zig");
 
 /// How many pooled workers a runtime declares, and how much work one claim may
 /// run before the worker goes back into the ready ring.
+///
+/// **Two pools, one protocol.** A runtime may declare a *blocking* pool as well
+/// (docs/RUNTIME.md §6): a `.blocking` worker runs on a second `Scheduler` built
+/// from `blocking_threads` / `max_blocking_workers`, with its own ready ring,
+/// its own threads and its own admission bound. Nothing about the protocol
+/// changes — the two rings share no state — which is exactly what makes "a
+/// blocked blocking worker cannot occupy a CPU-pool thread" a structural fact
+/// rather than a hope. Left undeclared (`blocking_threads = 0`) there is only the
+/// pool that existed before the class was introduced, and `.blocking` is a
+/// configuration error at `spawn`.
 pub const SchedulerConfig = struct {
-    /// Upper bound on `.pooled` workers this runtime will spawn. `0` = no pool:
-    /// the runtime starts no pool thread, and `.mode = .pooled` is a
-    /// configuration error at `spawn`.
+    /// Upper bound on `.pooled` workers of the **`.cpu`** class this runtime will
+    /// spawn. `0` = no pool: the runtime starts no pool thread, and
+    /// `.mode = .pooled` is a configuration error at `spawn`.
     max_pooled_workers: usize = 0,
     /// How many threads consume the ready ring (docs/RUNTIME.md §12.12). It is
     /// also the number of ring slots that can be *held by a consumer inside
@@ -116,6 +137,25 @@ pub const SchedulerConfig = struct {
     /// (one slow handler starves every other ready worker). 16 is a first
     /// measurement, not a conclusion — see docs/RUNTIME.md §12.9.
     batch: usize = default_batch,
+    /// How many threads run workers declared `.execution_class = .blocking`, i.e.
+    /// whether this runtime has a blocking pool at all (docs/RUNTIME.md §6).
+    /// `0` (the default) = none, and `.blocking` is then refused at `spawn`
+    /// (`error.BlockingPoolNotConfigured`) instead of quietly sharing the pool a
+    /// handler that blocks would hold down — the same discipline D2 applies to
+    /// `.pooled` without a declared pool.
+    blocking_threads: usize = 0,
+    /// Upper bound on `.blocking` workers, the way `max_pooled_workers` bounds the
+    /// `.cpu` class: the blocking pool's ring is sized from it and the (N+1)-th
+    /// `.blocking` spawn is refused (`error.PoolCapacityExceeded`).
+    ///
+    /// `0` = "the same number as `max_pooled_workers`", so a runtime that declares
+    /// one bound gets two pools of that declared size. The two bounds are
+    /// separate admissions, not a split of one: `max_pooled_workers` no longer
+    /// describes the blocking class once a blocking pool is declared, and the
+    /// runtime's total is bounded by the sum. Declaring the second bound — and
+    /// stating the rule here — is the alternative to silently widening a limit
+    /// someone already relies on.
+    max_blocking_workers: usize = 0,
 };
 
 pub const default_batch: usize = 16;
@@ -285,6 +325,12 @@ const ReadyRing = struct {
 
 /// The pool. Owned by `Runtime`, created when the pool is declared, and it
 /// starts no thread until a pooled worker is actually spawned.
+///
+/// A runtime owns one of these per execution class it declares: `Runtime.scheduler`
+/// for `.cpu`, `Runtime.blocking_scheduler` for `.blocking` (docs/RUNTIME.md §6).
+/// A worker is admitted by exactly one of them, and its `pool` link points at that
+/// one — so `announce`, the hand-back re-check and `join` all stay in the pool
+/// that owns it, with no class anywhere in the protocol.
 pub const Scheduler = struct {
     const Self = @This();
 

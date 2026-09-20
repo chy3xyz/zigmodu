@@ -67,6 +67,28 @@ pub const ElectionConfig = struct {
     /// Maximum entries to send in one AppendEntries RPC. A lagging follower is
     /// fed its backlog in chunks of this size; values below 1 are read as 1.
     max_append_entries: usize = 100,
+
+    /// How long an outbound Raft RPC may take before it is written off as a lost
+    /// message (which Raft re-sends — see `RaftTransport`: every failure mode is
+    /// the same "lost message" answer, never a panic).
+    ///
+    /// This is a **liveness bound, not a tuning knob**, and the reason is the
+    /// shape of the driver: `tick()` performs its outbound round while holding
+    /// `RaftLock`, which is a *spin* lock, so a peer that never answers does not
+    /// merely delay the round — it has every other thread that wants the state
+    /// (the accept thread's inbound RPCs, `appendEntry`, the accessors) burning a
+    /// core on `spinLoopHint` for as long as the RPC waits. Before this field
+    /// existed the wait was the OS default: a black-holed peer (SYN dropped, or a
+    /// connection accepted and never answered) cost the node *minutes*.
+    ///
+    /// With it, the cost of an unreachable peer is this number **per peer per
+    /// round**. Keep it comfortably under `election_timeout_min_ms`: past that
+    /// point the round has already missed its own heartbeat, so a larger value
+    /// buys nothing but a longer stall. Raise it for a WAN whose RTTs approach
+    /// the default — a slow-but-reachable peer now gets its reply written off as
+    /// lost instead of being waited for. 0 disables the bound (the pre-fix
+    /// behaviour).
+    rpc_timeout_ms: u32 = 100,
 };
 
 /// Raft server state
@@ -2052,4 +2074,83 @@ test "RaftElection: a tick and an inbound RPC cannot both free voted_for" {
     // Neither driver appends a command, so any entry here would be a write the
     // other thread made out of the interleave.
     try testing.expectEqual(@as(usize, 0), raft.logLen());
+}
+
+// The positive control for the rendezvous above — the half that was missing.
+//
+// The test above shows the lock *prevents* an overlap. In a healthy build that
+// is nearly a tautology: mutual exclusion means the two windows cannot be
+// entered at once, so `overlapped` cannot become true, and the assertion can
+// only fail on a build where the lock is gone. What said the detector *would*
+// fire was a manual experiment — delete the lock, watch 6 of 12 seeds abort —
+// which lived nowhere in the repo, so nobody could tell whether the guard still
+// had teeth.
+//
+// Here the gate is driven directly, by two threads, and the two halves differ in
+// exactly one thing: whether the entry takes the lock. That difference *is* the
+// regression the test above guards, isolated down to the mechanism, with no
+// allocator, no raft and no sleep — and with no probability in it, because in
+// the first half the first thread has nothing left to break out on and therefore
+// *must* wait for the second.
+//
+// Verified red (the whole point of this test existing): giving the first half's
+// entry a release condition — a lock the test holds, with the gate pointed at it
+// — turns `expect(overlapped)` red. That is what says the assertion tells the two
+// states apart rather than holding no matter what. The second half is the
+// stability question, and it does not depend on how the two threads interleave:
+// the false-returning `swap` cannot leave the window before the true-returning
+// one arrives, so the outcome is one of two mirror images and nothing else.
+test "RaftElection: the window rendezvous fires iff nothing serializes the entry" {
+    // The gate watches one address, and entering the protocol means naming it.
+    const watched: usize = 0x1234;
+
+    const Drivers = struct {
+        /// No lock: the state of the world the test above is supposed to detect
+        /// (a mutator that no longer takes it).
+        fn enterFree(g: *WindowGate, ptr: usize) void {
+            g.enterWindow(@ptrFromInt(ptr));
+        }
+
+        /// The real structure: the entry *is* a locked body, so the second thread
+        /// is at `acquire` while the first is inside the window.
+        fn enterLocked(g: *WindowGate, ptr: usize, lock: *RaftLock) void {
+            lock.acquire();
+            defer lock.release();
+            g.enterWindow(@ptrFromInt(ptr));
+        }
+    };
+
+    // 1. Unserialized. The first thread sets `waiting` and then has no release
+    //    condition to find, so it spins until the second arrives and sets
+    //    `overlapped`. Certain, not likely: the wait cannot end any other way.
+    {
+        var gate = WindowGate{ .backing = std.testing.allocator };
+        gate.watched.store(watched, .release);
+        const a = try std.Thread.spawn(.{}, Drivers.enterFree, .{ &gate, watched });
+        const b = try std.Thread.spawn(.{}, Drivers.enterFree, .{ &gate, watched });
+        a.join();
+        b.join();
+        try std.testing.expect(gate.overlapped.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 2), gate.freed.load(.acquire));
+    }
+
+    // 2. Serialized — the same two threads, the same gate, only the entry takes a
+    //    lock. The first thread is *inside* that lock, so it leaves at once on
+    //    `isHeld()`; the second is stuck at `acquire` and cannot set `overlapped`.
+    //    The rendezvous reports nothing, which is the healthy reading the test
+    //    above asserts — here with a reason rather than by luck of interleaving.
+    {
+        var lock = RaftLock{};
+        var gate = WindowGate{ .backing = std.testing.allocator, .lock = &lock };
+        gate.watched.store(watched, .release);
+        const a = try std.Thread.spawn(.{}, Drivers.enterLocked, .{ &gate, watched, &lock });
+        const b = try std.Thread.spawn(.{}, Drivers.enterLocked, .{ &gate, watched, &lock });
+        a.join();
+        b.join();
+        try std.testing.expect(!gate.overlapped.load(.acquire));
+        // Both walked it: the silence above is "they were serialized", not "the
+        // protocol was never reached" — the same distinction the test above
+        // draws with its own `freed >= 1`.
+        try std.testing.expectEqual(@as(usize, 2), gate.freed.load(.acquire));
+    }
 }

@@ -176,7 +176,35 @@
 # (34 growth allocations / 14.75 MB against 15 / 10.06 MB for the hash map on a
 # 100k-timer wheel), while at a presized 100k keys it is 6% *faster* to insert
 # into than the old map was. That is the trade for the 9.4x above, so no entry
-# here moved: 6.808 ms against a 2.0x window still leaves ~1.8x of headroom.
+# here moved.
+#
+# **What this metric's headroom actually is** (the old note claimed "~1.8x of
+# headroom"; that was 2.0 / 1.06 of one run, arithmetic rather than a reading —
+# the gate only speaks on a breach, so it never reports a margin). Measured, two
+# independent sample sets on the same machine, medians of `[med3]`:
+#
+#   8 runs         6.94 -  8.79 ms   -> 1.02x - 1.29x of the 6.808 baseline
+#   12 runs        6.05 - 12.91 ms   -> 0.89x - 1.90x of the same baseline
+#   neighbours in those same runs: TimerWheel churn x1M 1.05x, atomic RMW 1.04x
+#
+# So the metric is roughly five times noisier than the ones beside it, one run in
+# the larger set came within 5% of the window, and the spread is structural: a
+# **fresh** wheel armed with `count` never-reused ids grows `nodes` (34 growth
+# allocations / 14.75 MB at 100k) and first-touches every page it lands on, so the
+# host's page path is in the numerator by construction. The steady state is what
+# `TimerWheel churn x1M` measures; this one is deliberately the cold shape.
+#
+#  A slow reading here is therefore a *candidate* regression: re-run before
+#  believing it, and check `TimerWheel churn x1M` — if churn is flat and only this
+#  one moved, it is the host's page path, not the wheel.
+#
+# **Do not "fix" it by moving this harness to `harness_allocator`.** That is the
+# right call for the other harnesses (see the `findById x20K` note above, where it
+# took the spread from 1.10-1.37x to 1.04x) precisely because their loops free
+# per iteration, so the blocks come back off the freelist and keep the pages warm.
+# This loop never frees — it arms and drops — so nothing returns to any freelist
+# and the swap only adds `smp_allocator`'s own slab metadata. Tried and measured:
+# 7.95-12.17 ms, run-to-run 1.53x, worst in-run 1.86x. It is worse on every axis.
 # Full table: `docs/BEST_PRACTICES.md`, the `[pct]` section's last two bullets.
 #
 # The CI file (`scripts/bench-baseline.ci.json`) does **not** carry that entry
@@ -297,6 +325,9 @@
 # `{name, unit: "ms", value}`, exactly as before — or normalized —
 # `{name, unit: "ratio", value, normalized_by: "atomic RMW x10M"}`, where `value`
 # is the metric divided by the reference, both as measured in the recording run.
+# `normalized_by` names the reference *that entry* was recorded against, which is
+# what makes a later change of reference detectable rather than silently compared
+# (see the list below).
 # A normalized entry with `value: null` means "this machine class has not recorded
 # a ratio yet": the gate WARNs and skips it, the same way it treats a metric no
 # baseline knows. `--update` writes whichever shape each metric's criterion calls
@@ -361,7 +392,68 @@ THRESHOLD="${BENCH_THRESHOLD:-2.0}"
 # That imperfection is still the right trade for a 2.0x window: the ratios stay 26%
 # apart where the absolute values were 2.15x apart, and 2.15x is what failed a commit
 # that could not reach this code.
+#
+# ── One reference per metric ──
+#
+# An entry may name its own reference as `<metric>=<reference>`; a bare name keeps
+# the default (`REF_METRIC`). The reason is the ring: a locked RMW and a store→load
+# forwarding chain are different host properties, and a single reference cannot
+# cancel both — the same commit's ring ratio is 0.0524 on the EPYC runners and
+# 0.4976 on the aarch64 laptop that recorded `scripts/bench-baseline.json`, a 9.5x
+# gap in the *ratio*, which is the one thing a ratio is supposed to remove.
+#
+# `StoreForward x10M` (`src/benchmark.zig`) is the closer denominator for that
+# metric and nothing else: the ring's turn with the index arithmetic, the mask, the
+# fullness branch and the slot array removed, leaving two release stores and two
+# acquire loads per round on one cache line in one thread. **It is deliberately not
+# wired up here.** Whether it cancels the host better than the atomic does is a
+# claim about spread across host generations, and the evidence for the one in use
+# (26% on the ratio against 2.15x absolute, from EPYC-vs-Xeon CI logs) cannot be
+# beaten from a single machine. This round delivered the mechanism and the
+# candidate, both recorded and printed; the decision is one edit in the array below
+# (`"RingBuffer SPSC x1M=StoreForward x10M"`) plus `--update` on a machine of each
+# class. The gate will not compare across a reference change silently: a baseline
+# entry recorded against a different reference than the list names is reported as
+# `retargeted` and skipped, not compared.
+#
+# A reference is a host measurement, not a framework metric, so a metric named as
+# one — the default and any reference the list names — is reported but never gated
+# on the absolute criterion, even when every run has to be re-recorded for the
+# candidate above to be usable. A gate that fires on the host's own memory path is
+# the failure this whole criterion exists to remove. The candidate has to be named
+# here explicitly to get that treatment while nothing divides by it yet: otherwise
+# its recorded millisecond value would be a *second* absolute gate that fires when
+# the host generation changes, which is precisely the failure the reference
+# criterion exists to remove.
+#
+# What was measured on the machine that recorded the local baseline (Apple M1 Pro,
+# 11 runs of the suite, 2026-09-20). This is the evidence that the mechanism works,
+# **not** evidence that the candidate is the better denominator: the ring's ratio to
+# the atomic came back 0.4771-0.5086 (median 0.4949, 6.6% spread) and its ratio to
+# `StoreForward x10M` 0.0866-0.0903 (median 0.0882, 4.3%). Both are stable run to
+# run, and the candidate's is the tighter of the two *on this host* — all a single
+# host can show. The open question is the one these numbers cannot answer: does the
+# candidate's ratio move less than the 26% the atomic's ratio moved between EPYC and
+# Xeon 8370C? That needs runs from at least two host classes. Until then the ring
+# keeps its atomic denominator, and `StoreForward x10M` is a recorded, printed,
+# ungated number — no entry in either baseline file divides by it.
 REF_METRIC="atomic RMW x10M"
+# Metrics whose absolute value is a **host** property, so they are recorded and
+# printed but never gated. The two hand-off rows are here for a measured reason
+# rather than a stylistic one: eight runs of the suite on this machine gave
+# `Worker drain dedicated x1M` 122.9-226.2 ms (1.84x) and `Pooled dispatch x1M`
+# 214.4-661.6 ms (3.09x), against 1.26x for `Mailbox post+drain x1M` in the same
+# runs. A 2.0x window on a number that swings 3x within one machine is a
+# false-red machine — one run in eight already breached it against its own low
+# sample. What the pair is *for* is the boundary (`docs/RUNTIME.md` §12.5):
+# pooled costs ~2x a dedicated hand-off (ratio 1.57-2.93 over those runs), which
+# is why the critical path stays dedicated and the long tail pools.
+REF_METRICS=(
+  "$REF_METRIC"
+  "StoreForward x10M"
+  "Worker drain dedicated x1M"
+  "Pooled dispatch x1M"
+)
 NORMALIZED_METRICS=(
   "Mailbox post+drain x1M"
   "Mailbox full-path x10M"
@@ -371,6 +463,7 @@ NORMALIZED_METRICS=(
   "RingBuffer SPSC x1M"
 )
 export BENCH_REF_METRIC="$REF_METRIC"
+export BENCH_REF_METRICS="$(IFS=';'; printf '%s' "${REF_METRICS[*]}")"
 export BENCH_NORMALIZED_METRICS="$(IFS=';'; printf '%s' "${NORMALIZED_METRICS[*]}")"
 export BENCH_MACHINE=""
 
@@ -426,7 +519,7 @@ echo "machine: $BENCH_MACHINE  |  $(uname -srm)"
 if [ "$REGION" = "?" ]; then
   echo "         region unavailable (no BENCH_REGION, no Azure IMDS answer) — diagnostic only, not a failure"
 fi
-echo "criterion: absolute ms for every metric except ${#NORMALIZED_METRICS[@]} atomic-path metric(s), which are a ratio to '$REF_METRIC' (same run, both medians of 3)"
+echo "criterion: absolute ms for every metric except ${#NORMALIZED_METRICS[@]} normalized metric(s), a ratio to a reference measured in the same run (both medians of 3; default '$REF_METRIC'). References are reported, never gated: ${REF_METRICS[*]}"
 echo
 
 echo "building benchmark (ReleaseFast)..."
@@ -470,22 +563,45 @@ import json, os, sys
 
 force = sys.argv[1] == "1"
 results_path, base_path, threshold = sys.argv[2], sys.argv[3], float(sys.argv[4])
-ref_name = os.environ["BENCH_REF_METRIC"]
-normalized = [n for n in os.environ["BENCH_NORMALIZED_METRICS"].split(";") if n]
+ref_default = os.environ["BENCH_REF_METRIC"]
+
+# The gating list, as `metric -> reference`: `metric=reference` names its own, a
+# bare `metric` takes the default. The dict keeps the list's order, so the
+# reports below are deterministic.
+normalized = {}
+for item in os.environ["BENCH_NORMALIZED_METRICS"].split(";"):
+    if not item:
+        continue
+    metric, sep, ref = item.partition("=")
+    normalized[metric] = ref if sep else ref_default
 
 cur = json.load(open(results_path))
 old = {m["name"]: m for m in json.load(open(base_path))} if os.path.exists(base_path) else {}
 values = {m["name"]: m["value"] for m in cur}
 
-# The reference value this recording run divides by. Without it a normalized
-# metric cannot be expressed as a ratio, and writing milliseconds into a ratio
-# entry would compare 0.77 against 16.9 ms and pass everything — so its entry is
-# left alone instead.
-ref = values.get(ref_name)
-if ref is not None and ref <= 0:
-    ref = None
-if normalized and ref is None:
-    print(f"WARN: this run produced no usable '{ref_name}' — the ratio baselines are left as they are", file=sys.stderr)
+
+def reference_for(metric):
+    """(name, value) of the reference `metric` is divided by; value is None when
+    this recording run produced no usable one.
+
+    Without a value the metric cannot be expressed as a ratio, and writing
+    milliseconds into a ratio entry would compare 0.77 against 16.9 ms and pass
+    everything — so that entry is left as it is instead."""
+    name = normalized[metric]
+    value = values.get(name)
+    if value is None or value <= 0:
+        return name, None
+    return name, value
+
+
+# One WARN per reference this run could not supply, not one per metric on it.
+missing_refs = []
+for metric in normalized:
+    name, value = reference_for(metric)
+    if value is None and name not in missing_refs:
+        missing_refs.append(name)
+for name in missing_refs:
+    print(f"WARN: this run produced no usable '{name}' — the ratio baselines dividing by it are left as they are", file=sys.stderr)
 
 
 def recorded_ratio(entry):
@@ -497,6 +613,7 @@ def recorded_ratio(entry):
 
 loosened = []
 converted = []
+retargeted = []
 out = []
 for m in cur:
     name, value = m["name"], m["value"]
@@ -506,9 +623,10 @@ for m in cur:
         out.append({"name": name, "unit": m.get("unit", "ms"), "value": value})
         was = prev["value"] if prev is not None and prev.get("normalized_by") is None else None
         if was is not None and was > 0 and value > was * threshold:
-            loosened.append((name, was, value, None))
+            loosened.append((name, was, value, None, None))
         continue
 
+    ref_name, ref = reference_for(name)
     if ref is None:
         # Keep the recorded ratio (or record the entry as still pending) rather
         # than downgrading a ratio entry to milliseconds.
@@ -519,13 +637,21 @@ for m in cur:
     out.append({"name": name, "unit": "ratio", "value": ratio, "normalized_by": ref_name})
     if prev is not None and prev.get("normalized_by") is None:
         converted.append(name)
+    if prev is not None and prev.get("normalized_by") not in (None, ref_name):
+        # A ratio to a different reference is a different unit, so the ratchet has
+        # nothing to compare against: this is a re-record, not a slowdown. The new
+        # ratio is written above (that is what `--update` is for) and named here for
+        # review; the check pass reports the same disagreement as `retargeted` and
+        # skips it rather than comparing two ratios against different denominators.
+        retargeted.append(f"{name} ('{prev['normalized_by']}' → '{ref_name}')")
+        continue
     was = recorded_ratio(prev)
     if was is not None and ratio > was * threshold:
-        loosened.append((name, was, ratio, ref))
+        loosened.append((name, was, ratio, ref, ref_name))
 
 if loosened and not force:
     print(f"FAIL: --update would record {len(loosened)} metric(s) more than {threshold}x slower:", file=sys.stderr)
-    for name, was, actual, divisor in loosened:
+    for name, was, actual, divisor, ref_name in loosened:
         if divisor is None:
             print(f"  {name}: baseline {was:.3f} ms → actual {actual:.3f} ms (+{(actual / was - 1) * 100:.1f}%)", file=sys.stderr)
         else:
@@ -543,17 +669,25 @@ with open(base_path, "w") as fh:
 
 print(f"baseline updated: {len(old)} -> {len(out)} metric(s) (+{len(added)} / -{len(dropped)})")
 print("  absolute entries are the median of 3 samples per metric (see src/benchmark.zig median3)")
-print(f"  {len(normalized)} entry/entries recorded as a ratio to '{ref_name}' (`normalized_by`), value = metric ÷ reference, both medians of this run")
+if normalized:
+    print("  ratio entries hold `value` = this run's metric ÷ its reference, both medians of this run:")
+    by_ref = {}
+    for metric, ref in normalized.items():
+        by_ref.setdefault(ref, []).append(metric)
+    for ref, metrics in by_ref.items():
+        print(f"    '{ref}'  <- {', '.join(metrics)}")
 if added:
     print(f"  new: {', '.join(added)}")
 if dropped:
     print(f"  pruned: {', '.join(dropped)}")
 if converted:
     print(f"  converted from absolute ms to a ratio (review these): {', '.join(converted)}")
+if retargeted:
+    print(f"  recorded against a new reference — the old ratio was in different units, so the ratchet could not compare it (review these): {', '.join(retargeted)}")
 if pending:
     print(f"  still pending — no ratio recorded, the gate WARNs and skips them: {', '.join(pending)}")
 if loosened:
-    print(f"  recorded with --force: {', '.join(name for name, _, _, _ in loosened)}")
+    print(f"  recorded with --force: {', '.join(name for name, _, _, _, _ in loosened)}")
 EOF
   exit 0
 fi
@@ -563,9 +697,22 @@ import json, os, sys
 
 threshold = float(sys.argv[1])
 results_path, base_path, log_path = sys.argv[2], sys.argv[3], sys.argv[4]
-ref_name = os.environ["BENCH_REF_METRIC"]
-normalized = [n for n in os.environ["BENCH_NORMALIZED_METRICS"].split(";") if n]
+ref_default = os.environ["BENCH_REF_METRIC"]
 machine = os.environ.get("BENCH_MACHINE", "")
+
+# The gating list, as `metric -> reference`: `metric=reference` names its own, a
+# bare `metric` takes the default. The dict keeps the list's order.
+normalized = {}
+for item in os.environ["BENCH_NORMALIZED_METRICS"].split(";"):
+    if not item:
+        continue
+    metric, sep, ref = item.partition("=")
+    normalized[metric] = ref if sep else ref_default
+
+# Every metric named as a reference — the declared ones (the default divisor plus
+# any candidate nothing divides by yet), and any the list names: those are host
+# measurements, never framework metrics.
+ref_names = {n for n in os.environ["BENCH_REF_METRICS"].split(";") if n} | set(normalized.values())
 
 if not os.path.exists(base_path):
     print(f"FAIL: no baseline at {base_path} — create one with: scripts/check-bench.sh --update", file=sys.stderr)
@@ -575,11 +722,21 @@ cur = json.load(open(results_path))
 base = {m["name"]: m for m in json.load(open(base_path))}
 seen = set()
 
-# The reference for this run: every normalized metric is divided by the medians
-# this same run measured, which is what cancels the host generation.
-ref = {m["name"]: m["value"] for m in cur}.get(ref_name)
-if ref is not None and ref <= 0:
-    ref = None
+# The reference values for this run: every normalized metric is divided by the
+# median this same run measured *of its own reference*, which is what cancels the
+# host generation.
+values = {m["name"]: m["value"] for m in cur}
+
+
+def reference_for(metric):
+    """(name, value) of the reference `metric` is divided by; value None when this
+    run has no usable one."""
+    name = normalized[metric]
+    value = values.get(name)
+    if value is None or value <= 0:
+        return name, None
+    return name, value
+
 
 # The suite's `[med3] <name>: min / median / max` lines, so a breach can show the
 # three samples behind the median it compared. Missing log (deleted temp dir,
@@ -595,7 +752,7 @@ if os.path.exists(log_path):
             if rest:
                 samples[head] = rest
 
-slower, unmeasurable, pending, mismatch, host_notes = [], [], [], [], []
+slower, unmeasurable, pending, mismatch, host_notes, retargeted = [], [], [], [], [], []
 ratio_detail = []
 new_metrics = [m["name"] for m in cur if m["name"] not in base]
 for m in cur:
@@ -617,27 +774,43 @@ for m in cur:
                          f", the gating list says {'ratio' if gate_is_ratio else 'absolute milliseconds'}")
         continue
 
-    if name == ref_name:
-        # The reference is the host, not the framework. Gating it on an absolute
+    # Two ratios recorded against different denominators are different units, and
+    # comparing them would pass (or fail) on arithmetic that means nothing. The
+    # check for that lives inside the ratio branch below, after the reference
+    # lookup: a *missing* reference is the more specific diagnosis (a name this run
+    # did not measure at all) and has to be said first, so that nobody reads
+    # "--update" as the fix for a reference name that does not exist.
+    if name in ref_names:
+        # A reference is the host, not the framework. Gating it on an absolute
         # value would fire on exactly the host generation change this criterion
         # exists to cancel, so it is reported and stays out of the verdict (see
         # the header): a breach here says "this runner is a different generation",
         # which is the context for everything above it, not a regression.
+        users = [n for n in normalized if normalized[n] == name]
+        divides = (f"{len(users)} normalized metric(s) divide by it" if users
+                   else "no metric in the list divides by it yet (candidate reference)")
         if was is None:
             pending.append(f"{name} (absolute ms — reported, never gated)")
         elif was > 0 and (actual > was * threshold or actual < was / threshold):
-            host_notes.append(f"{name}: baseline {was:.3f} ms → actual {actual:.3f} ms ({actual / was:.2f}x) — this is the host's atomic path, not a framework metric; the ratio criterion cancels it, and it is reported rather than gated")
+            host_notes.append(f"{name}: baseline {was:.3f} ms → actual {actual:.3f} ms ({actual / was:.2f}x) — this is the host's memory path, not a framework metric; {divides}, and it is reported rather than gated")
         continue
 
     if gate_is_ratio:
+        ref_name, ref = reference_for(name)
         if ref is None:
             unmeasurable.append(f"{name} (no '{ref_name}' in this run to divide by)")
+            continue
+        if entry.get("normalized_by") != ref_name:
+            # The recording says which reference it divided by, so a later change of
+            # reference is visible: reported and skipped, not compared. Re-record it
+            # with `--update` on this machine class after changing the list.
+            retargeted.append(f"{name} — baseline is a ratio to '{entry.get('normalized_by')}', the gating list says '{ref_name}'")
             continue
         if was is None:
             pending.append(f"{name} (ratio to '{ref_name}')")
             continue
         ratio = actual / ref
-        ratio_detail.append((name, ratio, was, actual))
+        ratio_detail.append((name, ratio, was, actual, ref_name, ref))
         if ratio > was * threshold:
             slower.append((name, "ratio",
                            f"baseline ratio {was:.4f} → actual {ratio:.4f} "
@@ -656,16 +829,15 @@ for m in cur:
 
 gone = [n for n in base if n not in seen]
 gated_ratio = [m["name"] for m in cur if m["name"] in normalized]
-ref_txt = f"{ref:.3f} ms" if ref is not None else "NOT MEASURED this run"
 
 print(f"machine:  {machine}")
-print(f"criterion: {len(cur) - len(gated_ratio)} metric(s) absolute (median ms) + {len(gated_ratio)} normalized (metric ÷ '{ref_name}', this run: {ref_txt}, threshold {threshold}x on both)")
+print(f"criterion: {len(cur) - len(gated_ratio)} metric(s) absolute (median ms) + {len(gated_ratio)} normalized (each metric ÷ its own reference, both medians of this run), threshold {threshold}x on both")
 
 if ratio_detail:
-    print(f"normalized ({ref_name} = {ref_txt} — the two ratios the gate compares):")
-    for name, ratio, was, actual in ratio_detail:
+    print("normalized — the two ratios the gate compares (metric ÷ its reference, same run):")
+    for name, ratio, was, actual, ref_name, ref in ratio_detail:
         compared = f"baseline ratio {was:.4f}, {ratio / was:.2f}x" if was is not None else "no baseline ratio to compare"
-        print(f"  {name:<28s} {actual:>9.3f} ms / {ref:>8.3f} ms = {ratio:.4f}  ({compared})")
+        print(f"  {name:<28s} {actual:>9.3f} ms / {ref_name} {ref:>8.3f} ms = {ratio:.4f}  ({compared})")
 
 if slower:
     print(f"FAIL: {len(slower)} metric(s) slower than the baseline by more than {threshold}x (lower is better):")
@@ -674,7 +846,7 @@ if slower:
         if name in samples:
             print(f"      samples: {samples[name]}")
     print("  [absolute] compares milliseconds; [ratio] compares the metric divided by")
-    print(f"  this run's '{ref_name}' against the ratio the baseline recorded, so the host")
+    print("  this run's own reference against the ratio the baseline recorded, so the host")
     print("  cancels out but extra work in the metric does not (an added allocation, lock")
     print("  or atomic raises the ratio). Both compared values are medians of 3; three")
     print("  slow samples are a regression, one outlier sample (see `samples:` above) is")
@@ -682,7 +854,7 @@ if slower:
     print("Fix the regression, or accept it explicitly with: scripts/check-bench.sh --update --force")
 
 if host_notes:
-    print(f"NOTE: the machine reference is more than {threshold}x away from its recorded value (host generation, not code):")
+    print(f"NOTE: a machine reference is more than {threshold}x away from its recorded value (host generation, not code):")
     for line in host_notes:
         print(f"      {line}")
 
@@ -701,6 +873,11 @@ if mismatch:
     print(f"WARN: {len(mismatch)} metric(s) whose baseline entry and gating list disagree — skipped, not compared:")
     for line in mismatch:
         print(f"      {line}")
+if retargeted:
+    print(f"WARN: {len(retargeted)} metric(s) recorded against a different reference than the gating list names — skipped, not compared:")
+    for line in retargeted:
+        print(f"      {line}")
+    print("      (a ratio to another reference is a different unit; re-record it with --update on this machine class)")
 if unmeasurable:
     print(f"WARN: no comparison possible for {', '.join(unmeasurable)} — skipped, nothing to compare against")
 

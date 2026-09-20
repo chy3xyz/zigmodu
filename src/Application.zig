@@ -107,6 +107,22 @@ pub const Application = struct {
         /// pool and no width keeps exactly the scheduling behaviour it had
         /// before. Ignored when `max_pooled_workers` is 0: no pool is created.
         pool_threads: usize = 1,
+        /// How many threads the **blocking** pool runs (docs/RUNTIME.md §12.13).
+        /// `0` — the default — means no blocking pool: `.execution_class =
+        /// .blocking` is refused at `spawn`, exactly as `.pooled` is without
+        /// `max_pooled_workers`, so an app that never asks for one starts no
+        /// thread for it.
+        ///
+        /// These threads wait on things outside the process (a DB round trip, a
+        /// blocking HTTP call), so size them to what the downstream resource
+        /// allows — a connection pool's size — and **not** to the core count: a
+        /// thread parked in `read` is not competing for a core.
+        blocking_threads: usize = 0,
+        /// Declared upper bound on `.execution_class = .blocking` workers. `0`
+        /// means "the same count as `max_pooled_workers`" (docs/RUNTIME.md
+        /// §12.13): the two bounds are independent admissions, so the app's total
+        /// worker bound is their sum, not one number split in two.
+        max_blocking_workers: usize = 0,
     };
 
     /// Initialize application with modules
@@ -136,6 +152,8 @@ pub const Application = struct {
                 .max_dependencies = options.max_dependencies,
                 .max_pooled_workers = options.max_pooled_workers,
                 .pool_threads = options.pool_threads,
+                .blocking_threads = options.blocking_threads,
+                .max_blocking_workers = options.max_blocking_workers,
             },
             .state = .initialized,
             .shutdown_hooks = std.ArrayList(*const fn () void).empty,
@@ -293,6 +311,8 @@ pub const Application = struct {
             .scheduler = .{
                 .max_pooled_workers = self.config.max_pooled_workers,
                 .pool_threads = self.config.pool_threads,
+                .blocking_threads = self.config.blocking_threads,
+                .max_blocking_workers = self.config.max_blocking_workers,
             },
         });
         errdefer rt.deinit();
@@ -393,9 +413,16 @@ pub const ApplicationBuilder = struct {
     /// (docs/RUNTIME.md §12.8 D2).
     max_pooled_workers: usize = 0,
     /// How many threads that pool runs (`Config.pool_threads`), handed to the same
-    /// runtime. `1` — the default — keeps the single-consumer scheduling shape
+    /// `1` — the default — keeps the single-consumer scheduling shape
     /// (docs/RUNTIME.md §12.12).
     pool_threads: usize = 1,
+    /// How many threads the blocking pool runs (`Config.blocking_threads`). `0` —
+    /// the default — means the app has no blocking pool, so `.execution_class =
+    /// .blocking` is refused at `spawn` (docs/RUNTIME.md §12.13).
+    blocking_threads: usize = 0,
+    /// Declared upper bound on blocking workers (`Config.max_blocking_workers`).
+    /// `0` means "the same count as `max_pooled_workers`".
+    max_blocking_workers: usize = 0,
 
     const PendingService = struct {
         name: []const u8,
@@ -465,6 +492,26 @@ pub const ApplicationBuilder = struct {
         return self;
     }
 
+    /// Declare the **blocking** pool and how many threads it runs
+    /// (docs/RUNTIME.md §12.13) — the resource that keeps a handler waiting on
+    /// something outside the process from occupying the CPU pool.
+    ///
+    /// Declaring it is what makes `.execution_class = .blocking` legal at `spawn`;
+    /// without it that class is refused, exactly as `.pooled` is without
+    /// `withMaxPooledWorkers`. Size `blocking_threads` to what the downstream
+    /// resource tolerates (a DB connection pool's size), not to the core count:
+    /// these threads wait rather than compute, so more of them is not more
+    /// throughput past that limit.
+    pub fn withBlockingThreads(
+        self: *ApplicationBuilder,
+        blocking_threads: usize,
+        max_blocking_workers: usize,
+    ) *ApplicationBuilder {
+        self.blocking_threads = blocking_threads;
+        self.max_blocking_workers = max_blocking_workers;
+        return self;
+    }
+
     pub fn withDocsPath(self: *ApplicationBuilder, path: []const u8) *ApplicationBuilder {
         self.docs_path = path;
         return self;
@@ -526,6 +573,8 @@ pub const ApplicationBuilder = struct {
                 .max_dependencies = self.max_dependencies,
                 .max_pooled_workers = self.max_pooled_workers,
                 .pool_threads = self.pool_threads,
+                .blocking_threads = self.blocking_threads,
+                .max_blocking_workers = self.max_blocking_workers,
             },
         );
         errdefer app.deinit();
@@ -1138,4 +1187,78 @@ test "e2e: in-flight counter tracks request lifecycle" {
 
     _ = counter.fetchSub(1, .monotonic);
     try std.testing.expectEqual(@as(u64, 0), counter.load(.monotonic));
+}
+
+/// One message, so the blocking pool has something that actually runs on it.
+const BlockingTailWorker = struct {
+    pub const Message = u32;
+    handled: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    pub fn handle(self: *@This(), _: u32, _: anytype) !void {
+        _ = self.handled.fetchAdd(1, .release);
+    }
+};
+
+test "Application: withBlockingThreads declares the blocking pool the runtime then offers" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var b = ApplicationBuilder.init(allocator, io);
+    defer b.deinit();
+    // A blocking width and its own upper bound. `max_blocking_workers = 0` would
+    // mean "same count as the CPU pool", so declaring a different number here is
+    // what proves the two bounds are carried independently rather than derived.
+    var app = try b.withName("blocking-app").withMaxPooledWorkers(4).withBlockingThreads(2, 7).build(.{});
+    defer app.deinit();
+    try app.start();
+
+    const rt = try app.runtime();
+    const bp = rt.blockingPoolStats() orelse return error.BlockingPoolNotDeclared;
+    // The declared bound, and **not** the running width: `pool_threads` is 0
+    // until a `.blocking` spawn materialises the threads (a declared pool starts
+    // none), which is the same laziness the CPU pool has.
+    try std.testing.expectEqual(@as(usize, 7), bp.max_pooled_workers);
+    // …and the CPU pool kept its own bound: two independent admissions, not one
+    // number split in two.
+    try std.testing.expectEqual(@as(usize, 4), rt.poolStats().?.max_pooled_workers);
+
+    // The user-visible outcome, and the thing the wiring gap actually cost:
+    // before `withBlockingThreads` existed, an app on the builder could declare
+    // `.execution_class = .blocking` and get `error.BlockingPoolNotConfigured`
+    // with no builder-level way out. So spawn one.
+    const h = try rt.spawn(BlockingTailWorker, .{}, .{
+        .capacity = 8,
+        .mode = .pooled,
+        .execution_class = .blocking,
+    });
+    try h.send(1);
+    var spins: usize = 0;
+    while (h.state.handled.load(.monotonic) != 1 and spins < 400_000_000) : (spins += 1) std.atomic.spinLoopHint();
+    try std.testing.expectEqual(@as(u64, 1), h.state.handled.load(.monotonic));
+    // The threads are up now, and the width that came through is the declared one.
+    try std.testing.expectEqual(@as(usize, 2), rt.blockingPoolStats().?.pool_threads);
+    try std.testing.expect(rt.blockingPoolStats().?.dispatches >= 1);
+    try std.testing.expectEqual(@as(u64, 0), rt.blockingPoolStats().?.ready_push_failures);
+
+    app.stop();
+}
+
+test "Application: no withBlockingThreads means no blocking pool at all" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var b = ApplicationBuilder.init(allocator, io);
+    defer b.deinit();
+    var app = try b.withName("no-blocking-app").build(.{});
+    defer app.deinit();
+    try app.start();
+
+    const rt = try app.runtime();
+    // The default has to be "nothing changes": no thread, no ring, and a
+    // `.blocking` spawn refused — the same shape `.pooled` has without a
+    // declaration (docs/RUNTIME.md §12.8 D2 / §12.13).
+    try std.testing.expect(rt.blockingPoolStats() == null);
+    try std.testing.expectEqual(@as(usize, 0), rt.stats().workers);
+
+    app.stop();
 }
