@@ -388,9 +388,10 @@ test "3-node cluster with RaftElection quorum and event routing" {
     try Testing.expectEqual(@as(usize, 1), e2.clusterSize());
     try Testing.expectEqual(@as(usize, 1), e2.quorumSize());
 
-    // Verify quorum: need 2 of 3 votes
-    try Testing.expect(e1.hasQuorum(2));
-    try Testing.expect(!e1.hasQuorum(1));
+    // Verify quorum: 2 of 3 votes, and the self-vote is one of them, so ONE peer
+    // grant is a majority (docs/dev/cluster-auth-design.md §12).
+    try Testing.expect(e1.hasQuorum(1));
+    try Testing.expect(!e1.hasQuorum(0));
 
     // Publishing fans out to the local topic subscribers of the publishing bus.
     const Counter = struct {

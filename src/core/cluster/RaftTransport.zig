@@ -1289,12 +1289,16 @@ test "real loopback election: tick sends real vote requests and the candidate wi
     try testing.expect(a_raft.isLeader());
     try testing.expectEqual(@as(u64, 1), a_raft.getTerm());
 
-    // Two of three nodes voted for node-a over the wire → quorum.
+    // Two of three nodes voted for node-a over the wire → quorum. `hasQuorum` takes
+    // **peer** grants and adds the candidate's own vote, so one peer grant is a
+    // majority of three (this assertion said `hasQuorum(2)` while the off-by-one was
+    // in place — docs/dev/cluster-auth-design.md §12).
     try testing.expect(waitForTerm(io, &b_raft, 1, 2000));
     try testing.expect(waitForTerm(io, &c_raft, 1, 2000));
     try testing.expectEqualStrings("node-a", b_raft.voted_for.?);
     try testing.expectEqualStrings("node-a", c_raft.voted_for.?);
-    try testing.expect(a_raft.hasQuorum(2));
+    try testing.expect(a_raft.hasQuorum(1));
+    try testing.expect(!a_raft.hasQuorum(0));
 }
 
 test "real loopback replication: sync AppendEntries and same-connection replies" {

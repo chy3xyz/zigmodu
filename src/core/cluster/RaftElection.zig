@@ -645,12 +645,12 @@ pub const RaftElection = struct {
 
     /// Start a new election.
     ///
-    /// Tallying convention: `votes_received` counts **peer grants**, so a
-    /// candidate needs `quorumSize()` distinct peers to answer (the convention
-    /// `handleVoteResponse` and `hasQuorum` document). A cluster of one has no
-    /// peer to ask — its own vote is the entire majority (`quorumSize() == 1`),
-    /// so that election is won immediately instead of waiting for a ballot that
-    /// can never arrive.
+    /// Tallying convention: `votes_received` counts **peer grants**, and the
+    /// candidate's own vote is added on top of them (`handleVoteResponse` and
+    /// `hasQuorum` carry the +1) — so the tally is an ordinary majority of
+    /// `clusterSize()`. A cluster of one has no peer to ask — its own vote is the
+    /// entire majority (`quorumSize() == 1`), so that election is won immediately
+    /// instead of waiting for a ballot that can never arrive.
     fn startElection(self: *Self) !void {
         self.state = .candidate;
         self.current_term +|= 1;
@@ -768,7 +768,14 @@ pub const RaftElection = struct {
         const peer_id = self.peerId(from_peer) orelse return;
         try self.votes_received.put(peer_id, {});
 
-        if (@as(usize, self.votes_received.count()) >= self.quorumSize()) {
+        // `+ 1` is the candidate's **own** vote: `startElection` set
+        // `voted_for = local_id` before asking anyone, and `quorumSize()` counts the
+        // whole cluster (it is `clusterSize() / 2 + 1`, and `clusterSize()` includes
+        // self). Without it the tally demanded `quorumSize()` *peers* on top of self,
+        // i.e. one vote more than a Raft majority — which made N=2 unreachable
+        // outright (quorumSize 2, one peer) and cost every larger cluster a node of
+        // fault tolerance. `hasQuorum` below carries the same `+ 1`.
+        if (@as(usize, self.votes_received.count()) + 1 >= self.quorumSize()) {
             self.becomeLeader();
         }
     }
@@ -977,15 +984,19 @@ pub const RaftElection = struct {
         return (self.clusterSize() / 2) + 1;
     }
 
-    /// Check if votes received meet quorum.
+    /// Check if `votes_received` **peer** grants meet quorum.
     ///
-    /// `votes_received` is a count of **peer grants** — the candidate's own
-    /// vote is not part of the tally, so a multi-node candidate needs
-    /// `quorumSize()` peers behind it. A cluster of one never wins through this
-    /// path: `startElection` elects it outright, since there is no peer whose
-    /// ballot could ever arrive. Lock-free, see `clusterSize`.
+    /// The candidate's own vote is not in `votes_received` (it is not a grant that
+    /// arrived over the wire), but it *is* one of the `quorumSize()` votes a Raft
+    /// majority is made of — `clusterSize()` counts self, and `startElection` has
+    /// already voted for itself. So the +1 here is that vote, and the tally matches
+    /// a plain majority: N=2 needs 1 peer, N=3 needs 1, N=5 needs 2.
+    ///
+    /// A cluster of one never wins through this path: `startElection` elects it
+    /// outright, since there is no peer whose ballot could ever arrive.
+    /// Lock-free, see `clusterSize`.
     pub fn hasQuorum(self: *const Self, votes_received: usize) bool {
-        return votes_received >= self.quorumSize();
+        return votes_received + 1 >= self.quorumSize();
     }
 };
 
@@ -1725,20 +1736,95 @@ test "RaftElection quorum calculation" {
 
     try testing.expectEqual(@as(usize, 3), e.clusterSize());
     try testing.expectEqual(@as(usize, 2), e.quorumSize());
-    try testing.expect(e.hasQuorum(2));
-    try testing.expect(!e.hasQuorum(1));
+    // `votes_received` counts **peers**, and the candidate's own vote is added on
+    // top of it, so 1 peer grant is already a majority of 3. This assertion used to
+    // be `!hasQuorum(1)` — the off-by-one that made N=2 unreachable and cost every
+    // larger cluster a node of fault tolerance (docs/dev/cluster-auth-design.md §12).
+    try testing.expect(e.hasQuorum(1));
+    try testing.expect(!e.hasQuorum(0));
 
-    // 5-node cluster: quorum = 3
+    // 5-node cluster: quorum = 3, so 2 peer grants are a majority.
+    var e5 = try RaftElection.init(allocator, "n1", &.{}, .{}, &transport);
+    defer e5.deinit();
+    try e5.addPeer("n2");
+    try e5.addPeer("n3");
+    try e5.addPeer("n4");
+    try e5.addPeer("n5");
+    try testing.expectEqual(@as(usize, 5), e5.clusterSize());
+    try testing.expectEqual(@as(usize, 3), e5.quorumSize());
+    try testing.expect(e5.hasQuorum(2));
+    try testing.expect(!e5.hasQuorum(1));
+
+    // 2-node cluster: quorum = 2, and its single peer's grant is enough — the case
+    // that was structurally impossible before the fix.
     var e2 = try RaftElection.init(allocator, "n1", &.{}, .{}, &transport);
     defer e2.deinit();
-    try testing.expectEqual(@as(usize, 1), e2.clusterSize());
-    try testing.expectEqual(@as(usize, 1), e2.quorumSize());
+    try e2.addPeer("n2");
+    try testing.expectEqual(@as(usize, 2), e2.clusterSize());
+    try testing.expectEqual(@as(usize, 2), e2.quorumSize());
+    try testing.expect(e2.hasQuorum(1));
+    try testing.expect(!e2.hasQuorum(0));
+
+    // Single node: `startElection` elects it outright (no peer ballot can arrive),
+    // so 0 peer grants is already quorum.
+    var e1 = try RaftElection.init(allocator, "n1", &.{}, .{}, &transport);
+    defer e1.deinit();
+    try testing.expectEqual(@as(usize, 1), e1.clusterSize());
+    try testing.expectEqual(@as(usize, 1), e1.quorumSize());
+    try testing.expect(e1.hasQuorum(0));
+}
+
+// Verified red: reverting the `+ 1` in `handleVoteResponse` makes this fail on the
+// `isLeader()` assertion with `expected true, found false`. A 2-node cluster's single
+// peer can never supply the two *peer* grants the old tally demanded — `quorumSize()`
+// is 2 and there is exactly one peer — so the node stayed a candidate forever. That
+// was measured before the fix, not inferred:
+//   [PROBE] N=2 clusterSize=2 quorumSize=2
+//   [PROBE] after 1/1 peer grants: leader=false
+test "a 2-node cluster elects a leader with its single peer's grant" {
+    const allocator = testing.allocator;
+
+    const TransportImpl = struct {
+        sendVoteRequest: *const fn (?[]const u8, []const u8, VoteRequest) void,
+        sendAppendEntries: *const fn (?[]const u8, []const u8, AppendEntriesRequest) AppendEntriesResponse,
+    };
+    var transport_impl = TransportImpl{
+        .sendVoteRequest = (struct {
+            fn f(_: ?[]const u8, _: []const u8, _: VoteRequest) void {}
+        }).f,
+        .sendAppendEntries = (struct {
+            fn f(_: ?[]const u8, _: []const u8, _: AppendEntriesRequest) AppendEntriesResponse {
+                return AppendEntriesResponse{ .term = 0, .success = true, .match_index = 0 };
+            }
+        }).f,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&transport_impl)));
+
+    var peers = [_]Peer{.{ .id = "node-b", .address = "" }};
+    var e = try RaftElection.init(allocator, "node-a", &peers, .{}, &transport);
+    defer e.deinit();
+
+    try testing.expectEqual(@as(usize, 2), e.clusterSize());
+    try testing.expectEqual(@as(usize, 2), e.quorumSize());
+
+    try e.startElection();
+    try testing.expectEqual(RaftState.candidate, e.getState());
+    try testing.expect(!e.isLeader());
+
+    // The one peer grants. Self + that grant is a majority of two.
+    try e.handleVoteResponse(.{ .term = e.getTerm(), .vote_granted = true }, "node-b");
+    try testing.expect(e.isLeader());
 }
 
 test "RaftElection vote counting: leader only at quorum, duplicate and stale votes ignored" {
     const allocator = testing.allocator;
 
-    var cluster = try TestCluster.init(allocator, 3);
+    // Five nodes, not three: `quorumSize()` is 3 and the self-vote is one of them, so
+    // a candidate needs **two** peer grants. That leaves room to observe a duplicate
+    // and a non-member landing in the tally *before* quorum — with three nodes the
+    // first grant already wins, which is exactly why this test had been written
+    // against the old off-by-one (docs/dev/cluster-auth-design.md §12).
+    var cluster = try TestCluster.init(allocator, 5);
     defer cluster.deinit();
 
     var cand = &cluster.nodes.items[0].election;
@@ -1747,12 +1833,13 @@ test "RaftElection vote counting: leader only at quorum, duplicate and stale vot
     try cand.startElection();
     try testing.expectEqual(RaftState.candidate, cand.getState());
     try testing.expectEqual(@as(u64, 1), cand.getTerm());
+    try testing.expectEqual(@as(usize, 3), cand.quorumSize());
 
     // A ballot from an older term must not count.
     try cand.handleVoteResponse(.{ .term = 0, .vote_granted = true }, "n1");
     try testing.expect(!cand.isLeader());
 
-    // First granted vote: 1 peer vote < quorum(2) — must NOT become leader.
+    // First granted vote: self + n1 = 2 of 5, still short of 3.
     try cand.handleVoteResponse(.{ .term = 1, .vote_granted = true }, "n1");
     try testing.expect(!cand.isLeader());
     try testing.expectEqual(RaftState.candidate, cand.getState());
@@ -1780,11 +1867,13 @@ test "RaftElection vote counting: leader only at quorum, duplicate and stale vot
     try testing.expectEqual(@as(u64, 2), cand.getTerm());
 
     // The next election starts from a clean tally: one peer vote is, again,
-    // not enough on its own.
+    // not enough on its own — the self-vote plus one is 2 of 5, and quorum is 3.
     try cand.startElection();
     try testing.expectEqual(@as(u64, 3), cand.getTerm());
     try cand.handleVoteResponse(.{ .term = 3, .vote_granted = true }, "n1");
     try testing.expect(!cand.isLeader());
+    try cand.handleVoteResponse(.{ .term = 3, .vote_granted = true }, "n2");
+    try testing.expect(cand.isLeader());
 }
 
 test "RaftElection log compaction and InstallSnapshot" {
@@ -1925,7 +2014,7 @@ test "RaftElection single-node cluster elects itself on the first tick" {
     try testing.expectEqual(@as(usize, 0), AppendEntriesCapture.calls);
 }
 
-test "RaftElection three-node candidate needs two peer grants, not its self-vote" {
+test "a three-node candidate wins with its self-vote plus ONE peer grant" {
     const allocator = testing.allocator;
 
     var cluster = try TestCluster.init(allocator, 3);
@@ -1933,9 +2022,12 @@ test "RaftElection three-node candidate needs two peer grants, not its self-vote
 
     const cand = &cluster.nodes.items[0].election;
 
-    // `startElection` votes for itself and polls n1/n2 through the stub
-    // transport. The self-vote is not a peer grant, so the node stays a
-    // candidate: a 3-node cluster is only won with 2 of 3 votes.
+    // `startElection` votes for itself and polls n1/n2 through the stub transport.
+    // A 3-node cluster is won with 2 of 3 votes, and the self-vote is one of them —
+    // so ONE peer grant is already a majority. This test used to assert the
+    // opposite (`needs two peer grants, not its self-vote`), which is 3 of 3: the
+    // off-by-one in `handleVoteResponse` that made N=2 unreachable and cost every
+    // larger cluster a node of fault tolerance (docs/dev/cluster-auth-design.md §12).
     try cand.startElection();
     try testing.expectEqual(RaftState.candidate, cand.getState());
     try testing.expect(!cand.isLeader());
@@ -1943,9 +2035,6 @@ test "RaftElection three-node candidate needs two peer grants, not its self-vote
     try testing.expectEqual(@as(usize, 2), cand.quorumSize());
 
     try cand.handleVoteResponse(.{ .term = 1, .vote_granted = true }, "n1");
-    try testing.expect(!cand.isLeader());
-
-    try cand.handleVoteResponse(.{ .term = 1, .vote_granted = true }, "n2");
     try testing.expect(cand.isLeader());
     try testing.expectEqual(RaftState.leader, cand.getState());
 }

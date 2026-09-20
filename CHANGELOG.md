@@ -2,6 +2,52 @@
 
 ## [Unreleased]
 
+### 修选举的票数 off-by-one：多要一票，N=2 结构上不可能选出 leader（**破坏性：否**）
+
+`quorumSize()` 是 `clusterSize()/2 + 1` 而 `clusterSize()` **包含自己**，但 `votes_received`
+**只记 peer 的票**。于是实际要求 `1 + quorumSize()` 票，分母只有 `clusterSize()` ——
+**比 Raft 的多数多要一票**。
+
+实测（不是推演）——2 节点集群、让唯一 peer 授予投票：
+
+```
+[PROBE] N=2 clusterSize=2 quorumSize=2
+[PROBE] after 1/1 peer grants: leader=false
+```
+
+| N | Raft 多数 | 修前要求 peer 票 | 修前实际总票 | 后果 |
+|---|---|---|---|---|
+| 2 | 2 | 2 | 3 | **不可能**（只有 1 个 peer） |
+| 3 | 2 | 2 | 3 | 需要**全体一致** → 任一 peer 不可达即无法选举 |
+| 5 | 3 | 3 | 4 | 需要 4/5 |
+
+即**整体少一个节点的容错度**，N=2 完全不可用。修法是一行（`handleVoteResponse` 与 `hasQuorum`
+各一处，把自己那一票算进去），验算 N=2/3/5 都对得上 Raft 的多数。
+
+> **它为什么一直没被发现**：既有的 3 节点用例两个 peer 都活着、2 票拿得到，所以通过；
+> 而 `RaftElection three-node candidate needs two peer grants, not its self-vote` 这个**测试名本身就是那条 bug** ——
+> 它的注释写着 "a 3-node cluster is only won with 2 of 3 votes"（正确的 Raft 规则），
+> 断言却要求 **2 个 peer** 的票（= 3 票全拿）。**注释说的是意图，断言记的是实现**，
+> 而日志里还写着 "the candidate's own vote is not part of the tally" —— 把偏差当成了规范。
+> `hasQuorum(2)` 更是被写进了两个不同文件的断言。
+
+**一并改掉的旧口径描述**（否则它们继续把偏差当规范）：`startElection` 的口径注释、`hasQuorum`
+的文档注释、`RaftElection quorum calculation` 的断言（并补 N=1/2/3/5 四组算术）、
+`DistributedIntegrationTest` 与 `RaftTransport` 环回选举里的 `hasQuorum(2)`。
+那个 3 节点测试改名为 `a three-node candidate wins with its self-vote plus ONE peer grant`。
+
+`vote counting` 那条从 3 节点换成 **5 节点**：`quorumSize()=3` 且自己占一票，所以需要 **2 个 peer** 的票 ——
+这才留出"重复票/非成员票落进 tally 但还没到多数"的观察空间。3 节点下第一票就当选、根本观察不到，
+**这正是它当初被写成旧口径的原因**。
+
+**验证**：全量 **1490/1511（21 skipped，0 failed）**（+1，即下面这条新用例），`zig fmt --check` + 6 道门禁全绿。
+新的 `a 2-node cluster elects a leader with its single peer's grant` 有一条**我自己做的变异**：
+把 `+ 1` 去掉 → `try testing.expect(e.isLeader())` 处 `FAIL (TestUnexpectedResult)`，**断言红不是编译错**。
+
+**未修**：§10 的 peer id 空间问题（它让 `ClusterBootstrap` 配出来的多节点集群把票丢弃、
+因而同样选不出 leader）需要先定配置形状 —— **本次不动**，证据链在
+`docs/dev/cluster-auth-design.md` §10，修法记录在 §12 末尾。
+
 ### 集群入站逐帧 HMAC 认证 + fail-closed 门禁（安全审计 ② 的第 3 条；**破坏性：是**）
 
 审计那条"入站路径零认证"（`ClusterAuth` 全仓库零调用点，TCP 可达即集群成员）的修复。

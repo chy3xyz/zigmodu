@@ -345,7 +345,7 @@ TLS/边车（`TlsTransport.zig:1-8` 的文件头已经写明 mTLS 目前要边�
 
 ---
 
-## 12. 核查中发现的第二条独立缺陷：票数约定差一票（N=2 结构上不可能选出 leader）
+## 12. 核查中发现的第二条独立缺陷：票数约定差一票（N=2 结构上不可能选出 leader）—— **已修**
 
 §10 是 id 空间的问题。查它的时候顺手验了 `handleVoteResponse` 的计票口径，**是另一条独立的缺陷**，
 不需要 id 空间问题也能单独触发。
@@ -416,3 +416,40 @@ if (@as(usize, self.votes_received.count()) + 1 >= self.quorumSize()) self.becom
 **两条都要修**，且 §12 是**不需要任何配置决策**的那一条（纯 off-by-one）。
 本次**只记录未修**：它会改选举语义与一条既有断言，且 §10 那个配置形状的决定还没定 ——
 两件事叠在一起改，判据会糊。
+
+### §12 修复记录
+
+修法就是这一行（`handleVoteResponse` 与 `hasQuorum` 各一处）：
+
+```zig
+if (@as(usize, self.votes_received.count()) + 1 >= self.quorumSize()) self.becomeLeader();
+pub fn hasQuorum(self: *const Self, votes_received: usize) bool { return votes_received + 1 >= self.quorumSize(); }
+```
+
+**三处描述旧口径的注释与断言一并改了**（否则它们继续把偏差当规范）：
+
+| 位置 | 旧 | 新 |
+|---|---|---|
+| `RaftElection.zig` `startElection` 的口径注释 | "a candidate needs `quorumSize()` distinct peers" | 明说自己那一票要算进去，tally = `clusterSize()` 的普通多数 |
+| `hasQuorum` 的文档注释 | "the candidate's own vote is not part of the tally … needs `quorumSize()` peers" | "the +1 here is that vote"，并给出 N=2/3/5 的需求数 |
+| `RaftElection quorum calculation` 的断言 | `!hasQuorum(1)`（N=3） | `hasQuorum(1)`，并补 N=2/3/5/N=1 四组算术 |
+| `DistributedIntegrationTest` `:392-393` | `hasQuorum(2)` / `!hasQuorum(1)` | `hasQuorum(1)` / `!hasQuorum(0)` |
+| `RaftTransport` 环回选举 `:1297` | `hasQuorum(2)` | `hasQuorum(1)` + `!hasQuorum(0)` |
+
+**`RaftElection three-node candidate needs two peer grants, not its self-vote` 这个测试名本身就是那条 bug。**
+它的注释写着"a 3-node cluster is only won with 2 of 3 votes"（**正确的 Raft 规则**），
+而断言要求的是 **2 个 peer** 的票（= 3 票全拿）—— 注释说的是意图，断言记的是实现，两者矛盾。
+已改名成 `a three-node candidate wins with its self-vote plus ONE peer grant`。
+
+`vote counting` 那条从 3 节点换成 **5 节点**：`quorumSize()=3`、自己占一票，所以需要 **2 个 peer** 的票 ——
+这才留出"重复票/非成员票落在 tally 里但还没到多数"的观察空间。3 节点下第一票就当选，
+根本观察不到重复计票，**这正是它当初被写成旧口径的原因**。
+
+**验证**：全量 **1490/1511（21 skipped，0 failed）**，fmt + 6 道门禁全绿。
+新的 `a 2-node cluster elects a leader with its single peer's grant` 我亲自做了变异：
+把 `+ 1` 去掉 → `try testing.expect(e.isLeader())` 处 `FAIL (TestUnexpectedResult)`，**断言红不是编译错**。
+
+### §10 仍然未修
+
+peer id 空间那条需要**(a) 配置带显式 id** 还是 **(b) 用 host 当身份** 的决定（见 §10），
+涉及公开配置形状或身份语义，本次不动。
