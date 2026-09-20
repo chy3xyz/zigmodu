@@ -49,21 +49,30 @@ pub const Method = enum {
     HEAD,
     OPTIONS,
 
-    /// Parse HTTP method from string. Uses first-char dispatch for O(1) fast path.
-    pub fn fromString(s: []const u8) Method {
-        if (s.len == 0) return .GET;
+    /// Parse an HTTP method token. Uses first-char dispatch for O(1) fast path.
+    ///
+    /// Returns `null` for any other token — including well-formed extension
+    /// methods such as `PROPFIND`. It must not fall back to `.GET`: the method
+    /// token is attacker-controlled, and "token this parser does not know =
+    /// GET" is a request-smuggling primitive whenever a front-end proxy splits
+    /// the same bytes differently (the request line it serves is not the one
+    /// this server routed). Callers reject with 501 instead.
+    pub fn fromString(s: []const u8) ?Method {
+        if (s.len == 0) return null;
         return switch (s[0]) {
-            'G' => if (s.len == 3 and s[1] == 'E' and s[2] == 'T') .GET else .GET,
-            'P' => if (s.len >= 3) switch (s[1]) {
-                'O' => if (s.len == 4 and s[2] == 'S' and s[3] == 'T') .POST else .GET,
-                'U' => if (s.len == 3 and s[2] == 'T') .PUT else .GET,
-                'A' => if (s.len == 5 and s[2] == 'T' and s[3] == 'C' and s[4] == 'H') .PATCH else .GET,
-                else => .GET,
-            } else .GET,
-            'D' => if (s.len == 6 and s[1] == 'E' and s[2] == 'L' and s[3] == 'E' and s[4] == 'T' and s[5] == 'E') .DELETE else .GET,
-            'H' => if (s.len == 4 and s[1] == 'E' and s[2] == 'A' and s[3] == 'D') .HEAD else .GET,
-            'O' => if (s.len == 7 and s[1] == 'P' and s[2] == 'T' and s[3] == 'I' and s[4] == 'O' and s[5] == 'N' and s[6] == 'S') .OPTIONS else .GET,
-            else => .GET,
+            'G' => if (std.mem.eql(u8, s, "GET")) .GET else null,
+            'P' => if (std.mem.eql(u8, s, "POST"))
+                .POST
+            else if (std.mem.eql(u8, s, "PUT"))
+                .PUT
+            else if (std.mem.eql(u8, s, "PATCH"))
+                .PATCH
+            else
+                null,
+            'D' => if (std.mem.eql(u8, s, "DELETE")) .DELETE else null,
+            'H' => if (std.mem.eql(u8, s, "HEAD")) .HEAD else null,
+            'O' => if (std.mem.eql(u8, s, "OPTIONS")) .OPTIONS else null,
+            else => null,
         };
     }
 
@@ -1400,6 +1409,57 @@ pub const HeaderLimits = struct {
     max_total_bytes: usize = 16 * 1024,
 };
 
+/// A header line split into `field-name` / `field-value` (RFC 9110 §5.1).
+const HeaderField = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+/// `tchar` (RFC 9110 §5.6.2) — the only bytes a `field-name` may contain.
+fn isTchar(c: u8) bool {
+    return switch (c) {
+        'a'...'z', 'A'...'Z', '0'...'9' => true,
+        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+        else => false,
+    };
+}
+
+/// Split `field-name ":" OWS field-value OWS`. RFC 9110 §5.6.3 defines OWS as
+/// *optional* whitespace, so `Host:x` is a valid header line and must be read,
+/// not dropped.
+///
+/// Returns `null` when the line is not a header field at all (no colon, empty
+/// or non-token name, obs-fold continuation line). The caller turns that into a
+/// 400: a line one parser drops while the next one honours it is exactly what
+/// request smuggling is built from.
+fn splitHeaderLine(line: []const u8) ?HeaderField {
+    const colon = std.mem.indexOfScalar(u8, line, ':') orelse return null;
+    const name = line[0..colon];
+    if (name.len == 0) return null;
+    for (name) |c| {
+        if (!isTchar(c)) return null;
+    }
+    return .{ .name = name, .value = std.mem.trim(u8, line[colon + 1 ..], " \t") };
+}
+
+/// `Content-Length = 1*DIGIT` (RFC 9110 §8.6). Rejects the empty value, a
+/// sign, a list, and `_` (which Zig's `parseInt` would take as a digit
+/// separator, so `1_0` would silently mean 10).
+fn parseContentLength(value: []const u8) ?usize {
+    if (value.len == 0 or value.len > 20) return null;
+    for (value) |c| {
+        if (!std.ascii.isDigit(c)) return null;
+    }
+    return std.fmt.parseInt(usize, value, 10) catch null;
+}
+
+/// Only `HTTP/1.x` reaches this parser: HTTP/2 arrives through the
+/// prior-knowledge preface probe in `connFiber`, and a request line that names
+/// any other version was written for a different parser.
+fn isHttp1Version(version: []const u8) bool {
+    return version.len == 8 and std.mem.startsWith(u8, version, "HTTP/1.") and std.ascii.isDigit(version[7]);
+}
+
 /// HTTP request parser
 const RequestParser = struct {
     allocator: std.mem.Allocator,
@@ -1429,16 +1489,20 @@ const RequestParser = struct {
         const request_line_owned = try self.allocator.dupe(u8, trimCrlf(request_line_raw_view));
         const request_line = request_line_owned;
         if (request_line.len < 14) return error.InvalidRequest; // Minimum: "GET / HTTP/1.1"
+        if (request_line[0] == ' ' or request_line[0] == '\t') return error.InvalidRequest;
 
-        // Parse method
-        const method_end = std.mem.indexOf(u8, request_line, " ") orelse return error.InvalidRequest;
-        const method_str = request_line[0..method_end];
-        const method = Method.fromString(method_str);
+        // `method SP request-target SP HTTP-version` and nothing else. An extra
+        // field means this parser and the next one disagree about where the
+        // request line ends — which invents a request nobody sent.
+        var fields = std.mem.tokenizeScalar(u8, request_line, ' ');
+        const method_str = fields.next() orelse return error.InvalidRequest;
+        const raw_path = fields.next() orelse return error.InvalidRequest;
+        const version = fields.next() orelse return error.InvalidRequest;
+        if (fields.next() != null) return error.InvalidRequest;
+        if (!isHttp1Version(version)) return error.InvalidRequest;
 
-        // Parse path
-        const path_start = method_end + 1;
-        const path_end = std.mem.indexOfPos(u8, request_line, path_start, " ") orelse return error.InvalidRequest;
-        const raw_path = request_line[path_start..path_end];
+        // An unknown method token is refused (501), never folded into GET.
+        const method = Method.fromString(method_str) orelse return error.InvalidMethod;
 
         // Parse query string
         var path = raw_path;
@@ -1456,6 +1520,8 @@ const RequestParser = struct {
         var headers = std.StringHashMap([]const u8).init(self.allocator);
         var header_count: usize = 0;
         var header_bytes: usize = 0;
+        var content_length: ?usize = null;
+        var saw_transfer_encoding = false;
         while (true) {
             const line_raw = try reader.readUntilDelimiterOrEof(&buffer, '\n') orelse return error.InvalidRequest;
             const header_line = trimCrlf(line_raw);
@@ -1471,20 +1537,38 @@ const RequestParser = struct {
             if (header_count > header_limits.max_count) return error.TooManyHeaders;
             if (header_bytes > header_limits.max_total_bytes) return error.TooManyHeaders;
 
-            if (std.mem.indexOf(u8, header_line, ": ")) |colon_pos| {
-                const key_raw = try self.allocator.dupe(u8, header_line[0..colon_pos]);
-                for (key_raw) |*c| c.* = std.ascii.toLower(c.*);
-                const value = try self.allocator.dupe(u8, header_line[colon_pos + 2 ..]);
-                try headers.put(key_raw, value);
+            // Unparsable lines are refused, not skipped: a header this server
+            // drops is a header a front-end proxy may still act on.
+            const field = splitHeaderLine(header_line) orelse return error.InvalidHeader;
+            const key_raw = try self.allocator.dupe(u8, field.name);
+            for (key_raw) |*c| c.* = std.ascii.toLower(c.*);
+            const value = try self.allocator.dupe(u8, field.value);
+
+            // The body is framed by exactly one header, and this server only
+            // implements `Content-Length`. A repeated/unparsable
+            // `Content-Length`, or any `Transfer-Encoding`, is refused — the
+            // CL/TE smuggling shape is precisely "we ignored one of them".
+            if (std.mem.eql(u8, key_raw, "content-length")) {
+                if (content_length != null) return error.DuplicateContentLength;
+                content_length = parseContentLength(field.value) orelse return error.InvalidContentLength;
+            } else if (std.mem.eql(u8, key_raw, "transfer-encoding")) {
+                saw_transfer_encoding = true;
             }
+
+            try headers.put(key_raw, value);
+        }
+
+        if (saw_transfer_encoding) {
+            // No chunked request decoder exists here, so accepting such a
+            // request would leave the chunked body in the reader to be served
+            // as the next request line. Refuse the message instead.
+            if (content_length != null) return error.ConflictingBodyFraming;
+            return error.TransferEncodingNotSupported;
         }
 
         // Read body if Content-Length present
         var body: ?[]const u8 = null;
-        if (headers.get("content-length")) |len_str| {
-            const content_len = std.fmt.parseInt(usize, len_str, 10) catch {
-                return error.InvalidContentLength;
-            };
+        if (content_length) |content_len| {
             if (content_len > max_body_size) return error.BodyTooLarge;
             if (content_len > 0) {
                 const body_buf = try self.allocator.alloc(u8, content_len);
@@ -1957,6 +2041,7 @@ fn getStatusText(status: u16) []const u8 {
         404 => "Not Found",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
+        501 => "Not Implemented",
         503 => "Service Unavailable",
         else => "Unknown",
     };
@@ -2178,7 +2263,13 @@ pub const Server = struct {
         body: []const u8,
     ) anyerror!Http2Server.SiteResponse {
         const server: *Server = @ptrCast(@alignCast(user_ctx.?));
-        const method = Method.fromString(method_str);
+        // Same rule as HTTP/1.1: an unknown `:method` is reported, not coerced
+        // into GET and routed as if the client had asked for it.
+        const method = Method.fromString(method_str) orelse return .{
+            .status = 501,
+            .content_type = "text/plain",
+            .body = try allocator.dupe(u8, "Not Implemented"),
+        };
         var ctx = try Context.init(allocator, method, path);
         errdefer ctx.deinit();
 
@@ -2565,9 +2656,29 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                 error.IncompleteBody => return,
                 else => {},
             }
-            std.log.err("Parse error: {any}", .{err});
-            const msg = if (err == error.BodyTooLarge) "Payload Too Large" else if (err == error.TooManyHeaders) "Request Header Fields Too Large" else "Bad Request";
-            const status: u16 = if (err == error.BodyTooLarge) 413 else if (err == error.TooManyHeaders) 431 else 400;
+            // A malformed request is a client fault, not a server error: warn,
+            // so scanners/probes cannot inflate the error signal.
+            std.log.warn("Parse error: {any}", .{err});
+            // Every request-boundary failure is a refusal, never a best-effort
+            // reparse: 413/431 for the size guards, 501 for a method token this
+            // server does not implement, 400 for everything else (including
+            // the CL/TE framing conflicts).
+            const msg = if (err == error.BodyTooLarge)
+                "Payload Too Large"
+            else if (err == error.TooManyHeaders)
+                "Request Header Fields Too Large"
+            else if (err == error.InvalidMethod)
+                "Not Implemented"
+            else
+                "Bad Request";
+            const status: u16 = if (err == error.BodyTooLarge)
+                413
+            else if (err == error.TooManyHeaders)
+                431
+            else if (err == error.InvalidMethod)
+                501
+            else
+                400;
             writeErrorResponse(server.io, stream, arena_alloc, status, msg);
             return;
         };
@@ -3087,7 +3198,7 @@ test "path matching" {
 }
 
 test "http methods" {
-    try std.testing.expectEqual(Method.GET, Method.fromString("GET"));
+    try std.testing.expectEqual(Method.GET, Method.fromString("GET").?);
     try std.testing.expectEqualStrings("POST", Method.POST.toString());
 }
 
@@ -4194,6 +4305,184 @@ fn testSocketPair() ?[2]std.posix.socket_t {
     }
 }
 
+// ── request boundary (header / framing) tests ──────────────────────────────
+
+/// Drive `RequestParser` over a real socketpair, the way `connFiber` does it:
+/// one shared `StreamReader`, the request line prefetched with `&.{}`, then
+/// `parseAfterRequestLine`. Wire-level, so the tests see the same bytes a peer
+/// would send (not a hand-rolled buffer).
+const ParserProbe = struct {
+    peer: std.posix.socket_t,
+    stream: std.Io.net.Stream,
+    reader: StreamReader,
+    parser: RequestParser,
+
+    /// Heap-allocated on purpose: `StreamReader.setup` stores a pointer to its
+    /// own buffer, so the struct must not move after setup. Writes `payload`
+    /// into the peer end; `null` when no socketpair is available (the caller
+    /// turns that into `SkipZigTest`).
+    fn create(allocator: std.mem.Allocator, payload: []const u8) !?*ParserProbe {
+        const fds = testSocketPair() orelse return null;
+        const probe = try allocator.create(ParserProbe);
+        probe.* = .{
+            .peer = fds[1],
+            .stream = .{ .socket = .{ .handle = fds[0], .address = undefined } },
+            .reader = undefined,
+            .parser = RequestParser.init(allocator),
+        };
+        probe.reader.setup(probe.stream, std.testing.io);
+        probe.reader.setHeaderDeadline(2000);
+        _ = std.posix.system.write(fds[1], payload.ptr, payload.len);
+        return probe;
+    }
+
+    fn destroy(self: *ParserProbe) void {
+        self.stream.close(std.testing.io);
+        _ = std.posix.system.close(self.peer);
+    }
+
+    fn parse(self: *ParserProbe) !ParsedRequest {
+        const first = try self.reader.readUntilDelimiterOrEof(&.{}, '\n') orelse return error.ClientClosed;
+        return self.parser.parseAfterRequestLine(&self.reader, first, 1 * 1024 * 1024, .{}, 100);
+    }
+};
+
+test "request headers: OWS after the colon is optional, an unparsable line is a 400" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `Content-Length:5` — no OWS — is a valid header line (RFC 9110 §5.6.3 OWS
+    // may be zero octets). The old parser only matched ": " and dropped the
+    // line, leaving this body in the reader to be served as the next request.
+    const smuggled = "GET /admin HTTP/1.1\r\nHost: y\r\n\r\n";
+    const payload = try std.fmt.allocPrint(a, "POST /upload HTTP/1.1\r\nHost:x\r\nContent-Length:{d}\r\n\r\n{s}", .{ smuggled.len, smuggled });
+
+    var probe = try ParserProbe.create(a, payload) orelse return error.SkipZigTest;
+    defer probe.destroy();
+
+    var request = try probe.parse();
+    defer request.deinit(a);
+
+    try std.testing.expectEqualStrings("x", request.headers.get("host") orelse "<missing>");
+    const expected_len = try std.fmt.allocPrint(a, "{d}", .{smuggled.len});
+    try std.testing.expectEqualStrings(expected_len, request.headers.get("content-length") orelse "<missing>");
+    try std.testing.expect(request.body != null);
+    try std.testing.expectEqualStrings(smuggled, request.body.?);
+    try std.testing.expectEqual(Method.POST, request.method);
+    try std.testing.expectEqualStrings("/upload", request.path);
+
+    // A line that is not a header field at all must be refused, never skipped.
+    const broken = try ParserProbe.create(a, "GET / HTTP/1.1\r\nHost: x\r\nBrokenHeaderLine\r\n\r\n") orelse return error.SkipZigTest;
+    defer broken.destroy();
+    try std.testing.expectError(error.InvalidHeader, broken.parse());
+
+    // Same for a line that starts with a space (obs-fold continuation).
+    const folded = try ParserProbe.create(a, "GET / HTTP/1.1\r\nHost: x\r\n\tfolded: value\r\n\r\n") orelse return error.SkipZigTest;
+    defer folded.destroy();
+    try std.testing.expectError(error.InvalidHeader, folded.parse());
+}
+
+test "request body framing: Transfer-Encoding and conflicting Content-Length are refused" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cases = [_]struct {
+        payload: []const u8,
+        expected: anyerror,
+    }{
+        // Chunked request: no decoder exists here, so the chunked body would be
+        // read back as the next request line (the audit's "1;GET /admin" shape).
+        .{ .payload = "POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1;GET /admin HTTP/1.1\r\n\r\n", .expected = error.TransferEncodingNotSupported },
+        .{ .payload = "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello", .expected = error.ConflictingBodyFraming },
+        .{ .payload = "POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\nhello", .expected = error.ConflictingBodyFraming },
+        // Repeated / unparsable Content-Length: last-wins and "parse what we
+        // can" both let two parsers disagree about the body length.
+        .{ .payload = "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello", .expected = error.DuplicateContentLength },
+        .{ .payload = "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 5, 5\r\n\r\nhello", .expected = error.InvalidContentLength },
+        .{ .payload = "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\nhello", .expected = error.InvalidContentLength },
+        .{ .payload = "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: +5\r\n\r\nhello", .expected = error.InvalidContentLength },
+        .{ .payload = "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 1_0\r\n\r\nhello", .expected = error.InvalidContentLength },
+        .{ .payload = "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length:\r\n\r\n", .expected = error.InvalidContentLength },
+        .{ .payload = "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 5 5\r\n\r\nhello", .expected = error.InvalidContentLength },
+    };
+
+    for (cases) |case| {
+        const probe = try ParserProbe.create(a, case.payload) orelse return error.SkipZigTest;
+        defer probe.destroy();
+        try std.testing.expectError(case.expected, probe.parse());
+    }
+
+    // Control: the same request with one well-formed Content-Length parses, and
+    // the body is consumed (so it can never be read back as a request line).
+    const ok = try ParserProbe.create(a, "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello") orelse return error.SkipZigTest;
+    defer ok.destroy();
+    var request = try ok.parse();
+    defer request.deinit(a);
+    try std.testing.expect(request.body != null);
+    try std.testing.expectEqualStrings("hello", request.body.?);
+}
+
+test "request line: unknown methods are refused, not folded into GET" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Method token contract: known methods only. `PROPFIND`/`get`/`GETX` used to
+    // become `.GET`.
+    try std.testing.expectEqual(Method.GET, Method.fromString("GET").?);
+    try std.testing.expectEqual(Method.DELETE, Method.fromString("DELETE").?);
+    try std.testing.expect(Method.fromString("GETX") == null);
+    try std.testing.expect(Method.fromString("get") == null);
+    try std.testing.expect(Method.fromString("PROPFIND") == null);
+    try std.testing.expect(Method.fromString("") == null);
+
+    const payloads = [_][]const u8{
+        // The audit's chunk-size-as-request-line shape.
+        "1;GET /admin HTTP/1.1\r\nHost: x\r\n\r\n",
+        "GETX /admin HTTP/1.1\r\nHost: x\r\n\r\n",
+        "PROPFIND /admin HTTP/1.1\r\nHost: x\r\n\r\n",
+    };
+    for (payloads) |payload| {
+        const probe = try ParserProbe.create(a, payload) orelse return error.SkipZigTest;
+        defer probe.destroy();
+        try std.testing.expectError(error.InvalidMethod, probe.parse());
+    }
+}
+
+test "request line: extra fields and non-HTTP/1.x versions are refused" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const payloads = [_][]const u8{
+        "GET / HTTP/1.1 extra\r\nHost: x\r\n\r\n", // trailing field
+        "GET /verylongpath\r\n", // request-target without a version field
+        "GET /\r\n", // shorter than any legal request line
+        "GET / HTTP/2.0\r\nHost: x\r\n\r\n", // version for another parser
+        "GET / HTTP/0.9\r\nHost: x\r\n\r\n",
+        "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", // H2 preface with HTTP/2 disabled
+    };
+    for (payloads) |payload| {
+        const probe = try ParserProbe.create(a, payload) orelse return error.SkipZigTest;
+        defer probe.destroy();
+        try std.testing.expectError(error.InvalidRequest, probe.parse());
+    }
+
+    // Control: HTTP/1.0 and extra SP runs still parse (recipients MAY parse on
+    // whitespace-delimited word boundaries).
+    const ok = try ParserProbe.create(a, "GET  /ping HTTP/1.0\r\nHost: x\r\n\r\n") orelse return error.SkipZigTest;
+    defer ok.destroy();
+    var request = try ok.parse();
+    defer request.deinit(a);
+    try std.testing.expectEqualStrings("/ping", request.path);
+}
+
 test "StreamReader header deadline fires on a silent peer" {
     const fds = testSocketPair() orelse return error.SkipZigTest;
     const stream = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } };
@@ -4370,6 +4659,92 @@ test "over-limit connections get 503 when configured" {
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "503") != null);
 
     server.stop();
+}
+
+test "a chunked-bodied request is refused instead of becoming a second request" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{
+        .port = 0,
+        .header_timeout_ms = 2000,
+    });
+    defer server.deinit();
+
+    var group = server.group("");
+    const ping = struct {
+        fn h(ctx: *Context) anyerror!void {
+            try ctx.jsonStruct(200, .{ .ok = true });
+        }
+    }.h;
+    try group.get("ping", ping, null);
+    try group.post("ping", ping, null);
+    try group.get("admin", struct {
+        fn h(ctx: *Context) anyerror!void {
+            try ctx.jsonStruct(200, .{ .handler = "admin-was-served" });
+        }
+    }.h, null);
+
+    const th = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, struct {
+        fn run(s: *Server) void {
+            s.start() catch {};
+        }
+    }.run, .{&server});
+    defer th.join();
+    defer server.stop();
+
+    var port: u16 = 0;
+    var tries: usize = 0;
+    while (tries < 200) : (tries += 1) {
+        if (server.listener) |*l| {
+            port = l.socket.address.getPort();
+            break;
+        }
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    try std.testing.expect(port != 0);
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+
+    // Both smuggling shapes send one request and get one second request served
+    // out of it: a front-end that decodes `Transfer-Encoding` passes the
+    // chunked body through, while a back-end that ignores the header reads the
+    // left-over bytes as its next request line.
+    const payloads = [_][]const u8{
+        // Audit shape: the chunk-size line is a request line to that parser.
+        "POST /ping HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1;GET /admin HTTP/1.1\r\nHost: x\r\n\r\n",
+        // The chunked body simply starts with a complete request.
+        "POST /ping HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nGET /admin HTTP/1.1\r\nHost: x\r\n\r\n",
+    };
+
+    var buf: [1024]u8 = undefined;
+    for (payloads) |req| {
+        var client = try addr.connect(std.testing.io, .{ .mode = .stream });
+        defer client.close(std.testing.io);
+        _ = std.posix.system.write(client.socket.handle, req.ptr, req.len);
+
+        var pfds = [_]std.posix.pollfd{.{ .fd = client.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        try std.testing.expect(try std.posix.poll(&pfds, 3000) > 0);
+        const n = try std.posix.read(client.socket.handle, &buf);
+        try std.testing.expect(n > 0);
+        try std.testing.expect(std.mem.startsWith(u8, buf[0..n], "HTTP/1.1 400"));
+
+        // Nothing after the refusal: no served handler and no second response.
+        var got_eof = false;
+        var rounds: usize = 0;
+        while (rounds < 20) : (rounds += 1) {
+            var dpfds = [_]std.posix.pollfd{.{ .fd = client.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+            if (try std.posix.poll(&dpfds, 500) <= 0) break;
+            const dn = try std.posix.read(client.socket.handle, &buf);
+            if (dn == 0) {
+                got_eof = true;
+                break;
+            }
+            try std.testing.expect(std.mem.indexOf(u8, buf[0..dn], "admin-was-served") == null);
+            try std.testing.expect(std.mem.indexOf(u8, buf[0..dn], "HTTP/1.1 200") == null);
+        }
+        try std.testing.expect(got_eof);
+    }
 }
 
 const SlowWsState = struct {
