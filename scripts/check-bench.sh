@@ -358,6 +358,60 @@
 # `BENCH_REGION` if set, otherwise from Azure IMDS (the runner's own host
 # metadata, one short request), otherwise it prints `?`. It is diagnostic output
 # and never fails the gate.
+#
+# ── Reading a run: the marker, and the two diagnostic modes ──
+#
+# Every run prints a `references` block: the declared references (`REF_METRICS`)
+# with this run's drift from their recorded values, each row carrying the fixed
+# token **RE-RUN-BEFORE-FIX**. That token is not "ignore this row" and not a
+# verdict — it says a reading on this row is a *candidate fallback*: re-run
+# before changing anything. Each row also carries a role tag, which is where the
+# measured reason a metric is not gated now lives in machine-readable form
+# (`REF_METRIC_ROLES` below: `control` / `candidate` / `hand-off`), and rows
+# outside the host-suspect band are additionally tagged `HOST-MOVED`.
+#
+# `HOST-MOVED` is the signal that matters most here, and it used to live only in
+# prose: a run reported `findById x10K` 2.1x slow while the machine's own
+# `atomic RMW x10M` reference went 22.2 -> 35.8 ms *in that same run*, so every
+# number in it was the host's. The suspect band is deliberately narrower than
+# `THRESHOLD` (2.0x): a reference is one of the host's simplest loops, its
+# recorded run-to-run drift is a few percent, and a host slowed by 1.6x never
+# trips a 2.0x note — which is exactly how that false red survived the gate's
+# own host note.
+#
+# Two modes read a run without producing one, so the question "noise or real
+# regression?" is answerable from a log instead of from an argument:
+#
+#   --explain <log>...   the procedure. Prints step 1 (every declared reference,
+#                        this run vs its recorded value, tagged `HOST-MOVED` or
+#                        `flat`) and step 2 (what the gate would fail on), then
+#                        one verdict token: `RE-RUN-BEFORE-FIX` when a reference
+#                        moved in the same run, `REAL-REGRESSION-CANDIDATE` when
+#                        they are flat and the metric moved anyway, `NO-BREACH`
+#                        when there is nothing to explain. Exit 0 for the first
+#                        and third, 1 for the second, 3 when the input cannot be
+#                        read. These exit codes are the *procedure's* answer, not
+#                        the gate's; the gate is still this script with no
+#                        arguments and still fails only on a breach.
+#
+#   --ratios <log|baseline.json>...
+#                        the cross-host procedure for the one decision a single
+#                        machine cannot settle: which reference `RingBuffer SPSC
+#                        x1M` should divide by. Prints every metric/reference
+#                        pair each input can express, then the spread
+#                        (max/min) per (metric, reference, host class). It
+#                        prints spreads and draws no conclusion, and it sets no
+#                        default — see the `StoreForward x10M` note above for
+#                        what that decision needs.
+#
+# Both read `scripts/lib/bench-log.py`, both need a saved log (the stdout of this
+# script, of a bare `benchmark` run, or of a CI job that ran either), and neither
+# builds, runs or re-records anything. `THRESHOLD`, both baseline files and every
+# value in them are untouched by either mode.
+#
+# The full convention — which number to quote for a test run, which one is the
+# secondary label, and what the marker obliges you to do — is
+# `docs/dev/READING_NUMBERS.md`.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -462,29 +516,117 @@ NORMALIZED_METRICS=(
   "1L x10M events"
   "RingBuffer SPSC x1M"
 )
+
+# Role and reason per declared reference, `<name>=<role>|<reason>`. **Presentation
+# only**: this list decides nothing. What a metric is gated on is
+# `NORMALIZED_METRICS` (a ratio) or nothing at all (`REF_METRICS`), and a name
+# here that is not in `REF_METRICS` is rejected below rather than quietly
+# gaining a second meaning. It exists so the reasons scattered in the comments
+# above ("the host's own atomic cost", "a cross-host claim no single machine can
+# settle", "swings 3x within one machine") print next to the numbers they are
+# about, machine-readable, in the `references` block and in `--explain`.
+REF_METRIC_ROLES=(
+  "atomic RMW x10M=control|the host's own atomic cost; gating it fires on a host-generation change, which is what the ratio criterion exists to cancel"
+  "StoreForward x10M=candidate|the closer denominator for the ring; whether it cancels the host better than the atomic is a cross-host claim"
+  "Worker drain dedicated x1M=hand-off|half of the dedicated-vs-pooled boundary; 1.84x run-to-run spread within one machine"
+  "Pooled dispatch x1M=hand-off|the other half of that boundary; 3.09x run-to-run spread within one machine"
+)
 export BENCH_REF_METRIC="$REF_METRIC"
 export BENCH_REF_METRICS="$(IFS=';'; printf '%s' "${REF_METRICS[*]}")"
 export BENCH_NORMALIZED_METRICS="$(IFS=';'; printf '%s' "${NORMALIZED_METRICS[*]}")"
+export BENCH_REF_ROLES="$(IFS=';'; printf '%s' "${REF_METRIC_ROLES[*]}")"
 export BENCH_MACHINE=""
+
+# A role for a metric that is not a declared reference would be a label on a
+# metric nothing reports as a host measurement — reject it here instead.
+for role_entry in "${REF_METRIC_ROLES[@]}"; do
+  role_name="${role_entry%%=*}"
+  found=0
+  for ref_name in "${REF_METRICS[@]}"; do
+    if [ "$role_name" = "$ref_name" ]; then found=1; fi
+  done
+  if [ "$found" -ne 1 ]; then
+    echo "FAIL: REF_METRIC_ROLES names '$role_name', which is not in REF_METRICS" >&2
+    exit 2
+  fi
+done
+unset role_entry role_name ref_name found
+
+# The host-suspect band: how far a *reference* may drift from its recorded value
+# before a reading on it is the host rather than the code. Diagnostic only — it
+# gates nothing (see the header) — but it is the band `--explain` and the
+# `references` block classify with, and it is narrower than `THRESHOLD` on
+# purpose: the recorded false red had a reference at 1.61x, which a 2.0x note
+# cannot see. A reference is one of the host's simplest loops, so its own
+# run-to-run drift on one machine is a few percent: `atomic RMW x10M` stayed
+# within 1.04x across the runs that recorded the local baseline, and the ring's
+# ratio to it within 1.083x (max/min over 12 runs).
+HOST_SUSPECT="${BENCH_HOST_SUSPECT:-1.25}"
+export BENCH_HOST_SUSPECT="$HOST_SUSPECT"
 
 MODE=check
 FORCE=0
+INPUTS=()
+usage_line="usage: $0 [--update [--force]] | --explain <log>... | --ratios <log|baseline.json>..."
 for arg in "$@"; do
   case "$arg" in
     --update) MODE=update ;;
     --force) FORCE=1 ;;
+    --explain) MODE=explain ;;
+    --ratios) MODE=ratios ;;
+    --explain=*) MODE=explain; INPUTS+=("${arg#--explain=}") ;;
+    --ratios=*) MODE=ratios; INPUTS+=("${arg#--ratios=}") ;;
+    -*) echo "$usage_line" >&2; exit 2 ;;
     *)
-      echo "usage: $0 [--update [--force]]" >&2
-      exit 2
+      if [ "$MODE" = explain ] || [ "$MODE" = ratios ]; then
+        INPUTS+=("$arg")
+      else
+        # A log path with no mode that consumes it is a caller who meant to
+        # explain: running --update on it instead would rewrite a baseline.
+        echo "$usage_line" >&2
+        exit 2
+      fi
       ;;
   esac
 done
+if [ ${#INPUTS[@]} -gt 0 ] && [ "$MODE" != explain ] && [ "$MODE" != ratios ]; then
+  echo "$usage_line" >&2
+  exit 2
+fi
+
+# The two diagnostic modes read a saved log and stop here: no temp dir, no build,
+# no suite, no comparison against a fresh run. `BENCH_BASELINE_RESOLVED` is what
+# `scripts/lib/bench-log.py` compares against — the same file this script would
+# have used, so `BENCH_BASELINE=scripts/bench-baseline.ci.json … --explain` reads
+# the CI class exactly as the gate does.
+if [ "$MODE" = explain ] || [ "$MODE" = ratios ]; then
+  export BENCH_BASELINE_RESOLVED="$BASELINE"
+  export BENCH_THRESHOLD_EFFECTIVE="$THRESHOLD"
+  python3 scripts/lib/bench-log.py "$MODE" ${INPUTS[@]+"${INPUTS[@]}"}
+  exit $?
+fi
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/zigmodu-bench.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
 # Machine identification for the verdict. Every source is best-effort: a missing
 # region prints `?` and the gate carries on (see the header).
+# 1-minute load average, or `?` when neither source answers. Best-effort like the
+# rest of the machine identification: a missing value prints `?` and the gate
+# carries on.
+machine_load() {
+  if [ -r /proc/loadavg ]; then
+    cut -d' ' -f1 /proc/loadavg
+    return
+  fi
+  if command -v sysctl >/dev/null 2>&1; then
+    # macOS: `{ 10.00 9.67 8.25 }`
+    sysctl -n vm.loadavg 2>/dev/null | tr -d '{}' | awk '{print $1}'
+    return
+  fi
+  printf '?'
+}
+
 machine_region() {
   if [ -n "${BENCH_REGION:-}" ]; then
     printf '%s' "$BENCH_REGION"
@@ -512,7 +654,16 @@ machine_cores() {
 }
 
 REGION="$(machine_region)"
-BENCH_MACHINE="region=$REGION cpu=$(machine_cpu) cores=$(machine_cores)"
+# Load average goes **into the machine line**, because it is the one signal the
+# offline `--explain` cannot recover any other way. This gate's references are
+# deliberately the host's *simplest* loops (`atomic RMW`, and the store->load
+# chain next to it), and a cache-local loop stays flat while a memory-path metric
+# doubles when the machine is full — so "references flat, metric moved" is the
+# *expected* shape under saturation, not the suspicious one. Measured twice on
+# 2026-09-20: `TimerWheel x100K` read 2.14x and 2.52x with every reference inside
+# 1.08x, at load 10.0 on 10 cores. Without this field `--explain` called both of
+# them `REAL-REGRESSION-CANDIDATE`.
+BENCH_MACHINE="region=$REGION cpu=$(machine_cpu) cores=$(machine_cores) load=$(machine_load)"
 export BENCH_MACHINE
 
 echo "machine: $BENCH_MACHINE  |  $(uname -srm)"
@@ -755,6 +906,63 @@ if os.path.exists(log_path):
 slower, unmeasurable, pending, mismatch, host_notes, retargeted = [], [], [], [], [], []
 ratio_detail = []
 new_metrics = [m["name"] for m in cur if m["name"] not in base]
+
+# ── the declared references, this run vs their recorded values ──
+# Every host reference is a *host* measurement, so the drift here is the context
+# the verdict below is read in, and it is printed on every run (pass or fail)
+# rather than only when it breaches: the failure this block exists for reported
+# the reference 1.61x away, which is inside THRESHOLD and therefore never
+# reached the gate's own host note (see the header). `moved` is that reading, and
+# the FAIL block below points at it. Role labels and their reasons come from
+# `REF_METRIC_ROLES`, which decides nothing (presentation only).
+suspect = float(os.environ.get("BENCH_HOST_SUSPECT", "1.25"))
+roles = {}
+for item in os.environ.get("BENCH_REF_ROLES", "").split(";"):
+    if not item:
+        continue
+    role_name, _, rest = item.partition("=")
+    role, _, reason = rest.partition("|")
+    roles[role_name] = (role, reason)
+role_label = {"control": "control reference", "candidate": "candidate reference",
+              "hand-off": "hand-off pair", "reference": "reference"}
+# Only these roles are a reading about the *machine*. The hand-off pair is not:
+# it swings 1.84x / 3.09x within one machine by construction (thread hand-off),
+# so calling its drift "the host moved" would be the wrong answer — it is that
+# pair's own noise, and its rows are tagged `MOVED` rather than `HOST-MOVED`.
+host_roles = ("control", "candidate", "reference")
+declared = [n for n in os.environ.get("BENCH_REF_METRICS", "").split(";") if n]
+for ref_name in normalized.values():
+    if ref_name not in declared:
+        declared.append(ref_name)
+reference_rows = []
+moved = []
+for ref_name in declared:
+    actual = values.get(ref_name)
+    entry = base.get(ref_name)
+    was = None if entry is None else entry.get("value")
+    factor = None if not was or actual is None else actual / was
+    users = [n for n in normalized if normalized[n] == ref_name]
+    divides = f"{len(users)} metric(s) divide by it" if users else "no metric divides by it yet"
+    role, _reason = roles.get(ref_name, ("reference", ""))
+    out_of_band = factor is not None and (factor > suspect or factor < 1.0 / suspect)
+    host_moved = out_of_band and role in host_roles
+    if factor is None:
+        tag = "n/a"
+    elif host_moved:
+        tag = "HOST-MOVED"
+    elif out_of_band:
+        tag = "MOVED"
+    else:
+        tag = "flat"
+    if actual is None:
+        detail = "not measured in this run"
+    elif was is None:
+        detail = f"{actual:>9.3f} ms (no recorded value to compare)"
+    else:
+        detail = f"{was:>8.3f} → {actual:>9.3f} ms  {factor:.2f}x"
+    reference_rows.append((ref_name, detail, tag, role_label.get(role, role), divides, role, factor))
+    if host_moved:
+        moved.append((ref_name, was, actual, factor))
 for m in cur:
     name, actual = m["name"], m["value"]
     seen.add(name)
@@ -833,6 +1041,24 @@ gated_ratio = [m["name"] for m in cur if m["name"] in normalized]
 print(f"machine:  {machine}")
 print(f"criterion: {len(cur) - len(gated_ratio)} metric(s) absolute (median ms) + {len(gated_ratio)} normalized (each metric ÷ its own reference, both medians of this run), threshold {threshold}x on both")
 
+print("references — recorded and printed, never gated; a reading on one of these is a candidate")
+print("  fallback (re-run before changing anything), not something to ignore:")
+for ref_name, detail, tag, role, divides, _key, _factor in reference_rows:
+    print(f"  RE-RUN-BEFORE-FIX  {ref_name:<28s} {detail:<34s} {tag:<10s} ({role}; {divides})")
+host_readable = [r for r in reference_rows
+                 if r[2] != "n/a" and r[5] in ("control", "candidate", "reference")]
+handoff_moved = [r for r in reference_rows if r[2] == "MOVED"]
+print(f"  {len(moved)} of {len(host_readable)} host reference(s) outside the {suspect:.2f}x host-suspect band"
+      + ("" if moved else " — the host did not move in this run"))
+if handoff_moved:
+    print(f"  {len(handoff_moved)} hand-off row(s) MOVED — that pair swings 1.84x/3.09x within one machine by")
+    print("  construction, so its drift says nothing about the host (docs/RUNTIME.md §12.5).")
+print("  role tags: control reference = the host's own atomic cost (gating it fires on a host-generation")
+print("  change); candidate reference = recorded for a reference change no single machine can settle;")
+print("  hand-off pair = judged against each other (docs/RUNTIME.md §12.5), not against a gate.")
+print("  'noise or regression?' — bash scripts/check-bench.sh --explain <this log>; the convention is")
+print("  docs/dev/READING_NUMBERS.md.")
+
 if ratio_detail:
     print("normalized — the two ratios the gate compares (metric ÷ its reference, same run):")
     for name, ratio, was, actual, ref_name, ref in ratio_detail:
@@ -851,6 +1077,27 @@ if slower:
     print("  or atomic raises the ratio). Both compared values are medians of 3; three")
     print("  slow samples are a regression, one outlier sample (see `samples:` above) is")
     print("  machine noise — re-run before fixing.")
+    # The host check: the references in this run are printed above with their
+    # drift, and that is the reading that tells a slow host from slow code —
+    # which is what the recorded false red needed and did not have. Only *host*
+    # roles count here (see `host_roles`): a hand-off row's drift is that pair's
+    # own spread, so it must not be read as "the host moved".
+    measured_refs = [r for r in reference_rows
+                     if r[2] != "n/a" and r[5] in ("control", "candidate", "reference")]
+    if moved:
+        print(f"  host check: {len(moved)} of {len(measured_refs)} host reference(s) are outside the {suspect:.2f}x band in this run:")
+        for ref_name, was, actual, factor in moved:
+            print(f"      {ref_name}: {was:.3f} → {actual:.3f} ms ({factor:.2f}x)")
+        print("      RE-RUN-BEFORE-FIX: a host reference moved with the metric, so this failure is not yet")
+        print("      evidence about the code. Re-run on a quiet machine and compare (--explain).")
+    elif measured_refs:
+        worst = max(measured_refs, key=lambda r: max(r[6], 1.0 / r[6]) if r[6] else 1.0)
+        print(f"  host check: every measured host reference is inside the {suspect:.2f}x band (worst: {worst[0]} {worst[6]:.2f}x)")
+        print(f"      — the host did not move, so this is a real-regression candidate at the {threshold}x window:")
+        print("      re-run once to see it again, then look at the code the metric covers (--explain).")
+    else:
+        print("  host check: no declared reference was measured in this run, so the host cannot be read")
+        print("      and neither can this failure — the reference line is part of the evidence (--explain).")
     print("Fix the regression, or accept it explicitly with: scripts/check-bench.sh --update --force")
 
 if host_notes:

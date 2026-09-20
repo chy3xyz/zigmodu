@@ -163,9 +163,22 @@ pub fn MpscRing(comptime T: type, comptime capacity: usize) type {
                         pos = actual;
                         continue;
                     }
+                    const seen = self.dequeue_pos.value.load(.monotonic);
+                    // Read the consumer's cursor **before** publishing, not after.
+                    // `high_water` only ever grows, so one underflow poisons it for
+                    // the life of the ring — and the subtraction *can* underflow:
+                    // once this store is visible, a consumer may drain this slot
+                    // and another producer's higher-numbered one, pushing
+                    // `dequeue_pos` past `pos + 1`. Reading first makes the depth a
+                    // safe over-estimate: before the store no consumer can see this
+                    // slot, so `dequeue_pos <= pos` and `pos + 1 - dequeue_pos` is
+                    // at least 1. (Measured: with two producers this read
+                    // 18446744073709551615 on every run of
+                    // `zig build runtime-stress`, and that value is published as
+                    // `zigmodu_runtime_pool_ready_high_water`.)
                     slot.value = item;
                     slot.sequence.store(pos +% 1, .release);
-                    const depth = (pos +% 1) -% self.dequeue_pos.value.load(.monotonic);
+                    const depth = (pos +% 1) -% seen;
                     if (depth > self.high_water.load(.monotonic)) self.high_water.store(depth, .monotonic);
                     return true;
                 } else if (diff < 0) {
@@ -321,4 +334,48 @@ test "MpscRing reports full instead of overwriting" {
     try std.testing.expectEqual(@as(u8, 1), ring.tryPop().?); // the refused push did not clobber slot 0
     try std.testing.expectEqual(@as(u8, 2), ring.tryPop().?);
     try std.testing.expect(ring.tryPop() == null);
+}
+
+test "MpscRing: high_water stays a ring level with more than one producer" {
+    // `high_water` only ever grows, so a single bogus sample poisons it for the
+    // life of the ring — and the bogus sample is reachable exactly when there is
+    // **more than one producer**: another producer's slot can be drained ahead of
+    // this one, pushing `dequeue_pos` past `pos + 1` before this thread reads it,
+    // and the unsigned subtraction underflows to ~2^64. That value is published
+    // (`zigmodu_runtime_pool_ready_high_water`, `Mailbox` stats), so it is a
+    // reading that lies rather than a protocol error.
+    //
+    // One producer cannot reach it — `dequeue_pos <= pos + 1` holds for SPSC — so
+    // this test's whole point is the second thread.
+    const capacity = 64;
+    const per_producer = 200_000;
+    const producers = 2;
+    const total = producers * per_producer;
+    const R = MpscRing(u64, capacity);
+
+    const Shared = struct {
+        ring: *R,
+        fn produce(r: *R, tag: u64) void {
+            var i: u64 = 0;
+            while (i < per_producer) : (i += 1) {
+                while (!r.tryPush((tag << 32) | i)) std.atomic.spinLoopHint();
+            }
+        }
+    };
+
+    var ring = R.init();
+    var threads: [producers]std.Thread = undefined;
+    for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Shared.produce, .{ &ring, @as(u64, i) });
+
+    var received: usize = 0;
+    while (received < total) {
+        if (ring.tryPop()) |_| received += 1 else std.atomic.spinLoopHint();
+    }
+    for (threads) |t| t.join();
+
+    // Not vacuous: every value the producers pushed came out.
+    try std.testing.expectEqual(@as(usize, total), received);
+    // The reading is a ring level, not an underflow.
+    const s = ring.stats();
+    try std.testing.expect(s.high_water <= capacity);
 }

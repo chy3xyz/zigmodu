@@ -289,4 +289,72 @@ pub fn build(b: *std.Build) void {
     const run_soak = b.addRunArtifact(soak_tests);
     const soak_step = b.step("soak", "Run concurrency soak tests (N clients x M tenants)");
     soak_step.dependOn(&run_soak.step);
+
+    // Long-horizon runtime harness (`zig build runtime-stress`). Sibling of
+    // `soak`, and deliberately not a second one of it: `soak` is HTTP + tenant
+    // isolation and never touches the runtime, while this one drives the
+    // supervision tree, both schedulers, the ready ring and the timer wheel
+    // under *sustained* load and checks the invariants periodically. Sizing is
+    // by option so the default stays inside ~10 s.
+    const stress_options = b.addOptions();
+    stress_options.addOption(usize, "runtime_stress_duration_ms", b.option(usize, "runtime-stress-duration-ms", "runtime-stress: sustained-load duration in milliseconds") orelse 5000);
+    stress_options.addOption(usize, "runtime_stress_sample_ms", b.option(usize, "runtime-stress-sample-ms", "runtime-stress: time-series sample interval in milliseconds") orelse 100);
+    stress_options.addOption(usize, "runtime_stress_workers", b.option(usize, "runtime-stress-workers", "runtime-stress: pooled `.cpu` workers to spawn") orelse 4);
+    stress_options.addOption(usize, "runtime_stress_producers", b.option(usize, "runtime-stress-producers", "runtime-stress: producer threads feeding the cpu pool") orelse 2);
+    stress_options.addOption(usize, "runtime_stress_blocking_workers", b.option(usize, "runtime-stress-blocking-workers", "runtime-stress: pooled `.blocking` workers to spawn") orelse 2);
+    stress_options.addOption(usize, "runtime_stress_restarts", b.option(usize, "runtime-stress-restarts", "runtime-stress: restart budget of the group holding the always-failing member") orelse 3);
+    stress_options.addOption(usize, "runtime_stress_pool_threads", b.option(usize, "runtime-stress-pool-threads", "runtime-stress: cpu pool width") orelse 2);
+    stress_options.addOption(usize, "runtime_stress_blocking_threads", b.option(usize, "runtime-stress-blocking-threads", "runtime-stress: blocking pool width") orelse 1);
+    stress_options.addOption(usize, "runtime_stress_rss_budget_mib", b.option(usize, "runtime-stress-rss-budget-mib", "runtime-stress: RSS spread budget (MiB) for the steady phase") orelse 24);
+    stress_options.addOption(usize, "runtime_stress_timers", b.option(usize, "runtime-stress-timers", "runtime-stress: timers armed in the opening burst") orelse 48);
+    const stress_options_mod = stress_options.createModule();
+
+    const stress_mod = b.createModule(.{
+        .root_source_file = b.path("src/runtime_stress.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    stress_mod.addImport("zigmodu", zigmodu_mod);
+    stress_mod.addImport("build_options", stress_options_mod);
+    db_link.link(stress_mod, b, features);
+
+    const stress_exe = b.addExecutable(.{
+        .name = "runtime-stress",
+        .root_module = stress_mod,
+    });
+    const run_stress = b.addRunArtifact(stress_exe);
+    const stress_step = b.step("runtime-stress", "Run the long-horizon runtime harness (supervision tree, pools, timers, zero-allocation)");
+    stress_step.dependOn(&run_stress.step);
+
+    // The same file, compiled into `zig build test` with a *smoke* budget, so
+    // the default suite covers the harness's code path and every check while the
+    // long run stays its own step (the split `soak` uses). The numbers are fixed
+    // here rather than derived from the options above: `-Druntime-stress-
+    // duration-ms=20000` must not quietly add 20 s to every `zig build test`.
+    const stress_smoke_options = b.addOptions();
+    stress_smoke_options.addOption(usize, "runtime_stress_duration_ms", 2000);
+    stress_smoke_options.addOption(usize, "runtime_stress_sample_ms", 100);
+    stress_smoke_options.addOption(usize, "runtime_stress_workers", 2);
+    stress_smoke_options.addOption(usize, "runtime_stress_producers", 1);
+    stress_smoke_options.addOption(usize, "runtime_stress_blocking_workers", 1);
+    stress_smoke_options.addOption(usize, "runtime_stress_restarts", 3);
+    stress_smoke_options.addOption(usize, "runtime_stress_pool_threads", 2);
+    stress_smoke_options.addOption(usize, "runtime_stress_blocking_threads", 1);
+    stress_smoke_options.addOption(usize, "runtime_stress_rss_budget_mib", 24);
+    stress_smoke_options.addOption(usize, "runtime_stress_timers", 48);
+    const stress_smoke_options_mod = stress_smoke_options.createModule();
+
+    const stress_smoke_mod = b.createModule(.{
+        .root_source_file = b.path("src/runtime_stress.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    stress_smoke_mod.addImport("zigmodu", zigmodu_mod);
+    stress_smoke_mod.addImport("build_options", stress_smoke_options_mod);
+    db_link.link(stress_smoke_mod, b, features);
+
+    const stress_smoke_tests = b.addTest(.{ .root_module = stress_smoke_mod });
+    addTest(b, test_step, stress_smoke_tests, test_filter, test_force_run);
 }

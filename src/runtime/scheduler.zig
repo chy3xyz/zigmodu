@@ -271,9 +271,22 @@ const ReadyRing = struct {
                     pos = actual;
                     continue;
                 }
+                const seen = self.dequeue_pos.load(.monotonic);
+                // Read the consumer's cursor **before** publishing, not after.
+                // `high_water` only ever grows, so one underflow poisons it for
+                // the life of the ring — and the subtraction *can* underflow:
+                // once this store is visible, a consumer may drain this slot
+                // and another producer's higher-numbered one, pushing
+                // `dequeue_pos` past `pos + 1`. Reading first makes the depth a
+                // safe over-estimate: before the store no consumer can see this
+                // slot, so `dequeue_pos <= pos` and `pos + 1 - dequeue_pos` is
+                // at least 1. (Measured: with two producers this read
+                // 18446744073709551615 on every run of
+                // `zig build runtime-stress`, and that value is published as
+                // `zigmodu_runtime_pool_ready_high_water`.)
                 slot.value = item;
                 slot.sequence.store(pos +% 1, .release);
-                const depth = (pos +% 1) -% self.dequeue_pos.load(.monotonic);
+                const depth = (pos +% 1) -% seen;
                 if (depth > self.high_water.load(.monotonic)) self.high_water.store(depth, .monotonic);
                 return true;
             } else if (diff < 0) {
