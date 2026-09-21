@@ -637,9 +637,15 @@ brief 说 `ClusterBootstrap drives raft.tick and serves inbound Raft RPCs` 里 `
   `self.nodes` 以 id 为键，而入站连接的对端地址是 `dialer_ip:临时端口` —— 与节点表里登记的
   `host:监听端口` **天然不等**（NAT 之后更不可能）。要真关掉得先有握手（连接上先自报 id 并证明），
   那是 §4 形状的另一件事，不是一次校验能补的。
+  **→ 已单独出设计：[`cluster-identity-design.md`](cluster-identity-design.md)（未实现）。**
+  那份文档同时说明了一件比"没对照"更根本的事：**`identityKey` 本身不绑定身份** ——
+  它的 key 是 `HMAC(cluster_secret, claim)`，持有 `cluster_secret` 的人能推导任何节点的 key，
+  所以它相对"直接 MAC 整段 json"没有额外安全性。要真绑定只能上**每节点凭证 + 握手**。
 - §3.6 的重放残留**按设计接受**（总线侧的重放语义没有 Raft 的 term 单调兜底，见下一条）。
-- **总线侧没有重放防护**：这次上的是 MAC（完整性 + 主机身份），没有时间戳/序号窗口，
-  所以线路旁观者可以重放一条事件帧，订阅者会**再看到一次**。Raft 侧靠 term 单调 + 幂等挡住，
+- **总线侧的重放防护是后补的**：第一次上的是纯 MAC（完整性 + 主机身份），没有序号窗口，
+  线路旁观者可以重放一条事件帧、订阅者会**再看到一次**。**这一点已经修了**（帧内 `"seq"`
+  落在 MAC 覆盖区 + 每 claim 的高位标记，`nextSeq` / `acceptSeq` / `peer_seqs`），
+  但它自己的局限仍在（重启回退、`forgetPeerSeq` 要手动），见 §14 的"第二轮"。Raft 侧靠 term 单调 + 幂等挡住，
   总线侧没有这个性质 —— **残留风险，明写在这里**，要关掉需要 per-peer 序号窗口。
 - **混合版本集群仍未实测对跑**（设计上硬切）。
 - **并发写在同一个 socket 上未加锁**：`publish`（请求线程）与 `heartbeatLoop`（fiber）可能同时
