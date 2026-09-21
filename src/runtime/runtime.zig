@@ -5944,6 +5944,13 @@ test "Supervision (§14.5): a nested group escalates to its parent, and the pare
     // which contains the child subtree as one entry.
     try waitUntil(Published(@TypeOf(outer.group_restarts), u64){ .value = &outer.group_restarts, .want = 1 }, 5_000);
 
+    // Wait on the counter this test *asserts*, not on `group_restarts`: a
+    // rebuild bumps the latter *before* it runs `init` (`rebuildWorker`),
+    // so waiting on it and then reading the init counter is a check-then-assert
+    // race. Both init counters below are asserted this way; the `inner` one used
+    // to be read straight after the wait above, and that is what flaked on a
+    // loaded macOS CI runner (`expected 2, found 1`).
+    try waitUntil(Published(@TypeOf(inner_inits), u32){ .value = &inner_inits, .want = 2 }, 5_000);
     try std.testing.expectEqual(@as(u32, 2), inner_inits.load(.monotonic));
 
     // Wait on the counter this test *asserts*, not on `group_restarts`: a
