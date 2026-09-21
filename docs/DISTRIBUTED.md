@@ -16,7 +16,7 @@ For multi-node production, see the caveats below.
 | **RaftElection** | 11 | Leader election + vote counting. Multi-candidate split-vote tested. |
 | **DistributedTransaction** | 10 | 2PC protocol (commit + abort) + durable coordinator journal (`TransactionJournal.recover`). ⚠ Participants have no journal (see caveats). |
 | **ClusterMembership** | 4 | Gossip over bus with `subscribeWithContext` (join/leave/heartbeat converge). |
-| **DistributedEventBus** | 10 | Cross-node pub/sub + soft backpressure (quarantine after send failures). |
+| **DistributedEventBus** | 16 | Cross-node pub/sub + soft backpressure (quarantine after send failures); length-prefixed frames + optional HMAC (`setClusterSecret`). |
 | **ClusterView** (cluster/) | 6 | Reference-counted read-side snapshot + rendezvous pick. |
 | **WAL** (eventbus/) | 2 | Write-ahead log. Zig 0.16 Io.Dir + binary serialization. |
 | **DLQ** (eventbus/) | 3 | Dead-letter queue. Expiry + requeue with cooldown. |

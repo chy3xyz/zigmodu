@@ -2,6 +2,69 @@
 
 ## [Unreleased]
 
+### 集群入站零认证 ③：`DistributedEventBus` 自己的 listener 也上帧 + L1 —— 最后一个面闭环（**破坏性：是**）
+
+`docs/dev/cluster-auth-design.md` §3.3 的**第三个调用点**（审计项 ③ 的最后一个面）。
+此前该文件有自己的 listener（`:117`）、自己的 accept 环（`:149`）、自己的 `handleConnection`（`:198`），
+**全程零认证**：任何能连上总线端口的主机都能发布事件，且每个事件被信任为它自称的 `source`。
+
+**先修帧，再上认证** —— 不是顺序偏好，是 MAC 的前提：总线**完全没有消息帧**
+（一条 `readSome` 的返回值被当成一条完整消息），所以挂在它上面的 MAC 无法可靠验证 ——
+一条被两次读切开的合法消息给出半个 body，MAC 必然失败，于是**合法**事件被丢。
+帧化同时关掉两个既有的丢数据缺陷。
+
+| # | 缺陷 | 旧行为 |
+|---|---|---|
+| 1 | 一条消息被两次读切开 | 半个 JSON 解析失败 → 丢（或进 DLQ）—— **数据丢失** |
+| 2 | 两条消息落在一次读里 | `parseEvent` 只认第一条，第二条**静默丢弃** |
+| 3 | 固定 4096 字节栈缓冲 | 更大的 payload → `serializeEvent` 返回空切片 → `writeAll("")` **什么都没发**，且不记失败 |
+
+**帧形状（双向）**，与 `NetworkTransport.ClusterConnection` 同一套长度前缀：
+
+```text
+[4-byte BE len][mac: 32 raw bytes][json]    配了 cluster_secret
+[4-byte BE len][json]                       没配（"bare"：有长度前缀，没有 MAC）
+```
+
+`len` 覆盖它之后的一切，所以接收侧一次 `readFull(len)` 拿到整条；`len == 0` 或 >
+`NetworkTransport.MAX_MESSAGE_SIZE`（1 MiB）**在缓冲之前**拒绝并断开（流已失步）。
+**MAC 只覆盖 json 字节** —— 这个面没有 tag 字节（JSON 自带 `"topic"`），
+所以 MAC 在**头部**，与 Raft 那边尾部的 `[tag][payload][mac]` 形状相反。
+校验在任何解析之前完成，失败即 `std.log.debug` + 丢连接（认证失败**不是**解析失败，不进 DLQ）。
+
+**改动面**：`DistributedEventBus` 加 `cluster_secret` + `setClusterSecret`、
+`sendEventFrame`（`sendToNode` 与 `sendHeartbeat` 共用，帧整体一次 `writeAll`）、
+按事件大小分配的 `serializeEventAlloc`（替掉三处 `[4096]u8`）、定长帧接收环、
+以及**没有密钥时 `start()` 的 `log.warn`**（独立 bus 的端口是公开面）。
+`ClusterBootstrap.start()` 把**同一个** `config.cluster_secret` 交给 bus（`:167`）：
+Raft 端口认证了、事件端口没认证，等于审计项只关了一半。
+
+**破坏性：是** —— 总线线上格式变了，**混合版本对端必须一起升级**：
+
+- **新侧**收到非帧字节（旧格式）→ 长度落在 `1..1 MiB` 之外 → 丢连接 + debug 日志；
+- **旧侧**读到新帧**不保证干净地拒绝**：它的 `extractJsonValue` 是子串匹配器，
+  长度前缀与 MAC 是前导字节，JSON 跟在后头 —— 它可能解析出**一个错的事件**，
+  而不是干脆丢掉（`docs/dev/cluster-auth-design.md` §14）。
+
+**一行改法**：不用改代码，改的是部署 —— 所有节点**同版本**升级，密钥由应用从
+`SecretsManager` 取好填进 `BootstrapConfig.cluster_secret`；只用 `DistributedEventBus.start(port)`
+的独立部署调用一次 `bus.setClusterSecret(key)` 即可（不调用就是上面那个 warn 描述的公开总线）。
+
+**验证**：全量 **1505/1526（21 skipped，0 failed）**（+6，即新增 6 条用例），
+`zig fmt --check` + `check-production.sh` + `check-deadcode.sh` 全绿；
+Raft 侧未动且仍绿（`-Dtest-filter=RaftTransport` 14/14、`-Dtest-filter=RaftElection` 31/31）。
+两条变异逐条验过红、**都是断言红不是编译错**（按字节还原，md5 前后一致）：
+删掉 MAC 不匹配时的拒绝 → `a frame signed with another key is dropped` 在
+`expected 0, found 1` 处 `FAIL (TestExpectedEqual)`；
+把接收环换回"一次 `readSome` = 一条消息" →
+`a frame split across two writes delivers exactly one event` 在 `expected 1, found 0` 处同形红。
+
+**未做（写在明处）**：`source_node` **没有**与 `self.nodes` 对照（accept 侧无法把连接映射回 id ——
+对端地址是 `dialer_ip:临时端口`，与节点表的 `host:监听端口` 天然不等），所以配了密钥的对端仍可在
+payload 里冒用别的成员 id；`extractJsonValue` 仍是子串匹配器而非 JSON 解析器；
+总线侧**没有**重放防护（Raft 靠 term 单调兜底，总线没有这个性质）；
+并发写同一 socket 未加锁；混合版本未实测对跑。逐条见 §14。
+
 ### 集群成员校验（L2）：三个 Raft handler 只认成员 —— 零认证那条审计闭环（**破坏性：否**）
 
 `docs/dev/cluster-auth-design.md` §4 的落地，补上 §3（L1 逐帧 HMAC）之外的另一半。

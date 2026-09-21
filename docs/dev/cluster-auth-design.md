@@ -368,6 +368,7 @@ TLS/边车（`TlsTransport.zig:1-8` 的文件头已经写明 mTLS 目前要边�
   而那正是 leader→follower 复制唯一还能工作的原因 —— 先加 L2 会把唯一能走的路也堵死。
   §10 修完后 L2 已落地，见 §13。
 - `DistributedEventBus` 自己的 listener（§3.3 第三个调用点）**未做** —— 独立于 Raft 端口，单独一项。
+  **（2026-09-21 已落地，见 §14。）**
 - §3.6 的重放残留**按设计接受**（Raft 的 term 单调 + 幂等已覆盖），未做时间戳/窗口。
 - **混合版本集群未实测**：设计上硬切（不匹配的帧被丢弃 + debug 日志），但没有真的拿新旧两个二进制对跑。
 - 密钥的来源（`SecretsManager`）只有文档约定，**没有代码强制** —— `?[32]u8` 由应用自己填。
@@ -532,7 +533,118 @@ brief 说 `ClusterBootstrap drives raft.tick and serves inbound Raft RPCs` 里 `
 ### 仍未做
 
 - `DistributedEventBus` 自己的 listener（§3.3 第三个调用点）—— 独立于 Raft 端口，单独一项。
+  **（2026-09-21 已落地，见 §14。）**
 - §3.6 的重放残留**按设计接受**（Raft 的 term 单调 + 幂等已覆盖），未做时间戳/窗口。
 - 混合版本集群未实测对跑（设计上硬切）。
 - 密钥来源（`SecretsManager`）只有文档约定，无代码强制。
 - `scripts/ci-integration.sh` 未跑（不在本次要求的命令里）。
+
+---
+
+## 14. 总线侧入站（§3.3 第三个调用点）实现记录（2026-09-21）
+
+§1 表里的第 5 条 —— `DistributedEventBus` 自己的 listener、自己的 accept 环、自己的
+`handleConnection`，**零认证** —— 已落地。这是审计项 ③ 的最后一个面。
+
+**动工前先修的是帧**，因为 MAC 挂在没有帧的消息上无法可靠验证：一条被两次读切开的
+消息给出的是半个 body，MAC 必然失败，于是**合法**事件被丢。帧是认证的前提，不是偏好。
+
+### 三个既有缺陷（帧把它们一起关掉）
+
+| # | 缺陷 | 旧行为 |
+|---|---|---|
+| 1 | **一条消息被两次读切开** | 第一次读到的半个 JSON 解析失败 → 丢（或进 DLQ）。**数据丢失** |
+| 2 | **两条消息落在一次读里** | `parseEvent` 只认第一条，第二条**静默丢弃** |
+| 3 | **固定 4096 字节栈缓冲** | 超过它的 payload → `serializeEvent` 返回空切片 → `writeAll("")` **什么都没发**，且不记失败 |
+
+### 帧形状（双向）
+
+```text
+[4-byte BE len][mac: 32 raw bytes][json]    配了 cluster_secret
+[4-byte BE len][json]                       没配（"bare"）
+```
+
+- `len` 覆盖它之后的一切（MAC + json），所以接收侧一次 `readFull(len)` 拿到整条消息；
+  长度先读、再读 body，**校验在任何解析之前**完成。
+- MAC 只覆盖 **json 字节**：这个面**没有 tag 字节**（JSON 自带 `"topic"`），
+  和 Raft 的 `[tag][payload][mac]` 不同 —— 那边 MAC 在尾部覆盖 `[tag][payload]`，
+  这边 MAC 在头部覆盖 json。常量时间比较复用 `ClusterAuth.timingSafeEql`。
+- 上下界：`len == 0` 与 `len > NetworkTransport.MAX_MESSAGE_SIZE`（1 MiB）**在缓冲之前**拒绝并
+  断开连接 —— 流已经失步（或对端是另一个 wire 版本），猜下一个帧的起点等于把任意字节交给解析器。
+- 任何失败都是 `std.log.debug` + `break`（丢连接），与 `RaftTransport.handleConnection` 同形。
+  认证失败**不是解析失败**，所以不进 DLQ。
+
+### 改动面
+
+| 文件 | 改动 |
+|---|---|
+| `src/core/DistributedEventBus.zig` | `cluster_secret: ?[32]u8` + `setClusterSecret`（`:65` / `:610`）；`sendEventFrame`（`:262`，一个入口同时给 `sendToNode` 与 `sendHeartbeat`）；`openEventFrame`（`:293`）；`handleConnection` 改成**定长帧循环**（`:311`，读帧 `:330-356`）；`serializeEventAlloc`（`:596`）按事件大小分配，替掉三处 `[4096]u8`；`start()` 在没有密钥时 `log.warn`（`:166`） |
+| `src/core/cluster/ClusterBootstrap.zig` | `:167` 把 `config.cluster_secret` 交给 bus（`setClusterSecret`）—— 密钥**只有一个来源**，就是门禁刚判过的那个配置项，不新造第二条 |
+
+`sendEventFrame` 是**一个** helper：拼帧 + 一次 `writeAll`（帧整体一次写出，MAC 也在里面）。
+发送侧因此不再有"渲染进固定数组"那一步 —— 缺陷 3 在线上路径上不可达了。
+（`serializeEvent` 自己仍然是"缓冲不够就返回空切片"的契约，见下面的未做清单。）
+
+### 门禁的位置：为什么 `start()` 只 warn
+
+`start(port)` 是**独立入口**，它不知道集群的形状（单节点 bus 完全合法，没有对端要认证），
+所以这里**不拒绝**，只把风险喊出来。**强制门禁在 `ClusterBootstrap.start()`**（多节点 + 真 transport +
+无密钥 → `error.ClusterAuthRequired`），那里才知道该拒谁。warn 的措辞：
+
+> `[DistributedEventBus] node '{s}' listening on port {d} WITHOUT a cluster_secret: any host that can reach this port may publish events, and every frame is trusted as whatever `source` it claims — `__heartbeat` included. Call `setClusterSecret` (`ClusterBootstrap` does it for an enforced configuration).`
+
+### 验证
+
+全量 **1505/1526（21 skipped，0 failed）**（+6，即本次新增用例），`zig fmt --check` + `check-production.sh` +
+`check-deadcode.sh` 全绿。Raft 侧未动且仍绿：`-Dtest-filter=RaftTransport` 14/14、`-Dtest-filter=RaftElection` 31/31。
+
+新增 6 条用例（`DistributedEventBus.zig:1182` 起）：split-write 只投一次、一次写两条都投、
+带密钥的 publish→线上→订阅者（**逐字节**断言 `[len][mac][json]`）、另一把密钥签的帧被丢（带正对照）、
+签名后改过 json 的帧被丢（带正对照）、无密钥的 bare 帧仍被接受（断言"**有长度前缀、没有 MAC**"：
+`body.len == eventJsonSize(parsed)`，多一个字节都过不了）。
+
+**两条变异逐条验红，都是断言红不是编译错**（都按字节还原，md5 前后一致 `2dab557473bb8bf7c3b5418b7eaf528e`，
+`grep -c MUTATION` → 0）：
+
+1. 删掉 MAC 不匹配时的 `return null` →
+   `core.DistributedEventBus.test.a frame signed with another key is dropped...expected 0, found 1` /
+   `FAIL (TestExpectedEqual)`；
+2. 把接收环换回"一次 `readSome` = 一条消息" →
+   `...a frame split across two writes delivers exactly one event...expected 1, found 0` /
+   `FAIL (TestExpectedEqual)`。
+
+**实现期自己抓到的一个错**（值得记，因为它是"测试先红"的样本）：第一版 `openEventFrame`
+照 Raft 的形状把 MAC 当成**尾部**剥离（`body[len-32..]`），于是 MAC 覆盖的是 MAC 自己 —— 三条带密钥的用例
+当场红（`expected 1, found 0`），改成头部剥离后全绿。**抄帧形状不能抄一半。**
+
+### 未做（逐条）
+
+- **`serializeEvent`（改动前 `:434-441`，现 `:571`）自己没有修**：它仍以"返回空切片"报告缓冲不足。
+  本次只是把**发送路径**换成按事件大小分配的 `serializeEventAlloc`，所以线上不可达；这个契约留给
+  下一个调用者时仍是个坑（`catch buf[0..0]` 静默）。
+- **`extractJsonValue`（改动前 `:241-254`，现 `:380`）仍是子串匹配器，不是 JSON 解析器**：payload 里
+  出现字面量 `"topic"` 就能**改变解析方向**。L1 不依赖它（验签在解析之前），所以本次只记录。
+  **顺带发现的一个交互**：正因为它匹配子串，**旧**对端读到新帧时未必"干净地丢弃" —— 它可能解析出
+  一个**错的事件**（长度前缀与 MAC 是前导字节，JSON 跟在后头）。所以混合版本的正确口径是：
+  **新侧丢弃一切非帧字节（有日志），旧侧可能误解析** —— 这不是"两边都安静地不工作"，
+  而是"旧侧必须一起升级"。
+- **`source_node` 仍未与 `self.nodes` 对照 —— 记为 open，没有关**。`parseEvent`（`:395-405`）把
+  `"source"` 直接 `dupe` 成 `source_node`（`:398` / `:404`），从不查它是不是已知成员：
+  **L1 认证的是"哪台主机"，不是"它自称是哪个节点"**，所以配了密钥的对端仍然可以在 payload 里冒用
+  任何成员的 id（`__heartbeat` 也一样）。为什么没顺手关：**accept 侧没有把连接映射回 id 的手段**。
+  `self.nodes` 以 id 为键，而入站连接的对端地址是 `dialer_ip:临时端口` —— 与节点表里登记的
+  `host:监听端口` **天然不等**（NAT 之后更不可能）。要真关掉得先有握手（连接上先自报 id 并证明），
+  那是 §4 形状的另一件事，不是一次校验能补的。
+- §3.6 的重放残留**按设计接受**（总线侧的重放语义没有 Raft 的 term 单调兜底，见下一条）。
+- **总线侧没有重放防护**：这次上的是 MAC（完整性 + 主机身份），没有时间戳/序号窗口，
+  所以线路旁观者可以重放一条事件帧，订阅者会**再看到一次**。Raft 侧靠 term 单调 + 幂等挡住，
+  总线侧没有这个性质 —— **残留风险，明写在这里**，要关掉需要 per-peer 序号窗口。
+- **混合版本集群仍未实测对跑**（设计上硬切）。
+- **并发写在同一个 socket 上未加锁**：`publish`（请求线程）与 `heartbeatLoop`（fiber）可能同时
+  `writeAll` 到同一个对端。帧化之后这种交错的后果从"静默乱解析"降级为"帧校验失败 → 丢连接"，
+  但**没有**用互斥把它消掉。
+- **入站读没有超时**：一个连上总线端口、一个字节都不发的对端会把该连接的 fiber 一直占住，
+  而 `stop()` 要等这些 fiber（`fiber_group.await`）。树里已经有 `sockread.setRecvTimeout`
+  （Raft 入站在用，`:678`），总线这一次**没接** —— 是独立的一项，不带密钥时它同时是一条
+  廉价的拒绝服务路径。
+

@@ -10,6 +10,36 @@ const DLQ = @import("eventbus/DLQ.zig").DLQ;
 const DLQConfig = @import("eventbus/DLQ.zig").DLQConfig;
 const RequeuedMessage = @import("eventbus/DLQ.zig").RequeuedMessage;
 const Partitioner = @import("eventbus/Partitioner.zig").ConsistentHashPartitioner;
+const NetworkTransport = @import("cluster/NetworkTransport.zig");
+const ClusterAuth = @import("cluster/TlsTransport.zig").ClusterAuth;
+
+// ── Wire format for peer traffic (both directions) ──────────────────────────
+//
+//     [4-byte big-endian len][mac: 32 raw bytes][json]   `cluster_secret` set
+//     [4-byte big-endian len][json]                      no secret ("bare")
+//
+// `len` counts everything after it, so the reader's single `readFull(len)` gets
+// the whole message. Before this the bus had **no framing at all**: one
+// `readSome` was treated as one message, which lost data both ways — a message
+// split across two reads failed to parse, and two messages in one read had the
+// second one silently dropped. A MAC over an unframed message cannot be
+// verified for the same reason (a split read gives a partial body, so a
+// legitimate event would be dropped), which is why framing came first
+// (`docs/dev/cluster-auth-design.md` §3).
+//
+// The MAC covers the **json bytes only**. Unlike the Raft port there is no tag
+// byte on this surface — the JSON carries its own `"topic"` — so `json` is the
+// whole message body, and the raw 32-byte tag is compared with
+// `ClusterAuth.timingSafeEql` exactly as `RaftTransport.verifiedRecv` does.
+
+/// Length of the `mac32` the send side writes and the receive side strips.
+const auth_mac_bytes = 32;
+
+/// Cap on one frame body (`mac32 + json`). The same 1 MiB
+/// `NetworkTransport.MAX_MESSAGE_SIZE` puts on a Raft frame: same cluster, same
+/// kind of socket, and it is checked **before** the body is buffered, so a peer
+/// cannot make this node allocate without bound.
+const max_frame_size = NetworkTransport.MAX_MESSAGE_SIZE;
 
 /// Distributed Event Bus for cross-node communication
 /// Allows events to be published and subscribed across multiple processes/machines
@@ -27,6 +57,12 @@ pub const DistributedEventBus = struct {
     heartbeat_thread: ?std.Thread,
     /// Owns accept/handle/heartbeat fibers; awaited in `stop()`.
     fiber_group: std.Io.Group,
+
+    /// 32-byte pre-shared key authenticating every peer frame in **both**
+    /// directions. `null` (the default) means bare frames — length-prefixed
+    /// with no MAC, the state `start()` warns about and `ClusterBootstrap`
+    /// refuses for a multi-node cluster.
+    cluster_secret: ?[32]u8 = null,
 
     /// Optional distributed components
     partitioner: ?*Partitioner = null,
@@ -119,6 +155,22 @@ pub const DistributedEventBus = struct {
 
         std.log.info("[DistributedEventBus] Node '{s}' listening on port {d}", .{ self.node_id, port });
 
+        // A standalone `start(port)` has no cluster shape to judge, so this is a
+        // warning and not a refusal: `ClusterBootstrap.start()` owns the
+        // enforced gate (multi-node + real transport + no key =
+        // `error.ClusterAuthRequired`), and a single-node bus legitimately has
+        // no peer to authenticate. All this entry point can honestly do is be
+        // loud, so a standalone deployment is not silently open.
+        if (self.cluster_secret == null) {
+            std.log.warn(
+                "[DistributedEventBus] node '{s}' listening on port {d} WITHOUT a cluster_secret: any host that can reach " ++
+                    "this port may publish events, and every frame is trusted as whatever `source` it claims — " ++
+                    "`__heartbeat` included. Call `setClusterSecret` (`ClusterBootstrap` does it for an enforced " ++
+                    "configuration).",
+                .{ self.node_id, port },
+            );
+        }
+
         // Start accept loop and heartbeat asynchronously as members of
         // `fiber_group` so their futures do not leak.
         self.fiber_group.async(self.io, acceptLoop, .{self});
@@ -181,18 +233,79 @@ pub const DistributedEventBus = struct {
             .source_node = self.node_id,
             .timestamp = Time.monotonicNowSeconds(),
         };
-        var buf: [4096]u8 = undefined;
-        const serialized = serializeEvent(event, &buf);
+        // Serialized once for every peer, framed per peer: the frame carries the
+        // MAC, and the MAC only has to cover the json.
+        const json = serializeEventAlloc(self.allocator, event) catch |err| {
+            std.log.warn("[DistributedEventBus] Heartbeat not sent: {}", .{err});
+            return;
+        };
+        defer self.allocator.free(json);
 
         for (self.nodes.items) |*node| {
             if (node.socket) |sock| {
-                var write_buf: [4096]u8 = undefined;
-                var w = sock.writer(self.io, &write_buf);
-                _ = w.interface.writeAll(serialized) catch |err| {
+                self.sendEventFrame(sock, json) catch |err| {
                     std.log.warn("[DistributedEventBus] Heartbeat failed to node {s}: {}", .{ node.id, err });
                 };
             }
         }
+    }
+
+    /// Frame `json` for the wire (see the wire-format comment at the top of this
+    /// file) and write it with a single `writeAll`, so the whole message — MAC
+    /// included — leaves as one call.
+    ///
+    /// The frame is built in one heap buffer sized for this event. The old send
+    /// path rendered into a fixed `[4096]u8` scratch array and wrote whatever
+    /// came out; `serializeEvent` reports overflow by returning an empty slice,
+    /// so an event bigger than the array was written as `""` — nothing on the
+    /// wire, no failure recorded (`docs/dev/cluster-auth-design.md` §14).
+    fn sendEventFrame(self: *Self, sock: std.Io.net.Stream, json: []const u8) !void {
+        const mac_len: usize = if (self.cluster_secret != null) auth_mac_bytes else 0;
+        const body_len = mac_len + json.len;
+        if (body_len > max_frame_size) return error.MessageTooLarge;
+
+        const frame = try self.allocator.alloc(u8, 4 + body_len);
+        defer self.allocator.free(frame);
+        std.mem.writeInt(u32, frame[0..4], @intCast(body_len), .big);
+        if (self.cluster_secret) |key| {
+            std.crypto.auth.hmac.sha2.HmacSha256.create(frame[4..][0..auth_mac_bytes], json, &key);
+        }
+        @memcpy(frame[4 + mac_len ..], json);
+
+        var write_buf: [4096]u8 = undefined;
+        var w = sock.writer(self.io, &write_buf);
+        try w.interface.writeAll(frame);
+        try w.interface.flush();
+    }
+
+    /// The receive half of `sendEventFrame`: return the json inside one frame
+    /// body, or null when the frame must be dropped. A drop is terminal for the
+    /// connection — the stream cannot be resynchronised past an unauthenticated
+    /// frame — which is exactly how `RaftTransport.handleConnection` treats one.
+    ///
+    /// The MAC is a **prefix** here (`[mac32][json]`, the inverse of the Raft
+    /// port's trailing tag): the length is known first, so which bytes are the
+    /// tag does not have to be guessed from the body's tail.
+    ///
+    /// The two drops are the `error.ClusterAuthFailed` cases: a body too short
+    /// to carry a MAC (a bare frame from a peer that has no secret —
+    /// mixed-version clusters cut over hard) and a MAC that does not match.
+    fn openEventFrame(self: *Self, body: []const u8) ?[]const u8 {
+        const key = self.cluster_secret orelse return body;
+        if (body.len < auth_mac_bytes + 1) {
+            std.log.debug("[DEB] dropping connection: {d}-byte body carries no MAC", .{body.len});
+            return null;
+        }
+        const json = body[auth_mac_bytes..];
+        // Raw bytes, the same reason `RaftTransport.verifiedRecv` is: the frame
+        // carries the tag, raw, not `ClusterAuth.sign`'s hex rendering.
+        var expected: [auth_mac_bytes]u8 = undefined;
+        std.crypto.auth.hmac.sha2.HmacSha256.create(&expected, json, &key);
+        if (!ClusterAuth.timingSafeEql(&expected, body[0..auth_mac_bytes])) {
+            std.log.debug("[DEB] dropping connection: frame MAC does not verify", .{});
+            return null;
+        }
+        return json;
     }
 
     fn handleConnection(self: *Self, conn: std.Io.net.Stream) void {
@@ -202,19 +315,45 @@ pub const DistributedEventBus = struct {
         var msg_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer msg_arena.deinit();
 
+        // One body buffer for every frame on this connection: `resize` keeps the
+        // capacity, so a peer sending many small frames allocates once.
+        var body = ArrayList(u8).init(self.allocator);
+        defer body.deinit();
+
         while (self.is_running) {
             const ma = msg_arena.allocator();
 
-            // Raw read: io-based socket reads can hang when the io is shared
-            // across threads (see core/sockread.zig).
-            var read_buf: [8192]u8 = undefined;
-            const n = sockread.readSome(conn, &read_buf) catch |err| {
+            // Raw reads (see core/sockread.zig); `readFull` is what makes the
+            // stream a stream: the length prefix says how much the message is,
+            // so a frame arriving in two reads is not two messages.
+            var len_buf: [4]u8 = undefined;
+            sockread.readFull(conn, &len_buf) catch |err| {
+                // A peer that went away is routine, so this stays at debug
+                // level; EOF is the normal end of a connection.
+                if (self.is_running) std.log.debug("[DEB] Read error: {}", .{err});
+                break;
+            };
+            const body_len = std.mem.readInt(u32, &len_buf, .big);
+            if (body_len == 0 or body_len > max_frame_size) {
+                // Not recoverable: the stream is desynchronised (or the peer
+                // speaks another wire version), and guessing where the next
+                // frame starts would hand the parser arbitrary bytes.
+                std.log.debug("[DEB] dropping connection: frame length {d} outside 1..{d}", .{ body_len, max_frame_size });
+                break;
+            }
+            body.resize(body_len) catch |err| {
+                std.log.debug("[DEB] dropping connection: cannot buffer a {d}-byte frame ({})", .{ body_len, err });
+                break;
+            };
+            sockread.readFull(conn, body.items) catch |err| {
                 if (self.is_running) std.log.debug("[DEB] Read error: {}", .{err});
                 break;
             };
 
-            if (n == 0) break;
-            const data = read_buf[0..n];
+            // Verify before parsing, and drop on failure: an unauthenticated
+            // frame is never handed to the parser, and it is not a *parse*
+            // failure, so it does not go to the DLQ either.
+            const data = self.openEventFrame(body.items) orelse break;
 
             // Parse using our arena to avoid multiple tiny heap allocations
             if (parseEvent(ma, data)) |event| {
@@ -288,9 +427,10 @@ pub const DistributedEventBus = struct {
             .timestamp = Time.monotonicNowSeconds(),
         };
 
-        // Serialize event
-        var buf: [4096]u8 = undefined;
-        const serialized = serializeEvent(event, &buf);
+        // Serialize once for every peer (the frame is built per peer in
+        // `sendEventFrame`, because the MAC is part of it).
+        const json = try serializeEventAlloc(self.allocator, event);
+        defer self.allocator.free(json);
 
         // Route via partitioner if configured; otherwise broadcast.
         var routed = false;
@@ -302,7 +442,7 @@ pub const DistributedEventBus = struct {
                 } else {
                     for (self.nodes.items) |*node| {
                         if (std.mem.eql(u8, node.id, target_node)) {
-                            routed = self.sendToNode(node, topic, payload, serialized);
+                            routed = self.sendToNode(node, topic, payload, json);
                             break;
                         }
                     }
@@ -320,7 +460,7 @@ pub const DistributedEventBus = struct {
         if (!routed) {
             // Broadcast to all connected nodes with soft backpressure on failing sockets
             for (self.nodes.items) |*node| {
-                _ = self.sendToNode(node, topic, payload, serialized);
+                _ = self.sendToNode(node, topic, payload, json);
             }
         }
 
@@ -329,20 +469,14 @@ pub const DistributedEventBus = struct {
         self.local_bus.publish(event);
     }
 
-    /// Send a serialized event to a single node. Returns true on success.
-    /// On failure, increments the node failure counter. The message is pushed to
-    /// the DLQ only when the cumulative failures reach `max_send_failures`
-    /// (immediately before the node is quarantined).
-    fn sendToNode(self: *Self, node: *Node, topic: []const u8, payload: []const u8, serialized: []const u8) bool {
+    /// Send one event's json to a single node as a framed message. Returns true
+    /// on success. On failure, increments the node failure counter. The message
+    /// is pushed to the DLQ only when the cumulative failures reach
+    /// `max_send_failures` (immediately before the node is quarantined).
+    fn sendToNode(self: *Self, node: *Node, topic: []const u8, payload: []const u8, json: []const u8) bool {
         if (node.send_failures >= self.max_send_failures) return false;
         if (node.socket) |sock| {
-            var write_buf: [4096]u8 = undefined;
-            var w = sock.writer(self.io, &write_buf);
-            w.interface.writeAll(serialized) catch |err| {
-                self.recordSendFailure(node, sock, topic, payload, err);
-                return false;
-            };
-            w.interface.flush() catch |err| {
+            self.sendEventFrame(sock, json) catch |err| {
                 self.recordSendFailure(node, sock, topic, payload, err);
                 return false;
             };
@@ -431,13 +565,50 @@ pub const DistributedEventBus = struct {
         }
     }
 
+    /// The JSON body of one event — the shape `parseEvent` reads back.
+    const event_json_fmt = "{{\"topic\":\"{s}\",\"payload\":\"{s}\",\"source\":\"{s}\",\"time\":{d}}}";
+
     fn serializeEvent(event: NetworkEvent, buf: []u8) []const u8 {
-        return std.fmt.bufPrint(buf, "{{\"topic\":\"{s}\",\"payload\":\"{s}\",\"source\":\"{s}\",\"time\":{d}}}", .{
+        return std.fmt.bufPrint(buf, event_json_fmt, .{
             event.topic,
             event.payload,
             event.source_node,
             event.timestamp,
         }) catch buf[0..0];
+    }
+
+    /// Byte count of the JSON `serializeEvent` writes for `event` — `std.fmt.count`
+    /// over the same format string, so the two cannot drift.
+    fn eventJsonSize(event: NetworkEvent) usize {
+        return std.fmt.count(event_json_fmt, .{
+            event.topic,
+            event.payload,
+            event.source_node,
+            event.timestamp,
+        });
+    }
+
+    /// `serializeEvent` into a buffer sized for **this** event, so a payload
+    /// larger than any fixed scratch array is sent in full: the old send path
+    /// rendered into a `[4096]u8` local, and `serializeEvent` reports overflow by
+    /// returning an empty slice, so a bigger event left the node as nothing at
+    /// all and no failure was recorded (`docs/dev/cluster-auth-design.md` §14).
+    fn serializeEventAlloc(allocator: std.mem.Allocator, event: NetworkEvent) ![]u8 {
+        const buf = try allocator.alloc(u8, eventJsonSize(event));
+        errdefer allocator.free(buf);
+        const json = serializeEvent(event, buf);
+        // Same format string on both sides, so this cannot fire; it guards the
+        // pair against drifting apart, and is never a silently empty frame.
+        if (json.len != buf.len) return error.EventTooLarge;
+        return buf;
+    }
+
+    /// Set the key peer frames are signed and verified with. Null (the default)
+    /// means bare frames — `ClusterBootstrap` only ever sets a non-null
+    /// `cluster_secret` behind its multi-node gate, so the enforced path is the
+    /// authenticated one. See the wire-format comment at the top of this file.
+    pub fn setClusterSecret(self: *Self, key: [32]u8) void {
+        self.cluster_secret = key;
     }
 
     /// Get list of connected nodes
@@ -940,4 +1111,359 @@ test "DistributedEventBus duplicate connect reconciles partitioner" {
     // Reconnecting the same logical node should add it back to the ring.
     try bus.connectToNode("node-2", addr);
     try std.testing.expectEqual(@as(usize, 2), partitioner.nodeCount());
+}
+
+// ── Framing + L1 (`docs/dev/cluster-auth-design.md` §3, §14) ────────────────
+//
+// These tests drive `handleConnection` directly over a socketpair: it is the
+// bare two-ended stream the framing exists for, and it keeps them off the
+// network (`NetworkProbe` gates the loopback ones). The peer half is closed
+// before the call, so the framed loop drains what is buffered and stops at EOF
+// — no thread and no read timing, except where a split into two separately
+// observed reads is the thing under test.
+
+/// The bytes of one bus frame, built the way `sendEventFrame` builds them: the
+/// receive-side tests need raw bytes (a body split across two writes, a body
+/// that changed after it was signed), which is exactly why they do not go
+/// through the sender.
+fn testFrame(allocator: std.mem.Allocator, secret: ?[32]u8, json: []const u8) ![]u8 {
+    const mac_len: usize = if (secret != null) auth_mac_bytes else 0;
+    const frame = try allocator.alloc(u8, 4 + mac_len + json.len);
+    std.mem.writeInt(u32, frame[0..4], @intCast(mac_len + json.len), .big);
+    if (secret) |key| {
+        var mac: [auth_mac_bytes]u8 = undefined;
+        std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, json, &key);
+        @memcpy(frame[4..][0..auth_mac_bytes], &mac);
+    }
+    @memcpy(frame[4 + mac_len ..], json);
+    return frame;
+}
+
+/// Hand `bytes` to `bus.handleConnection` as the peer end of a fresh socketpair,
+/// with the writer half already closed.
+fn feedFrame(bus: *DistributedEventBus, bytes: []const u8) !void {
+    var fds: [2]std.posix.socket_t = undefined;
+    const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    const reader_side = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } };
+    const writer_side = std.Io.net.Stream{ .socket = .{ .handle = fds[1], .address = undefined } };
+    sockread.writeFull(writer_side, bytes) catch |err| {
+        writer_side.close(std.testing.io);
+        reader_side.close(std.testing.io);
+        return err;
+    };
+    writer_side.close(std.testing.io);
+    bus.is_running = true;
+    bus.handleConnection(reader_side);
+    bus.is_running = false;
+}
+
+/// A bus with a subscriber that counts events on one topic. `received` is the
+/// caller's counter, so a test can reset it between two feeds.
+fn framedBus(allocator: std.mem.Allocator, node_id: []const u8, topic: []const u8, received: *usize) !DistributedEventBus {
+    var bus = try DistributedEventBus.init(allocator, std.testing.io, node_id);
+    errdefer bus.deinit();
+    const Listener = struct {
+        var count: *usize = undefined;
+        var expected: []const u8 = undefined;
+        fn cb(evt: DistributedEventBus.NetworkEvent) void {
+            if (std.mem.eql(u8, evt.topic, expected)) count.* += 1;
+        }
+    };
+    Listener.count = received;
+    Listener.expected = topic;
+    try bus.subscribe(topic, Listener.cb);
+    return bus;
+}
+
+test "a frame split across two writes delivers exactly one event" {
+    const allocator = std.testing.allocator;
+    var received: usize = 0;
+    var bus = try framedBus(allocator, "split-node", "split.topic", &received);
+    defer bus.deinit();
+
+    var json_buf: [600]u8 = undefined;
+    const long_payload: [400]u8 = @splat('x');
+    const json = DistributedEventBus.serializeEvent(.{
+        .topic = "split.topic",
+        .payload = &long_payload,
+        .source_node = "peer",
+        .timestamp = 7,
+    }, &json_buf);
+    try std.testing.expect(json.len > 400);
+    const frame = try testFrame(allocator, null, json);
+    defer allocator.free(frame);
+
+    // Split inside the payload string, so the first chunk cannot parse as a
+    // complete event on its own (`"source"` has not arrived yet). That is the
+    // shape a real TCP stream produces, and the reason why one read cannot be
+    // one message: on the old loop the first chunk failed to parse and the
+    // second failed too — the event was lost.
+    const source_at = std.mem.indexOf(u8, frame, "\"source\"") orelse frame.len;
+    const cut = frame.len / 2;
+    try std.testing.expect(cut > 16 and cut < source_at);
+
+    var fds: [2]std.posix.socket_t = undefined;
+    const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    const reader_side = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } };
+    const writer_side = std.Io.net.Stream{ .socket = .{ .handle = fds[1], .address = undefined } };
+
+    bus.is_running = true;
+    const reader = try std.Thread.spawn(.{}, DistributedEventBus.handleConnection, .{ &bus, reader_side });
+    try sockread.writeFull(writer_side, frame[0..cut]);
+    // Let the reader take the first chunk and block on the rest. Without the
+    // gap the kernel hands both chunks over in one read, and the split — the
+    // whole point of this test — would never happen.
+    std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(100), .awake) catch |err| {
+        std.log.debug("[test] inter-chunk wait ({})", .{err});
+    };
+    try sockread.writeFull(writer_side, frame[cut..]);
+    writer_side.close(std.testing.io);
+    reader.join();
+    bus.is_running = false;
+
+    try std.testing.expectEqual(@as(usize, 1), received);
+}
+
+test "two frames in one write deliver both events" {
+    const allocator = std.testing.allocator;
+    var received: usize = 0;
+    var bus = try framedBus(allocator, "pair-node", "pair.topic", &received);
+    defer bus.deinit();
+
+    var json_a_buf: [128]u8 = undefined;
+    var json_b_buf: [128]u8 = undefined;
+    const json_a = DistributedEventBus.serializeEvent(.{
+        .topic = "pair.topic",
+        .payload = "first",
+        .source_node = "peer",
+        .timestamp = 1,
+    }, &json_a_buf);
+    const json_b = DistributedEventBus.serializeEvent(.{
+        .topic = "pair.topic",
+        .payload = "second",
+        .source_node = "peer",
+        .timestamp = 2,
+    }, &json_b_buf);
+
+    const frame_a = try testFrame(allocator, null, json_a);
+    defer allocator.free(frame_a);
+    const frame_b = try testFrame(allocator, null, json_b);
+    defer allocator.free(frame_b);
+
+    // Both messages in a single write. The old loop read once per message, so
+    // the second one was silently discarded — this is that data loss.
+    const both = try std.mem.concat(allocator, u8, &.{ frame_a, frame_b });
+    defer allocator.free(both);
+    try feedFrame(&bus, both);
+
+    try std.testing.expectEqual(@as(usize, 2), received);
+}
+
+test "a signed frame round-trips: publish → wire → subscriber" {
+    const allocator = std.testing.allocator;
+    const secret: [32]u8 = @splat(0x5a);
+    const topic = "wire.topic";
+
+    // The sender half: a real node with a real secret, writing to the peer end
+    // of a socketpair instead of dialling.
+    var sender = try DistributedEventBus.init(allocator, std.testing.io, "sender-node");
+    defer sender.deinit();
+    sender.setClusterSecret(secret);
+
+    var fds: [2]std.posix.socket_t = undefined;
+    const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    const peer_side = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } };
+    const bus_side = std.Io.net.Stream{ .socket = .{ .handle = fds[1], .address = undefined } };
+    try sender.nodes.append(.{
+        .id = try allocator.dupe(u8, "receiver-node"), // owned by the bus, freed by `deinit`
+        .address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 19100),
+        .socket = peer_side,
+        .last_seen = 0,
+    });
+
+    try sender.publish(topic, "signed-payload");
+
+    // What actually went out: `[4-byte BE len][mac32][json]`, `len` covering the
+    // MAC and the json, and the MAC over the **json bytes only**.
+    var len_buf: [4]u8 = undefined;
+    try sockread.readFull(bus_side, &len_buf);
+    const body_len = std.mem.readInt(u32, &len_buf, .big);
+    const body = try allocator.alloc(u8, body_len);
+    defer allocator.free(body);
+    try sockread.readFull(bus_side, body);
+    bus_side.close(std.testing.io);
+
+    try std.testing.expect(body_len > auth_mac_bytes);
+    const json = body[auth_mac_bytes..];
+    var expected_mac: [auth_mac_bytes]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&expected_mac, json, &secret);
+    try std.testing.expectEqualSlices(u8, &expected_mac, body[0..auth_mac_bytes]);
+    const parsed = DistributedEventBus.parseEvent(allocator, json) orelse return error.TestUnexpectedResult;
+    defer allocator.free(parsed.topic);
+    defer allocator.free(parsed.payload);
+    defer allocator.free(parsed.source_node);
+    try std.testing.expectEqualStrings(topic, parsed.topic);
+    try std.testing.expectEqualStrings("signed-payload", parsed.payload);
+    try std.testing.expectEqualStrings("sender-node", parsed.source_node);
+
+    // …and the very same bytes are what a receiving bus dispatches.
+    const frame = try allocator.alloc(u8, 4 + body_len);
+    defer allocator.free(frame);
+    @memcpy(frame[0..4], &len_buf);
+    @memcpy(frame[4..], body);
+
+    var received: usize = 0;
+    var receiver = try framedBus(allocator, "receiver-node", topic, &received);
+    defer receiver.deinit();
+    receiver.setClusterSecret(secret);
+    try feedFrame(&receiver, frame);
+
+    try std.testing.expectEqual(@as(usize, 1), received);
+}
+
+test "a frame signed with another key is dropped" {
+    const allocator = std.testing.allocator;
+    const sender_key: [32]u8 = @splat(0x11);
+    const receiver_key: [32]u8 = @splat(0x22);
+
+    var json_buf: [128]u8 = undefined;
+    const json = DistributedEventBus.serializeEvent(.{
+        .topic = "key.topic",
+        .payload = "confidential",
+        .source_node = "peer",
+        .timestamp = 3,
+    }, &json_buf);
+    const frame = try testFrame(allocator, sender_key, json);
+    defer allocator.free(frame);
+
+    var received: usize = 0;
+    var wrong_key = try framedBus(allocator, "wrong-key-node", "key.topic", &received);
+    defer wrong_key.deinit();
+    wrong_key.setClusterSecret(receiver_key);
+    try feedFrame(&wrong_key, frame);
+    try std.testing.expectEqual(@as(usize, 0), received);
+
+    // Positive control: the fixture is a frame that *is* deliverable — the same
+    // bytes reach the subscriber when the key matches, so the assertion above is
+    // about the key and not about a broken frame.
+    var right_key = try framedBus(allocator, "right-key-node", "key.topic", &received);
+    defer right_key.deinit();
+    right_key.setClusterSecret(sender_key);
+    try feedFrame(&right_key, frame);
+    try std.testing.expectEqual(@as(usize, 1), received);
+}
+
+test "a frame whose json changed after signing is dropped" {
+    const allocator = std.testing.allocator;
+    const secret: [32]u8 = @splat(0x33);
+
+    var json_buf: [128]u8 = undefined;
+    const json = DistributedEventBus.serializeEvent(.{
+        .topic = "tamper.topic",
+        .payload = "original-payload",
+        .source_node = "peer",
+        .timestamp = 4,
+    }, &json_buf);
+    const frame = try testFrame(allocator, secret, json);
+    defer allocator.free(frame);
+
+    // Flip one byte of the payload value, leaving the JSON valid and the topic —
+    // which is what the subscriber matches on — untouched: a frame that would be
+    // counted if it were accepted.
+    const payload_at = std.mem.indexOf(u8, frame, "\"payload\":\"") orelse 0;
+    try std.testing.expect(payload_at > 0);
+    const tampered = try allocator.dupe(u8, frame);
+    defer allocator.free(tampered);
+    tampered[payload_at + "\"payload\":\"".len] ^= 0x01;
+    try std.testing.expect(!std.mem.eql(u8, frame, tampered));
+
+    var received: usize = 0;
+    var bus = try framedBus(allocator, "tamper-node", "tamper.topic", &received);
+    defer bus.deinit();
+    bus.setClusterSecret(secret);
+
+    // Positive control: the untampered frame is delivered.
+    try feedFrame(&bus, frame);
+    try std.testing.expectEqual(@as(usize, 1), received);
+
+    // Changed after signing → the MAC no longer matches → dropped, nothing
+    // dispatched (the frame never reaches `parseEvent`, so it is not a DLQ entry
+    // either).
+    try feedFrame(&bus, tampered);
+    try std.testing.expectEqual(@as(usize, 1), received);
+}
+
+test "without a secret the frame is length-prefixed with no MAC, and accepted" {
+    const allocator = std.testing.allocator;
+    const topic = "bare.topic";
+
+    // Sent by a real node with no secret: the standalone path, which keeps
+    // working — "bare" means framed with the MAC omitted, not unframed.
+    var sender = try DistributedEventBus.init(allocator, std.testing.io, "bare-sender");
+    defer sender.deinit();
+
+    var fds: [2]std.posix.socket_t = undefined;
+    const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    const peer_side = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } };
+    const bus_side = std.Io.net.Stream{ .socket = .{ .handle = fds[1], .address = undefined } };
+    try sender.nodes.append(.{
+        .id = try allocator.dupe(u8, "bare-receiver"), // owned by the bus, freed by `deinit`
+        .address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 19101),
+        .socket = peer_side,
+        .last_seen = 0,
+    });
+
+    try sender.publish(topic, "bare-payload");
+
+    var len_buf: [4]u8 = undefined;
+    try sockread.readFull(bus_side, &len_buf);
+    const body_len = std.mem.readInt(u32, &len_buf, .big);
+    const body = try allocator.alloc(u8, body_len);
+    defer allocator.free(body);
+    try sockread.readFull(bus_side, body);
+    bus_side.close(std.testing.io);
+
+    // The whole body is the json: no MAC bytes anywhere in the frame. Length is
+    // the check — re-rendering the parsed event has to come back the same size,
+    // which only holds when the frame added nothing to the json.
+    const parsed = DistributedEventBus.parseEvent(allocator, body) orelse return error.TestUnexpectedResult;
+    defer allocator.free(parsed.topic);
+    defer allocator.free(parsed.payload);
+    defer allocator.free(parsed.source_node);
+    try std.testing.expectEqualStrings(topic, parsed.topic);
+    try std.testing.expectEqualStrings("bare-payload", parsed.payload);
+    try std.testing.expectEqualStrings("bare-sender", parsed.source_node);
+    try std.testing.expect(std.mem.startsWith(u8, body, "{\"topic\":\""));
+    try std.testing.expectEqual(body.len, DistributedEventBus.eventJsonSize(parsed));
+
+    var received: usize = 0;
+    var receiver = try framedBus(allocator, "bare-receiver", topic, &received);
+    defer receiver.deinit();
+    // No `setClusterSecret`: this bus is the standalone deployment `start()`
+    // warns about.
+    try std.testing.expect(receiver.cluster_secret == null);
+
+    const frame = try allocator.alloc(u8, 4 + body_len);
+    defer allocator.free(frame);
+    @memcpy(frame[0..4], &len_buf);
+    @memcpy(frame[4..], body);
+    try feedFrame(&receiver, frame);
+
+    try std.testing.expectEqual(@as(usize, 1), received);
 }

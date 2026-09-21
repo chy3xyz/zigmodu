@@ -158,6 +158,13 @@ pub const ClusterBootstrap = struct {
         const bus = try self.allocator.create(DistributedEventBus);
         bus.* = try DistributedEventBus.init(self.allocator, self.io, self.config.node_id);
         self.bus = bus;
+        // The bus is its own inbound surface — its own listener, its own wire
+        // format (`docs/dev/cluster-auth-design.md` §3.3, threat #5) — so the
+        // same key has to reach it: an authenticated Raft port next to an
+        // unauthenticated event port would leave the audit item open. There is
+        // **one** secret source here (`config.cluster_secret`, the one the gate
+        // above judged), never a second one.
+        if (self.config.cluster_secret) |key| bus.setClusterSecret(key);
 
         // 3. Create cluster membership (gossip + health)
         const addr = try std.Io.net.IpAddress.parseIp4("0.0.0.0", self.config.port);
@@ -640,6 +647,10 @@ test "ClusterBootstrap starts a multi-node cluster that has a cluster secret" {
     // The secret reached the raft, which is what `RaftTransport` reads on every
     // frame — outbound (`TransportImpl`) and inbound (`handleConnection`).
     try std.testing.expectEqual(secret, authed.getRaft().?.config.cluster_secret.?);
+    // …and the bus, which is a **separate** inbound surface with its own listener
+    // and its own wire format: leaving it keyless would keep the third call site
+    // of §3.3 unauthenticated.
+    try std.testing.expectEqual(secret, authed.getEventBus().?.cluster_secret.?);
 }
 
 test "ClusterBootstrap refuses a multi-node cluster whose peers carry no id" {
@@ -699,7 +710,10 @@ test "ClusterBootstrap starts an acknowledged unauthenticated multi-node cluster
     try acked.start();
     try std.testing.expect(acked.server.running.load(.monotonic));
     // "Unauthenticated" is exactly this: the raft has no key, so frames are bare.
+    // The bus is a separate inbound surface, and one secret source means it is
+    // keyless for the same reason rather than by its own decision.
     try std.testing.expect(acked.getRaft().?.config.cluster_secret == null);
+    try std.testing.expect(acked.getEventBus().?.cluster_secret == null);
 }
 
 test "ClusterBootstrap needs no cluster secret for a single node" {
