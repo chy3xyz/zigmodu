@@ -40,35 +40,55 @@ wait_http "/health/live"
 BODY="$(curl -sf "${BASE}/health/live")"
 echo "$BODY" | grep -q '"status":"UP"'
 
-CODE="$(curl -s -o /dev/null -w '%{http_code}' "${BASE}/dashboard")"
-[[ "$CODE" == "200" ]]
+# `set -e` does **not** abort on a failing `[[ … ]]` under macOS's bash 3.2, so
+# every bare `[[ "$CODE" == "…" ]]` in this script was inert there while Linux
+# (bash 5) enforced it — which is how three wrong expectations survived until the
+# ubuntu job stopped being skipped. An explicit `exit 1` in a helper behaves the
+# same on both shells.
+expect_code() { # url want description [extra curl args…]
+  local url="$1" want="$2" what="$3"
+  shift 3
+  local got
+  got="$(curl -s -o /dev/null -w '%{http_code}' "$@" "$url")"
+  if [ "$got" != "$want" ]; then
+    echo "integration: FAIL — $what: got HTTP $got, want $want ($url)" >&2
+    exit 1
+  fi
+}
 
-CODE="$(curl -s -o /dev/null -w '%{http_code}' "${BASE}/api/v1/tenants")"
-[[ "$CODE" == "401" ]]
+expect_body() { # body needle description
+  case "$1" in
+    *"$2"*) ;;
+    *) echo "integration: FAIL — $3 (body does not contain '$2')" >&2; exit 1 ;;
+  esac
+}
+
+expect_code "${BASE}/dashboard" 200 "dashboard"
+expect_code "${BASE}/api/v1/tenants" 401 "tenants without a token"
 
 CREATE_BODY="$(curl -sf -X POST -H "${AUTH}" \
   "${BASE}/api/v1/tenants?name=CI-Tenant&domain=ci.example.com&tier=free")"
-echo "$CREATE_BODY" | grep -q '"name":"CI-Tenant"'
-echo "$CREATE_BODY" | grep -q '"id":'
+expect_body "$CREATE_BODY" '"name":"CI-Tenant"' "tenant create returns the row"
+expect_body "$CREATE_BODY" '"id":' "tenant create returns an id"
 
 LIST_BODY="$(curl -sf -H "${AUTH}" "${BASE}/api/v1/tenants")"
-echo "$LIST_BODY" | grep -q 'CI-Tenant'
-echo "$LIST_BODY" | grep -q '"tier":"free"'
+expect_body "$LIST_BODY" 'CI-Tenant' "tenant list contains the created row"
+expect_body "$LIST_BODY" '"tier":"free"' "tenant list keeps the tier"
 
-CODE="$(curl -s -o /dev/null -w '%{http_code}' -H "${AUTH}" "${BASE}/api/v1/plans")"
-[[ "$CODE" == "200" ]]
+expect_code "${BASE}/api/v1/plans" 200 "plans with a token" -H "${AUTH}"
 
 echo "integration: tenant isolation probes"
-# JWT without aud + no X-Tenant-ID → missing tenant context
-CODE="$(curl -s -o /dev/null -w '%{http_code}' -H "${AUTH}" "${BASE}/api/v1/users")"
-[[ "$CODE" == "401" ]]
-# X-Tenant-ID fallback (no aud in token) → scoped list
-CODE="$(curl -s -o /dev/null -w '%{http_code}' -H "${AUTH}" -H "X-Tenant-ID: 1" "${BASE}/api/v1/users")"
-[[ "$CODE" == "200" ]]
-# JWT aud=1 vs X-Tenant-ID: 2 → conflict rejected
+# What `requireTenantId` actually promises, measured against a real server.
+# The token this script mints carries the framework's default `aud`
+# (`"zigmodu-app"`, `SecurityModule.generateToken` always writes one), so "a
+# token with no `aud` at all" is not a shape this generator can produce — the
+# absent-tenant branch (401) is real, but nothing here can reach it. The three
+# shapes below are the ones that exist:
+expect_code "${BASE}/api/v1/users" 400 "non-numeric aud, no X-Tenant-ID" -H "${AUTH}"
+expect_code "${BASE}/api/v1/users" 403 "non-numeric aud plus X-Tenant-ID" -H "${AUTH}" -H "X-Tenant-ID: 1"
 TENANT_TOKEN="$(JWT_AUD=1 "$JWT_BIN")"
-CODE="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${TENANT_TOKEN}" -H "X-Tenant-ID: 2" "${BASE}/api/v1/users")"
-[[ "$CODE" == "403" ]]
+expect_code "${BASE}/api/v1/users" 200 "numeric aud alone" -H "Authorization: Bearer ${TENANT_TOKEN}"
+expect_code "${BASE}/api/v1/users" 403 "aud=1 vs X-Tenant-ID: 2" -H "Authorization: Bearer ${TENANT_TOKEN}" -H "X-Tenant-ID: 2"
 
 echo "integration: http-stress-test"
 cd "$ROOT/examples/http-stress-test"
