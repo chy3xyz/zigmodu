@@ -7495,7 +7495,7 @@ fn generateImModule(io: std.Io, allocator: std.mem.Allocator, project_dir: []con
             \\Add to your main.zig before server.start():
             \\
             \\```zig
-            \\var uring = try zigmodu.im.WsUring.init(allocator, .{
+            \\var uring = try zigmodu.im.WsUring.init(allocator, io, .{
             \\    .max_connections = 16384,
             \\});
             \\try uring.start();

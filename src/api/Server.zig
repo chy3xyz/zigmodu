@@ -2571,6 +2571,40 @@ pub const Server = struct {
 
 // ==== §7  connFiber ====
 
+/// Does `Connection`'s value contain the `upgrade` token?
+///
+/// `Connection` is a comma-separated token list (RFC 7230 §6.1), and browsers
+/// send `Connection: keep-alive, Upgrade` — an equality test against
+/// `"Upgrade"` rejects the normal client. Tokens are case-insensitive.
+fn connectionHasUpgrade(value: []const u8) bool {
+    var tokens = std.mem.splitScalar(u8, value, ',');
+    while (tokens.next()) |token| {
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, token, " \t"), "upgrade")) return true;
+    }
+    return false;
+}
+
+/// The RFC 6455 §4.2.1 conditions a client handshake request must satisfy
+/// before the server may answer 101: an `Upgrade: websocket` header, `upgrade`
+/// in the `Connection` token list, `Sec-WebSocket-Version: 13`, and a non-empty
+/// `Sec-WebSocket-Key`.
+///
+/// The upgrade is answered *before* `router.match` and before every middleware
+/// (docs/RUNTIME.md §12.14), so this is the pre-auth surface: checking only
+/// `Upgrade` + a non-empty key used to be enough to get a 101 for a request that
+/// is not a WebSocket handshake at all.
+fn wsHandshakeValid(ctx: *const Context) bool {
+    const ws_key = ctx.headers.get("sec-websocket-key") orelse "";
+    if (ws_key.len == 0) return false;
+
+    // §4.4: no version other than 13 has ever existed, so anything else (or a
+    // missing header) is not a handshake we can complete.
+    const version = ctx.headers.get("sec-websocket-version") orelse "";
+    if (!std.mem.eql(u8, version, "13")) return false;
+
+    return connectionHasUpgrade(ctx.headers.get("connection") orelse "");
+}
+
 /// Connection fiber — handles one HTTP connection
 fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allocator) void {
     defer _ = server.active_connections.fetchSub(1, .monotonic);
@@ -2763,60 +2797,73 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
             if (std.mem.eql(u8, request.method.toString(), "GET")) {
                 const upgrade_hdr = ctx.headers.get("upgrade") orelse "";
                 if (std.ascii.eqlIgnoreCase(upgrade_hdr, "websocket")) {
+                    // RFC 6455 §4.2.1: the request also needs `upgrade` in the
+                    // `Connection` token list, `Sec-WebSocket-Version: 13` and a
+                    // non-empty key. A request that fails these is refused here
+                    // with a 400 and **no** 101 — the accept key must not be
+                    // computed for a request that is not a handshake.
+                    if (!wsHandshakeValid(&ctx)) {
+                        // `writeErrorResponse`, not `ctx.sendError`: this block
+                        // returns out of `connFiber` rather than falling through
+                        // to the normal response write, so a queued response
+                        // would never reach the socket.
+                        writeErrorResponse(server.io, stream, allocator, 400, "WebSocket handshake failed");
+                        return;
+                    }
+
+                    // Non-empty: `wsHandshakeValid` above returned true.
                     const ws_key = ctx.headers.get("sec-websocket-key") orelse "";
-                    if (ws_key.len > 0) {
-                        ctx.user_data = ws_route.user_data;
-                        // Perform handshake
-                        var framer = WsFramer.init(stream, server.io);
-                        framer.handshake(ws_key) catch {
-                            ctx.sendError(400, "WebSocket handshake failed") catch |e| std.log.err("[Server] WS handshake 400 failed: {}", .{e});
+                    ctx.user_data = ws_route.user_data;
+                    // Perform handshake
+                    var framer = WsFramer.init(stream, server.io);
+                    framer.handshake(ws_key) catch {
+                        writeErrorResponse(server.io, stream, allocator, 400, "WebSocket handshake failed");
+                        return;
+                    };
+                    ctx.upgraded = true;
+                    framer.setSendTimeout(server.ws_write_timeout_ms);
+
+                    // Call on_connect — gateway returns session pointer (null = reject)
+                    const session = ws_route.on_connect(&ctx, @ptrCast(&framer));
+                    if (session == null) {
+                        framer.writeClose() catch |err| std.log.err("[Server] WS writeClose on reject: {}", .{err});
+                        if (@intFromPtr(ws_route.on_close) != 0) ws_route.on_close(null);
+                        return;
+                    }
+
+                    // If io_uring is available, transfer fd ownership (fiber stack released here)
+                    if (server.ws_uring) |uring| {
+                        const sock_fd = stream.socket.handle;
+                        uring.adopt(sock_fd, session.?, ws_route.on_message, ws_route.on_close) catch {
+                            framer.writeClose() catch |err| std.log.err("[Server] WS writeClose on reject: {}", .{err});
+                            if (@intFromPtr(ws_route.on_close) != 0) ws_route.on_close(session.?);
                             return;
                         };
-                        ctx.upgraded = true;
-                        framer.setSendTimeout(server.ws_write_timeout_ms);
-
-                        // Call on_connect — gateway returns session pointer (null = reject)
-                        const session = ws_route.on_connect(&ctx, @ptrCast(&framer));
-                        if (session == null) {
-                            framer.writeClose() catch |err| std.log.err("[Server] WS writeClose on reject: {}", .{err});
-                            if (@intFromPtr(ws_route.on_close) != 0) ws_route.on_close(null);
-                            return;
-                        }
-
-                        // If io_uring is available, transfer fd ownership (fiber stack released here)
-                        if (server.ws_uring) |uring| {
-                            const sock_fd = stream.socket.handle;
-                            uring.adopt(sock_fd, session.?, ws_route.on_message, ws_route.on_close) catch {
-                                framer.writeClose() catch |err| std.log.err("[Server] WS writeClose on reject: {}", .{err});
-                                if (@intFromPtr(ws_route.on_close) != 0) ws_route.on_close(session.?);
-                                return;
-                            };
-                            return; // Fiber exits — io_uring takes over
-                        }
-
-                        // WebSocket read loop (fiber path)
-                        var messages = WsFramer.MessageReader.init(&framer, server.allocator);
-                        defer messages.deinit();
-                        while (server.running.load(.monotonic)) {
-                            const read_buf = if (server.ws_buffer_pool) |pool|
-                                pool.acquire() catch break
-                            else
-                                server.allocator.alloc(u8, 4096) catch break;
-                            defer {
-                                if (server.ws_buffer_pool) |pool| pool.release(read_buf) else server.allocator.free(read_buf);
-                            }
-                            const event = messages.read(read_buf) catch break;
-                            switch (event) {
-                                .message => |m| {
-                                    if (@intFromPtr(ws_route.on_message) != 0) ws_route.on_message(session, m.payload, m.kind);
-                                },
-                                .close => break,
-                            }
-                        }
-
-                        if (@intFromPtr(ws_route.on_close) != 0) ws_route.on_close(session);
-                        return; // Connection done — don't continue HTTP loop
+                        return; // Fiber exits — io_uring takes over
                     }
+
+                    // WebSocket read loop (fiber path)
+                    var messages = WsFramer.MessageReader.init(&framer, server.allocator);
+                    defer messages.deinit();
+                    while (server.running.load(.monotonic)) {
+                        const read_buf = if (server.ws_buffer_pool) |pool|
+                            pool.acquire() catch break
+                        else
+                            server.allocator.alloc(u8, 4096) catch break;
+                        defer {
+                            if (server.ws_buffer_pool) |pool| pool.release(read_buf) else server.allocator.free(read_buf);
+                        }
+                        const event = messages.read(read_buf) catch break;
+                        switch (event) {
+                            .message => |m| {
+                                if (@intFromPtr(ws_route.on_message) != 0) ws_route.on_message(session, m.payload, m.kind);
+                            },
+                            .close => break,
+                        }
+                    }
+
+                    if (@intFromPtr(ws_route.on_close) != 0) ws_route.on_close(session);
+                    return; // Connection done — don't continue HTTP loop
                 }
             }
         }
@@ -4126,7 +4173,7 @@ test "WebSocket fiber path receives client frames and fires on_close" {
     // Handshake.
     var wbuf: [512]u8 = undefined;
     var w = stream.writer(std.testing.io, &wbuf);
-    const handshake = "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+    const handshake = "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
     try w.interface.writeAll(handshake);
     try w.interface.flush();
 
@@ -4169,6 +4216,232 @@ test "WebSocket fiber path receives client frames and fires on_close" {
         std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
     }
     try std.testing.expect(ws_e2e_state.closed);
+
+    server.stop();
+}
+
+/// A masked client frame (RFC 6455 §5.1 — a server MUST reject unmasked ones).
+fn buildClientFrame(out: []u8, opcode: u8, payload: []const u8) []u8 {
+    const mask = [4]u8{ 1, 2, 3, 4 };
+    var n: usize = 0;
+    out[0] = 0x80 | opcode;
+    if (payload.len < 126) {
+        out[1] = 0x80 | @as(u8, @intCast(payload.len));
+        n = 2;
+    } else if (payload.len < 65536) {
+        out[1] = 0x80 | 126;
+        std.mem.writeInt(u16, out[2..4], @intCast(payload.len), .big);
+        n = 4;
+    } else {
+        out[1] = 0x80 | 127;
+        std.mem.writeInt(u64, out[2..10], @intCast(payload.len), .big);
+        n = 10;
+    }
+    @memcpy(out[n..][0..4], &mask);
+    n += 4;
+    for (payload, 0..) |b, i| out[n + i] = b ^ mask[i % 4];
+    return out[0 .. n + payload.len];
+}
+
+/// Send `req` on a fresh connection to `port` and return however many bytes of
+/// the response arrive first. The WS handshake tests need to see the status line
+/// the server actually wrote, which the normal `Context` response path is not
+/// involved in.
+fn wsProbe(port: u16, req: []const u8, out: []u8) usize {
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", port) catch return 0;
+    var stream = addr.connect(std.testing.io, .{ .mode = .stream }) catch return 0;
+    defer stream.close(std.testing.io);
+
+    var wbuf: [1024]u8 = undefined;
+    var w = stream.writer(std.testing.io, &wbuf);
+    w.interface.writeAll(req) catch return 0;
+    w.interface.flush() catch return 0;
+
+    var pfds = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    if ((std.posix.poll(&pfds, 3000) catch 0) == 0) return 0;
+    return std.posix.read(stream.socket.handle, out) catch 0;
+}
+
+const WsUpgradeState = struct { connects: usize = 0 };
+var ws_upgrade_state = WsUpgradeState{};
+
+test "WebSocket upgrade: bad handshakes get 400 and no 101, a Connection token list gets 101" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    ws_upgrade_state = .{};
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0 });
+    defer server.deinit();
+    var group = server.group("");
+    try group.ws("ws", (struct {
+        fn connect(_: *Context, _: ?*anyopaque) ?*anyopaque {
+            ws_upgrade_state.connects += 1;
+            return @ptrCast(&ws_upgrade_state);
+        }
+    }).connect, (struct {
+        fn message(_: ?*anyopaque, _: []const u8, _: WsFrameKind) void {}
+    }).message, (struct {
+        fn close(_: ?*anyopaque) void {}
+    }).close, null);
+
+    const th = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, struct {
+        fn run(s: *Server) void {
+            s.start() catch {};
+        }
+    }.run, .{&server});
+    defer th.join();
+
+    var port: u16 = 0;
+    var tries: usize = 0;
+    while (tries < 200) : (tries += 1) {
+        if (server.listener) |*l| {
+            port = l.socket.address.getPort();
+            break;
+        }
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    try std.testing.expect(port != 0);
+
+    // The three required headers, minus whichever one a case drops.
+    const head = "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n";
+    var resp: [512]u8 = undefined;
+
+    // `Sec-WebSocket-Version` is mandatory and must be 13 (RFC 6455 §4.2.1/§4.4).
+    var n = wsProbe(port, head ++ "Connection: Upgrade\r\n\r\n", &resp);
+    try std.testing.expect(std.mem.startsWith(u8, resp[0..n], "HTTP/1.1 400"));
+    n = wsProbe(port, head ++ "Connection: Upgrade\r\nSec-WebSocket-Version: 8\r\n\r\n", &resp);
+    try std.testing.expect(std.mem.startsWith(u8, resp[0..n], "HTTP/1.1 400"));
+
+    // `Connection` present but without the `upgrade` token.
+    n = wsProbe(port, head ++ "Connection: keep-alive\r\nSec-WebSocket-Version: 13\r\n\r\n", &resp);
+    try std.testing.expect(std.mem.startsWith(u8, resp[0..n], "HTTP/1.1 400"));
+
+    // No key at all.
+    n = wsProbe(port, "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\r\n", &resp);
+    try std.testing.expect(std.mem.startsWith(u8, resp[0..n], "HTTP/1.1 400"));
+
+    // None of those reached the upgrade path: no 101 was written and the
+    // application's `on_connect` never ran.
+    try std.testing.expectEqual(@as(usize, 0), ws_upgrade_state.connects);
+
+    // The shape browsers actually send — `Connection` is a token list, so an
+    // equality check against "Upgrade" would have rejected this.
+    n = wsProbe(port, "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n", &resp);
+    try std.testing.expect(std.mem.startsWith(u8, resp[0..n], "HTTP/1.1 101"));
+    try std.testing.expectEqual(@as(usize, 1), ws_upgrade_state.connects);
+
+    server.stop();
+}
+
+test "connectionHasUpgrade is a token-list test, not an equality test" {
+    try std.testing.expect(connectionHasUpgrade("Upgrade"));
+    try std.testing.expect(connectionHasUpgrade("upgrade"));
+    // Browsers send exactly this.
+    try std.testing.expect(connectionHasUpgrade("keep-alive, Upgrade"));
+    try std.testing.expect(connectionHasUpgrade("Upgrade,keep-alive"));
+    try std.testing.expect(connectionHasUpgrade("keep-alive , upgrade"));
+    try std.testing.expect(!connectionHasUpgrade("keep-alive"));
+    // Substring, not token.
+    try std.testing.expect(!connectionHasUpgrade("xyzupgrade"));
+    try std.testing.expect(!connectionHasUpgrade(""));
+}
+
+const WsBigFrameState = struct { bytes: usize = 0, kind: WsFrameKind = .binary };
+var ws_big_frame_state = WsBigFrameState{};
+
+test "WebSocket fiber path delivers a frame larger than the 4 KiB read buffer" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    ws_big_frame_state = .{};
+
+    // The pool is what production uses; it hands out 4 KiB slices and only takes
+    // back slices of at least that length, so `readFrame` must not resize its
+    // caller's buffer even when the frame does not fit in it. Declared before
+    // the server so it outlives `server.deinit()`.
+    var pool = BufferPool.init(allocator, std.testing.io, 4);
+    defer pool.deinit();
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0 });
+    defer server.deinit();
+    server.setWsBufferPool(&pool);
+
+    var group = server.group("");
+    try group.ws("ws", (struct {
+        fn connect(_: *Context, _: ?*anyopaque) ?*anyopaque {
+            return @ptrCast(&ws_big_frame_state);
+        }
+    }).connect, (struct {
+        fn message(session: ?*anyopaque, msg: []const u8, kind: WsFrameKind) void {
+            const st: *WsBigFrameState = @ptrCast(@alignCast(session.?));
+            st.bytes = msg.len;
+            st.kind = kind;
+        }
+    }).message, (struct {
+        fn close(_: ?*anyopaque) void {}
+    }).close, null);
+
+    const th = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, struct {
+        fn run(s: *Server) void {
+            s.start() catch {};
+        }
+    }.run, .{&server});
+    defer th.join();
+
+    var port: u16 = 0;
+    var tries: usize = 0;
+    while (tries < 200) : (tries += 1) {
+        if (server.listener) |*l| {
+            port = l.socket.address.getPort();
+            break;
+        }
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    try std.testing.expect(port != 0);
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+    var stream = try addr.connect(std.testing.io, .{ .mode = .stream });
+    var closed_early = false;
+    defer if (!closed_early) stream.close(std.testing.io);
+
+    var wbuf: [1024]u8 = undefined;
+    var w = stream.writer(std.testing.io, &wbuf);
+    try w.interface.writeAll("GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
+    try w.interface.flush();
+
+    var fds = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    try std.testing.expect(try std.posix.poll(&fds, 3000) > 0);
+    var resp: [512]u8 = undefined;
+    const n = try std.posix.read(stream.socket.handle, &resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp[0..n], "101") != null);
+
+    // 10 KiB: above the 4 KiB pooled buffer, so it used to come back as
+    // error.PayloadTooLarge and drop the connection silently.
+    const payload_len = 10 * 1024;
+    const payload = try allocator.alloc(u8, payload_len);
+    defer allocator.free(payload);
+    for (payload, 0..) |*b, i| b.* = @truncate(i *% 17);
+
+    const wire = try allocator.alloc(u8, payload_len + 14);
+    defer allocator.free(wire);
+    try w.interface.writeAll(buildClientFrame(wire, 0x2, payload));
+    try w.interface.flush();
+
+    tries = 0;
+    while (ws_big_frame_state.bytes == 0 and tries < 500) : (tries += 1) {
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    try std.testing.expectEqual(payload_len, ws_big_frame_state.bytes);
+    try std.testing.expectEqual(WsFrameKind.binary, ws_big_frame_state.kind);
+
+    // The pooled buffer came back whole: `readFrame` never resized it, so
+    // `BufferPool.release` accepted it instead of dropping it on the floor.
+    stream.close(std.testing.io);
+    closed_early = true;
+    tries = 0;
+    while (pool.stats().free < 1 and tries < 300) : (tries += 1) {
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().free);
 
     server.stop();
 }
@@ -4805,7 +5078,7 @@ test "WS write timeout disconnects a peer that stops reading" {
 
     var wbuf: [512]u8 = undefined;
     var w = stream.writer(std.testing.io, &wbuf);
-    const handshake = "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+    const handshake = "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
     try w.interface.writeAll(handshake);
     try w.interface.flush();
 

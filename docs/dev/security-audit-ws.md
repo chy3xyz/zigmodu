@@ -4,6 +4,29 @@
 > 最重的那条（握手把未校验长度的 key memcpy 进固定栈缓冲）已修，见 CHANGELOG；
 > 其余各条仍在，含 ConnectionRegistry 的悬挂指针与对象池只出不进。
 
+---
+
+## 处置状态（2026-09 更新，非审计原文）
+
+审计原文保留在下方未改动。以下条目已落地，逐条见 `CHANGELOG.md` 的
+「WebSocket ②：io_uring 那条解析路径不再"编译不过所以安全"…」。
+
+| 审计条目 | 状态 |
+|---|---|
+| §1.1 `WsFramer.handshake` 的 128 字节栈缓冲 | 已修（改增量 SHA-1，缓冲整个删掉） |
+| §1.5 未掩码客户端帧被接受（两个解析器） | 已修 —— MASK 必需成为 `WsFramer.validateFrameHeader` 的一条，两个解析器共用 |
+| §1.6 FIN / 分片 / 控制帧 / RSV / UTF-8 | 已修 —— 同上；分片重组与 UTF-8 规则收进 `WsFramer.Assembler`，两边共用 |
+| §1.7 `ws_uring` 64-bit 长度溢出 + ping `@intCast` | 已修 —— **并且先修了 `start()` 的编译错误**：`processData` 原先不可达（惰性分析），只修溢出等于把潜伏缺陷变成活漏洞 |
+| §3 4KB 隐式协议常量 | 部分修 —— **fiber 路径**（`Server.zig`）现在能收满 `max_message_bytes` 的单帧，≤4 KiB 常见路径仍零分配。**io_uring 路径单帧仍限 4 KiB**（超出即 1009 关闭，不再静默挂起）：该路径在 Linux 上，本机无法实测 |
+| §3 握手不校验 version / Connection | 已修 —— `Sec-WebSocket-Version: 13` + `Connection` 必须含 `upgrade` token，失败即 400 且不升级 |
+| §1.2 `extensions/WebSocket.zig` 的 `[60]u8` 握手缓冲 | **未动**（不在本次改动面内；它只经 `root.zig` 公开导出，仓内无内部使用者） |
+| §1.3 / §1.4 `ConnectionRegistry` 的 id-0 哨兵与对象池只出不进 | 已由另一条工作流修（见 `ConnectionRegistry.zig` 底部的测试） |
+| §3 帧解析器没有测试 | 已修 —— `im.WsFramer` 20 条、`im.ws_uring` 6 条（解析器本身是纯字节函数，**在 macOS 上就能跑**），另有 3 条端到端握手 / 大帧用例 |
+
+一处判断需要更正：同一类潜伏问题不止解析器。`ws_uring` 里
+`connections.getPtr` 的返回类型（`**Conn`）与 `conn.on_message != 0`
+（0.17 起函数指针不能与整数比较）同样是"从未被分析"才留下的 —— 修好 `start()` 的编译错误后
+它们一次性暴露出来。
 
 ---
 

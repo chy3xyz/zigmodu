@@ -2,6 +2,79 @@
 
 ## [Unreleased]
 
+### WebSocket ②：io_uring 那条解析路径不再"编译不过所以安全"，握手补上 RFC 6455 §4.2.1（**破坏性：是**）
+
+`docs/dev/security-audit-ws.md` 的处置。`WsFramer` 加固过一轮，**第二个解析器**（`src/im/ws_uring.zig`）没有 ——
+原因不是忘了，而是它**从未被编译过**：`start()` 里的 `std.time.sleep` 在 Zig 0.17 已删除，
+仓内又没有任何调用点，Zig 的惰性分析因此让 `start()` → `runLoop` → `processData` 整个解析体
+**不进任何分析图**。审计把它记成"潜在，当前不可达"；那是没错的，但**修编译错误本身就是激活它** ——
+所以这次改动里，编译修复与解析器修复必须同时落地，否则"潜伏缺陷"只是变成"活漏洞"。
+
+| # | 缺陷 | 旧行为 |
+|---|---|---|
+| 1 | `start()` 调用了已删除的 `std.time.sleep` | io_uring 路径名义存在、实际不可用；正因如此下面每条都不可达 |
+| 2 | 64-bit 长度无上界 | `header_len + 4 + payload_len` 在一个 10 字节帧上溢出 → `buf[10..9]`（start>end 切片）；安全构建 panic，ReleaseFast 内存不安全 |
+| 3 | ping payload > 255 | `@intCast` panic（0x9 的 payload 上限在那里是 ~4094） |
+| 4 | 无 RSV / 掩码必需 / opcode 白名单 / 控制帧约束 | 未掩码、RSV 置位、未知 opcode、分片控制帧一律当合法帧分发 |
+| 5 | 无分片重组 | 首片被当完整消息、续帧落进 `else => {}` **静默丢弃** —— 静默截断（OpenIM protobuf 首当其冲） |
+| 6 | 无 UTF-8 校验 | 非法 UTF-8 的文本帧直接交给应用 |
+| 7 | 单帧 >4 KiB | `readFrame` 返回 `error.PayloadTooLarge` → 连接静默断开，尽管 `max_message_bytes` 是 1 MiB |
+| 8 | 握手只查 `Upgrade` + key 非空 | 缺 `Sec-WebSocket-Version`、`Connection` 无 `upgrade` token、key 为空，三种都能拿到 101 |
+
+**共享，而不是复制。** 审计的原话就是"完全同构的两个解析器"，所以规则只留一份，两边都调它：
+
+- `WsFramer.validateFrameHeader(header: [2]u8, payload_len: u64)` —— RSV / **MASK 必需** /
+  opcode 白名单 `{0x0,0x1,0x2,0x8,0x9,0xA}` / 控制帧 FIN=1 且 ≤125。纯函数、零分配、无 I/O，
+  两个解析器共用，**无法漂移**。
+- `WsFramer.Assembler` —— 分片/FIN 状态机 + 1 MiB 上界 + UTF-8 规则，`?Message` 表示"还不完整"。
+  fiber 路径的 `MessageReader` 与 io_uring 的 `processData` 都驱动它，单帧消息仍零拷贝
+  （payload 直接指向调用方的缓冲）。
+- `WsFramer.CloseCode`（1002 / 1007 / 1009）与两边的 `closeCodeFor`：协议错误现在**告诉对端原因**再断。
+
+**UTF-8 在"完整消息"上校验**（RFC 6455 §8.1）。一个多字节字符可以横跨分片边界 ——
+`"中" = E4 | B8 AD` 被切成 `E4` + `B8 AD` 时，两片各自都不是合法 UTF-8，重组后才是。
+按片校验会把**合法**消息判非法，所以校验点只有一个：重组完成之后（单帧消息即 payload 本身）。
+失败 → 关闭码 **1007** + 不投递。二进制帧不校验（不透明字节）。
+
+**单帧 >4 KiB**：选"调用方持有溢出缓冲"（`readFrame(buf, overflow)`），而不是"`readFrame` 接受 allocator
+并就地放大调用方的 `buf`"。理由是所有权契约：`buf` 是 `BufferPool` 发的 4096 字节切片，
+而 `release` 按 `buf.len >= BufSize` 收 —— **被 `realloc` 过的切片会被静默丢弃**，正是这一轮要避开的性质。
+现在 `readFrame` 只在帧放不下时把 `overflow`（调用方持有、首次使用时按 2 的幂增长、上限 `max_message_bytes`）
+长起来，**调用方的切片永不变形**，≤4 KiB 的常见路径一次分配都没有。
+
+**握手**（`Server.wsHandshakeValid` + `connectionHasUpgrade`）：`Sec-WebSocket-Key` 非空、
+`Sec-WebSocket-Version` 恰好 `13`、`Connection` **含** `upgrade` token（逗号分隔、大小写不敏感，
+所以浏览器的 `keep-alive, Upgrade` 放行）—— 任一不满足 → **400 且不升级**（不写 101、`on_connect` 不跑）。
+顺带修好一条既有缺陷：`framer.handshake` 失败原本走 `ctx.sendError(400, …)` 后 `return`，
+而这一块是直接 `return` 出 `connFiber` 的 —— 那个响应**从来没写进 socket**；两条 400 路径都改走 `writeErrorResponse`。
+
+**破坏性：是**
+- `WsUring.init(allocator, cfg)` → `WsUring.init(allocator, io, cfg)`（`std.Io.sleep` 需要 io）。
+  仓内唯一引用是生成器 README 的示例块，已同步；调用方按 `init.io` 传入即可。
+- 没带 `Sec-WebSocket-Version: 13` 的握手请求现在回 400（以前回 101）。
+  合规客户端（浏览器、`websocat`、任何标准库）本来就发这个头；`Server.zig` 里两条既有测试的
+  握手字符串因此补上了该头（**断言未改**，改的是输入 —— 它断言的形状现在是"未升级"）。
+
+**验证**：全量 **1523/1544（21 skipped，0 failed）**，主产物 1429（新增 17 条 + 另一工作流的 1 条）；
+`zig fmt --check` + `check-production.sh` + `check-deadcode.sh` 全绿。
+两条变异逐条验过红、**都是断言红不是编译错**（按字节还原，`md5 -q` 前后一致，`grep -c MUTATION` → 0）：
+删掉 `validateUtf8` 的检查 → `Assembler: an invalid UTF-8 text message is rejected` 在
+`expected error.InvalidUtf8, found .{ .kind = .text, .payload = { 104, 255, 254 } }` 处
+`FAIL (TestExpectedError)`；删掉共享校验器里的 MASK 必需规则 →
+`validateFrameHeader: the RFC 6455 negative paths, one case each` 在
+`expected error.UnmaskedClientFrame, found void` 处同形红。
+`start()` 的编译修复用**同一条测试**证明：把那段 `std.time.sleep` 按原样放回，
+`-Dtest-filter="WsUring.start is analysed"` 编译失败（reference trace 为
+`runLoop: src/im/ws_uring.zig` → `std.Thread` 的 spawn 闭包），还原后同一条测试 1/1 通过。
+
+**未实测（写在明处）**：io_uring 事件循环本身。macOS 上 `IoUring` 是 stub，且 `init` 本体在非 Linux 上
+停在 `@compileError`，所以 `start()` / `runLoop` / `submitRead` 只有**编译期**保证；
+解析器函数（`parseFrame` / `writeControl`）已在本机用纯字节用例覆盖。
+另外 `ws_uring` 的**单帧上限仍是 `Conn.BufSize`（4 KiB）**（超出即 1009 关闭而非静默挂起）——
+本轮的"单帧到 `max_message_bytes`"只落在那条 fiber 路径上；io_uring 路径的分片重组已到位，
+所以 >4 KiB 的消息按 ≤4 KiB 的分片发即可，单帧放大留待有 Linux 环境时再动。
+`extensions/WebSocket.zig` 是第三份解析器（审计 §1.2 的 `[60]u8` 握手缓冲在那一份里），本轮未动。
+
 ### 集群入站零认证 ③：`DistributedEventBus` 自己的 listener 也上帧 + L1 —— 最后一个面闭环（**破坏性：是**）
 
 `docs/dev/cluster-auth-design.md` §3.3 的**第三个调用点**（审计项 ③ 的最后一个面）。
