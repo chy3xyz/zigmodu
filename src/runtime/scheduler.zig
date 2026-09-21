@@ -643,7 +643,9 @@ pub const Scheduler = struct {
             if (round > push_retry_rounds) {
                 // Out of spin: the consumer holding the slot may be off-CPU, and
                 // only the scheduler can bring it back. See `push_yield_rounds`.
-                std.Thread.yield() catch {};
+                std.Thread.yield() catch |err| {
+                    std.log.debug("[scheduler] push yield: {s}", .{@errorName(err)});
+                };
                 continue;
             }
             std.atomic.spinLoopHint();
