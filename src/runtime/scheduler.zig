@@ -171,6 +171,18 @@ pub const default_pool_threads: usize = 1;
 /// still waited out rather than blamed.
 const push_retry_rounds: usize = 1 << 20;
 
+/// After the spin budget, how many times `push` yields before it asserts.
+///
+/// Spinning only helps while the consumer is *runnable*; a consumer that the OS
+/// descheduled between advancing `dequeue_pos` and releasing its slot holds that
+/// slot for as long as it stays off-CPU, and spinning does not shorten that.
+/// Measured: on a 2-core macOS CI runner the smoke harness hit the assert with
+/// `push_failures` at 1 and `high_water` nowhere near capacity in the runs that
+/// completed (2 of 4) — the shape of a descheduled consumer, not of a full ring.
+/// Yielding hands the CPU to it instead of burning the budget: the assert the
+/// invariant deserves is still there, one yield budget later.
+const push_yield_rounds: usize = 1 << 12;
+
 /// A pool thread's spin budget before it parks, and how long it parks. Parking is
 /// a poll rather than a signal on purpose: a `signal` per publish would put a
 /// mutex (or a syscall) on the producer path this whole design keeps free.
@@ -627,7 +639,13 @@ pub const Scheduler = struct {
                 return;
             }
             round += 1;
-            if (round > push_retry_rounds) break;
+            if (round > push_retry_rounds + push_yield_rounds) break;
+            if (round > push_retry_rounds) {
+                // Out of spin: the consumer holding the slot may be off-CPU, and
+                // only the scheduler can bring it back. See `push_yield_rounds`.
+                std.Thread.yield() catch {};
+                continue;
+            }
             std.atomic.spinLoopHint();
         }
         _ = self.ready_push_failures.fetchAdd(1, .monotonic);

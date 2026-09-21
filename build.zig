@@ -307,6 +307,7 @@ pub fn build(b: *std.Build) void {
     stress_options.addOption(usize, "runtime_stress_blocking_threads", b.option(usize, "runtime-stress-blocking-threads", "runtime-stress: blocking pool width") orelse 1);
     stress_options.addOption(usize, "runtime_stress_rss_budget_mib", b.option(usize, "runtime-stress-rss-budget-mib", "runtime-stress: RSS spread budget (MiB) for the steady phase") orelse 24);
     stress_options.addOption(usize, "runtime_stress_timers", b.option(usize, "runtime-stress-timers", "runtime-stress: timers armed in the opening burst") orelse 48);
+    stress_options.addOption(usize, "runtime_stress_min_windows", b.option(usize, "runtime-stress-min-windows", "runtime-stress: windows that must cover all four paths") orelse 3);
     const stress_options_mod = stress_options.createModule();
 
     const stress_mod = b.createModule(.{
@@ -343,6 +344,11 @@ pub fn build(b: *std.Build) void {
     stress_smoke_options.addOption(usize, "runtime_stress_blocking_threads", 1);
     stress_smoke_options.addOption(usize, "runtime_stress_rss_budget_mib", 24);
     stress_smoke_options.addOption(usize, "runtime_stress_timers", 48);
+    // 1, not the sustained default of 3: how many four-path windows a machine
+    // delivers in this fixed 2 s budget is a property of the machine (a 2-core
+    // CI runner covered 2 of 6 samples), and a smoke that fails on runner
+    // speed teaches nothing. The sustained step keeps the real floor.
+    stress_smoke_options.addOption(usize, "runtime_stress_min_windows", 1);
     const stress_smoke_options_mod = stress_smoke_options.createModule();
 
     const stress_smoke_mod = b.createModule(.{
