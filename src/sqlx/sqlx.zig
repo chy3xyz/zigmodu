@@ -2877,13 +2877,14 @@ fn mysqlStmtReadRows(stmt: *libmysql_c.MYSQL_STMT, arena: std.heap.ArenaAllocato
     var arena_mut = arena;
     const arena_alloc = arena_mut.allocator();
 
-    if (libmysql_c.mysql_stmt_store_result(stmt) != 0) {
-        const err_no = libmysql_c.mysql_stmt_errno(stmt);
-        const err_msg = std.mem.span(libmysql_c.mysql_stmt_error(stmt));
-        std.log.err("MySQL stmt_store_result error: errno={d} msg={s}", .{ err_no, err_msg });
-        return mysqlErrnoToError(err_no);
-    }
-
+    // Metadata **before** `store_result`. Both orders are documented, but only
+    // this one holds on MariaDB Connector/C 11: `mysql_stmt_store_result` leaves
+    // the statement's field array such that `mysql_stmt_result_metadata` then
+    // hands back a descriptor whose first column is intact and whose remaining
+    // columns have `name == NULL` / `name_length == 0` — which is what
+    // `field.name[0..field.name_length]` below then panics on
+    // (`attempt to use null value`). Measured against mariadb:11 with Debian's
+    // libmariadb, the configuration CI runs.
     const meta = libmysql_c.mysql_stmt_result_metadata(stmt) orelse {
         // No metadata → treat as empty result set (should be rare after field_count > 0).
         const empty = arena_alloc.alloc(Row, 0) catch return error.DatabaseError;
@@ -2891,8 +2892,14 @@ fn mysqlStmtReadRows(stmt: *libmysql_c.MYSQL_STMT, arena: std.heap.ArenaAllocato
     };
     defer libmysql_c.mysql_free_result(meta);
 
+    if (libmysql_c.mysql_stmt_store_result(stmt) != 0) {
+        const err_no = libmysql_c.mysql_stmt_errno(stmt);
+        const err_msg = std.mem.span(libmysql_c.mysql_stmt_error(stmt));
+        std.log.err("MySQL stmt_store_result error: errno={d} msg={s}", .{ err_no, err_msg });
+        return mysqlErrnoToError(err_no);
+    }
+
     const n_cols = libmysql_c.mysql_num_fields(meta);
-    const fields = libmysql_c.mysql_fetch_fields(meta) orelse return error.DatabaseError;
 
     const shared_columns = arena_alloc.alloc([]const u8, n_cols) catch return error.DatabaseError;
     const binds = arena_alloc.alloc(libmysql_c.MYSQL_BIND, n_cols) catch return error.DatabaseError;
@@ -2902,9 +2909,32 @@ fn mysqlStmtReadRows(stmt: *libmysql_c.MYSQL_STMT, arena: std.heap.ArenaAllocato
     const err_flags = arena_alloc.alloc(libmysql_c.my_bool, n_cols) catch return error.DatabaseError;
     const bind_bufs = arena_alloc.alloc(MysqlBindBuffer, n_cols) catch return error.DatabaseError;
     const is_unsigned_flags = arena_alloc.alloc(libmysql_c.my_bool, n_cols) catch return error.DatabaseError;
+    // What the decode loop below switches on. Collected while walking the
+    // library's field cursor, so neither loop has to index a `MYSQL_FIELD`
+    // array (see the comment in the loop).
+    const col_types = arena_alloc.alloc(c_int, n_cols) catch return error.DatabaseError;
 
     for (0..n_cols) |c| {
-        const field = fields[c];
+        // `mysql_fetch_field(meta)` walks the library's own cursor, and that is
+        // why it is used instead of `mysql_fetch_fields(meta)[c]`: an array
+        // index assumes this file's `MYSQL_FIELD` has the *linked* library's
+        // stride, and it does not for MariaDB. Measured on the configuration CI
+        // runs (mariadb:11, Debian libmariadb):
+        //
+        //     sizeof(MYSQL_FIELD) = 128   offsetof(extension) = 120   offsetof(type) = 112
+        //
+        // while this file's declaration ends after `type` — 116 bytes, padded to
+        // 120. Indexing with that stride reads column 1 from eight bytes before
+        // where it starts, i.e. out of the tail of column 0: `name == NULL`,
+        // `name_length == 0`, `type == 0`. Column 0 reads correctly, which is
+        // exactly the shape the crash had — `attempt to use null value` at
+        // `field.name[0..field.name_length]` on the second column.
+        const field = libmysql_c.mysql_fetch_field(meta) orelse return error.DatabaseError;
+        if (field.name == null) {
+            std.log.warn("[sqlx] MySQL metadata gave column {d}/{d} no name; refusing to parse it as a string", .{ c, n_cols });
+            return error.DatabaseError;
+        }
+        col_types[c] = field.type;
         const name = field.name[0..field.name_length];
         shared_columns[c] = arena_alloc.dupe(u8, name) catch return error.DatabaseError;
 
@@ -3018,7 +3048,7 @@ fn mysqlStmtReadRows(stmt: *libmysql_c.MYSQL_STMT, arena: std.heap.ArenaAllocato
             if (null_flags[c] != 0) {
                 values[c] = null;
             } else {
-                values[c] = switch (fields[c].type) {
+                values[c] = switch (col_types[c]) {
                     libmysql_c.MYSQL_TYPE_TINY => blk: {
                         if (is_unsigned_flags[c] != 0) {
                             break :blk Value{ .int = @as(i64, bind_bufs[c].tiny) };
@@ -7096,11 +7126,21 @@ test "mysql live connection" {
     const pass = if (builtin.os.tag == .windows) pass_default else if (std.c.getenv("MYSQL_PASSWORD")) |ptr| std.mem.span(ptr) else pass_default;
     const db_default = "zigzero_test";
     const db = if (builtin.os.tag == .windows) db_default else if (std.c.getenv("MYSQL_DATABASE")) |ptr| std.mem.span(ptr) else db_default;
+    // The port is read for the same reason the other four are: a service reached
+    // through a container's published port (or a second server next to a local
+    // one) is the normal case, and a hardcoded 3306 makes the live suite
+    // unrunnable there.
+    const port_default: u16 = 3306;
+    const port: u16 = blk: {
+        if (builtin.os.tag == .windows) break :blk port_default;
+        const raw = std.c.getenv("MYSQL_PORT") orelse break :blk port_default;
+        break :blk std.fmt.parseInt(u16, std.mem.span(raw), 10) catch port_default;
+    };
 
     var client = Client.init(allocator, std.testing.io, .{
         .driver = .mysql,
         .host = host,
-        .port = 3306,
+        .port = port,
         .database = db,
         .username = user,
         .password = pass,
@@ -7121,9 +7161,13 @@ test "mysql live connection" {
 
     try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
     if ((&rows.rows[0]).get("name")) |name_val| {
-        const name_str = name_val.string;
-        try std.testing.expectEqualStrings("Alice", name_str);
-        allocator.free(name_str);
+        // Deliberately not freed: the string belongs to `rows`' arena (the
+        // driver duplicates scanned values into it), and `rows.deinit()` is its
+        // release. `allocator.free` here is a mismatched free — it used to panic
+        // with `free of invalid memory ... len: 5` ("Alice"), which went
+        // unnoticed only because the statement-metadata crash above it aborted
+        // the test before this line ever ran.
+        try std.testing.expectEqualStrings("Alice", name_val.string);
     } else return error.TestUnexpectedResult;
 
     // Empty SELECT: libmysql may return NULL from mysql_store_result with errno==0; must not be DatabaseError.

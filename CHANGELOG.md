@@ -1,5 +1,47 @@
 # Changelog
 
+## [Unreleased]
+
+### MySQL 预处理语句在 MariaDB 上崩进程：`MYSQL_FIELD` 的步长比库里的小 8 字节（**破坏性：否**）
+
+`client.query("… WHERE x = ?")` 走预处理语句路径时，CI 的 `Test (DB=mysql)` 一直
+`terminated with signal ABRT`：
+
+```text
+thread 3756 panic: attempt to use null value
+  src/sqlx/sqlx.zig:2908  const name = field.name[0..field.name_length];
+```
+
+**根因是数组步长，不是查询。** `mysqlStmtReadRows` 用
+`mysql_fetch_fields(meta)[c]` 取列描述符，而这个文件里 `MYSQL_FIELD` 的声明在
+`type` 之后结束（116 字节，补齐到 120），MariaDB Connector/C 的结构体还有一个
+尾部指针。容器里量出来的数：
+
+```text
+sizeof(MYSQL_FIELD) = 128   offsetof(extension) = 120   offsetof(type) = 112
+```
+
+于是 `fields[1]` 落在真实第 1 列**前 8 字节**——读到的是第 0 列的尾巴：`name == NULL`、
+`name_length == 0`、`type == 0`。第 0 列一切正常，所以症状看着像"偶发的空指针"。
+
+修法：改走 `mysql_fetch_field(meta)` 的游标（与同文件里非预处理路径一直用的写法
+一致），不再对任何 `MYSQL_FIELD` 数组做下标；顺带给列描述符结构体补上尾部指针，
+让 `@sizeOf` 与库一致；`name` 为空的列改为报错而不是解引用。
+
+同一条路径上还修掉一个**被这次崩溃掩盖的**测试缺陷：`mysql live connection` 里
+`allocator.free(name_str)` 释放的是 `rows` arena 拥有的字符串（5 字节的 "Alice"），
+报 `free of invalid memory`。arena 的释放点是 `rows.deinit()`。
+
+验证（本机 + Linux 容器，都是真库）：
+- Linux 容器 + `mariadb:11` + Debian libmariadb（= CI 的配置）：
+  `DB=mysql … zig build test -Ddb=all` → **1556/1576 passed（20 skipped），EXIT=0**
+  （CI 上此前是 `1555/1576 (20 skipped, 1 crashed)`）。
+- 过滤跑 `mysql live connection`：`1 passed, 0 failed, 0 leaked`（此前 ABRT）。
+- macOS 全量：1555/1576，21 skipped，0 failed（未回归）。
+
+顺带：该测试的端口改为可由 `MYSQL_PORT` 覆盖（默认 3306），此前端口写死，
+没法对着容器发布的端口跑。
+
 ## [0.33.0] - 2026-09-21
 
 ### 监听 socket 关不醒 `accept`：四个 `stop()` 在 Linux 上不返回（**破坏性：否**，行为修复）

@@ -29,6 +29,15 @@ pub const MYSQL_FIELD = extern struct {
     decimals: c_uint,
     charsetnr: c_uint,
     type: c_int,
+    /// MariaDB Connector/C and MySQL 8 both end the struct with a pointer here
+    /// (MySQL 8 additionally has `flags2` before it, which lands in the padding
+    /// this declaration would otherwise leave). Declaring it is what makes
+    /// `@sizeOf` match the linked library — measured 128 on Debian's libmariadb,
+    /// where omitting it gives 120 and every array index past the first reads
+    /// eight bytes early. No code indexes a `MYSQL_FIELD` array any more (the
+    /// statements walk `mysql_fetch_field`'s cursor instead), but a declaration
+    /// whose size is wrong is a trap for the next reader.
+    extension: ?*anyopaque,
 };
 
 pub const enum_field_types = c_int;
