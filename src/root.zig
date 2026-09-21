@@ -176,7 +176,7 @@ pub const RobustMQTransport = @import("core/KafkaConnector.zig").RobustMQTranspo
 pub const ConsumerGroupSession = @import("core/KafkaConnector.zig").ConsumerGroupSession;
 /// Encodes and decodes Kafka protocol frames.
 pub const KafkaWireFormat = @import("core/KafkaConnector.zig").KafkaWireFormat;
-/// NATS client (default localhost:4222) for pub/sub messaging.
+/// NATS client (default 127.0.0.1:4222 — a literal address, see `NatsConfig.url`) for pub/sub messaging.
 pub const NatsClient = @import("messaging/Nats.zig").NatsClient;
 /// NATS connection settings (URL, credentials, timeouts).
 pub const NatsConfig = @import("messaging/Nats.zig").NatsConfig;
