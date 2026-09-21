@@ -817,7 +817,7 @@ fn lintFile(
         // them into the wrong allocator", and `queryRowOwned` /
         // `scanRowsToOwned` are the same shape. Freeing one here is a
         // cross-allocator free: `free of invalid memory`, which kills the
-        // process (docs/ZENT.md §14, the v0.15.44 incident).
+        // process (the allocator-mismatch incident in docs/ZENT.md §14).
         //
         // Deliberately narrow: it keys on "the producer call mentions an
         // allocator/arena", which is the discriminator the docs give. A rule

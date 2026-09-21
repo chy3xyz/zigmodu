@@ -4276,7 +4276,12 @@ fn expectConnects(want: usize) !void {
     var tries: usize = 0;
     while (tries < 200) : (tries += 1) {
         if (ws_upgrade_state.connects.load(.monotonic) == want) return;
-        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch |err| {
+            // A failed sleep only makes the wait shorter than intended; the
+            // assertion below still reports the state that was actually
+            // observed, which is what this test is about.
+            std.log.debug("[test] expectConnects sleep: {s}", .{@errorName(err)});
+        };
     }
     try std.testing.expectEqual(want, ws_upgrade_state.connects.load(.monotonic));
 }
