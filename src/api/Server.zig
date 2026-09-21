@@ -34,6 +34,7 @@ const Hpack = @import("../http/Hpack.zig");
 const GrpcServiceRegistry = @import("../extensions/GrpcTransport.zig").GrpcServiceRegistry;
 const Rbac = @import("../security/Rbac.zig");
 const Time = @import("../core/Time.zig");
+const sockread = @import("../core/sockread.zig");
 const sqlx = @import("../sqlx/sqlx.zig");
 const ModuleLogger = @import("../log/ModuleLogger.zig").ModuleLogger;
 
@@ -2556,14 +2557,10 @@ pub const Server = struct {
     fn closeListener(self: *Server) void {
         if (self.listener_closing.swap(true, .acq_rel)) return;
         if (self.listener) |*l| {
-            // Linux: close() does NOT wake a thread blocked in accept() — the
-            // kernel keeps the socket alive for the in-flight call, so the
-            // accept loop would hang forever. shutdown() on a listening socket
-            // makes the blocked accept fail with EINVAL immediately.
-            // Errors are expected (ENOTCONN on macOS); the return is a raw
-            // c_int since Zig 0.17 removed std.posix.shutdown.
-            _ = std.c.shutdown(l.socket.handle, std.c.SHUT.RDWR);
-            l.deinit(self.io);
+            // `sockread.closeListener` is the shared version of this dance: the
+            // `shutdown` before the `close` is what wakes a thread blocked in
+            // `accept` on Linux, where `close` alone leaves it blocked forever.
+            sockread.closeListener(self.io, l);
             self.listener = null;
         }
     }

@@ -343,7 +343,10 @@ pub const DistributedEventBus = struct {
         self.is_running = false;
         self.heartbeat_thread = null;
         if (self.listener) |*l| {
-            l.deinit(self.io);
+            // `shutdown` before `close`: on Linux `close` does not wake a
+            // thread blocked in `accept`, so `acceptLoop` would never reach its
+            // `is_running` re-check and the await below would wait forever.
+            sockread.closeListener(self.io, l);
             self.listener = null;
         }
         // Drain accept/handle/heartbeat fibers; idempotent.

@@ -1,4 +1,5 @@
 const std = @import("std");
+const sockread = @import("../core/sockread.zig");
 const Application = @import("../Application.zig").Application;
 const ApplicationModules = @import("../core/Module.zig").ApplicationModules;
 const ModuleInfo = @import("../core/Module.zig").ModuleInfo;
@@ -54,7 +55,9 @@ pub const WebMonitor = struct {
     pub fn stop(self: *Self) void {
         self.is_running = false;
         if (self.server) |*s| {
-            s.deinit(self.io);
+            // `shutdown` before `close`: on Linux `close` does not wake the
+            // thread blocked in `accept`, so the loop would keep it alive.
+            sockread.closeListener(self.io, s);
             self.server = null;
         }
     }

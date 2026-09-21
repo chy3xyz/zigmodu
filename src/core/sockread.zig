@@ -51,6 +51,21 @@ fn applyTimeout(fd: std.posix.socket_t, optname: u32, tv: *const std.posix.timev
     std.log.warn("[sockread] {s} not applied ({s}): {s}", .{ what, @tagName(e), consequence });
 }
 
+/// Close a listening socket so a thread already blocked in `accept()` returns.
+///
+/// `close()` alone does not do that on Linux: the kernel keeps the socket alive
+/// for the in-flight `accept`, so the accept loop stays blocked and whoever is
+/// waiting for it — a `Thread.join`, an `Io.Group.await` — waits with it. The
+/// symptom is a `stop()` that never returns, which is a hang, not a shutdown.
+/// `shutdown()` on a listening socket makes that `accept` fail immediately
+/// (EINVAL). Errors are expected (macOS answers ENOTCONN for a listener) and
+/// ignored: the fd is closed either way, and a caller that gets no error had
+/// nothing blocked to begin with.
+pub fn closeListener(io: std.Io, listener: *std.Io.net.Server) void {
+    _ = std.c.shutdown(listener.socket.handle, std.c.SHUT.RDWR);
+    listener.deinit(io);
+}
+
 /// Bound how long a blocking write may stall on a full send buffer.
 ///
 /// Without this a slow (or maliciously non-reading) WS peer can block the

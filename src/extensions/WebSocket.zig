@@ -1,4 +1,5 @@
 const std = @import("std");
+const sockread = @import("../core/sockread.zig");
 const ApplicationModules = @import("../core/Module.zig").ApplicationModules;
 
 /// WebSocket support for real-time monitoring
@@ -83,7 +84,10 @@ pub const WebSocketServer = struct {
     pub fn stop(self: *Self) void {
         self.is_running = false;
         if (self.server) |*s| {
-            s.deinit(self.io);
+            // `shutdown` before `close`: on Linux `close` does not wake a
+            // thread blocked in `accept`, and the await below would wait for a
+            // loop that can never see `is_running` flip.
+            sockread.closeListener(self.io, s);
             self.server = null;
         }
         // Drain any in-flight accept/connection fibers so their futures do

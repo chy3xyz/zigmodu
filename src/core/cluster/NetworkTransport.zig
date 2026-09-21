@@ -158,7 +158,10 @@ pub const ClusterServer = struct {
         // being ordered against its own claim (see `start`).
         self.running.store(false, .seq_cst);
         if (self.listener) |*l| {
-            l.deinit(self.io);
+            // `shutdown` before `close`: on Linux `close` does not wake a
+            // thread already blocked in `accept`, so the loop below would never
+            // reach its re-check and `awaitHandlers` would wait forever.
+            sockread.closeListener(self.io, l);
             self.listener = null;
         }
         // The accept loop may be one dispatch short of handing a connection
