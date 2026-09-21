@@ -811,8 +811,9 @@ fn lintFile(
         // through the *client's* allocator, so they may only be handed a row the
         // driver scanned and the client owns (`Query().All()`, builder `Save()`).
         // A row produced by a call that took an allocator already belongs to
-        // that allocator — `CrudService.get(allocator, …)` returns an
-        // `ownedCopy(allocator, …)`, `query.zig` states that `AllIn(arena)`
+        // that allocator — `CrudService.getOwned(allocator, …)` (zent 0.73 renamed
+        // `get`; the framework's own `data.CrudService` still spells it `get`)
+        // returns an `ownedCopy(allocator, …)`, `query.zig` states that `AllIn(arena)`
         // rows must "not be passed to deinitRows/deinitEntity, which would free
         // them into the wrong allocator", and `queryRowOwned` /
         // `scanRowsToOwned` are the same shape. Freeing one here is a
@@ -828,7 +829,7 @@ fn lintFile(
                 try alloc_produced.put(name, {});
             } else if (deinitRowTarget(trimmed)) |target| {
                 if (alloc_produced.contains(target)) {
-                    try pushViolation(violations, allocator, "b23", rel_path, idx, "把「由带 allocator 形参的函数产出」的行交给了 deinitRow/deinitRows —— 那是用 client 的分配器释放别人的内存（`free of invalid memory`，会打死进程）。只对驱动扫描出来的行用 deinitRow(s)（`Query().All()` / builder `Save()`）；`get` / `AllIn(arena)` / `queryRowOwned` / `scanRowsToOwned` 的返回值由那个 allocator 自己回收（arena 会自己清）。确属误报则在同一行加 `// audit: ignore b23` 并注明出处", .{});
+                    try pushViolation(violations, allocator, "b23", rel_path, idx, "把「由带 allocator 形参的函数产出」的行交给了 deinitRow/deinitRows —— 那是用 client 的分配器释放别人的内存（`free of invalid memory`，会打死进程）。只对驱动扫描出来的行用 deinitRow(s)（`Query().All()` / builder `Save()`）；`getOwned`（旧名 `get`）/ `AllIn(arena)` / `queryRowOwned` / `scanRowsToOwned` 的返回值由那个 allocator 自己回收（arena 会自己清）。确属误报则在同一行加 `// audit: ignore b23` 并注明出处", .{});
                 }
             }
         }
@@ -1482,7 +1483,7 @@ fn isCrudName(name: []const u8) bool {
 }
 
 /// b23 — the LHS of a binding whose initializer is a call that mentions an
-/// allocator or an arena: `const e = try self.crud.get(allocator, …);`. Null for
+/// allocator or an arena: `const e = try self.crud.getOwned(allocator, …);`. Null for
 /// anything else, including comparisons and non-`const`/`var` assignments.
 ///
 /// Multi-line initializers and an allocator passed under a shorter name are
@@ -2217,7 +2218,7 @@ test "audit business lint flags anti-patterns" {
     try lintFile(allocator, "zent_crud.zig", "const A = CrudApi(infos, Info, .{ .tenant_source = .attr });\n", "src/modules/x/zent_crud.zig", &cfg, &violations);
     // b23 — the row came from a call that took the allocator, so it belongs to
     // that allocator; deinitRow frees it through the client's.
-    try lintFile(allocator, "persistence.zig", "pub fn find(self: *@This(), allocator: std.mem.Allocator, id: i64) !void {\n    const e = try self.crud.get(allocator, id);\n    defer self.client.user.deinitRow(&e);\n}\n", "src/modules/x/persistence.zig", &cfg, &violations);
+    try lintFile(allocator, "persistence.zig", "pub fn find(self: *@This(), allocator: std.mem.Allocator, id: i64) !void {\n    const e = try self.crud.getOwned(allocator, id);\n    defer self.client.user.deinitRow(&e);\n}\n", "src/modules/x/persistence.zig", &cfg, &violations);
     // b23 — query.zig states AllIn(arena) rows must not go to deinitRows.
     try lintFile(allocator, "persistence.zig", "pub fn page(self: *@This(), arena: *std.heap.ArenaAllocator) !void {\n    var rows = try self.client.user.Query().AllIn(arena);\n    defer self.client.user.deinitRows(&rows);\n}\n", "src/modules/x/persistence.zig", &cfg, &violations);
     // b23 negative — a driver-scanned page is exactly what deinitRows is for.

@@ -158,8 +158,8 @@ pub fn CrudApi(
         fn get(ctx: *http.Context, self: *State) !void {
             const tenant = try tenantId(ctx);
             const id = try ctx.paramInt(i64, "id");
-            const found = self.svc.get(ctx.allocator, tenant, id) catch |err| return http.respondErr(ctx, err);
-            // No deinitRow here, deliberately. `CrudService.get` returns
+            const found = self.svc.getOwned(ctx.allocator, tenant, id) catch |err| return http.respondErr(ctx, err);
+            // No deinitRow here, deliberately. `CrudService.getOwned` returns
             // `ownedCopy(allocator, …)` — its strings belong to the allocator we
             // passed (the request arena), not to the client's. `deinitRow` frees
             // with the *client* allocator, which is a mismatched free of arena
@@ -168,6 +168,9 @@ pub fn CrudApi(
             // 0.17 `ArenaAllocator.free` is a no-op, which is why the older
             // `deinitEntity(…, ctx.allocator)` form was harmless and why this
             // only started crashing once it was migrated to `deinitRow`.)
+            // zent v0.73.0 made this unmistakable in the API itself: `get` is
+            // `getOwned`, and `client.<entity>.deinitRowWith(allocator, &e)` is
+            // the release for such a row.
             if (found) |e| {
                 try ctx.jsonStruct(200, e);
             } else {

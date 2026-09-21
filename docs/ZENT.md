@@ -1,7 +1,7 @@
 # ZigModu × zent 最佳实践
 
 **zent**: [chy3xyz/zent](https://github.com/chy3xyz/zent) — Zig 版 [ent](https://entgo.io/)（schema-as-code ORM）  
-**版本口径**: zent **v0.67.0**（0.54 起 `CrudService.create(entity, tenant_id)` 双参；0.66 起空 `dept_ids` 拒绝而非放行、无谓词 `BulkDelete` 报 `NoPredicate`；0.67 起无 `last_insert_id` 报 `MissingLastInsertId`、MySQL 批量改逐行；0.57 起 MySQL 的 `String`/`Enum` 落 `VARCHAR(255)`；0.40 起一行式实体释放 `deinitRows`/`deinitRow`/`deinitEdgeRows`；0.38 起 `queryTargets*` fail-closed；0.39 起 `zent.scope` 让裸 SQL 也走同一套读契约，见 §14/§15）· 本仓库示例按 **v0.67.0** 验证；`create` 双参签名要求 **≥ v0.54.0**，其余条目见 §14 · ZigModu **v0.15.22+**（本文件随 v0.15.47 适配 v0.67.0）· Zig **≥ 0.17**  
+**版本口径**: zent **v0.74.2**（0.73 起 `CrudService.get` → **`getOwned`**、配套 `deinitRowWith(allocator, &e)`；0.73 起 `Sum`/`Avg` 空集报 `EmptyAggregate`；0.70 起 **SQLite 强制外键**（`PRAGMA foreign_keys = ON`）；0.70 起 PG 的 `23502/23503` 不再误报 `UniqueViolation`；0.69 起 `SaveError` 增 `InconsistentRowFields`/`MissingPrimaryKey`；0.72 起 `Restore` 受策略过滤与拦截器约束；0.74 起 EntQL 拒绝未知字段；0.54 起 `CrudService.create(entity, tenant_id)` 双参；0.57 起 MySQL 的 `String`/`Enum` 落 `VARCHAR(255)`；0.40 起一行式实体释放 `deinitRows`/`deinitRow`/`deinitEdgeRows`；0.38 起 `queryTargets*` fail-closed；0.39 起 `zent.scope` 让裸 SQL 也走同一套读契约，见 §14/§15）· 本仓库示例按 **v0.74.2** 验证；`create` 双参签名要求 **≥ v0.54.0**，`getOwned` 要求 **≥ v0.73.0**，其余条目见 §14 · ZigModu **v0.15.22+** · Zig **≥ 0.17**  
 **主推组合**: **电商 / 社交类项目默认选 ZigModu + zent**（见 §2 决策表与 §4.8 场景能力矩阵）；只有存量 SQL 繁重、报表主导或 DBA 强管控的项目才默认 sqlx。这是**新项目选型建议**，与框架自带的默认实现不是一件事——口径见 §1「与框架自带那条的关系」。
 
 **参考实现**: [`examples/zent-modulith/`](../examples/zent-modulith/)  
@@ -243,7 +243,7 @@ zent 是 ent-style：**关系走 Edges 预加载，不做跨表 JOIN 查询**（
    JOIN 时不会歧义；`table` 是 comptime 参数，写错表名是**编译错误**。
 3. 报表查询建议独立 `report/` 模块持有自己的 `sqlx.Client`，与写路径（zent）解耦，避免把复杂 SQL 混进 domain 模块。
 
-### 4.8 电商 / 社交主推能力矩阵（zent v0.30–v0.67）
+### 4.8 电商 / 社交主推能力矩阵（zent v0.30–v0.74）
 
 这两版把电商/社交最常见的「钱、幂等、列表、可见性」四类痛点补成了一等能力，是主推组合的直接理由：
 
@@ -539,7 +539,7 @@ pub const CatalogStore = struct {
 
 ## 11. 依赖接入
 
-zent **v0.67.0** 提供 `build.zig.zon`（模块名 `zent`；生产 pin git tag，本地开发可换 path 依赖）。
+zent **v0.74.2** 提供 `build.zig.zon`（模块名 `zent`；生产 pin git tag，本地开发可换 path 依赖）。
 
 **本地 sibling（开发）：**
 
@@ -558,7 +558,7 @@ exe_mod.addImport("zent", zent_dep.module("zent"));
 
 ```zon
 .zent = .{
-    .url = "https://github.com/chy3xyz/zent/archive/refs/tags/v0.67.0.tar.gz",
+    .url = "https://github.com/chy3xyz/zent/archive/refs/tags/v0.74.2.tar.gz",
     .hash = "<zig fetch 后填入>",
 },
 ```
@@ -594,7 +594,7 @@ zig_ws/
 
 - [ ] Schema 在 `model.zig`，HTTP **不** import `zent.sql_*`
 - [ ] 启动：`open/pool → migrateSchema → makeClient`
-- [ ] 列表：`deinitEntity` + `Managed.deinit`
+- [ ] 列表：`client.<entity>.deinitRows(&rows)`（zent ≥0.40 的一行式释放；手写 `deinitEntity` 循环是旧写法）
 - [ ] Create builder / Tx：**defer deinit**
 - [ ] 租户：predicate 或 PrivacyContext
 - [ ] 对外 DTO，不泄漏 zent 实体生命周期
@@ -604,7 +604,7 @@ zig_ws/
 
 ---
 
-## 14. 升级注意（zent 0.6 → 0.12 → 0.13 → … → 0.41 → 0.67）
+## 14. 升级注意（zent 0.6 → 0.12 → 0.13 → … → 0.67 → 0.74）
 
 > **升级自查（先跑命令，再读条目）**：
 > ```bash
@@ -616,12 +616,21 @@ zig_ws/
 
 | 主题 | 动作 / 新特性 |
 |------|--------------|
+| **v0.73.0 `CrudService.get` → `getOwned`（BREAKING，命名）** | 它返回的是复制进**调用方 allocator** 的行，而 `client.<entity>.deinitRow(&e)` 用 **client 的 allocator** 释放——两边是同一个 `Entity` 类型，除了调用点没人说得出哪个 allocator 才对，配错就是跨分配器 free（请求 arena 被写坏，或 `free of invalid memory` 打死进程）。改名把所有权写在了调用点上，配套 `client.<entity>.deinitRowWith(allocator, &e)` 是这类行的释放。本仓库 `zent_crud.get` 已改 `getOwned`（那段"这里为什么故意不 deinitRow"的注释保留，理由没变）。这也是 `zmodu audit` b23 拦的那一类，上游把它变成显式的了。 |
+| **v0.74.0 EntQL 拒绝实体上不存在的字段** | 解析器不认识 schema：typo 以前原样下发（服务端才报错，且各方言不同）；更糟的是 `has(...)` 里的联结列会绑到联结表，把过滤退化成对外层行的条件，**无声地给出答案**。现在在 lowering 之前按解析树检查，API 名与物理列名两种拼法都接受；答案是 `error.UnknownField`。 |
+| **v0.73.0 `Sum`/`Avg` 空集报 `EmptyAggregate`（BREAKING，错误集）** | 以前空集报 `error.TypeMismatch` —— 与"值不是数字"同一个错误，"没有数据"被报成类型问题，两者分不开。成员只加在 `Sum`/`Avg` 的专属错误集上（`QueryError \|\| error{EmptyAggregate}`），共享读取器（`All`/`First`/`Count` …）不被加宽；`SumOrZero`、`Max`/`Min` 不变。穷尽 `switch` 会被打到。 |
+| **v0.72.0 `Restore` 受策略过滤与拦截器约束（行为变更，安全）** | `Delete().Restore(id)` 以前查了策略判定却丢掉 `result.getFilters()`，也从不跑拦截器链 —— 唯一两条都没做的写路径（兄弟 `Save`、两种软/硬删、两条批量路径都做了）。按租户/策略限定范围的策略因此允许调用方**复活任何它叫得出名字的行**。现在越界的 restore 匹配不到行并回答 `false`。 |
+| **v0.72.0 `queryTargets*` / `QueryEdge` 中途失败不再给短页** | 读完最后一行后没问 `nextError()`，于是读一半的驱动失败（deadline 触发、消费到一半服务端报错）被当成"读完了"，把已读到的行当整页交给调用方，既无错误也无标记。其它批量读取器都会问，只有它例外。 |
+| **v0.70.0 SQLite 强制外键（BREAKING，行为）** | `SQLiteDriver.open` 在每条连接上发 `PRAGMA foreign_keys = ON` 并**回读确认**（pragma 是 per-connection，且在事务里静默无效却仍答 `SQLITE_OK`，"发了"不等于"生效"）。SQLite 默认关，于是 `migrateSchema` 写下的 `FOREIGN KEY` 一直只被记录、从未被检查：悬空引用被接受、级联删除什么都不删、删被引用的父表会成功。现在悬空引用报 `error.ForeignKeyViolation`、级联真的删子行、`DROP TABLE` 被引用的表会失败 —— **测试与清理顺序跟着改（先删子表/联结表）**。库里已有悬空引用的可按连接退出：`.{ .enforce_foreign_keys = false }`，它的意思就是"不再检查引用"。 |
+| **v0.70.0 PG 的 `23502`/`23503` 不再误报 `UniqueViolation`** | `sqlstateToError` 读的是 SQLSTATE 的第 2 位（`5`），整个 `235xx` 家族都命中唯一冲突分支，于是 not-null 与外键冲突在 PostgreSQL 上被当成唯一冲突。按 `ForeignKeyViolation` 分支、或拿 `UniqueViolation` 做 upsert 回退的消费者会走错路。 |
+| **v0.69.0 `SaveError` 增两个成员（BREAKING，错误集）** | `InconsistentRowFields`、`MissingPrimaryKey`。前者出自 `MultiInsert`：语句只带**第一行**的列清单，而每行的值按自己的顺序铺开，字段少/多的行于是写错列或越界（长度断言因为缓冲区是按列清单算的，两边都拦不住）；现在任何一行与第一行**逐位置**不一致就在语句执行前报错，顺序不同也算不一致。后者是"uuid 主键没设"在 MySQL 上被当成键为 `""` 的实体 —— 现在语句执行前就报，不会留下无名行。 |
+| **v0.68.0 预加载目标按字段顺序投影** | 邻居查询原来 `SELECT <target>.*`，列顺序是**表**的物理顺序，而结果集是按位置扫描的；`ALTER TABLE … ADD COLUMN`（`migrateSchema` 加字段的方式）会把列追加到末尾，所以在任何长期迁移过的库上，预加载目标都会把值读进错误的字段。MySQL 报 `TypeMismatch`，SQLite 静默给错值。现在 SELECT 列表取自扫描用的同一份 `TypeInfo`，投影与扫描不可能不一致。 |
 | **v0.67.0 无 `last_insert_id` 报错 / MySQL 批量逐行（BREAKING）** | `CreateBuilder.Save` 以前在驱动没给 id 时把 `0` 写进主键（`res.last_insert_id orelse 0`）——`0` 与真 key 无法区分，调用方拿着一个"看起来已存在"的实体；MySQL 的 `BulkInsert/SaveOrUpdate` 还按 `base + i` 编造一串 id，只要 chunk 里有 `ON DUPLICATE KEY UPDATE` 命中，编造就是错的。现在没有 id 直接 `error.MissingLastInsertId`（**行已写入，只是 key 未知**），MySQL 改为一行一条语句（每行用驱动回报的 id；代价是每行一次往返，且 chunk 中途失败不再原子）。 |
 | **v0.66.0 空 `dept_ids` 拒绝而非放行（BREAKING，安全）** | `.dept_custom` / `.dept_and_child` 拿到**空列表**时旧行为把谓词留成 `null`，而 `null` 在本模块就是"无限制"——于是没带部门的请求读到**全表**（相邻的"超长列表"分支却拒绝）。现在空列表与超长同样处理：物化恒假 `1 = 0` 并告警。`.all` 不受影响。本仓库 smoke 已把"空 `dept_ids` → 空结果"钉成断言（升级前那条会返回全表）。 |
 | **v0.66.0 无谓词 `BulkDelete` 报错（BREAKING）** | `BulkDelete().Exec()` 不带谓词时，旧行为取决于**实体 schema**：软删实体静默什么都不做并返回 `0`（调用方读作"没有匹配行"），硬删实体**删全表**。现在统一 `error.NoPredicate`。与 v0.45.0 对无 `SET` 的 `UPDATE` 报 `NoFieldsToUpdate` 同一条规矩。 |
 | **v0.54.0 `CrudService.create(entity, tenant_id)`（BREAKING，签名）** | 旧签名 `create(entity)` 从实体里读租户列，而写循环会**复制每个字段**（含租户列），拦截器又只填"缺失"的列——于是调用方新建实体的租户字段是 0 时，0 赢了绑定的租户并把 `0` 写进库。现在租户是**形参**，不再从实体读。本仓库 `zent_crud.CrudApi.create` 已改为 `create(buildEntity(tenant, body), tenant)`。 |
 | **v0.57.0 / 0.58–0.59 `driver.Error` 扩张（BREAKING，错误集）** | 新增 `ParamCountMismatch`、`PoolWaitTimeout`；错误集不可扩展，**没有 `else` 的穷尽 `switch` 会编译失败**。另外 MySQL 的 `field.String`/`field.Enum` 现在落 `VARCHAR(255)`（此前 `TEXT`，而 MySQL 不允许 TEXT 做唯一键/默认值/索引 → 建表直接失败）。SQLite 也不再容忍绑定参数个数错误（此前多绑被丢、少绑读成 NULL，语句照跑但语义不同）。 |
-| **⚠️ 升级陷阱：`deinitRow` 与 `CrudService.get` 的分配器不匹配（本仓库实测踩中）** | `CrudService.get(allocator, …)` 返回的是 **`ownedCopy(allocator, …)`**——字符串归**调用方传入的 allocator**（通常请求 arena），而 `client.<entity>.deinitRow(&e)` 用 **client 的 allocator** 释放 → 分配器不匹配，SafeAllocator 报 `free of invalid memory` 并**打死进程**（实测 `len: 6` 就是被释放两次的那 6 字节名字）。v0.15.44 那轮把 `deinitEntity(…, ctx.allocator)`（arena，Zig 0.17 里 `ArenaAllocator.free` 是 no-op，无害）机械替换成 `deinitRow`，才把这个潜伏错误变成崩溃。**规矩**：`deinitRow(s)` 只用于**驱动扫描出来**的行（`client.X.Query().All()` / builder `Save()` 的返回值）；凡是从"带 allocator 形参"的函数拿到的（`get` / `queryRowOwned` / `scanRowsToOwned` …）都不要交给它，arena 会自己回收。`Query().AllIn(arena)` 是同一类：zent 的注释明说这些行"must **not** be passed to `deinitRows`/`deinitEntity`, which would free them into the wrong allocator"。**`zmodu audit` b23 拦这一类**（判据：`deinitRow(s)` 的目标绑定自一个参数里出现 allocator/arena 的调用）；确属误报就在同一行写 `// audit: ignore b23` 并注明出处。 |
+| **⚠️ 升级陷阱：`deinitRow` 与 `CrudService.get` 的分配器不匹配（本仓库实测踩中）** | `CrudService.get(allocator, …)` 返回的是 **`ownedCopy(allocator, …)`**——字符串归**调用方传入的 allocator**（通常请求 arena），而 `client.<entity>.deinitRow(&e)` 用 **client 的 allocator** 释放 → 分配器不匹配，SafeAllocator 报 `free of invalid memory` 并**打死进程**（实测 `len: 6` 就是被释放两次的那 6 字节名字）。v0.15.44 那轮把 `deinitEntity(…, ctx.allocator)`（arena，Zig 0.17 里 `ArenaAllocator.free` 是 no-op，无害）机械替换成 `deinitRow`，才把这个潜伏错误变成崩溃。**v0.73.0 从 API 层面取消了这份心算**：`CrudService.get` 已改名 `getOwned`，这类行的释放是 `client.<entity>.deinitRowWith(allocator, &e)`（见本表首行）。**规矩**：`deinitRow(s)` 只用于**驱动扫描出来**的行（`client.X.Query().All()` / builder `Save()` 的返回值）；凡是从"带 allocator 形参"的函数拿到的（`get` / `queryRowOwned` / `scanRowsToOwned` …）都不要交给它，arena 会自己回收。`Query().AllIn(arena)` 是同一类：zent 的注释明说这些行"must **not** be passed to `deinitRows`/`deinitEntity`, which would free them into the wrong allocator"。**`zmodu audit` b23 拦这一类**（判据：`deinitRow(s)` 的目标绑定自一个参数里出现 allocator/arena 的调用）；确属误报就在同一行写 `// audit: ignore b23` 并注明出处。 |
 | **⚠️ 升级陷阱：Zig 0.17-dev 增量缓存会沿用旧 fetch 依赖** | 改完 pin 直接 `zig build` 可能**继续用旧版本模块**：本仓库实测在 pin 已改成 v0.67.0 的情况下，"编译通过"且崩溃栈里的源码路径仍是 `zent-0.41.1`。**改 pin 后先 `rm -rf .zig-cache`（并删 `zig-pkg/<旧版本>`）再构建**，否则你验证的不是新版本。 |
 | **v0.41.1 `deinitRows` 重新接受指针（0.40.0 回归修复）** | 0.40.0 把 `crud_helpers.deinitRows(rows: anytype)` 的实现收窄成只认值（`var list = rows; deinitEntityList(…, &list)`），于是所有传 `&rows` 的调用方**编译失败**（`expected type 'T', found '*T'`）；注释还声称"保持按值签名"，是错的。0.41.1 在 comptime 归一化：可变指针直通（调用方的列表被清空且可复用）、值与 `*const` 走可变副本。三个形态都有回归测试。**教训**：`anytype` 的"接受形态"一旦收窄就是静默破坏性变更——本仓库的 `docs/BEST_PRACTICES.md`「anytype 形参的契约写法」与 `src/test/ErrorSetSnapshot.zig` 就是为这类问题立的规矩。 |
 | **v0.41.0 裸路径审计（哪些有作用域、哪些没有）** | `crud_helpers.queryRows` 只是 `driver.query` 的映射器，**按你写的语句原样执行**——与 `zent.scope` 要解决的裸路径同类，只是位置更高一层；其文档现在明说并给出组合写法，`BEST_PRACTICES` §5 列出每条裸路径的要求，并有端到端测试（未加作用域 3 租户行 → 加作用域 1 行）。另两条经审计确认安全：`PreparedCache` 以最终 SQL 文本逐字节为键（跨租户语句永不共享）、`explainSql` 只包一层 `EXPLAIN`（`Format` 无 `ANALYZE`，不会真执行）。 |

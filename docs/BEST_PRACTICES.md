@@ -157,7 +157,7 @@ AI 侧、集群侧）的实测结果：builder 绑定、worker 归 app、不手�
 - ✅ `build.zig.zon` 的 `.minimum_zig_version` 已全部是 `"0.17.0"`
   （`grep -rn '"0.16.0"' examples/ --include='*.zon'` 为空）；`tenant-mgmt` README → v0.23.0；
   `metaverse-creative` 两处 → v0.24.0（v0.4.0 实际在 `ARCHITECTURE_DIAGRAM.txt:153`，不在 `DEMO_SUMMARY.md`）；
-  `shopdemo-zent` 注释 → zent v0.67.0 的 git tag pin
+  `shopdemo-zent` 注释 → zent v0.74.2 的 git tag pin
 - ✅ `examples/alpha-engine` 已进 `ci.yml` 两个 examples 构建循环（`:153` / `:319`）与 `zmodu doctor`
   循环（`:166`）。**仍未进 `zmodu audit` 循环**（`:214`，仍是 tenant-mgmt / tenant-shop / basic /
   ai-ops / zmsaas-backend）—— 实测 `audit examples/alpha-engine` pass、0 violations，可随时加入
@@ -214,7 +214,7 @@ shopdemo↔shopdemo-zent、basic↔testing、distributed↔cluster-demo、`depre
    `examples/README.md` 索引与目录一一对应（20 行，含 runtime-workers / alpha-engine）；`alpha-engine` 已进
    CI 构建列表（`ci.yml:153`）与 `zmodu doctor` 循环（`ci.yml:166`）。
 4. **统一 zent 依赖为 git tag pin** —— ✅ **已完成（2026-09-17）**：`shopdemo-zent` / `metaverse-creative` /
-   `zent-modulith` 三处都改成 `git+https://github.com/chy3xyz/zent?ref=v0.67.0` 的 tag pin（无 sibling 检出也能构建）；
+   `zent-modulith` 三处都改成 `git+https://github.com/chy3xyz/zent?ref=v0.74.2` 的 tag pin（无 sibling 检出也能构建）；
    例外只剩 `examples/_shared`（helper 库，仍按 path 引 sibling `../zent`，CI 的注释已写明此处不可离线构建）。
 5. **收敛重复示例** —— ✅ **已完成（2026-09-17）**：删 `deprecated/`（只有一份裸 snippet）与 `examples/example_tests.zig`
    （占位）；testing 并入 basic（`examples/basic/src/tests.zig` + `build.zig` 的 `test` step，5 个测试：原 testing 的 3 个
@@ -389,9 +389,9 @@ CI 构建 15 项 + `zmsaas/backend`。
    而示例真码是 `deinitRows(&found)`（`examples/zent-modulith/.../catalog/persistence.zig:84`），同一文档 `:519/:618/:665`
    又要求用 `deinitRows`；`docs/MODULE_LAYERS.md:67` 的 `findById(self, tenant_id, id)` 与其"参考实现"
    `examples/tenant-shop/.../tenant/persistence.zig:26` 的 `findById(self, id)` 不符；`Backend` 口径不清
-   （文档主推 `data.SqlxBackend`，但 `queryRowPartial` 只在 `*data.Client` 上存在）。`ZENT.md:532` 还写着 zent v0.39.2（实际 pin v0.67.0）。
+   （文档主推 `data.SqlxBackend`，但 `queryRowPartial` 只在 `*data.Client` 上存在）。`ZENT.md:532` 还写着 zent v0.39.2（实际 pin v0.74.2）。
    （2026-09-18 修：`docs/ZENT.md` 的"摘自示例"块已改成 `defer self.client.product.deinitRows(&found)`（`:479`），
-   `:491` 注明"手写 `deinitEntity` 循环是旧写法，本仓库示例已全部改掉"；全文 `v0.39.2` 清零、口径为 zent v0.67.0
+   `:491` 注明"手写 `deinitEntity` 循环是旧写法，本仓库示例已全部改掉"；全文 `v0.39.2` 清零、口径为 zent v0.74.2
    （`:4` / `:530` / `:549`）；`docs/MODULE_LAYERS.md:62-64` 写清 `Backend` 两套方法（`*data.Client` → `queryRowPartial`，
    `data.SqlxBackend` → `queryRowPartialBorrowed`），`:72-74` + `:94` 说明租户键表用 `findById(self, tenant_id, id)`、
    租户主表退化为 `findById(self, id)`。`rg -n 'v0\.39\.2' docs/ZENT.md` 为空）
