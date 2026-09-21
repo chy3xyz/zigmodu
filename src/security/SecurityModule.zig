@@ -469,9 +469,42 @@ fn base64UrlDecode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
 
     const decoder = std.base64.Base64Decoder.init(std.base64.standard_alphabet_chars, '=');
     const decoded = try allocator.alloc(u8, decoder.calcSizeForSlice(padded_data) catch return error.InvalidEncoding);
+    errdefer allocator.free(decoded);
     try decoder.decode(decoded, padded_data);
 
     return decoded;
+}
+
+// A failed `decode` must not leak its buffer. `calcSizeForSlice` accepts this
+// length and `decode` rejects the `*`, so the allocation above is live when the
+// error is returned — the `errdefer` is what frees it.
+//
+// This class is invisible to unit tests that use one allocator for both the
+// decode and the check: only an allocator that *reports* leaks at the end of the
+// test sees it. Before the `errdefer` these two tests fail with
+// `error.MemoryLeakDetected`, and a real caller (an invalid token's header or
+// payload segment on every failed verification) leaks a small block per attempt.
+// (Reported by a downstream project whose shutdown-leak gate caught it in
+// production; they are carrying an explicit exemption until this lands.)
+test "a base64 decode failure frees its buffer (standard)" {
+    const allocator = std.testing.allocator;
+    const result = base64Decode(allocator, "AA*A");
+    if (result) |decoded| {
+        allocator.free(decoded);
+        return error.ExpectedDecodeFailure;
+    } else |_| {}
+}
+
+test "a base64 url decode failure frees its buffer" {
+    const allocator = std.testing.allocator;
+    // The URL variant pads and rewrites in place, so it needs a mutable buffer.
+    var buf: [16]u8 = undefined;
+    @memcpy(buf[0..4], "AA*A");
+    const result = base64UrlDecode(allocator, buf[0..4]);
+    if (result) |decoded| {
+        allocator.free(decoded);
+        return error.ExpectedDecodeFailure;
+    } else |_| {}
 }
 
 /// Standard Base64 encoding
@@ -486,6 +519,7 @@ fn base64Encode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
 fn base64Decode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     const decoder = std.base64.Base64Decoder.init(std.base64.standard_alphabet_chars, '=');
     const decoded = try allocator.alloc(u8, decoder.calcSizeForSlice(data) catch return error.InvalidEncoding);
+    errdefer allocator.free(decoded);
     try decoder.decode(decoded, data);
     return decoded;
 }

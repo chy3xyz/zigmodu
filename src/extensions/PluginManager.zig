@@ -120,12 +120,19 @@ pub const PluginManager = struct {
             deinit_fn();
         }
 
-        // Free resources
-        self.allocator.free(entry.name);
-        self.allocator.free(entry.path);
-        self.allocator.free(entry.version);
+        // Take the owned slices out **before** removing the key. `name` may alias
+        // `entry.name` — unloading by the stored name is the natural usage (walk
+        // `plugins`, unload each by its own name) — and `remove` hashes and
+        // compares the key, so freeing first made that read a use-after-free.
+        const owned_name = entry.name;
+        const owned_path = entry.path;
+        const owned_version = entry.version;
 
-        _ = self.plugins.remove(name);
+        _ = self.plugins.remove(name); // `name` is still valid here
+
+        self.allocator.free(owned_name);
+        self.allocator.free(owned_path);
+        self.allocator.free(owned_version);
 
         std.log.info("[PluginManager] Unloaded plugin: {s}", .{name});
     }
