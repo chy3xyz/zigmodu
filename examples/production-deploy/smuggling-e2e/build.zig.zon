@@ -1,0 +1,1 @@
+.{ .name = .smuggling_e2e, .version = "0.1.0", .fingerprint = 0xb7a798d73a901265, .minimum_zig_version = "0.17.0", .dependencies = .{ .zigmodu = .{ .path = "../../.." } }, .paths = .{ "build.zig", "build.zig.zon", "src" } }

@@ -188,7 +188,7 @@ gRPC 的价值与**通信距离**成正比，modulith 的核心通信都在**进
 - ✅ 并发浸泡测试 `zig build soak`；沙箱隔离 `-Dnet-tests=false`。
 - ✅ 观测闭环：`docs/OBSERVABILITY.md` + `docs/grafana/zigmodu-overview.json`。
 - ✅ 部署参考拓扑 `examples/production-deploy/`（nginx/Envoy/k8s/systemd）。
-- ✅ 韧性三件套：`FrozenMap` / `panicHook` / audit b19–b22。
+- ✅ 韧性三件套：`FrozenMap` / `panicHook` / audit b19–b23（b23 = 分配器归属）。
 - ✅ 启动预检 `Preflight`（env / 占位 secret / DB / 待应用迁移 / 时钟）；
   JWT `kid` 轮换（`JwksKeyRing` + `setKeyring`，未知 kid 拒绝）；CORS 通配符告警。
 - ✅ 业务面可观测：outbox 积压/投递指标 + 内置轮询、DB 池指标、抓取时采样钩子、

@@ -395,7 +395,27 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libpq-dev libmariadb-dev libmariadb-dev-compat libsqlite3-dev curl
 
       - name: Run integration probes
-        run: HTTP_PORT=18080 bash scripts/ci-integration.sh 2>&1 | tee "$RUNNER_TEMP/integration.log"
+        # `set -o pipefail`: without it the step's status is `tee`'s, and a
+        # failing probe script reports success (the same hole c816ff1 fixed for
+        # the unit-test step).
+        run: |
+          set -o pipefail
+          HTTP_PORT=18080 bash scripts/ci-integration.sh 2>&1 | tee "$RUNNER_TEMP/integration.log"
+
+      - name: CL/TE smuggling through a real gateway (nginx)
+        # Non-default ports: the probe above just used 18080.
+        run: |
+          set -o pipefail
+          APP_PORT=18180 GW_BUFFERED_PORT=18181 GW_STREAM_PORT=18182 \
+            bash examples/production-deploy/smuggling-e2e/run.sh 2>&1 | tee "$RUNNER_TEMP/smuggling.log"
+
+      - name: Upload smuggling log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smuggling-log
+          path: ${{ runner.temp }}/smuggling.log
+          retention-days: 7
 
       - name: Upload integration log on failure
         if: failure()
@@ -512,7 +532,9 @@ jobs:
           MYSQL_USER: root
           MYSQL_PASSWORD: secret
           MYSQL_DATABASE: zigzero_test
-        run: zig build test 2>&1 | tee "$RUNNER_TEMP/mysql-test.log"
+        run: |
+          set -o pipefail
+          zig build test 2>&1 | tee "$RUNNER_TEMP/mysql-test.log"
 
       - name: Upload mysql test log on failure
         if: failure()
@@ -582,7 +604,9 @@ jobs:
           REDIS_URL: redis://127.0.0.1:6379
           NATS_URL: nats://127.0.0.1:4222
           KAFKA_BOOTSTRAP: 127.0.0.1:9092
-        run: zig build test 2>&1 | tee "$RUNNER_TEMP/live-test.log"
+        run: |
+          set -o pipefail
+          zig build test 2>&1 | tee "$RUNNER_TEMP/live-test.log"
 
       - name: Upload live-service test log on failure
         if: failure()

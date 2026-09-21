@@ -424,7 +424,7 @@ CI 构建 15 项 + `zmsaas/backend`。
 
 ### 实践 ↔ 门禁一致性（2026-09-18）
 
-「会炸/会漏」的规则**基本都有门禁**（`audit` b1–b22 + `check-production` + `DocSnippets` + `AiBoundary`）。缺口分三类：
+「会炸/会漏」的规则**基本都有门禁**（`audit` b1–b23 + `check-production` + `DocSnippets` + `AiBoundary`）。缺口分三类：
 
 **A. 只有约定、没有机制**（文档说得硬，机器不查）
 `worker 归 app`（禁模块内 `Runtime.init`/`rt.shutdown`）· **裸 `Agent{}` 必带 guard**（只有 opt-in 的 `isGuarded()`）· `请求路径勿读 ClusterMembership 哈希表`（b20 只管文件作用域 `var …HashMap`）· 多副本 cron/迁移 `setLock` · `TransactionJournal.recover()` · `SagaStep.timeout_seconds`。

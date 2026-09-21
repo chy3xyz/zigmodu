@@ -722,6 +722,10 @@ fn lintFile(
     // b18 — pseudo-transaction guard: beginTx() followed by a pool-connection
     // exec in the same fn (auto-commit, rollback no-op).
     var b18_begin_seen = false;
+    // b23 — allocator ownership: names bound from a call that took an allocator.
+    // Keys borrow from `content`, which outlives this call.
+    var alloc_produced = std.StringHashMap(void).init(allocator);
+    defer alloc_produced.deinit();
     // `const x = queryRow(...)` whose value is delegated via the next-line
     // `return x;` — ownership transfers, no leak at this call site.
     var pending_qr_var: ?[]const u8 = null;
@@ -800,6 +804,32 @@ fn lintFile(
         if (!config.disabled.contains("b22")) {
             if (std.mem.indexOf(u8, trimmed, "tenant_source = .query") != null) {
                 try pushViolation(violations, allocator, "b22", rel_path, idx, "租户来源取自 query 参数（客户端可任意篡改，改一个 URL 即可跨租户读）— 改为 .attr 并由 JWT 中间件注入；仅公开 demo 可用 // audit: ignore b22 豁免", .{});
+            }
+        }
+
+        // b23 — allocator ownership: `deinitRow(s)` / `deinitRows(...)` release
+        // through the *client's* allocator, so they may only be handed a row the
+        // driver scanned and the client owns (`Query().All()`, builder `Save()`).
+        // A row produced by a call that took an allocator already belongs to
+        // that allocator — `CrudService.get(allocator, …)` returns an
+        // `ownedCopy(allocator, …)`, `query.zig` states that `AllIn(arena)`
+        // rows must "not be passed to deinitRows/deinitEntity, which would free
+        // them into the wrong allocator", and `queryRowOwned` /
+        // `scanRowsToOwned` are the same shape. Freeing one here is a
+        // cross-allocator free: `free of invalid memory`, which kills the
+        // process (docs/ZENT.md §14, the v0.15.44 incident).
+        //
+        // Deliberately narrow: it keys on "the producer call mentions an
+        // allocator/arena", which is the discriminator the docs give. A rule
+        // that guessed at which helpers copy is a rule that fires on correct
+        // code.
+        if (!config.disabled.contains("b23")) {
+            if (allocatorProducedBinding(trimmed)) |name| {
+                try alloc_produced.put(name, {});
+            } else if (deinitRowTarget(trimmed)) |target| {
+                if (alloc_produced.contains(target)) {
+                    try pushViolation(violations, allocator, "b23", rel_path, idx, "把「由带 allocator 形参的函数产出」的行交给了 deinitRow/deinitRows —— 那是用 client 的分配器释放别人的内存（`free of invalid memory`，会打死进程）。只对驱动扫描出来的行用 deinitRow(s)（`Query().All()` / builder `Save()`）；`get` / `AllIn(arena)` / `queryRowOwned` / `scanRowsToOwned` 的返回值由那个 allocator 自己回收（arena 会自己清）。确属误报则在同一行加 `// audit: ignore b23` 并注明出处", .{});
+                }
             }
         }
 
@@ -1449,6 +1479,59 @@ fn isCrudName(name: []const u8) bool {
         std.mem.eql(u8, name, "create") or
         std.mem.eql(u8, name, "update") or
         std.mem.eql(u8, name, "delete");
+}
+
+/// b23 — the LHS of a binding whose initializer is a call that mentions an
+/// allocator or an arena: `const e = try self.crud.get(allocator, …);`. Null for
+/// anything else, including comparisons and non-`const`/`var` assignments.
+///
+/// Multi-line initializers and an allocator passed under a shorter name are
+/// not seen. That is the intended direction of the error: this rule must never
+/// fire on code that is correct.
+fn allocatorProducedBinding(line: []const u8) ?[]const u8 {
+    const eq = std.mem.indexOfScalar(u8, line, '=') orelse return null;
+    if (eq + 1 < line.len and line[eq + 1] == '=') return null;
+    if (eq > 0 and (line[eq - 1] == '!' or line[eq - 1] == '<' or line[eq - 1] == '>')) return null;
+
+    const rhs = line[eq + 1 ..];
+    if (std.mem.indexOfScalar(u8, rhs, '(') == null) return null;
+    if (std.mem.indexOf(u8, rhs, "allocator") == null and
+        std.mem.indexOf(u8, rhs, "arena") == null) return null;
+
+    const lhs = std.mem.trim(u8, line[0..eq], " \t");
+    const name = if (std.mem.startsWith(u8, lhs, "const "))
+        std.mem.trim(u8, lhs["const ".len..], " \t")
+    else if (std.mem.startsWith(u8, lhs, "var "))
+        std.mem.trim(u8, lhs["var ".len..], " \t")
+    else
+        return null;
+
+    if (name.len == 0) return null;
+    for (name) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_') return null;
+    }
+    if (std.ascii.isDigit(name[0])) return null;
+    return name;
+}
+
+/// b23 — the identifier handed to `deinitRow(` / `deinitRows(`, if the argument
+/// is one (`&rows`, `self.rows`, `&e`).
+fn deinitRowTarget(line: []const u8) ?[]const u8 {
+    const needles = [_][]const u8{ "deinitRows(", "deinitRow(" };
+    for (needles) |needle| {
+        const at = std.mem.indexOf(u8, line, needle) orelse continue;
+        const open = at + needle.len;
+        const close = std.mem.indexOfScalarPos(u8, line, open, ')') orelse continue;
+        var arg = std.mem.trim(u8, line[open..close], " \t&*");
+        if (std.mem.lastIndexOfScalar(u8, arg, '.')) |dot| arg = arg[dot + 1 ..];
+        if (arg.len == 0) continue;
+        for (arg) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '_') return null;
+        }
+        if (std.ascii.isDigit(arg[0])) return null;
+        return arg;
+    }
+    return null;
 }
 
 /// Extract the declared function name from `pub fn NAME(`.
@@ -2132,6 +2215,17 @@ test "audit business lint flags anti-patterns" {
     try lintFile(allocator, "zent_crud.zig", "const A = CrudApi(infos, Info, .{ .tenant_source = .query });\n", "src/modules/x/zent_crud.zig", &cfg, &violations);
     // b22 negative — .attr (JWT-provided tenant) is the sanctioned form.
     try lintFile(allocator, "zent_crud.zig", "const A = CrudApi(infos, Info, .{ .tenant_source = .attr });\n", "src/modules/x/zent_crud.zig", &cfg, &violations);
+    // b23 — the row came from a call that took the allocator, so it belongs to
+    // that allocator; deinitRow frees it through the client's.
+    try lintFile(allocator, "persistence.zig", "pub fn find(self: *@This(), allocator: std.mem.Allocator, id: i64) !void {\n    const e = try self.crud.get(allocator, id);\n    defer self.client.user.deinitRow(&e);\n}\n", "src/modules/x/persistence.zig", &cfg, &violations);
+    // b23 — query.zig states AllIn(arena) rows must not go to deinitRows.
+    try lintFile(allocator, "persistence.zig", "pub fn page(self: *@This(), arena: *std.heap.ArenaAllocator) !void {\n    var rows = try self.client.user.Query().AllIn(arena);\n    defer self.client.user.deinitRows(&rows);\n}\n", "src/modules/x/persistence.zig", &cfg, &violations);
+    // b23 negative — a driver-scanned page is exactly what deinitRows is for.
+    try lintFile(allocator, "persistence.zig", "pub fn page(self: *@This()) !void {\n    var rows = try self.client.user.Query().All();\n    defer self.client.user.deinitRows(&rows);\n}\n", "src/modules/x/persistence.zig", &cfg, &violations);
+    // b23 negative — builder Save() hands back a client-owned row.
+    try lintFile(allocator, "persistence.zig", "pub fn save(self: *@This()) !void {\n    var e = try self.q.Save();\n    defer self.q.deinitRow(&e);\n}\n", "src/modules/x/persistence.zig", &cfg, &violations);
+    // b23 negative — the comparison operators are not bindings.
+    try lintFile(allocator, "persistence.zig", "pub fn ok(self: *@This(), allocator: std.mem.Allocator) !bool {\n    _ = allocator;\n    return self.len == self.cap;\n}\n", "src/modules/x/persistence.zig", &cfg, &violations);
 
     var rules = std.StringHashMap(usize).init(allocator);
     defer rules.deinit();
@@ -2161,6 +2255,7 @@ test "audit business lint flags anti-patterns" {
     try std.testing.expectEqual(@as(usize, 1), rules.get("b20").?);
     try std.testing.expectEqual(@as(usize, 1), rules.get("b21").?);
     try std.testing.expectEqual(@as(usize, 1), rules.get("b22").?);
+    try std.testing.expectEqual(@as(usize, 2), rules.get("b23").?);
 }
 
 test "audit collectModelStructs picks up indented local const structs" {
