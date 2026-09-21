@@ -139,7 +139,24 @@ pub fn main(init: std.process.Init.Minimal) void {
         }
         testing.log_level = .warn;
 
-        std.debug.print("{d}/{d} {s}...", .{ i + 1, test_fn_list.len, test_fn.name });
+        // Print the name **and flush it** before running the test.
+        //
+        // `std.debug.print` buffers into 64 bytes (std/debug.zig) and Zig's
+        // `File.Writer` is not line-buffered, so `N/M name...` sits in the buffer
+        // until it fills. A test that hangs never fills it: measured, a step that
+        // timed out after 25 minutes produced **no test name anywhere** — not in the
+        // step log, not in the artifact, not in `tee`'s capture. The bytes never left
+        // the process.
+        //
+        // Format is byte-identical (`N/M name...OK`); the name merely reaches the log
+        // before the test can hang, which is the whole point of the per-test line.
+        {
+            var name_buf: [512]u8 = undefined;
+            const stderr = std.debug.lockStderr(&name_buf);
+            defer std.debug.unlockStderr();
+            stderr.file_writer.interface.print("{d}/{d} {s}...", .{ i + 1, test_fn_list.len, test_fn.name }) catch {};
+            stderr.file_writer.interface.flush() catch {};
+        }
         if (test_fn.func()) |_| {
             ok_count += 1;
             std.debug.print("OK\n", .{});
