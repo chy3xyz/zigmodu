@@ -877,28 +877,172 @@ pub const DistributedEventBus = struct {
     /// `"seq"` belongs in this document: the MAC covers these bytes, so the
     /// sequence is authenticated, and the claim the key is derived from has to
     /// travel in the same document as it.
-    const event_json_fmt = "{{\"topic\":\"{s}\",\"payload\":\"{s}\",\"source\":\"{s}\",\"time\":{d},\"seq\":{d}}}";
+    /// Every literal byte the document has outside the three escaped strings and
+    /// the two integers: `{"topic":"","payload":"","source":"","time":,"seq":}`.
+    const event_json_overhead: usize = 52;
+
+    /// A cursor over the caller's buffer that **cannot overflow it**: once a write
+    /// does not fit, `ok` goes false and every later write is a no-op, so the
+    /// caller can finish building and then report the failure once.
+    ///
+    /// This replaces a `std.fmt` format string. `serializeEvent` and
+    /// `eventJsonSize` shared that string so they could not drift — but it
+    /// interpolated the payload verbatim, so a payload containing a `"` produced
+    /// **invalid JSON** (the receiver's parser rejected the event into the DLQ).
+    /// They now share these three writers instead, and `eventJsonSize` mirrors
+    /// them exactly; the "cannot drift" property is preserved by construction.
+    const JsonWriter = struct {
+        buf: []u8,
+        i: usize = 0,
+        ok: bool = true,
+
+        fn put(self: *JsonWriter, s: []const u8) void {
+            if (!self.ok) return;
+            if (self.i + s.len > self.buf.len) {
+                self.ok = false;
+                return;
+            }
+            @memcpy(self.buf[self.i..][0..s.len], s);
+            self.i += s.len;
+        }
+
+        /// Write `s` JSON-escaped (no surrounding quotes). Mirrors `escapedLen`.
+        fn esc(self: *JsonWriter, s: []const u8) void {
+            for (s) |c| {
+                switch (c) {
+                    '"' => self.put("\\\""),
+                    '\\' => self.put("\\\\"),
+                    0x08 => self.put("\\b"),
+                    0x0c => self.put("\\f"),
+                    '\n' => self.put("\\n"),
+                    '\r' => self.put("\\r"),
+                    '\t' => self.put("\\t"),
+                    else => {
+                        if (c < 0x20) {
+                            // \u00XX, written by hand: no error path, no allocation.
+                            var esc4: [6]u8 = .{ '\\', 'u', '0', '0', hexDigit(c >> 4), hexDigit(c & 0xf) };
+                            self.put(&esc4);
+                        } else {
+                            self.put(&[_]u8{c});
+                        }
+                    },
+                }
+            }
+        }
+
+        /// Write an unsigned integer in decimal. Mirrors `decimalLenU64`.
+        /// Separate from `dec` because `seq` is `u64`: routing it through `i64`
+        /// panics on a value above `maxInt(i64)` (the drift test found this with
+        /// `maxInt(u64)` — a real seq, not a synthetic one).
+        fn decU64(self: *JsonWriter, v: u64) void {
+            var tmp: [20]u8 = undefined;
+            const s = std.fmt.bufPrint(&tmp, "{d}", .{v}) catch {
+                self.ok = false;
+                return;
+            };
+            self.put(s);
+        }
+
+        /// Write a signed integer in decimal. Mirrors `decimalLen`.
+        fn dec(self: *JsonWriter, v: i64) void {
+            var tmp: [20]u8 = undefined;
+            const s = std.fmt.bufPrint(&tmp, "{d}", .{v}) catch {
+                self.ok = false;
+                return;
+            };
+            self.put(s);
+        }
+    };
+
+    fn hexDigit(v: u8) u8 {
+        return if (v < 10) '0' + v else 'a' + (v - 10);
+    }
+
+    /// Bytes `s` occupies once escaped — the exact mirror of `JsonWriter.esc`.
+    fn escapedLen(s: []const u8) usize {
+        var n: usize = 0;
+        for (s) |c| n += switch (c) {
+            '"', '\\', 0x08, 0x0c, '\n', '\r', '\t' => 2,
+            else => if (c < 0x20) @as(usize, 6) else 1,
+        };
+        return n;
+    }
+
+    /// Digits `v` occupies in decimal — the exact mirror of `JsonWriter.decU64`.
+    fn decimalLenU64(v: u64) usize {
+        var n: usize = 1;
+        var x = v;
+        while (x >= 10) : (x = @divTrunc(x, 10)) n += 1;
+        return n;
+    }
+
+    /// Digits `v` occupies in decimal — the exact mirror of `JsonWriter.dec`.
+    fn decimalLen(v: i64) usize {
+        if (v < 0) {
+            // `-minInt(i64)` overflows, so the magnitude is taken in u64 via
+            // `-(v + 1) + 1`. (The drift test found this: it feeds `minInt(i64)`,
+            // which is a legitimate timestamp.)
+            const mag: u64 = @as(u64, @intCast(-(v + 1))) + 1;
+            return 1 + decimalLenU64(mag);
+        }
+        return decimalLenU64(@intCast(v));
+    }
+
+    // The two functions above must agree to the byte. `serializeEventAlloc` turns a
+    // disagreement into `error.EventTooLarge` and nothing on the wire, so a silent
+    // drift would look like "events stopped being delivered" — this is the
+    // assertion that catches it at the source instead. It exists because the first
+    // version of this rewrite got the overhead wrong by one byte (53 vs 52), which
+    // every delivery test immediately reported as `EventTooLarge`.
+    test "serializeEvent and eventJsonSize agree, including on escaped fields" {
+        const cases = [_]NetworkEvent{
+            .{ .topic = "t", .payload = "p", .source_node = "n", .timestamp = 0, .seq = 0 },
+            .{ .topic = "a\"b", .payload = "back\\slash", .source_node = "tab\there", .timestamp = -1, .seq = 18446744073709551615 },
+            .{ .topic = "line\nbreak", .payload = "\x01\x1f", .source_node = "unicode: \u{4e2d}\u{6587}", .timestamp = std.math.minInt(i64), .seq = 7 },
+            .{ .topic = "", .payload = "", .source_node = "", .timestamp = 1234567890, .seq = 42 },
+        };
+        var buf: [4096]u8 = undefined;
+        for (cases) |e| {
+            const json = serializeEvent(e, &buf);
+            try std.testing.expectEqual(eventJsonSize(e), json.len);
+            // And it is real JSON: the parser this receiver uses must accept it.
+            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings(e.topic, parsed.value.object.get("topic").?.string);
+            try std.testing.expectEqualStrings(e.payload, parsed.value.object.get("payload").?.string);
+            try std.testing.expectEqualStrings(e.source_node, parsed.value.object.get("source").?.string);
+            try std.testing.expectEqual(e.timestamp, parsed.value.object.get("time").?.integer);
+        }
+    }
 
     fn serializeEvent(event: NetworkEvent, buf: []u8) []const u8 {
-        return std.fmt.bufPrint(buf, event_json_fmt, .{
-            event.topic,
-            event.payload,
-            event.source_node,
-            event.timestamp,
-            event.seq,
-        }) catch buf[0..0];
+        var w = JsonWriter{ .buf = buf };
+        w.put("{\"topic\":\"");
+        w.esc(event.topic);
+        w.put("\",\"payload\":\"");
+        w.esc(event.payload);
+        w.put("\",\"source\":\"");
+        w.esc(event.source_node);
+        w.put("\",\"time\":");
+        w.dec(event.timestamp);
+        w.put(",\"seq\":");
+        w.decU64(event.seq);
+        w.put("}");
+        // Same overflow contract as before: too small a buffer is reported as an
+        // empty slice, never as a truncated document.
+        if (!w.ok) return buf[0..0];
+        return buf[0..w.i];
     }
 
     /// Byte count of the JSON `serializeEvent` writes for `event` — `std.fmt.count`
     /// over the same format string, so the two cannot drift.
     fn eventJsonSize(event: NetworkEvent) usize {
-        return std.fmt.count(event_json_fmt, .{
-            event.topic,
-            event.payload,
-            event.source_node,
-            event.timestamp,
-            event.seq,
-        });
+        return event_json_overhead +
+            escapedLen(event.topic) +
+            escapedLen(event.payload) +
+            escapedLen(event.source_node) +
+            decimalLen(event.timestamp) +
+            decimalLenU64(event.seq);
     }
 
     /// `serializeEvent` into a buffer sized for **this** event, so a payload
@@ -1825,9 +1969,10 @@ test "a payload containing quoted field names cannot steer the parse" {
 
 test "a payload that injects a duplicate field is not delivered as somebody else" {
     const allocator = std.testing.allocator;
-    // `serializeEvent` does not escape quotes (unchanged behaviour), so this
-    // payload produces a document with the payload's own `"source"` **before**
-    // the real one — which the substring matcher read as the event's source.
+    // `serializeEvent` now escapes, so this payload's quotes reach the wire as
+    // `\"` and the document has exactly one `"source"` field. That is the fix for
+    // the vector this test used to reproduce: the injection is inert, and the
+    // event round-trips with the text intact **as payload data**.
     var json_buf: [512]u8 = undefined;
     const json = DistributedEventBus.serializeEvent(.{
         .topic = "inject.topic",
@@ -1835,7 +1980,11 @@ test "a payload that injects a duplicate field is not delivered as somebody else
         .source_node = "node-a",
         .timestamp = 11,
     }, &json_buf);
-    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"source\":\"node-b\""));
+    // The payload's `"source":"node-b"` is inside a JSON string, so the document
+    // must NOT contain it as a field…
+    try std.testing.expect(!std.mem.containsAtLeast(u8, json, 1, "\"source\":\"node-b\""));
+    // …and the real source is still the node that sent it.
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"source\":\"node-a\""));
 
     var received: usize = 0;
     var bus = try framedBus(allocator, "inject-node", "inject.topic", &received);
@@ -1845,10 +1994,11 @@ test "a payload that injects a duplicate field is not delivered as somebody else
     defer allocator.free(frame);
     try feedFrame(&bus, frame);
 
-    // `std.json` rejects the duplicated key, so this is a parse failure (→ DLQ):
-    // nothing is dispatched. Under the substring matcher it dispatches one event
-    // whose `source_node` is `node-b`.
-    try std.testing.expectEqual(@as(usize, 0), received);
+    // Delivered, with the injected text as *data* — and crucially still attributed
+    // to `node-a`, not to the `node-b` the payload tried to install. Before
+    // escaping this dispatched an event whose `source_node` was `node-b`; before
+    // the JSON parser it read the injected field as the source.
+    try std.testing.expectEqual(@as(usize, 1), received);
 }
 
 test "a frame is keyed by the source it claims, not by the cluster secret" {

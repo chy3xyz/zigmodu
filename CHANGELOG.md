@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+### 总线事件序列化现在会转义（§14 收尾）（**破坏性：是**）
+
+`serializeEvent` 用一个 `std.fmt` 格式串把 payload **原样**插进 JSON，所以 payload 里带一个 `"`
+就会产出**非法 JSON** —— 接收方解析失败，事件变成一条 DLQ 条目。更早那条"子串匹配器"时代它更糟：
+payload 里的 `"source":"node-b"` 会**冒充来源**。
+
+现在换成一对共享的写入/计数 helper（`JsonWriter` + `escapedLen`/`decimalLen`/`decimalLenU64`），
+两个函数都从同一组 helper 构建，所以"不会漂移"这条性质是**构造性**的，而不是靠共用格式串。
+
+> **这次改动本身就撞了两次真 bug，都是新加的"漂移断言"抓到的**（它断言
+> `eventJsonSize(e) == serializeEvent(e, buf).len` **并对结果跑真解析**）：
+> ① `event_json_overhead` 写错一字节（53 应为 52）—— 所有投递用例立刻以 `EventTooLarge` 变红；
+> ② `decimalLen(minInt(i64))` **整数溢出**（对它取负）—— 时间戳可以是它。
+> 没有那条断言，① 会表现为"事件不再投递"，② 会在某个负时间戳上 panic。
+
+**那条"注入"用例的结论反过来了**：它原本断言"注入被拒（→DLQ）"，现在断言**注入无效** ——
+payload 原样作为**数据**送达，而文档里只有**一个** `source` 字段、且仍是真正发送方。
+这是更强的陈述：从"拒绝攻击"变成"攻击构不成"。
+
+**未做**：`ConcurrentError` 的拒绝分支仍无用例 —— `testing.io` 的 `concurrent_limit` 是 unlimited，
+**树内构造不出来**，这是"不可测"而不是"没测"。
+
+
 ### `ClusterServer` 改为并发分发（handler 签名变更）；入站 AppendEntries 设界（**破坏性：是**）
 
 **① accept 环此前在**自己的线程上内联跑 handler**：一个慢对端会**串行占用整个入站**（前面那次只修了
