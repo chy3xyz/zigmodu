@@ -64,8 +64,18 @@ pub const ElectionConfig = struct {
     /// Heartbeat interval (ms) - leader sends heartbeats at this rate
     heartbeat_interval_ms: u64 = 50,
 
-    /// Maximum entries to send in one AppendEntries RPC. A lagging follower is
-    /// fed its backlog in chunks of this size; values below 1 are read as 1.
+    /// Maximum entries to send in one AppendEntries RPC, and — the inbound half
+    /// — the most entries one received `append_entries` may apply. A lagging
+    /// follower is fed its backlog in chunks of this size; values below 1 are
+    /// read as 1 on both sides.
+    ///
+    /// Inbound it is a **clamp, not a refusal**: the follower applies a prefix
+    /// and reports the `match_index` it reached, so a peer with a different
+    /// value costs an extra round instead of stalling. The decoder's ceiling is
+    /// `RaftTransport.MAX_ENTRIES_PER_FRAME` — a frame declaring more than that
+    /// is dropped before it is decoded, so **keep this at or below it** on every
+    /// node: a sender set higher than a receiver's ceiling would have every
+    /// frame dropped and could never catch that follower up.
     max_append_entries: usize = 100,
 
     /// How long an outbound Raft RPC may take before it is written off as a lost
@@ -476,6 +486,31 @@ pub const RaftElection = struct {
             }
         }
 
+        // **The inbound half of `max_append_entries`.** The field was a
+        // sender-side chunking knob only — nothing bounded what a peer could put
+        // in one frame, so a single `append_entries` applied as many entries as
+        // it cared to carry (and by the time the request arrives here, the frame
+        // has already been decoded into the arena: see
+        // `RaftTransport.MAX_ENTRIES_PER_FRAME`, which is the other half of the
+        // bound).
+        //
+        // **Clamp, do not reject.** Applying a prefix is valid Raft: the follower
+        // appends sequentially from `prev_log_index + 1`, and its reply's
+        // `match_index` is the tail it actually reached, so the leader resumes
+        // from there next round (`sendAppendEntries` takes the lower of "what I
+        // sent" and that `match_index` — this is what keeps the leader's
+        // bookkeeping honest when the follower applies less than it was sent).
+        // Rejecting the frame instead would require both ends to share the same
+        // `max_append_entries`: a follower smaller than its leader would refuse
+        // every batch the leader can build, and replication would stall forever.
+        // Clamping is self-healing across that mismatch — it costs one extra
+        // round, not a stuck peer. A cap of 0 is read as 1, same as the sender.
+        const max_entries = @max(@as(usize, 1), self.config.max_append_entries);
+        const entries: []const LogEntry = if (req.entries.len > max_entries)
+            req.entries[0..max_entries]
+        else
+            req.entries;
+
         // A log index is **1-based**, and the loop below reads
         // `log.items[entry.index - 1]`. `entry.index == 0` is not a value that can
         // exist, and nothing on the decode side rejects it (`decodeAppendEntries`
@@ -509,12 +544,12 @@ pub const RaftElection = struct {
         // `leader_id` — have already happened by this point; that is the same
         // window every AppendEntries request gets, and losing an election round
         // is the recoverable outcome there.)
-        for (req.entries) |entry| {
+        for (entries) |entry| {
             if (entry.index == 0) return error.InvalidLogIndex;
         }
 
         // Process incoming entries: skip already-matched, overwrite conflicts
-        for (req.entries) |entry| {
+        for (entries) |entry| {
             if (entry.index <= self.log.items.len) {
                 const existing = self.log.items[entry.index - 1];
                 if (existing.term != entry.term) {
@@ -609,11 +644,20 @@ pub const RaftElection = struct {
             }
 
             if (resp.success) {
-                // Update match_index and next_index
-                const matched: u64 = if (entries.len > 0)
+                // Update match_index and next_index. The follower's own
+                // `match_index` is the floor: it applies at most
+                // `max_append_entries` of what it was sent (see
+                // `handleAppendEntries`), so trusting "what we sent" over "what it
+                // acknowledged" would record entries as replicated that the
+                // follower never appended — and `advanceCommitIndex` commits on
+                // `match_index`. `@min` is a no-op whenever the follower took the
+                // whole batch, and an empty batch acknowledges `prev_log_idx`
+                // (a follower that accepted `prev_log_index` has at least that).
+                const sent_last: u64 = if (entries.len > 0)
                     entries[entries.len - 1].index
                 else
                     prev_log_idx;
+                const matched: u64 = @min(sent_last, resp.match_index);
                 self.next_index.put(peer.id, matched + 1) catch |err| std.log.err("[RaftElection] next_index update failed: {}", .{err});
                 self.match_index.put(peer.id, matched) catch |err| std.log.err("[RaftElection] match_index update failed: {}", .{err});
             } else {
@@ -2192,6 +2236,140 @@ test "RaftElection caps each replication round at max_append_entries" {
     try testing.expectEqual(@as(u64, 10), AppendEntriesCapture.last_index);
     try testing.expectEqual(@as(usize, 10), raft.logLen());
     try testing.expectEqual(@as(u64, 11), raft.next_index.get(peer_key).?);
+}
+
+/// A peer that acknowledges only the entries up to `ack_through`: the reply a
+/// follower sends after clamping a batch it could not apply in full.
+const PartialAppendAck = struct {
+    var ack_through: u64 = 0;
+    var calls: usize = 0;
+    var entries_len: usize = 0;
+    var first_index: u64 = 0;
+
+    fn reset(ack_through_: u64) void {
+        ack_through = ack_through_;
+        calls = 0;
+        entries_len = 0;
+        first_index = 0;
+    }
+
+    fn accept(_: ?[]const u8, _: []const u8, req: AppendEntriesRequest) AppendEntriesResponse {
+        calls += 1;
+        entries_len = req.entries.len;
+        first_index = if (req.entries.len > 0) req.entries[0].index else req.prev_log_index;
+        const last = if (req.entries.len > 0) req.entries[req.entries.len - 1].index else req.prev_log_index;
+        return .{ .term = req.term, .success = true, .match_index = @min(last, ack_through) };
+    }
+};
+
+// The inbound half of `max_append_entries`. Before this clamp the field was read
+// only on the sender side (`sendAppendEntries`), so one `append_entries` applied
+// however many entries a peer chose to carry — and the response reported a log
+// the follower may not have.
+//
+// Verified red: removing the clamp from `handleAppendEntries` makes this fail on
+// `expected 3, found 10` at the `match_index` assertion (and on `logLen()`),
+// an assertion failure rather than a compile error.
+test "an inbound AppendEntries applies at most max_append_entries entries, and says so" {
+    const allocator = testing.allocator;
+
+    var peers = [_]Peer{.{ .id = "node-leader", .address = "" }};
+    var election = try RaftElection.init(allocator, "node1", &peers, .{ .max_append_entries = 3 }, &MembershipTestTransport.vtable);
+    defer election.deinit();
+
+    // One batch of ten, as a leader with a *larger* `max_append_entries` would
+    // send: the mismatch is what the clamp has to absorb without stalling.
+    const batch = [_]LogEntry{
+        .{ .term = 1, .index = 1, .command = "one" },
+        .{ .term = 1, .index = 2, .command = "two" },
+        .{ .term = 1, .index = 3, .command = "three" },
+        .{ .term = 1, .index = 4, .command = "four" },
+        .{ .term = 1, .index = 5, .command = "five" },
+        .{ .term = 1, .index = 6, .command = "six" },
+        .{ .term = 1, .index = 7, .command = "seven" },
+        .{ .term = 1, .index = 8, .command = "eight" },
+        .{ .term = 1, .index = 9, .command = "nine" },
+        .{ .term = 1, .index = 10, .command = "ten" },
+    };
+
+    const applied = try election.handleAppendEntries(.{
+        .term = 1,
+        .leader_id = "node-leader",
+        .prev_log_index = 0,
+        .prev_log_term = 0,
+        .entries = &batch,
+        .leader_commit = 10,
+    });
+
+    // Success with the prefix, not a refusal: the next round picks up at 4.
+    try testing.expect(applied.success);
+    try testing.expectEqual(@as(u64, 3), applied.match_index);
+    try testing.expectEqual(@as(usize, 3), election.logLen());
+    try testing.expectEqualStrings("three", election.getLogEntry(3).?.command);
+    try testing.expect(election.getLogEntry(4) == null);
+    // `match_index` is the log tail, so the commit advance is clamped by it too:
+    // `leader_commit = 10` cannot commit entries this node never applied.
+    try testing.expectEqual(@as(u64, 3), election.getCommitIndex());
+
+    // The rest arrives on the next round, from where the acknowledgement left
+    // off — the clamp costs an extra round, not a stuck follower.
+    const rest = try election.handleAppendEntries(.{
+        .term = 1,
+        .leader_id = "node-leader",
+        .prev_log_index = 3,
+        .prev_log_term = 1,
+        .entries = batch[3..],
+        .leader_commit = 10,
+    });
+    try testing.expect(rest.success);
+    try testing.expectEqual(@as(u64, 6), rest.match_index);
+    try testing.expectEqual(@as(usize, 6), election.logLen());
+    try testing.expectEqualStrings("six", election.getLogEntry(6).?.command);
+}
+
+// The leader's half of the same property. `resp.success` alone used to mean "the
+// whole batch landed": the acknowledged `match_index` was ignored on the success
+// path, so a follower that clamped would still be recorded as holding every
+// entry in the batch — and `advanceCommitIndex` commits on `match_index`.
+test "a follower that acknowledged only part of a batch rewinds the leader to what it acked" {
+    const allocator = testing.allocator;
+    PartialAppendAck.reset(2);
+
+    var impl = TestTransportVTable{
+        .sendVoteRequest = noopVoteRequest,
+        .sendAppendEntries = PartialAppendAck.accept,
+    };
+    const transport: RaftElection.ElectionTransport = @ptrCast(@alignCast(@constCast(&impl)));
+
+    var peers = [_]Peer{.{ .id = "n2", .address = "" }};
+    var raft = try RaftElection.init(allocator, "n1", &peers, .{ .max_append_entries = 4 }, &transport);
+    defer raft.deinit();
+
+    raft.state = .leader;
+    raft.current_term = 1;
+    for (0..6) |i| {
+        var buf: [16]u8 = undefined;
+        _ = try raft.appendEntry(try std.fmt.bufPrint(&buf, "cmd-{d}", .{i}));
+    }
+
+    const peer_key = raft.peers.items[0].id;
+    try raft.next_index.put(peer_key, 1);
+    try raft.match_index.put(peer_key, 0);
+
+    // Round 1 hands over entries 1..4; the peer acknowledges 1..2.
+    try raft.sendAppendEntries();
+    try testing.expectEqual(@as(usize, 4), PartialAppendAck.entries_len);
+    try testing.expectEqual(@as(u64, 1), PartialAppendAck.first_index);
+    try testing.expectEqual(@as(u64, 2), raft.match_index.get(peer_key).?);
+    try testing.expectEqual(@as(u64, 3), raft.next_index.get(peer_key).?);
+    // Only what the follower really holds counts toward a quorum.
+    try testing.expectEqual(@as(u64, 2), raft.getCommitIndex());
+
+    // Round 2 resumes at the acknowledged prefix instead of re-sending it.
+    try raft.sendAppendEntries();
+    try testing.expectEqual(@as(u64, 3), PartialAppendAck.first_index);
+    try testing.expectEqual(@as(u64, 2), raft.match_index.get(peer_key).?);
+    try testing.expectEqual(@as(u64, 3), raft.next_index.get(peer_key).?);
 }
 
 test "RaftElection becomeLeader reinitializes per-peer next_index and match_index" {

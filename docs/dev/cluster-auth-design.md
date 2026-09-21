@@ -791,3 +791,94 @@ EOF，所以这个失败是良性的）。`src/core/sockread.zig` 没有动。
   但没有 TTL / 淘汰。
 
 
+---
+
+## 15. 入站并发与入站 `AppendEntries` 的上界（2026-09-21）
+
+本节与 §3/§13 的认证无关，关的是 §1 表里的两件结构性问题：**#4（日志无界增长）的一半**，
+以及"慢对端串行占用 accept 环"。两者同批做，因为**它们动的是同一个函数的两侧**：
+`ClusterServer` 怎么把连接交出去，以及交出去之后 `handleAppendEntries` 接受多少。
+
+### 15.1 为什么"并发"必须先把 handler 的形参改掉
+
+`ClusterServer.start` 的 handler 是 `*const fn (ClusterConnection) void` —— **没有上下文**。
+owner（`RaftTransport.InboundServer.current`、`ClusterBootstrap.inbound_owner`）因此只能挂在
+`threadlocal` 上，而那只在"handler 跑在 accept 线程上"时成立。**把 handler 挪到别的线程 =
+`current` 为 null = 每个入站连接都被丢掉**。所以顺序只能是"先给 handler 上下文，再并发"，
+不能反过来。
+
+改为 `start(self, handler: Handler, context: ?*anyopaque)`，`Handler = *const fn (?*anyopaque, ClusterConnection) void`：
+
+- **上下文走形参而不是字段**：字段可以在没启动的 server 上被设置，也可以在运行中被改，
+  而形参只有一处赋值点，就是那个知道 handler 用途的地方。
+- **两处 `threadlocal` 都删了**：`RaftTransport.InboundServer.current` 与 `ClusterBootstrap.inbound_owner`。
+  两者是同一个 bug 的两个实例。`onConnection` / `onInboundConnection` 改成收 `context`，
+  `@ptrCast(@alignCast(ctx))`，null 时 debug 日志 + 返回（不是 `unreachable`：形参来自框架自己，
+  但这条路径上没有理由用 UB 表示它）。
+- **分发用 `Group.concurrent`，不是 `async`**：handler 会阻塞在对端读上，`async` 在
+  `async_limit` 上会**回落成在 accept 线程上跑**——那正是要修的东西。形状与
+  `DistributedEventBus.acceptLoop` 一致（`ConcurrentError` 分支关连接 + `log.warn`）。
+- **`stop()` 等 group**（`Group.await`）。`Io.Group.await` **不是线程安全的**，所以**只有一个 awaiter**：
+  只有 `stop()` 等。一开始我在 `start()` 的循环出口也加了一次 await —— 两次 await 在 `Threaded.groupAwait`
+  的 `assert(!pre_await_status.have_awaiter)` 上直接 abort（实测 `signal ABRT`，测试进程没了）。
+  这条是**实现期实测到的**，不是推演。
+- **"`stop()` 返回后不会再有 handler"要一个握手**：accept 成功与 `Group.concurrent` 之间有个窗口。
+  用 `dispatching` 原子 + **claim 后重查 `running`**：
+
+  ```text
+  accept 侧： dispatching.store(true, .seq_cst); if (!running.load(.seq_cst)) { 丢弃并退出 }
+  stop 侧：   running.store(false, .seq_cst); while (dispatching.load(.seq_cst)) spin; await(group)
+  ```
+
+  两个 `.seq_cst` 是这条推理的全部依据：若 claim 落在 `stop` 的 store 之后，它必然在重查里看见
+  `running == false`（顺序一致的全局序把"读 `dispatching` 得 false"排在"写 `dispatching` true"之前，
+  于是 `running` 的 store 也排在这次 load 之前）；若 claim 落在它之前，`stop` 的自旋会等到
+  `concurrent` 返回之后才 await，那个 fiber 因此被 await 覆盖。
+
+### 15.2 入站 `AppendEntries`：clamp，不是拒收
+
+`max_append_entries` 原来只在 `sendAppendEntries`（发送方）读。入站什么都不限，所以一个帧能带多少
+条目就应用多少；`decodeAppendEntries` 更早就 `allocator.alloc(LogEntry, count)` —— `count` 是 u16，
+**65535 × 32 B ≈ 2 MB，在 `count` 之后一个字节都没校验之前就分配**（帧内声明数与帧大小无关）。
+
+1. **应用侧 clamp**：`handleAppendEntries` 取 `@max(1, config.max_append_entries)` 条，多出来的不应用。
+   **为什么是 clamp 而不是拒绝**：应用一个前缀在 Raft 里是合法的 —— follower 从 `prev_log_index + 1`
+   顺序追加，回复的 `match_index` 是它**真正到达的位置**，leader 下一轮从那里继续。拒收则需要两端
+   `max_append_entries` 相同，否则 "leader 比 follower 大" 的那个 follower 会拒掉 leader 能构造的每一个批，
+   复制永远停在那里；clamp 只是多花一轮，**配置不一致能自愈**。
+   被截掉的尾部也跳过了 `entry.index == 0` 扫描 —— 有意且安全：越过前缀的条目根本不会进入
+   `entry.index - 1` 那个循环，而那条守卫存在的理由正是那个循环。
+2. **回复必须说真话**：`success = true` + `match_index = log.items.len`（= 真的应用到哪里）。
+   同时**leader 的成功分支要以 `resp.match_index` 为下限**（`@min(发出去的尾, 它确认的尾)`）——
+   原来成功分支只信"我发了什么"，那样一个 clamp 过的 follower 会被记成持有整批，
+   而 `advanceCommitIndex` 是拿 `match_index` 算多数的：**这是 safety 问题，不是记账问题**。
+   follower 整批收下时 `@min` 是恒等，所以正常路径零变化。
+3. **解码侧硬顶**：新增 `RaftTransport.MAX_ENTRIES_PER_FRAME = 4096`，`count` 超过它直接
+   `error.EntryCountTooLarge`，**在任何 entries 分配之前**（于是"声明 65535 条、一条都不带"的帧
+   不是 `TruncatedMessage` 也不是 `OutOfMemory`，而是这一条错误）。
+   **耦合的选择**：4096 是默认 `max_append_entries`（100）的 40 倍，即"远高于任何合理的 chunk 大小"，
+   **同时**把 `ElectionConfig.max_append_entries` 的文档写成"受这个常量约束、每个节点都要 ≤ 它"。
+   两者都做，因为这是**跨端**的硬线：发送方高于接收方的硬顶时，帧在接收侧被丢、发送方读超时、
+   同一批被无限重发 —— 那条 follower 永远追不上。框架里无法为一个**别的进程**的配置做检查，
+   所以只能是"常量足够高 + 文档写清上界"。
+
+### 15.3 验证
+
+全量、`zig fmt --check`、`check-production.sh`、`check-deadcode.sh` 的读数见 `CHANGELOG.md`
+的 `Unreleased` 条目。判据：
+
+| # | 用例 | 变异（红的样子） |
+|---|---|---|
+| 1 | `two stalled peers do not stop a third connection from being answered` | 分发改回内联 → `elapsed < concurrent_stall_ms / 2` 断言红（第三个对端的回复要等两个 stall 各一次超时） |
+| 2 | `an inbound AppendEntries applies at most max_append_entries entries, and says so` | 删掉 clamp → `expected 3, found 10`（`match_index`）与 `logLen()` 断言红 |
+| 3 | `a follower that acknowledged only part of a batch rewinds the leader to what it acked` | leader 成功分支不信 `resp.match_index` → `next_index` 断言红 |
+| 4 | `an append_entries frame above the decode cap is dropped without allocating` | 去掉解码上限 → `expected error.EntryCountTooLarge, found error.OutOfMemory`（`fail_index = 1` 让"确实分配了"变成另一种错误） |
+
+**被改的 fixture（有意，非弱化）**：
+`a half-frame on the inbound side costs rpc_timeout_ms, not the whole node` 原来把"B 是被 A 的超时释放的"
+写成 `elapsed >= timeout_ms - 50` —— 内联分发下这句话成立，**每连接一个 fiber 之后它就是错的**
+（B 立即被服务）。两条界都保留，只是移到**真正该被界住的那个对端**（A）身上：B 改为断言
+`elapsed < timeout_ms - 50`（在 A 的超时之前就被服务），A 补上 `>= timeout_ms - 50` 与
+`< stalled_peer_patience_ms - 500`。另外该用例与黑洞用例的收尾都补了一条**唤醒连接**：
+accept 环现在真的可能停在 `accept()` 里（以前它总是卡在 handler 体内），而关掉 listener
+不保证唤醒它 —— 与 `stopInbound` / `ClusterBootstrap.stop` 已有的做法一致。

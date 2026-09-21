@@ -143,9 +143,23 @@ defer allocator.free(json);               // 挂到 /cluster/health 或 metrics 
 |------|--------|---------|
 | 出站 · 投票 | `NetworkTransport.connect(host, port)` → `ClusterConnection.send(payload)` | `sendVoteRequest` 返回 `void`（fire-and-forget）：把 `VoteRequest` 编码后发给每个 peer 即可，**应答走入站** |
 | 出站 · 日志复制 | 同上 | `sendAppendEntries` 是**同步**的：发出去、读回 `AppendEntriesResponse`（同一条连接 `recv`） |
-| 入站 · 分发 | **`ClusterBootstrap.start()` 已经替你挂好**（给了 `.transport` 就在 `port` 上监听，走 `RaftTransport.handleConnection`）；不用 `ClusterBootstrap` 时才需要自己用 `ClusterServer.start(handler)` / `RaftTransport.InboundServer` | 解码后分别调 `RaftElection.handleVoteRequest` / `handleAppendEntries` / `handleVoteResponse` / `handleInstallSnapshot`，把返回值编码后**在同一连接上回包** |
+| 入站 · 分发 | **`ClusterBootstrap.start()` 已经替你挂好**（给了 `.transport` 就在 `port` 上监听，走 `RaftTransport.handleConnection`）；不用 `ClusterBootstrap` 时才需要自己用 `ClusterServer.start(handler, context)` / `RaftTransport.InboundServer` | 解码后分别调 `RaftElection.handleVoteRequest` / `handleAppendEntries` / `handleVoteResponse` / `handleInstallSnapshot`，把返回值编码后**在同一连接上回包** |
 | 地址簿 | **`ClusterBootstrap` 从 `config.peers` 建**（`RaftTransport.AddressBook`，键 = `peers` 里 `@` 前的 id，与 `raft.addPeer(p.id)` 同口径） | peer id → `host:port` 的映射（今天 `BootstrapConfig.peers` 是唯一来源；`ClusterMembership` 的 `nodes` 只有 loopback + 端口） |
 | 失败语义 | 你自己 | Raft 能容忍丢包与重发：`AppendEntriesResponse{ .success = false }` 是**正常应答**而不是错误；连接失败按"这条消息丢了"处理即可，别把节点判死（那是 `AccrualFailureDetector` 的活） |
+
+> **入站每连接一个 fiber（`Unreleased` 起）。** `ClusterServer` 把 accept 到的连接交给 `std.Io.Group`
+> 的一个任务，handler 从 `start(handler, context)` 的形参拿回它的 owner（`RaftTransport.InboundServer`
+> 或 `ClusterBootstrap`）——此前 handler 是**在 accept 线程上内联**跑的，owner 只能靠 `threadlocal`
+> 找回来，所以既"一个慢对端串行挡住所有人"，也不可能真的并发。现在 `rpc_timeout_ms` 只界定
+> **一个对端能占用多久**，不再决定"后面的人要不要等它"（两个半帧对端不挡第三个连接）。`stop()`
+> 会等这些 fiber 结束 —— 它们握着 `raft` 与地址簿。
+
+> **`max_append_entries` 现在两个方向都读（`Unreleased` 起）。** 出站按它切批，入站按它**截断**只应用
+> 前 N 条（**clamp 而非拒收**：拒收要求两端同值，否则那个 follower 永远追不上；截断只多花一轮，
+> 配置不一致能自愈）。回复里的 `match_index` 就是真的应用到哪里，leader 以它为下限推进 `next_index`
+> —— 所以批里没被应用的部分不会被记成"已复制"。解码侧另有硬顶
+> `RaftTransport.MAX_ENTRIES_PER_FRAME`（4096 条）：声明数超过它的帧在**分配之前**就被丢弃，
+> 所以 `max_append_entries` 要保持在它以下。
 
 **门面已闭上的两个洞**（`ClusterBootstrap`）：
 

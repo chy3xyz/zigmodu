@@ -96,7 +96,7 @@ self.leader_id = try self.allocator.dupe(u8, req.leader_id);  // dupe 失败 →
 
 - **一层的正确性依赖另一层的"记得"**：`Cursor` 把长度/边界做得干净，但它交出的**语义值**（`index`、`term`、`leader_id`、`candidate_id`）被上层无条件信任；`handleVoteResponse` 有成员校验、`handleVoteRequest` 没有 —— 同类检查在两个 handler 间不一致，正是"靠记得"而非"编译期强制"的典型形状。
 - **入站与出站的韧性不对称**：出站侧把 `rpc_timeout_ms` 用在了 `setSockopt(SO_SNDTIMEO/SO_RCVTIMEO)`(477/515/523)，入站侧一条都没有；`sockread.setRecvTimeout` 的文档注释本身就在描述"对端接受后不应答"这个入站场景。
-- **环形拓扑假设未文档化**：`ClusterServer.start` 是"单线程串行处理 + 内联业务"，即"集群 RPC 量小、对端都善意"；这个假设没有写在 `ClusterServer` 的文档注释里（对比 `DistributedEventBus` 就写了为什么必须并发）。
+- **环形拓扑假设未文档化**：`ClusterServer.start` 是"单线程串行处理 + 内联业务"，即"集群 RPC 量小、对端都善意"；这个假设没有写在 `ClusterServer` 的文档注释里（对比 `DistributedEventBus` 就写了为什么必须并发）。**（2026-09-21 已消除：见本文第 2 条的追记 —— 现在是每连接一个 fiber。）**
 - **OOM 路径被当成"不会发生"**：`free 后 try dupe` 的模式出现 3 处，而同一进程里存在对端可驱动的无界分配。错误路径没人测。
 - **测试面的缺口（重要）**：`decode*` 只有"自己编码→自己解码"的闭环（`RaftTransport.zig:721` "wire format round-trips every Raft RPC"），它确实覆盖了错 tag → `UnexpectedMessageTag`、未知 tag → null(797-798)，但**没有一条恶意字节用例**：`error.TruncatedMessage` 全仓库只出现在定义与抛出点(`RaftTransport.zig:65,80`)，**没有任何测试断言过它**；也没有 index=0、超大 count、零长字段的用例。
 
@@ -157,6 +157,12 @@ WAN 觉得紧就把两端一起调大（没有新开字段：与出站同源）�
 **这条修的是"挂死"，不是"吞吐"**：`ClusterServer.start` 仍然在**单线程内联**跑 handler，
 一个慢对端仍然串行占用 accept 环。本文 3 节里"入站与出站的韧性不对称"这条观察现在只剩
 这一半成立。
+
+> **2026-09-21 追记（这一半也已关）**：`ClusterServer` 现在是**每连接一个 fiber**
+> （`std.Io.Group` + `concurrent`），handler 的 owner 由 `start(handler, context)` 的形参传进去，
+> 两处 `threadlocal`（`RaftTransport.InboundServer.current`、`ClusterBootstrap.inbound_owner`）已删。
+> 一个慢对端从此不串行占用 accept 环；`stop()` 等这些 fiber 结束。判据与变异见
+> `docs/dev/cluster-auth-design.md` §15 与 `CHANGELOG.md` 的 `Unreleased` 条目。
 
 ### 两条判据
 

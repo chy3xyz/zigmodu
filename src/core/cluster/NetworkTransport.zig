@@ -50,12 +50,39 @@ pub const ClusterConnection = struct {
 };
 
 /// TCP server that accepts cluster connections.
+///
+/// **One fiber per connection.** The handler used to run *inline on the accept
+/// thread*, so a single slow peer serialised every other inbound connection for
+/// as long as it took to read its frame: `RaftTransport`'s recv/send bounds
+/// capped that stall at `ElectionConfig.rpc_timeout_ms`, but a node with two
+/// slow peers still answered the third one only after both had timed out. The
+/// dispatch below is the shape `DistributedEventBus.acceptLoop` already uses,
+/// for the same reason.
+///
+/// The handler takes a **context** because it no longer runs on the thread that
+/// called `start`: anything the handler needs (its raft, its address book) has
+/// to travel with the call instead of living in a `threadlocal` that only the
+/// accept thread can see. A handler dispatched onto a pool thread found that
+/// `threadlocal` null and dropped the connection.
 pub const ClusterServer = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     listener: ?std.Io.net.Server,
     port: u16,
     running: std.atomic.Value(bool),
+    /// Live handler fibers. `stop()` awaits this, so a returned `stop()` means
+    /// no handler is still running against the resources it was handed.
+    group: std.Io.Group,
+    /// True only for the window in which the accept loop can still add a task to
+    /// `group` (between a successful `accept` and `Group.concurrent` returning).
+    /// `stop()` waits for it to clear before awaiting the group: `Group.await` is
+    /// documented as unsafe to race with `Group.concurrent` (and would assert),
+    /// and a task added after the await began would not be covered by it.
+    dispatching: std.atomic.Value(bool),
+
+    /// `context` is whatever the handler needs to find its way back to its
+    /// owner; the server only passes it through.
+    pub const Handler = *const fn (context: ?*anyopaque, conn: ClusterConnection) void;
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, port: u16) ClusterServer {
         return .{
@@ -64,6 +91,8 @@ pub const ClusterServer = struct {
             .listener = null,
             .port = port,
             .running = std.atomic.Value(bool).init(false),
+            .group = .init,
+            .dispatching = std.atomic.Value(bool).init(false),
         };
     }
 
@@ -72,8 +101,13 @@ pub const ClusterServer = struct {
         self.* = undefined;
     }
 
-    /// Start listening. Accepts connections and passes them to the handler.
-    pub fn start(self: *ClusterServer, handler: *const fn (ClusterConnection) void) !void {
+    /// Start listening. Accepts connections and hands each one to `handler` on
+    /// its own fiber, together with `context`. Blocks until `stop()`.
+    ///
+    /// The context is a `start` parameter rather than a field so that the
+    /// binding cannot be set on a server that never starts (or changed under a
+    /// running one); there is exactly one place that knows what a handler is for.
+    pub fn start(self: *ClusterServer, handler: Handler, context: ?*anyopaque) !void {
         const addr = try std.Io.net.IpAddress.parseIp4("0.0.0.0", self.port);
         self.listener = try addr.listen(self.io, .{ .reuse_address = true });
         self.running.store(true, .monotonic);
@@ -84,17 +118,69 @@ pub const ClusterServer = struct {
                 std.log.err("[ClusterServer] Accept error: {}", .{err});
                 continue;
             };
-            const conn = ClusterConnection.init(self.allocator, stream, self.io);
-            handler(conn);
+            // **Claim the dispatch slot, then re-check `running` under it.** The
+            // two `seq_cst` operations are what make the re-check sound: `stop()`
+            // stores `running = false` and *then* spins on `dispatching`, so a
+            // claim that lands after that store sees `running == false` here and
+            // drops the connection instead of dispatching it — while a claim that
+            // lands before it is waited for by `stop()`'s spin. Without the
+            // re-check, an accept that completed just before `stop()` could add a
+            // task to the group *after* `stop()`'s await began, and the await
+            // would neither cover it nor be allowed to race it.
+            self.dispatching.store(true, .seq_cst);
+            if (!self.running.load(.seq_cst)) {
+                self.dispatching.store(false, .seq_cst);
+                stream.close(self.io);
+                break;
+            }
+            var conn = ClusterConnection.init(self.allocator, stream, self.io);
+            // `concurrent`, not `async`: a handler blocks on peer reads, and
+            // `async`'s eager fallback at its limit runs it on this thread —
+            // which is the serialization being removed. The limit's rejection
+            // path closes the connection rather than leaving the peer waiting.
+            self.group.concurrent(self.io, runHandler, .{ handler, context, conn }) catch |err| {
+                std.log.warn("[ClusterServer] connection rejected (concurrent limit): {}", .{err});
+                conn.deinit();
+                self.dispatching.store(false, .seq_cst);
+                continue;
+            };
+            self.dispatching.store(false, .seq_cst);
         }
+
+        // No await here: only `stop()` may wait on the group (a second awaiter
+        // races the first — `Group.await` is not threadsafe, and asserts on it).
+        // Nothing can be dispatched after `stop()` has observed `dispatching`
+        // clear, which is what makes `stop()`'s await complete.
     }
 
     pub fn stop(self: *ClusterServer) void {
-        self.running.store(false, .monotonic);
+        // `seq_cst`, because the accept loop's re-check relies on this store
+        // being ordered against its own claim (see `start`).
+        self.running.store(false, .seq_cst);
         if (self.listener) |*l| {
             l.deinit(self.io);
             self.listener = null;
         }
+        // The accept loop may be one dispatch short of handing a connection
+        // over; let it finish that step so the await below covers that fiber too
+        // (bounded by one `Group.concurrent` call — no later one can start,
+        // because `running` is already false).
+        while (self.dispatching.load(.seq_cst)) std.atomic.spinLoopHint();
+        self.awaitHandlers();
+    }
+
+    /// Wait for every handler fiber to return. Idempotent for the caller
+    /// (`stop()` is called twice by some owners) but **not** for two threads at
+    /// once: `Io.Group.await` is not threadsafe, so this is the owner's call to
+    /// make and `start()` deliberately does not make it too.
+    pub fn awaitHandlers(self: *ClusterServer) void {
+        self.group.await(self.io) catch |err| {
+            std.log.warn("[ClusterServer] waiting for handlers was interrupted: {}", .{err});
+        };
+    }
+
+    fn runHandler(handler: Handler, context: ?*anyopaque, conn: ClusterConnection) void {
+        handler(context, conn);
     }
 };
 

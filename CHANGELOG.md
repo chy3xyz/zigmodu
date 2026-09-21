@@ -2,6 +2,48 @@
 
 ## [Unreleased]
 
+### `ClusterServer` 改为并发分发（handler 签名变更）；入站 AppendEntries 设界（**破坏性：是**）
+
+**① accept 环此前在**自己的线程上内联跑 handler**：一个慢对端会**串行占用整个入站**（前面那次只修了
+"挂死"，没修"吞吐"）。而 handler 的签名是 `*const fn (ClusterConnection) void` —— **没有 context**，
+这正是 `RaftTransport.InboundServer` 用 `threadlocal var current` 绑 raft 的原因；
+一旦换到别的线程跑，`current` 就是 null → **每个入站连接都被丢弃**。
+
+所以按总线的先例（`DistributedEventBus` 的 `Group.concurrent`，审计自己点名的正确形状）改成带 context：
+
+```zig
+// 旧： fn (ClusterConnection) void
+// 新： fn (?*anyopaque, ClusterConnection) void，start(handler, context)
+```
+
+`concurrent`（不是 `async` —— handler 会阻塞在读上，`async` 到限就回落到 accept 线程，那正是要移除的串行），
+`stop()` 等待 group，两个 `threadlocal` 删除。因为 handler 签名变了，**这是破坏性变更**。
+
+**② 入站 `AppendEntries` 此前没有任何上界**（`max_append_entries` 只用于出站分块）：≈2MB/帧 的暂态分配
++ ≈1.8MB/帧 的常驻增长，可重放。现在**截断**（不是拒绝）：只应用前 `max_append_entries` 条，
+响应的 `success`/`match_index` 如实反映应用到了哪里 —— 这是合法 Raft（前缀），leader 下一轮从那里继续，
+所以**两端配置不一致时是自愈的**，而拒绝会让复制永久卡死。另加解码侧的帧级上界
+（`MAX_ENTRIES_PER_FRAME`），在**分配之前**拒绝。
+
+**验证**：全量 **1534/1555（21 skipped，0 failed）**（比上一版 +4），fmt + 6 道门禁全绿。
+两条变异我都自己重做过（inline 那条需要连带 `var conn`→`const conn` 才能编译，所以是"改两处"的变异，
+已按字节还原、md5 一致）：
+  inline 分发回去 → `two stalled peers do not stop a third connection from being answered`
+                    在 `try fast.recv` 处 `FAIL (ConnectionError)`（第三个对端在自己的
+                    2000ms 耐心内拿不到回复，因为内联分发要先还清两个 1000ms 的停顿）
+  clamp 去掉     → `an inbound AppendEntries applies at most max_append_entries entries, and says so`
+                    `expected 3, found 10` / `FAIL (TestExpectedEqual)`
+都是断言红不是编译错。
+
+> **复核时澄清了一处**：半帧测试里我原先的两条 elapsed 断言被**搬到了对端 A**，
+> 不是被删除 —— 并发之后 B 是**立刻**被服务，所以"上界生效"这件事只在 A 上可见，
+> 而 B 换成了更严的 `< timeout_ms - 50`。我自己做变异确认了它有牙齿
+> （`FAIL (TestUnexpectedResult)` 在 `:1798`）。
+
+**未做**：`ConcurrentError` 的拒绝分支没有用例（`testing.io` 的 `concurrent_limit` 是 unlimited，
+触发不到）；真正的身份绑定（每节点凭证 + 握手）仍 open。
+
+
 ### `sockread` 的超时设置会 **panic** 而不是 warn（AF_UNIX）；以及总线 §14 的五条（**破坏性：是**）
 
 **① `setRecvTimeout` / `setSendTimeout` 的 `catch` 是死代码。**

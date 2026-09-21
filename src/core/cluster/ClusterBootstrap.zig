@@ -105,7 +105,10 @@ pub const ClusterBootstrap = struct {
     election_transport: RaftElection.ElectionTransport = undefined,
     metrics: ClusterMetrics,
     /// Accepts inbound Raft RPCs on `config.port` — only when a `.transport` was
-    /// supplied (see `start()`); the accept loop runs on `inbound_thread`.
+    /// supplied (see `start()`); the accept loop runs on `inbound_thread`, one
+    /// handler fiber per connection, and each of those is handed `self` as the
+    /// handler context (a `threadlocal` owner cannot work once handlers run off
+    /// the accept thread).
     server: NetworkTransport.ClusterServer,
     inbound_thread: ?std.Thread = null,
     /// peer id → `host:port`, filled from `config.peers` in `start()`: the inbound
@@ -114,11 +117,6 @@ pub const ClusterBootstrap = struct {
     /// Read side fed by `tick()`. Request paths use it instead of the
     /// membership hash map (`acquire`/`pick`, see `cluster/MembershipView.zig`).
     view: View,
-
-    /// `ClusterServer.start` takes a bare handler (no context), so the server's
-    /// owner is bound per thread — the same trick `RaftTransport.InboundServer`
-    /// uses, without a second listener object.
-    threadlocal var inbound_owner: ?*Self = null;
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: BootstrapConfig) !Self {
         return .{
@@ -319,8 +317,10 @@ pub const ClusterBootstrap = struct {
     /// Tear the stack down. Idempotent: terminal cleanup hangs off `deinit()`, and
     /// an explicit `stop()` before it must not reach into torn-down memory.
     pub fn stop(self: *Self) void {
-        // First: the accept loop holds `self.raft` and `&self.addresses`, so it
-        // has to be gone before either is destroyed.
+        // First: the accept loop **and its handler fibers** hold `self.raft` and
+        // `&self.addresses`, so both have to be gone before either is destroyed.
+        // `server.stop()` waits for the fibers (and the accept loop cannot hand
+        // it another one after that); the join below reaps the accept thread.
         if (self.inbound_thread) |thread| {
             self.inbound_thread = null;
             const was_running = self.server.running.load(.monotonic);
@@ -359,20 +359,19 @@ pub const ClusterBootstrap = struct {
     /// (`RaftElection.RaftLock`), not anything the facade arranges — see
     /// `RaftTransport.handleConnection`.
     fn runInbound(self: *Self) void {
-        inbound_owner = self;
-        defer inbound_owner = null;
-        self.server.start(&onInboundConnection) catch |err| {
+        self.server.start(&onInboundConnection, self) catch |err| {
             std.log.debug("[ClusterBootstrap] inbound Raft server on port {d} exited ({})", .{ self.config.port, err });
         };
     }
 
-    fn onInboundConnection(conn: NetworkTransport.ClusterConnection) void {
+    fn onInboundConnection(context: ?*anyopaque, conn: NetworkTransport.ClusterConnection) void {
         var owned = conn;
         defer owned.deinit();
-        const self = inbound_owner orelse {
-            std.log.debug("[ClusterBootstrap] inbound connection on an unbound server thread", .{});
+        const ctx = context orelse {
+            std.log.debug("[ClusterBootstrap] inbound connection with no server context", .{});
             return;
         };
+        const self: *Self = @ptrCast(@alignCast(ctx));
         const raft = self.raft orelse return;
         RaftTransport.handleConnection(raft, &self.addresses, &owned);
     }

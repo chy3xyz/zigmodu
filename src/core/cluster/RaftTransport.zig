@@ -79,7 +79,28 @@ pub const DecodeError = error{
     /// The message is internally inconsistent for its tag — e.g. a response type
     /// arrived where a request was expected. Drop it and surface the bug.
     UnexpectedMessageTag,
+    /// An `append_entries` frame declared more entries than
+    /// [`MAX_ENTRIES_PER_FRAME`]. Returned **before** the entry array is
+    /// allocated, so an oversized count costs the frame and nothing else.
+    EntryCountTooLarge,
 };
+
+/// Upper bound on the entry count one `append_entries` frame may carry.
+///
+/// The count is a u16 on the wire, and `decodeAppendEntries` used to hand it
+/// straight to `allocator.alloc(LogEntry, count)`: a frame of a few dozen bytes
+/// could therefore ask for 65535 × 32 B ≈ 2 MB, allocated **before** the body it
+/// would have to contain was validated. The bound is what makes the allocation
+/// a function of the frame instead of a function of a peer's number.
+///
+/// 4096 is 40× the `ElectionConfig.max_append_entries` default and ≈128 KiB of
+/// `LogEntry`, i.e. comfortably above any sane chunking size — but it is a hard
+/// wire bound, so a peer whose `max_append_entries` exceeds it has its frames
+/// dropped (and replication to that peer stalls: the sender keeps re-sending the
+/// same too-large batch). `ElectionConfig.max_append_entries` is documented as
+/// bounded by this constant; a cluster is not required to use the same chunking
+/// size, only to stay under this ceiling on both ends.
+pub const MAX_ENTRIES_PER_FRAME: u16 = 4096;
 
 /// Cursor over one payload (the bytes after the tag).
 const Cursor = struct {
@@ -239,7 +260,13 @@ pub fn decodeAppendEntries(allocator: std.mem.Allocator, frame: []const u8) !App
     const prev_log_index = try cur.u64v();
     const prev_log_term = try cur.u64v();
     const leader_commit = try cur.u64v();
-    const entries = try allocator.alloc(LogEntry, try cur.u16v());
+    // The count is checked against the cap *before* the array exists, and before
+    // a single entry is walked: a truncated body under an oversized count has to
+    // be refused as `EntryCountTooLarge` (the count is wrong), not as
+    // `TruncatedMessage` after a pointless allocation.
+    const count = try cur.u16v();
+    if (count > MAX_ENTRIES_PER_FRAME) return error.EntryCountTooLarge;
+    const entries = try allocator.alloc(LogEntry, count);
     for (entries) |*entry| {
         entry.term = try cur.u64v();
         entry.index = try cur.u64v();
@@ -773,17 +800,18 @@ fn logDrop(err: anyerror) void {
     log.debug("[raft] inbound RPC dropped ({})", .{err});
 }
 
-/// Accept loop for inbound RPCs. `ClusterServer.start` takes a bare handler (no
-/// context), so each `InboundServer` marks its raft and address book as the ones
-/// for the thread it runs on — which is what lets several nodes share a process.
+/// Accept loop for inbound RPCs. `ClusterServer` runs one fiber per connection
+/// and passes this server as the handler's context, so several nodes can share a
+/// process without any thread-local state. The binding used to be a
+/// `threadlocal var current`, which only worked while the handler ran on the
+/// accept thread: as soon as the handler was dispatched onto a pool thread,
+/// `current` was null there and **every inbound connection was dropped**.
 pub const InboundServer = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     raft: *RaftElection,
     addresses: ?*const AddressBook,
     server: NetworkTransport.ClusterServer,
-
-    threadlocal var current: ?*InboundServer = null;
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, raft: *RaftElection, addresses: ?*const AddressBook, port: u16) InboundServer {
         return .{
@@ -798,26 +826,26 @@ pub const InboundServer = struct {
     /// Blocks until `stop()`. One RPC per connection, matching the outbound side,
     /// which opens a fresh connection per call.
     pub fn run(self: *InboundServer) void {
-        current = self;
-        defer current = null;
-        self.server.start(&onConnection) catch |err| {
+        self.server.start(&onConnection, self) catch |err| {
             log.debug("[raft] inbound server on port {d} exited ({})", .{ self.server.port, err });
         };
     }
 
     /// Ask `run` to return. The accept is already blocked, so a wake-up
-    /// connection is needed (see the tests).
+    /// connection is needed (see the tests). Waits for the in-flight handlers as
+    /// well: they hold `raft` and `addresses`, which the caller frees next.
     pub fn stop(self: *InboundServer) void {
         self.server.stop();
     }
 
-    fn onConnection(conn: NetworkTransport.ClusterConnection) void {
+    fn onConnection(context: ?*anyopaque, conn: NetworkTransport.ClusterConnection) void {
         var owned = conn;
         defer owned.deinit();
-        const self = current orelse {
-            log.debug("[raft] inbound connection on an unbound server thread", .{});
+        const ctx = context orelse {
+            log.debug("[raft] inbound connection with no server context", .{});
             return;
         };
+        const self: *InboundServer = @ptrCast(@alignCast(ctx));
         handleConnection(self.raft, self.addresses, &owned);
     }
 };
@@ -905,6 +933,67 @@ test "wire format round-trips every Raft RPC" {
     try encodeVoteResponse(&out, allocator, .{ .term = 1, .vote_granted = false }, "node-b");
     try testing.expectError(error.UnexpectedMessageTag, decodeVoteRequest(allocator, out.items));
     try testing.expectEqual(@as(?MessageTag, null), tagOf(&.{0x7f}));
+}
+
+// The entry count is a u16 on the wire, so without a cap `decodeAppendEntries`
+// would `alloc(LogEntry, 65535)` ≈ 2 MB on the say-so of a peer, before a single
+// entry byte was validated. The frame below is that shape: it declares 65535
+// entries and carries **none**, so a decoder that allocates (or walks the body)
+// first reports `TruncatedMessage` or `error.OutOfMemory` — the assertion here
+// is that the count is refused on its own, and that nothing was requested from
+// the allocator on the way to that refusal.
+test "an append_entries frame above the decode cap is dropped without allocating" {
+    const allocator = testing.allocator;
+
+    const claimed_entries: u16 = 65535;
+    try testing.expect(claimed_entries > MAX_ENTRIES_PER_FRAME);
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    try putU8(&out, allocator, @backingInt(MessageTag.append_entries));
+    try putU64(&out, allocator, 7); // term
+    try putStr(&out, allocator, "leader1"); // leader_id
+    try putU64(&out, allocator, 0); // prev_log_index
+    try putU64(&out, allocator, 0); // prev_log_term
+    try putU64(&out, allocator, 0); // leader_commit
+    try putU16(&out, allocator, claimed_entries);
+    // ...and no entries at all.
+
+    // `fail_index = 1`: the `leader_id` copy is allocation #0 and would succeed,
+    // so an implementation that allocates the entries array reaches a *failing*
+    // allocation (a different error) rather than reporting this one. The arena
+    // is what keeps the copied `leader_id` from leaking on the error path — the
+    // decoder itself relies on its caller's arena for that.
+    var failing = testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
+    var arena_state = std.heap.ArenaAllocator.init(failing.allocator());
+    defer arena_state.deinit();
+    try testing.expectError(error.EntryCountTooLarge, decodeAppendEntries(arena_state.allocator(), out.items));
+
+    // Nothing the size of the declared array was ever requested.
+    try testing.expect(failing.allocated_bytes < @as(usize, claimed_entries) * @sizeOf(LogEntry));
+    try testing.expect(failing.allocated_bytes < 256);
+
+    // The cap is a *ceiling*, not the normal path: a frame at it still decodes.
+    out.clearRetainingCapacity();
+    const at_cap = try allocator.alloc(LogEntry, MAX_ENTRIES_PER_FRAME);
+    defer allocator.free(at_cap);
+    for (at_cap, 0..) |*entry, i| entry.* = .{ .term = 1, .index = @intCast(i + 1), .command = "x" };
+    try encodeAppendEntries(&out, allocator, .{
+        .term = 7,
+        .leader_id = "leader1",
+        .prev_log_index = 0,
+        .prev_log_term = 0,
+        .entries = at_cap,
+        .leader_commit = 0,
+    });
+    const decoded = try decodeAppendEntries(allocator, out.items);
+    defer {
+        for (decoded.entries) |entry| allocator.free(entry.command);
+        allocator.free(decoded.entries);
+        allocator.free(decoded.leader_id);
+    }
+    try testing.expectEqual(@as(usize, MAX_ENTRIES_PER_FRAME), decoded.entries.len);
+    try testing.expectEqual(@as(u64, MAX_ENTRIES_PER_FRAME), decoded.entries[MAX_ENTRIES_PER_FRAME - 1].index);
 }
 
 // ── Frame authentication tests ──────────────────────────────────────────────
@@ -1524,9 +1613,9 @@ test "real loopback catch-up: empty-log follower converges via per-peer nextInde
     try testing.expectEqual(before, a_raft.next_index.get("node-b").?);
 }
 
-/// Frames the black-hole peer below actually read. A `ClusterServer` handler gets
-/// no user context (the signature is `fn (ClusterConnection) void`), so this is
-/// the same file-scope-channel trick `TransportImpl.bound` uses.
+/// Frames the black-hole peer below actually read. The handler now gets its
+/// context as a parameter, so this is a file-scope counter rather than the
+/// thread-local trick that predates it.
 var black_hole_frames = std.atomic.Value(u64).init(0);
 
 /// How long the black hole holds its half of the connection open after reading
@@ -1543,7 +1632,8 @@ const black_hole_hold_ms = 2_000;
 /// then nothing comes back. Without `SO_RCVTIMEO` the leader's synchronous reply
 /// read waits for the peer to close — which, for a peer that is up but wedged,
 /// is never.
-fn blackHoleHandler(conn: NetworkTransport.ClusterConnection) void {
+fn blackHoleHandler(context: ?*anyopaque, conn: NetworkTransport.ClusterConnection) void {
+    _ = context;
     var c = conn;
     defer c.deinit();
     var buf = std.ArrayList(u8).empty;
@@ -1574,7 +1664,7 @@ test "a peer that accepts and never replies costs rpc_timeout_ms, not the peer's
     var server = NetworkTransport.ClusterServer.init(allocator, io, 19660);
     var server_up = false;
     defer if (server_up) server.stop();
-    const server_thread = try std.Thread.spawn(.{}, NetworkTransport.ClusterServer.start, .{ &server, blackHoleHandler });
+    const server_thread = try std.Thread.spawn(.{}, NetworkTransport.ClusterServer.start, .{ &server, blackHoleHandler, null });
     server_up = true;
     var spins: usize = 0;
     while (!server.running.load(.monotonic) and spins < 2000) : (spins += 1) {
@@ -1623,6 +1713,16 @@ test "a peer that accepts and never replies costs rpc_timeout_ms, not the peer's
     try testing.expect(elapsed < black_hole_hold_ms - 500);
 
     server.stop();
+    // The accept loop may be blocked in `accept` rather than inside a handler
+    // (which is the whole point of the change above), and closing the listener
+    // does not reliably wake that. Same wake-up connection the inbound-server
+    // teardown uses.
+    if (dialTo(allocator, io, .{ .host = "127.0.0.1", .port = server.port })) |wake| {
+        var c = wake;
+        c.deinit();
+    } else |err| {
+        std.log.debug("[raft test] wake connection not needed ({s})", .{@errorName(err)});
+    }
     server_thread.join();
     server_up = false;
 }
@@ -1635,10 +1735,14 @@ const stalled_peer_patience_ms: u32 = 2_000;
 // Verified red: `rpc_timeout_ms = 0` (the pre-fix behaviour — `setRecvTimeout`
 // returns early on 0) makes this fail on `expectError(error.ConnectionClosed,
 // ...)` with `error.ConnectionError`: the second peer is never served, because
-// the accept thread is still inside the first one's body read. `ClusterServer`
-// runs the handler *inline*, so that one four-byte frame stops the node's entire
-// Raft inbound — no votes, no heartbeats, no replication — and
-// `ClusterBootstrap.stop()` then blocks in `thread.join()` behind it.
+// A's half-frame holds the node's entire Raft inbound — no votes, no heartbeats,
+// no replication — and `ClusterBootstrap.stop()` then blocks in `thread.join()`
+// behind it.
+//
+// The *other* half of the property this test used to encode ("A's bound is what
+// released B") is now asserted on A instead: B is served **before** A's bound
+// expires, because each connection gets its own handler fiber. That is the
+// assertion the inline-dispatch mutation below flips.
 test "a half-frame on the inbound side costs rpc_timeout_ms, not the whole node" {
     const allocator = testing.allocator;
     const io = testing.io;
@@ -1658,11 +1762,12 @@ test "a half-frame on the inbound side costs rpc_timeout_ms, not the whole node"
     const port = try startInbound(allocator, io, &raft, null, 19661, &inbound, &inbound_thread);
     defer stopInbound(io, &inbound, &inbound_thread);
 
-    // Peer A: a length prefix promising 64 bytes, then silence. Four bytes.
-    // `accept` hands out completed connections in order and A completed its
-    // handshake before B existed, so A is the one the handler is holding.
+    // Peer A: a length prefix promising 64 bytes, then silence. Four bytes. A
+    // completed its handshake before B existed, so it is the connection whose
+    // handler is stalled on the body if anything serializes the two.
     var peer_a = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = port });
     defer peer_a.deinit();
+    sockread.setRecvTimeout(peer_a.stream, stalled_peer_patience_ms);
     var prefix: [4]u8 = undefined;
     std.mem.writeInt(u32, &prefix, 64, .big);
     try sockread.writeFull(peer_a.stream, &prefix);
@@ -1686,10 +1791,107 @@ test "a half-frame on the inbound side costs rpc_timeout_ms, not the whole node"
     // until B's own bound expired.
     try testing.expectError(error.ConnectionClosed, served);
 
-    // And it was A's bound that released B. An immediate EOF would mean the
-    // listen socket refused the connection — a different, already-safe case.
-    try testing.expect(elapsed >= @as(i64, timeout_ms) - 50);
-    try testing.expect(elapsed < @as(i64, stalled_peer_patience_ms) - 500);
+    // ...and it was served *while A's half-frame was still outstanding*: an
+    // immediate EOF cannot be the listen socket refusing the connection either
+    // (that fails the dial above), and waiting for A's bound would put this at
+    // `timeout_ms` or more.
+    try testing.expect(elapsed < @as(i64, timeout_ms) - 50);
+
+    // A is where the bound is visible: its half-frame is dropped at
+    // `rpc_timeout_ms`, so this read ends in EOF neither immediately (something
+    // else closed it) nor at the peer's own patience (nothing bounded it).
+    const a_started = Time.monotonicNowMilliseconds();
+    try testing.expectError(error.ConnectionClosed, sockread.readFull(peer_a.stream, &reply));
+    const a_elapsed = Time.monotonicNowMilliseconds() - a_started;
+    try testing.expect(a_elapsed >= @as(i64, timeout_ms) - 50);
+    try testing.expect(a_elapsed < @as(i64, stalled_peer_patience_ms) - 500);
+}
+
+/// How long each stalled peer in the test below occupies a handler. Long enough
+/// that "the third peer was served alongside them" and "the third peer waited
+/// its turn" differ by an order of magnitude in elapsed time.
+const concurrent_stall_ms: u32 = 1_000;
+
+// Verified red: dispatching the handler inline again (removing `concurrent` from
+// `ClusterServer.start`'s dispatch) makes this fail — measured, and **at the
+// `fast.recv` bound rather than on the elapsed assertion below**. With inline
+// dispatch the third peer's reply is not produced until both stalled peers have
+// been released (~2 × `concurrent_stall_ms`), which is past that peer's own 2000 ms
+// patience, so `fast.recv` returns `error.ConnectionError`
+// (`FAIL (ConnectionError)` at the `try fast.recv` line, not a compile error and
+// not a hang). Raising `fast`'s patience above 2 × the stall would move the catch
+// to the elapsed assertion instead; "the reply never arrived inside its bound" is
+// the stronger of the two statements, so that is the one relied on.
+//
+// Either way it is exactly the property the recv/send bounds do not provide: they
+// bound *how long* one peer may stall the node's Raft inbound, not whether any
+// other peer is served during it.
+test "two stalled peers do not stop a third connection from being answered" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    if (!@import("../../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    const timeout_ms = concurrent_stall_ms;
+
+    var impl: ElectionTransportImpl = undefined;
+    var raft: RaftElection = undefined;
+    impl.init(allocator, io, &raft);
+    defer impl.deinit();
+    // `node-b` is a declared member, so the vote below passes the membership
+    // check (docs/dev/cluster-auth-design.md §4.1) and the reply is a *granted*
+    // one: the frame reached the raft, not merely the socket.
+    var peers = [_]Peer{.{ .id = "node-b", .address = "" }};
+    raft = try RaftElection.init(allocator, "node-a", &peers, .{ .rpc_timeout_ms = timeout_ms }, &impl.transport());
+    defer raft.deinit();
+
+    var inbound: InboundServer = undefined;
+    var inbound_thread: std.Thread = undefined;
+    const port = try startInbound(allocator, io, &raft, null, 19662, &inbound, &inbound_thread);
+    defer stopInbound(io, &inbound, &inbound_thread);
+
+    // Two peers that connect and then send a length prefix with no body: each
+    // holds a handler until `rpc_timeout_ms` releases it.
+    var slow_a = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = port });
+    defer slow_a.deinit();
+    var slow_b = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = port });
+    defer slow_b.deinit();
+    for ([_]*NetworkTransport.ClusterConnection{ &slow_a, &slow_b }) |stalled| {
+        var prefix: [4]u8 = undefined;
+        std.mem.writeInt(u32, &prefix, 64, .big);
+        try sockread.writeFull(stalled.stream, &prefix);
+    }
+
+    // The third peer sends a complete frame and has to be answered while both of
+    // the above are still inside their handler.
+    var fast = try dialTo(allocator, io, .{ .host = "127.0.0.1", .port = port });
+    defer fast.deinit();
+    sockread.setRecvTimeout(fast.stream, stalled_peer_patience_ms);
+
+    var frame = std.ArrayList(u8).empty;
+    defer frame.deinit(allocator);
+    try encodeVoteRequest(&frame, allocator, .{
+        .term = 5,
+        .candidate_id = "node-b",
+        .last_log_index = 0,
+        .last_log_term = 0,
+    });
+
+    const started = Time.monotonicNowMilliseconds();
+    try writeFrame(fast.stream, frame.items);
+    var reply = std.ArrayList(u8).empty;
+    defer reply.deinit(allocator);
+    const bytes = try fast.recv(&reply);
+    const elapsed = Time.monotonicNowMilliseconds() - started;
+
+    const decoded = try decodeVoteResponse(allocator, bytes);
+    defer allocator.free(decoded.responder_id);
+    try testing.expect(decoded.resp.vote_granted);
+    try testing.expectEqual(@as(u64, 5), decoded.resp.term);
+
+    // Served while both stalls were still outstanding. `fast`'s own bound is
+    // `stalled_peer_patience_ms` (4× this), so a not-yet-served peer surfaces as
+    // that read failing rather than as a hang.
+    try testing.expect(elapsed < @as(i64, timeout_ms) / 2);
 }
 
 // The frame helpers above are unit-tested against a socketpair; this is the
