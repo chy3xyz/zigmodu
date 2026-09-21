@@ -2,6 +2,74 @@
 
 ## [Unreleased]
 
+### 监听 socket 关不醒 `accept`：四个 `stop()` 在 Linux 上不返回（**破坏性：否**，行为修复）
+
+Linux 的 `close()` **不会**唤醒已经阻塞在 `accept()` 的线程（内核为那次进行中的调用留着
+socket），于是"停服务"变成"永远等下去"。`Server` 早就知道这条并写了 `shutdown()` 绕法，
+另外四个自己 accept 的地方都是裸 `deinit`：`DistributedEventBus.stop()`（随后的
+`fiber_group.await` 永不返回）、`ClusterServer.stop()`、`WebSocketServer.stop()`、
+`WebMonitor.stop()`。收成一个 `sockread.closeListener(io, *Server)`，五处统一。
+
+证据是 gdb 现场（Linux 全量 `zig build test` 挂住时）：
+
+```text
+Thread 1 (main)       Io.Group.await  ← DistributedEventBus.stop()   :350
+Thread 3 (async task) accept4         ← acceptLoop                    :392
+测试名：core.DistributedEventBus.test.two credentialed nodes bind over the network
+```
+
+修复后同一棵树：`run test 1440 pass, 21 skip (1461 total)`、退出码 0（此前挂到超时）。
+macOS 侧 1555/1576 不变。
+
+### zent 升到 v0.74.2：`getOwned` 改名 + 四条 BREAKING（**破坏性：是**）
+
+pin 与 hash 升到 `v0.74.2`（两个示例）。本仓库要动的调用点只有一处：
+**v0.73 把 `CrudService.get` 改名 `getOwned`**（它返回的是复制进*调用方* allocator 的行，
+配套 `client.<entity>.deinitRowWith(allocator, &e)`）—— `zent_crud.get` 已改用它。
+
+同时按上游 changelog 把 §14 补齐八条，其中三条会打到消费者：
+**v0.70 SQLite 强制外键**（`PRAGMA foreign_keys = ON` 并回读确认；悬空引用会
+`ForeignKeyViolation`，级联删除真的删，测试/清理顺序要跟着改）、**v0.73 `Sum`/`Avg` 空集报
+`EmptyAggregate`**（原来是 `TypeMismatch`）、**v0.69 `SaveError` 增两个成员**
+（`InconsistentRowFields`/`MissingPrimaryKey`，穷尽 switch 会编译失败）。
+另四条是行为修复：PG 的 `23502`/`23503` 不再误报 `UniqueViolation`、`Restore` 受策略过滤与
+拦截器约束、`queryTargets*` 中途失败不再给短页、EntQL 拒绝实体上不存在的字段。
+
+验证：`examples/zent-modulith` 构建 + smoke **43 checks, 0 failed**；
+`examples/metaverse-creative` 的 `zig build demo` 走通（`balanced=true outbox=1`）。
+
+### `zmodu audit` b23：分配器归属（**破坏性：否**）
+
+新增规则：`deinitRow(s)` / `deinitRows(...)` 只对**驱动扫描出来**的行用（`Query().All()`、
+builder `Save()`）；把"由带 allocator 形参的调用产出"的行交给它 ——
+`getOwned`（旧名 `get`）/ `Query().AllIn(arena)` / `queryRowOwned` / `scanRowsToOwned` ——
+是用 client 的分配器释放别人的内存（`free of invalid memory`，会打死进程）。
+判据是"目标的绑定来自一个参数里出现 allocator/arena 的调用"，即 `docs/ZENT.md` §14 写明的
+那两种形态；误报在同一行写 `// audit: ignore b23` 豁免。全仓 `zmodu audit .` 0 命中。
+
+### CL/TE 走私：真实代理拓扑用例（**破坏性：否**，补上缺失的证据）
+
+安全审计 ② 此前只有静态推导 + 进程内解析器测试；解析器只是一半，另一半是**前置代理的
+定界行为**。新增 `examples/production-deploy/smuggling-e2e/`：nginx 在前（`proxy_request_buffering`
+on/off 两个口），5 条载荷，断言是"**后端服务过的每一条请求，都是网关收到过的**"——
+两边各自记账，后端服务了而网关没收到的那一条就是走私原语，按定义成立。四条对照证明这个
+不变式能红（直接打后端 → 后端计数 > 网关计数）。
+
+实测 10 行全 `ok`：CL+TE 由 nginx 自己 400、裸 `Transfer-Encoding` 由后端 400、chunk 扩展行
+被 nginx 规范化后转发。用例已接进 CI 的 `Integration (full)`；**未覆盖** Envoy、HTTP/2 前端、
+TLS 终结层。
+
+### CI 台架两处"红了也看不见"（**破坏性：否**）
+
+① `cmd 2>&1 | tee log` 在命令留下握着 stdout 的孤儿进程时永不结束 —— 一次编译失败的
+报错发生在 07:20，这一步却挂到 07:45 才被超时打断（收尾日志里的
+`Terminate orphan process: pid (2921) (test)` 就是那个孤儿）。五处改走
+`scripts/ci-run-logged.sh`（shell 重定向写文件、结束后 cat、退出码是命令自己的）。
+
+② `set -e` 在 macOS 的 bash 3.2 下**不会**因为 `[[ … ]]` 失败而中止（Linux 的 bash 5 会），
+所以 `scripts/ci-integration.sh` 里那六处断言在本机一直是哑的 —— 三条错误期望因此活到
+ubuntu 不再被跳过的那天。改成显式 `exit 1` 的 `expect_code`/`expect_body`。
+
 ### 校验失败的 `code: 0` 修掉；`FieldRules` 消息带字段名（**破坏性：是**）
 
 **① `validateRequest` 写出的 422 体里业务码是 `0`，而 `0` 在这个方言里是成功。**
