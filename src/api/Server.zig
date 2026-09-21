@@ -4153,6 +4153,10 @@ test "WebSocket fiber path receives client frames and fires on_close" {
         }
     }.run, .{&server});
     defer th.join();
+    // Before the join (defer is LIFO): a failing assertion must not leave
+    // `start()` blocked in `accept`, because then the join waits forever and the
+    // failure reads as a hang. Same trap as the handshake test below.
+    defer server.stop();
 
     var port: u16 = 0;
     var tries: usize = 0;
@@ -4262,20 +4266,38 @@ fn wsProbe(port: u16, req: []const u8, out: []u8) usize {
     return std.posix.read(stream.socket.handle, out) catch 0;
 }
 
-const WsUpgradeState = struct { connects: usize = 0 };
+/// Counts `on_connect` calls. Atomic because the server runs on its own thread
+/// and the assertions below read it from the test thread.
+/// Wait (bounded) for `on_connect` to have run `want` times, then assert.
+///
+/// The upgrade path writes `101` before it calls the application's `on_connect`,
+/// so a client that has just read the status line can legitimately arrive before
+/// the server thread has incremented the counter. The wait is 2s — far more than
+/// the handshake needs, and short enough that a genuine regression still fails
+/// the test rather than the job.
+fn expectConnects(want: usize) !void {
+    var tries: usize = 0;
+    while (tries < 200) : (tries += 1) {
+        if (ws_upgrade_state.connects.load(.monotonic) == want) return;
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    try std.testing.expectEqual(want, ws_upgrade_state.connects.load(.monotonic));
+}
+
+const WsUpgradeState = struct { connects: std.atomic.Value(usize) = .init(0) };
 var ws_upgrade_state = WsUpgradeState{};
 
 test "WebSocket upgrade: bad handshakes get 400 and no 101, a Connection token list gets 101" {
     const allocator = std.testing.allocator;
     if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
-    ws_upgrade_state = .{};
+    ws_upgrade_state = .{ .connects = .init(0) };
 
     var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0 });
     defer server.deinit();
     var group = server.group("");
     try group.ws("ws", (struct {
         fn connect(_: *Context, _: ?*anyopaque) ?*anyopaque {
-            ws_upgrade_state.connects += 1;
+            _ = ws_upgrade_state.connects.fetchAdd(1, .monotonic);
             return @ptrCast(&ws_upgrade_state);
         }
     }).connect, (struct {
@@ -4290,6 +4312,13 @@ test "WebSocket upgrade: bad handshakes get 400 and no 101, a Connection token l
         }
     }.run, .{&server});
     defer th.join();
+    // Declared *after* the join, so it runs *before* it (defer is LIFO): every
+    // exit from this test — including the `try` assertions below — has to stop
+    // the server first. Without it a failed assertion leaves `start()` blocked
+    // in `accept`, and the deferred `join()` waits forever: an assertion failure
+    // becomes a hang, which is how this test turned a red CI into a 25-minute
+    // timeout instead of a one-line failure.
+    defer server.stop();
 
     var port: u16 = 0;
     var tries: usize = 0;
@@ -4322,13 +4351,18 @@ test "WebSocket upgrade: bad handshakes get 400 and no 101, a Connection token l
 
     // None of those reached the upgrade path: no 101 was written and the
     // application's `on_connect` never ran.
-    try std.testing.expectEqual(@as(usize, 0), ws_upgrade_state.connects);
+    try std.testing.expectEqual(@as(usize, 0), ws_upgrade_state.connects.load(.monotonic));
 
     // The shape browsers actually send — `Connection` is a token list, so an
     // equality check against "Upgrade" would have rejected this.
     n = wsProbe(port, "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n", &resp);
     try std.testing.expect(std.mem.startsWith(u8, resp[0..n], "HTTP/1.1 101"));
-    try std.testing.expectEqual(@as(usize, 1), ws_upgrade_state.connects);
+    // The 101 is written *before* `on_connect` runs, so the count is not
+    // guaranteed to be visible the moment the client has the status line in
+    // hand. Waiting for it turns this into an assertion about the server's
+    // behaviour instead of about which thread the scheduler ran first — on
+    // Linux the old bare read lost that race and failed here.
+    try expectConnects(1);
 
     server.stop();
 }
@@ -4386,6 +4420,9 @@ test "WebSocket fiber path delivers a frame larger than the 4 KiB read buffer" {
         }
     }.run, .{&server});
     defer th.join();
+    // Before the join (defer is LIFO): see the handshake test below — without
+    // this, a failed assertion hangs here instead of failing.
+    defer server.stop();
 
     var port: u16 = 0;
     var tries: usize = 0;
