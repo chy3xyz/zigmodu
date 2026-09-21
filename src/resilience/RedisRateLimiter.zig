@@ -80,7 +80,11 @@ test "RedisRateLimiter allows within limit" {
     const redis_url = if (std.c.getenv("REDIS_URL")) |ptr| std.mem.span(ptr) else null;
     if (redis_url == null or redis_url.?.len == 0) return error.SkipZigTest;
 
-    var r = try redis.Redis.new(allocator, std.testing.io, .{});
+    // Not `Redis.new(allocator, io, .{})`: the defaults connect to
+    // `127.0.0.1:6379` and this test is gated on REDIS_URL being set — using the
+    // URL is what makes the gate mean something (and what lets it run against a
+    // container's published port).
+    var r = try redis.Redis.new(allocator, std.testing.io, redis.RedisConfig.fromUrl(redis_url.?));
     defer r.deinit();
     try r.connect();
 
@@ -107,7 +111,11 @@ test "RedisRateLimiter denies over limit" {
     const redis_url = if (std.c.getenv("REDIS_URL")) |ptr| std.mem.span(ptr) else null;
     if (redis_url == null or redis_url.?.len == 0) return error.SkipZigTest;
 
-    var r = try redis.Redis.new(allocator, std.testing.io, .{});
+    // Not `Redis.new(allocator, io, .{})`: the defaults connect to
+    // `127.0.0.1:6379` and this test is gated on REDIS_URL being set — using the
+    // URL is what makes the gate mean something (and what lets it run against a
+    // container's published port).
+    var r = try redis.Redis.new(allocator, std.testing.io, redis.RedisConfig.fromUrl(redis_url.?));
     defer r.deinit();
     try r.connect();
 

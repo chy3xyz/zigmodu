@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+### 三个 live 测试"查了环境变量却不用它"：NATS 与 Redis 的默认地址根本连不上（**破坏性：否**）
+
+`Test (Redis + NATS + Kafka live)` 那五条红（NATS×3、RedisRateLimiter×2）是同一
+个形状，而且都不是被测代码的问题、也不是"服务不可达"：
+
+1. **默认地址是主机名，而解析器只认字面 IP。** `NatsConfig.url` 默认 `"localhost"`、
+   `RedisConfig.host` 默认 `"localhost"`，而两者的 `connect` 都用
+   `IpAddress.parseIp4` —— 主机名直接 `error.InvalidCharacter`。NATS 的文件头还写着
+   "default: localhost:4222"，也就是**文档里的默认值从来没连上过**，任何主机名都不行。
+   默认值改成 `127.0.0.1`（并在注释里写明：要支持主机名得走 `HostName.connect`）。
+
+2. **测试只检查变量存在，然后拿默认值去连。** `if (REDIS_URL == null) skip;`
+   之后 `Redis.new(allocator, io, .{})` —— 于是 `REDIS_URL` 指向别处会被静默忽略，
+   这些测试实际断言的是"localhost:6379 上有服务"。现在从 URL 取 **host 与 port**
+   （`RedisConfig.fromUrl` / `natsTestConfig`），非默认端口（容器发布的端口）也能跑。
+
+3. **NATS 的 `ping` 只读一次就要求恰好是 `PONG`。** PING/PONG 与消息是按设计交织的：
+   `publish` 之后 `flush()` 时，服务器先送来那条 `MSG`，旧代码读到的是 MSG 的字节却
+   拿它和 `"PONG
+"` 比，于是**在一条健康的连接上**返回 `error.ProtocolError`。
+   现在循环读到 `PONG` 为止，途中的帧交给 `parseMessages` 派发（MSG 与 PONG 可能
+   同一个 chunk），并有 `ping_timeout_ms`（默认 5s）兜底。
+
+验证（真服务，本机）：
+- `REDIS_URL=redis://127.0.0.1:16379 NATS_URL=nats://127.0.0.1:14222
+  bash scripts/test-fast.sh --force-run --db all` → **1565/1578 passed（13 skipped），0 failed**
+  （CI 上是 1559/1576 with 5 failed）。
+- 不带这两个变量：**1557/1578 passed（21 skipped），0 failed** —— 比改动前多 2 条，
+  是新加的两个配置解析单测（`RedisConfig.fromUrl`、`natsTestConfig`）。
+
 ### MySQL 预处理语句在 MariaDB 上崩进程：`MYSQL_FIELD` 的步长比库里的小 8 字节（**破坏性：否**）
 
 `client.query("… WHERE x = ?")` 走预处理语句路径时，CI 的 `Test (DB=mysql)` 一直

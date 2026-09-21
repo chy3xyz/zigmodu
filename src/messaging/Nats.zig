@@ -10,13 +10,21 @@ const Time = @import("../core/Time.zig");
 const sockread = @import("../core/sockread.zig");
 
 pub const NatsConfig = struct {
-    url: []const u8 = "localhost",
+    /// Host of the NATS server. A **literal IPv4** (or IPv6) address: `connect`
+    /// resolves it with `IpAddress.parseIp4` / `.resolve`, neither of which does
+    /// DNS — a host name would have to go through `HostName.connect`. The default
+    /// used to be `"localhost"`, which `parseIp4` rejects with
+    /// `error.InvalidCharacter`, so the documented default could never connect.
+    url: []const u8 = "127.0.0.1",
     port: u16 = 4222,
     token: ?[]const u8 = null,
     username: ?[]const u8 = null,
     password: ?[]const u8 = null,
     name: []const u8 = "zigmodu-nats",
     ping_interval_ms: u64 = 30_000,
+    /// How long `ping` / `flush` waits for the server's `PONG` while it keeps
+    /// dispatching whatever else arrives.
+    ping_timeout_ms: u64 = 5_000,
     max_reconnect_attempts: usize = 10,
 };
 
@@ -375,7 +383,15 @@ pub const NatsClient = struct {
         return try self.parseMessages(buf[0..n]);
     }
 
-    /// Send PING and expect PONG.
+    /// Send PING and wait for PONG.
+    ///
+    /// Reads until a `PONG` line arrives, dispatching whatever else comes in
+    /// through `parseMessages`. "The next read is the PONG" only holds on an
+    /// idle connection, and PING/PONG are *interleaved with traffic by design* —
+    /// the publish-and-subscribe live test failed here with `error.ProtocolError`
+    /// on a healthy connection because the server's `MSG` for the message just
+    /// published arrived first, and the single-read version read those bytes and
+    /// compared them to `"PONG\r\n"`.
     pub fn ping(self: *Self) !void {
         const s = self.stream orelse return error.NotConnected;
         var wbuf: [64]u8 = undefined;
@@ -383,9 +399,31 @@ pub const NatsClient = struct {
         try w.interface.writeAll("PING\r\n");
         try w.interface.flush();
 
-        var rbuf: [128]u8 = undefined;
-        const n = sockread.readSome(s, &rbuf) catch return error.ConnectionError;
-        if (n < 6 or !std.mem.eql(u8, rbuf[0..6], "PONG\r\n")) return error.ProtocolError;
+        const deadline = Time.monotonicNowMilliseconds() + @as(i64, @intCast(self.config.ping_timeout_ms));
+        var rbuf: [8192]u8 = undefined;
+        while (true) {
+            const n = sockread.readSome(s, &rbuf) catch return error.ConnectionError;
+            if (n == 0) return error.ConnectionClosed;
+            const chunk = rbuf[0..n];
+            // Dispatch first: a `MSG` can share the chunk with the `PONG`, and
+            // dropping it here would lose a message the caller still expects.
+            _ = self.parseMessages(chunk) catch |err| {
+                std.log.warn("[Nats] dispatch while waiting for PONG: {s}", .{@errorName(err)});
+            };
+            if (hasLine(chunk, "PONG")) return;
+            if (Time.monotonicNowMilliseconds() >= deadline) return error.Timeout;
+        }
+    }
+
+    /// True when `data` contains a line that is exactly `line` (trailing `\r`
+    /// stripped). NATS terminates protocol lines with CRLF, and several of them can
+    /// share one read.
+    fn hasLine(data: []const u8, comptime line: []const u8) bool {
+        var it = std.mem.splitScalar(u8, data, '\n');
+        while (it.next()) |raw| {
+            if (std.mem.eql(u8, std.mem.trimEnd(u8, raw, "\r"), line)) return true;
+        }
+        return false;
     }
 
     // ── Internal: parse incoming NATS messages and dispatch to callbacks ──
@@ -511,9 +549,50 @@ test "NatsClient init and deinit" {
 
 test "NatsConfig defaults" {
     const cfg = NatsConfig{};
-    try std.testing.expectEqualStrings("localhost", cfg.url);
+    // A literal address, not `"localhost"`: `connect` resolves this with
+    // `IpAddress.parseIp4`, which rejects a host name with
+    // `error.InvalidCharacter` — so the documented default used to be a config
+    // that could not connect. `NatsConfig.url`'s doc comment says what a host
+    // name would take.
+    try std.testing.expectEqualStrings("127.0.0.1", cfg.url);
     try std.testing.expectEqual(@as(u16, 4222), cfg.port);
     try std.testing.expectEqual(@as(usize, 10), cfg.max_reconnect_attempts);
+    // The address the default config describes is parsable, which is the whole
+    // point of the default being a literal.
+    _ = try std.Io.net.IpAddress.parseIp4(cfg.url, cfg.port);
+}
+
+test "natsTestConfig reads host and port from NATS_URL" {
+    const a = natsTestConfig("nats://127.0.0.1:4222");
+    try std.testing.expectEqualStrings("127.0.0.1", a.url);
+    try std.testing.expectEqual(@as(u16, 4222), a.port);
+    // Non-default port (a container's published port is the case that matters).
+    const b = natsTestConfig("nats://10.1.2.3:14222");
+    try std.testing.expectEqualStrings("10.1.2.3", b.url);
+    try std.testing.expectEqual(@as(u16, 14222), b.port);
+    // Bare host, no scheme and no port: the config default port survives.
+    const c = natsTestConfig("192.168.1.9");
+    try std.testing.expectEqualStrings("192.168.1.9", c.url);
+    try std.testing.expectEqual(@as(u16, 4222), c.port);
+}
+
+/// `NATS_URL` (`nats://127.0.0.1:4222`) as a config. The three live tests used to
+/// only *check* that the variable was set and then connect with the defaults —
+/// so a `NATS_URL` pointing somewhere else was silently ignored, and the tests
+/// were really asserting "there is a NATS server on localhost:4222". The host and
+/// the port are both taken from the URL now; `nats.zig`'s client resolves a
+/// literal address, so the scheme is dropped here (the same shape
+/// `redis.zig`'s live test uses).
+fn natsTestConfig(url: []const u8) NatsConfig {
+    const after_scheme = if (std.mem.indexOf(u8, url, "://")) |i| url[i + 3 ..] else url;
+    const host_end = std.mem.indexOfScalar(u8, after_scheme, ':') orelse after_scheme.len;
+    const host = after_scheme[0..host_end];
+    var cfg = NatsConfig{};
+    if (host.len > 0) cfg.url = host;
+    if (host_end < after_scheme.len) {
+        cfg.port = std.fmt.parseInt(u16, after_scheme[host_end + 1 ..], 10) catch cfg.port;
+    }
+    return cfg;
 }
 
 test "NATS connect and ping" {
@@ -522,7 +601,7 @@ test "NATS connect and ping" {
     if (nats_url == null or nats_url.?.len == 0) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
-    var client = NatsClient.init(allocator, std.testing.io, .{});
+    var client = NatsClient.init(allocator, std.testing.io, natsTestConfig(nats_url.?));
     defer client.deinit();
 
     const info = try client.connect();
@@ -540,7 +619,7 @@ test "NATS publish and subscribe" {
     if (nats_url == null or nats_url.?.len == 0) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
-    var client = NatsClient.init(allocator, std.testing.io, .{});
+    var client = NatsClient.init(allocator, std.testing.io, natsTestConfig(nats_url.?));
     defer client.deinit();
 
     _ = try client.connect();
@@ -566,7 +645,7 @@ test "NATS request-reply" {
     if (nats_url == null or nats_url.?.len == 0) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
-    var client = NatsClient.init(allocator, std.testing.io, .{});
+    var client = NatsClient.init(allocator, std.testing.io, natsTestConfig(nats_url.?));
     defer client.deinit();
 
     _ = try client.connect();

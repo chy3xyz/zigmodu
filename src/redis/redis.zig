@@ -140,13 +140,41 @@ fn writeCmd(stream: *const std.Io.net.Stream, io: std.Io, cmd: []const u8) error
 
 /// Redis configuration
 pub const RedisConfig = struct {
-    host: []const u8 = "localhost",
+    /// Literal IPv4 (or IPv6) address: `connect` resolves it with
+    /// `IpAddress.parseIp4`, which does no DNS. The default used to be
+    /// `"localhost"`, which that parser rejects with `error.InvalidCharacter` —
+    /// so the default config could never connect, and the three live tests
+    /// (which only checked that `REDIS_URL` was *set*, then connected with these
+    /// defaults) failed with `error.RedisError` against a perfectly healthy
+    /// server. `fromUrl` is what turns a `REDIS_URL` into this.
+    host: []const u8 = "127.0.0.1",
     port: u16 = 6379,
     password: ?[]const u8 = null,
     db: u32 = 0,
     pool_size: u32 = 100,
     read_timeout_ms: u32 = 3000,
     write_timeout_ms: u32 = 3000,
+
+    /// Config from a URL-shaped address (`redis://127.0.0.1:6379`, the shape
+    /// `REDIS_URL` carries). Scheme, `user:password@` and any path are dropped;
+    /// host and port are taken from what is left.
+    pub fn fromUrl(url: []const u8) RedisConfig {
+        var rest = url;
+        if (std.mem.indexOf(u8, rest, "://")) |i| rest = rest[i + 3 ..];
+        if (std.mem.lastIndexOfScalar(u8, rest, '@')) |i| rest = rest[i + 1 ..];
+        if (std.mem.indexOfAny(u8, rest, "/?#")) |i| rest = rest[0..i];
+
+        var cfg = RedisConfig{};
+        if (std.mem.lastIndexOfScalar(u8, rest, ':')) |i| {
+            // Inside brackets is an IPv6 literal, not a port.
+            if (std.mem.indexOfScalar(u8, rest, '[') == null) {
+                cfg.port = std.fmt.parseInt(u16, rest[i + 1 ..], 10) catch cfg.port;
+                rest = rest[0..i];
+            }
+        }
+        if (rest.len > 0) cfg.host = rest;
+        return cfg;
+    }
 };
 
 /// Redis client for zigzero
@@ -969,18 +997,42 @@ pub const Lock = struct {
 
 // ==== §5  Tests ====
 
+test "RedisConfig.fromUrl reads host and port from REDIS_URL" {
+    const a = RedisConfig.fromUrl("redis://127.0.0.1:6379");
+    try std.testing.expectEqualStrings("127.0.0.1", a.host);
+    try std.testing.expectEqual(@as(u16, 6379), a.port);
+
+    // A container's published port is the case this exists for: the tests are
+    // gated on REDIS_URL, and taking only the host would silently ignore it.
+    const b = RedisConfig.fromUrl("redis://10.1.2.3:16379");
+    try std.testing.expectEqualStrings("10.1.2.3", b.host);
+    try std.testing.expectEqual(@as(u16, 16379), b.port);
+
+    // Credentials and a path do not end up in the host.
+    const c = RedisConfig.fromUrl("redis://user:pass@192.168.1.9:6380/3");
+    try std.testing.expectEqualStrings("192.168.1.9", c.host);
+    try std.testing.expectEqual(@as(u16, 6380), c.port);
+
+    // Bare address: the default port survives.
+    const d = RedisConfig.fromUrl("192.168.1.9");
+    try std.testing.expectEqualStrings("192.168.1.9", d.host);
+    try std.testing.expectEqual(@as(u16, 6379), d.port);
+
+    // The default config describes an address the parser accepts — the whole
+    // reason it is a literal and not "localhost".
+    const e = RedisConfig{};
+    _ = try std.Io.net.IpAddress.parseIp4(e.host, e.port);
+}
+
 test "redis client" {
     // Requires a running Redis server; set REDIS_URL to enable (e.g. redis://127.0.0.1:6379).
     const redis_url = if (builtin.os.tag == .windows) @as(?[]const u8, null) else if (std.c.getenv("REDIS_URL")) |ptr| std.mem.span(ptr) else null;
     if (redis_url == null or redis_url.?.len == 0) return error.SkipZigTest;
 
-    // parseIp4 only accepts literal IPv4, so derive the host from REDIS_URL
-    // (e.g. redis://192.168.107.3:6379 -> 192.168.107.3).
-    const raw = redis_url.?;
-    const after_scheme = if (std.mem.startsWith(u8, raw, "redis://")) raw["redis://".len..] else raw;
-    const host = if (std.mem.indexOfScalar(u8, after_scheme, ':')) |i| after_scheme[0..i] else after_scheme;
-
-    const cfg = RedisConfig{ .host = host };
+    // Host *and port* come from REDIS_URL: the client resolves a literal
+    // address (`RedisConfig.host`), and taking only the host would silently
+    // ignore a non-default port.
+    const cfg = RedisConfig.fromUrl(redis_url.?);
     var redis = try Redis.new(std.testing.allocator, std.testing.io, cfg);
     defer redis.deinit();
 
