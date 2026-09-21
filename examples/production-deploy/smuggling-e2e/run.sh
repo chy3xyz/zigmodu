@@ -154,11 +154,17 @@ echo "   response: HTTP $te_status"
 # --- gateway -----------------------------------------------------------------
 
 echo "== start gateway ($NGINX_IMAGE) =="
+# The conf is rendered here, not mounted from the repo: the upstream port has to
+# be `APP_PORT`, and a conf mounted at `conf.d/` is used verbatim by nginx (no
+# env expansion, and the image's `envsubst-on-templates` only looks at
+# `/etc/nginx/templates`). Mounting the template directly is how the first CI
+# run proxied to the default 18080 while the probe listened on 18180.
+sed "s/@APP_PORT@/${APP_PORT}/g" "$HERE/nginx.conf.template" >"$WORK/nginx.conf"
 docker run -d --name "$NGINX_NAME" \
     --add-host=host.docker.internal:host-gateway \
     -p "$GW_BUFFERED_PORT:18081" \
     -p "$GW_STREAM_PORT:18082" \
-    -v "$HERE/nginx.conf:/etc/nginx/conf.d/default.conf:ro" \
+    -v "$WORK/nginx.conf:/etc/nginx/conf.d/default.conf:ro" \
     "$NGINX_IMAGE" >/dev/null
 
 gw_ready=0

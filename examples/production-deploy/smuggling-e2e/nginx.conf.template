@@ -15,6 +15,14 @@
 # gateway forwarded against what the backend says it served. A request the
 # backend served but the gateway never forwarded **is** a smuggling primitive,
 # by definition — that comparison, not the raw response bytes, is the assertion.
+#
+# `@APP_PORT@` is substituted by `run.sh` into a rendered copy under its temp
+# dir and *that* is what gets mounted. Deliberately not `${APP_PORT}`: nginx
+# does not expand environment variables, and the official image's
+# `envsubst-on-templates` only reaches `/etc/nginx/templates` — a conf mounted
+# at `conf.d/` is used verbatim. Hardcoding the port here is what made the first
+# CI run fail with `connect() failed (111: Connection refused)` to
+# `172.17.0.1:18080` while the probe was listening on 18180.
 
 log_format smug '$request_method $request_uri';
 
@@ -23,7 +31,7 @@ server {
     access_log /dev/stdout smug;
 
     location / {
-        proxy_pass http://host.docker.internal:18080;
+        proxy_pass http://host.docker.internal:@APP_PORT@;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header Connection "";
@@ -37,7 +45,7 @@ server {
     access_log /dev/stdout smug;
 
     location / {
-        proxy_pass http://host.docker.internal:18080;
+        proxy_pass http://host.docker.internal:@APP_PORT@;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header Connection "";

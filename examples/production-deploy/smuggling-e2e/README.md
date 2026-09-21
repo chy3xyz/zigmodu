@@ -14,6 +14,12 @@ cd examples/production-deploy/smuggling-e2e
 
 需要：docker（守护进程在跑）、python3、Zig 工具链。
 
+端口：`APP_PORT`（探针，默认 18080）/ `GW_BUFFERED_PORT`（默认 18081）/
+`GW_STREAM_PORT`（默认 18082）。`nginx.conf.template` 里的上游端口用 `@APP_PORT@`
+占位，`run.sh` 渲染一份到临时目录再挂进去 —— nginx 不展开环境变量，而挂在
+`conf.d/` 的配置是逐字节使用的，所以**不能**直接挂模板（第一次跑 CI 就是这么
+"连不上 18080"的：探针在 18180，nginx 转发到 18080）。
+
 ## 断言是什么
 
 不是"响应看起来对"，而是：

@@ -31,6 +31,7 @@ client ─┤  网关/边车  ├──────────────►�
 | 文件 | 用途 |
 |------|------|
 | `nginx.conf` | nginx 作为 TLS 终结 + h2c 反代（含超时、限连、健康检查） |
+| `smuggling-e2e/` | CL/TE 请求走私的真实拓扑用例（nginx 在前 + 探针；`bash smuggling-e2e/run.sh`） |
 | `envoy.yaml` | Envoy 版本（ALPN h2、`/health` 探针、上游健康检查） |
 | `docker-compose.yml` | 本地跑通「nginx + 两个后端副本」的最小拓扑 |
 | `k8s.yaml` | Deployment/Service/探针/Prometheus 注解 + HPA 片段 |
