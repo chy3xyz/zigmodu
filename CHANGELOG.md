@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.33.0] - 2026-09-21
 
 ### 监听 socket 关不醒 `accept`：四个 `stop()` 在 Linux 上不返回（**破坏性：否**，行为修复）
 

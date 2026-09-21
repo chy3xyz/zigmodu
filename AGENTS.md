@@ -401,7 +401,7 @@ filter 是**测试全限定名的子串**（形如 `core.cluster.RaftElection.te
 > 逐个失败会否掉所有正常的聚焦运行）；判定权在脚本的汇总。旧脚本 `bash scripts/test-fast.sh <name>` 的裸参数形式仍可用。
 
 ## Version
-- Framework: **v0.32.0** (`build.zig.zon`)
+- Framework: **v0.33.0** (`build.zig.zon`)
 - Zig: **0.17.0-dev.1970+67f39b551**（CI 同款锁定版本，见 `.github/workflows/ci.yml` → `ZIG_VERSION`；避免 fmt 行为漂移。注意 ziglang 镜像会回收旧 dev 构建——dev.1567 已 404，升级时本地先验证再改 CI）
 - Tests: **以 `zig build test` 输出为准**（`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`）。
   本文件不再抄写具体数字：`-Ddb` 收窄、平台（Linux/macOS）、门控用例都会改变计数，
@@ -437,11 +437,11 @@ filter 是**测试全限定名的子串**（形如 `core.cluster.RaftElection.te
 
 ## Learned Workspace Facts
 
-- Package **v0.32.0** · Zig **0.17.0** · GitHub `chy3xyz/zigmodu` · branch `master`.
+- Package **v0.33.0** · Zig **0.17.0** · GitHub `chy3xyz/zigmodu` · branch `master`.
 - Sandbox cache：`ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test`.
 - Auth Path A + `CatalogPermLoadInput` 已落地；legacy JWT 只写 `auth_info`。
 - x402 fail-closed；OTLP/Vault 已支持 HTTPS（系统 CA）。
-- zent **v0.67.0**（示例按此验证）与 `data.sqlx` 正交，勿混驱动/共享事务（`docs/ZENT.md`）。v0.54 起 `CrudService.create(entity, tenant_id)` 为双参（租户是形参，不再从实体读）；v0.66 起空 `dept_ids` 拒绝而非放行、无谓词 `BulkDelete` 报 `NoPredicate`；v0.67 起无 `last_insert_id` 报 `MissingLastInsertId`、MySQL 批量改逐行；v0.57 起 MySQL 的 `String`/`Enum` 落 `VARCHAR(255)`；v0.58–0.59 `driver.Error` 新增 `ParamCountMismatch`/`PoolWaitTimeout`（**无 `else` 的穷尽 switch 会编译失败**）。**两条升级陷阱**：① `client.<entity>.deinitRow(&e)` 只适用于驱动扫描出来的行——`CrudService.get` 返回的是 `ownedCopy(ctx.allocator, …)`，交给它会分配器不匹配并打死进程（实测 `free of invalid memory`）；② 改 pin 后先 `rm -rf .zig-cache`，增量缓存会沿用旧 fetch 模块（实测"编译通过"却仍跑旧版本）。v0.32.3 起 sqlite 单连接串行化（`Rows` 持锁至 `deinit()`）；v0.33.0 起 `UseInterceptor` 覆盖 Create/BulkInsert（create 上 `whereEq` = 缺省才填）；v0.35.0 起 outbox 认领式派发（崩溃遗留用 `requeueStale` 回收）；v0.36.0 起迁移默认加锁、outbox 新增 `claimed_at` 列、`createAllTables` 增加 allocator 参数；v0.37.0 起 `max_wait_ms` 真正阻塞等待、嵌套预加载每层一次查询；v0.38.0 起 `queryTargets*` fail-closed（旧语义改名 `*Unscoped`），新增 NULL 容忍扫描器；v0.39.0 起 `zent.scope` 让手写 SQL 也能带上软删/隐私/拦截器契约（**裸 SQL 不再自动隔离，必须接 scope**），并有 `<col>Like` 与 `zent.version`；v0.40.0 起一行式释放 `deinitRows`/`deinitRow`/`deinitEdgeRows`，v0.41.0 明确 `crud_helpers.queryRows` 也是需要 `zent.scope` 的裸路径，v0.41.1 修复 `deinitRows` 指针形态回归。
+- zent **v0.74.2**（示例按此验证）与 `data.sqlx` 正交，勿混驱动/共享事务（`docs/ZENT.md`）。v0.54 起 `CrudService.create(entity, tenant_id)` 为双参（租户是形参，不再从实体读）；v0.66 起空 `dept_ids` 拒绝而非放行、无谓词 `BulkDelete` 报 `NoPredicate`；v0.67 起无 `last_insert_id` 报 `MissingLastInsertId`、MySQL 批量改逐行；v0.57 起 MySQL 的 `String`/`Enum` 落 `VARCHAR(255)`；v0.58–0.59 `driver.Error` 新增 `ParamCountMismatch`/`PoolWaitTimeout`（**无 `else` 的穷尽 switch 会编译失败**）。**两条升级陷阱**：① `client.<entity>.deinitRow(&e)` 只适用于驱动扫描出来的行——`CrudService.getOwned`（zent 0.73 改名，旧名 `get`）返回的是 `ownedCopy(ctx.allocator, …)`，这类行的释放是 `deinitRowWith(allocator, &e)`；交给 `deinitRow` 会分配器不匹配并打死进程（实测 `free of invalid memory`），`zmodu audit` 的 b23 规则拦这一类；② 改 pin 后先 `rm -rf .zig-cache`，增量缓存会沿用旧 fetch 模块（实测"编译通过"却仍跑旧版本）。v0.32.3 起 sqlite 单连接串行化（`Rows` 持锁至 `deinit()`）；v0.33.0 起 `UseInterceptor` 覆盖 Create/BulkInsert（create 上 `whereEq` = 缺省才填）；v0.35.0 起 outbox 认领式派发（崩溃遗留用 `requeueStale` 回收）；v0.36.0 起迁移默认加锁、outbox 新增 `claimed_at` 列、`createAllTables` 增加 allocator 参数；v0.37.0 起 `max_wait_ms` 真正阻塞等待、嵌套预加载每层一次查询；v0.38.0 起 `queryTargets*` fail-closed（旧语义改名 `*Unscoped`），新增 NULL 容忍扫描器；v0.39.0 起 `zent.scope` 让手写 SQL 也能带上软删/隐私/拦截器契约（**裸 SQL 不再自动隔离，必须接 scope**），并有 `<col>Like` 与 `zent.version`；v0.40.0 起一行式释放 `deinitRows`/`deinitRow`/`deinitEdgeRows`，v0.41.0 明确 `crud_helpers.queryRows` 也是需要 `zent.scope` 的裸路径，v0.41.1 修复 `deinitRows` 指针形态回归。
 - SQLx 选择性链接：`-Ddb=` / `.db=`，默认 `all`；框架测试勿收窄；见 `docs/SQLX_DRIVERS.md`。
 - WS：`WsMessageFn` 含 `WsFrameKind`；fiber/io_uring 分发 text+binary（OpenIM protobuf OK）。
 - CI：`bash scripts/ci-integration.sh`（tenant-mgmt + stress + shopdemo，`-Ddb=sqlite`）。
