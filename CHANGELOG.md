@@ -2,6 +2,45 @@
 
 ## [Unreleased]
 
+### 校验失败的 `code: 0` 修掉；`FieldRules` 消息带字段名（**破坏性：是**）
+
+**① `validateRequest` 写出的 422 体里业务码是 `0`，而 `0` 在这个方言里是成功。**
+`api/middleware/Validation.zig` 原来是 `ctx.sendErrorResponse(422, 0, msg)`：`{code,msg,data}`
+信封里 `code: 0` 正是 `sendSuccess` 写的值，所以"先判 `code` 再判 HTTP 状态"的客户端
+把一次**拒绝**读成了**成功**。现在业务码是配置项、默认 `4220`、且**配不成 0**
+（`Validation.errorCode()` 把 0 换成默认值——"把 0 配回来"就是把这个 bug 配回来）：
+
+```zig
+try validateRequest(ctx, req, rules);                          // 4220
+var v = Validation{}; v.error_code = 4711;  try v.validateRequest(ctx, req, rules);
+try Validation.withErrorCode(4711).validateRequest(ctx, req, rules);
+```
+
+HTTP 状态仍是 422；信封形状与 RFC 7807 渲染器行为都没动。
+
+**② `Validator.FieldRules` 的消息现在带字段名，并可逐字段覆盖。**
+默认消息从 `field 'email' invalid email format` 变成 `email: invalid email format`
+（多字段请求体下不点名就修不了）；`FieldRules.message` **逐字替换**整条消息
+（不加字段名前缀），覆盖该字段上任何一条规则。`validateStruct` 的返回形状没变
+（仍是 `!?[]const u8`，调用方负责 free），所以没有连带的签名变更。
+
+**刻意没做**（留给后续评审）：结构化 `{field, rule, message}` 错误对象、i18n 钩子。
+
+### 生成 OpenAPI 的三个文档注解 + 两个"带了却没输出"的字段（**破坏性：否**）
+
+`RouteMeta` 新增 `summary` / `description` / `request_body`（`?[]const u8`，纯附加），
+`exportOpenApi` 的回落链是 `summary → permission → module`、`description → 按 auth 种类的词`、
+`request_body → 不输出`。**未标注时输出与从前逐字节一致**（用例里冻结了一份 golden；
+改动前后对同一份"全未标注"目录各生成一次，md5 相同、`diff` 为空）。
+
+同时修掉两处"字段存在但从不输出"：
+- `ApiParam.description` 在 `generate()` 里被丢掉 —— 参数的结构体一直带着它
+  （`deinit` 还负责 free），生成的文档里却从来看不到；现在非空才输出，空描述不产生键。
+- `ApiEndpoint.request_body` 在 `cloneEndpoint` 里根本没被复制，所以 `addEndpoint`
+  之后 `generate()` 永远看不到它 —— `ApiEndpoint` 有这个槽位，但发射器从来没写过
+  `requestBody`。现在补上最小的一份（`content.<content_type>.schema`；以 `{`/`[` 开头的值
+  原样内联，否则包成 `{ "$ref": … }`）。
+
 ### 总线事件序列化现在会转义（§14 收尾）（**破坏性：是**）
 
 `serializeEvent` 用一个 `std.fmt` 格式串把 payload **原样**插进 JSON，所以 payload 里带一个 `"`

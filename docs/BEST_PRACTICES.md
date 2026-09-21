@@ -1397,6 +1397,22 @@ zigmodu.http.useRfc7807Errors();
 - **未捕获的 500 抓不到就别去抓。** 它发生在中间件链之外，只能由进程级渲染器统一 —— 这也是钩子设计成进程级而非路由级的原因。
 - **渲染器签名不含业务 code。** `sendErrorResponse(status, code, msg)` 在装了渲染器后 `code` 会被丢弃（RFC 7807 没有业务码位）；需要两者兼得就用 `ctx.sendErrorEnvelope`。
 
+#### 校验失败：`422` + **非 0** 业务码
+
+`http.validateRequest(ctx, req, rules)`（`src/api/middleware/Validation.zig`）失败时写
+`422 {"code":4220,"msg":"email: invalid email format","data":null}`。两点是刻意的：
+
+- **业务码不是 0，而且配不成 0。** `{code,msg,data}` 方言里 `0` 是**成功**（`sendSuccess` 写的就是 0），
+  先看 `code` 再看 HTTP 状态的客户端会把 `422 + code:0` 读成成功 —— 旧实现正是 `sendErrorResponse(422, 0, msg)`。
+  默认 `default_error_code = 4220`；改法 `Validation{ .error_code = 4711 }` 或 `Validation.withErrorCode(4711)`；
+  传 `0` 会被 `Validation.errorCode()` 换成默认值 —— "把 0 配回来"等于把那个 bug 配回来。HTTP 状态始终 422。
+- **消息带字段名。** 默认消息是 `<字段>: <规则说明>`（`FieldRules` 由多个字段组成时，"invalid email format"
+  不说清是哪个字段就没法修）。单个字段自定义文案：`FieldRules{ .email = true, .message = "邮箱格式不正确" }`，
+  `message` **逐字替换**整条消息（不加字段名前缀），覆盖该字段上的任何一条规则。
+
+> 还没做的（刻意留到后续评审）：结构化的 `{field, rule, message}` 错误对象、i18n 钩子。
+> 现在只是"字段名进消息 + 逐字段文案覆盖"这一档。
+
 > 自查：`grep -rn 'application/json' src/api/middleware/` 不该出现自造信封；
 > `scripts/check-production.sh` 会拦"信封泄漏"（`sendSuccess`/`sendFail`/裸 `{"code":`）。
 

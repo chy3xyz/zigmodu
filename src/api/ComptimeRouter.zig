@@ -50,6 +50,17 @@ pub const RouteMeta = struct {
     roles: ?[]const u8 = null,
     /// ModuleGate name; null → module's `module_name`.
     module: ?[]const u8 = null,
+    /// Human-readable one-liner for the generated OpenAPI `summary`. Falls back to
+    /// `permission`, then `module`, so an un-annotated route keeps today's output.
+    summary: ?[]const u8 = null,
+    /// Longer prose for OpenAPI `description`. Falls back to today's per-auth-kind
+    /// string (`jwt` / `public` / `websocket` / `text/event-stream (SSE)`), which is
+    /// not prose at all — set this when the document is for a consumer.
+    description: ?[]const u8 = null,
+    /// Request body as a JSON-schema **string** (no new types: `?[]const u8`).
+    /// Emitted as the operation's request-body schema when present; absent →
+    /// no `requestBody` at all, so un-annotated output is unchanged.
+    request_body: ?[]const u8 = null,
     /// When true, route is Server-Sent Events (`Accept: text/event-stream`). Handler should call `http.sse(ctx)`.
     sse: bool = false,
     /// Extra OpenAPI params (typically from `http.openApiParamsFromStruct(QueryDto, .query)`).
@@ -115,6 +126,10 @@ pub const CatalogEntry = struct {
     permission: ?[]const u8 = null,
     /// Portal / coarse role gate from `RouteMeta.roles` (`|` = OR).
     roles: ?[]const u8 = null,
+    /// Borrowed OpenAPI annotations from RouteMeta (static / comptime strings).
+    summary: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    request_body: ?[]const u8 = null,
     is_ws: bool = false,
     is_sse: bool = false,
     /// Borrowed comptime/static OpenAPI params from RouteMeta.
@@ -255,8 +270,10 @@ pub const RouteCatalog = struct {
                 break :blk path_storage[0 .. e.path.len + 1];
             };
 
-            const summary = e.permission orelse e.module;
-            const desc: []const u8 = if (e.is_ws)
+            const summary = e.summary orelse e.permission orelse e.module;
+            const desc: []const u8 = if (e.description) |d|
+                d
+            else if (e.is_ws)
                 "websocket"
             else if (e.is_sse)
                 "text/event-stream (SSE)"
@@ -272,6 +289,11 @@ pub const RouteCatalog = struct {
                 resp_buf[1] = .{ .status_code = 401, .description = "Unauthorized" };
                 resp_count = 2;
             }
+            // `RouteMeta.request_body` is the schema itself; `RequestBody.schema_ref`
+            // emits a value starting with `{` verbatim (see OpenApi.RequestBody).
+            const req_body: ?OpenApi.RequestBody = if (e.request_body) |schema| .{
+                .schema_ref = schema,
+            } else null;
             try gen.addEndpoint(.{
                 .method = method,
                 .path = oapi_path,
@@ -279,6 +301,7 @@ pub const RouteCatalog = struct {
                 .description = desc,
                 .tags = &.{e.module},
                 .params = params_buf[0..param_count],
+                .request_body = req_body,
                 .requires_auth = e.auth != .public,
                 .responses = resp_buf[0..resp_count],
             });
@@ -684,6 +707,9 @@ pub fn Scoped(comptime AppState: type) type {
                     .module = module,
                     .permission = spec.meta.permission,
                     .roles = spec.meta.roles,
+                    .summary = spec.meta.summary,
+                    .description = spec.meta.description,
+                    .request_body = spec.meta.request_body,
                     .is_ws = false,
                     .is_sse = spec.meta.sse,
                     .openapi_params = spec.meta.openapi_params,
@@ -705,6 +731,9 @@ pub fn Scoped(comptime AppState: type) type {
                         .module = module,
                         .permission = spec.meta.permission,
                         .roles = spec.meta.roles,
+                        .summary = spec.meta.summary,
+                        .description = spec.meta.description,
+                        .request_body = spec.meta.request_body,
                         .is_ws = false,
                         .is_sse = true,
                         .openapi_params = spec.meta.openapi_params,
@@ -768,6 +797,8 @@ pub fn Scoped(comptime AppState: type) type {
                         .path = full,
                         .auth = auth,
                         .module = module,
+                        .summary = spec.meta.summary,
+                        .description = spec.meta.description,
                         .permission = spec.meta.permission,
                         .roles = spec.meta.roles,
                         .is_ws = true,
@@ -1102,4 +1133,285 @@ test "wrapHandler captures each handler independently (no shared store)" {
     try std.testing.expectEqual(@as(u8, 2), S.called);
     try a1(undefined, &state);
     try std.testing.expectEqual(@as(u8, 1), S.called);
+}
+
+test "catalog exportOpenApi: RouteMeta annotations replace the permission/auth fallbacks" {
+    const alloc = std.testing.allocator;
+    var entries = try alloc.alloc(CatalogEntry, 1);
+    entries[0] = .{
+        .method = .POST,
+        .path = try alloc.dupe(u8, "api/v1/users"),
+        .auth = .jwt,
+        .module = "user",
+        .permission = "user:create",
+        .summary = "Create a user",
+        .description = "Creates a user in the caller's tenant.",
+        .request_body = "{\"type\":\"object\",\"required\":[\"email\"]}",
+    };
+    var catalog = RouteCatalog{ .allocator = alloc, .entries = entries };
+    defer catalog.deinit();
+
+    var gen = OpenApi.OpenApiGenerator.init(alloc, "t", "1", "d");
+    defer gen.deinit();
+    try catalog.exportOpenApi(&gen);
+    const json = try gen.generate();
+    defer alloc.free(json);
+
+    // summary: the annotation wins over the permission code, which used to be
+    // the summary for every gated route.
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"summary\": \"Create a user\""));
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"summary\": \"user:create\"") == null);
+    // description: the prose wins over the auth-kind word.
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"description\": \"Creates a user in the caller's tenant.\""));
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"description\": \"jwt\"") == null);
+    // request body: the schema string is emitted verbatim.
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"requestBody\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"content\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"schema\": {\"type\":\"object\",\"required\":[\"email\"]}"));
+}
+
+test "catalog exportOpenApi: a public route's description is no longer the auth word when set" {
+    const alloc = std.testing.allocator;
+    var entries = try alloc.alloc(CatalogEntry, 1);
+    entries[0] = .{
+        .method = .GET,
+        .path = try alloc.dupe(u8, "health"),
+        .auth = .public,
+        .module = "system",
+        .description = "Liveness probe.",
+    };
+    var catalog = RouteCatalog{ .allocator = alloc, .entries = entries };
+    defer catalog.deinit();
+
+    var gen = OpenApi.OpenApiGenerator.init(alloc, "t", "1", "d");
+    defer gen.deinit();
+    try catalog.exportOpenApi(&gen);
+    const json = try gen.generate();
+    defer alloc.free(json);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"description\": \"Liveness probe.\""));
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"description\": \"public\"") == null);
+    // The un-annotated public route still says "public".
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"summary\": \"system\""));
+}
+
+test "catalog exportOpenApi: ApiParam.description reaches the parameter object" {
+    const alloc = std.testing.allocator;
+    var entries = try alloc.alloc(CatalogEntry, 1);
+    entries[0] = .{
+        .method = .GET,
+        .path = try alloc.dupe(u8, "api/v1/users/{id}"),
+        .auth = .jwt,
+        .module = "user",
+        .openapi_params = &.{
+            .{ .name = "fields", .location = .query, .param_type = "string", .description = "Fields to return" },
+            .{ .name = "verbose", .location = .query, .param_type = "boolean" },
+        },
+    };
+    var catalog = RouteCatalog{ .allocator = alloc, .entries = entries };
+    defer catalog.deinit();
+
+    var gen = OpenApi.OpenApiGenerator.init(alloc, "t", "1", "d");
+    defer gen.deinit();
+    try catalog.exportOpenApi(&gen);
+    const json = try gen.generate();
+    defer alloc.free(json);
+
+    // Was dropped on the floor before: the struct carried a description, the
+    // emitter never wrote it out.
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        json,
+        1,
+        "{ \"name\": \"fields\", \"in\": \"query\", \"required\": false, \"schema\": { \"type\": \"string\" }, \"description\": \"Fields to return\" }",
+    ));
+    // An empty description emits no key at all (that is what keeps un-annotated
+    // parameter bytes unchanged).
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        json,
+        1,
+        "{ \"name\": \"verbose\", \"in\": \"query\", \"required\": false, \"schema\": { \"type\": \"boolean\" } }",
+    ));
+}
+
+test "mount carries RouteMeta openapi annotations into the catalog" {
+    const AppState = struct {};
+    const DocMod = struct {
+        pub const module_name = "doc";
+        pub const nest = .{"doc"};
+        pub const State = struct {};
+        fn list(_: *Context, _: *State) !void {}
+        fn create(_: *Context, _: *State) !void {}
+        pub const routes = [_]RouteSpec(State){
+            .{ .method = .GET, .path = "items", .handler = list, .meta = .{ .auth = .jwt, .summary = "List items" } },
+            .{ .method = .POST, .path = "items", .handler = create, .meta = .{
+                .auth = .jwt,
+                .description = "Create one item.",
+                .request_body = "{\"type\":\"object\"}",
+            } },
+        };
+    };
+    var st = DocMod.State{};
+    var app: AppState = .{};
+
+    var server = Server.initWithConfig(std.testing.io, std.testing.allocator, .{ .port = 18102 });
+    defer server.deinit();
+    var router = Router(AppState).init(std.testing.io, std.testing.allocator, &server, &app);
+    defer router.deinit();
+    var scope = router.scope("/api");
+    try scope.mount(DocMod, &st);
+    var catalog = try router.finish();
+    defer catalog.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), catalog.entries.len);
+    try std.testing.expectEqualStrings("List items", catalog.entries[0].summary.?);
+    try std.testing.expect(catalog.entries[0].description == null);
+    try std.testing.expectEqualStrings("Create one item.", catalog.entries[1].description.?);
+    try std.testing.expectEqualStrings("{\"type\":\"object\"}", catalog.entries[1].request_body.?);
+
+    var gen = OpenApi.OpenApiGenerator.init(std.testing.allocator, "t", "1", "d");
+    defer gen.deinit();
+    try catalog.exportOpenApi(&gen);
+    const json = try gen.generate();
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"summary\": \"List items\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"requestBody\""));
+}
+
+/// The bytes `exportOpenApi` produced before `RouteMeta.summary` / `.description`
+/// / `.request_body` existed, for a catalog where none of them is set. Frozen on
+/// purpose: the fallbacks (`permission` → `module`, the per-auth-kind word, no
+/// request body at all) must stay output-identical for un-annotated routes.
+const unannotated_openapi_golden =
+    \\{
+    \\  "openapi": "3.0.3",
+    \\  "info": {
+    \\    "title": "t",
+    \\    "version": "1",
+    \\    "description": "d"
+    \\  },
+    \\  "servers": [
+    \\    { "url": "/" }
+    \\  ],
+    \\  "tags": [
+    \\    { "name": "user" },
+    \\    { "name": "system" },
+    \\    { "name": "im" },
+    \\    { "name": "order" },
+    \\    { "name": "opt" }
+    \\  ],
+    \\  "paths": {
+    \\    "/api/v1/users/{id}": {
+    \\      "get": {
+    \\        "summary": "user:view",
+    \\        "description": "jwt",
+    \\        "tags": ["user"],
+    \\        "parameters": [
+    \\          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+    \\          { "name": "fields", "in": "query", "required": false, "schema": { "type": "string" } },
+    \\          { "name": "X-Trace", "in": "header", "required": true, "schema": { "type": "string" } }
+    \\        ],
+    \\        "security": [ { "bearerAuth": [] } ],
+    \\        "responses": {
+    \\          "200": { "description": "OK" },
+    \\          "401": { "description": "Unauthorized" }
+    \\        }
+    \\      }
+    \\    },
+    \\    "/health": {
+    \\      "get": {
+    \\        "summary": "system",
+    \\        "description": "public",
+    \\        "tags": ["system"],
+    \\        "responses": {
+    \\          "200": { "description": "OK" }
+    \\        }
+    \\      }
+    \\    },
+    \\    "/im/ws": {
+    \\      "get": {
+    \\        "summary": "im",
+    \\        "description": "websocket",
+    \\        "tags": ["im"],
+    \\        "responses": {
+    \\          "200": { "description": "Switching Protocols" }
+    \\        }
+    \\      }
+    \\    },
+    \\    "/optional/ping": {
+    \\      "get": {
+    \\        "summary": "opt",
+    \\        "description": "jwt",
+    \\        "tags": ["opt"],
+    \\        "security": [ { "bearerAuth": [] } ],
+    \\        "responses": {
+    \\          "200": { "description": "OK" },
+    \\          "401": { "description": "Unauthorized" }
+    \\        }
+    \\      }
+    \\    },
+    \\    "/api/v1/users": {
+    \\      "post": {
+    \\        "summary": "user",
+    \\        "description": "jwt",
+    \\        "tags": ["user"],
+    \\        "security": [ { "bearerAuth": [] } ],
+    \\        "responses": {
+    \\          "200": { "description": "OK" },
+    \\          "401": { "description": "Unauthorized" }
+    \\        }
+    \\      }
+    \\    },
+    \\    "/orders/stream": {
+    \\      "get": {
+    \\        "summary": "order",
+    \\        "description": "text/event-stream (SSE)",
+    \\        "tags": ["order"],
+    \\        "security": [ { "bearerAuth": [] } ],
+    \\        "responses": {
+    \\          "200": { "description": "text/event-stream" },
+    \\          "401": { "description": "Unauthorized" }
+    \\        }
+    \\      }
+    \\    }
+    \\  },
+    \\  "components": {
+    \\    "securitySchemes": {
+    \\      "bearerAuth": { "type": "http", "scheme": "bearer", "bearerFormat": "JWT" }
+    \\    }
+    \\  }
+    \\}
+++ "\n";
+
+test "catalog exportOpenApi: un-annotated output is byte-identical to the pre-annotation emitter" {
+    const alloc = std.testing.allocator;
+    var entries = try alloc.alloc(CatalogEntry, 6);
+    entries[0] = .{
+        .method = .GET,
+        .path = try alloc.dupe(u8, "api/v1/users/{id}"),
+        .auth = .jwt,
+        .module = "user",
+        .permission = "user:view",
+        .openapi_params = &.{
+            .{ .name = "fields", .location = .query, .param_type = "string" },
+            .{ .name = "X-Trace", .location = .header, .param_type = "string", .required = true },
+        },
+    };
+    entries[1] = .{ .method = .POST, .path = try alloc.dupe(u8, "api/v1/users"), .auth = .jwt, .module = "user" };
+    entries[2] = .{ .method = .GET, .path = try alloc.dupe(u8, "health"), .auth = .public, .module = "system" };
+    entries[3] = .{ .method = .GET, .path = try alloc.dupe(u8, "im/ws"), .auth = .public, .module = "im", .is_ws = true };
+    entries[4] = .{ .method = .GET, .path = try alloc.dupe(u8, "orders/stream"), .auth = .jwt, .module = "order", .is_sse = true, .roles = "admin|ops" };
+    entries[5] = .{ .method = .GET, .path = try alloc.dupe(u8, "optional/ping"), .auth = .optional, .module = "opt" };
+    var catalog = RouteCatalog{ .allocator = alloc, .entries = entries };
+    defer catalog.deinit();
+
+    var gen = OpenApi.OpenApiGenerator.init(alloc, "t", "1", "d");
+    defer gen.deinit();
+    gen.bearer_auth = true;
+    try catalog.exportOpenApi(&gen);
+    const json = try gen.generate();
+    defer alloc.free(json);
+
+    try std.testing.expectEqualStrings(unannotated_openapi_golden, json);
 }

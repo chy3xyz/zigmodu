@@ -112,7 +112,30 @@ pub const FieldRules = struct {
     phone: bool = false,
     url: bool = false,
     one_of: ?[]const u8 = null,
+    /// Replaces the failure message for this field **verbatim** (no field-name
+    /// prefix added). Use it to phrase the error for the end user. It covers any
+    /// rule on that field, not one specific rule.
+    message: ?[]const u8 = null,
 };
+
+/// Failure message for one violated rule.
+///
+/// The default is `<field>: <what the rule requires>` — the field name is part
+/// of it because "invalid email format" on a multi-field request body does not
+/// say which field to fix. A `FieldRules.message` override replaces the whole
+/// string, including the field-name prefix.
+fn ruleFailure(
+    allocator: std.mem.Allocator,
+    field_name: []const u8,
+    field_rules: anytype,
+    comptime rule_fmt: []const u8,
+    rule_args: anytype,
+) ![]const u8 {
+    if (field_rules.message) |override| return try allocator.dupe(u8, override);
+    const rule_text = try std.fmt.allocPrint(allocator, rule_fmt, rule_args);
+    defer allocator.free(rule_text);
+    return try std.fmt.allocPrint(allocator, "{s}: {s}", .{ field_name, rule_text });
+}
 
 /// Validate a struct value against comptime rules.
 /// Returns an allocator-owned error message if validation fails, or null on success.
@@ -138,7 +161,7 @@ pub fn validateStruct(allocator: std.mem.Allocator, value: anytype, comptime rul
         if (field_rules.required) {
             const valid = isRequiredValid(@TypeOf(field_value), field_value);
             if (!valid) {
-                return try std.fmt.allocPrint(allocator, "field '{s}' is required", .{field_name});
+                return try ruleFailure(allocator, field_name, field_rules, "is required", .{});
             }
         }
 
@@ -147,12 +170,12 @@ pub fn validateStruct(allocator: std.mem.Allocator, value: anytype, comptime rul
         if (is_string) {
             if (field_rules.min_len) |min| {
                 if (field_value.len < min) {
-                    return try std.fmt.allocPrint(allocator, "field '{s}' must be at least {d} characters", .{ field_name, min });
+                    return try ruleFailure(allocator, field_name, field_rules, "must be at least {d} characters", .{min});
                 }
             }
             if (field_rules.max_len) |max| {
                 if (field_value.len > max) {
-                    return try std.fmt.allocPrint(allocator, "field '{s}' must be at most {d} characters", .{ field_name, max });
+                    return try ruleFailure(allocator, field_name, field_rules, "must be at most {d} characters", .{max});
                 }
             }
         }
@@ -164,13 +187,13 @@ pub fn validateStruct(allocator: std.mem.Allocator, value: anytype, comptime rul
             if (field_rules.min) |min| {
                 const fv = asF64(field_value);
                 if (fv < @as(f64, @floatFromInt(min))) {
-                    return try std.fmt.allocPrint(allocator, "field '{s}' must be at least {d}", .{ field_name, min });
+                    return try ruleFailure(allocator, field_name, field_rules, "must be at least {d}", .{min});
                 }
             }
             if (field_rules.max) |max| {
                 const fv = asF64(field_value);
                 if (fv > @as(f64, @floatFromInt(max))) {
-                    return try std.fmt.allocPrint(allocator, "field '{s}' must be at most {d}", .{ field_name, max });
+                    return try ruleFailure(allocator, field_name, field_rules, "must be at most {d}", .{max});
                 }
             }
         }
@@ -180,25 +203,25 @@ pub fn validateStruct(allocator: std.mem.Allocator, value: anytype, comptime rul
             if (field_rules.email) {
                 const r = email(field_value);
                 if (!r.valid) {
-                    return try std.fmt.allocPrint(allocator, "field '{s}' {s}", .{ field_name, r.message.? });
+                    return try ruleFailure(allocator, field_name, field_rules, "{s}", .{r.message.?});
                 }
             }
             if (field_rules.uuid) {
                 const r = uuid(field_value);
                 if (!r.valid) {
-                    return try std.fmt.allocPrint(allocator, "field '{s}' {s}", .{ field_name, r.message.? });
+                    return try ruleFailure(allocator, field_name, field_rules, "{s}", .{r.message.?});
                 }
             }
             if (field_rules.phone) {
                 const r = phone(field_value);
                 if (!r.valid) {
-                    return try std.fmt.allocPrint(allocator, "field '{s}' {s}", .{ field_name, r.message.? });
+                    return try ruleFailure(allocator, field_name, field_rules, "{s}", .{r.message.?});
                 }
             }
             if (field_rules.url) {
                 const r = url(field_value);
                 if (!r.valid) {
-                    return try std.fmt.allocPrint(allocator, "field '{s}' {s}", .{ field_name, r.message.? });
+                    return try ruleFailure(allocator, field_name, field_rules, "{s}", .{r.message.?});
                 }
             }
             if (field_rules.one_of) |choices_str| {
@@ -211,7 +234,7 @@ pub fn validateStruct(allocator: std.mem.Allocator, value: anytype, comptime rul
                     }
                 }
                 if (!found) {
-                    return try std.fmt.allocPrint(allocator, "field '{s}' must be one of: {s}", .{ field_name, choices_str });
+                    return try ruleFailure(allocator, field_name, field_rules, "must be one of: {s}", .{choices_str});
                 }
             }
         }
@@ -340,4 +363,73 @@ test "validateStruct" {
     const err3 = try validateStruct(allocator, empty_name_user, rules);
     try std.testing.expect(err3 != null);
     if (err3) |e| allocator.free(e);
+}
+
+test "validateStruct: the message names the failing field" {
+    const allocator = std.testing.allocator;
+    const User = struct { email: []const u8 };
+    const rules = .{ .email = FieldRules{ .required = true, .email = true } };
+
+    // Without the field name, "invalid email format" on a multi-field body does
+    // not say which field to fix.
+    const bad_format = (try validateStruct(allocator, User{ .email = "not-an-email" }, rules)).?;
+    defer allocator.free(bad_format);
+    try std.testing.expectEqualStrings("email: invalid email format", bad_format);
+
+    const missing = (try validateStruct(allocator, User{ .email = "" }, rules)).?;
+    defer allocator.free(missing);
+    try std.testing.expectEqualStrings("email: is required", missing);
+}
+
+test "validateStruct: the default message still describes the rule" {
+    const allocator = std.testing.allocator;
+    const Req = struct { name: []const u8, age: u32, role: []const u8 };
+
+    const too_short = (try validateStruct(allocator, Req{ .name = "A", .age = 30, .role = "admin" }, .{
+        .name = FieldRules{ .min_len = 2 },
+    })).?;
+    defer allocator.free(too_short);
+    try std.testing.expectEqualStrings("name: must be at least 2 characters", too_short);
+
+    const too_old = (try validateStruct(allocator, Req{ .name = "Alice", .age = 999, .role = "admin" }, .{
+        .age = FieldRules{ .min = 0, .max = 150 },
+    })).?;
+    defer allocator.free(too_old);
+    try std.testing.expectEqualStrings("age: must be at most 150", too_old);
+
+    const not_allowed = (try validateStruct(allocator, Req{ .name = "Alice", .age = 30, .role = "superuser" }, .{
+        .role = FieldRules{ .one_of = "admin,user,guest" },
+    })).?;
+    defer allocator.free(not_allowed);
+    try std.testing.expectEqualStrings("role: must be one of: admin,user,guest", not_allowed);
+
+    const too_long = (try validateStruct(allocator, Req{ .name = "Al", .age = 30, .role = "admin" }, .{
+        .name = FieldRules{ .max_len = 1 },
+    })).?;
+    defer allocator.free(too_long);
+    try std.testing.expectEqualStrings("name: must be at most 1 characters", too_long);
+}
+
+test "validateStruct: FieldRules.message is used verbatim" {
+    const allocator = std.testing.allocator;
+    const User = struct { email: []const u8, age: u32 };
+
+    const rules = .{
+        .email = FieldRules{ .required = true, .email = true, .message = "邮箱格式不正确" },
+        .age = FieldRules{ .max = 150, .message = "age out of range" },
+    };
+
+    const bad_email = (try validateStruct(allocator, User{ .email = "nope", .age = 30 }, rules)).?;
+    defer allocator.free(bad_email);
+    // Verbatim: no field-name prefix is added, and the override survives even
+    // when a different rule on the same field is the one that failed.
+    try std.testing.expectEqualStrings("邮箱格式不正确", bad_email);
+
+    const bad_age = (try validateStruct(allocator, User{ .email = "a@b.com", .age = 999 }, rules)).?;
+    defer allocator.free(bad_age);
+    try std.testing.expectEqualStrings("age out of range", bad_age);
+
+    const empty_email = (try validateStruct(allocator, User{ .email = "", .age = 30 }, rules)).?;
+    defer allocator.free(empty_email);
+    try std.testing.expectEqualStrings("邮箱格式不正确", empty_email);
 }

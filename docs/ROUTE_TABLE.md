@@ -70,16 +70,34 @@ try server.addMiddleware(http.permissionGateWith(&slot, .{ .mode = .rbac }));
 ### 4.1 Meta / Auth
 
 ```zig
-pub const Auth = enum { inherit, public, jwt };
+pub const Auth = enum { inherit, public, optional, jwt };
 
 pub const RouteMeta = struct {
     auth: Auth = .inherit,
-    /// 预留；首版 Gate 不读
+    /// 权限码（`|` = OR）；`.mode = .rbac` 时按权限码匹配，否则按 roles 匹配
     permission: ?[]const u8 = null,
+    /// 门户/粗粒度角色（`|` = OR），`permissionGateWith` 先查它
+    roles: ?[]const u8 = null,
     /// 默认取 nest/module 的 module 名
     module: ?[]const u8 = null,
+    /// ↓ 只影响生成的 OpenAPI 文档，不参与任何鉴权
+    /// `summary` 缺省回落 `permission` → `module`（即未标注时输出与从前逐字节相同）
+    summary: ?[]const u8 = null,
+    /// `description` 缺省回落按 auth 种类生成的词（`jwt` / `public` / …）——那是**词**不是说明
+    description: ?[]const u8 = null,
+    /// 请求体 JSON schema **字符串**，原样进 `requestBody.content.*.schema`
+    request_body: ?[]const u8 = null,
+    /// SSE 路由（handler 内 `http.sse(ctx)`）
+    sse: bool = false,
+    /// 额外 OpenAPI 参数（`http.openApiParamsFromStruct(...)`），与路径 `{name}` 合并
+    openapi_params: []const http.ApiParam = &.{},
 };
 ```
+
+> `summary` / `description` / `request_body` 是**纯附加**的文档注解：不设时 `exportOpenApi` 的输出
+> 与标注加入前**逐字节一致**（`src/api/ComptimeRouter.zig` 里冻结了一份 golden 用例守住这条）。
+> 从前"summary 是权限码、description 是 auth 种类"就是没有任何注解时的全部信息量 ——
+> 面向外部消费者的文档必须显式写这三个字段。
 
 ### 4.2 编译期路由说明（无函数指针生命周期问题：用 comptime 已知函数）
 

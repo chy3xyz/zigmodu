@@ -55,6 +55,10 @@ pub const RequestBody = struct {
     content_type: []const u8 = "application/json",
     description: []const u8 = "",
     required: bool = true,
+    /// Schema of the body, emitted as `content.<content_type>.schema`.
+    /// A value starting with `{` or `[` is emitted **verbatim** as the schema
+    /// document (this is how `RouteMeta.request_body` carries a JSON schema);
+    /// anything else is wrapped as `{ "$ref": "<value>" }`.
     schema_ref: ?[]const u8 = null,
 };
 
@@ -136,6 +140,11 @@ pub const OpenApiGenerator = struct {
                 self.allocator.free(p.description);
             }
             self.allocator.free(ep.params);
+            if (ep.request_body) |rb| {
+                self.allocator.free(rb.content_type);
+                self.allocator.free(rb.description);
+                if (rb.schema_ref) |sr| self.allocator.free(sr);
+            }
             for (ep.responses) |r| {
                 self.allocator.free(r.description);
             }
@@ -323,11 +332,45 @@ pub const OpenApiGenerator = struct {
                         try S.emit(
                             &buf,
                             self.allocator,
-                            "          {{ \"name\": \"{s}\", \"in\": \"{s}\", \"required\": {s}, \"schema\": {{ \"type\": \"{s}\" }} }}{s}\n",
-                            .{ param.name, @tagName(param.location), req, param.param_type, comma },
+                            "          {{ \"name\": \"{s}\", \"in\": \"{s}\", \"required\": {s}, \"schema\": {{ \"type\": \"{s}\" }}",
+                            .{ param.name, @tagName(param.location), req, param.param_type },
                         );
+                        // Omitted when empty so an un-annotated parameter keeps the
+                        // exact bytes the emitter produced before `description` was
+                        // serialized at all.
+                        if (param.description.len > 0) {
+                            try buf.appendSlice(self.allocator, ", \"description\": ");
+                            try S.emitJsonStr(&buf, self.allocator, param.description);
+                        }
+                        try S.emit(&buf, self.allocator, " }}{s}\n", .{comma});
                     }
                     try buf.appendSlice(self.allocator, "        ],\n");
+                }
+
+                // request body — emitted only when the endpoint declares one
+                if (ep.request_body) |rb| {
+                    try buf.appendSlice(self.allocator, "        \"requestBody\": {\n");
+                    if (rb.description.len > 0) {
+                        try buf.appendSlice(self.allocator, "          \"description\": ");
+                        try S.emitJsonStr(&buf, self.allocator, rb.description);
+                        try buf.appendSlice(self.allocator, ",\n");
+                    }
+                    try S.emit(&buf, self.allocator, "          \"required\": {s},\n", .{if (rb.required) "true" else "false"});
+                    try buf.appendSlice(self.allocator, "          \"content\": {\n            ");
+                    try S.emitJsonStr(&buf, self.allocator, rb.content_type);
+                    try buf.appendSlice(self.allocator, ": {\n              \"schema\": ");
+                    if (rb.schema_ref) |sr| {
+                        if (sr.len > 0 and (sr[0] == '{' or sr[0] == '[')) {
+                            try buf.appendSlice(self.allocator, sr);
+                        } else {
+                            try buf.appendSlice(self.allocator, "{ \"$ref\": ");
+                            try S.emitJsonStr(&buf, self.allocator, sr);
+                            try buf.appendSlice(self.allocator, " }");
+                        }
+                    } else {
+                        try buf.appendSlice(self.allocator, "{}");
+                    }
+                    try buf.appendSlice(self.allocator, "\n            }\n          }\n        },\n");
                 }
 
                 // security (M14): non-public endpoints require bearerAuth
@@ -416,6 +459,15 @@ pub const OpenApiGenerator = struct {
             };
         }
 
+        // Previously dropped here, so a caller-supplied `request_body` never
+        // reached `generate()` even though `ApiEndpoint` had the slot.
+        const rb_copy: ?RequestBody = if (ep.request_body) |rb| .{
+            .content_type = try self.allocator.dupe(u8, rb.content_type),
+            .description = try self.allocator.dupe(u8, rb.description),
+            .required = rb.required,
+            .schema_ref = if (rb.schema_ref) |sr| try self.allocator.dupe(u8, sr) else null,
+        } else null;
+
         return .{
             .method = ep.method,
             .path = path_copy,
@@ -423,6 +475,7 @@ pub const OpenApiGenerator = struct {
             .description = desc_copy,
             .tags = tags_copy,
             .params = params_copy,
+            .request_body = rb_copy,
             .responses = resp_copy,
             .deprecated = ep.deprecated,
             .requires_auth = ep.requires_auth,
@@ -525,6 +578,49 @@ test "OpenApiGenerator with params" {
     try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"name\": \"id\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "path"));
     try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "query"));
+    // `ApiParam.description` used to be dropped here even though the struct
+    // carried it (and `deinit` freed it).
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"description\": \"User ID\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"description\": \"Fields to return\""));
+}
+
+test "OpenApiGenerator emits declared request bodies" {
+    const allocator = std.testing.allocator;
+    var gen = OpenApiGenerator.init(allocator, "API", "1.0.0", "desc");
+    defer gen.deinit();
+
+    // Inline JSON schema — emitted verbatim.
+    try gen.addEndpoint(.{
+        .method = .POST,
+        .path = "/users",
+        .summary = "Create user",
+        .request_body = .{
+            .description = "User payload",
+            .schema_ref = "{\"type\":\"object\",\"required\":[\"email\"]}",
+        },
+        .responses = &.{.{ .status_code = 201, .description = "Created" }},
+    });
+
+    // A reference — wrapped as `$ref`.
+    try gen.addEndpoint(.{
+        .method = .PUT,
+        .path = "/users/{id}",
+        .summary = "Replace user",
+        .request_body = .{ .schema_ref = "#/components/schemas/User", .required = false },
+        .responses = &.{.{ .status_code = 200, .description = "OK" }},
+    });
+
+    const json = try gen.generate();
+    defer allocator.free(json);
+
+    // Survived `addEndpoint`'s deep copy: `cloneEndpoint` dropped it entirely
+    // before, so `generate()` never saw the field.
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"requestBody\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"schema\": {\"type\":\"object\",\"required\":[\"email\"]}"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"description\": \"User payload\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"schema\": { \"$ref\": \"#/components/schemas/User\" }"));
+    // `required: false` is honoured per body.
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"required\": false"));
 }
 
 test "OpenApiGenerator tags" {
