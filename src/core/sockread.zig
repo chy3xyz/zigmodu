@@ -28,6 +28,29 @@ pub fn readFull(stream: std.Io.net.Stream, buf: []u8) !void {
     }
 }
 
+/// Apply a socket timeout option **without** going through
+/// `std.posix.setsockopt`.
+///
+/// That wrapper maps `EINVAL` to `unreachable` (std/posix.zig:1081), so on a
+/// socket where the kernel rejects the option the caller does not get an error
+/// to `catch` — it **panics**. Measured on macOS: `setsockopt(SO_RCVTIMEO)` on an
+/// `AF_UNIX` socket whose peer end has already closed returns `EINVAL`
+/// (peer open → `SUCCESS`, peer closed → `INVAL`), so the `catch` below was dead
+/// code and the process aborted instead. Over **TCP** the same call stays
+/// `SUCCESS` after the peer closes, so the cluster/HTTP paths were never the
+/// exposed ones — this is an AF_UNIX hazard, and the `socketpair`-based tests are
+/// AF_UNIX.
+///
+/// Raw syscall + explicit errno, so every rejection is reportable. A failure is
+/// only a warning: the bound is a hardening measure, and the caller's next read
+/// or write still returns an error of its own.
+fn applyTimeout(fd: std.posix.socket_t, optname: u32, tv: *const std.posix.timeval, what: []const u8, consequence: []const u8) void {
+    const rc = std.posix.system.setsockopt(fd, std.posix.SOL.SOCKET, optname, @ptrCast(tv), @sizeOf(std.posix.timeval));
+    const e = std.posix.errno(rc);
+    if (e == .SUCCESS) return;
+    std.log.warn("[sockread] {s} not applied ({s}): {s}", .{ what, @tagName(e), consequence });
+}
+
 /// Bound how long a blocking write may stall on a full send buffer.
 ///
 /// Without this a slow (or maliciously non-reading) WS peer can block the
@@ -41,7 +64,7 @@ pub fn setSendTimeout(stream: std.Io.net.Stream, timeout_ms: u32) void {
         .sec = @intCast(timeout_ms / 1000),
         .usec = @intCast((timeout_ms % 1000) * 1000),
     };
-    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch |err| std.log.warn("[sockread] SO_SNDTIMEO not applied ({s}): a slow peer can block the writer indefinitely", .{@errorName(err)});
+    applyTimeout(stream.socket.handle, std.posix.SO.SNDTIMEO, &tv, "SO_SNDTIMEO", "a slow peer can block the writer indefinitely");
 }
 
 /// Bound how long a blocking read may wait for peer data.
@@ -63,7 +86,7 @@ pub fn setRecvTimeout(stream: std.Io.net.Stream, timeout_ms: u32) void {
         .sec = @intCast(timeout_ms / 1000),
         .usec = @intCast((timeout_ms % 1000) * 1000),
     };
-    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch |err| std.log.warn("[sockread] SO_RCVTIMEO not applied ({s}): a peer that accepts and never replies can block the reader indefinitely", .{@errorName(err)});
+    applyTimeout(stream.socket.handle, std.posix.SO.RCVTIMEO, &tv, "SO_RCVTIMEO", "a peer that accepts and never replies can block the reader indefinitely");
 }
 
 /// Write all of `bytes` (loops on partial writes so frames are never split).
@@ -152,6 +175,36 @@ pub const Reader = struct {
         }
     }
 };
+
+// Verified red: the previous `std.posix.setsockopt` call made this **panic**
+// (`reached unreachable code`, std/posix.zig:1081) rather than return, because
+// macOS answers `EINVAL` for `SO_RCVTIMEO` on an `AF_UNIX` socket whose peer end
+// has closed (measured: peer open → SUCCESS, peer closed → INVAL). That is an
+// abort, not an assertion failure — there is nothing to assert before it.
+//
+// Over TCP the same call stays SUCCESS after the peer closes, which is why the
+// cluster/HTTP paths never hit this; the exposure is AF_UNIX, and every
+// `socketpair`-based test in this repo is AF_UNIX.
+test "applying a timeout on a closed-peer socket warns instead of panicking" {
+    var fds: [2]std.posix.socket_t = undefined;
+    const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } };
+    defer _ = std.posix.system.close(fds[0]);
+
+    // Peer alive: both apply cleanly.
+    setRecvTimeout(stream, 100);
+    setSendTimeout(stream, 100);
+
+    // Peer gone: the kernel rejects the read-side option (that one is the measured
+    // case). Either way the requirement is the same — return, do not panic.
+    _ = std.posix.system.close(fds[1]);
+    setRecvTimeout(stream, 100);
+    setSendTimeout(stream, 100);
+}
 
 test "readSome returns EOF on closed socketpair" {
     var fds: [2]std.posix.socket_t = undefined;

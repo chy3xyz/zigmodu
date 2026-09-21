@@ -619,6 +619,8 @@ brief 说 `ClusterBootstrap drives raft.tick and serves inbound Raft RPCs` 里 `
 
 ### 未做（逐条）
 
+> 下面这五条已在同日的第二轮**全部关闭**，见本节末「第二轮」；原文保留，用来记录当时的状态。
+
 - **`serializeEvent`（改动前 `:434-441`，现 `:571`）自己没有修**：它仍以"返回空切片"报告缓冲不足。
   本次只是把**发送路径**换成按事件大小分配的 `serializeEventAlloc`，所以线上不可达；这个契约留给
   下一个调用者时仍是个坑（`catch buf[0..0]` 静默）。
@@ -647,4 +649,145 @@ brief 说 `ClusterBootstrap drives raft.tick and serves inbound Raft RPCs` 里 `
   而 `stop()` 要等这些 fiber（`fiber_group.await`）。树里已经有 `sockread.setRecvTimeout`
   （Raft 入站在用，`:678`），总线这一次**没接** —— 是独立的一项，不带密钥时它同时是一条
   廉价的拒绝服务路径。
+
+---
+
+### 第二轮（同日）：上面五项全部关闭（2026-09-21）
+
+上一节那五条是**记下但没动**的；这一轮逐条关掉，改动**全部**在
+`src/core/DistributedEventBus.zig`（`ClusterBootstrap` 未动 —— 没有新配置项；Raft、
+`src/im/**`、`src/api/**` 未动）。
+
+#### 1. `extractJsonValue` → `std.json` 真解析
+
+`parseEvent` 不再找子串：`std.json.parseFromSlice(std.json.Value, allocator, data, .{})` 读字段，
+再把四个字段 `dupe` 进调用方的 allocator。分配口径：**每消息多一棵 json 树，落在本来就有、
+每消息 `reset(.retain_capacity)` 的 arena 里** —— 是容量不是增长；`Parsed.deinit` 在返回前释放，
+所以 `std.testing.allocator` 也平衡。`parseEvent` 的契约（解析进调用方 arena、返回 `?NetworkEvent`、
+失败落 DLQ 路径）不变，帧循环不变（一次读里的第二条消息仍然不会被丢）。
+
+两处顺带的效果，都是收紧：
+
+| 输入 | 旧（子串） | 新（解析） |
+|---|---|---|
+| payload 值是 `say \"topic\" from \"source\"`（合法 JSON） | payload 被截成 `say \`，`source` 从 payload 里的**字面量**读出 | 完整 payload + 真正的 `source` |
+| payload 注入 `y","source":"node-b`（`serializeEvent` 不转义引号） | **投递**一个 `source_node = "node-b"` 的事件 | `DuplicateField` → 解析失败 → DLQ，**不投递** |
+
+第二条同时说明：**`serializeEvent` 不转义引号**（本轮未动）在旧行为下是"静默截断 / 改掉来源"，
+现在是"进 DLQ"，即 fail-closed。含 `"` 的 payload 从来没有被正确传过，这里没有回归。
+
+#### 2. `source_node` 绑定：MAC 密钥由**声称的身份**派生
+
+```text
+claim      = json 里的 "source"
+key(claim) = HMAC-SHA256(cluster_secret, claim)
+mac        = HMAC-SHA256(key(claim), json)      // 仍只覆盖 json 字节
+```
+
+发送侧（`sendEventFrame` 多一个 `identity` 形参，两个调用点传 `self.node_id`）与接收侧
+（`openEventFrame` 先从**未验证**的字节里只读一个字段 —— 声称的 source —— 用它派生密钥）
+同时改，否则谁都不验。`ClusterAuth.timingSafeEql` 的常量时间比较不变。
+
+「验证在解析之前」要**精确**表述，因为密钥派生必须先知道 claim：**解析先于验证的只有 claim 这一个
+字段，它只作 KDF 输入；投递给订阅者的事件仍然从 MAC 验过的字节重新解析**（因此认证路径每帧解析两次，
+都落在同一个 per-message arena 里）。伪造 claim 只会派生出拿不到 tag 的密钥。
+
+**残留（明写）**：`cluster_secret` 是集群级 PSK，**持有它的人仍可冒充任何节点**（能派生出任意 id 的
+密钥）—— 这是 PSK 的固有性质，在 L1 威胁模型之外。这一项买到的是"声称被绑进帧里、接收侧不再相信
+一个从未校验的自述"，**不是**"冒充不可能"。
+
+#### 3. 重放：每 claim 严格递增的序号（有界，残留明写）
+
+帧多一个 `"seq"`（**在 MAC 覆盖区内**）；`nextSeq()` 每帧自增；`peer_seqs: StringHashMap(u64)`
+记每个 claim 的高水位；`seq <= 高水位` 的帧丢弃并 debug 记录。只在**配了密钥**时生效 ——
+裸帧没有可放序号的认证区。
+
+- **重连不重置水位**。连接不是新鲜度的单位（旁观者可以自己开一条连接重放捕获到的字节），
+  所以水位按 **claim** 记、跨 socket 存活；发送侧的重连也不重置计数器（进程内单调）。
+- **序号种子**取 `Time.monotonicNowMilliseconds()`（进程启动时的单调毫秒），每帧 +1：
+  同一台机器上**进程重启**通常往前进（经过的毫秒数大于发出的帧数），对端因此不会拒绝它。
+- **残留 1（明写）**：捕获到但**从未被你接受过**的帧（连接已经断了之后才发出的那些）仍可重放一次 ——
+  防御的边界是"高水位之上的那段捕获窗口"，不是"所有捕获字节"。
+- **残留 2（明写）**：**宿主机重启**把单调时钟打回 0，重启后该节点的帧会全部低于对端高水位而被拒。
+  出路只有 `forgetPeerSeq(claim)`（人工、显式，会重开该 claim 的重放窗口）或对端重启；
+  **没有任何自动的"接受重置"** —— 那正是"看起来像防护"的形状。
+- 高水位表只可能被**持有密钥的对端**写入（写它之前 MAC 已验过），所以它不能被陌生人撑大。
+
+#### 4. 同一 socket 的并发写：每节点一把 `std.Io.Mutex`
+
+`Node.write_lock`；`sendFramed`（`publish` 与 `heartbeatLoop` 共用的唯一出口）持锁写整帧。
+用 `Io.Mutex` 而不是 `SpinLock`：临界区里是阻塞的 `writeAll`，而 `core/SpinLock.zig` 的文档
+明确把这种形状排除在外。锁覆盖的是"两个写者"，不覆盖"另一个线程 close 这个 socket"（既有行为）。
+
+#### 5. 入站读的空闲上界
+
+`inbound_idle_timeout_ms = 30_000`（= 6 × `heartbeat_interval_ms`，心跳间隔这次也提成常量），
+经 `SO_RCVTIMEO` 施加，0 关闭。**为什么是空闲式而不是每消息**：这条流是长寿命的 —— 健康对端在两次
+心跳之间本来就是安静的，安静期可能长达几分钟；任何**紧于心跳间隔**的界都会把健康连接拆掉，
+6× 只对真正沉默的对端生效（`stop()` 也就不再被一条空连接卡住）。
+
+**实现期发现的一个真缺陷（在允许改动范围外，记为待办）**：`sockread.setRecvTimeout` 的 `catch`
+**永远不会触发** —— `std.posix.setsockopt` 把 `EINVAL` 映射成 `unreachable`，而 macOS 对**对端已关闭**
+的 AF_UNIX socket 上的 `SO_RCVTIMEO` 恰好返回 `EINVAL`（本机实测：对端开着 rc=0；对端 close 之后
+rc=-1 / errno 22）。于是"连上就立刻消失"的对端会让**调用方 panic**，而不是被兜住。总线因此在
+`boundInboundRead` 里自己发同一个 `setsockopt`、失败只 `log.warn`（对端已经走了的话下一次读立刻
+EOF，所以这个失败是良性的）。`src/core/sockread.zig` 没有动。
+
+#### 门禁与验证
+
+| 命令 | 结果 |
+|---|---|
+| `zig fmt --check src tools examples` | 0 |
+| `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test --summary all -Dtest-force-run=true` | `15/15 steps succeeded; 1529/1550 tests passed (21 skipped)`（0 failed），主产物 1414 pass + 21 skip（1435） |
+| `bash scripts/check-production.sh` | 0（无裸 `catch {}`） |
+| `bash scripts/check-deadcode.sh` | 0 |
+| `-Dtest-filter=DistributedEventBus` | **改前 16/16（主产物 1429）→ 改后 22/22（主产物 1435）** |
+
+新增 6 条用例（`src/core/DistributedEventBus.zig` 末尾）：带转义引号的 payload 不被劫持、
+注入重复字段的 payload 不投递、密钥按自称派生（含"用集群密钥签的帧必须验不过"）、
+重放被丢（**每次 `feedFrame` 都是新连接**，即重连场景）而前进的序号仍被接受、
+两个写者同 socket 只产生整帧、静默对端被空闲界放掉。
+
+被改的 fixture（有意，非弱化）：
+
+| fixture | 为什么 |
+|---|---|
+| `testFrame(allocator, secret, claim, json)` | 帧必须用**声称身份派生**的密钥签，否则"合法帧"在新接收侧本来就不该验过 |
+| `testFrameRaw(allocator, key, json)`（新） | 保留"用原始密钥签"的形状，正是为了能**断言它不被接受** |
+| `a signed frame round-trips` 的 `expected_mac` 改用 `identityKey(secret, "sender-node")`，并新增 `expect(!eql(HMAC(secret, json), mac))` | 同一条契约在发送侧的证据 |
+| JSON 形状（`event_json_fmt` 加 `"seq"`） | `eventJsonSize` 与 `serializeEvent` 共用同一格式串，所以两者同步 |
+
+**四条变异逐条验红，都是断言红不是编译错**（都按字节还原，md5 前后一致
+`e9ff4838f19f7ca07d71a914d175b7a2`，`grep -c MUTATION` → 0）：
+
+1. `parseEvent` 换回子串匹配器 →
+   `a payload containing quoted field names cannot steer the parse`：
+   `expected: say "topic" from "source"` / `instead found: say \` → `FAIL (TestExpectedEqual)`；
+   同一次运行里 `a payload that injects a duplicate field is not delivered as somebody else`：
+   `expected 0, found 1` → `FAIL (TestExpectedEqual)`。
+2. 去掉 `sendFramed` 的锁（`writeAll` 照旧）→
+   `two writers on one socket produce only whole frames`: `expected 10, found 0` →
+   `FAIL (TestExpectedEqual)`（连跑两次一致；还原后同一条用例 OK）。
+3. 不施加 `SO_RCVTIMEO` →
+   `a peer that connects and then says nothing costs the idle bound, not the fiber`:
+   `FAIL (TestUnexpectedResult)`，位置是 `try std.testing.expect(returned.load(.acquire))`
+   （用例本身不会挂死：defer 会关掉对端让 mutate 版本也退得出来）。
+4. 接收侧换回集群级单一密钥 →
+   `a frame is keyed by the source it claims, not by the cluster secret`: `expected 0, found 1` →
+   `FAIL (TestExpectedEqual)`。
+
+#### 这一轮仍未做
+
+- **混合版本集群仍未实测对跑**：这一轮的帧形状变化（按身份派生密钥 + 必带 `"seq"`）让硬切**更硬**
+  —— 双向都不通，而且旧侧的"子串解析"会把 `[len][mac]` 之后的内容当事件误解析（见上一轮记录）。
+- **`serializeEvent` 仍不转义引号**（上一轮就记着）：现在它的后果是进 DLQ，而不是静默截断。
+- **`sockread.setRecvTimeout` / `setSendTimeout` 的 `catch` 不可达**（`EINVAL` → `unreachable`），
+  实测能 panic 调用方；总线绕过了它，Raft 入站仍直接用它（对端活着时不会触发）。**建议单独修
+  `src/core/sockread.zig`**（`SETSOCKOPT_ERROR`/`E` 里把 `INVAL` 从 `unreachable` 摘出来，或改用
+  裸 `std.posix.system.setsockopt` 判返回值）。
+- **`nextSeq` 的种子是启发式**：同机进程重启通常前进，但**高事件率 + 短间隔重启**仍可能回退
+  （经过的毫秒数 < 发出的帧数）→ 被对端拒绝。要彻底关掉需要持久化序号或重入握手。
+- **`peer_seqs` 没有上界**：只有持密钥的对端能往里加 claim，所以不是陌生人可撑大的表；
+  但没有 TTL / 淘汰。
+
 

@@ -16,7 +16,7 @@ For multi-node production, see the caveats below.
 | **RaftElection** | 11 | Leader election + vote counting. Multi-candidate split-vote tested. |
 | **DistributedTransaction** | 10 | 2PC protocol (commit + abort) + durable coordinator journal (`TransactionJournal.recover`). ⚠ Participants have no journal (see caveats). |
 | **ClusterMembership** | 4 | Gossip over bus with `subscribeWithContext` (join/leave/heartbeat converge). |
-| **DistributedEventBus** | 16 | Cross-node pub/sub + soft backpressure (quarantine after send failures); length-prefixed frames + optional HMAC (`setClusterSecret`). |
+| **DistributedEventBus** | 22 | Cross-node pub/sub + soft backpressure (quarantine after send failures); length-prefixed frames, per-identity HMAC (`setClusterSecret`), strictly increasing `"seq"` per claim (replay), per-node write lock, idle read bound. |
 | **ClusterView** (cluster/) | 6 | Reference-counted read-side snapshot + rendezvous pick. |
 | **WAL** (eventbus/) | 2 | Write-ahead log. Zig 0.16 Io.Dir + binary serialization. |
 | **DLQ** (eventbus/) | 3 | Dead-letter queue. Expiry + requeue with cooldown. |
@@ -32,6 +32,29 @@ For multi-node production, see the caveats below.
 > （不编译、测试不运行）。读侧的两个根导出名 `ClusterSnapshot`（= `ClusterView.Snapshot`）与
 > `ClusterNodeView`（= `MembershipView.Node`）是给应用的别名；框架内部只用后两个名字，这正是
 > 这两个别名在树内"零使用"的原因 —— 没有失效的类型，只有没被内部代码用到的名字。
+
+## 总线入站：帧、身份与重放（`Unreleased` 起，接线者要知道的三件事）
+
+`DistributedEventBus` 的监听端口是**集群内部面**。配了 `cluster_secret` 就有 L1：
+
+```text
+[4-byte BE len][mac: 32][json]
+mac = HMAC-SHA256( HMAC-SHA256(cluster_secret, json "source"), json )
+```
+
+1. **密钥按"声称的身份"派生**（`key(claim) = HMAC(cluster_secret, claim)`）：声称 `node-b` 的对端
+   必须持有 `node-b` 的密钥。**残留**：集群级 PSK 意味着**持有 `cluster_secret` 的人可以冒充任何
+   节点** —— 这是 PSK 的性质，不是实现缺陷。
+2. **`"seq"` 必带且对同一 claim 严格递增**（高水位跨重连存活），所以捕获到的帧重放不了。
+   **残留**：从未被接受过的帧（连接断掉之后才发出的那些）仍可重放一次；**宿主机重启**会让发送方
+   序号回退 → 被对端拒绝，需要 `forgetPeerSeq(id)` 人工放行（或对端重启）。没有自动接受重置。
+3. **入站读有 30s 空闲上界**（`inbound_idle_timeout_ms`，= 6 × 心跳间隔）：沉默对端不会占住连接，
+   `stop()` 也就不再被它卡住；健康对端在两次心跳之间本来就是安静的，30s 不会误杀。
+
+另外两点：每个 node 一把写锁（`publish` 的请求线程与 `heartbeatLoop` 的 fiber 不会在同一个 socket 上
+交错）；`source_node` **仍然只是自述**，没有与成员表比对（accept 侧拿不到"连接 → id"的映射）——
+L1 认证的是"哪台主机 + 它证明了它声称的那个密钥"，L2 不覆盖这一面。
+完整改动与残留清单：`docs/dev/cluster-auth-design.md` §14。
 
 ## 读侧怎么被喂（membership → view → 请求路径）
 

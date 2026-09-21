@@ -2,6 +2,54 @@
 
 ## [Unreleased]
 
+### `sockread` 的超时设置会 **panic** 而不是 warn（AF_UNIX）；以及总线 §14 的五条（**破坏性：是**）
+
+**① `setRecvTimeout` / `setSendTimeout` 的 `catch` 是死代码。**
+`std.posix.setsockopt` 把 `EINVAL` 映射成 `unreachable`（`std/posix.zig:1081`），所以内核拒绝该选项时
+调用方**拿不到错误可 catch —— 直接 panic**。实测（macOS）：`setsockopt(SO_RCVTIMEO)` 在**对端已关闭的
+AF_UNIX socket** 上返回 `EINVAL`（对端活着 → `SUCCESS`，对端已关 → `INVAL`，两个选项都是），
+于是进程 abort。**TCP 上同一调用在对端关闭后仍是 `SUCCESS`、不会 panic** —— 所以集群/HTTP 那些路径
+从来不是暴露面，**这是 AF_UNIX 的危害**，而本仓库所有 `socketpair` 用例都是 AF_UNIX。
+改为走裸 `std.posix.system.setsockopt` + 显式 errno，任何拒绝都能上报。
+
+**② 总线的五条**（`docs/dev/cluster-auth-design.md` §14 的未做清单）：子串匹配器换成真正的 JSON 解析；
+每个 peer 一个写锁（`sendFramed` 成为唯一出口）；入站读加 30s 空闲上界（= 6 × 心跳间隔）；
+`source_node` 用 `identityKey = HMAC(cluster_secret, claim)` 与 MAC 绑定；帧内 `"seq"` + 每 claim 的
+高位标记做重放防护（限制如实写在 §14）。
+
+> **复核时改掉了这条测试的一次"假绿"**：`a frame is keyed by the source it claims` 原先只断言
+> "key 不是裸 secret" + 一个正对照，**没有断言 key 随 claim 变化**。我把 `identityKey` 改成忽略 claim
+> （两边都用同一个固定标签）—— 该测试**照样通过**，也就是说身份绑定可以在无声中消失。
+> 已补一条"为 claim A 签的帧不能以 claim B 通过"的断言；同一条变异现在会红
+> （`expected 0, found 1`）。**另需如实说明**：在**共享 PSK** 下 `identityKey` 相对"直接 MAC 整段 json"
+> 并无额外安全性 —— 拿到 secret 的人可以推导任何节点的 key；真正的身份绑定需要**每节点各自的凭证**
+> （握手），这条仍 open。
+
+
+### `DistributedEventBus` 入站：真 JSON 解析 · 按身份派生密钥 · 序号防重放 · 写锁 · 空闲上界（**破坏性：是**）
+
+`docs/dev/cluster-auth-design.md` §14 上一轮记下的五条**全部关闭**，改动全在
+`src/core/DistributedEventBus.zig`。
+
+| # | 缺陷 | 现在的行为 |
+|---|---|---|
+| 1 | `extractJsonValue` 是**子串匹配器**：payload 里出现字面量 `"topic"` / `"source"` 就能改变解析方向 | `std.json` 真解析。payload 里的转义引号不再截断值；注入重复字段的 payload 从"投递成别人的事件"变成 `DuplicateField` → DLQ，**不投递** |
+| 2 | `source_node` 直接取自 JSON，从不与对端绑定 | MAC 密钥改为 `HMAC-SHA256(cluster_secret, 声称的 source)`。**残留**：持有 `cluster_secret` 者仍可冒充任何节点（PSK 固有，超出 L1 威胁模型） |
+| 3 | 无重放防护 | 帧带 `"seq"`（在 MAC 覆盖区内），每 claim 一个**严格递增**高水位、跨重连存活。**残留**：从未被接受过的帧仍可重放一次；宿主机重启使发送方序号回退 → 需 `forgetPeerSeq(id)` 人工放行（无自动重置） |
+| 4 | 同一 socket 上 `publish` 与心跳 fiber 并发 `writeAll` | 每节点一把 `std.Io.Mutex`（`sendFramed` 是唯一出口） |
+| 5 | 入站读无超时：连上不发言的对端占住 fiber，`stop()` 等它 | `SO_RCVTIMEO` 空闲上界 30s（= 6 × 心跳间隔，`inbound_idle_timeout_ms`，0 关闭） |
+
+**破坏性**：帧形状变了（密钥按身份派生 + 必带 `"seq"`），新旧版本**双向都不通** —— 混合版本集群必须一起升级。
+
+**顺带发现（不在本次改动范围）**：`sockread.setRecvTimeout` 的 `catch` 永远不会触发
+—— `std.posix.setsockopt` 把 `EINVAL` 映成 `unreachable`，而 macOS 对**对端已关闭**的 AF_UNIX socket
+上的 `SO_RCVTIMEO` 返回 `EINVAL`，实测会 panic 调用方。总线因此自己发同一个 `setsockopt` 并容忍失败；
+`src/core/sockread.zig` 建议单独修。
+
+验证：全量 `1529/1550（21 skipped，0 failed）`；`-Dtest-filter=DistributedEventBus` 16/16 → **22/22**；
+四条变异逐条验红（子串解析回归、去掉写锁、去掉 `SO_RCVTIMEO`、接收侧换回集群级单一密钥），
+都是断言红不是编译错。细节见 `docs/dev/cluster-auth-design.md` §14「第二轮」。
+
 ### `BufferPool.release` 的静默泄漏：不足尺寸的 buffer 既不回收也不归还（**破坏性：否**）
 
 `src/im/BufferPool.zig` 的 `if (buf.len < BufSize) return;` —— 调用方的 buffer **既没进池、
