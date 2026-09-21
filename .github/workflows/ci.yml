@@ -117,22 +117,18 @@ jobs:
         run: zig build
 
       - name: Run tests
-        # `set -euo pipefail` is load-bearing here and was missing. Without it the
-        # step's status is `tee`'s — always 0 — so a **failing suite left this step
-        # and the whole job green**. Every other step in this file already sets it;
-        # this one piped through `tee` and was the exception. Found while
-        # diagnosing the ubuntu hang on 48ac894.
+        # The step's status must be the *suite's*, not `tee`'s — see the comment
+        # on `scripts/ci-run-logged.sh`, which is what this step now runs.
         #
         # `timeout-minutes`: a *hanging* test used to burn the run's full 6-hour
-        # default before anyone learned anything. `scripts/test-runner.zig` prints
-        # `N/M <name>...` before it runs each test, so the last line of this log
-        # names the one that hung — but only if the step is actually cut off.
+        # default before anyone learned anything. The script writes the suite's
+        # output to a file as it goes, so the artifact names the last test that
+        # ran even when the step is cut off.
         # The step normally takes ~6 minutes; 25 leaves generous headroom while
         # still failing fast on a hang.
         timeout-minutes: 25
         run: |
-          set -euo pipefail
-          zig build test 2>&1 | tee "$RUNNER_TEMP/test-output.log"
+          bash scripts/ci-run-logged.sh "$RUNNER_TEMP/test-output.log" zig build test
 
       # Log download via API needs admin rights; artifacts are the reliable
       # way to inspect failures from automation.
@@ -395,19 +391,19 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libpq-dev libmariadb-dev libmariadb-dev-compat libsqlite3-dev curl
 
       - name: Run integration probes
-        # `set -o pipefail`: without it the step's status is `tee`'s, and a
-        # failing probe script reports success (the same hole c816ff1 fixed for
-        # the unit-test step).
+        # Logged through the helper rather than `| tee`: the status must be the
+        # probe's, and a `tee` pipeline hangs if the command leaves an orphan
+        # holding stdout (`scripts/ci-run-logged.sh`).
         run: |
-          set -o pipefail
-          HTTP_PORT=18080 bash scripts/ci-integration.sh 2>&1 | tee "$RUNNER_TEMP/integration.log"
+          HTTP_PORT=18080 bash scripts/ci-run-logged.sh "$RUNNER_TEMP/integration.log" \
+            bash scripts/ci-integration.sh
 
       - name: CL/TE smuggling through a real gateway (nginx)
         # Non-default ports: the probe above just used 18080.
         run: |
-          set -o pipefail
           APP_PORT=18180 GW_BUFFERED_PORT=18181 GW_STREAM_PORT=18182 \
-            bash examples/production-deploy/smuggling-e2e/run.sh 2>&1 | tee "$RUNNER_TEMP/smuggling.log"
+            bash scripts/ci-run-logged.sh "$RUNNER_TEMP/smuggling.log" \
+            bash examples/production-deploy/smuggling-e2e/run.sh
 
       - name: Upload smuggling log on failure
         if: failure()
@@ -533,8 +529,7 @@ jobs:
           MYSQL_PASSWORD: secret
           MYSQL_DATABASE: zigzero_test
         run: |
-          set -o pipefail
-          zig build test 2>&1 | tee "$RUNNER_TEMP/mysql-test.log"
+          bash scripts/ci-run-logged.sh "$RUNNER_TEMP/mysql-test.log" zig build test
 
       - name: Upload mysql test log on failure
         if: failure()
@@ -605,8 +600,7 @@ jobs:
           NATS_URL: nats://127.0.0.1:4222
           KAFKA_BOOTSTRAP: 127.0.0.1:9092
         run: |
-          set -o pipefail
-          zig build test 2>&1 | tee "$RUNNER_TEMP/live-test.log"
+          bash scripts/ci-run-logged.sh "$RUNNER_TEMP/live-test.log" zig build test
 
       - name: Upload live-service test log on failure
         if: failure()
