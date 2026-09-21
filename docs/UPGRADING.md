@@ -17,7 +17,7 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 
 ## v0.32.0
 
-> **本版有 6 处破坏性变更，其中 3 处是编译错**（WS 路由声明、CSPRNG 的 `io` 参数、`Method.fromString` 返回类型）。
+> **本版有 7 处破坏性变更，其中 3 处是编译错**（WS 路由声明、CSPRNG 的 `io` 参数、`Method.fromString` 返回类型）。
 > v0.29.0–v0.31.0 **没有**破坏性变更，所以本节是 v0.28.0 之后的唯一一段。
 > 逐条背景见 [`../CHANGELOG.md`](../CHANGELOG.md) 的 `[0.32.0]` 段。
 

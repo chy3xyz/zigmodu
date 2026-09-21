@@ -16,7 +16,7 @@ For multi-node production, see the caveats below.
 | **RaftElection** | 11 | Leader election + vote counting. Multi-candidate split-vote tested. |
 | **DistributedTransaction** | 10 | 2PC protocol (commit + abort) + durable coordinator journal (`TransactionJournal.recover`). ⚠ Participants have no journal (see caveats). |
 | **ClusterMembership** | 4 | Gossip over bus with `subscribeWithContext` (join/leave/heartbeat converge). |
-| **DistributedEventBus** | 22 | Cross-node pub/sub + soft backpressure (quarantine after send failures); length-prefixed frames, per-identity HMAC (`setClusterSecret`), strictly increasing `"seq"` per claim (replay), per-node write lock, idle read bound. |
+| **DistributedEventBus** | 22 | Cross-node pub/sub + soft backpressure (quarantine after send failures); length-prefixed frames, **per-node keys + challenge-response handshake** (`setOwnKey`/`setPeerKey`), `source` bound to the connection, strictly increasing `"seq"` per claim (replay), per-node write lock, idle read bound. |
 | **ClusterView** (cluster/) | 6 | Reference-counted read-side snapshot + rendezvous pick. |
 | **WAL** (eventbus/) | 2 | Write-ahead log. Zig 0.16 Io.Dir + binary serialization. |
 | **DLQ** (eventbus/) | 3 | Dead-letter queue. Expiry + requeue with cooldown. |
@@ -33,28 +33,47 @@ For multi-node production, see the caveats below.
 > `ClusterNodeView`（= `MembershipView.Node`）是给应用的别名；框架内部只用后两个名字，这正是
 > 这两个别名在树内"零使用"的原因 —— 没有失效的类型，只有没被内部代码用到的名字。
 
-## 总线入站：帧、身份与重放（`Unreleased` 起，接线者要知道的三件事）
+## 总线入站：帧、身份与重放（接线者要知道的四件事）
 
-`DistributedEventBus` 的监听端口是**集群内部面**。配了 `cluster_secret` 就有 L1：
+`DistributedEventBus` 的监听端口是**集群内部面**。配了凭证（`cluster_secret` / `setOwnKey` /
+`setPeerKey` 任一）就走认证路径。帧：
 
 ```text
 [4-byte BE len][mac: 32][json]
-mac = HMAC-SHA256( HMAC-SHA256(cluster_secret, json "source"), json )
+入站 mac = HMAC(peer_keys[bound_id], json)     出站 mac = HMAC(own_key, json)
 ```
 
-1. **密钥按"声称的身份"派生**（`key(claim) = HMAC(cluster_secret, claim)`）：声称 `node-b` 的对端
-   必须持有 `node-b` 的密钥。**残留**：集群级 PSK 意味着**持有 `cluster_secret` 的人可以冒充任何
-   节点** —— 这是 PSK 的性质，不是实现缺陷。
-2. **`"seq"` 必带且对同一 claim 严格递增**（高水位跨重连存活），所以捕获到的帧重放不了。
+**身份是握手钉住的，不是帧自述的**（`docs/dev/cluster-identity-design.md`）。每条连接在**任何事件帧之前**
+先跑一次：
+
+```text
+① receiver → dialer   [len][rc: 16]                        rc 每条连接新取（randomSecure）
+② dialer   → receiver [len][dc: 16][claim_id][mac: 32]     mac  = HMAC(own_key, claim_id ++ rc ++ dc)
+③ receiver → dialer   [len][receiver_id][mac2: 32]         mac2 = HMAC(own_key, receiver_id ++ dc)
+```
+
+1. **接收方先发挑战**，所以握手本身不可重放（捕获的应答带着上一轮的 `rc`，对不上新的）；
+   **③ 是互证** —— 拨号方同样要求对端证明它是它。两处 MAC 都是常时比较
+   （`ClusterAuth.timingSafeEql`）。签名一律用**自己的** key、验签一律用**发送方的** key，
+   `setPeerKey(id, key)` 里的 `key` 就是 `id` 那个节点自己的 key。
+2. **绑定后 `source` 必须等于 `bound_id`**，不等就**关连接**（不是丢帧）。于是 `source_node` 第一次是
+   **可验证的事实**，不是自述。**这把 §14 的残留关掉了**：持自己 key 的节点不能再以别人出现。
+3. **`"seq"` 必带且对同一 bound id 严格递增**（高水位跨重连存活），所以捕获到的帧重放不了。
    **残留**：从未被接受过的帧（连接断掉之后才发出的那些）仍可重放一次；**宿主机重启**会让发送方
    序号回退 → 被对端拒绝，需要 `forgetPeerSeq(id)` 人工放行（或对端重启）。没有自动接受重置。
-3. **入站读有 30s 空闲上界**（`inbound_idle_timeout_ms`，= 6 × 心跳间隔）：沉默对端不会占住连接，
-   `stop()` 也就不再被它卡住；健康对端在两次心跳之间本来就是安静的，30s 不会误杀。
+4. **入站读有 30s 空闲上界**（`inbound_idle_timeout_ms`，= 6 × 心跳间隔）：沉默对端不会占住连接，
+   `stop()` 也就不再被它卡住；健康对端在两次心跳之间本来就是安静的，30s 不会误杀。这条也施加于
+   **拨号方刚建好的 socket**（它的第一次读同样是"对端可以不回答"的读）。
 
-另外两点：每个 node 一把写锁（`publish` 的请求线程与 `heartbeatLoop` 的 fiber 不会在同一个 socket 上
-交错）；`source_node` **仍然只是自述**，没有与成员表比对（accept 侧拿不到"连接 → id"的映射）——
-L1 认证的是"哪台主机 + 它证明了它声称的那个密钥"，L2 不覆盖这一面。
-完整改动与残留清单：`docs/dev/cluster-auth-design.md` §14。
+fail-closed 是**整条路径**的，没有降级口：配了凭证但拨号到没有 `peer_key` 的对端 →
+`error.PeerKeyMissing`（在 dial **之前**）；握手 claim 不认识 / MAC 不对 / 重放 → 关；
+认证端口上出现**裸帧** → 关（那不是"没有 MAC 的帧"，是格式错的握手应答）。
+完全没配凭证才是既有的裸帧路径（单节点/开发，`start()` 有 warn）。
+
+代价：**每条连接建立时多一个 RTT**（帧形状与稳态投递不变）。树内连接是"每对端一条、长期复用"
+（`self.nodes` 每个 id 一条 socket，`connectToNode` 对已注册的 id 直接返回），所以只在节点加入/
+重连时多付一次。另有每个 node 一把写锁（`publish` 的请求线程与 `heartbeatLoop` 的 fiber 不会在
+同一个 socket 上交错帧）。完整改动、残留清单与变异证据：`docs/dev/cluster-identity-design.md` §11。
 
 ## 读侧怎么被喂（membership → view → 请求路径）
 

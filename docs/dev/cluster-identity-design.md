@@ -1,6 +1,9 @@
-# 总线的节点身份绑定 —— 设计（未实现）
+# 总线的节点身份绑定 —— 设计（**已实现**）
 
-> 状态：**设计草案，未实现**。承接 `docs/dev/cluster-auth-design.md` §14 里那条
+> 状态：**已实现**（2026-09-21）。落地记录见本文末 **§11**；本文其余部分是设计原文，
+> 实现期与它相左的地方在 §11 里逐条点名（其中一处是 §3.3 的 MAC 方向本身不自洽，实现取了
+> 唯一自洽的那一种）。
+> 本文承接 `docs/dev/cluster-auth-design.md` §14 里那条
 > "`source_node` 仍未被绑定 —— 记为 open，没有关"。
 > 所有事实带 `文件:行`；推测处显式标注"未验证"。
 
@@ -13,6 +16,8 @@
 
 要真的绑定，只有一条路：**每个节点一份自己的凭证**，并在连接建立时**握手**把"这条连接是谁"
 钉住。这是一次**新协议步骤**，不是现有帧的微调。
+
+（§11 起 `identityKey` 已删除，上面那个行号指的是实现前的位置。）
 
 ## 1. 现状与它挡不住什么（逐条可核对）
 
@@ -173,3 +178,150 @@ pub fn setPeerKey(self: *Self, peer_id: []const u8, key: [32]u8) void; // 我怎
 2. **双向认证**：现在就做互证，还是先只做接收方验拨号方？（我建议现在就做：拨号方同样在信任对端。）
 3. **凭证粒度**：`setPeerKey(id, key)` 逐对端配置（本设计），还是一个"节点 id → key"的配置文件由
    框架读？我建议前者 —— 与 `secrets` 的既有约定一致，框架不新造密钥通道。
+
+---
+
+## 11. 实现记录（2026-09-21）—— **§8 的五个阶段全部落地**
+
+§10 的三件事按建议定的：接收方先发 challenge、**现在就做互证**、`setPeerKey(id, key)` 逐对端。
+改动**全部**在 `src/core/DistributedEventBus.zig`（`ClusterBootstrap.zig`、Raft、`src/im/**`、
+`src/api/**` 一行未动）。
+
+### 11.1 阶段逐条
+
+| 阶段 | 落地 | 位置 |
+|---|---|---|
+| 1 凭证表 + setter | `own_key: ?[32]u8`、`peer_keys: StringHashMap([32]u8)`（键归表所有）、`setOwnKey`、`setPeerKey`（`!void`，OOM 才失败）、`peerKey`（带锁读） | `:136`–`:160`、`:1336`、`:1346`、`:1365` |
+| 2 握手（接收方 + 拨号方，双向） | `bindInbound`（①②③ 全做）、`bindOutbound`（读 challenge、证明自己、**要求对方也证明**）、`writeHandshake`/`readHandshake` | `:597`、`:671`、`:545`、`:563` |
+| 3 绑定连接 + `source == bound_id` + 删除 `identityKey` | `Binding{id, key}`；`handleConnection` 在帧循环**之前**绑定；每帧解析后比对 `event.source_node`，不等即 `break`（丢连接，不是丢帧）；入站 MAC 密钥改成 `peer_keys[bound_id]`；`identityKey`/`claimedSource` **删除** | `:720`、`:808`、`:516` |
+| 4 接线 + fail-closed | `connectToNode` 在拨号**之前**查 `peer_keys` → `error.PeerKeyMissing`；连上后同步跑 `bindOutbound`，失败即关 socket、`socket = null`（与既有"连不上"同形）；`sendEventFrame` 用自己的 key；`start()` 两条 warn | `:1394`、`:1415`、`:481`、`:313` |
+| 5 文档 | 本文、`docs/DISTRIBUTED.md`、`docs/UPGRADING.md` v0.32.0、`CHANGELOG.md` | — |
+
+### 11.2 实现期必须自己定的两件事（§10 之外）
+
+**① §3.3 的 MAC 方向本身不自洽，实现取唯一自洽的那种。** 把 §3.3 和 §3.1 一起读：
+
+```text
+§3.1  A 持有 key_A，并且知道 key_B（"知道对端的 key"）
+§3.2  拨号方用 own_key 签 claim        ⇒ 接收方用 peer_keys[claim] 验 ⇒ peer_keys[B] == key_B
+§3.2  接收方用 own_key 签 mac2         ⇒ 拨号方用 peer_keys[receiver] 验 ⇒ peer_keys[A] == key_A
+§3.3  出站 mac = HMAC(peer_key(对端 id), json)   ⇒ B 发 A 时用 peer_keys[A] == key_A 签
+§3.3  入站 mac = HMAC(peer_key(bound_id), json)  ⇒ A 用 peer_keys[B] == key_B 验
+```
+
+最后两行要求 `key_A == key_B` —— 即**所有节点共用一把 key**，正是 §0 要消掉的东西。所以实现取：
+
+```text
+签名一律用 own_key；验签一律用 peer_keys[发送方 id]
+```
+
+事件帧：出站 `HMAC(own_key, json)`，入站 `HMAC(peer_keys[bound_id], json)`。这与 §3.2 两条
+完全同形，`peer_keys[id]` 的含义也统一成一句：**`id` 这个节点自己的 key**。§3.3 那两行按此重读，
+其余不动。（brief 里"出站签 peer_keys[peer_id]"的父注与 §3.2 相冲突，按同一条判据解决。）
+
+**② 握手报文的边界**：三个报文都用与事件帧相同的 `[4-byte BE len][body]`，`len` 在**缓冲之前**
+校验 `1..MAX_MESSAGE_SIZE`（与事件帧同一条理由：流已失步时猜下一个报文起点＝把任意字节交给解析器）。
+② 至少 `16 + 1 + 32` 字节，③ 至少 `1 + 32`。
+
+### 11.3 fail-closed：实现后的实际行为（对照 §5 的表）
+
+| 场景 | 实现后的行为 |
+|---|---|
+| 配了凭证，拨号到没有 `peer_keys` 的对端 | `connectToNode` **先**返回 `error.PeerKeyMissing`（在 dial 之前，`peer_keys` 里没有就不开 socket，节点也不注册） |
+| 握手 `claim_id` 不在 `peer_keys` | 关连接（debug 日志），**没有任何回落** |
+| 握手 MAC 不对 / challenge 重放 | 关连接 |
+| 绑定后帧的 `source` ≠ `bound_id` | 关连接（**整条连接**，不是只丢这一帧 —— 否则可以把冒充藏在合法帧前面） |
+| 完全没配任何 key | 走既有裸帧路径，`start()` 打既有的那条 warn（措辞改成"没有凭证 / 调 `setOwnKey`"） |
+| 配了 key 但收到裸帧 | 关连接 —— 认证模式下**第一个**要读的就是握手应答，裸帧不是"没有 MAC 的帧"，是**应答格式错** |
+| 配了凭证但**自己没有 `own_key`** | 关连接 + `start()` 第二条 warn（以前这条是"连不上对端"，现在说得出来原因） |
+
+另加一条实现期的收紧，设计里没写：**③ 的接收方 id 必须等于我们拨的那个 id**（`bindOutbound`），
+与 §10 的 peer-id 纪律同一句话。
+
+### 11.4 §7 的七条，逐条有用例
+
+| # | 用例 | 位置 |
+|---|---|---|
+| 1 | `a claim answered with another node's key is refused`（带正对照） | `:2563` |
+| 2 | `a replayed handshake is refused on a fresh connection`（捕获第一轮的应答字节，在第二条连接上原样重放；之后仍写一条本可被接受的帧，断言**连接保持关闭**） | `:2599` |
+| 3 | `a frame claiming another node on a bound connection is refused, not delivered` ← **判据** | `:2650` |
+| 4 | `an event frame before the handshake is refused` | `:2695` |
+| 5 | `connectToNode refuses a peer with no key before it dials` | `:2736` |
+| 6 | `the dialer requires the receiver to prove its own identity` 的第一个块 + `two credentialed nodes bind over the network and exchange an event`（真 socket，accept 侧 + 拨号侧一起跑） | `:2754`、`:2825` |
+| 7 | 同上第二个块（同一个诚实的接收方，只是拿错钥匙签 `mac2` → 拨号方 `error.HandshakeRejected`） | `:2754` |
+
+**#3 的用例形状**值得单说：它在**同一条连接**上先发一条 `source = "node-b"` 的帧，再发一条
+`source = "node-a"` 的合法帧，断言**两条都没投递**。于是它同时区分三件事：不校验 source（两条都投）、
+只丢帧不关连接（合法帧会被投）、正确实现（0）。变异 (i) 就是把这条用例打红。
+
+### 11.5 验证
+
+| 命令 | 结果 |
+|---|---|
+| `zig fmt --check src tools examples` | 0 |
+| `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build test --summary all -Dtest-force-run=true` | **15/15 steps succeeded；1542/1563 tests passed（21 skipped，0 failed）**，主产物 1427 pass + 21 skip（1448） |
+| `bash scripts/check-production.sh` | 0（无裸 `catch {}`） |
+| `bash scripts/check-deadcode.sh` | 0（src+tools 32 未超基线） |
+
+新增 **8** 条用例（删掉 1 条已失效的 `a frame is keyed by the source it claims`，净 +7；基线
+1535/1556 → 1542/1563 差的正是 +7）。
+
+**三条变异逐条验红，都是断言红不是编译错**（都按字节还原，md5 前后一致
+`8a8c1c652602d9fea23286d338ab4a9b`，`grep -c MUTATION` → 0）：
+
+| 变异 | 红的样子（原文） |
+|---|---|
+| (i) 去掉 `source == bound_id` 校验 | `core.DistributedEventBus.test.a frame claiming another node on a bound connection is refused, not delivered...expected 0, found 2` / `FAIL (TestExpectedEqual)` |
+| (ii) challenge 不再每条连接新取（`@memset(&challenge, 0)` 替掉 `randomSecure`） | `core.DistributedEventBus.test.a replayed handshake is refused on a fresh connection...expected 0, found 1` / `FAIL (TestExpectedEqual)` |
+| (iii) 去掉 `mac2` 的常时比较 | `core.DistributedEventBus.test.the dialer requires the receiver to prove its own identity...expected error.HandshakeRejected, found void` / `FAIL (TestExpectedError)` |
+
+(ii) 是最贴近"去掉 challenge 单次性"的形状：challenge 一旦不新鲜，捕获的应答就能在第二条连接上
+复用，"绑定"退化成"任意持 key 者一次性证明过"，所以 #2 必须红。
+
+### 11.6 被改的 fixture（有意，非弱化）
+
+| fixture | 为什么 |
+|---|---|
+| `testFrame(allocator, key, json)`（**合并**原 `testFrame`/`testFrameRaw`） | 帧不再按"声称的身份"派生密钥，而是用发送方**自己的** key 签；原来那两个形状（一个走 KDF、一个走裸 key）现在是一件事 |
+| `feedAuthed(bus, claim, sign_key, frame_key, frames)`（新） | 认证连接是**对话**，只写字节的 fixture 不再是"对端"。`frame_key` 与 `sign_key` 分开，才能表达"握手过、帧的 key 不对" |
+| `peerAnswerChallenge` / `peerServeAsReceiver` / `ReceiverFixture`（新） | 分别是**拨号方**和**接收方**两半的测试替身；`peerAnswerChallenge` 返回它发出去的应答字节，专为 #2 的重放 |
+| `feedFrame` 的文档 | 它只对**裸**路径有效（对端半边先关，认证模式下首写 challenge 就会失败），注释里写明 |
+| `two writers on one socket…` | `setClusterSecret(secret)` → `setOwnKey(secret)`；验签 key 由 `identityKey(secret, "writer-node")` 改成 `secret`（发送方自己的 key） |
+| `a signed frame round-trips` | 发送侧断言改成"用发送方自己的 key 签、用接收方 key 验不过"；投递侧改成一次真握手（`feedAuthed`） |
+| `a frame signed with another key is dropped` / `…json changed after signing…` | 从"喂原始字节"改成"握手成功、帧的 key/内容不对"——契约没变，入口变了 |
+
+**没有删除任何 `expect`/`assert`**；§12 的 quorum `+ 1`、§10 的 peer-id 校验、L2 的成员校验、
+L1 的 HMAC helper、`serializeEvent` 的转义与漂移守卫、`seq` 重放防护、入站空闲上界**全部未动**。
+
+### 11.7 §6 那条"每连接多一个 RTT"，它影响什么
+
+设计里标"**未验证**：树内是否有'每事件一条连接'的用法" —— **查了，没有**：
+
+- 连接是**每个对端一条、长期存在**的：`self.nodes` 每个 id 只留一个 `socket`，
+  `connectToNode` 对已在表里的 id **直接 return**（`:1395`），`publish` 与 `heartbeatLoop` 都复用同一个
+  socket（`:282`、`:438`、`:1011`、`:1030`）。
+- `connectToNode` 的树内调用者只有两处，都在 `ClusterMembership`：gossip 收到 `join` 时
+  （`ClusterMembership.zig:332`）与 `connectToSeed`（`:358`）。两处都是**成员变化/setup** 路径，
+  不是每事件路径。
+- 所以代价是"**每条连接建立时多一个 RTT**"，即节点加入/重连时多一个 RTT；稳态事件投递的
+  时延与吞吐**完全不变**（帧形状、长度、MAC 长度都没变）。
+
+**但拨号方多了一处阻塞**（这是实现引入的、设计没写到的）：`connectToNode` 现在**同步**跑完握手，
+而它可能被 gossip 的 handler 调用（`ClusterMembership.zig:332` 是 `catch |err|` 吞掉的），
+所以"对端 accept 了却不发 challenge"会让那个调用者最多等一个 `inbound_idle_timeout_ms`（30s，
+`SO_RCVTIMEO` 已施加于拨号 socket）。**未实测**这条在最坏情况下的排队影响；要收紧就把拨号的握手
+移到独立 fiber 上，本轮没做（会改变 `connectToNode` 的同步语义）。
+
+### 11.8 仍未做（**明写**）
+
+- **不做加密**：帧仍是明文（§9 未变）。
+- **不做密钥轮换 / 撤销**：静态成员表 + 静态 key；`peer_keys` 可以被 `setPeerKey` 覆盖（最后一个
+  写入者赢），但**没有撤销入口**，也没有按 kid 的双验。
+- **混合版本集群未实测对跑**：硬切更硬了 —— 新侧对旧节点发的第一帧期望的是 challenge，收到的是
+  事件帧；旧侧对新节点的 challenge 会当事件去解析（§14 记过：旧侧的解析器是子串匹配）。**失败形态是
+  "总线连不上"，不是"看起来正常但不设防"**，但确实没有实测过混合版本。
+- **Raft 那一半没动**：L1 的 `ClusterAuth` 仍是共享 PSK，`leader_id` 的可信度仍只是"持有 secret 的
+  主机"（§9 已记，属于另一轮）。
+- **入站连接不登记回 `self.nodes`**：绑定给了 id，但没有地址可用（入站对端是
+  `dialer_ip:临时端口`），所以"反向投递仍走对端自己拨的那条连接"。这是既有形状，未改。
+- **`peer_keys` 没有上界 / TTL**：只有应用写它，不是对端可控的表（与 `peer_seqs` 的区别写在这里）。

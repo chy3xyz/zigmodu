@@ -15,8 +15,8 @@ const ClusterAuth = @import("cluster/TlsTransport.zig").ClusterAuth;
 
 // ── Wire format for peer traffic (both directions) ──────────────────────────
 //
-//     [4-byte big-endian len][mac: 32 raw bytes][json]   `cluster_secret` set
-//     [4-byte big-endian len][json]                      no secret ("bare")
+//     [4-byte big-endian len][mac: 32 raw bytes][json]   credentials configured
+//     [4-byte big-endian len][json]                      none ("bare")
 //
 // `len` counts everything after it, so the reader's single `readFull(len)` gets
 // the whole message. Before this the bus had **no framing at all**: one
@@ -32,28 +32,48 @@ const ClusterAuth = @import("cluster/TlsTransport.zig").ClusterAuth;
 // whole message body, and the raw 32-byte tag is compared with
 // `ClusterAuth.timingSafeEql` exactly as `RaftTransport.verifiedRecv` does.
 //
-// The MAC key is **derived from the identity the frame claims**, instead of
-// being one cluster-wide key:
+// ── Handshake: which node is on the other end of this connection ────────────
 //
-//     claim      = json `"source"`                    (what the peer says it is)
-//     key(claim) = HMAC-SHA256(cluster_secret, claim)
-//     mac        = HMAC-SHA256(key(claim), json)
+// A frame's `"source"` is a self-description, and a MAC keyed with one
+// cluster-wide secret proves only "some holder of the secret" — anyone with it
+// can mint a frame for any id. So the identity is established **once per
+// connection**, before any event frame, by the exchange below
+// (`docs/dev/cluster-identity-design.md`):
 //
-// So a peer that claims `node-b` has to hold `key(node-b)`, and the claim is
-// only as forgeable as `cluster_secret` itself — anyone holding the secret can
-// still impersonate any node, which is inherent to a cluster-wide PSK and
-// outside the L1 threat model. What it buys is that the claim is *bound to the
-// framing*: the sender cannot mint a frame for someone else's id without the
-// secret, and the receiver no longer trusts a self-description it never
-// checked. (An address lookup cannot do this job: `self.nodes` holds the
-// `host:listen-port` we dialled, while an inbound peer is `dialer_ip:ephemeral`
-// — see `docs/dev/cluster-auth-design.md` §14.)
+//     ① receiver → dialer   [len][rc: 16]                    rc = fresh, from
+//     ② dialer   → receiver [len][dc: 16][claim_id][mac: 32]    `randomSecure`,
+//                                       mac = HMAC(own_key, claim_id ++ rc ++ dc)
+//     ③ receiver → dialer   [len][receiver_id][mac2: 32]
+//                                       mac2 = HMAC(own_key, receiver_id ++ dc)
 //
-// A signed frame therefore also has to carry a strictly increasing `"seq"`: the
-// MAC covers the json, so the sequence sits inside the authenticated region and
-// a captured frame cannot be replayed at a receiver that already accepted a
-// later one from the same claim. Bare frames have no sequence check — without a
-// secret there is no authenticated region to put it in.
+// The receiver speaks first, which is what makes the handshake itself
+// unreplayable: a captured response carries the **previous** challenge, so it
+// cannot verify against a fresh one. `dc` is the dialer's own freshness and sits
+// inside the dialer's MAC, so the receiver's reply binds one exchange rather than
+// two unrelated halves; `mac2` is what makes it mutual — the dialer trusts the
+// peer too, rather than only being trusted by it.
+//
+// After a successful bind, on that connection:
+//
+//     inbound   mac = HMAC(peer_keys[bound_id], json)   + `source == bound_id`
+//     outbound  mac = HMAC(own_key, json)
+//
+// i.e. every node signs what it sends with **its own** key and verifies what it
+// receives with **the sender's**, which is exactly the credential the handshake
+// proved. (Signing outbound with the peer's key instead would make the two
+// directions disagree unless every node's key were the same, i.e. a shared
+// secret again — see `docs/dev/cluster-identity-design.md` §0.)
+//
+// `"source"` therefore stops being a claim and becomes a fact about the
+// connection, checked on every frame. A signed frame still carries a strictly
+// increasing `"seq"` inside the MAC'd region, so a captured event frame cannot be
+// replayed at a receiver that already accepted a later one from the same sender.
+//
+// With credentials configured the handshake is mandatory and there is no
+// downgrade: an unknown claimant is closed rather than retried, a bad MAC is
+// closed, and a bare frame on an authenticated port is simply a failed
+// handshake. A bus with no `cluster_secret`, no `own_key` and no `peer_keys` is
+// the standalone/dev one `start()` warns about — nothing to authenticate *with*.
 //
 // `setRecvTimeout` bounds each inbound read, so a peer that connects and then
 // sends nothing cannot hold a fiber (`stop()` waits on those fibers). The bound
@@ -63,6 +83,11 @@ const ClusterAuth = @import("cluster/TlsTransport.zig").ClusterAuth;
 
 /// Length of the `mac32` the send side writes and the receive side strips.
 const auth_mac_bytes = 32;
+
+/// Length of the freshness value (`rc` / `dc`) in a handshake. The same size as
+/// the AEAD/AES nonces the rest of the tree uses (128 bits): the value only has
+/// to be unpredictable, and 128 bits from `randomSecure` is the house default.
+const handshake_nonce_bytes = 16;
 
 /// Idle bound on one inbound read: a peer may be quiet for this long before the
 /// connection is dropped. `SO_RCVTIMEO` bounds **each** blocking read, and a
@@ -98,11 +123,40 @@ pub const DistributedEventBus = struct {
     /// Owns accept/handle/heartbeat fibers; awaited in `stop()`.
     fiber_group: std.Io.Group,
 
-    /// 32-byte pre-shared key authenticating every peer frame in **both**
-    /// directions. `null` (the default) means bare frames — length-prefixed
-    /// with no MAC, the state `start()` warns about and `ClusterBootstrap`
-    /// refuses for a multi-node cluster.
+    /// 32-byte pre-shared key the cluster was configured with. It is **not** a
+    /// frame key any more (there is no `HMAC(secret, claim)` derivation — see
+    /// the handshake comment at the top): it selects the authenticated path, and
+    /// it is the single knob `ClusterBootstrap` turns for `config.cluster_secret`.
+    /// `null` plus no `own_key`/`peer_keys` is the bare-frame path `start()`
+    /// warns about.
     cluster_secret: ?[32]u8 = null,
+
+    /// This node's own credential: what it proves at handshake time and the key
+    /// it signs everything it sends with (its handshake claim, `mac2`, and every
+    /// event frame). Source it from `SecretsManager` and call `setOwnKey`; the
+    /// framework does not read keys for you. `null` means this node cannot
+    /// complete a handshake at all, so with credentials configured every
+    /// connection is closed (`start()` says so, loudly).
+    own_key: ?[32]u8 = null,
+
+    /// `peer_id → that node's own key`: how the claim of `peer_id` is verified,
+    /// and how frames arriving on a connection bound to `peer_id` are verified.
+    /// Filled by the app with `setPeerKey` (the framework has no key channel of
+    /// its own), so this table is application configuration rather than
+    /// peer-controlled state — unlike `peer_seqs`, which only a verified peer can
+    /// grow.
+    peer_keys: std.StringHashMap([32]u8),
+
+    /// Guards `peer_keys`: `setPeerKey`/`setOwnKey` are wiring-time calls but the
+    /// bus is normally already started when an app reaches it through
+    /// `ClusterBootstrap.getEventBus()`, while accept fibers read the same table.
+    peer_keys_lock: std.Io.Mutex = .init,
+
+    /// Sticky "some credential exists" flag, set by any of the three setters.
+    /// `authEnabled` reads it instead of taking `peer_keys_lock`, because
+    /// "could not read the table" must never be mistaken for "there are no keys"
+    /// (that would be a downgrade to bare frames).
+    credentials_configured: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     /// Idle bound handed to `sockread.setRecvTimeout` for every inbound
     /// connection, so a peer that connects and then sends nothing cannot hold a
@@ -192,6 +246,7 @@ pub const DistributedEventBus = struct {
             .heartbeat_thread = null,
             .fiber_group = .init,
             .peer_seqs = std.StringHashMap(u64).init(allocator),
+            .peer_keys = std.StringHashMap([32]u8).init(allocator),
             // Milliseconds since the host booted, in the low bits: a *process*
             // restart on a host that did not reboot therefore resumes ahead of
             // the counter it had reached, so peers keep accepting it. A reboot
@@ -217,6 +272,12 @@ pub const DistributedEventBus = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.peer_seqs.deinit();
+
+        var key_iter = self.peer_keys.iterator();
+        while (key_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.peer_keys.deinit();
 
         for (self.nodes.items) |*node| {
             if (node.socket) |sock| {
@@ -244,12 +305,23 @@ pub const DistributedEventBus = struct {
         // `error.ClusterAuthRequired`), and a single-node bus legitimately has
         // no peer to authenticate. All this entry point can honestly do is be
         // loud, so a standalone deployment is not silently open.
-        if (self.cluster_secret == null) {
+        if (!self.authEnabled()) {
             std.log.warn(
-                "[DistributedEventBus] node '{s}' listening on port {d} WITHOUT a cluster_secret: any host that can reach " ++
+                "[DistributedEventBus] node '{s}' listening on port {d} WITHOUT any credential: any host that can reach " ++
                     "this port may publish events, and every frame is trusted as whatever `source` it claims — " ++
-                    "`__heartbeat` included. Call `setClusterSecret` (`ClusterBootstrap` does it for an enforced " ++
-                    "configuration).",
+                    "`__heartbeat` included. Call `setOwnKey` + `setPeerKey` (`ClusterBootstrap` calls " ++
+                    "`setClusterSecret` for an enforced configuration).",
+                .{ self.node_id, port },
+            );
+        } else if (self.own_key == null) {
+            // Authenticated path, but this node has nothing to present: the
+            // handshake can never complete, so every peer connection is refused.
+            // Fail-closed is the intent — silently accepting bare frames instead
+            // would be the downgrade the design forbids — but it is worth saying
+            // out loud, because "the bus connects to nobody" has no obvious cause.
+            std.log.warn(
+                "[DistributedEventBus] node '{s}' listening on port {d} with credentials configured but no `own_key`: " ++
+                    "every inbound handshake will be refused. Call `setOwnKey` from SecretsManager.",
                 .{ self.node_id, port },
             );
         }
@@ -278,7 +350,10 @@ pub const DistributedEventBus = struct {
         self.fiber_group.await(self.io) catch |err| std.log.err("[DEB] Fiber await failed: {}", .{err});
     }
 
-    /// Apply `inbound_idle_timeout_ms` as `SO_RCVTIMEO`.
+    /// Apply `inbound_idle_timeout_ms` as `SO_RCVTIMEO` — to an accepted
+    /// connection in `handleConnection`, and to the socket `connectToNode` just
+    /// opened, because the dialer's first read is also a read that a peer can
+    /// simply never answer.
     ///
     /// This is `sockread.setRecvTimeout`'s option with one deliberate
     /// difference: a failure is **logged and survived**. That helper's own
@@ -289,7 +364,7 @@ pub const DistributedEventBus = struct {
     /// from the bus would turn that peer into a panic instead of a dropped
     /// connection. The peer being already gone is also why a failure here is
     /// benign: the next read returns EOF immediately.
-    fn boundInboundRead(self: *Self, conn: std.Io.net.Stream) void {
+    fn applyRecvTimeout(self: *Self, conn: std.Io.net.Stream) void {
         const timeout_ms = self.inbound_idle_timeout_ms;
         if (timeout_ms == 0) return;
         const tv = std.posix.timeval{
@@ -377,16 +452,6 @@ pub const DistributedEventBus = struct {
         return self.next_seq.fetchAdd(1, .monotonic) + 1;
     }
 
-    /// A frame claiming `claim` is keyed with `HMAC-SHA256(cluster_secret,
-    /// claim)` instead of one cluster-wide key, so a valid MAC also proves the
-    /// sender holds the key for the identity it named (see the wire format at
-    /// the top of this file).
-    fn identityKey(cluster_secret: [32]u8, claim: []const u8) [32]u8 {
-        var key: [32]u8 = undefined;
-        std.crypto.auth.hmac.sha2.HmacSha256.create(&key, claim, &cluster_secret);
-        return key;
-    }
-
     /// Write one already-serialized frame to `node`'s socket, serialised against
     /// every other writer to the same peer.
     ///
@@ -399,31 +464,30 @@ pub const DistributedEventBus = struct {
         const sock = node.socket orelse return error.NotConnected;
         node.write_lock.lock(self.io) catch return error.WriteLockUnavailable;
         defer node.write_lock.unlock(self.io);
-        // The json was rendered from an event whose `source_node` is this node,
-        // so the identity the peer will derive the key from is our own id.
-        try self.sendEventFrame(sock, json, self.node_id);
+        try self.sendEventFrame(sock, json);
     }
 
     /// Frame `json` for the wire (see the wire-format comment at the top of this
     /// file) and write it with a single `writeAll`, so the whole message — MAC
-    /// included — leaves as one call. `identity` is the `"source"` the json
-    /// carries; the peer derives its verification key from exactly that value.
+    /// included — leaves as one call. The MAC is keyed with **this node's own
+    /// key**: the peer verifies it with `peer_keys[self.node_id]`, i.e. with the
+    /// credential the handshake already proved for this connection.
     ///
     /// The frame is built in one heap buffer sized for this event. The old send
     /// path rendered into a fixed `[4096]u8` scratch array and wrote whatever
     /// came out; `serializeEvent` reports overflow by returning an empty slice,
     /// so an event bigger than the array was written as `""` — nothing on the
     /// wire, no failure recorded (`docs/dev/cluster-auth-design.md` §14).
-    fn sendEventFrame(self: *Self, sock: std.Io.net.Stream, json: []const u8, identity: []const u8) !void {
-        const mac_len: usize = if (self.cluster_secret != null) auth_mac_bytes else 0;
+    fn sendEventFrame(self: *Self, sock: std.Io.net.Stream, json: []const u8) !void {
+        const mac_len: usize = if (self.authEnabled()) auth_mac_bytes else 0;
         const body_len = mac_len + json.len;
         if (body_len > max_frame_size) return error.MessageTooLarge;
 
         const frame = try self.allocator.alloc(u8, 4 + body_len);
         defer self.allocator.free(frame);
         std.mem.writeInt(u32, frame[0..4], @intCast(body_len), .big);
-        if (self.cluster_secret) |secret| {
-            const key = identityKey(secret, identity);
+        if (mac_len != 0) {
+            const key = self.own_key orelse return error.PeerKeyMissing;
             std.crypto.auth.hmac.sha2.HmacSha256.create(frame[4..][0..auth_mac_bytes], json, &key);
         }
         @memcpy(frame[4 + mac_len ..], json);
@@ -439,62 +503,230 @@ pub const DistributedEventBus = struct {
     /// connection — the stream cannot be resynchronised past an unauthenticated
     /// frame — which is exactly how `RaftTransport.handleConnection` treats one.
     ///
-    /// The MAC is a **prefix** here (`[mac32][json]`, the inverse of the Raft
-    /// port's trailing tag): the length is known first, so which bytes are the
-    /// tag does not have to be guessed from the body's tail. Its key is derived
-    /// from the `"source"` the frame **claims**, which is why this reads that one
-    /// field out of an otherwise unverified frame: a claim is only an input to
-    /// the KDF, and it has to be *right* — a forged claim derives a key the
-    /// sender cannot produce a tag for. Nothing from that scrape is dispatched;
-    /// the caller re-parses the event out of the verified bytes.
+    /// `sender_key` is the credential of the node this connection is **bound** to
+    /// (see the handshake comment at the top of this file). Nothing here reads
+    /// the frame before its MAC verifies: the key no longer comes from a
+    /// self-description, so this is a straight verify-then-return and the json it
+    /// hands back is the first and only parse of those bytes. A null key means
+    /// the bare path, where there is nothing to verify against.
     ///
     /// The drops are the `error.ClusterAuthFailed` cases: a body too short to
-    /// carry a MAC (a bare frame from a peer that has no secret — mixed-version
-    /// clusters cut over hard), a frame whose claim cannot be read, and a MAC
-    /// that does not match.
-    fn openEventFrame(self: *Self, scratch: std.mem.Allocator, body: []const u8) ?[]const u8 {
-        const secret = self.cluster_secret orelse return body;
+    /// carry a MAC (a bare frame on an authenticated port — mixed-version
+    /// clusters cut over hard), and a MAC that does not match.
+    fn openEventFrame(sender_key: ?[32]u8, body: []const u8) ?[]const u8 {
+        const key = sender_key orelse return body;
         if (body.len < auth_mac_bytes + 1) {
             std.log.debug("[DEB] dropping connection: {d}-byte body carries no MAC", .{body.len});
             return null;
         }
         const json = body[auth_mac_bytes..];
-        const claim = claimedSource(scratch, json) orelse {
-            std.log.debug("[DEB] dropping connection: frame names no source to key the MAC with", .{});
-            return null;
-        };
         // Raw bytes, the same reason `RaftTransport.verifiedRecv` is: the frame
         // carries the tag, raw, not `ClusterAuth.sign`'s hex rendering.
-        const key = identityKey(secret, claim);
         var expected: [auth_mac_bytes]u8 = undefined;
         std.crypto.auth.hmac.sha2.HmacSha256.create(&expected, json, &key);
         if (!ClusterAuth.timingSafeEql(&expected, body[0..auth_mac_bytes])) {
-            std.log.debug("[DEB] dropping connection: frame MAC does not verify for claim '{s}'", .{claim});
+            std.log.debug("[DEB] dropping connection: frame MAC does not verify against its bound peer", .{});
             return null;
         }
         return json;
     }
 
-    /// The `"source"` a frame claims, read out of bytes that have **not** been
-    /// authenticated yet. It is used for one thing only — choosing the KDF input
-    /// — so a wrong or hostile value costs a failed MAC, not a mis-parsed event.
-    /// The result is copied into `allocator`, which is the per-message arena on
-    /// the connection path.
-    fn claimedSource(allocator: std.mem.Allocator, json: []const u8) ?[]const u8 {
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return null;
-        defer parsed.deinit();
-        const claim = jsonStringField(parsed.value, "source") orelse return null;
-        return allocator.dupe(u8, claim) catch null;
+    /// A connection's identity, settled by the handshake: who the peer proved it
+    /// is, and the credential its event frames have to be signed with.
+    const Binding = struct {
+        id: []const u8,
+        key: [32]u8,
+    };
+
+    /// One length-prefixed handshake message: `[4-byte BE len][body]`. The same
+    /// prefix the event frames use, so either side can read either with
+    /// `readFull` and neither has to guess where a message ends. False means the
+    /// connection is unusable.
+    fn writeHandshake(conn: std.Io.net.Stream, body: []const u8) bool {
+        if (body.len == 0 or body.len > max_frame_size) return false;
+        var len_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len_buf, @intCast(body.len), .big);
+        sockread.writevAll(conn, &.{ &len_buf, body }) catch |err| {
+            std.log.debug("[DEB] handshake write failed: {}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    /// Read one handshake body into `allocator` (the caller frees it). Null on
+    /// any failure: a length outside the frame bound, a short read, a timeout, or
+    /// a peer that speaks another wire version — in every one of those cases the
+    /// connection has no usable identity, which is the only thing that matters
+    /// here. The old peer's event frame lands in this shape too (its json is not
+    /// a handshake), which is the hard cut-over `docs/dev/cluster-identity-design.md`
+    /// §6 describes: it fails, rather than looking fine and going unauthenticated.
+    fn readHandshake(conn: std.Io.net.Stream, allocator: std.mem.Allocator) ?[]u8 {
+        var len_buf: [4]u8 = undefined;
+        sockread.readFull(conn, &len_buf) catch |err| {
+            std.log.debug("[DEB] handshake read failed: {}", .{err});
+            return null;
+        };
+        const body_len = std.mem.readInt(u32, &len_buf, .big);
+        if (body_len == 0 or body_len > max_frame_size) {
+            std.log.debug("[DEB] handshake length {d} outside 1..{d}", .{ body_len, max_frame_size });
+            return null;
+        }
+        const body = allocator.alloc(u8, body_len) catch |err| {
+            std.log.debug("[DEB] handshake body of {d} bytes not buffered ({})", .{ body_len, err });
+            return null;
+        };
+        sockread.readFull(conn, body) catch |err| {
+            std.log.debug("[DEB] handshake read failed: {}", .{err});
+            allocator.free(body);
+            return null;
+        };
+        return body;
+    }
+
+    /// The receiving half of the handshake (① and ③ of the protocol comment):
+    /// challenge the dialer, verify the claim it answers with, then prove **our**
+    /// identity back to it.
+    ///
+    /// Returns the id bound to this connection (allocated from `self.allocator`;
+    /// the caller frees it) together with the key that peer's frames have to be
+    /// signed with, or null when the connection must be dropped. Every rejection
+    /// here is fail-closed with **no fallback**: an unknown claim is not retried
+    /// against the cluster secret, a bad MAC is not treated as a bare frame, and
+    /// no path out of this function ends in an accepted unauthenticated
+    /// connection.
+    fn bindInbound(self: *Self, conn: std.Io.net.Stream) ?Binding {
+        const own = self.own_key orelse {
+            std.log.debug("[DEB] dropping connection: this node has no own_key to bind with", .{});
+            return null;
+        };
+        // The challenge comes from the OS entropy source, never from a clock: the
+        // receiver speaks first so that a captured response cannot be replayed,
+        // and a predictable challenge would hand that replay straight back.
+        var challenge: [handshake_nonce_bytes]u8 = undefined;
+        std.Io.randomSecure(self.io, &challenge) catch |err| {
+            std.log.warn("[DEB] handshake refused: no entropy for a challenge ({})", .{err});
+            return null;
+        };
+        if (!writeHandshake(conn, &challenge)) return null;
+
+        const response = readHandshake(conn, self.allocator) orelse return null;
+        defer self.allocator.free(response);
+        // [dc: 16][claim_id][mac: 32]
+        if (response.len < handshake_nonce_bytes + 1 + auth_mac_bytes) {
+            std.log.debug("[DEB] dropping connection: handshake response is {d} bytes", .{response.len});
+            return null;
+        }
+        const dc = response[0..handshake_nonce_bytes];
+        const claim = response[handshake_nonce_bytes .. response.len - auth_mac_bytes];
+        const mac = response[response.len - auth_mac_bytes ..];
+
+        // The claim is what selects the key; a claim we hold no key for is an
+        // unknown peer, not a peer to fall back on.
+        const claim_key = self.peerKey(claim) orelse {
+            std.log.debug("[DEB] dropping connection: no peer key for handshake claim '{s}'", .{claim});
+            return null;
+        };
+        var expected: [auth_mac_bytes]u8 = undefined;
+        var claim_hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&claim_key);
+        claim_hmac.update(claim);
+        claim_hmac.update(&challenge);
+        claim_hmac.update(dc);
+        claim_hmac.final(&expected);
+        // Constant-time, for the same reason `RaftTransport.verifiedRecv` is: a
+        // byte-wise early exit leaks the tag.
+        if (!ClusterAuth.timingSafeEql(&expected, mac)) {
+            std.log.debug("[DEB] dropping connection: handshake MAC does not verify for claim '{s}'", .{claim});
+            return null;
+        }
+
+        // ③ The mutual half. Bound to the dialer's own `dc`, so one receiver
+        // reply cannot be lifted into a different exchange, and signed with our
+        // key so the dialer can verify it against `peer_keys[us]`.
+        const reply = self.allocator.alloc(u8, self.node_id.len + auth_mac_bytes) catch |err| {
+            std.log.debug("[DEB] dropping connection: handshake reply not allocated ({})", .{err});
+            return null;
+        };
+        defer self.allocator.free(reply);
+        @memcpy(reply[0..self.node_id.len], self.node_id);
+        var reply_hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&own);
+        reply_hmac.update(self.node_id);
+        reply_hmac.update(dc);
+        reply_hmac.final(reply[self.node_id.len..][0..auth_mac_bytes]);
+        if (!writeHandshake(conn, reply)) return null;
+
+        const id_copy = self.allocator.dupe(u8, claim) catch |err| {
+            std.log.debug("[DEB] dropping connection: bound id not stored ({})", .{err});
+            return null;
+        };
+        return .{ .id = id_copy, .key = claim_key };
+    }
+
+    /// The dialing half of the handshake: read the receiver's challenge, prove
+    /// which node this is, and require the receiver to prove itself back before
+    /// the connection is used for anything.
+    ///
+    /// Errors are the fail-closed outcomes; `connectToNode` drops the connection
+    /// on every one of them. `PeerKeyMissing` on either side is the case the
+    /// design names explicitly: no credential for this link means no link.
+    fn bindOutbound(self: *Self, conn: std.Io.net.Stream, peer_id: []const u8) !void {
+        // Both lookups happen **before** a byte is written: there is no point
+        // opening an exchange we cannot finish, and no path where a missing key
+        // degrades into an unverified connection.
+        const own = self.own_key orelse return error.PeerKeyMissing;
+        const peer_key = self.peerKey(peer_id) orelse return error.PeerKeyMissing;
+
+        const challenge = readHandshake(conn, self.allocator) orelse return error.HandshakeRejected;
+        defer self.allocator.free(challenge);
+        if (challenge.len != handshake_nonce_bytes) return error.HandshakeRejected;
+
+        var dc: [handshake_nonce_bytes]u8 = undefined;
+        std.Io.randomSecure(self.io, &dc) catch |err| {
+            std.log.warn("[DEB] handshake refused: no entropy for a nonce ({})", .{err});
+            return error.EntropyUnavailable;
+        };
+
+        const response = try self.allocator.alloc(u8, handshake_nonce_bytes + self.node_id.len + auth_mac_bytes);
+        defer self.allocator.free(response);
+        @memcpy(response[0..handshake_nonce_bytes], &dc);
+        @memcpy(response[handshake_nonce_bytes..][0..self.node_id.len], self.node_id);
+        var response_hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&own);
+        response_hmac.update(self.node_id);
+        response_hmac.update(challenge);
+        response_hmac.update(&dc);
+        response_hmac.final(response[handshake_nonce_bytes + self.node_id.len ..][0..auth_mac_bytes]);
+        if (!writeHandshake(conn, response)) return error.HandshakeRejected;
+
+        const reply = readHandshake(conn, self.allocator) orelse return error.HandshakeRejected;
+        defer self.allocator.free(reply);
+        if (reply.len < 1 + auth_mac_bytes) return error.HandshakeRejected;
+        const receiver_id = reply[0 .. reply.len - auth_mac_bytes];
+        // An answer from a node other than the one we dialled is not an answer to
+        // this dial (the peer-id discipline of `docs/dev/cluster-auth-design.md` §10).
+        if (!std.mem.eql(u8, receiver_id, peer_id)) {
+            std.log.debug("[DEB] handshake refused: dialled '{s}', answered by '{s}'", .{ peer_id, receiver_id });
+            return error.HandshakeRejected;
+        }
+        var expected: [auth_mac_bytes]u8 = undefined;
+        var reply_hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&peer_key);
+        reply_hmac.update(receiver_id);
+        reply_hmac.update(&dc);
+        reply_hmac.final(&expected);
+        if (!ClusterAuth.timingSafeEql(&expected, reply[reply.len - auth_mac_bytes ..])) {
+            std.log.debug("[DEB] handshake refused: '{s}' did not prove it holds its own key", .{peer_id});
+            return error.HandshakeRejected;
+        }
     }
 
     fn handleConnection(self: *Self, conn: std.Io.net.Stream) void {
         defer conn.close(self.io);
 
-        // Bound the **inbound read** — the same `SO_RCVTIMEO` bound Raft's
+        // Bound **each blocking read** — the same `SO_RCVTIMEO` bound Raft's
         // inbound side applies (`sockread.setRecvTimeout`,
         // `ElectionConfig.rpc_timeout_ms`). Without it a peer that connects and
         // then sends nothing holds this handle/fiber forever, and `stop()` waits
         // on those fibers in `fiber_group.await` — a cheap way to stall a node.
+        // It covers the handshake reads too, so a peer that opens a connection
+        // and never answers the challenge costs the bound rather than the fiber.
         //
         // The bound is per *read* and idle-based rather than per message: this
         // stream is long-lived (a healthy peer is quiet between heartbeats and
@@ -502,7 +734,18 @@ pub const DistributedEventBus = struct {
         // than `heartbeat_interval_ms` would tear down healthy connections. At
         // 6× the heartbeat interval it only fires for a peer that is *silent*,
         // and 0 still disables it.
-        self.boundInboundRead(conn);
+        self.applyRecvTimeout(conn);
+
+        // Settle the identity **before** the first event frame. The claim only
+        // exists on a connection that proved it; there is no event path that runs
+        // before this one (`docs/dev/cluster-identity-design.md` §3.2).
+        var binding: ?Binding = null;
+        defer {
+            if (binding) |b| self.allocator.free(b.id);
+        }
+        if (self.authEnabled()) {
+            binding = self.bindInbound(conn) orelse return;
+        }
 
         // Use an Arena for parsing-related allocations that can be cleared per message
         var msg_arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -544,17 +787,32 @@ pub const DistributedEventBus = struct {
                 break;
             };
 
-            // Authenticate before parsing the *event*: what `openEventFrame`
-            // reads ahead of the MAC is only the claimed source, and that is a
-            // KDF input — the event handed to `parseEvent` below comes from the
-            // verified bytes. An unauthenticated frame therefore never becomes an
-            // event, and it is not a *parse* failure either, so it does not go to
-            // the DLQ: the connection is dropped.
-            const data = self.openEventFrame(ma, body.items) orelse break;
+            // Authenticate before parsing anything at all: the key comes from the
+            // binding, not from the frame, so the json handed to `parseEvent`
+            // below is the only parse of these bytes. An unauthenticated frame
+            // never becomes an event, and it is not a *parse* failure either, so
+            // it does not go to the DLQ: the connection is dropped.
+            const sender_key: ?[32]u8 = if (binding) |b| b.key else null;
+            const data = openEventFrame(sender_key, body.items) orelse break;
 
             // Parse using our arena to avoid multiple tiny heap allocations
             if (parseEvent(ma, data)) |event| {
-                if (!self.admitInbound(event)) {
+                // The claim in the json is checked against what the handshake
+                // proved, and a mismatch is not a dropped event but a dropped
+                // connection: a peer that has proven it is `node-a` and then
+                // signs a frame saying `node-b` is either confused or hostile,
+                // and either way this connection can no longer be attributed.
+                if (binding) |b| {
+                    if (!std.mem.eql(u8, event.source_node, b.id)) {
+                        std.log.debug(
+                            "[DEB] dropping connection: frame claims source '{s}' on a connection bound to '{s}'",
+                            .{ event.source_node, b.id },
+                        );
+                        break;
+                    }
+                }
+
+                if (!self.admitInbound(event, binding != null)) {
                     _ = msg_arena.reset(.retain_capacity);
                     continue;
                 }
@@ -576,11 +834,13 @@ pub const DistributedEventBus = struct {
 
     /// The two gates after authentication: the replay sequence, then the
     /// heartbeat short-circuit. Both `continue` in `handleConnection`, so this
-    /// returns true only for a frame that gets dispatched.
-    fn admitInbound(self: *Self, event: NetworkEvent) bool {
+    /// returns true only for a frame that gets dispatched. `authenticated` is
+    /// whether this connection was bound to a peer; only that path carries a
+    /// sequence, and a bare frame has nothing to compare.
+    fn admitInbound(self: *Self, event: NetworkEvent, authenticated: bool) bool {
         // Only the authenticated path carries a sequence (it is part of the MAC'd
         // region); a bare frame has nothing to compare.
-        if (self.cluster_secret != null and !self.acceptSeq(event.source_node, event.seq)) {
+        if (authenticated and !self.acceptSeq(event.source_node, event.seq)) {
             std.log.debug(
                 "[DEB] dropping frame from '{s}' with seq {d}: not ahead of the last accepted one",
                 .{ event.source_node, event.seq },
@@ -1060,12 +1320,63 @@ pub const DistributedEventBus = struct {
         return buf;
     }
 
-    /// Set the key peer frames are signed and verified with. Null (the default)
-    /// means bare frames — `ClusterBootstrap` only ever sets a non-null
-    /// `cluster_secret` behind its multi-node gate, so the enforced path is the
-    /// authenticated one. See the wire-format comment at the top of this file.
+    /// Select the authenticated path (`ClusterBootstrap` does this behind its
+    /// multi-node gate, from `config.cluster_secret`). It is **not** a frame key:
+    /// node credentials come from `setOwnKey` / `setPeerKey`. See the handshake
+    /// comment at the top of this file.
     pub fn setClusterSecret(self: *Self, key: [32]u8) void {
         self.cluster_secret = key;
+        self.credentials_configured.store(true, .release);
+    }
+
+    /// This node's own credential — what it proves at handshake time and signs
+    /// its frames with. Source it from `secrets.SecretsManager`; the framework
+    /// deliberately does not read keys for you (the same convention as
+    /// `cluster_secret`).
+    pub fn setOwnKey(self: *Self, key: [32]u8) void {
+        self.own_key = key;
+        self.credentials_configured.store(true, .release);
+    }
+
+    /// How this node verifies `peer_id`: that node's **own** key. Set one per
+    /// peer — a cluster member we have no key for cannot be talked to at all
+    /// (`connectToNode` returns `error.PeerKeyMissing`) and cannot connect to us
+    /// (its claim is closed at the handshake), which is the fail-closed shape
+    /// `docs/dev/cluster-identity-design.md` §5 asks for.
+    pub fn setPeerKey(self: *Self, peer_id: []const u8, key: [32]u8) !void {
+        const id_copy = try self.allocator.dupe(u8, peer_id);
+        errdefer self.allocator.free(id_copy);
+
+        self.peer_keys_lock.lock(self.io) catch return error.KeyTableLocked;
+        defer self.peer_keys_lock.unlock(self.io);
+
+        const gop = try self.peer_keys.getOrPut(id_copy);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = id_copy;
+        } else {
+            self.allocator.free(id_copy);
+        }
+        gop.value_ptr.* = key;
+        self.credentials_configured.store(true, .release);
+    }
+
+    /// The key recorded for `peer_id`, or null. Locked: the table is read from
+    /// accept/handle fibers while an app may still be filling it in.
+    fn peerKey(self: *Self, peer_id: []const u8) ?[32]u8 {
+        self.peer_keys_lock.lock(self.io) catch return null;
+        defer self.peer_keys_lock.unlock(self.io);
+        return self.peer_keys.get(peer_id);
+    }
+
+    /// True once **any** credential is configured: a `cluster_secret`
+    /// (`ClusterBootstrap`'s gate judged it), an `own_key`, or any peer key.
+    ///
+    /// This is the switch between the two wire formats, and it is the reason
+    /// there is no downgrade path: once it is true, `handleConnection` requires a
+    /// handshake and `connectToNode` requires a peer key, so a bare frame on this
+    /// port is a failed handshake rather than an unauthenticated delivery.
+    fn authEnabled(self: *Self) bool {
+        return self.cluster_secret != null or self.credentials_configured.load(.acquire);
     }
 
     /// Get list of connected nodes
@@ -1097,6 +1408,12 @@ pub const DistributedEventBus = struct {
             }
         }
 
+        // Fail-closed **before** the dial: with credentials configured, a peer we
+        // hold no key for is a peer we cannot talk to, and finding that out after
+        // connecting — or, worse, falling back to bare frames — is exactly the
+        // downgrade `docs/dev/cluster-identity-design.md` §5 forbids.
+        if (self.authEnabled() and self.peerKey(node_id) == null) return error.PeerKeyMissing;
+
         const id_copy = try self.allocator.dupe(u8, node_id);
         errdefer self.allocator.free(id_copy);
 
@@ -1106,6 +1423,20 @@ pub const DistributedEventBus = struct {
             break :blk null;
         };
         errdefer if (stream) |s| s.close(self.io);
+
+        // The identity is settled before the socket is registered anywhere: a
+        // peer that cannot prove itself is not a peer, and `socket = null` is how
+        // this bus already says "tracked for routing, not reachable". A refused
+        // handshake is therefore a *connection* failure, not a fatal error for
+        // the caller — the same shape as the connect failure above.
+        if (stream) |s| {
+            self.applyRecvTimeout(s);
+            self.bindOutbound(s, node_id) catch |err| {
+                std.log.warn("[DistributedEventBus] Peer {s} at {any} refused the handshake: {}", .{ node_id, address, err });
+                s.close(self.io);
+                stream = null;
+            };
+        }
 
         try self.nodes.append(.{
             .id = id_copy,
@@ -1579,20 +1910,13 @@ test "DistributedEventBus duplicate connect reconciles partitioner" {
 // — no thread and no read timing, except where a split into two separately
 // observed reads is the thing under test.
 
-/// The bytes of one bus frame, built the way `sendEventFrame` builds them: the
-/// receive-side tests need raw bytes (a body split across two writes, a body
-/// that changed after it was signed), which is exactly why they do not go
-/// through the sender. `claim` is what the frame states as its source, and it is
-/// what the key is derived from — a fixture that MAC'd with the raw secret would
-/// no longer be a frame any receiver accepts.
-fn testFrame(allocator: std.mem.Allocator, secret: ?[32]u8, claim: []const u8, json: []const u8) ![]u8 {
-    const key: ?[32]u8 = if (secret) |s| DistributedEventBus.identityKey(s, claim) else null;
-    return testFrameRaw(allocator, key, json);
-}
-
-/// The same bytes MAC'd with `key` directly — the shape the pre-KDF sender wrote,
-/// kept so a test can show that a cluster-wide key no longer verifies.
-fn testFrameRaw(allocator: std.mem.Allocator, key: ?[32]u8, json: []const u8) ![]u8 {
+/// The bytes of one bus frame, built the way `sendEventFrame` builds them:
+/// `[4-byte BE len][mac32][json]` with a key, `[4-byte BE len][json]` without.
+/// The MAC is keyed with the **sender's own** key, which is what the receiver
+/// looks up for the peer its handshake bound (`peer_keys[bound_id]`) — so a
+/// fixture that MAC'd with the receiver's key, or with a cluster secret, would
+/// not be a frame any receiver accepts.
+fn testFrame(allocator: std.mem.Allocator, key: ?[32]u8, json: []const u8) ![]u8 {
     const mac_len: usize = if (key != null) auth_mac_bytes else 0;
     const frame = try allocator.alloc(u8, 4 + mac_len + json.len);
     std.mem.writeInt(u32, frame[0..4], @intCast(mac_len + json.len), .big);
@@ -1606,7 +1930,11 @@ fn testFrameRaw(allocator: std.mem.Allocator, key: ?[32]u8, json: []const u8) ![
 }
 
 /// Hand `bytes` to `bus.handleConnection` as the peer end of a fresh socketpair,
-/// with the writer half already closed.
+/// with the writer half already closed. The writer half is closed *before* the
+/// call, so this is only usable on the **bare** path: a bus with credentials
+/// sends its challenge first, and a closed peer end turns that into an
+/// immediate write error. Authenticated connections need a peer that answers —
+/// see `feedAuthed`.
 fn feedFrame(bus: *DistributedEventBus, bytes: []const u8) !void {
     var fds: [2]std.posix.socket_t = undefined;
     const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
@@ -1625,6 +1953,230 @@ fn feedFrame(bus: *DistributedEventBus, bytes: []const u8) !void {
     bus.is_running = true;
     bus.handleConnection(reader_side);
     bus.is_running = false;
+}
+
+// ── Driver for authenticated connections ────────────────────────────────────
+//
+// A bound connection is a *conversation* — receiver challenges, peer answers,
+// receiver answers back — so a fixture that only writes bytes is not a peer any
+// more. These helpers play the peer end while `handleConnection` runs on
+// another thread, which is also what makes "the connection was closed" an
+// observable outcome: a frame written after the receiver gave up reaches
+// nobody.
+
+/// Both ends of a fresh `socketpair`.
+const SocketPair = struct {
+    /// Handed to `handleConnection`.
+    conn: std.Io.net.Stream,
+    /// The peer end the test drives.
+    peer: std.Io.net.Stream,
+};
+
+fn openSocketPair() !SocketPair {
+    var fds: [2]std.posix.socket_t = undefined;
+    const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    return .{
+        .conn = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } },
+        .peer = std.Io.net.Stream{ .socket = .{ .handle = fds[1], .address = undefined } },
+    };
+}
+
+/// Read one length-prefixed handshake message from the peer end. Null on EOF or
+/// a short read — which is also how "the receiver hung up" shows up here.
+fn peerReadMessage(allocator: std.mem.Allocator, sock: std.Io.net.Stream) ?[]u8 {
+    var len_buf: [4]u8 = undefined;
+    sockread.readFull(sock, &len_buf) catch |err| {
+        std.log.debug("[test] peer read stopped: {}", .{err});
+        return null;
+    };
+    const n = std.mem.readInt(u32, &len_buf, .big);
+    if (n == 0 or n > max_frame_size) return null;
+    const body = allocator.alloc(u8, n) catch return null;
+    sockread.readFull(sock, body) catch |err| {
+        std.log.debug("[test] peer read stopped mid-message: {}", .{err});
+        allocator.free(body);
+        return null;
+    };
+    return body;
+}
+
+fn peerWriteMessage(sock: std.Io.net.Stream, body: []const u8) !void {
+    var len_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_buf, @intCast(body.len), .big);
+    try sockread.writevAll(sock, &.{ &len_buf, body });
+}
+
+/// The dialer half, played from the peer end: answer the receiver's challenge as
+/// `claim` (signing with `sign_key`) and require the receiver to prove itself
+/// with `receiver_key`. Returns the response body it sent, so a test can replay
+/// those exact bytes on a fresh connection.
+fn peerAnswerChallenge(
+    allocator: std.mem.Allocator,
+    sock: std.Io.net.Stream,
+    claim: []const u8,
+    sign_key: [32]u8,
+    receiver_id: []const u8,
+    receiver_key: [32]u8,
+) ![]u8 {
+    const challenge = peerReadMessage(allocator, sock) orelse return error.HandshakeRefused;
+    defer allocator.free(challenge);
+    if (challenge.len != handshake_nonce_bytes) return error.HandshakeRefused;
+
+    var dc: [handshake_nonce_bytes]u8 = undefined;
+    std.Io.randomSecure(std.testing.io, &dc) catch return error.EntropyUnavailable;
+
+    const response = try allocator.alloc(u8, handshake_nonce_bytes + claim.len + auth_mac_bytes);
+    errdefer allocator.free(response);
+    @memcpy(response[0..handshake_nonce_bytes], &dc);
+    @memcpy(response[handshake_nonce_bytes..][0..claim.len], claim);
+    var claim_hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&sign_key);
+    claim_hmac.update(claim);
+    claim_hmac.update(challenge);
+    claim_hmac.update(&dc);
+    claim_hmac.final(response[handshake_nonce_bytes + claim.len ..][0..auth_mac_bytes]);
+    try peerWriteMessage(sock, response);
+
+    // ③ The receiver's half of the mutual exchange, over the `dc` above.
+    const reply = peerReadMessage(allocator, sock) orelse return error.HandshakeRefused;
+    defer allocator.free(reply);
+    if (reply.len < 1 + auth_mac_bytes) return error.HandshakeRefused;
+    const reply_id = reply[0 .. reply.len - auth_mac_bytes];
+    try std.testing.expectEqualStrings(receiver_id, reply_id);
+    var expected: [auth_mac_bytes]u8 = undefined;
+    var reply_hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&receiver_key);
+    reply_hmac.update(reply_id);
+    reply_hmac.update(&dc);
+    reply_hmac.final(&expected);
+    try std.testing.expectEqualSlices(u8, &expected, reply[reply.len - auth_mac_bytes ..]);
+    return response;
+}
+
+/// Write one event frame from the peer end. `key` null writes a bare frame.
+fn peerWriteFrame(allocator: std.mem.Allocator, sock: std.Io.net.Stream, key: ?[32]u8, json: []const u8) !void {
+    const frame = try testFrame(allocator, key, json);
+    defer allocator.free(frame);
+    try sockread.writeFull(sock, frame);
+}
+
+/// The **receiver** half, played from the peer end — the counterpart of
+/// `peerAnswerChallenge`, for tests about what the dialer does with the answer.
+/// `reply_key` is the credential the reply is signed with, so a test can hand an
+/// otherwise honest receiver the wrong one and watch the dialer refuse it.
+/// `claim_key` is what the receiver uses to check the dialer's claim.
+fn peerServeAsReceiver(
+    allocator: std.mem.Allocator,
+    sock: std.Io.net.Stream,
+    receiver_id: []const u8,
+    reply_key: [32]u8,
+    claim_key: [32]u8,
+) !void {
+    var challenge: [handshake_nonce_bytes]u8 = undefined;
+    std.Io.randomSecure(std.testing.io, &challenge) catch return error.EntropyUnavailable;
+    try peerWriteMessage(sock, &challenge);
+
+    const response = peerReadMessage(allocator, sock) orelse return error.HandshakeRefused;
+    defer allocator.free(response);
+    if (response.len < handshake_nonce_bytes + 1 + auth_mac_bytes) return error.HandshakeRefused;
+    const dc = response[0..handshake_nonce_bytes];
+    const claim = response[handshake_nonce_bytes .. response.len - auth_mac_bytes];
+    // The claim is checked before the reply goes out, exactly like the real
+    // receiver: an unproven dialer gets nothing back.
+    var expected: [auth_mac_bytes]u8 = undefined;
+    var claim_hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&claim_key);
+    claim_hmac.update(claim);
+    claim_hmac.update(&challenge);
+    claim_hmac.update(dc);
+    claim_hmac.final(&expected);
+    try std.testing.expectEqualSlices(u8, &expected, response[response.len - auth_mac_bytes ..]);
+
+    const reply = try allocator.alloc(u8, receiver_id.len + auth_mac_bytes);
+    defer allocator.free(reply);
+    @memcpy(reply[0..receiver_id.len], receiver_id);
+    var reply_hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&reply_key);
+    reply_hmac.update(receiver_id);
+    reply_hmac.update(dc);
+    reply_hmac.final(reply[receiver_id.len..][0..auth_mac_bytes]);
+    try peerWriteMessage(sock, reply);
+}
+
+/// A `peerServeAsReceiver` running on its own thread, so the test thread can be
+/// the dialer (`bindOutbound` blocks reading the challenge).
+const ReceiverFixture = struct {
+    allocator: std.mem.Allocator,
+    sock: std.Io.net.Stream,
+    id: []const u8,
+    reply_key: [32]u8,
+    claim_key: [32]u8,
+    err: ?anyerror = null,
+
+    fn run(self: *ReceiverFixture) void {
+        peerServeAsReceiver(self.allocator, self.sock, self.id, self.reply_key, self.claim_key) catch |e| {
+            self.err = e;
+            return;
+        };
+        self.err = null;
+    }
+};
+
+/// One authenticated connection to `bus`: complete the handshake as `claim`
+/// (holding `sign_key`) and then write every frame in `frames`, MAC'd with
+/// `frame_key`. The receiver's own key is taken from `bus.own_key`, so the
+/// mutual half of the exchange is checked too.
+///
+/// A receiver that refuses the handshake simply closes, which is why this does
+/// not report an error: the assertion in every refusal test is that nothing was
+/// delivered — including the frames written **after** the refusal, since a
+/// closed connection has to stay closed.
+fn feedAuthed(
+    bus: *DistributedEventBus,
+    claim: []const u8,
+    sign_key: [32]u8,
+    frame_key: ?[32]u8,
+    frames: []const []const u8,
+) void {
+    const allocator = std.testing.allocator;
+    const pair = openSocketPair() catch {
+        std.log.debug("[test] no socketpair on this platform", .{});
+        return;
+    };
+
+    bus.is_running = true;
+    const reader = std.Thread.spawn(.{}, DistributedEventBus.handleConnection, .{ bus, pair.conn }) catch {
+        pair.conn.close(std.testing.io);
+        pair.peer.close(std.testing.io);
+        return;
+    };
+    defer {
+        pair.peer.close(std.testing.io);
+        reader.join();
+        bus.is_running = false;
+    }
+
+    const receiver_key = bus.own_key orelse {
+        std.log.debug("[test] feedAuthed needs an own_key on the receiver", .{});
+        return;
+    };
+    const response = peerAnswerChallenge(allocator, pair.peer, claim, sign_key, bus.node_id, receiver_key) catch |err| {
+        // Expected for the refusal tests: the receiver hung up instead of
+        // answering, and the frames below land on a closed socket.
+        std.log.debug("[test] peer handshake ended: {}", .{err});
+        for (frames) |json| peerWriteFrame(allocator, pair.peer, frame_key, json) catch |werr| {
+            std.log.debug("[test] write to a closed connection: {}", .{werr});
+        };
+        return;
+    };
+    allocator.free(response);
+
+    for (frames) |json| {
+        peerWriteFrame(allocator, pair.peer, frame_key, json) catch |err| {
+            std.log.debug("[test] peer write stopped: {}", .{err});
+            return;
+        };
+    }
 }
 
 /// A bus with a subscriber that counts events on one topic. `received` is the
@@ -1660,7 +2212,7 @@ test "a frame split across two writes delivers exactly one event" {
         .timestamp = 7,
     }, &json_buf);
     try std.testing.expect(json.len > 400);
-    const frame = try testFrame(allocator, null, "peer", json);
+    const frame = try testFrame(allocator, null, json);
     defer allocator.free(frame);
 
     // Split inside the payload string, so the first chunk cannot parse as a
@@ -1719,9 +2271,9 @@ test "two frames in one write deliver both events" {
         .timestamp = 2,
     }, &json_b_buf);
 
-    const frame_a = try testFrame(allocator, null, "peer", json_a);
+    const frame_a = try testFrame(allocator, null, json_a);
     defer allocator.free(frame_a);
-    const frame_b = try testFrame(allocator, null, "peer", json_b);
+    const frame_b = try testFrame(allocator, null, json_b);
     defer allocator.free(frame_b);
 
     // Both messages in a single write. The old loop read once per message, so
@@ -1735,23 +2287,19 @@ test "two frames in one write deliver both events" {
 
 test "a signed frame round-trips: publish → wire → subscriber" {
     const allocator = std.testing.allocator;
-    const secret: [32]u8 = @splat(0x5a);
+    const sender_key: [32]u8 = @splat(0x5a);
+    const receiver_key: [32]u8 = @splat(0x51);
     const topic = "wire.topic";
 
-    // The sender half: a real node with a real secret, writing to the peer end
-    // of a socketpair instead of dialling.
+    // The sender half: a real node with its own credential, writing to the peer
+    // end of a socketpair instead of dialling.
     var sender = try DistributedEventBus.init(allocator, std.testing.io, "sender-node");
     defer sender.deinit();
-    sender.setClusterSecret(secret);
+    sender.setOwnKey(sender_key);
 
-    var fds: [2]std.posix.socket_t = undefined;
-    const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
-    switch (std.posix.errno(rc)) {
-        .SUCCESS => {},
-        else => return error.SkipZigTest,
-    }
-    const peer_side = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } };
-    const bus_side = std.Io.net.Stream{ .socket = .{ .handle = fds[1], .address = undefined } };
+    const pair = try openSocketPair();
+    const peer_side = pair.conn;
+    const bus_side = pair.peer;
     try sender.nodes.append(.{
         .id = try allocator.dupe(u8, "receiver-node"), // owned by the bus, freed by `deinit`
         .address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 19100),
@@ -1773,16 +2321,15 @@ test "a signed frame round-trips: publish → wire → subscriber" {
 
     try std.testing.expect(body_len > auth_mac_bytes);
     const json = body[auth_mac_bytes..];
-    // The key is the *claim's*, not the cluster secret: `identityKey(secret,
-    // "sender-node")`. The raw secret must not verify, or the source a peer
-    // states would be an unauthenticated self-description again.
-    const key = DistributedEventBus.identityKey(secret, "sender-node");
+    // The key is the **sender's own**, which is what the receiver looks up for
+    // the peer its handshake bound. The receiver's key must not verify, or the
+    // two directions would disagree about who signs what.
     var expected_mac: [auth_mac_bytes]u8 = undefined;
-    std.crypto.auth.hmac.sha2.HmacSha256.create(&expected_mac, json, &key);
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&expected_mac, json, &sender_key);
     try std.testing.expectEqualSlices(u8, &expected_mac, body[0..auth_mac_bytes]);
-    var cluster_wide: [auth_mac_bytes]u8 = undefined;
-    std.crypto.auth.hmac.sha2.HmacSha256.create(&cluster_wide, json, &secret);
-    try std.testing.expect(!std.mem.eql(u8, &cluster_wide, body[0..auth_mac_bytes]));
+    var peer_keyed: [auth_mac_bytes]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&peer_keyed, json, &receiver_key);
+    try std.testing.expect(!std.mem.eql(u8, &peer_keyed, body[0..auth_mac_bytes]));
     const parsed = DistributedEventBus.parseEvent(allocator, json) orelse return error.TestUnexpectedResult;
     defer allocator.free(parsed.topic);
     defer allocator.free(parsed.payload);
@@ -1791,65 +2338,67 @@ test "a signed frame round-trips: publish → wire → subscriber" {
     try std.testing.expectEqualStrings("signed-payload", parsed.payload);
     try std.testing.expectEqualStrings("sender-node", parsed.source_node);
 
-    // …and the very same bytes are what a receiving bus dispatches.
-    const frame = try allocator.alloc(u8, 4 + body_len);
-    defer allocator.free(frame);
-    @memcpy(frame[0..4], &len_buf);
-    @memcpy(frame[4..], body);
-
+    // …and the same json is what a receiving bus dispatches: the peer plays
+    // `sender-node` through a real handshake (holding its own key), and the
+    // receiver verifies with the key it holds for that id.
     var received: usize = 0;
     var receiver = try framedBus(allocator, "receiver-node", topic, &received);
     defer receiver.deinit();
-    receiver.setClusterSecret(secret);
-    try feedFrame(&receiver, frame);
+    receiver.setOwnKey(receiver_key);
+    try receiver.setPeerKey("sender-node", sender_key);
+    feedAuthed(&receiver, "sender-node", sender_key, sender_key, &.{json});
 
     try std.testing.expectEqual(@as(usize, 1), received);
 }
 
 test "a frame signed with another key is dropped" {
     const allocator = std.testing.allocator;
-    const sender_key: [32]u8 = @splat(0x11);
-    const receiver_key: [32]u8 = @splat(0x22);
+    const peer_key: [32]u8 = @splat(0x11);
+    const other_key: [32]u8 = @splat(0x22);
+    const receiver_key: [32]u8 = @splat(0x23);
 
     var json_buf: [128]u8 = undefined;
     const json = DistributedEventBus.serializeEvent(.{
         .topic = "key.topic",
         .payload = "confidential",
-        .source_node = "peer",
+        .source_node = "peer-a",
         .timestamp = 3,
+        .seq = 1,
     }, &json_buf);
-    const frame = try testFrame(allocator, sender_key, "peer", json);
-    defer allocator.free(frame);
 
     var received: usize = 0;
-    var wrong_key = try framedBus(allocator, "wrong-key-node", "key.topic", &received);
-    defer wrong_key.deinit();
-    wrong_key.setClusterSecret(receiver_key);
-    try feedFrame(&wrong_key, frame);
+    var bus = try framedBus(allocator, "key-node", "key.topic", &received);
+    defer bus.deinit();
+    bus.setOwnKey(receiver_key);
+    try bus.setPeerKey("peer-a", peer_key);
+
+    // The handshake succeeds — the peer really does hold `peer_key` — and then it
+    // signs the frame with a key the receiver holds nothing for. The key is not
+    // negotiated per frame, it is the one the bind established.
+    feedAuthed(&bus, "peer-a", peer_key, other_key, &.{json});
     try std.testing.expectEqual(@as(usize, 0), received);
 
-    // Positive control: the fixture is a frame that *is* deliverable — the same
-    // bytes reach the subscriber when the key matches, so the assertion above is
-    // about the key and not about a broken frame.
-    var right_key = try framedBus(allocator, "right-key-node", "key.topic", &received);
-    defer right_key.deinit();
-    right_key.setClusterSecret(sender_key);
-    try feedFrame(&right_key, frame);
+    // Positive control: the same json, from the same bound peer, signed with the
+    // key that peer is known by. Delivered — so the assertion above is about the
+    // key and not about a frame that could never arrive.
+    feedAuthed(&bus, "peer-a", peer_key, peer_key, &.{json});
     try std.testing.expectEqual(@as(usize, 1), received);
 }
 
 test "a frame whose json changed after signing is dropped" {
     const allocator = std.testing.allocator;
-    const secret: [32]u8 = @splat(0x33);
+    const peer_key: [32]u8 = @splat(0x33);
+    const receiver_key: [32]u8 = @splat(0x34);
 
     var json_buf: [128]u8 = undefined;
     const json = DistributedEventBus.serializeEvent(.{
         .topic = "tamper.topic",
         .payload = "original-payload",
-        .source_node = "peer",
+        .source_node = "peer-t",
         .timestamp = 4,
+        .seq = 1,
     }, &json_buf);
-    const frame = try testFrame(allocator, secret, "peer", json);
+    const frame = try testFrame(allocator, peer_key, json);
     defer allocator.free(frame);
 
     // Flip one byte of the payload value, leaving the JSON valid and the topic —
@@ -1861,20 +2410,23 @@ test "a frame whose json changed after signing is dropped" {
     defer allocator.free(tampered);
     tampered[payload_at + "\"payload\":\"".len] ^= 0x01;
     try std.testing.expect(!std.mem.eql(u8, frame, tampered));
+    const tampered_json = tampered[4 + auth_mac_bytes ..];
 
     var received: usize = 0;
     var bus = try framedBus(allocator, "tamper-node", "tamper.topic", &received);
     defer bus.deinit();
-    bus.setClusterSecret(secret);
+    bus.setOwnKey(receiver_key);
+    try bus.setPeerKey("peer-t", peer_key);
 
-    // Positive control: the untampered frame is delivered.
-    try feedFrame(&bus, frame);
+    // Positive control: the untampered json on a bound connection is delivered.
+    feedAuthed(&bus, "peer-t", peer_key, peer_key, &.{json});
     try std.testing.expectEqual(@as(usize, 1), received);
 
-    // Changed after signing → the MAC no longer matches → dropped, nothing
-    // dispatched (the frame never reaches `parseEvent`, so it is not a DLQ entry
-    // either).
-    try feedFrame(&bus, tampered);
+    // Changed after signing → the MAC no longer matches → the connection is
+    // dropped, and nothing is dispatched (the frame never reaches `parseEvent`,
+    // so it is not a DLQ entry either). `seq` is one higher so the assertion is
+    // about the tag and not about the replay window.
+    feedAuthed(&bus, "peer-t", peer_key, peer_key, &.{tampered_json});
     try std.testing.expectEqual(@as(usize, 1), received);
 }
 
@@ -1990,7 +2542,7 @@ test "a payload that injects a duplicate field is not delivered as somebody else
     var bus = try framedBus(allocator, "inject-node", "inject.topic", &received);
     defer bus.deinit();
 
-    const frame = try testFrame(allocator, null, "peer", json);
+    const frame = try testFrame(allocator, null, json);
     defer allocator.free(frame);
     try feedFrame(&bus, frame);
 
@@ -2001,9 +2553,18 @@ test "a payload that injects a duplicate field is not delivered as somebody else
     try std.testing.expectEqual(@as(usize, 1), received);
 }
 
-test "a frame is keyed by the source it claims, not by the cluster secret" {
+// ── Identity binding: the §7 red-evidence list ──────────────────────────────
+//
+// `docs/dev/cluster-identity-design.md` §7. These are the cases the handshake
+// exists for; #3 is the criterion for the whole design — the previous scheme
+// (`identityKey`, a key derived from the value the frame itself claims) **passes**
+// it whenever the attacker holds the cluster secret.
+
+test "a claim answered with another node's key is refused" {
     const allocator = std.testing.allocator;
-    const secret: [32]u8 = @splat(0x7e);
+    const node_a_key: [32]u8 = @splat(0xa1);
+    const node_b_key: [32]u8 = @splat(0xb2);
+    const receiver_key: [32]u8 = @splat(0xc3);
 
     var json_buf: [256]u8 = undefined;
     const json = DistributedEventBus.serializeEvent(.{
@@ -2011,43 +2572,345 @@ test "a frame is keyed by the source it claims, not by the cluster secret" {
         .payload = "p",
         .source_node = "node-b",
         .timestamp = 12,
+        .seq = 1,
     }, &json_buf);
 
     var received: usize = 0;
     var bus = try framedBus(allocator, "claim-node", "claim.topic", &received);
     defer bus.deinit();
-    bus.setClusterSecret(secret);
+    bus.setOwnKey(receiver_key);
+    try bus.setPeerKey("node-a", node_a_key);
+    try bus.setPeerKey("node-b", node_b_key);
 
-    // Signed with the raw cluster secret — the pre-KDF scheme — while claiming
-    // `node-b`. The receiver derives its key from the claim, so this cannot
-    // verify; a single cluster-wide key would accept it.
-    const cluster_wide = try testFrameRaw(allocator, secret, json);
-    defer allocator.free(cluster_wide);
-    try feedFrame(&bus, cluster_wide);
+    // The claim is `node-b` but the MAC is computed with **node-a's** key — the
+    // shape of a member that holds its own credential and tries to appear as
+    // somebody else. The receiver keys the check off the claim, so this cannot
+    // verify. (This is §7 #1.)
+    feedAuthed(&bus, "node-b", node_a_key, node_a_key, &.{json});
     try std.testing.expectEqual(@as(usize, 0), received);
 
-    // A frame keyed for a **different** claim must not verify either. Without this
-    // the test above proves only that the key is not the raw secret: an
-    // `identityKey` that ignored its `claim` argument (say, one fixed label) would
-    // still satisfy both cases while the binding this item exists for was gone.
-    // Verified red: `_ = claim;` in `identityKey` makes this line fail — the two
-    // cases above keep passing, which is exactly why this assertion has to be here.
-    const wrong_claim_key = DistributedEventBus.identityKey(secret, "node-a");
-    const signed_for_a = try testFrameRaw(allocator, wrong_claim_key, json);
-    defer allocator.free(signed_for_a);
-    try feedFrame(&bus, signed_for_a);
-    try std.testing.expectEqual(@as(usize, 0), received); // still nothing delivered
-
-    // Positive control: the same json keyed the way a sender of `node-b` keys it.
-    const per_identity = try testFrame(allocator, secret, "node-b", json);
-    defer allocator.free(per_identity);
-    try feedFrame(&bus, per_identity);
+    // Positive control: the same claim signed with the key that claim owns is
+    // accepted, so the line above is about *whose* key it is, not about a
+    // handshake that could never succeed.
+    feedAuthed(&bus, "node-b", node_b_key, node_b_key, &.{json});
     try std.testing.expectEqual(@as(usize, 1), received);
+}
+
+test "a replayed handshake is refused on a fresh connection" {
+    const allocator = std.testing.allocator;
+    const peer_key: [32]u8 = @splat(0xd4);
+    const receiver_key: [32]u8 = @splat(0xd5);
+
+    var json_buf: [256]u8 = undefined;
+    const json = DistributedEventBus.serializeEvent(.{
+        .topic = "replay.handshake",
+        .payload = "p",
+        .source_node = "node-a",
+        .timestamp = 13,
+        .seq = 1,
+    }, &json_buf);
+
+    var received: usize = 0;
+    var bus = try framedBus(allocator, "replay-handshake-node", "replay.handshake", &received);
+    defer bus.deinit();
+    bus.setOwnKey(receiver_key);
+    try bus.setPeerKey("node-a", peer_key);
+
+    // First connection: the exchange succeeds and the response bytes are kept.
+    const first = try openSocketPair();
+    bus.is_running = true;
+    const first_reader = try std.Thread.spawn(.{}, DistributedEventBus.handleConnection, .{ &bus, first.conn });
+    const captured = try peerAnswerChallenge(allocator, first.peer, "node-a", peer_key, bus.node_id, receiver_key);
+    defer allocator.free(captured);
+    first.peer.close(std.testing.io);
+    first_reader.join();
+    bus.is_running = false;
+
+    // Second connection: the challenge is new, so the recorded response — MAC
+    // over the *previous* challenge — cannot verify. (§7 #2: a receiver that did
+    // not put its challenge inside the MAC would accept this and be impersonated.)
+    const second = try openSocketPair();
+    bus.is_running = true;
+    const second_reader = try std.Thread.spawn(.{}, DistributedEventBus.handleConnection, .{ &bus, second.conn });
+    const fresh_challenge = peerReadMessage(allocator, second.peer) orelse return error.TestUnexpectedResult;
+    defer allocator.free(fresh_challenge);
+    try peerWriteMessage(second.peer, captured);
+    // A connection that was refused must stay refused: even a frame the receiver
+    // would otherwise accept on this bound id has to reach nobody.
+    peerWriteFrame(allocator, second.peer, peer_key, json) catch |err| {
+        std.log.debug("[test] write to a refused connection: {}", .{err});
+    };
+    second.peer.close(std.testing.io);
+    second_reader.join();
+    bus.is_running = false;
+
+    try std.testing.expectEqual(@as(usize, 0), received);
+}
+
+test "a frame claiming another node on a bound connection is refused, not delivered" {
+    const allocator = std.testing.allocator;
+    const node_a_key: [32]u8 = @splat(0xe1);
+    const node_b_key: [32]u8 = @splat(0xe2);
+    const receiver_key: [32]u8 = @splat(0xe3);
+
+    var stolen_buf: [256]u8 = undefined;
+    const stolen = DistributedEventBus.serializeEvent(.{
+        .topic = "bound.topic",
+        .payload = "as-node-b",
+        .source_node = "node-b",
+        .timestamp = 14,
+        .seq = 1,
+    }, &stolen_buf);
+    var real_buf: [256]u8 = undefined;
+    const real = DistributedEventBus.serializeEvent(.{
+        .topic = "bound.topic",
+        .payload = "as-node-a",
+        .source_node = "node-a",
+        .timestamp = 15,
+        .seq = 2,
+    }, &real_buf);
+
+    var received: usize = 0;
+    var bus = try framedBus(allocator, "bound-node", "bound.topic", &received);
+    defer bus.deinit();
+    bus.setOwnKey(receiver_key);
+    try bus.setPeerKey("node-a", node_a_key);
+    try bus.setPeerKey("node-b", node_b_key);
+
+    // This is §7 #3, the criterion for the whole design: the connection is bound
+    // to `node-a` (a real handshake with node-a's key), and then a frame arrives
+    // carrying `"source":"node-b"`, signed with node-a's key — i.e. node-a trying
+    // to appear as node-b, which is exactly what the old `identityKey` scheme
+    // *allowed* for anyone holding the cluster secret.
+    //
+    // `real` is written **after** `stolen`, and it must not be delivered either:
+    // a source mismatch drops the connection, it does not just drop the frame.
+    // Without that, an attacker could hide the impersonation attempt at the
+    // front of a stream of legitimate-looking events.
+    feedAuthed(&bus, "node-a", node_a_key, node_a_key, &.{ stolen, real });
+
+    try std.testing.expectEqual(@as(usize, 0), received);
+}
+
+test "an event frame before the handshake is refused" {
+    const allocator = std.testing.allocator;
+    const peer_key: [32]u8 = @splat(0xf1);
+    const receiver_key: [32]u8 = @splat(0xf2);
+
+    var json_buf: [256]u8 = undefined;
+    const json = DistributedEventBus.serializeEvent(.{
+        .topic = "unbound.topic",
+        .payload = "straight-to-the-point",
+        .source_node = "node-a",
+        .timestamp = 16,
+        .seq = 1,
+    }, &json_buf);
+
+    var received: usize = 0;
+    var bus = try framedBus(allocator, "unbound-node", "unbound.topic", &received);
+    defer bus.deinit();
+    bus.setOwnKey(receiver_key);
+    try bus.setPeerKey("node-a", peer_key);
+
+    // §7 #4: no handshake, just a correctly signed frame on a fresh connection.
+    // The first thing an authenticated bus reads must be a handshake response, so
+    // this is not an event — it is a malformed answer to the challenge, and the
+    // connection goes away. There is no "accept the frame anyway" path.
+    const pair = try openSocketPair();
+    bus.is_running = true;
+    const reader = try std.Thread.spawn(.{}, DistributedEventBus.handleConnection, .{ &bus, pair.conn });
+
+    const challenge = peerReadMessage(allocator, pair.peer);
+    try std.testing.expect(challenge != null);
+    if (challenge) |c| allocator.free(c);
+    peerWriteFrame(allocator, pair.peer, peer_key, json) catch |err| {
+        std.log.debug("[test] write to a refused connection: {}", .{err});
+    };
+    pair.peer.close(std.testing.io);
+    reader.join();
+    bus.is_running = false;
+
+    try std.testing.expectEqual(@as(usize, 0), received);
+}
+
+test "connectToNode refuses a peer with no key before it dials" {
+    const allocator = std.testing.allocator;
+    var bus = try DistributedEventBus.init(allocator, std.testing.io, "dialer-node");
+    defer bus.deinit();
+    bus.setOwnKey(@splat(0x77));
+    try bus.setPeerKey("node-known", @splat(0x78));
+
+    // §7 #5. The address is deliberately irrelevant: the gate is *before* the
+    // dial, so a cluster with credentials never opens a socket it holds no key
+    // for (and never falls back to bare frames on the way out).
+    const dead = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 1);
+    try std.testing.expectError(error.PeerKeyMissing, bus.connectToNode("node-unknown", dead));
+    try std.testing.expectError(error.PeerKeyMissing, bus.connectToNode("node-missing-too", dead));
+
+    // The node was not registered either: a refused peer is not a peer.
+    try std.testing.expectEqual(@as(usize, 0), bus.getNodeCount());
+}
+
+test "the dialer requires the receiver to prove its own identity" {
+    const allocator = std.testing.allocator;
+    const node_a_key: [32]u8 = @splat(0x91);
+    const node_b_key: [32]u8 = @splat(0x92);
+    const impostor_key: [32]u8 = @splat(0x93);
+
+    var dialer = try DistributedEventBus.init(allocator, std.testing.io, "node-b");
+    defer dialer.deinit();
+    dialer.setOwnKey(node_b_key);
+
+    // §7 #6, the positive control: node-b holds node-a's key, node-a proves it
+    // holds its own, and the bind completes. Everything below is then about the
+    // *proof* and not about a handshake that could never work.
+    {
+        const pair = try openSocketPair();
+        var fixture = ReceiverFixture{
+            .allocator = allocator,
+            .sock = pair.peer,
+            .id = "node-a",
+            .reply_key = node_a_key,
+            .claim_key = node_b_key,
+        };
+        const receiver = try std.Thread.spawn(.{}, ReceiverFixture.run, .{&fixture});
+        try dialer.setPeerKey("node-a", node_a_key);
+        try dialer.bindOutbound(pair.conn, "node-a");
+        pair.conn.close(std.testing.io);
+        receiver.join();
+        try std.testing.expect(fixture.err == null);
+    }
+
+    // §7 #7: the same honest receiver, except that it signs its reply with a key
+    // that is not the one node-b holds for it. Without the `mac2` check the dialer
+    // would accept the connection on the strength of its **own** proof alone —
+    // i.e. it would trust "whoever answered", which is the half of the threat the
+    // mutual exchange closes.
+    {
+        const pair = try openSocketPair();
+        var fixture = ReceiverFixture{
+            .allocator = allocator,
+            .sock = pair.peer,
+            .id = "node-a",
+            .reply_key = impostor_key,
+            .claim_key = node_b_key,
+        };
+        const receiver = try std.Thread.spawn(.{}, ReceiverFixture.run, .{&fixture});
+        try std.testing.expectError(error.HandshakeRejected, dialer.bindOutbound(pair.conn, "node-a"));
+        pair.conn.close(std.testing.io);
+        receiver.join();
+        // The fake receiver was not the one that failed: it completed its half.
+        try std.testing.expect(fixture.err == null);
+    }
+
+    // Both gates are already checked by `connectToNode`; they are checked again
+    // inside `bindOutbound` so the dial half cannot be reached without them.
+    {
+        const pair = try openSocketPair();
+        defer pair.peer.close(std.testing.io);
+        try std.testing.expectError(error.PeerKeyMissing, dialer.bindOutbound(pair.conn, "node-unknown"));
+        pair.conn.close(std.testing.io);
+    }
+    {
+        var keyless = try DistributedEventBus.init(allocator, std.testing.io, "keyless-dialer");
+        defer keyless.deinit();
+        try keyless.setPeerKey("node-a", node_a_key);
+        const pair = try openSocketPair();
+        defer pair.peer.close(std.testing.io);
+        try std.testing.expectError(error.PeerKeyMissing, keyless.bindOutbound(pair.conn, "node-a"));
+        pair.conn.close(std.testing.io);
+    }
+}
+
+test "two credentialed nodes bind over the network and exchange an event" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    const node_a_key: [32]u8 = @splat(0xaa);
+    const node_b_key: [32]u8 = @splat(0xbb);
+    const port: u16 = 19018;
+    const topic = "e2e.topic";
+
+    // §7 #6, end to end: the accept path (receiver half) and `connectToNode`
+    // (dialer half) wired together over a real socket, not just the two halves
+    // against a fixture. If the pair disagreed about which key signs in which
+    // direction, the frame below would never arrive.
+    var received: usize = 0;
+    var bus_a = try framedBus(allocator, "node-a", topic, &received);
+    defer bus_a.deinit();
+    bus_a.setOwnKey(node_a_key);
+    try bus_a.setPeerKey("node-b", node_b_key);
+    try bus_a.start(port);
+    defer bus_a.stop();
+
+    var bus_b = try DistributedEventBus.init(allocator, io, "node-b");
+    defer bus_b.deinit();
+    bus_b.setOwnKey(node_b_key);
+    try bus_b.setPeerKey("node-a", node_a_key);
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+    try bus_b.connectToNode("node-a", addr);
+    // The handshake is synchronous inside `connectToNode`, so a socket that is
+    // still there means both ends completed the bind (`socket = null` is how a
+    // refused handshake shows up).
+    try std.testing.expectEqual(@as(usize, 1), bus_b.getNodeCount());
+    try std.testing.expect(bus_b.nodes.items[0].socket != null);
+
+    try bus_b.publish(topic, "hello");
+    // The event is delivered by an accept-side fiber, so give it a moment.
+    var waited: usize = 0;
+    while (received == 0 and waited < 200) : (waited += 1) {
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch break;
+    }
+    try std.testing.expectEqual(@as(usize, 1), received);
+}
+
+test "a bare frame on an authenticated port is not delivered" {
+    const allocator = std.testing.allocator;
+    const peer_key: [32]u8 = @splat(0x81);
+    const receiver_key: [32]u8 = @splat(0x82);
+
+    var json_buf: [256]u8 = undefined;
+    const json = DistributedEventBus.serializeEvent(.{
+        .topic = "downgrade.topic",
+        .payload = "bare",
+        .source_node = "node-a",
+        .timestamp = 17,
+        .seq = 1,
+    }, &json_buf);
+
+    var received: usize = 0;
+    var bus = try framedBus(allocator, "downgrade-node", "downgrade.topic", &received);
+    defer bus.deinit();
+    bus.setOwnKey(receiver_key);
+    try bus.setPeerKey("node-a", peer_key);
+
+    // A peer that reads the challenge and then behaves like an old (or
+    // unattended) node: no handshake, a bare frame. That is the downgrade the
+    // design forbids — "keys configured but a bare frame arrives → close", with no
+    // way back to an unauthenticated delivery on the same port.
+    const pair = try openSocketPair();
+    bus.is_running = true;
+    const reader = try std.Thread.spawn(.{}, DistributedEventBus.handleConnection, .{ &bus, pair.conn });
+
+    const challenge = peerReadMessage(allocator, pair.peer);
+    try std.testing.expect(challenge != null);
+    if (challenge) |c| allocator.free(c);
+    peerWriteFrame(allocator, pair.peer, null, json) catch |err| {
+        std.log.debug("[test] write to a refused connection: {}", .{err});
+    };
+    pair.peer.close(std.testing.io);
+    reader.join();
+    bus.is_running = false;
+
+    try std.testing.expectEqual(@as(usize, 0), received);
 }
 
 test "a replayed frame is dropped even on a fresh connection" {
     const allocator = std.testing.allocator;
-    const secret: [32]u8 = @splat(0x41);
+    const peer_key: [32]u8 = @splat(0x41);
+    const receiver_key: [32]u8 = @splat(0x42);
 
     var json_buf: [256]u8 = undefined;
     const json = DistributedEventBus.serializeEvent(.{
@@ -2057,22 +2920,22 @@ test "a replayed frame is dropped even on a fresh connection" {
         .timestamp = 13,
         .seq = 7,
     }, &json_buf);
-    const frame = try testFrame(allocator, secret, "node-r", json);
-    defer allocator.free(frame);
 
     var received: usize = 0;
     var bus = try framedBus(allocator, "replay-node", "replay.topic", &received);
     defer bus.deinit();
-    bus.setClusterSecret(secret);
+    bus.setOwnKey(receiver_key);
+    try bus.setPeerKey("node-r", peer_key);
 
-    // `feedFrame` opens a fresh connection every time, so this is the reconnect
-    // case: the high-water mark is per claim, not per socket, and a captured
-    // frame does not become fresh again by arriving on a new connection.
-    try feedFrame(&bus, frame);
+    // Every `feedAuthed` opens a fresh connection *and* a fresh handshake, so
+    // this is the reconnect case: the high-water mark is per bound id, not per
+    // socket, and a captured frame does not become fresh again by arriving on a
+    // new connection that is equally well authenticated.
+    feedAuthed(&bus, "node-r", peer_key, peer_key, &.{json});
     try std.testing.expectEqual(@as(usize, 1), received);
-    try feedFrame(&bus, frame);
+    feedAuthed(&bus, "node-r", peer_key, peer_key, &.{json});
     try std.testing.expectEqual(@as(usize, 1), received);
-    try feedFrame(&bus, frame);
+    feedAuthed(&bus, "node-r", peer_key, peer_key, &.{json});
     try std.testing.expectEqual(@as(usize, 1), received);
 
     // …but a sender moving forward is still delivered: this is a window, not
@@ -2085,9 +2948,7 @@ test "a replayed frame is dropped even on a fresh connection" {
         .timestamp = 14,
         .seq = 8,
     }, &newer_buf);
-    const newer_frame = try testFrame(allocator, secret, "node-r", newer);
-    defer allocator.free(newer_frame);
-    try feedFrame(&bus, newer_frame);
+    feedAuthed(&bus, "node-r", peer_key, peer_key, &.{newer});
     try std.testing.expectEqual(@as(usize, 2), received);
 }
 
@@ -2117,7 +2978,9 @@ test "two writers on one socket produce only whole frames" {
 
     var bus = try DistributedEventBus.init(allocator, std.testing.io, "writer-node");
     defer bus.deinit();
-    bus.setClusterSecret(secret);
+    // The send path signs with the node's **own** key, so that is the key the
+    // reader on the far end has to verify with.
+    bus.setOwnKey(secret);
 
     var fds: [2]std.posix.socket_t = undefined;
     const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
@@ -2147,8 +3010,9 @@ test "two writers on one socket produce only whole frames" {
     const w2 = try std.Thread.spawn(.{}, Writer.run, .{ &bus, json, frames_per_writer });
 
     // Read like a receiving bus does: the length prefix says how much to expect,
-    // and what follows has to be one frame whose MAC verifies.
-    const key = DistributedEventBus.identityKey(secret, "writer-node");
+    // and what follows has to be one frame whose MAC verifies against the
+    // credential of the node that sent it — its own key.
+    const key = secret;
     var good: usize = 0;
     var i: usize = 0;
     while (i < frames_per_writer * 2) : (i += 1) {
