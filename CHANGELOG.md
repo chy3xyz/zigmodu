@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### `BufferPool.release` 的静默泄漏：不足尺寸的 buffer 既不回收也不归还（**破坏性：否**）
+
+`src/im/BufferPool.zig` 的 `if (buf.len < BufSize) return;` —— 调用方的 buffer **既没进池、
+也没被 free**，而 `allocated` 还留在高位，于是 `acquire` 最终报 `PoolExhausted` 而实际
+没有任何东西是活的。这一侧无法 free 它（分配器要的是那次分配自己的长度）也不该收它，
+所以现在**用日志点名这个调用方 bug**，契约写进 `release` 的文档注释。
+
+**边界刻意没动**（仍是 `< BufSize`）：改成 `!=` 会连 oversized 一起拒，而 >4KiB 单帧那条路
+正可能让读缓冲变大 —— 只把"静默"改成"有名"。
+
+**没有行为红**：修复前后池的状态完全一样（旧代码也是什么都不做），变的是那条警告；
+用例是钉子不是复现，测试注释里这么标了。
+
+
 ### WebSocket ②：io_uring 那条解析路径不再"编译不过所以安全"，握手补上 RFC 6455 §4.2.1（**破坏性：是**）
 
 `docs/dev/security-audit-ws.md` 的处置。`WsFramer` 加固过一轮，**第二个解析器**（`src/im/ws_uring.zig`）没有 ——

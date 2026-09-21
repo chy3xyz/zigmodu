@@ -59,11 +59,34 @@ pub const BufferPool = struct {
     }
 
     /// Return a buffer to the pool for reuse.
+    ///
+    /// **Contract: `buf` must be one `acquire()` handed out** (i.e. `BufSize` bytes).
+    /// A differently-sized slice is refused with a warning and left to the caller —
+    /// this pool cannot free it (its allocator free needs the allocation's own
+    /// length) and must not pool it.
     pub fn release(self: *Self, buf: []u8) void {
         self.mutex.lock(self.io) catch return;
         defer self.mutex.unlock(self.io);
 
-        if (buf.len < BufSize) return;
+        // A buffer this pool did not hand out is not ours to free: `allocator.free`
+        // needs the allocation's own length, so freeing a differently-sized slice is
+        // wrong (the DebugAllocator rejects it outright). The old code just `return`ed
+        // here — the caller's buffer was then neither pooled nor freed, and
+        // `allocated` stayed inflated, so `acquire` would eventually report
+        // `PoolExhausted` while nothing was actually live. It is a caller bug either
+        // way; the only useful thing this side can do is name it instead of doing
+        // nothing.
+        // Only the *undersized* case is refused, which is the boundary this function
+        // already had — keeping it means no caller's oversized buffer changes
+        // behaviour here. What changed is the silence: `return`ing meant the caller's
+        // buffer was neither pooled nor freed and `allocated` stayed inflated, so
+        // `acquire` would eventually report `PoolExhausted` while nothing was live.
+        // This side cannot free it (the allocator needs the allocation's own length)
+        // and must not pool it, so naming the caller bug is the useful thing to do.
+        if (buf.len < BufSize) {
+            std.log.warn("[BufferPool] release() got a {d}-byte buffer; this pool hands out {d}-byte ones, and a slice this size did not come from `acquire` — not taking it (the caller still owns it)", .{ buf.len, BufSize });
+            return;
+        }
 
         if (self.max == 0 or self.free.items.len < self.max) {
             self.free.append(self.allocator, buf) catch {
@@ -105,6 +128,42 @@ test "acquire release" {
     const buf2 = try pool.acquire();
     try std.testing.expectEqual(ptr, buf2.ptr);
     pool.release(buf2);
+}
+
+// Pins the contract at the top of `release`: a buffer this pool did not hand out is
+// refused, and — the part that used to be a silent leak — is **not** silently
+// swallowed either: the pool's counters are untouched, so `allocated` keeps
+// reflecting reality and the caller keeps ownership.
+//
+// No mutation red: the pre-fix code also left the counters untouched (it just
+// `return`ed). What changed is that the misuse is now named in the log instead of
+// vanishing. This test is a pin, not a reproduction.
+test "release names an undersized buffer instead of silently dropping it" {
+    const allocator = std.testing.allocator;
+    var pool = BufferPool.init(allocator, std.testing.io, 4);
+    defer pool.deinit();
+
+    // No `defer allocator.free(buf)`: the last statement hands it back to the pool,
+    // which owns it from then on and frees it in `deinit` — freeing it here too would
+    // be a double free.
+    const buf = try pool.acquire();
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().allocated);
+
+    // Half a buffer, and a bigger one — neither came from `acquire()`.
+    pool.release(buf[0 .. buf.len / 2]);
+    try std.testing.expectEqual(@as(usize, 0), pool.available());
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().allocated);
+
+    // An *oversized* buffer keeps the old behaviour on purpose (it falls through to
+    // the normal pooling path) — only the undersized case was the leak, and changing
+    // the oversized boundary would also change what the >4 KiB frame path may hand
+    // back. So this asserts nothing about `bigger`; the point of the test is the
+    // undersized half above.
+
+    // The real one still round-trips.
+    pool.release(buf);
+    try std.testing.expectEqual(@as(usize, 1), pool.available());
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().allocated);
 }
 
 test "pool respects max" {
