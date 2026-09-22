@@ -128,7 +128,11 @@ pub fn OrderApi(comptime Client: type) type {
             defer ctx.allocator.free(ev_stock);
             try tx.enqueueEvent(ev_stock);
 
-            var ev_ctx = EvCtx{ .allocator = ctx.allocator, .tx = &tx };
+            // Event payloads and the hand-over slice are allocated by the
+            // tx client's allocator (see zent TxClient.enqueueEvent), so the
+            // after-commit drain must free with that same allocator — the
+            // request arena's free() is a no-op and would leak every payload.
+            var ev_ctx = EvCtx{ .allocator = self.client.allocator, .tx = &tx };
             tx.afterCommit(&ev_ctx, EvCtx.onCommit);
             tx.commit() catch |err| return http.respondErr(ctx, err);
 

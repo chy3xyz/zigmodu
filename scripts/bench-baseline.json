@@ -1,158 +1,201 @@
 [
-    {
-        "name": "scanModules x100K",
-        "unit": "ms",
-        "value": 7.941
-    },
-    {
-        "name": "scanModules x1M",
-        "unit": "ms",
-        "value": 77.915
-    },
-    {
-        "name": "validateModules x10K",
-        "unit": "ms",
-        "value": 7.042
-    },
-    {
-        "name": "validateModules x100K",
-        "unit": "ms",
-        "value": 72.498
-    },
-    {
-        "name": "App lifecycle x3K",
-        "unit": "ms",
-        "value": 9.177
-    },
-    {
-        "name": "workflow 20-step x5K",
-        "unit": "ms",
-        "value": 18.298
-    },
-    {
-        "name": "1L x10M events",
-        "unit": "ratio",
-        "value": 1.0083,
-        "normalized_by": "atomic RMW x10M"
-    },
-    {
-        "name": "10L x1M events",
-        "unit": "ms",
-        "value": 12.36
-    },
-    {
-        "name": "100L x100K events",
-        "unit": "ms",
-        "value": 12.222
-    },
-    {
-        "name": "CircuitBreaker x10M",
-        "unit": "ms",
-        "value": 6.385
-    },
-    {
-        "name": "CircuitBreaker x100M",
-        "unit": "ms",
-        "value": 63.047
-    },
-    {
-        "name": "RateLimiter x1M",
-        "unit": "ms",
-        "value": 51.549
-    },
-    {
-        "name": "RateLimiter x10M",
-        "unit": "ms",
-        "value": 335.643
-    },
-    {
-        "name": "10 checks x100K",
-        "unit": "ms",
-        "value": 12.617
-    },
-    {
-        "name": "100 checks x10K",
-        "unit": "ms",
-        "value": 15.458
-    },
-    {
-        "name": "findById x20K",
-        "unit": "ms",
-        "value": 12.709
-    },
-    {
-        "name": "findById x10K",
-        "unit": "ms",
-        "value": 6.211
-    },
-    {
-        "name": "atomic RMW x10M",
-        "unit": "ms",
-        "value": 22.177
-    },
-    {
-        "name": "StoreForward x10M",
-        "unit": "ms",
-        "value": 120.963
-    },
-    {
-        "name": "RingBuffer SPSC x1M",
-        "unit": "ratio",
-        "value": 0.4976,
-        "normalized_by": "atomic RMW x10M"
-    },
-    {
-        "name": "Mailbox post+drain x1M",
-        "unit": "ratio",
-        "value": 0.7902,
-        "normalized_by": "atomic RMW x10M"
-    },
-    {
-        "name": "Mailbox full-path x10M",
-        "unit": "ratio",
-        "value": 1.0732,
-        "normalized_by": "atomic RMW x10M"
-    },
-    {
-        "name": "TimerWheel x100K",
-        "unit": "ms",
-        "value": 6.808
-    },
-    {
-        "name": "TimerWheel churn x1M",
-        "unit": "ms",
-        "value": 28.193
-    },
-    {
-        "name": "HotBus 8sub x1M",
-        "unit": "ratio",
-        "value": 0.8221,
-        "normalized_by": "atomic RMW x10M"
-    },
-    {
-        "name": "ObjectPool x1M",
-        "unit": "ms",
-        "value": 15.327
-    },
-    {
-        "name": "Sequencer x10M",
-        "unit": "ratio",
-        "value": 1.031,
-        "normalized_by": "atomic RMW x10M"
-    },
-    {
-        "name": "Worker spawn+join x1K",
-        "unit": "ms",
-        "value": 29.37
-    },
-    {
-        "name": "Worker drain dedicated x1M",
-        "unit": "ms",
-        "value": 134.0
-    },
-    {
-        "name": "Pooled dispatch x1M",
-        "unit": "ms",
-        "value": 256.2
-    }
+  {
+    "name": "scanModules x100K",
+    "unit": "ms",
+    "value": 8.739,
+    "max_alloc_per_op": 5.0
+  },
+  {
+    "name": "scanModules x1M",
+    "unit": "ms",
+    "value": 86.561,
+    "max_alloc_per_op": 5.0
+  },
+  {
+    "name": "validateModules x10K",
+    "unit": "ms",
+    "value": 6.807,
+    "max_alloc_per_op": 3.75
+  },
+  {
+    "name": "validateModules x100K",
+    "unit": "ms",
+    "value": 69.089,
+    "max_alloc_per_op": 3.75
+  },
+  {
+    "name": "App lifecycle x3K",
+    "unit": "ms",
+    "value": 8.616,
+    "max_alloc_per_op": 8.75
+  },
+  {
+    "name": "workflow 20-step x5K",
+    "unit": "ms",
+    "value": 18.756,
+    "max_alloc_per_op": 133.75
+  },
+  {
+    "name": "1L x10M events",
+    "unit": "ratio",
+    "value": 0.9726,
+    "normalized_by": "atomic RMW x10M",
+    "max_alloc_per_op": 0.0
+  },
+  {
+    "name": "10L x1M events",
+    "unit": "ms",
+    "value": 12.498,
+    "max_alloc_per_op": 0.0
+  },
+  {
+    "name": "100L x100K events",
+    "unit": "ms",
+    "value": 12.18,
+    "max_alloc_per_op": 0.0
+  },
+  {
+    "name": "CircuitBreaker x10M",
+    "unit": "ms",
+    "value": 6.435,
+    "max_alloc_per_op": 0.0
+  },
+  {
+    "name": "CircuitBreaker x100M",
+    "unit": "ms",
+    "value": 64.137,
+    "max_alloc_per_op": 0.0
+  },
+  {
+    "name": "RateLimiter x1M",
+    "unit": "ms",
+    "value": 52.2,
+    "max_alloc_per_op": 0.0
+  },
+  {
+    "name": "RateLimiter x10M",
+    "unit": "ms",
+    "value": 336.706,
+    "max_alloc_per_op": 0.0
+  },
+  {
+    "name": "10 checks x100K",
+    "unit": "ms",
+    "value": 13.205,
+    "max_alloc_per_op": 2.5
+  },
+  {
+    "name": "100 checks x10K",
+    "unit": "ms",
+    "value": 15.314,
+    "max_alloc_per_op": 6.25
+  },
+  {
+    "name": "findById x20K",
+    "unit": "ms",
+    "value": 13.045,
+    "max_alloc_per_op": 5.0
+  },
+  {
+    "name": "findById x10K",
+    "unit": "ms",
+    "value": 6.318,
+    "max_alloc_per_op": 5.0
+  },
+  {
+    "name": "atomic RMW x10M",
+    "unit": "ms",
+    "value": 21.762,
+    "max_alloc_per_op": 0.0
+  },
+  {
+    "name": "StoreForward x10M",
+    "unit": "ms",
+    "value": 121.768,
+    "max_alloc_per_op": 0.0
+  },
+  {
+    "name": "RingBuffer SPSC x1M",
+    "unit": "ratio",
+    "value": 0.4922,
+    "normalized_by": "atomic RMW x10M",
+    "max_alloc_per_op": 0.0
+  },
+  {
+    "name": "MpscRing 4P x2M",
+    "unit": "ratio",
+    "value": 0.4308,
+    "normalized_by": "atomic RMW x10M",
+    "max_alloc_per_op": 0.0
+  },
+  {
+    "name": "Mailbox post+drain x1M",
+    "unit": "ratio",
+    "value": 0.7699,
+    "normalized_by": "atomic RMW x10M",
+    "max_alloc_per_op": 0.0
+  },
+  {
+    "name": "Mailbox full-path x10M",
+    "unit": "ratio",
+    "value": 1.2416,
+    "normalized_by": "atomic RMW x10M",
+    "max_alloc_per_op": 0.0
+  },
+  {
+    "name": "TimerWheel x100K",
+    "unit": "ms",
+    "value": 6.584,
+    "max_alloc_per_op": 1.25
+  },
+  {
+    "name": "TimerWheel churn x1M",
+    "unit": "ms",
+    "value": 27.833,
+    "max_alloc_per_op": 1.25
+  },
+  {
+    "name": "Timer after x100K",
+    "unit": "ms",
+    "value": 9.5,
+    "max_alloc_per_op": 2.5
+  },
+  {
+    "name": "HotBus 8sub x1M",
+    "unit": "ratio",
+    "value": 0.7767,
+    "normalized_by": "atomic RMW x10M",
+    "max_alloc_per_op": 0.0
+  },
+  {
+    "name": "ObjectPool x1M",
+    "unit": "ms",
+    "value": 15.236,
+    "max_alloc_per_op": 0.0
+  },
+  {
+    "name": "Sequencer x10M",
+    "unit": "ratio",
+    "value": 0.9974,
+    "normalized_by": "atomic RMW x10M",
+    "max_alloc_per_op": 0.0
+  },
+  {
+    "name": "Worker spawn+join x1K",
+    "unit": "ms",
+    "value": 27.234,
+    "max_alloc_per_op": 1.5
+  },
+  {
+    "name": "Worker drain dedicated x1M",
+    "unit": "ms",
+    "value": 180.893,
+    "max_alloc_per_op": 0.0
+  },
+  {
+    "name": "Pooled dispatch x1M",
+    "unit": "ms",
+    "value": 223.298,
+    "max_alloc_per_op": 0.0
+  }
 ]

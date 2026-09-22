@@ -1,3 +1,18 @@
+//! `zmodu` — ZigModu's code generator, project scaffold and doctor CLI.
+//!
+//! STRUCTURE:
+//!   §1  Options & CLI helpers —— Command / GenOptions / WrittenFiles / OrmCli, path & identifier safety predicates, cliLog
+//!   §2  Entry, dispatch & usage —— main, runCommand, case helpers, parseCommand, printUsage / printVersion
+//!   §3  Commands —— upgrade · mcp · ai · deadcode · audit · graph · doctor · ci · runtime · saas · market · verify · diff · new · module · event · api
+//!   §4  Project generators & safe file writes —— build.zig / .zon, AGENTS.md, main.zig, module/event/api skeletons, safeWrite
+//!   §5  ORM code generation —— SQL parser, DB introspection (sqlite/postgres/mysql), module & zent generators, generate / orm
+//!   §6  Migration (Flyway-style), health, config & test generators
+//!   §7  Scaffold —— one-shot SQL → full project (+ ai-chat / agent / web4 / im / life / claude-skills)
+//!   §8  Add —— append modules to an existing project, wireModulesIntoMainZig, scaffold main & tests
+//!   §9  Tests
+//!
+//! Every section carries a matching `// ==== §N ... ====` anchor — `grep "==== §5"` jumps there.
+
 // ZModu - Code generation tool for ZigModu
 const std = @import("std");
 const build_options = @import("build_options");
@@ -24,6 +39,8 @@ const runtime_mod = @import("runtime.zig");
 const ci_mod = @import("ci.zig");
 const saas_mod = @import("saas.zig");
 const market_mod = @import("market.zig");
+
+// ==== §1  Options & CLI helpers ====
 
 const Command = enum {
     new,
@@ -313,6 +330,8 @@ fn cliLog(
 
 pub const std_options: std.Options = .{ .logFn = cliLog };
 
+// ==== §2  Entry, dispatch & usage ====
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
@@ -583,6 +602,8 @@ fn printUsage() void {
 fn printVersion() void {
     std.log.info("zmodu v{s}", .{ZMODU_VERSION});
 }
+
+// ==== §3  Commands ====
 
 fn cmdUpgrade(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8, home: []const u8) !void {
     _ = args;
@@ -1471,6 +1492,8 @@ fn cmdApi(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
     }
 }
 
+// ==== §4  Project generators & safe file writes ====
+
 // Template generators
 fn generateBuildZig(allocator: std.mem.Allocator, project_name: []const u8, db_link: []const u8) ![]const u8 {
     var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
@@ -2277,7 +2300,7 @@ fn writeFileGen(io: std.Io, path: []const u8, content: []const u8, opts: GenOpti
     _ = opts;
 }
 
-// ==================== ORM Code Generation ====================
+// ==== §5  ORM code generation ====
 
 pub const ColumnType = enum {
     int,
@@ -4753,7 +4776,7 @@ fn cmdOrm(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !v
     };
 }
 
-// ── migration: generate Flyway-style migration file ─────────────────
+// ==== §6  Migration (Flyway-style), health, config & test ====
 
 fn cmdLife(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len == 0) {
@@ -5391,7 +5414,7 @@ fn cmdTest(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !
     std.log.info("Created test scaffold: {s}", .{fp});
 }
 
-// ── scaffold: one-shot SQL → full project ────────────────────────
+// ==== §7  Scaffold: one-shot SQL → full project ====
 
 const ScaffoldOpts = struct {
     sql_path: ?[]const u8,
@@ -8754,7 +8777,7 @@ fn generateClaudeSkills(io: std.Io, allocator: std.mem.Allocator, out_dir: []con
     try safeWrite(io, allocator, opencode_rm_path, opencode_readme, gen_opts);
 }
 
-// ── add: append new modules to existing project ──────────────────
+// ==== §8  Add: append new modules to an existing project ====
 
 fn cmdAdd(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
     var sql_path: ?[]const u8 = null;
@@ -9646,7 +9669,7 @@ fn zeroLiteral(col_type: ColumnType) []const u8 {
     };
 }
 
-// ── Tests ────────────────────────────────────────────────────────
+// ==== §9  Tests ====
 
 test "parseColumnDef: PRIMARY KEY implies non-optional" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

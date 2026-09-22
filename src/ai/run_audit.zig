@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const SqlxBackend = @import("../data.zig").SqlxBackend;
+const sqlx = @import("../data.zig").sqlx;
 const Time = @import("../core/Time.zig");
 const SkillContext = @import("skill.zig").SkillContext;
 
@@ -27,6 +28,10 @@ pub const RunAuditStore = struct {
 
     allocator: std.mem.Allocator,
     backend: *SqlxBackend,
+    /// Table name — an *identifier*, interpolated into every statement below.
+    /// Values are bound with `?`, identifiers cannot be, so each entry point
+    /// runs it through `sqlx.validateIdentifier` first (same gate `ai.business`
+    /// applies to its `EntitySpec.table`).
     table: []const u8 = "ai_run_audit",
 
     pub fn init(allocator: std.mem.Allocator, backend: *SqlxBackend) Self {
@@ -34,6 +39,7 @@ pub const RunAuditStore = struct {
     }
 
     pub fn migrate(self: *Self) !void {
+        try sqlx.validateIdentifier(self.table);
         const sql = try std.fmt.allocPrint(
             self.allocator,
             "CREATE TABLE IF NOT EXISTS {s} (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, tenant_id INTEGER, steps INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, model TEXT)",
@@ -58,6 +64,7 @@ pub const RunAuditStore = struct {
     }
 
     pub fn record(self: *Self, entry: RunAuditEntry) !void {
+        try sqlx.validateIdentifier(self.table);
         const now = Time.monotonicNowSeconds();
         const sql = try std.fmt.allocPrint(
             self.allocator,
@@ -87,6 +94,7 @@ pub const RunAuditStore = struct {
         tenant_id: ?i64,
         limit: usize,
     ) !void {
+        try sqlx.validateIdentifier(self.table);
         var where = std.ArrayList(u8).empty;
         defer where.deinit(allocator);
         var args = std.ArrayList(@import("../data.zig").sqlx.Value).empty;
@@ -130,6 +138,7 @@ pub const RunAuditStore = struct {
     }
 
     pub fn count(self: *Self) !usize {
+        try sqlx.validateIdentifier(self.table);
         const sql = try std.fmt.allocPrint(self.allocator, "SELECT COUNT(*) AS n FROM {s}", .{self.table});
         defer self.allocator.free(sql);
         var cursor = try self.backend.client.queryCursorEx(sql, &.{}, .{});
@@ -176,6 +185,25 @@ test "RunAuditStore records, filters and lists run history" {
     try store.list(allocator, &wf_only, .workflow, 1, 10);
     try std.testing.expectEqual(@as(usize, 2), wf_only.items.len);
     try std.testing.expectEqualStrings("r3", wf_only.items[0].run_id); // newest first
+}
+
+test "RunAuditStore rejects a table name that is not a plain identifier" {
+    const allocator = std.testing.allocator;
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    var store = RunAuditStore.init(allocator, &backend);
+    // `self.table` is the only part of these statements not bound with `?`, so
+    // a caller-supplied one has to be rejected before any SQL is built — on
+    // every entry point, not just the one that happens to run first.
+    store.table = "audit; DROP TABLE users";
+    try std.testing.expectError(error.InvalidSqlIdentifier, store.migrate());
+    try std.testing.expectError(error.InvalidSqlIdentifier, store.count());
+    try std.testing.expectError(error.InvalidSqlIdentifier, store.record(.{ .run_id = "r", .kind = .workflow, .status = "ok" }));
+    var out = std.ArrayList(RunAuditEntry).empty;
+    defer out.deinit(allocator);
+    try std.testing.expectError(error.InvalidSqlIdentifier, store.list(allocator, &out, null, null, 10));
 }
 
 /// Convenience: record a run with the tenant from the SkillContext.

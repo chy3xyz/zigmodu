@@ -45,7 +45,8 @@ pub const CatalogStore = struct {
         defer b.deinit();
         _ = try b.setFieldValue("name", name);
         _ = try b.setFieldValue("domain", domain);
-        const row = try b.Save();
+        var row = try b.Save();
+        defer self.client.tenant.deinitRow(&row); // Save dupes field values into the row
         return row.id;
     }
 
@@ -72,6 +73,10 @@ pub const CatalogStore = struct {
         const out = try self.allocator.alloc(CountRow, counts.items.len);
         for (counts.items, 0..) |g, i| out[i] = .{ .tenant_id = g.key, .count = g.count };
         return out;
+    }
+
+    pub fn freeCounts(self: *CatalogStore, rows: []CountRow) void {
+        self.allocator.free(rows);
     }
 
     /// zent ContainsEscaped：LIKE 通配符在渲染期转义，用户输入 % _ 按字面匹配。

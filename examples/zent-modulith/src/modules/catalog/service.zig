@@ -20,6 +20,10 @@ pub const CatalogService = struct {
         return try self.store.countProductsByTenant();
     }
 
+    pub fn freeCounts(self: *CatalogService, rows: []persist.CatalogStore.CountRow) void {
+        self.store.freeCounts(rows);
+    }
+
     pub fn searchProducts(self: *CatalogService, tenant_id: i64, needle: []const u8) ![]persist.CatalogStore.ProductRow {
         if (tenant_id <= 0 or needle.len == 0) return error.InvalidInput;
         return try self.store.searchProducts(tenant_id, needle);

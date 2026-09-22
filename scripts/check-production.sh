@@ -2,6 +2,17 @@
 # Fail CI if banned error-handling patterns appear in production hot paths:
 #   - bare `catch {}`        — swallows errors silently
 #   - `catch unreachable`    — turns runtime errors into panics
+# and, over the whole tree with no ratchet tier:
+#   - `std.Io.random(`       — not a CSPRNG: on failure it falls back to
+#                              pid + wall-clock + ASLR, which is the exact
+#                              defect class AGENTS.md "CSPRNG" bans
+#   - `std.crypto.random`    — not declared by this toolchain at all
+#   `std.Io.randomSecure(io, buf)` is the sanctioned form and never matches.
+#   Entropy is enforced everywhere, unlike the catch ratchet below: a lock's
+#   ownership id or an API-key salt derived from weak entropy is a security
+#   defect regardless of which directory it lives in. `audit`'s b24 only walks
+#   `src/modules/**` (application code), so this scan is what covers the
+#   framework's own `src/` — that gap is how `DistributedLock` shipped one.
 #
 # Scope (see scripts/lib/zig-scan.awk, shared with check-version.sh):
 #   * whole file, not "up to the first `test \"` line" — that truncation used to
@@ -112,6 +123,23 @@ while IFS= read -r f; do
     report "$f" "$hits" enforce >/dev/null
   fi
 done < <(find "${SCAN_ROOTS[@]}" -name '*.zig' | sort)
+
+# Entropy sources: scanned across the *entire* tree, enforced tier or not —
+# see the header. One hit fails the gate.
+entropy_fail=0
+while IFS= read -r f; do
+  [[ -f "$f" ]] || continue
+  hits="$(awk -v mode=entropy -f "$LEX" "$f" || true)"
+  [[ -n "$hits" ]] || continue
+  echo "check-production: banned entropy source in ${f}:" >&2
+  printf '%s\n' "$hits" >&2
+  entropy_fail=1
+done < <(find "${SCAN_ROOTS[@]}" -name '*.zig' | sort)
+
+if [[ "$entropy_fail" -ne 0 ]]; then
+  echo "check-production: use std.Io.randomSecure(io, buf) — std.Io.random falls back to pid+wall-clock+ASLR and std.crypto.random does not exist here (AGENTS.md \"CSPRNG\")" >&2
+  exit 1
+fi
 
 if [[ "$fail" -ne 0 ]]; then
   echo "check-production: replace catch {} / catch unreachable with logged catch |err| handling" >&2

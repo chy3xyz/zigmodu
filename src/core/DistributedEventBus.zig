@@ -80,6 +80,23 @@ const ClusterAuth = @import("cluster/TlsTransport.zig").ClusterAuth;
 // is idle-based and sits well above `heartbeat_interval_ms`, which is why a
 // connection that is merely quiet — a healthy peer between heartbeats — is not
 // torn down.
+//
+// `setSendTimeout` is the same bound on the way out, and it is about teardown
+// rather than throughput: `disconnectNode`/`deinit` wait for an in-flight write
+// on a node (`Node.write_lock`), so a peer that stops reading — leaving a write
+// parked in the kernel's send buffer — would otherwise wedge the teardown of the
+// whole bus, not just that peer's frames.
+//
+// The peer registry itself (`nodes`) is a single-owner structure: `nodes_lock`
+// guards its shape, the lifetime of every entry and the routing ring, so a
+// concurrent `connectToNode`/`disconnectNode` cannot free an entry another
+// thread is walking. "Single owner" is enforced per entry rather than promised:
+// `disconnectNode` *takes* the entry out and hands it to one caller, and
+// `connectToNode` reserves its entry **before** it dials, so concurrent callers
+// for one id end up with one entry, one socket and one `write_lock` — the
+// precondition everything else here relies on. See that field for the lock
+// order, and `reserveNode`/`settleConnect` for how the reservation survives a
+// blocking dial without holding the lock across it.
 
 /// Length of the `mac32` the send side writes and the receive side strips.
 const auth_mac_bytes = 32;
@@ -100,6 +117,23 @@ const default_inbound_idle_timeout_ms: u32 = 30_000;
 /// the idle bound safe for a long-lived stream.
 const heartbeat_interval_ms: u32 = 5_000;
 
+/// Default bound on **one outbound frame write** (`SO_SNDTIMEO`), applied by
+/// `applySendTimeout` to the socket `connectToNode` dialled and to the accepted
+/// side of `handleConnection`.
+///
+/// The mirror of `default_inbound_idle_timeout_ms`, and it exists for a wider
+/// reason than a slow peer: a peer that accepts a connection and then stops
+/// reading leaves the writer parked in `writeAll` while holding that node's
+/// `write_lock`, and every teardown of that node — `disconnectNode`,
+/// `closeNodeSocket`'s quarantine, `deinit` — waits for that lock. Without a
+/// bound, one non-reading peer can therefore wedge the teardown of the whole
+/// bus. The timeout turns the stalled write into `error.WriteTimeout`
+/// (`sockread.writeFull`'s mapping of `EAGAIN`), which is the failure path a
+/// dead connection already takes: the send fails, the node's failure counter
+/// grows, the DLQ gets the message at the threshold and the node is
+/// quarantined. 0 disables the bound.
+const default_outbound_send_timeout_ms: u32 = 5_000;
+
 /// Cap on one frame body (`mac32 + json`). The same 1 MiB
 /// `NetworkTransport.MAX_MESSAGE_SIZE` puts on a Raft frame: same cluster, same
 /// kind of socket, and it is checked **before** the body is buffered, so a peer
@@ -115,13 +149,57 @@ pub const DistributedEventBus = struct {
     io: std.Io,
     local_bus: TypedEventBus(NetworkEvent),
     topic_callbacks: std.StringHashMap(std.ArrayList(TopicHandler)),
-    nodes: ArrayList(Node),
+    /// The peer registry. Entries are **heap-allocated** (`*Node`) and owned by
+    /// this list; `nodes_lock` guards both the list and that ownership.
+    nodes: ArrayList(*Node),
     listener: ?std.Io.net.Server,
     is_running: bool,
     node_id: []const u8,
     heartbeat_thread: ?std.Thread,
     /// Owns accept/handle/heartbeat fibers; awaited in `stop()`.
     fiber_group: std.Io.Group,
+
+    /// Guards the `nodes` registry: the list's structure, the ownership of every
+    /// `Node` (and of the `id` slice it holds), the routing ring's mutations —
+    /// and therefore every walk that dereferences a node.
+    ///
+    /// What it is for: `disconnectNode` used to `free(node.id)` and
+    /// `swapRemove` the entry with no lock at all, so two threads disconnecting
+    /// the same node both freed one `id` (double free) and both compacted the
+    /// list (the second removed whatever `swapRemove` had just moved into that
+    /// slot). The registry is now a single-owner structure: a mutation happens
+    /// only in a critical section, and a walk happens only in one — a walk that
+    /// is not inside it can be holding a pointer to an entry a remover is about
+    /// to free (`publish`'s fan-out, `sendHeartbeat`, `setPartitioner` and
+    /// `connectToNode`'s duplicate scan are all walks).
+    ///
+    /// Lock order: **`nodes_lock` before `Node.write_lock`**, never the other way
+    /// round. A writer (`sendFramed` → `write_lock`) is reached from a walk, so a
+    /// walk holds this lock while it writes; nothing that holds a `write_lock`
+    /// takes this one. Two consequences, both deliberate:
+    ///   * the fan-out of a `publish` holds the lock across its blocking writes
+    ///     (each bounded by `outbound_send_timeout_ms` — see that field);
+    ///   * a teardown does **not** close a socket under it: `takeNode` only
+    ///     unlinks the entry, and the `close` that waits for an in-flight writer
+    ///     happens after the lock is released (`destroyNode`).
+    ///
+    /// Every mutation of the registry happens inside a critical section, and
+    /// each one is written as a *take* or a *reservation* so that exactly one
+    /// caller can ever own an entry: `takeNode` hands one entry out to the
+    /// caller disconnecting it, `reserveNode` creates one **before** the
+    /// blocking dial and stores a token in it, and `settleConnect` hands the
+    /// dialled connection to the entry whose token matches — never merely to
+    /// "the entry for this id". One id therefore has exactly one entry, one
+    /// socket and one `write_lock`, however many callers ask for it at once and
+    /// whatever is torn down while they dial.
+    nodes_lock: std.Io.Mutex = .init,
+
+    /// Source of the reservation tokens `reserveNode` stores in a fresh entry,
+    /// drawn and advanced **only under `nodes_lock`** — a plain counter is
+    /// enough, and a driver struct would not make the pair (draw, store) any
+    /// more atomic than the critical section already does. 1-based, because 0 is
+    /// how an entry says "no reservation is in flight for me".
+    next_reservation: u64 = 1,
 
     /// 32-byte pre-shared key the cluster was configured with. It is **not** a
     /// frame key any more (there is no `HMAC(secret, claim)` derivation — see
@@ -162,6 +240,13 @@ pub const DistributedEventBus = struct {
     /// connection, so a peer that connects and then sends nothing cannot hold a
     /// handle/fiber forever. 0 disables it (the pre-§14 behaviour).
     inbound_idle_timeout_ms: u32 = default_inbound_idle_timeout_ms,
+
+    /// Bound handed to `sockread.setSendTimeout` for every socket this bus
+    /// writes frames on, so a peer that stops reading cannot park a writer — and
+    /// with it the `write_lock` every teardown of that node waits for. 0
+    /// disables it; see `default_outbound_send_timeout_ms` for what the bound
+    /// turns into.
+    outbound_send_timeout_ms: u32 = default_outbound_send_timeout_ms,
 
     /// Highest `"seq"` accepted per claimed source id, **authenticated path
     /// only**: an entry is created after the frame's MAC verified, so this table
@@ -216,16 +301,50 @@ pub const DistributedEventBus = struct {
         }
     };
 
+    /// One peer. Heap-allocated and owned by `nodes`: the address is stable for
+    /// as long as the entry is registered, so a writer that is mid-frame keeps
+    /// the same `socket` field and the same `write_lock` the teardown of that
+    /// node waits on (an inline element would move — and its lock would be a
+    /// different object — under `swapRemove` and under `append`'s reallocation).
     const Node = struct {
         id: []const u8,
         address: std.Io.net.IpAddress,
         socket: ?std.Io.net.Stream,
         last_seen: i64,
+        /// Non-zero while this entry is a **reservation**: a `connectToNode`
+        /// caller created it (under `nodes_lock`) and is dialling for it right
+        /// now. The value is that caller's token, unique to this reservation and
+        /// cleared only by the caller itself (`settleConnect`), which is what
+        /// lets a dialer recognise its own entry after the lock has been dropped
+        /// without holding a pointer across the dial: the entry may be gone by
+        /// then (a `disconnectNode` or `deinit` took it and freed the storage),
+        /// so the lookup is by `(id, reservation)` — never by address, which the
+        /// allocator is free to hand to another entry.
+        ///
+        /// The bus's own machinery does not have to special-case a reserved
+        /// entry: `socket` is null for the whole window, so `sendFramed` reports
+        /// `NotConnected` (no failure counted — see `sendToNode`), `sendHeartbeat`
+        /// skips it, and `fanOut` writes nothing to it. It is visible for
+        /// routing and counted by `clusterSize` from the moment it is created,
+        /// which is the "registered for routing immediately" contract
+        /// `connectToNode` has always had for a node it could not reach.
+        reservation: u64 = 0,
+        /// Consecutive failed sends, reset by a success. Plain `u32` on purpose
+        /// and only ever touched atomically *inside the bus* (`@atomicRmw` /
+        /// `@atomicLoad` / `@atomicStore`, see `countSendFailure`): the field is
+        /// part of the shape callers outside the bus read plainly
+        /// (`src/soak_cluster.zig` watermarks it), and a `std.atomic.Value(u32)`
+        /// would break them without making the reads any safer. A racing plain
+        /// read sees one of the counter's values, never a torn one (a `u32` load
+        /// is atomic on every target this framework builds for).
         send_failures: u32 = 0,
-        /// Serialises writes to `socket`. `publish` (a request thread) and
-        /// `heartbeatLoop` (a fiber) can target the same peer at the same time;
-        /// framing bounds the damage of interleaved writes to "one corrupt frame
-        /// → verification fails → connection dropped", which is still wrong.
+        /// Serialises the whole outbound frame build for `socket`: replay-seq
+        /// stamp, json serialise, MAC, then the blocking write. `publish` (a
+        /// request thread) and `heartbeatLoop` (a fiber) can target the same
+        /// peer at the same time — without the lock two `writeAll`s interleave
+        /// into one corrupt frame, and even with the write alone locked, a
+        /// frame stamped before the lock could reach the socket after a
+        /// higher-seq one and be dropped by the receiver's replay gate.
         /// An `Io.Mutex` rather than a spin lock: the guarded section is a
         /// blocking `writeAll`.
         write_lock: std.Io.Mutex = .init,
@@ -239,7 +358,7 @@ pub const DistributedEventBus = struct {
             .io = io,
             .local_bus = TypedEventBus(NetworkEvent).init(allocator),
             .topic_callbacks = std.StringHashMap(std.ArrayList(TopicHandler)).init(allocator),
-            .nodes = ArrayList(Node).init(allocator),
+            .nodes = ArrayList(*Node).init(allocator),
             .listener = null,
             .is_running = false,
             .node_id = id_copy,
@@ -255,6 +374,14 @@ pub const DistributedEventBus = struct {
         };
     }
 
+    /// Tear the bus down. The calling constraint is unchanged — the caller owns
+    /// the bus for the duration, and `stop()` has to have drained the fibers
+    /// (which `deinit` calls itself) — but the *registry* teardown no longer
+    /// assumes it is the only thread in the process: it is a critical section
+    /// (see `tearDownRegistry`), so a `disconnectNode` racing this one frees each
+    /// entry exactly once instead of twice. The other fields (`topic_callbacks`,
+    /// `peer_keys`, `local_bus`) are still unguarded: they are wiring-time state
+    /// with no background reader.
     pub fn deinit(self: *Self) void {
         self.stop();
         self.allocator.free(self.node_id);
@@ -279,14 +406,47 @@ pub const DistributedEventBus = struct {
         }
         self.peer_keys.deinit();
 
-        for (self.nodes.items) |*node| {
-            if (node.socket) |sock| {
-                sock.close(self.io);
-            }
-            self.allocator.free(node.id);
-        }
-        self.nodes.deinit();
+        self.tearDownRegistry();
         self.* = undefined;
+    }
+
+    /// Take the whole registry out under `nodes_lock` and destroy what it held.
+    ///
+    /// The detach is the guarded half — one critical section, after which no
+    /// entry is reachable from this bus — and the per-entry destruction happens
+    /// after it, exactly like `disconnectNode`: `closeNodeSocket` waits for an
+    /// in-flight writer's `write_lock`, and no teardown has any business parking
+    /// the registry behind that wait. Nobody can still be holding one of these
+    /// entries at that point: every walk holds `nodes_lock` for as long as it
+    /// dereferences an entry (`fanOut`, `sendHeartbeat`), and the one caller that
+    /// owns an entry without the lock (`disconnectNode` → `destroyNode`) owns an
+    /// entry this list no longer contains. A dialing `connectToNode` holds no
+    /// entry at all — it looks its reservation up by `(id, token)` after taking
+    /// the lock, finds nothing, and closes the connection it dialled
+    /// (`settleConnect`).
+    ///
+    /// This is the "no external single-thread assumption" half of `deinit`: a
+    /// concurrent `disconnectNode` either finds the entry and is the one that
+    /// frees it, or finds nothing — where the sequential walk used to hand the
+    /// same entry to both of them (two `free`s of one `id`, two `destroy`s of
+    /// one `Node`, and a walk stepping over a list a `swapRemove` had already
+    /// compacted underneath it).
+    fn tearDownRegistry(self: *Self) void {
+        self.lockNodes() catch |err| {
+            // Without the lock there is no safe way to free the entries — that
+            // is precisely the double free this function exists to prevent — so
+            // they are left where they are and reported. Nothing else in the
+            // process can still reach them once this returns: the bus is being
+            // destroyed.
+            std.log.err("[DistributedEventBus] registry teardown skipped: {}", .{err});
+            return;
+        };
+        var doomed = self.nodes;
+        self.nodes = ArrayList(*Node).init(self.allocator);
+        self.nodes_lock.unlock(self.io);
+
+        for (doomed.items) |node| self.destroyNode(node);
+        doomed.deinit();
     }
 
     /// Start listening for incoming connections
@@ -389,6 +549,48 @@ pub const DistributedEventBus = struct {
         }
     }
 
+    /// Apply `outbound_send_timeout_ms` as `SO_SNDTIMEO` to a socket this bus
+    /// writes frames on: the one `connectToNode` dialled, and the accepted side
+    /// of `handleConnection` (its handshake replies are writes too). The mirror
+    /// of `applyRecvTimeout`, and the same shape as the bound Raft's transport
+    /// puts on both directions of an RPC (`RaftTransport.handleConnection`).
+    ///
+    /// It is `sockread.setSendTimeout`'s option with the same deliberate
+    /// difference `applyRecvTimeout` documents: a rejected option is **logged and
+    /// survived**, because `std.posix.setsockopt` maps `EINVAL` to `unreachable`
+    /// and macOS answers `EINVAL` for the socket options on an `AF_UNIX` socket
+    /// whose peer end is already gone. A peer that is already gone is also why
+    /// surviving is safe: the next write returns `EPIPE`/`ECONNRESET` on its own.
+    ///
+    /// What the bound buys is not throughput but bounded teardown. A write that
+    /// stalls comes back `EAGAIN`, which `sockread.writeFull` reports as
+    /// `error.WriteTimeout` (that is why `sendEventFrame` writes through the raw
+    /// helper — see its comment), so the send fails on the ordinary
+    /// failure path, the node's `write_lock` is released, and
+    /// `disconnectNode`/`deinit` can finish instead of waiting for a peer that
+    /// will never read.
+    fn applySendTimeout(self: *Self, conn: std.Io.net.Stream) void {
+        const timeout_ms = self.outbound_send_timeout_ms;
+        if (timeout_ms == 0) return;
+        const tv = std.posix.timeval{
+            .sec = @intCast(timeout_ms / 1000),
+            .usec = @intCast((timeout_ms % 1000) * 1000),
+        };
+        const rc = std.posix.system.setsockopt(
+            conn.socket.handle,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.SNDTIMEO,
+            &tv,
+            @sizeOf(std.posix.timeval),
+        );
+        if (rc != 0) {
+            std.log.warn(
+                "[DEB] SO_SNDTIMEO ({d} ms) not applied (errno {s}): a peer that stops reading can park a writer, and every teardown of this node waits for it",
+                .{ timeout_ms, @tagName(std.posix.errno(rc)) },
+            );
+        }
+    }
+
     fn acceptLoop(self: *Self) void {
         while (self.is_running) {
             if (self.listener) |*l| {
@@ -423,24 +625,18 @@ pub const DistributedEventBus = struct {
     }
 
     fn sendHeartbeat(self: *Self) void {
-        const event = NetworkEvent{
-            .topic = "__heartbeat",
-            .payload = self.node_id,
-            .source_node = self.node_id,
-            .timestamp = Time.monotonicNowSeconds(),
-            .seq = self.nextSeq(),
-        };
-        // Serialized once for every peer, framed per peer: the frame carries the
-        // MAC, and the MAC only has to cover the json.
-        const json = serializeEventAlloc(self.allocator, event) catch |err| {
-            std.log.warn("[DistributedEventBus] Heartbeat not sent: {}", .{err});
-            return;
-        };
-        defer self.allocator.free(json);
-
-        for (self.nodes.items) |*node| {
+        const now = Time.monotonicNowSeconds();
+        // A walk of the registry, so it is a critical section: a concurrent
+        // `disconnectNode` frees the entry it takes, and a walk that is not under
+        // `nodes_lock` can dereference it after that.
+        self.lockNodes() catch return;
+        defer self.nodes_lock.unlock(self.io);
+        for (self.nodes.items) |node| {
             if (node.socket != null) {
-                self.sendFramed(node, json) catch |err| {
+                // Framed, MAC'd and seq-stamped per peer inside that peer's
+                // write lock — see `sendFramed` for why the seq is drawn there
+                // and not here.
+                self.sendFramed(node, "__heartbeat", self.node_id, now) catch |err| {
                     std.log.warn("[DistributedEventBus] Heartbeat failed to node {s}: {}", .{ node.id, err });
                 };
             }
@@ -449,30 +645,310 @@ pub const DistributedEventBus = struct {
 
     /// The next `"seq"` this node stamps on an outbound frame. Atomic because
     /// `publish` is called from arbitrary threads while `heartbeatLoop` stamps
-    /// its own frame from a fiber: the counter has to be strictly increasing
-    /// **per receiver**, and one global counter is the simplest way to be.
+    /// its own frames from a fiber; and it is only ever called **under the
+    /// per-node write lock** (`sendFramed`), so the number a frame carries
+    /// always reflects the order that frame left the connection — the
+    /// receiver's replay gate (`acceptSeq`) requires exactly that. One global
+    /// counter is the simplest way to be strictly increasing per receiver.
     fn nextSeq(self: *Self) u64 {
         return self.next_seq.fetchAdd(1, .monotonic) + 1;
     }
 
-    /// Write one already-serialized frame to `node`'s socket, serialised against
-    /// every other writer to the same peer.
+    /// Write one event frame to `node`'s socket — the single funnel for every
+    /// peer-bound byte the bus sends (`publish`, `heartbeatLoop`).
     ///
-    /// `publish` (a request thread) and `heartbeatLoop` (a fiber) both target
-    /// connected peers, and two `writeAll`s interleaving on one socket is a
-    /// corrupt frame — after framing it is no longer a *silent* one (the length
-    /// prefix bounds the damage to "MAC fails, connection dropped"), but it drops
-    /// a live connection and loses the event, so the write is serialised instead.
-    fn sendFramed(self: *Self, node: *Node, json: []const u8) !void {
-        const sock = node.socket orelse return error.NotConnected;
+    /// The replay `"seq"` is stamped **here, under the write lock**, not at the
+    /// `publish` call site: the receiver keeps the highest seq it has accepted
+    /// per source and drops any frame that does not move that forward
+    /// (`acceptSeq`). A frame that drew its seq early but reached the socket
+    /// late would invert the wire order, read as a replay, and be silently
+    /// dropped — the stream survives, the event does not. Stamping inside the
+    /// lock makes wire order and seq order the same thing per connection, and
+    /// serialization plus the MAC move in with it because both embed the seq.
+    ///
+    /// The lock does for ordering what framing did for integrity: two
+    /// `writeAll`s can no longer interleave *inside* a frame (a corrupt frame
+    /// fails the MAC and drops the connection), and two frames can no longer
+    /// swap *positions* on the wire.
+    ///
+    /// The `node.socket` check also lives inside the lock: a concurrent
+    /// quarantine (`recordSendFailure`) or `disconnectNode` takes the socket out
+    /// from under it (`takeNodeSocket`), and writing a stale handle would be an
+    /// fd-reuse hazard, not just an error.
+    fn sendFramed(self: *Self, node: *Node, topic: []const u8, payload: []const u8, timestamp: i64) !void {
         node.write_lock.lock(self.io) catch return error.WriteLockUnavailable;
         defer node.write_lock.unlock(self.io);
+
+        const sock = node.socket orelse return error.NotConnected;
+        const event = NetworkEvent{
+            .topic = topic,
+            .payload = payload,
+            .source_node = self.node_id,
+            .timestamp = timestamp,
+            .seq = self.nextSeq(),
+        };
+        const json = try serializeEventAlloc(self.allocator, event);
+        defer self.allocator.free(json);
         try self.sendEventFrame(sock, json);
     }
 
+    /// The teardown half of `sendFramed`'s lock contract: take ownership of
+    /// `node`'s socket, nulling the field and handing the handle to **exactly one**
+    /// caller.
+    ///
+    /// Every path that used to close `node.socket` did it through a handle it had
+    /// read earlier and without the lock, so two failure paths racing on one dead
+    /// connection both closed the same fd, and a teardown could close the fd a
+    /// `sendFramed` was writing on — the `close` half of the fd-reuse hazard that
+    /// function's own comment describes for writes. POSIX offers no "close only if
+    /// it is still mine", so ownership has to be decided here: under the write
+    /// lock, where `sendFramed` cannot be mid-write, and by a `swap`-style take
+    /// (`orelse return null`) that only one caller can win.
+    ///
+    /// Closing is then the winner's business, outside the lock — the same reason
+    /// the lock is an `Io.Mutex` and not a spin lock: the guarded section is a
+    /// blocking `writeAll`, and a blocking `close` has no business waiting inside
+    /// it.
+    ///
+    /// A lock that cannot be acquired (the `Io.Mutex` is cancelable) returns null
+    /// *without touching anything*: the node keeps its socket and a later teardown
+    /// can still take it. That is the safe side of the two ways this can go wrong —
+    /// never close twice, never close a handle nobody took. One caller leaks on
+    /// that path and only that one: `disconnectNode` unlinks the node regardless,
+    /// so a canceled take there leaves the fd to the process rather than closing a
+    /// socket a `sendFramed` may still hold.
+    fn takeNodeSocket(self: *Self, node: *Node) ?std.Io.net.Stream {
+        node.write_lock.lock(self.io) catch return null;
+        const sock = node.socket orelse {
+            node.write_lock.unlock(self.io);
+            return null;
+        };
+        node.socket = null;
+        node.write_lock.unlock(self.io);
+        return sock;
+    }
+
+    /// Close `node`'s socket, at most once, whatever races with it: the single
+    /// funnel for `recordSendFailure`'s quarantine, `disconnectNode` and
+    /// `deinit`. Idempotent by construction — a second call finds no socket to
+    /// take, so there is no second `close` of anything.
+    ///
+    /// The `write_lock` it waits on cannot be held while `nodes_lock` is held by
+    /// this thread (lock order: `nodes_lock` before `write_lock`), which is why
+    /// the one caller that reaches it from inside a walk — the quarantine in
+    /// `recordSendFailure` — does not park there: no other writer can be inside
+    /// the registry at the same time.
+    fn closeNodeSocket(self: *Self, node: *Node) void {
+        if (self.takeNodeSocket(node)) |sock| sock.close(self.io);
+    }
+
+    /// Take `nodes_lock`, reporting a lock that cannot be acquired instead of
+    /// pretending the registry is empty. An `Io.Mutex` is cancelable, so this
+    /// returns an error rather than blocking forever; callers decide whether the
+    /// work is skippable (`publish` still dispatches locally) or fatal
+    /// (`connectToNode` cannot register the node at all).
+    fn lockNodes(self: *Self) !void {
+        self.nodes_lock.lock(self.io) catch |err| {
+            std.log.err("[DistributedEventBus] node registry lock unavailable: {}", .{err});
+            return error.NodeRegistryLockUnavailable;
+        };
+    }
+
+    /// Take `node_id` out of the topology — the registry entry **and** the hash
+    /// ring — handing the entry to exactly one caller.
+    ///
+    /// This is the claim that makes concurrent teardown safe: the caller that
+    /// gets the entry back is the only one that will close its socket and free
+    /// its `id`, and a second caller (or a second thread) finds nothing to take
+    /// and returns. The ring is mutated here for the same reason the walk in
+    /// `fanOut` reads it under this lock: `p.route` must not race a
+    /// `p.removeNode`.
+    fn takeNode(self: *Self, node_id: []const u8) ?*Node {
+        self.lockNodes() catch return null;
+        defer self.nodes_lock.unlock(self.io);
+        for (self.nodes.items, 0..) |node, i| {
+            if (std.mem.eql(u8, node.id, node_id)) {
+                if (self.partitioner) |p| p.removeNode(node_id);
+                return self.nodes.swapRemove(i);
+            }
+        }
+        return null;
+    }
+
+    /// The entry registered for `node_id`, or null. `nodes_lock` must be held —
+    /// the walk dereferences entries a concurrent remover frees.
+    fn findNodeLocked(self: *Self, node_id: []const u8) ?*Node {
+        for (self.nodes.items) |node| {
+            if (std.mem.eql(u8, node.id, node_id)) return node;
+        }
+        return null;
+    }
+
+    /// Add `node_id` to the routing ring if it is not already there. The caller
+    /// holds `nodes_lock` (the lock `fanOut` computes routes under), so the ring
+    /// is not read while it is written.
+    fn addToRingLocked(self: *Self, node_id: []const u8) void {
+        const p = self.partitioner orelse return;
+        if (p.nodes.contains(node_id)) return;
+        p.addNode(node_id) catch |err| {
+            std.log.err("[DistributedEventBus] Failed to add node {s} to partitioner: {}", .{ node_id, err });
+        };
+    }
+
+    /// Heap-allocate one registry entry, append it and put it in the ring, all
+    /// under `nodes_lock`. The caller owns the socket on failure — nothing is
+    /// registered unless the whole thing succeeds.
+    fn registerNode(self: *Self, node_id: []const u8, address: std.Io.net.IpAddress, socket: ?std.Io.net.Stream) !*Node {
+        try self.lockNodes();
+        defer self.nodes_lock.unlock(self.io);
+        return self.appendNodeLocked(node_id, address, socket, 0);
+    }
+
+    /// The body of `registerNode`/`reserveNode`, with `nodes_lock` held by the
+    /// caller: allocate the entry, append it and put it in the ring. It carries
+    /// no duplicate check — `reserveNode` is where "one id, one entry" is
+    /// enforced.
+    ///
+    /// `reservation` is 0 for an entry that is usable at once (a socket was
+    /// handed in) and the caller's token for one that is still being dialled.
+    fn appendNodeLocked(
+        self: *Self,
+        node_id: []const u8,
+        address: std.Io.net.IpAddress,
+        socket: ?std.Io.net.Stream,
+        reservation: u64,
+    ) !*Node {
+        const node = try self.allocator.create(Node);
+        errdefer self.allocator.destroy(node);
+        const id_copy = try self.allocator.dupe(u8, node_id);
+        errdefer self.allocator.free(id_copy);
+
+        node.* = .{
+            .id = id_copy,
+            .address = address,
+            .socket = socket,
+            .last_seen = Time.monotonicNowSeconds(),
+            .reservation = reservation,
+        };
+
+        try self.nodes.append(node);
+        // The entry is reachable from the registry from here on, so the ring has
+        // to know about it too — a route that names a node `fanOut` cannot find
+        // is the "unreachable, falling back to broadcast" warning path.
+        self.addToRingLocked(id_copy);
+        return node;
+    }
+
+    /// Create the entry `connectToNode` will dial for — **before** the dial —
+    /// and return its reservation token; null when this caller must not dial.
+    ///
+    /// This is the fix for the window `connectToNode` used to leave open between
+    /// its duplicate scan and its registration: the dial is blocking and cannot
+    /// happen under `nodes_lock`, so two callers for one id both found nothing in
+    /// their scans, both dialled and both registered — two entries for one id,
+    /// with two independent `write_lock`s (which is what breaks the per-node
+    /// serialisation the rest of this file assumes) and one of them an orphan
+    /// nobody routes to and nobody disconnects. Reserving first closes the window
+    /// at its source: the second caller's scan finds the first caller's *entry*,
+    /// not its absence.
+    ///
+    /// Null is that "somebody else owns this id" outcome, in either of the two
+    /// shapes it can take — an entry that is already connected, or a reservation
+    /// another caller is still dialling. Both are handled the same way: the ring
+    /// is reconciled (the same work the scan in `connectToNode` does) and the
+    /// caller returns without touching the network. Nothing is returned to the
+    /// caller but the token, on purpose: the entry may be gone by the time the
+    /// dial finishes, so ownership is decided by `(id, token)` later
+    /// (`settleConnect`) rather than by a pointer the caller would have to keep
+    /// alive.
+    fn reserveNode(self: *Self, node_id: []const u8, address: std.Io.net.IpAddress) !?u64 {
+        try self.lockNodes();
+        defer self.nodes_lock.unlock(self.io);
+
+        if (self.findNodeLocked(node_id) != null) {
+            self.addToRingLocked(node_id);
+            return null;
+        }
+
+        const token = self.next_reservation;
+        // 2^64 connects would wrap; skipping 0 keeps every live reservation
+        // non-zero, which is how an entry reads as "reserved" everywhere else.
+        self.next_reservation = if (token == std.math.maxInt(u64)) 1 else token + 1;
+        _ = try self.appendNodeLocked(node_id, address, null, token);
+        return token;
+    }
+
+    /// The second half of `connectToNode`, under `nodes_lock`: hand the dialled
+    /// connection to the entry this caller reserved, or close it.
+    ///
+    /// The lookup is by `(id, token)` and not by a pointer, because the entry may
+    /// have been removed while the dial ran — `disconnectNode`, `deinit` — and
+    /// its storage freed; the allocator is free to hand the same address to
+    /// another entry. The token is unique to this reservation and is cleared by
+    /// nothing else, so "found" means "still mine" and "not found" means a
+    /// teardown won the race.
+    ///
+    /// A teardown winning is not an error: the removal is the newer decision, so
+    /// this connection is closed rather than re-registered behind it — which is
+    /// also what keeps it from becoming an orphan connection (and an orphan fd).
+    /// `stream` is null on every dial/handshake failure, and that case still
+    /// installs: the entry stays, tracked for routing and unreachable, exactly
+    /// the state `connectToNode` has always left behind for a peer it could not
+    /// reach.
+    fn settleConnect(self: *Self, node_id: []const u8, token: u64, stream: ?std.Io.net.Stream) void {
+        self.lockNodes() catch {
+            // Nothing can be registered without the registry lock, and a
+            // connection nobody tracks is worse than no connection.
+            if (stream) |s| s.close(self.io);
+            return;
+        };
+        defer self.nodes_lock.unlock(self.io);
+
+        for (self.nodes.items) |node| {
+            if (node.reservation != token or !std.mem.eql(u8, node.id, node_id)) continue;
+            // The install sits under the node's own write lock: `node.socket` is
+            // owned by it (`sendFramed` reads it, `takeNodeSocket` takes it), and
+            // this is the documented `nodes_lock` → `write_lock` order, not an
+            // inversion. A reserved entry has no socket, so no writer can be
+            // inside that lock for long.
+            node.write_lock.lock(self.io) catch {
+                // A cancelable lock that will not be taken leaves the entry
+                // tracked-but-unconnected; clearing the reservation keeps it from
+                // reading as "a dial is in flight" forever.
+                if (stream) |s| s.close(self.io);
+                node.reservation = 0;
+                return;
+            };
+            node.socket = stream;
+            node.reservation = 0;
+            node.last_seen = Time.monotonicNowSeconds();
+            node.write_lock.unlock(self.io);
+            return;
+        }
+
+        // The reservation is gone: a `disconnectNode`/`deinit` removed the entry
+        // while this caller was dialling, and that removal stands.
+        if (stream) |s| s.close(self.io);
+    }
+
+    /// Close and free an entry that `takeNode` handed out. Called **without**
+    /// `nodes_lock`: `closeNodeSocket` waits for an in-flight writer on this
+    /// node's `write_lock`, and no teardown has any business parking the whole
+    /// registry behind that wait. Safe to do outside because the entry is no
+    /// longer reachable from the registry (the take removed it), so this is the
+    /// only reference left.
+    fn destroyNode(self: *Self, node: *Node) void {
+        self.closeNodeSocket(node);
+        self.allocator.free(node.id);
+        self.allocator.destroy(node);
+    }
+
     /// Frame `json` for the wire (see the wire-format comment at the top of this
-    /// file) and write it with a single `writeAll`, so the whole message — MAC
-    /// included — leaves as one call. The MAC is keyed with **this node's own
+    /// file) and write it with a single `writeAll`-style loop, so the whole
+    /// message — MAC included — leaves as one call. The write goes through
+    /// `sockread.writeFull`, which is the only form that reports a timed-out
+    /// `SO_SNDTIMEO` as `error.WriteTimeout` instead of aborting inside std — see
+    /// the comment at the write below. The MAC is keyed with **this node's own
     /// key**: the peer verifies it with `peer_keys[self.node_id]`, i.e. with the
     /// credential the handshake already proved for this connection.
     ///
@@ -495,10 +971,17 @@ pub const DistributedEventBus = struct {
         }
         @memcpy(frame[4 + mac_len ..], json);
 
-        var write_buf: [4096]u8 = undefined;
-        var w = sock.writer(self.io, &write_buf);
-        try w.interface.writeAll(frame);
-        try w.interface.flush();
+        // Written with the raw helper, not `sock.writer(...)`: `SO_SNDTIMEO`
+        // (`applySendTimeout`) surfaces a stalled write as `EAGAIN`, and
+        // `std.Io.Threaded`'s posix write path classifies `EAGAIN` as an OS bug —
+        // `errnoBug` is `std.debug.panic("programmer bug caused syscall error:
+        // {t}")` in a Debug build, an abort from inside std that no caller can
+        // catch. `writeFull` maps it to `error.WriteTimeout` instead, which the
+        // failure path above already knows what to do with
+        // (`recordSendFailure` → counter → DLQ at the threshold → quarantine).
+        // The whole frame still leaves as one `writeAll`-style loop, so framing is
+        // unchanged.
+        try sockread.writeFull(sock, frame);
     }
 
     /// The receive half of `sendEventFrame`: return the json inside one frame
@@ -540,6 +1023,41 @@ pub const DistributedEventBus = struct {
         id: []const u8,
         key: [32]u8,
     };
+
+    /// ② of the handshake protocol: `[dc: 16][claim_id][mac: 32]`, split into
+    /// its parts. Null when the body cannot carry the fixed-size bookends plus a
+    /// one-byte claim — a short body is a protocol violation, not a truncation
+    /// to retry, and the MAC still has to be verified before any of it is used.
+    const HandshakeResponse = struct {
+        dc: [handshake_nonce_bytes]u8,
+        claim: []const u8,
+        mac: [auth_mac_bytes]u8,
+    };
+
+    fn parseHandshakeResponse(response: []const u8) ?HandshakeResponse {
+        if (response.len < handshake_nonce_bytes + 1 + auth_mac_bytes) return null;
+        return .{
+            .dc = response[0..handshake_nonce_bytes].*,
+            .claim = response[handshake_nonce_bytes .. response.len - auth_mac_bytes],
+            .mac = response[response.len - auth_mac_bytes ..][0..auth_mac_bytes].*,
+        };
+    }
+
+    /// ③ of the handshake protocol: `[receiver_id][mac: 32]`, the receiver's
+    /// proof it holds the key the dialer expects. Same null contract as
+    /// `parseHandshakeResponse`.
+    const HandshakeReply = struct {
+        id: []const u8,
+        mac: [auth_mac_bytes]u8,
+    };
+
+    fn parseHandshakeReply(reply: []const u8) ?HandshakeReply {
+        if (reply.len < 1 + auth_mac_bytes) return null;
+        return .{
+            .id = reply[0 .. reply.len - auth_mac_bytes],
+            .mac = reply[reply.len - auth_mac_bytes ..][0..auth_mac_bytes].*,
+        };
+    }
 
     /// One length-prefixed handshake message: `[4-byte BE len][body]`. The same
     /// prefix the event frames use, so either side can read either with
@@ -615,13 +1133,13 @@ pub const DistributedEventBus = struct {
         const response = readHandshake(conn, self.allocator) orelse return null;
         defer self.allocator.free(response);
         // [dc: 16][claim_id][mac: 32]
-        if (response.len < handshake_nonce_bytes + 1 + auth_mac_bytes) {
+        const parts = parseHandshakeResponse(response) orelse {
             std.log.debug("[DEB] dropping connection: handshake response is {d} bytes", .{response.len});
             return null;
-        }
-        const dc = response[0..handshake_nonce_bytes];
-        const claim = response[handshake_nonce_bytes .. response.len - auth_mac_bytes];
-        const mac = response[response.len - auth_mac_bytes ..];
+        };
+        const dc = &parts.dc;
+        const claim = parts.claim;
+        const mac = &parts.mac;
 
         // The claim is what selects the key; a claim we hold no key for is an
         // unknown peer, not a peer to fall back on.
@@ -671,6 +1189,13 @@ pub const DistributedEventBus = struct {
     /// Errors are the fail-closed outcomes; `connectToNode` drops the connection
     /// on every one of them. `PeerKeyMissing` on either side is the case the
     /// design names explicitly: no credential for this link means no link.
+    ///
+    /// It is reached **only when `authEnabled()`** — the mirror of `bindInbound`
+    /// being reached only from `handleConnection`'s own `authEnabled()` guard. On
+    /// a bus with no credential at all there is no link to authenticate, so the
+    /// bare format is what both directions speak (see `connectToNode`); this
+    /// function's first two lines are what makes that guard load-bearing rather
+    /// than decorative.
     fn bindOutbound(self: *Self, conn: std.Io.net.Stream, peer_id: []const u8) !void {
         // Both lookups happen **before** a byte is written: there is no point
         // opening an exchange we cannot finish, and no path where a missing key
@@ -701,8 +1226,8 @@ pub const DistributedEventBus = struct {
 
         const reply = readHandshake(conn, self.allocator) orelse return error.HandshakeRejected;
         defer self.allocator.free(reply);
-        if (reply.len < 1 + auth_mac_bytes) return error.HandshakeRejected;
-        const receiver_id = reply[0 .. reply.len - auth_mac_bytes];
+        const proof = parseHandshakeReply(reply) orelse return error.HandshakeRejected;
+        const receiver_id = proof.id;
         // An answer from a node other than the one we dialled is not an answer to
         // this dial (the peer-id discipline of `docs/dev/cluster-auth-design.md` §10).
         if (!std.mem.eql(u8, receiver_id, peer_id)) {
@@ -714,7 +1239,7 @@ pub const DistributedEventBus = struct {
         reply_hmac.update(receiver_id);
         reply_hmac.update(&dc);
         reply_hmac.final(&expected);
-        if (!ClusterAuth.timingSafeEql(&expected, reply[reply.len - auth_mac_bytes ..])) {
+        if (!ClusterAuth.timingSafeEql(&expected, &proof.mac)) {
             std.log.debug("[DEB] handshake refused: '{s}' did not prove it holds its own key", .{peer_id});
             return error.HandshakeRejected;
         }
@@ -738,6 +1263,11 @@ pub const DistributedEventBus = struct {
         // 6× the heartbeat interval it only fires for a peer that is *silent*,
         // and 0 still disables it.
         self.applyRecvTimeout(conn);
+        // The accepted socket is a write side too: the handshake replies below go
+        // out on it. Bounding those is not the point (they are small) — the point
+        // is that a reply to a peer that stopped reading must not park this fiber,
+        // which `stop()` awaits.
+        self.applySendTimeout(conn);
 
         // Settle the identity **before** the first event frame. The claim only
         // exists on a connection that proved it; there is no event path that runs
@@ -987,23 +1517,54 @@ pub const DistributedEventBus = struct {
             };
         }
 
+        const timestamp = Time.monotonicNowSeconds();
+        // The event **local** subscribers see. Its seq is stamped here and is
+        // only for local observation; the frame that actually goes on the wire
+        // draws a fresh seq per peer inside that peer's write lock
+        // (`sendFramed`), because the receiver's replay gate requires wire
+        // order == seq order and only the lock knows that order.
         const event = NetworkEvent{
             .topic = topic,
             .payload = payload,
             .source_node = self.node_id,
-            .timestamp = Time.monotonicNowSeconds(),
-            // Stamped on the way out and part of the MAC'd region: a receiver
-            // keeps the highest it has seen per claim, so a replayed frame does
-            // not reach a subscriber twice.
+            .timestamp = timestamp,
             .seq = self.nextSeq(),
         };
 
-        // Serialize once for every peer (the frame is built per peer in
-        // `sendEventFrame`, because the MAC is part of it).
-        const json = try serializeEventAlloc(self.allocator, event);
-        defer self.allocator.free(json);
+        // The wire half, under the registry lock — see `fanOut`. A lock that
+        // cannot be taken skips the fan-out; this node's own subscribers are not
+        // behind that lock and are still served below.
+        self.fanOut(topic, payload, timestamp) catch |err| {
+            std.log.warn("[DistributedEventBus] peer fan-out skipped ({})", .{err});
+        };
 
-        // Route via partitioner if configured; otherwise broadcast.
+        // Also publish locally
+        self.publishToTopic(event);
+        self.local_bus.publish(event);
+    }
+
+    /// Write one event to the peers this node should send it to: the partition
+    /// owner when a partitioner routes it elsewhere, or every connected node.
+    ///
+    /// Holds `nodes_lock` for the whole fan-out. That is what makes the walk
+    /// safe — a concurrent `disconnectNode` removes and frees entries, and a walk
+    /// outside the lock could write through a pointer to a freed node, or (with
+    /// inline entries) through a slot `swapRemove` had just refilled with another
+    /// peer's data. It is also what makes `p.route` below safe: the ring's
+    /// mutations (`takeNode`, `registerNode`, `setPartitioner`) all happen under
+    /// this same lock.
+    ///
+    /// The cost is that the lock is held across blocking socket writes, bounded
+    /// by `outbound_send_timeout_ms` per peer. Correctness first: without the lock
+    /// there is no point at which a removal can be said to be safe from a walker,
+    /// and a partial write to the wrong peer is worse than a serialised one.
+    fn fanOut(self: *Self, topic: []const u8, payload: []const u8, timestamp: i64) !void {
+        try self.lockNodes();
+        defer self.nodes_lock.unlock(self.io);
+
+        // Route via partitioner if configured; otherwise broadcast. Each
+        // `sendToNode` call re-serializes under the peer's write lock: the seq
+        // stamped there is per-peer, so one shared rendering cannot be reused.
         var routed = false;
         if (self.partitioner) |p| {
             if (p.route(topic)) |target_node| {
@@ -1011,9 +1572,9 @@ pub const DistributedEventBus = struct {
                     // This node owns the partition — skip network fan-out.
                     routed = true;
                 } else {
-                    for (self.nodes.items) |*node| {
+                    for (self.nodes.items) |node| {
                         if (std.mem.eql(u8, node.id, target_node)) {
-                            routed = self.sendToNode(node, topic, payload, json);
+                            routed = self.sendToNode(node, topic, payload, timestamp);
                             break;
                         }
                     }
@@ -1030,43 +1591,77 @@ pub const DistributedEventBus = struct {
 
         if (!routed) {
             // Broadcast to all connected nodes with soft backpressure on failing sockets
-            for (self.nodes.items) |*node| {
-                _ = self.sendToNode(node, topic, payload, json);
+            for (self.nodes.items) |node| {
+                _ = self.sendToNode(node, topic, payload, timestamp);
             }
         }
-
-        // Also publish locally
-        self.publishToTopic(event);
-        self.local_bus.publish(event);
     }
 
-    /// Send one event's json to a single node as a framed message. Returns true
+    /// Send one event to a single node as a framed message. Returns true
     /// on success. On failure, increments the node failure counter. The message
-    /// is pushed to the DLQ only when the cumulative failures reach
-    /// `max_send_failures` (immediately before the node is quarantined).
-    fn sendToNode(self: *Self, node: *Node, topic: []const u8, payload: []const u8, json: []const u8) bool {
-        if (node.send_failures >= self.max_send_failures) return false;
-        // `sendFramed` takes the node's write lock, so a publish from a request
-        // thread cannot interleave with a heartbeat fiber on the same socket.
-        self.sendFramed(node, json) catch |err| {
-            if (node.socket) |sock| self.recordSendFailure(node, sock, topic, payload, err);
+    /// is pushed to the DLQ on the single failure that takes the cumulative count
+    /// to `max_send_failures` — the same call that quarantines the node.
+    ///
+    /// `sendFramed` takes the node's write lock and stamps the seq inside it,
+    /// so a publish from a request thread can neither interleave with nor
+    /// overtake (seq-wise) a heartbeat fiber on the same socket.
+    fn sendToNode(self: *Self, node: *Node, topic: []const u8, payload: []const u8, timestamp: i64) bool {
+        if (@atomicLoad(u32, &node.send_failures, .monotonic) >= self.max_send_failures) return false;
+        self.sendFramed(node, topic, payload, timestamp) catch |err| {
+            // Only count a failure that had a socket to fail on — a node whose
+            // connection is already gone (`socket == null`) is not failed again,
+            // and one that a concurrent quarantine just took reports
+            // `error.NotConnected` here. The read is advisory: the handle itself
+            // is never taken outside `takeNodeSocket`, which is what makes this
+            // safe to do without the lock.
+            if (node.socket != null) self.recordSendFailure(node, topic, payload, err);
             return false;
         };
-        node.send_failures = 0;
+        @atomicStore(u32, &node.send_failures, 0, .monotonic);
         return true;
     }
 
-    fn recordSendFailure(self: *Self, node: *Node, sock: std.Io.net.Stream, topic: []const u8, payload: []const u8, err: anyerror) void {
-        node.send_failures += 1;
-        std.log.err("[DistributedEventBus] Failed to send to node {s} (failures={d}): {}", .{ node.id, node.send_failures, err });
-        if (node.send_failures >= self.max_send_failures) {
-            var err_buf: [256]u8 = undefined;
-            const err_msg = std.fmt.bufPrint(&err_buf, "Send failed: {}", .{err}) catch "Send failed";
-            self.pushToDlq(topic, payload, "SendError", err_msg);
-            std.log.warn("[DistributedEventBus] Quarantining node {s} after {d} send failures", .{ node.id, node.send_failures });
-            sock.close(self.io);
-            node.socket = null;
-        }
+    /// Count one failed send and report whether **this** call is the one that
+    /// crossed `max_send_failures` — the one-shot edge `recordSendFailure` hangs
+    /// the DLQ push and the quarantine on.
+    ///
+    /// The counter is a plain `u32` touched with atomics (see the field's
+    /// comment); the edge is claimed by the return value of the add, not by a
+    /// load-then-store: every `@atomicRmw` returns a *unique* previous value, so
+    /// exactly one caller in a burst can observe the counter move from
+    /// `max_send_failures - 1` to the threshold. Two failing threads on one node
+    /// therefore produce one quarantine, where a non-atomic `+= 1` plus a
+    /// separate `>= max` test let both of them see the threshold — each pushing
+    /// the same message to the DLQ and each closing the socket.
+    ///
+    /// False means "below the threshold", or "already at or above it" (somebody
+    /// else's call was the crossing, or the node has been quarantined already and
+    /// `sendToNode` no longer reaches this point).
+    fn countSendFailure(self: *Self, node: *Node) bool {
+        const prev = @atomicRmw(u32, &node.send_failures, .Add, 1, .monotonic);
+        if (self.max_send_failures == 0) return false;
+        if (prev >= self.max_send_failures) return false;
+        return prev + 1 >= self.max_send_failures;
+    }
+
+    fn recordSendFailure(self: *Self, node: *Node, topic: []const u8, payload: []const u8, err: anyerror) void {
+        const crossed = self.countSendFailure(node);
+        std.log.err(
+            "[DistributedEventBus] Failed to send to node {s} (failures={d}): {}",
+            .{ node.id, @atomicLoad(u32, &node.send_failures, .monotonic), err },
+        );
+        if (!crossed) return;
+
+        var err_buf: [256]u8 = undefined;
+        const err_msg = std.fmt.bufPrint(&err_buf, "Send failed: {}", .{err}) catch "Send failed";
+        self.pushToDlq(topic, payload, "SendError", err_msg);
+        std.log.warn(
+            "[DistributedEventBus] Quarantining node {s} after {d} send failures",
+            .{ node.id, @atomicLoad(u32, &node.send_failures, .monotonic) },
+        );
+        // One owner, one `close`: reachable only from the crossing call above, and
+        // the take inside is what makes it at most one close even then.
+        self.closeNodeSocket(node);
     }
 
     fn publishToTopic(self: *Self, event: NetworkEvent) void {
@@ -1382,31 +1977,180 @@ pub const DistributedEventBus = struct {
         return self.cluster_secret != null or self.credentials_configured.load(.acquire);
     }
 
-    /// Get list of connected nodes
-    pub fn getConnectedNodes(self: *Self) []const Node {
+    /// The peer registry's **internal array**, handed out with no lock and no
+    /// ownership. Reading it is a data race, and using it can be a
+    /// use-after-free — this is the one API in this file that cannot be made
+    /// safe from the inside, so the contract is on the caller.
+    ///
+    /// What is wrong with it, concretely:
+    ///   * the slice header is `self.nodes.items`, so it is captured at this
+    ///     instant and **not** updated: an `append` from `connectToNode` may
+    ///     reallocate the array, and the slice this call returned then points at
+    ///     freed memory (every entry in it becomes garbage at once);
+    ///   * every `*Node` in it is owned by the registry. `disconnectNode` /
+    ///     `deinit` take an entry out and free it (`destroyNode`: socket closed,
+    ///     `id` freed, `Node` freed), and a `swapRemove` moves another peer's
+    ///     entry into the slot a walk may still be reading.
+    ///
+    /// So a caller may use this only if it **already** guarantees it is alone
+    /// with the bus (single-threaded wiring, or under a lock of its own that
+    /// every mutator also takes), and even then only for the duration of one
+    /// walk. The bus's own walks do not use it: they run as critical sections
+    /// under `nodes_lock`.
+    ///
+    /// For everything else — a `ClusterMembership`-style census that runs beside
+    /// a live gossip path — use `snapshotNodes`, which copies the registry
+    /// under `nodes_lock` and hands the copy to the caller. It is the supported
+    /// way to observe a live bus, and the reason this function has no safe
+    /// variant: a copy is the only shape that cannot be invalidated by the next
+    /// mutation.
+    pub fn getConnectedNodes(self: *Self) []const *Node {
         return self.nodes.items;
     }
 
-    /// Get node count
+    /// A point-in-time copy of the peer registry, owned by the caller.
+    ///
+    /// Ownership: `peers` and every `id` in it are allocated from the allocator
+    /// passed to `snapshotNodes`, and **nothing else references them** — the
+    /// registry can be mutated, torn down or deinited while the caller reads
+    /// this. `deinit` frees all of it; that is the only call needed, and the
+    /// only one a caller should make. Do not copy the value: like every
+    /// owning struct here, two copies would both free the same ids.
+    pub const NodeSnapshot = struct {
+        /// One peer in the snapshot — a **copy**, so the caller's copy stays
+        /// valid however the registry changes afterwards.
+        pub const Peer = struct {
+            /// Owned by the snapshot (freed by `deinit`).
+            id: []const u8,
+            address: std.Io.net.IpAddress,
+            /// `socket != null` at the moment the snapshot was taken, i.e. "the
+            /// entry holds a connection". A reserved entry that is still dialling
+            /// reads false, exactly as it does from a walk of the live registry.
+            /// Advisory, like every other read of that field: it says nothing
+            /// about whether the next frame goes out.
+            connected: bool,
+            /// The entry's consecutive send-failure counter, read atomically (the
+            /// field is a plain `u32` touched with `@atomicRmw` — see `Node`).
+            send_failures: u32,
+        };
+
+        allocator: std.mem.Allocator,
+        peers: []Peer,
+
+        pub fn deinit(self: *NodeSnapshot) void {
+            for (self.peers) |peer| self.allocator.free(peer.id);
+            self.allocator.free(self.peers);
+            self.* = undefined;
+        }
+    };
+
+    /// Copy the peer registry into a caller-owned snapshot, under `nodes_lock`.
+    ///
+    /// This is the safe way to walk the peers of a live bus: the lock is taken
+    /// once, the whole registry is copied inside it, and the caller reads the
+    /// copy afterwards with no lock held and nothing shared with the registry —
+    /// so a concurrent `connectToNode` (which may reallocate the array),
+    /// `disconnectNode` or `deinit` (both of which free entries) cannot move or
+    /// free anything the caller is looking at.
+    ///
+    /// Why a copy and not a visitor callback: a callback would run **under
+    /// `nodes_lock`**, which is where `fanOut` already does its blocking writes,
+    /// so it would inherit every problem that makes that deliberate exception
+    /// expensive — a callback that takes a moment parks the whole registry,
+    /// including the publish path; a callback that calls back into the bus
+    /// (`disconnectNode`, `connectToNode`, `publish`) self-deadlocks, because
+    /// `Io.Mutex` is not recursive; and a callback that frees or closes would be
+    /// mutating the structure it is walking. Copying keeps the critical section
+    /// to `alloc + dupe + four field copies` per entry, with no call, no I/O and
+    /// no free inside it, which is also why the entries are copied in one
+    /// strictly-read direction with nothing to re-enter.
+    ///
+    /// Cost: one allocation per call (the array, plus one per id). Callers that
+    /// walk on a hot path should snapshot at their own cadence rather than per
+    /// event — the registry changes only on a connect/disconnect. `nodes_lock` is
+    /// not recursive, so this must not be called from inside one of the bus's own
+    /// critical sections — which, since the field is private to this file, no
+    /// caller outside it can be.
+    ///
+    /// Errors: the registry lock not being acquirable (`NodeRegistryLockUnavailable`)
+    /// or allocation failure. Nothing is left behind either way — every id
+    /// already copied is freed before the error returns, and the lock is
+    /// released on every path.
+    pub fn snapshotNodes(self: *Self, allocator: std.mem.Allocator) !NodeSnapshot {
+        try self.lockNodes();
+        defer self.nodes_lock.unlock(self.io);
+
+        const peers = try allocator.alloc(NodeSnapshot.Peer, self.nodes.items.len);
+        var copied: usize = 0;
+        errdefer {
+            for (peers[0..copied]) |peer| allocator.free(peer.id);
+            allocator.free(peers);
+        }
+
+        for (self.nodes.items, peers) |node, *peer| {
+            peer.* = .{
+                .id = try allocator.dupe(u8, node.id),
+                .address = node.address,
+                .connected = node.socket != null,
+                .send_failures = @atomicLoad(u32, &node.send_failures, .monotonic),
+            };
+            copied += 1;
+        }
+        return .{ .allocator = allocator, .peers = peers };
+    }
+
+    /// Get node count.
+    ///
+    /// Unlocked and therefore a snapshot of a moving number: the registry can
+    /// change between this call and the next instruction (see
+    /// `getConnectedNodes` for what that costs a caller). It exposes no pointer,
+    /// so the worst case is a stale count rather than a fault — and taking
+    /// `nodes_lock` here would make the call unusable from inside the bus's own
+    /// critical sections, where a count is legitimately wanted. Use
+    /// `snapshotNodes` when the count and the peers have to agree.
     pub fn getNodeCount(self: *Self) usize {
         return self.nodes.items.len;
     }
 
     /// Connect to a remote node. The node is registered for routing immediately;
     /// the outbound socket is established opportunistically and may remain null.
+    ///
+    /// Safe to call concurrently **for the same id**, which is what the
+    /// reservation is for: the first caller creates the entry (under
+    /// `nodes_lock`) and owns the dial, every later caller finds that entry —
+    /// connected, or still being dialled — and returns without a second dial. So
+    /// a concurrent pair ends with one entry, one socket and one `write_lock`,
+    /// where it used to end with two entries (two locks, one of them an orphan
+    /// connection nothing routes to).
+    ///
+    /// One observable consequence, and it is a deliberate one: the entry exists
+    /// from **before** the dial, so a caller that is still dialling is visible —
+    /// `getNodeCount`, `clusterSize`, `getConnectedNodes` — with `socket == null`
+    /// and in the routing ring. That is the same state a failed dial leaves
+    /// behind (`tracked for routing, not reachable`), so there is no new state to
+    /// interpret; what is new is that it can be observed a few milliseconds
+    /// earlier, while the handshake runs.
+    ///
+    /// The error set and the dial's own outcomes are unchanged: a missing peer
+    /// key is `error.PeerKeyMissing` before any socket is opened, and a refused
+    /// connection or handshake is not an error at all — the node is registered
+    /// with `socket == null`, "tracked for routing, not reachable". The one
+    /// outcome that is *not* visible to the caller is a teardown that won the
+    /// race while this call was dialling: the connection is closed and this
+    /// returns normally, because the removal (a `disconnectNode`/`deinit`) is the
+    /// newer decision and re-registering behind it would resurrect a node
+    /// somebody just removed (see `settleConnect`).
     pub fn connectToNode(self: *Self, node_id: []const u8, address: std.Io.net.IpAddress) !void {
-        // Prevent duplicate entries.
-        for (self.nodes.items) |node| {
-            if (std.mem.eql(u8, node.id, node_id)) {
-                // Reconcile partitioner state in case the node was removed
-                // from the ring while still being tracked here.
-                if (self.partitioner) |p| {
-                    if (!p.nodes.contains(node_id)) {
-                        p.addNode(node_id) catch |err| {
-                            std.log.err("[DistributedEventBus] Failed to re-add duplicate node {s} to partitioner: {}", .{ node_id, err });
-                        };
-                    }
-                }
+        // Already tracked — connected, or a reservation another caller is dialling
+        // for right now. Both are walks of the registry, so both are critical
+        // sections, and so is the ring reconciliation next to them.
+        {
+            try self.lockNodes();
+            defer self.nodes_lock.unlock(self.io);
+            if (self.findNodeLocked(node_id) != null) {
+                // Reconcile partitioner state in case the node was removed from
+                // the ring while still being tracked here.
+                self.addToRingLocked(node_id);
                 return;
             }
         }
@@ -1417,63 +2161,91 @@ pub const DistributedEventBus = struct {
         // downgrade `docs/dev/cluster-identity-design.md` §5 forbids.
         if (self.authEnabled() and self.peerKey(node_id) == null) return error.PeerKeyMissing;
 
-        const id_copy = try self.allocator.dupe(u8, node_id);
-        errdefer self.allocator.free(id_copy);
+        // Claim the id **before** the dial. This is the whole duplicate fix: the
+        // scan above and the registration below used to be two separate critical
+        // sections with a blocking dial between them, so a concurrent second
+        // caller saw an empty registry and started a dial of its own. The
+        // reservation is that missing "somebody is already on it" state.
+        const token = (try self.reserveNode(node_id, address)) orelse return;
 
+        // The dial and the handshake are blocking and deliberately outside the
+        // registry lock — the id is reserved now, so nothing has to be guarded
+        // while they run, and the entry is inert until the socket is installed
+        // (`reservation`, and `socket == null`).
         var stream: ?std.Io.net.Stream = null;
         stream = address.connect(self.io, .{ .mode = .stream }) catch |err| blk: {
             std.log.warn("[DistributedEventBus] Connection to {s} at {any} failed: {}", .{ node_id, address, err });
             break :blk null;
         };
-        errdefer if (stream) |s| s.close(self.io);
 
         // The identity is settled before the socket is registered anywhere: a
         // peer that cannot prove itself is not a peer, and `socket = null` is how
         // this bus already says "tracked for routing, not reachable". A refused
         // handshake is therefore a *connection* failure, not a fatal error for
         // the caller — the same shape as the connect failure above.
+        //
+        // Guarded by `authEnabled()` exactly as the receiving half is
+        // (`handleConnection`: `if (self.authEnabled()) binding = self.bindInbound(conn)`),
+        // and for the same reason: with **no** credential configured there is
+        // nothing to authenticate *with*. The guard is what makes the bare path a
+        // path in both directions — without it every dial on a credential-less
+        // bus is closed again inside `bindOutbound` (`own_key` is null there, so
+        // its first line refuses), so the bus could receive bare frames and never
+        // send one, and `sendEventFrame`'s bare branch could never run at all
+        // (`nodes` is only ever populated by this function).
+        //
+        // This is not a downgrade door. `authEnabled()` is true as soon as *any*
+        // of `cluster_secret` / `own_key` / `peer_keys` is set, and every such
+        // configuration still runs the full handshake below and still closes the
+        // connection on `PeerKeyMissing` / `HandshakeRejected` — including "this
+        // node has no `own_key`" and "no key for this peer" (the latter refused
+        // even earlier, above, before the dial).
         if (stream) |s| {
             self.applyRecvTimeout(s);
-            self.bindOutbound(s, node_id) catch |err| {
-                std.log.warn("[DistributedEventBus] Peer {s} at {any} refused the handshake: {}", .{ node_id, address, err });
-                s.close(self.io);
-                stream = null;
-            };
-        }
-
-        try self.nodes.append(.{
-            .id = id_copy,
-            .address = address,
-            .socket = stream,
-            .last_seen = Time.monotonicNowSeconds(),
-            .send_failures = 0,
-        });
-
-        if (self.partitioner) |p| {
-            if (!p.nodes.contains(node_id)) {
-                p.addNode(node_id) catch |err| {
-                    std.log.err("[DistributedEventBus] Failed to add node {s} to partitioner: {}", .{ node_id, err });
+            // The write half of the same bound: this is the socket every frame to
+            // this peer goes out on (`sendFramed` → `sendEventFrame`).
+            self.applySendTimeout(s);
+            if (self.authEnabled()) {
+                self.bindOutbound(s, node_id) catch |err| {
+                    std.log.warn("[DistributedEventBus] Peer {s} at {any} refused the handshake: {}", .{ node_id, address, err });
+                    s.close(self.io);
+                    stream = null;
                 };
             }
         }
+
+        // Nothing to clean up on the way out of this function: the socket is
+        // handed to the entry **or** closed inside `settleConnect`, which cannot
+        // fail. (The `errdefer` that used to close a dialled socket here guarded
+        // the registration call, which is now the reservation above the dial.)
+        self.settleConnect(node_id, token, stream);
     }
 
-    /// Disconnect from a node
+    /// Disconnect from a node.
+    ///
+    /// Safe to call concurrently for the same node — including from several
+    /// threads at once, which used to free one `id` twice and compact the list
+    /// twice: `takeNode` removes the entry under the registry lock and hands it
+    /// to exactly one caller, and only that caller closes the socket and frees
+    /// the id.
+    ///
+    /// A node whose dial is still in flight is removed the same way, and that is
+    /// what makes the removal authoritative: `settleConnect` then finds no
+    /// reservation to hand its connection to and closes it, instead of
+    /// re-registering a node this call just took out.
     pub fn disconnectNode(self: *Self, node_id: []const u8) void {
-        for (self.nodes.items, 0..) |*node, i| {
-            if (std.mem.eql(u8, node.id, node_id)) {
-                if (node.socket) |sock| {
-                    sock.close(self.io);
-                }
-                self.allocator.free(node.id);
-                _ = self.nodes.swapRemove(i);
-                if (self.partitioner) |p| {
-                    p.removeNode(node_id);
-                }
-                std.log.info("[DistributedEventBus] Disconnected from node {s}", .{node_id});
-                return;
-            }
-        }
+        const node = self.takeNode(node_id) orelse return;
+        // Logged before the entry is freed, and from the entry's own `id` rather
+        // than from `node_id`: the argument is allowed to *be* `node.id` (the
+        // natural `for (bus.getConnectedNodes()) |n| bus.disconnectNode(n.id)`),
+        // and reading it after `destroyNode` would be a use-after-free in a log
+        // line. Everything the argument is needed for (`takeNode`'s comparison,
+        // the ring's `removeNode`) has already happened above.
+        std.log.info("[DistributedEventBus] Disconnected from node {s}", .{node.id});
+        // Outside the registry lock: this waits for an in-flight `sendFramed` on
+        // this node (`takeNodeSocket`) rather than closing the fd under it, and
+        // that wait does not belong behind the lock every walk needs.
+        self.destroyNode(node);
     }
 
     /// Return this node's identifier.
@@ -1488,6 +2260,10 @@ pub const DistributedEventBus = struct {
 
     /// Set the consistent-hash partitioner for event routing
     pub fn setPartitioner(self: *Self, p: *Partitioner) void {
+        // The ring is read by `fanOut` under `nodes_lock`, so it is written under
+        // it too — this is a walk of the registry as well.
+        self.lockNodes() catch return;
+        defer self.nodes_lock.unlock(self.io);
         self.partitioner = p;
         // Ensure the ring reflects the current topology.
         if (!p.nodes.contains(self.node_id)) {
@@ -1496,11 +2272,7 @@ pub const DistributedEventBus = struct {
             };
         }
         for (self.nodes.items) |node| {
-            if (!p.nodes.contains(node.id)) {
-                p.addNode(node.id) catch |err| {
-                    std.log.err("[DistributedEventBus] Failed to add node {s} to partitioner: {}", .{ node.id, err });
-                };
-            }
+            self.addToRingLocked(node.id);
         }
     }
 
@@ -2303,12 +3075,7 @@ test "a signed frame round-trips: publish → wire → subscriber" {
     const pair = try openSocketPair();
     const peer_side = pair.conn;
     const bus_side = pair.peer;
-    try sender.nodes.append(.{
-        .id = try allocator.dupe(u8, "receiver-node"), // owned by the bus, freed by `deinit`
-        .address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 19100),
-        .socket = peer_side,
-        .last_seen = 0,
-    });
+    _ = try sender.registerNode("receiver-node", try std.Io.net.IpAddress.parseIp4("127.0.0.1", 19100), peer_side);
 
     try sender.publish(topic, "signed-payload");
 
@@ -2450,12 +3217,7 @@ test "without a secret the frame is length-prefixed with no MAC, and accepted" {
     }
     const peer_side = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } };
     const bus_side = std.Io.net.Stream{ .socket = .{ .handle = fds[1], .address = undefined } };
-    try sender.nodes.append(.{
-        .id = try allocator.dupe(u8, "bare-receiver"), // owned by the bus, freed by `deinit`
-        .address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 19101),
-        .socket = peer_side,
-        .last_seen = 0,
-    });
+    _ = try sender.registerNode("bare-receiver", try std.Io.net.IpAddress.parseIp4("127.0.0.1", 19101), peer_side);
 
     try sender.publish(topic, "bare-payload");
 
@@ -2859,6 +3621,10 @@ test "two credentialed nodes bind over the network and exchange an event" {
     // refused handshake shows up).
     try std.testing.expectEqual(@as(usize, 1), bus_b.getNodeCount());
     try std.testing.expect(bus_b.nodes.items[0].socket != null);
+    // The dialled socket carries the outbound write bound (`applySendTimeout`)
+    // next to the inbound one, so a peer that stops reading cannot park this
+    // node's writer — and with it the teardown that waits for that writer.
+    try std.testing.expect(sndTimeoutMillis(bus_b.nodes.items[0].socket.?) != null);
 
     try bus_b.publish(topic, "hello");
     // The event is delivered by an accept-side fiber, so give it a moment.
@@ -2960,24 +3726,15 @@ test "two writers on one socket produce only whole frames" {
     const secret: [32]u8 = @splat(0x64);
     const frames_per_writer: usize = 5;
 
-    // A frame far larger than the 4 KiB write buffer, so one `writeAll` is dozens
-    // of syscalls and two writers can interleave *inside* a frame. That is what
-    // the per-node lock removes: without it the reader picks up a length prefix
-    // followed by the other writer's bytes, i.e. a MAC that cannot verify.
+    // A payload far larger than the 4 KiB write buffer, so one frame's write
+    // is dozens of syscalls and two writers would interleave *inside* a frame
+    // without the per-node lock. That is what the lock removes: with it the
+    // reader only ever picks up whole frames whose MAC verifies. (`sendFramed`
+    // draws a fresh seq per call now, so the frames differ per send — the
+    // reader below re-verifies the MAC of each one.)
     const big_payload = try allocator.alloc(u8, 256 * 1024);
     defer allocator.free(big_payload);
     @memset(big_payload, 'z');
-
-    const json_buf = try allocator.alloc(u8, big_payload.len + 256);
-    defer allocator.free(json_buf);
-    const json = DistributedEventBus.serializeEvent(.{
-        .topic = "concurrent.topic",
-        .payload = big_payload,
-        .source_node = "writer-node",
-        .timestamp = 21,
-        .seq = 1,
-    }, json_buf);
-    try std.testing.expect(json.len > big_payload.len);
 
     var bus = try DistributedEventBus.init(allocator, std.testing.io, "writer-node");
     defer bus.deinit();
@@ -2993,24 +3750,19 @@ test "two writers on one socket produce only whole frames" {
     }
     const peer_side = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } };
     const bus_side = std.Io.net.Stream{ .socket = .{ .handle = fds[1], .address = undefined } };
-    try bus.nodes.append(.{
-        .id = try allocator.dupe(u8, "node-w"), // owned by the bus, freed by `deinit`
-        .address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 19102),
-        .socket = bus_side,
-        .last_seen = 0,
-    });
+    const node = try bus.registerNode("node-w", try std.Io.net.IpAddress.parseIp4("127.0.0.1", 19102), bus_side);
 
     const Writer = struct {
-        fn run(b: *DistributedEventBus, bytes: []const u8, n: usize) void {
-            for (0..n) |_| {
-                b.sendFramed(&b.nodes.items[0], bytes) catch |err| {
+        fn run(b: *DistributedEventBus, n: *DistributedEventBus.Node, bytes: []const u8, frames: usize) void {
+            for (0..frames) |_| {
+                b.sendFramed(n, "concurrent.topic", bytes, 21) catch |err| {
                     std.log.debug("[test] sendFramed: {}", .{err});
                 };
             }
         }
     };
-    const w1 = try std.Thread.spawn(.{}, Writer.run, .{ &bus, json, frames_per_writer });
-    const w2 = try std.Thread.spawn(.{}, Writer.run, .{ &bus, json, frames_per_writer });
+    const w1 = try std.Thread.spawn(.{}, Writer.run, .{ &bus, node, big_payload, frames_per_writer });
+    const w2 = try std.Thread.spawn(.{}, Writer.run, .{ &bus, node, big_payload, frames_per_writer });
 
     // Read like a receiving bus does: the length prefix says how much to expect,
     // and what follows has to be one frame whose MAC verifies against the
@@ -3045,6 +3797,484 @@ test "two writers on one socket produce only whole frames" {
     w2.join();
 
     try std.testing.expectEqual(@as(usize, frames_per_writer * 2), good);
+}
+
+// ── FIX2: two concurrent publishers, one connection, strict seq order ────────
+//
+// `Node.write_lock` stops two writers interleaving *inside* a frame, but on its
+// own it does not stop them swapping *whole* frames: while the replay `seq` is
+// stamped before the lock (in `publish`), a frame that drew the lower seq can
+// reach the socket after one that drew a higher seq. The receiver's `acceptSeq`
+// reads that inversion as a replay ("not ahead") and drops the older frame —
+// the stream survives, one event is silently lost (the soak harness measured
+// ~1 loss in 15 with concurrent writers; `src/soak_cluster.zig` `driverMain`
+// works around it with one publisher per bus). The fix stamps the seq **inside**
+// the write lock, so wire order is seq order per connection. This test is the
+// red/green witness: two threads publish on one authenticated connection and
+// the receiver must see every frame exactly once, its wire seqs strictly
+// increasing (the replay gate's exact requirement). Pre-fix it fails
+// probabilistically (swap → drop → short count); post-fix it is deterministic.
+
+test "two publishers on one connection deliver every frame in strict seq order" {
+    const allocator = std.testing.allocator;
+    const sender_key: [32]u8 = @splat(0x21);
+    const receiver_key: [32]u8 = @splat(0x22);
+    const topic = "order.topic";
+    const per_thread: usize = 1000;
+    const total = per_thread * 2;
+
+    // A large payload so the pre-fix stamp→lock window (serialize outside the
+    // lock) is wide enough for the race to actually fire within the iteration
+    // budget; the numeric head is the per-test delivery counter.
+    const payload_len: usize = 32 * 1024;
+    const fill = try allocator.alloc(u8, payload_len);
+    defer allocator.free(fill);
+    @memset(fill, 'q');
+
+    var receiver = try DistributedEventBus.init(allocator, std.testing.io, "rcv");
+    defer receiver.deinit();
+    receiver.setOwnKey(receiver_key);
+    try receiver.setPeerKey("snd", sender_key);
+    // Teardown is by closing the connection; no idle bound wanted here.
+    receiver.inbound_idle_timeout_ms = 0;
+
+    var sender = try DistributedEventBus.init(allocator, std.testing.io, "snd");
+    defer sender.deinit();
+    sender.setOwnKey(sender_key);
+    try sender.setPeerKey("rcv", receiver_key);
+
+    const pair = try openSocketPair();
+
+    // Receiver side: one `handleConnection` thread is the only writer of
+    // `seqs`/`payloads` (dispatch happens on that thread), so the arrays need
+    // no lock; `count` is the release/acquire handoff to the polling thread.
+    var seqs: [total]u64 = undefined;
+    var payloads: [total]u64 = undefined;
+    var count = std.atomic.Value(usize).init(0);
+    const Rec = struct {
+        var seqs_ptr: *[total]u64 = undefined;
+        var payloads_ptr: *[total]u64 = undefined;
+        var count_ptr: *std.atomic.Value(usize) = undefined;
+        fn cb(ev: DistributedEventBus.NetworkEvent) void {
+            if (!std.mem.eql(u8, ev.topic, topic)) return;
+            const i = count_ptr.load(.monotonic); // single-threaded writer: exact
+            seqs_ptr[i] = ev.seq;
+            const colon = std.mem.indexOfScalar(u8, ev.payload, ':') orelse {
+                payloads_ptr[i] = std.math.maxInt(u64);
+                count_ptr.store(i + 1, .release);
+                return;
+            };
+            payloads_ptr[i] = std.fmt.parseInt(u64, ev.payload[0..colon], 10) catch std.math.maxInt(u64);
+            count_ptr.store(i + 1, .release);
+        }
+    };
+    Rec.seqs_ptr = &seqs;
+    Rec.payloads_ptr = &payloads;
+    Rec.count_ptr = &count;
+    try receiver.subscribe(topic, Rec.cb);
+
+    receiver.is_running = true;
+    const reader = try std.Thread.spawn(.{}, struct {
+        fn run(b: *DistributedEventBus, conn: std.Io.net.Stream) void {
+            b.handleConnection(conn);
+        }
+    }.run, .{ &receiver, pair.conn });
+
+    // Settle the identity, then register the connection as the sender's node.
+    try sender.bindOutbound(pair.peer, "rcv");
+    _ = try sender.registerNode("rcv", try std.Io.net.IpAddress.parseIp4("127.0.0.1", 19103), pair.peer);
+
+    var publish_errors = std.atomic.Value(usize).init(0);
+    const Publisher = struct {
+        fn run(b: *DistributedEventBus, t: usize, n: usize, padding: []const u8, errs: *std.atomic.Value(usize)) void {
+            var buf: [24 + 32 * 1024]u8 = undefined;
+            for (0..n) |k| {
+                const head = std.fmt.bufPrint(&buf, "{d}:", .{t * n + k}) catch unreachable;
+                @memcpy(buf[head.len..][0..padding.len], padding);
+                b.publish(topic, buf[0 .. head.len + padding.len]) catch {
+                    _ = errs.fetchAdd(1, .monotonic);
+                };
+            }
+        }
+    };
+    const p1 = try std.Thread.spawn(.{}, Publisher.run, .{ &sender, 0, per_thread, fill, &publish_errors });
+    const p2 = try std.Thread.spawn(.{}, Publisher.run, .{ &sender, 1, per_thread, fill, &publish_errors });
+    p1.join();
+    p2.join();
+
+    // Wait for every frame. Pre-fix, a swapped pair drops a frame at the
+    // receiver, so the count stalls well short of `total`; fail fast once the
+    // stream has been quiet for a second, but never while frames are still
+    // flowing (a slow machine must not flake this).
+    var last = count.load(.acquire);
+    var quiet_ms: i64 = 0;
+    while (count.load(.acquire) < total and quiet_ms < 1000) {
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .awake) catch break;
+        const now = count.load(.acquire);
+        quiet_ms = if (now == last) quiet_ms + 10 else 0;
+        last = now;
+    }
+
+    receiver.is_running = false;
+    // Close + unregister the connection so the reader's blocking read ends.
+    sender.disconnectNode("rcv");
+    reader.join();
+
+    try std.testing.expectEqual(@as(usize, 0), publish_errors.load(.acquire));
+    const n = count.load(.acquire);
+    if (n != total) {
+        // Red diagnostic: a swapped pair drops a frame at the receiver (the
+        // older seq reads as a replay to `acceptSeq`), so the count stalls
+        // short of `total`.
+        std.log.err("[test] {d} of {d} frames arrived; the rest were dropped", .{ n, total });
+    }
+    try std.testing.expectEqual(total, n);
+    // Strictly increasing, exactly as the receiver's replay gate enforces.
+    // Wire seqs are not necessarily *contiguous* — the same counter is drawn
+    // by the local-dispatch stamp in `publish` and by sends to other peers —
+    // so the no-loss evidence is the payload set below, not adjacency.
+    for (seqs[0 .. n - 1], seqs[1..n]) |a, b| {
+        try std.testing.expect(b > a);
+    }
+    // The delivery counters are exactly 0..total-1, each once: no duplicate,
+    // no mis-delivery, nothing lost that the seq check would not catch.
+    var seen: [total]bool = @splat(false);
+    for (payloads[0..n]) |p| {
+        try std.testing.expect(p < total);
+        try std.testing.expect(!seen[p]);
+        seen[p] = true;
+    }
+}
+
+// ── FIX2b: the teardown funnel — one owner, one `close`, no close under a writer
+//
+// `Node.write_lock` serialises whole outbound frames (FIX2), but the two paths
+// that *demolish* a connection — `recordSendFailure`'s quarantine and
+// `disconnectNode` — closed `node.socket` without it, each through a handle it
+// had read earlier. Two failure paths racing on one dead connection therefore
+// both closed the same fd, and a teardown could close the fd an in-flight
+// `sendFramed` was writing on (the fd-reuse hazard `sendFramed` documents). POSIX
+// gives `close` no "only if it is still mine", and `std.Io.Threaded` classifies a
+// second close of one fd (`EBADF`) as an OS bug: `recoverableOsBugDetected()`
+// is `unreachable` in a Debug build, so the double close is not silent here — it
+// aborts the test process from inside std, where nothing can catch it.
+//
+// The fix is the same shape FIX2 gave the send side: make the lock the single
+// owner of the handle. `takeNodeSocket` nulls the field and hands the socket to
+// exactly one caller *under the write lock*; only that caller closes it, after
+// releasing the lock (so the blocking close is never held inside it). Every
+// teardown goes through it, so "the node owns `socket`" and "somebody is about
+// to close it" can no longer both be true.
+//
+// Why there is no "eight threads fail at once" test here, even though that
+// scenario is the pre-fix double close (measured: three runs out of three aborted
+// with `programmer bug caused syscall error: BADF`, from a `sendFramed` writing on
+// the fd a quarantining thread had closed): every route into `recordSendFailure`
+// logs at `std.log.err`, and `scripts/test-runner.zig` turns any error-level log
+// into a failed artifact of its own — so that test fails the suite whether or not
+// the close is fixed. The two below cover the same two claims without logging:
+// the teardown must not act while a writer holds the lock (deterministic, and red
+// before the fix), and the take is what makes a second close impossible.
+
+/// Is `fd` still in this process's descriptor table? A closed descriptor answers
+/// `EBADF` to `fcntl(F_GETFD)`, and that is the only way a test can see "somebody
+/// closed it": `Stream.close` returns void and swallows nothing to assert on.
+fn fdIsOpen(fd: std.posix.fd_t) bool {
+    // The cast is for libc's variadic `fcntl`; the flags are ignored by F_GETFD.
+    const rc = std.posix.system.fcntl(fd, std.c.F.GETFD, @as(c_int, 0));
+    return std.posix.errno(rc) != .BADF;
+}
+
+/// The `SO_SNDTIMEO` bound on `sock`, in milliseconds, or null when the option is
+/// unset or unreadable. The only way a test can see that a bound was applied:
+/// `setsockopt` returning success says nothing about what the kernel kept.
+fn sndTimeoutMillis(sock: std.Io.net.Stream) ?u32 {
+    var tv: std.posix.timeval = undefined;
+    var len: std.posix.socklen_t = @sizeOf(std.posix.timeval);
+    const rc = std.posix.system.getsockopt(
+        sock.socket.handle,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.SNDTIMEO,
+        @ptrCast(&tv),
+        &len,
+    );
+    if (std.posix.errno(rc) != .SUCCESS) return null;
+    if (tv.sec == 0 and tv.usec == 0) return null;
+    return @as(u32, @intCast(tv.sec)) * 1000 + @as(u32, @intCast(@divTrunc(tv.usec, 1000)));
+}
+
+test "a teardown never closes a node's socket out from under a writer" {
+    const allocator = std.testing.allocator;
+    var bus = try DistributedEventBus.init(allocator, std.testing.io, "teardown-node");
+    defer bus.deinit();
+
+    const pair = try openSocketPair();
+    defer pair.peer.close(std.testing.io);
+    const node = try bus.registerNode("gone-peer", try std.Io.net.IpAddress.parseIp4("127.0.0.1", 19104), pair.conn);
+    const fd = pair.conn.socket.handle;
+
+    // Holding the lock stands in for a `sendFramed` that has already read
+    // `node.socket`: that function keeps the lock across the frame build, the
+    // MAC and the blocking write, so this is the region a teardown must not
+    // enter. The pointer is taken once and used for the unlock below: the entry
+    // is heap-allocated, so a teardown that removes it from `nodes` cannot move —
+    // or free — the storage this lock lives in (which is exactly why a teardown
+    // can still be said to wait for *this* writer's lock).
+    const lock: *std.Io.Mutex = &node.write_lock;
+    try lock.lock(std.testing.io);
+
+    var done = std.atomic.Value(bool).init(false);
+    const Teardown = struct {
+        fn run(b: *DistributedEventBus, flag: *std.atomic.Value(bool)) void {
+            b.disconnectNode("gone-peer");
+            flag.store(true, .release);
+        }
+    };
+    const teardown = try std.Thread.spawn(.{}, Teardown.run, .{ &bus, &done });
+
+    // Long enough that a teardown which ignores the lock (the pre-fix shape) has
+    // returned many times over: it awaits nothing but this lock.
+    std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(200), .awake) catch |err| {
+        std.log.debug("[test] grace wait ({})", .{err});
+    };
+    const finished_while_locked = done.load(.acquire);
+    const closed_while_locked = !fdIsOpen(fd);
+
+    // Both are true before the fix: `disconnectNode` closes the fd immediately and
+    // removes the node, while the "writer" still holds the lock that says the fd
+    // is in use. Asserted *before* the unlock, because pre-fix there is nothing
+    // left to unlock: the removal poisons this node's storage (`ArrayList.pop`
+    // writes `undefined` over the popped element), which is the use-after-free the
+    // lock is there to prevent.
+    try std.testing.expect(!finished_while_locked);
+    try std.testing.expect(!closed_while_locked);
+
+    lock.unlock(std.testing.io);
+    teardown.join();
+    // And afterwards the teardown did happen — exactly once, with nothing left
+    // pointing at the descriptor.
+    try std.testing.expect(done.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), bus.nodes.items.len);
+    try std.testing.expect(!fdIsOpen(fd));
+}
+
+test "the teardown funnel hands each socket to exactly one caller" {
+    const allocator = std.testing.allocator;
+    var bus = try DistributedEventBus.init(allocator, std.testing.io, "funnel-node");
+    defer bus.deinit();
+
+    const pair = try openSocketPair();
+    defer pair.peer.close(std.testing.io);
+    const node = try bus.registerNode("peer-1", try std.Io.net.IpAddress.parseIp4("127.0.0.1", 19105), pair.conn);
+    const fd = pair.conn.socket.handle;
+
+    // One take, one owner: this is the whole fix, and it is what a second
+    // `close` of the same fd cannot survive.
+    const taken = bus.takeNodeSocket(node);
+    try std.testing.expect(taken != null);
+    try std.testing.expect(node.socket == null);
+    // Nobody else can reach the handle — the state a racing quarantine or
+    // disconnect finds, instead of a stale one of its own.
+    try std.testing.expect(bus.takeNodeSocket(node) == null);
+    // The handle is closed by its owner.
+    taken.?.close(std.testing.io);
+    try std.testing.expect(!fdIsOpen(fd));
+
+    // Repeating the teardown is a no-op, and it must not go looking for a handle
+    // somewhere: a *live* connection that reuses the closed descriptor's number
+    // has to come through it untouched. `openSocketPair` takes the lowest free
+    // fds and nothing else in this test opens one, so the probe lands on `fd` —
+    // asserted, so the check below cannot pass vacuously.
+    const probe = try openSocketPair();
+    defer probe.peer.close(std.testing.io);
+    try std.testing.expectEqual(fd, probe.conn.socket.handle);
+
+    bus.closeNodeSocket(node);
+    bus.closeNodeSocket(node);
+
+    try std.testing.expect(fdIsOpen(probe.conn.socket.handle));
+    try sockread.writeFull(probe.peer, "x");
+    var byte: [1]u8 = undefined;
+    try sockread.readFull(probe.conn, &byte);
+    try std.testing.expectEqualStrings("x", &byte);
+}
+
+// ── FIX3: the registry is a single-owner structure ───────────────────────────
+//
+// `disconnectNode` freed `node.id` and `swapRemove`d the entry with no lock at
+// all, so two threads disconnecting the same node freed one `id` twice and the
+// second `swapRemove` removed whatever the first had moved into that slot — on a
+// one-node table, an index past the end. The fix is the take: `takeNode` removes
+// the entry under `nodes_lock` and hands it to exactly one caller, and only that
+// caller (`destroyNode`) closes the socket and frees the id. This test is the
+// red/green witness: several threads disconnect one node simultaneously, every
+// thread has to return, nothing may be freed twice, and the registry has to be
+// empty afterwards. Pre-fix it fails probabilistically (double free, or a
+// use-after-free read of the freed id in the scan) — the reproduction rate is
+// measured over the whole run rather than a single round.
+
+test "concurrent disconnects of one node free it exactly once" {
+    const allocator = std.testing.allocator;
+    const racers: usize = 8;
+    const rounds: usize = 16;
+
+    for (0..rounds) |_| {
+        var bus = try DistributedEventBus.init(allocator, std.testing.io, "race-node");
+        defer bus.deinit();
+
+        const pair = try openSocketPair();
+        defer pair.peer.close(std.testing.io);
+        _ = try bus.registerNode("dup", try std.Io.net.IpAddress.parseIp4("127.0.0.1", 19106), pair.conn);
+
+        // A gate rather than a sleep: every thread has to be past `spawn` and
+        // inside `disconnectNode` before any of them finishes, which is the
+        // overlap the fix is about.
+        var gate = std.atomic.Value(bool).init(false);
+        var returned = std.atomic.Value(usize).init(0);
+        const Worker = struct {
+            fn run(b: *DistributedEventBus, start: *std.atomic.Value(bool), done: *std.atomic.Value(usize)) void {
+                while (!start.load(.acquire)) std.atomic.spinLoopHint();
+                b.disconnectNode("dup");
+                _ = done.fetchAdd(1, .release);
+            }
+        };
+
+        var threads: [racers]std.Thread = undefined;
+        for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{ &bus, &gate, &returned });
+        gate.store(true, .release);
+        for (threads) |t| t.join();
+
+        try std.testing.expectEqual(racers, returned.load(.acquire));
+        // One thread won the take and removed the entry; the rest found nothing
+        // to take and left the registry alone.
+        try std.testing.expectEqual(@as(usize, 0), bus.getNodeCount());
+        // …and disconnecting a node that is already gone stays a no-op (the
+        // pre-fix scan would look at the freed storage here).
+        bus.disconnectNode("dup");
+        try std.testing.expectEqual(@as(usize, 0), bus.getNodeCount());
+    }
+}
+
+// ── FIX4: one quarantine per failure streak ──────────────────────────────────
+//
+// `send_failures` was a plain `u32` written with `+= 1` / `= 0` from every failing
+// thread, and every thread that observed the counter at or above
+// `max_send_failures` pushed the message to the DLQ (and closed the socket). A
+// burst of failures on one node could therefore lose counts to a
+// read-modify-write race and enqueue the same message several times. The counter
+// is now updated with `@atomicRmw` and the crossing is claimed by the **return
+// value** of the add: only the thread whose add takes the counter from `max - 1`
+// to `max` goes on to push the DLQ entry and quarantine the node
+// (`countSendFailure` → `recordSendFailure`) — which is also why this test can
+// call the edge function directly: `recordSendFailure` logs at `err` level, and
+// the test runner counts an error-level log as a failed artifact.
+
+test "the quarantine edge is claimed by exactly one failing thread" {
+    const allocator = std.testing.allocator;
+    var bus = try DistributedEventBus.init(allocator, std.testing.io, "quarantine-node");
+    defer bus.deinit();
+    bus.max_send_failures = 8;
+
+    const node = try bus.registerNode("flaky", try std.Io.net.IpAddress.parseIp4("127.0.0.1", 19107), null);
+
+    const threads_count: usize = 8;
+    const per_thread: usize = 25;
+    var crossings = std.atomic.Value(usize).init(0);
+    const Failer = struct {
+        fn run(b: *DistributedEventBus, n: *DistributedEventBus.Node, count: usize, out: *std.atomic.Value(usize)) void {
+            for (0..count) |_| {
+                if (b.countSendFailure(n)) _ = out.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+
+    var threads: [threads_count]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Failer.run, .{ &bus, node, per_thread, &crossings });
+    for (threads) |t| t.join();
+
+    // No lost update: every failing send is in the count.
+    try std.testing.expectEqual(threads_count * per_thread, @atomicLoad(u32, &node.send_failures, .monotonic));
+    // No duplicated quarantine: exactly one call was the edge, so exactly one
+    // DLQ entry and one `closeNodeSocket` follow from this run.
+    try std.testing.expectEqual(@as(usize, 1), crossings.load(.acquire));
+}
+
+// ── FIX5: an outbound write is bounded, and a bound is not an abort ──────────
+//
+// Teardown waits for a node's `write_lock`: `disconnectNode` (`destroyNode` →
+// `takeNodeSocket`) and `deinit` both block until an in-flight `sendFramed` on
+// that node returns. A peer that accepts a connection and then stops reading
+// leaves that writer parked in the kernel's send buffer forever, so one such
+// peer can wedge the teardown of the whole bus. `applySendTimeout` bounds the
+// write (`SO_SNDTIMEO`), which surfaces as `EAGAIN` — and `EAGAIN` is the reason
+// `sendEventFrame` writes through `sockread.writeFull` and not `sock.writer`:
+// `std.Io.Threaded`'s posix write path classifies `EAGAIN` as an OS bug and
+// **panics** on it (`errnoBug`), where `writeFull` reports `error.WriteTimeout`
+// — the ordinary send failure the counter, the DLQ and the quarantine already
+// handle. This test is the pair: the bound is really on the socket, and the write
+// really gives up on it.
+
+test "an outbound write to a peer that never reads gives up instead of parking" {
+    const allocator = std.testing.allocator;
+    var bus = try DistributedEventBus.init(allocator, std.testing.io, "stall-node");
+    defer bus.deinit();
+    // The production bound, shrunk to test size: what is under test is that the
+    // write path reports a stalled write at all.
+    bus.outbound_send_timeout_ms = 200;
+
+    const pair = try openSocketPair();
+    var peer_closed = false;
+    defer if (!peer_closed) pair.peer.close(std.testing.io); // nobody ever reads it
+
+    // Exactly what `connectToNode` and `handleConnection` call on a live socket.
+    bus.applySendTimeout(pair.conn);
+    try std.testing.expect(sndTimeoutMillis(pair.conn) != null);
+    const node = try bus.registerNode("slow-peer", try std.Io.net.IpAddress.parseIp4("127.0.0.1", 19109), pair.conn);
+
+    // Far larger than the socket buffer, so a write has to wait for the peer to
+    // drain it — which it never does.
+    const payload = try allocator.alloc(u8, 256 * 1024);
+    defer allocator.free(payload);
+    @memset(payload, 's');
+
+    var timed_out = std.atomic.Value(bool).init(false);
+    var done = std.atomic.Value(bool).init(false);
+    const Writer = struct {
+        fn run(
+            b: *DistributedEventBus,
+            n: *DistributedEventBus.Node,
+            bytes: []const u8,
+            out: *std.atomic.Value(bool),
+            finished: *std.atomic.Value(bool),
+        ) void {
+            defer finished.store(true, .release);
+            for (0..64) |_| {
+                b.sendFramed(n, "stall.topic", bytes, 1) catch |err| {
+                    if (err == error.WriteTimeout) out.store(true, .release);
+                    return;
+                };
+            }
+        }
+    };
+    const writer = try std.Thread.spawn(.{}, Writer.run, .{ &bus, node, payload, &timed_out, &done });
+
+    // Bounded wait. The bound is 200 ms, so a write path that honours it returns
+    // in a few hundred milliseconds; a write path that does not stays blocked
+    // until the peer goes away — the state this test exists to exclude.
+    var waited_ms: usize = 0;
+    while (!done.load(.acquire) and waited_ms < 3000) : (waited_ms += 10) {
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .awake) catch break;
+    }
+    const stalled = !done.load(.acquire);
+    if (stalled) {
+        // Let a still-blocked writer fail on its own so the thread can be joined.
+        pair.peer.close(std.testing.io);
+        peer_closed = true;
+    }
+    writer.join();
+
+    try std.testing.expect(!stalled);
+    try std.testing.expect(timed_out.load(.acquire));
 }
 
 test "a peer that connects and then says nothing costs the idle bound, not the fiber" {
@@ -3086,4 +4316,694 @@ test "a peer that connects and then says nothing costs the idle bound, not the f
         std.log.debug("[test] idle wait ({})", .{err});
     };
     try std.testing.expect(returned.load(.acquire));
+}
+
+// ── Fuzz: the wire decode surfaces only error or succeed ────────────────────
+//
+// Every byte a peer can put on this port ends up in one of three parses:
+// `openEventFrame` (MAC verify + strip), the two handshake shapes, or
+// `parseEvent` (the JSON body). All four are pure functions of the input, so
+// they fuzz directly — and the contract under arbitrary bytes is the same as
+// everywhere else on this port: null or a value, never a crash.
+
+fn fuzzWireInput(_: void, smith: *std.testing.Smith) !void {
+    var bytes: [4096]u8 = undefined;
+    smith.bytes(&bytes);
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A fixed key: the interesting variety is in the bytes, not the key, and a
+    // constant key still walks both the too-short and the MAC-mismatch paths.
+    const key: [32]u8 = @splat(0xa5);
+
+    // The event frame body ([mac: 32][json]) on the authenticated and the
+    // bare paths.
+    _ = DistributedEventBus.openEventFrame(key, &bytes);
+    _ = DistributedEventBus.openEventFrame(null, &bytes);
+
+    // The handshake halves, MAC verify included: a crash in the verify is as
+    // much a finding as one in the split.
+    if (DistributedEventBus.parseHandshakeResponse(&bytes)) |parts| {
+        var expected: [auth_mac_bytes]u8 = undefined;
+        var h = std.crypto.auth.hmac.sha2.HmacSha256.init(&key);
+        h.update(parts.claim);
+        h.update(&parts.dc);
+        h.final(&expected);
+        _ = ClusterAuth.timingSafeEql(&expected, &parts.mac);
+    }
+    if (DistributedEventBus.parseHandshakeReply(&bytes)) |proof| {
+        var expected: [auth_mac_bytes]u8 = undefined;
+        var h = std.crypto.auth.hmac.sha2.HmacSha256.init(&key);
+        h.update(proof.id);
+        h.final(&expected);
+        _ = ClusterAuth.timingSafeEql(&expected, &proof.mac);
+    }
+
+    // The JSON body itself.
+    _ = DistributedEventBus.parseEvent(a, &bytes);
+}
+
+test "fuzz: frame open, handshake shapes and event json only error or succeed" {
+    const allocator = std.testing.allocator;
+    const peer_key: [32]u8 = @splat(0x5a);
+
+    var json_buf: [128]u8 = undefined;
+    const json = DistributedEventBus.serializeEvent(.{
+        .topic = "fuzz.topic",
+        .payload = "payload",
+        .source_node = "fuzz-node",
+        .timestamp = 1,
+        .seq = 1,
+    }, &json_buf);
+
+    // Seed bodies (the 4-byte length prefix framing is `readHandshake`'s, not
+    // the parse under test): one correctly-signed event frame, one bare json,
+    // and both handshake shapes with real MACs so the corpus starts on the
+    // success path, not only on rejections.
+    const signed = try testFrame(allocator, peer_key, json);
+    defer allocator.free(signed);
+    const bare = try testFrame(allocator, null, json);
+    defer allocator.free(bare);
+
+    const dc: [handshake_nonce_bytes]u8 = @splat(0x11);
+    const challenge: [handshake_nonce_bytes]u8 = @splat(0x22);
+    var response_buf: [handshake_nonce_bytes + 9 + auth_mac_bytes]u8 = undefined;
+    response_buf[0..handshake_nonce_bytes].* = dc;
+    @memcpy(response_buf[handshake_nonce_bytes..][0..9], "fuzz-node");
+    var response_hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&peer_key);
+    response_hmac.update("fuzz-node");
+    response_hmac.update(&challenge);
+    response_hmac.update(&dc);
+    response_hmac.final(response_buf[handshake_nonce_bytes + 9 ..][0..auth_mac_bytes]);
+
+    var reply_buf: [9 + auth_mac_bytes]u8 = undefined;
+    @memcpy(reply_buf[0..9], "fuzz-recv");
+    var reply_hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&peer_key);
+    reply_hmac.update("fuzz-recv");
+    reply_hmac.update(&dc);
+    reply_hmac.final(reply_buf[9..][0..auth_mac_bytes]);
+
+    const corpus = [_][]const u8{
+        signed[4..],
+        bare[4..],
+        response_buf[0..],
+        reply_buf[0..],
+        json,
+        "",
+        "\x00",
+        "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
+    };
+    try std.testing.fuzz({}, fuzzWireInput, .{ .corpus = &corpus });
+}
+
+// ── FIX6: one id, one entry, however many callers ───────────────────────────
+//
+// `connectToNode`'s duplicate check and its registration used to sit on either
+// side of a blocking dial with **no state in between**, so the check could only
+// see "already registered", never "somebody is registering right now": two
+// callers for one id both found an empty registry, both dialled and both
+// registered. The damage is not the extra entry by itself — it is that the
+// second entry has its own `write_lock`, while every other invariant in this
+// file assumes one id means one lock (`sendFramed`'s wire order, `takeNode`'s
+// "the entry for this id", `disconnectNode`'s at-most-one owner). The orphan
+// also keeps a connection nothing routes to and nothing ever disconnects.
+//
+// The fix reserves the entry **before** the dial (`reserveNode`) and settles it
+// **after**, by token (`settleConnect`), so the lock is never held across a
+// blocking dial and the window has state in it. This test is the red/green
+// witness, and it is deterministic rather than probabilistic (which the
+// disconnect race next to it cannot be): the listener *answers* the handshake —
+// so the orphan this is about is an established connection, not a failed dial —
+// but holds its first answer back, and a dialer parked in that handshake has
+// already scanned the registry without registering. That is the exact window,
+// widened from microseconds to a fixed delay every racer fits into.
+//
+// The listener's side is played from the test thread, one `accept` per test, on
+// purpose: it means no thread is ever blocked in `accept` when the listener is
+// closed, which is the one shape this fixture must avoid — `close` under a
+// blocked `accept` is how `std.Io` answers `EBADF`, and `EBADF` there is
+// `errnoBug` (a panic), not an error a test could assert on.
+
+test "concurrent connects of one id leave one entry and one connection" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    // Port 0: the kernel picks, and `Socket.address` carries what it picked, so
+    // two runs of this test (or a busy machine) cannot collide on a port.
+    const bind_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try bind_addr.listen(io, .{});
+    const addr = server.socket.address;
+
+    const own_key: [32]u8 = @splat(0x41);
+    const peer_key: [32]u8 = @splat(0x42);
+
+    var bus = try DistributedEventBus.init(allocator, io, "connect-race");
+    defer bus.deinit();
+    // Credentials, because the window this test is about is the handshake's: on
+    // the bare path `connectToNode` registers the moment `connect` returns, so
+    // there is nothing to hold back.
+    bus.setOwnKey(own_key);
+    try bus.setPeerKey("peer-1", peer_key);
+    // Shrunk from the 30 s default so that a dialer whose handshake is never
+    // answered — what every racer past a *broken* duplicate check becomes, since
+    // there is one peer here and one answer — gives up inside this test rather
+    // than at the production bound. Comfortably above the 150 ms below.
+    bus.inbound_idle_timeout_ms = 600;
+
+    const racers: usize = 4;
+    var gate = std.atomic.Value(bool).init(false);
+    var returned = std.atomic.Value(usize).init(0);
+    var failures = std.atomic.Value(usize).init(0);
+    const Caller = struct {
+        fn run(
+            b: *DistributedEventBus,
+            a: std.Io.net.IpAddress,
+            start: *std.atomic.Value(bool),
+            done: *std.atomic.Value(usize),
+            failed: *std.atomic.Value(usize),
+        ) void {
+            // A gate rather than a sleep: every caller has to be inside
+            // `connectToNode` before any of them can be past its dial.
+            while (!start.load(.acquire)) std.atomic.spinLoopHint();
+            b.connectToNode("peer-1", a) catch |err| {
+                std.log.debug("[test] connectToNode: {}", .{err});
+                _ = failed.fetchAdd(1, .monotonic);
+            };
+            _ = done.fetchAdd(1, .release);
+        }
+    };
+
+    var threads: [racers]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Caller.run, .{ &bus, addr, &gate, &returned, &failures });
+    gate.store(true, .release);
+
+    // The other end of the race, played from this thread: take the dial, hold
+    // its answer back for a fixed stretch — a dialer parked here has already
+    // scanned the registry and not yet registered, which is the window — then
+    // let it bind.
+    const conn = try server.accept(io);
+    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(150), .awake) catch |err| {
+        std.log.debug("[test] first-answer delay ({})", .{err});
+    };
+    try peerServeAsReceiver(allocator, conn, "peer-1", peer_key, own_key);
+    conn.close(io);
+
+    for (threads) |t| t.join();
+    // Nothing is inside `accept` any more (this thread is the only caller and it
+    // is done), so closing the listener here cannot land under a blocked accept.
+    sockread.closeListener(io, &server);
+
+    try std.testing.expectEqual(@as(usize, 0), failures.load(.acquire));
+    try std.testing.expectEqual(racers, returned.load(.acquire));
+
+    // One id ⇒ one entry. Pre-fix this is `racers`: every caller that got past
+    // the duplicate check dialled and registered.
+    try std.testing.expectEqual(@as(usize, 1), bus.getNodeCount());
+    const nodes = bus.getConnectedNodes();
+    try std.testing.expectEqualStrings("peer-1", nodes[0].id);
+    // …carrying the connection it dialled: the survivor is an established
+    // connection, not a socket-less leftover.
+    try std.testing.expect(nodes[0].socket != null);
+
+    // So the descriptor belongs to that one entry and dies with it — where the
+    // pre-fix shape leaves one live socket per duplicate entry, reachable from
+    // nothing the topology knows about.
+    const fd = nodes[0].socket.?.socket.handle;
+    try std.testing.expect(fdIsOpen(fd));
+    bus.disconnectNode("peer-1");
+    try std.testing.expectEqual(@as(usize, 0), bus.getNodeCount());
+    try std.testing.expect(!fdIsOpen(fd));
+}
+
+// The same window from the other side: a caller whose dial is in flight when
+// somebody disconnects the id. The reservation is what makes this decidable —
+// the finishing caller looks its own entry up by `(id, token)`, finds nothing,
+// and closes the connection it dialled instead of re-registering a node the
+// caller just removed (or installing its socket on an entry a later connect
+// created for the same id).
+test "a disconnect during a dial wins, and the dialled connection is closed" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    const bind_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try bind_addr.listen(io, .{});
+    const addr = server.socket.address;
+
+    const own_key: [32]u8 = @splat(0x51);
+    const peer_key: [32]u8 = @splat(0x52);
+
+    var bus = try DistributedEventBus.init(allocator, io, "disconnect-race");
+    defer bus.deinit();
+    bus.setOwnKey(own_key);
+    try bus.setPeerKey("peer-1", peer_key);
+
+    const Dialer = struct {
+        fn run(b: *DistributedEventBus, a: std.Io.net.IpAddress, done: *std.atomic.Value(bool)) void {
+            b.connectToNode("peer-1", a) catch |err| {
+                std.log.debug("[test] connectToNode: {}", .{err});
+            };
+            done.store(true, .release);
+        }
+    };
+    var dialed = std.atomic.Value(bool).init(false);
+    const dialer = try std.Thread.spawn(.{}, Dialer.run, .{ &bus, addr, &dialed });
+
+    // The connection arriving is what says the dial is in flight, and it says
+    // more than that: a dialer that has been accepted is parked answering the
+    // challenge, i.e. past the reservation and short of the registration. The
+    // entry is already in the registry here — the state the pre-fix code had no
+    // way to express, and the reason its duplicate check could see nothing.
+    const conn = try server.accept(io);
+    try std.testing.expectEqual(@as(usize, 1), bus.getNodeCount());
+    const reserved = bus.getConnectedNodes()[0];
+    try std.testing.expectEqualStrings("peer-1", reserved.id);
+    // Not a connection yet: the socket is installed by `settleConnect`, after
+    // the handshake — which is exactly what the reservation reserves.
+    try std.testing.expect(reserved.socket == null);
+
+    // Somebody else decides this node should not be tracked (a membership loop
+    // tearing down, `deinit`): the removal is newer than the dial.
+    bus.disconnectNode("peer-1");
+    try std.testing.expectEqual(@as(usize, 0), bus.getNodeCount());
+
+    // Only now does the dial get its answer, and it settles against a registry
+    // that no longer holds its reservation.
+    try peerServeAsReceiver(allocator, conn, "peer-1", peer_key, own_key);
+    conn.close(io);
+
+    dialer.join();
+    sockread.closeListener(io, &server);
+
+    try std.testing.expect(dialed.load(.acquire));
+    // The removal stands: no entry was resurrected behind it, which is the
+    // decision `settleConnect` makes (and the reason it closes the connection it
+    // dialled rather than leaving it owned by nobody).
+    try std.testing.expectEqual(@as(usize, 0), bus.getNodeCount());
+}
+
+// ── FIX7: `deinit`'s registry teardown is a critical section ────────────────
+//
+// `deinit` used to walk `nodes` and free the entries with no lock, which made it
+// the one mutation of the registry that assumed the caller had kept every other
+// thread out — an assumption `stop()` (which drains the fibers) does not make
+// true for an application thread that is still inside `disconnectNode` (a
+// membership loop shutting down, say). Both of them then freed the same entry:
+// two `free`s of one `id`, two `destroy`s of one `Node`, and a walk stepping
+// over a list the other side had already compacted with `swapRemove`.
+//
+// The teardown now takes `nodes_lock` to *take the whole registry out*
+// (`tearDownRegistry`), so the entry goes to whoever gets there first and the
+// other side finds nothing. This test holds that lock exactly as a registry
+// mutation does and asserts the teardown waits for it — the deterministic shape
+// the socket-vs-writer test above uses for `write_lock`.
+
+test "deinit's registry teardown waits for the registry lock" {
+    const allocator = std.testing.allocator;
+    var bus = try DistributedEventBus.init(allocator, std.testing.io, "deinit-race");
+    _ = try bus.registerNode("peer-1", try std.Io.net.IpAddress.parseIp4("127.0.0.1", 19111), null);
+
+    // Standing in for a `disconnectNode` (or a walk) inside its critical
+    // section: the teardown must not free an entry another thread can still be
+    // holding.
+    try bus.nodes_lock.lock(std.testing.io);
+
+    var done = std.atomic.Value(bool).init(false);
+    const Teardown = struct {
+        fn run(b: *DistributedEventBus, flag: *std.atomic.Value(bool)) void {
+            b.deinit();
+            flag.store(true, .release);
+        }
+    };
+    const teardown = try std.Thread.spawn(.{}, Teardown.run, .{ &bus, &done });
+
+    // Far longer than this teardown takes when it does not wait: everything
+    // else it does is a handful of frees.
+    std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(200), .awake) catch |err| {
+        std.log.debug("[test] grace wait ({})", .{err});
+    };
+    if (done.load(.acquire)) {
+        // Pre-fix: the teardown walked the registry — freeing the entry — while
+        // the critical section was held. `deinit` has poisoned the bus by then,
+        // so nothing below touches it: the thread is joined and that is all.
+        teardown.join();
+        return error.RegistryTornDownUnderItsLock;
+    }
+
+    // The lock goes back, and *then* the teardown runs to completion.
+    bus.nodes_lock.unlock(std.testing.io);
+    teardown.join();
+    try std.testing.expect(done.load(.acquire));
+}
+
+// ── FIX8: observing a live registry means copying it ────────────────────────
+//
+// `getConnectedNodes()` hands out `nodes.items` — the registry's own array of
+// owned `*Node`s — with no lock. That is fine for the code inside this file
+// (which holds `nodes_lock` across every walk) and a use-after-free for anyone
+// else: `connectToNode` appends (which reallocates the array the caller is
+// holding) and `disconnectNode`/`deinit` take an entry out and free it
+// (`destroyNode`: socket, id and `Node`), from the gossip path's own thread.
+// The soak harness found this the hard way and could only defend against it in
+// its own code (one walk per reading, never let a reference out of it);
+// `snapshotNodes` is the API that lets a caller do the thing it actually wants.
+//
+// The test below is the red side of that: one thread rebuilds the registry
+// (append, realloc, take, free) while the other walks it — through the snapshot,
+// which is a copy and therefore cannot be invalidated.
+
+/// The peer end of the FIX8 fixture: accept and close, until told to stop.
+///
+/// It exists so the mutator's dials land on a live socket (a `connect` into a
+/// listener whose queue is full parks for the kernel's retransmit budget, which
+/// turns a busy test into a hung one) without the mutator having to `accept` on
+/// the same thread as its dials — the dials and the accepts would then be
+/// strictly alternating, which is one more invariant for the test to get right.
+///
+/// Stopping it is deliberately not "close the listener": a close under a blocked
+/// `accept` is `EBADF`, and `std.Io` answers `EBADF` in `accept` with
+/// `errnoBug`, a panic no test can catch. The test sets `stop` and then connects
+/// once to wake the blocked call, and only closes the listener after this thread
+/// has been joined.
+const PeerDrain = struct {
+    server: *std.Io.net.Server,
+    io: std.Io,
+    stop: *std.atomic.Value(bool),
+    accepted: *std.atomic.Value(usize),
+
+    fn run(self: *PeerDrain) void {
+        while (true) {
+            const conn = self.server.accept(self.io) catch |err| {
+                std.log.debug("[test] peer drain: {}", .{err});
+                return;
+            };
+            conn.close(self.io);
+            // Checked *after* the accept: the whole point of the wake-up
+            // connection is that it unblocks this call without the listener
+            // having been touched.
+            if (self.stop.load(.acquire)) return;
+            _ = self.accepted.fetchAdd(1, .release);
+        }
+    }
+};
+
+/// Index of `id` in `ids`, or null. The ids a run may see are a fixed table, so
+/// "the snapshot holds an id that was never connected" is a property a test can
+/// assert — it is what a stale `*Node` (or a freed `id` slice) would violate.
+fn idIndex(ids: []const []const u8, id: []const u8) ?usize {
+    for (ids, 0..) |candidate, i| {
+        if (std.mem.eql(u8, candidate, id)) return i;
+    }
+    return null;
+}
+
+test "a registry snapshot is safe while the registry is being rebuilt" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    // The dials below are deliberately left unauthenticated — what this test
+    // needs from `connectToNode` is the registry mutation it performs (reserve,
+    // append, install, take, free), and the bare path is the one that does that
+    // without a peer having to play the handshake protocol: `PeerDrain` accepts
+    // and closes, and the dialled socket is kept (no credential anywhere, so
+    // there is nothing to settle — see `connectToNode`). The entries here are
+    // therefore connected for real, and there is no warning to mute.
+    const bind_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try bind_addr.listen(io, .{});
+    const addr = server.socket.address;
+
+    var bus = try DistributedEventBus.init(allocator, io, "snapshot-race");
+    defer bus.deinit();
+
+    const ids: [8][]const u8 = .{ "peer-0", "peer-1", "peer-2", "peer-3", "peer-4", "peer-5", "peer-6", "peer-7" };
+    const cycles: usize = 40;
+
+    var stop = std.atomic.Value(bool).init(false);
+    var accepted = std.atomic.Value(usize).init(0);
+    var drain = PeerDrain{ .server = &server, .io = io, .stop = &stop, .accepted = &accepted };
+    const drain_thread = try std.Thread.spawn(.{}, PeerDrain.run, .{&drain});
+
+    var gate = std.atomic.Value(bool).init(false);
+    var cycles_done = std.atomic.Value(usize).init(0);
+    var mutate_failures = std.atomic.Value(usize).init(0);
+    const Mutator = struct {
+        fn run(
+            b: *DistributedEventBus,
+            a: std.Io.net.IpAddress,
+            peer_ids: []const []const u8,
+            rounds: usize,
+            start: *std.atomic.Value(bool),
+            done: *std.atomic.Value(usize),
+            failed: *std.atomic.Value(usize),
+        ) void {
+            while (!start.load(.acquire)) std.atomic.spinLoopHint();
+            for (0..rounds) |_| {
+                // Grow to full size (each append can reallocate the array every
+                // walker in the process is holding) …
+                for (peer_ids) |id| {
+                    b.connectToNode(id, a) catch {
+                        _ = failed.fetchAdd(1, .monotonic);
+                    };
+                }
+                // … and empty it again (each take frees an entry, its id and its
+                // `Node`).
+                for (peer_ids) |id| b.disconnectNode(id);
+                _ = done.fetchAdd(1, .release);
+            }
+        }
+    };
+    const mutator = try std.Thread.spawn(
+        .{},
+        Mutator.run,
+        .{ &bus, addr, &ids, cycles, &gate, &cycles_done, &mutate_failures },
+    );
+    gate.store(true, .release);
+
+    // The walker: this thread's whole job is to read the peers while the other
+    // one rebuilds them. Every snapshot is a private copy, so it stays valid for
+    // as long as it is held — which is the property the old array hands out
+    // without.
+    var snapshots: usize = 0;
+    var peers_seen: usize = 0;
+    while (cycles_done.load(.acquire) < cycles) : (snapshots += 1) {
+        var snap = try bus.snapshotNodes(allocator);
+        defer snap.deinit();
+
+        var seen: [ids.len]bool = @splat(false);
+        for (snap.peers) |peer| {
+            peers_seen += 1;
+            const idx = idIndex(&ids, peer.id) orelse return error.SnapshotHoldsAnIdThatWasNeverConnected;
+            // Two entries for one id is what the registry guarantees against
+            // (the reservation), and it is worth re-asserting from outside: a
+            // snapshot that mixed a freed entry into its copy would show up here
+            // as a duplicate or as an unknown id.
+            try std.testing.expect(!seen[idx]);
+            seen[idx] = true;
+        }
+    }
+    mutator.join();
+
+    // Anchors, so the run cannot pass vacuously: the walker really did overlap
+    // the rebuild, and a snapshot taken after the last disconnect is empty —
+    // i.e. the copy is that moment's registry, not a stale one.
+    try std.testing.expect(snapshots > 0);
+    try std.testing.expect(peers_seen > 0);
+    {
+        var empty = try bus.snapshotNodes(allocator);
+        defer empty.deinit();
+        try std.testing.expectEqual(@as(usize, 0), empty.peers.len);
+    }
+    try std.testing.expect(accepted.load(.acquire) > 0);
+
+    stop.store(true, .release);
+    if (addr.connect(io, .{ .mode = .stream })) |wake| {
+        wake.close(io);
+    } else |err| {
+        std.log.debug("[test] peer drain wake-up failed: {}", .{err});
+    }
+    drain_thread.join();
+    sockread.closeListener(io, &server);
+
+    try std.testing.expectEqual(@as(usize, 0), mutate_failures.load(.acquire));
+    try std.testing.expectEqual(cycles, cycles_done.load(.acquire));
+}
+
+test "a snapshot that runs out of memory leaves nothing behind" {
+    const allocator = std.testing.allocator;
+    var bus = try DistributedEventBus.init(allocator, std.testing.io, "snapshot-oom");
+    defer bus.deinit();
+
+    // Three entries, so a failure has a partially copied array to clean up.
+    const oom_ids: [3][]const u8 = .{ "oom-0", "oom-1", "oom-2" };
+    for (oom_ids, 0..) |id, i| {
+        _ = try bus.registerNode(id, try std.Io.net.IpAddress.parseIp4("127.0.0.1", @intCast(19200 + i)), null);
+    }
+
+    // `fail_index = 2`: the array allocation succeeds, the first id copy
+    // succeeds, the second fails — inside the copy loop, which is where a
+    // half-filled snapshot would leak. The leak is reported by the harness
+    // (`std.testing.allocator`) rather than asserted here: a snapshot that
+    // leaked the ids it had already copied has no return value to inspect.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 2 });
+    try std.testing.expectError(error.OutOfMemory, bus.snapshotNodes(failing.allocator()));
+
+    // The failed call released the registry lock and left the registry alone, so
+    // the next snapshot still sees all three — and the fields it copies are the
+    // entry's, not leftovers from the failed attempt.
+    var snap = try bus.snapshotNodes(allocator);
+    defer snap.deinit();
+    try std.testing.expectEqual(@as(usize, 3), snap.peers.len);
+    for (snap.peers) |peer| {
+        try std.testing.expect(idIndex(&oom_ids, peer.id) != null);
+        try std.testing.expect(!peer.connected);
+        try std.testing.expectEqual(@as(u32, 0), peer.send_failures);
+    }
+}
+
+// ── FIX9: the bare path connects out, like it receives ──────────────────────
+//
+// The identity work (48ac894) added the outbound handshake to `connectToNode`
+// without the `authEnabled()` guard its receiving half has: on a bus with **no**
+// credential at all, every successful dial was closed again inside
+// `bindOutbound`, whose first line refuses when there is no `own_key` — which,
+// on that configuration, is always. The node stayed registered with
+// `socket == null`, nothing was ever delivered, and every connect logged a
+// "refused the handshake: PeerKeyMissing" warning. The one configuration the
+// docs describe as the bare-frame path (`docs/DISTRIBUTED.md`: "完全没配凭证才是
+// 既有的裸帧路径"; `start()`'s warning is supposed to be the only thing
+// complaining) could therefore never form an outbound link at all — nor could
+// the event-bus mesh of the unauthenticated multi-node cluster `ClusterBootstrap`
+// explicitly allows (`.allow_unauthenticated_cluster = true`); its Raft side has
+// its own bare-frame path and is unaffected.
+//
+// The reason it is an oversight rather than a policy:
+//   * `connectToNode` itself refuses a missing peer key **only when
+//     `authEnabled()`** (`docs/dev/cluster-identity-design.md` §5's table is
+//     conditioned the same way: "配了 `own_key`"，"完全没配任何 key" → 裸帧路径) —
+//     so the two halves of one function disagreed about the credential-less case;
+//   * `sendEventFrame` writes bare frames exactly when `authEnabled()` is false,
+//     and `nodes` is only ever populated by `connectToNode`: with the dial always
+//     discarded, that branch was unreachable and the bare wire format had no
+//     outbound direction at all;
+//   * `handleConnection` accepts and dispatches bare frames — a bus that speaks
+//     bare inbound but refuses to speak it outbound cannot form a cluster in
+//     either direction, which is the opposite of what the ADR says the bare path
+//     is for.
+//
+// The fix is the receiving side's guard, verbatim. It cannot loosen anything
+// credentialed: `authEnabled()` is true as soon as *any* of `cluster_secret` /
+// `own_key` / `peer_keys` is set, and every such bus still runs the full
+// handshake and still drops the connection on `PeerKeyMissing` /
+// `HandshakeRejected` (the tests below this one, and every handshake test in
+// this file, run on that path).
+
+test "a bus with no credentials connects outbound and exchanges events" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    const port: u16 = 19031;
+    const topic = "bare.e2e.topic";
+
+    // Neither bus is given a key: no `setOwnKey`, no `setPeerKey`, no
+    // `setClusterSecret`. This is the standalone/dev configuration `start()`
+    // warns about — the warning is the intended output, and the link is meant to
+    // work anyway.
+    var received: usize = 0;
+    var bus_a = try framedBus(allocator, "bare-a", topic, &received);
+    defer bus_a.deinit();
+    try bus_a.start(port);
+    defer bus_a.stop();
+    try std.testing.expect(!bus_a.authEnabled());
+
+    var bus_b = try DistributedEventBus.init(allocator, io, "bare-b");
+    defer bus_b.deinit();
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+    try bus_b.connectToNode("bare-a", addr);
+
+    // The dial survived. Pre-fix this is where it failed: `bindOutbound` had
+    // closed the connection for want of an `own_key`, `socket` was null, and the
+    // only trace was the warn (the caller still saw success — `socket == null` is
+    // how this bus says "tracked for routing, not reachable").
+    try std.testing.expectEqual(@as(usize, 1), bus_b.getNodeCount());
+    try std.testing.expect(bus_b.nodes.items[0].socket != null);
+
+    // …and it carries traffic, in the bare format the receiver accepts because
+    // its own `authEnabled()` is false too: `[4-byte len][json]`, no MAC, no
+    // handshake on either end.
+    try bus_b.publish(topic, "bare hello");
+    var waited: usize = 0;
+    while (received == 0 and waited < 200) : (waited += 1) {
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch break;
+    }
+    try std.testing.expectEqual(@as(usize, 1), received);
+}
+
+// The other half of the same boundary, and the reason the guard is on
+// `authEnabled()` and not on "does this peer have a key": a bus with **any**
+// credential still refuses to talk to a peer it has no key for, before it dials,
+// and still refuses to complete a handshake it cannot prove. These two live next
+// to the fix so that "the bare path was opened" and "the credentialed path was
+// not" are readable in one place.
+
+test "a bus with credentials still fails closed when the handshake cannot complete" {
+    const allocator = std.testing.allocator;
+
+    // A key for one peer only: `authEnabled()` is true, so the bus is on the
+    // authenticated path as a whole — including for the peer it *does* hold a key
+    // for, whose handshake now has to complete against a fixture.
+    var bus = try DistributedEventBus.init(allocator, std.testing.io, "half-keyed");
+    defer bus.deinit();
+    try bus.setPeerKey("node-known", @splat(0x78));
+
+    const peer_key: [32]u8 = @splat(0x79);
+    bus.setOwnKey(peer_key);
+
+    // A peer with no key of ours is refused **before the dial** — the address is
+    // irrelevant on purpose (`docs/DISTRIBUTED.md`: "在 dial 之前").
+    const dead = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 1);
+    try std.testing.expectError(error.PeerKeyMissing, bus.connectToNode("node-unknown", dead));
+    try std.testing.expectEqual(@as(usize, 0), bus.getNodeCount());
+
+    // And the same bus, dialling a live socket whose peer does not answer the
+    // handshake, ends with no connection: the guard did not turn "I have
+    // credentials" into "I may skip the handshake".
+    const listener_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try listener_addr.listen(std.testing.io, .{});
+    defer sockread.closeListener(std.testing.io, &server);
+
+    // Accepted on this thread, which cannot serve the handshake while the dial
+    // below is blocked reading its challenge — so the dial is bounded by
+    // `inbound_idle_timeout_ms` rather than by a peer that answers.
+    bus.inbound_idle_timeout_ms = 200;
+    try bus.setPeerKey("node-silent", peer_key);
+    const silent_addr = server.socket.address;
+
+    var accepted = std.atomic.Value(bool).init(false);
+    const Accept = struct {
+        fn run(s: *std.Io.net.Server, io: std.Io, done: *std.atomic.Value(bool)) void {
+            const conn = s.accept(io) catch return;
+            done.store(true, .release);
+            // Hold the connection open and say nothing: the dialer has to give
+            // up on its own (`applyRecvTimeout` on the dialled socket, 3× the
+            // 200 ms bound above).
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(600), .awake) catch {};
+            conn.close(io);
+        }
+    };
+    const acceptor = try std.Thread.spawn(.{}, Accept.run, .{ &server, std.testing.io, &accepted });
+
+    try bus.connectToNode("node-silent", silent_addr);
+    acceptor.join();
+
+    try std.testing.expect(accepted.load(.acquire));
+    // Registered, but not connected: the handshake was required and was not
+    // answered, so the socket was closed rather than used bare.
+    try std.testing.expectEqual(@as(usize, 1), bus.getNodeCount());
+    try std.testing.expect(bus.nodes.items[0].socket == null);
 }

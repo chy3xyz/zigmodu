@@ -39,7 +39,7 @@ typed identity). Sibling ORM backlog: `zig_ws/zent/docs/ISSUES_FROM_ZAPI.md`.
 | 7 | 后台任务互斥 | `cron.setLock(...)` · `runner.setLock(...)`（`zmodu.DistributedLock`） | 多副本重复执行 job / 并发 DDL |
 | 8 | 业务面指标 | `OutboxConsumer.setMetrics/startPolling` · `Client.poolMetrics` · `metrics.setScrapeHook` | outbox 停投、池打满这类 HTTP 层看不见的静默失败 |
 | 9 | 指标下钻 | `createCounterFamily` / `createHistogramFamily` + `ctx.route_template` | 受限基数地按路由看延迟与错误 |
-| 10 | 审计规则 | `zmodu audit` b19–b23 | 请求路径裸 panic / 共享可变 HashMap / 裸 `@alignCast` / query 取租户 / 分配器归属（`deinitRow(s)` 收下别家 allocator 产出的行） |
+| 10 | 审计规则 | `zmodu audit` b19–b24 | 请求路径裸 panic / 共享可变 HashMap / 裸 `@alignCast` / query 取租户 / 分配器归属（`deinitRow(s)` 收下别家 allocator 产出的行）/ 非 CSPRNG 熵源（`std.Io.random`） |
 | 11 | 验证手段 | `zig build soak` · `src/test/FaultInjection.zig` · `src/test/ContractGate.zig` | 跨租户泄漏、熔断恢复行为、接口契约漂移 |
 
 权威细节：[`BEST_PRACTICES.md`](BEST_PRACTICES.md)「韧性 / 上线前预检 / 多副本」

@@ -290,6 +290,46 @@ pub fn build(b: *std.Build) void {
     const soak_step = b.step("soak", "Run concurrency soak tests (N clients x M tenants)");
     soak_step.dependOn(&run_soak.step);
 
+    // Cluster soak (`zig build soak-cluster`) — in-process 3-node cluster with
+    // real raft election/heartbeat/replication over loopback plus
+    // DistributedEventBus publish traffic; asserts message continuity, leader
+    // stability, log convergence and fd/RSS/thread non-growth while both run.
+    // Sibling of `soak` (HTTP + tenants) and `runtime-stress` (runtime), sized
+    // so the default finishes in ~1–2 minutes.
+    const soak_cluster_options = b.addOptions();
+    soak_cluster_options.addOption(usize, "soak_iterations", b.option(usize, "soak-cluster-iterations", "soak-cluster: published messages per writer (2 writers per node)") orelse 2400);
+    soak_cluster_options.addOption(usize, "soak_cluster_publish_ms", b.option(usize, "soak-cluster-publish-ms", "soak-cluster: ms between a node's publishes") orelse 25);
+    soak_cluster_options.addOption(usize, "soak_cluster_append_ms", b.option(usize, "soak-cluster-append-ms", "soak-cluster: ms between leader log appends") orelse 100);
+    soak_cluster_options.addOption(usize, "soak_cluster_sample_ms", b.option(usize, "soak-cluster-sample-ms", "soak-cluster: sample interval for the invariants") orelse 500);
+    soak_cluster_options.addOption(usize, "soak_cluster_tick_ms", b.option(usize, "soak-cluster-tick-ms", "soak-cluster: ms between cluster.tick() calls") orelse 25);
+    soak_cluster_options.addOption(usize, "soak_cluster_quiesce_ms", b.option(usize, "soak-cluster-quiesce-ms", "soak-cluster: replication settle time before the log snapshot") orelse 600);
+    const soak_cluster_options_mod = soak_cluster_options.createModule();
+
+    const soak_cluster_mod = b.createModule(.{
+        .root_source_file = b.path("src/soak_cluster.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    soak_cluster_mod.addImport("zigmodu", zigmodu_mod);
+    soak_cluster_mod.addImport("build_options", soak_cluster_options_mod);
+    db_link.link(soak_cluster_mod, b, features);
+
+    const soak_cluster_tests = b.addTest(.{ .root_module = soak_cluster_mod });
+    // The default test runner speaks the build runner's stdin protocol and
+    // panics (EndOfStream) when stdin is a closed pipe — exactly what CI gives
+    // it. The repo's simple runner reports without the protocol.
+    soak_cluster_tests.test_runner = .{
+        .path = b.path("scripts/test-runner.zig"),
+        .mode = .simple,
+    };
+    const run_soak_cluster = b.addRunArtifact(soak_cluster_tests);
+    // A soak must actually run on every invocation; a cached "run test"
+    // result would print nothing and verify nothing.
+    run_soak_cluster.has_side_effects = true;
+    const soak_cluster_step = b.step("soak-cluster", "Run the 3-node cluster soak (raft + event bus, leader/fd/RSS invariants)");
+    soak_cluster_step.dependOn(&run_soak_cluster.step);
+
     // Long-horizon runtime harness (`zig build runtime-stress`). Sibling of
     // `soak`, and deliberately not a second one of it: `soak` is HTTP + tenant
     // isolation and never touches the runtime, while this one drives the

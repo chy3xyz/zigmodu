@@ -12,12 +12,12 @@ fn elapsedMs(t0: i128) f64 {
 
 /// A reporting section's own wall time, measured around it.
 ///
-/// Both observation-only sections in this suite cost real CI time — the `[pct]`
+/// Both extra-pass sections in this suite cost real CI time — the `[pct]`
 /// section is one extra pass over the metrics it covers, and the `[alloc]`
-/// section is another — so the budget each one claims in its banner is printed
-/// next to what it actually spent. Without this the cost of the next metric added
-/// to either list would show up only as a slower CI job, which is exactly the kind
-/// of drift a comment cannot catch.
+/// section another over every gated metric — so the budget each one claims in
+/// its banner is printed next to what it actually spent. Without this the cost
+/// of the next metric added to either list would show up only as a slower CI
+/// job, which is exactly the kind of drift a comment cannot catch.
 fn reportSectionCost(comptime label: []const u8, t0: i128, metrics: usize) void {
     std.debug.print("  [{s}] section cost: {d:.2} s for {d} metric(s), measured around it\n", .{ label, elapsedMs(t0) / 1000.0, metrics });
 }
@@ -131,7 +131,7 @@ fn benchEventBus(allocator: std.mem.Allocator, listeners: usize, events: usize) 
 /// LLVM keep the state in registers and elide the loads). The counts are checked
 /// afterwards, so a harness that silently stops driving the breaker fails the run
 /// instead of reporting a suspiciously fast number.
-fn benchCircuitBreaker(allocator: std.mem.Allocator, calls: usize) !f64 {
+fn benchCircuitBreaker(allocator: std.mem.Allocator, calls: usize, counted: ?*usize) !f64 {
     const cb = try allocator.create(zigmodu.CircuitBreaker);
     defer allocator.destroy(cb);
     cb.* = try zigmodu.CircuitBreaker.init(allocator, "bench", .{ .failure_threshold = 100, .success_threshold = 2, .timeout_seconds = 30, .half_open_max_calls = 10 });
@@ -142,6 +142,14 @@ fn benchCircuitBreaker(allocator: std.mem.Allocator, calls: usize) !f64 {
     }.op;
 
     var accepted: usize = 0;
+    // `counted` is the [alloc] pass's counter slot: when non-null, `c.*` holds
+    // the probe's running total after fixture on entry and is replaced with the
+    // timed loop's allocation delta on return (`allocCircuitBreaker`). Timed
+    // callers pass null. The branch is outside the loop, and there is exactly
+    // one textual copy of this loop in the binary on purpose: a second copy —
+    // even of a noinline-wrapped call, measured 2026-09-22 — costs the judged
+    // loop ~4x by changing how LLVM specializes `CircuitBreaker.call`.
+    const counted_before: usize = if (counted) |c| c.* else 0;
     const t0 = now();
     for (0..calls) |_| {
         const result = cb.call(op);
@@ -153,6 +161,7 @@ fn benchCircuitBreaker(allocator: std.mem.Allocator, calls: usize) !f64 {
         std.mem.doNotOptimizeAway(&result);
     }
     const ms = elapsedMs(t0);
+    if (counted) |c| c.* = c.* - counted_before;
 
     if (accepted != calls) return error.BenchCircuitBreakerLostCalls;
     return ms;
@@ -583,6 +592,62 @@ fn benchRingBuffer(allocator: std.mem.Allocator, count: usize) !f64 {
     return elapsedMs(t0);
 }
 
+/// Producer count for the multi-producer push metric: enough cursors to be
+/// "many" (the scheduler's ready ring and the timer command queue are both
+/// many-producer structures), small enough that the round-robin bookkeeping
+/// stays below the noise floor.
+const bench_mpsc_producers = 4;
+
+/// MPSC push on the raw Vyukov ring: `count` pushes from
+/// `bench_mpsc_producers` interleaved producer cursors into one shared
+/// `MpscRing`, drained inline as it fills — the same post+drain shape as
+/// `benchMailbox`, one structural level down.
+///
+/// Why not real producer threads: this suite's position on thread-parallel
+/// numbers is measured, not stylistic — the hand-off pair below swings
+/// 1.84x/3.09x run-to-run within one machine, and the pool sweep is
+/// observation-only for exactly that reason (see `scripts/check-bench.sh`'s
+/// header: a 2.0x window on a number that swings 3x within one machine is a
+/// false-red machine). The gated shape is the contention-free one: same ring
+/// code, same slot-sequence protocol, four producer cursors taking turns.
+/// What it gives up — cross-core CAS retries — is the part a 2.0x window
+/// cannot hold anyway; the pool sweep is where the contended shape is read.
+///
+/// What it covers that `Mailbox post+drain x1M` does not: the raw ring path
+/// the scheduler's ready ring and the runtime's timer command queue actually
+/// run — no close-flag check, no sent/received stats, no error mapping. The
+/// per-producer order assertion is the MPSC contract from `ring.zig`'s own
+/// multi-producer test: each cursor's messages must come out in the order
+/// that cursor pushed them.
+fn benchMpscRingPush(count: usize) !f64 {
+    const R = rt.MpscRing(u64, 1024);
+    const ring = try harness_allocator.create(R);
+    defer harness_allocator.destroy(ring);
+    ring.* = R.init();
+
+    // The pushed value is the global sequence number; producer and per-producer
+    // sequence are its residue and quotient mod `bench_mpsc_producers`.
+    var expected: [bench_mpsc_producers]u64 = @splat(0);
+    var pushed: usize = 0;
+    const t0 = now();
+    while (pushed < count) {
+        while (pushed < count) {
+            if (!ring.tryPush(@intCast(pushed))) break; // full: drain below, then resume
+            pushed += 1;
+        }
+        while (ring.tryPop()) |v| {
+            if (expected[v % bench_mpsc_producers] != v / bench_mpsc_producers) return error.BenchMpscReordered;
+            expected[v % bench_mpsc_producers] = v / bench_mpsc_producers + 1;
+            std.mem.doNotOptimizeAway(v);
+        }
+    }
+    const ms = elapsedMs(t0);
+
+    if (pushed != count) return error.BenchMpscLostPushes;
+    if (!ring.isEmpty()) return error.BenchMpscLeftovers;
+    return ms;
+}
+
 /// Worker hand-off: `count` posts against a bounded mailbox, drained as it fills.
 /// Capacity 256 (not 1024): `MpscRing.init` seeds every slot at comptime, and a
 /// wider mailbox exceeds the default `@setEvalBranchQuota`.
@@ -752,6 +817,64 @@ fn benchTimerWheelChurn(allocator: std.mem.Allocator, rounds: usize) !f64 {
     // (or one whose ids collided) fails here instead of recording a fast number.
     if (wheel.pendingCount() != 0) return error.BenchTimerWheelLeaked;
     if (fired.fired != @as(u64, rounds) * timer_churn_live) return error.BenchTimerWheelLostTimers;
+    return ms;
+}
+
+/// The `after()` scheduling path end to end: `count` `Handle.after` calls on a
+/// worker whose runtime is driven by hand. Every arm allocates its `Delivery`
+/// payload and pushes a command onto the runtime's bounded timer-command ring
+/// on the caller's thread; the periodic `tick()` is the owner half of the same
+/// path — it drains that ring and inserts each command into the wheel. Both
+/// halves are the metric: `TimerWheel x100K` above measures the wheel insert
+/// alone, and gating only the caller half would leave the rest of the path
+/// unjudged.
+///
+/// The runtime is deliberately *not* started: on a `Manual` clock the harness
+/// thread is the wheel's owner (`tick()` claims ownership, and a running
+/// ticker has already claimed it — mixing the two is a bug the wheel reports,
+/// see `Runtime.tick`), which keeps the run deterministic and off the wall
+/// clock. The command ring is `timer_command_capacity` deep and is drained
+/// whenever the arm loop fills it, so `error.Full` is the backpressure answer,
+/// never an overflow.
+///
+/// Assertions: the clock is parked below every deadline, so nothing may fire
+/// during the run. After a final drain outside the timed region,
+/// `wheel.pendingCount()` must equal `count` — every arm reached the wheel —
+/// and `Runtime.shutdown()` must then discard exactly `count` timers with zero
+/// deliveries dropped (the payload-release path; nothing fired, so nothing was
+/// delivered). The mailbox overflow question never arises because nothing is
+/// ever delivered into it.
+fn benchTimerAfter(io: std.Io, count: usize) !f64 {
+    var clk = rt.Clock.Manual{ .now_ms = 0 };
+    var rtx = rt.Runtime.init(harness_allocator, io, .{ .manual = &clk });
+    defer rtx.deinit();
+    const handle = try rtx.spawn(BenchNoopWorker, .{}, bench_worker_mailbox_capacity);
+
+    const tick_count = timer_span_ms / rt.timer_wheel.slot_ms;
+    var armed: usize = 0;
+    const t0 = now();
+    while (armed < count) {
+        while (armed < count) {
+            const tick: i64 = @intCast(armed % @as(usize, @intCast(tick_count)));
+            _ = handle.after((tick + 1) * rt.timer_wheel.slot_ms, @intCast(armed)) catch |err| switch (err) {
+                error.Full => break, // command ring full: drain below, then resume
+                else => return err,
+            };
+            armed += 1;
+        }
+        _ = rtx.tick(); // the owner half: command ring -> wheel
+    }
+    const ms = elapsedMs(t0);
+
+    // Flush whatever the arm loop left in the command ring — fixture for the
+    // assertion, not part of the timed region.
+    _ = rtx.tick();
+    if (rtx.wheel.pendingCount() != count) return error.BenchTimerAfterLostTimers;
+
+    rtx.shutdown();
+    const s = rtx.stats();
+    if (s.timers_discarded != count) return error.BenchTimerAfterLeakedTimers;
+    if (s.timer_deliveries_dropped != 0) return error.BenchTimerAfterDroppedDelivery;
     return ms;
 }
 
@@ -1199,58 +1322,69 @@ fn benchWorkflow(allocator: std.mem.Allocator, io: std.Io, steps_count: usize, i
 }
 
 // ─────────────────────────────────────────────────
-// Allocation counts per op — `[alloc]` (instrumented, separate pass, report only)
+// Allocation counts per op — `[alloc]` (instrumented, separate pass, the second
+// criterion)
 //
 // A latency table says how long a turn takes; it cannot say whether the turn
 // *allocated*, and for the runtime group that is the number the framework actually
 // makes a promise about: `send` copies into a fixed-capacity slot, `publish` fans
 // out over frozen sinks, arming a timer pushes a command onto a fixed-capacity
-// ring. This section prints that number — allocations per op — for the same nine
-// runtime metrics whose `[med3]` values the gate thresholds, in the same run and at
-// the same scale.
+// ring. This section prints that number — allocations per op — for **every gated
+// metric**, in the same run and at the same scale as its `[med3]` line.
+//
+// The rows are a criterion, not just a readout. Since 2026-09-22 a baseline entry
+// may declare `"max_alloc_per_op": <f>`, and `scripts/check-bench.sh` parses these
+// lines from the measured run's own log and fails any budgeted metric that reads
+// above its budget. A counted allocation is exact — no median, no host wobble —
+// so an alloc breach is a regression the first time it fires, and the host-check
+// narrative that applies to a millisecond breach does not apply to it. Budgets
+// are recorded from a measured run plus headroom for fixed overheads (hash-map
+// growth, one-time setup), are preserved verbatim by `--update`, and are optional:
+// the CI baseline predates the field and simply carries no alloc criterion until
+// it is re-recorded on a runner.
 //
 // It is a **separate instrumented pass**, and none of it is comparable with the
 // other two sections:
 //
 //   * **A counting allocator is a change to the thing being measured**, which is
-//     why this section exists at all instead of being folded into `[pct]` (that
-//     was the deliberate omission until now). Every allocation in a counted path
-//     goes through a second vtable with a counter write behind it, so a *duration*
-//     measured here would be measuring the instrument. These runs therefore print
-//     no duration: a count, and the op count it is divided by. Nothing from this
-//     pass is mixed into the latency samples, and the timed harnesses above are
-//     untouched — each metric below has its own copy of that harness's op loop,
-//     call for call and assertion for assertion, and the counts come from the copy.
+//     why this section exists at all instead of being folded into `[pct]`. Every
+//     allocation in a counted path goes through a second vtable with a counter
+//     write behind it, so a *duration* measured here would be measuring the
+//     instrument. These runs therefore print no duration: a count, and the op
+//     count it is divided by. Nothing from this pass is mixed into the latency
+//     samples, and the timed harnesses above are untouched — each metric below
+//     has its own copy of that harness's op loop, call for call and assertion
+//     for assertion, and the counts come from the copy.
 //   * **The counting allocator goes where the code under test holds one.** The
-//     wheel (`schedule` allocates the node), the object pool and the worker
-//     runtime (`spawn` allocates the heap handle, one per worker; the mailbox
-//     storage is inline, sized at comptime) hold an allocator, so their counts are
-//     what the timed region really allocates through it. For `RingBuffer`,
-//     `Mailbox`, `HotBus.publish`, `Sequencer` and the atomic reference the
-//     operation takes no allocator at all: there is no path to allocate from, and
-//     the zero is structural rather than measured. Both readings — a `1.00` and a
-//     structural `0.00` — are the same numbers `src/runtime/alloc_contract_test.zig`
-//     asserts *exactly*, with the same instrument, on the same operations; that
-//     test is where the enforcement lives (it arms the allocator so an added
-//     allocation is an error, not a number), and this section is where the numbers
-//     are visible next to the timings they belong to. `Handle.send*` and `MpscRing`
-//     are covered by that test but have no metric of their own in this suite, so
-//     they have no row here.
+//     wheel (`schedule` allocates the node), the object pool, the SQLx client and
+//     the worker runtime (`spawn` allocates the heap handle; the mailbox storage
+//     is inline, sized at comptime) hold an allocator, so their counts are what
+//     the timed region really allocates through it. For `RingBuffer`, `MpscRing`,
+//     `Mailbox`, `HotBus.publish`, `Sequencer`, the two breakers, the rate
+//     limiter and the atomic reference the operation takes no allocator at all:
+//     there is no path to allocate from, and the zero is structural rather than
+//     measured. Both readings — a counted `N.NN` and a structural `0.00` — are
+//     the same numbers `src/runtime/alloc_contract_test.zig` asserts *exactly*,
+//     with the same instrument, on the same operations; that test is where the
+//     per-path enforcement lives (it arms the allocator so an added allocation
+//     is an error, not a number), and this section is where every gated metric's
+//     number sits next to the timing it belongs to.
 //   * **Fixture is built before the snapshot**, never counted: the mailbox is
 //     filled, the worker runtime is started, the wheel's map is left to grow as it
 //     grows in the timed harness. Only the timed region's allocations are reported.
-//   * **Reported, never gated.** No `[alloc]` number reaches `bench-results.json`,
-//     no baseline holds an `alloc/op`, and `scripts/check-bench.sh` neither knows
-//     these names nor thresholds them — the same rule the `[pct]` rows follow, and
-//     for the same reason: there is no cross-host spread for them yet.
+//   * **Printed in a fixed format on purpose.** Each row is
+//     `  [alloc] <name>: <alloc/op> alloc/op  (<count> allocation(s) / <ops> ops)`,
+//     and `check-bench.sh` matches it with a regex — metric names contain no
+//     colon, so the first colon separates name from value. `bench-results.json`
+//     stays duration-only (the CI history format); these rows reach the gate
+//     through the log, not the file.
 //
-// Cost: one extra pass over the runtime group's op loops, measured and printed by
-// `reportSectionCost` at the end of the section (~0.16 s at today's scales). What
-// dominates it is the op counts the `[med3]` metrics use — the three 10M-op loops,
-// `Worker spawn+join`'s 1000 thread lifecycles — not the counting itself. Two of
-// the nine metrics pay a counted allocation per op, `TimerWheel` (one node per
-// scheduled timer) and `Worker spawn+join` (a handle per spawn); that is the fact
-// their rows report, not a cost the other seven avoid.
+// Cost: one extra pass over every gated metric's op loop, measured and printed by
+// `reportSectionCost` at the end of the section. What dominates it is the op
+// counts the `[med3]` metrics use — the three 10M-op loops, the 100M-call breaker,
+// `Worker spawn+join`'s 1000 thread lifecycles — not the counting itself. The rows
+// that pay a counted allocation per op say so in their note; that is the fact they
+// report, not a cost the zero rows avoid.
 // ─────────────────────────────────────────────────
 
 /// Counting allocator for this section: every allocation served through it is
@@ -1451,6 +1585,354 @@ fn allocWorkerSpawnJoin(io: std.Io, turns: usize) !AllocReading {
     return .{ .allocations = allocations, .ops = turns, .none_alloc_half = stop_half };
 }
 
+// ── Mirrors for the rest of the gated metrics ─────────────────────────
+//
+// Same contract as the nine above: fixture through the counter, snapshot, the
+// timed harness's op loop call for call with its assertions kept, report the
+// delta. Everything here is one of the two readings the banner describes —
+// a counted `N.NN` where the path allocates by design, or a structural `0.00`
+// where it holds no allocator at all.
+
+fn allocModuleScan(count: usize) !AllocReading {
+    const MockModule = struct {
+        pub const info = zigmodu.api.Module{ .name = "bench", .description = "Benchmark module", .dependencies = &.{} };
+        pub fn init() !void {}
+        pub fn deinit() void {}
+    };
+    var probe = AllocCounter.init(harness_allocator, .{});
+    // No fixture: the harness's whole loop is the timed region, so the mirror
+    // counts all of it, scan and deinit alike.
+    const before = probe.allocations;
+    for (0..count) |_| {
+        var modules = try zigmodu.scanModules(probe.allocator(), .{MockModule});
+        modules.deinit();
+    }
+    return .{ .allocations = probe.allocations - before, .ops = count };
+}
+
+fn allocModuleValidation(count: usize) !AllocReading {
+    const A = struct {
+        pub const info = zigmodu.api.Module{ .name = "a", .description = "A", .dependencies = &.{} };
+        pub fn init() !void {}
+        pub fn deinit() void {}
+    };
+    const B = struct {
+        pub const info = zigmodu.api.Module{ .name = "b", .description = "B", .dependencies = &.{"a"} };
+        pub fn init() !void {}
+        pub fn deinit() void {}
+    };
+    var probe = AllocCounter.init(harness_allocator, .{});
+    var modules = try zigmodu.scanModules(probe.allocator(), .{ A, B });
+    defer modules.deinit();
+    const before = probe.allocations;
+    for (0..count) |_| {
+        try zigmodu.validateModules(&modules);
+    }
+    return .{ .allocations = probe.allocations - before, .ops = count };
+}
+
+fn allocApplicationLifecycle(io: std.Io, count: usize) !AllocReading {
+    const M = struct {
+        pub const info = zigmodu.api.Module{ .name = "m", .description = "M", .dependencies = &.{} };
+        pub fn init() !void {}
+        pub fn deinit() void {}
+    };
+    var probe = AllocCounter.init(harness_allocator, .{});
+    const before = probe.allocations;
+    for (0..count) |_| {
+        var app = try zigmodu.Application.init(io, probe.allocator(), "bench", .{M}, .{});
+        try app.start();
+        app.stop();
+        app.deinit();
+    }
+    return .{ .allocations = probe.allocations - before, .ops = count };
+}
+
+fn allocWorkflow(io: std.Io, steps_count: usize, iterations: usize) !AllocReading {
+    var probe = AllocCounter.init(harness_allocator, .{});
+    const allocator = probe.allocator();
+    var registry = zigmodu.ai.SkillRegistry.init(allocator, io);
+    defer registry.deinit();
+    try registry.register(.{
+        .name = "nop",
+        .description = "",
+        .parameters = &.{},
+        .handler = struct {
+            fn h(c: *zigmodu.ai.SkillContext, _: std.json.Value) anyerror!std.json.Value {
+                var o = std.json.ObjectMap{};
+                try o.put(c.allocator, try c.allocator.dupe(u8, "ok"), .{ .bool = true });
+                return .{ .object = o };
+            }
+        }.h,
+    });
+    const steps = try allocator.alloc(zigmodu.ai.workflow.Step, steps_count);
+    defer allocator.free(steps);
+    for (0..steps_count) |i| {
+        steps[i] = .{
+            .name = try std.fmt.allocPrint(allocator, "step-{d}", .{i}),
+            .kind = .{ .skill = .{ .name = "nop", .args = .{ .object = .{} } } },
+        };
+    }
+    defer for (steps) |s| allocator.free(s.name);
+    var wf = zigmodu.ai.workflow.Workflow.init(&registry, steps);
+    // Unlike `benchWorkflow` (fixture on the caller's arena, per-run records on
+    // `harness_allocator`), the mirror runs everything through the counter: the
+    // fixture is built before the snapshot, and the per-run records — step
+    // records plus the skill's result value — are exactly what the snapshot
+    // region must catch.
+    var ctx = zigmodu.ai.SkillContext{ .allocator = allocator };
+    const before = probe.allocations;
+    for (0..iterations) |_| {
+        var r = try wf.run(allocator, &ctx);
+        r.deinit();
+    }
+    return .{ .allocations = probe.allocations - before, .ops = iterations };
+}
+
+fn allocEventBus(listeners: usize, events: usize) !AllocReading {
+    const E = struct { id: u64 };
+    var probe = AllocCounter.init(harness_allocator, .{});
+    var bus = zigmodu.TypedEventBus(E).init(probe.allocator());
+    defer bus.deinit();
+    for (0..listeners) |_| {
+        try bus.subscribe(struct {
+            fn cb(_: E) void {}
+        }.cb);
+    }
+    const before = probe.allocations;
+    for (0..events) |i| {
+        bus.publish(.{ .id = @intCast(i) });
+    }
+    return .{ .allocations = probe.allocations - before, .ops = events };
+}
+
+fn allocCircuitBreaker(calls: usize) !AllocReading {
+    var probe = AllocCounter.init(harness_allocator, .{});
+    // One loop for both passes: the harness is the timed one, and the mirror
+    // routes through it with the probe as its allocator (see the `counted`
+    // parameter there — and why this binary must not hold two copies of that
+    // loop). On return `probe.allocations` holds the loop's delta.
+    _ = try benchCircuitBreaker(probe.allocator(), calls, &probe.allocations);
+    return .{ .allocations = probe.allocations, .ops = calls };
+}
+
+fn allocRateLimiter(calls: usize) !AllocReading {
+    var probe = AllocCounter.init(harness_allocator, .{});
+    var rl = try zigmodu.RateLimiter.init(probe.allocator(), "bench", 1_000_000, 1_000_000);
+    defer rl.deinit();
+    const before = probe.allocations;
+    for (0..calls) |_| {
+        _ = rl.tryAcquire();
+    }
+    return .{ .allocations = probe.allocations - before, .ops = calls };
+}
+
+fn allocHealthEndpoint(checks: usize, iterations: usize) !AllocReading {
+    var probe = AllocCounter.init(harness_allocator, .{});
+    const allocator = probe.allocator();
+    var ep = zigmodu.HealthEndpoint.init(allocator);
+    defer ep.deinit();
+    for (0..checks) |i| {
+        const name = try std.fmt.allocPrint(allocator, "check-{}", .{i});
+        defer allocator.free(name);
+        try ep.registerCheck(name, "bench", zigmodu.HealthEndpoint.alwaysUp);
+    }
+    const before = probe.allocations;
+    for (0..iterations) |_| {
+        var d = ep.checkHealth();
+        d.components.deinit();
+    }
+    return .{ .allocations = probe.allocations - before, .ops = iterations };
+}
+
+fn allocDbQuery(io: std.Io, queries: usize) !AllocReading {
+    var probe = AllocCounter.init(harness_allocator, .{});
+    const allocator = probe.allocator();
+    var client = zigmodu.data.sqlx.Client.init(allocator, io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    _ = try client.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, value REAL)", &.{});
+    for (0..100) |i| {
+        const s = try std.fmt.allocPrint(allocator, "INSERT INTO t VALUES ({}, 'item{}', {}.0)", .{ i, i, i });
+        defer allocator.free(s);
+        _ = try client.exec(s, &.{});
+    }
+    const backend = zigmodu.data.SqlxBackend{ .allocator = allocator, .client = &client };
+    var orm = zigmodu.data.orm.Orm(zigmodu.data.SqlxBackend){ .backend = backend };
+    const Row = struct {
+        pub const sql_table_name: []const u8 = "t";
+        id: i64,
+        name: []const u8,
+        value: f64,
+    };
+    var repo = zigmodu.data.Repository(Row){ .orm = &orm };
+    if (try repo.findById(@as(i64, 50))) |r| allocator.free(r.name);
+    const before = probe.allocations;
+    for (0..queries) |_| {
+        if (try repo.findById(@as(i64, 50))) |r| allocator.free(r.name);
+    }
+    return .{ .allocations = probe.allocations - before, .ops = queries };
+}
+
+fn allocStoreForward(count: usize) !AllocReading {
+    const Cells = struct {
+        a: std.atomic.Value(u64) align(std.atomic.cache_line),
+        b: std.atomic.Value(u64),
+    };
+    var probe = AllocCounter.init(harness_allocator, .{});
+    const cells = try probe.allocator().create(Cells);
+    defer probe.allocator().destroy(cells);
+    cells.* = .{
+        .a = std.atomic.Value(u64).init(0),
+        .b = std.atomic.Value(u64).init(0),
+    };
+    var x: u64 = 0;
+    const before = probe.allocations;
+    for (0..count) |_| {
+        cells.a.store(x +% 1, .release);
+        x = cells.a.load(.acquire);
+        cells.b.store(x +% 1, .release);
+        x = cells.b.load(.acquire);
+        std.mem.doNotOptimizeAway(x);
+    }
+    const allocations = probe.allocations - before;
+    if (x != 2 *% @as(u64, @intCast(count))) return error.BenchStoreForwardFolded;
+    return .{ .allocations = allocations, .ops = count };
+}
+
+fn allocMpscRingPush(count: usize) !AllocReading {
+    // The ring holds no allocator, so this reading is the structural zero —
+    // the same zero `alloc_contract_test.zig` asserts for `MpscRing` push+pop.
+    var probe = AllocCounter.init(harness_allocator, .{});
+    const R = rt.MpscRing(u64, 1024);
+    const ring = try probe.allocator().create(R);
+    defer probe.allocator().destroy(ring);
+    ring.* = R.init();
+    var expected: [bench_mpsc_producers]u64 = @splat(0);
+    var pushed: usize = 0;
+    const before = probe.allocations;
+    while (pushed < count) {
+        while (pushed < count) {
+            if (!ring.tryPush(@intCast(pushed))) break;
+            pushed += 1;
+        }
+        while (ring.tryPop()) |v| {
+            if (expected[v % bench_mpsc_producers] != v / bench_mpsc_producers) return error.BenchMpscReordered;
+            expected[v % bench_mpsc_producers] = v / bench_mpsc_producers + 1;
+        }
+    }
+    const allocations = probe.allocations - before;
+    if (pushed != count) return error.BenchMpscLostPushes;
+    if (!ring.isEmpty()) return error.BenchMpscLeftovers;
+    return .{ .allocations = allocations, .ops = count };
+}
+
+fn allocTimerWheelChurn(rounds: usize) !AllocReading {
+    var probe = AllocCounter.init(harness_allocator, .{});
+    var wheel = rt.Wheel(u64).init(probe.allocator(), 0);
+    defer wheel.deinit();
+    var fired = TimerFireCounter{};
+    const slots_used = timer_span_ms / rt.timer_wheel.slot_ms;
+    var now_ms: i64 = 0;
+    var id: u64 = 1;
+    const before = probe.allocations;
+    for (0..rounds) |_| {
+        for (0..timer_churn_live) |k| {
+            const tick: i64 = @intCast(k % @as(usize, @intCast(slots_used)));
+            try wheel.scheduleWithId(id, now_ms + (tick + 1) * rt.timer_wheel.slot_ms, @intCast(k));
+            id += 1;
+        }
+        _ = wheel.advance(now_ms + timer_span_ms, &fired, TimerFireCounter.onFire);
+        now_ms += timer_span_ms;
+    }
+    const allocations = probe.allocations - before;
+    if (wheel.pendingCount() != 0) return error.BenchTimerWheelLeaked;
+    if (fired.fired != @as(u64, rounds) * timer_churn_live) return error.BenchTimerWheelLostTimers;
+    return .{ .allocations = allocations, .ops = @as(usize, rounds) * timer_churn_live };
+}
+
+fn allocWorkerDrain(comptime mode: rt.SpawnMode, io: std.Io, count: usize) !AllocReading {
+    var seen = std.atomic.Value(u64).init(0);
+    var probe = AllocCounter.init(harness_allocator, .{});
+    // The runtime — and its ticker — run for real on the probe allocator. The
+    // ticker's steady state drains an empty command ring and advances an empty
+    // wheel, which allocates nothing, so the snapshot region is producer-side
+    // only; a ticker that grew a per-tick allocation would show up here.
+    var rtx = try rt.Runtime.initWithOptions(probe.allocator(), io, .{
+        .scheduler = .{ .max_pooled_workers = 1, .pool_threads = 1 },
+    });
+    defer rtx.deinit();
+    try rtx.start();
+
+    const handle = if (comptime mode == .pooled)
+        try rtx.spawn(BenchDrainWorker, .{ .seen = &seen }, .{ .capacity = bench_drain_capacity, .mode = .pooled })
+    else
+        try rtx.spawn(BenchDrainWorker, .{ .seen = &seen }, bench_drain_capacity);
+
+    const before = probe.allocations;
+    var sent: usize = 0;
+    while (sent < count) {
+        handle.send(sent) catch |err| switch (err) {
+            error.Full => {
+                std.atomic.spinLoopHint();
+                continue;
+            },
+            error.Closed => return error.BenchDrainWorkerClosed,
+            error.Timeout => return error.BenchDrainUnexpectedTimeout,
+        };
+        sent += 1;
+    }
+    var spins: usize = 0;
+    while (seen.load(.acquire) < count and spins < bench_drain_timeout_spins) : (spins += 1) std.atomic.spinLoopHint();
+    const allocations = probe.allocations - before;
+    if (seen.load(.acquire) != count) return error.BenchDrainLostMessages;
+
+    handle.stop();
+    handle.join();
+    if (handle.state.acc != count * (count - 1) / 2) return error.BenchDrainWrongSum;
+    return .{ .allocations = allocations, .ops = count };
+}
+
+fn allocWorkerDrainDedicated(io: std.Io, count: usize) !AllocReading {
+    return allocWorkerDrain(.dedicated, io, count);
+}
+
+fn allocWorkerDrainPooled(io: std.Io, count: usize) !AllocReading {
+    return allocWorkerDrain(.pooled, io, count);
+}
+
+fn allocTimerAfter(io: std.Io, count: usize) !AllocReading {
+    var clk = rt.Clock.Manual{ .now_ms = 0 };
+    var probe = AllocCounter.init(harness_allocator, .{});
+    var rtx = rt.Runtime.init(probe.allocator(), io, .{ .manual = &clk });
+    defer rtx.deinit();
+    const handle = try rtx.spawn(BenchNoopWorker, .{}, bench_worker_mailbox_capacity);
+
+    const tick_count = timer_span_ms / rt.timer_wheel.slot_ms;
+    var armed: usize = 0;
+    const before = probe.allocations;
+    while (armed < count) {
+        while (armed < count) {
+            const tick: i64 = @intCast(armed % @as(usize, @intCast(tick_count)));
+            _ = handle.after((tick + 1) * rt.timer_wheel.slot_ms, @intCast(armed)) catch |err| switch (err) {
+                error.Full => break,
+                else => return err,
+            };
+            armed += 1;
+        }
+        _ = rtx.tick();
+    }
+    _ = rtx.tick();
+    const allocations = probe.allocations - before;
+
+    if (rtx.wheel.pendingCount() != count) return error.BenchTimerAfterLostTimers;
+    rtx.shutdown();
+    const s = rtx.stats();
+    if (s.timers_discarded != count) return error.BenchTimerAfterLeakedTimers;
+    if (s.timer_deliveries_dropped != 0) return error.BenchTimerAfterDroppedDelivery;
+    return .{ .allocations = allocations, .ops = count };
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -1523,7 +2005,7 @@ pub fn main(init: std.process.Init) !void {
     // (one of nine samples already came back at 2.1x). Ten times the iterations
     // puts both at 6-7 ms and 60-70 ms, which the 2.0x window can judge.
     inline for (.{ .{ "CircuitBreaker x10M", 10_000_000 }, .{ "CircuitBreaker x100M", 100_000_000 } }) |tc| {
-        const ms = try median3(tc[0], benchCircuitBreaker, .{ a, tc[1] });
+        const ms = try median3(tc[0], benchCircuitBreaker, .{ a, tc[1], null });
         try results.append(a, .{ .name = tc[0], .value = ms });
         std.debug.print("  {s}  {d:.2} ms  ({d:.0} calls/s)\n", .{ tc[0], ms, @as(f64, @floatFromInt(tc[1])) / ms * 1000.0 });
     }
@@ -1594,6 +2076,20 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("  {s}  {d:.2} ms  ({d:.0} round trips/s)\n", .{ name, ms, 1_000_000.0 / ms * 1000.0 });
     }
     {
+        // The raw Vyukov ring's multi-producer push, next to its SPSC sibling
+        // above: `MpscRing` is what the scheduler's ready ring and the timer
+        // command queue run, and `Mailbox post+drain` only covers it through
+        // the mailbox wrapper. Four producer cursors, one thread — the gated
+        // shape is contention-free on purpose, see `benchMpscRingPush`. 2M
+        // (not 1M): the raw push is ~3.7x cheaper than the mailbox wrapper
+        // above, and 1M landed at 4.7 ms — under the ~5 ms this suite sizes a
+        // new metric at.
+        const name = "MpscRing 4P x2M";
+        const ms = try median3(name, benchMpscRingPush, .{2_000_000});
+        try results.append(a, .{ .name = name, .value = ms });
+        std.debug.print("  {s}  {d:.2} ms  ({d:.0} pushes/s)\n", .{ name, ms, 2_000_000.0 / ms * 1000.0 });
+    }
+    {
         const name = "Mailbox post+drain x1M";
         const ms = try median3(name, benchMailbox, .{ io, a, 1_000_000 });
         try results.append(a, .{ .name = name, .value = ms });
@@ -1642,6 +2138,16 @@ pub fn main(init: std.process.Init) !void {
         try results.append(a, .{ .name = name, .value = ms });
         const ops = @as(f64, timer_churn_rounds) * timer_churn_live;
         std.debug.print("  {s}  {d:.2} ms  ({d:.1} ns per schedule+fire, {d} live)\n", .{ name, ms, ms * 1e6 / ops, @as(u32, timer_churn_live) });
+    }
+    {
+        // The `after()` path end to end — caller-side payload + command ring,
+        // owner-side drain + wheel insert — on a hand-driven runtime, see
+        // `benchTimerAfter`. 100K arms lands in the same scale family as the
+        // two wheel metrics above it (~10-15 ms against today's build).
+        const name = "Timer after x100K";
+        const ms = try median3(name, benchTimerAfter, .{ io, 100_000 });
+        try results.append(a, .{ .name = name, .value = ms });
+        std.debug.print("  {s}  {d:.2} ms  ({d:.0} arms/s)\n", .{ name, ms, 100_000.0 / ms * 1000.0 });
     }
     {
         const name = "HotBus 8sub x1M";
@@ -1814,25 +2320,51 @@ pub fn main(init: std.process.Init) !void {
     // ── Allocation counts per op ──────────────────────────────────────────
     //
     // The instrumented pass described in the banner at `AllocCounter`, after the
-    // latency table and outside it: its runs are counted, never timed, and nothing
-    // it produces is comparable with `[med3]` or `[pct]`. Same nine runtime
-    // metrics, same scales, same op loops. A row that reads other than 0.00 is a
-    // finding rather than a bug in the harness — the two that do (`TimerWheel`,
-    // `Worker spawn+join`) are both deliberate, both documented in
-    // `src/runtime/alloc_contract_test.zig`, and both named in the lines below.
+    // latency table and outside it: its runs are counted, never timed, and a
+    // duration measured here would measure the instrument. One row per gated
+    // metric, same scales and op loops as the `[med3]` section — and since
+    // 2026-09-22 a criterion, not just a readout: `scripts/check-bench.sh`
+    // parses these rows and fails any metric whose baseline declares
+    // `max_alloc_per_op` and reads above it. A row that reads other than 0.00
+    // names why in its note — the paths that allocate by contract do so
+    // deliberately, and are asserted exactly in
+    // `src/runtime/alloc_contract_test.zig`.
     std.debug.print("\n-- Allocation counts per op (instrumented pass: counts only, no timing) --\n", .{});
-    std.debug.print("  A counting allocator sits in the path, so these runs are *not* timed and nothing here is\n  comparable with the `[med3]` or `[pct]` numbers above. Fixture is built before the\n  snapshot; the op loops are copies of the timed ones. Observation only, never gated.\n", .{});
+    std.debug.print("  A counting allocator sits in the path, so these runs are *not* timed and nothing here is\n  comparable with the `[med3]` or `[pct]` numbers above. Fixture is built before the\n  snapshot; the op loops are copies of the timed ones. Second criterion: `check-bench.sh`\n  fails any metric whose baseline declares `max_alloc_per_op` and reads above it — a count\n  is exact, so an alloc breach is a regression, not noise.\n", .{});
     const alloc_section_t0 = now();
-    allocLine("atomic RMW x10M", try allocAtomicRmw(10_000_000), "");
+    allocLine("scanModules x100K", try allocModuleScan(100000), "");
+    allocLine("scanModules x1M", try allocModuleScan(1_000_000), "");
+    allocLine("validateModules x10K", try allocModuleValidation(10000), "");
+    allocLine("validateModules x100K", try allocModuleValidation(100000), "");
+    allocLine("App lifecycle x3K", try allocApplicationLifecycle(io, 3000), "");
+    allocLine("workflow 20-step x5K", try allocWorkflow(io, 20, 5000), "");
+    allocLine("1L x10M events", try allocEventBus(1, 10_000_000), "");
+    allocLine("10L x1M events", try allocEventBus(10, 1_000_000), "");
+    allocLine("100L x100K events", try allocEventBus(100, 100_000), "");
+    allocLine("CircuitBreaker x10M", try allocCircuitBreaker(10_000_000), "");
+    allocLine("CircuitBreaker x100M", try allocCircuitBreaker(100_000_000), "");
+    allocLine("RateLimiter x1M", try allocRateLimiter(1_000_000), "");
+    allocLine("RateLimiter x10M", try allocRateLimiter(10_000_000), "");
+    allocLine("10 checks x100K", try allocHealthEndpoint(10, 100000), "");
+    allocLine("100 checks x10K", try allocHealthEndpoint(100, 10000), "");
+    allocLine("findById x20K", try allocDbQuery(io, 20000), "");
+    allocLine("findById x10K", try allocDbQuery(io, 10000), "");
+    allocLine("atomic RMW x10M", try allocAtomicRmw(10_000_000), "host reference: no allocator on the path, the zero is structural");
+    allocLine("StoreForward x10M", try allocStoreForward(10_000_000), "host reference: same structural zero");
     allocLine("RingBuffer SPSC x1M", try allocRingBuffer(1_000_000), "");
+    allocLine("MpscRing 4P x2M", try allocMpscRingPush(2_000_000), "");
     allocLine("Mailbox post+drain x1M", try allocMailbox(io, 1_000_000), "");
     allocLine("Mailbox full-path x10M", try allocMailboxFull(io, 10_000_000), "");
     allocLine("TimerWheel x100K", try allocTimerWheel(100_000), "one node per scheduled timer: `Wheel.schedule` allocates the node by contract, `cancel`/`advance` do not");
+    allocLine("TimerWheel churn x1M", try allocTimerWheelChurn(timer_churn_rounds), "one node per schedule, freed on fire: the churn shape's count is the same 1/op with reuse, so what it buys over `TimerWheel x100K`'s row is the *steady-state* map-growth number");
     allocLine("HotBus 8sub x1M", try allocHotBus(1_000_000), "");
     allocLine("ObjectPool x1M", try allocObjectPool(1_000_000), "");
     allocLine("Sequencer x10M", try allocSequencer(10_000_000), "");
     allocLine("Worker spawn+join x1K", try allocWorkerSpawnJoin(io, 1_000), "one heap handle per worker (`spawn`), plus the worker list's amortized growth; `stop`/`join` allocate nothing");
-    reportSectionCost("alloc", alloc_section_t0, 9);
+    allocLine("Worker drain dedicated x1M", try allocWorkerDrainDedicated(io, 1_000_000), "");
+    allocLine("Pooled dispatch x1M", try allocWorkerDrainPooled(io, 1_000_000), "");
+    allocLine("Timer after x100K", try allocTimerAfter(io, 100_000), "one `Delivery` payload per arm on the caller thread, plus one wheel node per insert on the owner half — the two allocations the path makes by contract");
+    reportSectionCost("alloc", alloc_section_t0, 32);
 
     // Emit bench-results.json for CI baseline tracking
     // (github-action-benchmark `customSmallerIsBetter` format); `value` is the
@@ -1840,8 +2372,9 @@ pub fn main(init: std.process.Init) !void {
     // The percentile section above deliberately writes nothing here: a metric the
     // baselines do not know is a WARN in `check-bench.sh`, and adding 40 such
     // entries per run (10 metrics x 4 quantiles) would train its reader to skip
-    // warnings. `check-bench.sh` sees the `[pct]` lines in its own log instead,
-    // and the `[alloc]` rows never reach a file at all.
+    // warnings. The `[alloc]` rows stay out of this file too — the CI history
+    // format has no place for them — but they are a criterion now, read from the
+    // run's log by `check-bench.sh`, not lost: see the section above.
     const json = try std.json.Stringify.valueAlloc(a, results.items, .{});
     const file = try std.Io.Dir.cwd().createFile(io, "bench-results.json", .{});
     defer file.close(io);

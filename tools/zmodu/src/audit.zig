@@ -9,10 +9,24 @@
 //! Baseline: `<dir>/.zmodu/audit-baseline.json` (same semantics as the
 //! deadcode baseline: new findings fail, removals are allowed, `--update`
 //! shrinks). Exit: 0 pass / 1 new findings / 2 usage error.
+//!
+//! STRUCTURE:
+//!   §1  CLI entry, args & rule config —— usage, run, parseArgs, loadRuleConfig
+//!   §2  Architecture rules —— collectArchitecture, module graph, cycle detection
+//!   §3  Business lint —— lintFile & the b1–b24 rules, helpers, rule config
+//!   §4  Baseline —— read / write `.zmodu/audit-baseline.json`
+//!   §5  Output —— text & JSON rendering, exit codes
+//!   §6  Tests —— architecture fixtures, per-rule fixtures
+//!
+//! Every section carries a matching `// ==== §N ... ====` anchor — `grep "==== §3"`
+//! jumps there. `§N` in prose without that prefix is a *document* section (e.g.
+//! `docs/ZENT.md §14`), never one of these.
 
 const std = @import("std");
 const Io = std.Io;
 const Dir = Io.Dir;
+
+// ==== §1  CLI entry, args & rule config ====
 
 pub const usage =
     \\Usage: zmodu audit [options] [dir]
@@ -264,7 +278,7 @@ fn loadRuleConfig(io: Io, allocator: std.mem.Allocator, project_dir: []const u8)
     return rc;
 }
 
-// ── architecture ──────────────────────────────────────────────────────────
+// ==== §2  Architecture rules ====
 
 fn collectArchitecture(
     io: Io,
@@ -540,7 +554,7 @@ fn cycleVisit(ctx: *CycleCtx, i: usize) !void {
     ctx.state[i] = 2;
 }
 
-// ── business lint ─────────────────────────────────────────────────────────
+// ==== §3  Business lint ====
 
 /// `collectModelStructs` over every `.zig` file in a module subtree.
 ///
@@ -831,6 +845,22 @@ fn lintFile(
                 if (alloc_produced.contains(target)) {
                     try pushViolation(violations, allocator, "b23", rel_path, idx, "把「由带 allocator 形参的函数产出」的行交给了 deinitRow/deinitRows —— 那是用 client 的分配器释放别人的内存（`free of invalid memory`，会打死进程）。只对驱动扫描出来的行用 deinitRow(s)（`Query().All()` / builder `Save()`）；`getOwned`（旧名 `get`）/ `AllIn(arena)` / `queryRowOwned` / `scanRowsToOwned` 的返回值由那个 allocator 自己回收（arena 会自己清）。确属误报则在同一行加 `// audit: ignore b23` 并注明出处", .{});
                 }
+            }
+        }
+
+        // b24 — entropy source: `std.Io.random(` is not a CSPRNG — its docs say
+        // that on failure it falls back to pid + wall-clock + ASLR, so a caller
+        // deriving a lock owner id, a session token or an API-key salt from it
+        // can end up with two replicas sharing a credential (AGENTS.md
+        // "CSPRNG"). `std.crypto.random` is not declared by this toolchain at
+        // all. `std.Io.randomSecure(io, buf)` is the only sanctioned spelling;
+        // it returns `error.EntropyUnavailable` rather than degrading. Keys on
+        // the whole identifier, not `random(`, so `randomSecure` — which the
+        // line-level comment skip below has already distinguished — never
+        // matches: the Secure form is stripped before the test.
+        if (!config.disabled.contains("b24")) {
+            if (weakEntropyCall(trimmed)) {
+                try pushViolation(violations, allocator, "b24", rel_path, idx, "非 CSPRNG 熵源 — std.Io.random 失败时回落 pid+墙钟+ASLR（两个副本可能算出同一个凭证），std.crypto.random 本工具链根本不存在。改用 std.Io.randomSecure(io, buf)：失败即 error.EntropyUnavailable，绝不降级（AGENTS.md「CSPRNG」）；确属不可能出问题的演示代码可加 // audit: ignore b24", .{});
             }
         }
 
@@ -1482,6 +1512,22 @@ fn isCrudName(name: []const u8) bool {
         std.mem.eql(u8, name, "delete");
 }
 
+/// b24 — does this line name a banned entropy source?
+///
+/// `std.Io.randomSecure` is removed first, then the remainder is tested for
+/// `std.Io.random` / `std.crypto.random`. Zig has no lookahead either, so
+/// stripping the sanctioned spelling is the direct equivalent — and it means
+/// `std.Io.randomSecure(io, &buf)`, the form every caller should be using,
+/// never trips the rule while `std.Io.random(io, &buf)` always does.
+fn weakEntropyCall(line: []const u8) bool {
+    var rest = line;
+    while (std.mem.indexOf(u8, rest, "std.Io.randomSecure")) |at| {
+        rest = rest[at + "std.Io.randomSecure".len ..];
+    }
+    return std.mem.indexOf(u8, rest, "std.Io.random") != null or
+        std.mem.indexOf(u8, rest, "std.crypto.random") != null;
+}
+
 /// b23 — the LHS of a binding whose initializer is a call that mentions an
 /// allocator or an arena: `const e = try self.crud.getOwned(allocator, …);`. Null for
 /// anything else, including comparisons and non-`const`/`var` assignments.
@@ -1767,7 +1813,7 @@ fn pushViolation(
     });
 }
 
-// ── baseline ──────────────────────────────────────────────────────────────
+// ==== §4  Baseline ====
 
 const BaselineResult = struct {
     added: usize,
@@ -1888,7 +1934,7 @@ fn writeBaseline(
     std.log.info("audit: baseline updated: {d} violations -> {s}", .{ violations.len, baseline_path });
 }
 
-// ── output ────────────────────────────────────────────────────────────────
+// ==== §5  Output (text / JSON / exit codes) ====
 
 fn printHuman(
     io: Io,
@@ -2035,7 +2081,7 @@ pub fn renderMermaid(io: Io, allocator: std.mem.Allocator, project_dir: []const 
     return buf.toOwnedSlice(allocator);
 }
 
-// ── tests ─────────────────────────────────────────────────────────────────
+// ==== §6  Tests ====
 
 test "audit extracts Module info from module.zig" {
     const allocator = std.testing.allocator;
@@ -2227,6 +2273,14 @@ test "audit business lint flags anti-patterns" {
     try lintFile(allocator, "persistence.zig", "pub fn save(self: *@This()) !void {\n    var e = try self.q.Save();\n    defer self.q.deinitRow(&e);\n}\n", "src/modules/x/persistence.zig", &cfg, &violations);
     // b23 negative — the comparison operators are not bindings.
     try lintFile(allocator, "persistence.zig", "pub fn ok(self: *@This(), allocator: std.mem.Allocator) !bool {\n    _ = allocator;\n    return self.len == self.cap;\n}\n", "src/modules/x/persistence.zig", &cfg, &violations);
+    // b24 — std.Io.random degrades to pid+wall-clock+ASLR on failure.
+    try lintFile(allocator, "service.zig", "pub fn f(self: *@This()) !void {\n    var seed: [8]u8 = undefined;\n    std.Io.random(self.io, &seed);\n    _ = seed;\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b24 — std.crypto.random is not declared by this toolchain.
+    try lintFile(allocator, "service.zig", "pub fn g(self: *@This()) void {\n    _ = self;\n    const n = std.crypto.random.int(u32);\n    _ = n;\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b24 negative — randomSecure is the sanctioned form and must never fire.
+    try lintFile(allocator, "service.zig", "pub fn h(self: *@This()) !void {\n    var seed: [8]u8 = undefined;\n    try std.Io.randomSecure(self.io, &seed);\n    _ = seed;\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b24 negative — prose mentioning the banned call is a comment, not a use.
+    try lintFile(allocator, "service.zig", "// never call std.Io.random(io, &seed) here\npub fn i(self: *@This()) void {\n    _ = self;\n}\n", "src/modules/x/service.zig", &cfg, &violations);
 
     var rules = std.StringHashMap(usize).init(allocator);
     defer rules.deinit();
@@ -2257,6 +2311,7 @@ test "audit business lint flags anti-patterns" {
     try std.testing.expectEqual(@as(usize, 1), rules.get("b21").?);
     try std.testing.expectEqual(@as(usize, 1), rules.get("b22").?);
     try std.testing.expectEqual(@as(usize, 2), rules.get("b23").?);
+    try std.testing.expectEqual(@as(usize, 2), rules.get("b24").?);
 }
 
 test "audit collectModelStructs picks up indented local const structs" {

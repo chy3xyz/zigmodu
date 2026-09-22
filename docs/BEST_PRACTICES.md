@@ -424,7 +424,7 @@ CI 构建 15 项 + `zmsaas/backend`。
 
 ### 实践 ↔ 门禁一致性（2026-09-18）
 
-「会炸/会漏」的规则**基本都有门禁**（`audit` b1–b23 + `check-production` + `DocSnippets` + `AiBoundary`）。缺口分三类：
+「会炸/会漏」的规则**基本都有门禁**（`audit` b1–b24 + `check-production` + `DocSnippets` + `AiBoundary`）。缺口分三类：
 
 **A. 只有约定、没有机制**（文档说得硬，机器不查）
 `worker 归 app`（禁模块内 `Runtime.init`/`rt.shutdown`）· **裸 `Agent{}` 必带 guard**（只有 opt-in 的 `isGuarded()`）· `请求路径勿读 ClusterMembership 哈希表`（b20 只管文件作用域 `var …HashMap`）· 多副本 cron/迁移 `setLock` · `TransactionJournal.recover()` · `SagaStep.timeout_seconds`。
@@ -2048,6 +2048,17 @@ pub fn processBatch(allocator: Allocator, items: []Item) !void {
    try tx.exec("UPDATE ...", &.{});
    try tx.commit();                // 全部成功才提交
    ```
+
+   > 这里的 `catch {}` 是**正当**的：`zmodu audit` 的 b10 只把「空 catch 吞掉错误」判为
+   > 违规，而对三类尽力清理豁免 —— `errdefer` 收尾、`rollback`、`sendError`（写给一个
+   > 已经失败的响应）。原始错误才是重点，兜底清理的失败是次要信息。这三类之外的空
+   > `catch {}` 才需要 `catch |err|` + 日志，或 `// audit: ignore b10` 注明理由。
+   >
+   > **两条链口径不同**：以上豁免只属于 `zmodu audit`，而且它按**整行子串**匹配
+   > （行尾注释、`self.rollback_cmd` 这类同名列也会被豁免）；`zig build check` 的
+   > hot-path 扫描（`scripts/check-production.sh`）对这些形状**没有豁免**，在
+   > `ENFORCED_PREFIXES` 下的生产代码里仍然判红——那边请写成非空 body 的
+   > `catch |err|`（清理场景可只降级为 debug 日志）。
 
 **铁律**：`beginTx()` 之后一切读写**走 tx 句柄**（`tx.exec` / `tx.queryRow` /
 `tx.queryRowPartial`），不要混用 `backend.exec`（池连接、非事务）。事务内查询优先

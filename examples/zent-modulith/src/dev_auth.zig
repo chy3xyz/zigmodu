@@ -30,10 +30,12 @@ pub fn DevAuthApi(comptime Security: type) type {
         fn issue(ctx: *http.Context, self: *State) !void {
             const sub = ctx.queryStr("sub", "1");
             const tenant = ctx.queryStr("tenant_id", "1");
-            // Token is allocated by the security module's allocator; both it
-            // and ctx.allocator are the process gpa in this demo.
+            // Token is allocated by the security module's allocator. It must
+            // be freed with that same allocator: ctx.allocator is the
+            // per-request arena, whose free() is a no-op — freeing across
+            // allocators leaks the token once per mint.
             const token = self.sec.generateTokenWithTenant(sub, &.{"user"}, tenant) catch |err| return http.respondErr(ctx, err);
-            defer ctx.allocator.free(token);
+            defer self.sec.allocator.free(token);
             try ctx.jsonStruct(200, .{ .token = token, .tenant_id = tenant });
         }
     };

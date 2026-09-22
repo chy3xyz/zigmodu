@@ -141,4 +141,35 @@ fi
 if [[ "$alive" != "200" ]]; then
   echo "smoke: server is not alive after the run"; sed -n '1,40p' "$LOG"; exit 1
 fi
+
+# ── graceful shutdown + leak gate ───────────────────────────────────────────
+# The debug binary's allocator (std.heap.SafeAllocator) only prints its leak
+# report ("leaked ... allocated at: ...") when main returns — i.e. after a
+# clean SIGTERM shutdown, which main.zig handles by flipping the server's
+# `running` flag and waking the blocked accept. A server that swallows
+# SIGTERM or panics mid-deinit fails the smoke.
+kill -TERM "$PID" 2>/dev/null
+term_deadline=$((SECONDS + 15))
+while kill -0 "$PID" 2>/dev/null; do
+  if (( SECONDS >= term_deadline )); then
+    echo "smoke: server did not exit within 15s of SIGTERM"
+    kill -9 "$PID" 2>/dev/null
+    exit 1
+  fi
+  sleep 0.25
+done
+wait "$PID" 2>/dev/null || { echo "smoke: server exited non-zero after SIGTERM"; exit 1; }
+PID="" # reaped; keep the EXIT trap's kill harmless
+if grep -qaE "panic|ABRT" "$LOG"; then
+  echo "smoke: SERVER PANICKED (during shutdown):"
+  grep -aE "panic|ABRT" "$LOG" | head -5
+  exit 1
+fi
+leaks=$(grep -ac "leaked" "$LOG" || true)
+if [[ "$leaks" != "0" ]]; then
+  echo "smoke: SERVER LEAKED memory ($leaks allocator report lines):"
+  grep -a "leaked" "$LOG" | head -10
+  exit 1
+fi
+echo "smoke: clean shutdown, no leaks"
 [[ "$bad" -eq 0 ]] || exit 1

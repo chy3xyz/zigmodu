@@ -52,6 +52,12 @@ pub fn Module(comptime Exec: type) type {
             const rt = try ctx.runtime();
             state = try service.State.create(ctx.allocator, ctx.io);
 
+            // The run is DB-bound: every proposal is staged into the sqlite
+            // table (`stageLeg`) and scored by risk rules that are SQL
+            // (`RiskReview`), all inside `onResult` on this worker's thread.
+            // So it is admitted to the blocking pool (docs/RUNTIME.md §12.13)
+            // — `.mode = .pooled` + `.execution_class = .blocking` — which the
+            // builder in `main` declares via `withBlockingThreads`.
             agent_worker = try rt.spawn(ai.AgentWorker, .{
                 .allocator = ctx.allocator,
                 .agent = &agent,
@@ -62,7 +68,11 @@ pub fn Module(comptime Exec: type) type {
                 // interesting number here — but it is bounded, like everything
                 // else in this example.
                 .max_steps = 2,
-            }, api.agent_capacity);
+            }, .{
+                .capacity = api.agent_capacity,
+                .mode = .pooled,
+                .execution_class = .blocking,
+            });
             // Assigned *after* the spawn, and safe because this worker's only
             // producer is the trigger spawned below: nothing can be posted to an
             // agent that nobody has a handle to yet. The order is worth keeping —

@@ -33,6 +33,52 @@
 # cross-host spread of a tail is known (the same reason the atomic-path metrics
 # became a ratio instead of tighter absolute thresholds).
 #
+# ── The second criterion: allocations per op (2026-09-22) ──
+#
+# The suite's `[alloc]` pass prints one row per gated metric,
+# `  [alloc] <name>: <alloc/op> alloc/op  (...)`, from a counting allocator in
+# an untimed copy of the harness's op loop (`src/benchmark.zig`, the banner at
+# `AllocCounter`). A baseline entry may declare an optional
+# `"max_alloc_per_op": <f>`; the check pass parses the rows from the measured
+# run's own log and fails any budgeted metric that reads above its budget.
+#
+# Unlike a millisecond value, a counted allocation is exact — no median of 3,
+# no host wobble, and no ratio cancels anything — so an alloc breach is a
+# regression the first time it fires, and the host-check / re-run narrative
+# that applies to a duration breach does not apply to it: the failing run
+# contains the allocation, find it. Budgets were recorded from a measured run
+# plus headroom for fixed overheads (hash-map growth, one-time setup): a row
+# that allocates by contract reads `N.NN` (e.g. `TimerWheel x100K` = one node
+# per schedule ≈ 1.00) and its budget sits between that reading and `+1.00`,
+# so an extra allocation *per op* fails the gate while bounded setup jitter
+# does not. Rows whose path holds no allocator read `0.00` and carry a `0.00`
+# budget — for them any allocation at all is the regression. The counts are
+# the same numbers `src/runtime/alloc_contract_test.zig` asserts exactly on
+# the runtime paths.
+#
+# `--update` preserves `max_alloc_per_op` verbatim (it is a human-set budget,
+# not something a recording run may loosen) and reports how many entries carry
+# one. `scripts/bench-baseline.ci.json` predates the field: until it is
+# re-recorded on a runner the CI check simply has no alloc criterion (missing
+# budgets gate nothing, the same way a metric no baseline knows is a WARN).
+# A budget whose metric produced no `[alloc]` row in this run's log is a WARN,
+# not a failure — deleting a benchmark must not break the gate.
+#
+# This is also why the criterion list now counts two metrics the suite grew on
+# 2026-09-22: `MpscRing 4P x2M` (multi-producer push on the raw Vyukov ring,
+# gated as a ratio like its mailbox sibling) and `Timer after x100K` (the
+# `after()` scheduling path end to end). Their baseline entries exist only in
+# this file until the CI class records its own — until then CI WARNs on them
+# and passes, by design. Both came through the 2026-09-22 `--update` re-record
+# of this file on the maintainer's machine (MpscRing ratio 0.4308; Timer after
+# median 9.5 ms). Timer after is a page-path metric in the TimerWheel x100K
+# class — fresh wheel nodes and payloads first-touch pages as the run grows
+# them — and its median has since read 8.55-14.90 ms across runs: a slow
+# reading is a candidate regression, re-run before believing it (see that
+# metric's note above). Its alloc budget (2.50, measured 2.00) covers the two
+# by-contract allocations — one `Delivery` payload per arm, one wheel node per
+# insert.
+#
 # Where that spread actually comes from, recorded so nobody re-discovers it:
 # `validateModules` logs one `info:` line per call, so the `validateModules x*`
 # and `App lifecycle x1K` harnesses write ~7 MB of logging per sample, into this
@@ -269,6 +315,19 @@
 #     while the medians step between hosts, which is a latency chain reporting the
 #     host's store-to-load-forwarding latency — not noise, and not a fold.
 #
+# Refreshing the CI file without a blanket `--update` (2026-09-22): the check
+# pass writes a merged candidate when `BENCH_UPDATE_MISSING_OUT` names a path —
+# every existing entry verbatim (notes and max_alloc_per_op included), plus
+# entries for metrics the baseline does not know yet and ratios still pending,
+# all measured by *this* run and stamped with `GITHUB_RUN_ID` + the machine
+# line when available (the provenance convention entries in the CI file already
+# carry). ci.yml points it at an artifact upload on the gate step, so a green
+# run on a runner produces a reviewable diff a maintainer downloads and commits
+# — adding newly introduced metrics without re-recording the rest. A red run
+# uploads nothing (its numbers are exactly what must not become the ratchet),
+# and the verdict itself is untouched: this path rewrites nothing already
+# recorded, so it cannot loosen the ratchet the way `--update` would.
+#
 # ── Two criteria, because the old one held the host still too (2026-09-19) ──
 #
 # An absolute millisecond value is a statement about two things at once — the code
@@ -428,6 +487,13 @@ THRESHOLD="${BENCH_THRESHOLD:-2.0}"
 #
 #   * the five atomic-path metrics below spend the turn in a read-modify-write,
 #     which is the host's atomic speed;
+#   * `MpscRing 4P x2M` spends the turn in the same algorithm the mailbox above
+#     wraps — a successful `cmpxchgWeak` on the shared enqueue position plus the
+#     slot's acquire/release pair — so it is gated as a ratio for the mailbox's
+#     own reason. Its four producer cursors are one thread's round-robin (the
+#     gated shape is contention-free on purpose; see `benchMpscRingPush`), so
+#     the cmpxchg is uncontended — but it is still the host's locked-instruction
+#     cost on x86_64, which is exactly what the reference cancels.
 #   * `RingBuffer SPSC x1M` spends the turn in one store→load chain per index —
 #     `tryPush` stores `tail` and `tryPop` loads it back, and the same for `head` —
 #     so it is the host's release/acquire lowering plus its store-to-load-forwarding
@@ -515,6 +581,7 @@ NORMALIZED_METRICS=(
   "Sequencer x10M"
   "1L x10M events"
   "RingBuffer SPSC x1M"
+  "MpscRing 4P x2M"
 )
 
 # Role and reason per declared reference, `<name>=<role>|<reason>`. **Presentation
@@ -670,7 +737,7 @@ echo "machine: $BENCH_MACHINE  |  $(uname -srm)"
 if [ "$REGION" = "?" ]; then
   echo "         region unavailable (no BENCH_REGION, no Azure IMDS answer) — diagnostic only, not a failure"
 fi
-echo "criterion: absolute ms for every metric except ${#NORMALIZED_METRICS[@]} normalized metric(s), a ratio to a reference measured in the same run (both medians of 3; default '$REF_METRIC'). References are reported, never gated: ${REF_METRICS[*]}"
+echo "criterion: absolute ms for every metric except ${#NORMALIZED_METRICS[@]} normalized metric(s), a ratio to a reference measured in the same run (both medians of 3; default '$REF_METRIC'). References are reported, never gated: ${REF_METRICS[*]}. Second criterion: any baseline entry declaring max_alloc_per_op is failed when its run's [alloc] row reads above it."
 echo
 
 echo "building benchmark (ReleaseFast)..."
@@ -770,8 +837,15 @@ for m in cur:
     name, value = m["name"], m["value"]
     prev = old.get(name)
 
+    def keep_budget(entry):
+        # `max_alloc_per_op` is a human-set ratchet (see the header): a
+        # recording run must preserve it verbatim, never re-derive or drop it.
+        if prev is not None and prev.get("max_alloc_per_op") is not None:
+            entry["max_alloc_per_op"] = prev["max_alloc_per_op"]
+        return entry
+
     if name not in normalized:
-        out.append({"name": name, "unit": m.get("unit", "ms"), "value": value})
+        out.append(keep_budget({"name": name, "unit": m.get("unit", "ms"), "value": value}))
         was = prev["value"] if prev is not None and prev.get("normalized_by") is None else None
         if was is not None and was > 0 and value > was * threshold:
             loosened.append((name, was, value, None, None))
@@ -780,12 +854,13 @@ for m in cur:
     ref_name, ref = reference_for(name)
     if ref is None:
         # Keep the recorded ratio (or record the entry as still pending) rather
-        # than downgrading a ratio entry to milliseconds.
+        # than downgrading a ratio entry to milliseconds. Keeping `prev` whole
+        # also keeps whatever budget it carries.
         out.append(prev if prev is not None else {"name": name, "unit": "ratio", "value": None, "normalized_by": ref_name})
         continue
 
     ratio = round(value / ref, 4)
-    out.append({"name": name, "unit": "ratio", "value": ratio, "normalized_by": ref_name})
+    out.append(keep_budget({"name": name, "unit": "ratio", "value": ratio, "normalized_by": ref_name}))
     if prev is not None and prev.get("normalized_by") is None:
         converted.append(name)
     if prev is not None and prev.get("normalized_by") not in (None, ref_name):
@@ -819,6 +894,8 @@ with open(base_path, "w") as fh:
     fh.write("\n")
 
 print(f"baseline updated: {len(old)} -> {len(out)} metric(s) (+{len(added)} / -{len(dropped)})")
+budgeted = sum(1 for e in out if e.get("max_alloc_per_op") is not None)
+print(f"  max_alloc_per_op preserved on {budgeted} entry/entries — a recording run never sets or loosens it; add it by hand for new metrics from the run's [alloc] rows")
 print("  absolute entries are the median of 3 samples per metric (see src/benchmark.zig median3)")
 if normalized:
     print("  ratio entries hold `value` = this run's metric ÷ its reference, both medians of this run:")
@@ -844,7 +921,7 @@ EOF
 fi
 
 python3 - "$THRESHOLD" "$RESULTS" "$BASELINE" "$WORK/bench.log" <<'EOF'
-import json, os, sys
+import json, os, re, sys
 
 threshold = float(sys.argv[1])
 results_path, base_path, log_path = sys.argv[2], sys.argv[3], sys.argv[4]
@@ -870,7 +947,8 @@ if not os.path.exists(base_path):
     sys.exit(2)
 
 cur = json.load(open(results_path))
-base = {m["name"]: m for m in json.load(open(base_path))}
+base_arr = json.load(open(base_path))
+base = {m["name"]: m for m in base_arr}
 seen = set()
 
 # The reference values for this run: every normalized metric is divided by the
@@ -890,18 +968,26 @@ def reference_for(metric):
 
 
 # The suite's `[med3] <name>: min / median / max` lines, so a breach can show the
-# three samples behind the median it compared. Missing log (deleted temp dir,
-# piped run) degrades to no sample lines, never to a crash.
+# three samples behind the median it compared, and its `[alloc]` rows — the
+# second criterion (see the header). Missing log (deleted temp dir, piped run)
+# degrades to no sample lines and no alloc readings, never to a crash.
 samples = {}
+alloc_meas = {}
+ALLOC_LINE = re.compile(r"^\s*\[alloc\] (.+): ([0-9]+(?:\.[0-9]+)?) alloc/op")
 if os.path.exists(log_path):
     with open(log_path, errors="replace") as fh:
         for line in fh:
             entry = line.strip()
-            if not entry.startswith("[med3] "):
+            if entry.startswith("[med3] "):
+                head, _, rest = entry[len("[med3] "):].partition(": ")
+                if rest:
+                    samples[head] = rest
                 continue
-            head, _, rest = entry[len("[med3] "):].partition(": ")
-            if rest:
-                samples[head] = rest
+            hit = ALLOC_LINE.match(entry)
+            if hit:
+                # Metric names contain no colon, so the first colon is the
+                # name/value separator; the note after `alloc/op` is ignored.
+                alloc_meas[hit.group(1)] = float(hit.group(2))
 
 slower, unmeasurable, pending, mismatch, host_notes, retargeted = [], [], [], [], [], []
 ratio_detail = []
@@ -1038,10 +1124,89 @@ for m in cur:
 gone = [n for n in base if n not in seen]
 gated_ratio = [m["name"] for m in cur if m["name"] in normalized]
 
-print(f"machine:  {machine}")
-print(f"criterion: {len(cur) - len(gated_ratio)} metric(s) absolute (median ms) + {len(gated_ratio)} normalized (each metric ÷ its own reference, both medians of this run), threshold {threshold}x on both")
+# ── the second criterion: allocations per op ──
+# A budget is optional per entry; a count is exact (no median, no host wobble),
+# so an alloc breach fails the run outright and the host check below — which
+# exists to excuse a *duration* — is never consulted for it.
+alloc_breach = []
+alloc_unmeasured = []
+for name, entry in base.items():
+    budget = entry.get("max_alloc_per_op")
+    if budget is None:
+        continue
+    measured = alloc_meas.get(name)
+    if measured is None:
+        alloc_unmeasured.append(name)
+        continue
+    if measured > budget:
+        alloc_breach.append((name, budget, measured))
+budgeted = sum(1 for e in base.values() if e.get("max_alloc_per_op") is not None)
 
-print("references — recorded and printed, never gated; a reading on one of these is a candidate")
+# ── the CI-refresh artifact (BENCH_UPDATE_MISSING_OUT) ──
+# The gate run already measured everything, so a green run on a runner can ride
+# along as a merged candidate baseline for a maintainer to review and commit
+# (ci.yml uploads it; see the header). Existing entries are kept **verbatim** —
+# notes and max_alloc_per_op included, nothing already recorded is rewritten —
+# so this path can never loosen the ratchet the way a blanket --update would.
+# Only entries the baseline does not know yet, and ratios still pending a value,
+# are filled from this run. Written before the verdict below on purpose: the
+# upload step runs only on green jobs anyway, and locally the file is a
+# convenience for the same review.
+merge_out = os.environ.get("BENCH_UPDATE_MISSING_OUT")
+if merge_out:
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    prov = f"recorded from run {run_id} ({machine})" if run_id else None
+    cur_by_name = {m["name"]: m for m in cur}
+    merged, added_now, filled = [], [], []
+    for entry in base_arr:
+        name = entry["name"]
+        m = cur_by_name.get(name)
+        # A ratio entry this machine class has not recorded a value for yet:
+        # fill it from this run when the run supplies a usable reference of the
+        # recorded name (the gate's pending WARN above names the same fix).
+        if (m is not None and entry.get("normalized_by") is not None
+                and entry.get("value") is None and name in normalized
+                and normalized[name] == entry["normalized_by"]):
+            _ref_name, ref = reference_for(name)
+            if ref is not None:
+                e = dict(entry)
+                e["value"] = round(m["value"] / ref, 4)
+                if prov:
+                    e["note"] = prov
+                merged.append(e)
+                filled.append(name)
+                continue
+        merged.append(entry)
+    for m in cur:
+        name = m["name"]
+        if name in base:
+            continue
+        if name in normalized:
+            # The gate list gates it as a ratio: record a ratio, or leave the
+            # entry pending when this run produced no usable reference.
+            ref_name, ref = reference_for(name)
+            e = {"name": name, "unit": "ratio",
+                 "value": (round(m["value"] / ref, 4) if ref is not None else None),
+                 "normalized_by": ref_name}
+        else:
+            e = {"name": name, "unit": m.get("unit", "ms"), "value": m["value"]}
+        if prov:
+            e["note"] = prov
+        merged.append(e)
+        added_now.append(name)
+    with open(merge_out, "w") as fh:
+        json.dump(merged, fh, indent=2)
+        fh.write("\n")
+    print(f"ci-refresh artifact: {merge_out} <- {len(merged)} entry/ies "
+          f"({len(added_now)} added, {len(filled)} pending filled)"
+          + (f": {', '.join(added_now + filled)}" if added_now or filled else " — nothing new"))
+
+print(f"machine:  {machine}")
+print(f"criterion: {len(cur) - len(gated_ratio)} metric(s) absolute (median ms) + {len(gated_ratio)} normalized (each metric ÷ its own reference, both medians of this run), threshold {threshold}x on both; {budgeted} baseline entry/entries carry a max_alloc_per_op budget, judged on this run's [alloc] rows")
+
+print("references — recorded and printed, never gated on duration; a baseline budget on one is")
+print("  still judged on its [alloc] row, because a count is host-independent, unlike these numbers:")
+print("  a reading on one of these is a candidate")
 print("  fallback (re-run before changing anything), not something to ignore:")
 for ref_name, detail, tag, role, divides, _key, _factor in reference_rows:
     print(f"  RE-RUN-BEFORE-FIX  {ref_name:<28s} {detail:<34s} {tag:<10s} ({role}; {divides})")
@@ -1100,6 +1265,17 @@ if slower:
         print("      and neither can this failure — the reference line is part of the evidence (--explain).")
     print("Fix the regression, or accept it explicitly with: scripts/check-bench.sh --update --force")
 
+if alloc_breach:
+    print(f"FAIL: {len(alloc_breach)} metric(s) over their max_alloc_per_op budget (counted exactly — this is not")
+    print("  host noise, and re-running is not the answer):")
+    for name, budget, measured in alloc_breach:
+        print(f"  [alloc] {name}: budget {budget:.2f} alloc/op → measured {measured:.2f} alloc/op")
+    print("  an alloc breach means the timed path grew an allocation; the counting-allocator")
+    print("  mirror of the harness is in src/benchmark.zig (the [alloc] section), and the")
+    print("  exact per-path contract is asserted in src/runtime/alloc_contract_test.zig.")
+    print("  Fix the allocation, or raise the budget in scripts/bench-baseline.json only")
+    print("  when the new allocation is deliberate — it is a ratchet, not a snapshot.")
+
 if host_notes:
     print(f"NOTE: a machine reference is more than {threshold}x away from its recorded value (host generation, not code):")
     for line in host_notes:
@@ -1127,9 +1303,15 @@ if retargeted:
     print("      (a ratio to another reference is a different unit; re-record it with --update on this machine class)")
 if unmeasurable:
     print(f"WARN: no comparison possible for {', '.join(unmeasurable)} — skipped, nothing to compare against")
+if alloc_unmeasured:
+    print(f"WARN: {len(alloc_unmeasured)} alloc budget(s) had no [alloc] row in this run's log — skipped, not judged:")
+    for name in alloc_unmeasured:
+        print(f"      {name}")
 
-if not slower:
-    print(f"OK: {len(cur)} metric(s) within {threshold}x of the baseline (each a median of 3 samples).")
+if not slower and not alloc_breach:
+    print(f"OK: {len(cur)} metric(s) within {threshold}x of the baseline (each a median of 3 samples);"
+          f" {budgeted - len(alloc_unmeasured)} of {budgeted} alloc budget(s) held"
+          + (f", {len(alloc_unmeasured)} unmeasured (WARN above)" if alloc_unmeasured else "") + ".")
 
-sys.exit(1 if slower else 0)
+sys.exit(1 if slower or alloc_breach else 0)
 EOF

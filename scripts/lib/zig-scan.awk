@@ -8,6 +8,14 @@
 #       as "<lineno>\t<shaped line>". Skips `zig_skip()` lines: prose and
 #       comment-only lines too, because a `// catch {}` in a comment is not a
 #       violation.
+#   awk -v mode=entropy -f scripts/lib/zig-scan.awk <file>
+#       scripts/check-production.sh — one line per banned entropy source:
+#       `std.Io.random(` (falls back to pid+wall-clock+ASLR when it fails, which
+#       is exactly the class AGENTS.md "CSPRNG" bans) and `std.crypto.random`
+#       (not declared by this toolchain at all). `std.Io.randomSecure(` is the
+#       sanctioned form and is stripped before the test, so it never matches.
+#       Comment-only and string-literal text is already gone via zig_skip(),
+#       which is why a `// never use std.Io.random(` in prose is not a hit.
 #   awk -v mode=at-test -v want=<lineno> -f scripts/lib/zig-scan.awk <file>
 #       scripts/check-version.sh — prints "test" when line <lineno> is inside a
 #       `test` block (or opens one), "keep" when it is real code, "missing" when
@@ -126,6 +134,18 @@ function zig_skip(raw) {
   return zig_in_test(raw)
 }
 
+# 1 when `s` names a banned entropy source. `std.Io.randomSecure` is removed
+# first so the sanctioned spelling can never trip the `std.Io.random` test —
+# awk has no lookahead, and stripping the good form is the portable equivalent.
+function weak_entropy(s,   t, i) {
+  t = s
+  while ((i = index(t, "std.Io.randomSecure")) > 0)
+    t = substr(t, 1, i - 1) substr(t, i + 19)
+  if (index(t, "std.Io.random") != 0) return 1
+  if (index(t, "std.crypto.random") != 0) return 1
+  return 0
+}
+
 BEGIN { in_test = 0; depth = 0; kw = 0; open = 0; seen = 0 }
 {
   raw = $0
@@ -135,6 +155,10 @@ BEGIN { in_test = 0; depth = 0; kw = 0; open = 0; seen = 0 }
     next
   }
   if (zig_skip(raw)) next
+  if (mode == "entropy") {
+    if (weak_entropy(code)) print NR "\t" rtrim(ltrim(code))
+    next
+  }
   # mode == "catch": resolve a `catch` whose body starts on an earlier line.
   if (kw > 0) {
     k = body_kind(code)

@@ -250,13 +250,13 @@ pub const PluginManifest = struct {
     };
 };
 
-// No "load and unload plugin" test: `unloadPlugin` frees the map key
-// (`entry.name`, line 123) *before* `self.plugins.remove(name)` (line 127), so
-// the lookup runs on freed memory and never matches — observed as
-// `isPluginLoaded("test_plugin") == false` while `getPluginCount() == 1`
-// (the allocator's free-list pointer overwrites the key bytes). Asserting a
-// clean unload therefore requires fixing that ordering (remove before free),
-// which is a production change. The test body is in git history.
+// Historical: `unloadPlugin` used to free the map key (`entry.name`) *before*
+// `self.plugins.remove(name)`, so `remove` hashed freed memory and never
+// matched — the entry leaked permanently (`isPluginLoaded("x") == false` while
+// `getPluginCount() == 1`; the allocator's free-list pointer overwrote the key
+// bytes). Fixed by taking the owned slices out first, then remove, then free
+// (see `unloadPlugin` above; shipped in v0.33.0). The "load and unload plugin"
+// round-trip test was never reinstated — its body is in git history.
 
 test "PluginManager enable and disable plugin" {
     const allocator = std.testing.allocator;

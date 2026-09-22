@@ -74,6 +74,20 @@
 //! being torn down (see `shutdown`). Workers that never return still block
 //! shutdown: that is deliberate — a runtime that silently abandons threads hides
 //! the bug.
+//!
+//! STRUCTURE:
+//!   §1  Re-exports, spawn config & TraceId —— Clock/Wheel/Mailbox/Scheduler/DeliveryLog · SpawnMode · StopPolicy · SpawnConfig · poolable
+//!   §2  Timer wheel hand-off —— TimerAction · timer_command_capacity · TimerCommand
+//!   §3  Supervision & stats —— Supervision · GroupPolicy/Group/Intensity · WorkerStats · RuntimeStats
+//!   §4  Handle & WorkerContext —— Handle(W, capacity) · WorkerContext(W, capacity)
+//!   §5  Runtime —— init/shutdown · spawn/stop · timers · metrics · MetricsBridge
+//!   §6  Worker thread & supervision plumbing —— stopThunk · workerMain · deliver · pooledDispatch · supervise · rebuildWorker
+//!   §7  Tests —— runtime / actor / pooled / trace / replay / supervision contracts
+//!
+//! Every section carries a matching `// ==== §N ... ====` anchor — `grep "==== §5"`
+//! jumps there. §N *with* the `====` prefix is a section of this file; a bare `§N`
+//! is `docs/RUNTIME.md`, and every reference of that kind below spells the file out
+//! (`docs/RUNTIME.md §5`) so the two numberings can never be confused.
 
 const std = @import("std");
 const mbox = @import("mailbox.zig");
@@ -84,6 +98,8 @@ const sequencer_mod = @import("sequencer.zig");
 const scheduler_mod = @import("scheduler.zig");
 const recorder_mod = @import("recorder.zig");
 const supervisor_mod = @import("supervisor.zig");
+
+// ==== §1  Re-exports, spawn config & TraceId ====
 
 pub const Clock = clock_mod.Clock;
 pub const Wheel = wheel_mod.Wheel;
@@ -171,7 +187,7 @@ pub const ExecutionClass = enum {
 pub const StopPolicy = enum {
     /// The worker stops now. Whatever is still in the mailbox is counted as
     /// abandoned (`WorkerStats.discarded_on_stop`,
-    /// `RuntimeStats.messages_discarded_on_stop`) and never handled — §5's "a
+    /// `RuntimeStats.messages_discarded_on_stop`) and never handled — docs/RUNTIME.md §5's "a
     /// drop has to be visible" applies to work that was accepted and then
     /// abandoned by a stop.
     immediate,
@@ -284,6 +300,8 @@ pub fn poolable(comptime W: type) bool {
 /// runtime-local one.
 pub const TraceId = @import("../tracing/DistributedTracer.zig").DistributedTracer.TraceId;
 
+// ==== §2  Timer wheel hand-off ====
+
 /// Deferred work handed to the timer wheel. Type-erased so one wheel serves
 /// workers with different message types; the runtime owns `ctx` and releases it
 /// exactly once — on fire, on cancel, at shutdown (a timer that never fires is
@@ -336,6 +354,8 @@ const TimerCommand = union(enum) {
         result: ?*std.atomic.Value(bool) = null,
     },
 };
+
+// ==== §3  Supervision & stats ====
 
 /// How the runtime reacts to an error a worker's `handle`/`run` returned.
 ///
@@ -471,6 +491,8 @@ pub const RuntimeStats = struct {
     /// Worst lateness observed between a timer's deadline and its firing.
     timer_lag_max_ms: i64,
 };
+
+// ==== §4  Handle & WorkerContext ====
 
 /// A runtime-owned worker. `*Handle(W, capacity)` is what `spawn` returns; the
 /// type-erased `WorkerHandle` view is what the runtime keeps for shutdown.
@@ -641,7 +663,7 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         /// readiness is its thread parked in `recv`, a pooled worker's is a token
         /// in the ready ring. Signature and backpressure are unchanged — a full
         /// mailbox still comes back as `error.Full` from `send`, before this
-        /// line, and nothing here allocates (§4's zero-allocation contract).
+        /// line, and nothing here allocates (docs/RUNTIME.md §4's zero-allocation contract).
         fn announceReady(self: *Self) void {
             const item = self.pool orelse return; // `.dedicated`: the mailbox signal is the whole story
             scheduler_mod.announce(item);
@@ -751,7 +773,7 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         /// returned (dedicated, or a `.pooled` worker stopped under
         /// `.stop_policy = .immediate`), or the pool that would have dispatched it
         /// has (`Runtime.shutdown`'s teardown). Nobody is going to handle those
-        /// messages, so the least this can do is leave a number (§5's rule), on
+        /// messages, so the least this can do is leave a number (docs/RUNTIME.md §5's rule), on
         /// the worker *and* on the runtime — the handle is destroyed by the very
         /// `shutdown` that abandoned them, so a per-worker counter alone would be
         /// unreadable exactly when it matters.
@@ -947,6 +969,8 @@ pub fn WorkerContext(comptime W: type, comptime capacity: usize) type {
         // single-threaded state ownership.
     };
 }
+
+// ==== §5  Runtime ====
 
 pub const Runtime = struct {
     const Self = @This();
@@ -1262,7 +1286,7 @@ pub const Runtime = struct {
         // Then the pools: either can be running a worker whose handle the lines
         // below are about to free. `Scheduler.shutdown` waits for the batch in
         // flight to finish (a worker that never returns still blocks shutdown —
-        // §4's rule, kept).
+        // docs/RUNTIME.md §4's rule, kept).
         //
         // Both are stopped before the assertion that follows, because a worker's
         // class decides *which* pool holds its claim and the check below is about
@@ -1444,7 +1468,7 @@ pub const Runtime = struct {
         // capacity is comptime by construction: the ring is a fixed array of the
         // worker's own `Message`.
         const track_capacity: ?usize = comptime if (spawn_config.record) |spec| spec.capacity else null;
-        // A `run`-owned worker has no `Message` to record (§3's contract: the
+        // A `run`-owned worker has no `Message` to record (docs/RUNTIME.md §3's contract: the
         // runtime hands it nothing), so `.record` on one is a wiring mistake
         // rather than a track that would sit empty and look like a quiet worker.
         if (comptime (track_capacity != null and !@hasDecl(W, "Message"))) @compileError(
@@ -2118,6 +2142,8 @@ pub const Runtime = struct {
     }
 };
 
+// ==== §6  Worker thread & supervision plumbing ====
+
 /// The thread body. Comptime-specialised per worker type, so the `handle`/`run`
 /// call the compiler generates is a direct call — no dispatch, no vtable.
 /// `Handle(W, cap).stop()`, type-erased — what a supervision group calls to take
@@ -2328,7 +2354,7 @@ fn pooledDispatch(comptime W: type, comptime H: type) *const fn (*anyopaque, usi
         fn run(ctx: *anyopaque, max: usize) bool {
             const handle: *H = @ptrCast(@alignCast(ctx));
 
-            // §4's owner contract, pooled flavour: *this* thread owns the worker
+            // docs/RUNTIME.md §4's owner contract, pooled flavour: *this* thread owns the worker
             // while it runs it. That is the answer `Handle.after`'s trace
             // inheritance needs ("am I the worker's thread?"), and 0 afterwards
             // says "no message is being handled here" — the same reading a
@@ -2567,9 +2593,7 @@ fn traceTag(trace: ?TraceId, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, " trace={x:016}{x:016}", .{ t.high, t.low }) catch "";
 }
 
-// ─────────────────────────────────────────────────
-// Tests
-// ─────────────────────────────────────────────────
+// ==== §7  Tests ====
 
 const CounterWorker = struct {
     pub const Message = u32;
@@ -2761,7 +2785,7 @@ test "Runtime: after(delay) never fires early and lands on the first tick at or 
 
 // ── a timer that fired and whose message could not be handed over ─────────
 //
-// The drop counter §5's list was missing: the timer *did* fire (`timer_fires`
+// The drop counter in docs/RUNTIME.md §5's list was missing: the timer *did* fire (`timer_fires`
 // moved), and the mailbox refused the message anyway. Not a producer being
 // refused (`messages_dropped`): there was no producer. Not a message abandoned
 // by a stop (`messages_discarded_on_stop`): nothing was ever accepted. Not a

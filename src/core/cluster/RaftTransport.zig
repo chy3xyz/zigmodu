@@ -502,9 +502,16 @@ pub const AddressBook = struct {
 /// The impl must outlive the `RaftElection` it is given (the raft keeps a
 /// pointer into it) and must not move after `init`.
 pub fn TransportImpl(comptime slot: usize) type {
-    _ = slot; // Distinct statics per instantiation; the value itself is unused.
     return struct {
         const Self = @This();
+
+        /// Load-bearing: with `slot` unreferenced, this Zig build memoizes
+        /// the generic into ONE type for every slot (measured: `Impl(0) ==
+        /// Impl(2)` at comptime), collapsing the per-slot `bound` static
+        /// into a single variable the last `init` wins — every in-process
+        /// node then dispatches through one node's transport. Referencing
+        /// the parameter in the type body keeps instantiations distinct.
+        pub const slot_id: usize = slot;
 
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -855,6 +862,17 @@ pub const InboundServer = struct {
 const testing = std.testing;
 const Time = @import("../Time.zig");
 
+test "TransportImpl keeps distinct statics per slot" {
+    // Regression guard for the comptime-generic memoization trap: on this Zig
+    // build a `fn(comptime slot: usize) type` whose body never references
+    // `slot` collapses into ONE type for every slot (measured: Impl(0) ==
+    // Impl(2)), merging the per-slot `bound` static so the last `init` wins
+    // and every node dispatches through one node's transport. The `slot_id`
+    // decl in the type body keeps instantiations distinct (same fix as
+    // src/soak_cluster.zig's SoakTransport).
+    try testing.expect(TransportImpl(0) != TransportImpl(2));
+}
+
 test "wire format round-trips every Raft RPC" {
     const allocator = testing.allocator;
     var out = std.ArrayList(u8).empty;
@@ -994,6 +1012,98 @@ test "an append_entries frame above the decode cap is dropped without allocating
     }
     try testing.expectEqual(@as(usize, MAX_ENTRIES_PER_FRAME), decoded.entries.len);
     try testing.expectEqual(@as(u64, MAX_ENTRIES_PER_FRAME), decoded.entries[MAX_ENTRIES_PER_FRAME - 1].index);
+}
+
+// ── Fuzz: decoders only error or succeed ────────────────────────────────────
+//
+// `decode*` is the parse surface an unauthenticated peer reaches first
+// (verification is HMAC, but a bare-mode cluster and any post-MAC byte are both
+// attacker-controlled here), so it has to survive arbitrary bytes: every outcome
+// is a value or a `DecodeError`, never a panic/UB. Runs under `zig build --fuzz`
+// against generated inputs; a plain `zig build test` replays the corpus seeds.
+
+/// One seed per RPC kind, built with the real encoders so the corpus starts on
+/// the success path instead of hoping mutation finds it.
+fn fuzzSeedFrames(allocator: std.mem.Allocator) ![][]const u8 {
+    var seeds = std.ArrayList([]const u8).empty;
+    errdefer {
+        for (seeds.items) |s| allocator.free(s);
+        seeds.deinit(allocator);
+    }
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+
+    out.clearRetainingCapacity();
+    try encodeVoteRequest(&out, allocator, .{ .term = 7, .candidate_id = "node-a", .last_log_index = 3, .last_log_term = 2 });
+    try seeds.append(allocator, try out.toOwnedSlice(allocator));
+
+    out.clearRetainingCapacity();
+    try encodeVoteResponse(&out, allocator, .{ .term = 7, .vote_granted = true }, "node-b");
+    try seeds.append(allocator, try out.toOwnedSlice(allocator));
+
+    out.clearRetainingCapacity();
+    const entries = [_]LogEntry{.{ .term = 2, .index = 1, .command = "set x" }};
+    try encodeAppendEntries(&out, allocator, .{ .term = 7, .leader_id = "node-a", .prev_log_index = 0, .prev_log_term = 0, .entries = &entries, .leader_commit = 1 });
+    try seeds.append(allocator, try out.toOwnedSlice(allocator));
+
+    out.clearRetainingCapacity();
+    // The hostile shape from the test above: a count of 65535 and no entries.
+    try putU8(&out, allocator, @backingInt(MessageTag.append_entries));
+    try putU64(&out, allocator, 7);
+    try putStr(&out, allocator, "leader1");
+    try putU64(&out, allocator, 0);
+    try putU64(&out, allocator, 0);
+    try putU64(&out, allocator, 0);
+    try putU16(&out, allocator, 65535);
+    try seeds.append(allocator, try out.toOwnedSlice(allocator));
+
+    out.clearRetainingCapacity();
+    try encodeAppendEntriesResponse(&out, allocator, .{ .term = 8, .success = false, .match_index = 4 });
+    try seeds.append(allocator, try out.toOwnedSlice(allocator));
+
+    out.clearRetainingCapacity();
+    try encodeInstallSnapshot(&out, allocator, .{ .term = 9, .leader_id = "node-a", .last_included_index = 12, .last_included_term = 8, .offset = 0, .data = "snapshot-bytes", .done = true });
+    try seeds.append(allocator, try out.toOwnedSlice(allocator));
+
+    out.clearRetainingCapacity();
+    try encodeInstallSnapshotResponse(&out, allocator, .{ .term = 9 });
+    try seeds.append(allocator, try out.toOwnedSlice(allocator));
+
+    return seeds.toOwnedSlice(allocator);
+}
+
+fn fuzzDecodeFrame(_: void, smith: *std.testing.Smith) !void {
+    var frame: [4096]u8 = undefined;
+    smith.bytes(&frame);
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Retry each tag on the same bytes: arbitrary first bytes rarely land on a
+    // valid one, and a fuzz run that only ever reaches `payloadOf`'s rejection
+    // would leave the decode bodies uncovered.
+    for (@backingInt(MessageTag.vote_request)..@backingInt(MessageTag.install_snapshot_response) + 1) |t| {
+        frame[0] = @intCast(t);
+        // Any outcome — value or `DecodeError` — is a pass; crashing is not.
+        _ = decodeVoteRequest(a, &frame) catch continue;
+        _ = decodeVoteResponse(a, &frame) catch continue;
+        _ = decodeAppendEntries(a, &frame) catch continue;
+        _ = decodeAppendEntriesResponse(&frame) catch continue;
+        _ = decodeInstallSnapshot(a, &frame) catch continue;
+        _ = decodeInstallSnapshotResponse(&frame) catch continue;
+    }
+}
+
+test "fuzz: frame decoders only error or succeed on arbitrary bytes" {
+    const allocator = testing.allocator;
+    const seeds = try fuzzSeedFrames(allocator);
+    defer {
+        for (seeds) |s| allocator.free(s);
+        allocator.free(seeds);
+    }
+    try std.testing.fuzz({}, fuzzDecodeFrame, .{ .corpus = seeds });
 }
 
 // ── Frame authentication tests ──────────────────────────────────────────────

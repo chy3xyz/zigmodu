@@ -2,6 +2,344 @@
 
 ## [Unreleased]
 
+### 新增审计规则 b24（弱熵源）+ 修掉它抓出的 `DistributedLock` 缺陷（**破坏性：否**）
+
+- **规则**：`zmodu audit` 新增 b24——`std.Io.random` / `std.crypto.random` 是禁用熵源
+  （前者失败会回落到 pid + 墙钟 + ASLR，正是 AGENTS.md「CSPRNG」那条禁的缺陷类；
+  后者本工具链根本没声明）。合规写法是 `std.Io.randomSecure(io, buf)`。b24 只扫
+  `src/modules/**`（应用代码），框架自身的 `src/` 由 `check-production.sh` 新加的
+  第三趟扫描兜底——**不分 ratchet 层、一个命中即 exit 1**。
+- **它抓出的真缺陷**：`src/core/DistributedLock.zig` 用 `std.Io.random(io, &seed)`
+  生成锁 owner id。弱熵 ⇒ 两个副本可能算出**同一个 owner** ⇒ 双方都通过
+  `SELECT owner` 的"可重入"判定进入临界区，而 `release` 是
+  `DELETE … WHERE name = ? AND owner = ?`，于是**一个副本会释放另一个的锁**。
+  改用 `randomSecure`（`init` 已是 `!Self`，全部调用点已 `try`）。
+- 验证：把 HEAD 版该文件放回同结构仓库跑同一脚本 → `check-production: banned entropy
+  source … :105` exit 1；当前树 exit 0。`audit.zig` 单测 12/12；`SqlLock` 用例 3 通过
+  1 跳过（跳过的是 PG 门控用例）。
+- 门禁口径差异（已写进 AGENTS.md 与 BEST_PRACTICES）：b10 的豁免是**整行子串匹配**，
+  而 `zig build check` 的 hot-path catch 扫描**不豁免 `errdefer`/`rollback`/`sendError`、
+  也没有 ignore 标记**——照 b10 的豁免写法写在生产代码里会红 CI。
+
+### 表名标识符闸门接到 ai / web4 的 SQL 入口（**破坏性：否**）
+
+`src/ai/approval_store.zig`、`src/ai/run_audit.zig`、`src/web4/x402_store.zig` 的每个
+会拼接表名的 SQL 入口（`migrate`/`push`/`listPending`/`resolve`/`count`/`record`/`list`/
+`create`/`redeem`）在函数首行过 `sqlx.validateIdentifier`；`src/ai/business.zig` 的
+`isValidIdentifier` / `isPlainIdentifier` 收窄为它的严格子集（`[A-Za-z_][A-Za-z0-9_.]*`、
+≤128；`isPlainIdentifier` 另拒 `.`）。这不是装饰性校验：`Client.exec` 本身不校验，
+PG 无参路径走 `PQexec`（libpq 简单查询会执行整串多语句），所以表名里带 `; DROP …`
+在 Postgres 上是真能落地的。错误名仍为 `error.UnsafeSqlIdentifier`（`business.zig`）
+/ `error.InvalidSqlIdentifier`（新闸门），调用方全是推断错误集、无需改动。
+
+验证：三个模块的新测试断言每个入口都返回 `error.InvalidSqlIdentifier`；全量
+`-Ddb=all` 通过；反例侧已核「闸门非摆设、入口无遗漏、默认表名不误拒、无泄漏」。
+
+### `docs/dev/README.md`：内部文档索引（**破坏性：否**）
+
+给 `docs/dev/` 的 22 份评审/评估/路线草稿加了索引：哪些仍生效、哪份被哪份取代、
+哪些路径被源码按字面引用（不能改）。`docs/README.md` 已链接它——**提交时必须同时
+`git add`，否则干净 clone 里是断链**。
+
+
+### DLQ 自身无锁：并发 `push` / `purgeExpired` / `requeue` 是纯竞态（**破坏性：否**，行为修复）
+
+失败路径最终汇入的 DLQ 一直是**裸 `ArrayList`**，而后台 retry fiber 每秒 `purgeExpired`
++ `requeue`（回调又会经 `publish → fanOut → 失败 → push` 重入队列），业务线程同时在
+`push`——三方共碰同一个 list。**红是 100% 复现**：并发 push + retry 10/10
+`Segmentation fault at address 0xaa…`（栈 `purgeExpired → Allocator.free`，free 到已
+poison 的指针）；并发 push 淘汰上限 10/10 `panic: remap after remap`（append 撕裂 list
+元数据）；另有一条私有副本契约测试确定性失败（`expected 0, found 8`——调度出去的
+slice 指针就是队列内的原 slice）。
+
+修法：DLQ 内加 `SpinLock`（沿用仓库既有 `core.SpinLock`；九个入口全是 io-free，换
+`std.Io.Mutex` 需要先给全部入口加 `io` 参数、属 API break，未做）；`push` 的长度判断
++ 淘汰 + append 收进同一临界区；`requeue` 在锁内**只取一条并把它 dupe 成私有副本**，
+**解锁后**才调回调；`stats` 不再内部调 `size()`（会二次加锁自死锁）；日志与
+`freeEntry` 移到锁外。**回调必须锁外**在模块头文档化——回调路径会经 `fanOut` 取
+`nodes_lock`，持 DLQ 锁调用就是自死锁 + 跨线程 ABBA。
+
+验证：新并发测试（账目守恒 `pushed - purged == size`、每 id dispatch ≤ `max_retries`、
+淘汰后 `size == max_size`）修复后 10/10 绿、整文件 3 轮全绿；`zig build check` OK。
+
+### 总线节点注册表：同 id 并发 connect 双记录、`deinit` 无锁拆除、遍历期被 realloc（**破坏性：否**，三处并发修复 + 一个新 API）
+
+注册表上一轮拿了 `nodes_lock`，但还有三个窗口：
+
+**① 查重与 dial 之间的窗口**：dial 前扫到"没有这个 id"、dial 之后才登记，四个并发
+caller 会各建一条记录（各带自己的 `write_lock`，per-node 串行化前提被破坏）。改为
+「锁内占位（`reserveNode`，带 reservation token）→ 锁外 dial → 锁内按 token 裁决
+（`settleConnect`）」；已有条目（连上的或别人正在 dial 的）直接返回不拨号。**红是
+确定性的**：回滚后 `expected 1, found 4`（连跑两次同结果），第二条测试
+`expected 1, found 0`。
+
+**② `deinit` 无锁顺序拆除**：新增 `tearDownRegistry`（锁内整表摘下，出锁后逐条
+`destroyNode`），锁取不到时**选择泄漏而不是二次释放**并记 error。**红**：测试握着
+`nodes_lock` 断言拆除线程 200ms 后仍未结束，回滚后 `FAIL (RegistryTornDownUnderItsLock)`。
+
+**③ `getConnectedNodes()` 无锁交出内部数组**，而 gossip 线程的 `connectToNode`
+（append realloc）/`disconnectNode`（take+destroy）会移动/释放它——任何"边走边用"
+的调用方都在读悬垂内存。新增 `snapshotNodes(allocator) !NodeSnapshot`：锁内整份拷贝
+（`id`/`address`/`connected`/`send_failures`），元素归调用方、`deinit()` 释放，锁内
+不做 I/O/回调/free（**不选锁内 visitor**：`fanOut` 已证明锁内跑回调会 park 整个注册表，
+且 `Io.Mutex` 不可重入，回调再进 bus 就是自死锁）。**红是确定性的**：用旧 API 压力
+测试 → `Segmentation fault at address 0xaaaaaaaaaaaaaaaa`（testing allocator 的
+已释放填充值），即读到了被 take/realloc 的条目。`getConnectedNodes()` 保留但文档改成
+醒目的「不安全、仅调用方自保独占时可用」，`docs/API.md` 同步。
+
+**④ 顺带修掉一条既存缺陷**：`connectToNode` 的 outbound 握手没有 `authEnabled()`
+守卫，于是**一个凭据都没配**的 dev/单机集群里，每条成功 dial 都被
+`bindOutbound` 以 `PeerKeyMissing` 丢弃——"只能收不能连"，且 `sendEventFrame` 的裸帧
+分支永远不可达（与同一函数 dial 前的守卫、与 `cluster-identity-design.md` §5 的格
+自相矛盾）。改为与入站侧逐字对称的 `if (authEnabled())`；**有凭据路径一条未放宽**
+（dial 前拒绝、握手不应答/MAC 不对仍关连接，均有测试）。**红**：`warn … refused the
+handshake: error.PeerKeyMissing` + 断言 `socket != null` 失败。
+
+验证：`DistributedEventBus` 44/44、`ClusterMembership` 11/11、
+`DistributedIntegrationTest` 11/11；`zig build check` OK；`zig build soak-cluster`
+18/18 流全量、**0 leaked**（约 470 次快照取用，漏一个 `deinit` 就会被抓）。
+soak harness 已迁到 `snapshotNodes`（每处 `defer snap.deinit()`，快照失败计入
+`harness_internal_failures` 而不是被当成"没有 peer"）。锁序仍为
+`nodes_lock → Node.write_lock`，另有既存的 `nodes_lock → DLQ.lock`（反向由 DLQ
+在锁外调回调避免）。
+
+**既知遗留**：`getNodeCount()` 仍是无锁"移动中的数字"（不暴露指针，最坏是过期计数）；
+`deinit` 与"另一线程仍在 bus 内"并存仍是契约违规（其余字段无锁且结尾 `self.* = undefined`）；
+混配集群（我方无凭据、对端有凭据）按硬切不支持处理，表现为对端关连接 → `send_failures`
+涨到阈值进 DLQ。
+
+### 总线三条并发遗留：并发断连 double-free、出站无发送超时、`send_failures` 丢计数（**破坏性：否**，行为修复 + 一处 API 形状微调）
+
+上一轮把 per-connection 写路径收敛成了「同一 fd 只关一次」的漏斗，但节点注册表本身还在裸奔。三条一起来：
+
+**① 并发断连同一节点会 double-free**（`self.nodes` 的 `free(id)` + `swapRemove` 无锁）。
+容器元素改为堆分配 `*Node`（条目地址稳定，摘除不再搬动邻居，也不让在途写者持有的
+`write_lock` 变成另一份拷贝里的另一把锁——FIX2b 的保证因此保住），新增 `nodes_lock`，
+固定锁序 **`nodes_lock` → `Node.write_lock`**；新增 `takeNode`（锁内摘除哈希环与条目，
+交给唯一调用者）/`destroyNode`（**锁外** close+free），`disconnectNode` 只做
+take→log→destroy。所有遍历（`fanOut`/`sendHeartbeat`/`setPartitioner`/connect 查重）
+进临界区，顺带修掉 `disconnectNode` 里「先 free 再用 id 做哈希查找」与日志行 UAF。
+**红→绿**：把 `disconnectNode` 还原成旧形状 → `panic: double free of … len 3`（"dup"，
+即 node.id），恢复后 16 轮 × 8 线程并发断连测试稳定绿（断言节点表最终为空、重复断连
+为 no-op）。
+
+**② 出站 socket 没有发送超时**，teardown 会等写锁 ⇒ 对端既不收也不关就能把
+`disconnectNode`/`deinit` 一起拖住。新增 `outbound_send_timeout_ms`（默认 5s，
+`applySendTimeout` 镜像 `applyRecvTimeout` 的「失败只 warn」），并**必须同步**把
+`sendEventFrame` 的写从 std writer 换成 `sockread.writeFull`——因为 `SO_SNDTIMEO`
+到期返回 `EAGAIN`，而 `std.Io.Threaded.netWritePosix` 把它判成 OS bug（Debug 直接
+panic）；`writeFull` 映射成 `error.WriteTimeout`，正好落进既有失败路径
+（计数→跨阈值 DLQ→隔离）。**红→绿**：还原成 std writer → `panic: programmer bug
+caused syscall error: AGAIN`；换回后新测试（对端不读、256KiB 帧、200ms 界）3s 内
+返回 `WriteTimeout`。
+
+**③ `send_failures` 非原子 + DLQ 重复入队**：改成 `@atomicRmw`，并用其**返回值**做
+一次性转移凭据（只有把计数从 `max-1` 推到 `max` 的那次返回 true）——此前每个
+≥ 阈值的线程都会推一次 DLQ 并各关一次 socket。**红→绿**：旧形状下 200 次并发失败
+只记到 182 次（丢 18），恢复后断言计数恰好 200、crossing 恰好 1。
+
+验证：`DistributedEventBus` 全文件 **37/37** 通过（会话内 3 次稳定）；`zig build
+check` OK；`zig build soak-cluster` 端到端 **1 通过 / 零丢帧**（18 条 (dest,src,writer)
+流全 2400/2400，leader 在位 100%，fd 23→23），耗时 1m21s 与改动前相当——扇出串行化
+（见下）没有伤到吞吐。
+
+**知悉的权衡与 API 形状**：`fanOut` 持 `nodes_lock` 跨越阻塞写，所以同一 bus 的
+publish 扇出现在互相串行、connect/disconnect 会等一次扇出（有 5s 发送超时兜底）；
+要收窄需 per-node 认领/引用计数或 hazard pointer。`getConnectedNodes()` 返回类型变为
+`[]const *Node`，`connectToNode` 错误集新增 `error.NodeRegistryLockUnavailable`
+（仅取消时出现）；仓内无 src 之外的调用方，soak 与全部测试已适配。
+**仍未修（不在本文件）**：`DLQ.zig` 自身 `entries` 无锁（并发 purge/requeue 仍纯竞态）；
+`deinit` 仍依赖 stop 后单线程；`connectToNode` 查重与 dial 之间仍有同 id 双记录窗口。
+
+### 总线 teardown 收敛到单一漏斗：断连与写入曾可并发关同一个 fd（**破坏性：否**，行为修复）
+
+上一条修的是「盖章在锁外」导致的**静默丢帧**，但 teardown 侧还有第二条同族缺陷：
+`recordSendFailure` / `disconnectNode` / `deinit` 关 socket 时**不取 per-connection
+写锁**，而且 `recordSendFailure` 用的是 `sendToNode` 早先读到的 **handle 快照**。于是
+两个并发失败者会对同一 fd 关两次（第二次若 fd 已被复用就静默偷走别人的 fd），
+`disconnectNode` 更能在 `sendFramed` 正持锁 `writeAll` 时把 fd 关掉。
+
+**这次有确定性红**：8 线程并发 `sendToNode` + 死 peer + `max_send_failures=1`
+→ **3/3** `panic: programmer bug caused syscall error: BADF`
+（`netWritePosix ← drain ← sendEventFrame ← sendFramed ← sendToNode`，
+`process terminated with signal ABRT`）——某线程正在写、另一线程把 fd 关了。
+
+修法：新增 `takeNodeSocket`（锁内取 handle → 置 `node.socket = null` → 解锁返回）与
+`closeNodeSocket`（拿到 handle 的那个调用者**在解锁之后**才 close），所有 teardown
+路径经此漏斗；`sendToNode` 只保留 `node.socket != null` 的只读判断，`recordSendFailure`
+不再接收 handle 快照。同一 fd 只有一个所有者，且关闭不与写入并发。
+
+验证：契约测试（持锁模拟写临界区 + teardown 必须等待；teardown 漏斗把每个 socket
+交给恰好一个调用者，含「fd 号被新连接复用后重复 teardown 不得碰它」的 stale-handle
+场景）；`DistributedEventBus` 全文件 34/34 通过。**残余风险（如实）**：teardown 现在
+会等写锁——若某次出站 `writeAll` 永久卡住（出站 socket 没设 `SO_SNDTIMEO`），
+断连/关机也会跟着卡，正解是给出站加发送超时；`disconnectNode` 对 `self.nodes` 的
+`free` + `swapRemove` 仍无锁，**并发断连同一节点**的 double-free 属另一条既存缺陷，
+不在本次范围。
+
+### `Server.stop()` 改成唤醒式：跨线程关 listener fd 会踩 `accept4` 的竞态窗口（**破坏性：否**，行为修复）
+
+`stop()` 原实现从调用线程直接 `shutdown` + `close` listener fd，与 accept 循环并发踩同一
+fd。两个平台各有各的坏法：Linux 上 close 唤不醒驻留的 `accept`（上一版已用 shutdown 缓解），
+macOS 上则是在 `while (running)` 检查与进入 `accept4` 之间那个 ~100ns 窗口——stop 恰在此
+刻拆完 fd，新的 `accept4` 在已关闭 fd 上启动，`std.Io.Threaded.netAcceptPosix` 把 `EBADF`
+归类为 `errnoBug`，Debug 下直接 panic（发生在 std 内部，Server 层捕不到）。
+
+现在 `stop()` 只做两件事：置 `running = false` + `wakeAccept()`（`shutdown(SHUT.RDWR)`
+唤醒 Linux 驻留 accept，再向实绑端口自连一个真实连接唤醒 macOS/BSD 的 accept）；
+**fd 只由 accept 线程自己在循环退出后关闭**。accept 成功后若 `running == false`（stop 落在
+迭代中途，或就是那个唤醒连接）则关闭该连接并退出，唤醒连接不进 dispatch。
+
+回归测试：停驻 accept + 跨线程 stop + join 的契约测试，以及 8 线程连接洪水下 15 轮
+start/churn/stop 的竞态压力测试。**如实说明**：修复前本机无法确定性复现该 panic（是抢占
+窗口竞态，本机 Darwin 对驻留 accept 返回可捕获的 `ECONNABORTED`），两个测试守护的是
+停止契约与竞态形状，不是「修前必红」。
+
+验证：`zig build test -Dtest-filter="api.Server"` → 59/59 通过（含 2 条新用例）。
+
+### 总线同 socket 并发写者：seq 盖章在写锁外，导致偶发静默丢帧（**破坏性：否**，行为修复）
+
+per-connection `write_lock` 早已存在（防的是帧内字节交错），但 replay `seq` 是在**锁外**
+盖的章——`publish` 先 `nextSeq()` 再序列化，然后才竞争写锁。于是两个并发发布者的
+「盖章顺序」≠「上锁写入顺序」，低 seq 帧可能晚于高 seq 帧上线；接收侧 `acceptSeq` 要求
+per-claim 严格递增，把晚到的低 seq 帧当重放以「not ahead」丢弃——流不坏、连接不断，
+**静默丢一帧**（soak 实测 ~1/15）。
+
+修法：`sendFramed` 改为在锁内完成「盖章 → 序列化 → MAC → 写入」，`publish` / `sendHeartbeat`
+不再共享预渲染 json，逐 peer 传入 `(topic, payload, timestamp)`；`node.socket` 存活检查
+一并进锁，顺带消掉 stale-fd 写入窗口。
+
+红→绿证据：新回归测试（socketpair 真实握手 + 双线程 publish，接收侧断言 seq 严格递增且
+payload 集合恰好 0..1999）在修复前 **10 轮 9 红**（`seq gap at delivery 169` 同形诊断）；
+把盖章移回锁外的变异 **6/6 红**；修复后 13/13 绿、`DistributedEventBus` 全文件 32/32 绿。
+注意 wire seq 现在 per-peer 非连续（计数器还被本地分发与其他 peer 消耗），协议契约是
+「严格递增 + 不丢帧」，测试按此断言。
+
+### comptime 泛型合并陷阱：参数只被 discard 时，所有实例化会 memoize 成同一个类型（**破坏性：否**，行为修复）
+
+本 Zig 版本（0.17.0-dev.2151）实测：`fn Impl(comptime slot: usize) type` 里若参数只被
+`_ = slot;` 丢弃，则 `Impl(0) == Impl(2)` 为真，**容器级 static 跨实例共享**——编译通过、
+静默错绑。全仓库 77 个返回 `type` 的泛型工厂排查后命中两处：
+
+- `RaftTransport.TransportImpl(slot)`：其注释声称 per-slot static 派发，实际会被合并，
+  同进程多 raft transport 实例互相踩。已在类型体内加承载性引用（`pub const slot_id = slot`）
+  并更正注释；回归测试直接断言 `TransportImpl(0) != TransportImpl(2)`（修复前 FAIL）。
+- `data.CrudService.CrudEvent(Entity)`：同形状（`CrudEvent(A) == CrudEvent(B)`），今天不会
+  出错（union 载荷本就不含 Entity），但按类型隔离的行为将来会静默失效。同样加承载 decl
+  + 断言测试。
+
+其余 75 个工厂经机检 + 人工复核确认安全（参数真实进入返回类型字面量即不触发）。精确
+判据：**参数是否被返回的类型字面量捕获**——工厂体内的 `guard`/日志不算，方法体内引用不算
+（那种也不会合并）。
+
+### CI 的 benchmark 基线可自刷新：新增候选 artifact 通道（**破坏性：否**）
+
+`scripts/bench-baseline.ci.json` 落后于套件（本轮新增的两个指标在 CI 上只会 WARN，且该
+文件没有 `max_alloc_per_op` 字段，alloc 判据在 CI 上完全不生效）。仓库纪律又不允许 blanket
+`--update`（会把当日 runner 速度烤进 ratchet，还丢 `note`）。现在门禁 run 在
+`BENCH_UPDATE_MISSING_OUT` 指向路径时额外写一份**合并候选**：既有条目逐字保留（含
+`note`/预算），只追加基线不知道的指标与待填 ratio；CI workflow 用 `upload-artifact` 在
+**绿跑**时上传（红 run 不上传，避免用失败数据当 ratchet 材料），维护者下载 diff 后提交即
+闭环。verdict 逻辑零改动。
+
+验证：本机两条路径都跑过——默认基线 + env → 门禁仍 OK、artifact 与本地基线逐字节相同；
+刻意用 CI 基线跑 → 预期红（aarch64 的 `RingBuffer SPSC`），artifact 仍按设计产出。
+
+### benchmark  suite 补两个缺口 + `alloc/op` 从"只打印"升级为门禁判据（**破坏性：否**，CI 判据新增）
+
+- 新增两个 bench 指标：**MPSC 多生产者 push**（`MpscRing 4P x2M`，4 个生产者游标
+  轮流推共享环，满则 inline drain）与 **`after()` 定时器调度路径**（`Timer after x100K`，
+  caller 侧 `Delivery` 分配 + 命令环 push、owner 侧 tick 排空 + 轮插，Manual 时钟自举
+  不启 Runtime）。套件从 30 → 32 个 gated 指标。
+- `[alloc]` 段从 9 个指标扩到**全部 32 个**；`scripts/bench-baseline.json` 每条新增
+  可选 `max_alloc_per_op` 预算（当前实测值 +25% 余量，结构性零分配的指标配 0.00），
+  `scripts/check-bench.sh` 对声明预算的指标超限即判红。以后任何 PR 在热路径引入
+  隐藏分配都会直接挂门禁。
+- 顺带修了一个 LLVM 特化翻转导致的度量失真：`CircuitBreaker` 镜像计时循环曾被编译器
+  优化得比 judged 循环慢 ~4x，改为单一循环文本 + 可选计数指针。
+
+验证：`bash scripts/check-bench.sh` → `OK: 32 metric(s) within 2.0x … 32 of 32
+alloc budget(s) held`；基线经 `--update` 在本机 ReleaseFast 实测重录（漂移 0.94–1.11x）。
+遗留：`bench-baseline.ci.json` 需在 CI runner 上重录（两个新指标在 CI 上 WARN 不判红）。
+
+### zent-modulith smoke 门禁补 `leaked` 断言 + 优雅退出；修掉 6 处存量泄漏（**破坏性：否**）
+
+- 旧 smoke 用 SIGTERM 杀进程且示例无任何信号处理，`main` 从不返回，泄漏报告永远
+  打不出来。现在：仅置标志的 SIGINT/SIGTERM handler + 自连接唤醒阻塞中的 `accept`，
+  主线程优雅关停后 `SafeAllocator` 的 `leaked …` 报告进日志；smoke 判败新增
+  「退出码非零 / 日志含 leaked」两条。两条失败路径均实测过真能判红。
+- 开启泄漏可报后暴露 6 处存量泄漏（全是"跨分配器释放"或漏调既有 deinit 的形状，
+  与 zweq 报告的那类同源）：`dev_auth` token 错用请求 arena 释放、tx_demo 事件
+  上下文错用 `ctx.allocator`、`features_demo` WithEdge 预载行未走 `deinitRows`、
+  catalog 两处计数行漏 deinit / 错用 arena free。全部一行级修复。
+- **框架级发现（未修，记入 follow-up）**：`Server.stop()` 跨线程关 listener 与阻塞
+  `accept4()` 竞争，macOS Debug 下 EBADF 被 std 归类为 `errnoBug` 直接 panic
+  （`src/api/Server.zig` accept 路径）。示例侧以 `running=false` + 自连接唤醒绕开，
+  框架侧待单独修。
+
+验证：`bash examples/zent-modulith/smoke.sh` 连续 4 次 exit=0，每次 43 checks /
+0 failed，结尾 `smoke: clean shutdown, no leaks`。
+
+### 校验失败可选结构化错误体 + 消息本地化钩子（**破坏性：否**，opt-in，默认行为逐字节不变）
+
+`Validation` 中间件新增 `structured_errors` / `message_hook` 选项
+（`withStructuredErrors()` / `withMessageHook()` 链式入口）。开启结构化后 422 响应的
+`data` 位携带 `errors: [{field, rule, message}]`（每失败字段一条，rule 是机器名），
+`msg` 仍是首条消息；`Validator.validateStructCollect` 返回全部违规
+（`Violation`/`Violations`，一次 deinit），`Validator.MessageHook` 可本地化默认规则
+消息（`FieldRules.message` 覆写仍优先）。零值默认 = 旧字符串消息路径，旧用例的精确
+响应体断言原样通过。装了 RFC 7807 `error_renderer` 时渲染器收到首条消息（该形状无
+`data` 槽，已在文档注明）。
+
+验证：`zig build test -Dtest-force-run=true` → 全绿（含 8 条新用例：单/多字段、
+覆写逐字、默认码 4220 可配、仅钩子平坦信封不变、结构化+钩子组合）。
+
+### 首批 fuzz 目标落地：Raft 帧 / 总线握手+事件帧+JSON / HTTP 请求行（**破坏性：否**）
+
+三个解析面各加 `std.testing.fuzz` 块（RaftTransport.zig / DistributedEventBus.zig /
+Server.zig）：任意字节下解析器只许返回 error 或成功，不许 panic/越界；种子含真实
+编码帧、真实 HMAC 的握手形状与审计加的拒绝形状。总线侧从 `bindInbound/bindOutbound`
+切出两个纯解析函数（行为等价）。`scripts/test-runner.zig` 补上 `fuzz` 导出——此前
+只要套件里有 fuzz 块，`-Dtest-filter=` 路径就编译不过（`no member named 'fuzz'`），
+现在 filter 路径按 default runner 同款语义回放 corpus + 空输入。真 fuzzer 走
+`zig build --fuzz test`（不要用 `-Dtest-filter` 组合）。
+
+验证：普通 `zig build test` 全绿（`3 fuzz tests found`）；真 fuzzer 实测
+HTTP 目标 60380 runs、Raft 帧 130151 runs、总线 30310 runs 无崩溃——未发现解析器
+缺陷，无需修解析器。
+
+### 新增 `zig build soak-cluster`：cluster/bus 的长时正确性 soak（**破坏性：否**）
+
+此前 `zig build soak` 只碰 HTTP+租户、`runtime-stress` 只碰 runtime，本轮改过的
+ClusterServer 生命周期 / 总线握手 / 入站 AppendEntries 截断**没有任何长时覆盖**
+（`docs/dev/v1.0-readiness-v0.32.md` B-10 的头号缺口）。现在：进程内 3 节点
+`ClusterBootstrap`（真实选举/心跳/复制 + 认证帧）+ 全互联总线发布流量（**每节点
+两个并发写者**，带 writer 维的 seq），主线程周期性断言：per-(dest,src,writer) 的
+消息 seq 严格递增且集合完备（gap/dup/malformed 全 0）、leader 稳定（双 leader 样本
+0 / 在位占比阈值）、raft 日志三节点全等、fd/RSS/线程 spread 预算内且 teardown 后
+fd 回基线。参数走 `-Dsoak-cluster-iterations`（默认 2400/写者 ≈ 60s 流量）与
+`SOAK_CLUSTER_*` 环境变量阈值。文件头注明：并发/正确性 soak，非 24h 长跑；混合
+版本对跑不在此覆盖。**多写者不是装饰**：单写者时并发盖章窗口根本打不开，无论漏斗
+是否正确 harness 都会报绿——按写者记账（并用一次「跳号变异」验证账目有牙）才让它
+成为总线写序契约的端到端验证。
+
+验证：`zig build soak-cluster` 三次 exit=0（2400/写者 ×2、4800/写者 ×1），18 条
+(dest,src,writer) 流全部全量送达（4800 规模下 18/18 × 4800/4800），leader 在位
+100%、零翻转，fd 23→23（teardown 回基线 5），send_failures 水位 0。
+
+### examples/alpha-engine 补 `.blocking` 执行类别样板（**破坏性：否**）
+
+`ExecutionClass` 双池隔离机制已落地，但 examples 零示范（评估 P1「机制可信、默认
+不安全」）。全 examples 树审计后唯一 DB-bound 的 runtime spawn 点（propose 模块的
+`ai.AgentWorker`，handler 路径有 sqlite INSERT / SELECT）加了
+`.execution_class = .blocking`，builder 链配 `.withBlockingThreads(4, 8)` 并注释
+sizing 理由；其余 worker 纯内存/纯计算，不加。`examples/runtime-workers` 是 CPU 池
+演示主题，刻意保持纯净。
+
+验证：`cd examples/alpha-engine && zig build` + `zig build run` → 6 条 `[assert]`
+全 PASS；未声明 blocking 池时 spawn 直接 `BlockingPoolNotConfigured` 失败，证明
+接线真实生效。
+
 ### 三个 live 测试"查了环境变量却不用它"：NATS 与 Redis 的默认地址根本连不上（**破坏性：否**）
 
 `Test (Redis + NATS + Kafka live)` 那五条红（NATS×3、RedisRateLimiter×2）是同一

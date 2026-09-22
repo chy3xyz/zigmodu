@@ -32,9 +32,15 @@
 //! unaffected: `Compile.test_runner` is set only when `-Dtest-filter=` is given,
 //! so `zig build test` still uses Zig's own runner.
 //!
-//! Not supported here: fuzz mode (`--fuzz`), and the `--listen=-` server
-//! protocol (this runner is wired as `mode = .simple`). Both start with an
-//! explicit panic rather than silently doing nothing.
+//! Fuzz test blocks (`std.testing.fuzz`) are supported to the extent this
+//! runner's `.simple` wiring allows: the suite compiles because this root
+//! exports the `fuzz` entry point the compiler-generated code references, and
+//! a filtered run replays the declared corpus once per input (plus one empty
+//! input), mirroring the default runner's non-fuzz behavior. Actual fuzzing
+//! (`zig build --fuzz test`) needs the default runner: run it without
+//! `-Dtest-filter`. The `--listen=-` server protocol is likewise not
+//! supported (this runner is wired as `mode = .simple`); both unsupported
+//! modes start with an explicit panic rather than silently doing nothing.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -196,6 +202,27 @@ pub fn main(init: std.process.Init.Minimal) void {
     if (leak_count != 0 or log_err_count != 0 or fail_count != 0) {
         std.process.exit(1);
     }
+}
+
+/// Entry point the compiler-generated code references whenever the suite
+/// contains `std.testing.fuzz` blocks — without this export the filtered
+/// build fails to compile (`root ... has no member named 'fuzz'`). Actual
+/// fuzzing is not available here (`.simple` wiring); mirror the default
+/// runner's non-fuzz contract instead: replay the declared corpus once per
+/// input, then one empty input as a smoke test.
+pub fn fuzz(
+    context: anytype,
+    comptime testOne: fn (context: @TypeOf(context), *std.testing.Smith) anyerror!void,
+    options: std.testing.FuzzInputOptions,
+) anyerror!void {
+    @disableInstrumentation();
+    if (builtin.fuzz) @panic("the zigmodu test runner does not support fuzz mode; run `zig build test --fuzz` without -Dtest-filter");
+    for (options.corpus) |input| {
+        var smith: std.testing.Smith = .{ .in = input };
+        try testOne(context, &smith);
+    }
+    var smith: std.testing.Smith = .{ .in = "" };
+    try testOne(context, &smith);
 }
 
 fn log(

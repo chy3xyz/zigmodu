@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const SqlxBackend = @import("../data.zig").SqlxBackend;
+const sqlx = @import("../data.zig").sqlx;
 const SkillContext = @import("skill.zig").SkillContext;
 const approval_api = @import("approval_api.zig");
 
@@ -16,6 +17,9 @@ pub const PersistentApprovalQueue = struct {
 
     allocator: std.mem.Allocator,
     backend: *SqlxBackend,
+    /// Table name — an *identifier*, interpolated into every statement below.
+    /// Values are bound with `?`, identifiers cannot be, so each entry point
+    /// runs it through `sqlx.validateIdentifier` first.
     table: []const u8 = "approval_queue",
 
     pub fn init(allocator: std.mem.Allocator, backend: *SqlxBackend) Self {
@@ -24,6 +28,7 @@ pub const PersistentApprovalQueue = struct {
 
     /// Create the queue table (idempotent). Call once at startup.
     pub fn migrate(self: *Self) !void {
+        try sqlx.validateIdentifier(self.table);
         const sql = try std.fmt.allocPrint(
             self.allocator,
             "CREATE TABLE IF NOT EXISTS {s} (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, subject TEXT NOT NULL, amount INTEGER NOT NULL, note TEXT NOT NULL DEFAULT '', step_name TEXT NOT NULL, tenant_id INTEGER, status INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)",
@@ -34,6 +39,7 @@ pub const PersistentApprovalQueue = struct {
     }
 
     pub fn push(self: *Self, item: PendingApproval) !void {
+        try sqlx.validateIdentifier(self.table);
         const now = @import("../core/Time.zig").monotonicNowSeconds();
         if (item.tenant_id) |tid| {
             const sql = try std.fmt.allocPrint(
@@ -74,6 +80,7 @@ pub const PersistentApprovalQueue = struct {
     /// Copy all pending rows into `out` (caller-allocated slices; caller owns
     /// the strings and must free them). Rows are ordered oldest first.
     pub fn listPending(self: *Self, allocator: std.mem.Allocator, out: *std.ArrayList(PendingApproval), tenant_id: ?i64) !void {
+        try sqlx.validateIdentifier(self.table);
         const sql = if (tenant_id) |tid| try std.fmt.allocPrint(
             self.allocator,
             "SELECT run_id, subject, amount, note, step_name, tenant_id FROM {s} WHERE status = 0 AND tenant_id = {d} ORDER BY id ASC",
@@ -101,6 +108,7 @@ pub const PersistentApprovalQueue = struct {
     /// Mark the first pending row with `run_id` resolved. Returns true when
     /// a row was updated.
     pub fn resolve(self: *Self, run_id: []const u8, tenant_id: ?i64) !bool {
+        try sqlx.validateIdentifier(self.table);
         const now = @import("../core/Time.zig").monotonicNowSeconds();
         const sql = if (tenant_id) |tid| try std.fmt.allocPrint(
             self.allocator,
@@ -117,6 +125,7 @@ pub const PersistentApprovalQueue = struct {
     }
 
     pub fn count(self: *Self, tenant_id: ?i64) !usize {
+        try sqlx.validateIdentifier(self.table);
         const sql = if (tenant_id) |tid| try std.fmt.allocPrint(
             self.allocator,
             "SELECT COUNT(*) AS n FROM {s} WHERE status = 0 AND tenant_id = {d}",
@@ -194,4 +203,31 @@ test "PersistentApprovalQueue push, list and resolve across queries" {
     try std.testing.expect(try queue.resolve("ap-1", null));
     try std.testing.expectEqual(@as(usize, 1), try queue.count(null));
     try std.testing.expect(!try queue.resolve("ap-1", null));
+}
+
+test "PersistentApprovalQueue rejects a table name that is not a plain identifier" {
+    const allocator = std.testing.allocator;
+    var client = @import("../data.zig").sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+
+    var queue = PersistentApprovalQueue.init(allocator, &backend);
+    // The approval queue is what a human signs off against, so the statement
+    // text must not be caller-influenceable: `table` is interpolated, never
+    // bound, and is therefore validated on every entry point.
+    queue.table = "approval_queue; DROP TABLE users";
+    try std.testing.expectError(error.InvalidSqlIdentifier, queue.migrate());
+    try std.testing.expectError(error.InvalidSqlIdentifier, queue.push(.{
+        .run_id = "ap-x",
+        .subject = "s",
+        .amount = 1,
+        .note = "",
+        .step_name = "n",
+    }));
+    var items = std.ArrayList(PendingApproval).empty;
+    defer items.deinit(allocator);
+    try std.testing.expectError(error.InvalidSqlIdentifier, queue.listPending(allocator, &items, null));
+    try std.testing.expectError(error.InvalidSqlIdentifier, queue.count(null));
+    try std.testing.expectError(error.InvalidSqlIdentifier, queue.resolve("ap-x", null));
 }

@@ -12,6 +12,34 @@ const tx_demo = @import("tx_demo.zig");
 const catalog_module = @import("modules/catalog/module.zig");
 const catalog = @import("modules/catalog/root.zig");
 
+/// Set by the SIGINT/SIGTERM handler. The handler itself does nothing else —
+/// it must stay async-signal-safe — and the main thread (blocked in the
+/// poll loop just below `server.runInBackground`) reacts to it.
+var shutdown_requested = std.atomic.Value(bool).init(false);
+
+fn onShutdownSignal(_: std.posix.SIG) callconv(.c) void {
+    shutdown_requested.store(true, .release);
+}
+
+/// One connection to our own port, made after `running` is cleared: it wakes
+/// the accept loop's blocked `accept4()` with a valid fd so `start()` can
+/// unwind on its own thread and run its `closeListener` defer there. Closing
+/// the listener from another thread instead (i.e. `server.stop()`) makes the
+/// woken syscall return EBADF, which std.Io.Threaded reports as errnoBug →
+/// panic in Debug.
+fn wakeBlockedAccept(port: u16) void {
+    const fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    if (fd < 0) return;
+    defer _ = std.c.close(fd);
+    var sa: std.posix.sockaddr.in = .{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7f000001), // 127.0.0.1
+        .zero = std.mem.zeroes([8]u8),
+    };
+    _ = std.c.connect(fd, @ptrCast(&sa), @sizeOf(std.posix.sockaddr.in));
+}
+
 // ═══════════════════════════════════════════════════
 // ZigModu Application + zent (ent-style) data layer
 // See docs/ZENT.md · ComptimeRouter: docs/ROUTE_TABLE.md
@@ -185,6 +213,10 @@ pub fn main(init: std.process.Init) !void {
         &injection_client,
         features_demo.InterceptorApi(@TypeOf(injection_client)).interceptor(&injection_tenant),
     );
+    // UseInterceptor heap-allocates the chain on this root client value; the
+    // matching DeinitClient frees it at shutdown (after the server thread is
+    // joined below, since interceptor_api serves requests until then).
+    defer zent.codegen.client.DeinitClient(catalog.persistence.infos, &injection_client);
     const InterceptorApiT = features_demo.InterceptorApi(@TypeOf(injection_client));
     var interceptor_api = InterceptorApiT.init(&injection_client);
 
@@ -352,5 +384,25 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("[main] PUT  /api/v1/sku-stock (v0.30 SaveOrUpdateOn upsert + v0.31 field.Decimal)", .{});
     std.log.info("[main] GET  /api/v1/feed2/authors-with-posts (v0.31 WithEdgeOptions inner join, arena copies)", .{});
     std.log.info("[main] OpenAPI: http://127.0.0.1:{d}/openapi.json", .{port});
-    try server.start();
+
+    // Graceful shutdown: smoke.sh ends the run with SIGTERM and the process
+    // must return from main so the debug SafeAllocator's leak report reaches
+    // the log (it only prints when main returns). The handler just sets a
+    // flag; this thread flips `running` and dials the port once to wake the
+    // accept loop — see wakeBlockedAccept for why stop() is not used here.
+    const shutdown_handler = std.posix.Sigaction{
+        .handler = .{ .handler = onShutdownSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &shutdown_handler, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &shutdown_handler, null);
+
+    const server_thread = try server.runInBackground();
+    while (!shutdown_requested.load(.acquire)) {
+        _ = std.c.nanosleep(&.{ .sec = 0, .nsec = 50 * std.time.ns_per_ms }, null);
+    }
+    server.running.store(false, .monotonic);
+    wakeBlockedAccept(port);
+    server_thread.join();
 }

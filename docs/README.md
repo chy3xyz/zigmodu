@@ -48,7 +48,7 @@ These are referenced by task but were not indexed before — kept as-is.
 | [LOGGING.md](LOGGING.md) | Structured logging: levels, fields, sinks |
 | [MIGRATION_v04_to_v07.md](MIGRATION_v04_to_v07.md) | Historical upgrade guide v0.4 → v0.7 (older than [UPGRADING.md](UPGRADING.md)) |
 | [ZIGMODU_NOTES.md](ZIGMODU_NOTES.md) | Field notes from a real project integration (v0.14.x) |
-| [docs/dev/](dev/) | Internal review / assessment / roadmap scratch notes (not user-facing contracts) |
+| [docs/dev/](dev/) | Internal review / assessment / roadmap scratch notes (not user-facing contracts). **先看 [dev/README.md](dev/README.md)** —— 22 份里哪几份仍生效、哪几份被哪一份取代、哪些路径被源码按字面引用不能动 |
 
 ## 🔧 Features
 

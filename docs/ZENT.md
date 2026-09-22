@@ -608,7 +608,7 @@ zig_ws/
 
 > **升级自查（先跑命令，再读条目）**：
 > ```bash
-> zmodu audit .                 # 租户来源 / 裸 panic / 共享 map / 裸 alignCast / 分配器归属（b19–b23）
+> zmodu audit .                 # 租户来源 / 裸 panic / 共享 map / 裸 alignCast / 分配器归属 / 熵源（b19–b24）
 > zig build check-production    # 裸 catch / catch unreachable
 > zig build test                # 形态与错误集快照（含文档↔代码一致性）
 > ```

@@ -330,7 +330,11 @@ pub fn stop(self: *Self) void
 pub fn connectToNode(self: *Self, node_id: []const u8, address: std.net.Address) !void
 pub fn publish(self: *Self, topic: []const u8, payload: []const u8) !void
 pub fn subscribe(self: *Self, topic: []const u8, callback: Callback) !void
-pub fn getConnectedNodes(self: *Self) []const Node
+// 安全遍历（推荐）：在注册表锁内整份拷贝，返回的元素归调用方，用完 deinit()
+pub fn snapshotNodes(self: *Self, allocator: std.mem.Allocator) !NodeSnapshot
+// 无锁视图（不持有注册表锁，切片可能在并发 connect/disconnect 时 realloc/失效）：
+// 只在调用方自行保证独占时合法，其他场合请用 snapshotNodes
+pub fn getConnectedNodes(self: *Self) []const *Node
 pub fn getNodeCount(self: *Self) usize
 ```
 

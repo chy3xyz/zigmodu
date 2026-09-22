@@ -8,8 +8,14 @@ const event_bus = @import("../core/EventBus.zig");
 const result_set = @import("ResultSet.zig");
 
 pub fn CrudEvent(comptime Entity: type) type {
-    _ = Entity;
+    // Carrier reference to the comptime parameter: on this Zig version a
+    // generic whose parameter is only discarded (`_ = Entity;`) is memoized
+    // into ONE type for all instantiations — `CrudEvent(A) == CrudEvent(B)` —
+    // so type-level isolation between entities silently collapses (same trap
+    // as RaftTransport.TransportImpl, see its comment). The decl below keeps
+    // each instantiation distinct.
     return union(enum) {
+        pub const entity_type: type = Entity;
         created: i64,
         updated: i64,
         deleted: i64,
@@ -99,6 +105,13 @@ const FakePersistence = struct {
         self.deleted = true;
     }
 };
+
+test "CrudEvent keeps distinct types per entity" {
+    // Memoize-trap guard: a generic whose comptime parameter is only
+    // discarded collapses into one type on this Zig version, silently
+    // merging per-entity bus types. See the comment on CrudEvent.
+    try std.testing.expect(CrudEvent(FakeEntity) != CrudEvent(struct { id: i64 }));
+}
 
 test "CrudService delegates and publishes events" {
     const allocator = std.testing.allocator;

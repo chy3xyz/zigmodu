@@ -67,7 +67,7 @@ pub fn CatalogApi(comptime Service: type) type {
 
         fn countProducts(ctx: *http.Context, self: *State) !void {
             const rows = self.svc.countProductsByTenant() catch |err| return http.respondErr(ctx, err);
-            defer ctx.allocator.free(rows);
+            defer self.svc.freeCounts(rows); // allocated by the store allocator, not the request arena
             var buf = std.ArrayList(u8).empty;
             defer buf.deinit(ctx.allocator);
             try buf.appendSlice(ctx.allocator, "{\"counts\":[");

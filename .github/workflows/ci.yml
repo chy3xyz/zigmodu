@@ -720,9 +720,30 @@ jobs:
         # M1 Pro it was recorded on (6.57 ms vs ~10.9 ms for CircuitBreaker x10M,
         # all 23 metrics scaling together), which left ~18% of headroom under the
         # 2.0x threshold and reddened a commit that changed only a shell script.
+        #
+        # BENCH_UPDATE_MISSING_OUT: alongside the verdict, write a merged
+        # candidate baseline — existing CI entries verbatim, plus this run's
+        # values for metrics the CI file does not know yet (e.g. a newly added
+        # metric WARNs "not in the baseline" until one of these is committed).
+        # The step below uploads it as an artifact on green runs; a maintainer
+        # reviews the diff and commits it. Never reaches the verdict, and a red
+        # run uploads nothing.
         env:
           BENCH_BASELINE: scripts/bench-baseline.ci.json
+          BENCH_UPDATE_MISSING_OUT: ${{ runner.temp }}/bench-baseline.ci.updated.json
         run: bash scripts/check-bench.sh
+
+      - name: Upload refreshed CI baseline candidate
+        # Green runs only (default condition): numbers from a failed run are
+        # exactly what must not become the ratchet. Download the artifact,
+        # review the diff against scripts/bench-baseline.ci.json, commit —
+        # this is the runner-class recording path for newly added metrics;
+        # do not blanket `--update` the file (see scripts/check-bench.sh header).
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-baseline-ci-updated
+          path: ${{ runner.temp }}/bench-baseline.ci.updated.json
+          retention-days: 30
 
   # ── Docker Build ──────────────────────────────
   docker:

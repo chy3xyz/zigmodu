@@ -101,8 +101,15 @@ pub fn SqlLock(comptime Client: type) type {
 
         pub fn init(allocator: std.mem.Allocator, io: std.Io, client: *Client, table: []const u8, dialect: Dialect) !Self {
             if (!isSafeIdentifier(table)) return error.InvalidLockTable;
+            // The owner id *is* the lock's ownership credential: `tryAcquire`
+            // treats a matching owner as a re-entrant hold and `release` deletes
+            // `WHERE owner = ?`. Two replicas deriving the same owner would both
+            // enter the critical section, and one would free the other's lock — so
+            // this needs a real CSPRNG, not `std.Io.random` (falls back to
+            // pid+wall-clock+ASLR, per AGENTS.md "CSPRNG"). Entropy failure is
+            // reported, never downgraded to a weaker source.
             var seed: [8]u8 = undefined;
-            std.Io.random(io, &seed);
+            try std.Io.randomSecure(io, &seed);
             const owner = std.fmt.bytesToHex(seed, .lower);
             return .{
                 .allocator = allocator,
@@ -291,7 +298,7 @@ test "SqlLock claims and reaps locks on a real PostgreSQL" {
     // Unique table per run so parallel/repeat runs never collide.
     var table_buf: [64]u8 = undefined;
     var seed: [8]u8 = undefined;
-    std.Io.random(std.testing.io, &seed);
+    try std.Io.randomSecure(std.testing.io, &seed);
     const table = try std.fmt.bufPrint(&table_buf, "zmodu_lock_pg_{s}", .{std.fmt.bytesToHex(seed, .lower)});
     defer {
         var drop_buf: [96]u8 = undefined;

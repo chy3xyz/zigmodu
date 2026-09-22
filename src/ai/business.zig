@@ -41,22 +41,25 @@ pub const EntitySpec = struct {
     writable: []const []const u8 = &.{},
 };
 
+/// Identifier for the parts of a statement that are *not* bound with `?`
+/// (table, primary key, update keys). Delegates to the framework gate
+/// `sqlx.validateIdentifier` (`[A-Za-z_][A-Za-z0-9_.]*`, ≤128) instead of
+/// re-deriving the rules — this local copy had already drifted weaker than
+/// that gate (it accepted a leading digit and had no length cap), which is
+/// exactly what a second implementation buys you. The module keeps its own
+/// `error.UnsafeSqlIdentifier` name so callers are unaffected.
 fn isValidIdentifier(s: []const u8) bool {
-    if (s.len == 0) return false;
-    for (s) |c| {
-        if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '.') return false;
-    }
+    sqlx.validateIdentifier(s) catch return false;
     return true;
 }
 
 /// Identifier restricted to a bare column name (no `.`): used where the name is
 /// prefixed with a framework-owned alias, so a qualified name cannot be valid.
+/// Same delegated checks as `isValidIdentifier` with the dot rejected on top —
+/// the narrower rule is an *additional* constraint, not another implementation.
 fn isPlainIdentifier(s: []const u8) bool {
-    if (s.len == 0) return false;
-    for (s) |c| {
-        if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
-    }
-    return true;
+    if (!isValidIdentifier(s)) return false;
+    return std.mem.indexOfScalar(u8, s, '.') == null;
 }
 
 fn jsonToValue(v: std.json.Value) error{InvalidArguments}!sqlx.Value {

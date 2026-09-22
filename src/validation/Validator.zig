@@ -123,24 +123,120 @@ pub const FieldRules = struct {
 /// The default is `<field>: <what the rule requires>` — the field name is part
 /// of it because "invalid email format" on a multi-field request body does not
 /// say which field to fix. A `FieldRules.message` override replaces the whole
-/// string, including the field-name prefix.
+/// string, including the field-name prefix, and wins over `hook`. When `hook`
+/// is set it sees the finished default message and may replace it with a
+/// localized one (the replacement is duplicated, so static table strings work).
 fn ruleFailure(
     allocator: std.mem.Allocator,
     field_name: []const u8,
     field_rules: anytype,
+    comptime rule_name: []const u8,
     comptime rule_fmt: []const u8,
     rule_args: anytype,
+    hook: ?MessageHook,
 ) ![]const u8 {
     if (field_rules.message) |override| return try allocator.dupe(u8, override);
     const rule_text = try std.fmt.allocPrint(allocator, rule_fmt, rule_args);
     defer allocator.free(rule_text);
-    return try std.fmt.allocPrint(allocator, "{s}: {s}", .{ field_name, rule_text });
+    const default_msg = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ field_name, rule_text });
+    if (hook) |h| {
+        if (h(field_name, rule_name, default_msg)) |localized| {
+            allocator.free(default_msg);
+            return try allocator.dupe(u8, localized);
+        }
+    }
+    return default_msg;
+}
+
+/// One violated rule on one field, as reported by `validateStructCollect`.
+pub const Violation = struct {
+    /// Struct field name (a comptime constant; not owned).
+    field: []const u8,
+    /// Machine name of the violated rule: "required", "min_len", "max_len",
+    /// "min", "max", "email", "uuid", "phone", "url" or "one_of".
+    rule: []const u8,
+    /// Failure message: either the default `<field>: <rule text>` (possibly
+    /// localized through `MessageHook`) or the verbatim `FieldRules.message`
+    /// override. Owned by `Violations`.
+    message: []const u8,
+};
+
+/// Every violation found by one `validateStructCollect` call. Owns all message
+/// strings plus the list itself; one `deinit` frees everything.
+pub const Violations = struct {
+    items: []Violation,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *Violations) void {
+        for (self.items) |v| self.allocator.free(v.message);
+        self.allocator.free(self.items);
+    }
+
+    /// Message of the earliest-collected violation — what the
+    /// first-failure-only `validateStruct` would have returned.
+    pub fn firstMessage(self: *const Violations) []const u8 {
+        return self.items[0].message;
+    }
+};
+
+/// Localization hook for default rule messages. Receives the field name, the
+/// rule name and the finished default message; return a replacement string, or
+/// `null` to keep the default. The returned string is duplicated into the
+/// caller's allocator, so returning static strings from a message table is the
+/// intended use. A `FieldRules.message` override is returned before the hook
+/// runs, so per-field overrides always win.
+pub const MessageHook = *const fn (
+    field: []const u8,
+    rule: []const u8,
+    default_message: []const u8,
+) ?[]const u8;
+
+fn appendViolation(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList(Violation),
+    field_name: []const u8,
+    field_rules: anytype,
+    comptime rule_name: []const u8,
+    comptime rule_fmt: []const u8,
+    rule_args: anytype,
+    hook: ?MessageHook,
+) !void {
+    const message = try ruleFailure(allocator, field_name, field_rules, rule_name, rule_fmt, rule_args, hook);
+    errdefer allocator.free(message);
+    try list.append(allocator, .{
+        .field = field_name,
+        .rule = rule_name,
+        .message = message,
+    });
 }
 
 /// Validate a struct value against comptime rules.
 /// Returns an allocator-owned error message if validation fails, or null on success.
 /// Caller must free the returned string if non-null.
+///
+/// This is the historical first-failure-only entry point: the message is the
+/// first failing field's first failing rule. The collecting variant is
+/// `validateStructCollect`.
 pub fn validateStruct(allocator: std.mem.Allocator, value: anytype, comptime rules: anytype) !?[]const u8 {
+    var violations = (try validateStructCollect(allocator, value, rules, null)) orelse return null;
+    defer violations.deinit();
+    return try allocator.dupe(u8, violations.firstMessage());
+}
+
+/// Validate a struct value against comptime rules, collecting every failed
+/// field instead of stopping at the first one.
+///
+/// Each failed field contributes exactly one `Violation` — its first failing
+/// rule, in the rule order the checks run — so the result is aggregated per
+/// field. Entries follow the declaration order of `rules`. `hook` localizes
+/// default messages (a `FieldRules.message` override still wins). Returns
+/// `null` when the value is valid; otherwise a `Violations` the caller owns.
+pub fn validateStructCollect(
+    allocator: std.mem.Allocator,
+    value: anytype,
+    comptime rules: anytype,
+    hook: ?MessageHook,
+) !?Violations {
     const T = @TypeOf(value);
     const t_info = @typeInfo(T);
     if (t_info != .@"struct") @compileError("value must be a struct");
@@ -149,6 +245,12 @@ pub fn validateStruct(allocator: std.mem.Allocator, value: anytype, comptime rul
     const r_info = @typeInfo(RulesType);
     if (r_info != .@"struct") @compileError("rules must be a struct literal");
 
+    var list = std.ArrayList(Violation).empty;
+    errdefer {
+        for (list.items) |v| allocator.free(v.message);
+        list.deinit(allocator);
+    }
+
     inline for (r_info.@"struct".field_names) |field_name| {
         if (!@hasField(T, field_name)) {
             @compileError("validation rules contain unknown field: " ++ field_name);
@@ -156,26 +258,34 @@ pub fn validateStruct(allocator: std.mem.Allocator, value: anytype, comptime rul
 
         const field_value = @field(value, field_name);
         const field_rules = @field(rules, field_name);
+        // First failing rule per field is reported; later rules on the same
+        // field are skipped (mirrors the single-message entry point).
+        var field_failed = false;
 
         // required check
-        if (field_rules.required) {
+        if (!field_failed and field_rules.required) {
             const valid = isRequiredValid(@TypeOf(field_value), field_value);
             if (!valid) {
-                return try ruleFailure(allocator, field_name, field_rules, "is required", .{});
+                try appendViolation(allocator, &list, field_name, field_rules, "required", "is required", .{}, hook);
+                field_failed = true;
             }
         }
 
         // string length checks
         const is_string = isStringSlice(@TypeOf(field_value));
-        if (is_string) {
+        if (!field_failed and is_string) {
             if (field_rules.min_len) |min| {
                 if (field_value.len < min) {
-                    return try ruleFailure(allocator, field_name, field_rules, "must be at least {d} characters", .{min});
+                    try appendViolation(allocator, &list, field_name, field_rules, "min_len", "must be at least {d} characters", .{min}, hook);
+                    field_failed = true;
                 }
             }
-            if (field_rules.max_len) |max| {
-                if (field_value.len > max) {
-                    return try ruleFailure(allocator, field_name, field_rules, "must be at most {d} characters", .{max});
+            if (!field_failed) {
+                if (field_rules.max_len) |max| {
+                    if (field_value.len > max) {
+                        try appendViolation(allocator, &list, field_name, field_rules, "max_len", "must be at most {d} characters", .{max}, hook);
+                        field_failed = true;
+                    }
                 }
             }
         }
@@ -183,64 +293,85 @@ pub fn validateStruct(allocator: std.mem.Allocator, value: anytype, comptime rul
         // numeric range checks
         const is_int = isInteger(@TypeOf(field_value));
         const is_float = isFloat(@TypeOf(field_value));
-        if (is_int or is_float) {
+        if (!field_failed and (is_int or is_float)) {
             if (field_rules.min) |min| {
                 const fv = asF64(field_value);
                 if (fv < @as(f64, @floatFromInt(min))) {
-                    return try ruleFailure(allocator, field_name, field_rules, "must be at least {d}", .{min});
+                    try appendViolation(allocator, &list, field_name, field_rules, "min", "must be at least {d}", .{min}, hook);
+                    field_failed = true;
                 }
             }
-            if (field_rules.max) |max| {
-                const fv = asF64(field_value);
-                if (fv > @as(f64, @floatFromInt(max))) {
-                    return try ruleFailure(allocator, field_name, field_rules, "must be at most {d}", .{max});
+            if (!field_failed) {
+                if (field_rules.max) |max| {
+                    const fv = asF64(field_value);
+                    if (fv > @as(f64, @floatFromInt(max))) {
+                        try appendViolation(allocator, &list, field_name, field_rules, "max", "must be at most {d}", .{max}, hook);
+                        field_failed = true;
+                    }
                 }
             }
         }
 
         // string format validators
-        if (is_string) {
+        if (!field_failed and is_string) {
             if (field_rules.email) {
                 const r = email(field_value);
                 if (!r.valid) {
-                    return try ruleFailure(allocator, field_name, field_rules, "{s}", .{r.message.?});
+                    try appendViolation(allocator, &list, field_name, field_rules, "email", "{s}", .{r.message.?}, hook);
+                    field_failed = true;
                 }
             }
-            if (field_rules.uuid) {
-                const r = uuid(field_value);
-                if (!r.valid) {
-                    return try ruleFailure(allocator, field_name, field_rules, "{s}", .{r.message.?});
-                }
-            }
-            if (field_rules.phone) {
-                const r = phone(field_value);
-                if (!r.valid) {
-                    return try ruleFailure(allocator, field_name, field_rules, "{s}", .{r.message.?});
-                }
-            }
-            if (field_rules.url) {
-                const r = url(field_value);
-                if (!r.valid) {
-                    return try ruleFailure(allocator, field_name, field_rules, "{s}", .{r.message.?});
-                }
-            }
-            if (field_rules.one_of) |choices_str| {
-                var it = std.mem.splitScalar(u8, choices_str, ',');
-                var found = false;
-                while (it.next()) |choice| {
-                    if (std.mem.eql(u8, field_value, choice)) {
-                        found = true;
-                        break;
+            if (!field_failed) {
+                if (field_rules.uuid) {
+                    const r = uuid(field_value);
+                    if (!r.valid) {
+                        try appendViolation(allocator, &list, field_name, field_rules, "uuid", "{s}", .{r.message.?}, hook);
+                        field_failed = true;
                     }
                 }
-                if (!found) {
-                    return try ruleFailure(allocator, field_name, field_rules, "must be one of: {s}", .{choices_str});
+            }
+            if (!field_failed) {
+                if (field_rules.phone) {
+                    const r = phone(field_value);
+                    if (!r.valid) {
+                        try appendViolation(allocator, &list, field_name, field_rules, "phone", "{s}", .{r.message.?}, hook);
+                        field_failed = true;
+                    }
+                }
+            }
+            if (!field_failed) {
+                if (field_rules.url) {
+                    const r = url(field_value);
+                    if (!r.valid) {
+                        try appendViolation(allocator, &list, field_name, field_rules, "url", "{s}", .{r.message.?}, hook);
+                        field_failed = true;
+                    }
+                }
+            }
+            if (!field_failed) {
+                if (field_rules.one_of) |choices_str| {
+                    var it = std.mem.splitScalar(u8, choices_str, ',');
+                    var found = false;
+                    while (it.next()) |choice| {
+                        if (std.mem.eql(u8, field_value, choice)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        try appendViolation(allocator, &list, field_name, field_rules, "one_of", "must be one of: {s}", .{choices_str}, hook);
+                        field_failed = true;
+                    }
                 }
             }
         }
     }
 
-    return null;
+    if (list.items.len == 0) {
+        list.deinit(allocator);
+        return null;
+    }
+    return Violations{ .items = try list.toOwnedSlice(allocator), .allocator = allocator };
 }
 
 fn isRequiredValid(comptime T: type, value: T) bool {
@@ -432,4 +563,77 @@ test "validateStruct: FieldRules.message is used verbatim" {
     const empty_email = (try validateStruct(allocator, User{ .email = "", .age = 30 }, rules)).?;
     defer allocator.free(empty_email);
     try std.testing.expectEqualStrings("邮箱格式不正确", empty_email);
+}
+
+test "validateStructCollect: one entry per failed field, first failing rule per field" {
+    const allocator = std.testing.allocator;
+    const Req = struct { name: []const u8, email: []const u8, age: u32 };
+
+    const rules = .{
+        .name = FieldRules{ .required = true, .min_len = 2 },
+        .email = FieldRules{ .required = true, .email = true },
+        .age = FieldRules{ .min = 0, .max = 150 },
+    };
+
+    // name fails `required` first — `min_len` would also fail on "" but a field
+    // contributes only its first failing rule.
+    var violations = (try validateStructCollect(allocator, Req{ .name = "", .email = "nope", .age = 999 }, rules, null)).?;
+    defer violations.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), violations.items.len);
+    try std.testing.expectEqualStrings("name", violations.items[0].field);
+    try std.testing.expectEqualStrings("required", violations.items[0].rule);
+    try std.testing.expectEqualStrings("name: is required", violations.items[0].message);
+    try std.testing.expectEqualStrings("email", violations.items[1].field);
+    try std.testing.expectEqualStrings("email", violations.items[1].rule);
+    try std.testing.expectEqualStrings("email: invalid email format", violations.items[1].message);
+    try std.testing.expectEqualStrings("age", violations.items[2].field);
+    try std.testing.expectEqualStrings("max", violations.items[2].rule);
+    try std.testing.expectEqualStrings("age: must be at most 150", violations.items[2].message);
+
+    // The first message matches what first-failure-only validateStruct reports.
+    const single = (try validateStruct(allocator, Req{ .name = "", .email = "nope", .age = 999 }, rules)).?;
+    defer allocator.free(single);
+    try std.testing.expectEqualStrings(violations.firstMessage(), single);
+
+    // A valid value reports no violations at all.
+    const ok_result = try validateStructCollect(allocator, Req{ .name = "Alice", .email = "a@b.com", .age = 30 }, rules, null);
+    try std.testing.expect(ok_result == null);
+}
+
+fn demoMessageHook(field: []const u8, rule: []const u8, default_message: []const u8) ?[]const u8 {
+    _ = field;
+    _ = default_message;
+    if (std.mem.eql(u8, rule, "required")) return "不能为空";
+    if (std.mem.eql(u8, rule, "email")) return "邮箱格式不正确";
+    return null;
+}
+
+test "validateStructCollect: message hook localizes defaults, FieldRules.message wins" {
+    const allocator = std.testing.allocator;
+    const Req = struct { name: []const u8, email: []const u8, age: u32 };
+
+    const rules = .{
+        .name = FieldRules{ .required = true },
+        .email = FieldRules{ .required = true, .email = true },
+        .age = FieldRules{ .min = 0, .max = 150 },
+    };
+
+    var localized = (try validateStructCollect(allocator, Req{ .name = "", .email = "nope", .age = 999 }, rules, demoMessageHook)).?;
+    defer localized.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), localized.items.len);
+    try std.testing.expectEqualStrings("不能为空", localized.items[0].message);
+    try std.testing.expectEqualStrings("邮箱格式不正确", localized.items[1].message);
+    // No mapping for `max`: the default survives untouched.
+    try std.testing.expectEqualStrings("age: must be at most 150", localized.items[2].message);
+
+    // A per-field override replaces the whole message, so the hook never runs.
+    const override_rules = .{
+        .name = FieldRules{ .required = true, .message = "name 必填" },
+    };
+    var overridden = (try validateStructCollect(allocator, Req{ .name = "", .email = "a@b.com", .age = 30 }, override_rules, demoMessageHook)).?;
+    defer overridden.deinit();
+    try std.testing.expectEqual(@as(usize, 1), overridden.items.len);
+    try std.testing.expectEqualStrings("name 必填", overridden.items[0].message);
 }

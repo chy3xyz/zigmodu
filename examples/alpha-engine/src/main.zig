@@ -113,7 +113,14 @@ pub fn main(init: std.process.Init) !void {
 
     var b = zmodu.builder(allocator, io);
     defer b.deinit();
-    var app = try b.withName("alpha-engine").build(.{ Market, Book, Alpha, Risk, Exec, Audit, Propose });
+    // The blocking pool backs propose's AgentWorker (spawned
+    // `.execution_class = .blocking`): 4 threads — a blocking handler waits
+    // rather than computes, so this is sized to the resource, not the cores —
+    // and 8 as the admission ceiling for blocking workers. Without this the
+    // spawn in propose's `initWith` is refused with `BlockingPoolNotConfigured`.
+    var app = try b.withName("alpha-engine").withBlockingThreads(4, 8).build(.{
+        Market, Book, Alpha, Risk, Exec, Audit, Propose,
+    });
     defer app.deinit();
     try app.start(); // each module's initWith spawned its workers via ctx.runtime()
     defer app.stop();

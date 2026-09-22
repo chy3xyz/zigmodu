@@ -2422,11 +2422,20 @@ pub const Server = struct {
         self.listener = try addr.listen(self.io, .{
             .reuse_address = true,
         });
-        // Only the path that first flips `listener_closing` to true is allowed
-        // to call `deinit`. This prevents a double-close race between `stop()`
-        // (called by user code) and this defer (triggered when the accept loop
-        // exits because the fd was closed underneath it).
-        defer self.closeListener();
+        // The listener fd is closed only here, on the accept loop's own
+        // thread, after the loop has exited. stop() deliberately never
+        // closes it: a cross-thread close races the blocked `accept`, and
+        // per platform either does not wake it at all (Linux) or lets a
+        // fresh accept4 start on the torn-down fd and return EBADF, which
+        // std.Io.Threaded classifies as errnoBug and panics on — from
+        // inside std, where it cannot be caught. stop() only clears
+        // `running` and wakes the syscall; the woken loop unwinds there and
+        // runs this defer. `listener_closing` is reset so start() can be
+        // called again (restart).
+        defer {
+            self.closeListener();
+            self.listener_closing.store(false, .monotonic); // allow restart
+        }
         // Reap any still-running connection fibers on exit so their futures
         // are released. Await (not cancel) so in-flight requests complete.
         defer self.conn_group.await(self.io) catch |err| std.log.warn("[Server] conn_group await: {}", .{err});
@@ -2440,6 +2449,15 @@ pub const Server = struct {
                 std.log.err("Accept error: {any}", .{err});
                 continue;
             };
+
+            // stop() may have landed between the loop condition and a
+            // completed accept (its loopback wake, or a real client racing
+            // shutdown): don't dispatch new work while stopping — close the
+            // connection and unwind. The loopback wake connection ends here.
+            if (!self.running.load(.monotonic)) {
+                stream.close(self.io);
+                break;
+            }
 
             // Connection-level backpressure: reserve a slot before dispatching
             // and release it when the fiber returns. Without this an accept
@@ -2497,10 +2515,24 @@ pub const Server = struct {
         std.posix.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.KEEPALIVE, std.mem.asBytes(&one)) catch |err| std.log.debug("[Server] setsockopt KEEPALIVE: {}", .{err});
     }
 
+    /// Stop the server. Safe to call from any thread, including while
+    /// `start()` is blocked in `accept()` on another thread; typically
+    /// followed by `join()` on the `runInBackground` thread.
+    ///
+    /// This never closes the listener fd. A cross-thread close races the
+    /// accept loop, and per platform either does not wake a parked
+    /// `accept` at all (Linux — the hang the shutdown dance in
+    /// `sockread.closeListener` was written for) or lets a fresh accept4
+    /// start on the torn-down fd and return EBADF, which std.Io.Threaded
+    /// reports as `errnoBug` and panics on, from inside std where it cannot
+    /// be caught. Instead: clear `running`, wake the parked syscall with a
+    /// real loopback connection (plus the Linux-side shutdown), and let the
+    /// accept loop exit on its own thread — `start()`'s defer then closes
+    /// the listener there and the port is released. Even without a join the
+    /// loop unwinds itself promptly.
     pub fn stop(self: *Server) void {
         self.running.store(false, .monotonic);
-        self.closeListener();
-        self.listener_closing.store(false, .monotonic); // allow restart
+        self.wakeAccept();
     }
 
     /// Start the server in a background thread. Returns immediately.
@@ -2563,6 +2595,36 @@ pub const Server = struct {
             sockread.closeListener(self.io, l);
             self.listener = null;
         }
+    }
+
+    /// Wake an accept loop blocked in `accept()` so `start()` can unwind on
+    /// its own thread and run its closeListener defer there. Two
+    /// mechanisms, because the platforms disagree about what wakes a
+    /// blocked accept and this must work on all of them without ever
+    /// closing the fd from the stopping thread:
+    ///
+    /// - `shutdown(SHUT.RDWR)` fails a *Linux* `accept` immediately (EINVAL
+    ///   → `error.SocketNotListening`, which the loop treats as a normal
+    ///   exit once `running` is false). macOS answers ENOTCONN for a
+    ///   listener — ignored.
+    /// - A real connection to our own port wakes a macOS/BSD `accept` with
+    ///   a *valid* fd (Darwin wakes a parked accept on close with
+    ///   ECONNABORTED, but that is a close — exactly what must not happen
+    ///   from this thread). The loop accepts the loopback connection and
+    ///   discards it: `running` is already false.
+    fn wakeAccept(self: *Server) void {
+        const l = self.listener orelse return;
+        _ = std.c.shutdown(l.socket.handle, std.c.SHUT.RDWR);
+        const fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        if (fd < 0) return;
+        defer _ = std.c.close(fd);
+        var sa: std.posix.sockaddr.in = .{
+            .family = std.posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, l.socket.address.getPort()),
+            .addr = std.mem.nativeToBig(u32, 0x7f000001), // 127.0.0.1
+            .zero = std.mem.zeroes([8]u8),
+        };
+        _ = std.c.connect(fd, @ptrCast(&sa), @sizeOf(std.posix.sockaddr.in));
     }
 };
 
@@ -4648,6 +4710,65 @@ const ParserProbe = struct {
     }
 };
 
+// ── Fuzz: request line + header parser ──────────────────────────────────────
+//
+// `parseAfterRequestLine` is the parse surface every unauthenticated peer
+// reaches, so it has to survive arbitrary bytes: any outcome — a
+// `ParsedRequest` or a refusal error — is a pass, a crash or an out-of-bounds
+// read is not. Driven over a socketpair because the parser reads
+// incrementally from a `StreamReader`; the model is "peer sent its whole
+// request, then half-closed", so a declared body longer than the bytes sent
+// hits EOF (a refusal) instead of blocking the read.
+
+fn fuzzParseRequest(_: void, smith: *std.testing.Smith) !void {
+    var raw: [4096]u8 = undefined;
+    smith.bytes(&raw);
+
+    const fds = testSocketPair() orelse return error.SkipZigTest;
+    const stream: std.Io.net.Stream = .{ .socket = .{ .handle = fds[0], .address = undefined } };
+    // One write, then close the write end: 4 KiB always fits the socket buffer,
+    // and the close is what turns "body shorter than Content-Length" from a
+    // hang into a clean `IncompleteBody`.
+    _ = std.posix.system.write(fds[1], &raw, raw.len);
+    _ = std.posix.system.close(fds[1]);
+    defer stream.close(std.testing.io);
+
+    var reader: StreamReader = undefined;
+    reader.setup(stream, std.testing.io);
+    // Backstop for a parser path that waits on more bytes despite the half-close.
+    reader.setHeaderDeadline(2000);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var parser = RequestParser.init(a);
+    const first_maybe = reader.readUntilDelimiterOrEof(&.{}, '\n') catch return;
+    const first = first_maybe orelse return;
+    var request = parser.parseAfterRequestLine(&reader, first, 16 * 1024, .{}, 100) catch return;
+    request.deinit(a);
+}
+
+test "fuzz: request-line + header parser only errors or succeeds on arbitrary bytes" {
+    // Valid requests on the success path, then the refusal shapes the audit
+    // added (chunked TE, duplicate/garbage Content-Length, folded headers),
+    // then bytes that aren't text at all.
+    const corpus = [_][]const u8{
+        "GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+        "POST /a?x=1&y=%20 HTTP/1.1\r\nHost: y\r\nContent-Length: 3\r\n\r\nabc",
+        "OPTIONS * HTTP/1.1\r\n\r\n",
+        "GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello",
+        "POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 1_0\r\n\r\nhello",
+        "GET / HTTP/1.1\r\nHost: x\r\n folded: value\r\n\r\n",
+        "GET / HTTP/1.1\r\nBrokenHeaderLine\r\n\r\n",
+        "GET /",
+        "\r\n\r\n",
+        "\x00\x01\x02\xff\xfe\xfd",
+    };
+    try std.testing.fuzz({}, fuzzParseRequest, .{ .corpus = &corpus });
+}
+
 test "request headers: OWS after the colon is optional, an unparsable line is a 400" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -5155,6 +5276,141 @@ test "WS write timeout disconnects a peer that stops reading" {
     try std.testing.expect(slow_ws_state.closed);
 
     server.stop();
+}
+
+test "stop() wakes a blocked accept without EBADF panic and unwinds cleanly" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0 });
+    defer server.deinit();
+
+    const th = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, struct {
+        fn run(s: *Server) void {
+            s.start() catch {};
+        }
+    }.run, .{&server});
+    var joined = false;
+    defer {
+        // Failure path: never leave the accept thread blocked in `accept` —
+        // a hung join would turn a red test into a timeout.
+        if (!joined) {
+            server.stop();
+            th.join();
+        }
+    }
+
+    var port: u16 = 0;
+    var tries: usize = 0;
+    while (tries < 200) : (tries += 1) {
+        if (server.listener) |*l| {
+            port = l.socket.address.getPort();
+            break;
+        }
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    try std.testing.expect(port != 0);
+
+    // Let the accept loop actually park inside accept4(). (On this Darwin a
+    // *blocked* accept wakes with ECONNABORTED — clean; the EBADF hazard is
+    // the loop *starting* a fresh accept4 on a closed fd, which the churn
+    // test below hammers.)
+    std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(100), .real) catch {};
+
+    server.stop();
+    th.join();
+    joined = true;
+
+    // The woken loop must have unwound start() — including its
+    // closeListener defer — by the time join returns.
+    try std.testing.expect(server.listener == null);
+
+    // And the port must be free again: a fresh listener binds the address.
+    const addr = try std.Io.net.IpAddress.parseIp4("0.0.0.0", port);
+    var probe = try addr.listen(std.testing.io, .{ .reuse_address = true });
+    probe.deinit(std.testing.io);
+
+    // A second stop() must be harmless.
+    server.stop();
+}
+
+/// Connect flood: keeps the accept backlog non-empty so the accept loop
+/// keeps *returning from* accept4 and re-entering it (never parked in the
+/// syscall) while stop() lands. Raw syscalls on purpose: a std.Io connect
+/// surfaces teardown races (EINVAL on a closing listener) through
+/// unexpectedErrno stack dumps, and here those races are the *expected*
+/// background noise of a stopping server.
+fn stopChurnLoop(port: u16, stop: *std.atomic.Value(bool)) void {
+    var sa: std.posix.sockaddr.in = .{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7f000001), // 127.0.0.1
+        .zero = std.mem.zeroes([8]u8),
+    };
+    while (!stop.load(.monotonic)) {
+        const fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        if (fd < 0) continue;
+        _ = std.c.connect(fd, @ptrCast(&sa), @sizeOf(std.posix.sockaddr.in));
+        _ = std.c.close(fd);
+    }
+}
+
+test "stop() during accept churn never hits the closed-fd EBADF race" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    // Regression: pre-fix stop() closed the listener fd from the stopping
+    // thread. When the accept loop is spinning (backlog non-empty, accept4
+    // returning and re-entering), a fresh accept4 can start on the
+    // just-closed fd → EBADF → std.Io.Threaded errnoBug → Debug panic the
+    // Server layer cannot catch. macOS only wakes a *parked* accept cleanly
+    // (ECONNABORTED), so the churn window needs load to surface — hammer it.
+    var cycle: usize = 0;
+    while (cycle < 15) : (cycle += 1) {
+        var server = Server.initWithConfig(std.testing.io, allocator, .{
+            .port = 0,
+            .header_timeout_ms = 200,
+        });
+        defer server.deinit();
+
+        const th = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, struct {
+            fn run(s: *Server) void {
+                s.start() catch {};
+            }
+        }.run, .{&server});
+        var joined = false;
+        defer if (!joined) {
+            server.stop();
+            th.join();
+        };
+
+        var port: u16 = 0;
+        var tries: usize = 0;
+        while (tries < 200) : (tries += 1) {
+            if (server.listener) |*l| {
+                port = l.socket.address.getPort();
+                break;
+            }
+            std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+        }
+        try std.testing.expect(port != 0);
+
+        var stop_churn = std.atomic.Value(bool).init(false);
+        var churns: [8]?std.Thread = undefined;
+        for (&churns) |*c| {
+            c.* = try std.Thread.spawn(.{}, stopChurnLoop, .{ port, &stop_churn });
+        }
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(50), .real) catch {};
+        server.stop();
+        stop_churn.store(true, .monotonic);
+        for (churns) |c| {
+            if (c) |t| t.join();
+        }
+        th.join();
+        joined = true;
+
+        try std.testing.expect(server.listener == null);
+    }
 }
 
 test "parseFormBody decodes keys and values like the query string" {

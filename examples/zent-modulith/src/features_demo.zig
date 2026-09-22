@@ -413,11 +413,14 @@ pub fn FeedModernApi(comptime Client: type) type {
             var q = self.client.author.Query();
             defer q.deinit();
             _ = try q.WithEdgeOptions("posts", .{ .join = .inner, .limit_mode = .after_edges });
-            const rows = try q.All();
-            defer rows.deinit(); // originals still owned by their allocator
+            var rows = try q.All();
+            // deinitRows (not rows.deinit) also releases the WithEdge-loaded
+            // posts and their strings — zent allocated those on the client
+            // allocator, and the request arena does not own them.
+            defer self.client.author.deinitRows(&rows);
 
             // Copy each author (strings + typed fields + one edge level) into
-            // the arena so serialization borrows nothing after rows.deinit().
+            // the arena so serialization borrows nothing after deinitRows.
             const copies = try arena.alloc(zent.codegen.entity(persist.infos, persist.AuthorInfo), rows.items.len);
             for (rows.items, 0..) |*a, i| {
                 copies[i] = try zent.codegen.dupeEntityTo(persist.infos, persist.AuthorInfo, a, arena);

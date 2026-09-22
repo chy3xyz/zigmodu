@@ -35,6 +35,26 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 
 ---
 
+## v0.33.1
+
+> 本版无破坏性变更。以下为 additive 亮点；完整列表见 [CHANGELOG](../CHANGELOG.md)。
+
+**新增：校验失败的结构化错误体与消息本地化（opt-in）。** `Validation` 中间件新增
+`structured_errors` 与 `message_hook` 选项（`withStructuredErrors()` /
+`withMessageHook()` 链式入口）。开启结构化后，422 响应的 `data` 位携带
+`errors: [{field, rule, message}]`（每失败字段一条），`msg` 仍是首条消息。
+`Validator.validateStructCollect` 返回全部违规（`Violation`/`Violations`，一次
+deinit），`Validator.MessageHook` 可本地化默认规则消息（`FieldRules.message`
+覆写仍优先）。**默认值完全不变**：平坦字符串消息、业务码 4220。装了 RFC 7807
+`error_renderer` 时渲染器收到首条消息（该形状无 `data` 槽）。
+**Breaking?** 否 · **影响面**：用到 `validateRequest` 的消费方可选接入 · **一行改法**：
+`validation_middleware.withStructuredErrors(true)`。
+
+**新增**：`zig build soak-cluster`（cluster/bus 长时正确性 soak）、benchmark 套件
+的 `alloc/op` CI 门禁、首批 fuzz 目标（`zig build --fuzz test`）。均无消费方改法。
+
+---
+
 ## v0.32.0
 
 > **本版有 7 处破坏性变更，其中 3 处是编译错**（WS 路由声明、CSPRNG 的 `io` 参数、`Method.fromString` 返回类型）。
