@@ -251,7 +251,18 @@ docker run --rm -v /tmp/out:/x <同样的目标镜像> ldd /x/bin/tenant-mgmt | 
 Zig 用的 glibc stub 版本比库旧。补上 `.2.34` 即通。**库与目标 ABI 要同源**：musl 目标配
 glibc 编的 `.so` 能链上（Zig 不校验库自身的依赖），但目标机上仍然缺 glibc，属于错误组合。
 
-### 12.4 内存：实测对照与降内存配方
+### 12.4 两个操作陷阱
+
+- **跨编译务必带 `-p <独立前缀>`**（或 `.zig-cache` 之外的 prefix）。不带的话产物会覆盖
+  `zig-out/bin/*` 成**目标平台的 ELF**，随后任何跑本地二进制的脚本都会炸——实测
+  `zig build -Dtarget=aarch64-linux` 之后再跑 `bash scripts/check-deadcode.sh` 得到
+  `OSError: [Errno 8] Exec format error: './zig-out/bin/zmodu'`；`zig build zmodu`
+  重建本地产物即恢复。
+- **`zig build docs` 的产物是构建输出**（`docs/modules.{puml,json,md}`），已在 `.gitignore`
+  里；该步不参与 `test`/`check`，所以 CI 专门加了一条 `zig build docs` 守卫——它曾经
+  烂了两处（`std.heap.GeneralPurposeAllocator` 已删除、`generateDocs` 变成 4 参）而无人发现。
+
+### 12.5 内存：实测对照与降内存配方
 
 同一份源码、同一目标（`aarch64-macOS → x86_64-linux`）、每个配置独立冷缓存，
 `--summary all` 的 MaxRSS 峰值（目标取 `benchmark-build`，只编译不运行）：

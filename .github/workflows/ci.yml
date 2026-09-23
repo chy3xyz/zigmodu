@@ -146,6 +146,14 @@ jobs:
       - name: Production hot-path gate
         run: zig build check
 
+      - name: Docs step compiles
+        # `zig build docs` is a dev step that `test`/`check` never compile, so it
+        # rotted silently: by the time it was run by hand it had two independent
+        # drifts (removed `std.heap.GeneralPurposeAllocator`, and a 3-arg call to
+        # the now-4-arg `generateDocs`). Compiling it here costs seconds and is
+        # the only thing that keeps it honest.
+        run: zig build docs
+
       - name: Tenant-scope compile gate
         run: bash scripts/check-tenant-scope.sh
 

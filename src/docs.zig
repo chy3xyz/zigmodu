@@ -25,10 +25,9 @@ const MockInventory = struct {
     };
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
     std.log.info("=== Generating ZigModu Documentation ===", .{});
 
@@ -37,22 +36,22 @@ pub fn main() !void {
 
     try zigmodu.validateModules(&modules);
 
-    try zigmodu.generateDocs(&modules, "docs/modules.puml", allocator);
+    try zigmodu.generateDocs(&modules, "docs/modules.puml", allocator, io);
     std.log.info("PlantUML docs generated: docs/modules.puml", .{});
 
     const json = try zigmodu.Documentation.generateJsonDocs(&modules, allocator);
     defer allocator.free(json);
 
-    var json_file = try std.Io.Dir.cwd().createFile("docs/modules.json", .{});
-    defer json_file.close(std.testing.io);
-    try json_file.writeStreamingAll(std.testing.io, json);
+    var json_file = try std.Io.Dir.cwd().createFile(io, "docs/modules.json", .{});
+    defer json_file.close(io);
+    try json_file.writeStreamingAll(io, json);
     std.log.info("JSON docs generated: docs/modules.json", .{});
 
     const md = try zigmodu.Documentation.generateMarkdownDocs(&modules, allocator);
     defer allocator.free(md);
 
-    var md_file = try std.Io.Dir.cwd().createFile("docs/modules.md", .{});
-    defer md_file.close(std.testing.io);
-    try md_file.writeStreamingAll(std.testing.io, md);
+    var md_file = try std.Io.Dir.cwd().createFile(io, "docs/modules.md", .{});
+    defer md_file.close(io);
+    try md_file.writeStreamingAll(io, md);
     std.log.info("Markdown docs generated: docs/modules.md", .{});
 }
