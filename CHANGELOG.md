@@ -2,6 +2,112 @@
 
 ## [Unreleased]
 
+### HTTP 服务端加固：长响应头曾静默丢整个响应、body 阶段零超时、读错误被吞（**破坏性：否**，行为修复 + 两个新配置/错误值）
+
+四件事，前两件可被远程触发：
+
+1. **响应头 256B 栈缓冲 → 静默丢响应。** `writeResponse` 用 `line_buf: [256]u8` + `bufPrint`
+   逐行拼头，任何头行超长就抛 `NoSpaceLeft`，冒到调用点只打一行日志然后 **关连接**——
+   客户端收不到一个字节。触发链是现成的：CORS 把请求 `Origin` 原样回显，而
+   `*.example.com` 后缀匹配允许任意长前缀。现在状态行/头/`Content-Length` 全走
+   `w.interface.print`，并给单值加了 **8 KiB 上限**（超限明确报 `error.HeaderTooLarge`；
+   若绕过 API 直写 header map，则回 **500** 而不是丢连接）。
+2. **`setHeader` 不校验 CR/LF。** query/form 值会 percent-decode，`%0d%0a` 于是成为真
+   CR/LF ——handler 把请求值塞进响应头就是响应拆分。现在集中校验（名字 `1*tchar`、
+   值禁 `\r`/`\n`/`\0`），非法返回 `error.InvalidHeader`。
+3. **body 阶段没有任何 deadline**（header 一读完就解除），`Content-Length: 8M` + 每秒
+   1 字节可无限占连接。新增 `Config.body_timeout_ms`（默认 **30 s**，`0` 关；
+   `HTTP_BODY_TIMEOUT_MS` 可覆盖），在空行处 re-arm 而不是清除；超预算回 **408**。
+4. **读错误被吞成 0 字节 → 静默关连接。** `readAll` 把 `EndOfStream` 与 `ReadFailed`
+   都返回 0，调用点报 `IncompleteBody`，而连接循环对该错误**直接 return（不发响应）**。
+   现在 `ReadFailed` 保真：超时/读失败 → **408**，对端半关且 body 不足 → **400**，
+   两种都有响应可观测。顺带 `jsonStruct` 改为直接写进 `self.response_body`
+   （`Writer.Allocating.fromArrayList`），省掉每请求一次分配 + 一次全量 memcpy。
+
+**红→绿**：7 个新用例在修复前全红（`expectError(error.InvalidHeader, …)` 拿到
+`NoSpaceLeft`；`readAll` 读失败返回 0；半截 body 用例断言"有响应"失败；stalled body
+用例断言 2 s 内返回失败；`jsonStruct` 分配数断言失败），修后 `api.Server.test.` **69/69**、
+`api.` 166/166、`http.` 149/149，且既有的逐字节响应断言（`{"ok":true}`、Unicode、转义）
+原样通过。端到端：`zig build integration` OK、zent-modulith smoke **43/43 干净退出无泄漏**。
+
+**行为变化（需知悉）**：`body_timeout_ms` 默认 30 s 让慢上传（8 MB 需持续 ≥ ~270 KB/s）
+从"无界"变成 408——要旧行为设 `0`；`setHeader` 新增 `error.InvalidHeader` /
+`error.HeaderTooLarge`（`!void` 签名未变）；半截 body 从静默关连接变成 400 + warn。
+
+### HTTP 客户端与静态文件：chunked 解帧是 O(n²)、请求头逐行分配、大文件整份驻留内存（**破坏性：否**，行为修复 + 一处行为变化）
+
+- **chunked 解帧换 `std.http.ChunkParser`**（`HttpClient.streamChunkedBody`）：旧实现用
+  `carry` 缓冲每块 `copyForwards` 前移剩余 + `resize`，**量化**后是 96 KiB 报文、
+  16 KiB payload 下 `memmove` **134,201,346 字节 = payload 的 8191 倍**、CRLF 重扫 4099 倍；
+  新实现只拷尺寸行（每块约 3 字节），payload 零拷贝。带一条严格度还原的校验
+  （`ChunkParser` 把 `A-Za-z` 当十六进制位）。新增用例：64×8 KiB 流式与缓冲两条入口
+  结果一致、16384×1 B 单读窗、以及 4 类畸形帧必须报错。
+- **请求头零分配**：4 处 `allocPrint` + `defer free` 换成 `w.interface.print`；该函数签名
+  去掉了 `self`，**函数体内已无 allocator 可达**——每请求 N+2 次分配在编译期无法回归。
+- **静态文件大响应改流式**（`StaticFiles`）：超过 chunk 阈值的 `GET` 走
+  `startChunked` + `writeChunk`（不再把整份文件读进 `response_body`，1 GB 文件不再等于
+  1 GB 峰值）；`HEAD` 恒不走 chunked 所以 `Content-Length` + 空 body 语义不变；
+  `Range`/416/`Content-Range` 不变。
+- **顺带修掉的真缺口**：`HttpClient.readResponse`（非流式的 `get`/`post`）**从不认
+  `Transfer-Encoding: chunked`**，会把分块帧当 body 返回乱码——静态文件改成 chunked 后
+  框架自己的客户端就会踩到。现在两个入口共用同一份解码器。
+
+**行为变化**：超过 chunk 阈值的静态响应不再带 `Content-Length`（RFC 7230 禁止 CL 与 TE
+共存），不认 chunked 的 HTTP/1.0 客户端对大文件应改用 `HEAD`/`Range`；chunked 尾部
+（空 trailer 之外的 trailer、缺末尾 CRLF）现在会报错——旧实现把残留字节留给池中连接的
+下一个响应（静默错位）；`chunk_bytes = 0` 从"静默返回空 body"变成 fail-loud。
+
+### 并发加固：`stats()` 的跨线程裸读（UB）、supervisor 锁快路径、pooled `join()` 无界自旋、RaftLock 烧核（**破坏性：否**，行为修复）
+
+- **`Handle.stats()` 跨线程读 4 个非原子字段**（`thread`/`joined`/`errors_in_window`/
+  `stopped_by_supervisor`），写者之一是 `join()`——跑在 `Runtime.shutdown` 的线程上。
+  **TSan 红→绿**：修复前的副本上 `ThreadSanitizer: data race`（`runtime.zig:895` 写 vs
+  `:816` 读），修复后干净。`thread` 是结构体不是指针（`std.atomic.Value(?std.Thread)`
+  编译不过），所以新增 `thread_live: std.atomic.Value(bool)` 与它在同两条语句上翻面，
+  取值与旧 `thread != null` **逐点等价**（含 `join` 中的微窗口）。`errors_in_window`
+  的写者全在 worker 自己线程上、无残留非原子写；`stopped_by_supervisor` 改原子后
+  `countSupervisedStop` 的 release/acquire 发布关系不变（反而更强）。
+- **supervisor 锁快路径 `swap` → `cmpxchgWeak` + 32 轮后 `Thread.yield()`**（照仓库
+  `core/SpinLock.zig` 的形态）；微基准（4 线程 × 40 万次加锁）**73–97 ns → 25–34 ns**。
+- **pooled `join()` 从无界自旋改为有界**：前 1024 轮 `spinLoopHint`（覆盖常规的批次
+  hand-back，微秒级、无系统调用），之后每 **1 ms** `std.Io.sleep` 轮询同一谓词。
+  实测：handler 持有 claim 150 ms 时，等待者自身 CPU **140,898 µs → 976 µs（~145×）**；
+  `runtime-stress` 整机停机 49 ms。代价是谓词翻转后最多晚 1 ms 返回。
+- **`RaftLock` 三档等待**（`RaftElection`）：`swap` 无界自旋 → `cmpxchgWeak` 快路径 →
+  32 轮自旋 → 128 轮 `yield` → 每轮 1 ms 的 `std.posix.poll(&.{}, 1)` 睡眠。该文件拿不到
+  `io`（`ClusterBootstrap` 有 `io` 但从不传给 `RaftElection`，且要改 15 个入口/约 30 个
+  调用点），所以用 poll 而不是 `std.Io.sleep`；Windows/WASI 无 `poll` 时退化为 `yield`。
+  实测持锁者睡 120 ms 时等待者 CPU **120 ms → 0 ms**（单 `yield` 无用：仍是 116 ms，
+  因为持锁者在等 syscall、`yield` 立刻返回）。新增两个用例：慢 RPC 下等待者 CPU 上界、
+  互斥与 `isHeld` 语义；`soak-cluster` 全绿（≤1 ms 交接延迟可接受）。
+
+### CI 与构建加固：两个门禁可能"因工具缺失而变绿"、测试步骤无超时、夜间从不跑并发 harness（**破坏性：否**）
+
+- **`check-api` 的 `rg` 缺失会静默通过**（`if rg -q …` 退出 127 → 假分支 → 步骤成功，
+  `2>/dev/null` 还把报错吃了）。加 `command -v rg` 前置检查——实测：`rg` 不可见时
+  exit 1 + 明确报错（旧写法等效片段返回 0，即原缺陷）。
+- **测试步骤统一 `--test-timeout 300s`**（5 处），并给 `build-and-test`/`lint`/`examples`/
+  `integration-full`/`test-postgres`/`test-mysql`/`test-live-services`/`benchmark` 补
+  `timeout-minutes`；`test-postgres` 原本是**裸 `zig build test` 且无 job 超时**（挂住可烧
+  6 小时、无日志），现在走 `ci-run-logged.sh` 并上传日志 artifact。
+- **失败 artifact 从整个 `.zig-cache/` 收窄为日志**（前者体积大、不可读，白烧 10 GB 配额）。
+- **夜间 job 补上从未跑过的并发 harness**：`zig build soak-cluster`（raft 选举/复制 +
+  总线不变量）、`zig build runtime-stress -Druntime-stress-duration-ms=60000`、以及有界
+  fuzz `zig build test --fuzz=2000`（不给上限会开 webui 永久运行；与 `-Dtest-filter`
+  互斥是设计使然）。这三个只挂 `schedule`/`workflow_dispatch`，不加
+  `continue-on-error`（那正是"隐藏失败"）。
+- **`soak-cluster` 的 RSS 预算重校准（128 MiB，CI 显式给 192）与一条未结发现。** 把它接进
+  CI 时它在本机红了，追下去是两件事：① 这个断言的默认 64 MiB 在本机**本来就在边缘**——
+  用 `f00269a`（本批次之前的 HEAD）建 worktree 对照，**未改动的树** 2400/写者跑三次是
+  42 / 63 / 70 MiB，确实能过但余量很薄；② 把流量翻倍（4800/写者）后**基线与本树都失败**
+  （基线 12→108 MiB、本树 11→163 MiB 且仍在涨），说明**增长随流量线性、且早于本批次存在**，
+  而每一轮 `std.testing` 的泄漏检查都是 `0 leaked` —— 所以这个指标量到的是**分配器页驻留**，
+  真正的泄漏门禁是那条 `0 leaked`。因此默认值抬到 128 并写明标定数据，CI 里显式给 192
+  （Linux runner 的分配器行为不该是掷硬币）。**未结部分**：同样 2× 流量下本树比基线多约
+  +55 MiB，二分测试给不出干净归因（单独加 runtime/supervisor 是 34 MiB、单独加
+  `RaftElection` 是 74 MiB，都在基线自身的 42–70 波动范围内），需要堆剖析才能定论。
+
+
 ### 跨编译可带 sqlite：`SQLITE_INCLUDE` / `SQLITE_LIB` 覆盖 + 跨编译口径落文档（**破坏性：否**）
 
 `examples/_shared/db_link.zig` 原先只给 postgres/mysql 留了环境变量覆盖，sqlite 是裸

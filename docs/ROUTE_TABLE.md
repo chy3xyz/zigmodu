@@ -489,6 +489,7 @@ catalog_slot.set(try router.finish());
 |----|------|--------|
 | 连接 | `max_connections` / `over_limit_response` | accept 洪泛、fd/内存耗尽 |
 | 头部 | `header_timeout_ms` | slowloris（慢速滴 header）；header 读完即解除，不误杀慢上传 |
+| 请求体 | `body_timeout_ms`（默认 30 s，`0` 关） | 慢滴 body / Slow-POST：header 之后 body 读完之前的预算；超预算回 **408** |
 | 请求 | `request_timeout_ms` | handler 执行时长 |
 | WS 出站 | `ws_write_timeout_ms` + `WsFramer.isWritable()` | 不读的慢客户端阻塞写线程 |
 

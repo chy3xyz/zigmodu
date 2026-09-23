@@ -494,6 +494,16 @@ pub const RuntimeStats = struct {
 
 // ==== §4  Handle & WorkerContext ====
 
+/// Rounds `Handle.join` spins on a pooled worker before it starts polling. The
+/// hand-back at the end of a batch is microseconds away in the intended case, so
+/// a budget this size rides it out without a syscall; anything longer than that
+/// is a handler still running, which is a wait and not a spin.
+const join_spin_rounds = 1024;
+/// How long `Handle.join` sleeps between polls once it is past that budget — the
+/// same 1 ms shape the runtime's other "not yet, look again" waits use (the pool's
+/// idle park, `RaftTransport`'s retry loops).
+const join_poll_interval = std.Io.Duration.fromMilliseconds(1);
+
 /// A runtime-owned worker. `*Handle(W, capacity)` is what `spawn` returns; the
 /// type-erased `WorkerHandle` view is what the runtime keeps for shutdown.
 pub fn Handle(comptime W: type, comptime capacity: usize) type {
@@ -552,12 +562,28 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         /// its delta (see there), not a second reading of the counter above.
         counted_at_stop: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
         supervision: Supervision = .{},
-        /// Supervisor bookkeeping. Owned by the worker's own thread (only it
-        /// handles messages), so plain fields — no atomics.
-        errors_in_window: u32 = 0,
+        /// Supervisor bookkeeping. Written by the worker's own thread (only it
+        /// handles messages) — atomic anyway, because `stats()` is a *scrape*: a
+        /// monitoring thread reads these while the worker is still serving, and a
+        /// plain field written by one thread and read by another is a data race
+        /// (the sanitizer build reports it), not merely a stale reading. The
+        /// ordering follows this file's rule — `.monotonic` where the reader is
+        /// the writer's own thread, `.acquire` where it is not — and `stats()`
+        /// itself takes them relaxed: it publishes a *snapshot*, and nothing is
+        /// concluded from a pair of these values.
+        errors_in_window: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
         window_start_ms: i64 = 0,
-        stopped_by_supervisor: bool = false,
-        joined: bool = false,
+        stopped_by_supervisor: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        /// A dedicated worker's thread exists, and the join is over. Two atomics
+        /// rather than the `?std.Thread` itself, because `?Thread` is a
+        /// non-pointer optional with no guaranteed atomic form (`std.atomic
+        /// .Value(?std.Thread)` does not compile — measured), and `stats()` has
+        /// no business reading the thread handle anyway. `thread` stays plain and
+        /// is written by `join` alone: it is set at spawn and cleared in `join`,
+        /// and `thread_live` mirrors exactly those two moments, which is what
+        /// keeps the pair from drifting.
+        thread_live: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        joined: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         /// Set for `.pooled` workers only: the scheduler that runs this worker,
         /// plus the bits it shares with it (`claimed`/`queued`). Null for a
         /// dedicated worker, whose readiness the mailbox's own condition
@@ -809,11 +835,14 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
                 // for a dedicated worker that is its thread having started (and
                 // not yet joined), for a pooled one it is the claim — which is
                 // also why the pooled total can never exceed the number of pool
-                // threads (docs/RUNTIME.md §12.9).
+                // threads (docs/RUNTIME.md §12.9). The dedicated half is read off
+                // `thread_live`/`joined`, never off `thread`: this runs on
+                // whatever thread asked, and `join` — another thread — is what
+                // clears both flags.
                 .running = if (self.pool != null)
                     self.claimed.load(.acquire)
                 else
-                    self.thread != null and !self.joined,
+                    self.thread_live.load(.monotonic) and !self.joined.load(.monotonic),
                 .mailbox_capacity = capacity,
                 .mailbox_len = ms.len,
                 .sent = ms.sent,
@@ -821,8 +850,8 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
                 .dropped_full = ms.dropped_full,
                 .discarded_on_stop = self.discarded_on_stop.load(.monotonic),
                 .handler_errors = self.handler_errors.load(.monotonic),
-                .errors_in_window = self.errors_in_window,
-                .stopped_by_supervisor = self.stopped_by_supervisor,
+                .errors_in_window = self.errors_in_window.load(.monotonic),
+                .stopped_by_supervisor = self.stopped_by_supervisor.load(.monotonic),
                 .group_restarts = self.group_restarts.load(.monotonic),
             };
         }
@@ -835,13 +864,19 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         /// on the same counter, because the reading is "this worker was stopped
         /// by the framework, not by `shutdown`".
         fn countSupervisedStop(self: *Self) void {
-            if (!self.stopped_by_supervisor and !self.stopped_by_group.load(.acquire)) return;
+            // `acquire`, not `monotonic`, on the flag half that another thread may
+            // have written last: this runs from the `abandon` thunk as well, i.e.
+            // off `Runtime.shutdown`'s thread, and it is `stopped_by_supervisor`
+            // (written by the worker, or by the pool on its behalf) that decides
+            // what the count below means.
+            if (!self.stopped_by_supervisor.load(.acquire) and !self.stopped_by_group.load(.acquire)) return;
             if (self.supervised_stop_counted.swap(true, .acq_rel)) return;
-            // `release`, not `monotonic`: the plain `stopped_by_supervisor` flag
-            // written above is what a reader of this counter wants to conclude
-            // from, so the counter has to publish it. An acquire load of the
-            // counter (which is how `Published` in this file's tests reads it)
-            // then orders the flag behind it.
+            // `release`, not `monotonic`: the `stopped_by_supervisor` flag written
+            // above is what a reader of this counter wants to conclude from, so
+            // the counter has to publish it. A relaxed atomic store is still a
+            // write that this release orders, and an acquire load of the counter
+            // (which is how `Published` in this file's tests reads it) then orders
+            // the flag behind it.
             _ = self.runtime.supervised_stops.fetchAdd(1, .release);
         }
 
@@ -854,10 +889,19 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
         }
 
         pub fn join(self: *Self) void {
-            if (self.joined) return;
+            // Idempotent, and called concurrently (`shutdown` is documented as
+            // re-entrant): the load is the reason the early return is not a race
+            // either — with two callers, both may pass it, but the body below is
+            // written to be safe for the one that gets there first (`shutdown`
+            // serialises on its own mutex today).
+            if (self.joined.load(.acquire)) return;
             if (self.thread) |t| {
                 t.join();
+                // The thread handle is the plain field; `thread_live` is what
+                // `stats()` reads, and it goes down at the same moment — a scrape
+                // never sees "running" after the join took the thread away.
                 self.thread = null;
+                self.thread_live.store(false, .release);
             } else if (self.pool) |link| {
                 // A pooled worker has no thread of its own, so "joined" has to
                 // mean both halves of "there is nothing left to run for it": no
@@ -882,17 +926,46 @@ pub fn Handle(comptime W: type, comptime capacity: usize) type {
                 // the policy declares), so waiting for it empty would wait
                 // forever. The messages are counted by the batch that abandoned
                 // them; `join` returning here is what makes that count readable.
+                var spins: u32 = 0;
                 while (self.claimed.load(.acquire) or
                     (self.mailbox.len() != 0 and !self.abandoned.load(.acquire) and
                         !link.scheduler.stopping.load(.acquire)))
                 {
-                    // Spins rather than parking: this is a startup/shutdown-path
-                    // call, and a condition variable here would put a signal on
-                    // the hand-back's hot path for nobody.
-                    std.atomic.spinLoopHint();
+                    // Spin briefly, then poll. The predicate can hold for as long
+                    // as a handler takes: `claimed` is handed back only once the
+                    // batch returns, and a long call inside it (an SDK round trip)
+                    // is the case this has to tolerate — so an unbounded
+                    // `spinLoopHint` loop is not "waiting", it is owning a core for
+                    // the duration of somebody else's work. Polling the same
+                    // predicate keeps the wait honest whatever the hold turns out
+                    // to be.
+                    //
+                    // Not parked, which is what the alternative would be: a signal
+                    // would have to be published on the hand-back's hot path (D5's
+                    // claim release) for a wait that only ever happens on the
+                    // startup/shutdown path. `std.Io.Event.set` would not cost a
+                    // syscall with no waiter, but a latch is the wrong shape for
+                    // *this* predicate: it can un-hold and re-hold itself (the pool
+                    // re-claims the worker, a producer refills the mailbox), so a
+                    // wait has to re-read all three conditions anyway — which is
+                    // exactly what a poll does, at a cost of one syscall per round
+                    // trip instead of one signal per hand-back.
+                    if (spins < join_spin_rounds) {
+                        spins += 1;
+                        std.atomic.spinLoopHint();
+                        continue;
+                    }
+                    std.Io.sleep(self.runtime.io, join_poll_interval, .awake) catch |err| {
+                        // A failed sleep is benign — the next iteration re-checks
+                        // the predicate — but it is still an error, so say so
+                        // rather than swallowing it.
+                        std.log.debug("[runtime] join of {s}: sleep failed ({s}), retrying", .{
+                            self.context.name, @errorName(err),
+                        });
+                    };
                 }
             }
-            self.joined = true;
+            self.joined.store(true, .release);
         }
 
         fn deinit(self: *Self, allocator: std.mem.Allocator) void {
@@ -1634,6 +1707,10 @@ pub const Runtime = struct {
             try s.start();
         } else {
             handle.thread = try std.Thread.spawn(.{}, workerMain(W, capacity), .{handle});
+            // Published *after* the handle exists, and cleared in `join` at the
+            // same moment `thread` is: `stats()` reads this pair, never `thread`
+            // (which another thread writes), so the two have to move together.
+            handle.thread_live.store(true, .release);
         }
         return handle;
     }
@@ -2239,7 +2316,7 @@ fn workerMain(comptime W: type, comptime capacity: usize) fn (*Handle(W, capacit
                     const wake_from = if (in_group) handle.mailbox.wakeEpoch() else 0;
                     if (handle.restart_requested.load(.acquire) and !handle.stop_requested.load(.acquire)) {
                         rebuildWorker(W, H, handle);
-                        if (handle.stopped_by_supervisor) break;
+                        if (handle.stopped_by_supervisor.load(.monotonic)) break;
                         continue;
                     }
                     if (handle.stop_requested.load(.acquire) and handle.mailbox.len() == 0) break;
@@ -2255,7 +2332,7 @@ fn workerMain(comptime W: type, comptime capacity: usize) fn (*Handle(W, capacit
                         .keep => {},
                         .rebuild => {
                             rebuildWorker(W, H, handle);
-                            if (handle.stopped_by_supervisor) break;
+                            if (handle.stopped_by_supervisor.load(.monotonic)) break;
                         },
                         // A supervisor's stop. `.immediate` is what a dedicated
                         // worker has always done and `.drain` is what a pooled one
@@ -2382,7 +2459,7 @@ fn pooledDispatch(comptime W: type, comptime H: type) *const fn (*anyopaque, usi
                     // `started` stays true across the rebuild — the destroy path
                     // reads it to decide whether a `deinit` is owed, and one is.
                     rebuildWorker(W, H, handle);
-                    if (handle.stopped_by_supervisor) return false;
+                    if (handle.stopped_by_supervisor.load(.monotonic)) return false;
                 } else {
                     // Asked for before the first claim: there is no generation to
                     // tear down, so this is a no-op rather than a rebuild — but
@@ -2415,7 +2492,7 @@ fn pooledDispatch(comptime W: type, comptime H: type) *const fn (*anyopaque, usi
                     // provoked (`pooledPending`) just to come back.
                     .rebuild => {
                         rebuildWorker(W, H, handle);
-                        if (handle.stopped_by_supervisor) return false;
+                        if (handle.stopped_by_supervisor.load(.monotonic)) return false;
                     },
                     // A supervisor's stop. `.drain` (the pooled default) is what
                     // the pool has always done: end the *batch* and let the
@@ -2482,9 +2559,12 @@ fn supervise(comptime W: type, comptime H: type, handle: *H, err: anyerror) Outc
     const now = handle.runtime.clock.nowMs();
     if (handle.supervision.window_ms > 0 and now - handle.window_start_ms > handle.supervision.window_ms) {
         handle.window_start_ms = now;
-        handle.errors_in_window = 0;
+        handle.errors_in_window.store(0, .monotonic);
     }
-    handle.errors_in_window += 1;
+    // Own thread, so a relaxed read-modify-write — but atomic, because a scrape
+    // may be reading this counter while the handler that just failed is being
+    // accounted for.
+    _ = handle.errors_in_window.fetchAdd(1, .monotonic);
 
     // The actor's own opinion wins when declared; otherwise the strategy.
     const decision: Supervision.Strategy = if (@hasDecl(W, "onError"))
@@ -2493,7 +2573,7 @@ fn supervise(comptime W: type, comptime H: type, handle: *H, err: anyerror) Outc
         handle.supervision.strategy;
 
     const over_budget = handle.supervision.max_errors != 0 and
-        handle.errors_in_window > handle.supervision.max_errors;
+        handle.errors_in_window.load(.monotonic) > handle.supervision.max_errors;
     const must_stop = decision == .stop or over_budget;
 
     // The trace of the message whose handler just failed — this is what
@@ -2501,6 +2581,7 @@ fn supervise(comptime W: type, comptime H: type, handle: *H, err: anyerror) Outc
     // errored". Read here, before the loop clears `current_trace`.
     var tag_buf: [trace_tag_len]u8 = undefined;
     const tag = traceTag(handle.context.traceId(), &tag_buf);
+    const in_window = handle.errors_in_window.load(.monotonic);
 
     if (must_stop) {
         // In a group, the decision is not this member's to make (§14.4). The
@@ -2517,7 +2598,7 @@ fn supervise(comptime W: type, comptime H: type, handle: *H, err: anyerror) Outc
                         .{
                             @typeName(W),
                             tag,
-                            handle.errors_in_window,
+                            in_window,
                             @tagName(decision),
                             if (over_budget) ", over budget" else "",
                             @errorName(err),
@@ -2528,11 +2609,15 @@ fn supervise(comptime W: type, comptime H: type, handle: *H, err: anyerror) Outc
             }
         }
 
-        handle.stopped_by_supervisor = true;
+        // `release`, not `monotonic`: this is the flag the *release* on
+        // `supervised_stops` below publishes to whoever counts the stop (see
+        // `countSupervisedStop`), and it says "I decided my own stop" — the other
+        // half of that counter's meaning.
+        handle.stopped_by_supervisor.store(true, .release);
         std.log.warn("[runtime] {s}{s} stopped by supervisor after {d} error(s) in window ({s}{s}); last: {s}", .{
             @typeName(W),
             tag,
-            handle.errors_in_window,
+            in_window,
             @tagName(decision),
             if (over_budget) ", over budget" else "",
             @errorName(err),
@@ -2542,7 +2627,7 @@ fn supervise(comptime W: type, comptime H: type, handle: *H, err: anyerror) Outc
     }
 
     std.log.warn("[runtime] {s}{s} handler error ({d} in window): {s}", .{
-        @typeName(W), tag, handle.errors_in_window, @errorName(err),
+        @typeName(W), tag, in_window, @errorName(err),
     });
     return .keep;
 }
@@ -2567,14 +2652,14 @@ const Outcome = enum {
 fn rebuildWorker(comptime W: type, comptime H: type, handle: *H) void {
     handle.countGroupRestart();
     if (@hasDecl(W, "deinit")) W.deinit(&handle.state);
-    handle.errors_in_window = 0;
+    handle.errors_in_window.store(0, .monotonic);
     handle.restart_requested.store(false, .release);
     // An `init` failure on the way back up is fatal for this generation and is
     // *not* handed to the group again: there is no half-started state to
     // supervise, and asking the group would be exactly the "init loop" the
     // restart budget exists to prevent. It stops, and it says which stop it was.
     if (!startWorker(W, H, handle)) {
-        handle.stopped_by_supervisor = true;
+        handle.stopped_by_supervisor.store(true, .release);
         return;
     }
     handle.window_start_ms = handle.runtime.clock.nowMs();
@@ -5244,8 +5329,7 @@ test "Runtime: two threads calling shutdown at once are safe" {
             .scheduler = .{ .max_pooled_workers = 1 },
         });
         // Both kinds of worker: the pooled one is the scheduler's thread to join,
-        // the dedicated one owns a thread of its own and a `joined` flag that is
-        // not atomic either.
+        // the dedicated one owns a thread of its own.
         const pooled = try rt.spawn(CounterWorker, .{}, .{ .capacity = 8, .mode = .pooled });
         const dedicated = try rt.spawn(CounterWorker, .{}, 8);
         try pooled.send(1);
@@ -5262,6 +5346,138 @@ test "Runtime: two threads calling shutdown at once are safe" {
         try std.testing.expectEqual(@as(usize, 0), rt.stats().running);
         rt.deinit(); // ...and a third, sequential call is still a no-op
     }
+}
+
+/// How long the pooled `join` test's handler holds its claim, and the CPU budget
+/// a thread waiting for it may spend. The gap between the two is the assertion:
+/// the handler sleeps, so a waiter that *waits* spends ~0 while one that spins
+/// spends the whole hold.
+const join_wait_hold_ms = 150;
+const join_wait_cpu_budget_ns = 60 * std.time.ns_per_ms;
+
+/// Process CPU time (`utime` + `stime`), in nanoseconds. Wall time cannot tell
+/// "waiting" from "spinning" — both take the same hold — and `std` exposes no
+/// per-thread reading here. `who = 0` is `RUSAGE_SELF` on every platform Zig
+/// targets, which is the honest scope anyway: the test's other threads are
+/// asleep, so the process's CPU *is* the waiter's.
+fn processCpuNanos() u64 {
+    const usage = std.posix.getrusage(0);
+    const user_s: i64 = @intCast(usage.utime.sec);
+    const user_us: i64 = @intCast(usage.utime.usec);
+    const sys_s: i64 = @intCast(usage.stime.sec);
+    const sys_us: i64 = @intCast(usage.stime.usec);
+    return @intCast((user_s + sys_s) * std.time.ns_per_s + (user_us + sys_us) * std.time.ns_per_us);
+}
+
+test "Runtime: a pooled join waits for a claim without burning a core" {
+    // The wait is the thing under test, so the handler *blocks* for a known span
+    // and leaves the claim held for all of it (`join`'s predicate is
+    // `claimed == true` until the batch hands it back). A wait on a handler that
+    // is still running is exactly the case an unbounded `spinLoopHint` loop gets
+    // wrong: a long handler — an SDK call, the reason `join` has to tolerate one —
+    // turns "wait for it" into "own a core for as long as it takes".
+    const Slow = struct {
+        pub const Message = u32;
+        started: *std.atomic.Value(bool),
+
+        pub fn handle(self: *@This(), msg: u32, ctx: anytype) anyerror!void {
+            _ = msg;
+            self.started.store(true, .release);
+            try std.Io.sleep(ctx.io, std.Io.Duration.fromMilliseconds(join_wait_hold_ms), .awake);
+        }
+    };
+
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = try Runtime.initWithOptions(std.testing.allocator, std.testing.io, .{
+        .clock = .{ .manual = &clk },
+        .scheduler = .{ .max_pooled_workers = 1 },
+    });
+    defer rt.deinit();
+
+    var started = std.atomic.Value(bool).init(false);
+    const h = try rt.spawn(Slow, .{ .started = &started }, .{ .capacity = 4, .mode = .pooled });
+    try h.send(1);
+    // Measure from the moment the handler really owns the claim, so the window
+    // is "waiting for a running handler" and not the microseconds before the
+    // pool picked the message up.
+    try waitUntil(Flag(@TypeOf(started)){ .value = &started }, 5_000);
+
+    const before = processCpuNanos();
+    h.join();
+    const spent = processCpuNanos() - before;
+
+    // Printed only when it is about to fail: a green run stays quiet, and a red
+    // one says how far off it was instead of just "TestUnexpectedResult".
+    if (spent >= join_wait_cpu_budget_ns) std.debug.print(
+        "[join-wait] {d} us of CPU spent waiting for a handler that held its claim for {d} ms (budget {d} us)\n",
+        .{ spent / 1000, join_wait_hold_ms, join_wait_cpu_budget_ns / 1000 },
+    );
+    try std.testing.expect(spent < join_wait_cpu_budget_ns);
+}
+
+test "Runtime: stats() reads soundly while another thread joins the worker" {
+    // `stats()` is a scrape: a monitoring thread calls it while the runtime is
+    // doing anything at all, `shutdown`'s joins included. For a dedicated worker
+    // it reads `thread`/`joined`, and it reads the supervisor's bookkeeping
+    // (`errors_in_window`/`stopped_by_supervisor`) — all four written by *other*
+    // threads (the joining one, and the worker's own on its error path), which is
+    // a data race no assertion here can see: the window is a handful of
+    // instructions wide. What this pins is the part that is observable — the
+    // reading on both sides of the join, taken from a thread that spends the join
+    // inside `stats()` — and it is the shape the sanitizer build of this file
+    // (`zig test -fsanitize-thread`) is pointed at.
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(std.testing.allocator, std.testing.io, .{ .manual = &clk });
+    defer rt.deinit();
+
+    const h = try rt.spawn(CounterWorker, .{}, 8);
+    try h.send(1);
+    try h.send(2);
+    try std.testing.expect(h.stats().running); // the thread has started, no join yet
+
+    const Reader = struct {
+        fn run(
+            handle: *Handle(CounterWorker, 8),
+            stop: *std.atomic.Value(bool),
+            calls: *std.atomic.Value(u32),
+            torn: *std.atomic.Value(bool),
+        ) void {
+            var n: u32 = 0;
+            while (!stop.load(.acquire)) {
+                const s = handle.stats();
+                // Whatever the interleaving, the reading has to stay *shape*-
+                // sound: a mailbox length past its capacity cannot come from any
+                // real state of this worker.
+                if (s.mailbox_len > s.mailbox_capacity) torn.store(true, .release);
+                n += 1;
+                calls.store(n, .release);
+                std.atomic.spinLoopHint();
+            }
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    var calls = std.atomic.Value(u32).init(0);
+    var torn = std.atomic.Value(bool).init(false);
+    const reader = try std.Thread.spawn(.{}, Reader.run, .{ h, &stop, &calls, &torn });
+    // Let the reader reach `stats()` *before* the join writes anything: that is
+    // what puts the two accesses in the sanitizer's conflicting pair.
+    try waitUntil(Published(@TypeOf(calls), u32){ .value = &calls, .want = 1 }, 5_000);
+
+    h.stop(); // a dedicated `join` waits for the *thread*, which stops on this
+    h.join(); // ...while the reader is calling `stats()`
+
+    // The same reading after the join: nothing is running, the supervisor never
+    // touched it, and the handle is still readable (it outlives the join).
+    const after = h.stats();
+    try std.testing.expect(!after.running);
+    try std.testing.expectEqual(@as(u32, 0), after.errors_in_window);
+    try std.testing.expect(!after.stopped_by_supervisor);
+    try std.testing.expectEqual(@as(u32, 2), after.received); // both were handled
+
+    stop.store(true, .release);
+    reader.join();
+    try std.testing.expect(!torn.load(.acquire));
+    try std.testing.expect(calls.load(.acquire) >= 1);
 }
 
 test "Runtime: a `run`-owned worker cannot be pooled" {
@@ -5850,7 +6066,7 @@ test "Supervision (§14): spending the restart budget takes the group down, and 
     try std.testing.expectEqual(@as(u64, 2), rt.stats().supervised_stops);
     // Still two: an action the budget refused is not a rebuild.
     try std.testing.expectEqual(@as(u64, 2), rt.stats().group_restarts);
-    try std.testing.expect(a.stopped_by_supervisor);
+    try std.testing.expect(a.stopped_by_supervisor.load(.acquire));
     // `b` was taken down *by the group*, which is the other reason a member can
     // stop — and it is why the two flags exist separately.
     try std.testing.expect(b.stopped_by_group.load(.acquire));

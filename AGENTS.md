@@ -121,7 +121,7 @@ CI、`scripts/ci-*.sh`、本文件都用那个。`cd tools/zmodu && zig build` �
 | 发布是单写者整份替换；`error.ReadersBusy` 当作"下个 tick 再发" | 把 `ReadersBusy` 当致命错误重试到死（读者卡住时该跳过这次发布） |
 | 取参数：路由占位 `pathParam`；form/query 用 `requestParam`（form 优先）或 `nestedParam`（点号路径） | 以为 `ctx.param` 会回退到 query/form（它只读路由占位符） |
 | 应用 root 接 `pub const panic = zmodu.panicHook`（panic 时输出当前请求 METHOD/path） | 请求路径 `catch unreachable` / `@panic`（audit b19–b21 拦截） |
-| 生产配置 `max_connections` + `header_timeout_ms`（连接洪泛/slowloris）；发布前 `zig build soak` | 只设 `request_timeout_ms` 就当防住了慢连接（它只管 handler 阶段） |
+| 生产配置 `max_connections` + `header_timeout_ms` + `body_timeout_ms`（连接洪泛/slowloris/Slow-POST）；发布前 `zig build soak` | 只设 `request_timeout_ms` 就当防住了慢连接（它只管 handler 阶段，`body_timeout_ms` 默认 30 s、`0` 关） |
 | 租户来源：JWT `aud` → attr（`.tenant_source = .attr`） | 从 query 取租户（`.query` 可被客户端篡改，audit b22 拦截） |
 | 生产一行接入：`http.productionProfile(&server, .{...}, &state)`（背压+安全+`/metrics`+`/health/*`+`/metrics` 黄金信号） | 在 `router.mountAll`/`addRoute` 之后再挂全局中间件（`addRoute` 注册时快照中间件链） |
 | WS 出站：`Server.Config.ws_write_timeout_ms` + `WsFramer.isWritable()` 丢帧 | 对不读的慢客户端无限阻塞写（会卡住写线程与 `ConnectionRegistry` shard 锁） |

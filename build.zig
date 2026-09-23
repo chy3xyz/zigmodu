@@ -179,9 +179,19 @@ pub fn build(b: *std.Build) void {
     docs_step.dependOn(&docs_run.step);
 
     // Fail if examples reintroduce deprecated http_server imports
+    //
+    // The `command -v` guard is load-bearing: without it a missing `rg` makes
+    // the shell exit 127, the `if` takes the false branch, and the gate reports
+    // success — silently, and exactly on the machines (fresh containers, new
+    // contributors) where nobody would notice. `2>/dev/null` used to swallow
+    // the "command not found" that would have hinted at it.
     const check_api_cmd = b.addSystemCommand(&.{
         "sh", "-c",
-        \\if rg -q 'zigmodu\.http_server' examples/ 2>/dev/null; then
+        \\command -v rg >/dev/null 2>&1 || {
+        \\  echo "error: ripgrep (rg) is required by check-api but was not found on PATH" >&2
+        \\  exit 1
+        \\}
+        \\if rg -q 'zigmodu\.http_server' examples/; then
         \\  echo "error: examples/ must use zigmodu.http, not zigmodu.http_server" >&2
         \\  rg 'zigmodu\.http_server' examples/
         \\  exit 1

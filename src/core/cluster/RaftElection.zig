@@ -10,9 +10,10 @@
 //! Reference: Ongaro & Ousterhout, "In Search of an Understandable Consensus Algorithm"
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Time = @import("../Time.zig");
 
-/// Spin lock guarding a `RaftElection`'s state.
+/// The lock guarding a `RaftElection`'s state.
 ///
 /// The algorithm's entry points are driven from two threads in the documented
 /// wiring (`docs/DISTRIBUTED.md`): the app's tick loop calls `tick()`, while the
@@ -25,11 +26,24 @@ const Time = @import("../Time.zig");
 /// stop is a process ABRT: `double free of [addr: …, len: 9]` out of
 /// `handleVoteRequest` racing `startElection`.
 ///
-/// A spin lock rather than `std.Io.Mutex`: what is guarded is a handful of
-/// in-memory field updates on a state machine that ticks at heartbeat rates,
-/// and the inbound accept thread is an OS thread spawned outside the `io`'s own
-/// pool — the same reason `scheduler.zig` coordinates its pool threads with
-/// atomics.
+/// Not `std.Io.Mutex`, and not by preference: **this file has no `io`**, and
+/// threading one in is not a local change. `ClusterBootstrap` owns the `io`
+/// (`ClusterBootstrap.zig:97`) but reaches this file without it — it calls
+/// `RaftElection.init(self.allocator, self.config.node_id, …)` at `:266` and
+/// `raft.tick()` at `:471` — and the accept thread reaches the handlers through
+/// `RaftTransport.handleConnection(raft, addresses, conn)` (`RaftTransport.zig:699`),
+/// which takes no `io` either (the one that does, `InboundImpl.init` at `:547`,
+/// keeps it for its own socket and never stores it on the raft). Adding a
+/// parameter would change `init` plus all fifteen public entry points and their
+/// ~30 call sites, in `ClusterBootstrap.zig` / `RaftTransport.zig` /
+/// `DistributedIntegrationTest.zig`. It would also put `error.Cancelable` — which
+/// `std.Io.Mutex.lock` can return — on the error set of seven accessors that
+/// return a plain value today (`isLeader`, `getLeader`, `getTerm`, `logLen`,
+/// `getCommitIndex`, `getLogEntry`, `getState`).
+///
+/// So the wait sleeps without an `Io` instead ([`sleepWithoutIo`]). What it is
+/// *not* is the flat spin it used to be: see `acquire` for why that mattered
+/// here more than the exclusion did.
 ///
 /// Deliberately **not** covered: `deinit` (terminal, see its doc), and
 /// `clusterSize` / `quorumSize` / `hasQuorum`, which read only the membership
@@ -37,8 +51,84 @@ const Time = @import("../Time.zig");
 pub const RaftLock = struct {
     flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+    /// The wait's three budgets, in loop rounds.
+    ///
+    /// `spin_rounds` covers micro-contention — a holder that is a few
+    /// instructions into its critical section, including the accessors' whole
+    /// bodies. `yield_rounds` covers a holder that is runnable but not currently
+    /// scheduled, where handing over the slice is cheaper than waiting the budget
+    /// out. Past both, the holder is not coming back within a scheduling quantum
+    /// and the only thing left that helps is to stop running; `core/SpinLock.zig`
+    /// stops at the second stage, which is right for the short sections it
+    /// guards and wrong for this one.
+    const spin_rounds: u32 = 32;
+    const yield_rounds: u32 = 128;
+
+    /// How long the sleep stage sleeps per round. One millisecond — the same
+    /// figure `runtime/scheduler.zig` parks on (`idle_wait_ms`), and for the same
+    /// reason: it is the granularity that costs nothing next to the waits it
+    /// exists for, while keeping the release-to-acquire hand-off delay bounded.
+    const sleep_ms: u32 = 1;
+
+    /// Take the lock, waiting in an escalating shape rather than spinning flat.
+    ///
+    /// **Why the wait shape matters here at all.** The holder is not a short
+    /// critical section: `tick()` keeps this lock for its whole outbound round,
+    /// and a black-holed peer is written off only after `ElectionConfig.rpc_timeout_ms`
+    /// (100 ms by default) — *per peer*. Every waiter is therefore parked for a
+    /// long-but-bounded time by design, and a waiter that spins for that long is
+    /// one burned core per waiter. That was the cost of the loop this replaces
+    /// (`while (self.flag.swap(true, .acquire)) spinLoopHint()`), measured at a
+    /// full core for the whole hold.
+    ///
+    /// Three stages, chosen by round count:
+    ///
+    ///   1. `spin_rounds` of `spinLoopHint`.
+    ///   2. `yield_rounds` of `std.Thread.yield`, so a holder that is runnable
+    ///      gets the core back.
+    ///   3. `sleepWithoutIo`, `sleep_ms` per round.
+    ///
+    /// The third stage is the one that does the work, and the second is not a
+    /// substitute for it: the holder here is normally *asleep in a syscall*
+    /// waiting out an RPC, i.e. not runnable at all, so `yield` returns
+    /// immediately and the core keeps burning (measured: `yield` alone costs
+    /// ~116 ms of CPU for a 120 ms hold, against ~0 ms with the sleep). The first
+    /// two stages exist so that the sleep — which can delay noticing a release by
+    /// up to `sleep_ms` — is only reached once the wait has stopped looking like
+    /// a short critical section.
+    ///
+    /// The **fast path** is a compare-exchange rather than a `swap`: `swap` wrote
+    /// the flag on every attempt, so N waiters kept dirtying the one cache line
+    /// they all read — exclusion stayed correct, but every waiter made all the
+    /// others slower. A failed compare-exchange does not write.
+    ///
+    /// Still **not re-entrant**, and still a deadlock if used that way: nothing
+    /// here tracks an owner. That is unchanged (a `cmpxchgWeak` on a held flag
+    /// fails exactly as the `swap` did), and it is why `clusterSize` /
+    /// `quorumSize` / `hasQuorum` are lock-free.
     pub fn acquire(self: *RaftLock) void {
-        while (self.flag.swap(true, .acquire)) std.atomic.spinLoopHint();
+        if (self.tryAcquire()) return;
+
+        var rounds: u32 = 0;
+        while (!self.tryAcquire()) {
+            rounds +|= 1;
+            if (rounds <= spin_rounds) {
+                std.atomic.spinLoopHint();
+            } else if (rounds <= spin_rounds + yield_rounds) {
+                std.Thread.yield() catch |err| {
+                    std.log.debug("[RaftLock] wait: yield failed ({s}), retrying", .{@errorName(err)});
+                };
+            } else {
+                sleepWithoutIo(sleep_ms);
+            }
+        }
+    }
+
+    /// One non-blocking attempt. Private: no caller of this lock wants a
+    /// non-blocking acquire, and the two places that need the compare-exchange
+    /// (the fast path and the loop above) are both in `acquire`.
+    fn tryAcquire(self: *RaftLock) bool {
+        return self.flag.cmpxchgWeak(false, true, .acquire, .monotonic) == null;
     }
 
     pub fn release(self: *RaftLock) void {
@@ -52,6 +142,39 @@ pub const RaftLock = struct {
         return self.flag.load(.acquire);
     }
 };
+
+/// Targets where `std.posix.poll` is usable. Windows is a `@compileError` there
+/// ("use std.Io instead"), and the freestanding-ish targets have no `poll` at
+/// all; on those the wait degrades to `std.Thread.yield`.
+const can_poll_sleep = switch (builtin.os.tag) {
+    .windows, .wasi, .uefi, .freestanding, .other => false,
+    else => true,
+};
+
+/// Sleep for `ms` milliseconds, with no `Io` to hand.
+///
+/// [`RaftLock`] has none: see its own doc for the call chain that leaves this
+/// file io-less. The toolchain's only sleeping primitive (`std.Io.sleep`) takes
+/// an `Io`, so the io-free equivalent is used — a timeout-only `poll`. On every
+/// POSIX target an empty fd set with a non-zero timeout *is* a sleep (measured
+/// on this repo's macOS toolchain: `wall = 121 ms`, `cpu = 49 µs` for `120`),
+/// and the errors it can return (`NetworkDown`, `SystemResources`) are safe to
+/// ignore here because the caller loops on the lock anyway: this is a retry, not
+/// a rendezvous, so a wait cut short costs one more round and nothing else. Same
+/// shape and same trade-off as the runtime's park — `runtime/scheduler.zig`
+/// parks on `std.Io.Condition` "rather than a signal on purpose … the cost of a
+/// missed wake-up is one poll interval".
+fn sleepWithoutIo(ms: u32) void {
+    if (comptime can_poll_sleep) {
+        _ = std.posix.poll(&.{}, @intCast(ms)) catch |err| {
+            std.log.debug("[RaftLock] wait: poll sleep failed ({s}), retrying", .{@errorName(err)});
+        };
+    } else {
+        std.Thread.yield() catch |err| {
+            std.log.debug("[RaftLock] wait: yield failed ({s}), retrying", .{@errorName(err)});
+        };
+    }
+}
 
 /// Configuration for Raft
 pub const ElectionConfig = struct {
@@ -84,12 +207,19 @@ pub const ElectionConfig = struct {
     ///
     /// This is a **liveness bound, not a tuning knob**, and the reason is the
     /// shape of the driver: `tick()` performs its outbound round while holding
-    /// `RaftLock`, which is a *spin* lock, so a peer that never answers does not
-    /// merely delay the round — it has every other thread that wants the state
-    /// (the accept thread's inbound RPCs, `appendEntry`, the accessors) burning a
-    /// core on `spinLoopHint` for as long as the RPC waits. Before this field
-    /// existed the wait was the OS default: a black-holed peer (SYN dropped, or a
-    /// connection accepted and never answered) cost the node *minutes*.
+    /// `RaftLock`, so a peer that never answers does not merely delay the round —
+    /// it holds off every other thread that wants the state (the accept thread's
+    /// inbound RPCs, `appendEntry`, the accessors) for as long as the RPC waits.
+    /// Before this field existed the wait was the OS default: a black-holed peer
+    /// (SYN dropped, or a connection accepted and never answered) cost the node
+    /// *minutes*.
+    ///
+    /// What those waiters spend while they wait is no longer a burned core —
+    /// `RaftLock.acquire` sleeps once it has spun and yielded its budget — so what
+    /// this number bounds is how long the state stays unavailable, i.e. the
+    /// latency floor a round imposes on every other user of this raft. That is
+    /// still the number to keep small: it is subtracted from every inbound RPC's
+    /// budget and added to every `appendEntry` and accessor call on the way in.
     ///
     /// With it, the cost of an unreachable peer is this number **per peer per
     /// round**. Keep it comfortably under `election_timeout_min_ms`: past that
@@ -589,8 +719,8 @@ pub const RaftElection = struct {
     // `truncateLog`, `startElection`, `becomeLeader`, `sendHeartbeats`,
     // `randomElectionTimeout`) is reachable only from the locked entry points
     // above and assumes `lock` is already held: they are steps *within* one
-    // state transition, so taking it here would self-deadlock the spin lock
-    // rather than add a safety margin.
+    // state transition, so taking it here would self-deadlock the lock rather
+    // than add a safety margin.
 
     /// Leader sends AppendEntries to all peers with new log entries.
     fn sendAppendEntries(self: *Self) !void {
@@ -2768,6 +2898,116 @@ test "RaftElection: the window rendezvous fires iff nothing serializes the entry
         // draws with its own `freed >= 1`.
         try std.testing.expectEqual(@as(usize, 2), gate.freed.load(.acquire));
     }
+}
+
+/// This thread's own consumed CPU time, in nanoseconds.
+///
+/// `std.Thread.getCpuTime` went away with the rest of the 0.16→0.17 removals, so
+/// the clock behind it is read directly: `CLOCK.THREAD_CPUTIME_ID` is part of
+/// `std.c.CLOCK` on every POSIX target this repo runs tests on (macOS 16, Linux
+/// 3).
+fn threadCpuNanoseconds() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.THREAD_CPUTIME_ID, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+// The reading the lock's wait shape exists for.
+//
+// `tick()` keeps this lock for its whole outbound round, and a black-holed peer
+// is written off only after `rpc_timeout_ms` (100 ms by default) — *per peer*.
+// So the wait is long by design rather than by accident, and "the waiter is
+// waiting" has to mean it is *off* the CPU: a core burned per waiter is the cost
+// the old `swap` + unbounded `spinLoopHint` loop paid, for as long as the round
+// took.
+//
+// Verified red, measured three ways on this toolchain (macOS, 120 ms hold
+// driving the same waiter, whose own `CLOCK.THREAD_CPUTIME_ID` delta is the
+// reading):
+//
+//   `swap(true, .acquire)` + `spinLoopHint`   120 ms CPU   (the shape removed here)
+//   `cmpxchgWeak` + bounded spin + `yield`    116 ms CPU   (route (b) as prescribed)
+//   … + the sleep stage below                   0 ms CPU
+//
+// The middle row is the whole reason the sleep stage exists: `yield` is not
+// enough. The holder in this shape is *asleep in a syscall* — not runnable — so
+// there is no thread to hand the core to and `sched_yield` returns immediately.
+// The threshold is deliberately half the hold: what is being asserted is the
+// order of magnitude, a core versus nothing, not the reading. This test's own
+// numbers, the ones the assertion below sees at `hold_ms = 200`: **200 ms**
+// before this change (`swap` + spin) and **0 ms** after it.
+test "RaftLock: a wait across a slow RPC costs the waiter sleep, not CPU" {
+    const hold_ms: u32 = 200;
+    const margin_ns = @as(u64, hold_ms) * std.time.ns_per_ms / 2;
+
+    const Waiter = struct {
+        fn run(lock: *RaftLock, measured: *std.atomic.Value(u64)) void {
+            const before = threadCpuNanoseconds();
+            lock.acquire();
+            lock.release();
+            measured.store(threadCpuNanoseconds() - before, .release);
+        }
+    };
+
+    var lock = RaftLock{};
+    lock.acquire();
+
+    var waiter_cpu_ns = std.atomic.Value(u64).init(0);
+    const waiter = try std.Thread.spawn(.{}, Waiter.run, .{ &lock, &waiter_cpu_ns });
+
+    // The holder's half of the pattern, not an artefact of the test: the lock is
+    // held while the holder is off the CPU, which is what `sendAppendEntries`
+    // waiting out a black-holed peer looks like from inside.
+    sleepWithoutIo(hold_ms);
+    lock.release();
+
+    waiter.join();
+    try testing.expect(waiter_cpu_ns.load(.acquire) < margin_ns);
+}
+
+// The other half of "the wait shape changed and nothing else did": exclusion, and
+// the `isHeld` reading the rendezvous above depends on.
+//
+// `RaftLock` had no test of its own shape before this — the two tests above it
+// test the *raft*, through the lock, and would notice a broken lock only as a
+// double free somewhere else.
+test "RaftLock: excludes, and isHeld tracks the holder" {
+    const threads_n: usize = 8;
+    const per_thread: usize = 5_000;
+
+    const Shared = struct {
+        lock: RaftLock = .{},
+        counter: u64 = 0,
+        /// Set if a thread that has returned from `acquire` ever reads the lock
+        /// as free. It is the one invariant a compare-exchange fast path could
+        /// break without breaking exclusion itself.
+        saw_free_inside: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn bump(self: *@This()) void {
+            self.lock.acquire();
+            defer self.lock.release();
+            if (!self.lock.isHeld()) self.saw_free_inside.store(true, .release);
+            self.counter += 1;
+        }
+    };
+
+    var shared = Shared{};
+    try testing.expect(!shared.lock.isHeld());
+
+    const threads = try testing.allocator.alloc(std.Thread, threads_n);
+    defer testing.allocator.free(threads);
+    const Worker = struct {
+        fn run(s: *Shared, n: usize) void {
+            for (0..n) |_| s.bump();
+        }
+    };
+    for (threads) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{ &shared, per_thread });
+    for (threads) |t| t.join();
+
+    // A read-modify-write under the lock: a lost update is two threads inside.
+    try testing.expectEqual(@as(u64, threads_n * per_thread), shared.counter);
+    try testing.expect(!shared.saw_free_inside.load(.acquire));
+    try testing.expect(!shared.lock.isHeld());
 }
 
 // ── L2: the inbound membership check (docs/dev/cluster-auth-design.md §4.1) ───

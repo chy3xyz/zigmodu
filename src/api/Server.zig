@@ -572,7 +572,14 @@ pub const Context = struct {
     /// Set response header. Keys/values are owned by the context allocator and
     /// freed in `deinit` / `resetArena`. Replacing an existing header frees the
     /// previous entry (GPA) or no-ops (arena).
+    ///
+    /// The field is validated first (`validateResponseField`): a non-token name
+    /// or a value carrying CR/LF/NUL is `error.InvalidHeader`, and a value past
+    /// `max_response_header_value_bytes` is `error.HeaderTooLarge`. Both are
+    /// refused *here* rather than at write time, so the handler that echoed
+    /// request data into a header is told which line it is.
     pub fn setHeader(self: *Context, key: []const u8, value: []const u8) !void {
+        try validateResponseField(key, value);
         const key_copy = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(key_copy);
         const value_copy = try self.allocator.dupe(u8, value);
@@ -1169,12 +1176,19 @@ pub const Context = struct {
     }
 
     /// Send JSON from struct.
+    ///
+    /// The value is serialized straight into `response_body` through an
+    /// allocating writer (`Allocating.fromArrayList`), so the body is built
+    /// once. Serializing into a temporary slice and appending it copied every
+    /// byte of every JSON response twice.
     pub fn jsonStruct(self: *Context, status: u16, value: anytype) !void {
         self.status_code = status;
         try self.setHeader("Content-Type", "application/json");
-        const json_str = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
-        defer self.allocator.free(json_str);
-        try self.response_body.appendSlice(self.allocator, json_str);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &self.response_body);
+        // Hand the list back on failure too: `aw` owns it while it is alive.
+        errdefer self.response_body = aw.toArrayList();
+        try std.json.Stringify.value(value, .{}, &aw.writer);
+        self.response_body = aw.toArrayList();
         self.responded = true;
     }
 
@@ -1299,9 +1313,10 @@ const StreamReader = struct {
     buffer: [8192]u8 = undefined,
     stream: std.Io.net.Stream = undefined,
     io: std.Io = undefined,
-    /// Absolute deadline (`.awake` clock, ns) for the request line + header
-    /// phase; null = unbounded. Enforced inside `streamImpl`, so every read
-    /// the delimiter scanner performs is covered, not just the first.
+    /// Absolute deadline (`.awake` clock, ns) for the phase currently being
+    /// read — the request line + headers, or the body; null = unbounded.
+    /// Enforced inside `readInto`, so every read the delimiter scanner
+    /// performs is covered, not just the first.
     deadline_ns: ?i96 = null,
     /// Set when `deadline_ns` fired, so callers can answer 408 instead of
     /// silently closing.
@@ -1323,9 +1338,14 @@ const StreamReader = struct {
         };
     }
 
-    /// Bound the header phase: a peer that trickles bytes (slowloris) is cut
-    /// off after `timeout_ms`. 0 disables the bound.
-    fn setHeaderDeadline(self: *StreamReader, timeout_ms: u32) void {
+    /// Bound the reads of one phase: a peer that trickles bytes (slowloris) is
+    /// cut off after `timeout_ms`. 0 disables the bound.
+    ///
+    /// `connFiber` arms this for the request line + headers; the parser re-arms
+    /// it for the body at the blank line. Two arms, not one, because the header
+    /// budget is spent by the time the body is read — with no second bound a
+    /// `Content-Length: 8M` + 1 byte/s peer holds the connection for free.
+    fn setReadDeadline(self: *StreamReader, timeout_ms: u32) void {
         self.timed_out = false;
         if (timeout_ms == 0) {
             self.deadline_ns = null;
@@ -1335,9 +1355,9 @@ const StreamReader = struct {
         self.deadline_ns = now + @as(i96, timeout_ms) * std.time.ns_per_ms;
     }
 
-    /// Headers are in — stop bounding. Bodies/uploads get the looser
-    /// `request_timeout_ms` (handler stage) instead.
-    fn clearHeaderDeadline(self: *StreamReader) void {
+    /// The phase this reader was bounding is over: the H2 preface hands it to
+    /// the frame loop, and the next keep-alive request arms its own deadline.
+    fn clearReadDeadline(self: *StreamReader) void {
         self.deadline_ns = null;
     }
 
@@ -1387,16 +1407,22 @@ const StreamReader = struct {
     /// Returns `null` if the peer closed cleanly with no bytes available
     /// (EOF on a fresh read), and propagates `error.ReadFailed` for actual
     /// I/O errors so the caller can distinguish benign close from failure.
-    fn readUntilDelimiterOrEof(self: *StreamReader, _: []u8, delimiter: u8) !?[]u8 {
+    fn readUntilDelimiterOrEof(self: *StreamReader, delimiter: u8) !?[]u8 {
         return self.interface.takeDelimiter(delimiter) catch |err| switch (err) {
             error.ReadFailed => error.ReadFailed,
             error.StreamTooLong => error.InvalidRequest,
         };
     }
 
+    /// Read a `Content-Length`-sized body. Returns 0 when the peer closed
+    /// before delivering all of it — that is a client fault the caller answers
+    /// — but `error.ReadFailed` stays an error: it is how a spent deadline
+    /// (`timed_out`) and a broken transport reach the caller as a 408 instead
+    /// of being laundered into "0 bytes read" and answered with a silent close.
     fn readAll(self: *StreamReader, out: []u8) !usize {
         self.interface.readSliceAll(out) catch |err| switch (err) {
-            error.EndOfStream, error.ReadFailed => return 0,
+            error.EndOfStream => return 0,
+            error.ReadFailed => return error.ReadFailed,
         };
         return out.len;
     }
@@ -1478,9 +1504,13 @@ const RequestParser = struct {
     }
 
     /// Continue HTTP/1.1 parse after the request line was already read (H2 preface probe).
-    pub fn parseAfterRequestLine(self: *RequestParser, reader: *StreamReader, request_line_raw_view: []const u8, max_body_size: usize, header_limits: HeaderLimits, max_params: usize) !ParsedRequest {
-        var buffer: [8192]u8 = undefined;
-
+    ///
+    /// `body_timeout_ms` bounds the body phase (0 = unbounded). It is armed
+    /// here, at the blank line, because the caller's header deadline is already
+    /// satisfied by then: the body needs a budget of its own or a peer that
+    /// announces a `Content-Length` and then trickles the body holds the
+    /// connection for as long as it likes.
+    pub fn parseAfterRequestLine(self: *RequestParser, reader: *StreamReader, request_line_raw_view: []const u8, max_body_size: usize, header_limits: HeaderLimits, max_params: usize, body_timeout_ms: u32) !ParsedRequest {
         const request_line_owned = try self.allocator.dupe(u8, trimCrlf(request_line_raw_view));
         const request_line = request_line_owned;
         if (request_line.len < 14) return error.InvalidRequest; // Minimum: "GET / HTTP/1.1"
@@ -1518,12 +1548,14 @@ const RequestParser = struct {
         var content_length: ?usize = null;
         var saw_transfer_encoding = false;
         while (true) {
-            const line_raw = try reader.readUntilDelimiterOrEof(&buffer, '\n') orelse return error.InvalidRequest;
+            const line_raw = try reader.readUntilDelimiterOrEof('\n') orelse return error.InvalidRequest;
             const header_line = trimCrlf(line_raw);
             if (header_line.len == 0) {
-                // Request line + headers are in; the body is not bounded by
-                // the header deadline.
-                reader.clearHeaderDeadline();
+                // Request line + headers are in. Arm the body budget in place
+                // of the spent header deadline: the body is read below, and a
+                // stalled body must end in 408 (via `timed_out`), not in a
+                // connection parked until the peer feels like finishing.
+                reader.setReadDeadline(body_timeout_ms);
                 break;
             }
 
@@ -1567,11 +1599,14 @@ const RequestParser = struct {
             if (content_len > max_body_size) return error.BodyTooLarge;
             if (content_len > 0) {
                 const body_buf = try self.allocator.alloc(u8, content_len);
+                // `readAll` can now fail (a spent body deadline), so the buffer
+                // needs a release on that path too — the arena callers would
+                // not notice, a GPA caller would.
+                errdefer self.allocator.free(body_buf);
                 const bytes_read = try reader.readAll(body_buf);
                 if (bytes_read == content_len) {
                     body = body_buf;
                 } else {
-                    self.allocator.free(body_buf);
                     return error.IncompleteBody;
                 }
             }
@@ -2042,37 +2077,74 @@ fn getStatusText(status: u16) []const u8 {
     };
 }
 
+/// Ceiling for one response header value. The writer streams header lines, so
+/// nothing truncates them silently anymore — this is the bound that has to be
+/// explicit and named instead.
+const max_response_header_value_bytes = 8 * 1024;
+
 /// Write HTTP response directly to a `std.Io.net.Stream`.
-/// Avoids intermediate ArrayList allocation — formats status line and headers
-/// into small stack buffers and writes body directly from caller's buffer.
+/// Avoids intermediate ArrayList allocation — header lines are formatted
+/// straight into the stream's write buffer and the body is written from the
+/// caller's buffer.
+///
+/// Every line goes through `Writer.print`, so its length is the peer's choice,
+/// not a stack buffer's: a fixed scratch line meant a long header value (a
+/// 300-byte `Origin` echoed by CORS is enough) failed with `error.NoSpaceLeft`,
+/// which connFiber logged and dropped — the client saw an empty socket. The
+/// only remaining bound is the explicit `max_response_header_value_bytes`.
 fn writeResponse(io: std.Io, stream: std.Io.net.Stream, status: u16, headers: std.StringHashMap([]const u8), body: []const u8) !void {
     var write_buf: [4096]u8 = undefined;
     var w = stream.writer(io, &write_buf);
 
-    var line_buf: [256]u8 = undefined;
+    // Refuse first, write afterwards: a header the server will not put on the
+    // wire must not leave a half-written response behind (and the caller can
+    // still answer 500, because nothing has been sent yet). The map can be
+    // filled directly, so this is checked here and not only in
+    // `Context.setHeader`.
+    var precheck = headers.iterator();
+    while (precheck.next()) |entry| {
+        try validateResponseField(entry.key_ptr.*, entry.value_ptr.*);
+    }
+
     const status_text = getStatusText(status);
 
     // Status line
-    const status_line = try std.fmt.bufPrint(&line_buf, "HTTP/1.1 {d} {s}\r\n", .{ status, status_text });
-    try w.interface.writeAll(status_line);
+    try w.interface.print("HTTP/1.1 {d} {s}\r\n", .{ status, status_text });
 
     // Headers
     var hiter = headers.iterator();
     while (hiter.next()) |entry| {
-        const header_line = try std.fmt.bufPrint(&line_buf, "{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
-        try w.interface.writeAll(header_line);
+        try w.interface.print("{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
     }
 
     // Content-Length (skip for chunked transfer to avoid HTTP spec violation)
     if (headers.get("Transfer-Encoding") == null) {
-        const cl_line = try std.fmt.bufPrint(&line_buf, "Content-Length: {d}\r\n", .{body.len});
-        try w.interface.writeAll(cl_line);
+        try w.interface.print("Content-Length: {d}\r\n", .{body.len});
     }
     try w.interface.writeAll("\r\n");
 
     // Body (already chunk-encoded if Transfer-Encoding: chunked)
     try w.interface.writeAll(body);
     try w.interface.flush();
+}
+
+/// Reject a response field that would let its value rewrite the message:
+/// `field-name` must be `1*tchar` (RFC 9110 §5.6.2) and the value must carry no
+/// CR, LF or NUL.
+///
+/// The request side has refused these from the start (`splitHeaderLine` /
+/// `isTchar`), but query and form values arrive *percent-decoded* — `%0d%0a` is
+/// a real CRLF by the time a handler reads it — so echoing request data into a
+/// header is response splitting unless it is checked on this side too.
+fn validateResponseField(name: []const u8, value: []const u8) !void {
+    if (name.len == 0) return error.InvalidHeader;
+    for (name) |c| {
+        if (!isTchar(c)) return error.InvalidHeader;
+    }
+    if (value.len > max_response_header_value_bytes) return error.HeaderTooLarge;
+    for (value) |c| {
+        if (c == '\r' or c == '\n' or c == 0) return error.InvalidHeader;
+    }
 }
 
 /// Case-insensitive header lookup. Keys stored in the map (request headers are
@@ -2119,6 +2191,8 @@ pub const Server = struct {
     over_limit_response: OverLimitResponse = .close,
     /// See `Config.header_timeout_ms`.
     header_timeout_ms: u32 = 10_000,
+    /// See `Config.body_timeout_ms`.
+    body_timeout_ms: u32 = 30_000,
     /// See `Config.ws_write_timeout_ms`.
     ws_write_timeout_ms: u32 = 0,
     /// See `Config.max_params`.
@@ -2166,6 +2240,13 @@ pub const Server = struct {
         /// `request_timeout_ms` (which only covers handler execution). Bounds
         /// slowloris-style trickle. 0 disables the deadline.
         header_timeout_ms: u32 = 10_000,
+        /// Deadline for receiving the request body, armed at the blank line —
+        /// `header_timeout_ms` is already satisfied by then, and the handler
+        /// budget starts only after the body is in. Without it a
+        /// `Content-Length: 8M` request that sends one byte per second holds a
+        /// connection (and its slot) forever. Exceeding it answers 408.
+        /// 0 disables the deadline.
+        body_timeout_ms: u32 = 30_000,
         /// Upper bound on parameters parsed from one request's query string or
         /// form body (occurrences, not distinct names). Mirrors PHP's
         /// `max_input_vars`: a parser that accepts unbounded input is a DoS
@@ -2219,6 +2300,7 @@ pub const Server = struct {
             .connection_stack_size = config.connection_stack_size,
             .over_limit_response = config.over_limit_response,
             .header_timeout_ms = config.header_timeout_ms,
+            .body_timeout_ms = config.body_timeout_ms,
             .ws_write_timeout_ms = config.ws_write_timeout_ms,
             .max_params = config.max_params,
             .owned_route_mw = std.ArrayList([]const Middleware).empty,
@@ -2581,6 +2663,7 @@ pub const Server = struct {
             .max_body_size = envInt(usize, env, "HTTP_MAX_BODY", 8 * 1024 * 1024),
             .max_connections = envInt(usize, env, "HTTP_MAX_CONNECTIONS", 0),
             .header_timeout_ms = envInt(u32, env, "HTTP_HEADER_TIMEOUT_MS", 10_000),
+            .body_timeout_ms = envInt(u32, env, "HTTP_BODY_TIMEOUT_MS", 30_000),
             .ws_write_timeout_ms = envInt(u32, env, "WS_WRITE_TIMEOUT_MS", 0),
         });
     }
@@ -2684,12 +2767,12 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
 
         const start_time = std.Io.Timestamp.now(server.io, .real);
 
-        // Bound the request line + header phase (slowloris guard). Cleared by
-        // the parser once the blank line is seen; re-armed per request here.
-        reader.setHeaderDeadline(server.header_timeout_ms);
+        // Bound the request line + header phase (slowloris guard). The parser
+        // re-arms it for the body at the blank line; re-armed per request here.
+        reader.setReadDeadline(server.header_timeout_ms);
 
         // Prefetch first line — HTTP/2 prior-knowledge preface starts with PRI.
-        const first_line_raw = reader.readUntilDelimiterOrEof(&.{}, '\n') catch |err| {
+        const first_line_raw = reader.readUntilDelimiterOrEof('\n') catch |err| {
             switch (err) {
                 error.ReadFailed => {
                     if (reader.timed_out) writeErrorResponse(server.io, stream, arena_alloc, 408, "Request Timeout");
@@ -2705,14 +2788,14 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
 
         if (server.enable_http2 and std.mem.eql(u8, first_line, "PRI * HTTP/2.0")) {
             // Consume remaining preface: empty line, "SM", empty line
-            const l2 = (reader.readUntilDelimiterOrEof(&.{}, '\n') catch return) orelse return;
-            const l3 = (reader.readUntilDelimiterOrEof(&.{}, '\n') catch return) orelse return;
-            const l4 = (reader.readUntilDelimiterOrEof(&.{}, '\n') catch return) orelse return;
+            const l2 = (reader.readUntilDelimiterOrEof('\n') catch return) orelse return;
+            const l3 = (reader.readUntilDelimiterOrEof('\n') catch return) orelse return;
+            const l4 = (reader.readUntilDelimiterOrEof('\n') catch return) orelse return;
             if (RequestParser.trimCrlf(l2).len != 0) return;
             if (!std.mem.eql(u8, RequestParser.trimCrlf(l3), "SM")) return;
             if (RequestParser.trimCrlf(l4).len != 0) return;
             // The preface is consumed; H2 frames are not header-phase reads.
-            reader.clearHeaderDeadline();
+            reader.clearReadDeadline();
 
             // Reuse the same StreamReader for the H2 session (do not create a second
             // reader on this stream). Any bytes already buffered after the preface
@@ -2734,13 +2817,14 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
             return;
         }
 
-        var request = parser.parseAfterRequestLine(&reader, first_line_raw, server.max_body_size, server.header_limits, server.max_params) catch |err| {
+        var request = parser.parseAfterRequestLine(&reader, first_line_raw, server.max_body_size, server.header_limits, server.max_params, server.body_timeout_ms) catch |err| {
             switch (err) {
                 error.ReadFailed => {
+                    // A spent read deadline is the client that stalled (headers
+                    // or body): 408, observable, instead of a vanished socket.
                     if (reader.timed_out) writeErrorResponse(server.io, stream, arena_alloc, 408, "Request Timeout");
                     return;
                 },
-                error.IncompleteBody => return,
                 else => {},
             }
             // A malformed request is a client fault, not a server error: warn,
@@ -2749,7 +2833,10 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
             // Every request-boundary failure is a refusal, never a best-effort
             // reparse: 413/431 for the size guards, 501 for a method token this
             // server does not implement, 400 for everything else (including
-            // the CL/TE framing conflicts).
+            // the CL/TE framing conflicts, and `IncompleteBody` — a
+            // `Content-Length` the peer never delivered, which used to be a
+            // `return` with nothing written: a closed socket and no status
+            // line, which reads as a crash rather than a 400).
             const msg = if (err == error.BodyTooLarge)
                 "Payload Too Large"
             else if (err == error.TooManyHeaders)
@@ -2978,7 +3065,20 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
 
         if (ctx.responded and !ctx.streaming) {
             writeResponse(server.io, stream, ctx.status_code, ctx.response_headers, ctx.response_body.items) catch |err| {
-                std.log.err("[HC] write error: {any}", .{err});
+                // A header the server refuses (non-token name, CR/LF value, past
+                // the value ceiling) is a server-side bug — a handler built it
+                // from input it should have validated. `writeResponse` rejects
+                // before writing a byte, so the connection is still clean and
+                // the client gets a status instead of nothing. `warn`, not
+                // `err`: the request is answered, and an error-level line makes
+                // `scripts/test-runner.zig` fail the whole suite (it counts
+                // err-level logs as failures).
+                if (err == error.InvalidHeader or err == error.HeaderTooLarge) {
+                    std.log.warn("[HC] response header refused: {any}", .{err});
+                    writeErrorResponse(server.io, stream, arena_alloc, 500, "Internal Server Error");
+                } else {
+                    std.log.err("[HC] write error: {any}", .{err});
+                }
                 return;
             };
         }
@@ -4679,6 +4779,10 @@ const ParserProbe = struct {
     stream: std.Io.net.Stream,
     reader: StreamReader,
     parser: RequestParser,
+    /// Body budget handed to the parser (ms); 0 = unbounded. The old parser
+    /// cleared the deadline at the blank line, which is the defect the body
+    /// budget test pins.
+    body_timeout_ms: u32 = 2000,
 
     /// Heap-allocated on purpose: `StreamReader.setup` stores a pointer to its
     /// own buffer, so the struct must not move after setup. Writes `payload`
@@ -4694,7 +4798,7 @@ const ParserProbe = struct {
             .parser = RequestParser.init(allocator),
         };
         probe.reader.setup(probe.stream, std.testing.io);
-        probe.reader.setHeaderDeadline(2000);
+        probe.reader.setReadDeadline(2000);
         _ = std.posix.system.write(fds[1], payload.ptr, payload.len);
         return probe;
     }
@@ -4705,8 +4809,8 @@ const ParserProbe = struct {
     }
 
     fn parse(self: *ParserProbe) !ParsedRequest {
-        const first = try self.reader.readUntilDelimiterOrEof(&.{}, '\n') orelse return error.ClientClosed;
-        return self.parser.parseAfterRequestLine(&self.reader, first, 1 * 1024 * 1024, .{}, 100);
+        const first = try self.reader.readUntilDelimiterOrEof('\n') orelse return error.ClientClosed;
+        return self.parser.parseAfterRequestLine(&self.reader, first, 1 * 1024 * 1024, .{}, 100, self.body_timeout_ms);
     }
 };
 
@@ -4736,16 +4840,16 @@ fn fuzzParseRequest(_: void, smith: *std.testing.Smith) !void {
     var reader: StreamReader = undefined;
     reader.setup(stream, std.testing.io);
     // Backstop for a parser path that waits on more bytes despite the half-close.
-    reader.setHeaderDeadline(2000);
+    reader.setReadDeadline(2000);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
     var parser = RequestParser.init(a);
-    const first_maybe = reader.readUntilDelimiterOrEof(&.{}, '\n') catch return;
+    const first_maybe = reader.readUntilDelimiterOrEof('\n') catch return;
     const first = first_maybe orelse return;
-    var request = parser.parseAfterRequestLine(&reader, first, 16 * 1024, .{}, 100) catch return;
+    var request = parser.parseAfterRequestLine(&reader, first, 16 * 1024, .{}, 100, 2000) catch return;
     request.deinit(a);
 }
 
@@ -4913,10 +5017,10 @@ test "StreamReader header deadline fires on a silent peer" {
 
     var reader: StreamReader = undefined;
     reader.setup(stream, std.testing.io);
-    reader.setHeaderDeadline(80);
+    reader.setReadDeadline(80);
 
     // Peer sends nothing: the deadline must cut the read instead of blocking.
-    try std.testing.expectError(error.ReadFailed, reader.readUntilDelimiterOrEof(&.{}, '\n'));
+    try std.testing.expectError(error.ReadFailed, reader.readUntilDelimiterOrEof('\n'));
     try std.testing.expect(reader.timed_out);
 }
 
@@ -4928,22 +5032,24 @@ test "StreamReader header deadline leaves a prompt peer alone" {
 
     var reader: StreamReader = undefined;
     reader.setup(stream, std.testing.io);
-    reader.setHeaderDeadline(2000);
+    reader.setReadDeadline(2000);
     _ = std.posix.system.write(fds[1], "GET / HTTP/1.1\r\n", 16);
 
-    const line = try reader.readUntilDelimiterOrEof(&.{}, '\n');
+    const line = try reader.readUntilDelimiterOrEof('\n');
     try std.testing.expect(line != null);
     try std.testing.expect(std.mem.startsWith(u8, line.?, "GET / HTTP/1.1"));
     try std.testing.expect(!reader.timed_out);
 
-    // Headers complete → deadline cleared → the body follows the normal read
-    // path (unbounded), so a slow upload is not killed by the header deadline.
-    reader.clearHeaderDeadline();
+    // The body phase gets its own budget (armed by the parser at the blank
+    // line, which is where `setReadDeadline` is called again in connFiber);
+    // `0` is what "unbounded upload" looks like, and the read still works.
+    reader.setReadDeadline(0);
     _ = std.posix.system.write(fds[1], "BODY", 4);
     var body: [4]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 4), try reader.readAll(&body));
     try std.testing.expectEqualStrings("BODY", &body);
     try std.testing.expect(!reader.timed_out);
+    try std.testing.expect(reader.deadline_ns == null);
 }
 
 test "header deadline answers 408 and max_connections sheds the flood" {
@@ -5624,4 +5730,409 @@ test "fromEnv falls back to defaults when a variable is malformed" {
     var server = try Server.fromEnv(std.testing.io, allocator, &env);
     defer server.deinit();
     try std.testing.expectEqual(@as(u16, 8080), server.port);
+}
+
+// ── response framing + body budget ─────────────────────────────────────────
+//
+// Response-path shapes that used to fail *silently*: a response dropped when a
+// header value outgrew a fixed 256-byte scratch line, a header value that could
+// rewrite the response, a body read that reported a transport failure as "0
+// bytes", and a body phase with no deadline at all. Asserted on the wire (or on
+// the state the wire is built from), because "the client sees it" is the
+// property that matters.
+
+/// Read what the peer has sent, stopping at a short idle gap. Every writer
+/// here is done before the read starts, so "nothing more arrived" means "that
+/// was all". `first_timeout_ms` bounds the wait for the first byte.
+fn readPeer(fd: std.posix.socket_t, buf: []u8, first_timeout_ms: i32) ![]const u8 {
+    var got: usize = 0;
+    while (got < buf.len) {
+        var pfds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = try std.posix.poll(&pfds, if (got == 0) first_timeout_ms else 50);
+        if (ready <= 0) break;
+        const n = try std.posix.read(fd, buf[got..]);
+        if (n == 0) break;
+        got += n;
+    }
+    return buf[0..got];
+}
+
+test "long response header values are written, not dropped" {
+    const allocator = std.testing.allocator;
+    const fds = testSocketPair() orelse return error.SkipZigTest;
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } };
+    defer stream.close(std.testing.io);
+    defer _ = std.posix.system.close(fds[1]);
+
+    // The CORS middleware echoes the request `Origin` back (Middleware.zig), and
+    // a `*.example.com` allow-list entry matches any prefix length — so a peer
+    // picks the length of this value. 300 bytes is past the old `[256]u8`
+    // scratch line, whose `error.NoSpaceLeft` connFiber logged and dropped:
+    // the client got an empty socket instead of a response.
+    const origin = try allocator.alloc(u8, 300);
+    defer allocator.free(origin);
+    @memset(origin, 'a');
+
+    var headers = std.StringHashMap([]const u8).init(allocator);
+    defer headers.deinit();
+    try headers.put("Access-Control-Allow-Origin", origin);
+
+    try writeResponse(std.testing.io, stream, 200, headers, "{}");
+
+    var buf: [1024]u8 = undefined;
+    const response = try readPeer(fds[1], &buf, 2000);
+    try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, response, origin) != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Content-Length: 2\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, response, "\r\n\r\n{}"));
+}
+
+test "response header values have an explicit ceiling, reported as an error" {
+    const allocator = std.testing.allocator;
+    const fds = testSocketPair() orelse return error.SkipZigTest;
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } };
+    defer stream.close(std.testing.io);
+    defer _ = std.posix.system.close(fds[1]);
+
+    const big = try allocator.alloc(u8, max_response_header_value_bytes + 1);
+    defer allocator.free(big);
+    @memset(big, 'a');
+
+    var headers = std.StringHashMap([]const u8).init(allocator);
+    defer headers.deinit();
+    try headers.put("X-Big", big);
+
+    // No fixed write buffer exists anymore, so the ceiling has to be explicit
+    // and named — not "NoSpaceLeft from a scratch buffer nobody can see".
+    try std.testing.expectError(error.HeaderTooLarge, writeResponse(std.testing.io, stream, 200, headers, "{}"));
+}
+
+test "setHeader refuses a CR/LF/NUL value and a non-token name" {
+    const allocator = std.testing.allocator;
+    var ctx = try Context.init(allocator, .GET, "/x");
+    defer ctx.deinit();
+
+    // Query and form values arrive *percent-decoded*, so `%0d%0a` is a real
+    // CRLF by the time a handler sees it: echoing one into a header is response
+    // splitting. The request side has refused these from the start
+    // (`splitHeaderLine`), the response side has to as well.
+    try std.testing.expectError(error.InvalidHeader, ctx.setHeader("X-Echo", "a\r\nX-Evil: 1"));
+    try std.testing.expectError(error.InvalidHeader, ctx.setHeader("X-Echo", "a\nb"));
+    try std.testing.expectError(error.InvalidHeader, ctx.setHeader("X-Echo", "a\x00b"));
+    try std.testing.expectError(error.InvalidHeader, ctx.setHeader("X Echo", "v"));
+    try std.testing.expectError(error.InvalidHeader, ctx.setHeader("", "v"));
+
+    const big = try allocator.alloc(u8, max_response_header_value_bytes + 1);
+    defer allocator.free(big);
+    @memset(big, 'a');
+    try std.testing.expectError(error.HeaderTooLarge, ctx.setHeader("X-Big", big));
+
+    // A legal field still goes through and is stored.
+    try ctx.setHeader("X-Ok", "fine");
+    try std.testing.expectEqualStrings("fine", ctx.response_headers.get("X-Ok") orelse "<missing>");
+}
+
+test "readAll reports a read failure instead of zero bytes" {
+    const fds = testSocketPair() orelse return error.SkipZigTest;
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = fds[0], .address = undefined } };
+    defer stream.close(std.testing.io);
+    defer _ = std.posix.system.close(fds[1]);
+
+    var reader: StreamReader = undefined;
+    reader.setup(stream, std.testing.io);
+    reader.setReadDeadline(80);
+
+    // The peer says nothing and the deadline fires. Returning 0 here made the
+    // caller answer `IncompleteBody`, which `connFiber` treats as "close and
+    // say nothing" — a transport failure the client cannot tell from a crash.
+    var body: [8]u8 = undefined;
+    try std.testing.expectError(error.ReadFailed, reader.readAll(&body));
+    try std.testing.expect(reader.timed_out);
+}
+
+test "incomplete body is answered, not closed silently" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{
+        .port = 0,
+        .header_timeout_ms = 2000,
+    });
+    defer server.deinit();
+    var group = server.group("");
+    try group.post("ping", struct {
+        fn h(ctx: *Context) anyerror!void {
+            try ctx.jsonStruct(200, .{ .ok = true });
+        }
+    }.h, null);
+
+    const th = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, struct {
+        fn run(s: *Server) void {
+            s.start() catch {};
+        }
+    }.run, .{&server});
+    defer th.join();
+    defer server.stop();
+
+    var port: u16 = 0;
+    var tries: usize = 0;
+    while (tries < 200) : (tries += 1) {
+        if (server.listener) |*l| {
+            port = l.socket.address.getPort();
+            break;
+        }
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    try std.testing.expect(port != 0);
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+
+    var client = try addr.connect(std.testing.io, .{ .mode = .stream });
+    defer client.close(std.testing.io);
+
+    // `Content-Length: 10` and 3 bytes, then half-close: the body can never
+    // arrive. Half-closing keeps this deterministic (no waiting on a timeout).
+    const head = "POST /ping HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc";
+    _ = std.posix.system.write(client.socket.handle, head.ptr, head.len);
+    _ = std.c.shutdown(client.socket.handle, std.c.SHUT.WR);
+
+    var buf: [512]u8 = undefined;
+    const response = try readPeer(client.socket.handle, &buf, 3000);
+    try std.testing.expect(response.len > 0);
+    try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 400"));
+}
+
+test "a stalled body is cut by its own budget, not parked forever" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The slow-POST shape: the peer announces 10 bytes, sends one, then goes
+    // quiet while its connection keeps the slot. The header deadline is long
+    // satisfied by then, so without a body budget the read parks forever.
+    var probe = try ParserProbe.create(a, "POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nA") orelse return error.SkipZigTest;
+    defer probe.destroy();
+    probe.body_timeout_ms = 200;
+
+    const Outcome = struct {
+        done: std.atomic.Value(bool) = .init(false),
+        err: ?anyerror = null,
+        timed_out: bool = false,
+    };
+    var outcome = Outcome{};
+    const th = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, struct {
+        fn run(p: *ParserProbe, alloc: std.mem.Allocator, o: *Outcome) void {
+            if (p.parse()) |request| {
+                var r = request;
+                r.deinit(alloc);
+            } else |err| {
+                o.err = err;
+            }
+            o.timed_out = p.reader.timed_out;
+            o.done.store(true, .release);
+        }
+    }.run, .{ probe, a, &outcome });
+    defer {
+        // Release a parser that is still parked: shutting the peer's write end
+        // turns the blocking read into EOF, so the join below cannot hang
+        // whether the assertion passes or fails.
+        _ = std.c.shutdown(probe.peer, std.c.SHUT.WR);
+        th.join();
+    }
+
+    var waited_ms: u32 = 0;
+    while (waited_ms < 2000 and !outcome.done.load(.acquire)) : (waited_ms += 10) {
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    try std.testing.expect(outcome.done.load(.acquire));
+    try std.testing.expectEqual(error.ReadFailed, outcome.err.?);
+    try std.testing.expect(outcome.timed_out);
+}
+
+test "jsonStruct serializes straight into response_body" {
+    const allocator = std.testing.allocator;
+    var fa = std.testing.FailingAllocator.init(allocator, .{});
+    var ctx = try Context.init(fa.allocator(), .GET, "/x");
+    defer ctx.deinit();
+
+    const blob = try allocator.alloc(u8, 4000);
+    defer allocator.free(blob);
+    @memset(blob, 'x');
+
+    // Reserve the capacity the body needs first: with a single-copy path
+    // serialization itself then allocates *nothing* — what is left is the
+    // `Content-Type` dupes and the header map's first insertion, ~300 bytes
+    // for a 4 KB response. The old `valueAlloc` + `appendSlice` round trip
+    // allocated the body a second time on top of that.
+    try ctx.response_body.ensureTotalCapacity(fa.allocator(), 8192);
+    const before = fa.allocated_bytes;
+    try ctx.jsonStruct(200, .{ .blob = blob });
+    const grown = fa.allocated_bytes - before;
+    try std.testing.expect(grown < blob.len);
+    try std.testing.expect(ctx.response_body.items.len > 4000);
+    try std.testing.expect(std.mem.startsWith(u8, ctx.response_body.items, "{\"blob\":\""));
+}
+
+test "a stalled body is answered with 408 once its budget is spent" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{
+        .port = 0,
+        .header_timeout_ms = 2000,
+        .body_timeout_ms = 200,
+    });
+    defer server.deinit();
+    var group = server.group("");
+    try group.post("ping", struct {
+        fn h(ctx: *Context) anyerror!void {
+            try ctx.jsonStruct(200, .{ .ok = true });
+        }
+    }.h, null);
+
+    const th = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, struct {
+        fn run(s: *Server) void {
+            s.start() catch {};
+        }
+    }.run, .{&server});
+    defer th.join();
+    defer server.stop();
+
+    var port: u16 = 0;
+    var tries: usize = 0;
+    while (tries < 200) : (tries += 1) {
+        if (server.listener) |*l| {
+            port = l.socket.address.getPort();
+            break;
+        }
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    try std.testing.expect(port != 0);
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+
+    var client = try addr.connect(std.testing.io, .{ .mode = .stream });
+    defer client.close(std.testing.io);
+
+    // `Content-Length: 10`, one byte delivered, then silence: the slow-POST
+    // shape that used to hold the connection (and its slot) for as long as the
+    // peer liked, because the header deadline was already satisfied.
+    const head = "POST /ping HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nA";
+    _ = std.posix.system.write(client.socket.handle, head.ptr, head.len);
+
+    var buf: [512]u8 = undefined;
+    const response = try readPeer(client.socket.handle, &buf, 3000);
+    try std.testing.expect(response.len > 0);
+    try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 408"));
+}
+
+test "a 300-byte Origin is echoed in a response that reaches the client" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{
+        .port = 0,
+        .header_timeout_ms = 2000,
+    });
+    defer server.deinit();
+    // A `*.example.com` suffix entry matches any prefix length, so the *client*
+    // picks how long the echoed `Access-Control-Allow-Origin` becomes.
+    try server.addMiddleware(@import("Middleware.zig").cors(.{ .allow_origins = &.{"*.example.com"} }));
+    var group = server.group("");
+    try group.get("ping", struct {
+        fn h(ctx: *Context) anyerror!void {
+            try ctx.jsonStruct(200, .{ .ok = true });
+        }
+    }.h, null);
+
+    const th = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, struct {
+        fn run(s: *Server) void {
+            s.start() catch {};
+        }
+    }.run, .{&server});
+    defer th.join();
+    defer server.stop();
+
+    var port: u16 = 0;
+    var tries: usize = 0;
+    while (tries < 200) : (tries += 1) {
+        if (server.listener) |*l| {
+            port = l.socket.address.getPort();
+            break;
+        }
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    try std.testing.expect(port != 0);
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+
+    var client = try addr.connect(std.testing.io, .{ .mode = .stream });
+    defer client.close(std.testing.io);
+
+    const origin = try allocator.alloc(u8, 320);
+    defer allocator.free(origin);
+    @memset(origin, 'a');
+    const request = try std.fmt.allocPrint(allocator, "GET /ping HTTP/1.1\r\nHost: x\r\nOrigin: https://{s}.example.com\r\nConnection: close\r\n\r\n", .{origin});
+    defer allocator.free(request);
+    _ = std.posix.system.write(client.socket.handle, request.ptr, request.len);
+
+    var buf: [2048]u8 = undefined;
+    const response = try readPeer(client.socket.handle, &buf, 3000);
+    // Same bytes as the `writeResponse` unit test above, but through the chain
+    // the finding described: middleware echo → response header → wire.
+    try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200"));
+    try std.testing.expect(std.mem.indexOf(u8, response, origin) != null);
+}
+
+test "a response header the server refuses is answered with 500, not dropped" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{
+        .port = 0,
+        .header_timeout_ms = 2000,
+    });
+    defer server.deinit();
+    var group = server.group("");
+    try group.get("bad-header", struct {
+        fn h(ctx: *Context) anyerror!void {
+            // Written straight into the map: `setHeader` refuses this (and a
+            // handler should use it), so this test reaches the wire-level
+            // guard — and is the shape a middleware writing the map itself has.
+            const big = try ctx.allocator.alloc(u8, max_response_header_value_bytes + 1);
+            @memset(big, 'x');
+            try ctx.response_headers.put(try ctx.allocator.dupe(u8, "X-Big"), big);
+            try ctx.jsonStruct(200, .{ .ok = true });
+        }
+    }.h, null);
+
+    const th = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, struct {
+        fn run(s: *Server) void {
+            s.start() catch {};
+        }
+    }.run, .{&server});
+    defer th.join();
+    defer server.stop();
+
+    var port: u16 = 0;
+    var tries: usize = 0;
+    while (tries < 200) : (tries += 1) {
+        if (server.listener) |*l| {
+            port = l.socket.address.getPort();
+            break;
+        }
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    try std.testing.expect(port != 0);
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+
+    var client = try addr.connect(std.testing.io, .{ .mode = .stream });
+    defer client.close(std.testing.io);
+
+    const request = "GET /bad-header HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    _ = std.posix.system.write(client.socket.handle, request.ptr, request.len);
+
+    var buf: [512]u8 = undefined;
+    const response = try readPeer(client.socket.handle, &buf, 3000);
+    // Nothing partial: the refusal happens before the status line is written,
+    // so the 500 is a complete response rather than a truncated 200.
+    try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 500"));
 }

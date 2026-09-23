@@ -19,6 +19,9 @@
 //!     paths, backslashes, `:` (drive/stream syntax) and NUL can never escape
 //!     the root.
 //!   - Files above `max_bytes` are refused with 413 rather than buffered whole.
+//!   - Bodies above `chunk_bytes` are streamed chunked straight from the file
+//!     (peak memory per request stays one read chunk); smaller ones are written
+//!     in one go, so their `Content-Length` is unchanged.
 //!
 //! Ownership: the mount (prefix + root + config) is allocated once and lives as
 //! long as the process, like the route table. Pass a long-lived allocator (the
@@ -36,7 +39,9 @@ pub const Config = struct {
     allow_range: bool = true,
     /// Refuse (413) rather than buffer a whole response in memory.
     max_bytes: usize = 16 * 1024 * 1024,
-    /// Read chunk used while streaming the body.
+    /// Read chunk used while streaming the body, and the size at which a body
+    /// stops being buffered: anything longer is streamed chunked, so this is also
+    /// the per-request memory bound of the buffering path.
     chunk_bytes: usize = 256 * 1024,
     mime_overrides: []const MimeOverride = &.{},
 };
@@ -173,17 +178,28 @@ fn serve(ctx: *api.Context, mount: *Mount) anyerror!void {
         }
     }
 
-    try ctx.setHeader("Content-Type", mimeFor(rel.?, mount.config));
-    try ctx.setHeader("Content-Length", try std.fmt.allocPrint(a, "{d}", .{length}));
+    const content_type = mimeFor(rel.?, mount.config);
+    try ctx.setHeader("Content-Type", content_type);
     if (partial) {
         try ctx.setHeader("Content-Range", try std.fmt.allocPrint(a, "bytes {d}-{d}/{d}", .{ offset, offset + length - 1, stat.size }));
     }
 
     ctx.status_code = if (partial) 206 else 200;
+
+    // Bodies above one read chunk are streamed chunked straight from the file:
+    // the whole entity used to sit in the response buffer until the request
+    // ended (a 1 GiB file = a 1 GiB peak). Smaller ones stay on the single-write
+    // path, which keeps `Content-Length` on the wire — what HTTP/1.0 peers and
+    // progress-reporting clients need. `HEAD` must answer with the same headers
+    // as `GET` and no body at all, so it never takes the chunked path.
+    const streamed = ctx.method == .GET and ctx.stream != null and ctx.io != null and
+        length > @as(u64, mount.config.chunk_bytes);
+    if (!streamed) try ctx.setHeader("Content-Length", try std.fmt.allocPrint(a, "{d}", .{length}));
     if (ctx.method == .HEAD) {
         ctx.responded = true;
         return;
     }
+    if (streamed) try ctx.startChunked(ctx.status_code, content_type);
 
     // Chunked read so a large file does not need one exact-size allocation.
     const chunk = try a.alloc(u8, @min(@as(usize, @intCast(@min(length, mount.config.chunk_bytes))), mount.config.chunk_bytes));
@@ -192,14 +208,27 @@ fn serve(ctx: *api.Context, mount: *Mount) anyerror!void {
     while (remaining > 0) {
         const want: usize = @intCast(@min(remaining, chunk.len));
         const got = file.readPositionalAll(mount.io, chunk[0..want], pos) catch {
+            // Once headers are on the wire there is no status line left to
+            // correct: a truncated chunked response is how the client finds out.
+            if (streamed) return error.ReadFailed;
             try ctx.sendError(500, "ReadFailed");
             return;
         };
-        if (got == 0) break;
-        try ctx.response_body.appendSlice(ctx.allocator, chunk[0..got]);
+        if (got == 0) {
+            // The file shrank under us. A short *chunked* body would look
+            // complete to the client, so fail loudly instead of terminating it.
+            if (streamed) return error.ReadFailed;
+            break;
+        }
+        if (streamed) {
+            try ctx.writeChunk(chunk[0..got]);
+        } else {
+            try ctx.response_body.appendSlice(ctx.allocator, chunk[0..got]);
+        }
         pos += got;
         remaining -= got;
     }
+    if (streamed) try ctx.endStream();
     ctx.responded = true;
 }
 
@@ -364,5 +393,172 @@ test "static files: serve, HEAD, 304, Range and traversal refusal" {
         var resp = try Testkit.dispatch(&server, .GET, "/other", null);
         defer resp.deinit(allocator);
         try std.testing.expectEqual(@as(u16, 404), resp.status_code);
+    }
+}
+
+test "static files: bodies above chunk_bytes stream chunked over a real socket" {
+    const allocator = std.testing.allocator;
+    const http_client = @import("HttpClient.zig");
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    const dir_name = "zigmodu_static_stream_test";
+    std.Io.Dir.cwd().createDirPath(io, dir_name) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    // 5 KiB served with a 1 KiB read chunk: five chunks have to reach the socket.
+    const big = try allocator.alloc(u8, 5 * 1024);
+    defer allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @intCast(i % 253);
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, dir_name ++ "/big.bin", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, big);
+    }
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, dir_name ++ "/small.txt", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "small static body");
+    }
+
+    var server = api.Server.init(io, allocator, 0);
+    defer server.deinit();
+    var mount_arena = std.heap.ArenaAllocator.init(allocator);
+    defer mount_arena.deinit();
+    try staticFiles(io, &server, mount_arena.allocator(), "/static", dir_name, .{ .chunk_bytes = 1024 });
+
+    // `Testkit.dispatch` has no socket at all, so the in-process path keeps
+    // buffering — that is what the test above covers. These assertions need the
+    // wire, because only a socket-attached request takes the streaming path.
+    const th = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, struct {
+        fn run(s: *api.Server) void {
+            s.start() catch {};
+        }
+    }.run, .{&server});
+    defer th.join();
+    defer server.stop();
+
+    var port: u16 = 0;
+    var tries: usize = 0;
+    while (tries < 200) : (tries += 1) {
+        if (server.listener) |*l| {
+            port = l.socket.address.getPort();
+            break;
+        }
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+    }
+    try std.testing.expect(port != 0);
+
+    // Raw syscalls only: the io scheduler is shared with the server thread, and
+    // an io-path read here can stall.
+    const Exchange = struct {
+        fn send(alloc: std.mem.Allocator, port_: u16, request: []const u8) ![]u8 {
+            const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port_);
+            var stream = try addr.connect(std.testing.io, .{ .mode = .stream });
+            defer stream.close(std.testing.io);
+
+            var sent: usize = 0;
+            while (sent < request.len) {
+                const rc = std.posix.system.write(stream.socket.handle, request.ptr + sent, request.len - sent);
+                if (std.posix.errno(rc) != .SUCCESS) return error.ConnectionFailed;
+                const n: usize = @intCast(rc);
+                if (n == 0) return error.ConnectionFailed;
+                sent += n;
+            }
+
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(alloc);
+            var buf: [4096]u8 = undefined;
+            var fds = [_]std.posix.pollfd{.{
+                .fd = stream.socket.handle,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            while (true) {
+                if ((std.posix.poll(&fds, 3000) catch 0) == 0) break;
+                const n = std.posix.read(stream.socket.handle, &buf) catch break;
+                if (n == 0) break;
+                try out.appendSlice(alloc, buf[0..n]);
+            }
+            return try out.toOwnedSlice(alloc);
+        }
+    };
+
+    const Raw = struct {
+        head: []const u8,
+        body: []const u8,
+
+        fn init(raw: []const u8) @This() {
+            const i = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return .{ .head = raw, .body = "" };
+            return .{ .head = raw[0..i], .body = raw[i + 4 ..] };
+        }
+
+        fn header(self: @This(), name: []const u8) ?[]const u8 {
+            var it = std.mem.splitSequence(u8, self.head, "\r\n");
+            while (it.next()) |line| {
+                const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+                if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), name)) {
+                    return std.mem.trim(u8, line[colon + 1 ..], " \t");
+                }
+            }
+            return null;
+        }
+    };
+
+    {
+        // Below the threshold: single write, `Content-Length` preserved.
+        const raw = try Exchange.send(allocator, port, "GET /static/small.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        defer allocator.free(raw);
+        const resp = Raw.init(raw);
+        try std.testing.expect(std.mem.startsWith(u8, resp.head, "HTTP/1.1 200 "));
+        try std.testing.expectEqualStrings("17", resp.header("content-length").?);
+        try std.testing.expect(resp.header("transfer-encoding") == null);
+        try std.testing.expectEqualStrings("small static body", resp.body);
+    }
+    {
+        // Above the threshold: chunked, no `Content-Length`, streamed per read
+        // chunk (5 × 1 KiB chunks + the terminal chunk on the wire).
+        const raw = try Exchange.send(allocator, port, "GET /static/big.bin HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        defer allocator.free(raw);
+        const resp = Raw.init(raw);
+        try std.testing.expect(std.mem.startsWith(u8, resp.head, "HTTP/1.1 200 "));
+        try std.testing.expectEqualStrings("chunked", resp.header("transfer-encoding").?);
+        try std.testing.expect(resp.header("content-length") == null);
+        try std.testing.expectEqualStrings("bytes", resp.header("accept-ranges").?);
+        try std.testing.expectEqual(@as(usize, 5 * (5 + 1024 + 2) + 5), resp.body.len);
+        try std.testing.expect(std.mem.startsWith(u8, resp.body, "400\r\n"));
+        const decoded = try http_client.HttpClient.decodeChunkedBuffer(allocator, resp.body);
+        defer allocator.free(decoded);
+        try std.testing.expectEqualSlices(u8, big, decoded);
+    }
+    {
+        // HEAD: same headers as GET, no body, `Content-Length` kept.
+        const raw = try Exchange.send(allocator, port, "HEAD /static/big.bin HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        defer allocator.free(raw);
+        const resp = Raw.init(raw);
+        try std.testing.expect(std.mem.startsWith(u8, resp.head, "HTTP/1.1 200 "));
+        try std.testing.expectEqualStrings("5120", resp.header("content-length").?);
+        try std.testing.expect(resp.header("transfer-encoding") == null);
+        try std.testing.expectEqualStrings("", resp.body);
+    }
+    {
+        // Range on the streamed path: 206 + `Content-Range`, body still streamed.
+        const raw = try Exchange.send(allocator, port, "GET /static/big.bin HTTP/1.1\r\nHost: x\r\nRange: bytes=1024-4095\r\nConnection: close\r\n\r\n");
+        defer allocator.free(raw);
+        const resp = Raw.init(raw);
+        try std.testing.expect(std.mem.startsWith(u8, resp.head, "HTTP/1.1 206 "));
+        try std.testing.expectEqualStrings("bytes 1024-4095/5120", resp.header("content-range").?);
+        try std.testing.expectEqualStrings("chunked", resp.header("transfer-encoding").?);
+        const decoded = try http_client.HttpClient.decodeChunkedBuffer(allocator, resp.body);
+        defer allocator.free(decoded);
+        try std.testing.expectEqualSlices(u8, big[1024..4096], decoded);
+    }
+    {
+        // Unsatisfiable range: unchanged (416 + the total size).
+        const raw = try Exchange.send(allocator, port, "GET /static/big.bin HTTP/1.1\r\nHost: x\r\nRange: bytes=99999-\r\nConnection: close\r\n\r\n");
+        defer allocator.free(raw);
+        const resp = Raw.init(raw);
+        try std.testing.expect(std.mem.startsWith(u8, resp.head, "HTTP/1.1 416 "));
+        try std.testing.expectEqualStrings("bytes */5120", resp.header("content-range").?);
     }
 }

@@ -799,6 +799,11 @@ itself). Serves `GET`/`HEAD` only; no directory index; normalizes paths before
 touching the filesystem; `ETag` + `If-None-Match` → 304; `Range` → 206/416;
 bodies above `max_bytes` (16 MiB default) → 413.
 
+Bodies larger than the serving chunk size are sent **chunked** (streamed from
+disk) instead of buffered whole — so a `Content-Length` is only present for
+`HEAD` and for bodies at or below the chunk threshold. HTTP/1.0 clients that
+cannot read chunked framing should use `HEAD` or `Range` for large files.
+
 ### Metrics with bounded labels
 
 ```zig

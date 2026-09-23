@@ -427,7 +427,7 @@ pub const HttpClient = struct {
         if (conn.stream) |stream| {
             var write_buf: [4096]u8 = undefined;
             var w = stream.writer(self.connection_pool.io, &write_buf);
-            try self.writeRequestHeaders(&w, req.method, target.path, target.host, target.port, &req.headers, req.body);
+            try writeRequestHeaders(&w, req.method, target.path, target.host, target.port, &req.headers, req.body);
             // Buffered writer: the request must reach the peer before we start
             // reading the response, otherwise both sides deadlock forever.
             try w.interface.flush();
@@ -462,8 +462,12 @@ pub const HttpClient = struct {
         if (n == 0) return error.Timeout;
     }
 
+    /// Serialize the request line, headers and body into `w`.
+    ///
+    /// Formatted straight into the writer's buffer: an `allocPrint` per header
+    /// line put N+2 allocations on every request for bytes that were copied into
+    /// the write buffer and freed immediately.
     fn writeRequestHeaders(
-        self: *Self,
         w: anytype,
         method: []const u8,
         path: []const u8,
@@ -472,9 +476,7 @@ pub const HttpClient = struct {
         headers: *const std.StringHashMap([]const u8),
         body: ?[]const u8,
     ) !void {
-        const request_line = try std.fmt.allocPrint(self.allocator, "{s} {s} HTTP/1.1\r\n", .{ method, path });
-        defer self.allocator.free(request_line);
-        _ = w.interface.writeAll(request_line) catch return error.ConnectionError;
+        w.interface.print("{s} {s} HTTP/1.1\r\n", .{ method, path }) catch return error.ConnectionError;
 
         var has_host = false;
         var has_content_length = false;
@@ -482,31 +484,66 @@ pub const HttpClient = struct {
         while (iter.next()) |entry| {
             if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "host")) has_host = true;
             if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "content-length")) has_content_length = true;
-            const header_line = try std.fmt.allocPrint(self.allocator, "{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
-            defer self.allocator.free(header_line);
-            _ = w.interface.writeAll(header_line) catch return error.ConnectionError;
+            w.interface.print("{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* }) catch return error.ConnectionError;
         }
 
         if (!has_host) {
-            const host_line = if (port == 80 or port == 443)
-                try std.fmt.allocPrint(self.allocator, "Host: {s}\r\n", .{host})
-            else
-                try std.fmt.allocPrint(self.allocator, "Host: {s}:{d}\r\n", .{ host, port });
-            defer self.allocator.free(host_line);
-            _ = w.interface.writeAll(host_line) catch return error.ConnectionError;
+            if (port == 80 or port == 443) {
+                w.interface.print("Host: {s}\r\n", .{host}) catch return error.ConnectionError;
+            } else {
+                w.interface.print("Host: {s}:{d}\r\n", .{ host, port }) catch return error.ConnectionError;
+            }
         }
 
         if (!has_content_length) {
             const len = if (body) |b| b.len else 0;
-            const cl = try std.fmt.allocPrint(self.allocator, "Content-Length: {d}\r\n", .{len});
-            defer self.allocator.free(cl);
-            _ = w.interface.writeAll(cl) catch return error.ConnectionError;
+            w.interface.print("Content-Length: {d}\r\n", .{len}) catch return error.ConnectionError;
         }
 
-        _ = w.interface.writeAll("\r\n") catch return error.ConnectionError;
+        w.interface.writeAll("\r\n") catch return error.ConnectionError;
         if (body) |b| {
-            if (b.len > 0) _ = w.interface.writeAll(b) catch return error.ConnectionError;
+            if (b.len > 0) w.interface.writeAll(b) catch return error.ConnectionError;
         }
+    }
+
+    test "writeRequestHeaders: exact request bytes, no allocation per header" {
+        // The signature takes no allocator at all, so the N+2 `allocPrint` calls
+        // that used to sit on every request cannot come back without failing to
+        // compile. `w` only has to expose `interface`, so no socket is needed.
+        const Capture = struct { interface: std.Io.Writer };
+        var buf: [256]u8 = undefined;
+        var capture = Capture{ .interface = std.Io.Writer.fixed(&buf) };
+
+        var headers = std.StringHashMap([]const u8).init(std.testing.allocator);
+        defer headers.deinit();
+        try headers.put("X-Test", "v");
+
+        try writeRequestHeaders(&capture, "POST", "/echo?x=1", "example.com", 8080, &headers, "hello");
+        try std.testing.expectEqualStrings(
+            "POST /echo?x=1 HTTP/1.1\r\nX-Test: v\r\nHost: example.com:8080\r\nContent-Length: 5\r\n\r\nhello",
+            capture.interface.buffered(),
+        );
+    }
+
+    test "writeRequestHeaders: caller Host and Content-Length win, default port elided" {
+        const Capture = struct { interface: std.Io.Writer };
+        var buf: [256]u8 = undefined;
+        var capture = Capture{ .interface = std.Io.Writer.fixed(&buf) };
+
+        var headers = std.StringHashMap([]const u8).init(std.testing.allocator);
+        defer headers.deinit();
+        try headers.put("Host", "cdn.example");
+        try headers.put("Content-Length", "0");
+
+        try writeRequestHeaders(&capture, "GET", "/", "ignored.example", 80, &headers, "");
+        const written = capture.interface.buffered();
+
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, "Host: "));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, "Content-Length: "));
+        try std.testing.expect(std.mem.indexOf(u8, written, "Host: cdn.example\r\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, written, "ignored.example") == null);
+        try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length: 0\r\n") != null);
+        try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\n"));
     }
 
     fn readResponse(self: *Self, stream: std.Io.net.Stream) !HttpResponse {
@@ -533,6 +570,7 @@ pub const HttpClient = struct {
         resp.status_code = std.fmt.parseInt(u16, status_str, 10) catch return error.InvalidResponse;
 
         var content_length: usize = 0;
+        var chunked = false;
         while (line_it.next()) |line| {
             if (line.len == 0) break;
             const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
@@ -547,10 +585,19 @@ pub const HttpClient = struct {
 
             if (std.ascii.eqlIgnoreCase(key_trim, "content-length")) {
                 content_length = std.fmt.parseInt(usize, val_trim, 10) catch 0;
+            } else if (std.ascii.eqlIgnoreCase(key_trim, "transfer-encoding")) {
+                if (containsIgnoreCaseAscii(val_trim, "chunked")) chunked = true;
             }
         }
 
         const initial_body = raw[body_start..];
+        // A chunked body has no `Content-Length` to read against; without this
+        // branch the caller got the raw framing back as the body. (The streaming
+        // path has decoded it all along.)
+        if (chunked) {
+            resp.body = try self.readChunkedBody(stream, &buf, initial_body);
+            return resp;
+        }
         if (content_length == 0) {
             resp.body = try self.allocator.dupe(u8, initial_body);
             return resp;
@@ -601,7 +648,7 @@ pub const HttpClient = struct {
         if (conn.stream) |stream| {
             var write_buf: [4096]u8 = undefined;
             var w = stream.writer(self.connection_pool.io, &write_buf);
-            try self.writeRequestHeaders(&w, req.method, target.path, target.host, target.port, &req.headers, req.body);
+            try writeRequestHeaders(&w, req.method, target.path, target.host, target.port, &req.headers, req.body);
             // Buffered writer: flush before reading, otherwise the peer waits
             // for a request that never leaves the buffer — deadlock (the
             // non-streaming path flushes too; this was the local-HTTP hang).
@@ -659,13 +706,32 @@ pub const HttpClient = struct {
         const initial = raw[body_start..];
 
         if (chunked) {
-            try streamChunkedBody(stream, &buf, initial, self.allocator, self.timeout_ms, cb_ctx, on_chunk);
+            try streamChunkedBody(stream, &buf, initial, self.timeout_ms, cb_ctx, on_chunk);
         } else if (content_length) |cl| {
             try streamContentLengthBody(stream, &buf, initial, cl, self.timeout_ms, cb_ctx, on_chunk);
         } else {
             try streamUntilEofBody(stream, &buf, initial, self.timeout_ms, cb_ctx, on_chunk);
         }
         return resp;
+    }
+
+    /// Buffer a chunked response body into contiguous bytes, reusing the same
+    /// decoder the streaming path uses (so there is one chunked implementation,
+    /// not one per entry point).
+    fn readChunkedBody(self: *Self, stream: std.Io.net.Stream, buf: []u8, initial: []const u8) ![]u8 {
+        const Collector = struct {
+            allocator: std.mem.Allocator,
+            out: std.ArrayList(u8),
+
+            fn onChunk(raw: *anyopaque, chunk: []const u8) anyerror!void {
+                const sink: *@This() = @ptrCast(@alignCast(raw));
+                try sink.out.appendSlice(sink.allocator, chunk);
+            }
+        };
+        var collector = Collector{ .allocator = self.allocator, .out = .empty };
+        errdefer collector.out.deinit(self.allocator);
+        try streamChunkedBody(stream, buf, initial, self.timeout_ms, &collector, Collector.onChunk);
+        return try collector.out.toOwnedSlice(self.allocator);
     }
 
     /// Decode a complete chunked-transfer buffer into contiguous body (unit-test helper).
@@ -768,45 +834,114 @@ fn streamUntilEofBody(
     }
 }
 
+/// True when a chunk-size line (`<hex>[;extension]`, up to and including its
+/// line terminator) starts with at least one hex digit and carries nothing but
+/// hex digits before the extension.
+fn isHexSizeLine(line: []const u8) bool {
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        switch (line[i]) {
+            '0'...'9', 'a'...'f', 'A'...'F' => {},
+            ';', '\r', '\n' => break,
+            else => return false,
+        }
+    }
+    return i > 0;
+}
+
+/// Stream a `Transfer-Encoding: chunked` body: framing is decoded with
+/// `std.http.ChunkParser` and every payload slice is handed to `on_chunk`
+/// straight out of the read buffer.
+///
+/// Only the current chunk-size line is copied aside (a bounded stack buffer),
+/// so the body is walked once and memory stays constant. The version this
+/// replaces kept all unconsumed bytes in a growing list and moved the remainder
+/// to the front after every chunk — quadratic copying (and a full rescan for the
+/// CRLF) once a read window carried many small chunks.
+///
+/// On the terminal chunk it also consumes the CRLF that closes the trailer
+/// section, so a pooled connection is left byte-aligned for the next request.
 fn streamChunkedBody(
     stream: std.Io.net.Stream,
     buf: []u8,
     initial: []const u8,
-    allocator: std.mem.Allocator,
     timeout_ms: u64,
     cb_ctx: *anyopaque,
     on_chunk: HttpClient.OnBodyChunk,
 ) !void {
-    var carry: std.ArrayList(u8) = .empty;
-    defer carry.deinit(allocator);
-    try carry.appendSlice(allocator, initial);
+    var pending: []const u8 = initial;
+    // "<hex>[;extension]\r\n": real servers keep this to a few dozen bytes, and
+    // a longer one is malformed framing rather than something to buffer.
+    var size_line: [64]u8 = undefined;
 
     while (true) {
-        while (std.mem.indexOf(u8, carry.items, "\r\n") == null) {
+        var line_len: usize = 0;
+        while (std.mem.indexOfScalar(u8, size_line[0..line_len], '\n') == null) {
+            if (line_len == size_line.len) return error.InvalidChunked;
+            try fillFrom(stream, buf, &pending, size_line[line_len..][0..1], timeout_ms);
+            line_len += 1;
+        }
+        // A fresh parser per chunk: `ChunkParser` accumulates `chunk_len` across
+        // `feed` calls, so one instance is only good for a single size line.
+        // It also accepts `A`…`Z`/`a`…`z` as "digits" (any value: `'z'` counts as
+        // 35), so the line is checked for being hex at all first — the decoder
+        // this replaced got that from `std.fmt.parseInt`.
+        if (!isHexSizeLine(size_line[0..line_len])) return error.InvalidChunked;
+        var parser: std.http.ChunkParser = .init;
+        _ = parser.feed(size_line[0..line_len]);
+        if (parser.state != .data) return error.InvalidChunked;
+
+        if (parser.chunk_len == 0) {
+            // End of body. Trailers are not supported (they never were), so the
+            // only well-formed continuation is the empty one; consuming it keeps
+            // the connection usable for the next request instead of leaving
+            // stray CRLF bytes for the next response parser to trip over.
+            var trailer_end: [2]u8 = undefined;
+            try fillFrom(stream, buf, &pending, &trailer_end, timeout_ms);
+            if (!std.mem.eql(u8, &trailer_end, "\r\n")) return error.InvalidChunked;
+            return;
+        }
+
+        var left = parser.chunk_len;
+        while (left > 0) {
+            if (pending.len == 0) {
+                const more = try HttpClient.blockingRead(stream, buf, timeout_ms);
+                if (more == 0) return error.IncompleteChunked;
+                pending = buf[0..more];
+            }
+            const take: usize = @intCast(@min(left, @as(u64, pending.len)));
+            try on_chunk(cb_ctx, pending[0..take]);
+            pending = pending[take..];
+            left -= @intCast(take);
+        }
+
+        var crlf: [2]u8 = undefined;
+        try fillFrom(stream, buf, &pending, &crlf, timeout_ms);
+        if (!std.mem.eql(u8, &crlf, "\r\n")) return error.InvalidChunked;
+    }
+}
+
+/// Move exactly `dest.len` bytes from `pending` into `dest`, refilling `pending`
+/// from the socket when it runs dry. Bytes past `dest` stay in `pending`, so the
+/// caller keeps its place in the stream and nothing is copied twice.
+fn fillFrom(
+    stream: std.Io.net.Stream,
+    buf: []u8,
+    pending: *[]const u8,
+    dest: []u8,
+    timeout_ms: u64,
+) !void {
+    var got: usize = 0;
+    while (got < dest.len) {
+        if (pending.len == 0) {
             const more = try HttpClient.blockingRead(stream, buf, timeout_ms);
             if (more == 0) return error.IncompleteChunked;
-            try carry.appendSlice(allocator, buf[0..more]);
+            pending.* = buf[0..more];
         }
-        const line_end = std.mem.indexOf(u8, carry.items, "\r\n").?;
-        const size = std.fmt.parseInt(usize, carry.items[0..line_end], 16) catch return error.InvalidChunked;
-        const after_line = line_end + 2;
-        // Drop size line
-        const rest_len = carry.items.len - after_line;
-        std.mem.copyForwards(u8, carry.items[0..rest_len], carry.items[after_line..]);
-        try carry.resize(allocator, rest_len);
-
-        if (size == 0) return;
-
-        while (carry.items.len < size + 2) {
-            const more = try HttpClient.blockingRead(stream, buf, timeout_ms);
-            if (more == 0) return error.IncompleteChunked;
-            try carry.appendSlice(allocator, buf[0..more]);
-        }
-        try on_chunk(cb_ctx, carry.items[0..size]);
-        const after_data = size + 2;
-        const rem = carry.items.len - after_data;
-        std.mem.copyForwards(u8, carry.items[0..rem], carry.items[after_data..]);
-        try carry.resize(allocator, rem);
+        const take = @min(pending.len, dest.len - got);
+        @memcpy(dest[got..][0..take], pending.*[0..take]);
+        got += take;
+        pending.* = pending.*[take..];
     }
 }
 
@@ -1010,4 +1145,319 @@ test "HttpClient request times out against a stalled peer" {
 
     const err = client.request(req) catch |e| e;
     try std.testing.expectEqual(error.Timeout, err);
+}
+
+// ── request framing / chunked decoding ─────────────────────────────────────
+
+/// Loopback server for the framing tests: writes `payload` verbatim on every
+/// accepted connection, records the request bytes in `seen`, then closes.
+///
+/// It stops once the listener has been quiet briefly, so a failing test cannot
+/// leave this thread parked in `accept` and hang `join`.
+const CannedServer = struct {
+    listener: *std.Io.net.Server,
+    payload: []const u8,
+    seen: []u8,
+    seen_len: usize = 0,
+
+    fn run(ctx: *@This()) void {
+        var served: usize = 0;
+        while (true) {
+            // The first accept waits for the client; afterwards only a short
+            // grace period, so a retry is still served but an idle test ends.
+            const wait_ms: u64 = if (served == 0) 5000 else 300;
+            HttpClient.waitForReadable(ctx.listener.socket.handle, wait_ms) catch return;
+            const accepted = ctx.listener.accept(std.testing.io) catch return;
+            defer accepted.close(std.testing.io);
+            served += 1;
+            ctx.drainRequest(accepted);
+            writeRawAll(accepted.socket.handle, ctx.payload);
+        }
+    }
+
+    /// Read one request: the head, plus the body its `Content-Length` promises.
+    fn drainRequest(ctx: *@This(), accepted: std.Io.net.Stream) void {
+        var total: usize = 0;
+        var body_len: ?usize = null;
+        while (total < ctx.seen.len) {
+            HttpClient.waitForReadable(accepted.socket.handle, 3000) catch break;
+            const n = std.posix.read(accepted.socket.handle, ctx.seen[total..]) catch break;
+            if (n == 0) break;
+            total += n;
+            const head_end = std.mem.indexOf(u8, ctx.seen[0..total], "\r\n\r\n") orelse continue;
+            if (body_len == null) {
+                body_len = if (headerValue(ctx.seen[0..head_end], "content-length")) |v|
+                    std.fmt.parseInt(usize, v, 10) catch 0
+                else
+                    0;
+            }
+            if (total >= head_end + 4 + body_len.?) break;
+        }
+        ctx.seen_len = total;
+    }
+};
+
+/// Case-insensitive value of `name` inside a raw request head.
+fn headerValue(head: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitSequence(u8, head, "\r\n");
+    while (it.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), name)) {
+            return std.mem.trim(u8, line[colon + 1 ..], " \t");
+        }
+    }
+    return null;
+}
+
+/// Raw syscall writes only: the io scheduler is shared with the test thread and
+/// an io-path write from a helper thread can stall (see the WS tests in
+/// `api/Server.zig`).
+fn writeRawAll(fd: std.posix.socket_t, bytes: []const u8) void {
+    var sent: usize = 0;
+    while (sent < bytes.len) {
+        const rc = std.posix.system.write(fd, bytes.ptr + sent, bytes.len - sent);
+        if (std.posix.errno(rc) != .SUCCESS) return;
+        const n: usize = @intCast(rc);
+        if (n == 0) return;
+        sent += n;
+    }
+}
+
+/// Build a chunked-transfer response for `payload`: `count` chunks of `size`
+/// bytes each (from `payload`), then the terminal chunk.
+fn chunkedResponse(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    count: usize,
+    size: usize,
+) ![]u8 {
+    var wire: std.ArrayList(u8) = .empty;
+    errdefer wire.deinit(allocator);
+    try wire.appendSlice(allocator, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+    for (0..count) |c| {
+        var size_line: [16]u8 = undefined;
+        const head = try std.fmt.bufPrint(&size_line, "{x}\r\n", .{size});
+        try wire.appendSlice(allocator, head);
+        try wire.appendSlice(allocator, payload[c * size ..][0..size]);
+        try wire.appendSlice(allocator, "\r\n");
+    }
+    try wire.appendSlice(allocator, "0\r\n\r\n");
+    return try wire.toOwnedSlice(allocator);
+}
+
+test "HttpClient sends the exact request framing over the wire" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var listener = try addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer listener.deinit(std.testing.io);
+    const port = listener.socket.address.getPort();
+
+    const seen = try allocator.alloc(u8, 4096);
+    defer allocator.free(seen);
+    var server = CannedServer{
+        .listener = &listener,
+        .payload = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+        .seen = seen,
+    };
+    const th = try std.Thread.spawn(.{}, CannedServer.run, .{&server});
+    defer th.join();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/echo?x=1", .{port});
+
+    var client = HttpClient.init(allocator, std.testing.io, 2, 3000);
+    defer client.deinit();
+    var req = HttpClient.HttpRequest.init(allocator, "POST", url);
+    defer req.deinit();
+    try req.setHeader("Content-Type", "text/plain");
+    try req.setHeader("X-Test", "v");
+    try req.setBody("hello");
+
+    var resp = try client.request(req);
+    defer resp.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+    try std.testing.expectEqualStrings("OK", resp.body);
+
+    const request = seen[0..server.seen_len];
+    const head_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return error.TestUnexpectedResult;
+    const head = request[0..head_end];
+    try std.testing.expectEqualStrings("hello", request[head_end + 4 ..]);
+
+    var host_line_buf: [64]u8 = undefined;
+    const host_line = try std.fmt.bufPrint(&host_line_buf, "Host: 127.0.0.1:{d}", .{port});
+    // Header order out of a StringHashMap is not defined, so compare as a set —
+    // but count every line, so a duplicate (`Content-Length` written twice, the
+    // shape writeResponse guards against on the server side) still fails.
+    const expected = [_][]const u8{
+        "Content-Type: text/plain",
+        "X-Test: v",
+        host_line,
+        "Content-Length: 5",
+    };
+    var lines = std.mem.splitSequence(u8, head, "\r\n");
+    try std.testing.expectEqualStrings("POST /echo?x=1 HTTP/1.1", lines.next() orelse "");
+    var line_count: usize = 0;
+    headers: while (lines.next()) |line| {
+        line_count += 1;
+        for (expected) |want| {
+            if (std.mem.eql(u8, line, want)) continue :headers;
+        }
+        std.debug.print("unexpected request line: '{s}'\n", .{line});
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expectEqual(expected.len, line_count);
+}
+
+test "HttpClient streams a 64-chunk body and decodes it identically when buffered" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    const chunk_count = 64;
+    const chunk_size = 8 * 1024;
+    const expected = try allocator.alloc(u8, chunk_count * chunk_size);
+    defer allocator.free(expected);
+    for (expected, 0..) |*b, i| b.* = @intCast(i % 251);
+    const wire = try chunkedResponse(allocator, expected, chunk_count, chunk_size);
+    defer allocator.free(wire);
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var listener = try addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer listener.deinit(std.testing.io);
+    const port = listener.socket.address.getPort();
+
+    const seen = try allocator.alloc(u8, 1024);
+    defer allocator.free(seen);
+    var server = CannedServer{ .listener = &listener, .payload = wire, .seen = seen };
+    const th = try std.Thread.spawn(.{}, CannedServer.run, .{&server});
+    defer th.join();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/big", .{port});
+
+    const Sink = struct {
+        allocator: std.mem.Allocator,
+        data: std.ArrayList(u8) = .empty,
+        calls: usize = 0,
+
+        fn onChunk(raw: *anyopaque, chunk: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try self.data.appendSlice(self.allocator, chunk);
+        }
+    };
+
+    {
+        // Streaming entry point (`requestStream` → the chunked decoder).
+        var sink = Sink{ .allocator = allocator };
+        defer sink.data.deinit(allocator);
+        var client = HttpClient.init(allocator, std.testing.io, 2, 5000);
+        defer client.deinit();
+        var req = HttpClient.HttpRequest.init(allocator, "GET", url);
+        defer req.deinit();
+
+        var resp = try client.requestStream(req, &sink, Sink.onChunk);
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+        try std.testing.expect(sink.calls >= 1);
+        try std.testing.expectEqualSlices(u8, expected, sink.data.items);
+    }
+    {
+        // Buffering entry point: a chunked reply must decode to the same body
+        // rather than come back as raw framing. Fresh client: the peer closed
+        // the connection after the first response.
+        var client = HttpClient.init(allocator, std.testing.io, 2, 5000);
+        defer client.deinit();
+        var req = HttpClient.HttpRequest.init(allocator, "GET", url);
+        defer req.deinit();
+
+        var resp = try client.request(req);
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+        try std.testing.expectEqualSlices(u8, expected, resp.body);
+    }
+}
+
+test "HttpClient decodes thousands of tiny chunks sharing one read window" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    // 16384 × 1 byte, 6 wire bytes per chunk: a single 8 KiB read carries >1000
+    // chunk headers. This is the shape the previous decoder handled by copying
+    // (and rescanning) the whole unconsumed remainder once per chunk.
+    const chunk_count = 16 * 1024;
+    const expected = try allocator.alloc(u8, chunk_count);
+    defer allocator.free(expected);
+    for (expected, 0..) |*b, i| b.* = @intCast(i % 251);
+    const wire = try chunkedResponse(allocator, expected, chunk_count, 1);
+    defer allocator.free(wire);
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var listener = try addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer listener.deinit(std.testing.io);
+    const port = listener.socket.address.getPort();
+
+    const seen = try allocator.alloc(u8, 1024);
+    defer allocator.free(seen);
+    var server = CannedServer{ .listener = &listener, .payload = wire, .seen = seen };
+    const th = try std.Thread.spawn(.{}, CannedServer.run, .{&server});
+    defer th.join();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/tiny", .{port});
+
+    var client = HttpClient.init(allocator, std.testing.io, 2, 5000);
+    defer client.deinit();
+    var req = HttpClient.HttpRequest.init(allocator, "GET", url);
+    defer req.deinit();
+
+    var resp = try client.request(req);
+    defer resp.deinit();
+    try std.testing.expectEqualSlices(u8, expected, resp.body);
+}
+
+test "HttpClient chunked decoder rejects malformed framing" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    const cases = [_]struct { payload: []const u8, expected: anyerror }{
+        // Not a hex size line.
+        .{ .payload = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nzz\r\nab\r\n0\r\n\r\n", .expected = error.InvalidChunked },
+        // Chunk data shorter than the declared size.
+        .{ .payload = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nab", .expected = error.IncompleteChunked },
+        // Missing the CRLF that closes the chunk.
+        .{ .payload = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\nabXX0\r\n\r\n", .expected = error.InvalidChunked },
+        // Truncated trailer section.
+        .{ .payload = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\nab\r\n0\r\n", .expected = error.IncompleteChunked },
+    };
+
+    for (cases) |case| {
+        const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        var listener = try addr.listen(std.testing.io, .{ .reuse_address = true });
+        defer listener.deinit(std.testing.io);
+        const port = listener.socket.address.getPort();
+
+        const seen = try allocator.alloc(u8, 1024);
+        defer allocator.free(seen);
+        var server = CannedServer{ .listener = &listener, .payload = case.payload, .seen = seen };
+        const th = try std.Thread.spawn(.{}, CannedServer.run, .{&server});
+        defer th.join();
+
+        var url_buf: [128]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/bad", .{port});
+
+        const Sink = struct {
+            fn onChunk(_: *anyopaque, _: []const u8) anyerror!void {}
+        };
+        var client = HttpClient.init(allocator, std.testing.io, 1, 2000);
+        defer client.deinit();
+        // One retry is enough to see the same error; more would just slow it down.
+        client.retry_policy.max_retries = 1;
+        var req = HttpClient.HttpRequest.init(allocator, "GET", url);
+        defer req.deinit();
+
+        const result = client.requestStream(req, undefined, Sink.onChunk);
+        try std.testing.expectError(case.expected, result);
+    }
 }

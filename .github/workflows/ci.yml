@@ -65,6 +65,7 @@ jobs:
   build-and-test:
     name: Build & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -128,7 +129,7 @@ jobs:
         # still failing fast on a hang.
         timeout-minutes: 25
         run: |
-          bash scripts/ci-run-logged.sh "$RUNNER_TEMP/test-output.log" zig build test
+          bash scripts/ci-run-logged.sh "$RUNNER_TEMP/test-output.log" zig build test --test-timeout 300s
 
       # Log download via API needs admin rights; artifacts are the reliable
       # way to inspect failures from automation.
@@ -267,16 +268,27 @@ jobs:
         run: bash scripts/check-deadcode.sh
 
       - name: Upload test logs
+        # Was `path: .zig-cache/` — a content-addressed binary directory: huge,
+        # unreadable, and it burned the 10 GB artifact budget without naming the
+        # test that failed. The logged-runner wrapper above already writes the
+        # useful file (`test-log-${{ matrix.os }}`, uploaded at the step that
+        # ran the suite); anything else here is only worth keeping when a gate
+        # script left output behind.
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-logs-${{ matrix.os }}
-          path: .zig-cache/
+          name: gate-logs-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/*.log
+            .zig-cache/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
 
   # ── Lint & Audit ──────────────────────────────
   lint:
     name: Lint & Audit
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -309,6 +321,7 @@ jobs:
   examples:
     name: Build Examples
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       # No sibling zent checkout: zent-modulith pins zent via git tag in its
@@ -373,6 +386,7 @@ jobs:
   integration-full:
     name: Integration (full)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [build-and-test]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     steps:
@@ -433,6 +447,9 @@ jobs:
   test-postgres:
     name: Test (DB=postgres)
     runs-on: ubuntu-latest
+    # A hanging test used to burn the run's 6-hour default here; the step also
+    # lacked the logged-runner wrapper, so a hang produced no artifact at all.
+    timeout-minutes: 30
     needs: [build-and-test]
     services:
       postgres:
@@ -487,11 +504,21 @@ jobs:
           PGUSER: postgres
           PGPASSWORD: postgres
           PGDATABASE: postgres
-        run: zig build test
+        run: |
+          bash scripts/ci-run-logged.sh "$RUNNER_TEMP/pg-test.log" zig build test --test-timeout 300s
+
+      - name: Upload test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-postgres
+          path: ${{ runner.temp }}/pg-test.log
+          retention-days: 7
 
   test-mysql:
     name: Test (DB=mysql)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [build-and-test]
     services:
       mysql:
@@ -537,7 +564,7 @@ jobs:
           MYSQL_PASSWORD: secret
           MYSQL_DATABASE: zigzero_test
         run: |
-          bash scripts/ci-run-logged.sh "$RUNNER_TEMP/mysql-test.log" zig build test
+          bash scripts/ci-run-logged.sh "$RUNNER_TEMP/mysql-test.log" zig build test --test-timeout 300s
 
       - name: Upload mysql test log on failure
         if: failure()
@@ -552,6 +579,7 @@ jobs:
   test-live-services:
     name: Test (Redis + NATS + Kafka live)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [build-and-test]
     services:
       redis:
@@ -608,7 +636,7 @@ jobs:
           NATS_URL: nats://127.0.0.1:4222
           KAFKA_BOOTSTRAP: 127.0.0.1:9092
         run: |
-          bash scripts/ci-run-logged.sh "$RUNNER_TEMP/live-test.log" zig build test
+          bash scripts/ci-run-logged.sh "$RUNNER_TEMP/live-test.log" zig build test --test-timeout 300s
 
       - name: Upload live-service test log on failure
         if: failure()
@@ -649,9 +677,40 @@ jobs:
         # to widen the window, not to re-run the fast suite.
         run: zig build soak -Dsoak-clients=64 -Dsoak-iterations=200
 
+      - name: Cluster soak (raft election/replication + event-bus invariants)
+        # `soak` above covers HTTP + tenant isolation only; `soak-cluster` is the
+        # one harness that exercises ClusterServer's lifecycle, the per-connection
+        # handshake and in-flight AppendEntries truncation. It had never run in
+        # CI at all (docs/dev/v1.0-readiness-v0.32.md B-10 tracked the gap).
+        #
+        # The RSS budget is stated here rather than left at the default: the
+        # spread this asserts is dominated by allocator page retention (the
+        # runner's own leak check stays at `0 leaked`), and it grows with traffic
+        # — measured on macOS, the *unchanged* tree fails the old 64 MiB default
+        # at 2x traffic (12 -> 108 MiB). 192 MiB keeps the invariant meaningful
+        # (a real leak of the same magnitude as the delivered volume would still
+        # trip it) without turning a Linux runner's allocator behaviour into a
+        # coin flip. The growth itself is an open finding, tracked in the
+        # CHANGELOG entry for this batch.
+        env:
+          SOAK_CLUSTER_RSS_BUDGET_MIB: "192"
+        run: zig build soak-cluster
+
+      - name: Runtime stress (supervision tree / pools / timers)
+        # The runtime harness asserts the things a short single-threaded test
+        # cannot: claims, ready-ring fairness, timer ownership under churn.
+        run: zig build runtime-stress -Druntime-stress-duration-ms=60000
+
+      - name: Fuzz (bounded)
+        # `--fuzz` with no limit opens the webui and never exits, so the bound is
+        # mandatory. It is also incompatible with `-Dtest-filter` (the filter
+        # runner panics in fuzz mode by design) — this runs the whole suite.
+        run: zig build test --fuzz=2000 -Ddb=all --test-timeout 300s
+
   benchmark:
     name: Benchmark
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     steps:
       - uses: actions/checkout@v4

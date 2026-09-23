@@ -1053,7 +1053,7 @@ var app = try b.withName("app").withMaxPooledWorkers(64).build(.{MyModule});
 | `ctx.owner` | 固定 = worker 自己的线程 | 批次期间 = 当前池线程，批次之外 0（trace 继承的答案来源） |
 | `Thread.getCurrentId()` 用于自查 | 稳定 | 只在一次 `handle` 内稳定，别跨消息保存 |
 | `stats().running` | 线程活着 | 正被 claim（所以总量上界 = 池线程数，§12.9 第 4 条） |
-| `join()` | `Thread.join` | 等 claim 交还（自旋；它只在停机路径被调用） |
+| `join()` | `Thread.join` | 等 claim 交还（先自旋 1024 轮，之后每 1 ms 轮询同一谓词；它只在停机路径被调用） |
 | `stop()` | 关邮箱 + 唤醒 `recv` | 同上；池把邮箱抽干后不再为它排 token |
 | **`spawnActor` 监督停机**（实测探针，非推理） | 循环 `break`：邮箱里剩下的消息**不再 `handle`**，但**都被计数** —— `stats().discarded_on_stop` | **继续把邮箱抽干**：`handle` 对每条剩余消息再跑一次，抽干后才不再排 token |
 

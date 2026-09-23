@@ -197,8 +197,8 @@ defer allocator.free(json);               // 挂到 /cluster/health 或 metrics 
 - **两个线程碰的同一个 `RaftElection`，由 raft 自己串起来**：`tick()` 在**你的线程**上跑
   `raft.tick()`，而入站分发在 `start()` 起的 accept 线程上跑 `raft.handleVoteRequest` /
   `handleAppendEntries` —— 两边都会 free/dupe `voted_for`、推 `log`、改 `next_index`/`match_index`。
-  所以这把锁**在 `RaftElection` 自己身上**（`RaftElection.RaftLock`，原子自旋，与 `scheduler.zig`
-  协调池线程同口径）：每个碰共享状态的公开入口（`tick` / `handleVoteRequest` / `handleAppendEntries` /
+  所以这把锁**在 `RaftElection` 自己身上**（`RaftElection.RaftLock`，快路径 `cmpxchgWeak` +
+  有界自旋 + `poll` 睡眠的三档，与 `scheduler.zig` 协调池线程同口径）：每个碰共享状态的公开入口（`tick` / `handleVoteRequest` / `handleAppendEntries` /
   `handleVoteResponse` / `handleInstallSnapshot` / `appendEntry` / `addPeer` / `compactLog` 以及状态
   访问器）自己取放一次，私有的步骤函数（`startElection` / `sendHeartbeats` / `becomeLeader` / …）
   假设锁已在手。**门面不再持锁**（`ClusterBootstrap.raft_lock` 已删）：`ClusterBootstrap` 直接驱动、
@@ -210,9 +210,14 @@ defer allocator.free(json);               // 挂到 /cluster/health 或 metrics 
   **但这条原则在出站方向曾经是反的**，而且这里必须写清是哪一半修了、哪一半没有：
 
   * `tick()` 的出站轮次（`sendHeartbeats` → `transport.sendAppendEntries`、`startElection` 的
-    `sendVoteRequest`）**整段在锁内**跑，而 `RaftLock` 是**自旋**锁 —— 一个不响应的对端不是"慢一轮"，
-    是让每个想碰状态的线程（accept 线程的入站 RPC、`appendEntry`、所有访问器）在
-    `spinLoopHint` 上**烧核**，时间为这一次 RPC 的等待时间。
+    `sendVoteRequest`）**整段在锁内**跑，而 `RaftLock` 曾经是**无界自旋**锁 —— 一个不响应的对端
+    不是"慢一轮"，是让每个想碰状态的线程（accept 线程的入站 RPC、`appendEntry`、所有访问器）
+    在 `spinLoopHint` 上**烧核**，时间为这一次 RPC 的等待时间。
+    现在 `RaftLock.acquire` 是三档：`cmpxchgWeak` 快路径（无竞争不写）→ 32 轮 `spinLoopHint`
+    → 128 轮 `Thread.yield` → 每轮 1 ms 的 `std.posix.poll(&.{}, 1)` 睡眠（该文件拿不到 `io`，
+    所以不能用 `std.Io.sleep`；Windows/WASI 无 `poll` 时退化为 `yield`）。实测：持锁者睡
+    120 ms 时，等待者自身 CPU 从 **120 ms → 0 ms**；代价是等待超过 ~160 轮后引入 ≤1 ms 的
+    释放→获取交接延迟。回归测试在 `RaftElection.zig`。
   * **已修的一半是回包等待**：`sockread.setRecvTimeout`（新，`SO_RCVTIMEO`，镜像已有的
     `setSendTimeout`）由 `ElectionConfig.rpc_timeout_ms`（新，默认 100 ms）驱动，套在发送方的
     连接上。它覆盖的正是生产里更常见的那种黑洞：**握手成功、然后永不回包**
