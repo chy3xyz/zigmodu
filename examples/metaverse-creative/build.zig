@@ -10,9 +10,20 @@ pub fn build(b: *std.Build) void {
     db_link.addToOptions(build_options, features);
     const build_options_mod = build_options.createModule();
 
+    // zent v0.76.0 lets a consumer say which drivers it links, and skips the
+    // `translate-c` pass for the rest. This demo imports `zent.sql_postgres`
+    // (src/db.zig) and `zent.sql_sqlite`, so both stay on; only MySQL is off —
+    // the example's `db_link` never links libmysqlclient.
+    //
+    // Measured in the sibling zent-modulith demo (macOS aarch64, cold caches):
+    // the skipped translations are parallel ~23 s / 30 MiB steps, so unless they
+    // dominate the host (upstream measures ~26 s / ~590 MB per driver) the
+    // end-to-end wall time and peak are unchanged (763 MiB / 80 s vs 723 MiB /
+    // 82 s there). Kept for the intent it states, not for a measured win here.
     const zent_dep = b.dependency("zent", .{
         .target = target,
         .optimize = optimize,
+        .mysql = false,
     });
     const zent_mod = zent_dep.module("zent");
     // src/db.zig references zent.sql_postgres; zent wires its pg_c binding

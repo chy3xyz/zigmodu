@@ -1,7 +1,7 @@
 # ZigModu × zent 最佳实践
 
 **zent**: [chy3xyz/zent](https://github.com/chy3xyz/zent) — Zig 版 [ent](https://entgo.io/)（schema-as-code ORM）  
-**版本口径**: zent **v0.74.2**（0.73 起 `CrudService.get` → **`getOwned`**、配套 `deinitRowWith(allocator, &e)`；0.73 起 `Sum`/`Avg` 空集报 `EmptyAggregate`；0.70 起 **SQLite 强制外键**（`PRAGMA foreign_keys = ON`）；0.70 起 PG 的 `23502/23503` 不再误报 `UniqueViolation`；0.69 起 `SaveError` 增 `InconsistentRowFields`/`MissingPrimaryKey`；0.72 起 `Restore` 受策略过滤与拦截器约束；0.74 起 EntQL 拒绝未知字段；0.54 起 `CrudService.create(entity, tenant_id)` 双参；0.57 起 MySQL 的 `String`/`Enum` 落 `VARCHAR(255)`；0.40 起一行式实体释放 `deinitRows`/`deinitRow`/`deinitEdgeRows`；0.38 起 `queryTargets*` fail-closed；0.39 起 `zent.scope` 让裸 SQL 也走同一套读契约，见 §14/§15）· 本仓库示例按 **v0.74.2** 验证；`create` 双参签名要求 **≥ v0.54.0**，`getOwned` 要求 **≥ v0.73.0**，其余条目见 §14 · ZigModu **v0.15.22+** · Zig **≥ 0.17**  
+**版本口径**: zent **v0.76.2**（**0.76 起可按驱动裁剪构建**：`b.dependency("zent", .{ .pg = false, .mysql = false })`，翻译期跳过对应 `translate-c`；**0.75 起** junction 表名与某个实体表名撞车时 `checkSchema` 报 **`junction_name_collision`** 并归为 read-breaking，`migrateSchema` 计划建表时 `warn` —— 只有一方能存在，改名是调用方的决定；0.76.1 修三处 OOM 路径泄漏（`Builder.initCapacity`/`takeQuery`/`Selector.init`）；0.73 起 `CrudService.get` → **`getOwned`**、配套 `deinitRowWith(allocator, &e)`；0.73 起 `Sum`/`Avg` 空集报 `EmptyAggregate`；0.70 起 **SQLite 强制外键**（`PRAGMA foreign_keys = ON`）；0.70 起 PG 的 `23502/23503` 不再误报 `UniqueViolation`；0.69 起 `SaveError` 增 `InconsistentRowFields`/`MissingPrimaryKey`；0.72 起 `Restore` 受策略过滤与拦截器约束；0.74 起 EntQL 拒绝未知字段；0.54 起 `CrudService.create(entity, tenant_id)` 双参；0.57 起 MySQL 的 `String`/`Enum` 落 `VARCHAR(255)`；0.40 起一行式实体释放 `deinitRows`/`deinitRow`/`deinitEdgeRows`；0.38 起 `queryTargets*` fail-closed；0.39 起 `zent.scope` 让裸 SQL 也走同一套读契约，见 §14/§15）· 本仓库示例按 **v0.76.2** 验证；`create` 双参签名要求 **≥ v0.54.0**，`getOwned` 要求 **≥ v0.73.0**，按驱动裁剪要求 **≥ v0.76.0**，其余条目见 §14 · ZigModu **v0.15.22+** · Zig **≥ 0.17**  
 **主推组合**: **电商 / 社交类项目默认选 ZigModu + zent**（见 §2 决策表与 §4.8 场景能力矩阵）；只有存量 SQL 繁重、报表主导或 DBA 强管控的项目才默认 sqlx。这是**新项目选型建议**，与框架自带的默认实现不是一件事——口径见 §1「与框架自带那条的关系」。
 
 **参考实现**: [`examples/zent-modulith/`](../examples/zent-modulith/)  
@@ -539,7 +539,7 @@ pub const CatalogStore = struct {
 
 ## 11. 依赖接入
 
-zent **v0.74.2** 提供 `build.zig.zon`（模块名 `zent`；生产 pin git tag，本地开发可换 path 依赖）。
+zent **v0.76.2** 提供 `build.zig.zon`（模块名 `zent`；生产 pin git tag，本地开发可换 path 依赖）。
 
 **本地 sibling（开发）：**
 
@@ -558,10 +558,29 @@ exe_mod.addImport("zent", zent_dep.module("zent"));
 
 ```zon
 .zent = .{
-    .url = "https://github.com/chy3xyz/zent/archive/refs/tags/v0.74.2.tar.gz",
+    .url = "https://github.com/chy3xyz/zent/archive/refs/tags/v0.76.2.tar.gz",
     .hash = "<zig fetch 后填入>",
 },
 ```
+
+**按驱动裁剪（≥ v0.76.0，可选）：** 消费方声明自己链哪些驱动，zent 就跳过其余的
+`translate-c` 期：
+
+```zig
+const zent_dep = b.dependency("zent", .{
+    .target = target,
+    .optimize = optimize,
+    .pg = false,     // 不 import zent.sql_postgres 时关掉
+    .mysql = false,  // 不 import zent.sql_mysql 时关掉
+});
+```
+
+关掉一个**确实 import 了**的驱动会在首次使用时编译失败（`no module named 'pg_c'`），
+不会静默降级。本仓库两个示例都用了它（`examples/zent-modulith` 关 pg+mysql，
+`examples/metaverse-creative` 只用 sqlite+pg 所以只关 mysql），但**实测在本机不改变
+端到端开销**（763 MiB / 80 s vs 默认 723 MiB / 82 s）：被省掉的两条 translate-c 是与
+SQLite 那条（~597 MiB）**并行**的 ~23 s / 30 MiB 步骤，只有它们在某些主机上成为主项时
+才有明显收益（上游给的数是每驱动 ~26 s / ~590 MB）。
 
 期望目录（path 依赖）：
 
@@ -604,7 +623,7 @@ zig_ws/
 
 ---
 
-## 14. 升级注意（zent 0.6 → 0.12 → 0.13 → … → 0.67 → 0.74）
+## 14. 升级注意（zent 0.6 → 0.12 → 0.13 → … → 0.74 → 0.76）
 
 > **升级自查（先跑命令，再读条目）**：
 > ```bash
@@ -616,6 +635,9 @@ zig_ws/
 
 | 主题 | 动作 / 新特性 |
 |------|--------------|
+| **v0.76.0 按驱动裁剪 translate-c（消费者构建开销）** | `b.dependency("zent", .{ …, .pg = false, .mysql = false })`：zent 只为声明的驱动做 `translate-c`。默认仍是"有头文件就译"，所以不传=旧行为；**关掉一个确实 import 的驱动会在首次使用时编译失败**（`no module named 'pg_c'`/`sqlite3_c`/`mysql_c`），是刻意 fail-loud 而不是静默降级。本仓库两个示例都用上了（`zent-modulith` 关 pg+mysql，`metaverse-creative` 只用 sqlite+pg 故只关 mysql）；**本机实测端到端不变**（763 MiB / 80 s vs 默认 723 MiB / 82 s）——省下的两条 translate-c 与 SQLite 那条（~597 MiB）并行，各 ~23 s / 30 MiB，只有它们在某些主机上成为主项时才明显（上游：每驱动 ~26 s / ~590 MB）。 |
+| **v0.75.0 junction 表名撞车报 `junction_name_collision`（BREAKING，schema 检查）** | `junctionTableForEdge` 推导的 `<a>_<b>` 可能正好是某个实体声明的表名，而两者都 `CREATE TABLE IF NOT EXISTS`、实体先建 —— 于是联结表的 `CREATE` 成了 no-op，该边的每次遍历都在**另一张表**上选列。以前 `checkSchema` 报的是症状（`missing_column` 之类）；现在报这个具名错误并归 **read-breaking**，`assertSchema(…, .read_breaking_only)` 会因此拦下一次发布。`migrateSchema` 在建联结表时（含 dry-run）只 `warn`：只有一个名字能存在，改哪个由调用方决定。本仓库示例不涉及撞名。 |
+| **v0.76.1 三处 OOM 路径泄漏** | `Builder.initCapacity` / `Builder.takeQuery` / `Selector.init`：同一种形状——同一个表达式里前面的 `try` 已经交出所有权、后面的 `try` 才失败，于是 OOM 时泄漏。非 OOM 路径完全看不出来，是 `std.testing.checkAllAllocationFailures` 扫出来的。消费方无动作，升级即得。 |
 | **v0.73.0 `CrudService.get` → `getOwned`（BREAKING，命名）** | 它返回的是复制进**调用方 allocator** 的行，而 `client.<entity>.deinitRow(&e)` 用 **client 的 allocator** 释放——两边是同一个 `Entity` 类型，除了调用点没人说得出哪个 allocator 才对，配错就是跨分配器 free（请求 arena 被写坏，或 `free of invalid memory` 打死进程）。改名把所有权写在了调用点上，配套 `client.<entity>.deinitRowWith(allocator, &e)` 是这类行的释放。本仓库 `zent_crud.get` 已改 `getOwned`（那段"这里为什么故意不 deinitRow"的注释保留，理由没变）。这也是 `zmodu audit` b23 拦的那一类，上游把它变成显式的了。 |
 | **v0.74.0 EntQL 拒绝实体上不存在的字段** | 解析器不认识 schema：typo 以前原样下发（服务端才报错，且各方言不同）；更糟的是 `has(...)` 里的联结列会绑到联结表，把过滤退化成对外层行的条件，**无声地给出答案**。现在在 lowering 之前按解析树检查，API 名与物理列名两种拼法都接受；答案是 `error.UnknownField`。 |
 | **v0.73.0 `Sum`/`Avg` 空集报 `EmptyAggregate`（BREAKING，错误集）** | 以前空集报 `error.TypeMismatch` —— 与"值不是数字"同一个错误，"没有数据"被报成类型问题，两者分不开。成员只加在 `Sum`/`Avg` 的专属错误集上（`QueryError \|\| error{EmptyAggregate}`），共享读取器（`All`/`First`/`Count` …）不被加宽；`SumOrZero`、`Max`/`Min` 不变。穷尽 `switch` 会被打到。 |

@@ -2,6 +2,39 @@
 
 ## [Unreleased]
 
+### zent 升到 v0.76.2：两个示例改 pin，并采用 0.76.0 的按驱动裁剪（**破坏性：否**）
+
+`examples/zent-modulith` 与 `examples/metaverse-creative` 的 pin 从 v0.74.2 升到 **v0.76.2**
+（commit `71a1a80a`），delta 里值得知道的四条：
+
+- **v0.75.0 `junction_name_collision`（read-breaking）**：`junctionTableForEdge` 推导的
+  `<a>_<b>` 若正好是某个实体声明的表名，两边都 `CREATE TABLE IF NOT EXISTS`、实体先建 ——
+  联结表的 `CREATE` 成了 no-op，该边每次遍历都在**另一张表**上选列。以前 `checkSchema`
+  报的是症状，现在报这个具名错误并归 read-breaking（`assertSchema(…, .read_breaking_only)`
+  会拦住发布）；`migrateSchema` 只 `warn`，改名是调用方的决定。本仓库示例不涉及撞名。
+- **v0.76.0 按驱动裁剪（已采纳）**：`b.dependency("zent", .{ …, .pg = false, .mysql = false })`
+  让 zent 跳过未声明的驱动的 `translate-c`。`zent-modulith` 是纯 SQLite 所以关 pg+mysql；
+  `metaverse-creative` 的 `src/db.zig` import 了 `zent.sql_postgres`，只关 mysql。关掉一个
+  确实 import 的驱动会在首次使用时编译失败（`no module named 'pg_c'`）——fail-loud，不静默降级。
+- **v0.76.1 三处 OOM 路径泄漏**（`Builder.initCapacity`/`takeQuery`/`Selector.init`）：
+  同一种"前面的 `try` 已交出所有权、后面的 `try` 才失败"的形状，只在 OOM 时可见；消费方升级即得。
+- v0.76.2 只修上游自己的 dead-code 门禁。
+
+**验证（离线，用解开的 0.76.2 做 path 依赖）**：两个示例都构建通过；
+`zent-modulith` 的 `zig build test`（该步含 43 项 smoke）**43/43 通过、干净退出无泄漏**；
+`metaverse-creative` 的 `zig build demo` 端到端通过（`balanced=true outbox=1 …`）。
+
+**没验到的两件事（如实）**：① 本机到 github.com 的 git/HTTPS 直连不通（`gh api` 那条约
+通），所以**新 pin 的实际 fetch 没有跑过**——hash 是用 API 取到的同源 tarball 算的，而
+这个方法先用 v0.74.2 校准过（复算值与仓库已 pin 的 hash **逐字节相同**）；② 按驱动裁剪的
+收益在本机**测不出来**：关掉两条 translate-c 是 763 MiB / 80 s，默认是 723 MiB / 82 s ——
+省下的两条与 SQLite 那条（~597 MiB）**并行**，各 ~23 s / 30 MiB，只有它们在某些主机上成为
+主项时才明显（上游给的数是每驱动 ~26 s / ~590 MB）。示例里保留了这两个选项，因为它表述的是
+"这个示例链哪些驱动"这一事实，而不是因为在本机量到了收益；注释与 `docs/ZENT.md` 都按实测写的。
+
+
+## [Unreleased]
+
 ### HTTP 服务端加固：长响应头曾静默丢整个响应、body 阶段零超时、读错误被吞（**破坏性：否**，行为修复 + 两个新配置/错误值）
 
 四件事，前两件可被远程触发：

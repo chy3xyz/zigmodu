@@ -11,9 +11,23 @@ pub fn build(b: *std.Build) void {
     db_link.addToOptions(build_options, features);
     const build_options_mod = build_options.createModule();
 
+    // zent v0.76.0 lets a consumer say which drivers it links, so zent skips the
+    // `translate-c` pass for the others. These demos are SQLite-only (see
+    // `features` above) and `db_link` links no libpq/libmysqlclient, so
+    // PostgreSQL and MySQL bindings are turned off; turning one back on that we
+    // *do* import fails loudly at first use ("no module named 'pg_c'").
+    //
+    // Measured here (macOS aarch64, cold caches): no end-to-end change — 763 MiB
+    // / 80 s with the options off vs 723 MiB / 82 s with defaults. The saving is
+    // two skipped translate-c steps (23 s CPU / 30 MiB each, run in parallel with
+    // the ~597 MiB SQLite one), so it does not move wall time or the peak unless
+    // those driver translations dominate on the host — upstream measures ~26 s
+    // and ~590 MB *per driver* on theirs.
     const zent_dep = b.dependency("zent", .{
         .target = target,
         .optimize = optimize,
+        .pg = false,
+        .mysql = false,
     });
     const zent_mod = zent_dep.module("zent");
 

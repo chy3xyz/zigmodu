@@ -4,12 +4,12 @@
     .fingerprint = 0xe59c3d8c04d4c4f,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        // Pinned to the released zent v0.74.2 (git tag). For local development
+        // Pinned to the released zent v0.76.2 (git tag). For local development
         // against a sibling checkout, replace with:
         //   .zent = .{ .path = "../../../zent" }.
         .zent = .{
-            .url = "git+https://github.com/chy3xyz/zent?ref=v0.74.2#22dbeaad0585584203e3788d770aa33bfa2cc94e",
-            .hash = "zent-0.74.2-oiur-wkNIQB5RLZ6Pf3GXMLJkd6ay5AHHbI7dWJTPTfW",
+            .url = "git+https://github.com/chy3xyz/zent?ref=v0.76.2#71a1a80a9a8aad6cfeb80c30727f2bb2986717ae",
+            .hash = "zent-0.76.2-oiur-9ZrIQA4qgdsajg44yzKc9lAczI6-gHJii-fFJOh",
         },
     },
     .paths = .{
