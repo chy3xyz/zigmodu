@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.33.1] - 2026-09-23
 
 ### 新增审计规则 b24（弱熵源）+ 修掉它抓出的 `DistributedLock` 缺陷（**破坏性：否**）
 
