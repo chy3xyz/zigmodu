@@ -3,7 +3,8 @@
 ZigModu 默认链接 **sqlite + postgres + mysql**（`-Ddb=all`），保证旧项目与框架自测兼容。小系统 / 单驱动部署应收窄链接，减少系统库依赖与部署面。`-Ddb=none` 全不链驱动（sqlx 走 stub，`DriverNotEnabled` 守卫运行时生效）——用于无 DB 的二进制（如 Windows 交叉编译 agent）或纯测试桩。
 
 **实现**：`examples/_shared/db_link.zig` · `build_options.enable_*` · `src/sqlx/*_c_stub.zig` · `sqlx.DriverFeatures`  
-**相关**：[`data.sqlx`](../src/data.zig) · [PRODUCTION_ROADMAP.md](PRODUCTION_ROADMAP.md)（sqlx 维护边界）· [ZENT.md](ZENT.md)（正交 ORM，仍可能链 libsqlite3）
+**相关**：[`data.sqlx`](../src/data.zig) · [PRODUCTION_ROADMAP.md](PRODUCTION_ROADMAP.md)（sqlx 维护边界）· [ZENT.md](ZENT.md)（正交 ORM，仍可能链 libsqlite3）  
+**跨平台编译**：见 §12（`-Ddb=none` 是默认唯一可行档；带驱动需要目标平台的库 + `SQLITE_*` / `PQ_*` / `MYSQL_*` 覆盖，附实测内存表）
 
 ---
 
@@ -190,3 +191,100 @@ zent 使用自己的 SQLite / 驱动栈，与 `data.sqlx` **正交**（见 [ZENT
 - **通用教训**：Threaded Io 的 fiber 内**任何**同步阻塞（`posix.poll/read`、
   `mutex.lock`、同步 libpq）都可能阻塞 worker——应用层默认禁止（见
   `docs/BEST_PRACTICES.md`「Threaded Io 下的同步阻塞」）。  
+
+---
+
+## 12. 跨平台编译（cross-compile）
+
+**一句话**：跨编译**默认只能用 `-Ddb=none`**；带驱动要自己提供**目标平台**的库并覆盖搜索路径，
+否则报 `unable to find dynamic system library 'sqlite3' using strategy 'paths_first'`。
+
+### 12.1 为什么默认不行
+
+`examples/_shared/db_link.zig` 的 `detectPqPaths` / `detectMysqlPaths` 是**主机**启发式
+（macOS 探 Homebrew、Linux 探 `/usr/include/{postgresql,mariadb}`），`link()` 又无条件
+`linkSystemLibrary` —— 于是交叉编译时 Zig 去**目标**的默认路径找 `libpq` / `libmysqlclient` /
+`libsqlite3`，那里什么都没有。CI 的 `windows-cross` job 就是照这个约束写的：
+`zig build -Ddb=none -Dtarget=x86_64-windows`。
+
+两条常被忽略的相邻事实：
+
+- **跨目标跑不了测试**：`the host system (...) is unable to run foreign binaries`。
+  所以跨编译不要走 `test` / `soak` / `runtime-stress` —— 那是内存最贵的一条路（见 12.4）。
+- **没被用到的依赖会被链接器丢掉**：`zig build -Dtarget=… -Ddb=sqlite` 对
+  `examples/basic` 会**成功**，但产物 `ldd` 里没有 `libsqlite3`（程序不引用 sqlx 符号，
+  `--as-needed` 语义把它丢了）。要验证依赖真的进去了，得用**真的用库**的示例（如
+  `tenant-mgmt`），或在目标机上 `ldd` 确认。
+
+### 12.2 环境变量覆盖（目标平台库）
+
+| 驱动 | 变量 | 说明 |
+|---|---|---|
+| postgres | `PQ_INCLUDE` / `PQ_LIB` | 已有；指向**目标**的 include / lib 目录 |
+| mysql | `MYSQL_INCLUDE` / `MYSQL_LIB` | 已有；同上 |
+| sqlite | `SQLITE_INCLUDE` / `SQLITE_LIB` | **新增**；至少给 `SQLITE_LIB`（sqlx 用 `extern` 绑定，头文件通常不需要） |
+
+只给 lib 目录即可；给 include 会同时加 `addSystemIncludePath`。
+
+### 12.3 实测可用的配方（本机 aarch64-macOS，容器里的 aarch64 Debian 库）
+
+```bash
+# 1) 从目标平台（或容器/sysroot）取出真库
+docker run --rm -v /tmp/sqlite-linux:/out debian:bookworm-slim \
+  sh -c 'cp -L /usr/lib/$(uname -m)-linux-gnu/libsqlite3.so.0* /out/'
+
+# 2) (a) musl 目标：Zig 对 aarch64-linux 的默认 libc 就是 musl，直接可用
+SQLITE_LIB=/tmp/sqlite-linux zig build -Dtarget=aarch64-linux -Ddb=sqlite
+
+# 2) (b) glibc 目标：必须写 glibc 版本，且与库的符号版本匹配
+SQLITE_LIB=/tmp/sqlite-linux zig build -Dtarget=aarch64-linux-gnu.2.34 -Ddb=sqlite
+
+# 3) 验证（真用库的示例 + 目标机 ldd）
+cd examples/tenant-mgmt && SQLITE_LIB=/tmp/sqlite-linux zig build \
+  -Ddb=sqlite -Dtarget=aarch64-linux-gnu.2.34 -p /tmp/out
+docker run --rm -v /tmp/out:/x <同样的目标镜像> ldd /x/bin/tenant-mgmt | grep sqlite
+# → libsqlite3.so.0 => /lib/aarch64-linux-gnu/libsqlite3.so.0
+```
+
+**踩过的坑**：只写 `-Dtarget=aarch64-linux-gnu`（不带版本）而库是 Debian bookworm 的，
+会得到一屏 `undefined reference: pthread_join@GLIBC_2.34`、`stat64@GLIBC_2.33` ——
+Zig 用的 glibc stub 版本比库旧。补上 `.2.34` 即通。**库与目标 ABI 要同源**：musl 目标配
+glibc 编的 `.so` 能链上（Zig 不校验库自身的依赖），但目标机上仍然缺 glibc，属于错误组合。
+
+### 12.4 内存：实测对照与降内存配方
+
+同一份源码、同一目标（`aarch64-macOS → x86_64-linux`）、每个配置独立冷缓存，
+`--summary all` 的 MaxRSS 峰值（目标取 `benchmark-build`，只编译不运行）：
+
+| 配置 | 峰值 | 耗时 |
+|---|---|---|
+| Debug | 266 MiB | 6s |
+| Debug（热缓存，第二次） | **31 MiB** | ~0s |
+| Debug `-fincremental` 冷 / 热 | 283 / 273 MiB | 8 / 4s |
+| **ReleaseSmall** | **419 MiB** | 19s |
+| **ReleaseSafe** | **858 MiB** | 50s |
+| **ReleaseFast** | 862–892 MiB | 59–98s |
+| 只编产物（默认 `install`，惰性分析） | 207 MiB | 17s |
+| 原生 Debug（同目标作对照） | 266–602 MiB | 6–13s |
+| 原生 `test` 全量编译（CI/发布日志） | **~1 GiB** | ~21s |
+
+结论（按收益排序）：
+
+1. **决定内存的是 `-Doptimize=`，不是"跨"**：ReleaseSafe/Fast 的 LLVM 优化把峰值抬到
+   Debug 的 ~3 倍（0.86 GB vs 0.27 GB）。跨编译只要产物、不需要 fast/safe 语义时用
+   **`-Doptimize=ReleaseSmall`**（0.42 GB）或 Debug。
+2. **别走 `test`**：全量分析（`refAllDecls`）的测试二进制是唯一上 1 GB 的路径，而跨目标
+   本来就跑不了测试。CI 的 cross job 只编库不是偷懒，是唯一合理的做法。
+3. **缓存是最大杠杆**：热缓存 31 MiB / ~0s。`--cache-dir` / `ZIG_LOCAL_CACHE_DIR` 放本地
+   SSD；CI 上缓存命中与否直接决定内存与时间。
+4. **内存受限机器/runner**：`zig build … -j2 --maxrss 1G --skip-oom-steps`。
+   `--maxrss` 让 build runner 按内存预算节流并发，`--skip-oom-steps` 是"超预算跳过"
+   而不是被 OOM kill。注意 **`-j1` 对峰值没有稳定收益**（实测 207→240、346→581，方向
+   甚至相反）——它压的是总量与可预测性，不是单 job 峰值。
+5. **`-fincremental` 是拿内存换重编速度**：冷启动无收益（283 vs 266），热起来后峰值反而
+   高于普通热缓存（273 vs 31）。频繁重编时开，省内存时不开。
+6. **系统层**：容器 `--memory` + swap、`ulimit -v`；真要跑全量测试编译（1 GB 级）就选
+   ≥4 GB 的 runner。
+
+> 数字来源：本机 aarch64-macOS + Zig 0.17.0-dev.2151，样本有限（Debug/原生组有波动，
+> 原生 Debug 一次测到 602 MiB），**按数量级使用**，不要当精确基线。

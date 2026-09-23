@@ -147,6 +147,23 @@ fn detectMysqlPaths(b: *std.Build) CLibPaths {
     return .{};
 }
 
+/// sqlite3 lives on the default search paths of macOS/Linux hosts, so there is
+/// nothing to detect there — the override below exists for **cross-compiling**:
+/// point `SQLITE_LIB` (and optionally `SQLITE_INCLUDE`) at a directory holding
+/// the *target* ABI's `libsqlite3.{so,a}` (typically inside a sysroot). Without
+/// it a cross build fails with
+/// `unable to find dynamic system library 'sqlite3' using strategy 'paths_first'`,
+/// because Zig searches the target's default paths, not the host's Homebrew ones.
+fn detectSqlitePaths(b: *std.Build) CLibPaths {
+    if (b.graph.environ_map.get("SQLITE_INCLUDE")) |inc| {
+        return .{ .include = b.dupe(inc), .lib = b.graph.environ_map.get("SQLITE_LIB") };
+    }
+    if (b.graph.environ_map.get("SQLITE_LIB")) |lib| {
+        return .{ .lib = b.dupe(lib) };
+    }
+    return .{};
+}
+
 /// Link only the drivers enabled in `features`.
 pub fn link(mod: *std.Build.Module, b: *std.Build, features: Features) void {
     if (features.postgres) {
@@ -172,6 +189,13 @@ pub fn link(mod: *std.Build.Module, b: *std.Build, features: Features) void {
     }
 
     if (features.sqlite) {
+        const sq = detectSqlitePaths(b);
+        if (sq.include) |inc| {
+            mod.addSystemIncludePath(.{ .cwd_relative = inc });
+        }
+        if (sq.lib) |lib| {
+            mod.addLibraryPath(.{ .cwd_relative = lib });
+        }
         mod.linkSystemLibrary("sqlite3", .{});
     }
 }
@@ -204,6 +228,13 @@ pub fn linkDetected(mod: *std.Build.Module, b: *std.Build, features: Features) v
     }
 
     if (features.sqlite) {
+        const sq = detectSqlitePaths(b);
+        if (sq.include) |inc| {
+            mod.addSystemIncludePath(.{ .cwd_relative = inc });
+        }
+        if (sq.lib) |lib| {
+            mod.addLibraryPath(.{ .cwd_relative = lib });
+        }
         mod.linkSystemLibrary("sqlite3", .{});
     }
 }

@@ -1,5 +1,35 @@
 # Changelog
 
+## [Unreleased]
+
+### 跨编译可带 sqlite：`SQLITE_INCLUDE` / `SQLITE_LIB` 覆盖 + 跨编译口径落文档（**破坏性：否**）
+
+`examples/_shared/db_link.zig` 原先只给 postgres/mysql 留了环境变量覆盖，sqlite 是裸
+`linkSystemLibrary("sqlite3")`——于是跨编译任何带驱动的目标都直接
+`unable to find dynamic system library 'sqlite3' using strategy 'paths_first'`
+（探测逻辑是主机的，Zig 不会去目标 sysroot 找；CI 的 windows-cross job 因此只能
+`-Ddb=none`）。新增 `detectSqlitePaths`，与 pq/mysql 对称：`SQLITE_LIB`（必需）+
+可选 `SQLITE_INCLUDE`。
+
+**端到端验证**（不是只读代码）：从容器里的 aarch64 Debian 取出真
+`libsqlite3.so.0.8.6` → `SQLITE_LIB=… zig build -Dtarget=aarch64-linux -Ddb=sqlite`（musl，
+Zig 对 aarch64-linux 的默认 libc）与 `-Dtarget=aarch64-linux-gnu.2.34`（glibc）双双成功；
+再用真用库的 `examples/tenant-mgmt` 交叉编译，在目标容器里 `ldd` 确认
+`libsqlite3.so.0 => /lib/aarch64-linux-gnu/libsqlite3.so.0`。证伪侧：`SQLITE_LIB` 指向
+空目录时错误信息里的 searched paths 正是 `<dir>/libsqlite3.so` / `.a`（证明变量确实进入
+搜索，不成功是因为那里没有库）。
+
+**顺带记录两个坑**（写进 `docs/SQLX_DRIVERS.md` §12）：① glibc 目标不写版本会得到
+一屏 `undefined reference: …@GLIBC_2.34`（Zig 的 stub 比库旧），补 `.2.34` 即通；
+② 没被程序引用的依赖会被链接器丢掉——对 `examples/basic` 用 `-Ddb=sqlite` 交叉编译会
+"成功"但 `ldd` 里没有 sqlite，验证要用真用库的示例。
+
+**§12 同时落了跨编译内存口径**（本机实测、每档独立冷缓存）：Debug 266 MiB / 热缓存
+31 MiB / ReleaseSmall 419 MiB / ReleaseSafe 858 MiB / ReleaseFast 862–892 MiB，而原生
+全量 `test` 编译约 1 GiB。结论是**决定内存的是 `-Doptimize=` 而不是"跨"**，跨编译不要走
+`test`（跨目标也跑不了），受限机器用 `-j2 --maxrss 1G --skip-oom-steps`；`-fincremental`
+是拿内存换重编速度，不省内存。
+
 ## [0.33.1] - 2026-09-23
 
 ### 新增审计规则 b24（弱熵源）+ 修掉它抓出的 `DistributedLock` 缺陷（**破坏性：否**）

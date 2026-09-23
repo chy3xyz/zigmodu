@@ -155,6 +155,8 @@ const zigmodu_dep = b.dependency("zigmodu", .{
 
 框架自测必须用默认 `-Ddb=all`（`zig build test`）。窄化 `-Ddb=` 只适合应用/示例构建。
 
+**跨平台编译**：默认只有 `-Ddb=none` 可行（三条驱动都链不上——探测逻辑是主机的，Zig 不会去目标 sysroot 找）；带驱动要给**目标平台**的库 + `SQLITE_LIB` / `PQ_*` / `MYSQL_*` 覆盖，glibc 目标还须写 glibc 版本（`-Dtarget=aarch64-linux-gnu.2.34`，否则 `@GLIBC_2.34` 一屏未定义符号）。跨目标**跑不了测试**，且内存大头是优化等级不是"跨"：ReleaseSafe/Fast ~0.86 GB vs Debug ~0.27 GB，只编产物用 `-Doptimize=ReleaseSmall`（~0.42 GB）或 Debug，配 `-j2 --maxrss 1G --skip-oom-steps`。实测数字与配方 → **[`docs/SQLX_DRIVERS.md`](docs/SQLX_DRIVERS.md) §12**。
+
 权威细则（取值表、stub、`DriverNotEnabled`、scaffold、symlink/Windows、体积预期）→ **[`docs/SQLX_DRIVERS.md`](docs/SQLX_DRIVERS.md)**。
 
 权威细则与接线样例 → `docs/BEST_PRACTICES.md`「JWT / 多端身份」· `docs/ROUTE_TABLE.md` §7。
