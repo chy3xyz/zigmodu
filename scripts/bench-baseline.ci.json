@@ -2,150 +2,213 @@
   {
     "name": "scanModules x100K",
     "unit": "ms",
-    "value": 11.1
+    "value": 11.1,
+    "max_alloc_per_op": 5.0
   },
   {
     "name": "scanModules x1M",
     "unit": "ms",
-    "value": 111.11
+    "value": 111.11,
+    "max_alloc_per_op": 5.0
   },
   {
     "name": "validateModules x10K",
     "unit": "ms",
-    "value": 10.56
+    "value": 10.56,
+    "max_alloc_per_op": 3.75
   },
   {
     "name": "validateModules x100K",
     "unit": "ms",
-    "value": 109.26
+    "value": 109.26,
+    "max_alloc_per_op": 3.75
   },
   {
     "name": "App lifecycle x3K",
     "unit": "ms",
-    "value": 13.97
+    "value": 13.97,
+    "max_alloc_per_op": 8.75
   },
   {
     "name": "workflow 20-step x5K",
     "unit": "ms",
-    "value": 24.28
+    "value": 24.28,
+    "max_alloc_per_op": 133.75
   },
   {
     "name": "1L x10M events",
     "unit": "ratio",
     "value": 0.8285,
     "normalized_by": "atomic RMW x10M",
-    "note": "recorded from run 35423924976 (region=eastus, AMD EPYC 7763, Linux 6.17.0-1022-azure)"
+    "note": "recorded from run 35423924976 (region=eastus, AMD EPYC 7763, Linux 6.17.0-1022-azure)",
+    "max_alloc_per_op": 0.0
   },
   {
     "name": "10L x1M events",
     "unit": "ms",
-    "value": 13.9
+    "value": 13.9,
+    "max_alloc_per_op": 0.0
   },
   {
     "name": "100L x100K events",
     "unit": "ms",
-    "value": 13.74
+    "value": 13.74,
+    "max_alloc_per_op": 0.0
   },
   {
     "name": "CircuitBreaker x10M",
     "unit": "ms",
-    "value": 10.91
+    "value": 10.91,
+    "max_alloc_per_op": 0.0
   },
   {
     "name": "CircuitBreaker x100M",
     "unit": "ms",
-    "value": 109.08
+    "value": 109.08,
+    "max_alloc_per_op": 0.0
   },
   {
     "name": "RateLimiter x1M",
     "unit": "ms",
-    "value": 60.27
+    "value": 60.27,
+    "max_alloc_per_op": 0.0
   },
   {
     "name": "RateLimiter x10M",
     "unit": "ms",
-    "value": 362.38
+    "value": 362.38,
+    "max_alloc_per_op": 0.0
   },
   {
     "name": "10 checks x100K",
     "unit": "ms",
-    "value": 17.31
+    "value": 17.31,
+    "max_alloc_per_op": 2.5
   },
   {
     "name": "100 checks x10K",
     "unit": "ms",
-    "value": 19.89
+    "value": 19.89,
+    "max_alloc_per_op": 6.25
   },
   {
     "name": "findById x20K",
     "unit": "ms",
-    "value": 19.28
+    "value": 19.28,
+    "max_alloc_per_op": 5.0
   },
   {
     "name": "findById x10K",
     "unit": "ms",
-    "value": 9.72
+    "value": 9.72,
+    "max_alloc_per_op": 5.0
   },
   {
     "name": "atomic RMW x10M",
     "unit": "ms",
     "value": 23.561,
-    "note": "recorded from run 35423924976 (region=eastus, AMD EPYC 7763, Linux 6.17.0-1022-azure)"
+    "note": "recorded from run 35423924976 (region=eastus, AMD EPYC 7763, Linux 6.17.0-1022-azure)",
+    "max_alloc_per_op": 0.0
   },
   {
     "name": "RingBuffer SPSC x1M",
     "unit": "ratio",
     "value": 0.0524,
     "normalized_by": "atomic RMW x10M",
-    "note": "median of three measured metric/reference pairs from CI logs: 1.24/23.68 (run 35426335882), 1.24/23.56 (35423924976), 1.09/20.67 (35424522314) \u2014 see scripts/check-bench.sh header; the 1.09 ms absolute entry it replaces was a host-class artifact (2.34 ms on the one Xeon 8370C run, identical loop)"
+    "note": "median of three measured metric/reference pairs from CI logs: 1.24/23.68 (run 35426335882), 1.24/23.56 (35423924976), 1.09/20.67 (35424522314) \u2014 see scripts/check-bench.sh header; the 1.09 ms absolute entry it replaces was a host-class artifact (2.34 ms on the one Xeon 8370C run, identical loop)",
+    "max_alloc_per_op": 0.0
   },
   {
     "name": "Mailbox post+drain x1M",
     "unit": "ratio",
     "value": 0.7411,
     "normalized_by": "atomic RMW x10M",
-    "note": "recorded from run 35423924976 (region=eastus, AMD EPYC 7763, Linux 6.17.0-1022-azure)"
+    "note": "recorded from run 35423924976 (region=eastus, AMD EPYC 7763, Linux 6.17.0-1022-azure)",
+    "max_alloc_per_op": 0.0
   },
   {
     "name": "Mailbox full-path x10M",
     "unit": "ratio",
     "value": 2.0976,
     "normalized_by": "atomic RMW x10M",
-    "note": "recorded from run 35423924976 (region=eastus, AMD EPYC 7763, Linux 6.17.0-1022-azure)"
+    "note": "recorded from run 35423924976 (region=eastus, AMD EPYC 7763, Linux 6.17.0-1022-azure)",
+    "max_alloc_per_op": 0.0
   },
   {
     "name": "TimerWheel x100K",
     "unit": "ms",
-    "value": 6.87
+    "value": 6.87,
+    "max_alloc_per_op": 1.25
   },
   {
     "name": "TimerWheel churn x1M",
     "unit": "ms",
     "value": 43.35,
-    "note": "recorded from run for 2fe8454 (region=westus, AMD EPYC 7763) \u2014 the gate's own run; it WARNed as 'not in the baseline' before this"
+    "note": "recorded from run for 2fe8454 (region=westus, AMD EPYC 7763) \u2014 the gate's own run; it WARNed as 'not in the baseline' before this",
+    "max_alloc_per_op": 1.25
   },
   {
     "name": "HotBus 8sub x1M",
     "unit": "ratio",
     "value": 0.9359,
     "normalized_by": "atomic RMW x10M",
-    "note": "recorded from run 35423924976 (region=eastus, AMD EPYC 7763, Linux 6.17.0-1022-azure)"
+    "note": "recorded from run 35423924976 (region=eastus, AMD EPYC 7763, Linux 6.17.0-1022-azure)",
+    "max_alloc_per_op": 0.0
   },
   {
     "name": "ObjectPool x1M",
     "unit": "ms",
-    "value": 12.27
+    "value": 12.27,
+    "max_alloc_per_op": 0.0
   },
   {
     "name": "Sequencer x10M",
     "unit": "ratio",
     "value": 1.0085,
     "normalized_by": "atomic RMW x10M",
-    "note": "recorded from run 35423924976 (region=eastus, AMD EPYC 7763, Linux 6.17.0-1022-azure)"
+    "note": "recorded from run 35423924976 (region=eastus, AMD EPYC 7763, Linux 6.17.0-1022-azure)",
+    "max_alloc_per_op": 0.0
   },
   {
     "name": "Worker spawn+join x1K",
     "unit": "ms",
-    "value": 44.88
+    "value": 44.88,
+    "max_alloc_per_op": 1.5
+  },
+  {
+    "name": "StoreForward x10M",
+    "unit": "ms",
+    "value": 7.029796,
+    "note": "recorded from run 35948318220 (region=westcentralus cpu=AMD EPYC 9V74 80-Core Processor cores=4 load=1.21)",
+    "max_alloc_per_op": 0.0
+  },
+  {
+    "name": "MpscRing 4P x2M",
+    "unit": "ratio",
+    "value": 0.5202,
+    "normalized_by": "atomic RMW x10M",
+    "note": "recorded from run 35948318220 (region=westcentralus cpu=AMD EPYC 9V74 80-Core Processor cores=4 load=1.21)",
+    "max_alloc_per_op": 0.0
+  },
+  {
+    "name": "Timer after x100K",
+    "unit": "ms",
+    "value": 15.910764,
+    "note": "recorded from run 35948318220 (region=westcentralus cpu=AMD EPYC 9V74 80-Core Processor cores=4 load=1.21)",
+    "max_alloc_per_op": 2.5
+  },
+  {
+    "name": "Worker drain dedicated x1M",
+    "unit": "ms",
+    "value": 261.531537,
+    "note": "recorded from run 35948318220 (region=westcentralus cpu=AMD EPYC 9V74 80-Core Processor cores=4 load=1.21)",
+    "max_alloc_per_op": 0.0
+  },
+  {
+    "name": "Pooled dispatch x1M",
+    "unit": "ms",
+    "value": 273.197426,
+    "note": "recorded from run 35948318220 (region=westcentralus cpu=AMD EPYC 9V74 80-Core Processor cores=4 load=1.21)",
+    "max_alloc_per_op": 0.0
   }
 ]
