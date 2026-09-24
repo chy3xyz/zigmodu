@@ -500,6 +500,13 @@ pub const SagaOrchestrator = struct {
 // Tests
 // ─────────────────────────────────────────────────
 
+/// Unique per process: `zig build test` runs its six test binaries in parallel,
+/// and two of them sharing a fixed relative directory delete each other's
+/// segments mid-test (observed as `error.FileNotFound` from `createSegment`).
+fn testWalDir(comptime base: []const u8, buf: *[64]u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "{s}_{d}", .{ base, std.c.getpid() });
+}
+
 test "SagaOrchestrator register and execute success" {
     const allocator = std.testing.allocator;
     var orchestrator = SagaOrchestrator.init(allocator);
@@ -822,7 +829,8 @@ test "Saga persists step results to WAL" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const wal_config = @import("eventbus/WAL.zig").WALConfig{ .dir_path = "wal_test_saga", .max_segment_size = 1024 * 1024 };
+    var wal_dir_buf: [64]u8 = undefined;
+    const wal_config = @import("eventbus/WAL.zig").WALConfig{ .dir_path = try testWalDir("wal_test_saga", &wal_dir_buf), .max_segment_size = 1024 * 1024 };
     var wal = try WAL.init(allocator, std.testing.io, wal_config);
     defer wal.deinit();
 
@@ -867,7 +875,8 @@ test "resume: a crash-restored saga continues without re-running completed steps
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const wal_config = @import("eventbus/WAL.zig").WALConfig{ .dir_path = "wal_test_resume", .max_segment_size = 1024 * 1024 };
+    var wal_dir_buf: [64]u8 = undefined;
+    const wal_config = @import("eventbus/WAL.zig").WALConfig{ .dir_path = try testWalDir("wal_test_resume", &wal_dir_buf), .max_segment_size = 1024 * 1024 };
     var wal = try WAL.init(allocator, std.testing.io, wal_config);
     defer wal.deinit();
 
@@ -931,7 +940,8 @@ test "restoreFromWal keeps the *latest* state per instance (no stale resurrectio
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const wal_config = @import("eventbus/WAL.zig").WALConfig{ .dir_path = "wal_test_latest", .max_segment_size = 1024 * 1024 };
+    var wal_dir_buf: [64]u8 = undefined;
+    const wal_config = @import("eventbus/WAL.zig").WALConfig{ .dir_path = try testWalDir("wal_test_latest", &wal_dir_buf), .max_segment_size = 1024 * 1024 };
     var wal = try WAL.init(allocator, std.testing.io, wal_config);
     defer wal.deinit();
 

@@ -20,7 +20,7 @@
 //!   §5  Pluggable auth backends —— AuthBackend and authFromCatalog (catalog = sole bypass truth)
 //!   §6  Token extraction, JWT backend & tenant resolver —— extract*, jwtBackend*, tenantResolver
 //!   §7  Module gate & permission gate —— moduleGate, permissionMatches*, permissionGate*
-//!   §8  CSRF & security headers —— csrf, defaultSecurityHeaders, securityHeaders, defaultCsp
+//!   §8  CSRF & security headers —— csrf, csrfWith/CsrfConfig, csrfMintSignedToken, defaultSecurityHeaders, securityHeaders, defaultCsp
 //!   §9  Tests —— auth / CORS / CSRF / gate unit tests
 //!
 //! Every section carries a matching `// ==== §N ... ====` anchor — `grep "§4"` jumps there.
@@ -1095,43 +1095,118 @@ fn constantTimeEql(a: []const u8, b: []const u8) bool {
 /// (browsers always do for a cross-site POST), and rejecting them would be a
 /// wire-level break, not a security win.
 ///
-/// Deployment note: the comparison is against `Host` (and `X-Forwarded-Host`,
-/// see `csrfOriginAllowed`). A reverse proxy that rewrites `Host` to an
-/// upstream name must forward the client's host as `X-Forwarded-Host`, or
-/// state-changing browser requests are refused.
+/// The origin gate compares against `Host` only. `X-Forwarded-Host` /
+/// `X-Forwarded-Proto` are **not** consulted unless the application opts in via
+/// `csrfWith(.{ .trust_forwarded_host = true })` — they are client-supplied
+/// headers, so trusting them by default let any client that can set a header
+/// name its own origin on both sides of the comparison. A TLS-terminating
+/// reverse proxy must therefore either preserve the public `Host`, or be one
+/// that overwrites the forwarded headers and opt in explicitly.
 ///
-/// The token is deliberately **not** signed/HMAC-bound to the session. A
-/// session-bound token (`nonce.hmac(nonce, session_key)`) would close the same
-/// hole without depending on `Origin` — and is the better long-term design —
-/// but it changes the format every client must mint and echo, so it needs a
-/// migration of its own rather than a silent change here.
+/// For the plain (`csrf()`) token: it is **not** signed, so it stops a
+/// cross-site POST through `Origin` but not an attacker who can write both
+/// halves of the pair. Opt into `csrfWith(.{ .sign_key = … })` to make the
+/// cookie half unforgeable; see `CsrfConfig` for what signing does and does not
+/// cover. Failure is always `403`, and every token branch shares one message.
+///
+/// Behaviour change (v0.33.x): `X-Forwarded-Host` / `X-Forwarded-Proto` used to
+/// be honoured unconditionally. A deployment that relied on them — a front proxy
+/// rewriting `Host` to an internal name — must now either preserve the public
+/// `Host` or pass `csrfWith(.{ .trust_forwarded_host = true })`; without one of
+/// those, state-changing browser requests are refused with `403`.
 pub fn csrf() api.Middleware {
+    return csrfWith(.{});
+}
+
+/// `csrf` configuration — see the field docs for the two hardening switches.
+pub const CsrfConfig = struct {
+    /// Honour `X-Forwarded-Host` / `X-Forwarded-Proto` when matching the
+    /// browser-supplied origin. **Default `false`.**
+    ///
+    /// Turning this on hands the origin comparison a value the client controls
+    /// unless the header is guaranteed to be overwritten in transit: a browser
+    /// can send `X-Forwarded-Host` whenever the app's CORS policy admits that
+    /// header name (or when it is a same-origin request), and `Origin:
+    /// https://evil.example.com` + `X-Forwarded-Host: evil.example.com` then
+    /// matches itself.
+    ///
+    /// Only set it behind a proxy you control that **overwrites** both headers
+    /// on every request (nginx `proxy_set_header`, Envoy `host_rewrite`, …) and
+    /// never forwards a client-supplied value. Prefer keeping the public `Host`
+    /// intact; then this flag is not needed at all.
+    trust_forwarded_host: bool = false,
+
+    /// HMAC-SHA256 key for a **signed** double-submit token, shape
+    /// `nonce.signature` (see `csrfMintSignedToken`). `null` (the default)
+    /// keeps the plain unsigned shape.
+    ///
+    /// Signing is what makes the cookie half unforgeable. Plain double-submit
+    /// accepts any pair an attacker can put in place — writing `csrf_token` on
+    /// the parent domain is enough — because both halves then come from the
+    /// attacker. With a key, only a token this server minted verifies.
+    ///
+    /// It does **not** bind the token to a session: it stops *forging*, not
+    /// *replaying* a token an attacker has already observed, and it carries no
+    /// expiry. Binding would need a session id (or a timestamped nonce) in the
+    /// wire format, which is an application-level migration.
+    ///
+    /// The key bytes are caller-owned and must outlive the middleware (same
+    /// contract as `jwtAuth`'s secret) — inject them from `AppSecurity` /
+    /// `SecretsManager`, never from a constant in the framework. A non-null but
+    /// **empty** key is treated as a configuration error: signing is disabled
+    /// with a warning rather than shipping tokens anyone can forge.
+    sign_key: ?[]const u8 = null,
+};
+
+/// Per-instance CSRF configuration carried on `user_data` (see `csrfWith`).
+const CsrfStore = struct {
+    config: CsrfConfig,
+};
+
+/// CSRF middleware with explicit configuration. `csrf()` is exactly
+/// `csrfWith(.{})`, so the defaults are the conservative ones.
+pub fn csrfWith(config: CsrfConfig) api.Middleware {
+    var resolved = config;
+    if (resolved.sign_key) |key| {
+        if (key.len == 0) {
+            std.log.warn("[csrf] sign_key is empty: token signing disabled (an empty key is public, so every token would be forgeable)", .{});
+            resolved.sign_key = null;
+        }
+    }
+    if (resolved.trust_forwarded_host) {
+        std.log.warn("[csrf] trust_forwarded_host=true: X-Forwarded-Host/Proto are trusted — the front proxy must overwrite them on every request", .{});
+    }
+    // Per-instance configuration on `user_data` (allocated once, process
+    // lifetime), like `cors` / `securityHeaders`: two middleware registrations
+    // with different configs must not share state.
+    const stored = std.heap.page_allocator.create(CsrfStore) catch @panic("csrf middleware setup: out of memory");
+    stored.* = .{ .config = resolved };
     return .{
         .func = struct {
-            fn mw(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
+            fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
+                // No fallback to the defaults when `user_data` is missing: that
+                // would let a call spelled `csrfWith(.{ .sign_key = k })` run
+                // unsigned — a silent downgrade. `.?` (the same shape `cors` and
+                // `securityHeaders` use) panics on a missing handle instead of
+                // being undefined behaviour in ReleaseFast.
+                const st: *const CsrfStore = @ptrCast(@alignCast(user_data.?));
                 switch (ctx.method) {
                     .GET, .HEAD, .OPTIONS => return next(ctx),
                     else => {
-                        if (!csrfOriginAllowed(ctx)) {
+                        if (!csrfOriginAllowed(ctx, st.config.trust_forwarded_host)) {
                             try ctx.sendError(403, "CSRF origin mismatch");
                             return;
                         }
                         const header_token = ctx.header("x-csrf-token") orelse "";
-                        const cookie_header = ctx.header("cookie") orelse "";
-                        // Extract csrf_token=... from Cookie header
-                        var cookie_match = false;
-                        var it = std.mem.splitScalar(u8, cookie_header, ';');
-                        while (it.next()) |part| {
-                            const trimmed = std.mem.trim(u8, part, " ");
-                            if (std.mem.startsWith(u8, trimmed, "csrf_token=")) {
-                                const token = trimmed["csrf_token=".len..];
-                                if (token.len > 0 and constantTimeEql(token, header_token)) {
-                                    cookie_match = true;
-                                }
-                                break;
-                            }
-                        }
-                        if (!cookie_match) {
+                        const cookie_token = csrfCookieToken(ctx.header("cookie") orelse "") orelse "";
+                        // One message for every branch below — missing token,
+                        // cookie/header mismatch, bad token shape, bad
+                        // signature — so the reply never says which one failed.
+                        const matched = if (st.config.sign_key) |key|
+                            cookie_token.len > 0 and constantTimeEql(cookie_token, header_token) and csrfSignedTokenValid(header_token, key)
+                        else
+                            cookie_token.len > 0 and constantTimeEql(cookie_token, header_token);
+                        if (!matched) {
                             try ctx.sendError(403, "CSRF token mismatch");
                             return;
                         }
@@ -1140,7 +1215,72 @@ pub fn csrf() api.Middleware {
                 }
             }
         }.mw,
+        .user_data = stored,
     };
+}
+
+/// Nonce width of a signed CSRF token, in bytes, and the hex length it encodes
+/// to (`csrfMintSignedToken`).
+const csrf_nonce_bytes = 32;
+const csrf_hex_len = csrf_nonce_bytes * 2;
+
+/// Mint a signed CSRF token: `nonce-hex + "." + HMAC-SHA256(key, nonce)-hex`,
+/// 129 bytes for the built-in shape.
+///
+/// The nonce comes from `std.Io.randomSecure` — fresh OS entropy on every call,
+/// no process-wide seed that one observed token would reveal. The HMAC is taken
+/// over the nonce **text** as it appears in the token, which is what fixes the
+/// wire format for other implementations.
+///
+/// Serve the returned string as the `csrf_token` cookie (the framework has no
+/// cookie helper — `ctx.setHeader("Set-Cookie", …)` in a handler or an
+/// `HttpOnly`-free helper of your own) *and* hand it to the page (meta tag or
+/// response body) for the `X-CSRF-Token` header; verify it with
+/// `csrfWith(.{ .sign_key = key })` using the same key. The caller owns the
+/// returned slice.
+pub fn csrfMintSignedToken(allocator: std.mem.Allocator, io: std.Io, sign_key: []const u8) ![]u8 {
+    var nonce_bytes: [csrf_nonce_bytes]u8 = undefined;
+    try std.Io.randomSecure(io, &nonce_bytes);
+    const nonce = std.fmt.bytesToHex(nonce_bytes, .lower);
+    var mac: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, &nonce, sign_key);
+    return std.fmt.allocPrint(allocator, "{s}.{s}", .{ nonce, std.fmt.bytesToHex(mac, .lower) });
+}
+
+/// Is `token` a well-shaped signed token whose HMAC matches `sign_key`?
+///
+/// Shape (`nonce.signature`, exactly one dot, non-empty nonce, hex signature of
+/// the right width) and signature failures are all `false`; the caller renders a
+/// single message for every branch, so a rejected request does not disclose
+/// which check failed. The signature comparison itself is constant time.
+fn csrfSignedTokenValid(token: []const u8, sign_key: []const u8) bool {
+    const dot = std.mem.indexOfScalar(u8, token, '.') orelse return false;
+    const nonce = token[0..dot];
+    const sig_text = token[dot + 1 ..];
+    if (nonce.len == 0) return false;
+    if (sig_text.len != csrf_hex_len) return false;
+    var sig: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+    // A non-hex signature is a malformed token, not a runtime failure: reject
+    // it here instead of letting the hex decoder's error escape.
+    _ = std.fmt.hexToBytes(&sig, sig_text) catch return false;
+    var expected: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&expected, nonce, sign_key);
+    return constantTimeEql(&expected, &sig);
+}
+
+/// Value of `csrf_token` in a `Cookie` header, or `null` when absent or blank.
+/// The first occurrence wins: the header is a list, and a proxy (or a sibling
+/// app on the parent domain) can append another one after it.
+fn csrfCookieToken(cookie_header: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, cookie_header, ';');
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " ");
+        if (std.mem.startsWith(u8, trimmed, "csrf_token=")) {
+            const token = trimmed["csrf_token=".len..];
+            return if (token.len > 0) token else null;
+        }
+    }
+    return null;
 }
 
 /// `scheme` + authority split out of an `Origin`/`Referer` value.
@@ -1247,34 +1387,36 @@ fn firstForwardedValue(raw: []const u8) ?[]const u8 {
 /// Origin/Referer gate for state-changing requests.
 ///
 /// `true` when the request carries neither header (see `csrf`), or when the
-/// browser-supplied origin names a host this server answers for. Any candidate
-/// host that is present must match: a *positive* mismatch rejects, while a
-/// request with no `Host` at all (HTTP/1.0 shape, bare test context) is left to
-/// the token check rather than refused.
+/// browser-supplied origin names *some* candidate host this server answers for —
+/// the candidates are tried in turn and one match is enough. With no candidate
+/// at all (HTTP/1.0 shape, bare test context) the token check decides rather
+/// than the request being refused.
 ///
-/// `X-Forwarded-Host` / `X-Forwarded-Proto` are honoured because the Context
-/// carries no TLS or listener identity of its own — behind a TLS-terminating
-/// proxy the backend name (`127.0.0.1:8080`) would otherwise never equal the
-/// browser's origin. Trusting them is a real boundary: a browser can only set
-/// them when the app's CORS policy allows those header names (a non-simple
-/// request is preflighted), so keep `CorsConfig.allow_headers` narrow.
-fn csrfOriginAllowed(ctx: *api.Context) bool {
+/// Only `Host` is a candidate by default. `X-Forwarded-Host` /
+/// `X-Forwarded-Proto` enter the comparison only when `trust_forwarded` is set
+/// (`CsrfConfig.trust_forwarded_host`): the Context carries no listener or TLS
+/// identity of its own, so behind a TLS-terminating proxy the backend name
+/// (`127.0.0.1:8080`) never equals the browser's origin — but those headers are
+/// client-supplied unless the front proxy overwrites them, which is why the
+/// application has to say so explicitly.
+fn csrfOriginAllowed(ctx: *api.Context, trust_forwarded: bool) bool {
     const raw = nonBlank(ctx.header("origin")) orelse nonBlank(ctx.header("referer")) orelse return true;
     const origin = parseOrigin(raw) orelse return false;
 
-    // Scheme is checkable only when a proxy told us the client-facing one:
-    // without that header the framework has no view of TLS, and the host check
-    // below is the load-bearing part.
-    if (ctx.header("x-forwarded-proto")) |proto| {
-        if (firstForwardedValue(proto)) |scheme| {
-            if (!std.ascii.eqlIgnoreCase(scheme, origin.scheme)) return false;
-        }
-    }
-
     var have_candidate = false;
-    if (ctx.header("x-forwarded-host")) |forwarded| {
-        have_candidate = true;
-        if (forwardedHostMatches(forwarded, origin.host, origin.scheme)) return true;
+    if (trust_forwarded) {
+        // Scheme is checkable only when a proxy told us the client-facing one:
+        // without that header the framework has no view of TLS, and the host
+        // check below is the load-bearing part.
+        if (ctx.header("x-forwarded-proto")) |proto| {
+            if (firstForwardedValue(proto)) |scheme| {
+                if (!std.ascii.eqlIgnoreCase(scheme, origin.scheme)) return false;
+            }
+        }
+        if (ctx.header("x-forwarded-host")) |forwarded| {
+            have_candidate = true;
+            if (forwardedHostMatches(forwarded, origin.host, origin.scheme)) return true;
+        }
     }
     if (ctx.header("host")) |host| {
         have_candidate = true;
@@ -1367,7 +1509,7 @@ test "csrf rejects state-changing requests without a matching token" {
     try ctx.headers.put(try allocator.dupe(u8, "cookie"), try allocator.dupe(u8, "csrf_token=abc"));
     try mw.func(&ctx, struct {
         fn h(_: *api.Context) anyerror!void {}
-    }.h, null);
+    }.h, mw.user_data);
     try std.testing.expectEqual(@as(u16, 403), ctx.status_code);
     try std.testing.expect(ctx.responded);
 }
@@ -1386,7 +1528,7 @@ test "csrf allows matching double-submit tokens" {
         fn h(_: *api.Context) anyerror!void {
             State.reached = true;
         }
-    }.h, null);
+    }.h, mw.user_data);
     try std.testing.expect(State.reached);
     try std.testing.expectEqual(@as(u16, 200), ctx.status_code);
 }
@@ -1410,7 +1552,7 @@ test "csrf rejects a cross-origin Origin even with a matching double-submit toke
             _ = c;
             S.reached = true;
         }
-    }.n, null);
+    }.n, mw.user_data);
 
     try std.testing.expectEqual(@as(u16, 403), ctx.status_code);
     try std.testing.expect(ctx.responded);
@@ -1432,7 +1574,7 @@ test "csrf accepts same-origin Origin and leaves missing Origin/Referer alone" {
         try putRequestHeader(&ctx, "x-csrf-token", "tok123");
         try putRequestHeader(&ctx, "host", "app.example.com");
         try putRequestHeader(&ctx, "origin", "https://app.example.com");
-        try mw.func(&ctx, next, null);
+        try mw.func(&ctx, next, mw.user_data);
         try std.testing.expect(!ctx.responded);
     }
     // No Origin, no Referer: CLI / cron / server-to-server keep the old
@@ -1442,7 +1584,7 @@ test "csrf accepts same-origin Origin and leaves missing Origin/Referer alone" {
         defer ctx.deinit();
         try putRequestHeader(&ctx, "cookie", "csrf_token=tok123");
         try putRequestHeader(&ctx, "x-csrf-token", "tok123");
-        try mw.func(&ctx, next, null);
+        try mw.func(&ctx, next, mw.user_data);
         try std.testing.expect(!ctx.responded);
     }
     // Referer fallback carries a full URL, path included; the default port is
@@ -1454,7 +1596,7 @@ test "csrf accepts same-origin Origin and leaves missing Origin/Referer alone" {
         try putRequestHeader(&ctx, "x-csrf-token", "tok123");
         try putRequestHeader(&ctx, "host", "app.example.com:443");
         try putRequestHeader(&ctx, "referer", "https://app.example.com/admin/orders?page=2");
-        try mw.func(&ctx, next, null);
+        try mw.func(&ctx, next, mw.user_data);
         try std.testing.expect(!ctx.responded);
     }
     // A blank `Origin:` counts as absent, so the same-origin Referer still gets
@@ -1467,7 +1609,7 @@ test "csrf accepts same-origin Origin and leaves missing Origin/Referer alone" {
         try putRequestHeader(&ctx, "host", "app.example.com");
         try putRequestHeader(&ctx, "origin", "");
         try putRequestHeader(&ctx, "referer", "https://app.example.com/admin/orders");
-        try mw.func(&ctx, next, null);
+        try mw.func(&ctx, next, mw.user_data);
         try std.testing.expect(!ctx.responded);
     }
 }
@@ -1494,7 +1636,7 @@ test "csrf rejects Origin null, decoy userinfo and a cross-host Referer" {
         try putRequestHeader(&ctx, "x-csrf-token", "tok123");
         try putRequestHeader(&ctx, "host", "app.example.com");
         try putRequestHeader(&ctx, "origin", bad);
-        try mw.func(&ctx, next, null);
+        try mw.func(&ctx, next, mw.user_data);
         try std.testing.expectEqual(@as(u16, 403), ctx.status_code);
     }
 
@@ -1504,13 +1646,14 @@ test "csrf rejects Origin null, decoy userinfo and a cross-host Referer" {
     try putRequestHeader(&ctx, "x-csrf-token", "tok123");
     try putRequestHeader(&ctx, "host", "app.example.com");
     try putRequestHeader(&ctx, "referer", "https://evil.example.com/admin");
-    try mw.func(&ctx, next, null);
+    try mw.func(&ctx, next, mw.user_data);
     try std.testing.expectEqual(@as(u16, 403), ctx.status_code);
 }
 
 test "csrf compares against X-Forwarded-Host and X-Forwarded-Proto behind a proxy" {
     const allocator = std.testing.allocator;
-    const mw = csrf();
+    // Only the explicit opt-in consults the forwarded headers.
+    const mw = csrfWith(.{ .trust_forwarded_host = true });
     const next = struct {
         fn n(_: *api.Context) anyerror!void {}
     }.n;
@@ -1526,7 +1669,7 @@ test "csrf compares against X-Forwarded-Host and X-Forwarded-Proto behind a prox
         try putRequestHeader(&ctx, "x-forwarded-host", "app.example.com");
         try putRequestHeader(&ctx, "x-forwarded-proto", "https");
         try putRequestHeader(&ctx, "origin", "https://app.example.com");
-        try mw.func(&ctx, next, null);
+        try mw.func(&ctx, next, mw.user_data);
         try std.testing.expect(!ctx.responded);
     }
     // The proxy says the request arrived over http while the browser claims
@@ -1540,7 +1683,7 @@ test "csrf compares against X-Forwarded-Host and X-Forwarded-Proto behind a prox
         try putRequestHeader(&ctx, "x-forwarded-host", "app.example.com");
         try putRequestHeader(&ctx, "x-forwarded-proto", "http");
         try putRequestHeader(&ctx, "origin", "https://app.example.com");
-        try mw.func(&ctx, next, null);
+        try mw.func(&ctx, next, mw.user_data);
         try std.testing.expectEqual(@as(u16, 403), ctx.status_code);
     }
     // The proxy headers name the site; the browser says it is somewhere else.
@@ -1552,9 +1695,162 @@ test "csrf compares against X-Forwarded-Host and X-Forwarded-Proto behind a prox
         try putRequestHeader(&ctx, "host", "127.0.0.1:8080");
         try putRequestHeader(&ctx, "x-forwarded-host", "app.example.com");
         try putRequestHeader(&ctx, "origin", "https://evil.example.com");
-        try mw.func(&ctx, next, null);
+        try mw.func(&ctx, next, mw.user_data);
         try std.testing.expectEqual(@as(u16, 403), ctx.status_code);
     }
+}
+
+test "csrf ignores a forged X-Forwarded-Host unless the app opts in" {
+    const allocator = std.testing.allocator;
+    const next = struct {
+        fn n(_: *api.Context) anyerror!void {}
+    }.n;
+    const default_mw = csrf();
+    const trust_mw = csrfWith(.{ .trust_forwarded_host = true });
+
+    // The exploit the default has to stop: the browser addresses the real site
+    // (`Host` is always set to the target, and page script cannot change it),
+    // the hostile page names its own origin, and a CORS policy wide enough to
+    // admit `x-forwarded-host` lets it add the third header. Whoever sets those
+    // three wins unless the forwarded header is ignored by default.
+    {
+        var ctx = try api.Context.init(allocator, .POST, "/api/orders");
+        defer ctx.deinit();
+        try putRequestHeader(&ctx, "cookie", "csrf_token=tok123");
+        try putRequestHeader(&ctx, "x-csrf-token", "tok123");
+        try putRequestHeader(&ctx, "host", "app.example.com");
+        try putRequestHeader(&ctx, "x-forwarded-host", "evil.example.com");
+        try putRequestHeader(&ctx, "x-forwarded-proto", "https");
+        try putRequestHeader(&ctx, "origin", "https://evil.example.com");
+        try default_mw.func(&ctx, next, default_mw.user_data);
+        try std.testing.expectEqual(@as(u16, 403), ctx.status_code);
+    }
+    // Opting in re-enables exactly that: the same header pair is accepted. This
+    // is the trust the flag asks for, and why it must only be set behind a
+    // proxy that overwrites both headers.
+    {
+        var ctx = try api.Context.init(allocator, .POST, "/api/orders");
+        defer ctx.deinit();
+        try putRequestHeader(&ctx, "cookie", "csrf_token=tok123");
+        try putRequestHeader(&ctx, "x-csrf-token", "tok123");
+        try putRequestHeader(&ctx, "host", "app.example.com");
+        try putRequestHeader(&ctx, "x-forwarded-host", "evil.example.com");
+        try putRequestHeader(&ctx, "x-forwarded-proto", "https");
+        try putRequestHeader(&ctx, "origin", "https://evil.example.com");
+        try trust_mw.func(&ctx, next, trust_mw.user_data);
+        try std.testing.expect(!ctx.responded);
+    }
+    // Trusting the forwarded host does not stop `Host` from counting: a
+    // forwarded candidate that mismatches is not fatal while `Host` matches.
+    {
+        var ctx = try api.Context.init(allocator, .POST, "/api/orders");
+        defer ctx.deinit();
+        try putRequestHeader(&ctx, "cookie", "csrf_token=tok123");
+        try putRequestHeader(&ctx, "x-csrf-token", "tok123");
+        try putRequestHeader(&ctx, "host", "app.example.com");
+        try putRequestHeader(&ctx, "x-forwarded-host", "stale.internal");
+        try putRequestHeader(&ctx, "origin", "https://app.example.com");
+        try trust_mw.func(&ctx, next, trust_mw.user_data);
+        try std.testing.expect(!ctx.responded);
+    }
+    // The deployment the switch exists for: TLS terminated in front, the
+    // backend named 127.0.0.1:8080, the public name only in the forward headers.
+    {
+        var ctx = try api.Context.init(allocator, .POST, "/api/orders");
+        defer ctx.deinit();
+        try putRequestHeader(&ctx, "cookie", "csrf_token=tok123");
+        try putRequestHeader(&ctx, "x-csrf-token", "tok123");
+        try putRequestHeader(&ctx, "host", "127.0.0.1:8080");
+        try putRequestHeader(&ctx, "x-forwarded-host", "app.example.com");
+        try putRequestHeader(&ctx, "x-forwarded-proto", "https");
+        try putRequestHeader(&ctx, "origin", "https://app.example.com");
+        try trust_mw.func(&ctx, next, trust_mw.user_data);
+        try std.testing.expect(!ctx.responded);
+    }
+}
+
+test "csrfMintSignedToken mints nonce.signature and validates the shape" {
+    const allocator = std.testing.allocator;
+    const key = "csrf-sign-key-1";
+
+    const token = try csrfMintSignedToken(allocator, std.testing.io, key);
+    defer allocator.free(token);
+    try std.testing.expectEqual(@as(usize, csrf_hex_len * 2 + 1), token.len);
+    const dot = std.mem.indexOfScalar(u8, token, '.').?;
+    try std.testing.expectEqual(@as(usize, csrf_hex_len), dot);
+    try std.testing.expect(csrfSignedTokenValid(token, key));
+
+    // Fresh OS entropy per call: the same key twice must not repeat a nonce.
+    const other = try csrfMintSignedToken(allocator, std.testing.io, key);
+    defer allocator.free(other);
+    try std.testing.expect(!std.mem.eql(u8, token, other));
+
+    // A changed signature byte, a truncated one, a bare nonce, a foreign key,
+    // "no signature" and garbage are all rejected.
+    const tampered = try allocator.dupe(u8, token);
+    defer allocator.free(tampered);
+    tampered[tampered.len - 1] = if (tampered[tampered.len - 1] == 'a') 'b' else 'a';
+    try std.testing.expect(!csrfSignedTokenValid(tampered, key));
+    try std.testing.expect(!csrfSignedTokenValid(token[0 .. token.len - 2], key));
+    try std.testing.expect(!csrfSignedTokenValid(token[0..dot], key));
+    try std.testing.expect(!csrfSignedTokenValid(token, "csrf-sign-key-2"));
+    try std.testing.expect(!csrfSignedTokenValid("", key));
+    try std.testing.expect(!csrfSignedTokenValid(".", key));
+    try std.testing.expect(!csrfSignedTokenValid("nonce.nothex", key));
+
+    // The signature is compared as decoded bytes, so hex case does not matter.
+    const upper = try allocator.dupe(u8, token);
+    defer allocator.free(upper);
+    for (upper[dot + 1 ..]) |*c| c.* = std.ascii.toUpper(c.*);
+    try std.testing.expect(csrfSignedTokenValid(upper, key));
+}
+
+test "csrf with sign_key rejects tampered, unsigned and foreign-key tokens" {
+    const allocator = std.testing.allocator;
+    const key = "csrf-sign-key-1";
+    const mw = csrfWith(.{ .sign_key = key });
+
+    const S = struct {
+        fn next(_: *api.Context) anyerror!void {}
+        /// Status of a state-changing request carrying these two halves.
+        fn attempt(mw_: api.Middleware, cookie_value: []const u8, header_value: []const u8) !u16 {
+            var ctx = try api.Context.init(std.testing.allocator, .POST, "/api/orders");
+            defer ctx.deinit();
+            const cookie = try std.fmt.allocPrint(std.testing.allocator, "csrf_token={s}", .{cookie_value});
+            defer std.testing.allocator.free(cookie);
+            try putRequestHeader(&ctx, "cookie", cookie);
+            try putRequestHeader(&ctx, "x-csrf-token", header_value);
+            try mw_.func(&ctx, next, mw_.user_data);
+            return ctx.status_code;
+        }
+    };
+
+    const token = try csrfMintSignedToken(allocator, std.testing.io, key);
+    defer allocator.free(token);
+    try std.testing.expectEqual(@as(u16, 200), try S.attempt(mw, token, token));
+
+    // The forgery signing is meant to stop: an attacker who can write the
+    // cookie (parent-domain sibling / taken-over subdomain) echoes its own
+    // unsigned value in both halves. Plain double-submit accepts this.
+    try std.testing.expectEqual(@as(u16, 403), try S.attempt(mw, "tok123", "tok123"));
+    // Same shape as a real token, one hex digit changed.
+    const tampered = try allocator.dupe(u8, token);
+    defer allocator.free(tampered);
+    tampered[tampered.len - 1] = if (tampered[tampered.len - 1] == 'a') 'b' else 'a';
+    try std.testing.expectEqual(@as(u16, 403), try S.attempt(mw, tampered, tampered));
+    // Minted by a different app (or an attacker who guessed another key).
+    const foreign = try csrfMintSignedToken(allocator, std.testing.io, "csrf-sign-key-2");
+    defer allocator.free(foreign);
+    try std.testing.expectEqual(@as(u16, 403), try S.attempt(mw, foreign, foreign));
+    // Both halves must still agree: a stolen valid token in the header alone
+    // (or a valid cookie combined with a different header) does not pass.
+    try std.testing.expectEqual(@as(u16, 403), try S.attempt(mw, token, tampered));
+    try std.testing.expectEqual(@as(u16, 403), try S.attempt(mw, tampered, token));
+
+    // An empty key is a configuration error, not a silent empty-secret signer:
+    // signing is dropped (with a warning) and the pair is plain double-submit.
+    const unsigned = csrfWith(.{ .sign_key = "" });
+    try std.testing.expectEqual(@as(u16, 200), try S.attempt(unsigned, "tok123", "tok123"));
 }
 
 test "csrf blocks a cross-origin POST through the dispatch path" {
@@ -1589,6 +1885,44 @@ test "csrf blocks a cross-origin POST through the dispatch path" {
     var resp_ok = try Testkit.dispatchOpts(&server, .POST, "/orders", .{ .headers = &same_origin });
     defer resp_ok.deinit(allocator);
     try std.testing.expectEqual(@as(u16, 200), resp_ok.status_code);
+}
+
+test "csrf signing holds through the dispatch path" {
+    const allocator = std.testing.allocator;
+    const Testkit = @import("../http/Testkit.zig");
+    const key = "dispatch-sign-key";
+    const token = try csrfMintSignedToken(allocator, std.testing.io, key);
+    defer allocator.free(token);
+    const cookie = try std.fmt.allocPrint(allocator, "csrf_token={s}", .{token});
+    defer allocator.free(cookie);
+
+    var server = api.Server.init(std.testing.io, allocator, 0);
+    defer server.deinit();
+    try server.addMiddleware(csrfWith(.{ .sign_key = key }));
+    var group = server.group("");
+    try group.post("orders", struct {
+        fn h(ctx: *api.Context) anyerror!void {
+            try ctx.jsonStruct(200, .{ .ok = true });
+        }
+    }.h, null);
+
+    const signed = [_]Testkit.HeaderPair{
+        .{ "cookie", cookie },
+        .{ "x-csrf-token", token },
+    };
+    var resp = try Testkit.dispatchOpts(&server, .POST, "/orders", .{ .headers = &signed });
+    defer resp.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+
+    // The same request with an unsigned value in both halves (what a cookie
+    // writer can produce) is refused on the real wire, not just in a unit test.
+    const forged = [_]Testkit.HeaderPair{
+        .{ "cookie", "csrf_token=tok123" },
+        .{ "x-csrf-token", "tok123" },
+    };
+    var resp_forged = try Testkit.dispatchOpts(&server, .POST, "/orders", .{ .headers = &forged });
+    defer resp_forged.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 403), resp_forged.status_code);
 }
 
 test "SecurityHeader: defaults carry no CSP, securityHeaders(null) adds one" {

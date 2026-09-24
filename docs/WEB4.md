@@ -54,9 +54,16 @@ try server.addMiddleware(web4.middleware.didAuthMiddleware(&did_cfg));
 ### 生产加固
 
 **invoice 持久化 + 幂等核销（防重放）**：`zigmodu.web4.x402_store.X402Store`
-（SQL 表）创建 invoice 落库；proof 到达时 `redeem(invoice_id, tx_hash)`
+（SQL 表）创建 invoice 落库；proof 到达时 `redeem(invoice_id, tx_hash, payer_did)`
 **每个 invoice 恰好核销一次**——重复 proof 返回 `already_used`（410），
-未知/过期分别返回 `not_found` / `expired`。挂到中间件：
+未知/过期分别返回 `not_found` / `expired`。
+
+**发票绑定付款人**（堵住"知道 invoice id 就能用自己的 tx 抢核销"）：发票在签发时记录
+付款人（来自 `X402Config.payer_attr`，默认按序读 `did` → `user_id` 两个 **attr**，
+**从不读 header**——`x-did` 之类的客户端自报一律不算），核销时比对，不符返回
+`payer_mismatch`（403，且**不消耗**发票，合法付款人仍可核销）；未绑定遗留行（老库的
+`payer_did IS NULL`）按原语义放行。**要求 `x402Middleware` 挂在身份中间件之后**，否则
+attr 还没写、发票会静默变成未绑定。挂到中间件：
 
 ```zig
 var store = web4.x402_store.X402Store.init(allocator, &backend);

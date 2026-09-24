@@ -275,12 +275,20 @@ pub const WALEntry = struct {
 
 // ── Tests ──
 
+/// Unique per process: `zig build test` runs its six test binaries in parallel,
+/// and two of them sharing a fixed relative directory delete each other's
+/// segments mid-test (observed as `error.FileNotFound` from `createSegment`).
+fn testWalDir(comptime base: []const u8, buf: *[64]u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "{s}_{d}", .{ base, std.c.getpid() });
+}
+
 test "WAL init and basic append" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const config = WALConfig{ .dir_path = "wal_test", .max_segment_size = 1024 * 1024 };
+    var dir_buf: [64]u8 = undefined;
+    const config = WALConfig{ .dir_path = try testWalDir("wal_test", &dir_buf), .max_segment_size = 1024 * 1024 };
     var wal = try WAL.init(allocator, std.testing.io, config);
     defer wal.deinit();
 
@@ -295,7 +303,8 @@ test "WAL multi-append and commit tracking" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const config = WALConfig{ .dir_path = "wal_test2", .max_segment_size = 1024 * 1024 };
+    var dir_buf: [64]u8 = undefined;
+    const config = WALConfig{ .dir_path = try testWalDir("wal_test2", &dir_buf), .max_segment_size = 1024 * 1024 };
     var wal = try WAL.init(allocator, std.testing.io, config);
     defer wal.deinit();
 
@@ -314,7 +323,8 @@ test "WAL multi-append and commit tracking" {
 test "WAL readFrom replays entries from start sequence" {
     const allocator = std.testing.allocator;
 
-    const config = WALConfig{ .dir_path = "wal_test_replay", .max_segment_size = 1024 * 1024 };
+    var dir_buf: [64]u8 = undefined;
+    const config = WALConfig{ .dir_path = try testWalDir("wal_test_replay", &dir_buf), .max_segment_size = 1024 * 1024 };
     var wal = try WAL.init(allocator, std.testing.io, config);
     defer wal.deinit();
 

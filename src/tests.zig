@@ -7,6 +7,7 @@ test "compile all source files" {
     // API
     _ = @import("api/Module.zig");
     _ = @import("api/Middleware.zig");
+    _ = @import("api/Compression.zig");
     _ = @import("api/middleware/Tracing.zig");
     _ = @import("api/Simplified.zig");
     _ = @import("api/Server.zig");

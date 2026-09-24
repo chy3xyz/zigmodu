@@ -188,6 +188,10 @@ pub const rateLimitMiddleware = @import("api/middleware/Tracing.zig").rateLimit;
 pub const validateRequest = @import("api/middleware/Validation.zig").validateRequest;
 /// Middleware form of `validateRequest` for a route group.
 pub const validationMiddleware = @import("api/middleware/Validation.zig").validationMiddleware;
+/// Opt-in response compression (`Accept-Encoding: gzip` / `deflate`).
+pub const compressionMiddleware = @import("api/Compression.zig").compressionMiddleware;
+/// Response-compression settings (threshold, compressible types, level).
+pub const CompressionConfig = @import("api/Compression.zig").CompressionConfig;
 
 /// Outbound HTTP(S) client; HTTPS streams through `std.http.Client` trust store.
 pub const HttpClient = @import("http/HttpClient.zig").HttpClient;

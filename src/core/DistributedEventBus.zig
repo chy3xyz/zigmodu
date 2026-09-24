@@ -2383,6 +2383,13 @@ pub const ClusterConfig = struct {
     };
 };
 
+/// Unique per process: `zig build test` runs its six test binaries in parallel,
+/// and two of them sharing a fixed relative directory delete each other's
+/// segments mid-test (observed as `error.FileNotFound` from `createSegment`).
+fn testWalDir(comptime base: []const u8, buf: *[64]u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "{s}_{d}", .{ base, std.c.getpid() });
+}
+
 test "DistributedEventBus init subscribe publish" {
     const allocator = std.testing.allocator;
     var bus = try DistributedEventBus.init(allocator, std.testing.io, "test-node");
@@ -2442,7 +2449,8 @@ test "DistributedEventBus with WAL persistence" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const wal_config = WALConfig{ .dir_path = "wal_test_deb", .max_segment_size = 1024 * 1024 };
+    var deb_dir_buf1: [64]u8 = undefined;
+    const wal_config = WALConfig{ .dir_path = try testWalDir("wal_test_deb", &deb_dir_buf1), .max_segment_size = 1024 * 1024 };
     var wal = try WAL.init(allocator, std.testing.io, wal_config);
     defer wal.deinit();
 
@@ -2558,7 +2566,8 @@ test "DistributedEventBus DLQ send failure and requeue republish" {
 test "DistributedEventBus WAL replay triggers local subscribers" {
     const allocator = std.testing.allocator;
 
-    const wal_config = WALConfig{ .dir_path = "wal_test_deb", .max_segment_size = 1024 * 1024 };
+    var deb_dir_buf2: [64]u8 = undefined;
+    const wal_config = WALConfig{ .dir_path = try testWalDir("wal_test_deb", &deb_dir_buf2), .max_segment_size = 1024 * 1024 };
     var wal = try WAL.init(allocator, std.testing.io, wal_config);
     defer wal.deinit();
 

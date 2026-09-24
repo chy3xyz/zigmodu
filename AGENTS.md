@@ -256,7 +256,13 @@ pub fn deinit() void {}  // reverse order
 - JWT (new apps): `AppSecurity` + `generateTokenWithTenant` + catalog JWT + `permissionGateWith(.rbac)`
 - JWT (legacy only): `rbacJwtMiddleware*` / `sec.auth.jwtAuth*` → `auth_info` only
 - Secrets: `SecretsManager`（env > file > vault KV v2）；`http(s)://` 均可，HTTPS 用系统 CA
-- CSRF: `http_middleware.csrf()` double-submit cookie
+- CSRF: `http_middleware.csrf()` double-submit cookie。**默认不采信 `X-Forwarded-Host`/`Proto`**（要求前置代理把外部
+  host 写进 `Host`）；确有反代时 `csrfWith(.{ .trust_forwarded_host = true })`，前提是代理**每个请求都覆写**这两个头。
+  `csrfWith(.{ .sign_key = k })` 让 token 变成 `nonce.HMAC-SHA256`（`csrfMintSignedToken` 签发，常数时间比较）。
+  **`csrf()` = `csrfWith(.{})`，两条路径都要求中间件在 `user_data` 上拿到 `CsrfConfig`**（手工 `mw.func(ctx, next, null)` 会 panic）。
+- 响应压缩: `http.compressionMiddleware`（`CompressionConfig`，deflate/zlib 容器；默认 `min_size = 1024`、类型白名单、
+  候选类型无条件加 `Vary: Accept-Encoding` 并与已有值合并、只有变小才替换且此时**移除 `Content-Length`**）。不做 brotli/zstd
+  与流式增量压缩；`ctx.streaming` 跳过。装在 security headers 之后、且**别对已经压过的响应重复装**
 - CSPRNG: `std.Io.randomSecure(io, buf)` —— 每次系统调用，失败即 `error.EntropyUnavailable`，**没有回落**
   （`src/security/ApiKeyAuth.zig:129` · `PasswordEncoder.zig:24` · `SecurityModule.zig:290` · `src/kit/random.zig:17,42`）。
   熵入口要 `io`：忘了传是**编译错误**，这是有意的。
@@ -267,7 +273,7 @@ pub fn deinit() void {}  // reverse order
   `check-production` 的熵扫描 + `audit` b24 已把「播种非加密 PRNG」纳入；豁免是**逐处**的人工评审，
   不落仓库目录白名单：`check-production` 看 `scripts/lib/zig-scan.awk` 的 `ENTROPY_OK` 表，`audit` 用
   `// audit: ignore b24 <缘由>`（测试固定种子做可复现属于正当用法）。
-- x402: fail-closed；dev 才注入 `verifyPaymentAllowAll`。**`X402Store` 是台账不是校验器**：它只持久化发票并记录"每张恰好核销一次"，校验**始终**走 `X402Config.verifier`（配了 store 也一样）；把两者混同会让任意客户端自报 tx hash 就过关。
+- x402: fail-closed；dev 才注入 `verifyPaymentAllowAll`。**`X402Store` 是台账不是校验器**：它只持久化发票并记录"每张恰好核销一次"，校验**始终**走 `X402Config.verifier`（配了 store 也一样）；把两者混同会让任意客户端自报 tx hash 就过关。发票另**绑定付款人**（签发时记 `payer_did`，来源是 attr 不是 header；核销不符 → `payer_mismatch`/403 且不消耗发票）——所以 `x402Middleware` 必须挂在身份中间件**之后**。
 
 ### Multi-tenancy (optional)
 - Default column `tenant_id`；ZigShop 风格用 `app_id`：

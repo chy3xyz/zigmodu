@@ -4,11 +4,11 @@
 //! inject an explicit `PaymentVerifier` (on-chain check, allow-list, etc.).
 //! Never treat a bare `verifyPayment` / missing verifier as "paid".
 //!
-//! `x402_store.X402Store` is a **ledger, not a verifier**: it persists invoices
-//! and records that each one was redeemed exactly once (anti-replay), while
-//! `middleware.x402Middleware` always consults `X402Config.verifier` for
-//! validity — configured store or not. The store never turns an unverified
-//! proof into a paid request.
+//! `x402_store.X402Store` is a **ledger, not a verifier**: it persists invoices,
+//! binds each one to the payer it was issued to, and records that each one was
+//! redeemed exactly once (anti-replay), while `middleware.x402Middleware` always
+//! consults `X402Config.verifier` for validity — configured store or not. The
+//! store never turns an unverified proof into a paid request.
 
 const std = @import("std");
 

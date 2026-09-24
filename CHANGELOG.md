@@ -1,5 +1,64 @@
 # Changelog
 
+## [Unreleased]
+
+### 第 6 批：HTTPS 池化、x402 发票绑定付款人、CSRF 签名与代理头信任收紧、flate 压缩中间件（**破坏性：是**，两处）
+
+全量 `-Ddb=all` **1721/1745（24 skipped，0 failed）**（基线 1693/1715 → +28 用例，新增 2 条 PG/MySQL 门控 skip）。
+
+**HTTPS 池化（`src/http/HttpClient.zig`，+526/−9）**。此前每个 `https://` 请求都新建一个 `std.http.Client`，
+连接无法复用（`keep_alive` 也被显式设成了 false）；现在常驻一个懒创建的 `https_client`（`httpsClient()` 在锁内
+创建/发放，`deinit` 用 `lockUncancelable` 把它摘出来后**在锁外**销毁），`keep_alive` 恢复默认 true。红证据：
+还原"每请求新建 client" → 单实例计数 `expected 1, found 2`。
+
+> **过程中发现的一条 std 行为**（否则这次改动会引入一个更糟的 bug）：用 `/tmp/probe_std_client.zig` 在 loopback
+> plain 上逼出 std 连接池的两条不同命运 —— **读失败**（`HttpConnectionClosing`）时 std 会把死连接从 free 表剔除；
+> 但**写失败**（`WriteFailed`，`reader.state` 仍 `.ready`）时死连接会被**放回** free 表，于是每次请求都命中同一条
+> （`accepts` 恒为 1，池等于卡死）。因此失败路径改为调用 `discardIdleHttpsConnectionsFor(url)` 按 host/port/protocol
+> 精确剪枝（用 `@hasField` 编译期断言钉住 std 的字段名，上游改名会编译失败而不是静默失效）。另外 std 对半读响应会先
+> `discardRemaining()` 抽干再回池 —— 对没有终止的 SSE/LLM body 就是无限阻塞，所以 `executeHttpsStream` 用
+> `errdefer { conn.closing = true }` 保证失败不回池。新增 5 条用例。
+
+**x402 发票绑定付款人（`src/web4/x402_store.zig` + `middleware.zig`）**。以前只要知道 `invoice_id`，任何客户端都能
+拿自己的 tx hash 把这张发票核销掉（发票是"每张恰好核销一次"的台账，先到先得）。现在签发时写入 `payer_did`，核销时
+比对，不符 → **新的** `RedeemResult.payer_mismatch`（403，且**不消耗**发票，合法付款人仍可核销；刻意不复用
+`already_used`，否则下游会把越权探测读成"已用过"）。比对发生在 status/deadline 判断**之前**。付款人来源是
+**attr**（默认按序读 `did` → `user_id`，`X402Config.payer_attr` 可覆盖），**从不读 header** —— 伪造 `x-did`
+仍然 403。未绑定的遗留行（老库 `payer_did IS NULL`）按原语义放行。`migrate()` 增加幂等 `ALTER`（sqlite 走
+`PRAGMA table_info`，PG/MySQL 走 `information_schema`），老库可以直接升级。红证据：去掉比对 →
+`expected .payer_mismatch, found .redeemed` / `expected 403, found 200`。**在真 PG 17.10 与 MySQL 9.3.0 上验过**
+（`ZIGMODU_TEST_PG=1` / `DB=mysql`）。
+
+> **接线前提（应用侧）**：`x402Middleware` 必须挂在身份中间件**之后**，否则 attr 还没写，发票会**静默**变成未绑定
+> （等于没有这道防护）。mTLS / API-key 场景没有 `did`，用 `payer_attr` 指到你的身份 attr 上。
+
+**CSRF：签名 token + 代理头信任收紧（`src/api/Middleware.zig`）**。新增
+`CsrfConfig{ trust_forwarded_host = false, sign_key = null }` 与 `csrfWith(config)`、`csrfMintSignedToken(io, sign_key)`。
+`csrf()` 现在是 `csrfWith(.{})`，即**默认不采信 `X-Forwarded-Host`/`Proto`** —— 这两条是客户端可伪造的，旧行为允许
+攻击者在代理会透传该头时把 origin 检查绕过去（红证据：伪造 XFH → `expected 403, found 200`）。反代场景用
+`csrfWith(.{ .trust_forwarded_host = true })` 显式打开（打开时会打一条 warn 提醒代理必须每请求覆写）。
+`sign_key` 把 cookie 里的 token 从纯随机 nonce 变成 `nonce.signature`（nonce = 32 B `randomSecure` hex，
+sig = HMAC-SHA256 hex，共 129 字节，常数时间比较），未签名/篡改的 token 一律 403。
+
+> **这是本批的第二处破坏性变化**：`csrf()` 现在要求中间件在 `user_data` 上拿到 `CsrfConfig`（`csrfWith` 自己会装）。
+> 手工调用 `mw.func(ctx, next, null)` 会 panic；按 `http.addMiddleware(http.csrf())` 的常规用法不受影响。文件内 8 处
+> 测试已相应改写。
+
+**响应压缩中间件（新文件 `src/api/Compression.zig`，699 行 / 13 用例）**：`http.compressionMiddleware` +
+`CompressionConfig`，deflate（zlib 容器）。默认 `min_size = 1024`；类型白名单（json/js/xml/wasm + 结构性
+`text/*`、`+json`/`+xml`，`image/svg+xml` 会压）；排除 1xx/204/205/206/304；**只有压缩后更小才替换**；候选类型上
+**无条件**加 `Vary: Accept-Encoding`（含客户端没发该头的情形，缓存正确性优先）并与已有值合并；替换后**移除
+`Content-Length`**（Server 会重算）；`ctx.streaming` 直接跳过；失败顺序保证不会出现"带了 `Content-Encoding` 但
+body 没编码"的响应。红证据：把 `compressResponse` 挖空 → 12 条里 8 条红。**未做**：brotli/zstd（std 无编码侧）、
+流式增量压缩、动态级别、按路由开关。新文件需要 `src/tests.zig` 里有一行 `_ = @import(...)` 才会进测试二进制
+——`http.zig` 的导出只保证它被编译。
+
+**测试隔离：WAL 用例的固定目录（顺带，解释了一类 flake）**。`zig build test` 并行跑 6 个测试二进制，
+`WAL.zig` / `SagaOrchestrator.zig` / `DistributedEventBus.zig` 的 8 处用例用的是**固定相对目录**
+（`wal_test`、`wal_test2`、`wal_test_deb`、`wal_test_saga` …），彼此 `deleteFile` 拆台，表现为
+`error.FileNotFound` @ `WAL.zig:221 createSegment`（上一次在 `ai.workflow` 用例上偶发过一次）。改为
+`testWalDir(base, buf)` = `"{base}_{pid}"`，旧的固定目录已删除。
+
 ## [0.33.2] - 2026-09-24
 
 ### 第 5 批：CI bench 基线重录、Lru/Pool 两处真红修复、h2 dispatch E2E、OOM 注入扫出两个真缺陷（**破坏性：否**）

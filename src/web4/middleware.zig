@@ -37,7 +37,38 @@ pub const X402Config = struct {
     /// validity — `verifier` is consulted on every request either way, and a
     /// store that is configured while the verifier rejects still yields 403.
     store: ?*x402_store_mod.X402Store = null,
+    /// Attribute holding the caller identity an invoice is bound to. `null`
+    /// reads the framework's auth attrs in order: `did` (written by
+    /// `didAuthMiddleware`, after the signature checked out) then `user_id`
+    /// (the `sub` the JWT / catalog middleware verified). Set it when the app's
+    /// identity lives in an attr of its own.
+    ///
+    /// It is an **attribute**, never a request header — including `x-did` and
+    /// the x402 headers. Attrs are written by middleware that verified the
+    /// caller; a header is whatever the client typed, so binding to one would
+    /// hand the binding straight back to the caller it is meant to constrain.
+    ///
+    /// A request whose identity is missing (no auth middleware on this route,
+    /// or one mounted *after* this gate — order matters, the attr has to be set
+    /// by the time the 402 is issued) leaves the invoice unbound, and
+    /// `X402Store.redeem` then has nothing to compare against — see `payerDid`.
+    payer_attr: ?[]const u8 = null,
 };
+
+/// The verified identity of this request, or `null` when nothing authenticated
+/// it. Only attributes are consulted — and only attributes some middleware wrote
+/// *after* it verified the caller (see `X402Config.payer_attr`). A request
+/// header is never a source here, however it is spelled.
+fn payerDid(ctx: *api.Context, cfg: *X402Config) ?[]const u8 {
+    if (cfg.payer_attr) |attr| return trimmed(ctx.getAttr(attr));
+    if (trimmed(ctx.getAttr("did"))) |did| return did;
+    return trimmed(ctx.getAttr("user_id"));
+}
+
+fn trimmed(value: ?[]const u8) ?[]const u8 {
+    const raw = value orelse return null;
+    return if (raw.len == 0) null else raw;
+}
 
 /// x402 payment gate: no proof → 402 + invoice; invalid proof → 403; valid →
 /// downstream handler.
@@ -75,10 +106,21 @@ pub fn x402Middleware(cfg: *X402Config) api.Middleware {
                         return;
                     }
                     if (c.store) |st| {
-                        switch (try st.redeem(invoice_id, tx)) {
+                        switch (try st.redeem(invoice_id, tx, payerDid(ctx, c))) {
                             .redeemed => {},
                             .already_used, .not_found, .expired => {
                                 try ctx.sendError(410, "invoice not redeemable");
+                                return;
+                            },
+                            // A proof that verifies is still not proof of *this*
+                            // invoice's payment: the row records who it was
+                            // issued to, and a proof arriving from anyone else
+                            // must not spend it. 403 (not 410) because the
+                            // invoice is untouched and still redeemable by its
+                            // payer — the same status the verifier path uses,
+                            // since both mean "this proof does not entitle you".
+                            .payer_mismatch => {
+                                try ctx.sendError(403, "payment proof does not match the invoice payer");
                                 return;
                             },
                         }
@@ -102,7 +144,11 @@ pub fn x402Middleware(cfg: *X402Config) api.Middleware {
                     };
                 };
                 if (c.store) |st| {
-                    st.create(invoice) catch |err| switch (err) {
+                    // Bind the invoice to whichever identity the request
+                    // carries (null when the route has no auth middleware):
+                    // `redeem` compares against it, so the payer is fixed when
+                    // the invoice is issued rather than inferred later.
+                    st.create(invoice, payerDid(ctx, c)) catch |err| switch (err) {
                         // The id is already on the books. An app that derives it
                         // from its own order id meets this on every retry, and a
                         // paying client must not be answered with a 500 — the id
@@ -548,4 +594,208 @@ test "x402Middleware still issues an invoice without an Io handle" {
     const now = @import("../core/Time.zig").wallClockSeconds(std.testing.io);
     try std.testing.expect(deadline > now);
     try std.testing.expect(deadline <= now + 3601);
+}
+
+/// The two headers an x402 proof arrives in. Values are owned by the context
+/// allocator and freed with the context.
+fn presentProof(allocator: std.mem.Allocator, ctx: *api.Context, tx_hash: []const u8, invoice_id: []const u8) !void {
+    try ctx.headers.put(try allocator.dupe(u8, "x402-tx-hash"), try allocator.dupe(u8, tx_hash));
+    try ctx.headers.put(try allocator.dupe(u8, "x402-invoice-id"), try allocator.dupe(u8, invoice_id));
+}
+
+test "x402Middleware refuses a payment proof from a payer the invoice was not issued to" {
+    const allocator = std.testing.allocator;
+    var client = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    var backend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend{ .allocator = allocator, .client = &client };
+    var store = x402_store_mod.X402Store.init(allocator, &backend);
+    try store.migrate();
+
+    var cfg = X402Config{ .verifier = x402_mod.verifyPaymentAllowAll, .store = &store, .on_invoice = struct {
+        fn build(_: *api.Context, _: std.mem.Allocator) anyerror!x402_mod.Invoice {
+            return .{
+                .id = "inv-e2e-bound",
+                .payee_did = "did:key:z6MkDemo",
+                .amount = 1000000,
+                .currency = .usdc,
+                .deadline = 0,
+                .description = "order",
+            };
+        }
+    }.build };
+    const mw = x402Middleware(&cfg);
+    const State = struct {
+        var reached: usize = 0;
+    };
+    State.reached = 0;
+    const Handler = struct {
+        fn h(_: *api.Context) anyerror!void {
+            State.reached += 1;
+        }
+    };
+
+    // Alice asks for the invoice; the gate records her as its payer.
+    var issue = try api.Context.init(allocator, .GET, "/api/paid");
+    defer issue.deinit();
+    try issue.setAttr("did", "did:key:z6MkAlice");
+    try mw.func(&issue, Handler.h, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 402), issue.status_code);
+
+    // Mallory knows the invoice id (observed, guessed, or just reused) and pays
+    // with a proof of her own. The proof is a real payment, so the verifier —
+    // the only thing consulted before the ledger — accepts it; the payer
+    // binding is what has to stop her, and it must stop her *without* spending
+    // the invoice.
+    var attack = try api.Context.init(allocator, .GET, "/api/paid");
+    defer attack.deinit();
+    try attack.setAttr("did", "did:key:z6MkMallory");
+    try presentProof(allocator, &attack, "0xmallory", "inv-e2e-bound");
+    try mw.func(&attack, Handler.h, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 403), attack.status_code);
+    try std.testing.expectEqual(@as(usize, 0), State.reached);
+
+    // `x-did` is a request header, so typing Alice's DID into it is not identity:
+    // with no verified attr behind it the caller is still a stranger.
+    var spoof = try api.Context.init(allocator, .GET, "/api/paid");
+    defer spoof.deinit();
+    try spoof.headers.put(try allocator.dupe(u8, "x-did"), try allocator.dupe(u8, "did:key:z6MkAlice"));
+    try presentProof(allocator, &spoof, "0xspoof", "inv-e2e-bound");
+    try mw.func(&spoof, Handler.h, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 403), spoof.status_code);
+    try std.testing.expectEqual(@as(usize, 0), State.reached);
+
+    // Alice's own proof is the one that lands…
+    var pay = try api.Context.init(allocator, .GET, "/api/paid");
+    defer pay.deinit();
+    try pay.setAttr("did", "did:key:z6MkAlice");
+    try presentProof(allocator, &pay, "0xalice", "inv-e2e-bound");
+    try mw.func(&pay, Handler.h, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 200), pay.status_code);
+    try std.testing.expectEqual(@as(usize, 1), State.reached);
+
+    // …and nothing above consumed the invoice, so this is her first redemption
+    // and the next attempt is the replay, not a mismatch.
+    var replay = try api.Context.init(allocator, .GET, "/api/paid");
+    defer replay.deinit();
+    try replay.setAttr("did", "did:key:z6MkAlice");
+    try presentProof(allocator, &replay, "0xalice2", "inv-e2e-bound");
+    try mw.func(&replay, Handler.h, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 410), replay.status_code);
+}
+
+test "x402Middleware leaves an invoice unbound when the route carries no identity" {
+    const allocator = std.testing.allocator;
+    var client = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    var backend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend{ .allocator = allocator, .client = &client };
+    var store = x402_store_mod.X402Store.init(allocator, &backend);
+    try store.migrate();
+
+    // No auth middleware on this route, so no request has an identity to bind
+    // to. The invoice is then redeemable by whoever `verifier` accepts — the
+    // behaviour every row written before payers were recorded keeps. It is the
+    // documented fallback, not a defended one: add `didAuthMiddleware` in front
+    // of the gate to get the binding.
+    var cfg = X402Config{ .verifier = x402_mod.verifyPaymentAllowAll, .store = &store, .on_invoice = struct {
+        fn build(_: *api.Context, _: std.mem.Allocator) anyerror!x402_mod.Invoice {
+            return .{
+                .id = "inv-e2e-unbound",
+                .payee_did = "did:key:z6MkDemo",
+                .amount = 1,
+                .currency = .usdc,
+                .deadline = 0,
+                .description = "order",
+            };
+        }
+    }.build };
+    const mw = x402Middleware(&cfg);
+    const State = struct {
+        var reached: usize = 0;
+    };
+    State.reached = 0;
+    const Handler = struct {
+        fn h(_: *api.Context) anyerror!void {
+            State.reached += 1;
+        }
+    };
+
+    var issue = try api.Context.init(allocator, .GET, "/api/paid");
+    defer issue.deinit();
+    try mw.func(&issue, Handler.h, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 402), issue.status_code);
+
+    var pay = try api.Context.init(allocator, .GET, "/api/paid");
+    defer pay.deinit();
+    try presentProof(allocator, &pay, "0xanyone", "inv-e2e-unbound");
+    try mw.func(&pay, Handler.h, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 200), pay.status_code);
+    try std.testing.expectEqual(@as(usize, 1), State.reached);
+
+    // Exactly-once still holds for the unbound row.
+    var replay = try api.Context.init(allocator, .GET, "/api/paid");
+    defer replay.deinit();
+    try presentProof(allocator, &replay, "0xanyone2", "inv-e2e-unbound");
+    try mw.func(&replay, Handler.h, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 410), replay.status_code);
+    try std.testing.expectEqual(@as(usize, 1), State.reached);
+}
+
+test "x402Middleware binds to the configured payer attribute" {
+    const allocator = std.testing.allocator;
+    var client = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    var backend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend{ .allocator = allocator, .client = &client };
+    var store = x402_store_mod.X402Store.init(allocator, &backend);
+    try store.migrate();
+
+    // An app whose identity lives in its own attr names it here; the defaults
+    // (`did`, then `user_id`) are then not consulted at all.
+    var cfg = X402Config{ .verifier = x402_mod.verifyPaymentAllowAll, .store = &store, .payer_attr = "account_id", .on_invoice = struct {
+        fn build(_: *api.Context, _: std.mem.Allocator) anyerror!x402_mod.Invoice {
+            return .{
+                .id = "inv-e2e-attr",
+                .payee_did = "did:key:z6MkDemo",
+                .amount = 1,
+                .currency = .usdc,
+                .deadline = 0,
+                .description = "order",
+            };
+        }
+    }.build };
+    const mw = x402Middleware(&cfg);
+    const State = struct {
+        var reached: usize = 0;
+    };
+    State.reached = 0;
+    const Handler = struct {
+        fn h(_: *api.Context) anyerror!void {
+            State.reached += 1;
+        }
+    };
+
+    var issue = try api.Context.init(allocator, .GET, "/api/paid");
+    defer issue.deinit();
+    try issue.setAttr("account_id", "acct-1");
+    try mw.func(&issue, Handler.h, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 402), issue.status_code);
+
+    // The same caller, but the identity arrives in the attr the gate is *not*
+    // configured for — a different account from the gate's point of view.
+    var other = try api.Context.init(allocator, .GET, "/api/paid");
+    defer other.deinit();
+    try other.setAttr("did", "acct-1");
+    try presentProof(allocator, &other, "0xacct", "inv-e2e-attr");
+    try mw.func(&other, Handler.h, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 403), other.status_code);
+
+    var pay = try api.Context.init(allocator, .GET, "/api/paid");
+    defer pay.deinit();
+    try pay.setAttr("account_id", "acct-1");
+    try presentProof(allocator, &pay, "0xacct", "inv-e2e-attr");
+    try mw.func(&pay, Handler.h, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 200), pay.status_code);
+    try std.testing.expectEqual(@as(usize, 1), State.reached);
 }

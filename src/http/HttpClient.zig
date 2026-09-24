@@ -9,6 +9,27 @@ pub const HttpClient = struct {
     connection_pool: ConnectionPool,
     retry_policy: RetryPolicy,
     timeout_ms: u64,
+    /// Shared `std.http.Client` for the HTTPS path, created on first use and
+    /// kept until `deinit`. One instance is what lets outbound TLS connections
+    /// be reused (`keep_alive`) and keeps the system CA bundle from being
+    /// rescanned per request.
+    https_client: ?*std.http.Client,
+    /// Guards `https_client`: creation, hand-out and teardown. Held only for
+    /// the hand-out, never across a request — `std.http.Client` is itself
+    /// thread-safe, and serializing all outbound TLS behind this mutex would
+    /// be a throughput regression.
+    ///
+    /// Lock order: `https_mutex` → `std.http.Client.connection_pool.mutex`.
+    https_mutex: std.Io.Mutex,
+    /// How many `std.http.Client` instances this `HttpClient` created. Created
+    /// lazily on the first HTTPS request and never replaced, so this stays 1 —
+    /// anything else means the shape regressed to one client per request.
+    /// Read by tests, and useful when wondering whether outbound TLS is being
+    /// re-handshaked per request.
+    https_clients_created: u32,
+    /// Set by `deinit`. Later requests fail with `error.HttpClientClosed`
+    /// instead of touching torn-down state.
+    closed: bool,
 
     pub const ConnectionPool = struct {
         allocator: std.mem.Allocator,
@@ -237,12 +258,58 @@ pub const HttpClient = struct {
             .connection_pool = ConnectionPool.init(allocator, io, max_connections),
             .retry_policy = RetryPolicy.default(),
             .timeout_ms = timeout_ms,
+            .https_client = null,
+            .https_mutex = .init,
+            .https_clients_created = 0,
+            .closed = false,
         };
     }
 
+    /// Release the shared HTTPS client and the plain-HTTP connection pool.
+    ///
+    /// Must not run while another thread has a request in flight: std asserts
+    /// that its pool has no used connections (and would close connections out
+    /// from under them). Every entry point fails with `error.HttpClientClosed`
+    /// once this returned, and a second `deinit` is a no-op.
     pub fn deinit(self: *Self) void {
+        if (self.closed) return;
+        self.closed = true;
+
+        const io = self.connection_pool.io;
+        // Uncancelable: a canceled teardown would leak the client's
+        // connections and its CA bundle.
+        self.https_mutex.lockUncancelable(io);
+        const https_client = self.https_client;
+        self.https_client = null;
+        self.https_mutex.unlock(io);
+
+        if (https_client) |client| {
+            client.deinit();
+            self.allocator.destroy(client);
+        }
+
         self.connection_pool.deinit();
-        self.* = undefined;
+    }
+
+    /// Get the shared HTTPS client, creating it on first use.
+    ///
+    /// The lock is taken cancelably (this is the request path) and released
+    /// before the caller starts the request; `deinit` takes the same mutex
+    /// uncancelably and nulls the pointer before freeing it.
+    fn httpsClient(self: *Self) !*std.http.Client {
+        const io = self.connection_pool.io;
+        self.https_mutex.lock(io) catch |err| return err;
+        defer self.https_mutex.unlock(io);
+
+        if (self.closed) return error.HttpClientClosed;
+        if (self.https_client) |client| return client;
+
+        const client = try self.allocator.create(std.http.Client);
+        errdefer self.allocator.destroy(client);
+        client.* = .{ .allocator = self.allocator, .io = io };
+        self.https_client = client;
+        self.https_clients_created += 1;
+        return client;
     }
 
     const Target = struct {
@@ -254,12 +321,24 @@ pub const HttpClient = struct {
 
     /// Send HTTP(S) request (with retry). HTTPS uses `std.http.Client` (TLS 1.3).
     pub fn request(self: *Self, req: HttpRequest) !HttpResponse {
+        if (self.closed) return error.HttpClientClosed;
+
         var last_error: anyerror = error.Unknown;
 
         var attempt: u32 = 0;
         while (attempt <= self.retry_policy.max_retries) : (attempt += 1) {
             return self.executeRequest(req) catch |err| {
                 last_error = err;
+
+                // The failed attempt has already released its connection by
+                // now. A reused TLS connection that the peer closed while it
+                // sat idle shows up here as ReadFailed/WriteFailed; std marks
+                // the ReadFailed case for closing and destroys it, but a
+                // failure *before* the response head leaves std's request
+                // reader in `.ready` and std pools that connection again — so
+                // the retry would pick the same dead connection. Drop this
+                // target's idle TLS connections, forcing a fresh dial.
+                self.discardIdleHttpsConnectionsFor(req.url);
 
                 if (attempt < self.retry_policy.max_retries) {
                     const delay = self.retry_policy.calculateDelay(attempt);
@@ -313,10 +392,14 @@ pub const HttpClient = struct {
         return .GET;
     }
 
-    /// HTTPS via std.http.Client (system CA bundle + TLS 1.3). Not pooled.
+    /// HTTPS via the shared `std.http.Client` (system CA bundle + TLS 1.3).
+    ///
+    /// `keep_alive` is std's default (`true`): a completed response leaves the
+    /// TLS connection in the client's pool for the next request to the same
+    /// host. Failures are handled by the caller's retry loop, which discards
+    /// this target's idle connections first.
     fn executeHttps(self: *Self, req: HttpRequest) !HttpResponse {
-        var client = std.http.Client{ .allocator = self.allocator, .io = self.connection_pool.io };
-        defer client.deinit();
+        const client = try self.httpsClient();
 
         var header_list = std.ArrayList(std.http.Header).empty;
         defer header_list.deinit(self.allocator);
@@ -334,7 +417,6 @@ pub const HttpClient = struct {
             .payload = req.body,
             .extra_headers = header_list.items,
             .response_writer = &aw.writer,
-            .keep_alive = false,
         }) catch |err| return mapHttpsError(err);
 
         var resp = HttpResponse.init(self.allocator);
@@ -344,10 +426,18 @@ pub const HttpClient = struct {
         return resp;
     }
 
-    /// HTTPS incremental body stream via std.http.Client (read loop → on_chunk).
+    /// HTTPS incremental body stream via `std.http.Client` (read loop → on_chunk).
+    ///
+    /// A stream that stops before the end of the body — `on_chunk` failing, a
+    /// read error, the caller giving up in the middle of an SSE/LLM stream —
+    /// closes its connection instead of returning it to the pool. Leaving the
+    /// connection reusable is not safe here for two reasons: std's
+    /// `Request.deinit` would try to *drain* the rest of the body (blocking
+    /// until the peer ends a body that may never end), and a half-consumed
+    /// stream is not a position a later request may resume from. See the
+    /// `errdefer` below for the mechanism.
     fn executeHttpsStream(self: *Self, req: HttpRequest, cb_ctx: *anyopaque, on_chunk: OnBodyChunk) !HttpResponse {
-        var client = std.http.Client{ .allocator = self.allocator, .io = self.connection_pool.io };
-        defer client.deinit();
+        const client = try self.httpsClient();
 
         var header_list = std.ArrayList(std.http.Header).empty;
         defer header_list.deinit(self.allocator);
@@ -359,9 +449,15 @@ pub const HttpClient = struct {
         const uri = std.Uri.parse(req.url) catch return error.InvalidUrl;
         var https_req = client.request(parseMethod(req.method), uri, .{
             .extra_headers = header_list.items,
-            .keep_alive = false,
         }) catch |err| return mapHttpsError(err);
         defer https_req.deinit();
+        // Registration order is load-bearing: defers run newest-first, so this
+        // has to come after `defer https_req.deinit()` to run *before* it.
+        // `Request.deinit` only skips the drain (and the return to the pool)
+        // when the connection is already marked closing.
+        errdefer {
+            if (https_req.connection) |conn| conn.closing = true;
+        }
 
         if (req.body) |body| {
             https_req.sendBodyComplete(@constCast(body)) catch |err| return mapHttpsError(err);
@@ -391,6 +487,71 @@ pub const HttpClient = struct {
             try on_chunk(cb_ctx, chunk_buf[0..n]);
         }
         return resp;
+    }
+
+    /// Drop the shared client's idle TLS connections to one target, so the
+    /// next request to it must dial (and handshake) again.
+    fn discardIdleHttpsConnections(self: *Self, host: []const u8, port: u16) void {
+        const io = self.connection_pool.io;
+        self.https_mutex.lockUncancelable(io);
+        defer self.https_mutex.unlock(io);
+
+        const client = self.https_client orelse return;
+        discardIdleConnections(client, host, port, .tls);
+    }
+
+    /// `req.url` flavour of `discardIdleHttpsConnections`; plain-HTTP targets
+    /// are left alone (their pool is this struct's own `ConnectionPool`).
+    fn discardIdleHttpsConnectionsFor(self: *Self, url: []const u8) void {
+        var host_buf: [256]u8 = undefined;
+        var path_buf: [4096]u8 = undefined;
+        const target = parseTarget(url, &host_buf, &path_buf) catch return;
+        if (!target.is_tls) return;
+        self.discardIdleHttpsConnections(target.host, target.port);
+    }
+
+    /// Close every idle connection `client` holds for `host`/`port`/`protocol`.
+    ///
+    /// `std.http.Client` has no API for this — `deinit` also closes in-use
+    /// connections and invalidates the pool — so the idle list is walked
+    /// directly. Connections in `used` (another thread's in-flight request)
+    /// are deliberately untouched. Tie the field names to the toolchain: a
+    /// rename must break the build here, not silently stop pruning.
+    fn discardIdleConnections(
+        client: *std.http.Client,
+        host: []const u8,
+        port: u16,
+        protocol: std.http.Client.Protocol,
+    ) void {
+        comptime {
+            for ([_][]const u8{ "free", "free_len", "mutex" }) |field| {
+                if (!@hasField(std.http.Client.ConnectionPool, field)) {
+                    @compileError("std.http.Client.ConnectionPool." ++ field ++
+                        " is gone; update HttpClient.discardIdleConnections");
+                }
+            }
+            if (!@hasField(std.http.Client.Connection, "pool_node")) {
+                @compileError("std.http.Connection.pool_node is gone; update HttpClient.discardIdleConnections");
+            }
+        }
+
+        const io = client.io;
+        const pool = &client.connection_pool;
+        pool.mutex.lockUncancelable(io);
+        defer pool.mutex.unlock(io);
+
+        const wanted = std.Io.net.HostName{ .bytes = host };
+        var node = pool.free.first;
+        while (node) |current| {
+            // `destroy` frees the connection, so advance first.
+            node = current.next;
+            const conn: *std.http.Client.Connection = @alignCast(@fieldParentPtr("pool_node", current));
+            if (conn.protocol != protocol or conn.port != port) continue;
+            if (!conn.host().eql(wanted)) continue;
+            pool.free.remove(current);
+            pool.free_len -= 1;
+            conn.destroy(io);
+        }
     }
 
     fn mapHttpsError(err: anyerror) anyerror {
@@ -631,6 +792,7 @@ pub const HttpClient = struct {
     /// Send HTTP request and stream the response body via `on_chunk` (no retry — streams are not idempotent).
     /// Returned `HttpResponse.body` is empty; status/headers are filled. Caller still owns `deinit`.
     pub fn requestStream(self: *Self, req: HttpRequest, cb_ctx: *anyopaque, on_chunk: OnBodyChunk) !HttpResponse {
+        if (self.closed) return error.HttpClientClosed;
         return self.executeRequestStream(req, cb_ctx, on_chunk);
     }
 
@@ -1460,4 +1622,359 @@ test "HttpClient chunked decoder rejects malformed framing" {
         const result = client.requestStream(req, undefined, Sink.onChunk);
         try std.testing.expectError(case.expected, result);
     }
+}
+
+// ── Shared `std.http.Client` / TLS connection reuse ──────────────────────────
+//
+// The HTTPS path keeps one `std.http.Client` alive for the lifetime of the
+// `HttpClient` (`HttpClient.https_client`) instead of building one per request.
+// Two things follow, and only the first has a test here:
+//
+//   * reusing the client is what makes `keep_alive` do anything — a per-request
+//     client has nothing to reuse the connection in (test: "builds one
+//     std.http.Client for the HTTPS path", via the creation counter);
+//   * the client caches the system CA bundle (`Client.now`/`ca_bundle`), so it
+//     is scanned once rather than per request. Not locally testable: it only
+//     happens on a real TLS request.
+//
+// The tests below drive `std.http.Client` over *plain* loopback HTTP for the
+// pool mechanics: `Request.deinit` → `ConnectionPool.release` is shared by both
+// protocols, so the pool behaviour here is the behaviour the TLS path gets. A
+// real TLS handshake cannot be exercised on loopback (self-signed peer, no
+// system trust), so TLS-specific reuse is explicitly *not* covered — see the
+// note on `HttpClient.httpsClient`.
+
+/// Loopback server for the pool experiments: answers every request on a
+/// connection with `payload` and leaves the connection open (HTTP/1.1
+/// keep-alive). With `abort_after_reply` it closes the socket right after
+/// replying — what an idle timeout (or a crashed peer) does to a connection
+/// the client still has in its pool.
+const PoolProbeServer = struct {
+    listener: *std.Io.net.Server,
+    payload: []const u8,
+    abort_after_reply: bool = false,
+
+    fn run(ctx: *@This()) void {
+        var first = true;
+        while (true) {
+            // The first accept waits for the client; afterwards only a short
+            // grace period, so the test ends instead of hanging on join.
+            const wait_ms: u64 = if (first) 5000 else 300;
+            first = false;
+            HttpClient.waitForReadable(ctx.listener.socket.handle, wait_ms) catch return;
+            const accepted = ctx.listener.accept(std.testing.io) catch return;
+
+            while (readProbeRequest(accepted)) {
+                writeRawAll(accepted.socket.handle, ctx.payload);
+                if (ctx.abort_after_reply) break;
+            }
+            accepted.close(std.testing.io);
+        }
+    }
+};
+
+/// Read one request head; false when the peer closed instead of sending one.
+fn readProbeRequest(accepted: std.Io.net.Stream) bool {
+    var total: usize = 0;
+    var buf: [1024]u8 = undefined;
+    while (total < buf.len) {
+        HttpClient.waitForReadable(accepted.socket.handle, 1000) catch return false;
+        const n = std.posix.read(accepted.socket.handle, buf[total..]) catch return false;
+        if (n == 0) return false;
+        total += n;
+        if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) return true;
+    }
+    return true;
+}
+
+/// A loopback `std.http.Client` request whose body is discarded.
+fn probeFetch(client: *std.http.Client, url: []const u8) !void {
+    var aw: std.Io.Writer.Allocating = .init(client.allocator);
+    defer aw.deinit();
+    _ = try client.fetch(.{ .location = .{ .url = url }, .response_writer = &aw.writer });
+}
+
+/// Start a loopback listener and hand back its port.
+fn probeListener() !std.Io.net.Server {
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    return addr.listen(std.testing.io, .{ .reuse_address = true });
+}
+
+/// A port nothing listens on: bind, read the number, close.
+fn deadLoopbackPort() !u16 {
+    var listener = try probeListener();
+    defer listener.deinit(std.testing.io);
+    return listener.socket.address.getPort();
+}
+
+// The HTTPS path must hold one `std.http.Client`, not one per request. The
+// attempts below fail (nothing listens) — that is the point: they still have
+// to be served by the same, lazily created client.
+test "HttpClient builds one std.http.Client for the HTTPS path" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var client = HttpClient.init(allocator, std.testing.io, 1, 500);
+    defer client.deinit();
+    client.retry_policy.max_retries = 0;
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/probe", .{try deadLoopbackPort()});
+
+    for (0..2) |_| {
+        var req = HttpClient.HttpRequest.init(allocator, "GET", url);
+        defer req.deinit();
+        // Refused (or an unusable CA bundle): never a success, and never a
+        // crash — a per-request client would already be a different shape.
+        if (client.request(req)) |ok| {
+            var resp = ok;
+            resp.deinit();
+            return error.TestUnexpectedResult;
+        } else |_| {}
+        try std.testing.expectEqual(@as(u32, 1), client.https_clients_created);
+    }
+}
+
+// `deinit` has to be safe to run twice and to run before any HTTPS request,
+// and requests after it must be a defined error rather than a use-after-free
+// of the torn-down pool/client.
+test "HttpClient refuses requests after deinit" {
+    const allocator = std.testing.allocator;
+
+    var client = HttpClient.init(allocator, std.testing.io, 1, 500);
+    client.deinit();
+    // No shared client was ever created; a second deinit must not touch the
+    // (already freed) pool or the null pointer again.
+    client.deinit();
+
+    var req = HttpClient.HttpRequest.init(allocator, "GET", "http://127.0.0.1:1/probe");
+    defer req.deinit();
+
+    try std.testing.expectError(error.HttpClientClosed, client.request(req));
+
+    const Sink = struct {
+        fn onChunk(_: *anyopaque, _: []const u8) anyerror!void {}
+    };
+    try std.testing.expectError(error.HttpClientClosed, client.requestStream(req, undefined, Sink.onChunk));
+}
+
+// Plain HTTP keeps using this struct's own `ConnectionPool` (behaviour
+// unchanged) and must not create the HTTPS client on the way.
+test "plain HTTP reuses one keep-alive connection and builds no HTTPS client" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var listener = try probeListener();
+    defer listener.deinit(std.testing.io);
+    const port = listener.socket.address.getPort();
+
+    var server = PoolProbeServer{
+        .listener = &listener,
+        .payload = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK",
+    };
+    const th = try std.Thread.spawn(.{}, PoolProbeServer.run, .{&server});
+    defer th.join();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/probe", .{port});
+
+    var client = HttpClient.init(allocator, std.testing.io, 1, 2000);
+    defer client.deinit();
+
+    for (0..3) |_| {
+        var req = HttpClient.HttpRequest.init(allocator, "GET", url);
+        defer req.deinit();
+        var resp = try client.request(req);
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+        try std.testing.expectEqualStrings("OK", resp.body);
+    }
+
+    // Three requests, one socket. `acquire` only dials when no idle connection
+    // matches, so the pool's own per-connection counter is the reading that
+    // says the same socket served all three (a re-dial would have restarted
+    // the counter at 1).
+    try std.testing.expectEqual(@as(usize, 1), client.connection_pool.idle_connections.items.len);
+    try std.testing.expectEqual(@as(u64, 3), client.connection_pool.idle_connections.items[0].request_count);
+    try std.testing.expectEqual(@as(usize, 0), client.connection_pool.active_connections.items.len);
+    // The plain path never touches the HTTPS client.
+    try std.testing.expectEqual(@as(u32, 0), client.https_clients_created);
+}
+
+// The retry path relies on `discardIdleConnections` dropping exactly one
+// target's idle connections: the next request to that target then has nothing
+// to reuse and must dial again, while other targets keep their pooled socket.
+test "HttpClient drops idle connections for one target only" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var listener_a = try probeListener();
+    defer listener_a.deinit(std.testing.io);
+    const port_a = listener_a.socket.address.getPort();
+    var listener_b = try probeListener();
+    defer listener_b.deinit(std.testing.io);
+    const port_b = listener_b.socket.address.getPort();
+
+    const payload = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+    var server_a = PoolProbeServer{ .listener = &listener_a, .payload = payload };
+    var server_b = PoolProbeServer{ .listener = &listener_b, .payload = payload };
+    const th_a = try std.Thread.spawn(.{}, PoolProbeServer.run, .{&server_a});
+    defer th_a.join();
+    const th_b = try std.Thread.spawn(.{}, PoolProbeServer.run, .{&server_b});
+    defer th_b.join();
+
+    var url_a_buf: [128]u8 = undefined;
+    const url_a = try std.fmt.bufPrint(&url_a_buf, "http://127.0.0.1:{d}/probe", .{port_a});
+    var url_b_buf: [128]u8 = undefined;
+    const url_b = try std.fmt.bufPrint(&url_b_buf, "http://127.0.0.1:{d}/probe", .{port_b});
+
+    var client: std.http.Client = .{ .allocator = allocator, .io = std.testing.io };
+    defer client.deinit();
+
+    try probeFetch(&client, url_a);
+    try probeFetch(&client, url_b);
+    const free = &client.connection_pool.free_len;
+    try std.testing.expectEqual(@as(usize, 2), free.*);
+
+    // Other host, same port: nothing matches, nothing is closed.
+    HttpClient.discardIdleConnections(&client, "localhost", port_a, .plain);
+    try std.testing.expectEqual(@as(usize, 2), free.*);
+
+    // Wrong port for that host: still nothing.
+    HttpClient.discardIdleConnections(&client, "127.0.0.1", port_b +% 1, .plain);
+    try std.testing.expectEqual(@as(usize, 2), free.*);
+
+    HttpClient.discardIdleConnections(&client, "127.0.0.1", port_a, .plain);
+    try std.testing.expectEqual(@as(usize, 1), free.*);
+    // Idempotent: the second call finds nothing left to close.
+    HttpClient.discardIdleConnections(&client, "127.0.0.1", port_a, .plain);
+    try std.testing.expectEqual(@as(usize, 1), free.*);
+
+    // A is gone from the pool, so this request has nothing to reuse: it must
+    // dial again, and its new connection lands next to B's.
+    try probeFetch(&client, url_a);
+    try std.testing.expectEqual(@as(usize, 2), free.*);
+
+    // B never lost its pooled connection — pruning A left it alone.
+    try probeFetch(&client, url_b);
+    try std.testing.expectEqual(@as(usize, 2), free.*);
+}
+
+// A peer that closes an *idle keep-alive* connection is the failure mode the
+// retry loop has to survive: the pooled socket is dead, so the request on it
+// fails. Whatever std does with that connection on the way out, the next
+// request must not be handed it again — that is what the prune buys, and the
+// final fetch proves a usable connection either way.
+test "HttpClient retries a dead pooled connection on a fresh one" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var listener = try probeListener();
+    defer listener.deinit(std.testing.io);
+    const port = listener.socket.address.getPort();
+
+    var server = PoolProbeServer{
+        .listener = &listener,
+        .payload = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK",
+        .abort_after_reply = true,
+    };
+    const th = try std.Thread.spawn(.{}, PoolProbeServer.run, .{&server});
+    defer th.join();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/probe", .{port});
+
+    var client: std.http.Client = .{ .allocator = allocator, .io = std.testing.io };
+    defer client.deinit();
+
+    // First request succeeded, and its connection was pooled even though the
+    // peer has already closed it.
+    try probeFetch(&client, url);
+    try std.testing.expectEqual(@as(usize, 1), client.connection_pool.free_len);
+
+    // The second request reuses that dead socket and must fail. (Which error
+    // depends on how the close races the write — observed on macOS:
+    // `HttpConnectionClosing` for a clean close, `WriteFailed` for an abortive
+    // one. `WriteFailed` is also the case where std leaves the connection in
+    // the pool, which is why the prune below is not optional.)
+    const second = probeFetch(&client, url);
+    if (second) |_| return error.TestUnexpectedResult else |_| {}
+
+    // Retry shaping: drop the target's idle connections so the retry cannot
+    // pick the connection that just failed, then the request must succeed on a
+    // freshly dialed one.
+    HttpClient.discardIdleConnections(&client, "127.0.0.1", port, .plain);
+    try std.testing.expectEqual(@as(usize, 0), client.connection_pool.free_len);
+    try probeFetch(&client, url);
+    try std.testing.expectEqual(@as(usize, 1), client.connection_pool.free_len);
+}
+
+// Why the streaming path closes its connection on an aborted body: std's
+// `Request.deinit` *drains* whatever is left of a response before pooling the
+// connection. Against a peer that keeps streaming (an SSE/LLM body with no
+// final chunk) that drain is a block on a body that may never end, and a
+// partially consumed stream is not a position the next request may resume
+// from. Marking the connection `closing` skips the drain and destroys it —
+// the same two lines the `errdefer` in `executeHttpsStream` executes.
+test "std.http.Client drains and re-pools a half-read body unless it is closing" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var listener = try probeListener();
+    defer listener.deinit(std.testing.io);
+    const port = listener.socket.address.getPort();
+
+    var server = PoolProbeServer{
+        .listener = &listener,
+        // 100 body bytes, as the Content-Length promises.
+        .payload = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n" ++
+            "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789",
+    };
+    const th = try std.Thread.spawn(.{}, PoolProbeServer.run, .{&server});
+    defer th.join();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/long", .{port});
+    const uri = try std.Uri.parse(url);
+
+    var client: std.http.Client = .{ .allocator = allocator, .io = std.testing.io };
+    defer client.deinit();
+
+    const consumeFourBytes = struct {
+        fn run(c: *std.http.Client, req_uri: std.Uri) !void {
+            var req = try c.request(.GET, req_uri, .{});
+            defer req.deinit();
+            try req.sendBodiless();
+            var resp = try req.receiveHead(&.{});
+            var transfer_buf: [4096]u8 = undefined;
+            const body = resp.reader(&transfer_buf);
+            var small: [4]u8 = undefined;
+            try std.testing.expectEqual(@as(usize, 4), try body.readSliceShort(&small));
+        }
+    };
+
+    // (a) The caller emptied 4 of the 100 bytes; std reads the other 96 before
+    // pooling, and the connection comes back for the next request.
+    try consumeFourBytes.run(&client, uri);
+    try std.testing.expectEqual(@as(usize, 1), client.connection_pool.free_len);
+
+    // (b) Same shape, but the connection is marked closing first (what the
+    // `errdefer` does): no drain, no pooling — the socket is closed instead.
+    {
+        var req = try client.request(.GET, uri, .{});
+        defer req.deinit();
+        try req.sendBodiless();
+        var resp = try req.receiveHead(&.{});
+        var transfer_buf: [4096]u8 = undefined;
+        const body = resp.reader(&transfer_buf);
+        var small: [4]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 4), try body.readSliceShort(&small));
+        req.connection.?.closing = true;
+    }
+    try std.testing.expectEqual(@as(usize, 0), client.connection_pool.free_len);
+
+    // The pool is empty, so this is another fresh dial and the server is still
+    // serving: the abort did not wedge anything.
+    try probeFetch(&client, url);
+    try std.testing.expectEqual(@as(usize, 1), client.connection_pool.free_len);
 }
