@@ -91,9 +91,10 @@ pub const X402Store = struct {
     /// SQLite answers from the schema itself (`PRAGMA table_info`) — a list of
     /// the real names, so the answer cannot be confused with a failing
     /// connection. PG and MySQL have no `PRAGMA`; the catalogue view
-    /// `information_schema.columns` is the portable equivalent (names compared
+    /// `information_schema.columns` is the portable equivalent, built by
+    /// `sqlx.catalogColumnProbe`, which pins it to a schema and compares names
     /// case-insensitively: PG folds an unquoted identifier to lower case, MySQL
-    /// stores `table_name` as the OS created it).
+    /// stores `table_name` as the OS created it.
     ///
     /// Errors are returned, never read as "no such column": a probe that failed
     /// because the database is unreachable must not be answered by running DDL
@@ -122,27 +123,24 @@ pub const X402Store = struct {
                 }
                 return false;
             },
-            // `table` may be schema-qualified (`sqlx.validateIdentifier` allows
-            // the dot); only the bare name is compared, and the catalogue is
-            // searched by name rather than narrowed to the current schema. A
-            // same-named table elsewhere could therefore make this answer
-            // "present" too readily — which skips the ALTER, and the failure
-            // then lands on the first statement that names `payer_did` (loudly),
-            // never as a row that is silently left unbound.
-            .postgres, .mysql => {
-                const bare = if (std.mem.lastIndexOfScalar(u8, self.table, '.')) |dot|
-                    self.table[dot + 1 ..]
-                else
-                    self.table;
-                const probe = "SELECT 1 FROM information_schema.columns WHERE LOWER(table_name) = LOWER(?) AND LOWER(column_name) = LOWER(?)";
-                var cursor = try self.backend.client.queryCursorEx(probe, &.{
-                    .{ .string = bare },
-                    .{ .string = column },
-                }, .{});
-                defer cursor.deinit();
-                return cursor.next() != null;
-            },
+            .postgres => return self.catalogHasColumn(.postgres, column),
+            .mysql => return self.catalogHasColumn(.mysql, column),
         }
+    }
+
+    /// The catalogue arm of `hasColumn`.
+    ///
+    /// `information_schema.columns` is server-wide, so the statement
+    /// `sqlx.catalogColumnProbe` builds carries the schema predicate that keeps
+    /// a same-named table in another schema from answering "the column is
+    /// there" — which would skip the ALTER this table needs. `table` may be
+    /// schema-qualified (`sqlx.validateIdentifier` allows the dot); the probe
+    /// then searches that schema, otherwise the one `migrate`'s DDL lands in.
+    fn catalogHasColumn(self: *Self, dialect: sqlx.CatalogDialect, column: []const u8) !bool {
+        const probe = sqlx.catalogColumnProbe(dialect, self.table, column);
+        var cursor = try self.backend.client.queryCursorEx(probe.sql, probe.bindArgs(), .{});
+        defer cursor.deinit();
+        return cursor.next() != null;
     }
 
     /// Insert a pending invoice, bound to `payer_did` when the caller knows who

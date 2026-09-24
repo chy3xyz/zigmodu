@@ -2,6 +2,75 @@
 
 ## [Unreleased]
 
+### 第 7 批：plain 池不再交出死连接、常驻 HTTPS client 的证书时钟重挂、Otlp/Secrets 常驻 client、sqlx Builder 不再静默丢子句、catalog 查询按 schema 限定（**破坏性：否**）
+
+全量 `-Ddb=all` **1731/1755（24 skipped，0 failed）**（第 6 批 1721/1745 → +10 用例）。
+
+**plain-HTTP 池会把死连接交出去（真红，已修）**。`executeRequest` 原本在返回前无条件 `release`，而
+`release` 只看 `isAlive()`（对 `last_used` 的 30 s 窗口）——对端在应答后关掉的连接**不是**"不 alive"，
+于是它回到 idle 又被下个请求领走。新用例（loopback：服务一次后关闭）红证据：
+`round 1: WriteFailed — 1 idle connection(s) in the pool, 0 active`，四次重试**全**打在同一条尸体上。
+修法照 HTTPS 那条路：新增 `ConnectionPool.discard`（关 socket 并从 active 列表摘除，不再入池）与
+`removeActiveLocked`（`release` 与 `discard` 共用），失败路径 `errdefer … discard`、成功路径才
+`release`（`executeRequest` 与 `executeRequestStream` 各一处）。
+
+> **残留（有意不修）**：对端在**成功应答之后**才关连接时，仍可能有**一次**失败（重试循环吸收掉，
+> 池随后自愈）。修复前是"此后每一次都失败"。要彻底消掉得做整个 target 的剪枝（HTTPS 路径那样），
+> 那需要另一轮实验。`isAlive()` 本身仍是启发式，不是存活证明。
+
+**常驻 HTTPS client 冻结了它的时钟（随之修掉）**。上一批把 `std.http.Client` 变成了常驻对象，而 std 的
+`Client.now` 在 init 时取值、**只读一次**并作为 `.realtime_now` 交给 TLS 做证书有效期判定
+（`crypto/tls/Client.zig` → `chain.verify`）。后果：跑久了会用一个陈旧的"现在"判定 —— 一小时前刚过期的
+证书可能被放行。一次性实验（真实出站 HTTPS，非仓库用例）：把 `client.now` 钉到 2010-01-01 后**每次**请求
+都 `TlsInitializationFailed`，置 `now = null` 后立刻 200 且 std 自己重新取了值 —— 所以 std 的官方开关就是
+`now = null`，**不需要重建 client**。落地：`https_clock_max_skew_seconds = 300`（偏离真实时钟超此值才重挂，
+即最多每 300 s 流量触发一次 CA bundle 重扫），且重挂只在 `https_inflight == 0` 时做 —— std 是在自己的
+CA 锁**之外**读 `now` 的（它源码里就留着 `TODO data race …`），所以必须保证没有在飞请求。用例钉住：界内不动、
+越界（两个方向）清空、client 仍只有 1 个、真实请求后 std 自行重新武装。池化的 TLS 连接与
+`https_clients_created == 1` 都不受影响。
+
+**`OtlpExporter` / `SecretsManager` 改为长生命周期 `HttpClient`**。这两处此前**每次调用**都
+`HttpClient.init` + `deinit`，拿不到任何连接复用（HTTPS 每次重握手）。现在各自持有一个懒创建的常驻
+client（单次原子发布：`load(.acquire)` 快路径、`cmpxchgStrong` 慢路径，败者丢弃自己那份——`HttpClient.init`
+不分配任何东西，所以丢弃不掉连接也不掉字节），在各自的 `deinit` 释放。红证据（loopback 探针按 TCP accept
+计数）：修复前 3 次 export → **3** 次 accept、3 次 Vault 读 → **3** 次 accept；修复后各 **1** 次，并直接断言
+`idle_connections.items.len == 1 && items[0].request_count == 3`（重拨会把计数重置为 1）。另外做了两次
+"守卫确实会咬人"的变异检查：把 `SecretsManager.deinit` 的拆卸换成只 swap 不 deinit → SafeAllocator 报
+`leaked 176 bytes`；在 cmpxchg 败者分支插探针 → 一共命中 14 次（证明竞态分支真的被执行，探针已移除）。
+
+> **行为面变化**：`max_connections = 2` 的口径从"每次调用的 2 条"变成"每个组件实例的 2 条"——同一实例上
+> 超过 2 个并发的 plain-HTTP export / Vault 读可能拿到 `error.PoolExhausted`（HTTPS 不走这个池）。
+> **契约**：两个 `deinit` 都**不得与在飞请求并发**（`deinit` 没有 `io` 可用于等待，加引用计数得改公开签名），
+> 已写进两处文档注释。`https://` 的 **TLS 连接复用仍未经 loopback 实测**（自签对端不在系统信任库里）。
+
+**sqlx `Builder` 的链式方法不再静默丢子句**。`where` 等六个链式方法会把实参复制一份，复制失败时错误**无处
+可去**——于是 builder 照常输出**少了那个子句**的语句。对 `WHERE` 来说这不是少个括号，是查询被悄悄放宽。
+红证据（一次性失败分配器）：期望 `SELECT * FROM users WHERE tenant_id = ?1 ORDER BY id DESC`，
+实际 `SELECT * FROM users ORDER BY id DESC`。
+
+> **实现选择（与最初设想不同，记录一下理由）**：没有改成返回错误联合（那会让
+> `_ = b.where(…)` 直接编译不过，**下游每一处调用点都得改**，并且把 fluent 链打断成 `_ = try …` 一串），
+> 而是把错误**latch** 在 builder 上、由 `toSql` 返回。`toSql` 本来就是 `![]u8`，是每个调用点都必须经过的
+> 唯一装配口，所以"少了子句的语句被发出去"这条路依然不存在 —— 而源码保持兼容。链失败时**不**改动 builder
+> 状态（`appendClause` 先复制再改列表，`replaceClause` 同理），所以失败调用不留下半个子句。
+> 顺带：`Builder.select` 把 OOM 伪装成 `error.DatabaseError`，改为直接抛出 —— 它同时也是 OOM 扫描看不到
+> 这条路径的原因。新增两条用例（一次性失败分配器逐个分配点 + `checkAllAllocationFailures` 全链扫描）。
+
+**catalog 列探测不再跨 schema 命中**。`information_schema.columns` 的查询此前**不带任何 schema 谓词**，
+同名表在别的 schema 里存在就会答"这列存在"，而且显式写成 `schema.table` 时 schema 被**丢掉**。现在收敛到
+`src/sqlx/sqlx.zig` 的可复用 `catalogColumnProbe(dialect, table, column)`（新 `CatalogDialect` /
+`CatalogColumnProbe`）：PG 用 `table_schema = current_schema()`、MySQL 用 `table_schema = DATABASE()`；
+写成 `billing.orders` 时改为 `LOWER(table_schema) = LOWER(?)` 并把 schema 作为**绑定参数**（不是拼进文本）。
+`src/web4/x402_store.zig` 的迁移探测改调这个 helper。
+
+> **未验证**：没有可达的 PG/MySQL 服务器，所以**服务端行为没有实测**——用例只断言生成的语句与绑定参数的
+> 顺序/个数。真机覆盖（`ZIGMODU_TEST_PG=1` / `DB=mysql` 门控的 `probeCatalogColumn`）在本地是 skipped。
+
+**删除 `ConnPool.reconnect` 与其两个只服务它的字段**（`max_reconnect_attempts` / `reconnect_delay_ms`）。
+它开连接时**不更新 `active` 计数**（其他所有开路都更新），且**无任何调用点**（`zmodu deadcode` 也把它标为
+dead 并已在基线里）——缺陷真实但不可达，所以删掉而不是给它补账。`check-deadcode.sh` 报
+`3 dead declaration(s) removed`。
+
 ### 第 6 批：HTTPS 池化、x402 发票绑定付款人、CSRF 签名与代理头信任收紧、flate 压缩中间件（**破坏性：是**，两处）
 
 全量 `-Ddb=all` **1721/1745（24 skipped，0 failed）**（基线 1693/1715 → +28 用例，新增 2 条 PG/MySQL 门控 skip）。

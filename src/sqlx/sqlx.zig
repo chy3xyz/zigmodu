@@ -766,6 +766,61 @@ pub fn diagnoseMysql(err_no: c_uint, err_msg: []const u8) SqlDiagnostic {
     return diag;
 }
 
+/// The dialects that answer "does this column exist?" from the catalogue view
+/// `information_schema.columns`. SQLite has no such view — it answers from
+/// `PRAGMA table_info`, which is already local to the database file.
+pub const CatalogDialect = enum { postgres, mysql };
+
+/// A column-existence probe: the statement, plus the arguments it binds.
+///
+/// `information_schema.columns` is **server-wide** — every schema of the
+/// current database on PostgreSQL, every database on the server on MySQL — so a
+/// lookup that names only `table_name` lets a same-named table somewhere else
+/// answer for this one. The callers of such a lookup are startup migrations
+/// deciding whether to run `ALTER TABLE … ADD COLUMN`, where a wrong "yes" skips
+/// the DDL the real table needs and nothing says so until a later statement
+/// names the missing column.
+pub const CatalogColumnProbe = struct {
+    /// The statement, with `?` placeholders in `bindArgs()` order.
+    sql: []const u8,
+    /// The schema (only when `table` named one), the bare table name, the
+    /// column. The unused tail is `.null` and is never bound.
+    args: [3]Value,
+    arg_count: usize,
+
+    pub fn bindArgs(self: *const CatalogColumnProbe) []const Value {
+        return self.args[0..self.arg_count];
+    }
+};
+
+const catalog_column_probe_named_schema = "SELECT 1 FROM information_schema.columns WHERE LOWER(table_schema) = LOWER(?) AND LOWER(table_name) = LOWER(?) AND LOWER(column_name) = LOWER(?)";
+const catalog_column_probe_postgres = "SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND LOWER(table_name) = LOWER(?) AND LOWER(column_name) = LOWER(?)";
+const catalog_column_probe_mysql = "SELECT 1 FROM information_schema.columns WHERE table_schema = DATABASE() AND LOWER(table_name) = LOWER(?) AND LOWER(column_name) = LOWER(?)";
+
+/// Build the probe for `table` / `column` on `dialect`.
+///
+/// The schema predicate is the point. It is the schema `table` names when it is
+/// qualified (`billing.orders`), otherwise the schema the connection is on —
+/// `current_schema()` on PostgreSQL, `DATABASE()` on MySQL, both of which are
+/// what an unqualified `ALTER TABLE` resolves against. Names are compared
+/// case-insensitively: PG folds an unquoted identifier to lower case, MySQL
+/// stores `table_name` as the OS created it.
+pub fn catalogColumnProbe(dialect: CatalogDialect, table: []const u8, column: []const u8) CatalogColumnProbe {
+    const schema: ?[]const u8 = if (std.mem.lastIndexOfScalar(u8, table, '.')) |dot| table[0..dot] else null;
+    const bare = if (schema) |s| table[s.len + 1 ..] else table;
+
+    const sql = if (schema != null) catalog_column_probe_named_schema else switch (dialect) {
+        .postgres => catalog_column_probe_postgres,
+        .mysql => catalog_column_probe_mysql,
+    };
+    const args: [3]Value = if (schema) |s|
+        .{ .{ .string = s }, .{ .string = bare }, .{ .string = column } }
+    else
+        .{ .{ .string = bare }, .{ .string = column }, .null };
+
+    return .{ .sql = sql, .args = args, .arg_count = if (schema != null) 3 else 2 };
+}
+
 /// SQL connection interface
 pub const Conn = struct {
     ptr: *anyopaque,
@@ -4020,8 +4075,6 @@ const ConnPool = struct {
     max_wait_ms: u32,
     max_lifetime_ms: u64,
     max_idle_time_ms: u64,
-    max_reconnect_attempts: u32 = 3,
-    reconnect_delay_ms: u32 = 100,
     active: std.atomic.Value(u32),
     idle: std.ArrayList(PooledEntry),
     waiters: std.ArrayList(*Waiter),
@@ -4075,22 +4128,6 @@ const ConnPool = struct {
         }
         self.idle.deinit(self.allocator);
         self.waiters.deinit(self.allocator);
-    }
-
-    /// Reconnect and add a new idle connection to the pool
-    fn reconnect(self: *ConnPool) !void {
-        var conn = self.client.newConn() catch return;
-        const now = Time.monotonicNowMilliseconds();
-        conn.created_at_ms = now;
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        self.idle.append(self.allocator, .{
-            .conn = conn,
-            .created_at_ms = now,
-            .idle_since_ms = now,
-        }) catch {
-            conn.close();
-        };
     }
 
     pub fn acquire(self: *ConnPool) !Conn {
@@ -6087,6 +6124,17 @@ pub const CachedConn = struct {
 /// interpolating unguarded while `Client`/`Transaction`/`CachedConn` validated
 /// the identical inputs. Consequence: `selectColumns` takes plain columns — an
 /// expression such as `COUNT(*) AS n` is rejected rather than interpolated.
+///
+/// The chain methods (`selectColumns`, `join`, `where`, `groupBy`, `having`,
+/// `orderBy`) stay infallible *at the call site* and keep returning `*Builder`,
+/// so the fluent chain is unchanged, but each one stores an owned copy of its
+/// argument and a copy that fails is no longer dropped on the floor: the failure
+/// is **latched** on the builder and `toSql` returns it. Emitting the statement
+/// *without* the clause is what made this a correctness bug rather than a
+/// cosmetic loss — a dropped `WHERE` is a silently widened query, so the
+/// allocation failure has to reach the caller, and `toSql` (already `![]u8`) is
+/// the one point every caller must pass through. `limit` and `offset` cannot
+/// fail and have nothing to latch.
 pub const Builder = struct {
     allocator: std.mem.Allocator,
     table: []const u8,
@@ -6098,6 +6146,11 @@ pub const Builder = struct {
     order_by_clause: ?[]const u8 = null,
     limit_val: ?usize = null,
     offset_val: ?usize = null,
+    /// First allocation failure seen by a chain method. Latched rather than
+    /// dropped; `toSql` returns it. Once set it stays set — the statement this
+    /// builder would emit is already wrong, so later successful calls cannot
+    /// make it right again.
+    pending_error: ?std.mem.Allocator.Error = null,
 
     pub fn init(allocator: std.mem.Allocator, table: []const u8) Builder {
         return .{
@@ -6153,65 +6206,69 @@ pub const Builder = struct {
         self.* = undefined;
     }
 
+    /// Latch an allocation failure instead of dropping the clause. See
+    /// `pending_error`: `toSql` is what turns this back into an error.
+    fn latch(self: *Builder, err: std.mem.Allocator.Error) void {
+        if (self.pending_error == null) self.pending_error = err;
+    }
+
     pub fn selectColumns(self: *Builder, columns: []const []const u8) *Builder {
+        const owned = self.allocator.dupe([]const u8, columns) catch |err| {
+            self.latch(err);
+            return self;
+        };
         if (self.select_columns) |cols| self.allocator.free(cols);
-        self.select_columns = self.allocator.dupe([]const u8, columns) catch null;
+        self.select_columns = owned;
         return self;
     }
 
-    pub fn join(self: *Builder, clause: []const u8) *Builder {
-        const new_clause = self.allocator.dupe(u8, clause) catch return self;
-        if (self.join_clauses) |joins| {
-            const new_j = self.allocator.realloc(joins, joins.len + 1) catch {
-                self.allocator.free(new_clause);
-                return self;
-            };
-            new_j[new_j.len - 1] = new_clause;
-            self.join_clauses = new_j;
+    /// Append an owned copy of `clause` to a clause list. The copy is made
+    /// before the list is touched, so a failed call leaves the builder exactly
+    /// as the caller left it.
+    fn appendClause(self: *Builder, list: *?[][]const u8, clause: []const u8) std.mem.Allocator.Error!void {
+        const owned = try self.allocator.dupe(u8, clause);
+        errdefer self.allocator.free(owned);
+        if (list.*) |clauses| {
+            const grown = try self.allocator.realloc(clauses, clauses.len + 1);
+            grown[grown.len - 1] = owned;
+            list.* = grown;
         } else {
-            self.join_clauses = self.allocator.alloc([]const u8, 1) catch {
-                self.allocator.free(new_clause);
-                return self;
-            };
-            self.join_clauses.?[0] = new_clause;
+            const fresh = try self.allocator.alloc([]const u8, 1);
+            fresh[0] = owned;
+            list.* = fresh;
         }
+    }
+
+    /// `appendClause` for the slots that hold one clause: a later call replaces
+    /// the earlier one rather than adding to it.
+    fn replaceClause(self: *Builder, slot: *?[]const u8, clause: []const u8) std.mem.Allocator.Error!void {
+        const owned = try self.allocator.dupe(u8, clause);
+        if (slot.*) |previous| self.allocator.free(previous);
+        slot.* = owned;
+    }
+
+    pub fn join(self: *Builder, clause: []const u8) *Builder {
+        self.appendClause(&self.join_clauses, clause) catch |err| self.latch(err);
         return self;
     }
 
     pub fn where(self: *Builder, clause: []const u8) *Builder {
-        const new_clause = self.allocator.dupe(u8, clause) catch return self;
-        if (self.where_clauses) |wheres| {
-            const new_w = self.allocator.realloc(wheres, wheres.len + 1) catch {
-                self.allocator.free(new_clause);
-                return self;
-            };
-            new_w[new_w.len - 1] = new_clause;
-            self.where_clauses = new_w;
-        } else {
-            self.where_clauses = self.allocator.alloc([]const u8, 1) catch {
-                self.allocator.free(new_clause);
-                return self;
-            };
-            self.where_clauses.?[0] = new_clause;
-        }
+        self.appendClause(&self.where_clauses, clause) catch |err| self.latch(err);
         return self;
     }
 
     pub fn groupBy(self: *Builder, clause: []const u8) *Builder {
-        if (self.group_by_clause) |g| self.allocator.free(g);
-        self.group_by_clause = self.allocator.dupe(u8, clause) catch null;
+        self.replaceClause(&self.group_by_clause, clause) catch |err| self.latch(err);
         return self;
     }
 
     pub fn having(self: *Builder, clause: []const u8) *Builder {
-        if (self.having_clause) |h| self.allocator.free(h);
-        self.having_clause = self.allocator.dupe(u8, clause) catch null;
+        self.replaceClause(&self.having_clause, clause) catch |err| self.latch(err);
         return self;
     }
 
     pub fn orderBy(self: *Builder, clause: []const u8) *Builder {
-        if (self.order_by_clause) |o| self.allocator.free(o);
-        self.order_by_clause = self.allocator.dupe(u8, clause) catch null;
+        self.replaceClause(&self.order_by_clause, clause) catch |err| self.latch(err);
         return self;
     }
 
@@ -6226,6 +6283,9 @@ pub const Builder = struct {
     }
 
     pub fn toSql(self: *const Builder) ![]u8 {
+        // A latched chain failure means a clause is missing from the statement
+        // this would emit, so the caller gets the error instead of the SQL.
+        if (self.pending_error) |err| return err;
         try self.checkNames(self.select_columns orelse &.{});
         try self.checkClauses();
         var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
@@ -6281,7 +6341,9 @@ pub const Builder = struct {
 
     pub fn select(self: *const Builder, columns: []const []const u8) ![]u8 {
         var b = Builder.init(self.allocator, self.table);
-        b.select_columns = self.allocator.dupe([]const u8, columns) catch return error.DatabaseError;
+        // `dupe`'s failure is an allocation failure, not a database one — and
+        // labelling it `error.DatabaseError` also hid it from the OOM scans.
+        b.select_columns = try self.allocator.dupe([]const u8, columns);
         defer b.deinit();
         return b.toSql();
     }
@@ -6677,6 +6739,43 @@ test "validateSqlStatement allows full SELECT but bans literals/comments" {
     try std.testing.expectError(error.UnsafeSqlFragment, validateSqlStatement("SELECT `pw` FROM users"));
 }
 
+// `information_schema.columns` spans every schema (PG) / every database (MySQL)
+// the server can see, so the `table_schema` predicate is what keeps a
+// same-named table elsewhere from answering for this one. **No server is
+// reachable from this test**: what is asserted is the generated statement and
+// its arguments — that each shape carries a schema predicate, and that the
+// binds line up with the placeholders. The end-to-end behaviour against PG and
+// MySQL is covered by the real-server tests behind `ZIGMODU_TEST_PG` / `DB=mysql`
+// (`web4.X402Store`), which do not run here.
+test "catalogColumnProbe scopes the lookup to a schema" {
+    const pg = catalogColumnProbe(.postgres, "orders", "payer_did");
+    try std.testing.expect(std.mem.indexOf(u8, pg.sql, "information_schema.columns") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pg.sql, "table_schema = current_schema()") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, pg.sql, "?"));
+    try std.testing.expectEqual(@as(usize, 2), pg.bindArgs().len);
+    try std.testing.expectEqualStrings("orders", pg.bindArgs()[0].string);
+    try std.testing.expectEqualStrings("payer_did", pg.bindArgs()[1].string);
+
+    const my = catalogColumnProbe(.mysql, "orders", "payer_did");
+    try std.testing.expect(std.mem.indexOf(u8, my.sql, "table_schema = DATABASE()") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, my.sql, "?"));
+    try std.testing.expectEqual(@as(usize, 2), my.bindArgs().len);
+    try std.testing.expectEqualStrings("orders", my.bindArgs()[0].string);
+    try std.testing.expectEqualStrings("payer_did", my.bindArgs()[1].string);
+
+    // A qualified table names its own schema; the connection's schema is not
+    // consulted, and the schema travels as a bind rather than as SQL text.
+    for ([_]CatalogDialect{ .postgres, .mysql }) |dialect| {
+        const qualified = catalogColumnProbe(dialect, "billing.orders", "payer_did");
+        try std.testing.expect(std.mem.indexOf(u8, qualified.sql, "LOWER(table_schema) = LOWER(?)") != null);
+        try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, qualified.sql, "?"));
+        try std.testing.expectEqual(@as(usize, 3), qualified.bindArgs().len);
+        try std.testing.expectEqualStrings("billing", qualified.bindArgs()[0].string);
+        try std.testing.expectEqualStrings("orders", qualified.bindArgs()[1].string);
+        try std.testing.expectEqualStrings("payer_did", qualified.bindArgs()[2].string);
+    }
+}
+
 test "cached conn findOne" {
     const allocator = std.testing.allocator;
     var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
@@ -6768,13 +6867,15 @@ test "sqlx builder chainable" {
     var b = Builder.init(allocator, "users");
     defer b.deinit();
 
-    const sql = try b.selectColumns(&.{ "id", "name" })
-        .where("id = ?1")
-        .where("name = ?2")
-        .orderBy("id DESC")
-        .limit(10)
-        .offset(20)
-        .toSql();
+    // The clause links are fallible, so they are handled one by one; the
+    // infallible tail (`limit` / `offset`) still chains.
+    _ = b.selectColumns(&.{ "id", "name" });
+    _ = b.where("id = ?1");
+    _ = b.where("name = ?2");
+    _ = b.orderBy("id DESC");
+    _ = b.limit(10).offset(20);
+
+    const sql = try b.toSql();
     defer allocator.free(sql);
 
     try std.testing.expectEqualStrings("SELECT id, name FROM users WHERE id = ?1 AND name = ?2 ORDER BY id DESC LIMIT 10 OFFSET 20", sql);
@@ -6785,14 +6886,15 @@ test "sqlx builder join group by having" {
     var b = Builder.init(allocator, "users");
     defer b.deinit();
 
-    const sql = try b.selectColumns(&.{ "users.id", "users.name" })
-        .join("INNER JOIN orders ON orders.user_id = users.id")
-        .where("users.id = ?1")
-        .groupBy("users.id")
-        .having("COUNT(orders.id) > ?2")
-        .orderBy("users.id DESC")
-        .limit(10)
-        .toSql();
+    _ = b.selectColumns(&.{ "users.id", "users.name" });
+    _ = b.join("INNER JOIN orders ON orders.user_id = users.id");
+    _ = b.where("users.id = ?1");
+    _ = b.groupBy("users.id");
+    _ = b.having("COUNT(orders.id) > ?2");
+    _ = b.orderBy("users.id DESC");
+    _ = b.limit(10);
+
+    const sql = try b.toSql();
     defer allocator.free(sql);
 
     try std.testing.expectEqualStrings(
@@ -6873,6 +6975,38 @@ test "sqlx builder toSql survives every allocation point failing (OOM scan)" {
     });
 }
 
+// The same statement, built through the public chain instead of by writing the
+// fields: a failure at any link must surface (the scan fails with
+// `SwallowedOutOfMemoryError` if one is ignored) and every clause already
+// stored must still be released by `deinit` (`MemoryLeakDetected` if it is not).
+test "sqlx builder chain survives every allocation point failing (OOM scan)" {
+    const allocator = std.testing.allocator;
+
+    const Scan = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var b = Builder.init(alloc, "users");
+            defer b.deinit();
+
+            _ = b.selectColumns(&.{ "users.id", "users.name" });
+            _ = b.join("INNER JOIN orders ON orders.user_id = users.id");
+            _ = b.where("users.id = ?1");
+            _ = b.where("users.name = ?2");
+            _ = b.groupBy("users.id");
+            _ = b.having("COUNT(orders.id) > ?3");
+            _ = b.orderBy("users.id DESC");
+            _ = b.limit(10).offset(20);
+
+            const sql = try b.toSql();
+            defer alloc.free(sql);
+            try std.testing.expectEqualStrings(
+                "SELECT users.id, users.name FROM users INNER JOIN orders ON orders.user_id = users.id WHERE users.id = ?1 AND users.name = ?2 GROUP BY users.id HAVING COUNT(orders.id) > ?3 ORDER BY users.id DESC LIMIT 10 OFFSET 20",
+                sql,
+            );
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{});
+}
+
 /// `Builder.deinit` frees the clause list's strings as well as the list, so a
 /// half-filled list cannot be handed to the builder: every slot holds a valid
 /// (empty) slice before the first copy can fail. Zero-length frees are no-ops,
@@ -6915,32 +7049,138 @@ test "sqlx builder gates identifiers and clauses" {
     try expectSqlRejected(b.insert(&.{"name) VALUES (1); --"}), "InvalidSqlIdentifier");
     try expectSqlRejected(b.batchInsert(&.{"a\"=1"}, 2), "InvalidSqlIdentifier");
     try expectSqlRejected(b.update(&.{"a\"=1"}), "InvalidSqlIdentifier");
-    try expectSqlRejected(b.selectColumns(&.{"a\"=1"}).toSql(), "InvalidSqlIdentifier");
+    try expectSqlRejected((b.selectColumns(&.{"a\"=1"})).toSql(), "InvalidSqlIdentifier");
 
     // Clauses go through the fragment gate rather than the identifier one: a
     // statement separator is caught, while `id DESC` / `COUNT(x) > ?1` keep
     // building. A fresh builder per case — clauses accumulate.
     var bad_where = Builder.init(allocator, "users");
     defer bad_where.deinit();
-    try expectSqlRejected(bad_where.where("id = 1; DROP TABLE users").toSql(), "UnsafeSqlFragment");
+    try expectSqlRejected((bad_where.where("id = 1; DROP TABLE users")).toSql(), "UnsafeSqlFragment");
 
     var bad_order = Builder.init(allocator, "users");
     defer bad_order.deinit();
-    try expectSqlRejected(bad_order.orderBy("id; DROP TABLE users").toSql(), "UnsafeSqlFragment");
+    try expectSqlRejected((bad_order.orderBy("id; DROP TABLE users")).toSql(), "UnsafeSqlFragment");
 
     var ok = Builder.init(allocator, "users");
     defer ok.deinit();
-    const sql = try ok.selectColumns(&.{"users.id"})
-        .where("users.id = ?1")
-        .groupBy("users.id")
-        .having("COUNT(orders.id) > ?2")
-        .orderBy("users.id DESC")
-        .toSql();
+    _ = ok.selectColumns(&.{"users.id"});
+    _ = ok.where("users.id = ?1");
+    _ = ok.groupBy("users.id");
+    _ = ok.having("COUNT(orders.id) > ?2");
+    _ = ok.orderBy("users.id DESC");
+
+    const sql = try ok.toSql();
     defer allocator.free(sql);
     try std.testing.expectEqualStrings(
         "SELECT users.id FROM users WHERE users.id = ?1 GROUP BY users.id HAVING COUNT(orders.id) > ?2 ORDER BY users.id DESC",
         sql,
     );
+}
+
+/// Fails exactly one allocation — the `fail_at`-th `alloc`, then nothing else —
+/// and lets every later call through.
+///
+/// `std.testing.FailingAllocator` cannot show the bug this looks for: once it
+/// induces a failure, *every* later allocation fails too, so a chain that
+/// swallowed its own `error.OutOfMemory` looks innocent — the builder's own
+/// statement buffer then fails to allocate and the run ends in OOM anyway.
+/// Failing one point and carrying on is what makes "the clause is missing"
+/// distinguishable from "the failure was reported".
+const FailOnceAllocator = struct {
+    inner: std.mem.Allocator,
+    fail_at: usize,
+    calls: usize = 0,
+
+    fn init(inner: std.mem.Allocator, fail_at: usize) FailOnceAllocator {
+        return .{ .inner = inner, .fail_at = fail_at };
+    }
+
+    fn allocator(self: *FailOnceAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *FailOnceAllocator = @ptrCast(@alignCast(ctx));
+        const call = self.calls;
+        self.calls += 1;
+        if (call == self.fail_at) return null;
+        return self.inner.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *FailOnceAllocator = @ptrCast(@alignCast(ctx));
+        return self.inner.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *FailOnceAllocator = @ptrCast(@alignCast(ctx));
+        return self.inner.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *FailOnceAllocator = @ptrCast(@alignCast(ctx));
+        self.inner.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+// A chained clause is a *copy* of the caller's string, so recording it can
+// fail — and a builder that drops the copy on the floor still emits a
+// statement: one without the predicate. `tenant_id = ?1` missing from a
+// `WHERE` is not a cosmetic difference, it is every tenant's rows.
+//
+// Every allocation index the chain plus `toSql` performs is failed in turn;
+// either the statement comes back whole, or the failure is reported.
+test "sqlx builder never drops a chained clause when an allocation fails" {
+    const allocator = std.testing.allocator;
+
+    const Chain = struct {
+        const expected = "SELECT * FROM users WHERE tenant_id = ?1 ORDER BY id DESC";
+
+        fn run(alloc: std.mem.Allocator, fail_at: usize) ![]u8 {
+            var probe = FailOnceAllocator.init(alloc, fail_at);
+            var b = Builder.init(probe.allocator(), "users");
+            defer b.deinit();
+            _ = b.where("tenant_id = ?1");
+            _ = b.orderBy("id DESC");
+            return b.toSql();
+        }
+
+        fn allocationCount(alloc: std.mem.Allocator) !usize {
+            var probe = FailOnceAllocator.init(alloc, std.math.maxInt(usize));
+            var b = Builder.init(probe.allocator(), "users");
+            defer b.deinit();
+            _ = b.where("tenant_id = ?1");
+            _ = b.orderBy("id DESC");
+            const sql = try b.toSql();
+            alloc.free(sql);
+            return probe.calls;
+        }
+    };
+
+    const allocations = try Chain.allocationCount(allocator);
+    // The clause copy, the clause list, the order-by copy, the statement buffer.
+    try std.testing.expect(allocations >= 4);
+
+    for (0..allocations) |fail_at| {
+        if (Chain.run(allocator, fail_at)) |sql| {
+            defer allocator.free(sql);
+            try std.testing.expectEqualStrings(Chain.expected, sql);
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+    }
+
+    // Past the last allocation nothing is failed, so the whole statement — the
+    // clause included — is the answer again.
+    const whole = try Chain.run(allocator, allocations);
+    defer allocator.free(whole);
+    try std.testing.expectEqualStrings(Chain.expected, whole);
 }
 
 test "sqlite transaction commit" {

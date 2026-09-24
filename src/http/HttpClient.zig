@@ -5,6 +5,27 @@ const Time = @import("../core/Time.zig");
 pub const HttpClient = struct {
     const Self = @This();
 
+    /// How far the clock `std.http.Client` verifies certificates against may
+    /// drift before it is dropped and re-read.
+    ///
+    /// `std.http.Client.now` is the time used for certificate expiry
+    /// (`std/http/Client.zig`, `.realtime_now` handed to the TLS client), and
+    /// std captures it once — on that client's first HTTPS request. A client
+    /// kept alive for hours would then keep checking certificates against a
+    /// clock from hours ago, so a certificate that expired in the meantime
+    /// still verifies. Setting that field to `null` is std's documented way of
+    /// asking for a re-read: the next HTTPS request takes the time again and
+    /// rescans the system CA bundle. Re-arming on a deviation bound costs one
+    /// CA-bundle scan per `https_clock_max_skew_seconds` of traffic instead of
+    /// one per request, and bounds how stale a clock a certificate check can
+    /// see. Five minutes, like the plain pool's idle window, is a compromise:
+    /// far below any certificate's useful lifetime, far above the scan cost.
+    ///
+    /// A fresh `std.http.Client` would have the same problem one request later,
+    /// which is why the resident client is re-armed rather than replaced (a
+    /// replacement would also drop every pooled TLS connection).
+    pub const https_clock_max_skew_seconds: i64 = 300;
+
     allocator: std.mem.Allocator,
     connection_pool: ConnectionPool,
     retry_policy: RetryPolicy,
@@ -13,11 +34,15 @@ pub const HttpClient = struct {
     /// kept until `deinit`. One instance is what lets outbound TLS connections
     /// be reused (`keep_alive`) and keeps the system CA bundle from being
     /// rescanned per request.
+    ///
+    /// Two things it caches go stale with uptime: the CA bundle (that is the
+    /// point) and the clock std decides certificate expiry with — see
+    /// `https_clock_max_skew_seconds`.
     https_client: ?*std.http.Client,
-    /// Guards `https_client`: creation, hand-out and teardown. Held only for
-    /// the hand-out, never across a request — `std.http.Client` is itself
-    /// thread-safe, and serializing all outbound TLS behind this mutex would
-    /// be a throughput regression.
+    /// Guards `https_client`: creation, hand-out, clock re-arm and teardown.
+    /// Held only for the hand-out, never across a request — `std.http.Client`
+    /// is itself thread-safe, and serializing all outbound TLS behind this
+    /// mutex would be a throughput regression.
     ///
     /// Lock order: `https_mutex` → `std.http.Client.connection_pool.mutex`.
     https_mutex: std.Io.Mutex,
@@ -27,6 +52,13 @@ pub const HttpClient = struct {
     /// Read by tests, and useful when wondering whether outbound TLS is being
     /// re-handshaked per request.
     https_clients_created: u32,
+    /// HTTPS hand-outs not yet returned. Another thread may be inside
+    /// `std.http.Client` while the clock is checked, and std reads the field
+    /// that re-arming clears outside of any lock (its own comment: "TODO data
+    /// race here on ca_bundle if the user sets `now` to null"). A non-zero count
+    /// therefore suspends the re-arm, which is why it is kept under
+    /// `https_mutex` together with the hand-out itself.
+    https_inflight: usize,
     /// Set by `deinit`. Later requests fail with `error.HttpClientClosed`
     /// instead of touching torn-down state.
     closed: bool,
@@ -130,17 +162,19 @@ pub const HttpClient = struct {
             return conn;
         }
 
+        /// Return `conn` to `idle_connections`, making it available to the next
+        /// `acquire`.
+        ///
+        /// Only call this once the request that borrowed it is known to have
+        /// completed — `isAlive()` is a 30-second wall-clock window over
+        /// `last_used` and says nothing about the request that just ran, so
+        /// pooling a connection whose request failed hands the next request a
+        /// socket that is already dead. A failed request ends in `discard`.
         pub fn release(self: *ConnectionPool, conn: Connection) void {
             self.mutex.lock(self.io) catch return;
             defer self.mutex.unlock(self.io);
 
-            // Remove from active connections
-            for (self.active_connections.items, 0..) |active_conn, i| {
-                if (active_conn.stream != null and conn.stream != null and active_conn.stream.?.socket.handle == conn.stream.?.socket.handle) {
-                    _ = self.active_connections.swapRemove(i);
-                    break;
-                }
-            }
+            self.removeActiveLocked(conn);
 
             // Return to idle pool if still alive
             if (conn.isAlive()) {
@@ -154,6 +188,36 @@ pub const HttpClient = struct {
                     stream.close(self.io);
                 }
                 self.allocator.free(conn.host);
+            }
+        }
+
+        /// Put `conn` down instead of back: close the socket and drop it from
+        /// the pool. This is the `release` for a request that failed — the
+        /// socket is either dead or left at an unknown position in the response
+        /// (timeout mid-head, truncated body, malformed framing), and neither is
+        /// a state the next request may resume from.
+        pub fn discard(self: *ConnectionPool, conn: Connection) void {
+            self.mutex.lock(self.io) catch return;
+            defer self.mutex.unlock(self.io);
+
+            self.removeActiveLocked(conn);
+            if (conn.stream) |stream| {
+                stream.close(self.io);
+            }
+            self.allocator.free(conn.host);
+        }
+
+        /// Take `conn` out of `active_connections`. Caller holds `mutex`.
+        ///
+        /// Matched by socket handle, which is how the pool identifies a
+        /// connection it handed out (the caller's copy may have moved on:
+        /// `request_count` is bumped by the borrower).
+        fn removeActiveLocked(self: *ConnectionPool, conn: Connection) void {
+            for (self.active_connections.items, 0..) |active_conn, i| {
+                if (active_conn.stream != null and conn.stream != null and active_conn.stream.?.socket.handle == conn.stream.?.socket.handle) {
+                    _ = self.active_connections.swapRemove(i);
+                    break;
+                }
             }
         }
     };
@@ -261,6 +325,7 @@ pub const HttpClient = struct {
             .https_client = null,
             .https_mutex = .init,
             .https_clients_created = 0,
+            .https_inflight = 0,
             .closed = false,
         };
     }
@@ -291,25 +356,70 @@ pub const HttpClient = struct {
         self.connection_pool.deinit();
     }
 
-    /// Get the shared HTTPS client, creating it on first use.
+    /// Get the shared HTTPS client, creating it on first use, and count the
+    /// hand-out.
     ///
     /// The lock is taken cancelably (this is the request path) and released
     /// before the caller starts the request; `deinit` takes the same mutex
-    /// uncancelably and nulls the pointer before freeing it.
+    /// uncancelably and nulls the pointer before freeing it. Every hand-out must
+    /// be balanced by `releaseHttpsClient`.
+    ///
+    /// A hand-out that finds no other request in flight re-arms the client's
+    /// certificate clock when it has drifted too far (`rearmHttpsClockIfStale`).
     fn httpsClient(self: *Self) !*std.http.Client {
         const io = self.connection_pool.io;
         self.https_mutex.lock(io) catch |err| return err;
         defer self.https_mutex.unlock(io);
 
         if (self.closed) return error.HttpClientClosed;
-        if (self.https_client) |client| return client;
+
+        if (self.https_client) |client| {
+            // Only when nobody holds the client: std reads the clock field
+            // outside its CA-bundle lock, so clearing it under an in-flight
+            // request is the data race std's own TODO warns about.
+            if (self.https_inflight == 0) rearmHttpsClockIfStale(client, io);
+            self.https_inflight += 1;
+            return client;
+        }
 
         const client = try self.allocator.create(std.http.Client);
         errdefer self.allocator.destroy(client);
         client.* = .{ .allocator = self.allocator, .io = io };
         self.https_client = client;
         self.https_clients_created += 1;
+        self.https_inflight += 1;
         return client;
+    }
+
+    /// Counterpart of `httpsClient`: call it once per hand-out, on every path
+    /// out of the request (success and failure alike).
+    fn releaseHttpsClient(self: *Self) void {
+        const io = self.connection_pool.io;
+        self.https_mutex.lockUncancelable(io);
+        defer self.https_mutex.unlock(io);
+        std.debug.assert(self.https_inflight != 0);
+        self.https_inflight -= 1;
+    }
+
+    /// Drop the resident client's cached certificate clock once it is more than
+    /// `https_clock_max_skew_seconds` away from the real clock, so std takes the
+    /// time again (and rescans the CA bundle) on the next HTTPS request.
+    ///
+    /// Deviation in either direction counts, not just a clock that fell behind:
+    /// on a backward wall-clock step the cached time would make certificate
+    /// checks *stricter* than reality, refusing certificates that are still
+    /// valid. Caller holds `https_mutex` and has no request in flight.
+    fn rearmHttpsClockIfStale(client: *std.http.Client, io: std.Io) void {
+        // `null` means std has not taken the time yet (nothing is stale) or that
+        // a request is already going to re-read it — either way, leave it.
+        const cached_seconds = (client.now orelse return).toSeconds();
+        const real_seconds = std.Io.Clock.real.now(io).toSeconds();
+        const skew_seconds = if (real_seconds > cached_seconds)
+            real_seconds - cached_seconds
+        else
+            cached_seconds - real_seconds;
+        if (skew_seconds <= https_clock_max_skew_seconds) return;
+        client.now = null;
     }
 
     const Target = struct {
@@ -338,6 +448,10 @@ pub const HttpClient = struct {
                 // reader in `.ready` and std pools that connection again — so
                 // the retry would pick the same dead connection. Drop this
                 // target's idle TLS connections, forcing a fresh dial.
+                //
+                // The plain-HTTP pool needs no equivalent here: `executeRequest`
+                // closes its failing connection on the way out (the `errdefer`),
+                // so it is already gone from `idle_connections` by this point.
                 self.discardIdleHttpsConnectionsFor(req.url);
 
                 if (attempt < self.retry_policy.max_retries) {
@@ -400,6 +514,7 @@ pub const HttpClient = struct {
     /// this target's idle connections first.
     fn executeHttps(self: *Self, req: HttpRequest) !HttpResponse {
         const client = try self.httpsClient();
+        defer self.releaseHttpsClient();
 
         var header_list = std.ArrayList(std.http.Header).empty;
         defer header_list.deinit(self.allocator);
@@ -438,6 +553,7 @@ pub const HttpClient = struct {
     /// `errdefer` below for the mechanism.
     fn executeHttpsStream(self: *Self, req: HttpRequest, cb_ctx: *anyopaque, on_chunk: OnBodyChunk) !HttpResponse {
         const client = try self.httpsClient();
+        defer self.releaseHttpsClient();
 
         var header_list = std.ArrayList(std.http.Header).empty;
         defer header_list.deinit(self.allocator);
@@ -583,7 +699,13 @@ pub const HttpClient = struct {
         if (target.is_tls) return self.executeHttps(req);
 
         var conn = try self.connection_pool.acquire(target.host, target.port);
-        defer self.connection_pool.release(conn);
+        // Whether this connection goes back to `idle` is a fact about the
+        // request, not about the socket: `release` leaves a failed request's
+        // socket in the pool, and the retry loop above then re-acquires it on
+        // every attempt — one peer close poisons the slot for good. The errdefer
+        // is the plain-HTTP mirror of the HTTPS path pruning its target's idle
+        // connections between attempts.
+        errdefer self.connection_pool.discard(conn);
 
         if (conn.stream) |stream| {
             var write_buf: [4096]u8 = undefined;
@@ -594,6 +716,7 @@ pub const HttpClient = struct {
             try w.interface.flush();
             const response = try self.readResponse(stream);
             conn.request_count += 1;
+            self.connection_pool.release(conn);
             return response;
         }
 
@@ -805,7 +928,10 @@ pub const HttpClient = struct {
         }
 
         var conn = try self.connection_pool.acquire(target.host, target.port);
-        defer self.connection_pool.release(conn);
+        // Same rule as the buffering path: a stream that ended early (reader
+        // error, `on_chunk` failing, truncated body) leaves the socket
+        // mid-response, so it is closed rather than pooled.
+        errdefer self.connection_pool.discard(conn);
 
         if (conn.stream) |stream| {
             var write_buf: [4096]u8 = undefined;
@@ -817,6 +943,7 @@ pub const HttpClient = struct {
             try w.interface.flush();
             const response = try self.readResponseStreaming(stream, cb_ctx, on_chunk);
             conn.request_count += 1;
+            self.connection_pool.release(conn);
             return response;
         }
         return error.ConnectionError;
@@ -1188,6 +1315,36 @@ test "HttpClient ConnectionPool exhaustion" {
     try std.testing.expectError(error.PoolExhausted, result);
 
     pool.release(conn);
+}
+
+// `discard` is `release`'s counterpart for a request that failed: the socket is
+// closed and dropped from both lists. Being on neither list is what makes the
+// teardown below safe — `std.testing.allocator` fails the run if the host string
+// is freed twice or not at all.
+test "HttpClient ConnectionPool discard drops the connection instead of pooling it" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    const server_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try server_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = server.socket.address.getPort();
+
+    var pool = HttpClient.ConnectionPool.init(allocator, std.testing.io, 1);
+    defer pool.deinit();
+
+    const conn = try pool.acquire("127.0.0.1", port);
+    try std.testing.expectEqual(@as(usize, 1), pool.active_connections.items.len);
+
+    pool.discard(conn);
+    try std.testing.expectEqual(@as(usize, 0), pool.active_connections.items.len);
+    try std.testing.expectEqual(@as(usize, 0), pool.idle_connections.items.len);
+
+    // The slot is free again, so the pool is still usable after a discard.
+    const conn2 = try pool.acquire("127.0.0.1", port);
+    try std.testing.expectEqual(@as(usize, 1), pool.active_connections.items.len);
+    pool.release(conn2);
+    try std.testing.expectEqual(@as(usize, 1), pool.idle_connections.items.len);
 }
 
 test "HttpClient HttpRequest and HttpResponse" {
@@ -1628,14 +1785,18 @@ test "HttpClient chunked decoder rejects malformed framing" {
 //
 // The HTTPS path keeps one `std.http.Client` alive for the lifetime of the
 // `HttpClient` (`HttpClient.https_client`) instead of building one per request.
-// Two things follow, and only the first has a test here:
+// Three things follow:
 //
 //   * reusing the client is what makes `keep_alive` do anything — a per-request
 //     client has nothing to reuse the connection in (test: "builds one
 //     std.http.Client for the HTTPS path", via the creation counter);
-//   * the client caches the system CA bundle (`Client.now`/`ca_bundle`), so it
-//     is scanned once rather than per request. Not locally testable: it only
-//     happens on a real TLS request.
+//   * the client caches the system CA bundle (`ca_bundle`), so it is scanned
+//     once rather than per request. Not locally testable: it only happens on a
+//     real TLS request;
+//   * it also caches the clock certificate expiry is checked against
+//     (`Client.now`), which is what makes a long-lived client dangerous —
+//     bounded, and tested, by `https_clock_max_skew_seconds` (test: "re-arms the
+//     resident HTTPS client clock when it is stale").
 //
 // The tests below drive `std.http.Client` over *plain* loopback HTTP for the
 // pool mechanics: `Request.deinit` → `ConnectionPool.release` is shared by both
@@ -1653,13 +1814,17 @@ const PoolProbeServer = struct {
     listener: *std.Io.net.Server,
     payload: []const u8,
     abort_after_reply: bool = false,
+    /// How long the listener keeps accepting after its first connection. Tests
+    /// whose client has to dial a *second* connection need this to outlive the
+    /// retry backoff (the default is sized for tests that never re-dial).
+    accept_grace_ms: u64 = 300,
 
     fn run(ctx: *@This()) void {
         var first = true;
         while (true) {
             // The first accept waits for the client; afterwards only a short
             // grace period, so the test ends instead of hanging on join.
-            const wait_ms: u64 = if (first) 5000 else 300;
+            const wait_ms: u64 = if (first) 5000 else ctx.accept_grace_ms;
             first = false;
             HttpClient.waitForReadable(ctx.listener.socket.handle, wait_ms) catch return;
             const accepted = ctx.listener.accept(std.testing.io) catch return;
@@ -1735,6 +1900,78 @@ test "HttpClient builds one std.http.Client for the HTTPS path" {
     }
 }
 
+// The resident client caches the clock std decides certificate expiry with
+// (`std.http.Client.now`, handed to the TLS client as `realtime_now`) and takes
+// it only on that client's first HTTPS request. A client kept alive for hours
+// would keep validating certificates against a clock from hours ago, so a
+// hand-out re-arms it once it has drifted past `https_clock_max_skew_seconds`.
+// The hand-outs here are driven directly: clearing the clock is this file's
+// decision, and std re-reading it needs no handshake (it happens before the
+// connect), so neither half needs a TLS peer.
+test "HttpClient re-arms the resident HTTPS client clock when it is stale" {
+    const allocator = std.testing.allocator;
+
+    var client = HttpClient.init(allocator, std.testing.io, 1, 500);
+    defer client.deinit();
+    client.retry_policy.max_retries = 0;
+
+    const shared = try client.httpsClient();
+    client.releaseHttpsClient();
+    try std.testing.expectEqual(@as(u32, 1), client.https_clients_created);
+
+    const bound = HttpClient.https_clock_max_skew_seconds;
+    const real = std.Io.Clock.real.now(std.testing.io);
+
+    // Inside the bound the cached clock is left alone: a client in use must not
+    // pay a CA-bundle rescan per request.
+    const inside_ns: i96 = real.toNanoseconds() - (bound - 1) * std.time.ns_per_s;
+    shared.now = .fromNanoseconds(inside_ns);
+    _ = try client.httpsClient();
+    client.releaseHttpsClient();
+    try std.testing.expect(shared.now != null);
+    try std.testing.expectEqual(inside_ns, shared.now.?.toNanoseconds());
+
+    // Past the bound (either direction) it is dropped, and std reads the time
+    // again on the next HTTPS request.
+    for ([_]i96{
+        real.toNanoseconds() - (bound + 1) * std.time.ns_per_s,
+        real.toNanoseconds() + (bound + 1) * std.time.ns_per_s,
+    }) |stale_ns| {
+        shared.now = .fromNanoseconds(stale_ns);
+        _ = try client.httpsClient();
+        try std.testing.expect(shared.now == null);
+        client.releaseHttpsClient();
+    }
+
+    // Re-arming is not a re-create: the CA bundle and the pooled TLS
+    // connections survive the clock being dropped.
+    try std.testing.expectEqual(@as(u32, 1), client.https_clients_created);
+
+    // And std does take the time again — the field must not stay `null`, or
+    // every request from here on would rescan the system CA bundle. One request
+    // against a closed port is enough: the clock is read before the connect.
+    if (@import("../test/NetworkProbe.zig").available()) {
+        var url_buf: [128]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/probe", .{try deadLoopbackPort()});
+        var req = HttpClient.HttpRequest.init(allocator, "GET", url);
+        defer req.deinit();
+
+        const result = client.request(req);
+        if (result) |ok| {
+            var resp = ok;
+            resp.deinit();
+            return error.TestUnexpectedResult;
+        } else |err| {
+            // Without a usable system CA bundle std never reaches the clock;
+            // every other outcome (refused, unusable address) happens after it
+            // has taken the time.
+            if (err != error.TlsHandshakeFailed) {
+                try std.testing.expect(shared.now != null);
+            }
+        }
+    }
+}
+
 // `deinit` has to be safe to run twice and to run before any HTTPS request,
 // and requests after it must be a defined error rather than a use-after-free
 // of the torn-down pool/client.
@@ -1799,6 +2036,61 @@ test "plain HTTP reuses one keep-alive connection and builds no HTTPS client" {
     try std.testing.expectEqual(@as(usize, 0), client.connection_pool.active_connections.items.len);
     // The plain path never touches the HTTPS client.
     try std.testing.expectEqual(@as(u32, 0), client.https_clients_created);
+}
+
+// A peer that closes every connection after a single reply — a per-connection
+// idle timeout, a crashed worker, a rolling restart — is what the plain path
+// cannot see: `isAlive()` only checks a 30-second window over `last_used`, never
+// the request that just ran. So a socket whose request failed goes straight back
+// to `idle_connections` and the next request is handed it; every retry then
+// re-acquires the same corpse (`acquire` finds a matching idle entry whose
+// window has not elapsed), turning one peer close into a permanently poisoned
+// pool slot. Two rounds against a server that closes after each reply: the
+// second has to dial again, not reuse the dead socket.
+test "plain HTTP does not re-hand-out a connection whose request failed" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var listener = try probeListener();
+    defer listener.deinit(std.testing.io);
+    const port = listener.socket.address.getPort();
+
+    var server = PoolProbeServer{
+        .listener = &listener,
+        .payload = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK",
+        .abort_after_reply = true,
+        // The retry that must dial a fresh connection lands ~100ms after the
+        // failed attempt; the listener has to still be accepting by then.
+        .accept_grace_ms = 2000,
+    };
+    const th = try std.Thread.spawn(.{}, PoolProbeServer.run, .{&server});
+    defer th.join();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/probe", .{port});
+
+    var client = HttpClient.init(allocator, std.testing.io, 1, 2000);
+    defer client.deinit();
+
+    for (0..2) |round| {
+        var req = HttpClient.HttpRequest.init(allocator, "GET", url);
+        defer req.deinit();
+        var resp = client.request(req) catch |err| {
+            std.debug.print(
+                "round {d}: {s} — {} idle connection(s) in the pool, {} active\n",
+                .{
+                    round,
+                    @errorName(err),
+                    client.connection_pool.idle_connections.items.len,
+                    client.connection_pool.active_connections.items.len,
+                },
+            );
+            return err;
+        };
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+        try std.testing.expectEqualStrings("OK", resp.body);
+    }
 }
 
 // The retry path relies on `discardIdleConnections` dropping exactly one
