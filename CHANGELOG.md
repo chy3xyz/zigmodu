@@ -2,6 +2,89 @@
 
 ## [Unreleased]
 
+### 第 22 批：`ProviderLease` 的 use-after-free（真红，`0x55` 就是被释放内存）、`RedisCluster.addNode` 的 OOM 清理（顺带查出同路径第二个泄漏）、失败节点退役的决策、无类型 `EventBus` 的 `AssumeCapacity` 写越界（**破坏性：是**，1 处公开签名）
+
+全量 `-Ddb=all` **1897/1955（58 skipped，0 failed）**；CI 的示例清单本机 **16/16** 构建通过；Redis 门控真机 20/20。
+
+**`ProviderLease` 借用的是注册表里会被替换掉的槽位 —— 一条真的 use-after-free。** `ProviderEntry` 按**值**
+存在 `providers: ArrayList(ProviderEntry)` 里，租约持有 `pool = &items[idx].pool`（槽位地址）、`entry.name`
+/`entry.endpoint` 与池自己 dupe 的 key 字符串。`registerLocked` 替换同名 provider 时 `old.pool.deinit()`
+然后**原地覆盖槽位**，于是：
+- 旧租约的 `pool` **别名到了新池** —— 它之后的 `onError` 把错误记进**替换者**的计数器（红证据
+  `expected 0, found 1`，静默串写）；
+- `lease.key` 读的是**已释放内存** —— 本工具链的 `std.testing.allocator` 是 SafeAllocator，释放时用
+  `0x55` 填充，所以红证据是读回 `UUUUUU`（值级别证据，不依赖页是否被 unmap）。
+**另一个独立断裂**（与替换无关）：`ArrayList` 扩容会搬走缓冲区，**所有**已发出租约的 `pool` 指针随之
+悬垂 —— 只要再注册一个**新名字**就能触发（红证据第三条：`lease.pool` 已不等于活跃槽位）。
+修法：每个 provider 独立 `allocator.create(ProviderEntry)` 成**稳定的堆盒**（租约借的指针全部来自盒子），
+替换时旧盒进 **`retired`** 列表、只在 `deinit` 释放；新增 `retiredCount()` 让"替换带来的常驻内存"可观测。
+顺带修掉同一函数里三处旧泄漏（`models`/`fallback_providers` 逐个 dupe 中途失败、`by_name` 的 key dupe 在
+`put` 失败时、以及 `append` 成功但 `by_name.put` 失败时被 `errdefer` 释放却**仍留在 `providers` 里**的悬垂条目）。
+> **行为变化（可观测）**：同名 `register` **不再立刻释放**旧条目；旧池继续接收该租约的
+> `onSuccess`/`onError`（语义上正确 —— 反馈本来就是关于那把已发出的 key）。代价是每次替换多一个盒子常驻到
+> `deinit`；真正做到有界需要"租约释放"API，而现有 API 没有释放点（`acquire` 按值返回、`onSuccess`/`onError`
+> 按值接收），所以 refcount 与"有未完成租约就报错"两种方案都没采用。仓内**没有任何**调用方触碰
+> `providers`/`retired`/`retiredCount`（`examples/**`、`tools/**` 零引用）。
+> **范围内未修、仅报告**：`src/ai/key_pool.zig:128` —— `dupe` 成功但 `append` 扩容失败时，那把 key 还没
+> 进 `owned.items`、其 `errdefer` 看不到它，泄漏（我的 FailingAllocator 测试抓到：`fail_index 8/37`、
+> `leaked [len: 4]`，栈顶 `key_pool.zig:128 → provider_registry.zig:189 KeyPool.init`）。修法是 3 行局部
+> 变量 + `errdefer`。
+
+**`RedisCluster.addNode` 的 OOM 清理（上一批记为"需要真正的 OOM 注入测试才敢修"）。** 原顺序下三个失败点
+各有后果：`node_configs.append` 失败漏 `host_copy` 9 B；`Redis.new` 失败留下
+**`nodes=0 / node_configs=1` 的分裂**（配置永远多一条，且"重试一次"会让它继续恶化）；`nodes.append` 失败
+**漏掉整个 `Redis`（含 pool）**。红证据（逐索引注入，`pool_size > 1` 才存在危险索引）：
+```
+fail_index 1/5: leaked 9 of 4638 allocated bytes
+fail_index 2/5: nodes.items.len = 0, node_configs.items.len = 1 — the arrays are out of step
+fail_index 3/5: leaked 4000 of 8638 allocated bytes
+fail_index 4/5: leaked 4100 of 8738 allocated bytes
+```
+修法选**"单发"顺序**而不是 errdefer 回滚链：先在两个数组上 `ensureUnusedCapacity(1)`（可失败，各自
+`errdefer` 归还 `host_copy`）→ `Redis.new` → 两次 `appendAssumeCapacity`。这样"记录配置"与"记录节点"之间
+**不存在任何可失败语句**，没有中间态窗口。
+> **顺带修掉同一路径上的第二个缺陷**：`ConnPool.init` 里 `in_use = alloc(…)` 失败时 **`streams`
+> （`pool_size` 个 `?Stream`，实测 4000 B）无人释放** —— 不修它，`addNode` 修得再对也过不了
+> `allocated == freed`（这正是第 3 个索引上那条 `leaked 4000` 的来源）。加一行 `errdefer`。
+> 也检查了相邻路径：全仓只有 `init`/`deinit`/`addNode` 会写那两个数组（**没有** `removeNode`），所以
+> "移除时两边是否同步"今天无从违反；`deinit` 按各自长度独立释放，不依赖这个不变量。
+
+**`ClusterMembership` 的失败节点退役：决定"不退役"，并把理由写进代码。** 交付是文档 + 一条钉住语义的
+测试，**生产行为零变化** —— 依据是三条硬证据：① `nodesSnapshot` **借出** `ClusterNode.id`，而它的唯一
+树内消费者（`MembershipView.sync`）是**在放锁之后**才把这些字符串拷进视图的，今天成立只因为 `deinit`
+之前没有 `free`；改成"失败即移除"要么在别人正格式化时释放（UAF），要么把 id 挪进"墓地"继续持有（同一份
+内存换个名字）；② 路由本来就不给失败节点流量（`ClusterView` 的 `if (!m.healthy) continue`），
+`getHealthyNodeCount` 已经是"活集群"读数，而 `getNodeCount` **没有**任何树内调用方拿它做 quorum/容量
+决策；③ 没有可用的 TTL 旋钮 —— `node_timeout_ms` 是**探测**预算，复用它会改变一个既有配置项的语义，
+而且退役后对端下一个心跳就会重新 join（"丢一次又加回"的 churn 而非收敛）。
+为了让"这条测试有牙"可验证，做了一次**伪造决策**实验（把 `getNodeCount` 改成跳过 `.failed`）→ 立刻红
+（`expected 3, found 2`），随后还原。
+> **顺带发现、未修**：`.leave` 来自**从未见过**的节点时，未知分支会先把它插入为 `.healthy`（并触发 join
+> 回调 + 对已离开节点拨号），紧接着 `.leave` 块再改成 `.leaving` —— census 永久多一个"只说过再见的对端"。
+
+**无类型 `EventBus(T).subscribe` 的 `AssumeCapacity` 会写越界（真红）。** 它被文档写成"不可失败"，实际用
+`getOrPutAssumeCapacity`/`addAssumeCapacity`，而 `init`/`initCapacity` 的预留失败**只记日志**（`:28`、`:104`）
+—— 预留不足时那两个调用会**写到预留之外**。两条独立路径：事件类型表，以及每种类型的监听器列表（即使
+分配器完美，同一事件类型第 **5** 个回调就会溢出，因为 `ListenerSet.init` 正好预留 4 个）。红探针：
+```
+[default] (warn): [EventBus] listeners capacity prealloc failed: error.OutOfMemory
+thread … panic: integer overflow    @ src/core/EventBus.zig:139 … in subscribe
+```
+改为 `!void`（与同文件的 `TypedEventBus.subscribe`/`ThreadSafeEventBus.subscribe` 一致，而
+**`docs/API.md:292` 一直**就把它写成 `!void` —— 文档走在代码前面）。唯一仓内调用点
+`src/core/ModuleListener.zig:51` 加 `try`；`EventBus` 是公开导出（`src/root.zig:89`），所以外部调用方
+`bus.subscribe(...)` 需要加 `try`（编译错、诚实，无静默行为变化）。预留失败的日志保留，但注释改成
+"这些只是提示，后面不再假设容量"。
+
+**`LockFailed`-for-cancellation 收尾（四个文件）。** `std.Io.Mutex.lock` 唯一的错误是 `error.Canceled`，
+所以把取消答成"锁机制失败"是在撒谎。逐处决策：`core/EventRegistry.zig` 的 `bus()`、
+`scheduler/Cron.zig` 的 `addJob`/`listJobNames`、`web4/challenge.zig` 的 `issue` → **传播**
+`error.Canceled`（错误集都是推断的，仓内调用方全是裸 `try`，零改动；`error.LockFailed` 从推断集里消失，
+按名字捕获它的消费者会受影响 —— 仓内没有）；`Cron.tick` → **`lockUncancelable`**（没有错误通道，而放弃
+等待会静默丢掉那一分钟**所有到期**的 job）；`challenge.verifyAndConsume` → **保留 `false` 并写明理由**：
+进入那个临界区本身就是**消耗**一次性 nonce，等待会为一个正在被取消的请求把 nonce 烧掉、迫使重新签发与
+重新签名，而 `false` 是 fail-closed（中间件回 401，与签名错**字节相同**）且什么都没花掉。
+
 ### 第 21 批：`RedisCluster.addNode` 让应用编译不过（用真实消费者程序证明）、`skill.register` 超容量直接 panic、`Router.match` 的 OOM 伪装成 404、metrics 两处桩/泄漏（**破坏性：是**，1 处公开签名）
 
 全量 `-Ddb=all` **1884/1942（58 skipped，0 failed）**；Redis 门控真机 18/18；`examples/mcp-server` 构建通过。

@@ -5,6 +5,14 @@
 //! healthy key inside that provider's pool. When the primary provider has no
 //! healthy key (or is disabled), the fallback provider chain is tried in
 //! order — this is the "provider + key rotation" layer on top of `KeyPool`.
+//!
+//! Ownership: every provider lives in its own heap box (`*ProviderEntry`), and
+//! `ProviderLease` borrows pointers out of that box (`&entry.pool`,
+//! `entry.name`, `entry.endpoint`) plus a key string owned by the pool. The box
+//! address is therefore stable when the provider list grows, and a same-named
+//! re-registration **retires** the box it replaces instead of freeing it — so
+//! every lease stays valid until `ProviderRegistry.deinit`, the only place a
+//! box dies. See `register`.
 
 const std = @import("std");
 const key_pool = @import("key_pool.zig");
@@ -22,6 +30,11 @@ pub const ProviderOpts = struct {
     pool_opts: key_pool.Options = .{},
 };
 
+/// A leased provider + key. `provider`, `endpoint` and `key` are borrowed, and
+/// stay valid until `ProviderRegistry.deinit` — including when the provider is
+/// re-registered while the lease is out (the registry retires the box it
+/// replaced rather than freeing it, so feedback about this lease still reaches
+/// the pool it was taken from). `model` is the caller's own string.
 pub const ProviderLease = struct {
     provider: []const u8, // borrowed (provider name)
     endpoint: []const u8, // borrowed
@@ -48,6 +61,9 @@ pub const ProviderInfo = struct {
     }
 };
 
+/// One provider's owned state. Always heap-allocated (in `registerLocked`) so
+/// that `&entry.pool` (and the borrowed strings) stay valid for the lifetime of
+/// a `ProviderLease` — the list holding these pointers may reallocate freely.
 const ProviderEntry = struct {
     name: []const u8, // owned
     endpoint: []const u8, // owned
@@ -61,37 +77,70 @@ pub const ProviderRegistry = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
-    providers: std.ArrayList(ProviderEntry),
+    providers: std.ArrayList(*ProviderEntry),
+    /// Boxes replaced by a later `register` of the same name. A lease taken
+    /// from one may still be in flight — `onSuccess`/`onError`, or a key that
+    /// is the credential of a request already being made — and a lease has no
+    /// release call, so nothing here can prove it is dead. They are freed in
+    /// `deinit`; the cost is one box per replacement that lives until shutdown.
+    retired: std.ArrayList(*ProviderEntry),
     by_name: std.StringHashMap(usize),
     mutex: std.Io.Mutex,
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
             .allocator = allocator,
-            .providers = std.ArrayList(ProviderEntry).empty,
+            .providers = std.ArrayList(*ProviderEntry).empty,
+            .retired = std.ArrayList(*ProviderEntry).empty,
             .by_name = std.StringHashMap(usize).init(allocator),
             .mutex = std.Io.Mutex.init,
         };
     }
 
+    /// Frees every provider box, live and retired. Leases (and `AiProvider`s
+    /// bound to them) still hold borrowed pointers into those boxes, so the
+    /// registry must outlive every lease it handed out.
     pub fn deinit(self: *Self) void {
-        for (self.providers.items) |*p| {
-            self.allocator.free(p.name);
-            self.allocator.free(p.endpoint);
-            for (p.models) |m| self.allocator.free(m);
-            self.allocator.free(p.models);
-            for (p.fallback_providers) |f| self.allocator.free(f);
-            self.allocator.free(p.fallback_providers);
-            p.pool.deinit();
-        }
+        for (self.providers.items) |p| self.destroyEntry(p);
         self.providers.deinit(self.allocator);
+        for (self.retired.items) |p| self.destroyEntry(p);
+        self.retired.deinit(self.allocator);
         var it = self.by_name.iterator();
         while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.by_name.deinit();
         self.* = undefined;
     }
 
+    fn destroyEntry(self: *Self, p: *ProviderEntry) void {
+        self.allocator.free(p.name);
+        self.allocator.free(p.endpoint);
+        for (p.models) |m| self.allocator.free(m);
+        self.allocator.free(p.models);
+        for (p.fallback_providers) |f| self.allocator.free(f);
+        self.allocator.free(p.fallback_providers);
+        p.pool.deinit();
+        self.allocator.destroy(p);
+    }
+
+    /// How many replaced provider boxes are still being kept alive for
+    /// outstanding leases. Grows by one per same-named `register` and only
+    /// shrinks when the registry dies — worth watching if providers are
+    /// re-registered on a hot path (a lease-release API would bound it).
+    pub fn retiredCount(self: *Self, io: std.Io) usize {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.retired.items.len;
+    }
+
     /// Register (or replace) a provider: name → endpoint + key pool + models.
+    ///
+    /// Replacing a provider does not free the state it replaces: leases already
+    /// issued from it borrow `&entry.pool`, `entry.name`, `entry.endpoint` and
+    /// a key string, and none of those has a release call — the caller may
+    /// still be using the lease (`onSuccess`/`onError`, or a request already in
+    /// flight with that key). The replaced entry moves to `retired`, where its
+    /// pool keeps accepting that lease's feedback, and is freed in `deinit`.
+    /// Routing and `listProviders` only ever see the new entry.
     pub fn register(
         self: *Self,
         io: std.Io,
@@ -113,47 +162,69 @@ pub const ProviderRegistry = struct {
         api_keys: []const []const u8,
         opts: ProviderOpts,
     ) !void {
-        const owned_name = try self.allocator.dupe(u8, name);
-        errdefer self.allocator.free(owned_name);
-        const owned_endpoint = try self.allocator.dupe(u8, endpoint);
-        errdefer self.allocator.free(owned_endpoint);
-        const owned_models = try self.allocator.alloc([]const u8, opts.models.len);
-        errdefer self.allocator.free(owned_models);
-        for (opts.models, 0..) |m, i| owned_models[i] = try self.allocator.dupe(u8, m);
-        const owned_fallbacks = try self.allocator.alloc([]const u8, opts.fallback_providers.len);
-        errdefer self.allocator.free(owned_fallbacks);
-        for (opts.fallback_providers, 0..) |f, i| owned_fallbacks[i] = try self.allocator.dupe(u8, f);
-        var pool = try KeyPool.init(self.allocator, io, name, api_keys, opts.pool_opts);
-        errdefer pool.deinit();
+        // Built in a block of its own so the construction-time `errdefer`s are
+        // no longer armed once the box exists: from then on the box owns the
+        // strings and the pool, and only `destroyEntry` may free them.
+        const box = blk: {
+            const owned_name = try self.allocator.dupe(u8, name);
+            errdefer self.allocator.free(owned_name);
+            const owned_endpoint = try self.allocator.dupe(u8, endpoint);
+            errdefer self.allocator.free(owned_endpoint);
+            const owned_models = try self.allocator.alloc([]const u8, opts.models.len);
+            errdefer self.allocator.free(owned_models);
+            var n_models: usize = 0;
+            errdefer for (owned_models[0..n_models]) |m| self.allocator.free(m);
+            for (opts.models, 0..) |m, i| {
+                owned_models[i] = try self.allocator.dupe(u8, m);
+                n_models += 1;
+            }
+            const owned_fallbacks = try self.allocator.alloc([]const u8, opts.fallback_providers.len);
+            errdefer self.allocator.free(owned_fallbacks);
+            var n_fallbacks: usize = 0;
+            errdefer for (owned_fallbacks[0..n_fallbacks]) |f| self.allocator.free(f);
+            for (opts.fallback_providers, 0..) |f, i| {
+                owned_fallbacks[i] = try self.allocator.dupe(u8, f);
+                n_fallbacks += 1;
+            }
+            var pool = try KeyPool.init(self.allocator, io, name, api_keys, opts.pool_opts);
+            errdefer pool.deinit();
 
-        const entry = ProviderEntry{
-            .name = owned_name,
-            .endpoint = owned_endpoint,
-            .models = owned_models,
-            .fallback_providers = owned_fallbacks,
-            .pool = pool,
-            .enabled = opts.enabled,
+            const box = try self.allocator.create(ProviderEntry);
+            box.* = .{
+                .name = owned_name,
+                .endpoint = owned_endpoint,
+                .models = owned_models,
+                .fallback_providers = owned_fallbacks,
+                .pool = pool,
+                .enabled = opts.enabled,
+            };
+            break :blk box;
         };
+        errdefer self.destroyEntry(box);
+
         if (self.by_name.get(name)) |idx| {
-            const old = &self.providers.items[idx];
-            self.allocator.free(old.name);
-            self.allocator.free(old.endpoint);
-            for (old.models) |m| self.allocator.free(m);
-            self.allocator.free(old.models);
-            for (old.fallback_providers) |f| self.allocator.free(f);
-            self.allocator.free(old.fallback_providers);
-            old.pool.deinit();
-            self.providers.items[idx] = entry;
+            // The box being replaced may still be named by a live lease, so it
+            // goes to `retired` instead of being freed (see `register`).
+            try self.retired.append(self.allocator, self.providers.items[idx]);
+            self.providers.items[idx] = box;
             return;
         }
         const new_idx = self.providers.items.len;
-        try self.providers.append(self.allocator, entry);
-        try self.by_name.put(try self.allocator.dupe(u8, name), new_idx);
+        try self.providers.append(self.allocator, box);
+        errdefer _ = self.providers.pop();
+        const by_name_key = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(by_name_key);
+        try self.by_name.put(by_name_key, new_idx);
     }
 
     /// Resolve `model` to a provider (provider rotation) and a healthy key
     /// (key rotation). Tries the provider serving the model, then its
     /// fallback providers in order.
+    ///
+    /// The returned lease borrows registry-owned memory and has no release
+    /// call: it stays valid (and its `onSuccess`/`onError` keep reaching the
+    /// pool it was taken from) until `deinit`, whether or not the provider is
+    /// replaced in the meantime.
     pub fn acquire(self: *Self, io: std.Io, model: []const u8) !ProviderLease {
         self.mutex.lock(io) catch return error.LockFailed;
         defer self.mutex.unlock(io);
@@ -165,7 +236,7 @@ pub const ProviderRegistry = struct {
         var chain: [16]usize = undefined;
         var n: usize = 0;
         // Primary provider(s) serving this model.
-        for (self.providers.items, 0..) |*p, idx| {
+        for (self.providers.items, 0..) |p, idx| {
             if (n >= chain.len) break;
             for (p.models) |m| {
                 if (std.mem.eql(u8, m, model)) {
@@ -186,7 +257,7 @@ pub const ProviderRegistry = struct {
         if (n == 0) return error.ModelNotFound;
 
         for (chain[0..n]) |pidx| {
-            const p = &self.providers.items[pidx];
+            const p = self.providers.items[pidx];
             if (!p.enabled) continue;
             if (try p.pool.acquire(io)) |lease| {
                 return .{
@@ -228,7 +299,8 @@ pub const ProviderRegistry = struct {
         try self.providers.items[idx].pool.enableKey(io, key_index);
     }
 
-    /// Snapshot the provider table (owned by the caller).
+    /// Snapshot the provider table (owned by the caller). Live providers only —
+    /// a replaced one is retired, not registered (see `register`).
     pub fn listProviders(self: *Self, io: std.Io, allocator: std.mem.Allocator) ![]ProviderInfo {
         self.mutex.lock(io) catch return error.LockFailed;
         defer self.mutex.unlock(io);
@@ -238,7 +310,7 @@ pub const ProviderRegistry = struct {
             for (out.items) |*p| p.deinit(allocator);
             out.deinit(allocator);
         }
-        for (self.providers.items) |*p| {
+        for (self.providers.items) |p| {
             const keys = try p.pool.snapshot(io, allocator);
             errdefer allocator.free(keys);
             const models = try allocator.alloc([]const u8, p.models.len);
@@ -327,6 +399,124 @@ test "registry listProviders snapshot" {
     try std.testing.expectEqualStrings("a", infos[0].name);
     try std.testing.expectEqual(@as(usize, 2), infos[0].keys.len);
     try std.testing.expectEqual(@as(u64, 1), infos[0].keys[0].total_calls);
+}
+
+// The three tests below pin the lifetime a `ProviderLease` is entitled to: it
+// borrows `&entry.pool` plus `entry.name` / `entry.endpoint` / the pool's key
+// string, so the registry may not free any of them while a lease is out.
+// `std.testing.allocator` fills every freed block with 0x55 (SafeAllocator
+// `overwriteFreed`), so a read through a dead lease shows up as 0x55 bytes and a
+// write that lands on a moved pool shows up in the counters.
+
+test "re-registering a provider keeps the leased key readable" {
+    const allocator = std.testing.allocator;
+    var reg = ProviderRegistry.init(allocator);
+    defer reg.deinit();
+    try reg.register(std.testing.io, "p", "https://old/v1/chat/completions", &.{"sk-old"}, .{ .models = &.{"m"} });
+    const lease = try reg.acquire(std.testing.io, "m");
+    try std.testing.expectEqualStrings("sk-old", lease.key);
+
+    // Same-named re-registration — the replacement path in `registerLocked`.
+    try reg.register(std.testing.io, "p", "https://new/v1/chat/completions", &.{"sk-new"}, .{ .models = &.{"m"} });
+
+    // The request the lease was issued for is still in flight: the key it names
+    // is the credential of that request and must not be freed under it. The
+    // other borrows are what `AiKeyManager.providerFor` copies into the
+    // `AiProvider` it hands out (`provider`/`endpoint`/`key`/`pool`).
+    try std.testing.expectEqual(@as(usize, 1), reg.retiredCount(std.testing.io));
+    try std.testing.expectEqualStrings("sk-old", lease.key);
+    try std.testing.expectEqualStrings("p", lease.provider);
+    try std.testing.expectEqualStrings("https://old/v1/chat/completions", lease.endpoint);
+    try std.testing.expect(lease.pool == &reg.retired.items[0].pool);
+}
+
+test "a replaced provider's lease does not write into the replacement" {
+    const allocator = std.testing.allocator;
+    var reg = ProviderRegistry.init(allocator);
+    defer reg.deinit();
+    try reg.register(std.testing.io, "p", "https://old/v1/chat/completions", &.{"sk-old"}, .{ .models = &.{"m"} });
+    const lease = try reg.acquire(std.testing.io, "m");
+    try reg.register(std.testing.io, "p", "https://new/v1/chat/completions", &.{ "sk-new-1", "sk-new-2" }, .{ .models = &.{"m"} });
+
+    // Feedback rides on the lease: it is about the key that served the request,
+    // which by key index alone happens to be key 0 of the replacement too.
+    reg.onError(std.testing.io, lease, .rate_limit);
+
+    const keys = try reg.providers.items[0].pool.snapshot(std.testing.io, allocator);
+    defer allocator.free(keys);
+    try std.testing.expectEqual(@as(u64, 0), keys[0].total_errors);
+    try std.testing.expectEqual(KeyStatus.healthy, keys[0].status);
+    try std.testing.expectEqual(@as(u64, 0), keys[1].total_errors);
+    try std.testing.expectEqual(KeyStatus.healthy, keys[1].status);
+
+    // ... and the failure is not lost either: it is recorded on the pool the
+    // lease was taken from, which is exactly what the feedback is about.
+    const old_keys = try reg.retired.items[0].pool.snapshot(std.testing.io, allocator);
+    defer allocator.free(old_keys);
+    try std.testing.expectEqual(@as(u64, 1), old_keys[0].total_errors);
+    try std.testing.expectEqual(KeyStatus.cooling, old_keys[0].status);
+    try std.testing.expectEqualStrings("sk-old", lease.key);
+}
+
+test "a lease survives a registration that moves the provider list" {
+    const allocator = std.testing.allocator;
+    var reg = ProviderRegistry.init(allocator);
+    defer reg.deinit();
+    try reg.register(std.testing.io, "p0", "https://p0/v1/chat/completions", &.{"sk-0"}, .{ .models = &.{"m"} });
+    const lease = try reg.acquire(std.testing.io, "m");
+
+    // Fill the list until `ArrayList.append` has to move the entries, which
+    // frees the buffer the lease's pointers were taken from.
+    const initial_capacity = reg.providers.capacity;
+    var name_buf: [16]u8 = undefined;
+    var i: usize = 1;
+    while (reg.providers.capacity == initial_capacity) : (i += 1) {
+        try std.testing.expect(i < 64);
+        const name = try std.fmt.bufPrint(&name_buf, "extra{d}", .{i});
+        try reg.register(std.testing.io, name, "https://x/v1/chat/completions", &.{"sk-x"}, .{});
+    }
+
+    // Reading the lease first: it must not touch the freed buffer. The rest of
+    // this test is exercised green only (`try` ends the test at the first
+    // failure), and the write below would be a write into freed memory.
+    try std.testing.expectEqualStrings("sk-0", lease.key);
+    try std.testing.expect(lease.pool == &reg.providers.items[0].pool);
+
+    reg.onSuccess(std.testing.io, lease);
+    const keys = try reg.providers.items[0].pool.snapshot(std.testing.io, allocator);
+    defer allocator.free(keys);
+    try std.testing.expectEqual(@as(u64, 1), keys[0].total_calls);
+}
+
+test "every allocation failure inside register and deinit is reported and leaks nothing" {
+    // `api_keys` is empty on purpose: a failed `register` in the *keyed* case
+    // currently leaks the key string inside `key_pool.KeyPool.init`
+    // (`owned.append(allocator, .{ .key = try allocator.dupe(u8, k) })` — the
+    // dupe succeeds, the append's growth fails, and the errdefer only knows
+    // about `owned.items`). That is a pre-existing defect in `key_pool.zig`,
+    // not in this file, and it would mask the ownership paths this test is for.
+    const Scan = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var reg = ProviderRegistry.init(allocator);
+            defer reg.deinit();
+            // New provider: strings, pool, entry box, list slot, by_name entry.
+            try reg.register(std.testing.io, "p", "https://p/v1/chat/completions", &.{}, .{
+                .models = &.{ "m1", "m2" },
+                .fallback_providers = &.{"q"},
+            });
+            // Replacement: the replaced box must reach `retired` (or be freed
+            // when the move to `retired` itself fails) and be freed by `deinit`.
+            try reg.register(std.testing.io, "p", "https://p2/v1/chat/completions", &.{}, .{
+                .models = &.{"m1"},
+            });
+            // A second provider: the append + by_name path for a name that is
+            // not a replacement.
+            try reg.register(std.testing.io, "q", "https://q/v1/chat/completions", &.{}, .{
+                .models = &.{"m1"},
+            });
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scan.run, .{});
 }
 
 var fake_now: i64 = 1_000_000;

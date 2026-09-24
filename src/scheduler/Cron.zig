@@ -168,10 +168,20 @@ pub const Scheduler = struct {
     /// Add a job to the scheduler. The name is copied, so the caller may reuse
     /// or free its buffer afterwards. Safe from any thread (mutex-protected
     /// against the background loop).
+    ///
+    /// The lock wait is a cancelation point this signature can report:
+    /// `std.Io.Mutex.lock` fails only with `error.Canceled`, so the old
+    /// `catch return error.SchedulerLockFailed` told the caller the scheduler's
+    /// lock machinery had failed when the truth was that the caller was being
+    /// canceled. Nothing is at stake — the job is not registered either way, and
+    /// the `errdefer` above frees the copied name. Red:
+    /// `scheduler.Cron.test.addJob and listJobNames report a canceled lock wait
+    /// as error.Canceled` reads `expected error.Canceled, found
+    /// error.SchedulerLockFailed`.
     pub fn addJob(self: *Scheduler, name: []const u8, schedule: Expression, task: *const fn (*anyopaque) void, context: *anyopaque) !void {
         const name_copy = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(name_copy);
-        self.mutex.lock(self.io) catch return error.SchedulerLockFailed;
+        try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
         try self.jobs.append(self.allocator, .{
             .name = name_copy,
@@ -203,7 +213,7 @@ pub const Scheduler = struct {
         // Uncancelable: `0` is a published reading, not a placeholder — it says "no
         // jobs are scheduled" while jobs are registered and firing. There is no
         // error channel (the `usize` *is* the answer), and `listJobNames` next door
-        // reports `error.SchedulerLockFailed` rather than inventing a short list.
+        // reports `error.Canceled` rather than inventing a short list.
         // Red: `scheduler.Cron.test.canceled lock wait does not fabricate an empty
         // job count` reads `expected 1, found 0`.
         self.mutex.lockUncancelable(self.io);
@@ -213,8 +223,13 @@ pub const Scheduler = struct {
 
     /// Duplicated names of registered jobs (caller frees each entry and the
     /// slice). Thread-safe.
+    ///
+    /// Same cancelation contract as `addJob`: the lock wait is reported as
+    /// `error.Canceled`, never as a lock-machinery name, because that is the only
+    /// way `std.Io.Mutex.lock` fails. Nothing is allocated before the lock is
+    /// held, so a canceled wait leaves nothing behind.
     pub fn listJobNames(self: *Scheduler, allocator: std.mem.Allocator) ![][]const u8 {
-        self.mutex.lock(self.io) catch return error.SchedulerLockFailed;
+        try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
         const out = try allocator.alloc([]const u8, self.jobs.items.len);
         errdefer allocator.free(out);
@@ -255,7 +270,14 @@ pub const Scheduler = struct {
     /// tests can drive scheduling deterministically (the background loop calls
     /// this once per tick).
     pub fn tick(self: *Scheduler, now: i64) void {
-        self.mutex.lock(self.io) catch return;
+        // Uncancelable: the pass has no error channel, and abandoning the wait
+        // drops every job whose minute this is without telling the caller a pass
+        // was skipped (the loop retries a second later, but only while the caller
+        // stays cancelable). The critical section is the jobs themselves — the
+        // same reason `ThreadSafeEventBus.publish` holds its mutex across the
+        // callbacks. Red: `scheduler.Cron.test.canceled lock wait does not skip a
+        // due tick` reads `expected 1, found 0`.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const minute_start = @divFloor(now, 60) * 60;
         for (self.jobs.items) |*job| {
@@ -554,7 +576,7 @@ test "canceled lock wait does not report a live job as missing" {
 // `jobCount` answering a canceled lock wait with `0` reports "no jobs scheduled"
 // while jobs are registered and firing on every matching tick — the reading an
 // operator checks wiring with, and the one `listJobNames` next door contradicts
-// (it *has* an error channel and reports `error.SchedulerLockFailed` instead of
+// (it *has* an error channel and reports `error.Canceled` instead of
 // inventing a short list). The count is a `usize`, so there is nowhere to put the
 // cancelation, and the critical section is a length read.
 //
@@ -605,4 +627,155 @@ test "canceled lock wait does not fabricate an empty job count" {
     read_fut.await(io);
 
     try std.testing.expectEqual(@as(usize, 1), Task.count);
+}
+
+// `addJob` and `listJobNames` answered a canceled lock with
+// `error.SchedulerLockFailed`. Nothing is fabricated by that name — neither call
+// did its work — but it is the wrong fact: `std.Io.Mutex.lock` fails only with
+// `error.Canceled`, so a cancelation was reported as lock-machinery failure, and
+// a caller cannot tell "unwind, you were canceled" from "this scheduler's lock is
+// broken". Both error sets are inferred and nothing is allocated before the lock
+// is held, so naming the truth costs no call site.
+//
+// Red evidence: with the old `catch return error.SchedulerLockFailed` both
+// assertions below read `expected error.Canceled, found error.SchedulerLockFailed`.
+test "addJob and listJobNames report a canceled lock wait as error.Canceled" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const Task = struct {
+        var sched: *Scheduler = undefined;
+        var op: *const fn (*Scheduler) void = undefined;
+        var schedule: Expression = undefined;
+        var job_ctx: u8 = 0;
+        var add_err: ?anyerror = null;
+        var list_err: ?anyerror = null;
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+
+        fn onAdd(s: *Scheduler) void {
+            s.addJob("nightly", schedule, noop, &job_ctx) catch |e| {
+                add_err = e;
+            };
+        }
+
+        fn onList(s: *Scheduler) void {
+            const names = s.listJobNames(std.testing.allocator) catch |e| {
+                list_err = e;
+                return;
+            };
+            for (names) |n| std.testing.allocator.free(n);
+            std.testing.allocator.free(names);
+        }
+
+        fn noop(_: *anyopaque) void {}
+
+        fn body() void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            op(sched);
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+
+        /// Park the task on the scheduler mutex this thread holds, place the
+        /// cancelation request while it is parked, then release the lock: the
+        /// call reports whatever it answers a canceled wait with.
+        fn run(op_fn: *const fn (*Scheduler) void) !void {
+            op = op_fn;
+            entered.store(false, .monotonic);
+            open.store(false, .monotonic);
+
+            try sched.mutex.lock(io);
+            var task_fut = try io.concurrent(body, .{});
+            while (!entered.load(.acquire)) std.atomic.spinLoopHint();
+
+            var cancel_fut = try io.concurrent(cancel, .{ io, &task_fut });
+            try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+            open.store(true, .release);
+            while (sched.mutex.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+            sched.mutex.unlock(io);
+            cancel_fut.await(io);
+            task_fut.await(io);
+        }
+    };
+
+    var sched = Scheduler.init(allocator, io);
+    defer sched.deinit();
+    Task.sched = &sched;
+    Task.schedule = try Expression.parse("* * * * *");
+
+    Task.add_err = null;
+    try Task.run(Task.onAdd);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), Task.add_err);
+    // The failure was real: no job was registered (and the copied name was freed).
+    try std.testing.expectEqual(@as(usize, 0), sched.jobCount());
+
+    Task.list_err = null;
+    try Task.run(Task.onList);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), Task.list_err);
+}
+
+// `tick` answered a canceled lock wait with `return`: the pass was abandoned
+// silently, so every job whose minute it was never ran and nothing told the
+// caller a pass had been skipped. The pass has no error channel, and its critical
+// section is the jobs themselves — the same reason
+// `ThreadSafeEventBus.publish` holds its mutex across the callbacks — so it
+// waits.
+//
+// Red evidence: with the old `catch return` the assertion below reads
+// `expected 1, found 0`.
+test "canceled lock wait does not skip a due tick" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const Task = struct {
+        var sched: *Scheduler = undefined;
+        var runs = std.atomic.Value(usize).init(0);
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+
+        fn count(_: *anyopaque) void {
+            _ = runs.fetchAdd(1, .monotonic);
+        }
+
+        fn body() void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            // 2023-11-14T22:15:40Z — a second "* * * * *" matches.
+            sched.tick(1_700_000_140);
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+
+    var sched = Scheduler.init(allocator, io);
+    defer sched.deinit();
+    var job_ctx: u8 = 0;
+    try sched.addJob("nightly", try Expression.parse("* * * * *"), Task.count, &job_ctx);
+    Task.sched = &sched;
+
+    Task.runs.store(0, .monotonic);
+    Task.entered.store(false, .monotonic);
+    Task.open.store(false, .monotonic);
+
+    try sched.mutex.lock(io);
+    var task_fut = try io.concurrent(Task.body, .{});
+    while (!Task.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Task.cancel, .{ io, &task_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Task.open.store(true, .release);
+    while (sched.mutex.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    sched.mutex.unlock(io);
+    cancel_fut.await(io);
+    task_fut.await(io);
+
+    try std.testing.expectEqual(@as(usize, 1), Task.runs.load(.monotonic));
 }

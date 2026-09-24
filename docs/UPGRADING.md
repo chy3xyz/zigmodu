@@ -85,6 +85,17 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 参数数组。现在重复名**替换**（与原 docstring 一致，"注册即设置"的 40+ 处调用不受影响），超容量走正常的
 可失败分配路径并如实返回错误。若你的代码依赖"超容量必定 panic"或"重复注册保留旧工具"，需要改。
 
+**破坏：无类型 `EventBus(T).subscribe` 现在返回错误。** 它以前是 `void`，却用 `getOrPutAssumeCapacity` /
+`addAssumeCapacity` 在"只记了日志"的预留上写入 —— 预留不足时会**写越界**（同一事件类型第 5 个回调就会
+触发，因为初始预留是 4）。现在与同文件的 `TypedEventBus`/`ThreadSafeEventBus` 一致，是 `!void`
+（`docs/API.md` 一直就是这么写的）。
+**Breaking?** 是（编译错）· **影响面**：直接调 `bus.subscribe(...)` 的应用代码 · **一行改法**：
+`bus.subscribe(MyEvent, handler);` → `try bus.subscribe(MyEvent, handler);`（模块监听器走
+`ApplicationModuleListener.subscribe()`，那个签名本来就是 `!void`，不需要改）。
+另：**同名 `ProviderRegistry.register` 不再立刻释放被替换的 provider**（改为 retired，推迟到 `deinit`；
+`retiredCount()` 可观测），所以旧租约继续把反馈写进它自己的池，而不是串到替换者身上。若你的代码依赖
+"替换后旧条目立即释放"，这条是行为变化；若你只是热加载同名配置，这条修掉的正是 use-after-free。
+
 **行为变化（非破坏）⑨：一批"取消被当成成功/默认值"的路径改成等待或报错。** 涉及 `EventBus`
 （`publish`/`unsubscribe`/`subscriberCount`/`publishedCount` 改不可取消的等待；**`subscribe`/`subscribeAsync`
 现在会返回 `error.Canceled`** —— 以前它们**返回成功却没注册**）、`EventStore`

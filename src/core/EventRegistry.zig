@@ -44,9 +44,19 @@ pub const EventRegistry = struct {
     /// Get or create the shared bus for event type `T`. Creation is
     /// mutex-guarded; the returned pointer is stable for the registry's
     /// lifetime and may be published/subscribed from any thread.
+    ///
+    /// The lock wait is a cancelation point this signature can report:
+    /// `std.Io.Mutex.lock` fails only with `error.Canceled`, so the old
+    /// `catch return error.LockFailed` reported lock-machinery failure for a
+    /// cancelation — a caller cannot tell "unwind, you were canceled" from "this
+    /// registry's lock is broken". Nothing is at stake in the abandoned critical
+    /// section (it is taken before any bus is created, so no half-built bus is
+    /// left behind); the honest answer is the cancelation itself. Red:
+    /// `core.EventRegistry.test.bus() reports a canceled lock wait as
+    /// error.Canceled` reads `expected error.Canceled, found error.LockFailed`.
     pub fn bus(self: *Self, comptime T: type) !*EventBus.ThreadSafeEventBus(T) {
         const key = @typeName(T);
-        self.mu.lock(self.io) catch return error.LockFailed;
+        try self.mu.lock(self.io);
         defer self.mu.unlock(self.io);
 
         if (self.buses.get(key)) |entry| {
@@ -112,4 +122,65 @@ test "EventRegistry bus delivers events to subscribers" {
     try bus.subscribe(Ctx.onEvent);
     bus.publish(.{ .id = 42 });
     try std.testing.expectEqual(@as(i64, 42), Ctx.received);
+}
+
+// `bus()` answered a canceled lock with `error.LockFailed`. Nothing is fabricated
+// by that name — no bus is created behind the caller's back — but it is the wrong
+// fact: `std.Io.Mutex.lock` fails only with `error.Canceled`, so a cancelation was
+// reported as lock-machinery failure, and the caller cannot tell "unwind, you were
+// canceled" from "this registry's lock is broken". The error set is inferred, so
+// naming the truth costs no call site (`Application.eventBus` and
+// `ModuleContext.eventBus` just `try` it).
+test "EventRegistry bus() reports a canceled lock wait as error.Canceled" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const E = struct { id: i64 };
+
+    const Task = struct {
+        var err: ?anyerror = null;
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+
+        fn get(reg: *EventRegistry) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            _ = reg.bus(E) catch |e| {
+                err = e;
+                return;
+            };
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+
+    var reg = EventRegistry.init(allocator, io);
+    defer reg.deinit();
+
+    Task.err = null;
+    Task.entered.store(false, .monotonic);
+    Task.open.store(false, .monotonic);
+
+    // The test thread holds the registry mutex, so the task parks on the lock
+    // wait and the cancelation is delivered there. Same idiom as the
+    // canceled-lock-wait tests in `core/EventBus.zig` / `core/EventStore.zig`.
+    try reg.mu.lock(io);
+
+    var task_fut = try io.concurrent(Task.get, .{&reg});
+    while (!Task.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Task.cancel, .{ io, &task_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Task.open.store(true, .release);
+    while (reg.mu.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    reg.mu.unlock(io);
+
+    cancel_fut.await(io);
+    task_fut.await(io);
+
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), Task.err);
+    // The failure was real: no bus was created behind the caller's back.
+    try std.testing.expectEqual(@as(usize, 0), reg.busCount());
 }

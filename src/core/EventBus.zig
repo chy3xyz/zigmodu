@@ -25,6 +25,9 @@ fn ListenerSet(comptime CallbackType: type) type {
 
         pub fn init(allocator: std.mem.Allocator) Self {
             var list = std.ArrayList(CallbackType).empty;
+            // Hint, not a guarantee: the adders report their own allocation
+            // failures. The `appendAssumeCapacity` this reservation used to feed
+            // wrote past the list whenever the reservation had failed.
             list.ensureTotalCapacity(allocator, 4) catch |err| std.log.warn("[EventBus] listener capacity prealloc failed: {}", .{err});
             return .{
                 .list = list,
@@ -39,10 +42,6 @@ fn ListenerSet(comptime CallbackType: type) type {
 
         pub fn add(self: *Self, callback: CallbackType) !void {
             try self.list.append(self.allocator, callback);
-        }
-
-        pub fn addAssumeCapacity(self: *Self, callback: CallbackType) void {
-            self.list.appendAssumeCapacity(callback);
         }
 
         pub fn remove(self: *Self, callback: CallbackType) bool {
@@ -97,8 +96,12 @@ pub fn EventBus(comptime EventType: type) type {
             return initCapacity(alloc, 32);
         }
 
-        /// Init with capacity hint (max distinct event types). Pre-allocates
-        /// HashMap storage so runtime subscribe() is infallible.
+        /// Init with a capacity hint (expected number of distinct event types).
+        /// The reservation is a hint only: a failed `ensureTotalCapacity` is
+        /// logged, and `subscribe` then grows the map or reports
+        /// `error.OutOfMemory`. It cannot be a guarantee — nothing bounds how many
+        /// distinct event types a caller subscribes, and the constructor has no
+        /// error channel to report a short reservation through.
         pub fn initCapacity(alloc: std.mem.Allocator, capacity: usize) Self {
             var listeners = std.AutoHashMap(EventType, ListenerSet(CallbackType)).init(alloc);
             listeners.ensureTotalCapacity(@intCast(capacity)) catch |err| std.log.warn("[EventBus] listeners capacity prealloc failed: {}", .{err});
@@ -117,13 +120,23 @@ pub fn EventBus(comptime EventType: type) type {
             self.* = undefined;
         }
 
-        /// Infallible subscribe — capacity pre-allocated in initCapacity.
-        pub fn subscribe(self: *Self, event_type: EventType, callback: CallbackType) void {
-            const result = self.listeners.getOrPutAssumeCapacity(event_type);
+        /// Registers `callback` for `event_type`.
+        ///
+        /// Fallible, because both growth paths can need the allocator: the
+        /// event-type map (nothing bounds how many distinct event types a caller
+        /// subscribes, and `initCapacity`'s reservation only *logs* its failure)
+        /// and the per-type listener list (its 4 slots are reserved the same
+        /// way). The `getOrPutAssumeCapacity` / `addAssumeCapacity` pair this
+        /// replaces wrote past unreserved storage in exactly those cases instead
+        /// of reporting anything. `error.OutOfMemory` means the listener is NOT
+        /// registered; a failed subscribe can leave an empty listener set behind
+        /// for that event type, which reads the same as nobody having subscribed.
+        pub fn subscribe(self: *Self, event_type: EventType, callback: CallbackType) !void {
+            const result = try self.listeners.getOrPut(event_type);
             if (!result.found_existing) {
                 result.value_ptr.* = ListenerSet(CallbackType).init(self.allocator);
             }
-            result.value_ptr.addAssumeCapacity(callback);
+            try result.value_ptr.add(callback);
         }
 
         pub fn unsubscribe(self: *Self, event_type: EventType, callback: CallbackType) void {
@@ -700,4 +713,46 @@ test "ThreadSafeEventBus subscribe reports a canceled lock wait as error.Cancele
     try std.testing.expectEqual(@as(?anyerror, error.Canceled), Task.err);
     // The failure was real: nothing was registered behind the caller's back.
     try std.testing.expectEqual(@as(usize, 0), bus.subscriberCount());
+}
+
+// The untyped bus's `subscribe` was documented as infallible — "capacity
+// pre-allocated in initCapacity" — and backed by `getOrPutAssumeCapacity` /
+// `addAssumeCapacity`. The premise does not hold: `initCapacity` and
+// `ListenerSet.init` only *log* a failed `ensureTotalCapacity`. Red evidence on
+// that shape: this test aborted the binary with `panic: integer overflow` inside
+// `subscribe` (the zero-capacity map's `capacity() - 1`) right after
+// `[EventBus] listeners capacity prealloc failed: error.OutOfMemory`. Sweeping
+// `fail_index` walks a failure through each allocation of `initCapacity` plus the
+// first subscribe; the contract now is "the listener is registered, or you get
+// `error.OutOfMemory`".
+test "untyped EventBus subscribe registers the listener or reports OutOfMemory" {
+    const allocator = std.testing.allocator;
+    const E = enum { a };
+    const Ctx = struct {
+        var received = std.atomic.Value(u32).init(0);
+        fn onEvent(event: E, _: *anyopaque) void {
+            _ = event;
+            _ = received.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var payload: u8 = 0;
+    for (0..8) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        var bus = EventBus(E).initCapacity(failing.allocator(), 4);
+        defer bus.deinit();
+
+        Ctx.received.store(0, .monotonic);
+        bus.subscribe(.a, Ctx.onEvent) catch |err| {
+            try std.testing.expectEqual(@as(anyerror, error.OutOfMemory), err);
+            // A failed subscribe registers nothing — there is no half
+            // subscription that would fire the callback with the caller none the
+            // wiser.
+            try std.testing.expectEqual(@as(usize, 0), bus.subscriberCount(.a));
+            continue;
+        };
+        try std.testing.expectEqual(@as(usize, 1), bus.subscriberCount(.a));
+        bus.publish(.a, &payload);
+        try std.testing.expectEqual(@as(u32, 1), Ctx.received.load(.monotonic));
+    }
 }

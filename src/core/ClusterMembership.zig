@@ -3,6 +3,35 @@
 //! Uses `subscribeWithContext` so membership events update this node's table
 //! (join / heartbeat / leave / leader_election). Suitable for small clusters
 //! (documented guidance: 3–7 nodes) behind an external load balancer.
+//!
+//! ## What `nodes` is (a census — nothing is retired)
+//!
+//! `nodes` holds every node this process has ever heard about, `self` included,
+//! and entries are **appended, never removed** (there is no removal path in this
+//! file; `deinit` is the only thing that frees one). Liveness lives in
+//! `ClusterNode.state`: a peer that misses `node_timeout_ms` walks
+//! `healthy → suspect → failed` and **stays in the map**. Three things depend on
+//! that, so it is the intent, not an omission:
+//!
+//!  * `nodesSnapshot` lends out `ClusterNode` values whose `id` borrows the map's
+//!    own copy, and its consumer (`cluster/MembershipView.zig`) copies those
+//!    strings into the view *after* the lock is dropped. Freeing an id before the
+//!    membership dies would turn that copy into a use-after-free.
+//!  * The read side wants the dead peer *visible*: `MembershipView.sync` publishes
+//!    it with `healthy = false`, which keeps it out of `ClusterView.pick` while
+//!    still showing an operator that it exists.
+//!  * A peer that comes back is the *same* entry — `handleGossipEvent` resets any
+//!    non-healthy state to `.healthy` on its next heartbeat. So there is no re-add
+//!    path that could double-count, and no join callback for a peer that merely
+//!    returned.
+//!
+//! Consequences to read the accessors by: `getNodeCount` is the **census** (dead
+//! peers included, so it is not the live cluster size), `getHealthyNodeCount` is
+//! the live reading, and everything that needs liveness filters on state —
+//! `electLeaderLocked` (below), `MembershipView` and `ClusterView.pick`. The
+//! census is bounded by the number of distinct node ids ever seen, not by the
+//! cluster size: a peer that restarts under a **new** id leaves its old entry
+//! behind until `deinit`.
 
 const std = @import("std");
 const Time = @import("Time.zig");
@@ -177,6 +206,10 @@ pub const ClusterMembership = struct {
         const timeout_secs = @divFloor(self.node_timeout_ms, 1000);
         var should_broadcast_leader = false;
 
+        // Cancelable on purpose, unlike the read accessors below: this is a
+        // *periodic* pass over facts that are already recorded (`last_seen`, the
+        // detector's samples), so a canceled wait costs one tick and nothing else —
+        // the next `runOnce` re-derives the same transition from the same inputs.
         self.mutex.lock(self.io) catch return;
         {
             defer self.mutex.unlock(self.io);
@@ -299,6 +332,13 @@ pub const ClusterMembership = struct {
     }
 
     pub fn handleGossipEvent(self: *Self, event: GossipEvent) void {
+        // Cancelable on purpose: a dropped membership event is bounded staleness,
+        // not a lost fact — the peer's next heartbeat re-announces it (the same
+        // recovery the OOM branch below relies on), and a peer that really left is
+        // failed by the next health pass (`2 × node_timeout_ms`). The exception
+        // worth knowing: a dropped `.leader_election` can leave this node on a
+        // stale leader until a later election is announced or its own health pass
+        // fails the leader it holds.
         self.mutex.lock(self.io) catch return;
         defer self.mutex.unlock(self.io);
 
@@ -394,6 +434,12 @@ pub const ClusterMembership = struct {
         std.log.info("[ClusterMembership] Connected to seed node {s} at {any}", .{ node_id, address });
     }
 
+    /// How many nodes this process knows about — the **census**, `self`
+    /// included, with peers in any non-healthy state (`.suspect`, `.failed`,
+    /// `.leaving`) still counted (see "What `nodes` is" at the top of this file).
+    /// This is therefore *not* the live cluster size: `getHealthyNodeCount` is the
+    /// reading a health endpoint or a capacity number wants, and no in-tree caller
+    /// makes a quorum decision on this one.
     pub fn getNodeCount(self: *Self) usize {
         // Uncancelable: `0` is a published reading, not a placeholder — it says
         // "this cluster holds no nodes" to whatever health endpoint or metrics
@@ -404,6 +450,12 @@ pub const ClusterMembership = struct {
         return self.nodes.count();
     }
 
+    /// How many nodes are `.healthy` right now. `suspect`, `failed` and
+    /// `leaving` peers are **not** counted, so this is the live reading — and it
+    /// is the one to use wherever "how much cluster is up" matters (the census
+    /// `getNodeCount` returns would count dead peers). `self` counts: nothing in
+    /// this file moves it off `.healthy` (the health pass skips it and gossip from
+    /// itself is ignored).
     pub fn getHealthyNodeCount(self: *Self) usize {
         // Uncancelable, for the same reason as `getNodeCount`: a fabricated `0`
         // reads as "every node is down", which is the input a quorum or capacity
@@ -426,6 +478,14 @@ pub const ClusterMembership = struct {
     /// from here (`cluster/MembershipView.zig`), so request paths never touch
     /// this hash map. `ClusterNode` values borrow `id` — valid while the
     /// membership lives, which is exactly what a view publish expects.
+    ///
+    /// What comes back is the **census**, and it only grows: a `.failed` peer is
+    /// still listed, with the state a consumer needs to keep it out of routing
+    /// (`MembershipView.sync` publishes it as `healthy = false`; `ClusterView.pick`
+    /// skips it) instead of losing the operator's only record that it exists. The
+    /// list therefore cannot shrink under a consumer — `deinit` is the only thing
+    /// that drops an entry. Truncation is bounded by `out.len`; the copy stops
+    /// there rather than writing past it.
     pub fn nodesSnapshot(self: *Self, out: []ClusterNode) usize {
         // Uncancelable: `0` is a published reading, not a placeholder — this is
         // the snapshot the read side is fed from (`cluster/MembershipView.zig`),
@@ -475,6 +535,9 @@ pub const ClusterMembership = struct {
 
     pub fn electLeader(self: *Self) void {
         const should_broadcast = blk: {
+            // Cancelable on purpose: an election is idempotent — it re-derives the
+            // winner from `nodes` — and every node runs the same pass, so a canceled
+            // wait costs one round rather than the election.
             self.mutex.lock(self.io) catch return;
             defer self.mutex.unlock(self.io);
             break :blk self.electLeaderLocked();
@@ -825,6 +888,107 @@ test "ClusterMembership checkNodeHealth re-elects before it lets the lock go" {
     try std.testing.expectEqual(ClusterMembership.NodeState.failed, cluster.nodes.get("node-a").?.state);
     try std.testing.expectEqualStrings("node-m", cluster.getLeader().?);
     try std.testing.expect(cluster.isLeader());
+}
+
+// What this file decides about a peer that walks to `.failed` (see "What `nodes`
+// is" at the top): it is **not** retired. It stays in the census — still counted
+// by `getNodeCount`, still listed by `nodesSnapshot` — while `getHealthyNodeCount`
+// and leader election ignore it by state. Pinned here because that is the reading
+// the accessors publish: "we still know about it" is the intent, and the reader
+// side depends on the dead peer staying *visible* as unhealthy rather than
+// disappearing from the snapshot.
+test "ClusterMembership a failed node stays in the census and out of the healthy count" {
+    const allocator = std.testing.allocator;
+
+    var bus = try DistributedEventBus.init(allocator, std.testing.io, "census-bus");
+    defer bus.deinit();
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 18220);
+    var cluster = try ClusterMembership.init(allocator, std.testing.io, "node-m", addr, &bus);
+    defer cluster.deinit();
+
+    // Peers go straight into the table: the `join` path for an unknown node dials
+    // a socket, and this test is about the census, not networking. "node-a" has
+    // the lowest id (it wins an election) and is backdated well past
+    // `node_timeout_ms` (10s default, doubled for the suspect → failed step), so
+    // each health pass advances it one state; "node-z" is fresh and must stay
+    // healthy throughout.
+    const peer_a = try allocator.dupe(u8, "node-a");
+    try cluster.nodes.put(peer_a, .{
+        .id = peer_a,
+        .address = addr,
+        .state = .healthy,
+        .last_seen = Time.monotonicNowSeconds() - 100,
+        .joined_at = 0,
+    });
+    const peer_z = try allocator.dupe(u8, "node-z");
+    try cluster.nodes.put(peer_z, .{
+        .id = peer_z,
+        .address = addr,
+        .state = .healthy,
+        .last_seen = Time.monotonicNowSeconds(),
+        .joined_at = 0,
+    });
+
+    cluster.electLeader();
+    try std.testing.expectEqual(@as(usize, 3), cluster.getNodeCount());
+    try std.testing.expectEqual(@as(usize, 3), cluster.getHealthyNodeCount());
+    try std.testing.expectEqualStrings("node-a", cluster.getLeader().?);
+
+    cluster.checkNodeHealth();
+    try std.testing.expectEqual(ClusterMembership.NodeState.suspect, cluster.nodes.get("node-a").?.state);
+    try std.testing.expectEqual(@as(usize, 3), cluster.getNodeCount());
+    try std.testing.expectEqual(@as(usize, 2), cluster.getHealthyNodeCount());
+
+    cluster.checkNodeHealth();
+    try std.testing.expectEqual(ClusterMembership.NodeState.failed, cluster.nodes.get("node-a").?.state);
+
+    // The decision: a failed peer is counted by the census and *not* by the live
+    // reading, and both numbers are answers rather than placeholders.
+    try std.testing.expectEqual(@as(usize, 3), cluster.getNodeCount());
+    try std.testing.expectEqual(@as(usize, 2), cluster.getHealthyNodeCount());
+
+    // And it is still listed, with the state a consumer keys off: `MembershipView`
+    // turns it into `healthy = false`, which `ClusterView.pick` skips, while the
+    // operator's view keeps the record that the peer existed.
+    var snapshot: [4]ClusterMembership.ClusterNode = undefined;
+    var listed = cluster.nodesSnapshot(&snapshot);
+    try std.testing.expectEqual(@as(usize, 3), listed);
+    var failed_seen = false;
+    for (snapshot[0..listed]) |node| {
+        if (std.mem.eql(u8, node.id, "node-a")) {
+            try std.testing.expectEqual(ClusterMembership.NodeState.failed, node.state);
+            failed_seen = true;
+        }
+    }
+    try std.testing.expect(failed_seen);
+
+    // Leader election also filters by state, so the dead peer does not lead: the
+    // node that is actually up does, and `isLeader` agrees with `getLeader`.
+    try std.testing.expectEqualStrings("node-m", cluster.getLeader().?);
+    try std.testing.expect(cluster.isLeader());
+
+    // The peer coming back reuses the same entry — one heartbeat, no second copy,
+    // no extra census slot. This is why "never retire" costs nothing on the
+    // rejoin path (and why the join callback does not fire for a peer that merely
+    // returned).
+    cluster.handleGossipEvent(.{
+        .event_type = .heartbeat,
+        .node_id = "node-a",
+        .host = "127.0.0.1",
+        .port = 18221,
+        .timestamp = 0,
+    });
+    try std.testing.expectEqual(ClusterMembership.NodeState.healthy, cluster.nodes.get("node-a").?.state);
+    try std.testing.expectEqual(@as(usize, 3), cluster.getNodeCount());
+    try std.testing.expectEqual(@as(usize, 3), cluster.getHealthyNodeCount());
+
+    listed = cluster.nodesSnapshot(&snapshot);
+    var copies: usize = 0;
+    for (snapshot[0..listed]) |node| {
+        if (std.mem.eql(u8, node.id, "node-a")) copies += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), copies);
 }
 
 // The three read-only accessors answering a canceled lock wait with a fabricated

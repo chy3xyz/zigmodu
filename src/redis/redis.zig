@@ -196,6 +196,7 @@ pub const Redis = struct {
         fn init(allocator: std.mem.Allocator, size: u32) !ConnPool {
             const n = @max(size, 1);
             const streams = try allocator.alloc(?std.Io.net.Stream, n);
+            errdefer allocator.free(streams);
             @memset(streams, null);
             const in_use = try allocator.alloc(bool, n);
             @memset(in_use, false);
@@ -942,12 +943,24 @@ pub const RedisCluster = struct {
         self.* = undefined;
     }
 
+    /// Add a node. `nodes` and `node_configs` are parallel — `selectNode`
+    /// routes by the former, `deinit` walks both — so the pair is recorded in
+    /// one step: both buffers are grown up front, and the two appends after
+    /// `Redis.new` cannot fail. Nothing falls between them, so no config can
+    /// outlive its node and no partially built node can be left behind.
     pub fn addNode(self: *Self, host: []const u8, port: u16) !void {
         const host_copy = try self.allocator.dupe(u8, host);
+        errdefer self.allocator.free(host_copy);
         const cfg = RedisConfig{ .host = host_copy, .port = port };
-        try self.node_configs.append(self.allocator, cfg);
-        const redis = try Redis.new(self.allocator, self.io, cfg);
-        try self.nodes.append(self.allocator, redis);
+
+        try self.node_configs.ensureUnusedCapacity(self.allocator, 1);
+        try self.nodes.ensureUnusedCapacity(self.allocator, 1);
+
+        var redis = try Redis.new(self.allocator, self.io, cfg);
+        errdefer redis.deinit();
+
+        self.node_configs.appendAssumeCapacity(cfg);
+        self.nodes.appendAssumeCapacity(redis);
     }
 
     fn selectNode(self: *Self, key: []const u8) ?*Redis {
@@ -1162,6 +1175,13 @@ test "redis cluster init" {
     try cluster.addNode("127.0.0.1", 7002);
 
     try std.testing.expectEqual(@as(usize, 3), cluster.nodes.items.len);
+    // The two arrays are parallel: one config per node, same order, and the
+    // config a node routes with is the one the cluster recorded for it.
+    try std.testing.expectEqual(cluster.nodes.items.len, cluster.node_configs.items.len);
+    for (cluster.node_configs.items, 0..) |cfg, i| {
+        try std.testing.expectEqualStrings("127.0.0.1", cfg.host);
+        try std.testing.expectEqual(cluster.nodes.items[i].config.port, cfg.port);
+    }
 
     // Verify consistent routing for the same key
     const node1 = cluster.selectNode("mykey");
@@ -1201,6 +1221,136 @@ test "redis cluster: addNode nodes carry the cluster io and work" {
         defer allocator.free(v);
         try std.testing.expectEqualStrings("cluster_value", v);
     }
+}
+
+// `addNode` used to be three bare `try`s over three allocations with no
+// unwinding at all: `dupe` then `node_configs.append` then `Redis.new` then
+// `nodes.append`. Every one of the three later failure points left damage
+// behind — `node_configs.append` failing leaked `host_copy`, `nodes.append`
+// failing leaked the whole `Redis` (and the pool `Redis.new` had just
+// allocated for it), and `Redis.new` failing left a config with no node, which
+// breaks the one invariant the two arrays have: they are parallel.
+// `selectNode` routes by `nodes`, `deinit` walks both, and a config that
+// outlives its node is a cluster that reports a node it does not have.
+//
+// The two tests below walk every allocation `addNode` makes. Both need a pool:
+// with `pool_size <= 1` `Redis.new` allocates nothing, the dangerous index
+// ("the node could not be built") would not exist, and the divergence would be
+// untestable.
+
+/// Report `addNode`'s post-failure state the way the two arrays have to agree
+/// on it. Returns the number of ways they do not, so a run can list all of
+/// them instead of stopping at the first.
+fn addNodeOutOfStep(failing: *std.testing.FailingAllocator, fail_index: usize, alloc_count: usize, nodes_len: usize, configs_len: usize) usize {
+    var failures: usize = 0;
+
+    if (!failing.has_induced_failure) {
+        std.debug.print("fail_index {d}/{d}: no allocation was refused\n", .{ fail_index, alloc_count });
+        failures += 1;
+    }
+    if (nodes_len != configs_len or nodes_len != 0) {
+        std.debug.print(
+            "fail_index {d}/{d}: nodes.items.len = {d}, node_configs.items.len = {d} — the arrays are out of step\n",
+            .{ fail_index, alloc_count, nodes_len, configs_len },
+        );
+        failures += 1;
+    }
+
+    return failures;
+}
+
+test "redis cluster: a failed addNode leaves the cluster unchanged and leaks nothing" {
+    const host = "127.0.0.1";
+    const port: u16 = 7000;
+
+    // An unfailed run first: it says exactly how many allocations `addNode`
+    // makes, so each of them can be armed in turn without hardcoding an index
+    // that the next `std.ArrayList` growth strategy would move.
+    var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    {
+        var cluster = RedisCluster.init(counting.allocator(), std.testing.io);
+        defer cluster.deinit();
+        try cluster.addNode(host, port);
+        try std.testing.expectEqual(@as(usize, 1), cluster.nodes.items.len);
+    }
+    const alloc_count = counting.alloc_index;
+
+    var failures: usize = 0;
+    for (0..alloc_count) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        {
+            var cluster = RedisCluster.init(failing.allocator(), std.testing.io);
+            defer cluster.deinit();
+
+            const result = cluster.addNode(host, port);
+            failures += addNodeOutOfStep(&failing, fail_index, alloc_count, cluster.nodes.items.len, cluster.node_configs.items.len);
+            if (result) |_| {
+                std.debug.print("fail_index {d}/{d}: addNode succeeded although an allocation was refused\n", .{ fail_index, alloc_count });
+                failures += 1;
+            } else |err| {
+                if (err != error.OutOfMemory) {
+                    std.debug.print("fail_index {d}/{d}: addNode reported {s}, not error.OutOfMemory\n", .{ fail_index, alloc_count, @errorName(err) });
+                    failures += 1;
+                }
+            }
+
+            // Memory is back: an intact cluster takes the node, in both arrays,
+            // so the failed call must not have spent the state it needs for it.
+            failing.fail_index = std.math.maxInt(usize);
+            const retry = cluster.addNode(host, port);
+            if (retry) |_| {
+                if (cluster.nodes.items.len != 1 or cluster.node_configs.items.len != 1 or
+                    !std.mem.eql(u8, cluster.node_configs.items[0].host, host))
+                {
+                    std.debug.print(
+                        "fail_index {d}/{d}: the retry left nodes.items.len = {d}, node_configs.items.len = {d}, host = \"{s}\"\n",
+                        .{ fail_index, alloc_count, cluster.nodes.items.len, cluster.node_configs.items.len, cluster.node_configs.items[0].host },
+                    );
+                    failures += 1;
+                }
+            } else |err| {
+                std.debug.print("fail_index {d}/{d}: the retry after OOM failed with {s}\n", .{ fail_index, alloc_count, @errorName(err) });
+                failures += 1;
+            }
+        }
+
+        if (failing.allocated_bytes != failing.freed_bytes) {
+            std.debug.print(
+                "fail_index {d}/{d}: leaked {d} of {d} allocated bytes ({d} allocations, {d} deallocations)\n",
+                .{ fail_index, alloc_count, failing.allocated_bytes - failing.freed_bytes, failing.allocated_bytes, failing.allocations, failing.deallocations },
+            );
+            failures += 1;
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), failures);
+}
+
+// The same requirement across a longer sequence than any one index, checked by
+// the std helper: it makes each allocation fail in turn and requires that the
+// failure surfaces as exactly `error.OutOfMemory` with nothing left allocated.
+// The caught-OOM arm is what lets the invariant be asserted on the failure path
+// too — the helper accepts a re-thrown `error.OutOfMemory`, so the lengths are
+// checked before it is handed back, and the stack trace it prints on a mismatch
+// names the allocation that leaked.
+test "redis cluster: every allocation failure inside addNode is reported and leaks nothing" {
+    const Scan = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var cluster = RedisCluster.init(allocator, std.testing.io);
+            defer cluster.deinit();
+
+            cluster.addNode("127.0.0.1", 7000) catch |err| switch (err) {
+                error.OutOfMemory => {
+                    try std.testing.expectEqual(cluster.nodes.items.len, cluster.node_configs.items.len);
+                    return error.OutOfMemory;
+                },
+                else => |e| return e,
+            };
+            try std.testing.expectEqual(cluster.nodes.items.len, cluster.node_configs.items.len);
+            try std.testing.expectEqual(@as(usize, 1), cluster.nodes.items.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scan.run, .{});
 }
 
 // ── RESP framing & single-stream locking (regression tests for the desync bug) ──

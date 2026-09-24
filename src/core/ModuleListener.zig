@@ -48,7 +48,7 @@ pub fn ApplicationModuleListener(comptime EventType: type) type {
             S.current_handler = handler_ptr;
             _ = self.config.async_mode; // delivery mode is informational
 
-            self.event_bus.subscribe(self.event_type, S.wrapper);
+            try self.event_bus.subscribe(self.event_type, S.wrapper);
         }
 
         /// No-op: this listener implementation never removes its subscription.
