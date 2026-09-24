@@ -96,6 +96,14 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 `retiredCount()` 可观测），所以旧租约继续把反馈写进它自己的池，而不是串到替换者身上。若你的代码依赖
 "替换后旧条目立即释放"，这条是行为变化；若你只是热加载同名配置，这条修掉的正是 use-after-free。
 
+**行为变化（非破坏，但你的 dump 可能被判为损坏）**：`MemoryStore.loadJson` / `loadFromFile` 现在**拒绝**
+一份作用域不可用的记忆 dump（`error.InvalidMemoryScope`），而不是把缺失或类型错误的 `tenant_id`/`user_id`
+静默当成 `0`。这条修的是一个**安全**问题：`0` 在 `recall(prefix, 0, …)` 里的含义是 **"any scope"**，所以
+一份损坏的 dump 会把那些行变成任何租户都读得到。**由本框架自己写出的 dump 不受影响**（`dumpJson` 一直把
+这两个字段写成整数，显式写出的 `0` 仍然合法），需要动作的只有手工编辑过、被截断或来自别处的文件 —— 它们
+现在会整份失败并逐条 warn 出下标/字段/实际类型，请修好那一行（或删掉该条目）再加载。
+**Breaking?** 否（`loadJson` 的声明签名未变，只是推断错误集多了一个成员；仓内没有按错误名分支的调用方）。
+
 **行为变化（非破坏）⑨：一批"取消被当成成功/默认值"的路径改成等待或报错。** 涉及 `EventBus`
 （`publish`/`unsubscribe`/`subscriberCount`/`publishedCount` 改不可取消的等待；**`subscribe`/`subscribeAsync`
 现在会返回 `error.Canceled`** —— 以前它们**返回成功却没注册**）、`EventStore`

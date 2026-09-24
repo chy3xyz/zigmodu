@@ -342,6 +342,35 @@ pub const MemoryStore = struct {
     }
 
     /// Load entries from `dumpJson` output (merge/overwrite by composite key).
+    ///
+    /// Never invents a fact, and never invents a scope. Two kinds of unusable
+    /// input get two answers, because only one of them can change what a stored
+    /// memory means:
+    ///
+    ///   - an item that is not a row — not an object, or without a string
+    ///     `key`/`value` — was never readable as a memory, so it is skipped, with
+    ///     a `warn` naming its index and the reason. The skip is the answer; being
+    ///     silent about it was the defect;
+    ///   - an item that carries `key`+`value` but no knowable scope (`tenant_id`/
+    ///     `user_id` missing, or not an integer) refuses the whole load with
+    ///     `error.InvalidMemoryScope`. Admitting it needs a scope the dump does
+    ///     not state, and `0` — what the reader used to substitute — is exactly
+    ///     what `recall` reads as "any" (`matchesScope`), so a corrupt dump
+    ///     *widened* those rows to every "any"-scope read instead of failing.
+    ///     Dropping the row is the other candidate and is worse: it destroys a
+    ///     memory whose content is known, behind a log line. Refusing the file
+    ///     leaves both the row and the decision with the operator.
+    ///
+    /// A scope the dump states is kept as stated, `0` included (an explicit
+    /// `remember(..., 0, 0)` is a scope this store supports): only a *missing* or
+    /// mistyped field is corrupt.
+    ///
+    /// Rows are read before any of them is applied, so a refused load leaves the
+    /// store exactly as it was — a half-merged store *plus* an error is the one
+    /// outcome a caller cannot act on. (An allocation failure while applying
+    /// still leaves a partial merge; a refused file does not.) `created_at`,
+    /// `access_count` and `last_accessed_at` in the dump are not restored: the
+    /// row goes through `remember`, which stamps the entry as new.
     pub fn loadJson(self: *MemoryStore, json: []const u8) !void {
         const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, json, .{});
         defer parsed.deinit();
@@ -349,35 +378,76 @@ pub const MemoryStore = struct {
             .array => |a| a,
             else => return error.InvalidMemoryDump,
         };
-        for (arr.items) |item| {
+
+        const Row = struct {
+            key: []const u8,
+            value: []const u8,
+            tenant_id: i64,
+            user_id: i64,
+        };
+
+        // Pass 1: read. The slices below point into `parsed`, which outlives the
+        // apply pass; `remember` copies what it keeps.
+        var rows = std.ArrayList(Row).empty;
+        defer rows.deinit(self.allocator);
+        for (arr.items, 0..) |item, index| {
             const obj = switch (item) {
                 .object => |o| o,
-                else => continue,
+                else => {
+                    std.log.warn("[ai.memory] dump item {d} skipped: not an object (found {s})", .{ index, @tagName(item) });
+                    continue;
+                },
             };
-            const key = switch (obj.get("key") orelse continue) {
+            const key = switch (obj.get("key") orelse {
+                std.log.warn("[ai.memory] dump item {d} skipped: no `key`", .{index});
+                continue;
+            }) {
                 .string => |s| s,
-                else => continue,
+                else => |other| {
+                    std.log.warn("[ai.memory] dump item {d} skipped: `key` is {s}, not a string", .{ index, @tagName(other) });
+                    continue;
+                },
             };
-            const value = switch (obj.get("value") orelse continue) {
+            const value = switch (obj.get("value") orelse {
+                std.log.warn("[ai.memory] dump item {d} skipped: no `value`", .{index});
+                continue;
+            }) {
                 .string => |s| s,
-                else => continue,
+                else => |other| {
+                    std.log.warn("[ai.memory] dump item {d} skipped: `value` is {s}, not a string", .{ index, @tagName(other) });
+                    continue;
+                },
             };
-            const tenant_id: i64 = blk: {
-                const v = obj.get("tenant_id") orelse break :blk 0;
-                break :blk switch (v) {
-                    .integer => |n| n,
-                    else => 0,
-                };
-            };
-            const user_id: i64 = blk: {
-                const v = obj.get("user_id") orelse break :blk 0;
-                break :blk switch (v) {
-                    .integer => |n| n,
-                    else => 0,
-                };
-            };
-            try self.remember(key, value, tenant_id, user_id);
+            try rows.append(self.allocator, .{
+                .key = key,
+                .value = value,
+                .tenant_id = try dumpRowScope(obj, index, "tenant_id"),
+                .user_id = try dumpRowScope(obj, index, "user_id"),
+            });
         }
+
+        // Pass 2: apply.
+        for (rows.items) |row| {
+            try self.remember(row.key, row.value, row.tenant_id, row.user_id);
+        }
+    }
+
+    /// The scope a dump row states, or `error.InvalidMemoryScope` with the reason
+    /// logged. There is deliberately no fallback: `0` is `recall`'s "any", so
+    /// substituting it is not a smaller claim than the dump made — it is a larger
+    /// one, and it is the claim that reaches every tenant.
+    fn dumpRowScope(obj: std.json.ObjectMap, index: usize, name: []const u8) error{InvalidMemoryScope}!i64 {
+        const v = obj.get(name) orelse {
+            std.log.warn("[ai.memory] dump item {d} refused: `{s}` is missing, and a memory's scope must not be guessed", .{ index, name });
+            return error.InvalidMemoryScope;
+        };
+        return switch (v) {
+            .integer => |n| n,
+            else => |other| {
+                std.log.warn("[ai.memory] dump item {d} refused: `{s}` is {s}, not an integer", .{ index, name, @tagName(other) });
+                return error.InvalidMemoryScope;
+            },
+        };
     }
 
     /// Persist snapshot to a relative path under cwd (`std.Io.Dir.cwd`).
@@ -580,6 +650,248 @@ test "MemoryStore dumpJson loadJson roundtrip" {
     }
     try std.testing.expectEqual(@as(usize, 1), results.items.len);
     try std.testing.expectEqualStrings("zh", results.items[0].value);
+}
+
+// `loadJson` reads what `dumpJson` writes, and `dumpJson` always writes
+// `tenant_id`/`user_id` as integers. The reader repaired anything else — a
+// missing field, or one of another type — into `0`, and `0` is exactly the value
+// `recall` reads as "any" (`matchesScope`:
+// `if (e.tenant_id != tenant_id and tenant_id != 0)`). A corrupt or hand-edited
+// dump therefore did not fail: a row that belonged to one tenant became readable
+// by every "any"-scope reader.
+//
+// Red on the old shape: `leak: recall(any) returned value="tenant-2-secret"
+// scope=(0,2)`, then `expected 0, found 2` — both entries were in scope (0, 0)
+// and (0, 2), the scopes the dump never stated, whatever the "any" reader asks
+// for. (Which of the two the map walks out first is iteration order, so the value
+// printed can be either; the count is the assertion.)
+test "a corrupt-scope dump cannot be read back through an any-scope recall" {
+    const a = std.testing.allocator;
+    var store = MemoryStore.init(a, std.testing.io);
+    defer store.deinit();
+
+    // Row 1 has no scope at all; row 2 spells `tenant_id` as a string. Both are
+    // what a hand-edited file or a dump written by another tool looks like.
+    const corrupt =
+        \\[{"key":"user:fact:secret","value":"tenant-1-secret"},
+        \\ {"key":"user:fact:other","value":"tenant-2-secret","tenant_id":"2","user_id":2}]
+    ;
+    // Which of the two answers the load gives is asserted by the next test; what
+    // matters here is that neither answer may leave a scope-less row reachable
+    // through "any", so a refusal is tolerated and any other error is not.
+    var load_err: ?anyerror = null;
+    store.loadJson(corrupt) catch |err| {
+        load_err = err;
+    };
+    if (load_err) |err| try std.testing.expectEqual(@as(anyerror, error.InvalidMemoryScope), err);
+
+    var any = try store.recall(a, "user:", 0, 0); // 0 = any tenant, any user
+    defer {
+        for (any.items) |e| {
+            a.free(e.key);
+            a.free(e.value);
+        }
+        any.deinit(a);
+    }
+    if (any.items.len != 0) {
+        // Speaks only when the leak is back. The scope shown is the one the dump
+        // never stated: `0`, which is what "any" matches.
+        std.debug.print("leak: recall(any) returned value=\"{s}\" scope=({d},{d})\n", .{
+            any.items[0].value,
+            any.items[0].tenant_id,
+            any.items[0].user_id,
+        });
+    }
+    try std.testing.expectEqual(@as(usize, 0), any.items.len);
+}
+
+// The refusal, and what it is worth: a row that carries `key`+`value` but no
+// knowable scope is not admitted — admitting it needs a scope the dump does not
+// state, and the only value the old reader could invent (`0`) is "any" to
+// `recall`. It is not silently dropped either: dropping destroys a memory whose
+// content *is* known. The file is refused instead, and because the rows are read
+// before any of them is applied, the store is left exactly as it was — a
+// half-merged store plus an error is the one outcome the caller cannot act on.
+//
+// Red on the old shape: `expected error.InvalidMemoryScope, found null` for the
+// first dump, and the partial-merge dump would leave 2 entries instead of 1.
+test "loadJson refuses a dump whose scope is unusable and applies nothing" {
+    const a = std.testing.allocator;
+    var store = MemoryStore.init(a, std.testing.io);
+    defer store.deinit();
+    try store.remember("user:fact:kept", "kept", 7, 8);
+    const before = try store.dumpJson(a);
+    defer a.free(before);
+
+    const corrupt = [_][]const u8{
+        // no `tenant_id` / `user_id` at all
+        \\[{"key":"user:fact:secret","value":"tenant-1-secret"}]
+        ,
+        // `tenant_id` present with the wrong type
+        \\[{"key":"user:fact:secret","value":"tenant-1-secret","tenant_id":"7","user_id":8}]
+        ,
+        // `user_id` missing, `tenant_id` fine
+        \\[{"key":"user:fact:secret","value":"tenant-1-secret","tenant_id":7}]
+        ,
+        // `user_id` explicitly null
+        \\[{"key":"user:fact:secret","value":"tenant-1-secret","tenant_id":7,"user_id":null}]
+        ,
+        // the unusable row is not the first one: nothing in front of it may be
+        // applied before the refusal
+        \\[{"key":"user:fact:ok","value":"v","tenant_id":7,"user_id":8},
+        \\ {"key":"user:fact:bad","value":"v","tenant_id":7}]
+        ,
+    };
+
+    for (corrupt) |dump| {
+        var seen: ?anyerror = null;
+        store.loadJson(dump) catch |err| {
+            seen = err;
+        };
+        try std.testing.expectEqual(@as(?anyerror, error.InvalidMemoryScope), seen);
+        try std.testing.expectEqual(@as(usize, 1), store.count());
+        const after = try store.dumpJson(a);
+        defer a.free(after);
+        try std.testing.expectEqualStrings(before, after);
+    }
+
+    // The restore path the docs hand applications (`loadFromFile`) is the same
+    // judgment, so the refusal reaches the operator there too rather than a
+    // half-restored store.
+    const path = "zigmodu-test-memory-corrupt-scope.json";
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    {
+        const file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, corrupt[0]);
+    }
+    try std.testing.expectError(error.InvalidMemoryScope, store.loadFromFile(path));
+    try std.testing.expectEqual(@as(usize, 1), store.count());
+}
+
+// An explicit `0` is a scope the store supports (`remember(..., 0, 0)`, and the
+// `forget`/eviction tests use it), so the refusal above must not reinterpret it:
+// only a *missing* or mistyped field is corrupt, never a stated zero. A dump this
+// class wrote therefore needs no migration.
+test "loadJson keeps a scope the dump states explicitly, including 0" {
+    const a = std.testing.allocator;
+    var store = MemoryStore.init(a, std.testing.io);
+    defer store.deinit();
+    try store.remember("user:fact:global", "unscoped", 0, 0);
+    try store.remember("user:fact:scoped", "tenant-7", 7, 8);
+
+    const json = try store.dumpJson(a);
+    defer a.free(json);
+
+    var store2 = MemoryStore.init(a, std.testing.io);
+    defer store2.deinit();
+    try store2.loadJson(json);
+    try std.testing.expectEqual(@as(usize, 2), store2.count());
+
+    // Scope is what an entry is read back by: the tenant-7 row is reachable by
+    // its own scope — a row the reader had repaired into `0` would *not* be
+    // (see `matchesScope`: `e.tenant_id != tenant_id and tenant_id != 0`) — and
+    // the scoped recall does not hand back the 0/0 row either.
+    var scoped = try store2.recall(a, "user:", 7, 8);
+    defer {
+        for (scoped.items) |e| {
+            a.free(e.key);
+            a.free(e.value);
+        }
+        scoped.deinit(a);
+    }
+    try std.testing.expectEqual(@as(usize, 1), scoped.items.len);
+    try std.testing.expectEqualStrings("tenant-7", scoped.items[0].value);
+
+    // "Any" matches every entry, whatever scope it carries — which is exactly why
+    // a scope the dump did not state must never be turned into one that reads as
+    // "any" (the test above).
+    var any = try store2.recall(a, "user:", 0, 0);
+    defer {
+        for (any.items) |e| {
+            a.free(e.key);
+            a.free(e.value);
+        }
+        any.deinit(a);
+    }
+    try std.testing.expectEqual(@as(usize, 2), any.items.len);
+}
+
+// An item that is not a row at all — not an object, or without a string
+// `key`/`value` — carries nothing that could be admitted, so skipping it stays
+// the answer (that part of the contract does not change). What changes is that
+// the skip is no longer silent: each one is warned with its index and the reason,
+// which is what this test prints above its result. Nothing is repaired into a
+// row: the four unusable items below must not appear as entries.
+//
+// Red on the old shape: the same count, and *no* warn line anywhere in the run —
+// the items vanished with nothing said.
+test "loadJson names each item it skips" {
+    const a = std.testing.allocator;
+    var store = MemoryStore.init(a, std.testing.io);
+    defer store.deinit();
+
+    const mixed =
+        \\[{"key":"user:fact:kept","value":"kept","tenant_id":1,"user_id":2},
+        \\ 42,
+        \\ {"key":"user:fact:novalue","tenant_id":1,"user_id":2},
+        \\ {"value":"nokey","tenant_id":1,"user_id":2},
+        \\ {"key":"user:fact:numvalue","value":7,"tenant_id":1,"user_id":2}]
+    ;
+    try store.loadJson(mixed);
+
+    // The load is not an error — every readable row was read, and the unreadable
+    // ones were named rather than repaired.
+    try std.testing.expectEqual(@as(usize, 1), store.count());
+    var got = try store.recall(a, "user:", 1, 2);
+    defer {
+        for (got.items) |e| {
+            a.free(e.key);
+            a.free(e.value);
+        }
+        got.deinit(a);
+    }
+    try std.testing.expectEqual(@as(usize, 1), got.items.len);
+    try std.testing.expectEqualStrings("kept", got.items[0].value);
+}
+
+// A listed asymmetry, not a fix (see the report): `dumpJson` writes a `[]const u8`
+// that is not valid UTF-8 as an *array of bytes* rather than a JSON string
+// (`std/json/stringify.zig`: `if (!self.options.emit_strings_as_arrays and
+// std.unicode.utf8ValidateSlice(slice))`), and `loadJson` reads only the string
+// form — so a binary memory value is written by the pair and not read back. It is
+// skipped rather than repaired, and the skip is warned like any other; decoding
+// the array form would be the lossless answer.
+//
+// The dump below is produced by `dumpJson`, so this is the pair's own output and
+// not a hand-written file: the assertion on the dump is what pins the shape, and
+// it stops holding the day the array form is decoded.
+test "loadJson does not read back a non-UTF-8 value that dumpJson writes" {
+    const a = std.testing.allocator;
+    var store = MemoryStore.init(a, std.testing.io);
+    defer store.deinit();
+    try store.remember("user:fact:bin", "\xff\xfe\x00ok", 3, 4);
+    try store.remember("user:fact:text", "ok", 3, 4);
+
+    const json = try store.dumpJson(a);
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "[255,254,0,111,107]") != null);
+
+    var store2 = MemoryStore.init(a, std.testing.io);
+    defer store2.deinit();
+    try store2.loadJson(json);
+    try std.testing.expectEqual(@as(usize, 1), store2.count());
+
+    var got = try store2.recall(a, "user:", 3, 4);
+    defer {
+        for (got.items) |e| {
+            a.free(e.key);
+            a.free(e.value);
+        }
+        got.deinit(a);
+    }
+    try std.testing.expectEqual(@as(usize, 1), got.items.len);
+    try std.testing.expectEqualStrings("ok", got.items[0].value);
 }
 
 test "recall leaves the store untouched when an allocation fails" {

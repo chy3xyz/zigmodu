@@ -2,6 +2,48 @@
 
 ## [Unreleased]
 
+### 第 25 批：损坏的记忆 dump 会把作用域**放宽**成 "any"（真红，值级证据）、畸形条目静默消失（**破坏性：否**，但一个损坏文件现在会失败）
+
+全量 `-Ddb=all` **1926/1984（58 skipped，0 failed）**。
+
+**`loadJson` 的静默修复会把一条记忆的作用域放大成 "any"。** 读 scope 的写法是
+`obj.get("tenant_id") orelse 0` ＋ `switch (v) { .integer => |n| n, else => 0 }` —— **字段缺失**与
+**字段存在但类型不对**都落到 `0`，而 `0` 正是 `recall(prefix, 0, …)` 读作 **"any"** 的那个值。于是
+**一份损坏的 dump 把那些行变成"任何租户都能读到"**，而不是失败。红证据是值级的（不是 `null` 检查）：
+```
+leak: recall(any) returned value="tenant-2-secret" scope=(0,2)
+expected 0, found 2
+```
+用的 dump：第 1 行完全没有 scope 字段 → 存成 `(0,0)`；第 2 行 `tenant_id` 写成了字符串 `"2"` → 存成 `(0,2)`；
+`recall(prefix, 0, 0)` 把**两行都**返回了。
+> **暴露面比"每个租户都看得到"窄，这一点也核准了**：带真实 `(tenant, user)` 的 `recall` **不会**返回它
+> （`0 != 7` 被拒），所以放宽**恰好只朝向**那些传 `0` 的调用 —— 也就是本文件文档化的那个约定
+> （`docs/BEST_PRACTICES.md:81`）。而 agent 路径从来没暴露（`ai.Agent.memory` → `recallBlockAlloc`
+> **拒绝** `0`）。镜像的一面同样值得记：`forget(k, 0, 0)` 是按字段精确匹配的，所以这种行同样会被"any"
+> 调用方删掉。
+> **修法：整份 load 拒绝（`error.InvalidMemoryScope`），不是"丢弃该行"也不是"引入哨兵"。** ① 调用方本来就
+> 有错误通道（`loadFromFile` 直接传播，文档给的也是 `try memory.loadFromFile(...)`），而且"这不是一份 dump"
+> 已有 `error.InvalidMemoryDump` 可用；② **哨兵在现有形状里不可能** —— `recall` 的"any"会匹配**任何**存储
+> scope 的行，所以任何带内取值仍会被"any"读返回，要挡住它就得把公开的 `MemoryEntry` 字段改成 `?i64` 并让
+> `matchesScope` 拒绝未知 scope，那是一次 API 变更，而且会留下一批"看不见但占着容量和 dump 位置"的僵尸行；
+> ③ 丢弃是 fail-closed，但它**销毁一条内容其实已知的记忆**、还只留一条日志，拒绝则把行和决定都留给运维。
+> 校验与施加分成两遍，所以**畸形输入不会留下半合并的 store**（半合并加一个错误，是调用方无法处置的状态）。
+> **dump 自己写出来的 `0` 仍然合法**（"这条没有作用域"是明确声明的，不是缺失），所以**没有迁移需求**：
+> `dumpJson` 一直把这两个字段写成整数，旧 dump 行为不变（有用例钉住）。
+> **行为变化**：手工编辑过、被截断或来自别处的 dump 现在会**整份失败**并报 `error.InvalidMemoryScope`
+> （并逐条 warn 指出下标、字段与实际 JSON 类型），而不是被静默放宽。已经在本进程里放宽过的行不会回溯清除。
+
+**畸形数组条目以前静默消失（现在逐条 warn）。** 非对象、缺 `key`/`value`、类型不对的条目仍然是**跳过**
+（这样的条目没有可读内容，跳过既不会销毁也不会歪曲一条记忆），但每一条都会 warn 出下标与原因，例如
+`dump item 1 skipped: not an object (found integer)` / `dump item 4 skipped: \`value\` is integer, not a string`。
+
+> **顺带发现、未修（已列）**：**`dumpJson` 会写它读不回来的东西** —— 不是合法 UTF-8 的 `[]const u8` 会被
+> JSON 序列化成**字节值数组**，而 `loadJson` 只认字符串形式，于是这类值**写得出、读不回**（以前是静默丢，
+> 现在至少会 warn 出 `\`value\` is array, not a string`）。无损修法是把数组形式解回 arena 拥有的字节，
+> 属于新行为与额外代码路径。另：`created_at`/`access_count`/`last_accessed_at` **不被恢复**（恢复走
+> `remember`、时间戳重新盖章），后果是恢复后 `evictOldestLocked` 看到所有行的 `last_accessed_at` 相同、
+> 次序取决 map 迭代顺序 —— 已写进 `loadJson` 的文档注释（非安全相关）。
+
 ### 第 24 批：metrics 的 scrape 路径是 use-after-free（不只是读数撕裂）、取消的请求会被**服务**、记忆存储的删除在 OOM 下静默失效、集群恢复不重连（**破坏性：否**）
 
 全量 `-Ddb=all` **1921/1979（58 skipped，0 failed）**；CI 的示例清单本机 16/16。
