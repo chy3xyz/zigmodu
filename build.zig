@@ -178,22 +178,28 @@ pub fn build(b: *std.Build) void {
     const docs_step = b.step("docs", "Generate documentation");
     docs_step.dependOn(&docs_run.step);
 
-    // Fail if examples reintroduce deprecated http_server imports
+    // Fail if examples reintroduce deprecated http_server imports.
     //
-    // The `command -v` guard is load-bearing: without it a missing `rg` makes
-    // the shell exit 127, the `if` takes the false branch, and the gate reports
-    // success — silently, and exactly on the machines (fresh containers, new
-    // contributors) where nobody would notice. `2>/dev/null` used to swallow
-    // the "command not found" that would have hinted at it.
+    // The gate has to *run* everywhere. It used to `if rg -q …` with `2>/dev/null`,
+    // so a host without ripgrep exited 127 into the false branch and reported
+    // success without searching anything — the macOS runner is such a host. Adding
+    // a `command -v rg || exit 1` guard fixed the silence but turned that host red;
+    // both are wrong. So: prefer `rg`, fall back to `grep -R`, and only fail when
+    // neither exists.
     const check_api_cmd = b.addSystemCommand(&.{
         "sh", "-c",
-        \\command -v rg >/dev/null 2>&1 || {
-        \\  echo "error: ripgrep (rg) is required by check-api but was not found on PATH" >&2
+        \\pattern='zigmodu\.http_server'
+        \\if command -v rg >/dev/null 2>&1; then
+        \\  hits=$(rg -n "$pattern" examples/ || true)
+        \\elif command -v grep >/dev/null 2>&1; then
+        \\  hits=$(grep -Rn --include='*.zig' "$pattern" examples/ || true)
+        \\else
+        \\  echo "error: check-api needs ripgrep or grep on PATH" >&2
         \\  exit 1
-        \\}
-        \\if rg -q 'zigmodu\.http_server' examples/; then
+        \\fi
+        \\if [ -n "$hits" ]; then
         \\  echo "error: examples/ must use zigmodu.http, not zigmodu.http_server" >&2
-        \\  rg 'zigmodu\.http_server' examples/
+        \\  printf '%s\n' "$hits" >&2
         \\  exit 1
         \\fi
     });

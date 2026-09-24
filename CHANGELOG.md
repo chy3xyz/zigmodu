@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+### 修 CI 红：`poll(&.{})` 在 Linux 上 EFAULT 直接 ABRT；`check-api` 在无 rg 的主机上失败（**破坏性：否**）
+
+推 `93c4e18` 后 master 红了两个 job，两条都出在上一批改动里：
+
+**① Ubuntu `Run tests`：`panic: reached unreachable code`（ABRT）。** 栈是
+`RaftElection.sleepWithoutIo` → `std.posix.poll` 的 `.FAULT => unreachable` —— 也就是
+**poll 返回了 `EFAULT`**。原因不是 poll 的语义，而是**空切片字面量的指针**：`poll(&.{}, ms)`
+传的是一个零长数组字面量的地址，编译器可以把它物化成不可解引用的值（Debug 下是 `0xaa…`
+的 undefined 填充），Linux 就此拒绝。macOS 不复现，容器里跑最小复现也不复现 —— 决定它的是
+codegen，不是 API，这正是它的恶毒之处。
+
+修法：**不再玩指针**。POSIX 目标下改用 libc `nanosleep`（无指针参数）；没有 libc 时用
+**真实变量**的零长数组去 poll（那是栈地址，永远有效）；无 poll 的平台（Windows/WASI）
+仍退化为 `yield`。验证：macOS 上那条崩溃的测试与全部 56 条 `Raft*` 通过；把修复后的测试
+二进制**交叉编成 aarch64-linux 在 Debian 容器里跑**，同一条测试 `1 passed; 0 failed`；
+三个交叉目标（x86_64/aarch64-linux-gnu.2.36、x86_64-windows）编译 exit 0。
+**没能复现红**：用修复前的 HEAD 编同一个二进制在容器里跑，那条测试**通过** —— EFAULT 只在
+CI 那次构建的 codegen 下触发，所以"先红"这一步只有 CI 的栈可作证，本地复现失败这一点如实记录。
+
+**② macOS `check-api`：`error: ripgrep (rg) is required … not found on PATH`。** 上一批给
+`if rg -q …` 加的前置守卫修掉了"缺工具就静默通过"，却把**没有预装 rg 的 macOS runner** 判红 ——
+两种都不对。现在门禁**优先 rg、回退 `grep -Rn --include='*.zig'`，只有两者都不存在才失败**：
+门禁要的是"真的搜过"，用哪个工具是实现细节。**红/绿都验过**：造一个含字面
+`zigmodu.http_server` 的 fixture，有 rg 与无 rg 两条路径都 exit 1 并打出报文；清理后 exit 0。
+
+
+## [Unreleased]
+
 ### zent 升到 v0.76.2：两个示例改 pin，并采用 0.76.0 的按驱动裁剪（**破坏性：否**）
 
 `examples/zent-modulith` 与 `examples/metaverse-creative` 的 pin 从 v0.74.2 升到 **v0.76.2**

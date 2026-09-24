@@ -155,20 +155,38 @@ const can_poll_sleep = switch (builtin.os.tag) {
 ///
 /// [`RaftLock`] has none: see its own doc for the call chain that leaves this
 /// file io-less. The toolchain's only sleeping primitive (`std.Io.sleep`) takes
-/// an `Io`, so the io-free equivalent is used — a timeout-only `poll`. On every
-/// POSIX target an empty fd set with a non-zero timeout *is* a sleep (measured
-/// on this repo's macOS toolchain: `wall = 121 ms`, `cpu = 49 µs` for `120`),
-/// and the errors it can return (`NetworkDown`, `SystemResources`) are safe to
-/// ignore here because the caller loops on the lock anyway: this is a retry, not
-/// a rendezvous, so a wait cut short costs one more round and nothing else. Same
-/// shape and same trade-off as the runtime's park — `runtime/scheduler.zig`
-/// parks on `std.Io.Condition` "rather than a signal on purpose … the cost of a
-/// missed wake-up is one poll interval".
+/// an `Io`, so an io-free equivalent is used.
+///
+/// **Why not a timeout-only `poll` with an empty slice** (the first shape here):
+/// it *worked on macOS and faulted on Linux CI* — `poll(&.{}, …)` passes the
+/// address of a zero-length array literal, which the compiler is free to
+/// materialize as a non-dereferenceable value (`0xaa…` under Debug's undefined
+/// fill), and Linux answers `EFAULT`. `std.posix.poll` maps `.FAULT` to
+/// `unreachable`, so the waiter aborted the process instead of sleeping:
+/// `panic: reached unreachable code` in `RaftLock.acquire` →
+/// `handleVoteResponse` → `RaftTransport.handleConnection`, reproduced on the
+/// Ubuntu runner. The same minimal program passes in a Linux container, which is
+/// exactly the trap — the pointer's value, not the API, decided it.
+///
+/// So: `nanosleep` via libc (no pointer arguments at all), and a `poll` on a
+/// **real** zero-length variable where libc is unavailable — that pointer is a
+/// stack address and always valid. Signals cut the sleep short; the caller loops
+/// on the lock anyway, so one extra round costs nothing.
 fn sleepWithoutIo(ms: u32) void {
+    if (ms == 0) return;
     if (comptime can_poll_sleep) {
-        _ = std.posix.poll(&.{}, @intCast(ms)) catch |err| {
-            std.log.debug("[RaftLock] wait: poll sleep failed ({s}), retrying", .{@errorName(err)});
-        };
+        if (comptime builtin.link_libc) {
+            var ts = std.c.timespec{
+                .sec = @intCast(ms / 1000),
+                .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+            };
+            _ = std.c.nanosleep(&ts, null);
+        } else {
+            var no_fds: [0]std.posix.pollfd = .{};
+            _ = std.posix.poll(&no_fds, @intCast(ms)) catch |err| {
+                std.log.debug("[RaftLock] wait: poll sleep failed ({s}), retrying", .{@errorName(err)});
+            };
+        }
     } else {
         std.Thread.yield() catch |err| {
             std.log.debug("[RaftLock] wait: yield failed ({s}), retrying", .{@errorName(err)});
