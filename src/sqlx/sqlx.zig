@@ -6810,6 +6810,84 @@ test "sqlx builder batch insert" {
     try std.testing.expectEqualStrings("INSERT INTO users (name, email) VALUES (?1, ?2), (?3, ?4), (?5, ?6)", sql);
 }
 
+// The builder's emitters are one long string-append loop, so they have an
+// allocation point per column, per row and per clause — and one place to lose
+// the buffer. `checkAllAllocationFailures` walks every one of them: the
+// statement must come back as `error.OutOfMemory` and the accumulator must be
+// released, leaving the caller nothing to free.
+test "sqlx builder batchInsert survives every allocation point failing (OOM scan)" {
+    const allocator = std.testing.allocator;
+
+    const Scan = struct {
+        fn run(alloc: std.mem.Allocator, cols: []const []const u8, rows: usize) !void {
+            const b = Builder.init(alloc, "orders");
+            const sql = try b.batchInsert(cols, rows);
+            defer alloc.free(sql);
+            // 4 columns × 3 rows: the last placeholder is ?12.
+            try std.testing.expect(std.mem.endsWith(u8, sql, "(?9, ?10, ?11, ?12)"));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{ &.{ "id", "user_id", "amount", "created_at" }, 3 });
+}
+
+// `toSql` is the same shape with more branches. The builder is filled in the
+// scanned function (so the allocations behind it are injected into too) in the
+// forms `selectColumns` / `join` / `where` / `groupBy` / `orderBy` produce:
+// the column list is a single allocation with borrowed elements, the clause
+// lists own their strings.
+test "sqlx builder toSql survives every allocation point failing (OOM scan)" {
+    const allocator = std.testing.allocator;
+
+    const Scan = struct {
+        fn run(alloc: std.mem.Allocator, cols: []const []const u8, exprs: []const []const u8) !void {
+            var b = Builder.init(alloc, "users");
+            defer b.deinit();
+
+            b.select_columns = try alloc.dupe([]const u8, cols);
+            b.join_clauses = try dupeSqlClauses(alloc, exprs[0..1]);
+            b.where_clauses = try dupeSqlClauses(alloc, exprs[1..3]);
+            b.group_by_clause = try alloc.dupe(u8, exprs[3]);
+            b.having_clause = try alloc.dupe(u8, exprs[4]);
+            b.order_by_clause = try alloc.dupe(u8, exprs[5]);
+            b.limit_val = 10;
+            b.offset_val = 20;
+
+            const sql = try b.toSql();
+            defer alloc.free(sql);
+            try std.testing.expectEqualStrings(
+                "SELECT users.id, users.name FROM users INNER JOIN orders ON orders.user_id = users.id WHERE users.id = ?1 AND users.name = ?2 GROUP BY users.id HAVING COUNT(orders.id) > ?3 ORDER BY users.id DESC LIMIT 10 OFFSET 20",
+                sql,
+            );
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{
+        &.{ "users.id", "users.name" },
+        &.{
+            "INNER JOIN orders ON orders.user_id = users.id",
+            "users.id = ?1",
+            "users.name = ?2",
+            "users.id",
+            "COUNT(orders.id) > ?3",
+            "users.id DESC",
+        },
+    });
+}
+
+/// `Builder.deinit` frees the clause list's strings as well as the list, so a
+/// half-filled list cannot be handed to the builder: every slot holds a valid
+/// (empty) slice before the first copy can fail. Zero-length frees are no-ops,
+/// which is what makes the unfilled slots safe to release.
+fn dupeSqlClauses(alloc: std.mem.Allocator, exprs: []const []const u8) ![][]const u8 {
+    const list = try alloc.alloc([]const u8, exprs.len);
+    for (list) |*slot| slot.* = &.{};
+    errdefer {
+        for (list) |s| alloc.free(s);
+        alloc.free(list);
+    }
+    for (list, exprs) |*slot, e| slot.* = try alloc.dupe(u8, e);
+    return list;
+}
+
 /// `raw` must be rejected rather than built: a builder that emitted injected
 /// SQL would leak the returned slice, so the test path frees it and fails.
 fn expectSqlRejected(result: anyerror![]u8, expected_name: []const u8) !void {
@@ -7207,7 +7285,10 @@ test "sqlite connection pool" {
 
 test "sqlite prepared statement" {
     const allocator = std.testing.allocator;
-    const db_path = "/tmp/zigzero_sqlx_stmt_test.db";
+    // Unique per process — see the sibling note in DistributedTransaction.zig:
+    // a fixed /tmp name lets two concurrent suite runs delete each other's db.
+    var path_buf: [64]u8 = undefined;
+    const db_path = try std.fmt.bufPrint(&path_buf, "/tmp/zigzero_sqlx_stmt_test_{d}.db", .{std.c.getpid()});
     std.Io.Dir.cwd().deleteFile(std.testing.io, db_path) catch {};
     var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = db_path });
     defer {
@@ -7970,6 +8051,46 @@ test "conn pool rebinds client pointer after value move" {
     db.pool.?.client = @ptrFromInt(0x70);
     db.ensurePool();
     try std.testing.expectEqual(@intFromPtr(&db), @intFromPtr(db.pool.?.client));
+}
+
+// `active` counts the connections the pool *owns* — checked out and idle alike —
+// because that is what `acquire` compares against `max_open` before opening
+// another one. A release-to-idle therefore keeps the slot counted and a
+// reacquire off the idle list does not increment it: the number is stable
+// across a borrow/return cycle, and `current_active` reads the pool's
+// high-water mark of open connections rather than the in-flight count. The
+// in-flight reading is the difference to `current_idle`. Changing this to a
+// borrowing counter would move the cap check off `active` (it would then admit
+// up to `max_open` *checked-out* connections plus whatever sits idle).
+test "conn pool active counts open connections, not only checked-out ones" {
+    if (!DriverFeatures.sqlite) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var db = try Client.open(allocator, std.testing.io, .{
+        .driver = .sqlite,
+        .sqlite_path = ":memory:",
+        .max_open_conns = 4,
+        .max_idle_conns = 2,
+    });
+    defer db.deinit();
+    db.warmPool();
+    const pool = &db.pool.?;
+
+    // Warmed but unused: two open connections, both idle, none in flight.
+    const warmed = pool.metrics();
+    try std.testing.expectEqual(@as(u32, 2), warmed.current_active);
+    try std.testing.expectEqual(@as(u32, 2), warmed.current_idle);
+
+    // Check one out — the slot was already counted, so `active` does not move.
+    const conn = try pool.acquire();
+    const checked_out = pool.metrics();
+    try std.testing.expectEqual(@as(u32, 2), checked_out.current_active);
+    try std.testing.expectEqual(@as(u32, 1), checked_out.current_idle);
+
+    // Give it back: same number, one idle connection more.
+    pool.release(conn);
+    const released = pool.metrics();
+    try std.testing.expectEqual(@as(u32, 2), released.current_active);
+    try std.testing.expectEqual(@as(u32, 2), released.current_idle);
 }
 
 test "conn pool evicts idle connection after timeout" {

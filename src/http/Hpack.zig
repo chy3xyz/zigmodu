@@ -648,11 +648,23 @@ pub const Decoder = struct {
                 i += n;
                 const h = try self.lookup(idx);
                 const is_static = idx < static_table.len;
-                const d = Decoded{
-                    .name = if (is_static) h.name else try self.allocator.dupe(u8, h.name),
-                    .value = if (is_static) h.value else try self.allocator.dupe(u8, h.value),
-                    .name_owner = if (is_static) .borrowed else .owned,
-                    .value_owner = if (is_static) .borrowed else .owned,
+                // A dynamic entry's two halves are separate copies, and the
+                // second one is a second place to fail: the name is armed for
+                // release *before* the value is attempted, because the
+                // `errdefer self.release(d)` below only arms once `d` exists —
+                // a value-side failure used to strand the name copy (found by
+                // the OOM scan at the bottom of this file).
+                const d: Decoded = blk: {
+                    if (is_static) break :blk Decoded{ .name = h.name, .value = h.value };
+                    const owned_name = try self.allocator.dupe(u8, h.name);
+                    errdefer self.allocator.free(owned_name);
+                    const owned_value = try self.allocator.dupe(u8, h.value);
+                    break :blk Decoded{
+                        .name = owned_name,
+                        .value = owned_value,
+                        .name_owner = .owned,
+                        .value_owner = .owned,
+                    };
                 };
                 errdefer self.release(d);
                 if (!budget.charge(d.name, d.value)) {
@@ -672,10 +684,18 @@ pub const Decoder = struct {
                 const name_idx, const n0 = try decodeInt(block[i..], 6);
                 i += n0;
                 const name_is_static = name_idx > 0 and name_idx < static_table.len;
+                // A Huffman name is an allocation of `decodeString`'s, and it
+                // has to stay alive until the last read of `name` below
+                // (`dupEntry`) — so its cleanup belongs to this field's scope,
+                // the same way the value's does. A `defer` inside the block
+                // expression runs at `break :blk`, i.e. before the owned copy
+                // is taken, and hands a freed buffer to the copy.
+                var name_owned: ?[]u8 = null;
+                defer if (name_owned) |buf| self.allocator.free(buf);
                 const name = if (name_idx == 0) blk: {
                     const ds = try decodeString(self.allocator, block[i..]);
                     i += ds.consumed;
-                    defer if (ds.owned) self.allocator.free(@constCast(ds.value));
+                    if (ds.owned) name_owned = @constCast(ds.value);
                     break :blk ds.value;
                 } else (try self.lookup(name_idx)).name;
                 // When the name came from a dynamic index, `name` points into
@@ -723,10 +743,14 @@ pub const Decoder = struct {
             const name_idx, const n0 = try decodeInt(block[i..], 4);
             i += n0;
             const name_is_static = name_idx > 0 and name_idx < static_table.len;
+            // Same rule as the incremental-indexing branch above: the Huffman
+            // name buffer is owned by this field, freed when the field ends.
+            var name_owned: ?[]u8 = null;
+            defer if (name_owned) |buf| self.allocator.free(buf);
             const name = if (name_idx == 0) blk: {
                 const ds = try decodeString(self.allocator, block[i..]);
                 i += ds.consumed;
-                defer if (ds.owned) self.allocator.free(@constCast(ds.value));
+                if (ds.owned) name_owned = @constCast(ds.value);
                 break :blk ds.value;
             } else (try self.lookup(name_idx)).name;
             const value_ds = try decodeString(self.allocator, block[i..]);
@@ -1484,4 +1508,116 @@ test "Hpack oversize list drops the extra fields without leaking them" {
     dec.setAdvertisedHeaderListSize(60, 0);
     try std.testing.expectError(error.HeaderListTooLarge, dec.decode(&refs));
     try std.testing.expectEqual(@as(usize, 90), dec.current_size);
+}
+
+test "Hpack huffman-encoded literal name decodes to the name itself" {
+    const allocator = std.testing.allocator;
+
+    // `01` + index 0 and `0000` + index 0: both literal branches with a *new*
+    // name, the name Huffman-encoded (the values stay raw). `decodeString`
+    // allocates the name in both, so this is where an owned name buffer has to
+    // survive until the caller's own copy has been taken.
+    const name_a = "x-trace-id";
+    const name_b = "x-request-id";
+    var block = std.ArrayList(u8).empty;
+    defer block.deinit(allocator);
+    for ([_][]const u8{ name_a, name_b }, 0..) |n, i| {
+        try block.append(allocator, if (i == 0) 0x40 else 0x00);
+        const enc = try huffmanEncode(allocator, n);
+        defer allocator.free(enc);
+        try appendStringHuffman(&block, allocator, enc);
+        try appendStringRaw(&block, allocator, if (i == 0) "abc-123" else "def-456");
+    }
+
+    var dec = Decoder.init(allocator);
+    defer dec.deinit();
+    const headers = try dec.decode(block.items);
+    defer freeHeaders(allocator, headers);
+    try std.testing.expectEqual(@as(usize, 2), headers.len);
+    try std.testing.expectEqualStrings(name_a, headers[0].name);
+    try std.testing.expectEqualStrings("abc-123", headers[0].value);
+    try std.testing.expectEqualStrings(name_b, headers[1].name);
+    try std.testing.expectEqualStrings("def-456", headers[1].value);
+    // The first branch also inserts, and that copy is taken from the same
+    // buffer: the table entry must carry the name, not its freed remains.
+    try std.testing.expectEqual(@as(usize, 1), dec.dynamic.items.len);
+    try std.testing.expectEqualStrings(name_a, dec.dynamic.items[0].name);
+}
+
+// ---------------------------------------------------------------------------
+// OOM scan (std.testing.checkAllAllocationFailures).
+// ---------------------------------------------------------------------------
+
+// `decode` is the file's densest allocation site: four branch shapes, each
+// with its own `errdefer`/ownership hand-off, plus the dynamic table's own
+// copies. `checkAllAllocationFailures` re-runs it once per allocation point
+// with that allocation failing, and asserts the error propagates (no
+// swallowing) with every byte that was handed out given back.
+test "Hpack decode survives every allocation point failing (OOM scan)" {
+    const allocator = std.testing.allocator;
+
+    // One field per branch shape: indexed static (allocates nothing), literal
+    // with incremental indexing and a new name (duplicates both halves, then
+    // inserts a second pair into the dynamic table), an *indexed reference* to
+    // the entry that insertion created — both halves of that one are allocated
+    // inside a struct literal — and literal without indexing, which copies
+    // without inserting.
+    var block = std.ArrayList(u8).empty;
+    defer block.deinit(allocator);
+    try block.append(allocator, 0x82); // indexed static 2 → :method GET
+    try appendLitIncNewName(&block, allocator, "x-trace-id", "abc-123");
+    try block.append(allocator, @intCast(0x80 | static_table.len)); // dynamic index 62
+    try block.append(allocator, 0x00); // literal without indexing, new name
+    try appendStringRaw(&block, allocator, "x-extra");
+    try appendStringRaw(&block, allocator, "yes");
+
+    const Scan = struct {
+        fn run(alloc: std.mem.Allocator, b: []const u8) !void {
+            var dec = Decoder.init(alloc);
+            defer dec.deinit();
+            const headers = try dec.decode(b);
+            defer freeHeaders(alloc, headers);
+            try std.testing.expectEqual(@as(usize, 4), headers.len);
+            try std.testing.expectEqual(@as(usize, 1), dec.dynamic.items.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{block.items});
+}
+
+// Same scan for the header-list budget path: every field is decoded and then
+// dropped by `HeaderListBudget.charge`, so `release` + `continue` is the code
+// under the injector, and the block still has to end in the limit error.
+test "Hpack budget-dropped fields survive every allocation point failing (OOM scan)" {
+    const allocator = std.testing.allocator;
+
+    // One 45-byte entry (6 + 7 + the 32-byte per-field overhead) referenced
+    // three times: against a 45-byte budget the first reference fits and the
+    // other two are decoded, charged and released.
+    var block = std.ArrayList(u8).empty;
+    defer block.deinit(allocator);
+    try appendLitIncNewName(&block, allocator, "x-name", "x-value");
+    std.debug.assert(static_table.len == 62);
+    try block.appendSlice(allocator, &.{ 0xbe, 0xbe, 0xbe }); // dynamic index 62, thrice
+
+    const Scan = struct {
+        fn run(alloc: std.mem.Allocator, b: []const u8) !void {
+            var dec = Decoder.init(alloc);
+            defer dec.deinit();
+            const seeded = try dec.decode(b);
+            defer freeHeaders(alloc, seeded);
+
+            dec.setAdvertisedHeaderListSize(45, 0);
+            const result = dec.decode(b);
+            if (result) |limited| {
+                // The budget must have refused the extra references.
+                freeHeaders(alloc, limited);
+                return error.ExpectedHeaderListTooLarge;
+            } else |err| switch (err) {
+                error.OutOfMemory => return err, // the injected failure comes back out
+                error.HeaderListTooLarge => {}, // the budget path, exercised in full
+                else => return err,
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{block.items});
 }

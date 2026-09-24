@@ -2,6 +2,70 @@
 
 ## [Unreleased]
 
+### 第 5 批：CI bench 基线重录、Lru/Pool 两处真红修复、h2 dispatch E2E、OOM 注入扫出两个真缺陷（**破坏性：否**）
+
+按"ROI 先做"清单推进。全量 `-Ddb=all` **1693/1715（22 skipped，0 failed）**。
+
+**CI bench 基线重录（已单独提交 `60a4313`）**：CI 基线此前是 **27 条指标 / 0 条 alloc 预算** →
+`check-bench.sh` 在 CI 上对 alloc 判据 `budgeted=0`，**等于没生效**（本地 32/32 是生效的）。
+数值取自 `89d5dd4` 绿跑产出的候选 artifact（27 → 32 条，补上新指标），预算从本地基线逐条抄入
+（预算描述"该热路径应零分配/按契约分配"，是结构属性、与机器无关）。现在两边同为 32/32。
+
+**`Lru.deinit` 的无锁 teardown（真红）**：`if (!self.mutex.tryLock())` 抢不到锁就**在别人持锁、
+正在改 `map`/`list` 时**销毁节点并 `map.deinit()`。新用例把"free 是否发生在持锁者临界区内"记进
+计数分配器，修复前 `expected 0, found 3`（3 次 free 全在临界区内）；改用 `lockUncancelable` 后
+5/5 绿。语义变化是有意的：deinit 从"竞争失败就带病拆"变成"等待"，注释写明理由。
+
+**`Pool.release` 取消时丢连接（真红）**：`self.mutex.lock(self.io) catch return` → 取消即返回，
+连接既不回 idle 也不销毁、`active_count` 不减（每发生一次池永久少一个槽）。新用例在 release 卡在
+池锁上时对其 future 下 cancel，修复前 `expected 1, found 0`（`idle + destroyed != created`）并
+被 SafeAllocator 判泄漏；改用 `lockUncancelable` 后 5/5 绿。**选"等"而不是"取消即销毁"的理由**：
+`release` 返回 `void`，取消发生时**没人能接收这个连接**，"尊重取消"只能二选一——每次取消白扔一条
+健康连接，或丢一个槽位（正是本 bug）；同文件 `deinit` 与 `sqlx.ConnPool.release` 也已是这个口径。
+
+**h2 完整 dispatch E2E（3 条真 socket）**：补上此前**唯一零观测的那一跳**
+（`Config → Server.http2ServeOptions → 执法/派发`）：① 注册路由返回 handler 体、`:status=200`、
+`content-type=application/json`；② 路由级中间件按 h2 请求头判定（无 `x-tenant` → 401、有 → 200）；
+③ `Server.Config.max_body_size = 64` 在 h2 上生效（128 字节 → `RST(ENHANCE_YOUR_CALM)` 且连接存活、
+8 字节 → 200）。**红证据**：在 `http2ServeOptions` 顶部插 `if (true) return .{};`（= 统一前行为）
+→ 三条全红（内置 404 `not found` / 无视限额）。
+
+> **更正上一版的一条结论**：上一批声称"h2 响应的 content-type 大小写敏感查找已修"，**实际没有**
+> —— 我改用的 `ctx.header()` 是读**请求头**的，h2 响应一直回落 `application/octet-stream`。
+> 本版用 `headerLookup(ctx.response_headers, "content-type")` 真正修好，并由上面第 ① 条用例钉住。
+
+**OOM 注入扫描落地（`checkAllAllocationFailures`，此前 0 处使用）**：挑了 5 处"分配密集 + errdefer
+链复杂"的小函数（`Hpack.Decoder.decode` ×2 路径、`Validator.validateStructCollect` ×2、
+`sqlx.Builder.toSql`/`batchInsert`、`SecurityModule.generateTokenWithTenantAndVersion`），
+逐个分配点注入失败。扫描成本合计 **3.6s**（N=7–24 个分配点/函数）。**扫出两个真缺陷**：
+
+1. **`Hpack.decode` 在 OOM 时泄漏名字副本**：同一个 struct literal 里的两个 `dupe`，第二个（value）
+   失败时第一个（name）还悬着（`errdefer` 要等结构体构造出来才注册）。红：`fail_index 7/11`，
+   `allocated 364 / freed 354`（漏 10 字节），失败点与泄漏点栈都指向那两行。修法：把两条 dupe 提成
+   具名变量、name 先 `errdefer free` 再试 value。
+2. **Huffman 字面量名字的第二处 use-after-free**（非 OOM 路径）：名字缓冲的清理写成了**块表达式内的
+   `defer`**，而块表达式里的 `defer` 在 `break :blk` 时就执行——于是它在 `dupe(name)` **之前**就 free 了
+   缓冲。新用例打出 `found: UUUUUUUUUU`（0xAA 释放毒）而非 `x-trace-id`。既有测试没发现是因为
+   Huffman 端到端用例只编码**值**、名字走静态索引。修法：把清理移到字段作用域（与同函数 value 的写法一致）。
+
+   为证明绿的扫描不是空跑，对生产代码各做了一次"临时拆掉一处清理 → 扫描变红 → 立即还原"的变异检查
+   （Validator `appendViolation` 的 errdefer → 漏 12 字节；Builder `toSql` 的 `buf.deinit` → 漏 344 字节；
+   SecurityModule 的 `header_json` free → 漏 38 字节），三处均已还原。
+
+**`ConnPool.active`：判定为"不是 bug"，并更正此前的一处描述**。加了特征化用例后确认：它数的是
+**池拥有的连接数（idle + 借出）**，不是"在飞数"——开连接 `+1`、关连接 `-1`，release→acquire 净变化 0，
+而 acquire 的容量闸门正是拿它比 `max_open`，语义必须如此。此前记的"读数偏低"是反的：按"在飞"去读会
+**高估**空闲数，且无流量时它会钉在池的高水位；真正的在飞数是 `active - idle`。想要"在飞"指标应当是
+**纯增量**（加 `current_in_use = active - idle`），不要改计数语义（改计数必须同时改容量闸门，否则池会
+放进 `max_open + max_idle` 条 socket）。顺带发现 `ConnPool.reconnect` 是唯一"开连接不计账"的地方，
+但**无任何调用点**（死代码）。
+
+**测试隔离修复（顺带，解释了我们看到的"偶发失败"）**：两个用例用**固定的 `/tmp` 路径**
+（`/tmp/zigmodu_2pc_in_doubt.db`、`/tmp/zigzero_sqlx_stmt_test.db`），并发跑同一套件（第二个测试二进制、
+或同一工作树里的另一个代理）会互相 `deleteFile` 拆台——这正解释了并行时偶发的
+`TwoPhaseCommit: in-doubt` / `sqlite prepared statement` 失败。两处改为**按 pid 唯一**并保留了前后清理。
+## [Unreleased]
+
 ### soak 的 RSS 增长查明：**是测试分配器这条探针**，不是集群；门禁改成有意义的（**破坏性：否**）
 
 困扰几轮的"RSS 随流量线性增长"有了确定性根因：`std.testing.allocator`（SafeAllocator）在**每次

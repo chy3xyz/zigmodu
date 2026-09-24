@@ -168,7 +168,16 @@ pub fn Pool(comptime T: type) type {
                 return;
             }
 
-            self.mutex.lock(self.io) catch return;
+            // Uncancelable: `release` is the caller handing its connection back,
+            // and a canceled `lock` has no way to say "never mind" — the old
+            // `catch return` dropped the connection on the floor (not destroyed,
+            // not idle, `active_count` unchanged), so every canceled release
+            // cost the pool one slot for good. Waiting is the honest answer: the
+            // critical section is a single list append, and the alternative
+            // (destroying a healthy connection) throws away the connection for
+            // no reason. Same choice as `sqlx.ConnPool.release`, which also
+            // takes this mutex with `lockUncancelable`.
+            self.mutex.lockUncancelable(self.io);
             self.idle_conns.append(self.allocator, .{
                 .conn = conn,
                 .last_used = 0,
@@ -273,4 +282,120 @@ test "connection pool" {
     try std.testing.expectEqual(@as(u64, 0), st.eviction_count);
 
     try std.testing.expect(create_count >= 2);
+}
+
+// Regression: `release` used to return early when its (cancelable) mutex lock
+// came back `error.Canceled`. The connection was then neither destroyed nor put
+// back on the idle list, and `active_count` stayed up — one permanent slot lost
+// per canceled release, until the pool could not hand anything out at all.
+//
+// The release task here is parked on the pool mutex (held by the test thread)
+// with a cancel request already placed on its thread, so it reaches the lock
+// wait at a cancelation point. Whatever `release` decides to do about that
+// request, the connection must not fall out of the pool's books.
+test "Pool release keeps the connection when its lock wait is canceled" {
+    const Counters = struct {
+        var created = std.atomic.Value(u32).init(0);
+        var destroyed = std.atomic.Value(u32).init(0);
+
+        fn create() errors.ResultT(*u32) {
+            _ = created.fetchAdd(1, .monotonic);
+            const conn = std.testing.allocator.create(u32) catch return error.ServerError;
+            conn.* = 7;
+            return conn;
+        }
+        fn destroy(conn: *u32) void {
+            _ = destroyed.fetchAdd(1, .monotonic);
+            std.testing.allocator.destroy(conn);
+        }
+        fn validate(conn: *u32) bool {
+            return conn.* == 7;
+        }
+    };
+    Counters.created.store(0, .monotonic);
+    Counters.destroyed.store(0, .monotonic);
+
+    const io = std.testing.io;
+    var pool = try Pool(u32).init(std.testing.allocator, io, Counters.create, Counters.destroy, Counters.validate, .{
+        .min_idle = 0,
+        .max_active = 4,
+        .max_wait_ms = 1000,
+    });
+    defer pool.deinit();
+
+    const conn = try pool.acquire();
+    try std.testing.expectEqual(@as(u32, 1), pool.active());
+    try std.testing.expectEqual(@as(usize, 0), pool.idle());
+
+    const Gate = struct {
+        var ready = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+        var released = std.atomic.Value(bool).init(false);
+
+        fn releaseTask(p: *Pool(u32), c: *u32) void {
+            ready.store(true, .release);
+            // Pure spinning: no cancelation point, so a request placed while the
+            // task is still gated cannot be consumed before `release` takes the
+            // lock — it is still pending when the lock wait begins.
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            p.release(c);
+            released.store(true, .release);
+        }
+
+        fn cancelTask(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Gate.ready.store(false, .monotonic);
+    Gate.open.store(false, .monotonic);
+    Gate.released.store(false, .monotonic);
+
+    // The test thread holds the pool mutex, so the release task cannot get past
+    // the lock wait until told to.
+    try pool.mutex.lock(io);
+
+    var release_fut = try io.concurrent(Gate.releaseTask, .{ &pool, conn });
+    while (!Gate.ready.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Gate.cancelTask, .{ io, &release_fut });
+    // Give the request time to land on the release task's thread while it is
+    // still gated. This is what makes the cancelation point the lock wait, not
+    // some earlier operation of the task.
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Gate.open.store(true, .release);
+    // The release task is now inside `release`: either it left through the
+    // `error.Canceled` path (the bug), or it is parked on the mutex.
+    while (pool.mutex.state.load(.monotonic) != .contended and !Gate.released.load(.acquire)) {
+        std.atomic.spinLoopHint();
+    }
+    pool.mutex.unlock(io);
+
+    cancel_fut.await(io);
+    release_fut.await(io);
+
+    try std.testing.expect(Gate.released.load(.acquire));
+    // Every connection the pool created is accounted for: idle, or destroyed and
+    // dropped from `active_count`. Canceling the release must not produce a third
+    // state — that is the slot the pool used to leak, and `active` alone cannot
+    // see it.
+    try std.testing.expectEqual(
+        Counters.created.load(.monotonic),
+        @as(u32, @intCast(pool.idle())) + Counters.destroyed.load(.monotonic),
+    );
+    // What `release` does with a canceled lock wait here is take the connection
+    // back (see the comment on `release`): it is idle, still counted, not
+    // destroyed. The other defensible answer — treat the cancelation as "this
+    // connection is gone", destroy it and decrement `active` — would satisfy the
+    // invariant above with `idle == 0`, `destroyed == 1`, `active == 0`. Both are
+    // fine; the leak (`idle + destroyed == 0` with `active == 1`) is not.
+    try std.testing.expectEqual(@as(usize, 1), pool.idle());
+    try std.testing.expectEqual(@as(u32, 0), Counters.destroyed.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), pool.active());
+
+    // The slot is not merely counted, it is usable: the pool hands back out the
+    // very connection the canceled release returned.
+    const reacquired = try pool.acquire();
+    try std.testing.expect(reacquired == conn);
+    pool.release(reacquired);
 }

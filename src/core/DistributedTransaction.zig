@@ -739,7 +739,12 @@ test "TwoPhaseCommit journals the decision so commit and abort leave nothing in 
 test "TwoPhaseCommit: in-doubt transaction survives a coordinator crash" {
     const allocator = std.testing.allocator;
     const data = @import("../data.zig");
-    const db_path = "/tmp/zigmodu_2pc_in_doubt.db";
+    // Unique per process: the fixed "/tmp/…db" name this used to carry made two
+    // concurrent runs of the suite (a second test binary, or another agent
+    // working in the same tree) delete each other's database mid-test, which is
+    // what the intermittent failures in this test were.
+    var path_buf: [64]u8 = undefined;
+    const db_path = try std.fmt.bufPrint(&path_buf, "/tmp/zigmodu_2pc_in_doubt_{d}.db", .{std.c.getpid()});
     std.Io.Dir.cwd().deleteFile(std.testing.io, db_path) catch {};
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, db_path) catch {};
 

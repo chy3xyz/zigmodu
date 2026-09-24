@@ -690,3 +690,27 @@ test "without a keyring the header has no kid (previous behavior)" {
     defer sec.freePayload(payload);
     try std.testing.expectEqualStrings("u", payload.sub);
 }
+
+// Token assembly is a chain of six borrowed buffers (header JSON, its base64,
+// payload JSON, its base64, the signing base, the signature) held by `defer`s
+// that all unwind through one return path. `checkAllAllocationFailures` fails
+// each allocation in turn — the JSON stringifier's own growth, both base64
+// buffers, the `allocPrint`s and the HMAC signature — and requires the error to
+// surface with every earlier buffer released.
+test "generateTokenWithTenantAndVersion survives every allocation point failing (OOM scan)" {
+    const allocator = std.testing.allocator;
+
+    const Scan = struct {
+        fn run(alloc: std.mem.Allocator, secret: []const u8, roles: []const []const u8) !void {
+            var sec = SecurityModule.init(alloc, secret, 3600);
+            const token = try sec.generateTokenWithTenantAndVersion("user-1", roles, "tenant-1", 3);
+            defer alloc.free(token);
+            try std.testing.expect(token.len > 0);
+            try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, token, "."));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{
+        "scan-secret-0123456789abcdef",
+        &.{ "user", "admin" },
+    });
+}

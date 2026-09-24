@@ -35,16 +35,27 @@ pub fn Cache(comptime K: type, comptime V: type) type {
             };
         }
 
+        /// Destroy the cache: every node, then the map that indexed them.
+        ///
+        /// Two things here are deliberate, and both are a change of semantics from
+        /// the first version of this function, which gave up on a contended
+        /// `tryLock` and tore the container down anyway:
+        ///
+        /// * Uncancelable — a destructor has to run to completion. A cancelable
+        ///   `lock` would instead return `error.Canceled`, and that error has no
+        ///   usable answer here: returning leaves the cache alive, and proceeding
+        ///   is the bug below.
+        /// * It waits instead of proceeding unlocked — the old fallback walked
+        ///   `map` and `list` (destroying every node, then deiniting the map)
+        ///   while another thread was *inside* its critical section on those same
+        ///   two containers, freeing memory that holder could still reach and
+        ///   leaving the teardown observable to it.
+        ///
+        /// So `deinit` blocks until the cache is quiet. Every other critical
+        /// section in this file is an O(1) map/list operation, so the wait is
+        /// bounded by whichever call is in flight.
         pub fn deinit(self: *Self) void {
-            if (!self.mutex.tryLock()) {
-                var it = self.map.valueIterator();
-                while (it.next()) |node_ptr| {
-                    self.allocator.destroy(node_ptr.*);
-                }
-                self.map.deinit();
-                self.list = .{};
-                return;
-            }
+            self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
 
             var it = self.map.valueIterator();
@@ -210,4 +221,89 @@ test "cache pointer return" {
     // Modify through pointer
     ptr.* = 200;
     try std.testing.expectEqual(@as(u32, 200), cache.get(1).?.*);
+}
+
+// Regression: `deinit` used to give up on a contended `tryLock` and then rip the
+// container down anyway — destroying every node and deiniting `map` while
+// another thread was *inside* the critical section (and still holding the lock,
+// so the holder could go on to touch the nodes it had just lost). The teardown
+// is observed here without inducing the UB itself: the cache lives on an
+// allocator that records every `free` and whether the holder thread was inside
+// its critical section at that moment. Teardown under the lock is the contract;
+// `deinit` therefore has to be an uncancelable *wait*, not a best-effort.
+test "cache Lru deinit tears the container down under the lock, never beside a holder" {
+    const CountingAllocator = struct {
+        // Set by the holder thread for the whole of its critical section.
+        var holder_in_cs = std.atomic.Value(bool).init(false);
+        var frees_total = std.atomic.Value(u32).init(0);
+        var frees_beside_holder = std.atomic.Value(u32).init(0);
+
+        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            _ = ctx;
+            return std.testing.allocator.rawAlloc(len, alignment, ret_addr);
+        }
+        fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+            _ = ctx;
+            return std.testing.allocator.rawResize(memory, alignment, new_len, ret_addr);
+        }
+        fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+            _ = ctx;
+            return std.testing.allocator.rawRemap(memory, alignment, new_len, ret_addr);
+        }
+        fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            _ = ctx;
+            _ = frees_total.fetchAdd(1, .monotonic);
+            if (holder_in_cs.load(.acquire)) _ = frees_beside_holder.fetchAdd(1, .monotonic);
+            std.testing.allocator.rawFree(memory, alignment, ret_addr);
+        }
+
+        const vtable: std.mem.Allocator.VTable = .{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        };
+        const allocator: std.mem.Allocator = .{ .ptr = undefined, .vtable = &vtable };
+    };
+
+    CountingAllocator.holder_in_cs.store(false, .monotonic);
+    CountingAllocator.frees_total.store(0, .monotonic);
+    CountingAllocator.frees_beside_holder.store(0, .monotonic);
+
+    const io = std.testing.io;
+    var cache = Cache(u32, u32).init(CountingAllocator.allocator, io, 8);
+    try cache.set(1, 10, null);
+    try cache.set(2, 20, null);
+
+    const Holder = struct {
+        fn hold(c: *Cache(u32, u32), thread_io: std.Io) void {
+            c.mutex.lock(thread_io) catch |err| {
+                std.debug.print("holder could not take the cache lock: {}\n", .{err});
+                return;
+            };
+            CountingAllocator.holder_in_cs.store(true, .release);
+            // A bounded critical section. `deinit` has to be observed *while*
+            // this is held, and the test thread is already spinning on
+            // `holder_in_cs`, so its reaction costs nanoseconds — the budget only
+            // has to survive a hostile scheduler. Measured: 20M hints ≈ 0.25s.
+            var spins: usize = 0;
+            while (spins < 20_000_000) : (spins += 1) std.atomic.spinLoopHint();
+            CountingAllocator.holder_in_cs.store(false, .release);
+            c.mutex.unlock(thread_io);
+        }
+    };
+
+    var holder = try io.concurrent(Holder.hold, .{ &cache, io });
+    while (!CountingAllocator.holder_in_cs.load(.acquire)) std.atomic.spinLoopHint();
+
+    const frees_before = CountingAllocator.frees_total.load(.monotonic);
+    cache.deinit();
+    const frees_after = CountingAllocator.frees_total.load(.monotonic);
+
+    holder.await(io);
+
+    // The teardown did happen ...
+    try std.testing.expect(frees_after > frees_before);
+    // ... and none of it happened behind the holder's back.
+    try std.testing.expectEqual(@as(u32, 0), CountingAllocator.frees_beside_holder.load(.monotonic));
 }

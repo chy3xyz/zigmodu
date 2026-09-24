@@ -637,3 +637,67 @@ test "validateStructCollect: message hook localizes defaults, FieldRules.message
     try std.testing.expectEqual(@as(usize, 1), overridden.items.len);
     try std.testing.expectEqualStrings("name 必填", overridden.items[0].message);
 }
+
+// The collector allocates once or twice per violated field (rule text, then the
+// `<field>: <rule text>` message, then the hooked localization) and grows a
+// list, with three `errdefer`s layered over that. `checkAllAllocationFailures`
+// re-runs the whole call once per allocation point with that allocation
+// failing: the error has to come back out (nothing may be swallowed) and
+// `Violations` must not own any string that was built before the failure.
+test "validateStructCollect survives every allocation point failing (OOM scan)" {
+    const allocator = std.testing.allocator;
+
+    const Scan = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const Req = struct { name: []const u8, email: []const u8, age: u32, role: []const u8 };
+            const rules = .{
+                .name = FieldRules{ .required = true, .min_len = 2 },
+                .email = FieldRules{ .email = true },
+                .age = FieldRules{ .min = 0, .max = 150 },
+                .role = FieldRules{ .one_of = "user,admin" },
+            };
+            // All four fields fail, each on its first failing rule: four
+            // messages built, four list slots.
+            var violations = (try validateStructCollect(
+                alloc,
+                Req{ .name = "", .email = "nope", .age = 999, .role = "root" },
+                rules,
+                demoMessageHook,
+            )) orelse return error.ExpectedViolations;
+            defer violations.deinit();
+            try std.testing.expectEqual(@as(usize, 4), violations.items.len);
+            // The hook localizes two of the four; `one_of` has no mapping.
+            try std.testing.expectEqualStrings("不能为空", violations.items[0].message);
+            try std.testing.expectEqualStrings("邮箱格式不正确", violations.items[1].message);
+            try std.testing.expectEqualStrings("age: must be at most 150", violations.items[2].message);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{});
+}
+
+// The `FieldRules.message` override returns before any of that: one `dupe` and
+// no list growth past the first slot is the whole allocation budget here.
+test "validateStructCollect message override survives every allocation point failing (OOM scan)" {
+    const allocator = std.testing.allocator;
+
+    const Scan = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const Req = struct { name: []const u8, email: []const u8, age: u32 };
+            const rules = .{
+                .name = FieldRules{ .required = true, .message = "name 必填" },
+                .email = FieldRules{ .required = true, .email = true },
+                .age = FieldRules{ .min = 0, .max = 150 },
+            };
+            var violations = (try validateStructCollect(
+                alloc,
+                Req{ .name = "", .email = "nope", .age = 999 },
+                rules,
+                demoMessageHook,
+            )) orelse return error.ExpectedViolations;
+            defer violations.deinit();
+            try std.testing.expectEqual(@as(usize, 3), violations.items.len);
+            try std.testing.expectEqualStrings("name 必填", violations.items[0].message);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{});
+}

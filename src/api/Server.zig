@@ -2425,7 +2425,11 @@ pub const Server = struct {
         try server.handleForTest(&ctx);
 
         const status = ctx.status_code;
-        const ctype_src = ctx.header("content-type") orelse "application/octet-stream";
+        // The *response* map, not `ctx.header` (which reads request headers):
+        // handlers write `Content-Type` with that spelling, so the lookup has
+        // to be case-insensitive or every h2 response falls back to
+        // `application/octet-stream`.
+        const ctype_src = headerLookup(ctx.response_headers, "content-type") orelse "application/octet-stream";
         const ctype = try allocator.dupe(u8, ctype_src);
         errdefer allocator.free(ctype);
         const resp_body = try allocator.dupe(u8, ctx.response_body.items);

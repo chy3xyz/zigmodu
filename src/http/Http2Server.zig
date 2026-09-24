@@ -2272,3 +2272,277 @@ test "read failure code names the idle peer, not the transport" {
     try std.testing.expectEqual(Http2.ErrorCode.ENHANCE_YOUR_CALM, readFailureCode(true));
     try std.testing.expectEqual(Http2.ErrorCode.PROTOCOL_ERROR, readFailureCode(false));
 }
+
+// --- §10b  End-to-end: the registered-route path (Config → ServeOptions → dispatch) ---
+//
+// The loopback tests above hand the loop a `ServeOptions` the test built, so
+// they cross neither `Server.http2ServeOptions` — the one place where
+// `Server.Config` becomes H2 behaviour — nor the router. These drive a real
+// `api.Server` (`.port = 0`, `setHttp2Enabled(true)`) with registered routes and
+// middleware over prior-knowledge h2c, the only shape that observes that hop.
+
+const api_server = @import("../api/Server.zig");
+
+/// Client side of one prior-knowledge h2c exchange with a running
+/// `api_server.Server`: preface, then `frames`, then a half-close so the
+/// connection fiber's frame loop sees EOF instead of parking in a read.
+fn h2SpeakToServer(port: u16, frames: []const u8, out: []u8) !usize {
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+    var stream = try addr.connect(std.testing.io, .{ .mode = .stream });
+    defer stream.close(std.testing.io);
+
+    try @import("../core/sockread.zig").writeFull(stream, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try @import("../core/sockread.zig").writeFull(stream, frames);
+    _ = std.c.shutdown(stream.socket.handle, std.c.SHUT.WR);
+
+    var total: usize = 0;
+    while (total < out.len) {
+        var fds = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&fds, 3000) catch break;
+        if (ready == 0) break;
+        const n = std.posix.read(stream.socket.handle, out[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    return total;
+}
+
+/// One HPACK request block: the four pseudo-headers plus `extra`.
+fn hpackRequestBlock(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    path: []const u8,
+    extra: []const Hpack.Header,
+) ![]u8 {
+    var headers = std.ArrayList(Hpack.Header).empty;
+    defer headers.deinit(allocator);
+    try headers.append(allocator, .{ .name = ":method", .value = method });
+    try headers.append(allocator, .{ .name = ":path", .value = path });
+    try headers.append(allocator, .{ .name = ":scheme", .value = "http" });
+    try headers.append(allocator, .{ .name = ":authority", .value = "localhost" });
+    try headers.appendSlice(allocator, extra);
+    const enc = Hpack.Encoder.init(allocator);
+    return enc.encodeSmart(headers.items);
+}
+
+fn firstHeaderValue(headers: []const Hpack.Header, name: []const u8) ?[]const u8 {
+    for (headers) |h| {
+        if (std.mem.eql(u8, h.name, name)) return h.value;
+    }
+    return null;
+}
+
+/// A real `api.Server` listening on a loopback port on its own thread.
+const RunningServer = struct {
+    thread: std.Thread,
+    port: u16,
+
+    /// Returns once the accept loop has published the port it bound.
+    fn start(server: *api_server.Server) !RunningServer {
+        const th = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, struct {
+            fn run(s: *api_server.Server) void {
+                s.start() catch |err| std.log.warn("[h2] test server accept loop ended: {s}", .{@errorName(err)});
+            }
+        }.run, .{server});
+
+        var port: u16 = 0;
+        var tries: usize = 0;
+        while (tries < 200) : (tries += 1) {
+            if (server.listener) |*l| {
+                port = l.socket.address.getPort();
+                break;
+            }
+            std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch |err|
+                std.log.debug("[h2] test server poll sleep failed: {s}", .{@errorName(err)});
+        }
+        if (port == 0) {
+            server.stop();
+            th.join();
+            return error.ServerNeverListened;
+        }
+        return .{ .thread = th, .port = port };
+    }
+
+    /// `stop()` before `join()`: the accept loop only unwinds once `running` is
+    /// cleared, and `start()`'s `conn_group.await` then waits for the fibers.
+    fn stop(self: *RunningServer, server: *api_server.Server) void {
+        server.stop();
+        self.thread.join();
+    }
+};
+
+/// Route-level middleware: the H2 adapter copies non-pseudo H2 headers into
+/// `ctx.headers`, so middleware sees them exactly as it does on H1 — and
+/// answering without calling `next` short-circuits the handler.
+fn requireTenant(ctx: *api_server.Context, next: api_server.HandlerFn, _: ?*anyopaque) anyerror!void {
+    if (ctx.header("x-tenant") == null) {
+        try ctx.sendError(401, "missing tenant");
+        return;
+    }
+    try next(ctx);
+}
+
+test "h2 server dispatches a registered route: handler body and content-type reach the client" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var server = api_server.Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h2-route" });
+    defer server.deinit();
+    server.setHttp2Enabled(true);
+
+    var group = server.group("");
+    try group.get("h2hello", struct {
+        fn h(ctx: *api_server.Context) anyerror!void {
+            try ctx.jsonStruct(200, .{ .ok = true, .proto = "h2" });
+        }
+    }.h, null);
+
+    var running = try RunningServer.start(&server);
+    defer running.stop(&server);
+
+    const block = try hpackRequestBlock(allocator, "GET", "/h2hello", &.{});
+    defer allocator.free(block);
+    const head = try Http2.encodeHeaders(allocator, 1, block, true, true);
+    defer allocator.free(head);
+
+    var out: [8192]u8 = undefined;
+    const n = try h2SpeakToServer(running.port, head, &out);
+    const reply = out[0..n];
+    try std.testing.expect(findFrameInReply(reply, .goaway, 0) == null);
+
+    // The DATA body is the handler's, not the loop's built-in 404 — i.e. the
+    // route was matched and run.
+    const data = findFrameInReply(reply, .data, 1) orelse return error.TestUnexpectedResultWithMessage;
+    try std.testing.expectEqualStrings("{\"ok\":true,\"proto\":\"h2\"}", data.payload);
+    try std.testing.expect((data.header.flags & Http2.FrameFlags.end_stream) != 0);
+
+    const hframe = findFrameInReply(reply, .headers, 1) orelse return error.TestUnexpectedResultWithMessage;
+    var dec = Hpack.Decoder.init(allocator);
+    defer dec.deinit();
+    const hdrs = try dec.decode(hframe.payload);
+    defer Hpack.freeHeaders(allocator, hdrs);
+    try std.testing.expectEqualStrings("200", firstHeaderValue(hdrs, ":status") orelse return error.TestUnexpectedResultWithMessage);
+    // `ctx.jsonStruct` writes `Content-Type` into the response map; the H2 site
+    // adapter reads it back case-insensitively, so this must be the JSON type
+    // and not the `application/octet-stream` fallback.
+    try std.testing.expectEqualStrings("application/json", firstHeaderValue(hdrs, "content-type") orelse return error.TestUnexpectedResultWithMessage);
+}
+
+test "h2 server runs route middleware against H2 request headers" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var server = api_server.Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h2-mw" });
+    defer server.deinit();
+    server.setHttp2Enabled(true);
+
+    var group = try (server.group("")).use(.{ .func = requireTenant });
+    try group.get("h2tenant", struct {
+        fn h(ctx: *api_server.Context) anyerror!void {
+            try ctx.text(200, "tenanted");
+        }
+    }.h, null);
+
+    var running = try RunningServer.start(&server);
+    defer running.stop(&server);
+
+    // 1) No `x-tenant`: the middleware answers before the handler runs.
+    {
+        const block = try hpackRequestBlock(allocator, "GET", "/h2tenant", &.{});
+        defer allocator.free(block);
+        const head = try Http2.encodeHeaders(allocator, 1, block, true, true);
+        defer allocator.free(head);
+
+        var out: [8192]u8 = undefined;
+        const n = try h2SpeakToServer(running.port, head, &out);
+        const reply = out[0..n];
+        const hframe = findFrameInReply(reply, .headers, 1) orelse return error.TestUnexpectedResultWithMessage;
+        var dec = Hpack.Decoder.init(allocator);
+        defer dec.deinit();
+        const hdrs = try dec.decode(hframe.payload);
+        defer Hpack.freeHeaders(allocator, hdrs);
+        try std.testing.expectEqualStrings("401", firstHeaderValue(hdrs, ":status") orelse return error.TestUnexpectedResultWithMessage);
+        try std.testing.expect(findFrameInReply(reply, .data, 1) != null);
+    }
+
+    // 2) With `x-tenant`: the header reached `ctx.headers`, so the handler ran.
+    {
+        const extra = [_]Hpack.Header{.{ .name = "x-tenant", .value = "acme" }};
+        const block = try hpackRequestBlock(allocator, "GET", "/h2tenant", &extra);
+        defer allocator.free(block);
+        const head = try Http2.encodeHeaders(allocator, 1, block, true, true);
+        defer allocator.free(head);
+
+        var out: [8192]u8 = undefined;
+        const n = try h2SpeakToServer(running.port, head, &out);
+        const reply = out[0..n];
+        const hframe = findFrameInReply(reply, .headers, 1) orelse return error.TestUnexpectedResultWithMessage;
+        var dec = Hpack.Decoder.init(allocator);
+        defer dec.deinit();
+        const hdrs = try dec.decode(hframe.payload);
+        defer Hpack.freeHeaders(allocator, hdrs);
+        try std.testing.expectEqualStrings("200", firstHeaderValue(hdrs, ":status") orelse return error.TestUnexpectedResultWithMessage);
+        const data = findFrameInReply(reply, .data, 1) orelse return error.TestUnexpectedResultWithMessage;
+        try std.testing.expectEqualStrings("tenanted", data.payload);
+    }
+}
+
+test "h2 server enforces Server.Config.max_body_size on the H2 path" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    // 64 bytes is the H1 body limit; the H2 loop has to take the same number
+    // from the same `Config` field instead of its own 8 MiB default.
+    var server = api_server.Server.initWithConfig(std.testing.io, allocator, .{
+        .port = 0,
+        .max_body_size = 64,
+        .name = "h2-limit",
+    });
+    defer server.deinit();
+    server.setHttp2Enabled(true);
+
+    var group = server.group("");
+    try group.post("h2echo", struct {
+        fn h(ctx: *api_server.Context) anyerror!void {
+            try ctx.text(200, "small ok");
+        }
+    }.h, null);
+
+    var running = try RunningServer.start(&server);
+    defer running.stop(&server);
+
+    const block = try hpackRequestBlock(allocator, "POST", "/h2echo", &.{});
+    defer allocator.free(block);
+
+    var script = std.ArrayList(u8).empty;
+    defer script.deinit(allocator);
+
+    // Stream 1 — 128 bytes against the 64-byte budget.
+    const h1 = try Http2.encodeHeaders(allocator, 1, block, false, true);
+    defer allocator.free(h1);
+    try script.appendSlice(allocator, h1);
+    var big: [128]u8 = @splat('x');
+    const d1 = try Http2.encodeData(allocator, 1, &big, true);
+    defer allocator.free(d1);
+    try script.appendSlice(allocator, d1);
+
+    // Stream 3 — 8 bytes: the budget is a limit, not a blanket refusal, and the
+    // connection survives the RST.
+    const h3 = try Http2.encodeHeaders(allocator, 3, block, false, true);
+    defer allocator.free(h3);
+    try script.appendSlice(allocator, h3);
+    const d3 = try Http2.encodeData(allocator, 3, "12345678", true);
+    defer allocator.free(d3);
+    try script.appendSlice(allocator, d3);
+
+    var out: [8192]u8 = undefined;
+    const n = try h2SpeakToServer(running.port, script.items, &out);
+    const reply = out[0..n];
+
+    const rst = findFrameInReply(reply, .rst_stream, 1) orelse return error.TestUnexpectedResultWithMessage;
+    try std.testing.expectEqual(Http2.ErrorCode.ENHANCE_YOUR_CALM, try Http2.decodeRstStream(rst.payload));
+    try std.testing.expect(findFrameInReply(reply, .goaway, 0) == null);
+
+    const ok = findFrameInReply(reply, .data, 3) orelse return error.TestUnexpectedResultWithMessage;
+    try std.testing.expectEqualStrings("small ok", ok.payload);
+}
