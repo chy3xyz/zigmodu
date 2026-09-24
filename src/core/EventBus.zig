@@ -269,6 +269,14 @@ pub fn TypedEventBus(comptime T: type) type {
 
 /// Thread-safe wrapper around TypedEventBus.
 /// All operations are protected by a Mutex for concurrent access.
+///
+/// Cancelation policy: the entry points that have an error channel
+/// (`subscribe`, `subscribeAsync` — both `!void`) report `error.Canceled` when
+/// their lock wait is canceled, because the caller can act on that. The
+/// `void`-returning and value-returning ones (`publish`, `unsubscribe`,
+/// `subscriberCount`, `publishedCount`) wait uncancelably instead, because
+/// skipping the critical section silently would either lose an event or a
+/// subscription for good, or answer a fabricated `0` the caller reads as truth.
 pub fn ThreadSafeEventBus(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -290,20 +298,31 @@ pub fn ThreadSafeEventBus(comptime T: type) type {
             self.* = undefined;
         }
 
+        /// The lock wait is a cancelation point this signature can report:
+        /// `error.Canceled` means the listener is NOT registered. Swallowing it
+        /// returned success without subscribing — a caller that later awaits an
+        /// event that never arrives had been told the subscription was in place.
         pub fn subscribe(self: *Self, listener: TypedEventBus(T).CallbackType) !void {
-            self.mu.lock(self.io) catch return;
+            try self.mu.lock(self.io);
             defer self.mu.unlock(self.io);
             try self.bus.subscribe(listener);
         }
 
+        /// Same contract as `subscribe`: a canceled wait is reported, never
+        /// turned into a success.
         pub fn subscribeAsync(self: *Self, pool: *WorkerPool, listener: TypedEventBus(T).CallbackType) !void {
-            self.mu.lock(self.io) catch return;
+            try self.mu.lock(self.io);
             defer self.mu.unlock(self.io);
             try self.bus.subscribeAsync(pool, listener);
         }
 
+        /// Uncancelable — this has no error channel, and a swallowed failure
+        /// would leave the listener attached after the caller believes it is
+        /// gone (the callback keeps firing, and its context may already be
+        /// freed). The critical section is an O(1) list removal, so the wait is
+        /// bounded by whichever callback is in flight.
         pub fn unsubscribe(self: *Self, listener: TypedEventBus(T).CallbackType) void {
-            self.mu.lock(self.io) catch return;
+            self.mu.lockUncancelable(self.io);
             defer self.mu.unlock(self.io);
             self.bus.unsubscribe(listener);
         }
@@ -313,20 +332,33 @@ pub fn ThreadSafeEventBus(comptime T: type) type {
         /// NOTE: The mutex is held for the duration of all listener callbacks.
         /// Keep listener handlers short (non-blocking). For long-running work,
         /// have listeners enqueue to a worker instead of processing inline.
+        ///
+        /// Uncancelable, and it has to be: this returns `void`, so a canceled
+        /// lock wait can only answer one of two ways — block until the critical
+        /// section is free, or return having delivered the event to nobody. The
+        /// second is a fabricated success on the application event bus
+        /// (`Application.eventBus` / `ModuleContext.eventBus`, and
+        /// `CrudService`'s created/updated/deleted events), so this waits. The
+        /// critical section is the callbacks themselves: the wait is bounded by
+        /// the handlers, hence the note above.
         pub fn publish(self: *Self, event: T) void {
-            self.mu.lock(self.io) catch return;
+            self.mu.lockUncancelable(self.io);
             defer self.mu.unlock(self.io);
             self.bus.publish(event);
         }
 
+        /// Uncancelable for the same reason as `publish`: a reader that gives up
+        /// on the lock would report `0` subscribers while they exist, and a
+        /// caller that reads `0` as "nobody will hear this" is being lied to.
+        /// (The answer used to be a literal `0` on a canceled wait.)
         pub fn subscriberCount(self: *Self) usize {
-            self.mu.lock(self.io) catch return 0;
+            self.mu.lockUncancelable(self.io);
             defer self.mu.unlock(self.io);
             return self.bus.subscriberCount();
         }
 
         pub fn publishedCount(self: *Self) u64 {
-            self.mu.lock(self.io) catch return 0;
+            self.mu.lockUncancelable(self.io);
             defer self.mu.unlock(self.io);
             return self.bus.publishedCount();
         }
@@ -535,4 +567,137 @@ test "TypedEventBus async subscribers on separate ModuleRuntime worker pools" {
 
     try std.testing.expectEqual(@as(u32, 2), Ctx.inventory_count.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 2), Ctx.payment_count.load(.monotonic));
+}
+
+// The two tests below pin the shape of `ThreadSafeEventBus`'s critical section
+// against cancelation. The lock wait is their cancelation point: the task is
+// parked on the bus mutex (held by the test thread) with a cancel request
+// already placed on its thread, and the gate before the call is pure spinning,
+// which consumes nothing. Same idiom as `im.BufferPool`'s canceled-lock-wait
+// tests, which is where the pattern is documented.
+//
+// `publish` has no error channel, so a canceled wait must not be able to answer
+// it: a bus that returns from `publish` without entering the critical section
+// reports "delivered" while the event went to nobody, and `CrudService` publishes
+// its created/updated/deleted events exactly this way.
+test "ThreadSafeEventBus publish does not lose the event to a canceled lock wait" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Event = struct { value: i32 };
+
+    const Ctx = struct {
+        var received = std.atomic.Value(i32).init(0);
+        fn onEvent(event: Event) void {
+            _ = received.fetchAdd(event.value, .monotonic);
+        }
+    };
+
+    const Task = struct {
+        var done = std.atomic.Value(bool).init(false);
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+
+        fn publish(bus: *ThreadSafeEventBus(Event)) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            bus.publish(.{ .value = 7 });
+            done.store(true, .release);
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+
+    var bus = ThreadSafeEventBus(Event).init(allocator, io);
+    defer bus.deinit();
+    try bus.subscribe(Ctx.onEvent);
+
+    Ctx.received.store(0, .monotonic);
+    Task.done.store(false, .monotonic);
+    Task.entered.store(false, .monotonic);
+    Task.open.store(false, .monotonic);
+
+    // The test thread holds the bus mutex, so the task cannot get past the lock
+    // wait until told to.
+    try bus.mu.lock(io);
+
+    var task_fut = try io.concurrent(Task.publish, .{&bus});
+    while (!Task.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Task.cancel, .{ io, &task_fut });
+    // Give the request time to land while the task is still gated.
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Task.open.store(true, .release);
+    // The task is now inside `publish`: parked on the mutex (it swaps the state
+    // to `contended` on its way to the wait), or already gone.
+    while (bus.mu.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    // A cancelable wait gives up here; an uncancelable one is still parked.
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(20), .awake);
+    try std.testing.expect(!Task.done.load(.acquire));
+
+    bus.mu.unlock(io);
+    cancel_fut.await(io);
+    task_fut.await(io);
+
+    try std.testing.expectEqual(@as(i32, 7), Ctx.received.load(.monotonic));
+}
+
+// `subscribe` does have an error channel, so the honest answer to a canceled
+// wait is `error.Canceled` — "returns success without registering" is a
+// correctness bug the caller cannot see.
+test "ThreadSafeEventBus subscribe reports a canceled lock wait as error.Canceled" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Event = struct { value: i32 };
+
+    const Ctx = struct {
+        fn onEvent(_: Event) void {}
+    };
+
+    const Task = struct {
+        var err: ?anyerror = null;
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+
+        fn subscribe(bus: *ThreadSafeEventBus(Event)) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            bus.subscribe(Ctx.onEvent) catch |e| {
+                err = e;
+                return;
+            };
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+
+    var bus = ThreadSafeEventBus(Event).init(allocator, io);
+    defer bus.deinit();
+
+    Task.err = null;
+    Task.entered.store(false, .monotonic);
+    Task.open.store(false, .monotonic);
+
+    try bus.mu.lock(io);
+
+    var task_fut = try io.concurrent(Task.subscribe, .{&bus});
+    while (!Task.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Task.cancel, .{ io, &task_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Task.open.store(true, .release);
+    while (bus.mu.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    bus.mu.unlock(io);
+
+    cancel_fut.await(io);
+    task_fut.await(io);
+
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), Task.err);
+    // The failure was real: nothing was registered behind the caller's back.
+    try std.testing.expectEqual(@as(usize, 0), bus.subscriberCount());
 }

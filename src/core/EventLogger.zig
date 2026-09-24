@@ -8,6 +8,10 @@ pub const EventLogger = struct {
     events: std.ArrayList(LoggedEvent),
     max_events: usize,
     next_event_id: u64,
+    /// Bumped by every `generateCorrelationId` call, independently of
+    /// `next_event_id`: minting an id must not consume an event id, and two ids
+    /// minted inside the same second still have to differ from each other.
+    correlation_seq: u64 = 0,
 
     pub const LoggedEvent = struct {
         id: u64,
@@ -112,9 +116,22 @@ pub const EventLogger = struct {
         self.pruneOldest(self.events.items.len);
     }
 
+    /// Correlation id for the events that follow, formatted `{second}-{sequence}`.
+    ///
+    /// The sequence is bumped per call, so the clock is not what has to keep two
+    /// ids apart: two lines minted in the same second used to come back identical
+    /// and were read as one correlation.
+    ///
+    /// The id is a label, not a key — `log` takes the id from its caller, and
+    /// nothing in the framework indexes by it (it is a free-text field in a log
+    /// line). That is why the allocation stays best-effort: on failure this
+    /// returns an empty string, which renders as a blank correlation field. A
+    /// less useful line, not a wrong one. The caller owns the returned slice.
     pub fn generateCorrelationId(self: *Self) []const u8 {
-        const id = Time.monotonicNowSeconds();
-        return std.fmt.allocPrint(self.allocator, "{d}-{d}", .{ id, self.next_event_id }) catch "";
+        const second = Time.monotonicNowSeconds();
+        const sequence = self.correlation_seq;
+        self.correlation_seq += 1;
+        return std.fmt.allocPrint(self.allocator, "{d}-{d}", .{ second, sequence }) catch "";
     }
 };
 
@@ -229,4 +246,22 @@ test "TestEventCollector basic operations" {
     collector.clear();
     try std.testing.expectEqual(@as(usize, 0), collector.getEventCount());
     try std.testing.expect(!collector.hasEvent("test-event"));
+}
+
+test "EventLogger mints a distinct correlation id per call" {
+    const allocator = std.testing.allocator;
+    var logger = EventLogger.init(allocator, 10);
+    defer logger.deinit();
+
+    const first = logger.generateCorrelationId();
+    const second = logger.generateCorrelationId();
+
+    // Both are minted inside the same second, so the sequence — not the clock —
+    // is what has to keep them apart: two log lines sharing an id are read as
+    // one correlation.
+    try std.testing.expect(first.len > 0);
+    try std.testing.expect(second.len > 0);
+    defer allocator.free(first);
+    defer allocator.free(second);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
 }

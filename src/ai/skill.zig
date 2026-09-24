@@ -177,7 +177,13 @@ pub const SkillRegistry = struct {
 
     /// Register a tool. Duplicate names are replaced.
     pub fn register(self: *Self, tool: Tool) !void {
-        self.mutex.lock(self.io) catch return;
+        // Propagated, not waited out: `register` returns `!void` — a silent
+        // success would tell the caller a tool is registered that never reached
+        // the model (`toOpenAiFunctionsAlloc`/`auditPolicy` would not list it, and
+        // `agent.zig` reads the registry before the guard judges a call).
+        // Red: `ai.skill.test.canceled lock wait does not lose a register, get,
+        // count or names`.
+        self.mutex.lock(self.io) catch return error.RegistryLockFailed;
         defer self.mutex.unlock(self.io);
 
         const key = try self.allocator.dupe(u8, tool.name);
@@ -205,20 +211,29 @@ pub const SkillRegistry = struct {
 
     /// Get a tool definition by name.
     pub fn get(self: *Self, name: []const u8) ?Tool {
-        self.mutex.lock(self.io) catch return null;
+        // Uncancelable: `null` here reads as "no such tool" (the guard in
+        // `agent.zig` treats a missing tool as "let dispatch decide on an unknown
+        // name"), so a canceled wait must not answer it. The signature is fixed
+        // by that caller; one map lookup.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return self.tools.get(name);
     }
 
     pub fn count(self: *Self) usize {
-        self.mutex.lock(self.io) catch return 0;
+        // Uncancelable: a fabricated `0` reads as "no tools registered". One map
+        // count.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return self.tools.count();
     }
 
     /// List all tool names.
     pub fn names(self: *Self, buf: [][]const u8) usize {
-        self.mutex.lock(self.io) catch return 0;
+        // Uncancelable: `0` reads as "the registry is empty" — and a short list
+        // would silently drop registered tools from whatever is built from `buf`.
+        // One walk.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
         var n: usize = 0;
@@ -661,4 +676,128 @@ fn pingHandler(ctx: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
 fn echoHandler(ctx: *SkillContext, args: std.json.Value) anyerror!std.json.Value {
     _ = ctx;
     return args.object.get("text").?;
+}
+
+/// Park `read` on `mutex` with a cancel request already placed on its thread, then
+/// let it through: the lock wait becomes the cancelation point. `std.Io.Mutex.lock`'s
+/// uncontended fast path does not check for cancellation, so it is the contended
+/// wait that can come back canceled.
+fn readUnderCanceledLockWait(
+    comptime T: type,
+    target: *T,
+    mutex: *std.Io.Mutex,
+    io: std.Io,
+    comptime read: fn (*T) void,
+) !void {
+    const Gate = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+
+        fn run(t: *T) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            read(t);
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Gate.entered.store(false, .monotonic);
+    Gate.open.store(false, .monotonic);
+
+    try mutex.lock(io);
+
+    var read_fut = try io.concurrent(Gate.run, .{target});
+    while (!Gate.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Gate.cancel, .{ io, &read_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Gate.open.store(true, .release);
+    while (mutex.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    mutex.unlock(io);
+
+    cancel_fut.await(io);
+    read_fut.await(io);
+}
+
+// The registry's four lock-wait sites, split by whether the caller can be told:
+//   - `register` returns `!void`, so the canceled wait is *propagated*
+//     (`error.RegistryLockFailed`, the name `dispatchWith`/`auditPolicy` already
+//     use) — a silent success would mean a tool the caller believes is registered
+//     never reaches the model, and `agent.zig` reads the registry to decide
+//     whether a tool even exists before the guard judges it;
+//   - `get`, `count` and `names` return `?Tool`/`usize`, where `null`/`0` read as
+//     "no such tool"/"empty registry" — the registry cannot fabricate those, and
+//     `get`'s signature is fixed by its caller (`agent.zig:481`), so they wait
+//     (`lockUncancelable`); each critical section is a map lookup or a walk.
+//
+// Red evidence: with the old shapes the first assertion below fails —
+// `expected error.RegistryLockFailed, found null`, because the canceled `register`
+// returned success without registering anything. The `get`/`count`/`names`
+// assertions after it are the same lock shape; a `try` ends the test at the first
+// failure, so those three are only exercised green.
+test "canceled lock wait does not lose a register, get, count or names" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var reg = SkillRegistry.init(allocator, io);
+    defer reg.deinit();
+
+    const RegisterRead = struct {
+        var seen: ?anyerror = null;
+        fn read(r: *SkillRegistry) void {
+            seen = null;
+            r.register(.{
+                .name = "ping",
+                .description = "Returns pong",
+                .parameters = &.{},
+                .handler = pingHandler,
+            }) catch |err| {
+                seen = err;
+            };
+        }
+    };
+    RegisterRead.seen = null;
+    try readUnderCanceledLockWait(SkillRegistry, &reg, &reg.mutex, io, RegisterRead.read);
+    try std.testing.expectEqual(@as(?anyerror, error.RegistryLockFailed), RegisterRead.seen);
+    try std.testing.expectEqual(@as(usize, 0), reg.count());
+
+    try reg.register(.{
+        .name = "ping",
+        .description = "Returns pong",
+        .parameters = &.{},
+        .handler = pingHandler,
+    });
+
+    const GetRead = struct {
+        var found: bool = false;
+        fn read(r: *SkillRegistry) void {
+            found = r.get("ping") != null;
+        }
+    };
+    GetRead.found = false;
+    try readUnderCanceledLockWait(SkillRegistry, &reg, &reg.mutex, io, GetRead.read);
+    try std.testing.expect(GetRead.found);
+
+    const CountRead = struct {
+        var seen: usize = 0;
+        fn read(r: *SkillRegistry) void {
+            seen = r.count();
+        }
+    };
+    CountRead.seen = 0;
+    try readUnderCanceledLockWait(SkillRegistry, &reg, &reg.mutex, io, CountRead.read);
+    try std.testing.expectEqual(@as(usize, 1), CountRead.seen);
+
+    const NamesRead = struct {
+        var seen: usize = 0;
+        fn read(r: *SkillRegistry) void {
+            var buf: [4][]const u8 = undefined;
+            seen = r.names(&buf);
+        }
+    };
+    NamesRead.seen = 0;
+    try readUnderCanceledLockWait(SkillRegistry, &reg, &reg.mutex, io, NamesRead.read);
+    try std.testing.expectEqual(@as(usize, 1), NamesRead.seen);
 }

@@ -61,7 +61,12 @@ pub const MemoryStore = struct {
 
     /// Store a fact. Logical key format: "namespace:category:detail" (e.g. "user:pref:lang").
     pub fn remember(self: *MemoryStore, key: []const u8, value: []const u8, tenant_id: i64, user_id: i64) !void {
-        self.mutex.lock(self.io) catch return;
+        // Propagated, not waited out: `remember` returns `!void`, so the caller
+        // can be told that the fact was *not* stored instead of being handed a
+        // success it cannot trust (the old `catch return` returned success
+        // without storing anything). Red: `ai.memory.test.canceled lock wait does
+        // not lose a remember, forget or count`.
+        self.mutex.lock(self.io) catch return error.LockFailed;
         defer self.mutex.unlock(self.io);
 
         if (self.entries.count() >= self.max_entries) {
@@ -138,7 +143,12 @@ pub const MemoryStore = struct {
 
     /// Remove memory for logical key scoped to tenant+user.
     pub fn forget(self: *MemoryStore, key: []const u8, tenant_id: i64, user_id: i64) void {
-        self.mutex.lock(self.io) catch return;
+        // Uncancelable: `forget` has no error channel (`void`), and a skipped call
+        // leaves data standing that was asked to be deleted — privacy deletions
+        // included — with nothing reported back. One map removal. Red:
+        // `ai.memory.test.canceled lock wait does not lose a remember, forget or
+        // count`.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
         const sk = storageKey(self.allocator, tenant_id, user_id, key) catch return;
@@ -227,7 +237,9 @@ pub const MemoryStore = struct {
     }
 
     pub fn count(self: *MemoryStore) usize {
-        self.mutex.lock(self.io) catch return 0;
+        // Uncancelable: a fabricated `0` reads as "this store is empty" — the
+        // reading a size/health report is built from. One map count.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return self.entries.count();
     }
@@ -479,4 +491,107 @@ test "MemoryStore saveToFile loadFromFile" {
     defer store2.deinit();
     try store2.loadFromFile(path);
     try std.testing.expectEqual(@as(usize, 1), store2.count());
+}
+
+/// Park `read` on `mutex` with a cancel request already placed on its thread, then
+/// let it through: the lock wait becomes the cancelation point. `std.Io.Mutex.lock`'s
+/// uncontended fast path does not check for cancellation, so it is the contended
+/// wait that can come back canceled.
+fn readUnderCanceledLockWait(
+    comptime T: type,
+    target: *T,
+    mutex: *std.Io.Mutex,
+    io: std.Io,
+    comptime read: fn (*T) void,
+) !void {
+    const Gate = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+
+        fn run(t: *T) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            read(t);
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Gate.entered.store(false, .monotonic);
+    Gate.open.store(false, .monotonic);
+
+    try mutex.lock(io);
+
+    var read_fut = try io.concurrent(Gate.run, .{target});
+    while (!Gate.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Gate.cancel, .{ io, &read_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Gate.open.store(true, .release);
+    while (mutex.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    mutex.unlock(io);
+
+    cancel_fut.await(io);
+    read_fut.await(io);
+}
+
+// The three lock-wait sites the inventory flagged, and why each is answered
+// differently:
+//   - `remember` returns `!void`, so the canceled wait is *propagated*
+//     (`error.LockFailed`) — the caller learns the fact was not stored instead of
+//     being told a success it cannot trust;
+//   - `forget` returns `void` and has no error channel, so it *waits*
+//     (`lockUncancelable`): the skipped call would leave data that was asked to be
+//     deleted (privacy deletions included) in the store, invisibly;
+//   - `count` returns `usize`, and a fabricated `0` reads as "this store is
+//     empty", so it waits too. Each critical section is a map operation.
+//
+// Red evidence: with the old shapes the first assertion below fails —
+// `expected error.LockFailed, found null`, because the canceled `remember`
+// returned success without storing. The `forget` and `count` assertions after it
+// are the same lock shape; a `try` ends the test at the first failure, so those
+// two are only exercised green.
+test "canceled lock wait does not lose a remember, forget or count" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var store = MemoryStore.init(a, io);
+    defer store.deinit();
+
+    const RememberRead = struct {
+        var seen: ?anyerror = null;
+        fn read(s: *MemoryStore) void {
+            seen = null;
+            s.remember("k", "v", 0, 0) catch |err| {
+                seen = err;
+            };
+        }
+    };
+    RememberRead.seen = null;
+    try readUnderCanceledLockWait(MemoryStore, &store, &store.mutex, io, RememberRead.read);
+    try std.testing.expectEqual(@as(?anyerror, error.LockFailed), RememberRead.seen);
+    try std.testing.expectEqual(@as(usize, 0), store.count());
+
+    try store.remember("gone", "x", 0, 0);
+    const ForgetRead = struct {
+        fn read(s: *MemoryStore) void {
+            s.forget("gone", 0, 0);
+        }
+    };
+    try readUnderCanceledLockWait(MemoryStore, &store, &store.mutex, io, ForgetRead.read);
+    try std.testing.expectEqual(@as(usize, 0), store.count());
+
+    // Seeded again: the count read below must return 1, so "0" is unambiguous
+    // evidence that the canceled wait was answered with a fabricated value.
+    try store.remember("kept", "x", 0, 0);
+    const CountRead = struct {
+        var seen: usize = 0;
+        fn read(s: *MemoryStore) void {
+            seen = s.count();
+        }
+    };
+    CountRead.seen = 0;
+    try readUnderCanceledLockWait(MemoryStore, &store, &store.mutex, io, CountRead.read);
+    try std.testing.expectEqual(@as(usize, 1), CountRead.seen);
 }

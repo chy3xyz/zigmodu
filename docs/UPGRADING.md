@@ -72,6 +72,20 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 返回：`release` 丢掉缓冲区（`allocated` 永久虚高 → 以后报**假** `PoolExhausted`），`available`/`stats`
 给出伪造读数（会被 scrape/健康检查当成事实）。`acquire` 仍然返回 `error.Canceled`。
 
+**行为变化（非破坏）⑨：一批"取消被当成成功/默认值"的路径改成等待或报错。** 涉及 `EventBus`
+（`publish`/`unsubscribe`/`subscriberCount`/`publishedCount` 改不可取消的等待；**`subscribe`/`subscribeAsync`
+现在会返回 `error.Canceled`** —— 以前它们**返回成功却没注册**）、`EventStore`
+（`getVersion`/`SnapshotStore.load` 改等待；**并且修掉了 `replayFromSnapshot` 只读一次 256 条事件、
+长流静默丢尾部**）、`cache`（`Lru.set` 现在会返回 `error.Canceled`，`delete`/`clear`/`size`/`get` 改等待）、
+`Runtime.shutdown`/`Mailbox`（关停与唤醒不再被取消吞掉）、`redis` 的池释放/逐出（池槽不再永久丢失）、
+`ai` 的 `key_pool.onError`/`onSuccess`、`memory.remember`/`forget`/`count`、`skill.register`/`get`/`count`/`names`、
+`audit.record`、`quota.used`/`remaining`。**错误集变化**（用 `try` 的调用方不受影响，只有穷举错误集匹配
+需要加一支）：`MemoryStore.remember` 增 `error.LockFailed`、`SkillRegistry.register` 增
+`error.RegistryLockFailed`、`Lru.set` 与 `EventBus.subscribe(Async)` 增 `error.Canceled`。
+**结构变化**：`AgentAuditLog` 新增公开字段 `owned: []bool`（用字面量构造会编译不过；请用
+`AgentAuditLog.init`）。另外 `Preflight` 的失败计数改为**先计数后记录**，所以"有致命失败却
+`report.ok() == true`"这条不再可能。
+
 **行为变化（非破坏）⑧：MySQL 的 `NULL` 结果集元数据不再被读成"零行"。** 语句有字段却拿不到元数据时
 （libmysql 的分配失败）以前返回空结果集，现在返回映射后的错误；`field_count == 0` 这条真实子情形仍是
 空结果集（记一条 debug 日志）。

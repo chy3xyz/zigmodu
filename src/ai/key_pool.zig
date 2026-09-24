@@ -178,7 +178,13 @@ pub const KeyPool = struct {
     }
 
     pub fn onSuccess(self: *Self, io: std.Io, key_index: usize) void {
-        self.mutex.lock(io) catch return;
+        // Uncancelable: this is the write that puts a key *back* into service and
+        // clears its failure count. `void` is the whole answer, so `catch return`
+        // is a silent no-op — the key stays cooling (or disabled) after a call it
+        // just served, and nothing reaches the caller. The critical section is a
+        // few map operations. Red: `ai.key_pool.test.canceled lock wait does not
+        // lose an onError cooldown or onSuccess reset`.
+        self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const key = self.keyPtrLocked(key_index) orelse return;
         key.total_calls += 1;
@@ -192,7 +198,14 @@ pub const KeyPool = struct {
     /// accumulate and disable the key after `auth_fail_threshold`; all other
     /// kinds cool it with exponential backoff.
     pub fn onError(self: *Self, io: std.Io, key_index: usize, kind: KeyErrorKind) void {
-        self.mutex.lock(io) catch return;
+        // Uncancelable: this is the write that takes a failing key *out* of
+        // rotation, and its production caller is the 401/403/402/429 path
+        // (`ai/provider.zig` → `AiProviderManager.onError`). `void` is the whole
+        // answer, so `catch return` never records the failure — the key that just
+        // failed stays selectable and is neither cooled nor banned. The critical
+        // section is a few map operations. Red: `ai.key_pool.test.canceled lock
+        // wait does not lose an onError cooldown or onSuccess reset`.
+        self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const key = self.keyPtrLocked(key_index) orelse return;
         key.total_errors += 1;
@@ -374,4 +387,85 @@ test "pool routes cooldown through an external shared store" {
     try std.testing.expectEqual(@as(?KeyLease, null), try pool.acquire(std.testing.io));
     // External store knows the key is cooling (cross-process visibility).
     try std.testing.expect(shared.asStore().isCooling("shared:0"));
+}
+
+/// Park `read` on `mutex` with a cancel request already placed on its thread, then
+/// let it through: the lock wait becomes the cancelation point. `std.Io.Mutex.lock`'s
+/// uncontended fast path does not check for cancellation, so it is the contended
+/// wait that can come back canceled.
+fn readUnderCanceledLockWait(
+    comptime T: type,
+    target: *T,
+    mutex: *std.Io.Mutex,
+    io: std.Io,
+    comptime read: fn (*T) void,
+) !void {
+    const Gate = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+
+        fn run(t: *T) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            read(t);
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Gate.entered.store(false, .monotonic);
+    Gate.open.store(false, .monotonic);
+
+    try mutex.lock(io);
+
+    var read_fut = try io.concurrent(Gate.run, .{target});
+    while (!Gate.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Gate.cancel, .{ io, &read_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Gate.open.store(true, .release);
+    while (mutex.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    mutex.unlock(io);
+
+    cancel_fut.await(io);
+    read_fut.await(io);
+}
+
+// `onError` is the write that takes a failing key *out* of rotation and
+// `onSuccess` the one that puts it back. Both return `void`, so a canceled lock
+// wait swallowed as `catch return` is a silent no-op: the 401/403/402/429 the
+// provider just received (`ai/provider.zig:279` → `AiProviderManager.onError`) is
+// never recorded, the failing key stays selectable, and the caller has no error
+// channel to notice. The critical section is a few map operations, so the wait
+// must not be cancelable.
+//
+// Red evidence: with the old `self.mutex.lock(io) catch return;` the first
+// assertion below fails (`sk-a` is handed back after the canceled `onError` was
+// dropped). The `onSuccess` half is the same lock shape; a `try` ends the test at
+// the first failure, so it is only exercised green.
+test "canceled lock wait does not lose an onError cooldown or onSuccess reset" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    fake_now = 1_000_000;
+    var pool = try testPool(allocator, &.{"sk-a"});
+    defer pool.deinit();
+
+    _ = (try pool.acquire(io)).?;
+    const ErrorRead = struct {
+        fn read(p: *KeyPool) void {
+            p.onError(std.testing.io, 0, .rate_limit);
+        }
+    };
+    try readUnderCanceledLockWait(KeyPool, &pool, &pool.mutex, io, ErrorRead.read);
+    try std.testing.expectEqual(@as(?KeyLease, null), try pool.acquire(io));
+
+    const SuccessRead = struct {
+        fn read(p: *KeyPool) void {
+            p.onSuccess(std.testing.io, 0);
+        }
+    };
+    try readUnderCanceledLockWait(KeyPool, &pool, &pool.mutex, io, SuccessRead.read);
+    try std.testing.expectEqualStrings("sk-a", (try pool.acquire(io)).?.key);
 }

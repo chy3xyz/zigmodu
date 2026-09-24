@@ -1347,7 +1347,17 @@ pub const Runtime = struct {
         // See the doc comment above: the join is what makes "no timer can fire
         // after this line" true rather than likely.
         if (self.ticker_running.swap(false, .acquire)) {
-            self.mu.lock(self.io) catch return;
+            // Uncancelable: this wake is the one the join below depends on, and
+            // everything after it — both pool shutdowns, the worker joins and
+            // destroys, the group frees, `wakeTimerWaiters`, `shutdown_done` — is
+            // abandoned by an early `return`. A caller that hears "shutdown
+            // returned" would then be free to free the memory the ticker, the
+            // pool threads and the workers are still using. The `shutdown_mu`
+            // taken on entry is already uncancelable for the same reason; there
+            // is no error channel and the critical section is one broadcast.
+            // Red: `Runtime: a canceled shutdown still tears the runtime down`
+            // (`stats().workers` still 1).
+            self.mu.lockUncancelable(self.io);
             self.idle.broadcast(self.io);
             self.mu.unlock(self.io);
             if (self.ticker) |t| {
@@ -2192,7 +2202,16 @@ pub const Runtime = struct {
         // gets it, including the `catch return`s below.
         defer self.drainWheel();
 
-        self.mu.lock(self.io) catch return;
+        // Uncancelable, both locks below: this thread *is* the wheel's driver, so
+        // exiting it retires every timer in the process while `ticker_running`
+        // (swapped by `shutdown`, and the flag `shutdown` uses to justify its
+        // join) still reads `true` — and on the way out of the loop the wheel
+        // would be left owned by a thread that no longer exists. Neither lock is
+        // held across anything but a broadcast/signal; the body between them
+        // (drain, advance, fire) runs with `mu` released, so this cannot become
+        // an unbounded wait. There is no error channel: `tickerMain` is a
+        // `std.Thread` body.
+        self.mu.lockUncancelable(self.io);
         while (self.ticker_running.load(.acquire)) {
             self.idle.waitTimeout(self.io, &self.mu, .{
                 .duration = clock_mod.duration(tick_interval_ms),
@@ -2213,7 +2232,7 @@ pub const Runtime = struct {
             _ = self.wheel.advance(before, self, onTimerFire);
             if (applied > 0) self.wakeTimerWaiters();
 
-            self.mu.lock(self.io) catch return;
+            self.mu.lockUncancelable(self.io);
         }
         self.mu.unlock(self.io);
     }
@@ -3797,6 +3816,57 @@ test "Runtime: trace context exists only inside a message's handler" {
     loop.join(); // `run` returns immediately
     try std.testing.expect(!loop.state.saw_trace);
     loop.stop();
+}
+
+test "Runtime: a canceled shutdown still tears the runtime down" {
+    // `shutdown`'s body is a sequence of irreversible steps — join the ticker,
+    // stop both pools, join and destroy the workers, free the groups, wake the
+    // timer waiters, publish `shutdown_done`. Its first line (`shutdown_mu`) is
+    // already uncancelable; the `mu` it takes one step later is not, and the
+    // `catch return` there abandons the whole teardown *midway*: the caller gets
+    // a return that reads as "shut down", while the workers are still registered,
+    // their threads are still running, and `deinit` will free the memory under
+    // them.
+    //
+    // `stats().workers` is the reading that says so: it is `workers.items.len`,
+    // which only a completed teardown clears.
+    const io = std.testing.io;
+    var clk = Clock.Manual{ .now_ms = 0 };
+    var rt = Runtime.init(std.testing.allocator, io, .{ .manual = &clk });
+    defer rt.deinit();
+
+    _ = try rt.spawn(CounterWorker, .{}, 8);
+    try rt.start(); // the ticker join is the first step a lost teardown skips
+
+    const Shared = struct {
+        var at_call = std.atomic.Value(bool).init(false);
+
+        fn run(r: *Runtime) void {
+            at_call.store(true, .release);
+            r.shutdown();
+        }
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Shared.at_call.store(false, .monotonic);
+
+    try rt.mu.lock(io);
+    var shutdown_fut = try io.concurrent(Shared.run, .{&rt});
+    while (!Shared.at_call.load(.acquire)) std.atomic.spinLoopHint();
+    var cancel_fut = try io.concurrent(Shared.cancel, .{ io, &shutdown_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+    rt.mu.unlock(io);
+
+    cancel_fut.await(io);
+    shutdown_fut.await(io);
+    // Give a ticker a lost teardown left behind time to notice `ticker_running`
+    // on its own, so the failure below is the assertion and not a teardown race.
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(30), .awake);
+
+    const after = rt.stats();
+    try std.testing.expectEqual(@as(usize, 0), after.workers);
+    try std.testing.expectEqual(@as(usize, 0), after.running);
 }
 
 test "Runtime: shutdown joins every worker and reports stats" {

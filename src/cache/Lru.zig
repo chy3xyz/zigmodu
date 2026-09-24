@@ -67,8 +67,17 @@ pub fn Cache(comptime K: type, comptime V: type) type {
         }
 
         /// Get value from cache (returns pointer to avoid copying)
+        ///
+        /// Uncancelable: `std.Io.Mutex.lock` fails only with `error.Canceled`
+        /// (`std.Io.Cancelable`), and the old `catch return null` answered a
+        /// canceled wait with "miss" for a key the cache is holding — and, since
+        /// a cancelation is delivered exactly once, it ate the request's
+        /// cancelation too, so the caller went on to do the work cancelation was
+        /// meant to stop. The critical section is one map lookup plus a list
+        /// move, so waiting is the answer this file's `deinit` already chose for
+        /// the same mutex.
         pub fn get(self: *Self, key: K) ?*V {
-            self.mutex.lock(self.io) catch return null;
+            self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
 
             const node_ptr = self.map.get(key) orelse return null;
@@ -86,9 +95,14 @@ pub fn Cache(comptime K: type, comptime V: type) type {
             return &node_ptr.value;
         }
 
-        /// Set value in cache with optional TTL
+        /// Set value in cache with optional TTL.
+        ///
+        /// A canceled lock wait surfaces as `error.Canceled` (see `get`): the old
+        /// `catch return` reported success while storing nothing, so a caller
+        /// that went on to read back its own write got a miss. This one has an
+        /// error channel, so the cancelation is the caller's to handle.
         pub fn set(self: *Self, key: K, value: V, ttl_ms: ?i64) !void {
-            self.mutex.lock(self.io) catch return;
+            self.mutex.lock(self.io) catch |err| return err;
             defer self.mutex.unlock(self.io);
 
             const expires_at = if (ttl_ms) |ttl| 0 + ttl else null;
@@ -118,9 +132,14 @@ pub fn Cache(comptime K: type, comptime V: type) type {
             try self.map.put(key, node);
         }
 
-        /// Delete key from cache
+        /// Delete key from cache.
+        ///
+        /// Uncancelable (see `get`): the old `catch return` left the stale entry
+        /// where it was and told the caller nothing, so the next read served a
+        /// value the caller believed it had just invalidated. There is no error
+        /// channel to report a skipped delete through.
         pub fn delete(self: *Self, key: K) void {
-            self.mutex.lock(self.io) catch return;
+            self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
 
             if (self.map.get(key)) |node_ptr| {
@@ -128,9 +147,14 @@ pub fn Cache(comptime K: type, comptime V: type) type {
             }
         }
 
-        /// Clear all cache entries
+        /// Clear all cache entries.
+        ///
+        /// Uncancelable (see `get`) — and this is the "drop everything" button
+        /// after a permission or tenant change, where a silent no-op leaves the
+        /// previous caller's entries behind. No error channel to report it
+        /// through either.
         pub fn clear(self: *Self) void {
-            self.mutex.lock(self.io) catch return;
+            self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
 
             var it = self.map.valueIterator();
@@ -141,9 +165,13 @@ pub fn Cache(comptime K: type, comptime V: type) type {
             self.list = .{};
         }
 
-        /// Current cache size
+        /// Current cache size.
+        ///
+        /// Uncancelable (see `get`): the old `catch return 0` reported a cache
+        /// that is not empty as empty — a reading a metrics scrape or a health
+        /// check would act on, not a harmless placeholder.
         pub fn size(self: *Self) usize {
-            self.mutex.lock(self.io) catch return 0;
+            self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             return self.map.count();
         }
@@ -221,6 +249,155 @@ test "cache pointer return" {
     // Modify through pointer
     ptr.* = 200;
     try std.testing.expectEqual(@as(u32, 200), cache.get(1).?.*);
+}
+
+// `delete` answered a canceled lock wait with a bare `catch return`, and the
+// caller had no way to tell: it asked for a key to be gone and got no error
+// back, so the next read served the value the caller believed it had just
+// invalidated. `clear` has the same shape and a sharper edge — it is the "drop
+// everything" button after a permission or tenant change — and `size` / `get`
+// fabricated `0` / "miss" for a cache that was not empty.
+//
+// None of the three has an error channel and each critical section is one map
+// operation, so the answer is the one this file's own `deinit` already chose:
+// wait uncancelably rather than skip the work.
+//
+// In each test the action is parked on the cache mutex (held by the test thread)
+// with a cancel request already placed on its thread, so the lock wait inside
+// the action is the cancelation point; the gate between the two is pure
+// spinning, which consumes nothing.
+fn parkedBehindCanceledLock(cache: *Cache(u32, u32), action: *const fn (*Cache(u32, u32)) void) !void {
+    const io = cache.io;
+    const Gate = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+
+        fn run(c: *Cache(u32, u32), act: *const fn (*Cache(u32, u32)) void) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            act(c);
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Gate.entered.store(false, .monotonic);
+    Gate.open.store(false, .monotonic);
+
+    try cache.mutex.lock(io);
+    var action_fut = try io.concurrent(Gate.run, .{ cache, action });
+    while (!Gate.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Gate.cancel, .{ io, &action_fut });
+    // Give the request time to land on the action's thread while it is still gated.
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Gate.open.store(true, .release);
+    // The action is now inside the cache: parked on the mutex (it swaps the
+    // state to `contended` on its way to the wait), or already gone.
+    while (cache.mutex.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    cache.mutex.unlock(io);
+
+    cancel_fut.await(io);
+    action_fut.await(io);
+}
+
+test "cache: a canceled delete still deletes" {
+    var cache = Cache(u32, u32).init(std.testing.allocator, std.testing.io, 8);
+    defer cache.deinit();
+
+    try cache.set(1, 10, null);
+    try cache.set(2, 20, null);
+
+    const Act = struct {
+        fn run(c: *Cache(u32, u32)) void {
+            c.delete(1);
+        }
+    };
+    try parkedBehindCanceledLock(&cache, Act.run);
+
+    // The key the caller just deleted is gone, and only that key.
+    try std.testing.expect(cache.get(1) == null);
+    try std.testing.expect(cache.get(2) != null);
+    try std.testing.expectEqual(@as(usize, 1), cache.size());
+}
+
+test "cache: a canceled clear still clears" {
+    var cache = Cache(u32, u32).init(std.testing.allocator, std.testing.io, 8);
+    defer cache.deinit();
+
+    try cache.set(1, 10, null);
+    try cache.set(2, 20, null);
+
+    const Act = struct {
+        fn run(c: *Cache(u32, u32)) void {
+            c.clear();
+        }
+    };
+    try parkedBehindCanceledLock(&cache, Act.run);
+
+    try std.testing.expectEqual(@as(usize, 0), cache.size());
+    try std.testing.expect(cache.get(1) == null);
+    try std.testing.expect(cache.get(2) == null);
+}
+
+test "cache: a canceled set reports the cancelation instead of a fabricated success" {
+    var cache = Cache(u32, u32).init(std.testing.allocator, std.testing.io, 8);
+    defer cache.deinit();
+
+    const Act = struct {
+        var outcome: ?anyerror = null;
+        fn run(c: *Cache(u32, u32)) void {
+            c.set(1, 10, null) catch |err| {
+                outcome = err;
+                return;
+            };
+        }
+    };
+    Act.outcome = null;
+    try parkedBehindCanceledLock(&cache, Act.run);
+
+    // `set` has an error channel, so the caller has to see the cancelation
+    // rather than believe a write that never happened: reading back its own
+    // write would otherwise report a miss.
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), Act.outcome);
+    try std.testing.expect(cache.get(1) == null);
+}
+
+test "cache: a canceled size and get still report the cache as it is" {
+    var cache = Cache(u32, u32).init(std.testing.allocator, std.testing.io, 8);
+    defer cache.deinit();
+
+    try cache.set(7, 70, null);
+
+    const SizeAct = struct {
+        var seen: usize = 0;
+        fn run(c: *Cache(u32, u32)) void {
+            seen = c.size();
+        }
+    };
+    SizeAct.seen = 0;
+    try parkedBehindCanceledLock(&cache, SizeAct.run);
+    // One entry is in there: `0` would be a reading, not a harmless placeholder.
+    try std.testing.expectEqual(@as(usize, 1), SizeAct.seen);
+
+    const GetAct = struct {
+        var hit = false;
+        var value: u32 = 0;
+        fn run(c: *Cache(u32, u32)) void {
+            if (c.get(7)) |v| {
+                hit = true;
+                value = v.*;
+            }
+        }
+    };
+    GetAct.hit = false;
+    GetAct.value = 0;
+    try parkedBehindCanceledLock(&cache, GetAct.run);
+    // The key is there, so "miss" is a wrong answer, not a safe default.
+    try std.testing.expect(GetAct.hit);
+    try std.testing.expectEqual(@as(u32, 70), GetAct.value);
 }
 
 // Regression: `deinit` used to give up on a contended `tryLock` and then rip the

@@ -749,9 +749,15 @@ pub const Scheduler = struct {
             }
             // Park on the condition until `shutdown` broadcasts or the poll times
             // out. Same shape as the ticker's idle loop — and a poll rather than a
-            // signal on purpose: the producers' path stays free of mutexes, so the
-            // cost of a missed wake-up is one poll interval.
-            self.mu.lock(self.io) catch return;
+            // signal on purpose: the producers' path stays free of mutexes, so a
+            // *missed wake-up* costs one poll interval. A `return` here is not a
+            // missed wake-up: it retires the thread for good while
+            // `stats().pool_threads` (and `running`) keep counting it, so the pool
+            // silently loses width — with one thread, all of it. Uncancelable, and
+            // the lock is not held across the park (`waitTimeout` releases it), so
+            // this cannot become an unbounded wait. There is no error channel:
+            // `poolMain` is a `std.Thread` body.
+            self.mu.lockUncancelable(self.io);
             // Sleep only if the ring is exactly what the attempt above saw: a push
             // that landed while we were spinning (including one for a token that
             // just became claimable) is work to look at, not a reason to sleep.

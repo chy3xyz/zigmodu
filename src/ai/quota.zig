@@ -62,14 +62,21 @@ pub const TokenQuota = struct {
     }
 
     pub fn used(self: *TokenQuota, tenant_id: i64) usize {
-        self.mutex.lock(self.io) catch return 0;
+        // Uncancelable: a fabricated `0` reads as "this tenant has consumed
+        // nothing" — the fail-open direction, and `used` is what an operator or a
+        // dashboard compares against `limit`. One map lookup.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const b = self.buckets.get(tenant_id) orelse return 0;
         return b.used;
     }
 
     pub fn remaining(self: *TokenQuota, tenant_id: i64) usize {
-        self.mutex.lock(self.io) catch return 0;
+        // Uncancelable: a fabricated `0` reads as "quota exhausted" (fail-closed,
+        // but still a false refusal for a tenant with budget left). One map
+        // lookup. Red pair: `ai.quota.test.canceled lock wait does not fabricate
+        // used 0 or remaining 0`.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const b = self.buckets.get(tenant_id) orelse return self.default_limit;
         if (b.used >= b.limit) return 0;
@@ -114,4 +121,87 @@ test "TokenQuota prometheus" {
     const out = try q.toPrometheusFormat(a);
     defer a.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "tenant_id=\"1\"") != null);
+}
+
+/// Park `read` on `mutex` with a cancel request already placed on its thread, then
+/// let it through: the lock wait becomes the cancelation point. `std.Io.Mutex.lock`'s
+/// uncontended fast path does not check for cancellation, so it is the contended
+/// wait that can come back canceled.
+fn readUnderCanceledLockWait(
+    comptime T: type,
+    target: *T,
+    mutex: *std.Io.Mutex,
+    io: std.Io,
+    comptime read: fn (*T) void,
+) !void {
+    const Gate = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+
+        fn run(t: *T) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            read(t);
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Gate.entered.store(false, .monotonic);
+    Gate.open.store(false, .monotonic);
+
+    try mutex.lock(io);
+
+    var read_fut = try io.concurrent(Gate.run, .{target});
+    while (!Gate.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Gate.cancel, .{ io, &read_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Gate.open.store(true, .release);
+    while (mutex.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    mutex.unlock(io);
+
+    cancel_fut.await(io);
+    read_fut.await(io);
+}
+
+// The two readers are a matched pair, and the old shapes failed **opposite ways**:
+// `used → 0` reads as "nothing has been consumed" (fail-open — a tenant over its
+// budget looks untouched), while `remaining → 0` reads as "quota exhausted"
+// (fail-closed — a tenant with budget left is refused). Neither `0` is a
+// legitimate answer for a tenant that has spent tokens, and both return `usize`
+// with no error channel, so they wait (`lockUncancelable`).
+//
+// Red evidence: with the old `catch return 0` on both, the first assertion below
+// fails — `expected 80, found 0`. The `remaining` assertion after it is the same
+// lock shape; a `try` ends the test at the first failure, so it is only exercised
+// green.
+test "canceled lock wait does not fabricate used 0 or remaining 0" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var q = TokenQuota.init(a, io, 100);
+    defer q.deinit();
+    try q.record(7, 40, 40);
+
+    const UsedRead = struct {
+        var seen: usize = 0;
+        fn read(qq: *TokenQuota) void {
+            seen = qq.used(7);
+        }
+    };
+    UsedRead.seen = 0;
+    try readUnderCanceledLockWait(TokenQuota, &q, &q.mutex, io, UsedRead.read);
+    try std.testing.expectEqual(@as(usize, 80), UsedRead.seen);
+
+    const RemainingRead = struct {
+        var seen: usize = 0;
+        fn read(qq: *TokenQuota) void {
+            seen = qq.remaining(7);
+        }
+    };
+    RemainingRead.seen = 0;
+    try readUnderCanceledLockWait(TokenQuota, &q, &q.mutex, io, RemainingRead.read);
+    try std.testing.expectEqual(@as(usize, 20), RemainingRead.seen);
 }

@@ -161,8 +161,14 @@ pub const EventStore = struct {
     }
 
     /// Get current stream version.
+    ///
+    /// Uncancelable, and it has to be: `u64` has no room for "I could not read
+    /// this", and `0` is a real answer — "this stream has no events". A canceled
+    /// lock wait answered with `0` claimed an empty stream for a stream that has
+    /// events, so this waits out the lock instead. The critical section is a hash
+    /// lookup plus a load.
     pub fn getVersion(self: *Self, stream_id: []const u8) u64 {
-        self.mutex.lock(self.io) catch return 0;
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const stream = self.streams.get(stream_id) orelse return 0;
         return stream.version;
@@ -225,8 +231,14 @@ pub const SnapshotStore = struct {
     }
 
     /// Load latest snapshot (borrowed; valid until the next save).
+    ///
+    /// `null` means one thing only: this stream has no snapshot. The lock wait is
+    /// therefore uncancelable — the old `catch return null` answered a canceled
+    /// wait with "no snapshot", and `EventReplay.replayFromSnapshot` reads that
+    /// as "replay this stream from version 1", which rebuilds state from a window
+    /// the snapshot was supposed to have replaced.
     pub fn load(self: *Self, stream_id: []const u8) ?Snapshot {
-        self.mutex.lock(self.io) catch return null;
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return self.snapshots.get(stream_id);
     }
@@ -236,6 +248,12 @@ pub const SnapshotStore = struct {
 pub const EventReplay = struct {
     /// Replay events from the snapshot point: applies the snapshot state
     /// (via `apply_snapshot`) then every event after it (via `apply_event`).
+    ///
+    /// Long streams are read in as many passes as they need: `readStream` fills
+    /// at most one buffer, so a single pass applied the first `buf.len` events of
+    /// a longer stream and dropped the tail without a word — state rebuilt from a
+    /// truncated window, with nothing in the return value or the callbacks to say
+    /// so. Each pass resumes at the sequence after the last event it saw.
     pub fn replayFromSnapshot(
         event_store: *EventStore,
         snapshot_store: *SnapshotStore,
@@ -244,12 +262,17 @@ pub const EventReplay = struct {
         apply_event: *const fn (EventStore.EventStream.StoredEvent) void,
     ) !void {
         const snapshot = snapshot_store.load(stream_id);
-        const from_version = if (snapshot) |s| s.version + 1 else 1;
+        var from_version: u64 = if (snapshot) |s| s.version + 1 else 1;
         if (snapshot) |s| apply_snapshot(s);
 
         var buf: [256]EventStore.EventStream.StoredEvent = undefined;
-        const events = try event_store.readStream(stream_id, from_version, &buf);
-        for (events) |event| apply_event(event);
+        while (true) {
+            const events = try event_store.readStream(stream_id, from_version, &buf);
+            for (events) |event| apply_event(event);
+            // A short read is the end of the stream; a full one may not be.
+            if (events.len < buf.len) break;
+            from_version = events[events.len - 1].sequence + 1;
+        }
     }
 };
 
@@ -325,4 +348,154 @@ test "SnapshotStore and replay from snapshot" {
     try std.testing.expect(State.applied_snapshot);
     // Only event 3 (sequence > snapshot version 2) is replayed.
     try std.testing.expectEqual(@as(usize, 1), State.events_after);
+}
+
+// A stream longer than one read buffer used to be replayed only as far as
+// `buf.len`: the tail was dropped without a word, so the rebuilt state was
+// taken from a truncated window and nothing downstream could tell.
+test "EventStore replay from snapshot drains streams longer than one read buffer" {
+    const allocator = std.testing.allocator;
+    var store = EventStore.init(allocator, std.testing.io);
+    defer store.deinit();
+    var snapshots = SnapshotStore.init(allocator, std.testing.io);
+    defer snapshots.deinit();
+
+    const Ev = struct { n: u32 };
+    const total: u32 = 300; // more than the 256-event buffer
+    var n: u32 = 0;
+    while (n < total) : (n += 1) try store.append("agg-long", Ev{ .n = n }, .{});
+
+    const State = struct {
+        var applied: usize = 0;
+        var last_sequence: u64 = 0;
+    };
+    State.applied = 0;
+    State.last_sequence = 0;
+
+    // No snapshot for this stream: every event is replayed, from version 1.
+    try EventReplay.replayFromSnapshot(&store, &snapshots, "agg-long", struct {
+        fn s(_: SnapshotStore.Snapshot) void {}
+    }.s, struct {
+        fn e(event: EventStore.EventStream.StoredEvent) void {
+            State.applied += 1;
+            State.last_sequence = event.sequence;
+        }
+    }.e);
+
+    try std.testing.expectEqual(@as(usize, total), State.applied);
+    try std.testing.expectEqual(@as(u64, total), State.last_sequence);
+}
+
+// The two tests below pin the read side against cancelation. `getVersion` and
+// `SnapshotStore.load` have no error channel, so the answer a canceled wait
+// must not produce is the fabricated one: `0` reads as "this stream has no
+// events" and `null` reads as "there is no snapshot", which `replayFromSnapshot`
+// turns into "replay from version 1". The lock wait is the cancelation point —
+// the task is parked on the store mutex (held by the test thread) with a cancel
+// request already placed on its thread, and the gate before the call is pure
+// spinning, which consumes nothing. Same idiom as `im.BufferPool`'s tests.
+test "EventStore getVersion waits out a canceled lock instead of reporting an empty stream" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Ev = struct { n: u32 };
+
+    const Task = struct {
+        var version = std.atomic.Value(u64).init(0);
+        var done = std.atomic.Value(bool).init(false);
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+
+        fn read(store: *EventStore) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            version.store(store.getVersion("agg-1"), .release);
+            done.store(true, .release);
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+
+    var store = EventStore.init(allocator, io);
+    defer store.deinit();
+    try store.append("agg-1", Ev{ .n = 1 }, .{});
+    try store.append("agg-1", Ev{ .n = 2 }, .{});
+    try store.append("agg-1", Ev{ .n = 3 }, .{});
+
+    Task.version.store(0, .monotonic);
+    Task.done.store(false, .monotonic);
+    Task.entered.store(false, .monotonic);
+    Task.open.store(false, .monotonic);
+
+    try store.mutex.lock(io);
+
+    var task_fut = try io.concurrent(Task.read, .{&store});
+    while (!Task.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Task.cancel, .{ io, &task_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Task.open.store(true, .release);
+    while (store.mutex.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    // A cancelable wait gives up here; an uncancelable one is still parked.
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(20), .awake);
+    try std.testing.expect(!Task.done.load(.acquire));
+
+    store.mutex.unlock(io);
+    cancel_fut.await(io);
+    task_fut.await(io);
+
+    try std.testing.expectEqual(@as(u64, 3), Task.version.load(.acquire));
+}
+
+test "EventStore snapshot load waits out a canceled lock instead of reporting no snapshot" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const Task = struct {
+        var got: ?SnapshotStore.Snapshot = null;
+        var done = std.atomic.Value(bool).init(false);
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+
+        fn read(snapshots: *SnapshotStore) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            got = snapshots.load("agg-1");
+            done.store(true, .release);
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+
+    var snapshots = SnapshotStore.init(allocator, io);
+    defer snapshots.deinit();
+    try snapshots.save("agg-1", 2, "{\"n\":2}");
+
+    Task.got = null;
+    Task.done.store(false, .monotonic);
+    Task.entered.store(false, .monotonic);
+    Task.open.store(false, .monotonic);
+
+    try snapshots.mutex.lock(io);
+
+    var task_fut = try io.concurrent(Task.read, .{&snapshots});
+    while (!Task.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Task.cancel, .{ io, &task_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Task.open.store(true, .release);
+    while (snapshots.mutex.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(20), .awake);
+    try std.testing.expect(!Task.done.load(.acquire));
+
+    snapshots.mutex.unlock(io);
+    cancel_fut.await(io);
+    task_fut.await(io);
+
+    try std.testing.expectEqual(@as(u64, 2), Task.got.?.version);
 }

@@ -284,13 +284,23 @@ pub const Redis = struct {
         return .{ .stream = s, .pool_idx = null };
     }
 
+    /// Hand a borrowed connection back to the pool.
+    ///
+    /// Uncancelable: `std.Io.Mutex.lock` fails only with `error.Canceled`, and
+    /// the old `catch return` skipped the one statement that gives the slot back
+    /// — `in_use[idx]` stayed `true` for good, so the pool permanently lost that
+    /// slot and, after `pool_size` such releases, failed every command with
+    /// `error.RedisError` while nothing was actually in flight. There is no error
+    /// channel here (commands call this from a `defer`) and the critical section
+    /// is one flag store, so waiting is the honest answer. Same rule as
+    /// `pool.Pool.release`, `sqlx.ConnPool.release` and `im.BufferPool.release`.
     fn releaseStream(self: *Redis, pool_idx: ?usize) void {
         const idx = pool_idx orelse {
             self.stream_mu.unlock(self.io);
             return;
         };
         if (self.pool) |*p| {
-            self.pool_mu.lock(self.io) catch return;
+            self.pool_mu.lockUncancelable(self.io);
             defer self.pool_mu.unlock(self.io);
             if (idx < p.in_use.len) p.in_use[idx] = false;
         }
@@ -298,13 +308,18 @@ pub const Redis = struct {
 
     /// Drop the stream we just failed on instead of returning it to the pool:
     /// a desynchronised connection must never be handed to the next borrower.
+    ///
+    /// Uncancelable, for the same reason as `releaseStream` — and the old
+    /// `catch return` here was worse: it skipped the `close` as well as the slot
+    /// bookkeeping, so the connection being evicted for desynchronisation stayed
+    /// in the pool *and* its fd leaked.
     fn evictStream(self: *Redis, borrowed: Borrowed) void {
         if (self.pool) |*p| {
             const idx = borrowed.pool_idx orelse {
                 borrowed.stream.close(self.io);
                 return;
             };
-            self.pool_mu.lock(self.io) catch return;
+            self.pool_mu.lockUncancelable(self.io);
             defer self.pool_mu.unlock(self.io);
             if (idx < p.streams.len) {
                 if (p.streams[idx]) |s| s.close(self.io);
@@ -1386,6 +1401,142 @@ test "redis: a server reply is data, a server error reply is not" {
     try std.testing.expectError(error.RedisError, r.lock("k", "v", 5));
     peerWriteAll(fds[1], "-ERR wrong number of arguments for 'del' command\r\n");
     try std.testing.expectError(error.RedisError, r.unlock("k"));
+}
+
+// ── a canceled release/eviction must not lose the pooled slot ──
+//
+// `releaseStream` answered a canceled `pool_mu.lock(io)` with a bare `catch
+// return` — before the one statement that gives the slot back. `in_use[idx]`
+// stayed `true` for good, so the pool lost a slot for the lifetime of the
+// process, and after `pool_size` such releases every later command failed with
+// `error.RedisError` while nothing was actually in flight. `evictStream`
+// returned even earlier, so it leaked the slot *and* the socket of the
+// connection it was supposed to drop.
+//
+// Neither has an error channel (both are called from a `defer` on the command
+// path) and both have to run to completion, so the answer is the one
+// `Pool.release`, `sqlx.ConnPool.release`, `im/BufferPool.release` and this
+// repo's `cache/Lru.deinit` already use: wait uncancelably. The critical section
+// is one flag store.
+//
+// In both tests the task is parked on `pool_mu` (held by the test thread) with a
+// cancel request already placed on its thread, so the lock wait is the
+// cancelation point; the gate between the two is pure spinning, which consumes
+// nothing.
+test "redis: a canceled pool release keeps its slot" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const fds = testPair() orelse return error.SkipZigTest;
+    defer _ = std.posix.system.close(fds[1]);
+
+    var r = try Redis.new(allocator, io, .{ .pool_size = 2 });
+    defer r.deinit();
+    const pool = if (r.pool) |*p| p else return error.TestUnexpectedResult;
+    // Slot 0 is borrowed, and its connection is a socketpair, so the pool can
+    // hand that same slot out again below without a server.
+    pool.streams[0] = .{ .socket = .{ .handle = fds[0], .address = undefined } };
+    pool.in_use[0] = true;
+
+    const Task = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+
+        fn release(redis: *Redis) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            redis.releaseStream(0);
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Task.entered.store(false, .monotonic);
+    Task.open.store(false, .monotonic);
+
+    try r.pool_mu.lock(io);
+    var release_fut = try io.concurrent(Task.release, .{&r});
+    while (!Task.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Task.cancel, .{ io, &release_fut });
+    // Give the request time to land on the task's thread while it is still gated.
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Task.open.store(true, .release);
+    // The task is now inside `releaseStream`: parked on the mutex (it swaps the
+    // state to `contended` on its way to the wait), or already gone.
+    while (r.pool_mu.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    r.pool_mu.unlock(io);
+
+    cancel_fut.await(io);
+    release_fut.await(io);
+
+    // The canceled release still gave the slot back ...
+    try std.testing.expect(!pool.in_use[0]);
+    // ... so the pool hands it out again instead of opening another connection
+    // (or, once every slot has been lost this way, failing every command).
+    const again = try r.acquireStream();
+    try std.testing.expectEqual(@as(?usize, 0), again.pool_idx);
+    r.releaseStream(again.pool_idx);
+}
+
+test "redis: a canceled pool eviction still drops the connection and frees its slot" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const fds = testPair() orelse return error.SkipZigTest;
+    defer _ = std.posix.system.close(fds[1]);
+
+    var r = try Redis.new(allocator, io, .{ .pool_size = 2 });
+    defer r.deinit();
+    const pool = if (r.pool) |*p| p else return error.TestUnexpectedResult;
+    pool.streams[0] = .{ .socket = .{ .handle = fds[0], .address = undefined } };
+    pool.in_use[0] = true;
+
+    const Task = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+
+        fn evict(redis: *Redis, handle: std.posix.socket_t) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            redis.evictStream(.{
+                .stream = .{ .socket = .{ .handle = handle, .address = undefined } },
+                .pool_idx = 0,
+            });
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Task.entered.store(false, .monotonic);
+    Task.open.store(false, .monotonic);
+
+    try r.pool_mu.lock(io);
+    var evict_fut = try io.concurrent(Task.evict, .{ &r, fds[0] });
+    while (!Task.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Task.cancel, .{ io, &evict_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Task.open.store(true, .release);
+    while (r.pool_mu.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    r.pool_mu.unlock(io);
+
+    cancel_fut.await(io);
+    evict_fut.await(io);
+
+    // The slot is vacant ...
+    try std.testing.expect(pool.streams[0] == null);
+    try std.testing.expect(!pool.in_use[0]);
+    // ... and the connection it held is closed: the other end of the socketpair
+    // reads back EOF. Before the fix the eviction returned without closing it,
+    // so both the fd and the slot leaked.
+    var peel = [1]std.posix.pollfd{.{ .fd = fds[1], .events = std.posix.POLL.IN, .revents = 0 }};
+    const ready = try std.posix.poll(&peel, 0);
+    try std.testing.expect(ready == 1 and peel[0].revents != 0);
 }
 
 test "redis: real server answers arrive as data (TTL -1, SETNX false)" {

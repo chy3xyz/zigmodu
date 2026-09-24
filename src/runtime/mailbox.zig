@@ -85,7 +85,16 @@ pub fn Mailbox(comptime T: type, comptime capacity: usize) type {
             // Signal under the mutex: a consumer that already found the queue
             // empty is either about to wait (and will be woken) or still holds
             // the mutex (and will re-check before waiting).
-            self.mu.lock(self.io) catch return;
+            //
+            // Uncancelable: the message is already in the ring and counted;
+            // abandoning the signal here is a lost wake-up, not a skipped
+            // bookkeeping update — a consumer parked in `recv(0)` stays parked
+            // until some *later* send happens to signal it. Senders are the
+            // handler path (`Handle.send`), i.e. cancelable tasks. There is no
+            // error channel (`SendError` has no `Canceled`) and the critical
+            // section is one signal. Red: `Mailbox: send signals even when the
+            // sender's lock is canceled`.
+            self.mu.lockUncancelable(self.io);
             self.not_empty.signal(self.io);
             self.mu.unlock(self.io);
         }
@@ -104,7 +113,11 @@ pub fn Mailbox(comptime T: type, comptime capacity: usize) type {
                 if (self.closed.load(.acquire)) return error.Closed;
                 if (self.ring.tryPush(message)) {
                     _ = self.sent.fetchAdd(1, .monotonic);
-                    self.mu.lock(self.io) catch return;
+                    // Uncancelable, for the same reason as `send`'s: the message
+                    // is in the ring and the wake-up is not optional. Red:
+                    // `Mailbox: sendBlocking signals even when the sender's lock
+                    // is canceled`.
+                    self.mu.lockUncancelable(self.io);
                     self.not_empty.signal(self.io);
                     self.mu.unlock(self.io);
                     return;
@@ -152,7 +165,12 @@ pub fn Mailbox(comptime T: type, comptime capacity: usize) type {
         pub fn tryRecv(self: *Self) ?T {
             const message = self.ring.tryPop() orelse return null;
             _ = self.received.fetchAdd(1, .monotonic);
-            self.mu.lock(self.io) catch return message;
+            // Uncancelable: the slot this pop just freed is only reachable
+            // through the signal, and a `sendBlocking(msg, 0)` producer parked on
+            // `not_full` has no timeout to save it — the lost wake-up is
+            // permanent. Red: `Mailbox: tryRecv signals not_full even when the
+            // drainer's lock is canceled`.
+            self.mu.lockUncancelable(self.io);
             self.not_full.signal(self.io);
             self.mu.unlock(self.io);
             return message;
@@ -187,7 +205,13 @@ pub fn Mailbox(comptime T: type, comptime capacity: usize) type {
         /// on its way in or is woken by the broadcast.
         pub fn wake(self: *Self) void {
             _ = self.wake_epoch.fetchAdd(1, .release);
-            self.mu.lock(self.io) catch return;
+            // Uncancelable: the epoch bump only helps a receiver that has not yet
+            // read it. One that is *already parked* is reachable through the
+            // broadcast alone, so a canceled lock here leaves a supervision
+            // member waiting to rebuild itself with nothing left to wake it —
+            // `wake`'s own doc calls out this window. Red: `Mailbox: wake
+            // broadcasts even when the waker's lock is canceled`.
+            self.mu.lockUncancelable(self.io);
             self.not_empty.broadcast(self.io);
             self.mu.unlock(self.io);
         }
@@ -241,7 +265,15 @@ pub fn Mailbox(comptime T: type, comptime capacity: usize) type {
         /// available until drained.
         pub fn close(self: *Self) void {
             self.closed.store(true, .release);
-            self.mu.lock(self.io) catch return;
+            // Uncancelable: `closed` is already published, so a canceled lock here
+            // returns "closed" to every future caller while the receivers that
+            // were parked *before* it never hear about it — `send` refuses
+            // (error.Closed) and therefore cannot signal them either, so they
+            // stay parked forever and a join behind them never returns. This is
+            // the same shape `WorkerPool.signalShutdown` was changed to fix.
+            // Red: `Mailbox: close broadcasts even when the closer's lock is
+            // canceled`.
+            self.mu.lockUncancelable(self.io);
             self.not_empty.broadcast(self.io);
             self.not_full.broadcast(self.io);
             self.mu.unlock(self.io);
@@ -451,6 +483,282 @@ test "Mailbox: wake is only visible to a receiver that was watching the old epoc
     try std.testing.expectEqual(@as(u64, 0), mb.received.load(.acquire));
     try std.testing.expect(!mb.isClosed());
     try std.testing.expectEqual(before + 1, after);
+}
+
+// ── Canceled callers ────────────────────────────────────────────────
+//
+// The tests below all share one shape, and it is the only shape that can make
+// `Mutex.lock` return `error.Canceled`: `Mutex.lock`'s fast path does not check
+// for cancelation at all (it returns the moment the `cmpxchg` succeeds), so the
+// error can only come from the *contended* path — a task that is parked waiting
+// for the mutex when a cancel request lands on its thread. Hence: the test holds
+// the mailbox's mutex, drives the call under test into that park, waits until it
+// is really parked (`at_call` plus a sleep — there is no cheaper proof that a
+// task is inside `futexWait`), and only then cancels.
+//
+// What each test has to prove is that the cancelation did *not* cost the wake-up.
+// Two readings are used, in this order:
+//
+// * the condition's own `epoch`, which `signal`/`broadcast` bump only when there
+//   is a waiter to wake — a deterministic, immediate answer to "did the signal
+//   happen" (no timing, no spin);
+// * the parked receiver itself (`woke`), which is the consequence that matters.
+
+/// Iterations the "the receiver should have come back" spins are bounded by, so
+/// a lost wake-up *fails* the suite instead of hanging it.
+const wait_for_receiver_rounds = 200_000_000;
+
+/// Park `m.recv`/`recvWakeable` on an empty queue and return once it is really
+/// inside the condition variable (`not_empty.state.waiters` is the mailbox's own
+/// count of receivers that reached it).
+fn parkedReceiverSpins(comptime M: type, m: *M, rounds: u32) void {
+    var spins: u32 = 0;
+    while (spins < rounds) : (spins += 1) {
+        if (m.not_empty.state.load(.monotonic).waiters > 0) return;
+        std.atomic.spinLoopHint();
+    }
+    @panic("no receiver ever parked on not_empty");
+}
+
+test "Mailbox: close broadcasts even when the closer's lock is canceled" {
+    const M = Mailbox(u32, 8);
+    var mb = M.init(std.testing.io);
+    const io = std.testing.io;
+
+    const Shared = struct {
+        var at_call = std.atomic.Value(bool).init(false);
+        var woke = std.atomic.Value(bool).init(false);
+
+        fn consume(m: *M) void {
+            _ = m.recv(0); // no timeout: only a wake-up ends this
+            woke.store(true, .release);
+        }
+        fn close(m: *M) void {
+            at_call.store(true, .release);
+            m.close();
+        }
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Shared.woke.store(false, .monotonic);
+    Shared.at_call.store(false, .monotonic);
+
+    const receiver = try std.Thread.spawn(.{}, Shared.consume, .{&mb});
+    parkedReceiverSpins(M, &mb, wait_for_receiver_rounds);
+    const broadcasts_before = mb.not_empty.epoch.load(.acquire);
+
+    // Hold the mutex: the canceled `close` below can only lose its broadcast if
+    // its `lock` is the contended one.
+    try mb.mu.lock(io);
+    var close_fut = try io.concurrent(Shared.close, .{&mb});
+    while (!Shared.at_call.load(.acquire)) std.atomic.spinLoopHint();
+    var cancel_fut = try io.concurrent(Shared.cancel, .{ io, &close_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+    mb.mu.unlock(io);
+
+    cancel_fut.await(io);
+    close_fut.await(io);
+
+    const broadcasts_after = mb.not_empty.epoch.load(.acquire);
+    var after: u32 = 0;
+    while (!Shared.woke.load(.acquire) and after < wait_for_receiver_rounds) : (after += 1) std.atomic.spinLoopHint();
+    const woke = Shared.woke.load(.acquire);
+    // Release a receiver a lost broadcast left parked, so the join cannot hang
+    // and the failure this test reports is the assertion, not the teardown.
+    if (!woke) mb.wake();
+    receiver.join();
+
+    try std.testing.expect(mb.isClosed());
+    try std.testing.expectEqual(broadcasts_before + 1, broadcasts_after);
+    try std.testing.expect(woke);
+}
+
+test "Mailbox: send signals even when the sender's lock is canceled" {
+    try sendSignalsUnderCancelation(false);
+}
+
+test "Mailbox: sendBlocking signals even when the sender's lock is canceled" {
+    try sendSignalsUnderCancelation(true);
+}
+
+fn sendSignalsUnderCancelation(comptime blocking: bool) !void {
+    const M = Mailbox(u32, 8);
+    var mb = M.init(std.testing.io);
+    const io = std.testing.io;
+
+    const Shared = struct {
+        var at_call = std.atomic.Value(bool).init(false);
+        var woke = std.atomic.Value(bool).init(false);
+
+        fn consume(m: *M) void {
+            _ = m.recv(0);
+            woke.store(true, .release);
+        }
+        fn send(m: *M, mode_blocking: bool) void {
+            at_call.store(true, .release);
+            // The message is enqueued *before* the lock either way; that is what
+            // makes a lost signal a lost wake-up rather than a lost message.
+            if (mode_blocking) {
+                // `error.Closed` only after this test's own cleanup has closed
+                // the mailbox; the other two cannot happen with an empty 8-slot
+                // queue.
+                m.sendBlocking(7, 1_000) catch |err| switch (err) {
+                    error.Closed => {},
+                    error.Full, error.Timeout => unreachable,
+                };
+            } else {
+                m.send(7) catch |err| switch (err) {
+                    error.Closed => {},
+                    error.Full => unreachable,
+                    error.Timeout => unreachable, // `send` never waits
+                };
+            }
+        }
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Shared.woke.store(false, .monotonic);
+    Shared.at_call.store(false, .monotonic);
+
+    const receiver = try std.Thread.spawn(.{}, Shared.consume, .{&mb});
+    parkedReceiverSpins(M, &mb, wait_for_receiver_rounds);
+    const signals_before = mb.not_empty.epoch.load(.acquire);
+
+    try mb.mu.lock(io);
+    var send_fut = try io.concurrent(Shared.send, .{ &mb, blocking });
+    while (!Shared.at_call.load(.acquire)) std.atomic.spinLoopHint();
+    var cancel_fut = try io.concurrent(Shared.cancel, .{ io, &send_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+    mb.mu.unlock(io);
+
+    cancel_fut.await(io);
+    send_fut.await(io);
+
+    const signals_after = mb.not_empty.epoch.load(.acquire);
+    var after: u32 = 0;
+    while (!Shared.woke.load(.acquire) and after < wait_for_receiver_rounds) : (after += 1) std.atomic.spinLoopHint();
+    const woke = Shared.woke.load(.acquire);
+    const left_queued = mb.len();
+    if (!woke) mb.wake(); // delivers the message to the parked receiver
+    receiver.join();
+
+    // Enqueued either way — the acceptance is not what a canceled lock costs.
+    try std.testing.expectEqual(@as(u64, 1), mb.stats().sent);
+    try std.testing.expectEqual(signals_before + 1, signals_after);
+    try std.testing.expect(woke);
+    try std.testing.expectEqual(@as(usize, 0), left_queued);
+}
+
+test "Mailbox: tryRecv signals not_full even when the drainer's lock is canceled" {
+    // capacity 2, both slots taken: the producer below has nowhere to go and
+    // parks on `not_full` with no timeout, so the slot `tryRecv` frees is only
+    // usable again if its signal survives.
+    const M = Mailbox(u32, 2);
+    var mb = M.init(std.testing.io);
+    const io = std.testing.io;
+    try mb.send(1);
+    try mb.send(2);
+
+    const Shared = struct {
+        var at_call = std.atomic.Value(bool).init(false);
+
+        fn produce(m: *M) void {
+            // Frees the slot the canceled `tryRecv` hands back; `error.Closed`
+            // is this test's own cleanup.
+            m.sendBlocking(3, 0) catch |err| switch (err) {
+                error.Closed => {},
+                error.Full, error.Timeout => unreachable,
+            };
+        }
+        fn drain(m: *M) void {
+            at_call.store(true, .release);
+            _ = m.tryRecv();
+        }
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Shared.at_call.store(false, .monotonic);
+
+    const producer = try std.Thread.spawn(.{}, Shared.produce, .{&mb});
+    var spins: u32 = 0;
+    while (mb.not_full.state.load(.monotonic).waiters == 0 and spins < wait_for_receiver_rounds) : (spins += 1) std.atomic.spinLoopHint();
+    try std.testing.expect(mb.not_full.state.load(.monotonic).waiters > 0);
+
+    try mb.mu.lock(io);
+    var drain_fut = try io.concurrent(Shared.drain, .{&mb});
+    while (!Shared.at_call.load(.acquire)) std.atomic.spinLoopHint();
+    var cancel_fut = try io.concurrent(Shared.cancel, .{ io, &drain_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+    mb.mu.unlock(io);
+
+    cancel_fut.await(io);
+    drain_fut.await(io);
+
+    var after: u32 = 0;
+    while (mb.stats().sent < 3 and after < wait_for_receiver_rounds) : (after += 1) std.atomic.spinLoopHint();
+    const sent = mb.stats().sent;
+    const left = mb.len();
+    // Free a producer a lost signal left parked forever (`timeout_ms = 0`), and
+    // let its `error.Closed` land in the `catch |err|` above.
+    mb.close();
+    producer.join();
+
+    try std.testing.expectEqual(@as(u64, 3), sent); // the space was handed back
+    try std.testing.expectEqual(@as(usize, 2), left);
+}
+
+test "Mailbox: wake broadcasts even when the waker's lock is canceled" {
+    // `wake`'s own doc warns about exactly this window: the epoch is bumped
+    // before the lock, so a receiver that is *already parked* is only reachable
+    // through the broadcast.
+    const M = Mailbox(u32, 4);
+    var mb = M.init(std.testing.io);
+    const io = std.testing.io;
+    const epoch = mb.wakeEpoch();
+
+    const Shared = struct {
+        var at_call = std.atomic.Value(bool).init(false);
+        var woke = std.atomic.Value(bool).init(false);
+
+        fn receive(m: *M, watching: u32) void {
+            _ = m.recvWakeable(0, watching); // nothing enqueues: only the wake ends this
+            woke.store(true, .release);
+        }
+        fn wake(m: *M) void {
+            at_call.store(true, .release);
+            m.wake();
+        }
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Shared.woke.store(false, .monotonic);
+    Shared.at_call.store(false, .monotonic);
+
+    const receiver = try std.Thread.spawn(.{}, Shared.receive, .{ &mb, epoch });
+    parkedReceiverSpins(M, &mb, wait_for_receiver_rounds);
+
+    try mb.mu.lock(io);
+    var wake_fut = try io.concurrent(Shared.wake, .{&mb});
+    while (!Shared.at_call.load(.acquire)) std.atomic.spinLoopHint();
+    var cancel_fut = try io.concurrent(Shared.cancel, .{ io, &wake_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+    mb.mu.unlock(io);
+
+    cancel_fut.await(io);
+    wake_fut.await(io);
+
+    try std.testing.expect(mb.wakeEpoch() != epoch); // the bump is the pre-lock half
+    var after: u32 = 0;
+    while (!Shared.woke.load(.acquire) and after < wait_for_receiver_rounds) : (after += 1) std.atomic.spinLoopHint();
+    const woke = Shared.woke.load(.acquire);
+    if (!woke) mb.wake(); // the second broadcast is what frees a receiver the first missed
+    receiver.join();
+
+    try std.testing.expect(woke);
 }
 
 test "Mailbox: wake unparks a receiver that had already blocked" {

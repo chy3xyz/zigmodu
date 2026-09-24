@@ -187,7 +187,17 @@ pub const WorkerPool = struct {
 
     pub fn pendingCount(self: *Self) usize {
         const shared = self.shared;
-        shared.mu.lock(shared.io) catch return 0;
+        // Uncancelable: `0` is not "I could not read it", it is the answer
+        // "nothing is queued" — and it is what `isOverloaded` (and every scrape
+        // built on `stats()`) acts on. A canceled `lock` here therefore *raises*
+        // the pool's apparent headroom at exactly the moment the pool is
+        // contended, which is the one moment the reading matters: the caller
+        // keeps admitting work into a queue that is full. Same shape as
+        // `core/cluster/LoadBalancer.zig`'s fabricated fallbacks. Callers are the
+        // handler path (`ModuleRuntime.isOverloaded`) and metrics scrapes —
+        // cancelable tasks. No error channel, and the critical section is one
+        // length read.
+        shared.mu.lockUncancelable(shared.io);
         defer shared.mu.unlock(shared.io);
         return shared.queue.items.len;
     }
@@ -220,7 +230,13 @@ pub const WorkerPool = struct {
 
     fn workerLoop(shared: *Shared) void {
         while (true) {
-            shared.mu.lock(shared.io) catch return;
+            // Uncancelable: `return` retires the worker for good, while
+            // `total_workers` keeps reporting it — so a lost critical section
+            // here silently shrinks the pool, and every task the pool still
+            // admits has one fewer thread to run it. The mutex is released
+            // across `cond.wait` below, so this cannot become an unbounded wait,
+            // and the body has no error channel to propagate into.
+            shared.mu.lockUncancelable(shared.io);
 
             while (shared.queue.items.len == 0 and !shared.shutdown) {
                 shared.cond.wait(shared.io, &shared.mu) catch break;

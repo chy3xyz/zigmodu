@@ -19,8 +19,11 @@
 //! if (!report.ok()) return error.PreflightFailed;
 //! ```
 //!
-//! Checks never panic and never abort: a failure is recorded as a finding with
-//! a message, so one broken probe cannot hide the others.
+//! Checks never panic and never abort: a failure is counted and (allocation
+//! permitting) recorded as a finding with a message, so one broken probe cannot
+//! hide the others. The counter is bumped before the finding is formatted, so
+//! memory pressure cannot talk `ok()` out of a fatal failure; what it can cost
+//! is the finding's own line, and `log()` reports that gap.
 
 const std = @import("std");
 const Time = @import("Time.zig");
@@ -71,6 +74,14 @@ pub const Report = struct {
                 .warn => std.log.warn("[preflight] {s}: {s}", .{ f.name, f.message }),
             }
         }
+        // Findings are counted before they are formatted, so the counters can
+        // outrun the lines above. Say so instead of printing a total the list
+        // does not add up to.
+        if (self.findings.items.len < self.failures + self.warnings) {
+            std.log.err("[preflight] {d} finding(s) could not be recorded (out of memory)", .{
+                self.failures + self.warnings - self.findings.items.len,
+            });
+        }
         if (self.ok()) {
             std.log.info("[preflight] {d} checks passed, {d} warning(s)", .{ self.passed, self.warnings });
         } else {
@@ -80,20 +91,27 @@ pub const Report = struct {
 };
 
 /// Run every check and collect findings.
+///
+/// A check that reports an error is counted the moment it does — before its
+/// finding is formatted. `ok()` is the value the caller acts on (the header
+/// example refuses to start on it), so it must not depend on whether the report
+/// could be allocated: a failed probe that vanishes under memory pressure would
+/// have `ok()` say "nothing fatal" about a run that had a fatal failure. What
+/// memory pressure *can* cost is the finding's own strings — `log()` reports
+/// that gap rather than printing a count no finding backs.
 pub fn run(allocator: std.mem.Allocator, checks: []const Check) Report {
     var report = Report{ .allocator = allocator };
     for (checks) |check| {
         check.run(check.ctx, allocator) catch |err| {
-            const severity = check.severity;
+            if (check.severity == .fatal) report.failures += 1 else report.warnings += 1;
             const message = std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)}) catch continue;
             const name_copy = allocator.dupe(u8, check.name) catch {
                 allocator.free(message);
                 continue;
             };
-            if (severity == .fatal) report.failures += 1 else report.warnings += 1;
             report.findings.append(allocator, .{
                 .name = name_copy,
-                .severity = severity,
+                .severity = check.severity,
                 .message = message,
             }) catch {
                 allocator.free(name_copy);
@@ -324,6 +342,27 @@ test "preflight migration and clock checks" {
     try std.testing.expectEqualStrings("migrations", report.findings.items[0].name);
     try std.testing.expectEqualStrings("PendingMigrations", report.findings.items[0].message);
     try std.testing.expectEqual(@as(usize, 1), report.passed); // clock check
+}
+
+// `ok()` is the value the caller acts on — the example in the header of this
+// file refuses to start on it. It must therefore not depend on whether the
+// report could be formatted: a check that failed has to be counted even when
+// the finding cannot be recorded.
+test "preflight counts a failed check even when its finding cannot be recorded" {
+    const Probe = struct {
+        fn run(_: ?*anyopaque, _: std.mem.Allocator) anyerror!void {
+            return error.ProbeFailed;
+        }
+    };
+
+    // Every allocation the report needs fails, so no finding can be stored.
+    var report = run(std.testing.failing_allocator, &.{Check{ .name = "probe", .run = Probe.run }});
+    defer report.deinit();
+
+    try std.testing.expect(!report.ok());
+    try std.testing.expectEqual(@as(usize, 1), report.failures);
+    try std.testing.expectEqual(@as(usize, 0), report.findings.items.len);
+    try std.testing.expectEqual(@as(usize, 0), report.passed);
 }
 
 test "dbCheck accepts any type with queryRows (kept as a contract test)" {

@@ -2,6 +2,104 @@
 
 ## [Unreleased]
 
+### 第 20 批：丢失唤醒/永久停摆一族（mailbox 5 处 + `Runtime.shutdown` 中途放弃，真红）、Redis 池槽永久丢失、`Lru` 五处伪造、"缓存管理器"级别的三个真缺陷（事件订阅假成功、重放只读 256 条、preflight 把致命失败漏掉）（**破坏性：否**）
+
+全量 `-Ddb=all` **1870/1927（57 skipped，0 failed）**；Redis 门控用例在真机 Redis 上跑过（`REDIS_URL` 打开时 15/15）。
+
+**核心机制（决定了本批每一条判定，也是上一批误述的更正）**：`std.Io.Mutex.lock` 的快路径
+（对 `unlocked` 的 `cmpxchgStrong`）**不做取消检查**，只有**有争用**时才会走到 `futexWait` 并可能返回
+`error.Canceled`。所以 `catch` 只在"那一刻恰好有争用**且**调用任务正被取消"时触发 —— 本批每条红证据
+都精确构造这个窗口（持锁 → 把待测调用推进 park → 取消 → 放锁）。
+
+**mailbox：五处丢失唤醒，全部真红。** `close` 的临界区**置了 `closed` 却不广播**：`send` 之后一律
+`error.Closed`，所以此前停在 `not_empty.wait` 的接收者**再也无法被唤醒**，它背后的 join 永不返回 ——
+与 `WorkerPool.signalShutdown` 当年被修的是同一个形状；`send`/`sendBlocking` 是**消息已经进环、也计过数**
+之后跳过 `signal`（`recv(0)` 的消费者会一直停到**下一次**发送）；`tryRecv` 释放的槽位只能通过
+`not_full.signal` 被 `sendBlocking(msg, 0)` 的生产者拿到（它没有超时兜底）；`wake` 的 epoch 只对**还没读**的
+接收者有效。红证据（`--filter "Mailbox:"`，修复前）：
+```
+Mailbox: close broadcasts even when the closer's lock is canceled...expected 1, found 0
+Mailbox: send signals even when the sender's lock is canceled...expected 1, found 0
+Mailbox: sendBlocking signals even when the sender's lock is canceled...expected 1, found 0
+Mailbox: tryRecv signals not_full even when the drainer's lock is canceled...expected 3, found 2
+Mailbox: wake broadcasts even when the waker's lock is canceled...FAIL (TestUnexpectedResult)
+```
+全部改 `lockUncancelable`（这一步没有错误通道，而 `SendError` 无法表达 `Canceled`）。绿：`Mailbox:` 14/14。
+
+**`Runtime.shutdown` 的 `catch return` 会**中途放弃整个拆卸** —— 跳过 ticker join、两个池的 shutdown、
+worker 的 join/abandon/destroy、group 释放、`wakeTimerWaiters` 与 `shutdown_done.store`，而调用方却听到
+"shutdown 已返回"，此时池线程与 worker 还在用那块内存。红证据：
+```
+Runtime: a canceled shutdown still tears the runtime down...expected 0, found 1
+```
+改 `lockUncancelable`（`shutdown` 是 `void`，且那个锁只被本函数与 ticker 循环持有、临界区是一次 broadcast）。
+> **同一批里另有 5 处"改对了但今天不可达"**（`tickerMain` ×2、`scheduler.poolMain`、`WorkerPool` 的
+> `workerLoop` 与 `pendingCount`）：它们跑在**裸 `std.Thread`** 上，而 `std.Thread` **没有任何取消 API**，
+> `Io.Threaded` 的 `threadlocal current` 只在它自己 spawn 的线程里赋值（`Io/Threaded.zig:1756`），
+> 裸线程走的是 `syscall = .{ .thread = null }` 的路径（macOS 上 `use_parking_futex == false`）——
+> **在那个身体里不可能产生 `error.Canceled`**。所以这 5 处是**加固**（把"未来某天变成可取消时会是
+> 灾难性失败"改成正确的等待），**没有红证据**，报告里也是这么标注的。对照之下，HTTP 请求确实是可取消的
+> fiber（`Server.zig:2936` 的 `conn_group.concurrent`），所以 mailbox 与 `shutdown` 那两处有真证据。
+> `pendingCount → 0` 那处顺便修掉了"伪造'没有排队'、恰恰在池最忙的时候抬高表观余量"（`LoadBalancer` 同形）。
+
+**Redis：`releaseStream`/`evictStream` 的 `catch return` 让池槽永久丢失。** `in_use[idx]` 再也不复位，
+池满之后**每一条 Redis 命令都失败**（而实际没有任何在飞请求）；`evictStream` 还在 `s.close(io)` **之前**
+返回，于是那条因失同步而被逐出的连接既留在池里、又漏了 fd。红证据（离线 driver，`pool_size = 2` +
+socketpair + 自旋门 + 持锁线程）：
+```
+redis: a canceled pool release keeps its slot...FAIL (TestUnexpectedResult)
+redis: a canceled pool eviction still drops the connection and frees its slot...FAIL (TestUnexpectedResult)
+```
+改 `lockUncancelable`（两者都在命令路径的 `defer` 里，没有错误通道）。**`acquireStream` 的两处锁保持
+原样**（它有错误通道、也不占资源）。
+
+**`Lru` 五处：`set` 报成功却没存、`delete`/`clear` 静默不生效、`size`/`get` 伪造读数。** `set` 是 `!void`
+所以**有**错误通道 → 改为传播 `error.Canceled`（写完立刻读自己的写却是 miss，这是调用方该处理的取消）；
+`delete`/`clear`/`size`/`get` 没有通道 → `lockUncancelable`（`get` 那处尤其值得说：伪造一次 miss **同时**
+吃掉了那个一次性取消，于是"本来该被取消的请求"继续去做取消想拦下的那件事）。红证据：
+```
+cache: a canceled delete still deletes...FAIL (TestUnexpectedResult)
+cache: a canceled clear still clears → expected 1, found 0
+cache: a canceled set reports the cancelation → expected error.Canceled, found null
+cache: a canceled size and get still report the cache as it is → expected 1, found 0
+```
+与本文件 `deinit` 早先为同一把锁做的决定（等，而不是跳过）一致。
+
+**三个"应用级"真缺陷（都不在上一批的清单里，是顺着同族查出来的）。**
+- **`EventBus.subscribe`/`subscribeAsync` 是"假成功"**：两者都是 `!void`，调用方**有**错误通道，旧代码却
+  `catch return` **返回成功** —— 监听器从未注册，而调用方以为注册了。改为传播（`try`）。同文件的
+  `publish`（`void`，投给**零个**订阅者而调用方无从得知，且它挂在 CRUD 数据路径上）、`unsubscribe`、
+  `subscriberCount`、`publishedCount` 改 `lockUncancelable`。**`publish` 的签名刻意没改**：仓库里 5 处文档
+  （含 `AGENTS.md`、`docs/API.md`）都把它写成 `try`-less，且 `TypedEventBus`/`DistributedEventBus`
+  共享同一个 `void publish` 契约 —— 改动面远大于"等一把锁"能解决的收益。
+- **`EventStore.replayFromSnapshot` 只读一次 256 条** —— 比它上面那两个伪造读数更严重：任何超过 256 条
+  事件的流都会**静默丢掉尾部**，状态被重建在一个**不完整的窗口**上（红：`expected 300, found 256`）。
+  改为可续读的循环；同时 `getVersion` 的 `catch return 0`（"这条流没有事件"，实际有三条）与
+  `SnapshotStore.load` 的 `catch return null`（`replayFromSnapshot` 把 `null` 精确地读成"没有快照、
+  从版本 1 重放"）都改 `lockUncancelable`。
+- **`Preflight` 会把致命失败漏掉**：计数器在"记录结论"的字符串分配**之后**才自增，于是分配失败时
+  `catch continue` 连计数一起跳过 —— `report.ok()` 对一个**有致命失败**的运行返回 `true`，而 `ok()` 正是
+  头部示例用来拒绝启动的东西。改为**先计数**并把这个顺序写进注释。
+- **`EventLogger` 的关联 id 在同一秒内重复**（真实小 bug）：`next_event_id` 只由 `log()` 自增，于是同一秒
+  铸造的两个 id 相同、两条不同的关联被合并。加了 `correlation_seq`。同文件 `allocPrint catch ""` 判为
+  **可接受并写进注释**（`generateCorrelationId` 全仓零调用者，且 id 是自由文本标签、无人按它索引）。
+
+**AI 数据/安全路径五处。** `key_pool.onError`（丢 401/403/429 反馈 → 泄漏的 key 永远不被冷却/封禁；
+**同一形状的 `onSuccess` 也顺带修了** —— 丢一次成功复位会让 key 一直处于冷却/禁用）、`memory.remember`
+（`!void` → **传播**；以前"返回成功却没存"）、`memory.forget`（**隐私删除**的静默无操作 → `lockUncancelable`）、
+`memory.count`/`quota.used`/`quota.remaining`（伪造读数；`used → 0` 是 fail-open、`remaining → 0` 是
+fail-closed，两者此前自相矛盾）、`skill.register`（`!void` → 传播 `error.RegistryLockFailed`；
+以前"返回成功却没注册"，而 `dispatchWith` 早就正确地报错，注册表与它自己不一致）、
+`skill.get`/`count`/`names`、`audit.record`（丢审计条目，**包括 `.tool_denied`**）。`audit` 的另一个分支
+（`dupe catch ""`）改为**两个拷贝都在碰槽位之前做好**、失败时写 `"(unallocated)"` 占位符 —— 丢掉一条安全
+事件比记一条"payload 丢了"更糟，而空白工具名会被读成"某个没有名字的工具真的被调用了"。
+> **签名/结构影响（源码兼容，但记录在案）**：`MemoryStore.remember` 的错误集新增 `error.LockFailed`、
+> `SkillRegistry.register` 新增 `error.RegistryLockFailed`、`Lru.set` 与 `EventBus.subscribe(Async)` 新增
+> `error.Canceled` —— 用 `try` 的调用方不受影响，只有穷举错误集匹配才需要加一支；`AgentAuditLog` 新增
+> 公开字段 `owned: []bool`（用字面量构造的地方会编译不过，全仓 grep 只找到 `AgentAuditLog.init`）。
+> **未验证**：本批 5 处"今天不可达"的加固没有红证据；AI 那批每条测试的**第二条及以后**断言只有绿跑覆盖
+> （`try` 首次失败即结束）；`audit` 占位符测试比对的是字面量而非私有常量。
+
 ### 第 19 批：`RedisCooldownStore` 从来就没编译过（文档教用户照抄的代码编译不过）、`AutoInstrumentation` 的耗时全是 0（真红）、io-mutex 家族第二批 11 处、（**破坏性：否**，一处公开签名放宽）
 
 全量 `-Ddb=all` **1845/1902（57 skipped，0 failed）**。
