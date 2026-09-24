@@ -239,7 +239,19 @@ pub const WorkerPool = struct {
             shared.mu.lockUncancelable(shared.io);
 
             while (shared.queue.items.len == 0 and !shared.shutdown) {
-                shared.cond.wait(shared.io, &shared.mu) catch break;
+                // Uncancelable: `wait`'s only error is `error.Canceled`, and the
+                // only reason a worker is waiting is an empty queue — so taking
+                // that error out of the loop lands on the `return` below and
+                // retires this thread for good, while `total_workers` keeps
+                // reporting it and every task the pool still admits has one
+                // fewer thread to run it. `waitUncancelable` re-parks on a
+                // spurious wake and the loop above re-checks the queue; the wait
+                // is bounded by `shutdown`'s broadcast, and the mutex is
+                // released across it. (A worker thread spawned with
+                // `std.Thread.spawn` has no cancelation context for
+                // `error.Canceled` to arrive from, but the pool should not rest
+                // on that.)
+                shared.cond.waitUncancelable(shared.io, &shared.mu);
             }
 
             if (shared.queue.items.len == 0) {
@@ -295,6 +307,51 @@ test "WorkerPool executes dispatched tasks" {
         std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
     try std.testing.expectEqual(@as(u32, 10), Ctx.counter.load(.monotonic));
+}
+
+// The reachable half of what `workerLoop`'s uncancelable wait guarantees. The
+// other half — a wait that fails with `error.Canceled` — cannot be driven from
+// a test: `std.Io.Mutex`/`Condition` waits are only cancelation points for a
+// thread that has a cancelation context, and a pool worker is a bare
+// `std.Thread.spawn`ed thread (`Threaded.Thread.checkCancel` returns
+// immediately when `Thread.current` is null, and the parking futex registers
+// such a thread as non-cancelable). What *is* reachable is a worker coming back
+// from its wait with nothing to do — so this drives exactly that and checks the
+// worker is still in the pool afterwards.
+test "WorkerPool keeps its workers across an idle wait" {
+    const allocator = std.testing.allocator;
+
+    const Ctx = struct {
+        var counter = std.atomic.Value(u32).init(0);
+        fn run(ctx: ?*anyopaque, io: std.Io) void {
+            _ = ctx;
+            _ = io;
+            _ = @This().counter.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var pool = try WorkerPool.init(allocator, std.testing.io, "test-idle", 2, 8);
+    defer pool.deinit();
+    Ctx.counter.store(0, .monotonic);
+
+    // Let both workers reach the wait — the queue is empty and nothing is
+    // shutting down — then wake them for no reason at all.
+    var spins: u32 = 0;
+    while (pool.shared.cond.state.load(.monotonic).waiters < 2 and spins < 500_000_000) : (spins += 1) std.atomic.spinLoopHint();
+    try std.testing.expect(pool.shared.cond.state.load(.monotonic).waiters >= 2);
+    pool.shared.cond.broadcast(std.testing.io);
+
+    // Waking with an empty queue must leave them parked, not retired: both have
+    // to run a task, and the pool must still report both.
+    try std.testing.expect(pool.dispatch(.{ .run = Ctx.run, .ctx = null }));
+    try std.testing.expect(pool.dispatch(.{ .run = Ctx.run, .ctx = null }));
+    const deadline = Time.monotonicNowMilliseconds() + 5000;
+    while (Ctx.counter.load(.monotonic) < 2) {
+        if (Time.monotonicNowMilliseconds() >= deadline) return error.Timeout;
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(u32, 2), Ctx.counter.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 2), pool.stats().total_workers);
 }
 
 test "WorkerPool rejects when queue is full" {

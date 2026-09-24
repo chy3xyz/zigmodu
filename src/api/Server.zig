@@ -2003,16 +2003,28 @@ const Router = struct {
         return result.toOwnedSlice(alloc);
     }
 
-    /// PERF: `allocator` should be the per-request arena (connFiber passes
-    /// `arena_alloc`) — params map + dupes are bump-allocated and bulk-freed
-    /// with the request, so no per-match heap traffic on the hot path.
-    pub fn match(self: *const Router, allocator: std.mem.Allocator, method: Method, path: []const u8) ?MatchedRoute {
+    /// Match `method` + `path` against the trie. `null` means exactly one
+    /// thing: no route answers this method and path.
+    ///
+    /// A match copies nothing, so it cannot fail. The parameter keys are the
+    /// trie's own node names (`TrieNode.param_name`, owned by the router) and
+    /// the values are sub-slices of `path`, both of which outlive any use of
+    /// the result — the router lives for the process, the path for the request.
+    /// That is the point: the previous version duped every key and value into a
+    /// `StringHashMap`, and neither way that could fail had an honest answer to
+    /// give. A failed dupe came back as `null`, which is "no route matched" —
+    /// a 404 for a route that exists. A failed `put` kept the match while
+    /// dropping the parameter it could not copy, so a handler reading a tenant
+    /// or user path parameter found it silently absent. Callers that need owned
+    /// copies build them and report their own failure (`connFiber` answers 500,
+    /// `handleForTest` propagates), which is where an error channel exists.
+    ///
+    /// `allocator` is unused: it is kept in the signature because the call
+    /// sites pass the request arena at it.
+    pub fn match(self: *const Router, _: std.mem.Allocator, method: Method, path: []const u8) ?MatchedRoute {
         const root = self.roots.get(method) orelse return null;
 
-        const MAX_PARAMS = 8;
-        var param_keys: [MAX_PARAMS][]const u8 = undefined;
-        var param_vals: [MAX_PARAMS][]const u8 = undefined;
-        var param_count: usize = 0;
+        var params: RouteParams = .{};
 
         var parts = std.mem.splitScalar(u8, path, '/');
         var current = root;
@@ -2025,81 +2037,38 @@ const Router = struct {
             } else if (current.wildcard_child) |wc| {
                 // Consume remaining parts into a single rest parameter
                 if (wc.route) |route| {
-                    var params = std.StringHashMap([]const u8).init(allocator);
-                    for (0..param_count) |i| {
-                        params.put(param_keys[i], param_vals[i]) catch |err| {
-                            std.log.err("[Router] wildcard param put failed: {}", .{err});
-                            for (0..param_count) |k| {
-                                allocator.free(param_keys[k]);
-                                allocator.free(param_vals[k]);
-                            }
-                            params.deinit();
-                            return null;
-                        };
-                    }
                     return MatchedRoute{ .route = route, .params = params };
                 }
                 return null;
             } else if (current.findParamChild()) |param_child| {
-                if (param_count >= MAX_PARAMS) return null;
-                param_keys[param_count] = allocator.dupe(u8, param_child.param_name.?) catch return null;
-                errdefer allocator.free(param_keys[param_count]);
-                param_vals[param_count] = allocator.dupe(u8, part) catch {
-                    allocator.free(param_keys[param_count]);
-                    return null;
-                };
-                param_count += 1;
+                // A route with more parameters than `RouteParams` can hold is
+                // not expressible; that limit has always answered `null`, and it
+                // is a property of the route, not of this request's memory.
+                if (params.count >= RouteParams.MAX) return null;
+                params.keys[params.count] = param_child.param_name.?;
+                params.values[params.count] = part;
+                params.count += 1;
                 current = param_child;
             } else {
-                for (0..param_count) |i| {
-                    allocator.free(param_keys[i]);
-                    allocator.free(param_vals[i]);
-                }
                 return null;
             }
         }
 
         // Exact route takes priority over wildcard child
         if (current.route) |route| {
-            var params = std.StringHashMap([]const u8).init(allocator);
-            for (0..param_count) |i| {
-                params.put(param_keys[i], param_vals[i]) catch |err| {
-                    std.log.err("[Router] param put failed: {}", .{err});
-                    allocator.free(param_keys[i]);
-                    allocator.free(param_vals[i]);
-                };
-            }
-            return MatchedRoute{
-                .route = route,
-                .params = params,
-            };
+            return MatchedRoute{ .route = route, .params = params };
         }
 
         // Check if current node has a wildcard child (for /prefix/* matching /prefix)
         if (current.wildcard_child) |wc| {
             if (wc.route) |route| {
-                var params = std.StringHashMap([]const u8).init(allocator);
-                for (0..param_count) |i| {
-                    params.put(param_keys[i], param_vals[i]) catch |err| {
-                        std.log.err("[Router] wildcard param put failed: {}", .{err});
-                        for (0..param_count) |k| {
-                            allocator.free(param_keys[k]);
-                            allocator.free(param_vals[k]);
-                        }
-                        params.deinit();
-                        return null;
-                    };
-                }
                 return MatchedRoute{ .route = route, .params = params };
             }
         }
 
-        for (0..param_count) |i| {
-            allocator.free(param_keys[i]);
-            allocator.free(param_vals[i]);
-        }
         if (self.wildcards.get(method)) |wc| {
-            return MatchedRoute{ .route = wc, .params = std.StringHashMap([]const u8).init(allocator) };
+            // The catch-all does not carry the segments it swallowed.
+            return MatchedRoute{ .route = wc, .params = .{} };
         }
         std.log.debug("[Router] no match: {s} {s}", .{ method.toString(), path });
         return null;
@@ -2136,19 +2105,81 @@ fn collectRoutes(
     }
 }
 
-const MatchedRoute = struct {
-    route: Route,
-    params: std.StringHashMap([]const u8),
+/// Parameters captured by a match. Borrowed, not owned: the keys are the trie's
+/// node names and the values are sub-slices of the path `match` was handed.
+/// There is nothing to release and nothing here that can fail — see
+/// `Router.match` for why that is the point.
+const RouteParams = struct {
+    pub const MAX = 8;
 
-    pub fn deinit(self: *MatchedRoute, allocator: std.mem.Allocator) void {
-        var it = self.params.iterator();
-        while (it.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            allocator.free(entry.value_ptr.*);
+    keys: [MAX][]const u8 = undefined,
+    values: [MAX][]const u8 = undefined,
+    count: usize = 0,
+
+    /// The value of the named parameter, or null if the route has no such
+    /// parameter. Names are unique within a route.
+    pub fn get(self: *const RouteParams, name: []const u8) ?[]const u8 {
+        for (0..self.count) |i| {
+            if (std.mem.eql(u8, self.keys[i], name)) return self.values[i];
         }
-        self.params.deinit();
+        return null;
+    }
+
+    pub const Entry = struct { key: []const u8, value: []const u8 };
+
+    pub const Iterator = struct {
+        params: *const RouteParams,
+        index: usize = 0,
+
+        pub fn next(self: *Iterator) ?Entry {
+            if (self.index == self.params.count) return null;
+            const i = self.index;
+            self.index += 1;
+            return .{ .key = self.params.keys[i], .value = self.params.values[i] };
+        }
+    };
+
+    pub fn iterator(self: *const RouteParams) Iterator {
+        return .{ .params = self };
     }
 };
+
+const MatchedRoute = struct {
+    route: Route,
+    params: RouteParams,
+
+    /// Releases nothing, and there is nothing a caller could forget to do:
+    /// `params` borrows the trie's node names and slices of the path it was
+    /// matched against, and the route belongs to the router. It stays because
+    /// callers tear a match down through it — `ComptimeRouter`'s catalog test
+    /// does — and removing it would be a compile break for a step that was
+    /// already a no-op in effect.
+    pub fn deinit(self: *MatchedRoute, allocator: std.mem.Allocator) void {
+        _ = self;
+        _ = allocator;
+    }
+};
+
+/// Copy a match's borrowed parameters into a map the caller owns — the step
+/// `connFiber` needs before a handler can read them out of `ctx.params`. This
+/// is the copy that can run out of memory, kept at the caller on purpose: the
+/// caller is where an error channel exists, so an allocation failure becomes a
+/// 500 instead of a 404 for a route that exists or a match quietly missing the
+/// parameter a handler is about to read.
+fn copyParamsOwned(
+    allocator: std.mem.Allocator,
+    params: *const RouteParams,
+    into: *std.StringHashMap([]const u8),
+) !void {
+    var it = params.iterator();
+    while (it.next()) |entry| {
+        const key = try allocator.dupe(u8, entry.key);
+        errdefer allocator.free(key);
+        const value = try allocator.dupe(u8, entry.value);
+        errdefer allocator.free(value);
+        try into.put(key, value);
+    }
+}
 
 // ==== §6  Server & response writers ====
 
@@ -2830,14 +2861,11 @@ pub const Server = struct {
     pub fn handleForTest(self: *Server, ctx: *Context) !void {
         var matched = self.router.match(ctx.allocator, ctx.method, ctx.path);
         if (matched) |*m| {
-            defer m.deinit(ctx.allocator);
-
-            var pit = m.params.iterator();
-            while (pit.next()) |entry| {
-                const key = try ctx.allocator.dupe(u8, entry.key_ptr.*);
-                const val = try ctx.allocator.dupe(u8, entry.value_ptr.*);
-                try ctx.params.put(key, val);
-            }
+            // The match borrowed the parameters from the trie and the path; the
+            // map handlers read owns its own copies, so this is where an
+            // allocation failure can still show up — and this entry point has
+            // an error channel for it.
+            try copyParamsOwned(ctx.allocator, &m.params, &ctx.params);
 
             ctx.user_data = m.route.user_data;
             ctx.route_template = m.route.path;
@@ -3395,30 +3423,27 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
         const matched_orig = server.router.match(arena_alloc, request.method, request.path);
         var matched = matched_orig;
         if (matched) |*m| {
-            defer {
-                var it = m.params.iterator();
-                while (it.next()) |entry| {
-                    arena_alloc.free(entry.key_ptr.*);
-                    arena_alloc.free(entry.value_ptr.*);
-                }
-                m.params.deinit();
-            }
+            // The match borrows its parameters from the trie and the request
+            // line, so they are copied into the map handlers read. That copy is
+            // the allocation that can fail, and this is the level that can
+            // answer for it: a 500 for this request — not a match with a
+            // parameter missing from it.
+            if (copyParamsOwned(arena_alloc, &m.params, &ctx.params)) |_| {
+                ctx.user_data = m.route.user_data;
+                ctx.route_template = m.route.path;
 
-            // Transfer params ownership (same pattern as query/headers above).
-            // Avoids duping every param key/value — saves 2 allocs per param.
-            ctx.params.deinit();
-            ctx.params = m.params;
-            m.params = std.StringHashMap([]const u8).init(arena_alloc);
-
-            ctx.user_data = m.route.user_data;
-            ctx.route_template = m.route.path;
-
-            server.executeWithMiddleware(&ctx, m.route.handler, m.route.combined_middleware) catch |err| {
-                std.log.err("[HC] Handler error: {any}", .{err});
+                server.executeWithMiddleware(&ctx, m.route.handler, m.route.combined_middleware) catch |err| {
+                    std.log.err("[HC] Handler error: {any}", .{err});
+                    if (!ctx.responded) {
+                        ctx.sendError(500, @errorName(err)) catch |e| std.log.err("[Server] Failed to send 500: {}", .{e});
+                    }
+                };
+            } else |err| {
+                std.log.err("[HC] route params could not be copied into the request: {any}", .{err});
                 if (!ctx.responded) {
-                    ctx.sendError(500, @errorName(err)) catch |e| std.log.err("[Server] Failed to send 500: {}", .{e});
+                    ctx.sendError(500, "Internal Server Error") catch |e| std.log.err("[Server] Failed to send 500: {}", .{e});
                 }
-            };
+            }
         } else {
             // Run global middleware before 404
             if (server.global_middleware.items.len > 0) {
@@ -3791,14 +3816,8 @@ test "path matching" {
 
     var matched = router.match(std.testing.allocator, .GET, "/users/123");
     if (matched) |*m| {
-        defer {
-            var iter = m.params.iterator();
-            while (iter.next()) |entry| {
-                std.testing.allocator.free(entry.key_ptr.*);
-                std.testing.allocator.free(entry.value_ptr.*);
-            }
-            m.params.deinit();
-        }
+        // Nothing to release: the match borrows the trie's parameter name and
+        // a slice of the path it was given.
         try std.testing.expectEqualStrings("123", m.params.get("id").?);
     } else {
         try std.testing.expect(false);
@@ -3806,6 +3825,52 @@ test "path matching" {
 
     const no_match = router.match(std.testing.allocator, .GET, "/posts/123");
     try std.testing.expect(no_match == null);
+}
+
+// `Router.match` used to copy every parameter name and value into a
+// `StringHashMap`, and both ways that could fail were lies about the request:
+// the traversal's `catch return null` came back as "no route matched" — a 404
+// for a route that exists — and the map-filling `catch` in the exact-route
+// branch kept the match with the parameters it managed to copy, so a handler
+// reading a tenant or user path parameter found it silently absent. Neither
+// needs the heap: the keys are the tree's own node names and the values are
+// slices of the path handed in. An allocator that refuses everything must
+// therefore not change the answer.
+test "Router match answers from the tree and the path, not the heap" {
+    const allocator = std.testing.allocator;
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    const route = Route{
+        .method = .GET,
+        .path = "/users/{id}/posts/{post}",
+        .handler = struct {
+            fn handle(_: *Context) anyerror!void {}
+        }.handle,
+    };
+    try router.addRoute(route);
+
+    // 4 = let both keys and both values through and refuse the map's own bucket
+    // array (the case that used to yield a match missing a parameter), 0 =
+    // refuse the first allocation (the case that used to yield a 404 for a
+    // route that exists), maxInt = refuse nothing. Ordered so the partly
+    // copied match is the first thing this test reports.
+    for ([_]usize{ 4, 0, std.math.maxInt(usize) }) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        const matched = router.match(failing.allocator(), .GET, "/users/123/posts/456");
+
+        // `null` here is the first defect: an allocation failure wearing the
+        // answer "no such route".
+        try std.testing.expect(matched != null);
+        // `null` from `.get("id")` is the second: a match that is missing a
+        // parameter the path carried.
+        try std.testing.expectEqualStrings("123", matched.?.params.get("id").?);
+        try std.testing.expectEqualStrings("456", matched.?.params.get("post").?);
+        // And matching must not have needed the heap at all: an allocation
+        // failure cannot be answered honestly by a function with no error
+        // channel, so the fix is to make none of them happen.
+        try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    }
 }
 
 test "http methods" {
@@ -3844,12 +3909,10 @@ test "route group" {
     }.handle, null);
 
     // Route should exist at /api/v1/users
-    var matched_opt = server.router.match(allocator, .GET, "/api/v1/users");
-    if (matched_opt) |*matched| {
-        defer matched.deinit(allocator);
-    } else {
-        try std.testing.expect(false);
-    }
+    const matched_opt = server.router.match(allocator, .GET, "/api/v1/users");
+    // A match owns nothing to release: its parameters borrow from the trie and
+    // the path.
+    try std.testing.expect(matched_opt != null);
 }
 
 test "wildcard route matching" {
@@ -3859,8 +3922,7 @@ test "wildcard route matching" {
 
     const expectMatch = struct {
         fn call(r: *Router, method: Method, path: []const u8) !void {
-            var matched = r.match(allocator, method, path) orelse return error.TestExpectedEqual;
-            defer matched.deinit(allocator);
+            try std.testing.expect(r.match(allocator, method, path) != null);
         }
     }.call;
 
@@ -4087,25 +4149,11 @@ test "integration: router + handler + response" {
     try std.testing.expect(matched != null);
 
     if (matched) |*m| {
-        defer {
-            var it = m.params.iterator();
-            while (it.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-                allocator.free(entry.value_ptr.*);
-            }
-            m.params.deinit();
-        }
-
         var ctx = try Context.init(allocator, .GET, "/users/99");
         defer ctx.deinit();
 
-        // Copy params from matched route
-        var piter = m.params.iterator();
-        while (piter.next()) |entry| {
-            const key = try allocator.dupe(u8, entry.key_ptr.*);
-            const val = try allocator.dupe(u8, entry.value_ptr.*);
-            try ctx.params.put(key, val);
-        }
+        // Copy params from matched route — the match borrowed them, the map owns them.
+        try copyParamsOwned(allocator, &m.params, &ctx.params);
 
         // Set a query param
         try ctx.query.put("page", "5");
@@ -4206,15 +4254,6 @@ test "integration: router + global middleware + handler" {
     try std.testing.expect(matched != null);
 
     if (matched) |*m| {
-        defer {
-            var it = m.params.iterator();
-            while (it.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-                allocator.free(entry.value_ptr.*);
-            }
-            m.params.deinit();
-        }
-
         var ctx = try Context.init(allocator, .GET, "/health");
         defer ctx.deinit();
 
@@ -4278,14 +4317,6 @@ test "e2e: full middleware chain with error path" {
         var matched = server.router.match(allocator, .POST, "/items");
         try std.testing.expect(matched != null);
         if (matched) |*m| {
-            defer {
-                var it = m.params.iterator();
-                while (it.next()) |entry| {
-                    allocator.free(entry.key_ptr.*);
-                    allocator.free(entry.value_ptr.*);
-                }
-                m.params.deinit();
-            }
             var ctx = try Context.init(allocator, .POST, "/items");
             defer ctx.deinit();
             try server.executeWithMiddleware(&ctx, m.route.handler, m.route.combined_middleware);
@@ -4307,14 +4338,6 @@ test "e2e: full middleware chain with error path" {
         var matched = server.router.match(allocator, .GET, "/boom");
         try std.testing.expect(matched != null);
         if (matched) |*m| {
-            defer {
-                var it = m.params.iterator();
-                while (it.next()) |entry| {
-                    allocator.free(entry.key_ptr.*);
-                    allocator.free(entry.value_ptr.*);
-                }
-                m.params.deinit();
-            }
             var ctx = try Context.init(allocator, .GET, "/boom");
             defer ctx.deinit();
             server.executeWithMiddleware(&ctx, m.route.handler, m.route.combined_middleware) catch {
@@ -4491,33 +4514,29 @@ test "deep path matching with RouteGroup" {
     }.handle, null);
 
     // Test: deep path (4 segments) should match
-    var m1 = server.router.match(allocator, .GET, "/test/overview/home/dashboard");
+    const m1 = server.router.match(allocator, .GET, "/test/overview/home/dashboard");
     if (m1 == null) @panic("route match failed: expected GET /test/overview/home/dashboard to resolve " ++
         "(registered as group(\"/test/overview/home\").get(\"/dashboard\")). Fix the prefix join in " ++
         "RouteGroup.get / normalizeRoutePath, or correct the path asserted here.");
 
     // Test: 2-segment path should match
-    var m2 = server.router.match(allocator, .GET, "/customer/summary");
+    const m2 = server.router.match(allocator, .GET, "/customer/summary");
     if (m2 == null) @panic("route match failed: expected GET /customer/summary to resolve " ++
         "(registered as group(\"/customer\").get(\"/summary\")). Fix RouteGroup prefix joining, " ++
         "or correct the path asserted here.");
 
     // Test: 3-segment paths should match
-    var m3 = server.router.match(allocator, .GET, "/crm/statistics");
+    const m3 = server.router.match(allocator, .GET, "/crm/statistics");
     if (m3 == null) @panic("route match failed: expected GET /crm/statistics to resolve " ++
         "(registered as group(\"/crm\").get(\"/statistics\")). Fix RouteGroup prefix joining, " ++
         "or correct the path asserted here.");
 
-    var m4 = server.router.match(allocator, .GET, "/insurance/compensation-plan");
+    const m4 = server.router.match(allocator, .GET, "/insurance/compensation-plan");
     if (m4 == null) @panic("route match failed: expected GET /insurance/compensation-plan to resolve " ++
         "(registered as group(\"/insurance\").get(\"/compensation-plan\")). Fix RouteGroup prefix " ++
         "joining, or correct the path asserted here.");
 
-    // Clean up params
-    if (m1) |*m| m.params.deinit();
-    if (m2) |*m| m.params.deinit();
-    if (m3) |*m| m.params.deinit();
-    if (m4) |*m| m.params.deinit();
+    // Params need no cleanup: a match borrows them.
 }
 
 test "bindJsonLoose matches camelCase, skips null, defaults missing" {
@@ -4617,8 +4636,7 @@ test "path rewriter changes route selection" {
     const rw = server.path_rewriter.?;
     rw(&ctx);
     defer if (!std.mem.eql(u8, ctx.path, "/old/path")) allocator.free(ctx.path);
-    var matched = server.router.match(allocator, .GET, ctx.path);
-    defer if (matched) |*m| m.deinit(allocator);
+    const matched = server.router.match(allocator, .GET, ctx.path);
     try std.testing.expect(matched != null);
 }
 

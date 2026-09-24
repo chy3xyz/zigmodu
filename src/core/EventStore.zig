@@ -2,7 +2,9 @@
 //! per-aggregate stream, read/replay them, and combine with snapshots for
 //! CQRS-style reconstruction. Events are serialized to JSON at append time;
 //! replay invokes an application handler for every event. Thread-safe via
-//! `std.Io.Mutex`.
+//! `std.Io.Mutex`; a canceled lock wait is reported as `error.Canceled` — the
+//! name of the thing that actually failed — never as a lock-machinery failure
+//! the caller could not tell from a broken lock.
 
 const std = @import("std");
 const Time = @import("Time.zig");
@@ -71,7 +73,7 @@ pub const EventStore = struct {
         event: anytype,
         metadata: EventStream.EventMetadata,
     ) !void {
-        self.mutex.lock(self.io) catch return error.LockFailed;
+        try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
 
         const stream = try self.getOrCreateStreamLocked(stream_id);
@@ -132,7 +134,7 @@ pub const EventStore = struct {
         from_version: u64,
         buf: []EventStream.StoredEvent,
     ) ![]EventStream.StoredEvent {
-        self.mutex.lock(self.io) catch return error.LockFailed;
+        try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
         const stream = self.streams.get(stream_id) orelse return buf[0..0];
 
@@ -154,7 +156,7 @@ pub const EventStore = struct {
         stream_id: []const u8,
         handler: *const fn (EventStream.StoredEvent) void,
     ) !void {
-        self.mutex.lock(self.io) catch return error.LockFailed;
+        try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
         const stream = self.streams.get(stream_id) orelse return;
         for (stream.events.items) |event| handler(event);
@@ -211,7 +213,7 @@ pub const SnapshotStore = struct {
 
     /// Save snapshot (replaces any previous snapshot for the stream).
     pub fn save(self: *Self, stream_id: []const u8, version: u64, data: []const u8) !void {
-        self.mutex.lock(self.io) catch return error.LockFailed;
+        try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
         const id_copy = try self.allocator.dupe(u8, stream_id);
         errdefer self.allocator.free(id_copy);
@@ -498,4 +500,101 @@ test "EventStore snapshot load waits out a canceled lock instead of reporting no
     task_fut.await(io);
 
     try std.testing.expectEqual(@as(u64, 2), Task.got.?.version);
+}
+
+// `append`, `readStream`, `replay` and `SnapshotStore.save` answered a canceled
+// lock with `error.LockFailed`. Nothing is fabricated by that name — the work
+// did not happen and the caller is told so — but it is the wrong fact about
+// what happened, and this framework has an error channel on every one of them:
+// `std.Io.Mutex.lock` fails with `error.Canceled` and nothing else, so a
+// cancelation was reported as lock-machinery failure. A caller cannot tell
+// "unwind, you were canceled" from "this store's lock is broken". These four
+// functions have inferred error sets, so naming the truth costs no call site.
+test "EventStore reports a canceled lock as error.Canceled, not error.LockFailed" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Ev = struct { n: u32 };
+
+    const Call = struct {
+        fn append(ctx: *anyopaque) anyerror!void {
+            const store: *EventStore = @ptrCast(@alignCast(ctx));
+            return store.append("agg-1", Ev{ .n = 4 }, .{});
+        }
+        fn readStream(ctx: *anyopaque) anyerror!void {
+            const store: *EventStore = @ptrCast(@alignCast(ctx));
+            var buf: [4]EventStore.EventStream.StoredEvent = undefined;
+            _ = try store.readStream("agg-1", 1, &buf);
+        }
+        fn replay(ctx: *anyopaque) anyerror!void {
+            const store: *EventStore = @ptrCast(@alignCast(ctx));
+            return store.replay("agg-1", struct {
+                fn ignore(_: EventStore.EventStream.StoredEvent) void {}
+            }.ignore);
+        }
+        fn save(ctx: *anyopaque) anyerror!void {
+            const snapshots: *SnapshotStore = @ptrCast(@alignCast(ctx));
+            return snapshots.save("agg-1", 4, "{\"n\":4}");
+        }
+    };
+
+    // The idiom the two tests above use: park the task on the store mutex this
+    // thread holds, with the cancelation request placed before the gate opens,
+    // and read back the error the call answered with.
+    const Runner = struct {
+        var seen: ?anyerror = null;
+        var call: *const fn (*anyopaque) anyerror!void = undefined;
+        var target: *anyopaque = undefined;
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+
+        fn body() void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            call(target) catch |err| {
+                seen = err;
+            };
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+
+        fn run(mutex: *std.Io.Mutex, call_fn: *const fn (*anyopaque) anyerror!void, target_ptr: *anyopaque) !?anyerror {
+            seen = null;
+            call = call_fn;
+            target = target_ptr;
+            entered.store(false, .monotonic);
+            open.store(false, .monotonic);
+
+            try mutex.lock(io);
+            var task_fut = try io.concurrent(body, .{});
+            while (!entered.load(.acquire)) std.atomic.spinLoopHint();
+
+            var cancel_fut = try io.concurrent(cancel, .{ io, &task_fut });
+            try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+            open.store(true, .release);
+            // Wait for the task to be genuinely parked on the mutex before
+            // releasing it: the cancelation has to be delivered *there*, not
+            // after the lock was free to take.
+            while (mutex.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+            mutex.unlock(io);
+            cancel_fut.await(io);
+            task_fut.await(io);
+            return seen;
+        }
+    };
+
+    var store = EventStore.init(allocator, io);
+    defer store.deinit();
+    try store.append("agg-1", Ev{ .n = 1 }, .{});
+
+    var snapshots = SnapshotStore.init(allocator, io);
+    defer snapshots.deinit();
+    try snapshots.save("agg-1", 1, "{\"n\":1}");
+
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), try Runner.run(&store.mutex, Call.append, &store));
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), try Runner.run(&store.mutex, Call.readStream, &store));
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), try Runner.run(&store.mutex, Call.replay, &store));
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), try Runner.run(&snapshots.mutex, Call.save, &snapshots));
 }

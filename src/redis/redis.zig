@@ -907,14 +907,24 @@ pub const ClusterNode = struct {
 /// Redis cluster client
 pub const RedisCluster = struct {
     allocator: std.mem.Allocator,
+    /// The io every node client is built with. It is a constructor parameter
+    /// because `addNode` used to build each node with `std.testing.io`, which is
+    /// `@compileError("not testing")` outside a test build (std/testing.zig:24) —
+    /// so the cluster could only ever be created from inside this file's tests,
+    /// and any application calling `addNode` failed to compile. Same defect class
+    /// as `RedisCooldownStore`. `Redis` carries the io it was built with, and
+    /// every command on the node uses it, so one io for the whole cluster is the
+    /// honest shape (mirrors `Redis.new` / `Cache.init`).
+    io: std.Io,
     nodes: std.ArrayList(Redis),
     node_configs: std.ArrayList(RedisConfig),
 
     const Self = @This();
 
-    pub fn init(allocator: std.mem.Allocator) Self {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) Self {
         return .{
             .allocator = allocator,
+            .io = io,
             .nodes = std.ArrayList(Redis).empty,
             .node_configs = std.ArrayList(RedisConfig).empty,
         };
@@ -936,7 +946,7 @@ pub const RedisCluster = struct {
         const host_copy = try self.allocator.dupe(u8, host);
         const cfg = RedisConfig{ .host = host_copy, .port = port };
         try self.node_configs.append(self.allocator, cfg);
-        const redis = try Redis.new(self.allocator, std.testing.io, cfg);
+        const redis = try Redis.new(self.allocator, self.io, cfg);
         try self.nodes.append(self.allocator, redis);
     }
 
@@ -1144,7 +1154,7 @@ test "redis cluster slot calculation" {
 
 test "redis cluster init" {
     const allocator = std.testing.allocator;
-    var cluster = RedisCluster.init(allocator);
+    var cluster = RedisCluster.init(allocator, std.testing.io);
     defer cluster.deinit();
 
     try cluster.addNode("127.0.0.1", 7000);
@@ -1157,6 +1167,40 @@ test "redis cluster init" {
     const node1 = cluster.selectNode("mykey");
     const node2 = cluster.selectNode("mykey");
     try std.testing.expectEqual(node1, node2);
+}
+
+// Regression: `addNode` used to hand `std.testing.io` to `Redis.new`, and that
+// declaration is `@compileError("not testing")` outside a test build
+// (std/testing.zig:24) — the cluster was a test-only type that no application
+// could compile against. The io now comes in through `RedisCluster.init`, and
+// this test drives the whole path with a real io: `addNode` builds the node,
+// `connect` opens the socket with that io, and a command round-trips through it,
+// which is only possible if the io reaches `Redis.new` intact. Skipped unless
+// REDIS_URL is set.
+test "redis cluster: addNode nodes carry the cluster io and work" {
+    const redis_url = if (builtin.os.tag == .windows) @as(?[]const u8, null) else if (std.c.getenv("REDIS_URL")) |ptr| std.mem.span(ptr) else null;
+    if (redis_url == null or redis_url.?.len == 0) return error.SkipZigTest;
+
+    const cfg = RedisConfig.fromUrl(redis_url.?);
+    const allocator = std.testing.allocator;
+    var cluster = RedisCluster.init(allocator, std.testing.io);
+    defer cluster.deinit();
+
+    try cluster.addNode(cfg.host, cfg.port);
+    try std.testing.expectEqual(@as(usize, 1), cluster.nodes.items.len);
+    // The io the cluster was built with is the one the node client holds:
+    // `Redis.new` copies it into the client, which is what every command uses.
+    try std.testing.expect(cluster.nodes.items[0].io.vtable == std.testing.io.vtable);
+
+    try cluster.connect();
+
+    try cluster.set("zigmodu_cluster_test_key", "cluster_value", null);
+    const value = try cluster.get("zigmodu_cluster_test_key");
+    try std.testing.expect(value != null);
+    if (value) |v| {
+        defer allocator.free(v);
+        try std.testing.expectEqualStrings("cluster_value", v);
+    }
 }
 
 // ── RESP framing & single-stream locking (regression tests for the desync bug) ──

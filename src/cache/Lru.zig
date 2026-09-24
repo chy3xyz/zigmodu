@@ -120,7 +120,17 @@ pub fn Cache(comptime K: type, comptime V: type) type {
                 self.evictLRU();
             }
 
-            // Insert new node at tail (most recent)
+            // Insert into the map first, link into the list second. The map
+            // insert is the only step here that can fail, and the old order —
+            // `self.list.append(&node.list_node)` before `try self.map.put` —
+            // left the node on the LRU list with no map entry whenever it did.
+            // Nothing indexes such a node: `size`, `get`, `delete`, `clear`
+            // and `deinit` all walk the map, so it was unreachable and
+            // unaccounted for — the memory leaked until some later eviction
+            // happened to reach it, and until then `list` and `map` disagreed
+            // about what the cache held. Doing the fallible step first means
+            // the node becomes visible to both structures or to neither, and
+            // the failed insert frees it here.
             const node = try self.allocator.create(Node);
             node.* = .{
                 .key = key,
@@ -128,8 +138,11 @@ pub fn Cache(comptime K: type, comptime V: type) type {
                 .expires_at = expires_at,
                 .list_node = .{},
             };
+            self.map.put(key, node) catch |err| {
+                self.allocator.destroy(node);
+                return err;
+            };
             self.list.append(&node.list_node);
-            try self.map.put(key, node);
         }
 
         /// Delete key from cache.
@@ -483,4 +496,81 @@ test "cache Lru deinit tears the container down under the lock, never beside a h
     try std.testing.expect(frees_after > frees_before);
     // ... and none of it happened behind the holder's back.
     try std.testing.expectEqual(@as(u32, 0), CountingAllocator.frees_beside_holder.load(.monotonic));
+}
+
+// `std.DoublyLinkedList` has no `len`, and "the list agrees with the map" is
+// exactly what these tests assert, so count the nodes by walking from the head.
+fn listLen(cache: *Cache(u32, u32)) usize {
+    var n: usize = 0;
+    var cur = cache.list.first;
+    while (cur) |node| : (cur = node.next) {
+        n += 1;
+        if (n > 1024) break; // a runaway count is a broken list, not a big one
+    }
+    return n;
+}
+
+// `set` used to link the new node into the LRU list *before* the map insert,
+// and that insert is the one step in `set` that can fail. On OOM the node then
+// stayed on the list with no map entry, and every reader of the cache walks the
+// map: `size` counted it as absent, `get` served a miss for a key in the list,
+// `delete` removed nothing, and `deinit` / `clear` never freed it — so a cache
+// that failed one insert leaked that node and had a list that lied about its
+// contents until an eviction happened to walk over it.
+//
+// The node's own allocation is index #0 and the map's backing storage is #1, so
+// failing index #1 is exactly "the insert failed after the node was created".
+
+test "cache: a failed map insert leaves the node in neither the map nor the list" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var cache = Cache(u32, u32).init(failing.allocator(), std.testing.io, 4);
+    errdefer cache.deinit(); // an earlier expectation must not hide the real one behind a leak report
+
+    try std.testing.expectError(error.OutOfMemory, cache.set(1, 10, null));
+    try std.testing.expect(failing.has_induced_failure);
+
+    // Neither structure knows about the node — and, crucially, the list does
+    // not hold it on its own.
+    try std.testing.expectEqual(@as(usize, 0), cache.map.count());
+    try std.testing.expect(cache.list.first == null);
+    try std.testing.expect(cache.get(1) == null);
+
+    // The cache still works afterwards, and both structures agree again.
+    failing.fail_index = std.math.maxInt(usize);
+    try cache.set(1, 10, null);
+    try std.testing.expectEqual(@as(u32, 10), cache.get(1).?.*);
+    try std.testing.expectEqual(@as(usize, 1), cache.map.count());
+    try std.testing.expectEqual(@as(usize, 1), listLen(&cache));
+
+    cache.deinit();
+    // Every byte the failed insert took (the node it created) was given back.
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+// The same invariant at *every* allocation point of a longer sequence, not just
+// the index the map insert happens to use: `checkAllAllocationFailures` makes
+// each allocation fail in turn and asserts that the failure is either reported
+// (exactly `error.OutOfMemory`) with nothing left allocated, or does not happen
+// at all. Before the fix, the failing map insert leaked the node and left it
+// listed-but-unindexed, so this reports `MemoryLeakDetected`.
+test "cache: every allocation failure across set/get/delete/evict is consistent and leaks nothing" {
+    const Scan = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var cache = Cache(u32, u32).init(allocator, std.testing.io, 3);
+            defer cache.deinit();
+
+            try cache.set(1, 10, null);
+            try cache.set(2, 20, null);
+            try cache.set(3, 30, null);
+            _ = cache.get(1);
+            try cache.set(4, 40, null); // at capacity: evicts the LRU
+            try cache.set(4, 41, null); // existing key: update, no allocation
+            cache.delete(2);
+
+            // The invariant: one list entry per map entry, no orphans either way.
+            try std.testing.expectEqual(cache.map.count(), listLen(&cache));
+            try std.testing.expectEqual(cache.map.count(), cache.size());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scan.run, .{});
 }

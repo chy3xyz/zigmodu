@@ -18,6 +18,22 @@ const cooldown_store = @import("cooldown_store.zig");
 
 pub const KeyStatus = enum { healthy, cooling, disabled };
 
+/// Size of the buffer `keyStr` writes into. Callers pass `*[key_buf_len]u8`.
+pub const key_buf_len = 128;
+/// Bytes the long-name form of a logical key needs besides the name prefix:
+/// "~", the 16 hex digits of the digest, ":" and the widest possible `usize`
+/// index (20 digits).
+const key_long_form_overhead = 1 + 16 + 1 + 20;
+/// Longest provider-name prefix kept in the long-name form of a logical key.
+pub const key_name_max = key_buf_len - key_long_form_overhead;
+
+comptime {
+    // `keyStr` writes the long form by hand and relies on exactly this
+    // reservation: shrink `key_buf_len` (or set `key_name_max` by hand) and the
+    // widest index would no longer fit after the prefix.
+    std.debug.assert(key_name_max + key_long_form_overhead <= key_buf_len);
+}
+
 pub const KeyErrorKind = enum {
     auth, // 401 / 403 — bad key
     rate_limit, // 429 — too many requests
@@ -167,7 +183,7 @@ pub const KeyPool = struct {
         for (0..klen) |step| {
             const idx = (self.rr_index + step) % klen;
             const key = &self.keys.items[idx];
-            var kbuf: [128]u8 = undefined;
+            var kbuf: [key_buf_len]u8 = undefined;
             if (key.status != .disabled and !self.store.isCooling(self.keyStr(idx, &kbuf))) {
                 if (key.status == .cooling) key.status = .healthy; // recovered
                 self.rr_index = (idx + 1) % klen;
@@ -189,7 +205,7 @@ pub const KeyPool = struct {
         const key = self.keyPtrLocked(key_index) orelse return;
         key.total_calls += 1;
         key.failures = 0;
-        var kbuf: [128]u8 = undefined;
+        var kbuf: [key_buf_len]u8 = undefined;
         self.store.reset(self.keyStr(key_index, &kbuf));
         if (key.status != .disabled) key.status = .healthy;
     }
@@ -209,7 +225,7 @@ pub const KeyPool = struct {
         defer self.mutex.unlock(io);
         const key = self.keyPtrLocked(key_index) orelse return;
         key.total_errors += 1;
-        var kbuf: [128]u8 = undefined;
+        var kbuf: [key_buf_len]u8 = undefined;
         const k = self.keyStr(key_index, &kbuf);
         key.failures = self.store.bumpFailures(k);
         switch (kind) {
@@ -240,7 +256,7 @@ pub const KeyPool = struct {
         const key = self.keyPtrLocked(key_index) orelse return error.KeyNotFound;
         key.status = .healthy;
         key.failures = 0;
-        var kbuf: [128]u8 = undefined;
+        var kbuf: [key_buf_len]u8 = undefined;
         self.store.reset(self.keyStr(key_index, &kbuf));
     }
 
@@ -268,8 +284,39 @@ pub const KeyPool = struct {
 
     /// Logical cooldown-store key: "<provider>:<key_index>". Writes into the
     /// caller-provided buffer (the store copies or reads it synchronously).
-    fn keyStr(self: *Self, key_index: usize, buf: []u8) []const u8 {
-        return std.fmt.bufPrint(buf, "{s}:{d}", .{ self.name, key_index }) catch self.name;
+    ///
+    /// A provider name is caller-supplied and never length-checked, so a name
+    /// long enough to overflow `key_buf_len` is handled instead of dropped: the
+    /// name is truncated (to `key_name_max`) and tagged with a digest of the
+    /// **full** name, while the index stays. The old `catch self.name` fallback
+    /// returned the bare name for every index, so all keys of a long-named
+    /// provider shared one cooldown entry — one key's 429 cooled a different key
+    /// (red: `ai.key_pool.test.a long provider name keeps one cooldown entry per
+    /// key and per provider`).
+    fn keyStr(self: *Self, key_index: usize, buf: *[key_buf_len]u8) []const u8 {
+        if (std.fmt.bufPrint(buf, "{s}:{d}", .{ self.name, key_index })) |s| {
+            return s;
+        } else |err| switch (err) {
+            // Handled by the bounded form below.
+            error.NoSpaceLeft => {},
+        }
+
+        const digest = std.hash.Wyhash.hash(0, self.name);
+        const short = self.name[0..@min(self.name.len, key_name_max)];
+        var w: usize = 0;
+        @memcpy(buf[w..][0..short.len], short);
+        w += short.len;
+        buf[w] = '~';
+        w += 1;
+        const hex = std.fmt.bytesToHex(@as([8]u8, @bitCast(digest)), .lower);
+        @memcpy(buf[w..][0..hex.len], &hex);
+        w += hex.len;
+        buf[w] = ':';
+        w += 1;
+        // Total by construction: `key_name_max` reserves the widest possible
+        // index, so this cannot run out of buffer.
+        w += std.fmt.printInt(buf[w..], key_index, 10, .lower, .{});
+        return buf[0..w];
     }
 
     fn backoffMs(self: *Self, failures: u32) i64 {
@@ -284,6 +331,12 @@ pub const KeyPool = struct {
 var fake_now: i64 = 1_000_000;
 fn fakeNow() i64 {
     return fake_now;
+}
+
+fn repeatedName(comptime n: usize, comptime c: u8) [n]u8 {
+    var b: [n]u8 = undefined;
+    @memset(&b, c);
+    return b;
 }
 
 fn testPool(allocator: std.mem.Allocator, keys: []const []const u8) !KeyPool {
@@ -387,6 +440,51 @@ test "pool routes cooldown through an external shared store" {
     try std.testing.expectEqual(@as(?KeyLease, null), try pool.acquire(std.testing.io));
     // External store knows the key is cooling (cross-process visibility).
     try std.testing.expect(shared.asStore().isCooling("shared:0"));
+}
+
+test "a long provider name keeps one cooldown entry per key and per provider" {
+    const allocator = std.testing.allocator;
+    fake_now = 1_000_000;
+    var shared = cooldown_store.MemoryCooldownStore.initWithOptions(allocator, std.testing.io, .{ .now_fn = fakeNow });
+    defer shared.deinit();
+    var shared_store = shared.asStore();
+
+    // The logical key buffer is 128 bytes, so a name this long overflows
+    // "<name>:<index>". The old `catch self.name` fallback then used the bare
+    // name for *every* key of the pool.
+    const long_a = repeatedName(200, 'p');
+    // Same 199-byte prefix, different name.
+    const long_b = blk: {
+        var b = repeatedName(200, 'p');
+        b[199] = 'q';
+        break :blk b;
+    };
+    const opts = Options{
+        .cooldown_base_ms = 1_000,
+        .cooldown_max_ms = 8_000,
+        .now_fn = fakeNow,
+        .shared_store = &shared_store,
+    };
+    var pool_a = try KeyPool.init(allocator, std.testing.io, &long_a, &.{ "sk-a", "sk-b" }, opts);
+    defer pool_a.deinit();
+    var pool_b = try KeyPool.init(allocator, std.testing.io, &long_b, &.{"sk-c"}, opts);
+    defer pool_b.deinit();
+
+    const a0 = (try pool_a.acquire(std.testing.io)).?;
+    try std.testing.expectEqual(@as(usize, 0), a0.key_index);
+    pool_a.onError(std.testing.io, a0.key_index, .rate_limit); // cools sk-a only
+
+    // Same pool, other key: the index survives the truncation, so sk-b is not
+    // cooled along with sk-a.
+    const a1 = try pool_a.acquire(std.testing.io);
+    try std.testing.expect(a1 != null);
+    try std.testing.expectEqualStrings("sk-b", a1.?.key);
+
+    // Another provider whose name shares the whole 199-byte prefix: the digest of
+    // the full name is what keeps the two providers' keys apart.
+    const b0 = try pool_b.acquire(std.testing.io);
+    try std.testing.expect(b0 != null);
+    try std.testing.expectEqualStrings("sk-c", b0.?.key);
 }
 
 /// Park `read` on `mutex` with a cancel request already placed on its thread, then

@@ -2,6 +2,77 @@
 
 ## [Unreleased]
 
+### 第 21 批：`RedisCluster.addNode` 让应用编译不过（用真实消费者程序证明）、`skill.register` 超容量直接 panic、`Router.match` 的 OOM 伪装成 404、metrics 两处桩/泄漏（**破坏性：是**，1 处公开签名）
+
+全量 `-Ddb=all` **1884/1942（58 skipped，0 failed）**；Redis 门控真机 18/18；`examples/mcp-server` 构建通过。
+
+**`RedisCluster.addNode` 用 `std.testing.io` —— 任何调用它的应用都编译不过。** 这次不是靠推理，而是写了一个
+**非 test 构建的消费者程序**（仓库 `src/` 整份复制到 `/tmp`，`main(init: std.process.Init)` 调
+`RedisCluster.init` + `addNode`）：修前 `error: not testing`（引用链
+`addNode: src/redis/redis.zig:939 → std/testing.zig:24`），修后**编译并运行成功**（真实连库往返）。
+与上一批的 `RedisCooldownStore` 同一类"只在测试里活着"的缺陷。
+**修法与兼容成本**：`RedisCluster` 新增 `io: std.Io` 字段，`init(allocator)` → `init(allocator, io)`
+（`addNode` 签名不变）。`io` 走构造参数是因为 `Redis` 自己就带 `io`、整个 cluster 共用一个 io 是唯一自洽
+的形状（与 `Redis.new`、`Cache.init(allocator, io, …)` 一致）。**这是公开签名变更**，但全仓（含
+`docs/`、`examples/`、`tools/`）**没有任何 `RedisCluster` 调用点**，见 UPGRADING。
+> **未修（已记录）**：`addNode` 自身的分配失败清理仍不完整 —— `nodes.append` 失败会漏掉整个 `Redis`
+> （含它的 pool 分配）、`node_configs.append` 失败会漏掉 `host_copy`、`Redis.new` 失败后两个数组长度
+> 不一致（配置在、节点不在）。修法是 `errdefer` 链，但它需要真正的 OOM 注入测试才敢说修对，本批没做。
+
+**`SkillRegistry.register` 超容量会 `panic: integer overflow`（不是报错）。** `initCapacity` 的注释写着
+"register() is infallible"，于是它用 `putAssumeCapacity` 且**没有任何容量断言** —— hint 用完后再注册就
+是 `available -= 1` 下溢（实测 `panic: integer overflow @ skill.zig:209`，`signal ABRT`；这版 std 的
+`getOrPutAssumeCapacityContext` 在 `capacity() == 0` 时还会越界写）。重复注册也漏：`putAssumeCapacity`
+保留旧 key 指针、覆盖 value 却**不释放**旧的 `parameters` 数组与每个 param name，新 dupe 的 key 也漏
+（红证据：3 条 `leaked` 全指向 `skill.zig:189`）。
+改为 `getOrPut`（增长回到**可失败且可上报**的路径）并在替换时释放被替换工具的参数，循环内补 `errdefer`
+（含 `copied` 计数）。**重复名语义定为"替换"**：原 docstring 就写着 "Duplicate names are replaced"，
+且 40+ 处 `try registry.register(...)` 依赖"注册即设置"，改成报错会把"模块更新自己的工具"变成启动失败。
+`initCapacity` 的注释也改成"提示不是上限"。
+
+**`Router.match` 的分配失败会伪装成"没有这条路由"（404），或者更糟 —— 匹配成功却少了路径参数。**
+`dupe … catch return null` 让一个**存在的路由**在 OOM 时返回 404；精确匹配分支的
+`catch { log; continue }` 让 `null` 之外的另一种失败变成了**参数缺失的成功匹配**（handler 读租户/用户
+路径参数会读到空），并且顺带漏掉前几轮已 dupe 的参数。红证据：
+`Router match answers…FAIL (TestUnexpectedResult)` 与 `panic: attempt to use null value` +
+`[Router] param put failed: error.OutOfMemory`。
+**修法是"让这个分配不存在"**（改签名成 `!?MatchedRoute` 会牵动约 26 个调用点 + 一个出范围的文件）：
+`match` 现在填一个固定的 ≤8 对参数表，**借用** trie 里的参数名（router 所有，只在 `Router.deinit` 释放）
+与路径的子切片 —— **不分配，所以不可能失败**，`null` 重新只表示"没有这条路由"；"复制成自有"移到**有错误
+通道的调用方**（`connFiber` 回 500）。请求路径的总分配数不变，只是从 `match` 移到了能报告它的那一层。
+`MatchedRoute.deinit` 保留为显式 no-op，只为不动那个出范围的 `ComptimeRouter.zig` 调用点。
+> 记录：`RouteParams.MAX = 8` 仍是"超过 8 个参数的路径会 404"（既有，已就地写明）。
+
+**两处 metrics 缺陷。** ① **`ModuleMetricsCollector` 的同一个桩时钟**（上一批刚修过
+`AutoInstrumentation`）：`module_start_time = 0` 且 `getUptimeSeconds()` 返回 `0 - start` = **恒 0**，
+而且**减法方向是反的**。字段改名 `module_start_ns`（原名正是 bug 的一部分）、`init` 打时间戳、
+`Time.monotonicNow()` 两端同源、`@divFloor(…, ns_per_s)` 并钳到 0（保持名字承诺的**秒**），新增
+"真实经过秒数"测试。② **`InstrumentedEventListener` 的泄漏（四类）**：consume span 被 tracer 从
+active 列表摘掉却**没人 `deinit`/destroy**、两个 map key 在 `remove` 后从未释放（而且两个 map 曾经
+**共享同一个 key 指针**，`deinit` 会双 free）、内联 `allocPrint` 出来的 span 名也没释放（红证据：一次
+start→end 就有 12 条 `leaked`）。ownership 决策：tracer **不**接管 span（`endSpan` 只 `end` 并从
+active 列表摘除，真正的释放归调用方），所以释放放回调用点；`onEventConsumeStart` 改为给两个 map 各存
+**独立的 dupe**，`onEventConsumeEnd` 用 `fetchRemove` 两边都取再各自释放。
+
+**另四处（同族清点）。** `WorkerPool.workerLoop` 的 `cond.wait catch break` 会让 **worker 线程永久消失**
+（`total_workers` 却还在报它）→ `waitUncancelable`；这条与上一批那 5 处一样**不可达**（裸 `std.Thread`
+没有取消上下文），所以只加了可达性质测试、**没有红证据**。`mailbox.sendWaiting` 把取消说成
+`error.Closed`（信箱其实是开着的，而调用方按"该 worker 没了"处理）→ 改成不可取消的等待；**没有**给
+`SendError` 加 `Canceled`，因为那会破坏所有穷举 switch（含三个出范围的文件）——代价是 `timeout_ms = 0`
+时被取消的 `sendBlocking` 现在会等到有槽位或 `close`。`EventStore` 四处把取消答成 `error.LockFailed` →
+直接传播 `error.Canceled`（零兼容成本：错误集是推断的、全仓无调用者）。
+`memory.recall` 边迭代边改 → 改为**先收集后累加**（all-or-nothing：分配失败则 store 完全不变，红证据用
+`FailingAllocator{fail_index=3}` 比 `dumpJson` 前后一致，并顺带暴露了错误路径连半个结果都没释放的 3 条泄漏）。
+`key_pool.keyStr` 在 provider 名 ≥127 字节时**回退成整个 name**，于是两个长名 key **共享一条冷却记录**
+（红证据：200 字节 provider 名下，key 0 的 429 把 key 1 一起冷却了）→ 有界形式
+`"<name 前 90 字节>~<wyhash 16 hex>:<index>"`（**index 永不丢**、截断名用**全名摘要**区分，因而
+(provider, index) 唯一；短名走原格式，既有 key 一字不变）。`module.zig` 的 `AiKeyManager.onSuccess/onError`
+是 `void` 直通，但**链上已无可失败点**（`KeyPool` 那两个已改成不可取消的等待），所以只加了精确文档：
+`void` 是诚实的，以及**将来若下方新增可失败操作，这两处必须同批改成 `!void`**。
+> **顺带发现、未修（超出该 agent 的编辑范围）**：`provider_registry.registerLocked` 替换同名 provider 时
+> 会 `old.pool.deinit()`，而已发出的 `ProviderLease` 仍持有 `*KeyPool` + `key_index` —— 这是
+> use-after-free / 静默丢写的形状，值得单独立项。
+
 ### 第 20 批：丢失唤醒/永久停摆一族（mailbox 5 处 + `Runtime.shutdown` 中途放弃，真红）、Redis 池槽永久丢失、`Lru` 五处伪造、"缓存管理器"级别的三个真缺陷（事件订阅假成功、重放只读 256 条、preflight 把致命失败漏掉）（**破坏性：否**）
 
 全量 `-Ddb=all` **1870/1927（57 skipped，0 failed）**；Redis 门控用例在真机 Redis 上跑过（`REDIS_URL` 打开时 15/15）。

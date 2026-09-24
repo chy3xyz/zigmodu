@@ -72,6 +72,19 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 返回：`release` 丢掉缓冲区（`allocated` 永久虚高 → 以后报**假** `PoolExhausted`），`available`/`stats`
 给出伪造读数（会被 scrape/健康检查当成事实）。`acquire` 仍然返回 `error.Canceled`。
 
+**破坏：`RedisCluster.init` 多一个 `io` 参数。** `redis.RedisCluster.init(allocator)` →
+`init(allocator, io)`。原因：它内部用 `std.testing.io` 建节点，而 `std.testing.io` 在非 test 构建里是
+`@compileError("not testing")` —— 所以**此前任何调用 `addNode` 的应用都编译不过**（实测：一个普通
+`main` 调 `init`+`addNode`，修前 `error: not testing`，修后编译并真实连库成功）。
+**Breaking?** 是（编译错）· **影响面**：用到 `RedisCluster` 的应用（本仓库内无调用点）· **一行改法**：
+`var c = RedisCluster.init(alloc);` → `var c = RedisCluster.init(alloc, io);`（`io` 就是你启动时拿到的那个
+`std.process.Init` 的 io；`addNode` 签名不变）。
+
+**行为变化（非破坏）：`SkillRegistry.register` 对重复名字是"替换"且超容量不再 panic。**
+以前 `initCapacity` 用完后再注册会 `panic: integer overflow`（不是报错），重复注册还会漏掉被替换工具的
+参数数组。现在重复名**替换**（与原 docstring 一致，"注册即设置"的 40+ 处调用不受影响），超容量走正常的
+可失败分配路径并如实返回错误。若你的代码依赖"超容量必定 panic"或"重复注册保留旧工具"，需要改。
+
 **行为变化（非破坏）⑨：一批"取消被当成成功/默认值"的路径改成等待或报错。** 涉及 `EventBus`
 （`publish`/`unsubscribe`/`subscriberCount`/`publishedCount` 改不可取消的等待；**`subscribe`/`subscribeAsync`
 现在会返回 `error.Canceled`** —— 以前它们**返回成功却没注册**）、`EventStore`

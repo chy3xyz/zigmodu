@@ -132,7 +132,19 @@ pub fn Mailbox(comptime T: type, comptime capacity: usize) type {
         }
 
         fn sendWaiting(self: *Self, message: T, timeout_ms: u32) SendError!void {
-            self.mu.lock(self.io) catch return error.Closed;
+            // Not a cancelation point. `SendError` has nowhere to put
+            // `error.Canceled` — a fourth tag would break every exhaustive
+            // `switch` on it, and the mailbox's own `error.Full`/`error.Closed`
+            // say nothing about the caller's task — so a canceled wait used to
+            // come back as `error.Closed` for a mailbox that is open. Nothing
+            // was lost by that, but the caller acts on the reason:
+            // `Handle.sendBlocking` reads `error.Closed` as "this worker is
+            // gone", which is a fact about a healthy worker that the sender
+            // never observed. The budget below, or `close()`, ends this wait.
+            const saved_protection = self.io.swapCancelProtection(.blocked);
+            defer _ = self.io.swapCancelProtection(saved_protection);
+
+            self.mu.lockUncancelable(self.io);
             defer self.mu.unlock(self.io);
             const deadline = if (timeout_ms == 0) null else blk: {
                 const start = std.Io.Clock.Timestamp.now(self.io, .awake);
@@ -153,10 +165,17 @@ pub fn Mailbox(comptime T: type, comptime capacity: usize) type {
                         .duration = nanosDuration(budget_ns - elapsed_ns),
                     }) catch |err| switch (err) {
                         error.Timeout => return error.Timeout,
-                        else => return error.Closed,
+                        // Unreachable with the protection above; if an `Io`
+                        // implementation does not honor `.blocked`, this is
+                        // still another pass rather than a fabricated
+                        // `error.Closed` — the deadline is absolute and the
+                        // mutex is re-locked before `waitTimeout` returns.
+                        error.Canceled => continue,
                     };
                 } else {
-                    self.not_full.wait(self.io, &self.mu) catch return error.Closed;
+                    // A parked sender is released by a slot freeing up or by
+                    // `close()`, both of which signal `not_full`.
+                    self.not_full.waitUncancelable(self.io, &self.mu);
                 }
             }
         }
@@ -793,4 +812,50 @@ test "Mailbox: wake unparks a receiver that had already blocked" {
     try std.testing.expectEqual(@as(usize, 0), mb.len());
     try std.testing.expectEqual(@as(u64, 0), mb.received.load(.acquire));
     try std.testing.expect(!mb.isClosed());
+}
+
+// `sendWaiting` answered a canceled `lock` and a canceled `waitTimeout` with
+// `error.Closed` while the mailbox was open. Nothing is lost by that (the
+// message is not enqueued either way), but it is the wrong fact, and the caller
+// acts on it: `Handle.sendBlocking` treats `error.Closed` as "this worker is
+// gone", so a canceled producer concluded its producer-side backpressure had
+// stopped a healthy worker. The wait is uncancelable instead — the caller's own
+// `timeout_ms` is the budget, `close()` is the other way out — so the answers
+// are `error.Timeout` and success, both of them true.
+test "Mailbox: a canceled sendBlocking wait is not reported as Closed" {
+    // capacity 2, both slots taken: the sender below has nowhere to go.
+    const M = Mailbox(u32, 2);
+    var mb = M.init(std.testing.io);
+    const io = std.testing.io;
+    try mb.send(1);
+    try mb.send(2);
+
+    const Shared = struct {
+        var seen: ?SendError = null;
+
+        fn send(m: *M) void {
+            m.sendBlocking(3, 100) catch |err| {
+                seen = err;
+            };
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Shared.seen = null;
+
+    var send_fut = try io.concurrent(Shared.send, .{&mb});
+    var spins: u32 = 0;
+    while (mb.not_full.state.load(.monotonic).waiters == 0 and spins < wait_for_receiver_rounds) : (spins += 1) std.atomic.spinLoopHint();
+    try std.testing.expect(mb.not_full.state.load(.monotonic).waiters > 0);
+
+    var cancel_fut = try io.concurrent(Shared.cancel, .{ io, &send_fut });
+    cancel_fut.await(io);
+    send_fut.await(io);
+
+    // Nothing drained a slot, so the budget is what ended the wait — and the
+    // mailbox never closed.
+    try std.testing.expect(!mb.isClosed());
+    try std.testing.expectEqual(@as(?SendError, error.Timeout), Shared.seen);
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const Time = @import("../core/Time.zig");
 
 /// Prometheus metrics collector
 /// Supports Counter, Gauge, Histogram, Summary
@@ -678,10 +679,17 @@ pub const PrometheusMetrics = struct {
         };
     }
 
-    /// Module metrics collector
+    /// Module metrics collector.
+    ///
+    /// `module_start_ns` is a `Time.monotonicNow()` stamp (nanoseconds since an
+    /// arbitrary epoch) taken in `init`, so `getUptimeSeconds` measures from the
+    /// moment the collector was created. It is stored in nanoseconds, not
+    /// seconds: the only consumer wants whole seconds, and rounding at the point
+    /// of measurement would make every sub-second uptime indistinguishable from
+    /// a clock that never ran.
     pub const ModuleMetricsCollector = struct {
         metrics: *PrometheusMetrics,
-        module_start_time: i64,
+        module_start_ns: i64,
         request_count: *Counter,
         request_duration: *Histogram,
         active_connections: *Gauge,
@@ -696,7 +704,7 @@ pub const PrometheusMetrics = struct {
 
             return .{
                 .metrics = metrics,
-                .module_start_time = 0,
+                .module_start_ns = Time.monotonicNow(),
                 .request_count = try metrics.createCounter(req_count_name, "Total requests"),
                 .request_duration = try metrics.createHistogram(req_duration_name, "Request duration", &.{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0 }),
                 .active_connections = try metrics.createGauge(active_conn_name, "Active connections"),
@@ -716,8 +724,16 @@ pub const PrometheusMetrics = struct {
             self.active_connections.dec();
         }
 
+        /// Whole seconds since `init`, measured against the monotonic clock —
+        /// the same clock `init` sampled, so the difference is real elapsed
+        /// time. Whole seconds *truncated*: 1.9 s of uptime reports 1.
+        ///
+        /// Clamped at 0: if the clock ever appears to move backwards, the
+        /// uptime reads 0 rather than a negative number of seconds.
         pub fn getUptimeSeconds(self: *ModuleMetricsCollector) i64 {
-            return 0 - self.module_start_time;
+            const elapsed_ns = Time.monotonicNow() - self.module_start_ns;
+            if (elapsed_ns <= 0) return 0;
+            return @divFloor(elapsed_ns, std.time.ns_per_s);
         }
     };
 
@@ -885,6 +901,32 @@ test "ModuleMetricsCollector" {
 
     try std.testing.expectEqual(@as(u64, 1), collector.request_count.get());
     try std.testing.expectEqual(@as(f64, 0.0), collector.active_connections.get());
+}
+
+test "ModuleMetricsCollector uptime is real elapsed seconds" {
+    const allocator = std.testing.allocator;
+    var metrics = PrometheusMetrics.init(allocator);
+    defer metrics.deinit();
+
+    var collector = try PrometheusMetrics.ModuleMetricsCollector.init(&metrics, "uptime_module");
+
+    // Freshly created: less than a second of uptime, so 0 whole seconds. This
+    // alone does not prove the clock runs (a hardcoded 0 reads the same); the
+    // wait below is what separates the two.
+    try std.testing.expectEqual(@as(i64, 0), collector.getUptimeSeconds());
+
+    // Real time spent, so the seconds it reports are real too. A 1.1 s wait is
+    // what it takes to pin a seconds-granularity accessor: nothing shorter can
+    // cross a second boundary.
+    std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(1_100), .awake) catch {};
+
+    const uptime = collector.getUptimeSeconds();
+    try std.testing.expect(uptime >= 1); // the stub reported 0; an inverted subtraction reports negative
+    try std.testing.expect(uptime < 60); // a millisecond reading reports ~1100, a nanosecond reading ~1.1e9
+
+    // Shape: the stamp the accessor measures from is a real monotonic reading
+    // taken in `init`, never the 0 the stubbed field held.
+    try std.testing.expect(collector.module_start_ns > 0);
 }
 
 test "Gauge atomic CAS correctness" {

@@ -90,10 +90,33 @@ pub const AiKeyManager = struct {
         return self.registry.acquire(self.io, model);
     }
 
+    /// Report success for a leased key. Aggregate-level counterpart of
+    /// `AiProvider.reportSuccess`.
+    ///
+    /// `void` is accurate for this chain rather than a swallowed failure: every
+    /// step below — `ProviderRegistry.onSuccess` → `KeyPool.onSuccess` — is
+    /// itself `void` and takes its lock **uncancelably**
+    /// (`std.Io.Mutex.lockUncancelable`), so there is no failure a caller could
+    /// act on. The only silent outcome left is `KeyPool`'s own range check
+    /// (`keyPtrLocked(key_index) orelse return`), which is a broken-lease
+    /// contract — a lease names an index in the pool it was taken from — and not
+    /// something an `!void` here could describe either. Per-request feedback does
+    /// not come through here at all: `AiProvider.reportSuccess/reportError` calls
+    /// the pool directly, because a key rotation inside `chatWith` may have moved
+    /// the key index the lease names.
+    ///
+    /// The limitation, so a future change does not inherit it silently: if any
+    /// step below ever gains a failing operation (a store write that can fail, a
+    /// cancelable wait), this must become `!void` in the same change — a dropped
+    /// `onSuccess` leaves a healthy key cooling, and a dropped `onError`
+    /// (`AiProviderManager.onError`) leaves a failing key selectable, both
+    /// without a word to anyone.
     pub fn onSuccess(self: *Self, lease: ProviderLease) void {
         self.registry.onSuccess(self.io, lease);
     }
 
+    /// Report a failure for a leased key. See `onSuccess` for why this is `void`
+    /// and what would have to change to make it fallible.
     pub fn onError(self: *Self, lease: ProviderLease, kind: KeyErrorKind) void {
         self.registry.onError(self.io, lease, kind);
     }

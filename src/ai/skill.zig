@@ -149,12 +149,16 @@ pub const SkillRegistry = struct {
         return initCapacity(allocator, io, 32);
     }
 
-    /// Init with capacity hint (max registered tools). Pre-allocates
-    /// HashMap storage so runtime register() is infallible.
+    /// Init with capacity hint (max registered tools).
+    ///
+    /// The hint only pre-allocates HashMap storage: `register` still allocates
+    /// when it grows past it (or dupes names/parameter names) and reports the
+    /// failure as an error. It is a hint, **not** a limit — registering more
+    /// tools than this is fine.
     pub fn initCapacity(allocator: std.mem.Allocator, io: std.Io, capacity: usize) Self {
         var tools = std.StringHashMap(Tool).init(allocator);
         tools.ensureTotalCapacity(@intCast(capacity)) catch |err| {
-            std.log.warn("[ai.skill] pre-allocating {d} tools failed ({s}); register() may fail later", .{ capacity, @errorName(err) });
+            std.log.warn("[ai.skill] pre-allocating {d} tools failed ({s}); register() will allocate as it goes", .{ capacity, @errorName(err) });
         };
         return .{
             .allocator = allocator,
@@ -175,7 +179,14 @@ pub const SkillRegistry = struct {
         self.* = undefined;
     }
 
-    /// Register a tool. Duplicate names are replaced.
+    /// Register a tool. **A duplicate name replaces the previous definition** (the
+    /// registry aggregates tools from modules, and re-registering is how a module
+    /// or a test updates its own tool); the replaced definition's parameter
+    /// storage is freed, as is this call's own name copy, since the map keeps the
+    /// name key it already owns.
+    ///
+    /// `error.OutOfMemory` means the tool is **not** registered, including when
+    /// the map had to grow past the `initCapacity` hint.
     pub fn register(self: *Self, tool: Tool) !void {
         // Propagated, not waited out: `register` returns `!void` — a silent
         // success would tell the caller a tool is registered that never reached
@@ -187,8 +198,12 @@ pub const SkillRegistry = struct {
         defer self.mutex.unlock(self.io);
 
         const key = try self.allocator.dupe(u8, tool.name);
+        errdefer self.allocator.free(key);
         // Deep copy parameters
         const params = try self.allocator.alloc(Param, tool.parameters.len);
+        errdefer self.allocator.free(params);
+        var copied: usize = 0;
+        errdefer for (params[0..copied]) |p| self.allocator.free(p.name);
         for (tool.parameters, 0..) |p, i| {
             params[i] = .{
                 .name = try self.allocator.dupe(u8, p.name),
@@ -196,9 +211,24 @@ pub const SkillRegistry = struct {
                 .description = p.description,
                 .required = p.required,
             };
+            copied = i + 1;
         }
-        const owned = Tool{
-            .name = key,
+
+        // `getOrPut`, not `putAssumeCapacity`: the latter asserts the reserved
+        // capacity holds (it panicked with `integer overflow` on the 7th tool of
+        // an 8-slot map — `ai.skill.test.register grows past the initCapacity
+        // hint instead of dropping an entry`), while `register` promises an
+        // error. `getOrPut` also answers the duplicate case.
+        const entry = try self.tools.getOrPut(key);
+        if (entry.found_existing) {
+            // The map keeps the key it already holds, so this call's copy is
+            // ours to free, together with the definition it replaces.
+            self.allocator.free(key);
+            for (entry.value_ptr.parameters) |p| self.allocator.free(p.name);
+            self.allocator.free(entry.value_ptr.parameters);
+        }
+        entry.value_ptr.* = .{
+            .name = entry.key_ptr.*,
             .description = tool.description,
             .parameters = params,
             .timeout_ms = tool.timeout_ms,
@@ -206,7 +236,6 @@ pub const SkillRegistry = struct {
             .action = tool.action,
             .handler = tool.handler,
         };
-        self.tools.putAssumeCapacity(key, owned);
     }
 
     /// Get a tool definition by name.
@@ -512,6 +541,57 @@ test "SkillRegistry cooperative deadline" {
     try std.testing.expectError(error.ToolTimeout, reg.dispatch("slow", &ctx, .null));
 }
 
+test "re-registering a name replaces the tool without leaking its parameters" {
+    const allocator = std.testing.allocator;
+    var reg = SkillRegistry.init(allocator, std.testing.io);
+    defer reg.deinit();
+
+    const first_params = [_]Param{.{ .name = "text", .type = .string, .description = "t", .required = true }};
+    const second_params = [_]Param{
+        .{ .name = "a", .type = .string, .description = "a" },
+        .{ .name = "b", .type = .number, .description = "b" },
+    };
+
+    try reg.register(.{ .name = "dup", .description = "first", .parameters = &first_params, .handler = firstHandler });
+    try reg.register(.{ .name = "dup", .description = "second", .parameters = &second_params, .handler = secondHandler });
+
+    try std.testing.expectEqual(@as(usize, 1), reg.count());
+    const tool = reg.get("dup").?;
+    try std.testing.expectEqualStrings("second", tool.description);
+    try std.testing.expectEqualStrings("dup", tool.name);
+    try std.testing.expectEqual(@as(usize, 2), tool.parameters.len);
+    try std.testing.expectEqualStrings("a", tool.parameters[0].name);
+    try std.testing.expectEqualStrings("b", tool.parameters[1].name);
+    try std.testing.expectEqual(Param.Type.number, tool.parameters[1].type);
+    try std.testing.expect(!tool.parameters[0].required);
+
+    var ctx = SkillContext{ .allocator = allocator };
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    defer parsed.deinit();
+    const result = try reg.dispatch("dup", &ctx, parsed.value);
+    try std.testing.expectEqualStrings("second", result.string);
+}
+
+test "register grows past the initCapacity hint instead of dropping an entry" {
+    const allocator = std.testing.allocator;
+    // The hint is a hint, not a limit: the builtin catalog registers 22 tools and
+    // an application module can add more to the same registry.
+    var reg = SkillRegistry.initCapacity(allocator, std.testing.io, 4);
+    defer reg.deinit();
+
+    const names = [_][]const u8{ "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8" };
+    for (names) |n| {
+        try reg.register(.{
+            .name = n,
+            .description = n,
+            .parameters = &.{.{ .name = "p", .type = .string, .description = "p" }},
+            .handler = pingHandler,
+        });
+    }
+    try std.testing.expectEqual(names.len, reg.count());
+    for (names) |n| try std.testing.expect(reg.get(n) != null);
+}
+
 // ─────────────────────────────────────────────────
 // Policy audit — declared classes vs. a policy (guard.zig)
 // ─────────────────────────────────────────────────
@@ -671,6 +751,14 @@ test "auditPolicy: an execute-only allow list is a class blind spot isInert() mi
 fn pingHandler(ctx: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
     _ = ctx;
     return .{ .string = "pong" };
+}
+
+fn firstHandler(_: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+    return .{ .string = "first" };
+}
+
+fn secondHandler(_: *SkillContext, _: std.json.Value) anyerror!std.json.Value {
+    return .{ .string = "second" };
 }
 
 fn echoHandler(ctx: *SkillContext, args: std.json.Value) anyerror!std.json.Value {

@@ -105,6 +105,10 @@ pub const MemoryStore = struct {
 
     /// Recall facts matching a logical key prefix, scoped to tenant+user.
     /// Caller owns returned ArrayList memory.
+    ///
+    /// All-or-nothing: an allocation failure returns the error with the store
+    /// **unchanged** — no entry is marked as accessed for a call that did not
+    /// hand back a result.
     pub fn recall(
         self: *MemoryStore,
         allocator: std.mem.Allocator,
@@ -115,30 +119,60 @@ pub const MemoryStore = struct {
         self.mutex.lock(self.io) catch return error.LockFailed;
         defer self.mutex.unlock(self.io);
 
-        var result = std.ArrayList(MemoryEntry).empty;
         const now = Time.monotonicNowSeconds();
+        var result = std.ArrayList(MemoryEntry).empty;
+        errdefer {
+            for (result.items) |e| {
+                allocator.free(e.key);
+                allocator.free(e.value);
+            }
+            result.deinit(allocator);
+        }
 
+        // Collect first, bump the access counters afterwards: the old loop wrote
+        // `access_count`/`last_accessed_at` as it went, so a mid-loop allocation
+        // failure returned an error with the entries it had already walked
+        // marked as accessed (red: `ai.memory.test.recall leaves the store
+        // untouched when an allocation fails`). Nothing mutates between the two
+        // walks, so this one resets exactly the entries the first one returned.
         var it = self.entries.iterator();
         while (it.next()) |entry| {
             const e = entry.value_ptr;
-            if (e.tenant_id != tenant_id and tenant_id != 0) continue;
-            if (e.user_id != user_id and user_id != 0) continue;
-            if (key_prefix.len > 0 and !std.mem.startsWith(u8, e.key, key_prefix)) continue;
+            if (!matchesScope(e, key_prefix, tenant_id, user_id)) continue;
 
-            e.access_count += 1;
-            e.last_accessed_at = now;
+            const owned_key = try allocator.dupe(u8, e.key);
+            errdefer allocator.free(owned_key);
+            const owned_value = try allocator.dupe(u8, e.value);
+            errdefer allocator.free(owned_value);
 
             try result.append(allocator, .{
-                .key = try allocator.dupe(u8, e.key),
-                .value = try allocator.dupe(u8, e.value),
+                .key = owned_key,
+                .value = owned_value,
                 .tenant_id = e.tenant_id,
                 .user_id = e.user_id,
                 .created_at = e.created_at,
-                .access_count = e.access_count,
-                .last_accessed_at = e.last_accessed_at,
+                .access_count = e.access_count + 1,
+                .last_accessed_at = now,
             });
         }
+
+        var bump = self.entries.iterator();
+        while (bump.next()) |entry| {
+            const e = entry.value_ptr;
+            if (!matchesScope(e, key_prefix, tenant_id, user_id)) continue;
+            e.access_count += 1;
+            e.last_accessed_at = now;
+        }
         return result;
+    }
+
+    /// The scope test `recall` applies both when collecting and when bumping —
+    /// shared so the two walks cannot drift apart.
+    fn matchesScope(e: *const MemoryEntry, key_prefix: []const u8, tenant_id: i64, user_id: i64) bool {
+        if (e.tenant_id != tenant_id and tenant_id != 0) return false;
+        if (e.user_id != user_id and user_id != 0) return false;
+        if (key_prefix.len > 0 and !std.mem.startsWith(u8, e.key, key_prefix)) return false;
+        return true;
     }
 
     /// Remove memory for logical key scoped to tenant+user.
@@ -475,6 +509,29 @@ test "MemoryStore dumpJson loadJson roundtrip" {
     }
     try std.testing.expectEqual(@as(usize, 1), results.items.len);
     try std.testing.expectEqualStrings("zh", results.items[0].value);
+}
+
+test "recall leaves the store untouched when an allocation fails" {
+    const a = std.testing.allocator;
+    var store = MemoryStore.init(a, std.testing.io);
+    defer store.deinit();
+
+    try store.remember("user:pref:a", "1", 1, 42);
+    try store.remember("user:pref:b", "2", 1, 42);
+    try store.remember("user:pref:c", "3", 1, 42);
+
+    const before = try store.dumpJson(a);
+    defer a.free(before);
+
+    // The 4th allocation fails: one entry has already been appended to the
+    // result (and, before the fix, the entries walked so far had already had
+    // their access counters bumped).
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 3 });
+    try std.testing.expectError(error.OutOfMemory, store.recall(failing.allocator(), "user:pref", 1, 42));
+
+    const after = try store.dumpJson(a);
+    defer a.free(after);
+    try std.testing.expectEqualStrings(before, after);
 }
 
 test "MemoryStore saveToFile loadFromFile" {

@@ -116,11 +116,18 @@ pub const AutoInstrumentation = struct {
     }
 
     /// Record event published (with trace)
+    ///
+    /// Span ownership: `startTrace` copies the name into the span and hands the
+    /// caller the `*Span`; the name slice passed in stays the caller's, so it is
+    /// freed here. The returned span stays in the tracer's active list until it
+    /// is ended — a span still listed at `tracer.deinit()` is freed there.
     pub fn recordEventPublished(self: *Self, event_name: []const u8, module_name: []const u8) !?*DistributedTracer.Span {
         self.event_published_total.inc();
 
         // Create trace span
-        const span = try self.tracer.startTrace(try std.fmt.allocPrint(self.allocator, "event_publish:{s}", .{event_name}));
+        const span_name = try std.fmt.allocPrint(self.allocator, "event_publish:{s}", .{event_name});
+        defer self.allocator.free(span_name);
+        const span = try self.tracer.startTrace(span_name);
         errdefer {
             span.deinit(self.allocator);
             self.allocator.destroy(span);
@@ -136,14 +143,20 @@ pub const AutoInstrumentation = struct {
     }
 
     /// Record event consumed (with trace)
+    ///
+    /// Ownership is the same as `recordEventPublished`: the span name is copied
+    /// by `startTrace`/`startSpan` and freed here, the returned span is the
+    /// caller's only after `endSpan` un-lists it.
     pub fn recordEventConsumed(self: *Self, event_name: []const u8, module_name: []const u8, parent_span: ?*DistributedTracer.Span) !?*DistributedTracer.Span {
         self.event_consumed_total.inc();
 
         // Create trace span
+        const span_name = try std.fmt.allocPrint(self.allocator, "event_consume:{s}", .{event_name});
+        defer self.allocator.free(span_name);
         const span = if (parent_span) |parent|
-            try self.tracer.startSpan(parent, try std.fmt.allocPrint(self.allocator, "event_consume:{s}", .{event_name}))
+            try self.tracer.startSpan(parent, span_name)
         else
-            try self.tracer.startTrace(try std.fmt.allocPrint(self.allocator, "event_consume:{s}", .{event_name}));
+            try self.tracer.startTrace(span_name);
 
         errdefer {
             span.deinit(self.allocator);
@@ -159,7 +172,13 @@ pub const AutoInstrumentation = struct {
         return span;
     }
 
-    /// Record event processing complete
+    /// Record event processing complete.
+    ///
+    /// Ends the span — which only un-lists it from the tracer — so the caller
+    /// keeps the storage and must release it (`span.deinit(self.allocator)` +
+    /// `self.allocator.destroy(span)`) once nothing else needs the readings.
+    /// A span that is never ended stays the tracer's and is freed by
+    /// `tracer.deinit()`.
     pub fn recordEventProcessed(self: *Self, span: *DistributedTracer.Span, duration_seconds: f64, success: bool) void {
         self.event_processing_duration.observe(duration_seconds);
 
@@ -177,11 +196,15 @@ pub const AutoInstrumentation = struct {
         });
     }
 
-    /// Record API call start (with trace)
+    /// Record API call start (with trace).
+    ///
+    /// Same name/span ownership as `recordEventPublished`.
     pub fn recordApiRequestStart(self: *Self, api_name: []const u8, module_name: []const u8) !*DistributedTracer.Span {
         self.api_request_total.inc();
 
-        const span = try self.tracer.startTrace(try std.fmt.allocPrint(self.allocator, "api:{s}", .{api_name}));
+        const span_name = try std.fmt.allocPrint(self.allocator, "api:{s}", .{api_name});
+        defer self.allocator.free(span_name);
+        const span = try self.tracer.startTrace(span_name);
         errdefer {
             span.deinit(self.allocator);
             self.allocator.destroy(span);
@@ -193,7 +216,10 @@ pub const AutoInstrumentation = struct {
         return span;
     }
 
-    /// Record API call complete
+    /// Record API call complete.
+    ///
+    /// Ends the span; the caller keeps ownership of the storage afterwards (see
+    /// `recordEventProcessed`).
     pub fn recordApiRequestEnd(self: *Self, span: *DistributedTracer.Span, duration_seconds: f64, success: bool) void {
         self.api_request_duration.observe(duration_seconds);
 
@@ -218,6 +244,11 @@ pub const AutoInstrumentation = struct {
     /// The elapsed time is log-only: no histogram of its own is observed here
     /// (`module_init_duration` / `event_processing_duration` /
     /// `api_request_duration` are recorded by their respective callers).
+    ///
+    /// `name` is only read (`startTrace` copies it), so the caller keeps it; the
+    /// span itself is ended, deinit'ed and destroyed here, since this function
+    /// is the one that allocated it. It is the reference for the ownership rule
+    /// the other span helpers document.
     pub fn instrumentFunction(
         self: *Self,
         name: []const u8,
@@ -331,6 +362,11 @@ pub const InstrumentedEventListener = struct {
         };
     }
 
+    /// Frees the map keys (one allocation per map — see `onEventConsumeStart`).
+    /// Span values are not touched: the listener holds no span that it also
+    /// released, because an ended span is freed by `onEventConsumeEnd` and an
+    /// un-ended one is still in the tracer's active list, which frees it at
+    /// `tracer.deinit()`.
     pub fn deinit(self: *Self) void {
         var span_iter = self.event_processing_spans.iterator();
         while (span_iter.next()) |entry| {
@@ -351,24 +387,35 @@ pub const InstrumentedEventListener = struct {
         const span = try self.instrumentation.recordEventPublished(event_name, module_name);
         if (span) |s| {
             const key = try std.fmt.allocPrint(self.event_processing_spans.allocator, "{s}:{s}", .{ event_name, module_name });
+            errdefer self.event_processing_spans.allocator.free(key);
             try self.event_processing_spans.put(key, s);
         }
     }
 
     /// Called on event consumption start
+    ///
+    /// Both maps are keyed by the *same* string, but each holds its own copy:
+    /// `deinit` and `onEventConsumeEnd` free one key per entry, so a shared
+    /// pointer would be freed twice.
     pub fn onEventConsumeStart(self: *Self, event_name: []const u8, module_name: []const u8) !void {
+        const allocator = self.event_processing_spans.allocator;
+
         // Look up publish-time span as parent
-        const pub_key = try std.fmt.allocPrint(self.event_processing_spans.allocator, "{s}:{s}", .{ event_name, module_name });
-        defer self.event_processing_spans.allocator.free(pub_key);
+        const pub_key = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ event_name, module_name });
+        defer allocator.free(pub_key);
         const parent_span = self.event_processing_spans.get(pub_key);
 
         const span = try self.instrumentation.recordEventConsumed(event_name, module_name, parent_span);
 
         if (span) |s| {
-            const key = try std.fmt.allocPrint(self.event_processing_spans.allocator, "consume:{s}:{s}", .{ event_name, module_name });
+            const key = try std.fmt.allocPrint(allocator, "consume:{s}:{s}", .{ event_name, module_name });
+            errdefer allocator.free(key);
+            const start_key = try allocator.dupe(u8, key);
+            errdefer allocator.free(start_key);
+
             try self.event_processing_spans.put(key, s);
             // Nanoseconds from the same clock `onEventConsumeEnd` reads.
-            try self.event_start_times.put(key, Time.monotonicNow());
+            try self.event_start_times.put(start_key, Time.monotonicNow());
         }
     }
 
@@ -380,27 +427,45 @@ pub const InstrumentedEventListener = struct {
     /// here costs one duration sample and leaves the span's map entry to
     /// `deinit` — the same trade `recordApiRequestEnd` makes for a dropped span
     /// event, which is why it logs at the same level.
+    ///
+    /// On the happy path the span is also released here: `recordEventProcessed`
+    /// ends it, which un-lists it from the tracer, so from that point the
+    /// listener is the only owner. A span left in the map by an early return is
+    /// still listed in the tracer, which frees it at `tracer.deinit()`.
     pub fn onEventConsumeEnd(self: *Self, event_name: []const u8, module_name: []const u8, success: bool) void {
-        const key = std.fmt.allocPrint(self.event_start_times.allocator, "consume:{s}:{s}", .{ event_name, module_name }) catch |err| {
+        const allocator = self.event_start_times.allocator;
+
+        const key = std.fmt.allocPrint(allocator, "consume:{s}:{s}", .{ event_name, module_name }) catch |err| {
             std.log.debug("[metrics] event consume end dropped ({s}); the span stays un-ended", .{@errorName(err)});
             return;
         };
-        defer self.event_start_times.allocator.free(key);
+        defer allocator.free(key);
 
-        const start_ns = self.event_start_times.get(key) orelse {
+        const span_entry = self.event_processing_spans.fetchRemove(key) orelse {
             // `onEventConsumeStart` writes both maps under this key, so this is
             // unreachable through the public API; treat it like the allocation
             // failure above (say so, record nothing) instead of measuring from a
             // zero origin.
+            std.log.debug("[metrics] event consume end dropped (no span for {s}); nothing recorded", .{key});
+            return;
+        };
+
+        const start_entry = self.event_start_times.fetchRemove(key) orelse {
+            // Same unreachable case, other half: hand the span back to the
+            // tracer (it was never ended, so `tracer.deinit` still owns it)
+            // rather than ending and freeing it without a start timestamp.
+            allocator.free(span_entry.key);
             std.log.debug("[metrics] event consume end dropped (no start timestamp for {s}); the span stays un-ended", .{key});
             return;
         };
 
-        if (self.event_processing_spans.get(key)) |span| {
-            self.instrumentation.recordEventProcessed(span, elapsedSecondsSince(start_ns), success);
-            _ = self.event_processing_spans.remove(key);
-            _ = self.event_start_times.remove(key);
-        }
+        allocator.free(span_entry.key);
+        allocator.free(start_entry.key);
+
+        self.instrumentation.recordEventProcessed(span_entry.value, elapsedSecondsSince(start_entry.value), success);
+
+        span_entry.value.deinit(allocator);
+        allocator.destroy(span_entry.value);
     }
 };
 
@@ -501,13 +566,10 @@ test "InstrumentedLifecycleListener records a measured duration" {
 test "InstrumentedEventListener records a measured duration" {
     const testing = std.testing;
 
-    // Arena on purpose: `InstrumentedEventListener` hands its spans to the
-    // tracer's active list and drops the map keys it removes, so a
-    // `testing.allocator` run would fail on those pre-existing leaks rather
-    // than on the timing under test here.
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
+    // No arena: this listener's spans and map keys are checked by
+    // `testing.allocator` here, so a leak in publish → consume-start →
+    // consume-end fails the test as well as the timing assertions below do.
+    const allocator = testing.allocator;
 
     var metrics = PrometheusMetrics.init(allocator);
     defer metrics.deinit();
@@ -530,4 +592,88 @@ test "InstrumentedEventListener records a measured duration" {
     const recorded = instrumentation.event_processing_duration.sum();
     try testing.expect(recorded >= measured_wait_seconds);
     try testing.expect(recorded < measured_wait_ceiling_seconds);
+}
+
+test "InstrumentedEventListener deinit releases an unended consume" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var metrics = PrometheusMetrics.init(allocator);
+    defer metrics.deinit();
+
+    var tracer = try DistributedTracer.init(allocator, "test_tracer", "test_service");
+    defer tracer.deinit();
+
+    var instrumentation = try AutoInstrumentation.init(allocator, &metrics, &tracer);
+
+    var listener = InstrumentedEventListener.init(allocator, &instrumentation);
+    defer listener.deinit();
+
+    // Published and never consumed: `deinit` frees the publish key, and the
+    // span is still in the tracer's active list, which is what frees it.
+    try listener.onEventPublished("order.created", "orders");
+
+    // Consumed and never ended: both maps hold a `consume:…` key, one
+    // allocation each, so `deinit` frees two keys and never the same one twice.
+    // The span stays un-ended, so the tracer still owns it.
+    try listener.onEventConsumeStart("order.created", "orders");
+    try testing.expectEqual(@as(usize, 2), tracer.active_spans.items.len);
+}
+
+const FunctionProbe = struct {
+    fn ok() anyerror!u32 {
+        return 7;
+    }
+};
+
+test "instrumentFunction frees its span and leaves the name to the caller" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var metrics = PrometheusMetrics.init(allocator);
+    defer metrics.deinit();
+
+    var tracer = try DistributedTracer.init(allocator, "test_tracer", "test_service");
+    defer tracer.deinit();
+
+    var instrumentation = try AutoInstrumentation.init(allocator, &metrics, &tracer);
+
+    // Static name: `startTrace` copies it, so nothing is allocated for it here.
+    const name = "probe.work";
+    try testing.expectEqual(@as(u32, 7), try instrumentation.instrumentFunction(name, u32, FunctionProbe.ok));
+
+    // The span was ended, so it is not left for `tracer.deinit` to free:
+    // `instrumentFunction` destroyed it, and the `testing.allocator` run reports
+    // the leak if it had not.
+    try testing.expectEqual(@as(usize, 0), tracer.active_spans.items.len);
+    // Elapsed time here is log-only, per the doc comment.
+    try testing.expectEqual(@as(u64, 0), instrumentation.api_request_duration.totalCount());
+
+    // The failing path (same `defer`, plus an `error.type` attribute) is not
+    // driven here: it logs with `std.log.err`, and `scripts/test-runner.zig`
+    // fails a run in which anything logged at that level.
+}
+
+test "recordApiRequestEnd leaves the span to the caller" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var metrics = PrometheusMetrics.init(allocator);
+    defer metrics.deinit();
+
+    var tracer = try DistributedTracer.init(allocator, "test_tracer", "test_service");
+    defer tracer.deinit();
+
+    var instrumentation = try AutoInstrumentation.init(allocator, &metrics, &tracer);
+
+    const span = try instrumentation.recordApiRequestStart("GET /orders", "orders");
+    instrumentation.recordApiRequestEnd(span, 0.01, false);
+
+    // `endSpan` only un-lists the span, so from here the caller owns the storage.
+    try testing.expectEqual(@as(usize, 0), tracer.active_spans.items.len);
+    span.deinit(allocator);
+    allocator.destroy(span);
+
+    try testing.expectEqual(@as(u64, 1), instrumentation.api_request_duration.totalCount());
+    try testing.expectEqual(@as(u64, 1), instrumentation.api_error_total.get());
 }
