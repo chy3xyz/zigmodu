@@ -20,7 +20,7 @@
 //!   §5  Pluggable auth backends —— AuthBackend and authFromCatalog (catalog = sole bypass truth)
 //!   §6  Token extraction, JWT backend & tenant resolver —— extract*, jwtBackend*, tenantResolver
 //!   §7  Module gate & permission gate —— moduleGate, permissionMatches*, permissionGate*
-//!   §8  CSRF & security headers —— csrf, defaultSecurityHeaders, securityHeaders
+//!   §8  CSRF & security headers —— csrf, defaultSecurityHeaders, securityHeaders, defaultCsp
 //!   §9  Tests —— auth / CORS / CSRF / gate unit tests
 //!
 //! Every section carries a matching `// ==== §N ... ====` anchor — `grep "§4"` jumps there.
@@ -1060,9 +1060,51 @@ pub fn permissionGateWith(slot: *comptime_router.CatalogSlot, config: Permission
 
 // ==== §8  CSRF & security headers ====
 
-/// CSRF protection using double-submit cookie pattern.
-/// GET/HEAD/OPTIONS pass through. State-changing methods require
-/// X-CSRF-Token header to match the csrf_token cookie value.
+/// Constant-time byte-slice comparison for CSRF tokens.
+///
+/// Zig 0.17's `std.crypto.timing_safe.eql` only accepts arrays/vectors, so the
+/// slice loop is spelled out here (the same shape as `security.PasswordEncoder`).
+/// The value a client sends must not decide how long the check takes beyond the
+/// single "all bytes equal" bit — that bit is the accept/reject decision itself.
+fn constantTimeEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var diff: u8 = 0;
+    for (a, 0..) |x, i| diff |= x ^ b[i];
+    // `diff -% 1` borrows to 0xFF exactly when every byte matched; widening to
+    // u16 and shifting by 8 turns that into the branchless answer.
+    const widened: u16 = diff;
+    return (widened -% 1) >> 8 != 0;
+}
+
+/// CSRF protection: double-submit cookie **plus** an Origin/Referer gate.
+///
+/// GET/HEAD/OPTIONS pass through. State-changing methods require an
+/// `X-CSRF-Token` header matching the `csrf_token` cookie — compared in
+/// constant time — and, when the request carries `Origin` (or a degraded
+/// `Referer`), a value naming this server.
+///
+/// Why the origin gate: plain double-submit is only as strong as the cookie
+/// jar. Anyone who can write `csrf_token` on the parent domain — a sibling
+/// app, a taken-over subdomain, any page that forgot `__Host-` / domain
+/// scoping — can forge both halves of the pair, so the token check alone does
+/// not stop a cross-site POST. `Origin` is set by the browser and cannot be
+/// forged by page script, so comparing it closes that path.
+///
+/// Requests with neither header keep the token-only behaviour: CLIs, cron
+/// jobs, server-to-server callers and most test harnesses send no `Origin`
+/// (browsers always do for a cross-site POST), and rejecting them would be a
+/// wire-level break, not a security win.
+///
+/// Deployment note: the comparison is against `Host` (and `X-Forwarded-Host`,
+/// see `csrfOriginAllowed`). A reverse proxy that rewrites `Host` to an
+/// upstream name must forward the client's host as `X-Forwarded-Host`, or
+/// state-changing browser requests are refused.
+///
+/// The token is deliberately **not** signed/HMAC-bound to the session. A
+/// session-bound token (`nonce.hmac(nonce, session_key)`) would close the same
+/// hole without depending on `Origin` — and is the better long-term design —
+/// but it changes the format every client must mint and echo, so it needs a
+/// migration of its own rather than a silent change here.
 pub fn csrf() api.Middleware {
     return .{
         .func = struct {
@@ -1070,6 +1112,10 @@ pub fn csrf() api.Middleware {
                 switch (ctx.method) {
                     .GET, .HEAD, .OPTIONS => return next(ctx),
                     else => {
+                        if (!csrfOriginAllowed(ctx)) {
+                            try ctx.sendError(403, "CSRF origin mismatch");
+                            return;
+                        }
                         const header_token = ctx.header("x-csrf-token") orelse "";
                         const cookie_header = ctx.header("cookie") orelse "";
                         // Extract csrf_token=... from Cookie header
@@ -1079,7 +1125,7 @@ pub fn csrf() api.Middleware {
                             const trimmed = std.mem.trim(u8, part, " ");
                             if (std.mem.startsWith(u8, trimmed, "csrf_token=")) {
                                 const token = trimmed["csrf_token=".len..];
-                                if (std.mem.eql(u8, token, header_token) and token.len > 0) {
+                                if (token.len > 0 and constantTimeEql(token, header_token)) {
                                     cookie_match = true;
                                 }
                                 break;
@@ -1097,14 +1143,166 @@ pub fn csrf() api.Middleware {
     };
 }
 
+/// `scheme` + authority split out of an `Origin`/`Referer` value.
+const OriginValue = struct { scheme: []const u8, host: []const u8 };
+
+/// Parse `scheme://host[:port]` out of `Origin` / `Referer`.
+///
+/// `null` for anything that is not a plain http(s) origin — including the
+/// literal `null` a sandboxed iframe (or a `data:` / `file:` page) sends, which
+/// is a shape only a hostile embedding produces.
+fn parseOrigin(raw: []const u8) ?OriginValue {
+    const trimmed = std.mem.trim(u8, raw, " \t");
+    // `Origin` holds a single value; a proxy that rewrites headers may append a
+    // list, in which case the first entry is the originating one.
+    const value = if (std.mem.indexOfScalar(u8, trimmed, ',')) |comma|
+        std.mem.trim(u8, trimmed[0..comma], " \t")
+    else
+        trimmed;
+    if (value.len == 0 or std.mem.eql(u8, value, "null")) return null;
+
+    const sep = std.mem.indexOf(u8, value, "://") orelse return null;
+    const scheme = value[0..sep];
+    if (!std.ascii.eqlIgnoreCase(scheme, "http") and !std.ascii.eqlIgnoreCase(scheme, "https")) return null;
+
+    var rest = value[sep + 3 ..];
+    // `Referer` is a full URL; keep only the authority.
+    if (std.mem.indexOfAny(u8, rest, "/?#")) |end| rest = rest[0..end];
+    if (rest.len == 0) return null;
+    // `user@host` never appears in a browser-sent origin and would hide the
+    // real host behind a decoy one.
+    if (std.mem.indexOfScalar(u8, rest, '@') != null) return null;
+    return .{ .scheme = scheme, .host = rest };
+}
+
+const HostPort = struct { host: []const u8, port: ?[]const u8 };
+
+/// Split `host[:port]`, keeping IPv6 literals (`[::1]:8080`) intact and
+/// dropping a trailing DNS dot.
+fn splitHostPort(raw: []const u8) HostPort {
+    var h = std.mem.trim(u8, raw, " \t");
+    var port: ?[]const u8 = null;
+    if (h.len > 1 and h[0] == '[') {
+        if (std.mem.indexOfScalar(u8, h, ']')) |close| {
+            if (close + 1 < h.len and h[close + 1] == ':') port = h[close + 2 ..];
+            h = h[0 .. close + 1];
+        }
+    } else if (std.mem.lastIndexOfScalar(u8, h, ':')) |colon| {
+        // Exactly one `:` separates a port. Several means an unbracketed IPv6
+        // address, which is not a legal `Host` value: leave it whole (it then
+        // simply fails to match anything) instead of guessing where the split is.
+        if (std.mem.indexOfScalar(u8, h, ':').? == colon) {
+            port = h[colon + 1 ..];
+            h = h[0..colon];
+        }
+    }
+    if (port) |p| {
+        if (p.len == 0) port = null;
+    }
+    while (h.len > 1 and h[h.len - 1] == '.') h = h[0 .. h.len - 1];
+    return .{ .host = h, .port = port };
+}
+
+/// Same host and same effective port? Browsers omit default ports from
+/// `Origin`; proxies routinely leave `:443` in `Host`, so `example.com:443`
+/// and `https://example.com` must count as one origin.
+fn hostMatches(expected_raw: []const u8, origin_host_raw: []const u8, origin_scheme: []const u8) bool {
+    const expected = splitHostPort(expected_raw);
+    const origin = splitHostPort(origin_host_raw);
+    if (!std.ascii.eqlIgnoreCase(expected.host, origin.host)) return false;
+    const default_port = if (std.ascii.eqlIgnoreCase(origin_scheme, "https")) "443" else "80";
+    return std.mem.eql(u8, expected.port orelse default_port, origin.port orelse default_port);
+}
+
+/// Match the origin against a comma-separated proxy host list
+/// (`X-Forwarded-Host`): any entry may be the one a fronting proxy set.
+fn forwardedHostMatches(list: []const u8, origin_host: []const u8, origin_scheme: []const u8) bool {
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |part| {
+        const candidate = std.mem.trim(u8, part, " \t");
+        if (candidate.len == 0) continue;
+        if (hostMatches(candidate, origin_host, origin_scheme)) return true;
+    }
+    return false;
+}
+
+/// A header value, treating a blank one as absent: `Origin:` with an empty
+/// value is how some clients spell "not applicable", and the `Referer`
+/// fallback should still get its turn.
+fn nonBlank(value: ?[]const u8) ?[]const u8 {
+    const v = value orelse return null;
+    return if (std.mem.trim(u8, v, " \t").len > 0) v else null;
+}
+
+/// First non-empty entry of a comma-separated proxy header value.
+fn firstForwardedValue(raw: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |part| {
+        const value = std.mem.trim(u8, part, " \t");
+        if (value.len > 0) return value;
+    }
+    return null;
+}
+
+/// Origin/Referer gate for state-changing requests.
+///
+/// `true` when the request carries neither header (see `csrf`), or when the
+/// browser-supplied origin names a host this server answers for. Any candidate
+/// host that is present must match: a *positive* mismatch rejects, while a
+/// request with no `Host` at all (HTTP/1.0 shape, bare test context) is left to
+/// the token check rather than refused.
+///
+/// `X-Forwarded-Host` / `X-Forwarded-Proto` are honoured because the Context
+/// carries no TLS or listener identity of its own — behind a TLS-terminating
+/// proxy the backend name (`127.0.0.1:8080`) would otherwise never equal the
+/// browser's origin. Trusting them is a real boundary: a browser can only set
+/// them when the app's CORS policy allows those header names (a non-simple
+/// request is preflighted), so keep `CorsConfig.allow_headers` narrow.
+fn csrfOriginAllowed(ctx: *api.Context) bool {
+    const raw = nonBlank(ctx.header("origin")) orelse nonBlank(ctx.header("referer")) orelse return true;
+    const origin = parseOrigin(raw) orelse return false;
+
+    // Scheme is checkable only when a proxy told us the client-facing one:
+    // without that header the framework has no view of TLS, and the host check
+    // below is the load-bearing part.
+    if (ctx.header("x-forwarded-proto")) |proto| {
+        if (firstForwardedValue(proto)) |scheme| {
+            if (!std.ascii.eqlIgnoreCase(scheme, origin.scheme)) return false;
+        }
+    }
+
+    var have_candidate = false;
+    if (ctx.header("x-forwarded-host")) |forwarded| {
+        have_candidate = true;
+        if (forwardedHostMatches(forwarded, origin.host, origin.scheme)) return true;
+    }
+    if (ctx.header("host")) |host| {
+        have_candidate = true;
+        if (hostMatches(host, origin.host, origin.scheme)) return true;
+    }
+    return !have_candidate;
+}
+
 /// Security response header pair.
 pub const SecurityHeader = struct {
     name: []const u8,
     value: []const u8,
 };
 
+/// Baseline Content-Security-Policy carried by the opt-in `securityHeaders`
+/// middleware. See `defaultSecurityHeaders` for why it is *not* part of the
+/// data-only default set.
+pub const defaultCsp = "object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
+
 /// Production-grade default security headers (HSTS, frame/type protections,
-/// CSP, referrer policy).
+/// referrer policy) — deliberately **without** a Content-Security-Policy.
+///
+/// These are the headers that cannot change how a page renders, so they are
+/// safe to hand out as data (`zigmodu.security.defaultHeaders` aliases this
+/// set). A CSP is the one header that *can* break a working site — inline
+/// `<script>`, CDN assets, `data:` images all stop loading under a policy that
+/// does not name them — so it is not imposed here; an application that wants a
+/// policy opts into `securityHeaders`, which supplies `defaultCsp`.
 pub const defaultSecurityHeaders = [_]SecurityHeader{
     .{ .name = "Strict-Transport-Security", .value = "max-age=31536000; includeSubDomains" },
     .{ .name = "X-Frame-Options", .value = "DENY" },
@@ -1115,8 +1313,25 @@ pub const defaultSecurityHeaders = [_]SecurityHeader{
     .{ .name = "X-DNS-Prefetch-Control", .value = "off" },
 };
 
+/// `defaultSecurityHeaders` plus `defaultCsp` — what `securityHeaders(null)`
+/// installs, and the set `defaultCsp` is meant to be tightened from.
+pub const defaultSecurityHeadersWithCsp = defaultSecurityHeaders ++ [_]SecurityHeader{
+    .{ .name = "Content-Security-Policy", .value = defaultCsp },
+};
+
 /// Injects security response headers on every response. `null` uses the
-/// built-in defaults; pass a custom slice for a tailored policy.
+/// built-in defaults plus `defaultCsp`; pass a custom slice for a tailored
+/// policy (the middleware then sends exactly that slice — no CSP unless the
+/// caller included one).
+///
+/// The built-in CSP is the hardening subset that cannot break rendering:
+/// `object-src 'none'` (no plugin/`<embed>` documents), `base-uri 'self'`
+/// (an injected `<base href>` cannot move relative URLs off-site) and
+/// `frame-ancestors 'none'` (the CSP twin of the `X-Frame-Options: DENY`
+/// already in the defaults). No `default-src` / `script-src` / `style-src` /
+/// `form-action` here: those are policies only the application can get right —
+/// they decide whether its inline scripts, CDNs and payment redirect forms
+/// keep working. Add them by passing your own slice.
 ///
 /// One store per call (like `cors` / `moduleGate`): a function-level `var` would
 /// be process-wide, so a second `securityHeaders(custom)` in the same process
@@ -1131,7 +1346,7 @@ pub fn securityHeaders(headers: ?[]const SecurityHeader) api.Middleware {
         .func = struct {
             fn mw(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
                 const st: *const Store = @ptrCast(@alignCast(user_data.?));
-                const hdrs: []const SecurityHeader = if (st.headers.len > 0) st.headers else &defaultSecurityHeaders;
+                const hdrs: []const SecurityHeader = if (st.headers.len > 0) st.headers else &defaultSecurityHeadersWithCsp;
                 for (hdrs) |h| {
                     try ctx.setHeader(h.name, h.value);
                 }
@@ -1174,6 +1389,242 @@ test "csrf allows matching double-submit tokens" {
     }.h, null);
     try std.testing.expect(State.reached);
     try std.testing.expectEqual(@as(u16, 200), ctx.status_code);
+}
+
+test "csrf rejects a cross-origin Origin even with a matching double-submit token" {
+    const allocator = std.testing.allocator;
+    var ctx = try api.Context.init(allocator, .POST, "/api/orders");
+    defer ctx.deinit();
+    try putRequestHeader(&ctx, "cookie", "csrf_token=tok123");
+    try putRequestHeader(&ctx, "x-csrf-token", "tok123");
+    try putRequestHeader(&ctx, "host", "app.example.com");
+    try putRequestHeader(&ctx, "origin", "https://evil.example.com");
+
+    const S = struct {
+        var reached: bool = false;
+    };
+    S.reached = false;
+    const mw = csrf();
+    try mw.func(&ctx, struct {
+        fn n(c: *api.Context) anyerror!void {
+            _ = c;
+            S.reached = true;
+        }
+    }.n, null);
+
+    try std.testing.expectEqual(@as(u16, 403), ctx.status_code);
+    try std.testing.expect(ctx.responded);
+    try std.testing.expect(!S.reached);
+}
+
+test "csrf accepts same-origin Origin and leaves missing Origin/Referer alone" {
+    const allocator = std.testing.allocator;
+    const mw = csrf();
+    const next = struct {
+        fn n(_: *api.Context) anyerror!void {}
+    }.n;
+
+    // Same-origin: browser fetch/XHR from the site itself.
+    {
+        var ctx = try api.Context.init(allocator, .POST, "/api/orders");
+        defer ctx.deinit();
+        try putRequestHeader(&ctx, "cookie", "csrf_token=tok123");
+        try putRequestHeader(&ctx, "x-csrf-token", "tok123");
+        try putRequestHeader(&ctx, "host", "app.example.com");
+        try putRequestHeader(&ctx, "origin", "https://app.example.com");
+        try mw.func(&ctx, next, null);
+        try std.testing.expect(!ctx.responded);
+    }
+    // No Origin, no Referer: CLI / cron / server-to-server keep the old
+    // token-only behaviour (CSRF defends browsers, not these clients).
+    {
+        var ctx = try api.Context.init(allocator, .POST, "/api/orders");
+        defer ctx.deinit();
+        try putRequestHeader(&ctx, "cookie", "csrf_token=tok123");
+        try putRequestHeader(&ctx, "x-csrf-token", "tok123");
+        try mw.func(&ctx, next, null);
+        try std.testing.expect(!ctx.responded);
+    }
+    // Referer fallback carries a full URL, path included; the default port is
+    // omitted by browsers and often present in `Host`.
+    {
+        var ctx = try api.Context.init(allocator, .DELETE, "/api/orders/7");
+        defer ctx.deinit();
+        try putRequestHeader(&ctx, "cookie", "csrf_token=tok123");
+        try putRequestHeader(&ctx, "x-csrf-token", "tok123");
+        try putRequestHeader(&ctx, "host", "app.example.com:443");
+        try putRequestHeader(&ctx, "referer", "https://app.example.com/admin/orders?page=2");
+        try mw.func(&ctx, next, null);
+        try std.testing.expect(!ctx.responded);
+    }
+    // A blank `Origin:` counts as absent, so the same-origin Referer still gets
+    // its turn instead of the request being refused on an empty value.
+    {
+        var ctx = try api.Context.init(allocator, .PUT, "/api/orders/7");
+        defer ctx.deinit();
+        try putRequestHeader(&ctx, "cookie", "csrf_token=tok123");
+        try putRequestHeader(&ctx, "x-csrf-token", "tok123");
+        try putRequestHeader(&ctx, "host", "app.example.com");
+        try putRequestHeader(&ctx, "origin", "");
+        try putRequestHeader(&ctx, "referer", "https://app.example.com/admin/orders");
+        try mw.func(&ctx, next, null);
+        try std.testing.expect(!ctx.responded);
+    }
+}
+
+test "csrf rejects Origin null, decoy userinfo and a cross-host Referer" {
+    const allocator = std.testing.allocator;
+    const mw = csrf();
+    const next = struct {
+        fn n(_: *api.Context) anyerror!void {}
+    }.n;
+    // Each value is a shape a hostile page can produce (or a sandboxed iframe):
+    // `null`, an authority hiding behind userinfo, another host, garbage.
+    const bad_origins = [_][]const u8{
+        "null",
+        "https://app.example.com@evil.example.com",
+        "https://evil.example.com",
+        "https://evil.example.com:auth",
+        "app.example.com",
+    };
+    for (bad_origins) |bad| {
+        var ctx = try api.Context.init(allocator, .POST, "/api/orders");
+        defer ctx.deinit();
+        try putRequestHeader(&ctx, "cookie", "csrf_token=tok123");
+        try putRequestHeader(&ctx, "x-csrf-token", "tok123");
+        try putRequestHeader(&ctx, "host", "app.example.com");
+        try putRequestHeader(&ctx, "origin", bad);
+        try mw.func(&ctx, next, null);
+        try std.testing.expectEqual(@as(u16, 403), ctx.status_code);
+    }
+
+    var ctx = try api.Context.init(allocator, .POST, "/api/orders");
+    defer ctx.deinit();
+    try putRequestHeader(&ctx, "cookie", "csrf_token=tok123");
+    try putRequestHeader(&ctx, "x-csrf-token", "tok123");
+    try putRequestHeader(&ctx, "host", "app.example.com");
+    try putRequestHeader(&ctx, "referer", "https://evil.example.com/admin");
+    try mw.func(&ctx, next, null);
+    try std.testing.expectEqual(@as(u16, 403), ctx.status_code);
+}
+
+test "csrf compares against X-Forwarded-Host and X-Forwarded-Proto behind a proxy" {
+    const allocator = std.testing.allocator;
+    const mw = csrf();
+    const next = struct {
+        fn n(_: *api.Context) anyerror!void {}
+    }.n;
+
+    // TLS terminated in front: the backend sees 127.0.0.1, the browser sees
+    // https://app.example.com. The proxy headers make that same-origin.
+    {
+        var ctx = try api.Context.init(allocator, .POST, "/api/orders");
+        defer ctx.deinit();
+        try putRequestHeader(&ctx, "cookie", "csrf_token=tok123");
+        try putRequestHeader(&ctx, "x-csrf-token", "tok123");
+        try putRequestHeader(&ctx, "host", "127.0.0.1:8080");
+        try putRequestHeader(&ctx, "x-forwarded-host", "app.example.com");
+        try putRequestHeader(&ctx, "x-forwarded-proto", "https");
+        try putRequestHeader(&ctx, "origin", "https://app.example.com");
+        try mw.func(&ctx, next, null);
+        try std.testing.expect(!ctx.responded);
+    }
+    // The proxy says the request arrived over http while the browser claims
+    // https: not the same origin.
+    {
+        var ctx = try api.Context.init(allocator, .POST, "/api/orders");
+        defer ctx.deinit();
+        try putRequestHeader(&ctx, "cookie", "csrf_token=tok123");
+        try putRequestHeader(&ctx, "x-csrf-token", "tok123");
+        try putRequestHeader(&ctx, "host", "127.0.0.1:8080");
+        try putRequestHeader(&ctx, "x-forwarded-host", "app.example.com");
+        try putRequestHeader(&ctx, "x-forwarded-proto", "http");
+        try putRequestHeader(&ctx, "origin", "https://app.example.com");
+        try mw.func(&ctx, next, null);
+        try std.testing.expectEqual(@as(u16, 403), ctx.status_code);
+    }
+    // The proxy headers name the site; the browser says it is somewhere else.
+    {
+        var ctx = try api.Context.init(allocator, .POST, "/api/orders");
+        defer ctx.deinit();
+        try putRequestHeader(&ctx, "cookie", "csrf_token=tok123");
+        try putRequestHeader(&ctx, "x-csrf-token", "tok123");
+        try putRequestHeader(&ctx, "host", "127.0.0.1:8080");
+        try putRequestHeader(&ctx, "x-forwarded-host", "app.example.com");
+        try putRequestHeader(&ctx, "origin", "https://evil.example.com");
+        try mw.func(&ctx, next, null);
+        try std.testing.expectEqual(@as(u16, 403), ctx.status_code);
+    }
+}
+
+test "csrf blocks a cross-origin POST through the dispatch path" {
+    const allocator = std.testing.allocator;
+    const Testkit = @import("../http/Testkit.zig");
+    var server = api.Server.init(std.testing.io, allocator, 0);
+    defer server.deinit();
+    try server.addMiddleware(csrf());
+    var group = server.group("");
+    try group.post("orders", struct {
+        fn h(ctx: *api.Context) anyerror!void {
+            try ctx.jsonStruct(200, .{ .ok = true });
+        }
+    }.h, null);
+
+    const cross_origin = [_]Testkit.HeaderPair{
+        .{ "cookie", "csrf_token=tok123" },
+        .{ "x-csrf-token", "tok123" },
+        .{ "host", "app.example.com" },
+        .{ "origin", "https://evil.example.com" },
+    };
+    var resp = try Testkit.dispatchOpts(&server, .POST, "/orders", .{ .headers = &cross_origin });
+    defer resp.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 403), resp.status_code);
+
+    const same_origin = [_]Testkit.HeaderPair{
+        .{ "cookie", "csrf_token=tok123" },
+        .{ "x-csrf-token", "tok123" },
+        .{ "host", "app.example.com" },
+        .{ "origin", "https://app.example.com" },
+    };
+    var resp_ok = try Testkit.dispatchOpts(&server, .POST, "/orders", .{ .headers = &same_origin });
+    defer resp_ok.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 200), resp_ok.status_code);
+}
+
+test "SecurityHeader: defaults carry no CSP, securityHeaders(null) adds one" {
+    const allocator = std.testing.allocator;
+    const next = struct {
+        fn n(_: *api.Context) anyerror!void {}
+    }.n;
+
+    // The data-only default set is CSP-free: `security.defaultHeaders` (the
+    // alias below) is handed to callers that never opted into a policy.
+    for (defaultSecurityHeaders) |h| {
+        try std.testing.expect(!std.mem.eql(u8, h.name, "Content-Security-Policy"));
+    }
+    for (@import("../security/SecurityHeaders.zig").defaultHeaders) |h| {
+        try std.testing.expect(!std.mem.eql(u8, h.name, "Content-Security-Policy"));
+    }
+
+    // The opt-in middleware, default policy → CSP present.
+    {
+        const mw = securityHeaders(null);
+        var ctx = try api.Context.init(allocator, .GET, "/");
+        defer ctx.deinit();
+        try mw.func(&ctx, next, mw.user_data);
+        try std.testing.expectEqualStrings(defaultCsp, ctx.response_headers.get("Content-Security-Policy").?);
+        try std.testing.expect(ctx.response_headers.get("X-Frame-Options") != null);
+    }
+    // A caller-supplied slice replaces the whole set (CSP included, if wanted).
+    {
+        const custom = [_]SecurityHeader{.{ .name = "X-Policy-A", .value = "a" }};
+        const mw = securityHeaders(&custom);
+        var ctx = try api.Context.init(allocator, .GET, "/");
+        defer ctx.deinit();
+        try mw.func(&ctx, next, mw.user_data);
+        try std.testing.expect(ctx.response_headers.get("Content-Security-Policy") == null);
+        try std.testing.expect(ctx.response_headers.get("Strict-Transport-Security") == null);
+    }
 }
 
 test "securityHeaders injects defaults and calls through" {

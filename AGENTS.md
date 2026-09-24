@@ -267,7 +267,7 @@ pub fn deinit() void {}  // reverse order
   `check-production` 的熵扫描 + `audit` b24 已把「播种非加密 PRNG」纳入；豁免是**逐处**的人工评审，
   不落仓库目录白名单：`check-production` 看 `scripts/lib/zig-scan.awk` 的 `ENTROPY_OK` 表，`audit` 用
   `// audit: ignore b24 <缘由>`（测试固定种子做可复现属于正当用法）。
-- x402: fail-closed；dev 才注入 `verifyPaymentAllowAll`
+- x402: fail-closed；dev 才注入 `verifyPaymentAllowAll`。**`X402Store` 是台账不是校验器**：它只持久化发票并记录"每张恰好核销一次"，校验**始终**走 `X402Config.verifier`（配了 store 也一样）；把两者混同会让任意客户端自报 tx hash 就过关。
 
 ### Multi-tenancy (optional)
 - Default column `tenant_id`；ZigShop 风格用 `app_id`：

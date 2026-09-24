@@ -282,9 +282,13 @@ pub fn BorrowedRow(comptime T: type) type {
 /// Cursor fetch mode.
 pub const CursorMode = enum {
     /// Materialize all rows upfront. Rows remain valid until `cursor.deinit()`.
+    /// The connection is handed back to the pool immediately.
     buffered,
     /// Fetch rows lazily from the driver. The row returned by `next()` is only
-    /// valid until the next call to `next()` or `deinit()`.
+    /// valid until the next call to `next()` or `deinit()`. The cursor holds a
+    /// pooled connection until `deinit` (which drains the unconsumed tail of
+    /// the stream first) — so `deinit` before using the client for anything
+    /// else, and well before `Client.deinit`.
     streaming,
 };
 
@@ -308,14 +312,33 @@ pub const BatchInsertOptions = struct {
 };
 
 /// Streaming cursor over a query result set.
+///
+/// Ownership: a `.streaming` cursor reads from a live driver connection, so it
+/// holds onto it (`checkout`) until `deinit`, which drains whatever part of the
+/// result stream was not consumed and only then returns the connection to the
+/// pool. A cursor must therefore be `deinit`'d before its `Client` (`Client.deinit`
+/// tears the pool down — releasing into it afterwards writes to undefined
+/// memory), and no other statement may run on that client until it is: on the
+/// single-connection path (no pool) there is exactly one connection to
+/// interleave with.
 pub const Cursor = struct {
     state: State,
     pos: usize = 0,
+    /// Pooled connection this cursor owns until `deinit`; null for buffered
+    /// cursors (rows already materialized) and for the single-connection path
+    /// (that connection belongs to the `Client`, not to a pool).
+    checkout: ?Checkout = null,
 
     const State = union(enum) {
         buffered: Rows,
         streaming_mysql: MySqlCursor,
         streaming_pg: PgCursor,
+    };
+
+    /// A pool slot the cursor has to give back.
+    pub const Checkout = struct {
+        pool: *ConnPool,
+        conn: Conn,
     };
 
     pub fn init(rows: Rows) Cursor {
@@ -328,7 +351,29 @@ pub const Cursor = struct {
             .streaming_mysql => |*c| c.deinit(),
             .streaming_pg => |*c| c.deinit(),
         }
+        // The driver deinit above drained the rest of the result stream, so the
+        // connection is idle on the wire again — but only hand back one that is
+        // still usable. A stream that broke while draining (`ping` fails) is
+        // retired instead: re-pooling it would hand the next borrower a
+        // connection whose protocol state is unknown.
+        if (self.checkout) |co| {
+            if (co.conn.ping()) |_| {
+                co.pool.release(co.conn);
+            } else |_| {
+                co.pool.discard(co.conn);
+            }
+        }
         self.* = undefined;
+    }
+
+    /// True when rows are pulled from the driver on demand, i.e. this cursor
+    /// owns a live wire stream that only `deinit` may end. Drivers without
+    /// incremental fetch (sqlite) serve a `.streaming` request buffered.
+    pub fn isStreaming(self: *const Cursor) bool {
+        return switch (self.state) {
+            .buffered => false,
+            .streaming_mysql, .streaming_pg => true,
+        };
     }
 
     pub fn next(self: *Cursor) ?*Row {
@@ -364,6 +409,11 @@ const MySqlCursor = struct {
     eof: bool,
 
     fn deinit(self: *MySqlCursor) void {
+        // `mysql_free_result` on a `mysql_use_result` handle reads and discards
+        // the rows still on the wire — that is what returns the connection to
+        // an idle protocol state. Dropping it (or `mysql_store_result`-ing it
+        // first) would leave the next `mysql_real_query` reading this result
+        // set's frames.
         if (self.res) |r| libmysql_c.mysql_free_result(r);
         self.arena.deinit();
         self.* = undefined;
@@ -411,7 +461,24 @@ const PgCursor = struct {
     eof: bool,
 
     fn deinit(self: *PgCursor) void {
-        if (self.current) |r| libpq_c.PQclear(r);
+        // Abandoning the cursor early must not leave the connection mid-stream:
+        // libpq returns to an idle protocol state only once every result of the
+        // in-flight query has been fetched, which is why clearing `current`
+        // alone (the previous behavior) left the next borrower — `ping` only
+        // looks at `PQstatus`, which stays CONNECTION_OK — reading this query's
+        // leftover frames. `PQgetResult` blocks until the next result arrives
+        // and returns null at the end of the stream, so the loop below drains
+        // whatever `next()` did not consume. That drain is a full read of the
+        // remaining rows (not a cancel): dropping a cursor over a large scan
+        // costs reading the rest of it.
+        if (self.conn) |conn| {
+            if (self.current) |res| libpq_c.PQclear(res);
+            self.current = null;
+            while (libpq_c.PQgetResult(conn)) |res| libpq_c.PQclear(res);
+        } else if (self.current) |res| {
+            libpq_c.PQclear(res);
+            self.current = null;
+        }
         self.arena.deinit();
         self.* = undefined;
     }
@@ -475,14 +542,28 @@ pub const SqlDiagnostic = struct {
     column: ?[]const u8 = null,
 };
 
+/// SQLite extended result codes share their low 8 bits with the primary code
+/// (`sqlite3_errcode`). The call sites here pass the *extended* code so the log
+/// names the specific failure (2067 = SQLITE_CONSTRAINT_UNIQUE, 1299 = NOTNULL),
+/// which means every comparison against a primary code has to mask first — the
+/// unmasked `ext_code == 19` comparisons this used to be made the constraint
+/// paths (diagnosis, `error.ConstraintViolation`) dead on arrival.
+fn sqlitePrimaryCode(extended: i32) i32 {
+    return extended & 0xff;
+}
+
 /// Parse SQLite error message to extract table/column from constraint failures.
 pub fn diagnoseSqlite(err_code: i32, err_msg: []const u8) SqlDiagnostic {
     var diag = SqlDiagnostic{ .code = err_code, .message = err_msg };
 
-    if (err_code == 19) { // SQLITE_CONSTRAINT
-        // "UNIQUE constraint failed: table.column"
-        if (std.mem.indexOf(u8, err_msg, "UNIQUE constraint failed:")) |pos| {
-            const rest = std.mem.trim(u8, err_msg[pos + 24 ..], " \t\r\n");
+    if (sqlitePrimaryCode(err_code) == 19) { // SQLITE_CONSTRAINT
+        // "UNIQUE constraint failed: table.column" — the prefix lengths are
+        // taken from the literals: the hand-counted 24/26 here were one short
+        // (the trailing colon belongs to the prefix), so every diagnosed name
+        // carried a leading ':'.
+        const unique_prefix = "UNIQUE constraint failed:";
+        if (std.mem.indexOf(u8, err_msg, unique_prefix)) |pos| {
+            const rest = std.mem.trim(u8, err_msg[pos + unique_prefix.len ..], " \t\r\n");
             if (rest.len > 0) {
                 diag.constraint = rest;
                 if (std.mem.indexOf(u8, rest, ".")) |dot| {
@@ -494,8 +575,9 @@ pub fn diagnoseSqlite(err_code: i32, err_msg: []const u8) SqlDiagnostic {
             }
         }
         // "NOT NULL constraint failed: table.column"
-        if (std.mem.indexOf(u8, err_msg, "NOT NULL constraint failed:")) |pos| {
-            const rest = std.mem.trim(u8, err_msg[pos + 26 ..], " \t\r\n");
+        const notnull_prefix = "NOT NULL constraint failed:";
+        if (std.mem.indexOf(u8, err_msg, notnull_prefix)) |pos| {
+            const rest = std.mem.trim(u8, err_msg[pos + notnull_prefix.len ..], " \t\r\n");
             if (rest.len > 0) {
                 diag.constraint = rest;
                 if (std.mem.indexOf(u8, rest, ".")) |dot| {
@@ -506,10 +588,11 @@ pub fn diagnoseSqlite(err_code: i32, err_msg: []const u8) SqlDiagnostic {
                 }
             }
         }
-    } else if (err_code == 1) { // SQLITE_ERROR
+    } else if (sqlitePrimaryCode(err_code) == 1) { // SQLITE_ERROR
         // "no such table: xxx"
-        if (std.mem.indexOf(u8, err_msg, "no such table:")) |pos| {
-            const rest = std.mem.trim(u8, err_msg[pos + 14 ..], " \t\r\n");
+        const missing_prefix = "no such table:";
+        if (std.mem.indexOf(u8, err_msg, missing_prefix)) |pos| {
+            const rest = std.mem.trim(u8, err_msg[pos + missing_prefix.len ..], " \t\r\n");
             if (rest.len > 0) {
                 diag.table = rest;
             }
@@ -1124,7 +1207,7 @@ pub const SQLiteConn = struct {
             const err_msg = std.mem.span(sqlite3_c.sqlite3_errmsg(self.db));
             const ext_code = sqlite3_c.sqlite3_extended_errcode(self.db);
             const diag = diagnoseSqlite(ext_code, err_msg);
-            if (ext_code == 1 and std.mem.indexOf(u8, err_msg, "no such table") != null) { // SQLITE_ERROR + no such table
+            if (sqlitePrimaryCode(ext_code) == 1 and std.mem.indexOf(u8, err_msg, "no such table") != null) { // SQLITE_ERROR + no such table
                 std.log.err("SQLite not found: table={s}", .{diag.table orelse "?"});
                 return error.NotFound;
             }
@@ -1201,7 +1284,7 @@ pub const SQLiteConn = struct {
             const err_msg = std.mem.span(sqlite3_c.sqlite3_errmsg(self.db));
             const ext_code = sqlite3_c.sqlite3_extended_errcode(self.db);
             const diag = diagnoseSqlite(ext_code, err_msg);
-            if (ext_code == 19) { // SQLITE_CONSTRAINT
+            if (sqlitePrimaryCode(ext_code) == 19) { // SQLITE_CONSTRAINT
                 std.log.err("SQLite constraint violation: table={s} column={s} msg={s}", .{ diag.table orelse "?", diag.column orelse "?", err_msg });
                 return error.ConstraintViolation;
             }
@@ -4664,6 +4747,13 @@ pub const Client = struct {
     /// Query and return a Cursor with explicit fetch mode. `.buffered` (default)
     /// materializes all rows; `.streaming` fetches rows lazily and the row returned
     /// by `next()` is only valid until the next `next()`/`deinit()`.
+    ///
+    /// The cursor is the sole owner of the connection it reads from: a
+    /// `.streaming` cursor keeps a pooled connection checked out until
+    /// `deinit`, which drains the unconsumed tail of the result stream and only
+    /// then releases the connection (retiring it if the stream broke). Its
+    /// lifecycle therefore nests inside the client's — `deinit` the cursor
+    /// before `Client.deinit`.
     pub fn queryCursorEx(self: *Client, sql_str: []const u8, args: []const Value, opts: CursorOptions) !Cursor {
         // Read/write splitting (same fallback semantics as `query`, including
         // the primary-only fallback so the replica is not re-entered).
@@ -4684,8 +4774,24 @@ pub const Client = struct {
         self.ensurePool();
         if (self.pool) |*p| {
             const conn = try p.acquire();
-            defer p.release(conn);
-            return try conn.queryCursor(self.allocator, sql_str, args, opts);
+            // A streaming cursor keeps reading from this connection after the
+            // function returns, so the checkout has to survive until
+            // `Cursor.deinit` (which drains the stream and then releases it).
+            // Releasing here — the previous behavior — put the connection back
+            // on the idle list (or straight into another fiber's hands) while
+            // this query was still on the wire.
+            var cursor = conn.queryCursor(self.allocator, sql_str, args, opts) catch |err| {
+                p.release(conn);
+                return err;
+            };
+            if (cursor.isStreaming()) {
+                cursor.checkout = .{ .pool = p, .conn = conn };
+            } else {
+                // Buffered: every row is in memory, nothing keeps the
+                // connection busy.
+                p.release(conn);
+            }
+            return cursor;
         }
         if (self.conn == null) try self.connect();
         return self.conn.?.queryCursor(self.allocator, sql_str, args, opts) catch |err| {
@@ -5018,15 +5124,41 @@ pub const Client = struct {
     /// the caller. Requires a **string-free** `T` (scalars / numeric structs);
     /// models with `[]const u8` fields hit a compile error (use `queryRow` /
     /// `queryRowOwned` / `queryRowBorrowed` instead). `NotFound` → `null`.
+    /// Read one row. Two shapes are accepted:
+    ///   * a **struct** — scanned by column name, exactly like `queryRow` (the
+    ///     shape this always supported, e.g. a one-field `Count`);
+    ///   * a **string-free scalar** (`i64`, `f64`, …) — the *first column* of
+    ///     the first row, which is what the `scanStruct` diagnostic points
+    ///     callers here for.
+    ///
+    /// The scalar shape used to forward to `queryRow(T, …)`, which requires a
+    /// struct, so it could not compile for any scalar `T` — a dead end that the
+    /// error message recommending it led straight into.
     pub fn queryScalar(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !?T {
         comptime if (typeHasStrings(T)) {
             @compileError("queryScalar requires a string-free type — use queryRow / queryRowOwned / queryRowBorrowed for models with []const u8 fields");
         };
-        const row = self.queryRow(T, sql_str, args) catch |err| switch (err) {
-            error.NotFound => return null,
-            else => return err,
+        if (comptime isStruct(T)) {
+            const row = self.queryRow(T, sql_str, args) catch |err| switch (err) {
+                error.NotFound => return null,
+                else => return err,
+            };
+            return row; // freeScanned is a no-op for string-free T
+        }
+        var cursor = try self.queryCursorEx(sql_str, args, .{});
+        defer cursor.deinit();
+        const row = cursor.next() orelse return null;
+        if (row.values.len == 0) return error.NotFound;
+        const raw = row.values[0] orelse return null;
+        if (raw == .null) return null;
+        return try valueToType(self.allocator, T, raw);
+    }
+
+    fn isStruct(comptime T: type) bool {
+        return switch (@typeInfo(T)) {
+            .@"struct" => true,
+            else => false,
         };
-        return row; // freeScanned is a no-op for string-free T
     }
 
     /// Deadline-aware `queryScalar`: refuses to start once the request budget is
@@ -5834,7 +5966,16 @@ pub const CachedConn = struct {
     }
 };
 
-/// SQL builder for common operations
+/// SQL builder for common operations.
+///
+/// Every method that emits SQL gates its inputs first: pieces that land in the
+/// text as *names* (`table`, column lists) go through `validateIdentifier`;
+/// pieces that land as developer *expressions* (`join`/`where`/`groupBy`/
+/// `having`/`orderBy` clauses, `count`'s predicate) go through
+/// `validateSqlFragment`. Without that, the builder was the one same-layer path
+/// interpolating unguarded while `Client`/`Transaction`/`CachedConn` validated
+/// the identical inputs. Consequence: `selectColumns` takes plain columns — an
+/// expression such as `COUNT(*) AS n` is rejected rather than interpolated.
 pub const Builder = struct {
     allocator: std.mem.Allocator,
     table: []const u8,
@@ -5852,6 +5993,37 @@ pub const Builder = struct {
             .allocator = allocator,
             .table = table,
         };
+    }
+
+    /// Gate for the pieces a method emits as names: the table plus the column
+    /// list it was handed. Same check `Client.findAll` / `Client.batchInsert`
+    /// apply to their `table` / `columns` arguments.
+    fn checkNames(self: *const Builder, columns: []const []const u8) error{InvalidSqlIdentifier}!void {
+        try self.checkTable();
+        for (columns) |c| try validateIdentifier(c);
+    }
+
+    /// Gate for a method that emits the table without a column list.
+    fn checkTable(self: *const Builder) error{InvalidSqlIdentifier}!void {
+        try validateIdentifier(self.table);
+    }
+
+    /// Gate for the pieces a method emits as expressions. These are predicates
+    /// and ordering terms, not identifiers (`id DESC`, `COUNT(orders.id) > ?2`,
+    /// `INNER JOIN ...`), so they get the fragment gate — the same rule
+    /// `Client.findAll` applies to its `where_clause`: literals, statement
+    /// separators, comments and statement keywords are rejected, ordinary
+    /// expressions are not.
+    fn checkClauses(self: *const Builder) error{UnsafeSqlFragment}!void {
+        if (self.join_clauses) |joins| {
+            for (joins) |c| try validateSqlFragment(c);
+        }
+        if (self.where_clauses) |wheres| {
+            for (wheres) |c| try validateSqlFragment(c);
+        }
+        if (self.group_by_clause) |g| try validateSqlFragment(g);
+        if (self.having_clause) |h| try validateSqlFragment(h);
+        if (self.order_by_clause) |o| try validateSqlFragment(o);
     }
 
     pub fn deinit(self: *Builder) void {
@@ -5943,6 +6115,8 @@ pub const Builder = struct {
     }
 
     pub fn toSql(self: *const Builder) ![]u8 {
+        try self.checkNames(self.select_columns orelse &.{});
+        try self.checkClauses();
         var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
 
@@ -6002,6 +6176,7 @@ pub const Builder = struct {
     }
 
     pub fn insert(self: *const Builder, columns: []const []const u8) ![]u8 {
+        try self.checkNames(columns);
         var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
 
@@ -6021,6 +6196,7 @@ pub const Builder = struct {
     }
 
     pub fn batchInsert(self: *const Builder, columns: []const []const u8, row_count: usize) ![]u8 {
+        try self.checkNames(columns);
         var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
 
@@ -6046,6 +6222,7 @@ pub const Builder = struct {
     }
 
     pub fn update(self: *const Builder, columns: []const []const u8) ![]u8 {
+        try self.checkNames(columns);
         var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
         try buf.print(self.allocator, "UPDATE {s} SET ", .{self.table});
@@ -6057,11 +6234,14 @@ pub const Builder = struct {
     }
 
     pub fn delete(self: *const Builder) ![]u8 {
+        try self.checkTable();
         return std.fmt.allocPrint(self.allocator, "DELETE FROM {s}", .{self.table});
     }
 
     pub fn count(self: *const Builder, where_clause: ?[]const u8) ![]u8 {
+        try self.checkTable();
         if (where_clause) |w| {
+            try validateSqlFragment(w);
             return std.fmt.allocPrint(self.allocator, "SELECT COUNT(*) FROM {s} WHERE {s}", .{ self.table, w });
         }
         return std.fmt.allocPrint(self.allocator, "SELECT COUNT(*) FROM {s}", .{self.table});
@@ -6517,6 +6697,61 @@ test "sqlx builder batch insert" {
     const sql = try b.batchInsert(&.{ "name", "email" }, 3);
     defer allocator.free(sql);
     try std.testing.expectEqualStrings("INSERT INTO users (name, email) VALUES (?1, ?2), (?3, ?4), (?5, ?6)", sql);
+}
+
+/// `raw` must be rejected rather than built: a builder that emitted injected
+/// SQL would leak the returned slice, so the test path frees it and fails.
+fn expectSqlRejected(result: anyerror![]u8, expected_name: []const u8) !void {
+    if (result) |sql| {
+        std.testing.allocator.free(sql);
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectEqualStrings(expected_name, @errorName(err));
+    }
+}
+
+test "sqlx builder gates identifiers and clauses" {
+    const allocator = std.testing.allocator;
+
+    var bad_table = Builder.init(allocator, "users; DROP TABLE users");
+    defer bad_table.deinit();
+    try expectSqlRejected(bad_table.toSql(), "InvalidSqlIdentifier");
+    try expectSqlRejected(bad_table.count(null), "InvalidSqlIdentifier");
+    try expectSqlRejected(bad_table.delete(), "InvalidSqlIdentifier");
+    try expectSqlRejected(bad_table.select(&.{"name"}), "InvalidSqlIdentifier");
+    try expectSqlRejected(bad_table.insert(&.{"name"}), "InvalidSqlIdentifier");
+
+    var b = Builder.init(allocator, "users");
+    defer b.deinit();
+    try expectSqlRejected(b.insert(&.{"name) VALUES (1); --"}), "InvalidSqlIdentifier");
+    try expectSqlRejected(b.batchInsert(&.{"a\"=1"}, 2), "InvalidSqlIdentifier");
+    try expectSqlRejected(b.update(&.{"a\"=1"}), "InvalidSqlIdentifier");
+    try expectSqlRejected(b.selectColumns(&.{"a\"=1"}).toSql(), "InvalidSqlIdentifier");
+
+    // Clauses go through the fragment gate rather than the identifier one: a
+    // statement separator is caught, while `id DESC` / `COUNT(x) > ?1` keep
+    // building. A fresh builder per case — clauses accumulate.
+    var bad_where = Builder.init(allocator, "users");
+    defer bad_where.deinit();
+    try expectSqlRejected(bad_where.where("id = 1; DROP TABLE users").toSql(), "UnsafeSqlFragment");
+
+    var bad_order = Builder.init(allocator, "users");
+    defer bad_order.deinit();
+    try expectSqlRejected(bad_order.orderBy("id; DROP TABLE users").toSql(), "UnsafeSqlFragment");
+
+    var ok = Builder.init(allocator, "users");
+    defer ok.deinit();
+    const sql = try ok.selectColumns(&.{"users.id"})
+        .where("users.id = ?1")
+        .groupBy("users.id")
+        .having("COUNT(orders.id) > ?2")
+        .orderBy("users.id DESC")
+        .toSql();
+    defer allocator.free(sql);
+    try std.testing.expectEqualStrings(
+        "SELECT users.id FROM users WHERE users.id = ?1 GROUP BY users.id HAVING COUNT(orders.id) > ?2 ORDER BY users.id DESC",
+        sql,
+    );
 }
 
 test "sqlite transaction commit" {
@@ -7813,6 +8048,139 @@ test "sqlite streaming cursor falls back to buffered" {
     try std.testing.expect(cursor.next() == null);
 }
 
+/// Minimal `Conn` whose `ping`/`close` are observable — enough to drive
+/// `Cursor.deinit`'s checkout handling without a live driver.
+const CursorTestConn = struct {
+    closed: bool = false,
+    healthy: bool = true,
+    pings: usize = 0,
+};
+
+fn cursorTestQuery(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const Value) errors.ResultT(Rows) {
+    return error.DatabaseError;
+}
+
+fn cursorTestExec(_: *anyopaque, _: []const u8, _: []const Value) errors.ResultT(ExecResult) {
+    return error.DatabaseError;
+}
+
+fn cursorTestUnit(_: *anyopaque) errors.Result {
+    return error.DatabaseError;
+}
+
+fn cursorTestPrepare(_: *anyopaque, _: std.mem.Allocator, _: []const u8) errors.ResultT(Stmt) {
+    return error.DatabaseError;
+}
+
+fn cursorTestPing(ptr: *anyopaque) errors.Result {
+    const state: *CursorTestConn = @ptrCast(@alignCast(ptr));
+    state.pings += 1;
+    if (!state.healthy) return error.DatabaseError;
+}
+
+fn cursorTestClose(ptr: *anyopaque) void {
+    const state: *CursorTestConn = @ptrCast(@alignCast(ptr));
+    state.closed = true;
+}
+
+const cursor_test_vtable = Conn.VTable{
+    .query = cursorTestQuery,
+    .exec = cursorTestExec,
+    .close = cursorTestClose,
+    .ping = cursorTestPing,
+    .begin = cursorTestUnit,
+    .commit = cursorTestUnit,
+    .rollback = cursorTestUnit,
+    .prepare = cursorTestPrepare,
+};
+
+/// A `.streaming` cursor as the drivers build it, except the driver half is
+/// inert (`conn = null`) so the checkout half can be exercised on its own.
+fn testStreamingCursor(state: *CursorTestConn, pool: *ConnPool, allocator: std.mem.Allocator) Cursor {
+    return .{
+        .state = .{ .streaming_pg = .{
+            .conn = null,
+            .arena = std.heap.ArenaAllocator.init(allocator),
+            .columns = &.{},
+            .row = undefined,
+            .current = null,
+            .eof = true,
+        } },
+        .checkout = .{ .pool = pool, .conn = .{ .ptr = state, .vtable = &cursor_test_vtable } },
+    };
+}
+
+test "cursor deinit returns its pooled connection or retires a broken one" {
+    const allocator = std.testing.allocator;
+    var db = Client.init(allocator, std.testing.io, .{
+        .driver = .sqlite,
+        .sqlite_path = ":memory:",
+        .max_open_conns = 2,
+        .max_idle_conns = 2,
+    });
+    defer db.deinit();
+    db.ensurePool();
+    const pool = &db.pool.?;
+
+    // While a streaming cursor is alive its connection is *its own*: nobody
+    // else may be handed the same socket with rows still on it.
+    var state = CursorTestConn{};
+    var cursor = testStreamingCursor(&state, pool, allocator);
+    try std.testing.expect(cursor.isStreaming());
+    try std.testing.expectEqual(@as(u64, 0), pool.metrics().total_released);
+    try std.testing.expectEqual(@as(u32, 0), pool.metrics().current_idle);
+
+    // `deinit` drains the stream (driver half), then hands the connection back
+    // exactly once.
+    cursor.deinit();
+    try std.testing.expectEqual(@as(u64, 1), pool.metrics().total_released);
+    try std.testing.expectEqual(@as(u32, 1), pool.metrics().current_idle);
+    try std.testing.expectEqual(@as(usize, 1), state.pings);
+    try std.testing.expect(!state.closed);
+
+    // A stream that broke while draining must be retired, not re-pooled: its
+    // protocol state is unknown, so the next borrower would read this query's
+    // leftover frames.
+    var dead = CursorTestConn{ .healthy = false };
+    var dead_cursor = testStreamingCursor(&dead, pool, allocator);
+    dead_cursor.deinit();
+    try std.testing.expect(dead.closed);
+    try std.testing.expectEqual(@as(u32, 1), pool.metrics().current_idle);
+}
+
+test "sqlite pooled client stays usable after a cursor is abandoned early" {
+    const allocator = std.testing.allocator;
+    var db = Client.init(allocator, std.testing.io, .{
+        .driver = .sqlite,
+        .sqlite_path = ":memory:",
+        .max_open_conns = 2,
+        .max_idle_conns = 2,
+    });
+    defer db.deinit();
+    db.ensurePool();
+    const pool = &db.pool.?;
+
+    // sqlite has no incremental step here, so a `.streaming` request is served
+    // buffered — the cursor owns no wire stream and says so.
+    var cur = try db.queryCursorEx("SELECT ?1 AS n", &.{.{ .int = 7 }}, .{ .mode = .streaming });
+    try std.testing.expect(!cur.isStreaming());
+    try std.testing.expectEqual(@as(i64, 7), cur.next().?.get("n").?.int);
+    cur.deinit();
+
+    // Abandon a cursor mid-iteration, then keep using the same client.
+    var abandoned = try db.queryCursor("SELECT ?1 AS n", &.{.{ .int = 1 }});
+    try std.testing.expect(abandoned.next() != null);
+    abandoned.deinit();
+
+    const after = try db.queryRow(struct { n: i64 }, "SELECT ?1 AS n", &.{.{ .int = 42 }});
+    defer freeScanned(allocator, @TypeOf(after), after);
+    try std.testing.expectEqual(@as(i64, 42), after.n);
+
+    // Every checkout came back exactly once — no leaked pool slot.
+    const m = pool.metrics();
+    try std.testing.expectEqual(m.total_acquired, m.total_released);
+}
+
 test "mysql streaming cursor api compiles" {
     // Requires a live MySQL server; kept as a compile-time/API smoke test.
     if (true) return error.SkipZigTest;
@@ -8251,4 +8619,46 @@ test "transaction scan helpers match client for the same query" {
     try std.testing.expectEqual(c_batch.len, t_batch.len);
     for (c_batch, t_batch) |c, t| try std.testing.expectEqual(c.rows_affected, t.rows_affected);
     try std.testing.expectEqual(@as(u64, 1), t_batch[0].rows_affected);
+}
+
+test "sqlite extended codes are masked before comparing to primary codes" {
+    // 2067 = SQLITE_CONSTRAINT_UNIQUE, 1299 = SQLITE_CONSTRAINT_NOTNULL,
+    // 787 = SQLITE_CONSTRAINT_FOREIGNKEY. The call sites pass the extended code
+    // (so logs name the specific failure) and compare against primary codes, so
+    // the mask is what makes `error.ConstraintViolation` and the table/column
+    // diagnosis reachable at all.
+    try std.testing.expectEqual(@as(i32, 19), sqlitePrimaryCode(2067));
+    try std.testing.expectEqual(@as(i32, 19), sqlitePrimaryCode(1299));
+    try std.testing.expectEqual(@as(i32, 19), sqlitePrimaryCode(787));
+    try std.testing.expectEqual(@as(i32, 1), sqlitePrimaryCode(1));
+    try std.testing.expectEqual(@as(i32, 5), sqlitePrimaryCode(5));
+
+    const unique = diagnoseSqlite(2067, "UNIQUE constraint failed: users.email");
+    try std.testing.expectEqual(@as(i32, 2067), unique.code);
+    try std.testing.expectEqualStrings("users", unique.table.?);
+    try std.testing.expectEqualStrings("email", unique.column.?);
+
+    const notnull = diagnoseSqlite(1299, "NOT NULL constraint failed: orders.total");
+    try std.testing.expectEqualStrings("orders", notnull.table.?);
+    try std.testing.expectEqualStrings("total", notnull.column.?);
+
+    // A plain error (no extended constraint class) must not be diagnosed as one.
+    const plain = diagnoseSqlite(1, "near \"slect\": syntax error");
+    try std.testing.expect(plain.table == null and plain.column == null);
+}
+
+test "queryScalar reads the first column" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+
+    try std.testing.expectEqual(@as(?i64, 7), try client.queryScalar(i64, "SELECT 7", &.{}));
+    try std.testing.expectEqual(@as(?i64, null), try client.queryScalar(i64, "SELECT NULL", &.{}));
+    try std.testing.expectEqual(@as(?i64, null), try client.queryScalar(i64, "SELECT 1 WHERE 0", &.{}));
+    // Two columns: the first is the one read (documented behaviour).
+    try std.testing.expectEqual(@as(?i64, 11), try client.queryScalar(i64, "SELECT 11, 22", &.{}));
+    try std.testing.expectEqual(@as(?f64, 1.5), try client.queryScalar(f64, "SELECT 1.5", &.{}));
+    // Bound arguments reach the driver on this path too.
+    try std.testing.expectEqual(@as(?i64, 5), try client.queryScalar(i64, "SELECT ?1 + 2", &.{.{ .int = 3 }}));
 }

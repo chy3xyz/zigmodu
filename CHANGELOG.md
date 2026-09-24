@@ -2,6 +2,74 @@
 
 ## [Unreleased]
 
+### 第 3 组：sqlx 游标所有权/闸门、两处配置串号、CSRF/CSP、web4 顺序与时钟、x402 台账语义（**破坏性：否**，含一处 fail-open 修复）
+
+**x402：`store` 明确为「幂等台账」，校验回归 verifier（fail-open → fail-closed）**
+`x402Middleware` 过去在配了 `store` 时**完全跳过 verifier** —— 而 `redeem` 只把客户端自报的
+`tx_hash` 写进库，所以任何客户端对任意已签发发票自报一个 hash 就通过。旗舰示例正是这个配置，
+它自己的测试还用伪造的 `"0xabc"` 断言 **200**（把漏洞固化成了期望值）。现在：**校验始终走
+`X402Config.verifier`**，store 只负责"每张发票恰好核销一次"；文档（`x402.zig`/`x402_store.zig`/
+`middleware.zig` 字段注释/AGENTS.md）统一改成"台账 ≠ 校验器"。示例改为显式注入 dev 用的
+`verifyPaymentAllowAll`，并**加了一个 strict 门**（同一个 store + 默认 reject verifier）断言
+**403** —— 这条断言在 store 越权顶替校验时会红。行为变化：只配 store 不配 verifier 的应用
+会从"放行"变成"403"（这正是修复本意）。
+
+**sqlx**
+- **流式游标现在拥有连接**：过去 `queryCursorEx` 在返回前就 `defer release`，而游标内部仍持有
+  `conn`/`PGconn` —— 另一个 fiber 可立刻拿到同一条连接发查询（协议交错）。现在流式游标把
+  `{pool, conn}` 存进 `Cursor`，`deinit` 时先 `ping` 再 `release`，不健康就 `discard`；
+  **PG 侧 `deinit` 先抽干 `PQgetResult`**（`pingFn` 只看 socket 状态，所以旧代码下这条连接
+  永远"健康"地被复用并持续出错）。红→绿：无 `checkout` 字段时编译失败 → 两条用例（归还一次
+  且 `acquired == released`；坏连接被 discard 不进 idle）。**未运行时验证**：真 PG/MySQL 的抽干
+  路径（本机无服务），且"游标必须先于 `Client.deinit` 释放"现在是硬约束（已文档化）。
+- **`Builder` / `Bulk` 的标识符闸门**：表名/列名/upsert 的 conflict/update 列过
+  `validateIdentifier`，`where`/`orderBy`/`having`/`join` 片段过 `validateSqlFragment`
+  （开发者表达式不误判）。红：恶意表名被原样拼进 SQL。语义变化：`selectColumns` 现在只收列名
+  （`"COUNT(*) AS n"` 这类表达式被拒）。
+- **`queryScalar` 从未能编译**：它转调要求 struct 的 `queryRow`，而 `scanStruct` 的报错文案
+  恰恰推荐"用 `queryScalar` 扫单列"—— 一个指进去就是死路的循环。现在两条形状都支持：struct
+  按列名扫（既有用法不变），标量取首行首列（`i64`/`f64`/NULL/无行/绑定参数都有用例）。
+- **SQLite 扩展码被拿去比主码**：`sqlite3_extended_errcode` 返回 2067（UNIQUE）之类，而代码写
+  `ext_code == 19`，于是约束诊断与 `error.ConstraintViolation` 在 sqlite 上**从不触发**（一律
+  落 `DatabaseError`，任何 switch 这个错误的调用方都踩空）。新增 `sqlitePrimaryCode()` 遮蔽后
+  在三处使用。**顺带被新用例抓到同一函数里的 off-by-one**：`"UNIQUE constraint failed:"` 是 25
+  字符而代码用 `+24`，所以诊断出的表名一直带一个前导 `:`（现已用字面量 `.len`）。
+
+**安全**
+- **两处函数级 `var` 单例 → 每槽一个 trampoline**（`ApiKeyAuth.zig`、`CatalogPermDb.zig`）：
+  第二次 `apiKeyAuth(A)`/`loaderFromClient(A)` 会覆盖第一次的配置，于是**用 B 的密钥能过 A 的
+  路由**、A 的 loader 读 B 的库。红：`expected 401, found 200`。改成"槽表 + 原子领取 + 每槽独立
+  函数指针"（裸函数指针不带上下文，闭包只能落在函数身份上），空槽 fail-closed，上限 64。
+  顺带修掉一处**从未被实例化所以从未暴露的编译错**（`next(ctx, next, null)` 对单参 `HandlerFn`）。
+- **CSRF 补 Origin/Referer 校验 + 常数时间比较**：带 `Origin`/`Referer` 时其 host 必须匹配
+  `Host`/`X-Forwarded-Host`（scheme 与 `X-Forwarded-Proto` 一致），`null`/`user@host`/无 scheme
+  一律拒；**不带这两个头时维持现状**（CLI/服务间调用不受影响）。红：`expected 403, found 200`。
+- **CSP 注释与实现对齐**：`defaultSecurityHeaders` 仍然**不含** CSP（行为不变，注释改成说明原因）；
+  opt-in 的 `securityHeaders()` 默认带一条硬化子集（`object-src 'none'; base-uri 'self';
+  frame-ancestors 'none'`）。**注意**：`productionProfile` 内部就是 `securityHeaders(null)`，
+  所以生产档位应用会开始收到这条 CSP（不含 `script-src`/`default-src`，不打断内联脚本）。
+
+**web4**
+- **先验签、后消费 challenge**：原先先 `verifyAndConsume` 再验签 —— 知道某 DID 未使用 challenge 的
+  人发一个**签名无效**的请求就能把它烧掉（一次性挑战变 DoS 面）；消费失败与签名失败的 401 文案现在
+  逐字节相同（不再泄露"该 DID 是否有有效 challenge"）。原子性未变（消费仍在 store 的 mutex 里）。
+- **墙钟而非单调钟**：发票 `created_at`/`redeemed_at`/`deadline` 原用 uptime（重启后永久失真，
+  还被当 Unix 时间发给客户端）→ 改用 `Time.wallClockSeconds(io)`（store 借 `sqlx.Client.io`；
+  middleware 用 `ctx.io orelse store.io()`，合成 context 退化为 libc `clock_gettime(REALTIME)`）。
+- **发票 id 用 `randomSecure`**（原先 `-{monotonicMs}` 同毫秒碰撞且可猜），重复 id 由 store 预检
+  归类为 `DuplicateInvoice` → **402**（原先撞 UNIQUE 冒泡成 500）。顺带查明 sqlite 的 UNIQUE 违规
+  报扩展码 2067 而驱动只比主码，所以"预期内的重复"必须预检才不会被记成 error 日志。
+
+验证：全量 `-Ddb=all` **1667/1689（22 skipped，0 failed）**；`zig build check`/fmt/check-version/
+deadcode 全绿；`examples/web4` 的测试（含新 strict 门 403 断言）通过；`examples/tenant-mgmt`、
+`examples/zmsaas/backend` 构建通过。
+
+**未做**：`X-Forwarded-Host` 的信任边界（需要 trusted-proxy 名单）；CSRF token 签名（会改 wire 形状）；
+PG 抽干改用 `PQcancel`（需要新增 libpq 绑定）；游标路径对熔断器/指标"隐形"
+（`queryCursorExPrimary` 不记 success/failure）；`queryScalar` 的 struct 分支仍是 `queryRow` 语义。
+
+## [Unreleased]
+
 ### 协议面加固：HTTP/2 三条「未认证单包打崩进程」、HPACK UAF、sqlx 两条 P0、challenge 弱熵（**破坏性：否**）
 
 一次"从没被审过的面"的深审（HTTP/2 / HPACK / sqlx / web4），每条都带实测探针或确定性红。

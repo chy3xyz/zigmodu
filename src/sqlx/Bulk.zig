@@ -16,8 +16,9 @@
 //! });
 //! ```
 //!
-//! SECURITY: table/column names are trusted schema identifiers (never user
-//! input); values always go through `?` placeholders.
+//! SECURITY: table/column names are schema identifiers (never user input) and
+//! are gated through `sqlx.validateIdentifier` before they are interpolated;
+//! values always go through `?` placeholders.
 
 const std = @import("std");
 const sqlx = @import("sqlx.zig");
@@ -36,6 +37,10 @@ pub const UpsertOpts = struct {
 
 /// Build `INSERT INTO t (c1,c2) VALUES (?,?),(?,?) [ON CONFLICT ...]`.
 /// Caller frees the returned slice.
+///
+/// `table` / `columns` / the upsert column lists are interpolated (only the
+/// values are parameterized), so they are gated as identifiers — the same
+/// `error.InvalidSqlIdentifier` the `Client`/`Transaction` insert paths raise.
 pub fn buildInsertMany(
     allocator: std.mem.Allocator,
     table: []const u8,
@@ -46,6 +51,14 @@ pub fn buildInsertMany(
 ) ![]u8 {
     if (row_count == 0) return error.EmptyRows;
     if (columns.len == 0) return error.EmptyColumns;
+    try sqlx.validateIdentifier(table);
+    for (columns) |c| try sqlx.validateIdentifier(c);
+    if (upsert) |u| {
+        for (u.conflict_columns) |c| try sqlx.validateIdentifier(c);
+        if (u.update_columns) |update_cols| {
+            for (update_cols) |c| try sqlx.validateIdentifier(c);
+        }
+    }
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
 
@@ -221,6 +234,38 @@ test "buildInsertMany rejects empty rows / columns / update list" {
         error.EmptyUpsertColumns,
         buildInsertMany(testing.allocator, "t", &.{"id"}, 1, .sqlite, .{ .conflict_columns = &.{"id"} }),
     );
+}
+
+test "buildInsertMany rejects non-identifier table and column names" {
+    // Table / column names are interpolated, not parameterized — they go
+    // through the same gate the Client insert paths apply.
+    try expectBuildRejected(buildInsertMany(testing.allocator, "t; DROP TABLE users", &.{"a"}, 1, .sqlite, null), "InvalidSqlIdentifier");
+    try expectBuildRejected(buildInsertMany(testing.allocator, "t", &.{"a\") VALUES (1); --"}, 1, .sqlite, null), "InvalidSqlIdentifier");
+    // The upsert suffix interpolates the conflict / update columns too.
+    try expectBuildRejected(
+        buildInsertMany(testing.allocator, "t", &.{"a"}, 1, .sqlite, .{ .conflict_columns = &.{"id) DO NOTHING; --"} }),
+        "InvalidSqlIdentifier",
+    );
+    try expectBuildRejected(
+        buildInsertMany(testing.allocator, "t", &.{"a"}, 1, .sqlite, .{ .conflict_columns = &.{"id"}, .update_columns = &.{"a\"=excluded.\"a"} }),
+        "InvalidSqlIdentifier",
+    );
+
+    // Legitimate names (incl. schema-qualified) still build.
+    const sql = try buildInsertMany(testing.allocator, "public.orders", &.{ "order_id", "sku" }, 1, .sqlite, null);
+    defer testing.allocator.free(sql);
+    try testing.expectEqualStrings("INSERT INTO public.orders (order_id, sku) VALUES (?,?)", sql);
+}
+
+/// `buildInsertMany` must reject `raw`; a builder that emitted injected SQL
+/// would leak the returned slice, so the test path frees it and fails.
+fn expectBuildRejected(result: anyerror![]u8, expected_name: []const u8) !void {
+    if (result) |sql| {
+        testing.allocator.free(sql);
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try testing.expectEqualStrings(expected_name, @errorName(err));
+    }
 }
 
 test "flattenArgs concatenates rows in order" {

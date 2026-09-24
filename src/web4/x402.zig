@@ -3,8 +3,12 @@
 //! Payment verification is **fail-closed by default**. Production code must
 //! inject an explicit `PaymentVerifier` (on-chain check, allow-list, etc.).
 //! Never treat a bare `verifyPayment` / missing verifier as "paid".
-//! For persisted, exactly-once redemption use `x402_store.X402Store` with
-//! `middleware.x402Middleware` (see docs/WEB4.md).
+//!
+//! `x402_store.X402Store` is a **ledger, not a verifier**: it persists invoices
+//! and records that each one was redeemed exactly once (anti-replay), while
+//! `middleware.x402Middleware` always consults `X402Config.verifier` for
+//! validity — configured store or not. The store never turns an unverified
+//! proof into a paid request.
 
 const std = @import("std");
 

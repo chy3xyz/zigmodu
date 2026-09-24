@@ -8,12 +8,14 @@
 //!     writes `did` / `user_id` attrs for downstream handlers.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const api = @import("../api/Server.zig");
 const x402_mod = @import("x402.zig");
 const x402_store_mod = @import("x402_store.zig");
 const did_mod = @import("did.zig");
 const challenge_mod = @import("challenge.zig");
 const security_mod = @import("../security/AppSecurity.zig");
+const Time = @import("../core/Time.zig");
 
 /// Config for `x402Middleware`. `verifier` must be the production payment
 /// verifier (on-chain check, allow-list); the helper stays fail-closed when
@@ -30,8 +32,10 @@ pub const X402Config = struct {
     amount: u64 = 1000000,
     currency: x402_mod.Currency = .usdc,
     description: []const u8 = "Web4 API access",
-    /// When set, invoices are persisted and proofs are redeemed exactly once
-    /// (idempotent anti-replay); otherwise the `verifier` callback is used.
+    /// Optional **ledger**: when set, invoices are persisted and each proof is
+    /// redeemed exactly once (idempotent anti-replay). It does *not* decide
+    /// validity — `verifier` is consulted on every request either way, and a
+    /// store that is configured while the verifier rejects still yields 403.
     store: ?*x402_store_mod.X402Store = null,
 };
 
@@ -53,19 +57,6 @@ pub fn x402Middleware(cfg: *X402Config) api.Middleware {
                         try ctx.sendError(402, "missing invoice id");
                         return;
                     };
-                    if (c.store) |st| {
-                        switch (try st.redeem(invoice_id, tx)) {
-                            .redeemed => {
-                                try ctx.setAttr("x402_paid", "true");
-                                try next(ctx);
-                                return;
-                            },
-                            .already_used, .not_found, .expired => {
-                                try ctx.sendError(410, "invoice not redeemable");
-                                return;
-                            },
-                        }
-                    }
                     const proof = x402_mod.PaymentProof{
                         .tx_hash = try ctx.allocator.dupe(u8, tx),
                         .invoice_id = try ctx.allocator.dupe(u8, invoice_id),
@@ -74,34 +65,112 @@ pub fn x402Middleware(cfg: *X402Config) api.Middleware {
                         ctx.allocator.free(proof.tx_hash);
                         ctx.allocator.free(proof.invoice_id);
                     }
-                    if (x402_mod.verifyWith(c.verifier, proof)) {
-                        try ctx.setAttr("x402_paid", "true");
-                        try next(ctx);
+                    // The verifier decides validity — **always**, store or not.
+                    // The store is a ledger: it records that this invoice was
+                    // redeemed once. Letting it stand in for verification (the
+                    // shape here until this fix) accepted any client-supplied
+                    // tx hash for any invoice the server had issued.
+                    if (!x402_mod.verifyWith(c.verifier, proof)) {
+                        try ctx.sendError(403, "invalid payment proof");
                         return;
                     }
-                    try ctx.sendError(403, "invalid payment proof");
+                    if (c.store) |st| {
+                        switch (try st.redeem(invoice_id, tx)) {
+                            .redeemed => {},
+                            .already_used, .not_found, .expired => {
+                                try ctx.sendError(410, "invoice not redeemable");
+                                return;
+                            },
+                        }
+                    }
+                    try ctx.setAttr("x402_paid", "true");
+                    try next(ctx);
                     return;
                 }
+                const io_handle = requestIo(ctx, c);
+                var id_buf: [128]u8 = undefined;
                 const invoice = if (c.on_invoice) |f|
                     try f(ctx, ctx.allocator)
                 else blk: {
-                    var id_buf: [64]u8 = undefined;
-                    const id = try std.fmt.bufPrint(&id_buf, "{s}-{d}", .{ c.invoice_id, @import("../core/Time.zig").monotonicNowMilliseconds() });
                     break :blk x402_mod.Invoice{
-                        .id = id,
+                        .id = try mintInvoiceId(&id_buf, c.invoice_id, io_handle),
                         .payee_did = c.payee_did,
                         .amount = c.amount,
                         .currency = c.currency,
-                        .deadline = @import("../core/Time.zig").monotonicNowSeconds() + 3600,
+                        .deadline = try nowSeconds(io_handle) + 3600,
                         .description = c.description,
                     };
                 };
-                if (c.store) |st| try st.create(invoice);
+                if (c.store) |st| {
+                    st.create(invoice) catch |err| switch (err) {
+                        // The id is already on the books. An app that derives it
+                        // from its own order id meets this on every retry, and a
+                        // paying client must not be answered with a 500 — the id
+                        // is issued, so the payment conversation continues.
+                        error.DuplicateInvoice => {
+                            try ctx.sendError(402, "invoice id already issued");
+                            return;
+                        },
+                        else => return err,
+                    };
+                }
                 try x402_mod.writePaymentRequired(ctx, ctx.allocator, invoice);
             }
         }.mw,
         .user_data = cfg,
     };
+}
+
+/// Sequence that keeps fallback invoice ids distinct within a process. Only
+/// reached when no `Io` handle is available (see `mintInvoiceId`).
+var fallback_id_seq = std.atomic.Value(u64).init(0);
+
+/// Where this request's wall clock and entropy come from: the request's own
+/// handle when dispatch set one, otherwise the store's client (the store is
+/// what mints and compares these timestamps). `null` means a synthetic context
+/// — `http.Testkit.dispatch`, a unit test calling the middleware directly — and
+/// the two helpers below then avoid the `Io` handle instead of guessing at one.
+fn requestIo(ctx: *api.Context, cfg: *X402Config) ?std.Io {
+    if (ctx.io) |io| return io;
+    if (cfg.store) |st| return st.io();
+    return null;
+}
+
+/// Mint an invoice id: unique per request (the store's UNIQUE key rejects a
+/// repeat, and a rejected payment request is a bug, not a payment problem) and
+/// unguessable (a guessed id is what a stranger redeems before the payer does).
+/// A millisecond timestamp is neither — two requests inside one millisecond
+/// share it, and anyone can read the clock.
+fn mintInvoiceId(buf: []u8, prefix: []const u8, io: ?std.Io) ![]const u8 {
+    if (io) |handle| {
+        var nonce: [16]u8 = undefined;
+        try std.Io.randomSecure(handle, &nonce);
+        return std.fmt.bufPrint(buf, "{s}-{x}", .{ prefix, std.mem.readInt(u128, &nonce, .little) });
+    }
+    // No handle means no OS entropy: `std.Io.randomSecure` is the only
+    // sanctioned source and it needs one. Stay unique — uptime milliseconds
+    // plus a process counter — rather than fail a request that production
+    // dispatch (which always sets `ctx.io`) would never build this way.
+    const seq = fallback_id_seq.fetchAdd(1, .monotonic);
+    return std.fmt.bufPrint(buf, "{s}-{x}-{x}", .{ prefix, Time.monotonicNowMilliseconds(), seq });
+}
+
+/// Wall-clock seconds for the invoice deadline. `Invoice.deadline` is handed to
+/// the client and persisted, so it has to be a Unix timestamp: uptime seconds
+/// mean the same row expires or never expires depending on when the process
+/// last started.
+fn nowSeconds(io: ?std.Io) !i64 {
+    if (io) |handle| return Time.wallClockSeconds(handle);
+    switch (comptime builtin.os.tag) {
+        .windows, .freestanding, .other, .uefi => return error.WallClockUnavailable,
+        else => {
+            // Same libc read `Time.monotonicNow` uses, reached only from a
+            // context that carries no `Io` handle.
+            var ts: std.c.timespec = undefined;
+            if (std.c.clock_gettime(.REALTIME, &ts) != 0) return error.WallClockUnavailable;
+            return @as(i64, ts.sec);
+        },
+    }
 }
 
 /// Config for `didAuthMiddleware`.
@@ -123,6 +192,10 @@ pub const DidAuthConfig = struct {
 
 /// did:key authentication: verifies a signature over `message`; on success
 /// writes `did` and `user_id` attrs. Missing/invalid credentials → 401.
+///
+/// With `challenge_store` set, `message` must be a challenge the store issued
+/// for this DID, and it is spent exactly once — after the signature verifies,
+/// never before, so a rejected signature cannot burn someone else's challenge.
 pub fn didAuthMiddleware(cfg: *DidAuthConfig) api.Middleware {
     return .{
         .func = struct {
@@ -142,12 +215,6 @@ pub fn didAuthMiddleware(cfg: *DidAuthConfig) api.Middleware {
                     try ctx.sendError(401, "missing message");
                     return;
                 };
-                if (c.challenge_store) |cs| {
-                    if (!cs.verifyAndConsume(ctx.allocator, did, message)) {
-                        try ctx.sendError(401, "invalid or expired challenge");
-                        return;
-                    }
-                }
                 const sig_b64 = ctx.header(c.signature_header) orelse {
                     try ctx.sendError(401, "missing signature");
                     return;
@@ -172,6 +239,22 @@ pub fn didAuthMiddleware(cfg: *DidAuthConfig) api.Middleware {
                     try ctx.sendError(401, "invalid signature");
                     return;
                 }
+                // Consume only after the signature proved this caller holds the
+                // key: spending the challenge first would let anyone who can
+                // observe it burn the victim's challenge with a garbage
+                // signature, so the victim's own signed request is rejected as a
+                // replay. `verifyAndConsume` still decides under the store's lock
+                // and removes the entry, so two concurrent requests carrying the
+                // same valid `(message, signature)` cannot both pass.
+                if (c.challenge_store) |cs| {
+                    if (!cs.verifyAndConsume(ctx.allocator, did, message)) {
+                        // Byte-identical to a bare bad signature on purpose: a
+                        // distinct "no such challenge" body would tell an
+                        // attacker which DIDs have a live challenge to spend.
+                        try ctx.sendError(401, "invalid signature");
+                        return;
+                    }
+                }
                 try ctx.setAttr("did", did);
                 try ctx.setAttr("user_id", did);
                 if (c.jwt_issuer) |sec| {
@@ -185,6 +268,21 @@ pub fn didAuthMiddleware(cfg: *DidAuthConfig) api.Middleware {
         .user_data = cfg,
     };
 }
+
+/// Reader for the fields these tests assert on in a 402 body.
+const InvoiceBody = struct {
+    fn idOf(allocator: std.mem.Allocator, ctx: *const api.Context) ![]u8 {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, ctx.response_body.items, .{});
+        defer parsed.deinit();
+        return allocator.dupe(u8, parsed.value.object.get("data").?.object.get("invoice_id").?.string);
+    }
+
+    fn deadlineOf(allocator: std.mem.Allocator, ctx: *const api.Context) !i64 {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, ctx.response_body.items, .{});
+        defer parsed.deinit();
+        return parsed.value.object.get("data").?.object.get("deadline").?.integer;
+    }
+};
 
 test "x402Middleware gates unauthenticated requests with 402" {
     const allocator = std.testing.allocator;
@@ -264,4 +362,190 @@ test "didAuthMiddleware with challenge store rejects replayed challenges" {
     try mw.func(&ctx2, Handler.h, mw.user_data);
     try std.testing.expectEqual(@as(usize, 1), State.reached);
     try std.testing.expectEqual(@as(u16, 401), ctx2.status_code);
+}
+
+test "didAuthMiddleware does not burn the challenge on an invalid signature" {
+    const allocator = std.testing.allocator;
+    var store = challenge_mod.ChallengeStore.init(allocator, std.testing.io);
+    defer store.deinit();
+    var cfg = DidAuthConfig{ .challenge_store = &store };
+    const mw = didAuthMiddleware(&cfg);
+
+    var key = try did_mod.DidKey.generate(allocator, std.testing.io);
+    defer allocator.free(key.did);
+    const challenge = try store.issue(allocator, key.did);
+    defer allocator.free(challenge);
+
+    const enc = std.base64.standard.Encoder;
+    const sig = try key.sign(allocator, challenge);
+    defer allocator.free(sig);
+    const good_b64 = try allocator.alloc(u8, enc.calcSize(sig.len));
+    defer allocator.free(good_b64);
+    _ = enc.encode(good_b64, sig);
+    const zero_signature: [64]u8 = @splat(0);
+    const bad_b64 = try allocator.alloc(u8, enc.calcSize(zero_signature.len));
+    defer allocator.free(bad_b64);
+    _ = enc.encode(bad_b64, &zero_signature);
+
+    const State = struct {
+        var reached: usize = 0;
+    };
+    const Handler = struct {
+        fn h(_: *api.Context) anyerror!void {
+            State.reached += 1;
+        }
+    };
+
+    // Attacker: observes the DID's live challenge but cannot sign for it. A
+    // rejected signature must leave the challenge intact — consuming it before
+    // verification turns every one-shot challenge into a DoS primitive the
+    // attacker can spend on the victim's behalf.
+    var attack = try api.Context.init(allocator, .GET, "/api/identity");
+    defer attack.deinit();
+    try attack.headers.put(try allocator.dupe(u8, "x-did"), try allocator.dupe(u8, key.did));
+    try attack.headers.put(try allocator.dupe(u8, "x-did-message"), try allocator.dupe(u8, challenge));
+    try attack.headers.put(try allocator.dupe(u8, "x-did-signature"), try allocator.dupe(u8, bad_b64));
+    try mw.func(&attack, Handler.h, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 401), attack.status_code);
+    try std.testing.expectEqual(@as(usize, 0), State.reached);
+
+    // A DID with no live challenge gets the byte-identical 401: the body must
+    // not report whether the DID had a challenge to spend (that oracle is what
+    // lets an attacker aim the burn at a specific victim).
+    var unknown = try api.Context.init(allocator, .GET, "/api/identity");
+    defer unknown.deinit();
+    try unknown.headers.put(try allocator.dupe(u8, "x-did"), try allocator.dupe(u8, key.did));
+    try unknown.headers.put(try allocator.dupe(u8, "x-did-message"), try allocator.dupe(u8, "challenge-never-issued"));
+    try unknown.headers.put(try allocator.dupe(u8, "x-did-signature"), try allocator.dupe(u8, bad_b64));
+    try mw.func(&unknown, Handler.h, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 401), unknown.status_code);
+    try std.testing.expectEqualStrings(attack.response_body.items, unknown.response_body.items);
+    try std.testing.expectEqual(@as(usize, 0), State.reached);
+
+    // Victim: the same challenge, signed for real. Nobody consumed it above, so
+    // this is still its first successful use.
+    var victim = try api.Context.init(allocator, .GET, "/api/identity");
+    defer victim.deinit();
+    try victim.headers.put(try allocator.dupe(u8, "x-did"), try allocator.dupe(u8, key.did));
+    try victim.headers.put(try allocator.dupe(u8, "x-did-message"), try allocator.dupe(u8, challenge));
+    try victim.headers.put(try allocator.dupe(u8, "x-did-signature"), try allocator.dupe(u8, good_b64));
+    try mw.func(&victim, Handler.h, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 200), victim.status_code);
+    try std.testing.expectEqual(@as(usize, 1), State.reached);
+}
+
+test "x402Middleware mints a distinct invoice id per request" {
+    const allocator = std.testing.allocator;
+    var cfg = X402Config{};
+    const mw = x402Middleware(&cfg);
+    const Handler = struct {
+        fn h(_: *api.Context) anyerror!void {}
+    };
+
+    var seen = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = seen.keyIterator();
+        while (it.next()) |k| allocator.free(k.*);
+        seen.deinit();
+    }
+
+    // A clock-derived id repeats for every request inside one millisecond and
+    // is guessable from outside; both matter, since a minted id is what a
+    // payment is later redeemed against. 256 in-memory requests span far fewer
+    // than 256 milliseconds, so a millisecond-resolution id cannot be unique.
+    for (0..256) |_| {
+        var ctx = try api.Context.init(allocator, .GET, "/api/paid");
+        defer ctx.deinit();
+        ctx.io = std.testing.io;
+        try mw.func(&ctx, Handler.h, mw.user_data);
+        try std.testing.expectEqual(@as(u16, 402), ctx.status_code);
+        const id = try InvoiceBody.idOf(allocator, &ctx);
+        defer allocator.free(id);
+        try std.testing.expect(!seen.contains(id));
+        try seen.put(try allocator.dupe(u8, id), {});
+    }
+    try std.testing.expectEqual(@as(usize, 256), seen.count());
+}
+
+test "x402Middleware dates the invoice on the wall clock" {
+    const allocator = std.testing.allocator;
+    var cfg = X402Config{};
+    const mw = x402Middleware(&cfg);
+    var ctx = try api.Context.init(allocator, .GET, "/api/paid");
+    defer ctx.deinit();
+    ctx.io = std.testing.io;
+    try mw.func(&ctx, struct {
+        fn h(_: *api.Context) anyerror!void {}
+    }.h, mw.user_data);
+
+    // `Invoice.deadline` is sent to the client and persisted (`x402.zig` calls
+    // it a Unix timestamp), so it has to survive a restart. Uptime seconds — a
+    // few hundred on a fresh runner — sit orders of magnitude below the wall
+    // clock, which is why a one-hour window is a decisive check.
+    const deadline = try InvoiceBody.deadlineOf(allocator, &ctx);
+    const now = @import("../core/Time.zig").wallClockSeconds(std.testing.io);
+    try std.testing.expect(deadline > now);
+    try std.testing.expect(deadline <= now + 3601);
+}
+
+test "x402Middleware answers a repeated invoice id with 402, not 500" {
+    const allocator = std.testing.allocator;
+    var client = @import("../sqlx/sqlx.zig").Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    var backend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend{ .allocator = allocator, .client = &client };
+    var store = x402_store_mod.X402Store.init(allocator, &backend);
+    try store.migrate();
+
+    // An app that prices by its own order id hands the middleware the same
+    // invoice id on every retry; the UNIQUE key then rejects the INSERT. That
+    // is a payment-protocol outcome, not a server fault.
+    var cfg = X402Config{ .store = &store, .on_invoice = struct {
+        fn build(_: *api.Context, _: std.mem.Allocator) anyerror!x402_mod.Invoice {
+            return .{
+                .id = "inv-fixed",
+                .payee_did = "did:key:z6MkDemo",
+                .amount = 1000000,
+                .currency = .usdc,
+                .deadline = 0,
+                .description = "order",
+            };
+        }
+    }.build };
+    const mw = x402Middleware(&cfg);
+    const Handler = struct {
+        fn h(_: *api.Context) anyerror!void {}
+    };
+
+    var first = try api.Context.init(allocator, .GET, "/api/paid");
+    defer first.deinit();
+    try mw.func(&first, Handler.h, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 402), first.status_code);
+    try std.testing.expect(std.mem.indexOf(u8, first.response_body.items, "inv-fixed") != null);
+
+    var second = try api.Context.init(allocator, .GET, "/api/paid");
+    defer second.deinit();
+    try mw.func(&second, Handler.h, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 402), second.status_code);
+    try std.testing.expect(second.responded);
+}
+
+test "x402Middleware still issues an invoice without an Io handle" {
+    const allocator = std.testing.allocator;
+    var cfg = X402Config{};
+    const mw = x402Middleware(&cfg);
+    var ctx = try api.Context.init(allocator, .GET, "/api/paid");
+    defer ctx.deinit();
+
+    // This is how `http.Testkit.dispatch` and hand-built contexts reach the
+    // gate: no `Io` handle anywhere. The request must still be answered with an
+    // invoice (and a wall-clock deadline) instead of failing.
+    try mw.func(&ctx, struct {
+        fn h(_: *api.Context) anyerror!void {}
+    }.h, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 402), ctx.status_code);
+    const deadline = try InvoiceBody.deadlineOf(allocator, &ctx);
+    const now = @import("../core/Time.zig").wallClockSeconds(std.testing.io);
+    try std.testing.expect(deadline > now);
+    try std.testing.expect(deadline <= now + 3601);
 }

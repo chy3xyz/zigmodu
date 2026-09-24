@@ -68,14 +68,16 @@ var x402_cfg = web4.middleware.X402Config{
 ```
 
 **DID 一次性 challenge（防重放）**：`zigmodu.web4.challenge.ChallengeStore`
-签发短时随机 challenge，`verifyAndConsume` 每个 challenge 只接受一次：
+签发短时随机 challenge，`verifyAndConsume` 每个 challenge 只接受一次。
+中间件**先解 DID、验签，通过后才消费**该 challenge —— 反过来的顺序会让任何能
+观测到 challenge 的人用一份无效签名替受害者把它烧掉（此后受害者的合法请求被判重放）：
 
 ```zig
 var challenges = web4.challenge.ChallengeStore.init(allocator, io);
 defer challenges.deinit();
 var did_cfg = web4.middleware.DidAuthConfig{
     .path_prefix = "/api/identity",
-    .challenge_store = &challenges,   // 签名前必须先通过一次性 challenge
+    .challenge_store = &challenges,   // 先验签、通过后才消费一次性 challenge
 };
 ```
 

@@ -34,14 +34,27 @@ fn run(allocator: std.mem.Allocator, io: std.Io, serve: bool) !void {
     var server = http.Server.init(io, allocator, 18089);
     defer server.deinit();
 
-    // x402 gate: invoices persisted; proofs redeemed exactly once.
+    // x402 gate: the **verifier** decides validity (dev: allow-all, so the demo
+    // can be exercised without a chain); the **store** is the ledger that makes
+    // each invoice redeemable exactly once. Leaving the verifier at its default
+    // (`verifyPaymentReject`) would 403 every proof — see the strict gate below,
+    // which is exactly that configuration.
     var x402_cfg = web4.middleware.X402Config{
         .store = &invoice_store,
+        .verifier = web4.x402.verifyPaymentAllowAll, // demo only
         .path_prefix = "/api/paywall",
         .payee_did = "did:key:z6MkWeb4Demo",
         .description = "web4 demo access",
     };
     try server.addMiddleware(web4.middleware.x402Middleware(&x402_cfg));
+
+    // Same ledger, default verifier: proves a store does not stand in for
+    // verification (a client-supplied tx hash must still be rejected).
+    var strict_cfg = web4.middleware.X402Config{
+        .store = &invoice_store,
+        .path_prefix = "/api/paywall-strict",
+    };
+    try server.addMiddleware(web4.middleware.x402Middleware(&strict_cfg));
 
     // DID auth: protect /api/identity only.
     var did_cfg = web4.middleware.DidAuthConfig{
@@ -100,8 +113,30 @@ test "web4 x402 gate: 402 without proof, 200 with proof" {
     var backend = zigmodu.data.SqlxBackend{ .allocator = allocator, .client = &client };
     var invoice_store = web4.x402_store.X402Store.init(allocator, &backend);
     try invoice_store.migrate();
-    var x402_cfg = web4.middleware.X402Config{ .store = &invoice_store, .path_prefix = "/api/paywall" };
+    // x402 gate (dev verifier) + the same ledger under the default (rejecting)
+    // verifier, so the test can show both: a proof accepted by the verifier is
+    // redeemed once, and a proof the verifier rejects is 403 even though the
+    // invoice exists in the ledger.
+    var x402_cfg = web4.middleware.X402Config{
+        .store = &invoice_store,
+        .verifier = web4.x402.verifyPaymentAllowAll, // demo only
+        .path_prefix = "/api/paywall",
+    };
     try server.addMiddleware(web4.middleware.x402Middleware(&x402_cfg));
+    var strict_cfg = web4.middleware.X402Config{
+        .store = &invoice_store,
+        .path_prefix = "/api/paywall-strict",
+    };
+    try server.addMiddleware(web4.middleware.x402Middleware(&strict_cfg));
+    try server.addRoute(.{
+        .method = .GET,
+        .path = "api/paywall-strict",
+        .handler = struct {
+            fn h(ctx: *http.Context) anyerror!void {
+                try ctx.json(200, "{\"paid\":true}");
+            }
+        }.h,
+    });
     try server.addRoute(.{
         .method = .GET,
         .path = "api/paywall",
@@ -140,6 +175,24 @@ test "web4 x402 gate: 402 without proof, 200 with proof" {
     try ctx3.headers.put(try allocator.dupe(u8, "x402-invoice-id"), try allocator.dupe(u8, invoice_id));
     try server.handleForTest(&ctx3);
     try std.testing.expectEqual(@as(u16, 410), ctx3.status_code);
+
+    // A ledger entry is not a payment. Same store, default rejecting verifier,
+    // same client-supplied hash as above → 403, not 200 (this is the assertion
+    // that fails if the store is ever allowed to stand in for verification).
+    var ctx4 = try http.Context.init(allocator, .GET, "/api/paywall-strict");
+    defer ctx4.deinit();
+    try server.handleForTest(&ctx4);
+    try std.testing.expectEqual(@as(u16, 402), ctx4.status_code);
+    const body4 = try std.json.parseFromSlice(std.json.Value, allocator, ctx4.response_body.items, .{});
+    defer body4.deinit();
+    const strict_invoice = body4.value.object.get("data").?.object.get("invoice_id").?.string;
+
+    var ctx5 = try http.Context.init(allocator, .GET, "/api/paywall-strict");
+    defer ctx5.deinit();
+    try ctx5.headers.put(try allocator.dupe(u8, "x402-tx-hash"), try allocator.dupe(u8, "0xabc"));
+    try ctx5.headers.put(try allocator.dupe(u8, "x402-invoice-id"), try allocator.dupe(u8, strict_invoice));
+    try server.handleForTest(&ctx5);
+    try std.testing.expectEqual(@as(u16, 403), ctx5.status_code);
 }
 
 test "web4 did auth: 401 without signature, 200 with valid signature" {
