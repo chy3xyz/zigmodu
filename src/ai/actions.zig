@@ -45,11 +45,15 @@ fn findEntity(entities: []const business.EntitySpec, name: []const u8) ?business
     return null;
 }
 
+/// Column-name gate for the writable-column path. Delegates to the framework's
+/// `sqlx.validateIdentifier` (`[A-Za-z_][A-Za-z0-9_.]*`, ≤128) rather than
+/// re-deriving the rules: this local copy had drifted weaker than that gate (it
+/// accepted a leading digit and had no length cap), which is the same second-
+/// implementation problem `business.zig` was fixed for. The allowlist check
+/// above already restricts `col` to declared writable columns; this stays as
+/// the shape check that does not depend on that list being right.
 fn isValidIdentifier(s: []const u8) bool {
-    if (s.len == 0) return false;
-    for (s) |c| {
-        if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
-    }
+    sqlx.validateIdentifier(s) catch return false;
     return true;
 }
 

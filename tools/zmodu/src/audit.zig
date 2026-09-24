@@ -41,7 +41,9 @@ pub const usage =
     \\                (use data.CrudService), bare raw-entity responses
     \\                (use DTO whitelists), missing module tests, hand-written
     \\                column-index scan (use typed row.scan), multi-write
-    \\                service methods without a transaction
+    \\                service methods without a transaction, non-CSPRNG entropy
+    \\                (use std.Io.randomSecure — seeding a PRNG from a clock or
+    \\                pointer is the same defect)
     \\
     \\Options:
     \\  -j, --json              machine-readable JSON output
@@ -853,14 +855,18 @@ fn lintFile(
         // deriving a lock owner id, a session token or an API-key salt from it
         // can end up with two replicas sharing a credential (AGENTS.md
         // "CSPRNG"). `std.crypto.random` is not declared by this toolchain at
-        // all. `std.Io.randomSecure(io, buf)` is the only sanctioned spelling;
-        // it returns `error.EntropyUnavailable` rather than degrading. Keys on
+        // all. Seeding a non-cryptographic PRNG is the same defect by a longer
+        // road: its state is recoverable from a few outputs and the seed is
+        // whatever the caller assembled — the shape that shipped a predictable
+        // anti-replay nonce in `src/web4/challenge.zig` (see weakPrngSeed).
+        // `std.Io.randomSecure(io, buf)` is the only sanctioned spelling; it
+        // returns `error.EntropyUnavailable` rather than degrading. Keys on
         // the whole identifier, not `random(`, so `randomSecure` — which the
         // line-level comment skip below has already distinguished — never
         // matches: the Secure form is stripped before the test.
         if (!config.disabled.contains("b24")) {
             if (weakEntropyCall(trimmed)) {
-                try pushViolation(violations, allocator, "b24", rel_path, idx, "非 CSPRNG 熵源 — std.Io.random 失败时回落 pid+墙钟+ASLR（两个副本可能算出同一个凭证），std.crypto.random 本工具链根本不存在。改用 std.Io.randomSecure(io, buf)：失败即 error.EntropyUnavailable，绝不降级（AGENTS.md「CSPRNG」）；确属不可能出问题的演示代码可加 // audit: ignore b24", .{});
+                try pushViolation(violations, allocator, "b24", rel_path, idx, "非 CSPRNG 熵源 — std.Io.random 失败时回落 pid+墙钟+ASLR（两个副本可能算出同一个凭证），std.crypto.random 本工具链根本不存在；用时钟/指针/计数器播种 std.Random.DefaultPrng（= Xoshiro256）等非加密 PRNG 也一样可预测 —— challenge/nonce/会话令牌/盐值由此推出即可被重放。改用 std.Io.randomSecure(io, buf)：失败即 error.EntropyUnavailable，绝不降级（AGENTS.md「CSPRNG」）；测试用固定种子做可复现、或确属不可能出问题的演示代码，在同一行加 // audit: ignore b24 并注明缘由", .{});
             }
         }
 
@@ -1515,17 +1521,46 @@ fn isCrudName(name: []const u8) bool {
 /// b24 — does this line name a banned entropy source?
 ///
 /// `std.Io.randomSecure` is removed first, then the remainder is tested for
-/// `std.Io.random` / `std.crypto.random`. Zig has no lookahead either, so
-/// stripping the sanctioned spelling is the direct equivalent — and it means
-/// `std.Io.randomSecure(io, &buf)`, the form every caller should be using,
-/// never trips the rule while `std.Io.random(io, &buf)` always does.
+/// `std.Io.random` / `std.crypto.random` and for a seeded non-crypto PRNG. Zig
+/// has no lookahead either, so stripping the sanctioned spelling is the direct
+/// equivalent — and it means `std.Io.randomSecure(io, &buf)`, the form every
+/// caller should be using, never trips the rule while `std.Io.random(io, &buf)`
+/// always does.
 fn weakEntropyCall(line: []const u8) bool {
     var rest = line;
     while (std.mem.indexOf(u8, rest, "std.Io.randomSecure")) |at| {
         rest = rest[at + "std.Io.randomSecure".len ..];
     }
     return std.mem.indexOf(u8, rest, "std.Io.random") != null or
-        std.mem.indexOf(u8, rest, "std.crypto.random") != null;
+        std.mem.indexOf(u8, rest, "std.crypto.random") != null or
+        weakPrngSeed(rest);
+}
+
+/// b24 — seeding a non-cryptographic PRNG.
+///
+/// `std.Random.DefaultPrng` is an alias for `Xoshiro256`, and
+/// `Xoroshiro128` / `Pcg` / `Isaac64` / `Sfc64` / `RomuTrio` / `SplitMix64` are
+/// the same class: a few outputs recover the state, and — the part that made
+/// `src/web4/challenge.zig` replayable — the seed is whatever the *caller*
+/// assembled, a clock plus a pointer in that case. `DefaultCsprng` (ChaCha) is
+/// cryptographic but only as good as its 32-byte seed, and one line cannot tell
+/// a pointer from entropy, so seeding it is reported too.
+///
+/// Types are matched unqualified (`DefaultPrng`, not `std.Random.DefaultPrng`)
+/// so a line that names the type next to the seed call is caught even through
+/// an alias written on that same line:
+/// `const Rng = std.Random.Xoshiro256; var p = Rng.init(seed);`. The `.init(`
+/// requirement keeps *holding* such a type (`rng: std.Random.DefaultPrng,`)
+/// out of the rule — only seeding is a finding. Known gap, on the side of
+/// silence: a seed spelled `Rng.init(seed)` with the alias declared on an
+/// earlier line, and a `std.Random` that arrives from another function.
+fn weakPrngSeed(line: []const u8) bool {
+    if (std.mem.indexOf(u8, line, ".init(") == null) return false;
+    const weak = [_][]const u8{
+        "DefaultPrng", "DefaultCsprng", "Xoshiro256", "Xoroshiro128", "Pcg",
+        "Isaac64",     "Sfc64",         "RomuTrio",   "SplitMix64",
+    };
+    return containsAny(line, &weak);
 }
 
 /// b23 — the LHS of a binding whose initializer is a call that mentions an
@@ -2281,6 +2316,21 @@ test "audit business lint flags anti-patterns" {
     try lintFile(allocator, "service.zig", "pub fn h(self: *@This()) !void {\n    var seed: [8]u8 = undefined;\n    try std.Io.randomSecure(self.io, &seed);\n    _ = seed;\n}\n", "src/modules/x/service.zig", &cfg, &violations);
     // b24 negative — prose mentioning the banned call is a comment, not a use.
     try lintFile(allocator, "service.zig", "// never call std.Io.random(io, &seed) here\npub fn i(self: *@This()) void {\n    _ = self;\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b24 — seeding std.Random.DefaultPrng (an alias for Xoshiro256) from a
+    // clock/pointer pair: the anti-replay nonce that shipped predictable in
+    // src/web4/challenge.zig.
+    try lintFile(allocator, "service.zig", "pub fn j(self: *@This(), did: []const u8) !void {\n    _ = self;\n    const seed = @as(u64, @bitCast(@as(i64, 1))) ^ @as(u64, @intFromPtr(did.ptr));\n    var prng = std.Random.DefaultPrng.init(seed);\n    _ = prng.random().int(u64);\n}\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b24 — the type named beside the seed call still counts: a same-line alias
+    // (`const Rng = std.Random.Xoshiro256; var p = Rng.init(seed);`), plus the
+    // caller-seeded CSPRNG, whose 32-byte seed a line scan cannot tell apart
+    // from a pointer.
+    try lintFile(allocator, "persistence.zig", "pub fn k(self: *@This()) !void {\n    _ = self;\n    const Rng = std.Random.Xoshiro256; var prng = Rng.init(7);\n    _ = prng.random().int(u64);\n}\n", "src/modules/x/persistence.zig", &cfg, &violations);
+    try lintFile(allocator, "persistence.zig", "pub fn l(self: *@This(), seed: [32]u8) void {\n    _ = self;\n    var csprng = std.Random.DefaultCsprng.init(seed);\n    _ = csprng;\n}\n", "src/modules/x/persistence.zig", &cfg, &violations);
+    // b24 negative — *holding* a PRNG type is not seeding it.
+    try lintFile(allocator, "service.zig", "pub const Gen = struct {\n    rng: std.Random.DefaultPrng,\n};\n", "src/modules/x/service.zig", &cfg, &violations);
+    // b24 negative — a reproducible fixed seed is the sanctioned test use; the
+    // marker is the口径 (audit has no test-block state).
+    try lintFile(allocator, "service.zig", "test \"deterministic shuffle\" {\n    var prng = std.Random.DefaultPrng.init(42); // audit: ignore b24 reproducible test seed\n    _ = prng.random().int(u64);\n}\n", "src/modules/x/service.zig", &cfg, &violations);
 
     var rules = std.StringHashMap(usize).init(allocator);
     defer rules.deinit();
@@ -2311,7 +2361,7 @@ test "audit business lint flags anti-patterns" {
     try std.testing.expectEqual(@as(usize, 1), rules.get("b21").?);
     try std.testing.expectEqual(@as(usize, 1), rules.get("b22").?);
     try std.testing.expectEqual(@as(usize, 2), rules.get("b23").?);
-    try std.testing.expectEqual(@as(usize, 2), rules.get("b24").?);
+    try std.testing.expectEqual(@as(usize, 5), rules.get("b24").?);
 }
 
 test "audit collectModelStructs picks up indented local const structs" {

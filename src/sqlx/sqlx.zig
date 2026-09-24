@@ -3453,14 +3453,19 @@ pub const MySqlConn = struct {
         try sql.appendSlice(self.allocator, ")");
 
         const stmt = libmysql_c.mysql_stmt_init(self.mysql) orelse return error.DatabaseError;
-        errdefer _ = libmysql_c.mysql_stmt_close(stmt);
+        // Sole owner of `stmt` for the whole function: exactly one close on
+        // every exit path. An overlapping `errdefer` here (also closing `stmt`)
+        // used to fire *together* with this `defer` whenever a later step
+        // returned an error — row/column count mismatch below, or
+        // `mysql_stmt_execute` failing (e.g. duplicate key) — closing the same
+        // MYSQL_STMT twice.
+        defer _ = libmysql_c.mysql_stmt_close(stmt);
         if (libmysql_c.mysql_stmt_prepare(stmt, @ptrCast(sql.items.ptr), @intCast(sql.items.len)) != 0) {
             const err_no = libmysql_c.mysql_stmt_errno(stmt);
             const err_msg = std.mem.span(libmysql_c.mysql_stmt_error(stmt));
             std.log.err("MySQL batch prepare error: errno={d} msg={s}", .{ err_no, err_msg });
             return mysqlErrnoToError(err_no);
         }
-        defer _ = libmysql_c.mysql_stmt_close(stmt);
 
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
@@ -4006,7 +4011,14 @@ const ConnPool = struct {
                     // (waitTimeout re-acquires the mutex before returning).
                     error.Timeout => {},
                     error.Canceled => {
-                        self.removeWaiter(&waiter);
+                        // Cancellation can land *after* `release` already handed
+                        // this waiter a connection (`ready` is set, `conn` is
+                        // written, and the signal may or may not have been
+                        // observed). Dropping such a hand-off loses the
+                        // connection outright — neither closed nor re-pooled,
+                        // with `active` never decremented — so every canceled
+                        // wait would cost the pool one permanent slot.
+                        if (self.cancelWaiter(&waiter)) |conn| return conn;
                         self.mutex.unlock(self.io);
                         return error.Timeout;
                     },
@@ -4038,6 +4050,18 @@ const ConnPool = struct {
                 return;
             }
         }
+    }
+
+    /// Canceled-wait cleanup: drop `waiter` from the queue and report the
+    /// connection `release` already handed it (`ready`/`conn` are written before
+    /// the signal, so a cancellation can arrive in between). Caller holds the
+    /// pool mutex; a non-null result transfers that connection to the caller,
+    /// null means the waiter owned nothing.
+    fn cancelWaiter(self: *ConnPool, waiter: *Waiter) ?Conn {
+        self.removeWaiter(waiter);
+        if (!waiter.ready) return null;
+        _ = self.acquire_count.fetchAdd(1, .monotonic);
+        return waiter.conn;
     }
 
     pub fn release(self: *ConnPool, conn: Conn) void {
@@ -4085,6 +4109,18 @@ const ConnPool = struct {
             conn.close();
             _ = self.active.fetchSub(1, .monotonic);
         }
+    }
+
+    /// Retire a connection that must not be reused: ROLLBACK/COMMIT itself
+    /// failed, so the server-side transaction state is unknown (PostgreSQL, for
+    /// example, keeps the session in "current transaction is aborted" until a
+    /// successful ROLLBACK). Failure-path counterpart of `release` — closes the
+    /// connection and drops it from the active count instead of handing it to
+    /// the next borrower.
+    pub fn discard(self: *ConnPool, conn: Conn) void {
+        _ = self.release_count.fetchAdd(1, .monotonic);
+        conn.close();
+        _ = self.active.fetchSub(1, .monotonic);
     }
 
     /// Pre-create `count` idle connections (capped at `max_idle`).
@@ -4186,14 +4222,24 @@ const ConnPool = struct {
     }
 
     /// Execute a function within a transaction, acquiring a connection from the pool.
-    /// The connection is automatically released after commit or rollback.
+    /// The connection is automatically released after commit or rollback — or
+    /// discarded when ending the transaction failed (its state is unknown then).
     pub fn transaction(self: *ConnPool, comptime func: anytype, args: anytype) !@typeInfo(@TypeOf(func)).@"fn".return_type {
         const conn = try self.acquire();
-        defer self.release(conn);
+        var poisoned = false;
+        defer {
+            if (poisoned) self.discard(conn) else self.release(conn);
+        }
         try conn.begin();
-        errdefer conn.rollback() catch |e| std.log.err("[ConnPool] tx rollback failed: {}", .{e});
+        errdefer conn.rollback() catch |e| {
+            std.log.err("[ConnPool] tx rollback failed: {}", .{e});
+            poisoned = true;
+        };
         const result = try @call(.auto, func, .{conn} ++ args);
-        try conn.commit();
+        conn.commit() catch |e| {
+            poisoned = true;
+            return e;
+        };
         return result;
     }
 };
@@ -4410,6 +4456,12 @@ pub const Client = struct {
     /// it as long-lived as the primary. On any replica failure the read is
     /// retried once against the primary, so stale-or-down replicas degrade
     /// to single-primary behavior instead of failing requests.
+    ///
+    /// Every failed replica attempt counts against the *replica's* breaker —
+    /// including the errors `isAcceptable` swallows (`error.NotFound` is a
+    /// replica that is structurally behind, i.e. missing the table). Without
+    /// that count the breaker never trips and routing keeps picking a replica
+    /// that cannot serve the read.
     pub fn withReplica(self: *Client, replica: *Client) void {
         self.replica = replica;
     }
@@ -4427,6 +4479,18 @@ pub const Client = struct {
             return f(err);
         }
         return defaultAcceptable(err);
+    }
+
+    /// Count a failed replica attempt against the replica's own breaker.
+    ///
+    /// The replica's `query`/`queryCursorEx` already records every error
+    /// `isAcceptable` rejects; this covers the other half — an *acceptable*
+    /// error (`error.NotFound` from a table the replica does not have) still
+    /// means the replica could not serve the read. Mirroring the acceptance
+    /// filter keeps the bookkeeping "exactly once per failed attempt".
+    fn noteReplicaFailure(replica: *Client, err: anyerror) void {
+        if (!replica.isAcceptable(err)) return;
+        replica.cb.recordFailure(replica.io);
     }
 
     /// Pool saturation snapshot — `null` when pooling is disabled (e.g. the
@@ -4550,14 +4614,22 @@ pub const Client = struct {
     pub fn query(self: *Client, sql_str: []const u8, args: []const Value) !Rows {
         // Read/write splitting: route pure reads to the replica when one is
         // registered. A replica failure falls back to the primary read so a
-        // stale replica degrades instead of erroring.
+        // stale replica degrades instead of erroring. The fallback goes to
+        // `queryPrimary` directly — re-entering `query` would run `readTarget()`
+        // again and, with the replica's breaker still closed (see
+        // `noteReplicaFailure`), recurse without bound.
         if (self.readTarget()) |r| {
             return r.query(sql_str, args) catch |err| {
                 std.log.warn("[sqlx] replica read failed ({s}), falling back to primary", .{@errorName(err)});
-                return self.query(sql_str, args);
+                r.noteReplicaFailure(err);
+                return self.queryPrimary(sql_str, args);
             };
         }
+        return self.queryPrimary(sql_str, args);
+    }
 
+    /// The primary-side read path: `query` with replica routing removed.
+    fn queryPrimary(self: *Client, sql_str: []const u8, args: []const Value) !Rows {
         if (!self.cb.allow(self.io)) return error.CircuitBreakerOpen;
 
         const t0 = Time.monotonicNow();
@@ -4593,13 +4665,20 @@ pub const Client = struct {
     /// materializes all rows; `.streaming` fetches rows lazily and the row returned
     /// by `next()` is only valid until the next `next()`/`deinit()`.
     pub fn queryCursorEx(self: *Client, sql_str: []const u8, args: []const Value, opts: CursorOptions) !Cursor {
-        // Read/write splitting (same fallback semantics as `query`).
+        // Read/write splitting (same fallback semantics as `query`, including
+        // the primary-only fallback so the replica is not re-entered).
         if (self.readTarget()) |r| {
             return r.queryCursorEx(sql_str, args, opts) catch |err| {
                 std.log.warn("[sqlx] replica cursor failed ({s}), falling back to primary", .{@errorName(err)});
-                return self.queryCursorEx(sql_str, args, opts);
+                r.noteReplicaFailure(err);
+                return self.queryCursorExPrimary(sql_str, args, opts);
             };
         }
+        return self.queryCursorExPrimary(sql_str, args, opts);
+    }
+
+    /// The primary-side cursor path: `queryCursorEx` with replica routing removed.
+    fn queryCursorExPrimary(self: *Client, sql_str: []const u8, args: []const Value, opts: CursorOptions) !Cursor {
         if (!self.cb.allow(self.io)) return error.CircuitBreakerOpen;
 
         self.ensurePool();
@@ -4821,8 +4900,11 @@ pub const Client = struct {
     pub fn transact(self: *Client, comptime T: type, fn_tx: *const fn (*Transaction) errors.ResultT(T)) errors.ResultT(T) {
         var tx = try self.beginTx();
         errdefer {
+            // `Transaction.rollback` retires the connection either way —
+            // released after a clean ROLLBACK, discarded when ROLLBACK itself
+            // failed. Releasing here as well would hand a connection with an
+            // unknown transaction state to the next borrower.
             tx.rollback() catch |err| std.log.err("[sqlx] Transaction rollback failed: {}", .{err});
-            if (tx.pool) |p| p.release(tx.conn);
         }
         const result = try fn_tx(&tx);
         try tx.commit();
@@ -4836,7 +4918,6 @@ pub const Client = struct {
         var tx = try self.beginTx();
         errdefer {
             tx.rollback() catch |err| std.log.err("[sqlx] Transaction rollback failed: {}", .{err});
-            if (tx.pool) |p| p.release(tx.conn);
         }
         const result = try fn_tx(&tx, ctx);
         try tx.commit();
@@ -5112,12 +5193,29 @@ pub const Transaction = struct {
         return self.conn.exec(sql_str, args);
     }
 
-    pub fn commit(self: *Transaction) !void {
-        try self.conn.commit();
+    /// Return the pooled connection after a clean COMMIT/ROLLBACK.
+    fn releaseConn(self: *Transaction) void {
         if (self.pool) |p| {
             p.release(self.conn);
             self.pool = null;
         }
+    }
+
+    /// Failure-path counterpart of `releaseConn`: ending the transaction failed,
+    /// so the connection's state is unknown and it must not be pooled.
+    fn discardConn(self: *Transaction) void {
+        if (self.pool) |p| {
+            p.discard(self.conn);
+            self.pool = null;
+        }
+    }
+
+    pub fn commit(self: *Transaction) !void {
+        self.conn.commit() catch |err| {
+            self.discardConn();
+            return err;
+        };
+        self.releaseConn();
     }
 
     pub fn commitCtx(self: *Transaction, ctx: SqlContext) !void {
@@ -5126,11 +5224,11 @@ pub const Transaction = struct {
     }
 
     pub fn rollback(self: *Transaction) !void {
-        try self.conn.rollback();
-        if (self.pool) |p| {
-            p.release(self.conn);
-            self.pool = null;
-        }
+        self.conn.rollback() catch |err| {
+            self.discardConn();
+            return err;
+        };
+        self.releaseConn();
     }
 
     pub fn rollbackCtx(self: *Transaction, ctx: SqlContext) !void {
@@ -6069,6 +6167,60 @@ test "read replica failure falls back to primary" {
     try std.testing.expectEqualStrings("from-primary", row.v);
 }
 
+test "read replica failure that is 'acceptable' still falls back to primary" {
+    if (!DriverFeatures.sqlite) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var primary = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer primary.deinit();
+    var dead_replica = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = "/nonexistent-dir-must-fail/replica.db" });
+    defer dead_replica.deinit();
+
+    // `acceptable` is the knob that decides whether a replica failure trips the
+    // replica's own breaker, and it is the whole reason the fallback used to
+    // recurse: an error the filter accepts is not recorded, so `readTarget()`
+    // kept picking the same replica and `self.query(...)` re-entered itself.
+    // `error.NotFound` is the real-world instance (`defaultAcceptable` accepts
+    // it; SQLite raises it for a table the replica does not have, i.e. a
+    // structurally-behind replica). It is modeled with a connection failure
+    // here because the SQLite driver logs an *error* for the missing-table
+    // path, and Zig's test runner fails the run when anything logged at error
+    // level — the mechanism under test does not depend on which error it is.
+    const Accept = struct {
+        fn f(err: anyerror) bool {
+            return err == error.ConnectionFailed;
+        }
+    };
+    dead_replica.acceptable = Accept.f;
+
+    _ = try primary.exec("CREATE TABLE t (v TEXT)", &.{});
+    _ = try primary.exec("INSERT INTO t (v) VALUES ('from-primary')", &.{});
+
+    primary.withReplica(&dead_replica);
+
+    // One failed replica attempt, then the primary — not one recursion per
+    // attempt.
+    const row = try primary.queryRow(struct { v: []const u8 }, "SELECT v FROM t", &.{});
+    defer freeScanned(allocator, @TypeOf(row), row);
+    try std.testing.expectEqualStrings("from-primary", row.v);
+
+    // The unusable attempt counts against the replica's breaker even though its
+    // error is "acceptable": after `failure_threshold` of them the replica is
+    // skipped outright instead of probed on every read.
+    try std.testing.expectEqual(@as(u32, 1), dead_replica.cb.failure_count);
+    var i: u32 = 1;
+    while (i < dead_replica.cb.failure_threshold) : (i += 1) {
+        const r = try primary.queryRow(struct { v: []const u8 }, "SELECT v FROM t", &.{});
+        freeScanned(allocator, @TypeOf(r), r);
+    }
+    try std.testing.expect(!dead_replica.cb.allow(std.testing.io));
+
+    // ...and reads keep serving from the primary.
+    const after = try primary.queryRow(struct { v: []const u8 }, "SELECT v FROM t", &.{});
+    defer freeScanned(allocator, @TypeOf(after), after);
+    try std.testing.expectEqualStrings("from-primary", after.v);
+}
+
 test "cached conn queryRow and exec" {
     if (!DriverFeatures.sqlite) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -6400,6 +6552,101 @@ test "sqlite transaction rollback" {
     var rows = try client.query("SELECT name FROM users WHERE name = ?1", &.{.{ .string = "Charlie" }});
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 0), rows.rows.len);
+}
+
+test "failed transaction is re-pooled when ROLLBACK succeeds" {
+    if (!DriverFeatures.sqlite) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var db = try Client.open(allocator, std.testing.io, .{
+        .driver = .sqlite,
+        .sqlite_path = ":memory:",
+        .max_open_conns = 2,
+        .max_idle_conns = 2,
+        .max_wait_ms = 1000,
+    });
+    defer db.deinit();
+
+    // The pool is created lazily by the first statement; take it afterwards.
+    _ = try db.exec("CREATE TABLE t (v INTEGER)", &.{});
+    const pool = &db.pool.?;
+    try std.testing.expectEqual(@as(u32, 1), pool.metrics().current_active);
+    try std.testing.expectEqual(@as(u32, 1), pool.metrics().current_idle);
+
+    const Fail = struct {
+        fn run(tx: *Transaction) errors.ResultT(void) {
+            // Business failure: the transaction is still healthy, so
+            // `transact`'s error path rolls it back successfully.
+            _ = try tx.exec("INSERT INTO t (v) VALUES (1)", &.{});
+            return error.DatabaseError;
+        }
+    };
+    try std.testing.expectError(error.DatabaseError, db.transact(void, Fail.run));
+
+    // ROLLBACK succeeded, so the connection comes back to the pool as usual —
+    // `transact` must not retire a connection that was cleaned up.
+    try std.testing.expectEqual(@as(u32, 1), pool.metrics().current_idle);
+    try std.testing.expectEqual(@as(u32, 1), pool.metrics().current_active);
+}
+
+test "failed rollback retires the pooled connection instead of re-pooling it" {
+    if (!DriverFeatures.sqlite) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var db = try Client.open(allocator, std.testing.io, .{
+        .driver = .sqlite,
+        .sqlite_path = ":memory:",
+        .max_open_conns = 2,
+        .max_idle_conns = 2,
+        .max_wait_ms = 1000,
+    });
+    defer db.deinit();
+
+    // The pool is created lazily by the first statement; take it afterwards.
+    _ = try db.exec("CREATE TABLE t (v INTEGER)", &.{});
+    const pool = &db.pool.?;
+    try std.testing.expectEqual(@as(u32, 1), pool.metrics().current_active);
+    try std.testing.expectEqual(@as(u32, 1), pool.metrics().current_idle);
+
+    var tx = try db.beginTx();
+    // End the transaction out from under it: the ROLLBACK now fails ("cannot
+    // rollback - no transaction is active"), leaving the connection's
+    // transaction state unknown.
+    _ = try tx.exec("COMMIT", &.{});
+    try std.testing.expectError(error.DatabaseError, tx.rollback());
+
+    // It must be closed, not put back into the idle pool for the next borrower.
+    try std.testing.expectEqual(@as(u32, 0), pool.metrics().current_idle);
+    try std.testing.expectEqual(@as(u32, 0), pool.metrics().current_active);
+
+    // The pool recovers on the next checkout.
+    const n = try db.queryRow(struct { n: i64 }, "SELECT 1 AS n", &.{});
+    try std.testing.expectEqual(@as(i64, 1), n.n);
+    try std.testing.expectEqual(@as(u32, 1), pool.metrics().current_active);
+}
+
+test "failed commit retires the pooled connection instead of re-pooling it" {
+    if (!DriverFeatures.sqlite) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var db = try Client.open(allocator, std.testing.io, .{
+        .driver = .sqlite,
+        .sqlite_path = ":memory:",
+        .max_open_conns = 2,
+        .max_idle_conns = 2,
+        .max_wait_ms = 1000,
+    });
+    defer db.deinit();
+
+    _ = try db.exec("CREATE TABLE t (v INTEGER)", &.{});
+    const pool = &db.pool.?;
+
+    var tx = try db.beginTx();
+    _ = try tx.exec("ROLLBACK", &.{});
+    try std.testing.expectError(error.DatabaseError, tx.commit());
+
+    try std.testing.expectEqual(@as(u32, 0), pool.metrics().current_idle);
+    try std.testing.expectEqual(@as(u32, 0), pool.metrics().current_active);
+
+    const n = try db.queryRow(struct { n: i64 }, "SELECT 1 AS n", &.{});
+    try std.testing.expectEqual(@as(i64, 1), n.n);
 }
 
 test "sqlite queryRowPartial struct scan" {
@@ -7485,6 +7732,51 @@ test "conn pool release hands off to waiters in FIFO order" {
     waiters[1].conn.close();
 }
 
+test "canceled pool waiter keeps a connection already handed to it" {
+    const allocator = std.testing.allocator;
+    var db = try Client.open(allocator, std.testing.io, .{
+        .driver = .sqlite,
+        .sqlite_path = ":memory:",
+        .max_open_conns = 2,
+        .max_idle_conns = 0,
+        .max_wait_ms = 1000,
+    });
+    defer db.deinit();
+    db.warmPool();
+    const pool = &db.pool.?;
+
+    const conn = try pool.acquire();
+    try std.testing.expectEqual(@as(u32, 1), pool.metrics().current_active);
+
+    // `release` writes the hand-off into the waiter (`ready` + `conn`) *before*
+    // signalling, so a cancelation can arrive with `ready` set. That connection
+    // is the waiter's at that point: dropping it on cancel would neither close
+    // it nor re-pool it, and `active` would never come down — one pool slot
+    // lost per canceled wait.
+    var waiter: ConnPool.Waiter = .{ .cond = .init, .ready = false, .conn = undefined };
+    try pool.waiters.append(allocator, &waiter);
+    pool.release(conn);
+    try std.testing.expect(waiter.ready);
+
+    const handed = pool.cancelWaiter(&waiter);
+    try std.testing.expect(handed != null);
+    try std.testing.expectEqual(@as(usize, 0), pool.waiters.items.len);
+    try std.testing.expectEqual(@as(u32, 1), pool.metrics().current_active);
+
+    // The other half: a waiter that was never handed anything owns nothing.
+    var empty: ConnPool.Waiter = .{ .cond = .init, .ready = false, .conn = undefined };
+    try pool.waiters.append(allocator, &empty);
+    try std.testing.expect(pool.cancelWaiter(&empty) == null);
+    try std.testing.expectEqual(@as(usize, 0), pool.waiters.items.len);
+
+    // Give it back: the connection goes through normal pool accounting
+    // (max_idle_conns = 0 → closed, active back to zero).
+    pool.release(handed.?);
+    const after = pool.metrics();
+    try std.testing.expectEqual(@as(u32, 0), after.current_active);
+    try std.testing.expectEqual(@as(u32, 0), after.current_idle);
+}
+
 test "sqlite buffered cursor iterates rows" {
     const allocator = std.testing.allocator;
     var db = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
@@ -7586,6 +7878,55 @@ test "postgres batchInsertEx protocol mode api compiles" {
     _ = try db.batchInsertEx("t", &.{"c"}, &.{
         &.{Value{ .int = 1 }},
     }, .{ .mode = .protocol });
+}
+
+test "mysql batch insert failure closes the prepared statement exactly once" {
+    try skipUnlessDb("mysql");
+    const allocator = std.testing.allocator;
+
+    const Env = struct {
+        fn get(comptime name: [:0]const u8) ?[]const u8 {
+            if (builtin.os.tag == .windows) return null;
+            const raw = std.c.getenv(name.ptr) orelse return null;
+            return std.mem.span(raw);
+        }
+    };
+    const port: u16 = blk: {
+        const raw = Env.get("MYSQL_PORT") orelse break :blk 3306;
+        break :blk std.fmt.parseInt(u16, raw, 10) catch 3306;
+    };
+
+    var client = Client.init(allocator, std.testing.io, .{
+        .driver = .mysql,
+        .host = Env.get("MYSQL_HOST") orelse "127.0.0.1",
+        .port = port,
+        .username = Env.get("MYSQL_USER") orelse "root",
+        .password = Env.get("MYSQL_PASSWORD") orelse "",
+        .database = Env.get("MYSQL_DATABASE") orelse "zigzero_test",
+    });
+    defer client.deinit();
+    try client.connect();
+
+    _ = client.exec("DROP TABLE IF EXISTS zm_stmt_close_probe", &.{}) catch |e| std.log.debug("[test] drop probe table: {}", .{e});
+    defer _ = client.exec("DROP TABLE IF EXISTS zm_stmt_close_probe", &.{}) catch |e| std.log.debug("[test] drop probe table: {}", .{e});
+    _ = try client.exec("CREATE TABLE zm_stmt_close_probe (id INT PRIMARY KEY, v VARCHAR(32))", &.{});
+    _ = try client.exec("INSERT INTO zm_stmt_close_probe (id, v) VALUES (1, 'first')", &.{});
+
+    const rows = [_][]const Value{
+        &.{ Value{ .int = 2 }, Value{ .string = "ok" } },
+        &.{Value{ .int = 3 }}, // one value for two columns
+    };
+    // The second row's arity is wrong, so `batchInsertPrepared` returns an error
+    // after the statement was prepared and the first row was executed — the
+    // error return where the statement must still be closed exactly once. The
+    // old code had an `errdefer` *and* a `defer` live for the same MYSQL_STMT
+    // here, and closed it twice (double free on the driver's heap).
+    try std.testing.expectError(error.DatabaseError, client.batchInsertEx("zm_stmt_close_probe", &.{ "id", "v" }, &rows, .{ .mode = .protocol }));
+
+    // The connection is still usable, and only the first (well-formed) row of
+    // the failed protocol batch landed.
+    const n = try client.queryRow(struct { n: i64 }, "SELECT COUNT(*) AS n FROM zm_stmt_close_probe", &.{});
+    try std.testing.expectEqual(@as(i64, 2), n.n);
 }
 
 test "diagnosePostgres handles null result and missing error fields safely" {

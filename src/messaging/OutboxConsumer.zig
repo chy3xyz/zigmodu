@@ -10,6 +10,7 @@ const std = @import("std");
 const SqlxBackend = @import("../persistence/backends/SqlxBackend.zig").SqlxBackend;
 const Outbox = @import("OutboxPublisher.zig");
 const PrometheusMetrics = @import("../metrics/PrometheusMetrics.zig").PrometheusMetrics;
+const sqlx = @import("../sqlx/sqlx.zig");
 
 pub const OutboxEntry = Outbox.OutboxEntry;
 
@@ -138,7 +139,8 @@ pub const OutboxConsumer = struct {
         const select = try self.buildSelectPending();
         defer self.allocator.free(select);
 
-        var cursor = try self.backend.client.queryCursorEx(select, &.{}, .{});
+        var arg_buf: [1]sqlx.Value = undefined;
+        var cursor = try self.backend.client.queryCursorEx(select, self.pendingArgs(&arg_buf), .{});
         defer cursor.deinit();
 
         var stats = PollStats{ .selected = 0, .delivered = 0, .failed = 0 };
@@ -199,12 +201,17 @@ pub const OutboxConsumer = struct {
         return stats;
     }
 
+    /// Pending-batch SELECT. The topic is **bound** (`?`), never interpolated:
+    /// the filter comes from configuration, and a quote in it used to end the
+    /// string literal and change the statement (recorded as low severity in
+    /// `docs/dev/security-audit-v0.31.0.md` and left unfixed until now). The
+    /// caller supplies the argument — see `pendingArgs`.
     fn buildSelectPending(self: *Self) ![]const u8 {
-        if (self.config.topic_filter) |topic| {
+        if (self.config.topic_filter != null) {
             return std.fmt.allocPrint(
                 self.allocator,
-                "SELECT id, topic, payload, status, retry_count, max_retries, created_at, updated_at, error_message FROM event_outbox WHERE status IN (0, 1) AND retry_count < max_retries AND topic = '{s}' ORDER BY created_at ASC LIMIT {d}",
-                .{ topic, self.config.batch_size },
+                "SELECT id, topic, payload, status, retry_count, max_retries, created_at, updated_at, error_message FROM event_outbox WHERE status IN (0, 1) AND retry_count < max_retries AND topic = ? ORDER BY created_at ASC LIMIT {d}",
+                .{self.config.batch_size},
             );
         }
         return std.fmt.allocPrint(
@@ -212,6 +219,17 @@ pub const OutboxConsumer = struct {
             "SELECT id, topic, payload, status, retry_count, max_retries, created_at, updated_at, error_message FROM event_outbox WHERE status IN (0, 1) AND retry_count < max_retries ORDER BY created_at ASC LIMIT {d}",
             .{self.config.batch_size},
         );
+    }
+
+    /// Arguments for `buildSelectPending`: the bound topic when a filter is
+    /// configured, otherwise none. `buf` is caller-owned scratch, one slot per
+    /// possible filter.
+    fn pendingArgs(self: *const Self, buf: *[1]sqlx.Value) []const sqlx.Value {
+        if (self.config.topic_filter) |topic| {
+            buf[0] = .{ .string = topic };
+            return buf[0..1];
+        }
+        return &.{};
     }
 
     fn parseEntry(self: *Self, row: *@import("../sqlx/sqlx.zig").Row) !OutboxEntry {
@@ -377,4 +395,48 @@ test "outbox metrics expose backlog and delivery counters" {
     try std.testing.expect(std.mem.indexOf(u8, text, "outbox_failed_total 0") != null);
     // Gauge was refreshed when the backlog was still 2.
     try std.testing.expect(std.mem.indexOf(u8, text, "outbox_pending 2.000000") != null);
+}
+
+test "OutboxConsumer binds the topic filter instead of interpolating it" {
+    // The filter used to be pasted into a single-quoted literal, so a quote in
+    // the configured topic ended the string and changed the statement. It is a
+    // bound parameter now: a topic that contains quotes must both select the
+    // right row and keep the statement well-formed.
+    const allocator = std.testing.allocator;
+    var client = sqlx.Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+    try client.connect();
+    _ = try client.exec(
+        "CREATE TABLE event_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, payload TEXT, status INTEGER DEFAULT 0, tenant_id INTEGER, retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 5, created_at INTEGER, updated_at INTEGER, error_message TEXT)",
+        &.{},
+    );
+    const quoted = "ai.o'brien";
+    _ = try client.exec(
+        "INSERT INTO event_outbox (topic, payload, status, retry_count, max_retries, created_at, updated_at) VALUES (?, '{}', 0, 0, 3, 100, 100), ('ai.other', '{}', 0, 0, 3, 101, 101)",
+        &.{.{ .string = quoted }},
+    );
+
+    var backend = SqlxBackend{ .allocator = allocator, .client = &client };
+    const State = struct {
+        var handled: usize = 0;
+    };
+    const Handler = struct {
+        fn call(_: *anyopaque, _: std.mem.Allocator, _: OutboxEntry) anyerror!void {
+            State.handled += 1;
+        }
+    };
+    State.handled = 0;
+    var dummy: u8 = 0;
+    var consumer = OutboxConsumer.init(
+        allocator,
+        &backend,
+        .{ .batch_size = 10, .topic_filter = quoted },
+        &dummy,
+        Handler.call,
+    );
+
+    const stats = try consumer.pollOnce();
+    try std.testing.expectEqual(@as(usize, 1), stats.selected);
+    try std.testing.expectEqual(@as(usize, 1), stats.delivered);
+    try std.testing.expectEqual(@as(usize, 1), State.handled);
 }

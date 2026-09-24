@@ -67,7 +67,102 @@ pub const ServeOptions = struct {
     max_pending_streams: usize = 64,
     /// Cap total pending outbound wire bytes (ENHANCE_YOUR_CALM when exceeded).
     max_pending_bytes: usize = 4 * 1024 * 1024,
+    /// Inbound resource limits (RFC 7540 §10.5 denial-of-service defenses).
+    inbound: InboundLimits = .{},
 };
+
+/// Inbound resource limits for one HTTP/2 connection.
+///
+/// The H1 path bounds requests through `Server.Config` (`max_body_size`,
+/// `header_limits`); the H2 loop has no access to that struct, so it carries its
+/// own limits and applies them at the frame layer, before anything is buffered.
+pub const InboundLimits = struct {
+    /// Largest inbound frame we accept. RFC 7540 §4.2: the peer must not exceed
+    /// the value we advertise in SETTINGS, and 16384 is the default. Raise it
+    /// only together with an advertised SETTINGS_MAX_FRAME_SIZE.
+    max_frame_size: u24 = 16384,
+    /// Compressed header-block bytes buffered per stream (HEADERS + CONTINUATION).
+    max_header_block_bytes: usize = 64 * 1024,
+    /// Request-body bytes buffered per stream. Mirrors the H1 `max_body_size` default.
+    max_body_bytes: usize = 8 * 1024 * 1024,
+    /// Total inbound frame bytes (header + payload) per connection.
+    max_inbound_bytes: usize = 64 * 1024 * 1024,
+    /// CONTINUATION frames allowed after one HEADERS frame without END_HEADERS.
+    /// Bounds the CONTINUATION-flood class: each frame may be empty, so the byte
+    /// budget alone would not stop it.
+    max_continuation_frames: usize = 16,
+    /// Advertised SETTINGS_MAX_CONCURRENT_STREAMS — and actually enforced (§5.1.2).
+    max_concurrent_streams: u32 = 100,
+    /// Priority-tree nodes allowed beyond the concurrent-stream cap. PRIORITY on
+    /// idle streams is legal, so the tree needs headroom — but not unbounded.
+    priority_tree_slack: usize = 32,
+};
+
+/// Inbound limit breaches. Each maps to a concrete HTTP/2 answer (GOAWAY or
+/// RST_STREAM) — none of them may be swallowed, because the alternative is an
+/// unbounded buffer or, for the flow-control cases, a desynchronised stream.
+pub const InboundLimitError = error{
+    /// Frame longer than `InboundLimits.max_frame_size` → GOAWAY FRAME_SIZE_ERROR.
+    FrameSizeExceeded,
+    /// Connection byte budget spent → GOAWAY ENHANCE_YOUR_CALM.
+    BudgetExceeded,
+    /// Too many CONTINUATION frames → GOAWAY ENHANCE_YOUR_CALM.
+    ContinuationFlood,
+    /// New client stream id that is not odd / not strictly increasing → GOAWAY PROTOCOL_ERROR.
+    InvalidStreamId,
+    /// More concurrent streams than advertised → RST_STREAM REFUSED_STREAM.
+    TooManyStreams,
+    /// Per-stream header block cap → RST_STREAM ENHANCE_YOUR_CALM.
+    HeaderBlockTooLarge,
+    /// Per-stream body cap → RST_STREAM ENHANCE_YOUR_CALM.
+    BodyTooLarge,
+};
+
+/// Peer SETTINGS entries that changed connection-level state.
+const AppliedPeerSettings = struct {
+    /// New peer INITIAL_WINDOW_SIZE; the caller must propagate it to every open
+    /// stream (`Http2.FlowControlState.applyPeerInitialWindowSize`).
+    initial_window_size: ?u31 = null,
+    /// New peer MAX_FRAME_SIZE — the cap on *our* outbound frames.
+    max_frame_size: ?u31 = null,
+};
+
+/// Validate and apply a peer SETTINGS payload (RFC 7540 §6.5.2).
+///
+/// Connection-fatal values come back as errors so the caller can answer GOAWAY
+/// with the code RFC 7540 mandates; `applyPeerSettings` never clamps or
+/// truncates. `Http2.validateInitialWindowSize` is the narrowing step: casting
+/// `0x8000_0000` used to abort the process here.
+fn applyPeerSettings(
+    conn_flow: *Http2.FlowControlState,
+    payload: []const u8,
+) Http2.FlowControlError!AppliedPeerSettings {
+    var applied = AppliedPeerSettings{};
+    var it = try Http2.SettingsIterator.init(payload);
+    while (it.next()) |s| {
+        switch (s.id) {
+            Http2.SettingsId.initial_window_size => {
+                const new_initial = try Http2.validateInitialWindowSize(s.value);
+                try conn_flow.applyPeerInitialWindowSize(new_initial);
+                applied.initial_window_size = new_initial;
+            },
+            Http2.SettingsId.max_frame_size => {
+                applied.max_frame_size = try Http2.validateMaxFrameSize(s.value);
+            },
+            else => {},
+        }
+    }
+    return applied;
+}
+
+/// RFC 7540 §6.5.2 error code for a rejected SETTINGS frame.
+fn settingsErrorCode(err: Http2.FlowControlError) u32 {
+    return switch (err) {
+        error.InvalidSettingsPayload => Http2.ErrorCode.FRAME_SIZE_ERROR,
+        error.InvalidFrameSize => Http2.ErrorCode.PROTOCOL_ERROR,
+        else => Http2.ErrorCode.FLOW_CONTROL_ERROR,
+    };
+}
 
 /// Coalesces small writes and flushes once per drain/control batch.
 const ConnWriter = struct {
@@ -185,8 +280,8 @@ pub fn serveAfterPrefacePrefetchReader(
     var writer = ConnWriter.init(io, stream);
 
     const settings = try Http2.encodeSettings(allocator, false, &.{
-        .{ 0x3, 100 }, // MAX_CONCURRENT_STREAMS
-        .{ 0x4, 65535 }, // INITIAL_WINDOW_SIZE
+        .{ Http2.SettingsId.max_concurrent_streams, opts.inbound.max_concurrent_streams },
+        .{ Http2.SettingsId.initial_window_size, Http2.default_initial_window_size },
     });
     defer allocator.free(settings);
     try writer.write(settings);
@@ -198,6 +293,12 @@ pub fn serveAfterPrefacePrefetchReader(
     var conn_flow = Http2.FlowControlState.init(Http2.default_initial_window_size);
     var conn_max_frame_size: u31 = 16384;
     var last_peer_stream: u31 = 0;
+    // Highest client-initiated stream id we have opened state for (RFC 7540 §5.1.1).
+    var last_opened_stream: u31 = 0;
+    // Stream whose header block is still open (HEADERS without END_HEADERS).
+    var continuation_of: ?u31 = null;
+    var continuation_frames: usize = 0;
+    var inbound_bytes: usize = 0;
     var goaway_sent = false;
     var reject_new_streams = false;
 
@@ -235,10 +336,25 @@ pub fn serveAfterPrefacePrefetchReader(
             try writer.flush();
         }
 
-        const frame_buf = readFramePrefetch(reader, allocator, prefetch_buf, &prefetch_off) catch |err| switch (err) {
+        const frame_buf = readFramePrefetch(
+            reader,
+            allocator,
+            prefetch_buf,
+            &prefetch_off,
+            opts.inbound.max_frame_size,
+            opts.inbound.max_inbound_bytes -| inbound_bytes,
+        ) catch |err| switch (err) {
             error.ConnectionClosed => {
                 try outbound.drain(&writer, &priority_tree, &conn_flow, conn_max_frame_size, 0);
                 try writer.flush();
+                return;
+            },
+            error.FrameSizeExceeded => {
+                try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.FRAME_SIZE_ERROR, &goaway_sent);
+                return;
+            },
+            error.BudgetExceeded => {
+                try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.ENHANCE_YOUR_CALM, &goaway_sent);
                 return;
             },
             else => {
@@ -247,6 +363,7 @@ pub fn serveAfterPrefacePrefetchReader(
             },
         };
         defer allocator.free(frame_buf);
+        inbound_bytes += frame_buf.len;
 
         const frame = Http2.decodeFrame(frame_buf) catch {
             try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.PROTOCOL_ERROR, &goaway_sent);
@@ -256,39 +373,32 @@ pub fn serveAfterPrefacePrefetchReader(
             last_peer_stream = frame.header.stream_id;
         }
 
+        // RFC 7540 §4.3: a header block stays a single contiguous frame sequence.
+        if (continuation_of) |pending_sid| {
+            if (frame.header.typ != .continuation or frame.header.stream_id != pending_sid) {
+                try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.PROTOCOL_ERROR, &goaway_sent);
+                return;
+            }
+        }
+
         switch (frame.header.typ) {
             .settings => {
                 if ((frame.header.flags & Http2.FrameFlags.ack) == 0) {
-                    const peer_settings = Http2.decodeSettings(allocator, frame.payload) catch {
-                        try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.FRAME_SIZE_ERROR, &goaway_sent);
+                    const applied = applyPeerSettings(&conn_flow, frame.payload) catch |err| {
+                        try sendGoAway(&writer, allocator, last_peer_stream, settingsErrorCode(err), &goaway_sent);
                         return;
                     };
-                    defer allocator.free(peer_settings);
-                    for (peer_settings) |s| {
-                        switch (s.id) {
-                            Http2.SettingsId.initial_window_size => {
-                                const new_initial: u31 = @intCast(s.value);
-                                conn_flow.applyPeerInitialWindowSize(new_initial) catch {
-                                    try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.FLOW_CONTROL_ERROR, &goaway_sent);
-                                    return;
-                                };
-                                var it = streams.valueIterator();
-                                while (it.next()) |st| {
-                                    st.flow.applyPeerInitialWindowSize(new_initial) catch |err| std.log.debug("[h2] window-size update ignored ({s})", .{@errorName(err)});
-                                }
-                                var pit = outbound.pending.valueIterator();
-                                while (pit.next()) |p| {
-                                    p.flow.applyPeerInitialWindowSize(new_initial) catch |err| std.log.debug("[h2] window-size update ignored ({s})", .{@errorName(err)});
-                                }
-                            },
-                            Http2.SettingsId.max_frame_size => {
-                                if (s.value >= 16384 and s.value <= 16777215) {
-                                    conn_max_frame_size = @intCast(s.value);
-                                }
-                            },
-                            else => {},
+                    if (applied.initial_window_size) |new_initial| {
+                        var it = streams.valueIterator();
+                        while (it.next()) |st| {
+                            st.flow.applyPeerInitialWindowSize(new_initial) catch |err| std.log.debug("[h2] window-size update ignored ({s})", .{@errorName(err)});
+                        }
+                        var pit = outbound.pending.valueIterator();
+                        while (pit.next()) |p| {
+                            p.flow.applyPeerInitialWindowSize(new_initial) catch |err| std.log.debug("[h2] window-size update ignored ({s})", .{@errorName(err)});
                         }
                     }
+                    if (applied.max_frame_size) |peer_max_frame_size| conn_max_frame_size = peer_max_frame_size;
                     try writer.writeFrame(.settings, Http2.FrameFlags.ack, 0, &.{});
                     try writer.flush();
                 }
@@ -322,9 +432,16 @@ pub fn serveAfterPrefacePrefetchReader(
                 const sid = frame.header.stream_id;
                 if (sid == 0) continue;
                 const pri = Http2.decodePriority(frame.payload) catch continue;
-                const gop = try streams.getOrPut(sid);
-                if (!gop.found_existing) gop.value_ptr.* = StreamState.init();
-                gop.value_ptr.priority = pri;
+                if (streams.getPtr(sid)) |st| {
+                    st.priority = pri;
+                } else if (priority_tree.nodes.count() >=
+                    @as(usize, opts.inbound.max_concurrent_streams) + opts.inbound.priority_tree_slack)
+                {
+                    // PRIORITY on an idle stream is advisory (RFC 7540 §5.3): the
+                    // hint may be dropped, but the state it would allocate may not
+                    // grow without bound.
+                    continue;
+                }
                 try priority_tree.setPriority(sid, pri);
             },
             .rst_stream => {
@@ -351,9 +468,22 @@ pub fn serveAfterPrefacePrefetchReader(
                     try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.PROTOCOL_ERROR, &goaway_sent);
                     return;
                 }
-                if (reject_new_streams and !streams.contains(sid)) {
-                    try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, Http2.ErrorCode.REFUSED_STREAM);
-                    continue;
+                if (!streams.contains(sid)) {
+                    // RFC 7540 §5.1.1 — new client streams are odd and increasing.
+                    validateNewClientStreamId(sid, last_opened_stream) catch {
+                        try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.PROTOCOL_ERROR, &goaway_sent);
+                        return;
+                    };
+                    if (reject_new_streams) {
+                        try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, Http2.ErrorCode.REFUSED_STREAM);
+                        continue;
+                    }
+                    // RFC 7540 §5.1.2 — the advertised MAX_CONCURRENT_STREAMS is a promise.
+                    checkConcurrentStreams(streams.count(), opts.inbound.max_concurrent_streams) catch {
+                        try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, Http2.ErrorCode.REFUSED_STREAM);
+                        continue;
+                    };
+                    last_opened_stream = sid;
                 }
                 const gop = try streams.getOrPut(sid);
                 if (!gop.found_existing) gop.value_ptr.* = StreamState.init();
@@ -366,13 +496,23 @@ pub fn serveAfterPrefacePrefetchReader(
                     }
                     break :blk stripped.header_block;
                 };
-                gop.value_ptr.appendHeaders(allocator, header_chunk) catch {
-                    try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, Http2.ErrorCode.INTERNAL_ERROR);
+                gop.value_ptr.appendHeaders(allocator, header_chunk, opts.inbound.max_header_block_bytes) catch |err| {
+                    try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, inboundLimitCode(err));
+                    if ((frame.header.flags & Http2.FrameFlags.end_headers) == 0) continuation_of = null;
                     continue;
                 };
                 if ((frame.header.flags & Http2.FrameFlags.end_headers) != 0) {
                     gop.value_ptr.headers_done = true;
-                    gop.value_ptr.decodeHeaders(allocator, &hpack_dec) catch {
+                    gop.value_ptr.decodeHeaders(allocator, &hpack_dec) catch |err| {
+                        // RFC 7541 §4.2 / RFC 7540 §4.2: a failure in the
+                        // compression context is a *connection* error — the
+                        // decoder's table state has already diverged from the
+                        // peer's, so later streams would keep failing. RST alone
+                        // would leave the session writing into a broken decoder.
+                        if (Hpack.isConnectionError(err)) {
+                            try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.COMPRESSION_ERROR, &goaway_sent);
+                            return;
+                        }
                         try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, Http2.ErrorCode.COMPRESSION_ERROR);
                         continue;
                     };
@@ -380,6 +520,9 @@ pub fn serveAfterPrefacePrefetchReader(
                         try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, streamErrorFromAny(err));
                         continue;
                     };
+                } else {
+                    continuation_of = sid;
+                    continuation_frames = 0;
                 }
                 if ((frame.header.flags & Http2.FrameFlags.end_stream) != 0) {
                     gop.value_ptr.end_stream = true;
@@ -409,17 +552,33 @@ pub fn serveAfterPrefacePrefetchReader(
             },
             .continuation => {
                 const sid = frame.header.stream_id;
+                continuation_frames += 1;
+                if (continuation_frames > opts.inbound.max_continuation_frames) {
+                    // CONTINUATION frames may be empty, so the byte budget alone
+                    // does not bound this loop (the 2023 "CONTINUATION flood" class).
+                    try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.ENHANCE_YOUR_CALM, &goaway_sent);
+                    return;
+                }
                 const st = streams.getPtr(sid) orelse {
                     try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, Http2.ErrorCode.STREAM_CLOSED);
                     continue;
                 };
-                st.appendHeaders(allocator, frame.payload) catch {
-                    try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, Http2.ErrorCode.INTERNAL_ERROR);
+                st.appendHeaders(allocator, frame.payload, opts.inbound.max_header_block_bytes) catch |err| {
+                    try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, inboundLimitCode(err));
                     continue;
                 };
                 if ((frame.header.flags & Http2.FrameFlags.end_headers) != 0) {
+                    continuation_of = null;
+                    continuation_frames = 0;
                     st.headers_done = true;
-                    st.decodeHeaders(allocator, &hpack_dec) catch {
+                    st.decodeHeaders(allocator, &hpack_dec) catch |err| {
+                        // Connection-level for the same reason as the
+                        // `streams.getOrPut` path above: the HPACK context is
+                        // shared by every stream on the connection.
+                        if (Hpack.isConnectionError(err)) {
+                            try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.COMPRESSION_ERROR, &goaway_sent);
+                            return;
+                        }
                         try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, Http2.ErrorCode.COMPRESSION_ERROR);
                         continue;
                     };
@@ -460,6 +619,14 @@ pub fn serveAfterPrefacePrefetchReader(
                     try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, Http2.ErrorCode.STREAM_CLOSED);
                     continue;
                 };
+                // Per-stream body budget, checked before granting more window: the
+                // connection window is replenished as it drains, so flow control
+                // alone does not bound what a stream buffers.
+                st.inbound_body_bytes +|= frame.payload.len;
+                if (st.inbound_body_bytes > opts.inbound.max_body_bytes) {
+                    try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, Http2.ErrorCode.ENHANCE_YOUR_CALM);
+                    continue;
+                }
                 onInboundData(&writer, allocator, &st.flow, sid, data_len) catch {
                     try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, Http2.ErrorCode.FLOW_CONTROL_ERROR);
                     continue;
@@ -481,8 +648,8 @@ pub fn serveAfterPrefacePrefetchReader(
                         abortStream(&outbound, &priority_tree, &streams, allocator, sid);
                     }
                 } else {
-                    st.appendData(allocator, frame.payload) catch {
-                        try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, Http2.ErrorCode.INTERNAL_ERROR);
+                    st.appendData(allocator, frame.payload, opts.inbound.max_body_bytes) catch |err| {
+                        try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, inboundLimitCode(err));
                         continue;
                     };
                     if (st.ready()) {
@@ -547,6 +714,29 @@ fn resetStream(
     defer allocator.free(frame);
     try writer.write(frame);
     try writer.flush();
+}
+
+/// RFC 7540 §5.1.1 — a client-initiated stream id must be odd and greater than
+/// every id the client has already opened. Anything else is a connection error
+/// (PROTOCOL_ERROR), not something to allocate state for.
+fn validateNewClientStreamId(sid: u31, last_opened: u31) InboundLimitError!void {
+    if ((sid & 1) == 0) return error.InvalidStreamId;
+    if (sid <= last_opened) return error.InvalidStreamId;
+}
+
+/// RFC 7540 §5.1.2 — enforce the MAX_CONCURRENT_STREAMS we advertised, instead
+/// of letting the peer open unbounded stream state (each stream buffers headers,
+/// a body and its own flow-control window).
+fn checkConcurrentStreams(open_streams: usize, max_concurrent: u32) InboundLimitError!void {
+    if (open_streams >= max_concurrent) return error.TooManyStreams;
+}
+
+/// HTTP/2 error code for an inbound resource-limit breach (RFC 7540 §10.5).
+fn inboundLimitCode(err: anyerror) u32 {
+    return switch (err) {
+        error.HeaderBlockTooLarge, error.BodyTooLarge => Http2.ErrorCode.ENHANCE_YOUR_CALM,
+        else => Http2.ErrorCode.INTERNAL_ERROR,
+    };
 }
 
 fn sendGoAway(
@@ -815,6 +1005,9 @@ const StreamState = struct {
     decoded: ?[]Hpack.Header = null,
     flow: Http2.FlowControlState = Http2.FlowControlState.init(Http2.default_initial_window_size),
     priority: Http2.PriorityInfo = .{ .exclusive = false, .depends_on = 0, .weight = 15 },
+    /// Inbound request-body bytes counted against `InboundLimits.max_body_bytes`
+    /// — covers both `data` and the live bidi `grpc_buf`.
+    inbound_body_bytes: usize = 0,
     /// Live interleaved bidi pump (headers sent; DATA flushed as messages arrive).
     bidi_live: bool = false,
     grpc_buf: Grpc.GrpcStreamBuffer = undefined,
@@ -843,11 +1036,13 @@ const StreamState = struct {
         return self.headers_done and self.end_stream and !self.bidi_live;
     }
 
-    fn appendHeaders(self: *StreamState, allocator: std.mem.Allocator, chunk: []const u8) !void {
+    fn appendHeaders(self: *StreamState, allocator: std.mem.Allocator, chunk: []const u8, limit: usize) !void {
+        if (self.header_block.items.len + chunk.len > limit) return error.HeaderBlockTooLarge;
         try self.header_block.appendSlice(allocator, chunk);
     }
 
-    fn appendData(self: *StreamState, allocator: std.mem.Allocator, chunk: []const u8) !void {
+    fn appendData(self: *StreamState, allocator: std.mem.Allocator, chunk: []const u8, limit: usize) !void {
+        if (self.data.items.len + chunk.len > limit) return error.BodyTooLarge;
         try self.data.appendSlice(allocator, chunk);
     }
 
@@ -892,7 +1087,7 @@ fn onInboundData(
     size: u31,
 ) !void {
     if (size == 0) return;
-    if (fc.consumeRecv(size)) |increment| {
+    if (try fc.consumeRecv(size)) |increment| {
         const wu = try Http2.encodeWindowUpdate(allocator, window_stream_id, increment);
         defer allocator.free(wu);
         try writer.write(wu);
@@ -1141,19 +1336,30 @@ fn readFrame(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator
     var r = stream.reader(io, &rbuf);
     var empty: [0]u8 = .{};
     var off: usize = 0;
-    return readFramePrefetch(&r.interface, allocator, &empty, &off);
+    const limits: InboundLimits = .{};
+    return readFramePrefetch(&r.interface, allocator, &empty, &off, limits.max_frame_size, limits.max_inbound_bytes);
 }
 
+/// Read one frame (9-byte header + payload) into an owned buffer.
+///
+/// `max_frame_size` and `budget_remaining` are checked *before* the payload
+/// allocation: the header `length` field reaches 2^24-1 (16 MiB), so allocating
+/// on the peer's word alone lets a single frame — or a chain of them — exhaust
+/// memory before any handler sees it. The caller answers GOAWAY.
 fn readFramePrefetch(
     reader: *std.Io.Reader,
     allocator: std.mem.Allocator,
     prefetch: []const u8,
     prefetch_off: *usize,
+    max_frame_size: u24,
+    budget_remaining: usize,
 ) ![]u8 {
     var hdr: [9]u8 = undefined;
     try readExactPrefetch(reader, prefetch, prefetch_off, &hdr);
     const header = try Http2.FrameHeader.decode(&hdr);
+    if (header.length > max_frame_size) return error.FrameSizeExceeded;
     const total = 9 + @as(usize, header.length);
+    if (total > budget_remaining) return error.BudgetExceeded;
     const buf = try allocator.alloc(u8, total);
     errdefer allocator.free(buf);
     @memcpy(buf[0..9], &hdr);
@@ -1245,8 +1451,8 @@ test "inbound DATA decrements conn and stream recv windows" {
     var conn = Http2.FlowControlState.init(Http2.default_initial_window_size);
     var stream = Http2.FlowControlState.init(Http2.default_initial_window_size);
     const size: u31 = 1000;
-    _ = conn.consumeRecv(size);
-    _ = stream.consumeRecv(size);
+    _ = try conn.consumeRecv(size);
+    _ = try stream.consumeRecv(size);
     try std.testing.expectEqual(Http2.default_initial_window_size - size, conn.recv_window);
     try std.testing.expectEqual(Http2.default_initial_window_size - size, stream.recv_window);
 }
@@ -1302,8 +1508,82 @@ test "encodeSiteResponseWire is headers then data" {
     try std.testing.expectEqualStrings("ok", f1.payload);
 }
 
-// Regression for prior-knowledge h2c: SETTINGS+HEADERS that arrive with the preface
-// must be readable from a prefetch buffer (same bytes StreamReader would leave buffered).
+// --- Inbound hardening: RFC 7540 §6.5.2 SETTINGS validation (see `applyPeerSettings`) ---
+
+/// Encode a peer SETTINGS frame and return its payload view (owned by caller's `wire`).
+fn settingsPayloadForTest(
+    allocator: std.mem.Allocator,
+    entries: []const struct { u16, u32 },
+    wire: *[]u8,
+) ![]const u8 {
+    wire.* = try Http2.encodeSettings(allocator, false, entries);
+    const frame = try Http2.decodeFrame(wire.*);
+    return frame.payload;
+}
+
+test "SETTINGS INITIAL_WINDOW_SIZE above 2^31-1 is a connection error, not a panic" {
+    const allocator = std.testing.allocator;
+    var conn_flow = Http2.FlowControlState.init(Http2.default_initial_window_size);
+
+    var wire: []u8 = undefined;
+    const payload = try settingsPayloadForTest(allocator, &.{
+        .{ Http2.SettingsId.initial_window_size, 0x8000_0000 },
+    }, &wire);
+    defer allocator.free(wire);
+
+    // The wire value is a u32; narrowing it without a range check aborts the
+    // process (`panic: integer does not fit in destination type`) before any
+    // GOAWAY can be sent.
+    try std.testing.expectError(error.FlowControlOverflow, applyPeerSettings(&conn_flow, payload));
+    try std.testing.expectEqual(Http2.ErrorCode.FLOW_CONTROL_ERROR, settingsErrorCode(error.FlowControlOverflow));
+    try std.testing.expectEqual(Http2.default_initial_window_size, conn_flow.send_window);
+
+    // 2^31-1 itself is the documented maximum and must still be accepted.
+    var wire_max: []u8 = undefined;
+    const payload_max = try settingsPayloadForTest(allocator, &.{
+        .{ Http2.SettingsId.initial_window_size, std.math.maxInt(u31) },
+    }, &wire_max);
+    defer allocator.free(wire_max);
+    const applied = try applyPeerSettings(&conn_flow, payload_max);
+    try std.testing.expectEqual(@as(u31, std.math.maxInt(u31)), applied.initial_window_size.?);
+}
+
+test "SETTINGS MAX_FRAME_SIZE outside [2^14, 2^24-1] is a protocol error" {
+    const allocator = std.testing.allocator;
+    var conn_flow = Http2.FlowControlState.init(Http2.default_initial_window_size);
+
+    var too_small: []u8 = undefined;
+    const small = try settingsPayloadForTest(allocator, &.{
+        .{ Http2.SettingsId.max_frame_size, 16383 },
+    }, &too_small);
+    defer allocator.free(too_small);
+    try std.testing.expectError(error.InvalidFrameSize, applyPeerSettings(&conn_flow, small));
+    try std.testing.expectEqual(Http2.ErrorCode.PROTOCOL_ERROR, settingsErrorCode(error.InvalidFrameSize));
+
+    var too_big: []u8 = undefined;
+    const big = try settingsPayloadForTest(allocator, &.{
+        .{ Http2.SettingsId.max_frame_size, 16777216 },
+    }, &too_big);
+    defer allocator.free(too_big);
+    try std.testing.expectError(error.InvalidFrameSize, applyPeerSettings(&conn_flow, big));
+
+    // In-range values are applied to the outbound frame cap.
+    var ok_wire: []u8 = undefined;
+    const ok = try settingsPayloadForTest(allocator, &.{
+        .{ Http2.SettingsId.max_frame_size, 65536 },
+    }, &ok_wire);
+    defer allocator.free(ok_wire);
+    const applied = try applyPeerSettings(&conn_flow, ok);
+    try std.testing.expectEqual(@as(u31, 65536), applied.max_frame_size.?);
+}
+
+test "SETTINGS payload not a multiple of 6 keeps the FRAME_SIZE_ERROR mapping" {
+    var conn_flow = Http2.FlowControlState.init(Http2.default_initial_window_size);
+    const bad = [_]u8{ 0x00, 0x04, 0x00 };
+    try std.testing.expectError(error.InvalidSettingsPayload, applyPeerSettings(&conn_flow, &bad));
+    try std.testing.expectEqual(Http2.ErrorCode.FRAME_SIZE_ERROR, settingsErrorCode(error.InvalidSettingsPayload));
+}
+
 test "OutboundScheduler refuses over pending stream/byte caps" {
     const allocator = std.testing.allocator;
     const flow = Http2.FlowControlState.init(Http2.default_initial_window_size);
@@ -1342,6 +1622,193 @@ test "streamErrorFromAny maps outbound backpressure codes" {
     try std.testing.expectEqual(Http2.ErrorCode.INTERNAL_ERROR, streamErrorFromAny(error.OutOfMemory));
 }
 
+// --- §10  End-to-end: a real prior-knowledge h2c session over loopback ---
+//
+// The frame-level unit tests above pin the individual gates; these drive the
+// whole connection loop (`serveAfterPrefacePrefetchReader`, the entry
+// `Server.zig:2803` uses) so a regression in the loop's wiring — not just in a
+// helper — shows up. Before the hardening, each of these aborted the process
+// (`panic: integer overflow` / `integer does not fit in destination type`).
+
+/// Feed `frames` to one real h2c session (preface already consumed) and return
+/// the server's reply bytes in `out`. Client I/O is raw `posix` so the test never
+/// shares the io scheduler across threads (same reason as the WS e2e test).
+fn runLoopbackH2Session(opts: ServeOptions, frames: []const u8, out: []u8) !usize {
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var listener = try addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer listener.deinit(std.testing.io);
+    const port = listener.socket.address.getPort();
+
+    const Ctx = struct {
+        listener: *std.Io.net.Server,
+        opts: ServeOptions,
+        fn run(self: *@This()) void {
+            const accepted = self.listener.accept(std.testing.io) catch return;
+            defer accepted.close(std.testing.io);
+            serveAfterPrefacePrefetchReader(std.testing.io, accepted, std.testing.allocator, self.opts, &.{}, null) catch |err| {
+                std.log.debug("[h2] test session ended: {s}", .{@errorName(err)});
+            };
+        }
+    };
+    var ctx = Ctx{ .listener = &listener, .opts = opts };
+    const th = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, Ctx.run, .{&ctx});
+    defer th.join();
+
+    const server_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+    var stream = try server_addr.connect(std.testing.io, .{ .mode = .stream });
+    defer stream.close(std.testing.io);
+
+    try @import("../core/sockread.zig").writeFull(stream, frames);
+    // Half-close: the server's frame loop sees EOF after our frames, but we can
+    // still read the answer it wrote first.
+    _ = std.c.shutdown(stream.socket.handle, std.c.SHUT.WR);
+
+    var total: usize = 0;
+    while (total < out.len) {
+        var fds = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&fds, 3000) catch break;
+        if (ready == 0) break;
+        const n = std.posix.read(stream.socket.handle, out[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    return total;
+}
+
+/// First frame of `typ` (any stream when `stream_id` is 0) in a server reply.
+fn findFrameInReply(wire: []const u8, typ: Http2.FrameType, stream_id: u31) ?Http2.Frame {
+    var off: usize = 0;
+    while (off + 9 <= wire.len) {
+        const frame = Http2.decodeFrame(wire[off..]) catch return null;
+        if (frame.header.typ == typ and (stream_id == 0 or frame.header.stream_id == stream_id)) return frame;
+        off += 9 + @as(usize, frame.header.length);
+    }
+    return null;
+}
+
+test "h2 session answers GOAWAY FRAME_SIZE_ERROR for an oversized inbound DATA frame" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    // One 65536-byte DATA frame on an idle stream — the reviewer's probe: no
+    // stream state, no prior negotiation.
+    var payload: [65536]u8 = @splat(0x41);
+    const oversized = try Http2.encodeData(allocator, 1, &payload, false);
+    defer allocator.free(oversized);
+
+    var out: [4096]u8 = undefined;
+    const n = try runLoopbackH2Session(.{}, oversized, &out);
+    const goaway = findFrameInReply(out[0..n], .goaway, 0) orelse
+        return error.TestUnexpectedResultWithMessage; // no GOAWAY → loop did not answer
+    const info = try Http2.decodeGoAway(goaway.payload);
+    try std.testing.expectEqual(Http2.ErrorCode.FRAME_SIZE_ERROR, info.error_code);
+    try std.testing.expect(findFrameInReply(out[0..n], .rst_stream, 0) == null);
+}
+
+test "h2 session answers GOAWAY PROTOCOL_ERROR for an even client stream id" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var enc = Hpack.Encoder.init(allocator);
+    const block = try enc.encodeSmart(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":authority", .value = "localhost" },
+    });
+    defer allocator.free(block);
+    // Stream 4 is server-initiated space (RFC 7540 §5.1.1).
+    const headers = try Http2.encodeHeaders(allocator, 4, block, true, true);
+    defer allocator.free(headers);
+
+    var out: [4096]u8 = undefined;
+    const n = try runLoopbackH2Session(.{}, headers, &out);
+    const goaway = findFrameInReply(out[0..n], .goaway, 0) orelse return error.TestUnexpectedResultWithMessage;
+    const info = try Http2.decodeGoAway(goaway.payload);
+    try std.testing.expectEqual(Http2.ErrorCode.PROTOCOL_ERROR, info.error_code);
+}
+
+test "h2 session answers GOAWAY COMPRESSION_ERROR for a header block the decoder rejects" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    // `3f e2 1f` is a Dynamic Table Size Update asking for 4097 — above the
+    // advertised/default 4096, so the decoder rejects it. That rejection is a
+    // *connection* error (RFC 7541 §4.2): the table state has diverged, so the
+    // answer has to be GOAWAY, not RST_STREAM.
+    const block = [_]u8{ 0x3f, 0xe2, 0x1f };
+    const headers = try Http2.encodeHeaders(allocator, 1, &block, true, true);
+    defer allocator.free(headers);
+
+    var out: [4096]u8 = undefined;
+    const n = try runLoopbackH2Session(.{}, headers, &out);
+    const goaway = findFrameInReply(out[0..n], .goaway, 0) orelse return error.TestUnexpectedResultWithMessage;
+    const info = try Http2.decodeGoAway(goaway.payload);
+    try std.testing.expectEqual(Http2.ErrorCode.COMPRESSION_ERROR, info.error_code);
+    try std.testing.expect(findFrameInReply(out[0..n], .rst_stream, 0) == null);
+}
+
+test "h2 session still serves a normal request on stream 1" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var enc = Hpack.Encoder.init(allocator);
+    const block = try enc.encodeSmart(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/health" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":authority", .value = "localhost" },
+    });
+    defer allocator.free(block);
+    // No site_handler → the loop's built-in 404 body, but a complete response.
+    const headers = try Http2.encodeHeaders(allocator, 1, block, true, true);
+    defer allocator.free(headers);
+
+    var out: [4096]u8 = undefined;
+    const n = try runLoopbackH2Session(.{}, headers, &out);
+    const reply = out[0..n];
+    try std.testing.expect(findFrameInReply(reply, .goaway, 0) == null);
+    try std.testing.expect(findFrameInReply(reply, .rst_stream, 0) == null);
+    const data = findFrameInReply(reply, .data, 1) orelse return error.TestUnexpectedResultWithMessage;
+    try std.testing.expectEqualStrings("not found", data.payload);
+    try std.testing.expect((data.header.flags & Http2.FrameFlags.end_stream) != 0);
+}
+
+test "h2 session refuses the stream past the advertised MAX_CONCURRENT_STREAMS" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var enc = Hpack.Encoder.init(allocator);
+    const block = try enc.encodeSmart(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/hold" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":authority", .value = "localhost" },
+    });
+    defer allocator.free(block);
+
+    // HEADERS without END_STREAM: every stream stays open, so the loop must hold
+    // state for all of them and stop at the 100 it advertised.
+    var script = std.ArrayList(u8).empty;
+    defer script.deinit(allocator);
+    const max: u32 = test_limits.max_concurrent_streams;
+    var sid: u31 = 1;
+    var i: u32 = 0;
+    while (i < max + 1) : (i += 1) {
+        const h = try Http2.encodeHeaders(allocator, sid, block, false, true);
+        defer allocator.free(h);
+        try script.appendSlice(allocator, h);
+        sid += 2;
+    }
+    const refused_sid: u31 = 1 + 2 * max;
+
+    var out: [4096]u8 = undefined;
+    const n = try runLoopbackH2Session(.{}, script.items, &out);
+    const rst = findFrameInReply(out[0..n], .rst_stream, refused_sid) orelse return error.TestUnexpectedResultWithMessage;
+    try std.testing.expectEqual(Http2.ErrorCode.REFUSED_STREAM, try Http2.decodeRstStream(rst.payload));
+    try std.testing.expect(findFrameInReply(out[0..n], .rst_stream, 1) == null);
+}
+
 test "readFramePrefetch consumes SETTINGS then HEADERS from leftover buffer" {
     const allocator = std.testing.allocator;
     const settings = try Http2.encodeSettings(allocator, false, &.{.{ 0x3, 100 }});
@@ -1363,16 +1830,103 @@ test "readFramePrefetch consumes SETTINGS then HEADERS from leftover buffer" {
     var r = std.Io.Reader.fixed(&.{});
     var off: usize = 0;
 
-    const f0 = try readFramePrefetch(&r, allocator, leftover, &off);
+    const f0 = try readFramePrefetch(&r, allocator, leftover, &off, test_limits.max_frame_size, test_limits.max_inbound_bytes);
     defer allocator.free(f0);
     const d0 = try Http2.decodeFrame(f0);
     try std.testing.expectEqual(Http2.FrameType.settings, d0.header.typ);
 
-    const f1 = try readFramePrefetch(&r, allocator, leftover, &off);
+    const f1 = try readFramePrefetch(&r, allocator, leftover, &off, test_limits.max_frame_size, test_limits.max_inbound_bytes);
     defer allocator.free(f1);
     const d1 = try Http2.decodeFrame(f1);
     try std.testing.expectEqual(Http2.FrameType.headers, d1.header.typ);
     try std.testing.expectEqual(@as(u31, 1), d1.header.stream_id);
     try std.testing.expect((d1.header.flags & Http2.FrameFlags.end_stream) != 0);
     try std.testing.expectEqual(leftover.len, off);
+}
+
+// --- Inbound hardening: frame-size gate, byte budget, per-stream caps, stream lifecycle ---
+
+/// Defaults used by the inbound-limit tests.
+const test_limits: InboundLimits = .{};
+
+test "readFramePrefetch rejects an inbound frame above SETTINGS_MAX_FRAME_SIZE" {
+    const allocator = std.testing.allocator;
+    // 65536 > the 16384 default: one frame, one shot, no prior stream needed.
+    var big: [65536]u8 = @splat(0);
+    const oversized = try Http2.encodeData(allocator, 1, &big, false);
+    defer allocator.free(oversized);
+
+    var r = std.Io.Reader.fixed(&.{});
+    var off: usize = 0;
+    try std.testing.expectError(
+        error.FrameSizeExceeded,
+        readFramePrefetch(&r, allocator, oversized, &off, test_limits.max_frame_size, test_limits.max_inbound_bytes),
+    );
+
+    // Exactly at the advertised limit is still accepted, and reads through.
+    var at_limit_payload: [16384]u8 = @splat(0);
+    const at_limit = try Http2.encodeData(allocator, 1, &at_limit_payload, false);
+    defer allocator.free(at_limit);
+    var off2: usize = 0;
+    const ok = try readFramePrefetch(&r, allocator, at_limit, &off2, test_limits.max_frame_size, test_limits.max_inbound_bytes);
+    defer allocator.free(ok);
+    try std.testing.expectEqual(@as(usize, at_limit.len), ok.len);
+}
+
+test "readFramePrefetch enforces the connection byte budget before allocating" {
+    const allocator = std.testing.allocator;
+    const frame = try Http2.encodeData(allocator, 1, "0123456789", false);
+    defer allocator.free(frame);
+
+    var r = std.Io.Reader.fixed(&.{});
+    var off: usize = 0;
+    // Budget is smaller than header + payload → refuse, do not read the payload.
+    try std.testing.expectError(
+        error.BudgetExceeded,
+        readFramePrefetch(&r, allocator, frame, &off, test_limits.max_frame_size, frame.len - 1),
+    );
+
+    var off2: usize = 0;
+    const ok = try readFramePrefetch(&r, allocator, frame, &off2, test_limits.max_frame_size, frame.len);
+    defer allocator.free(ok);
+    try std.testing.expectEqual(frame.len, ok.len);
+}
+
+test "StreamState append caps header block and body bytes" {
+    const allocator = std.testing.allocator;
+    var st = StreamState.init();
+    defer st.deinit(allocator);
+
+    try st.appendHeaders(allocator, "abcd", 4);
+    try std.testing.expectError(error.HeaderBlockTooLarge, st.appendHeaders(allocator, "e", 4));
+    try std.testing.expectEqualStrings("abcd", st.header_block.items);
+
+    try st.appendData(allocator, "xyz", 3);
+    try std.testing.expectError(error.BodyTooLarge, st.appendData(allocator, "w", 3));
+    try std.testing.expectEqualStrings("xyz", st.data.items);
+}
+
+test "inbound limit errors map to ENHANCE_YOUR_CALM, OOM stays INTERNAL_ERROR" {
+    try std.testing.expectEqual(Http2.ErrorCode.ENHANCE_YOUR_CALM, inboundLimitCode(error.HeaderBlockTooLarge));
+    try std.testing.expectEqual(Http2.ErrorCode.ENHANCE_YOUR_CALM, inboundLimitCode(error.BodyTooLarge));
+    try std.testing.expectEqual(Http2.ErrorCode.INTERNAL_ERROR, inboundLimitCode(error.OutOfMemory));
+}
+
+test "client stream ids must be odd and strictly increasing" {
+    // First stream on a connection.
+    try validateNewClientStreamId(1, 0);
+    try validateNewClientStreamId(5, 3);
+    // Server-initiated (even) ids never arrive as client requests (RFC 7540 §5.1.1).
+    try std.testing.expectError(error.InvalidStreamId, validateNewClientStreamId(2, 0));
+    try std.testing.expectError(error.InvalidStreamId, validateNewClientStreamId(4, 3));
+    // Re-use of a spent id, and going backwards.
+    try std.testing.expectError(error.InvalidStreamId, validateNewClientStreamId(3, 3));
+    try std.testing.expectError(error.InvalidStreamId, validateNewClientStreamId(1, 3));
+}
+
+test "advertised MAX_CONCURRENT_STREAMS is enforced" {
+    try checkConcurrentStreams(0, 100);
+    try checkConcurrentStreams(99, 100);
+    try std.testing.expectError(error.TooManyStreams, checkConcurrentStreams(100, 100));
+    try std.testing.expectError(error.TooManyStreams, checkConcurrentStreams(101, 100));
 }

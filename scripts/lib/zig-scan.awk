@@ -11,11 +11,17 @@
 #   awk -v mode=entropy -f scripts/lib/zig-scan.awk <file>
 #       scripts/check-production.sh — one line per banned entropy source:
 #       `std.Io.random(` (falls back to pid+wall-clock+ASLR when it fails, which
-#       is exactly the class AGENTS.md "CSPRNG" bans) and `std.crypto.random`
-#       (not declared by this toolchain at all). `std.Io.randomSecure(` is the
-#       sanctioned form and is stripped before the test, so it never matches.
+#       is exactly the class AGENTS.md "CSPRNG" bans), `std.crypto.random`
+#       (not declared by this toolchain at all), and *seeding a non-cryptographic
+#       PRNG* (`std.Random.DefaultPrng.init(…)`, `Xoshiro256`, `Pcg`, … — see
+#       weak_prng below). `std.Io.randomSecure(` is the sanctioned form and is
+#       stripped before the test, so it never matches.
 #       Comment-only and string-literal text is already gone via zig_skip(),
 #       which is why a `// never use std.Io.random(` in prose is not a hit.
+#       Exceptions for reviewed non-security uses live in the ENTROPY_OK table
+#       below (see its comment for the exact 口径): keyed by file *and* by the
+#       whole stripped line, so a new weak-seed line in an exempted file still
+#       fires.
 #   awk -v mode=at-test -v want=<lineno> -f scripts/lib/zig-scan.awk <file>
 #       scripts/check-version.sh — prints "test" when line <lineno> is inside a
 #       `test` block (or opens one), "keep" when it is real code, "missing" when
@@ -137,13 +143,86 @@ function zig_skip(raw) {
 # 1 when `s` names a banned entropy source. `std.Io.randomSecure` is removed
 # first so the sanctioned spelling can never trip the `std.Io.random` test —
 # awk has no lookahead, and stripping the good form is the portable equivalent.
-function weak_entropy(s,   t, i) {
+function weak_entropy(s) {
+  return weak_io_random(s) || weak_prng(s)
+}
+
+function weak_io_random(s,   t, i) {
   t = s
   while ((i = index(t, "std.Io.randomSecure")) > 0)
     t = substr(t, 1, i - 1) substr(t, i + 19)
   if (index(t, "std.Io.random") != 0) return 1
   if (index(t, "std.crypto.random") != 0) return 1
   return 0
+}
+
+# 1 when `s` seeds/names a PRNG that is not a CSPRNG. `std.Random.DefaultPrng`
+# is an alias for `Xoshiro256`, and `Xoroshiro128`/`Pcg`/`Isaac64`/`Sfc64`/
+# `RomuTrio`/`SplitMix64` are the same class: a few outputs recover the state,
+# and — the part that mattered in src/web4/challenge.zig — the seed is whatever
+# the *caller* assembled, typically a clock, a pointer or a counter. A challenge
+# nonce, session id or API-key salt drawn from one is the identical defect to
+# `std.Io.random`, which is why the ban covers the seeding call too.
+# `DefaultCsprng` (ChaCha) is cryptographic but only as good as its 32-byte
+# seed, and one line cannot tell a pointer from entropy, so seeding it is
+# reported and reviewed via ENTROPY_OK instead of assumed safe.
+#
+# Names are matched unqualified (`DefaultPrng`, not `std.Random.DefaultPrng`)
+# so a line that names the type beside the seed call is caught even through an
+# alias written on that same line:
+# `const Rng = std.Random.Xoshiro256; var p = Rng.init(seed);`. The whole line
+# is comment- and literal-stripped before this runs, so prose cannot hit.
+# A `.init(` on the same line is required as well, so *holding* one of these
+# types (`rng: std.Random.DefaultPrng,`) is not a hit — only seeding is.
+# Known gap, on the side of silence: a seed spelled `Rng.init(seed)` with the
+# alias declared on an earlier line, and a `std.Random` value that arrives from
+# another function, are not detectable line-wise.
+function weak_prng(s,   pats, n, i) {
+  if (index(s, ".init(") == 0) return 0
+  n = split("DefaultPrng DefaultCsprng Xoshiro256 Xoroshiro128 Pcg Isaac64 Sfc64 RomuTrio SplitMix64", pats, " ")
+  for (i = 1; i <= n; i++) {
+    if (index(s, pats[i]) != 0) return 1
+  }
+  return 0
+}
+
+# 1 when this exact usage is a reviewed exception. Same spirit as b24's
+# `// audit: ignore b24 <reason>`: a human read the line and wrote down why
+# unpredictability is not required there. The table lives here rather than as a
+# marker in the scanned files because check-production's roots are the
+# framework's own sources — the file being exempted is usually not the file the
+# reviewer is editing. 口径: an entry is justified only when the value produced
+# is consumed as (a) a distribution/balancing choice, (b) timing jitter, or
+# (c) an identifier that needs uniqueness but not unpredictability, and when
+# nothing downstream treats it as a credential.
+#
+# The anchor is matched against the whole *stripped* line, not as a substring,
+# so a new weak-seed line in an exempted file is still reported — only the
+# reviewed statement itself passes. (An anchor is text, not semantics: an
+# added line byte-identical to an exempted one would ride along, and an edited
+# line silently lapses the exemption and turns the gate red, which is the safe
+# direction.)
+function entropy_exempt(file, s,   i, key, sep, f, anchor) {
+  for (i = 1; i <= ENTROPY_OK_N; i++) {
+    key = ENTROPY_OK[i]
+    sep = index(key, "|")
+    f = substr(key, 1, sep - 1)
+    anchor = substr(key, sep + 1)
+    # `index` for the path rather than equality, so an absolute or
+    # `./`-prefixed path from a hand-run scan still matches the relative entry.
+    if (index(file, f) > 0 && rtrim(ltrim(s)) == anchor) return 1
+  }
+  return 0
+}
+
+BEGIN {
+  # "path|anchor" pairs — see entropy_exempt for the 口径.
+  ENTROPY_OK[1] = "src/util.zig|var rng = std.Random.DefaultPrng.init(seed);"
+  ENTROPY_OK[2] = "src/tracing/DistributedTracer.zig|var prng = std.Random.DefaultPrng.init(prng_seed.fetchAdd(1, .monotonic));"
+  ENTROPY_OK[3] = "src/core/cluster/LoadBalancer.zig|var prng = std.Random.DefaultPrng.init(seed);"
+  ENTROPY_OK[4] = "src/core/cluster/RaftElection.zig|var rng = std.Random.DefaultPrng.init(@bitCast(now));"
+  ENTROPY_OK[5] = "src/test/IntegrationTest.zig|.rng = std.Random.DefaultPrng.init(seed),"
+  ENTROPY_OK_N = 5
 }
 
 BEGIN { in_test = 0; depth = 0; kw = 0; open = 0; seen = 0 }
@@ -156,7 +235,7 @@ BEGIN { in_test = 0; depth = 0; kw = 0; open = 0; seen = 0 }
   }
   if (zig_skip(raw)) next
   if (mode == "entropy") {
-    if (weak_entropy(code)) print NR "\t" rtrim(ltrim(code))
+    if (weak_entropy(code) && !entropy_exempt(FILENAME, code)) print NR "\t" rtrim(ltrim(code))
     next
   }
   # mode == "catch": resolve a `catch` whose body starts on an earlier line.

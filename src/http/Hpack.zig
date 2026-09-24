@@ -6,6 +6,22 @@ const std = @import("std");
 pub const Header = struct {
     name: []const u8,
     value: []const u8,
+    /// Ownership of `name` / `value` once the header leaves the producer.
+    /// `Decoder.decode` sets these explicitly so `freeHeaders` never has to
+    /// guess; hand-built literals keep the default and fall back to the
+    /// static-table fingerprint.
+    name_owner: Owner = .unspecified,
+    value_owner: Owner = .unspecified,
+};
+
+/// Provenance of a `Header` slice, consumed by `freeHeaders`.
+pub const Owner = enum {
+    /// Heap slice belonging to this header — `freeHeaders` releases it.
+    owned,
+    /// Borrowed slice (static table, caller memory) — never released.
+    borrowed,
+    /// Producer did not say — `freeHeaders` falls back to `isStaticSlice`.
+    unspecified,
 };
 
 /// RFC 7541 Appendix A static table (subset + common entries 1–61).
@@ -445,6 +461,10 @@ fn huffmanDecode(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
     errdefer out.deinit(allocator);
 
     var idx: u16 = 0;
+    // Bits seen since the last complete symbol. Whatever trails the final
+    // symbol is padding, and RFC 7541 §5.2 caps padding at 7 bits — a whole
+    // 0xFF byte must not be accepted (the EOS walk makes it look "valid").
+    var padding_bits: u8 = 0;
     for (data) |byte| {
         var bit_pos: u4 = 0;
         while (bit_pos < 8) : (bit_pos += 1) {
@@ -456,17 +476,29 @@ fn huffmanDecode(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
                 if (sym == huffman_eos_sym) return error.InvalidHpack;
                 try out.append(allocator, @intCast(sym));
                 idx = 0;
+                padding_bits = 0;
+            } else {
+                padding_bits += 1;
             }
         }
     }
-    if (idx != 0 and !huffman_padding_ok[idx]) return error.InvalidHpack;
+    if (idx != 0 and (padding_bits > 7 or !huffman_padding_ok[idx])) return error.InvalidHpack;
     return out.toOwnedSlice(allocator);
 }
+
+/// RFC 7541 §6.5.2 default SETTINGS_HEADER_TABLE_SIZE.
+pub const default_table_size: usize = 4096;
 
 pub const Decoder = struct {
     allocator: std.mem.Allocator,
     dynamic: std.ArrayList(OwnedHeader) = .empty,
-    max_table_size: usize = 4096,
+    /// Hard upper bound for `max_table_size`: the SETTINGS_HEADER_TABLE_SIZE we
+    /// advertised to the peer. A dynamic table size update above it is a
+    /// decoding error (RFC 7541 §6.3).
+    settings_max_table_size: usize = default_table_size,
+    /// Current table limit — the last size update received, or the advertised
+    /// value. Drives eviction (RFC 7541 §4.4).
+    max_table_size: usize = default_table_size,
     current_size: usize = 0,
 
     const OwnedHeader = struct {
@@ -484,6 +516,15 @@ pub const Decoder = struct {
         self.* = undefined;
     }
 
+    /// Advertise a new SETTINGS_HEADER_TABLE_SIZE: the hard upper bound for
+    /// dynamic table size updates, and the current limit until the peer sends
+    /// one of its own. Shrinking trims the table immediately (RFC 7541 §4.2).
+    pub fn setAdvertisedTableSize(self: *Decoder, size: usize) void {
+        self.settings_max_table_size = size;
+        self.max_table_size = size;
+        self.evictFor(0);
+    }
+
     fn clearDynamic(self: *Decoder) void {
         for (self.dynamic.items) |h| {
             self.allocator.free(h.name);
@@ -493,7 +534,14 @@ pub const Decoder = struct {
         self.current_size = 0;
     }
 
-    /// Decode header block. Returns owned Header slice (names/values owned; free with freeHeaders).
+    /// Decode a header block. Slice ownership is flagged per header
+    /// (`Header.name_owner` / `value_owner`); release the result with
+    /// `freeHeaders`.
+    ///
+    /// Every failure here is a connection error (RFC 7541 §4.2): the caller
+    /// must send GOAWAY(COMPRESSION_ERROR) instead of RST_STREAM — see
+    /// `isConnectionError`. The table state is undefined after a failure, so
+    /// drop the decoder rather than reusing it.
     pub fn decode(self: *Decoder, block: []const u8) ![]Header {
         var out = std.ArrayList(Header).empty;
         errdefer {
@@ -504,6 +552,7 @@ pub const Decoder = struct {
         while (i < block.len) {
             const b = block[i];
             if (b & 0x80 != 0) {
+                // 1xxxxxxx — indexed header field (RFC 7541 §6.1).
                 const idx, const n = try decodeInt(block[i..], 7);
                 i += n;
                 const h = try self.lookup(idx);
@@ -511,10 +560,13 @@ pub const Decoder = struct {
                 try out.append(self.allocator, .{
                     .name = if (is_static) h.name else try self.allocator.dupe(u8, h.name),
                     .value = if (is_static) h.value else try self.allocator.dupe(u8, h.value),
+                    .name_owner = if (is_static) .borrowed else .owned,
+                    .value_owner = if (is_static) .borrowed else .owned,
                 });
                 continue;
             }
             if (b & 0x40 != 0) {
+                // 01xxxxxx — literal with incremental indexing (§6.2.1).
                 const name_idx, const n0 = try decodeInt(block[i..], 6);
                 i += n0;
                 const name_is_static = name_idx > 0 and name_idx < static_table.len;
@@ -524,21 +576,38 @@ pub const Decoder = struct {
                     defer if (ds.owned) self.allocator.free(@constCast(ds.value));
                     break :blk ds.value;
                 } else (try self.lookup(name_idx)).name;
+                // When the name came from a dynamic index, `name` points into
+                // that entry: inserting below evicts from the oldest end
+                // (§4.4) and can free the very entry being read. Take the copy
+                // out of the table first.
+                const out_name: []const u8 = if (name_is_static) name else try self.allocator.dupe(u8, name);
+                errdefer if (!name_is_static) self.allocator.free(@constCast(out_name));
+
                 const value_ds = try decodeString(self.allocator, block[i..]);
                 i += value_ds.consumed;
                 defer if (value_ds.owned) self.allocator.free(@constCast(value_ds.value));
                 const value = value_ds.value;
 
-                const dyn_name = try self.allocator.dupe(u8, name);
-                const dyn_value = try self.allocator.dupe(u8, value);
-                try self.pushDynamic(dyn_name, dyn_value);
+                try self.pushDynamic(try self.dupEntry(name, value));
 
+                const out_value = try self.allocator.dupe(u8, value);
+                errdefer self.allocator.free(out_value);
                 try out.append(self.allocator, .{
-                    .name = if (name_is_static) name else try self.allocator.dupe(u8, name),
-                    .value = try self.allocator.dupe(u8, value),
+                    .name = out_name,
+                    .value = out_value,
+                    .name_owner = if (name_is_static) .borrowed else .owned,
+                    .value_owner = .owned,
                 });
                 continue;
             }
+            if (b & 0x20 != 0) {
+                // 001xxxxx — dynamic table size update (RFC 7541 §6.3).
+                const new_size, const n = try decodeInt(block[i..], 5);
+                i += n;
+                try self.setMaxTableSize(new_size);
+                continue;
+            }
+            // 0000xxxx / 0001xxxx — literal without indexing (§6.2.2 / §6.2.3).
             const name_idx, const n0 = try decodeInt(block[i..], 4);
             i += n0;
             const name_is_static = name_idx > 0 and name_idx < static_table.len;
@@ -552,14 +621,25 @@ pub const Decoder = struct {
             i += value_ds.consumed;
             defer if (value_ds.owned) self.allocator.free(@constCast(value_ds.value));
             const value = value_ds.value;
+            // This branch inserts nothing, so a table-supplied `name` is stable
+            // until the caller-owned copy below is taken.
+            const out_name: []const u8 = if (name_is_static) name else try self.allocator.dupe(u8, name);
+            errdefer if (!name_is_static) self.allocator.free(@constCast(out_name));
+            const out_value = try self.allocator.dupe(u8, value);
+            errdefer self.allocator.free(out_value);
             try out.append(self.allocator, .{
-                .name = if (name_is_static) name else try self.allocator.dupe(u8, name),
-                .value = try self.allocator.dupe(u8, value),
+                .name = out_name,
+                .value = out_value,
+                .name_owner = if (name_is_static) .borrowed else .owned,
+                .value_owner = .owned,
             });
         }
         return try out.toOwnedSlice(self.allocator);
     }
 
+    /// Resolve an index against static + dynamic table. The returned slices are
+    /// borrows into the table (static memory or a live entry) — never handed to
+    /// `freeHeaders`, and invalidated by any insertion that evicts the entry.
     fn lookup(self: *Decoder, index: usize) !Header {
         if (index == 0) return error.InvalidHpackIndex;
         if (index < static_table.len) return static_table[index];
@@ -567,27 +647,66 @@ pub const Decoder = struct {
         if (dyn_i >= self.dynamic.items.len) return error.InvalidHpackIndex;
         const rev = self.dynamic.items.len - 1 - dyn_i;
         const h = self.dynamic.items[rev];
-        return .{ .name = h.name, .value = h.value };
+        return .{ .name = h.name, .value = h.value, .name_owner = .borrowed, .value_owner = .borrowed };
     }
 
-    fn pushDynamic(self: *Decoder, name: []u8, value: []u8) !void {
-        const entry_size = name.len + value.len + 32;
-        while (self.current_size + entry_size > self.max_table_size and self.dynamic.items.len > 0) {
+    /// Duplicate both halves of an entry in one step, so a half-built pair can
+    /// never be lost: the caller hands the result to `pushDynamic`.
+    fn dupEntry(self: *Decoder, name: []const u8, value: []const u8) !OwnedHeader {
+        const owned_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned_name);
+        const owned_value = try self.allocator.dupe(u8, value);
+        return .{ .name = owned_name, .value = owned_value };
+    }
+
+    /// Apply a dynamic table size update (RFC 7541 §6.3): the new size may not
+    /// exceed what we advertised, and shrinking evicts from the oldest end.
+    fn setMaxTableSize(self: *Decoder, size: usize) !void {
+        if (size > self.settings_max_table_size) return error.InvalidHpackTableSize;
+        self.max_table_size = size;
+        self.evictFor(0);
+    }
+
+    /// Evict oldest entries until `incoming` more bytes fit (RFC 7541 §4.4).
+    fn evictFor(self: *Decoder, incoming: usize) void {
+        while (self.dynamic.items.len > 0 and self.current_size + incoming > self.max_table_size) {
             const old = self.dynamic.orderedRemove(0);
             self.current_size -= old.name.len + old.value.len + 32;
             self.allocator.free(old.name);
             self.allocator.free(old.value);
         }
+    }
+
+    /// Append an entry to the dynamic table, taking ownership of both slices.
+    fn pushDynamic(self: *Decoder, entry: OwnedHeader) !void {
+        errdefer self.allocator.free(entry.name);
+        errdefer self.allocator.free(entry.value);
+        const entry_size = entry.name.len + entry.value.len + 32;
+        self.evictFor(entry_size);
         if (entry_size > self.max_table_size) {
-            self.allocator.free(name);
-            self.allocator.free(value);
+            // Larger than the whole table: inserted never, table left empty.
+            self.allocator.free(entry.name);
+            self.allocator.free(entry.value);
             return;
         }
-        try self.dynamic.append(self.allocator, .{ .name = name, .value = value });
+        try self.dynamic.append(self.allocator, entry);
         self.current_size += entry_size;
     }
 };
 
+/// RFC 7541 §4.2 — every decoding failure is a *connection* error: the peer
+/// must be closed with GOAWAY(COMPRESSION_ERROR). A stream-level RST_STREAM
+/// leaves the connection alive while the two sides disagree about every later
+/// header block. `error.OutOfMemory` is ours, not a compression error.
+pub fn isConnectionError(err: anyerror) bool {
+    return switch (err) {
+        error.InvalidHpack, error.InvalidHpackIndex, error.InvalidHpackTableSize => true,
+        else => false,
+    };
+}
+
+/// Static-table membership test, kept as the fallback used by `freeHeaders`
+/// for headers whose producer left `name_owner` / `value_owner` unspecified.
 fn isStaticSlice(slice: []const u8) bool {
     for (static_table) |st| {
         if (slice.ptr == st.name.ptr and slice.len == st.name.len) return true;
@@ -596,10 +715,18 @@ fn isStaticSlice(slice: []const u8) bool {
     return false;
 }
 
+fn ownsSlice(owner: Owner, slice: []const u8) bool {
+    return switch (owner) {
+        .owned => true,
+        .borrowed => false,
+        .unspecified => !isStaticSlice(slice),
+    };
+}
+
 pub fn freeHeaders(allocator: std.mem.Allocator, headers: []Header) void {
     for (headers) |h| {
-        if (!isStaticSlice(h.name)) allocator.free(@constCast(h.name));
-        if (!isStaticSlice(h.value)) allocator.free(@constCast(h.value));
+        if (ownsSlice(h.name_owner, h.name)) allocator.free(@constCast(h.name));
+        if (ownsSlice(h.value_owner, h.value)) allocator.free(@constCast(h.value));
     }
     allocator.free(headers);
 }
@@ -817,4 +944,313 @@ test "Hpack decodeString Huffman end-to-end via Decoder.decode" {
     try std.testing.expectEqual(@as(usize, 1), headers.len);
     try std.testing.expectEqualStrings(":authority", headers[0].name);
     try std.testing.expectEqualStrings("www.example.com", headers[0].value);
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic table (RFC 7541 §2.3.2, §4.4) + header block boundary tests.
+// ---------------------------------------------------------------------------
+
+/// `01` + 6-bit index 0 → literal with incremental indexing, new name.
+fn appendLitIncNewName(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, name: []const u8, value: []const u8) !void {
+    try buf.append(allocator, 0x40);
+    try appendStringRaw(buf, allocator, name);
+    try appendStringRaw(buf, allocator, value);
+}
+
+/// `01` + 6-bit index → incremental indexing with a table-supplied name.
+fn appendLitIncIndexedName(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, name_idx: usize, value: []const u8) !void {
+    if (name_idx < 63) {
+        try buf.append(allocator, @intCast(0x40 | name_idx));
+    } else {
+        try buf.append(allocator, 0x7f);
+        try encodeIntRest(buf, allocator, name_idx - 63);
+    }
+    try appendStringRaw(buf, allocator, value);
+}
+
+test "Hpack dynamic table insert accounting and index order" {
+    const allocator = std.testing.allocator;
+    var block = std.ArrayList(u8).empty;
+    defer block.deinit(allocator);
+
+    var dec = Decoder.init(allocator);
+    defer dec.deinit();
+
+    try appendLitIncNewName(&block, allocator, "a", "1");
+    const first = try dec.decode(block.items);
+    defer freeHeaders(allocator, first);
+    try std.testing.expectEqual(@as(usize, 1), dec.dynamic.items.len);
+    try std.testing.expectEqual(@as(usize, 1 + 1 + 32), dec.current_size);
+
+    block.clearRetainingCapacity();
+    try appendLitIncNewName(&block, allocator, "b", "2");
+    const second = try dec.decode(block.items);
+    defer freeHeaders(allocator, second);
+    try std.testing.expectEqual(@as(usize, 2), dec.dynamic.items.len);
+    try std.testing.expectEqual(@as(usize, 2 * 34), dec.current_size);
+
+    // Newest first: index 62 is "b", index 63 is "a".
+    const refs = [_]u8{ 0xbe, 0xbf };
+    const by_index = try dec.decode(&refs);
+    defer freeHeaders(allocator, by_index);
+    try std.testing.expectEqualStrings("b", by_index[0].name);
+    try std.testing.expectEqualStrings("2", by_index[0].value);
+    try std.testing.expectEqualStrings("a", by_index[1].name);
+    try std.testing.expectEqualStrings("1", by_index[1].value);
+}
+
+test "Hpack dynamic table evicts oldest entries when full" {
+    const allocator = std.testing.allocator;
+    var dec = Decoder.init(allocator);
+    defer dec.deinit();
+    dec.max_table_size = 70; // room for two 34-byte entries.
+
+    var block = std.ArrayList(u8).empty;
+    defer block.deinit(allocator);
+
+    try appendLitIncNewName(&block, allocator, "a", "1");
+    try appendLitIncNewName(&block, allocator, "b", "2");
+    const two = try dec.decode(block.items);
+    defer freeHeaders(allocator, two);
+    try std.testing.expectEqual(@as(usize, 2), dec.dynamic.items.len);
+    try std.testing.expectEqual(@as(usize, 68), dec.current_size);
+
+    // Third entry pushes the oldest ("a") out; "b" then "c" remain.
+    block.clearRetainingCapacity();
+    try appendLitIncNewName(&block, allocator, "c", "3");
+    const three = try dec.decode(block.items);
+    defer freeHeaders(allocator, three);
+    try std.testing.expectEqual(@as(usize, 2), dec.dynamic.items.len);
+    try std.testing.expectEqual(@as(usize, 68), dec.current_size);
+
+    const refs = [_]u8{ 0xbe, 0xbf };
+    const remaining = try dec.decode(&refs);
+    defer freeHeaders(allocator, remaining);
+    try std.testing.expectEqualStrings("c", remaining[0].name);
+    try std.testing.expectEqualStrings("b", remaining[1].name);
+
+    // Index of the evicted entry is gone.
+    const stale = [_]u8{0xc0}; // indexed 64 → dynamic index 2, out of range
+    try std.testing.expectError(error.InvalidHpackIndex, dec.decode(&stale));
+}
+
+test "Hpack dynamic name is copied before the entry can be evicted (UAF regression)" {
+    const allocator = std.testing.allocator;
+    var block = std.ArrayList(u8).empty;
+    defer block.deinit(allocator);
+
+    try appendLitIncNewName(&block, allocator, "s", "S");
+    const big = try allocator.alloc(u8, 3900);
+    defer allocator.free(big);
+    @memset(big, 'B');
+    try appendLitIncNewName(&block, allocator, "b", big);
+    const c200 = try allocator.alloc(u8, 200);
+    defer allocator.free(c200);
+    @memset(c200, 'C');
+    // Name index 63 == the oldest entry ("s", dynamic index 1): inserting this
+    // 233-byte entry evicts — and frees — that very entry, so the emitted name
+    // must already be an owned copy (reading the table entry here would read
+    // freed memory).
+    try appendLitIncIndexedName(&block, allocator, static_table.len + 1, c200);
+
+    var dec = Decoder.init(allocator);
+    defer dec.deinit();
+    const headers = try dec.decode(block.items);
+    defer freeHeaders(allocator, headers);
+
+    try std.testing.expectEqual(@as(usize, 3), headers.len);
+    try std.testing.expectEqualStrings("b", headers[1].name);
+    try std.testing.expectEqualStrings("s", headers[2].name);
+    try std.testing.expectEqualStrings("S", headers[0].value);
+    try std.testing.expectEqualStrings(c200, headers[2].value);
+    try std.testing.expectEqual(@as(usize, 1), dec.dynamic.items.len);
+    try std.testing.expectEqual(@as(usize, 233), dec.current_size);
+}
+
+test "Hpack decodes dynamic table size update" {
+    const allocator = std.testing.allocator;
+    var dec = Decoder.init(allocator);
+    defer dec.deinit();
+
+    // 001 00000 → update to 0; 0x82 → indexed static 2 (:method GET).
+    const block = [_]u8{ 0x20, 0x82 };
+    const headers = try dec.decode(&block);
+    defer freeHeaders(allocator, headers);
+    try std.testing.expectEqual(@as(usize, 1), headers.len);
+    try std.testing.expectEqualStrings(":method", headers[0].name);
+    try std.testing.expectEqualStrings("GET", headers[0].value);
+    try std.testing.expectEqual(@as(usize, 0), dec.max_table_size);
+}
+
+test "Hpack dynamic table size update evicts down to the new limit" {
+    const allocator = std.testing.allocator;
+    var dec = Decoder.init(allocator);
+    defer dec.deinit();
+
+    var block = std.ArrayList(u8).empty;
+    defer block.deinit(allocator);
+    try appendLitIncNewName(&block, allocator, "a", "1");
+    try appendLitIncNewName(&block, allocator, "b", "2");
+    const two = try dec.decode(block.items);
+    defer freeHeaders(allocator, two);
+    try std.testing.expectEqual(@as(usize, 2), dec.dynamic.items.len);
+
+    block.clearRetainingCapacity();
+    try block.append(allocator, 0x20); // update to 0
+    try block.append(allocator, 0xbe); // indexed 62 → evicted with the table
+    try std.testing.expectError(error.InvalidHpackIndex, dec.decode(block.items));
+    try std.testing.expectEqual(@as(usize, 0), dec.dynamic.items.len);
+    try std.testing.expectEqual(@as(usize, 0), dec.current_size);
+    try std.testing.expectEqual(@as(usize, 0), dec.max_table_size);
+}
+
+test "Hpack rejects huffman padding longer than 7 bits" {
+    const allocator = std.testing.allocator;
+    // RFC 7541 C.4.1 encoding of "www.example.com" ends with 1..7 padding bits;
+    // appending a whole 0xFF byte makes the padding 8+ bits, which §5.2 says
+    // MUST be treated as a decoding error.
+    const over_padded = [_]u8{ 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff, 0xff };
+    try std.testing.expectError(error.InvalidHpack, huffmanDecode(allocator, &over_padded));
+    // The same encoding without the extra byte still decodes.
+    const ok = try huffmanDecode(allocator, over_padded[0..12]);
+    defer allocator.free(ok);
+    try std.testing.expectEqualStrings("www.example.com", ok);
+}
+
+test "Hpack size update may move within the advertised limit" {
+    const allocator = std.testing.allocator;
+    var dec = Decoder.init(allocator);
+    defer dec.deinit();
+    try std.testing.expectEqual(default_table_size, dec.settings_max_table_size);
+
+    // 4096 needs a multi-byte 5-bit-prefixed integer: 0x3f, rest = 4065.
+    const to_advertised = [_]u8{ 0x3f, 0xe1, 0x1f };
+    try std.testing.expectEqual(@as(usize, 0), (try dec.decode(&to_advertised)).len);
+    try std.testing.expectEqual(@as(usize, 4096), dec.max_table_size);
+
+    const to_zero = [_]u8{0x20};
+    try std.testing.expectEqual(@as(usize, 0), (try dec.decode(&to_zero)).len);
+    try std.testing.expectEqual(@as(usize, 0), dec.max_table_size);
+
+    // Back up to the advertised ceiling is allowed; one byte more is not.
+    try std.testing.expectEqual(@as(usize, 0), (try dec.decode(&to_advertised)).len);
+    const oversize = [_]u8{ 0x3f, 0xe2, 0x1f }; // 4097
+    try std.testing.expectError(error.InvalidHpackTableSize, dec.decode(&oversize));
+    try std.testing.expect(isConnectionError(error.InvalidHpackTableSize));
+    try std.testing.expectEqual(@as(usize, 4096), dec.max_table_size);
+}
+
+test "Hpack advertised table size bounds what a peer may ask for" {
+    const allocator = std.testing.allocator;
+    var dec = Decoder.init(allocator);
+    defer dec.deinit();
+
+    var block = std.ArrayList(u8).empty;
+    defer block.deinit(allocator);
+    try appendLitIncNewName(&block, allocator, "a", "1");
+    try appendLitIncNewName(&block, allocator, "b", "2");
+    const two = try dec.decode(block.items);
+    defer freeHeaders(allocator, two);
+    try std.testing.expectEqual(@as(usize, 68), dec.current_size);
+
+    // Shrinking below the newest entry trims the table immediately.
+    dec.setAdvertisedTableSize(34);
+    try std.testing.expectEqual(@as(usize, 1), dec.dynamic.items.len);
+    try std.testing.expectEqual(@as(usize, 34), dec.current_size);
+    try std.testing.expectEqualStrings("b", dec.dynamic.items[0].name);
+
+    // 35 is now above what we advertised: 0x3f, rest = 35 - 31 = 4.
+    const too_big = [_]u8{ 0x3f, 0x04 };
+    try std.testing.expectError(error.InvalidHpackTableSize, dec.decode(&too_big));
+    // 34 is exactly the limit: 0x3f, rest = 3.
+    const at_limit = [_]u8{ 0x3f, 0x03 };
+    try std.testing.expectEqual(@as(usize, 0), (try dec.decode(&at_limit)).len);
+    try std.testing.expectEqual(@as(usize, 34), dec.max_table_size);
+}
+
+test "Hpack isConnectionError separates compression failures from OOM" {
+    try std.testing.expect(isConnectionError(error.InvalidHpack));
+    try std.testing.expect(isConnectionError(error.InvalidHpackIndex));
+    try std.testing.expect(isConnectionError(error.InvalidHpackTableSize));
+    try std.testing.expect(!isConnectionError(error.OutOfMemory));
+
+    var dec = Decoder.init(std.testing.allocator);
+    defer dec.deinit();
+    // Indexed 62 against an empty dynamic table — a real decode failure, and
+    // one the caller must classify as a connection error.
+    const malformed = [_]u8{0xbe};
+    try std.testing.expectError(error.InvalidHpackIndex, dec.decode(&malformed));
+}
+
+test "Hpack decoder follows RFC 7541 C.3 (dynamic table, 256-byte limit)" {
+    const allocator = std.testing.allocator;
+    var dec = Decoder.init(allocator);
+    defer dec.deinit();
+    dec.setAdvertisedTableSize(256);
+
+    // C.3.1 — :method GET, :scheme http, :path /, :authority www.example.com.
+    const first = [_]u8{
+        0x82, 0x86, 0x84, 0x41, 0x0f, 'w', 'w', 'w', '.', 'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o', 'm',
+    };
+    const h1 = try dec.decode(&first);
+    defer freeHeaders(allocator, h1);
+    try std.testing.expectEqual(@as(usize, 4), h1.len);
+    try std.testing.expectEqualStrings(":method", h1[0].name);
+    try std.testing.expectEqualStrings("GET", h1[0].value);
+    try std.testing.expectEqualStrings(":authority", h1[3].name);
+    try std.testing.expectEqualStrings("www.example.com", h1[3].value);
+    try std.testing.expectEqual(@as(usize, 57), dec.current_size);
+
+    // C.3.2 — same four headers, :authority now from the dynamic table (index
+    // 62), plus cache-control: no-cache.
+    const second = [_]u8{ 0x82, 0x86, 0x84, 0xbe, 0x58, 0x08, 'n', 'o', '-', 'c', 'a', 'c', 'h', 'e' };
+    const h2 = try dec.decode(&second);
+    defer freeHeaders(allocator, h2);
+    try std.testing.expectEqual(@as(usize, 5), h2.len);
+    try std.testing.expectEqualStrings(":authority", h2[3].name);
+    try std.testing.expectEqualStrings("www.example.com", h2[3].value);
+    try std.testing.expectEqualStrings("cache-control", h2[4].name);
+    try std.testing.expectEqualStrings("no-cache", h2[4].value);
+    try std.testing.expectEqual(@as(usize, 110), dec.current_size);
+
+    // C.3.3 — :scheme https, :path /index.html, :authority via index 63, then a
+    // new literal name with incremental indexing.
+    const third = [_]u8{
+        0x82, 0x87, 0x85, 0xbf, 0x40, 0x0a, 'c', 'u', 's', 't', 'o', 'm', '-', 'k', 'e', 'y', 0x0c, 'c', 'u', 's', 't', 'o', 'm', '-', 'v', 'a', 'l', 'u', 'e',
+    };
+    const h3 = try dec.decode(&third);
+    defer freeHeaders(allocator, h3);
+    try std.testing.expectEqual(@as(usize, 5), h3.len);
+    try std.testing.expectEqualStrings(":scheme", h3[1].name);
+    try std.testing.expectEqualStrings("https", h3[1].value);
+    try std.testing.expectEqualStrings(":path", h3[2].name);
+    try std.testing.expectEqualStrings("/index.html", h3[2].value);
+    try std.testing.expectEqualStrings(":authority", h3[3].name);
+    try std.testing.expectEqualStrings("custom-key", h3[4].name);
+    try std.testing.expectEqualStrings("custom-value", h3[4].value);
+    try std.testing.expectEqual(@as(usize, 164), dec.current_size);
+    try std.testing.expectEqual(@as(usize, 3), dec.dynamic.items.len);
+}
+
+test "Hpack freeHeaders follows explicit ownership over the static fingerprint" {
+    const allocator = std.testing.allocator;
+
+    // `.borrowed` wins over the fingerprint: heap slices stay with the caller.
+    const name = try allocator.dupe(u8, "x-name");
+    defer allocator.free(name);
+    const value = try allocator.dupe(u8, "x-value");
+    defer allocator.free(value);
+    const borrowed = try allocator.alloc(Header, 1);
+    borrowed[0] = .{ .name = name, .value = value, .name_owner = .borrowed, .value_owner = .borrowed };
+    freeHeaders(allocator, borrowed);
+    try std.testing.expectEqualStrings("x-name", name);
+    try std.testing.expectEqualStrings("x-value", value);
+
+    // Headers a caller built by hand keep the old fingerprint behaviour:
+    // static-table slices are never released.
+    const legacy = try allocator.alloc(Header, 1);
+    legacy[0] = .{ .name = static_table[2].name, .value = static_table[2].value };
+    freeHeaders(allocator, legacy);
+    try std.testing.expectEqualStrings(":method", static_table[2].name);
+    try std.testing.expectEqualStrings("GET", static_table[2].value);
 }

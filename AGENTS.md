@@ -92,7 +92,7 @@ CI、`scripts/ci-*.sh`、本文件都用那个。`cd tools/zmodu && zig build` �
 | `http.HttpClient`：`https://` 经 `std.http.Client`（OTLP/Vault/AI 出站共用；`requestStream` HTTPS 真增量） | 自签证书未入系统信任库即报 TLS 失败 |
 | WS：`on_message(session, msg, kind)` — **text+binary**（`WsFrameKind`）；`writeBinary`/`writeData` | 假定只收 0x1；丢弃 0x2（会破坏 OpenIM protobuf） |
 | WS 路由：`ws_routes` 每项**显式** `.meta.auth = .public`（`ComptimeRouter.zig:734-758` 强制；非 public 或省掉 `.meta` 都是**编译错**，`permission`/`roles` 也被拒） | 省掉 `.meta`（`.auth` 默认 `.inherit` → 编译不过）；给 WS 路由挂 `permission`/`roles` |
-| CSPRNG：`std.Io.randomSecure(io, buf)` —— 每次系统调用，失败即 `error.EntropyUnavailable`、**无回落** | `std.crypto.random`（**本工具链无此声明**）；`std.Io.random`（文档明写失败回落 pid+墙钟+ASLR）；单一时间戳种子 |
+| CSPRNG：`std.Io.randomSecure(io, buf)` —— 每次系统调用，失败即 `error.EntropyUnavailable`、**无回落** | `std.crypto.random`（**本工具链无此声明**）；`std.Io.random`（文档明写失败回落 pid+墙钟+ASLR）；单一时间戳种子；`std.Random.DefaultPrng.init(seed)`（时钟^指针 → 同一个 challenge） |
 | sqlx：`Client.open` 后注意 pool/client 指针；CB 传 `io` | 在 ConnPool 上缓存失效的 `*Client` |
 | sqlx 驱动链接：`-Ddb=sqlite\|postgres\|mysql\|all`（默认 `all`） | 小系统用 `.db = "sqlite"`，勿默认三库全链 |
 | Runtime 监督树：`rt.spawnGroup(.one_for_one\|.one_for_all\|.rest_for_one\|.stop_group)` + `Supervision.group`；重建是原地 `deinit`+`init`（`docs/RUNTIME.md` §14） | 让 handler 自己 `catch` 装作没事（错误预算就废了）；把声明 `run` 的 worker 放进会重建的组（spawn 报 `NotRestartable`） |
@@ -261,7 +261,12 @@ pub fn deinit() void {}  // reverse order
   （`src/security/ApiKeyAuth.zig:129` · `PasswordEncoder.zig:24` · `SecurityModule.zig:290` · `src/kit/random.zig:17,42`）。
   熵入口要 `io`：忘了传是**编译错误**，这是有意的。
   **不要**用 `std.crypto.random`（本工具链上不存在，实测编译不过）、也**不要**用 `std.Io.random`
-  （它的文档明写失败时回落到 pid + 墙钟 + ASLR —— 那正是 §"CSPRNG" 这条修掉的缺陷类别）。
+  （它的文档明写失败时回落到 pid + 墙钟 + ASLR —— 那正是 §"CSPRNG" 这条修掉的缺陷类别）、也不要**播种**
+  非 CSPRNG 的 PRNG 来取 challenge/nonce/令牌/盐值（`std.Random.DefaultPrng` = `Xoshiro256`，种子由调用方
+  自己拼：时钟 ^ 指针即可复现，`src/web4/challenge.zig` 就这么签发过可预测的防重放 challenge）。
+  `check-production` 的熵扫描 + `audit` b24 已把「播种非加密 PRNG」纳入；豁免是**逐处**的人工评审，
+  不落仓库目录白名单：`check-production` 看 `scripts/lib/zig-scan.awk` 的 `ENTROPY_OK` 表，`audit` 用
+  `// audit: ignore b24 <缘由>`（测试固定种子做可复现属于正当用法）。
 - x402: fail-closed；dev 才注入 `verifyPaymentAllowAll`
 
 ### Multi-tenancy (optional)

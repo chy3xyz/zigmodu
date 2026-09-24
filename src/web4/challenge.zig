@@ -35,10 +35,17 @@ pub const ChallengeStore = struct {
 
     /// Issue a fresh random challenge for `did` (replaces any previous one).
     /// The caller owns the returned string.
+    ///
+    /// The nonce comes from the OS entropy source via `std.Io.randomSecure`,
+    /// never from a seeded PRNG: a predictable challenge is one an attacker can
+    /// sign for a DID it does not control. A failing entropy source surfaces as
+    /// `error.EntropyUnavailable` (or `error.Canceled`) instead of a degraded
+    /// challenge — both are new in this function's inferred error set, which
+    /// otherwise holds `error.OutOfMemory` / `error.LockFailed`.
     pub fn issue(self: *Self, allocator: std.mem.Allocator, did: []const u8) ![]const u8 {
-        const seed = @as(u64, @bitCast(Time.monotonicNowMilliseconds())) ^ @as(u64, @intFromPtr(did.ptr));
-        var prng = std.Random.DefaultPrng.init(seed);
-        const n = prng.random().int(u64);
+        var buf: [8]u8 = undefined;
+        try std.Io.randomSecure(self.io, &buf);
+        const n = std.mem.readInt(u64, &buf, .little);
         const challenge = try std.fmt.allocPrint(allocator, "challenge-{x}", .{n});
         errdefer allocator.free(challenge);
 
@@ -87,4 +94,20 @@ test "ChallengeStore issues and consumes exactly once" {
     try std.testing.expect(!store.verifyAndConsume(allocator, "did:key:z6MkA", ch));
     // Unknown DID is rejected.
     try std.testing.expect(!store.verifyAndConsume(allocator, "did:key:z6MkB", "challenge-x"));
+}
+
+test "ChallengeStore re-issuing for the same DID yields a different challenge" {
+    const allocator = std.testing.allocator;
+    var store = ChallengeStore.init(allocator, std.testing.io);
+    defer store.deinit();
+
+    // Same slice → same DoS-visible inputs. A clock/pointer-seeded PRNG draws
+    // the identical nonce twice here, which re-issues the challenge an attacker
+    // already captured a signature for; OS entropy cannot.
+    const did = "did:key:z6MkA";
+    const first = try store.issue(allocator, did);
+    defer allocator.free(first);
+    const second = try store.issue(allocator, did);
+    defer allocator.free(second);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
 }

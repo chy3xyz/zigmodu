@@ -43,6 +43,14 @@ pub const FlowControlError = error{
     /// A frame payload was shorter than its type's fixed part (e.g. GOAWAY < 8
     /// bytes, RST_STREAM < 4). GOAWAY with FRAME_SIZE_ERROR.
     InvalidFramePayload,
+    /// A SETTINGS MAX_FRAME_SIZE value outside [2^14, 2^24-1] (RFC 7540 §6.5.2).
+    /// Connection-fatal: GOAWAY with PROTOCOL_ERROR.
+    InvalidFrameSize,
+    /// An inbound DATA frame carried more bytes than the receive window allows
+    /// (RFC 7540 §6.9.1). The peer's flow-control accounting is broken, so the
+    /// connection or stream is aborted with FLOW_CONTROL_ERROR instead of
+    /// wrapping `recv_window` into a huge value that never gets replenished.
+    RecvWindowExceeded,
 };
 
 /// RFC 7540 §6.5.2 SETTINGS identifiers.
@@ -75,7 +83,12 @@ pub const FlowControlState = struct {
     }
 
     /// Decrement recv window after inbound DATA. Returns WINDOW_UPDATE increment when below half initial.
-    pub fn consumeRecv(self: *FlowControlState, size: u31) ?u31 {
+    ///
+    /// Fails with `error.RecvWindowExceeded` when `size` is larger than the
+    /// remaining window: `recv_window` is a u31 and the subtraction would
+    /// underflow (panic in Debug/ReleaseSafe, silent wrap in ReleaseFast).
+    pub fn consumeRecv(self: *FlowControlState, size: u31) FlowControlError!?u31 {
+        if (size > self.recv_window) return error.RecvWindowExceeded;
         self.recv_window -= size;
         const threshold = self.our_initial / 2;
         if (self.recv_window <= threshold) {
@@ -216,23 +229,60 @@ pub fn decodeFrame(buf: []const u8) !Frame {
     return .{ .header = hdr, .payload = buf[9..total] };
 }
 
+/// Non-allocating iterator over a SETTINGS payload (RFC 7540 §6.5.1: repeated
+/// 6-byte id/value pairs). Lets the connection loop validate entries before
+/// applying any of them, without a scratch allocation per SETTINGS frame.
+pub const SettingsIterator = struct {
+    payload: []const u8,
+    off: usize = 0,
+
+    /// `error.InvalidSettingsPayload` when the payload length is not a multiple of 6.
+    pub fn init(payload: []const u8) FlowControlError!SettingsIterator {
+        if (@rem(payload.len, 6) != 0) return error.InvalidSettingsPayload;
+        return .{ .payload = payload };
+    }
+
+    pub fn next(self: *SettingsIterator) ?SettingEntry {
+        if (self.off + 6 > self.payload.len) return null;
+        const off = self.off;
+        self.off += 6;
+        const id: u16 = (@as(u16, self.payload[off]) << 8) | self.payload[off + 1];
+        const value: u32 =
+            (@as(u32, self.payload[off + 2]) << 24) |
+            (@as(u32, self.payload[off + 3]) << 16) |
+            (@as(u32, self.payload[off + 4]) << 8) |
+            self.payload[off + 5];
+        return .{ .id = id, .value = value };
+    }
+};
+
 /// Parse SETTINGS frame payload into (id, value) pairs. Empty payload is valid.
 pub fn decodeSettings(allocator: std.mem.Allocator, payload: []const u8) ![]SettingEntry {
-    if (@rem(payload.len, 6) != 0) return error.InvalidSettingsPayload;
+    var it = try SettingsIterator.init(payload);
     const count = payload.len / 6;
-    var out = try allocator.alloc(SettingEntry, count);
+    const out = try allocator.alloc(SettingEntry, count);
     errdefer allocator.free(out);
-    for (0..count) |i| {
-        const off = i * 6;
-        const id: u16 = (@as(u16, payload[off]) << 8) | payload[off + 1];
-        const value: u32 =
-            (@as(u32, payload[off + 2]) << 24) |
-            (@as(u32, payload[off + 3]) << 16) |
-            (@as(u32, payload[off + 4]) << 8) |
-            payload[off + 5];
-        out[i] = .{ .id = id, .value = value };
-    }
+    for (out) |*entry| entry.* = it.next().?;
     return out;
+}
+
+/// RFC 7540 §6.5.2 INITIAL_WINDOW_SIZE: values above 2^31-1 are a connection
+/// error of type FLOW_CONTROL_ERROR.
+///
+/// The wire value is a u32, so the check has to happen before any narrowing
+/// cast: `@intCast` on `0x8000_0000` aborts the process instead of answering
+/// GOAWAY. A value of 0 is refused as well (see `applyPeerInitialWindowSize`).
+pub fn validateInitialWindowSize(value: u32) FlowControlError!u31 {
+    if (value == 0) return error.InvalidInitialWindowSize;
+    if (value > std.math.maxInt(u31)) return error.FlowControlOverflow;
+    return @intCast(value);
+}
+
+/// RFC 7540 §6.5.2 MAX_FRAME_SIZE: the value must be within [2^14, 2^24-1];
+/// anything else is a connection error of type PROTOCOL_ERROR.
+pub fn validateMaxFrameSize(value: u32) FlowControlError!u31 {
+    if (value < 16384 or value > std.math.maxInt(u24)) return error.InvalidFrameSize;
+    return @intCast(value);
 }
 
 pub fn encodeSettings(allocator: std.mem.Allocator, ack: bool, params: []const struct { u16, u32 }) ![]u8 {
@@ -746,13 +796,33 @@ test "decodeWindowUpdate rejects short payload" {
 test "FlowControlState consumeRecv replenishes at half threshold" {
     var fc = FlowControlState.init(default_initial_window_size);
     // Consume to just above half (32768 remaining after 32767 consumed).
-    const inc1 = fc.consumeRecv(32767);
+    const inc1 = try fc.consumeRecv(32767);
     try std.testing.expect(inc1 == null);
     try std.testing.expectEqual(@as(u31, 32768), fc.recv_window);
     // One more byte drops to half → replenish to initial.
-    const inc2 = fc.consumeRecv(1);
+    const inc2 = try fc.consumeRecv(1);
     try std.testing.expectEqual(@as(u31, 32768), inc2.?);
     try std.testing.expectEqual(default_initial_window_size, fc.recv_window);
+}
+
+test "FlowControlState consumeRecv rejects DATA beyond the receive window" {
+    var fc = FlowControlState.init(default_initial_window_size);
+    // A single DATA frame can carry up to 2^24-1 bytes; the window is only 65535.
+    // Subtracting an unchecked u31 underflows (panic in Debug, wrap in ReleaseFast).
+    try std.testing.expectError(error.RecvWindowExceeded, fc.consumeRecv(65536));
+    try std.testing.expectEqual(default_initial_window_size, fc.recv_window);
+
+    // Exactly the window size is still legal (and replenishes back to initial).
+    const inc = try fc.consumeRecv(default_initial_window_size);
+    try std.testing.expectEqual(default_initial_window_size, inc.?);
+    try std.testing.expectEqual(default_initial_window_size, fc.recv_window);
+
+    // A partially consumed window refuses anything above the remainder, and the
+    // failed charge leaves the window untouched.
+    _ = try fc.consumeRecv(100);
+    try std.testing.expectEqual(@as(u31, default_initial_window_size - 100), fc.recv_window);
+    try std.testing.expectError(error.RecvWindowExceeded, fc.consumeRecv(65436));
+    try std.testing.expectEqual(@as(u31, default_initial_window_size - 100), fc.recv_window);
 }
 
 test "FlowControlState applyWindowUpdate and maxOutboundData" {

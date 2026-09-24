@@ -2,6 +2,76 @@
 
 ## [Unreleased]
 
+### 协议面加固：HTTP/2 三条「未认证单包打崩进程」、HPACK UAF、sqlx 两条 P0、challenge 弱熵（**破坏性：否**）
+
+一次"从没被审过的面"的深审（HTTP/2 / HPACK / sqlx / web4），每条都带实测探针或确定性红。
+
+**HTTP/2 入站（h2 是 opt-in，但打开后这些都在鉴权之前执行）**
+- **`SETTINGS INITIAL_WINDOW_SIZE` 越界 → `@intCast` panic**：线上 u32 直接窄化成 u31。红：喂
+  `0x8000_0000` → `panic: integer does not fit in destination type` → ABRT。现在先校验（0 → 协议错，
+  >2^31-1 → `FLOW_CONTROL_ERROR`）再窄化。
+- **入站 DATA 超接收窗口 → u31 下溢**：全文件没有 `data_len` 与窗口的比较，一帧 `length=65536` 即可
+  （**不需要该流存在**）。红：`panic: integer overflow` → ABRT；ReleaseFast 下会回绕成巨值 → 该连接流控
+  永久失效。`consumeRecv` 改为可失败，连接级 GOAWAY / 流级 RST。
+- **无入站 `MAX_FRAME_SIZE` 校验、无字节预算**：HEADERS + 4096×16 MiB CONTINUATION 可灌 ~68 GB 进
+  `header_block`（`max_frames` 数的是帧不是字节）。现在：入站帧长按通告值拒、连接字节预算（64 MiB）、
+  每流 header_block（64 KiB）与 body（8 MiB）上限、CONTINUATION 计数闸，超限 GOAWAY
+  `ENHANCE_YOUR_CALM`。**红（真 socket）**：把校验去掉 → 一次 socket 会话就 `panic: integer overflow`。
+- **通告了 `MAX_CONCURRENT_STREAMS=100` 却不执行**，且客户端流 id 未校验「奇数 + 严格递增」。
+  红（真 socket）：去掉两个校验后偶数流照样被服务、第 101 条被接受。现在按通告值 RST `REFUSED_STREAM`
+  / GOAWAY `PROTOCOL_ERROR`，并顺带堵住 PRIORITY 无界建状态。
+- **测试**：10 条函数级 + **4 条真 loopback 端到端**（此前 h2 没有端到端用例），含「正常请求不被误伤」的
+  反向断言。
+
+**HPACK**
+- **use-after-free**：`01` 分支引用的 name 指向动态表条目，而 `pushDynamic` 会淘汰并 free 它，之后再
+  `dupe` 读的是已释放内存。**红**：探针回读 `0x55`（freed-fill）而非 `'s'`。修法：复制先于 `pushDynamic`。
+- **Dynamic Table Size Update（`001xxxxx`）未实现** → 合规客户端（nghttp2）请求被拒。**红**：合法块
+  `[0x20, 0x82]` 报 `InvalidHpack`。现在支持（超通告上限 → `InvalidHpackTableSize`）并提供
+  `isConnectionError()`，**调用方改成连接级 GOAWAY**（`Http2Server` 两处，连带 1 条真 socket 用例）。
+- Huffman 填充 >7 bit 现在拒绝（整字节 `0xFF` 结尾不再算合法）；`Header` 的所有权显式化
+  （`name_owner`/`value_owner`），不再靠 ptr+len 指纹判静态。
+- 共 18 条新测试，`Hpack` 19/19、`http` 面 177/177。
+
+**sqlx**
+- **读副本回退可无限递归**：副本失败为 `error.NotFound` 时熔断器不记失败 → 每层又选回同一副本。现在回退
+  走 `queryPrimary`，不再重入 `readTarget()`；「可接受」的副本失败也会记一次。新增 3 条副本用例
+  （其中 1 条专门覆盖 `NotFound` 分支——旧用例用 `ConnectionFailed` 掩盖了它）。
+- **MySQL `batchInsertPrepared` 双重 `mysql_stmt_close`**：同一 `stmt` 上 `errdefer` 与 `defer` 并存，
+  行数不符或 `mysql_stmt_execute` 失败（唯一键冲突）时双双执行 → double free。现在「sole owner，每条
+  退出路径恰好 close 一次」。**注意**：该用例需要真 MySQL，本机是 **skipped**，实证只能靠 CI 的
+  `Test (DB=mysql)`。
+- 附带两条 P1：取消的池等待者不再丢掉已移交的连接（原先每发生一次池永久少一个槽位）；失败的
+  rollback/commit 改为**丢弃**连接而不是放回池（下个借用者会继承 "transaction is aborted"）。
+
+**web4 / 门禁**
+- `challenge.zig` 用 `DefaultPrng.init(时间戳 ^ 指针)` 生成一次性挑战（同毫秒 + 同一 did → 同一个
+  challenge，被截获的签名可在新窗口重放）。**红**：同一 did 两次签发得到相同值。改用
+  `std.Io.randomSecure`（`issue` 的错误集因此多了 `EntropyUnavailable`/`Canceled`——仓库内唯一调用点用 `try`）。
+- **门禁补上它漏掉的形态**：熵扫描与 audit b24 现在识别 **PRNG 播种**（`DefaultPrng`/`DefaultCsprng`/
+  `Xoshiro256`/… 同行 `.init(`）。**红**：事故形状种回去 → `check-production` exit 1 并指名到行；
+  还原后 OK。8 处合法用途（负载均衡挑节点、选举抖动、tracer id、测试夹具）以**逐行锚点**豁免——
+  被豁免文件里新增一行弱种子**照样报**（已验证）。顺带说明为什么漏：`audit` 的 b 规则只走
+  `<dir>/src/modules`，框架自身靠 check-production 的整树扫描，漏的是**模式表**不是扫描范围。
+
+**顺带（同一批，独立小项）**
+- `src/ai/actions.zig` 的第二份 `isValidIdentifier` 改为委托 `sqlx.validateIdentifier`（与 `business.zig`
+  同口径；本地那份接受首位数字、无长度上限）。
+- `src/messaging/OutboxConsumer.zig` 的 `topic_filter` 由字符串拼接改为**绑定参数**（`topic = ?`）：
+  话题名带引号时旧写法直接产生语法错误 —— `sqlite3` 实测 `WHERE topic = 'ai.o'brien'` →
+  `syntax error near "brien"`。新增一条注入回归用例（`ai.o'brien` 必须命中且语句完好）。
+
+**明确未做（留给下一批）**：H1/H2 限额统一（需要 `Server.zig` 把 `max_body_size`/`header_limits` 传进
+`ServeOptions`）；**H2 会话没有读超时**（连上不说话的 prior-knowledge h2c 连接会一直占一个处理线程，
+需要决策加超时还是改 Server.zig）；HPACK 解压膨胀预算（`SETTINGS_MAX_HEADER_LIST_SIZE` 未通告）；
+h2 仍缺"完整 dispatch 链路"的端到端用例（现有 4 条走内置 404 站点响应）；`web4/middleware.zig`
+「先消费后验签」的顺序问题（同批 agent 给了改法但不在其文件白名单内）。
+
+验证：全量 `-Ddb=all` **1645/1667（22 skipped，0 failed）**；`zig build check`/`check-version`/deadcode/
+fmt/yaml 全绿；`zig build soak-cluster` 通过（RSS max 66 MiB，预算 128）。
+
+## [Unreleased]
+
 ### 修 CI 红：`poll(&.{})` 在 Linux 上 EFAULT 直接 ABRT；`check-api` 在无 rg 的主机上失败（**破坏性：否**）
 
 推 `93c4e18` 后 master 红了两个 job，两条都出在上一批改动里：

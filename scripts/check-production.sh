@@ -7,12 +7,24 @@
 #                              pid + wall-clock + ASLR, which is the exact
 #                              defect class AGENTS.md "CSPRNG" bans
 #   - `std.crypto.random`    — not declared by this toolchain at all
+#   - seeding a non-crypto PRNG (`std.Random.DefaultPrng.init(…)` — an alias for
+#     `Xoshiro256` — plus Xoroshiro128/Pcg/Isaac64/Sfc64/RomuTrio/SplitMix64 and
+#     caller-seeded `DefaultCsprng`): the state is recoverable from a few
+#     outputs and the seed is whatever the caller assembled (clock, pointer,
+#     counter). That is how `src/web4/challenge.zig` shipped a *predictable*
+#     anti-replay nonce while the older pattern list — which only knew about
+#     `std.Io.random`/`std.crypto.random` — stayed green.
 #   `std.Io.randomSecure(io, buf)` is the sanctioned form and never matches.
 #   Entropy is enforced everywhere, unlike the catch ratchet below: a lock's
 #   ownership id or an API-key salt derived from weak entropy is a security
 #   defect regardless of which directory it lives in. `audit`'s b24 only walks
 #   `src/modules/**` (application code), so this scan is what covers the
-#   framework's own `src/` — that gap is how `DistributedLock` shipped one.
+#   framework's own `src/` — that gap is how `DistributedLock` shipped one, and
+#   it is the side `src/web4/challenge.zig` fell on too (b24 never sees it).
+#   Reviewed non-security uses (balancing / jitter / identifier uniqueness) are
+#   exempted one *usage* at a time by the ENTROPY_OK table in
+#   scripts/lib/zig-scan.awk — that comment is the 口径, and its anchors are
+#   deliberately narrow so a new weak-seed line in an exempted file still fails.
 #
 # Scope (see scripts/lib/zig-scan.awk, shared with check-version.sh):
 #   * whole file, not "up to the first `test \"` line" — that truncation used to
@@ -137,7 +149,7 @@ while IFS= read -r f; do
 done < <(find "${SCAN_ROOTS[@]}" -name '*.zig' | sort)
 
 if [[ "$entropy_fail" -ne 0 ]]; then
-  echo "check-production: use std.Io.randomSecure(io, buf) — std.Io.random falls back to pid+wall-clock+ASLR and std.crypto.random does not exist here (AGENTS.md \"CSPRNG\")" >&2
+  echo "check-production: use std.Io.randomSecure(io, buf) — std.Io.random falls back to pid+wall-clock+ASLR, std.crypto.random does not exist here, and a seeded non-crypto PRNG (std.Random.DefaultPrng & co.) is predictable from a handful of outputs (AGENTS.md \"CSPRNG\")" >&2
   exit 1
 fi
 
