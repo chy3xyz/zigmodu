@@ -1502,7 +1502,15 @@ pub const SQLiteConn = struct {
             return err;
         };
         self.stmt_counter += 1;
-        try self.stmt_cache.put(key, .{ .value = stmt.?, .last_used = self.stmt_counter });
+        // A failed `put` is the cache's own allocation failing. The statement and
+        // the key are already this process's, so they have to go back with it —
+        // otherwise the failure leaves a leaked key *and* a leaked prepared
+        // statement behind, which is what the row-scan allocation sweep catches.
+        self.stmt_cache.put(key, .{ .value = stmt.?, .last_used = self.stmt_counter }) catch |err| {
+            self.allocator.free(key);
+            _ = sqlite3_c.sqlite3_finalize(stmt);
+            return err;
+        };
         return stmt.?;
     }
 
@@ -1542,7 +1550,7 @@ pub const SQLiteConn = struct {
             }
             const values = try arena_alloc.alloc(?Value, @intCast(col_count));
             for (0..@intCast(col_count)) |i| {
-                values[i] = readSQLiteValue(arena_alloc, stmt, @intCast(i));
+                values[i] = try readSQLiteValue(arena_alloc, stmt, @intCast(i));
             }
             try rows_list.append(arena_alloc, .{ .arena = undefined, .columns = shared_columns, .values = values });
             step_rc = sqlite3_c.sqlite3_step(stmt);
@@ -1694,7 +1702,14 @@ fn bindSQLite(stmt: ?*sqlite3_c.sqlite3_stmt, args: []const Value) !void {
     }
 }
 
-fn readSQLiteValue(allocator: std.mem.Allocator, stmt: ?*sqlite3_c.sqlite3_stmt, col: c_int) ?Value {
+/// Decode one SQLite cell.
+///
+/// `null` means the column holds SQL NULL — or a type this driver does not
+/// decode — and never a failed allocation. Copying a TEXT cell out of the
+/// driver is this process's memory, so it leaves through the error channel as
+/// `error.OutOfMemory`, the way `pgReadCell` does; reporting it as `null` gave
+/// the caller a wrong value with no error at all.
+fn readSQLiteValue(allocator: std.mem.Allocator, stmt: ?*sqlite3_c.sqlite3_stmt, col: c_int) !?Value {
     const t = sqlite3_c.sqlite3_column_type(stmt, col);
     return switch (t) {
         sqlite3_c.SQLITE_INTEGER => Value{ .int = sqlite3_c.sqlite3_column_int64(stmt, col) },
@@ -1703,7 +1718,7 @@ fn readSQLiteValue(allocator: std.mem.Allocator, stmt: ?*sqlite3_c.sqlite3_stmt,
             const raw_text = sqlite3_c.sqlite3_column_text(stmt, col);
             const text_len = std.mem.len(raw_text);
             const text = raw_text[0..text_len];
-            break :blk Value{ .string = allocator.dupe(u8, text) catch return null };
+            break :blk Value{ .string = try allocator.dupe(u8, text) };
         },
         sqlite3_c.SQLITE_NULL => null,
         else => null,
@@ -4063,7 +4078,7 @@ pub const SQLiteStmt = struct {
                 const name_len = std.mem.len(raw_name);
                 const name = raw_name[0..name_len];
                 columns[i] = try arena_alloc.dupe(u8, name);
-                values[i] = readSQLiteValue(arena_alloc, self.stmt, @intCast(i));
+                values[i] = try readSQLiteValue(arena_alloc, self.stmt, @intCast(i));
             }
             try rows_list.append(arena_alloc, .{ .arena = undefined, .columns = columns, .values = values });
         }
@@ -10221,6 +10236,103 @@ test "sqlite statement-cache key allocation failure is OutOfMemory" {
     pinAllocatorLimit(&failing);
     try std.testing.expectError(error.OutOfMemory, SQLiteConn.getCachedStmt(&conn, "SELECT 1"));
     try std.testing.expect(failing.has_induced_failure);
+}
+
+// `readSQLiteValue` used to fold both of these into one `null`: the SQL NULL a
+// column legitimately holds, and a failed `dupe` of the TEXT cell it had to copy
+// out of the driver. A caller cannot tell them apart, so an out-of-memory became
+// a wrong value (a NULL cell in an otherwise complete row) with no error at all.
+// The copy now leaves through the error channel, as `pgReadCell`'s does.
+test "sqlite text cell: allocation failure is OutOfMemory, SQL NULL stays null" {
+    if (!DriverFeatures.sqlite) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var conn = try SQLiteConn.open(allocator, ":memory:");
+    defer closeStackSQLiteConn(&conn);
+
+    const stmt = try SQLiteConn.getCachedStmt(&conn, "SELECT 'x' AS s, NULL AS n");
+    try std.testing.expectEqual(@as(c_int, sqlite3_c.SQLITE_ROW), sqlite3_c.sqlite3_step(stmt));
+
+    // Column 1 is a genuine SQL NULL…
+    try std.testing.expect((try readSQLiteValue(allocator, stmt, 1)) == null);
+    // …and column 0 is the text, present whenever its copy can be made.
+    const cell = (try readSQLiteValue(allocator, stmt, 0)).?;
+    defer allocator.free(cell.string);
+    try std.testing.expectEqualStrings("x", cell.string);
+
+    // The copy is this process's memory, so failing it must not masquerade as the
+    // NULL above.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, readSQLiteValue(failing.allocator(), stmt, 0));
+    try std.testing.expect(failing.has_induced_failure);
+}
+
+/// One scan on a connection of its own — `SQLiteConn.queryFn` builds its result
+/// set on the connection's allocator, so the connection has to be rebuilt on the
+/// allocator under test for a run to replay the same allocation sequence.
+fn sqliteScanOnce(allocator: std.mem.Allocator, big: []const u8) !void {
+    var conn = try SQLiteConn.open(allocator, ":memory:");
+    defer closeStackSQLiteConn(&conn);
+
+    _ = try SQLiteConn.execFn(&conn, "CREATE TABLE t (a INTEGER, b TEXT)", &.{});
+    _ = try SQLiteConn.execFn(&conn, "INSERT INTO t VALUES (1, ?1)", &.{.{ .string = big }});
+
+    // First the statement is prepared and cached, then the scan that is swept.
+    // The text is checked without `expectEqualStrings`, so a scan that hands back
+    // a NULL cell fails the test instead of dereferencing it.
+    var warm = try SQLiteConn.queryFn(&conn, allocator, "SELECT a, b FROM t", &.{});
+    defer warm.deinit();
+    if (warm.rows[0].values[1]) |cell| {
+        if (!std.mem.eql(u8, big, cell.string)) return error.ScanReturnedWrongText;
+    } else return error.ScanReturnedNullText;
+
+    var rows = try SQLiteConn.queryFn(&conn, allocator, "SELECT a, b FROM t", &.{});
+    defer rows.deinit();
+    if (rows.rows[0].values[1]) |cell| {
+        if (!std.mem.eql(u8, big, cell.string)) return error.ScanReturnedWrongText;
+    } else return error.ScanReturnedNullText;
+}
+
+test "sqlite row scan: no allocation failure in the scan is reported as a value" {
+    if (!DriverFeatures.sqlite) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    // The cell has to be big enough that its copy cannot be served out of the
+    // arena node the row buffer already holds: the copy then asks the injected
+    // allocator for a new node, which is what makes it reachable here at all.
+    var big_buf: [4096]u8 = undefined;
+    @memset(&big_buf, 'x');
+    const big: []const u8 = &big_buf;
+
+    // Run once with nothing failing to learn how many allocations a scan makes —
+    // the same shape `std.testing.checkAllAllocationFailures` uses. The count
+    // covers everything the helper allocates, statement prepare and caching
+    // included, so those are swept too, not just the row buffer.
+    const total = blk: {
+        var counting = std.testing.FailingAllocator.init(allocator, .{});
+        try sqliteScanOnce(counting.allocator(), big);
+        break :blk counting.alloc_index;
+    };
+    try std.testing.expect(total > 0);
+
+    // Then fail each of them in turn. Every iteration gets a fresh allocator, so
+    // its counter starts at zero and `fail_index = k` lands on the k-th
+    // allocation of that run; a shared counter would drift, because a failed
+    // allocation is never counted and each run stops where it failed.
+    var k: usize = 0;
+    while (k < total) : (k += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = k });
+        if (sqliteScanOnce(failing.allocator(), big)) |_| {
+            if (!failing.has_induced_failure) return error.NondeterministicAllocationCount;
+            std.debug.print("\nallocation #{d} of the scan failed but the scan returned a result\n", .{k});
+            return error.AllocationFailureReportedAsValue;
+        } else |err| {
+            if (err != error.OutOfMemory) {
+                std.debug.print("\nallocation #{d} of the scan came back as {s}\n", .{ k, @errorName(err) });
+                return err;
+            }
+        }
+    }
 }
 
 test "scanStruct indexed string-dupe allocation failure is OutOfMemory" {

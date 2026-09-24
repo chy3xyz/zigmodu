@@ -1537,6 +1537,12 @@ fn maybeStartLiveBidi(
     opts: ServeOptions,
 ) !void {
     if (st.bidi_live) return;
+    // The interleaved path is the one gRPC shape that writes its DATA frames as
+    // the handler flushes them, i.e. outside `buildStreamResponseWire` — so a
+    // `HEAD` must not take it, or the octets would be on the wire before the
+    // `no_body` decision could be applied. Those requests go through the batch
+    // path instead and get the same DATA-stripping as the other gRPC shapes.
+    if (std.mem.eql(u8, st.method, "HEAD")) return;
     const is_grpc = std.mem.indexOf(u8, st.content_type, "application/grpc") != null;
     if (!is_grpc) return;
     const reg = opts.grpc_registry orelse return;
@@ -1648,20 +1654,27 @@ fn buildStreamResponseWire(
     opts: ServeOptions,
 ) ![]u8 {
     // A `HEAD` request is answered with the same field section and no body
-    // (RFC 9113 §8.2) — see `encodeSiteResponseWire`'s `no_body`.
+    // (RFC 9113 §8.2) — see `encodeSiteResponseWire`'s `no_body`. The gRPC
+    // wires are the one case the encoder cannot decide for us: they are built
+    // inside `extensions/GrpcTransport.zig`, which never sees `:method`, so
+    // `grpcWireWithoutBody` applies the same rule to them after the fact.
     const no_body = std.mem.eql(u8, st.method, "HEAD");
     const is_grpc = std.mem.indexOf(u8, st.content_type, "application/grpc") != null;
     if (is_grpc) {
         if (opts.grpc_registry) |reg| {
             const path = st.path;
             if (reg.findMethod(path)) |method| {
+                // Every streaming shape funnels its wire here so the `HEAD`
+                // rule is applied once, on the one path that leaves this
+                // function.
+                var grpc_wire: ?[]u8 = null;
                 switch (method.method.method_type) {
                     .server_streaming => {
                         var result = try reg.handleHttpServerStream(path, st.data.items, stream_id);
                         defer result.deinit(allocator);
                         if (result.http2_wire) |wire| {
                             result.http2_wire = null;
-                            return wire;
+                            grpc_wire = wire;
                         }
                     },
                     .client_streaming => {
@@ -1669,7 +1682,7 @@ fn buildStreamResponseWire(
                         defer result.deinit(allocator);
                         if (result.http2_wire) |wire| {
                             result.http2_wire = null;
-                            return wire;
+                            grpc_wire = wire;
                         }
                     },
                     .bidi_streaming => {
@@ -1678,24 +1691,28 @@ fn buildStreamResponseWire(
                             defer result.deinit(allocator);
                             if (result.http2_wire) |wire| {
                                 result.http2_wire = null;
-                                return wire;
+                                grpc_wire = wire;
                             }
                         }
-                        var result = try reg.handleHttpBidi(path, st.data.items, stream_id);
-                        defer result.deinit(allocator);
-                        if (result.http2_wire) |wire| {
-                            result.http2_wire = null;
-                            return wire;
+                        if (grpc_wire == null) {
+                            var result = try reg.handleHttpBidi(path, st.data.items, stream_id);
+                            defer result.deinit(allocator);
+                            if (result.http2_wire) |wire| {
+                                result.http2_wire = null;
+                                grpc_wire = wire;
+                            }
                         }
                     },
                     .unary => {},
                 }
+                if (grpc_wire) |wire| return try grpcWireWithoutBody(allocator, wire, no_body);
             }
             var unary = try reg.handleHttpUnary(path, st.data.items);
             defer unary.deinit(allocator);
             const status_str = try std.fmt.allocPrint(allocator, "{d}", .{@backingInt(unary.grpc_status)});
             defer allocator.free(status_str);
-            return try Http2.encodeGrpcServerStream(allocator, stream_id, unary.body, status_str, unary.grpc_message);
+            const wire = try Http2.encodeGrpcServerStream(allocator, stream_id, unary.body, status_str, unary.grpc_message);
+            return try grpcWireWithoutBody(allocator, wire, no_body);
         }
     }
 
@@ -1726,6 +1743,54 @@ fn buildStreamResponseWire(
     // response on this connection.
     const budget = responseHeaderBudget(opts, peer_max_header_list, conn_max_frame_size);
     return try encodeSiteResponseWire(allocator, stream_id, 404, "text/plain", &.{}, "not found", budget, no_body);
+}
+
+/// The gRPC response wire, minus its DATA frames when the request was a `HEAD`.
+///
+/// A `HEAD` is answered with the field section of the `GET` and no body
+/// (RFC 9110 §9.3.2), and on H2 "no body" means no DATA frame at all — not a
+/// zero-length one, and not the message octets the client would have to skip.
+/// The gRPC wires are built by `extensions/GrpcTransport.zig`, which is handed
+/// `:path` and the body but no method, so the decision cannot be taken there;
+/// it is taken here, on the wire, for every gRPC shape at once.
+///
+/// Not asking the registry for a response *instead* is the trap: the gRPC
+/// branch would then fall through to the site handler (and its built-in 404),
+/// answering a `HEAD` with "not found" on a route that exists. So the registry
+/// is invoked exactly as it is for `GET` — same handler, same status — and only
+/// the octets are dropped.
+///
+/// That leaves a **trailers-only** response: the head field section
+/// (`:status`, `content-type`) plus the wire's own trailer HEADERS, which
+/// carries `grpc-status` / `grpc-message` and already ends the stream. gRPC
+/// defines that shape as a legitimate answer (`grpc-status` in the trailer
+/// section and no message), so what a `HEAD` gets is a valid empty gRPC
+/// response rather than a broken one. `HEAD` is not a method gRPC clients
+/// send; this is protocol hygiene, and the field sections are the ones the
+/// `GET` would have carried.
+fn grpcWireWithoutBody(allocator: std.mem.Allocator, wire: []u8, no_body: bool) ![]u8 {
+    if (!no_body) return wire;
+
+    var kept = std.ArrayList(u8).empty;
+    errdefer kept.deinit(allocator);
+    var off: usize = 0;
+    while (off < wire.len) {
+        if (off + 9 > wire.len) break;
+        const frame = Http2.decodeFrame(wire[off..]) catch break;
+        const end = off + 9 + @as(usize, frame.header.length);
+        if (end > wire.len) break;
+        if (frame.header.typ != .data) try kept.appendSlice(allocator, wire[off..end]);
+        off = end;
+    }
+    // A wire with no DATA frame in it is already the answer (a zero-message
+    // response has none), and a wire whose framing this loop could not walk is
+    // not this module's to rewrite: hand both back untouched.
+    if (off != wire.len or kept.items.len == wire.len) {
+        kept.deinit(allocator);
+        return wire;
+    }
+    allocator.free(wire);
+    return try kept.toOwnedSlice(allocator);
 }
 
 /// Caps on the response header block. The inbound side has the same knobs
@@ -3573,5 +3638,117 @@ test "h2 server fits the response block to the peer's SETTINGS_MAX_HEADER_LIST_S
         try std.testing.expect(findFrameInReply(reply, .rst_stream, 1) == null);
         const data = findFrameInReply(reply, .data, 1) orelse return error.TestUnexpectedResultWithMessage;
         try std.testing.expectEqualStrings("ok", data.payload);
+    }
+}
+
+/// How many frames of `typ` (any stream when `stream_id` is 0) a reply carries.
+fn countFramesInReply(wire: []const u8, typ: Http2.FrameType, stream_id: u31) usize {
+    var count: usize = 0;
+    var off: usize = 0;
+    while (off + 9 <= wire.len) {
+        const frame = Http2.decodeFrame(wire[off..]) catch return count;
+        off += 9 + @as(usize, frame.header.length);
+        if (frame.header.typ == typ and (stream_id == 0 or frame.header.stream_id == stream_id)) count += 1;
+    }
+    return count;
+}
+
+/// The `n`-th (0-based) frame of `typ` in a reply — how the trailer field
+/// section is reached when a response has more than one HEADERS frame.
+fn nthFrameInReply(wire: []const u8, typ: Http2.FrameType, stream_id: u31, n: usize) ?Http2.Frame {
+    var seen: usize = 0;
+    var off: usize = 0;
+    while (off + 9 <= wire.len) {
+        const frame = Http2.decodeFrame(wire[off..]) catch return null;
+        off += 9 + @as(usize, frame.header.length);
+        if (frame.header.typ != typ) continue;
+        if (stream_id != 0 and frame.header.stream_id != stream_id) continue;
+        if (seen == n) return frame;
+        seen += 1;
+    }
+    return null;
+}
+
+test "h2 server answers a HEAD on a gRPC route with no DATA frame" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var registry = Grpc.GrpcServiceRegistry.init(allocator);
+    defer registry.deinit();
+    try registry.registerService("h2grpc.Echo");
+    try registry.registerMethod("h2grpc.Echo", "Say", .unary, struct {
+        fn h(req: Grpc.GrpcRequest) anyerror!Grpc.GrpcResponse {
+            _ = req;
+            return .{ .payload = "pong", .status = .OK, .message = "" };
+        }
+    }.h);
+
+    var server = api_server.Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h2-grpc-head" });
+    defer server.deinit();
+    server.setHttp2Enabled(true);
+    server.setGrpcRegistry(&registry);
+
+    var running = try RunningServer.start(&server);
+    defer running.stop(&server);
+
+    const framed_in = try Grpc.GrpcFrame.encode(allocator, "");
+    defer allocator.free(framed_in);
+    const expected_body = try Grpc.GrpcFrame.encode(allocator, "pong");
+    defer allocator.free(expected_body);
+    const grpc_extra = [_]Hpack.Header{.{ .name = "content-type", .value = "application/grpc" }};
+
+    // 1) The GET control: the message reaches the client as DATA. Without this
+    //    half the test cannot tell "the DATA was dropped for HEAD" from "no DATA
+    //    is ever produced on this route".
+    {
+        const block = try hpackRequestBlock(allocator, "GET", "/h2grpc.Echo/Say", &grpc_extra);
+        defer allocator.free(block);
+        const head = try Http2.encodeHeaders(allocator, 1, block, false, true);
+        defer allocator.free(head);
+        const data = try Http2.encodeData(allocator, 1, framed_in, true);
+        defer allocator.free(data);
+        const script = try std.mem.concat(allocator, u8, &.{ head, data });
+        defer allocator.free(script);
+
+        var out: [8192]u8 = undefined;
+        const n = try h2SpeakToServer(running.port, script, &out);
+        const body = findFrameInReply(out[0..n], .data, 1) orelse return error.NoDataFrameForGet;
+        try std.testing.expectEqualStrings(expected_body, body.payload);
+    }
+
+    // 2) The same route asked with HEAD. A HEAD body is not sent, so the one
+    //    request frame here is HEADERS with END_STREAM.
+    {
+        const block = try hpackRequestBlock(allocator, "HEAD", "/h2grpc.Echo/Say", &grpc_extra);
+        defer allocator.free(block);
+        const head = try Http2.encodeHeaders(allocator, 1, block, true, true);
+        defer allocator.free(head);
+
+        var out: [8192]u8 = undefined;
+        const n = try h2SpeakToServer(running.port, head, &out);
+        const reply = out[0..n];
+
+        // The head field section is the gRPC one — not the loop's built-in 404.
+        const hframe = findFrameInReply(reply, .headers, 1) orelse return error.NoHeadersFrameForHead;
+        var dec = Hpack.Decoder.init(allocator);
+        defer dec.deinit();
+        const hdrs = try dec.decode(hframe.payload);
+        defer Hpack.freeHeaders(allocator, hdrs);
+        try std.testing.expectEqualStrings("200", firstHeaderValue(hdrs, ":status") orelse return error.NoStatusField);
+        try std.testing.expectEqualStrings("application/grpc", firstHeaderValue(hdrs, "content-type") orelse return error.NoContentTypeField);
+
+        // The trailer field section still carries the gRPC status, and it is
+        // what closes the stream.
+        const trailers = nthFrameInReply(reply, .headers, 1, 1) orelse return error.NoTrailerHeadersForHead;
+        try std.testing.expect((trailers.header.flags & Http2.FrameFlags.end_stream) != 0);
+        var tdec = Hpack.Decoder.init(allocator);
+        defer tdec.deinit();
+        const thdrs = try tdec.decode(trailers.payload);
+        defer Hpack.freeHeaders(allocator, thdrs);
+        try std.testing.expect(firstHeaderValue(thdrs, "grpc-status") != null);
+
+        // RFC 9110 §9.3.2: the field sections above, and no body.
+        try std.testing.expectEqual(@as(usize, 0), countFramesInReply(reply, .data, 1));
+        try std.testing.expect(findFrameInReply(reply, .rst_stream, 1) == null);
     }
 }

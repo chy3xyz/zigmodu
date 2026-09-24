@@ -2,6 +2,55 @@
 
 ## [Unreleased]
 
+### 第 14 批：H2 上 gRPC 路由的 `HEAD` 仍会发 DATA 帧（真红）、sqlite 把 OOM 与 SQL NULL 混成一个 `null` 并顺带修掉一个真泄漏（**破坏性：否**）
+
+全量 `-Ddb=all` **1783/1836（53 skipped，0 failed）**。
+
+**H2 上走 gRPC 路由的 `HEAD` 仍会发出 DATA 帧 —— 已修。** 上一批给 H2 加了 `no_body`（HEAD 不发 body）
+并在 site 编码器上生效，但 **gRPC 的四个形状在 `buildStreamResponseWire` 里早于那个判定就 return 了**，
+`st.content_type` 又来自请求头，于是 `HEAD` + `content-type: application/grpc` 会拿到一个 5 字节 DATA
+（空 gRPC 消息 `00 00 00 00 00`）—— 字段段本身是对的（头段 200 + `application/grpc`、trailer 段有
+`grpc-status`），错的只是八位组。红证据：
+```
+[default] (warn): [TEMP] HEAD gRPC DATA frame: 5 bytes { 0, 0, 0, 0, 0 }
+expected 0, found 1
+```
+修法：四个 gRPC 形状不再各自 `return wire`，而是汇进一个 `grpc_wire`，统一经
+`grpcWireWithoutBody(allocator, wire, no_body)` 出去（**非 HEAD 逐字节不变**：该函数对非 `no_body` 原样
+返回入参）；`maybeStartLiveBidi` 对 `HEAD` 提前返回 —— 那是唯一在 `buildStreamResponseWire` **之外**写
+DATA 的 gRPC 形状（handler 边刷边写）。**决定写进注释**：`HEAD` 保留 gRPC handler 的调用与字段段、
+只丢掉 DATA；丢掉 DATA 之后剩下的"trailers-only"（`grpc-status`/`grpc-message` 在 trailer 段、没有消息）
+**本身就是 gRPC 合法的错误/空应答**，所以不需要编造状态；而"不看 registry、直接 `and !no_body`"正是
+这条要避开的陷阱 —— 那会让 gRPC 分支落到 site handler，给一个**存在的**路由回内置 404。
+> **未验证**：`maybeStartLiveBidi` 的 HEAD 守卫只有推理（仓库里没有 H2 上的 bidi pump socket 用例，
+> 两个 bidi 用例都是 registry 级的）；四个形状里只有 unary 端到端跑过 h2c；"trailers-only 合法"依据的是
+> gRPC 规范，**没有真 gRPC 客户端**验证过（用例里的客户端是个读帧的 HTTP/2 客户端）。
+> 非 HEAD 的 gRPC 路径已按原有测试复核：`--filter "rpc"` 18/18、`--filter "bidi"` 2/2、`--filter "h2 server"`
+> 8/8、`--filter "h2c upgrade"` 9/9、`--filter "h2 adapter parity"` 7/7。
+
+**sqlite 的 `readSQLiteValue` 把"分配失败"与"SQL NULL"混成同一个 `null` —— 已修。** 这比"错误名撒谎"
+更糟：调用方拿到的是**错值**（一个普通的 NULL 单元混在完好的一行里），**没有任何错误、没有任何日志**。
+红证据（SafeAllocator 的 1 字节泄漏栈直指那一行）：
+```
+RED: readSQLiteValue returned a NULL cell after its text copy failed to allocate
+FAIL (TextCellAllocationFailureReportedAsSQLNull)
+[SafeAllocator] (err): leaked [len: 1] allocated at: …/sqlx.zig:1706:55 in readSQLiteValue
+    break :blk Value{ .string = allocator.dupe(u8, text) catch return null };
+```
+改为 `!?Value`（**与 `pgReadCell` 同形**），文本单元用 `try`；文档注释写明 `null` **只**表示 SQL NULL
+或未解码的列类型、**绝不**表示分配失败。两个调用点（`SQLiteConn.queryFn`、`SQLiteStmt.queryFn`）加
+`try` —— 它们本来就返回 `errors.ResultT(Rows)` 且错误集含 `OutOfMemory`，所以**没有涟漪**。
+> **顺带修掉一个真泄漏**（新写的扫描用例发现的）：`SQLiteConn.getCachedStmt` 里 `stmt_cache.put` 分配
+> 失败时，缓存键与预处理语句**都漏了**（34 字节 `CREATE TABLE` 键）；现在释放键、finalize 语句再返回
+> 错误，与 MySQL 驱动的同一路径一致。
+> 两条新用例：① 直接驱动那个接缝（真 SQL NULL 仍是 `null`、文本单元复制成功是 `"x"`、复制失败是
+> `error.OutOfMemory` —— 两侧都钉住）；② 公共路径扫描，**每个索引用一个全新分配器**（失败的那次分配
+> 不会被计数，共享计数器会漂移 —— `std.testing.checkAllAllocationFailures` 就是这个形状），且单元故意
+> 用 4096 字节：短文本会由行缓冲已有的 arena 节点直接满足、**根本碰不到注入的分配器**（实测过一个变体）。
+> **未验证**：没有真机 PG/MySQL 参与（sqlite 走嵌入式 `:memory:`，是真实驱动路径）；`else => null`
+> 分支（未解码的列类型，如 BLOB）仍会静默变成 SQL NULL —— 那是另一类混淆（不涉及分配），注释里点名了
+> 它以免被误当成这个 OOM 情形。
+
 ### 第 13 批：PG `?*PGresult` 的 null 语义收敛（上一批只给了评估、这次真做）、一个进程两个 server 的全局状态彻底按实例隔离（**破坏性：否**，公开签名未动）
 
 全量 `-Ddb=all` **1780/1833（53 skipped，0 failed）**；PG 门控真机 `allocation` 组 38 passed / 9 skipped，
