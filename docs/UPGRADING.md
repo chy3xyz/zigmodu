@@ -37,10 +37,44 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 
 ## v0.33.4（未发布）
 
-> **本版有 1 处破坏性变更（编译错）**：口令校验不再返回裸 `bool`。另有 4 处**行为变化**值得确认：
-> Redis 不可达时不再静默返回 `0`/`false`、表单解析超限从 200 变 400、`CachedConn` 的坏缓存条目从
-> `DatabaseError` 变成"缓存未命中 + 修复"、`BufferPool.acquire` 的取消不再报 `OutOfMemory`。
+> **本版有 2 处破坏性变更（都是编译错）**：口令校验不再返回裸 `bool`、
+> `Middleware.attachIdentityBestEffort` 改成 `!void`。另有 8 处**行为变化**值得确认：Redis 不可达时不再
+> 静默返回 `0`/`false`、表单解析超限从 200 变 400、`CachedConn` 的坏缓存条目从 `DatabaseError` 变成
+> "缓存未命中 + 修复"、`BufferPool` 的取消语义、认证中间件对"我们这侧失败"改回 500、API key 比较改恒定
+> 时间、MySQL 的 NULL 元数据不再读成"零行"。
 > 逐条背景见 [`../CHANGELOG.md`](../CHANGELOG.md) 的 `[Unreleased]` 段。
+
+**破坏 ②：`Middleware.attachIdentityBestEffort` 由 `void` 变成 `!void`。** 它以前在构建 `roles` 属性失败时
+**静默返回**，留下一个"有 `user_id`/`tenant_id`、没有 `roles`"的身份继续处理请求（role gate 一律 403，
+而把"无角色"当匿名看的 handler 则行为未定义）。现在先把 roles CSV 建好再写任何属性，任一写失败即
+`return err`（fail-closed）。
+**Breaking?** 是（编译错）· **影响面**：直接调用它的中间件代码（仓库内只有本库自己） · **一行改法**：
+`attachIdentityBestEffort(ctx, claims, alloc);` → `try attachIdentityBestEffort(ctx, claims, alloc);`。
+用 `http.addMiddleware(http.jwtAuthFromCatalog(...))` 这类常规接线的消费者**不需要改**。
+
+**行为变化（非破坏）⑤：认证中间件不再把"我们这侧出错"答成 401。** `jwtBackend`、旧路径
+`jwtAuth*`、`authFromCatalog` 与 `security.AuthMiddleware` 的 `verifyToken` 失败以前一律 401（或
+`false`）。现在 **token 级失败**（签名/过期/算法/格式）仍是 401；**我们这侧的失败**（分配失败、
+自定义 `AuthBackend` 的存储故障）→ **500** + warn 日志；**未知 `kid`** 仍是 401（`kid` 由客户端控制，
+答 5xx 等于给未认证调用者一个制造 5xx 的开关）但会打一条 warn，让运维看到"密钥轮换漏了一把"。
+`authFromCatalog` 在 `.public`/`.optional` 路由上，我们这侧的失败现在**让请求失败**（以前是记一条日志
+后当作匿名继续）。若你的客户端把 500 当成"重试即可"，这正是想要的；若你的监控按 401 统计失败登录，
+现在它不再包含我们的内部故障。
+
+**行为变化（非破坏）⑥：API key 比较改为恒定时间。** `security.ApiKeyAuth.validateKey` 不再用
+`std.mem.eql`（实测"错在第一个字节"与"错在最后一个字节"的耗时差约 **3560×**；改后差 0.8%）并且不再
+提前返回。语义不变，只是耗时不再泄漏匹配长度。
+> `ApiKeyLoaderConfig.loader` 的类型仍是 `*const fn ([]const u8) bool`，**存储故障与"key 不存在"同形**；
+> 文档现在要求 loader 自己 fail-closed 并旁路上报。计划改成 `anyerror!bool`（与 `PermissionLoader` 对齐），
+> 但那是公开字段的破坏性变更，本版**没有**做。
+
+**行为变化（非破坏）⑦：`BufferPool.release` / `available` / `stats` 的锁等待不再可被取消。** 以前取消即
+返回：`release` 丢掉缓冲区（`allocated` 永久虚高 → 以后报**假** `PoolExhausted`），`available`/`stats`
+给出伪造读数（会被 scrape/健康检查当成事实）。`acquire` 仍然返回 `error.Canceled`。
+
+**行为变化（非破坏）⑧：MySQL 的 `NULL` 结果集元数据不再被读成"零行"。** 语句有字段却拿不到元数据时
+（libmysql 的分配失败）以前返回空结果集，现在返回映射后的错误；`field_count == 0` 这条真实子情形仍是
+空结果集（记一条 debug 日志）。
 
 **破坏：口令校验返回错误联合。** `PasswordEncoder.matches` 与 `SecurityModule.verifyPassword` 由
 `bool` 变成 `PasswordError!bool`（`error{MalformedStoredHash} || std.mem.Allocator.Error`）。

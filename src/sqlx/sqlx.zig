@@ -3358,15 +3358,45 @@ fn mysqlParseDateTime(s: []const u8) errors.Error![]const u8 {
 }
 
 /// Validate a MySQL JSON string. Returns the input unchanged on success.
-fn mysqlParseJson(s: []const u8) errors.Error![]const u8 {
+///
+/// A parse verdict stays `error.InvalidFormat`; the parser running out of this
+/// process's memory is `error.OutOfMemory`, the name `Error.zig` documents for
+/// allocation failures — the same split `CachedConn.decodeCached` below makes.
+/// One `catch` for both reported an OOM inside the parser as "the JSON is
+/// malformed", which sends the caller looking at the data instead of at memory.
+fn mysqlParseJson(allocator: std.mem.Allocator, s: []const u8) errors.Error![]const u8 {
     const trimmed = std.mem.trim(u8, s, " \t\r\n");
     if (trimmed.len == 0) return error.InvalidFormat;
 
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), trimmed, .{}) catch return error.InvalidFormat;
+    const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), trimmed, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidFormat,
+    };
     parsed.deinit();
     return s;
+}
+
+/// What a NULL `mysql_stmt_result_metadata` means, split so the reader below
+/// never reports a library failure as an empty result set.
+///
+/// `null` = no result set. That is the library's own answer for a statement with
+/// `field_count == 0`, and it leaves `mysql_stmt_errno(stmt)` at 0 (measured
+/// against the live server: a prepared `DO 1` puts the statement in exactly this
+/// state). Reading it as zero rows is the honest verdict.
+///
+/// Any other NULL is the library failing to describe a statement that *does*
+/// have fields, and it is not "no rows". The reachable instance — measured by
+/// disassembling the linked client, MySQL 9.3's `libmysqlclient.24` — is its own
+/// descriptor allocation failing, which it reports as
+/// `mysql_stmt_errno(stmt) == 2008` (CR_OUT_OF_MEMORY) plus a message. That is
+/// why the caller has to read the handle's errno instead of guessing from the
+/// NULL. The `err_no == 0` remainder is a library that declined to explain
+/// itself: still an error, never an empty result set.
+fn mysqlNullMetadataVerdict(field_count: c_uint, err_no: c_uint) ?errors.Error {
+    if (field_count == 0) return null;
+    return mysqlErrnoToError(err_no);
 }
 
 /// After successful `mysql_stmt_execute` for a result-producing statement, fetch rows with binary decoding.
@@ -3386,9 +3416,19 @@ fn mysqlStmtReadRows(stmt: *libmysql_c.MYSQL_STMT, arena: *std.heap.ArenaAllocat
     // (`attempt to use null value`). Measured against mariadb:11 with Debian's
     // libmariadb, the configuration CI runs.
     const meta = libmysql_c.mysql_stmt_result_metadata(stmt) orelse {
-        // No metadata → treat as empty result set (should be rare after field_count > 0).
-        const empty = try arena_alloc.alloc(Row, 0);
-        return Rows{ .arena = arena.*, .rows = empty };
+        const field_count = libmysql_c.mysql_stmt_field_count(stmt);
+        const err_no = libmysql_c.mysql_stmt_errno(stmt);
+        const err_msg = std.mem.span(libmysql_c.mysql_stmt_error(stmt));
+        const verdict = mysqlNullMetadataVerdict(field_count, err_no) orelse {
+            // No result set: the sub-case this branch was measured against.
+            std.log.debug("[sqlx] MySQL statement has no result set; reading zero rows", .{});
+            const empty = try arena_alloc.alloc(Row, 0);
+            return Rows{ .arena = arena.*, .rows = empty };
+        };
+        // Fields but no descriptor: returning the empty row set here would hand
+        // the caller a wrong answer ("no rows") with no error attached to it.
+        std.log.err("[sqlx] MySQL stmt_result_metadata returned NULL for a statement with {d} field(s): errno={d} msg={s}", .{ field_count, err_no, err_msg });
+        return verdict;
     };
     defer libmysql_c.mysql_free_result(meta);
 
@@ -8403,24 +8443,53 @@ test "mysqlParseDateTime rejects invalid temporal strings" {
 }
 
 test "mysqlParseJson accepts valid MySQL JSON strings" {
-    try std.testing.expectEqualStrings("{\"key\":\"value\"}", try mysqlParseJson("{\"key\":\"value\"}"));
-    try std.testing.expectEqualStrings("[1,2,3]", try mysqlParseJson("[1,2,3]"));
-    try std.testing.expectEqualStrings("null", try mysqlParseJson("null"));
-    try std.testing.expectEqualStrings("true", try mysqlParseJson("true"));
-    try std.testing.expectEqualStrings("42", try mysqlParseJson("42"));
-    try std.testing.expectEqualStrings("  {\"a\":1}  ", try mysqlParseJson("  {\"a\":1}  "));
-    try std.testing.expectEqualStrings("\"hello\"", try mysqlParseJson("\"hello\""));
-    try std.testing.expectEqualStrings("-3.14", try mysqlParseJson("-3.14"));
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqualStrings("{\"key\":\"value\"}", try mysqlParseJson(allocator, "{\"key\":\"value\"}"));
+    try std.testing.expectEqualStrings("[1,2,3]", try mysqlParseJson(allocator, "[1,2,3]"));
+    try std.testing.expectEqualStrings("null", try mysqlParseJson(allocator, "null"));
+    try std.testing.expectEqualStrings("true", try mysqlParseJson(allocator, "true"));
+    try std.testing.expectEqualStrings("42", try mysqlParseJson(allocator, "42"));
+    try std.testing.expectEqualStrings("  {\"a\":1}  ", try mysqlParseJson(allocator, "  {\"a\":1}  "));
+    try std.testing.expectEqualStrings("\"hello\"", try mysqlParseJson(allocator, "\"hello\""));
+    try std.testing.expectEqualStrings("-3.14", try mysqlParseJson(allocator, "-3.14"));
 }
 
 test "mysqlParseJson rejects invalid JSON strings" {
-    try std.testing.expectError(error.InvalidFormat, mysqlParseJson(""));
-    try std.testing.expectError(error.InvalidFormat, mysqlParseJson("not json"));
-    try std.testing.expectError(error.InvalidFormat, mysqlParseJson("{\"a\":1"));
-    try std.testing.expectError(error.InvalidFormat, mysqlParseJson("42e"));
-    try std.testing.expectError(error.InvalidFormat, mysqlParseJson("1.2.3"));
-    try std.testing.expectError(error.InvalidFormat, mysqlParseJson("++1"));
-    try std.testing.expectError(error.InvalidFormat, mysqlParseJson("--1"));
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidFormat, mysqlParseJson(allocator, ""));
+    try std.testing.expectError(error.InvalidFormat, mysqlParseJson(allocator, "not json"));
+    try std.testing.expectError(error.InvalidFormat, mysqlParseJson(allocator, "{\"a\":1"));
+    try std.testing.expectError(error.InvalidFormat, mysqlParseJson(allocator, "42e"));
+    try std.testing.expectError(error.InvalidFormat, mysqlParseJson(allocator, "1.2.3"));
+    try std.testing.expectError(error.InvalidFormat, mysqlParseJson(allocator, "++1"));
+    try std.testing.expectError(error.InvalidFormat, mysqlParseJson(allocator, "--1"));
+}
+
+test "mysqlParseJson reports a parser allocation failure as OutOfMemory" {
+    // The verdict and the resource failure are different events: valid JSON that
+    // the parser cannot allocate for is not "malformed JSON". A caller that
+    // branches on `InvalidFormat` (data error) must not be handed a resource
+    // error, and vice versa.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, mysqlParseJson(failing.allocator(), "{\"a\":1}"));
+    try std.testing.expect(failing.has_induced_failure);
+}
+
+test "mysql NULL stmt metadata is empty only for a statement with no result set" {
+    // `field_count == 0`: the library's own "no result set" answer, and the one
+    // NULL it produces with `mysql_stmt_errno` still 0. Zero rows, not an error.
+    try std.testing.expectEqual(@as(?errors.Error, null), mysqlNullMetadataVerdict(0, 0));
+
+    // Fields but a NULL descriptor: the statement's rows are unreachable. The
+    // caller gets an error either way, never an empty result set.
+    try std.testing.expectEqual(@as(?errors.Error, error.DatabaseError), mysqlNullMetadataVerdict(1, 0));
+
+    // 2008 is CR_OUT_OF_MEMORY, what the linked libmysqlclient leaves on the
+    // statement when its own descriptor allocation is what failed.
+    try std.testing.expectEqual(@as(?errors.Error, error.DatabaseError), mysqlNullMetadataVerdict(2, 2008));
+
+    // A NULL whose errno is a mapped server code keeps that mapping.
+    try std.testing.expectEqual(@as(?errors.Error, error.DatabaseConnectionFailed), mysqlNullMetadataVerdict(2, 2013));
 }
 
 test "mysql live connection" {
@@ -8514,7 +8583,7 @@ test "mysql live connection" {
     try std.testing.expectEqualStrings("2024-03-15 14:30:00", try mysqlParseDateTime(created_val.string));
 
     const payload_val = type_row.get("payload") orelse return error.TestUnexpectedResult;
-    const payload_str = try mysqlParseJson(payload_val.string);
+    const payload_str = try mysqlParseJson(allocator, payload_val.string);
     try std.testing.expect(std.mem.indexOf(u8, payload_str, "\"key\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload_str, "\"value\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload_str, "\"num\"") != null);
@@ -10822,6 +10891,33 @@ test "mysql statement row scan reports allocation failures as OutOfMemory" {
     }
     try std.testing.expect(succeeded);
     try std.testing.expect(failures > 0);
+}
+
+test "mysql statement without a result set reads as zero rows, not an error" {
+    try skipUnlessDb("mysql");
+    const allocator = std.testing.allocator;
+    const cfg = mysqlLiveConfig();
+    var conn = try MySqlConn.connect(allocator, cfg.host, cfg.username, cfg.password, cfg.database, cfg.port);
+    defer closeStackMySqlConn(&conn);
+
+    // `DO 1` runs but produces no result set: `field_count == 0`, which is the
+    // state in which the library hands back NULL metadata with no errno set
+    // (the sub-case `mysqlNullMetadataVerdict` keeps as "empty"). The reader
+    // has to come back with zero rows and no error rather than inventing one.
+    const stmt = try conn.getCachedStmt("DO 1");
+    try std.testing.expectEqual(@as(c_int, 0), libmysql_c.mysql_stmt_execute(stmt));
+    try std.testing.expectEqual(@as(c_uint, 0), libmysql_c.mysql_stmt_field_count(stmt));
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    const res = mysqlStmtReadRows(stmt, &arena);
+    if (res) |rows| {
+        var got = rows;
+        defer got.deinit();
+        try std.testing.expectEqual(@as(usize, 0), got.rows.len);
+    } else |err| {
+        arena.deinit();
+        return err;
+    }
 }
 
 test "mysql prepared-statement cell allocation failure is OutOfMemory" {

@@ -372,40 +372,45 @@ pub const CatalogPermissionLoader = *const fn (
 
 /// Best-effort identity for `.optional` routes: attach `user_id`/`tenant_id`/
 /// `roles` when a valid Bearer token is present, and do nothing at all when it
-/// is missing, malformed, expired or unknown. Never writes a response, never
+/// is missing, malformed, expired or unknown. Never writes a response and never
 /// 401s — that is the whole difference from `verifyJwtLoadPermsAndNext`.
 ///
-/// Failures are logged at debug level rather than swallowed silently (a bare
-/// `catch {}` is banned on this path by the project's own gate).
-pub fn attachIdentityBestEffort(sec: *SecurityModule, ctx: *api.Context) void {
+/// Token-level failures are logged rather than swallowed silently (a bare
+/// `catch {}` is banned on this path by the project's own gate) and leave the
+/// request anonymous. Failures on *our* side — a keyring miss, an arena that
+/// refuses an allocation — are returned instead, so the caller fails the
+/// request closed rather than proceeding with half an identity. The roles CSV
+/// is built before the first attribute write precisely so the "half" cannot be
+/// `user_id` without `roles`: every role gate reads that as "no roles granted",
+/// and no handler can tell it apart from an identity with no roles.
+pub fn attachIdentityBestEffort(sec: *SecurityModule, ctx: *api.Context) !void {
     const auth = ctx.headers.get("authorization") orelse return;
     const token = SecurityModule.extractBearerToken(auth) orelse {
         std.log.debug("[auth] optional route {s} {s}: malformed Authorization header", .{ ctx.method.toString(), ctx.path });
         return;
     };
     const payload = sec.verifyToken(token) catch |err| {
-        std.log.debug("[auth] optional route {s} {s}: token ignored ({s})", .{ ctx.method.toString(), ctx.path, @errorName(err) });
+        if (noteVerifyFailure(ctx, err)) return err;
         return;
     };
     defer sec.freePayload(payload);
 
-    ctx.setAttr("user_id", payload.sub) catch |err| {
-        std.log.debug("[auth] optional route {s} {s}: user_id attr failed ({s})", .{ ctx.method.toString(), ctx.path, @errorName(err) });
-        return;
-    };
-    if (payload.aud.len > 0) {
-        ctx.setAttr("tenant_id", payload.aud) catch |err| {
-            std.log.debug("[auth] optional route {s} {s}: tenant_id attr failed ({s})", .{ ctx.method.toString(), ctx.path, @errorName(err) });
-            return;
-        };
-    }
+    var roles_csv: []const u8 = "";
+    var roles_owned = false;
     if (payload.roles.len > 0) {
-        const roles_csv = joinCsv(ctx.allocator, payload.roles) catch return;
-        defer ctx.allocator.free(roles_csv);
-        ctx.setAttr("roles", roles_csv) catch |err| std.log.debug("[auth] optional route: roles attr failed ({s})", .{@errorName(err)});
-    } else {
-        ctx.setAttr("roles", "") catch |err| std.log.debug("[auth] optional route: empty roles attr failed ({s})", .{@errorName(err)});
+        roles_csv = joinCsv(ctx.allocator, payload.roles) catch |err| {
+            std.log.warn("[auth] optional route {s} {s}: roles attr build failed ({s})", .{ ctx.method.toString(), ctx.path, @errorName(err) });
+            return err;
+        };
+        roles_owned = true;
     }
+    defer {
+        if (roles_owned) ctx.allocator.free(roles_csv);
+    }
+
+    try ctx.setAttr("user_id", payload.sub);
+    if (payload.aud.len > 0) try ctx.setAttr("tenant_id", payload.aud);
+    try ctx.setAttr("roles", roles_csv);
 }
 
 fn verifyJwtLoadPermsAndNext(
@@ -424,7 +429,11 @@ fn verifyJwtLoadPermsAndNext(
         return;
     };
 
-    const payload = sec.verifyToken(token) catch {
+    const payload = sec.verifyToken(token) catch |err| {
+        if (noteVerifyFailure(ctx, err)) {
+            try reject(ctx, 500, "Authentication unavailable");
+            return;
+        }
         try reject(ctx, 401, "Unauthorized");
         return;
     };
@@ -494,7 +503,7 @@ pub fn jwtAuthFromCatalog(security: *SecurityModule, slot: *comptime_router.Cata
                         return;
                     }
                     if (cat.isOptionalAuth(ctx.method, ctx.path)) {
-                        attachIdentityBestEffort(st.sec, ctx);
+                        try attachIdentityBestEffort(st.sec, ctx);
                         try next(ctx);
                         return;
                     }
@@ -537,7 +546,7 @@ pub fn jwtAuthFromCatalogWithPermissions(
                         return;
                     }
                     if (cat.isOptionalAuth(ctx.method, ctx.path)) {
-                        attachIdentityBestEffort(st.sec, ctx);
+                        try attachIdentityBestEffort(st.sec, ctx);
                         try next(ctx);
                         return;
                     }
@@ -631,9 +640,13 @@ const table_loader_trampolines: [max_table_loader_slots]CatalogPermissionLoader 
 /// via `ctx.setIdentity(...)` (attrs are duped, so token payloads can be
 /// freed inside `verifyFn`) and return true. Return false when
 /// unauthenticated — the catalog wrapper emits the configured reject
-/// envelope. JWT is one backend (`jwtBackend`); Redis/token-service schemes
-/// implement the same shape. Keeping attr writes inside the backend avoids
-/// any ownership transfer across the verify boundary.
+/// envelope. Return `false` **only** for credentials you could actually judge:
+/// an error means the check could not be completed (a token store that is down,
+/// an allocation failure) and the stack answers 5xx rather than 401, because
+/// asking the caller to re-authenticate against a backend that cannot verify
+/// anything is no answer. JWT is one backend (`jwtBackend`); Redis/token-service
+/// schemes implement the same shape. Keeping attr writes inside the backend
+/// avoids any ownership transfer across the verify boundary.
 pub const AuthBackend = struct {
     verifyFn: *const fn (ctx: *api.Context, user_data: ?*anyopaque) anyerror!bool,
     user_data: ?*anyopaque = null,
@@ -651,6 +664,47 @@ pub const AuthFromCatalogConfig = struct {
     /// Rejection renderer (default: `{"code":status,"msg":…,"data":null}`).
     reject: AuthRejectFn = defaultReject,
 };
+
+/// Log a verification failure and report whether the caller must treat the
+/// request as *unanswered* (`true`) rather than unauthenticated (`false`).
+///
+/// The failures that mean "this token cannot be trusted" are the client's own
+/// problem and stay on the unauthenticated side, logged at debug — every stale
+/// credential on a `.public` route would otherwise fill production logs.
+/// `UnknownKeyId` is unauthenticated too (re-authenticating gives the client a
+/// token with a key we do hold), but it is an operator-facing signal: it means
+/// the keyring dropped a key clients still have, so it goes out at warn.
+/// Everything else is ours — an allocation failure, a token store that could not
+/// be reached. The request was never judged, so it must not be reported as bad
+/// credentials: the caller answers 5xx (on a best-effort route it fails the
+/// request) instead of asking the client to re-authenticate against a server
+/// that cannot verify anything.
+fn noteVerifyFailure(ctx: *api.Context, err: anyerror) bool {
+    switch (err) {
+        // `verifyToken`: bad shape, bad signature, expired, unsupported `alg`,
+        // plus the base64 failures its header/payload decode can hand back for a
+        // token the client made up.
+        error.InvalidToken,
+        error.InvalidSignature,
+        error.TokenExpired,
+        error.UnsupportedAlgorithm,
+        error.InvalidEncoding,
+        error.InvalidPadding,
+        error.InvalidCharacter,
+        => {
+            std.log.debug("[auth] {s} {s}: token ignored ({s})", .{ ctx.method.toString(), ctx.path, @errorName(err) });
+            return false;
+        },
+        error.UnknownKeyId => {
+            std.log.warn("[auth] {s} {s}: token names an unknown kid — keyring missing a rotated key?", .{ ctx.method.toString(), ctx.path });
+            return false;
+        },
+        else => {
+            std.log.warn("[auth] {s} {s}: verification unavailable ({s})", .{ ctx.method.toString(), ctx.path, @errorName(err) });
+            return true;
+        },
+    }
+}
 
 /// Catalog-driven auth around any `AuthBackend`: a request is skipped iff the
 /// route catalog marks `(method, path)` `.public` (or matches a legacy
@@ -676,11 +730,12 @@ pub fn authFromCatalog(slot: *comptime_router.CatalogSlot, backend: AuthBackend,
                 if (st.catalog_slot.get()) |cat| {
                     if (cat.isOptionalAuth(ctx.method, ctx.path)) {
                         // `.optional`: verify when a token is present, attach the
-                        // identity, never reject (see Auth.optional).
+                        // identity, never reject for the token's own failures (see
+                        // Auth.optional). A failure on our side is different: the
+                        // backend may already have written part of an identity, so
+                        // the request must not proceed as if it had none.
                         if (st.backend.verify(ctx)) |_| {} else |err| {
-                            std.log.debug("[auth] optional route {s} {s}: token ignored ({s})", .{
-                                ctx.method.toString(), ctx.path, @errorName(err),
-                            });
+                            if (noteVerifyFailure(ctx, err)) return err;
                         }
                         try next(ctx);
                         return;
@@ -689,26 +744,24 @@ pub fn authFromCatalog(slot: *comptime_router.CatalogSlot, backend: AuthBackend,
                         // Best-effort identity on public routes: when a token is
                         // presented, verify it so handlers may *optionally*
                         // personalize (ctx.userId() / optionalPortalUser) without a
-                        // second route or an "optional auth" mode. Failures are
-                        // ignored — the route stays public, and `verifyFn` never
-                        // writes a response.
+                        // second route or an "optional auth" mode. A bad token must
+                        // not fail a public route, but a failure on our side must
+                        // not vanish either (`noteVerifyFailure` logs it and asks
+                        // for the request to fail); and this stays a real `catch`
+                        // instead of a bare `catch {}` (banned by the project's own
+                        // gate for I/O paths).
                         if (st.backend.verify(ctx)) |_| {} else |err| {
-                            // A missing/expired/malformed token must not fail a
-                            // public route — but it must not vanish either:
-                            // debug keeps it out of production logs while
-                            // remaining diagnosable, and this stays a real
-                            // `catch` instead of a bare `catch {}` (banned by
-                            // the project's own gate for I/O paths).
-                            std.log.debug("[auth] public route {s} {s}: token ignored ({s})", .{
-                                ctx.method.toString(), ctx.path, @errorName(err),
-                            });
+                            if (noteVerifyFailure(ctx, err)) return err;
                         }
                         try next(ctx);
                         return;
                     }
                 }
                 const authed = st.backend.verify(ctx) catch |err| {
-                    std.log.err("auth backend verify failed: {s}", .{@errorName(err)});
+                    if (noteVerifyFailure(ctx, err)) {
+                        try st.cfg.reject(ctx, 500, "Authentication unavailable");
+                        return;
+                    }
                     try st.cfg.reject(ctx, 401, "Unauthorized");
                     return;
                 };
@@ -812,7 +865,16 @@ pub fn jwtBackend(security: *SecurityModule) AuthBackend {
             fn verify(ctx: *api.Context, user_data: ?*anyopaque) anyerror!bool {
                 const sec: *SecurityModule = @ptrCast(@alignCast(user_data.?));
                 const token = extractTokenAny(ctx, &.{ .bearer, .x_token }) orelse return false;
-                const payload = sec.verifyToken(token) catch return false;
+                // Ours, not the token's: a key the deployment does not hold and an
+                // allocation that failed. Both leave `verifyFn` as errors —
+                // `noteVerifyFailure` at the call site separates them (the keyring
+                // miss is an operator signal that still answers 401, the allocation
+                // failure is a 5xx). Everything else is the token itself: bad shape,
+                // bad signature, expired, bad encoding.
+                const payload = sec.verifyToken(token) catch |err| switch (err) {
+                    error.UnknownKeyId, error.OutOfMemory => return err,
+                    else => return false,
+                };
                 defer sec.freePayload(payload);
                 const roles_csv = try joinCsv(ctx.allocator, payload.roles);
                 defer ctx.allocator.free(roles_csv);
@@ -3279,4 +3341,164 @@ test "Auth.optional: identity when a token is valid, no 401 otherwise" {
         try std.testing.expectEqual(@as(u16, 200), resp.status_code);
         try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"user\":\"user-42\"") != null);
     }
+}
+
+// ── Internal verification failures vs. unauthenticated requests ───────────
+
+test "jwtBackend reports an unknown kid as a server error, not as an anonymous request" {
+    const allocator = std.testing.allocator;
+    const JwksKeyRing = @import("../security/JwksKeyRing.zig").JwksKeyRing;
+
+    var ring = JwksKeyRing.init(allocator);
+    defer ring.deinit();
+    // The deployment holds `v1`; the token below names `v9`. That is a keyring
+    // misconfiguration (a rotation that dropped a key too early), not a forged
+    // token — the operator has to be able to see it.
+    try ring.addKey("v1", "secret-2025-aaaaaaaaaaaaaaaaaaaaaa", true);
+
+    var sec = SecurityModule.init(allocator, "fallback-secret-0123456789abcdef", 3600);
+    sec.setKeyring(&ring);
+
+    const child = struct {
+        fn b64(alloc: std.mem.Allocator, data: []const u8) ![]const u8 {
+            const buf = try alloc.alloc(u8, std.base64.url_safe_no_pad.Encoder.calcSize(data.len));
+            return std.base64.url_safe_no_pad.Encoder.encode(buf, data);
+        }
+    };
+    const header_b64 = try child.b64(allocator, "{\"alg\":\"HS256\",\"typ\":\"JWT\",\"kid\":\"v9\"}");
+    defer allocator.free(header_b64);
+    const payload_b64 = try child.b64(allocator, "{\"sub\":\"42\",\"iss\":\"zigmodu\",\"aud\":\"tenant-a\",\"exp\":4102444800,\"iat\":0,\"roles\":[],\"ver\":0}");
+    defer allocator.free(payload_b64);
+    const token = try std.fmt.allocPrint(allocator, "{s}.{s}.bm90LWEtc2lnbmF0dXJl", .{ header_b64, payload_b64 });
+    defer allocator.free(token);
+
+    const backend = jwtBackend(&sec);
+
+    // The error channel is what carries a keyring miss now (it used to be a bare
+    // `false`, indistinguishable from a forged token).
+    var direct = try api.Context.init(allocator, .GET, "/api/me");
+    defer direct.deinit();
+    try putBearerAuth(&direct, token);
+    try std.testing.expectError(error.UnknownKeyId, backend.verify(&direct));
+
+    // Through the stack the client's answer is still "this token is not
+    // trustworthy — re-authenticate" (401): a forged `kid` must not let an
+    // unauthenticated caller mint 5xxs. What changed is that the caller classifies
+    // the error instead of the backend flattening it, so the keyring miss reaches
+    // the operator as a warn log line rather than vanishing.
+    var entries = try allocator.alloc(comptime_router.CatalogEntry, 1);
+    entries[0] = .{ .method = .GET, .path = try allocator.dupe(u8, "api/me"), .auth = .jwt, .module = "user" };
+    var slot: comptime_router.CatalogSlot = .{};
+    defer slot.deinit();
+    slot.set(.{ .allocator = allocator, .entries = entries });
+    const mw = authFromCatalog(&slot, backend, .{});
+    const next = struct {
+        fn n(_: *api.Context) anyerror!void {}
+    }.n;
+
+    var ctx = try api.Context.init(allocator, .GET, "/api/me");
+    defer ctx.deinit();
+    try putBearerAuth(&ctx, token);
+    try mw.func(&ctx, next, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 401), ctx.status_code);
+
+    // Same answer on the legacy catalog path (`jwtAuthFromCatalog`), which runs
+    // its own verify pass.
+    const legacy = jwtAuthFromCatalog(&sec, &slot, .{});
+    var legacy_ctx = try api.Context.init(allocator, .GET, "/api/me");
+    defer legacy_ctx.deinit();
+    try putBearerAuth(&legacy_ctx, token);
+    try legacy.func(&legacy_ctx, next, legacy.user_data);
+    try std.testing.expectEqual(@as(u16, 401), legacy_ctx.status_code);
+
+    // A three-part token the client made up (here: a header that is not even
+    // base64) stays a 401 on both paths: the decode failures `verifyToken` can
+    // hand back for invented input are not ours, so they must not become 5xxs.
+    const garbage = "a.b.c";
+    var garbage_ctx = try api.Context.init(allocator, .GET, "/api/me");
+    defer garbage_ctx.deinit();
+    try putBearerAuth(&garbage_ctx, garbage);
+    try legacy.func(&garbage_ctx, next, legacy.user_data);
+    try std.testing.expectEqual(@as(u16, 401), garbage_ctx.status_code);
+
+    var garbage_backend_ctx = try api.Context.init(allocator, .GET, "/api/me");
+    defer garbage_backend_ctx.deinit();
+    try putBearerAuth(&garbage_backend_ctx, garbage);
+    try mw.func(&garbage_backend_ctx, next, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 401), garbage_backend_ctx.status_code);
+}
+
+test "jwtBackend verification allocation failure surfaces as an error, never as 'unauthenticated'" {
+    const allocator = std.testing.allocator;
+    const secret = "scan-secret-0123456789abcdef";
+
+    // Signed with the module's own secret: verification would answer `true`
+    // here, so the only reason it cannot is the allocation we fail.
+    var signer = SecurityModule.init(allocator, secret, 3600);
+    const token = try signer.generateTokenWithTenant("42", &.{"admin"}, "tenant-a");
+    defer allocator.free(token);
+
+    // Fail exactly the *first* allocation inside verification (the header
+    // base64 buffer). Deeper allocation points are deliberately not scanned
+    // here: `verifyToken` copies its payload through several `try`
+    // allocations, a region this file does not own.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var sec = SecurityModule.init(failing.allocator(), secret, 3600);
+    const backend = jwtBackend(&sec);
+
+    var ctx = try api.Context.init(allocator, .GET, "/api/me");
+    defer ctx.deinit();
+    try putBearerAuth(&ctx, token);
+
+    // OOM on our side must not be reported as "this token is not valid": during
+    // memory pressure that reads as a login storm of bad credentials.
+    try std.testing.expectError(error.OutOfMemory, backend.verify(&ctx));
+    try std.testing.expect(!ctx.responded);
+
+    // And through the stack that becomes a 5xx, not a 401 — the caller cannot fix
+    // an allocation failure by re-authenticating.
+    var entries = try allocator.alloc(comptime_router.CatalogEntry, 1);
+    entries[0] = .{ .method = .GET, .path = try allocator.dupe(u8, "api/me"), .auth = .jwt, .module = "user" };
+    var slot: comptime_router.CatalogSlot = .{};
+    defer slot.deinit();
+    slot.set(.{ .allocator = allocator, .entries = entries });
+    const next = struct {
+        fn n(_: *api.Context) anyerror!void {}
+    }.n;
+
+    // A fresh failing allocator: `fail_index` counts allocations, so reusing the
+    // one above would let this call through.
+    var failing_again = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var sec_again = SecurityModule.init(failing_again.allocator(), secret, 3600);
+    const mw = authFromCatalog(&slot, jwtBackend(&sec_again), .{});
+    var stack_ctx = try api.Context.init(allocator, .GET, "/api/me");
+    defer stack_ctx.deinit();
+    try putBearerAuth(&stack_ctx, token);
+    try mw.func(&stack_ctx, next, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 500), stack_ctx.status_code);
+}
+
+test "attachIdentityBestEffort never leaves a half-written identity (allocation scan)" {
+    const allocator = std.testing.allocator;
+    // Verification runs on the backing allocator, so every induced failure here
+    // lands on the request-scoped writes this function makes.
+    var sec = SecurityModule.init(allocator, "optional-attach-secret-0123456789", 3600);
+    const token = try sec.generateTokenWithTenant("42", &.{ "admin", "ops" }, "tenant-a");
+    defer allocator.free(token);
+
+    const Scan = struct {
+        fn run(scan_alloc: std.mem.Allocator, sec_: *SecurityModule, token_: []const u8) !void {
+            var ctx = try api.Context.init(scan_alloc, .GET, "/api/optional");
+            defer ctx.deinit();
+            try ctx.headers.ensureTotalCapacity(1);
+            try putBearerAuth(&ctx, token_);
+            // A failure building the identity must fail the request, not hand
+            // the handler half of one: `user_id` without `roles` reads as "this
+            // user has no roles" to every gate.
+            try attachIdentityBestEffort(sec_, &ctx);
+            try std.testing.expect(ctx.userId() != null);
+            try std.testing.expect(ctx.rolesCsv() != null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Scan.run, .{ &sec, token });
 }

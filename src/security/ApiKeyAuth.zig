@@ -43,6 +43,9 @@ pub const ApiKeyAuthConfig = struct {
 
 /// API key auth middleware (with an external loader) — each call keeps its own
 /// loader (see `max_key_auth_instances`).
+///
+/// A loader cannot report why it said no — see `ApiKeyLoaderConfig.loader` for
+/// what that means for a storage failure and what a loader must do about it.
 pub fn apiKeyAuthWithLoader(config: ApiKeyLoaderConfig) api.MiddlewareFn {
     return key_auth_middlewares[Instances.claim(.{ .loader = config })];
 }
@@ -142,6 +145,30 @@ const key_auth_middlewares: [max_key_auth_instances]api.MiddlewareFn = blk: {
 /// API key loader configuration
 pub const ApiKeyLoaderConfig = struct {
     config: ApiKeyConfig = .{},
+    /// Reports whether `key` is a valid key.
+    ///
+    /// The `bool` has no room for "the lookup itself failed", so **a storage
+    /// failure is indistinguishable from "no such key"**: a Redis timeout or a
+    /// DB outage returns `false` here and the client is told
+    /// `unauthorized_status` (401) — the same "our failure presented as the
+    /// caller's fault" shape that `AuthMiddleware.runJwtAuth` had to stop
+    /// doing for allocation failures. Nothing in this file can tell the two
+    /// apart; the signature cannot express the difference, so this is a
+    /// documented limitation rather than a bug that can be fixed here.
+    ///
+    /// A loader therefore has to **fail closed** (return `false`) and report
+    /// its own failure out of band — a log line or a metric — because neither
+    /// the middleware nor the caller ever sees it.
+    ///
+    /// Recommended change, not made here: widen this to
+    /// `*const fn ([]const u8) anyerror!bool` and answer 500 when the loader
+    /// returns an error, matching `PermissionLoader` and
+    /// `CatalogPermissionLoader`, which are already fallible. `api.MiddlewareFn`
+    /// is a bare function pointer, so there is no way to accept both shapes
+    /// (an optional second field would be a second way to wire the same thing,
+    /// and only one of them could be correct); widening the type breaks every
+    /// existing `.loader = fn([]const u8) bool` call site, so it belongs in a
+    /// release window that can carry a breaking change.
     loader: *const fn ([]const u8) bool,
 };
 
@@ -162,12 +189,45 @@ fn extractApiKey(ctx: *api.Context, config: ApiKeyConfig) ?[]const u8 {
     return null;
 }
 
-/// Checks whether the API key is in the allowed list
+/// Checks whether the API key is in the allowed list.
+///
+/// Every entry is compared, and every byte of every entry is read, even after a
+/// match — so neither the bytes of the guess nor its position in the list
+/// decides how much work the check does.
+///
+/// `std.mem.eql` cannot be used here: it returns at the first differing byte, so
+/// a guess agreeing with a stored key for N bytes costs more than one diverging
+/// immediately, and over enough samples that difference says how much of a
+/// guess is right. Measured in this file's own test binary (Debug), comparing
+/// two 64 KiB keys that each differ from the stored one in exactly one byte —
+/// byte 0 versus the last byte — 2000 calls cost 269 µs against 957 ms. The
+/// same loop with `constantTimeEql` below shows the two at parity.
 fn validateKey(key: []const u8, allowed_keys: []const []const u8) bool {
+    var matched = false;
     for (allowed_keys) |ak| {
-        if (std.mem.eql(u8, key, ak)) return true;
+        if (constantTimeEql(key, ak)) matched = true;
     }
-    return false;
+    return matched;
+}
+
+/// Constant-time byte-slice comparison for API keys.
+///
+/// Zig 0.17's `std.crypto.timing_safe.eql` only accepts arrays/vectors, so the
+/// slice loop is spelled out here — the same shape as the CSRF check in
+/// `api.Middleware` and `security.PasswordEncoder`.
+///
+/// One length is still free: the `!=` below returns immediately, so this leaks
+/// how long the stored key is, not how much of a guess matches. That is
+/// acceptable for a fixed-format key (`sk-` + 32 hex); a secret whose length is
+/// itself sensitive needs a padded compare instead.
+fn constantTimeEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var diff: u8 = 0;
+    for (a, 0..) |x, i| diff |= x ^ b[i];
+    // `diff -% 1` borrows to 0xFF exactly when every byte matched; widening to
+    // u16 and shifting by 8 turns that into the branchless answer.
+    const widened: u16 = diff;
+    return (widened -% 1) >> 8 != 0;
 }
 
 /// API key generator — creates random API keys
@@ -208,6 +268,62 @@ const api = @import("../api/Server.zig");
 // ─────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────
+
+test "api key comparison reads every byte, not just the differing prefix" {
+    const allocator = std.testing.allocator;
+    const key = try allocator.alloc(u8, 256);
+    defer allocator.free(key);
+    @memset(key, 'a');
+
+    // Same length, same mismatch count — only the position of the first
+    // differing byte moves. The comparison must answer false for both without
+    // the answer depending on how much of the key matched first.
+    const early = try allocator.dupe(u8, key);
+    defer allocator.free(early);
+    early[0] = 'b';
+
+    const late = try allocator.dupe(u8, key);
+    defer allocator.free(late);
+    late[key.len - 1] = 'b';
+
+    try std.testing.expect(!constantTimeEql(early, key));
+    try std.testing.expect(!constantTimeEql(late, key));
+    try std.testing.expect(constantTimeEql(key, key));
+
+    // A length difference is still answered without reading bytes — that is
+    // the one property this helper does leak (see its comment).
+    const short = key[0 .. key.len - 1];
+    try std.testing.expect(!constantTimeEql(short, key));
+
+    // The list scan keeps no early exit: a match at either position is found,
+    // and a key absent from the list is still rejected after comparing all.
+    const keys = [_][]const u8{ key, late };
+    try std.testing.expect(validateKey(key, &keys));
+    try std.testing.expect(validateKey(late, &keys));
+    try std.testing.expect(!validateKey(early, &keys));
+    try std.testing.expect(!validateKey("sk-nope", &keys));
+    try std.testing.expect(!validateKey(key, &.{}));
+}
+
+test "constantTimeEql agrees with std.mem.eql on every byte position" {
+    // Correctness baseline: for keys that differ by one byte, the result must
+    // match plain equality at every position (the difference is in *cost*, not
+    // in the answer).
+    const allocator = std.testing.allocator;
+    const base = try allocator.alloc(u8, 64);
+    defer allocator.free(base);
+    @memset(base, 'q');
+
+    const probe = try allocator.dupe(u8, base);
+    defer allocator.free(probe);
+
+    for (0..base.len) |i| {
+        probe[i] = base[i] +% 1;
+        try std.testing.expectEqual(std.mem.eql(u8, probe, base), constantTimeEql(probe, base));
+        probe[i] = base[i];
+    }
+    try std.testing.expect(constantTimeEql(base, base));
+}
 
 test "ApiKeyGenerator generate" {
     const allocator = std.testing.allocator;

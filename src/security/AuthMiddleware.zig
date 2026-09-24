@@ -88,9 +88,53 @@ fn runJwtAuth(
         return;
     };
 
-    // verifyToken returns JwtPayload directly
-    const payload = security.verifyToken(token) catch {
-        try ctx.sendErrorResponse(401, 401, "Invalid or expired token");
+    // verifyToken returns JwtPayload directly. Its failure set holds two
+    // different kinds of failure and does not tag which is which, so the ones
+    // that describe *the presented token* are listed here and everything else
+    // is answered 500. Without that split an allocation failure inside
+    // verification — or any internal fault added later — is reported as
+    // "Invalid or expired token": the legacy path is the only one that writes
+    // `auth_info`, so a 401 here is indistinguishable from a genuine bad token
+    // and the real fault would never surface.
+    //
+    // The same classification, by the same error names, is what
+    // `api.Middleware.noteVerifyFailure` does for the catalog/backend path
+    // (private there, so it cannot be shared); this is its counterpart for the
+    // legacy middleware. Enumerating the token's errors rather than ours means
+    // an error added to `verifyToken` later surfaces as a 5xx — the safe
+    // direction — instead of silently joining the 401 group.
+    const payload = security.verifyToken(token) catch |err| {
+        switch (err) {
+            // The client's credential is unusable/expired — retrying the same
+            // token cannot help, and 401 is what every consumer expects.
+            error.InvalidToken,
+            error.InvalidSignature,
+            error.TokenExpired,
+            error.UnsupportedAlgorithm,
+            // A `kid` we hold no key for: the token names a key we retired.
+            error.UnknownKeyId,
+            // Base64 errors fire on whichever segment is malformed. The header
+            // segment is client data decoded before the signature check; the
+            // payload segment is decoded after it, so this name also covers a
+            // corrupt token we signed ourselves. The error set cannot tell the
+            // two apart at this layer, and both mean "unusable credential".
+            error.InvalidEncoding,
+            error.InvalidPadding,
+            error.InvalidCharacter,
+            => try ctx.sendErrorResponse(401, 401, "Invalid or expired token"),
+            // Our side: the module's allocator refused (OutOfMemory), a decode
+            // ran out of destination space, or a payload we signed failed to
+            // parse as JSON — none of it is a property of the request's token.
+            //
+            // `warn`, not `err`: `scripts/test-runner.zig` fails the suite on
+            // any err-level log, so a branch a test can drive has to warn (the
+            // same call `ClusterBootstrap`'s cluster-auth gate made — see
+            // `docs/dev/cluster-auth-design.md` §"实现期对设计的两处收紧").
+            else => {
+                std.log.warn("jwt verification failed inside the server: {s}", .{@errorName(err)});
+                try ctx.sendErrorResponse(500, 500, "Token verification failed");
+            },
+        }
         return;
     };
     defer security.freePayload(payload);
@@ -324,6 +368,72 @@ test "jwtAuth preserves ComptimeRouter user_data State" {
     try std.testing.expect(S.saw_auth);
     try std.testing.expect(ctx.userData(RouteState) != null);
     try std.testing.expectEqual(@as(i32, 99), ctx.userData(RouteState).?.n);
+}
+
+test "jwtAuth answers 5xx, not 401, when verification fails on our side" {
+    const allocator = std.testing.allocator;
+    var sec = SecurityModule.init(allocator, "test-secret", 3600);
+    const token = try sec.generateTokenWithTenant("42", &.{}, "1");
+    defer allocator.free(token);
+
+    var ctx = try api.Context.init(allocator, .GET, "/tenants");
+    defer ctx.deinit();
+    try testPutBearerAuth(&ctx, token);
+
+    // Every allocation `verifyToken` makes from here on fails, so the failure
+    // cannot be a property of the token: it is a genuine, unexpired one.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    sec.allocator = failing.allocator();
+
+    const S = struct {
+        var reached: bool = false;
+        fn handler(_: *api.Context) anyerror!void {
+            reached = true;
+        }
+    };
+    S.reached = false;
+    const auth_mw = try jwtAuth(&sec, allocator);
+    try auth_mw.func(&ctx, S.handler, auth_mw.user_data);
+
+    try std.testing.expect(!S.reached);
+    try std.testing.expectEqual(@as(u16, 500), ctx.status_code);
+}
+
+test "jwtAuth still answers 401 for a token that is genuinely bad" {
+    const allocator = std.testing.allocator;
+    var sec = SecurityModule.init(allocator, "test-secret", 3600);
+    // Signed with a secret this middleware does not hold.
+    var other = SecurityModule.init(allocator, "another-secret", 3600);
+    const foreign = try other.generateTokenWithTenant("42", &.{}, "1");
+    defer allocator.free(foreign);
+
+    const S = struct {
+        var reached: bool = false;
+        fn handler(_: *api.Context) anyerror!void {
+            reached = true;
+        }
+    };
+
+    var ctx_bad = try api.Context.init(allocator, .GET, "/tenants");
+    defer ctx_bad.deinit();
+    try testPutBearerAuth(&ctx_bad, foreign);
+    const mw = try jwtAuth(&sec, allocator);
+    try mw.func(&ctx_bad, S.handler, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 401), ctx_bad.status_code);
+    try std.testing.expect(!S.reached);
+
+    // …and for an expired one, which is a client-side fact, not our fault.
+    var expiring = SecurityModule.init(allocator, "test-secret", -1);
+    const expired = try expiring.generateTokenWithTenant("42", &.{}, "1");
+    defer allocator.free(expired);
+
+    var ctx_expired = try api.Context.init(allocator, .GET, "/tenants");
+    defer ctx_expired.deinit();
+    try testPutBearerAuth(&ctx_expired, expired);
+    const mw2 = try jwtAuth(&expiring, allocator);
+    try mw2.func(&ctx_expired, S.handler, mw2.user_data);
+    try std.testing.expectEqual(@as(u16, 401), ctx_expired.status_code);
+    try std.testing.expect(!S.reached);
 }
 
 test "each jwtAuth keeps its own security module" {

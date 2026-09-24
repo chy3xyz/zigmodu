@@ -45,17 +45,15 @@ pub const ClusterAuth = struct {
 
     /// Sign a message payload with HMAC-SHA256 using the pre-shared key.
     /// Returns hex-encoded signature.
+    ///
+    /// The `!` here is vestigial: both the tag and its hex rendering are stack
+    /// values (`mac` + `hexTag`), so the inferred error set is empty and nothing
+    /// in this file depends on this call being able to fail. It is left on the
+    /// type because callers already write `try auth.sign(...)` (see
+    /// `RaftTransport.zig`); dropping it is a source-breaking change for them and
+    /// belongs in a change that can touch them together.
     pub fn sign(self: *ClusterAuth, payload: []const u8) ![64]u8 {
-        var sig: [32]u8 = undefined;
-        std.crypto.auth.hmac.sha2.HmacSha256.create(&sig, payload, &self.pre_shared_key);
-
-        var hex: [64]u8 = undefined;
-        const hex_chars = "0123456789abcdef";
-        for (sig, 0..) |byte, i| {
-            hex[i * 2] = hex_chars[byte >> 4];
-            hex[i * 2 + 1] = hex_chars[byte & 0xf];
-        }
-        return hex;
+        return hexTag(self.mac(payload));
     }
 
     /// Raw HMAC-SHA256 over `payload` — the form the wire format uses.
@@ -64,6 +62,18 @@ pub const ClusterAuth = struct {
         var tag: [32]u8 = undefined;
         std.crypto.auth.hmac.sha2.HmacSha256.create(&tag, payload, &self.pre_shared_key);
         return tag;
+    }
+
+    /// Hex-encode an HMAC tag: the encoding `sign` returns and `verify`
+    /// recomputes. Pure stack work — no allocator, so no failure to report.
+    fn hexTag(tag: [32]u8) [64]u8 {
+        var hex: [64]u8 = undefined;
+        const hex_chars = "0123456789abcdef";
+        for (tag, 0..) |byte, i| {
+            hex[i * 2] = hex_chars[byte >> 4];
+            hex[i * 2 + 1] = hex_chars[byte & 0xf];
+        }
+        return hex;
     }
 
     /// Constant-time slice comparison for signature verification.
@@ -79,12 +89,66 @@ pub const ClusterAuth = struct {
     }
 
     /// Verify a message signature.
+    ///
+    /// Infallible on purpose. The body used to be
+    /// `const expected = self.sign(payload) catch return false;`, which made one
+    /// `false` mean two different things at once — "the peer signed something
+    /// else" and "we could not compute the tag" — so any failure on our own side
+    /// would have rejected a valid peer as a forger: a wrong accusation, an
+    /// availability loss, and nothing in the operator's log to explain it. The
+    /// tag is now recomputed locally (`mac` + `hexTag`), both of which are stack
+    /// values, so there is no failure to misreport: a `false` from this function
+    /// means exactly one thing.
+    ///
+    /// That single thing is acted on, not logged: the real inbound path
+    /// (`RaftTransport.verifiedRecv`, which verifies the raw tag itself) maps a
+    /// mismatch to `error.ClusterAuthFailed`, and its callers treat that as "drop
+    /// this peer". A rejection must only ever be reached for the peer's reasons.
     pub fn verify(self: *ClusterAuth, payload: []const u8, signature: []const u8) bool {
-        const expected = self.sign(payload) catch return false;
+        const expected = hexTag(self.mac(payload));
         // Constant-time comparison to prevent timing oracle
         return timingSafeEql(expected[0..], signature);
     }
 };
+
+// The audit this pin answers read `verify`'s `self.sign(payload) catch return
+// false` as a live path: an allocation failure on *our* side would have been
+// reported as "your signature is invalid" — a valid peer accused of forging.
+//
+// It was never live, and this measures that rather than arguing it: computing the
+// tag and rendering it as hex both work on stack values (`mac` + `hexTag`), so
+// the verification path reaches no allocator and has no failure to misreport. The
+// `try` on the `FailingAllocator`-backed second `init` below proves the
+// instrument is armed (that allocation really does fail), while `verify` — with
+// every further allocation armed to fail — still returns the true verdict and
+// leaves the allocation count where it was.
+//
+// Teeth: if the verification path ever grows an allocation, the armed allocator
+// turns it into a failure, and a `verify` that reports such a failure as "invalid
+// signature" fails this test instead of shipping.
+test "verify reaches no allocator, so no OOM can be reported as a bad signature" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = failing.allocator();
+
+    // `node_id` is the only allocation this type has, and it happens here.
+    var auth = try ClusterAuth.init(allocator, "node-1", @splat(5));
+    defer auth.deinit();
+
+    const sig = try auth.sign("payload");
+
+    // From here on, the next allocation fails.
+    const before = failing.allocations;
+    failing.fail_index = failing.alloc_index;
+    defer failing.fail_index = std.math.maxInt(usize);
+
+    // The instrument is armed: this `init` really does hit the wall.
+    try std.testing.expectError(error.OutOfMemory, ClusterAuth.init(allocator, "node-2", @splat(5)));
+
+    // Same arming, on the verification path: the verdict is still the true one.
+    try std.testing.expect(auth.verify("payload", &sig));
+    try std.testing.expect(!auth.verify("payload!", &sig));
+    try std.testing.expectEqual(before, failing.allocations);
+}
 
 test "ClusterAuth sign and verify" {
     const allocator = std.testing.allocator;

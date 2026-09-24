@@ -2,6 +2,103 @@
 
 ## [Unreleased]
 
+### 第 16 批：认证路径把"我们这侧出错"答成 401（含一条静默半份身份）、API key 比较非恒定时间（实测 3560×）、MySQL 把 NULL metadata 读成"零行"、审计的一处前提被证伪（**破坏性：是**，1 处编译错）
+
+全量 `-Ddb=all` **1827/1884（57 skipped，0 failed）**；MySQL 门控真机（含全量 `DB=mysql` 跑）全绿。
+
+**认证路径：`verifyToken` 的失败不再一律 401。** 三处同形塌陷：`api.Middleware.jwtBackend` 的
+`sec.verifyToken(token) catch return false`、旧路径 `verifyJwtLoadPermsAndNext`、`authFromCatalog`。
+于是**分配失败**（我们这侧，本该 5xx）与**未知 kid**（配置错，本该被运维看见）都变成"token 无效"，
+登录风暴在内存压力下看起来就是一片坏 token。红证据（回退一行即红）：
+```
+jwtBackend reports an unknown kid as a server error...expected error.UnknownKeyId, found false
+jwtBackend verification allocation failure surfaces as an error...expected error.OutOfMemory, found false
+```
+新口径：token 级失败（`InvalidToken`/`InvalidSignature`/`TokenExpired`/…）→ 401 + debug；
+**`UnknownKeyId` 仍 401**（`kid` 完全由客户端控制，映射成 5xx 等于让任何未认证调用者制造 5xx）但加
+**warn**：`token names an unknown kid — keyring missing a rotated key?`；其余（OOM、自定义 backend 的存储
+故障）→ **500**。`authFromCatalog` 的 `.public`/`.optional` 分支对我们这侧的失败改为 **fail-closed**
+（以前记一条日志后继续，带着"有 user_id、没有 roles"的半份身份往下走 —— role gate 一律 403，
+handler 眼里的"无角色"则未定义）。
+> **破坏性**：`Middleware.attachIdentityBestEffort` 由 `void` 改成 `!void`（先把 roles CSV 建好再写任何
+> 属性，任一写失败即 `return err`）。仓库内只有本文件两处调用、未从 `http.zig` 再导出，但它是 `pub`。
+> 红证据：`FAIL (SwallowedOutOfMemoryError)`（std 分配扫描器自己的诊断名 —— "注入了一次分配失败，
+> 函数却照样返回成功"）。日志用 warn 而非 err 是刻意的：`scripts/test-runner.zig` 把任何 err 级日志判为
+> 测试失败，且 warn 在默认生产日志级别下同样可见。
+
+**API key 比较不是恒定时间（已改，并且做了实测）。** `ApiKeyAuth.validateKey` 用 `std.mem.eql`（首个
+不同字节即返回），于是"猜对了多少字节"可以从耗时里读出来。红/绿都是**测量**：64 KiB key、两个只差一个
+字节的错 key（byte 0 vs 最后一个字节），2000 次取中位数 ——
+```
+修复前:  diff@0 269000 ns / diff@last 957366000 ns   （比值 ≈ 3560×，对照组 mem.eql 同量级）
+修复后:  diff@0 317212000 ns / diff@last 314665000 ns（差 0.8%，持平）
+```
+改为逐字节恒定时间比较（复刻 CSRF 用的那份形状）并去掉提前返回（比较次数也不依赖命中的槽位）。
+> **未验证**：以上是 **Debug** 构建（本套件自身的构建），ReleaseFast 未测；优化构建下 `mem.eql` 会在
+> 第一个不同的向量块处返回，泄漏最多缩小到块粒度、不会消失 —— 这是推理，不是测量。
+> 另记录未改：`ApiKeyLoaderConfig.loader` 的类型是 `*const fn ([]const u8) bool`，**存储故障与"key 不存在"
+> 完全同形**，客户端只会拿到 401。建议改成 `anyerror!bool`（与已是 fallible 的 `PermissionLoader` 对齐），
+> 但那是公开 API 字段的破坏性变更，留给能承担它的窗口；当前缓解是文档要求 loader 自己 fail-closed 并
+> 旁路上报。
+
+**旧 JWT 中间件：我们这侧的失败从 401 变 500。** `src/security/AuthMiddleware.zig` 的
+`verifyToken(...) catch { 401 }` 同形。红证据：`expected 500, found 401`（造法：先签一个合法未过期 token，
+再把 `sec.allocator` 换成永不成功的失败分配器 —— 失败不可能是 token 的属性）。改成按错误名分类：token
+级 → 401（消息原样），其余 → warn + 500。
+> **未验证**：`InvalidEncoding`/`InvalidPadding`/`InvalidCharacter` 三个**无法再分** —— header 段（签名
+> 校验前，客户端数据）与 payload 段（校验后，我们自己签坏）产生同名错误，注释里写明了这一点；
+> `verifyToken` 的推断错误集共 22 个（用一次性探针打印后删除）。分配失败只钉了 `fail_index = 0`，没做
+> 全量扫描：`SecurityModule.verifyToken` 拷贝 payload 那段（`sub`/`iss`/`aud` 的 dupe）没有 `errdefer`，
+> 全量扫描会撞到本文件管不到的路径 —— **这一点没有实测，是读代码的推测**。
+
+**审计的一条前提被证伪（记下来，因为"没修"也是结论）。** 上一轮清点说
+`src/core/cluster/TlsTransport.zig` 的 `sign(payload) catch return false` 会把我们的 OOM 说成"对端签名
+伪造"。实测**不成立**：`sign` 的 HMAC 与 hex 全算在栈数组上，**没有任何分配器**，所以那个 `catch` 是
+**死代码**。钉子测试（打开失败分配器后 `verify` 仍返回真值、`allocations` 计数不变）在未改动的源码上
+就是绿的 —— 即"修改前没有可红的测试"。为了仍然把危害形状固定下来，做了一次**单点 mutation**（给
+`verify` 加一次分配 + 用旧的 `catch return false` 上报）→ 立刻红：
+`try std.testing.expect(auth.verify("payload", &sig))` 失败，即"我们的分配失败 → 合法对端被判为伪造"。
+mutation 已还原；改法是最小且诚实的：抽出 `hexTag`，让 `verify` 整条路径**没有**错误通道，并在注释里
+写明 `false` 在真实入站路径上意味着什么（`RaftTransport.verifiedRecv` → `error.ClusterAuthFailed` →
+调用方**静默丢弃该对端**，不重试、不记日志）。`sign` 的签名未变（`RaftTransport.zig:1153` 的 `try`
+不受影响）；去掉它那个空错误集的 `!` 列为后续项。
+
+**`BufferPool`：`release`/`available`/`stats` 不再可被取消。** 红证据一条给出三件事：
+```
+release keeps the buffer when its lock wait is canceled...FAIL (PoolExhausted)
+[SafeAllocator] (err): leaked [len: 4096]   ← 被取消的 release 丢掉一个 4 KiB 缓冲区
+available and stats report the true state when a lock wait is canceled...expected 1, found 0
+```
+即：取消丢缓冲区 → `allocated` 永久虚高 → 以后 `acquire` 报**假** `PoolExhausted`，而读侧给出伪造读数
+（会被 scrape/健康检查当成事实）。改 `lockUncancelable`（本仓 `Pool.release` 早为同一问题做过同样选择），
+`acquire` 仍传播 `error.Canceled`（等待缓冲区正是取消有意义的地方，且它有错误通道）。
+> **未改并记录**：`BufferPool.deinit` 仍用 `tryLock`，失败时**不持锁**就 free 空闲表 —— 与并发
+> `release`（现在会不可取消地等这把锁）之间存在竞态；全仓还有约 11 处
+> `mutex.lock(io) catch return …` 未逐个判定是缺陷还是有意语义。
+> 另：`PoolExhausted` 现在仍可能因**池子无法区分**的原因上报（调用方交回 sub-slice、或干脆不 release），
+> 注释里写明了。
+
+**MySQL：`mysql_stmt_result_metadata` 返回 NULL 不再被读成"零行"（真机端到端红证据）。**
+这条以前被注释解释为"`field_count > 0` 后应该很罕见"，而 NULL 被当成空结果集 —— 调用方看到"没有行"
+而不是错误。用 **C 探针**先在真机上确定语义：NULL ⟺ `field_count == 0`（errno=0），
+`stmt_reset`/`store_result`/`free_result` 后再取仍非 NULL；再反汇编实际链接的 `libmysqlclient.24`，
+该函数只有两条 NULL 路径：`field_count == 0`（直接返回、不设 errno）与描述符 `my_malloc` 失败时的
+`errno 2008`（CR_OUT_OF_MEMORY）。为了在线缆上拿到红，用 **DYLD 符号拦截**强制返回 NULL：
+```
+168/1758 sqlx.sqlx.test.mysql live connection...expected 1, found 0
+FAIL (TestExpectedEqual)   ← 服务器返回 1 行，驱动报 0 行，且没有任何错误
+```
+现在：`field_count == 0` → 仍按空结果集（debug 日志，这就是所测量的子情形）；否则打印
+`field_count/errno/msg` 为 err 并返回映射后的错误，不再返回空行集。
+> **未验证**：那条错误分支**没有 CI 可跑的回归测试** —— 仓库没有可注入该故障的缝，而我没有往驱动里加
+> 测试钩子（能进 CI 的只有判决函数单测与"空结果集"这条保留子情形）。本机链的是
+> `/opt/homebrew/opt/mysql/lib/libmysqlclient.24`（**不是**注释里假设的 libmariadb），所以针对
+> mariadb 构建的拦截器会被静默忽略 —— 这一点也写进了注释。
+
+**`mysqlParseJson` 的解析器 OOM 不再折成 `error.InvalidFormat`**（红：`expected error.OutOfMemory,
+found error.InvalidFormat`）。该文件里最后一处这类塌陷；`CachedConn.decodeCached` 早先已按同一口径修好，
+本次以它为模板。该函数此前只有测试调用（全部 `try`）。
+
 ### 第 15 批：授权路径在 OOM 下 fail-open（真红，含一处越界写）、口令校验把"我们这侧出错"答成"口令错"（**破坏性：是**，1 处编译错）、另有 10 处"失败被当成成功值"（**破坏性：否**）
 
 全量 `-Ddb=all` **1815/1871（56 skipped，0 failed）**。

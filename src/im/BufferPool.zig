@@ -66,6 +66,12 @@ pub const BufferPool = struct {
             return buf;
         }
 
+        // Still reachable without genuine exhaustion: `allocated` counts buffers
+        // that have no path back into the pool — one whose caller handed back a
+        // sub-slice (refused and warned, the caller keeping it) or simply never
+        // handed one back. The pool cannot tell such a buffer from a live one.
+        // What is fixed is the pool's own accounting error: a canceled `release`
+        // no longer drops the buffer (see there), so this side cannot lose count.
         return error.PoolExhausted;
     }
 
@@ -76,7 +82,15 @@ pub const BufferPool = struct {
     /// this pool cannot free it (its allocator free needs the allocation's own
     /// length) and must not pool it.
     pub fn release(self: *Self, buf: []u8) void {
-        self.mutex.lock(self.io) catch return;
+        // Uncancelable: `release` is the caller handing its buffer back, and a
+        // canceled `mutex.lock` has no way to say "never mind" — the old
+        // `catch return` left the buffer neither pooled nor freed, so `allocated`
+        // stayed up for good and a later `acquire` reported `PoolExhausted` with
+        // nothing live. Waiting is the honest answer (the critical section is one
+        // list append), and there is nowhere for an error to go anyway: the WS
+        // read loop calls this from a `defer` (`api/Server.zig`). Same choice as
+        // `Pool.release` and `sqlx.ConnPool.release`.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
         // A buffer this pool did not hand out is not ours to free: `allocator.free`
@@ -112,13 +126,19 @@ pub const BufferPool = struct {
     }
 
     pub fn available(self: *Self) usize {
-        self.mutex.lock(self.io) catch return 0;
+        // Uncancelable: this is a reading, and answering a canceled lock wait with
+        // `0` (the old `catch return 0`) fabricated "the pool holds nothing" — a
+        // scrape hook or a health check cannot tell that apart from the truth.
+        // The critical section is one length read; waiting for it costs nothing.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return self.free.items.len;
     }
 
     pub fn stats(self: *Self) struct { allocated: usize, free: usize } {
-        self.mutex.lock(self.io) catch return .{ .allocated = 0, .free = 0 };
+        // Uncancelable, for the same reason as `available`: `{ 0, 0 }` is a
+        // reading an operator would act on, not a harmless placeholder.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return .{ .allocated = self.allocated, .free = self.free.items.len };
     }
@@ -213,6 +233,135 @@ test "stats track allocation" {
 // The task below is parked on the pool mutex (held by the test thread) with a
 // cancel request already placed on its thread, so the cancelation point is the
 // lock wait itself: the gate between the two is pure spinning, which is not one.
+// `release` used to answer a canceled `mutex.lock(io)` with an early `return`:
+// the buffer was neither pooled nor freed, so `allocated` stayed up for good and
+// a later `acquire` reported `error.PoolExhausted` with nothing actually live —
+// which the WS read loop reads as "drop this connection".
+//
+// The lock wait is the cancelation point here: the release task is parked on the
+// pool mutex (held by the test thread) with a cancel request already placed on
+// its thread, and the gate between the two is pure spinning, which consumes
+// nothing.
+test "release keeps the buffer when its lock wait is canceled" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var pool = BufferPool.init(allocator, io, 1);
+    defer pool.deinit();
+
+    const buf = try pool.acquire();
+    const ptr = buf.ptr;
+
+    const Task = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+
+        fn release(p: *BufferPool, b: []u8) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            p.release(b);
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Task.entered.store(false, .monotonic);
+    Task.open.store(false, .monotonic);
+
+    // The test thread holds the pool mutex, so the task cannot get past the lock
+    // wait until told to.
+    try pool.mutex.lock(io);
+
+    var release_fut = try io.concurrent(Task.release, .{ &pool, buf });
+    while (!Task.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Task.cancel, .{ io, &release_fut });
+    // Give the request time to land on the task's thread while it is still gated.
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Task.open.store(true, .release);
+    // The task is now inside `release`: parked on the mutex (it swaps the state
+    // to `contended` on its way to the wait), or already gone.
+    while (pool.mutex.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    pool.mutex.unlock(io);
+
+    cancel_fut.await(io);
+    release_fut.await(io);
+
+    // The buffer is back in the pool's books — handed out again, so not leaked
+    // either. Before the fix this `acquire` was `error.PoolExhausted`: nothing
+    // was live, but the dropped buffer left `allocated` at its cap for good.
+    const again = try pool.acquire();
+    try std.testing.expectEqual(ptr, again.ptr);
+    pool.release(again);
+    try std.testing.expectEqual(@as(usize, 1), pool.available());
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().allocated);
+}
+
+// The same defect class in the read-only accessors: a canceled lock wait was
+// answered with a fabricated `0` / `{ allocated = 0, free = 0 }` — "this pool
+// holds nothing and has allocated nothing" — which is what a metrics scrape or a
+// health check would believe. The pool is not empty here, so the reading has to
+// say so.
+test "available and stats report the true state when a lock wait is canceled" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var pool = BufferPool.init(allocator, io, 4);
+    defer pool.deinit();
+
+    // One buffer pooled and one allocation on the books, so a fabricated reading
+    // (0 / {0, 0}) is visibly different from the true one (1 / {1, 1}).
+    const buf = try pool.acquire();
+    pool.release(buf);
+
+    const Task = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+        var seen_available: usize = 0;
+        var seen_allocated: usize = 0;
+        var seen_free: usize = 0;
+
+        fn read(p: *BufferPool) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            seen_available = p.available();
+            const st = p.stats();
+            seen_allocated = st.allocated;
+            seen_free = st.free;
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Task.entered.store(false, .monotonic);
+    Task.open.store(false, .monotonic);
+    Task.seen_available = 0;
+    Task.seen_allocated = 0;
+    Task.seen_free = 0;
+
+    try pool.mutex.lock(io);
+
+    var read_fut = try io.concurrent(Task.read, .{&pool});
+    while (!Task.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Task.cancel, .{ io, &read_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Task.open.store(true, .release);
+    while (pool.mutex.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    pool.mutex.unlock(io);
+
+    cancel_fut.await(io);
+    read_fut.await(io);
+
+    try std.testing.expectEqual(@as(usize, 1), Task.seen_available);
+    try std.testing.expectEqual(@as(usize, 1), Task.seen_allocated);
+    try std.testing.expectEqual(@as(usize, 1), Task.seen_free);
+}
+
 test "acquire reports a canceled lock wait as error.Canceled" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
