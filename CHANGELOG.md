@@ -2,6 +2,65 @@
 
 ## [Unreleased]
 
+### 第 10 批：H1 会写出重复的 `Content-Length`（真红）、h2c 升级放开方法限制、HEAD 不再带 body、MySQL 缓冲路径把 OOM 误报成 `DatabaseError`、游标断线现在会上报 breaker（**破坏性：否**）
+
+全量 `-Ddb=all` **1763/1795（32 skipped，0 failed）**；MySQL 门控真机 16 passed / 2 skipped / 0 failed，
+PG 门控真机 1 passed / 3 skipped / 0 failed。
+
+**H1 的 `Content-Length` 会被写两遍 —— 而且在 `HEAD` 上是自相矛盾的（真红，已修）。** 这是被
+"检查 h2 侧故意丢弃不匹配的 `content-length` 时顺手回看 H1"发现的，而且**在真实路由上现场存在**：
+`StaticFiles.zig:197` 会自己声明文件长度，于是 `GET /static/small.txt` 的响应里有两个
+`Content-Length: 17`，`HEAD /static/big.bin` 则是 `Content-Length: 5120` **紧跟着** `Content-Length: 0`。
+（既有测试没发现，因为它们只取第一个匹配。）重复的定界头是走私邻域的形状，不是排版问题。
+红证据：`expected 1, found 2`（断言响应里该字段的条数）。
+修法（`src/api/Server.zig:2098` + helper `:2173`）：**一个定界字段，在写 map 之前就定下来** ——
+走 chunked（`Transfer-Encoding`，改为大小写不敏感）→ 两边都不写；`HEAD` → 用 handler 声明的合法值
+（没有八位组会发出去，而 `StaticFiles` 依赖它）；其余情况 → handler 的值**只在它等于即将写出的字节数**
+时保留（这正是 `assembleSiteResponseBlock` 在 H2 上已经执行的规则），否则用服务端自己算的。值必须是严格的
+`1*DIGIT`，复用请求侧的 `parseContentLength` —— 第一版用了 `std.fmt.parseInt`，它把 `1_7` 读成 17，
+于是自己先红了一条（`declaredLengthMatches`），已改。
+
+**h2c 升级放开方法限制，并且 `HEAD` 不再发 body。** 上一批把升级请求按 stream 1 派发后，
+`connFiber` 的升级分支仍只认 `GET`（RFC 7540 §3.2 对方法**没有**限制），于是 `POST` 升级根本进不来
+（body 路径其实早就实现并有用例）。红证据（两条都被当成普通 H1 处理、**完全没有 101**）：
+`h2c upgrade: a POST carrying a body is stream 1, and OPTIONS upgrades too` 与
+`h2c upgrade: a HEAD request is answered with no body at all`。现在门只由 `server.enable_http2` 决定；
+`fillUpgradeStream` 的 `end_stream = true` 保留并写明理由：H1 请求（含 body）在会话开始前已整个读完，
+所以**无论什么方法** stream 1 都是半关闭 remote —— 写成条件反而会让 POST 升级挂住。
+> **随之而来的行为变化**：`HEAD` 的响应体在 H1 与 H2 上都不再发送（红：`expected "" / found "eleven byte"`）。
+> 这是修正而非回归，但确实是行为变化，且**尚未覆盖**：H1 的 `startChunked` 流式路径仍会写 chunk、
+> `writeErrorResponse`（解析错误 / WS 握手失败 / 拒绝头 500 / 503 甩负载）仍会给 HEAD 写 body。
+
+**MySQL 缓冲读把 arena 的 OOM 误报成 `DatabaseError`（已修）。** `mysqlReadRowsAfterQuery` 里每个
+arena 分配点都写 `catch return error.DatabaseError`，于是 `std.crypto` 之外的诊断链全在说谎：
+`toErrorContext` 把 `OutOfMemory` 映射成具名 code 而 `DatabaseError` 落到 `UnknownError`，metrics 回调
+记的 `@errorName(err)` 也是错的，而且**同一种故障在流式路径上报 `OutOfMemory`、在缓冲路径上报
+`DatabaseError`**（`src/core/Error.zig:194-196` 明说这一族应是 `OutOfMemory`）。红证据：
+`expected error.OutOfMemory, found error.DatabaseError`。改为 `try` 如实传播。
+> 同一个循环里的两处**守卫**（`mysql_fetch_row` 为 NULL、`mysql_fetch_lengths` 为 NULL）也一并改成
+> 返回 `error.DatabaseError` 而不是伪造一整行 NULL。但**没有为它们造测试**：用原始 C API 探针实测
+> MySQL 9.3.0 后确认 `mysql_fetch_lengths` 的 NULL **等价于"当前没有行"**（`num_rows=2` 时 fetch 前为
+> true、两次 fetch 后为 false、越界 fetch 后为 true），框架函数跑 8 种语句形状（空结果 / NULL 单元格 /
+> 零长串 / 200KB 大格 / 5 行 / binary / 中途报错 / `SET`）共 9 次循环内 fetch **无一返回 NULL** ——
+> 在 `res != null` 的前提下该解引用不可达。注释里写明"这是守卫"，实测依据记录在测试注释中。
+
+**游标中途断线现在会记进 breaker（metrics 仍不记，附成本实测）。** `Cursor.next` 变成可失败之后，
+调用方能看到错误，但**没有任何地方记录它**。现在 `Cursor` 增加 `owner: ?*Client` 与
+`booked_failure: bool`：`next` 出错时按与获取路径**同一个** `isAcceptable` 过滤上报，**每个游标最多记一次**；
+`deinit` 的 ping 失败也走同一条路，避免同一次断裂被记两遍；手工构造（`Cursor.init`）的游标 `owner = null`
+→ 不计数。红证据：`expected 1, found 0`（`db.cb.failure_count`）。
+> **metrics 仍只在获取阶段上报**，这是**有实测依据的选择**：用计数分配器实测，失败的 `next` 调用
+> **分配 0 次**（只是 mutex + 计数），而"把 `sql_str` 拷一份留在游标上喂 metrics"是**每个游标 +1 次分配
+> （实测 156 字节）**、每次获取都付、且绝大多数游标永不出错；借用调用方的 `sql_str` 也**不行** —— API
+> 没承诺其生命周期，树内就有传临时缓冲的调用（`src/ai/business.zig:322` 传 `sql_buf.items`，调用方
+> `defer` 释放），那会让 metrics 回调收到悬垂切片。
+
+> **未结的一项**：本批期间有一次整跑 `FAILED`（125s，输出未留存），之后**三次同样的整跑全部通过且
+> 计数一致**（1763/1795）。无法证伪也未能复现，怀疑是既有的 wall-clock 敏感用例（runtime stress）抖动，
+> 但**没有排除与本次改动有关** —— 记在这里而不是当作已解释。
+> 另：同类 OOM 误标在 **PG 缓冲路径**（`pgReadRows`）、**sqlite** 路径与 `formatQuery` 调用点仍然存在，
+> 本批只改了 MySQL 缓冲路径。
+
 ### 第 9 批：H2 不再丢响应头（Set-Cookie/Location/Retry-After 全丢）、h2c 升级按 RFC 把升级请求当 stream 1 派发、MySQL 流式游标首次有真机用例（**破坏性：否**）
 
 全量 `-Ddb=all` **1753/1782（29 skipped，0 failed）**；PG 17.10 与 MySQL 9.3.0 门控用例分别在

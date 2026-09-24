@@ -87,7 +87,19 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 **修复（非破坏）**：h2c 升级路径此前**不派发 stream 1**，真实客户端 `curl --http2` 升级后拿不到任何
 响应（prior-knowledge 不受影响）。现在按 RFC 7540 §3.2 把**携带升级的那个请求**当作 stream 1 派发
 一次，并先应用 `HTTP2-Settings`；此后客户端再发 `HEADERS(1)` 会收到 `RST_STREAM(STREAM_CLOSED)`。
-若你的客户端一直在用 h2c 升级，这条修好之前它大概什么都没收到。
+若你的客户端一直在用 h2c 升级，这条修好之前它大概什么都没收到。升级同时**放开了方法限制**（此前只认
+`GET`，而 RFC 对方法没有限制）：`POST`/`HEAD`/`OPTIONS` 升级现在都能进。
+
+**行为变化（非破坏）**：`HEAD` 的响应**不再带 body**（H1 与 H2 都是）。以前 H1 会给 HEAD 写出 body
+字节，与 `Content-Length` 自相矛盾。已知未覆盖：H1 的 `startChunked` 流式路径仍会写 chunk，
+`writeErrorResponse`（解析错误 / WS 握手失败 / 拒绝头 500 / 503 甩负载）仍会给 HEAD 写 body。
+
+**修复（非破坏）**：H1 的 `Content-Length` 以前会被**写两遍**（handler 自己声明过一次、服务端再加一次），
+`HEAD` 上更会出现 `Content-Length: 5120` 紧跟 `Content-Length: 0` 这种自相矛盾（`StaticFiles` 会声明文件
+长度，所以这在真实路由上存在）。重复的定界头是走私邻域的形状。现在**只有一个定界字段**，chunked 时两边都
+不写；`HEAD` 用 handler 声明的值；其余情况只用 handler 的值——**且仅当它等于即将写出的字节数**（与 H2
+已有规则一致）。若你的 handler 依赖"自己写的 `Content-Length` 一定会原样发出"，而它与实际 body 不符，
+这条之后会被服务端自己的值替换。
 
 ---
 

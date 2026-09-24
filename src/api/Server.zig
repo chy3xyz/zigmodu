@@ -2092,7 +2092,17 @@ const max_response_header_value_bytes = 8 * 1024;
 /// 300-byte `Origin` echoed by CORS is enough) failed with `error.NoSpaceLeft`,
 /// which connFiber logged and dropped — the client saw an empty socket. The
 /// only remaining bound is the explicit `max_response_header_value_bytes`.
-fn writeResponse(io: std.Io, stream: std.Io.net.Stream, status: u16, headers: std.StringHashMap([]const u8), body: []const u8) !void {
+/// Write one HTTP/1.1 response. `write_body` is `false` for a `HEAD` request:
+/// the field section is the `GET` one — `Content-Length` included — and the
+/// octets are not sent (RFC 9110 §9.3.2).
+fn writeResponse(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    status: u16,
+    headers: std.StringHashMap([]const u8),
+    body: []const u8,
+    write_body: bool,
+) !void {
     var write_buf: [4096]u8 = undefined;
     var w = stream.writer(io, &write_buf);
 
@@ -2111,21 +2121,58 @@ fn writeResponse(io: std.Io, stream: std.Io.net.Stream, status: u16, headers: st
     // Status line
     try w.interface.print("HTTP/1.1 {d} {s}\r\n", .{ status, status_text });
 
+    // The framing field, decided before the map is written.
+    //
+    //  - chunked: none at all, from either side (RFC 9112 §6.1 forbids framing a
+    //    message both ways).
+    //  - `HEAD`: the handler's declaration, which *is* the entity length — no
+    //    octets go out here, so there is nothing to check it against and nothing
+    //    else that could report the length (RFC 9110 §9.3.2: a response to
+    //    `HEAD` carries the field section the `GET` would have). `StaticFiles`
+    //    depends on exactly that.
+    //  - otherwise: the handler's own only when it equals the octets this
+    //    response carries — the rule the H2 encoder applies too
+    //    (`assembleSiteResponseBlock`), so both protocols frame a response the
+    //    same way — otherwise the server's own, since it is holding the body.
+    //
+    // Whatever wins goes out **once**. Appending the server's length next to the
+    // handler's put two framing fields on the wire (`StaticFiles` declares the
+    // file length: `Content-Length: 5120` then `Content-Length: 0` on
+    // `HEAD /static/big.bin`), and a response framed by a number its body does
+    // not match is one a recipient may reject or mis-read (RFC 9110 §8.6) —
+    // `1*DIGIT` is enforced as well, so `1_7` cannot mean 17.
+    const chunked = headerLookup(headers, "Transfer-Encoding") != null;
+    const declared_length = declaredContentLength(headers);
+    const keep_declared_length = !chunked and (if (write_body)
+        (declared_length != null and declared_length.? == body.len)
+    else
+        declared_length != null);
+
     // Headers
     var hiter = headers.iterator();
     while (hiter.next()) |entry| {
+        if (!keep_declared_length and std.ascii.eqlIgnoreCase(entry.key_ptr.*, "content-length")) continue;
         try w.interface.print("{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
     }
 
-    // Content-Length (skip for chunked transfer to avoid HTTP spec violation)
-    if (headers.get("Transfer-Encoding") == null) {
+    if (!chunked and !keep_declared_length) {
         try w.interface.print("Content-Length: {d}\r\n", .{body.len});
     }
     try w.interface.writeAll("\r\n");
 
-    // Body (already chunk-encoded if Transfer-Encoding: chunked)
-    try w.interface.writeAll(body);
+    // Body (already chunk-encoded if Transfer-Encoding: chunked). Under `HEAD`
+    // there is none to write: the entity length above is the `GET` answer's.
+    if (write_body) try w.interface.writeAll(body);
     try w.interface.flush();
+}
+
+/// The handler's `Content-Length`, when the value really is one: `1*DIGIT` per
+/// RFC 9110 §8.6. Zig's `parseInt` would take `_` as a digit separator, so
+/// `1_7` has to be refused rather than read as 17 — `parseContentLength` is the
+/// request side's parser and refuses exactly that.
+fn declaredContentLength(headers: std.StringHashMap([]const u8)) ?usize {
+    const value = headerLookup(headers, "content-length") orelse return null;
+    return parseContentLength(value);
 }
 
 /// Reject a response field that would let its value rewrite the message:
@@ -3115,7 +3162,14 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
         }
 
         // ── HTTP/2 cleartext upgrade (h2c, RFC 7540 §3.2) ──
-        if (server.enable_http2 and std.mem.eql(u8, request.method.toString(), "GET")) {
+        // No method restriction: the upgrade is a property of the connection,
+        // not of the request (RFC 7540 §3.2 / RFC 9113 §3.2 name no method), so
+        // every method the HTTP/1.1 parser above accepted can carry it — a
+        // `POST` upgrade is how a body rides onto the upgraded connection, and
+        // `HEAD`/`OPTIONS` upgrade like anything else. A method this server does
+        // not implement never reaches this point: the request-line parse above
+        // refused an unknown token with 501 (`error.InvalidMethod`).
+        if (server.enable_http2) {
             const upgrade_hdr = ctx.headers.get("upgrade") orelse "";
             const conn_hdr = ctx.headers.get("connection") orelse "";
             const h2_settings = ctx.headers.get("http2-settings");
@@ -3293,7 +3347,18 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
         }
 
         if (ctx.responded and !ctx.streaming) {
-            writeResponse(server.io, stream, ctx.status_code, ctx.response_headers, ctx.response_body.items) catch |err| {
+            writeResponse(
+                server.io,
+                stream,
+                ctx.status_code,
+                ctx.response_headers,
+                ctx.response_body.items,
+                // `HEAD`: the response ends at the field section. Every route
+                // reached through here — a handler's 200, `sendError`'s 404/408
+                // — gets the same treatment, and the declared `Content-Length`
+                // still describes the entity the `GET` would have sent.
+                ctx.method != .HEAD,
+            ) catch |err| {
                 // A header the server refuses (non-token name, CR/LF value, past
                 // the value ceiling) is a server-side bug — a handler built it
                 // from input it should have validated. `writeResponse` rejects
@@ -3374,7 +3439,7 @@ fn writeErrorResponse(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.
         return;
     };
 
-    writeResponse(io, stream, status, headers, rendered.body) catch |err| std.log.err("[Server] writeErrorResponse failed: {}", .{err});
+    writeResponse(io, stream, status, headers, rendered.body, true) catch |err| std.log.err("[Server] writeErrorResponse failed: {}", .{err});
 }
 
 // ==== §8  Middleware runner & struct binding ====
@@ -6006,7 +6071,7 @@ test "long response header values are written, not dropped" {
     defer headers.deinit();
     try headers.put("Access-Control-Allow-Origin", origin);
 
-    try writeResponse(std.testing.io, stream, 200, headers, "{}");
+    try writeResponse(std.testing.io, stream, 200, headers, "{}", true);
 
     var buf: [1024]u8 = undefined;
     const response = try readPeer(fds[1], &buf, 2000);
@@ -6033,7 +6098,7 @@ test "response header values have an explicit ceiling, reported as an error" {
 
     // No fixed write buffer exists anymore, so the ceiling has to be explicit
     // and named — not "NoSpaceLeft from a scratch buffer nobody can see".
-    try std.testing.expectError(error.HeaderTooLarge, writeResponse(std.testing.io, stream, 200, headers, "{}"));
+    try std.testing.expectError(error.HeaderTooLarge, writeResponse(std.testing.io, stream, 200, headers, "{}", true));
 }
 
 test "setHeader refuses a CR/LF/NUL value and a non-token name" {
@@ -6924,11 +6989,15 @@ fn h2cUpgradeToServer(
     return total;
 }
 
-/// One h2c upgrade request block, upgrade fields included. `extra_lines` are
-/// complete header lines, each terminated with CRLF (empty when there are none);
-/// `body` follows the blank line.
+/// One h2c upgrade request block, upgrade fields included. `method` is the
+/// request-line method — the upgrade is a connection property, not a `GET` one
+/// (RFC 7540 §3.2), so the tests that carry a body or ask about `HEAD` send
+/// theirs with the method they mean. `extra_lines` are complete header lines,
+/// each terminated with CRLF (empty when there are none); `body` follows the
+/// blank line.
 fn h2cUpgradeRequest(
     allocator: std.mem.Allocator,
+    method: []const u8,
     target: []const u8,
     settings_value: []const u8,
     extra_lines: []const u8,
@@ -6937,9 +7006,9 @@ fn h2cUpgradeRequest(
     std.debug.assert(extra_lines.len == 0 or std.mem.endsWith(u8, extra_lines, "\r\n"));
     return std.fmt.allocPrint(
         allocator,
-        "GET {s} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade, HTTP2-Settings\r\n" ++
+        "{s} {s} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade, HTTP2-Settings\r\n" ++
             "Upgrade: h2c\r\nHTTP2-Settings: {s}\r\n{s}\r\n{s}",
-        .{ target, settings_value, extra_lines, body },
+        .{ method, target, settings_value, extra_lines, body },
     );
 }
 
@@ -6996,7 +7065,7 @@ test "h2c upgrade: the request that carried the upgrade is answered as stream 1"
 
     const settings_value = try h2cSettingsValue(allocator, &.{.{ Http2.SettingsId.initial_window_size, 131072 }});
     defer allocator.free(settings_value);
-    const request = try h2cUpgradeRequest(allocator, "/h2cup", settings_value, "", "");
+    const request = try h2cUpgradeRequest(allocator, "GET", "/h2cup", settings_value, "", "");
     defer allocator.free(request);
 
     var out: [8192]u8 = undefined;
@@ -7053,6 +7122,7 @@ test "h2c upgrade: the request's query string and fields reach the handler" {
     // `x-tenant` field is the ordinary-field half of the same path.
     const request = try h2cUpgradeRequest(
         allocator,
+        "GET",
         "/h2cupq?a=1&b=%E5%BC%A0%E4%B8%89",
         settings_value,
         "X-Tenant: acme\r\n",
@@ -7100,7 +7170,7 @@ test "h2c upgrade: the HTTP2-Settings payload is applied before the first respon
 
     const settings_value = try h2cSettingsValue(allocator, &.{.{ Http2.SettingsId.initial_window_size, 131072 }});
     defer allocator.free(settings_value);
-    const request = try h2cUpgradeRequest(allocator, "/h2cbig", settings_value, "", "");
+    const request = try h2cUpgradeRequest(allocator, "GET", "/h2cbig", settings_value, "", "");
     defer allocator.free(request);
 
     // A reply larger than the default peer window, so it needs its own buffer.
@@ -7135,7 +7205,7 @@ test "h2c upgrade: a HEADERS frame for stream 1 is refused, not dispatched twice
 
     const settings_value = try h2cSettingsValue(allocator, &.{.{ Http2.SettingsId.initial_window_size, 131072 }});
     defer allocator.free(settings_value);
-    const request = try h2cUpgradeRequest(allocator, "/h2cupdup", settings_value, "", "");
+    const request = try h2cUpgradeRequest(allocator, "GET", "/h2cupdup", settings_value, "", "");
     defer allocator.free(request);
 
     // The client preface, the SETTINGS frame the RFC requires next (§3.2.2: the
@@ -7198,6 +7268,7 @@ test "h2c upgrade: an upgrade request body becomes stream 1's body" {
     // will never come — stream 1 is half-closed (remote) from the first frame.
     const request = try h2cUpgradeRequest(
         allocator,
+        "GET",
         "/h2cbody",
         settings_value,
         "Content-Length: 11\r\n",
@@ -7215,4 +7286,401 @@ test "h2c upgrade: an upgrade request body becomes stream 1's body" {
     try std.testing.expectEqualStrings("hello world", body);
     const data = h2FindFrame(wire, .data, 1) orelse return error.NoStream1BodyAfterUpgrade;
     try std.testing.expect((data.header.flags & Http2.FrameFlags.end_stream) != 0);
+}
+
+test "h2c upgrade: a POST carrying a body is stream 1, and OPTIONS upgrades too" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h2c-upgrade-post" });
+    defer server.deinit();
+    server.setHttp2Enabled(true);
+
+    var group = server.group("");
+    // Neither RFC 7540 §3.2 nor RFC 9113 §3.2 names a method: the upgrade is a
+    // connection property, and the request that carried it becomes stream 1
+    // whatever it is. `POST` is the interesting one — the HTTP/1.1 request is
+    // how a body rides onto the upgraded connection.
+    try group.post("h2cpost", struct {
+        fn h(ctx: *Context) anyerror!void {
+            const body = ctx.body orelse "NOBODY";
+            const out = try std.fmt.allocPrint(ctx.allocator, "{s}:{s}", .{ ctx.method.toString(), body });
+            try ctx.text(200, out);
+        }
+    }.h, null);
+    try group.options("h2copt", struct {
+        fn h(ctx: *Context) anyerror!void {
+            try ctx.text(200, ctx.method.toString());
+        }
+    }.h, null);
+
+    var running = try H2TestServer.start(&server);
+    defer running.stop(&server);
+
+    const settings_value = try h2cSettingsValue(allocator, &.{.{ Http2.SettingsId.initial_window_size, 131072 }});
+    defer allocator.free(settings_value);
+
+    var out: [8192]u8 = undefined;
+    {
+        const request = try h2cUpgradeRequest(
+            allocator,
+            "POST",
+            "/h2cpost",
+            settings_value,
+            "Content-Length: 11\r\n",
+            "hello world",
+        );
+        defer allocator.free(request);
+
+        const n = try h2cUpgradeToServer(running.port, request, &.{}, &out);
+        try std.testing.expect(std.mem.startsWith(u8, out[0..n], "HTTP/1.1 101"));
+        const wire = try h2cWireAfter101(out[0..n]);
+
+        // The method reached the handler as `POST` and the body arrived whole:
+        // the seeded stream carries both, since no DATA frame will ever come for
+        // a stream that is half-closed (remote) from the start.
+        const body = try h2CollectData(allocator, wire, 1);
+        defer allocator.free(body);
+        try std.testing.expectEqualStrings("POST:hello world", body);
+
+        const hframe = h2FindFrame(wire, .headers, 1) orelse return error.NoStream1ResponseAfterUpgrade;
+        var dec = Hpack.Decoder.init(allocator);
+        defer dec.deinit();
+        const hdrs = try dec.decode(hframe.payload);
+        defer Hpack.freeHeaders(allocator, hdrs);
+        try std.testing.expectEqualStrings("200", h2FirstHeaderValue(hdrs, ":status") orelse return error.NoStatusField);
+    }
+    {
+        // A second connection, no body: the method gate is gone, not widened to
+        // one extra verb.
+        const request = try h2cUpgradeRequest(allocator, "OPTIONS", "/h2copt", settings_value, "", "");
+        defer allocator.free(request);
+
+        const n = try h2cUpgradeToServer(running.port, request, &.{}, &out);
+        try std.testing.expect(std.mem.startsWith(u8, out[0..n], "HTTP/1.1 101"));
+        const wire = try h2cWireAfter101(out[0..n]);
+
+        const body = try h2CollectData(allocator, wire, 1);
+        defer allocator.free(body);
+        try std.testing.expectEqualStrings("OPTIONS", body);
+    }
+}
+
+test "h2c upgrade: a HEAD request is answered with no body at all" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h2c-upgrade-head" });
+    defer server.deinit();
+    server.setHttp2Enabled(true);
+
+    var group = server.group("");
+    try group.head("h2chead", struct {
+        fn h(ctx: *Context) anyerror!void {
+            // The method the session seeded into `:method`/`st.method`, echoed
+            // back — a `GET` would take this route and send its body.
+            try ctx.setHeader("X-Seen-Method", ctx.method.toString());
+            // The entity a `GET` would have produced, and its length: a response
+            // to `HEAD` carries the field section and no body (RFC 9110 §9.3.2,
+            // RFC 9113 §8.2), so the declared length has to survive while the
+            // octets do not.
+            try ctx.setHeader("Content-Length", "11");
+            try ctx.text(200, "eleven byte");
+        }
+    }.h, null);
+
+    var running = try H2TestServer.start(&server);
+    defer running.stop(&server);
+
+    const settings_value = try h2cSettingsValue(allocator, &.{.{ Http2.SettingsId.initial_window_size, 131072 }});
+    defer allocator.free(settings_value);
+    const request = try h2cUpgradeRequest(allocator, "HEAD", "/h2chead", settings_value, "", "");
+    defer allocator.free(request);
+
+    var out: [8192]u8 = undefined;
+    const n = try h2cUpgradeToServer(running.port, request, &.{}, &out);
+    try std.testing.expect(std.mem.startsWith(u8, out[0..n], "HTTP/1.1 101"));
+    const wire = try h2cWireAfter101(out[0..n]);
+
+    // No DATA frame for stream 1: HEADERS carries END_STREAM instead.
+    try std.testing.expectEqual(@as(usize, 0), h2CountFrames(wire, .data, 1));
+    const hframe = h2FindFrame(wire, .headers, 1) orelse return error.NoStream1ResponseAfterUpgrade;
+    try std.testing.expect((hframe.header.flags & Http2.FrameFlags.end_stream) != 0);
+
+    var dec = Hpack.Decoder.init(allocator);
+    defer dec.deinit();
+    const hdrs = try dec.decode(hframe.payload);
+    defer Hpack.freeHeaders(allocator, hdrs);
+    try std.testing.expectEqualStrings("200", h2FirstHeaderValue(hdrs, ":status") orelse return error.NoStatusField);
+    // The seeded `:method` is the request line's, not the `GET` the upgrade path
+    // used to be limited to.
+    try std.testing.expectEqualStrings("HEAD", h2FirstHeaderValue(hdrs, "x-seen-method") orelse return error.NoSeenMethodField);
+    try std.testing.expectEqualStrings("11", h2FirstHeaderValue(hdrs, "content-length") orelse return error.NoContentLengthField);
+}
+
+test "h2c upgrade: an HTTP2-Settings value that is not base64url is refused with GOAWAY" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h2c-upgrade-badsettings" });
+    defer server.deinit();
+    server.setHttp2Enabled(true);
+
+    var group = server.group("");
+    try group.get("h2cbad", struct {
+        fn h(ctx: *Context) anyerror!void {
+            try ctx.text(200, "must not be reached");
+        }
+    }.h, null);
+
+    var running = try H2TestServer.start(&server);
+    defer running.stop(&server);
+
+    // RFC 7540 §3.2.1: the `HTTP2-Settings` field *is* the peer's SETTINGS, so a
+    // value that is not the base64url payload of a SETTINGS frame is a
+    // connection error. The 101 is already out by the time the field is read, so
+    // GOAWAY is the only answer left — and stream 1 must not be dispatched: the
+    // request was never understood far enough to serve it. A `POST` with a body,
+    // i.e. the upgrade a client uses to send one, refuses the same way.
+    const request = try h2cUpgradeRequest(
+        allocator,
+        "POST",
+        "/h2cbad",
+        "!!!not-base64url!!!",
+        "Content-Length: 11\r\n",
+        "hello world",
+    );
+    defer allocator.free(request);
+
+    var out: [8192]u8 = undefined;
+    const n = try h2cUpgradeToServer(running.port, request, &.{}, &out);
+    try std.testing.expect(std.mem.startsWith(u8, out[0..n], "HTTP/1.1 101"));
+    const wire = try h2cWireAfter101(out[0..n]);
+
+    const goaway = h2FindFrame(wire, .goaway, 0) orelse return error.NoGoAwayForUndecodableSettings;
+    const info = try Http2.decodeGoAway(goaway.payload);
+    try std.testing.expectEqual(Http2.ErrorCode.PROTOCOL_ERROR, info.error_code);
+    try std.testing.expectEqual(@as(u31, 1), info.last_stream_id);
+    try std.testing.expectEqual(@as(usize, 0), h2CountFrames(wire, .headers, 1));
+    try std.testing.expectEqual(@as(usize, 0), h2CountFrames(wire, .data, 1));
+}
+
+test "h2c upgrade: base64url that is not a SETTINGS payload is refused with the mapped code" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h2c-upgrade-shortsets" });
+    defer server.deinit();
+    server.setHttp2Enabled(true);
+
+    var group = server.group("");
+    try group.get("h2cshort", struct {
+        fn h(ctx: *Context) anyerror!void {
+            try ctx.text(200, "must not be reached");
+        }
+    }.h, null);
+
+    var running = try H2TestServer.start(&server);
+    defer running.stop(&server);
+
+    // Five bytes of well-formed base64url: it survives the decode and is refused
+    // by `SettingsIterator.init` instead — a SETTINGS payload is a whole number
+    // of 6-byte entries (RFC 7540 §6.5). The second arm of the same guard, and
+    // the one that has to map the error rather than assume PROTOCOL_ERROR.
+    var five = [_]u8{ 0, 0, 0, 0, 1 };
+    var encoded_buf: [16]u8 = undefined;
+    const encoded = std.base64.url_safe_no_pad.Encoder.encode(&encoded_buf, &five);
+    const request = try h2cUpgradeRequest(allocator, "GET", "/h2cshort", encoded, "", "");
+    defer allocator.free(request);
+
+    var out: [8192]u8 = undefined;
+    const n = try h2cUpgradeToServer(running.port, request, &.{}, &out);
+    try std.testing.expect(std.mem.startsWith(u8, out[0..n], "HTTP/1.1 101"));
+    const wire = try h2cWireAfter101(out[0..n]);
+
+    const goaway = h2FindFrame(wire, .goaway, 0) orelse return error.NoGoAwayForShortSettingsPayload;
+    const info = try Http2.decodeGoAway(goaway.payload);
+    try std.testing.expectEqual(Http2.ErrorCode.FRAME_SIZE_ERROR, info.error_code);
+    try std.testing.expectEqual(@as(usize, 0), h2CountFrames(wire, .headers, 1));
+    try std.testing.expectEqual(@as(usize, 0), h2CountFrames(wire, .data, 1));
+}
+
+// --- H1 response framing over loopback ---
+//
+// The field section `writeResponse` builds is the one thing H1 and H2 do not
+// share, so these drive it through a socket rather than calling it: the shapes
+// that matter (`Content-Length` twice, a body under `HEAD`) only exist on the
+// wire.
+
+/// One HTTP/1.1 exchange against a running `Server`: send `request`, then read
+/// until EOF (the caller's `Connection: close` is what ends it). The reply is a
+/// subslice of `out`.
+fn h1RawExchange(port: u16, request: []const u8, out: []u8) ![]const u8 {
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+    var stream = try addr.connect(std.testing.io, .{ .mode = .stream });
+    defer stream.close(std.testing.io);
+
+    try sockread.writeFull(stream, request);
+
+    var total: usize = 0;
+    while (total < out.len) {
+        var fds = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&fds, 3000) catch break;
+        if (ready == 0) break;
+        const n = std.posix.read(stream.socket.handle, out[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    return out[0..total];
+}
+
+/// Values of every `name` field line in `response`'s field section, in wire
+/// order. A count is what a duplicate-framing assertion needs: `indexOf != null`
+/// cannot tell one `Content-Length` from two.
+fn h1HeaderValues(allocator: std.mem.Allocator, response: []const u8, name: []const u8) ![][]const u8 {
+    const head_end = std.mem.indexOf(u8, response, "\r\n\r\n") orelse response.len;
+    var values = std.ArrayList([]const u8).empty;
+    errdefer values.deinit(allocator);
+    var lines = std.mem.splitSequence(u8, response[0..head_end], "\r\n");
+    _ = lines.next(); // status line
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), name)) {
+            try values.append(allocator, std.mem.trim(u8, line[colon + 1 ..], " \t"));
+        }
+    }
+    return values.toOwnedSlice(allocator);
+}
+
+/// The bytes after the field section of an H1 response.
+fn h1Body(response: []const u8) []const u8 {
+    const end = std.mem.indexOf(u8, response, "\r\n\r\n") orelse return "";
+    return response[end + 4 ..];
+}
+
+test "a handler's Content-Length is written once, not twice" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h1-content-length" });
+    defer server.deinit();
+
+    var group = server.group("");
+    // `StaticFiles` sets the field itself on the non-streamed path (the file
+    // length), and that is the length the client has to see. `writeResponse`
+    // used to append the server's own next to it, so the wire carried two
+    // framing fields — `Content-Length: 17` and `Content-Length: 17` here, and
+    // `17` next to `0` on the `HEAD` shape below.
+    try group.get("cl", struct {
+        fn h(ctx: *Context) anyerror!void {
+            try ctx.setHeader("Content-Length", "17");
+            try ctx.text(200, "small static body");
+        }
+    }.h, null);
+    try group.head("clh", struct {
+        fn h(ctx: *Context) anyerror!void {
+            try ctx.setHeader("Content-Length", "17");
+            ctx.responded = true;
+        }
+    }.h, null);
+    // The same field with a value that does not describe the body: it is the
+    // handler's bug, and sending it next to the server's own would put two
+    // disagreeing framing fields on the wire.
+    try group.get("cllie", struct {
+        fn h(ctx: *Context) anyerror!void {
+            try ctx.setHeader("Content-Length", "999");
+            try ctx.text(200, "small static body");
+        }
+    }.h, null);
+
+    var running = try H2TestServer.start(&server);
+    defer running.stop(&server);
+
+    var out: [4096]u8 = undefined;
+    {
+        const response = try h1RawExchange(running.port, "GET /cl HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+        try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200"));
+        const values = try h1HeaderValues(allocator, response, "content-length");
+        defer allocator.free(values);
+        try std.testing.expectEqual(@as(usize, 1), values.len);
+        try std.testing.expectEqualStrings("17", values[0]);
+        try std.testing.expectEqualStrings("small static body", h1Body(response));
+    }
+    {
+        // The static-files `HEAD`: the entity length is declared, no body is
+        // written. One field, and it is the entity's.
+        const response = try h1RawExchange(running.port, "HEAD /clh HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+        try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200"));
+        const values = try h1HeaderValues(allocator, response, "content-length");
+        defer allocator.free(values);
+        try std.testing.expectEqual(@as(usize, 1), values.len);
+        try std.testing.expectEqualStrings("17", values[0]);
+        try std.testing.expectEqualStrings("", h1Body(response));
+    }
+    {
+        // A declaration that disagrees with the octets is dropped, not written:
+        // the remaining field is the one that frames this body.
+        const response = try h1RawExchange(running.port, "GET /cllie HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+        try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200"));
+        const values = try h1HeaderValues(allocator, response, "content-length");
+        defer allocator.free(values);
+        try std.testing.expectEqual(@as(usize, 1), values.len);
+        try std.testing.expectEqualStrings("17", values[0]);
+        try std.testing.expectEqualStrings("small static body", h1Body(response));
+    }
+}
+
+test "declaredContentLength reads only a real 1*DIGIT length" {
+    const allocator = std.testing.allocator;
+    var headers = std.StringHashMap([]const u8).init(allocator);
+    defer headers.deinit();
+
+    // Absent: the server frames the body itself.
+    try std.testing.expectEqual(@as(?usize, null), declaredContentLength(headers));
+    // A handler's value, under the spelling a handler actually uses.
+    try headers.put("Content-Length", "17");
+    try std.testing.expectEqual(@as(?usize, 17), declaredContentLength(headers));
+    _ = headers.remove("Content-Length");
+    // `1_7` is not a length: Zig's `parseInt` takes `_` as a digit separator
+    // and would read it as 17, which is not what goes on the wire.
+    try headers.put("content-length", "1_7");
+    try std.testing.expectEqual(@as(?usize, null), declaredContentLength(headers));
+    _ = headers.remove("content-length");
+    // Nor is a padded or signed value; the lookup itself is case-insensitive.
+    try headers.put("content-length", " 17");
+    try std.testing.expectEqual(@as(?usize, null), declaredContentLength(headers));
+    _ = headers.remove("content-length");
+    try headers.put("Content-Length", "+17");
+    try std.testing.expectEqual(@as(?usize, null), declaredContentLength(headers));
+}
+
+test "a response to HEAD carries the entity length and no body bytes" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h1-head-body" });
+    defer server.deinit();
+
+    var group = server.group("");
+    try group.head("headbody", struct {
+        fn h(ctx: *Context) anyerror!void {
+            try ctx.text(200, "eleven byte");
+        }
+    }.h, null);
+
+    var running = try H2TestServer.start(&server);
+    defer running.stop(&server);
+
+    var out: [4096]u8 = undefined;
+    const response = try h1RawExchange(running.port, "HEAD /headbody HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200"));
+
+    // The field section of the `GET` response, and nothing after it: RFC 9110
+    // §9.3.2 forbids a body under `HEAD`, and the 11 octets a client would have
+    // to skip are exactly what desynchronises a keep-alive connection.
+    const values = try h1HeaderValues(allocator, response, "content-length");
+    defer allocator.free(values);
+    try std.testing.expectEqual(@as(usize, 1), values.len);
+    try std.testing.expectEqualStrings("11", values[0]);
+    try std.testing.expectEqualStrings("", h1Body(response));
 }

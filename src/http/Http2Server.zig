@@ -1070,6 +1070,13 @@ fn fillUpgradeStream(allocator: std.mem.Allocator, st: *StreamState, req: Upgrad
     st.method = try allocator.dupe(u8, req.method);
     st.path = try allocator.dupe(u8, req.target);
     st.headers_done = true;
+    // Not "the request had no body". The HTTP/1.1 request was read to its end
+    // before the session started — `Content-Length` is the only body framing
+    // this server accepts, and the parser buffered all of it — so there is
+    // nothing left for the peer to send on **any** method. RFC 7540 §3.2 makes
+    // stream 1 implicitly half-closed (remote) for exactly that reason, a `POST`
+    // with a body included; a session that waited for DATA frames would hang on
+    // a request whose body it is already holding.
     st.end_stream = true;
     if (req.body.len > 0) try st.data.appendSlice(allocator, req.body);
 
@@ -1640,6 +1647,9 @@ fn buildStreamResponseWire(
     peer_max_header_list: ?u32,
     opts: ServeOptions,
 ) ![]u8 {
+    // A `HEAD` request is answered with the same field section and no body
+    // (RFC 9113 §8.2) — see `encodeSiteResponseWire`'s `no_body`.
+    const no_body = std.mem.eql(u8, st.method, "HEAD");
     const is_grpc = std.mem.indexOf(u8, st.content_type, "application/grpc") != null;
     if (is_grpc) {
         if (opts.grpc_registry) |reg| {
@@ -1694,12 +1704,28 @@ fn buildStreamResponseWire(
         var resp = try handler(opts.site_user_ctx, allocator, st.method, st.path, hdrs, st.data.items);
         defer resp.deinit(allocator);
         const budget = responseHeaderBudget(opts, peer_max_header_list, conn_max_frame_size);
-        return try encodeSiteResponseWire(allocator, stream_id, resp.status, resp.content_type, resp.headers, resp.body, budget);
+        return try encodeSiteResponseWire(
+            allocator,
+            stream_id,
+            resp.status,
+            resp.content_type,
+            resp.headers,
+            resp.body,
+            budget,
+            // `HEAD`: the field section of the `GET` response and no body at all
+            // (RFC 9110 §9.3.2 for H1, RFC 9113 §8.2 for H2, where the response
+            // ends at HEADERS with END_STREAM). `resp.body` is still the entity
+            // the handler produced, so a declared `content-length` is judged
+            // against what a `GET` would have sent.
+            no_body,
+        );
     }
 
-    // No site handler: the loop's own 404, with no extras to budget for.
+    // No site handler: the loop's own 404, with no extras to budget for. A
+    // `HEAD` 404 is a field section and nothing else, like every other `HEAD`
+    // response on this connection.
     const budget = responseHeaderBudget(opts, peer_max_header_list, conn_max_frame_size);
-    return try encodeSiteResponseWire(allocator, stream_id, 404, "text/plain", &.{}, "not found", budget);
+    return try encodeSiteResponseWire(allocator, stream_id, 404, "text/plain", &.{}, "not found", budget, no_body);
 }
 
 /// Caps on the response header block. The inbound side has the same knobs
@@ -1769,6 +1795,12 @@ const DropReport = struct {
     }
 };
 
+/// `body` is the entity the handler produced and `no_body` is a `HEAD` request:
+/// the field section is built from the entity either way — so a declared
+/// `content-length` is still judged against the length a `GET` would have sent —
+/// while the octets are dropped and the HEADERS frame carries END_STREAM in
+/// place of a DATA frame (RFC 9110 §9.3.2, RFC 9113 §8.2). Sending the body
+/// under `HEAD` gives the client bytes it has no reason to skip.
 fn encodeSiteResponseWire(
     allocator: std.mem.Allocator,
     stream_id: u31,
@@ -1777,12 +1809,16 @@ fn encodeSiteResponseWire(
     extra: []const Hpack.Header,
     body: []const u8,
     budget: ResponseHeaderBudget,
+    no_body: bool,
 ) ![]u8 {
     const status_str = try std.fmt.allocPrint(allocator, "{d}", .{status});
     defer allocator.free(status_str);
     const block = try assembleSiteResponseBlock(allocator, status_str, content_type, extra, body.len, budget);
     defer allocator.free(block);
-    const h = try Http2.encodeHeaders(allocator, stream_id, block, false, true);
+    // A response with no body ends on its HEADERS frame: the stream is closed
+    // there, and a zero-length DATA frame would be a body frame that is not one.
+    const h = try Http2.encodeHeaders(allocator, stream_id, block, no_body, true);
+    if (no_body) return h;
     defer allocator.free(h);
     const d = try Http2.encodeData(allocator, stream_id, body, true);
     defer allocator.free(d);
@@ -2077,6 +2113,53 @@ test "StreamState ready requires headers and end_stream" {
     try std.testing.expect(st.ready());
 }
 
+test "fillUpgradeStream releases every partial allocation when one fails" {
+    const base = std.testing.allocator;
+    const headers = [_]Hpack.Header{
+        .{ .name = "content-type", .value = "application/json" },
+        .{ .name = "x-tenant", .value = "acme" },
+    };
+
+    // Every allocation of the seeding function in turn: the ones before it
+    // succeeded and the ones after it never ran, so what this exercises is the
+    // unwind — an allocator that fails at index N has to leave a `StreamState`
+    // the caller can still `deinit`, with nothing owned twice and nothing
+    // dropped. `base` is the testing allocator, so a missed free fails the run
+    // instead of hiding in a counter.
+    var failures: usize = 0;
+    var fail_index: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(base, .{ .fail_index = fail_index });
+        const allocator = failing.allocator();
+
+        var st = StreamState.init();
+        fillUpgradeStream(allocator, &st, .{
+            .method = "POST",
+            .target = "/upgrade?a=1",
+            .authority = "example.test",
+            .headers = &headers,
+            .body = "hello",
+        }) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            st.deinit(allocator);
+            failures += 1;
+            continue;
+        };
+        // Past the last allocation in the function: nothing failed, so the
+        // stream is the whole upgrade request and the loop is done.
+        try std.testing.expectEqualStrings("POST", st.method);
+        try std.testing.expectEqualStrings("/upgrade?a=1", st.path);
+        try std.testing.expectEqualStrings("hello", st.data.items);
+        st.deinit(allocator);
+        break;
+    }
+
+    // Both outcomes were reached: at least one allocation was refused, and the
+    // loop ran off the end of the function's allocations.
+    try std.testing.expect(failures > 0);
+    try std.testing.expect(fail_index < 64);
+}
+
 test "inbound DATA decrements conn and stream recv windows" {
     var conn = Http2.FlowControlState.init(Http2.default_initial_window_size);
     var stream = Http2.FlowControlState.init(Http2.default_initial_window_size);
@@ -2128,7 +2211,7 @@ test "PriorityTree pickNext favors high-weight among ready streams" {
 
 test "encodeSiteResponseWire is headers then data" {
     const allocator = std.testing.allocator;
-    const wire = try encodeSiteResponseWire(allocator, 7, 200, "text/plain", &.{}, "ok", .{});
+    const wire = try encodeSiteResponseWire(allocator, 7, 200, "text/plain", &.{}, "ok", .{}, false);
     defer allocator.free(wire);
     const f0 = try Http2.decodeFrame(wire);
     try std.testing.expectEqual(Http2.FrameType.headers, f0.header.typ);
@@ -2136,6 +2219,28 @@ test "encodeSiteResponseWire is headers then data" {
     const f1 = try Http2.decodeFrame(wire[9 + f0.header.length ..]);
     try std.testing.expectEqual(Http2.FrameType.data, f1.header.typ);
     try std.testing.expectEqualStrings("ok", f1.payload);
+}
+
+test "encodeSiteResponseWire answers HEAD with END_STREAM and no DATA frame" {
+    const allocator = std.testing.allocator;
+    const extra = [_]Hpack.Header{.{ .name = "Content-Length", .value = "2" }};
+    const wire = try encodeSiteResponseWire(allocator, 1, 200, "text/plain", &extra, "ok", .{}, true);
+    defer allocator.free(wire);
+
+    // The whole message is the HEADERS frame: END_STREAM takes the place of the
+    // DATA frame, so the client never sees body octets under `HEAD` (RFC 9113
+    // §8.2) and the stream still closes.
+    const f0 = try Http2.decodeFrame(wire);
+    try std.testing.expectEqual(Http2.FrameType.headers, f0.header.typ);
+    try std.testing.expect((f0.header.flags & Http2.FrameFlags.end_stream) != 0);
+    try std.testing.expectEqual(wire.len, 9 + @as(usize, f0.header.length));
+
+    const hdrs = try decodeSiteResponseFields(allocator, wire);
+    defer Hpack.freeHeaders(allocator, hdrs);
+    try std.testing.expectEqualStrings("200", firstHeaderValue(hdrs, ":status").?);
+    // The entity length, not the zero octets this message carries: a `HEAD`
+    // response declares what the `GET` would have sent.
+    try std.testing.expectEqualStrings("2", firstHeaderValue(hdrs, "content-length").?);
 }
 
 /// Decode the HEADERS frame of a site-response wire and return its fields.
@@ -2175,7 +2280,7 @@ test "encodeSiteResponseWire carries handler fields, lowercased, and only one co
         .{ .name = "X-Split", .value = "a\r\nX-Injected: 1" },
         .{ .name = "X-Padded", .value = "v1 " },
     };
-    const wire = try encodeSiteResponseWire(allocator, 1, 429, "text/plain", &extra, "ok", .{});
+    const wire = try encodeSiteResponseWire(allocator, 1, 429, "text/plain", &extra, "ok", .{}, false);
     defer allocator.free(wire);
     const hdrs = try decodeSiteResponseFields(allocator, wire);
     defer Hpack.freeHeaders(allocator, hdrs);
@@ -2200,7 +2305,7 @@ test "encodeSiteResponseWire carries handler fields, lowercased, and only one co
 test "encodeSiteResponseWire drops a content-length that disagrees with the body" {
     const allocator = std.testing.allocator;
     const extra = [_]Hpack.Header{.{ .name = "Content-Length", .value = "9999" }};
-    const wire = try encodeSiteResponseWire(allocator, 1, 200, "text/plain", &extra, "ok", .{});
+    const wire = try encodeSiteResponseWire(allocator, 1, 200, "text/plain", &extra, "ok", .{}, false);
     defer allocator.free(wire);
     const hdrs = try decodeSiteResponseFields(allocator, wire);
     defer Hpack.freeHeaders(allocator, hdrs);
@@ -2228,7 +2333,7 @@ test "encodeSiteResponseWire never builds a HEADERS block past the peer's frame 
     // ~8 KiB of extras against a 600-byte frame cap: the block has to be
     // truncated, and the result still a single, sendable HEADERS frame.
     const cap: usize = 600;
-    const wire = try encodeSiteResponseWire(allocator, 1, 200, "text/plain", &extra, "ok", .{ .max_block_bytes = cap });
+    const wire = try encodeSiteResponseWire(allocator, 1, 200, "text/plain", &extra, "ok", .{ .max_block_bytes = cap }, false);
     defer allocator.free(wire);
     const f = try Http2.decodeFrame(wire);
     try std.testing.expectEqual(Http2.FrameType.headers, f.header.typ);
@@ -2257,7 +2362,7 @@ test "encodeSiteResponseWire enforces the response header count and list budgets
 
     // `:status` + `content-type` + one extra = 3 fields.
     {
-        const wire = try encodeSiteResponseWire(allocator, 1, 200, "text/plain", &extra, "ok", .{ .max_count = 3 });
+        const wire = try encodeSiteResponseWire(allocator, 1, 200, "text/plain", &extra, "ok", .{ .max_count = 3 }, false);
         defer allocator.free(wire);
         const hdrs = try decodeSiteResponseFields(allocator, wire);
         defer Hpack.freeHeaders(allocator, hdrs);
@@ -2267,7 +2372,7 @@ test "encodeSiteResponseWire enforces the response header count and list budgets
 
     // 42 + 54 bytes for the mandatory pair, so a 40-byte extra no longer fits.
     {
-        const wire = try encodeSiteResponseWire(allocator, 1, 200, "text/plain", &extra, "ok", .{ .max_list_bytes = 100 });
+        const wire = try encodeSiteResponseWire(allocator, 1, 200, "text/plain", &extra, "ok", .{ .max_list_bytes = 100 }, false);
         defer allocator.free(wire);
         const hdrs = try decodeSiteResponseFields(allocator, wire);
         defer Hpack.freeHeaders(allocator, hdrs);

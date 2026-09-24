@@ -323,11 +323,17 @@ pub const BatchInsertOptions = struct {
 /// interleave with.
 ///
 /// Observability: acquiring a cursor is reported like any other read (metrics
-/// callback + circuit breaker, see `Client.queryCursorEx`). Reading one is not —
-/// a cursor has no `sql_str` to key a meter on — except that a pooled stream
-/// which broke while draining is counted as a read failure against the owning
-/// client's breaker. A driver failure *while fetching* is not metered either;
-/// it is returned to the caller by `next`.
+/// callback + circuit breaker, see `Client.queryCursorEx`). Reading one is
+/// reported to the circuit breaker — but not to the meter: a driver failure
+/// while fetching is counted once against the owning client's breaker (as is a
+/// pooled stream that broke while draining), while the metrics callback stays
+/// with acquisition because it is keyed by the statement text. `sql_str`
+/// belongs to the caller and has no promised lifetime (`src/ai/business.zig`
+/// passes a scratch buffer's `items`), so the cursor can neither borrow it nor
+/// keep an index into it; copying it once per cursor was rejected as a
+/// permanent allocation on every acquisition, paid for a failure most cursors
+/// never hit — see `bookFailure`. The failure itself is not lost: `next`
+/// returns it to the caller.
 pub const Cursor = struct {
     state: State,
     pos: usize = 0,
@@ -335,6 +341,15 @@ pub const Cursor = struct {
     /// cursors (rows already materialized) and for the single-connection path
     /// (that connection belongs to the `Client`, not to a pool).
     checkout: ?Checkout = null,
+    /// The client whose breaker this cursor's failures are counted against —
+    /// set by `Client.doQueryCursor`, the only place that knows it. Null only
+    /// for cursors a test built by hand. Same stability requirement as the
+    /// pool's `client` back-pointer: the address must stay valid until the
+    /// cursor is `deinit`'d, which is already the documented contract.
+    owner: ?*Client = null,
+    /// Whether this cursor already counted a failure, so `deinit` does not
+    /// count the same break a second time.
+    booked_failure: bool = false,
 
     const State = union(enum) {
         buffered: Rows,
@@ -367,24 +382,44 @@ pub const Cursor = struct {
             if (co.conn.ping()) |_| {
                 co.pool.release(co.conn);
             } else |err| {
-                // A stream that broke while draining is what a cursor
-                // contributes to the breaker. `next` reports a mid-stream
-                // driver failure to its caller rather than folding it into "no
-                // more rows", but it cannot book one: the meter is keyed by
-                // statement (`sql_str` belongs to the caller, not to the
-                // cursor) and copying it on the chance that `deinit` reports
-                // would put an allocation on every cursor's hot path. This is
-                // also where the connection's end state is visible, so a stream
-                // that stopped because the server or the socket died is seen
-                // here as a failed `ping`. Same filter as the acquisition used
-                // (`isAcceptable`), so the acceptable-error rule stays "never
-                // counted, on either path".
-                const client = co.pool.client;
-                if (!client.isAcceptable(err)) client.cb.recordFailure(client.io);
+                // The half of "the stream broke" that `next` cannot see: a
+                // cursor drained or abandoned over a connection that died, where
+                // no `next` call ever returned an error to book. The end state
+                // of the connection is visible here as a failed `ping`, and it
+                // is the same filter and the same once-per-cursor rule the fetch
+                // side uses (`bookFailure`), so a break `next` already counted
+                // is not counted twice.
+                self.bookFailure(err);
                 co.pool.discard(co.conn);
             }
         }
         self.* = undefined;
+    }
+
+    /// Count `err` as a failed read attempt against the owning client's breaker,
+    /// at most once per cursor.
+    ///
+    /// Called from both ends of a cursor's life: `next` on a driver failure in
+    /// the middle of a result, and `deinit` when the connection turns out to be
+    /// dead after the drain. Both are read attempts that failed, and the
+    /// acquisition path (`Client.queryCursorExPrimary`) counts exactly that
+    /// class — a client whose streamed statements keep dying at row N has to be
+    /// able to trip its breaker, or replica routing keeps sending reads to a
+    /// backend that cannot serve them.
+    ///
+    /// Nothing is allocated here and no statement text is needed: the breaker is
+    /// per client, not per statement. That is what makes booking the use phase
+    /// affordable, and it is also the whole reason the metrics callback is not
+    /// fed here — the meter is keyed by `sql_str`, which the cursor does not own
+    /// (see the `Cursor` doc comment).
+    fn bookFailure(self: *Cursor, err: anyerror) void {
+        if (self.booked_failure) return;
+        const client = self.owner orelse return;
+        // Same filter as acquisition, so the acceptable-error rule stays "never
+        // counted, on either path".
+        if (client.isAcceptable(err)) return;
+        client.cb.recordFailure(client.io);
+        self.booked_failure = true;
     }
 
     /// True when rows are pulled from the driver on demand, i.e. this cursor
@@ -404,8 +439,19 @@ pub const Cursor = struct {
     /// never as `null`: "the row source broke" and "the rows ran out" are
     /// different events, and a caller that cannot tell them apart reports a
     /// truncated result as a complete one. `try` on the result is therefore not
-    /// optional bookkeeping — it is what makes the short read visible.
+    /// optional bookkeeping — it is what makes the short read visible. The same
+    /// failure is counted against the owning client's breaker on its way out
+    /// (`bookFailure`), because the caller that sees it may be the only other
+    /// party that ever will.
     pub fn next(self: *Cursor) errors.ResultT(?*Row) {
+        return self.fetchNext() catch |err| {
+            self.bookFailure(err);
+            return err;
+        };
+    }
+
+    /// The fetching half of `next`, with none of the failure bookkeeping.
+    fn fetchNext(self: *Cursor) errors.ResultT(?*Row) {
         switch (self.state) {
             .buffered => |*rows| {
                 if (self.pos >= rows.rows.len) return null;
@@ -2927,6 +2973,26 @@ fn formatQuery(allocator: std.mem.Allocator, sql: []const u8, args: []const Valu
 /// with no result set (field_count == 0, e.g. INSERT), or an **empty SELECT** (errno == 0,
 /// field_count > 0). The last case must yield zero rows, not `DatabaseError`.
 /// Caller owns `arena` and should `errdefer arena.deinit()` until `Rows` is returned.
+///
+/// The two kinds of failure are kept apart: a failure of the arena allocations
+/// below is the caller's allocator failing and comes back as `error.OutOfMemory`
+/// — the name `Error.zig` documents this file as producing for "arena/dupe
+/// failures while scanning rows" — while a failed fetch or field lookup is the
+/// driver failing and stays `error.DatabaseError`. Folding the first kind into
+/// the second made running out of memory indistinguishable from a statement the
+/// server rejected, in the metrics callback's error name, in logs, and in
+/// `toErrorContext`.
+///
+/// The fetch guards are guards, not covered branches: `res` is always a
+/// `mysql_store_result` handle, so every row is already in client memory (that
+/// is what `mysql_store_result` means) and `mysql_num_rows` is the buffered row
+/// count. `mysql_fetch_lengths` is NULL exactly when there is no current row —
+/// measured on MySQL 9.3.0: NULL before the first fetch and one fetch past the
+/// end, non-NULL after each successful fetch — and no live statement was found
+/// that makes either call fail inside this loop (see the MySQL buffered-read
+/// tests). They are here so a driver version that ever breaks that contract
+/// returns an error instead of dereferencing `lengths[c]` or inventing an
+/// all-NULL row.
 fn mysqlReadRowsAfterQuery(mysql: ?*libmysql_c.MYSQL, arena: std.heap.ArenaAllocator) errors.ResultT(Rows) {
     var arena_mut = arena;
     const arena_alloc = arena_mut.allocator();
@@ -2937,40 +3003,48 @@ fn mysqlReadRowsAfterQuery(mysql: ?*libmysql_c.MYSQL, arena: std.heap.ArenaAlloc
         const n_cols = libmysql_c.mysql_num_fields(r);
         const n_rows = libmysql_c.mysql_num_rows(r);
 
-        const field_names = arena_alloc.alloc([]const u8, n_cols) catch return error.DatabaseError;
+        const field_names = try arena_alloc.alloc([]const u8, n_cols);
         for (0..n_cols) |c| {
             const field = libmysql_c.mysql_fetch_field(r) orelse return error.DatabaseError;
             const name = std.mem.span(field.name);
-            field_names[c] = arena_alloc.dupe(u8, name) catch return error.DatabaseError;
+            field_names[c] = try arena_alloc.dupe(u8, name);
         }
 
         var rows_list: std.ArrayList(Row) = std.ArrayList(Row).empty;
 
         for (0..n_rows) |_| {
-            const row_data = libmysql_c.mysql_fetch_row(r);
-            const lengths = libmysql_c.mysql_fetch_lengths(r);
-            const values = arena_alloc.alloc(?Value, n_cols) catch return error.DatabaseError;
+            const row_data = libmysql_c.mysql_fetch_row(r) orelse {
+                std.log.warn("[sqlx] MySQL buffered read ran out of rows after {d} of {d}", .{
+                    rows_list.items.len, n_rows,
+                });
+                return error.DatabaseError;
+            };
+            const lengths = libmysql_c.mysql_fetch_lengths(r) orelse {
+                std.log.warn("[sqlx] MySQL buffered read got no column lengths for a fetched row", .{});
+                return error.DatabaseError;
+            };
+            const values = try arena_alloc.alloc(?Value, n_cols);
             for (0..n_cols) |c| {
-                if (row_data == null or row_data.?[c] == null) {
+                if (row_data[c] == null) {
                     values[c] = null;
                 } else {
                     const len = lengths[c];
-                    const val = row_data.?[c].?[0..len];
-                    values[c] = .{ .string = arena_alloc.dupe(u8, val) catch return error.DatabaseError };
+                    const val = row_data[c].?[0..len];
+                    values[c] = .{ .string = try arena_alloc.dupe(u8, val) };
                 }
             }
             // Share field_names across rows (same arena lifetime).
-            rows_list.append(arena_alloc, .{ .arena = undefined, .columns = field_names, .values = values }) catch return error.DatabaseError;
+            try rows_list.append(arena_alloc, .{ .arena = undefined, .columns = field_names, .values = values });
         }
 
-        const rows_slice = arena_alloc.alloc(Row, rows_list.items.len) catch return error.DatabaseError;
+        const rows_slice = try arena_alloc.alloc(Row, rows_list.items.len);
         @memcpy(rows_slice, rows_list.items);
         return Rows{ .arena = arena_mut, .rows = rows_slice };
     }
 
     if (libmysql_c.mysql_errno(mysql) != 0) return error.DatabaseError;
     if (libmysql_c.mysql_field_count(mysql) == 0) return error.DatabaseError;
-    const rows_slice = arena_alloc.alloc(Row, 0) catch return error.DatabaseError;
+    const rows_slice = try arena_alloc.alloc(Row, 0);
     const rows = Rows{ .arena = arena_mut, .rows = rows_slice };
     return rows;
 }
@@ -4977,11 +5051,13 @@ pub const Client = struct {
     /// too, or routing keeps picking it).
     ///
     /// Both cover *acquiring* the cursor only. Row fetching happens later, in
-    /// `Cursor.next` — which reports a mid-stream failure to its caller instead
-    /// of folding it into "no more rows", but cannot meter it either (the
-    /// meter is keyed by statement, and the statement text belongs to the
-    /// caller). The one use-phase signal that does reach the breaker — a stream
-    /// that broke while draining — is booked in `Cursor.deinit`.
+    /// `Cursor.next`, which reports a mid-stream failure to its caller instead
+    /// of folding it into "no more rows" — and books that same failure against
+    /// the cursor's owning client, so the use phase is not a blind spot for the
+    /// breaker either (the acquisition above already handed the cursor the
+    /// client, and `Cursor.bookFailure` applies the same `isAcceptable` filter
+    /// and the same once-per-attempt rule). The meter stays with acquisition:
+    /// it is keyed by the statement text, which the cursor does not own.
     fn queryCursorExPrimary(self: *Client, sql_str: []const u8, args: []const Value, opts: CursorOptions) !Cursor {
         if (!self.cb.allow(self.io)) return error.CircuitBreakerOpen;
 
@@ -4999,7 +5075,10 @@ pub const Client = struct {
     }
 
     /// Cursor acquisition over the pool / single connection — the `queryCursorEx`
-    /// analogue of `doQuery` (same shape, `CursorOptions` forwarded).
+    /// analogue of `doQuery` (same shape, `CursorOptions` forwarded). Both
+    /// branches hand the cursor its owning client: failures that happen *after*
+    /// acquisition (mid-stream driver errors) are booked against that client's
+    /// breaker, and this is the only place that knows which client that is.
     fn doQueryCursor(self: *Client, sql_str: []const u8, args: []const Value, opts: CursorOptions) !Cursor {
         self.ensurePool();
         if (self.pool) |*p| {
@@ -5014,6 +5093,7 @@ pub const Client = struct {
                 p.release(conn);
                 return err;
             };
+            cursor.owner = self;
             if (cursor.isStreaming()) {
                 cursor.checkout = .{ .pool = p, .conn = conn };
             } else {
@@ -5024,13 +5104,15 @@ pub const Client = struct {
             return cursor;
         }
         if (self.conn == null) try self.connect();
-        return self.conn.?.queryCursor(self.allocator, sql_str, args, opts) catch |err| {
+        var cursor = self.conn.?.queryCursor(self.allocator, sql_str, args, opts) catch |err| blk: {
             std.log.err("queryCursorEx failed, reconnecting: {s}", .{@errorName(err)});
             self.conn.?.close();
             self.conn = null;
             try self.connect();
-            return self.conn.?.queryCursor(self.allocator, sql_str, args, opts);
+            break :blk try self.conn.?.queryCursor(self.allocator, sql_str, args, opts);
         };
+        cursor.owner = self;
+        return cursor;
     }
 
     fn doExec(self: *Client, sql_str: []const u8, args: []const Value) !ExecResult {
@@ -8676,6 +8758,11 @@ test "streaming PG cursor reports a mid-stream server error instead of ending th
     // SQLSTATE table, so it maps to the generic driver failure — the same
     // mapping the acquisition path would apply to the same statement.
     try std.testing.expectError(error.DatabaseError, cursor.next());
+    // `Cursor.next` does not only return the error: the cursor books it against
+    // the client that handed it out, on the same filter and the same
+    // once-per-attempt rule the acquisition path uses (`Cursor.bookFailure`).
+    // The statement never ran, so nothing else has counted it.
+    try std.testing.expectEqual(@as(u32, 1), db.cb.failure_count);
 }
 
 // The other half of the same contract: a stream that broke mid-result must not
@@ -8912,6 +8999,105 @@ test "mysql pooled client stays usable after a streaming cursor fails mid-result
     try std.testing.expectEqual(@as(i64, 42), after.n);
 }
 
+// A mid-result failure is a failed *read attempt*, and the cursor is the only
+// party that sees it — the caller gets the error and nothing else happens. The
+// acquisition path books exactly this class of event (`queryCursorExPrimary`
+// counts every failure `isAcceptable` rejects), so the same statement dying at
+// row 3 was invisible: metrics untouched, and the breaker never learned that
+// this client cannot serve the read. Replica routing reads that breaker.
+//
+// The pooled client is the case `deinit`'s ping cannot cover: 1242 is a
+// server-side error, so the socket stays healthy and the drain books nothing.
+test "mysql streaming cursor books a mid-stream failure against its client's breaker" {
+    try skipUnlessDb("mysql");
+    const allocator = std.testing.allocator;
+    var db = Client.init(allocator, std.testing.io, mysqlLiveConfig());
+    defer db.deinit();
+    try db.connect();
+    try std.testing.expectEqual(@as(u32, 0), db.cb.failure_count);
+
+    var cursor = try db.queryCursorEx(mysql_midstream_sql, &.{}, .{ .mode = .streaming });
+    try std.testing.expectEqualStrings("1", (try cursor.next()).?.get("q").?.string);
+    try std.testing.expectEqualStrings("2", (try cursor.next()).?.get("q").?.string);
+    try std.testing.expectError(error.DatabaseError, cursor.next());
+    try std.testing.expectEqual(@as(u32, 1), db.cb.failure_count);
+
+    // One failed attempt, one count: `deinit` drains and pings the same
+    // connection, and that drain must not book the break a second time.
+    cursor.deinit();
+    try std.testing.expectEqual(@as(u32, 1), db.cb.failure_count);
+}
+
+// The same contract on the path that has no pool at all: `max_open_conns = 1`
+// keeps the connection on the `Client`, so `Cursor.deinit` has no checkout to
+// inspect and `next` is the only place this failure can ever be counted.
+test "mysql single-connection cursor books a mid-stream failure too" {
+    try skipUnlessDb("mysql");
+    const allocator = std.testing.allocator;
+    var cfg = mysqlLiveConfig();
+    cfg.max_open_conns = 1;
+    var client = Client.init(allocator, std.testing.io, cfg);
+    defer client.deinit();
+    try client.connect();
+    try std.testing.expect(client.pool == null);
+
+    var cursor = try client.queryCursorEx(mysql_midstream_sql, &.{}, .{ .mode = .streaming });
+    try std.testing.expectEqualStrings("1", (try cursor.next()).?.get("q").?.string);
+    try std.testing.expectEqualStrings("2", (try cursor.next()).?.get("q").?.string);
+    try std.testing.expectError(error.DatabaseError, cursor.next());
+    try std.testing.expectEqual(@as(u32, 1), client.cb.failure_count);
+    cursor.deinit();
+
+    // The connection outlives the broken stream: the next statement on it still
+    // works, and its success resets the count as any successful read would.
+    const after = try client.queryRow(struct { n: i64 }, "SELECT 42 AS n", &.{});
+    try std.testing.expectEqual(@as(i64, 42), after.n);
+    try std.testing.expectEqual(@as(u32, 0), client.cb.failure_count);
+}
+
+// The buffered MySQL read path is where every non-cursor MySQL query lands
+// (`MySqlConn.queryFn` builds its `Rows` in a caller-owned arena and does
+// `errdefer arena.deinit()`), and its *allocation* failures used to be folded
+// into `error.DatabaseError` — the name the driver also uses for a statement
+// the server rejected. The row buffer is built in that arena, so an allocation
+// failure there is a process problem, not a database one, and `Error.zig`'s
+// taxonomy says so explicitly ("OutOfMemory … Produced by `toErrorContext` and
+// by `src/sqlx/sqlx.zig` (arena/dupe failures while scanning rows)").
+//
+// Driving the function directly is what makes the failure injectable: the
+// arena is the caller's, so a `FailingAllocator` under it fails the *first*
+// row-buffer allocation while the statement and its result handle are real
+// (`MySqlConn.connect` + `mysql_real_query`, the same two calls `queryFn`
+// makes). Through `Client.query` there is no seam — the client owns the
+// allocator — and a failure at *connect* time would be the only reachable one.
+test "mysql buffered read reports an allocation failure as OutOfMemory" {
+    try skipUnlessDb("mysql");
+    const allocator = std.testing.allocator;
+    const cfg = mysqlLiveConfig();
+    var raw = try MySqlConn.connect(allocator, cfg.host, cfg.username, cfg.password, cfg.database, cfg.port);
+    defer {
+        raw.stmt_cache.deinit();
+        libmysql_c.mysql_close(raw.mysql);
+    }
+
+    const sql = "SELECT 1 AS a, 2 AS b";
+    try std.testing.expectEqual(@as(c_int, 0), libmysql_c.mysql_real_query(raw.mysql, @ptrCast(sql.ptr), @intCast(sql.len)));
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var arena = std.heap.ArenaAllocator.init(failing.allocator());
+    defer arena.deinit();
+    try std.testing.expectError(error.OutOfMemory, mysqlReadRowsAfterQuery(raw.mysql, arena));
+    try std.testing.expect(failing.has_induced_failure);
+
+    // The error unwinds through the `defer mysql_free_result` in that function,
+    // so the connection is idle on the wire again rather than holding a
+    // half-consumed result — the next statement on it must work.
+    try std.testing.expectEqual(@as(c_int, 0), libmysql_c.mysql_real_query(raw.mysql, @ptrCast(sql.ptr), @intCast(sql.len)));
+    const res = libmysql_c.mysql_store_result(raw.mysql) orelse return error.DatabaseError;
+    defer libmysql_c.mysql_free_result(res);
+    try std.testing.expectEqual(@as(c_ulonglong, 1), libmysql_c.mysql_num_rows(res));
+}
+
 /// Minimal `Conn` whose `ping`/`close` are observable — enough to drive
 /// `Cursor.deinit`'s checkout handling without a live driver.
 const CursorTestConn = struct {
@@ -8960,7 +9146,9 @@ const cursor_test_vtable = Conn.VTable{
 
 /// A `.streaming` cursor as the drivers build it, except the driver half is
 /// inert (`conn = null`) so the checkout half can be exercised on its own.
-fn testStreamingCursor(state: *CursorTestConn, pool: *ConnPool, allocator: std.mem.Allocator) Cursor {
+/// `owner` is what `Client.doQueryCursor` would have set: the client whose
+/// breaker a use-phase failure is counted against.
+fn testStreamingCursor(state: *CursorTestConn, pool: *ConnPool, allocator: std.mem.Allocator, owner: ?*Client) Cursor {
     return .{
         .state = .{ .streaming_pg = .{
             .conn = null,
@@ -8972,6 +9160,7 @@ fn testStreamingCursor(state: *CursorTestConn, pool: *ConnPool, allocator: std.m
             .eof = true,
         } },
         .checkout = .{ .pool = pool, .conn = .{ .ptr = state, .vtable = &cursor_test_vtable } },
+        .owner = owner,
     };
 }
 
@@ -8990,7 +9179,7 @@ test "cursor deinit returns its pooled connection or retires a broken one" {
     // While a streaming cursor is alive its connection is *its own*: nobody
     // else may be handed the same socket with rows still on it.
     var state = CursorTestConn{};
-    var cursor = testStreamingCursor(&state, pool, allocator);
+    var cursor = testStreamingCursor(&state, pool, allocator, &db);
     try std.testing.expect(cursor.isStreaming());
     try std.testing.expectEqual(@as(u64, 0), pool.metrics().total_released);
     try std.testing.expectEqual(@as(u32, 0), pool.metrics().current_idle);
@@ -9007,7 +9196,7 @@ test "cursor deinit returns its pooled connection or retires a broken one" {
     // protocol state is unknown, so the next borrower would read this query's
     // leftover frames.
     var dead = CursorTestConn{ .healthy = false };
-    var dead_cursor = testStreamingCursor(&dead, pool, allocator);
+    var dead_cursor = testStreamingCursor(&dead, pool, allocator, &db);
     dead_cursor.deinit();
     try std.testing.expect(dead.closed);
     try std.testing.expectEqual(@as(u32, 1), pool.metrics().current_idle);
@@ -9164,7 +9353,7 @@ test "cursor deinit books a broken stream against the owning client's breaker" {
 
     // A cursor that ends cleanly leaves the breaker alone.
     var state = CursorTestConn{};
-    var cursor = testStreamingCursor(&state, pool, allocator);
+    var cursor = testStreamingCursor(&state, pool, allocator, &db);
     cursor.deinit();
     try std.testing.expectEqual(@as(u32, 0), db.cb.failure_count);
 
@@ -9172,10 +9361,67 @@ test "cursor deinit books a broken stream against the owning client's breaker" {
     // retired (see the checkout test) *and* the attempt is counted, so a client
     // whose cursors keep breaking trips its breaker instead of looping.
     var dead = CursorTestConn{ .healthy = false };
-    var dead_cursor = testStreamingCursor(&dead, pool, allocator);
+    var dead_cursor = testStreamingCursor(&dead, pool, allocator, &db);
     dead_cursor.deinit();
     try std.testing.expect(dead.closed);
     try std.testing.expectEqual(@as(u32, 1), db.cb.failure_count);
+}
+
+test "cursor counts one failed attempt per broken stream, not one per sighting" {
+    const allocator = std.testing.allocator;
+    var db = Client.init(allocator, std.testing.io, .{
+        .driver = .sqlite,
+        .sqlite_path = ":memory:",
+        .max_open_conns = 2,
+        .max_idle_conns = 2,
+    });
+    defer db.deinit();
+    db.ensurePool();
+    const pool = &db.pool.?;
+
+    // Both ends of the cursor can see the same break: `next` reports it from the
+    // driver (`bookFailure` is what it calls on the way out) and the drain's
+    // `ping` then fails as well, because the break that killed the fetch is what
+    // took the connection with it. That is one failed read attempt, not two —
+    // the no-double-count rule the acquisition path states as "exactly once per
+    // failed attempt".
+    //
+    // Driven through `bookFailure` rather than through a live server because the
+    // two halves have to be staged together: the live MySQL tests cover the
+    // wiring (`next` returning a driver error against a *healthy* socket, where
+    // no ping ever fails), and this covers the composition the wire cannot
+    // produce on demand.
+    var dead = CursorTestConn{ .healthy = false };
+    var cursor = testStreamingCursor(&dead, pool, allocator, &db);
+    cursor.bookFailure(error.DatabaseError);
+    try std.testing.expectEqual(@as(u32, 1), db.cb.failure_count);
+    cursor.deinit();
+    try std.testing.expect(dead.closed);
+    try std.testing.expectEqual(@as(u32, 1), db.cb.failure_count);
+
+    // The acceptance filter applies here exactly as it does at acquisition: an
+    // error the filter allows is not a failure, so neither the fetch half nor
+    // the drain half may count it.
+    const AcceptAll = struct {
+        fn f(_: anyerror) bool {
+            return true;
+        }
+    };
+    db.acceptable = AcceptAll.f;
+    var allowed_state = CursorTestConn{};
+    var allowed = testStreamingCursor(&allowed_state, pool, allocator, &db);
+    allowed.bookFailure(error.DatabaseError);
+    try std.testing.expectEqual(@as(u32, 1), db.cb.failure_count);
+    allowed.deinit();
+    try std.testing.expectEqual(@as(u32, 1), db.cb.failure_count);
+
+    // A cursor nobody handed out (`owner = null`, e.g. one a caller assembled
+    // from `Cursor.init`) has no breaker to count against, and says so instead
+    // of guessing one from the checkout.
+    var orphan = Cursor.init(.{ .arena = std.heap.ArenaAllocator.init(allocator), .rows = &.{} });
+    orphan.bookFailure(error.DatabaseError);
+    try std.testing.expectEqual(@as(u32, 1), db.cb.failure_count);
+    orphan.deinit();
 }
 
 test "libpq cancel bindings link and answer without a server" {
