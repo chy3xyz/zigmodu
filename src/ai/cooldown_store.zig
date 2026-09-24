@@ -110,7 +110,13 @@ pub const MemoryCooldownStore = struct {
 
     fn coolFn(ctx: *anyopaque, key: []const u8, ttl_ms: i64) void {
         const self = selfOf(ctx);
-        self.mutex.lock(self.io) catch return;
+        // Uncancelable: `cool` is the write that takes a failing key *out* of
+        // rotation, and the vtable gives it no error channel (`void`), so
+        // `catch return` is a silent no-op — the key keeps failing and `KeyPool`
+        // keeps selecting it. The critical section is one map operation. Red:
+        // `ai.cooldown_store.test.canceled lock wait does not lose a memory store
+        // cool, failure count or reset`.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         // ArrayHashMap stores keys by reference — own a copy on insert.
         if (self.cooling.getPtr(key)) |until| {
@@ -125,7 +131,11 @@ pub const MemoryCooldownStore = struct {
 
     fn bumpFailuresFn(ctx: *anyopaque, key: []const u8) u32 {
         const self = selfOf(ctx);
-        self.mutex.lock(self.io) catch return 0;
+        // Uncancelable: the return value *is* the answer — a fabricated `0` reads
+        // as "this key has not failed yet", which is exactly the count `KeyPool`
+        // compares against its threshold before cooling the key. Waiting costs one
+        // map operation.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const count = (self.failures.get(key) orelse 0) + 1;
         if (self.failures.getPtr(key)) |c| {
@@ -141,7 +151,11 @@ pub const MemoryCooldownStore = struct {
 
     fn resetFn(ctx: *anyopaque, key: []const u8) void {
         const self = selfOf(ctx);
-        self.mutex.lock(self.io) catch return;
+        // Uncancelable: this is the manual "clear this key" call an operator or a
+        // recovered provider triggers. Skipping it leaves the key cooling (and its
+        // failure count standing) with nothing reported back, and the vtable has
+        // no error channel to report it through. Two map removals.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.cooling.fetchRemove(key)) |kv| self.allocator.free(kv.key);
         if (self.failures.fetchRemove(key)) |kv| self.allocator.free(kv.key);
@@ -192,6 +206,12 @@ pub const RedisCooldownStore = struct {
         return .{ .ctx = self, .vtable = &vtable };
     }
 
+    // Every function above is analysed only when something reaches this table (Zig
+    // is lazy), so this store went a whole Zig release without compiling: two
+    // mirror inserts still called the old three-argument `put`, and `resetFn`
+    // discarded `del`'s `u32` into a `void` catch block. The red run of the mirror
+    // test below is what surfaced it, and that test is what keeps the table honest
+    // now — it instantiates the store through `asStore`.
     const vtable = CooldownStore.VTable{
         .isCooling = isCoolingFn,
         .cool = coolFn,
@@ -237,11 +257,21 @@ pub const RedisCooldownStore = struct {
 
     fn coolFn(ctx: *anyopaque, key: []const u8, ttl_ms: i64) void {
         const self = selfOf(ctx);
-        self.mutex.lock(self.io) catch return;
+        // Uncancelable, for the same reason as the in-process store's `coolFn`:
+        // `void` is the whole answer, so a canceled wait swallowed here drops the
+        // cooldown *and* never reaches the Redis `SET` below — the key that just
+        // failed stays in rotation. The mirror write is one map operation.
+        self.mutex.lockUncancelable(self.io);
         if (self.mirror_cooling.getPtr(key)) |until| {
             until.* = self.now_fn() + ttl_ms;
         } else {
-            _ = self.mirror_cooling.put(self.allocator, self.allocator.dupe(u8, key) catch return, self.now_fn() + ttl_ms) catch |err| {
+            // The mirror key is owned — freed if the insert itself fails, the same
+            // shape the in-process store uses (this used to call the old
+            // three-argument `put`, which no longer exists; see the note on the
+            // vtable below).
+            const owned = self.allocator.dupe(u8, key) catch return;
+            self.mirror_cooling.put(owned, self.now_fn() + ttl_ms) catch |err| {
+                self.allocator.free(owned);
                 std.log.debug("[RedisCooldownStore] mirror cool insert failed ({s})", .{@errorName(err)});
             };
         }
@@ -249,7 +279,7 @@ pub const RedisCooldownStore = struct {
 
         var kbuf: [128]u8 = undefined;
         const rkey = redisKey(&kbuf, key);
-        const ttl_sec: u32 = @intCast(@max((ttl_ms + 999) / 1000, 1));
+        const ttl_sec: u32 = @intCast(@max(@divTrunc(ttl_ms + 999, 1000), 1));
         self.redis.set(rkey, "1", ttl_sec) catch |err| {
             std.log.warn("[RedisCooldownStore] set failed ({}), using local cooldown for '{s}'", .{ err, key });
         };
@@ -257,12 +287,17 @@ pub const RedisCooldownStore = struct {
 
     fn bumpFailuresFn(ctx: *anyopaque, key: []const u8) u32 {
         const self = selfOf(ctx);
-        self.mutex.lock(self.io) catch return 0;
+        // Uncancelable: with Redis unreachable the mirror count below is the value
+        // that comes back, and a fabricated `0` reads as a key that has never
+        // failed — the comparison `KeyPool` makes before cooling it.
+        self.mutex.lockUncancelable(self.io);
         const count = (self.mirror_failures.get(key) orelse 0) + 1;
         if (self.mirror_failures.getPtr(key)) |c| {
             c.* = count;
         } else {
-            _ = self.mirror_failures.put(self.allocator, self.allocator.dupe(u8, key) catch return count, count) catch |err| {
+            const owned = self.allocator.dupe(u8, key) catch return count;
+            self.mirror_failures.put(owned, count) catch |err| {
+                self.allocator.free(owned);
                 std.log.debug("[RedisCooldownStore] mirror failure insert failed ({s})", .{@errorName(err)});
             };
         }
@@ -283,7 +318,10 @@ pub const RedisCooldownStore = struct {
 
     fn resetFn(ctx: *anyopaque, key: []const u8) void {
         const self = selfOf(ctx);
-        self.mutex.lock(self.io) catch return;
+        // Uncancelable: a skipped reset leaves both mirrors standing, so with Redis
+        // unreachable (the state the mirror is for) the key stays cooling after a
+        // manual clear. Two map removals.
+        self.mutex.lockUncancelable(self.io);
         if (self.mirror_cooling.fetchRemove(key)) |kv| self.allocator.free(kv.key);
         if (self.mirror_failures.fetchRemove(key)) |kv| self.allocator.free(kv.key);
         self.mutex.unlock(self.io);
@@ -292,9 +330,9 @@ pub const RedisCooldownStore = struct {
         const rkey = redisKey(&kbuf, key);
         var fbuf: [128]u8 = undefined;
         const fkey = failKey(&fbuf, key);
-        self.redis.del(&.{ rkey, fkey }) catch |err| {
+        if (self.redis.del(&.{ rkey, fkey })) |_| {} else |err| {
             std.log.warn("[RedisCooldownStore] del failed ({}), mirror cleared for '{s}'", .{ err, key });
-        };
+        }
     }
 };
 
@@ -405,4 +443,153 @@ test "canceled lock wait does not fabricate a key as not-cooling" {
     read_fut.await(io);
 
     try std.testing.expect(Task.seen);
+}
+
+/// Park `read` on `mutex` with a cancel request already placed on its thread, then
+/// let it through. That makes the lock wait the cancelation point: `read` starts
+/// only after `open` is set, the 50 ms sleep places the cancel while the task is
+/// still gated, and the mutex is contended by the time the task reaches it.
+fn readUnderCanceledLockWait(
+    comptime T: type,
+    target: *T,
+    mutex: *std.Io.Mutex,
+    io: std.Io,
+    comptime read: fn (*T) void,
+) !void {
+    const Gate = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+
+        fn run(t: *T) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            read(t);
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Gate.entered.store(false, .monotonic);
+    Gate.open.store(false, .monotonic);
+
+    try mutex.lock(io);
+
+    var read_fut = try io.concurrent(Gate.run, .{target});
+    while (!Gate.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Gate.cancel, .{ io, &read_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Gate.open.store(true, .release);
+    while (mutex.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    mutex.unlock(io);
+
+    cancel_fut.await(io);
+    read_fut.await(io);
+}
+
+// The three write-side vtable calls on the in-process store: none of them returns
+// an error, so a canceled lock wait swallowed as `catch return` / `catch return 0`
+// is a silent no-op — `cool` leaves the key that just failed in rotation,
+// `bumpFailures` reports a count that never happened (0, i.e. "this key is fine"),
+// and `reset` leaves a key cooling after the operator asked for it back. Each
+// critical section is a map operation, so waiting costs nothing.
+//
+// Red evidence: with the old shapes the first assertion below fails —
+// `FAIL (TestUnexpectedResult)` on the `isCooling("c:0")` line, because the
+// canceled `cool` was dropped. The `bumpFailures` and `reset` assertions after it
+// are the same lock shape; a `try` ends the test at the first failure, so those
+// two are only exercised green.
+test "canceled lock wait does not lose a memory store cool, failure count or reset" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    fake_now = 1_000_000;
+    var store = MemoryCooldownStore.initWithOptions(allocator, io, .{ .now_fn = fakeNow });
+    defer store.deinit();
+
+    const CoolRead = struct {
+        fn read(s: *MemoryCooldownStore) void {
+            s.asStore().cool("c:0", 60_000);
+        }
+    };
+    try readUnderCanceledLockWait(MemoryCooldownStore, &store, &store.mutex, io, CoolRead.read);
+    try std.testing.expect(store.asStore().isCooling("c:0"));
+
+    const BumpRead = struct {
+        var seen: u32 = 0;
+        fn read(s: *MemoryCooldownStore) void {
+            seen = s.asStore().bumpFailures("b:0");
+        }
+    };
+    // Seeded to 1 first, so the true answer to the canceled call is 2 and the
+    // fabricated 0 is not confusable with a legitimate first bump.
+    try std.testing.expectEqual(@as(u32, 1), store.asStore().bumpFailures("b:0"));
+    BumpRead.seen = 0;
+    try readUnderCanceledLockWait(MemoryCooldownStore, &store, &store.mutex, io, BumpRead.read);
+    try std.testing.expectEqual(@as(u32, 2), BumpRead.seen);
+
+    const ResetRead = struct {
+        fn read(s: *MemoryCooldownStore) void {
+            s.asStore().reset("c:0");
+        }
+    };
+    try std.testing.expect(store.asStore().isCooling("c:0"));
+    try readUnderCanceledLockWait(MemoryCooldownStore, &store, &store.mutex, io, ResetRead.read);
+    try std.testing.expect(!store.asStore().isCooling("c:0"));
+}
+
+// The same three calls on the Redis store, whose first act is the local mirror
+// (Redis is consulted after, outside the lock). The client below has no stream and
+// no pool, so every command fails inside `acquireStream` without opening a socket
+// — the fail-open state the mirror exists for, and the same client shape
+// `RedisRateLimiter`'s degradation test builds. With Redis dead the mirror *is*
+// the answer, so a skipped mirror write is the whole effect lost.
+//
+// Red evidence: with the old shapes the first assertion below fails —
+// `FAIL (TestUnexpectedResult)` on the `isCooling("c:0")` line, because the
+// canceled `cool` was dropped. The `bumpFailures` and `reset` assertions after it
+// are the same lock shape; a `try` ends the test at the first failure, so those
+// two are only exercised green.
+test "canceled lock wait does not lose a redis store cool, failure count or reset" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var redis_client = redis_mod.Redis{
+        .allocator = allocator,
+        .io = io,
+        .stream = null,
+        .config = .{},
+    };
+    var store = RedisCooldownStore.init(allocator, io, &redis_client);
+    defer store.deinit();
+
+    const CoolRead = struct {
+        fn read(s: *RedisCooldownStore) void {
+            s.asStore().cool("c:0", 60_000);
+        }
+    };
+    try readUnderCanceledLockWait(RedisCooldownStore, &store, &store.mutex, io, CoolRead.read);
+    try std.testing.expect(store.asStore().isCooling("c:0"));
+
+    const BumpRead = struct {
+        var seen: u32 = 0;
+        fn read(s: *RedisCooldownStore) void {
+            seen = s.asStore().bumpFailures("b:0");
+        }
+    };
+    try std.testing.expectEqual(@as(u32, 1), store.asStore().bumpFailures("b:0"));
+    BumpRead.seen = 0;
+    try readUnderCanceledLockWait(RedisCooldownStore, &store, &store.mutex, io, BumpRead.read);
+    try std.testing.expectEqual(@as(u32, 2), BumpRead.seen);
+
+    const ResetRead = struct {
+        fn read(s: *RedisCooldownStore) void {
+            s.asStore().reset("c:0");
+        }
+    };
+    try std.testing.expect(store.asStore().isCooling("c:0"));
+    try readUnderCanceledLockWait(RedisCooldownStore, &store, &store.mutex, io, ResetRead.read);
+    try std.testing.expect(!store.asStore().isCooling("c:0"));
 }

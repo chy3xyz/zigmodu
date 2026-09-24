@@ -200,7 +200,13 @@ pub const Scheduler = struct {
 
     /// Number of registered jobs (thread-safe).
     pub fn jobCount(self: *Scheduler) usize {
-        self.mutex.lock(self.io) catch return 0;
+        // Uncancelable: `0` is a published reading, not a placeholder — it says "no
+        // jobs are scheduled" while jobs are registered and firing. There is no
+        // error channel (the `usize` *is* the answer), and `listJobNames` next door
+        // reports `error.SchedulerLockFailed` rather than inventing a short list.
+        // Red: `scheduler.Cron.test.canceled lock wait does not fabricate an empty
+        // job count` reads `expected 1, found 0`.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return self.jobs.items.len;
     }
@@ -543,4 +549,60 @@ test "canceled lock wait does not report a live job as missing" {
 
     try std.testing.expect(Task.removed);
     try std.testing.expectEqual(@as(usize, 0), scheduler.jobCount());
+}
+
+// `jobCount` answering a canceled lock wait with `0` reports "no jobs scheduled"
+// while jobs are registered and firing on every matching tick — the reading an
+// operator checks wiring with, and the one `listJobNames` next door contradicts
+// (it *has* an error channel and reports `error.SchedulerLockFailed` instead of
+// inventing a short list). The count is a `usize`, so there is nowhere to put the
+// cancelation, and the critical section is a length read.
+//
+// Red evidence: with the old `self.mutex.lock(self.io) catch return 0` the
+// assertion below fails with `expected 1, found 0`.
+test "canceled lock wait does not fabricate an empty job count" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var scheduler = Scheduler.init(allocator, io);
+    defer scheduler.deinit();
+    var runs: usize = 0;
+    try scheduler.addJob("counted", try Expression.parse("* * * * *"), countTask, &runs);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.jobCount());
+
+    const Task = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+        var count: usize = 0;
+
+        fn read(s: *Scheduler) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            count = s.jobCount();
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Task.entered.store(false, .monotonic);
+    Task.open.store(false, .monotonic);
+    Task.count = 0;
+
+    try scheduler.mutex.lock(io);
+
+    var read_fut = try io.concurrent(Task.read, .{&scheduler});
+    while (!Task.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Task.cancel, .{ io, &read_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Task.open.store(true, .release);
+    while (scheduler.mutex.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    scheduler.mutex.unlock(io);
+
+    cancel_fut.await(io);
+    read_fut.await(io);
+
+    try std.testing.expectEqual(@as(usize, 1), Task.count);
 }

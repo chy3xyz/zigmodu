@@ -2,6 +2,82 @@
 
 ## [Unreleased]
 
+### 第 19 批：`RedisCooldownStore` 从来就没编译过（文档教用户照抄的代码编译不过）、`AutoInstrumentation` 的耗时全是 0（真红）、io-mutex 家族第二批 11 处、（**破坏性：否**，一处公开签名放宽）
+
+全量 `-Ddb=all` **1845/1902（57 skipped，0 failed）**。
+
+**`RedisCooldownStore` 从来没有任何调用者，于是四个 vtable 函数体一次都没被分析过 —— 它编译不过。**
+第一次红跑没跑到测试就先炸出编译错误：
+```
+src/ai/cooldown_store.zig:244:36: error: member function expected 2 argument(s), found 3   (旧的三参 put)
+src/ai/cooldown_store.zig:265:37: error: member function expected 2 argument(s), found 3
+src/ai/cooldown_store.zig:295:42: error: incompatible types: 'u32' and 'void'               (del 的 u32 丢进 void catch)
+（修掉前两条后再现）src/ai/cooldown_store.zig:282:59: error: division with 'i64' and 'comptime_int'
+```
+而 `docs/LLM_POLICIES.md:193` **明着教用户** `zigmodu.ai.RedisCooldownStore.init(...)` —— 照着抄就编译不过。
+做最小机械修复（`put` 改两参并在失败时释放 dupe 的 key、`del` 的结果用 `if … else |err|`、
+`/ 1000` → `@divTrunc`），并且新加的 Redis 测试通过 `asStore()` **真正实例化那张 vtable** ——
+这正是 AGENTS.md 要求的那种"真正调用"测试，也是这类"只导出、没调用者"缺陷唯一的防线。
+> **未验证**：本机没有 Redis，Redis 侧只跑了 fail-open 镜像路径（`stream=null`、无 pool，`acquireStream`
+> 直接失败），真实的 `SET/INCR/EXPIRE/DEL` 与 TTL 秒数**未经真实 Redis 验证**（`REDIS_URL` 门控用例未启用）。
+
+**`AutoInstrumentation` 的耗时测量是桩的 —— 每个上报的耗时都是 `0`。** 五处 `const start_time = 0;` /
+`put(name, 0)` 让 `(0 - start_time)/1e9 = 0`，也就是说
+`zigmodu_module_init_duration_seconds` 与 `zigmodu_event_processing_duration_seconds` 两个直方图
+**每次 scrape 都在报一个"测出来的" 0** —— 比同一文件里那个（本批之前刚补了日志的）丢弃采样更严重。
+红证据（桩还在时）：
+```
+InstrumentedLifecycleListener records a measured duration...FAIL (TestUnexpectedResult)
+InstrumentedEventListener records a measured duration...FAIL (TestUnexpectedResult)
+```
+改成真实单调时钟（`core.Time.monotonicNow()`，i64 纳秒；注意 `Time.monotonicNowNanoseconds()` **不存在**），
+单位保持**秒**（`_seconds` 直方图）并用 `@max(…, 0)` 兜住时钟重置；缺 start 时**不再从 0 起算**，
+而是记一条 warn 并把 init 记为"未测量"（计数与活跃 gauge 照常走，避免 gauge 失同步）。
+新用例断言的是**形状 + 量级**：`totalCount() == 1`（确实记了一条）且 `sum() >= 0.002` **小于 60 秒**
+—— `>= 0` 是同义反复、会掩盖回归；下界绑在测试自己等的 2 ms 上，能同时否掉"桩（0）"与"减反（负数）"，
+上界能抓住单位回归（纳秒/毫秒混进 `_seconds`）。端到端用临时探针抓真实 Prometheus 文本验证过：
+`zigmodu_module_init_duration_seconds_sum 0.002150` / `..._event_processing_duration_seconds_sum 0.002018`。
+> **公开签名放宽**：`recordModuleInit(module_name, duration_seconds: ?f64, success)` —— `f64` → `?f64`
+> 是**源码兼容**的（`f64` 可隐式转 `?f64`），但它是公开 API，记一条。
+> **顺带发现、未修**：`InstrumentedEventListener` 有泄漏（consume span 没人 `deinit`/destroy、
+> 两个 map key 在 `onEventConsumeEnd` 里 `remove` 后从未释放、内联 `allocPrint` 出来的 span 名也没释放）；
+> `PrometheusMetrics.ModuleMetricsCollector` 是**同一个桩**（`module_start_time = 0`、
+> `getUptimeSeconds()` 返回 `0 - self.module_start_time` = 恒 0，而且那个减法方向还是反的），
+> 目前 `getUptimeSeconds` 无调用者，属"只导出"状态。
+
+**io-mutex 家族第二批：11 处改成不可取消的等待。** 延续上一批的两条家规（丢资源/伪造读数且调用方无错误
+通道 → `lockUncancelable`；调用方有错误通道 → 传播）。这批改的是上一批列出的 leftowers：
+`ClusterMembership` 的 `getNodeCount`/`getHealthyNodeCount`/`getLeader`（`0`/`0`/`null` 会被读成
+"全挂了"/"集群没有 leader"，而后者正是 failover 的信号）、`Cron.jobCount`（`0` = "没有任何任务"，
+而任务正在按时触发）、`cooldown_store` 的 `cool`/`bumpFailures`/`reset`**两个 store 各一套**（`bumpFailures`
+返回 `0` = "该 key 从未失败"，喂给 `auth_fail_threshold` 会让一个泄漏的 key 永远不被封；跳过的 `reset`
+让手工清零失效）、`pool/Pool.idle`（`0` 会被 `stats()` 当 `idle_count` 发布）。
+红证据：`selected 13 of 1787 tests (filter "canceled lock wait") — 8 passed; 5 failed`，每处一条
+（memory store / redis store / Cron / ClusterMembership / Pool）。绿：同一 filter 13/13。
+> **未验证**：红只覆盖每个测试的**第一条断言**（Zig 的 `try` 首次失败即结束），所以 `bumpFailures` 与
+> `reset` 只有绿跑覆盖；测试注释已按实测口径改写，没有超额宣称。
+> **保持现状并复核了理由**：`DistributedEventBus.takeNodeSocket`（临界区里是**没有发送超时**的阻塞
+> `writeAll`，`lockUncancelable` 会把拆除永久卡在一个停滞的对端后面；而 `catch return null` 不丢资源，
+> socket 仍挂在 node 上，注释也已说明至多漏一个 fd）。要改它得先有**有界的等待**。
+
+**同族清点的更大一批（只读盘点，未改）：** 这一轮同时做了一次跨文件盘点，按爆炸半径排出 15 处**真缺陷**，
+其中三条属于"线程/定时器永久停摆"级别（`runtime/scheduler.zig:754 poolMain` 的 `catch return` 会让
+**池线程永久消失**，而 `stats()` 仍在报它；`runtime/runtime.zig:2195/2216 tickerMain` 会让
+**定时器在本进程余下的生命里不再触发**；`mailbox.zig:244 close` 置了 `closed` 却**不广播**，停在
+`not_empty.wait` 的接收者永不醒来、join/关停挂住），另有 `redis.zig:293/307` 的 `releaseStream`/`evictStream`
+（`in_use` 永不复位 → 池槽永久丢失 → 池满之后**每一条 Redis 命令都失败**）、`EventBus.publish` 是 `void`
+（事件投给**零个**订阅者而调用方无从得知，而它挂在 CRUD 数据路径上）、`EventStore.SnapshotStore.load` 的
+`null` 被 `replayFromSnapshot` 读成"没有快照、从版本 1 重放"（快照读取失败 → 从**错误的窗口**重建状态）、
+`Router.match` 的 `dupe catch return null`（分配失败 → **存在的路由返回 404**，且在 `continue` 分支上
+匹配成功却**静默丢掉路径参数**）、`ai/memory.zig` 的 `remember` **返回成功却没存**（`forget` 的静默无操作
+会留下本该被删除的数据，包括隐私删除）、`ai/audit.zig` 的 `record` 会**丢掉审计条目**（包括
+`.tool_denied`）…… 全部逐条附了"两个含义/丢了什么 + 调用方能否察觉 + 有没有可用测试夹具"。
+> **这批尚未修**，排进下一批。盘点还纠正了一处**机制误述**：`std.Io.Mutex.lock` 的快路径
+> （对 `unlocked` 的 `cmpxchgStrong`）**不做取消检查**，所以 `catch` 只在"那一刻恰好有争用**且**调用任务
+> 被取消"时触发 —— 于是"每次都触发"只对**有争用的拆除路径**成立；这也决定了上面"池线程/定时器永久停摆"
+> 三条的**可达性无法从代码确定**（那几条线程跑在哪个 `Io` 下不确定），盘点把这一点标为**最大不确定性**，
+> 而不是当成既成事实。
+
 ### 第 18 批：`mutex.lock(io) catch …` 家族的系统清点（15 处改成不可取消的等待，含一处 UAF 与一处析构泄漏）、`LoadBalancer` 把"量不出来"读成"空闲"（真红）、一批"注释即修复"（**破坏性：否**）
 
 全量 `-Ddb=all` **1838/1895（57 skipped，0 failed）**。

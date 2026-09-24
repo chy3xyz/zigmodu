@@ -395,13 +395,20 @@ pub const ClusterMembership = struct {
     }
 
     pub fn getNodeCount(self: *Self) usize {
-        self.mutex.lock(self.io) catch return 0;
+        // Uncancelable: `0` is a published reading, not a placeholder — it says
+        // "this cluster holds no nodes" to whatever health endpoint or metrics
+        // scrape asks, and the accessor has no error channel to report a
+        // cancelation through. The critical section is one map count.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return self.nodes.count();
     }
 
     pub fn getHealthyNodeCount(self: *Self) usize {
-        self.mutex.lock(self.io) catch return 0;
+        // Uncancelable, for the same reason as `getNodeCount`: a fabricated `0`
+        // reads as "every node is down", which is the input a quorum or capacity
+        // decision is made on. One map walk.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
         var count: usize = 0;
@@ -439,7 +446,13 @@ pub const ClusterMembership = struct {
     }
 
     pub fn getLeader(self: *Self) ?[]const u8 {
-        self.mutex.lock(self.io) catch return null;
+        // Uncancelable: `null` is a reading, not a placeholder — it says "this
+        // cluster has no leader", which is the signal a failover path or a
+        // leader-only duty acts on, and there is no error channel to tell the two
+        // apart (`?[]const u8` is the answer). The critical section is a pointer
+        // read. Red: `core.ClusterMembership.test.canceled lock wait does not
+        // fabricate an empty cluster reading` fails at its first assertion.
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return self.current_leader;
     }
@@ -812,4 +825,94 @@ test "ClusterMembership checkNodeHealth re-elects before it lets the lock go" {
     try std.testing.expectEqual(ClusterMembership.NodeState.failed, cluster.nodes.get("node-a").?.state);
     try std.testing.expectEqualStrings("node-m", cluster.getLeader().?);
     try std.testing.expect(cluster.isLeader());
+}
+
+// The three read-only accessors answering a canceled lock wait with a fabricated
+// `0` / `0` / `null` all read the same way: "this cluster holds no nodes and has no
+// leader". That is what a health endpoint or metrics scrape publishes, what a
+// caller compares against a quorum, and what leader-only duties route on — and
+// none of the three has an error channel, because the returned value *is* the
+// answer (`isLeader` next door was fixed for exactly that). Each critical section
+// is a map walk or a pointer read, so waiting costs nothing. `getLeader` is the
+// one with reach: a fabricated `null` says the leader is gone, which is the signal
+// a failover path acts on.
+test "canceled lock wait does not fabricate an empty cluster reading" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var bus = try DistributedEventBus.init(allocator, io, "reader-node");
+    defer bus.deinit();
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 18216);
+    var cluster = try ClusterMembership.init(allocator, io, "reader-node", addr, &bus);
+    defer cluster.deinit();
+
+    // A second, healthy node and an elected peer leader, so the true readings are
+    // visibly different from the fabricated ones (2 / 2 / "peer-a", not 0 / 0 /
+    // null). Written straight into the table, and the leader set through the
+    // `leader_election` event: the `join` path dials the peer
+    // (`handleGossipEvent` → `connectToNode`), which is a socket and no part of
+    // what this test is about.
+    const peer = try allocator.dupe(u8, "peer-a");
+    try cluster.nodes.put(peer, .{
+        .id = peer,
+        .address = addr,
+        .state = .healthy,
+        .last_seen = 0,
+        .joined_at = 0,
+    });
+    cluster.handleGossipEvent(.{
+        .event_type = .leader_election,
+        .node_id = "peer-a",
+        .host = "127.0.0.1",
+        .port = 18217,
+        .timestamp = 0,
+    });
+    try std.testing.expectEqual(@as(usize, 2), cluster.getNodeCount());
+    try std.testing.expectEqual(@as(usize, 2), cluster.getHealthyNodeCount());
+    try std.testing.expectEqualStrings("peer-a", cluster.getLeader().?);
+
+    const Task = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+        var node_count: usize = 0;
+        var healthy_count: usize = 0;
+        var has_leader: bool = false;
+
+        fn read(c: *ClusterMembership) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            node_count = c.getNodeCount();
+            healthy_count = c.getHealthyNodeCount();
+            has_leader = c.getLeader() != null;
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Task.entered.store(false, .monotonic);
+    Task.open.store(false, .monotonic);
+    Task.node_count = 0;
+    Task.healthy_count = 0;
+    Task.has_leader = false;
+
+    try cluster.mutex.lock(io);
+
+    var read_fut = try io.concurrent(Task.read, .{&cluster});
+    while (!Task.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Task.cancel, .{ io, &read_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Task.open.store(true, .release);
+    while (cluster.mutex.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    cluster.mutex.unlock(io);
+
+    cancel_fut.await(io);
+    read_fut.await(io);
+
+    try std.testing.expectEqual(@as(usize, 2), Task.node_count);
+    try std.testing.expectEqual(@as(usize, 2), Task.healthy_count);
+    try std.testing.expect(Task.has_leader);
 }

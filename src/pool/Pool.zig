@@ -199,7 +199,14 @@ pub fn Pool(comptime T: type) type {
 
         /// Current idle connection count
         pub fn idle(self: *Self) usize {
-            self.mutex.lock(self.io) catch return 0;
+            // Uncancelable: `0` here claims the pool holds nothing while
+            // connections sit in `idle_conns` — the reading `stats()` republishes
+            // as `idle_count` and every capacity/health check is built on. Same
+            // class as `im/BufferPool.zig`'s `available`, and the accessor has no
+            // error channel to report a cancelation through. Red:
+            // `pool.Pool.test.canceled lock wait does not fabricate an empty pool
+            // reading` reads `expected 1, found 0`.
+            self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             return self.idle_conns.items.len;
         }
@@ -398,4 +405,86 @@ test "Pool release keeps the connection when its lock wait is canceled" {
     const reacquired = try pool.acquire();
     try std.testing.expect(reacquired == conn);
     pool.release(reacquired);
+}
+
+// `idle` answering a canceled lock wait with `0` claims the pool holds nothing
+// while connections sit in `idle_conns` — the reading `stats()` republishes as
+// `idle_count` and every capacity/health check is built on. Same class as
+// `im/BufferPool.zig`'s `available`, and the same rule as `release` just above:
+// this accessor has no error channel (it returns `usize`), and the critical
+// section is a length read.
+//
+// Red evidence: with the old `self.mutex.lock(self.io) catch return 0` the
+// assertion below fails with `expected 1, found 0`.
+test "canceled lock wait does not fabricate an empty pool reading" {
+    const Counters = struct {
+        var created = std.atomic.Value(u32).init(0);
+        var destroyed = std.atomic.Value(u32).init(0);
+
+        fn create() errors.ResultT(*u32) {
+            _ = created.fetchAdd(1, .monotonic);
+            const conn = std.testing.allocator.create(u32) catch return error.ServerError;
+            conn.* = 7;
+            return conn;
+        }
+        fn destroy(conn: *u32) void {
+            _ = destroyed.fetchAdd(1, .monotonic);
+            std.testing.allocator.destroy(conn);
+        }
+        fn validate(conn: *u32) bool {
+            return conn.* == 7;
+        }
+    };
+    Counters.created.store(0, .monotonic);
+    Counters.destroyed.store(0, .monotonic);
+
+    const io = std.testing.io;
+    var pool = try Pool(u32).init(std.testing.allocator, io, Counters.create, Counters.destroy, Counters.validate, .{
+        .min_idle = 0,
+        .max_active = 4,
+        .max_wait_ms = 1000,
+    });
+    defer pool.deinit();
+
+    // One connection, handed back: idle is 1, not 0, so the fabricated reading is
+    // distinguishable from the true one.
+    const conn = try pool.acquire();
+    pool.release(conn);
+    try std.testing.expectEqual(@as(usize, 1), pool.idle());
+
+    const Task = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+        var idle_count: usize = 0;
+
+        fn read(p: *Pool(u32)) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            idle_count = p.idle();
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Task.entered.store(false, .monotonic);
+    Task.open.store(false, .monotonic);
+    Task.idle_count = 0;
+
+    try pool.mutex.lock(io);
+
+    var read_fut = try io.concurrent(Task.read, .{&pool});
+    while (!Task.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Task.cancel, .{ io, &read_fut });
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Task.open.store(true, .release);
+    while (pool.mutex.state.load(.monotonic) != .contended) std.atomic.spinLoopHint();
+    pool.mutex.unlock(io);
+
+    cancel_fut.await(io);
+    read_fut.await(io);
+
+    try std.testing.expectEqual(@as(usize, 1), Task.idle_count);
 }
