@@ -229,7 +229,10 @@ fn runDemo(allocator: std.mem.Allocator, io: std.Io, verbose: bool, serve: bool)
         defer http_ctx.deinit();
         http_ctx.user_data = matched.route.user_data;
         var pit = matched.params.iterator();
-        while (pit.next()) |p| try http_ctx.params.put(try allocator.dupe(u8, p.key_ptr.*), try allocator.dupe(u8, p.value_ptr.*));
+        // `RouteParams.iterator` yields `Entry{ key, value }` by value (the
+        // match borrows the router's names and the path it matched against);
+        // the context owns copies, so dupe both halves.
+        while (pit.next()) |p| try http_ctx.params.put(try allocator.dupe(u8, p.key), try allocator.dupe(u8, p.value));
         try matched.route.handler(&http_ctx);
         try std.testing.expectEqual(@as(usize, 0), try approval_queue.count(null));
     }
