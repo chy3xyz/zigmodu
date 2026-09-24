@@ -83,7 +83,16 @@ pub const EventRegistry = struct {
         return b;
     }
 
+    /// The registry mutex is taken uncancelably: there is no error channel here
+    /// to report `error.Canceled` through (nothing is at stake in an abandoned
+    /// read either), and the critical section is one load of a word the mutex
+    /// already made coherent. It must be taken at all because `bus()` inserts
+    /// into the same map under `self.mu` and `put` does `size += 1`, so an
+    /// unlocked `count()` is an unsynchronized read of a field another thread
+    /// writes — and during a rehash it reads more than the field.
     pub fn busCount(self: *Self) usize {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
         return self.buses.count();
     }
 };
@@ -183,4 +192,49 @@ test "EventRegistry bus() reports a canceled lock wait as error.Canceled" {
     try std.testing.expectEqual(@as(?anyerror, error.Canceled), Task.err);
     // The failure was real: no bus was created behind the caller's back.
     try std.testing.expectEqual(@as(usize, 0), reg.busCount());
+}
+
+// `busCount()` read the map's `size` field with no lock while `bus()` bumped it
+// under `self.mu` (`put` does `size += 1`), so a user-code reader counting buses
+// while another thread lazily created one was an unsynchronized read of a field
+// that thread writes — and a rehash makes it worse than one stale word. A
+// genuine race has no reproducing failure here without a sanitizer, so this
+// pins the invariant that removes it: while the test thread holds the registry
+// mutex, a `busCount()` cannot be in progress (the old unlocked read answered
+// immediately and would be done long before the window below elapses).
+test "busCount() takes the registry mutex" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const E = struct { id: i64 };
+
+    const Task = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var done = std.atomic.Value(bool).init(false);
+        var count: usize = 0;
+
+        fn run(reg: *EventRegistry) void {
+            entered.store(true, .release);
+            count = reg.busCount();
+            done.store(true, .release);
+        }
+    };
+
+    var reg = EventRegistry.init(allocator, io);
+    defer reg.deinit();
+    _ = try reg.bus(E);
+
+    Task.entered.store(false, .monotonic);
+    Task.done.store(false, .monotonic);
+
+    reg.mu.lockUncancelable(io);
+    var task_fut = try io.concurrent(Task.run, .{&reg});
+    while (!Task.entered.load(.acquire)) std.atomic.spinLoopHint();
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+    try std.testing.expect(!Task.done.load(.acquire));
+    reg.mu.unlock(io);
+
+    task_fut.await(io);
+    try std.testing.expect(Task.done.load(.acquire));
+    // And the read is still the right one.
+    try std.testing.expectEqual(@as(usize, 1), Task.count);
 }

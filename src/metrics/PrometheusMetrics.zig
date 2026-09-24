@@ -193,6 +193,49 @@ pub const PrometheusMetrics = struct {
         }
     };
 
+    /// Snapshot of a labeled family's series set: copied out under that family's
+    /// mutex, then formatted without it.
+    ///
+    /// `get()` publishes a series with `series.put` under the family mutex, and
+    /// `put` rehashes the map — freeing the bucket array a concurrent
+    /// `series.iterator()` would still be walking, so an unlocked render of the
+    /// map is a use-after-free rather than a stale line in one scrape. The same
+    /// applies to `overflow_used`, which `get()` also sets under that mutex.
+    ///
+    /// The copy is taken under the lock; the text is not. That keeps the
+    /// critical section to a `count()` plus N pointer pairs, so a hot-path
+    /// `get()` waits for the copy instead of for a whole family's formatting
+    /// pass. Entries stay valid after the lock is dropped: the label key is
+    /// owned by the map and the series object is never freed before `deinit`,
+    /// and the sample itself is read atomically.
+    fn SeriesSnapshot(comptime Series: type) type {
+        return struct {
+            const Snapshot = @This();
+            const Entry = struct { label_value: []const u8, metric: Series };
+
+            entries: std.ArrayListUnmanaged(Entry) = .empty,
+            overflow_used: bool = false,
+
+            fn take(self: *Snapshot, allocator: std.mem.Allocator, family: anytype) !void {
+                family.mutex.lockUncancelable(family.io);
+                defer family.mutex.unlock(family.io);
+                self.overflow_used = family.overflow_used;
+                try self.entries.ensureTotalCapacity(allocator, family.series.count());
+                var it = family.series.iterator();
+                while (it.next()) |entry| {
+                    self.entries.appendAssumeCapacity(.{
+                        .label_value = entry.key_ptr.*,
+                        .metric = entry.value_ptr.*,
+                    });
+                }
+            }
+
+            fn deinit(self: *Snapshot, allocator: std.mem.Allocator) void {
+                self.entries.deinit(allocator);
+            }
+        };
+    }
+
     /// A counter split by one label, with a hard series cap. Values beyond the
     /// cap collapse into a single `__other__` series, so a dynamic label value
     /// can never make a scrape (or memory) unbounded.
@@ -254,15 +297,18 @@ pub const PrometheusMetrics = struct {
         }
 
         fn render(self: *CounterFamily, buf: *std.array_list.Managed(u8)) !void {
+            var snapshot = SeriesSnapshot(*Counter){};
+            defer snapshot.deinit(buf.allocator);
+            try snapshot.take(buf.allocator, self);
+
             try buf.print("# HELP {s} {s}\n", .{ self.name, self.help });
             try buf.print("# TYPE {s} counter\n", .{self.name});
-            var it = self.series.iterator();
-            while (it.next()) |entry| {
+            for (snapshot.entries.items) |entry| {
                 try buf.print("{s}{{{s}=\"{s}\"}} {d}\n", .{
-                    self.name, self.label, entry.key_ptr.*, entry.value_ptr.*.value.load(.monotonic),
+                    self.name, self.label, entry.label_value, entry.metric.value.load(.monotonic),
                 });
             }
-            if (self.overflow_used) {
+            if (snapshot.overflow_used) {
                 try buf.print("{s}{{{s}=\"__other__\"}} {d}\n", .{
                     self.name, self.label, self.overflow.value.load(.monotonic),
                 });
@@ -361,13 +407,16 @@ pub const PrometheusMetrics = struct {
         }
 
         fn render(self: *HistogramFamily, buf: *std.array_list.Managed(u8)) !void {
+            var snapshot = SeriesSnapshot(*Histogram){};
+            defer snapshot.deinit(buf.allocator);
+            try snapshot.take(buf.allocator, self);
+
             try buf.print("# HELP {s} {s}\n", .{ self.name, self.help });
             try buf.print("# TYPE {s} histogram\n", .{self.name});
-            var it = self.series.iterator();
-            while (it.next()) |entry| {
-                try renderHistogram(buf, entry.value_ptr.*, self.label, entry.key_ptr.*);
+            for (snapshot.entries.items) |entry| {
+                try renderHistogram(buf, entry.metric, self.label, entry.label_value);
             }
-            if (self.overflow_used) {
+            if (snapshot.overflow_used) {
                 try renderHistogram(buf, &self.overflow, self.label, "__other__");
             }
             try buf.print("\n", .{});
@@ -393,7 +442,12 @@ pub const PrometheusMetrics = struct {
     };
 
     fn renderHistogram(buf: *std.array_list.Managed(u8), hist: *const Histogram, label: []const u8, label_value: []const u8) !void {
-        for (hist.buckets.items, hist.counts.items) |bucket, count| {
+        // `observe` adds to a bucket count with an atomic RMW and holds no lock,
+        // so the scrape has to load that slot atomically too. `hist.counts` is
+        // built in full before the series is published, so its length is fixed
+        // here (and stays in lockstep with `hist.buckets`).
+        for (hist.buckets.items, 0..) |bucket, i| {
+            const count = @atomicLoad(u64, &hist.counts.items[i], .monotonic);
             try buf.print("{s}_bucket{{{s}=\"{s}\",le=\"{d:.3}\"}} {d}\n", .{ hist.name, label, label_value, bucket, count });
         }
         try buf.print("{s}_bucket{{{s}=\"{s}\",le=\"+Inf\"}} {d}\n", .{ hist.name, label, label_value, hist.totalCount() });
@@ -614,7 +668,8 @@ pub const PrometheusMetrics = struct {
             try buf.print("# HELP {s} {s}\n", .{ hist.name, hist.help });
             try buf.print("# TYPE {s} histogram\n", .{hist.name});
 
-            for (hist.buckets.items, hist.counts.items) |bucket, count| {
+            for (hist.buckets.items, 0..) |bucket, i| {
+                const count = @atomicLoad(u64, &hist.counts.items[i], .monotonic);
                 try buf.print("{s}_bucket{{le=\"{d:.3}\"}} {d}\n", .{ hist.name, bucket, count });
             }
             try buf.print("{s}_bucket{{le=\"+Inf\"}} {d}\n", .{ hist.name, hist.totalCount() });
@@ -1191,4 +1246,85 @@ test "scrape hook refreshes gauges before rendering" {
     defer allocator.free(text);
     // The value was sampled at scrape time, not registered up front.
     try std.testing.expect(std.mem.indexOf(u8, text, "db_pool_active 7.000000") != null);
+}
+
+// A scrape renders on the metrics/HTTP thread while request threads call
+// `family.get(...)` for label values they have not used before. `get()`
+// publishes with `series.put` under the family mutex and `put` rehashes the map
+// — freeing the bucket array that the old unlocked `series.iterator()` in
+// `render` would still be walking — so the two threads together were a
+// use-after-free, not merely a stale number in one scrape. (`overflow_used` was
+// read unlocked in the same pass; `get()` sets it under that mutex.)
+//
+// A genuine race has no reproducing failure here without a sanitizer, so this
+// pins the invariant that removes it: while the test thread holds the family
+// mutex, a render cannot be in progress. The old `render` took no lock at all,
+// so it would finish well inside the 50 ms window, with the mutex still held.
+test "family render takes the family mutex (a scrape never walks the series map unlocked)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var m = PrometheusMetrics.init(allocator);
+    defer m.deinit();
+
+    const counter_family = try m.createCounterFamily("http_requests_total", "Total requests", "route", 8, io);
+    counter_family.get("/orders/{id}").inc();
+
+    const buckets = [_]f64{ 10, 100 };
+    const histogram_family = try m.createHistogramFamily("http_request_duration_milliseconds", "latency", "route", 8, &buckets, io);
+    histogram_family.get("/orders/{id}").observe(5);
+
+    const Task = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var done = std.atomic.Value(bool).init(false);
+        var err: ?anyerror = null;
+
+        fn renderCounter(family: *PrometheusMetrics.CounterFamily) void {
+            entered.store(true, .release);
+            var scratch: [8192]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&scratch);
+            var buf = std.array_list.Managed(u8).init(fba.allocator());
+            family.render(&buf) catch |e| {
+                err = e;
+            };
+            done.store(true, .release);
+        }
+
+        fn renderHistogram(family: *PrometheusMetrics.HistogramFamily) void {
+            entered.store(true, .release);
+            var scratch: [8192]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&scratch);
+            var buf = std.array_list.Managed(u8).init(fba.allocator());
+            family.render(&buf) catch |e| {
+                err = e;
+            };
+            done.store(true, .release);
+        }
+    };
+
+    Task.entered.store(false, .monotonic);
+    Task.done.store(false, .monotonic);
+
+    counter_family.mutex.lockUncancelable(io);
+    var counter_task = try io.concurrent(Task.renderCounter, .{counter_family});
+    while (!Task.entered.load(.acquire)) std.atomic.spinLoopHint();
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+    try std.testing.expect(!Task.done.load(.acquire));
+    counter_family.mutex.unlock(io);
+    counter_task.await(io);
+    try std.testing.expect(Task.done.load(.acquire));
+    try std.testing.expectEqual(@as(?anyerror, null), Task.err);
+
+    Task.entered.store(false, .monotonic);
+    Task.done.store(false, .monotonic);
+
+    histogram_family.mutex.lockUncancelable(io);
+    var histogram_task = try io.concurrent(Task.renderHistogram, .{histogram_family});
+    while (!Task.entered.load(.acquire)) std.atomic.spinLoopHint();
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+    try std.testing.expect(!Task.done.load(.acquire));
+    histogram_family.mutex.unlock(io);
+    histogram_task.await(io);
+    try std.testing.expect(Task.done.load(.acquire));
+    try std.testing.expectEqual(@as(?anyerror, null), Task.err);
 }

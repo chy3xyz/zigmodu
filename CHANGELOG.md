@@ -2,6 +2,68 @@
 
 ## [Unreleased]
 
+### 第 24 批：metrics 的 scrape 路径是 use-after-free（不只是读数撕裂）、取消的请求会被**服务**、记忆存储的删除在 OOM 下静默失效、集群恢复不重连（**破坏性：否**）
+
+全量 `-Ddb=all` **1921/1979（58 skipped，0 failed）**；CI 的示例清单本机 16/16。
+
+**`PrometheusMetrics.render()` 越锁遍历 family map —— 后果是 use-after-free。** 一个 agent 把这条记为"
+读数撕裂"并留在原地，这次查清了：`CounterFamily.series`/`HistogramFamily.series` 在 `render` 里被**无锁**
+迭代，而写方 `get()` 在 `self.mutex` 内 `series.put(...)` —— **`put` 会 rehash 并释放旧的 bucket 数组**，
+无锁的 `iterator()` 正走在那块内存上。可达性是确认过的：每个被观测请求都在请求线程上
+`total.get(route).inc()`，而 `/metrics` 在另一个线程上跑。
+修法是**锁内只拷指针的快照**（`SeriesSnapshot`）：锁覆盖"读 `overflow_used` + `ensureTotalCapacity(count)` +
+count 次指针对拷贝"，**格式化文本、HELP/TYPE、缓冲区增长、原子采样全在锁外**，所以热路径等的是"拷 N 个
+指针"（8 条 series ≈128 字节）而不是"把一个 family 打成 Prometheus 文本"（同样 8 条 ≈1KB 格式化）。
+顺带把两处对 histogram 计数的**普通读改成原子读**（`observe()` 一直用 `@atomicRmw` 加）。
+> 红证据是"同步点"意义的：先临时去掉锁，新用例断言"另一线程持锁时 render 尚未完成" → 立刻红
+> （`family render takes the family mutex...FAIL (TestUnexpectedResult)`）。**没有 sanitizer 就没有可复现的
+> 竞争红**，这一点如实标注。
+> **仍未修（已列）**：`toPrometheusFormat` 顶层那四个 map 与两个 family ArrayList 仍是无锁遍历（注册发生在
+> 启动期，修它要给整个 registry 加锁或改成"构造后指针稳定发布"）；`Summary.observe`/`getQuantile` 争同一
+> 个 ArrayList（但 `getQuantile` 仓内只有测试调用，**没有 scrape 侧暴露**）。
+
+**取消了的请求以前会被真的发出去并服务。** `ConnectionPool.acquire` 把锁等待的取消映射成 `error.ServerError`，
+于是一个**已被取消**的调用会继续走到 `request` 的**重试循环** —— 而 `std.Io` 的语义是"取消只报一次、之后的
+取消点照常运行"，所以重试会把一个调用方已经走开的请求**完整执行掉**。红证据看得最清楚：
+```
+HttpClient ConnectionPool acquire reports a canceled lock wait as error.Canceled...expected error.Canceled, found error.ServerError
+HttpClient request hands a canceled attempt to its caller instead of retrying
+  ... expected 0, found 1      ← server.served：那个被取消的请求被服务了
+```
+修法：传播 `error.Canceled`（不改成不可取消的等待 —— 这里没有资源会丢，而且临界区**跨着
+`IpAddress.resolve` + `addr.connect`**，等下去会把已取消的调用方钉在一次拨号上）＋ 在重试循环里对
+`error.Canceled` **短路** ＋ `mapHttpsError` 让 `Canceled` 直通（它本来就在被映射的错误集里，却走了
+catch-all 变成 `error.ConnectionError`）。
+
+**`memory.forget` 的 OOM 会静默丢掉一次删除 —— 修成零分配而不是加错误通道。** `forget` 先
+`storageKey(...)`（`allocPrint`）再 `fetchRemove`，失败即 `catch return`；它是 `void`，所以 OOM 把一次删除
+（**包括隐私删除**）变成静默 no-op。**关键发现：这个 key 根本不需要分配** —— map 的值里已经原样存着
+`tenant_id`/`user_id`/逻辑 key 三个字段，所以"这次删除指哪一条"完全可以在锁内扫一遍 map、用**各条目自己的
+键**去 `fetchRemove`（先找后删，因为 `fetchRemove` 会让迭代器失效）。栈缓冲区的路走不通：逻辑 key 无上界，
+截断的键会**跨作用域碰撞**（删错租户的行比不删更坏）—— 这一点写进了文档注释。
+于是**没有改签名**（`forget` 保持 `void`）：路径已经零分配，失败模式是**消失**而不是被报告，加错误通道
+没有东西可报，而改签名会破坏 `docs/AI.md:226` 里那段已发布的示例。红证据：
+`forget removes the entry when no allocation is possible...expected 1, found 2`。
+> 代价：锁内一次 O(n) 遍历（n ≤ `max_entries`，默认 10000），已写进注释；循环删很多键会退化成 O(n²)。
+
+**集群恢复时不重连（"视图说健康、总线没连它"）。** `checkNodeHealth` 把节点标记为 `.failed` 时会
+`bus.disconnectNode`，但 `handleGossipEvent` 的**恢复分支只翻状态**、不重连。用总线注册表拿到值级证据：
+`.failed` 之后 `bus.getNodeCount() == 0`（断开是真的），心跳回来后**仍然是 0**（本该是 1）。
+修法：恢复分支里 `connectToNode`（与失败扫描、`.leave` 分支镜像），拨的是 `node.address`——本文件已经持有
+并对外发布过的地址（payload 派生的 loopback+宣告端口会丢掉显式 seed 的真实地址），对 `.suspect` 是幂等的。
+> 顺带确认"总线没有别处按需重连"：`fanOut` 只遍历注册表，目标不在注册表里时只打
+> `Partition target … unreachable, falling back to broadcast`，所以这个分支是唯一能补回连接的地方。
+> **只列清单、未改**：回调通道的不对称（失败路径发 `on_node_leave_cb`，恢复路径**不发** `on_node_join_cb`）
+> 是文件头明文决定的，改它等于重新定义 `on_node_join_cb` 的语义。
+
+> **本批新发现（值得单独立项）**：`src/ai/memory.zig` 的 `loadJson` 把缺失/类型错误的 `tenant_id`/`user_id`
+> **静默落成 `0`**，而存下来的 `0` 正是 `recall(prefix, 0, …)` 读作 **"any"** 的那个值 —— 也就是说一份
+> **损坏的 dump 会把作用域放宽**而不是失败。同函数还把畸形数组项静默 `continue`（无日志）。两条都未改：
+> 后者是"逐项跳过要不要记日志"的持久化语义决定，前者牵扯 `loadJson` 的容错策略，值得单独决策。
+> 另：`Http2Server.serveSession` 那个 seeding 失败的 `errdefer` 现在被"整条 walk 逐索引注入"覆盖到了，
+> 但它的**效果**（把 map 条目摘掉）observable 不了 —— 同一错误路径上有一个 session 级 `defer` 会释放
+> **同一个 map 的所有值**，所以那条 `errdefer` 是与 defer 冗余的，测试里已如实注明。
+
 ### 第 23 批：`src/ai/*` 的 `LockFailed` 家族清零（24 处）、未知节点的 `.leave` 被当成 join、`nodesSnapshot` 的截断改成确定性、publish span 的**无界增长**（128 次发布＝128 个活 span）、`RouteParams.MAX` 改成注册期报错（**破坏性：否**，但错误集与两处行为变了）
 
 全量 `-Ddb=all` **1914/1972（58 skipped，0 failed）**；`-Ddb=sqlite`（脚本默认）**1913/1972（59 skipped，0 failed）**；
@@ -85,8 +147,10 @@ map 恰好 3 条、tracer 0 个 span，且 consume 仍带非空 `parent_span_id`
 红：`leaked [len: 5]` + `expected 37, found 32`）、`web4.challenge.issue`（`did` 与 challenge 两个 dupe 是
 `put` 的实参，任一失败或插入增长失败都会把它们悬在那里；红：`leaked [len: 13]`）。
 
-> **未修（有依据地）**：`EventRegistry.busCount()` 的**数据竞争已核实为真**（无锁读 `buses.count()` 的
-> `size`，而 `bus()` 在锁内自增；仓内无调用者，外部可用）—— 不在本批的编辑范围；
+> **未修（有依据地）**：**已跟进（第 24 批）**：`EventRegistry.busCount()` 的无锁读已改 `lockUncancelable`；
+> `PrometheusMetrics.render()` 越锁遍历 family map 的问题比"读数撕裂"严重得多 —— `series.put` 会 rehash 并
+> 释放旧 bucket 数组，而无锁的 `iterator()` 正走在那块内存上，是 **use-after-free**，已改成锁内只拷指针的
+> 快照（顺带把两处对 histogram 计数的普通读改成原子读）。
 > `memory.forget` 里 `storageKey(...) catch return` 的 OOM 会静默丢掉一次删除（含隐私删除，`void` 无通道）；
 > 未知 id 的 `.suspect`/`.leader_election` **仍**走 join 路径（判断：宣布"某人可疑/选举"本身就蕴含成员身份，
 > 且本文件对远端 suspect 判决从不采信）；对端从 `.failed` 恢复时只翻状态**不重连**（与 `checkNodeHealth`

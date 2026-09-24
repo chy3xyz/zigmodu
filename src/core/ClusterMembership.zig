@@ -25,10 +25,15 @@
 //!  * A peer that comes back is the *same* entry — `handleGossipEvent` resets any
 //!    non-healthy state to `.healthy` on its next heartbeat. So there is no re-add
 //!    path that could double-count, and no join callback for a peer that merely
-//!    returned. The mirror image is the stranger that only says goodbye: a `.leave`
-//!    for an id that is not in the census is dropped without a trace, because
-//!    there is no member to retire — and inventing one would also make that peer's
-//!    *real* join later look like a return (state flip, no callback, no dial).
+//!    returned — but the state is not the whole recovery: the failure sweep
+//!    `disconnectNode`s a peer as it marks it `.failed` (and the `.leave` branch
+//!    disconnects too), so that branch dials the peer again at the address the
+//!    census holds. State and connection are flipped together, in the one place
+//!    either of them can be. The mirror image is the stranger that only says
+//!    goodbye: a `.leave` for an id that is not in the census is dropped without
+//!    a trace, because there is no member to retire — and inventing one would also
+//!    make that peer's *real* join later look like a return (state flip, no
+//!    callback, no dial).
 //!
 //! Consequences to read the accessors by: `getNodeCount` is the **census** (dead
 //! peers included, so it is not the live cluster size), `getHealthyNodeCount` is
@@ -236,6 +241,11 @@ pub const ClusterMembership = struct {
                     if (is_dead) {
                         node.state = .failed;
                         if (self.on_node_leave_cb) |cb| cb(node.id);
+                        // Half of one decision, not a teardown on its own: the
+                        // peer's next heartbeat dials this connection back up
+                        // in `handleGossipEvent`'s recovery branch. Leaving one
+                        // half out is how the census came to say `.healthy`
+                        // while the bus held no entry for the peer.
                         self.bus.disconnectNode(node.id);
 
                         if (self.current_leader) |leader| {
@@ -402,6 +412,40 @@ pub const ClusterMembership = struct {
             } else if (node.state == .suspect or node.state == .failed or node.state == .leaving) {
                 node.state = .healthy;
                 std.log.info("[ClusterMembership] Node {s} is back healthy", .{event.node_id});
+                // The connection half of that flip, and the mirror of the two
+                // teardowns that wrote the peer off: `checkNodeHealth` calls
+                // `bus.disconnectNode` on the failed transition and the `.leave`
+                // branch above does the same. Without a dial here the census —
+                // and the read side fed from it (`MembershipView`,
+                // `ClusterView.pick`) — said healthy and routed to a peer the
+                // bus held no entry for. Idempotent for `.suspect`, which was
+                // never disconnected: `connectToNode` returns without a second
+                // dial when the id is already tracked.
+                //
+                // Dialled at `node.address`, the address this membership
+                // already holds and publishes for the peer (installed by the
+                // join path, handed to the app and the read side with it). The
+                // payload-derived `addr` above is loopback + the advertised
+                // port, so using it here would throw away a real seed address; a
+                // peer that restarted on a new port is dialled at the address we
+                // have and stays "tracked for routing, not reachable" until it
+                // rejoins under a new id — nothing in this file resolves a
+                // gossiped host, so a moved peer was already this unreachable.
+                //
+                // The join callback is deliberately **not** fired (unlike the
+                // unknown-node join below): the census never lost the entry, so
+                // a return is not a join — see "What `nodes` is" at the top.
+                // Note the asymmetry that leaves behind: a peer written off here
+                // is announced through `on_node_leave_cb` by the failure sweep,
+                // and its return is announced through no callback at all. An app
+                // that mirrors a peer set from callbacks therefore drops it for
+                // good, while this file's census and the bus both keep it. That
+                // is the documented intent above, not an oversight — changing it
+                // means re-deciding what `on_node_join_cb` counts (per peer, or
+                // per health recovery).
+                self.bus.connectToNode(event.node_id, node.address) catch |err| {
+                    std.log.err("[ClusterMembership] Failed to reconnect event bus to recovered node {s}: {}", .{ event.node_id, err });
+                };
             }
         } else {
             const id_copy = self.allocator.dupe(u8, event.node_id) catch |err| {
@@ -1220,4 +1264,90 @@ test "canceled lock wait does not fabricate an empty cluster reading" {
     try std.testing.expectEqual(@as(usize, 2), Task.node_count);
     try std.testing.expectEqual(@as(usize, 2), Task.healthy_count);
     try std.testing.expect(Task.has_leader);
+}
+
+// The connection half of a state flip. `checkNodeHealth` calls
+// `bus.disconnectNode` the moment it marks a peer `.failed`, and the `.leave`
+// branch disconnects too — but the recovery branch only flipped the state back
+// to `.healthy`. The census then said "healthy, route to it" (that is what
+// `MembershipView` publishes and `ClusterView.pick` routes on) while the bus
+// held no entry for that peer at all: two answers to one question, and the read
+// side acts on the census one. This pins the two halves together — fail ⇒
+// disconnected, come back ⇒ connected again — and the `.leave` → heartbeat case
+// with it.
+//
+// Red on the old shape: the first bus count after recovery reads
+// `expected 1, found 0`.
+test "ClusterMembership reconnects a peer that recovers from failed" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var bus = try DistributedEventBus.init(allocator, std.testing.io, "recovery-bus");
+    defer bus.deinit();
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 18240);
+    var cluster = try ClusterMembership.init(allocator, std.testing.io, "node-m", addr, &bus);
+    defer cluster.deinit();
+
+    // The peer joins through gossip, which is also what puts it in the bus
+    // registry (the dial to the closed port below leaves the entry with
+    // `socket == null`, "tracked for routing, not reachable") — so every count
+    // from here on is about *that* entry, not about a socket being open.
+    cluster.handleGossipEvent(.{
+        .event_type = .join,
+        .node_id = "node-a",
+        .host = "127.0.0.1",
+        .port = 18241,
+        .timestamp = 0,
+    });
+    try std.testing.expectEqual(@as(usize, 1), bus.getNodeCount());
+
+    // Backdated well past `node_timeout_ms` (10s default, doubled for the
+    // suspect → failed step), so each health pass advances one state.
+    cluster.nodes.getPtr("node-a").?.last_seen = Time.monotonicNowSeconds() - 100;
+
+    cluster.checkNodeHealth();
+    try std.testing.expectEqual(ClusterMembership.NodeState.suspect, cluster.nodes.get("node-a").?.state);
+    // A suspect peer is not disconnected — the sweep tears the connection down
+    // only on the failed transition, so there is nothing to reconnect yet.
+    try std.testing.expectEqual(@as(usize, 1), bus.getNodeCount());
+
+    cluster.checkNodeHealth();
+    try std.testing.expectEqual(ClusterMembership.NodeState.failed, cluster.nodes.get("node-a").?.state);
+    try std.testing.expectEqual(@as(usize, 0), bus.getNodeCount());
+
+    // The peer heartbeats again. The state flip and the dial are one decision:
+    // a `.healthy` peer the bus holds no entry for is traffic routed at a peer
+    // we cannot reach.
+    cluster.handleGossipEvent(.{
+        .event_type = .heartbeat,
+        .node_id = "node-a",
+        .host = "127.0.0.1",
+        .port = 18241,
+        .timestamp = 0,
+    });
+    try std.testing.expectEqual(ClusterMembership.NodeState.healthy, cluster.nodes.get("node-a").?.state);
+    try std.testing.expectEqual(@as(usize, 1), bus.getNodeCount());
+
+    // Same asymmetry on the `.leave` path: a known peer's goodbye disconnects
+    // it and its next heartbeat is the return trip.
+    cluster.handleGossipEvent(.{
+        .event_type = .leave,
+        .node_id = "node-a",
+        .host = "127.0.0.1",
+        .port = 18241,
+        .timestamp = 0,
+    });
+    try std.testing.expectEqual(ClusterMembership.NodeState.leaving, cluster.nodes.get("node-a").?.state);
+    try std.testing.expectEqual(@as(usize, 0), bus.getNodeCount());
+
+    cluster.handleGossipEvent(.{
+        .event_type = .join,
+        .node_id = "node-a",
+        .host = "127.0.0.1",
+        .port = 18241,
+        .timestamp = 0,
+    });
+    try std.testing.expectEqual(ClusterMembership.NodeState.healthy, cluster.nodes.get("node-a").?.state);
+    try std.testing.expectEqual(@as(usize, 1), bus.getNodeCount());
 }

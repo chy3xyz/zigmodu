@@ -55,6 +55,9 @@ pub const MemoryStore = struct {
         self.* = undefined;
     }
 
+    /// The map key of a *new* entry: `tenant\x1fuser\x1flogical`. Insert path
+    /// only — a lookup must not go through it (see `forget`, which cannot
+    /// format a key at all: it has no error channel and no bounded buffer).
     fn storageKey(allocator: std.mem.Allocator, tenant_id: i64, user_id: i64, logical: []const u8) ![]u8 {
         return std.fmt.allocPrint(allocator, "{d}\x1f{d}\x1f{s}", .{ tenant_id, user_id, logical });
     }
@@ -176,19 +179,46 @@ pub const MemoryStore = struct {
     }
 
     /// Remove memory for logical key scoped to tenant+user.
+    ///
+    /// Allocation-free on purpose. `forget` has no error channel (`void`), and a
+    /// skipped call leaves data standing that was asked to be deleted — privacy
+    /// deletions included — with nothing reported back. The old shape formatted
+    /// the map key first (`storageKey(...) catch return`), so an OOM turned the
+    /// delete into a silent no-op; the map is keyed `tenant\x1fuser\x1flogical`,
+    /// so the entry a delete means is exactly the one whose three stored fields
+    /// match, and comparing those needs no buffer. A stack buffer was the other
+    /// candidate and is what this deliberately does not use: the logical key is
+    /// caller-supplied and unbounded, so the buffer would need a cap, and a
+    /// truncated key collides across scopes — a delete that removes the wrong
+    /// tenant's row is worse than one that does not run.
+    ///
+    /// `matchesScope` is *not* reused here: it reads `0` as "any" (right for
+    /// `recall`), so `forget(k, 0, 0)` would delete every scope's copy.
     pub fn forget(self: *MemoryStore, key: []const u8, tenant_id: i64, user_id: i64) void {
         // Uncancelable: `forget` has no error channel (`void`), and a skipped call
         // leaves data standing that was asked to be deleted — privacy deletions
-        // included — with nothing reported back. One map removal. Red:
+        // included — with nothing reported back. One map walk plus one removal,
+        // neither of which allocates (a walk of a map bounded by `max_entries`;
+        // the old shape traded that walk for a temporary key whose allocation
+        // failure was the silent drop). Red:
         // `ai.memory.test.canceled lock wait does not lose a remember, forget or
         // count`.
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        const sk = storageKey(self.allocator, tenant_id, user_id, key) catch return;
-        defer self.allocator.free(sk);
+        // The entry's own key is found first: `fetchRemove` would invalidate the
+        // iterator it is looking through.
+        var owned_key: ?[]const u8 = null;
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            const e = entry.value_ptr;
+            if (e.tenant_id == tenant_id and e.user_id == user_id and std.mem.eql(u8, e.key, key)) {
+                owned_key = entry.key_ptr.*;
+                break;
+            }
+        }
 
-        if (self.entries.fetchRemove(sk)) |kv| {
+        if (self.entries.fetchRemove(owned_key orelse return)) |kv| {
             self.allocator.free(kv.key);
             self.allocator.free(kv.value.key);
             self.allocator.free(kv.value.value);
@@ -420,6 +450,47 @@ test "MemoryStore forget" {
 
     store.forget("test:key", 0, 0);
     try std.testing.expectEqual(@as(usize, 0), store.count());
+}
+
+// `forget` used to format a composite lookup key before it removed anything, and
+// answered an allocation failure with `catch return`: `void` has no error
+// channel, so a delete — privacy deletions included — became a silent no-op and
+// the data stayed. The key is compared field-by-field now, so the removal needs
+// no allocation at all, and an OOM cannot drop it.
+//
+// Red on the old shape: `expected 1, found 2` — the delete below was dropped and
+// both entries survived it.
+test "MemoryStore forget removes the entry when no allocation is possible" {
+    const a = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = std.math.maxInt(usize) });
+    var store = MemoryStore.init(failing.allocator(), std.testing.io);
+    defer store.deinit();
+
+    try store.remember("user:pref:lang", "zh", 1, 42);
+    try store.remember("user:pref:lang", "en", 2, 99); // same logical key, other scope
+    try std.testing.expectEqual(@as(usize, 2), store.count());
+
+    // Setup is over: the next allocation fails, and the delete below must not
+    // need one.
+    failing.fail_index = failing.alloc_index;
+
+    store.forget("user:pref:lang", 1, 42);
+
+    // The scoped entry is gone, the other scope's copy is not: the field-wise
+    // match is exact, not a loose "same logical key" sweep.
+    try std.testing.expectEqual(@as(usize, 1), store.count());
+
+    failing.fail_index = std.math.maxInt(usize);
+    var results = try store.recall(a, "user:pref", 2, 99);
+    defer {
+        for (results.items) |e| {
+            a.free(e.key);
+            a.free(e.value);
+        }
+        results.deinit(a);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.items.len);
+    try std.testing.expectEqualStrings("en", results.items[0].value);
 }
 
 test "MemoryStore formatContext" {

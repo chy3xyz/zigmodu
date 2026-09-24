@@ -2764,6 +2764,112 @@ test "h2 session refuses the stream past the advertised MAX_CONCURRENT_STREAMS" 
     try std.testing.expect(findFrameInReply(out[0..n], .rst_stream, 1) == null);
 }
 
+// The other error arm of the h2c upgrade: the stream enters the session's map
+// *before* it is filled from the HTTP/1.1 request, so an allocation failure
+// while filling it has to end the session rather than answer a half-built
+// stream 1. Driven with a `FailingAllocator` over the session's allocations,
+// with the testing allocator as its base — so what this pins is that the arm is
+// reached, that the session ends on the refusal, and that a refusal before the
+// response was encoded leaves stream 1 unanswered (nothing leaked, nothing
+// freed twice: `base` is the testing allocator). The `errdefer`'s own effect —
+// dropping the map entry — is not observable on its own: the session-level
+// `defer` over `streams` frees every value in that same map on the same error
+// path.
+test "serveAfterUpgrade: a refused seeding allocation ends the session with no stream 1 answer" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const base = std.testing.allocator;
+
+    const listen_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var listener = try listen_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer listener.deinit(std.testing.io);
+    const port = listener.socket.address.getPort();
+
+    // Enough fields that the seeding function has a window of allocations to
+    // fail in, rather than a single one.
+    const headers = [_]Hpack.Header{
+        .{ .name = "content-type", .value = "application/json" },
+        .{ .name = "x-tenant", .value = "acme" },
+        .{ .name = "x-extra", .value = "1" },
+    };
+
+    // Calibration: a session whose allocator never fails has to answer stream 1
+    // (that is the harness being the real upgrade path, not a dead end), and the
+    // number of allocations it performs is what bounds the sweep below — a fixed
+    // bound either stops short of the seeding window or runs past the end of the
+    // walk, and a sweep that never fails anything proves nothing.
+    var counting = std.testing.FailingAllocator.init(base, .{});
+    var calibrated_answered = false;
+    _ = upgradeSessionOutcome(&listener, port, counting.allocator(), &headers, &calibrated_answered);
+    try std.testing.expect(calibrated_answered);
+    const walk_allocations = counting.allocations;
+    try std.testing.expect(walk_allocations > 1);
+
+    var refused_before_answer: usize = 0;
+    var refused_after_answer: usize = 0;
+    var fail_index: usize = 0;
+    while (fail_index < walk_allocations) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(base, .{ .fail_index = fail_index });
+        var answered = false;
+        const outcome = upgradeSessionOutcome(&listener, port, failing.allocator(), &headers, &answered);
+        if (outcome) |err| {
+            // The only error a refused allocation produces out of the session.
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            if (answered) refused_after_answer += 1 else refused_before_answer += 1;
+        }
+    }
+
+    // The seeding window is inside the sweep: a refusal that ended the session
+    // before the response was encoded is the arm under test being driven.
+    try std.testing.expect(refused_before_answer > 0);
+    // A refusal before the response was encoded never answered stream 1 — the
+    // other half of the same property (a half-built stream is not dispatched).
+    try std.testing.expect(refused_before_answer >= refused_after_answer);
+}
+
+/// One `serveAfterUpgrade` exchange on a fresh loopback connection: the client
+/// sends the preface and half-closes, the server side runs the session with
+/// `allocator` (what the seeding-failure sweep above varies). Returns the
+/// session's error, `null` when it ended cleanly, and reports through `answered`
+/// whether a response HEADERS frame for stream 1 reached the client.
+fn upgradeSessionOutcome(
+    listener: *std.Io.net.Server,
+    port: u16,
+    allocator: std.mem.Allocator,
+    headers: []const Hpack.Header,
+    answered: *bool,
+) ?anyerror {
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", port) catch return error.UpgradeHarnessFailed;
+    var client = addr.connect(std.testing.io, .{ .mode = .stream }) catch return error.UpgradeHarnessFailed;
+    defer client.close(std.testing.io);
+    const server_side = listener.accept(std.testing.io) catch return error.UpgradeHarnessFailed;
+    defer server_side.close(std.testing.io);
+
+    // No HTTP/1.1 reader to reuse here, so the session reads the preface off the
+    // wire; the half-close is what ends its frame loop.
+    @import("../core/sockread.zig").writeFull(client, Http2.connection_preface) catch return error.UpgradeHarnessFailed;
+    _ = std.c.shutdown(client.socket.handle, std.c.SHUT.WR);
+
+    const outcome: ?anyerror = if (serveAfterUpgrade(std.testing.io, server_side, allocator, .{ .read_idle_timeout_ms = 0 }, null, .{
+        .method = "GET",
+        .target = "/seed",
+        .authority = "localhost",
+        .headers = headers,
+    })) |_| null else |err| err;
+
+    var out: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (total < out.len) {
+        var fds = [_]std.posix.pollfd{.{ .fd = client.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&fds, 1000) catch break;
+        if (ready == 0) break;
+        const n = std.posix.read(client.socket.handle, out[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    answered.* = findFrameInReply(out[0..total], .headers, 1) != null;
+    return outcome;
+}
+
 test "readFramePrefetch consumes SETTINGS then HEADERS from leftover buffer" {
     const allocator = std.testing.allocator;
     const settings = try Http2.encodeSettings(allocator, false, &.{.{ 0x3, 100 }});

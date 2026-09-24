@@ -118,7 +118,17 @@ pub const HttpClient = struct {
         }
 
         pub fn acquire(self: *ConnectionPool, host: []const u8, port: u16) !Connection {
-            self.mutex.lock(self.io) catch return error.ServerError;
+            // Cancelable, unlike `release`/`discard`: nothing is at stake here.
+            // The caller is asking for a room it does not have yet, and neither
+            // list is touched until the lock is held, so there is no resource a
+            // cancelation could strand. Waiting it out uncancelably would be the
+            // wrong answer for the opposite reason: the critical section is not
+            // a list move — it dials (`IpAddress.resolve` + `connect`) — so a
+            // caller told to stop would be held for the length of a connect.
+            // The old mapping to `error.ServerError` could not be told apart
+            // from a broken pool, so the cancelation is propagated as itself
+            // (`std.Io.Mutex.lock` fails only with `error.Canceled`).
+            try self.mutex.lock(self.io);
             defer self.mutex.unlock(self.io);
 
             // Find idle connection & evict stale ones
@@ -471,6 +481,14 @@ pub const HttpClient = struct {
             return self.executeRequest(req) catch |err| {
                 last_error = err;
 
+                // A cancelation is not a failed attempt to retry: it is the
+                // caller saying stop, and it is consumed by the point that
+                // reports it (`error.Canceled` comes back once; later
+                // cancelation points run). Retrying here would therefore not
+                // retry a canceled attempt — it would complete the request
+                // after the caller walked away. Hand it straight back.
+                if (err == error.Canceled) return error.Canceled;
+
                 // The failed attempt has already released its connection by
                 // now. A reused TLS connection that the peer closed while it
                 // sat idle shows up here as ReadFailed/WriteFailed; std marks
@@ -703,6 +721,14 @@ pub const HttpClient = struct {
 
     fn mapHttpsError(err: anyerror) anyerror {
         const name = @errorName(err);
+        // Reached through the same "cancelation reported as something else"
+        // shape as `acquire`'s old `error.ServerError`: `error.Canceled` is in
+        // the error sets of every call this maps (`ConnectTcpError` includes
+        // `Io.Cancelable`, and it is what `Client.request`/`fetch` reach through
+        // `ConnectError`), and the catch-all below would report a caller's stop
+        // as a broken transport. A cancelation is neither a TLS nor a network
+        // failure, so it passes through as itself.
+        if (err == error.Canceled) return error.Canceled;
         if (std.mem.indexOf(u8, name, "Certificate") != null or
             std.mem.indexOf(u8, name, "Tls") != null or
             std.mem.eql(u8, name, "CertificateBundleLoadFailure"))
@@ -1502,6 +1528,231 @@ test "HttpClient ConnectionPool discard drops a connection whose lock wait is ca
     try std.testing.expectEqual(@as(usize, 0), pool.idle_connections.items.len);
     const conn2 = try pool.acquire("127.0.0.1", port);
     pool.release(conn2);
+}
+
+/// What one canceled `acquire` produced: the connection, when the call went
+/// through anyway (the cancelation never landed), or the error, when it did not.
+const AcquireOutcome = struct {
+    err: ?anyerror = error.Unknown,
+    conn: ?HttpClient.ConnectionPool.Connection = null,
+};
+
+/// `acquire`'s counterpart of `cancelWhilePoolLocked`: run it on a concurrent
+/// task whose wait on the pool mutex is canceled — the test thread holds the
+/// mutex — and return what that task got. Same gate, same reason: the gate is
+/// pure spinning, so a cancel request placed while the task is behind it is
+/// still pending when it reaches the lock wait, and the cancelation point under
+/// test is that wait rather than an earlier operation of the task.
+fn canceledAcquireWhilePoolLocked(
+    pool: *HttpClient.ConnectionPool,
+    host: []const u8,
+    port: u16,
+) !AcquireOutcome {
+    const io = pool.io;
+    const Gate = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+        var returned = std.atomic.Value(bool).init(false);
+        var outcome: AcquireOutcome = .{};
+
+        fn run(p: *HttpClient.ConnectionPool, h: []const u8, prt: u16) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            if (p.acquire(h, prt)) |conn| {
+                outcome.conn = conn;
+                outcome.err = null;
+            } else |err| {
+                outcome.err = err;
+            }
+            returned.store(true, .release);
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Gate.entered.store(false, .monotonic);
+    Gate.open.store(false, .monotonic);
+    Gate.returned.store(false, .monotonic);
+    Gate.outcome = .{};
+
+    try pool.mutex.lock(io);
+    var op_fut = try io.concurrent(Gate.run, .{ pool, host, port });
+    while (!Gate.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try io.concurrent(Gate.cancel, .{ io, &op_fut });
+    // Give the request time to land on the task's thread while it is still gated.
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Gate.open.store(true, .release);
+    // The task is now inside `acquire`: parked on the mutex (it swaps the state
+    // to `contended` on its way into the wait) or already gone.
+    while (pool.mutex.state.load(.monotonic) != .contended and !Gate.returned.load(.acquire)) {
+        std.atomic.spinLoopHint();
+    }
+    pool.mutex.unlock(io);
+
+    cancel_fut.await(io);
+    op_fut.await(io);
+    try std.testing.expect(Gate.returned.load(.acquire));
+    return Gate.outcome;
+}
+
+// `acquire` is the pool's one entry point whose wait has to stay cancelable. It
+// used to fold the cancelation into `error.ServerError`, so a caller could not
+// tell "I was canceled" from "the pool machinery broke", and — because a room in
+// the pool is not a resource `acquire` holds yet — there was nothing to protect:
+// neither list has been touched when the wait is canceled. The caller that gave
+// up therefore has to hear `error.Canceled`; the pool must be left exactly as it
+// was, with the slot still usable.
+test "HttpClient ConnectionPool acquire reports a canceled lock wait as error.Canceled" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    const server_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try server_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = server.socket.address.getPort();
+
+    var pool = HttpClient.ConnectionPool.init(allocator, std.testing.io, 1);
+    defer pool.deinit();
+
+    const outcome = try canceledAcquireWhilePoolLocked(&pool, "127.0.0.1", port);
+    if (outcome.conn) |conn| {
+        pool.release(conn);
+        return error.TestUnexpectedResultWithMessage; // the cancelation never landed
+    }
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), outcome.err);
+
+    // Nothing was taken out of the pool, so the caller that gave up owns
+    // nothing: on neither list, and the single slot is free for the next caller.
+    try std.testing.expectEqual(@as(usize, 0), pool.active_connections.items.len);
+    try std.testing.expectEqual(@as(usize, 0), pool.idle_connections.items.len);
+    const conn = try pool.acquire("127.0.0.1", port);
+    try std.testing.expectEqual(@as(usize, 1), pool.active_connections.items.len);
+    pool.release(conn);
+}
+
+/// Answers requests one at a time and stops once `stop` is set. `CannedServer`
+/// above waits five seconds for its first connection, which is what a test that
+/// expects to be served wants; this one is for a test whose expected path never
+/// connects at all, so it has to be able to give up in tens of milliseconds.
+const OneShotHttpServer = struct {
+    listener: *std.Io.net.Server,
+    payload: []const u8,
+    stop: *std.atomic.Value(bool),
+    served: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+    fn run(ctx: *@This()) void {
+        while (!ctx.stop.load(.acquire)) {
+            HttpClient.waitForReadable(ctx.listener.socket.handle, 50) catch continue;
+            const accepted = ctx.listener.accept(std.testing.io) catch continue;
+            defer accepted.close(std.testing.io);
+            _ = ctx.served.fetchAdd(1, .monotonic);
+
+            var seen: [4096]u8 = undefined;
+            var total: usize = 0;
+            while (total < seen.len) {
+                HttpClient.waitForReadable(accepted.socket.handle, 3000) catch break;
+                const n = std.posix.read(accepted.socket.handle, seen[total..]) catch break;
+                if (n == 0) break;
+                total += n;
+                if (std.mem.indexOf(u8, seen[0..total], "\r\n\r\n") != null) break;
+            }
+            writeRawAll(accepted.socket.handle, ctx.payload);
+        }
+    }
+};
+
+// `acquire` reports a canceled wait as `error.Canceled` (test above), and
+// `request` must hand that to its caller instead of spending the remaining
+// attempts: a cancelation is consumed by the point that reports it, so a later
+// cancelation point runs — the "retry" is not a retry, it is the request going
+// out anyway, after the caller asked to stop. The listener here answers, so the
+// old behaviour is not "the request failed" but "the request was served after
+// the cancelation": `served` counts the connections the listener accepted.
+test "HttpClient request hands a canceled attempt to its caller instead of retrying" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var listener = try addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer listener.deinit(std.testing.io);
+    const port = listener.socket.address.getPort();
+
+    var stop = std.atomic.Value(bool).init(false);
+    var server = OneShotHttpServer{
+        .listener = &listener,
+        .payload = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+        .stop = &stop,
+    };
+    const th = try std.Thread.spawn(.{}, OneShotHttpServer.run, .{&server});
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/canceled", .{port});
+
+    var client = HttpClient.init(allocator, std.testing.io, 2, 500);
+    defer client.deinit();
+    var req = HttpClient.HttpRequest.init(allocator, "GET", url);
+    defer req.deinit();
+
+    const Gate = struct {
+        var entered = std.atomic.Value(bool).init(false);
+        var open = std.atomic.Value(bool).init(false);
+        var returned = std.atomic.Value(bool).init(false);
+        var err: ?anyerror = error.Unknown;
+        var status: u16 = 0;
+
+        fn run(c: *HttpClient, r: HttpClient.HttpRequest) void {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.atomic.spinLoopHint();
+            if (c.request(r)) |resp| {
+                var owned = resp;
+                status = owned.status_code;
+                owned.deinit();
+            } else |e| {
+                err = e;
+            }
+            returned.store(true, .release);
+        }
+
+        fn cancel(thread_io: std.Io, fut: *std.Io.Future(void)) void {
+            fut.cancel(thread_io);
+        }
+    };
+    Gate.entered.store(false, .monotonic);
+    Gate.open.store(false, .monotonic);
+    Gate.returned.store(false, .monotonic);
+    Gate.err = error.Unknown;
+    Gate.status = 0;
+
+    // The test thread holds the pool mutex, so the task's first (and only
+    // expected) cancelation point is `acquire`'s wait.
+    try client.connection_pool.mutex.lock(std.testing.io);
+    var op_fut = try std.testing.io.concurrent(Gate.run, .{ &client, req });
+    while (!Gate.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var cancel_fut = try std.testing.io.concurrent(Gate.cancel, .{ std.testing.io, &op_fut });
+    try std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(50), .awake);
+
+    Gate.open.store(true, .release);
+    while (client.connection_pool.mutex.state.load(.monotonic) != .contended and !Gate.returned.load(.acquire)) {
+        std.atomic.spinLoopHint();
+    }
+    client.connection_pool.mutex.unlock(std.testing.io);
+
+    cancel_fut.await(std.testing.io);
+    op_fut.await(std.testing.io);
+    try std.testing.expect(Gate.returned.load(.acquire));
+
+    stop.store(true, .release);
+    th.join();
+
+    // The connection the retried attempt dialed is what the listener counted.
+    try std.testing.expectEqual(@as(usize, 0), server.served.load(.acquire));
+    // Not `status == 200`: a retried attempt is answered by this listener, and
+    // that is the defect — the caller asked to stop and the request went anyway.
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), Gate.err);
 }
 
 // Regression: `acquire` took the connection out of `idle_connections` and only
