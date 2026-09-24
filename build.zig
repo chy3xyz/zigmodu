@@ -206,6 +206,20 @@ pub fn build(b: *std.Build) void {
     const check_api_step = b.step("check-api", "Ensure examples use canonical domain imports");
     check_api_step.dependOn(&check_api_cmd.step);
 
+    // Formatting gate, expressed in the build graph instead of as a bare shell
+    // command in CI so there is one entry point (`zig build fmt-check`) and the
+    // path list cannot drift between jobs. `paths` are handed to `zig fmt`
+    // verbatim and directories recurse, so this checks exactly what the inline
+    // `zig fmt --check src tools examples` did — including the vendored
+    // `examples/*/zig-pkg` snapshots (verified clean before landing). A
+    // non-conforming file makes the step fail (exit 1), not skip.
+    const fmt_check = b.addFmt(.{
+        .paths = &.{ b.path("src"), b.path("tools"), b.path("examples") },
+        .check = true,
+    });
+    const fmt_check_step = b.step("fmt-check", "Check formatting (zig fmt --check src tools examples)");
+    fmt_check_step.dependOn(&fmt_check.step);
+
     const check_prod_cmd = b.addSystemCommand(&.{ "bash", "scripts/check-production.sh" });
     const check_step = b.step("check", "Production gates: no bare catch {} in hot paths");
     check_step.dependOn(&check_prod_cmd.step);

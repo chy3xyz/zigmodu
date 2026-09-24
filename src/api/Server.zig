@@ -2330,6 +2330,63 @@ pub const Server = struct {
         self.tls_front = cfg;
     }
 
+    /// H2 session options derived from `Config`, so both protocols enforce the
+    /// same numbers: `max_body_size`, `header_limits` and `header_timeout_ms`
+    /// mean on the H2 path exactly what they mean on the H1 one.
+    ///
+    /// `deadline` is the connection's `StreamReader` wrapped for the loop; pass
+    /// `null` only if the session is not reading through one.
+    fn http2ServeOptions(self: *Server, deadline: ?Http2Server.ReadDeadline) Http2Server.ServeOptions {
+        return .{
+            .grpc_registry = self.grpc_registry,
+            .site_handler = if (self.http2_site_handler != null)
+                self.http2_site_handler
+            else if (self.http2_use_router)
+                Server.http2RouterSiteHandler
+            else
+                null,
+            .site_user_ctx = self,
+            // One inbound frame per stream request is typical; leave headroom for SETTINGS/WINDOW_UPDATE/CONTINUATION.
+            .max_frames = @max(self.max_requests_per_conn * 16, 4096),
+            .inbound = .{
+                .max_body_bytes = self.max_body_size,
+                .max_header_list_bytes = self.header_limits.max_total_bytes,
+                .max_header_count = self.header_limits.max_count,
+            },
+            // The H1 header deadline is the H2 idle budget: H1 already closes a
+            // keep-alive connection that goes quiet for that long, so one number
+            // governs both, and `0` disables both. `read_deadline` is what makes
+            // it bite inside a blocking read.
+            .read_idle_timeout_ms = self.header_timeout_ms,
+            .read_deadline = deadline,
+        };
+    }
+
+    /// Adapter between the H2 loop's idle deadline and this connection's
+    /// `StreamReader` (`Http2Server` cannot see the transport, and
+    /// `std.Io.Reader` carries no deadline). Reads happen on the connection's
+    /// own fiber, so the reader outlives the session.
+    const Http2ReadDeadline = struct {
+        fn arm(ctx: *anyopaque, ms: u32) void {
+            const reader: *StreamReader = @ptrCast(@alignCast(ctx));
+            reader.setReadDeadline(ms);
+        }
+
+        fn clear(ctx: *anyopaque) void {
+            const reader: *StreamReader = @ptrCast(@alignCast(ctx));
+            reader.clearReadDeadline();
+        }
+
+        fn timedOut(ctx: *anyopaque) bool {
+            const reader: *StreamReader = @ptrCast(@alignCast(ctx));
+            return reader.timed_out;
+        }
+
+        fn handle(reader: *StreamReader) Http2Server.ReadDeadline {
+            return .{ .ctx = reader, .arm_ms = arm, .clear = clear, .timed_out = timedOut };
+        }
+    };
+
     /// H2 site adapter: run `handleForTest` and map Context → SiteResponse.
     fn http2RouterSiteHandler(
         user_ctx: ?*anyopaque,
@@ -2368,7 +2425,7 @@ pub const Server = struct {
         try server.handleForTest(&ctx);
 
         const status = ctx.status_code;
-        const ctype_src = ctx.response_headers.get("content-type") orelse "application/octet-stream";
+        const ctype_src = ctx.header("content-type") orelse "application/octet-stream";
         const ctype = try allocator.dupe(u8, ctype_src);
         errdefer allocator.free(ctype);
         const resp_body = try allocator.dupe(u8, ctx.response_body.items);
@@ -2800,18 +2857,14 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
             // Reuse the same StreamReader for the H2 session (do not create a second
             // reader on this stream). Any bytes already buffered after the preface
             // stay in the reader and are consumed as frames.
-            Http2Server.serveAfterPrefacePrefetchReader(server.io, stream, allocator, .{
-                .grpc_registry = server.grpc_registry,
-                .site_handler = if (server.http2_site_handler != null)
-                    server.http2_site_handler
-                else if (server.http2_use_router)
-                    Server.http2RouterSiteHandler
-                else
-                    null,
-                .site_user_ctx = server,
-                // One inbound frame per stream request is typical; leave headroom for SETTINGS/WINDOW_UPDATE/CONTINUATION.
-                .max_frames = @max(server.max_requests_per_conn * 16, 4096),
-            }, &.{}, &reader.interface) catch |err| {
+            Http2Server.serveAfterPrefacePrefetchReader(
+                server.io,
+                stream,
+                allocator,
+                server.http2ServeOptions(Server.Http2ReadDeadline.handle(&reader)),
+                &.{},
+                &reader.interface,
+            ) catch |err| {
                 std.log.warn("[Server] HTTP/2 session ended: {s}", .{@errorName(err)});
             };
             return;
@@ -2920,17 +2973,13 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
                 var w = stream.writer(server.io, &wbuf);
                 w.interface.writeAll("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n") catch return;
                 w.interface.flush() catch return;
-                Http2Server.serve(server.io, stream, allocator, .{
-                    .grpc_registry = server.grpc_registry,
-                    .site_handler = if (server.http2_site_handler != null)
-                        server.http2_site_handler
-                    else if (server.http2_use_router)
-                        Server.http2RouterSiteHandler
-                    else
-                        null,
-                    .site_user_ctx = server,
-                    .max_frames = @max(server.max_requests_per_conn * 16, 4096),
-                }) catch |err| {
+                Http2Server.serveAfterUpgrade(
+                    server.io,
+                    stream,
+                    allocator,
+                    server.http2ServeOptions(Server.Http2ReadDeadline.handle(&reader)),
+                    &reader.interface,
+                ) catch |err| {
                     std.log.warn("[Server] HTTP/2 h2c upgrade session ended: {s}", .{@errorName(err)});
                 };
                 return;

@@ -281,6 +281,7 @@ pub fn deinit() void {}  // reverse order
 ### Observability / protocols (recent)
 - OTLP: `OtlpExporter.exportSpans` → `http(s)://` + retries（HTTPS 经 std.http.Client）
 - gRPC：unary + stream 四态；HTTP/2 priority / h2c / `Http2Tls` sidecar ALPN
+- **HTTP/2 现在跟随 H1 的限额与超时**（`Server.http2ServeOptions` 是唯一构造点）：`max_body_size` / `header_limits`（解压后头列 16 KiB、100 条，并通告 `SETTINGS_MAX_HEADER_LIST_SIZE`）/ `header_timeout_ms`（空闲读超时，超时 GOAWAY `ENHANCE_YOUR_CALM`）。**两处对 h2 是新行为**：过去 h2 既无头列预算也无空闲超时（浏览器挂着的 h2 连接现在会在 10 s 空闲后断开）；`header_timeout_ms = 0` 可关，但会同时关掉 H1 的 slowloris 闸门
 - Kafka CG：assignor（含 cooperative_sticky）+ `acknowledgeRevocation`；live 需 `KAFKA_BOOTSTRAP`
 
 ## Generated Code Patterns

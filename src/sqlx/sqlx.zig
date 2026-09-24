@@ -321,6 +321,11 @@ pub const BatchInsertOptions = struct {
 /// memory), and no other statement may run on that client until it is: on the
 /// single-connection path (no pool) there is exactly one connection to
 /// interleave with.
+///
+/// Observability: acquiring a cursor is reported like any other read (metrics
+/// callback + circuit breaker, see `Client.queryCursorEx`). Using one is not —
+/// `next` has no error channel — except that a pooled stream which broke while
+/// draining is counted as a read failure against the owning client's breaker.
 pub const Cursor = struct {
     state: State,
     pos: usize = 0,
@@ -359,7 +364,17 @@ pub const Cursor = struct {
         if (self.checkout) |co| {
             if (co.conn.ping()) |_| {
                 co.pool.release(co.conn);
-            } else |_| {
+            } else |err| {
+                // A broken stream is the only *use-phase* failure a cursor can
+                // report — `next()` folds driver errors into "no more rows" — so
+                // it is what a cursor contributes to the breaker. Same filter as
+                // the acquisition used (`isAcceptable`), so the acceptable-error
+                // rule stays "never counted, on either path". No metrics event
+                // here: `sql_str` belongs to the caller, not to the cursor, and
+                // copying it on the chance that `deinit` reports would put an
+                // allocation on every cursor's hot path.
+                const client = co.pool.client;
+                if (!client.isAcceptable(err)) client.cb.recordFailure(client.io);
                 co.pool.discard(co.conn);
             }
         }
@@ -381,6 +396,11 @@ pub const Cursor = struct {
             .buffered => |*rows| {
                 if (self.pos >= rows.rows.len) return null;
                 const row = &rows.rows[self.pos];
+                // The buffered path hands back rows whose `arena` still points
+                // wherever the driver left it (a stack frame, or `undefined`) —
+                // `Row.rowAllocator()` / `scan()` on those is UB. The other
+                // buffered entry points patch it the same way.
+                row.arena = &rows.arena;
                 self.pos += 1;
                 return row;
             },
@@ -466,14 +486,23 @@ const PgCursor = struct {
         // in-flight query has been fetched, which is why clearing `current`
         // alone (the previous behavior) left the next borrower — `ping` only
         // looks at `PQstatus`, which stays CONNECTION_OK — reading this query's
-        // leftover frames. `PQgetResult` blocks until the next result arrives
-        // and returns null at the end of the stream, so the loop below drains
-        // whatever `next()` did not consume. That drain is a full read of the
-        // remaining rows (not a cancel): dropping a cursor over a large scan
-        // costs reading the rest of it.
+        // leftover frames.
+        //
+        // The drain below is what restores that state. The cancel in front of it
+        // is what keeps the drain from having to *read* the whole remaining
+        // result set: without it, dropping a cursor over a large scan costs
+        // every remaining row on the wire. Cancel is an optimization, never a
+        // requirement — when it cannot be dispatched (dead connection,
+        // unreachable postmaster) the drain still ends the stream, which is
+        // exactly the old behavior and the old cost.
         if (self.conn) |conn| {
             if (self.current) |res| libpq_c.PQclear(res);
             self.current = null;
+            // `eof` set means the driver already saw the end of the stream
+            // (`PQgetResult` returned null, or an error status ended it): there
+            // is nothing in flight to cancel, and a cancel nobody needs is a
+            // wasted postmaster connection.
+            if (!self.eof) cancelInFlight(conn);
             while (libpq_c.PQgetResult(conn)) |res| libpq_c.PQclear(res);
         } else if (self.current) |res| {
             libpq_c.PQclear(res);
@@ -503,6 +532,24 @@ const PgCursor = struct {
             self.eof = true;
             return null;
         }
+        // A zero-row `PGRES_TUPLES_OK` is the end of the stream, not a row. In
+        // single-row mode libpq delivers the query's *row-description* result —
+        // zero rows, the original `PQresult` restored by `pqPrepareAsyncResult`
+        // once the last tuple is handed out — as the terminal result, and an
+        // empty result set is delivered as exactly that result too (it is then
+        // the only result the query ever produces). Reading row 0 out of it is
+        // out of range, and libpq answers "is null" for every column, so this
+        // used to come back as one phantom all-NULL row — which for an empty
+        // result set was the only row the caller ever saw, and which panics the
+        // usual `row.get("col").?.int` decoding.
+        if (libpq_c.PQntuples(res) == 0) {
+            libpq_c.PQclear(res);
+            self.current = libpq_c.PQgetResult(self.conn);
+            // If nothing else is pending the stream has ended, so record it:
+            // `deinit` then has nothing to cancel and nothing to drain.
+            if (self.current == null) self.eof = true;
+            return null;
+        }
         const n_cols = libpq_c.PQnfields(res);
         const values = self.arena.allocator().alloc(?Value, @intCast(n_cols)) catch return null;
         for (0..@intCast(n_cols)) |c| {
@@ -518,6 +565,38 @@ const PgCursor = struct {
         return &self.row;
     }
 };
+
+/// `PQcancel` writes its failure text into a caller-supplied buffer; libpq's
+/// own comment calls 256 the recommended size (fe-cancel.c: "must be of size
+/// errbufsize (recommended size is 256 bytes)").
+const PG_CANCEL_ERRBUF_SIZE = 256;
+
+/// Ask the server to abort `conn`'s in-flight command — best effort, no return
+/// value: the caller drains the result stream either way, so a cancel that does
+/// not dispatch is a cost, not an error.
+///
+/// Assumptions this relies on:
+///   * the connection is not being used concurrently. `PgCursor.deinit` is the
+///     only caller and a streaming cursor holds its pool checkout, so no other
+///     statement can be in flight on `conn`; the cancel is issued *between*
+///     `PQgetResult` calls, never during one (the old cancel protocol is
+///     signal-safe but not reentrant);
+///   * cancel only affects a command already running on the server. When the
+///     command has already finished, the request is a no-op the backend
+///     discards while idle (tcop/postgres.c: "Query cancel is supposed to be a
+///     no-op when there is no query in progress"), which is why this is gated on
+///     `!eof` rather than being issued unconditionally.
+fn cancelInFlight(conn: *libpq_c.PGconn) void {
+    const cancel = libpq_c.PQgetCancel(conn) orelse return;
+    defer libpq_c.PQfreeCancel(cancel);
+    // Zeroed, not `undefined`: a failed dispatch is *documented* to leave the
+    // message here, but only a terminated buffer makes reading it safe if that
+    // ever stops being true.
+    var errbuf: [PG_CANCEL_ERRBUF_SIZE]u8 = @splat(0);
+    if (libpq_c.PQcancel(cancel, &errbuf, PG_CANCEL_ERRBUF_SIZE) == 0) {
+        std.log.debug("[sqlx] PG cancel request not dispatched: {s}", .{cStrSpan(&errbuf)});
+    }
+}
 
 /// Execution result
 pub const ExecResult = struct {
@@ -4665,7 +4744,11 @@ pub const Client = struct {
         return self.prepare(sql_str);
     }
 
-    pub fn withAcceptable(f: *const fn (anyerror) bool) SqlOption {
+    /// `comptime`: the option is a bare `fn (*Client) void`, so the captured
+    /// filter has to be a compile-time parameter — as a runtime one, the inner
+    /// `apply` cannot reach it and *every* caller fails to compile
+    /// (`error: 'f' not accessible from inner function`).
+    pub fn withAcceptable(comptime f: *const fn (anyerror) bool) SqlOption {
         return struct {
             fn apply(client: *Client) void {
                 client.acceptable = f;
@@ -4768,9 +4851,37 @@ pub const Client = struct {
     }
 
     /// The primary-side cursor path: `queryCursorEx` with replica routing removed.
+    ///
+    /// Metrics and breaker bookkeeping mirror `queryPrimary` field by field —
+    /// same callback arguments, same `isAcceptable` filter, same "one event per
+    /// attempt" — so a read served by a cursor is as visible as one served by
+    /// `query` (a replica whose cursors fail must be able to trip its breaker
+    /// too, or routing keeps picking it).
+    ///
+    /// Both cover *acquiring* the cursor only. Row fetching happens later, in
+    /// `Cursor.next`, which has no error channel at all (the drivers fold a
+    /// mid-stream failure into "no more rows"); the one use-phase signal that
+    /// does exist — a stream that broke while draining — is booked in
+    /// `Cursor.deinit`.
     fn queryCursorExPrimary(self: *Client, sql_str: []const u8, args: []const Value, opts: CursorOptions) !Cursor {
         if (!self.cb.allow(self.io)) return error.CircuitBreakerOpen;
 
+        const t0 = Time.monotonicNow();
+        const cursor = self.doQueryCursor(sql_str, args, opts) catch |err| {
+            const elapsed: u64 = @intCast(@max(@as(i64, 0), Time.monotonicNow() - t0));
+            if (self.metrics_callback) |cb| cb(elapsed, sql_str, false, @errorName(err));
+            if (!self.isAcceptable(err)) self.cb.recordFailure(self.io);
+            return err;
+        };
+        const elapsed: u64 = @intCast(@max(@as(i64, 0), Time.monotonicNow() - t0));
+        if (self.metrics_callback) |cb| cb(elapsed, sql_str, true, null);
+        self.cb.recordSuccess(self.io);
+        return cursor;
+    }
+
+    /// Cursor acquisition over the pool / single connection — the `queryCursorEx`
+    /// analogue of `doQuery` (same shape, `CursorOptions` forwarded).
+    fn doQueryCursor(self: *Client, sql_str: []const u8, args: []const Value, opts: CursorOptions) !Cursor {
         self.ensurePool();
         if (self.pool) |*p| {
             const conn = try p.acquire();
@@ -8179,6 +8290,157 @@ test "sqlite pooled client stays usable after a cursor is abandoned early" {
     // Every checkout came back exactly once — no leaked pool slot.
     const m = pool.metrics();
     try std.testing.expectEqual(m.total_acquired, m.total_released);
+}
+
+/// Counts `MetricsCallback` invocations. A read path that never calls the
+/// callback is invisible to HTTP/SQL metrics no matter how healthy it is, so
+/// the tests below pin the *observability* of the cursor path, not just its
+/// return values.
+const MetricsRecorder = struct {
+    var ok_calls: usize = 0;
+    var fail_calls: usize = 0;
+    var last_err: ?[]const u8 = null;
+
+    fn reset() void {
+        ok_calls = 0;
+        fail_calls = 0;
+        last_err = null;
+    }
+
+    fn record(_: u64, _: []const u8, ok: bool, err_msg: ?[]const u8) void {
+        if (ok) {
+            ok_calls += 1;
+        } else {
+            fail_calls += 1;
+            last_err = err_msg;
+        }
+    }
+};
+
+test "cursor path reports metrics and breaker state like the query path" {
+    const allocator = std.testing.allocator;
+    MetricsRecorder.reset();
+
+    // (1) A cursor handed out successfully is a successful read.
+    {
+        var db = Client.init(allocator, std.testing.io, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+        defer db.deinit();
+        db.withMetrics(MetricsRecorder.record);
+        var cursor = try db.queryCursor("SELECT ?1 AS n", &.{.{ .int = 1 }});
+        defer cursor.deinit();
+        try std.testing.expectEqual(@as(i64, 1), cursor.next().?.get("n").?.int);
+        try std.testing.expectEqual(@as(usize, 1), MetricsRecorder.ok_calls);
+        try std.testing.expectEqual(@as(usize, 0), MetricsRecorder.fail_calls);
+        try std.testing.expectEqual(@as(u32, 0), db.cb.failure_count);
+    }
+
+    // (2) An acquisition that fails is a failed read — the same event shape
+    // `query` books, in metrics *and* in the breaker.
+    //
+    // The failure used is pool exhaustion (`max_wait_ms = 0`), not a bad
+    // statement: a driver error would be logged at `err` level, and this
+    // suite's runner treats any logged error as a failed run. Both slots are
+    // taken before the first cursor call, so the pool cannot serve the checkout
+    // from idle — nothing may be released in between, since a released
+    // connection would satisfy the next acquire.
+    var db = Client.init(allocator, std.testing.io, .{
+        .driver = .sqlite,
+        .sqlite_path = ":memory:",
+        .max_open_conns = 2,
+        .max_idle_conns = 2,
+        .max_wait_ms = 0,
+    });
+    defer db.deinit();
+    db.ensurePool();
+    const pool = &db.pool.?;
+    db.withMetrics(MetricsRecorder.record);
+    const held_a = try pool.acquire();
+    defer pool.release(held_a);
+    const held_b = try pool.acquire();
+    defer pool.release(held_b);
+
+    try std.testing.expectError(error.Timeout, db.queryCursor("SELECT ?1 AS n", &.{.{ .int = 2 }}));
+    try std.testing.expectEqual(@as(usize, 1), MetricsRecorder.fail_calls);
+    try std.testing.expectEqualStrings("Timeout", MetricsRecorder.last_err.?);
+    try std.testing.expectEqual(@as(u32, 1), db.cb.failure_count);
+
+    try std.testing.expectError(error.Timeout, db.query("SELECT ?1 AS n", &.{.{ .int = 2 }}));
+    try std.testing.expectEqual(@as(usize, 2), MetricsRecorder.fail_calls);
+    try std.testing.expectEqual(@as(u32, 2), db.cb.failure_count);
+
+    // (3) The acceptance filter is honoured on both paths: an error it allows
+    // is reported to metrics but not counted by the breaker. Assigned directly
+    // rather than through `Client.withAcceptable`, whose `SqlOption` closure
+    // cannot read the filter out of its enclosing frame (see the replica
+    // fallback test above).
+    const AcceptTimeout = struct {
+        fn f(err: anyerror) bool {
+            return err == error.Timeout;
+        }
+    };
+    db.acceptable = AcceptTimeout.f;
+    try std.testing.expectError(error.Timeout, db.queryCursor("SELECT ?1 AS n", &.{.{ .int = 3 }}));
+    try std.testing.expectEqual(@as(usize, 3), MetricsRecorder.fail_calls);
+    try std.testing.expectEqualStrings("Timeout", MetricsRecorder.last_err.?);
+    try std.testing.expectEqual(@as(u32, 2), db.cb.failure_count);
+
+    try std.testing.expectError(error.Timeout, db.query("SELECT ?1 AS n", &.{.{ .int = 3 }}));
+    try std.testing.expectEqual(@as(usize, 4), MetricsRecorder.fail_calls);
+    try std.testing.expectEqual(@as(u32, 2), db.cb.failure_count);
+
+    // (4) The `allow()` gate still comes first, as it does for `query`: an open
+    // breaker rejects without emitting a metrics event.
+    for (0..5) |_| db.cb.recordFailure(db.io);
+    const before = MetricsRecorder.fail_calls;
+    try std.testing.expectError(error.CircuitBreakerOpen, db.queryCursor("SELECT ?1 AS n", &.{.{ .int = 4 }}));
+    try std.testing.expectEqual(before, MetricsRecorder.fail_calls);
+}
+
+test "cursor deinit books a broken stream against the owning client's breaker" {
+    const allocator = std.testing.allocator;
+    var db = Client.init(allocator, std.testing.io, .{
+        .driver = .sqlite,
+        .sqlite_path = ":memory:",
+        .max_open_conns = 2,
+        .max_idle_conns = 2,
+    });
+    defer db.deinit();
+    db.ensurePool();
+    const pool = &db.pool.?;
+
+    // A cursor that ends cleanly leaves the breaker alone.
+    var state = CursorTestConn{};
+    var cursor = testStreamingCursor(&state, pool, allocator);
+    cursor.deinit();
+    try std.testing.expectEqual(@as(u32, 0), db.cb.failure_count);
+
+    // A stream that broke while draining is a read failure: the connection is
+    // retired (see the checkout test) *and* the attempt is counted, so a client
+    // whose cursors keep breaking trips its breaker instead of looping.
+    var dead = CursorTestConn{ .healthy = false };
+    var dead_cursor = testStreamingCursor(&dead, pool, allocator);
+    dead_cursor.deinit();
+    try std.testing.expect(dead.closed);
+    try std.testing.expectEqual(@as(u32, 1), db.cb.failure_count);
+}
+
+test "libpq cancel bindings link and answer without a server" {
+    if (!DriverFeatures.postgres) return error.SkipZigTest;
+    // The cancel path itself needs a live server, but the bindings can be
+    // exercised — and their symbols resolved out of the linked libpq — with no
+    // server at all: `PQgetCancel(NULL)` returns NULL by contract, `PQfreeCancel`
+    // is a bare `free` (NULL-safe), and `PQcancel(NULL, …)` takes libpq's "no
+    // cancel object supplied" branch, writing the message into `errbuf` and
+    // returning 0 without touching the network (fe-cancel.c).
+    try std.testing.expect(libpq_c.PQgetCancel(null) == null);
+    libpq_c.PQfreeCancel(null);
+
+    var errbuf: [PG_CANCEL_ERRBUF_SIZE]u8 = @splat(0);
+    try std.testing.expect(libpq_c.PQcancel(null, &errbuf, PG_CANCEL_ERRBUF_SIZE) == 0);
+    // The stub (postgres disabled) would leave the buffer untouched, so a
+    // written byte is what shows the call reached real libpq. The text itself
+    // is libpq's and may change; only "it wrote something" is asserted.
+    try std.testing.expect(errbuf[0] != 0);
 }
 
 test "mysql streaming cursor api compiles" {

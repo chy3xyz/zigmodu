@@ -111,9 +111,6 @@ jobs:
         run: |
           brew install libpq mariadb-connector-c sqlite3 || true
 
-      - name: Check formatting
-        run: zig fmt --check src tools examples
-
       - name: Build library
         run: zig build
 
@@ -313,7 +310,11 @@ jobs:
         run: sudo apt-get install -y libpq-dev libmariadb-dev libmariadb-dev-compat libsqlite3-dev
 
       - name: Zig fmt check
-        run: zig fmt --check src tools examples
+        # Single home for the formatting gate: the build graph owns the path
+        # list (`fmt-check` in build.zig), so this job and any local run call
+        # the same thing. It used to also run in `build-and-test`, i.e. three
+        # times across the matrix for one platform-independent check.
+        run: zig build fmt-check
 
       - name: Version consistency
         run: bash scripts/check-version.sh

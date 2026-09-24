@@ -26,6 +26,7 @@ const std = @import("std");
 const Http2 = @import("Http2.zig");
 const Hpack = @import("Hpack.zig");
 const Grpc = @import("../extensions/GrpcTransport.zig");
+const Time = @import("../core/Time.zig");
 
 // ==== §1  Wire types ====
 
@@ -54,6 +55,22 @@ pub const SiteHandler = *const fn (
     body: []const u8,
 ) anyerror!SiteResponse;
 
+/// Deadline control for the transport the session reads from. The H2 loop sees
+/// only a `std.Io.Reader`, which has no deadline concept, so a caller that has
+/// one (e.g. `Server`'s `StreamReader`) hands it in here; without it a peer
+/// that stops sending parks the loop in `read` and the idle budget below can
+/// only be noticed between frames.
+pub const ReadDeadline = struct {
+    ctx: *anyopaque,
+    /// Bound the next read to `ms`; 0 = unbounded.
+    arm_ms: *const fn (ctx: *anyopaque, ms: u32) void,
+    /// Clear the bound — the session is over.
+    clear: *const fn (ctx: *anyopaque) void,
+    /// Whether the last failed read was cut short by the deadline rather than
+    /// by the transport.
+    timed_out: *const fn (ctx: *anyopaque) bool,
+};
+
 pub const ServeOptions = struct {
     /// When set, `:path` + `content-type: application/grpc` → registry dispatch.
     grpc_registry: ?*Grpc.GrpcServiceRegistry = null,
@@ -69,6 +86,16 @@ pub const ServeOptions = struct {
     max_pending_bytes: usize = 4 * 1024 * 1024,
     /// Inbound resource limits (RFC 7540 §10.5 denial-of-service defenses).
     inbound: InboundLimits = .{},
+    /// Idle-read budget for the session, in milliseconds: the clock starts when
+    /// the session does and restarts on every complete frame. The H2 loop has
+    /// no request phase to bound (unlike the H1 request-line / body
+    /// deadlines), so without this a peer that sends the preface and then goes
+    /// quiet holds its connection fiber forever. Over budget the session
+    /// answers GOAWAY(ENHANCE_YOUR_CALM) and returns. `0` disables the bound.
+    /// `Server` fills this from `Config.header_timeout_ms`.
+    read_idle_timeout_ms: u32 = 10_000,
+    /// Transport hook that cuts a blocked read short — see `ReadDeadline`.
+    read_deadline: ?ReadDeadline = null,
 };
 
 /// Inbound resource limits for one HTTP/2 connection.
@@ -76,6 +103,9 @@ pub const ServeOptions = struct {
 /// The H1 path bounds requests through `Server.Config` (`max_body_size`,
 /// `header_limits`); the H2 loop has no access to that struct, so it carries its
 /// own limits and applies them at the frame layer, before anything is buffered.
+/// `Server` fills every field from its `Config` (see `Server.http2ServeOptions`),
+/// so both protocols enforce the same numbers; the defaults here are the H1
+/// defaults and are what a direct `ServeOptions` caller gets.
 pub const InboundLimits = struct {
     /// Largest inbound frame we accept. RFC 7540 §4.2: the peer must not exceed
     /// the value we advertise in SETTINGS, and 16384 is the default. Raise it
@@ -96,6 +126,14 @@ pub const InboundLimits = struct {
     /// Priority-tree nodes allowed beyond the concurrent-stream cap. PRIORITY on
     /// idle streams is legal, so the tree needs headroom — but not unbounded.
     priority_tree_slack: usize = 32,
+    /// Decoded header-list bytes per stream, advertised as
+    /// SETTINGS_MAX_HEADER_LIST_SIZE (RFC 9113 §6.5.2: name + value + 32 per
+    /// field). `max_header_block_bytes` bounds the compressed block; this
+    /// bounds what the block expands to. Mirrors `Server.HeaderLimits.max_total_bytes`.
+    max_header_list_bytes: usize = 16 * 1024,
+    /// Decoded header fields per stream. HTTP/2 advertises no SETTINGS value
+    /// for it; it mirrors `Server.HeaderLimits.max_count`.
+    max_header_count: usize = 100,
 };
 
 /// Inbound limit breaches. Each maps to a concrete HTTP/2 answer (GOAWAY or
@@ -239,6 +277,30 @@ pub fn serve(
     try serveAfterPreface(io, stream, allocator, opts);
 }
 
+/// Serve one HTTP/2 connection whose preface still has to be read, reusing the
+/// connection's own reader (h2c upgrade, RFC 7540 §3.2: the 101 is already on
+/// the wire, and the client's preface may have been pipelined into the same
+/// segment as the upgrade request — those bytes are in `inbound`'s buffer, not
+/// in the socket). `null` reads the preface straight from the stream, which is
+/// what `serve` does.
+pub fn serveAfterUpgrade(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    allocator: std.mem.Allocator,
+    opts: ServeOptions,
+    inbound: ?*std.Io.Reader,
+) !void {
+    var preface_buf: [Http2.connection_preface.len]u8 = undefined;
+    if (inbound) |reader| {
+        var off: usize = 0;
+        try readExactPrefetch(reader, &.{}, &off, &preface_buf);
+    } else {
+        try readExact(io, stream, &preface_buf);
+    }
+    if (!std.mem.eql(u8, &preface_buf, Http2.connection_preface)) return error.InvalidHttp2Preface;
+    try serveAfterPrefacePrefetchReader(io, stream, allocator, opts, &.{}, inbound);
+}
+
 /// Serve one prior-knowledge HTTP/2 connection. Preface must already be consumed.
 ///
 /// `prefetch` holds bytes already buffered by the caller (e.g. StreamReader leftover
@@ -279,9 +341,12 @@ pub fn serveAfterPrefacePrefetchReader(
 ) !void {
     var writer = ConnWriter.init(io, stream);
 
+    // Advertised limits: the peer must see the same numbers we enforce, or it
+    // cannot know which of its requests will be refused (RFC 9113 §6.5.2).
     const settings = try Http2.encodeSettings(allocator, false, &.{
         .{ Http2.SettingsId.max_concurrent_streams, opts.inbound.max_concurrent_streams },
         .{ Http2.SettingsId.initial_window_size, Http2.default_initial_window_size },
+        .{ Http2.SettingsId.max_header_list_size, std.math.cast(u32, opts.inbound.max_header_list_bytes) orelse std.math.maxInt(u32) },
     });
     defer allocator.free(settings);
     try writer.write(settings);
@@ -289,6 +354,7 @@ pub fn serveAfterPrefacePrefetchReader(
 
     var hpack_dec = Hpack.Decoder.init(allocator);
     defer hpack_dec.deinit();
+    hpack_dec.setAdvertisedHeaderListSize(opts.inbound.max_header_list_bytes, opts.inbound.max_header_count);
 
     var conn_flow = Http2.FlowControlState.init(Http2.default_initial_window_size);
     var conn_max_frame_size: u31 = 16384;
@@ -328,8 +394,30 @@ pub fn serveAfterPrefacePrefetchReader(
 
     const drain_slice: usize = 8;
 
+    // Idle clock: the budget covers the session, and a complete frame refills
+    // it. The enforcement is the transport deadline (`read_deadline`), armed
+    // below for whatever is left of the budget — the check at the top of the
+    // iteration only runs *between* frames, so on its own it cannot bound a
+    // loop parked in a blocking read (a caller that supplies no deadline keeps
+    // its reads unbounded, as before).
+    const idle_timeout_ms = opts.read_idle_timeout_ms;
+    defer if (opts.read_deadline) |d| d.clear(d.ctx);
+    var last_progress_ms: i64 = Time.monotonicNowMilliseconds();
+
     var frames: usize = 0;
     while (frames < opts.max_frames) : (frames += 1) {
+        if (idle_timeout_ms > 0) {
+            const idle_ms = Time.monotonicNowMilliseconds() - last_progress_ms;
+            if (idle_ms >= @as(i64, idle_timeout_ms)) {
+                try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.ENHANCE_YOUR_CALM, &goaway_sent);
+                return;
+            }
+            // Arm for what is left of the budget, not a fresh full one: a peer
+            // that sends one byte per (budget - 1) ms must not extend the
+            // session indefinitely.
+            if (opts.read_deadline) |d| d.arm_ms(d.ctx, @intCast(idle_timeout_ms - @as(u32, @intCast(idle_ms))));
+        }
+
         const inbound_ready = (prefetch_off < prefetch_buf.len) or (reader.bufferedLen() > 0);
         if (!inbound_ready and outbound.pending.count() > 0) {
             try outbound.drain(&writer, &priority_tree, &conn_flow, conn_max_frame_size, 0);
@@ -357,12 +445,20 @@ pub fn serveAfterPrefacePrefetchReader(
                 try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.ENHANCE_YOUR_CALM, &goaway_sent);
                 return;
             },
+            error.ReadFailed => {
+                // A spent deadline is the idle peer: name it, so the client can
+                // tell "you went quiet" from a broken transport.
+                const timed_out = if (opts.read_deadline) |d| d.timed_out(d.ctx) else false;
+                try sendGoAway(&writer, allocator, last_peer_stream, readFailureCode(timed_out), &goaway_sent);
+                return;
+            },
             else => {
                 try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.PROTOCOL_ERROR, &goaway_sent);
                 return;
             },
         };
         defer allocator.free(frame_buf);
+        last_progress_ms = Time.monotonicNowMilliseconds();
         inbound_bytes += frame_buf.len;
 
         const frame = Http2.decodeFrame(frame_buf) catch {
@@ -509,11 +605,13 @@ pub fn serveAfterPrefacePrefetchReader(
                         // decoder's table state has already diverged from the
                         // peer's, so later streams would keep failing. RST alone
                         // would leave the session writing into a broken decoder.
+                        // A header list past the size we advertised is the other
+                        // case: the block decoded, only *this* stream is refused.
                         if (Hpack.isConnectionError(err)) {
                             try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.COMPRESSION_ERROR, &goaway_sent);
                             return;
                         }
-                        try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, Http2.ErrorCode.COMPRESSION_ERROR);
+                        try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, headerDecodeErrorCode(err));
                         continue;
                     };
                     maybeStartLiveBidi(&writer, allocator, sid, gop.value_ptr, opts) catch |err| {
@@ -574,12 +672,13 @@ pub fn serveAfterPrefacePrefetchReader(
                     st.decodeHeaders(allocator, &hpack_dec) catch |err| {
                         // Connection-level for the same reason as the
                         // `streams.getOrPut` path above: the HPACK context is
-                        // shared by every stream on the connection.
+                        // shared by every stream on the connection. A list past
+                        // the advertised size is not that kind of failure.
                         if (Hpack.isConnectionError(err)) {
                             try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.COMPRESSION_ERROR, &goaway_sent);
                             return;
                         }
-                        try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, Http2.ErrorCode.COMPRESSION_ERROR);
+                        try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, headerDecodeErrorCode(err));
                         continue;
                     };
                     maybeStartLiveBidi(&writer, allocator, sid, st, opts) catch |err| {
@@ -737,6 +836,25 @@ fn inboundLimitCode(err: anyerror) u32 {
         error.HeaderBlockTooLarge, error.BodyTooLarge => Http2.ErrorCode.ENHANCE_YOUR_CALM,
         else => Http2.ErrorCode.INTERNAL_ERROR,
     };
+}
+
+/// HTTP/2 error code for a header block that decoded but produced a list past
+/// what we advertised (RFC 9113 §6.5.2). The block itself was fine, so this is
+/// one stream's answer, not the connection's — but the list was refused, and
+/// `ENHANCE_YOUR_CALM` is that refusal.
+fn headerDecodeErrorCode(err: anyerror) u32 {
+    return switch (err) {
+        error.HeaderListTooLarge, error.TooManyHeaderFields => Http2.ErrorCode.ENHANCE_YOUR_CALM,
+        else => Http2.ErrorCode.COMPRESSION_ERROR,
+    };
+}
+
+/// HTTP/2 error code for a frame read that failed: a read the idle deadline cut
+/// short is a peer that stopped talking (`ENHANCE_YOUR_CALM`, the §10.5 answer
+/// to excessive load — it is holding a connection slot for nothing), anything
+/// else is the transport.
+fn readFailureCode(timed_out: bool) u32 {
+    return if (timed_out) Http2.ErrorCode.ENHANCE_YOUR_CALM else Http2.ErrorCode.PROTOCOL_ERROR;
 }
 
 fn sendGoAway(
@@ -1929,4 +2047,228 @@ test "advertised MAX_CONCURRENT_STREAMS is enforced" {
     try checkConcurrentStreams(99, 100);
     try std.testing.expectError(error.TooManyStreams, checkConcurrentStreams(100, 100));
     try std.testing.expectError(error.TooManyStreams, checkConcurrentStreams(101, 100));
+}
+
+// --- Header-list budget (RFC 9113 §6.5.2) + session idle deadline, end to end ---
+
+/// HPACK string literal: length prefix + bytes, no Huffman. Test-local because
+/// `Hpack.Encoder` never emits a dynamic-table reference, and the block below
+/// has to: a client that indexes a name it just inserted is what makes "the
+/// decoder kept its table in step past the budget" observable at the session
+/// level. Short strings only, so the length-prefix path is one byte.
+fn appendHpackString(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
+    std.debug.assert(s.len < 127);
+    try buf.append(allocator, @intCast(s.len));
+    try buf.appendSlice(allocator, s);
+}
+
+/// `GET <path>` pseudo-headers: static indexes for `:method` / `:scheme`,
+/// literal values for `:authority` / `:path`. 178 bytes on the header-list
+/// budget for `/echo` (42 + 43 + 51 + 42).
+fn appendPseudoHeaders(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, path: []const u8) !void {
+    try buf.append(allocator, 0x82); // :method GET — static index 2
+    try buf.append(allocator, 0x86); // :scheme http — static index 6
+    try buf.append(allocator, 0x01); // literal, name from static index 1 (:authority)
+    try appendHpackString(buf, allocator, "localhost");
+    try buf.append(allocator, 0x04); // literal, name from static index 4 (:path)
+    try appendHpackString(buf, allocator, path);
+}
+
+/// Site handler that answers with the request's `x-big` value, so the body
+/// says which slices the decoder actually produced.
+fn echoBigHeader(
+    _: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    path: []const u8,
+    headers: []const Hpack.Header,
+    body: []const u8,
+) anyerror!SiteResponse {
+    _ = method;
+    _ = path;
+    _ = body;
+    var value: []const u8 = "none";
+    for (headers) |h| {
+        if (std.mem.eql(u8, h.name, "x-big")) value = h.value;
+    }
+    return .{ .status = 200, .content_type = "text/plain", .body = try allocator.dupe(u8, value) };
+}
+
+/// Stand-in for a transport deadline: records what the loop asked for. The
+/// session runs on another thread and the helper joins it before returning, so
+/// reading these fields afterwards is ordered by the join.
+const FakeDeadline = struct {
+    arms: usize = 0,
+    last_ms: u32 = 0,
+    cleared: bool = false,
+
+    fn arm(ctx: *anyopaque, ms: u32) void {
+        const self: *FakeDeadline = @ptrCast(@alignCast(ctx));
+        self.arms += 1;
+        self.last_ms = ms;
+    }
+
+    fn clear(ctx: *anyopaque) void {
+        const self: *FakeDeadline = @ptrCast(@alignCast(ctx));
+        self.cleared = true;
+    }
+
+    fn timedOut(ctx: *anyopaque) bool {
+        _ = ctx;
+        return false;
+    }
+
+    fn handle(self: *FakeDeadline) ReadDeadline {
+        return .{ .ctx = self, .arm_ms = arm, .clear = clear, .timed_out = timedOut };
+    }
+};
+
+test "h2 session advertises SETTINGS_MAX_HEADER_LIST_SIZE from the options" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    const advertised: u32 = 4096;
+    var out: [4096]u8 = undefined;
+    const n = try runLoopbackH2Session(.{ .inbound = .{ .max_header_list_bytes = advertised } }, &.{}, &out);
+    const reply = out[0..n];
+
+    var seen = false;
+    var off: usize = 0;
+    while (off + 9 <= reply.len) {
+        const f = Http2.decodeFrame(reply[off..]) catch break;
+        if (f.header.typ == .settings) {
+            const entries = try Http2.decodeSettings(allocator, f.payload);
+            defer allocator.free(entries);
+            for (entries) |s| {
+                if (s.id == Http2.SettingsId.max_header_list_size) {
+                    // The advertised value is the one we enforce, not a
+                    // hard-coded default: the peer has to be able to tell.
+                    try std.testing.expectEqual(advertised, s.value);
+                    seen = true;
+                }
+            }
+        }
+        off += 9 + @as(usize, f.header.length);
+    }
+    try std.testing.expect(seen);
+}
+
+test "h2 session answers a header list past the advertised size with one RST" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    // 250 bytes: one request (178) fits, one request plus a 60-byte field (275)
+    // does not.
+    var script = std.ArrayList(u8).empty;
+    defer script.deinit(allocator);
+
+    // Stream 1 — inserts `x-big` into the dynamic table (index 62), then blows
+    // the budget on that very field.
+    var block1 = std.ArrayList(u8).empty;
+    defer block1.deinit(allocator);
+    try appendPseudoHeaders(&block1, allocator, "/echo");
+    try block1.append(allocator, 0x40); // literal with incremental indexing, new name
+    try appendHpackString(&block1, allocator, "x-big");
+    try appendHpackString(&block1, allocator, "012345678901234567890123456789012345678901234567890123456789");
+    const h1 = try Http2.encodeHeaders(allocator, 1, block1.items, true, true);
+    defer allocator.free(h1);
+    try script.appendSlice(allocator, h1);
+
+    // Stream 3 — an indexed reference to that entry (name index 62). If the
+    // decoder had stopped at the budget instead of finishing the block, the
+    // entry would not exist and this would be a connection error, not a
+    // response.
+    var block3 = std.ArrayList(u8).empty;
+    defer block3.deinit(allocator);
+    try appendPseudoHeaders(&block3, allocator, "/echo");
+    try block3.append(allocator, 0x40 | 62); // literal with incremental indexing, name from dynamic index 62
+    try appendHpackString(&block3, allocator, "synced");
+    const h3 = try Http2.encodeHeaders(allocator, 3, block3.items, true, true);
+    defer allocator.free(h3);
+    try script.appendSlice(allocator, h3);
+
+    var out: [8192]u8 = undefined;
+    const n = try runLoopbackH2Session(.{
+        .inbound = .{ .max_header_list_bytes = 250 },
+        .site_handler = echoBigHeader,
+    }, script.items, &out);
+    const reply = out[0..n];
+
+    // The over-size list is refused for *that stream*: RST + ENHANCE_YOUR_CALM,
+    // no GOAWAY — the block decoded, only the list is too big.
+    const rst = findFrameInReply(reply, .rst_stream, 1) orelse return error.TestUnexpectedResultWithMessage;
+    try std.testing.expectEqual(Http2.ErrorCode.ENHANCE_YOUR_CALM, try Http2.decodeRstStream(rst.payload));
+    try std.testing.expect(findFrameInReply(reply, .goaway, 0) == null);
+
+    // …and the connection is healthy: the next stream decodes against the
+    // table the refused block left behind.
+    const data = findFrameInReply(reply, .data, 3) orelse return error.TestUnexpectedResultWithMessage;
+    try std.testing.expectEqualStrings("synced", data.payload);
+    try std.testing.expect((data.header.flags & Http2.FrameFlags.end_stream) != 0);
+}
+
+test "h2 session answers too many header fields with one RST" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var script = std.ArrayList(u8).empty;
+    defer script.deinit(allocator);
+
+    // Stream 1 — five fields against a four-field budget.
+    var block1 = std.ArrayList(u8).empty;
+    defer block1.deinit(allocator);
+    try appendPseudoHeaders(&block1, allocator, "/over");
+    try block1.append(allocator, 0x00); // literal without indexing, new name
+    try appendHpackString(&block1, allocator, "x-extra");
+    try appendHpackString(&block1, allocator, "1");
+    const h1 = try Http2.encodeHeaders(allocator, 1, block1.items, true, true);
+    defer allocator.free(h1);
+    try script.appendSlice(allocator, h1);
+
+    // Stream 3 — exactly four, so the bound is a limit and not a blanket refusal.
+    var block3 = std.ArrayList(u8).empty;
+    defer block3.deinit(allocator);
+    try appendPseudoHeaders(&block3, allocator, "/ok");
+    const h3 = try Http2.encodeHeaders(allocator, 3, block3.items, true, true);
+    defer allocator.free(h3);
+    try script.appendSlice(allocator, h3);
+
+    var out: [8192]u8 = undefined;
+    // Byte budget off: this test is about the count.
+    const n = try runLoopbackH2Session(.{
+        .inbound = .{ .max_header_list_bytes = 0, .max_header_count = 4 },
+    }, script.items, &out);
+    const reply = out[0..n];
+
+    const rst = findFrameInReply(reply, .rst_stream, 1) orelse return error.TestUnexpectedResultWithMessage;
+    try std.testing.expectEqual(Http2.ErrorCode.ENHANCE_YOUR_CALM, try Http2.decodeRstStream(rst.payload));
+    try std.testing.expect(findFrameInReply(reply, .goaway, 0) == null);
+
+    // No site_handler → the loop's built-in 404 body, but a complete response.
+    const data = findFrameInReply(reply, .data, 3) orelse return error.TestUnexpectedResultWithMessage;
+    try std.testing.expectEqualStrings("not found", data.payload);
+}
+
+test "h2 session arms the read idle deadline and clears it on exit" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var fake = FakeDeadline{};
+    var out: [4096]u8 = undefined;
+    const n = try runLoopbackH2Session(.{
+        .read_idle_timeout_ms = 30_000,
+        .read_deadline = fake.handle(),
+    }, &.{}, &out);
+    _ = n;
+
+    // Armed before the read (that is what lets a silent peer be cut off) and
+    // cleared once the session is over, so the deadline does not leak into
+    // whatever the connection does next.
+    try std.testing.expect(fake.arms > 0);
+    try std.testing.expect(fake.last_ms > 0 and fake.last_ms <= 30_000);
+    try std.testing.expect(fake.cleared);
+}
+
+test "read failure code names the idle peer, not the transport" {
+    try std.testing.expectEqual(Http2.ErrorCode.ENHANCE_YOUR_CALM, readFailureCode(true));
+    try std.testing.expectEqual(Http2.ErrorCode.PROTOCOL_ERROR, readFailureCode(false));
 }

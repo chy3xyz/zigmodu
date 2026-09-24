@@ -243,7 +243,11 @@ pub const WorkerPool = struct {
 };
 
 fn signalShutdown(shared: *WorkerPool.Shared) void {
-    shared.mu.lock(shared.io) catch return;
+    // Uncancelable: this is the shutdown path. `deinit` calls this and then
+    // `thread.join()`s every worker; a canceled `lock` returning early would
+    // leave `shutdown` unset and the broadcast unsent, so workers stay parked
+    // in `cond.wait` and the join never returns.
+    shared.mu.lockUncancelable(shared.io);
     defer shared.mu.unlock(shared.io);
 
     shared.shutdown = true;

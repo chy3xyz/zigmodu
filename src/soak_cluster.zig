@@ -158,22 +158,17 @@ fn envU64(name: [*:0]const u8, default: u64) u64 {
 // reads them afterwards, so they are plain data settled before any spawn.
 var port_base: u16 = 23456;
 var fd_budget: u64 = 8;
-/// Envelope for the RSS *spread* over a run — deliberately loose, because what
-/// it can observe here is allocator page retention, not a leak: the runner's
-/// leak check (`0 leaked`) is the actual leak gate, and it stays clean while
-/// this spread grows.
+/// Envelope for the RSS *spread* over a run. **It is a real envelope again**,
+/// now that the growth it used to catch has been explained (it was not the
+/// cluster — see `soak_gpa` below): with the root allocator no longer capturing
+/// stack traces per alloc/free, the same load that used to spread 42–91 MiB
+/// (and 108–163 MiB at 2x traffic) stays at ~9–12 MiB.
 ///
-/// Calibration (macOS aarch64, `-Dsoak-cluster-iterations=2400`): the *unchanged*
-/// tree measured 42 / 63 / 70 MiB across three runs, and with the batch of
-/// concurrency fixes in this tree 88 / 90 / 91 MiB. At 2x traffic (`=4800`) both
-/// grow further and both exceed 64 — baseline 12 -> 108 MiB, with the fixes
-/// 11 -> 163 MiB and still climbing — so the growth scales with traffic and is
-/// pre-existing, not introduced here. 128 keeps the default config a real
-/// envelope on this machine while `SOAK_CLUSTER_RSS_BUDGET_MIB` lets a tighter
-/// or looser machine state its own number. The unresolved part — why 2x traffic
-/// costs ~+55 MiB more with the fixes than without — is an open finding, not
-/// something this constant should hide.
-var rss_budget_bytes: u64 = 128 * 1024 * 1024;
+/// 48 MiB leaves ~4x headroom for a different allocator/page-size regime while
+/// still failing on anything that grows with traffic. `SOAK_CLUSTER_RSS_BUDGET_MIB`
+/// overrides it for a host that needs its own number. The *live-byte* assertion
+/// after teardown (`soak_gpa.deinit()`) is the precise gate; this is the coarse one.
+var rss_budget_bytes: u64 = 48 * 1024 * 1024;
 var thread_budget: u64 = 2;
 var max_leader_transitions: u64 = 3;
 var min_leader_presence_pct: u64 = 90;
@@ -1078,10 +1073,46 @@ var series: [max_samples]Sample = undefined;
 // `std.testing.allocator` makes exactly that a failed run (`leaked` in the
 // runner's summary), which is why every use below is wrapped in a `defer`.
 
-/// Allocator for the peer snapshots. Deliberately the testing allocator: it
-/// fails the test (instead of silently growing RSS) when a snapshot is not
-/// freed, including on the failure paths.
-const snapshot_allocator = std.testing.allocator;
+/// Root allocator for the cluster fixtures and the peer snapshots.
+///
+/// **Why not `std.testing.allocator`** (the shape here until this change): on this
+/// toolchain it captures a stack trace on *every* alloc and free, and each capture
+/// permanently leaks ~313 B into `std.debug.getDebugInfoAllocator()` — a
+/// process-global arena that is never reset (an arena's `free` is a no-op).
+/// Measured on this repo, all with the same load:
+///
+/// * 200k isolated `alloc(u8,128)` + `free` with `stack_trace_frames = 7` (the
+///   Debug default) → **+125 MiB RSS**; the identical loop with `= 0` → flat.
+/// * 400k bare `std.debug.captureCurrentStackTrace` calls → +125,104 KiB, i.e.
+///   ~313 B each, linear; an idle control loop → 0.
+/// * `SafeAllocator`'s own accounting during that churn: backing live bytes
+///   constant at 32 KiB, allocations and frees paired — the allocator retained
+///   nothing.
+/// * Relinking this harness's root allocator to `std.heap.smp_allocator`: live
+///   bytes 130–227 KiB, RSS **9–12 MiB flat** at both 2400 and 4800 messages per
+///   writer — versus the 89 / 163 MiB this test used to fail on (including on an
+///   unchanged tree).
+///
+/// So the RSS growth was the probe, not the cluster: ~0.75 KB per allocation.
+/// `DebugAllocator` with stack capture off keeps what the harness actually wants
+/// (double-free / write-after-free canaries, leak detection on `deinit`, and a
+/// hard `0 leaked` verdict via `soak_gpa.deinit()` below) without the per-capture
+/// leak. Leak reports lose their call stacks — the tradefair price, and the
+/// snapshots' `defer` discipline is what those stacks were diagnosing.
+var soak_gpa = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }){};
+
+fn soakAllocator() std.mem.Allocator {
+    return soak_gpa.allocator();
+}
+
+/// Allocator for the peer snapshots: deliberately the leak-checked root above, so
+/// a snapshot that is not `deinit()`ed fails the run instead of silently growing.
+/// (`std.testing.allocator` used to be here and made exactly that a failed run —
+/// it still would, but every snapshot would also leak ~313 B into the debug-info
+/// arena, ~470 snapshots per run.)
+fn snapshotAllocator() std.mem.Allocator {
+    return soakAllocator();
+}
 
 /// Entry count of one bus's registry plus how many of those entries held a
 /// socket, both from **one** snapshot.
@@ -1093,7 +1124,7 @@ const BusCensus = struct { entries: usize, live: usize };
 /// reading" — never read as "this bus has no peers". The returned snapshot is
 /// the caller's to `deinit()`.
 fn snapshotPeers(bus: *DistributedEventBus) ?DistributedEventBus.NodeSnapshot {
-    return bus.snapshotNodes(snapshot_allocator) catch |err| {
+    return bus.snapshotNodes(snapshotAllocator()) catch |err| {
         _ = harness_internal_failures.fetchAdd(1, .monotonic);
         std.log.warn("[soak-cluster] peer snapshot for {s} failed ({}); reading skipped", .{ bus.nodeId(), err });
         return null;
@@ -1175,7 +1206,10 @@ fn reconnectMissingMeshPeers() void {
 }
 
 test "soak: 3-node cluster — raft + event bus, leader/fd/RSS invariants" {
-    const allocator = std.testing.allocator;
+    // The leak-checked root below, not `std.testing.allocator`: see `soak_gpa`
+    // for the measurements. Safer in every way this test cares about, and it
+    // stops the harness from measuring std's debug-info arena instead of itself.
+    const allocator = soakAllocator();
     if (!zigmodu.NetworkProbe.available()) return error.SkipZigTest;
 
     initThresholds();
@@ -1574,4 +1608,10 @@ test "soak: 3-node cluster — raft + event bus, leader/fd/RSS invariants" {
     if (threads_walked) {
         try std.testing.expect(th_max - th_min <= thread_budget);
     }
+
+    // The precise gate the RSS envelope is only an approximation of: every
+    // byte the fixtures and snapshots took is back. `deinit` also runs the
+    // canary checks, so this replaces the runner's `0 leaked` line for this
+    // test (which no longer uses `std.testing.allocator`).
+    try std.testing.expectEqual(std.heap.Check.ok, soak_gpa.deinit());
 }

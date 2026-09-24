@@ -2,6 +2,12 @@
 
 pub const PGconn = opaque {};
 pub const PGresult = opaque {};
+/// Cancel-request handle from `PQgetCancel`: an opaque snapshot of the
+/// backend's address/pid/cancel-key, deliberately *not* a reference to the
+/// `PGconn` — that is what lets a cancel be dispatched while a query is in
+/// flight (and from a signal handler / another thread; libpq does not require
+/// the owning thread to be idle).
+pub const PGcancel = opaque {};
 
 pub const ConnStatusType = enum(c_int) {
     CONNECTION_OK = 0,
@@ -77,6 +83,20 @@ pub extern "c" fn PQsetSingleRowMode(conn: ?*PGconn) c_int;
 pub extern "c" fn PQgetResult(conn: ?*PGconn) ?*PGresult;
 pub extern "c" fn PQconsumeInput(conn: ?*PGconn) c_int;
 pub extern "c" fn PQisBusy(conn: ?*PGconn) c_int;
+
+/// Snapshot `conn`'s cancel key. NULL when there is nothing to cancel with
+/// (NULL connection, or a connection whose socket is already invalid).
+pub extern "c" fn PQgetCancel(conn: ?*PGconn) ?*PGcancel;
+/// Free a handle from `PQgetCancel` — libpq's implementation is a bare `free`.
+pub extern "c" fn PQfreeCancel(cancel: ?*PGcancel) void;
+/// Dispatch the cancel request: opens its own short-lived connection to the
+/// postmaster and sends the key. Returns non-zero when the request was sent;
+/// on failure the reason is written into `errbuf` (which "must be of size
+/// errbufsize (recommended size is 256 bytes)" — fe-cancel.c) and is *not*
+/// touched on success. Successful dispatch is not a guarantee of effect at the
+/// backend: the caller still has to read the result stream to completion.
+/// Signal-safe but not reentrant; only meaningful for an in-flight command.
+pub extern "c" fn PQcancel(cancel: ?*PGcancel, errbuf: [*c]u8, errbufsize: c_int) c_int;
 pub extern "c" fn PQputCopyData(conn: ?*PGconn, buffer: [*c]const u8, nbytes: c_int) c_int;
 pub extern "c" fn PQputCopyEnd(conn: ?*PGconn, errormsg: [*c]const u8) c_int;
 pub extern "c" fn PQsetdbLogin(

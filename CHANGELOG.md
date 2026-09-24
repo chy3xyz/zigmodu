@@ -2,6 +2,95 @@
 
 ## [Unreleased]
 
+### soak 的 RSS 增长查明：**是测试分配器这条探针**，不是集群；门禁改成有意义的（**破坏性：否**）
+
+困扰几轮的"RSS 随流量线性增长"有了确定性根因：`std.testing.allocator`（SafeAllocator）在**每次
+alloc/free 各做一次栈回溯**，而这套工具链上**每次回溯在进程里永久留下 ~313 B** —— 落点是
+`std.debug.getDebugInfoAllocator()` 那个**永不 reset 的 arena**（arena 的 `free` 是 no-op），
+`SelfUnwinder.deinit` 每次都用它释放 CFI/表达式 scratch。证据链（每步都是差分实验，非推理）：
+
+| 实验 | 结果 |
+|---|---|
+| 同一负载，只换根分配器 | `testing.allocator`：活字节 172 KiB / **RSS 11→89 MiB**；`smp_allocator`：活字节 130 KiB / **RSS 9→12 MiB 平** |
+| 纯 churn（最多 1 个活分配，200k 次 `alloc(128)`+`free`） | testing **+125 MiB**；smp / page **0** |
+| 分配器内部记账（SafeAllocator + 计数 backing） | 活字节恒 32 KiB、alloc/free 成对 → 分配器**一个字节都没留** |
+| 唯一变量 A/B：`.stack_trace_frames = 7`（Debug 默认） vs `0` | `7` → **+125,040 KiB**（三次一毫不差）；`0` → 平 |
+| 完全不碰分配器：400k 次 `captureCurrentStackTrace` | **+125,104 KiB ≈ 313 B/次，线性**；空转对照组 0 |
+| 在编译根 hook `getDebugInfoAllocator` | 同样 400k 次 → **+128 KiB 平**（hook 被调 2,002,320 次） |
+
+模型自洽：105k 次分配 → 78 MiB = 782 B/次 ≈ 2 次捕捉 × ~330 B，用它预测 4800 那组得 167 MiB
+（实测 163 MiB，差 2.5%）。
+
+**harness 改动**：soak-cluster 与 runtime-stress 的根分配器从 `std.testing.allocator` 换成
+`DebugAllocator(.{ .stack_trace_frames = 0 })` —— canary 与泄漏检测都保留，只是不做栈回溯
+（那正是泄漏源）；soak 另加一条**精确判据** `soak_gpa.deinit() == .ok`（活字节回到拆机前），
+RSS 预算从 128 收紧到 **48 MiB**（原来它是"量 Zig 调试 arena"的假门禁，我还把它接进了夜间 CI）。
+
+实测（本机）：soak-cluster 默认 **RSS 10→12 MiB**（原来 88–91）、4800/写者 **9→12 MiB**（原来 163）、
+`1 passed`；runtime-stress RSS spread 49 KB（budget 24 MiB）、PASS。顺带把文件里那段"未结发现"的
+注释换成根因与标定数据。
+
+### HTTP/2 收尾：限额统一、会话空闲超时、HPACK 头列预算、h2c 升级路径（**破坏性：否**，两处 h2 行为变化）
+
+- **限额统一**：新增 `Server.http2ServeOptions`（唯一构造点），h2 从此跟随 H1 的
+  `max_body_size` / `header_limits`（解压后头列 **16 KiB / 100 条**）/ `header_timeout_ms`；
+  过去 h2 **完全绕开**这三个（硬编码）。**没有引入新旋钮**（一个设置管两个协议，刻意的）。
+- **会话空闲读超时**：h2 过去**永不超时** —— 一个连上就不说话的 prior-knowledge h2c 连接会永久占住
+  一个连接处理线程。现在按剩余预算武装读超时（递减，所以"每 budget-1 ms 发一个字节"不能续命），
+  超时回 `GOAWAY(ENHANCE_YOUR_CALM)`。**这是对 h2 的行为变化**：浏览器挂着的空闲 h2 连接会在
+  10 s 后断开；`header_timeout_ms = 0` 可关（会同时关掉 H1 的 slowloris 闸门）。
+- **HPACK 头列预算 + 通告**：按"解压后字节（每字段 +32 B 开销）+ 条数"计费，通告
+  `SETTINGS_MAX_HEADER_LIST_SIZE`（通告值 == 执法值）。**超限是流级 `RST(ENHANCE_YOUR_CALM)`**
+  （RFC 9113 §6.5.2），且**整个块仍解完只是丢字段** —— 中途弃块会让 HPACK 动态表与对端编码器错位，
+  把流级错误升级成连接级（有用例钉住"下一个流仍能按索引解出正确值"）。
+- **顺带修三处**：① `serveAfterUpgrade` 从未被调用（h2c 升级路径仍用硬编码选项 = 死 API），且升级
+  路径丢管线化 preface 字节（客户端把 preface 与升级请求同段发来时）—— 两处都修；② `Hpack.decode`
+  的 `errdefer` 用**长度 ≤ capacity 的 slice** 去 `free` 再 `deinit` 容量 = invalid free（此前不可达，
+  新预算错误路径一踩就 SIGABRT）；③ h2 响应的 content-type 查找是大小写敏感的
+  （`response_headers.get("content-type")` vs 实际写入的 `Content-Type`）→ h2 响应一律落到
+  `application/octet-stream`，改用大小写不敏感的 `ctx.header()`。
+- 测试：新增 8 条（5 条真 loopback），②③ 有可复现红（探针断开预算/`arm_ms` 即红）；① 只有推理链
+  —— `Config → ServeOptions` 那一跳没有测试观测，**"走注册路由的完整 dispatch E2E"仍未做**。
+
+### sqlx 游标收尾：接回熔断与指标、`PQcancel` 抽干、PG 幽灵行（**破坏性：否**）
+
+- **游标路径接回熔断器与指标**：`queryCursorExPrimary` 过去只 `cb.allow`，成功/失败都不记账、
+  不触发 `metrics_callback`（对比 `queryPrimary` 两者都有）—— 副本熔断在游标路径上永不打开。
+  现在四处字段（`duration_ns`/`query`/`ok`/`err_msg`）与熔断时机**逐字段对齐** `queryPrimary`；
+  "抽干时流断了"也在 `Cursor.deinit` 记账（deinit 处不报 metrics：游标没留 `sql_str` 副本，
+  为一条迟到事件拷一份等于给每个游标加一次分配）。
+- **PG 早弃游标改用 `PQcancel`**：过去只能"读完剩余行"（弃掉大扫描要付全量读取代价）。新绑定
+  `PQgetCancel`/`PQcancel`/`PQfreeCancel`（签名用 clang 对着真 `libpq-fe.h` 验过），errbuf 256 B
+  照 `fe-cancel.c` 约定；`PQgetCancel` 为 NULL 或 `PQcancel` 失败都**回落到抽干**（旧行为、旧成本）。
+  **未运行时验证**：真 PG 的 cancel+抽干时序（本机无服务）。
+- **修 PG 流式游标的幽灵行**：读到结尾会多出**一行全 NULL**（空结果集时这行是唯一看到的行），
+  `row.get("col").?` 在 Debug/Safe 直接 panic。依据链到 libpq 的 `PGASYNC_READY` 终局交付
+  （`PQntuples(res)==0`），`!eof` 门控也因此更准。
+- **`Client.withAcceptable` 任何调用方都编译不过**（内层函数捕获运行时参数 → `'f' not accessible`）
+  → 参数改 `comptime`；**buffered 游标返回的行 `arena` 是悬空/undefined**（`Row.rowAllocator()` /
+  `scan()` 即 UB）→ 在 `Cursor.next` 的 buffered 分支补 `row.arena = &rows.arena`。
+
+### 构建/工具链：`Compile.max_rss` 实测是 fail-silent（**决定不加**）、fmt 门禁入 build 图、关停锁逐处判定
+
+- **`Compile.max_rss` 不加**：实测超限时打印 `memory usage peaked at 0.26GB …, exceeding the declared
+  upper bound`、树里显示 `failure`，但**总结是 `3/3 steps succeeded`、退出码 0**（源码：
+  `Maker/Step.zig` 只把消息 append 进 `result_error_msgs`，不返回错误；`Maker.zig` 仍置 `.success`）
+  —— 又一个"树里红、CI 绿"的假门禁。`--skip-oom-steps` 更是静默跳过。CI 侧的真杠杆是 `-j2`。
+- **`b.addFmt` 落地**：新增 `zig build fmt-check`（`check = true`），CI 从两处裸 `zig fmt --check`
+  收编到一处；探针验证过"绿跑后改坏文件仍会红"（不会被缓存掩盖）。
+- **关停路径 `lockUncancelable`**：前提修正（全仓并非 0 处，`runtime.zig`/`scheduler.zig`/`sqlx.zig`/
+  `breaker.zig` 已在用）；逐处判定后**只改 2 处**：`Pool.deinit`（原来取消即 `catch return`，跳过销毁
+  idle 连接 = 全泄漏）与 `WorkerPool.signalShutdown`（取消则 `shutdown` 标志没置、broadcast 没发 →
+  随后 `thread.join()` **永久挂死**）；其余 10 处（请求路径/getter/`Lru` 的完整清理分支）判定不改并
+  写明理由。顺带报告未修：`Lru.deinit` 的 `tryLock` 无锁 teardown 竞态、`Pool.release` 取消时静默丢连接。
+
+### 文档
+
+`AGENTS.md` 与 `docs/ROUTE_TABLE.md` 的背压表补上 h2 一行：h2 跟随 H1 的限额/超时、**没有独立旋钮**，
+并标出"空闲超时与头列预算对 h2 是新行为"。
+
+## [Unreleased]
+
 ### 第 3 组：sqlx 游标所有权/闸门、两处配置串号、CSRF/CSP、web4 顺序与时钟、x402 台账语义（**破坏性：否**，含一处 fail-open 修复）
 
 **x402：`store` 明确为「幂等台账」，校验回归 verifier（fail-open → fail-closed）**

@@ -490,6 +490,7 @@ catalog_slot.set(try router.finish());
 | 连接 | `max_connections` / `over_limit_response` | accept 洪泛、fd/内存耗尽 |
 | 头部 | `header_timeout_ms` | slowloris（慢速滴 header）；header 读完即解除，不误杀慢上传 |
 | 请求体 | `body_timeout_ms`（默认 30 s，`0` 关） | 慢滴 body / Slow-POST：header 之后 body 读完之前的预算；超预算回 **408** |
+| HTTP/2 | 同上三者（`max_body_size`/`header_limits`/`header_timeout_ms`，经 `Server.http2ServeOptions`） | h2 **没有独立的旋钮**：body 限额、解压后头列预算（16 KiB/100 条，并通告 `SETTINGS_MAX_HEADER_LIST_SIZE`，超限 `RST(ENHANCE_YOUR_CALM)`）与空闲读超时都跟随 H1 的设置；空闲超时对 h2 是新行为（过去不会超时） |
 | 请求 | `request_timeout_ms` | handler 执行时长 |
 | WS 出站 | `ws_write_timeout_ms` + `WsFramer.isWritable()` | 不读的慢客户端阻塞写线程 |
 

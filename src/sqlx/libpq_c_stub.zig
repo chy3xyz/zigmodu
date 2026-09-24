@@ -2,6 +2,7 @@
 
 pub const PGconn = opaque {};
 pub const PGresult = opaque {};
+pub const PGcancel = opaque {};
 
 pub const ConnStatusType = enum(c_int) {
     CONNECTION_OK = 0,
@@ -102,6 +103,13 @@ pub fn PQconsumeInput(_: ?*PGconn) c_int {
     return 0;
 }
 pub fn PQisBusy(_: ?*PGconn) c_int {
+    return 0;
+}
+pub fn PQgetCancel(_: ?*PGconn) ?*PGcancel {
+    return null;
+}
+pub fn PQfreeCancel(_: ?*PGcancel) void {}
+pub fn PQcancel(_: ?*PGcancel, _: [*c]u8, _: c_int) c_int {
     return 0;
 }
 pub fn PQputCopyData(_: ?*PGconn, _: [*c]const u8, _: c_int) c_int {

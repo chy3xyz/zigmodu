@@ -60,6 +60,10 @@ pub const SettingsId = struct {
     pub const max_concurrent_streams: u16 = 0x3;
     pub const initial_window_size: u16 = 0x4;
     pub const max_frame_size: u16 = 0x5;
+    /// RFC 9113 §6.5.2 — the uncompressed header list we are willing to accept
+    /// (name + value + 32 per field). Purely advisory on the wire: a list over
+    /// it is answered at the stream level, not with GOAWAY.
+    pub const max_header_list_size: u16 = 0x6;
 };
 
 pub const SettingEntry = struct { id: u16, value: u32 };
@@ -1039,4 +1043,18 @@ test "encodeGoAway decodeGoAway roundtrip with debug" {
     try std.testing.expectEqual(@as(u31, 7), info.last_stream_id);
     try std.testing.expectEqual(ErrorCode.NO_ERROR, info.error_code);
     try std.testing.expectEqualStrings("bye", info.debug);
+}
+
+test "SETTINGS_MAX_HEADER_LIST_SIZE round-trips through encode/decode" {
+    const allocator = std.testing.allocator;
+    const wire = try encodeSettings(allocator, false, &.{.{ SettingsId.max_header_list_size, 16 * 1024 }});
+    defer allocator.free(wire);
+
+    const frame = try decodeFrame(wire);
+    try std.testing.expectEqual(FrameType.settings, frame.header.typ);
+    const got = try decodeSettings(allocator, frame.payload);
+    defer allocator.free(got);
+    try std.testing.expectEqual(@as(usize, 1), got.len);
+    try std.testing.expectEqual(@as(u16, 0x6), got[0].id);
+    try std.testing.expectEqual(@as(u32, 16 * 1024), got[0].value);
 }

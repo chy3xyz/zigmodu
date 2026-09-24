@@ -489,6 +489,41 @@ fn huffmanDecode(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
 /// RFC 7541 §6.5.2 default SETTINGS_HEADER_TABLE_SIZE.
 pub const default_table_size: usize = 4096;
 
+/// Header-list budget for one decoded block (RFC 9113 §6.5.2), charged as the
+/// fields are decoded.
+///
+/// The compressed block is not the interesting bound: an indexed reference
+/// costs 1–2 bytes on the wire and can name a 4 KiB dynamic-table entry, so a
+/// 64 KiB block inflates into a header list orders of magnitude larger. What a
+/// peer can make us allocate is the *decoded* list, so that is what is metered.
+const HeaderListBudget = struct {
+    /// Advertised SETTINGS_MAX_HEADER_LIST_SIZE. 0 = no byte budget.
+    max_bytes: usize = 0,
+    /// Field-count cap (there is no SETTINGS entry for it). 0 = no cap.
+    max_fields: usize = 0,
+    bytes: usize = 0,
+    fields: usize = 0,
+    /// The limit error, once the budget is spent; `null` while within it.
+    hit: ?anyerror = null,
+
+    /// Charge one decoded field (name + value + the 32-byte per-field overhead
+    /// RFC 9113 §6.5.2 counts). Returns `false` once the budget is spent — the
+    /// caller must then drop the field **and keep decoding**: see
+    /// `Decoder.decode`.
+    fn charge(self: *HeaderListBudget, name: []const u8, value: []const u8) bool {
+        if (self.hit == null) {
+            self.fields += 1;
+            self.bytes += name.len + value.len + 32;
+            if (self.max_bytes != 0 and self.bytes > self.max_bytes) {
+                self.hit = error.HeaderListTooLarge;
+            } else if (self.max_fields != 0 and self.fields > self.max_fields) {
+                self.hit = error.TooManyHeaderFields;
+            }
+        }
+        return self.hit == null;
+    }
+};
+
 pub const Decoder = struct {
     allocator: std.mem.Allocator,
     dynamic: std.ArrayList(OwnedHeader) = .empty,
@@ -500,10 +535,26 @@ pub const Decoder = struct {
     /// value. Drives eviction (RFC 7541 §4.4).
     max_table_size: usize = default_table_size,
     current_size: usize = 0,
+    /// Advertised SETTINGS_MAX_HEADER_LIST_SIZE in bytes (RFC 9113 §6.5.2).
+    /// 0 = no budget: a direct `Decoder` user keeps the unbounded behaviour
+    /// unless it opts in through `setAdvertisedHeaderListSize`.
+    max_header_list_size: usize = 0,
+    /// Field-count budget. Not a SETTINGS value — HTTP/2 has none for it; it
+    /// mirrors the H1 `HeaderLimits.max_count` guard. 0 = no budget.
+    max_header_count: usize = 0,
 
     const OwnedHeader = struct {
         name: []u8,
         value: []u8,
+    };
+
+    /// One decoded field plus the ownership flags `freeHeaders` needs — the
+    /// unit the header-list budget is charged for.
+    const Decoded = struct {
+        name: []const u8,
+        value: []const u8,
+        name_owner: Owner = .borrowed,
+        value_owner: Owner = .borrowed,
     };
 
     pub fn init(allocator: std.mem.Allocator) Decoder {
@@ -525,6 +576,17 @@ pub const Decoder = struct {
         self.evictFor(0);
     }
 
+    /// Advertise SETTINGS_MAX_HEADER_LIST_SIZE: a decoded list larger than
+    /// `bytes` (RFC 9113 §6.5.2 counts name + value + 32 per field), or with
+    /// more than `max_fields` fields, fails `decode` with
+    /// `error.HeaderListTooLarge` / `error.TooManyHeaderFields`. `0` disables
+    /// either budget. Both errors are stream errors (`isConnectionError` is
+    /// false): the block decoded, only the list is past what we advertised.
+    pub fn setAdvertisedHeaderListSize(self: *Decoder, bytes: usize, max_fields: usize) void {
+        self.max_header_list_size = bytes;
+        self.max_header_count = max_fields;
+    }
+
     fn clearDynamic(self: *Decoder) void {
         for (self.dynamic.items) |h| {
             self.allocator.free(h.name);
@@ -534,20 +596,49 @@ pub const Decoder = struct {
         self.current_size = 0;
     }
 
+    /// Release a decoded field whose ownership never reached the header list.
+    fn release(self: *Decoder, d: Decoded) void {
+        if (ownsSlice(d.name_owner, d.name)) self.allocator.free(@constCast(d.name));
+        if (ownsSlice(d.value_owner, d.value)) self.allocator.free(@constCast(d.value));
+    }
+
     /// Decode a header block. Slice ownership is flagged per header
     /// (`Header.name_owner` / `value_owner`); release the result with
     /// `freeHeaders`.
     ///
-    /// Every failure here is a connection error (RFC 7541 §4.2): the caller
+    /// A decoding failure is a connection error (RFC 7541 §4.2): the caller
     /// must send GOAWAY(COMPRESSION_ERROR) instead of RST_STREAM — see
     /// `isConnectionError`. The table state is undefined after a failure, so
     /// drop the decoder rather than reusing it.
+    ///
+    /// A header-list budget breach (`setAdvertisedHeaderListSize`) is **not**
+    /// one of those: the block decoded fine, only the list is bigger than we
+    /// advertised, so the caller answers RST_STREAM and keeps the decoder.
+    /// That is why the loop runs to the end of the block even after the budget
+    /// is spent — the dynamic table is shared by every stream on the
+    /// connection (RFC 7541 §2.2), so abandoning a block mid-way would leave
+    /// our table out of step with the peer's encoder and make the next stream
+    /// fail too.
     pub fn decode(self: *Decoder, block: []const u8) ![]Header {
         var out = std.ArrayList(Header).empty;
         errdefer {
-            freeHeaders(self.allocator, out.items);
+            // Release the fields already decoded, then the list's own buffer.
+            // `freeHeaders` cannot be used here: it frees the slice it is
+            // handed, and that slice is `out.items` (length ≤ capacity, so not
+            // the allocation the allocator knows) while `deinit` frees the
+            // capacity — one free too many.
+            for (out.items) |h| self.release(.{
+                .name = h.name,
+                .value = h.value,
+                .name_owner = h.name_owner,
+                .value_owner = h.value_owner,
+            });
             out.deinit(self.allocator);
         }
+        var budget = HeaderListBudget{
+            .max_bytes = self.max_header_list_size,
+            .max_fields = self.max_header_count,
+        };
         var i: usize = 0;
         while (i < block.len) {
             const b = block[i];
@@ -557,11 +648,22 @@ pub const Decoder = struct {
                 i += n;
                 const h = try self.lookup(idx);
                 const is_static = idx < static_table.len;
-                try out.append(self.allocator, .{
+                const d = Decoded{
                     .name = if (is_static) h.name else try self.allocator.dupe(u8, h.name),
                     .value = if (is_static) h.value else try self.allocator.dupe(u8, h.value),
                     .name_owner = if (is_static) .borrowed else .owned,
                     .value_owner = if (is_static) .borrowed else .owned,
+                };
+                errdefer self.release(d);
+                if (!budget.charge(d.name, d.value)) {
+                    self.release(d);
+                    continue;
+                }
+                try out.append(self.allocator, .{
+                    .name = d.name,
+                    .value = d.value,
+                    .name_owner = d.name_owner,
+                    .value_owner = d.value_owner,
                 });
                 continue;
             }
@@ -592,11 +694,21 @@ pub const Decoder = struct {
 
                 const out_value = try self.allocator.dupe(u8, value);
                 errdefer self.allocator.free(out_value);
-                try out.append(self.allocator, .{
+                const d = Decoded{
                     .name = out_name,
                     .value = out_value,
                     .name_owner = if (name_is_static) .borrowed else .owned,
                     .value_owner = .owned,
+                };
+                if (!budget.charge(d.name, d.value)) {
+                    self.release(d);
+                    continue;
+                }
+                try out.append(self.allocator, .{
+                    .name = d.name,
+                    .value = d.value,
+                    .name_owner = d.name_owner,
+                    .value_owner = d.value_owner,
                 });
                 continue;
             }
@@ -627,13 +739,24 @@ pub const Decoder = struct {
             errdefer if (!name_is_static) self.allocator.free(@constCast(out_name));
             const out_value = try self.allocator.dupe(u8, value);
             errdefer self.allocator.free(out_value);
-            try out.append(self.allocator, .{
+            const d = Decoded{
                 .name = out_name,
                 .value = out_value,
                 .name_owner = if (name_is_static) .borrowed else .owned,
                 .value_owner = .owned,
+            };
+            if (!budget.charge(d.name, d.value)) {
+                self.release(d);
+                continue;
+            }
+            try out.append(self.allocator, .{
+                .name = d.name,
+                .value = d.value,
+                .name_owner = d.name_owner,
+                .value_owner = d.value_owner,
             });
         }
+        if (budget.hit) |limit_err| return limit_err;
         return try out.toOwnedSlice(self.allocator);
     }
 
@@ -1253,4 +1376,112 @@ test "Hpack freeHeaders follows explicit ownership over the static fingerprint" 
     freeHeaders(allocator, legacy);
     try std.testing.expectEqualStrings(":method", static_table[2].name);
     try std.testing.expectEqualStrings("GET", static_table[2].value);
+}
+
+// ---------------------------------------------------------------------------
+// Header-list budget (RFC 9113 §6.5.2 SETTINGS_MAX_HEADER_LIST_SIZE).
+// ---------------------------------------------------------------------------
+
+test "Hpack decoder enforces the advertised header list size" {
+    const allocator = std.testing.allocator;
+
+    // Two `a`/`1` + `b`/`2` pairs: 34 bytes each (name + value + the 32-byte
+    // per-field overhead), so 64 is spent by the second field.
+    var block = std.ArrayList(u8).empty;
+    defer block.deinit(allocator);
+    try appendLitIncNewName(&block, allocator, "a", "1");
+    try appendLitIncNewName(&block, allocator, "b", "2");
+
+    var dec = Decoder.init(allocator);
+    defer dec.deinit();
+    // Default is unbounded: an existing `Decoder` user sees no change.
+    try std.testing.expectEqual(@as(usize, 0), dec.max_header_list_size);
+
+    dec.setAdvertisedHeaderListSize(64, 0);
+    try std.testing.expectError(error.HeaderListTooLarge, dec.decode(block.items));
+    // A list past what we advertised is a *stream* error: the block decoded.
+    try std.testing.expect(!isConnectionError(error.HeaderListTooLarge));
+
+    // Both insertions landed: the loop ran to the end of the block instead of
+    // bailing out at the limit, which is what keeps our dynamic table in step
+    // with the peer's encoder. 68 = 34 + 34, even though only the first field
+    // was kept.
+    try std.testing.expectEqual(@as(usize, 68), dec.current_size);
+    try std.testing.expectEqual(@as(usize, 2), dec.dynamic.items.len);
+    // …and the connection-level state is still usable: the very next block
+    // referencing those entries decodes against the same decoder.
+    dec.setAdvertisedHeaderListSize(0, 0);
+    const refs = [_]u8{ 0xbe, 0xbf }; // indexes 62 then 63
+    const after = try dec.decode(&refs);
+    defer freeHeaders(allocator, after);
+    try std.testing.expectEqual(@as(usize, 2), after.len);
+    try std.testing.expectEqualStrings("b", after[0].name);
+    try std.testing.expectEqualStrings("2", after[0].value);
+    try std.testing.expectEqualStrings("a", after[1].name);
+
+    // Exactly at the advertised size is still within the budget.
+    dec.setAdvertisedHeaderListSize(68, 0);
+    const at_limit = try dec.decode(block.items);
+    defer freeHeaders(allocator, at_limit);
+    try std.testing.expectEqual(@as(usize, 2), at_limit.len);
+}
+
+test "Hpack decoder enforces the advertised header count" {
+    const allocator = std.testing.allocator;
+
+    var block = std.ArrayList(u8).empty;
+    defer block.deinit(allocator);
+    try appendLitIncNewName(&block, allocator, "a", "1");
+    try appendLitIncNewName(&block, allocator, "b", "2");
+
+    var dec = Decoder.init(allocator);
+    defer dec.deinit();
+
+    // Byte budget off, count budget on: one field fits, the second is over.
+    dec.setAdvertisedHeaderListSize(0, 1);
+    try std.testing.expectError(error.TooManyHeaderFields, dec.decode(block.items));
+    try std.testing.expect(!isConnectionError(error.TooManyHeaderFields));
+    // The block still decoded in full — same reason as the byte budget.
+    try std.testing.expectEqual(@as(usize, 68), dec.current_size);
+
+    dec.setAdvertisedHeaderListSize(0, 2);
+    const two = try dec.decode(block.items);
+    defer freeHeaders(allocator, two);
+    try std.testing.expectEqual(@as(usize, 2), two.len);
+}
+
+test "Hpack oversize list drops the extra fields without leaking them" {
+    const allocator = std.testing.allocator;
+
+    // Two indexed fields whose names/values are table entries: each is an
+    // owned dupe, so the one the budget refuses has to be released by the
+    // decoder (std.testing.allocator fails the test on a leak).
+    var block = std.ArrayList(u8).empty;
+    defer block.deinit(allocator);
+    try appendLitIncNewName(&block, allocator, "x-name", "x-value");
+    try appendLitIncNewName(&block, allocator, "y-name", "y-value");
+
+    var dec = Decoder.init(allocator);
+    defer dec.deinit();
+
+    const seeded = try dec.decode(block.items);
+    freeHeaders(allocator, seeded);
+
+    // The same two fields again, this time as dynamic-table references: 1 byte
+    // each on the wire, 45 bytes each once decoded — the inflation the budget
+    // exists for. Both fit at 90…
+    const refs = [_]u8{ 0xbf, 0xbe }; // indexes 63 then 62
+    dec.setAdvertisedHeaderListSize(90, 0);
+    const inflated = try dec.decode(&refs);
+    defer freeHeaders(allocator, inflated);
+    try std.testing.expectEqual(@as(usize, 2), inflated.len);
+    try std.testing.expectEqualStrings("x-name", inflated[0].name);
+    try std.testing.expectEqualStrings("y-value", inflated[1].value);
+
+    // …and at 60 only the first does, so the second is decoded, charged and
+    // then dropped: no leak, and no new table entries either (indexed fields
+    // insert nothing), so the size the first block left is unchanged.
+    dec.setAdvertisedHeaderListSize(60, 0);
+    try std.testing.expectError(error.HeaderListTooLarge, dec.decode(&refs));
+    try std.testing.expectEqual(@as(usize, 90), dec.current_size);
 }

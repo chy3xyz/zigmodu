@@ -96,7 +96,11 @@ pub fn Pool(comptime T: type) type {
             self.closed.store(true, .monotonic);
             self.cond.broadcast(self.io);
 
-            self.mutex.lock(self.io) catch return;
+            // Uncancelable: this is the destructor. A cancelable `lock` returns
+            // early on cancellation, which here would skip destroying the idle
+            // connections and freeing the list — the pool would leak every idle
+            // connection while reporting itself closed.
+            self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
 
             for (self.idle_conns.items) |node| {
