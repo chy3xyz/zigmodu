@@ -224,7 +224,7 @@ test "DiagnosisFlow gathers evidence, diagnoses and writes outbox" {
 
     var cursor = try client.queryCursorEx("SELECT topic, payload FROM event_outbox", &.{}, .{});
     defer cursor.deinit();
-    const row = cursor.next().?;
+    const row = (try cursor.next()).?;
     try std.testing.expectEqualStrings("ai.diagnose", row.get("topic").?.string);
     try std.testing.expect(std.mem.indexOf(u8, row.get("payload").?.string, "payment provider rejected") != null);
 }
@@ -277,7 +277,7 @@ test "DiagnosisFlow writeOutbox fills every NOT NULL column of the shipped DDL" 
         .{},
     );
     defer cursor.deinit();
-    const row = cursor.next().?;
+    const row = (try cursor.next()).?;
     try std.testing.expectEqualStrings("ai.diagnose", row.get("topic").?.string);
     try std.testing.expect(std.mem.indexOf(u8, row.get("payload").?.string, "gateway timeout") != null);
     // The driver reports SQL NULL as a missing `?Value`, so the tenant column is

@@ -40,8 +40,8 @@ pub fn query(
 ) !KpiResult {
     var cursor = try backend.client.queryCursorEx(metric.sql, &.{}, .{});
     defer cursor.deinit();
-    const row = cursor.next() orelse return error.NoRows;
-    if (cursor.next() != null) return error.MultipleRows;
+    const row = (try cursor.next()) orelse return error.NoRows;
+    if ((try cursor.next()) != null) return error.MultipleRows;
     const v = row.get(metric.value_column) orelse return error.MissingColumn;
     const value: f64 = switch (v) {
         .int => |i| @floatFromInt(i),

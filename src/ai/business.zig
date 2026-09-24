@@ -199,7 +199,7 @@ pub fn registerBusinessSkillsWith(
 
                 var rows = std.json.Array.init(ctx.allocator);
                 var count: usize = 0;
-                while (cursor.next()) |row| {
+                while (try cursor.next()) |row| {
                     if (count >= limit) break;
                     try rows.append(try rowToJson(row, ctx.allocator));
                     count += 1;
@@ -256,7 +256,7 @@ pub fn registerBusinessSkillsWith(
 
                 var cursor = try b.client.queryCursorEx(sql_buf.items, args_list.items, .{});
                 defer cursor.deinit();
-                const row = cursor.next() orelse return .{ .object = .{} };
+                const row = (try cursor.next()) orelse return .{ .object = .{} };
                 return rowToJson(row, ctx.allocator);
             }
         }.h,
@@ -324,7 +324,7 @@ pub fn registerBusinessSkillsWith(
 
                 var rows = std.json.Array.init(ctx.allocator);
                 var count: usize = 0;
-                while (cursor.next()) |row| {
+                while (try cursor.next()) |row| {
                     if (count >= limit) break;
                     try rows.append(try rowToJson(row, ctx.allocator));
                     count += 1;

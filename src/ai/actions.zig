@@ -345,7 +345,7 @@ fn generateReport(sctx: *SkillContext, rctx: *ReportCtx, args: std.json.Value) a
         errdefer buf.deinit(sctx.allocator);
         var first_row = true;
         var rows: usize = 0;
-        while (cursor.next()) |row| {
+        while (try cursor.next()) |row| {
             if (rows >= rctx.max_rows) break;
             rows += 1;
             if (first_row) {
@@ -381,7 +381,7 @@ fn generateReport(sctx: *SkillContext, rctx: *ReportCtx, args: std.json.Value) a
 
     var arr = std.json.Array.init(sctx.allocator);
     var rows: usize = 0;
-    while (cursor.next()) |row| {
+    while (try cursor.next()) |row| {
         if (rows >= rctx.max_rows) break;
         rows += 1;
         var rec = std.json.ObjectMap{};
@@ -441,7 +441,7 @@ test "entity.create enforces tenant and writable whitelist" {
 
     var cursor = try client.queryCursorEx("SELECT tenant_id, amount, note FROM orders", &.{}, .{});
     defer cursor.deinit();
-    const row = cursor.next().?;
+    const row = (try cursor.next()).?;
     try std.testing.expectEqual(@as(i64, 7), row.get("tenant_id").?.int);
     try std.testing.expectEqual(@as(i64, 9900), row.get("amount").?.int);
     try std.testing.expectEqualStrings("rush", row.get("note").?.string);
@@ -490,7 +490,7 @@ test "command.execute writes an idempotent outbox event" {
 
     var cursor = try client.queryCursorEx("SELECT topic, payload FROM event_outbox", &.{}, .{});
     defer cursor.deinit();
-    const row = cursor.next().?;
+    const row = (try cursor.next()).?;
     try std.testing.expectEqualStrings("ai.command.refund", row.get("topic").?.string);
     try std.testing.expect(std.mem.indexOf(u8, row.get("payload").?.string, "run-42") != null);
 

@@ -151,7 +151,7 @@ test "TicketFlow triages with context and writes to outbox" {
 
     var cursor = try client.queryCursorEx("SELECT topic, payload FROM event_outbox", &.{}, .{});
     defer cursor.deinit();
-    const row = cursor.next() orelse return error.NoOutboxRow;
+    const row = (try cursor.next()) orelse return error.NoOutboxRow;
     try std.testing.expectEqualStrings("ai.ticket", row.get("topic").?.string);
     try std.testing.expect(std.mem.indexOf(u8, row.get("payload").?.string, "billing") != null);
 }

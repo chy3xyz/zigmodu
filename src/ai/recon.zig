@@ -170,7 +170,7 @@ pub const ReconCheck = struct {
         var cursor = try self.backend.client.queryCursorEx(sql, args, .{});
         defer cursor.deinit();
         var key_buf: [64]u8 = undefined;
-        while (cursor.next()) |row| {
+        while (try cursor.next()) |row| {
             const key = self.keyOf(row, &key_buf) orelse continue;
             const key_owned = try allocator.dupe(u8, key);
             const canonical = try self.canonicalValue(allocator, row);
@@ -356,7 +356,7 @@ test "ReconCheck detects missing, extra and mismatched rows" {
     // Outbox summary written for downstream automation.
     var cursor = try client.queryCursorEx("SELECT topic, payload FROM event_outbox", &.{}, .{});
     defer cursor.deinit();
-    const row = cursor.next() orelse return error.NoOutboxRow;
+    const row = (try cursor.next()) orelse return error.NoOutboxRow;
     try std.testing.expectEqualStrings("ai.recon", row.get("topic").?.string);
     try std.testing.expect(std.mem.indexOf(u8, row.get("payload").?.string, "DRIFT") != null);
 

@@ -2501,6 +2501,208 @@ test "each permissionGateWith keeps its own catalog slot and config" {
     try std.testing.expect(!S.reached);
 }
 
+test "one process, two servers: each gate enforces its own catalog" {
+    const allocator = std.testing.allocator;
+    const Testkit = @import("../http/Testkit.zig");
+    const cr = @import("ComptimeRouter.zig");
+
+    // The same binary standing up two `Server` instances — each with its own
+    // `Router`, its own `CatalogSlot` and its own route→permission mapping.
+    // The test above pins the per-call `Store` against a process-wide `var`;
+    // this one observes the whole topology end to end (auth middleware + gate +
+    // router + catalog slot), where a `permissionGateWith` that cached the
+    // resolved catalog — or read anything process-global — would let one app
+    // enforce the other's permissions.
+    //
+    // Both apps share one auth service (one `SecurityModule`, so one configured
+    // JWT secret and identical grants per role): the *only* difference between
+    // them is what their catalogs demand. That is what makes a leak visible —
+    // the same token must get opposite answers from the two apps.
+    var sec = SecurityModule.init(allocator, "two-server-isolation-secret", 3600);
+    defer sec.deinit();
+
+    // Role → permission grants, identical in both apps (one RBAC table behind
+    // one auth service). A custom loader on purpose: `catalogLoaderFromTable`
+    // keeps a module-level holder and is documented single-instance-only.
+    const load: CatalogPermissionLoader = struct {
+        fn load_(al: std.mem.Allocator, input: CatalogPermLoadInput) anyerror![]u8 {
+            for (input.roles) |role| {
+                if (std.mem.eql(u8, role, "reader")) return al.dupe(u8, "report:read,report:audit");
+                if (std.mem.eql(u8, role, "writer")) return al.dupe(u8, "report:write");
+            }
+            return al.dupe(u8, "");
+        }
+    }.load_;
+
+    const ShopState = struct {};
+    const ShopApi = struct {
+        pub const module_name = "shop";
+        pub const nest = .{};
+        pub const State = @This();
+
+        pub const routes = [_]cr.RouteSpec(State){
+            .{ .method = .GET, .path = "status", .handler = public_status, .meta = .{ .auth = .public } },
+            .{ .method = .GET, .path = "reports", .handler = echo, .meta = .{ .auth = .jwt, .permission = "report:read" } },
+            // Registered here and nowhere else — admin has no such path.
+            .{ .method = .GET, .path = "audit", .handler = echo, .meta = .{ .auth = .jwt, .permission = "report:audit" } },
+        };
+
+        fn public_status(ctx: *api.Context, _: *State) !void {
+            try ctx.jsonStruct(200, .{ .app = module_name, .perm = ctx.getAttr("permission") });
+        }
+        fn echo(ctx: *api.Context, _: *State) !void {
+            try ctx.jsonStruct(200, .{ .app = module_name, .user = ctx.userId(), .perm = ctx.getAttr("permission") });
+        }
+    };
+
+    const AdminState = struct {};
+    const AdminApi = struct {
+        pub const module_name = "admin";
+        pub const nest = .{};
+        pub const State = @This();
+
+        pub const routes = [_]cr.RouteSpec(State){
+            // Same path as shop's, `.jwt` here and `.public` there: the auth
+            // middleware reads public-ness from the gate's own slot too.
+            .{ .method = .GET, .path = "status", .handler = echo, .meta = .{ .auth = .jwt, .permission = "report:read" } },
+            // Same method + path as shop's, different required permission —
+            // the sharpest form of "different mapping".
+            .{ .method = .GET, .path = "reports", .handler = echo, .meta = .{ .auth = .jwt, .permission = "report:write" } },
+        };
+
+        fn echo(ctx: *api.Context, _: *State) !void {
+            try ctx.jsonStruct(200, .{ .app = module_name, .user = ctx.userId(), .perm = ctx.getAttr("permission") });
+        }
+    };
+
+    var shop_srv = api.Server.init(std.testing.io, allocator, 0);
+    defer shop_srv.deinit();
+    var shop_slot: cr.CatalogSlot = .{};
+    defer shop_slot.deinit();
+
+    var admin_srv = api.Server.init(std.testing.io, allocator, 0);
+    defer admin_srv.deinit();
+    var admin_slot: cr.CatalogSlot = .{};
+    defer admin_slot.deinit();
+
+    // Production order: middleware first (a route's chain is snapshotted at
+    // registration), then routes, then the catalog slot is filled.
+    try shop_srv.addMiddleware(jwtAuthFromCatalogWithPermissions(&sec, &shop_slot, load, .{}));
+    try shop_srv.addMiddleware(permissionGateWith(&shop_slot, .{ .mode = .rbac }));
+    try admin_srv.addMiddleware(jwtAuthFromCatalogWithPermissions(&sec, &admin_slot, load, .{}));
+    try admin_srv.addMiddleware(permissionGateWith(&admin_slot, .{ .mode = .rbac }));
+
+    var shop_state: ShopState = .{};
+    var shop_mod: ShopApi = .{};
+    var admin_state: AdminState = .{};
+    var admin_mod: AdminApi = .{};
+
+    var shop_router = cr.Router(ShopState).init(std.testing.io, allocator, &shop_srv, &shop_state);
+    defer shop_router.deinit();
+    var admin_router = cr.Router(AdminState).init(std.testing.io, allocator, &admin_srv, &admin_state);
+    defer admin_router.deinit();
+    {
+        var shop_root = shop_router.scope("");
+        try shop_root.mountAll(.{.{ .Mod = ShopApi, .state = &shop_mod }});
+    }
+    {
+        var admin_root = admin_router.scope("");
+        try admin_root.mountAll(.{.{ .Mod = AdminApi, .state = &admin_mod }});
+    }
+    shop_slot.set(try shop_router.finish());
+    admin_slot.set(try admin_router.finish());
+
+    const reader_tok = try sec.generateTokenWithTenant("reader-1", &.{"reader"}, "tenant-shop");
+    defer allocator.free(reader_tok);
+    const writer_tok = try sec.generateTokenWithTenant("writer-1", &.{"writer"}, "tenant-shop");
+    defer allocator.free(writer_tok);
+    const reader_bearer = try std.fmt.allocPrint(allocator, "Bearer {s}", .{reader_tok});
+    defer allocator.free(reader_bearer);
+    const writer_bearer = try std.fmt.allocPrint(allocator, "Bearer {s}", .{writer_tok});
+    defer allocator.free(writer_bearer);
+
+    const Hit = struct {
+        fn get(srv: *api.Server, path: []const u8, bearer: ?[]const u8) !Testkit.TestResponse {
+            const headers = [1]Testkit.HeaderPair{.{ "authorization", bearer orelse "" }};
+            var opts = Testkit.DispatchOptions{};
+            if (bearer != null) opts.headers = &headers;
+            return Testkit.dispatchOpts(srv, .GET, path, opts);
+        }
+    };
+
+    // Same token, same path, opposite verdicts.
+    {
+        var resp = try Hit.get(&shop_srv, "/reports", reader_bearer);
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"app\":\"shop\"") != null);
+        // The matched expression itself must come from shop's catalog.
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"perm\":\"report:read\"") != null);
+    }
+    {
+        var resp = try Hit.get(&admin_srv, "/reports", reader_bearer);
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 403), resp.status_code);
+    }
+    // …and back to the first app: a cache filled while answering admin would
+    // show up right here.
+    {
+        var resp = try Hit.get(&shop_srv, "/reports", reader_bearer);
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"perm\":\"report:read\"") != null);
+    }
+    // The other direction: what admin allows, shop must not.
+    {
+        var resp = try Hit.get(&shop_srv, "/reports", writer_bearer);
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 403), resp.status_code);
+    }
+    {
+        var resp = try Hit.get(&admin_srv, "/reports", writer_bearer);
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"app\":\"admin\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"perm\":\"report:write\"") != null);
+    }
+    {
+        var resp = try Hit.get(&shop_srv, "/reports", writer_bearer);
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 403), resp.status_code);
+    }
+    // Public-ness is per app as well: `/status` is anonymous on shop, gated on
+    // admin. Leaking the slot would turn the anonymous request into a 401 or
+    // the gated one into a 200.
+    {
+        var resp = try Hit.get(&shop_srv, "/status", null);
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"perm\":null") != null);
+    }
+    {
+        var resp = try Hit.get(&admin_srv, "/status", null);
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 401), resp.status_code);
+    }
+    {
+        var resp = try Hit.get(&admin_srv, "/status", reader_bearer);
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+    }
+    // Route membership too: `/audit` exists only on shop.
+    {
+        var resp = try Hit.get(&shop_srv, "/audit", reader_bearer);
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"perm\":\"report:audit\"") != null);
+    }
+    {
+        var resp = try Hit.get(&admin_srv, "/audit", reader_bearer);
+        defer resp.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 404), resp.status_code);
+    }
+}
+
 test "permissionGateWith fails closed before the catalog is ready" {
     const alloc = std.testing.allocator;
     var slot: comptime_router.CatalogSlot = .{}; // never `.set()` — startup window / unwired server

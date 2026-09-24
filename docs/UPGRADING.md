@@ -35,6 +35,48 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 
 ---
 
+## v0.33.3（未发布）
+
+> **本版有 2 处破坏性变更，都是编译错**（`Cursor.next` 的错误联合、`csrf()` 要求中间件拿到
+> `CsrfConfig`），另有 1 处**默认行为收紧**（CSRF 不再采信 `X-Forwarded-Host`）。逐条背景见
+> [`../CHANGELOG.md`](../CHANGELOG.md) 的 `[Unreleased]` 段。
+
+**破坏 ①：`Cursor.next` 返回错误联合。** `sqlx.Cursor.next` 从 `?*Row` 变成
+`errors.ResultT(?*Row)`——**流中途的驱动/服务器错误以前被折叠成 `null`**，即"查询坏了"和"结果取完"
+不可区分，调用方会把**被截断的结果当成完整结果**（PG 实测：`SELECT 100/(3-i) …` 在第 3 行报
+`22012`，循环却"正常"结束在第 2 行）。
+**Breaking?** 是（编译错）· **影响面**：所有直接迭代游标的消费方 · **一行改法**：
+`while (cursor.next()) |row|` → `while (try cursor.next()) |row|`；`cursor.next() == null` →
+`(try cursor.next()) == null`。
+仓库内 39 处（19 个文件）已按此改完。另外这一版还修了 PG 流式游标的一个 use-after-free
+（列名曾分配在每行重置的 arena 里，`row.get("col")` 读到的是已释放内存）——与上面的签名变化
+同批落地，不需要消费方额外动作。
+
+**破坏 ②：`csrf()` 现在要求中间件在 `user_data` 上拿到 `CsrfConfig`。**
+`csrf()` 变成 `csrfWith(.{})` 的别名；手动 `mw.func(ctx, next, null)` 会 panic。
+**Breaking?** 是（运行时 panic，不是编译错）· **影响面**：只有手工调用中间件 `func` 的代码
+（按 `http.addMiddleware(http.csrf())` 常规用法不受影响）· **一行改法**：
+`mw.func(ctx, next, null)` → `mw.func(ctx, next, mw.user_data)`（把中间件自己的 `user_data`
+传下去，别丢）。另外**默认不再采信 `X-Forwarded-Host`/`Proto`**（客户端可伪造）：
+反代部署要显式 `csrfWith(.{ .trust_forwarded_host = true })`，且代理必须**每个请求都覆写**这两个头；
+已有 `sign_key` 可让 cookie 里的 token 变 `nonce.HMAC-SHA256`（`csrfMintSignedToken` 签发）。
+
+**行为变化（非破坏）**：`sqlx.Builder` 的 `where` / `join` / `groupBy` / `having` / `orderBy` /
+`selectColumns` 在分配失败时不再**静默丢弃**该子句（那会让 `WHERE` 消失、查询被悄悄放宽）——错误现在
+由 `toSql()` 返回。**签名没变**，链式写法 `_ = b.where(...)` 照旧可用；只要你的代码处理了 `toSql()` 的
+错误（本来就该处理），就不需要改动。
+
+**行为变化（非破坏）**：`OtlpExporter` / `SecretsManager` 改为持有常驻 `HttpClient`。`max_connections`
+的口径从"每次调用的 N 条"变成"**每个组件实例的 N 条**"，同一实例上超过 N 个并发请求可能拿到
+`error.PoolExhausted`；两个 `deinit` **不得与在飞请求并发**（在等待导出/读取线程结束后再 `deinit`）。
+
+**行为变化（非破坏）**：H1 与 H2 的请求路径补齐——H2 现在也解析 `application/x-www-form-urlencoded`
+表单体（并遵守 `max_params`）、运行 `path_rewriter`、把 `:path` 里的查询串拆进 `ctx.query`（拆不动时
+返回 400 而不是带着缺失参数继续路由）、`ctx.allocator` 改为**每请求** arena；`ctx.stream` 在 H2 上仍为
+`null`，流式处理器得到明确的 **501** 而不是把 H1 chunk 头当成 body 发出去。
+
+---
+
 ## v0.33.1
 
 > 本版无破坏性变更。以下为 additive 亮点；完整列表见 [CHANGELOG](../CHANGELOG.md)。

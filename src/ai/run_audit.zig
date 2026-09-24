@@ -124,7 +124,7 @@ pub const RunAuditStore = struct {
 
         var cursor = try self.backend.client.queryCursorEx(sql, args.items, .{});
         defer cursor.deinit();
-        while (cursor.next()) |row| {
+        while (try cursor.next()) |row| {
             try out.append(allocator, .{
                 .run_id = try allocator.dupe(u8, row.get("run_id").?.string),
                 .kind = std.meta.stringToEnum(RunKind, row.get("kind").?.string) orelse .workflow,
@@ -143,7 +143,7 @@ pub const RunAuditStore = struct {
         defer self.allocator.free(sql);
         var cursor = try self.backend.client.queryCursorEx(sql, &.{}, .{});
         defer cursor.deinit();
-        return @intCast(cursor.next().?.get("n").?.int);
+        return @intCast((try cursor.next()).?.get("n").?.int);
     }
 };
 

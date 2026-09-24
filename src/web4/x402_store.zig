@@ -112,7 +112,7 @@ pub const X402Store = struct {
                 defer self.allocator.free(pragma);
                 var cursor = try self.backend.client.queryCursorEx(pragma, &.{}, .{});
                 defer cursor.deinit();
-                while (cursor.next()) |row| {
+                while (try cursor.next()) |row| {
                     // The SQLite driver maps SQLITE_NULL to a null optional, so
                     // a `name` that came back at all is a string.
                     const name = row.get("name") orelse continue;
@@ -140,7 +140,7 @@ pub const X402Store = struct {
         const probe = sqlx.catalogColumnProbe(dialect, self.table, column);
         var cursor = try self.backend.client.queryCursorEx(probe.sql, probe.bindArgs(), .{});
         defer cursor.deinit();
-        return cursor.next() != null;
+        return (try cursor.next()) != null;
     }
 
     /// Insert a pending invoice, bound to `payer_did` when the caller knows who
@@ -211,7 +211,7 @@ pub const X402Store = struct {
         defer self.allocator.free(select);
         var cursor = try self.backend.client.queryCursorEx(select, &.{.{ .string = invoice_id }}, .{});
         defer cursor.deinit();
-        return cursor.next() != null;
+        return (try cursor.next()) != null;
     }
 
     /// Redeem a proof's invoice id. Succeeds exactly once per invoice: a second
@@ -239,7 +239,7 @@ pub const X402Store = struct {
         defer self.allocator.free(select);
         var cursor = try self.backend.client.queryCursorEx(select, &.{.{ .string = invoice_id }}, .{});
         defer cursor.deinit();
-        const row = cursor.next() orelse return .not_found;
+        const row = (try cursor.next()) orelse return .not_found;
         // Binding first, and before the write: a caller the invoice was not
         // issued to gets no redemption *and* no report of the row's state
         // (spent / expired / still open) — that state is the payer's business.

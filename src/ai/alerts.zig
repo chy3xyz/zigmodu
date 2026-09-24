@@ -46,7 +46,7 @@ pub const BusinessAlert = struct {
         for (self.rules) |rule| {
             var cursor = try self.backend.client.queryCursorEx(rule.sql, rule.args, .{});
             defer cursor.deinit();
-            if (cursor.next() == null) continue;
+            if ((try cursor.next()) == null) continue;
 
             alerts += 1;
             const message = try std.fmt.allocPrint(
@@ -98,7 +98,7 @@ test "BusinessAlert raises alerts for violation rows" {
 
     var cursor = try client.queryCursorEx("SELECT topic, payload FROM event_outbox", &.{}, .{});
     defer cursor.deinit();
-    const row = cursor.next() orelse return error.NoOutboxRow;
+    const row = (try cursor.next()) orelse return error.NoOutboxRow;
     try std.testing.expectEqualStrings("ai.alert", row.get("topic").?.string);
     try std.testing.expect(std.mem.indexOf(u8, row.get("payload").?.string, "failed orders") != null);
 }

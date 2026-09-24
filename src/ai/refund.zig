@@ -116,9 +116,9 @@ test "RefundFlow executes, notifies, and compensates on demand" {
 
     var cursor = try client.queryCursorEx("SELECT topic, payload FROM event_outbox ORDER BY id", &.{}, .{});
     defer cursor.deinit();
-    try std.testing.expectEqualStrings("refund.execute", cursor.next().?.get("topic").?.string);
-    try std.testing.expectEqualStrings("refund.notify", cursor.next().?.get("topic").?.string);
-    try std.testing.expectEqualStrings("refund.reverse", cursor.next().?.get("topic").?.string);
+    try std.testing.expectEqualStrings("refund.execute", (try cursor.next()).?.get("topic").?.string);
+    try std.testing.expectEqualStrings("refund.notify", (try cursor.next()).?.get("topic").?.string);
+    try std.testing.expectEqualStrings("refund.reverse", (try cursor.next()).?.get("topic").?.string);
 }
 
 test "RefundFlow rejects invalid orders and holds for approval" {

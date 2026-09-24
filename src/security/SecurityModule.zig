@@ -372,11 +372,29 @@ pub const SecurityModule = struct {
 
 /// Rate-limited auth middleware — prevents brute-force attacks.
 /// Limits to `max_attempts` per `window_seconds`. Returns 429 on excess.
+///
+/// The rejection is answered through the `Context` response channel
+/// (`status_code` + `response_headers` + `response_body`, i.e. `ctx.sendError`),
+/// never by writing to `ctx.stream` directly: `ctx.stream` is the HTTP/1.1
+/// socket handle and is `null` on the HTTP/2 adapter by construction (that
+/// adapter has no mid-response channel — see `Server.http2RouterSiteHandler`),
+/// so a raw write there is a null dereference on H2 *and* mis-framed on H1 (the
+/// body bytes reach the socket ahead of the status line). Going through the
+/// Context lets each transport write the response it owns: `writeResponse` on
+/// H1, the `SiteResponse` on H2.
+///
+/// `Retry-After` is advisory and reaches H1 clients only: the H2
+/// `SiteResponse` channel carries `content-type` and the body, and drops every
+/// other response header. `RateLimiter` exposes no per-window remaining time
+/// either, so the value is the documented 60-second window.
+///
+/// `allocator` owns the limiter, which lives for the process (the returned
+/// `Middleware` carries it as `user_data`; nothing frees it).
 pub fn authRateLimitMiddleware(
     allocator: std.mem.Allocator,
     max_attempts: u32,
     window_seconds: u32,
-) !api.MiddlewareFn {
+) !api.Middleware {
     const limiter = try allocator.create(@import("../resilience/RateLimiter.zig").RateLimiter);
     limiter.* = try @import("../resilience/RateLimiter.zig").RateLimiter.init(
         allocator,
@@ -388,16 +406,11 @@ pub fn authRateLimitMiddleware(
         fn handler(ctx: *api.Context, next: api.HandlerFn, user_data: ?*anyopaque) anyerror!void {
             const lim: *@import("../resilience/RateLimiter.zig").RateLimiter = @ptrCast(@alignCast(user_data orelse return error.InternalError));
             if (!lim.tryAcquire()) {
-                ctx.status_code = 429;
-                ctx.setHeader("Content-Type", "application/json") catch |err| std.log.err("[RateLimit] setHeader failed: {}", .{err});
                 ctx.setHeader("Retry-After", "60") catch |err| std.log.err("[RateLimit] setHeader failed: {}", .{err});
-                _ = ctx.stream.?.writer(ctx.io.?, &.{}{}).interface.writeAll(
-                    "{\"code\":429,\"msg\":\"Too many requests. Try again later.\"}",
-                ) catch |err| std.log.err("[RateLimit] write 429 body failed: {}", .{err});
-                ctx.responded = true;
+                try ctx.sendError(429, "Too many requests. Try again later.");
                 return;
             }
-            try next(ctx, next, user_data);
+            try next(ctx);
         }
     };
     return .{ .func = S.handler, .user_data = @ptrCast(@constCast(limiter)) };

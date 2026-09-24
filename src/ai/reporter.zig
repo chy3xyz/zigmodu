@@ -47,7 +47,7 @@ pub const BusinessReporter = struct {
 
             var first = true;
             var rows: usize = 0;
-            while (cursor.next()) |row| {
+            while (try cursor.next()) |row| {
                 if (rows >= self.max_rows) break;
                 rows += 1;
                 if (first) {

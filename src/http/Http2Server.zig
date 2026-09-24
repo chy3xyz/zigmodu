@@ -2546,3 +2546,141 @@ test "h2 server enforces Server.Config.max_body_size on the H2 path" {
     const ok = findFrameInReply(reply, .data, 3) orelse return error.TestUnexpectedResultWithMessage;
     try std.testing.expectEqualStrings("small ok", ok.payload);
 }
+
+test "h2 server arms ctx.io and the request budget on the dispatched Context" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    // A budget that is not the 30s default, so the reply proves the number came
+    // from `Server.Config.request_timeout_ms` and not from a literal.
+    const budget_ms: u32 = 12_345;
+    var server = api_server.Server.initWithConfig(std.testing.io, allocator, .{
+        .port = 0,
+        .request_timeout_ms = budget_ms,
+        .name = "h2-ctx",
+    });
+    defer server.deinit();
+    server.setHttp2Enabled(true);
+
+    var group = server.group("");
+    try group.get("h2ctx", struct {
+        fn h(ctx: *api_server.Context) anyerror!void {
+            // The H1 dispatch arms `ctx.io` and `ctx.setDeadline(...)` before
+            // routing; the H2 adapter used to leave both at their `null`
+            // defaults, so `ctx.io` was null and `ctx.sqlContext().deadline_ms`
+            // was null (storage unbounded).
+            const sc = ctx.sqlContext();
+            const rem = ctx.remainingMs();
+            const body = try std.fmt.allocPrint(ctx.allocator, "io={s} sql_deadline={s} within_budget={}", .{
+                if (ctx.io != null) "set" else "null",
+                if (sc.deadline_ms != null) "set" else "none",
+                rem != null and rem.? <= budget_ms,
+            });
+            defer ctx.allocator.free(body);
+            try ctx.text(200, body);
+        }
+    }.h, null);
+
+    var running = try RunningServer.start(&server);
+    defer running.stop(&server);
+
+    const block = try hpackRequestBlock(allocator, "GET", "/h2ctx", &.{});
+    defer allocator.free(block);
+    const head = try Http2.encodeHeaders(allocator, 1, block, true, true);
+    defer allocator.free(head);
+
+    var out: [8192]u8 = undefined;
+    const n = try h2SpeakToServer(running.port, head, &out);
+    const reply = out[0..n];
+    const data = findFrameInReply(reply, .data, 1) orelse return error.TestUnexpectedResultWithMessage;
+    try std.testing.expectEqualStrings("io=set sql_deadline=set within_budget=true", data.payload);
+}
+
+test "h2 server answers 501 instead of framing a streaming handler's chunks as H1 body bytes" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var server = api_server.Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h2-stream" });
+    defer server.deinit();
+    server.setHttp2Enabled(true);
+
+    var group = server.group("");
+    try group.get("h2stream", struct {
+        fn h(ctx: *api_server.Context) anyerror!void {
+            // The H1 chunked API. On H2 `ctx.stream` is null, so the chunks
+            // land in `response_body` *with* their H1 chunk framing — which the
+            // H2 adapter then served as opaque body bytes (silent corruption,
+            // a 200 to the client).
+            try ctx.startChunked(200, "application/json");
+            try ctx.writeChunk("{\"a\":1}");
+            try ctx.endStream();
+        }
+    }.h, null);
+
+    var running = try RunningServer.start(&server);
+    defer running.stop(&server);
+
+    const block = try hpackRequestBlock(allocator, "GET", "/h2stream", &.{});
+    defer allocator.free(block);
+    const head = try Http2.encodeHeaders(allocator, 1, block, true, true);
+    defer allocator.free(head);
+
+    var out: [8192]u8 = undefined;
+    const n = try h2SpeakToServer(running.port, head, &out);
+    const reply = out[0..n];
+
+    const hframe = findFrameInReply(reply, .headers, 1) orelse return error.TestUnexpectedResultWithMessage;
+    var dec = Hpack.Decoder.init(allocator);
+    defer dec.deinit();
+    const hdrs = try dec.decode(hframe.payload);
+    defer Hpack.freeHeaders(allocator, hdrs);
+    try std.testing.expectEqualStrings("501", firstHeaderValue(hdrs, ":status") orelse return error.TestUnexpectedResultWithMessage);
+
+    const data = findFrameInReply(reply, .data, 1) orelse return error.TestUnexpectedResultWithMessage;
+    try std.testing.expectEqualStrings("streaming is not supported over HTTP/2", data.payload);
+    // The refusal itself must not carry the H1 framing it replaces.
+    try std.testing.expect(std.mem.indexOf(u8, data.payload, "0\r\n\r\n") == null);
+}
+
+test "h2 server refuses an SSE handler rather than writing H1 event bytes into DATA frames" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var server = api_server.Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h2-sse" });
+    defer server.deinit();
+    server.setHttp2Enabled(true);
+
+    var group = server.group("");
+    try group.get("h2sse", struct {
+        fn h(ctx: *api_server.Context) anyerror!void {
+            var sse = try @import("../http.zig").sse(ctx);
+            try sse.sendEvent("tick", "1");
+        }
+    }.h, null);
+
+    var running = try RunningServer.start(&server);
+    defer running.stop(&server);
+
+    const block = try hpackRequestBlock(allocator, "GET", "/h2sse", &.{});
+    defer allocator.free(block);
+    const head = try Http2.encodeHeaders(allocator, 1, block, true, true);
+    defer allocator.free(head);
+
+    var out: [8192]u8 = undefined;
+    const n = try h2SpeakToServer(running.port, head, &out);
+    const reply = out[0..n];
+
+    // `SseWriter.init` refuses before any byte is framed (`error.NoStream`), so
+    // the H2 adapter never sees `ctx.streaming` here: the exchange is a 500
+    // whose body names the missing stream, not a 200 carrying `data: tick`.
+    const hframe = findFrameInReply(reply, .headers, 1) orelse return error.TestUnexpectedResultWithMessage;
+    var dec = Hpack.Decoder.init(allocator);
+    defer dec.deinit();
+    const hdrs = try dec.decode(hframe.payload);
+    defer Hpack.freeHeaders(allocator, hdrs);
+    try std.testing.expectEqualStrings("500", firstHeaderValue(hdrs, ":status") orelse return error.TestUnexpectedResultWithMessage);
+
+    const data = findFrameInReply(reply, .data, 1) orelse return error.TestUnexpectedResultWithMessage;
+    try std.testing.expect(std.mem.indexOf(u8, data.payload, "NoStream") != null);
+    try std.testing.expect(std.mem.indexOf(u8, data.payload, "data: tick") == null);
+}

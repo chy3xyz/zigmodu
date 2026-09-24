@@ -2336,6 +2336,10 @@ pub const Server = struct {
     ///
     /// `deadline` is the connection's `StreamReader` wrapped for the loop; pass
     /// `null` only if the session is not reading through one.
+    ///
+    /// `request_timeout_ms` is not a session option: it is a *per-request*
+    /// budget, and `http2RouterSiteHandler` arms it on the `Context` it builds
+    /// (`ctx.setDeadline`) — the same call `connFiber` makes on the H1 path.
     fn http2ServeOptions(self: *Server, deadline: ?Http2Server.ReadDeadline) Http2Server.ServeOptions {
         return .{
             .grpc_registry = self.grpc_registry,
@@ -2404,25 +2408,115 @@ pub const Server = struct {
             .content_type = "text/plain",
             .body = try allocator.dupe(u8, "Not Implemented"),
         };
-        var ctx = try Context.init(allocator, method, path);
+
+        // `:path` is the whole request target, query included (RFC 9113 §8.3.1):
+        // the same string `RequestParser.parse` receives and splits. Routing, the
+        // path rewriter and `requestParam`'s query fallback all run on the split
+        // halves. Passing the target through whole made `/route?a=1` unmatched
+        // (404) and every query parameter invisible, for the very route that
+        // answers both on H1.
+        const query_start = std.mem.indexOfScalar(u8, path, '?');
+        const path_only = if (query_start) |q| path[0..q] else path;
+
+        // `ctx.allocator` is per-request on H1: `connFiber` owns an arena and
+        // resets it at the top of every request, so what a handler allocates
+        // from the Context is reclaimed when the request is done — the pattern
+        // `setPathRewriter` documents ("allocate new path in arena"). The H2
+        // loop hands this adapter the *connection*-level allocator, so without
+        // an arena here those allocations pile up for the life of the session
+        // (observed: one leaked rewritten `ctx.path` per rewritten request).
+        // Same lifetime, same contract, both protocols.
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+
+        var ctx = try Context.init(arena_alloc, method, path_only);
         errdefer ctx.deinit();
 
-        var body_owned: ?[]u8 = null;
-        defer if (body_owned) |b| allocator.free(b);
+        if (query_start) |q| {
+            parseQueryInto(&ctx.query, path[q + 1 ..], arena_alloc, server.max_params) catch |err| {
+                // H1 fails such a request (400) instead of routing it with a
+                // half-parsed query. Refuse here too — quietly answering the
+                // route with the parameters missing is the divergence class
+                // this adapter already refuses to have for streaming (501).
+                std.log.warn("[Server] HTTP/2 query string refused: {s}", .{@errorName(err)});
+                ctx.deinit();
+                return .{
+                    .status = 400,
+                    .content_type = "text/plain",
+                    .body = try allocator.dupe(u8, "Bad Request"),
+                };
+            };
+        }
+
+        // The same two arms the H1 dispatch performs before routing (see
+        // `connFiber`: "Arm the request budget once, here" / `ctx.io =
+        // server.io`). Without them the H2 adapter handed handlers a `null`
+        // `ctx.io` and `ctx.sqlContext()` reported `deadline_ms = null`, i.e.
+        // an unbounded request with no way for storage to hear about the
+        // budget — for the same routes, at the same `Config` numbers.
+        ctx.setDeadline(server.request_timeout_ms);
+        ctx.io = server.io;
+        // `ctx.stream` is deliberately left `null` rather than pointed at the
+        // connection socket: writing H1 bytes there produces bytes the peer
+        // cannot parse as frames. There is no mid-response channel on this
+        // adapter at all (the body is one `SiteResponse` written as DATA frames
+        // after the handler returns), so a streaming handler is refused below
+        // instead of being handed a stream that would corrupt the response —
+        // and nothing on this path may dereference `ctx.stream` (it is `null`
+        // here, not on H1).
+        ctx.raw_path = path; // the whole target; `ctx.path` above is the split
+
         if (body.len > 0) {
-            body_owned = try allocator.dupe(u8, body);
-            ctx.body = body_owned;
+            ctx.body = try arena_alloc.dupe(u8, body);
         }
         for (headers) |h| {
             if (h.name.len == 0 or h.name[0] == ':') continue;
-            const k = try allocator.dupe(u8, h.name);
-            errdefer allocator.free(k);
-            const v = try allocator.dupe(u8, h.value);
-            errdefer allocator.free(v);
+            const k = try arena_alloc.dupe(u8, h.name);
+            const v = try arena_alloc.dupe(u8, h.value);
             try ctx.headers.put(k, v);
         }
 
+        // ── Path rewriter, then the urlencoded form parse ──
+        // Both are steps `connFiber` runs between taking the request apart and
+        // matching a route, and both write fields the handler reads (`ctx.path`,
+        // `ctx.requestParam`). Running them on H1 only makes one route answer
+        // differently per protocol — e.g. an app that strips an API-version
+        // prefix, or a login form whose fields never arrive.
+        if (server.path_rewriter) |rewriter| {
+            rewriter(&ctx);
+        }
+        if (ctx.body) |form_body| {
+            const form_ctype = ctx.headers.get("content-type") orelse "";
+            if (std.mem.startsWith(u8, form_ctype, "application/x-www-form-urlencoded")) {
+                ctx.form = parseFormBody(arena_alloc, form_body, server.max_params) catch null;
+            }
+        }
+
         try server.handleForTest(&ctx);
+
+        if (ctx.streaming) {
+            // `startChunked` / `writeChunk` is the H1 chunked API and has no H2
+            // equivalent on this adapter: with `ctx.stream` null the chunks
+            // land in `response_body` *with their H1 framing*, and the code
+            // below would serve that as an ordinary 200 body (observed:
+            // `7\r\n{"a":1}\r\n0\r\n\r\n`). A silent 200 carrying framing bytes
+            // is worse than a refusal, so refuse — and say why.
+            // `warn`, not `err`, for the same reason as the refused-response
+            // header at the end of `connFiber`: the request is answered, and an
+            // error-level line makes `scripts/test-runner.zig` fail the suite.
+            std.log.warn(
+                "[Server] HTTP/2 has no response stream: {s} {s} used the chunked streaming path; answering 501",
+                .{ method_str, path },
+            );
+            const refusal = try allocator.dupe(u8, "streaming is not supported over HTTP/2");
+            ctx.deinit();
+            return .{
+                .status = 501,
+                .content_type = "text/plain",
+                .body = refusal,
+            };
+        }
 
         const status = ctx.status_code;
         // The *response* map, not `ctx.header` (which reads request headers):
@@ -6188,4 +6282,353 @@ test "a response header the server refuses is answered with 500, not dropped" {
     // Nothing partial: the refusal happens before the status line is written,
     // so the 500 is a complete response rather than a truncated 200.
     try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 500"));
+}
+
+// --- H2 adapter parity (h2c over loopback) ---
+//
+// `connFiber` performs a fixed sequence between receiving a request and routing
+// it: split the query off the request target, arm the budget and `io`, take
+// `.body`, copy headers, run `path_rewriter`, parse a urlencoded form body,
+// match. `http2RouterSiteHandler` is the H2 twin of that sequence, and every
+// step it skips is a difference the application can see — handler code reads
+// `ctx.path` / `ctx.requestParam` the same way on both protocols. These tests
+// drive a real h2c exchange, so what is asserted is the bytes the client gets,
+// not the adapter's internals.
+
+/// Client side of one prior-knowledge h2c exchange with a running `Server`:
+/// connection preface, then `frames`, then a half-close so the connection
+/// fiber's frame loop sees EOF instead of parking in a read.
+fn h2SendToServer(port: u16, frames: []const u8, out: []u8) !usize {
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+    var stream = try addr.connect(std.testing.io, .{ .mode = .stream });
+    defer stream.close(std.testing.io);
+
+    try @import("../core/sockread.zig").writeFull(stream, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try @import("../core/sockread.zig").writeFull(stream, frames);
+    _ = std.c.shutdown(stream.socket.handle, std.c.SHUT.WR);
+
+    var total: usize = 0;
+    while (total < out.len) {
+        var fds = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&fds, 3000) catch break;
+        if (ready == 0) break;
+        const n = std.posix.read(stream.socket.handle, out[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    return total;
+}
+
+/// One HPACK request block: the four pseudo-headers plus `extra`.
+fn h2RequestBlock(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    path: []const u8,
+    extra: []const Hpack.Header,
+) ![]u8 {
+    var headers = std.ArrayList(Hpack.Header).empty;
+    defer headers.deinit(allocator);
+    try headers.append(allocator, .{ .name = ":method", .value = method });
+    try headers.append(allocator, .{ .name = ":path", .value = path });
+    try headers.append(allocator, .{ .name = ":scheme", .value = "http" });
+    try headers.append(allocator, .{ .name = ":authority", .value = "localhost" });
+    try headers.appendSlice(allocator, extra);
+    const enc = Hpack.Encoder.init(allocator);
+    return enc.encodeSmart(headers.items);
+}
+
+fn h2FindFrame(wire: []const u8, typ: Http2.FrameType, stream_id: u31) ?Http2.Frame {
+    var off: usize = 0;
+    while (off + 9 <= wire.len) {
+        const frame = Http2.decodeFrame(wire[off..]) catch return null;
+        if (frame.header.typ == typ and (stream_id == 0 or frame.header.stream_id == stream_id)) return frame;
+        off += 9 + @as(usize, frame.header.length);
+    }
+    return null;
+}
+
+fn h2FirstHeaderValue(headers: []const Hpack.Header, name: []const u8) ?[]const u8 {
+    for (headers) |h| {
+        if (std.mem.eql(u8, h.name, name)) return h.value;
+    }
+    return null;
+}
+
+/// POST one urlencoded body over h2c and return the reply's DATA payload (a
+/// subslice of `out`, which the caller owns).
+fn h2PostForm(
+    allocator: std.mem.Allocator,
+    port: u16,
+    route: []const u8,
+    body: []const u8,
+    out: []u8,
+) ![]const u8 {
+    const ctype = [_]Hpack.Header{.{ .name = "content-type", .value = "application/x-www-form-urlencoded" }};
+    const block = try h2RequestBlock(allocator, "POST", route, &ctype);
+    defer allocator.free(block);
+
+    var script = std.ArrayList(u8).empty;
+    defer script.deinit(allocator);
+    const head = try Http2.encodeHeaders(allocator, 1, block, false, true);
+    defer allocator.free(head);
+    try script.appendSlice(allocator, head);
+    const data = try Http2.encodeData(allocator, 1, body, true);
+    defer allocator.free(data);
+    try script.appendSlice(allocator, data);
+
+    const n = try h2SendToServer(port, script.items, out);
+    const frame = h2FindFrame(out[0..n], .data, 1) orelse return error.NoDataFrameInReply;
+    return frame.payload;
+}
+
+/// A real `Server` listening on a loopback port on its own thread.
+const H2TestServer = struct {
+    thread: std.Thread,
+    port: u16,
+
+    /// Returns once the accept loop has published the port it bound.
+    fn start(server: *Server) !H2TestServer {
+        const th = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, struct {
+            fn run(s: *Server) void {
+                s.start() catch |err| std.log.warn("[h2 parity] test accept loop ended: {s}", .{@errorName(err)});
+            }
+        }.run, .{server});
+
+        var port: u16 = 0;
+        var tries: usize = 0;
+        while (tries < 200) : (tries += 1) {
+            if (server.listener) |*l| {
+                port = l.socket.address.getPort();
+                break;
+            }
+            std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real) catch |err|
+                std.log.debug("[h2 parity] poll sleep failed: {s}", .{@errorName(err)});
+        }
+        if (port == 0) {
+            server.stop();
+            th.join();
+            return error.ServerNeverListened;
+        }
+        return .{ .thread = th, .port = port };
+    }
+
+    /// `stop()` before `join()`: the accept loop only unwinds once `running` is
+    /// cleared, and `start()`'s `conn_group.await` then waits for the fibers.
+    fn stop(self: *H2TestServer, server: *Server) void {
+        server.stop();
+        self.thread.join();
+    }
+};
+
+test "h2 adapter parity: a urlencoded form body is parsed like H1" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h2-form" });
+    defer server.deinit();
+    server.setHttp2Enabled(true);
+
+    var group = server.group("");
+    try group.post("h2form", struct {
+        fn h(ctx: *Context) anyerror!void {
+            try ctx.text(200, ctx.requestParam("name") orelse "MISSING");
+        }
+    }.h, null);
+
+    var running = try H2TestServer.start(&server);
+    defer running.stop(&server);
+
+    // Percent-encoded value: the point is that the *same* parser ran
+    // (`parseFormBody` decodes `+` and `%XX`), not just that some bytes were
+    // buffered.
+    var out: [8192]u8 = undefined;
+    const payload = try h2PostForm(allocator, running.port, "/h2form", "name=%E5%BC%A0%E4%B8%89&role=admin", &out);
+    try std.testing.expectEqualStrings("张三", payload);
+}
+
+test "h2 adapter parity: the form parser takes Server.Config.max_params too" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    // The limit is the field the H1 parser is handed; a body over it must be
+    // refused on H2 as well, or the H2 path is the cheap way past the DoS bound.
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .max_params = 2, .name = "h2-form-limit" });
+    defer server.deinit();
+    server.setHttp2Enabled(true);
+
+    var group = server.group("");
+    try group.post("h2formlimit", struct {
+        fn h(ctx: *Context) anyerror!void {
+            try ctx.text(200, ctx.requestParam("a") orelse "MISSING");
+        }
+    }.h, null);
+
+    var running = try H2TestServer.start(&server);
+    defer running.stop(&server);
+
+    // Two bodies through the same route: one within the limit is parsed, the
+    // one over it is refused — so "the limit is applied" is distinguishable from
+    // "no body is ever parsed".
+    var out_a: [8192]u8 = undefined;
+    const within_limit = try h2PostForm(allocator, running.port, "/h2formlimit", "a=1&b=2", &out_a);
+    try std.testing.expectEqualStrings("1", within_limit);
+
+    var out_b: [8192]u8 = undefined;
+    const over_limit = try h2PostForm(allocator, running.port, "/h2formlimit", "a=1&b=2&c=3", &out_b);
+    try std.testing.expectEqualStrings("MISSING", over_limit);
+}
+
+test "h2 adapter parity: the path rewriter runs before routing" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h2-rewrite" });
+    defer server.deinit();
+    server.setHttp2Enabled(true);
+    // The shape an app uses to strip an API-version prefix.
+    server.setPathRewriter(struct {
+        fn rewrite(ctx: *Context) void {
+            if (std.mem.startsWith(u8, ctx.path, "/v1/")) {
+                ctx.path = std.fmt.allocPrint(ctx.allocator, "/{s}", .{ctx.path["/v1/".len..]}) catch return;
+            }
+        }
+    }.rewrite);
+
+    var group = server.group("");
+    try group.get("ping", struct {
+        fn h(ctx: *Context) anyerror!void {
+            try ctx.text(200, "pong");
+        }
+    }.h, null);
+
+    var running = try H2TestServer.start(&server);
+    defer running.stop(&server);
+
+    const block = try h2RequestBlock(allocator, "GET", "/v1/ping", &.{});
+    defer allocator.free(block);
+    const head = try Http2.encodeHeaders(allocator, 1, block, true, true);
+    defer allocator.free(head);
+
+    var out: [8192]u8 = undefined;
+    const n = try h2SendToServer(running.port, head, &out);
+    const reply = out[0..n];
+
+    const hframe = h2FindFrame(reply, .headers, 1) orelse return error.TestUnexpectedResultWithMessage;
+    var dec = Hpack.Decoder.init(allocator);
+    defer dec.deinit();
+    const hdrs = try dec.decode(hframe.payload);
+    defer Hpack.freeHeaders(allocator, hdrs);
+    try std.testing.expectEqualStrings("200", h2FirstHeaderValue(hdrs, ":status") orelse return error.TestUnexpectedResultWithMessage);
+
+    const body = h2FindFrame(reply, .data, 1) orelse return error.TestUnexpectedResultWithMessage;
+    try std.testing.expectEqualStrings("pong", body.payload);
+}
+
+test "h2 adapter parity: the query string is split off the target and parsed" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h2-query" });
+    defer server.deinit();
+    server.setHttp2Enabled(true);
+
+    var group = server.group("");
+    try group.get("h2query", struct {
+        fn h(ctx: *Context) anyerror!void {
+            // `ctx.param` is the route placeholder; the query is the fallback
+            // `requestParam` reaches for, and it has to be parsed to be there.
+            try ctx.text(200, ctx.requestParam("b") orelse "MISSING");
+        }
+    }.h, null);
+
+    var running = try H2TestServer.start(&server);
+    defer running.stop(&server);
+
+    const block = try h2RequestBlock(allocator, "GET", "/h2query?a=1&b=%E5%BC%A0%E4%B8%89", &.{});
+    defer allocator.free(block);
+    const head = try Http2.encodeHeaders(allocator, 1, block, true, true);
+    defer allocator.free(head);
+
+    var out: [8192]u8 = undefined;
+    const n = try h2SendToServer(running.port, head, &out);
+    const reply = out[0..n];
+
+    // A 200 also proves the target was matched as `/h2query`: the router sees
+    // `ctx.path`, not the whole `:path` with the query still attached.
+    const hframe = h2FindFrame(reply, .headers, 1) orelse return error.TestUnexpectedResultWithMessage;
+    var dec = Hpack.Decoder.init(allocator);
+    defer dec.deinit();
+    const hdrs = try dec.decode(hframe.payload);
+    defer Hpack.freeHeaders(allocator, hdrs);
+    try std.testing.expectEqualStrings("200", h2FirstHeaderValue(hdrs, ":status") orelse return error.TestUnexpectedResultWithMessage);
+
+    const body = h2FindFrame(reply, .data, 1) orelse return error.TestUnexpectedResultWithMessage;
+    try std.testing.expectEqualStrings("张三", body.payload);
+}
+
+test "h2 adapter parity: the auth rate limiter answers 429 through the response channel" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h2-ratelimit" });
+    defer server.deinit();
+    server.setHttp2Enabled(true);
+
+    // max_attempts 1 per 60s: the second request is refused, which is the path
+    // that used to write to `ctx.stream` — null on this adapter, so it took the
+    // process down instead of answering. The limiter lives as long as the
+    // middleware does (it rides along as `user_data`; nothing frees it), so it
+    // gets an arena the test tears down wholesale rather than the leak-checking
+    // `std.testing.allocator`.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const mw = try @import("../security/SecurityModule.zig").authRateLimitMiddleware(arena.allocator(), 1, 60);
+    try server.addMiddleware(mw);
+
+    var group = server.group("");
+    try group.post("h2login", struct {
+        fn h(ctx: *Context) anyerror!void {
+            try ctx.text(200, "ok");
+        }
+    }.h, null);
+
+    var running = try H2TestServer.start(&server);
+    defer running.stop(&server);
+
+    const block = try h2RequestBlock(allocator, "POST", "/h2login", &.{});
+    defer allocator.free(block);
+    const head = try Http2.encodeHeaders(allocator, 1, block, true, true);
+    defer allocator.free(head);
+
+    {
+        var out: [8192]u8 = undefined;
+        const n = try h2SendToServer(running.port, head, &out);
+        const reply = out[0..n];
+        const hframe = h2FindFrame(reply, .headers, 1) orelse return error.TestUnexpectedResultWithMessage;
+        var dec = Hpack.Decoder.init(allocator);
+        defer dec.deinit();
+        const hdrs = try dec.decode(hframe.payload);
+        defer Hpack.freeHeaders(allocator, hdrs);
+        try std.testing.expectEqualStrings("200", h2FirstHeaderValue(hdrs, ":status") orelse return error.TestUnexpectedResultWithMessage);
+    }
+
+    {
+        // A fresh connection, so the 429 is the limiter's answer and not
+        // stream state from the request above.
+        var out: [8192]u8 = undefined;
+        const n = try h2SendToServer(running.port, head, &out);
+        const reply = out[0..n];
+
+        const hframe = h2FindFrame(reply, .headers, 1) orelse return error.TestUnexpectedResultWithMessage;
+        var dec = Hpack.Decoder.init(allocator);
+        defer dec.deinit();
+        const hdrs = try dec.decode(hframe.payload);
+        defer Hpack.freeHeaders(allocator, hdrs);
+        try std.testing.expectEqualStrings("429", h2FirstHeaderValue(hdrs, ":status") orelse return error.TestUnexpectedResultWithMessage);
+
+        // ...and a body, delivered as an ordinary DATA frame: the refusal is a
+        // response, not a dropped connection or a process abort.
+        const body = h2FindFrame(reply, .data, 1) orelse return error.TestUnexpectedResultWithMessage;
+        try std.testing.expect(std.mem.indexOf(u8, body.payload, "Too many requests") != null);
+    }
 }

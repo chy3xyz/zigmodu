@@ -483,7 +483,7 @@ test "OutboxPublisher unscoped insert fills every NOT NULL column" {
         .{},
     );
     defer cursor.deinit();
-    const row = cursor.next().?;
+    const row = (try cursor.next()).?;
     try std.testing.expectEqualStrings("order.created", row.get("topic").?.string);
     try std.testing.expectEqualStrings("{\"id\":1}", row.get("payload").?.string);
     // The driver reports SQL NULL as a missing `?Value`, so the tenant column is

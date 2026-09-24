@@ -177,7 +177,7 @@ test "trigger writes run outcome to the outbox" {
 
     var cursor = try sqlx_client.queryCursorEx("SELECT topic, payload FROM event_outbox", &.{}, .{});
     defer cursor.deinit();
-    const row = cursor.next() orelse return error.NoOutboxRow;
+    const row = (try cursor.next()) orelse return error.NoOutboxRow;
     try std.testing.expectEqualStrings("ai.run", row.get("topic").?.string);
     const payload = row.get("payload").?.string;
     try std.testing.expect(std.mem.indexOf(u8, payload, "run-1") != null);

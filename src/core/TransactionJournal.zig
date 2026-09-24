@@ -221,7 +221,7 @@ pub const TransactionJournal = struct {
         var seen = std.StringHashMap(void).init(allocator);
         defer seen.deinit();
 
-        while (cursor.next()) |row| {
+        while (try cursor.next()) |row| {
             const tx_id_text = textOf(row.get("tx_id"));
             if (tx_id_text.len == 0 or seen.contains(tx_id_text)) continue;
 

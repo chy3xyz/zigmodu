@@ -128,7 +128,7 @@ test "SlaTracker fires warn before deadline and breach after" {
 
     var cursor = try client.queryCursorEx("SELECT topic, payload FROM event_outbox", &.{}, .{});
     defer cursor.deinit();
-    const row = cursor.next().?;
+    const row = (try cursor.next()).?;
     try std.testing.expectEqualStrings("ai.sla", row.get("topic").?.string);
     try std.testing.expect(std.mem.indexOf(u8, row.get("payload").?.string, "warn") != null);
 }

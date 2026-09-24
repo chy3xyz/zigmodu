@@ -4670,6 +4670,26 @@ fn Flag(comptime V: type) type {
     };
 }
 
+/// Probe: a boolean flag another thread **clears** — the negative of `Flag`.
+///
+/// `Runtime.alive` is the case it exists for: it is true from construction and
+/// `shutdown` clears it, so "the teardown has begun" is a wait for *false*.
+/// `Flag` would ask for true, which its initial value already satisfies: the
+/// wait then means "until the other side stops doing anything", never "until it
+/// has started". Both readings happen to end the wait, and they are not the
+/// same one — the difference only shows up on the interleaving where the
+/// clearer ran first, where true never comes back and the wait spins out its
+/// whole budget.
+fn Cleared(comptime V: type) type {
+    return struct {
+        value: *V,
+
+        pub fn ready(self: @This()) bool {
+            return !self.value.load(.acquire);
+        }
+    };
+}
+
 test "Runtime: a pooled worker receives every message, in order" {
     const OrderWorker = struct {
         pub const Message = u32;
@@ -5303,7 +5323,22 @@ test "Runtime: shutdown with the pool mid-batch hands the claim back first" {
     const thread = try std.Thread.spawn(.{}, Teardown.run, .{&rt});
     // Wait for the teardown to have actually begun (shutdown clears `alive`
     // first), then let the handler finish.
-    try waitUntil(Flag(@TypeOf(rt.alive)){ .value = &rt.alive }, 5_000);
+    //
+    // `Cleared`, not `Flag`: `alive` is *true* until shutdown clears it, so
+    // "the teardown has begun" is a wait for false. Asking `Flag` for true is
+    // answered by the initial value — the wait returns before anything happened
+    // when the teardown loses that race, and against a predicate that is never
+    // true again when it wins: the spawn hands the CPU to the new thread, the
+    // clear lands first, and the loop spins out its whole budget.
+    waitUntil(Cleared(@TypeOf(rt.alive)){ .value = &rt.alive }, 5_000) catch |err| {
+        // A wait that gave up still has to let the handler go, or the failure is
+        // unreportable: the teardown is inside `shutdown`, whose pool join waits
+        // for exactly this batch, and the `deinit` deferred above waits for the
+        // teardown. Returning here without releasing turns "the wait timed out"
+        // into a hang of the whole suite.
+        shared.release.store(true, .release);
+        return err;
+    };
     shared.release.store(true, .release);
     thread.join();
 

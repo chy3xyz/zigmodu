@@ -2,6 +2,88 @@
 
 ## [Unreleased]
 
+### 第 8 批：CI 那条红是测试的等待谓词反了；`Cursor.next` 不再把错误折叠成 EOF；H2 补齐表单/改写器/查询串；`authRateLimitMiddleware` 首次可编译（**破坏性：是**，1 处编译错）
+
+全量 `-Ddb=all` **1740/1766（26 skipped，0 failed）**；另有真机 PG 17.10（`ZIGMODU_TEST_PG=1`）与
+MySQL 9.3.0（`DB=mysql`）分组跑过相关用例。
+
+**CI 上那条 5 分钟超时：测试等错了极性，不是运行时的错。** `Runtime: shutdown with the pool mid-batch
+hands the claim back first` 的第二次等待写成 `waitUntil(Flag(rt.alive))` —— 而 `Flag.ready()` 返回**原值**，
+`rt.alive` 初值就是 `true`（`src/runtime/runtime.zig:1085`）且只会被 `shutdown` 置 `false`。于是它等的
+是"alive 变成 true"：绝大多数运行里主线程的第一次检查早于 teardown 的 clear，**立刻返回**（于是它连
+"shutdown 已开始"都没等到，与注释相反）；一旦 teardown 的 clear 先落地，谓词永假，5 s 预算耗尽后走
+`error.WaitTimeout` 错误路径 → 三方死锁（main 卡在 `deinit` 的 `shutdown_mu`，teardown 卡在 pool join，
+pool 线程在 handler 里等 `release`，而 `release` 只有 main 会设）。实测挂死率 **0.1%（1000 次顺序）/ 约
+0.3%（4 路并发各 600–480 次）**，CI 上就是那条 `timed out after 5m1.634ms`。
+`Clock.Manual` 是误导：`waitUntil` 用的是真实 `monotonicNowMilliseconds`，超时**会**触发，挂死在错误路径之后。
+修法（只改测试）：新增 `Cleared(V)` 探针（`!value.load(.acquire)`，即"等一个被别人清掉的标志"），并让
+失败路径**先放掉 `shared.release` 再 re-raise** —— 否则任何一次等待失败都不可报告（deferred `deinit` 会
+把整个测试二进制挂住）。**强制复现**：在 `std.Thread.spawn` 之后注入 25 ms 忙等（保证 clear 先落地）→
+修前 `exit=124`（30 s 超时）/ 修后 0.02 s 过；修后 0/2000 顺序 + 0/2000 并发宽 4。
+生产侧的顺序经反汇编与 lldb 独立确认过是对的（`shutdown` 在 `<+180>` 就 `stlrb` 清 `alive`，到 `+792`
+才调 `Scheduler.shutdown`），**没有**改动生产代码。
+
+**`Cursor.next` 把驱动错误折叠成"结果取完"（真红已修，破坏性）。** `sqlx.Cursor.next`（以及两个驱动游标）
+返回 `?*Row`：流中途的服务器错误与"没有更多行"不可区分，于是**被截断的结果被当成完整结果**。
+真机 PG 红证据（`SELECT 100 / (3 - i) AS q FROM generate_series(1, 5) AS i`，`.mode = .streaming`）：
+```
+[red] row 1 / row 2 … loop ended with no error after 2 row(s); the query has 5 and the server raises at row 3
+expected 5, found 2
+```
+新的签名是 `errors.ResultT(?*Row)`（仓库里 `GrpcStreamReader.next` 已是这个形状）：MySQL 侧
+`mysql_fetch_row` 为 NULL **且** `mysql_errno != 0` → 抛错，PG 侧非 `TUPLES_OK`/`SINGLE_TUPLE`/`COMMAND_OK`
+→ 走新增的 `pgResultToError`（与获取路径同一张 SQLSTATE 表），连接掉了（`PQgetResult` NULL +
+`PQstatus != CONNECTION_OK`）→ `error.DatabaseConnectionFailed`，每行的 arena 分配与
+`mysql_fetch_lengths` 的 NULL 解引用也都改成可失败。**同一个流上顺带修掉一个 use-after-free**：列名原
+本分配在**每行都会 `free_all` 的行 arena** 里，所以每个流式行携带的 `columns` 都是悬垂切片 —— 真机红证据是
+读 `row.columns[0]` 直接 `FAULT`/`SIGSEGV`（列名改为独立的 `columns_arena`）。
+**Breaking?** 是（编译错）· 仓库内 39 处（19 个文件）已改完；消费方 `while (cursor.next()) |row|` →
+`while (try cursor.next()) |row|`，逐条见 [`docs/UPGRADING.md`](docs/UPGRADING.md) §v0.33.3。
+**刻意没有**保留一个"旧的 `next()` 继续折叠 + 新的 `tryNext()`"的兼容层：`Repository`/`QueryResult`/分页
+里**没有**任何 Cursor 调用点（那层兼容只会把静默截断留给唯一需要它的那批调用者）。
+MySQL 侧的 `mysql_errno` 分支与 `columns_arena` **无测试覆盖**（本机 MySQL 9.3.0 只跑了门控用例，
+8 passed / 0 failed），只做了推理。
+
+**H2 适配器补齐 H1 已有、H2 一直缺的四件事（真红各一条）。** 这些是"静默行为不同"，不是"不支持"：
+① **表单体不解析** —— H2 上 `ctx.requestParam("field")` 恒为 null（红：`expected 张三, found MISSING`），
+现在按与 H1 相同的 helper 解析并遵守 `Server.Config.max_params`（限内解析、超限不解析，两个方向都有断言）；
+② **`path_rewriter` 不运行** —— 重写后的路径在 H2 上 404（红：`expected 200, found 404`）；
+③ **`:path` 里的查询串不拆** —— `/h2query?a=1` 带着查询串去匹配路由（红：同上 404）且 `ctx.query` 为空，
+现在按 `RequestParser` 的方式拆开（`ctx.raw_path` 保留完整 target），**拆不动时返回 400** 而不是带着缺参数
+继续路由；④ **`ctx.allocator` 是连接级的** —— H1 每次请求给一个 arena，H2 给的是整个会话的 allocator，
+于是 handler 分配的东西会随会话一直累计（`setPathRewriter` 的文档示例正好用 `ctx.allocator`，实测在
+SafeAllocator 下当场泄漏 `leaked [len: 5]`），改为每请求 arena。五条用例都是真 socket h2c。
+
+**`authRateLimitMiddleware` 此前从未被编译过 —— 它里面有 4 个编译错误，修好后才看得见那个 panic。**
+Zig 惰性分析函数体，而这个工厂**没有任何 in-tree 调用者**，所以：返回类型声明成 `!api.MiddlewareFn` 却返回
+`.func/.user_data`（`Middleware`）、把 `&.{}` 当 writer 缓冲、在临时值上取 `*const Io.Writer`、
+`next(ctx, next, user_data)` 用三个实参调用 `HandlerFn` —— 四个错误全在一个语句里，一直没被发现。
+最小修到能编译后，上一批报告的 panic 就复现了：H2 上 `ctx.stream` 为 null，而 429 路径
+`ctx.stream.?.writer(ctx.io.? …)` 直接 `panic: attempt to use null value`（`exit=134`）。
+现在拒绝走 Context 的响应通道（`ctx.setHeader("Retry-After", "60")` + `ctx.sendError(429, …)`）。
+> **顺带发现**：旧代码是把 body **直接写到 socket、且写在状态行之前**的 —— 在 H1 上也是一条框架错误的响应，
+> 不只是 H2 的问题。这条路径既然从没编译过，任何依赖它 429 响应体的应用都不存在。
+
+**`permissionGateWith`「一个进程两个 server」有结论了：正确，且现在有用例钉住。** 新增用例在一个进程里
+建两套完整拓扑（各自 Router/CatalogSlot，路由与权限映射都不同，共用一个 JWT 密钥与授权表，所以差异只在
+"各自 catalog 要什么"），断言 reader token 在 A 200 / B 403、A→B→A 交错后仍 A 200、writer token 相反、
+`/status` 的公开性按 app 各自成立、`/audit` 只在 A 注册（B 404）。**用例的牙**：故意把 gate 改成读一个
+进程全局 slot（两个 server 共用最后一个构造的 catalog）→ 立刻红（`expected 200, found 403`），已还原，
+生产代码一行未动。原因是设计使然：slot 指针与 config 在**每次构造**时拷进 per-call `Store`、
+catalog **每请求**读，中间没有进程级状态。
+> **顺带查出两个真的进程全局**（都**未改**，且都是既有文档化的单实例假设）：
+> `OpenApiRouteStore`（第二个 server 注册会覆盖第一个 → A 的 `/openapi.json` 会服务 B 的 catalog，
+> 只影响文档端点不影响执法）；`catalogLoaderFromTable` 的模块级 `Holder.tbl`。要隔离得按 slot 指针分状态。
+
+**H2 的 `ctx.io` / 请求预算**（上一批只修了流式拒绝，这批补齐）：H2 路径此前不 arm `ctx.io` 与
+`setDeadline`，于是 `ctx.io` 为 null（`jwtAuth` 会静默降级到没有 CSPRNG 句柄的 `SecurityModule.init`、
+x402 发票号回落到时间戳+计数器）、`sqlContext().deadline_ms` 为 null（存储层不会拒绝开始新查询）。
+红证据：把这两行注释掉 → `io=null sql_deadline=none within_budget=false` / 期望
+`io=set sql_deadline=set within_budget=true`。
+> **已知未修**：`Http2Server.SiteResponse` 只带 `status`/`content_type`/`body`，所以 **H2 上除
+> `content-type` 以外的响应头全部被丢弃** —— `Retry-After`、`Location`、`Set-Cookie`、CORS 头都会
+> 静默消失。修它要给 `SiteResponse` 加头列表，是独立的下一批。
+
 ### 第 7 批：plain 池不再交出死连接、常驻 HTTPS client 的证书时钟重挂、Otlp/Secrets 常驻 client、sqlx Builder 不再静默丢子句、catalog 查询按 schema 限定（**破坏性：否**）
 
 全量 `-Ddb=all` **1731/1755（24 skipped，0 failed）**（第 6 批 1721/1745 → +10 用例）。

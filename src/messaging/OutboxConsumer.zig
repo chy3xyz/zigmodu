@@ -144,7 +144,7 @@ pub const OutboxConsumer = struct {
         defer cursor.deinit();
 
         var stats = PollStats{ .selected = 0, .delivered = 0, .failed = 0 };
-        while (cursor.next()) |row| {
+        while (try cursor.next()) |row| {
             const entry = self.parseEntry(row) catch continue;
             stats.selected += 1;
             _ = try self.backend.exec("UPDATE event_outbox SET status = 1, updated_at = ? WHERE id = ?", &.{
@@ -309,10 +309,10 @@ test "OutboxConsumer dispatches pending entries and updates lifecycle" {
         .{},
     );
     defer cursor.deinit();
-    const r1 = cursor.next().?;
+    const r1 = (try cursor.next()).?;
     try std.testing.expectEqualStrings("ai.approval", r1.get("topic").?.string);
     try std.testing.expectEqual(@as(i64, 2), r1.get("status").?.int);
-    const r2 = cursor.next().?;
+    const r2 = (try cursor.next()).?;
     try std.testing.expectEqualStrings("ai.recon", r2.get("topic").?.string);
     try std.testing.expectEqual(@as(i64, 0), r2.get("status").?.int);
 }
@@ -347,7 +347,7 @@ test "OutboxConsumer marks retry then fails on persistent handler errors" {
 
     var cursor = try client.queryCursorEx("SELECT status, retry_count, error_message FROM event_outbox", &.{}, .{});
     defer cursor.deinit();
-    const row = cursor.next().?;
+    const row = (try cursor.next()).?;
     try std.testing.expectEqual(@as(i64, 3), row.get("status").?.int);
     try std.testing.expectEqual(@as(i64, 2), row.get("retry_count").?.int);
     try std.testing.expectEqualStrings("DeliveryFailed", row.get("error_message").?.string);

@@ -93,7 +93,7 @@ pub const PersistentApprovalQueue = struct {
         defer self.allocator.free(sql);
         var cursor = try self.backend.client.queryCursorEx(sql, &.{}, .{});
         defer cursor.deinit();
-        while (cursor.next()) |row| {
+        while (try cursor.next()) |row| {
             try out.append(allocator, .{
                 .run_id = try allocator.dupe(u8, row.get("run_id").?.string),
                 .subject = try allocator.dupe(u8, row.get("subject").?.string),
@@ -134,7 +134,7 @@ pub const PersistentApprovalQueue = struct {
         defer self.allocator.free(sql);
         var cursor = try self.backend.client.queryCursorEx(sql, &.{}, .{});
         defer cursor.deinit();
-        return @intCast(cursor.next().?.get("n").?.int);
+        return @intCast((try cursor.next()).?.get("n").?.int);
     }
 };
 

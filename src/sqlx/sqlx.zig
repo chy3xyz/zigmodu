@@ -323,9 +323,11 @@ pub const BatchInsertOptions = struct {
 /// interleave with.
 ///
 /// Observability: acquiring a cursor is reported like any other read (metrics
-/// callback + circuit breaker, see `Client.queryCursorEx`). Using one is not —
-/// `next` has no error channel — except that a pooled stream which broke while
-/// draining is counted as a read failure against the owning client's breaker.
+/// callback + circuit breaker, see `Client.queryCursorEx`). Reading one is not —
+/// a cursor has no `sql_str` to key a meter on — except that a pooled stream
+/// which broke while draining is counted as a read failure against the owning
+/// client's breaker. A driver failure *while fetching* is not metered either;
+/// it is returned to the caller by `next`.
 pub const Cursor = struct {
     state: State,
     pos: usize = 0,
@@ -365,14 +367,18 @@ pub const Cursor = struct {
             if (co.conn.ping()) |_| {
                 co.pool.release(co.conn);
             } else |err| {
-                // A broken stream is the only *use-phase* failure a cursor can
-                // report — `next()` folds driver errors into "no more rows" — so
-                // it is what a cursor contributes to the breaker. Same filter as
-                // the acquisition used (`isAcceptable`), so the acceptable-error
-                // rule stays "never counted, on either path". No metrics event
-                // here: `sql_str` belongs to the caller, not to the cursor, and
-                // copying it on the chance that `deinit` reports would put an
-                // allocation on every cursor's hot path.
+                // A stream that broke while draining is what a cursor
+                // contributes to the breaker. `next` reports a mid-stream
+                // driver failure to its caller rather than folding it into "no
+                // more rows", but it cannot book one: the meter is keyed by
+                // statement (`sql_str` belongs to the caller, not to the
+                // cursor) and copying it on the chance that `deinit` reports
+                // would put an allocation on every cursor's hot path. This is
+                // also where the connection's end state is visible, so a stream
+                // that stopped because the server or the socket died is seen
+                // here as a failed `ping`. Same filter as the acquisition used
+                // (`isAcceptable`), so the acceptable-error rule stays "never
+                // counted, on either path".
                 const client = co.pool.client;
                 if (!client.isAcceptable(err)) client.cb.recordFailure(client.io);
                 co.pool.discard(co.conn);
@@ -391,7 +397,15 @@ pub const Cursor = struct {
         };
     }
 
-    pub fn next(self: *Cursor) ?*Row {
+    /// Pull the next row, or `null` once the result set is exhausted (or the
+    /// cursor was already drained).
+    ///
+    /// A driver failure **in the middle** of a stream comes back as an error,
+    /// never as `null`: "the row source broke" and "the rows ran out" are
+    /// different events, and a caller that cannot tell them apart reports a
+    /// truncated result as a complete one. `try` on the result is therefore not
+    /// optional bookkeeping — it is what makes the short read visible.
+    pub fn next(self: *Cursor) errors.ResultT(?*Row) {
         switch (self.state) {
             .buffered => |*rows| {
                 if (self.pos >= rows.rows.len) return null;
@@ -423,7 +437,15 @@ pub const Cursor = struct {
 const MySqlCursor = struct {
     mysql: ?*libmysql_c.MYSQL,
     res: ?*libmysql_c.MYSQL_RES,
+    /// Row values only. `next` resets this arena on every call, so nothing that
+    /// has to outlive a row may be allocated here — that is why the column
+    /// names live in `columns_arena` instead (they used to be allocated here
+    /// and were freed by the first `reset`, leaving every row's `columns` slice
+    /// dangling).
     arena: std.heap.ArenaAllocator,
+    /// Column names, copied at acquisition: one set per result set, shared by
+    /// every row, freed by `deinit`.
+    columns_arena: std.heap.ArenaAllocator,
     columns: []const []const u8,
     row: Row,
     eof: bool,
@@ -436,28 +458,46 @@ const MySqlCursor = struct {
         // set's frames.
         if (self.res) |r| libmysql_c.mysql_free_result(r);
         self.arena.deinit();
+        self.columns_arena.deinit();
         self.* = undefined;
     }
 
-    fn next(self: *MySqlCursor) ?*Row {
+    fn next(self: *MySqlCursor) errors.ResultT(?*Row) {
         if (self.eof or self.res == null) return null;
         _ = self.arena.reset(.free_all);
         const row_data = libmysql_c.mysql_fetch_row(self.res);
         if (row_data == null) {
+            // `NULL` means either "no more rows" or a read failure, and only
+            // the error slot tells them apart. Folding the two together is what
+            // let a broken stream reach the caller as a short result set.
+            const err_no = libmysql_c.mysql_errno(self.mysql);
+            if (err_no != 0) {
+                const err_msg = std.mem.span(libmysql_c.mysql_error(self.mysql));
+                std.log.warn("[sqlx] MySQL stream failed mid-result: errno={d} msg={s}", .{ err_no, err_msg });
+                self.eof = true;
+                return mysqlErrnoToError(err_no);
+            }
             self.eof = true;
             return null;
         }
         const row_ptr = row_data.?;
         const lengths = libmysql_c.mysql_fetch_lengths(self.res);
+        // One length per column, every time — a `NULL` here is a driver
+        // failure, not an empty row, and indexing it was a null deref.
+        if (lengths == null) {
+            std.log.warn("[sqlx] MySQL stream failed mid-result: mysql_fetch_lengths returned NULL", .{});
+            self.eof = true;
+            return error.DatabaseError;
+        }
         const n_cols = self.columns.len;
-        const values = self.arena.allocator().alloc(?Value, n_cols) catch return null;
+        const values = try self.arena.allocator().alloc(?Value, n_cols);
         for (0..n_cols) |c| {
             if (row_ptr[c] == null) {
                 values[c] = null;
             } else {
                 const len = lengths[c];
                 const val = row_ptr[c].?[0..len];
-                values[c] = .{ .string = self.arena.allocator().dupe(u8, val) catch return null };
+                values[c] = .{ .string = try self.arena.allocator().dupe(u8, val) };
             }
         }
         self.row = .{
@@ -474,7 +514,15 @@ const MySqlCursor = struct {
 /// is invalidated by the next `next()` call.
 const PgCursor = struct {
     conn: ?*libpq_c.PGconn,
+    /// Row values only. `next` resets this arena on every call, so nothing that
+    /// has to outlive a row may be allocated here — that is why the column
+    /// names live in `columns_arena` instead (they used to be allocated here
+    /// and were freed by the first `reset`, leaving every row's `columns` slice
+    /// dangling).
     arena: std.heap.ArenaAllocator,
+    /// Column names, copied at acquisition: one set per result set, shared by
+    /// every row, freed by `deinit`.
+    columns_arena: std.heap.ArenaAllocator,
     columns: []const []const u8,
     row: Row,
     current: ?*libpq_c.PGresult,
@@ -509,14 +557,25 @@ const PgCursor = struct {
             self.current = null;
         }
         self.arena.deinit();
+        self.columns_arena.deinit();
         self.* = undefined;
     }
 
-    fn next(self: *PgCursor) ?*Row {
+    fn next(self: *PgCursor) errors.ResultT(?*Row) {
         if (self.eof) return null;
         _ = self.arena.reset(.free_all);
         const res = self.current orelse {
             self.eof = true;
+            // No further result. On a healthy connection that is the end of the
+            // query; if libpq lost the connection, saying so is the whole point
+            // of the error channel — the rows that did arrive are a prefix, not
+            // the result set.
+            if (self.conn) |conn| {
+                if (libpq_c.PQstatus(conn) != .CONNECTION_OK) {
+                    std.log.warn("[sqlx] PG stream lost its connection: {s}", .{cStrSpan(libpq_c.PQerrorMessage(conn))});
+                    return error.DatabaseConnectionFailed;
+                }
+            }
             return null;
         };
         const status = libpq_c.PQresultStatus(res);
@@ -527,10 +586,16 @@ const PgCursor = struct {
             return null;
         }
         if (status != libpq_c.ExecStatusType.PGRES_TUPLES_OK and status != libpq_c.ExecStatusType.PGRES_SINGLE_TUPLE) {
+            // A failure result in the middle of a stream — the server says why,
+            // and that reason is what the caller gets: same SQLSTATE mapping the
+            // acquisition path uses, so a statement that dies at row 10^6 is
+            // classified like one that dies at parse time.
+            const db_err = pgResultToError(res);
+            std.log.warn("[sqlx] PG stream failed mid-result ({s}): {s}", .{ @tagName(status), cStrSpan(libpq_c.PQresultErrorMessage(res)) });
             libpq_c.PQclear(res);
             self.current = null;
             self.eof = true;
-            return null;
+            return db_err;
         }
         // A zero-row `PGRES_TUPLES_OK` is the end of the stream, not a row. In
         // single-row mode libpq delivers the query's *row-description* result —
@@ -551,9 +616,9 @@ const PgCursor = struct {
             return null;
         }
         const n_cols = libpq_c.PQnfields(res);
-        const values = self.arena.allocator().alloc(?Value, @intCast(n_cols)) catch return null;
+        const values = try self.arena.allocator().alloc(?Value, @intCast(n_cols));
         for (0..@intCast(n_cols)) |c| {
-            values[c] = pgReadCell(self.arena.allocator(), res, 0, @intCast(c)) catch return null;
+            values[c] = try pgReadCell(self.arena.allocator(), res, 0, @intCast(c));
         }
         self.row = .{
             .arena = &self.arena,
@@ -565,6 +630,30 @@ const PgCursor = struct {
         return &self.row;
     }
 };
+
+/// Classify a `PGresult` that is not usable data: the SQLSTATE decides, exactly
+/// as it does on the acquisition path (`queryFn` / `execFn`), so a failure that
+/// arrives mid-stream is named like the same failure arriving up front.
+/// Nothing is logged here — each caller's log line names the statement, which
+/// the result itself does not carry.
+fn pgResultToError(res: *libpq_c.PGresult) errors.Error {
+    const db_err = errors.sqlStateToError(cStrSpan(libpq_c.PQresultErrorField(res, PG_DIAG_SQLSTATE)));
+    return switch (db_err) {
+        error.ConstraintViolation => error.ConstraintViolation,
+        error.NotFound => error.NotFound,
+        error.ConnectionFailed => error.DatabaseConnectionFailed,
+        error.SerializationFailure => error.SerializationFailure,
+        error.ReadOnlyViolation => error.ReadOnlyViolation,
+        else => error.DatabaseError,
+    };
+}
+
+/// The detail a `ConstraintViolation` deserves and the generic error name does
+/// not carry: which constraint, on which table and column.
+fn logPgConstraintViolation(res: *libpq_c.PGresult) void {
+    const diag = diagnosePostgres(res);
+    std.log.err("PG constraint violation: table={s} column={s}", .{ diag.table orelse "?", diag.column orelse "?" });
+}
 
 /// `PQcancel` writes its failure text into a caller-supplied buffer; libpq's
 /// own comment calls 256 the recommended size (fe-cancel.c: "must be of size
@@ -2140,21 +2229,9 @@ pub const PostgresConn = struct {
             const err_msg = std.mem.span(libpq_c.PQerrorMessage(self.conn));
             std.log.err("PG queryFn: status={d} sql={s} err={s}", .{ @backingInt(status), sql_str, err_msg });
             if (status == libpq_c.ExecStatusType.PGRES_FATAL_ERROR) {
-                const diag = diagnosePostgres(res);
-                const sqlstate = cStrSpan(libpq_c.PQresultErrorField(res.?, PG_DIAG_SQLSTATE));
-                const db_err = errors.sqlStateToError(sqlstate);
-
-                switch (db_err) {
-                    error.ConstraintViolation => {
-                        std.log.err("PG constraint violation: table={s} column={s}", .{ diag.table orelse "?", diag.column orelse "?" });
-                        return error.ConstraintViolation;
-                    },
-                    error.NotFound => return error.NotFound,
-                    error.ConnectionFailed => return error.DatabaseConnectionFailed,
-                    error.SerializationFailure => return error.SerializationFailure,
-                    error.ReadOnlyViolation => return error.ReadOnlyViolation,
-                    else => return error.DatabaseError,
-                }
+                const db_err = pgResultToError(res.?);
+                if (db_err == error.ConstraintViolation) logPgConstraintViolation(res.?);
+                return db_err;
             }
             return error.DatabaseError;
         }
@@ -2198,21 +2275,9 @@ pub const PostgresConn = struct {
             const err_msg = std.mem.span(libpq_c.PQerrorMessage(self.conn));
             std.log.err("PG execFn: status={d} sql={s} err={s}", .{ @backingInt(status), sql_str, err_msg });
             if (status == libpq_c.ExecStatusType.PGRES_FATAL_ERROR) {
-                const diag = diagnosePostgres(res.?);
-                const sqlstate = cStrSpan(libpq_c.PQresultErrorField(res.?, PG_DIAG_SQLSTATE));
-                const db_err = errors.sqlStateToError(sqlstate);
-
-                switch (db_err) {
-                    error.ConstraintViolation => {
-                        std.log.err("PG constraint violation: table={s} column={s}", .{ diag.table orelse "?", diag.column orelse "?" });
-                        return error.ConstraintViolation;
-                    },
-                    error.NotFound => return error.NotFound,
-                    error.ConnectionFailed => return error.DatabaseConnectionFailed,
-                    error.SerializationFailure => return error.SerializationFailure,
-                    error.ReadOnlyViolation => return error.ReadOnlyViolation,
-                    else => return error.DatabaseError,
-                }
+                const db_err = pgResultToError(res.?);
+                if (db_err == error.ConstraintViolation) logPgConstraintViolation(res.?);
+                return db_err;
             }
             return error.DatabaseError;
         }
@@ -2678,6 +2743,11 @@ pub const PostgresConn = struct {
 
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
+        // The column names must survive `PgCursor.next`, which resets `arena` on
+        // every row — a second arena is what gives them the result set's
+        // lifetime instead of a row's.
+        var columns_arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer columns_arena.deinit();
         var first = libpq_c.PQgetResult(self.conn);
         var columns: [][]u8 = &[_][]u8{};
         var eof = false;
@@ -2690,10 +2760,10 @@ pub const PostgresConn = struct {
             } else if (status == libpq_c.ExecStatusType.PGRES_TUPLES_OK or status == libpq_c.ExecStatusType.PGRES_SINGLE_TUPLE) {
                 const n_cols = libpq_c.PQnfields(r);
                 if (n_cols > 0) {
-                    columns = arena.allocator().alloc([]u8, @intCast(n_cols)) catch return error.DatabaseError;
+                    columns = columns_arena.allocator().alloc([]u8, @intCast(n_cols)) catch return error.DatabaseError;
                     for (0..@intCast(n_cols)) |c| {
                         const name = std.mem.span(libpq_c.PQfname(r, @intCast(c)));
-                        columns[c] = arena.allocator().dupe(u8, name) catch return error.DatabaseError;
+                        columns[c] = columns_arena.allocator().dupe(u8, name) catch return error.DatabaseError;
                     }
                 }
             } else {
@@ -2707,6 +2777,7 @@ pub const PostgresConn = struct {
         return Cursor{ .state = .{ .streaming_pg = .{
             .conn = self.conn,
             .arena = arena,
+            .columns_arena = columns_arena,
             .columns = columns,
             .row = undefined,
             .current = first,
@@ -3618,16 +3689,21 @@ pub const MySqlConn = struct {
 
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
+        // The column names must survive `MySqlCursor.next`, which resets `arena`
+        // on every row — a second arena is what gives them the result set's
+        // lifetime instead of a row's.
+        var columns_arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer columns_arena.deinit();
         const res = libmysql_c.mysql_use_result(self.mysql);
         var columns: [][]u8 = &[_][]u8{};
         var eof = false;
         if (res) |r| {
             const n_cols = libmysql_c.mysql_num_fields(r);
             if (n_cols > 0) {
-                columns = arena.allocator().alloc([]u8, n_cols) catch return error.DatabaseError;
+                columns = columns_arena.allocator().alloc([]u8, n_cols) catch return error.DatabaseError;
                 for (0..n_cols) |c| {
                     const field = libmysql_c.mysql_fetch_field(r) orelse return error.DatabaseError;
-                    columns[c] = arena.allocator().dupe(u8, std.mem.span(field.name)) catch return error.DatabaseError;
+                    columns[c] = columns_arena.allocator().dupe(u8, std.mem.span(field.name)) catch return error.DatabaseError;
                 }
             }
         } else {
@@ -3639,6 +3715,7 @@ pub const MySqlConn = struct {
             .mysql = self.mysql,
             .res = res,
             .arena = arena,
+            .columns_arena = columns_arena,
             .columns = columns,
             .row = undefined,
             .eof = eof,
@@ -4896,10 +4973,11 @@ pub const Client = struct {
     /// too, or routing keeps picking it).
     ///
     /// Both cover *acquiring* the cursor only. Row fetching happens later, in
-    /// `Cursor.next`, which has no error channel at all (the drivers fold a
-    /// mid-stream failure into "no more rows"); the one use-phase signal that
-    /// does exist — a stream that broke while draining — is booked in
-    /// `Cursor.deinit`.
+    /// `Cursor.next` — which reports a mid-stream failure to its caller instead
+    /// of folding it into "no more rows", but cannot meter it either (the
+    /// meter is keyed by statement, and the statement text belongs to the
+    /// caller). The one use-phase signal that does reach the breaker — a stream
+    /// that broke while draining — is booked in `Cursor.deinit`.
     fn queryCursorExPrimary(self: *Client, sql_str: []const u8, args: []const Value, opts: CursorOptions) !Cursor {
         if (!self.cb.allow(self.io)) return error.CircuitBreakerOpen;
 
@@ -5295,7 +5373,7 @@ pub const Client = struct {
         }
         var cursor = try self.queryCursorEx(sql_str, args, .{});
         defer cursor.deinit();
-        const row = cursor.next() orelse return null;
+        const row = (try cursor.next()) orelse return null;
         if (row.values.len == 0) return error.NotFound;
         const raw = row.values[0] orelse return null;
         if (raw == .null) return null;
@@ -8192,7 +8270,7 @@ test "sqlite batchExec and batchInsert helpers" {
     var rows = try client.queryCursor("SELECT id, name FROM users ORDER BY id", &.{});
     defer rows.deinit();
     var count: usize = 0;
-    while (rows.next()) |row| {
+    while (try rows.next()) |row| {
         _ = (&row.*).get("id").?.int;
         count += 1;
     }
@@ -8496,7 +8574,7 @@ test "sqlite buffered cursor iterates rows" {
     defer cursor.deinit();
 
     var count: usize = 0;
-    while (cursor.next()) |row| {
+    while (try cursor.next()) |row| {
         count += 1;
         const id = row.get("id").?.int;
         const name = row.get("name").?.string;
@@ -8515,9 +8593,128 @@ test "sqlite streaming cursor falls back to buffered" {
     _ = try db.exec("INSERT INTO cur2 VALUES (1), (2)", &.{});
     var cursor = try db.queryCursorEx("SELECT id FROM cur2 ORDER BY id", &.{}, .{ .mode = .streaming });
     defer cursor.deinit();
-    try std.testing.expect(cursor.next().?.get("id").?.int == 1);
-    try std.testing.expect(cursor.next().?.get("id").?.int == 2);
-    try std.testing.expect(cursor.next() == null);
+    try std.testing.expect((try cursor.next()).?.get("id").?.int == 1);
+    try std.testing.expect((try cursor.next()).?.get("id").?.int == 2);
+    try std.testing.expect(try cursor.next() == null);
+}
+
+// Real-server coverage for the two things a streaming cursor can get wrong
+// that no sqlite test can reach: sqlite is served buffered, so `PgCursor` /
+// `MySqlCursor` rows and their failures only exist against a live server.
+//
+// Gating follows both conventions already in this tree: `DB=postgres` (the CI
+// `test-postgres` job, same as this file's other live-PG tests) or
+// `ZIGMODU_TEST_PG=1` (the opt-in the other real-database tests use — and the
+// only one that survives `scripts/test-fast.sh`, which owns `DB`).
+//
+// The queries are shaped so the server streams rows and *then* fails:
+// `100 / (3 - i)` is computable for i = 1, 2 and raises SQLSTATE 22012
+// (division by zero) at i = 3, so the failure genuinely arrives mid-result.
+// Red evidence, taken on the pre-fix code with a probe that could compile
+// against `next() ?*Row`:
+//
+//     [red] row 1: values.len=1
+//     [red] row 2: values.len=1
+//     [red] loop ended with no error after 2 row(s); the query has 5 and the server raises at row 3
+//     expected 5, found 2
+//
+// i.e. the documented `while (cursor.next()) |row|` loop reported a truncated
+// result set as a complete one.
+test "streaming PG cursor reports a mid-stream server error instead of ending the result" {
+    const opt_in = if (std.c.getenv("ZIGMODU_TEST_PG")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else false;
+    if (!opt_in) try skipUnlessDb("postgres");
+    if (!DriverFeatures.postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const conninfo_default = "host=127.0.0.1 port=5432 dbname=postgres user=postgres";
+    const conninfo = if (builtin.os.tag == .windows) conninfo_default else if (std.c.getenv("PGconninfo")) |ptr| std.mem.span(ptr) else conninfo_default;
+    var db = Client.init(allocator, std.testing.io, .{ .driver = .postgres, .postgres_conninfo = conninfo });
+    defer db.deinit();
+    try db.connect();
+
+    {
+        // A streaming row that reads at all: `values` and the column names come
+        // from two different lifetimes inside the cursor, and the names used to
+        // be freed by the arena reset at the top of `next` — every row then
+        // carried a dangling `columns` slice, which is what `row.get("col")`
+        // walks. (Red on the pre-fix code: reading `columns[0]` below aborted
+        // with `FAULT` on freed memory, in this query, with no error involved.)
+        var ok_cursor = try db.queryCursorEx(
+            "SELECT i * 10 AS q FROM generate_series(1, 3) AS i",
+            &.{},
+            .{ .mode = .streaming },
+        );
+        defer ok_cursor.deinit();
+        const ok_row = (try ok_cursor.next()).?;
+        try std.testing.expectEqual(@as(usize, 1), ok_row.values.len);
+        try std.testing.expectEqualStrings("q", ok_row.columns[0]);
+        // PG streams in text format, where every cell is a string (`pgReadCell`
+        // keeps it that way on purpose, for `scanStruct`); the point here is
+        // that the cell *decodes*, not which union member it lands in.
+        try std.testing.expectEqualStrings("10", ok_row.get("q").?.string);
+        try std.testing.expectEqualStrings("20", (try ok_cursor.next()).?.get("q").?.string);
+        try std.testing.expectEqualStrings("30", (try ok_cursor.next()).?.get("q").?.string);
+        try std.testing.expectEqual(@as(?*Row, null), try ok_cursor.next());
+    }
+
+    var cursor = try db.queryCursorEx(
+        "SELECT 100 / (3 - i) AS q FROM generate_series(1, 5) AS i",
+        &.{},
+        .{ .mode = .streaming },
+    );
+    defer cursor.deinit();
+    try std.testing.expect(cursor.isStreaming());
+
+    // The rows the server can produce are real rows: the failure arrives after
+    // them, not instead of them.
+    try std.testing.expectEqualStrings("50", (try cursor.next()).?.get("q").?.string);
+    try std.testing.expectEqualStrings("100", (try cursor.next()).?.get("q").?.string);
+    // And here the server raises. `22012` has no dedicated member in the
+    // SQLSTATE table, so it maps to the generic driver failure — the same
+    // mapping the acquisition path would apply to the same statement.
+    try std.testing.expectError(error.DatabaseError, cursor.next());
+}
+
+// The other half of the same contract: a stream that broke mid-result must not
+// leave the client unusable. `deinit` drains whatever is left and either
+// re-pools the connection or retires it, and the very next statement on the
+// same client has to work.
+test "pooled client stays usable after a streaming cursor fails mid-result" {
+    const opt_in = if (std.c.getenv("ZIGMODU_TEST_PG")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else false;
+    if (!opt_in) try skipUnlessDb("postgres");
+    if (!DriverFeatures.postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const conninfo_default = "host=127.0.0.1 port=5432 dbname=postgres user=postgres";
+    const conninfo = if (builtin.os.tag == .windows) conninfo_default else if (std.c.getenv("PGconninfo")) |ptr| std.mem.span(ptr) else conninfo_default;
+    var db = Client.init(allocator, std.testing.io, .{
+        .driver = .postgres,
+        .postgres_conninfo = conninfo,
+        .max_open_conns = 2,
+        .max_idle_conns = 2,
+    });
+    defer db.deinit();
+    db.ensurePool();
+    try db.connect();
+    const pool = &db.pool.?;
+
+    var cursor = try db.queryCursorEx(
+        "SELECT 100 / (3 - i) AS q FROM generate_series(1, 5) AS i",
+        &.{},
+        .{ .mode = .streaming },
+    );
+    try std.testing.expectEqualStrings("50", (try cursor.next()).?.get("q").?.string);
+    // Same statement as the test above: two rows, then the server raises on
+    // the third (`100 / (3 - 3)`).
+    try std.testing.expectEqualStrings("100", (try cursor.next()).?.get("q").?.string);
+    try std.testing.expectError(error.DatabaseError, cursor.next());
+    cursor.deinit();
+
+    // The checkout came back exactly once, so the next borrower gets a usable
+    // connection rather than this query's leftover frames.
+    const m = pool.metrics();
+    try std.testing.expectEqual(m.total_acquired, m.total_released);
+    const after = try db.queryRow(struct { n: i64 }, "SELECT ?1 AS n", &.{.{ .int = 42 }});
+    defer freeScanned(allocator, @TypeOf(after), after);
+    try std.testing.expectEqual(@as(i64, 42), after.n);
 }
 
 /// Minimal `Conn` whose `ping`/`close` are observable — enough to drive
@@ -8573,6 +8770,7 @@ fn testStreamingCursor(state: *CursorTestConn, pool: *ConnPool, allocator: std.m
         .state = .{ .streaming_pg = .{
             .conn = null,
             .arena = std.heap.ArenaAllocator.init(allocator),
+            .columns_arena = std.heap.ArenaAllocator.init(allocator),
             .columns = &.{},
             .row = undefined,
             .current = null,
@@ -8636,12 +8834,12 @@ test "sqlite pooled client stays usable after a cursor is abandoned early" {
     // buffered — the cursor owns no wire stream and says so.
     var cur = try db.queryCursorEx("SELECT ?1 AS n", &.{.{ .int = 7 }}, .{ .mode = .streaming });
     try std.testing.expect(!cur.isStreaming());
-    try std.testing.expectEqual(@as(i64, 7), cur.next().?.get("n").?.int);
+    try std.testing.expectEqual(@as(i64, 7), (try cur.next()).?.get("n").?.int);
     cur.deinit();
 
     // Abandon a cursor mid-iteration, then keep using the same client.
     var abandoned = try db.queryCursor("SELECT ?1 AS n", &.{.{ .int = 1 }});
-    try std.testing.expect(abandoned.next() != null);
+    try std.testing.expect((try abandoned.next()) != null);
     abandoned.deinit();
 
     const after = try db.queryRow(struct { n: i64 }, "SELECT ?1 AS n", &.{.{ .int = 42 }});
@@ -8689,7 +8887,7 @@ test "cursor path reports metrics and breaker state like the query path" {
         db.withMetrics(MetricsRecorder.record);
         var cursor = try db.queryCursor("SELECT ?1 AS n", &.{.{ .int = 1 }});
         defer cursor.deinit();
-        try std.testing.expectEqual(@as(i64, 1), cursor.next().?.get("n").?.int);
+        try std.testing.expectEqual(@as(i64, 1), (try cursor.next()).?.get("n").?.int);
         try std.testing.expectEqual(@as(usize, 1), MetricsRecorder.ok_calls);
         try std.testing.expectEqual(@as(usize, 0), MetricsRecorder.fail_calls);
         try std.testing.expectEqual(@as(u32, 0), db.cb.failure_count);
@@ -8812,7 +9010,7 @@ test "mysql streaming cursor api compiles" {
     defer db.deinit();
     var cursor = try db.queryCursorEx("SELECT 1 AS n", &.{});
     defer cursor.deinit();
-    _ = cursor.next();
+    _ = try cursor.next();
 }
 
 test "postgres streaming cursor api compiles" {
@@ -8822,7 +9020,7 @@ test "postgres streaming cursor api compiles" {
     defer db.deinit();
     var cursor = try db.queryCursorEx("SELECT 1 AS n", &.{}, .{ .mode = .streaming });
     defer cursor.deinit();
-    _ = cursor.next();
+    _ = try cursor.next();
 }
 
 test "sqlite batchInsertEx sql mode matches batchInsert" {

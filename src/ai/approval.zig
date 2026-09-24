@@ -345,7 +345,7 @@ test "ApprovalFlow advances, escalates and rejects with outbox audit" {
     );
     defer cursor.deinit();
     var n: usize = 0;
-    while (cursor.next()) |row| {
+    while (try cursor.next()) |row| {
         _ = row.get("payload").?.string;
         n += 1;
     }
