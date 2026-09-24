@@ -383,10 +383,10 @@ pub const SecurityModule = struct {
 /// Context lets each transport write the response it owns: `writeResponse` on
 /// H1, the `SiteResponse` on H2.
 ///
-/// `Retry-After` is advisory and reaches H1 clients only: the H2
-/// `SiteResponse` channel carries `content-type` and the body, and drops every
-/// other response header. `RateLimiter` exposes no per-window remaining time
-/// either, so the value is the documented 60-second window.
+/// `Retry-After` is advisory and carries the documented 60-second window
+/// (`RateLimiter` exposes no per-window remaining time). It reaches **both**
+/// transports: the H2 `SiteResponse` channel carries every response header the
+/// handler set, not just `content-type`.
 ///
 /// `allocator` owns the limiter, which lives for the process (the returned
 /// `Middleware` carries it as `user_data`; nothing frees it).

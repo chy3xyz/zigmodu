@@ -16,7 +16,8 @@
 //!   §4  Stream teardown —— abortStream, resetStream, sendGoAway
 //!   §5  Outbound scheduler —— PendingOutbound, OutboundScheduler, window-aware DATA chunking
 //!   §6  Stream state & live bidi —— StreamState, LiveFlushCtx, gRPC bidi pumping
-//!   §7  Response encoding —— buildStreamResponseWire, encodeSiteResponseWire
+//!   §7  Response encoding —— buildStreamResponseWire, encodeSiteResponseWire,
+//!        assembleSiteResponseBlock (handler fields, h2 filtering, size budget)
 //!   §8  Frame readers —— readFrame / readExact and their prefetch variants
 //!   §9  Tests
 //!
@@ -37,10 +38,30 @@ pub const SiteResponse = struct {
     body: []u8,
     /// When true, `deinit` frees `content_type` as well.
     content_type_owned: bool = false,
+    /// Every other response field the handler produced — `Set-Cookie`,
+    /// `Location`, `Retry-After`, CORS, app headers. Without this the H2
+    /// response carried `:status` and `content-type` only, so a handler that
+    /// sends cookies and redirects on H1 silently sent neither to an H2 client.
+    ///
+    /// `content-type` here is ignored: `SiteResponse.content_type` owns that
+    /// field, and two of them on one response is a protocol error. A handler
+    /// may spell names in any case and add fields H2 cannot carry — the encoder
+    /// (`assembleSiteResponseBlock`) lowercases names and filters those out, so
+    /// nothing a handler does can make the block unsendable.
+    headers: []const Hpack.Header = &.{},
+    /// When true, `deinit` frees `headers` and every name/value in it.
+    headers_owned: bool = false,
 
     pub fn deinit(self: *SiteResponse, allocator: std.mem.Allocator) void {
         allocator.free(self.body);
         if (self.content_type_owned) allocator.free(self.content_type);
+        if (self.headers_owned) {
+            for (self.headers) |h| {
+                allocator.free(h.name);
+                allocator.free(h.value);
+            }
+            allocator.free(self.headers);
+        }
         self.* = undefined;
     }
 };
@@ -69,6 +90,42 @@ pub const ReadDeadline = struct {
     /// Whether the last failed read was cut short by the deadline rather than
     /// by the transport.
     timed_out: *const fn (ctx: *anyopaque) bool,
+};
+
+/// The HTTP/1.1 request that carried an `Upgrade: h2c` (RFC 7540 §3.2),
+/// handed to the session that follows the 101 so it can answer it as stream 1.
+///
+/// RFC 7540 §3.2: "The HTTP/1.1 request that is sent prior to upgrade is
+/// assigned a stream identifier of 1 ... Stream 1 is implicitly 'half-closed'
+/// from the client toward the server, since the request is completed as an
+/// HTTP/1.1 request." The client therefore never sends a HEADERS frame for it,
+/// and a session that dispatches only on inbound frames answers the upgrade
+/// with silence — the client sees the protocol switch and then hangs.
+///
+/// Every slice is borrowed for the duration of the `serveAfterUpgrade` call;
+/// the session copies what it keeps.
+pub const UpgradeRequest = struct {
+    /// `:method`, from the HTTP/1.1 request line.
+    method: []const u8,
+    /// `:path` — the whole request target, query included (RFC 9113 §8.3.1).
+    target: []const u8,
+    /// `:authority`, from the `Host` field (empty when the request had none).
+    authority: []const u8 = "",
+    /// `:scheme`. Cleartext on the upgrade path.
+    scheme: []const u8 = "http",
+    /// Request fields as the HTTP/1.1 parser normalized them (lowercase names).
+    /// The ones that describe the upgrade — `connection`, `upgrade`,
+    /// `HTTP2-Settings` — are dropped when the stream is seeded: they are not
+    /// HTTP/2 request fields (RFC 9113 §8.2.2) and the encoding could not have
+    /// carried them.
+    headers: []const Hpack.Header = &.{},
+    /// Request body, already read in full off the HTTP/1.1 wire. Stream 1 is
+    /// half-closed from the first frame, so this is the whole body.
+    body: []const u8 = &.{},
+    /// Raw `HTTP2-Settings` field value: the peer's SETTINGS payload, base64url.
+    /// Applied as peer SETTINGS before the first response (§3.2.1) — the client
+    /// also sends that same SETTINGS frame, but nothing waits for it.
+    http2_settings: ?[]const u8 = null,
 };
 
 pub const ServeOptions = struct {
@@ -163,6 +220,10 @@ const AppliedPeerSettings = struct {
     initial_window_size: ?u31 = null,
     /// New peer MAX_FRAME_SIZE — the cap on *our* outbound frames.
     max_frame_size: ?u31 = null,
+    /// New peer MAX_HEADER_LIST_SIZE — the peer saying how large a response
+    /// field section it will accept (RFC 9113 §6.5.2). Advisory, but we now
+    /// have response headers to fit into it, so it bounds them.
+    max_header_list_size: ?u32 = null,
 };
 
 /// Validate and apply a peer SETTINGS payload (RFC 7540 §6.5.2).
@@ -186,6 +247,11 @@ fn applyPeerSettings(
             },
             Http2.SettingsId.max_frame_size => {
                 applied.max_frame_size = try Http2.validateMaxFrameSize(s.value);
+            },
+            Http2.SettingsId.max_header_list_size => {
+                // No validation: the field is a size hint and every u32 is a
+                // legal value for it (0 = "accept no fields").
+                applied.max_header_list_size = s.value;
             },
             else => {},
         }
@@ -283,12 +349,18 @@ pub fn serve(
 /// segment as the upgrade request — those bytes are in `inbound`'s buffer, not
 /// in the socket). `null` reads the preface straight from the stream, which is
 /// what `serve` does.
+///
+/// `upgrade` is the request that carried the upgrade: it is stream 1 of this
+/// session, and the session has to answer it itself (the client sends no
+/// HEADERS frame for it). Passing it is what makes the upgrade a served request
+/// rather than a protocol switch followed by silence.
 pub fn serveAfterUpgrade(
     io: std.Io,
     stream: std.Io.net.Stream,
     allocator: std.mem.Allocator,
     opts: ServeOptions,
     inbound: ?*std.Io.Reader,
+    upgrade: UpgradeRequest,
 ) !void {
     var preface_buf: [Http2.connection_preface.len]u8 = undefined;
     if (inbound) |reader| {
@@ -298,7 +370,7 @@ pub fn serveAfterUpgrade(
         try readExact(io, stream, &preface_buf);
     }
     if (!std.mem.eql(u8, &preface_buf, Http2.connection_preface)) return error.InvalidHttp2Preface;
-    try serveAfterPrefacePrefetchReader(io, stream, allocator, opts, &.{}, inbound);
+    try serveSession(io, stream, allocator, opts, &.{}, inbound, upgrade);
 }
 
 /// Serve one prior-knowledge HTTP/2 connection. Preface must already be consumed.
@@ -339,6 +411,21 @@ pub fn serveAfterPrefacePrefetchReader(
     prefetch: []const u8,
     inbound: ?*std.Io.Reader,
 ) !void {
+    try serveSession(io, stream, allocator, opts, prefetch, inbound, null);
+}
+
+/// The connection loop itself. `upgrade` is non-null only on the h2c upgrade
+/// path, where the request that carried the 101 has to be dispatched as stream 1
+/// before anything is read (see `UpgradeRequest`).
+fn serveSession(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    allocator: std.mem.Allocator,
+    opts: ServeOptions,
+    prefetch: []const u8,
+    inbound: ?*std.Io.Reader,
+    upgrade: ?UpgradeRequest,
+) !void {
     var writer = ConnWriter.init(io, stream);
 
     // Advertised limits: the peer must see the same numbers we enforce, or it
@@ -358,6 +445,9 @@ pub fn serveAfterPrefacePrefetchReader(
 
     var conn_flow = Http2.FlowControlState.init(Http2.default_initial_window_size);
     var conn_max_frame_size: u31 = 16384;
+    // Peer `SETTINGS_MAX_HEADER_LIST_SIZE`, until it says otherwise: the bound
+    // on the response header blocks we build (see `responseHeaderBudget`).
+    var peer_max_header_list: ?u32 = null;
     var last_peer_stream: u31 = 0;
     // Highest client-initiated stream id we have opened state for (RFC 7540 §5.1.1).
     var last_opened_stream: u31 = 0;
@@ -403,6 +493,83 @@ pub fn serveAfterPrefacePrefetchReader(
     const idle_timeout_ms = opts.read_idle_timeout_ms;
     defer if (opts.read_deadline) |d| d.clear(d.ctx);
     var last_progress_ms: i64 = Time.monotonicNowMilliseconds();
+
+    // ---- h2c upgrade: the HTTP/1.1 request is stream 1 (RFC 7540 §3.2) ----
+    //
+    // The 101 is already on the wire and the client is waiting for the answer to
+    // the request it upgraded on. It will not send a HEADERS frame for that
+    // request — the RFC assigned it stream 1 — so seeding the stream here, once,
+    // before the loop reads anything, is the only way it is ever dispatched: the
+    // loop's own dispatch is driven entirely by inbound frames.
+    var upgrade_stream_seeded = false;
+    if (upgrade) |req| {
+        // RFC 7540 §3.2.1: the `HTTP2-Settings` payload *is* the peer's SETTINGS
+        // and is applied before anything is answered — the first response is
+        // encoded against it. The client's own SETTINGS frame repeats the same
+        // values (the RFC requires it to), so applying them twice is a no-op, not
+        // a second window shift.
+        if (req.http2_settings) |settings_value| {
+            var payload = std.ArrayList(u8).empty;
+            defer payload.deinit(allocator);
+            decodeHttp2Settings(allocator, settings_value, &payload) catch {
+                // RFC 7540 §3.2.1: an `HTTP2-Settings` the server cannot read is
+                // a connection error. The 101 is already out, so GOAWAY is the
+                // only answer left.
+                try sendGoAway(&writer, allocator, 1, Http2.ErrorCode.PROTOCOL_ERROR, &goaway_sent);
+                return;
+            };
+            const applied = applyPeerSettings(&conn_flow, payload.items) catch |err| {
+                try sendGoAway(&writer, allocator, 1, settingsErrorCode(err), &goaway_sent);
+                return;
+            };
+            if (applied.max_frame_size) |peer_max_frame_size| conn_max_frame_size = peer_max_frame_size;
+            if (applied.max_header_list_size) |peer_list| peer_max_header_list = peer_list;
+        }
+
+        // The map owns stream 1 from here — a failure below releases it.
+        const gop = try streams.getOrPut(1);
+        if (gop.found_existing) return error.UpgradeStreamAlreadyOpen;
+        gop.value_ptr.* = StreamState.init();
+        errdefer {
+            if (streams.fetchRemove(1)) |kv| {
+                var removed = kv;
+                removed.value.deinit(allocator);
+            }
+        }
+        try fillUpgradeStream(allocator, gop.value_ptr, req);
+        // A stream's own send window follows the peer's INITIAL_WINDOW_SIZE, and
+        // stream 1 is created after the settings above were applied — the same
+        // treatment the SETTINGS branch gives every stream it already holds.
+        gop.value_ptr.flow.applyPeerInitialWindowSize(conn_flow.peer_initial) catch |err|
+            std.log.debug("[h2] upgrade stream window not adjusted ({s})", .{@errorName(err)});
+        // Both markers, so a GOAWAY names stream 1 as the last one processed and
+        // a HEADERS frame for it is not mistaken for a new stream.
+        last_opened_stream = 1;
+        last_peer_stream = 1;
+        try priority_tree.ensureStream(1);
+        upgrade_stream_seeded = true;
+
+        const more_inbound = (prefetch_off < prefetch_buf.len) or (reader.bufferedLen() > 0);
+        try finishStreamScheduled(
+            &writer,
+            allocator,
+            1,
+            gop.value_ptr,
+            &conn_flow,
+            conn_max_frame_size,
+            peer_max_header_list,
+            opts,
+            &priority_tree,
+            &outbound,
+            more_inbound,
+        );
+        try writer.flush();
+        if (streams.fetchRemove(1)) |kv| {
+            var removed = kv;
+            removed.value.deinit(allocator);
+        }
+        if (!outbound.pending.contains(1)) priority_tree.removeStream(1);
+    }
 
     var frames: usize = 0;
     while (frames < opts.max_frames) : (frames += 1) {
@@ -495,6 +662,7 @@ pub fn serveAfterPrefacePrefetchReader(
                         }
                     }
                     if (applied.max_frame_size) |peer_max_frame_size| conn_max_frame_size = peer_max_frame_size;
+                    if (applied.max_header_list_size) |peer_list| peer_max_header_list = peer_list;
                     try writer.writeFrame(.settings, Http2.FrameFlags.ack, 0, &.{});
                     try writer.flush();
                 }
@@ -563,6 +731,16 @@ pub fn serveAfterPrefacePrefetchReader(
                 if (sid == 0) {
                     try sendGoAway(&writer, allocator, last_peer_stream, Http2.ErrorCode.PROTOCOL_ERROR, &goaway_sent);
                     return;
+                }
+                if (upgrade_stream_seeded and sid == 1) {
+                    // Stream 1 is the upgrade request, and it has been answered:
+                    // RFC 7540 §3.2 puts it in half-closed (remote) from the
+                    // start, so a HEADERS frame for it is the one frame the
+                    // client must not send. Treating it as a new stream would
+                    // dispatch the same request a second time; §5.1 names the
+                    // answer for a half-closed (remote) stream — a stream error.
+                    try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, Http2.ErrorCode.STREAM_CLOSED);
+                    continue;
                 }
                 if (!streams.contains(sid)) {
                     // RFC 7540 §5.1.1 — new client streams are odd and increasing.
@@ -636,7 +814,7 @@ pub fn serveAfterPrefacePrefetchReader(
                     }
                 } else if (gop.value_ptr.ready()) {
                     const more_inbound = (prefetch_off < prefetch_buf.len) or (reader.bufferedLen() > 0);
-                    finishStreamScheduled(&writer, allocator, sid, gop.value_ptr, &conn_flow, conn_max_frame_size, opts, &priority_tree, &outbound, more_inbound) catch |err| {
+                    finishStreamScheduled(&writer, allocator, sid, gop.value_ptr, &conn_flow, conn_max_frame_size, peer_max_header_list, opts, &priority_tree, &outbound, more_inbound) catch |err| {
                         try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, streamErrorFromAny(err));
                         continue;
                     };
@@ -694,7 +872,7 @@ pub fn serveAfterPrefacePrefetchReader(
                         abortStream(&outbound, &priority_tree, &streams, allocator, sid);
                     } else if (st.ready()) {
                         const more_inbound = (prefetch_off < prefetch_buf.len) or (reader.bufferedLen() > 0);
-                        finishStreamScheduled(&writer, allocator, sid, st, &conn_flow, conn_max_frame_size, opts, &priority_tree, &outbound, more_inbound) catch |err| {
+                        finishStreamScheduled(&writer, allocator, sid, st, &conn_flow, conn_max_frame_size, peer_max_header_list, opts, &priority_tree, &outbound, more_inbound) catch |err| {
                             try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, streamErrorFromAny(err));
                             continue;
                         };
@@ -753,7 +931,7 @@ pub fn serveAfterPrefacePrefetchReader(
                     };
                     if (st.ready()) {
                         const more_inbound = (prefetch_off < prefetch_buf.len) or (reader.bufferedLen() > 0);
-                        finishStreamScheduled(&writer, allocator, sid, st, &conn_flow, conn_max_frame_size, opts, &priority_tree, &outbound, more_inbound) catch |err| {
+                        finishStreamScheduled(&writer, allocator, sid, st, &conn_flow, conn_max_frame_size, peer_max_header_list, opts, &priority_tree, &outbound, more_inbound) catch |err| {
                             try resetStream(&writer, allocator, &outbound, &priority_tree, &streams, sid, streamErrorFromAny(err));
                             continue;
                         };
@@ -855,6 +1033,99 @@ fn headerDecodeErrorCode(err: anyerror) u32 {
 /// else is the transport.
 fn readFailureCode(timed_out: bool) u32 {
     return if (timed_out) Http2.ErrorCode.ENHANCE_YOUR_CALM else Http2.ErrorCode.PROTOCOL_ERROR;
+}
+
+/// Decode an `HTTP2-Settings` field value into the SETTINGS payload it carries:
+/// base64url (RFC 4648 §5), trailing `=` omitted per RFC 7540 §3.2.1.
+///
+/// Padding is tolerated when a client sends it anyway — that is a spelling of
+/// the same bytes, not a different value. Interior `=` is not: it is not base64
+/// at all, and `decode` reports it as `InvalidCharacter`.
+fn decodeHttp2Settings(
+    allocator: std.mem.Allocator,
+    value: []const u8,
+    out: *std.ArrayList(u8),
+) !void {
+    var body = value;
+    while (body.len > 0 and body[body.len - 1] == '=') body = body[0 .. body.len - 1];
+    const decoder = std.base64.url_safe_no_pad.Decoder;
+    const size = try decoder.calcSizeForSlice(body);
+    const buf = try allocator.alloc(u8, size);
+    defer allocator.free(buf);
+    try decoder.decode(buf, body);
+    try out.appendSlice(allocator, buf);
+}
+
+/// Fill `st` with the request that carried the h2c upgrade (RFC 7540 §3.2).
+/// That request is already complete — it was parsed off the HTTP/1.1 wire — so
+/// the stream starts with `headers_done` and `end_stream` set: it is
+/// half-closed (remote) from the first frame and its whole body is already in
+/// hand.
+///
+/// The four pseudo-headers a prior-knowledge request would carry are built from
+/// the request line and `Host`; the rest are the request's own fields, minus the
+/// ones that describe the upgrade rather than the request. Everything is copied
+/// with `allocator`, which is also what `StreamState.deinit` frees with.
+fn fillUpgradeStream(allocator: std.mem.Allocator, st: *StreamState, req: UpgradeRequest) !void {
+    st.method = try allocator.dupe(u8, req.method);
+    st.path = try allocator.dupe(u8, req.target);
+    st.headers_done = true;
+    st.end_stream = true;
+    if (req.body.len > 0) try st.data.appendSlice(allocator, req.body);
+
+    var owned = std.ArrayList(Hpack.Header).empty;
+    errdefer {
+        for (owned.items) |h| {
+            allocator.free(@constCast(h.name));
+            allocator.free(@constCast(h.value));
+        }
+        owned.deinit(allocator);
+    }
+
+    for ([_]Hpack.Header{
+        .{ .name = ":method", .value = req.method },
+        .{ .name = ":path", .value = req.target },
+        .{ .name = ":scheme", .value = req.scheme },
+        .{ .name = ":authority", .value = req.authority },
+    }) |h| try appendOwnedHeader(allocator, &owned, h.name, h.value);
+
+    for (req.headers) |h| {
+        if (h.name.len == 0 or h.name[0] == ':') continue;
+        // The three fields the upgrade itself was made of. They are not HTTP/2
+        // request fields (RFC 9113 §8.2.2), and a handler that saw them on this
+        // path would see what no H2 request can carry.
+        if (isConnectionSpecific(h.name)) continue;
+        if (std.ascii.eqlIgnoreCase(h.name, "http2-settings")) continue;
+        // `content-type` decides the gRPC branch of the response encoder, so it
+        // is mirrored the way `decodeHeaders` mirrors it for a real H2 request.
+        if (st.content_type.len == 0 and h.value.len > 0 and std.ascii.eqlIgnoreCase(h.name, "content-type")) {
+            st.content_type = try allocator.dupe(u8, h.value);
+        }
+        try appendOwnedHeader(allocator, &owned, h.name, h.value);
+    }
+    st.decoded = try owned.toOwnedSlice(allocator);
+}
+
+/// One owned `name: value` pair in `list`. Ownership is recorded per slice so
+/// `Hpack.freeHeaders` releases both — the fallback it uses for an unmarked
+/// header is a pointer fingerprint, which a `dupe` of a static-table string
+/// would not match.
+fn appendOwnedHeader(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList(Hpack.Header),
+    name: []const u8,
+    value: []const u8,
+) !void {
+    const n = try allocator.dupe(u8, name);
+    errdefer allocator.free(n);
+    const v = try allocator.dupe(u8, value);
+    errdefer allocator.free(v);
+    try list.append(allocator, .{
+        .name = n,
+        .value = v,
+        .name_owner = .owned,
+        .value_owner = .owned,
+    });
 }
 
 fn sendGoAway(
@@ -1336,13 +1607,14 @@ fn finishStreamScheduled(
     st: *StreamState,
     conn_flow: *Http2.FlowControlState,
     conn_max_frame_size: u31,
+    peer_max_header_list: ?u32,
     opts: ServeOptions,
     tree: *Http2.PriorityTree,
     outbound: *OutboundScheduler,
     more_inbound: bool,
 ) !void {
     try tree.setPriority(stream_id, st.getPriority());
-    const wire = try buildStreamResponseWire(allocator, stream_id, st, opts);
+    const wire = try buildStreamResponseWire(allocator, stream_id, st, conn_max_frame_size, peer_max_header_list, opts);
     // enqueue takes ownership of wire (frees on refuse).
     try outbound.enqueue(stream_id, wire, st.flow);
     const budget: usize = if (more_inbound or outbound.pending.count() > 1) 8 else 0;
@@ -1364,6 +1636,8 @@ fn buildStreamResponseWire(
     allocator: std.mem.Allocator,
     stream_id: u31,
     st: *StreamState,
+    conn_max_frame_size: u31,
+    peer_max_header_list: ?u32,
     opts: ServeOptions,
 ) ![]u8 {
     const is_grpc = std.mem.indexOf(u8, st.content_type, "application/grpc") != null;
@@ -1419,32 +1693,270 @@ fn buildStreamResponseWire(
         const hdrs = st.decoded orelse &[_]Hpack.Header{};
         var resp = try handler(opts.site_user_ctx, allocator, st.method, st.path, hdrs, st.data.items);
         defer resp.deinit(allocator);
-        return try encodeSiteResponseWire(allocator, stream_id, resp.status, resp.content_type, resp.body);
+        const budget = responseHeaderBudget(opts, peer_max_header_list, conn_max_frame_size);
+        return try encodeSiteResponseWire(allocator, stream_id, resp.status, resp.content_type, resp.headers, resp.body, budget);
     }
 
-    return try encodeSiteResponseWire(allocator, stream_id, 404, "text/plain", "not found");
+    // No site handler: the loop's own 404, with no extras to budget for.
+    const budget = responseHeaderBudget(opts, peer_max_header_list, conn_max_frame_size);
+    return try encodeSiteResponseWire(allocator, stream_id, 404, "text/plain", &.{}, "not found", budget);
 }
+
+/// Caps on the response header block. The inbound side has the same knobs
+/// (`opts.inbound`); this is the response half of the same contract, so a
+/// number an operator set to bound requests bounds responses too.
+const ResponseHeaderBudget = struct {
+    /// `SETTINGS_MAX_HEADER_LIST_SIZE` accounting (RFC 9113 §6.5.2: name +
+    /// value + 32 per field). `null` = unbounded.
+    max_list_bytes: ?usize = null,
+    /// Fields in the block, `:status` and `content-type` included. `null` =
+    /// unbounded.
+    max_count: ?usize = null,
+    /// Peer `SETTINGS_MAX_FRAME_SIZE`. The compressed block leaves as a single
+    /// HEADERS frame — this module never emits CONTINUATION — so a block past
+    /// this is a frame the peer must reject with FRAME_SIZE_ERROR (RFC 9113
+    /// §4.2), which may be answered at connection level. Everything we build
+    /// fits it.
+    max_block_bytes: usize = 16384,
+};
+
+/// The response-side budget: the peer's advertised limits where it has them,
+/// ours where the number is ours to choose.
+///
+/// `0` means "off" on our side (`Hpack.Decoder.setAdvertisedHeaderListSize` and
+/// every caller of it read it that way) but "accept no fields" on the peer's
+/// side (RFC 9113 §6.5.2), so the two cannot simply be `@min`ed.
+fn responseHeaderBudget(opts: ServeOptions, peer_max_header_list: ?u32, conn_max_frame_size: u31) ResponseHeaderBudget {
+    const mine: ?usize = if (opts.inbound.max_header_list_bytes == 0) null else opts.inbound.max_header_list_bytes;
+    const peer: ?usize = if (peer_max_header_list) |v| v else null;
+    const list: ?usize = if (mine) |m|
+        if (peer) |p| @min(m, p) else m
+    else
+        peer;
+    return .{
+        .max_list_bytes = list,
+        .max_count = if (opts.inbound.max_header_count == 0) null else opts.inbound.max_header_count,
+        .max_block_bytes = conn_max_frame_size,
+    };
+}
+
+/// Response fields HTTP/2 does not carry (RFC 9113 §8.2.2, "connection-specific
+/// header fields"): forwarding one is a MUST NOT, and a peer that receives one
+/// is entitled to treat the response as malformed.
+const connection_specific_fields = [_][]const u8{
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "transfer-encoding",
+    "upgrade",
+};
+
+/// Why a response field did not reach the wire, for the single `warn` this path
+/// emits per response.
+const DropReport = struct {
+    count: usize = 0,
+    first_name: []const u8 = "",
+    first_reason: []const u8 = "",
+
+    fn note(self: *DropReport, name: []const u8, reason: []const u8) void {
+        // `name` is the caller's slice, never the lowercasing scratch, so it is
+        // still the right bytes when the log line is written after the loop.
+        if (self.count == 0) {
+            self.first_name = name;
+            self.first_reason = reason;
+        }
+        self.count += 1;
+    }
+};
 
 fn encodeSiteResponseWire(
     allocator: std.mem.Allocator,
     stream_id: u31,
     status: u16,
     content_type: []const u8,
+    extra: []const Hpack.Header,
     body: []const u8,
+    budget: ResponseHeaderBudget,
 ) ![]u8 {
     const status_str = try std.fmt.allocPrint(allocator, "{d}", .{status});
     defer allocator.free(status_str);
-    var enc = Hpack.Encoder.init(allocator);
-    const block = try enc.encodeSmart(&.{
-        .{ .name = ":status", .value = status_str },
-        .{ .name = "content-type", .value = content_type },
-    });
+    const block = try assembleSiteResponseBlock(allocator, status_str, content_type, extra, body.len, budget);
     defer allocator.free(block);
     const h = try Http2.encodeHeaders(allocator, stream_id, block, false, true);
     defer allocator.free(h);
     const d = try Http2.encodeData(allocator, stream_id, body, true);
     defer allocator.free(d);
     return try std.mem.concat(allocator, u8, &.{ h, d });
+}
+
+/// The response header block: the two fields this module owns, then every extra
+/// field that HTTP/2 can carry and the budget has room for.
+///
+/// A field that cannot go on the wire is **dropped with a warn**, never a
+/// reason to refuse the response. H1 refuses the whole response for such a
+/// field (`writeResponse` answers 500), but that is about representation: an H1
+/// message whose value carries CRLF is ambiguous on the wire, so it cannot be
+/// sent at all. On H2 the block is length-prefixed, so the field can simply be
+/// left out — and refusing would turn a middleware that sets `Connection:
+/// keep-alive` (this framework's own `Sse` does) or a legacy handler's wrong
+/// `Content-Length` into a 5xx for that route on H2 while H1 serves it. The
+/// status line and body are the answer; a dropped field costs the client that
+/// field only, and the warn tells the operator which one.
+fn assembleSiteResponseBlock(
+    allocator: std.mem.Allocator,
+    status_str: []const u8,
+    content_type: []const u8,
+    extra: []const Hpack.Header,
+    body_len: usize,
+    budget: ResponseHeaderBudget,
+) ![]u8 {
+    const enc = Hpack.Encoder.init(allocator);
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    // Emitted first and unconditionally: `:status` is mandatory and has to be
+    // the first field (RFC 9113 §8.3), and a response whose `content-type` was
+    // dropped would leave the client unable to read the body — the extras below
+    // are the ones a peer can live without. They still count against the
+    // budget, so the counters start at two.
+    var list_bytes: usize = 0;
+    var fields: usize = 0;
+    for ([_]Hpack.Header{
+        .{ .name = ":status", .value = status_str },
+        .{ .name = "content-type", .value = content_type },
+    }) |h| {
+        const one = try enc.encodeSmart(&.{h});
+        defer allocator.free(one);
+        try out.appendSlice(allocator, one);
+        list_bytes += h.name.len + h.value.len + 32;
+        fields += 1;
+    }
+
+    var lower = std.ArrayList(u8).empty;
+    defer lower.deinit(allocator);
+
+    var report = DropReport{};
+    for (extra, 0..) |h, i| {
+        if (h.name.len == 0 or h.name[0] == ':') {
+            // Pseudo-headers are the encoder's, and they may not follow regular
+            // fields — a handler that set one is not obeyed, it is reported.
+            report.note(h.name, "pseudo-header");
+            continue;
+        }
+        if (std.ascii.eqlIgnoreCase(h.name, "content-type")) continue; // SiteResponse.content_type owns it
+        // H2 field names are lowercase (RFC 9113 §8.2.1) and a peer MUST treat
+        // `Set-Cookie` as malformed, whatever the handler spelled.
+        try lower.resize(allocator, h.name.len);
+        for (h.name, lower.items) |c, *dst| dst.* = std.ascii.toLower(c);
+        const name = lower.items;
+
+        if (isConnectionSpecific(name)) {
+            report.note(h.name, "connection-specific field (RFC 9113 §8.2.2)");
+            continue;
+        }
+        if (!isLowercaseFieldName(name)) {
+            report.note(h.name, "not a valid field name");
+            continue;
+        }
+        if (!isFieldValue(h.value)) {
+            report.note(h.name, "field value carries CR/LF/NUL or edge whitespace (RFC 9113 §8.2)");
+            continue;
+        }
+        if (std.mem.eql(u8, name, "content-length")) {
+            // A mismatch between `content-length` and the DATA octets is a
+            // malformed response (§8.1.1), so carry the field only when it
+            // agrees with what this response actually sends — which is the
+            // whole body on this adapter.
+            const declared = std.fmt.parseInt(usize, h.value, 10) catch null;
+            if (declared != body_len) {
+                report.note(h.name, "content-length disagrees with the body");
+                continue;
+            }
+        }
+
+        const field_bytes = name.len + h.value.len + 32;
+        if (budget.max_count) |max| {
+            if (fields + 1 > max) {
+                report.note(h.name, "past the response header count budget");
+                report.count += extra.len - i - 1;
+                break;
+            }
+        }
+        if (budget.max_list_bytes) |max| {
+            if (list_bytes + field_bytes > max) {
+                report.note(h.name, "past the response header list budget");
+                report.count += extra.len - i - 1;
+                break;
+            }
+        }
+        // The block goes out as one HEADERS frame, so the *encoded* size is
+        // what has to fit `SETTINGS_MAX_FRAME_SIZE`. `encodeSmart` is stateless
+        // (static table only, no dynamic table), so encoding field by field and
+        // concatenating is byte-for-byte the whole-list block.
+        const one = try enc.encodeSmart(&.{.{ .name = name, .value = h.value }});
+        defer allocator.free(one);
+        if (out.items.len + one.len > budget.max_block_bytes) {
+            report.note(h.name, "past the peer's SETTINGS_MAX_FRAME_SIZE");
+            report.count += extra.len - i - 1;
+            break;
+        }
+        try out.appendSlice(allocator, one);
+        list_bytes += field_bytes;
+        fields += 1;
+    }
+
+    if (report.count > 0) {
+        // One line per response, not one per field, and `warn` rather than
+        // `err`: the request is answered, and an error-level line makes
+        // `scripts/test-runner.zig` fail the whole suite.
+        std.log.warn(
+            "[h2] {d} response field(s) left off the wire (first: '{s}' — {s})",
+            .{ report.count, report.first_name, report.first_reason },
+        );
+    }
+
+    // The two mandatory fields are the floor: if even they do not fit the
+    // peer's frame size, sending them would be a connection error there, so
+    // fail the stream instead (the caller answers RST_STREAM). Unreachable with
+    // any sane `content-type`, and cheaper to state than to reason about.
+    if (out.items.len > budget.max_block_bytes) return error.ResponseHeaderBlockTooLarge;
+    return out.toOwnedSlice(allocator);
+}
+
+fn isConnectionSpecific(name: []const u8) bool {
+    for (connection_specific_fields) |f| {
+        if (std.mem.eql(u8, name, f)) return true;
+    }
+    return false;
+}
+
+/// `tchar` (RFC 9110 §5.6.2), lowercased: the only bytes an H2 field name may
+/// contain (RFC 9113 §8.2.1 requires the lowercase spelling). Callers pass the
+/// lowercased copy, so an uppercase byte here is a name that cannot be sent.
+fn isLowercaseFieldName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| {
+        switch (c) {
+            'a'...'z', '0'...'9', '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
+/// A field value as HTTP/2 defines it: no CR, LF or NUL, and no leading or
+/// trailing SP/HTAB (RFC 9113 §8.2) — a peer MUST treat those as malformed, so
+/// forwarding such a field is not carrying the header, it is emitting a
+/// malformed response.
+fn isFieldValue(value: []const u8) bool {
+    for (value) |c| {
+        if (c == '\r' or c == '\n' or c == 0) return false;
+    }
+    if (value.len > 0) {
+        const last = value[value.len - 1];
+        if (value[0] == ' ' or value[0] == '\t' or last == ' ' or last == '\t') return false;
+    }
+    return true;
 }
 
 // ==== §8  Frame readers ====
@@ -1616,7 +2128,7 @@ test "PriorityTree pickNext favors high-weight among ready streams" {
 
 test "encodeSiteResponseWire is headers then data" {
     const allocator = std.testing.allocator;
-    const wire = try encodeSiteResponseWire(allocator, 7, 200, "text/plain", "ok");
+    const wire = try encodeSiteResponseWire(allocator, 7, 200, "text/plain", &.{}, "ok", .{});
     defer allocator.free(wire);
     const f0 = try Http2.decodeFrame(wire);
     try std.testing.expectEqual(Http2.FrameType.headers, f0.header.typ);
@@ -1624,6 +2136,161 @@ test "encodeSiteResponseWire is headers then data" {
     const f1 = try Http2.decodeFrame(wire[9 + f0.header.length ..]);
     try std.testing.expectEqual(Http2.FrameType.data, f1.header.typ);
     try std.testing.expectEqualStrings("ok", f1.payload);
+}
+
+/// Decode the HEADERS frame of a site-response wire and return its fields.
+fn decodeSiteResponseFields(allocator: std.mem.Allocator, wire: []const u8) ![]Hpack.Header {
+    const f = try Http2.decodeFrame(wire);
+    try std.testing.expectEqual(Http2.FrameType.headers, f.header.typ);
+    var dec = Hpack.Decoder.init(allocator);
+    defer dec.deinit();
+    return dec.decode(f.payload);
+}
+
+fn countFields(headers: []const Hpack.Header, name: []const u8) usize {
+    var n: usize = 0;
+    for (headers) |h| {
+        if (std.mem.eql(u8, h.name, name)) n += 1;
+    }
+    return n;
+}
+
+test "encodeSiteResponseWire carries handler fields, lowercased, and only one content-type" {
+    const allocator = std.testing.allocator;
+    const extra = [_]Hpack.Header{
+        .{ .name = "Set-Cookie", .value = "sid=1; HttpOnly" },
+        // The dedicated field owns `content-type`: a second one on the wire is
+        // a protocol error, so whatever is here loses.
+        .{ .name = "Content-Type", .value = "text/html" },
+        // Connection-specific (RFC 9113 §8.2.2): a MUST NOT to forward.
+        .{ .name = "Connection", .value = "keep-alive" },
+        .{ .name = "Transfer-Encoding", .value = "chunked" },
+        // Agrees with the body, so it is carried; the mismatch case is below.
+        .{ .name = "Content-Length", .value = "2" },
+        .{ .name = "Retry-After", .value = "60" },
+        // Pseudo-headers are the encoder's own: the SiteResponse status wins.
+        .{ .name = ":status", .value = "999" },
+        // CRLF in a value is malformed on H2 (§8.2) — the case H1 refuses the
+        // whole response for.
+        .{ .name = "X-Split", .value = "a\r\nX-Injected: 1" },
+        .{ .name = "X-Padded", .value = "v1 " },
+    };
+    const wire = try encodeSiteResponseWire(allocator, 1, 429, "text/plain", &extra, "ok", .{});
+    defer allocator.free(wire);
+    const hdrs = try decodeSiteResponseFields(allocator, wire);
+    defer Hpack.freeHeaders(allocator, hdrs);
+
+    // The block starts with the status — pseudo-headers may not follow a
+    // regular field (RFC 9113 §8.3) — and the handler's fields are all there.
+    try std.testing.expectEqualStrings(":status", hdrs[0].name);
+    try std.testing.expectEqualStrings("429", hdrs[0].value);
+    try std.testing.expectEqualStrings("text/plain", firstHeaderValue(hdrs, "content-type").?);
+    try std.testing.expectEqual(@as(usize, 1), countFields(hdrs, "content-type"));
+    try std.testing.expectEqualStrings("sid=1; HttpOnly", firstHeaderValue(hdrs, "set-cookie").?);
+    try std.testing.expectEqualStrings("60", firstHeaderValue(hdrs, "retry-after").?);
+    try std.testing.expectEqualStrings("2", firstHeaderValue(hdrs, "content-length").?);
+
+    try std.testing.expect(firstHeaderValue(hdrs, "connection") == null);
+    try std.testing.expect(firstHeaderValue(hdrs, "transfer-encoding") == null);
+    try std.testing.expect(firstHeaderValue(hdrs, "x-split") == null);
+    try std.testing.expect(firstHeaderValue(hdrs, "x-padded") == null);
+    try std.testing.expectEqual(@as(usize, 0), countFields(hdrs, "connection"));
+}
+
+test "encodeSiteResponseWire drops a content-length that disagrees with the body" {
+    const allocator = std.testing.allocator;
+    const extra = [_]Hpack.Header{.{ .name = "Content-Length", .value = "9999" }};
+    const wire = try encodeSiteResponseWire(allocator, 1, 200, "text/plain", &extra, "ok", .{});
+    defer allocator.free(wire);
+    const hdrs = try decodeSiteResponseFields(allocator, wire);
+    defer Hpack.freeHeaders(allocator, hdrs);
+    try std.testing.expectEqual(@as(usize, 0), countFields(hdrs, "content-length"));
+    // The response itself is untouched: a wrong field costs the field.
+    try std.testing.expectEqualStrings("200", firstHeaderValue(hdrs, ":status").?);
+    try std.testing.expectEqualStrings("text/plain", firstHeaderValue(hdrs, "content-type").?);
+}
+
+test "encodeSiteResponseWire never builds a HEADERS block past the peer's frame size" {
+    const allocator = std.testing.allocator;
+
+    var values: [16][512]u8 = undefined;
+    var extra: [16]Hpack.Header = undefined;
+    for (&values, &extra, 0..) |*v, *h, i| {
+        @memset(v, 'x');
+        const name = try std.fmt.allocPrint(allocator, "x-bulk-{d}", .{i});
+        defer allocator.free(name);
+        h.* = .{ .name = try allocator.dupe(u8, name), .value = v };
+    }
+    defer {
+        for (extra) |h| allocator.free(h.name);
+    }
+
+    // ~8 KiB of extras against a 600-byte frame cap: the block has to be
+    // truncated, and the result still a single, sendable HEADERS frame.
+    const cap: usize = 600;
+    const wire = try encodeSiteResponseWire(allocator, 1, 200, "text/plain", &extra, "ok", .{ .max_block_bytes = cap });
+    defer allocator.free(wire);
+    const f = try Http2.decodeFrame(wire);
+    try std.testing.expectEqual(Http2.FrameType.headers, f.header.typ);
+    try std.testing.expect(f.header.length <= cap);
+    try std.testing.expect((f.header.flags & Http2.FrameFlags.end_headers) != 0);
+
+    // What could not be dropped is intact, and the DATA frame still follows.
+    const hdrs = try decodeSiteResponseFields(allocator, wire);
+    defer Hpack.freeHeaders(allocator, hdrs);
+    try std.testing.expectEqualStrings("200", firstHeaderValue(hdrs, ":status").?);
+    try std.testing.expectEqualStrings("text/plain", firstHeaderValue(hdrs, "content-type").?);
+    try std.testing.expect(countFields(hdrs, "content-type") == 1);
+    try std.testing.expect(hdrs.len < extra.len + 2);
+
+    const d = try Http2.decodeFrame(wire[9 + f.header.length ..]);
+    try std.testing.expectEqual(Http2.FrameType.data, d.header.typ);
+    try std.testing.expectEqualStrings("ok", d.payload);
+}
+
+test "encodeSiteResponseWire enforces the response header count and list budgets" {
+    const allocator = std.testing.allocator;
+    const extra = [_]Hpack.Header{
+        .{ .name = "x-one", .value = "1" },
+        .{ .name = "x-two", .value = "2" },
+    };
+
+    // `:status` + `content-type` + one extra = 3 fields.
+    {
+        const wire = try encodeSiteResponseWire(allocator, 1, 200, "text/plain", &extra, "ok", .{ .max_count = 3 });
+        defer allocator.free(wire);
+        const hdrs = try decodeSiteResponseFields(allocator, wire);
+        defer Hpack.freeHeaders(allocator, hdrs);
+        try std.testing.expectEqual(@as(usize, 3), hdrs.len);
+        try std.testing.expect(firstHeaderValue(hdrs, "content-type") != null);
+    }
+
+    // 42 + 54 bytes for the mandatory pair, so a 40-byte extra no longer fits.
+    {
+        const wire = try encodeSiteResponseWire(allocator, 1, 200, "text/plain", &extra, "ok", .{ .max_list_bytes = 100 });
+        defer allocator.free(wire);
+        const hdrs = try decodeSiteResponseFields(allocator, wire);
+        defer Hpack.freeHeaders(allocator, hdrs);
+        try std.testing.expectEqual(@as(usize, 2), hdrs.len);
+        try std.testing.expectEqualStrings("text/plain", firstHeaderValue(hdrs, "content-type").?);
+    }
+}
+
+test "responseHeaderBudget takes the peer's advertised list size when it is smaller" {
+    const opts = ServeOptions{ .inbound = .{ .max_header_list_bytes = 16 * 1024, .max_header_count = 100 } };
+    // No advertisement: our own number, `0` meaning "off" (our convention).
+    try std.testing.expectEqual(@as(?usize, 16 * 1024), responseHeaderBudget(opts, null, 16384).max_list_bytes);
+    const off = ServeOptions{ .inbound = .{ .max_header_list_bytes = 0, .max_header_count = 0 } };
+    try std.testing.expectEqual(@as(?usize, null), responseHeaderBudget(off, null, 16384).max_list_bytes);
+    try std.testing.expectEqual(@as(?usize, null), responseHeaderBudget(off, null, 16384).max_count);
+    // The peer's number wins when it is the smaller one, and *is* the bound
+    // when we have none — including 0, which for a peer means "no fields".
+    try std.testing.expectEqual(@as(?usize, 4096), responseHeaderBudget(opts, 4096, 16384).max_list_bytes);
+    try std.testing.expectEqual(@as(?usize, 16 * 1024), responseHeaderBudget(opts, 64 * 1024, 16384).max_list_bytes);
+    try std.testing.expectEqual(@as(?usize, 4096), responseHeaderBudget(off, 4096, 16384).max_list_bytes);
+    try std.testing.expectEqual(@as(?usize, 0), responseHeaderBudget(opts, 0, 16384).max_list_bytes);
+    // The frame size is the peer's, always.
+    try std.testing.expectEqual(@as(usize, 32768), responseHeaderBudget(opts, null, 32768).max_block_bytes);
 }
 
 // --- Inbound hardening: RFC 7540 §6.5.2 SETTINGS validation (see `applyPeerSettings`) ---
@@ -2683,4 +3350,75 @@ test "h2 server refuses an SSE handler rather than writing H1 event bytes into D
     const data = findFrameInReply(reply, .data, 1) orelse return error.TestUnexpectedResultWithMessage;
     try std.testing.expect(std.mem.indexOf(u8, data.payload, "NoStream") != null);
     try std.testing.expect(std.mem.indexOf(u8, data.payload, "data: tick") == null);
+}
+
+test "h2 server fits the response block to the peer's SETTINGS_MAX_HEADER_LIST_SIZE" {
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var server = api_server.Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h2-peer-list" });
+    defer server.deinit();
+    server.setHttp2Enabled(true);
+
+    var group = server.group("");
+    try group.get("h2peerlist", struct {
+        fn h(ctx: *api_server.Context) anyerror!void {
+            // RFC 9113 §6.5.2 accounting: 6 + 400 + 32 = 438 bytes, i.e. past a
+            // peer budget of 200 but well inside our own 16 KiB one.
+            const big = try ctx.allocator.alloc(u8, 400);
+            @memset(big, 'x');
+            try ctx.response_headers.put(try ctx.allocator.dupe(u8, "X-Only"), big);
+            try ctx.text(200, "ok");
+        }
+    }.h, null);
+
+    var running = try RunningServer.start(&server);
+    defer running.stop(&server);
+
+    const block = try hpackRequestBlock(allocator, "GET", "/h2peerlist", &.{});
+    defer allocator.free(block);
+    const head = try Http2.encodeHeaders(allocator, 1, block, true, true);
+    defer allocator.free(head);
+
+    // 1) Nothing advertised: the field fits our default budget and goes out —
+    //    so case 2 below is the peer's number biting, not a blanket drop.
+    {
+        var out: [8192]u8 = undefined;
+        const n = try h2SpeakToServer(running.port, head, &out);
+        const reply = out[0..n];
+        const hframe = findFrameInReply(reply, .headers, 1) orelse return error.TestUnexpectedResultWithMessage;
+        var dec = Hpack.Decoder.init(allocator);
+        defer dec.deinit();
+        const hdrs = try dec.decode(hframe.payload);
+        defer Hpack.freeHeaders(allocator, hdrs);
+        const got = firstHeaderValue(hdrs, "x-only") orelse return error.XOnlyMissingFromH2Response;
+        try std.testing.expectEqual(@as(usize, 400), got.len);
+    }
+
+    // 2) The peer advertises 200 bytes of list, so the 438-byte field cannot be
+    //    carried: the block is built without it and the response is otherwise
+    //    complete — status, content-type and body all intact, no RST_STREAM.
+    {
+        const settings = try Http2.encodeSettings(allocator, false, &.{.{ Http2.SettingsId.max_header_list_size, 200 }});
+        defer allocator.free(settings);
+        var script = std.ArrayList(u8).empty;
+        defer script.deinit(allocator);
+        try script.appendSlice(allocator, settings);
+        try script.appendSlice(allocator, head);
+
+        var out: [8192]u8 = undefined;
+        const n = try h2SpeakToServer(running.port, script.items, &out);
+        const reply = out[0..n];
+        const hframe = findFrameInReply(reply, .headers, 1) orelse return error.TestUnexpectedResultWithMessage;
+        var dec = Hpack.Decoder.init(allocator);
+        defer dec.deinit();
+        const hdrs = try dec.decode(hframe.payload);
+        defer Hpack.freeHeaders(allocator, hdrs);
+        try std.testing.expectEqualStrings("200", firstHeaderValue(hdrs, ":status") orelse return error.NoStatusField);
+        try std.testing.expectEqualStrings("text/plain", firstHeaderValue(hdrs, "content-type") orelse return error.NoContentTypeField);
+        try std.testing.expect(firstHeaderValue(hdrs, "x-only") == null);
+        try std.testing.expect(findFrameInReply(reply, .rst_stream, 1) == null);
+        const data = findFrameInReply(reply, .data, 1) orelse return error.TestUnexpectedResultWithMessage;
+        try std.testing.expectEqualStrings("ok", data.payload);
+    }
 }

@@ -75,6 +75,20 @@ zmodu ci                                # 业务项目：build + fmt + verify + 
 返回 400 而不是带着缺失参数继续路由）、`ctx.allocator` 改为**每请求** arena；`ctx.stream` 在 H2 上仍为
 `null`，流式处理器得到明确的 **501** 而不是把 H1 chunk 头当成 body 发出去。
 
+**行为变化（非破坏）**：H2 现在**把 handler 设置的响应头都发出去**（以前只发 `content-type`，
+`Set-Cookie` / `Location` / `Retry-After` / CORS 头在 H2 上会静默消失）。注意三件事：
+① 违反 RFC 9113 §8.2.2 的连接相关字段（`connection` / `keep-alive` / `proxy-connection` /
+`transfer-encoding` / `upgrade`）**不会**被转发，只记一条 warn —— 与 H1 的"整响应 500"不同；
+② handler 自己设的 `content-length` 与 body 不符时也不转发（H2 里那是 malformed），H1 的行为未动；
+③ 响应头有预算（peer 的 `SETTINGS_MAX_HEADER_LIST_SIZE`、字段数、编码后 ≤ peer
+`SETTINGS_MAX_FRAME_SIZE`），超出的字段被丢掉并记一条 warn，而不是发一个对端必须拒绝的帧。
+如果没有依赖"某个头在 H2 上恰好不发"的行为，就不需要改动。
+
+**修复（非破坏）**：h2c 升级路径此前**不派发 stream 1**，真实客户端 `curl --http2` 升级后拿不到任何
+响应（prior-knowledge 不受影响）。现在按 RFC 7540 §3.2 把**携带升级的那个请求**当作 stream 1 派发
+一次，并先应用 `HTTP2-Settings`；此后客户端再发 `HEADERS(1)` 会收到 `RST_STREAM(STREAM_CLOSED)`。
+若你的客户端一直在用 h2c 升级，这条修好之前它大概什么都没收到。
+
 ---
 
 ## v0.33.1

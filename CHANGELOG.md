@@ -2,10 +2,97 @@
 
 ## [Unreleased]
 
+### 第 9 批：H2 不再丢响应头（Set-Cookie/Location/Retry-After 全丢）、h2c 升级按 RFC 把升级请求当 stream 1 派发、MySQL 流式游标首次有真机用例（**破坏性：否**）
+
+全量 `-Ddb=all` **1753/1782（29 skipped，0 failed）**；PG 17.10 与 MySQL 9.3.0 门控用例分别在
+对应服务器上跑过（见下：**门控的正确调用形式**）。
+
+**H2 上除 `content-type` 以外的响应头会被整批丢弃 —— 已修。** `Http2Server.SiteResponse` 只带
+`status`/`content_type`/`body`，于是 handler 在 `Context` 上设的 `Set-Cookie` / `Location` /
+`Retry-After` / `Cache-Control` / CORS 头在 H2 上**静默消失**（H1 正常）。红证据（真 socket h2c，
+解析 HEADERS 帧）：
+```
+====== expected this output: =========
+:status,content-type,location,retry-after,set-cookie,x-app␃
+======== instead found this: =========
+:status,content-type␃
+```
+`SiteResponse` 新增 `headers: []const Hpack.Header = &.{}`（**有默认值**，第三方 `SiteHandler` 不受影响；
+`headers_owned` 决定 `deinit` 是否逐条释放）。三个决策：
+- **`content-type` 保留独立字段**：只有一个权威来源就不存在"两个 content-type"的歧义，而且删字段会破
+  已有 `SiteHandler`；编码器是唯一咽喉点，extras 里的 `content-type`（不分大小写）一律忽略。
+- **新增响应侧预算 `ResponseHeaderBudget`**，三段同时生效：`SETTINGS_MAX_HEADER_LIST_SIZE` 记账
+  （取 `min(peer 广播值, 我们的)`，**peer 的 0 = "不收任何字段"与我们的 0 = "关闭"语义不同，不能直接
+  `@min`**，所以 peer 现在被单独跟踪）、字段数上限、以及**编码后块 ≤ peer `SETTINGS_MAX_FRAME_SIZE`**
+  —— 后者是硬约束：整块塞进**一个** HEADERS 帧、本模块从不发 CONTINUATION，超了 peer 必须回
+  FRAME_SIZE_ERROR。连 `:status` 都塞不下（现实中不可能）时返回 `error.ResponseHeaderBlockTooLarge`
+  → 既有路径回 `RST_STREAM(INTERNAL_ERROR)`，绝不发一个超帧。
+- **h2 禁止的连接相关字段 = 丢掉 + 一条 warn，不整响应拒绝**：RFC 9113 §8.2.2 对
+  `connection`/`keep-alive`/`proxy-connection`/`transfer-encoding`/`upgrade` 是 MUST NOT，静默透传不行；
+  但拒绝会把"中间件设了 `Connection: keep-alive`（框架自家 SSE 就设）或 handler 写了错 `Content-Length`"
+  在同一条路由上从 H1 的正常服务变成 5xx —— 那正是本次要消除的协议间差异。同一策略覆盖伪头/空名、
+  非 tchar 名、值含 CR/LF/NUL、以及 `content-length` 与 body 不符（RFC 9113 §8.1.1 不符即 malformed，
+  只有相等才转发）。日志按响应一条汇总（首个被丢字段名 + 原因）。
+交叉验证：用重建后的 `examples/http-stress-test` 起服、`curl --http2-prior-knowledge` 实测拿到
+`HTTP/2 200` + `content-type: application/json` 且无 malformed frame。**未验证**：真实客户端只验到
+status/content-type/body（示例没有设 `Set-Cookie` 的路由），这些字段的线上存在性由仓库自带 HPACK
+解码器验证。
+
+**h2c 升级路径根本没派发 stream 1 —— 已修。** RFC 7540 §3.2 / RFC 9113 §3.2：**携带升级的那个请求**就是
+stream 1（且处于半关闭 remote），客户端不会再发 `HEADERS(1)`；而本模块只在收到 HEADERS/DATA 时才派发，
+于是真实客户端 `curl --http2` 升级后**拿不到任何响应**（原始 socket 探针实测：101 之后只回
+`SETTINGS` + `SETTINGS ACK`，on-线 27 字节、无 stream-1 帧；补发一个 `HEADERS(1)` 后立刻正常返回，说明
+编码路径本身没问题）。prior-knowledge h2c 正常，所以一直没被发现。
+修法：新增 `Http2Server.UpgradeRequest`（method/target/authority/scheme/fields/body/`HTTP2-Settings` 原值），
+`serveAfterUpgrade` 多收一个参数，旧的 `serveAfterPrefacePrefetchReader` 主体变成私有的
+`serveSession(..., upgrade: ?UpgradeRequest)`，公开入口传 `null`（**其它调用者不变**）。升级请求按
+`headers_done + end_stream = true` 播种、**恰好派发一次**后从 `streams` 摘除，并把 `HTTP2-Settings`
+**先**当 peer SETTINGS 应用（`conn_max_frame_size`/`peer_max_header_list`/连接窗口）——不等客户端的
+SETTINGS 帧，客户端重复发同一组值是无操作；payload 解不开回 `GOAWAY(PROTOCOL_ERROR)`。
+之后的 `HEADERS(1)` 命中显式守卫，回 `RST_STREAM(STREAM_CLOSED)` 而不是二次派发（RFC 7540 §5.1）。
+红证据：`FAIL (NoStream1ResponseAfterUpgrade)` + 临时帧转储（只有一条 `typ=settings sid=0 len=18`）。
+**两条变异检查**证明用例有牙：把 `HTTP2-Settings` 的应用挖空 → `expected 70000, found 65535`（正好是
+默认 peer 窗口）；关掉 `HEADERS(1)` 守卫 → `NoStreamClosedForRepeatedHeaders`。真机 `curl --http2`
+（非 prior-knowledge，重建后的示例服务）实测：`101 Switching Protocols` → `HTTP/2 200` +
+`content-type: application/json` + body，**不再挂住**。
+> **残留**：`connFiber` 仍把 h2c 限制在 `GET`（RFC §3.2 没有方法限制），所以真实的 `POST` 升级仍进不来
+> （body 路径已实现并有 `GET + Content-Length` 的用例）；`HTTP2-Settings` 畸形 payload 的
+> `GOAWAY` 分支、以及 `fillUpgradeStream` 的 OOM 路径都**没有测试**。
+
+**MySQL 流式游标首次有真机用例（补齐上一批"只推理"的那半边）。** 上一批把 `Cursor.next` 变成可失败后，
+MySQL 侧的 `mysql_errno` 分支与 `columns_arena` 生命周期**没有任何测试**。新增三条（`DB=mysql` 门控，
+真机 MySQL 9.3.0）：中途服务器错误必须以 error 返回、每个流式行的列名必须仍然可读、失败后同 client 仍可用。
+> **一个必须记下来的坑**：**PG 用的除零形状在 MySQL 上不成立** —— 本机 `sql_mode` 含
+> `ERROR_FOR_DIVISION_BY_ZERO`+`STRICT_TRANS_TABLES`，但 `SELECT 100/(3-i) …` 在 i=3 只返回 `NULL`
+> 不报错（`mysql -e` 实测 `50.0000 / 100.0000 / NULL / -100.0000`）。改用**逐行投影错误**：第三行才求值的
+> 标量子查询返回两行 → `ER_SUBQUERY_NO_1_ROW (1242)` → `error.DatabaseError`；`mysql --quick`
+> （同一 `mysql_use_result` 协议）确认 "先出 2 行、再 ERROR 1242"，**且不能加 `ORDER BY`**（会 filesort，
+> 错误在任何行到达前就返回，反而测不到 mid-stream）。
+> 列名那条的 red 证据**纠正了一个假设**：把 `columns_arena.reset` 放回 `next` 顶部（等价旧生命周期）→
+> 崩在**第一行**（`Segmentation fault at address 0x5555…` @ `expectEqualStrings`），不是"只有后续行坏" ——
+> `reset` 在 fetch 之前执行，所以第 1 行的 `columns` 就已经悬垂。用例因此在第 1/2/3 行都读名字。
+> `mysql_fetch_lengths` 那个 NULL 守卫**给不出 red 证据**（C API 只在 `mysql_fetch_row` 返回 NULL 时才
+> 为 NULL，而进入守卫的路径都在一次成功 fetch 之后）；用 JSON path(3143)/GIS(3037)/标量子查询(1242)
+> 三类逐行错误都没能触发它，注释里写明"这是守卫，不是被测分支"。
+
+> **口径更正（上一批写错过，这条比 bug 本身重要）**：`DB=mysql bash scripts/test-fast.sh …` **不会**
+> 启用 MySQL 门控用例 —— `test-fast.sh` 自己持有 `DB` 变量（默认 `sqlite`、由 `--db` 覆盖为 `all`），
+> 前缀导出的值被脚本内的赋值盖掉，测试二进制看到的是 `DB=all`，`skipUnlessDb("mysql")` 全部静默 skip
+> （实测同一 filter：包装脚本 8 passed / 7 skipped，直连 build 13 passed / 2 skipped）。
+> **正确形式**：`DB=mysql zig build test -Ddb=all -Dtest-filter=… -Dtest-force-run=true`。
+> PG 不受影响（`ZIGMODU_TEST_PG=1` 是环境变量，没有同名脚本变量）。上一批那句"与 MySQL 9.3.0 分组跑过"
+> 因此是错的，已在原处标注。
+
 ### 第 8 批：CI 那条红是测试的等待谓词反了；`Cursor.next` 不再把错误折叠成 EOF；H2 补齐表单/改写器/查询串；`authRateLimitMiddleware` 首次可编译（**破坏性：是**，1 处编译错）
 
-全量 `-Ddb=all` **1740/1766（26 skipped，0 failed）**；另有真机 PG 17.10（`ZIGMODU_TEST_PG=1`）与
-MySQL 9.3.0（`DB=mysql`）分组跑过相关用例。
+全量 `-Ddb=all` **1740/1766（26 skipped，0 failed）**；PG 侧另有真机 17.10 跑过
+（`ZIGMODU_TEST_PG=1` 是**唯一**能穿过 `scripts/test-fast.sh` 的环境门控）。
+
+> **更正一处口径（本批写错过，第 9 批发现）**：`DB=mysql bash scripts/test-fast.sh …` **不会**启用
+> MySQL 门控用例 —— `test-fast.sh` 自己持有 `DB` 变量（默认 `sqlite`，被 `--db all` 覆盖），前缀导出
+> 的值会被脚本内的赋值盖掉，于是测试二进制看到的是 `DB=all`，`skipUnlessDb("mysql")` 全部 skip。要跑
+> MySQL 门控用例得绕过包装脚本：`DB=mysql zig build test -Ddb=all -Dtest-filter=… -Dtest-force-run=true`。
+> 本批（第 8 批）的 MySQL 侧因此**没有**真机验证，第 9 批才补上。
 
 **CI 上那条 5 分钟超时：测试等错了极性，不是运行时的错。** `Runtime: shutdown with the pool mid-batch
 hands the claim back first` 的第二次等待写成 `waitUntil(Flag(rt.alive))` —— 而 `Flag.ready()` 返回**原值**，
@@ -178,7 +265,9 @@ dead 并已在基线里）——缺陷真实但不可达，所以删掉而不是
 仍然 403。未绑定的遗留行（老库 `payer_did IS NULL`）按原语义放行。`migrate()` 增加幂等 `ALTER`（sqlite 走
 `PRAGMA table_info`，PG/MySQL 走 `information_schema`），老库可以直接升级。红证据：去掉比对 →
 `expected .payer_mismatch, found .redeemed` / `expected 403, found 200`。**在真 PG 17.10 与 MySQL 9.3.0 上验过**
-（`ZIGMODU_TEST_PG=1` / `DB=mysql`）。
+（门控形式：PG 用 `ZIGMODU_TEST_PG=1`；MySQL **不能**用 `DB=mysql bash scripts/test-fast.sh` —— 那句的
+`DB` 会被脚本自己的赋值盖掉、门控用例全部静默 skip，得用 `DB=mysql zig build test -Ddb=all
+-Dtest-filter=… -Dtest-force-run=true`；见第 9 批的口径更正）。
 
 > **接线前提（应用侧）**：`x402Middleware` 必须挂在身份中间件**之后**，否则 attr 还没写，发票会**静默**变成未绑定
 > （等于没有这道防护）。mTLS / API-key 场景没有 `did`，用 `payer_attr` 指到你的身份 attr 上。

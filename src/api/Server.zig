@@ -2527,13 +2527,66 @@ pub const Server = struct {
         const ctype = try allocator.dupe(u8, ctype_src);
         errdefer allocator.free(ctype);
         const resp_body = try allocator.dupe(u8, ctx.response_body.items);
+        errdefer allocator.free(resp_body);
+        // Everything else the handler put in the map travels too. On H1
+        // `writeResponse` writes the whole map, so dropping these on H2 is a
+        // per-protocol divergence an app can see: a login's `Set-Cookie`, a
+        // redirect's `Location`, a 429's `Retry-After`. H2's rules about what
+        // may go in a block (lowercase names, no connection-specific fields,
+        // the size budget) are enforced in the encoder, which is the one place
+        // every `SiteHandler` passes through.
+        const extra = try copyResponseHeaders(allocator, ctx.response_headers);
+        errdefer {
+            for (extra) |h| {
+                allocator.free(h.name);
+                allocator.free(h.value);
+            }
+            allocator.free(extra);
+        }
         ctx.deinit();
         return .{
             .status = status,
             .content_type = ctype,
             .body = resp_body,
             .content_type_owned = true,
+            .headers = extra,
+            .headers_owned = true,
         };
+    }
+
+    /// Duplicate a response-header map into an owned `Hpack.Header` list.
+    ///
+    /// `content-type` is left out: `SiteResponse.content_type` owns that field
+    /// and two of them in one response is a protocol error. Names keep the
+    /// spelling the handler used — lowercasing is the encoder's job, so those
+    /// bytes stay valid for anything else that reads this list.
+    fn copyResponseHeaders(
+        allocator: std.mem.Allocator,
+        headers: std.StringHashMap([]const u8),
+    ) ![]Hpack.Header {
+        var out = std.ArrayList(Hpack.Header).empty;
+        errdefer {
+            for (out.items) |h| {
+                allocator.free(h.name);
+                allocator.free(h.value);
+            }
+            out.deinit(allocator);
+        }
+        var it = headers.iterator();
+        while (it.next()) |entry| {
+            if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "content-type")) continue;
+            const name = try allocator.dupe(u8, entry.key_ptr.*);
+            const value = allocator.dupe(u8, entry.value_ptr.*) catch |err| {
+                allocator.free(name);
+                return err;
+            };
+            out.append(allocator, .{ .name = name, .value = value }) catch |err| {
+                allocator.free(name);
+                allocator.free(value);
+                return err;
+            };
+        }
+        return out.toOwnedSlice(allocator);
     }
 
     /// Attach a shared buffer pool for WebSocket frame I/O.
@@ -3067,16 +3120,45 @@ fn connFiber(server: *Server, stream: std.Io.net.Stream, allocator: std.mem.Allo
             const conn_hdr = ctx.headers.get("connection") orelse "";
             const h2_settings = ctx.headers.get("http2-settings");
             if (Http2.isH2cUpgrade(upgrade_hdr, conn_hdr, h2_settings)) {
+                // RFC 7540 §3.2: this request *is* stream 1 of the session that
+                // follows, and the client sends no HEADERS frame for it — so it
+                // is handed to the session rather than forgotten here. Built
+                // before the 101, so a failure is still answerable: every slice
+                // is copied by the session before it returns.
+                var upgrade_headers = std.ArrayList(Hpack.Header).empty;
+                defer upgrade_headers.deinit(arena_alloc);
+                var hdr_it = ctx.headers.iterator();
+                while (hdr_it.next()) |e| {
+                    upgrade_headers.append(arena_alloc, .{ .name = e.key_ptr.*, .value = e.value_ptr.* }) catch {
+                        writeErrorResponse(server.io, stream, arena_alloc, 500, "Internal Server Error");
+                        return;
+                    };
+                }
+
                 var wbuf: [256]u8 = undefined;
                 var w = stream.writer(server.io, &wbuf);
                 w.interface.writeAll("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n") catch return;
                 w.interface.flush() catch return;
+
                 Http2Server.serveAfterUpgrade(
                     server.io,
                     stream,
                     allocator,
                     server.http2ServeOptions(Server.Http2ReadDeadline.handle(&reader)),
                     &reader.interface,
+                    .{
+                        .method = request.method.toString(),
+                        // The whole request target, query included: this is what
+                        // `:path` means (RFC 9113 §8.3.1) and what the H2 site
+                        // adapter splits. `request.path` is the split half.
+                        .target = if (request.raw_path.len > 0) request.raw_path else request.path,
+                        .authority = ctx.headers.get("host") orelse "",
+                        .headers = upgrade_headers.items,
+                        // Already read in full by the parser above; stream 1 is
+                        // half-closed (remote) from the start.
+                        .body = request.body orelse "",
+                        .http2_settings = h2_settings,
+                    },
                 ) catch |err| {
                     std.log.warn("[Server] HTTP/2 h2c upgrade session ended: {s}", .{@errorName(err)});
                 };
@@ -6626,9 +6708,511 @@ test "h2 adapter parity: the auth rate limiter answers 429 through the response 
         defer Hpack.freeHeaders(allocator, hdrs);
         try std.testing.expectEqualStrings("429", h2FirstHeaderValue(hdrs, ":status") orelse return error.TestUnexpectedResultWithMessage);
 
+        // The limiter's `Retry-After` is the header a client backs off on, and
+        // it is written into `ctx.response_headers` exactly like `content-type`
+        // — the one response field this adapter used to carry.
+        try std.testing.expectEqualStrings("60", h2FirstHeaderValue(hdrs, "retry-after") orelse return error.RetryAfterMissingFromH2Response);
+
         // ...and a body, delivered as an ordinary DATA frame: the refusal is a
         // response, not a dropped connection or a process abort.
         const body = h2FindFrame(reply, .data, 1) orelse return error.TestUnexpectedResultWithMessage;
         try std.testing.expect(std.mem.indexOf(u8, body.payload, "Too many requests") != null);
     }
+}
+
+/// Comma-joined response field names, sorted, so comparing the *set* of fields
+/// a reply carried does not depend on hash-map iteration order.
+fn h2FieldNamesSorted(allocator: std.mem.Allocator, headers: []const Hpack.Header) ![]u8 {
+    const names = try allocator.alloc([]const u8, headers.len);
+    defer allocator.free(names);
+    for (headers, 0..) |h, i| names[i] = h.name;
+    std.mem.sort([]const u8, names, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    return std.mem.join(allocator, ",", names);
+}
+
+test "h2 adapter parity: every response header the handler set reaches the wire" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h2-resp-headers" });
+    defer server.deinit();
+    server.setHttp2Enabled(true);
+
+    var group = server.group("");
+    try group.post("h2headers", struct {
+        fn h(ctx: *Context) anyerror!void {
+            // The shapes an app loses when only `content-type` travels: a
+            // session cookie, a back-off hint, a redirect target, an app
+            // header. `writeResponse` writes the whole map on H1, so the same
+            // handler gets all four onto an H1 wire.
+            try ctx.setHeader("Set-Cookie", "sid=abc123; Path=/; HttpOnly");
+            try ctx.setHeader("Retry-After", "60");
+            try ctx.setHeader("Location", "/next");
+            try ctx.setHeader("X-App", "v1");
+            // Connection-specific. H2 forbids these in a response (RFC 9113
+            // §8.2.2) — the requirement is to filter it, not to forward it,
+            // and not to lose the rest of the response over it either.
+            try ctx.setHeader("Connection", "keep-alive");
+            try ctx.text(429, "slow down");
+        }
+    }.h, null);
+
+    var running = try H2TestServer.start(&server);
+    defer running.stop(&server);
+
+    const block = try h2RequestBlock(allocator, "POST", "/h2headers", &.{});
+    defer allocator.free(block);
+    const head = try Http2.encodeHeaders(allocator, 1, block, true, true);
+    defer allocator.free(head);
+
+    var out: [8192]u8 = undefined;
+    const n = try h2SendToServer(running.port, head, &out);
+    const reply = out[0..n];
+
+    const hframe = h2FindFrame(reply, .headers, 1) orelse return error.TestUnexpectedResultWithMessage;
+    var dec = Hpack.Decoder.init(allocator);
+    defer dec.deinit();
+    const hdrs = try dec.decode(hframe.payload);
+    defer Hpack.freeHeaders(allocator, hdrs);
+
+    // One assertion carries the whole field-name set, so a miss names the
+    // fields that did arrive instead of "expected true, found false". No
+    // `connection` here: it is the field h2 forbids.
+    const names = try h2FieldNamesSorted(allocator, hdrs);
+    defer allocator.free(names);
+    try std.testing.expectEqualStrings(
+        ":status,content-type,location,retry-after,set-cookie,x-app",
+        names,
+    );
+
+    // …and the values, so this is not just "some field with that name".
+    try std.testing.expectEqualStrings("429", h2FirstHeaderValue(hdrs, ":status") orelse return error.NoStatusField);
+    try std.testing.expectEqualStrings("text/plain", h2FirstHeaderValue(hdrs, "content-type") orelse return error.NoContentTypeField);
+    try std.testing.expectEqualStrings("sid=abc123; Path=/; HttpOnly", h2FirstHeaderValue(hdrs, "set-cookie") orelse return error.NoSetCookieField);
+    try std.testing.expectEqualStrings("60", h2FirstHeaderValue(hdrs, "retry-after") orelse return error.NoRetryAfterField);
+    try std.testing.expectEqualStrings("/next", h2FirstHeaderValue(hdrs, "location") orelse return error.NoLocationField);
+    try std.testing.expectEqualStrings("v1", h2FirstHeaderValue(hdrs, "x-app") orelse return error.NoXAppField);
+    try std.testing.expect(h2FirstHeaderValue(hdrs, "connection") == null);
+
+    // H2 field names are lowercase on the wire (RFC 9113 §8.2.1) and a peer
+    // must treat `Set-Cookie` as malformed — the handler's spelling may not
+    // reach the encoder.
+    for (hdrs) |h| {
+        for (h.name) |c| try std.testing.expectEqual(std.ascii.toLower(c), c);
+    }
+
+    const body = h2FindFrame(reply, .data, 1) orelse return error.TestUnexpectedResultWithMessage;
+    try std.testing.expectEqualStrings("slow down", body.payload);
+}
+
+test "h2 adapter parity: a response field past Config.header_limits is dropped, not framed unsendably" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    // RFC 9113 §6.5.2 accounting (name + value + 32 per field): the request's
+    // four pseudo-headers cost 185, the response's `:status` + `content-type`
+    // 96, so the 400-byte extra below cannot fit in what the peer advertised.
+    var server = Server.initWithConfig(std.testing.io, allocator, .{
+        .port = 0,
+        .name = "h2-resp-budget",
+        .header_limits = .{ .max_total_bytes = 250 },
+    });
+    defer server.deinit();
+    server.setHttp2Enabled(true);
+
+    var group = server.group("");
+    try group.post("h2budget", struct {
+        fn h(ctx: *Context) anyerror!void {
+            try ctx.setHeader("X-Small", "1");
+            const big = try ctx.allocator.alloc(u8, 400);
+            @memset(big, 'x');
+            try ctx.response_headers.put(try ctx.allocator.dupe(u8, "X-Big"), big);
+            try ctx.text(200, "ok");
+        }
+    }.h, null);
+
+    var running = try H2TestServer.start(&server);
+    defer running.stop(&server);
+
+    const block = try h2RequestBlock(allocator, "POST", "/h2budget", &.{});
+    defer allocator.free(block);
+    const head = try Http2.encodeHeaders(allocator, 1, block, true, true);
+    defer allocator.free(head);
+
+    var out: [8192]u8 = undefined;
+    const n = try h2SendToServer(running.port, head, &out);
+    const reply = out[0..n];
+
+    // A field that does not fit costs that field, not the response: the status,
+    // the content-type and the body are all still there, and the stream was not
+    // reset.
+    const hframe = h2FindFrame(reply, .headers, 1) orelse return error.TestUnexpectedResultWithMessage;
+    var dec = Hpack.Decoder.init(allocator);
+    defer dec.deinit();
+    const hdrs = try dec.decode(hframe.payload);
+    defer Hpack.freeHeaders(allocator, hdrs);
+    try std.testing.expectEqualStrings("200", h2FirstHeaderValue(hdrs, ":status") orelse return error.NoStatusField);
+    try std.testing.expectEqualStrings("text/plain", h2FirstHeaderValue(hdrs, "content-type") orelse return error.NoContentTypeField);
+    try std.testing.expect(h2FirstHeaderValue(hdrs, "x-big") == null);
+    try std.testing.expect(h2FindFrame(reply, .rst_stream, 1) == null);
+    try std.testing.expect(h2FindFrame(reply, .goaway, 0) == null);
+
+    const body = h2FindFrame(reply, .data, 1) orelse return error.TestUnexpectedResultWithMessage;
+    try std.testing.expectEqualStrings("ok", body.payload);
+}
+
+// --- h2c upgrade (RFC 7540 §3.2 / RFC 9113 §3.2) over loopback ---
+//
+// `connFiber` answers `Connection: Upgrade, HTTP2-Settings` + `Upgrade: h2c`
+// with a 101 and hands the socket to the H2 session. RFC 7540 §3.2: the request
+// that carried the upgrade **is** stream 1, and it is implicitly half-closed
+// from the client toward the server — the client sends no HEADERS frame for it.
+// These tests drive that handshake on a real socket, so what is asserted is
+// what a client gets after the 101. Without the seeding of stream 1 the client
+// sees the protocol switch and then nothing at all: `curl --http2` hangs.
+
+/// `HTTP2-Settings` value (RFC 7540 §3.2.1): the payload of a SETTINGS frame,
+/// base64url, no padding. Encoded through the shared frame codec and then cut
+/// back to the payload, so the header cannot drift from the wire format.
+fn h2cSettingsValue(allocator: std.mem.Allocator, params: []const struct { u16, u32 }) ![]u8 {
+    const frame = try Http2.encodeSettings(allocator, false, params);
+    defer allocator.free(frame);
+    const payload = frame[9..];
+    const buf = try allocator.alloc(u8, std.base64.url_safe_no_pad.Encoder.calcSize(payload.len));
+    errdefer allocator.free(buf);
+    const encoded = std.base64.url_safe_no_pad.Encoder.encode(buf, payload);
+    return buf[0..encoded.len];
+}
+
+/// Client side of one h2c upgrade against a running `Server`: the HTTP/1.1
+/// request carrying the upgrade fields, then the client connection preface and
+/// `frames`. Returns the whole reply — the 101 status line included — so a test
+/// can assert both halves (`h2cWireAfter101` splits them).
+///
+/// Everything goes out in one segment: the server reads the preface only after
+/// it has written the 101, and the bytes that arrived earlier sit in the
+/// connection's own reader buffer — the case `serveAfterUpgrade` exists for.
+/// The half-close lets the session's frame loop see EOF instead of parking.
+fn h2cUpgradeToServer(
+    port: u16,
+    request_headers: []const u8,
+    frames: []const u8,
+    out: []u8,
+) !usize {
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+    var stream = try addr.connect(std.testing.io, .{ .mode = .stream });
+    defer stream.close(std.testing.io);
+
+    try sockread.writeFull(stream, request_headers);
+    try sockread.writeFull(stream, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try sockread.writeFull(stream, frames);
+    _ = std.c.shutdown(stream.socket.handle, std.c.SHUT.WR);
+
+    var total: usize = 0;
+    while (total < out.len) {
+        var fds = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&fds, 3000) catch break;
+        if (ready == 0) break;
+        const n = std.posix.read(stream.socket.handle, out[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    return total;
+}
+
+/// One h2c upgrade request block, upgrade fields included. `extra_lines` are
+/// complete header lines, each terminated with CRLF (empty when there are none);
+/// `body` follows the blank line.
+fn h2cUpgradeRequest(
+    allocator: std.mem.Allocator,
+    target: []const u8,
+    settings_value: []const u8,
+    extra_lines: []const u8,
+    body: []const u8,
+) ![]u8 {
+    std.debug.assert(extra_lines.len == 0 or std.mem.endsWith(u8, extra_lines, "\r\n"));
+    return std.fmt.allocPrint(
+        allocator,
+        "GET {s} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade, HTTP2-Settings\r\n" ++
+            "Upgrade: h2c\r\nHTTP2-Settings: {s}\r\n{s}\r\n{s}",
+        .{ target, settings_value, extra_lines, body },
+    );
+}
+
+/// The H2 half of an upgrade reply: everything after the 101's header block.
+fn h2cWireAfter101(reply: []const u8) ![]const u8 {
+    const end = std.mem.indexOf(u8, reply, "\r\n\r\n") orelse return error.NoUpgradeResponseHeaders;
+    return reply[end + 4 ..];
+}
+
+/// Frames of `typ` on `stream_id` (any stream when 0) in a server reply.
+fn h2CountFrames(wire: []const u8, typ: Http2.FrameType, stream_id: u31) usize {
+    var count: usize = 0;
+    var off: usize = 0;
+    while (off + 9 <= wire.len) {
+        const frame = Http2.decodeFrame(wire[off..]) catch return count;
+        off += 9 + @as(usize, frame.header.length);
+        if (frame.header.typ == typ and (stream_id == 0 or frame.header.stream_id == stream_id)) count += 1;
+    }
+    return count;
+}
+
+/// Concatenated DATA payloads for one stream, in wire order: the body a client
+/// reassembles, however many frames the server split it into.
+fn h2CollectData(allocator: std.mem.Allocator, wire: []const u8, stream_id: u31) ![]u8 {
+    var body = std.ArrayList(u8).empty;
+    errdefer body.deinit(allocator);
+    var off: usize = 0;
+    while (off + 9 <= wire.len) {
+        const frame = Http2.decodeFrame(wire[off..]) catch break;
+        off += 9 + @as(usize, frame.header.length);
+        if (frame.header.typ != .data or frame.header.stream_id != stream_id) continue;
+        try body.appendSlice(allocator, frame.payload);
+    }
+    return body.toOwnedSlice(allocator);
+}
+
+test "h2c upgrade: the request that carried the upgrade is answered as stream 1" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h2c-upgrade" });
+    defer server.deinit();
+    server.setHttp2Enabled(true);
+
+    var group = server.group("");
+    try group.get("h2cup", struct {
+        fn h(ctx: *Context) anyerror!void {
+            try ctx.jsonStruct(200, .{ .ok = true, .proto = "h2c" });
+        }
+    }.h, null);
+
+    var running = try H2TestServer.start(&server);
+    defer running.stop(&server);
+
+    const settings_value = try h2cSettingsValue(allocator, &.{.{ Http2.SettingsId.initial_window_size, 131072 }});
+    defer allocator.free(settings_value);
+    const request = try h2cUpgradeRequest(allocator, "/h2cup", settings_value, "", "");
+    defer allocator.free(request);
+
+    var out: [8192]u8 = undefined;
+    // No HEADERS frame anywhere on this connection: the only request is the one
+    // that carried the upgrade, so a stream-1 answer can come from nothing else.
+    const n = try h2cUpgradeToServer(running.port, request, &.{}, &out);
+    const reply = out[0..n];
+    try std.testing.expect(std.mem.startsWith(u8, reply, "HTTP/1.1 101"));
+
+    const wire = try h2cWireAfter101(reply);
+    const hframe = h2FindFrame(wire, .headers, 1) orelse return error.NoStream1ResponseAfterUpgrade;
+    var dec = Hpack.Decoder.init(allocator);
+    defer dec.deinit();
+    const hdrs = try dec.decode(hframe.payload);
+    defer Hpack.freeHeaders(allocator, hdrs);
+    try std.testing.expectEqualStrings("200", h2FirstHeaderValue(hdrs, ":status") orelse return error.NoStatusField);
+    // The route's own content-type, not the loop's built-in 404 fallback: the
+    // path in the HTTP/1.1 request line reached the router.
+    try std.testing.expectEqualStrings("application/json", h2FirstHeaderValue(hdrs, "content-type") orelse return error.NoContentTypeField);
+
+    const data = h2FindFrame(wire, .data, 1) orelse return error.NoStream1BodyAfterUpgrade;
+    try std.testing.expectEqualStrings("{\"ok\":true,\"proto\":\"h2c\"}", data.payload);
+    // The upgrade request was complete before the session started, so stream 1
+    // is answered exactly once and closed (END_STREAM on the response's body).
+    try std.testing.expect((data.header.flags & Http2.FrameFlags.end_stream) != 0);
+    try std.testing.expect(h2FindFrame(wire, .goaway, 0) == null);
+}
+
+test "h2c upgrade: the request's query string and fields reach the handler" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h2c-upgrade-query" });
+    defer server.deinit();
+    server.setHttp2Enabled(true);
+
+    var group = server.group("");
+    try group.get("h2cupq", struct {
+        fn h(ctx: *Context) anyerror!void {
+            const q = ctx.requestParam("b") orelse "MISSING";
+            const f = ctx.header("x-tenant") orelse "NOFIELD";
+            const out = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ q, f });
+            try ctx.text(200, out);
+        }
+    }.h, null);
+
+    var running = try H2TestServer.start(&server);
+    defer running.stop(&server);
+
+    const settings_value = try h2cSettingsValue(allocator, &.{.{ Http2.SettingsId.initial_window_size, 131072 }});
+    defer allocator.free(settings_value);
+    // The whole request target goes in the request line, so the query reaches
+    // `:path` intact (RFC 9113 §8.3.1) and the adapter splits it off; the
+    // `x-tenant` field is the ordinary-field half of the same path.
+    const request = try h2cUpgradeRequest(
+        allocator,
+        "/h2cupq?a=1&b=%E5%BC%A0%E4%B8%89",
+        settings_value,
+        "X-Tenant: acme\r\n",
+        "",
+    );
+    defer allocator.free(request);
+
+    var out: [8192]u8 = undefined;
+    const n = try h2cUpgradeToServer(running.port, request, &.{}, &out);
+    try std.testing.expect(std.mem.startsWith(u8, out[0..n], "HTTP/1.1 101"));
+    const wire = try h2cWireAfter101(out[0..n]);
+
+    const body = try h2CollectData(allocator, wire, 1);
+    defer allocator.free(body);
+    try std.testing.expectEqualStrings("张三/acme", body);
+}
+
+test "h2c upgrade: the HTTP2-Settings payload is applied before the first response" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    // 70000 bytes is past the 65535 a stream may send before the peer's
+    // INITIAL_WINDOW_SIZE is known. The upgrade request advertises 131072 in
+    // `HTTP2-Settings`, and this connection sends no SETTINGS frame of its own
+    // — so the whole body can only arrive if that field was applied as the
+    // peer's SETTINGS before stream 1 was answered (RFC 7540 §3.2.1). A session
+    // that waits for a SETTINGS frame truncates the body to 65535 and stalls.
+    const big_len: usize = 70000;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h2c-upgrade-settings" });
+    defer server.deinit();
+    server.setHttp2Enabled(true);
+
+    var group = server.group("");
+    try group.get("h2cbig", struct {
+        fn h(ctx: *Context) anyerror!void {
+            const big = try ctx.allocator.alloc(u8, big_len);
+            @memset(big, 'x');
+            try ctx.text(200, big);
+        }
+    }.h, null);
+
+    var running = try H2TestServer.start(&server);
+    defer running.stop(&server);
+
+    const settings_value = try h2cSettingsValue(allocator, &.{.{ Http2.SettingsId.initial_window_size, 131072 }});
+    defer allocator.free(settings_value);
+    const request = try h2cUpgradeRequest(allocator, "/h2cbig", settings_value, "", "");
+    defer allocator.free(request);
+
+    // A reply larger than the default peer window, so it needs its own buffer.
+    const out = try allocator.alloc(u8, big_len + 1024);
+    defer allocator.free(out);
+    const n = try h2cUpgradeToServer(running.port, request, &.{}, out);
+    const wire = try h2cWireAfter101(out[0..n]);
+
+    const body = try h2CollectData(allocator, wire, 1);
+    defer allocator.free(body);
+    try std.testing.expectEqual(big_len, body.len);
+    for (body) |c| try std.testing.expectEqual(@as(u8, 'x'), c);
+}
+
+test "h2c upgrade: a HEADERS frame for stream 1 is refused, not dispatched twice" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h2c-upgrade-dup" });
+    defer server.deinit();
+    server.setHttp2Enabled(true);
+
+    var group = server.group("");
+    try group.get("h2cupdup", struct {
+        fn h(ctx: *Context) anyerror!void {
+            try ctx.text(200, "served once");
+        }
+    }.h, null);
+
+    var running = try H2TestServer.start(&server);
+    defer running.stop(&server);
+
+    const settings_value = try h2cSettingsValue(allocator, &.{.{ Http2.SettingsId.initial_window_size, 131072 }});
+    defer allocator.free(settings_value);
+    const request = try h2cUpgradeRequest(allocator, "/h2cupdup", settings_value, "", "");
+    defer allocator.free(request);
+
+    // The client preface, the SETTINGS frame the RFC requires next (§3.2.2: the
+    // same values as `HTTP2-Settings`), and then the mistake §3.2 makes
+    // impossible for a correct client — the upgrade request again as HEADERS(1).
+    // Stream 1 is half-closed (remote) from the start, so this must not be
+    // served a second time.
+    var script = std.ArrayList(u8).empty;
+    defer script.deinit(allocator);
+    const client_settings = try Http2.encodeSettings(allocator, false, &.{.{ Http2.SettingsId.initial_window_size, 131072 }});
+    defer allocator.free(client_settings);
+    try script.appendSlice(allocator, client_settings);
+    const block = try h2RequestBlock(allocator, "GET", "/h2cupdup", &.{});
+    defer allocator.free(block);
+    const dup = try Http2.encodeHeaders(allocator, 1, block, true, true);
+    defer allocator.free(dup);
+    try script.appendSlice(allocator, dup);
+
+    var out: [8192]u8 = undefined;
+    const n = try h2cUpgradeToServer(running.port, request, script.items, &out);
+    const wire = try h2cWireAfter101(out[0..n]);
+
+    // Exactly one response HEADERS frame on stream 1: the answer seeded from the
+    // upgrade. A second one is the double dispatch.
+    try std.testing.expectEqual(@as(usize, 1), h2CountFrames(wire, .headers, 1));
+    try std.testing.expectEqual(@as(usize, 1), h2CountFrames(wire, .data, 1));
+    const rst = h2FindFrame(wire, .rst_stream, 1) orelse return error.NoStreamClosedForRepeatedHeaders;
+    try std.testing.expectEqual(Http2.ErrorCode.STREAM_CLOSED, try Http2.decodeRstStream(rst.payload));
+    // A stream error, not the connection: the session keeps running.
+    try std.testing.expect(h2FindFrame(wire, .goaway, 0) == null);
+
+    const body = try h2CollectData(allocator, wire, 1);
+    defer allocator.free(body);
+    try std.testing.expectEqualStrings("served once", body);
+}
+
+test "h2c upgrade: an upgrade request body becomes stream 1's body" {
+    const allocator = std.testing.allocator;
+    if (!@import("../test/NetworkProbe.zig").available()) return error.SkipZigTest;
+
+    var server = Server.initWithConfig(std.testing.io, allocator, .{ .port = 0, .name = "h2c-upgrade-body" });
+    defer server.deinit();
+    server.setHttp2Enabled(true);
+
+    var group = server.group("");
+    try group.get("h2cbody", struct {
+        fn h(ctx: *Context) anyerror!void {
+            try ctx.text(200, ctx.body orelse "NOBODY");
+        }
+    }.h, null);
+
+    var running = try H2TestServer.start(&server);
+    defer running.stop(&server);
+
+    const settings_value = try h2cSettingsValue(allocator, &.{.{ Http2.SettingsId.initial_window_size, 131072 }});
+    defer allocator.free(settings_value);
+    // RFC 7540 §3.2: a request with a body sends it *in full* as part of the
+    // HTTP/1.1 request, before any HTTP/2 frame. The session therefore receives
+    // the whole body with the request and must not wait for DATA frames that
+    // will never come — stream 1 is half-closed (remote) from the first frame.
+    const request = try h2cUpgradeRequest(
+        allocator,
+        "/h2cbody",
+        settings_value,
+        "Content-Length: 11\r\n",
+        "hello world",
+    );
+    defer allocator.free(request);
+
+    var out: [8192]u8 = undefined;
+    const n = try h2cUpgradeToServer(running.port, request, &.{}, &out);
+    try std.testing.expect(std.mem.startsWith(u8, out[0..n], "HTTP/1.1 101"));
+    const wire = try h2cWireAfter101(out[0..n]);
+
+    const body = try h2CollectData(allocator, wire, 1);
+    defer allocator.free(body);
+    try std.testing.expectEqualStrings("hello world", body);
+    const data = h2FindFrame(wire, .data, 1) orelse return error.NoStream1BodyAfterUpgrade;
+    try std.testing.expect((data.header.flags & Http2.FrameFlags.end_stream) != 0);
 }

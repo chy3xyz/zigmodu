@@ -483,7 +483,11 @@ const MySqlCursor = struct {
         const row_ptr = row_data.?;
         const lengths = libmysql_c.mysql_fetch_lengths(self.res);
         // One length per column, every time — a `NULL` here is a driver
-        // failure, not an empty row, and indexing it was a null deref.
+        // failure, not an empty row, and indexing it was a null deref. The
+        // branch is a guard rather than a covered path: the C API documents
+        // `mysql_fetch_lengths` as NULL only when the *preceding* fetch
+        // returned NULL, and no live statement was found that makes it NULL
+        // after the successful fetch above (see the MySQL streaming tests).
         if (lengths == null) {
             std.log.warn("[sqlx] MySQL stream failed mid-result: mysql_fetch_lengths returned NULL", .{});
             self.eof = true;
@@ -8714,6 +8718,197 @@ test "pooled client stays usable after a streaming cursor fails mid-result" {
     try std.testing.expectEqual(m.total_acquired, m.total_released);
     const after = try db.queryRow(struct { n: i64 }, "SELECT ?1 AS n", &.{.{ .int = 42 }});
     defer freeScanned(allocator, @TypeOf(after), after);
+    try std.testing.expectEqual(@as(i64, 42), after.n);
+}
+
+// The MySQL half of the same two contracts. It is a separate server and a
+// separate driver, so the PG tests above prove nothing about it: `MySqlCursor`
+// reads its error slot with `mysql_errno` (libpq reports through the result
+// status), and its rows are built from `mysql_fetch_row` +
+// `mysql_fetch_lengths` (libpq hands the cells over pre-parsed).
+//
+// Not covered below: the `mysql_fetch_lengths` NULL guard in the same function.
+// The C API documents that call as returning NULL only when the fetch before it
+// failed, and every path into the guard sits behind a fetch that succeeded — no
+// live statement was found that reaches it, so it is a guard, not a tested
+// branch. Saying so is the point: the null deref it replaced is fixed either
+// way, but the branch itself has no red evidence behind it.
+//
+// The mid-result failure is a scalar subquery that returns two rows, reached
+// only from the third row of the series: the projection raises
+// ER_SUBQUERY_NO_1_ROW (1242) *while the result is streaming*, after the first
+// two rows are already on the wire. Divisor-based shapes do not work here —
+// `ERROR_FOR_DIVISION_BY_ZERO` is set on this server and `SELECT 100/(3-i)`
+// still yields `NULL` for i = 3 with no error, so the division-by-zero shape
+// the PG test uses is not a mid-stream failure on MySQL at all.
+//
+// `--quick` is `mysql_use_result`, the same incremental protocol `MySqlCursor`
+// uses, which is what makes "two rows, then the error" a property of this
+// statement rather than of the client library's buffering:
+//
+//     $ mysql --quick -h 127.0.0.1 -P 3306 -u root -e "<the SELECT below>"
+//     i   q
+//     1   1
+//     2   2
+//     ERROR 1242 (21000) at line 1: Subquery returns more than 1 row
+//
+// Red evidence, taken against the pre-fix `next` with only its error slot
+// removed (the branch folded back into `return null`, signature unchanged).
+// Line numbers in the transcripts below are from the file as it stood during
+// the probe, before the comment you are reading existed:
+//
+//     $ DB=mysql zig build test -Ddb=all -Dtest-filter="mysql streaming" -Dtest-force-run=true
+//     185/1661 sqlx.sqlx.test.mysql streaming cursor reports a mid-stream server error instead of ending the result...expected error.DatabaseError, found null
+//     FAIL (TestExpectedError)
+//     src/sqlx/sqlx.zig:8788:9: in test.mysql streaming cursor reports a mid-stream server error...
+//         try std.testing.expectError(error.DatabaseError, cursor.next());
+//
+// i.e. the truncated result set ended the loop after two rows and no error.
+
+/// Connection settings for the live MySQL streaming tests below — the same five
+/// environment variables, and the same defaults, as `test "mysql live
+/// connection"`. A function because four tests share the block, and four hand
+/// copies of it is how the host/port/defaults drift apart.
+fn mysqlLiveConfig() Config {
+    const Env = struct {
+        fn get(comptime name: [:0]const u8) ?[]const u8 {
+            if (builtin.os.tag == .windows) return null;
+            const raw = std.c.getenv(name.ptr) orelse return null;
+            return std.mem.span(raw);
+        }
+    };
+    const port: u16 = blk: {
+        const raw = Env.get("MYSQL_PORT") orelse break :blk 3306;
+        break :blk std.fmt.parseInt(u16, raw, 10) catch 3306;
+    };
+    return .{
+        .driver = .mysql,
+        .host = Env.get("MYSQL_HOST") orelse "127.0.0.1",
+        .port = port,
+        .username = Env.get("MYSQL_USER") orelse "root",
+        .password = Env.get("MYSQL_PASSWORD") orelse "",
+        .database = Env.get("MYSQL_DATABASE") orelse "zigzero_test",
+    };
+}
+
+const mysql_midstream_sql =
+    "SELECT i, CASE WHEN i = 3 THEN (SELECT 1 UNION ALL SELECT 2) ELSE i END AS q" ++
+    " FROM (SELECT 1 AS i UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4) t";
+
+test "mysql streaming cursor reports a mid-stream server error instead of ending the result" {
+    try skipUnlessDb("mysql");
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, std.testing.io, mysqlLiveConfig());
+    defer client.deinit();
+    try client.connect();
+
+    {
+        var cursor = try client.queryCursorEx(mysql_midstream_sql, &.{}, .{ .mode = .streaming });
+        defer cursor.deinit();
+        try std.testing.expect(cursor.isStreaming());
+
+        // The rows the server could produce before the failure are real rows ...
+        const first = (try cursor.next()).?;
+        try std.testing.expectEqualStrings("1", first.get("q").?.string);
+        const second = (try cursor.next()).?;
+        try std.testing.expectEqualStrings("2", second.get("q").?.string);
+        // ... and here the server raises, one row short of the series' fourth
+        // row. 1242 has no dedicated member in `mysqlErrnoToError`, so it lands
+        // on the generic driver failure — the same mapping the acquisition path
+        // applies to the same statement. Before this change the two rows above
+        // were the whole result: the `while (cursor.next()) |row|` loop ended
+        // quietly and reported a truncated result set as a complete one.
+        try std.testing.expectError(error.DatabaseError, cursor.next());
+    }
+
+    // Scoped so the cursor gave its connection back before the next statement:
+    // this is the pool-less path, where the connection is the client's own and
+    // a broken stream leaves its mark on `self.conn` rather than on a pool
+    // slot. The driver's error slot is per-command, so the next statement on
+    // the same connection has to succeed rather than inherit the failure.
+    const after = try client.queryRow(struct { n: i64 }, "SELECT 42 AS n", &.{});
+    try std.testing.expectEqual(@as(i64, 42), after.n);
+}
+
+test "mysql streaming cursor keeps column names alive across rows" {
+    try skipUnlessDb("mysql");
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, std.testing.io, mysqlLiveConfig());
+    defer client.deinit();
+    try client.connect();
+
+    var cursor = try client.queryCursorEx(
+        "SELECT i AS alpha, i * 10 AS beta FROM (SELECT 1 AS i UNION ALL SELECT 2 UNION ALL SELECT 3) t",
+        &.{},
+        .{ .mode = .streaming },
+    );
+    defer cursor.deinit();
+
+    // A streaming row that reads at all: `values` and the column names come
+    // from two different lifetimes inside the cursor. The names used to be
+    // allocated in the row arena — the one `next` resets at its top — and that
+    // reset runs *before* the fetch, so by the time the first row was handed
+    // out its `columns` slice already pointed at freed memory. `row.get("col")`
+    // walks that slice on the way to the values, which is why this test reads
+    // the names off every row rather than just the first: it pins the new
+    // lifetime ("one set per result set") rather than a single offset that
+    // happens to survive. Red evidence, taken with the reset restored to the
+    // top of `next` (the pre-fix lifetime); line numbers are from the file as
+    // it stood during the probe:
+    //
+    //     $ DB=mysql zig build test -Ddb=all \
+    //         -Dtest-filter="mysql streaming cursor keeps column names alive" -Dtest-force-run=true
+    //     ...mysql streaming cursor keeps column names alive across rows...Segmentation fault at address 0x5555555555555555
+    //       std/mem.zig:909:40 in findDiff
+    //       std/testing.zig:669:25 in expectEqualStrings
+    //       src/sqlx/sqlx.zig:8833:39 in test.mysql streaming cursor keeps column names alive across rows
+    //         try std.testing.expectEqualStrings("alpha", first.columns[0]);
+    const first = (try cursor.next()).?;
+    try std.testing.expectEqual(@as(usize, 2), first.columns.len);
+    try std.testing.expectEqualStrings("alpha", first.columns[0]);
+    try std.testing.expectEqualStrings("beta", first.columns[1]);
+    try std.testing.expectEqualStrings("1", first.get("alpha").?.string);
+    try std.testing.expectEqualStrings("10", first.get("beta").?.string);
+
+    const second = (try cursor.next()).?;
+    try std.testing.expectEqualStrings("alpha", second.columns[0]);
+    try std.testing.expectEqualStrings("beta", second.columns[1]);
+    try std.testing.expectEqualStrings("2", second.get("alpha").?.string);
+    try std.testing.expectEqualStrings("20", second.get("beta").?.string);
+
+    const third = (try cursor.next()).?;
+    try std.testing.expectEqualStrings("alpha", third.columns[0]);
+    try std.testing.expectEqualStrings("3", third.get("alpha").?.string);
+    try std.testing.expectEqualStrings("30", third.get("beta").?.string);
+
+    try std.testing.expectEqual(@as(?*Row, null), try cursor.next());
+}
+
+test "mysql pooled client stays usable after a streaming cursor fails mid-result" {
+    try skipUnlessDb("mysql");
+    const allocator = std.testing.allocator;
+    var cfg = mysqlLiveConfig();
+    cfg.max_open_conns = 2;
+    cfg.max_idle_conns = 2;
+    var db = Client.init(allocator, std.testing.io, cfg);
+    defer db.deinit();
+    db.ensurePool();
+    try db.connect();
+    const pool = &db.pool.?;
+
+    var cursor = try db.queryCursorEx(mysql_midstream_sql, &.{}, .{ .mode = .streaming });
+    try std.testing.expectEqualStrings("1", (try cursor.next()).?.get("q").?.string);
+    try std.testing.expectEqualStrings("2", (try cursor.next()).?.get("q").?.string);
+    // Same statement as the test above: two rows, then the server raises.
+    try std.testing.expectError(error.DatabaseError, cursor.next());
+    cursor.deinit();
+
+    // 1242 is a *server* error on an otherwise healthy socket, so `deinit`'s
+    // `ping` succeeds and the connection goes back to the pool rather than
+    // being retired — acquired and released must still balance.
+    const m = pool.metrics();
+    try std.testing.expectEqual(m.total_acquired, m.total_released);
+    const after = try db.queryRow(struct { n: i64 }, "SELECT 42 AS n", &.{});
     try std.testing.expectEqual(@as(i64, 42), after.n);
 }
 
