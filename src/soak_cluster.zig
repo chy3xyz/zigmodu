@@ -642,9 +642,9 @@ fn linuxFdCount() ?u32 {
         var off: usize = 0;
         while (off + @sizeOf(std.os.linux.dirent64) <= @as(usize, @intCast(n))) {
             const ent: *align(1) const std.os.linux.dirent64 = @ptrCast(&buf[off]);
-            const name = std.mem.sliceTo(&ent.d_name, 0);
+            const name = std.mem.sliceTo(&ent.name, 0);
             if (!std.mem.eql(u8, name, ".") and !std.mem.eql(u8, name, "..")) count += 1;
-            off += ent.d_reclen;
+            off += ent.reclen;
         }
     }
     return count;

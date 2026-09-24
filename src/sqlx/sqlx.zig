@@ -2761,22 +2761,26 @@ pub const PostgresConn = struct {
         // Convert ? → $1,$2,... then null-terminate for libpq.
         // Keep branches separate: `if (a) []u8 else [:0]u8` coerces to []u8 and
         // `free` then drops the sentinel (alloc=N+1 / free=N SafeAllocator panic).
+        // Every buffer below is the caller's allocator, i.e. this process's
+        // memory: a failure to get one is `error.OutOfMemory`, while
+        // `convertPlaceholders` returning null and `PQsendQueryParams`
+        // returning 0 stay `error.DatabaseError` (those are the driver paths).
         const sql_z: [:0]u8 = blk: {
             if (args.len == 0) {
-                break :blk allocZ(allocator, sql_str) catch return error.DatabaseError;
+                break :blk try allocZ(allocator, sql_str);
             }
             const pg_sql = convertPlaceholders(self.allocator, sql_str) orelse return error.DatabaseError;
             defer self.allocator.free(pg_sql);
-            break :blk allocZ(allocator, pg_sql) catch return error.DatabaseError;
+            break :blk try allocZ(allocator, pg_sql);
         };
         defer allocator.free(sql_z);
 
         // Build text parameter arrays. Owned by `allocator` and freed before return.
-        const paramValues = allocator.alloc(?[*]const u8, args.len) catch return error.DatabaseError;
+        const paramValues = try allocator.alloc(?[*]const u8, args.len);
         defer allocator.free(paramValues);
-        const paramLengths = allocator.alloc(c_int, args.len) catch return error.DatabaseError;
+        const paramLengths = try allocator.alloc(c_int, args.len);
         defer allocator.free(paramLengths);
-        const paramAllocs = allocator.alloc(?[]u8, args.len) catch return error.DatabaseError;
+        const paramAllocs = try allocator.alloc(?[]u8, args.len);
         defer {
             for (paramAllocs) |maybe| {
                 if (maybe) |a| allocator.free(a);
@@ -2792,19 +2796,19 @@ pub const PostgresConn = struct {
                     break :blk null;
                 },
                 .int => |v| blk: {
-                    const s = std.fmt.allocPrint(allocator, "{d}", .{v}) catch return error.DatabaseError;
+                    const s = try std.fmt.allocPrint(allocator, "{d}", .{v});
                     paramAllocs[i] = s;
                     paramLengths[i] = @intCast(s.len);
                     break :blk @ptrCast(s.ptr);
                 },
                 .float => |v| blk: {
-                    const s = std.fmt.allocPrint(allocator, "{d}", .{v}) catch return error.DatabaseError;
+                    const s = try std.fmt.allocPrint(allocator, "{d}", .{v});
                     paramAllocs[i] = s;
                     paramLengths[i] = @intCast(s.len);
                     break :blk @ptrCast(s.ptr);
                 },
                 .string => |v| blk: {
-                    const s = allocator.dupe(u8, v) catch return error.DatabaseError;
+                    const s = try allocator.dupe(u8, v);
                     paramAllocs[i] = s;
                     paramLengths[i] = @intCast(s.len);
                     break :blk @ptrCast(s.ptr);
@@ -2841,10 +2845,10 @@ pub const PostgresConn = struct {
             } else if (status == libpq_c.ExecStatusType.PGRES_TUPLES_OK or status == libpq_c.ExecStatusType.PGRES_SINGLE_TUPLE) {
                 const n_cols = libpq_c.PQnfields(r);
                 if (n_cols > 0) {
-                    columns = columns_arena.allocator().alloc([]u8, @intCast(n_cols)) catch return error.DatabaseError;
+                    columns = try columns_arena.allocator().alloc([]u8, @intCast(n_cols));
                     for (0..@intCast(n_cols)) |c| {
                         const name = std.mem.span(libpq_c.PQfname(r, @intCast(c)));
-                        columns[c] = columns_arena.allocator().dupe(u8, name) catch return error.DatabaseError;
+                        columns[c] = try columns_arena.allocator().dupe(u8, name);
                     }
                 }
             } else {
@@ -2884,7 +2888,7 @@ pub const PostgresConn = struct {
         }
         try sql.appendSlice(self.allocator, ") FROM STDIN WITH (FORMAT csv)");
 
-        const sql_z = allocZ(self.allocator, sql.items) catch return error.DatabaseError;
+        const sql_z = try allocZ(self.allocator, sql.items);
         defer self.allocator.free(sql_z);
 
         const begin = libpq_c.PQexec(self.conn, "BEGIN");
@@ -3175,7 +3179,10 @@ fn mysqlBindParams(stmt: *libmysql_c.MYSQL_STMT, arena: std.mem.Allocator, args:
 /// so binary BLOB columns are refetched without string coercion.
 /// The returned slice is allocated in `arena_alloc`.
 fn mysqlFetchStringColumn(arena_alloc: std.mem.Allocator, stmt: *libmysql_c.MYSQL_STMT, col: usize, actual_len: usize, field_type: c_int) errors.ResultT([]u8) {
-    const temp = arena_alloc.alloc(u8, actual_len) catch return error.DatabaseError;
+    // The refetch buffer is this process's memory, so running out of it is
+    // `error.OutOfMemory`; the `mysql_stmt_fetch_column` failure below stays
+    // `error.DatabaseError` (the server/library refused to hand the column over).
+    const temp = try arena_alloc.alloc(u8, actual_len);
     var fetch_len: c_ulong = 0;
     const buffer_type: c_int = if (field_type == 0) libmysql_c.MYSQL_TYPE_STRING else field_type;
     var fetch_bind: libmysql_c.MYSQL_BIND = .{
@@ -3201,7 +3208,7 @@ fn mysqlFetchStringValue(arena_alloc: std.mem.Allocator, stmt: *libmysql_c.MYSQL
         }
         return error.DatabaseError;
     }
-    return Value{ .string = arena_alloc.dupe(u8, buf[0..len]) catch return error.DatabaseError };
+    return Value{ .string = try arena_alloc.dupe(u8, buf[0..len]) };
 }
 
 /// Validate a MySQL DECIMAL/NEWDECIMAL string. Returns the input unchanged on success.
@@ -3270,9 +3277,12 @@ fn mysqlParseJson(s: []const u8) errors.Error![]const u8 {
 }
 
 /// After successful `mysql_stmt_execute` for a result-producing statement, fetch rows with binary decoding.
-fn mysqlStmtReadRows(stmt: *libmysql_c.MYSQL_STMT, arena: std.heap.ArenaAllocator) errors.ResultT(Rows) {
-    var arena_mut = arena;
-    const arena_alloc = arena_mut.allocator();
+fn mysqlStmtReadRows(stmt: *libmysql_c.MYSQL_STMT, arena: *std.heap.ArenaAllocator) errors.ResultT(Rows) {
+    // `arena` is a pointer on purpose: the row buffer is built inside this call,
+    // and an arena taken by value would record those nodes in the *copy* — so the
+    // caller's `errdefer arena.deinit()` would free an empty list and leak the
+    // partially built rows on the very allocation failures this path reports.
+    const arena_alloc = arena.allocator();
 
     // Metadata **before** `store_result`. Both orders are documented, but only
     // this one holds on MariaDB Connector/C 11: `mysql_stmt_store_result` leaves
@@ -3284,8 +3294,8 @@ fn mysqlStmtReadRows(stmt: *libmysql_c.MYSQL_STMT, arena: std.heap.ArenaAllocato
     // libmariadb, the configuration CI runs.
     const meta = libmysql_c.mysql_stmt_result_metadata(stmt) orelse {
         // No metadata → treat as empty result set (should be rare after field_count > 0).
-        const empty = arena_alloc.alloc(Row, 0) catch return error.DatabaseError;
-        return Rows{ .arena = arena_mut, .rows = empty };
+        const empty = try arena_alloc.alloc(Row, 0);
+        return Rows{ .arena = arena.*, .rows = empty };
     };
     defer libmysql_c.mysql_free_result(meta);
 
@@ -3298,18 +3308,23 @@ fn mysqlStmtReadRows(stmt: *libmysql_c.MYSQL_STMT, arena: std.heap.ArenaAllocato
 
     const n_cols = libmysql_c.mysql_num_fields(meta);
 
-    const shared_columns = arena_alloc.alloc([]const u8, n_cols) catch return error.DatabaseError;
-    const binds = arena_alloc.alloc(libmysql_c.MYSQL_BIND, n_cols) catch return error.DatabaseError;
+    // Everything the bind/decode machinery needs is built in the caller's
+    // arena — this process's memory. An allocation failure here is
+    // `error.OutOfMemory` (the name `Error.zig` documents for "arena/dupe
+    // failures while scanning rows"); a failure of the *library* to describe a
+    // column stays `error.DatabaseError` (see the two checks in the loop below).
+    const shared_columns = try arena_alloc.alloc([]const u8, n_cols);
+    const binds = try arena_alloc.alloc(libmysql_c.MYSQL_BIND, n_cols);
     @memset(binds, .{});
-    const null_flags = arena_alloc.alloc(libmysql_c.my_bool, n_cols) catch return error.DatabaseError;
-    const lengths = arena_alloc.alloc(c_ulong, n_cols) catch return error.DatabaseError;
-    const err_flags = arena_alloc.alloc(libmysql_c.my_bool, n_cols) catch return error.DatabaseError;
-    const bind_bufs = arena_alloc.alloc(MysqlBindBuffer, n_cols) catch return error.DatabaseError;
-    const is_unsigned_flags = arena_alloc.alloc(libmysql_c.my_bool, n_cols) catch return error.DatabaseError;
+    const null_flags = try arena_alloc.alloc(libmysql_c.my_bool, n_cols);
+    const lengths = try arena_alloc.alloc(c_ulong, n_cols);
+    const err_flags = try arena_alloc.alloc(libmysql_c.my_bool, n_cols);
+    const bind_bufs = try arena_alloc.alloc(MysqlBindBuffer, n_cols);
+    const is_unsigned_flags = try arena_alloc.alloc(libmysql_c.my_bool, n_cols);
     // What the decode loop below switches on. Collected while walking the
     // library's field cursor, so neither loop has to index a `MYSQL_FIELD`
     // array (see the comment in the loop).
-    const col_types = arena_alloc.alloc(c_int, n_cols) catch return error.DatabaseError;
+    const col_types = try arena_alloc.alloc(c_int, n_cols);
 
     for (0..n_cols) |c| {
         // `mysql_fetch_field(meta)` walks the library's own cursor, and that is
@@ -3333,7 +3348,7 @@ fn mysqlStmtReadRows(stmt: *libmysql_c.MYSQL_STMT, arena: std.heap.ArenaAllocato
         }
         col_types[c] = field.type;
         const name = field.name[0..field.name_length];
-        shared_columns[c] = arena_alloc.dupe(u8, name) catch return error.DatabaseError;
+        shared_columns[c] = try arena_alloc.dupe(u8, name);
 
         const unsigned = (field.flags & libmysql_c.UNSIGNED_FLAG) != 0;
         is_unsigned_flags[c] = if (unsigned) 1 else 0;
@@ -3440,7 +3455,7 @@ fn mysqlStmtReadRows(stmt: *libmysql_c.MYSQL_STMT, arena: std.heap.ArenaAllocato
             return error.DatabaseError;
         }
 
-        const values = arena_alloc.alloc(?Value, n_cols) catch return error.DatabaseError;
+        const values = try arena_alloc.alloc(?Value, n_cols);
         for (0..n_cols) |c| {
             if (null_flags[c] != 0) {
                 values[c] = null;
@@ -3495,13 +3510,13 @@ fn mysqlStmtReadRows(stmt: *libmysql_c.MYSQL_STMT, arena: std.heap.ArenaAllocato
                 };
             }
         }
-        rows_list.append(arena_alloc, .{ .arena = undefined, .columns = shared_columns, .values = values }) catch return error.DatabaseError;
+        try rows_list.append(arena_alloc, .{ .arena = undefined, .columns = shared_columns, .values = values });
     }
 
-    const rows_slice = arena_alloc.alloc(Row, rows_list.items.len) catch return error.DatabaseError;
+    const rows_slice = try arena_alloc.alloc(Row, rows_list.items.len);
     @memcpy(rows_slice, rows_list.items);
     _ = libmysql_c.mysql_stmt_free_result(stmt);
-    return Rows{ .arena = arena_mut, .rows = rows_slice };
+    return Rows{ .arena = arena.*, .rows = rows_slice };
 }
 
 pub const MySqlConn = struct {
@@ -3595,15 +3610,20 @@ pub const MySqlConn = struct {
             _ = libmysql_c.mysql_stmt_close(stmt);
             return mysqlErrnoToError(err_no);
         }
-        const key = self.allocator.dupe(u8, sql_str) catch {
+        // Both allocations are this process's memory, so their failure keeps the
+        // allocator's own name (`error.OutOfMemory`) rather than becoming the
+        // driver's `error.DatabaseError`. The `catch |err|` blocks still close
+        // the statement handle the callers rely on before they decline the
+        // prepared path (`catch return null`).
+        const key = self.allocator.dupe(u8, sql_str) catch |err| {
             _ = libmysql_c.mysql_stmt_close(stmt);
-            return error.DatabaseError;
+            return err;
         };
         self.stmt_counter += 1;
-        self.stmt_cache.put(key, .{ .value = stmt, .last_used = self.stmt_counter }) catch {
+        self.stmt_cache.put(key, .{ .value = stmt, .last_used = self.stmt_counter }) catch |err| {
             self.allocator.free(key);
             _ = libmysql_c.mysql_stmt_close(stmt);
-            return error.DatabaseError;
+            return err;
         };
         return stmt;
     }
@@ -3649,7 +3669,7 @@ pub const MySqlConn = struct {
             const empty = try arena.allocator().alloc(Row, 0);
             return Rows{ .arena = arena, .rows = empty };
         }
-        return try mysqlStmtReadRows(stmt, arena);
+        return try mysqlStmtReadRows(stmt, &arena);
     }
 
     fn queryFn(ptr: *anyopaque, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value) errors.ResultT(Rows) {
@@ -3782,7 +3802,9 @@ pub const MySqlConn = struct {
     fn prepareFn(ptr: *anyopaque, allocator: std.mem.Allocator, sql_str: []const u8) errors.ResultT(Stmt) {
         const self = @as(*MySqlConn, @ptrCast(@alignCast(ptr)));
         self.guard();
-        const stmt = allocator.create(MySqlStmt) catch return error.DatabaseError;
+        // The statement cell is this process's memory; `MySqlStmt.prepare`'s own
+        // failure is the driver refusing to prepare, and stays `DatabaseError`.
+        const stmt = try allocator.create(MySqlStmt);
         errdefer allocator.destroy(stmt);
         stmt.* = MySqlStmt.prepare(self.mysql, allocator, sql_str) catch return error.DatabaseError;
         return stmt.toStmt();
@@ -3820,10 +3842,10 @@ pub const MySqlConn = struct {
         if (res) |r| {
             const n_cols = libmysql_c.mysql_num_fields(r);
             if (n_cols > 0) {
-                columns = columns_arena.allocator().alloc([]u8, n_cols) catch return error.DatabaseError;
+                columns = try columns_arena.allocator().alloc([]u8, n_cols);
                 for (0..n_cols) |c| {
                     const field = libmysql_c.mysql_fetch_field(r) orelse return error.DatabaseError;
-                    columns[c] = columns_arena.allocator().dupe(u8, std.mem.span(field.name)) catch return error.DatabaseError;
+                    columns[c] = try columns_arena.allocator().dupe(u8, std.mem.span(field.name));
                 }
             }
         } else {
@@ -3887,7 +3909,10 @@ pub const MySqlConn = struct {
         var last_insert_id: i64 = 0;
         for (rows) |row| {
             if (row.len != columns.len) return error.DatabaseError;
-            mysqlBindParams(stmt, scratch.allocator(), row) catch return error.DatabaseError;
+            // `mysqlBindParams` builds its bind arrays in `scratch` (this
+            // process's memory), so its failure keeps its own name — an
+            // allocation failure must not read as the server rejecting the row.
+            try mysqlBindParams(stmt, scratch.allocator(), row);
             if (libmysql_c.mysql_stmt_execute(stmt) != 0) {
                 const err_no = libmysql_c.mysql_stmt_errno(stmt);
                 const err_msg = std.mem.span(libmysql_c.mysql_stmt_error(stmt));
@@ -4203,7 +4228,7 @@ pub const MySqlStmt = struct {
             const empty = try arena.allocator().alloc(Row, 0);
             return Rows{ .arena = arena, .rows = empty };
         }
-        return mysqlStmtReadRows(stmt, arena);
+        return mysqlStmtReadRows(stmt, &arena);
     }
 
     fn execFn(ptr: *anyopaque, args: []const Value) errors.ResultT(ExecResult) {
@@ -10308,4 +10333,272 @@ test "postgres statement name allocation failure is OutOfMemory" {
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
     try std.testing.expectError(error.OutOfMemory, PostgresConn.prepareFn(&conn, failing.allocator(), "SELECT 1"));
     try std.testing.expect(failing.has_induced_failure);
+}
+
+// The tests below cover the two drivers whose row-scanning paths are only
+// reachable against a live server, at the sites the tests above leave out: the
+// prepared-statement row reader, the statement cache, the streaming cursors and
+// the bulk-insert paths. They are written as *walks*: `fail_index = idx` fails
+// the (idx+1)-th allocation the site asks its allocator for, and `idx` advances
+// by one per attempt, so one loop passes through every allocation on the path in
+// the order the code makes them. Reaching the success case is what says the walk
+// covered all of them — an attempt can only succeed once the index is past the
+// last allocation. `resize_fail_index = 0` keeps an arena from growing its node
+// in place: without it a `rawResize` the counter never sees could satisfy the
+// request and the walk would step over sites it claims to have visited.
+
+test "mysql statement row scan reports allocation failures as OutOfMemory" {
+    try skipUnlessDb("mysql");
+    const allocator = std.testing.allocator;
+    const cfg = mysqlLiveConfig();
+    var conn = try MySqlConn.connect(allocator, cfg.host, cfg.username, cfg.password, cfg.database, cfg.port);
+    defer closeStackMySqlConn(&conn);
+
+    // Two rows on purpose: the short one is copied out of the fixed 4096-byte
+    // bind buffer, the long one overflows it and is refetched — the two string
+    // paths that each allocate.
+    const sql = "SELECT 1 AS a, 'x' AS b UNION ALL SELECT 2, REPEAT('x', 5000)";
+    {
+        // Warm the statement cache with a working allocator, so every walk below
+        // trips over the row buffer and never over the cache key.
+        const stmt = try conn.getCachedStmt(sql);
+        try std.testing.expectEqual(@as(c_int, 0), libmysql_c.mysql_stmt_execute(stmt));
+        var warm_arena = std.heap.ArenaAllocator.init(allocator);
+        var warm = try mysqlStmtReadRows(stmt, &warm_arena);
+        defer warm.deinit();
+        try std.testing.expectEqual(@as(usize, 2), warm.rows.len);
+        try std.testing.expectEqualStrings("x", warm.rows[0].get("b").?.string);
+        try std.testing.expectEqual(@as(usize, 5000), warm.rows[1].get("b").?.string.len);
+    }
+
+    var idx: usize = 0;
+    var failures: usize = 0;
+    var succeeded = false;
+    while (idx < 24) : (idx += 1) {
+        const stmt = try conn.getCachedStmt(sql); // cache hit: allocates nothing
+        var scratch = std.heap.ArenaAllocator.init(allocator);
+        defer scratch.deinit();
+        try mysqlBindParams(stmt, scratch.allocator(), &.{});
+        try std.testing.expectEqual(@as(c_int, 0), libmysql_c.mysql_stmt_execute(stmt));
+
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = idx, .resize_fail_index = 0 });
+        var arena = std.heap.ArenaAllocator.init(failing.allocator());
+        const res = mysqlStmtReadRows(stmt, &arena);
+        if (res) |rows| {
+            var got = rows;
+            got.deinit();
+            succeeded = true;
+            break;
+        } else |err| {
+            // The failed read handed nothing back, so the row buffer it had
+            // already built is still this test's to release.
+            arena.deinit();
+            try std.testing.expectEqual(@as(errors.Error, error.OutOfMemory), err);
+            try std.testing.expect(failing.has_induced_failure);
+            failures += 1;
+        }
+    }
+    try std.testing.expect(succeeded);
+    try std.testing.expect(failures > 0);
+}
+
+test "mysql prepared-statement cell allocation failure is OutOfMemory" {
+    try skipUnlessDb("mysql");
+    const allocator = std.testing.allocator;
+    const cfg = mysqlLiveConfig();
+    var conn = try MySqlConn.connect(allocator, cfg.host, cfg.username, cfg.password, cfg.database, cfg.port);
+    defer closeStackMySqlConn(&conn);
+
+    // `prepareFn` allocates the statement cell before it asks the library to
+    // prepare, so the first failure on this path is this process's memory rather
+    // than a statement the server rejected.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, MySqlConn.prepareFn(&conn, failing.allocator(), "SELECT 1"));
+    try std.testing.expect(failing.has_induced_failure);
+}
+
+test "mysql statement cache reports allocation failures as OutOfMemory" {
+    try skipUnlessDb("mysql");
+    const allocator = std.testing.allocator;
+    const sql = "SELECT 1 AS a";
+
+    // `getCachedStmt` on a cold cache: the SQL text is copied into the key and
+    // the map behind it grows. Both are this process's memory; the statement
+    // itself is already prepared by then.
+    var idx: usize = 0;
+    var failures: usize = 0;
+    var succeeded = false;
+    while (idx < 6) : (idx += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = idx, .resize_fail_index = 0 });
+        var conn = try mysqlFailingConn(&failing);
+        defer closeStackMySqlConn(&conn);
+
+        if (conn.getCachedStmt(sql)) |_| {
+            succeeded = true;
+            break;
+        } else |err| {
+            try std.testing.expectEqual(@as(errors.Error, error.OutOfMemory), @as(errors.Error, err));
+            try std.testing.expect(failing.has_induced_failure);
+            failures += 1;
+        }
+    }
+    try std.testing.expect(succeeded);
+    try std.testing.expect(failures > 0);
+}
+
+test "mysql streaming cursor reports column allocation failures as OutOfMemory" {
+    try skipUnlessDb("mysql");
+    const allocator = std.testing.allocator;
+    const cfg = mysqlLiveConfig();
+    const sql = "SELECT 1 AS a, 2 AS b";
+
+    // Zero arguments, so the only allocations before the wire are the column
+    // array and one `dupe` per column name — all on the allocator the *caller*
+    // passes, which is why the connection can stay on a working one.
+    var idx: usize = 0;
+    var succeeded = false;
+    while (idx < 6) : (idx += 1) {
+        // A fresh connection per attempt: a failure after `mysql_use_result`
+        // leaves the result set on the wire, and this cursor never got to drain
+        // it.
+        var conn = try MySqlConn.connect(allocator, cfg.host, cfg.username, cfg.password, cfg.database, cfg.port);
+        defer closeStackMySqlConn(&conn);
+
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = idx, .resize_fail_index = 0 });
+        const res = MySqlConn.queryCursorFn(&conn, failing.allocator(), sql, &.{}, .{ .mode = .streaming });
+        if (res) |cursor| {
+            var c = cursor;
+            c.deinit();
+            succeeded = true;
+            break;
+        } else |err| {
+            try std.testing.expectEqual(@as(errors.Error, error.OutOfMemory), err);
+            try std.testing.expect(failing.has_induced_failure);
+        }
+    }
+    try std.testing.expect(succeeded);
+}
+
+test "mysql batch insert reports allocation failures as OutOfMemory" {
+    try skipUnlessDb("mysql");
+    const allocator = std.testing.allocator;
+    const columns = [_][]const u8{ "a", "b" };
+    const row = [_]Value{ .{ .int = 1 }, .{ .string = "x" } };
+    const rows = [_][]const Value{&row};
+
+    // The insert text is built on the connection's own allocator and the bind
+    // arrays on a scratch arena over it, so one walk covers both. The bind step
+    // is the one that used to answer `error.DatabaseError`.
+    var idx: usize = 0;
+    var failures: usize = 0;
+    var succeeded = false;
+    while (idx < 24) : (idx += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = idx, .resize_fail_index = 0 });
+        var conn = try mysqlFailingConn(&failing);
+        defer closeStackMySqlConn(&conn);
+
+        const ddl = "CREATE TEMPORARY TABLE oom_batch (a INT, b VARCHAR(8))";
+        if (libmysql_c.mysql_real_query(conn.mysql, @ptrCast(ddl.ptr), @intCast(ddl.len)) != 0) return error.DatabaseError;
+
+        const res = MySqlConn.batchInsertPrepared(&conn, "oom_batch", &columns, &rows);
+        if (res) |r| {
+            try std.testing.expectEqual(@as(u64, 1), r.rows_affected);
+            succeeded = true;
+            break;
+        } else |err| {
+            try std.testing.expectEqual(@as(errors.Error, error.OutOfMemory), err);
+            try std.testing.expect(failing.has_induced_failure);
+            failures += 1;
+        }
+    }
+    try std.testing.expect(succeeded);
+    try std.testing.expect(failures > 0);
+}
+
+test "mysql bind-param allocation failure is OutOfMemory" {
+    // The bind arrays are allocated before the library is called, so this needs
+    // no server and no statement: what it pins is that the failure keeps its own
+    // name, which is what the batch path above depends on.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, mysqlBindParams(@as(*libmysql_c.MYSQL_STMT, undefined), failing.allocator(), &.{.{ .int = 1 }}));
+    try std.testing.expect(failing.has_induced_failure);
+}
+
+test "postgres streaming cursor reports allocation failures as OutOfMemory" {
+    try skipUnlessLivePg();
+    const allocator = std.testing.allocator;
+    // The `?` placeholder is required: `PQsendQueryParams` is handed one
+    // parameter, and a query with none comes back `PGRES_FATAL_ERROR` — a driver
+    // error, which would end the walk before it reached the column names. The
+    // cast is required too: a bare `$1` in a select list has no type to infer.
+    const sql = "SELECT ?::text AS a, 2 AS b";
+
+    // The caller's allocator owns every buffer this path builds: the
+    // null-terminated SQL, the parameter arrays, the text of each bound value
+    // (`allocPrint` for the numeric tags, `dupe` for the string) and the column
+    // names. One walk per parameter shape, because the text is built per tag.
+    for ([_]Value{ .{ .int = 1 }, .{ .float = 1.5 }, .{ .string = "x" } }) |arg| {
+        const args = [_]Value{arg};
+        var idx: usize = 0;
+        var succeeded = false;
+        while (idx < 24) : (idx += 1) {
+            // A fresh connection per attempt: a failure after
+            // `PQsendQueryParams` leaves the result on the wire, and this cursor
+            // has no path that drains it.
+            var conn = try PostgresConn.connect(allocator, pgTestConninfo(), 0);
+            defer closeStackPostgresConn(&conn);
+
+            var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = idx, .resize_fail_index = 0 });
+            const res = PostgresConn.queryCursorFn(&conn, failing.allocator(), sql, &args, .{ .mode = .streaming });
+            if (res) |cursor| {
+                var c = cursor;
+                c.deinit();
+                succeeded = true;
+                break;
+            } else |err| {
+                try std.testing.expectEqual(@as(errors.Error, error.OutOfMemory), err);
+                try std.testing.expect(failing.has_induced_failure);
+            }
+        }
+        try std.testing.expect(succeeded);
+    }
+}
+
+test "postgres copy-from reports allocation failures as OutOfMemory" {
+    try skipUnlessLivePg();
+    const allocator = std.testing.allocator;
+    const columns = [_][]const u8{ "a", "b" };
+    const row = [_]Value{ .{ .int = 1 }, .{ .string = "x" } };
+    const rows = [_][]const Value{&row};
+
+    var idx: usize = 0;
+    var failures: usize = 0;
+    var succeeded = false;
+    while (idx < 24) : (idx += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{});
+        var conn = try PostgresConn.connect(failing.allocator(), pgTestConninfo(), 0);
+        defer closeStackPostgresConn(&conn);
+
+        // `connect` spent one allocation of its own (the null-terminated
+        // conninfo), so the failure is placed `idx` allocations into the copy.
+        failing.fail_index = failing.alloc_index + idx;
+        failing.resize_fail_index = 0;
+
+        const ddl = "CREATE TEMPORARY TABLE oom_copy (a int, b text)";
+        const ddl_res = libpq_c.PQexec(conn.conn, ddl);
+        if (ddl_res) |r| libpq_c.PQclear(r) else return error.DatabaseError;
+
+        const res = PostgresConn.copyFrom(&conn, "oom_copy", &columns, &rows);
+        if (res) |r| {
+            try std.testing.expectEqual(@as(u64, 1), r.rows_affected);
+            succeeded = true;
+            break;
+        } else |err| {
+            try std.testing.expectEqual(@as(errors.Error, error.OutOfMemory), err);
+            try std.testing.expect(failing.has_induced_failure);
+            failures += 1;
+        }
+    }
+    try std.testing.expect(succeeded);
+    try std.testing.expect(failures > 0);
 }

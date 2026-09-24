@@ -2,6 +2,65 @@
 
 ## [Unreleased]
 
+### 第 12 批：夜间 soak 在 Linux 上编译不过（已修）、SSE 不再给 HEAD 写事件、sqlx OOM 误标第二批并修掉一个真泄漏（**破坏性：否**）
+
+全量 `-Ddb=all` **1777/1823（46 skipped，0 failed）**；MySQL 门控真机 `allocation failure` 组 18 passed /
+6 skipped、`mysql` 组 25 passed / 2 skipped，PG 门控真机 15 passed / 9 skipped（均 0 failed）。
+
+**夜间 soak 在 CI 上是红的，而且已经红了一段时间 —— 它在 Linux 上根本编译不过。** 排程跑
+（run `35975588517`，commit `1bf35c4`）的 `Nightly soak` job 失败于：
+```
+src/soak_cluster.zig:645:47: error: no field named 'd_name' in struct 'os.linux.dirent64'
+```
+`linuxFdCount()` 里读的是 `dirent64.d_name` / `d_reclen`，而本工具链的
+`std.os.linux.dirent64` 字段是 `name` / `reclen`。**为什么一直没被发现**：push 触发的 run 会把
+`Nightly soak` 标成 skipped（只有排程跑才真跑），而 macOS 上 `builtin.os.tag == .linux` 的分支被
+comptime 剪掉、函数体不做惰性分析 —— 于是这条错误只在 Linux + 排程跑的组合里出现。
+修法：`ent.name` / `ent.reclen`。绿证据：`zig build soak-cluster -Dtarget=x86_64-linux -Ddb=none`
+现在能编译通过（只剩 "host cannot execute binaries from the target"，即编译成功、无法运行）。
+
+**SSE 不再给 `HEAD` 写事件字节（上一批记录的空缺，已闭环）。** 先做可达性判定：`sse_routes` 只按
+`group.get(...)` 注册（`ComptimeRouter.zig:724`），而路由表按**精确方法**查（`Server.zig:1935`，全框架
+没有 HEAD→GET 回退），所以 HEAD 打到只注册 GET 的 SSE 路径会落进 404 分支、而 404 已经 HEAD 安全；
+但**文档里的第二种 SSE 声明形式**（普通 `routes` 行 + `meta = .{ .sse = true }`，见
+`docs/ROUTE_TABLE.md:293`）可以用**任意方法**注册，把同一个 handler 同时挂 `get` 与 `head` 就可达 ——
+实测修复前 HEAD 的响应里带着 `event: tick\ndata: 1\n\n`。红证据：
+`expected: "" / found: "event: tick"`。修法：`SseWriter` 新增 `head_request`（`init` 时由
+`isHeadRequest(ctx)` 判定，带 `@hasField` 守卫），六个写路径
+（`sendEvent`/`sendData`/`sendMultiLine`/`sendRetry`/`sendComment`/`heartbeat`）各自提前返回；`init`
+仍照发完整字段段（`Content-Type: text/event-stream` 等），所以 HEAD 的字段段与 GET 一致。
+用例是真 socket 三段：GET 基线（钉住 GET 的逐字节框架）、带 `Connection: close` 的 HEAD（字段段 +
+body 为空）、以及**同一条连接上 HEAD 与 GET 流水线**（HEAD 的响应必须停在字段段、下一个请求必须被完整
+应答）。**变异检查**：只去掉 `heartbeat` 那一处守卫，用例立刻在 `expectEqualStrings("", …)` 变红。
+> 有意留下的决定：`event_count` 只在事件真正上线时才增长，所以 HEAD 下它不动 —— 如果有 handler 用
+> `while (writer.event_count < n)` 做循环条件，它会空转。这是"最小改动、不发明计数器语义"的选择，**已
+> 记录为可复议项**。另外，一个"永远 sendEvent"的长命 SSE handler 在 HEAD 下会静默丢写并继续持有
+> fiber/连接（与 `Context.writeChunk` 对 HEAD 的处理同形，不是本次引入，也未修）。SSE 不响应
+> HEAD→GET 回退（HEAD 打只注册 GET 的路径仍是 404）；H2 上 SSE 本来就 fail-closed（`error.NoStream`）。
+> `markSseResponse` 在客户端要求 close 时仍发 `Connection: keep-alive`（既有，未动）。
+
+**sqlx OOM 误标清扫第二批（MySQL 语句族 + PG 流式/批量），并修掉一个真泄漏。**
+改为 `try` 的站点：MySQL 语句族的列值回取与 dupe、`shared_columns`/`binds`/`null_flags`/`lengths`/
+`err_flags`/`bind_bufs`/`is_unsigned_flags`/`col_types` 八个 arena 分配、列名 dupe、每行 `?Value` 数组、
+`rows_list.append` 与 `rows_slice`、`prepareFn` 的 `MySqlStmt` 分配、流式游标的列数组与列名、
+`batchInsertPrepared` 的 bind；PG 流式 `queryCursorFn` 的 `allocZ`/参数数组/`allocPrint`/`dupe`/列数组、
+以及 `copyFrom` 的 `allocZ`。`getCachedStmt` 的两处保留 `mysql_stmt_close(stmt)` 清理后按 err 返回
+（换裸 `try` 会漏句柄）。真驱动错误（`mysql_stmt_prepare`/`execute`、`PQsendQueryParams == 0`、各 PQ
+状态、`validateIdentifier`）**保持不动**。
+> **修掉的真 bug（不是这个缺陷类）**：`mysqlStmtReadRows` 按**值**收 `ArenaAllocator`，于是行缓冲的
+> 节点记在**副本**里，而调用方 `errdefer arena.deinit()` 释放的是空链表 —— 在
+> `std.testing.allocator` 下报 3 处泄漏（`allocated at sqlx.zig:3313/3314 in mysqlStmtReadRows`）。
+> 改成按指针传（两个调用点）。
+> 红证据统一为 `expected error.OutOfMemory, found error.DatabaseError`（在临时副本里逐处还原出红后
+> 复原）；真机验证：MySQL 9.3.0 上 5 条（语句行扫描 / 预处理单元 / 语句缓存 / 流式列 / 批量插入），
+> PG 17.10 上 2 条（流式游标 / `copyFrom`）。
+> **未做并给出评估**：`execPrepared` / `execParamsDirect` / `execPreparedStmt` 的契约是 `?*PGresult`，
+> **null 同时表示"分配失败"与"驱动失败"**（约 22 个调用点，涟漪收在 `PostgresConn` 内但不机械，
+> 还有 `convertPlaceholders` 用 null 表示"无需转换"三方纠缠）—— 本批**没有开始**，因为判错任一处就会
+> 把真驱动错误吞成 OOM。`convertPlaceholders` 的 3 个 `orelse` 调用点因此**仍会误标**。
+> 另：`batchInsertPrepared` 的 bind 失败现在会透出细分错误（如约束冲突）而不是一律 `DatabaseError`
+> —— 这是"更少隐藏"，但**该分支没有测试**。
+
 ### 第 11 批：CI 那条 macos 红是同一条测试测错了量；HEAD 收尾（流式与错误响应）；sqlx 的 OOM 误标清扫并带出一个真 bug（**破坏性：否**）
 
 全量 `-Ddb=all` **1775/1814（39 skipped，0 failed）**；MySQL 门控真机 19 passed / 2 skipped，PG 门控真机
